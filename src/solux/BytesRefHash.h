@@ -1,0 +1,162 @@
+#pragma once
+
+#include "index/ByteBlockPool.h"
+
+// TODO: look at rapidjson to figure out the lowest impedance mismatch to go from json->document?
+// TODO: try something like an existing dense hash map in comparison?
+// TODO: store T (SegmentTerm for instance) right next to the term in the ByteBlockPool!
+// - Only advantage is on a resize... SegmentTerm would not need to be copied?
+// OPT: store first few term bytes next to pointer in the table? (faster sorting) store hash right next to pointer? (faster table resize)
+
+
+//
+// This was roughly 3 times as fast as std::unordered_map<std::string,int64_t> for inserting a bunch of 16 byte keys, 40% faster for subsequent lookups
+// Need to compare against something better like abseil now... perhaps figure out how to inherit from abseil or folly's map
+// Or make Str constructors take a BBPool so we can use try_emplace?
+
+template <class T>
+class BytesRefHash {
+  void newTable(unsigned newSize);
+
+public:
+  typedef T value_type;
+  typedef std::pair<ByteBlockPool::Str, T> composite_type;
+
+  composite_type * table_;
+  ByteBlockPool& pool_;
+  int elements_ = 0;   // how many slots used
+  int capacity_;       // how many slots may be used
+  int mask_;           // mask for power-of-two hash
+  unsigned tableSize_;  // size of the hash table, always a power of two
+
+  BytesRefHash(ByteBlockPool &pool, unsigned initialSizePowerOfTwo) : pool_(pool) {
+    newTable(initialSizePowerOfTwo);
+  }
+
+  ~BytesRefHash();
+
+  int size() { return elements_; }
+
+  T& lookup(const char* ptr, int sz) {
+    int hash = (int) Hash::hash(ptr, sz);
+    int slot = hash;
+    for (; ;) {
+      slot = slot & mask_;
+      auto v = table_ + slot;
+      if (v->first.isNull() || v->first.equals(ptr, sz)) {
+        return v->second;
+      }
+      slot++;
+    }
+  }
+
+  void rehash();
+
+  // Returns a pointer to the current slot or adds a new slot.
+  // A Rehash will move the slot, so do not use the pointer after other BytesRefHash operations.
+  // TODO: should we return V& instead like []
+  composite_type& lookupOrAdd(const char* ptr, int sz) {
+    if (elements_ >= capacity_) {
+      rehash();
+    }
+    int hash = (int) Hash::hash(ptr, sz);
+    int slot = hash;
+    for (; ;) {
+      slot = slot & mask_;
+      composite_type& v = table_[slot];
+      if (v.first.isNull()) {
+        elements_++;
+        // unsigned char* dest = pool_.writeStr((const unsigned char*)ptr, sz);
+        // v.first = reinterpret_cast<PackedTerm&>(dest);
+        v.first = pool_.writeStr((const unsigned char*)ptr, sz);
+        new(&v.second) T();  // invoke default constructor?
+        return v;
+      } else if (v.first.equals(ptr, sz)) {
+        return v;
+      }
+      slot++;
+    }
+  }
+
+  template <class CreateFunctor>
+  composite_type& lookupOrAdd(const char* ptr, int sz, CreateFunctor createFunctor) {
+    if (elements_ >= capacity_) {
+      rehash();
+    }
+    int hash = (int) Hash::hash(ptr, sz);
+    int slot = hash;
+    for (; ;) {
+      slot = slot & mask_;
+      composite_type& v = table_[slot];
+      if (v.first.isNull()) {
+        elements_++;
+        // unsigned char* dest = pool_.writeStr((const unsigned char*)ptr, sz);
+        // v.first = reinterpret_cast<PackedTerm&>(dest);
+        v.first = pool_.writeStr((const unsigned char*)ptr, sz);
+        createFunctor(v);
+        return v;
+      } else if (v.first.equals(ptr, sz)) {
+        return v;
+      }
+      slot++;
+    }
+  }
+
+  T& get(const char* ptr, int sz) {
+    return lookupOrAdd(ptr, sz).second;
+  }
+
+  void emplace(const char* ptr, int sz, const T&& v) {
+    // lookupOrAdd(ptr, sz).second = v;
+    lookupOrAdd(ptr, sz).second = std::move(v);
+  }
+
+  // FUTURE: try robinhood hashing?
+
+
+};
+
+template <class T> void BytesRefHash<T>::newTable(unsigned newSize) {
+  assert(newSize>0 && isPowerOfTwo(newSize));
+
+  // this was often twice as fast in some cases - zeroing is not as well optimized it seems
+  table_ = reinterpret_cast<BytesRefHash<T>::composite_type *>( new char[newSize * sizeof(BytesRefHash<T>::composite_type)]() );
+  capacity_ = newSize - (newSize >> 2);  // .75 load factor
+  // capacity_ = newSize - (newSize >> 1);  // .5 load factor
+  // capacity_ = newSize - (newSize >> 2) - (newSize >> 3);  // .625 load factor
+
+  mask_ = newSize - 1;
+  tableSize_ = newSize;
+}
+
+
+template <class T> void BytesRefHash<T>::rehash() {
+  auto oldTable = table_;
+  auto oldTableSize = tableSize_;
+  newTable(tableSize_ << 1);
+
+  for (auto i = 0; i<oldTableSize; i++) {
+    auto oldslot = oldTable + i;
+    if (!oldslot->first.isNull()) {
+      int hash = static_cast<int>( oldslot->first.hashcode() );  // TODO: store this?
+      int slot = hash;
+      for (;;) {
+        slot = slot & mask_;
+        composite_type * newslot = table_ + slot;
+        if (newslot->first.isNull()) {
+//          *newslot = *oldslot;  // TODO: try memcpy to see if it's more optimized
+          *newslot = std::move(*oldslot);
+          break;
+        }
+        slot++;
+      }
+    }
+  }
+
+  delete [] reinterpret_cast<char*>(oldTable);
+}
+
+template <class T> BytesRefHash<T>::~BytesRefHash() {
+  delete [] reinterpret_cast<char*>(table_);
+}
+

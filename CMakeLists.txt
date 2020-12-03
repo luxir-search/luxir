@@ -1,0 +1,74 @@
+cmake_minimum_required(VERSION 3.16)
+project(Solux VERSION 0.1)
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED True)
+
+# This keeps dlls and executables together, which makes windows happy.
+set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+
+include_directories(SYSTEM ./src)
+
+#from clion docs
+find_package(Boost)
+IF (Boost_FOUND)
+    include_directories(${Boost_INCLUDE_DIR})
+endif()
+set (Boost_USE_STATIC_LIBS OFF) # enable dynamic linking
+set (Boost_USE_MULTITHREAD ON)  # enable multithreading
+find_package (Boost COMPONENTS REQUIRED locale chrono filesystem)
+
+include_directories(deps)
+link_directories(deps/simdcomp)
+
+#Print out all env vars... useful while build system is in development
+get_cmake_property(_variableNames VARIABLES)
+list (SORT _variableNames)
+foreach (_variableName ${_variableNames})
+    message(STATUS "${_variableName}=${${_variableName}}")
+endforeach()
+
+
+# sanitizer settings.. can leave this first one on while developing for linux
+#set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -std=c++2a -g -O1 -fno-omit-frame-pointer -fsanitize=address")
+#set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -std=c++2a -g -O1 -fno-omit-frame-pointer -fsanitize=address -DBBP_MALLOC")
+#set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -std=c++2a -g -O1 -fno-omit-frame-pointer -fsanitize=thread -fPIE -pie")
+# NOTE: memory sanitizer needs *everything* including linked libc++ to be compiled with it.
+# see https://github.com/google/sanitizers/wiki/MemorySanitizerLibcxxHowTo
+#set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -std=c++2a -g -O1 -fno-omit-frame-pointer -fsanitize=memory -fsanitize-memory-track-origins -fPIE -pie -fno-optimize-sibling-calls")
+#set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -std=c++2a -O3 -DNDEBUG -fstrict-aliasing")
+
+message(STATUS "CMAKE_CXX_COMPILER_ID=${CMAKE_CXX_COMPILER_ID}")
+if (CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
+  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -mavx -mssse3 -march=native")
+elseif (CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -mavx -mssse3 -march=native")   # native just for dev... lock down more later?
+elseif (CMAKE_CXX_COMPILER_ID STREQUAL "Intel")
+elseif (CMAKE_CXX_COMPILER_ID STREQUAL "MSVC")
+  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -D__SSSE3__ -arch:AVX")
+  #if debugging?
+  #add_link_options("/nodefaultlib:msvcrt")
+endif()
+
+
+
+
+file(GLOB_RECURSE Proj_SOURCES "src/*.cpp")   #TODO: .h need to be here for any reason?
+list(FILTER Proj_SOURCES EXCLUDE REGEX ".*/main.cpp")
+
+add_library(solux_lib STATIC ${Proj_SOURCES})
+
+add_executable(solux src/solux/main.cpp)
+target_link_libraries(solux solux_lib)
+
+add_subdirectory(test)
+
+
+# this needs to be after add_executable or add_library
+target_link_libraries (solux ${Boost_LIBRARIES})
+
+target_link_libraries (solux_lib debug simdcomp_ad)
+target_link_libraries (solux_lib optimized simdcomp_a)
+
+
