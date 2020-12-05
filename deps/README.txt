@@ -1,3 +1,12 @@
+Building
+--------
+
+Ubuntu:
+```
+sudo apt install build-essential cmake libboost-dev libboost-doc libgtest-dev libboost-chrono-dev \
+    libboost-locale-dev libboost-filesystem-dev
+```
+
 Other 3rd party dependencies.
 
 # SIMDCompressionAndIntersection is only dependency here currently
