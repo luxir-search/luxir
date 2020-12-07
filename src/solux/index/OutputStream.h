@@ -65,13 +65,13 @@ public:
   }
 
   // Write without bounds checking.  Assumes len <= reserved().
-  void unsafeWrite(void* data, size_t len) {
+  void unsafeWrite(const void* data, size_t len) {
     assert(len <= reserved());
     memcpy(pos, data, len);
     pos += len;
   }
 
-  void write(void* data, size_t len) {
+  void write(const void* data, size_t len) {
     // TODO: optimize this for the case that File can handle non-full buffers.
     while (len > 0) {
       size_t toWrite = std::min(len, reserved());
@@ -107,6 +107,11 @@ public:
       val >>= 7;
     }
     write((char)val);
+  }
+
+  void writeStr(const char* data, uint32_t len) {
+    writeVint(len);
+    write((void*)data, len);
   }
 
 };

@@ -133,6 +133,7 @@ public:
         }
     }
 
+    // An inlineable push version for performance experimentation
     template<class Sink>
     inline static void process(char *val, int len, Sink sink) {
         const char* end = val + len;
@@ -150,6 +151,7 @@ public:
                 val++;  // TODO: an incrementIsWhitespace that always increments over a UTF8 code point and returns if it was whitespace or not?
             }
 
+            // TODO: should sink return a boolean to continue or break out?
             sink(start, (int)(val - start));
         }
     }

@@ -164,17 +164,16 @@ public:
   int32_t lastDoc;
   int32_t lastPos;
 
+  std::unique_ptr<OutputStream> tindexOutput;  // output stream for terms index
   std::unique_ptr<OutputStream> termOutput;  // output stream for termFile
   std::unique_ptr<OutputStream> docOutput;  // output stream for docFile
   std::unique_ptr<OutputStream> posOutput;  // output stream for posFile
 
   // TODO: if these files were only used for writing, then we wouldn't need shared_ptr to them? Only one should exist at any point in time.
+  std::shared_ptr<File> tindexFile; // terms for each field
   std::shared_ptr<File> termFile; // terms for each field
   std::shared_ptr<File> docFile; // documents for each term
   std::shared_ptr<File> posFile; // positions for each term
-
-  // TODO: allocate these from pool.  Should these parallel arrays be a struct instead?
-  std::vector<uint64_t> termBlockFP;  // position (file pointer) in file for each term block
 
   // needed to build each block
   std::vector<ByteBlockPool::Str> termList;  // list of terms in the current term block
@@ -187,13 +186,29 @@ public:
   std::vector<int32_t> tfreqs; // term freqs - number of times the term appears in each document (parallel vector to "docs")
   std::vector<int32_t> posdeltas; // list of position deltas for the current term (for all documents... per-document positions are not delimited)
 
-  uint64_t locationOfPositionsForTermBlock;
-  uint64_t locationOfPositionsForTerm;
-  uint64_t locationOfDocsForTerm;
+
+  uint64_t offsetOfTermBlock;
+  uint64_t offsetOfPositionsForTermBlock;
+  uint64_t offsetOfDocsForTermBlock;
+  uint64_t offsetOfPositionsForTerm;
+  uint64_t offsetOfDocsForTerm;
 
   uint64_t positionsFlushed;  /// number of positions flushed for the current term so far
   uint32_t docsFlushed;  /// number of documents flushed for the current term so far
   uint64_t totalTermFreqPrevDoc = 0; // total term freq up through the previous doc
+
+  // Should this be refactored into a class?
+  struct FieldInfo {
+    std::string fieldName;
+    uint64_t termsOffset;
+    uint64_t docsOffset;
+    uint64_t posOffset;
+    int numTerms;
+    uint64_t sumDocFreq;
+    uint64_t sumTotalTermFreq;
+    std::vector<uint64_t> termBlockOffsets;  // offset from termsOffset (for this field) for each term block
+  };
+  FieldInfo fieldInfo;
 
 
 
@@ -215,7 +230,7 @@ private:  // some internal utility methods... not for use by indexers
 
   // the size the docfile takes
   uint32_t getDocFileSize() const {
-    auto sz = docOutput->size() - locationOfDocsForTerm;
+    auto sz = docOutput->size() - offsetOfDocsForTerm;
     assert(sz <= UINT_MAX);
     return sz;
   }
@@ -240,10 +255,12 @@ public:
     // That would mess up the option to sync all files and then write a segments file, but many file systems don't need that.
     // We should have a flexible enough container format to be able to include or pull out whatever files we want.
 
+    tindexFile = std::make_shared<RAMFile>();
     termFile = std::make_shared<RAMFile>();
     docFile = std::make_shared<RAMFile>();
     posFile = std::make_shared<RAMFile>();
 
+    tindexOutput = std::make_unique<OutputStream>(*termFile);
     termOutput = std::make_unique<OutputStream>(*termFile);
     docOutput = std::make_unique<OutputStream>(*docFile);
     posOutput = std::make_unique<OutputStream>(*posFile);
@@ -275,6 +292,8 @@ public:
 
   // TODO: move to .cpp unless we template this class
   void flushDocs() {
+    assert(docs.size() == tfreqs.size());
+
     if (docs.empty()) {
       return;
     }
@@ -301,21 +320,32 @@ public:
                            compressedSize);
     docOutput->write(compressed_output.data(), compressedSize);
 
-    // TODO: add data (or keep track of blocks) for skip list
+    // TODO: add data (or keep track of blocks) for docs skip list
   }
 
 
   // Have a different set of methods depending on the field type?
   // For example things could be much simpler if not indexing positions.
 
-  void startField(const std::string& fieldName) {
+
+  // called starting a new field, or after flushing a term block.
+  void _startTermBlock(bool endingField) {
+    // is the branch here even worth it?  the extra work should be cheap + redundant.
+    if (!endingField) {
+      termList.resize(0);
+      docFileSize.resize(0);
+      pulsedDoc.resize(0);
+      pulsedPos.resize(0);
+      offsetOfPositionsForTermBlock = posOutput->size() - fieldInfo.posOffset;
+      offsetOfDocsForTermBlock = docOutput->size() - fieldInfo.docsOffset;
+    }
+    offsetOfTermBlock = termOutput->size() - fieldInfo.termsOffset;
+
+
+    fieldInfo.termBlockOffsets.push_back(offsetOfTermBlock);
   }
 
-  void endField(const std::string& fieldName) {
-  }
-
-
-  void flushTerms() {
+  void flushTerms(bool endingField) {
     if (termList.empty()) {
       return;
     }
@@ -328,12 +358,20 @@ public:
     ByteBlockPool::Str reference = termList[0];
     auto [refdata, reflen] = reference.unpack();
 
+    // Write the terms block header.
+    termOutput->writeStr(refdata, reflen);
+    termOutput->writeVlong(offsetOfDocsForTermBlock);  // TODO: make these relative to field
+    termOutput->writeVlong(offsetOfPositionsForTermBlock);
+
+
+
+    // now write the block:
     int pulsedIdx = 0;  // index of next pulsed data
     for (int i=0; i<termList.size(); i++) {
       auto term = termList[i];
 
       if (i > 0) {
-        // If not the first term, find common prefix with last term
+        // If not the first term, find common prefix with previous term
         auto[tdata, tlen] = term.unpack();
         auto minsize = std::min(tlen, reflen);
         uint32_t mismatchPos = 0;
@@ -360,7 +398,7 @@ public:
         }
 
         // now write the suffix of the current term
-        termOutput->write((void *) (tdata + prefixLen), suffixLen);
+        termOutput->write(tdata + prefixLen, suffixLen);
       }
 
       // Write the term metadata that belongs in the term dictionary.
@@ -393,12 +431,9 @@ public:
 
     assert(pulsedIdx == pulsedDoc.size());  // we should have read all pulsed docs;
 
-    // move this to an internal startTermBlock?
-    termList.resize(0);
-    docFileSize.resize(0);
-    pulsedIdx = 0;
-    pulsedDoc.resize(0);
-    pulsedPos.resize(0);
+    if (!endingField) {
+      _startTermBlock(endingField);
+    }
   }
 
 
@@ -406,8 +441,8 @@ public:
     termList.push_back(term);  // we don't really need the term name at this point (could add in endTerm), but it might be nice for debugging / exceptions?
     docsFlushed = 0;
     positionsFlushed = 0;
-    locationOfPositionsForTerm = posOutput->size();
-    locationOfDocsForTerm = docOutput->size();
+    offsetOfPositionsForTerm = posOutput->size();
+    offsetOfDocsForTerm = docOutput->size();
   }
 
   void endTerm(ByteBlockPool::Str term) {
@@ -461,7 +496,7 @@ public:
       auto docfreq = getDocFreq();
       auto ttfCode = totalTermFreq - docfreq;
       // offset from start of positions in term dict block
-      auto posOffset = locationOfPositionsForTerm - locationOfPositionsForTermBlock;
+      auto posOffset = offsetOfPositionsForTerm - offsetOfPositionsForTermBlock;
 
       // TODO: encode as group, and can replace the metadataSize byte with the control byte.
       docOutput->writeVint(docfreq);
@@ -470,28 +505,56 @@ public:
 
       auto metadataSize = docOutput->size() - metadataStart;
       docOutput->write((char)metadataSize);
+      // TODO: generate/store skip index
 
-      // store ttf
-      // store positions start (delta from block)
-      // store skip index
       docFileSize.push_back(getDocFileSize());
     }
 
     if (termList.size() == TERMS_BLOCK_SIZE) {
-      flushTerms();
+      flushTerms(false);
     }
   }
 
+  void startField(const std::string& fieldName) {
+    fieldInfo.fieldName = fieldName;
+    fieldInfo.termsOffset = termOutput->size();
+    fieldInfo.docsOffset = docOutput->size();
+    fieldInfo.posOffset = posOutput->size();
+    fieldInfo.termBlockOffsets.resize(0);
+
+    _startTermBlock(false);
+  }
+
+  void endField(const std::string& fieldName) {
+    // TODO: investigate inlining small fields in the terms index instead of pointing out to other files.
+    // TODO: For many fields, the field index and the terms index should perhaps have the same structure (prefix compressed blocks?)
+    flushTerms(true);
+    tindexOutput->writeStr(fieldName.c_str(), fieldName.size());  // TODO: use fieldNumbers, or don't use field identifier at all... another index should point to this?
+    tindexOutput->writeVlong(fieldInfo.termsOffset);
+    tindexOutput->writeVlong(fieldInfo.docsOffset);
+    tindexOutput->writeVlong(fieldInfo.posOffset);
+    tindexOutput->writeVint(fieldInfo.numTerms);
+    // write index into the blocks of the terms dict
+    // TODO: termBlockOffsets[0] is redundant with fieldInfo.termsOffset and we should be able to skip it (should always be 0)
+    // TODO: use a more efficient encoding for this array
+    tindexOutput->write(&(fieldInfo.termBlockOffsets[0]), fieldInfo.termBlockOffsets.size() * sizeof(uint64_t) );
+  }
+
   void startDoc(int32_t doc) {
-    docs.push_back(doc);
+    // Do we need to know the current doc?
 
     // We don't keep track of positions for the doc... we block encode all positions for a term together.
     // locationOfPositionsForDoc = posOutput->size();
   }
 
   void endDoc(int32_t doc) {
-    tfreqs.push_back(getTermFreq());
-    assert(docs.size() == tfreqs.size());
+    auto tf = getTermFreq();
+    if (tf == 0) {
+      // TODO: revisit if this can happen... it depends on where deleted docs are checked.
+      return;
+    }
+    docs.push_back(doc);
+    tfreqs.push_back(tf);
     if (docs.size() == DOCS_BLOCK_SIZE) {
       flushDocs();
     }
