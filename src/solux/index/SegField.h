@@ -1,10 +1,10 @@
 #pragma once
 
 #include "solux/analysis/Analyzer.h"
-#include "ByteBlockPool.h"
+#include "solux/util/MemPool.h"
 #include "solux/FieldType.h"
-#include "solux/BytesRefHash.h"
-#include "solux/StrValHash.h"
+#include "solux/util/TermHash.h"
+#include "solux/util/TermValHash.h"
 #include "DocStream.h"
 
 /***
@@ -12,7 +12,7 @@ class SegmentTerm {
 public:
 
   // Since Streams aren't currently relocabable (they can point to themselves),
-  ByteBlockPool::DeltaVintStream termDocs;
+  MemPool::DeltaVintStream termDocs;
 };
  ***/
 
@@ -44,7 +44,7 @@ template <class StreamType>
 class SegmentField {
 public:
   FieldInfo& field_;
-  StrValHash<StreamType> termsHash;
+  TermValHash<StreamType> termsHash;
 
   // pointer to the global field info...
   // prob not necessary to store (it can be implicit and we could pass along FieldInfo everywhere)
@@ -60,7 +60,7 @@ public:
   int docsWithField;
   // What about docValues fields?
 
-  SegmentField(ByteBlockPool& pool, FieldInfo& field) :  field_(field), termsHash(pool, 4) {
+  SegmentField(MemPool& pool, FieldInfo& field) :  field_(field), termsHash(pool, 4) {
   }
 };
 ***/
@@ -107,9 +107,9 @@ public:
 
 class SegFieldDocs : public SegFieldIndexed {
 public:
-  StrValHash<DocStream> termsHash;
+  TermValHash<DocStream> termsHash;
 
-  SegFieldDocs(const FieldType &field, ByteBlockPool& pool) : SegFieldIndexed(field) , termsHash(pool, 4) { }
+  SegFieldDocs(const FieldType &field, MemPool& pool) : SegFieldIndexed(field) , termsHash(pool, 4) { }
 
   virtual void indexSingleValue(int docid, const char *ptr, int len) override {
 
@@ -149,16 +149,16 @@ public:
 /*
 class SegFieldDocsFreq : SegFieldIndexed {
 public:
-  StrValHash<DocFreqStream> termsHash;
+  TermValHash<DocFreqStream> termsHash;
 };
 */
 
 
 class SegFieldDocsFreqPos : public SegFieldIndexed {
 public:
-  StrValHash<DocFreqPosStream> termsHash;
+  TermValHash<DocFreqPosStream> termsHash;
 
-  SegFieldDocsFreqPos(const FieldType &field, ByteBlockPool& pool) : SegFieldIndexed(field) , termsHash(pool, 4) { }
+  SegFieldDocsFreqPos(const FieldType &field, MemPool& pool) : SegFieldIndexed(field) , termsHash(pool, 4) { }
 
   inline void indexSingleTerm(int docid, char* term, int len, int pos) {
     auto [entry, inserted] = termsHash.try_emplace(term, len, termsHash.pool_, docid, pos);
@@ -208,9 +208,9 @@ public:
 
 
       /***
-      StrValRef<DocFreqPosStream>& entry = termsHash.lookup(tok.ptr, tokLen);
+      TermValRef<DocFreqPosStream>& entry = termsHash.lookup(tok.ptr, tokLen);
       if (entry.isNull()) {
-        entry = StrValRef<DocFreqPosStream>::alloc(termsHash.pool_, tok.ptr, tokLen);
+        entry = TermValRef<DocFreqPosStream>::alloc(termsHash.pool_, tok.ptr, tokLen);
         new (entry.valPtr()) DocFreqPosStream(termsHash.pool_, docid, pos);
       } else {
         entry.val().addDoc(termsHash.pool_, docid, pos);
@@ -218,7 +218,7 @@ public:
       ***/
 
       /*
-      StrValRef<DocFreqPosStream> entry(0,0);  // try moving outside loop for better perf?
+      TermValRef<DocFreqPosStream> entry(0,0);  // try moving outside loop for better perf?
       bool inserted;
       [entry, inserted] = termsHash.lookupOrAdd(tok.ptr, tokLen);
       if (inserted) {
@@ -241,7 +241,7 @@ public:
 
 
 /*
-      StrValRef<DocFreqPosStream>* entry;
+      TermValRef<DocFreqPosStream>* entry;
       bool inserted = termsHash.lookupOrAdd(tok.ptr, tokLen, entry);
       if (inserted) {
         new (entry->valPtr()) DocFreqPosStream(termsHash.pool_, docid, pos);

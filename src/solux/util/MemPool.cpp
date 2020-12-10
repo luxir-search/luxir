@@ -1,18 +1,18 @@
 
-#include "ByteBlockPool.h"
+#include "MemPool.h"
 
 
-ByteBlockPool::ByteBlockPool() {
+MemPool::MemPool() {
   nextBuffer();
 }
 
-ByteBlockPool::~ByteBlockPool() {
+MemPool::~MemPool() {
   for (char* ptr : buffers_) {
     delete[] ptr;
   }
 }
 
-void ByteBlockPool::nextBuffer() {
+void MemPool::nextBuffer() {
   // buffer_ = new unsigned char[BYTE_BLOCK_SIZE] {0};
   buffer_ = new char[BYTE_BLOCK_SIZE];  // not 0 initialized
   buffers_.push_back(buffer_);

@@ -1,6 +1,6 @@
 #pragma once
 
-#include "index/ByteBlockPool.h"
+#include "solux/util/MemPool.h"
 #include "analysis/Analyzer.h"
 
 #include <memory>
@@ -92,7 +92,7 @@ public:
   // perhaps that is the answer!
   virtual Analyzer& getAnalyzer() { return *(Analyzer*)0; } // nocommit TODO
 
-  virtual SegFieldIndexed* createSegFieldIndexed(ByteBlockPool& pool);
+  virtual SegFieldIndexed* createSegFieldIndexed(MemPool& pool);
 };
 
 

@@ -3,7 +3,7 @@
 #include <cstdint>
 #include <assert.h>
 
-#include "solux/solux_util.h"
+#include "solux/util/solux_util.h"
 
 
 // ripped off directly from Lucene

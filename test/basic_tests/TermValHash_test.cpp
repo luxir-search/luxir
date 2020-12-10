@@ -7,7 +7,7 @@
 using namespace std;
 
 
-TEST(StrValHash, test_hash) {
+TEST(TermValHash, test_hash) {
 
   Inverter inverter;
 
@@ -70,7 +70,7 @@ TEST(StrValHash, test_hash) {
       cout << "Term " << *p << endl;
     }
 
-    vector<StrValHash<DocFreqPosStream>::entry_type> terms;
+    vector<TermValHash<DocFreqPosStream>::entry_type> terms;
     terms.reserve(sss->termsHash.size());
     std::copy(sss->termsHash.begin(), sss->termsHash.end(), back_inserter(terms));
     cout << "TERMS=" << terms << endl;

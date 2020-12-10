@@ -9,10 +9,8 @@
 #include <assert.h>
 #include <unordered_set>
 
-#include "solux/solux_util.h"
-#include "solux/index/Fields.h"
-#include "solux/store/DataInput.h"
-#include "solux/index/StrRef.h"
+#include "solux_util.h"
+
 
 // #define BBP_MALLOC true   // use malloc for each allocation for better memory checking
 
@@ -52,11 +50,8 @@
 //
 
 
-class ByteBlockPool {
+class MemPool {
 public:
-    // using Str = StrRef;
-  using Str = PackedTerm;
-
 
 // TODO - make a lot of this stuff private
   static constexpr int BYTE_BLOCK_SHIFT = 15;
@@ -90,11 +85,11 @@ public:
 
   // TODO: accept an upstream allocator / memory resource
 
-  ByteBlockPool(const ByteBlockPool &) = delete;
-  ByteBlockPool& operator=(const ByteBlockPool&) = delete;
+  MemPool(const MemPool &) = delete;
+  MemPool& operator=(const MemPool&) = delete;
 
-  ByteBlockPool();
-  ~ByteBlockPool();
+  MemPool();
+  ~MemPool();
 
 
   // TODO: avoid using ptr() directly since it won't work when switching to malloc
@@ -134,7 +129,7 @@ public:
 
   // ensures that there is enough space starting with the current buffer (moving to a new buffer if necessary)
   // and returns the resulting end offset into the last (current) block.
-  int ensure(int size) {
+  int ensure(uint32_t size) {
     assert(size >= 0 && size <= BYTE_BLOCK_SIZE);
     auto newEnd = pos_ + size;
     if (newEnd > BYTE_BLOCK_SIZE) {
@@ -144,7 +139,7 @@ public:
     return newEnd;
   }
 
-  int allocate(int size) {
+  int allocate(uint32_t size) {
 #ifndef BBP_MALLOC
     int newEnd = ensure(size);
     // char* p = buffer + pos;
@@ -161,7 +156,7 @@ public:
   }
 
 
-  char *allocatePtr(int size) {
+  char *allocatePtr(uint32_t size) {
 #ifndef BBP_MALLOC
     int newEnd = ensure(size);
     auto p = ptr();
@@ -174,7 +169,7 @@ public:
   }
 
     // do allocation and return both the normal pointer as well as the short pool specific pointer (bbptr)
-    std::pair<char *, int> allocateAddrs(int size) {
+    std::pair<char *, int> allocateAddrs(uint32_t size) {
 #ifndef BBP_MALLOC
     int newEnd = ensure(size);
     int bbAddr = bbAddress();
@@ -223,10 +218,11 @@ public:
   }
 **/
 
+  /** nocommit
 
   // Write a string and return a pointer to it.
   // TODO: return PackedTerm reference?
-  // TODO: only used by BytesRefHash...
+  // TODO: only used by TermHash...
   Str writeStr(const void *data, int sz) {
 #ifndef BBP_MALLOC
     ensure(Str::getMaxSize(sz));
@@ -240,6 +236,7 @@ public:
     return Str(target,sz);
 #endif
   }
+   **/
 
 
   void nextBuffer();

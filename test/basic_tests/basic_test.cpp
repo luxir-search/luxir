@@ -1,7 +1,7 @@
 
 #include <gtest/gtest.h>
 #include <iostream>
-#include "solux/solux_util.h"
+#include "solux/util/solux_util.h"
 
 using namespace std;
 

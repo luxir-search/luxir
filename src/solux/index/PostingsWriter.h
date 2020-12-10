@@ -7,7 +7,8 @@
 #include <sstream>
 #include <unordered_map>
 #include <vector>
-#include "ByteBlockPool.h"
+#include "solux/util/MemPool.h"
+#include "solux/util/StrRef.h"
 #include "solux/store/OutputStream.h"
 #include "solux/store/Directory.h"
 #include "simdcomp/include/codecfactory.h"
@@ -180,7 +181,7 @@ public:
   std::unique_ptr<File> posFile; // positions for each term
 
   // needed to build each block
-  std::vector<ByteBlockPool::Str> termList;  // list of terms in the current term block
+  std::vector<TermRef> termList;  // list of terms in the current term block
   std::vector<uint32_t> docFileSize;         // size of the data in the docs file for this term (TODO: can we guarantee that this isn't bigger than 2B or 4B?)
   std::vector<uint32_t> pulsedDoc; // if docFileSize==0, then the term has a single doc/pos that is pulsed, and those values are the next in this list.
   std::vector<uint32_t> pulsedPos;
@@ -351,7 +352,7 @@ public:
     // TODO: store min term size (or minimum suffix length) and then code the suffix lengths as additional to that? Would help indexing things like text uuids.
     // Store max term size to help optimize readers?
 
-    ByteBlockPool::Str reference = termList[0];
+    TermRef reference = termList[0];
     auto [refdata, reflen] = reference.unpack();
 
     // Write the terms block header.
@@ -433,7 +434,7 @@ public:
   }
 
 
-  void startTerm(ByteBlockPool::Str term) {
+  void startTerm(TermRef term) {
     termList.push_back(term);  // we don't really need the term name at this point (could add in endTerm), but it might be nice for debugging / exceptions?
     docsFlushed = 0;
     positionsFlushed = 0;
@@ -441,7 +442,7 @@ public:
     offsetOfDocsForTerm = docOutput.size();
   }
 
-  void endTerm(ByteBlockPool::Str term) {
+  void endTerm(TermRef term) {
     uint64_t totalTermFreq = getTotalTermFreq();
     if (totalTermFreq == 1) {
       assert(getDocFileSize()==0 && docs.size()==1 && posdeltas.size() == 1);

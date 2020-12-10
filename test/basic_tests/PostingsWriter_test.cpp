@@ -6,5 +6,8 @@
 
 TEST(PostingsWriter_test, test_basic) {
   RAMDir dir;
+  MemPool pool;
   PostingsWriter writer(dir, "gen1");
+  writer.startField("field1");
+
 }

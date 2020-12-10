@@ -8,7 +8,7 @@
 // (only for string types that have the length info in the data itself? perhaps just standardize on that?)
 
 
-// FUTURE OPTIMIZATION: Use a separate ByteBlockPool that is 64 byte aligned (cache line)
+// FUTURE OPTIMIZATION: Use a separate MemPool that is 64 byte aligned (cache line)
 // and use the extra space at the end as buffer space.  Instead of using it as the head of the byte stream,
 // we can avoid a cache miss by always using it, and copying out the bytes when full.
 // Current sizes: Stream=18  DocStream=26  DocFreqStream=34 DocFreqPosStream=56
@@ -19,10 +19,10 @@
 //
 // Also, if we have a local buffer (not in the linked list), then we don't need the starting small
 // buffers to save memory any more!  We could just always use 64 byte chunks in the linked list, and the
-// overhead wouldn't be horrible... 4/64==6%.  And if all chunks in the ByteBlockPool are 64 byte aligned,
+// overhead wouldn't be horrible... 4/64==6%.  And if all chunks in the MemPool are 64 byte aligned,
 // then so could offsets, and we could address 4GB*64 in one pool with 4 bytes.  We could also investigate
 // wasting a little more memory and using a full pointer (8 bytes) to point to the next chunk and potentially
-// avoid a miss on the vector of pointers in the ByteBlockPool?  Presumably that vector should be hot though
+// avoid a miss on the vector of pointers in the MemPool?  Presumably that vector should be hot though
 // and a miss should be unlikely?
 //
 
@@ -48,12 +48,12 @@ public:
   int lastDoc;
   int docFreq;  // number of docs with this term
 
-  DocStream(ByteBlockPool& pool, int docid) : lastDoc(docid) , docFreq(1) {
+  DocStream(MemPool& pool, int docid) : lastDoc(docid) , docFreq(1) {
   }
   DocStream(const DocStream&) = delete;
   void operator=(const DocStream&) = delete;
 
-  void addDoc(ByteBlockPool& pool, int docid) {
+  void addDoc(MemPool& pool, int docid) {
     int delta = docid - lastDoc;
     assert(delta >= 0);
     if (delta != 0) {
@@ -85,7 +85,7 @@ public:
 
 
 
-  void addDoc(ByteBlockPool& pool, int docid) {
+  void addDoc(MemPool& pool, int docid) {
     int delta = docid - lastDoc;
     if (delta == 0) {
       // same document
@@ -136,13 +136,13 @@ public:
   // todo: support positions > 2B?  Not useful?  Perhaps support with a special marker in the stream (like a 0 length payload that means
   // read a vint and multiply that by 2B and add it to the delta
 
-  DocFreqPosStream(ByteBlockPool& pool, int docid, int pos) : lastDoc(docid) , docFreq(1), lastDocCode(docid<<1), termFreq(1), lastPos(pos) {
+  DocFreqPosStream(MemPool& pool, int docid, int pos) : lastDoc(docid) , docFreq(1), lastDocCode(docid << 1), termFreq(1), lastPos(pos) {
     positions.writeVInt(pool, pos<<1);
   }
   DocFreqPosStream(const DocFreqPosStream&) = delete;
   DocFreqPosStream(DocFreqPosStream&&) = delete;
 
-  void writePos(ByteBlockPool& pool, int pos) {
+  void writePos(MemPool& pool, int pos) {
     int posCode = pos - lastPos;
     assert(posCode >= 0);
     // TODO: do we need to support duplicate positions for the same term for the same doc???  Would seem to make search code more complex.
@@ -150,7 +150,7 @@ public:
     lastPos = pos;
   }
 
-  void addDoc(ByteBlockPool& pool, int docid, int pos) { // TODO: add payload
+  void addDoc(MemPool& pool, int docid, int pos) { // TODO: add payload
     int delta = docid - lastDoc;
     if (delta == 0) {
       // same document
@@ -179,6 +179,7 @@ public:
 SOLUX_PACKED_END;
 
 
+/*** prototype code for reading back postings
 // TODO: make a PushPositionsIterator that you could template / inherit from / pass a lambda to.
 // It will call nextDoc() and nextPos() until exhaustion.  May be faster since we keep context?  coroutine generator
 // is another option, but may be slower and we might need to test for doc change instead of being told.
@@ -233,3 +234,4 @@ return 0; // nocommit
 
 };
 
+***/

@@ -35,7 +35,8 @@
 #include <tuple>
 #include <algorithm>
 #include <assert.h>
-#include "solux/solux_util.h"
+#include "solux_util.h"
+#include "MemPool.h"
 
 // Another string alternative could inline up to 7 byte strings in the pointer (or 15 bytes for something like a string_view)
 
@@ -45,11 +46,11 @@
 class StrRef {
   int64_t x;
 public:
-  static const unsigned SIZE_BITS=16;
-  static const unsigned MAX_SIZE=(1<<SIZE_BITS)-1;
+  static const uint32_t SIZE_BITS=16;
+  static const uint32_t MAX_SIZE=(1<<SIZE_BITS)-1;
 
-  static unsigned getMaxSize(unsigned size) { return size; }
-  static unsigned getExactSize(unsigned size) { return size; }
+  static uint32_t getMaxSize(uint32_t size) { return size; }
+  static uint32_t getExactSize(uint32_t size) { return size; }
 
   // returns the number of bytes written to the target
   static int write(char* target, const void* data, int sz) {
@@ -59,19 +60,24 @@ public:
 
   StrRef() {}
 
-  // TODO: a constructor that takes a ByteBlockPool?
+  // TODO: a constructor that takes a MemPool?
 
   // expert: should already point to an instance of this type
-  void init(void* data, unsigned size) {
+  void init(void* data, uint32_t size) {
     assert( (size & 0xffff0000)==0 );
     x = (reinterpret_cast<int64_t>(data) << SIZE_BITS) + size;
   }
 
   // expert: should already point to an instance of this type
-  StrRef(void* data, unsigned size) {
+  StrRef(void* data, uint32_t size) {
     init(data, size);
   }
-
+  StrRef(MemPool& target, const void* data, uint32_t len) {
+    assert( (len & 0xffff0000)==0 );
+    auto p = target.allocatePtr(len);
+    memcpy(p, data, len);
+    init(p, len);
+  }
 
 
   void* ptr() const {
@@ -82,7 +88,7 @@ public:
     return reinterpret_cast<void*>(x >> SIZE_BITS);
   }
 
-  unsigned size() const { return (uint16_t)x; }
+  uint32_t size() const { return (uint16_t)x; }
   bool operator==(const StrRef& other) const {
     return size() == other.size() && memcmp(ptr(), other.ptr(), size());
   }
@@ -121,9 +127,6 @@ public:
   }
 };
 
-// TODO:
-// Templatized StrStruct that also contains the value?
-
 
 
 // The length is part of the data (a one or 2 byte prefix, supporting sizes up to 32K)
@@ -133,25 +136,11 @@ class PackedTerm {
   const char* ptr_;
 
 public:
-  static unsigned getMaxSize(unsigned size) { return size + 2; }
-  static unsigned getExactSize(unsigned size) { return ((size < 128) ? 1 : 2) + size; }
-
-  PackedTerm() {}
-
-  // expert: should already point to an instance of this type
-  void init(void* ptr, unsigned size) {
-    ptr_ = reinterpret_cast<const char*>(ptr);
-  }
-
-  // expert: should already point to an instance of this type
-  PackedTerm(void* ptr) : ptr_(reinterpret_cast<const char*>(ptr)) { }
-  PackedTerm(void* ptr, unsigned size) : ptr_(reinterpret_cast<const char*>(ptr)) { }
-
-  // expert: a pointer to the start of the data... not to the first byte of the string!
-  void* ptr() { return (void*)ptr_; }
+  static uint32_t getMaxSize(uint32_t size) { return size + 2; }
+  static uint32_t getExactSize(uint32_t size) { return ((size < 128) ? 1 : 2) + size; }
 
   // returns the number of bytes written to the target... either sz+1 or sz+2
-  static int write(char* target, const void* data, int sz) {
+  inline static int write(char* target, const void* data, int sz) {
     int sizeBytes;
     if (sz<128) {
       target[0] = (char)sz;
@@ -164,6 +153,41 @@ public:
     memcpy(target+sizeBytes, data, (size_t)sz);
     return sz + sizeBytes;
   }
+  inline static const char* write(MemPool& targetPool, const void* data, uint32_t sz) {
+    auto totalSz = getExactSize(sz);
+    auto target = targetPool.allocatePtr(totalSz);
+    write(target, data, sz);
+    return target;
+  }
+
+  // this version seemed a little faster for clang, but not for g++
+  inline static const char* write2(MemPool& targetPool, const void* data, uint32_t sz) {
+    targetPool.ensure(getMaxSize(sz));
+    auto target = targetPool.ptr();
+    auto sizeOut = write(target, data, sz);
+    targetPool.pos_ += sizeOut;
+    return target;
+  }
+
+
+  PackedTerm() {}
+  PackedTerm(MemPool& target, const void* data, uint32_t len) {
+    ptr_ = write(target, data, len);
+  }
+
+  // expert: should already point to an instance of this type
+  void init(void* ptr, uint32_t size) {
+    ptr_ = reinterpret_cast<const char*>(ptr);
+  }
+
+  // expert: should already point to an instance of this type
+  PackedTerm(void* ptr) : ptr_(reinterpret_cast<const char*>(ptr)) { }
+  PackedTerm(void* ptr, uint32_t size) : ptr_(reinterpret_cast<const char*>(ptr)) { }
+
+  // expert: a pointer to the start of the data... not to the first byte of the string!
+  void* ptr() { return (void*)ptr_; }
+
+
 
 // TODO: do this in a more standard way
   uint64_t hashcode() const {
@@ -275,6 +299,7 @@ public:
 };
 
 
+
 namespace std
 {
   template<>
@@ -367,3 +392,8 @@ public:
   // and only copy if the string can't be inlined (isLocal==true).
 
 };
+
+
+
+// the general implementation to use for a non-owning Term reference.
+using TermRef = PackedTerm;

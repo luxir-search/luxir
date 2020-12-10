@@ -1,6 +1,6 @@
 #pragma once
 
-#include "index/ByteBlockPool.h"
+#include "solux/util/MemPool.h"
 #include <functional>
 #include "boost/iterator/filter_iterator.hpp"
 
@@ -21,18 +21,18 @@
 
 
 template <class V>
-class StrValRef : public ByteBlockPool::Str
+class TermValRef : public TermRef
 {
 private:
 
 public:
-  static unsigned getMaxSize(unsigned strBytes) { return ByteBlockPool::Str::getMaxSize(strBytes) + sizeof(V); }
-  static unsigned getExactSize(unsigned strBytes) { return ByteBlockPool::Str::getExactSize(strBytes) + sizeof(V); }
+  static unsigned getMaxSize(unsigned strBytes) { return TermRef::getMaxSize(strBytes) + sizeof(V); }
+  static unsigned getExactSize(unsigned strBytes) { return TermRef::getExactSize(strBytes) + sizeof(V); }
 
   // Expert!
   // create a reference to a ValKey pair that already exists in memory.
   // ptr/len refer to the string portion that directly follows the value.
-  StrValRef(void* ptr, unsigned len) : ByteBlockPool::Str(ptr, len) {}
+  TermValRef(void* ptr, unsigned len) : TermRef(ptr, len) {}
 
   V* valPtr() {
     // return const_cast<V*>( reinterpret_cast<const V*>( (const char*)ptr() - sizeof(V) ) );
@@ -42,23 +42,23 @@ public:
   V& val() { return *valPtr(); }
 
   template <typename... Args>
-  static StrValRef create(ByteBlockPool& pool, const char* str, unsigned len, Args&&... args) {
+  static TermValRef create(MemPool& pool, const char* str, unsigned len, Args&&... args) {
     pool.align(); // Cost=~4 bytes per unique term
     auto target = pool.allocatePtr( getExactSize(len) );
     new (target) V(std::forward<Args>(args)...);    // construct the value
     auto strStart = target + sizeof(V);
-    ByteBlockPool::Str::write(strStart, str, len);  // copy the string following the value
-    return StrValRef(strStart, len);                // the pointer to *this* compound value is the same as the string, and hence we can thus inherit from the string
+    TermRef::write(strStart, str, len);  // copy the string following the value
+    return TermValRef(strStart, len);                // the pointer to *this* compound value is the same as the string, and hence we can thus inherit from the string
   }
 
   template <typename... Args>
-  StrValRef (ByteBlockPool& pool, const char* str, unsigned len, Args&&... args) {
+  TermValRef (MemPool& pool, const char* str, unsigned len, Args&&... args) {
     pool.align(); // Cost=~4 bytes per unique term
     auto target = pool.allocatePtr( getExactSize(len) );
     new (target) V(std::forward<Args>(args)...);    // construct the value
     auto strStart = target + sizeof(V);
-    ByteBlockPool::Str::write(strStart, str, len);  // copy the string following the value
-    init(strStart, len);
+    TermRef::write(strStart, str, len);  // copy the string following the value
+    init(strStart, len); // this is like a private constructor for the string part.
   }
 };
 
@@ -75,9 +75,9 @@ public:
 
 
 template <class T>
-class StrValHash {
+class TermValHash {
 private:
-  StrValHash(const StrValHash&) = delete;
+  TermValHash(const TermValHash&) = delete;
 
   void newTable(unsigned newSize);
   void rehash();
@@ -85,20 +85,20 @@ private:
 
 public:
   typedef T value_type;
-  typedef StrValRef<T> entry_type; // should normally be the size of a single pointer
+  typedef TermValRef<T> entry_type; // should normally be the size of a single pointer
   typedef entry_type* iterator;
 
   entry_type* table_;
-  ByteBlockPool& pool_;
+  MemPool& pool_;
   int elements_ = 0;   // how many slots used
   int capacity_;       // how many slots may be used before rehashing
   unsigned tableSize_; // size of the hash table, always a power of two
 
-  StrValHash(ByteBlockPool &pool, unsigned initialSizePowerOfTwo) : pool_(pool) {
+  TermValHash(MemPool &pool, unsigned initialSizePowerOfTwo) : pool_(pool) {
     newTable(initialSizePowerOfTwo);
   }
 
-  ~StrValHash();
+  ~TermValHash();
 
   size_t size() { return (size_t)elements_; }
 
@@ -151,7 +151,7 @@ public:
         elements_++;
         char* valptr = pool_.allocatePtr( entry_type::getExactSize(sz) );
         char* keyPtr = valptr + sizeof(value_type);
-        ByteBlockPool::Str::write(keyPtr, ptr, sz);
+        TermRef::write(keyPtr, ptr, sz);
         new (&v) entry_type(keyPtr, sz);
         return std::make_tuple(v, true);
       } else if (v.equals(ptr, sz)) {
@@ -177,7 +177,7 @@ public:
               char* valptr = pool_.allocatePtr( entry_type::getExactSize(sz) );
               char* keyPtr = valptr + sizeof(value_type);
               new (valptr) T(std::forward<Args>(args)...);  // construct the T value
-              ByteBlockPool::Str::write(keyPtr, ptr, sz);      // write the string key directly after the value
+              TermRef::write(keyPtr, ptr, sz);      // write the string key directly after the value
               new (&v) entry_type(keyPtr, sz);                 // construct or hash entry
               return {v, true};
           } else if (v.equals(ptr, sz)) {
@@ -226,7 +226,7 @@ public:
         elements_++;
         char* valptr = pool_.allocatePtr( entry_type::getExactSize(sz) );
         char* keyPtr = valptr + sizeof(value_type);
-        ByteBlockPool::Str::write(keyPtr, ptr, sz);
+        TermRef::write(keyPtr, ptr, sz);
         new (&v) entry_type(keyPtr, sz);
         init(reinterpret_cast<value_type*>(valptr));
         return;
@@ -252,7 +252,7 @@ public:
         elements_++;
         char* valptr = pool_.allocatePtr( entry_type::getExactSize(sz) );
         char* keyPtr = valptr + sizeof(value_type);
-        ByteBlockPool::Str::write(keyPtr, ptr, sz);
+        TermRef::write(keyPtr, ptr, sz);
         new (&v) entry_type(keyPtr, sz);
         init(reinterpret_cast<value_type*>(valptr));
         return;
@@ -268,11 +268,11 @@ public:
   // FUTURE: try robinhood hashing?
 };
 
-template <class T> void StrValHash<T>::newTable(unsigned newSize) {
+template <class T> void TermValHash<T>::newTable(unsigned newSize) {
   assert(newSize>0 && isPowerOfTwo(newSize));
 
   // this was often twice as fast in some cases - zeroing is not as well optimized for some types it seems
-  table_ = reinterpret_cast<StrValHash<T>::entry_type *>( new char[newSize * sizeof(StrValHash<T>::entry_type)]() );
+  table_ = reinterpret_cast<TermValHash<T>::entry_type *>( new char[newSize * sizeof(TermValHash<T>::entry_type)]() );
   capacity_ = newSize - (newSize >> 2);  // .75 load factor
   // capacity_ = newSize - (newSize >> 1);  // .5 load factor
   // capacity_ = newSize - (newSize >> 2) - (newSize >> 3);  // .625 load factor
@@ -280,7 +280,7 @@ template <class T> void StrValHash<T>::newTable(unsigned newSize) {
 }
 
 
-template <class T> void StrValHash<T>::rehash() {
+template <class T> void TermValHash<T>::rehash() {
   auto oldTable = table_;
   auto oldTableSize = tableSize_;
   newTable(tableSize_ << 1);
@@ -305,6 +305,6 @@ template <class T> void StrValHash<T>::rehash() {
   delete [] reinterpret_cast<char*>(oldTable);
 }
 
-template <class T> StrValHash<T>::~StrValHash() {
+template <class T> TermValHash<T>::~TermValHash() {
   delete [] reinterpret_cast<char*>(table_);
 }

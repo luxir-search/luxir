@@ -2,10 +2,10 @@
 
 #include <unordered_map>
 #include <unordered_set>
-#include "ByteBlockPool.h"
+#include "solux/util/MemPool.h"
 #include "solux/FieldType.h"
-#include "solux/BytesRefHash.h"
-#include "solux/StrValHash.h"
+#include "solux/util/TermHash.h"
+#include "solux/util/TermValHash.h"
 #include "DocStream.h"
 
 class Inverter;
@@ -14,13 +14,13 @@ class Inverter;
 
 /***
 Minimum needed to index a single term position:
-   StrValHash (one per field)
+   TermValHash (one per field)
      used to lookup DocStream for the term
-   ByteBlockPool
+   MemPool
      where memory comes from
    Given: docid, position
 
-Inverter has the mapping of field to StrValHash (currently encapsulated in SegFieldIndexed)
+Inverter has the mapping of field to TermValHash (currently encapsulated in SegFieldIndexed)
 
 
 Minimum needed to index a field value:
@@ -61,9 +61,9 @@ public:
   // flush at the same time to release the pool though.
   // Either that, or completely finish indexing (i.e. flush a segment) for each tenant
   // every time you get a batch of docs.  Then we could wind back the pool for each different tenant batch.
-  ByteBlockPool pool_;
+  MemPool pool_;
 
-  // TODO: if our hashes are faster, use a StrValHash to do the mapping from string to
+  // TODO: if our hashes are faster, use a TermValHash to do the mapping from string to
   // field.  Need to handle variable size though... (packing string first, then value would
   // eliminate the need to know the size.)  But destructors are off the list if we use BBP.
   // Still, we should switch to a monotonic allocator for this since we will never need to
@@ -75,7 +75,7 @@ public:
   int currDoc_ = -1;  // the current document being indexed
 
 
-  // TODO: normal map, or BytesRefHash for field names?
+  // TODO: normal map, or TermHash for field names?
 
   // when does FieldType get looked up?
   // ability to reuse FieldType

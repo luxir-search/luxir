@@ -2,7 +2,7 @@ include_directories(${gtest_SOURCE_DIR}/include ${gtest_SOURCE_DIR})
 
 add_executable(runBasicTests
         basic_test.cpp
-        StrValHash_test.cpp
+        TermValHash_test.cpp
         Stream_test.cpp
         PostingsWriter_test.cpp
         simd_test.cpp

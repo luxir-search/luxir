@@ -2,7 +2,8 @@
 
 #include <cstdint>
 #include <iostream>
-#include "solux/index/ByteBlockPool.h"
+#include "solux/util/solux_util.h"
+#include "solux/util/MemPool.h"
 
 
 class StreamReader;
@@ -85,10 +86,10 @@ public:
     return *this;
   }
 
-  const char* ptr(const ByteBlockPool& pool) const { return ptr_; }
-  int size(const ByteBlockPool& pool) const { return allocatedSz_ - left_; }
-  int left(const ByteBlockPool& pool) const { return left_; }
-  const char* start(const ByteBlockPool& pool) const {
+  const char* ptr(const MemPool& pool) const { return ptr_; }
+  int size(const MemPool& pool) const { return allocatedSz_ - left_; }
+  int left(const MemPool& pool) const { return left_; }
+  const char* start(const MemPool& pool) const {
     if (allocatedSz_ == FIRST_LEVEL_SIZE) {
       return reinterpret_cast<const char*>(&bbStart_);
     } else {
@@ -97,19 +98,19 @@ public:
   }
 
   /** Pointer to previously written byte.  Only valid if a byte as been previously written. */
-  char* prevPtr(ByteBlockPool& pool) {
+  char* prevPtr(MemPool& pool) {
     assert(size(pool) > 0);
     return ptr_ - 1;
   }
 
-  void writeByte(ByteBlockPool& pool, uint8_t val) {
+  void writeByte(MemPool& pool, uint8_t val) {
     if (left_ == 0) {
       // pull this out into a function?
       sliceSz_ = nextSliceSize(sliceSz_);
       int blockAddr = pool.allocate(sliceSz_);
 
       char* newPointer = pool.ptr(blockAddr);  // TODO: what about a version that returns pointer and the block address
-      assert( newPointer - pool.buffer_ + sliceSz_ <= ByteBlockPool::BYTE_BLOCK_SIZE );
+      assert( newPointer - pool.buffer_ + sliceSz_ <= MemPool::BYTE_BLOCK_SIZE );
       // move last 4 bytes to new area... we do this in one chunk using an integer.
       // this works for both both little endian and big endian since we're only moving.
       int* lastWord = reinterpret_cast<int*>(ptr_ - 4);
@@ -133,7 +134,7 @@ public:
 
   // TODO: an optimized version for when we have >= 5 bytes available?
   // TODO: convert to unsigned and do checks elsewhere?
-  void writeVInt(ByteBlockPool& pool, int val) {
+  void writeVInt(MemPool& pool, int val) {
     assert(val >= 0);
     auto v = (unsigned)val;
     while ((v & ~0x7F) != 0) {
@@ -144,7 +145,7 @@ public:
   }
 
   // This version may be be slower... but it might help inlining with only a single call to writeByte (need to test)
-  void writeVInt2(ByteBlockPool& pool, int val) {
+  void writeVInt2(MemPool& pool, int val) {
     assert(val >= 0);
     auto v = (unsigned)val;
     for(;;) {
@@ -157,9 +158,9 @@ public:
 
 
   // TODO: some sort of adapter that will specify the pool for us?
-  StreamReader begin(const ByteBlockPool& pool) const;
-  // const StreamReader& end(const ByteBlockPool& pool) const;
-  END end(const ByteBlockPool& pool) const { return END(); }
+  StreamReader begin(const MemPool& pool) const;
+  // const StreamReader& end(const MemPool& pool) const;
+  END end(const MemPool& pool) const { return END(); }
 
 } 
 SOLUX_PACKED_END;
@@ -171,7 +172,7 @@ SOLUX_PACKED_END;
 // TODO: Stream could also be cast as an output iterator??
 class StreamReader {
   const char* ptr_; // if ptr_ is null, all other members may be invalid!
-  const ByteBlockPool& pool_;
+  const MemPool& pool_;
   int remaining_;   // number of data bytes left to consume in the full stream
   uint8_t remainingInSlice_;
   uint8_t sliceSize_;
@@ -187,7 +188,7 @@ public:
 
   // TODO: try a static push reader that accepts a template/lambda
 
-  StreamReader(const Stream& source, const ByteBlockPool& pool) : pool_(pool) {
+  StreamReader(const Stream& source, const MemPool& pool) : pool_(pool) {
     remaining_ = source.size(pool_);
 
     // position ptr on first character, or null if none
@@ -269,7 +270,7 @@ public:
 };
 
 
-inline StreamReader Stream::begin(const ByteBlockPool& pool) const {
+inline StreamReader Stream::begin(const MemPool& pool) const {
   return StreamReader(*this, pool);
 }
 

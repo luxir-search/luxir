@@ -11,7 +11,7 @@ using namespace std;
 
 // Write a bunch of random bytes and then ensure we can read them back verbatim.
 // A PNRG with a known seed is perfect to test this w/o having to store the whole sequence.
-void testStream(ByteBlockPool& pool, int nbytes, int startVal) {
+void testStream(MemPool& pool, int nbytes, int startVal) {
   Stream stream;
   if (startVal==0) startVal=1;
 
@@ -51,7 +51,7 @@ TEST(stream_test, test_basic) {
   // Simplest code possible to try and tease out any optimization issue arising over strict aliasing violation (see bbStart_ in Stream).
   // This code should be tested with maximum optimization flags.
   //
-  ByteBlockPool pool;
+  MemPool pool;
   Stream stream;
 
   stream.writeByte(pool, 1);
@@ -83,11 +83,11 @@ TEST(stream_test, test_basic) {
 }
 
 TEST(stream_test, rand_stream) {
-  int maxlen = ByteBlockPool::BYTE_BLOCK_SIZE*2;
+  int maxlen = MemPool::BYTE_BLOCK_SIZE * 2;
   int iter=1000;
   int minBytesToWrite = 1000000;
 
-  ByteBlockPool pool;
+  MemPool pool;
   for (int i=0; i<iter || pool.size() <= minBytesToWrite; i++) {
     // test many small, but some big.
     int slen = rint(20);   // TODO: repeatable seeds in random number generators

@@ -2,7 +2,7 @@
 #include "index/SegField.h"
 #include "FieldType.h"
 
-SegFieldIndexed* FieldType::createSegFieldIndexed(ByteBlockPool& pool) {
+SegFieldIndexed* FieldType::createSegFieldIndexed(MemPool& pool) {
   if (flags_ & INDEX_DOCS_AND_FREQS_AND_POSITIONS) {
     return new SegFieldDocsFreqPos(*this, pool);
   }

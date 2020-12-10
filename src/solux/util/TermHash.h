@@ -1,10 +1,11 @@
 #pragma once
 
-#include "index/ByteBlockPool.h"
+#include "solux/util/MemPool.h"
+#include "solux/util/StrRef.h"
 
 // TODO: look at rapidjson to figure out the lowest impedance mismatch to go from json->document?
 // TODO: try something like an existing dense hash map in comparison?
-// TODO: store T (SegmentTerm for instance) right next to the term in the ByteBlockPool!
+// TODO: store T (SegmentTerm for instance) right next to the term in the MemPool!
 // - Only advantage is on a resize... SegmentTerm would not need to be copied?
 // OPT: store first few term bytes next to pointer in the table? (faster sorting) store hash right next to pointer? (faster table resize)
 
@@ -15,25 +16,25 @@
 // Or make Str constructors take a BBPool so we can use try_emplace?
 
 template <class T>
-class BytesRefHash {
+class TermHash {
   void newTable(unsigned newSize);
 
 public:
   typedef T value_type;
-  typedef std::pair<ByteBlockPool::Str, T> composite_type;
+  typedef std::pair<TermRef, T> composite_type;
 
   composite_type * table_;
-  ByteBlockPool& pool_;
+  MemPool& pool_;
   int elements_ = 0;   // how many slots used
   int capacity_;       // how many slots may be used
   int mask_;           // mask for power-of-two hash
-  unsigned tableSize_;  // size of the hash table, always a power of two
+  unsigned tableSize_; // size of the hash table, always a power of two
 
-  BytesRefHash(ByteBlockPool &pool, unsigned initialSizePowerOfTwo) : pool_(pool) {
+  TermHash(MemPool &pool, unsigned initialSizePowerOfTwo) : pool_(pool) {
     newTable(initialSizePowerOfTwo);
   }
 
-  ~BytesRefHash();
+  ~TermHash();
 
   int size() { return elements_; }
 
@@ -53,7 +54,7 @@ public:
   void rehash();
 
   // Returns a pointer to the current slot or adds a new slot.
-  // A Rehash will move the slot, so do not use the pointer after other BytesRefHash operations.
+  // A Rehash will move the slot, so do not use the pointer after other TermHash operations.
   // TODO: should we return V& instead like []
   composite_type& lookupOrAdd(const char* ptr, int sz) {
     if (elements_ >= capacity_) {
@@ -68,7 +69,8 @@ public:
         elements_++;
         // unsigned char* dest = pool_.writeStr((const unsigned char*)ptr, sz);
         // v.first = reinterpret_cast<PackedTerm&>(dest);
-        v.first = pool_.writeStr((const unsigned char*)ptr, sz);
+        // v.first = pool_.writeStr((const unsigned char*)ptr, sz);
+        v.first = TermRef(pool_, ptr, sz);
         new(&v.second) T();  // invoke default constructor?
         return v;
       } else if (v.first.equals(ptr, sz)) {
@@ -92,7 +94,7 @@ public:
         elements_++;
         // unsigned char* dest = pool_.writeStr((const unsigned char*)ptr, sz);
         // v.first = reinterpret_cast<PackedTerm&>(dest);
-        v.first = pool_.writeStr((const unsigned char*)ptr, sz);
+        v.first = TermRef(pool_, ptr, sz);
         createFunctor(v);
         return v;
       } else if (v.first.equals(ptr, sz)) {
@@ -116,11 +118,11 @@ public:
 
 };
 
-template <class T> void BytesRefHash<T>::newTable(unsigned newSize) {
+template <class T> void TermHash<T>::newTable(unsigned newSize) {
   assert(newSize>0 && isPowerOfTwo(newSize));
 
   // this was often twice as fast in some cases - zeroing is not as well optimized it seems
-  table_ = reinterpret_cast<BytesRefHash<T>::composite_type *>( new char[newSize * sizeof(BytesRefHash<T>::composite_type)]() );
+  table_ = reinterpret_cast<TermHash<T>::composite_type *>( new char[newSize * sizeof(TermHash<T>::composite_type)]() );
   capacity_ = newSize - (newSize >> 2);  // .75 load factor
   // capacity_ = newSize - (newSize >> 1);  // .5 load factor
   // capacity_ = newSize - (newSize >> 2) - (newSize >> 3);  // .625 load factor
@@ -130,7 +132,7 @@ template <class T> void BytesRefHash<T>::newTable(unsigned newSize) {
 }
 
 
-template <class T> void BytesRefHash<T>::rehash() {
+template <class T> void TermHash<T>::rehash() {
   auto oldTable = table_;
   auto oldTableSize = tableSize_;
   newTable(tableSize_ << 1);
@@ -156,7 +158,7 @@ template <class T> void BytesRefHash<T>::rehash() {
   delete [] reinterpret_cast<char*>(oldTable);
 }
 
-template <class T> BytesRefHash<T>::~BytesRefHash() {
+template <class T> TermHash<T>::~TermHash() {
   delete [] reinterpret_cast<char*>(table_);
 }
 

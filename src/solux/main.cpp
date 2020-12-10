@@ -4,10 +4,10 @@
 #include <algorithm>
 #include <ranges>
 #include "index/SegField.h"
-#include "index/ByteBlockPool.h"
-#include "BytesRefHash.h"
+#include "solux/util/MemPool.h"
+#include "solux/util/TermHash.h"
 // #include "rapidjson/document.h"
-#include "solux_util.h"
+#include "solux/util/solux_util.h"
 #include "index/Inverter.h"
 #include "analysis/Analyzer.h"
 
@@ -172,21 +172,6 @@ void testjson() {
 }
 **/
 
-// TODO: move all this benchmarking stuff to google benchmark
-
-int teststuff() {
-  ByteBlockPool pool;
-  pool.nextBuffer();  // TODO: do this in constructor?
-  BytesRefHash<int> tbl(pool, 16);
-
-
-  auto str = pool.writeStr((const unsigned char*)"hello", 5);
-
-  cout << " str=" << str << endl;
-
-  return 0;
-}
-
 
 void checkzero(void* ptr, size_t sz) {
   char* p = (char*)ptr;
@@ -201,7 +186,7 @@ void checkzero(void* ptr, size_t sz) {
 
 
 // hmmm, it's not my class causing the slowdown... is it pair<>?
-// typedef BytesRefHash<char*>::value_type ttt;
+// typedef TermHash<char*>::value_type ttt;
 // typedef pair<const char*,const char*> ttt;
 
 // this is just as slow as pair<>
@@ -213,10 +198,10 @@ public:
 
 
 void checkInit(int sz) {
-  ByteBlockPool pool;
-  BytesRefHash<char*> tbl(pool, 16);
+  MemPool pool;
+  TermHash<char*> tbl(pool, 16);
 
-  typedef BytesRefHash<int>::composite_type ttt;
+  typedef TermHash<int>::composite_type ttt;
   // ttt* x = new ttt[sz]();
   ttt* x = new ttt[sz];
   auto memsz = sz * sizeof(ttt);
@@ -293,10 +278,10 @@ int timing2a(int sz) {
 
 
 void testPool() {
-  ByteBlockPool pool;
-  BytesRefHash<int> tbl(pool, 4);
+  MemPool pool;
+  TermHash<int> tbl(pool, 4);
 
-  typedef BytesRefHash<int>::composite_type entry_type;
+  typedef TermHash<int>::composite_type entry_type;
 
   entry_type* entry = &tbl.lookupOrAdd("hello",5);
   // assert(entry->first.isNull());
@@ -339,14 +324,14 @@ inline valtype newval(int i) {
 }
 
 
-// BytesRefHash roughly 3 times as fast...
+// TermHash roughly 3 times as fast...
 int64_t timePool(int iteration) {
   uint64_t ret = 0;
 
-  ByteBlockPool pool;
-  BytesRefHash<valtype> tbl(pool, 4);
-  // BytesRefHash<uint64_t> tbl(pool, 1<<21);
-  typedef BytesRefHash<valtype>::composite_type entry_type;
+  MemPool pool;
+  TermHash<valtype> tbl(pool, 4);
+  // TermHash<uint64_t> tbl(pool, 1<<21);
+  typedef TermHash<valtype>::composite_type entry_type;
 
   unordered_map<std::string, valtype> umap(4);
 
@@ -407,7 +392,7 @@ int main2() {
   cout << "Hello, World!" << endl;
 
 
-  ByteBlockPool pool;
+  MemPool pool;
   cout << pool.BYTE_BLOCK_SIZE << endl;
 
   cout << sizeof(aaa) << " " << sizeof(bbb) << " sizeof_tuple=" << sizeof( tuple<int64_t,int> ) << endl;
