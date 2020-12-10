@@ -7,9 +7,10 @@
 #include <sstream>
 #include <unordered_map>
 #include <vector>
-#include "simdcomp/include/codecfactory.h"
 #include "ByteBlockPool.h"
-#include "OutputStream.h"
+#include "solux/store/OutputStream.h"
+#include "solux/store/Directory.h"
+#include "simdcomp/include/codecfactory.h"
 
 /**
  * The high level strategy is to write the lowest levels first since higher level information needs/points to that info.
@@ -131,6 +132,10 @@
 
 
 class PostingsWriter {
+  Directory& directory;
+  std::string generation;
+
+
 public:
 
   static constexpr uint32_t TERMS_BLOCK_SIZE = 128;
@@ -164,16 +169,15 @@ public:
   int32_t lastDoc;
   int32_t lastPos;
 
-  std::unique_ptr<OutputStream> tindexOutput;  // output stream for terms index
-  std::unique_ptr<OutputStream> termOutput;  // output stream for termFile
-  std::unique_ptr<OutputStream> docOutput;  // output stream for docFile
-  std::unique_ptr<OutputStream> posOutput;  // output stream for posFile
+  OutputStream tindexOutput;  // output stream for terms index
+  OutputStream termOutput;    // output stream for termFile
+  OutputStream docOutput;     // output stream for docFile
+  OutputStream posOutput;     // output stream for posFile
 
-  // TODO: if these files were only used for writing, then we wouldn't need shared_ptr to them? Only one should exist at any point in time.
-  std::shared_ptr<File> tindexFile; // terms for each field
-  std::shared_ptr<File> termFile; // terms for each field
-  std::shared_ptr<File> docFile; // documents for each term
-  std::shared_ptr<File> posFile; // positions for each term
+  std::unique_ptr<File> tindexFile; // terms for each field
+  std::unique_ptr<File> termFile; // terms for each field
+  std::unique_ptr<File> docFile; // documents for each term
+  std::unique_ptr<File> posFile; // positions for each term
 
   // needed to build each block
   std::vector<ByteBlockPool::Str> termList;  // list of terms in the current term block
@@ -230,40 +234,32 @@ private:  // some internal utility methods... not for use by indexers
 
   // the size the docfile takes
   uint32_t getDocFileSize() const {
-    auto sz = docOutput->size() - offsetOfDocsForTerm;
+    auto sz = docOutput.size() - offsetOfDocsForTerm;
     assert(sz <= UINT_MAX);
     return sz;
   }
 
 public:
-  PostingsWriter()
+  PostingsWriter(Directory& dir, const std::string& gen) : directory(dir), generation(gen)
   {
-    // Temporary... these should be presumably passed in, or
-    // a directory/factory to make files since the PostingsWriter is the one that knows what needs to be created.
+    // TODO: defer file creation until needed, *or* use a RAMDelegatingFile that does so.
+    // that does so.
+    tindexFile = directory.createFile("tindex");  // TODO: temporary names just for now...
+    termFile   = directory.createFile("term");
+    docFile    = directory.createFile("doc");
+    posFile    = directory.createFile("pos");
 
-    // TODO: make filenames naturally sortable... prefix with the number of digits following.
-    // Extensions won't mess up this scheme since even if the "." is included in the sort, ord(".") < ord("0")
-    // Also prefix with an "s" for solux?   s10 s11 s12 .. s1z .. s210 s211 s2
-    // Multiple indexes in the same directory with a custom prefix (or prefix with the index name?)
-    // For the segments file... perhaps name it s_<version> since _ is between A and a (use caps for base36 and then the segments file will be last)
-    // Although I think we should have a cfs format that packs *everything* into a single file.
-    // Maybe name an all-in-one cfs the same as the segments file, so we only have to look at single files.
-    // TODO: what about different document types / tables?  Essentially mini indexes.
-    // What about multiple shards in a single directory?  Just have efficient dirs and have multiple dirs instead?
-    // How about setting overrides in a directory? Like number of partitions?  Seems like that should be at a higher / pluggable level.
+    tindexOutput.setFile(tindexFile.get());
+    termOutput.setFile(termFile.get());
+    docOutput.setFile(docFile.get());
+    posOutput.setFile(posFile.get());
+  }
 
-    // That would mess up the option to sync all files and then write a segments file, but many file systems don't need that.
-    // We should have a flexible enough container format to be able to include or pull out whatever files we want.
-
-    tindexFile = std::make_shared<RAMFile>();
-    termFile = std::make_shared<RAMFile>();
-    docFile = std::make_shared<RAMFile>();
-    posFile = std::make_shared<RAMFile>();
-
-    tindexOutput = std::make_unique<OutputStream>(*termFile);
-    termOutput = std::make_unique<OutputStream>(*termFile);
-    docOutput = std::make_unique<OutputStream>(*docFile);
-    posOutput = std::make_unique<OutputStream>(*posFile);
+  void finish() {
+    directory.finishFile(*tindexFile);
+    directory.finishFile(*termFile);
+    directory.finishFile(*docFile);
+    directory.finishFile(*posFile);
   }
 
 
@@ -284,7 +280,7 @@ public:
     posCodec.encodeArray(reinterpret_cast<uint32_t *>(posdeltas.data()), posdeltas.size(), compressed_output.data(),
                          compressedSize);
 
-    posOutput->write(compressed_output.data(), compressedSize);
+    posOutput.write(compressed_output.data(), compressedSize);
 
     positionsFlushed += posdeltas.size();
     posdeltas.resize(0);
@@ -307,7 +303,7 @@ public:
     size_t compressedSize = compressed_output.size(); // this gets changed to the actual size
     docCodec.encodeArray(reinterpret_cast<uint32_t *>(docs.data()), docs.size(), compressed_output.data(),
                       compressedSize);
-    docOutput->write(compressed_output.data(), compressedSize);
+    docOutput.write(compressed_output.data(), compressedSize);
     docsFlushed += docs.size();
     docs.resize(0);
 
@@ -318,7 +314,7 @@ public:
     compressedSize = compressed_output.size(); // this gets changed to the actual size
     tfreqCodec.encodeArray(reinterpret_cast<uint32_t *>(docs.data()), docs.size(), compressed_output.data(),
                            compressedSize);
-    docOutput->write(compressed_output.data(), compressedSize);
+    docOutput.write(compressed_output.data(), compressedSize);
 
     // TODO: add data (or keep track of blocks) for docs skip list
   }
@@ -336,10 +332,10 @@ public:
       docFileSize.resize(0);
       pulsedDoc.resize(0);
       pulsedPos.resize(0);
-      offsetOfPositionsForTermBlock = posOutput->size() - fieldInfo.posOffset;
-      offsetOfDocsForTermBlock = docOutput->size() - fieldInfo.docsOffset;
+      offsetOfPositionsForTermBlock = posOutput.size() - fieldInfo.posOffset;
+      offsetOfDocsForTermBlock = docOutput.size() - fieldInfo.docsOffset;
     }
-    offsetOfTermBlock = termOutput->size() - fieldInfo.termsOffset;
+    offsetOfTermBlock = termOutput.size() - fieldInfo.termsOffset;
 
 
     fieldInfo.termBlockOffsets.push_back(offsetOfTermBlock);
@@ -359,9 +355,9 @@ public:
     auto [refdata, reflen] = reference.unpack();
 
     // Write the terms block header.
-    termOutput->writeStr(refdata, reflen);
-    termOutput->writeVlong(offsetOfDocsForTermBlock);  // TODO: make these relative to field
-    termOutput->writeVlong(offsetOfPositionsForTermBlock);
+    termOutput.writeStr(refdata, reflen);
+    termOutput.writeVlong(offsetOfDocsForTermBlock);  // TODO: make these relative to field
+    termOutput.writeVlong(offsetOfPositionsForTermBlock);
 
 
 
@@ -389,16 +385,16 @@ public:
         auto suffixLen = tlen - prefixLen;
         auto prefCode = (prefixLen < 7) ? (prefixLen << 5u) : (7u << 5u);
         auto suffCode = (suffixLen < 32) ? (suffixLen - 1) : (32 - 1);
-        termOutput->write((char) (prefCode | suffCode));
+        termOutput.write((char) (prefCode | suffCode));
         if (prefixLen >= 7) {
-          termOutput->write((char) prefixLen);
+          termOutput.write((char) prefixLen);
         }
         if (suffixLen >= 32) {
-          termOutput->writeVint(suffixLen - 32);
+          termOutput.writeVint(suffixLen - 32);
         }
 
         // now write the suffix of the current term
-        termOutput->write(tdata + prefixLen, suffixLen);
+        termOutput.write(tdata + prefixLen, suffixLen);
       }
 
       // Write the term metadata that belongs in the term dictionary.
@@ -421,11 +417,11 @@ public:
         // in a separate block... but we really want primary key lookup to be fast!
         // We could also find something else to encode and always group encode 2 integers (like term freq)
         // We could make the term freq or doc even if it's real or odd if it's a pulsed position.
-        termOutput->write(0);
-        termOutput->writeVint(doc);  // for now, just write vints (slower to skip though)
-        termOutput->writeVint(pos);
+        termOutput.write(0);
+        termOutput.writeVint(doc);  // for now, just write vints (slower to skip though)
+        termOutput.writeVint(pos);
       } else {
-        termOutput->writeVint(docsSize);
+        termOutput.writeVint(docsSize);
       }
     }
 
@@ -441,8 +437,8 @@ public:
     termList.push_back(term);  // we don't really need the term name at this point (could add in endTerm), but it might be nice for debugging / exceptions?
     docsFlushed = 0;
     positionsFlushed = 0;
-    offsetOfPositionsForTerm = posOutput->size();
-    offsetOfDocsForTerm = docOutput->size();
+    offsetOfPositionsForTerm = posOutput.size();
+    offsetOfDocsForTerm = docOutput.size();
   }
 
   void endTerm(ByteBlockPool::Str term) {
@@ -459,7 +455,7 @@ public:
       //       Downside to this is that it could hurt block compression to mix terms (small + big deltas mixed)
       for (auto posDelta : posdeltas) {
         // TODO: try group varint
-        posOutput->writeVint(posDelta);
+        posOutput.writeVint(posDelta);
       }
 
       // Finish docs that were not block encoded.  In this case, we simply interleave docs and termfreqs
@@ -482,16 +478,16 @@ public:
         if (tfreq == 1) {
           doccode |= 1u;  // low bit==1 means tfreq==1.
         }
-        docOutput->writeVint(doccode);
+        docOutput.writeVint(doccode);
         if (tfreq != 1) {
-          docOutput->writeVint(tfreq);
+          docOutput.writeVint(tfreq);
         }
       }
 
       // The reader can find the start or end of a doc block from the terms dictionary (since blocks are all adjacent)
       // So we can store info at the end of the block as well (but need to encode backwards, or have a single byte metadata
       // length at the end to enable backing up.)
-      auto metadataStart = docOutput->size();
+      auto metadataStart = docOutput.size();
 
       auto docfreq = getDocFreq();
       auto ttfCode = totalTermFreq - docfreq;
@@ -499,12 +495,12 @@ public:
       auto posOffset = offsetOfPositionsForTerm - offsetOfPositionsForTermBlock;
 
       // TODO: encode as group, and can replace the metadataSize byte with the control byte.
-      docOutput->writeVint(docfreq);
-      docOutput->writeVlong(ttfCode);
-      docOutput->writeVlong(posOffset);
+      docOutput.writeVint(docfreq);
+      docOutput.writeVlong(ttfCode);
+      docOutput.writeVlong(posOffset);
 
-      auto metadataSize = docOutput->size() - metadataStart;
-      docOutput->write((char)metadataSize);
+      auto metadataSize = docOutput.size() - metadataStart;
+      docOutput.write((char)metadataSize);
       // TODO: generate/store skip index
 
       docFileSize.push_back(getDocFileSize());
@@ -517,9 +513,9 @@ public:
 
   void startField(const std::string& fieldName) {
     fieldInfo.fieldName = fieldName;
-    fieldInfo.termsOffset = termOutput->size();
-    fieldInfo.docsOffset = docOutput->size();
-    fieldInfo.posOffset = posOutput->size();
+    fieldInfo.termsOffset = termOutput.size();
+    fieldInfo.docsOffset = docOutput.size();
+    fieldInfo.posOffset = posOutput.size();
     fieldInfo.termBlockOffsets.resize(0);
 
     _startTermBlock(false);
@@ -529,15 +525,15 @@ public:
     // TODO: investigate inlining small fields in the terms index instead of pointing out to other files.
     // TODO: For many fields, the field index and the terms index should perhaps have the same structure (prefix compressed blocks?)
     flushTerms(true);
-    tindexOutput->writeStr(fieldName.c_str(), fieldName.size());  // TODO: use fieldNumbers, or don't use field identifier at all... another index should point to this?
-    tindexOutput->writeVlong(fieldInfo.termsOffset);
-    tindexOutput->writeVlong(fieldInfo.docsOffset);
-    tindexOutput->writeVlong(fieldInfo.posOffset);
-    tindexOutput->writeVint(fieldInfo.numTerms);
+    tindexOutput.writeStr(fieldName.c_str(), fieldName.size());  // TODO: use fieldNumbers, or don't use field identifier at all... another index should point to this?
+    tindexOutput.writeVlong(fieldInfo.termsOffset);
+    tindexOutput.writeVlong(fieldInfo.docsOffset);
+    tindexOutput.writeVlong(fieldInfo.posOffset);
+    tindexOutput.writeVint(fieldInfo.numTerms);
     // write index into the blocks of the terms dict
     // TODO: termBlockOffsets[0] is redundant with fieldInfo.termsOffset and we should be able to skip it (should always be 0)
     // TODO: use a more efficient encoding for this array
-    tindexOutput->write(&(fieldInfo.termBlockOffsets[0]), fieldInfo.termBlockOffsets.size() * sizeof(uint64_t) );
+    tindexOutput.write(&(fieldInfo.termBlockOffsets[0]), fieldInfo.termBlockOffsets.size() * sizeof(uint64_t) );
   }
 
   void startDoc(int32_t doc) {

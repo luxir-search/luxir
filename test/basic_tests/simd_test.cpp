@@ -2,6 +2,7 @@
 #include "gtest/gtest.h"
 #include <iostream>
 #include "simdcomp/include/codecfactory.h"
+#include "simdcomp/include/intersection.h"
 #include "test_util.h"
 
 using namespace std;
