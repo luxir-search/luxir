@@ -160,7 +160,7 @@ public:
 
   SegFieldDocsFreqPos(const FieldType &field, MemPool& pool) : SegFieldIndexed(field) , termsHash(pool, 4) { }
 
-  inline void indexSingleTerm(int docid, char* term, int len, int pos) {
+  inline void addPosition(int docid, char* term, int len, int pos) {
     auto [entry, inserted] = termsHash.try_emplace(term, len, termsHash.pool_, docid, pos);
     if (!inserted) {
       entry.val().addDoc(termsHash.pool_, docid, pos);
@@ -184,10 +184,11 @@ public:
       first = false;
       ++numTokens;
       pos += tok.positionIncrement;
-      int tokLen = tok.end - tok.ptr;  // todo: check overflow? (impossible if we start with "int" len?)
+      int tokLen = tok.end - tok.ptr;
 
 
-      indexSingleTerm(docid, tok.ptr, tokLen, pos);
+      addPosition(docid, tok.ptr, tokLen, pos);
+
       // TODO: benchmark these variants once we have a good benchmark suite
 
 

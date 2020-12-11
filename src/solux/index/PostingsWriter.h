@@ -208,10 +208,10 @@ public:
     uint64_t termsOffset;
     uint64_t docsOffset;
     uint64_t posOffset;
-    int numTerms;
     uint64_t sumDocFreq;
     uint64_t sumTotalTermFreq;
     std::vector<uint64_t> termBlockOffsets;  // offset from termsOffset (for this field) for each term block
+    int numTerms;  // currently only updated in flushTerms()
   };
   FieldInfo fieldInfo;
 
@@ -257,9 +257,13 @@ public:
   }
 
   void finish() {
+    tindexOutput.close();
     directory.finishFile(*tindexFile);
+    termOutput.close();
     directory.finishFile(*termFile);
+    docOutput.close();
     directory.finishFile(*docFile);
+    posOutput.close();
     directory.finishFile(*posFile);
   }
 
@@ -347,6 +351,8 @@ public:
       return;
     }
 
+    fieldInfo.numTerms += termList.size();
+
     // TODO: find common prefix (i.e. min_prefix_len) for all terms in block and strip it off (same as common prefix of first and last)
     // important for some things that share long prefixes, like URLs for example.
     // TODO: store min term size (or minimum suffix length) and then code the suffix lengths as additional to that? Would help indexing things like text uuids.
@@ -359,8 +365,6 @@ public:
     termOutput.writeStr(refdata, reflen);
     termOutput.writeVlong(offsetOfDocsForTermBlock);  // TODO: make these relative to field
     termOutput.writeVlong(offsetOfPositionsForTermBlock);
-
-
 
     // now write the block:
     int pulsedIdx = 0;  // index of next pulsed data
@@ -444,6 +448,7 @@ public:
 
   void endTerm(TermRef term) {
     uint64_t totalTermFreq = getTotalTermFreq();
+    // TODO: handle case when all docs were deleted for term (and term should no longer appear)
     if (totalTermFreq == 1) {
       assert(getDocFileSize()==0 && docs.size()==1 && posdeltas.size() == 1);
       docFileSize.push_back(0);
@@ -518,7 +523,7 @@ public:
     fieldInfo.docsOffset = docOutput.size();
     fieldInfo.posOffset = posOutput.size();
     fieldInfo.termBlockOffsets.resize(0);
-
+    fieldInfo.numTerms = 0;
     _startTermBlock(false);
   }
 

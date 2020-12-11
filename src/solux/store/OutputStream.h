@@ -13,7 +13,7 @@ protected:
 public:
   explicit File(std::string name) : name_(std::move(name)) {}
   const std::string& name() { return name_; }
-  virtual void flush(OutputStream& os)=0;
+  virtual void flush(OutputStream& os, bool last)=0;
   virtual void close(OutputStream& os)=0;
   virtual ~File() = default;
 
@@ -31,8 +31,13 @@ class OutputStream {
   char* pos = nullptr;
   char* start = nullptr;
   char* end = nullptr;
-  size_t flushed_size = 0; // number of bytes that have been flushed to the source
+  size_t flushedSize = 0; // number of bytes that have been flushed to the source
   File* target = nullptr;
+
+  void clear() {
+    pos = start = end = nullptr;
+    flushedSize = 0;
+  }
 
 public:
   // By not requiring the File target up-front, we can directly include OutputStream instances in other
@@ -41,10 +46,13 @@ public:
   size_t buffered() const noexcept { return pos - start; }
   size_t reserved() const noexcept { return end - pos; }  // the amount of space left in the buffer
   char* ptr() const noexcept { return pos; } // the current position in the buffer
-  size_t size() const noexcept { return flushed_size + buffered(); }
+  size_t size() const noexcept { return flushedSize + buffered(); }
   File* getFile() const noexcept { return target; }
-  void flush() { target->flush(*this); }
-  void close() { target->close(*this); } // unneeded?  Could be rolled into Directory.finish()
+  void flush(bool last=false) { target->flush(*this, last); }
+  void close() {
+    target->close(*this);
+    target = nullptr;
+  }
 
   void setFile(File* fileTarget) noexcept {
     assert(target == nullptr);
@@ -134,15 +142,23 @@ class RAMFile : public File {
   friend class RAMInputFile;
 
   using element_type = std::pair<std::unique_ptr<char[]>, size_t>;
+
   std::vector<element_type> buffers;
-  size_t fileSize;
-  const char* firstBuffer;
-  uint32_t firstLen;
+  size_t fileSize = 0;
+  const char* firstBuffer = nullptr;
+  uint32_t firstLen = 0;
+
+  void newBuffer(size_t size) {
+    // buffers.emplace_back( std::make_pair(std::unique_ptr<char[]>( new char[size]), size) );
+    // buffers.emplace_back( std::unique_ptr<char[]>( new char[size]), size );
+    buffers.emplace_back(  new char[size], size );
+  }
 
 public:
   RAMFile(std::string name) : File(std::move(name)) {
   }
 
+  // only valid after flush or close
   size_t size() const {
     return fileSize;
   }
@@ -158,37 +174,37 @@ public:
     return ptr - (char*)dest;
   }
 
-  void newBuffer(size_t size) {
-    // buffers.emplace_back( std::make_pair(std::unique_ptr<char[]>( new char[size]), size) );
-    // buffers.emplace_back( std::unique_ptr<char[]>( new char[size]), size );
-    buffers.emplace_back(  new char[size], size );
-  }
-
-  virtual void flush(OutputStream &os) override {
+  void flush(OutputStream &os, bool last) override {
     auto thisBufferSize = os.pos - os.start;
     // TODO: handle extra flush
     fileSize += thisBufferSize;
-    os.flushed_size = fileSize;
+    os.flushedSize = fileSize;
     auto prevBufferSize = 512;  // set up for first buffer to be 1024
     if (buffers.size() == 0) {
       // If this is the first call to flush, remember whatever buffer is set by the output stream as the first element.
       firstBuffer = os.pos;
       firstLen = thisBufferSize;
     } else {
+      if (thisBufferSize == 0) return; // protection against multiple calls to flush
       prevBufferSize = buffers.back().second;
       buffers.back().second = thisBufferSize;  // truncate to actually used space
     }
 
-    // doubling strategy up to 1MB
-    newBuffer(std::max( prevBufferSize<<1, 0x100000 ));
-    os.start = buffers.back().first.get();
-    os.pos = os.start;
-    os.end = os.start + buffers.back().second;
+    if (last) {
+      os.clear();
+    } else {
+      // doubling strategy up to 1MB
+      newBuffer(std::max(prevBufferSize << 1, 0x100000));
+      os.start = buffers.back().first.get();
+      os.pos = os.start;
+      os.end = os.start + buffers.back().second;
+    }
   }
 
-  virtual void close(OutputStream &os) override {
+  // TODO: this is currently redundant with Directory.finish
+  void close(OutputStream &os) override {
     if (os.pos - os.start > 0) {
-      flush(os);
+      flush(os, true);
     }
   }
 

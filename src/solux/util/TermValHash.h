@@ -32,7 +32,7 @@ public:
   // Expert!
   // create a reference to a ValKey pair that already exists in memory.
   // ptr/len refer to the string portion that directly follows the value.
-  TermValRef(void* ptr, unsigned len) : TermRef(ptr, len) {}
+  explicit TermValRef(void* ptr, unsigned len) : TermRef(ptr, len) {}
 
   V* valPtr() {
     // return const_cast<V*>( reinterpret_cast<const V*>( (const char*)ptr() - sizeof(V) ) );

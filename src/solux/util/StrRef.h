@@ -38,7 +38,11 @@
 #include "solux_util.h"
 #include "MemPool.h"
 
-// Another string alternative could inline up to 7 byte strings in the pointer (or 15 bytes for something like a string_view)
+
+
+// the general implementation to use for a non-owning Term references.
+class PackedTerm;
+using TermRef = PackedTerm;
 
 
 // most x86_64 processors only use the lower 48 bits of pointers.  The upper bits (48 through 63) must all be 1 or 0
@@ -59,8 +63,6 @@ public:
   }
 
   StrRef() {}
-
-  // TODO: a constructor that takes a MemPool?
 
   // expert: should already point to an instance of this type
   void init(void* data, uint32_t size) {
@@ -169,7 +171,7 @@ public:
     return target;
   }
 
-
+  // TODO: keep this a trivial class that doesn't initialize itself?
   PackedTerm() {}
   PackedTerm(MemPool& target, const void* data, uint32_t len) {
     ptr_ = write(target, data, len);
@@ -181,6 +183,7 @@ public:
   }
 
   // expert: should already point to an instance of this type
+  // TODO: make this somehow harder to accidentally use!
   PackedTerm(void* ptr) : ptr_(reinterpret_cast<const char*>(ptr)) { }
   PackedTerm(void* ptr, uint32_t size) : ptr_(reinterpret_cast<const char*>(ptr)) { }
 
@@ -299,22 +302,28 @@ public:
 };
 
 
+namespace std {
+template<>
+struct hash<PackedTerm> {
+  typedef PackedTerm argument_type;
+  typedef std::size_t result_type;
 
-namespace std
-{
-  template<>
-  struct hash<PackedTerm>
-  {
-    typedef PackedTerm argument_type;
-    typedef std::size_t result_type;
-
-    result_type operator()(const argument_type & val) const
-    {
-      return val.hashcode();
-    }
-  };
+  result_type operator()(const argument_type &val) const {
+    return val.hashcode();
+  }
+};
 }
+namespace std {
+template<>
+struct hash<StrRef> {
+  typedef StrRef argument_type;
+  typedef std::size_t result_type;
 
+  result_type operator()(const argument_type &val) const {
+    return val.hashcode();
+  }
+};
+}
 
 //
 // TODO: experimental and in progress string_view with short string optimization (can store strings of length 15 inline)
@@ -393,7 +402,5 @@ public:
 
 };
 
+// Another string alternative could inline up to 7 byte strings in the pointer
 
-
-// the general implementation to use for a non-owning Term reference.
-using TermRef = PackedTerm;
