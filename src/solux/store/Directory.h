@@ -66,7 +66,6 @@ public:
       } else {
         // insert
         files.insert(insertion_point, {file.name(), RAMInputFile(std::move(singleBuffer), sz)});
-        insertion_point->second = RAMInputFile(std::move(singleBuffer), sz);
       }
 
     }
