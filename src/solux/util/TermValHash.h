@@ -52,7 +52,7 @@ public:
   }
 
   template <typename... Args>
-  TermValRef (MemPool& pool, const char* str, unsigned len, Args&&... args) {
+  TermValRef(MemPool& pool, const char* str, unsigned len, Args&&... args) {
     pool.align(); // Cost=~4 bytes per unique term
     auto target = pool.allocatePtr( getExactSize(len) );
     new (target) V(std::forward<Args>(args)...);    // construct the value
@@ -77,8 +77,6 @@ public:
 template <class T>
 class TermValHash {
 private:
-  TermValHash(const TermValHash&) = delete;
-
   void newTable(unsigned newSize);
   void rehash();
   // use stable_partition on the existing memory to sort?

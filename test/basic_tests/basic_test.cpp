@@ -78,10 +78,8 @@ TEST(basic_test, test_address_sanitizer) {
   ptr = (char*)malloc(size);
   char x = 0;
   uint64_t off = xorshift(0) + xorshift(reinterpret_cast<uint64_t>(ptr) % 2);  // try to foil static analysis (this should be 0 though)
-  x = ptr[0 + off]; // BUG: uninitialized memory read... requires memory sanitizer, not address sanitizer
-  if (x==55) { // use it...
-    off = 0;
-  }
+  x = ptr[0 + off]; // BUG: uninitialized memory read... requires memory sanitizer, not address sanitizer (or valgrind)
+  // if (x==55) { off = 0; }  // BUG: valgrind correctly detects the first conditional use of uninitialized memory.
   memset(ptr+off,0+off,10+off); // ok, initialize buffer
   // ptr[10+off] = x; // BUG: one past end write
   // arr[10+off] = x; // BUG: one past end write on stack

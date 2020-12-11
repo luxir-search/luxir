@@ -7,9 +7,16 @@
 
 class Directory {
 public:
-  virtual std::unique_ptr<File> createFile(std::string name) = 0;
-  virtual void finishFile(File& file) = 0;  // make the file readable to others
+  // TODO: add a prefix option?
+  // appends a list of names to the referenced vector
+  virtual void listFiles(std::vector<std::string>& target) = 0;
 
+  virtual std::unique_ptr<File> createFile(std::string name) = 0;
+
+  // Make the file readable to others through the Directory.  Putting this on the Directory class
+  // gives more flexibility in implementation without having every File have to point back to it's
+  // owning Directory.
+  virtual void finishFile(File& file) = 0;
 };
 
 class RAMDir : public Directory {
@@ -18,7 +25,17 @@ public:
   using InputFileType = RAMInputFile;
   using entry_type = std::pair<std::string, InputFileType>;
 
+  // RAMDir uses a sorted vector to minimize the additional space requirements when there are tons of directories.
+  // Insertion will be fast since files are also generally produced in sorted order (although removing old ones will be slightly slower)
+  // We should still benchmark (time and space) vs a good ordered_map implementation in the future though.
   std::vector<entry_type> files;
+
+  void listFiles(std::vector<std::string> &target) override {
+    target.reserve(files.size());
+    for (const auto&[name, ifile] : files) {
+      target.push_back(name);
+    }
+  }
 
   std::unique_ptr<File> createFile(std::string name) override {
     return std::make_unique<RAMFile>(std::move(name));
@@ -30,8 +47,30 @@ public:
     // don't use make_unique as it uselessly zeroes memory first.
     std::unique_ptr<char[]> singleBuffer(new char[sz]);
     ramFile.copyTo(singleBuffer.get());
-    // TODO: maintain sorted order
-    files.emplace_back(file.name(), RAMInputFile(std::move(singleBuffer), sz));
+
+    // See if new file name is greater than all others produced (this is common by design)
+    if (files.empty() || files.back().first < file.name()) {  // TODO: what is clang-tidy's problem with this line???
+      files.emplace_back(file.name(), RAMInputFile(std::move(singleBuffer), sz));
+    } else {
+      // file does not belong at end, so let's find insertion point to maintain sorted order.
+      auto insertion_point = std::lower_bound(files.begin(), files.end(), file.name(),
+                       [&](const entry_type & x, const std::string& key)
+                       { return x.first < key; }
+                       );
+      // Insertion_point won't be at end since we already detected that common case.
+      // Check for an overwrite though (overwrite should be a flag somewhere...)
+      if (insertion_point->first == file.name()) {
+        // overwrite (or throw/return error if we're not supposed to overwrite or it's unexpected)
+        *insertion_point = {file.name(), RAMInputFile(std::move(singleBuffer), sz)};
+        // insertion_point->second = RAMInputFile(std::move(singleBuffer), sz);  // alternative that just changes one element of the pair?
+      } else {
+        // insert
+        files.insert(insertion_point, {file.name(), RAMInputFile(std::move(singleBuffer), sz)});
+        insertion_point->second = RAMInputFile(std::move(singleBuffer), sz);
+      }
+
+    }
+
   }
 };
 

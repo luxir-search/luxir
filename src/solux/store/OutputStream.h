@@ -15,6 +15,9 @@ public:
   const std::string& name() { return name_; }
   virtual void flush(OutputStream& os, bool last)=0;
   virtual void close(OutputStream& os)=0;
+  virtual size_t size() = 0;
+
+
   virtual ~File() = default;
 
   // virtual std::string_view read()=0;
@@ -159,7 +162,7 @@ public:
   }
 
   // only valid after flush or close
-  size_t size() const {
+  size_t size() override {
     return fileSize;
   }
 
@@ -214,7 +217,11 @@ public:
 };
 
 class InputFile {
+public:
+  virtual size_t size() = 0;
 
+  // Reads all of the file and returns a pointer to the data, which should be valid as long as the InputFile is valid.
+  virtual std::string_view read() = 0;
 };
 
 class RAMInputFile : public InputFile {
@@ -223,11 +230,11 @@ class RAMInputFile : public InputFile {
 public:
   RAMInputFile(std::unique_ptr<char[]> fileData, size_t size) : data(std::move(fileData)), sz(size) {}
 
-  size_t size() const {
+  size_t size() override {
     return sz;
   }
 
-  std::string_view read() const {
+  std::string_view read() override {
     return std::string_view(data.get(), sz);
   }
 };
