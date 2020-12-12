@@ -44,9 +44,7 @@ void addFile(Directory& dir, const std::string& name, const std::string& data, s
   ASSERT_EQ(input->read().data(), input2->read().data());
 }
 
-template <class DirType>
-void doDir() {
-  DirType dir;
+void doDir(Directory& dir) {
   std::vector<std::string> lst;
 
   dir.listFiles(lst);
@@ -66,8 +64,25 @@ void doDir() {
   // add file in middle
   addFile(dir, "bbb", "qwertyuiop", lst);
   ASSERT_EQ("bbb", lst[1]);
+
+  // remove a non-existing file
+  bool found = dir.deleteFile("doesntexist");
+  ASSERT_EQ(false, found);
+
+  // remove a non-existing file that would appear at the end of the directory listing
+  found = dir.deleteFile("zzzzzzzzzzzzzzzzzzzzzzzzzzzz");
+  ASSERT_EQ(false, found);
+
+  // remove existing file from the middle
+  found = dir.deleteFile("bbb");
+  ASSERT_EQ(true, found);
+
+  // make sure it's gone
+  auto input = dir.openFile("bbb");
+  ASSERT_TRUE(input.get() == nullptr);
 }
 
 TEST(Directory, test) {
-  doDir<RAMDir>();
+  RAMDir dir;
+  doDir(dir);
 }

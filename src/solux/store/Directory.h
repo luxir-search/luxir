@@ -15,6 +15,9 @@ public:
 
   virtual std::unique_ptr<File> createFile(const std::string& name) = 0;
 
+  // Returns true if file was found and deleted, false if not found.
+  virtual bool deleteFile(const std::string& name) = 0;
+
   // Make the file readable to others through the Directory.  Putting this on the Directory class
   // gives more flexibility in implementation without having every File have to point back to it's
   // owning Directory.
@@ -27,12 +30,26 @@ public:
   using OutputFileType = RAMFile;
   using InputFileType = RAMInputFile;
   using InputReferenceType = std::shared_ptr<InputFileType>;
+
+private:
   using entry_type = std::pair<std::string, InputReferenceType>;
+  using iterator_type = std::vector<entry_type>::iterator;
 
   // RAMDir uses a sorted vector to minimize the additional space requirements when there are tons of directories.
   // Insertion will be fast since files are also generally produced in sorted order (although removing old ones will be slightly slower)
   // We should still benchmark (time and space) vs a good ordered_map implementation in the future though.
   std::vector<entry_type> files;
+
+  // returns <found,iterator> pair... iterator is the element if found==true or the insertion point if found==false.
+  std::pair<bool, iterator_type> find(const std::string& name) {
+    auto iter = std::lower_bound(files.begin(), files.end(), name,
+                                       [&](const entry_type & x, const std::string& key) { return x.first < key; }
+    );
+    return {!(iter == files.end() || iter->first !=  name), iter};
+  }
+
+public:
+
 
   void listFiles(std::vector<std::string> &target) override {
     target.reserve(files.size());
@@ -42,22 +59,30 @@ public:
   }
 
   std::shared_ptr<InputFile> openFile(const std::string& name) override {
-    auto ptr = std::lower_bound(files.begin(), files.end(), name,
-                                            [&](const entry_type & x, const std::string& key) { return x.first < key; }
-    );
-    if (ptr == files.end() || ptr->first !=  name) {
-      return {};
+    auto [found, iter] = find(name);
+    if (found) {
+      return iter->second;
     } else {
-      return ptr->second;
+      return {};
+    }
+  }
+
+  bool deleteFile(const std::string& name) override {
+    auto [found, iter] = find(name);
+    if (found) {
+      files.erase(iter);
+      return true;
+    } else {
+      return false;
     }
   }
 
   std::unique_ptr<File> createFile(const std::string& name) override {
-    return std::make_unique<RAMFile>(name);
+    return std::make_unique<OutputFileType>(name);
   }
 
   void finishFile(File& file) override {
-    auto& ramFile = dynamic_cast<RAMFile&>(file);
+    auto& ramFile = dynamic_cast<OutputFileType&>(file);
     auto sz = ramFile.size();
     // don't use make_unique as it uselessly zeroes memory first.
     std::unique_ptr<char[]> singleBuffer(new char[sz]);
@@ -68,24 +93,17 @@ public:
     if (files.empty() || files.back().first < file.name()) {  // TODO: what is clang-tidy's problem with this line??? It suggests replacing "<" with nullptr !??
       files.emplace_back(file.name(), std::move(inputFile));
     } else {
-      // file does not belong at end, so let's find insertion point to maintain sorted order.
-      auto insertion_point = std::lower_bound(files.begin(), files.end(), file.name(),
-                       [&](const entry_type & x, const std::string& key) { return x.first < key; }
-                       );
-      // Insertion_point won't be at end since we already detected that common case.
-      // Check for an overwrite though (overwrite should be a flag somewhere...)
-      if (insertion_point->first == file.name()) {
-        // overwrite (or throw/return error if we're not supposed to overwrite or it's unexpected)
-        *insertion_point = {file.name(), std::move(inputFile)};
-        // insertion_point->second = RAMInputFile(std::move(singleBuffer), sz);  // alternative that just changes one element of the pair?
+      auto[found, iter] = find(file.name());
+      if (found) {
+        // overwrite
+        *iter = {file.name(), std::move(inputFile)};
       } else {
         // insert
-        files.insert(insertion_point, {file.name(), std::move(inputFile)});
+        files.insert(iter, {file.name(), std::move(inputFile)});
       }
-
     }
-
   }
+
 };
 
 

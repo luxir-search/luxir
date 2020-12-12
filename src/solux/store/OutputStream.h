@@ -184,6 +184,7 @@ public:
       memcpy(ptr, data.get(), sz);
       ptr += sz;
     }
+    assert(ptr - (char*)dest == fileSize);
     return ptr - (char*)dest;
   }
 
