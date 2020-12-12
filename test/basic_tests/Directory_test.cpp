@@ -9,6 +9,12 @@ void addFile(Directory& dir, const std::string& name, const std::string& data, s
 
   std::unique_ptr<File> f = dir.createFile(name);
   OutputStream os;
+  char arr[6];
+  // sometimes start off with a user supplied buffer for the output stream
+  if ((std::rand() & 0x01) == 1) {
+    os = OutputStream(arr, arr+sizeof(arr));
+  }
+
   os.setFile(f.get());
   os.write(data.data(), data.size());
   // os.write('X');  // make sure test fails with this
@@ -54,11 +60,11 @@ void doDir() {
   ASSERT_EQ("f5a", lst[1]);
 
   // add file at start
-  addFile(dir, "aaa", "1", lst);
+  addFile(dir, "aaa", "123456789abcdefghijklmnopqrstuvwxyz", lst);
   ASSERT_EQ("aaa", lst[0]);
 
   // add file in middle
-  addFile(dir, "bbb", "22", lst);
+  addFile(dir, "bbb", "qwertyuiop", lst);
   ASSERT_EQ("bbb", lst[1]);
 }
 

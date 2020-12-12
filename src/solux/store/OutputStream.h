@@ -45,6 +45,13 @@ public:
   // By not requiring the File target up-front, we can directly include OutputStream instances in other
   // classes even if file creation is deferred.
   explicit OutputStream() {}
+
+  // An initial buffer to use.  It's lifetime should exceed the lifetime of this OutputStream and associated File.
+  explicit OutputStream(char* beginInitialBuffer, char* endInitialBuffer) {
+    start = pos = beginInitialBuffer;
+    end = endInitialBuffer;
+  }
+
   size_t buffered() const noexcept { return pos - start; }
   size_t reserved() const noexcept { return end - pos; }  // the amount of space left in the buffer
   char* ptr() const noexcept { return pos; } // the current position in the buffer
@@ -91,10 +98,12 @@ public:
   }
 
   void write(const void* data, size_t len) {
-    // TODO: optimize this for the case that File can handle non-full buffers.
+    // TODO: optimize this for the case that File can handle non-full buffers or doesn't keep a copy of the buffer (i.e. we can avoid a copy)
+    char* in = (char*)data;
     while (len > 0) {
       size_t toWrite = std::min(len, reserved());
-      unsafeWrite(data, toWrite);
+      unsafeWrite(in, toWrite);
+      in += toWrite;
       len -= toWrite;
       if (len > 0) {
         flush();
@@ -139,7 +148,6 @@ public:
 // TODO: make a RAMDelegatingFile that starts out in RAM and after a certain size spills to (and delegates to) another
 // type of File.
 class RAMFile : public File {
-  constexpr static uint32_t BUFFER_SIZE = 8192;
   friend class OutputStream;
   friend class RAMInputFile;
 
@@ -157,6 +165,8 @@ class RAMFile : public File {
   }
 
 public:
+  constexpr static uint32_t START_BUFFER_SIZE = 1024;  // size of first allocated buffer (subsequent buffers may be bigger)... mostly for testing.
+
   RAMFile(const std::string& name) : File(name) {
   }
 
@@ -165,12 +175,13 @@ public:
     return fileSize;
   }
 
+  // copies size() bytes to the destination
   size_t copyTo(void* dest) {
     char* ptr = (char*)dest;
     memcpy(ptr, firstBuffer, firstLen);
     ptr += firstLen;
     for (const auto&[data, sz] : buffers) {
-      memcpy(dest, data.get(), sz);
+      memcpy(ptr, data.get(), sz);
       ptr += sz;
     }
     return ptr - (char*)dest;
@@ -178,13 +189,12 @@ public:
 
   void flush(OutputStream &os, bool last) override {
     auto thisBufferSize = os.pos - os.start;
-    // TODO: handle extra flush
     fileSize += thisBufferSize;
     os.flushedSize = fileSize;
-    auto prevBufferSize = 512;  // set up for first buffer to be 1024
+    auto prevBufferSize = START_BUFFER_SIZE/2;  // set up for first buffer to be 1024
     if (buffers.size() == 0) {
       // If this is the first call to flush, remember whatever buffer is set by the output stream as the first element.
-      firstBuffer = os.pos;
+      firstBuffer = os.start;
       firstLen = thisBufferSize;
     } else {
       if (thisBufferSize == 0) return; // protection against multiple calls to flush
@@ -196,7 +206,7 @@ public:
       os.clear();
     } else {
       // doubling strategy up to 1MB
-      newBuffer(std::max(prevBufferSize << 1, 0x100000));
+      newBuffer(std::max(prevBufferSize << 1, 0x100000u));
       os.start = buffers.back().first.get();
       os.pos = os.start;
       os.end = os.start + buffers.back().second;
@@ -205,7 +215,7 @@ public:
 
   // TODO: this is currently redundant with Directory.finish
   void close(OutputStream &os) override {
-    if (os.pos - os.start > 0) {
+    if (os.pos > os.start) {
       flush(os, true);
     }
   }
