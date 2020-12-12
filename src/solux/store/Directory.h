@@ -11,7 +11,9 @@ public:
   // appends a list of names to the referenced vector
   virtual void listFiles(std::vector<std::string>& target) = 0;
 
-  virtual std::unique_ptr<File> createFile(std::string name) = 0;
+  virtual std::shared_ptr<InputFile> openFile(const std::string& name) = 0;
+
+  virtual std::unique_ptr<File> createFile(const std::string& name) = 0;
 
   // Make the file readable to others through the Directory.  Putting this on the Directory class
   // gives more flexibility in implementation without having every File have to point back to it's
@@ -19,11 +21,13 @@ public:
   virtual void finishFile(File& file) = 0;
 };
 
+// TODO: currently not thread safe
 class RAMDir : public Directory {
 public:
   using OutputFileType = RAMFile;
   using InputFileType = RAMInputFile;
-  using entry_type = std::pair<std::string, InputFileType>;
+  using InputReferenceType = std::shared_ptr<InputFileType>;
+  using entry_type = std::pair<std::string, InputReferenceType>;
 
   // RAMDir uses a sorted vector to minimize the additional space requirements when there are tons of directories.
   // Insertion will be fast since files are also generally produced in sorted order (although removing old ones will be slightly slower)
@@ -37,8 +41,19 @@ public:
     }
   }
 
-  std::unique_ptr<File> createFile(std::string name) override {
-    return std::make_unique<RAMFile>(std::move(name));
+  std::shared_ptr<InputFile> openFile(const std::string& name) override {
+    auto ptr = std::lower_bound(files.begin(), files.end(), name,
+                                            [&](const entry_type & x, const std::string& key) { return x.first < key; }
+    );
+    if (ptr == files.end() || ptr->first !=  name) {
+      return {};
+    } else {
+      return ptr->second;
+    }
+  }
+
+  std::unique_ptr<File> createFile(const std::string& name) override {
+    return std::make_unique<RAMFile>(name);
   }
 
   void finishFile(File& file) override {
@@ -47,25 +62,25 @@ public:
     // don't use make_unique as it uselessly zeroes memory first.
     std::unique_ptr<char[]> singleBuffer(new char[sz]);
     ramFile.copyTo(singleBuffer.get());
+    auto inputFile = std::make_shared<RAMInputFile>(std::move(singleBuffer), sz);
 
     // See if new file name is greater than all others produced (this is common by design)
-    if (files.empty() || files.back().first < file.name()) {  // TODO: what is clang-tidy's problem with this line???
-      files.emplace_back(file.name(), RAMInputFile(std::move(singleBuffer), sz));
+    if (files.empty() || files.back().first < file.name()) {  // TODO: what is clang-tidy's problem with this line??? It suggests replacing "<" with nullptr !??
+      files.emplace_back(file.name(), std::move(inputFile));
     } else {
       // file does not belong at end, so let's find insertion point to maintain sorted order.
       auto insertion_point = std::lower_bound(files.begin(), files.end(), file.name(),
-                       [&](const entry_type & x, const std::string& key)
-                       { return x.first < key; }
+                       [&](const entry_type & x, const std::string& key) { return x.first < key; }
                        );
       // Insertion_point won't be at end since we already detected that common case.
       // Check for an overwrite though (overwrite should be a flag somewhere...)
       if (insertion_point->first == file.name()) {
         // overwrite (or throw/return error if we're not supposed to overwrite or it's unexpected)
-        *insertion_point = {file.name(), RAMInputFile(std::move(singleBuffer), sz)};
+        *insertion_point = {file.name(), std::move(inputFile)};
         // insertion_point->second = RAMInputFile(std::move(singleBuffer), sz);  // alternative that just changes one element of the pair?
       } else {
         // insert
-        files.insert(insertion_point, {file.name(), RAMInputFile(std::move(singleBuffer), sz)});
+        files.insert(insertion_point, {file.name(), std::move(inputFile)});
       }
 
     }

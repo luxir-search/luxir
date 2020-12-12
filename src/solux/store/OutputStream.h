@@ -11,12 +11,11 @@ class File {
 protected:
   std::string name_;
 public:
-  explicit File(std::string name) : name_(std::move(name)) {}
+  explicit File(const std::string& name) : name_(name) {}
   const std::string& name() { return name_; }
   virtual void flush(OutputStream& os, bool last)=0;
   virtual void close(OutputStream& os)=0;
   virtual size_t size() = 0;
-
 
   virtual ~File() = default;
 
@@ -158,7 +157,7 @@ class RAMFile : public File {
   }
 
 public:
-  RAMFile(std::string name) : File(std::move(name)) {
+  RAMFile(const std::string& name) : File(name) {
   }
 
   // only valid after flush or close
