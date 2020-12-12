@@ -32,6 +32,10 @@ void addFile(Directory& dir, const std::string& name, const std::string& data, s
   ASSERT_TRUE(input.get() != nullptr);
   ASSERT_EQ(data.size(), input->size());
   ASSERT_EQ(0, memcmp(data.data(), input->read().data(), data.size()));
+
+  auto input2 = dir.openFile(name);  // open again... to test out shared_ptr + resource management
+  ASSERT_EQ(input->read().size(), input2->read().size());
+  ASSERT_EQ(input->read().data(), input2->read().data());
 }
 
 template <class DirType>
