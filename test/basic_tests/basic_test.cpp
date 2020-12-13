@@ -89,7 +89,7 @@ TEST(basic_test, test_address_sanitizer) {
   // memcpy(ptr-1+off, arr+off, size+off); // BUG: write before beginning with memcpy
   // memcpy(arr-1+off, ptr+off, size+off); // BUG: write before beginning on stack with memcpy
 
-  if (ptr[0]=='Z' || arr[0]=='Z') {cout<<"How?";}  // use the arrays to try and prevent optimizing away. clang didn't detect last underflow w/o this.
+  // if (ptr[0]=='Z' || arr[0]=='Z') {cout<<"How?";}  // BUG. use the arrays to try and prevent optimizing away. clang didn't detect last underflow w/o this uncommented.
 
   char* ptr2 = returnsStackAddr(ptr);
   // if (*ptr2 == 'A') { cout<<"Oops, stack frame no longer exists!"<<endl; }  // BUG: use old stack frame

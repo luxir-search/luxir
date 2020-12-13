@@ -164,7 +164,7 @@ public:
 
   // this version seemed a little faster for clang, but not for g++
   inline static const char* write2(MemPool& targetPool, const void* data, uint32_t sz) {
-    targetPool.ensure(getMaxSize(sz));
+    targetPool.reserve(getMaxSize(sz));
     auto target = targetPool.ptr();
     auto sizeOut = write(target, data, sz);
     targetPool.pos_ += sizeOut;

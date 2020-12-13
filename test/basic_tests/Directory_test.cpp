@@ -3,6 +3,7 @@
 #include <iostream>
 
 #include "solux/store/Directory.h"
+#include "test_util.h"
 
 void addFile(Directory& dir, const std::string& name, const std::string& data, std::vector<std::string>& resultListing) {
   resultListing.resize(0);
@@ -58,7 +59,8 @@ void doDir(Directory& dir) {
   ASSERT_EQ("f5a", lst[1]);
 
   // add file at start
-  addFile(dir, "aaa", "123456789abcdefghijklmnopqrstuvwxyz", lst);
+  std::string aaa_data = "123456789abcdefghijklmnopqrstuvwxyz";
+  addFile(dir, "aaa", aaa_data, lst);
   ASSERT_EQ("aaa", lst[0]);
 
   // add file in middle
@@ -80,7 +82,21 @@ void doDir(Directory& dir) {
   // make sure it's gone
   auto input = dir.openFile("bbb");
   ASSERT_TRUE(input.get() == nullptr);
+
+  lst.resize(0);
+  dir.listFiles(lst);
+  ASSERT_EQ(lst.size(), 3);
+  ASSERT_EQ("f5", lst[1]);
+
+  // test delete of open file
+  input = dir.openFile("aaa");
+  found = dir.deleteFile("aaa");
+  ASSERT_EQ(true, found);
+  auto data = input->read();
+  ASSERT_EQ(data.size(), aaa_data.size());
+  ASSERT_EQ(0, memcmp(data.data(), aaa_data.data(), data.size()));
 }
+
 
 TEST(Directory, test) {
   RAMDir dir;

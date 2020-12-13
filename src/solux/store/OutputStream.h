@@ -8,20 +8,18 @@ class File;
 class OutputStream;
 
 class File {
+  friend class OutputStream;
+
 protected:
   std::string name_;
+  virtual void flush(OutputStream& os, bool last)=0;
+  virtual void close(OutputStream& os)=0;
+
 public:
   explicit File(const std::string& name) : name_(name) {}
   const std::string& name() { return name_; }
-  virtual void flush(OutputStream& os, bool last)=0;
-  virtual void close(OutputStream& os)=0;
   virtual size_t size() = 0;
-
   virtual ~File() = default;
-
-  // virtual std::string_view read()=0;
-
-  friend class OutputStream;
 };
 
 
@@ -36,11 +34,6 @@ class OutputStream {
   size_t flushedSize = 0; // number of bytes that have been flushed to the source
   File* target = nullptr;
 
-  void clear() {
-    pos = start = end = nullptr;
-    flushedSize = 0;
-  }
-
 public:
   // By not requiring the File target up-front, we can directly include OutputStream instances in other
   // classes even if file creation is deferred.
@@ -54,10 +47,20 @@ public:
 
   size_t buffered() const noexcept { return pos - start; }
   size_t reserved() const noexcept { return end - pos; }  // the amount of space left in the buffer
+  uint32_t reserve(uint32_t needed) {
+    if (reserved() < needed) {
+      flush();  // TODO: pass down needed amount?
+    }
+    assert(reserved() >= needed);
+    return reserved();
+  }
   char* ptr() const noexcept { return pos; } // the current position in the buffer
   size_t size() const noexcept { return flushedSize + buffered(); }
   File* getFile() const noexcept { return target; }
+
+  // don't call flush before close... it would needlessly create a new memory buffer
   void flush(bool last=false) { target->flush(*this, last); }
+
   void close() {
     target->close(*this);
     target = nullptr;
@@ -164,11 +167,45 @@ class RAMFile : public File {
     buffers.emplace_back(  new char[size], size );
   }
 
+  void flush(OutputStream &os, bool last) override {
+    auto thisBufferSize = os.pos - os.start;
+    fileSize += thisBufferSize;
+    os.flushedSize = fileSize;
+    auto prevBufferSize = START_BUFFER_SIZE/2;  // set up for first buffer to be 1024
+    if (buffers.size() == 0) {
+      // If this is the first call to flush, remember whatever buffer is set by the output stream as the first element.
+      firstBuffer = os.start;
+      firstLen = thisBufferSize;
+    } else {
+      prevBufferSize = buffers.back().second;
+      if (os.start == buffers.back().first.get()) {
+        buffers.back().second = thisBufferSize;  // truncate to actually used space
+      }
+    }
+
+    if (!last) {
+      // doubling strategy up to 1MiB
+      newBuffer(std::min(prevBufferSize << 1, 0x100000u));
+      auto& [ptr,sz] = buffers.back();
+      os.start = ptr.get();
+      os.pos = os.start;
+      os.end = os.start + sz;
+    }
+  }
+
+  // TODO: this is currently redundant with Directory.finish
+  void close(OutputStream &os) override {
+    flush(os, true);
+  }
+
+
 public:
   constexpr static uint32_t START_BUFFER_SIZE = 1024;  // size of first allocated buffer (subsequent buffers may be bigger)... mostly for testing.
 
   RAMFile(const std::string& name) : File(name) {
   }
+
+  ~RAMFile() override = default;
 
   // only valid after flush or close
   size_t size() override {
@@ -181,49 +218,14 @@ public:
     memcpy(ptr, firstBuffer, firstLen);
     ptr += firstLen;
     for (const auto&[data, sz] : buffers) {
+      // if this overwrites memory, the bug is probably not closing the OutputStream (and hence not truncating the last buffer to the used size)
+      assert(ptr - (char*)dest <= fileSize);
       memcpy(ptr, data.get(), sz);
       ptr += sz;
     }
     assert(ptr - (char*)dest == fileSize);
     return ptr - (char*)dest;
   }
-
-  void flush(OutputStream &os, bool last) override {
-    auto thisBufferSize = os.pos - os.start;
-    fileSize += thisBufferSize;
-    os.flushedSize = fileSize;
-    auto prevBufferSize = START_BUFFER_SIZE/2;  // set up for first buffer to be 1024
-    if (buffers.size() == 0) {
-      // If this is the first call to flush, remember whatever buffer is set by the output stream as the first element.
-      firstBuffer = os.start;
-      firstLen = thisBufferSize;
-    } else {
-      if (thisBufferSize == 0) return; // protection against multiple calls to flush
-      prevBufferSize = buffers.back().second;
-      buffers.back().second = thisBufferSize;  // truncate to actually used space
-    }
-
-    if (last) {
-      os.clear();
-    } else {
-      // doubling strategy up to 1MB
-      newBuffer(std::max(prevBufferSize << 1, 0x100000u));
-      os.start = buffers.back().first.get();
-      os.pos = os.start;
-      os.end = os.start + buffers.back().second;
-    }
-  }
-
-  // TODO: this is currently redundant with Directory.finish
-  void close(OutputStream &os) override {
-    if (os.pos > os.start) {
-      flush(os, true);
-    }
-  }
-
-public:
-
-  ~RAMFile() override = default;
 };
 
 class InputFile {

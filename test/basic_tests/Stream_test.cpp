@@ -84,7 +84,7 @@ TEST(stream_test, test_basic) {
 
 TEST(stream_test, rand_stream) {
   int maxlen = MemPool::BYTE_BLOCK_SIZE * 2;
-  int iter=1000;
+  int iter=100;
   int minBytesToWrite = 1000000;
 
   MemPool pool;

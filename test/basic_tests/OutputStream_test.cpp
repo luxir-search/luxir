@@ -1,0 +1,105 @@
+
+#include <gtest/gtest.h>
+#include <iostream>
+
+#include "solux/store/Directory.h"
+#include "test_util.h"
+
+// if you run into an issue in this test, try changing to true to catch the bug earlier.
+constexpr bool catch_early = false;
+
+// TODO: when we have an InputStream that can read everything that an OutputStream can write,
+// do a better test that exercizes all of the outputs+inputs.
+TEST(OutputStream, randWrite) {
+  RAMDir dir;
+  auto nwords = RAMFile::START_BUFFER_SIZE/2;  // size==4 times amount of start buffer...
+  std::vector<uint64_t> rdata(nwords);
+  const char* rbegin = reinterpret_cast<char*>(rdata.data());
+  const char* rend = reinterpret_cast<char*>(rdata.data()+nwords);
+  auto rlen = rend-rbegin;
+
+  uint64_t x = 0x123456789;
+  for (auto& elem : rdata) {
+    elem = (x = xorshift(x));
+  }
+
+  for (int iter=0; iter<100; iter++) {
+    auto f = dir.createFile("rdata");
+    OutputStream os;
+    ASSERT_EQ(0, os.size());
+    char arr[16];
+    // sometimes start off with a user supplied buffer for the output stream
+    if (((x = xorshift(x)) & 0x01u) == 1) {
+      os = OutputStream(arr, arr+rint(sizeof(arr)+1));
+    }
+    os.setFile(f.get());
+
+    int targetLen = rint(rlen-1);
+    const char* start = rbegin + rint(rlen - targetLen);  // start at random place in data
+    const char* end = start + targetLen;  // start at random place in data
+    const char* pos = start;
+
+    // std::cout << "targetLen=" << targetLen << std::endl;
+
+    while (pos < end) {
+      auto a = os.ptr();
+
+      switch(rint(4)) {
+        case 0:
+          os.write(*pos);
+          if constexpr (catch_early) {
+            if (os.ptr() - a == 1) { // same buffer, check for data written
+              ASSERT_EQ(*pos, *a);
+            }
+          }
+          pos++;
+          break;
+        case 1:
+          os.reserve(1);
+          os.unsafeWrite(*pos);
+          if constexpr (catch_early) {
+            if (os.ptr() - a == 1) { // same buffer, check for data written
+              ASSERT_EQ(*pos, *a);
+            }
+          }
+          pos++;
+          break;
+        case 2: {
+          auto sz = std::min(rint(32), (int)(end-pos));
+          os.write(pos, sz);
+          if constexpr (catch_early) {
+            if (os.ptr() - a == sz) { // same buffer, check for data written
+              ASSERT_EQ(0, memcmp(pos, a, sz));
+            }
+          }
+          pos += sz;
+          break;
+        }
+        case 3: {
+          auto sz = std::min(rint(32), (int)(end-pos));
+          os.reserve(sz);
+          os.unsafeWrite(pos, sz);
+          if constexpr (catch_early) {
+            if (os.ptr() - a == sz) { // same buffer, check for data written
+              ASSERT_EQ(0, memcmp(pos, a, sz));
+            }
+          }
+          pos+=sz;
+          break;
+        }
+      }
+    }
+
+    os.close();
+
+    ASSERT_EQ(pos-start, targetLen);
+    dir.finishFile(*f);
+    auto input = dir.openFile("rdata");
+    ASSERT_EQ(targetLen, input->size());
+    auto data = input->read();
+    ASSERT_EQ(targetLen, data.size());
+    ASSERT_EQ(0, memcmp(start, data.data(), targetLen));
+    dir.deleteFile("rdata");
+  }
+
+}

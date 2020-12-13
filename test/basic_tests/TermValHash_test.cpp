@@ -46,6 +46,7 @@ TEST(TermValHash, test_hash) {
 
   val = "now is the time for all good men to come to the aid of their country ";
   val = "wow";
+  val.reserve(10000);
   for (int i=0; i<1000000; i+=1000) {
     val += ' ';
     val += std::to_string(i);
@@ -55,7 +56,7 @@ TEST(TermValHash, test_hash) {
 
   cout << "Inverter size is " << inverter.pool_.size() << endl;
 
-  for (int i=0; i<16000; i++) {
+  for (int i=0; i<1000; i++) {
     segField->indexTokenStream(i+1, &val[0], (int)val.size());
   }
 

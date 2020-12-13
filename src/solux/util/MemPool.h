@@ -129,7 +129,7 @@ public:
 
   // ensures that there is enough space starting with the current buffer (moving to a new buffer if necessary)
   // and returns the resulting end offset into the last (current) block.
-  int ensure(uint32_t size) {
+  int reserve(uint32_t size) {
     assert(size >= 0 && size <= BYTE_BLOCK_SIZE);
     auto newEnd = pos_ + size;
     if (newEnd > BYTE_BLOCK_SIZE) {
@@ -141,7 +141,7 @@ public:
 
   int allocate(uint32_t size) {
 #ifndef BBP_MALLOC
-    int newEnd = ensure(size);
+    int newEnd = reserve(size);
     // char* p = buffer + pos;
     int bbAddr = bbAddress();
     pos_ = newEnd;
@@ -158,7 +158,7 @@ public:
 
   char *allocatePtr(uint32_t size) {
 #ifndef BBP_MALLOC
-    int newEnd = ensure(size);
+    int newEnd = reserve(size);
     auto p = ptr();
     pos_ = newEnd;
     return p;
@@ -171,7 +171,7 @@ public:
     // do allocation and return both the normal pointer as well as the short pool specific pointer (bbptr)
     std::pair<char *, int> allocateAddrs(uint32_t size) {
 #ifndef BBP_MALLOC
-    int newEnd = ensure(size);
+    int newEnd = reserve(size);
     int bbAddr = bbAddress();
     auto p = ptr();
     pos_ = newEnd;
@@ -195,7 +195,7 @@ public:
   int allocateTypeAligned(T *&out) {
 #ifndef BBP_MALLOC
     align();
-    int newEnd = ensure((int) sizeof(T));
+    int newEnd = reserve((int) sizeof(T));
     out = reinterpret_cast<T *>( ptr());
     int bbAddr = bbAddress();
     pos_ = newEnd;
@@ -210,7 +210,7 @@ public:
   // Write PackedTerm format and return a pointer to the start
   // TODO: return PackedTerm reference?
   char* writeStr(const void* data, int sz) {
-    ensure(sz+2);
+    reserve(sz+2);
     auto target = ptr();
     auto sizeOut = PackedTerm::write(target, data, sz);
     pos += sizeOut;
@@ -225,7 +225,7 @@ public:
   // TODO: only used by TermHash...
   Str writeStr(const void *data, int sz) {
 #ifndef BBP_MALLOC
-    ensure(Str::getMaxSize(sz));
+    reserve(Str::getMaxSize(sz));
     auto target = ptr();
     auto sizeOut = Str::write(target, data, sz);
     pos_ += sizeOut;
