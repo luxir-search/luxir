@@ -184,13 +184,13 @@ public:
 
   // expert: should already point to an instance of this type
   // TODO: make this somehow harder to accidentally use!
-  PackedTerm(void* ptr) : ptr_(reinterpret_cast<const char*>(ptr)) { }
-  PackedTerm(void* ptr, uint32_t size) : ptr_(reinterpret_cast<const char*>(ptr)) { }
+  explicit PackedTerm(const void* ptr) : ptr_(reinterpret_cast<const char*>(ptr)) { }
+  explicit PackedTerm(const void* ptr, uint32_t size) : ptr_(reinterpret_cast<const char*>(ptr)) { }
 
   // expert: a pointer to the start of the data... not to the first byte of the string!
   void* ptr() { return (void*)ptr_; }
 
-
+  void setSize(uint32_t sz) { *const_cast<char*>(ptr_) = sz; }
 
 // TODO: do this in a more standard way
   uint64_t hashcode() const {
@@ -236,6 +236,11 @@ public:
       sz = (sz & 0x7f) | (ptr_[1] << 7);
     }
     return sz;
+  }
+
+  // size of both the length and the data
+  uint32_t memorySize() const {
+    return getExactSize(size());
   }
 
   bool operator==(const PackedTerm& other) const {

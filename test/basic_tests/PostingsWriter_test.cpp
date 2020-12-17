@@ -3,6 +3,7 @@
 #include <iostream>
 
 #include "solux/index/PostingsWriter.h"
+#include "solux/search/PostingsReader.h"
 
 
 TEST(PostingsWriter, test_basic) {
@@ -21,4 +22,21 @@ TEST(PostingsWriter, test_basic) {
   writer.endTerm(term1);
   writer.endField("field1");
   writer.finish();
+
+
+  auto tindexFile = dir.openFile("tindex");
+  auto termFile = dir.openFile("term");
+  auto docFile = dir.openFile("doc") ;
+  auto posFile = dir.openFile("pos");
+  PostingsReader reader(tindexFile.get(), termFile.get(), docFile.get(), posFile.get());
+  TermIndexReader tindexReader(pool, reader);
+  tindexReader.readNextField();
+  std::cout << "FIELD NAME name=" << tindexReader.name() << " numTerms=" << tindexReader.numTerms() << std::endl;
+
+  TermEnum tenum(pool, reader, tindexReader);
+  while (tenum.nextTerm()) {
+    std::cout << "TERM=" << tenum.term() << " ord=" << tenum.ord() << std::endl;
+  }
+
+
 }

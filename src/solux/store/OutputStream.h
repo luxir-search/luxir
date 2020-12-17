@@ -1,7 +1,6 @@
-#include <utility>
-
 #pragma once
 
+#include "InputStream.h"
 
 class File;
 
@@ -234,6 +233,8 @@ public:
 
   // Reads all of the file and returns a pointer to the data, which should be valid as long as the InputFile is valid.
   virtual std::string_view read() = 0;
+
+  virtual InputStream getInputStream() = 0;
 };
 
 class RAMInputFile : public InputFile {
@@ -249,26 +250,11 @@ public:
   std::string_view read() override {
     return std::string_view(data.get(), sz);
   }
+
+  InputStream getInputStream() override {
+    return InputStream(data.get(), data.get()+sz);
+  }
+
 };
 
-
-class InputStream;
-
-
-class InputStream {
-  char* pos;
-  char* start;
-  char* end;
-  size_t offset; // the position of "start" in the file
-  File& source;
-public:
-  // TODO: implement a clone type functionality that lucene has that can share the underlying buffer? (operator= or copy constructor)
-  // This could be the mechanism to avoid a virtual call for positioning at a different spot in a memory mapped file?
-};
-
-
-
-// TODO: output and input should perhaps be different classes?
-// hence this should probably be RAMOutputFile
-// What connects them though... just filename?
 
