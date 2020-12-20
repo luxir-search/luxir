@@ -14,8 +14,8 @@
 
 class PostingsReader;
 class TermIndexReader;
-class TermEnum;
-
+class TermsEnum;
+class DocsEnum;
 
 
 // Lowest level postings reader class that needs to correspond to the PostingsWriter class that created the data.
@@ -39,7 +39,7 @@ public:
 
 // not thread safe
 class TermIndexReader {
-  friend class TermEnum;
+  friend class TermsEnum;
 
 
   InputStream is;
@@ -92,14 +92,16 @@ public:
 
 
 
-class TermEnum {
+class TermsEnum {
+  friend class DocsEnum;
+
   InputStream is;
   PostingsReader& postingsReader;
   TermIndexReader& tindexReader;
   MemPool& pool;
 
   PackedTerm currTerm;
-  int32_t ordInBlock = -1;
+  int32_t ordInBlock = -1; // TODO: make ord 1-based everywhere and use 0 for "missing", unset, etc
   uint32_t docsSize;
   uint32_t pulsedDoc;
   uint32_t pulsedPos;
@@ -113,9 +115,8 @@ class TermEnum {
   uint64_t offsetOfPositionsForTermBlock;
   uint64_t cumulativeDocsSize;
 
-
 public:
-  TermEnum(MemPool& pool, PostingsReader& postingsReader, TermIndexReader& tindexReader) : pool(pool), postingsReader(postingsReader), tindexReader(tindexReader) {
+  TermsEnum(MemPool& pool, PostingsReader& postingsReader, TermIndexReader& tindexReader) : pool(pool), postingsReader(postingsReader), tindexReader(tindexReader) {
     is = postingsReader.termFile->getInputStream();
     currTerm = PackedTerm(pool.allocatePtr(256));
   }
@@ -189,6 +190,123 @@ public:
     readTermMetadata();
   }
 
+  // TODO: a push interface that can more quickly/directly handle pulsed postings while allowing inlining?
+  // That could also handle differences between block and doc
+};
+
+
+class DocsEnum {
+  InputStream docIs;
+  InputStream posIs;
+  TermsEnum& tenum;
+  MemPool& pool;
+  int32_t docfreq; // number of docs containing this term
+  uint64_t ttf;  // totalTermFreq
+
+  int32_t docid;
+  int32_t pos;
+  int32_t tfreq;
+  int64_t cumulativeTermFreq;  // to keep track of how many positions need to be skipped.
+  int32_t ordStartBlock = 0;
+  int32_t ordInBlock;
+  uint64_t posOffset;
+  uint64_t posIdx = 0;
+  uint64_t posIdxStart = 0;
+
+  int32_t docsSize;  // size of the postings in the doc file for the given term
+  uint64_t statOfDocs;
+
+  uint64_t cumulativeDocsSize;
+  uint64_t offsetOfDocsForTermBlock;
+  uint64_t offsetOfPositionsForTermBlock;
+
+public:
+  DocsEnum(MemPool& pool, PostingsReader& postingsReader, TermIndexReader& tindexReader, TermsEnum& tenum) : pool(pool), tenum(tenum) {
+    // Since the same terms enum will often be used for multiple docs enum, we should copy everything we need
+    // from the terms enum that we need (that may change.)
+    // TODO: package those dependencies in a struct that can be simply assigned?  Or if there is enough overlap, simply copy the complete tenum?
+    // Or we could invert the responsibility and make the client copy the tenum if they are going to change it.
+    docsSize = tenum.docsSize;
+    if (docsSize == 0) {
+      // postings pulsed
+      docid = tenum.pulsedDoc;
+      pos = tenum.pulsedPos;
+      docfreq = 1;
+      ttf = 1;
+    } else {
+      offsetOfDocsForTermBlock = tenum.offsetOfDocsForTermBlock;
+      offsetOfPositionsForTermBlock = tenum.offsetOfDocsForTermBlock;
+      cumulativeDocsSize = tenum.cumulativeDocsSize;
+      docIs = postingsReader.docFile->getInputStream();
+      // see the end of PostingsWiter.endTerm() for the term-specific metadata written there (docfreq, ttf, etc)
+
+      // read last byte of docs to get the metadata size
+      docIs.seek(offsetOfDocsForTermBlock + cumulativeDocsSize - 1);
+      uint8_t metaSize = docIs.readByte();
+      docIs.relativeSeek(-metaSize - 1); // move to start of metadata
+      docfreq = docIs.readVint();
+      ttf = docfreq + docIs.readVlong();
+      posOffset = docIs.readVlong();
+
+      // start of the actual docs is end of block - size
+      statOfDocs = offsetOfDocsForTermBlock + cumulativeDocsSize - docsSize;
+      docIs.seek(statOfDocs);
+
+      posIs = postingsReader.posFile->getInputStream();
+      posIs.seek(offsetOfPositionsForTermBlock);
+      cumulativeTermFreq = 0;
+    }
+  }
+
+  int32_t numDocs() {
+    return docfreq;
+  }
+
+  int32_t totalTermFreq() {
+    return ttf;
+  }
+
+  int32_t nextDoc() {
+    if (docsSize != 0) {
+      // see PostingsWriter.endTerm() for format of non-block encoded docs/freqs
+      uint32_t doccode = docIs.readVint();
+      if ((doccode & 0x01)==1) {
+        tfreq = 1;
+      } else {
+        tfreq = docIs.readVint();
+      }
+      posIdxStart = cumulativeTermFreq;
+      cumulativeTermFreq += tfreq;
+      docid = doccode >> 1;
+      pos = 0;  // reset positions
+    }
+    return docid;
+  }
+
+  int32_t ord() {
+    return ordStartBlock;
+  }
+
+  int32_t termFreq() {
+    return tfreq;
+  }
+
+  void startPositions() {
+    while (posIdx < posIdxStart) {
+      // need to skip positions
+      // TODO: a faster skipVint (potentially)? inlining may already eliminate the dead code though.
+      auto delta = posIs.readVint();
+    }
+  }
+
+  int32_t nextPosition() {
+    if (docsSize != 0) {
+      auto delta = posIs.readVint();
+      pos += delta;
+    }
+    return pos;
+  }
 
 };
+
 

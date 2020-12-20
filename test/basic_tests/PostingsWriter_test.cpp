@@ -33,10 +33,24 @@ TEST(PostingsWriter, test_basic) {
   tindexReader.readNextField();
   std::cout << "FIELD NAME name=" << tindexReader.name() << " numTerms=" << tindexReader.numTerms() << std::endl;
 
-  TermEnum tenum(pool, reader, tindexReader);
+  TermsEnum tenum(pool, reader, tindexReader);
   while (tenum.nextTerm()) {
     std::cout << "TERM=" << tenum.term() << " ord=" << tenum.ord() << std::endl;
   }
 
+  DocsEnum docsEnum(pool, reader, tindexReader, tenum);
+  auto ndocs = docsEnum.numDocs();
+  std::cout << "\tnumDocs=" << docsEnum.numDocs() << " totalTermFreq=" << docsEnum.totalTermFreq() << std::endl;
+
+  for (int i=0; i<ndocs; i++) {
+    auto id = docsEnum.nextDoc();
+    auto tfreq = docsEnum.termFreq();
+    std::cout << "\t\tdocid=" << id << " termFreq=" << tfreq << std::endl;
+    docsEnum.startPositions();
+    for (int j=0; j<tfreq; j++) {
+      auto pos = docsEnum.nextPosition();
+      std::cout << "\t\t\tpos=" << pos << std::endl;
+    }
+  }
 
 }

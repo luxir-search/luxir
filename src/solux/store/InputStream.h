@@ -22,6 +22,11 @@ public:
     assert(pos <= end);
   }
 
+  void relativeSeek(uint64_t offset) {
+    pos += offset;
+    assert(start <= pos && pos <= end);
+  }
+
   void skip(uint64_t len) {
     pos += len;
     assert(pos <= end);
