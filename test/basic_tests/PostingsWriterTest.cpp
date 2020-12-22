@@ -1,12 +1,12 @@
-
-#include <gtest/gtest.h>
-#include <iostream>
-
 #include "solux/index/PostingsWriter.h"
 #include "solux/search/PostingsReader.h"
+#include "SoluxTest.h"
+
+class PostingsTest : public SoluxTest {
+};
 
 
-TEST(PostingsWriter, test_basic) {
+TEST_F(PostingsTest, basic) {
   RAMDir dir;
   MemPool pool;
   PostingsWriter writer(dir, "gen1");
@@ -52,5 +52,12 @@ TEST(PostingsWriter, test_basic) {
       std::cout << "\t\t\tpos=" << pos << std::endl;
     }
   }
+
+}
+
+
+
+TEST_F(PostingsTest, randWrite) {
+ std::cout << "SEED=" << rng_seed << std::endl;
 
 }

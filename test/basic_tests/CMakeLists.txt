@@ -1,12 +1,12 @@
 include_directories(${gtest_SOURCE_DIR}/include ${gtest_SOURCE_DIR})
 
 add_executable(runBasicTests
-        basic_test.cpp
-        TermValHash_test.cpp
-        Stream_test.cpp
-        PostingsWriter_test.cpp
-        simd_test.cpp
-        test_util.h )
+        BasicTest.cpp
+        TermValHashTest.cpp
+        StreamTest.cpp
+        PostingsWriterTest.cpp
+        SIMDCompTest.cpp
+        SoluxTest.h)
 
 target_link_libraries(runBasicTests gtest gtest_main)
 target_link_libraries(runBasicTests solux_lib SIMDCompressionAndIntersection)

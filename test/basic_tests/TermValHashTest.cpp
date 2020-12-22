@@ -7,7 +7,7 @@
 using namespace std;
 
 
-TEST(TermValHash, test_hash) {
+TEST(TermValHash, testHash) {
 
   Inverter inverter;
 

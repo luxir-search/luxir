@@ -3,16 +3,17 @@
 #include <iostream>
 #include "simdcomp/include/codecfactory.h"
 #include "simdcomp/include/intersection.h"
-#include "test_util.h"
+#include "SoluxTest.h"
 
 using namespace std;
 using namespace SIMDCompressionLib;
 
-
+class SIMDCompTest : public SoluxTest {
+};
 
 
 // started from SIMDCompressionAndIntersection example.cpp
-TEST(simd_test, test_comp) {
+TEST_F(SIMDCompTest, testComp) {
   // We pick a CODEC
   // https://arxiv.org/pdf/1401.6399.pdf
   //
@@ -39,9 +40,9 @@ TEST(simd_test, test_comp) {
   uint32_t val = 0;
   vector<uint32_t> mydata(N);
   for (uint32_t i = 0; i < N; ++i) {
-    val += rint(10) + 1;
-    if (rint(10) < 3) val += rint(100);
-    if (rint(10) < 1) val += rint(200);
+    val += rng.rint(10) + 1;
+    if (rng.rint(10) < 3) val += rng.rint(100);
+    if (rng.rint(10) < 1) val += rng.rint(200);
     mydata[i] = val;
   }
 
@@ -105,7 +106,7 @@ TEST(simd_test, test_comp) {
   val = 0;
   vector<uint32_t> mydata2(N);
   for (uint32_t i = 0; i < N; ++i) {
-    if (rint(10) < 1) {
+    if (rng.rint(10) < 1) {
       // 10% of the time, select a value from the other list so we will get some matches.
       for (auto other : mydata) { // n^2 alg here, but test lists are small
         if (other > val) {  // first value that fits the bill
@@ -114,7 +115,7 @@ TEST(simd_test, test_comp) {
         }
       }
     } else {
-      val += rint(10)+1;
+      val += rng.rint(10)+1;
     }
 
     mydata2[i] = val;

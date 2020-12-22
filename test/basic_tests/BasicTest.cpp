@@ -7,35 +7,35 @@ using namespace std;
 
 // Basic sanity tests
 
-TEST(basic_test, test_compiler) {
+TEST(BasicTest, testCompiler) {
+  // TODO: move some of this to main() so it always appears at the start.
+  std::cout << "############## TEST environment info:";
 #ifdef NDEBUG
-  cerr << "DEBUGGING DISABLED NDEBUG=" << NDEBUG;
+  std::cout << "DEBUGGING DISABLED NDEBUG=" << NDEBUG;
 #else
-  cerr << "Debugging!";
+  std::cout << "Debugging!";
 #endif
 
-  std::cerr << " __cplusplus=" << __cplusplus;
+  std::cout << " __cplusplus=" << __cplusplus;
 #ifdef __VERSION__
-  std::cerr << " __VERSION__=" << __VERSION__;
+  std::cout << " __VERSION__=" << __VERSION__;
 #endif
 #ifdef __GNUC__
-  std::cerr << " __GNUC__=" << __GNUC__;
+  std::cout << " __GNUC__=" << __GNUC__;
 #endif
 #ifdef _MSC_VER
-  std::cerr << " _MSC_VER=" << _MSC_VER;
+  std::cout << " _MSC_VER=" << _MSC_VER;
 #endif
 #ifdef __clang__
-  std::cerr << " __clang__=" << __clang__;
+  std::cout << " __clang__=" << __clang__;
 #endif
 #ifdef __linux__
-  std::cerr << " __linux__=" << __linux__;
+  std::cout << " __linux__=" << __linux__;
 #endif
 #ifdef __OPTIMIZE__
-  std::cerr << " __OPTIMIZE__=" << __OPTIMIZE__;
+  std::cout << " __OPTIMIZE__=" << __OPTIMIZE__;
 #endif
-
-  std::cerr << std::endl;
-  std::cerr << "sizeof(std::string)==" << sizeof(std::string) << std::endl;
+  std::cout << "sizeof(std::string)==" << sizeof(std::string) << std::endl;
 
     // Some of our basic expectations...
     // We would need a thorough code review if any of these are broken.
@@ -68,7 +68,7 @@ char* returnsStackAddr(char* ptr) {
 
 // TODO: get memory sanitizer working (requires everything linked to be compiled with that!)
 // If you want to try out various sanitizers, uncomment one of the BUG lines below.
-TEST(basic_test, test_address_sanitizer) {
+TEST(BasicTest, testAddressSanitizer) {
   constexpr int size = 16;
   char onstack[size];
   char* arr = onstack;
@@ -102,12 +102,6 @@ TEST(basic_test, test_address_sanitizer) {
 
 }
 
-
-
-TEST(basic_test, test_neq) {
-    EXPECT_NE(1, 0);
-    // EXPECT_EQ(1,2);
-}
 
 
 // test too large tokens
