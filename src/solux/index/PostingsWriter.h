@@ -550,6 +550,8 @@ public:
   }
 
   void startDoc(int32_t doc) {
+    totalTermFreqPrevDoc = getTotalTermFreq();
+
     // Do we need to know the current doc?
 
     // We don't keep track of positions for the doc... we block encode all positions for a term together.

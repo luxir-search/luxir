@@ -234,6 +234,7 @@ public:
       docfreq = 1;
       ttf = 1;
     } else {
+      docid = 0; // we delta-encode, so start from 0.  TODO: should we start at -1?  As it is now, a term with all docs will yield a delta list of 0,1,1,1,1... not optimal for RLE
       offsetOfDocsForTermBlock = tenum.offsetOfDocsForTermBlock;
       offsetOfPositionsForTermBlock = tenum.offsetOfDocsForTermBlock;
       cumulativeDocsSize = tenum.cumulativeDocsSize;
@@ -277,7 +278,8 @@ public:
       }
       posIdxStart = cumulativeTermFreq;
       cumulativeTermFreq += tfreq;
-      docid = doccode >> 1;
+      auto docDelta = doccode >> 1;
+      docid += docDelta;
       pos = 0;  // reset positions
     }
     return docid;
@@ -303,6 +305,7 @@ public:
     if (docsSize != 0) {
       auto delta = posIs.readVint();
       pos += delta;
+      posIdx++;
     }
     return pos;
   }

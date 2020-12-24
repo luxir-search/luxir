@@ -118,6 +118,10 @@ TEST_F(PostingsTest, basic) {
   writer.addPositionDelta(3);
   writer.addPositionDelta(10);
   writer.endDoc(7);
+  writer.startDoc(11);
+  writer.addPositionDelta(0);
+  writer.addPositionDelta(300);
+  writer.endDoc(11);
   writer.endTerm(term1);
   writer.endField("field1");
   writer.finish();

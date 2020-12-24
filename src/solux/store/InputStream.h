@@ -22,7 +22,7 @@ public:
     assert(pos <= end);
   }
 
-  void relativeSeek(uint64_t offset) {
+  void relativeSeek(int64_t offset) {
     pos += offset;
     assert(start <= pos && pos <= end);
   }
@@ -102,7 +102,10 @@ public:
     assert(pos <= end);
   }
 
-  // The returned PackedTerm points into this InputStream
+  // The returned PackedTerm points into this InputStream.
+  // NOTE: if we create other implementations that read chunk-at-a-time, then this PackedTerm
+  // could either be split or later invalidated by more reads on the InputStream.  This won't
+  // happen for memory-mapped files or for RAMDir.
   PackedTerm readPackedTerm() {
     PackedTerm term(const_cast<char*>(pos));
     pos += term.memorySize();
