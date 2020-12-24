@@ -131,43 +131,24 @@ public:
 
 
 
-// The length is part of the data (a one or 2 byte prefix, supporting sizes up to 32K)
+// A term has a byte of size (0-255) followed directly by the data.
 class PackedTerm {
-  // TODO: could also just have a char[1] data member here and use the address of that...
-  // then instead of casting a pointer to PackedTerm, we'd cast a pointer to a pointer-to-PackedTerm???
-  const char* ptr_;
-
+  char* ptr_;
 public:
-  static uint32_t getMaxSize(uint32_t size) { return size + 2; }
-  static uint32_t getExactSize(uint32_t size) { return ((size < 128) ? 1 : 2) + size; }
+  static uint32_t getMaxSize(uint32_t size) { return size + 1; }
+  static uint32_t getExactSize(uint32_t size) { return size + 1; }
 
   // returns the number of bytes written to the target... either sz+1 or sz+2
-  inline static int write(char* target, const void* data, int sz) {
-    int sizeBytes;
-    if (sz<128) {
-      target[0] = (char)sz;
-      sizeBytes = 1;
-    } else {
-      target[0] = (char)(sz | 0x80);
-      target[1] = (char)(sz>>7);
-      sizeBytes = 2;
-    }
-    memcpy(target+sizeBytes, data, (size_t)sz);
-    return sz + sizeBytes;
+  inline static uint32_t write(char* target, const void* data, uint32_t sz) {
+    target[0] = sz;
+    memcpy(target+1, data, (size_t)sz);
+    return sz + 1;
   }
-  inline static const char* write(MemPool& targetPool, const void* data, uint32_t sz) {
+
+  inline static char* write(MemPool& targetPool, const void* data, uint32_t sz) {
     auto totalSz = getExactSize(sz);
     auto target = targetPool.allocatePtr(totalSz);
     write(target, data, sz);
-    return target;
-  }
-
-  // this version seemed a little faster for clang, but not for g++
-  inline static const char* write2(MemPool& targetPool, const void* data, uint32_t sz) {
-    targetPool.reserve(getMaxSize(sz));
-    auto target = targetPool.ptr();
-    auto sizeOut = write(target, data, sz);
-    targetPool.pos_ += sizeOut;
     return target;
   }
 
@@ -179,133 +160,99 @@ public:
 
   // expert: should already point to an instance of this type
   void init(void* ptr, uint32_t size) {
-    ptr_ = reinterpret_cast<const char*>(ptr);
+    ptr_ = reinterpret_cast<char*>(ptr);
   }
 
   // expert: should already point to an instance of this type
   // TODO: make this somehow harder to accidentally use!
-  explicit PackedTerm(const void* ptr) : ptr_(reinterpret_cast<const char*>(ptr)) { }
-  explicit PackedTerm(const void* ptr, uint32_t size) : ptr_(reinterpret_cast<const char*>(ptr)) { }
+  explicit PackedTerm(void* ptr) : ptr_(reinterpret_cast<char*>(ptr)) { }
+  explicit PackedTerm(void* ptr, uint32_t size) : ptr_(reinterpret_cast<char*>(ptr)) { }
 
   // expert: a pointer to the start of the data... not to the first byte of the string!
   void* ptr() { return (void*)ptr_; }
 
-  void setSize(uint32_t sz) { *const_cast<char*>(ptr_) = sz; }
+  // the number of bytes in the value, not including the bytes to encode the length
+  uint32_t size() const noexcept {
+    return *(unsigned char*)ptr_;
+  }
+
+  char* data() const noexcept {
+    return ptr_+1;
+  }
+
+  // returns the unpacked term as a pair of pointer,size
+  std::tuple<const char*, uint32_t> unpack() const {
+    return {ptr_+1, size()};
+  };
+
+  // expert: Up to you not to misuse this.
+  void setSize(uint32_t sz) { ptr_[0] = (char)sz; }
 
 // TODO: do this in a more standard way
   uint64_t hashcode() const {
-    int sz = ptr_[0];
-    int off=1;
-    if (sz & 0x80) {  // this branch normally won't be taken
-      sz = (sz & 0x7f) | (ptr_[1]<<7);
-      off=2;
-    }
-    return Hash::hash(ptr_+off, sz);
+    return Hash::hash(ptr_+1, size());
   }
 
   bool isNull() const { return ptr_ == nullptr; }
 
-
   // compare to raw bytes
   bool equals(const void* ptr, int len) const {
-    int sz = ptr_[0];
-    int off=1;
-    if (sz & 0x80) {  // this branch normally won't be taken
-      sz = (sz & 0x7f) | (ptr_[1]<<7);
-      off=2;
-    }
-    return sz == len && memcmp(ptr_+off, ptr, (size_t)len)==0;
-  }
-
-  // returns the unpacked term as a pair of pointer,size
-  std::tuple<const char*, int> unpack() const {
-    int sz = ptr_[0];
-    int off=1;
-    if (sz & 0x80) {  // this branch normally won't be taken
-      sz = (sz & 0x7f) | (ptr_[1]<<7);
-      off=2;
-    }
-    return {ptr_+off, sz};
-  };
-
-
-  // the number of bytes in the value, not including the bytes to encode the length
-  int size() const {
-    int sz = ptr_[0];
-    if (sz & 0x80) {  // this branch normally won't be taken
-      sz = (sz & 0x7f) | (ptr_[1] << 7);
-    }
-    return sz;
+    auto sz =size();
+    return sz == len && memcmp(ptr_+1, ptr, (size_t)len)==0;
   }
 
   // size of both the length and the data
   uint32_t memorySize() const {
-    return getExactSize(size());
+    return size()+1;
   }
 
   bool operator==(const PackedTerm& other) const {
-    // TODO: try just using unpack, verify no slowdown.  Once we use a hash table
-    // that embeds part of the hash code, this should normally return true at this
-    // point any sort of potential short circuiting won't matter here.
+    auto sz1 = size();
+    auto sz2 = other.size();
 
-    int sz1 = ptr_[0];
-    int off=1;
-    if (sz1 & 0x80) {  // this branch normally won't be taken
-      sz1 = (sz1 & 0x7f) | (ptr_[1]<<7);
-      off=2;
-    }
-
-    int sz2 = other.ptr_[0];
-    int off2=1;
-    if (sz1 & 0x80) {  // this branch normally won't be taken
-      sz1 = (sz1 & 0x7f) | (other.ptr_[1]<<7);
-      off2=2;
-    }
     if (sz1 != sz2) {
       return false;
     }
 
     // TODO: make sure memcmp is faster/equal to a loop for likely small strings
-    return memcmp(ptr_+off, other.ptr_+off, sz1) == 0;
+    return memcmp(ptr_+1, other.ptr_+1, sz1) == 0;
   }
-
-  int compare(const PackedTerm& other) const {
-    int sz1 = ptr_[0];
-    int off=1;
-    if (sz1 & 0x80) {  // this branch normally won't be taken
-      sz1 = (sz1 & 0x7f) | (ptr_[1]<<7);
-      off=2;
-    }
-
-    int sz2 = other.ptr_[0];
-    int off2=1;
-    if (sz1 & 0x80) {  // this branch normally won't be taken
-      sz1 = (sz1 & 0x7f) | (other.ptr_[1]<<7);
-      off2=2;
-    }
-
-    // TODO: make sure memcmp is faster/equal to a loop for likely small strings
-    int cmp = memcmp(ptr_+off, other.ptr_+off2, (size_t)std::min(sz1, sz2));
-    return cmp != 0 ? cmp : (sz1-sz2);
-  }
-
-  bool operator<(const PackedTerm& other) const {
-    return compare(other) < 0;
-  }
-
 
   friend std::ostream& operator<< (std::ostream &out, const PackedTerm &term) {
     if (term.isNull()) {
       out << "(null)";
     } else {
+      // TODO: perhaps escape unprintable bytes?
       auto [p,sz] = term.unpack();
-      out.write((const char *) p, sz);
+      out.write(p, sz);
     }
     return out;
   }
 
 };
 
+inline bool operator==(const PackedTerm& p, const std::string& s) {
+  auto [data,sz] = p.unpack();
+  if (sz != s.size()) return false;
+  return memcmp(data, s.data(), sz) == 0;
+}
+inline bool operator==(const std::string& s, const PackedTerm& p) {
+  return p==s;
+}
+
+inline int operator<=>(const PackedTerm& a, const PackedTerm& b) {
+  int datacmp = memcmp(a.data(), b.data(), std::min(a.size(),b.size()));
+  return (datacmp != 0) ? datacmp : ((int)a.size() - (int)b.size());
+}
+
+inline int operator<=>(const PackedTerm& p, const std::string& s) {
+  auto [data,sz] = p.unpack();
+  int datacmp = memcmp(data, s.data(), std::min((size_t)sz, s.size()));
+  return (datacmp != 0) ? datacmp : ((int)sz - (int)s.size());
+}
+inline int operator<=>(const std::string& s, const PackedTerm& p) {
+  return -(p <=> s);
+}
 
 namespace std {
 template<>
