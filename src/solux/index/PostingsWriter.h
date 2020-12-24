@@ -492,6 +492,7 @@ public:
           docOutput.writeVint(tfreq);
         }
       }
+      docsFlushed += docs.size();
       docs.resize(0);
       tfreqs.resize(0);
 
