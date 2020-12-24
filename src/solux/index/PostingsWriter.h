@@ -309,8 +309,7 @@ public:
     docCodec.encodeArray(reinterpret_cast<uint32_t *>(docs.data()), docs.size(), compressed_output.data(),
                       compressedSize);
     docOutput.write(compressed_output.data(), compressedSize);
-    docsFlushed += docs.size();
-    docs.resize(0);
+
 
     //
     // now the term freqs
@@ -320,6 +319,10 @@ public:
     tfreqCodec.encodeArray(reinterpret_cast<uint32_t *>(docs.data()), docs.size(), compressed_output.data(),
                            compressedSize);
     docOutput.write(compressed_output.data(), compressedSize);
+
+    docsFlushed += docs.size();
+    docs.resize(0);
+    tfreqs.resize(0);
 
     // TODO: add data (or keep track of blocks) for docs skip list
   }
@@ -489,6 +492,9 @@ public:
           docOutput.writeVint(tfreq);
         }
       }
+      docs.resize(0);
+      tfreqs.resize(0);
+
 
       // The reader can find the start or end of a doc block from the terms dictionary (since blocks are all adjacent)
       // So we can store info at the end of the block as well (but need to encode backwards, or have a single byte metadata

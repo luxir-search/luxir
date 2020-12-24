@@ -31,12 +31,19 @@
 //     auto saved_rng = rng;  // after this point, the rngs should output the same sequence of values.
 //
 
+//
+// TODO: switch from std::cout to some sort of logging framework where we can disable output like this by default and
+// easily enable for debugging.  Research NanoLog more... only has support for printf type formatters
+// (i.e. logging a vector of string wouldn't work...) but perhaps we could come up with some macros that check if a message would be logged
+// and only then generate a string from an object.  Or, start with something with better support / adoption (and Windows support), like spdlog.
+// Also: investigate g3log's crash resistance / logging.
+//
 
 // Adapted from http://prng.di.unimi.it/splitmix64.c (ORIG LICENSE: CC0 / public domain)
 class SplitMix64 {
   uint64_t x;
 public:
-  explicit SplitMix64() {} // unseeded! call reseed() before using.
+  explicit SplitMix64() {} // unseeded! call init() before using.
   explicit SplitMix64(uint64_t seed) : x(seed) {}
   void init(uint64_t seed) {
     x = seed;
@@ -56,16 +63,27 @@ class RomuTrio {
   uint64_t xState, yState, zState;
 
 public:
+  // Expert! Directly seed internal state without any mixing.  The seeds should
+  // be high quality, or the first number of values should be discarded.  In all cases, there
+  // should be at least one non-zero state.
+  void init(uint64_t seed1, uint64_t seed2,  uint64_t seed3) {
+    xState = seed1;
+    yState = seed2;
+    zState = seed3;
+  }
+
+  // Seed from a normal (potentially low quality) seed.  A separate PRNG is used to
+  // generate a high quality internal state from the provided seed.
   void init(uint64_t seed) {
     // xState will be used unchanged to return the first value, so we should either discard the first
     // value, or use another PRNG to initialize the seed.  If initialization speed is important, we
     // really probably only need to have a good seed for xState.
     SplitMix64 seeder(seed);
-    xState = seeder();
-    yState = seeder();
-    zState = seeder();
+    init(seeder(), seeder(), seeder());
   }
-  explicit RomuTrio() {}
+
+  explicit RomuTrio() {} // unseeded! call init() before using.
+
   explicit RomuTrio(uint64_t seed) {
     init(seed);
   }
@@ -83,7 +101,7 @@ public:
 
 
 // TODO: implement interfaces expected of std random engines so we can use these in conjunction with
-// other standard lib random code.
+// other standard lib random code (like distribution generation)
 template <class Engine>
 class SoluxRand {
   Engine engine;
@@ -105,6 +123,7 @@ public:
     return engine();
   }
 
+  // templates to try to work with ints, longs, signed, unsigned, w/o casting.
   template <typename T>
   T rint(T max) {
     return engine() % max;
@@ -116,7 +135,10 @@ public:
   }
 
   bool rbool() {
-    return (engine() & 0x01);
+    // Lowest bits can be lower quality for some engines, so use highest bit.
+    // For most architectures, this is compiled to a shift, which should be the same
+    // speed as a logical and.
+    return ((int64_t)engine()) < 0;
   }
 
   uint8_t rbyte() {

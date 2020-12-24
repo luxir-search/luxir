@@ -28,7 +28,7 @@ TEST_F(OutputStreamTest, randWrite) {
     elem = rng();
   }
 
-  for (int iter=0; iter<100; iter++) {
+  for (int iter=0; iter<1000; iter++) {
     auto f = dir.createFile("rdata");
     OutputStream os;
     ASSERT_EQ(0, os.size());
