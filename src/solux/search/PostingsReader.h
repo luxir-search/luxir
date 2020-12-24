@@ -232,6 +232,7 @@ public:
       docid = tenum.pulsedDoc;
       pos = tenum.pulsedPos;
       docfreq = 1;
+      tfreq = 1;
       ttf = 1;
     } else {
       docid = 0; // we delta-encode, so start from 0.  TODO: should we start at -1?  As it is now, a term with all docs will yield a delta list of 0,1,1,1,1... not optimal for RLE

@@ -183,8 +183,7 @@ public:
   // needed to build each block
   std::vector<TermRef> termList;  // list of terms in the current term block
   std::vector<uint32_t> docFileSize;         // size of the data in the docs file for this term (TODO: can we guarantee that this isn't bigger than 2B or 4B?)
-  std::vector<uint32_t> pulsedDoc; // if docFileSize==0, then the term has a single doc/pos that is pulsed, and those values are the next in this list.
-  std::vector<uint32_t> pulsedPos;
+  std::vector<int32_t> pulsed; // if docFileSize==0, then the term has a single doc/pos that is pulsed, and those values are the next in this list.
 
   // needed for each term
   std::vector<int32_t> docs; // list of documents containing a term
@@ -334,18 +333,13 @@ public:
 
   // called starting a new field, or after flushing a term block.
   void _startTermBlock(bool endingField) {
-    // is the branch here even worth it?  the extra work should be cheap + redundant.
-    if (!endingField) {
-      termList.resize(0);
-      docFileSize.resize(0);
-      pulsedDoc.resize(0);
-      pulsedPos.resize(0);
-      offsetOfPositionsForTermBlock = posOutput.size() - fieldInfo.posOffset;
-      offsetOfDocsForTermBlock = docOutput.size() - fieldInfo.docsOffset;
-    }
+    termList.resize(0);
+    docFileSize.resize(0);
+    pulsed.resize(0);
+    offsetOfPositionsForTermBlock = posOutput.size() - fieldInfo.posOffset;
+    offsetOfDocsForTermBlock = docOutput.size() - fieldInfo.docsOffset;
+
     offsetOfTermBlock = termOutput.size() - fieldInfo.termsOffset;
-
-
     fieldInfo.termBlockOffsets.push_back(offsetOfTermBlock);
   }
 
@@ -412,13 +406,12 @@ public:
       // a doc block from it's tail anyway.  We could save a little space (smaller doc skipping index) if we didn't need
       // to encode the start of the block there though.
 
-      // This is also were we "pulse" (directly include) a term that only has a single doc and position.
-      // A doc block will have a minimum size... hence we can use a small docBlockSize to encode the size of pulsed data.
+      // This is also where we "pulse" (directly include) a term that only has a single doc and position.
+      // A doc block will have a minimum size... hence we cloud use (FUTURE) a small docBlockSize to encode the size of pulsed data.
       auto docsSize = docFileSize[i];
       if (docsSize == 0) {
-        auto doc = pulsedDoc[pulsedIdx];
-        auto pos = pulsedDoc[pulsedIdx];
-        pulsedIdx++;
+        auto doc = pulsed[pulsedIdx++];
+        auto pos = pulsed[pulsedIdx++];
         // TODO: optimize this wasteful encoding.
         // We could add enough to the minimum size of a docs block so that we could use the low 4 bits as a group
         // varint encoding.  This would also speed up skipping over a pulsed term.  We could also put pulsed terms
@@ -433,7 +426,7 @@ public:
       }
     }
 
-    assert(pulsedIdx == pulsedDoc.size());  // we should have read all pulsed docs;
+    assert(pulsedIdx == pulsed.size());  // we should have read all pulsed docs/pos;
 
     if (!endingField) {
       _startTermBlock(endingField);
@@ -456,8 +449,14 @@ public:
       assert(getDocFileSize()==0 && docs.size()==1 && posdeltas.size() == 1);
       docFileSize.push_back(0);
       // the doc+position will be remembered to be included directly in the term dictionary (i.e. pulsing)
-      pulsedDoc.push_back(docs[0]);
-      pulsedDoc.push_back(posdeltas[0]);  // the first position delta is equal to the actual position
+      pulsed.push_back(docs[0]);
+      pulsed.push_back(posdeltas.back());
+      posdeltas.pop_back();
+
+      docsFlushed += docs.size();
+      docs.resize(0);
+      tfreqs.resize(0);
+
     } else {
       // Finish positions that were not block encoded
       // TODO: possibly block encode positions across terms?  For that we would want ttf encoded in the terms dict (or could also store sum of all prev in docs file)

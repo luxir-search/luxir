@@ -2,6 +2,8 @@
 #include "solux/search/PostingsReader.h"
 #include "gtest/gtest.h"
 #include "SoluxTest.h"
+#include<boost/container/static_vector.hpp>
+
 
 class PostingsTest : public SoluxTest {
 protected:
@@ -111,18 +113,27 @@ TEST_F(PostingsTest, basic) {
   PostingsWriter writer(dir, "gen1");
   writer.startField("field1");
   std::string t1 = "term1";
+  std::string t2 = "term2";
   TermRef term1(pool,t1.data(),t1.size());
-  writer.startTerm(term1);
+  TermRef term2(pool,t2.data(),t2.size());
+
+  writer.startTerm(term1);  // single doc, single position... this should be pulsed
+  writer.startDoc(44);
+  writer.addPositionDelta(1);
+  writer.endDoc(44);
+  writer.endTerm(term1);
+
+  writer.startTerm(term2);
   writer.startDoc(7);
   writer.addPositionDelta(5);
   writer.addPositionDelta(3);
   writer.addPositionDelta(10);
   writer.endDoc(7);
-  writer.startDoc(11);
+  writer.startDoc(22);
   writer.addPositionDelta(0);
   writer.addPositionDelta(300);
-  writer.endDoc(11);
-  writer.endTerm(term1);
+  writer.endDoc(22);
+  writer.endTerm(term2);
   writer.endField("field1");
   writer.finish();
 
@@ -139,20 +150,20 @@ TEST_F(PostingsTest, basic) {
   TermsEnum tenum(pool, reader, tindexReader);
   while (tenum.nextTerm()) {
     std::cout << "TERM=" << tenum.term() << " ord=" << tenum.ord() << std::endl;
-  }
 
-  DocsEnum docsEnum(pool, reader, tindexReader, tenum);
-  auto ndocs = docsEnum.numDocs();
-  std::cout << "\tnumDocs=" << docsEnum.numDocs() << " totalTermFreq=" << docsEnum.totalTermFreq() << std::endl;
+    DocsEnum docsEnum(pool, reader, tindexReader, tenum);
+    auto ndocs = docsEnum.numDocs();
+    std::cout << "\tnumDocs=" << docsEnum.numDocs() << " totalTermFreq=" << docsEnum.totalTermFreq() << std::endl;
 
-  for (int i=0; i<ndocs; i++) {
-    auto id = docsEnum.nextDoc();
-    auto tfreq = docsEnum.termFreq();
-    std::cout << "\t\tdocid=" << id << " termFreq=" << tfreq << std::endl;
-    docsEnum.startPositions();
-    for (int j=0; j<tfreq; j++) {
-      auto pos = docsEnum.nextPosition();
-      std::cout << "\t\t\tpos=" << pos << std::endl;
+    for (int i = 0; i < ndocs; i++) {
+      auto id = docsEnum.nextDoc();
+      auto tfreq = docsEnum.termFreq();
+      std::cout << "\t\tdocid=" << id << " termFreq=" << tfreq << std::endl;
+      docsEnum.startPositions();
+      for (int j = 0; j < tfreq; j++) {
+        auto pos = docsEnum.nextPosition();
+        std::cout << "\t\t\tpos=" << pos << std::endl;
+      }
     }
   }
 
