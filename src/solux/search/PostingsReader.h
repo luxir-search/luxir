@@ -255,7 +255,7 @@ public:
       docIs.seek(statOfDocs);
 
       posIs = postingsReader.posFile->getInputStream();
-      posIs.seek(offsetOfPositionsForTermBlock);
+      posIs.seek(offsetOfPositionsForTermBlock + posOffset);
       cumulativeTermFreq = 0;
     }
   }

@@ -197,7 +197,7 @@ public:
   uint64_t offsetOfPositionsForTerm;
   uint64_t offsetOfDocsForTerm;
 
-  uint64_t positionsFlushed;  /// number of positions flushed for the current term so far
+  uint64_t positionsHandled;  /// number of positions handled for the current term so far (everything except posdeltas)
   uint32_t docsFlushed;  /// number of documents flushed for the current term so far
   uint64_t totalTermFreqPrevDoc = 0; // total term freq up through the previous doc
 
@@ -224,7 +224,7 @@ private:  // some internal utility methods... not for use by indexers
 
   // total number of positions for the current term
   uint64_t getTotalTermFreq() const {
-    return positionsFlushed + posdeltas.size();
+    return positionsHandled + posdeltas.size();
   }
 
   // total number of positions for the current doc
@@ -286,7 +286,7 @@ public:
 
     posOutput.write(compressed_output.data(), compressedSize);
 
-    positionsFlushed += posdeltas.size();
+    positionsHandled += posdeltas.size();
     posdeltas.resize(0);
   }
 
@@ -437,7 +437,7 @@ public:
   void startTerm(TermRef term) {
     termList.push_back(term);  // we don't really need the term name at this point (could add in endTerm), but it might be nice for debugging / exceptions?
     docsFlushed = 0;
-    positionsFlushed = 0;
+    positionsHandled = 0;
     offsetOfPositionsForTerm = posOutput.size();
     offsetOfDocsForTerm = docOutput.size();
   }
@@ -452,6 +452,7 @@ public:
       pulsed.push_back(docs[0]);
       pulsed.push_back(posdeltas.back());
       posdeltas.pop_back();
+      positionsHandled++;
 
       docsFlushed += docs.size();
       docs.resize(0);
@@ -465,6 +466,8 @@ public:
         // TODO: try group varint
         posOutput.writeVint(posDelta);
       }
+      positionsHandled += posdeltas.size();
+      posdeltas.resize(0);
 
       // Finish docs that were not block encoded.  In this case, we simply interleave docs and termfreqs
       // for more efficient incremental decode.
