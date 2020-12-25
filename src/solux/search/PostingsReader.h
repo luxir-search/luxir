@@ -31,6 +31,12 @@ public:
   PostingsReader(InputFile* tindexFile, InputFile* termFile, InputFile* docFile, InputFile* posFile)
   : tindexFile(tindexFile), termFile(termFile), docFile(docFile), posFile(posFile)
   {
+    std::cout << "DEBUG:"
+      << " tindexFile=" << tindexFile->size()
+      << " termFile=" << termFile->size()
+      << " docFile=" << docFile->size()
+      << " posFile=" << posFile->size()
+      << std::endl;
   }
 
 };

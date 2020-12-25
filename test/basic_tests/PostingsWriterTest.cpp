@@ -15,17 +15,42 @@ protected:
 
 
   // set these limits lower for easier debugging
-  uint32_t positionsPerDocMax=4;
-  uint32_t docsPerTermMax=4;
-  uint32_t termsPerFieldMax=4;
+  uint32_t positionsPerDocMax=10;  // TODO: We don't have support for reading blocks yet, so make sure positionsPerDocMax*docsPerTermMax is less than a positions block size
+  uint32_t docsPerTermMax=10;
+  uint32_t termsPerFieldMax=100;  // TODO: stick to a single block for now
+
+
+  std::unique_ptr<PostingsReader> reader;
+  std::unique_ptr<TermIndexReader> tindexReader;
+  std::unique_ptr<TermsEnum> tenum;
+  std::unique_ptr<DocsEnum> docsEnum;
+
+  rng_type rng_start;
 
 
   PostingsTest() {
 
   }
 
-  void init() {
+  void initWriter() {
     writer = std::make_unique<PostingsWriter>(dir,"gen1");
+
+    // save the RNG state
+    rng_start = rng;
+  }
+
+  void initReader() {
+    writer->finish();
+
+    auto tindexFile = dir.openFile("tindex");
+    auto termFile = dir.openFile("term");
+    auto docFile = dir.openFile("doc") ;
+    auto posFile = dir.openFile("pos");
+    reader = std::make_unique<PostingsReader>(tindexFile.get(), termFile.get(), docFile.get(), posFile.get());
+    tindexReader = std::make_unique<TermIndexReader>(pool, *reader);
+
+    // restore the RNG state
+    rng = rng_start;
   }
 
   uint32_t getPositionDelta(int nPositions) {
@@ -42,65 +67,128 @@ protected:
     return rng.rint(1u, positionsPerDocMax);
   }
 
+  uint32_t getNumDocs(uint32_t numTerms) {
+    return rng.rint(1u,docsPerTermMax);
+     2;
+  }
+
   uint32_t getNumTerms(uint32_t numFields) {
     return rng.rint(1u, termsPerFieldMax);
   }
 
-  uint32_t getNumDocs(uint32_t numTerms) {
-    return rng.rint(1u,docsPerTermMax);
-  }
 
-  void addDoc(int docid, uint32_t numPositions) {
-    writer->startDoc(docid);
+  // numPositions is changed to the actual number indexed (random positions can overflow max)
+  void addDoc(bool read, int docid, uint32_t& numPositions) {
+    uint32_t readTf = 0;
+    if (read) {
+      auto readid = docsEnum->nextDoc();
+      ASSERT_EQ(docid, readid);
+      readTf = docsEnum->termFreq();  // read the tf first, but don't compare it until later
+      docsEnum->startPositions();
+    } else {
+      writer->startDoc(docid);
+    }
     uint64_t position = 0;
+    uint32_t actualPositions = 0;
     for (int i=0; i<numPositions; i++) {   // TODO: introduce constants for limits
       auto delta = getPositionDelta(numPositions);
       position += delta;
       if (position >= INT_MAX) {
         break;
       }
-      writer->addPositionDelta(delta);
+      actualPositions++;
+      if (read) {
+        auto pos = docsEnum->nextPosition();
+        // std::cout << "\t\tread pos=" << pos << std::endl;
+        ASSERT_EQ(position, pos);
+      } else {
+        // std::cout << "\t\tadding posDelta=" << delta << " pos=" << position << std::endl;
+        writer->addPositionDelta(delta);
+      }
     }
-    writer->endDoc(docid);
+    if (read) {
+      ASSERT_EQ(readTf, actualPositions);
+      // undefined behavior reading positions past termFreq
+    } else {
+      writer->endDoc(docid);
+    }
+    numPositions = actualPositions;
   }
 
 
-  void addTerm(const std::string& term, uint32_t numDocs) {
-    TermRef termRef(pool,term.data(),term.size());
-    writer->startTerm(termRef);
+  void addTerm(bool read, const std::string& term, uint32_t numDocs) {
+    TermRef termRef;
+    uint32_t numDocsRead = 0;
+    if (read) {
+      if (numDocs > 0) {
+        ASSERT_TRUE(tenum->nextTerm());
+        ASSERT_EQ(tenum->term(), term);
+        docsEnum = std::make_unique<DocsEnum>(pool, *reader, *tindexReader, *tenum);
+        numDocsRead = docsEnum->numDocs();
+      }
+    }
+    else {
+      termRef = TermRef(pool, term.data(), term.size());
+      writer->startTerm(termRef);
+    }
     uint64_t docid = 0;
+    int actualDocs = 0;
+    uint64_t actualttf = 0;
     for (int i=0; i<numDocs; i++) {
       auto docDelta = getDocDelta(numDocs);
       docid += docDelta;
       if (docid > INT_MAX) {
         break;
       }
-      addDoc((int)docid, getNumPositions(numDocs));
+      actualDocs++;
+      uint32_t numPositions = getNumPositions(numDocs);
+      addDoc(read, (int)docid, numPositions);
+      actualttf += numPositions;
     }
-    writer->endTerm(termRef);
+    if (read) {
+      if (numDocs > 0) {
+        ASSERT_EQ(actualDocs, numDocsRead);
+        ASSERT_EQ(actualttf, docsEnum->totalTermFreq());
+      }
+    } else {
+      writer->endTerm(termRef);
+    }
   }
 
-  void addField(const std::string& fname, uint32_t numTerms) {
+  void addField(bool read, const std::string& fname, uint32_t numTerms) {
     std::string term = "term";
     term.resize(12);
 
-    writer->startField(fname);
+    if (read) {
+      tindexReader->readNextField();
+      ASSERT_EQ(fname,tindexReader->name());
+      tenum = std::make_unique<TermsEnum>(pool, *reader, *tindexReader);
+    } else {
+      writer->startField(fname);
+    }
+    int realNumTerms = 0;
     for (int i=0; i<numTerms; i++) {
       // std::format not implemented yet...
       sprintf(term.data()+4,"%08d",i);
-      addTerm(term, getNumDocs(numTerms));
+      auto ndocs = getNumDocs(numTerms);
+      if (ndocs > 0) ++realNumTerms;  // if number of docs for term ends up being 0, we should drop the term.
+      addTerm(read, term, ndocs);
     }
-    writer->endField(fname);
+    if (read) {
+      ASSERT_EQ(tindexReader->numTerms(), realNumTerms);
+    }else {
+      writer->endField(fname);
+    }
   }
 
-  void addFields(uint32_t numFields) {
+  void addFields(bool read, uint32_t numFields) {
     std::string fname = "field";
     fname.resize(13);
 
     for (int i=0; i<numFields; i++) {
       // std::format not implemented yet...
       sprintf(fname.data()+5,"%08d",i);
-      addField(fname, getNumTerms(numFields));
+      addField(read, fname, getNumTerms(numFields));
     }
   }
 
@@ -121,6 +209,14 @@ TEST_F(PostingsTest, basic) {
   writer.startDoc(44);
   writer.addPositionDelta(1);
   writer.endDoc(44);
+  writer.startDoc(55);
+  writer.addPositionDelta(555);
+  writer.addPositionDelta(111);
+  writer.endDoc(55);
+  writer.startDoc(56);
+  writer.addPositionDelta(7);
+  writer.addPositionDelta(2);
+  writer.endDoc(56);
   writer.endTerm(term1);
 
   writer.startTerm(term2);
@@ -134,6 +230,7 @@ TEST_F(PostingsTest, basic) {
   writer.addPositionDelta(300);
   writer.endDoc(22);
   writer.endTerm(term2);
+
   writer.endField("field1");
   writer.finish();
 
@@ -150,6 +247,7 @@ TEST_F(PostingsTest, basic) {
   TermsEnum tenum(pool, reader, tindexReader);
   while (tenum.nextTerm()) {
     std::cout << "TERM=" << tenum.term() << " ord=" << tenum.ord() << std::endl;
+    // if (tenum.ord()==0) continue; // skip first term, good for figuring out of second term errors are due to reader or writer.
 
     DocsEnum docsEnum(pool, reader, tindexReader, tenum);
     auto ndocs = docsEnum.numDocs();
@@ -172,7 +270,9 @@ TEST_F(PostingsTest, basic) {
 
 
 TEST_F(PostingsTest, randWrite) {
- std::cout << "SEED=" << rng_seed << std::endl;
- init();
-  addFields(2);
+  std::cout << "SEED=" << rng_seed << std::endl;
+  initWriter();
+  addFields(false,1);
+  initReader();
+  addFields(true,1);
 }
