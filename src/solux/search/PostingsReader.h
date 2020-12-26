@@ -52,9 +52,9 @@ class TermIndexReader {
   PostingsReader& postingsReader;
 
   PackedTerm fieldname;
-  uint64_t termsOffset;
-  uint64_t docsOffset;
-  uint64_t posOffset;
+  uint64_t termsLoc;
+  uint64_t docsLoc;
+  uint64_t posLoc;
   uint32_t nTerms;
 
   // actual index into terms
@@ -68,14 +68,17 @@ public:
   }
 
   // TODO: should this read into a different structure?
-  void readNextField() {
+  bool readNextField() {
+    if (is.left() <= 0) {  // TODO: most likely temporary way to detect end
+      return false;
+    }
     // See PostingsWriter.endField() for the format written.
     fieldname = is.readPackedTerm();
-    termsOffset = is.readVlong();
-    docsOffset = is.readVlong();
-    posOffset = is.readVlong();
+    termsLoc = is.readVlong();
+    docsLoc = is.readVlong();
+    posLoc = is.readVlong();
     nTerms = is.readVint();
-    termBlockOffsets = reinterpret_cast<const uint64_t*>(is.ptr());
+    termBlockOffsets = reinterpret_cast<const uint64_t*>(is.ptr());  // offsets from termsLoc
     numTermBlocks = ((nTerms-1) / PostingsWriter::TERMS_BLOCK_SIZE) + 1;
     is.skip(numTermBlocks * sizeof(uint64_t));
   }
@@ -117,8 +120,8 @@ class TermsEnum {
   PackedTerm startingTerm;
   int32_t startingOrd = 0;
   int32_t maxOrdInBlock = -1;
-  uint64_t offsetOfDocsForTermBlock;
-  uint64_t offsetOfPositionsForTermBlock;
+  uint64_t locOfDocsForTermBlock;  // absolute location... field offset + block offset
+  uint64_t locOfPositionsForTermBlock;  // absolute location... field offset + block offset
   uint64_t cumulativeDocsSize;
 
 public:
@@ -149,7 +152,7 @@ public:
   void readTermBlock() {
     if (ordInBlock == -1) {
       // first block we are reading, so seek to the first block.
-      is.seek(tindexReader.termsOffset);
+      is.seek(tindexReader.termsLoc);
     } else {
       startingOrd += PostingsWriter::TERMS_BLOCK_SIZE;
     }
@@ -159,8 +162,8 @@ public:
 
     // see PostingsWriter.flushTerms
     startingTerm = is.readPackedTerm();
-    offsetOfDocsForTermBlock = is.readVlong();
-    offsetOfPositionsForTermBlock = is.readVlong();
+    locOfDocsForTermBlock = tindexReader.docsLoc + is.readVlong();  // fieldOffset + blockOffset
+    locOfPositionsForTermBlock = tindexReader.posLoc + is.readVlong();
 
     memcpy(currTerm.ptr(), startingTerm.ptr(), startingTerm.memorySize());
     readTermMetadata();
@@ -201,6 +204,7 @@ public:
 };
 
 
+// TODO: some of this internal state could be removed... we only need some of it in the constructor?
 class DocsEnum {
   InputStream docIs;
   InputStream posIs;
@@ -223,8 +227,8 @@ class DocsEnum {
   uint64_t statOfDocs;
 
   uint64_t cumulativeDocsSize;
-  uint64_t offsetOfDocsForTermBlock;
-  uint64_t offsetOfPositionsForTermBlock;
+  uint64_t locOfDocsForTermBlock;
+  uint64_t locOfPositionsForTermBlock;
 
 public:
   DocsEnum(MemPool& pool, PostingsReader& postingsReader, TermIndexReader& tindexReader, TermsEnum& tenum) : pool(pool), tenum(tenum) {
@@ -242,14 +246,14 @@ public:
       ttf = 1;
     } else {
       docid = 0; // we delta-encode, so start from 0.  TODO: should we start at -1?  As it is now, a term with all docs will yield a delta list of 0,1,1,1,1... not optimal for RLE
-      offsetOfDocsForTermBlock = tenum.offsetOfDocsForTermBlock;
-      offsetOfPositionsForTermBlock = tenum.offsetOfDocsForTermBlock;
+      locOfDocsForTermBlock = tenum.locOfDocsForTermBlock;
+      locOfPositionsForTermBlock = tenum.locOfPositionsForTermBlock;
       cumulativeDocsSize = tenum.cumulativeDocsSize;
       docIs = postingsReader.docFile->getInputStream();
       // see the end of PostingsWiter.endTerm() for the term-specific metadata written there (docfreq, ttf, etc)
 
       // read last byte of docs to get the metadata size
-      docIs.seek(offsetOfDocsForTermBlock + cumulativeDocsSize - 1);
+      docIs.seek(locOfDocsForTermBlock + cumulativeDocsSize - 1);
       uint8_t metaSize = docIs.readByte();
       docIs.relativeSeek(-metaSize - 1); // move to start of metadata
       docfreq = docIs.readVint();
@@ -257,11 +261,11 @@ public:
       posOffset = docIs.readVlong();
 
       // start of the actual docs is end of block - size
-      statOfDocs = offsetOfDocsForTermBlock + cumulativeDocsSize - docsSize;
+      statOfDocs = locOfDocsForTermBlock + cumulativeDocsSize - docsSize;
       docIs.seek(statOfDocs);
 
       posIs = postingsReader.posFile->getInputStream();
-      posIs.seek(offsetOfPositionsForTermBlock + posOffset);
+      posIs.seek(locOfPositionsForTermBlock + posOffset);
       cumulativeTermFreq = 0;
     }
   }

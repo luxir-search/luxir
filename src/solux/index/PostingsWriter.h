@@ -138,6 +138,12 @@ class PostingsWriter {
 
 
 public:
+//
+// variable naming:
+// *loc* refers to absolute locations in a file, usually obtained via OutputStream::size()
+// *off* / *offset* refers to offsets relative to something else (i.e. a location)
+//
+
 
   static constexpr uint32_t TERMS_BLOCK_SIZE = 128;
 
@@ -191,11 +197,10 @@ public:
   std::vector<int32_t> posdeltas; // list of position deltas for the current term (for all documents... per-document positions are not delimited)
 
 
-  uint64_t offsetOfTermBlock;
-  uint64_t offsetOfPositionsForTermBlock;
-  uint64_t offsetOfDocsForTermBlock;
-  uint64_t offsetOfPositionsForTerm;
-  uint64_t offsetOfDocsForTerm;
+  uint64_t locOfPositionsForTermBlock;
+  uint64_t locOfDocsForTermBlock;
+  uint64_t locOfPositionsForTerm;
+  uint64_t locOfDocsForTerm;
 
   uint64_t positionsHandled;  /// number of positions handled for the current term so far (everything except posdeltas)
   uint32_t docsFlushed;  /// number of documents flushed for the current term so far
@@ -204,9 +209,9 @@ public:
   // Should this be refactored into a class?
   struct FieldInfo {
     std::string fieldName;
-    uint64_t termsOffset;
-    uint64_t docsOffset;
-    uint64_t posOffset;
+    uint64_t termsLoc;
+    uint64_t docsLoc;
+    uint64_t posLoc;
     uint64_t sumDocFreq;
     uint64_t sumTotalTermFreq;
     std::vector<uint64_t> termBlockOffsets;  // offset from termsOffset (for this field) for each term block
@@ -234,7 +239,7 @@ private:  // some internal utility methods... not for use by indexers
 
   // the size the docfile takes
   uint32_t getDocFileSize() const {
-    auto sz = docOutput.size() - offsetOfDocsForTerm;
+    auto sz = docOutput.size() - locOfDocsForTerm;
     assert(sz <= UINT_MAX);
     return sz;
   }
@@ -336,11 +341,10 @@ public:
     termList.resize(0);
     docFileSize.resize(0);
     pulsed.resize(0);
-    offsetOfPositionsForTermBlock = posOutput.size() - fieldInfo.posOffset;
-    offsetOfDocsForTermBlock = docOutput.size() - fieldInfo.docsOffset;
+    locOfPositionsForTermBlock = posOutput.size();
+    locOfDocsForTermBlock = docOutput.size();
 
-    offsetOfTermBlock = termOutput.size() - fieldInfo.termsOffset;
-    fieldInfo.termBlockOffsets.push_back(offsetOfTermBlock);
+    fieldInfo.termBlockOffsets.push_back( termOutput.size() - fieldInfo.termsLoc);
   }
 
   void flushTerms(bool endingField) {
@@ -360,8 +364,8 @@ public:
 
     // Write the terms block header.
     termOutput.writeStr(refdata, reflen);
-    termOutput.writeVlong(offsetOfDocsForTermBlock);  // TODO: make these relative to field
-    termOutput.writeVlong(offsetOfPositionsForTermBlock);
+    termOutput.writeVlong(fieldInfo.docsLoc - locOfDocsForTermBlock);
+    termOutput.writeVlong(fieldInfo.posLoc - locOfPositionsForTermBlock);
 
     // now write the block:
     int pulsedIdx = 0;  // index of next pulsed data
@@ -438,8 +442,8 @@ public:
     termList.push_back(term);  // we don't really need the term name at this point (could add in endTerm), but it might be nice for debugging / exceptions?
     docsFlushed = 0;
     positionsHandled = 0;
-    offsetOfPositionsForTerm = posOutput.size();
-    offsetOfDocsForTerm = docOutput.size();
+    locOfPositionsForTerm = posOutput.size();
+    locOfDocsForTerm = docOutput.size();
   }
 
   void endTerm(TermRef term) {
@@ -507,7 +511,7 @@ public:
       auto docfreq = getDocFreq();
       auto ttfCode = totalTermFreq - docfreq;
       // offset from start of positions in term dict block
-      auto posOffset = offsetOfPositionsForTerm - offsetOfPositionsForTermBlock;
+      auto posOffset = locOfPositionsForTerm - locOfPositionsForTermBlock;
 
       // TODO: encode as group, and can replace the metadataSize byte with the control byte.
       docOutput.writeVint(docfreq);
@@ -528,9 +532,9 @@ public:
 
   void startField(const std::string& fieldName) {
     fieldInfo.fieldName = fieldName;
-    fieldInfo.termsOffset = termOutput.size();
-    fieldInfo.docsOffset = docOutput.size();
-    fieldInfo.posOffset = posOutput.size();
+    fieldInfo.termsLoc = termOutput.size();
+    fieldInfo.docsLoc = docOutput.size();
+    fieldInfo.posLoc = posOutput.size();
     fieldInfo.termBlockOffsets.resize(0);
     fieldInfo.numTerms = 0;
     _startTermBlock(false);
@@ -541,9 +545,9 @@ public:
     // TODO: For many fields, the field index and the terms index should perhaps have the same structure (prefix compressed blocks?)
     flushTerms(true);
     tindexOutput.writeStr(fieldName.c_str(), fieldName.size());  // TODO: use fieldNumbers, or don't use field identifier at all... another index should point to this?
-    tindexOutput.writeVlong(fieldInfo.termsOffset);
-    tindexOutput.writeVlong(fieldInfo.docsOffset);
-    tindexOutput.writeVlong(fieldInfo.posOffset);
+    tindexOutput.writeVlong(fieldInfo.termsLoc);
+    tindexOutput.writeVlong(fieldInfo.docsLoc);
+    tindexOutput.writeVlong(fieldInfo.posLoc);
     tindexOutput.writeVint(fieldInfo.numTerms);
     // write index into the blocks of the terms dict
     // TODO: termBlockOffsets[0] is redundant with fieldInfo.termsOffset and we should be able to skip it (should always be 0)

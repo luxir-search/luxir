@@ -16,6 +16,7 @@ public:
 
   const char* ptr() { return pos; }
   uint64_t offset() { return pos - start; }
+  uint64_t left() { return end - pos; }  // how much data is left to read
 
   void seek(uint64_t offset) {
     pos = start + offset;

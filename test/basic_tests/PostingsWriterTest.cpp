@@ -202,8 +202,10 @@ TEST_F(PostingsTest, basic) {
   writer.startField("field1");
   std::string t1 = "term1";
   std::string t2 = "term2";
+  std::string ta = "termA";
   TermRef term1(pool,t1.data(),t1.size());
   TermRef term2(pool,t2.data(),t2.size());
+  TermRef terma(pool,ta.data(),ta.size());
 
   writer.startTerm(term1);  // single doc, single position... this should be pulsed
   writer.startDoc(44);
@@ -232,6 +234,17 @@ TEST_F(PostingsTest, basic) {
   writer.endTerm(term2);
 
   writer.endField("field1");
+
+
+  writer.startField("field2");
+  writer.startTerm(terma);
+  writer.startDoc(0);
+  writer.addPositionDelta(3);
+  writer.addPositionDelta(1);
+  writer.endDoc(0);
+  writer.endTerm(terma);
+  writer.endField("field2");
+
   writer.finish();
 
 
@@ -240,27 +253,29 @@ TEST_F(PostingsTest, basic) {
   auto docFile = dir.openFile("doc") ;
   auto posFile = dir.openFile("pos");
   PostingsReader reader(tindexFile.get(), termFile.get(), docFile.get(), posFile.get());
+
   TermIndexReader tindexReader(pool, reader);
-  tindexReader.readNextField();
-  std::cout << "FIELD NAME name=" << tindexReader.name() << " numTerms=" << tindexReader.numTerms() << std::endl;
+  while (tindexReader.readNextField()) {
+    std::cout << "FIELD NAME name=" << tindexReader.name() << " numTerms=" << tindexReader.numTerms() << std::endl;
 
-  TermsEnum tenum(pool, reader, tindexReader);
-  while (tenum.nextTerm()) {
-    std::cout << "TERM=" << tenum.term() << " ord=" << tenum.ord() << std::endl;
-    // if (tenum.ord()==0) continue; // skip first term, good for figuring out of second term errors are due to reader or writer.
+    TermsEnum tenum(pool, reader, tindexReader);
+    while (tenum.nextTerm()) {
+      std::cout << "\tTERM=" << tenum.term() << " ord=" << tenum.ord() << std::endl;
+      // if (tenum.ord()==0) continue; // skip first term, good for figuring out of second term errors are due to reader or writer.
 
-    DocsEnum docsEnum(pool, reader, tindexReader, tenum);
-    auto ndocs = docsEnum.numDocs();
-    std::cout << "\tnumDocs=" << docsEnum.numDocs() << " totalTermFreq=" << docsEnum.totalTermFreq() << std::endl;
+      DocsEnum docsEnum(pool, reader, tindexReader, tenum);
+      auto ndocs = docsEnum.numDocs();
+      std::cout << "\t\tnumDocs=" << docsEnum.numDocs() << " totalTermFreq=" << docsEnum.totalTermFreq() << std::endl;
 
-    for (int i = 0; i < ndocs; i++) {
-      auto id = docsEnum.nextDoc();
-      auto tfreq = docsEnum.termFreq();
-      std::cout << "\t\tdocid=" << id << " termFreq=" << tfreq << std::endl;
-      docsEnum.startPositions();
-      for (int j = 0; j < tfreq; j++) {
-        auto pos = docsEnum.nextPosition();
-        std::cout << "\t\t\tpos=" << pos << std::endl;
+      for (int i = 0; i < ndocs; i++) {
+        auto id = docsEnum.nextDoc();
+        auto tfreq = docsEnum.termFreq();
+        std::cout << "\t\t\tdocid=" << id << " termFreq=" << tfreq << std::endl;
+        docsEnum.startPositions();
+        for (int j = 0; j < tfreq; j++) {
+          auto pos = docsEnum.nextPosition();
+          std::cout << "\t\t\t\tpos=" << pos << std::endl;
+        }
       }
     }
   }
@@ -272,7 +287,7 @@ TEST_F(PostingsTest, basic) {
 TEST_F(PostingsTest, randWrite) {
   std::cout << "SEED=" << rng_seed << std::endl;
   initWriter();
-  addFields(false,1);
+  addFields(false,10);
   initReader();
-  addFields(true,1);
+  addFields(true,10);
 }
