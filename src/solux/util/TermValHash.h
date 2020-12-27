@@ -44,7 +44,7 @@ public:
   template <typename... Args>
   static TermValRef create(MemPool& pool, const char* str, unsigned len, Args&&... args) {
     pool.align(); // Cost=~4 bytes per unique term
-    auto target = pool.allocatePtr( getExactSize(len) );
+    auto target = pool.allocate(getExactSize(len));
     new (target) V(std::forward<Args>(args)...);    // construct the value
     auto strStart = target + sizeof(V);
     TermRef::write(strStart, str, len);  // copy the string following the value
@@ -54,7 +54,7 @@ public:
   template <typename... Args>
   TermValRef(MemPool& pool, const char* str, unsigned len, Args&&... args) {
     pool.align(); // Cost=~4 bytes per unique term
-    auto target = pool.allocatePtr( getExactSize(len) );
+    auto target = pool.allocate(getExactSize(len));
     new (target) V(std::forward<Args>(args)...);    // construct the value
     auto strStart = target + sizeof(V);
     TermRef::write(strStart, str, len);  // copy the string following the value
@@ -147,7 +147,7 @@ public:
       entry_type& v = table_[slot];
       if (v.isNull()) {
         elements_++;
-        char* valptr = pool_.allocatePtr( entry_type::getExactSize(sz) );
+        char* valptr = pool_.allocate(entry_type::getExactSize(sz));
         char* keyPtr = valptr + sizeof(value_type);
         TermRef::write(keyPtr, ptr, sz);
         new (&v) entry_type(keyPtr, sz);
@@ -172,7 +172,7 @@ public:
           entry_type& v = table_[slot];
           if (v.isNull()) {
               elements_++;
-              char* valptr = pool_.allocatePtr( entry_type::getExactSize(sz) );
+              char* valptr = pool_.allocate(entry_type::getExactSize(sz));
               char* keyPtr = valptr + sizeof(value_type);
               new (valptr) T(std::forward<Args>(args)...);  // construct the T value
               TermRef::write(keyPtr, ptr, sz);      // write the string key directly after the value
@@ -222,7 +222,7 @@ public:
       entry_type& v = table_[slot];
       if (v.isNull()) {
         elements_++;
-        char* valptr = pool_.allocatePtr( entry_type::getExactSize(sz) );
+        char* valptr = pool_.allocate(entry_type::getExactSize(sz));
         char* keyPtr = valptr + sizeof(value_type);
         TermRef::write(keyPtr, ptr, sz);
         new (&v) entry_type(keyPtr, sz);
@@ -248,7 +248,7 @@ public:
       entry_type& v = table_[slot];
       if (v.isNull()) {
         elements_++;
-        char* valptr = pool_.allocatePtr( entry_type::getExactSize(sz) );
+        char* valptr = pool_.allocate(entry_type::getExactSize(sz));
         char* keyPtr = valptr + sizeof(value_type);
         TermRef::write(keyPtr, ptr, sz);
         new (&v) entry_type(keyPtr, sz);

@@ -127,7 +127,7 @@ class TermsEnum {
 public:
   TermsEnum(MemPool& pool, PostingsReader& postingsReader, TermIndexReader& tindexReader) : pool(pool), postingsReader(postingsReader), tindexReader(tindexReader) {
     is = postingsReader.termFile->getInputStream();
-    currTerm = PackedTerm(pool.allocatePtr(256));
+    currTerm = PackedTerm(pool.allocate(256));
   }
 
   int32_t ord() const {

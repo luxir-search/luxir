@@ -52,6 +52,8 @@
 
 class MemPool {
 public:
+  using save_point = char *;
+  static constexpr char SCRIBBLE_CHAR = 'Z';
 
 // TODO - make a lot of this stuff private
   static constexpr int BYTE_BLOCK_SHIFT = 15;
@@ -59,20 +61,18 @@ public:
   static constexpr int BYTE_BLOCK_MASK = BYTE_BLOCK_SIZE - 1;
 
   // todo - try unique_ptr here and see if it slows anything down
-  std::vector<char *> buffers_;
+  std::vector<char *> buffers;
 
   /** index into the buffers array pointing to the current buffer used as the head */
 
-  int bufferIndex_ = -1;                        // which buffer we are in
+  int bufferIdx = -1;                        // which buffer we are in
 
   /** Where we are in head buffer */
-  int pos_ = BYTE_BLOCK_SIZE;
+  int pos = BYTE_BLOCK_SIZE;
 
   /** Current head buffer */
-  char *buffer_ = nullptr;
+  char *buffer = nullptr;
 
-  /** Current head offset */
-  int byteOffset = -BYTE_BLOCK_SIZE;
 
   // TODO: keep track of high water mark?
   // TODO: keep debugging statistics? (number of pool allocations, size breakdown, wasted space at end of blocks, etc..)
@@ -93,11 +93,11 @@ public:
 
 
   // TODO: avoid using ptr() directly since it won't work when switching to malloc
-  char *ptr() { return buffer_ + pos_; }
+  char* ptr() { return buffer + pos; }
 
-  char *ptr(int bbAddr) const {
+  char* ptr(int bbAddr) const {
 #ifndef BBP_MALLOC
-    return buffers_[bbAddr >> BYTE_BLOCK_SHIFT] + (bbAddr & BYTE_BLOCK_MASK);
+    return buffers[bbAddr >> BYTE_BLOCK_SHIFT] + (bbAddr & BYTE_BLOCK_MASK);
 #else
     return pointers[bbAddr].get();
 #endif
@@ -105,7 +105,7 @@ public:
 
   int bbAddress() {
 #ifndef BBP_MALLOC
-    return (bufferIndex_ << BYTE_BLOCK_SHIFT) | pos_;
+    return (bufferIdx << BYTE_BLOCK_SHIFT) | pos;
 #else
     return (int)pointers.size();
 #endif
@@ -113,7 +113,7 @@ public:
 
   int size() {
 #ifndef BBP_MALLOC
-    return capacity() - (BYTE_BLOCK_SIZE - pos_);
+    return capacity() - (BYTE_BLOCK_SIZE - pos);
 #else
     return allocated;
 #endif
@@ -121,7 +121,7 @@ public:
 
   int capacity() {
 #ifndef BBP_MALLOC
-    return buffers_.size() * BYTE_BLOCK_SIZE;
+    return buffers.size() * BYTE_BLOCK_SIZE;
 #else
     return size();
 #endif
@@ -129,9 +129,9 @@ public:
 
   // ensures that there is enough space starting with the current buffer (moving to a new buffer if necessary)
   // and returns the resulting end offset into the last (current) block.
-  int reserve(uint32_t size) {
+  int reserveBBP(uint32_t size) {
     assert(size >= 0 && size <= BYTE_BLOCK_SIZE);
-    auto newEnd = pos_ + size;
+    auto newEnd = pos + size;
     if (newEnd > BYTE_BLOCK_SIZE) {
       nextBuffer();
       newEnd = size;
@@ -139,12 +139,12 @@ public:
     return newEnd;
   }
 
-  int allocate(uint32_t size) {
+  int allocateBBP(uint32_t size) {
 #ifndef BBP_MALLOC
-    int newEnd = reserve(size);
+    int newEnd = reserveBBP(size);
     // char* p = buffer + pos;
     int bbAddr = bbAddress();
-    pos_ = newEnd;
+    pos = newEnd;
     return bbAddr;
 #else
     pointers.emplace_back( new char[size] );
@@ -156,11 +156,11 @@ public:
   }
 
 
-  char *allocatePtr(uint32_t size) {
+  char* allocate(size_t size) {
 #ifndef BBP_MALLOC
-    int newEnd = reserve(size);
+    int newEnd = reserveBBP(size);
     auto p = ptr();
-    pos_ = newEnd;
+    pos = newEnd;
     return p;
 #else
     allocate(size);
@@ -171,10 +171,10 @@ public:
     // do allocation and return both the normal pointer as well as the short pool specific pointer (bbptr)
     std::pair<char *, int> allocateAddrs(uint32_t size) {
 #ifndef BBP_MALLOC
-    int newEnd = reserve(size);
+    int newEnd = reserveBBP(size);
     int bbAddr = bbAddress();
     auto p = ptr();
-    pos_ = newEnd;
+      pos = newEnd;
     return {p, bbAddr};
 #else
     auto bbAddr = allocate(size);
@@ -186,7 +186,7 @@ public:
     void align() {
 #ifndef BBP_MALLOC
         unsigned align = 8;
-        pos_ = (pos_ + (align - 1)) & -align;
+      pos = (pos + (align - 1)) & -align;
 #else
 #endif
     }
@@ -195,49 +195,43 @@ public:
   int allocateTypeAligned(T *&out) {
 #ifndef BBP_MALLOC
     align();
-    int newEnd = reserve((int) sizeof(T));
+    int newEnd = reserveBBP((int) sizeof(T));
     out = reinterpret_cast<T *>( ptr());
     int bbAddr = bbAddress();
-    pos_ = newEnd;
+    pos = newEnd;
     return bbAddr;
 #else
     return allocate(sizeof(T));
 #endif
   }
 
-
-  /**
-  // Write PackedTerm format and return a pointer to the start
-  // TODO: return PackedTerm reference?
-  char* writeStr(const void* data, int sz) {
-    reserve(sz+2);
-    auto target = ptr();
-    auto sizeOut = PackedTerm::write(target, data, sz);
-    pos += sizeOut;
-    return target;
+  bool scribble(char* p, size_t len) {
+    memset(p, SCRIBBLE_CHAR, len);
+    return true;
   }
-**/
 
-  /** nocommit
+  void _rewind(const save_point& savePoint, int32_t buffersToSave);
 
-  // Write a string and return a pointer to it.
-  // TODO: return PackedTerm reference?
-  // TODO: only used by TermHash...
-  Str writeStr(const void *data, int sz) {
-#ifndef BBP_MALLOC
-    reserve(Str::getMaxSize(sz));
-    auto target = ptr();
-    auto sizeOut = Str::write(target, data, sz);
-    pos_ += sizeOut;
-    return Str(target, sz);
-#else
-    auto target = allocatePtr(Str::getMaxSize(sz));
-    auto sizeOut = Str::write(target, data, sz);
-    return Str(target,sz);
-#endif
+  /// Rewinds to the rewindPoint, effectively deallocating all allocations after that point.
+  /// buffersToSave is the number of buffers to hold in reserve for use during subsequent pool expansions.
+  /// If you are going to be repeating some type of work you just did, and hence expect the same order of
+  /// magnitude of memory allocation, consider passing INT_MAX.  Otherwise, 1 may be a good general purpose choice.
+  /// 0 may be better if one has many pools.
+  void rewind(const save_point& savePoint, int32_t buffersToSave=1) {
+    if (savePoint >= buffer && savePoint <= buffer + BYTE_BLOCK_SIZE) {  // TODO: check boundary condition here...
+      // fast path: same buffer
+      assert(scribble(savePoint, ptr()-savePoint));  // scribble from the save point to the current point
+      // if sp==buffer+pos, then pos=sp-buffer to restore.
+      pos = savePoint - buffer;
+    } else {
+      _rewind(savePoint, buffersToSave);
+    }
   }
-   **/
 
+  // returns enough information for a call to rewind() to deallocate all allocations after the save point
+  save_point getSavePoint() {
+    return ptr();
+  }
 
   void nextBuffer();
 };

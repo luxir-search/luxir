@@ -107,10 +107,10 @@ public:
     if (left_ == 0) {
       // pull this out into a function?
       sliceSz_ = nextSliceSize(sliceSz_);
-      int blockAddr = pool.allocate(sliceSz_);
+      int blockAddr = pool.allocateBBP(sliceSz_);
 
       char* newPointer = pool.ptr(blockAddr);  // TODO: what about a version that returns pointer and the block address
-      assert( newPointer - pool.buffer_ + sliceSz_ <= MemPool::BYTE_BLOCK_SIZE );
+      assert(newPointer - pool.buffer + sliceSz_ <= MemPool::BYTE_BLOCK_SIZE );
       // move last 4 bytes to new area... we do this in one chunk using an integer.
       // this works for both both little endian and big endian since we're only moving.
       int* lastWord = reinterpret_cast<int*>(ptr_ - 4);
