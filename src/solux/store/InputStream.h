@@ -4,14 +4,14 @@
 
 
 class InputStream {
-  const char* pos;
-  const char* start;
-  const char* end;
+  const char* pos = nullptr;  // these initializations just to suppress maybe-uninitialized warnings with -O3
+  const char* start = nullptr;
+  const char* end = nullptr;
   // Future?
   // size_t offset; // the position of "start" in the file
   // File& source;
 public:
-  InputStream() {}
+  InputStream() = default;
   InputStream(const char* start, const char* end) : pos(start), start(start), end(end) {}
 
   const char* ptr() const noexcept { return pos; }

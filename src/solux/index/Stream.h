@@ -100,6 +100,7 @@ public:
 
   /** Pointer to previously written byte.  Only valid if a byte as been previously written. */
   char* prevPtr(MemPool& pool) {
+    unused(pool);
     assert(size(pool) > 0);
     return ptr_ - 1;
   }

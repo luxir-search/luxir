@@ -448,6 +448,7 @@ public:
   }
 
   void endTerm(TermRef term) {
+    unused(term);
     uint64_t totalTermFreq = getTotalTermFreq();
     // TODO: handle case when all docs were deleted for term (and term should no longer appear)
     if (totalTermFreq == 1) {
@@ -482,7 +483,7 @@ public:
       //   it would only speed up rare/rare term conjunctions.  Might help common terms in small segments too though.
       // TODO: make first delta an actual delta from the last block... not from 0.  Not too important though given that that this is only sub-optimal
       //   when the docfreq is larger than the doc block size.
-      uint32_t lastdoc = 0;
+      int lastdoc = 0;
       assert(docs.size() == tfreqs.size());
       for (uint32_t i=0; i<docs.size(); i++) {
         assert(docs[i] > lastdoc || i==0);
@@ -557,6 +558,7 @@ public:
   }
 
   void startDoc(int32_t doc) {
+    unused(doc);
     totalTermFreqPrevDoc = getTotalTermFreq();
 
     // Do we need to know the current doc?

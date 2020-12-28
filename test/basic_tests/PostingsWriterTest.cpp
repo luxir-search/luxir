@@ -64,14 +64,17 @@ protected:
   }
 
   uint32_t getNumPositions(uint32_t numDocs) {
+    unused(numDocs);
     return rng.rint(1u, positionsPerDocMax);
   }
 
   uint32_t getNumDocs(uint32_t numTerms) {
+    unused(numTerms);
     return rng.rint(1u,docsPerTermMax);
   }
 
   uint32_t getNumTerms(uint32_t numFields) {
+    unused(numFields);
     return rng.rint(1u, termsPerFieldMax);
   }
 
@@ -89,7 +92,7 @@ protected:
     }
     uint64_t position = 0;
     uint32_t actualPositions = 0;
-    for (int i=0; i<numPositions; i++) {   // TODO: introduce constants for limits
+    for (uint32_t i=0; i<numPositions; i++) {   // TODO: introduce constants for limits
       auto delta = getPositionDelta(numPositions);
       position += delta;
       if (position >= INT_MAX) {
@@ -133,7 +136,7 @@ protected:
     uint64_t docid = 0;
     int actualDocs = 0;
     uint64_t actualttf = 0;
-    for (int i=0; i<numDocs; i++) {
+    for (uint32_t i=0; i<numDocs; i++) {
       auto docDelta = getDocDelta(numDocs);
       docid += docDelta;
       if (docid > INT_MAX) {
@@ -166,7 +169,7 @@ protected:
       writer->startField(fname);
     }
     int realNumTerms = 0;
-    for (int i=0; i<numTerms; i++) {
+    for (uint32_t i=0; i<numTerms; i++) {
       // std::format not implemented yet...
       sprintf(term.data()+4,"%08d",i);
       auto ndocs = getNumDocs(numTerms);
@@ -184,7 +187,7 @@ protected:
     std::string fname = "field";
     fname.resize(13);
 
-    for (int i=0; i<numFields; i++) {
+    for (uint32_t i=0; i<numFields; i++) {
       // std::format not implemented yet...
       sprintf(fname.data()+5,"%08d",i);
       addField(read, fname, getNumTerms(numFields));

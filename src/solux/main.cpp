@@ -27,7 +27,7 @@ int main(int argc, char** argv) {
     TokenChain* tokenChain = new TokenChain(std::unique_ptr<Token>(token), *tokenizer, std::unique_ptr<TokenStream>(tokenizer) );
 
     SegFieldIndexed* segField = new SegFieldDocsFreqPos(*fieldInfo, inverter.pool_);
-    segField->tokenChain = std::move( std::unique_ptr<TokenChain>( tokenChain ) );
+    segField->tokenChain = std::unique_ptr<TokenChain>( tokenChain );
 
     std::string val = "now is the time for all good men to come to the aid of their country ";
     // val = "wow";
@@ -62,7 +62,6 @@ int main(int argc, char** argv) {
     }
 
     auto end = chrono::steady_clock::now();
-    auto diff1 = (end - start);
     auto sec = chrono::duration<double>(end - start).count();
     auto MB = val.size() * iter / 1000000.0;
 

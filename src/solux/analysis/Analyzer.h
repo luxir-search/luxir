@@ -200,8 +200,8 @@ public:
 // Analyzer class is thread safe
 class Analyzer {
   // Lucene Analyzer always has to look up by fieldName... we should be able to avoid this
-  TokenChain& createChain() {
-    return *(TokenChain*)0;
+  TokenChain* createChain() {
+    return nullptr;
   }
 };
 

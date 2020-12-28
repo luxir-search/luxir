@@ -247,6 +247,7 @@ public:
       tfreq = 1;
       ttf = 1;
     } else {
+      pos = tfreq = -1;  // unnecessary initializations, but it makes some maybe-uninitialized warnings go away with -O3
       docid = 0; // we delta-encode, so start from 0.  TODO: should we start at -1?  As it is now, a term with all docs will yield a delta list of 0,1,1,1,1... not optimal for RLE
       locOfDocsForTermBlock = tenum.locOfDocsForTermBlock;
       locOfPositionsForTermBlock = tenum.locOfPositionsForTermBlock;

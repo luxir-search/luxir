@@ -27,7 +27,7 @@ TEST(TermValHash, testHash) {
 
   std::string val = "wow";
 
-  auto pool_size0 = inverter.pool_.size();
+  // auto pool_size0 = inverter.pool_.size();
 
   segField->indexTokenStream(0, &val[0], (int)val.size());
   auto pool_size1 = inverter.pool_.size();
