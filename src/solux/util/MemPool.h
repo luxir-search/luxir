@@ -12,7 +12,7 @@
 #include "solux_util.h"
 
 
-// #define BBP_MALLOC true   // use malloc for each allocation for better memory checking
+// #define MEMPOOL_MALLOC true   // use malloc/new for each individual allocation for better memory checking with checkers
 
 // TODO: allocate in large enough chunks so that we use MMAP so it can be released back to OS?
 // Could start allocating pages in groups of 4 after some limit (128K is default to go to mmap in glibc at least)
@@ -49,10 +49,13 @@
 // these pointers to get how much memory was used for an operation as well.
 //
 
-
 class MemPool {
 public:
+#ifndef MEMPOOL_MALLOC
   using save_point = char *;
+#else
+  using save_point = std::pair<size_t,size_t>;  // pointers.size(), pool.size() pair
+#endif
   static constexpr char SCRIBBLE_CHAR = 'Z';
 
 // TODO - make a lot of this stuff private
@@ -77,10 +80,10 @@ public:
   // TODO: keep track of high water mark?
   // TODO: keep debugging statistics? (number of pool allocations, size breakdown, wasted space at end of blocks, etc..)
 
-#ifdef BBP_MALLOC
+#ifdef MEMPOOL_MALLOC
   // pointers[bbAddr] -> heap pointer
   std::vector< std::unique_ptr<char[]> > pointers;
-  int64_t allocated = 0;
+  size_t allocated = 0;
 #endif
 
   // TODO: accept an upstream allocator / memory resource
@@ -96,7 +99,7 @@ public:
   char* ptr() { return buffer + pos; }
 
   char* ptr(int bbAddr) const {
-#ifndef BBP_MALLOC
+#ifndef MEMPOOL_MALLOC
     return buffers[bbAddr >> BYTE_BLOCK_SHIFT] + (bbAddr & BYTE_BLOCK_MASK);
 #else
     return pointers[bbAddr].get();
@@ -104,7 +107,7 @@ public:
   }
 
   int bbAddress() {
-#ifndef BBP_MALLOC
+#ifndef MEMPOOL_MALLOC
     return (bufferIdx << BYTE_BLOCK_SHIFT) | pos;
 #else
     return (int)pointers.size();
@@ -112,16 +115,16 @@ public:
   }
 
   int size() {
-#ifndef BBP_MALLOC
-    return capacity() - (BYTE_BLOCK_SIZE - pos);
+#ifndef MEMPOOL_MALLOC
+    return bufferIdx < 0 ? 0 : (bufferIdx-1) * BYTE_BLOCK_SIZE + pos;
 #else
     return allocated;
 #endif
   }
 
   int capacity() {
-#ifndef BBP_MALLOC
-    return buffers.size() * BYTE_BLOCK_SIZE;
+#ifndef MEMPOOL_MALLOC
+    return bufferIdx < 0 ? 0 : bufferIdx * BYTE_BLOCK_SIZE;
 #else
     return size();
 #endif
@@ -140,7 +143,7 @@ public:
   }
 
   int allocateBBP(uint32_t size) {
-#ifndef BBP_MALLOC
+#ifndef MEMPOOL_MALLOC
     int newEnd = reserveBBP(size);
     // char* p = buffer + pos;
     int bbAddr = bbAddress();
@@ -157,34 +160,34 @@ public:
 
 
   char* allocate(size_t size) {
-#ifndef BBP_MALLOC
+#ifndef MEMPOOL_MALLOC
     int newEnd = reserveBBP(size);
     auto p = ptr();
     pos = newEnd;
     return p;
 #else
-    allocate(size);
+    allocateBBP(size);
     return pointers.back().get();
 #endif
   }
 
     // do allocation and return both the normal pointer as well as the short pool specific pointer (bbptr)
     std::pair<char *, int> allocateAddrs(uint32_t size) {
-#ifndef BBP_MALLOC
+#ifndef MEMPOOL_MALLOC
     int newEnd = reserveBBP(size);
     int bbAddr = bbAddress();
     auto p = ptr();
       pos = newEnd;
     return {p, bbAddr};
 #else
-    auto bbAddr = allocate(size);
+    auto bbAddr = allocateBBP(size);
     auto p = pointers.back().get();
     return {p, bbAddr};
 #endif
   };
 
     void align() {
-#ifndef BBP_MALLOC
+#ifndef MEMPOOL_MALLOC
         unsigned align = 8;
       pos = (pos + (align - 1)) & -align;
 #else
@@ -193,7 +196,7 @@ public:
 
   template<class T>
   int allocateTypeAligned(T *&out) {
-#ifndef BBP_MALLOC
+#ifndef MEMPOOL_MALLOC
     align();
     int newEnd = reserveBBP((int) sizeof(T));
     out = reinterpret_cast<T *>( ptr());
@@ -201,7 +204,7 @@ public:
     pos = newEnd;
     return bbAddr;
 #else
-    return allocate(sizeof(T));
+    return allocateBBP(sizeof(T));
 #endif
   }
 
@@ -218,6 +221,7 @@ public:
   /// magnitude of memory allocation, consider passing INT_MAX.  Otherwise, 1 may be a good general purpose choice.
   /// 0 may be better if one has many pools.
   void rewind(const save_point& savePoint, uint32_t buffersToSave=1) {
+#ifndef MEMPOOL_MALLOC
     if (savePoint >= buffer && savePoint <= buffer + BYTE_BLOCK_SIZE) {  // TODO: check boundary condition here...
       // fast path: same buffer
       assert(scribble(savePoint, ptr()-savePoint));  // scribble from the save point to the current point
@@ -226,11 +230,18 @@ public:
     } else {
       _rewind(savePoint, buffersToSave);
     }
+#else
+    _rewind(savePoint, buffersToSave);
+#endif
   }
 
   // returns enough information for a call to rewind() to deallocate all allocations after the save point
   save_point getSavePoint() {
+#ifndef MEMPOOL_MALLOC
     return ptr();
+#else
+    return {pointers.size(), this->size()};
+#endif
   }
 
   void nextBuffer();

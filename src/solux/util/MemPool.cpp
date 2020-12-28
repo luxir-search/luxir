@@ -21,10 +21,27 @@ void MemPool::nextBuffer() {
     buffer = new char[BYTE_BLOCK_SIZE];  // not 0 initialized
     buffers.emplace_back(buffer);
   }
+  // for new allocations, we want to let memory checkers find reads from uninitialized memory
+  // assert(scribble(buffer,BYTE_BLOCK_SIZE));
   pos = 0;
 }
 
+#ifdef MEMPOOL_MALLOC
+void MemPool::_rewind(const MemPool::save_point& savePoint, uint32_t buffersToSave) {
+  unused(buffersToSave);
 
+  if (pointers.size() < savePoint.first) {
+    // exceptions?
+    std::cerr << "Error rewinding pool to allocation #" << savePoint.first << ", pool only has " << pointers.size() << std::endl;
+  }
+  while (pointers.size() > savePoint.first) {
+    // if we knew the sizes, we could scribble on the memory too... but hopefully address sanitizer and valgrind
+    // can detect what we need in separate allocations.
+    pointers.pop_back();
+  }
+  allocated = savePoint.second;
+}
+#else
 void MemPool::_rewind(const MemPool::save_point& savePoint, uint32_t buffersToSave) {
   // this is only called if the save point wasn't in the current buffer.
   int i= bufferIdx - 1;
@@ -71,3 +88,4 @@ void MemPool::_rewind(const MemPool::save_point& savePoint, uint32_t buffersToSa
   assert(scribble(savePoint, ptr()-savePoint));
   pos = savePoint - buffer;
 }
+#endif

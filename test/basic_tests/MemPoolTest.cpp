@@ -14,20 +14,28 @@ TEST_F(MemPoolTest, rewind) {
   char* a = pool.allocate(2);
   unused(a);
   auto savePoint = pool.getSavePoint();
+  auto sz = pool.size();
   char* b = pool.allocate(3);
   *b = 'b';
   char* c = pool.allocate(4);
   *c = 'c';
   pool.rewind(savePoint);
+  // check that the size matches again
+  ASSERT_EQ(sz, pool.size());
+#ifndef MEMPOOL_MALLOC
   char* bb = pool.allocate(3);
   ASSERT_EQ(b, bb);
   assert(*bb != 'b');  // in debug mode, we should have stomped on the memory
 #ifdef NDEBUG
-  // if we aren't in debug mode, our memory should be untouched (TODO: unless we instructed the pool to use malloc!)
+  // if we aren't in debug mode, our memory should be untouched
   ASSERT_EQ('b', *bb);
+#endif
+#else
+  // not much to check if we are using malloc
 #endif
 }
 
+#ifndef MEMPOOL_MALLOC
 // test page boundary conditions efficiently using rewind
 TEST_F(MemPoolTest, boundary) {
   MemPool pool;
@@ -35,10 +43,12 @@ TEST_F(MemPoolTest, boundary) {
   char* a = pool.allocate(1);
   unused(a);
   auto savePoint = pool.getSavePoint();
+  auto poolSz = pool.size();
   char* p = pool.ptr();
   char* b = pool.allocate(sz - 1);  // should be room for this.
   ASSERT_EQ(p, b);
   pool.rewind(savePoint);
+  ASSERT_EQ(poolSz, pool.size());
   savePoint = pool.getSavePoint();
   ASSERT_EQ(p, pool.ptr());
   char* bb = pool.allocate(sz);  // should not be room for this.
@@ -46,6 +56,7 @@ TEST_F(MemPoolTest, boundary) {
   *bb = 'b';
 
   pool.rewind(savePoint);
+  ASSERT_EQ(poolSz, pool.size());
 
   char* mem = new char[sz];  // if we freed the last block, try to foil malloc from returning the same one to the pool again
   mem[0] = 'A'; // try to avoid the malloc being optimized away
@@ -64,3 +75,4 @@ TEST_F(MemPoolTest, boundary) {
   ASSERT_EQ(mem[0],'A');
   delete[] mem;
 }
+#endif
