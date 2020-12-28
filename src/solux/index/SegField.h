@@ -98,9 +98,12 @@ public:
 
   explicit SegFieldIndexed(const FieldType& field) : field_(field) {}
 
+  /* WIP
   virtual void indexSingleValue(int docid, const char* ptr, int len) {}
   virtual void indexMultipleValues() {}
-  virtual void indexTokenStream(int docid, char* mutableVal, int len) {}
+  */
+
+  virtual void indexTokenStream(int docid, char* mutableVal, int len) = 0;
 
   virtual ~SegFieldIndexed() {}
 };
@@ -111,11 +114,12 @@ public:
 
   SegFieldDocs(const FieldType &field, MemPool& pool) : SegFieldIndexed(field) , termsHash(pool, 4) { }
 
+  /*
   virtual void indexSingleValue(int docid, const char *ptr, int len) override {
-
 //    DocStream& stream = termsHash.get(ptr, len);
 //    stream.addDoc(termsHash.pool_, docid);
   }
+   */
 
   virtual void indexTokenStream(int docid, char* mutableVal, int len) override {  // todo: could make a templatized version
     tokenChain->head.setMutableValue(mutableVal, len);

@@ -4,6 +4,7 @@
 #include <assert.h>
 #include <climits>
 #include <memory>
+#include "solux/util/solux_util.h"
 
 //
 // TODO: investigate using string view?
@@ -86,6 +87,7 @@ class WhitespaceTokenizer : public Tokenizer {
     // assumes ptr is less than end
     // after returning ptr may be equal to end
     static bool incrementOverWhitespace(char *&ptr, const char *end) {
+        unused(end); // we don't check multiple bytes yet
         char ch = *ptr;
         // all whitespace chars are either less than ' ' or take up more than one UTF8 byte, so the first byte will be negative!
         // this does rely on char being signed
@@ -106,6 +108,7 @@ public:
     // or something that could be inlined (i.e. delegation via templates)
 
     virtual bool incrementToken(bool first) override {
+        unused(first);
         // first reset the token state
         token.clear();
 

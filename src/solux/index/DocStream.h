@@ -48,8 +48,10 @@ public:
   int lastDoc;
   int docFreq;  // number of docs with this term
 
-  DocStream(MemPool& pool, int docid) : lastDoc(docid) , docFreq(1) {
+  DocStream(MemPool& pool, int docid) : lastDoc(docid), docFreq(1) {
+    unused(pool);
   }
+
   DocStream(const DocStream&) = delete;
   void operator=(const DocStream&) = delete;
 
@@ -65,6 +67,7 @@ public:
   }
 }
 SOLUX_PACKED_END;
+
 
 SOLUX_PACKED_START
 class DocFreqStream {

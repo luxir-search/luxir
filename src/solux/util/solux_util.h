@@ -20,6 +20,10 @@
 #define SOLUX_PACKED_END __pragma(pack(pop))
 #endif
 
+template <typename... Args> inline void unused(Args&&...) {}
+
+
+
 // java compatible types?
 typedef int8_t byte;
 

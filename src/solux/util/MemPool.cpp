@@ -14,7 +14,7 @@ MemPool::~MemPool() {
 
 void MemPool::nextBuffer() {
   bufferIdx++;
-  if (bufferIdx < buffers.size()) {
+  if ((uint32_t)bufferIdx < buffers.size()) {
     // reuse previously allocated block
     buffer = buffers[bufferIdx];
   } else {
@@ -25,7 +25,7 @@ void MemPool::nextBuffer() {
 }
 
 
-void MemPool::_rewind(const MemPool::save_point& savePoint, int32_t buffersToSave) {
+void MemPool::_rewind(const MemPool::save_point& savePoint, uint32_t buffersToSave) {
   // this is only called if the save point wasn't in the current buffer.
   int i= bufferIdx - 1;
 
@@ -55,13 +55,13 @@ void MemPool::_rewind(const MemPool::save_point& savePoint, int32_t buffersToSav
 
 #ifndef NDEBUG
   // scribble up to the current position on the current block (not the whole block just to save time)
-  if (bufferIdx < buffers.size() && bufferIdx != i) {
+  if ((uint32_t)bufferIdx < buffers.size() && bufferIdx != i) {
     scribble(buffer, pos);
   }
 
   // Also scribble on other blocks we are going to keep that haven't previously been scribbled on...
   // Basically, those between bufferIndex_ and i
-  for (auto j=i+1; j < bufferIdx && j < buffers.size(); j++) {
+  for (auto j=i+1; j < bufferIdx && (uint32_t)j < buffers.size(); j++) {
     scribble(buffers[j], BYTE_BLOCK_SIZE);
   }
 #endif

@@ -69,6 +69,7 @@ char* returnsStackAddr(char* ptr) {
 // TODO: get memory sanitizer working (requires everything linked to be compiled with that!)
 // If you want to try out various sanitizers, uncomment one of the BUG lines below.
 TEST(BasicTest, testAddressSanitizer) {
+  /*** code commented out to prevent spamming warnings
   constexpr int size = 16;
   char onstack[size];
   char* arr = onstack;
@@ -99,7 +100,7 @@ TEST(BasicTest, testAddressSanitizer) {
 
   free(ptr); // comment out for leak test
   // free(ptr); // BUG: double free
-
+  ***/
 }
 
 

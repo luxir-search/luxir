@@ -86,10 +86,11 @@ public:
     return *this;
   }
 
-  const char* ptr(const MemPool& pool) const { return ptr_; }
-  int size(const MemPool& pool) const { return allocatedSz_ - left_; }
-  int left(const MemPool& pool) const { return left_; }
+  const char* ptr(const MemPool& pool) const { unused(pool); return ptr_; }
+  int size(const MemPool& pool) const { unused(pool); return allocatedSz_ - left_; }
+  int left(const MemPool& pool) const { unused(pool); return left_; }
   const char* start(const MemPool& pool) const {
+    unused(pool);
     if (allocatedSz_ == FIRST_LEVEL_SIZE) {
       return reinterpret_cast<const char*>(&bbStart_);
     } else {
@@ -160,7 +161,7 @@ public:
   // TODO: some sort of adapter that will specify the pool for us?
   StreamReader begin(const MemPool& pool) const;
   // const StreamReader& end(const MemPool& pool) const;
-  END end(const MemPool& pool) const { return END(); }
+  END end(const MemPool& pool) const { unused(pool); return END(); }
 
 } 
 SOLUX_PACKED_END;
@@ -254,9 +255,11 @@ public:
 
 
   bool operator==(const END& other) const {
+    unused(other);
     return this->ptr_ == nullptr;
   }
   bool operator!=(const END& other) const {
+    unused(other);
     return this->ptr_ != nullptr;
   }
 

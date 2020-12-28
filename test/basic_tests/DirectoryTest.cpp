@@ -14,7 +14,7 @@ protected:
     OutputStream os;
     char arr[6];
     // sometimes start off with a user supplied buffer for the output stream
-    if ((std::rand() & 0x01) == 1) {
+    if (rng.rbool()) {
       os = OutputStream(arr, arr+sizeof(arr));
     }
 
@@ -28,7 +28,7 @@ protected:
 
     // check if dir contents are in sorted order
     dir.listFiles(resultListing);
-    for (int i=1; i<resultListing.size(); i++) {
+    for (uint32_t i=1; i<resultListing.size(); i++) {
       ASSERT_LT(resultListing[i-1], resultListing[i]);
     }
 

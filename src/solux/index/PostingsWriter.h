@@ -338,6 +338,7 @@ public:
 
   // called starting a new field, or after flushing a term block.
   void _startTermBlock(bool endingField) {
+    unused(endingField);
     termList.resize(0);
     docFileSize.resize(0);
     pulsed.resize(0);
@@ -368,8 +369,8 @@ public:
     termOutput.writeVlong(fieldInfo.posLoc - locOfPositionsForTermBlock);
 
     // now write the block:
-    int pulsedIdx = 0;  // index of next pulsed data
-    for (int i=0; i<termList.size(); i++) {
+    uint32_t pulsedIdx = 0;  // index of next pulsed data
+    for (uint32_t i=0; i<termList.size(); i++) {
       auto term = termList[i];
 
       if (i > 0) {
@@ -483,7 +484,7 @@ public:
       //   when the docfreq is larger than the doc block size.
       uint32_t lastdoc = 0;
       assert(docs.size() == tfreqs.size());
-      for (int i=0; i<docs.size(); i++) {
+      for (uint32_t i=0; i<docs.size(); i++) {
         assert(docs[i] > lastdoc || i==0);
         uint32_t docdelta = docs[i] - lastdoc;
         lastdoc = docs[i];

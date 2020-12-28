@@ -2,7 +2,8 @@
 #include "Inverter.h"
 
 void Inverter::index(Document& doc) {
-/*
+  unused(doc);
+  /*
   int docid = ++currDoc_;
   for (auto fv : doc.fields) {
     indexField(fv);
@@ -12,5 +13,5 @@ void Inverter::index(Document& doc) {
 
 
 void Inverter::indexField(FieldValue& fv) {
-
+  unused(fv);
 }

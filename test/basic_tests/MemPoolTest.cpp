@@ -12,6 +12,7 @@ TEST_F(MemPoolTest, rewind) {
   MemPool pool;
   pool.allocate(3);
   char* a = pool.allocate(2);
+  unused(a);
   auto savePoint = pool.getSavePoint();
   char* b = pool.allocate(3);
   *b = 'b';
@@ -32,6 +33,7 @@ TEST_F(MemPoolTest, boundary) {
   MemPool pool;
   size_t sz = MemPool::BYTE_BLOCK_SIZE;
   char* a = pool.allocate(1);
+  unused(a);
   auto savePoint = pool.getSavePoint();
   char* p = pool.ptr();
   char* b = pool.allocate(sz - 1);  // should be room for this.

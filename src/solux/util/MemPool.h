@@ -130,7 +130,7 @@ public:
   // ensures that there is enough space starting with the current buffer (moving to a new buffer if necessary)
   // and returns the resulting end offset into the last (current) block.
   int reserveBBP(uint32_t size) {
-    assert(size >= 0 && size <= BYTE_BLOCK_SIZE);
+    assert(size <= BYTE_BLOCK_SIZE);
     auto newEnd = pos + size;
     if (newEnd > BYTE_BLOCK_SIZE) {
       nextBuffer();
@@ -210,14 +210,14 @@ public:
     return true;
   }
 
-  void _rewind(const save_point& savePoint, int32_t buffersToSave);
+  void _rewind(const save_point& savePoint, uint32_t buffersToSave);
 
   /// Rewinds to the rewindPoint, effectively deallocating all allocations after that point.
   /// buffersToSave is the number of buffers to hold in reserve for use during subsequent pool expansions.
   /// If you are going to be repeating some type of work you just did, and hence expect the same order of
   /// magnitude of memory allocation, consider passing INT_MAX.  Otherwise, 1 may be a good general purpose choice.
   /// 0 may be better if one has many pools.
-  void rewind(const save_point& savePoint, int32_t buffersToSave=1) {
+  void rewind(const save_point& savePoint, uint32_t buffersToSave=1) {
     if (savePoint >= buffer && savePoint <= buffer + BYTE_BLOCK_SIZE) {  // TODO: check boundary condition here...
       // fast path: same buffer
       assert(scribble(savePoint, ptr()-savePoint));  // scribble from the save point to the current point
