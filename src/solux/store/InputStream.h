@@ -14,9 +14,9 @@ public:
   InputStream() {}
   InputStream(const char* start, const char* end) : pos(start), start(start), end(end) {}
 
-  const char* ptr() { return pos; }
-  uint64_t offset() { return pos - start; }
-  uint64_t left() { return end - pos; }  // how much data is left to read
+  const char* ptr() const noexcept { return pos; }
+  uint64_t offset() const noexcept { return pos - start; }
+  uint64_t left() const noexcept { return end - pos; }  // how much data is left to read
 
   void seek(uint64_t offset) {
     pos = start + offset;
@@ -114,6 +114,13 @@ public:
     return term;
   }
 
+  friend std::ostream& operator<< (std::ostream &out, const InputStream &is) {
+    // TODO: print out some of the bytes before and after the current position?
+    out << "{sz=" << (is.end-is.start) << " left=" << is.left()
+        << " start=" << (void*)is.start << " pos=" << (void*)is.pos << " end=" << (void*)is.end
+        << '}';
+    return out;
+  }
 
 
 };

@@ -32,11 +32,11 @@ public:
   : tindexFile(tindexFile), termFile(termFile), docFile(docFile), posFile(posFile)
   {
     std::cout << "DEBUG:"
-      << " tindexFile=" << tindexFile->size()
-      << " termFile=" << termFile->size()
-      << " docFile=" << docFile->size()
-      << " posFile=" << posFile->size()
-      << std::endl;
+      << " tindexFile=" << *tindexFile << std::endl
+      << " termFile=" << *termFile << std::endl
+      << " docFile=" << *docFile << std::endl
+      << " posFile=" << *posFile << std::endl
+      ;
   }
 
 };
@@ -81,6 +81,7 @@ public:
     termBlockOffsets = reinterpret_cast<const uint64_t*>(is.ptr());  // offsets from termsLoc
     numTermBlocks = ((nTerms-1) / PostingsWriter::TERMS_BLOCK_SIZE) + 1;
     is.skip(numTermBlocks * sizeof(uint64_t));
+    return true;
   }
 
   void readFieldAt(uint64_t offset) {
@@ -197,6 +198,7 @@ public:
     currTerm.setSize(prefixLen + suffixLen);
 
     readTermMetadata();
+    return true;
   }
 
   // TODO: a push interface that can more quickly/directly handle pulsed postings while allowing inlining?

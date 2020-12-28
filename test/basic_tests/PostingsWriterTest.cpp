@@ -69,7 +69,6 @@ protected:
 
   uint32_t getNumDocs(uint32_t numTerms) {
     return rng.rint(1u,docsPerTermMax);
-     2;
   }
 
   uint32_t getNumTerms(uint32_t numFields) {
@@ -192,6 +191,23 @@ protected:
     }
   }
 
+  int stackfill(uint64_t fill, int sz) {
+    uint64_t* p = (uint64_t*)alloca(sz*sizeof(uint64_t));
+    uint64_t ret = rng();
+    for (int i=0; i<sz; i++) {
+      p[i] = rng();
+    }
+    // conspire to set all the mem to the same thing without the compiler optimizing it away
+    for (int i=0; i<sz; i++) {
+      uint64_t otherIdx = rng() % sz;
+      if (otherIdx != 7) {
+        p[i] = fill;
+      }
+      ret += p[otherIdx];
+    }
+    return ret;
+  }
+
 };
 
 
@@ -199,7 +215,6 @@ TEST_F(PostingsTest, basic) {
   RAMDir dir;
   MemPool pool;
   PostingsWriter writer(dir, "gen1");
-  writer.startField("field1");
   std::string t1 = "term1";
   std::string t2 = "term2";
   std::string ta = "termA";
@@ -207,6 +222,7 @@ TEST_F(PostingsTest, basic) {
   TermRef term2(pool,t2.data(),t2.size());
   TermRef terma(pool,ta.data(),ta.size());
 
+  writer.startField("field1");
   writer.startTerm(term1);  // single doc, single position... this should be pulsed
   writer.startDoc(44);
   writer.addPositionDelta(1);

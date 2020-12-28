@@ -235,6 +235,12 @@ public:
   virtual std::string_view read() = 0;
 
   virtual InputStream getInputStream() = 0;
+
+  friend std::ostream& operator<< (std::ostream &out, InputFile &inf) {
+    out << "InputFile: at" << &inf << " stream=" << inf.getInputStream();
+    return out;
+  }
+
 };
 
 class RAMInputFile : public InputFile {
