@@ -301,7 +301,67 @@ TEST_F(PostingsTest, basic) {
 
 }
 
+/* WIP
+TEST_F(PostingsTest, blockPositions) {
+  RAMDir dir;
+  MemPool pool;
+  PostingsWriter writer(dir, "gen1");
+  std::string t1 = "term1";
+  TermRef term1(pool,t1.data(),t1.size());
 
+  writer.startField("field1");
+  writer.startTerm(term1);
+  writer.startDoc(42);
+  int nPos = PostingsWriter::POSITIONS_BLOCK_SIZE + 2; // TODO: parameterize
+  int delta = 2;
+  for (int i=0; i<nPos; i++) {
+    writer.addPositionDelta(2);
+  }
+  writer.endDoc(42);
+  writer.endTerm(term1);
+  writer.endField("field1");
+  writer.finish();
+
+
+  auto tindexFile = dir.openFile("tindex");
+  auto termFile = dir.openFile("term");
+  auto docFile = dir.openFile("doc") ;
+  auto posFile = dir.openFile("pos");
+  PostingsReader reader(tindexFile.get(), termFile.get(), docFile.get(), posFile.get());
+
+  TermIndexReader tindexReader(pool, reader);
+  ASSERT_TRUE(tindexReader.readNextField());
+  std::cout << "FIELD NAME name=" << tindexReader.name() << " numTerms=" << tindexReader.numTerms() << std::endl;
+  ASSERT_EQ(tindexReader.name(), "field1");
+  ASSERT_EQ(tindexReader.numTerms(), 1);
+
+  TermsEnum tenum(pool, reader, tindexReader);
+  ASSERT_TRUE(tenum.nextTerm());
+  ASSERT_EQ(tenum.ord(), 0);
+  ASSERT_EQ(tenum.term(), "term1");
+
+  DocsEnum docsEnum(pool, reader, tindexReader, tenum);
+  ASSERT_EQ(docsEnum.numDocs(), 1);
+  ASSERT_EQ(docsEnum.totalTermFreq(), nPos);
+
+  auto id = docsEnum.nextDoc();
+  auto tfreq = docsEnum.termFreq();
+  ASSERT_EQ(id, 42);
+  ASSERT_EQ(tfreq, nPos);
+
+  docsEnum.startPositions();
+  uint32_t lastPos = 0;
+  for (int i = 0; i < tfreq; i++) {
+    auto pos = docsEnum.nextPosition();
+    auto posDelta = pos - lastPos;
+    lastPos = pos;
+    ASSERT_EQ(posDelta, delta);
+  }
+
+  ASSERT_FALSE(tenum.nextTerm());
+  ASSERT_FALSE(tindexReader.readNextField());
+}
+*/
 
 TEST_F(PostingsTest, randWrite) {
   std::cout << "SEED=" << rng_seed << std::endl;

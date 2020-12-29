@@ -11,6 +11,7 @@
 #include "solux/util/StrRef.h"
 #include "solux/store/OutputStream.h"
 #include "solux/store/Directory.h"
+#include "solux/search/PostingsReader.h"
 #include "simdcomp/include/codecfactory.h"
 
 /**
@@ -145,8 +146,6 @@ public:
 //
 
 
-  static constexpr uint32_t TERMS_BLOCK_SIZE = 128;
-
   // TODO: after we settle on the right codec, make an optimized version specifically for our usecase.
   // Perhaps try to keep it pluggable at compile time to make it easy for others to experiment?
   // TODO: I don't think these are thread safe! (but the codec factory hands out the same one to everyone)
@@ -159,12 +158,10 @@ public:
   // SIMDCompressionLib::IntegerCODEC &posCodec = *SIMDCompressionLib::CODECFactory::getFromName("fastpfor");  // best for space   // NOTE: block size==256 integers!  What is the page size for?
   // TODO: switch to simd
   SIMDCompressionLib::FastPFor<4, false> posCodec; // corresponds to a block size of 128 and non-delta coding
-  static constexpr uint32_t POSITIONS_BLOCK_SIZE = 128;
 
   // docs will be sorted (hence should use deltas) but we could calculate them ourselves just as easily, and maybe faster if interleaved with other work?
   // SIMDCompressionLib::IntegerCODEC& docCodec = *SIMDCompressionLib::CODECFactory::getFromName("s4-fastpfor-d1");
   SIMDCompressionLib::SIMDFastPFor<4, SIMDCompressionLib::RegularDeltaSIMD> docCodec;
-  static constexpr uint32_t DOCS_BLOCK_SIZE = 128;
 
   // freq codec should not use deltas (freqs not sorted)
   SIMDCompressionLib::IntegerCODEC& tfreqCodec = posCodec;
@@ -284,7 +281,7 @@ public:
     }
 
     // TODO: potentially write directly to output buffer if there is room?
-    compressed_output.resize(POSITIONS_BLOCK_SIZE + 1024);
+    compressed_output.resize(Postings::POSITIONS_BLOCK_SIZE + 1024);
     size_t compressedSize = compressed_output.size(); // this gets changed to the actual size
     posCodec.encodeArray(reinterpret_cast<uint32_t *>(posdeltas.data()), posdeltas.size(), compressed_output.data(),
                          compressedSize);
@@ -308,7 +305,7 @@ public:
     // NOTE: SIMDCompressionAndIntersection puts 32 bit size at start!  Look at C version and see if it's easier to modify?
     // The simdcomp C library does have lower level interfaces that just handle a single 128 value block
 
-    compressed_output.resize(DOCS_BLOCK_SIZE + 1024);
+    compressed_output.resize(Postings::DOCS_BLOCK_SIZE + 1024);
     size_t compressedSize = compressed_output.size(); // this gets changed to the actual size
     docCodec.encodeArray(reinterpret_cast<uint32_t *>(docs.data()), docs.size(), compressed_output.data(),
                       compressedSize);
@@ -318,7 +315,7 @@ public:
     //
     // now the term freqs
     //
-    compressed_output.resize(DOCS_BLOCK_SIZE + 1024);
+    compressed_output.resize(Postings::DOCS_BLOCK_SIZE + 1024);
     compressedSize = compressed_output.size(); // this gets changed to the actual size
     tfreqCodec.encodeArray(reinterpret_cast<uint32_t *>(docs.data()), docs.size(), compressed_output.data(),
                            compressedSize);
@@ -527,7 +524,7 @@ public:
       docFileSize.push_back(getDocFileSize());
     }
 
-    if (termList.size() == TERMS_BLOCK_SIZE) {
+    if (termList.size() == Postings::TERMS_BLOCK_SIZE) {
       flushTerms(false);
     }
   }
@@ -575,14 +572,14 @@ public:
     }
     docs.push_back(doc);
     tfreqs.push_back(tf);
-    if (docs.size() == DOCS_BLOCK_SIZE) {
+    if (docs.size() == Postings::DOCS_BLOCK_SIZE) {
       flushDocs();
     }
   }
 
   void addPositionDelta(uint32_t posDelta) {
     posdeltas.push_back(posDelta);
-    if (posdeltas.size() == POSITIONS_BLOCK_SIZE) {
+    if (posdeltas.size() == Postings::POSITIONS_BLOCK_SIZE) {
       flushPositions();
     }
   }

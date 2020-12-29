@@ -30,6 +30,12 @@
 //   The simplest way is to just copy the rng.  Example:
 //     auto saved_rng = rng;  // after this point, the rngs should output the same sequence of values.
 //
+// Debugging a failing test:
+//   A standard gtest flag "--gtest_break_on_failure" will cause debuggers to suspend in any failed assertion.
+//   You may want to configure your IDE to add this parameter to the test executable (and perhaps add it
+//   to the Google Test template if using CLion.)
+
+
 
 //
 // TODO: switch from std::cout to some sort of logging framework where we can disable output like this by default and

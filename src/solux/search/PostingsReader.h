@@ -1,11 +1,18 @@
 #pragma once
 
-#include "solux/index/PostingsWriter.h"
+#include <cstdint>
+#include <assert.h>
+#include <iostream>
+#include <ostream>
+#include <sstream>
+#include <unordered_map>
+#include <vector>
 #include "solux/store/Directory.h"
 #include "solux/store/InputStream.h"
-
-// TODO: we could probably improve compile times by pulling some needed constants out into a Postings header that both
-// writer and reader could share?
+#include "solux/util/MemPool.h"
+#include "solux/util/StrRef.h"
+#include "solux/store/OutputStream.h"
+#include "simdcomp/include/codecfactory.h"
 
 
 // TODO: should the PostingsReader class be determining what files to open, or should a higher level class determine
@@ -17,6 +24,13 @@ class TermIndexReader;
 class TermsEnum;
 class DocsEnum;
 
+// Some stuff that the postings reader and writer need to share.
+class Postings {
+public:
+  static constexpr uint32_t TERMS_BLOCK_SIZE = 128;
+  static constexpr uint32_t POSITIONS_BLOCK_SIZE = 128;
+  static constexpr uint32_t DOCS_BLOCK_SIZE = 128;
+};
 
 // Lowest level postings reader class that needs to correspond to the PostingsWriter class that created the data.
 // PostingsReader should be thread-safe at the top level, but any iterators it supplies would not be.
@@ -41,7 +55,11 @@ public:
 
 };
 
-
+//
+// IDEA: have something top-level, like a PostingsReader, that is not thread-safe (i.e. per-session/thread)
+// that can cache some things (block encoders, pool, fast terms cache, or whatever)
+// That could just be the TermIndexReader, but we will probably have a higher level than that eventually.
+//
 
 // not thread safe
 class TermIndexReader {
@@ -79,7 +97,7 @@ public:
     posLoc = is.readVlong();
     nTerms = is.readVint();
     termBlockOffsets = reinterpret_cast<const uint64_t*>(is.ptr());  // offsets from termsLoc
-    numTermBlocks = ((nTerms-1) / PostingsWriter::TERMS_BLOCK_SIZE) + 1;
+    numTermBlocks = ((nTerms-1) / Postings::TERMS_BLOCK_SIZE) + 1;
     is.skip(numTermBlocks * sizeof(uint64_t));
     return true;
   }
@@ -155,11 +173,11 @@ public:
       // first block we are reading, so seek to the first block.
       is.seek(tindexReader.termsLoc);
     } else {
-      startingOrd += PostingsWriter::TERMS_BLOCK_SIZE;
+      startingOrd += Postings::TERMS_BLOCK_SIZE;
     }
     cumulativeDocsSize = 0;
     ordInBlock = 0;
-    maxOrdInBlock = std::min((int)PostingsWriter::TERMS_BLOCK_SIZE - 1, tindexReader.numTerms() - startingOrd - 1);
+    maxOrdInBlock = std::min((int)Postings::TERMS_BLOCK_SIZE - 1, tindexReader.numTerms() - startingOrd - 1);
 
     // see PostingsWriter.flushTerms
     startingTerm = is.readPackedTerm();
@@ -218,12 +236,15 @@ class DocsEnum {
   int32_t docid;
   int32_t pos;
   int32_t tfreq;
-  int64_t cumulativeTermFreq;  // to keep track of how many positions need to be skipped.
   int32_t ordStartBlock = 0;
   int32_t ordInBlock;
-  uint64_t posOffset;
-  uint64_t posIdx = 0;
-  uint64_t posIdxStart = 0;
+
+  // Position ordinals are indexes into the term-global positions list for non-pulsed positions.
+  // Thus the max posOrd should thus be totalTermFreq (except in the case of a single pulsed term,
+  // in which case there is nothing to read from the posFile anyway).
+  uint64_t posOrd = 0;         // the ordinal of the current position we are on
+  uint64_t posOrdStart = 0;    // the starting position ordinal for the current doc
+  int64_t cumulativeTermFreq;  // Should be equal to posOrdStart + tfreq (i.e. a docs positions are [posOrdStart,cumulativeTermFreq)
 
   int32_t docsSize;  // size of the postings in the doc file for the given term
   uint64_t statOfDocs;
@@ -231,6 +252,9 @@ class DocsEnum {
   uint64_t cumulativeDocsSize;
   uint64_t locOfDocsForTermBlock;
   uint64_t locOfPositionsForTermBlock;
+
+
+  uint32_t* posDeltas = nullptr;  // the list of decoded positions
 
 public:
   DocsEnum(MemPool& pool, PostingsReader& postingsReader, TermIndexReader& tindexReader, TermsEnum& tenum) : pool(pool), tenum(tenum) {
@@ -261,7 +285,7 @@ public:
       docIs.relativeSeek(-metaSize - 1); // move to start of metadata
       docfreq = docIs.readVint();
       ttf = docfreq + docIs.readVlong();
-      posOffset = docIs.readVlong();
+      auto posOffset = docIs.readVlong();
 
       // start of the actual docs is end of block - size
       statOfDocs = locOfDocsForTermBlock + cumulativeDocsSize - docsSize;
@@ -290,11 +314,11 @@ public:
       } else {
         tfreq = docIs.readVint();
       }
-      posIdxStart = cumulativeTermFreq;
+      posOrdStart = cumulativeTermFreq;
       cumulativeTermFreq += tfreq;
       auto docDelta = doccode >> 1;
       docid += docDelta;
-      pos = 0;  // reset positions
+      pos = 0;  // reset positions base (to add deltas to)
     }
     return docid;
   }
@@ -308,7 +332,7 @@ public:
   }
 
   void startPositions() {
-    while (posIdx < posIdxStart) {
+    while (posOrd < posOrdStart) {
       // need to skip positions
       // TODO: a faster skipVint (potentially)? inlining may already eliminate the dead code though.
       auto delta = posIs.readVint();
@@ -319,10 +343,13 @@ public:
     if (docsSize != 0) {
       auto delta = posIs.readVint();
       pos += delta;
-      posIdx++;
+      posOrd++;
     }
     return pos;
   }
+
+  // we could also think about exposing the position deltas
+
 
 };
 
