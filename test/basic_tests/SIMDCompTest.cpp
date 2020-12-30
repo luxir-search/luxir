@@ -8,7 +8,7 @@
 using namespace std;
 using namespace SIMDCompressionLib;
 
-class SIMDCompTest : public SoluxTest {
+class SIMDCompTest : public solux::SoluxTest {
 };
 
 

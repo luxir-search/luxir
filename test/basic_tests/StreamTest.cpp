@@ -8,12 +8,14 @@
 
 using namespace std;
 
+namespace solux {
+
 class StreamTest : public SoluxTest {
 public:
 
 // Write a bunch of random bytes and then ensure we can read them back verbatim.
 // A PNRG with a known seed is perfect to test this w/o having to store the whole sequence.
-  void testStream(MemPool& pool, int nbytes) {
+  void testStream(MemPool &pool, int nbytes) {
     Stream stream;
 
     // capture rng state so we can replay to compare
@@ -73,7 +75,7 @@ TEST_F(StreamTest, basic) {
   ++reader;
   total += *reader;
 
-  ASSERT_EQ(1+2+3+4+5, total);
+  ASSERT_EQ(1 + 2 + 3 + 4 + 5, total);
 
   int total2 = 0;
   for (Stream::iterator iter = stream.begin(pool); iter != stream.end(pool); total2 += *iter++);
@@ -83,18 +85,19 @@ TEST_F(StreamTest, basic) {
 
 TEST_F(StreamTest, randStream) {
   int maxlen = MemPool::BYTE_BLOCK_SIZE * 2;
-  int iter=100;
+  int iter = 100;
   int minBytesToWrite = 1000000;
 
   MemPool pool;
-  for (int i=0; i<iter || pool.size() <= minBytesToWrite; i++) {
+  for (int i = 0; i < iter || pool.size() <= minBytesToWrite; i++) {
     // test many small, but some big.
     int slen = rng.rint(20);
-    if (slen==18) slen = rng.rint(100);
-    if (slen==19) slen = rng.rint(maxlen);
+    if (slen == 18) slen = rng.rint(100);
+    if (slen == 19) slen = rng.rint(maxlen);
     testStream(pool, slen);
 
     // TODO: rewind the pool occasionally so we don't use more memory than necessary.
   }
 }
 
+} // end namespace

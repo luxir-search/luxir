@@ -1,6 +1,31 @@
 Building
 --------
 
+NOTE: The debugging version of libsimdcomp is currently built with -D_GLIBCXX_DEBUG, which is
+incompatible with c++ source built without that flag (things crash).  Specifically, if
+google benchmark is not built with that flag, then it will also crash.  Easiest way to get
+all debugging libs built this way is to modify the vcpkg toolchain:
+
+/opt/vcpkg$ git diff
+diff --git a/scripts/toolchains/linux.cmake b/scripts/toolchains/linux.cmake
+index fb5666538..35732451e 100644
+--- a/scripts/toolchains/linux.cmake
++++ b/scripts/toolchains/linux.cmake
+@@ -39,7 +39,8 @@ if(NOT _CMAKE_IN_TRY_COMPILE)
+     string(APPEND CMAKE_C_FLAGS_INIT " -fPIC ${VCPKG_C_FLAGS} ")
+     string(APPEND CMAKE_CXX_FLAGS_INIT " -fPIC ${VCPKG_CXX_FLAGS} ")
+     string(APPEND CMAKE_C_FLAGS_DEBUG_INIT " ${VCPKG_C_FLAGS_DEBUG} ")
+-    string(APPEND CMAKE_CXX_FLAGS_DEBUG_INIT " ${VCPKG_CXX_FLAGS_DEBUG} ")
++    #string(APPEND CMAKE_CXX_FLAGS_DEBUG_INIT " ${VCPKG_CXX_FLAGS_DEBUG} ")
++    string(APPEND CMAKE_CXX_FLAGS_DEBUG_INIT " -D_GLIBCXX_DEBUG ${VCPKG_CXX_FLAGS_DEBUG} ")
+     string(APPEND CMAKE_C_FLAGS_RELEASE_INIT " ${VCPKG_C_FLAGS_RELEASE} ")
+     string(APPEND CMAKE_CXX_FLAGS_RELEASE_INIT " ${VCPKG_CXX_FLAGS_RELEASE} ")
+
+Then recompile:
+/opt/vcpkg$ ./vcpkg remove benchmark
+/opt/vcpkg$ ./vcpkg install benchmark
+
+
 Ubuntu:
 ```
 sudo apt install build-essential cmake libboost-dev libboost-doc libgtest-dev libboost-chrono-dev \

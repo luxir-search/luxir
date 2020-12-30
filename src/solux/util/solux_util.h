@@ -38,17 +38,6 @@ inline bool isPowerOfTwo(unsigned int x)
   return ((x != 0) && !(x & (x - 1)));
 }
 
-// Although not the highest quality PRNG, xorshift64 simplicity is good for matching random sequences in different languages.
-// Do not pass 0, and it is recommended to start with something that has a lot of bits set, otherwise it takes a while to
-// build up to that.
-inline uint64_t xorshift(uint64_t x) {
-  x ^= x << 13;
-  x ^= x >> 7;
-  x ^= x << 17;
-  return x;
-}
-// TODO: implement wyrand... requires 64*64 bit -> 128 result multiply though (harder to port though)
-
 
 // generic vector ostream
 template <typename T>
@@ -70,16 +59,6 @@ std::ostream& operator<< (std::ostream& out, const std::vector<T>& v) {
 }
 
 
-
-// from MetroHash64
-
-// rotate right idiom recognized by most compilers
-inline static uint64_t rotate_right(uint64_t v, unsigned k)
-{
-  return (v >> k) | (v << (64 - k));
-}
-
-// unaligned reads, fast and safe on Nehalem and later microarchitectures
 inline uint64_t read_u64(const void * const ptr)
 {
   return static_cast<uint64_t>(*reinterpret_cast<const uint64_t*>(ptr));

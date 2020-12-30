@@ -5,7 +5,7 @@
 #include "solux/store/Directory.h"
 #include "SoluxTest.h"
 
-class DirectoryTest : public SoluxTest {
+class DirectoryTest : public solux::SoluxTest {
 protected:
   void addFile(Directory& dir, const std::string& name, const std::string& data, std::vector<std::string>& resultListing) {
     resultListing.resize(0);

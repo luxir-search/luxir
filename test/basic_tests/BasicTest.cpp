@@ -54,7 +54,7 @@ TEST(BasicTest, testCompiler) {
     EXPECT_EQ(9, sizeof(s2));  // make sure that the packed attribute does not pad the end
 }
 
-
+#if REMOVED_CODE
 char* returnsStackAddr(char* ptr) {
   char onstack[10];
   onstack[0]='A';
@@ -69,7 +69,6 @@ char* returnsStackAddr(char* ptr) {
 // TODO: get memory sanitizer working (requires everything linked to be compiled with that!)
 // If you want to try out various sanitizers, uncomment one of the BUG lines below.
 TEST(BasicTest, testAddressSanitizer) {
-  /*** code commented out to prevent spamming warnings
   constexpr int size = 16;
   char onstack[size];
   char* arr = onstack;
@@ -102,7 +101,7 @@ TEST(BasicTest, testAddressSanitizer) {
   // free(ptr); // BUG: double free
   ***/
 }
-
+#endif
 
 
 // test too large tokens

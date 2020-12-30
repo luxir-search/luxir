@@ -1,6 +1,6 @@
-find_package(GTest CONFIG REQUIRED)    #TODO: should this be in the "test" directory?
+find_package(GTest CONFIG REQUIRED)
 
-file(GLOB_RECURSE Test_SOURCES "*.cpp")
+file(GLOB_RECURSE Test_SOURCES *.cpp *.h)
 
 add_executable(mytest ${Test_SOURCES})
 target_link_libraries(mytest PUBLIC solux_lib)

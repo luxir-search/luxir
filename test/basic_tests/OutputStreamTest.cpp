@@ -6,7 +6,7 @@
 #include "SoluxTest.h"
 
 
-class OutputStreamTest : public SoluxTest {
+class OutputStreamTest : public solux::SoluxTest {
 public:
   // if you run into an issue in this test, try changing to true to catch the bug earlier.
   constexpr static bool catch_early = false;

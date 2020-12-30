@@ -3,7 +3,7 @@
 
 using namespace std;
 
-class MemPoolTest : public SoluxTest {
+class MemPoolTest : public solux::SoluxTest {
 protected:
 };
 

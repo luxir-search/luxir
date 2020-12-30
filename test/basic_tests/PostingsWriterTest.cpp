@@ -4,6 +4,7 @@
 #include "SoluxTest.h"
 #include<boost/container/static_vector.hpp>
 
+namespace solux {
 
 class PostingsTest : public SoluxTest {
 protected:
@@ -15,9 +16,9 @@ protected:
 
 
   // set these limits lower for easier debugging
-  uint32_t positionsPerDocMax=10;  // TODO: We don't have support for reading blocks yet, so make sure positionsPerDocMax*docsPerTermMax is less than a positions block size
-  uint32_t docsPerTermMax=10;
-  uint32_t termsPerFieldMax=100;  // TODO: stick to a single block for now
+  uint32_t positionsPerDocMax = 10;  // TODO: We don't have support for reading blocks yet, so make sure positionsPerDocMax*docsPerTermMax is less than a positions block size
+  uint32_t docsPerTermMax = 10;
+  uint32_t termsPerFieldMax = 100;  // TODO: stick to a single block for now
 
 
   std::unique_ptr<PostingsReader> reader;
@@ -33,7 +34,7 @@ protected:
   }
 
   void initWriter() {
-    writer = std::make_unique<PostingsWriter>(dir,"gen1");
+    writer = std::make_unique<PostingsWriter>(dir, "gen1");
 
     // save the RNG state
     rng_start = rng;
@@ -44,7 +45,7 @@ protected:
 
     auto tindexFile = dir.openFile("tindex");
     auto termFile = dir.openFile("term");
-    auto docFile = dir.openFile("doc") ;
+    auto docFile = dir.openFile("doc");
     auto posFile = dir.openFile("pos");
     reader = std::make_unique<PostingsReader>(tindexFile.get(), termFile.get(), docFile.get(), posFile.get());
     tindexReader = std::make_unique<TermIndexReader>(pool, *reader);
@@ -55,12 +56,12 @@ protected:
 
   uint32_t getPositionDelta(int nPositions) {
     // TODO: do a better job at testing boundaries
-    return rng.rint(1,(INT_MAX-1)/nPositions);
+    return rng.rint(1, (INT_MAX - 1) / nPositions);
   }
 
   uint32_t getDocDelta(int nDocs) {
     // TODO: do a better job at testing boundaries
-    return rng.rint(1,(INT_MAX-1)/nDocs);
+    return rng.rint(1, (INT_MAX - 1) / nDocs);
   }
 
   uint32_t getNumPositions(uint32_t numDocs) {
@@ -70,7 +71,7 @@ protected:
 
   uint32_t getNumDocs(uint32_t numTerms) {
     unused(numTerms);
-    return rng.rint(1u,docsPerTermMax);
+    return rng.rint(1u, docsPerTermMax);
   }
 
   uint32_t getNumTerms(uint32_t numFields) {
@@ -80,7 +81,7 @@ protected:
 
 
   // numPositions is changed to the actual number indexed (random positions can overflow max)
-  void addDoc(bool read, int docid, uint32_t& numPositions) {
+  void addDoc(bool read, int docid, uint32_t &numPositions) {
     uint32_t readTf = 0;
     if (read) {
       auto readid = docsEnum->nextDoc();
@@ -92,7 +93,7 @@ protected:
     }
     uint64_t position = 0;
     uint32_t actualPositions = 0;
-    for (uint32_t i=0; i<numPositions; i++) {   // TODO: introduce constants for limits
+    for (uint32_t i = 0; i < numPositions; i++) {   // TODO: introduce constants for limits
       auto delta = getPositionDelta(numPositions);
       position += delta;
       if (position >= INT_MAX) {
@@ -118,7 +119,7 @@ protected:
   }
 
 
-  void addTerm(bool read, const std::string& term, uint32_t numDocs) {
+  void addTerm(bool read, const std::string &term, uint32_t numDocs) {
     TermRef termRef;
     uint32_t numDocsRead = 0;
     if (read) {
@@ -128,15 +129,14 @@ protected:
         docsEnum = std::make_unique<DocsEnum>(pool, *reader, *tindexReader, *tenum);
         numDocsRead = docsEnum->numDocs();
       }
-    }
-    else {
+    } else {
       termRef = TermRef(pool, term.data(), term.size());
       writer->startTerm(termRef);
     }
     uint64_t docid = 0;
     int actualDocs = 0;
     uint64_t actualttf = 0;
-    for (uint32_t i=0; i<numDocs; i++) {
+    for (uint32_t i = 0; i < numDocs; i++) {
       auto docDelta = getDocDelta(numDocs);
       docid += docDelta;
       if (docid > INT_MAX) {
@@ -144,7 +144,7 @@ protected:
       }
       actualDocs++;
       uint32_t numPositions = getNumPositions(numDocs);
-      addDoc(read, (int)docid, numPositions);
+      addDoc(read, (int) docid, numPositions);
       actualttf += numPositions;
     }
     if (read) {
@@ -157,28 +157,28 @@ protected:
     }
   }
 
-  void addField(bool read, const std::string& fname, uint32_t numTerms) {
+  void addField(bool read, const std::string &fname, uint32_t numTerms) {
     std::string term = "term";
     term.resize(12);
 
     if (read) {
       tindexReader->readNextField();
-      ASSERT_EQ(fname,tindexReader->name());
+      ASSERT_EQ(fname, tindexReader->name());
       tenum = std::make_unique<TermsEnum>(pool, *reader, *tindexReader);
     } else {
       writer->startField(fname);
     }
     int realNumTerms = 0;
-    for (uint32_t i=0; i<numTerms; i++) {
+    for (uint32_t i = 0; i < numTerms; i++) {
       // std::format not implemented yet...
-      sprintf(term.data()+4,"%08d",i);
+      sprintf(term.data() + 4, "%08d", i);
       auto ndocs = getNumDocs(numTerms);
       if (ndocs > 0) ++realNumTerms;  // if number of docs for term ends up being 0, we should drop the term.
       addTerm(read, term, ndocs);
     }
     if (read) {
       ASSERT_EQ(tindexReader->numTerms(), realNumTerms);
-    }else {
+    } else {
       writer->endField(fname);
     }
   }
@@ -187,21 +187,21 @@ protected:
     std::string fname = "field";
     fname.resize(13);
 
-    for (uint32_t i=0; i<numFields; i++) {
+    for (uint32_t i = 0; i < numFields; i++) {
       // std::format not implemented yet...
-      sprintf(fname.data()+5,"%08d",i);
+      sprintf(fname.data() + 5, "%08d", i);
       addField(read, fname, getNumTerms(numFields));
     }
   }
 
   int stackfill(uint64_t fill, int sz) {
-    uint64_t* p = (uint64_t*)alloca(sz*sizeof(uint64_t));
+    uint64_t *p = (uint64_t *) alloca(sz * sizeof(uint64_t));
     uint64_t ret = rng();
-    for (int i=0; i<sz; i++) {
+    for (int i = 0; i < sz; i++) {
       p[i] = rng();
     }
     // conspire to set all the mem to the same thing without the compiler optimizing it away
-    for (int i=0; i<sz; i++) {
+    for (int i = 0; i < sz; i++) {
       uint64_t otherIdx = rng() % sz;
       if (otherIdx != 7) {
         p[i] = fill;
@@ -221,9 +221,9 @@ TEST_F(PostingsTest, basic) {
   std::string t1 = "term1";
   std::string t2 = "term2";
   std::string ta = "termA";
-  TermRef term1(pool,t1.data(),t1.size());
-  TermRef term2(pool,t2.data(),t2.size());
-  TermRef terma(pool,ta.data(),ta.size());
+  TermRef term1(pool, t1.data(), t1.size());
+  TermRef term2(pool, t2.data(), t2.size());
+  TermRef terma(pool, ta.data(), ta.size());
 
   writer.startField("field1");
   writer.startTerm(term1);  // single doc, single position... this should be pulsed
@@ -269,7 +269,7 @@ TEST_F(PostingsTest, basic) {
 
   auto tindexFile = dir.openFile("tindex");
   auto termFile = dir.openFile("term");
-  auto docFile = dir.openFile("doc") ;
+  auto docFile = dir.openFile("doc");
   auto posFile = dir.openFile("pos");
   PostingsReader reader(tindexFile.get(), termFile.get(), docFile.get(), posFile.get());
 
@@ -366,7 +366,9 @@ TEST_F(PostingsTest, blockPositions) {
 TEST_F(PostingsTest, randWrite) {
   std::cout << "SEED=" << rng_seed << std::endl;
   initWriter();
-  addFields(false,10);
+  addFields(false, 10);
   initReader();
-  addFields(true,10);
+  addFields(true, 10);
+}
+
 }

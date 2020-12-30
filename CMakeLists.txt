@@ -43,7 +43,7 @@ message(STATUS "CMAKE_CXX_COMPILER_ID=${CMAKE_CXX_COMPILER_ID}")
 if (CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -mavx -mssse3 -march=native")
   add_compile_options(
-          #"$<$<CONFIG:RELEASE>:-g>"
+          "$<$<CONFIG:RELEASE>:-g>"
           "$<$<CONFIG:DEBUG>:-D_GLIBCXX_DEBUG>"
   )
   add_compile_options(-Wall -Wextra)
@@ -51,7 +51,7 @@ if (CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
 elseif (CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -mavx -mssse3 -march=native")   # native just for dev... lock down more later?
   add_compile_options(
-          #"$<$<CONFIG:RELEASE>:-g>"
+          "$<$<CONFIG:RELEASE>:-g>"
           "$<$<CONFIG:DEBUG>:-D_GLIBCXX_DEBUG>"
   )
   add_compile_options(-Wall -Wextra)
@@ -66,8 +66,8 @@ endif()
 
 
 
-file(GLOB_RECURSE Proj_SOURCES "src/*.cpp")   #TODO: .h need to be here for any reason?
-list(FILTER Proj_SOURCES EXCLUDE REGEX ".*/main.cpp")
+file(GLOB_RECURSE Proj_SOURCES src/*.cpp src/*.h)
+list(FILTER Proj_SOURCES EXCLUDE REGEX .*/main.cpp)
 
 add_library(solux_lib STATIC ${Proj_SOURCES})
 
@@ -75,6 +75,7 @@ add_executable(solux src/solux/main.cpp)
 target_link_libraries(solux solux_lib)
 
 add_subdirectory(test)
+add_subdirectory(bench)
 
 
 # this needs to be after add_executable or add_library
