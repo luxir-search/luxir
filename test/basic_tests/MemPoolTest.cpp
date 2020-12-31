@@ -1,4 +1,4 @@
-#include "SoluxTest.h"
+#include "test/SoluxTest.h"
 #include "solux/util/MemPool.h"
 
 using namespace std;

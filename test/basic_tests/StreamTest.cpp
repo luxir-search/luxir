@@ -4,7 +4,7 @@
 
 #include "solux/index/Stream.h"
 #include "simdcomp/include/for.h"
-#include "SoluxTest.h"
+#include "test/SoluxTest.h"
 
 using namespace std;
 

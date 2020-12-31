@@ -137,4 +137,6 @@ public:
   }
 };
 
+using Rng = SoluxRand<RomuTrio>;
+
 } // end namespace solux

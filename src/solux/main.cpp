@@ -9,8 +9,10 @@
 #include "solux/util/solux_util.h"
 #include "index/Inverter.h"
 #include "analysis/Analyzer.h"
+#include "solux/util/random.h"
 
 using namespace std;
+using namespace solux;
 
 
 // trying to find alternate way to have no virtual calls for each word and enable inline
@@ -31,12 +33,12 @@ int main(int argc, char** argv) {
 
     std::string val = "now is the time for all good men to come to the aid of their country ";
     // val = "wow";
-    uint64_t x=0xdeadbeefabadcafe;
+    Rng r(0xdeeadbeef);
     int ntokens=1000;
     for (int i=0; i<ntokens; i++) {
         val += ' ';
-        std::string num = std::to_string(x=xorshift(x));
-        size_t digits = (uint32_t)(x=xorshift(x)) % 8 + 1;
+        std::string num = std::to_string(r());
+        size_t digits = (uint32_t)(r()) % 8 + 1;
         num = num.substr(0, std::min(digits, num.size()));
         val += num;
     }

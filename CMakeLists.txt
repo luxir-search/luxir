@@ -75,8 +75,6 @@ add_executable(solux src/solux/main.cpp)
 target_link_libraries(solux solux_lib)
 
 add_subdirectory(test)
-add_subdirectory(bench)
-
 
 # this needs to be after add_executable or add_library
 target_link_libraries (solux ${Boost_LIBRARIES})

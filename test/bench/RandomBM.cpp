@@ -1,6 +1,7 @@
 #include <benchmark/benchmark.h>
 #include <random>
 #include "solux/util/random.h"
+#include "gtest/gtest.h"
 
 
 template <class Rng>
@@ -22,9 +23,13 @@ inline uint64_t calcComplex(Rng& rng) {
     x += rng() - v;
   }
   v -= rng() + x;
+
   return v;
 };
 
+void tstz(uint64_t v) {
+  ASSERT_EQ(v, 0);  // test assertions in benchmarks
+}
 
 template <class Rng>
 inline void benchRng(benchmark::State& state, Rng& rng) {
@@ -32,6 +37,11 @@ inline void benchRng(benchmark::State& state, Rng& rng) {
   for (auto _ : state) {
     result += calcComplex(rng);
     result += calcSimple(rng);
+    /*** Test failures in benchmarking (from a utility method where a return won't break the loop and cause failure.
+    std::cout << "Test::HasFatalFailure=" << testing::Test::HasFatalFailure() << std::endl;
+    tstz(result);
+    std::cout << "Test::HasFatalFailure=" << testing::Test::HasFatalFailure() << std::endl;
+    ***/
     benchmark::DoNotOptimize(result);
     benchmark::ClobberMemory();
   }

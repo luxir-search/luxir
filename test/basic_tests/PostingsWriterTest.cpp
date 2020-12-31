@@ -1,7 +1,7 @@
 #include "solux/index/PostingsWriter.h"
 #include "solux/search/PostingsReader.h"
 #include "gtest/gtest.h"
-#include "SoluxTest.h"
+#include "test/SoluxTest.h"
 #include<boost/container/static_vector.hpp>
 
 namespace solux {

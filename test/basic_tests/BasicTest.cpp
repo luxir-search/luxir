@@ -8,35 +8,6 @@ using namespace std;
 // Basic sanity tests
 
 TEST(BasicTest, testCompiler) {
-  // TODO: move some of this to main() so it always appears at the start.
-  std::cout << "############## TEST environment info:";
-#ifdef NDEBUG
-  std::cout << "DEBUGGING DISABLED NDEBUG=" << NDEBUG;
-#else
-  std::cout << "Debugging!";
-#endif
-
-  std::cout << " __cplusplus=" << __cplusplus;
-#ifdef __VERSION__
-  std::cout << " __VERSION__=" << __VERSION__;
-#endif
-#ifdef __GNUC__
-  std::cout << " __GNUC__=" << __GNUC__;
-#endif
-#ifdef _MSC_VER
-  std::cout << " _MSC_VER=" << _MSC_VER;
-#endif
-#ifdef __clang__
-  std::cout << " __clang__=" << __clang__;
-#endif
-#ifdef __linux__
-  std::cout << " __linux__=" << __linux__;
-#endif
-#ifdef __OPTIMIZE__
-  std::cout << " __OPTIMIZE__=" << __OPTIMIZE__;
-#endif
-  std::cout << "sizeof(std::string)==" << sizeof(std::string) << std::endl;
-
     // Some of our basic expectations...
     // We would need a thorough code review if any of these are broken.
     EXPECT_EQ(8, sizeof(void*));

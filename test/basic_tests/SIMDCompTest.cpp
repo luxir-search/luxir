@@ -3,7 +3,7 @@
 #include <iostream>
 #include "simdcomp/include/codecfactory.h"
 #include "simdcomp/include/intersection.h"
-#include "SoluxTest.h"
+#include "test/SoluxTest.h"
 
 using namespace std;
 using namespace SIMDCompressionLib;

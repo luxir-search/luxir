@@ -3,7 +3,7 @@
 #include <iostream>
 
 #include "solux/store/Directory.h"
-#include "SoluxTest.h"
+#include "test/SoluxTest.h"
 
 
 class OutputStreamTest : public solux::SoluxTest {
