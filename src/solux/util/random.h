@@ -113,7 +113,7 @@ public:
   // in inner loops where performance may matter.
   template<typename T>
   T rint(T max) {
-    return engine() % max;
+    return (engine()&0x7fffffffffffffff) % max;
   }
 
   template<typename T>
