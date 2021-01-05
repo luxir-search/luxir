@@ -12,8 +12,9 @@
 #include "solux/util/MemPool.h"
 #include "solux/util/StrRef.h"
 #include "solux/store/OutputStream.h"
-#include "simdcomp/include/codecfactory.h"
+#include "solux/codec/Codec.h"
 
+namespace solux {
 
 // TODO: should the PostingsReader class be determining what files to open, or should a higher level class determine
 // that and pass the opened files?  For now, assume the latter.
@@ -30,6 +31,15 @@ public:
   static constexpr uint32_t TERMS_BLOCK_SIZE = 128;
   static constexpr uint32_t POSITIONS_BLOCK_SIZE = 128;
   static constexpr uint32_t DOCS_BLOCK_SIZE = 128;
+
+  using PositionsCodec = IntegerCODECTypeWrapper<SIMDCompressionLib::FastPFor<4, false>>;
+  using DocsCodec = IntegerCODECTypeWrapper<SIMDCompressionLib::SIMDFastPFor<4, SIMDCompressionLib::RegularDeltaSIMD>>;
+  using TFreqCodec = PositionsCodec; // same type, but should also share instances for better performance
+
+  // These could be static if we made them thread safe...
+  DocsCodec docCodec;
+  PositionsCodec posCodec;
+  TFreqCodec& tfreqCodec = posCodec;
 };
 
 // Lowest level postings reader class that needs to correspond to the PostingsWriter class that created the data.
@@ -354,3 +364,4 @@ public:
 };
 
 
+} // end namespace

@@ -131,7 +131,7 @@
 // FIRST ITERATION: use whatever we would for leftover small enough to not encode in a block.
 //   <doc_delta_code>  // doc delta or
 
-
+namespace solux {
 
 class PostingsWriter {
   Directory& directory;
@@ -145,29 +145,8 @@ public:
 // *off* / *offset* refers to offsets relative to something else (i.e. a location)
 //
 
-
-  // TODO: after we settle on the right codec, make an optimized version specifically for our usecase.
-  // Perhaps try to keep it pluggable at compile time to make it easy for others to experiment?
-  // TODO: I don't think these are thread safe! (but the codec factory hands out the same one to everyone)
-
-  // TODO: pull this stuff out to a postings-codec file? With factory functions for creating, and make it easy for
-  // developers to experiment.
-
-  // Positions codec should handle non-monotonic since we encode positions for multiple docs in a block.
-  // We will handle the calculation of deltas since we know where one doc starts and another stops.
-  // SIMDCompressionLib::IntegerCODEC &posCodec = *SIMDCompressionLib::CODECFactory::getFromName("fastpfor");  // best for space   // NOTE: block size==256 integers!  What is the page size for?
-  // TODO: switch to simd
-  SIMDCompressionLib::FastPFor<4, false> posCodec; // corresponds to a block size of 128 and non-delta coding
-
-  // docs will be sorted (hence should use deltas) but we could calculate them ourselves just as easily, and maybe faster if interleaved with other work?
-  // SIMDCompressionLib::IntegerCODEC& docCodec = *SIMDCompressionLib::CODECFactory::getFromName("s4-fastpfor-d1");
-  SIMDCompressionLib::SIMDFastPFor<4, SIMDCompressionLib::RegularDeltaSIMD> docCodec;
-
-  // freq codec should not use deltas (freqs not sorted)
-  SIMDCompressionLib::IntegerCODEC& tfreqCodec = posCodec;
-
   // TODO: pool allocate this
-  std::vector<uint32_t> compressed_output;
+  std::vector<char> compressed_output;
 
 
   int32_t lastDoc;
@@ -217,8 +196,9 @@ public:
   FieldInfo fieldInfo;
 
 
-
 private:  // some internal utility methods... not for use by indexers
+  Postings postings; // contains limits and codecs
+
   // number of docs for the current term
   uint32_t getDocFreq() const {
     return docsFlushed + docs.size();
@@ -269,23 +249,16 @@ public:
   }
 
 
-  // TODO: we want a different set of methods for different types of indexing...
-  // one set for indexed (with positions), one set for indexed documents only, etc.
-  // SegField could be responsible for pushing it's own data to this.
-
   // Currently only called for a full block of positions.
   // TODO: move to .cpp unless we template this class
   void flushPositions() {
     if (posdeltas.empty()) {
       return;
     }
-
-    // TODO: potentially write directly to output buffer if there is room?
-    compressed_output.resize(Postings::POSITIONS_BLOCK_SIZE + 1024);
-    size_t compressedSize = compressed_output.size(); // this gets changed to the actual size
-    posCodec.encodeArray(reinterpret_cast<uint32_t *>(posdeltas.data()), posdeltas.size(), compressed_output.data(),
-                         compressedSize);
-
+    compressed_output.resize(Postings::POSITIONS_BLOCK_SIZE * sizeof(uint32_t) + 1024);
+    uint32_t compressedSize = compressed_output.size(); // this gets changed to the actual size
+    postings.posCodec.encodeBlock(reinterpret_cast<uint32_t *>(posdeltas.data()), posdeltas.size(), compressed_output.data(),
+                                  compressedSize);
     posOutput.write(compressed_output.data(), compressedSize);
 
     positionsHandled += posdeltas.size();
@@ -305,19 +278,18 @@ public:
     // NOTE: SIMDCompressionAndIntersection puts 32 bit size at start!  Look at C version and see if it's easier to modify?
     // The simdcomp C library does have lower level interfaces that just handle a single 128 value block
 
-    compressed_output.resize(Postings::DOCS_BLOCK_SIZE + 1024);
-    size_t compressedSize = compressed_output.size(); // this gets changed to the actual size
-    docCodec.encodeArray(reinterpret_cast<uint32_t *>(docs.data()), docs.size(), compressed_output.data(),
+    compressed_output.resize(Postings::DOCS_BLOCK_SIZE * sizeof(uint32_t) + 1024);
+    uint32_t compressedSize = compressed_output.size(); // this gets changed to the actual size
+    postings.docCodec.encodeBlock(reinterpret_cast<uint32_t *>(docs.data()), docs.size(), compressed_output.data(),
                       compressedSize);
     docOutput.write(compressed_output.data(), compressedSize);
-
 
     //
     // now the term freqs
     //
-    compressed_output.resize(Postings::DOCS_BLOCK_SIZE + 1024);
+    compressed_output.resize(Postings::TERMS_BLOCK_SIZE + 1024);
     compressedSize = compressed_output.size(); // this gets changed to the actual size
-    tfreqCodec.encodeArray(reinterpret_cast<uint32_t *>(docs.data()), docs.size(), compressed_output.data(),
+    postings.tfreqCodec.encodeBlock(reinterpret_cast<uint32_t *>(tfreqs.data()), tfreqs.size(), compressed_output.data(),
                            compressedSize);
     docOutput.write(compressed_output.data(), compressedSize);
 
@@ -586,3 +558,4 @@ public:
 
 };
 
+} // end namespace
