@@ -2,7 +2,7 @@
 #include "solux/util/random.h"
 #include "solux/util/solux_util.h"
 #include "test/CodecTest.h"
-#include <benchmark/benchmark.h>
+#include "bench/solux_bench.h"
 #include <gtest/gtest.h>
 
 
@@ -48,29 +48,39 @@ static void BM_blockDecode(benchmark::State& state, std::string codecName, bool 
   decoded.resize(nvalues);
   encoded.resize(nvalues*sizeof(uint32_t) * 2);  // may result in SIMDCompressionLib::NotEnoughStorage if not big enough
 
+  fillBlock(rng, &values[0], (uint32_t) values.size(), sorted);
+  // some codecs modify the input array (calculating deltas in place), so make a copy.
+  std::vector<uint32_t> orig(values);
+  uint32_t encodedSz = encoded.size();
+  codec->encodeBlock(&values[0], values.size(), &encoded[0], encodedSz);
+  uint32_t decodedSz = 0;
 
   for (auto _ : state) {
-    state.PauseTiming();
-    fillBlock(rng, &values[0], (uint32_t)values.size(), sorted);
+    if (solux::unit_tests) {
+      state.PauseTiming();  // Only use in unit tests or slow tests!  See BenchTimer
+      fillBlock(rng, &values[0], (uint32_t) values.size(), sorted);
+      // some codecs modify the input array (calculating deltas in place), so make a copy.
+      orig = values;
+      encodedSz = encoded.size();
+      codec->encodeBlock(&values[0], values.size(), &encoded[0], encodedSz);
+      state.ResumeTiming();
+    }
 
-    // some codecs modify the input array (calculating deltas in place), so make a copy.
-    std::vector<uint32_t> orig(values);
-
-    uint32_t encodedSz = encoded.size();
-    codec->encodeBlock(&values[0], values.size(), &encoded[0], encodedSz);
-
-
-    state.ResumeTiming();
-    uint32_t decodedSz = decoded.size();
+    decodedSz = decoded.size();
     codec->decodeBlock(&encoded[0], encodedSz, &decoded[0], decodedSz);
     benchmark::DoNotOptimize(&decoded[0]);
     benchmark::ClobberMemory();
 
-    state.PauseTiming();
-    ASSERT_EQ(nvalues, decodedSz);
-    ASSERT_EQ(orig, decoded);
-    state.ResumeTiming();
+    if (solux::unit_tests) {
+      state.PauseTiming();
+      ASSERT_EQ(nvalues, decodedSz);
+      ASSERT_EQ(orig, decoded);
+      state.ResumeTiming();
+    }
   }
+
+  ASSERT_EQ(nvalues, decodedSz);
+  ASSERT_EQ(orig, decoded);
 };
 
 

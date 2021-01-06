@@ -123,7 +123,7 @@ int main(int argc, char **argv) {
   // our PRNGs.
   // --gtest-shuffle
   myargv.push_back(const_cast<char *>("--gtest_shuffle"));
-  bool unit_tests = !std::any_of(myargv.begin(), myargv.end(),  [](char* s){return strcmp(s,"--bench")==0;} );
+  solux::unit_tests = !std::any_of(myargv.begin(), myargv.end(),  [](char* s){return strcmp(s,"--bench")==0;} );
   int myargc = myargv.size();
 
   // init gtest so things like --gtest_break_on_failure work in benchmarks.
@@ -132,7 +132,7 @@ int main(int argc, char **argv) {
 
   testing::AddGlobalTestEnvironment(new solux::SoluxEnvironment());
 
-  if (!unit_tests) {
+  if (!solux::unit_tests) {
     benchmark::Initialize(&myargc, &(myargv[0]));
     benchmark::RunSpecifiedBenchmarks();
     return testing::Test::HasFatalFailure();
