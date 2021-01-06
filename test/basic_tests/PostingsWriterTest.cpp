@@ -10,6 +10,7 @@ class PostingsTest : public SoluxTest {
 protected:
   RAMDir dir;
   MemPool pool;
+  MemPool::save_point save = pool.getSavePoint();
   std::unique_ptr<PostingsWriter> writer;
   std::string field;
   std::string term;
@@ -18,7 +19,7 @@ protected:
   // set these limits lower for easier debugging
   uint32_t positionsPerDocMax = 10;  // TODO: We don't have support for reading blocks yet, so make sure positionsPerDocMax*docsPerTermMax is less than a positions block size
   uint32_t docsPerTermMax = 10;
-  uint32_t termsPerFieldMax = 100;  // TODO: stick to a single block for now
+  uint32_t termsPerFieldMax = 100;  // TODO: stick to a single term block for now
 
 
   std::unique_ptr<PostingsReader> reader;
@@ -26,18 +27,22 @@ protected:
   std::unique_ptr<TermsEnum> tenum;
   std::unique_ptr<DocsEnum> docsEnum;
 
-  rng_type rng_start;
+  Rng rng_start;
+  Rng r2;
 
 
   PostingsTest() {
-
   }
 
   void initWriter() {
+    pool.rewind(save);
+    dir = RAMDir();  // remove all files?
     writer = std::make_unique<PostingsWriter>(dir, "gen1");
 
     // save the RNG state
     rng_start = rng;
+    // re-init secondary rng off of first
+    r2.init(rng());
   }
 
   void initReader() {
@@ -52,6 +57,8 @@ protected:
 
     // restore the RNG state
     rng = rng_start;
+    // re-init secondary rng off of first
+    r2.init(rng());
   }
 
   uint32_t getPositionDelta(int nPositions) {
@@ -83,11 +90,18 @@ protected:
   // numPositions is changed to the actual number indexed (random positions can overflow max)
   void addDoc(bool read, int docid, uint32_t &numPositions) {
     uint32_t readTf = 0;
+    uint32_t maxRead = numPositions;
     if (read) {
       auto readid = docsEnum->nextDoc();
       ASSERT_EQ(docid, readid);
       readTf = docsEnum->termFreq();  // read the tf first, but don't compare it until later
-      docsEnum->startPositions();
+      if (r2.rbool()) {
+        // don't read all of the positions
+        maxRead = 0;  // for now, don't read any (simplate skipping)
+      }
+      if (maxRead > 0 || r2.rbool()) { // sometimes call startPositions even if we aren't going to read positions
+        docsEnum->startPositions();
+      }
     } else {
       writer->startDoc(docid);
     }
@@ -101,9 +115,12 @@ protected:
       }
       actualPositions++;
       if (read) {
-        auto pos = docsEnum->nextPosition();
-        // std::cout << "\t\tread pos=" << pos << std::endl;
-        ASSERT_EQ(position, pos);
+        if (maxRead > 0) {
+          maxRead--;
+          auto pos = docsEnum->nextPosition();
+          // std::cout << "\t\tread pos=" << pos << std::endl;
+          ASSERT_EQ(position, pos);
+        }
       } else {
         // std::cout << "\t\tadding posDelta=" << delta << " pos=" << position << std::endl;
         writer->addPositionDelta(delta);
@@ -290,6 +307,7 @@ TEST_F(PostingsTest, basic) {
         auto id = docsEnum.nextDoc();
         auto tfreq = docsEnum.termFreq();
         std::cout << "\t\t\tdocid=" << id << " termFreq=" << tfreq << std::endl;
+        // if (i==1) { continue; }  // test skipping reading a docs positions
         docsEnum.startPositions();
         for (int j = 0; j < tfreq; j++) {
           auto pos = docsEnum.nextPosition();
@@ -364,11 +382,31 @@ TEST_F(PostingsTest, blockPositions) {
 */
 
 TEST_F(PostingsTest, randWrite) {
-  std::cout << "SEED=" << rng_seed << std::endl;
-  initWriter();
-  addFields(false, 10);
-  initReader();
-  addFields(true, 10);
+  for (int i=0; i<10; i++) {
+    auto nFields = rng.rint(1,20);
+    initWriter();
+    addFields(false, nFields);
+    initReader();
+    addFields(true, nFields);
+  }
 }
 
+/*** An example of how to find a very small random test case that fails (for easier debugging)
+TEST_F(PostingsTest, randWriteTmp) {
+  std::cout << "SEED=" << rng_seed << std::endl;
+   positionsPerDocMax = 3;
+   docsPerTermMax = 3;
+   termsPerFieldMax = 2;
+
+   for (int i=0; i<100; i++) {
+     std::cout << "seed " << i << std::endl;
+     rng.init(i);
+     initWriter();
+     addFields(false, 1);
+     initReader();
+     addFields(true, 1);
+  }
 }
+ */
+
+} // end namespace

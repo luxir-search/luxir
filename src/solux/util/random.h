@@ -21,7 +21,7 @@ namespace solux {
 
 
 // Adapted from http://prng.di.unimi.it/splitmix64.c (ORIG LICENSE: CC0 / public domain)
-// Although not the highest quality, it's simplicity is good for matching random sequences in different languages.
+// Although not the highest quality, it's simplicity is good for matching random sequences in different languages
 // since it's easy to port.  xorshift64 was previously used for this purpose, but this is both faster
 // and does not have issues with a 0 seed.
 class SplitMix64 {
@@ -67,9 +67,7 @@ public:
     init(seeder(), seeder(), seeder());
   }
 
-  explicit RomuTrio() {} // unseeded! call init() before using.
-
-  explicit RomuTrio(uint64_t seed) {
+  explicit RomuTrio(uint64_t seed = 0) {
     init(seed);
   }
 

@@ -55,14 +55,18 @@ public:
   PostingsReader(InputFile* tindexFile, InputFile* termFile, InputFile* docFile, InputFile* posFile)
   : tindexFile(tindexFile), termFile(termFile), docFile(docFile), posFile(posFile)
   {
-    std::cout << "DEBUG:"
-      << " tindexFile=" << *tindexFile << std::endl
-      << " termFile=" << *termFile << std::endl
-      << " docFile=" << *docFile << std::endl
-      << " posFile=" << *posFile << std::endl
-      ;
   }
 
+
+  friend std::ostream& operator<< (std::ostream &out, const PostingsReader &reader) {
+    out << "PostingsReader:" << std::endl
+              << "  tindexFile=" << *reader.tindexFile << std::endl
+              << "  termFile=" << *reader.termFile << std::endl
+              << "  docFile=" << *reader.docFile << std::endl
+              << "  posFile=" << *reader.posFile << std::endl
+            ;
+    return out;
+  }
 };
 
 //
@@ -328,7 +332,7 @@ public:
       cumulativeTermFreq += tfreq;
       auto docDelta = doccode >> 1;
       docid += docDelta;
-      pos = 0;  // reset positions base (to add deltas to)
+      pos = 0;  // reset positions base (to add deltas to).
     }
     return docid;
   }
@@ -344,8 +348,9 @@ public:
   void startPositions() {
     while (posOrd < posOrdStart) {
       // need to skip positions
-      // TODO: a faster skipVint (potentially)? inlining may already eliminate the dead code though.
+      // TODO: a faster skipVint (potentially)? inlining should already eliminate the dead code though.
       auto delta = posIs.readVint();
+      posOrd++;
     }
   }
 

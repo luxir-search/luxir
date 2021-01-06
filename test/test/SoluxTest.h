@@ -51,9 +51,8 @@ namespace solux {
 
 class SoluxTest : public ::testing::Test {
 public:
-  using rng_type = SoluxRand<RomuTrio>;
+  static Rng rng;
   static uint64_t rng_seed;
-  static rng_type rng;
 
   // This is called from a listener with a seed that is different for every test.
   inline static void init_test(uint64_t seed) {

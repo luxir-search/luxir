@@ -10,7 +10,7 @@ namespace solux {
 static uint64_t global_random_seed;
 
 uint64_t SoluxTest::rng_seed;
-SoluxTest::rng_type SoluxTest::rng;
+Rng SoluxTest::rng;
 
 class SoluxTestListener : public testing::EmptyTestEventListener {
   uint64_t suiteHash;
