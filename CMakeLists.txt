@@ -32,6 +32,7 @@ endforeach()
 # sanitizer settings.. can leave this first one on while developing for linux
 #set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -std=c++2a -g -O1 -fno-omit-frame-pointer -fsanitize=address")
 #set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -std=c++2a -g -O0 -fno-omit-frame-pointer -fsanitize=address")     #don't optimize stuff out
+#set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -std=c++2a -g -O0 -fno-omit-frame-pointer -fsanitize=address -DMEM_SCRIBBLE") #scribble over heap allocations before use
 #set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -std=c++2a -g -O1 -fno-omit-frame-pointer -fsanitize=address -DMEMPOOL_MALLOC")  #use separate allocations
 #set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -std=c++2a -g -O1 -fno-omit-frame-pointer -fsanitize=thread -fPIE -pie")
 # NOTE: memory sanitizer needs *everything* including linked libc++ to be compiled with it.

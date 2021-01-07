@@ -185,3 +185,22 @@ TEST(Benchmarks, all) {
   benchmark::RunSpecifiedBenchmarks();
 }
 
+
+#ifdef MEM_SCRIBBLE
+void* operator new (std::size_t count ) {
+  // std::cout << "new(" << count << ")" << std::endl;
+  auto p = malloc(count);
+  memset(p, 'z', count);
+  return p;
+}
+
+void operator delete  (void* ptr) {
+  // std::cout << "delete(" << ptr << ")" << std::endl;
+  free(ptr);
+}
+void operator delete  (void* ptr, std::size_t sz) {
+  // std::cout << "delete2(" << ptr << "," << sz << ")" << std::endl;
+  memset(ptr, 'z', sz);
+  free(ptr);
+}
+#endif
