@@ -95,9 +95,11 @@ public:
 
   uint32_t decodeBlock(const char* in, uint32_t inSz, uint32_t* out, uint32_t &outSz) override {
     uint64_t recoveredSz = outSz;
-    codec.decodeArray( (uint32_t*)in, inSz / sizeof(uint32_t), out, recoveredSz);
+    auto endPtr = codec.decodeArray( (uint32_t*)in, inSz / sizeof(uint32_t), out, recoveredSz);
     outSz = recoveredSz;
-    return inSz*sizeof(uint32_t);
+    auto bytesRead = (char*)endPtr - in;
+    assert(bytesRead <= inSz);
+    return bytesRead;
   }
 };
 

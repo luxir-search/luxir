@@ -52,6 +52,9 @@ public:
   InputFile* docFile;
   InputFile* posFile;
 
+  Postings postings; // for codecs... temporary since they aren't necessarily thread safe?
+
+
   PostingsReader(InputFile* tindexFile, InputFile* termFile, InputFile* docFile, InputFile* posFile)
   : tindexFile(tindexFile), termFile(termFile), docFile(docFile), posFile(posFile)
   {
@@ -240,15 +243,26 @@ public:
 
 // TODO: some of this internal state could be removed... we only need some of it in the constructor?
 class DocsEnum {
+  uint32_t* posBuf;      // the list of decoded position deltas (may be partial)
+  int32_t posBufIdx=0;   // index of the next value to read in the position buffer
+  int32_t posBufEnd;     // one-past the last decoded position delta (but may be past the deltas for *this* doc
+  int32_t posBufEndDoc;  // one-past the last decoded pos delta for *this* doc
+  uint32_t* docBuf;      // the list of decoded docs (may be partial)
+  int32_t docBufIdx=0;   // index of the next value to read in the docs buffer
+  int32_t docBufEnd;     // index of one-past the last valid element
+
+  int32_t docid;  // current docid
+  int32_t pos;    // current position
+
   InputStream docIs;
   InputStream posIs;
+  PostingsReader& postingsReader;
+  TermIndexReader& tindexReader;
   TermsEnum& tenum;
   MemPool& pool;
   int32_t docfreq; // number of docs containing this term
-  uint64_t ttf;  // totalTermFreq
+  int64_t ttf;    // totalTermFreq (sum of term freq across all docs for this term)
 
-  int32_t docid;
-  int32_t pos;
   int32_t tfreq;
   int32_t ordStartBlock = 0;
   int32_t ordInBlock;
@@ -256,37 +270,60 @@ class DocsEnum {
   // Position ordinals are indexes into the term-global positions list for non-pulsed positions.
   // Thus the max posOrd should thus be totalTermFreq (except in the case of a single pulsed term,
   // in which case there is nothing to read from the posFile anyway).
-  uint64_t posOrd = 0;         // the ordinal of the current position we are on
-  uint64_t posOrdStart = 0;    // the starting position ordinal for the current doc
+  int64_t posOrd = 0;         // the ordinal of the current position we are on
+  int64_t posOrdStart = 0;    // the starting position ordinal for the current doc
   int64_t cumulativeTermFreq;  // Should be equal to posOrdStart + tfreq (i.e. a docs positions are [posOrdStart,cumulativeTermFreq)
 
   int32_t docsSize;  // size of the postings in the doc file for the given term
-  uint64_t statOfDocs;
+  int64_t startOfDocs;
 
-  uint64_t cumulativeDocsSize;
-  uint64_t locOfDocsForTermBlock;
-  uint64_t locOfPositionsForTermBlock;
+  int64_t cumulativeDocsSize;
+  int64_t locOfDocsForTermBlock;
+  int64_t locOfPositionsForTermBlock;
 
 
-  uint32_t* posDeltas = nullptr;  // the list of decoded positions
+  uint32_t db[Postings::DOCS_BLOCK_SIZE];  // temporary...
+  uint32_t pb[Postings::POSITIONS_BLOCK_SIZE];
+
+  // returns the ord of the last position in the last full block.. i.e. for 150 positions, it would return 127 (0-127 are in first block)
+  // for 10, it would return -1 (there are no block encoded positions)
+  static int64_t lastBlockEncodedPosOrd(uint64_t ttf) {
+    // A ttf of 127 means we don't have a full block... so return -1.
+    // A ttf of 128 through (128+127) means ords 0-127 are in first block and we would want to return 127.
+    return (ttf & ~(Postings::POSITIONS_BLOCK_SIZE-1)) - 1;
+  }
 
 public:
-  DocsEnum(MemPool& pool, PostingsReader& postingsReader, TermIndexReader& tindexReader, TermsEnum& tenum) : pool(pool), tenum(tenum) {
+  DocsEnum(MemPool& pool, PostingsReader& postingsReader, TermIndexReader& tindexReader, TermsEnum& tenum, int32_t* docsScratch=nullptr, int32_t* posScratch=nullptr)
+  : postingsReader(postingsReader), tindexReader(tindexReader), pool(pool), tenum(tenum)
+  {
+    docBuf=db;
+    posBuf=pb;
+
     // Since the same terms enum will often be used for multiple docs enum, we should copy everything we need
     // from the terms enum that we need (that may change.)
     // TODO: package those dependencies in a struct that can be simply assigned?  Or if there is enough overlap, simply copy the complete tenum?
     // Or we could invert the responsibility and make the client copy the tenum if they are going to change it.
     docsSize = tenum.docsSize;
+    docid = 0; // we delta-encode, so start from 0.  TODO: should we start at -1?  As it is now, a term with all docs will yield a delta list of 0,1,1,1,1... not optimal for RLE
+
     if (docsSize == 0) {
       // postings pulsed
-      docid = tenum.pulsedDoc;
-      pos = tenum.pulsedPos;
       docfreq = 1;
       tfreq = 1;
       ttf = 1;
+      docid = tenum.pulsedDoc;  // temporary, nocommit.. remove after docs are cut over to handle blocks?
+      // fill buffers with single pulsed doc+position
+      docBuf[0] = tenum.pulsedDoc;
+      docBufEnd = 1;
+      posBuf[0] = tenum.pulsedPos;
+      posBufIdx = 0;
+      posBufEndDoc = posBufEnd = 1;
+      cumulativeTermFreq = 0;
+      // std::cout << "Pulsed posting: id=" << docid << "pos=" << posDeltaBuf[0] << std::endl;
+
     } else {
-      pos = tfreq = -1;  // unnecessary initializations, but it makes some maybe-uninitialized warnings go away with -O3
-      docid = 0; // we delta-encode, so start from 0.  TODO: should we start at -1?  As it is now, a term with all docs will yield a delta list of 0,1,1,1,1... not optimal for RLE
+      pos = tfreq = -1;  // unnecessary initializations, but it makes some maybe-uninitialized warnings go away with -O3  // todo: revisit
       locOfDocsForTermBlock = tenum.locOfDocsForTermBlock;
       locOfPositionsForTermBlock = tenum.locOfPositionsForTermBlock;
       cumulativeDocsSize = tenum.cumulativeDocsSize;
@@ -299,14 +336,17 @@ public:
       docIs.relativeSeek(-metaSize - 1); // move to start of metadata
       docfreq = docIs.readVint();
       ttf = docfreq + docIs.readVlong();
+      docBufEnd = 0;
+
       auto posOffset = docIs.readVlong();
 
       // start of the actual docs is end of block - size
-      statOfDocs = locOfDocsForTermBlock + cumulativeDocsSize - docsSize;
-      docIs.seek(statOfDocs);
+      startOfDocs = locOfDocsForTermBlock + cumulativeDocsSize - docsSize;
+      docIs.seek(startOfDocs);
 
       posIs = postingsReader.posFile->getInputStream();
       posIs.seek(locOfPositionsForTermBlock + posOffset);
+      posBufEndDoc = posBufEnd = 0; // no positions read yet
       cumulativeTermFreq = 0;
     }
   }
@@ -332,7 +372,6 @@ public:
       cumulativeTermFreq += tfreq;
       auto docDelta = doccode >> 1;
       docid += docDelta;
-      pos = 0;  // reset positions base (to add deltas to).
     }
     return docid;
   }
@@ -346,26 +385,135 @@ public:
   }
 
   void startPositions() {
+    pos = 0;
     while (posOrd < posOrdStart) {
-      // need to skip positions
-      // TODO: a faster skipVint (potentially)? inlining should already eliminate the dead code though.
-      auto delta = posIs.readVint();
-      posOrd++;
+      // need to skip some positions.
+      auto numToSkip = posOrdStart - posOrd;
+      auto leftInBlock = posBufEnd - posBufIdx;
+
+      if (numToSkip <= leftInBlock) {
+        // std::cout << "skipping within position block: id=" << docid << " numToSkip=" << numToSkip << std::endl;
+        // our start is within current decoded block
+        posBufIdx += numToSkip;
+        posOrd += numToSkip;
+        posBufEndDoc = std::min(posBufIdx + tfreq, posBufEnd);
+        return;
+      }
+
+      // skip to end of block first.
+      // some of these calculations may be redundant, but it's just to make it easier to think about for now.
+      // Hopefully optimizer can take care of inefficiencies.
+      posOrd += leftInBlock;
+      numToSkip -= leftInBlock;
+      posBufIdx = posBufEnd;
+
+      if (numToSkip >= Postings::POSITIONS_BLOCK_SIZE) {
+        // TODO: skip whole block
+        // std::cout << "skipping blocks: id=" << docid << " numToSkip=" << numToSkip << std::endl;
+        // For now, just decode the whole block.  Optimize this later.
+        uint32_t outSz = Postings::POSITIONS_BLOCK_SIZE;
+        auto bytesRead = postingsReader.postings.posCodec.decodeBlock(posIs.ptr(), posIs.left(), posBuf, outSz);
+        posIs.skip(bytesRead);
+        assert(outSz == Postings::POSITIONS_BLOCK_SIZE);
+        posBufIdx = 0;
+        posBufEnd = outSz;
+        // posBufEndDoc = std::min(posBufEnd, tfreq);  // not needed, we will be skipping the block
+        continue;
+      }
+
+
+      // At this point, we need to skip less than a block of positions, but we need to know
+      // if it is block encoded or vInt encoded.  Compare to last block encoded ord to tell.
+      // Boundary conditions: if posOrdStart=127 then it is the last in the block and we
+      // do want to decode the block (hence do tail logic otherwise)
+      if (posOrdStart > lastBlockEncodedPosOrd(ttf)) {
+        // std::cout << "skipping in position tail: id=" << docid << " numToSkip=" << numToSkip << std::endl;
+        for (int i=0; i<numToSkip; i++) {
+          auto delta = posIs.readVint();
+          // TODO: a faster skipVint (potentially)? inlining should already eliminate the dead code though.
+        }
+        posOrd += numToSkip;
+        assert (posOrd == posOrdStart); // nocommit, trivial
+        posBufIdx = posBufEnd = posBufEndDoc = 0;
+        return;
+      }
+
+      // OK load block of positions.  This could be optimized by only loading the relevant part.
+      // If this enum wants all positions, we should just decode everything.
+      uint32_t outSz = Postings::POSITIONS_BLOCK_SIZE;
+      auto bytesRead = postingsReader.postings.posCodec.decodeBlock(posIs.ptr(), posIs.left(), posBuf, outSz);
+      posIs.skip(bytesRead);
+      assert(outSz == Postings::POSITIONS_BLOCK_SIZE);
+      posBufIdx = 0;
+      posBufEnd = outSz;
+      posBufEndDoc = std::min(posBufEnd, tfreq);
     }
   }
 
   int32_t nextPosition() {
-    if (docsSize != 0) {
-      auto delta = posIs.readVint();
-      pos += delta;
-      posOrd++;
+    if (posBufIdx >= posBufEndDoc) {
+      // Reached the end of buffered pos deltas, either because
+      // there are no more positions for this doc, or because we need
+      // to reload more.
+
+      int leftToRead = cumulativeTermFreq - posOrd;
+
+      if (leftToRead <= 0) {
+        assert(posOrd == cumulativeTermFreq); // should not have gone past
+        // TODO: set pos to something, or keep last valid position?
+        pos = INT_MAX;
+        return pos;  // or -1?
+      }
+
+      // we moved to a new doc, but still have positions decoded in the buffer.
+      // TODO: it feels like we should move this case to startPositions()
+      if (posBufEnd > posBufEndDoc) {
+        // just update our new end pointer
+        posBufEndDoc = std::min(posBufEnd, posBufIdx+leftToRead);
+      } else {
+        // if we have more positions to read, then there should be no more buffered
+        assert(posBufEndDoc == posBufEnd);
+
+        if (posOrd <= lastBlockEncodedPosOrd(ttf)) {
+          // read a new block of positions
+          // TODO: refactor reading a new block (not skipping) to one place?
+          uint32_t outSz = Postings::POSITIONS_BLOCK_SIZE;
+          auto bytesRead = postingsReader.postings.posCodec.decodeBlock(posIs.ptr(), posIs.left(), posBuf, outSz);
+          posIs.skip(bytesRead);
+          assert(outSz == Postings::POSITIONS_BLOCK_SIZE);
+          posBufIdx = 0;
+          posBufEnd = outSz;
+          posBufEndDoc = std::min(posBufEnd, tfreq);
+        } else {
+          // we are in the tail
+          // we could read position-by-position at the tail if we wanted...
+          // we could also handle pulsed positions here instead if sticking them in the buffer.
+          posBufIdx = 0;
+          posBufEnd = leftToRead; // only read enough for this doc
+          posBufEndDoc = leftToRead;
+          // std::cout << "FILL pos buffer docid=" << docid << " ords=" << posOrd << " through " << posOrd+tfreq-1 << std::endl;
+          for (int i = posBufIdx; i < posBufEnd; i++) {
+            posBuf[i] = posIs.readVint();
+          }
+        }
+      }
     }
+    // std::cout << "RETN pos buffer docid=" << docid << " posOrd=" << posOrd << " posBufIdx=" << posBufIdx << std::endl;
+    auto delta = posBuf[posBufIdx++];
+    // We could possibly move posOrd update and only update at block end.
+    // Would need to adjust/account for where we started in a block though.
+    // And given that there is no data dependency in this hot loop, it's unclear if it would help at all.
+    posOrd++;
+    pos += delta;
     return pos;
   }
 
-  // we could also think about exposing the position deltas
-
-
+  // We could also think about exposing the position deltas?
+  // Or, we could sum the positions in a block (for a doc) and then it would make bulk access
+  // easier / more efficient.
+  // Also think about bulk copying of positions when merging?  Would only work for first segment unless
+  // we supported multiple position lists.  Hence prob only worth it when merging small segment into large.
+  // How to do position skipping?  Could always pre-pend last position in a block?
 };
 
 

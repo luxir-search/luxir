@@ -138,6 +138,8 @@ protected:
 
   void addTerm(bool read, const std::string &term, uint32_t numDocs) {
     TermRef termRef;
+    termRef.init(nullptr,0);  // just to get rid of "possibly uninitialized" warning
+
     uint32_t numDocsRead = 0;
     if (read) {
       if (numDocs > 0) {
@@ -212,14 +214,15 @@ protected:
   }
 
   int stackfill(uint64_t fill, int sz) {
+    Rng r;
     uint64_t *p = (uint64_t *) alloca(sz * sizeof(uint64_t));
-    uint64_t ret = rng();
+    uint64_t ret = r();
     for (int i = 0; i < sz; i++) {
-      p[i] = rng();
+      p[i] = r();
     }
     // conspire to set all the mem to the same thing without the compiler optimizing it away
     for (int i = 0; i < sz; i++) {
-      uint64_t otherIdx = rng() % sz;
+      uint64_t otherIdx = r() % sz;
       if (otherIdx != 7) {
         p[i] = fill;
       }
@@ -307,7 +310,7 @@ TEST_F(PostingsTest, basic) {
         auto id = docsEnum.nextDoc();
         auto tfreq = docsEnum.termFreq();
         std::cout << "\t\t\tdocid=" << id << " termFreq=" << tfreq << std::endl;
-        // if (i==1) { continue; }  // test skipping reading a docs positions
+        if (i==1) { continue; }  // test skipping reading a docs positions
         docsEnum.startPositions();
         for (int j = 0; j < tfreq; j++) {
           auto pos = docsEnum.nextPosition();
@@ -319,23 +322,32 @@ TEST_F(PostingsTest, basic) {
 
 }
 
-/* WIP
 TEST_F(PostingsTest, blockPositions) {
   RAMDir dir;
   MemPool pool;
   PostingsWriter writer(dir, "gen1");
   std::string t1 = "term1";
-  TermRef term1(pool,t1.data(),t1.size());
+  TermRef term1(pool, t1.data(), t1.size());
 
   writer.startField("field1");
   writer.startTerm(term1);
   writer.startDoc(42);
-  int nPos = PostingsWriter::POSITIONS_BLOCK_SIZE + 2; // TODO: parameterize
+  int nPos = Postings::POSITIONS_BLOCK_SIZE * 2 + 2; // TODO: parameterize
   int delta = 2;
-  for (int i=0; i<nPos; i++) {
-    writer.addPositionDelta(2);
+  for (int i = 0; i < nPos; i++) {
+    writer.addPositionDelta(delta);
   }
   writer.endDoc(42);
+
+  writer.startDoc(43);
+  int nPos2 = Postings::POSITIONS_BLOCK_SIZE * 2 + 2; // TODO: parameterize
+  int delta2 = 3;
+  for (int i = 0; i < nPos; i++) {
+    writer.addPositionDelta(delta2);
+  }
+  writer.endDoc(43);
+
+
   writer.endTerm(term1);
   writer.endField("field1");
   writer.finish();
@@ -343,7 +355,7 @@ TEST_F(PostingsTest, blockPositions) {
 
   auto tindexFile = dir.openFile("tindex");
   auto termFile = dir.openFile("term");
-  auto docFile = dir.openFile("doc") ;
+  auto docFile = dir.openFile("doc");
   auto posFile = dir.openFile("pos");
   PostingsReader reader(tindexFile.get(), termFile.get(), docFile.get(), posFile.get());
 
@@ -359,27 +371,44 @@ TEST_F(PostingsTest, blockPositions) {
   ASSERT_EQ(tenum.term(), "term1");
 
   DocsEnum docsEnum(pool, reader, tindexReader, tenum);
-  ASSERT_EQ(docsEnum.numDocs(), 1);
-  ASSERT_EQ(docsEnum.totalTermFreq(), nPos);
+  ASSERT_EQ(docsEnum.numDocs(), 2);
+  ASSERT_EQ(docsEnum.totalTermFreq(), nPos + nPos2);
 
   auto id = docsEnum.nextDoc();
   auto tfreq = docsEnum.termFreq();
   ASSERT_EQ(id, 42);
   ASSERT_EQ(tfreq, nPos);
+  if (false)  // skip reading positions
+  {
+    docsEnum.startPositions();
+    uint32_t lastPos = 0;
+    for (int i = 0; i < tfreq; i++) {
+      auto pos = docsEnum.nextPosition();
+      auto posDelta = pos - lastPos;
+      lastPos = pos;
+      ASSERT_EQ(posDelta, delta);
+    }
+  }
 
-  docsEnum.startPositions();
-  uint32_t lastPos = 0;
-  for (int i = 0; i < tfreq; i++) {
-    auto pos = docsEnum.nextPosition();
-    auto posDelta = pos - lastPos;
-    lastPos = pos;
-    ASSERT_EQ(posDelta, delta);
+  auto id2 = docsEnum.nextDoc();
+  auto tfreq2 = docsEnum.termFreq();
+  ASSERT_EQ(id2, 43);
+  ASSERT_EQ(tfreq2, nPos2);
+  {
+    docsEnum.startPositions();
+    uint32_t lastPos = 0;
+    for (int i = 0; i < tfreq; i++) {
+      auto pos = docsEnum.nextPosition();
+      auto posDelta = pos - lastPos;
+      lastPos = pos;
+      ASSERT_EQ(posDelta, delta2);
+    }
   }
 
   ASSERT_FALSE(tenum.nextTerm());
   ASSERT_FALSE(tindexReader.readNextField());
 }
-*/
+
 
 TEST_F(PostingsTest, randWrite) {
   for (int i=0; i<10; i++) {
@@ -391,12 +420,31 @@ TEST_F(PostingsTest, randWrite) {
   }
 }
 
-/*** An example of how to find a very small random test case that fails (for easier debugging)
+TEST_F(PostingsTest, randWriteManyPos) {
+  for (int i=0; i<10; i++) {
+    auto nFields = rng.rint(1,20);
+    positionsPerDocMax = Postings::POSITIONS_BLOCK_SIZE * 5/2;
+    docsPerTermMax = 120;  // less than a doc block
+    termsPerFieldMax = 2;
+
+    initWriter();
+    addFields(false, nFields);
+    initReader();
+    addFields(true, nFields);
+  }
+}
+
+#if REMOVED
+// An indispensable example of how to come up with a very small test case that fails.  Run many times with multiple seeds
+// and if one fails, then set the lower bound of the loop to that seed number and debug!
 TEST_F(PostingsTest, randWriteTmp) {
   std::cout << "SEED=" << rng_seed << std::endl;
-   positionsPerDocMax = 3;
-   docsPerTermMax = 3;
-   termsPerFieldMax = 2;
+
+   // this set is good for finding bugs with pulsed and skipping  (just 1 term, 1 or 2 docs, 1 or 2 positions)
+   positionsPerDocMax = 3; docsPerTermMax = 3; termsPerFieldMax = 2;
+
+   // this set is good for finding bugs with position blocks mixed in and skipping
+   positionsPerDocMax = Postings::POSITIONS_BLOCK_SIZE*3/2; docsPerTermMax = 3; termsPerFieldMax = 2;
 
    for (int i=0; i<100; i++) {
      std::cout << "seed " << i << std::endl;
@@ -407,6 +455,6 @@ TEST_F(PostingsTest, randWriteTmp) {
      addFields(true, 1);
   }
 }
- */
+#endif
 
 } // end namespace
