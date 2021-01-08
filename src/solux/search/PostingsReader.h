@@ -240,19 +240,39 @@ public:
   // That could also handle differences between block and doc
 };
 
-
+// TODO: investigate writing a version of this based on continuations and see how it performs?
 // TODO: some of this internal state could be removed... we only need some of it in the constructor?
 class DocsEnum {
-  uint32_t* posBuf;      // the list of decoded position deltas (may be partial)
-  int32_t posBufIdx=0;   // index of the next value to read in the position buffer
+  // Position ordinals are indexes into the term-global positions list for non-pulsed positions.
+  // Thus the max posOrd should thus be totalTermFreq (except in the case of a single pulsed term,
+  // in which case there is nothing to read from the posFile anyway).
+  int32_t* posBuf;       // the list of decoded position deltas (may be partial)
+  int32_t* docBuf;       // the list of decoded docs (may be partial)
+  int32_t* tfreqBuf;     // the list of decoded term freqs
+
+  int64_t posOrd = 0;         // the ordinal of the current position we are on
+  int64_t posOrdStart = 0;    // the starting position ordinal for the current doc
+  int64_t cumulativeTermFreq; // Synonym for posOrdEnd.  Should be equal to posOrdStart + tfreq (i.e. a docs positions are [posOrdStart,cumulativeTermFreq)
+
+  int32_t posBufIdx = 0; // index of the next value to read in the position buffer
   int32_t posBufEnd;     // one-past the last decoded position delta (but may be past the deltas for *this* doc
   int32_t posBufEndDoc;  // one-past the last decoded pos delta for *this* doc
-  uint32_t* docBuf;      // the list of decoded docs (may be partial)
-  int32_t docBufIdx=0;   // index of the next value to read in the docs buffer
-  int32_t docBufEnd;     // index of one-past the last valid element
+  int32_t pos;           // current position
 
-  int32_t docid;  // current docid
-  int32_t pos;    // current position
+  int32_t docOrd = 0;    // the ordinal of the current document we are on for this term
+  int32_t docBufIdx = 0; // index of the next value to read in the docs buffer
+  int32_t docBufEnd;     // index of one-past the last valid element
+  int32_t docid;         // current docid
+
+  // For term freqs, since they are parallel to docs, we don't actually need
+  // all of these variables.  But it sets the stage for separating the two
+  // more and using different encodings / block sizes for them.
+  int32_t tfreqOrd;      // ordinal of the current term freq (parallel to docOrd)
+  int32_t tfreqBufIdx;      // index of the next valid value
+  int32_t tfreqBufEnd;      // index of one-past the last valid element
+  int32_t tfreq;
+
+
 
   InputStream docIs;
   InputStream posIs;
@@ -263,16 +283,10 @@ class DocsEnum {
   int32_t docfreq; // number of docs containing this term
   int64_t ttf;    // totalTermFreq (sum of term freq across all docs for this term)
 
-  int32_t tfreq;
   int32_t ordStartBlock = 0;
   int32_t ordInBlock;
 
-  // Position ordinals are indexes into the term-global positions list for non-pulsed positions.
-  // Thus the max posOrd should thus be totalTermFreq (except in the case of a single pulsed term,
-  // in which case there is nothing to read from the posFile anyway).
-  int64_t posOrd = 0;         // the ordinal of the current position we are on
-  int64_t posOrdStart = 0;    // the starting position ordinal for the current doc
-  int64_t cumulativeTermFreq;  // Should be equal to posOrdStart + tfreq (i.e. a docs positions are [posOrdStart,cumulativeTermFreq)
+
 
   int32_t docsSize;  // size of the postings in the doc file for the given term
   int64_t startOfDocs;
@@ -282,8 +296,9 @@ class DocsEnum {
   int64_t locOfPositionsForTermBlock;
 
 
-  uint32_t db[Postings::DOCS_BLOCK_SIZE];  // temporary...
-  uint32_t pb[Postings::POSITIONS_BLOCK_SIZE];
+  int32_t db[Postings::DOCS_BLOCK_SIZE];  // temporary...
+  int32_t pb[Postings::POSITIONS_BLOCK_SIZE];
+  int32_t tb[Postings::POSITIONS_BLOCK_SIZE];
 
   // returns the ord of the last position in the last full block.. i.e. for 150 positions, it would return 127 (0-127 are in first block)
   // for 10, it would return -1 (there are no block encoded positions)
@@ -294,11 +309,13 @@ class DocsEnum {
   }
 
 public:
-  DocsEnum(MemPool& pool, PostingsReader& postingsReader, TermIndexReader& tindexReader, TermsEnum& tenum, int32_t* docsScratch=nullptr, int32_t* posScratch=nullptr)
+  DocsEnum(MemPool& pool, PostingsReader& postingsReader, TermIndexReader& tindexReader, TermsEnum& tenum,
+           int32_t* docsScratch=nullptr, int32_t* posScratch=nullptr, int32_t* tfreqScratch=nullptr)
   : postingsReader(postingsReader), tindexReader(tindexReader), pool(pool), tenum(tenum)
   {
     docBuf=db;
     posBuf=pb;
+    tfreqBuf=tb;
 
     // Since the same terms enum will often be used for multiple docs enum, we should copy everything we need
     // from the terms enum that we need (that may change.)
@@ -359,6 +376,7 @@ public:
     return ttf;
   }
 
+
   int32_t nextDoc() {
     if (docsSize != 0) {
       // see PostingsWriter.endTerm() for format of non-block encoded docs/freqs
@@ -373,6 +391,76 @@ public:
       auto docDelta = doccode >> 1;
       docid += docDelta;
     }
+    return docid;
+  }
+
+
+  int32_t nextDocX() {
+    if (docBufIdx >= docBufEnd) {
+      auto leftToRead = docfreq - docOrd;
+      // Boundary analysis: if docfreq==1 and docOrd==1 (meaning we already read ord 0, but not 1), we are done.
+      if (leftToRead <= 0) {
+        assert(leftToRead == 0);
+        docid = INT_MAX;
+        return docid;
+      }
+
+      // Since we only read whole blocks, simply comparing with number of docs left to read is sufficient.
+      // If we start partial decoding of blocks (say because of skipping), then we would want something
+      // like lastBlockEncodedPosOrd, but for docs.
+      if (leftToRead >= Postings::DOCS_BLOCK_SIZE) {
+        uint32_t outSz = Postings::DOCS_BLOCK_SIZE;
+        auto bytesRead = postingsReader.postings.docCodec.decodeBlock(docIs.ptr(), docIs.left(), (uint32_t*)docBuf, outSz);
+        docIs.skip(bytesRead);
+        assert(outSz == Postings::DOCS_BLOCK_SIZE);
+        docBufIdx = 0;
+        docBufEnd = Postings::DOCS_BLOCK_SIZE;
+
+        // TODO: we should really decode term freqs lazily in case they aren't needed... but this is far simpler for now.
+        outSz = Postings::DOCS_BLOCK_SIZE;  // currently parallel to docs, so must be same block size
+        bytesRead = postingsReader.postings.tfreqCodec.decodeBlock(posIs.ptr(), posIs.left(), (uint32_t*)posBuf, outSz);
+        docIs.skip(bytesRead);
+        assert(outSz == Postings::DOCS_BLOCK_SIZE);
+        tfreqBufIdx = 0;
+        tfreqBufEnd = Postings::DOCS_BLOCK_SIZE;
+      } else {
+        // decode whole tail?
+        for (int i=0; i<leftToRead; i++) {
+          // see PostingsWriter.endTerm() for format of non-block encoded docs/freqs
+          uint32_t doccode = docIs.readVint();
+          int32_t tf;
+          int32_t id = docid;
+          if ((doccode & 0x01) == 1) {
+            tf = 1;
+          } else {
+            tf = docIs.readVint();
+          }
+          auto docDelta = doccode >> 1;
+          id += docDelta;
+          docBuf[i] = id;
+          tfreqBuf[i] = tf;
+        }
+
+        docBufIdx = 0;
+        docBufEnd = leftToRead;
+        tfreqBufIdx = 0;
+        tfreqBufEnd = leftToRead;
+      } // end decode tail
+    }
+
+    // NOTE: because tfreq and cumulativeTermFreq are currently directly read used when reading positions,
+    // keep these up-to-date for now instead of lazily calculating.
+    assert(docBufIdx == tfreqBufIdx);
+    assert(docOrd == tfreqOrd);
+
+    docid = docBuf[docBufIdx++];
+    docOrd++;
+
+    tfreq = tfreqBuf[tfreqBufIdx++];
+    tfreqOrd++;
+    posOrdStart = cumulativeTermFreq;
+    cumulativeTermFreq += tfreq;
+
     return docid;
   }
 
@@ -412,7 +500,7 @@ public:
         // std::cout << "skipping blocks: id=" << docid << " numToSkip=" << numToSkip << std::endl;
         // For now, just decode the whole block.  Optimize this later.
         uint32_t outSz = Postings::POSITIONS_BLOCK_SIZE;
-        auto bytesRead = postingsReader.postings.posCodec.decodeBlock(posIs.ptr(), posIs.left(), posBuf, outSz);
+        auto bytesRead = postingsReader.postings.posCodec.decodeBlock(posIs.ptr(), posIs.left(), (uint32_t*)posBuf, outSz);
         posIs.skip(bytesRead);
         assert(outSz == Postings::POSITIONS_BLOCK_SIZE);
         posBufIdx = 0;
@@ -441,7 +529,7 @@ public:
       // OK load block of positions.  This could be optimized by only loading the relevant part.
       // If this enum wants all positions, we should just decode everything.
       uint32_t outSz = Postings::POSITIONS_BLOCK_SIZE;
-      auto bytesRead = postingsReader.postings.posCodec.decodeBlock(posIs.ptr(), posIs.left(), posBuf, outSz);
+      auto bytesRead = postingsReader.postings.posCodec.decodeBlock(posIs.ptr(), posIs.left(), (uint32_t*)posBuf, outSz);
       posIs.skip(bytesRead);
       assert(outSz == Postings::POSITIONS_BLOCK_SIZE);
       posBufIdx = 0;
@@ -456,7 +544,7 @@ public:
       // there are no more positions for this doc, or because we need
       // to reload more.
 
-      int leftToRead = cumulativeTermFreq - posOrd;
+      int leftToRead = (int)(cumulativeTermFreq - posOrd); // should never be larger than 32 bit int
 
       if (leftToRead <= 0) {
         assert(posOrd == cumulativeTermFreq); // should not have gone past
@@ -478,7 +566,7 @@ public:
           // read a new block of positions
           // TODO: refactor reading a new block (not skipping) to one place?
           uint32_t outSz = Postings::POSITIONS_BLOCK_SIZE;
-          auto bytesRead = postingsReader.postings.posCodec.decodeBlock(posIs.ptr(), posIs.left(), posBuf, outSz);
+          auto bytesRead = postingsReader.postings.posCodec.decodeBlock(posIs.ptr(), posIs.left(), (uint32_t*)posBuf, outSz);
           posIs.skip(bytesRead);
           assert(outSz == Postings::POSITIONS_BLOCK_SIZE);
           posBufIdx = 0;

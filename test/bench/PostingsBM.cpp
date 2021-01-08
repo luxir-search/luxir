@@ -1,6 +1,6 @@
 #include "bench/solux_bench.h"
 #include "test/SegmentTest.h"
-
+#include "solux/search/PostingsReader.h"
 
 /* Results of postings reading before position blocks are supported (just reading vints directly,
  * without decoding into intermediate array:
@@ -36,42 +36,73 @@ BM_readAllPositions                      479 ns          479 ns      1498213 ndo
 BM_readAllPositions                     1041 ns         1041 ns       680326 ndoc=8 npos=128
 ****************/
 
+/**** Block Doc Decoding:
+ As a baseline, the simple vint decoding w/o a buffer shown below is fast:
+   int32_t nextDoc() {
+    if (docsSize != 0) {
+      uint32_t doccode = docIs.readVint();
+      if ((doccode & 0x01)==1) {tfreq = 1;}
+      else {tfreq = docIs.readVint();}
+      posOrdStart = cumulativeTermFreq;
+      cumulativeTermFreq += tfreq;
+      auto docDelta = doccode >> 1;
+      docid += docDelta;
+    }
+    return docid;
+  }
+Anywhere from 425ns to 450ns for decoding 127 docs while skipping positions:
+BM_Postings/readDocsTail                 446 ns          438 ns      1628727 docs=127 pos=0 terms=1
 
+ */
 
-static void BM_readAllPositions(benchmark::State& state) {
+// percentReadPos is the percentage of documents for which we decide to read it's positions.
+// pass 0 to just read documents or 100 to always read positions.
+static void BM_Postings(benchmark::State& state, int nTerms, int nDocs, int nPosPerDoc, int percentReadPos=100) {
+  // std::cout << "RANGE: " << state.range(0) << std::endl;
+
   solux::SegmentTest seg;
 
-  uint32_t nDocs=8;
-  // uint32_t nPos=15;  // 8 docs * 15 positions per doc (i.e. slightly less than a block size of positions)
-  uint32_t nPos=16;  // 8 docs * 16 positions per doc (exactly one position block)
 
   seg.r.init(1);  // keep seed the same for performance benchmark
   seg.initWriter();
-  seg.addFields(false, 1, 1, nDocs, nPos);
+  seg.addFields(false, 1, nTerms, nDocs, nPosPerDoc);
   seg.initReader();
-  seg.addFields(true, 1, 1, nDocs, nPos);  // verify reading
+  seg.addFields(true, 1, nTerms, nDocs, nPosPerDoc);  // verify reading
 
-  uint64_t ndocs=0, npos=0;
+  uint64_t tterms=0, tdocs=0, tpos=0;
   for (auto _ : state) {
     if (solux::unit_tests) {
       // add a new different index each time if we are running unit tests
       state.PauseTiming();  // PauseTiming and ResumeTiming are very slow (~200ns)! Don't use in conjunction with anything fast!
       seg.initWriter();
-      seg.addFields(false, 1, 1, nDocs, nPos);
+      seg.addFields(false, 1, nTerms, nDocs, nPosPerDoc);
       seg.initReader();
       state.ResumeTiming();
     }
 
     uint64_t fingerprint = 1;
-    benchmark::DoNotOptimize( std::tie(fingerprint, ndocs, npos) = seg.readFingerprint() );
+    benchmark::DoNotOptimize( std::tie(fingerprint, tterms, tdocs, tpos) = seg.readFingerprint(percentReadPos) );
     // benchmark::DoNotOptimize(fingerprint); // this causes fingerprint to be 0???? (when I tie'd directly to seg.readFingerprint()) compiler bug?
     benchmark::ClobberMemory();
-    ASSERT_EQ(seg.fingerprint, fingerprint);
-    ASSERT_EQ(nDocs*nPos, npos);
+    if (percentReadPos >= 100) {
+      ASSERT_EQ(seg.fingerprint, fingerprint);
+      ASSERT_EQ(nTerms * nDocs * nPosPerDoc, tpos);
+    }
+    ASSERT_EQ(tdocs, nDocs * nTerms);
+    ASSERT_EQ(tterms, nTerms);
   }
 
-  state.counters["ndoc"] = ndocs;
-  state.counters["npos"] = npos;
+  state.counters["terms"] = tterms;
+  state.counters["docs"] = tdocs;
+  state.counters["pos"] = tpos;
 }
 
-BENCHMARK(BM_readAllPositions);
+
+
+BENCHMARK_CAPTURE(BM_Postings, readTailPos, 1, 8, solux::Postings::POSITIONS_BLOCK_SIZE/8-1);      // read non-block encoded positions (tail)
+BENCHMARK_CAPTURE(BM_Postings, readBlockPos, 1, 8, solux::Postings::POSITIONS_BLOCK_SIZE/8);      // read positions when they are block encoded
+BENCHMARK_CAPTURE(BM_Postings, readDocsTail, 1, solux::Postings::DOCS_BLOCK_SIZE-1, 2, 0);        // read non-block encoded documents (tail)
+// BENCHMARK_CAPTURE(BM_Postings, readDocsBlock, 1, solux::Postings::DOCS_BLOCK_SIZE, 2, 0);
+// BENCHMARK_CAPTURE(BM_Postings, readDocsBlockPos, 1, solux::Postings::DOCS_BLOCK_SIZE, 2, 0);
+BENCHMARK_CAPTURE(BM_Postings, readPulsedDoc, solux::Postings::TERMS_BLOCK_SIZE-1, 1, 1, 0);
+BENCHMARK_CAPTURE(BM_Postings, readPulsedPos, solux::Postings::TERMS_BLOCK_SIZE-1, 1, 1, 100);

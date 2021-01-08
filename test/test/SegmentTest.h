@@ -224,15 +224,17 @@ public:
     }
   }
 
-  // return fingerprint, #docs read, #positions read
-  std::tuple<uint64_t,uint64_t,uint64_t> readFingerprint() {
-    uint64_t totDocs = 0;
-    uint64_t totPositions = 0;
-    uint64_t ret = 0;
+  // return fingerprint, #terms read, #docs read, #positions read
+  std::tuple<int64_t,int64_t,int64_t,int64_t> readFingerprint(int percentReadPositions) {
+    int64_t totTerms = 0;
+    int64_t totDocs = 0;
+    int64_t totPositions = 0;
+    int64_t ret = 0;
     TermIndexReader tindexReader(pool, *reader);
     while (tindexReader.readNextField()) {
       TermsEnum tenum(pool, *reader, tindexReader);
       while (tenum.nextTerm()) {
+        totTerms++;
         DocsEnum docsEnum(pool, *reader, tindexReader, tenum);
         auto ndocs = docsEnum.numDocs();
         for (int i = 0; i < ndocs; i++) {
@@ -241,18 +243,23 @@ public:
           totDocs++;
           // std::cout << "d fingerprint+=" << id << " total=" << ret << std::endl;
 
-          auto tfreq = docsEnum.termFreq();
-          docsEnum.startPositions();
-          for (int j = 0; j < tfreq; j++) {
-            auto pos = docsEnum.nextPosition();
-            ret += pos;
-            totPositions++;
-            // std::cout << "p fingerprint+=" << pos << " total=" << ret << std::endl;
+          bool readPositions = percentReadPositions>0;  // todo: impl percentages
+
+          if (readPositions) {
+            auto tfreq = docsEnum.termFreq();
+            docsEnum.startPositions();
+            for (int j = 0; j < tfreq; j++) {
+              auto pos = docsEnum.nextPosition();
+              ret += pos;
+              totPositions++;
+              // std::cout << "p fingerprint+=" << pos << " total=" << ret << std::endl;
+            }
           }
+
         }
       }
     }
-    return {ret, totDocs, totPositions};
+    return {ret, totTerms, totDocs, totPositions};
   }
 
 
