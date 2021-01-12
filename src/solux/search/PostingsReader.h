@@ -267,9 +267,9 @@ class DocsEnum {
   // For term freqs, since they are parallel to docs, we don't actually need
   // all of these variables.  But it sets the stage for separating the two
   // more and using different encodings / block sizes for them.
-  int32_t tfreqOrd;      // ordinal of the current term freq (parallel to docOrd)
-  int32_t tfreqBufIdx;      // index of the next valid value
-  int32_t tfreqBufEnd;      // index of one-past the last valid element
+  int32_t tfreqOrd = 0;      // ordinal of the current term freq (parallel to docOrd)
+  int32_t tfreqBufIdx = 0;   // index of the next valid value
+  int32_t tfreqBufEnd;       // index of one-past the last valid element
   int32_t tfreq;
 
 
@@ -329,15 +329,16 @@ public:
       docfreq = 1;
       tfreq = 1;
       ttf = 1;
-      docid = tenum.pulsedDoc;  // temporary, nocommit.. remove after docs are cut over to handle blocks?
       // fill buffers with single pulsed doc+position
       docBuf[0] = tenum.pulsedDoc;
       docBufEnd = 1;
+      tfreqBuf[0] = 1;
+      tfreqBufEnd = 1;
       posBuf[0] = tenum.pulsedPos;
       posBufIdx = 0;
       posBufEndDoc = posBufEnd = 1;
-      cumulativeTermFreq = 0;
-      // std::cout << "Pulsed posting: id=" << docid << "pos=" << posDeltaBuf[0] << std::endl;
+      cumulativeTermFreq = 0;  // this will be incremented in nextDoc()
+      // std::cout << "Pulsed posting: id=" << docid << "pos=" << posBuf[0] << std::endl;
 
     } else {
       pos = tfreq = -1;  // unnecessary initializations, but it makes some maybe-uninitialized warnings go away with -O3  // todo: revisit
@@ -365,6 +366,7 @@ public:
       posIs.seek(locOfPositionsForTermBlock + posOffset);
       posBufEndDoc = posBufEnd = 0; // no positions read yet
       cumulativeTermFreq = 0;
+      // std::cout << "Normal posting" << std::endl;
     }
   }
 
@@ -377,7 +379,7 @@ public:
   }
 
 
-  int32_t nextDoc() {
+  int32_t nextDocOld() {
     if (docsSize != 0) {
       // see PostingsWriter.endTerm() for format of non-block encoded docs/freqs
       uint32_t doccode = docIs.readVint();
@@ -395,7 +397,7 @@ public:
   }
 
 
-  int32_t nextDocX() {
+  int32_t nextDoc() {
     if (docBufIdx >= docBufEnd) {
       auto leftToRead = docfreq - docOrd;
       // Boundary analysis: if docfreq==1 and docOrd==1 (meaning we already read ord 0, but not 1), we are done.
@@ -415,21 +417,24 @@ public:
         assert(outSz == Postings::DOCS_BLOCK_SIZE);
         docBufIdx = 0;
         docBufEnd = Postings::DOCS_BLOCK_SIZE;
+        // std::cout << "read doc block: " << std::endl;
 
         // TODO: we should really decode term freqs lazily in case they aren't needed... but this is far simpler for now.
         outSz = Postings::DOCS_BLOCK_SIZE;  // currently parallel to docs, so must be same block size
-        bytesRead = postingsReader.postings.tfreqCodec.decodeBlock(posIs.ptr(), posIs.left(), (uint32_t*)posBuf, outSz);
+        bytesRead = postingsReader.postings.tfreqCodec.decodeBlock(docIs.ptr(), docIs.left(), (uint32_t*)tfreqBuf, outSz);
         docIs.skip(bytesRead);
         assert(outSz == Postings::DOCS_BLOCK_SIZE);
         tfreqBufIdx = 0;
         tfreqBufEnd = Postings::DOCS_BLOCK_SIZE;
+        // std::cout << "read tfreq block: " << std::endl;
       } else {
         // decode whole tail?
+        // int32_t id = docid;  // PostingsWriter currently uses 0 for tail base, not lastDoc
+        int32_t id = 0;
         for (int i=0; i<leftToRead; i++) {
           // see PostingsWriter.endTerm() for format of non-block encoded docs/freqs
           uint32_t doccode = docIs.readVint();
           int32_t tf;
-          int32_t id = docid;
           if ((doccode & 0x01) == 1) {
             tf = 1;
           } else {
@@ -445,6 +450,8 @@ public:
         docBufEnd = leftToRead;
         tfreqBufIdx = 0;
         tfreqBufEnd = leftToRead;
+        // std::cout << "read doc/tfreq tail: " << leftToRead << std::endl;
+
       } // end decode tail
     }
 

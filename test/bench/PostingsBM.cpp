@@ -102,7 +102,7 @@ static void BM_Postings(benchmark::State& state, int nTerms, int nDocs, int nPos
 BENCHMARK_CAPTURE(BM_Postings, readTailPos, 1, 8, solux::Postings::POSITIONS_BLOCK_SIZE/8-1);      // read non-block encoded positions (tail)
 BENCHMARK_CAPTURE(BM_Postings, readBlockPos, 1, 8, solux::Postings::POSITIONS_BLOCK_SIZE/8);      // read positions when they are block encoded
 BENCHMARK_CAPTURE(BM_Postings, readDocsTail, 1, solux::Postings::DOCS_BLOCK_SIZE-1, 2, 0);        // read non-block encoded documents (tail)
-// BENCHMARK_CAPTURE(BM_Postings, readDocsBlock, 1, solux::Postings::DOCS_BLOCK_SIZE, 2, 0);
-// BENCHMARK_CAPTURE(BM_Postings, readDocsBlockPos, 1, solux::Postings::DOCS_BLOCK_SIZE, 2, 0);
+BENCHMARK_CAPTURE(BM_Postings, readDocsBlock, 1, solux::Postings::DOCS_BLOCK_SIZE, 2, 0);
+BENCHMARK_CAPTURE(BM_Postings, readDocsBlockPos, 1, solux::Postings::DOCS_BLOCK_SIZE, 2, 100);
 BENCHMARK_CAPTURE(BM_Postings, readPulsedDoc, solux::Postings::TERMS_BLOCK_SIZE-1, 1, 1, 0);
 BENCHMARK_CAPTURE(BM_Postings, readPulsedPos, solux::Postings::TERMS_BLOCK_SIZE-1, 1, 1, 100);

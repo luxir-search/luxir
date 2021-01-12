@@ -378,7 +378,7 @@ TEST_F(PostingsTest, blockPositions) {
   auto tfreq = docsEnum.termFreq();
   ASSERT_EQ(id, 42);
   ASSERT_EQ(tfreq, nPos);
-  if (false)  // skip reading positions
+  // if (false)  // skip reading positions
   {
     docsEnum.startPositions();
     uint32_t lastPos = 0;
@@ -434,6 +434,20 @@ TEST_F(PostingsTest, randWriteManyPos) {
   }
 }
 
+TEST_F(PostingsTest, randWriteManyDocPos) {
+  for (int i=0; i<10; i++) {
+    auto nFields = rng.rint(1,20);
+    positionsPerDocMax = Postings::POSITIONS_BLOCK_SIZE * 5/2;
+    docsPerTermMax = Postings::DOCS_BLOCK_SIZE * 5/2;
+    termsPerFieldMax = 2;
+
+    initWriter();
+    addFields(false, nFields);
+    initReader();
+    addFields(true, nFields);
+  }
+}
+
 #if REMOVED
 // An indispensable example of how to come up with a very small test case that fails.  Run many times with multiple seeds
 // and if one fails, then set the lower bound of the loop to that seed number and debug!
@@ -446,7 +460,12 @@ TEST_F(PostingsTest, randWriteTmp) {
    // this set is good for finding bugs with position blocks mixed in and skipping
    positionsPerDocMax = Postings::POSITIONS_BLOCK_SIZE*3/2; docsPerTermMax = 3; termsPerFieldMax = 2;
 
-   for (int i=0; i<100; i++) {
+  // doc blocks
+  positionsPerDocMax = 3; docsPerTermMax = Postings::DOCS_BLOCK_SIZE*2; termsPerFieldMax = 2;
+
+
+
+   for (int i=1; i<100; i++) {
      std::cout << "seed " << i << std::endl;
      rng.init(i);
      initWriter();
