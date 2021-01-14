@@ -148,10 +148,6 @@ public:
   // TODO: pool allocate this
   std::vector<char> compressed_output;
 
-
-  int32_t lastDoc;
-  int32_t lastPos;
-
   OutputStream tindexOutput;  // output stream for terms index
   OutputStream termOutput;    // output stream for termFile
   OutputStream docOutput;     // output stream for docFile
@@ -173,23 +169,23 @@ public:
   std::vector<int32_t> posdeltas; // list of position deltas for the current term (for all documents... per-document positions are not delimited)
 
 
-  uint64_t locOfPositionsForTermBlock;
-  uint64_t locOfDocsForTermBlock;
-  uint64_t locOfPositionsForTerm;
-  uint64_t locOfDocsForTerm;
+  int64_t locOfPositionsForTermBlock;
+  int64_t locOfDocsForTermBlock;
+  int64_t locOfPositionsForTerm;
+  int64_t locOfDocsForTerm;
 
-  uint64_t positionsHandled;  /// number of positions handled for the current term so far (everything except posdeltas)
-  uint32_t docsFlushed;  /// number of documents flushed for the current term so far
-  uint64_t totalTermFreqPrevDoc = 0; // total term freq up through the previous doc
+  int64_t positionsHandled;  /// number of positions handled for the current term so far (everything except posdeltas)
+  int32_t docsFlushed;  /// number of documents flushed for the current term so far
+  int64_t totalTermFreqPrevDoc = 0; // total term freq up through the previous doc
 
   // Should this be refactored into a class?
   struct FieldInfo {
     std::string fieldName;
-    uint64_t termsLoc;
-    uint64_t docsLoc;
-    uint64_t posLoc;
-    uint64_t sumDocFreq;
-    uint64_t sumTotalTermFreq;
+    int64_t termsLoc;
+    int64_t docsLoc;
+    int64_t posLoc;
+    int64_t sumDocFreq;
+    int64_t sumTotalTermFreq;
     std::vector<uint64_t> termBlockOffsets;  // offset from termsOffset (for this field) for each term block
     int numTerms;  // currently only updated in flushTerms()
   };
@@ -200,22 +196,22 @@ private:  // some internal utility methods... not for use by indexers
   Postings postings; // contains limits and codecs
 
   // number of docs for the current term
-  uint32_t getDocFreq() const {
+  int32_t getDocFreq() const {
     return docsFlushed + docs.size();
   }
 
   // total number of positions for the current term
-  uint64_t getTotalTermFreq() const {
+  int64_t getTotalTermFreq() const {
     return positionsHandled + posdeltas.size();
   }
 
   // total number of positions for the current doc
-  uint32_t getTermFreq() const {
+  int32_t getTermFreq() const {
     return getTotalTermFreq() - totalTermFreqPrevDoc;
   }
 
   // the size the docfile takes
-  uint32_t getDocFileSize() const {
+  int32_t getDocFileSize() const {
     auto sz = docOutput.size() - locOfDocsForTerm;
     assert(sz <= UINT_MAX);
     return sz;
@@ -255,7 +251,7 @@ public:
     if (posdeltas.empty()) {
       return;
     }
-    compressed_output.resize(Postings::POSITIONS_BLOCK_SIZE * sizeof(uint32_t) + 1024);
+    compressed_output.resize(Postings::POSITIONS_BLOCK_SIZE * sizeof(int32_t) + 1024);
     uint32_t compressedSize = compressed_output.size(); // this gets changed to the actual size
     postings.posCodec.encodeBlock(reinterpret_cast<uint32_t *>(posdeltas.data()), posdeltas.size(), compressed_output.data(),
                                   compressedSize);
@@ -278,7 +274,7 @@ public:
     // NOTE: SIMDCompressionAndIntersection puts 32 bit size at start!  Look at C version and see if it's easier to modify?
     // The simdcomp C library does have lower level interfaces that just handle a single 128 value block
 
-    compressed_output.resize(Postings::DOCS_BLOCK_SIZE * sizeof(uint32_t) + 1024);
+    compressed_output.resize(Postings::DOCS_BLOCK_SIZE * sizeof(int32_t) + 1024);
     uint32_t compressedSize = compressed_output.size(); // this gets changed to the actual size
     postings.docCodec.encodeBlock(reinterpret_cast<uint32_t *>(docs.data()), docs.size(), compressed_output.data(),
                       compressedSize);
@@ -338,21 +334,22 @@ public:
     termOutput.writeVlong(fieldInfo.posLoc - locOfPositionsForTermBlock);
 
     // now write the block:
-    uint32_t pulsedIdx = 0;  // index of next pulsed data
-    for (uint32_t i=0; i<termList.size(); i++) {
+    int32_t pulsedIdx = 0;  // index of next pulsed data
+    int nTerms = termList.size();
+    for (int i=0; i<nTerms; i++) {
       auto term = termList[i];
 
       if (i > 0) {
         // If not the first term, find common prefix with previous term
         auto[tdata, tlen] = term.unpack();
-        auto minsize = std::min(tlen, reflen);
-        uint32_t mismatchPos = 0;
+        int minsize = std::min(tlen, reflen);
+        int mismatchPos = 0;
         // Is there a compiler intrinsic for this?  Or a SIMD version?  Seems like a SIMD subtract followed by find-first-nonzero would do it.
         // Even w/o simd, if registers are in big endian (see movbe instr), then subtract, find high bit, divide to convert to byte.
         while (mismatchPos < minsize && tdata[mismatchPos] == refdata[mismatchPos]) {
           mismatchPos++;
         }
-        auto prefixLen = std::min(mismatchPos,0xffu);  // support a maximum prefix sharing of 255 to simplify coding.
+        auto prefixLen = std::min(mismatchPos,0x0ff);  // support a maximum prefix sharing of 255 to simplify coding.
 
         // encode shared prefix length + suffix length in a single byte.
         // 3 bits of prefix length starting at 0 (7 means this is followed by another byte encoding the prefix length)
@@ -400,7 +397,7 @@ public:
       }
     }
 
-    assert(pulsedIdx == pulsed.size());  // we should have read all pulsed docs/pos;
+    assert(pulsedIdx == (int)pulsed.size());  // we should have read all pulsed docs/pos;
 
     if (!endingField) {
       _startTermBlock(endingField);
@@ -418,7 +415,7 @@ public:
 
   void endTerm(TermRef term) {
     unused(term);
-    uint64_t totalTermFreq = getTotalTermFreq();
+    auto totalTermFreq = getTotalTermFreq();
     // TODO: handle case when all docs were deleted for term (and term should no longer appear)
     if (totalTermFreq == 1) {
       assert(getDocFileSize()==0 && docs.size()==1 && posdeltas.size() == 1);
@@ -454,13 +451,13 @@ public:
       //   when the docfreq is larger than the doc block size.
       int lastdoc = 0;
       assert(docs.size() == tfreqs.size());
-      for (uint32_t i=0; i<docs.size(); i++) {
+      for (int i=0; i<(int)docs.size(); i++) {
         assert(docs[i] > lastdoc || i==0);
-        uint32_t docdelta = docs[i] - lastdoc;
+        int docdelta = docs[i] - lastdoc;
         lastdoc = docs[i];
 
         auto tfreq = tfreqs[i];
-        uint32_t doccode = docdelta << 1;  // the low bit will be used to signal a termfreq of 1 or not.
+        int doccode = docdelta << 1;  // the low bit will be used to signal a termfreq of 1 or not.
         if (tfreq == 1) {
           doccode |= 1u;  // low bit==1 means tfreq==1.
         }
@@ -523,7 +520,7 @@ public:
     // write index into the blocks of the terms dict
     // TODO: termBlockOffsets[0] is redundant with fieldInfo.termsOffset and we should be able to skip it (should always be 0)
     // TODO: use a more efficient encoding for this array
-    tindexOutput.write(&(fieldInfo.termBlockOffsets[0]), fieldInfo.termBlockOffsets.size() * sizeof(uint64_t) );
+    tindexOutput.write(&(fieldInfo.termBlockOffsets[0]), fieldInfo.termBlockOffsets.size() * sizeof(int64_t) );
   }
 
   void startDoc(int32_t doc) {
@@ -549,7 +546,7 @@ public:
     }
   }
 
-  void addPositionDelta(uint32_t posDelta) {
+  void addPositionDelta(int32_t posDelta) {
     posdeltas.push_back(posDelta);
     if (posdeltas.size() == Postings::POSITIONS_BLOCK_SIZE) {
       flushPositions();

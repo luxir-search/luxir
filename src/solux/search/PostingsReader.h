@@ -28,9 +28,9 @@ class DocsEnum;
 // Some stuff that the postings reader and writer need to share.
 class Postings {
 public:
-  static constexpr uint32_t TERMS_BLOCK_SIZE = 128;
-  static constexpr uint32_t POSITIONS_BLOCK_SIZE = 128;
-  static constexpr uint32_t DOCS_BLOCK_SIZE = 128;
+  static constexpr int32_t TERMS_BLOCK_SIZE = 128;
+  static constexpr int32_t POSITIONS_BLOCK_SIZE = 128;
+  static constexpr int32_t DOCS_BLOCK_SIZE = 128;
 
   using PositionsCodec = IntegerCODECTypeWrapper<SIMDCompressionLib::FastPFor<4, false>>;
   using DocsCodec = IntegerCODECTypeWrapper<SIMDCompressionLib::SIMDFastPFor<4, SIMDCompressionLib::RegularDeltaSIMD>>;
@@ -87,14 +87,14 @@ class TermIndexReader {
   PostingsReader& postingsReader;
 
   PackedTerm fieldname;
-  uint64_t termsLoc;
-  uint64_t docsLoc;
-  uint64_t posLoc;
-  uint32_t nTerms;
+  int64_t termsLoc;
+  int64_t docsLoc;
+  int64_t posLoc;
+  int32_t nTerms;
 
   // actual index into terms
-  uint32_t numTermBlocks;
-  const uint64_t* termBlockOffsets;
+  int32_t numTermBlocks;
+  const int64_t* termBlockOffsets;
 
   // TODO: field number?
 public:
@@ -113,13 +113,13 @@ public:
     docsLoc = is.readVlong();
     posLoc = is.readVlong();
     nTerms = is.readVint();
-    termBlockOffsets = reinterpret_cast<const uint64_t*>(is.ptr());  // offsets from termsLoc
+    termBlockOffsets = reinterpret_cast<const int64_t*>(is.ptr());  // offsets from termsLoc
     numTermBlocks = ((nTerms-1) / Postings::TERMS_BLOCK_SIZE) + 1;
-    is.skip(numTermBlocks * sizeof(uint64_t));
+    is.skip(numTermBlocks * sizeof(int64_t));
     return true;
   }
 
-  void readFieldAt(uint64_t offset) {
+  void readFieldAt(int64_t offset) {
     is.seek(offset);
     readNextField();
   }
@@ -147,18 +147,18 @@ class TermsEnum {
 
   PackedTerm currTerm;
   int32_t ordInBlock = -1; // TODO: make ord 1-based everywhere and use 0 for "missing", unset, etc
-  uint32_t docsSize;
-  uint32_t pulsedDoc;
-  uint32_t pulsedPos;
+  int32_t docsSize;
+  int32_t pulsedDoc;
+  int32_t pulsedPos;
 
   // block-level information
 
   PackedTerm startingTerm;
   int32_t startingOrd = 0;
   int32_t maxOrdInBlock = -1;
-  uint64_t locOfDocsForTermBlock;  // absolute location... field offset + block offset
-  uint64_t locOfPositionsForTermBlock;  // absolute location... field offset + block offset
-  uint64_t cumulativeDocsSize;
+  int64_t locOfDocsForTermBlock;  // absolute location... field offset + block offset
+  int64_t locOfPositionsForTermBlock;  // absolute location... field offset + block offset
+  int64_t cumulativeDocsSize;
 
 public:
   TermsEnum(MemPool& pool, PostingsReader& postingsReader, TermIndexReader& tindexReader) : pool(pool), postingsReader(postingsReader), tindexReader(tindexReader) {
@@ -273,7 +273,6 @@ class DocsEnum {
   int32_t tfreq;
 
 
-
   InputStream docIs;
   InputStream posIs;
   PostingsReader& postingsReader;
@@ -282,11 +281,6 @@ class DocsEnum {
   MemPool& pool;
   int32_t docfreq; // number of docs containing this term
   int64_t ttf;    // totalTermFreq (sum of term freq across all docs for this term)
-
-  int32_t ordStartBlock = 0;
-  int32_t ordInBlock;
-
-
 
   int32_t docsSize;  // size of the postings in the doc file for the given term
   int64_t startOfDocs;
@@ -440,7 +434,7 @@ public:
           } else {
             tf = docIs.readVint();
           }
-          auto docDelta = doccode >> 1;
+          auto docDelta = ((uint32_t)doccode) >> 1;
           id += docDelta;
           docBuf[i] = id;
           tfreqBuf[i] = tf;
@@ -469,10 +463,6 @@ public:
     cumulativeTermFreq += tfreq;
 
     return docid;
-  }
-
-  int32_t ord() {
-    return ordStartBlock;
   }
 
   int32_t termFreq() {

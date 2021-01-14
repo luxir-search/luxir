@@ -15,12 +15,12 @@ public:
   InputStream(const char* start, const char* end) : pos(start), start(start), end(end) {}
 
   const char* ptr() const noexcept { return pos; }
-  uint64_t offset() const noexcept { return pos - start; }
-  uint64_t left() const noexcept { return end - pos; }  // how much data is left to read
+  int64_t offset() const noexcept { return pos - start; }
+  int64_t left() const noexcept { return end - pos; }  // how much data is left to read
 
-  void seek(uint64_t offset) {
+  void seek(int64_t offset) {
     pos = start + offset;
-    assert(pos <= end);
+    assert(start <= pos && pos <= end);
   }
 
   void relativeSeek(int64_t offset) {
@@ -28,9 +28,9 @@ public:
     assert(start <= pos && pos <= end);
   }
 
-  void skip(uint64_t len) {
+  void skip(int64_t len) {
     pos += len;
-    assert(pos <= end);
+    assert(start <= pos && pos <= end && len >= 0);
   }
 
   char readByte() {
@@ -38,7 +38,7 @@ public:
     return *pos++;
   }
 
-  void read(void* dest, uint32_t len) {
+  void read(void* dest, int32_t len) {
     memcpy(dest, pos, len);
     pos += len;
     assert(pos<=end);
