@@ -315,6 +315,7 @@ public:
 
   void flushTerms(bool endingField) {
     if (termList.empty()) {
+      fieldInfo.termBlockOffsets.pop_back();  // last block has no terms in it.
       return;
     }
 
@@ -330,8 +331,8 @@ public:
 
     // Write the terms block header.
     termOutput.writeStr(refdata, reflen);
-    termOutput.writeVlong(fieldInfo.docsLoc - locOfDocsForTermBlock);
-    termOutput.writeVlong(fieldInfo.posLoc - locOfPositionsForTermBlock);
+    termOutput.writeVlong(locOfDocsForTermBlock - fieldInfo.docsLoc);
+    termOutput.writeVlong(locOfPositionsForTermBlock - fieldInfo.posLoc);
 
     // now write the block:
     int32_t pulsedIdx = 0;  // index of next pulsed data
@@ -520,6 +521,8 @@ public:
     // write index into the blocks of the terms dict
     // TODO: termBlockOffsets[0] is redundant with fieldInfo.termsOffset and we should be able to skip it (should always be 0)
     // TODO: use a more efficient encoding for this array
+    assert((int)fieldInfo.termBlockOffsets.size() == ((fieldInfo.numTerms-1) / Postings::TERMS_BLOCK_SIZE) + 1);
+
     tindexOutput.write(&(fieldInfo.termBlockOffsets[0]), fieldInfo.termBlockOffsets.size() * sizeof(int64_t) );
   }
 

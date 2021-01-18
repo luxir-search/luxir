@@ -409,8 +409,76 @@ TEST_F(PostingsTest, blockPositions) {
   ASSERT_FALSE(tindexReader.readNextField());
 }
 
+TEST_F(PostingsTest, blockTerms) {
+  RAMDir dir;
+  MemPool pool;
+  PostingsWriter writer(dir, "gen1");
+  int nTerms = Postings::TERMS_BLOCK_SIZE + 1;
 
-TEST_F(PostingsTest, randWrite) {
+  writer.startField("field1");
+
+  std::string tstr = "term";
+  tstr.resize(12);
+  for (int i=0; i<nTerms; i++) {
+    sprintf(tstr.data() + 4, "%08d", i);
+    TermRef term(pool, tstr.data(), tstr.size());
+    writer.startTerm(term);
+    writer.startDoc(i);
+    writer.addPositionDelta(i*2);
+    writer.addPositionDelta(1);
+    writer.endDoc(i);
+    writer.endTerm(term);
+  }
+  writer.endField("field1");
+  writer.finish();
+
+
+  auto tindexFile = dir.openFile("tindex");
+  auto termFile = dir.openFile("term");
+  auto docFile = dir.openFile("doc");
+  auto posFile = dir.openFile("pos");
+  PostingsReader reader(tindexFile.get(), termFile.get(), docFile.get(), posFile.get());
+
+  TermIndexReader tindexReader(pool, reader);
+  ASSERT_TRUE(tindexReader.readNextField());
+  // std::cout << "FIELD NAME name=" << tindexReader.name() << " numTerms=" << tindexReader.numTerms() << std::endl;
+  ASSERT_EQ(tindexReader.name(), "field1");
+  ASSERT_EQ(tindexReader.numTerms(), nTerms);
+
+  TermsEnum tenum(pool, reader, tindexReader);
+  for (int i=0; i<nTerms; i++) {
+    sprintf(tstr.data() + 4, "%08d", i);
+
+    ASSERT_TRUE(tenum.nextTerm());
+    ASSERT_EQ(tenum.ord(), i);
+    ASSERT_EQ(tenum.term(), tstr);
+
+
+    DocsEnum docsEnum(pool, reader, tindexReader, tenum);
+    ASSERT_EQ(docsEnum.numDocs(), 1);
+    ASSERT_EQ(docsEnum.totalTermFreq(), 2);
+    ASSERT_EQ(docsEnum.nextDoc(), i);
+    ASSERT_EQ(docsEnum.termFreq(), 2);
+
+    docsEnum.startPositions();
+    ASSERT_EQ(docsEnum.nextPosition(), i*2);
+    ASSERT_EQ(docsEnum.nextPosition(), i*2 + 1);
+    ASSERT_EQ(docsEnum.nextPosition(), INT_MAX);  // TODO: replace with constant
+
+    ASSERT_EQ(docsEnum.nextDoc(), INT_MAX);
+  }
+
+  ASSERT_FALSE(tenum.nextTerm());
+  ASSERT_FALSE(tindexReader.readNextField());
+}
+
+
+
+TEST_F(PostingsTest, randTail) {
+  // avoid creating a full block of terms, docs, or positions
+  positionsPerDocMax = 11;
+  docsPerTermMax = 11;
+  termsPerFieldMax = 120;
   for (int i=0; i<10; i++) {
     auto nFields = rng.rint(1,20);
     initWriter();
@@ -420,7 +488,7 @@ TEST_F(PostingsTest, randWrite) {
   }
 }
 
-TEST_F(PostingsTest, randWriteManyPos) {
+TEST_F(PostingsTest, randManyPos) {
   for (int i=0; i<10; i++) {
     auto nFields = rng.rint(1,20);
     positionsPerDocMax = Postings::POSITIONS_BLOCK_SIZE * 5/2;
@@ -434,7 +502,7 @@ TEST_F(PostingsTest, randWriteManyPos) {
   }
 }
 
-TEST_F(PostingsTest, randWriteManyDocPos) {
+TEST_F(PostingsTest, randManyDocPos) {
   for (int i=0; i<10; i++) {
     auto nFields = rng.rint(1,20);
     positionsPerDocMax = Postings::POSITIONS_BLOCK_SIZE * 5/2;
@@ -448,30 +516,51 @@ TEST_F(PostingsTest, randWriteManyDocPos) {
   }
 }
 
+// test enough terms that more than one term block per field is required
+TEST_F(PostingsTest, randManyTerms) {
+  positionsPerDocMax = 3;
+  docsPerTermMax = 3;
+  termsPerFieldMax = Postings::TERMS_BLOCK_SIZE * 5 / 2;
+
+  for (int i=0; i<10; i++) {
+    auto nFields = rng.rint(1,20);
+    initWriter();
+    addFields(false, nFields);
+    initReader();
+    addFields(true, nFields);
+  }
+}
+
 #if REMOVED
 // An indispensable example of how to come up with a very small test case that fails.  Run many times with multiple seeds
 // and if one fails, then set the lower bound of the loop to that seed number and debug!
 TEST_F(PostingsTest, randWriteTmp) {
   std::cout << "SEED=" << rng_seed << std::endl;
 
-   // this set is good for finding bugs with pulsed and skipping  (just 1 term, 1 or 2 docs, 1 or 2 positions)
-   positionsPerDocMax = 3; docsPerTermMax = 3; termsPerFieldMax = 2;
+  int nFields = 1;
 
-   // this set is good for finding bugs with position blocks mixed in and skipping
-   positionsPerDocMax = Postings::POSITIONS_BLOCK_SIZE*3/2; docsPerTermMax = 3; termsPerFieldMax = 2;
+  // this set is good for finding bugs with pulsed and skipping  (just 1 term, 1 or 2 docs, 1 or 2 positions)
+  positionsPerDocMax = 3; docsPerTermMax = 3; termsPerFieldMax = 2;
+
+  // this set is good for finding bugs with position blocks mixed in and skipping
+  positionsPerDocMax = Postings::POSITIONS_BLOCK_SIZE*3/2; docsPerTermMax = 3; termsPerFieldMax = 2;
 
   // doc blocks
   positionsPerDocMax = 3; docsPerTermMax = Postings::DOCS_BLOCK_SIZE*2; termsPerFieldMax = 2;
 
+  // term blocks
+  positionsPerDocMax = 3; docsPerTermMax = 3; termsPerFieldMax = Postings::TERMS_BLOCK_SIZE*5/2;
 
+  // multiple fields
+  nFields=2;
 
-   for (int i=1; i<100; i++) {
-     std::cout << "seed " << i << std::endl;
-     rng.init(i);
-     initWriter();
-     addFields(false, 1);
-     initReader();
-     addFields(true, 1);
+  for (int i=1; i<1000; i++) {
+    std::cout << "seed " << i << std::endl;
+    rng.init(i);
+    initWriter();
+    addFields(false, nFields);
+    initReader();
+    addFields(true, nFields);
   }
 }
 #endif

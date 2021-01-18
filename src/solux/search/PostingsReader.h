@@ -190,11 +190,11 @@ public:
       // first block we are reading, so seek to the first block.
       is.seek(tindexReader.termsLoc);
     } else {
-      startingOrd += Postings::TERMS_BLOCK_SIZE;
+      startingOrd += Postings::TERMS_BLOCK_SIZE;  // TODO: this is only valid if reading *next* term block...
     }
     cumulativeDocsSize = 0;
     ordInBlock = 0;
-    maxOrdInBlock = std::min((int)Postings::TERMS_BLOCK_SIZE - 1, tindexReader.numTerms() - startingOrd - 1);
+    maxOrdInBlock = std::min(Postings::TERMS_BLOCK_SIZE - 1, tindexReader.numTerms() - startingOrd - 1);
 
     // see PostingsWriter.flushTerms
     startingTerm = is.readPackedTerm();
