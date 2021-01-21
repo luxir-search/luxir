@@ -83,7 +83,7 @@ class TermIndexReader {
   friend class TermsEnum;
 
 
-  InputStream is;
+  InputStream tindexIS;
   PostingsReader& postingsReader;
 
   PackedTerm fieldname;
@@ -99,39 +99,37 @@ class TermIndexReader {
   // TODO: field number?
 public:
   TermIndexReader(MemPool& pool, PostingsReader& postingsReader) : postingsReader(postingsReader) {
-    is = postingsReader.tindexFile->getInputStream();
+    tindexIS = postingsReader.tindexFile->getInputStream();
   }
 
   // TODO: should this read into a different structure?
   bool readNextField() {
-    if (is.left() <= 0) {  // TODO: most likely temporary way to detect end
+    if (tindexIS.left() <= 0) {  // TODO: most likely temporary way to detect end
       return false;
     }
     // See PostingsWriter.endField() for the format written.
-    fieldname = is.readPackedTerm();
-    termsLoc = is.readVlong();
-    docsLoc = is.readVlong();
-    posLoc = is.readVlong();
-    nTerms = is.readVint();
-    termBlockOffsets = reinterpret_cast<const int64_t*>(is.ptr());  // offsets from termsLoc
+    fieldname = tindexIS.readPackedTerm();
+    termsLoc = tindexIS.readVlong();
+    docsLoc = tindexIS.readVlong();
+    posLoc = tindexIS.readVlong();
+    nTerms = tindexIS.readVint();
+    termBlockOffsets = reinterpret_cast<const int64_t*>(tindexIS.ptr());  // offsets from termsLoc
     numTermBlocks = ((nTerms-1) / Postings::TERMS_BLOCK_SIZE) + 1;
-    is.skip(numTermBlocks * sizeof(int64_t));
+    tindexIS.skip(numTermBlocks * sizeof(int64_t));
     return true;
   }
 
   void readFieldAt(int64_t offset) {
-    is.seek(offset);
+    tindexIS.seek(offset);
     readNextField();
   }
 
 
-  TermIndexReader(PostingsReader& postingsReader,const InputStream& is) : postingsReader(postingsReader), is(is) {};
+  TermIndexReader(PostingsReader& postingsReader,const InputStream& is) : postingsReader(postingsReader), tindexIS(is) {};
   TermRef name() { return fieldname; }
   int numTerms() { return nTerms; }  // TODO: move this down in hierarchy given that we don't know where it will be stored in the future?
 
 
-  //  bool nextField(PostingsReader& reader);
-  // void fillTermsEnum(PostingsReader& reader, TermsEnum& termsEnum); // TODO: should this be on TermsEnum or here?
 };
 
 
@@ -140,13 +138,13 @@ public:
 class TermsEnum {
   friend class DocsEnum;
 
-  InputStream is;
+  InputStream termsIS;
   PostingsReader& postingsReader;
   TermIndexReader& tindexReader;
   MemPool& pool;
 
   PackedTerm currTerm;
-  int32_t ordInBlock = -1; // TODO: make ord 1-based everywhere and use 0 for "missing", unset, etc
+  int32_t ordInBlock = -1; // the term number local to the current block
   int32_t docsSize;
   int32_t pulsedDoc;
   int32_t pulsedPos;
@@ -154,6 +152,7 @@ class TermsEnum {
   // block-level information
 
   PackedTerm startingTerm;
+  int32_t termBlockIndex = -1; // what term block are we currently in
   int32_t startingOrd = 0;
   int32_t maxOrdInBlock = -1;
   int64_t locOfDocsForTermBlock;  // absolute location... field offset + block offset
@@ -162,8 +161,8 @@ class TermsEnum {
 
 public:
   TermsEnum(MemPool& pool, PostingsReader& postingsReader, TermIndexReader& tindexReader) : pool(pool), postingsReader(postingsReader), tindexReader(tindexReader) {
-    is = postingsReader.termFile->getInputStream();
-    currTerm = PackedTerm(pool.allocate(256));
+    termsIS = postingsReader.termFile->getInputStream();
+    currTerm = PackedTerm(pool.allocate(256)); // TODO: pass in?  this will allocate for each term if called in a loop.  Could also have an init() method to reuse inst?
   }
 
   int32_t ord() const {
@@ -177,29 +176,26 @@ public:
   // read the data that comes after each term
   void readTermMetadata() {
     // see PostingsWriter.flushTerms
-    docsSize = is.readVint();
+    docsSize = termsIS.readVint();
     cumulativeDocsSize += docsSize;
     if (docsSize == 0) {
-      pulsedDoc = is.readVint();
-      pulsedPos = is.readVint();
+      pulsedDoc = termsIS.readVint();
+      pulsedPos = termsIS.readVint();
     }
   }
 
+  // seeks to termBlockIndex and reads the block metadata + first term
   void readTermBlock() {
-    if (ordInBlock == -1) {
-      // first block we are reading, so seek to the first block.
-      is.seek(tindexReader.termsLoc);
-    } else {
-      startingOrd += Postings::TERMS_BLOCK_SIZE;  // TODO: this is only valid if reading *next* term block...
-    }
+    termsIS.seek(tindexReader.termsLoc + tindexReader.termBlockOffsets[termBlockIndex]);
+    startingOrd = termBlockIndex * Postings::TERMS_BLOCK_SIZE;  // we currently have fixed size blocks
     cumulativeDocsSize = 0;
     ordInBlock = 0;
     maxOrdInBlock = std::min(Postings::TERMS_BLOCK_SIZE - 1, tindexReader.numTerms() - startingOrd - 1);
 
     // see PostingsWriter.flushTerms
-    startingTerm = is.readPackedTerm();
-    locOfDocsForTermBlock = tindexReader.docsLoc + is.readVlong();  // fieldOffset + blockOffset
-    locOfPositionsForTermBlock = tindexReader.posLoc + is.readVlong();
+    startingTerm = termsIS.readPackedTerm();
+    locOfDocsForTermBlock = tindexReader.docsLoc + termsIS.readVlong();  // fieldOffset + blockOffset for docs
+    locOfPositionsForTermBlock = tindexReader.posLoc + termsIS.readVlong();
 
     memcpy(currTerm.ptr(), startingTerm.ptr(), startingTerm.memorySize());
     readTermMetadata();
@@ -207,9 +203,10 @@ public:
 
   bool nextTerm() {
     if (ordInBlock == maxOrdInBlock) {
-      if (ord() + 1 >= tindexReader.numTerms()) {
+      if (ord() + 1 >= tindexReader.numTerms()) {  // could also compare number of blocks to detect end.
         return false;
       }
+      termBlockIndex++;
       readTermBlock();
       return true;
     } else {
@@ -218,25 +215,70 @@ public:
 
     // read next suffix
     // see PostingsWriter.flushTerms
-    uint8_t code = is.readByte();
+    uint8_t code = termsIS.readByte();
     auto prefixLen = code >> 5;
     auto suffixLen = (code & 0x1f) + 1;
     if (prefixLen == 7) {
-      prefixLen = is.readByte();
+      prefixLen = termsIS.readByte();
     }
     if (suffixLen == 31) {
-      suffixLen = is.readVint()+32;
+      suffixLen = termsIS.readVint() + 32;
     }
 
     auto [data, len] = currTerm.unpack();
-    is.read(const_cast<char*>(data+prefixLen), suffixLen);
+    termsIS.read(const_cast<char*>(data + prefixLen), suffixLen);
     currTerm.setSize(prefixLen + suffixLen);
 
     readTermMetadata();
     return true;
   }
 
-  // TODO: a push interface that can more quickly/directly handle pulsed postings while allowing inlining?
+  bool seek(const std::string_view& target) {  // TODO: templatize for anything that looks like a string?
+    auto termBlockEnd = tindexReader.termBlockOffsets + tindexReader.numTermBlocks;
+    // Find the first block that is greater than the current term.
+    // std::cout << "seek key=" << target << " numBlocks=" << tindexReader.numTermBlocks << std::endl;
+
+    auto blockOffsetPtr = std::upper_bound(tindexReader.termBlockOffsets, termBlockEnd, target,
+                                 [&](const std::string_view& key, const int64_t& blockOffset) {
+      auto termAtBlock = termsIS.readPackedTerm(tindexReader.termsLoc + blockOffset);
+      auto ret = key < termAtBlock;
+      // std::cout << "index=" << (&blockOffset-tindexReader.termBlockOffsets) << " termAtBlock=" << termAtBlock << " ret=" << ret << std::endl;
+      return ret;
+    }
+    );
+
+    // Since the block we found is after, we will find our target term in the
+    // previous block (if at all)
+    if (blockOffsetPtr > tindexReader.termBlockOffsets) {
+      blockOffsetPtr--;
+    };
+
+    termBlockIndex = blockOffsetPtr - tindexReader.termBlockOffsets;
+    readTermBlock();
+    return seekInBlock(target);
+  }
+
+  bool seekInBlock(const std::string_view& target) {
+    auto cmp = term() <=> target;
+    // std::cout << " comparing with first " << term() << ": eq=" << (cmp==0) << " gt=" <<  (cmp>0) << std::endl;
+    if (cmp == 0) return true;
+    if (cmp > 0) return false;  // this will normally only happen on the *first* block
+
+    // TODO: we could optimize this seeking by not actually building the term to compare.
+    // We know from prefix encoding how much of the previous term is shared.
+    // It could also possibly be faster to skip term metadata rather than reading it as well.
+    while (ordInBlock < maxOrdInBlock) {
+      nextTerm();
+      cmp = term() <=> target;
+      // std::cout << " comparing with next " << term() << ": eq=" << (cmp==0) << " gt=" <<  (cmp>0) << std::endl;
+      if (cmp == 0) return true;
+      if (cmp > 0) return false;
+    }
+    return false;
+  }
+
+
+    // TODO: a push interface that can more quickly/directly handle pulsed postings while allowing inlining?
   // That could also handle differences between block and doc
 };
 
@@ -273,8 +315,8 @@ class DocsEnum {
   int32_t tfreq;
 
 
-  InputStream docIs;
-  InputStream posIs;
+  InputStream docIS;
+  InputStream posIS;
   PostingsReader& postingsReader;
   TermIndexReader& tindexReader;
   TermsEnum& tenum;
@@ -339,25 +381,25 @@ public:
       locOfDocsForTermBlock = tenum.locOfDocsForTermBlock;
       locOfPositionsForTermBlock = tenum.locOfPositionsForTermBlock;
       cumulativeDocsSize = tenum.cumulativeDocsSize;
-      docIs = postingsReader.docFile->getInputStream();
+      docIS = postingsReader.docFile->getInputStream();
       // see the end of PostingsWiter.endTerm() for the term-specific metadata written there (docfreq, ttf, etc)
 
       // read last byte of docs to get the metadata size
-      docIs.seek(locOfDocsForTermBlock + cumulativeDocsSize - 1);
-      uint8_t metaSize = docIs.readByte();
-      docIs.relativeSeek(-metaSize - 1); // move to start of metadata
-      docfreq = docIs.readVint();
-      ttf = docfreq + docIs.readVlong();
+      docIS.seek(locOfDocsForTermBlock + cumulativeDocsSize - 1);
+      uint8_t metaSize = docIS.readByte();
+      docIS.relativeSeek(-metaSize - 1); // move to start of metadata
+      docfreq = docIS.readVint();
+      ttf = docfreq + docIS.readVlong();
       docBufEnd = 0;
 
-      auto posOffset = docIs.readVlong();
+      auto posOffset = docIS.readVlong();
 
       // start of the actual docs is end of block - size
       startOfDocs = locOfDocsForTermBlock + cumulativeDocsSize - docsSize;
-      docIs.seek(startOfDocs);
+      docIS.seek(startOfDocs);
 
-      posIs = postingsReader.posFile->getInputStream();
-      posIs.seek(locOfPositionsForTermBlock + posOffset);
+      posIS = postingsReader.posFile->getInputStream();
+      posIS.seek(locOfPositionsForTermBlock + posOffset);
       posBufEndDoc = posBufEnd = 0; // no positions read yet
       cumulativeTermFreq = 0;
       // std::cout << "Normal posting" << std::endl;
@@ -376,11 +418,11 @@ public:
   int32_t nextDocOld() {
     if (docsSize != 0) {
       // see PostingsWriter.endTerm() for format of non-block encoded docs/freqs
-      uint32_t doccode = docIs.readVint();
+      uint32_t doccode = docIS.readVint();
       if ((doccode & 0x01)==1) {
         tfreq = 1;
       } else {
-        tfreq = docIs.readVint();
+        tfreq = docIS.readVint();
       }
       posOrdStart = cumulativeTermFreq;
       cumulativeTermFreq += tfreq;
@@ -406,8 +448,8 @@ public:
       // like lastBlockEncodedPosOrd, but for docs.
       if (leftToRead >= Postings::DOCS_BLOCK_SIZE) {
         uint32_t outSz = Postings::DOCS_BLOCK_SIZE;
-        auto bytesRead = postingsReader.postings.docCodec.decodeBlock(docIs.ptr(), docIs.left(), (uint32_t*)docBuf, outSz);
-        docIs.skip(bytesRead);
+        auto bytesRead = postingsReader.postings.docCodec.decodeBlock(docIS.ptr(), docIS.left(), (uint32_t*)docBuf, outSz);
+        docIS.skip(bytesRead);
         assert(outSz == Postings::DOCS_BLOCK_SIZE);
         docBufIdx = 0;
         docBufEnd = Postings::DOCS_BLOCK_SIZE;
@@ -415,8 +457,8 @@ public:
 
         // TODO: we should really decode term freqs lazily in case they aren't needed... but this is far simpler for now.
         outSz = Postings::DOCS_BLOCK_SIZE;  // currently parallel to docs, so must be same block size
-        bytesRead = postingsReader.postings.tfreqCodec.decodeBlock(docIs.ptr(), docIs.left(), (uint32_t*)tfreqBuf, outSz);
-        docIs.skip(bytesRead);
+        bytesRead = postingsReader.postings.tfreqCodec.decodeBlock(docIS.ptr(), docIS.left(), (uint32_t*)tfreqBuf, outSz);
+        docIS.skip(bytesRead);
         assert(outSz == Postings::DOCS_BLOCK_SIZE);
         tfreqBufIdx = 0;
         tfreqBufEnd = Postings::DOCS_BLOCK_SIZE;
@@ -427,12 +469,12 @@ public:
         int32_t id = 0;
         for (int i=0; i<leftToRead; i++) {
           // see PostingsWriter.endTerm() for format of non-block encoded docs/freqs
-          uint32_t doccode = docIs.readVint();
+          uint32_t doccode = docIS.readVint();
           int32_t tf;
           if ((doccode & 0x01) == 1) {
             tf = 1;
           } else {
-            tf = docIs.readVint();
+            tf = docIS.readVint();
           }
           auto docDelta = ((uint32_t)doccode) >> 1;
           id += docDelta;
@@ -497,8 +539,8 @@ public:
         // std::cout << "skipping blocks: id=" << docid << " numToSkip=" << numToSkip << std::endl;
         // For now, just decode the whole block.  Optimize this later.
         uint32_t outSz = Postings::POSITIONS_BLOCK_SIZE;
-        auto bytesRead = postingsReader.postings.posCodec.decodeBlock(posIs.ptr(), posIs.left(), (uint32_t*)posBuf, outSz);
-        posIs.skip(bytesRead);
+        auto bytesRead = postingsReader.postings.posCodec.decodeBlock(posIS.ptr(), posIS.left(), (uint32_t*)posBuf, outSz);
+        posIS.skip(bytesRead);
         assert(outSz == Postings::POSITIONS_BLOCK_SIZE);
         posBufIdx = 0;
         posBufEnd = outSz;
@@ -514,7 +556,7 @@ public:
       if (posOrdStart > lastBlockEncodedPosOrd(ttf)) {
         // std::cout << "skipping in position tail: id=" << docid << " numToSkip=" << numToSkip << std::endl;
         for (int i=0; i<numToSkip; i++) {
-          auto delta = posIs.readVint();
+          auto delta = posIS.readVint();
           // TODO: a faster skipVint (potentially)? inlining should already eliminate the dead code though.
         }
         posOrd += numToSkip;
@@ -526,8 +568,8 @@ public:
       // OK load block of positions.  This could be optimized by only loading the relevant part.
       // If this enum wants all positions, we should just decode everything.
       uint32_t outSz = Postings::POSITIONS_BLOCK_SIZE;
-      auto bytesRead = postingsReader.postings.posCodec.decodeBlock(posIs.ptr(), posIs.left(), (uint32_t*)posBuf, outSz);
-      posIs.skip(bytesRead);
+      auto bytesRead = postingsReader.postings.posCodec.decodeBlock(posIS.ptr(), posIS.left(), (uint32_t*)posBuf, outSz);
+      posIS.skip(bytesRead);
       assert(outSz == Postings::POSITIONS_BLOCK_SIZE);
       posBufIdx = 0;
       posBufEnd = outSz;
@@ -563,8 +605,8 @@ public:
           // read a new block of positions
           // TODO: refactor reading a new block (not skipping) to one place?
           uint32_t outSz = Postings::POSITIONS_BLOCK_SIZE;
-          auto bytesRead = postingsReader.postings.posCodec.decodeBlock(posIs.ptr(), posIs.left(), (uint32_t*)posBuf, outSz);
-          posIs.skip(bytesRead);
+          auto bytesRead = postingsReader.postings.posCodec.decodeBlock(posIS.ptr(), posIS.left(), (uint32_t*)posBuf, outSz);
+          posIS.skip(bytesRead);
           assert(outSz == Postings::POSITIONS_BLOCK_SIZE);
           posBufIdx = 0;
           posBufEnd = outSz;
@@ -578,7 +620,7 @@ public:
           posBufEndDoc = leftToRead;
           // std::cout << "FILL pos buffer docid=" << docid << " ords=" << posOrd << " through " << posOrd+tfreq-1 << std::endl;
           for (int i = posBufIdx; i < posBufEnd; i++) {
-            posBuf[i] = posIs.readVint();
+            posBuf[i] = posIS.readVint();
           }
         }
       }

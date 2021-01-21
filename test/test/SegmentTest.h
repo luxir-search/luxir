@@ -35,6 +35,13 @@ public:
 
   uint64_t fingerprint = 0;  // sum of all docs and positions calculated when writing
 
+  static void makeTerm(int termNum, std::string& target) {
+    target.resize(12);
+    memcpy(target.data(), "term", 4);
+    sprintf(target.data() + 4, "%08d", termNum);
+  }
+
+
   SegmentTest() {
   }
 

@@ -114,6 +114,10 @@ public:
     return term;
   }
 
+  PackedTerm readPackedTerm(int64_t location) {
+    return PackedTerm(const_cast<char*>(start+location));
+  }
+
   friend std::ostream& operator<< (std::ostream &out, const InputStream &is) {
     // TODO: print out some of the bytes before and after the current position?
     out << "{sz=" << (is.end-is.start) << " left=" << is.left()

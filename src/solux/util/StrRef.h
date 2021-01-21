@@ -231,28 +231,48 @@ public:
 
 };
 
-inline bool operator==(const PackedTerm& p, const std::string& s) {
-  auto [data,sz] = p.unpack();
-  if (sz != s.size()) return false;
-  return memcmp(data, s.data(), sz) == 0;
-}
-inline bool operator==(const std::string& s, const PackedTerm& p) {
-  return p==s;
-}
 
 inline int operator<=>(const PackedTerm& a, const PackedTerm& b) {
   int datacmp = memcmp(a.data(), b.data(), std::min(a.size(),b.size()));
   return (datacmp != 0) ? datacmp : ((int)a.size() - (int)b.size());
 }
 
-inline int operator<=>(const PackedTerm& p, const std::string& s) {
+template <typename StringType> // StringType just needs size() and data().... which std::string and std::string_view both have.
+inline bool operator==(const PackedTerm& p, const StringType& s) {
   auto [data,sz] = p.unpack();
-  int datacmp = memcmp(data, s.data(), std::min((size_t)sz, s.size()));
+  if (sz != (int)s.size()) return false;
+  return memcmp(data, s.data(), sz) == 0;
+}
+
+template <typename StringType>
+inline bool operator==(const StringType& s, const PackedTerm& p) {
+  return p==s;
+}
+
+template <typename StringType>
+inline int operator<=>(const PackedTerm& p, const StringType& s) {
+  auto [data,sz] = p.unpack();
+  int datacmp = memcmp(data, s.data(), std::min((int)sz,(int)s.size()));
   return (datacmp != 0) ? datacmp : ((int)sz - (int)s.size());
 }
-inline int operator<=>(const std::string& s, const PackedTerm& p) {
-  return -(p <=> s);
+
+// I needed to explicitly add support for const char*, otherwise the support for both string and string_view
+// above causes ambiguity.  NOTE: these are not optimized, as "s" is scanned twice if the lengths are equal.
+// The current expected usage is only in test code though.
+inline int operator<=>(const PackedTerm& p, const char* s) {
+  auto [data,sz] = p.unpack();
+  auto slen = strlen(s);
+  int datacmp = memcmp(data, s, std::min((int)sz,(int)slen));
+  return (datacmp != 0) ? datacmp : ((int)sz - (int)slen);
 }
+
+inline bool operator==(const PackedTerm& p, const char* s) {
+  auto [data,sz] = p.unpack();
+  int slen = strlen(s);
+  if (sz !=slen) return false;
+  return memcmp(data, s, sz) == 0;
+}
+
 
 namespace std {
 template<>
