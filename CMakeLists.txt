@@ -10,6 +10,8 @@ set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 
 include_directories(SYSTEM ./src)
 
+find_package(xxHash CONFIG REQUIRED)
+
 #from clion docs
 find_package(Boost)
 IF (Boost_FOUND)
@@ -29,6 +31,7 @@ foreach (_variableName ${_variableNames})
     message(STATUS "${_variableName}=${${_variableName}}")
 endforeach()
 
+# set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fno-omit-frame-pointer")   #for profiling release
 # sanitizer settings.. can leave this first one on while developing for linux
 #set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -std=c++2a -g -O1 -fno-omit-frame-pointer -fsanitize=address")
 #set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -std=c++2a -g -O0 -fno-omit-frame-pointer -fsanitize=address")     #don't optimize stuff out
@@ -78,9 +81,9 @@ target_link_libraries(solux solux_lib)
 add_subdirectory(test)
 
 # this needs to be after add_executable or add_library
-target_link_libraries (solux ${Boost_LIBRARIES})
-
-target_link_libraries (solux_lib debug simdcomp_ad)
-target_link_libraries (solux_lib optimized simdcomp_a)
+target_link_libraries(solux_lib PRIVATE xxHash::xxhash)
+target_link_libraries(solux ${Boost_LIBRARIES})
+target_link_libraries(solux_lib PRIVATE debug simdcomp_ad)
+target_link_libraries(solux_lib PRIVATE optimized simdcomp_a)
 
 

@@ -192,8 +192,7 @@ public:
         if (elements_ >= capacity_) {
             rehash();
         }
-        // auto hash = Hash::hash(ptr, sz);
-        auto hash = Hash::fvn1a(ptr, sz);
+        auto hash = Hash::hash(ptr, sz);
         auto slot = hash;
         for (; ;) {
             slot = slot & (tableSize_-1);

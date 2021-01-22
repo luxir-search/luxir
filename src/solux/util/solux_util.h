@@ -6,6 +6,11 @@
 #include <vector>
 #include <memory.h>
 
+// NOTE: this is better than including xxhash.h since it enables inline. Inverter performance equal to
+// fvn1a when inlined.  25% slower if not inlined.
+#include <xxh3.h>
+
+
 // gcc and msvc have different ways of specifying packing of structs :-(
 // use SOLUX_PACKED_START class X{} SOLUX_PACKED_END;
 #ifdef __GNUC__
@@ -85,25 +90,10 @@ inline uint64_t read_u8 (const void * const ptr)
 class Hash
 {
 private:
-  static const uint64_t k0 = 0xD6D018F5;
-  static const uint64_t k1 = 0xA2AA033B;
-  static const uint64_t k2 = 0x62992FC1;
-  static const uint64_t k3 = 0x30BC5B29;
-
   static constexpr uint32_t FVN_Prime = 0x01000193; //   16777619
   static constexpr uint32_t FVN_Seed  = 0x811C9DC5; // 2166136261
 
 public:
-  /**
-  static uint64_t mix(uint64_t val) {
-    h += read_u64(ptr) * k3; ptr += 8;
-    h ^= rotate_right(h, 55) * k1;
-    h ^= rotate_right(h, 28);
-    h *= k0;
-    h ^= rotate_right(h, 29);
-  }
-   **/
-
   /// fnv1a hash, descent for hash tables with short keys.
   // We could do better if we knew it was safe to read up to 8 bytes before/after the data...
   // see wyhash (safety=0) and fvn1a-pippin
@@ -126,71 +116,14 @@ public:
     return h;
   }
 
-  // non-inlined version
-  static uint64_t fasthash64_func(const void *buf, size_t len, uint64_t seed);
-
-  static uint64_t fasthash64(const void *buf, size_t len, uint64_t seed)
-  {
-    const uint64_t    m = 0x880355f21e6d1965ULL;
-    const uint64_t *pos = (const uint64_t *)buf;
-    const uint64_t *end = pos + (len / 8);
-    const unsigned char *pos2;
-    uint64_t h = seed ^ (len * m);
-    uint64_t v;
-
-    while (pos != end) {
-      v  = *pos++;
-      h ^= mix(v);
-      h *= m;
-    }
-
-    pos2 = (const unsigned char*)pos;
-    v = 0;
-
-    switch (len & 7) {
-      case 7: v ^= (uint64_t)pos2[6] << 48;
-      case 6: v ^= (uint64_t)pos2[5] << 40;
-      case 5: v ^= (uint64_t)pos2[4] << 32;
-      case 4: v ^= (uint64_t)pos2[3] << 24;
-      case 3: v ^= (uint64_t)pos2[2] << 16;
-      case 2: v ^= (uint64_t)pos2[1] << 8;
-      case 1: v ^= (uint64_t)pos2[0];
-        h ^= mix(v);
-        h *= m;
-    }
-
-    return mix(h);
-  }
-
-  static uint64_t ycs_hash(const void *buf, size_t len, uint64_t seed) {
-    const unsigned char *ptr = (const unsigned char*)buf;
-
-    uint64_t v = 0;
-    switch(len) {
-      case 4: v = read_u32(ptr); break;
-      case 3: v = (uint64_t)ptr[2] << 16;
-      case 2: v ^= read_u16(ptr); break;
-      case 1: v = (uint64_t)ptr[0]; break;
-      // default: return metro_hash(ptr, len, seed);
-      default: return fvn1a(ptr, len, seed);
-    }
-    return mix(v);
-  }
-
-
-  static uint64_t metro_hash(const void* ptr, int length, uint64_t seed=0);
-
   static uint32_t hash(const void* ptr, int length, uint64_t seed=FVN_Seed) {
-    return fvn1a(ptr, length, seed);
-    // return (uint32_t)metro_hash(ptr, length, seed);
-    // return (uint32_t)ycs_hash(ptr, length, seed);
-    // return (uint32_t)fasthash64(ptr, length, seed);
-    // return (uint32_t)fasthash64_func(ptr, length, seed);
+    // return fvn1a(ptr, length, seed);
+    return XXH64(ptr, length, seed);
   }
 
-  // Simple inverter test: (seems like inlining is hurting here?)
-  // g++ MB/sec fvn=133 metro=131 fast=122  fast_func=124
-  // clang      fvn= 96 metro=110 fast=110  fast_func=113
+  static uint64_t hash64(const void* ptr, int length, uint64_t seed=FVN_Seed) {
+    return XXH64(ptr, length, seed);
+  }
 
 };
 
