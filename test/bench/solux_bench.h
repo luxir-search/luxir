@@ -18,7 +18,7 @@ extern bool unit_tests;
 /// DO NOT USE state.PauseTiming() and state.ResumeTiming() for anything fast, since they are very slow
 /// themselves and add hundreds of nanoseconds attributed to the test.
 ///
-/// WARNING: if you do use manual benchmark timing, the google bench test runner has an issue where that
+/// WARNING: if you do use manual benchmark timing, the google bench test runner has an issue where
 /// manual timing will be used to calculate the number of iterations (i.e. minTime), so benchmarks will
 /// take a ton of time if you have a relatively slow operation outside of the manual timing measurement.
 //

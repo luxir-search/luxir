@@ -11,7 +11,7 @@ using namespace solux;
 // about 1.2% slower when not ommitting frame pointer
 // adding term hashes (without using them) resulted in a slowdown of ~1%
 // med is about 5% slower than small (before any optimizations like using hashes or pulling out prefixes from block starts)
-// 
+//
 
 static void BM_TermFind(benchmark::State& state, uint64_t maxId, int hitPercent) {
   int nPosPerDoc=1;

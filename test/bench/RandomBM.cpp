@@ -1,6 +1,7 @@
 #include <benchmark/benchmark.h>
 #include <random>
 #include "solux/util/random.h"
+#include "solux/util/solux_util.h"
 #include "gtest/gtest.h"
 
 
@@ -65,11 +66,29 @@ static void BM_SplitMix64(benchmark::State& state) {
   benchRng(state, rng);
 }
 
+inline uint64_t mymix(uint64_t v) {
+  // change to different implementations here to test mixing
+  return solux::Hash::hash(&v, sizeof(uint64_t));
+}
 
+static void BM_mix(benchmark::State& state) {
+  uint64_t result = 1;
+  for (auto _ : state) {
+    result += mymix(result);
+    result *= mymix(result);
+    result += mymix(result);
+    result *= mymix(result);
+    benchmark::DoNotOptimize(result);
+    benchmark::ClobberMemory();
+  }
+  ASSERT_TRUE(result != 0);
+}
+
+// Only turn these on when doing random perf testing.
+#ifdef DISABLED_BENCHMARKS
 // Register the function as a benchmark
 BENCHMARK(BM_mersenne_twister);
 BENCHMARK(BM_RomuTrio);
 BENCHMARK(BM_SplitMix64);
-
-// Run the benchmark
-// BENCHMARK_MAIN();
+BENCHMARK(BM_mix);
+#endif

@@ -29,10 +29,6 @@ namespace solux {
 template<typename... Args>
 inline void unused(Args &&...) {}
 
-
-// java compatible types?
-typedef int8_t byte;
-
 // Returns true if x is a power of two. Will also return true for x==0, so check for that separately if needed.
 inline bool isPowerOfTwo(int x) {
   return ((x > 0) && !(x & (x - 1)));
@@ -63,8 +59,6 @@ std::ostream &operator<<(std::ostream &out, const std::vector<T> &v) {
 }
 
 
-// todo: get XXH3
-// todo: namespace
 class Hash {
 private:
   static constexpr uint32_t FVN_Prime = 0x01000193; //   16777619
@@ -81,23 +75,12 @@ public:
     return hash;
   }
 
-
-// fasthash
-// Compression function for Merkle-Damgard construction.
-// This function is generated using the framework provided.
-  static inline uint64_t mix(uint64_t h) {
-    (h) ^= (h) >> 23;
-    (h) *= 0x2127599bf4325c37ULL;
-    (h) ^= (h) >> 47;
-    return h;
-  }
-
-  static uint32_t hash(const void *ptr, int length, uint64_t seed = FVN_Seed) {
-    // return fvn1a(ptr, length, seed);
+  static uint32_t hash(const void *ptr, int length, uint64_t seed = 0) {
+    // return fvn1a(ptr, length, FVN_Seed+seed);
     return (uint32_t) XXH64(ptr, length, seed);
   }
 
-  static uint64_t hash64(const void *ptr, int length, uint64_t seed = FVN_Seed) {
+  static uint64_t hash64(const void *ptr, int length, uint64_t seed = 0) {
     return XXH64(ptr, length, seed);
   }
 
