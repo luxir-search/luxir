@@ -5,7 +5,7 @@
 #include "solux/index/SegField.h"
 
 using namespace std;
-
+using namespace solux;
 
 TEST(TermValHash, testHash) {
 

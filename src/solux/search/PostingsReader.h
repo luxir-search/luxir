@@ -158,6 +158,7 @@ class TermsEnum {
   int64_t locOfDocsForTermBlock;  // absolute location... field offset + block offset
   int64_t locOfPositionsForTermBlock;  // absolute location... field offset + block offset
   int64_t cumulativeDocsSize;
+  const char* termHashes;
 
 public:
   TermsEnum(MemPool& pool, PostingsReader& postingsReader, TermIndexReader& tindexReader) : pool(pool), postingsReader(postingsReader), tindexReader(tindexReader) {
@@ -198,6 +199,11 @@ public:
     locOfPositionsForTermBlock = tindexReader.posLoc + termsIS.readVlong();
 
     memcpy(currTerm.ptr(), startingTerm.ptr(), startingTerm.memorySize());
+
+    // remember, then skip over the term hashes... one byte per hash.
+    termHashes = termsIS.ptr();
+    termsIS.skip(maxOrdInBlock+1);  // ords are 0 based, so add 1 for the number of them. maxOrdInBlock is also inclusive (not one past the end)
+
     readTermMetadata();
   }
 
@@ -209,10 +215,17 @@ public:
       termBlockIndex++;
       readTermBlock();
       return true;
-    } else {
-      ordInBlock++;
     }
 
+    readNextTermInBlock();
+    return true;
+  }
+
+
+  // reads the next term in the block with no checking if one runs off the end of the block.
+  void readNextTermInBlock() {
+    assert(ordInBlock < maxOrdInBlock);
+    ordInBlock++;
     // read next suffix
     // see PostingsWriter.flushTerms
     uint8_t code = termsIS.readByte();
@@ -230,7 +243,6 @@ public:
     currTerm.setSize(prefixLen + suffixLen);
 
     readTermMetadata();
-    return true;
   }
 
   bool seek(const std::string_view& target) {  // TODO: templatize for anything that looks like a string?
@@ -256,9 +268,40 @@ public:
     termBlockIndex = blockOffsetPtr - tindexReader.termBlockOffsets;
     readTermBlock();
     return seekInBlock(target);
+    // return seekCeilInBlock(target); // use this version to skip comparing hashes
   }
 
   bool seekInBlock(const std::string_view& target) {
+    // TODO: rather than hashing every segment, have an option to pass it in?
+    char hash = (char)Hash::hash(target.data(), target.length());
+    int lastOrd = ordInBlock - 1; // check the current term we are on.
+    for(;;) {
+      int matchOrd;
+      for(matchOrd=lastOrd+1;;matchOrd++) {
+        if (termHashes[matchOrd] == hash) break;
+        if (matchOrd >= maxOrdInBlock) return false;  // we got lucky and no more hashes matched!
+      }
+
+      // Hash code matched for the matchOrd term.
+      // If we had a different term block structure, it might be easier to skip.  For now,
+      // just call nextTerm and we get to skip the compare.
+      while (ordInBlock < matchOrd) {
+        readNextTermInBlock();
+        // NOTE: there is one case where we do more work here than we should by skipping comparisons.
+        // if the term does not exist, we could return earlier if we hit a term larger.
+      }
+
+      // Since the hash code matched, do actual comparison.  A test for equality would be faster if it's a match, but
+      // we also want to handle the case where we went too far.
+      auto cmp = term() <=> target;
+      if (cmp == 0) return true;
+      if (cmp > 0) return false;
+      lastOrd=ordInBlock;
+    }
+  }
+
+
+  bool seekCeilInBlock(const std::string_view& target) {
     auto cmp = term() <=> target;
     // std::cout << " comparing with first " << term() << ": eq=" << (cmp==0) << " gt=" <<  (cmp>0) << std::endl;
     if (cmp == 0) return true;

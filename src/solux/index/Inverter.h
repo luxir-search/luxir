@@ -8,8 +8,7 @@
 #include "solux/util/TermValHash.h"
 #include "DocStream.h"
 
-class Inverter;
-
+namespace solux {
 
 
 /***
@@ -69,7 +68,7 @@ public:
   // Still, we should switch to a monotonic allocator for this since we will never need to
   // release individually.
 
-  std::unordered_map<std::string, SegFieldIndexed*> segFields_;
+  std::unordered_map<std::string, SegFieldIndexed *> segFields_;
 
 
   int currDoc_ = -1;  // the current document being indexed
@@ -97,8 +96,9 @@ public:
   // pass function that fills in token, or pass function that actually indexes?
 
 
-  void index(Document& doc);
-  void indexField(FieldValue& fv);
+  void index(Document &doc);
+
+  void indexField(FieldValue &fv);
 
 
 
@@ -144,4 +144,5 @@ public:
 
 };
 
+} // end namespace
 

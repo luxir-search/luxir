@@ -20,7 +20,7 @@ TEST_F(SIMDCompTest, testComp) {
   // IntegerCODEC &codec = *CODECFactory::getFromName("s4-bp128-d4");  // fastest according to the paper?
   // IntegerCODEC &codec = *CODECFactory::getFromName("s4-bp128-d1");  // 11% slower, 7% smaller than d4?
   IntegerCODEC &mycodec = *CODECFactory::getFromName("s4-fastpfor-d1");  // best for space   // NOTE: block size==256 integers!  What is the page size for?
-  unused(mycodec);
+  solux::unused(mycodec);
   // NOTE: some codecs (like s4-fastpfor-d1) modify the input array to calculate deltas!
   // NOTE: SIMDCompressionAndIntersection puts 32 bit size at start!  Look at C version and see if it's easier to modify?
 

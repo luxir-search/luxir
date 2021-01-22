@@ -5,9 +5,12 @@
 #include "solux/util/solux_util.h"
 #include "solux/util/MemPool.h"
 
+namespace solux {
 
 class StreamReader;
-class END{};
+
+class END {
+};
 
 // TODO: try using a 64 byte aligned stream! (see comments at start of DocStream.h)
 //   we wouldn't need to store how much left (calc it), size of the current slice (always 64)
@@ -19,6 +22,7 @@ class END{};
 // Hmmm, when there are 3 streams together, it would be better coded as
 // ptr,ptr,ptr,len,len,len to avoid extra padding!  termdoc, termpos
 SOLUX_PACKED_START
+
 class Stream {
 public:
 
@@ -37,7 +41,7 @@ public:
    */
   static constexpr int FIRST_LEVEL_SIZE = sizeof(int);
 
-  char* ptr_;    // pointer to the last byte of the stream
+  char *ptr_;    // pointer to the last byte of the stream
 
   // ptr_ starts out pointing at bbStart_, which can hold 4 bytes.  Then when we write the forwarding address, it will be equal to
   // what we would have set bbStart_ to anyway!  When reading back, we just need to check size.
@@ -56,7 +60,7 @@ public:
   Stream() {
     // this creates an alias, but we don't actually *do* anything with bbStart_ when writing
     // Ah... but we do support move operators... if those were used / optimized, it could mean big troubles.
-    ptr_ = reinterpret_cast<char*>(&bbStart_);
+    ptr_ = reinterpret_cast<char *>(&bbStart_);
     // bbStart_ member is uninitialized, and that's OK
     sliceSz_ = sizeof(int);
     left_ = sliceSz_;
@@ -65,57 +69,70 @@ public:
   }
 
   // TODO: we could also just prohibit moves...
-  void moveFrom(Stream& o) {
+  void moveFrom(Stream &o) {
     std::cout << "MOVED!" << std::endl;  // nocommit
-    ptr_ = o.allocatedSz_ == sizeof(int) ?  (reinterpret_cast<char*>(&bbStart_) + (sizeof(int)-o.left_)) : o.ptr_;
+    ptr_ = o.allocatedSz_ == sizeof(int) ? (reinterpret_cast<char *>(&bbStart_) + (sizeof(int) - o.left_)) : o.ptr_;
     bbStart_ = o.bbStart_;
     allocatedSz_ = o.allocatedSz_;
     left_ = o.left_;
     sliceSz_ = o.sliceSz_;
   }
 
-  Stream(const Stream& o) = delete;
-  void operator=(const Stream& o) = delete;
+  Stream(const Stream &o) = delete;
 
-  Stream(Stream&& o) {
+  void operator=(const Stream &o) = delete;
+
+  Stream(Stream &&o) {
     moveFrom(o);
   }
 
-  Stream& operator=(Stream&& o) {
+  Stream &operator=(Stream &&o) {
     moveFrom(o);
     return *this;
   }
 
-  const char* ptr(const MemPool& pool) const { unused(pool); return ptr_; }
-  int size(const MemPool& pool) const { unused(pool); return allocatedSz_ - left_; }
-  int left(const MemPool& pool) const { unused(pool); return left_; }
-  const char* start(const MemPool& pool) const {
+  const char *ptr(const MemPool &pool) const {
+    unused(pool);
+    return ptr_;
+  }
+
+  int size(const MemPool &pool) const {
+    unused(pool);
+    return allocatedSz_ - left_;
+  }
+
+  int left(const MemPool &pool) const {
+    unused(pool);
+    return left_;
+  }
+
+  const char *start(const MemPool &pool) const {
     unused(pool);
     if (allocatedSz_ == FIRST_LEVEL_SIZE) {
-      return reinterpret_cast<const char*>(&bbStart_);
+      return reinterpret_cast<const char *>(&bbStart_);
     } else {
       return pool.ptr(bbStart_);
     }
   }
 
   /** Pointer to previously written byte.  Only valid if a byte as been previously written. */
-  char* prevPtr(MemPool& pool) {
+  char *prevPtr(MemPool &pool) {
     unused(pool);
     assert(size(pool) > 0);
     return ptr_ - 1;
   }
 
-  void writeByte(MemPool& pool, uint8_t val) {
+  void writeByte(MemPool &pool, uint8_t val) {
     if (left_ == 0) {
       // pull this out into a function?
       sliceSz_ = nextSliceSize(sliceSz_);
       int blockAddr = pool.allocateBBP(sliceSz_);
 
-      char* newPointer = pool.ptr(blockAddr);  // TODO: what about a version that returns pointer and the block address
+      char *newPointer = pool.ptr(blockAddr);  // TODO: what about a version that returns pointer and the block address
       // move last 4 bytes to new area... we do this in one chunk using an integer.
       // this works for both both little endian and big endian since we're only moving.
-      int* lastWord = reinterpret_cast<int*>(ptr_ - 4);
-      *reinterpret_cast<int*>(newPointer) =  *lastWord;
+      int *lastWord = reinterpret_cast<int *>(ptr_ - 4);
+      *reinterpret_cast<int *>(newPointer) = *lastWord;
       *lastWord = blockAddr;  // point to the new area with the last 4 bytes of the old area
       // TODO: this can alias bbStart_... is there anything we can do before reading bbStart_ to ensure this write is seen?
       // NOTE: we never read bbStart_ during the inversion phase of indexing, only when flushing.
@@ -135,23 +152,23 @@ public:
 
   // TODO: an optimized version for when we have >= 5 bytes available?
   // TODO: convert to unsigned and do checks elsewhere?
-  void writeVInt(MemPool& pool, int val) {
+  void writeVInt(MemPool &pool, int val) {
     assert(val >= 0);
-    auto v = (unsigned)val;
+    auto v = (unsigned) val;
     while ((v & ~0x7F) != 0) {
-      writeByte(pool, (uint8_t)(v | 0x80));
+      writeByte(pool, (uint8_t) (v | 0x80));
       v >>= 7;
     }
-    writeByte(pool, (uint8_t)v);
+    writeByte(pool, (uint8_t) v);
   }
 
   // This version may be be slower... but it might help inlining with only a single call to writeByte (need to test)
-  void writeVInt2(MemPool& pool, int val) {
+  void writeVInt2(MemPool &pool, int val) {
     assert(val >= 0);
-    auto v = (unsigned)val;
-    for(;;) {
+    auto v = (unsigned) val;
+    for (;;) {
       auto flag = (v & 0x7f) == 0 ? 0 : 0x80;
-      writeByte(pool, (uint8_t)(v | flag));
+      writeByte(pool, (uint8_t) (v | flag));
       if (flag == 0) break;
       v >>= 7;
     }
@@ -159,12 +176,16 @@ public:
 
 
   // TODO: some sort of adapter that will specify the pool for us?
-  StreamReader begin(const MemPool& pool) const;
-  // const StreamReader& end(const MemPool& pool) const;
-  END end(const MemPool& pool) const { unused(pool); return END(); }
+  StreamReader begin(const MemPool &pool) const;
 
-} 
-SOLUX_PACKED_END;
+  // const StreamReader& end(const MemPool& pool) const;
+  END end(const MemPool &pool) const {
+    unused(pool);
+    return END();
+  }
+
+}
+  SOLUX_PACKED_END;
 
 
 //////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -172,8 +193,8 @@ SOLUX_PACKED_END;
 
 // TODO: Stream could also be cast as an output iterator??
 class StreamReader {
-  const char* ptr_; // if ptr_ is null, all other members may be invalid!
-  const MemPool& pool_;
+  const char *ptr_; // if ptr_ is null, all other members may be invalid!
+  const MemPool &pool_;
   int remaining_;   // number of data bytes left to consume in the full stream
   uint8_t remainingInSlice_;
   uint8_t sliceSize_;
@@ -185,11 +206,12 @@ class StreamReader {
   }
 
   friend class Stream;
+
 public:
 
   // TODO: try a static push reader that accepts a template/lambda
 
-  StreamReader(const Stream& source, const MemPool& pool) : pool_(pool) {
+  StreamReader(const Stream &source, const MemPool &pool) : pool_(pool) {
     remaining_ = source.size(pool_);
 
     // position ptr on first character, or null if none
@@ -216,9 +238,9 @@ public:
       if (remaining_ <= sliceSize_) {
         ptr_ = nullptr;
       } else {
-          // follow the next link in the chain
+        // follow the next link in the chain
         remaining_ -= (sliceSize_ - 4);
-        int bbptr = *reinterpret_cast<const int*>(ptr_);
+        int bbptr = *reinterpret_cast<const int *>(ptr_);
         initFromBBPointer(bbptr);
       }
     }
@@ -238,12 +260,12 @@ public:
      **/
   }
 
-  StreamReader& operator++ () {
+  StreamReader &operator++() {
     incrementPointer();
     return *this;
   }
 
-  StreamReader operator++ (int) { // postfix ++
+  StreamReader operator++(int) { // postfix ++
     StreamReader prev = *this;
     incrementPointer();
     return prev;
@@ -254,18 +276,19 @@ public:
   }
 
 
-  bool operator==(const END& other) const {
+  bool operator==(const END &other) const {
     unused(other);
     return this->ptr_ == nullptr;
   }
-  bool operator!=(const END& other) const {
+
+  bool operator!=(const END &other) const {
     unused(other);
     return this->ptr_ != nullptr;
   }
 
 
   uint8_t read() {
-    uint8_t ret = (uint8_t)*ptr_;
+    uint8_t ret = (uint8_t) *ptr_;
     incrementPointer();
     return ret;
   }
@@ -273,7 +296,8 @@ public:
 };
 
 
-inline StreamReader Stream::begin(const MemPool& pool) const {
+inline StreamReader Stream::begin(const MemPool &pool) const {
   return StreamReader(*this, pool);
 }
 
+} // end namespace

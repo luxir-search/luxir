@@ -5,6 +5,7 @@
 #include "solux/store/Directory.h"
 #include "test/SoluxTest.h"
 
+using namespace solux;
 
 class OutputStreamTest : public solux::SoluxTest {
 public:

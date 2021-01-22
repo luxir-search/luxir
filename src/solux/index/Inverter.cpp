@@ -1,7 +1,8 @@
 
 #include "Inverter.h"
 
-void Inverter::index(Document& doc) {
+namespace solux {
+void Inverter::index(Document &doc) {
   unused(doc);
   /*
   int docid = ++currDoc_;
@@ -12,6 +13,8 @@ void Inverter::index(Document& doc) {
 }
 
 
-void Inverter::indexField(FieldValue& fv) {
+void Inverter::indexField(FieldValue &fv) {
   unused(fv);
 }
+
+} // end namespace

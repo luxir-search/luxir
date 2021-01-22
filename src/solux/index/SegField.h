@@ -7,6 +7,8 @@
 #include "solux/util/TermValHash.h"
 #include "DocStream.h"
 
+namespace solux {
+
 /***
 class SegmentTerm {
 public:
@@ -81,11 +83,10 @@ struct FieldValueStats {
 };
 
 
-
 class SegFieldIndexed {
 public:
   // Pointer to the global field type.
-  const FieldType& field_;
+  const FieldType &field_;
 
   // Reusable TokenStream, instantiated on demand (may be null)
   // The analyzer can be obtained from the FieldType
@@ -96,23 +97,23 @@ public:
   int64_t sumDocFreq = 0;        // sum of doc freqs across all terms
   int docsWithField = 0;      // count of how many documents have this field
 
-  explicit SegFieldIndexed(const FieldType& field) : field_(field) {}
+  explicit SegFieldIndexed(const FieldType &field) : field_(field) {}
 
   /* WIP
   virtual void indexSingleValue(int docid, const char* ptr, int len) {}
   virtual void indexMultipleValues() {}
   */
 
-  virtual void indexTokenStream(int docid, char* mutableVal, int len) = 0;
+  virtual void indexTokenStream(int docid, char *mutableVal, int len) = 0;
 
   virtual ~SegFieldIndexed() {}
 };
 
 class SegFieldDocs : public SegFieldIndexed {
 public:
-  TermValHash<DocStream> termsHash;
+  TermValHash <DocStream> termsHash;
 
-  SegFieldDocs(const FieldType &field, MemPool& pool) : SegFieldIndexed(field) , termsHash(pool, 4) { }
+  SegFieldDocs(const FieldType &field, MemPool &pool) : SegFieldIndexed(field), termsHash(pool, 4) {}
 
   /*
   virtual void indexSingleValue(int docid, const char *ptr, int len) override {
@@ -121,12 +122,13 @@ public:
   }
    */
 
-  virtual void indexTokenStream(int docid, char* mutableVal, int len) override {  // todo: could make a templatized version
+  virtual void
+  indexTokenStream(int docid, char *mutableVal, int len) override {  // todo: could make a templatized version
     tokenChain->head.setMutableValue(mutableVal, len);
 
-    Token& tok = *tokenChain->token;
+    Token &tok = *tokenChain->token;
     bool first = true;
-    for(;;) {
+    for (;;) {
       bool hasNext = tokenChain->tail->incrementToken(first);
       first = false;
       if (!hasNext) break;
@@ -140,9 +142,9 @@ public:
       );
        ***/
 
-      auto [entry, inserted] = termsHash.try_emplace(tok.ptr, tokLen, termsHash.pool_, docid);
+      auto[entry, inserted] = termsHash.try_emplace(tok.ptr, tokLen, termsHash.pool_, docid);
       if (!inserted) {
-          entry.val().addDoc(termsHash.pool_, docid);
+        entry.val().addDoc(termsHash.pool_, docid);
       }
 
     }
@@ -160,12 +162,12 @@ public:
 
 class SegFieldDocsFreqPos : public SegFieldIndexed {
 public:
-  TermValHash<DocFreqPosStream> termsHash;
+  TermValHash <DocFreqPosStream> termsHash;
 
-  SegFieldDocsFreqPos(const FieldType &field, MemPool& pool) : SegFieldIndexed(field) , termsHash(pool, 4) { }
+  SegFieldDocsFreqPos(const FieldType &field, MemPool &pool) : SegFieldIndexed(field), termsHash(pool, 4) {}
 
-  inline void addPosition(int docid, char* term, int len, int pos) {
-    auto [entry, inserted] = termsHash.try_emplace(term, len, termsHash.pool_, docid, pos);
+  inline void addPosition(int docid, char *term, int len, int pos) {
+    auto[entry, inserted] = termsHash.try_emplace(term, len, termsHash.pool_, docid, pos);
     if (!inserted) {
       entry.val().addDoc(termsHash.pool_, docid, pos);
     }
@@ -175,14 +177,14 @@ public:
 
 
   // TODO: OPT: try templatizing by the token chain?
-  virtual void indexTokenStream(int docid, char* val, int len) {
+  virtual void indexTokenStream(int docid, char *val, int len) {
     tokenChain->head.setMutableValue(val, len);
 
     int numTokens = 0;
     int pos = 0;
-    Token& tok = *tokenChain->token;
+    Token &tok = *tokenChain->token;
     bool first = true;
-    for(;;) {
+    for (;;) {
       bool hasNext = tokenChain->tail->incrementToken(first);
       if (!hasNext) break;
       first = false;
@@ -269,23 +271,24 @@ public:
   // Results of indexing directly with this method:
   // clang=130MB/sec vs 122MB/sec  (i.e. 6.5% increase)
   // gcc: 159MB/sec vs 172MB/sec (i.e. this one is slower than the TokenChain version by 8% ???)
-  void indexWhitespace(int docid, char* val, int len) {
-      int numTokens = 0;
-      int pos = 0;
-      WhitespaceTokenizer::process(val, len,
-              [&](const char* token, int tokLen) {
-          numTokens++;
-          pos++;  // need to have the tokenizer do this in case tokens are skipped or overlapped?
-          auto [entry, inserted] = termsHash.try_emplace(token, tokLen, termsHash.pool_, docid, pos);
-          if (!inserted) {
-              entry.val().addDoc(termsHash.pool_, docid, pos);
-          }
-      }
-      );
+  void indexWhitespace(int docid, char *val, int len) {
+    int numTokens = 0;
+    int pos = 0;
+    WhitespaceTokenizer::process(val, len,
+                                 [&](const char *token, int tokLen) {
+                                   numTokens++;
+                                   pos++;  // need to have the tokenizer do this in case tokens are skipped or overlapped?
+                                   auto[entry, inserted] = termsHash.try_emplace(token, tokLen, termsHash.pool_, docid,
+                                                                                 pos);
+                                   if (!inserted) {
+                                     entry.val().addDoc(termsHash.pool_, docid, pos);
+                                   }
+                                 }
+    );
 
-      sumTotalTermFreq += numTokens;
-    }
+    sumTotalTermFreq += numTokens;
+  }
 
 };
 
-
+} // end namespace

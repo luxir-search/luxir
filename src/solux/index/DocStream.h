@@ -2,6 +2,7 @@
 
 #include "Stream.h"
 
+namespace solux {
 
 // if for whatever reason we needed to access the string from the given DocStream,
 // we could add the string directly following the value
@@ -42,20 +43,22 @@
 
 // Documents matching a term
 SOLUX_PACKED_START
+
 class DocStream {
 public:
   Stream docs;
   int lastDoc;
   int docFreq;  // number of docs with this term
 
-  DocStream(MemPool& pool, int docid) : lastDoc(docid), docFreq(1) {
+  DocStream(MemPool &pool, int docid) : lastDoc(docid), docFreq(1) {
     unused(pool);
   }
 
-  DocStream(const DocStream&) = delete;
-  void operator=(const DocStream&) = delete;
+  DocStream(const DocStream &) = delete;
 
-  void addDoc(MemPool& pool, int docid) {
+  void operator=(const DocStream &) = delete;
+
+  void addDoc(MemPool &pool, int docid) {
     int delta = docid - lastDoc;
     assert(delta >= 0);
     if (delta != 0) {
@@ -66,10 +69,8 @@ public:
     }
   }
 }
-SOLUX_PACKED_END;
+  SOLUX_PACKED_END;SOLUX_PACKED_START
 
-
-SOLUX_PACKED_START
 class DocFreqStream {
 
 public:
@@ -81,14 +82,15 @@ public:
   int lastDocCode;
   int termFreq;
 
-  explicit DocFreqStream(int docid) : lastDoc(docid) , docFreq(1), lastDocCode(docid<<1), termFreq(1) {
+  explicit DocFreqStream(int docid) : lastDoc(docid), docFreq(1), lastDocCode(docid << 1), termFreq(1) {
   }
-  DocFreqStream(const DocFreqStream&) = delete;
-  DocFreqStream(DocFreqStream&&) = delete;
+
+  DocFreqStream(const DocFreqStream &) = delete;
+
+  DocFreqStream(DocFreqStream &&) = delete;
 
 
-
-  void addDoc(MemPool& pool, int docid) {
+  void addDoc(MemPool &pool, int docid) {
     int delta = docid - lastDoc;
     if (delta == 0) {
       // same document
@@ -109,7 +111,7 @@ public:
     }
   }
 }
-SOLUX_PACKED_END;
+  SOLUX_PACKED_END;
 
 // TODO: consider indexing payloads as separate type? (separate index options)
 // That would save 1 bit per position.
@@ -125,6 +127,7 @@ SOLUX_PACKED_END;
 //     want to avoid the contention.
 
 SOLUX_PACKED_START
+
 class DocFreqPosStream {
 public:
   Stream docs;
@@ -139,13 +142,16 @@ public:
   // todo: support positions > 2B?  Not useful?  Perhaps support with a special marker in the stream (like a 0 length payload that means
   // read a vint and multiply that by 2B and add it to the delta
 
-  DocFreqPosStream(MemPool& pool, int docid, int pos) : lastDoc(docid) , docFreq(1), lastDocCode(docid << 1), termFreq(1), lastPos(pos) {
-    positions.writeVInt(pool, pos<<1);
+  DocFreqPosStream(MemPool &pool, int docid, int pos) : lastDoc(docid), docFreq(1), lastDocCode(docid << 1),
+                                                        termFreq(1), lastPos(pos) {
+    positions.writeVInt(pool, pos << 1);
   }
-  DocFreqPosStream(const DocFreqPosStream&) = delete;
-  DocFreqPosStream(DocFreqPosStream&&) = delete;
 
-  void writePos(MemPool& pool, int pos) {
+  DocFreqPosStream(const DocFreqPosStream &) = delete;
+
+  DocFreqPosStream(DocFreqPosStream &&) = delete;
+
+  void writePos(MemPool &pool, int pos) {
     int posCode = pos - lastPos;
     assert(posCode >= 0);
     // TODO: do we need to support duplicate positions for the same term for the same doc???  Would seem to make search code more complex.
@@ -153,7 +159,7 @@ public:
     lastPos = pos;
   }
 
-  void addDoc(MemPool& pool, int docid, int pos) { // TODO: add payload
+  void addDoc(MemPool &pool, int docid, int pos) { // TODO: add payload
     int delta = docid - lastDoc;
     if (delta == 0) {
       // same document
@@ -179,7 +185,7 @@ public:
     }
   }
 }
-SOLUX_PACKED_END;
+  SOLUX_PACKED_END;
 
 
 /*** prototype code for reading back postings
@@ -238,3 +244,5 @@ return 0; // nocommit
 };
 
 ***/
+
+} // end namespace

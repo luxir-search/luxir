@@ -38,10 +38,11 @@
 #include "solux_util.h"
 #include "MemPool.h"
 
-
+namespace solux {
 
 // the general implementation to use for a non-owning Term references.
 class PackedTerm;
+
 using TermRef = PackedTerm;
 
 
@@ -50,102 +51,105 @@ using TermRef = PackedTerm;
 class StrRef {
   int64_t x;
 public:
-  static const uint32_t SIZE_BITS=16;
-  static const uint32_t MAX_SIZE=(1<<SIZE_BITS)-1;
+  static const uint32_t SIZE_BITS = 16;
+  static const uint32_t MAX_SIZE = (1 << SIZE_BITS) - 1;
 
   static uint32_t getMaxSize(uint32_t size) { return size; }
+
   static uint32_t getExactSize(uint32_t size) { return size; }
 
   // returns the number of bytes written to the target
-  static int write(char* target, const void* data, int sz) {
-    memcpy(target, data, (size_t)sz);
+  static int write(char *target, const void *data, int sz) {
+    memcpy(target, data, (size_t) sz);
     return sz;
   }
 
   StrRef() {}
 
   // expert: should already point to an instance of this type
-  void init(void* data, uint32_t size) {
-    assert( (size & 0xffff0000)==0 );
+  void init(void *data, uint32_t size) {
+    assert((size & 0xffff0000) == 0);
     x = (reinterpret_cast<int64_t>(data) << SIZE_BITS) + size;
   }
 
   // expert: should already point to an instance of this type
-  StrRef(void* data, uint32_t size) {
+  StrRef(void *data, uint32_t size) {
     init(data, size);
   }
-  StrRef(MemPool& target, const void* data, uint32_t len) {
-    assert( (len & 0xffff0000)==0 );
+
+  StrRef(MemPool &target, const void *data, uint32_t len) {
+    assert((len & 0xffff0000) == 0);
     auto p = target.allocate(len);
     memcpy(p, data, len);
     init(p, len);
   }
 
 
-  void* ptr() const {
+  void *ptr() const {
     // Do a signed shift so we get the correct sign extension (all bits above the 48th bit
     // must match the 48th bit).  Most operating systems I know of use the "0" half of the address
     // space for user-space, but the signed extension is free anyway for our purposes here (unless
     // directly storing the top 16 bits is cheaper since no shift is needed?)
-    return reinterpret_cast<void*>(x >> SIZE_BITS);
+    return reinterpret_cast<void *>(x >> SIZE_BITS);
   }
 
-  uint32_t size() const { return (uint16_t)x; }
-  bool operator==(const StrRef& other) const {
+  uint32_t size() const { return (uint16_t) x; }
+
+  bool operator==(const StrRef &other) const {
     return size() == other.size() && memcmp(ptr(), other.ptr(), size());
   }
 
-  bool isNull() const { return x==0; }
+  bool isNull() const { return x == 0; }
 
   uint64_t hashcode() const {
     return Hash::hash(ptr(), size());
   }
 
   // compare to raw bytes
-  bool equals(const void* data, int len) const {
-    return size() == len && memcmp(ptr(), data, (size_t)len)==0;
+  bool equals(const void *data, int len) const {
+    return size() == len && memcmp(ptr(), data, (size_t) len) == 0;
   }
 
-  int compare(const StrRef& other) const {
+  int compare(const StrRef &other) const {
     auto sz1 = size();
     auto sz2 = other.size();
 
-    int cmp = memcmp(ptr(), other.ptr(), (size_t)std::min(sz1, sz2));
-    return cmp != 0 ? cmp : ((int)sz1 - (int)sz2); // IMPORTANT: cast sizes to signed values so we can get negatives
+    int cmp = memcmp(ptr(), other.ptr(), (size_t) std::min(sz1, sz2));
+    return cmp != 0 ? cmp : ((int) sz1 - (int) sz2); // IMPORTANT: cast sizes to signed values so we can get negatives
   }
 
-  bool operator<(const StrRef& other) const {
+  bool operator<(const StrRef &other) const {
     return compare(other) < 0;
   }
 
 
-  friend std::ostream& operator<< (std::ostream &out, const StrRef &term) {
+  friend std::ostream &operator<<(std::ostream &out, const StrRef &term) {
     if (term.isNull()) {
       out << "(null)";
     } else {
-      out.write((const char *)term.ptr() , term.size());
+      out.write((const char *) term.ptr(), term.size());
     }
     return out;
   }
 };
 
 
-
 // A term has a byte of size (0-255) followed directly by the data.
 class PackedTerm {
-  char* ptr_;
+  char *ptr_;
 public:
   static uint32_t getMaxSize(uint32_t size) { return size + 1; }
+
   static uint32_t getExactSize(uint32_t size) { return size + 1; }
 
   // returns the number of bytes written to the target... either sz+1 or sz+2
-  inline static uint32_t write(char* target, const void* data, uint32_t sz) {
+  inline static uint32_t write(char *target, const void *data, uint32_t sz) {
     target[0] = sz;
-    memcpy(target+1, data, (size_t)sz);
+    memcpy(target + 1, data, (size_t) sz);
     return sz + 1;
   }
 
-  inline static char* write(MemPool& targetPool, const void* data, uint32_t sz) {
+  inline static char *write(MemPool &targetPool, const void *data, uint32_t sz) {
     auto totalSz = getExactSize(sz);
     auto target = targetPool.allocate(totalSz);
     write(target, data, sz);
@@ -154,59 +158,61 @@ public:
 
   // TODO: keep this a trivial class that doesn't initialize itself?
   PackedTerm() {}
-  PackedTerm(MemPool& target, const void* data, uint32_t len) {
+
+  PackedTerm(MemPool &target, const void *data, uint32_t len) {
     ptr_ = write(target, data, len);
   }
 
   // expert: should already point to an instance of this type
-  void init(void* ptr, uint32_t size) {
-    ptr_ = reinterpret_cast<char*>(ptr);
+  void init(void *ptr, uint32_t size) {
+    ptr_ = reinterpret_cast<char *>(ptr);
   }
 
   // expert: should already point to an instance of this type
   // TODO: make this somehow harder to accidentally use!
-  explicit PackedTerm(void* ptr) : ptr_(reinterpret_cast<char*>(ptr)) { }
-  explicit PackedTerm(void* ptr, uint32_t size) : ptr_(reinterpret_cast<char*>(ptr)) { }
+  explicit PackedTerm(void *ptr) : ptr_(reinterpret_cast<char *>(ptr)) {}
+
+  explicit PackedTerm(void *ptr, uint32_t size) : ptr_(reinterpret_cast<char *>(ptr)) {}
 
   // expert: a pointer to the start of the data... not to the first byte of the string!
-  void* ptr() { return (void*)ptr_; }
+  void *ptr() { return (void *) ptr_; }
 
   // the number of bytes in the value, not including the bytes to encode the length
   uint32_t size() const noexcept {
-    return *(unsigned char*)ptr_;
+    return *(unsigned char *) ptr_;
   }
 
-  char* data() const noexcept {
-    return ptr_+1;
+  char *data() const noexcept {
+    return ptr_ + 1;
   }
 
   // returns the unpacked term as a pair of pointer,size
-  std::tuple<const char*, uint32_t> unpack() const {
-    return {ptr_+1, size()};
+  std::tuple<const char *, uint32_t> unpack() const {
+    return {ptr_ + 1, size()};
   };
 
   // expert: Up to you not to misuse this.
-  void setSize(uint32_t sz) { ptr_[0] = (char)sz; }
+  void setSize(uint32_t sz) { ptr_[0] = (char) sz; }
 
 // TODO: do this in a more standard way
   uint64_t hashcode() const {
-    return Hash::hash(ptr_+1, size());
+    return Hash::hash(ptr_ + 1, size());
   }
 
   bool isNull() const { return ptr_ == nullptr; }
 
   // compare to raw bytes
-  bool equals(const void* ptr, int len) const {
-    auto sz =size();
-    return sz == len && memcmp(ptr_+1, ptr, (size_t)len)==0;
+  bool equals(const void *ptr, int len) const {
+    auto sz = size();
+    return sz == len && memcmp(ptr_ + 1, ptr, (size_t) len) == 0;
   }
 
   // size of both the length and the data
   uint32_t memorySize() const {
-    return size()+1;
+    return size() + 1;
   }
 
-  bool operator==(const PackedTerm& other) const {
+  bool operator==(const PackedTerm &other) const {
     auto sz1 = size();
     auto sz2 = other.size();
 
@@ -215,88 +221,66 @@ public:
     }
 
     // TODO: make sure memcmp is faster/equal to a loop for likely small strings
-    return memcmp(ptr_+1, other.ptr_+1, sz1) == 0;
+    return memcmp(ptr_ + 1, other.ptr_ + 1, sz1) == 0;
   }
 
-  friend std::ostream& operator<< (std::ostream &out, const PackedTerm &term) {
+  friend std::ostream &operator<<(std::ostream &out, const PackedTerm &term) {
     if (term.isNull()) {
       out << "(null)";
     } else {
       // TODO: perhaps escape unprintable bytes?
-      auto [p,sz] = term.unpack();
+      auto[p, sz] = term.unpack();
       out.write(p, sz);
     }
     return out;
   }
 
-  explicit operator std::string_view() const { return std::string_view(data(), size());}
+  explicit operator std::string_view() const { return std::string_view(data(), size()); }
 };
 
 
-inline int operator<=>(const PackedTerm& a, const PackedTerm& b) {
-  int datacmp = memcmp(a.data(), b.data(), std::min(a.size(),b.size()));
-  return (datacmp != 0) ? datacmp : ((int)a.size() - (int)b.size());
+inline int operator<=>(const PackedTerm &a, const PackedTerm &b) {
+  int datacmp = memcmp(a.data(), b.data(), std::min(a.size(), b.size()));
+  return (datacmp != 0) ? datacmp : ((int) a.size() - (int) b.size());
 }
 
-template <typename StringType> // StringType just needs size() and data().... which std::string and std::string_view both have.
-inline bool operator==(const PackedTerm& p, const StringType& s) {
-  auto [data,sz] = p.unpack();
-  if (sz != (int)s.size()) return false;
+template<typename StringType>
+// StringType just needs size() and data().... which std::string and std::string_view both have.
+inline bool operator==(const PackedTerm &p, const StringType &s) {
+  auto[data, sz] = p.unpack();
+  if (sz != (int) s.size()) return false;
   return memcmp(data, s.data(), sz) == 0;
 }
 
-template <typename StringType>
-inline bool operator==(const StringType& s, const PackedTerm& p) {
-  return p==s;
+template<typename StringType>
+inline bool operator==(const StringType &s, const PackedTerm &p) {
+  return p == s;
 }
 
-template <typename StringType>
-inline int operator<=>(const PackedTerm& p, const StringType& s) {
-  auto [data,sz] = p.unpack();
-  int datacmp = memcmp(data, s.data(), std::min((int)sz,(int)s.size()));
-  return (datacmp != 0) ? datacmp : ((int)sz - (int)s.size());
+template<typename StringType>
+inline int operator<=>(const PackedTerm &p, const StringType &s) {
+  auto[data, sz] = p.unpack();
+  int datacmp = memcmp(data, s.data(), std::min((int) sz, (int) s.size()));
+  return (datacmp != 0) ? datacmp : ((int) sz - (int) s.size());
 }
 
 // I needed to explicitly add support for const char*, otherwise the support for both string and string_view
 // above causes ambiguity.  NOTE: these are not optimized, as "s" is scanned twice if the lengths are equal.
 // The current expected usage is only in test code though.
-inline int operator<=>(const PackedTerm& p, const char* s) {
-  auto [data,sz] = p.unpack();
+inline int operator<=>(const PackedTerm &p, const char *s) {
+  auto[data, sz] = p.unpack();
   auto slen = strlen(s);
-  int datacmp = memcmp(data, s, std::min((int)sz,(int)slen));
-  return (datacmp != 0) ? datacmp : ((int)sz - (int)slen);
+  int datacmp = memcmp(data, s, std::min((int) sz, (int) slen));
+  return (datacmp != 0) ? datacmp : ((int) sz - (int) slen);
 }
 
-inline bool operator==(const PackedTerm& p, const char* s) {
-  auto [data,sz] = p.unpack();
+inline bool operator==(const PackedTerm &p, const char *s) {
+  auto[data, sz] = p.unpack();
   int slen = strlen(s);
-  if (sz !=slen) return false;
+  if (sz != slen) return false;
   return memcmp(data, s, sz) == 0;
 }
 
-
-namespace std {
-template<>
-struct hash<PackedTerm> {
-  typedef PackedTerm argument_type;
-  typedef std::size_t result_type;
-
-  result_type operator()(const argument_type &val) const {
-    return val.hashcode();
-  }
-};
-}
-namespace std {
-template<>
-struct hash<StrRef> {
-  typedef StrRef argument_type;
-  typedef std::size_t result_type;
-
-  result_type operator()(const argument_type &val) const {
-    return val.hashcode();
-  }
-};
-}
 
 //
 // TODO: experimental and in progress string_view with short string optimization (can store strings of length 15 inline)
@@ -318,7 +302,7 @@ class sso_stringview {
     char local[sizeof(remote)];
   } u;
 
-  static_assert(sizeof(u)<=16);
+  static_assert(sizeof(u) <= 16);
 
   // Look at this byte to find the local size plus 1 (to enable storing a zero lengh string)
   // We could also support the idea of a null value (if remote.ptr is 0)
@@ -334,12 +318,12 @@ public:
     return u.local[size_idx] ? u.local[size_idx] + 1 : u.remote.size;
   }
 
-  const char* data() const {
+  const char *data() const {
     return isLocal() ? u.local : u.remote.ptr;
   }
 
   // returns the pointer,size pair
-  std::tuple<const char*, uint32_t> unpack() const {
+  std::tuple<const char *, uint32_t> unpack() const {
     if (u.local[size_idx]) {
       return {u.local, u.local[size_idx] + 1};
     } else {
@@ -347,26 +331,27 @@ public:
     }
   };
 
-  bool operator==(const sso_stringview& other) const {
+  bool operator==(const sso_stringview &other) const {
     // code if we had 64 bit size field
     // if (u.remote.size != other.u.remote.size) return false;
 
     // compare both size and hash code at once.
-    if ( *(reinterpret_cast<const uint64_t*>(this)) != *(reinterpret_cast<const uint64_t*>(&other)) ) return false;
+    if (*(reinterpret_cast<const uint64_t *>(this)) != *(reinterpret_cast<const uint64_t *>(&other))) return false;
 
     // at this point, either remote sizes match, or first 8 bytes of local sizes match.
-    if (u.remote.ptr == other.u.remote.ptr) return true;  // if true, either pointing at same remote string, or all bytes match of local strings.
+    if (u.remote.ptr == other.u.remote.ptr)
+      return true;  // if true, either pointing at same remote string, or all bytes match of local strings.
     // only way for strings to match now is if they are both remote.
     if (isLocal() || other.isLocal()) return false;
     // if one of the pointers was null, then the size would not have matched (i.e. no null check needed)
     return memcmp(u.remote.ptr, other.u.remote.ptr, u.remote.size) == 0;
   }
 
-  int operator<=>(const sso_stringview& other) const {
-    auto [a, alen] = this->unpack();
-    auto [b, blen] = other.unpack();
+  int operator<=>(const sso_stringview &other) const {
+    auto[a, alen] = this->unpack();
+    auto[b, blen] = other.unpack();
     int datacmp = memcmp(a, b, std::min(alen, blen));
-    return (datacmp != 0) ? datacmp : ((int)alen - (int)blen);
+    return (datacmp != 0) ? datacmp : ((int) alen - (int) blen);
   }
 
 
@@ -377,3 +362,29 @@ public:
 
 // Another string alternative could inline up to 7 byte strings in the pointer
 
+} // end namespace
+
+
+namespace std {
+template<>
+struct hash<solux::PackedTerm> {
+  typedef solux::PackedTerm argument_type;
+  typedef std::size_t result_type;
+
+  result_type operator()(const argument_type &val) const {
+    return val.hashcode();
+  }
+};
+}
+
+namespace std {
+template<>
+struct hash<solux::StrRef> {
+  typedef solux::StrRef argument_type;
+  typedef std::size_t result_type;
+
+  result_type operator()(const argument_type &val) const {
+    return val.hashcode();
+  }
+};
+}

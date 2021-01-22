@@ -5,6 +5,7 @@
 
 #include <memory>
 
+namespace solux {
 
 // TODO: where do versions live??? (say we deleted a field... or even changed a field)
 // Version based on the table... or based on the DB?
@@ -43,11 +44,11 @@ class SegFieldIndexed;
 // before indexing any data.
 class FieldType {
 public:
-  static constexpr int INDEX_DOCS                         = (1<<0);
-  static constexpr int INDEX_DOCS_AND_FREQS               = INDEX_DOCS | (1<<1);
-  static constexpr int INDEX_DOCS_AND_FREQS_AND_POSITIONS = INDEX_DOCS_AND_FREQS | (1<<2);
-  static constexpr int NUM_TOKENS_APPROX                  = (1<<3);
-  static constexpr int NUM_TOKENS_EXACT                   = (1<<4);
+  static constexpr int INDEX_DOCS = (1 << 0);
+  static constexpr int INDEX_DOCS_AND_FREQS = INDEX_DOCS | (1 << 1);
+  static constexpr int INDEX_DOCS_AND_FREQS_AND_POSITIONS = INDEX_DOCS_AND_FREQS | (1 << 2);
+  static constexpr int NUM_TOKENS_APPROX = (1 << 3);
+  static constexpr int NUM_TOKENS_EXACT = (1 << 4);
 
   // TODO: combine FIELD_LENGTHS with exists... i.e. use "norms" for exists
   // But what about the reverse... the full set of fields that were in a doc?
@@ -76,12 +77,15 @@ public:
 
   virtual ~FieldType() = default;
 
-  const std::string& name() { return name_; }
+  const std::string &name() { return name_; }
 
   // TODO: check standard on cast of int to bool (check generated code too)
   bool indexed() { return (bool) (flags_ & INDEX_DOCS_AND_FREQS_AND_POSITIONS); }
+
   bool hasFreqs() { return (bool) (flags_ & INDEX_DOCS_AND_FREQS); }
+
   bool hasPositions() { return (bool) (flags_ & INDEX_DOCS_AND_FREQS_AND_POSITIONS); }
+
   bool hasNumTokens() { return (bool) (flags_ & (NUM_TOKENS_APPROX | NUM_TOKENS_EXACT)); }
 
   bool multiValued() { return false; }
@@ -90,9 +94,9 @@ public:
   // For example, a dynamic field w/ a big dict for analysis, or
   // even the StopWord list?  dynamic fields will have a template...
   // perhaps that is the answer!
-  virtual Analyzer& getAnalyzer() { return *(Analyzer*)0; } // nocommit TODO
+  virtual Analyzer &getAnalyzer() { return *(Analyzer *) 0; } // nocommit TODO
 
-  virtual SegFieldIndexed* createSegFieldIndexed(MemPool& pool);
+  virtual SegFieldIndexed *createSegFieldIndexed(MemPool &pool);
 };
 
 
@@ -104,7 +108,6 @@ enum IndexOptions {
   DOCS_AND_FREQS,  // Indexes the documents as well as how many times each term appeared in the field for the document
   DOCS_AND_FREQS_AND_POSITIONS   // Default for full-text indexing.  Positions allow things like phrase matching
 };
-
 
 
 class Analyzer;
@@ -119,10 +122,11 @@ public:
   IndexOptions indexOptions;
 
   bool hasNorms() { return true; }
+
   bool isMultiValued() { return false; }
 
 
-  Analyzer& getAnalyzer() { return *(Analyzer*)0; } // nocommit
+  Analyzer &getAnalyzer() { return *(Analyzer *) 0; } // nocommit
 
 
 };
@@ -194,7 +198,7 @@ class DateFieldInfo : public FieldInfo {
 class FieldValue {
 public:
   // what if the type of a field changes?  Maybe the Inverter should be the one to do the lookup, etc?  Make it a weak pointer?  Make it an implementation detail under the covers?
-  FieldInfo* fieldInfo;
+  FieldInfo *fieldInfo;
 
   virtual ~FieldValue() {}
 
@@ -214,11 +218,12 @@ class StrFieldValue : FieldValue {
   std::string val;
 
 
-
 };
 
 
 class Document {
 public:
-  std::vector< std::unique_ptr<FieldValue> > fields;
+  std::vector<std::unique_ptr<FieldValue> > fields;
 };
+
+} // end namespace

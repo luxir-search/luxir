@@ -1,7 +1,7 @@
 #pragma once
 #include <chrono>
 #include "benchmark/benchmark.h"
-
+#include "test/SoluxTest.h"
 
 namespace solux {
 

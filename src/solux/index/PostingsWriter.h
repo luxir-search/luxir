@@ -334,9 +334,16 @@ public:
     termOutput.writeVlong(locOfDocsForTermBlock - fieldInfo.docsLoc);
     termOutput.writeVlong(locOfPositionsForTermBlock - fieldInfo.posLoc);
 
+    int nTerms = termList.size();
+
+    // now write hashes of the terms
+    for (int i=0; i<nTerms; i++) {
+      auto term = termList[i];
+      termOutput.write((char)term.hashcode());
+    }
+
     // now write the block:
     int32_t pulsedIdx = 0;  // index of next pulsed data
-    int nTerms = termList.size();
     for (int i=0; i<nTerms; i++) {
       auto term = termList[i];
 

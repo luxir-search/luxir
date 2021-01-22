@@ -2,6 +2,7 @@
 #include "solux/util/MemPool.h"
 
 using namespace std;
+using namespace solux;
 
 class MemPoolTest : public solux::SoluxTest {
 protected:

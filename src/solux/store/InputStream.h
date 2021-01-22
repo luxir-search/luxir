@@ -2,20 +2,24 @@
 
 #include "solux/util/StrRef.h"
 
+namespace solux {
 
 class InputStream {
-  const char* pos = nullptr;  // these initializations just to suppress maybe-uninitialized warnings with -O3
-  const char* start = nullptr;
-  const char* end = nullptr;
+  const char *pos = nullptr;  // these initializations just to suppress maybe-uninitialized warnings with -O3
+  const char *start = nullptr;
+  const char *end = nullptr;
   // Future?
   // size_t offset; // the position of "start" in the file
   // File& source;
 public:
   InputStream() = default;
-  InputStream(const char* start, const char* end) : pos(start), start(start), end(end) {}
 
-  const char* ptr() const noexcept { return pos; }
+  InputStream(const char *start, const char *end) : pos(start), start(start), end(end) {}
+
+  const char *ptr() const noexcept { return pos; }
+
   int64_t offset() const noexcept { return pos - start; }
+
   int64_t left() const noexcept { return end - pos; }  // how much data is left to read
 
   void seek(int64_t offset) {
@@ -38,14 +42,14 @@ public:
     return *pos++;
   }
 
-  void read(void* dest, int32_t len) {
+  void read(void *dest, int32_t len) {
     memcpy(dest, pos, len);
     pos += len;
-    assert(pos<=end);
+    assert(pos <= end);
   }
 
 
-  inline static uint32_t readVint(const char*& pos, const char* end) {
+  inline static uint32_t readVint(const char *&pos, const char *end) {
     char b = *pos++;
     uint32_t val = b & 0x7f;
     for (int shift = 7; (b & 0x80) != 0; shift += 7) {
@@ -56,7 +60,7 @@ public:
     return val;
   }
 
-  inline static uint64_t readVlong(const char*& pos, const char* end) {
+  inline static uint64_t readVlong(const char *&pos, const char *end) {
     char b = *pos++;
     uint32_t val = b & 0x7f;
     for (int shift = 7; (b & 0x80) != 0; shift += 7) {
@@ -67,7 +71,7 @@ public:
     return val;
   }
 
-  inline static uint32_t readStrLen(const char*& pos, const char* end) {
+  inline static uint32_t readStrLen(const char *&pos, const char *end) {
     return readVint(pos, end);
   }
 
@@ -108,20 +112,20 @@ public:
   // could either be split or later invalidated by more reads on the InputStream.  This won't
   // happen for memory-mapped files or for RAMDir.
   PackedTerm readPackedTerm() {
-    PackedTerm term(const_cast<char*>(pos));
+    PackedTerm term(const_cast<char *>(pos));
     pos += term.memorySize();
     assert(pos <= end);
     return term;
   }
 
   PackedTerm readPackedTerm(int64_t location) {
-    return PackedTerm(const_cast<char*>(start+location));
+    return PackedTerm(const_cast<char *>(start + location));
   }
 
-  friend std::ostream& operator<< (std::ostream &out, const InputStream &is) {
+  friend std::ostream &operator<<(std::ostream &out, const InputStream &is) {
     // TODO: print out some of the bytes before and after the current position?
-    out << "{sz=" << (is.end-is.start) << " left=" << is.left()
-        << " start=" << (void*)is.start << " pos=" << (void*)is.pos << " end=" << (void*)is.end
+    out << "{sz=" << (is.end - is.start) << " left=" << is.left()
+        << " start=" << (void *) is.start << " pos=" << (void *) is.pos << " end=" << (void *) is.end
         << '}';
     return out;
   }
@@ -129,3 +133,4 @@ public:
 
 };
 
+} // end namespace

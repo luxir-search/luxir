@@ -3,6 +3,8 @@
 #include "solux/util/MemPool.h"
 #include "solux/util/StrRef.h"
 
+namespace solux {
+
 // TODO: look at rapidjson to figure out the lowest impedance mismatch to go from json->document?
 // TODO: try something like an existing dense hash map in comparison?
 // TODO: store T (SegmentTerm for instance) right next to the term in the MemPool!
@@ -15,7 +17,7 @@
 // Need to compare against something better like abseil now... perhaps figure out how to inherit from abseil or folly's map
 // Or make Str constructors take a BBPool so we can use try_emplace?
 
-template <class T>
+template<class T>
 class TermHash {
   void newTable(unsigned newSize);
 
@@ -23,8 +25,8 @@ public:
   typedef T value_type;
   typedef std::pair<TermRef, T> composite_type;
 
-  composite_type * table_;
-  MemPool& pool_;
+  composite_type *table_;
+  MemPool &pool_;
   int elements_ = 0;   // how many slots used
   int capacity_;       // how many slots may be used
   int mask_;           // mask for power-of-two hash
@@ -38,10 +40,10 @@ public:
 
   int size() { return elements_; }
 
-  T& lookup(const char* ptr, int sz) {
+  T &lookup(const char *ptr, int sz) {
     int hash = (int) Hash::hash(ptr, sz);
     int slot = hash;
-    for (; ;) {
+    for (;;) {
       slot = slot & mask_;
       auto v = table_ + slot;
       if (v->first.isNull() || v->first.equals(ptr, sz)) {
@@ -56,15 +58,15 @@ public:
   // Returns a pointer to the current slot or adds a new slot.
   // A Rehash will move the slot, so do not use the pointer after other TermHash operations.
   // TODO: should we return V& instead like []
-  composite_type& lookupOrAdd(const char* ptr, int sz) {
+  composite_type &lookupOrAdd(const char *ptr, int sz) {
     if (elements_ >= capacity_) {
       rehash();
     }
     int hash = (int) Hash::hash(ptr, sz);
     int slot = hash;
-    for (; ;) {
+    for (;;) {
       slot = slot & mask_;
-      composite_type& v = table_[slot];
+      composite_type &v = table_[slot];
       if (v.first.isNull()) {
         elements_++;
         // unsigned char* dest = pool_.writeStr((const unsigned char*)ptr, sz);
@@ -80,16 +82,16 @@ public:
     }
   }
 
-  template <class CreateFunctor>
-  composite_type& lookupOrAdd(const char* ptr, int sz, CreateFunctor createFunctor) {
+  template<class CreateFunctor>
+  composite_type &lookupOrAdd(const char *ptr, int sz, CreateFunctor createFunctor) {
     if (elements_ >= capacity_) {
       rehash();
     }
     int hash = (int) Hash::hash(ptr, sz);
     int slot = hash;
-    for (; ;) {
+    for (;;) {
       slot = slot & mask_;
-      composite_type& v = table_[slot];
+      composite_type &v = table_[slot];
       if (v.first.isNull()) {
         elements_++;
         // unsigned char* dest = pool_.writeStr((const unsigned char*)ptr, sz);
@@ -104,11 +106,11 @@ public:
     }
   }
 
-  T& get(const char* ptr, int sz) {
+  T &get(const char *ptr, int sz) {
     return lookupOrAdd(ptr, sz).second;
   }
 
-  void emplace(const char* ptr, int sz, const T&& v) {
+  void emplace(const char *ptr, int sz, const T &&v) {
     // lookupOrAdd(ptr, sz).second = v;
     lookupOrAdd(ptr, sz).second = std::move(v);
   }
@@ -118,11 +120,12 @@ public:
 
 };
 
-template <class T> void TermHash<T>::newTable(unsigned newSize) {
-  assert(newSize>0 && isPowerOfTwo(newSize));
+template<class T>
+void TermHash<T>::newTable(unsigned newSize) {
+  assert(newSize > 0 && isPowerOfTwo(newSize));
 
   // this was often twice as fast in some cases - zeroing is not as well optimized it seems
-  table_ = reinterpret_cast<TermHash<T>::composite_type *>( new char[newSize * sizeof(TermHash<T>::composite_type)]() );
+  table_ = reinterpret_cast<TermHash<T>::composite_type *>( new char[newSize * sizeof(TermHash<T>::composite_type)]());
   capacity_ = newSize - (newSize >> 2);  // .75 load factor
   // capacity_ = newSize - (newSize >> 1);  // .5 load factor
   // capacity_ = newSize - (newSize >> 2) - (newSize >> 3);  // .625 load factor
@@ -132,19 +135,20 @@ template <class T> void TermHash<T>::newTable(unsigned newSize) {
 }
 
 
-template <class T> void TermHash<T>::rehash() {
+template<class T>
+void TermHash<T>::rehash() {
   auto oldTable = table_;
   auto oldTableSize = tableSize_;
   newTable(tableSize_ << 1);
 
-  for (auto i = 0; i<oldTableSize; i++) {
+  for (auto i = 0; i < oldTableSize; i++) {
     auto oldslot = oldTable + i;
     if (!oldslot->first.isNull()) {
-      int hash = static_cast<int>( oldslot->first.hashcode() );  // TODO: store this?
+      int hash = static_cast<int>( oldslot->first.hashcode());  // TODO: store this?
       int slot = hash;
       for (;;) {
         slot = slot & mask_;
-        composite_type * newslot = table_ + slot;
+        composite_type *newslot = table_ + slot;
         if (newslot->first.isNull()) {
 //          *newslot = *oldslot;  // TODO: try memcpy to see if it's more optimized
           *newslot = std::move(*oldslot);
@@ -155,10 +159,12 @@ template <class T> void TermHash<T>::rehash() {
     }
   }
 
-  delete [] reinterpret_cast<char*>(oldTable);
+  delete[] reinterpret_cast<char *>(oldTable);
 }
 
-template <class T> TermHash<T>::~TermHash() {
-  delete [] reinterpret_cast<char*>(table_);
+template<class T>
+TermHash<T>::~TermHash() {
+  delete[] reinterpret_cast<char *>(table_);
 }
 
+} // end namespace

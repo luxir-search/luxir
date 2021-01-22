@@ -4,24 +4,25 @@
 #include <string_view>
 #include "OutputStream.h"
 
+namespace solux {
 
 class Directory {
 public:
   // TODO: add a prefix option?
   // appends a list of names to the referenced vector
-  virtual void listFiles(std::vector<std::string>& target) = 0;
+  virtual void listFiles(std::vector<std::string> &target) = 0;
 
-  virtual std::shared_ptr<InputFile> openFile(const std::string& name) = 0;
+  virtual std::shared_ptr<InputFile> openFile(const std::string &name) = 0;
 
-  virtual std::unique_ptr<File> createFile(const std::string& name) = 0;
+  virtual std::unique_ptr<File> createFile(const std::string &name) = 0;
 
   // Returns true if file was found and deleted, false if not found.
-  virtual bool deleteFile(const std::string& name) = 0;
+  virtual bool deleteFile(const std::string &name) = 0;
 
   // Make the file readable to others through the Directory.  Putting this on the Directory class
   // gives more flexibility in implementation without having every File have to point back to it's
   // owning Directory.
-  virtual void finishFile(File& file) = 0;
+  virtual void finishFile(File &file) = 0;
 };
 
 // TODO: currently not thread safe
@@ -41,11 +42,11 @@ private:
   std::vector<entry_type> files;
 
   // returns <found,iterator> pair... iterator is the element if found==true or the insertion point if found==false.
-  std::pair<bool, iterator_type> find(const std::string& name) {
+  std::pair<bool, iterator_type> find(const std::string &name) {
     auto iter = std::lower_bound(files.begin(), files.end(), name,
-                                       [&](const entry_type & x, const std::string& key) { return x.first < key; }
+                                 [&](const entry_type &x, const std::string &key) { return x.first < key; }
     );
-    return {!(iter == files.end() || iter->first !=  name), iter};
+    return {!(iter == files.end() || iter->first != name), iter};
   }
 
 public:
@@ -58,8 +59,8 @@ public:
     }
   }
 
-  std::shared_ptr<InputFile> openFile(const std::string& name) override {
-    auto [found, iter] = find(name);
+  std::shared_ptr<InputFile> openFile(const std::string &name) override {
+    auto[found, iter] = find(name);
     if (found) {
       return iter->second;
     } else {
@@ -67,8 +68,8 @@ public:
     }
   }
 
-  bool deleteFile(const std::string& name) override {
-    auto [found, iter] = find(name);
+  bool deleteFile(const std::string &name) override {
+    auto[found, iter] = find(name);
     if (found) {
       files.erase(iter);
       return true;
@@ -77,12 +78,12 @@ public:
     }
   }
 
-  std::unique_ptr<File> createFile(const std::string& name) override {
+  std::unique_ptr<File> createFile(const std::string &name) override {
     return std::make_unique<OutputFileType>(name);
   }
 
-  void finishFile(File& file) override {
-    auto& ramFile = dynamic_cast<OutputFileType&>(file);
+  void finishFile(File &file) override {
+    auto &ramFile = dynamic_cast<OutputFileType &>(file);
     auto sz = ramFile.size();
     // don't use make_unique as it uselessly zeroes memory first.
     std::unique_ptr<char[]> singleBuffer(new char[sz]);
@@ -90,7 +91,8 @@ public:
     auto inputFile = std::make_shared<RAMInputFile>(std::move(singleBuffer), sz);
 
     // See if new file name is greater than all others produced (this is common by design)
-    if (files.empty() || files.back().first < file.name()) {  // TODO: what is clang-tidy's problem with this line??? It suggests replacing "<" with nullptr !??
+    if (files.empty() || files.back().first <
+                         file.name()) {  // TODO: what is clang-tidy's problem with this line??? It suggests replacing "<" with nullptr !??
       files.emplace_back(file.name(), std::move(inputFile));
     } else {
       auto[found, iter] = find(file.name());
@@ -120,3 +122,5 @@ public:
 
 // That would mess up the option to sync all files and then write a segments file, but many file systems don't need that.
 // We should have a flexible enough container format to be able to include or pull out whatever files we want.
+
+} // end namespace
