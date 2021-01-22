@@ -120,6 +120,7 @@ static void BM_TermFind(benchmark::State& state, uint64_t maxId, int hitPercent)
   // std::cout << "fp=" << fp << " fingerprint=" << fingerprint << " hits=" << hits << " sumdf=" << sumdf << " sumdoc=" << sumdoc << std::endl;
   state.counters["fp"] = fingerprint % 100000;  // hmmm, how to get the full resolution on this?  Take mod to try and see least significant digits.
   state.counters["terms"] = nTerms;
+  state.counters["isize"] = seg.getIndexSize();
   // state.counters["hits"] = hits; // just a check to see if things are working correctly
 }
 

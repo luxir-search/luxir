@@ -325,6 +325,7 @@ public:
   // That could also handle differences between block and doc
 };
 
+// TODO: templatize to be able to instrument, implement checkindex, etc...
 // TODO: investigate writing a version of this based on continuations and see how it performs?
 // TODO: some of this internal state could be removed... we only need some of it in the constructor?
 class DocsEnum {

@@ -34,6 +34,7 @@ public:
   Rng rng_snapshot;
 
   uint64_t fingerprint = 0;  // sum of all docs and positions calculated when writing
+  uint64_t indexSize = 0;
 
   static void makeTerm(int termNum, std::string& target) {
     target.resize(12);
@@ -43,6 +44,10 @@ public:
 
 
   SegmentTest() {
+  }
+
+  uint64_t getIndexSize() {
+    return indexSize;
   }
 
   void initWriter() {
@@ -71,6 +76,8 @@ public:
     r = rng_snapshot;
     // re-init secondary rng off of first
     r2.init(r());
+
+    indexSize = tindexFile->size() +termFile->size() + docFile->size() + posFile->size();
   }
 
   uint32_t getPositionDelta(int nPositions) {
