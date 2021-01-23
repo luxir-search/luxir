@@ -28,7 +28,7 @@ class DocsEnum;
 // Some stuff that the postings reader and writer need to share.
 class Postings {
 public:
-  static constexpr int32_t TERMS_BLOCK_SIZE = 128;
+  static constexpr int32_t TERMS_BLOCK_SIZE = 32;
   static constexpr int32_t POSITIONS_BLOCK_SIZE = 128;
   static constexpr int32_t DOCS_BLOCK_SIZE = 128;
 
@@ -235,7 +235,7 @@ public:
       prefixLen = termsIS.readByte();
     }
     if (suffixLen == 31) {
-      suffixLen = termsIS.readVint() + 32;
+      suffixLen = termsIS.readByte();
     }
 
     auto [data, len] = currTerm.unpack();

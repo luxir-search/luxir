@@ -362,8 +362,10 @@ public:
 
         // encode shared prefix length + suffix length in a single byte.
         // 3 bits of prefix length starting at 0 (7 means this is followed by another byte encoding the prefix length)
-        // 5 bits of suffix length starting at 1 (32 means this is followed by another vInt encoding the suffix length (and add 32)
-        // we start at 1 for the suffix since that is the min suffix length (otherwise it would be the same term)
+        // ORIG FORMAT to support lengths to 32K: 5 bits of suffix length starting at 1 (32 means this is followed by
+        // another vInt encoding the suffix length (and add 32) we start at 1 for the suffix since that is the min
+        // suffix length (otherwise it would be the same term)
+        // NEW: term lengths are limited to one byte, so 32 means just read the second byte for the exact suffix len.
         auto suffixLen = tlen - prefixLen;
         auto prefCode = (prefixLen < 7) ? (prefixLen << 5u) : (7u << 5u);
         auto suffCode = (suffixLen < 32) ? (suffixLen - 1) : (32 - 1);
@@ -372,7 +374,8 @@ public:
           termOutput.write((char) prefixLen);
         }
         if (suffixLen >= 32) {
-          termOutput.writeVint(suffixLen - 32);
+          // termOutput.writeVint(suffixLen - 32);
+          termOutput.write((char)suffixLen);
         }
 
         // now write the suffix of the current term
