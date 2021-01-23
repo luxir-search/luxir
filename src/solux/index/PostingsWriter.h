@@ -376,6 +376,10 @@ public:
 
         // now write the suffix of the current term
         termOutput.write(tdata + prefixLen, suffixLen);
+
+        // update what we are prefix encoding relative to
+        refdata = tdata;
+        reflen = tlen;
       }
 
       // Write the term metadata that belongs in the term dictionary.

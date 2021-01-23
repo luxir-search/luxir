@@ -85,10 +85,18 @@ static void BM_mix(benchmark::State& state) {
 }
 
 // Only turn these on when doing random perf testing.
-#ifdef DISABLED_BENCHMARKS
+#ifdef RUN_DISABLED_BENCHMARKS
 // Register the function as a benchmark
 BENCHMARK(BM_mersenne_twister);
 BENCHMARK(BM_RomuTrio);
 BENCHMARK(BM_SplitMix64);
 BENCHMARK(BM_mix);
+#else
+inline void hackety_hack() {
+  solux::unused(hackety_hack);
+  solux::unused(BM_mersenne_twister);  // get rid of "unused" warnings
+  solux::unused(BM_RomuTrio);
+  solux::unused(BM_SplitMix64);
+  solux::unused(BM_mix);
+}
 #endif
