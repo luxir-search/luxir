@@ -78,6 +78,9 @@ public:
     r2.init(r());
 
     indexSize = tindexFile->size() +termFile->size() + docFile->size() + posFile->size();
+
+    // TODO: refactor this somewhere more useful.  Directory?
+    // std::cout << "INDEX SIZE tif=" << tindexFile->size() << " tf=" << termFile->size() << " df=" << docFile->size() << " pf=" << posFile->size() << std::endl;
   }
 
   uint32_t getPositionDelta(int nPositions) {

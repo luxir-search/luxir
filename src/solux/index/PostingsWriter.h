@@ -351,13 +351,14 @@ public:
         // If not the first term, find common prefix with previous term
         auto[tdata, tlen] = term.unpack();
         int minsize = std::min(tlen, reflen);
-        int mismatchPos = 0;
+        int prefixLen = 0;
         // Is there a compiler intrinsic for this?  Or a SIMD version?  Seems like a SIMD subtract followed by find-first-nonzero would do it.
         // Even w/o simd, if registers are in big endian (see movbe instr), then subtract, find high bit, divide to convert to byte.
-        while (mismatchPos < minsize && tdata[mismatchPos] == refdata[mismatchPos]) {
-          mismatchPos++;
+        while (prefixLen < minsize && tdata[prefixLen] == refdata[prefixLen]) {
+          prefixLen++;
         }
-        auto prefixLen = std::min(mismatchPos,0x0ff);  // support a maximum prefix sharing of 255 to simplify coding.
+        // No longer needed. PackedTerm is now limited to 0xff length
+        // auto prefixLen = std::min(prefixLen,0x0ff);  // support a maximum prefix sharing of 255 to simplify coding.
 
         // encode shared prefix length + suffix length in a single byte.
         // 3 bits of prefix length starting at 0 (7 means this is followed by another byte encoding the prefix length)

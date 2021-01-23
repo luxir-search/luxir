@@ -239,6 +239,14 @@ public:
     }
 
     auto [data, len] = currTerm.unpack();
+    // TODO: things to try:
+    // - an explicit loop vs memcpy
+    // - an explict loop of 8 bytes at a time... requires making sure there are extra bytes at the end of termIS file.
+    //   - try it as a do-while loop... easier branch prediction?
+
+    // try and catch unoptimal prefix compression (we had a bug before)
+    assert(prefixLen == len || data[prefixLen] != *termsIS.ptr());
+
     termsIS.read(const_cast<char*>(data + prefixLen), suffixLen);
     currTerm.setSize(prefixLen + suffixLen);
 
