@@ -142,9 +142,9 @@ public:
       );
        ***/
 
-      auto[entry, inserted] = termsHash.try_emplace(tok.ptr, tokLen, termsHash.pool_, docid);
+      auto[entry, inserted] = termsHash.try_emplace(tok.ptr, tokLen, termsHash.getMemPool(), docid);
       if (!inserted) {
-        entry.val().addDoc(termsHash.pool_, docid);
+        entry->val().addDoc(termsHash.getMemPool(), docid);
       }
 
     }
@@ -167,9 +167,9 @@ public:
   SegFieldDocsFreqPos(const FieldType &field, MemPool &pool) : SegFieldIndexed(field), termsHash(pool, 4) {}
 
   inline void addPosition(int docid, char *term, int len, int pos) {
-    auto[entry, inserted] = termsHash.try_emplace(term, len, termsHash.pool_, docid, pos);
+    auto[entry, inserted] = termsHash.try_emplace(term, len, termsHash.getMemPool(), docid, pos);
     if (!inserted) {
-      entry.val().addDoc(termsHash.pool_, docid, pos);
+      entry->val().addDoc(termsHash.getMemPool(), docid, pos);
     }
   }
 
@@ -278,10 +278,10 @@ public:
                                  [&](const char *token, int tokLen) {
                                    numTokens++;
                                    pos++;  // need to have the tokenizer do this in case tokens are skipped or overlapped?
-                                   auto[entry, inserted] = termsHash.try_emplace(token, tokLen, termsHash.pool_, docid,
+                                   auto[entry, inserted] = termsHash.try_emplace(token, tokLen, termsHash.getMemPool(), docid,
                                                                                  pos);
                                    if (!inserted) {
-                                     entry.val().addDoc(termsHash.pool_, docid, pos);
+                                     entry->val().addDoc(termsHash.getMemPool(), docid, pos);
                                    }
                                  }
     );

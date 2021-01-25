@@ -271,6 +271,46 @@ inline int operator<=>(const PackedTerm &p, const StringType &s) {
   return (datacmp != 0) ? datacmp : ((int) sz - (int) s.size());
 }
 
+// Hashers and Comparators to use for heterogeneous lookup.
+// don't do const char* versions since we are dealing with binary data
+struct PackedTermHash {
+  using is_transparent = void;
+  size_t operator()(const char* data, size_t len) const {
+    return Hash::hash(data, len);
+  }
+  size_t operator()(const PackedTerm& term) const {
+    return (*this)(term.data(), term.size());
+  }
+  size_t operator()(const std::string& str) const {
+    return (*this)(str.data(), str.size());
+  }
+  size_t operator()(const std::string_view& str) const {
+    return (*this)(str.data(), str.size());
+  }
+};
+
+struct PackedTermEqual {
+  using is_transparent = void;
+  bool operator()(const PackedTerm& lhs, const PackedTerm& rhs) const noexcept {
+    return lhs == rhs;
+  }
+  bool operator()(const PackedTerm& lhs, const std::string_view& rhs) const noexcept {
+    return lhs == rhs;
+  }
+  bool operator()(const std::string_view& lhs, const PackedTerm& rhs) const noexcept {
+    return lhs == rhs;
+  }
+  bool operator()(const PackedTerm& lhs, const std::string& rhs) const noexcept {
+    return lhs == rhs;
+  }
+  bool operator()(const std::string& lhs, const PackedTerm& rhs) const noexcept {
+    return lhs == rhs;
+  }
+  bool operator()(const std::string_view& lhs, const std::string_view& rhs) const noexcept {
+    return lhs == rhs;
+  }
+};
+
 
 //
 // TODO: experimental and in progress string_view with short string optimization (can store strings of length 15 inline)

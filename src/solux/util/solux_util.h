@@ -8,6 +8,8 @@
 
 // NOTE: this is better than including xxhash.h since it enables inline. Inverter performance equal to
 // fvn1a when inlined.  25% slower if not inlined.
+#define XXH_INLINE_ALL
+#define XXH_PRIVATE_API
 #include <xxh3.h>
 
 namespace solux {
@@ -75,12 +77,10 @@ public:
     return hash;
   }
 
-  static uint32_t hash(const void *ptr, int length, uint64_t seed = 0) {
+  // default fast hash for hash tables, etc. Can change at any time so don't put it
+  // in external files / interfaces.
+  static uint64_t hash(const void *ptr, size_t length, uint64_t seed = 0) {
     // return fvn1a(ptr, length, FVN_Seed+seed);
-    return (uint32_t) XXH64(ptr, length, seed);
-  }
-
-  static uint64_t hash64(const void *ptr, int length, uint64_t seed = 0) {
     return XXH64(ptr, length, seed);
   }
 
