@@ -36,12 +36,12 @@ public:
   // ptr/len refer to the string portion that directly follows the value.
   explicit TermValRef(void *ptr, unsigned len) : TermRef(ptr, len) {}
 
-  V *valPtr() {
+  V *valPtr() const {
     // return const_cast<V*>( reinterpret_cast<const V*>( (const char*)ptr() - sizeof(V) ) );
     return reinterpret_cast<V *>(ptr()) - 1;
   }
 
-  V &val() { return *valPtr(); }
+  V &val() const { return *valPtr(); }
 
   template<typename... Args>
   static TermValRef create(MemPool &pool, const char *str, unsigned len, Args &&... args) {

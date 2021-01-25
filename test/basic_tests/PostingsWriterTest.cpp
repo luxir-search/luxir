@@ -362,13 +362,13 @@ TEST_F(PostingsTest, blockPositions) {
   TermIndexReader tindexReader(pool, reader);
   ASSERT_TRUE(tindexReader.readNextField());
   std::cout << "FIELD NAME name=" << tindexReader.name() << " numTerms=" << tindexReader.numTerms() << std::endl;
-  ASSERT_EQ(tindexReader.name(), "field1");
+  ASSERT_EQ(tindexReader.name(), std::string_view("field1"));
   ASSERT_EQ(tindexReader.numTerms(), 1);
 
   TermsEnum tenum(pool, reader, tindexReader);
   ASSERT_TRUE(tenum.nextTerm());
   ASSERT_EQ(tenum.ord(), 0);
-  ASSERT_EQ(tenum.term(), "term1");
+  ASSERT_EQ(tenum.term(), std::string_view("term1"));
 
   DocsEnum docsEnum(pool, reader, tindexReader, tenum);
   ASSERT_EQ(docsEnum.numDocs(), 2);
@@ -442,7 +442,7 @@ TEST_F(PostingsTest, blockTerms) {
   TermIndexReader tindexReader(pool, reader);
   ASSERT_TRUE(tindexReader.readNextField());
   // std::cout << "FIELD NAME name=" << tindexReader.name() << " numTerms=" << tindexReader.numTerms() << std::endl;
-  ASSERT_EQ(tindexReader.name(), "field1");
+  ASSERT_EQ(tindexReader.name(), std::string_view("field1"));
   ASSERT_EQ(tindexReader.numTerms(), nTerms);
 
   TermsEnum tenum(pool, reader, tindexReader);

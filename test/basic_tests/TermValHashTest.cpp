@@ -7,6 +7,14 @@
 using namespace std;
 using namespace solux;
 
+TEST(TermValHash, testTypes) {
+  // PackedTerm isn't trivial, but it should be trivially copyable
+  ASSERT_TRUE(std::is_trivially_copyable<PackedTerm>::value);
+  ASSERT_TRUE(std::is_trivially_copyable<TermValRef<PackedTerm>>::value);
+  ASSERT_TRUE(std::is_trivially_copyable<TermValRef<DocStream>>::value);  // DocStream may not be trivially copyable, but a TermValRef of anything should be.
+  ASSERT_TRUE(std::is_trivially_copyable<TermValRef<DocFreqPosStream>>::value);
+}
+
 TEST(TermValHash, testHash) {
 
   Inverter inverter;

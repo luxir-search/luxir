@@ -135,6 +135,8 @@ public:
 
 
 // A term has a byte of size (0-255) followed directly by the data.
+// NOTE: if this is overlaid over zeroes, isNull() will return true.
+// By default, *no* initialization is done.
 class PackedTerm {
   char *ptr_;
 public:
@@ -162,6 +164,9 @@ public:
   PackedTerm(MemPool &target, const void *data, uint32_t len) {
     ptr_ = write(target, data, len);
   }
+  PackedTerm(MemPool &target, std::string_view s) {
+    ptr_ = write(target, s.data(), s.size());
+  }
 
   // expert: should already point to an instance of this type
   void init(void *ptr, uint32_t size) {
@@ -175,7 +180,7 @@ public:
   explicit PackedTerm(void *ptr, uint32_t size) : ptr_(reinterpret_cast<char *>(ptr)) {}
 
   // expert: a pointer to the start of the data... not to the first byte of the string!
-  void *ptr() { return (void *) ptr_; }
+  void *ptr() const { return (void *) ptr_; }
 
   // the number of bytes in the value, not including the bytes to encode the length
   uint32_t size() const noexcept {
@@ -238,6 +243,8 @@ public:
   explicit operator std::string_view() const { return std::string_view(data(), size()); }
 };
 
+// NOTE: comparators with const char* are not supported as we are dealing with binary data
+// which has explicit lengths (and accidental use would lead to bugs)
 
 inline int operator<=>(const PackedTerm &a, const PackedTerm &b) {
   int datacmp = memcmp(a.data(), b.data(), std::min(a.size(), b.size()));
@@ -262,23 +269,6 @@ inline int operator<=>(const PackedTerm &p, const StringType &s) {
   auto[data, sz] = p.unpack();
   int datacmp = memcmp(data, s.data(), std::min((int) sz, (int) s.size()));
   return (datacmp != 0) ? datacmp : ((int) sz - (int) s.size());
-}
-
-// I needed to explicitly add support for const char*, otherwise the support for both string and string_view
-// above causes ambiguity.  NOTE: these are not optimized, as "s" is scanned twice if the lengths are equal.
-// The current expected usage is only in test code though.
-inline int operator<=>(const PackedTerm &p, const char *s) {
-  auto[data, sz] = p.unpack();
-  auto slen = strlen(s);
-  int datacmp = memcmp(data, s, std::min((int) sz, (int) slen));
-  return (datacmp != 0) ? datacmp : ((int) sz - (int) slen);
-}
-
-inline bool operator==(const PackedTerm &p, const char *s) {
-  auto[data, sz] = p.unpack();
-  int slen = strlen(s);
-  if (sz != slen) return false;
-  return memcmp(data, s, sz) == 0;
 }
 
 
