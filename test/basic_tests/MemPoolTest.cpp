@@ -36,6 +36,31 @@ TEST_F(MemPoolTest, rewind) {
 #endif
 }
 
+TEST_F(MemPoolTest, randRewind) {
+  MemPool pool;
+
+  int maxStates = 100;
+  vector<std::pair<MemPool::save_point, size_t>> states;
+  for (int i=0; i<1000; i++) {
+    if (rng.rbool() && states.size() < maxStates) {
+      states.emplace_back(pool.getSavePoint(), pool.size());
+    } else if (rng.rbool() && states.size() > 0) {
+      auto [save,sz] = states.back();
+      states.pop_back();
+      int nBuffersToSave=rng.rint(4);
+      pool.rewind(save, nBuffersToSave);
+      ASSERT_EQ(sz, pool.size());
+    }
+    int nallocs = rng.rint(6);
+    for (int i=0; i<nallocs; i++) {
+      int allocSz = rng.rint(1, MemPool::BYTE_BLOCK_SIZE);
+      char* x = pool.allocate(allocSz);
+      x[0] = 'A';  // touch beginning and end
+      x[allocSz-1] = 'A';
+    }
+  }
+}
+
 #ifndef MEMPOOL_MALLOC
 // test page boundary conditions efficiently using rewind
 TEST_F(MemPoolTest, boundary) {

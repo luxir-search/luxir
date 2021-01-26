@@ -83,9 +83,17 @@ void MemPool::_rewind(const MemPool::save_point& savePoint, uint32_t buffersToSa
   }
 #endif
 
+#ifndef NDEBUG
+  if (bufferIdx == i) {
+    // if we were already on this block, only scribble to the end of the used space to save time
+    scribble(savePoint, ptr()-savePoint);
+  } else {
+    //we weren't on this block, so scribble to the end of the block
+    scribble(savePoint, (buffers[i]+BYTE_BLOCK_SIZE)-savePoint);
+  }
+#endif
   bufferIdx = i;
   buffer = buffers[bufferIdx];
-  assert(scribble(savePoint, ptr()-savePoint));
   pos = savePoint - buffer;
 }
 #endif
