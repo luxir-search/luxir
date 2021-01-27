@@ -116,7 +116,7 @@ public:
 
   int size() {
 #ifndef MEMPOOL_MALLOC
-    return bufferIdx < 0 ? 0 : (bufferIdx-1) * BYTE_BLOCK_SIZE + pos;
+    return bufferIdx * BYTE_BLOCK_SIZE + pos;
 #else
     return allocated;
 #endif
@@ -124,7 +124,7 @@ public:
 
   int capacity() {
 #ifndef MEMPOOL_MALLOC
-    return bufferIdx < 0 ? 0 : bufferIdx * BYTE_BLOCK_SIZE;
+    return buffers.size() * BYTE_BLOCK_SIZE;
 #else
     return size();
 #endif

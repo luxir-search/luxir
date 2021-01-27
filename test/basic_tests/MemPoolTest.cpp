@@ -11,7 +11,9 @@ protected:
 
 TEST_F(MemPoolTest, rewind) {
   MemPool pool;
+  ASSERT_EQ(pool.size(), 0);
   pool.allocate(3);
+  ASSERT_EQ(pool.size(), 3);
   char* a = pool.allocate(2);
   unused(a);
   auto savePoint = pool.getSavePoint();
