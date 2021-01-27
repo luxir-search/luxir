@@ -25,6 +25,10 @@ Then recompile:
 /opt/vcpkg$ ./vcpkg remove benchmark
 /opt/vcpkg$ ./vcpkg install benchmark
 
+Installing dependencies via vcpkg:
+$ cd /opt/vcpkg
+$ ./vcpkg install boost gtest xxhash parallel-hashmap 
+$ ./vcpkg install robin-hood-hashing   #optional... see MapBM.cpp
 
 Ubuntu:
 ```
