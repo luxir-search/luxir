@@ -101,7 +101,7 @@ public:
 
   bool isNull() const { return x == 0; }
 
-  uint64_t hashcode() const {
+  size_t hash_value() const {
     return Hash::hash(ptr(), size());
   }
 
@@ -200,7 +200,7 @@ public:
   void setSize(uint32_t sz) { ptr_[0] = (char) sz; }
 
 // TODO: do this in a more standard way
-  uint64_t hashcode() const {
+  std::size_t hash_value() const noexcept {
     return Hash::hash(ptr_ + 1, size());
   }
 
@@ -402,7 +402,7 @@ struct hash<solux::PackedTerm> {
   typedef std::size_t result_type;
 
   result_type operator()(const argument_type &val) const {
-    return val.hashcode();
+    return val.hash_value();
   }
 };
 }
@@ -414,7 +414,7 @@ struct hash<solux::StrRef> {
   typedef std::size_t result_type;
 
   result_type operator()(const argument_type &val) const {
-    return val.hashcode();
+    return val.hash_value();
   }
 };
 }

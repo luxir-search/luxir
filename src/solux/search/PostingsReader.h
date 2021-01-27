@@ -281,7 +281,7 @@ public:
 
   bool seekInBlock(const std::string_view& target) {
     // TODO: rather than hashing every segment, have an option to pass it in?
-    char hash = (char)Hash::hash(target.data(), target.length());
+    char hash = (char)XXH3_64bits(target.data(), target.size());
     int lastOrd = ordInBlock - 1; // check the current term we are on.
     for(;;) {
       int matchOrd;

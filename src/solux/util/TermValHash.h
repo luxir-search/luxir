@@ -85,7 +85,7 @@ public:
   using iterator = entry_type*;
 
 private:
-  entry_type *table_;
+  entry_type* table_;
   MemPool& pool_;
   int elements_ = 0;   // how many slots used
   int capacity_;       // how many slots may be used before rehashing
@@ -119,6 +119,11 @@ public:
   // TODO: don't know the performance implications of calling this often...
   auto end() {
     return boost::make_filter_iterator(non_null_predicate, table_ + tableSize_, table_ + tableSize_);
+  }
+
+  /// memory consumed by this table (does not traverse into values, only includes shallow value size)
+  size_t memSize() const {
+    return tableSize_ * sizeof(entry_type) + sizeof(TermValHash<T,Hasher>) ;
   }
 
   template<typename... Args>

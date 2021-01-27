@@ -77,11 +77,63 @@ public:
     return hash;
   }
 
-  // default fast hash for hash tables, etc. Can change at any time so don't put it
-  // in external files / interfaces.
-  static uint64_t hash(const void *ptr, size_t length, uint64_t seed = 0) {
-    // return fvn1a(ptr, length, FVN_Seed+seed);
-    return XXH64(ptr, length, seed);
+
+//-----------------------------------------------------------------------------
+// MurMurHash2 (MurmurHash64A), by Austin Appleby, originally in the public domain.
+// https://github.com/aappleby/smhasher/blob/master/src/MurmurHash2.cpp
+// This version has just been slightly modified to get rid of compiler / IDE warnings & suggestions.
+// Does unaligned loads and produces different values on little/big endian.
+  static constexpr uint64_t MurmurHash64A(const void * key, size_t len, uint64_t seed)
+  {
+    const uint64_t m = 0xc6a4a7935bd1e995;
+    const int r = 47;
+
+    uint64_t h = seed ^ (len * m);
+
+    auto data = (const uint64_t *)key;
+    auto end = data + (len/8);
+
+    while(data != end)
+    {
+      uint64_t k = *data++;
+
+      k *= m;
+      k ^= k >> r;
+      k *= m;
+
+      h ^= k;
+      h *= m;
+    }
+
+    auto data2 = (const unsigned char*)data;
+
+    switch(len & 7)
+    {
+      case 7: h ^= uint64_t(data2[6]) << 48;
+      case 6: h ^= uint64_t(data2[5]) << 40;
+      case 5: h ^= uint64_t(data2[4]) << 32;
+      case 4: h ^= uint64_t(data2[3]) << 24;
+      case 3: h ^= uint64_t(data2[2]) << 16;
+      case 2: h ^= uint64_t(data2[1]) << 8;
+      case 1: h ^= uint64_t(data2[0]);
+        h *= m;
+    };
+
+    h ^= h >> r;
+    h *= m;
+    h ^= h >> r;
+
+    return h;
+  }
+
+  // General purpose fast hash for internal use in hash tables. Is not guaranteed to be
+  // stable across releases, runs, or on different architectures, so do not use
+  // in file formats / APIs that require it.
+  static inline uint64_t hash(const void * key, size_t len, uint64_t seed = 0) {
+    // return MurmurHash64A(key, len, seed);
+    // return fvn1a(key, len, FVN_Seed+seed);
+    // return XXH64(key, len, seed);
+    return XXH3_64bits_withSeed(key, len, seed);
   }
 
 };

@@ -80,6 +80,14 @@ target_link_libraries(solux solux_lib)
 
 add_subdirectory(test)
 
+if(ROBIN_HOOD_HASHING)
+  find_path(ROBIN_HOOD_HASHING_INCLUDE_DIRS "robin_hood.h")
+  target_include_directories(solux_lib PRIVATE ${ROBIN_HOOD_HASHING_INCLUDE_DIRS})
+endif()
+
+find_path(PARALLEL_HASHMAP_INCLUDE_DIRS "parallel_hashmap/btree.h")
+target_include_directories(solux_lib PRIVATE ${PARALLEL_HASHMAP_INCLUDE_DIRS})
+
 # this needs to be after add_executable or add_library
 target_link_libraries(solux_lib PRIVATE xxHash::xxhash)
 target_link_libraries(solux ${Boost_LIBRARIES})

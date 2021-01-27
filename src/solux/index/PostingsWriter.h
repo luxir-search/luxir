@@ -339,7 +339,7 @@ public:
     // now write hashes of the terms
     for (int i=0; i<nTerms; i++) {
       auto term = termList[i];
-      termOutput.write((char)term.hashcode());
+      termOutput.write((char)XXH3_64bits(term.data(), term.size()));
     }
 
     // now write the block:

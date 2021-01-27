@@ -42,7 +42,7 @@ TEST_F(MemPoolTest, randRewind) {
   int maxStates = 100;
   vector<std::pair<MemPool::save_point, size_t>> states;
   for (int i=0; i<1000; i++) {
-    if (rng.rbool() && states.size() < maxStates) {
+    if (rng.rbool() && (int)states.size() < maxStates) {
       states.emplace_back(pool.getSavePoint(), pool.size());
     } else if (rng.rbool() && states.size() > 0) {
       auto [save,sz] = states.back();
