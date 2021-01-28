@@ -129,46 +129,44 @@ public:
 SOLUX_PACKED_START
 
 class DocFreqPosStream {
-public:
   Stream docs;
   Stream positions;
   int lastDoc;
-  int docFreq;
-  int lastDocCode;
+  int docFreq;  // we don't strictly need to track this unless we need to know for some reason.  we can read to end of doc stream.
   int termFreq;
+  int lastPos; // just for calculating deltas... we always write positions to the stream.
 
-  int lastPos;
-
-  // todo: support positions > 2B?  Not useful?  Perhaps support with a special marker in the stream (like a 0 length payload that means
-  // read a vint and multiply that by 2B and add it to the delta
-
-  DocFreqPosStream(MemPool &pool, int docid, int pos) : lastDoc(docid), docFreq(1), lastDocCode(docid << 1),
-                                                        termFreq(1), lastPos(pos) {
-    positions.writeVInt(pool, pos << 1);
-  }
-
-  DocFreqPosStream(const DocFreqPosStream &) = delete;
-
-  DocFreqPosStream(DocFreqPosStream &&) = delete;
 
   void writePos(MemPool &pool, int pos) {
     int posCode = pos - lastPos;
     assert(posCode >= 0);
     // TODO: do we need to support duplicate positions for the same term for the same doc???  Would seem to make search code more complex.
-    positions.writeVInt(pool, posCode << 1);
+    positions.writeVInt(pool, posCode);
     lastPos = pos;
   }
 
-  void addDoc(MemPool &pool, int docid, int pos) { // TODO: add payload
+public:
+
+  // todo: support positions > 2B?  Not useful?  Perhaps support with a special marker in the stream (like a 0 length payload that means
+  // read a vint and multiply that by 2B and add it to the delta
+
+  DocFreqPosStream(MemPool &pool, int docid, int pos) : lastDoc(docid), docFreq(1),
+                                                        termFreq(1), lastPos(pos) {
+    positions.writeVInt(pool, pos);
+  }
+
+  DocFreqPosStream(const DocFreqPosStream &) = delete;
+  DocFreqPosStream(DocFreqPosStream &&) = delete;
+
+  void addDoc(MemPool &pool, int docid, int pos) {
     int delta = docid - lastDoc;
     if (delta == 0) {
       // same document
       ++termFreq;
-
       writePos(pool, pos);
     } else {
       // new document... first write doc+freq for prev document
-      int code = termFreq != 1 ? lastDocCode : (lastDocCode | 0x01);
+      int code = termFreq == 1 ? (lastDoc<<1)|0x01 : lastDoc<<1;
       docs.writeVInt(pool, code);
       if (termFreq != 1) {
         docs.writeVInt(pool, termFreq);
@@ -176,7 +174,6 @@ public:
 
       // now handle stuff for new doc
       termFreq = 1;
-      lastDocCode = delta << 1;
       lastDoc = docid;
       ++docFreq;
 
@@ -184,65 +181,53 @@ public:
       writePos(pool, pos);
     }
   }
+
+  template <class PostingsConsumer>
+  void pushDocs(MemPool& pool, PostingsConsumer& sink) {
+    StreamReader dstream(docs, pool);
+    StreamReader pstream(positions, pool);
+    int docid = 0;  // pass in base or have external user add if needed?
+    int handledIds = 0;
+    bool readLastId = false;
+    do {
+      int tf;
+      if (!dstream.eof()) {
+        uint32_t docCode = dstream.readVint();
+        int docDelta = docCode >> 1;
+        docid += docDelta;
+        tf = (int)docCode & 0x01;
+        if (tf != 1) {
+          tf = dstream.readVint();
+        }
+      } else {
+        docid = lastDoc;
+        tf = termFreq;
+        readLastId = true;
+      }
+      handledIds++;  // just sanity check
+
+      sink.startDoc(docid);
+      for (int i=0; i<tf; i++) {
+        int posCode = pstream.readVint();
+        sink.addPositionDelta(posCode);
+      }
+      sink.endDoc(docid);
+
+    } while (!readLastId);
+
+    assert(pstream.eof());
+    assert(handledIds == docFreq);
+  }
+
+  friend std::ostream &operator<<(std::ostream &out, const DocFreqPosStream &obj) {
+    return out << "DocFreqPosStream(lastDoc=" << obj.lastDoc
+               << ",lastPos=" << obj.lastPos
+               << ')';
+  }
 }
   SOLUX_PACKED_END;
 
 
-/*** prototype code for reading back postings
-// TODO: make a PushPositionsIterator that you could template / inherit from / pass a lambda to.
-// It will call nextDoc() and nextPos() until exhaustion.  May be faster since we keep context?  coroutine generator
-// is another option, but may be slower and we might need to test for doc change instead of being told.
 
-class DocFreqPosStreamReader : public PostingsEnum {
-public:
-  DocFreqPosStream& source_;
-  int docid;
-  int remaining_;
-  uint8_t remainingInSlice_;
-  uint8_t sliceSize_;
-
-  // allow someone to pull postings, or should we push?
-  // We want pull if we want to be able to search?
-
-  DocFreqPosStreamReader(DocFreqPosStream& source) : source_(source) {
-    docid = -1;
-    remaining_ = source.termFreq;
-    sliceSize_ = Stream::FIRST_LEVEL_SIZE;
-    remainingInSlice_ = sliceSize_;
-  }
-
-  virtual int docID() override {
-    return 0;
-  }
-
-
-  int readVInt() {
-    return 0;
-
-  }
-
-  virtual int nextDoc() override {
-    if (remaining_ <= 0) {
-      docid = NO_MORE_DOCS;
-    } else {
-      // TODO: factor out a stream reader
-      int delta = readVInt();
-// nocommit
-
-    }
-return 0; // nocommit
-  }
-
-  virtual int advance(int target) override {
-    return DocIterator::advance(target);
-  }
-
-  virtual int64_t cost() override {
-    return source_.termFreq;
-  }
-
-};
-
-***/
 
 } // end namespace

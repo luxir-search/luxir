@@ -176,7 +176,7 @@ public:
 
 
   // TODO: some sort of adapter that will specify the pool for us?
-  StreamReader begin(const MemPool &pool) const;
+  [[nodiscard]] StreamReader begin(const MemPool &pool) const;
 
   // const StreamReader& end(const MemPool& pool) const;
   END end(const MemPool &pool) const {
@@ -208,9 +208,6 @@ class StreamReader {
   friend class Stream;
 
 public:
-
-  // TODO: try a static push reader that accepts a template/lambda
-
   StreamReader(const Stream &source, const MemPool &pool) : pool_(pool) {
     remaining_ = source.size(pool_);
 
@@ -244,28 +241,14 @@ public:
         initFromBBPointer(bbptr);
       }
     }
-
-    /** nocommit
-    if (--remainingInSlice_ == 0) {
-      // TODO: hmmm, if this is the last slice, -4 won't work!
-      remaining_ -= (sliceSize_ - 4);  // this may become negative but that's OK
-      if (remaining_ <= 0) {
-        ptr_ = nullptr;
-      } else {
-        // follow pointer to next slice
-        int bbptr = *reinterpret_cast<const int*>(ptr_);
-        initFromBBPointer(bbptr);
-      }
-    }
-     **/
   }
 
-  StreamReader &operator++() {
+  StreamReader& operator++() {
     incrementPointer();
     return *this;
   }
 
-  StreamReader operator++(int) { // postfix ++
+  const StreamReader operator++(int) { // postfix ++
     StreamReader prev = *this;
     incrementPointer();
     return prev;
@@ -286,11 +269,29 @@ public:
     return this->ptr_ != nullptr;
   }
 
+  bool eof() const { return ptr_ == nullptr; }
 
-  uint8_t read() {
-    uint8_t ret = (uint8_t) *ptr_;
+  char readByte() {
+    auto ret = *ptr_;
     incrementPointer();
     return ret;
+  }
+  char read() {
+    auto ret = *ptr_;
+    incrementPointer();
+    return ret;
+  }
+
+  // TODO: consolidate with InputStream somehow... templatize?
+  uint32_t readVint() {
+    char b = readByte();
+    uint32_t val = b & 0x7f;
+    // TODO: try replacing with a loop to 4 (to avoid running long if data is bad)
+    for (int shift = 7; (b & 0x80) != 0; shift += 7) {
+      b = readByte();
+      val |= (b & 0x7f) << shift;
+    }
+    return val;
   }
 
 };

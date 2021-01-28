@@ -44,24 +44,34 @@ public:
   V &val() const { return *valPtr(); }
 
   template<typename... Args>
-  static TermValRef create(MemPool &pool, const char *str, unsigned len, Args &&... args) {
-    pool.align(); // Cost=~4 bytes per unique term
-    auto target = pool.allocate(getExactSize(len));
+  void initTV(MemPool &pool, const std::string_view& str, Args &&... args) {
+    // pool.align(); // Cost=~4 bytes per unique term... doesn't seem to be worth it from benchmarks so far.
+    auto target = pool.allocate(getExactSize(str.size()));
     new(target) V(std::forward<Args>(args)...);    // construct the value
     auto strStart = target + sizeof(V);
-    TermRef::write(strStart, str, len);  // copy the string following the value
-    return TermValRef(strStart,
-                      len);                // the pointer to *this* compound value is the same as the string, and hence we can thus inherit from the string
+    TermRef::write(strStart, str.data(), str.size());  // copy the string following the value
+    init(strStart, str.size()); // the pointer to *this* compound value is the same as the string, and hence we can thus inherit from the string
   }
 
   template<typename... Args>
   TermValRef(MemPool &pool, const char *str, unsigned len, Args &&... args) {
-    pool.align(); // Cost=~4 bytes per unique term
-    auto target = pool.allocate(getExactSize(len));
-    new(target) V(std::forward<Args>(args)...);    // construct the value
-    auto strStart = target + sizeof(V);
-    TermRef::write(strStart, str, len);  // copy the string following the value
-    init(strStart, len); // this is like a private constructor for the string part.
+    initTV(pool, std::string_view(str,len), std::forward<Args>(args)...);
+  }
+
+  template<typename... Args>
+  TermValRef(MemPool &pool, const std::string_view& str, Args &&... args) {
+    initTV(pool, str, std::forward<Args>(args)...);
+  }
+
+  friend std::ostream &operator<<(std::ostream &out, const TermValRef &tv) {
+    if (tv.isNull()) {
+      out << "(null)";
+    } else {
+      out << (const TermRef&)tv  // base class string
+          << ':'
+          << tv.val();
+    }
+    return out;
   }
 };
 
@@ -127,20 +137,20 @@ public:
   }
 
   template<typename... Args>
-  std::pair<iterator, bool> try_emplace(const char *ptr, int sz, Args &&... args) {
+  std::pair<iterator, bool> try_emplace(const std::string_view& str, Args &&... args) {
     if (elements_ >= capacity_) {
       rehash();
     }
-    auto hash = Hasher()(ptr,sz);
+    auto hash = Hasher()(str);
     auto slot = hash;
     for (;;) {
       slot = slot & (tableSize_ - 1);
       iterator v = table_ + slot;
       if (v->isNull()) {
         elements_++;
-        *v = entry_type(pool_, ptr, sz, std::forward<Args>(args)...);
+        *v = entry_type(pool_, str, std::forward<Args>(args)...);
         return {v, true};
-      } else if (v->equals(ptr, sz)) {
+      } else if (*v == str) {
         return {v, false};
       }
       slot++;
@@ -148,11 +158,6 @@ public:
   }
 
   // Some heterogeneous lookup support.  We could support it as a template param if needed.
-  template<typename... Args>
-  std::pair<entry_type, bool> try_emplace(const std::string_view& s, Args &&... args) {
-    return try_emplace(s.data(), s.size(), std::forward<Args>(args)...);
-  }
-
   template<typename... Args>
   std::pair<entry_type, bool> try_emplace(const std::string& s, Args &&... args) {
     return try_emplace(s.data(), s.size(), std::forward<Args>(args)...);

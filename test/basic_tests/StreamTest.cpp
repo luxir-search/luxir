@@ -84,19 +84,23 @@ TEST_F(StreamTest, basic) {
 }
 
 TEST_F(StreamTest, randStream) {
-  int maxlen = MemPool::BYTE_BLOCK_SIZE * 2;
-  int iter = 100;
+  int maxlen = MemPool::BYTE_BLOCK_SIZE * 3;
   int minBytesToWrite = 1000000;
+  int maxPoolSize = 100000;
 
   MemPool pool;
-  for (int i = 0; i < iter || pool.size() <= minBytesToWrite; i++) {
+  auto save = pool.getSavePoint();
+  int totWritten = 0;
+  while (totWritten < minBytesToWrite) {
     // test many small, but some big.
     int slen = rng.rint(20);
     if (slen == 18) slen = rng.rint(100);
     if (slen == 19) slen = rng.rint(maxlen);
     testStream(pool, slen);
-
-    // TODO: rewind the pool occasionally so we don't use more memory than necessary.
+    totWritten += slen;
+    if (pool.size() > maxPoolSize) {
+      pool.rewind(save, 10);
+    }
   }
 }
 

@@ -124,6 +124,7 @@ public:
 
   virtual void
   indexTokenStream(int docid, char *mutableVal, int len) override {  // todo: could make a templatized version
+
     tokenChain->head.setMutableValue(mutableVal, len);
 
     Token &tok = *tokenChain->token;
@@ -135,14 +136,8 @@ public:
 
       int tokLen = tok.end - tok.ptr;  // todo: check overflow
       // DocStream& stream = termsHash.get(tok.ptr, tokLen);
-      /***
-      termsHash.update(tok.ptr, tokLen
-              , [=](DocStream* p){ new (p) DocStream(docid); }
-              , [=](DocStream& s){ s.addDoc(termsHash.pool_, docid); }
-      );
-       ***/
 
-      auto[entry, inserted] = termsHash.try_emplace(tok.ptr, tokLen, termsHash.getMemPool(), docid);
+      auto[entry, inserted] = termsHash.try_emplace(std::string_view(tok.ptr, tokLen), termsHash.getMemPool(), docid);
       if (!inserted) {
         entry->val().addDoc(termsHash.getMemPool(), docid);
       }
@@ -167,7 +162,7 @@ public:
   SegFieldDocsFreqPos(const FieldType &field, MemPool &pool) : SegFieldIndexed(field), termsHash(pool, 4) {}
 
   inline void addPosition(int docid, char *term, int len, int pos) {
-    auto[entry, inserted] = termsHash.try_emplace(term, len, termsHash.getMemPool(), docid, pos);
+    auto[entry, inserted] = termsHash.try_emplace(std::string_view(term, len), termsHash.getMemPool(), docid, pos);
     if (!inserted) {
       entry->val().addDoc(termsHash.getMemPool(), docid, pos);
     }
@@ -278,7 +273,7 @@ public:
                                  [&](const char *token, int tokLen) {
                                    numTokens++;
                                    pos++;  // need to have the tokenizer do this in case tokens are skipped or overlapped?
-                                   auto[entry, inserted] = termsHash.try_emplace(token, tokLen, termsHash.getMemPool(), docid,
+                                   auto[entry, inserted] = termsHash.try_emplace(std::string_view(token, tokLen), termsHash.getMemPool(), docid,
                                                                                  pos);
                                    if (!inserted) {
                                      entry->val().addDoc(termsHash.getMemPool(), docid, pos);

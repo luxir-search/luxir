@@ -206,12 +206,6 @@ public:
 
   bool isNull() const { return ptr_ == nullptr; }
 
-  // compare to raw bytes
-  bool equals(const void *ptr, int len) const {
-    auto sz = size();
-    return sz == len && memcmp(ptr_ + 1, ptr, (size_t) len) == 0;
-  }
-
   // size of both the length and the data
   uint32_t memorySize() const {
     return size() + 1;

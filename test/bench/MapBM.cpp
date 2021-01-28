@@ -10,9 +10,87 @@
 
 using namespace solux;
 
+
+
+template<class T, class Hash, class Eq, class Alloc = std::allocator<T>>
+class flat_set : public phmap::flat_hash_set<T, Hash, Eq, Alloc> {
+public:
+  using Base = phmap::container_internal::raw_hash_set<
+          phmap::container_internal::FlatHashSetPolicy<T>, Hash, Eq, Alloc>;
+  using iterator = typename Base::iterator;
+
+
+  template<typename KeyType, typename... Args>
+  inline std::pair<iterator, bool> try_emplace(const KeyType &key, Args &&... args) {
+    bool inserted = false;
+    auto iter = this->lazy_emplace(key, [&](const auto &ctor) {
+      ctor(std::forward<Args>(args)...);
+      inserted = true;
+    });
+    return {iter, inserted};
+  }
+
+  // Get the list of compact values using the internal memory so we don't have to double
+  // the memory size temporarily.
+  T* messWithInternals() {
+    // Control bytes come first, so we wouldn't have a problem with the first block (provided set is
+    // large enough to be in the standard format... at least 16?)   But if things are full enough, we will
+    // stomp on the control block of the second group while iterating over it.
+    // Buffering a certain number of items and then adding at end: we could calculate the max number of items
+    // we would have to buffer (assuming worst canse of all blocks full at front?) or we could detect when
+    // the output pointer and input pointer are too close (less than a group size?) and only then buffer
+    // on a per-element basis (would lead to much less buffering)
+
+    // grab first slot in map.
+    const T* first_slot_const = &*this->iterator_at(0);
+    T* first_slot = const_cast<T*>(first_slot_const);
+    T* output = first_slot;
+
+    std::vector<T> buffered; // pass this in eventually.
+
+    int min_diff = 16 * (sizeof(T) + 1);
+    for (auto iter = this->begin(); iter != this->end(); iter++) {
+      const T &item = *iter;
+      auto resulting_diff = (const char *) &item - (const char *) (output + 1);
+      if (resulting_diff < min_diff) {
+        std::cout << "item: " << item << " resulting_diff=" << resulting_diff << " buffering" << std::endl;
+        buffered.emplace_back(item);
+      } else {
+        std::cout << "item: " << item << " resulting_diff=" << resulting_diff << " moving" << std::endl;
+        *output++ = item;
+      }
+    }
+
+    // add buffered items at end
+    for (auto& item : buffered) {
+      std::cout << "item: " << item << " pushing." << std::endl;
+      *output++ = item;
+    }
+
+    // we really want to just skip deallocation. For types without a destructor, does
+    // the destroy loop get optimized out?
+    // (*(Base*)this).destroy_slots();
+
+    return first_slot;
+  }
+
+};
+
+
+// Convert phmap's lazy_emplace support for sets into try_emplace that also tells you if the item was inserted.
+template <typename SetType, typename KeyType, typename... Args>
+inline std::pair<typename SetType::iterator, bool> try_emplace(SetType& set, const KeyType& key, Args&&... args) {
+  bool inserted = false;
+  auto iter = set.lazy_emplace(key, [&](const auto& ctor) {
+    ctor(std::forward<Args>(args)...);
+    inserted = true;
+  });
+  return {iter, inserted};
+}
+
 struct TestHasher {
-  static int call_count;
   using is_transparent = void;
+  static int call_count;
 
   // The fastest hash by far was XXH3
   size_t h(const char* data, int len) const {
@@ -55,18 +133,6 @@ struct TestHasher {
 int TestHasher::call_count = 0;
 
 
-/** in progress
-// Convert phmap's lazy_emplace support for sets into try_emplace that also tells you if the item was inserted!
-template <typename SetType, typename KeyType, typename... Args>
-inline auto try_emplace(SetType& set, const KeyType& key, Args&&... args) {
-  bool inserted = false;
-  auto iter = set.lazy_emplace(key, [&](const auto& ctor) {
-    ctor(std::forward<Args>(args)...);
-    inserted = true;
-  });
-  return {iter, inserted};
-}
-**/
 
 // Do a minimal amount of realistic work.
 class FakeDocStream {
@@ -91,6 +157,13 @@ public:
     lastDoc = doc;
     lastPos = pos;
   }
+
+
+  friend std::ostream &operator<<(std::ostream &out, const FakeDocStream &obj) {
+    return out << "FakeDocStream(lastDoc=" << obj.lastDoc
+               << ",lastPos=" << obj.lastPos
+               << ')';
+  }
 };
 
 
@@ -104,7 +177,7 @@ public:
 
   // returns partial fingerprint for comparison across multiple iterations.
   int add(const char* term, int tlen, int doc, int pos) {
-    auto [iter, inserted] = set.try_emplace(term, tlen, pool, doc, pos);
+    auto [iter, inserted] = set.try_emplace(std::string_view(term, tlen), pool, doc, pos);
     int ret;
     if (!inserted) {
       iter->val().addDoc(pool, doc, pos);
@@ -137,11 +210,20 @@ public:
 
   // returns partial fingerprint for comparison across multiple iterations.
   int add(const char* term, int tlen, int doc, int pos) {
+
+    auto sv = std::string_view(term, tlen);
+    auto [iter, inserted] = try_emplace(set,
+                                        sv, // the key to look up
+                                        pool, sv, pool, doc, pos  // args to TermValRef<T> (first two are for key, last 3 are for T)
+                                        );
+
+/*
     bool inserted = false;
     auto iter = set.lazy_emplace(std::string_view(term, tlen), [&](const auto& ctor) {
       ctor(pool, term, tlen, pool, doc, pos);
       inserted = true;
     });
+*/
 
     // TODO:  try my converter template
     // auto [iter, inserted] = try_emplace(set, std::string_view(term, tlen), pool, term, tlen, doc, pos);
@@ -164,7 +246,7 @@ public:
   }
 };
 using PHFlatSet = PHSet<phmap::flat_hash_set<TermValRef<FakeDocStream>,TestHasher,PackedTermEqual>>;
-using PHFlatSetPar = PHSet<phmap::parallel_flat_hash_set<TermValRef<FakeDocStream>,TestHasher,PackedTermEqual>>;
+using PHFlatParSet = PHSet<phmap::parallel_flat_hash_set<TermValRef<FakeDocStream>,TestHasher,PackedTermEqual>>;
 using PHNodeSet = PHSet<phmap::node_hash_set<TermValRef<FakeDocStream>,TestHasher,PackedTermEqual>>;
 
 
@@ -296,8 +378,8 @@ static void BM_invertTemplate(benchmark::State& state) {
         // comparing solux impl of TermValHash with phmap::unordered_flat_set
         // Note: most of these numbers were with murmurhash, but now we switched to XXH3!
         // tlen = (r()&0x3f) + 4;   // 655K unique keys (long): phmap 6.5% better (prob because skipping long key comps)
-        // tlen = (r()&0x0f) + 4;   // 256k unique keys (shortish): TVHash better by 1.5%
-        tlen = (r()&0x07) + 8;   // 130k unique keys (med): tie
+        tlen = (r()&0x0f) + 4;   // 256k unique keys (shortish): TVHash better by 1.5%
+        // tlen = (r()&0x07) + 8;   // 130k unique keys (med): tie
         // tlen = (r()%10 + 1);     // 145K unique short keys: TVHash better by 7.8%
         // tlen = (r()%9 + 1);      // 129K unique short keys: TVHash better by 15.3%
         // tlen = (r()%8 + 1);      // 113K unique short keys: TVHash better by 9.2% (TVHash rehashed sooner)
@@ -361,8 +443,8 @@ static void BM_invertTermValHash(benchmark::State& state) { BM_invertTemplate<Te
 BENCHMARK(BM_invertTermValHash);
 static void BM_invertPHFlatSet(benchmark::State& state) { BM_invertTemplate<PHFlatSet>(state); }
 BENCHMARK(BM_invertPHFlatSet);
-static void BM_invertPHFlatSetPar(benchmark::State& state) { BM_invertTemplate<PHFlatSetPar>(state); }
-BENCHMARK(BM_invertPHFlatSetPar);
+static void BM_invertPHFlatParSet(benchmark::State& state) { BM_invertTemplate<PHFlatParSet>(state); }
+BENCHMARK(BM_invertPHFlatParSet);
 static void BM_invertPHNodeSet(benchmark::State& state) { BM_invertTemplate<PHNodeSet>(state); }
 BENCHMARK(BM_invertPHNodeSet);
 static void BM_invertPHFlatMap(benchmark::State& state) { BM_invertTemplate<PHFlatMap>(state); }
@@ -409,3 +491,46 @@ BM_invertSVPHFlatMap_mean         29640047 ns     29640118 ns           60 fp=11
 BM_invertSVRobinFlatMap_mean      39307582 ns     39307677 ns           60 fp=11.663k hashes=1.35523M inserts=1000k mem=0 rate=25.4411M/s unique=145.498k
 BM_invertSVstdMap_mean            64080090 ns     64080268 ns           60 fp=11.663k hashes=1.1455M inserts=1000k mem=0 rate=15.6162M/s unique=145.498k
 */
+
+
+
+
+
+
+
+[[maybe_unused]] void BM_dealloc(benchmark::State& state) {
+  MemPool pool;
+  // using Set = phmap::flat_hash_set<TermValRef<FakeDocStream>,TestHasher,PackedTermEqual>;
+  using Set = phmap::flat_hash_set<std::string_view>;
+  Set* set;
+
+  auto sv = std::string_view("hello");
+
+  for (auto _ : state) {
+    set = new Set(state.range(0));
+    // set.emplace(pool, sv, pool, 1, 2);
+    set->emplace(sv);
+    benchmark::DoNotOptimize(set);
+    benchmark::DoNotOptimize(set->size());
+    ASSERT_TRUE(set->size() == 1);
+    delete set;
+  }
+/*
+  // This takes 1.4ms for an 8MB capacity array! The question is, how much of it is in the delete, which looks like
+  // it loops over capacity looking for objects to deallocate (and we don't have a destructor!)
+  // We could use a custom allocator to wink out the entire thing as a comparison.
+  // Going off of the raw numbers though, it looks like it's only .1% of the time of the invert benchmark.
+-------------------------------------------------------------
+Benchmark                   Time             CPU   Iterations
+-------------------------------------------------------------
+BM_dealloc/8             39.1 ns         39.1 ns     18791370
+BM_dealloc/64            70.4 ns         70.4 ns      9912426
+BM_dealloc/512           60.8 ns         60.8 ns     11328287
+BM_dealloc/4096           108 ns          108 ns      6509792
+BM_dealloc/32768          579 ns          579 ns      1205817
+BM_dealloc/262144        5169 ns         5169 ns       136418
+BM_dealloc/2097152     369413 ns       369333 ns         1886
+BM_dealloc/8388608    1471430 ns      1471394 ns          482
+*/
+}
+// BENCHMARK(BM_dealloc)->Range(8, 8<<20);
