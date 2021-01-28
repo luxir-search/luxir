@@ -127,14 +127,14 @@ public:
 //     want to avoid the contention.
 
 SOLUX_PACKED_START
-
 class DocFreqPosStream {
   Stream docs;
   Stream positions;
-  int lastDoc;
-  int docFreq;  // we don't strictly need to track this unless we need to know for some reason.  we can read to end of doc stream.
+  int lastDoc;      // we only write lastDoc when we receive a new doc
+  int lastDocDelta;
+  int docFreq;      // we don't strictly need to track this unless we need to know for some reason.  we can read to end of doc stream.
   int termFreq;
-  int lastPos; // just for calculating deltas... we always write positions to the stream.
+  int lastPos;      // just for calculating deltas... we always write positions to the stream as we get them.
 
 
   void writePos(MemPool &pool, int pos) {
@@ -150,7 +150,7 @@ public:
   // todo: support positions > 2B?  Not useful?  Perhaps support with a special marker in the stream (like a 0 length payload that means
   // read a vint and multiply that by 2B and add it to the delta
 
-  DocFreqPosStream(MemPool &pool, int docid, int pos) : lastDoc(docid), docFreq(1),
+  DocFreqPosStream(MemPool &pool, int docid, int pos) : lastDoc(docid), lastDocDelta(docid), docFreq(1),
                                                         termFreq(1), lastPos(pos) {
     positions.writeVInt(pool, pos);
   }
@@ -166,17 +166,17 @@ public:
       writePos(pool, pos);
     } else {
       // new document... first write doc+freq for prev document
-      int code = termFreq == 1 ? (lastDoc<<1)|0x01 : lastDoc<<1;
+      int code = termFreq == 1 ? (lastDocDelta<<1)|0x01 : lastDocDelta<<1;
       docs.writeVInt(pool, code);
       if (termFreq != 1) {
         docs.writeVInt(pool, termFreq);
       }
 
       // now handle stuff for new doc
+      ++docFreq;
       termFreq = 1;
       lastDoc = docid;
-      ++docFreq;
-
+      lastDocDelta = delta;
       lastPos = 0;
       writePos(pool, pos);
     }
@@ -225,7 +225,7 @@ public:
                << ')';
   }
 }
-  SOLUX_PACKED_END;
+SOLUX_PACKED_END;
 
 
 
