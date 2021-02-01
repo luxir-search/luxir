@@ -12,11 +12,6 @@ namespace solux {
 //
 class Token {
 private:
-  // TODO: need move constructors.
-  // If ptr doesn't point to buf, then we should make a copy into buf
-
-  // ptr may or may not point to buf.
-  std::string buf;
 public:
   char *ptr;
   char *end;
@@ -45,7 +40,7 @@ public:
   TokenStream(Token &tok) : token(tok) {
   }
 
-  virtual ~TokenStream() {}
+  virtual ~TokenStream() = default;
 
   Token &getToken() { return token; }
 
@@ -54,12 +49,13 @@ public:
 
 class Tokenizer : public TokenStream {
 protected:
-  char *start_;
-  char *end_;
+  char *start_ = nullptr;
+  char *end_ = nullptr;
+  Token token;
 public:
-  Tokenizer(Token &tok) : TokenStream(tok) {}
+  Tokenizer() : TokenStream(token) {}
 
-  /** The value this points to should exist for the duration of the analysis and may be changed in place! */
+  /// The value this points to should exist for the duration of the analysis and may be changed in place!
   void setMutableValue(char *val, int len) {
     assert(len >= 0); // do we mave a max size as well?
     start_ = val;
@@ -69,17 +65,15 @@ public:
 
 
 class TokenFilter : public TokenStream {
-  std::unique_ptr<TokenFilter> source_;
+  std::unique_ptr<TokenStream> tokSource;
 public:
-  TokenFilter(Token &tok, std::unique_ptr<TokenFilter> source) : TokenStream(tok), source_(std::move(source)) {}
+  TokenFilter(std::unique_ptr<TokenStream> source) : TokenStream(source->getToken()), tokSource(std::move(source)) {
+  }
 
-  TokenFilter &source() { return *source_; }
+  TokenStream& source() { return *tokSource; }
 };
 
-// TODO: implement a test tokenizer like I did previously for my splitting filter in Lucene (and add payload support?)
-//  foo bar/3 baz/0|my_payload
 
-// TODO: keep track of offset!!!!!!!!!!!!!!!!! will need for highlighting!
 
 class WhitespaceTokenizer : public Tokenizer {
 
@@ -102,7 +96,7 @@ class WhitespaceTokenizer : public Tokenizer {
   }
 
 public:
-  WhitespaceTokenizer(Token &tok) : Tokenizer(tok) {}
+  WhitespaceTokenizer() : Tokenizer() {}
 
   // TODO: somehow add a method that could be used via templates
   // or something that could be inlined (i.e. delegation via templates)
@@ -163,6 +157,23 @@ public:
 };
 
 
+class LowercaseFilter : public TokenFilter {
+public:
+  LowercaseFilter(std::unique_ptr<TokenStream> source) : TokenFilter(std::move(source)) {}
+
+  bool incrementToken(bool first) override {
+    if (source().incrementToken(first)) {
+      for (char* curr = token.ptr; curr < token.end; curr++) {
+        if (*curr <= 'Z' && *curr >= 'A') { // TODO: handle unicode!
+          *curr += 'a' - 'A';
+        }
+      }
+      return true;
+    }
+    return false;
+  }
+};
+
 class TokenStreamFactory {
 
 
@@ -185,12 +196,11 @@ class FieldAnalyzer {
 
 class TokenChain {
 public:
-  std::unique_ptr<Token> token; // TODO: just include directly?
   Tokenizer &head;
   std::unique_ptr<TokenStream> tail;
 
-  TokenChain(std::unique_ptr<Token> token, Tokenizer &head, std::unique_ptr<TokenStream> tail)
-          : token(std::move(token)), head(head), tail(std::move(tail)) {}
+  TokenChain(Tokenizer &head, std::unique_ptr<TokenStream> tail)
+          : head(head), tail(std::move(tail)) {}
 };
 
 
@@ -202,22 +212,6 @@ class Analyzer {
     return nullptr;
   }
 };
-
-
-
-
-
-/***
-
-  fieldInfo.getFieldType()
-
-  // ask a field value to index itself?
-  // what about multi-valued fields?
-  fieldValue.index(Indexer& indexer)
-
-// wait... we already look up something per-field in the indexer... SegmentField... that's where the reusable analyzer (if needed) should live!
-
- */
 
 
 } // end namespace

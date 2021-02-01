@@ -1,6 +1,7 @@
 #pragma once
 
 #include "solux/util/MemPool.h"
+#include "solux/util/StrRef.h"
 #include <functional>
 #include "boost/iterator/filter_iterator.hpp"
 

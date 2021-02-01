@@ -1,5 +1,5 @@
 #include "SoluxTest.h"
-#include "stdlib.h"
+#include "solux/solux_main.h"
 #include "benchmark/benchmark.h"
 
 namespace solux {
@@ -69,43 +69,12 @@ bool starts_with(const char * str, const char * prefix)
   return true;
 }
 
-void print_env() {
-  // TODO: move some of this to main() so it always appears at the start.
-  std::cout << "ENV_INFO:";
-#ifdef NDEBUG
-  std::cout << " Release (NDEBUG)";
-#else
-  std::cout << " Debugging!";
-#endif
-#ifdef __OPTIMIZE__
-  std::cout << " __OPTIMIZE__=" << __OPTIMIZE__;
-#endif
-  std::cout << " __cplusplus=" << __cplusplus;
-#ifdef __clang__
-  std::cout << " __clang__=" << __clang__;
-#endif
-#ifdef __GNUC__
-  std::cout << " __GNUC__=" << __GNUC__;
-#endif
-#ifdef _MSC_VER
-  std::cout << " _MSC_VER=" << _MSC_VER;
-#endif
-#ifdef __VERSION__
-  std::cout << " __VERSION__=" << __VERSION__;
-#endif
-#ifdef __linux__
-  std::cout << " __linux__=" << __linux__;
-#endif
-
-  // std::cout << "sizeof(std::string)==" << sizeof(std::string) << std::endl;
-  std::cout << std::endl;
-}
 
 int main(int argc, char **argv) {
   gArgc = argc;
   gArgv = argv;
 
-  print_env();
+  std::cout << compile_env() << std::endl;
 
   std::vector<char *> myargv(gArgv, gArgv + gArgc);
 

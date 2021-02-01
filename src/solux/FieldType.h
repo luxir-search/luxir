@@ -94,9 +94,10 @@ public:
   // For example, a dynamic field w/ a big dict for analysis, or
   // even the StopWord list?  dynamic fields will have a template...
   // perhaps that is the answer!
+  // Still, want to dedup even for fields that change something minor... need separate identifier for analysis chain.
   virtual Analyzer &getAnalyzer() { return *(Analyzer *) 0; } // nocommit TODO
 
-  virtual SegFieldIndexed *createSegFieldIndexed(MemPool &pool);
+  // virtual SegFieldIndexed *createSegFieldIndexed(MemPool &pool);
 };
 
 

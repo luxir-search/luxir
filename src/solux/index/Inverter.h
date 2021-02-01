@@ -1,10 +1,9 @@
 #pragma once
 
-#include <unordered_map>
-#include <unordered_set>
+#include <parallel_hashmap/phmap.h>
+#include <map>
 #include "solux/util/MemPool.h"
 #include "solux/FieldType.h"
-#include "solux/util/TermHash.h"
 #include "solux/util/TermValHash.h"
 #include "DocStream.h"
 
@@ -40,108 +39,150 @@ Minimum needed to index a field value:
 
 
 
-// todo - a way to use multiple pools to expand our mem usage beyond 2G?
-// or get rid of that 2G limitation (get rid of block addressing)
 class Inverter {
+private:
+
+
+  std::vector<int> deleted; // use a docstream for this?
+
+  // TODO: this is temporary... we should get FieldTypes and TokenChains from the schema somehow
+  // and TokenChains should not be shared across different threads.
+  phmap::flat_hash_map<std::string, std::pair<std::unique_ptr<FieldType>, std::unique_ptr<TokenChain>>> typeInfo;
 public:
-
-  // Should this have pointers back to the Table object (Table or TableData)
-  // Should FieldInfo lookups been done already?
-
-
-  // TODO: should this the ultimate owner of the pool?
-  // If things are highly sharded, we could share a pool_ and have multiple
-  // uninverters per thread (highly multi-tennanted)
-
-
   // This means we should provide a way to specify a pool to use and then
   // have a higher level construct that represents an indexing thread.
   // This way, multiple shards could be handled by one thread.  They would all need to
   // flush at the same time to release the pool though.
   // Either that, or completely finish indexing (i.e. flush a segment) for each tenant
   // every time you get a batch of docs.  Then we could wind back the pool for each different tenant batch.
-  MemPool pool_;
-
-  // TODO: if our hashes are faster, use a TermValHash to do the mapping from string to
-  // field.  Need to handle variable size though... (packing string first, then value would
-  // eliminate the need to know the size.)  But destructors are off the list if we use BBP.
-  // Still, we should switch to a monotonic allocator for this since we will never need to
-  // release individually.
-
-  std::unordered_map<std::string, SegFieldIndexed *> segFields_;
+  MemPool pool;
 
 
-  int currDoc_ = -1;  // the current document being indexed
+  // Holds info for a single inverted field with positions for a single segment for this inverter.
+  class SegFieldPos {
+    friend class Inverter;
+
+    TermValHash<DocFreqPosStream> terms;  // the set of terms contained in this field
+    std::string fieldName;
+    FieldType *fieldType;
+    TokenChain *tokenChain;
+  public:
+    SegFieldPos(Inverter &inverter, const std::string_view &fieldName, FieldType *fieldType, TokenChain *tokenChain)
+            : terms(inverter.pool, 4), fieldName(fieldName), fieldType(fieldType), tokenChain(tokenChain) {
+    }
+
+    void index(Inverter &inverter, char *mutableVal, int len) {
+      inverter.index(*this, mutableVal, len);
+    }
+  };
+
+  // OPTIMIZATION: since we only do additions and not deletions, a monotonic allocator that had destructor
+  // support would be good here.
+  // This could also be a Set with a little more work since the fieldname is already in the value.
+  phmap::flat_hash_map<std::string, SegFieldPos> segFields;
+
+  SegFieldPos& getSegField(const std::string_view& name) {
+    auto iter = segFields.find(name);
+    if (iter != segFields.end()) {
+      return iter->second;
+    }
+
+    // How do we incorporate schema changes? Or do we?
+    // If we get a whole new schema, we would still need to hold onto all old ones if anything points back to them
+    // without a shared pointer?
+    // What if we turned FieldType into a value type
+    // and used std::variant / std::visit?
+    // Perhaps used named analysis chains... this would also facilitate specifying different ones at query time
+
+    // TODO: Need to look up the correct field type in schema.  For now just inline it.
+
+    std::string_view suffix = name.substr(name.find_last_of('_'));
+    auto typeIter = typeInfo.find(suffix);
+
+    if (typeIter == typeInfo.end()) {
+      auto ft = std::make_unique<FieldType>();
+      ft->name_ = suffix;
+      ft->flags_ = FieldType::INDEX_DOCS_AND_FREQS_AND_POSITIONS | FieldType::NUM_TOKENS_APPROX;
 
 
-  // TODO: normal map, or TermHash for field names?
+      auto wsTok = std::make_unique<WhitespaceTokenizer>();
+      auto& headRef = *wsTok;
+      std::unique_ptr<TokenChain> tc;
+      if (suffix == "_w") {
+        tc = make_unique<TokenChain>(headRef, std::move(wsTok));  // ws only
+      } else if (suffix =="_wl") {
+        auto lowerFilt = std::make_unique<LowercaseFilter>(std::move(wsTok));
+        tc = make_unique<TokenChain>(headRef, std::move(lowerFilt));
+      }
+      auto [it2, inserted] = typeInfo.try_emplace(suffix, std::move(ft), std::move(tc));
+      typeIter = it2;
+    }
 
-  // when does FieldType get looked up?
-  // ability to reuse FieldType
+    FieldType* fieldType = &*typeIter->second.first;
+    TokenChain* tokenChain = &*typeIter->second.second;
+
+    auto [newIter, inserted] = segFields.try_emplace(name, *this, name, fieldType, tokenChain);
+    return newIter->second;
+  }
 
 
-  // For "id", if we have DocValues, do we even want to create postings?  In essence, we already have all the info
-  // (just sort the DocValues to create the lookup later)
-  // - could use the PackedTerm returned and just have an array of those?
-  // - store anything with the ID as a payload (like "_version_"?)
-  // How does lucene store DocValues at first?
-  // Would the smaller size of doing it like lucene make up for the extra load (need to load buffer start)...should be cached?
 
-  // if we are both indexing and storing docvalues, then use the string pointer that is returned?
 
-  // single hash lookup to go from field name to SegmentFieldInfo or whatever?
-  // TODO: where is autodetection done?
-  // TODO: avoid hash lookup for "id" field?
+  int currDoc = -1;  // the current document being indexed
 
-  // pass function that fills in token, or pass function that actually indexes?
+  void startDoc() {
+    currDoc++;
+  }
+
+  void finishDoc() {
+  }
+
+  // mark the current doc as deleted if something went wrong.
+  void deleteDoc(int docid) {
+    deleted.push_back(docid);
+  }
+
+  void index(SegFieldPos& segField, char* mutableVal, int len) {
+    TokenChain& tc = *segField.tokenChain;
+    tc.head.setMutableValue(mutableVal, len);
+
+    int numTokens = 0;
+    int pos = 0;
+    auto& termsHash = segField.terms;
+    Token &tok = tc.head.getToken();
+    TokenStream& tail = *tc.tail;
+    int docid = currDoc;
+    for (;;) {
+      bool hasNext = tail.incrementToken(numTokens==0);
+      if (!hasNext) break;
+      ++numTokens;
+      pos += tok.positionIncrement;
+      auto term = std::string_view(tok.ptr, tok.end);
+      // int tokLen = tok.end - tok.ptr;
+
+      auto[entry, inserted] = termsHash.try_emplace(term, termsHash.getMemPool(), docid, pos);
+      if (!inserted) {
+        entry->val().addDoc(termsHash.getMemPool(), docid, pos);
+      }
+    }
+
+    // segField.sumTotalTermFreq += numTokens;
+    if (numTokens > 0) {
+      // todo: index field length (for normalization / scoring) if we're indexing norms
+      // todo: add to "document has field" if we're not indexing norms, or if we need
+      // an index into sparse norms.  Same thing for any field with sparse docvalues...
+      // Can these "document has field" sets be deduped?  Keep a hash of all others written
+      // so far and if the hash compares, then compare the sets.
+    }
+  }
 
 
   void index(Document &doc);
 
-  void indexField(FieldValue &fv);
-
-
-
-  /***
-
-
-  SegmentField& getSegmentField(const std::string& fname) {
-    auto segField = segFields_[fname];
-    if (segField == nullptr) {
-      // TODO: use a different pool for less waste?  Or a vector if we want to use fieldnums efficiently?
-      auto bbAddr = pool_.allocateTypeAligned(segField);
-      segField = new(segField) SegmentField(pool_, fi);
-      segFields_[fname] = segField;
-    }
+  size_t memSize() {
+    // TODO: take into account more than just the pool
+    return pool.size();
   }
-
-
-  void indexToken(SegmentField& segField, Token token) {
-    auto& entry = segField.terms.lookupOrAdd(token.ptr, token.numBytes());
-    if (entry.second.ptr_ == nullptr) {
-      new (&entry.second)TermsHash::value_type();
-      entry.second.writeFirstInt(pool_, currDoc_);
-    } else {
-      entry.second.writeAnotherInt(pool_, currDoc_);
-    }
-  }
-
-  SegmentTerm& indexTokenDoc(FieldInfo& fi, SegmentField& segField, char* ptr, char* end) {
-
-    SegmentTerm& segTerm = segField.terms.lookupOrAdd(ptr, (int)(end-ptr)).second;  // todo: handle overflow of token length
-    // &segTerm can be null at this point... should we create the value_type in lookupOrAdd instead?
-
-    if (segTerm.ptr_ == nullptr) {
-      new (&segTerm)TermsHash::value_type();
-      segTerm.writeFirstInt(pool_, currDoc_);
-    } else {
-      segTerm.writeAnotherInt(pool_, currDoc_);
-    }
-    return segTerm;
-  }
-
-   ***/
-
 };
 
 } // end namespace

@@ -1,6 +1,7 @@
 
 #include <gtest/gtest.h>
 #include <iostream>
+#include <solux/index/Inverter.h>
 
 #include "solux/index/DocStream.h"
 #include "test/SoluxTest.h"
