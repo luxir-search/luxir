@@ -116,7 +116,17 @@ public:
     newTable(initialSizePowerOfTwo);
   }
 
-  ~TermValHash();
+  ~TermValHash() {
+    free();
+  }
+
+  // free up what memory we can early (i.e. before normal destructor would be called)
+  void free() {
+    if (table_ != nullptr) {
+      delete[] reinterpret_cast<char *>(table_);
+      table_ = nullptr;
+    }
+  }
 
   [[nodiscard]] MemPool& getMemPool() const { return pool_; }
 
@@ -164,6 +174,28 @@ public:
     return try_emplace(s.data(), s.size(), std::forward<Args>(args)...);
   }
 
+  // Packs all values into the start of the internal array and returns a pointer to the beginning.
+  // Additions, lookups, or other hash operations will be undefined after this point.  The purpose of this
+  // method is to avoid an extra (potentially large) allocation just to copy the values to sort.
+  // The memory pointed at is still owned by this table and should not be accessed after it has been destructed.
+  iterator destructiveCompress() {
+    auto sz = size();
+    size_t endIdx = tableSize_;
+    for (size_t i=0; i<sz; i++) {
+      // first find an empty slot
+      if (!table_[i].isNull()) continue;
+      // now search from the end to find a full slot
+      while (table_[--endIdx].isNull());
+      // move the occupied slot at the end to be empty slot
+      table_[i] = table_[endIdx];
+      // not necessary to actually "empty" the occupied slot we copied.
+    }
+    return table_;
+  }
+
+  friend std::ostream& operator<<(std::ostream &out, const TermValHash &tvh) {
+    return out << "{size:" << tvh.size() << " loadFactor:" << tvh.size()/(float)tvh.tableSize_ << "}";
+  }
 };
 
 template<class T, class Hasher>
@@ -201,11 +233,6 @@ void TermValHash<T,Hasher>::rehash() {
   }
 
   delete[] reinterpret_cast<char *>(oldTable);
-}
-
-template<class T, class Hasher>
-TermValHash<T,Hasher>::~TermValHash() {
-  delete[] reinterpret_cast<char *>(table_);
 }
 
 } // end namespace

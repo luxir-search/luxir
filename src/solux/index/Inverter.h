@@ -6,6 +6,7 @@
 #include "solux/FieldType.h"
 #include "solux/util/TermValHash.h"
 #include "DocStream.h"
+#include "PostingsWriter.h"
 
 namespace solux {
 
@@ -71,8 +72,18 @@ public:
             : terms(inverter.pool, 4), fieldName(fieldName), fieldType(fieldType), tokenChain(tokenChain) {
     }
 
+    ~SegFieldPos() = default;
+
     void index(Inverter &inverter, char *mutableVal, int len) {
       inverter.index(*this, mutableVal, len);
+    }
+
+    auto operator<=>(const SegFieldPos& other) const {
+      return this->fieldName <=> other.fieldName;
+    }
+
+    friend std::ostream& operator<<(std::ostream &out, const SegFieldPos &sf) {
+      return out << "{field:" << sf.fieldName << " terms:" << sf.terms << "}";
     }
   };
 
@@ -183,6 +194,43 @@ public:
     // TODO: take into account more than just the pool
     return pool.size();
   }
+
+  void writePostings(PostingsWriter& postingsWriter) {
+    // first gather and sort the fields
+    std::vector<SegFieldPos*> fields;
+    fields.reserve(segFields.size());
+    for (auto& entry : segFields) {
+      fields.push_back(&entry.second);
+    }
+    // TODO: use a better sort like spreadsort, pdqsort, ska_sort
+    std::sort(fields.begin(), fields.end(), [](SegFieldPos* a, SegFieldPos* b){return *a < *b;} );
+
+    for (auto field : fields) {
+      // std::cout << "Writing field " << *field << std::endl;
+      writePostings(postingsWriter, *field);
+    }
+  }
+
+  void writePostings(PostingsWriter& postingsWriter, SegFieldPos& field) {
+    auto sz = field.terms.size();
+    // gathering and sorting terms for each field could be done in parallel, but it probably doesn't
+    // represent much time.  Fields that can result in their own file should be able to be parallelized easily!
+    auto terms = field.terms.destructiveCompress();
+    // TODO: use better sort
+    std::sort(terms, terms+sz);
+    postingsWriter.startField(field.fieldName);
+    for (size_t tnum=0; tnum<sz; tnum++) {
+      auto term = terms[tnum];
+      postingsWriter.startTerm(term);
+      // push all the docs / positions for this term
+      term.val().pushDocs(pool, postingsWriter);
+      postingsWriter.endTerm(term);
+    }
+    postingsWriter.endField(field.fieldName);
+    field.terms.free();
+  }
+
+
 };
 
 } // end namespace
