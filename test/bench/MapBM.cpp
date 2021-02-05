@@ -449,8 +449,8 @@ static void BM_mapPHNodeSet(benchmark::State& state) { BM_invertTemplate<PHNodeS
 BENCHMARK(BM_mapPHNodeSet);
 static void BM_mapPHFlatMap(benchmark::State& state) { BM_invertTemplate<PHFlatMap>(state); }
 BENCHMARK(BM_mapPHFlatMap);
-static void BM_vStrPHFlatMap(benchmark::State& state) { BM_invertTemplate<StrPHFlatMap>(state); }
-BENCHMARK(BM_vStrPHFlatMap);
+static void BM_mapStrPHFlatMap(benchmark::State& state) { BM_invertTemplate<StrPHFlatMap>(state); }
+BENCHMARK(BM_mapStrPHFlatMap);
 static void BM_mapSVPHFlatMap(benchmark::State& state) { BM_invertTemplate<SVPHFlatMap>(state); }
 BENCHMARK(BM_mapSVPHFlatMap);
 static void BM_mapSVstdMap(benchmark::State& state) { BM_invertTemplate<SVstdMap>(state); }

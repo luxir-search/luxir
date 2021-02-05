@@ -1,5 +1,8 @@
+#include <filesystem>
 #include <sstream>
 #include <solux/util/solux_util.h>
+
+namespace fs = std::filesystem;
 
 using namespace solux;
 
@@ -8,9 +11,9 @@ int solux_main(int argc, char** argv) {
   return 0;
 }
 
-std::string compile_env() {
+std::string solux_banner() {
   std::stringstream ss;
-  ss << "INFO:";
+  ss << "solux (insert cool ascii art here ;-) ";
 #ifdef NDEBUG
   ss << " Release (NDEBUG)";
 #else
@@ -35,5 +38,11 @@ std::string compile_env() {
 #ifdef __linux__
   ss << " __linux__=" << __linux__;
 #endif
+
+  ss << std::endl;
+  ss << "\tcwd=" << fs::current_path();
+  ss << " tmp=" << fs::temp_directory_path();
+
+
   return ss.str();
 }

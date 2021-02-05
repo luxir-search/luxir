@@ -1,4 +1,5 @@
 #include "SoluxTest.h"
+#include "TestData.h"
 #include "solux/solux_main.h"
 #include "benchmark/benchmark.h"
 
@@ -74,7 +75,7 @@ int main(int argc, char **argv) {
   gArgc = argc;
   gArgv = argv;
 
-  std::cout << compile_env() << std::endl;
+  std::cout << solux_banner() << std::endl;
 
   std::vector<char *> myargv(gArgv, gArgv + gArgc);
 
@@ -154,6 +155,7 @@ TEST(Benchmarks, all) {
   benchmark::RunSpecifiedBenchmarks();
 }
 
+std::unique_ptr<TestData> TestData::data = std::make_unique<TestData>();
 
 #ifdef MEM_SCRIBBLE
 void* operator new (std::size_t count ) {
