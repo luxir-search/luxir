@@ -1,46 +1,24 @@
 #pragma once
-#include <filesystem>
-#include <iostream>
-#include <fstream>
 #include <gtest/gtest.h>
-#include "solux/util/solux_util.h"
-#include "solux/util/random.h"
 
-namespace fs=std::filesystem;
-using namespace solux;
 
 class Book {
-public:
   std::string str;
+  void readFile();
+  void parse();
 
+public:
+  std::vector<int> bookOffsets;
+  std::vector<int> chapterOffsets;
+  std::vector<int> paraOffsets;
+  std::vector<int16_t> paraSizes;
+  int sumParaSizes;  // size of all paragraphs together (i.e. smaller than the whole text of the book)
 
-  Book() {
-    readFile();
-    parse();
-  }
+  Book();
 
   std::string_view text() {
     return str;
   }
-
-  void readFile() {
-    auto fname = fs::temp_directory_path() / "solux" / "book.txt";
-    std::ifstream file(fname, std::ios::binary);
-    if (!file) {
-      std::cout << "Couldn't read file " << fname << std::endl;
-    }
-    std::stringstream ss;
-    ss << file.rdbuf();
-    str = ss.str();
-    std::cout << "LENGTH of " << fname << " is " << str.size() << std::endl;
-  }
-
-  void parse() {
-
-
-
-  }
-
 };
 
 class TestData {

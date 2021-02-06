@@ -1,5 +1,5 @@
+#include <filesystem>
 #include "SoluxTest.h"
-#include "TestData.h"
 #include "solux/solux_main.h"
 #include "benchmark/benchmark.h"
 
@@ -155,7 +155,6 @@ TEST(Benchmarks, all) {
   benchmark::RunSpecifiedBenchmarks();
 }
 
-std::unique_ptr<TestData> TestData::data = std::make_unique<TestData>();
 
 #ifdef MEM_SCRIBBLE
 void* operator new (std::size_t count ) {

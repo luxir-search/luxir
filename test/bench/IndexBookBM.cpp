@@ -6,7 +6,7 @@
 
 using namespace solux;
 
-static void BM_IndexBook(benchmark::State& state, std::string field, bool writePostings) {
+static void BM_IndexBook(benchmark::State& state, std::string field, bool writePostings, bool docPerPara) {
 
   Book& book = TestData::data->getBook();
 
@@ -15,19 +15,26 @@ static void BM_IndexBook(benchmark::State& state, std::string field, bool writeP
     segTest = std::make_unique<SegmentTest>();
   }
 
-  int iter = unit_tests ? 1 : 1;
   int64_t inverterSz = 0;
   char* data = const_cast<char*>(book.text().data());  // TODO: need to make a copy for any analysis that mutates? Make tokenizer do this?
-  int sz = book.text().size();
+  int sz = docPerPara ? book.sumParaSizes : book.text().size();
 
   for (auto _ : state) {
     Inverter inverter;
     Inverter::SegFieldPos& segField = inverter.getSegField(field);
 
-    for (int i=0; i<iter;i++) {
+    if (!docPerPara) {
+      // index whole book as a single document
       inverter.startDoc();
       inverter.index(segField, data, sz);
       inverter.finishDoc();
+    } else {
+      // index each paragraph as its own document
+      for (int i=0; i<(int)book.paraOffsets.size(); i++) {
+        inverter.startDoc();
+        inverter.index(segField, data + book.paraOffsets[i], book.paraSizes[i]);
+        inverter.finishDoc();
+      }
     }
 
     inverterSz = inverter.memSize();
@@ -38,7 +45,7 @@ static void BM_IndexBook(benchmark::State& state, std::string field, bool writeP
     }
   }
 
-  state.counters["rate="] = benchmark::Counter(sz*iter, benchmark::Counter::kIsIterationInvariantRate);
+  state.counters["rate="] = benchmark::Counter(sz, benchmark::Counter::kIsIterationInvariantRate);
   state.counters["inverterSz"] = inverterSz;
   if (writePostings) {
     segTest->initReader();
@@ -48,7 +55,7 @@ static void BM_IndexBook(benchmark::State& state, std::string field, bool writeP
 
 
 
-BENCHMARK_CAPTURE(BM_IndexBook, ws, "text_w", false);
-BENCHMARK_CAPTURE(BM_IndexBook, ws_postings, "text_w", true);
-// BENCHMARK_CAPTURE(BM_IndexBook, ws_lc, "text_wl", false);
-// BENCHMARK_CAPTURE(BM_IndexBook, ws_postings, "text_w", true);
+BENCHMARK_CAPTURE(BM_IndexBook, ws, "text_w", false, false);             // index whole book as single doc, invert only
+BENCHMARK_CAPTURE(BM_IndexBook, ws_postings, "text_w", true, false);     // index whole book as single doc
+BENCHMARK_CAPTURE(BM_IndexBook, para_ws, "text_w", false, true);         // index paragraph-per-doc, invert only
+BENCHMARK_CAPTURE(BM_IndexBook, para_ws_postings, "text_w", true, true); // index paragraph-per-ddoc
