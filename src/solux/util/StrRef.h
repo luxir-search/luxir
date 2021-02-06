@@ -223,6 +223,28 @@ public:
     return memcmp(ptr_ + 1, other.ptr_ + 1, sz1) == 0;
   }
 
+  explicit operator std::string_view() const { return std::string_view(data(), size()); }
+
+  inline friend int operator<=>(const PackedTerm &a, const PackedTerm &b) {
+    int datacmp = memcmp(a.data(), b.data(), std::min(a.size(), b.size()));
+    return (datacmp != 0) ? datacmp : ((int) a.size() - (int) b.size());
+  }
+
+  // functors for use with boost sort
+  struct lessthan {
+    inline bool operator()(const PackedTerm& x, const PackedTerm& y) const {
+      return x < y;
+    }
+  };
+  struct bracket {
+    inline unsigned char operator()(const PackedTerm& x, size_t offset) const {
+      return x.ptr_[offset+1];
+    }
+  };
+  struct getsize {
+    inline size_t operator()(const PackedTerm& x) const { return x.size(); }
+  };
+
   friend std::ostream &operator<<(std::ostream &out, const PackedTerm &term) {
     if (term.isNull()) {
       out << "(null)";
@@ -234,16 +256,16 @@ public:
     return out;
   }
 
-  explicit operator std::string_view() const { return std::string_view(data(), size()); }
 };
 
 // NOTE: comparators with const char* are not supported as we are dealing with binary data
 // which has explicit lengths (and accidental use would lead to bugs)
-
+/*
 inline int operator<=>(const PackedTerm &a, const PackedTerm &b) {
   int datacmp = memcmp(a.data(), b.data(), std::min(a.size(), b.size()));
   return (datacmp != 0) ? datacmp : ((int) a.size() - (int) b.size());
 }
+*/
 
 template<typename StringType>
 // StringType just needs size() and data().... which std::string and std::string_view both have.

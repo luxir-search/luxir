@@ -1,5 +1,8 @@
 #pragma once
 
+#include <algorithm>
+#include <boost/sort/spreadsort/string_sort.hpp>
+#include <boost/sort/pdqsort/pdqsort.hpp>
 #include <parallel_hashmap/phmap.h>
 #include <map>
 #include "solux/util/MemPool.h"
@@ -8,7 +11,11 @@
 #include "DocStream.h"
 #include "PostingsWriter.h"
 
+
+
 namespace solux {
+
+using std::iter_swap; // for boost string_sort
 
 
 /***
@@ -216,8 +223,23 @@ public:
     // gathering and sorting terms for each field could be done in parallel, but it probably doesn't
     // represent much time.  Fields that can result in their own file should be able to be parallelized easily!
     auto terms = field.terms.destructiveCompress();
-    // TODO: use better sort
-    std::sort(terms, terms+sz);
+
+    // Sorting this with std::sort took ~7.3ms out of a total of ~22ms for inversion and 38ms for inversion+postings_writing!
+    // There were only 41991 unique terms... how can sort be so slow? Cache misses?
+    // For cache misses, we could try using a string type with a short-string optimization, or try packing all the strings
+    // for a field together (would need to know what fields have many terms though.)
+    // If strings are short on average, try an inline memcmp!
+    // pdqsort == 6.8ms
+    // spread_sort::string_sort == 3.9ms
+
+    // std::chrono::high_resolution_clock::time_point startTime = std::chrono::high_resolution_clock::now();
+    // std::sort(terms, terms+sz);
+    // boost::sort::pdqsort(terms, terms+sz);
+    boost::sort::spreadsort::string_sort(terms, terms+sz, TermRef::bracket(), TermRef::getsize(), TermRef::lessthan());
+    // auto endTime = std::chrono::high_resolution_clock::now();
+    // auto thisElapsed = std::chrono::duration_cast<std::chrono::nanoseconds>( endTime - startTime ).count();
+    // std::cout << "terms=" << sz << " SORT time ns=" << thisElapsed << std::endl;
+
     postingsWriter.startField(field.fieldName);
     for (size_t tnum=0; tnum<sz; tnum++) {
       auto term = terms[tnum];
