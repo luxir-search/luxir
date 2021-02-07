@@ -2,9 +2,7 @@
 
 #include <algorithm>
 #include <boost/sort/spreadsort/string_sort.hpp>
-#include <boost/sort/pdqsort/pdqsort.hpp>
 #include <parallel_hashmap/phmap.h>
-#include <map>
 #include "solux/util/MemPool.h"
 #include "solux/FieldType.h"
 #include "solux/util/TermValHash.h"
@@ -209,8 +207,14 @@ public:
     for (auto& entry : segFields) {
       fields.push_back(&entry.second);
     }
-    // TODO: use a better sort like spreadsort, pdqsort, ska_sort
-    std::sort(fields.begin(), fields.end(), [](SegFieldPos* a, SegFieldPos* b){return *a < *b;} );
+
+    // For normal usecases, spreadsort will fall back to pdqsort (less than 1000 fields, but we want to
+    // take care of the outliers as well (esp when it doesn't hurt the average case)
+    boost::sort::spreadsort::string_sort(fields.begin(), fields.end(),
+                                         [](const SegFieldPos* x, size_t offset) {return x->fieldName[offset];},
+                                         [](const SegFieldPos* x) {return x->fieldName.size();},
+                                         [](const SegFieldPos* x, const SegFieldPos* y) {return *x < *y;});
+
 
     for (auto field : fields) {
       // std::cout << "Writing field " << *field << std::endl;
