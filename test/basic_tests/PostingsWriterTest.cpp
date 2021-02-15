@@ -17,9 +17,9 @@ protected:
 
 
   // set these limits lower for easier debugging
-  uint32_t positionsPerDocMax = 10;  // TODO: We don't have support for reading blocks yet, so make sure positionsPerDocMax*docsPerTermMax is less than a positions block size
+  uint32_t positionsPerDocMax = 10;
   uint32_t docsPerTermMax = 10;
-  uint32_t termsPerFieldMax = 100;  // TODO: stick to a single term block for now
+  uint32_t termsPerFieldMax = 100;
 
 
   std::unique_ptr<PostingsReader> reader;
@@ -37,7 +37,7 @@ protected:
   void initWriter() {
     pool.rewind(save);
     dir = RAMDir();  // remove all files?
-    writer = std::make_unique<PostingsWriter>(dir, "gen1");
+    writer = std::make_unique<PostingsWriter>(dir, "10");
 
     // save the RNG state
     rng_start = rng;
@@ -48,11 +48,8 @@ protected:
   void initReader() {
     writer->finish();
 
-    auto tindexFile = dir.openFile("tindex");
-    auto termFile = dir.openFile("term");
-    auto docFile = dir.openFile("doc");
-    auto posFile = dir.openFile("pos");
-    reader = std::make_unique<PostingsReader>(tindexFile.get(), termFile.get(), docFile.get(), posFile.get());
+    std::string gen = "10";
+    reader = std::make_unique<PostingsReader>(dir, "10");
     tindexReader = std::make_unique<TermIndexReader>(pool, *reader);
 
     // restore the RNG state
@@ -237,7 +234,7 @@ protected:
 TEST_F(PostingsTest, basic) {
   RAMDir dir;
   MemPool pool;
-  PostingsWriter writer(dir, "gen1");
+  PostingsWriter writer(dir, "10");
   std::string t1 = "term1";
   std::string t2 = "term2";
   std::string ta = "termA";
@@ -287,11 +284,7 @@ TEST_F(PostingsTest, basic) {
   writer.finish();
 
 
-  auto tindexFile = dir.openFile("tindex");
-  auto termFile = dir.openFile("term");
-  auto docFile = dir.openFile("doc");
-  auto posFile = dir.openFile("pos");
-  PostingsReader reader(tindexFile.get(), termFile.get(), docFile.get(), posFile.get());
+  PostingsReader reader(dir, "10");
 
   TermIndexReader tindexReader(pool, reader);
   while (tindexReader.readNextField()) {
@@ -325,7 +318,7 @@ TEST_F(PostingsTest, basic) {
 TEST_F(PostingsTest, blockPositions) {
   RAMDir dir;
   MemPool pool;
-  PostingsWriter writer(dir, "gen1");
+  PostingsWriter writer(dir, "10");
   std::string t1 = "term1";
   TermRef term1(pool, t1.data(), t1.size());
 
@@ -352,12 +345,7 @@ TEST_F(PostingsTest, blockPositions) {
   writer.endField("field1");
   writer.finish();
 
-
-  auto tindexFile = dir.openFile("tindex");
-  auto termFile = dir.openFile("term");
-  auto docFile = dir.openFile("doc");
-  auto posFile = dir.openFile("pos");
-  PostingsReader reader(tindexFile.get(), termFile.get(), docFile.get(), posFile.get());
+  PostingsReader reader(dir, "10");
 
   TermIndexReader tindexReader(pool, reader);
   ASSERT_TRUE(tindexReader.readNextField());
@@ -412,7 +400,7 @@ TEST_F(PostingsTest, blockPositions) {
 TEST_F(PostingsTest, blockTerms) {
   RAMDir dir;
   MemPool pool;
-  PostingsWriter writer(dir, "gen1");
+  PostingsWriter writer(dir, "10");
   int nTerms = Postings::TERMS_BLOCK_SIZE + 1;
 
   writer.startField("field1");
@@ -432,12 +420,7 @@ TEST_F(PostingsTest, blockTerms) {
   writer.endField("field1");
   writer.finish();
 
-
-  auto tindexFile = dir.openFile("tindex");
-  auto termFile = dir.openFile("term");
-  auto docFile = dir.openFile("doc");
-  auto posFile = dir.openFile("pos");
-  PostingsReader reader(tindexFile.get(), termFile.get(), docFile.get(), posFile.get());
+  PostingsReader reader(dir, "10");
 
   TermIndexReader tindexReader(pool, reader);
   ASSERT_TRUE(tindexReader.readNextField());

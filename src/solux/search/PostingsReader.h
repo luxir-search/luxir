@@ -40,11 +40,26 @@ public:
   DocsCodec docCodec;
   PositionsCodec posCodec;
   TFreqCodec& tfreqCodec = posCodec;
+
+  static constexpr std::string_view PREFIX_FNAME = "s";
+  static constexpr std::string_view TERM_INDEX_FNAME = "_ti";
+  static constexpr std::string_view TERMS_FNAME = "_t";
+  static constexpr std::string_view DOCS_FNAME = "_d";
+  static constexpr std::string_view POS_FNAME = "_p";
+
+
+  static std::string getIndexFileName(const std::string_view& gen, const std::string_view& suffix) {
+    return std::string(PREFIX_FNAME).append(gen).append(suffix);
+  }
+
+
 };
 
 // Lowest level postings reader class that needs to correspond to the PostingsWriter class that created the data.
 // PostingsReader should be thread-safe at the top level, but any iterators it supplies would not be.
 class PostingsReader {
+  std::vector<std::shared_ptr<InputFile>> files;  // temporary owner of open files
+
 public:
 
   InputFile* tindexFile;
@@ -54,6 +69,13 @@ public:
 
   Postings postings; // for codecs... temporary since they aren't necessarily thread safe?
 
+  // TODO temporary... this will likely be done at a higher level?
+  explicit PostingsReader(Directory& dir, std::string_view gen) {
+    tindexFile = files.emplace_back(dir.openFile(Postings::getIndexFileName(gen, Postings::TERM_INDEX_FNAME))).get();
+    termFile = files.emplace_back(dir.openFile(Postings::getIndexFileName(gen, Postings::TERMS_FNAME))).get();
+    docFile = files.emplace_back(dir.openFile(Postings::getIndexFileName(gen, Postings::DOCS_FNAME))).get();
+    posFile = files.emplace_back(dir.openFile(Postings::getIndexFileName(gen, Postings::POS_FNAME))).get();
+  }
 
   PostingsReader(InputFile* tindexFile, InputFile* termFile, InputFile* docFile, InputFile* posFile)
   : tindexFile(tindexFile), termFile(termFile), docFile(docFile), posFile(posFile)

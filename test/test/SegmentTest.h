@@ -54,7 +54,7 @@ public:
     fingerprint = 0;
     pool.rewind(save);
     dir = RAMDir();  // remove all files?
-    writer = std::make_unique<PostingsWriter>(dir, "gen1");
+    writer = std::make_unique<PostingsWriter>(dir, "10");
 
     // save the RNG state
     rng_snapshot = r;
@@ -65,11 +65,7 @@ public:
   void initReader() {
     writer->finish();
 
-    auto tindexFile = dir.openFile("tindex");
-    auto termFile = dir.openFile("term");
-    auto docFile = dir.openFile("doc");
-    auto posFile = dir.openFile("pos");
-    reader = std::make_unique<PostingsReader>(tindexFile.get(), termFile.get(), docFile.get(), posFile.get());
+    reader = std::make_unique<PostingsReader>(dir, "10");
     tindexReader = std::make_unique<TermIndexReader>(pool, *reader);
 
     // restore the RNG state
@@ -77,7 +73,12 @@ public:
     // re-init secondary rng off of first
     r2.init(r());
 
-    indexSize = tindexFile->size() +termFile->size() + docFile->size() + posFile->size();
+    std::vector<std::string> files;
+    dir.listFiles(files);
+    indexSize = 0;
+    for (auto& fname : files) {
+      indexSize += dir.openFile(fname)->size();
+    }
 
     // TODO: refactor this somewhere more useful.  Directory?
     // std::cout << "INDEX SIZE tif=" << tindexFile->size() << " tf=" << termFile->size() << " df=" << docFile->size() << " pf=" << posFile->size() << std::endl;

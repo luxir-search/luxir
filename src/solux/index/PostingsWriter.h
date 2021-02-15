@@ -218,14 +218,14 @@ private:  // some internal utility methods... not for use by indexers
   }
 
 public:
-  PostingsWriter(Directory& dir, const std::string& gen) : directory(dir), generation(gen)
+  PostingsWriter(Directory& dir, const std::string_view& gen) : directory(dir), generation(gen)
   {
     // TODO: defer file creation until needed, *or* use a RAMDelegatingFile that does so.
     // that does so.
-    tindexFile = directory.createFile("tindex");  // TODO: temporary names just for now...
-    termFile   = directory.createFile("term");
-    docFile    = directory.createFile("doc");
-    posFile    = directory.createFile("pos");
+    tindexFile = directory.createFile(Postings::getIndexFileName(gen, Postings::TERM_INDEX_FNAME));
+    termFile   = directory.createFile(Postings::getIndexFileName(gen, Postings::TERMS_FNAME));
+    docFile    = directory.createFile(Postings::getIndexFileName(gen, Postings::DOCS_FNAME));
+    posFile    = directory.createFile(Postings::getIndexFileName(gen, Postings::POS_FNAME));
 
     tindexOutput.setFile(tindexFile.get());
     termOutput.setFile(termFile.get());

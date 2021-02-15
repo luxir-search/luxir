@@ -101,6 +101,13 @@ public:
     return readVint();
   }
 
+  std::string_view readStr() {
+    size_t strLen = readStrLen();
+    auto strStart = pos;
+    skip(strLen);
+    return {strStart, strLen};
+  }
+
   void skipStr() {
     auto len = readStrLen();
     pos += len;

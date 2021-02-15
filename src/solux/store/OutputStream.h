@@ -155,6 +155,10 @@ public:
     write((void *) data, len);
   }
 
+  void writeStr(const std::string_view& sv) {
+    writeStr(sv.data(), sv.length());
+  }
+
 };
 
 
