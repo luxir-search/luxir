@@ -19,9 +19,9 @@ protected:
   virtual void close(OutputStream &os) = 0;
 
 public:
-  explicit File(const std::string &name) : name_(name) {}
+  explicit File(const std::string_view &name) : name_(name) {}
 
-  const std::string &name() { return name_; }
+  const std::string& name() { return name_; }
 
   virtual size_t size() = 0;
 

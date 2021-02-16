@@ -7,6 +7,8 @@
 #include <sstream>
 #include <unordered_map>
 #include <vector>
+#include <string>
+#include <charconv>
 #include "solux/store/Directory.h"
 #include "solux/store/InputStream.h"
 #include "solux/util/MemPool.h"
@@ -41,6 +43,7 @@ public:
   PositionsCodec posCodec;
   TFreqCodec& tfreqCodec = posCodec;
 
+  static constexpr auto SEGFILE = "s.olux";
   static constexpr std::string_view PREFIX_FNAME = "s";
   static constexpr std::string_view TERM_INDEX_FNAME = "_ti";
   static constexpr std::string_view TERMS_FNAME = "_t";
