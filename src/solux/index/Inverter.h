@@ -153,6 +153,10 @@ public:
   void finishDoc() {
   }
 
+  int32_t getMaxDoc() {
+    return currDoc + 1;
+  }
+
   // mark the current doc as deleted if something went wrong.
   void deleteDoc(int docid) {
     deleted.push_back(docid);

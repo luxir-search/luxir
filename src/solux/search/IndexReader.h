@@ -12,6 +12,7 @@ public:
     int ord;  // index of this segment in the list of segments
     std::unique_ptr<PostingsReader> reader;
 
+
     /* couldn't get any of these to work with storing directly in vector (when including PostingsReader directly)
      so changed to unique_ptr for now.
     Segment(int64_t base, int ord, Directory& dir, const std::string_view& gen)
@@ -27,17 +28,18 @@ public:
 
 
   IndexReader(Directory& dir) {
-    std::shared_ptr<InputFile> segFile = dir.openFile(Postings::SEGFILE);
-    if (segFile.get() == nullptr) {
+    std::shared_ptr<InputFile> inputFile = dir.openFile(Postings::INDEX_INFO_FILE);
+    if (inputFile == nullptr) {
       // throw exception, or just have zero segments?
     } else {
-      InputStream segmentsIs = segFile->getInputStream();
+      InputStream segmentsIs = inputFile->getInputStream();
       gen = segmentsIs.readVlong();
       int nsegs = segmentsIs.readVint();
       segs.reserve(nsegs);
       for (int i=0; i<nsegs; i++) {
         auto s = segmentsIs.readStr();
-        segs.emplace_back(0, i, std::make_unique<PostingsReader>(dir, s));
+        segs.emplace_back(maxdoc, i, std::make_unique<PostingsReader>(dir, s));
+        maxdoc += segs.back().reader->maxDoc();
       }
       // TODO: sort segments by maxdoc, largest first?  Or make IndexWriter do this when writing segments file?
     }
@@ -47,6 +49,9 @@ public:
     return segs;
   }
 
+  int64_t maxDoc() {
+    return maxdoc;
+  }
 
 private:
   // TODO: how to handle deleted docs?  Have a different postings reader that actually knows it's own deleted docs
@@ -54,6 +59,7 @@ private:
   // If we start caching anything on PostingsReader, we would want the latter (but that would require using shared_ptr again too.
   std::vector<Segment> segs;
   uint64_t gen;
+  int64_t maxdoc = 0;
 };
 
 }

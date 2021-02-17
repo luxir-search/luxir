@@ -54,7 +54,7 @@ public:
   std::vector<std::string> segs;  // all of the referenced segments (TODO: replace with something containing more info when needed)
 
   explicit IndexWriter(Directory &dir) : dir(dir) {
-    std::shared_ptr<InputFile> segFile = dir.openFile(Postings::SEGFILE);
+    std::shared_ptr<InputFile> segFile = dir.openFile(Postings::INDEX_INFO_FILE);
     if (segFile.get() == nullptr) {
       gen = 0;
       // TODO: verify directory has no other index files? (i.e. this would tend to indicate corruption)
@@ -76,7 +76,7 @@ public:
   // TODO: currently not thread safe
   // Only valid until a flush
   Inverter &getInverter() {
-    if (inverter.get() == nullptr) {
+    if (inverter == nullptr) {
       inverter = std::make_unique<Inverter>();
     }
     return *inverter;
@@ -87,29 +87,30 @@ public:
   // TODO: currently not thread safe
   // just pass in Inverter here?
   void flush() {
-    if (inverter.get() == nullptr) return;
+    if (inverter == nullptr) return;
     // TODO: check if inverter actually inverted any docs?
 
     gen++;
     std::string genStr = getSortableString(gen);
     PostingsWriter postingsWriter(dir, genStr);
+    postingsWriter.setMaxDocUpperBound(inverter->getMaxDoc());
     inverter->writePostings(postingsWriter);
     postingsWriter.finish();
 
     segs.emplace_back(genStr);
     // write new segments file
     // TODO: TBD if we write new segments files or just use the same name
-    auto segFile = dir.createFile(Postings::SEGFILE);
-    OutputStream segOut;
-    segOut.setFile(&*segFile);
+    auto indexFile = dir.createFile(Postings::INDEX_INFO_FILE);
+    OutputStream indexOut;
+    indexOut.setFile(&*indexFile);
 
-    segOut.writeVlong(gen);
-    segOut.writeVint(segs.size());
+    indexOut.writeVlong(gen);
+    indexOut.writeVint(segs.size());
     for (auto &seg : segs) {
-      segOut.writeStr(seg);
+      indexOut.writeStr(seg);
     }
-    segOut.flush(true);
-    dir.finishFile(*segFile);
+    indexOut.flush(true);
+    dir.finishFile(*indexFile);
 
     inverter.reset();
   }

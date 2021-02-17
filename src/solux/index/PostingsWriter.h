@@ -136,8 +136,8 @@ namespace solux {
 class PostingsWriter {
   Directory& directory;
   std::string generation;
-
-
+  int32_t maxDocSeen = -1; // updated in flushDocs, endTerm
+  int32_t maxDocUpperBound = -1; // this is what the client gives us (Inverter / seg merger)
 public:
 //
 // variable naming:
@@ -148,11 +148,13 @@ public:
   // TODO: pool allocate this
   std::vector<char> compressed_output;
 
+  OutputStream segOutput;     // output stream for segment info file
   OutputStream tindexOutput;  // output stream for terms index
   OutputStream termOutput;    // output stream for termFile
   OutputStream docOutput;     // output stream for docFile
   OutputStream posOutput;     // output stream for posFile
 
+  std::unique_ptr<File> segFile; // segment info
   std::unique_ptr<File> tindexFile; // terms for each field
   std::unique_ptr<File> termFile; // terms for each field
   std::unique_ptr<File> docFile; // documents for each term
@@ -222,28 +224,43 @@ public:
   {
     // TODO: defer file creation until needed, *or* use a RAMDelegatingFile that does so.
     // that does so.
+    segFile    = directory.createFile(Postings::getIndexFileName(gen, Postings::SEGMENT_INFO_FNAME));
     tindexFile = directory.createFile(Postings::getIndexFileName(gen, Postings::TERM_INDEX_FNAME));
     termFile   = directory.createFile(Postings::getIndexFileName(gen, Postings::TERMS_FNAME));
     docFile    = directory.createFile(Postings::getIndexFileName(gen, Postings::DOCS_FNAME));
     posFile    = directory.createFile(Postings::getIndexFileName(gen, Postings::POS_FNAME));
 
+    segOutput.setFile(segFile.get());
     tindexOutput.setFile(tindexFile.get());
     termOutput.setFile(termFile.get());
     docOutput.setFile(docFile.get());
     posOutput.setFile(posFile.get());
+
+    // TODO: if we hit an error, should we clean up any files?
   }
 
   void finish() {
-    tindexOutput.close();
-    directory.finishFile(*tindexFile);
-    termOutput.close();
-    directory.finishFile(*termFile);
+    writeSegmentInfo();
+    // TODO: implement compound files for small files
+
+    // minor optimization here - we close the files in sorted order to trigger the
+    // optimization in RAMDir
     docOutput.close();
     directory.finishFile(*docFile);
     posOutput.close();
     directory.finishFile(*posFile);
+    segOutput.close();
+    directory.finishFile(*segFile);
+    termOutput.close();
+    directory.finishFile(*termFile);
+    tindexOutput.close();
+    directory.finishFile(*tindexFile);
   }
 
+  // currently needs to be done before finish() is called
+  void setMaxDocUpperBound(int max) {
+    maxDocUpperBound = max;
+  }
 
   // Currently only called for a full block of positions.
   // TODO: move to .cpp unless we template this class
@@ -268,6 +285,8 @@ public:
     if (docs.empty()) {
       return;
     }
+
+    maxDocSeen = std::max(maxDocSeen, docs.back());
 
     // NOTE: some codecs (like s4-fastpfor-d1) modify the input array to calculate deltas!
     // given that we (could) already have deltas, is there an easy way to bypass that part?
@@ -432,6 +451,9 @@ public:
   void endTerm(TermRef term) {
     unused(term);
     auto totalTermFreq = getTotalTermFreq();
+    if (docs.size() > 0) {
+      maxDocSeen = std::max(maxDocSeen, docs.back());
+    }
     // TODO: handle case when all docs were deleted for term (and term should no longer appear)
     if (totalTermFreq == 1) {
       assert(getDocFileSize()==0 && docs.size()==1 && posdeltas.size() == 1);
@@ -570,6 +592,15 @@ public:
       flushPositions();
     }
   }
+
+private:
+  void writeSegmentInfo() {
+    assert(maxDocSeen >= 0);
+    auto maxdoc = maxDocSeen + 1;
+    segOutput.writeVint(maxdoc);
+    // Other info we should eventually write: version info, what other files are present, cfs info
+  }
+
 
 };
 

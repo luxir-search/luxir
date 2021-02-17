@@ -187,7 +187,7 @@ class RAMFile : public File {
     fileSize += thisBufferSize;
     os.flushedSize = fileSize;
     auto prevBufferSize = START_BUFFER_SIZE / 2;  // set up for first buffer to be 1024
-    if (buffers.size() == 0) {
+    if (buffers.empty()) {
       // If this is the first call to flush, remember whatever buffer is set by the output stream as the first element.
       firstBuffer = os.start;
       firstLen = thisBufferSize;
@@ -217,7 +217,7 @@ class RAMFile : public File {
 public:
   constexpr static uint32_t START_BUFFER_SIZE = 1024;  // size of first allocated buffer (subsequent buffers may be bigger)... mostly for testing.
 
-  RAMFile(const std::string &name) : File(name) {
+  RAMFile(const std::string_view& name) : File(name) {
   }
 
   ~RAMFile() override = default;

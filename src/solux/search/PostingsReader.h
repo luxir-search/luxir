@@ -43,8 +43,9 @@ public:
   PositionsCodec posCodec;
   TFreqCodec& tfreqCodec = posCodec;
 
-  static constexpr auto SEGFILE = "s.olux";
+  static constexpr std::string_view INDEX_INFO_FILE = "s.olux"; // lists all segments in the index
   static constexpr std::string_view PREFIX_FNAME = "s";
+  static constexpr std::string_view SEGMENT_INFO_FNAME = "_s";  // info about a single segment
   static constexpr std::string_view TERM_INDEX_FNAME = "_ti";
   static constexpr std::string_view TERMS_FNAME = "_t";
   static constexpr std::string_view DOCS_FNAME = "_d";
@@ -62,9 +63,8 @@ public:
 // PostingsReader should be thread-safe at the top level, but any iterators it supplies would not be.
 class PostingsReader {
   std::vector<std::shared_ptr<InputFile>> files;  // temporary owner of open files
-
+  int32_t maxdoc;
 public:
-
   InputFile* tindexFile;
   InputFile* termFile;
   InputFile* docFile;
@@ -74,6 +74,10 @@ public:
 
   // TODO temporary... this will likely be done at a higher level?
   explicit PostingsReader(Directory& dir, std::string_view gen) {
+    auto segFile = dir.openFile(Postings::getIndexFileName(gen, Postings::SEGMENT_INFO_FNAME));
+    InputStream segIS = segFile->getInputStream();
+    maxdoc = segIS.readVint();
+
     tindexFile = files.emplace_back(dir.openFile(Postings::getIndexFileName(gen, Postings::TERM_INDEX_FNAME))).get();
     termFile = files.emplace_back(dir.openFile(Postings::getIndexFileName(gen, Postings::TERMS_FNAME))).get();
     docFile = files.emplace_back(dir.openFile(Postings::getIndexFileName(gen, Postings::DOCS_FNAME))).get();
@@ -85,6 +89,9 @@ public:
   {
   }
 
+  int32_t maxDoc() {
+    return maxdoc;
+  }
 
   friend std::ostream& operator<< (std::ostream &out, const PostingsReader &reader) {
     out << "PostingsReader:" << std::endl

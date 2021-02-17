@@ -31,4 +31,5 @@ TEST_F(IndexWriterTest, singleSeg) {
 
   IndexReader r1(dir);
   ASSERT_EQ(1, r1.segments().size());
+  ASSERT_EQ(1, r1.maxDoc());
 }

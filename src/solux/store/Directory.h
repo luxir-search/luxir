@@ -12,12 +12,12 @@ public:
   // appends a list of names to the referenced vector
   virtual void listFiles(std::vector<std::string> &target) = 0;
 
-  virtual std::shared_ptr<InputFile> openFile(const std::string &name) = 0;
+  virtual std::shared_ptr<InputFile> openFile(const std::string_view &name) = 0;
 
-  virtual std::unique_ptr<File> createFile(const std::string &name) = 0;
+  virtual std::unique_ptr<File> createFile(const std::string_view &name) = 0;
 
   // Returns true if file was found and deleted, false if not found.
-  virtual bool deleteFile(const std::string &name) = 0;
+  virtual bool deleteFile(const std::string_view &name) = 0;
 
   // Make the file readable to others through the Directory.  Putting this on the Directory class
   // gives more flexibility in implementation without having every File have to point back to it's
@@ -42,9 +42,9 @@ private:
   std::vector<entry_type> files;
 
   // returns <found,iterator> pair... iterator is the element if found==true or the insertion point if found==false.
-  std::pair<bool, iterator_type> find(const std::string &name) {
+  std::pair<bool, iterator_type> find(const std::string_view &name) {
     auto iter = std::lower_bound(files.begin(), files.end(), name,
-                                 [&](const entry_type &x, const std::string &key) { return x.first < key; }
+                                 [&](const entry_type &x, const std::string_view &key) { return x.first < key; }
     );
     return {!(iter == files.end() || iter->first != name), iter};
   }
@@ -59,7 +59,7 @@ public:
     }
   }
 
-  std::shared_ptr<InputFile> openFile(const std::string &name) override {
+  std::shared_ptr<InputFile> openFile(const std::string_view &name) override {
     auto[found, iter] = find(name);
     if (found) {
       return iter->second;
@@ -68,7 +68,7 @@ public:
     }
   }
 
-  bool deleteFile(const std::string &name) override {
+  bool deleteFile(const std::string_view &name) override {
     auto[found, iter] = find(name);
     if (found) {
       files.erase(iter);
@@ -78,7 +78,7 @@ public:
     }
   }
 
-  std::unique_ptr<File> createFile(const std::string &name) override {
+  std::unique_ptr<File> createFile(const std::string_view &name) override {
     return std::make_unique<OutputFileType>(name);
   }
 
