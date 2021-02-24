@@ -1,6 +1,7 @@
 #include <filesystem>
 #include <sstream>
-#include <solux/util/solux_util.h>
+#include "solux/util/solux_util.h"
+#include "solux/server/GRPCServer.h"
 
 namespace fs = std::filesystem;
 
@@ -8,6 +9,7 @@ using namespace solux;
 
 int solux_main(int argc, char** argv) {
   unused(argc, argv);
+  GRPCServer::run();
   return 0;
 }
 
