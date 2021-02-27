@@ -98,21 +98,22 @@ endif()
 
 # Proto file
 get_filename_component(solux_proto "./protos/solux.proto" ABSOLUTE)
+get_filename_component(solux_types_proto "./protos/solux_types.proto" ABSOLUTE)
 get_filename_component(solux_proto_path "${solux_proto}" PATH)
 
 # Generated sources
-set(solux_proto_srcs "${CMAKE_CURRENT_BINARY_DIR}/solux.pb.cc")
-set(solux_proto_hdrs "${CMAKE_CURRENT_BINARY_DIR}/solux.pb.h")
+set(solux_proto_srcs "${CMAKE_CURRENT_BINARY_DIR}/solux.pb.cc" "${CMAKE_CURRENT_BINARY_DIR}/solux_types.pb.cc")
+set(solux_proto_hdrs "${CMAKE_CURRENT_BINARY_DIR}/solux.pb.h" "${CMAKE_CURRENT_BINARY_DIR}/solux_types.pb.h")
 set(solux_grpc_srcs "${CMAKE_CURRENT_BINARY_DIR}/solux.grpc.pb.cc")
 set(solux_grpc_hdrs "${CMAKE_CURRENT_BINARY_DIR}/solux.grpc.pb.h")
 add_custom_command(
         OUTPUT "${solux_proto_srcs}" "${solux_proto_hdrs}" "${solux_grpc_srcs}" "${solux_grpc_hdrs}"
         COMMAND ${_PROTOBUF_PROTOC}
-        ARGS --grpc_out "${CMAKE_CURRENT_BINARY_DIR}"
+        ARGS --grpc_out "${CMAKE_CURRENT_BINARY_DIR}" --experimental_allow_proto3_optional
         --cpp_out "${CMAKE_CURRENT_BINARY_DIR}"
         -I "${solux_proto_path}"
         --plugin=protoc-gen-grpc="${_GRPC_CPP_PLUGIN_EXECUTABLE}"
-        "${solux_proto}"
+        "${solux_proto}" "${solux_types_proto}"
         DEPENDS "${solux_proto}")
 
 # Include generated *.pb.h files
@@ -124,11 +125,12 @@ include_directories("${CMAKE_CURRENT_BINARY_DIR}")
 file(GLOB_RECURSE Proj_SOURCES src/*.cpp src/*.h)
 list(FILTER Proj_SOURCES EXCLUDE REGEX .*/main.cpp)
 
-add_library(solux_lib STATIC ${Proj_SOURCES} ${solux_proto_srcs} ${solux_grpc_srcs})
+add_library(solux_lib STATIC ${Proj_SOURCES})
 
 add_executable(solux src/solux/main.cpp)
 target_link_libraries(solux solux_lib)
 
+add_subdirectory(protos)
 add_subdirectory(test)
 
 if(ROBIN_HOOD_HASHING)
@@ -143,4 +145,4 @@ target_link_libraries(solux_lib PRIVATE xxHash::xxhash)
 target_link_libraries(solux ${Boost_LIBRARIES})
 target_link_libraries(solux_lib PRIVATE debug simdcomp_ad)
 target_link_libraries(solux_lib PRIVATE optimized simdcomp_a)
-target_link_libraries(solux_lib PRIVATE ${_REFLECTION} ${_GRPC_GRPCPP} ${_PROTOBUF_LIBPROTOBUF})
+target_link_libraries(solux_lib PRIVATE myproto)

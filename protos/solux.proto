@@ -1,5 +1,9 @@
 syntax = "proto3";
 
+import "google/protobuf/struct.proto";
+import "google/protobuf/wrappers.proto";
+import "solux_types.proto";
+
 option java_multiple_files = true;
 option java_package = "org.apache.solux";
 option java_outer_classname = "SoluxProto";
@@ -7,7 +11,8 @@ option objc_class_prefix = "Solux";
 
 package solux;
 
-// The greeting service definition.
+// The greeting service definition.  Just here temporarily as a sanity check around running multiple services
+// as well as having a service that just works.
 service Greeter {
   // Sends a greeting
   rpc SayHello (HelloRequest) returns (HelloReply) {}
@@ -21,4 +26,9 @@ message HelloRequest {
 // The response message containing the greetings
 message HelloReply {
   string message = 1;
+}
+
+
+service Indexer {
+  rpc Add(solux.proto.Docs) returns (HelloReply) {}
 }

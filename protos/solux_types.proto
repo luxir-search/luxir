@@ -1,0 +1,109 @@
+syntax = "proto3";
+
+import "google/protobuf/struct.proto";
+import "google/protobuf/wrappers.proto";
+
+option java_multiple_files = true;
+option java_package = "org.apache.solux.types";
+option java_outer_classname = "SoluxTypes";
+option objc_class_prefix = "Solux";
+
+package solux.proto;
+
+
+/*
+ Using the well-known-type of google.protobuf.Struct doc = 1
+ allows {"doc":{"myint":77, "mystr":"foo"}}
+ Unfortunately, that's not enough types!
+ Replicating Struct myself requires this really verbose JSON to send to evans:
+{
+  "doc": {
+    "fields": {
+      "myint": {
+        "number_value": 77
+      },
+      "mystr": {
+        "string_value": "foo"
+      }
+    }
+  }
+}
+*/
+
+
+message Docs {
+  // google.protobuf.Struct doc = 1;
+  Struct doc = 1;
+}
+
+
+// name : value
+message NamedValue {
+  string name = 1;
+  oneof val {
+    string s = 2;
+    int64 i = 3;
+  }
+}
+
+// Proto notes:
+// can't repeat oneof fields or map fields
+// can't have map as value in map
+
+
+message Struct {
+  // Unordered map of dynamically typed values.
+  map<string, Val> fields = 1;
+}
+
+message Val {
+  oneof kind {
+    // Represents a null value.
+    google.protobuf.NullValue null = 1;
+    string s = 2;
+    sint64 i = 3;  // since the encoding is the same, we don't bother distinguishing between 32 and 64 bit int
+    double d = 4;
+    float f = 5;
+    bool b = 6;
+    bytes bin = 7;
+    Struct map = 8;
+    ArrVal arr = 9;
+    ArrStr arr_s = 10;
+    ArrInt arr_i = 11;
+    ArrFloat arr_f = 12;
+    ArrDouble arr_d = 13;
+  }
+}
+
+message ArrVal {
+  // Repeated field of dynamically typed values.
+  repeated Val v = 1;
+}
+
+message ArrStr {
+  repeated string v = 1;
+}
+
+message ArrInt {
+  repeated sint64 v = 1;
+}
+
+message ArrFloat {
+  repeated float v = 1;
+}
+
+message ArrDouble {
+  repeated double v = 1;
+}
+
+// although the encoding is the same, the stub mapping is not and could blow up memory for large arrays
+// if we always use 64 byte ints.
+// TODO: if we can do custom decoding, an array that specifies a min/max would be even more efficient
+message ArrInt32 {
+  repeated sint32 v = 1;
+}
+
+message IntCol {
+  optional sint64 missingVal = 1;
+  repeated sint64 v = 2;
+}
