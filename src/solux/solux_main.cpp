@@ -9,7 +9,8 @@ using namespace solux;
 
 int solux_main(int argc, char** argv) {
   unused(argc, argv);
-  GRPCServer::run();
+  GRPCServer server;
+  server.run();
   return 0;
 }
 

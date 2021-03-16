@@ -77,6 +77,8 @@ public:
             : terms(inverter.pool, 4), fieldName(fieldName), fieldType(fieldType), tokenChain(tokenChain) {
     }
 
+    SegFieldPos(SegFieldPos&& other) = default;
+
     ~SegFieldPos() = default;
 
     void index(Inverter &inverter, char *mutableVal, int len) {
@@ -87,6 +89,14 @@ public:
       return this->fieldName <=> other.fieldName;
     }
 
+    auto operator<=>(const std::string_view& sv) const {
+      return this->fieldName <=> sv;
+    }
+
+    auto operator==(const std::string_view& sv) const {
+      return this->fieldName == sv;
+    }
+
     friend std::ostream& operator<<(std::ostream &out, const SegFieldPos &sf) {
       return out << "{field:" << sf.fieldName << " terms:" << sf.terms << "}";
     }
@@ -95,8 +105,10 @@ public:
   // OPTIMIZATION: since we only do additions and not deletions, a monotonic allocator that had destructor
   // support would be good here.
   // This could also be a Set with a little more work since the fieldname is already in the value.
-  phmap::flat_hash_map<std::string, SegFieldPos> segFields;
+  // We don't want the values to move since clients can cache and reuse when indexing.
+  phmap::node_hash_map<std::string, SegFieldPos> segFields;
 
+  // The returned reference will be valid for the duration of indexing this block.
   SegFieldPos& getSegField(const std::string_view& name) {
     auto iter = segFields.find(name);
     if (iter != segFields.end()) {

@@ -19,7 +19,7 @@ IF (Boost_FOUND)
 endif()
 set (Boost_USE_STATIC_LIBS OFF) # enable dynamic linking
 set (Boost_USE_MULTITHREAD ON)  # enable multithreading
-find_package (Boost COMPONENTS REQUIRED locale chrono filesystem)
+find_package (Boost COMPONENTS REQUIRED thread)
 
 include_directories(deps)
 link_directories(deps/simdcomp)
@@ -142,7 +142,7 @@ find_path(PARALLEL_HASHMAP_INCLUDE_DIRS "parallel_hashmap/btree.h")
 target_include_directories(solux_lib PRIVATE ${PARALLEL_HASHMAP_INCLUDE_DIRS})
 
 target_link_libraries(solux_lib PRIVATE xxHash::xxhash)
-target_link_libraries(solux ${Boost_LIBRARIES})
+target_link_libraries(solux_lib PRIVATE ${Boost_LIBRARIES})
 target_link_libraries(solux_lib PRIVATE debug simdcomp_ad)
 target_link_libraries(solux_lib PRIVATE optimized simdcomp_a)
 target_link_libraries(solux_lib PRIVATE myproto)

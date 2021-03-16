@@ -1,5 +1,7 @@
 #include <filesystem>
+#include <thread>
 #include "SoluxTest.h"
+#include "solux/server/GRPCServer.h"
 #include "solux/solux_main.h"
 #include "benchmark/benchmark.h"
 
@@ -102,13 +104,23 @@ int main(int argc, char **argv) {
 
   testing::AddGlobalTestEnvironment(new solux::SoluxEnvironment());
 
+  int ret = 0;
+  solux::GRPCServer server;
+
+  // TODO: pull this out and only do it on demand if the specific test needs it?
+  std::thread serverThread([&server](){server.run();});
+  server.waitForStart();
+
   if (!solux::unit_tests) {
     benchmark::Initialize(&myargc, &(myargv[0]));
     benchmark::RunSpecifiedBenchmarks();
-    return testing::Test::HasFatalFailure();
+    ret = testing::Test::HasFatalFailure();
+  } else {
+    ret = RUN_ALL_TESTS();
   }
 
-  auto ret = RUN_ALL_TESTS();
+  server.shutdown();
+  serverThread.join();
   return ret;
 }
 

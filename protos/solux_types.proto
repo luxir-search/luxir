@@ -31,29 +31,49 @@ package solux.proto;
 */
 
 
-message Docs {
-  // google.protobuf.Struct doc = 1;
-  Struct doc = 1;
+// Proto notes:
+// can't repeat oneof fields or map fields
+// can't have map as value in map
+
+
+message UpdateRequest {
+  // TODO: need some sort of index identifier (tenant, collection, ???)
+
+  // TODO:
+  // possible parameters: commitWithin,
+  // optional batchId - in streaming request/responses, used to tell what batch has been indexed
+  // optional stream - what logical stream this batch is part of (don't reorder docs in the same stream)
+  //   or should this just be a separate streaming request for a separate stream?  That might be more difficult for some clients.
+
+
+
+  // TODO: should docs/columns be wrapped in "oneof" (if so, need wrapper for "repeated Map docs")
+
+  // documents represented as multiple rows... less efficient since field names are repeated for each document
+  repeated Map docs = 1;
+
+  // Column representation of a batch of documents.  All columns should have the same length.
+  // For very sparse columns that you do not wish to represent as columns, use a special
+  // field name of "_fields_" with a value of ColMap for per-document sparse values.  This is
+  // effectively a mix of column oriented and row oriented.
+  Columns columns = 2;
 }
 
 
 // name : value
 message NamedValue {
   string name = 1;
-  oneof val {
-    string s = 2;
-    int64 i = 3;
-  }
+  Val val = 2;
 }
 
-// Proto notes:
-// can't repeat oneof fields or map fields
-// can't have map as value in map
-
-
-message Struct {
+message Map {
   // Unordered map of dynamically typed values.
   map<string, Val> fields = 1;
+}
+
+// like a Map, but the values are restricted to column types
+message Columns {
+  map<string, Column> columns = 1;
 }
 
 message Val {
@@ -66,7 +86,7 @@ message Val {
     float f = 5;
     bool b = 6;
     bytes bin = 7;
-    Struct map = 8;
+    Map map = 8;
     ArrVal arr = 9;
     ArrStr arr_s = 10;
     ArrInt arr_i = 11;
@@ -103,7 +123,45 @@ message ArrInt32 {
   repeated sint32 v = 1;
 }
 
-message IntCol {
+message ColStr {
+  // this will cause an additional tag (byte) per string value, but strings are normally somewhat larger anyway
+  repeated google.protobuf.StringValue v = 1;
+ /*
+  optional string missingVal = 1;
+  repeated string v = 2;
+ */
+}
+
+// The distinction between a column and an array is that column values are somehow "nullable".
+// This is a requirement to get different columns to "line up" if there mare missing values
+// in some of them.
+message Column {
+  oneof kind {
+    ColStr col_s = 1;
+    ColInt col_i = 2;
+    ColFloat col_f = 3;
+    ColDouble col_d = 4;
+    ColMap col_map = 14;
+    ArrVal col_val = 15; // array-of-value is already nullable, so we don't have a separate column type for it
+  }
+}
+
+message ColInt {
   optional sint64 missingVal = 1;
   repeated sint64 v = 2;
 }
+
+message ColFloat {
+  optional float missingVal = 1;
+  repeated float v = 2;
+}
+
+message ColDouble {
+  optional double missingVal = 1;
+  repeated double v = 2;
+}
+
+message ColMap {
+  repeated Map v = 1;
+}
+

@@ -116,6 +116,13 @@ public:
     newTable(initialSizePowerOfTwo);
   }
 
+  TermValHash(TermValHash&& other) :
+    table_(other.table_), pool_(other.pool_), elements_(other.elements_),
+    capacity_(other.capacity_), tableSize_(other.tableSize_)
+  {
+    other.table_ = nullptr;
+  }
+
   ~TermValHash() {
     free();
   }

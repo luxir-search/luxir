@@ -30,5 +30,5 @@ message HelloReply {
 
 
 service Indexer {
-  rpc Add(solux.proto.Docs) returns (HelloReply) {}
+  rpc Update(solux.proto.UpdateRequest) returns (HelloReply) {}
 }
