@@ -36,8 +36,17 @@ package solux.proto;
 // can't have map as value in map
 
 
+/// The target of this operation
+message Target {
+  repeated string name = 1;  // qualified collection name
+
+  // An API-key could reference an existing Library that would be the root for further qualifying the collection name.
+  // Thus a user would not need to know where in the hierarchy they are.  Responses containing collection names should
+  // likewise only contain collection names qualified from this reference point.
+}
+
 message UpdateRequest {
-  // TODO: need some sort of index identifier (tenant, collection, ???)
+  Target collection = 1;
 
   // TODO:
   // possible parameters: commitWithin,
@@ -50,13 +59,13 @@ message UpdateRequest {
   // TODO: should docs/columns be wrapped in "oneof" (if so, need wrapper for "repeated Map docs")
 
   // documents represented as multiple rows... less efficient since field names are repeated for each document
-  repeated Map docs = 1;
+  repeated Map docs = 2;
 
   // Column representation of a batch of documents.  All columns should have the same length.
   // For very sparse columns that you do not wish to represent as columns, use a special
   // field name of "_fields_" with a value of ColMap for per-document sparse values.  This is
   // effectively a mix of column oriented and row oriented.
-  Columns columns = 2;
+  Columns columns = 3;
 }
 
 

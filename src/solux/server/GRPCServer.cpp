@@ -41,14 +41,34 @@ private:
     unused(context);
     std::cout << "GRPCServer peer=" << context->peer() << std::endl;
 
+    std::shared_ptr<Collection> collection;
+
+    if (request->collection().name_size() == 0) {
+      // TODO: do we support default collections (implicitly defined by something like an api-key?)
+    }
+
+    std::shared_ptr<Library> library = server.getSoluxNode().getLibrary(nullptr, "");
+    for (int i=0; i<request->collection().name_size(); i++) {
+      // TODO: walk from our implicit root to find the correct collection.
+      if (i == request->collection().name_size()-1) {
+        std::cout << "looking up collection name " << request->collection().name(i) << std::endl;
+
+        // last element in path, so get collection.
+        collection = server.getSoluxNode().getCollection(library.get(), request->collection().name(i));
+        // TODO: handle lookup failure
+      } else {
+        // not last element... get sub-library
+        library = server.getSoluxNode().getLibrary(library.get(), request->collection().name(i));
+        // TODO: handle lookup failure
+      }
+    }
+
+
     if (request->docs_size() > 0) {
       std::cout << "\tindexer got docs: " << request->docs_size() << std::endl;
-
-      // TODO: find right index
-
-      Directory& dir = server.getSoluxNode().dir;
-      IndexWriter iw(dir);
-      auto inverter = &iw.getInverter();
+      auto shard = collection->getShard();
+      auto iw = shard->getIndexWriter();
+      Inverter& inverter = iw->getInverter();
 
       std::string reqStr;
       google::protobuf::TextFormat::PrintToString(*request, &reqStr);
@@ -62,23 +82,25 @@ private:
           segFields.resize(nFields);
         }
 
-        inverter->startDoc();
+        inverter.startDoc();
 
         int idx=0;
         for (auto& [fname,fval] : doc.fields()) {
           auto segField = segFields[idx];
           if (segField == nullptr || *segField != fname) {
-            segFields[idx] = segField = &inverter->getSegField(fname);
+            segFields[idx] = segField = &inverter.getSegField(fname);
           }
           auto& sval = fval.s();
           std::cout << " Indexing " << fname << ":" << sval << std::endl;
-          inverter->index(*segField, const_cast<char*>(sval.data()), sval.size());  // TODO: get rid of the const-cast
+          inverter.index(*segField, const_cast<char*>(sval.data()), sval.size());  // TODO: get rid of the const-cast
           idx++;
         }
 
-        inverter->finishDoc();
+        inverter.finishDoc();
       }
-      iw.flush();
+
+      // TODO: keep the current inverter around if we expect more docs coming.
+      iw->flush();
 
     }
     if (request->has_columns()) {

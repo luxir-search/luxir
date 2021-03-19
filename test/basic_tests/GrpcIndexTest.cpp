@@ -17,6 +17,9 @@ TEST_F(GrpcIndexTest, addDocs) {
   // Setup request
   solux::proto::UpdateRequest ureq;
   HelloReply result;
+
+  ureq.mutable_collection()->add_name("main");
+
   auto& fields = *ureq.add_docs()->mutable_fields();
   fields["text1_w"].set_s("my first field value");
   fields["text2_w"].set_s("my second field value");
