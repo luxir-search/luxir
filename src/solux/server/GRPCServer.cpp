@@ -1,5 +1,6 @@
 
 #include <string>
+#include <algorithm>
 #include <grpcpp/grpcpp.h>
 #include <google/protobuf/text_format.h>
 #include <grpcpp/health_check_service_interface.h>
@@ -9,74 +10,207 @@
 #include "solux/index/IndexWriter.h"
 #include "solux/util/solux_util.h"
 
-using grpc::Server;
-using grpc::ServerBuilder;
-using grpc::ServerContext;
-using grpc::Status;
 
 using namespace solux;
 
-// can call this example with evans via:
-// $ echo '{"name":"dude"}' | evans -r cli call solux.Greeter.SayHello
-class GreeterServiceImpl final : public Greeter::Service {
-  Status SayHello(ServerContext* context, const HelloRequest* request,
-                  HelloReply* reply) override {
-    unused(context);
+
+GRPCServer::GRPCServer()
+  : startLatch(1) {
+}
+
+// adapted from the grpc helloworld example
+void solux::GRPCServer::run() {
+  std::string server_address("0.0.0.0:50051");
+
+  grpc::EnableDefaultHealthCheckService(true);
+  grpc::reflection::InitProtoReflectionServerBuilderPlugin();
+  grpc::ServerBuilder builder;
+  // Listen on the given address without any authentication mechanism.
+  builder.AddListeningPort(server_address, grpc::InsecureServerCredentials());
+  // Register "service" as the instance through which we'll communicate with
+  // clients. In this case it corresponds to a *synchronous* service.
+
+  builder.RegisterService(&greeterService);
+  builder.RegisterService(&indexerService);
+
+  int nthreads = std::max(1u, std::thread::hardware_concurrency());
+  nthreads = 2; // TODO TODO TODO: delete this line in the future... this is just to lower the number of threads to make debugging easier
+  threads.reserve(nthreads);
+  threadInfos.reserve(nthreads);
+
+  // Give each thread a completion queue, but don't let them use it
+  // before the server starts (implemented with startLatch)
+  for (int i=0; i<nthreads; i++) {
+    threadInfos.emplace_back();
+    threadInfos.back().threadno = i;
+    threadInfos.back().cq = builder.AddCompletionQueue(); // each thread gets it's own completion queue
+    threads.emplace_back([this,i]{ this->runThread(threadInfos[i]); });
+  }
+
+  this->server = builder.BuildAndStart();
+  std::cout << "GRPCServer listening on " << server_address << std::endl;
+
+  // inform everyone that the server is up and running
+  startLatch.count_down();
+
+  // Wait for the server to shutdown. Note that some other thread must be
+  // responsible for shutting down the server for this call to ever return.
+  server->Wait();
+  std::cout << "server->Wait() returned!" << std::endl;
+}
+
+
+class CallData {
+public:
+  CallData(GRPCServer& server, GRPCServer::ThreadInfo& threadInfo) : server(server), threadInfo(threadInfo) {
+  }
+
+  virtual ~CallData() = default;
+
+  virtual void proceed(bool ok) = 0;
+
+  GRPCServer& server;
+  GRPCServer::ThreadInfo& threadInfo;
+
+  grpc::ServerContext ctx;
+  // TODO: ServerContext objects should not be used across different RPC calls (but does this apply to multiple messages in a streaming RPC???)
+};
+
+
+// TODO: make a template class for request/response
+template <class RequestT, class ReplyT, class AsyncServiceT>
+class UnaryCallData : public CallData {
+public:
+  RequestT request;
+  ReplyT reply;
+  AsyncServiceT& service;
+  grpc::ServerAsyncResponseWriter<ReplyT> responder;
+  enum CallStatus { CREATE, PROCESS, FINISH };
+  CallStatus state;
+
+  UnaryCallData(GRPCServer& server, AsyncServiceT& service, GRPCServer::ThreadInfo& threadInfo) : CallData(server, threadInfo), service(service), responder(&ctx) {
+    // TODO: how to do this in a generic way?  I would need to get the index of the method and then call
+    // ::grpc::Service::RequestAsyncUnary(0, context, request, response, new_call_cq, notification_cq, tag);
+    // service.RequestSayHello(&ctx, &request, &responder, &cq, &cq, (void*)this);
+    state = PROCESS;
+  }
+
+  virtual void proceed(bool ok) override {
+    std::cout << "UnaryCallData.proceed(" << ok << ") this=" << (void*)this << std::endl;
+    if (!ok) {
+      // canceled/errored... nothing else to do.
+      std::cout << "deleting " << (void*)this << std::endl;
+      delete this;
+      return;
+    }
+
+    if (state == PROCESS) {
+      // create a new instance of this to handle additional calls.
+      createNew();
+
+      // The actual processing.
+      fillReply();
+
+      state = FINISH;
+      responder.Finish(reply, grpc::Status::OK, (void*)this);
+      //std::cout << "finish called," << counter++ << std::endl;
+    } else {
+      // nothing left to do but delete ourselves
+      std::cout << "deleting " << (void*)this << std::endl;
+      delete this;
+    }
+
+  }
+
+  virtual void createNew() = 0;
+  virtual void fillReply() = 0;
+};
+
+class SayHelloCall : public UnaryCallData<HelloRequest, HelloReply, Greeter::AsyncService> {
+public:
+  SayHelloCall(GRPCServer& server, Greeter::AsyncService& service, GRPCServer::ThreadInfo& threadInfo) : UnaryCallData(server, service, threadInfo) {
+    std::cout << "hello inserting " << (void*)this << std::endl;
+    // TODO: how to do this in a generic way?  I would need to get the index of the method and then call
+    // ::grpc::Service::RequestAsyncUnary(0, context, request, response, new_call_cq, notification_cq, tag);
+    service.RequestSayHello(&ctx, &request, &responder, threadInfo.cq.get(), threadInfo.cq.get(), (void*)this);
+  }
+
+  virtual void createNew() override {
+    new SayHelloCall(server, service, threadInfo);
+  }
+  virtual void fillReply() override {
     std::string prefix("Hello ");
-    reply->set_message(prefix + request->name());
-    return Status::OK;
+    reply.set_message(prefix + request.name());
+    std::cout << "req name:" << request.name() << std::endl;
   }
 };
 
-class IndexerServiceImpl final : public Indexer::Service {
+class SayHelloCall2 : public UnaryCallData<HelloRequest, HelloReply, Greeter::AsyncService> {
 public:
-  IndexerServiceImpl(GRPCServer& server) : server(server) {
+  SayHelloCall2(GRPCServer& server, Greeter::AsyncService& service, GRPCServer::ThreadInfo& threadInfo) : UnaryCallData(server, service, threadInfo) {
+    std::cout << "hello2 inserting " << (void*)this << std::endl;
+    service.RequestSayHello2(&ctx, &request, &responder, threadInfo.cq.get(), threadInfo.cq.get(), (void*)this);
   }
 
-private:
-  GRPCServer& server;
+  virtual void createNew() override {
+    new SayHelloCall2(server, service, threadInfo);
+  }
+  virtual void fillReply() override {
+    std::string prefix("Hello2 ");
+    reply.set_message(prefix + request.name());
+    std::cout << "req name:" << request.name() << std::endl;
+  }
+};
 
-  Status Update(ServerContext* context, const solux::proto::UpdateRequest* request,
-                  HelloReply* reply) override {
-    unused(context);
-    std::cout << "GRPCServer peer=" << context->peer() << std::endl;
+class IndexerUpdateCall : public UnaryCallData<solux::proto::UpdateRequest, HelloReply, Indexer::AsyncService> {
+public:
+  IndexerUpdateCall(GRPCServer& server, Indexer::AsyncService& service, GRPCServer::ThreadInfo& threadInfo) : UnaryCallData(server, service, threadInfo) {
+    std::cout << "Indexer.Update inserting " << (void*)this << std::endl;
+    service.RequestUpdate(&ctx, &request, &responder, threadInfo.cq.get(), threadInfo.cq.get(), (void*)this);
+  }
+
+  virtual void createNew() override {
+    new IndexerUpdateCall(server, service, threadInfo);
+  }
+  virtual void fillReply() override {
+    std::cout << "Update GRPCServer peer=" << ctx.peer() << std::endl;
 
     std::shared_ptr<Collection> collection;
 
-    if (request->collection().name_size() == 0) {
+    if (request.collection().name_size() == 0) {
       // TODO: do we support default collections (implicitly defined by something like an api-key?)
     }
 
     std::shared_ptr<Library> library = server.getSoluxNode().getLibrary(nullptr, "");
-    for (int i=0; i<request->collection().name_size(); i++) {
+    for (int i=0; i<request.collection().name_size(); i++) {
       // TODO: walk from our implicit root to find the correct collection.
-      if (i == request->collection().name_size()-1) {
-        std::cout << "looking up collection name " << request->collection().name(i) << std::endl;
+      if (i == request.collection().name_size()-1) {
+        std::cout << "looking up collection name " << request.collection().name(i) << std::endl;
 
         // last element in path, so get collection.
-        collection = server.getSoluxNode().getCollection(library.get(), request->collection().name(i));
+        collection = server.getSoluxNode().getCollection(library.get(), request.collection().name(i));
         // TODO: handle lookup failure
       } else {
         // not last element... get sub-library
-        library = server.getSoluxNode().getLibrary(library.get(), request->collection().name(i));
+        library = server.getSoluxNode().getLibrary(library.get(), request.collection().name(i));
         // TODO: handle lookup failure
       }
     }
 
 
-    if (request->docs_size() > 0) {
-      std::cout << "\tindexer got docs: " << request->docs_size() << std::endl;
+    if (request.docs_size() > 0) {
+      std::cout << "\tindexer got docs: " << request.docs_size() << std::endl;
       auto shard = collection->getShard();
       auto iw = shard->getIndexWriter();
       Inverter& inverter = iw->getInverter();
 
       std::string reqStr;
-      google::protobuf::TextFormat::PrintToString(*request, &reqStr);
+      google::protobuf::TextFormat::PrintToString(request, &reqStr);
       std::cout << "REQ:( " << reqStr << " )" << std::endl;
 
       std::vector<Inverter::SegFieldPos*> segFields;
       // int ndocs = request->docs_size();
-      for (auto& doc : request->docs()) {
+      for (auto& doc : request.docs()) {
         size_t nFields = doc.fields_size();
         if (segFields.size() < nFields) {
           segFields.resize(nFields);
@@ -103,49 +237,52 @@ private:
       iw->flush();
 
     }
-    if (request->has_columns()) {
-      std::cout << "\tindexer got columns: " << request->columns().columns_size() << std::endl;
+    if (request.has_columns()) {
+      std::cout << "\tindexer got columns: " << request.columns().columns_size() << std::endl;
 
     }
 
-
-    reply->set_message("Indexing Response");
-    return Status::OK;
+    reply.set_message("Indexing Response");
+    // return grpc::Status::OK;
   }
 };
 
 
 
-GRPCServer::GRPCServer()
-  : startLatch(1) {
+void GRPCServer::runThread(ThreadInfo& threadInfo) {
+  // wait for the server to start before trying to use it.
+  if (!waitForStart()) {
+    return;
+  };
 
+  // Create one of each type of call.  They insert themselves into the completion queue.
+  new SayHelloCall(*this, greeterService, threadInfo);
+  new SayHelloCall2(*this, greeterService, threadInfo);
+  new IndexerUpdateCall(*this, indexerService, threadInfo);
+
+  while (true) {
+    void* tag;  // uniquely identifies a request.
+    bool ok;
+    bool gotEvent = threadInfo.cq->Next(&tag, &ok);
+
+    if (!gotEvent) {
+      // shutting down... completion queue should be empty at this point.
+      std::cout << "thread " << threadInfo.threadno << " completionQueue->Next() returned false." << std::endl;
+      break;
+    }
+
+    if (!ok) {
+      // request failed or was terminated.... still call proceed() so that it can be cleaned up
+      std::cout << "thread " << threadInfo.threadno << " ERROR in completionQueue->Next()" << std::endl;
+    }
+
+    CallData* callData = (CallData*)tag;
+    callData->proceed(ok);
+  }
+
+  // threadInfo.cq->Shutdown();
 }
 
-// adapted from the grpc helloworld example
-void solux::GRPCServer::run() {
-  std::string server_address("0.0.0.0:50051");
-  GreeterServiceImpl service;
-  IndexerServiceImpl indexerService(*this);
-
-  grpc::EnableDefaultHealthCheckService(true);
-  grpc::reflection::InitProtoReflectionServerBuilderPlugin();
-  ServerBuilder builder;
-  // Listen on the given address without any authentication mechanism.
-  builder.AddListeningPort(server_address, grpc::InsecureServerCredentials());
-  // Register "service" as the instance through which we'll communicate with
-  // clients. In this case it corresponds to a *synchronous* service.
-  builder.RegisterService(&service);
-  builder.RegisterService(&indexerService);
-  // Finally assemble the server.
-  this->server = builder.BuildAndStart();
-  std::cout << "GRPCServer listening on " << server_address << std::endl;
-
-  startLatch.count_down();
-
-  // Wait for the server to shutdown. Note that some other thread must be
-  // responsible for shutting down the server for this call to ever return.
-  server->Wait();
-}
 
 bool GRPCServer::waitForStart() {
   startLatch.wait();
@@ -154,5 +291,19 @@ bool GRPCServer::waitForStart() {
 
 void solux::GRPCServer::shutdown() {
   std::cout << "Shutting down grpc server." << std::endl;
+
+  // server should be shut down before completion queues
   server->Shutdown();
+
+  // calling Shutdown on the completion queue will cause cq->Next() to return false
+  // rather than block.
+  for (auto& threadInfo : threadInfos) {
+    threadInfo.cq->Shutdown();
+  }
+
+  for (auto& thread : threads) {
+    thread.join();
+    std::cout << "thread joined." << std::endl;
+  }
+
 }

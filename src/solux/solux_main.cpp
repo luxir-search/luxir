@@ -43,7 +43,8 @@ std::string solux_banner() {
 #endif
 
   ss << std::endl;
-  ss << "\tcwd=" << fs::current_path();
+  ss << "\thw_threads=" << std::thread::hardware_concurrency();
+  ss << " cwd=" << fs::current_path();
   ss << " tmp=" << fs::temp_directory_path();
 
 

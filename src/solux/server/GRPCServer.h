@@ -1,5 +1,6 @@
 #pragma once
 
+#include <thread>
 #include <grpcpp/grpcpp.h>
 #include <grpcpp/health_check_service_interface.h>
 #include <grpcpp/ext/proto_server_reflection_plugin.h>
@@ -21,10 +22,27 @@ public:
     return soluxNode;
   }
 
+
+  struct ThreadInfo {
+    int threadno;  // the thread number, starting at 0
+    std::unique_ptr<grpc::ServerCompletionQueue> cq;
+  };
 private:
+
+  solux::Greeter::AsyncService greeterService;
+  solux::Indexer::AsyncService indexerService;
+
+
   SoluxNode soluxNode;  // TODO: this may be passed in later rather than exclusively owned?
   boost::latch startLatch;
   std::unique_ptr<grpc::Server> server;
+  std::vector<std::thread> threads;
+  std::vector<ThreadInfo> threadInfos;
+
+  // this is run for each thread
+  void runThread(ThreadInfo& threadInfo);
+
+  friend class CallData;
 };
 
 }

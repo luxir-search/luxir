@@ -16,6 +16,7 @@ package solux;
 service Greeter {
   // Sends a greeting
   rpc SayHello (HelloRequest) returns (HelloReply) {}
+  rpc SayHello2 (HelloRequest) returns (HelloReply) {}
 }
 
 // The request message containing the user's name.
