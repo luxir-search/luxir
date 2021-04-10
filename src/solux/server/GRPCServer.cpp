@@ -96,10 +96,10 @@ public:
   }
 
   virtual void proceed(bool ok) override {
-    std::cout << "UnaryCallData.proceed(" << ok << ") this=" << (void*)this << std::endl;
+    // std::cout << "UnaryCallData.proceed(" << ok << ") this=" << (void*)this << std::endl;
     if (!ok) {
       // canceled/errored... nothing else to do.
-      std::cout << "deleting " << (void*)this << std::endl;
+      // std::cout << "deleting " << (void*)this << std::endl;
       delete this;
       return;
     }
@@ -116,7 +116,7 @@ public:
       //std::cout << "finish called," << counter++ << std::endl;
     } else {
       // nothing left to do but delete ourselves
-      std::cout << "deleting " << (void*)this << std::endl;
+      // std::cout << "deleting " << (void*)this << std::endl;
       delete this;
     }
 
@@ -129,7 +129,7 @@ public:
 class SayHelloCall : public UnaryCallData<HelloRequest, HelloReply, Greeter::AsyncService> {
 public:
   SayHelloCall(GRPCServer& server, Greeter::AsyncService& service, GRPCServer::ThreadInfo& threadInfo) : UnaryCallData(server, service, threadInfo) {
-    std::cout << "hello inserting " << (void*)this << std::endl;
+    // std::cout << "hello inserting " << (void*)this << std::endl;
     // TODO: how to do this in a generic way?  I would need to get the index of the method and then call
     // ::grpc::Service::RequestAsyncUnary(0, context, request, response, new_call_cq, notification_cq, tag);
     service.RequestSayHello(&ctx, &request, &responder, threadInfo.cq.get(), threadInfo.cq.get(), (void*)this);
@@ -141,14 +141,14 @@ public:
   virtual void fillReply() override {
     std::string prefix("Hello ");
     reply.set_message(prefix + request.name());
-    std::cout << "req name:" << request.name() << std::endl;
+    // std::cout << "req name:" << request.name() << std::endl;
   }
 };
 
 class SayHelloCall2 : public UnaryCallData<HelloRequest, HelloReply, Greeter::AsyncService> {
 public:
   SayHelloCall2(GRPCServer& server, Greeter::AsyncService& service, GRPCServer::ThreadInfo& threadInfo) : UnaryCallData(server, service, threadInfo) {
-    std::cout << "hello2 inserting " << (void*)this << std::endl;
+    // std::cout << "hello2 inserting " << (void*)this << std::endl;
     service.RequestSayHello2(&ctx, &request, &responder, threadInfo.cq.get(), threadInfo.cq.get(), (void*)this);
   }
 
@@ -158,7 +158,7 @@ public:
   virtual void fillReply() override {
     std::string prefix("Hello2 ");
     reply.set_message(prefix + request.name());
-    std::cout << "req name:" << request.name() << std::endl;
+    // std::cout << "req name:" << request.name() << std::endl;
   }
 };
 
