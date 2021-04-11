@@ -26,6 +26,12 @@ public:
   struct ThreadInfo {
     int threadno;  // the thread number, starting at 0
     std::unique_ptr<grpc::ServerCompletionQueue> cq;
+
+    int64_t requests;
+
+    friend std::ostream &operator<<(std::ostream &out, const ThreadInfo &obj) {
+      return out << "thread " << obj.threadno << " requests=" << obj.requests;
+    }
   };
 private:
 

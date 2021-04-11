@@ -24,6 +24,7 @@ public:
 
 // Test to see if our generic methods of communication (client objects, grpcserver impl, etc) are thread safe.
 // This does not test application logic for thread safety, just the communications infrastructure (and how we use it.)
+// TODO: remove Greeter and add no-op index & query flags
 TEST_F(GrpcIndexTest, threadsafe) {
   std::vector<std::thread> threads;
 

@@ -105,6 +105,8 @@ public:
     }
 
     if (state == PROCESS) {
+      threadInfo.requests++;
+
       // create a new instance of this to handle additional calls.
       createNew();
 
@@ -280,7 +282,7 @@ void GRPCServer::runThread(ThreadInfo& threadInfo) {
     callData->proceed(ok);
   }
 
-  // threadInfo.cq->Shutdown();
+  std::cout << "GRPCServer thread shutting down: " << threadInfo << std::endl;
 }
 
 
@@ -303,7 +305,6 @@ void solux::GRPCServer::shutdown() {
 
   for (auto& thread : threads) {
     thread.join();
-    std::cout << "thread joined." << std::endl;
   }
 
 }
