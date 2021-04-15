@@ -2,6 +2,7 @@
 #include <gtest/gtest.h>
 #include <iostream>
 #include "solux/util/solux_util.h"
+#include "solux/util/TaggedPtr.h"
 
 using namespace std;
 
@@ -23,6 +24,18 @@ TEST(BasicTest, testCompiler) {
     } SOLUX_PACKED_END;
 
     EXPECT_EQ(9, sizeof(s2));  // make sure that the packed attribute does not pad the end
+
+    // tagged pointer on heap
+    TaggedPtr<std::string> tp(new std::string("hi"),5);
+    EXPECT_EQ(*tp.ptr(), "hi");
+    EXPECT_EQ(tp.tag(), 5);
+    delete tp.ptr();
+
+    // tagged pointer on stack
+    std::string stackString("hi");
+    TaggedPtr<std::string> tp2(&stackString,3);
+    EXPECT_EQ(*tp2.ptr(), "hi");
+    EXPECT_EQ(tp2.tag(), 3);
 }
 
 #if REMOVED_CODE
