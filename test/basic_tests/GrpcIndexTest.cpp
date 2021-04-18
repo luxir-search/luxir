@@ -22,6 +22,37 @@ public:
 
 };
 
+
+TEST_F(GrpcIndexTest, streaming) {
+  solux::HelloRequest req;
+  solux::HelloReply result;
+  grpc::ClientContext context;  // need a new one for each RPC
+
+  std::unique_ptr<grpc::ClientReaderWriter<HelloRequest,HelloReply>> stream = greeterStub->SayHelloStreaming(&context);
+
+  req.set_name("A");
+  bool wrote = stream->Write(req);
+  ASSERT_TRUE(wrote);
+  req.set_name("B");
+  wrote = stream->Write(req);
+  ASSERT_TRUE(wrote);
+
+  bool ok1 = stream->WritesDone();  // can replace with WriteLast? is it more efficient?
+  ASSERT_TRUE(ok1);
+
+  while (stream->Read(&result)) {
+    std::string resStr;
+    google::protobuf::TextFormat::PrintToString(result, &resStr);
+    std::cout << "CLIENT RESULT:( " << resStr << " )" << std::endl;
+  }
+
+  grpc::Status status = stream->Finish();
+  std::cout << "CLIENT FINISHED" << std::endl;
+  ASSERT_TRUE(status.ok());
+}
+
+
+
 // Test to see if our generic methods of communication (client objects, grpcserver impl, etc) are thread safe.
 // This does not test application logic for thread safety, just the communications infrastructure (and how we use it.)
 // TODO: remove Greeter and add no-op index & query flags
@@ -37,7 +68,7 @@ TEST_F(GrpcIndexTest, threadsafe) {
               std::cout << "STARTED TEST THREAD " << i <<  std::endl;
 
               std::string name = "Name_" + std::to_string(i) + "_";
-              int namelen = name.size();
+              auto namelen = name.size();
 
               for (int j=0; j<100; j++) {
                 solux::HelloRequest req;

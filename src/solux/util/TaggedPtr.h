@@ -18,6 +18,16 @@ public:
     x = (reinterpret_cast<int64_t>(ptr) << TAG_BITS) + tag;
   }
 
+  explicit TaggedPtr(uint64_t taggedPtr) {
+    x = taggedPtr;
+  }
+
+  // Recreate a TaggedPtr that has previously been converted to a void*
+  // We don't have a constructor that takes a void* because that would be error prone. This is explicit.
+  static TaggedPtr fromTaggedPtrBits(void* taggedPtr) {
+    return TaggedPtr(reinterpret_cast<int64_t>(taggedPtr));
+  }
+
   T* ptr() const {
     // Do a signed shift so we get the correct sign extension (all bits above the 48th bit
     // must match the 48th bit).  Most operating systems I know of use the "0" half of the address
