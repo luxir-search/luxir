@@ -91,13 +91,13 @@ public:
 
 
 // TODO: make a template class for request/response
-template <class RequestT, class ReplyT, class AsyncServiceT>
+template <class RequestT, class ResponseT, class AsyncServiceT>
 class UnaryCallData : public CallData {
 public:
   RequestT request;
-  ReplyT reply;
+  ResponseT response;
   AsyncServiceT& service;
-  grpc::ServerAsyncResponseWriter<ReplyT> responder;
+  grpc::ServerAsyncResponseWriter<ResponseT> responder;
   enum CallStatus { CREATE, PROCESS, FINISH };
   CallStatus state;
 
@@ -124,10 +124,10 @@ public:
       createNew();
 
       // The actual processing.
-      fillReply();
+      fillResponse();
 
       state = FINISH;
-      responder.Finish(reply, grpc::Status::OK, make_tag());
+      responder.Finish(response, grpc::Status::OK, make_tag());
       //std::cout << "finish called," << counter++ << std::endl;
     } else {
       // nothing left to do but delete ourselves
@@ -138,17 +138,17 @@ public:
   }
 
   virtual void createNew() = 0;
-  virtual void fillReply() = 0;
+  virtual void fillResponse() = 0;
 };
 
 
-template <class RequestT, class ReplyT, class AsyncServiceT>
+template <class RequestT, class ResponseT, class AsyncServiceT>
 class StreamingCallData : public CallData {
 public:
   RequestT request;
-  ReplyT reply;
+  ResponseT response;
   AsyncServiceT& service;
-  grpc::ServerAsyncReaderWriter<ReplyT,RequestT> readerWriter;
+  grpc::ServerAsyncReaderWriter<ResponseT,RequestT> readerWriter;
   enum CallStatus { READ = 1, WRITE = 2, CONNECT = 3, FINISH = 5 };
 
   CallStatus state;
@@ -203,11 +203,15 @@ public:
           break;
         }
 
-        std::cout << "Read new message: " << request.name() << std::endl;
 
-        fillReply();
+        {
+          std::string reqStr;
+          google::protobuf::TextFormat::PrintToString(request, &reqStr);
+          std::cout << "Server read new streaming message:( " << reqStr << " )" << std::endl;
+        }
+        fillResponse();
 
-        readerWriter.Write(reply, make_tag());
+        readerWriter.Write(response, make_tag());
 
         // TODO: we should be able to do multiple reads before the first write if we want.
         state = CallStatus::WRITE;
@@ -235,7 +239,7 @@ public:
   }
 
   virtual void createNew() = 0;
-  virtual void fillReply() = 0;
+  virtual void fillResponse() = 0;
 };
 
 class SayHelloStreamingCall : public StreamingCallData<HelloRequest, HelloReply, Greeter::AsyncService> {
@@ -248,9 +252,9 @@ public:
   virtual void createNew() override {
     new SayHelloStreamingCall(server, service, threadInfo);
   }
-  virtual void fillReply() override {
+  virtual void fillResponse() override {
     std::string prefix("HelloStreaming ");
-    reply.set_message(prefix + request.name());
+    response.set_message(prefix + request.name());
     // std::cout << "req name:" << request.name() << std::endl;
   }
 };
@@ -267,9 +271,9 @@ public:
   virtual void createNew() override {
     new SayHelloCall(server, service, threadInfo);
   }
-  virtual void fillReply() override {
+  virtual void fillResponse() override {
     std::string prefix("Hello ");
-    reply.set_message(prefix + request.name());
+    response.set_message(prefix + request.name());
     // std::cout << "req name:" << request.name() << std::endl;
   }
 };
@@ -284,14 +288,14 @@ public:
   virtual void createNew() override {
     new SayHelloCall2(server, service, threadInfo);
   }
-  virtual void fillReply() override {
+  virtual void fillResponse() override {
     std::string prefix("Hello2 ");
-    reply.set_message(prefix + request.name());
+    response.set_message(prefix + request.name());
     // std::cout << "req name:" << request.name() << std::endl;
   }
 };
 
-class IndexerUpdateCall : public UnaryCallData<solux::proto::UpdateRequest, HelloReply, Indexer::AsyncService> {
+class IndexerUpdateCall : public UnaryCallData<solux::proto::UpdateRequest, solux::proto::UpdateResponse, Indexer::AsyncService> {
 public:
   IndexerUpdateCall(GRPCServer& server, Indexer::AsyncService& service, GRPCServer::ThreadInfo& threadInfo) : UnaryCallData(server, service, threadInfo) {
     std::cout << "Indexer.Update inserting " << (void*)this << std::endl;
@@ -301,7 +305,7 @@ public:
   virtual void createNew() override {
     new IndexerUpdateCall(server, service, threadInfo);
   }
-  virtual void fillReply() override {
+  virtual void fillResponse() override {
     std::cout << "Update GRPCServer peer=" << ctx.peer() << std::endl;
 
     std::shared_ptr<Collection> collection;
@@ -371,12 +375,47 @@ public:
 
     }
 
-    reply.set_message("Indexing Response");
+    auto& singleResponse = *response.add_responses();
+    singleResponse.set_request_id(request.request_id());
     // return grpc::Status::OK;
   }
 };
 
 
+// client-server interaction scenarios:
+//   single streaming client to single index
+//   single streaming client to multiple indexes
+//   multiple streaming clients to single index
+//   multiple streaming clients to multiple indexes
+//
+// Server partition:
+//   For updates, the solux server enables indexing one or more update requests in parallel by partitioning by
+//   document id and ensuring that updates to the same document are in-order.
+//
+// A) Single large index, all unique docs:
+//   1) N streaming clients connected to N server threads, all updates processed in receiving thread on cached Inverter.
+//       # more complicated client, but potentially fastest due to fewer context switches?
+//   2) 1 streaming client connected to 1 streaming server, handing out messages to N indexing threads, each with their own cached Inverter.
+//
+// B) Single large index, non-unique docs:
+//   1) N streaming clients connected to N server threads, handing out messages to M indexing threads partitioned by docid
+//
+
+class IndexerUpdateStreamingCall : public StreamingCallData<solux::proto::UpdateRequest, solux::proto::UpdateResponse, Indexer::AsyncService> {
+public:
+  IndexerUpdateStreamingCall(GRPCServer& server, Indexer::AsyncService& service, GRPCServer::ThreadInfo& threadInfo) : StreamingCallData(server, service, threadInfo) {
+    service.RequestUpdateStream(&ctx, &readerWriter, threadInfo.cq.get(), threadInfo.cq.get(), make_tag());
+  }
+
+  virtual void createNew() override {
+    new IndexerUpdateStreamingCall(server, service, threadInfo);
+  }
+  virtual void fillResponse() override {
+    std::string prefix("HelloStreaming ");
+    auto& singleResponse = *response.add_responses();
+    singleResponse.set_request_id(request.request_id());
+  }
+};
 
 void GRPCServer::runThread(ThreadInfo& threadInfo) {
   // wait for the server to start before trying to use it.
@@ -389,6 +428,7 @@ void GRPCServer::runThread(ThreadInfo& threadInfo) {
   new SayHelloCall2(*this, greeterService, threadInfo);
   new SayHelloStreamingCall(*this, greeterService, threadInfo);
   new IndexerUpdateCall(*this, indexerService, threadInfo);
+  new IndexerUpdateStreamingCall(*this, indexerService, threadInfo);
 
   while (true) {
     void* tag;  // uniquely identifies a request.

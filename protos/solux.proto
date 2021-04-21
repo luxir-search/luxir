@@ -32,5 +32,6 @@ message HelloReply {
 
 
 service Indexer {
-  rpc Update(solux.proto.UpdateRequest) returns (HelloReply) {}
+  rpc Update(solux.proto.UpdateRequest) returns (solux.proto.UpdateResponse) {}
+  rpc UpdateStream(stream solux.proto.UpdateRequest) returns (stream solux.proto.UpdateResponse) {}
 }

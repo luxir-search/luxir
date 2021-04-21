@@ -46,7 +46,16 @@ message Target {
 }
 
 message UpdateRequest {
-  Target collection = 1;
+  // request_id is optional and opaque (server does not care what the value is).  If provided, the server will
+  // use it in the UpdateResponse.  This is useful for the client to correlate requests and responses in
+  // streaming RPCs.
+  bytes request_id = 1;
+
+  // stream_id is optional.  When in streaming mode,
+  // Update messages in the same logical stream will be processed serially.  A stream_id of 0
+  bytes stream_id = 2;
+
+  Target collection = 3;
 
   // TODO:
   // possible parameters: commitWithin,
@@ -59,13 +68,28 @@ message UpdateRequest {
   // TODO: should docs/columns be wrapped in "oneof" (if so, need wrapper for "repeated Map docs")
 
   // documents represented as multiple rows... less efficient since field names are repeated for each document
-  repeated Map docs = 2;
+  repeated Map docs = 4;
 
   // Column representation of a batch of documents.  All columns should have the same length.
   // For very sparse columns that you do not wish to represent as columns, use a special
   // field name of "_fields_" with a value of ColMap for per-document sparse values.  This is
   // effectively a mix of column oriented and row oriented.
-  Columns columns = 3;
+  Columns columns = 5;
+}
+
+// The response to an update request, or one or more update requests in streaming mode.
+message UpdateResponse {
+  repeated SingleUpdateResponse responses = 1;
+}
+
+message SingleUpdateResponse {
+  bytes request_id = 1;
+  repeated UpdateError errors = 2;
+}
+
+message UpdateError {
+  // docId... bytes? string?
+  string error_message = 1;
 }
 
 
@@ -156,17 +180,17 @@ message Column {
 }
 
 message ColInt {
-  optional sint64 missingVal = 1;
+  optional sint64 missing_val = 1;
   repeated sint64 v = 2;
 }
 
 message ColFloat {
-  optional float missingVal = 1;
+  optional float missing_val = 1;
   repeated float v = 2;
 }
 
 message ColDouble {
-  optional double missingVal = 1;
+  optional double missing_val = 1;
   repeated double v = 2;
 }
 
