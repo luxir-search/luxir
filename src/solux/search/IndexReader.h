@@ -12,6 +12,9 @@ public:
     int ord;  // index of this segment in the list of segments
     std::unique_ptr<PostingsReader> reader;
 
+    Segment(int64_t base, int ord, std::unique_ptr<PostingsReader>&& postingsReader)
+            : base(base), ord(ord), reader(std::move(postingsReader)) {
+    }
 
     /* couldn't get any of these to work with storing directly in vector (when including PostingsReader directly)
      so changed to unique_ptr for now.

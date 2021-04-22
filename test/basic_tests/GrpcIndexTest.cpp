@@ -180,30 +180,4 @@ TEST_F(GrpcIndexTest, addDocsStream) {
   std::cout << "STREAMING UPDATE CLIENT FINISHED" << std::endl;
   ASSERT_TRUE(status.ok());
 }
-TEST_F(GrpcIndexTest, streamingDeleteMe) {
-  solux::HelloRequest req;
-  solux::HelloReply result;
-  grpc::ClientContext context;  // need a new one for each RPC
 
-  std::unique_ptr<grpc::ClientReaderWriter<HelloRequest,HelloReply>> stream = greeterStub->SayHelloStreaming(&context);
-
-  req.set_name("A");
-  bool wrote = stream->Write(req);
-  ASSERT_TRUE(wrote);
-  req.set_name("B");
-  wrote = stream->Write(req);
-  ASSERT_TRUE(wrote);
-
-  bool ok1 = stream->WritesDone();  // can replace with WriteLast? is it more efficient?
-  ASSERT_TRUE(ok1);
-
-  while (stream->Read(&result)) {
-    std::string resStr;
-    google::protobuf::TextFormat::PrintToString(result, &resStr);
-    std::cout << "CLIENT RESULT:( " << resStr << " )" << std::endl;
-  }
-
-  grpc::Status status = stream->Finish();
-  std::cout << "CLIENT FINISHED" << std::endl;
-  ASSERT_TRUE(status.ok());
-}

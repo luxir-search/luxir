@@ -53,7 +53,7 @@ message UpdateRequest {
 
   // stream_id is optional.  When in streaming mode,
   // Update messages in the same logical stream will be processed serially.  A stream_id of 0
-  bytes stream_id = 2;
+  int64 stream_id = 2;
 
   Target collection = 3;
 
