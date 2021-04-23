@@ -2,11 +2,17 @@
 
 #include <string>
 #include <charconv>
+#include <thread>
+#include <mutex>
 #include "solux/store/Directory.h"
 #include "solux/store/OutputStream.h"
 #include "solux/store/InputStream.h"
 #include "Inverter.h"
 #include "PostingsWriter.h"
+
+// we may want to decouple from protobuf in the future, but for now it makes it easy to develop
+#include "protos/solux_types.pb.h"
+
 
 namespace solux {
 
@@ -45,6 +51,7 @@ class IndexWriter {
     }
   }
 
+  std::mutex indexMutex;
 
 public:
 
@@ -87,6 +94,8 @@ public:
   // TODO: currently not thread safe
   // just pass in Inverter here?
   void flush() {
+    const std::lock_guard<std::mutex> lock(indexMutex);
+
     if (inverter == nullptr) return;
     // TODO: check if inverter actually inverted any docs?
 
@@ -113,6 +122,47 @@ public:
     dir.finishFile(*indexFile);
 
     inverter.reset();
+  }
+
+  // TODO: Currently single threaded and protected by the IndexWriter mutex... we need something different
+  // in the future that can utilize multi-threading.
+  void update(solux::proto::UpdateRequest& request) {
+    const std::lock_guard<std::mutex> lock(indexMutex);
+
+    Inverter& inverter = getInverter();
+
+    std::vector<Inverter::SegFieldPos*> segFields;
+    // int ndocs = request->docs_size();
+
+    if (request.docs_size() > 0) {
+      for (auto &doc : request.docs()) {
+        size_t nFields = doc.fields_size();
+        if (segFields.size() < nFields) {
+          segFields.resize(nFields);
+        }
+
+        inverter.startDoc();
+
+        int idx = 0;
+        for (auto&[fname, fval] : doc.fields()) {
+          auto segField = segFields[idx];
+          if (segField == nullptr || *segField != fname) {
+            segFields[idx] = segField = &inverter.getSegField(fname);
+          }
+          auto &sval = fval.s();
+          std::cout << " Indexing " << fname << ":" << sval << std::endl;
+          inverter.index(*segField, const_cast<char *>(sval.data()), sval.size());  // TODO: get rid of the const-cast
+          idx++;
+        }
+
+        inverter.finishDoc();
+      }
+    }
+
+    if (request.has_columns()) {
+      std::cout << "\tindexer got columns: " << request.columns().columns_size() << std::endl;
+    }
+
   }
 
   // TODO: can merging be decoupled and done by something else?  What about even on a different node?

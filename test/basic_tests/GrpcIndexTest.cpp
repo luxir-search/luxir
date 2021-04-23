@@ -159,6 +159,8 @@ TEST_F(GrpcIndexTest, addDocsStream) {
   ASSERT_TRUE(wrote);
 
   solux::proto::UpdateRequest req2;
+  req2.mutable_collection()->add_name("main");  // TODO: allow this to not be set if same as last message!
+
   auto& fields2 = *req2.add_docs()->mutable_fields();
   fields2["text1_w"].set_s("x3");
   fields2["text2_w"].set_s("x4");

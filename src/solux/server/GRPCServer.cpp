@@ -1,7 +1,6 @@
 
 #include <string>
 #include <algorithm>
-#include <boost/lockfree/detail/tagged_ptr.hpp>
 #include <grpcpp/grpcpp.h>
 #include <google/protobuf/text_format.h>
 #include <grpcpp/health_check_service_interface.h>
@@ -307,7 +306,12 @@ public:
   }
   virtual void fillResponse() override {
     std::cout << "Update GRPCServer peer=" << ctx.peer() << std::endl;
+    auto code = handleUpdate(server, request, response);
+    unused(code); // TOOD: pass back?
+  }
 
+  // static methods meant to be usable by streaming server as well
+  static grpc::Status handleUpdate(GRPCServer& server, solux::proto::UpdateRequest& request, solux::proto::UpdateResponse& response) {
     std::shared_ptr<Collection> collection;
 
     if (request.collection().name_size() == 0) {
@@ -330,54 +334,15 @@ public:
       }
     }
 
-
-    if (request.docs_size() > 0) {
-      std::cout << "\tindexer got docs: " << request.docs_size() << std::endl;
-      auto shard = collection->getShard();
-      auto iw = shard->getIndexWriter();
-      Inverter& inverter = iw->getInverter();
-
-      std::string reqStr;
-      google::protobuf::TextFormat::PrintToString(request, &reqStr);
-      std::cout << "REQ:( " << reqStr << " )" << std::endl;
-
-      std::vector<Inverter::SegFieldPos*> segFields;
-      // int ndocs = request->docs_size();
-      for (auto& doc : request.docs()) {
-        size_t nFields = doc.fields_size();
-        if (segFields.size() < nFields) {
-          segFields.resize(nFields);
-        }
-
-        inverter.startDoc();
-
-        int idx=0;
-        for (auto& [fname,fval] : doc.fields()) {
-          auto segField = segFields[idx];
-          if (segField == nullptr || *segField != fname) {
-            segFields[idx] = segField = &inverter.getSegField(fname);
-          }
-          auto& sval = fval.s();
-          std::cout << " Indexing " << fname << ":" << sval << std::endl;
-          inverter.index(*segField, const_cast<char*>(sval.data()), sval.size());  // TODO: get rid of the const-cast
-          idx++;
-        }
-
-        inverter.finishDoc();
-      }
-
-      // TODO: keep the current inverter around if we expect more docs coming.
-      iw->flush();
-
-    }
-    if (request.has_columns()) {
-      std::cout << "\tindexer got columns: " << request.columns().columns_size() << std::endl;
-
-    }
+    std::cout << "\tindexer got docs: " << request.docs_size() << std::endl;
+    auto shard = collection->getShard();
+    auto iw = shard->getIndexWriter();
+    iw->update(request);
+    iw->flush();
 
     auto& singleResponse = *response.add_responses();
     singleResponse.set_request_id(request.request_id());
-    // return grpc::Status::OK;
+    return grpc::Status::OK;
   }
 };
 
@@ -411,11 +376,13 @@ public:
     new IndexerUpdateStreamingCall(server, service, threadInfo);
   }
   virtual void fillResponse() override {
-    std::string prefix("HelloStreaming ");
-    auto& singleResponse = *response.add_responses();
-    singleResponse.set_request_id(request.request_id());
+    std::cout << "StreamingUpdate GRPCServer peer=" << ctx.peer() << std::endl;
+    auto ok = IndexerUpdateCall::handleUpdate(server, request, response);
+    unused(ok);
   }
 };
+
+
 
 void GRPCServer::runThread(ThreadInfo& threadInfo) {
   // wait for the server to start before trying to use it.
