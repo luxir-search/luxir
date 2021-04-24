@@ -27,7 +27,7 @@ Then recompile:
 
 Installing dependencies via vcpkg:
 $ cd /opt/vcpkg
-$ ./vcpkg install boost gtest xxhash parallel-hashmap protobuf grpc
+$ ./vcpkg install boost gtest xxhash parallel-hashmap protobuf grpc taskflow
 $ ./vcpkg install robin-hood-hashing   #optional... see MapBM.cpp
 
 Ubuntu:

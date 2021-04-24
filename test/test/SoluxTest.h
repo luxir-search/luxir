@@ -2,6 +2,7 @@
 #include <gtest/gtest.h>
 #include "solux/util/solux_util.h"
 #include "solux/util/random.h"
+#include "taskflow/taskflow.hpp"
 
 namespace solux {
 
@@ -50,9 +51,19 @@ namespace solux {
 
 
 class SoluxTest : public ::testing::Test {
+  static std::unique_ptr<tf::Executor> tfExecutor;
+  static std::once_flag initExecutorFlag;
+
 public:
   static Rng rng;
   static uint64_t rng_seed;
+
+  // Thread safe delayed creation of the executor
+  tf::Executor& executor() {
+    std::call_once(initExecutorFlag,[]{tfExecutor = std::make_unique<tf::Executor>(); });
+    return *tfExecutor.get();
+  }
+
 
   // This is called from a listener with a seed that is different for every test.
   inline static void init_test(uint64_t seed) {
