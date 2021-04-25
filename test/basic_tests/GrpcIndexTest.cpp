@@ -25,7 +25,7 @@ public:
 };
 
 
-TEST_F(GrpcIndexTest, streaming) {
+TEST_F(GrpcIndexTest, streamingHello) {
   solux::HelloRequest req;
   solux::HelloReply result;
   grpc::ClientContext context;  // need a new one for each RPC
@@ -59,20 +59,20 @@ TEST_F(GrpcIndexTest, streaming) {
 // This does not test application logic for thread safety, just the communications infrastructure (and how we use it.)
 // TODO: remove Greeter and add no-op index & query flags
 TEST_F(GrpcIndexTest, threadsafe) {
-  std::vector<std::thread> threads;
+  int nTasks = 100; // concurrency will be limited by executor
+  int callsPerTask = 10;
+  auto& exec = executor();
 
-  int nthreads = std::max(2u, std::thread::hardware_concurrency());
-  threads.reserve(nthreads);
 
-  for (int i=0; i<nthreads; i++) {
-    threads.emplace_back(
-            [this,i]{
-              std::cout << "STARTED TEST THREAD " << i <<  std::endl;
+  for (int i=0; i<nTasks; i++) {
+    exec.silent_async(
+            [=,this]{
+              // std::cout << "STARTED TEST THREAD " << i <<  " worker=" << exec.this_worker_id() << std::endl;
 
               std::string name = "Name_" + std::to_string(i) + "_";
               auto namelen = name.size();
 
-              for (int j=0; j<100; j++) {
+              for (int j=0; j<callsPerTask; j++) {
                 solux::HelloRequest req;
                 solux::HelloReply result;
                 grpc::ClientContext context;  // need a new one for each RPC
@@ -95,13 +95,10 @@ TEST_F(GrpcIndexTest, threadsafe) {
                 ASSERT_TRUE(result.message().ends_with(name));
               }
             }
-            );
+    );
   }
 
-  for (auto& thread : threads) {
-    thread.join();
-  }
-
+  exec.wait_for_all();
 }
 
 
