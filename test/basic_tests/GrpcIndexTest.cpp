@@ -21,6 +21,97 @@ public:
     indexerStub = solux::Indexer::NewStub(channel);
   }
 
+  void doSingleUpdate() {
+    solux::proto::UpdateRequest ureq;
+    solux::proto::UpdateResponse response;
+    grpc::ClientContext context;
+
+    ureq.mutable_collection()->add_name("main");
+
+    auto& fields = *ureq.add_docs()->mutable_fields();
+    fields["text1_w"].set_s("a value");
+
+    grpc::Status status = indexerStub->Update(&context, ureq , &response);
+
+    ASSERT_TRUE(status.ok());
+  }
+
+  // How we do things here in the client isn't actually ok depending on how the server is implemented and could
+  // lead to deadlock if we are insisting on writing more messages and the server is waiting for us to read more.
+  // Ideally, a separate thread is used for reading the responses.  This should also increase efficiency/throughput.
+  void doStreamingUpdates(Rng& r, int nMessages) {
+    solux::proto::UpdateRequest req;
+    solux::proto::UpdateResponse response;
+    grpc::ClientContext context;  // need a new one for each RPC
+
+    std::unique_ptr<grpc::ClientReaderWriter<solux::proto::UpdateRequest, solux::proto::UpdateResponse>> stream = indexerStub->UpdateStream(&context);
+
+    int nWrites=0;
+    int nReads=0;
+
+    for(;;) {
+      bool doWrite = nWrites < nMessages;
+      bool doRead = nReads < nWrites;
+
+      if (!doWrite && !doRead) {
+        // we are done
+        break;
+      }
+
+      // If we could do a read or a write, randomly select which one
+      if (doRead && doWrite) {
+        if (r.rbool()) {
+          doWrite = false;
+        } else {
+          doRead = false;
+        }
+      }
+
+      if (doWrite) {
+        nWrites++;
+
+        solux::proto::UpdateRequest req;
+        req.mutable_collection()->add_name("main");
+
+        auto& fields = *req.add_docs()->mutable_fields();
+        fields["text1_w"].set_s("val1");
+        fields["text2_w"].set_s("val2");
+
+        /* dump message
+        std::string reqStr;
+        google::protobuf::TextFormat::PrintToString(req, &reqStr);
+        std::cout << "CLIENT REQ:( " << reqStr << " )" << std::endl;
+         */
+
+        // on last message, randomly use WriteLast or WritesDone
+        if (nWrites == nMessages && r.rbool()) {
+           stream->WriteLast(req, grpc::WriteOptions());
+           // hmmm, return type of WriteLast is void
+        } else {
+          bool wrote = stream->Write(req);
+          ASSERT_TRUE(wrote);
+
+          // I could also test delaying this call (doing a read inbetween sometimes)
+          if (nWrites == nMessages) {
+            bool ok = stream->WritesDone();
+            ASSERT_TRUE(ok);
+          }
+        }
+      }
+
+      if (doRead) {
+        nReads++;
+        bool read = stream->Read(&response);
+        ASSERT_TRUE(read);
+        /*
+        std::string resStr;
+        google::protobuf::TextFormat::PrintToString(response, &resStr);
+        std::cout << "CLIENT RESULT:( " << resStr << " )" << std::endl;
+        */
+      }
+
+    } // end for(;;)
+  }
 
 };
 
@@ -93,6 +184,45 @@ TEST_F(GrpcIndexTest, threadsafe) {
                 // std::cout << "Got response " << result.message() <<  std::endl;
 
                 ASSERT_TRUE(result.message().ends_with(name));
+              }
+            }
+    );
+  }
+
+  exec.wait_for_all();
+}
+
+//
+// With the first simplistic multi-threading support in IndexWriter (just a single Inverter protected by a mutex)
+// this test quickly crashed after the mutex was removed.  When investigating thread safety and indexing, consider
+// ramping up callsPerTask to hammer things for longer.
+//
+TEST_F(GrpcIndexTest, threadsafeIndex) {
+  auto& exec = executor();
+
+  int nTasks = 32; // concurrency will be limited by executor
+  int callsPerTask = 10;
+  int streamingPercent = 20;  // percent of the requests that use streaming
+
+  for (int i=0; i<nTasks; i++) {
+    exec.silent_async(
+            [=,this]{
+              Rng r(rng_seed + i);
+
+              // std::cout << "STARTED TEST THREAD " << i <<  " worker=" << exec.this_worker_id() << std::endl;
+
+              int nCalls = 0;
+
+              while (nCalls < callsPerTask) {
+                if (r.rint(0,100) < streamingPercent) {
+                  int left = callsPerTask-nCalls;
+                  int nStream = left==1 ? 1 : r.rint(left) + 1;
+                  doStreamingUpdates(r, nStream);
+                  nCalls += nStream;
+                } else {
+                  doSingleUpdate();
+                  nCalls++;
+                }
               }
             }
     );
@@ -180,3 +310,7 @@ TEST_F(GrpcIndexTest, addDocsStream) {
   ASSERT_TRUE(status.ok());
 }
 
+
+TEST_F(GrpcIndexTest, addDocsStream2) {
+  doStreamingUpdates(rng, 10);
+}
