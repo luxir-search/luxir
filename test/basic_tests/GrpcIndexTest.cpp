@@ -202,7 +202,8 @@ TEST_F(GrpcIndexTest, threadsafeIndex) {
 
   int nTasks = 32; // concurrency will be limited by executor
   int callsPerTask = 10;
-  int streamingPercent = 20;  // percent of the requests that use streaming
+  int streamingPercent = 20;  // percent of the requests that use streaming, lower than 50% since streaming
+                              // requests will often consist of a number of update messages.
 
   for (int i=0; i<nTasks; i++) {
     exec.silent_async(

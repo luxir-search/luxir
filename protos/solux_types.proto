@@ -45,6 +45,142 @@ message Target {
   // likewise only contain collection names qualified from this reference point.
 }
 
+
+message SearchRequest {
+  // request_id is optional and opaque (server does not care what the value is).  If provided, the server will
+  // use it in the response.
+  bytes request_id = 1;
+  Target collection = 2;
+
+  // An alternative could be to put the tag/name in the SearchOp itself
+  map<string, SearchOp> ops = 3;
+}
+
+message SearchOp {
+  oneof kind {
+    TopDocs top_docs = 1;
+    // future: function (or leave that as a query type?)
+    FieldFacet field_facet = 8;
+    // future: something like terms component... stream out all terms of one or more (or all) fields
+  }
+}
+
+message TopDocs {
+  Query query = 1;
+  int64 offset = 2;
+  optional sint64 limit = 3;
+  bool get_matches = 4;         // return the number of matching documents
+  bool get_scores = 5;          // return the relevancy score for each document returned
+  repeated string fields = 6;   // fields to return for each document
+  repeated SortSpec sorts = 7;
+}
+
+message SortSpec {
+  string field = 1;
+  // future: sort by function
+
+  enum SortDir {
+    option allow_alias = true;
+    UNKNOWN = 0;
+    ASC = 1;
+    ASCENDING = 1;
+    DESC = 2;
+    DESCENDING = 2;
+  }
+  SortDir dir = 10;
+}
+
+message Query {
+  oneof kind {
+    Match match = 1;
+    BooleanQuery boolean = 2;
+    bool all = 3;                   // selects all documents
+    string field = 4;               // selects all documents with the given field name.  // TODO: what about field regex?
+
+    // TODO: a looser string match that will auto-convert to correct type
+    // TODO: a text query type (parsed by QueryParser)
+    // TODO: wildcard query
+    // TODO: phrase query
+    // TODO: function?
+
+
+  }
+
+
+}
+
+  // use NamedValue here instead? Repeat field so this can be used to query multiple fields at once? Add a field regex?
+  // the alternative is to add more query types at the top level to be more explicit
+message Match {
+  string field = 1;
+  Val val = 2;   // if val is an Array, this could be used for TermsQuery as well...  how to tell if scoring or not though?
+}
+
+message BooleanQuery {
+  repeated Query filter = 1;       // required clauses that do not add to the score
+  repeated Query required = 2;     // required clauses that do add to the score
+  repeated Query optional = 3;     // optional clauses that add to the score
+  repeated Query prohibited = 4;   // prohibited clauses that must not match
+  int32 min_match = 5;             // minimum number of optional clauses that must match
+}
+
+
+message FieldFacet {
+  string field = 1;
+  map<string, SearchOp> ops = 2;  // sub-facets or search operations performed per bucket
+}
+
+
+// Top-level response to a Search request
+message SearchResponse {
+  map<string, SearchResult> ops = 3;
+}
+
+message SearchResult {
+  oneof kind {
+    DocList docs = 1;
+  }
+}
+
+message DocList {
+  sint64 matches = 1;
+  float max_score = 2;
+  Columns columns = 3;
+  int64 offset = 4;
+  bool more = 5; // expect more results to be streamed back?
+}
+
+// TODO: a column format for facets for better efficiency (so string names and protobuf tags aren't repeated for each bucket?)
+// may be more efficient client language mapping as well?
+// What about special buckets then?  Map to a column number?  See FacetResponse below for a prototype column response
+message BucketList {
+  repeated Bucket buckets = 1;
+  sint64 num_buckets = 2;  // The total number of buckets *if* it was requested.  This can be expensive to calculate.
+  int64 offset = 3;
+  // TODO: a more flag if streaming for this bucket list?
+}
+
+message Bucket {
+  Val val = 1;
+  sint64 count = 2;
+  map<string, SearchResult> ops = 3;
+}
+
+message FacetResponse {
+  sint64 num_buckets =  1;
+  // TODO: for a field facet, the values will be string,binary,integer, or boolean.  We could also use
+  // the array type embedded in a single Val (i.e. don't have this field repeated) for a tigher response type.
+  repeated Val bucket_ids = 2;
+  repeated int64 counts = 3;
+  Columns columns = 4;  // other custom values requested for this facet, like min(price) for example
+}
+
+
+
+//
+//  Indexing
+//
+
 message UpdateRequest {
   // request_id is optional and opaque (server does not care what the value is).  If provided, the server will
   // use it in the UpdateResponse.  This is useful for the client to correlate requests and responses in
@@ -104,7 +240,7 @@ message Map {
   map<string, Val> fields = 1;
 }
 
-// like a Map, but the values are restricted to column types
+// like a Map, but the values are column types
 message Columns {
   map<string, Column> columns = 1;
 }

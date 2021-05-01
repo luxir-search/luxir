@@ -35,3 +35,8 @@ service Indexer {
   rpc Update(solux.proto.UpdateRequest) returns (solux.proto.UpdateResponse) {}
   rpc UpdateStream(stream solux.proto.UpdateRequest) returns (stream solux.proto.UpdateResponse) {}
 }
+
+service Searcher {
+  rpc search(solux.proto.SearchRequest) returns (solux.proto.SearchResponse) {}
+  rpc searchStream(solux.proto.SearchRequest) returns (stream solux.proto.SearchResponse) {}
+}
