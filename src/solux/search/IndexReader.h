@@ -3,6 +3,9 @@
 
 namespace solux {
 
+
+// TODO: how to handle multi-reader (say for most common use case of multiple shards in same node?)
+
 // IndexReader is thread safe
 class IndexReader {
 public:

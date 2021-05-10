@@ -17,6 +17,9 @@ class Shard {
   std::shared_ptr<Directory> dir;  // does this need to be shared_ptr?  Perhaps not if we have a shared ptr to a parent object (Shard or Collection?)
   std::shared_ptr<IndexWriter> iw;
 public:
+  // TODO: we don't want to be in the position of having more than ine IW pointing at the index/dir... this suggests that instead of
+  // having the ability for it to come and go, it should be a singleton (which could still be created on demand) that
+  // can dump most of it's state for low memory usage?  Then this method would not return a shared_ptr, but a simple reference.
   std::shared_ptr<IndexWriter> getIndexWriter() {
     return iw;
   }

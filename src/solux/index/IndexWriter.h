@@ -7,6 +7,7 @@
 #include "solux/store/Directory.h"
 #include "solux/store/OutputStream.h"
 #include "solux/store/InputStream.h"
+#include "solux/search/IndexReader.h"
 #include "Inverter.h"
 #include "PostingsWriter.h"
 
@@ -52,6 +53,7 @@ class IndexWriter {
   }
 
   std::mutex indexMutex;
+  std::mutex indexReaderMutex;
 
 public:
 
@@ -59,6 +61,8 @@ public:
   uint64_t gen;
   std::unique_ptr<Inverter> inverter;
   std::vector<std::string> segs;  // all of the referenced segments (TODO: replace with something containing more info when needed)
+
+  std::shared_ptr<IndexReader> indexReader;
 
   explicit IndexWriter(Directory &dir) : dir(dir) {
     std::shared_ptr<InputFile> segFile = dir.openFile(Postings::INDEX_INFO_FILE);
@@ -76,6 +80,20 @@ public:
       }
     }
   }
+
+  // return a copy of the shared_ptr so that the instance it points to will never change while in use.
+  std::shared_ptr<IndexReader> getIndexReader() {
+    const std::lock_guard<std::mutex> lock(indexReaderMutex);
+    if (indexReader.get() != nullptr) {
+      return indexReader;
+    }
+
+    std::shared_ptr<IndexReader> newReader = std::make_shared<IndexReader>(dir);
+    indexReader = newReader;
+    return indexReader;
+  }
+
+
 
   // What about multiple inverters on the same thread (because of sharding)?  Another alternative (if micro-sharding will be common)
   // is to enable it from a single Inverter (i.e. inverter can split and write to multiple postings writers)

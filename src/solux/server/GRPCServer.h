@@ -37,6 +37,7 @@ private:
 
   solux::Greeter::AsyncService greeterService;
   solux::Indexer::AsyncService indexerService;
+  solux::Searcher::AsyncService searcherService;
 
 
   SoluxNode soluxNode;  // TODO: this may be passed in later rather than exclusively owned?

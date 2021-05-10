@@ -37,6 +37,7 @@ service Indexer {
 }
 
 service Searcher {
-  rpc search(solux.proto.SearchRequest) returns (solux.proto.SearchResponse) {}
-  rpc searchStream(solux.proto.SearchRequest) returns (stream solux.proto.SearchResponse) {}
+  // TODO: should we have a non-streaming version for the request? Perhaps if it makes some
+  // clients easlier (is this the case?)
+  rpc Search(stream solux.proto.SearchRequest) returns (stream solux.proto.SearchResponse) {}
 }

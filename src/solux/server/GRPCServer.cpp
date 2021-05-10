@@ -33,6 +33,7 @@ void solux::GRPCServer::run() {
 
   builder.RegisterService(&greeterService);
   builder.RegisterService(&indexerService);
+  builder.RegisterService(&searcherService);
 
   int nthreads = std::max(1u, std::thread::hardware_concurrency());
   nthreads = 2; // TODO TODO TODO: delete this line in the future... this is just to lower the number of threads to make debugging easier
@@ -347,6 +348,7 @@ public:
 };
 
 
+
 // client-server interaction scenarios:
 //   single streaming client to single index
 //   single streaming client to multiple indexes
@@ -382,7 +384,61 @@ public:
   }
 };
 
+//   rpc search(stream solux.proto.SearchRequest) returns (stream solux.proto.SearchResponse) {}
+class SearcherSearchStreamingCall : public StreamingCallData<solux::proto::SearchRequest, solux::proto::SearchResponse, Searcher::AsyncService> {
+public:
+  SearcherSearchStreamingCall(GRPCServer& server, Searcher::AsyncService& service, GRPCServer::ThreadInfo& threadInfo) : StreamingCallData(server, service, threadInfo) {
+    service.RequestSearch(&ctx, &readerWriter, threadInfo.cq.get(), threadInfo.cq.get(), make_tag());
+  }
 
+  virtual void createNew() override {
+    new SearcherSearchStreamingCall(server, service, threadInfo);
+  }
+  virtual void fillResponse() override {
+    std::cout << "StreamingSearch GRPCServer peer=" << ctx.peer() << std::endl;
+    std::shared_ptr<Collection> collection;
+
+    if (request.collection().name_size() == 0) {
+      // TODO: do we support default collections (implicitly defined by something like an api-key?)
+    }
+
+    std::shared_ptr<Library> library = server.getSoluxNode().getLibrary(nullptr, "");
+    for (int i=0; i<request.collection().name_size(); i++) {
+      // TODO: walk from our implicit root to find the correct collection.
+      if (i == request.collection().name_size()-1) {
+        std::cout << "looking up collection name " << request.collection().name(i) << std::endl;
+
+        // last element in path, so get collection.
+        collection = server.getSoluxNode().getCollection(library.get(), request.collection().name(i));
+        // TODO: handle lookup failure
+      } else {
+        // not last element... get sub-library
+        library = server.getSoluxNode().getLibrary(library.get(), request.collection().name(i));
+        // TODO: handle lookup failure
+      }
+    }
+
+    for (auto& [opKey, searchOp] : request.ops()) {
+      switch (searchOp.kind_case()) {
+        case solux::proto::SearchOp::kTopDocs:
+        {
+          auto shard = collection->getShard();
+          auto iw = shard->getIndexWriter();
+          std::shared_ptr<IndexReader> reader = iw->getIndexReader();
+          response.set_request_id(request.request_id());
+          solux::proto::SearchResult& srsp = (*response.mutable_ops())[opKey];
+          solux::proto::DocList& docList = *srsp.mutable_docs();
+          docList.set_matches(reader->maxDoc());
+          break;
+        }
+        case solux::proto::SearchOp::kFieldFacet:
+          break;
+        default:
+          break;
+      }
+    }
+  }
+};
 
 void GRPCServer::runThread(ThreadInfo& threadInfo) {
   // wait for the server to start before trying to use it.
@@ -396,6 +452,7 @@ void GRPCServer::runThread(ThreadInfo& threadInfo) {
   new SayHelloStreamingCall(*this, greeterService, threadInfo);
   new IndexerUpdateCall(*this, indexerService, threadInfo);
   new IndexerUpdateStreamingCall(*this, indexerService, threadInfo);
+  new SearcherSearchStreamingCall(*this, searcherService, threadInfo);
 
   while (true) {
     void* tag;  // uniquely identifies a request.
