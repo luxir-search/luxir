@@ -1,8 +1,8 @@
 
 #include <gtest/gtest.h>
 #include <iostream>
+#include <latch>
 #include "test/SoluxTest.h"
-#include "boost/thread/latch.hpp"  // replace with std::latch when it's ready (libstdc++11 / gcc11)
 
 using namespace solux;
 
@@ -10,11 +10,9 @@ class TaskflowTest : public solux::SoluxTest {
 protected:
   tf::Executor& exec = executor(); // copy to local var so no further synchronization
 
-  boost::latch doneLatch;
+  std::latch doneLatch;
   int topLevelTasks = std::thread::hardware_concurrency() * 2;
   int subtasks = 1000; // number of subtasks to spawn for each top-level task
-
-  int result=.5;
 
   std::mutex lock;
   std::unordered_set<int> workers;
