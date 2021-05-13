@@ -24,6 +24,8 @@ find_package (Boost COMPONENTS REQUIRED thread)
 find_package(Taskflow CONFIG REQUIRED)
 
 include_directories(deps)
+include_directories(deps/CRoaring/cpp)
+include_directories(deps/CRoaring/include)
 link_directories(deps/simdcomp)
 
 #Print out all env vars... useful while build system is in development
@@ -132,6 +134,7 @@ add_library(solux_lib STATIC ${Proj_SOURCES})
 add_executable(solux src/solux/main.cpp)
 target_link_libraries(solux solux_lib)
 
+add_subdirectory(deps)
 add_subdirectory(protos)
 add_subdirectory(test)
 
@@ -149,3 +152,4 @@ target_link_libraries(solux_lib PRIVATE ${Boost_LIBRARIES})
 target_link_libraries(solux_lib PRIVATE debug simdcomp_ad)
 target_link_libraries(solux_lib PRIVATE optimized simdcomp_a)
 target_link_libraries(solux_lib PRIVATE myproto)
+target_link_libraries(solux_lib PRIVATE roaring)

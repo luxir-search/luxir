@@ -42,6 +42,7 @@ Other 3rd party dependencies.
 # and it currently is a manual setup.
 
 #For linux/unix: in the "deps" directory
+### for simdcomp
 $ git clone git@github.com:lemire/SIMDCompressionAndIntersection.git simdcomp
 $ cd simdcomp
 $ DEBUG=1 make
@@ -50,4 +51,5 @@ $ make clean
 $ make
 $ cp libSIMDCompressionAndIntersection.a libsimdcomp_a.a
 $ make clean
-
+### for CRoaring
+#git clone https://github.com/RoaringBitmap/CRoaring
