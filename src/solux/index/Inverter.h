@@ -64,7 +64,9 @@ public:
   MemPool pool;
 
 
+  //
   // Holds info for a single inverted field with positions for a single segment for this inverter.
+  //
   class SegFieldPos {
     friend class Inverter;
 
@@ -101,6 +103,50 @@ public:
       return out << "{field:" << sf.fieldName << " terms:" << sf.terms << "}";
     }
   };
+
+  //
+  // Info for one single valued column
+  //
+  class IntCol {
+    friend class Inverter;
+    std::string fieldName;
+
+
+    TermValHash<DocFreqPosStream> terms;  // the set of terms contained in this field
+    FieldType *fieldType;
+    TokenChain *tokenChain;
+  public:
+    IntCol(Inverter &inverter, const std::string_view &fieldName, FieldType *fieldType, TokenChain *tokenChain)
+    : terms(inverter.pool, 4), fieldName(fieldName), fieldType(fieldType), tokenChain(tokenChain) {
+    }
+
+    IntCol(IntCol&& other) = default;
+
+    ~IntCol() = default;
+
+    void index(Inverter &inverter, char *mutableVal, int len) {
+      // inverter.index(*this, mutableVal, len);
+    }
+
+    auto operator<=>(const SegFieldPos& other) const {
+      return this->fieldName <=> other.fieldName;
+    }
+
+    auto operator<=>(const std::string_view& sv) const {
+      return this->fieldName <=> sv;
+    }
+
+    auto operator==(const std::string_view& sv) const {
+      return this->fieldName == sv;
+    }
+
+    friend std::ostream& operator<<(std::ostream &out, const IntCol &sf) {
+      return out << "{field:" << sf.fieldName << " terms:" << sf.terms << "}";
+    }
+
+
+  };
+
 
   // OPTIMIZATION: since we only do additions and not deletions, a monotonic allocator that had destructor
   // support would be good here.

@@ -36,7 +36,7 @@ void solux::GRPCServer::run() {
   builder.RegisterService(&searcherService);
 
   int nthreads = std::max(1u, std::thread::hardware_concurrency());
-  nthreads = 2; // TODO TODO TODO: delete this line in the future... this is just to lower the number of threads to make debugging easier
+  nthreads = 2; // TODO TODO TODO FIXME: delete this line in the future... this is just to lower the number of threads to make debugging easier
   threads.reserve(nthreads);
   threadInfos.reserve(nthreads);
 
@@ -54,6 +54,10 @@ void solux::GRPCServer::run() {
 
   // inform everyone that the server is up and running
   startLatch.count_down();
+  // At this point the completion queues have all been created, but runThread() may not have continued (hence we have
+  // not requested to the completion queue to handle certain messages.) If a client request comes in, it will still
+  // wait to be handled (and then will be handled correctly.)  This was tested manually by adding a long sleep
+  // in runThread() before requesting calls.
 
   // Wait for the server to shutdown. Note that some other thread must be
   // responsible for shutting down the server for this call to ever return.
@@ -445,6 +449,9 @@ void GRPCServer::runThread(ThreadInfo& threadInfo) {
   if (!waitForStart()) {
     return;
   };
+
+  // Used to test that a client request will still be handled correctly if it comes in before we've registered the calls
+  // std::this_thread::sleep_for (std::chrono::seconds(10));
 
   // Create one of each type of call.  They insert themselves into the completion queue.
   new SayHelloCall(*this, greeterService, threadInfo);

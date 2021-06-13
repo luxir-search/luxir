@@ -22,7 +22,6 @@ class END {
 // Hmmm, when there are 3 streams together, it would be better coded as
 // ptr,ptr,ptr,len,len,len to avoid extra padding!  termdoc, termpos
 SOLUX_PACKED_START
-
 class Stream {
 public:
 

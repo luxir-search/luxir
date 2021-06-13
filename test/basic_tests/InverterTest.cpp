@@ -20,7 +20,9 @@ public:
   bool operator==(TestConsumer const&) const = default;
 
   void startDoc(int docid) {
+    // std::cout << docid << "," << std::flush;
     ASSERT_GT(docid , lastDoc);
+    dochash = dochash*29 + lastDoc;
     lastDoc = docid;
     position = 0;
   }
@@ -139,3 +141,67 @@ TEST_F(InverterTest, interleavedPos) {
   }
 }
 
+
+TEST_F(InverterTest, docs) {
+  MemPool pool;
+
+  /* for testing specific scenarios by hand
+  {
+    DocStream docs(pool, 0);
+    docs.addDoc(pool, 1000);
+    TestConsumer c2;
+    docs.pushDocs(pool, c2);
+  }
+  */
+
+  // test big run starting at 0
+  DocStream docs(pool, 0);
+  TestConsumer c;
+  c.startDoc(0);
+  int ndocs = rng.rint(200);
+  for (int i=1; i<ndocs; i++) {
+    docs.addDoc(pool, i);
+    c.startDoc(i);
+  }
+
+  TestConsumer c1;
+  docs.pushDocs(pool, c1);
+  ASSERT_EQ(c1, c);
+
+
+  int iter = 200;
+  // maximum number of regions per set... each region has a separate maxgap between docs to better test compressed
+  // bitset implementations.
+  int maxregions = 200;
+  int maxdocperregion = 1000;
+
+  auto savepoint= pool.getSavePoint();
+  for (int i=0; i<iter; i++) {
+    pool.rewind(savepoint);
+    TestConsumer consumer1;
+    // std::cout << std::endl << "CREATING" << std::endl;
+    int docid = rng.rbool() ? rng.rint(10) : rng.rint(65536*10);  // starting doc... very small or all over the place
+    DocStream docs(pool, docid);
+    consumer1.startDoc(docid);
+
+    int regions = rng.rint(maxregions);
+    for (int j=0; j<regions; j++) {
+      int maxgap = rng.rbool() ? rng.rint(1,20) : rng.rint(1,65536*2);
+      // number of docs in this region... lower if maxgap is high to not overrun maxint
+      int ndocs = maxgap < 1000 ? rng.rint(1,maxdocperregion) : rng.rint(1,20);
+      ndocs = 1;
+      for (int k=0; k<ndocs; k++) {
+        docid += rng.rint(1,maxgap+1);
+        if (docid < 0) break;  // overflow
+        docs.addDoc(pool, docid);
+        consumer1.startDoc(docid);
+      }
+    }
+
+    // std::cout << std::endl << "READING" << std::endl;
+    TestConsumer consumer2;
+    docs.pushDocs(pool, consumer2);
+    ASSERT_EQ(consumer1, consumer2);
+  }
+
+}

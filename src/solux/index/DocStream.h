@@ -1,6 +1,7 @@
 #pragma once
 
 #include "Stream.h"
+#include "roaring.hh"
 
 namespace solux {
 
@@ -41,16 +42,21 @@ namespace solux {
 // count could be just a single byte to save space as well.
 
 
-// Documents matching a term
+// Documents matching a term.
+// Should we use the same doclist to count what docs have a value for something?
 SOLUX_PACKED_START
-
 class DocStream {
 public:
-  Stream docs;
-  int lastDoc;
-  int docFreq;  // number of docs with this term
+  // TODO: FIXME! if this is allocated in MemPool, we would need to run destructors for Roaring!!!
+  // TODO: replace with something simpler that can handle the common cases (per byte... delta, bitmap, run) by
+  // collecting 7 oir 8 values at a time in a queue.
+  roaring::Roaring bitset;
 
-  DocStream(MemPool &pool, int docid) : lastDoc(docid), docFreq(1) {
+  int lastDoc;
+  int firstDocWithoutVal;
+  // Stream docs;
+
+  DocStream(MemPool &pool, int docid) : lastDoc(docid), firstDocWithoutVal(docid==0 ? 1:0) {
     unused(pool);
   }
 
@@ -59,18 +65,43 @@ public:
   void operator=(const DocStream &) = delete;
 
   void addDoc(MemPool &pool, int docid) {
+    unused(pool);
     int delta = docid - lastDoc;
     assert(delta >= 0);
-    if (delta != 0) {
-      assert (docid > lastDoc);
-      docs.writeVInt(pool, delta);
-      ++docFreq;
-      lastDoc = docid;
+    if (delta == 0) return;  // already handled
+    auto prevDoc = lastDoc;
+    lastDoc = docid;
+    if (docid == firstDocWithoutVal) {
+      // Only possible if everything is full!  This avoids using the bitset in the all-full case.
+      firstDocWithoutVal++;
+      return;
+    }
+    // may already be handled by range 0-firstDocWithoutVal
+    if (prevDoc+1 != firstDocWithoutVal) {
+      bitset.add(prevDoc); // only add previous doc.  lastDoc always holds the last value added.
     }
   }
-}
-  SOLUX_PACKED_END;SOLUX_PACKED_START
 
+
+  /// Calls sink.startDoc(int docid) only for each doc
+  template <class PostingsConsumer>
+  void pushDocs(MemPool& pool, PostingsConsumer& sink) {
+    unused(pool);
+    for (int i=0; i<firstDocWithoutVal; i++) {
+      sink.startDoc(i);
+    }
+    for (int v : bitset) {
+      sink.startDoc(v);
+    }
+    if (lastDoc > firstDocWithoutVal) {
+      sink.startDoc(lastDoc);
+    }
+  }
+
+
+} SOLUX_PACKED_END;
+
+SOLUX_PACKED_START
 class DocFreqStream {
 
 public:
