@@ -110,14 +110,12 @@ public:
   class IntCol {
     friend class Inverter;
     std::string fieldName;
+    DocStream docsWithVal;
 
-
-    TermValHash<DocFreqPosStream> terms;  // the set of terms contained in this field
     FieldType *fieldType;
-    TokenChain *tokenChain;
   public:
-    IntCol(Inverter &inverter, const std::string_view &fieldName, FieldType *fieldType, TokenChain *tokenChain)
-    : terms(inverter.pool, 4), fieldName(fieldName), fieldType(fieldType), tokenChain(tokenChain) {
+    IntCol(Inverter &inverter, const std::string_view &fieldName, FieldType *fieldType, int docid)
+    :  fieldName(fieldName), docsWithVal(inverter.pool, docid), fieldType(fieldType) {
     }
 
     IntCol(IntCol&& other) = default;
@@ -141,7 +139,7 @@ public:
     }
 
     friend std::ostream& operator<<(std::ostream &out, const IntCol &sf) {
-      return out << "{field:" << sf.fieldName << " terms:" << sf.terms << "}";
+      return out << "{field:" << sf.fieldName << "}";
     }
 
 
@@ -252,6 +250,11 @@ public:
       // Can these "document has field" sets be deduped?  Keep a hash of all others written
       // so far and if the hash compares, then compare the sets.
     }
+  }
+
+  void index(IntCol& intColField, int val) {
+    // TODO
+
   }
 
 

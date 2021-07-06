@@ -260,5 +260,48 @@ SOLUX_PACKED_END;
 
 
 
+// list of integers
+SOLUX_PACKED_START
+class IntStream {
+public:
+  Stream storage;
+  int32_t lastVal;
+
+  IntStream(MemPool &pool) : lastVal(0) {
+    unused(pool);
+  }
+
+  IntStream(MemPool &pool, int32_t val) : lastVal(val) {
+    storage.writeVInt(pool, val);
+  }
+
+  IntStream(const DocStream &) = delete;
+  void operator=(const DocStream &) = delete;
+
+  void addVal(MemPool &pool, int32_t val) {
+    // XOR with previous value will remove common high bits (including high bits of successive negative values)
+    // TODO: should we calculate other statistics at this point (min, max, gcd?)
+    int32_t code = lastVal ^ val;
+    storage.writeVInt(pool, code);
+    lastVal = val;
+  }
+
+  /// Calls sink.addVal(int32_t val)
+  template <class PostingsConsumer>
+  void pushValues(MemPool& pool, PostingsConsumer& sink) {
+    StreamReader vstream(storage, pool);
+    int32_t prev = 0;
+    while (!vstream.eof()) {
+      int32_t code = vstream.readVint();
+      int32_t val = prev ^ code;
+      prev = val;
+      sink.addVal(val);
+    }
+  }
+
+
+} SOLUX_PACKED_END;
+
+
 
 } // end namespace

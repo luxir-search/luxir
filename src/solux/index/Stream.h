@@ -152,7 +152,7 @@ public:
   // TODO: an optimized version for when we have >= 5 bytes available?
   // TODO: convert to unsigned and do checks elsewhere?
   void writeVInt(MemPool &pool, int val) {
-    assert(val >= 0);
+    // assert(val >= 0);
     auto v = (unsigned) val;
     while ((v & ~0x7F) != 0) {
       writeByte(pool, (uint8_t) (v | 0x80));

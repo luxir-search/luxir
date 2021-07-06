@@ -35,6 +35,10 @@ public:
     ASSERT_GT(position, -1);  // TODO: can positions be 0?
     poshash = poshash*29 + position;
   }
+
+  void addVal(int32_t val) {
+    dochash = dochash*31 + val;
+  }
 };
 
 
@@ -204,4 +208,37 @@ TEST_F(InverterTest, docs) {
     ASSERT_EQ(consumer1, consumer2);
   }
 
+}
+
+
+TEST_F(InverterTest, intstream) {
+  MemPool pool;
+
+  int iter = 100;
+  int maxvals = 1000;
+
+  auto savepoint = pool.getSavePoint();
+  for (int i = 0; i < iter; i++) {
+    pool.rewind(savepoint);
+    IntStream ints(pool);
+    TestConsumer consumer1;
+
+    int nvals = rng.rint(1, maxvals);
+    int lastval = 0;
+    for (int j=0; j<nvals; j++) {
+      int val;
+      if (rng.rbool()) {
+        val = lastval + rng.rint(-256,256);
+      } else {
+        val = (int32_t)rng();
+      }
+      ints.addVal(pool, val);
+      consumer1.addVal(val);
+    }
+
+    TestConsumer consumer2;
+    ints.pushValues(pool, consumer2);
+
+    ASSERT_EQ(consumer1, consumer2);
+  }
 }
