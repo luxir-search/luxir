@@ -56,8 +56,12 @@ public:
   int firstDocWithoutVal;
   // Stream docs;
 
-  DocStream(MemPool &pool, int docid) : lastDoc(docid), firstDocWithoutVal(docid==0 ? 1:0) {
+  DocStream(MemPool &pool) : lastDoc(-1), firstDocWithoutVal(0) {
     unused(pool);
+  }
+  DocStream(MemPool &pool, int docid) : DocStream(pool) {
+    // : lastDoc(docid), firstDocWithoutVal(docid==0 ? 1:0) {
+    addDoc(pool, docid);
   }
 
   DocStream(const DocStream &) = delete;
@@ -69,17 +73,13 @@ public:
     int delta = docid - lastDoc;
     assert(delta >= 0);
     if (delta == 0) return;  // already handled
-    auto prevDoc = lastDoc;
     lastDoc = docid;
     if (docid == firstDocWithoutVal) {
       // Only possible if everything is full!  This avoids using the bitset in the all-full case.
       firstDocWithoutVal++;
       return;
     }
-    // may already be handled by range 0-firstDocWithoutVal
-    if (prevDoc+1 != firstDocWithoutVal) {
-      bitset.add(prevDoc); // only add previous doc.  lastDoc always holds the last value added.
-    }
+    bitset.add(docid);
   }
 
 
@@ -92,9 +92,6 @@ public:
     }
     for (int v : bitset) {
       sink.startDoc(v);
-    }
-    if (lastDoc > firstDocWithoutVal) {
-      sink.startDoc(lastDoc);
     }
   }
 
