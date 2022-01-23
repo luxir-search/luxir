@@ -317,9 +317,12 @@ public:
     int lastOrd = ordInBlock - 1; // check the current term we are on.
     for(;;) {
       int matchOrd;
-      for(matchOrd=lastOrd+1;;matchOrd++) {
+      // find the first matching hash
+      for(matchOrd = lastOrd+1; matchOrd <= maxOrdInBlock; matchOrd++) {
         if (termHashes[matchOrd] == hash) break;
-        if (matchOrd >= maxOrdInBlock) return false;  // we got lucky and no more hashes matched!
+      }
+      if (matchOrd > maxOrdInBlock) {
+        return false;  // we got lucky and no more hashes matched!
       }
 
       // Hash code matched for the matchOrd term.
@@ -336,7 +339,8 @@ public:
       auto cmp = term() <=> target;
       if (cmp == 0) return true;
       if (cmp > 0) return false;
-      lastOrd=ordInBlock;
+      // if the term we just saw was smaller, continue where we left off
+      lastOrd = ordInBlock;
     }
   }
 
