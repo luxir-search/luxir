@@ -52,15 +52,16 @@ if (CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -mavx -mssse3 -march=native -mtune=native")
   add_compile_options(
           "$<$<CONFIG:RELEASE>:-g>"
-          "$<$<CONFIG:DEBUG>:-D_GLIBCXX_DEBUG>"
+#          "$<$<CONFIG:DEBUG>:-D_GLIBCXX_DEBUG>"
   )
   add_compile_options(-Wall -Wextra)
-  # NOTE: simdcomp lib is compiled with -D_GLIBCXX_DEBUG for debugging lib... and if our files aren't, it causes a segv.
+  # NOTE: simdcomp lib is compiled with -D_GLIBCXX_DEBUG for debugging lib by default... and if our files aren't, it causes a segv
+  # so make sure they match.  For now, we remove that flag from simdcomp.
 elseif (CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -mavx -mssse3 -march=native -mtune=native")   # native just for dev... lock down more later?
   add_compile_options(
           "$<$<CONFIG:RELEASE>:-g>"
-          "$<$<CONFIG:DEBUG>:-D_GLIBCXX_DEBUG>"
+#          "$<$<CONFIG:DEBUG>:-D_GLIBCXX_DEBUG>"
   )
   add_compile_options(-Wall -Wextra)
 elseif (CMAKE_CXX_COMPILER_ID STREQUAL "Intel")

@@ -15,8 +15,8 @@ using namespace solux;
 template<class T, class Hash, class Eq, class Alloc = std::allocator<T>>
 class flat_set : public phmap::flat_hash_set<T, Hash, Eq, Alloc> {
 public:
-  using Base = phmap::container_internal::raw_hash_set<
-          phmap::container_internal::FlatHashSetPolicy<T>, Hash, Eq, Alloc>;
+  using Base = phmap::priv::raw_hash_set<
+          phmap::priv::FlatHashSetPolicy<T>, Hash, Eq, Alloc>;
   using iterator = typename Base::iterator;
 
 
