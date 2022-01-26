@@ -36,8 +36,11 @@ public:
     poshash = poshash*29 + position;
   }
 
-  void addVal(int32_t val) {
+  void addInt32(int32_t val) {
     dochash = dochash*31 + val;
+  }
+  void addInt64(int64_t val) {
+    dochash = dochash*33 + val;
   }
 };
 
@@ -229,15 +232,50 @@ TEST_F(InverterTest, intstream) {
       int val;
       if (rng.rbool()) {
         val = lastval + rng.rint(-256,256);
+        lastval = val;
       } else {
         val = (int32_t)rng();
       }
       ints.addVal(pool, val);
-      consumer1.addVal(val);
+      consumer1.addInt32(val);
     }
 
     TestConsumer consumer2;
     ints.pushValues(pool, consumer2);
+
+    ASSERT_EQ(consumer1, consumer2);
+  }
+}
+
+TEST_F(InverterTest, longstream) {
+  MemPool pool;
+
+  int iter = 1;
+  int maxvals = 10;
+
+  auto savepoint = pool.getSavePoint();
+  for (int i = 0; i < iter; i++) {
+    pool.rewind(savepoint);
+    LongStream longs(pool);
+    TestConsumer consumer1;
+
+    int nvals = rng.rint(1, maxvals);
+    int64_t lastval = 0;
+    for (int j=0; j<nvals; j++) {
+      int64_t val;
+      if (rng.rbool()) {
+        val = lastval + rng.rint(-256,256);
+        lastval = val;
+      } else {
+        val = (int64_t)rng();
+      }
+      val = -1000000+j;
+      longs.addVal(pool, val);
+      consumer1.addInt64(val);
+    }
+
+    TestConsumer consumer2;
+    longs.pushValues(pool, consumer2);
 
     ASSERT_EQ(consumer1, consumer2);
   }

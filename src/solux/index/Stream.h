@@ -173,6 +173,14 @@ public:
     }
   }
 
+  void writeVLong(MemPool &pool, int64_t val) {
+    auto v = (uint64_t) val;
+    while ((v & ~0x7FULL) != 0) {
+      writeByte(pool, (uint8_t) (v | 0x80));
+      v >>= 7;
+    }
+    writeByte(pool, (uint8_t) v);
+  }
 
   // TODO: some sort of adapter that will specify the pool for us?
   [[nodiscard]] StreamReader begin(const MemPool &pool) const;
@@ -282,13 +290,23 @@ public:
   }
 
   // TODO: consolidate with InputStream somehow... templatize?
-  uint32_t readVint() {
+  int32_t readVint() {
     char b = readByte();
-    uint32_t val = b & 0x7f;
+    int32_t val = b & 0x7f;
     // TODO: try replacing with a loop to 4 (to avoid running long if data is bad)
     for (int shift = 7; (b & 0x80) != 0; shift += 7) {
       b = readByte();
       val |= (b & 0x7f) << shift;
+    }
+    return val;
+  }
+
+  int64_t readVlong() {
+    char b = readByte();
+    int64_t val = b & 0x7f;
+    for (int shift = 7; (b & 0x80) != 0; shift += 7) {
+      b = readByte();
+      val |= (b & 0x7fULL) << shift;
     }
     return val;
   }

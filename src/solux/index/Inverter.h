@@ -110,23 +110,25 @@ public:
   class IntCol {
     friend class Inverter;
     std::string fieldName;
+    IntStream intStream;
     DocStream docsWithVal;
 
     FieldType *fieldType;
   public:
-    IntCol(Inverter &inverter, const std::string_view &fieldName, FieldType *fieldType, int docid)
-    :  fieldName(fieldName), docsWithVal(inverter.pool, docid), fieldType(fieldType) {
+    IntCol(Inverter &inverter, const std::string_view &fieldName, FieldType *fieldType)
+    :  fieldName(fieldName), intStream(inverter.pool), docsWithVal(inverter.pool), fieldType(fieldType) {
     }
 
     IntCol(IntCol&& other) = default;
 
     ~IntCol() = default;
 
-    void index(Inverter &inverter, char *mutableVal, int len) {
-      // inverter.index(*this, mutableVal, len);
+    void index(Inverter &inverter, int32_t val) {
+      intStream.addVal(inverter.pool, val);
+      docsWithVal.addDoc(inverter.pool, inverter.currDoc);
     }
 
-    auto operator<=>(const SegFieldPos& other) const {
+    auto operator<=>(const IntCol& other) const {
       return this->fieldName <=> other.fieldName;
     }
 
@@ -141,16 +143,16 @@ public:
     friend std::ostream& operator<<(std::ostream &out, const IntCol &sf) {
       return out << "{field:" << sf.fieldName << "}";
     }
-
-
   };
 
 
   // OPTIMIZATION: since we only do additions and not deletions, a monotonic allocator that had destructor
-  // support would be good here.
+  // support would be good here.  Or we could add to our MemPool and manually destruct later.
   // This could also be a Set with a little more work since the fieldname is already in the value.
   // We don't want the values to move since clients can cache and reuse when indexing.
   phmap::node_hash_map<std::string, SegFieldPos> segFields;
+  phmap::node_hash_map<std::string, IntCol> intCols;
+
 
   // The returned reference will be valid for the duration of indexing this block.
   SegFieldPos& getSegField(const std::string_view& name) {
@@ -197,6 +199,19 @@ public:
     return newIter->second;
   }
 
+  IntCol& getIntCol(const std::string_view& name) {
+    auto iter = intCols.find(name);
+    if (iter != intCols.end()) {
+      return iter->second;
+    }
+    auto [newIter, inserted] = intCols.try_emplace(name, *this, name, nullptr);
+    return newIter->second;
+  }
+
+  void index(IntCol& intCol, int32_t val) {
+    intCol.docsWithVal.addDoc(pool, currDoc);
+    intCol.intStream.addVal(pool, val);
+  }
 
 
 
@@ -252,10 +267,6 @@ public:
     }
   }
 
-  void index(IntCol& intColField, int val) {
-    // TODO
-
-  }
 
 
   void index(Document &doc);

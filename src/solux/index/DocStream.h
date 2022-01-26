@@ -220,7 +220,7 @@ public:
     do {
       int tf;
       if (!dstream.eof()) {
-        uint32_t docCode = dstream.readVint();
+        uint32_t docCode = (uint32_t) dstream.readVint();
         int docDelta = docCode >> 1;
         docid += docDelta;
         tf = (int)docCode & 0x01;
@@ -272,8 +272,8 @@ public:
     storage.writeVInt(pool, val);
   }
 
-  IntStream(const DocStream &) = delete;
-  void operator=(const DocStream &) = delete;
+  IntStream(const IntStream &) = delete;
+  void operator=(const IntStream &) = delete;
 
   void addVal(MemPool &pool, int32_t val) {
     // XOR with previous value will remove common high bits (including high bits of successive negative values)
@@ -283,7 +283,7 @@ public:
     lastVal = val;
   }
 
-  /// Calls sink.addVal(int32_t val)
+  /// Calls sink.addInt32(int32_t val)
   template <class PostingsConsumer>
   void pushValues(MemPool& pool, PostingsConsumer& sink) {
     StreamReader vstream(storage, pool);
@@ -292,7 +292,50 @@ public:
       int32_t code = vstream.readVint();
       int32_t val = prev ^ code;
       prev = val;
-      sink.addVal(val);
+      sink.addInt32(val);
+    }
+  }
+
+
+} SOLUX_PACKED_END;
+
+
+// list of integers
+SOLUX_PACKED_START
+class LongStream {
+public:
+  Stream storage;
+  int64_t lastVal;
+
+  LongStream(MemPool &pool) : lastVal(0) {
+    unused(pool);
+  }
+
+  LongStream(MemPool &pool, int64_t val) : lastVal(val) {
+    storage.writeVInt(pool, val);
+  }
+
+  LongStream(const LongStream &) = delete;
+  void operator=(const LongStream &) = delete;
+
+  void addVal(MemPool &pool, int64_t val) {
+    // XOR with previous value will remove common high bits (including high bits of successive negative values)
+    // TODO: should we calculate other statistics at this point (min, max, gcd?)
+    int64_t code = lastVal ^ val;
+    storage.writeVLong(pool, code);
+    lastVal = val;
+  }
+
+  /// Calls sink.addInt64(int64_t val)
+  template <class PostingsConsumer>
+  void pushValues(MemPool& pool, PostingsConsumer& sink) {
+    StreamReader vstream(storage, pool);
+    int64_t prev = 0;
+    while (!vstream.eof()) {
+      int64_t code = vstream.readVlong();
+      int64_t val = prev ^ code;
+      prev = val;
+      sink.addInt64(val);
     }
   }
 

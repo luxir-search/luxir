@@ -51,5 +51,6 @@ $ make
 $ cp libSIMDCompressionAndIntersection.a libsimdcomp_a.a
 $ make clean
 ### for CRoaring
-$ git clone https://github.com/RoaringBitmap/CRoaring
+$ cd deps; git clone https://github.com/RoaringBitmap/CRoaring
+$ cd CRoaring; git co tags/v0.4.0
 

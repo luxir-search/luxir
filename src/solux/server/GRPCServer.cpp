@@ -19,6 +19,8 @@ GRPCServer::GRPCServer()
   : startLatch(1) {
 }
 
+// NOTE: as of gRPC 1.39 there is a new C++ async callback API: https://github.com/grpc/grpc/pull/25728 in addition to an EventEngine
+// interface that may help with integration with external event loops.
 // adapted from the grpc helloworld example
 void solux::GRPCServer::run() {
   std::string server_address("0.0.0.0:50051");
