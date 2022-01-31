@@ -21,18 +21,18 @@ static void BM_IndexBook(benchmark::State& state, std::string field, bool writeP
 
   for (auto _ : state) {
     Inverter inverter;
-    Inverter::SegFieldPos& segField = inverter.getSegField(field);
+    Inverter::IndexHandler& fieldHandler = inverter.getIndexHandler(field);
 
     if (!docPerPara) {
       // index whole book as a single document
       inverter.startDoc();
-      inverter.index(segField, data, sz);
+      fieldHandler.index(inverter, data, sz);
       inverter.finishDoc();
     } else {
       // index each paragraph as its own document
       for (int i=0; i<(int)book.paraOffsets.size(); i++) {
         inverter.startDoc();
-        inverter.index(segField, data + book.paraOffsets[i], book.paraSizes[i]);
+        fieldHandler.index(inverter, data + book.paraOffsets[i], book.paraSizes[i]);
         inverter.finishDoc();
       }
     }

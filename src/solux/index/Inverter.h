@@ -9,6 +9,9 @@
 #include "DocStream.h"
 #include "PostingsWriter.h"
 
+// so IndexHandler can consume protobuf types
+#include "protos/solux_types.pb.h"
+
 
 
 namespace solux {
@@ -47,6 +50,7 @@ Minimum needed to index a field value:
 
 class Inverter {
 private:
+  int currDoc = -1;  // the current document being indexed
 
 
   std::vector<int> deleted; // use a docstream for this?
@@ -64,30 +68,20 @@ public:
   MemPool pool;
 
 
-  //
-  // Holds info for a single inverted field with positions for a single segment for this inverter.
-  //
-  class SegFieldPos {
-    friend class Inverter;
 
-    TermValHash<DocFreqPosStream> terms;  // the set of terms contained in this field
+  class IndexHandler {
+    friend Inverter;
+
     std::string fieldName;
-    FieldType *fieldType;
-    TokenChain *tokenChain;
+    FieldType& fieldType;
+
   public:
-    SegFieldPos(Inverter &inverter, const std::string_view &fieldName, FieldType *fieldType, TokenChain *tokenChain)
-            : terms(inverter.pool, 4), fieldName(fieldName), fieldType(fieldType), tokenChain(tokenChain) {
+    IndexHandler(const std::string_view& fieldName, FieldType& fieldType)
+    : fieldName(fieldName), fieldType(fieldType) {
     }
+    virtual ~IndexHandler() = default;
 
-    SegFieldPos(SegFieldPos&& other) = default;
-
-    ~SegFieldPos() = default;
-
-    void index(Inverter &inverter, char *mutableVal, int len) {
-      inverter.index(*this, mutableVal, len);
-    }
-
-    auto operator<=>(const SegFieldPos& other) const {
+    auto operator<=>(const IndexHandler& other) const {
       return this->fieldName <=> other.fieldName;
     }
 
@@ -99,49 +93,126 @@ public:
       return this->fieldName == sv;
     }
 
-    friend std::ostream& operator<<(std::ostream &out, const SegFieldPos &sf) {
-      return out << "{field:" << sf.fieldName << " terms:" << sf.terms << "}";
+
+    virtual void index(Inverter& inverter, char* mutableVal, int len) {
     }
+    virtual void index(Inverter& inverter, int64_t) {
+    }
+
+    virtual void index(Inverter& inverter, const proto::Val& val) {
+      if (val.has_s()) {
+        auto &sval = val.s();
+        index(inverter, const_cast<char *>(sval.data()), sval.size());  // TODO: get rid of the const-cast
+      }
+    }
+
+    friend std::ostream& operator<<(std::ostream &out, const IndexHandler &sf) {
+      return out << "{IndexHandler field:" << sf.fieldName << "}";
+    }
+  };
+
+  // indexes text with positions
+  class PosIndexHandler : public IndexHandler {
+    friend Inverter;
+
+    TermValHash<DocFreqPosStream> termsHash;  // the set of terms contained in this field
+    TokenChain *tokenChain;  // TODO: change to ref?  is this nullable?
+
+  public:
+
+    PosIndexHandler(Inverter &inverter, const std::string_view &fieldName, FieldType& fieldType, TokenChain *tokenChain)
+    : IndexHandler(fieldName, fieldType), termsHash(inverter.pool, 4), tokenChain(tokenChain) {
+    }
+    PosIndexHandler(PosIndexHandler&& other) = default;
+    ~PosIndexHandler() override = default;
+
+    void index(Inverter& inverter, const proto::Val& val) override {
+      // TODO: handle bytes
+      char* mutableValue = nullptr;
+      int len = 0;
+      if (val.has_s()) {
+        auto &sval = val.s();
+        mutableValue = const_cast<char *>(sval.data());  // TODO: get rid of the const-cast
+        len = sval.size();
+      } else if (val.has_bin()) {
+        // TODO: handle binary
+      }
+
+      // TODO: handle arrays as well.  Hard to do in virtual methods where you can't use templates though.
+
+      indexSingle(inverter, mutableValue, len);
+    }
+
+    void index(Inverter &inverter, char *mutableVal, int len) override {
+      indexSingle(inverter, mutableVal, len);
+    }
+
+    // TODO: handle multi-valued. Or is that a diff subclass?
+    void indexSingle(Inverter& inverter, char* mutableVal, int len) {
+      TokenChain& tc = *tokenChain;
+      tc.head.setMutableValue(mutableVal, len);
+
+      int numTokens = 0;
+      int pos = 0;
+      Token &tok = tc.head.getToken();
+      TokenStream& tail = *tc.tail;
+      int docid = inverter.currDoc;
+      for (;;) {
+        bool hasNext = tail.incrementToken(numTokens==0);
+        if (!hasNext) break;
+        ++numTokens;
+        pos += tok.positionIncrement;
+        auto term = std::string_view(tok.ptr, tok.end);
+        // int tokLen = tok.end - tok.ptr;
+
+        auto[entry, inserted] = termsHash.try_emplace(term, termsHash.getMemPool(), docid, pos);
+        if (!inserted) {
+          entry->val().addDoc(termsHash.getMemPool(), docid, pos);
+        }
+      }
+
+      // segField.sumTotalTermFreq += numTokens;
+      if (numTokens > 0) {
+        // todo: index field length (for normalization / scoring) if we're indexing norms
+        // todo: add to "document has field" if we're not indexing norms, or if we need
+        // an index into sparse norms.  Same thing for any field with sparse docvalues...
+        // Can these "document has field" sets be deduped?  Keep a hash of all others written
+        // so far and if the hash compares, then compare the sets.
+      }
+    }
+
   };
 
   //
   // Info for one single valued column
   //
-  class IntCol {
+  class IntColHandler : public IndexHandler {
     friend class Inverter;
-    std::string fieldName;
-    IntStream intStream;
+    LongStream longStream;
     DocStream docsWithVal;
+    int64_t minVal = std::numeric_limits<int64_t>::max();
+    int64_t maxVal = std::numeric_limits<int64_t>::min();
 
     FieldType *fieldType;
   public:
-    IntCol(Inverter &inverter, const std::string_view &fieldName, FieldType *fieldType)
-    :  fieldName(fieldName), intStream(inverter.pool), docsWithVal(inverter.pool), fieldType(fieldType) {
+    IntColHandler(Inverter &inverter, const std::string_view &fieldName, FieldType& fieldType)
+            :  IndexHandler(fieldName, fieldType), longStream(inverter.pool), docsWithVal(inverter.pool) {
     }
 
-    IntCol(IntCol&& other) = default;
+    IntColHandler(IntColHandler&& other) = default;
 
-    ~IntCol() = default;
+    ~IntColHandler() = default;
 
-    void index(Inverter &inverter, int32_t val) {
-      intStream.addVal(inverter.pool, val);
+    void index(Inverter &inverter, int64_t val) {
+      // NOTE: we can't roll these min/max values back on indexing failure, so they may not be optimal.
+      if (val < minVal) {
+        minVal = val;
+      }
+      if (val > maxVal) {
+        maxVal = val;
+      }
+      longStream.addVal(inverter.pool, val);
       docsWithVal.addDoc(inverter.pool, inverter.currDoc);
-    }
-
-    auto operator<=>(const IntCol& other) const {
-      return this->fieldName <=> other.fieldName;
-    }
-
-    auto operator<=>(const std::string_view& sv) const {
-      return this->fieldName <=> sv;
-    }
-
-    auto operator==(const std::string_view& sv) const {
-      return this->fieldName == sv;
-    }
-
-    friend std::ostream& operator<<(std::ostream &out, const IntCol &sf) {
-      return out << "{field:" << sf.fieldName << "}";
     }
   };
 
@@ -150,15 +221,14 @@ public:
   // support would be good here.  Or we could add to our MemPool and manually destruct later.
   // This could also be a Set with a little more work since the fieldname is already in the value.
   // We don't want the values to move since clients can cache and reuse when indexing.
-  phmap::node_hash_map<std::string, SegFieldPos> segFields;
-  phmap::node_hash_map<std::string, IntCol> intCols;
+  phmap::flat_hash_map<std::string, std::unique_ptr<IndexHandler>> indexHandlers;
 
 
   // The returned reference will be valid for the duration of indexing this block.
-  SegFieldPos& getSegField(const std::string_view& name) {
-    auto iter = segFields.find(name);
-    if (iter != segFields.end()) {
-      return iter->second;
+  IndexHandler& getIndexHandler(const std::string_view& name) {
+    auto iter = indexHandlers.find(name);
+    if (iter != indexHandlers.end()) {
+      return *iter->second;
     }
 
     // How do we incorporate schema changes? Or do we?
@@ -195,27 +265,11 @@ public:
     FieldType* fieldType = &*typeIter->second.first;
     TokenChain* tokenChain = &*typeIter->second.second;
 
-    auto [newIter, inserted] = segFields.try_emplace(name, *this, name, fieldType, tokenChain);
-    return newIter->second;
-  }
-
-  IntCol& getIntCol(const std::string_view& name) {
-    auto iter = intCols.find(name);
-    if (iter != intCols.end()) {
-      return iter->second;
-    }
-    auto [newIter, inserted] = intCols.try_emplace(name, *this, name, nullptr);
-    return newIter->second;
-  }
-
-  void index(IntCol& intCol, int32_t val) {
-    intCol.docsWithVal.addDoc(pool, currDoc);
-    intCol.intStream.addVal(pool, val);
+    auto [newIter, inserted] = indexHandlers.try_emplace(name, std::make_unique<PosIndexHandler>(*this, name, *fieldType, tokenChain));
+    return *newIter->second;
   }
 
 
-
-  int currDoc = -1;  // the current document being indexed
 
   void startDoc() {
     currDoc++;
@@ -233,42 +287,6 @@ public:
     deleted.push_back(docid);
   }
 
-  void index(SegFieldPos& segField, char* mutableVal, int len) {
-    TokenChain& tc = *segField.tokenChain;
-    tc.head.setMutableValue(mutableVal, len);
-
-    int numTokens = 0;
-    int pos = 0;
-    auto& termsHash = segField.terms;
-    Token &tok = tc.head.getToken();
-    TokenStream& tail = *tc.tail;
-    int docid = currDoc;
-    for (;;) {
-      bool hasNext = tail.incrementToken(numTokens==0);
-      if (!hasNext) break;
-      ++numTokens;
-      pos += tok.positionIncrement;
-      auto term = std::string_view(tok.ptr, tok.end);
-      // int tokLen = tok.end - tok.ptr;
-
-      auto[entry, inserted] = termsHash.try_emplace(term, termsHash.getMemPool(), docid, pos);
-      if (!inserted) {
-        entry->val().addDoc(termsHash.getMemPool(), docid, pos);
-      }
-    }
-
-    // segField.sumTotalTermFreq += numTokens;
-    if (numTokens > 0) {
-      // todo: index field length (for normalization / scoring) if we're indexing norms
-      // todo: add to "document has field" if we're not indexing norms, or if we need
-      // an index into sparse norms.  Same thing for any field with sparse docvalues...
-      // Can these "document has field" sets be deduped?  Keep a hash of all others written
-      // so far and if the hash compares, then compare the sets.
-    }
-  }
-
-
-
   void index(Document &doc);
 
   size_t memSize() {
@@ -278,31 +296,34 @@ public:
 
   void writePostings(PostingsWriter& postingsWriter) {
     // first gather and sort the fields
-    std::vector<SegFieldPos*> fields;
-    fields.reserve(segFields.size());
-    for (auto& entry : segFields) {
-      fields.push_back(&entry.second);
+    std::vector<IndexHandler*> fields;
+    fields.reserve(indexHandlers.size());
+    for (auto& entry : indexHandlers) {
+      fields.push_back(entry.second.get());
     }
 
     // For normal usecases, spreadsort will fall back to pdqsort (less than 1000 fields, but we want to
     // take care of the outliers as well (esp when it doesn't hurt the average case)
     boost::sort::spreadsort::string_sort(fields.begin(), fields.end(),
-                                         [](const SegFieldPos* x, size_t offset) {return x->fieldName[offset];},
-                                         [](const SegFieldPos* x) {return x->fieldName.size();},
-                                         [](const SegFieldPos* x, const SegFieldPos* y) {return *x < *y;});
+                                         [](const IndexHandler* x, size_t offset) {return x->fieldName[offset];},
+                                         [](const IndexHandler* x) {return x->fieldName.size();},
+                                         [](const IndexHandler* x, const IndexHandler* y) {return *x < *y;});
 
 
     for (auto field : fields) {
       // std::cout << "Writing field " << *field << std::endl;
-      writePostings(postingsWriter, *field);
+
+      // TODO: move this to IndexHandler? Or is greater context needed?
+      writePostings(postingsWriter, *(PosIndexHandler*)field);
     }
   }
 
-  void writePostings(PostingsWriter& postingsWriter, SegFieldPos& field) {
-    auto sz = field.terms.size();
+
+  void writePostings(PostingsWriter& postingsWriter, PosIndexHandler& fieldHandler) {
+    auto sz = fieldHandler.termsHash.size();
     // gathering and sorting terms for each field could be done in parallel, but it probably doesn't
     // represent much time.  Fields that can result in their own file should be able to be parallelized easily!
-    auto terms = field.terms.destructiveCompress();
+    auto terms = fieldHandler.termsHash.destructiveCompress();
 
     // Sorting this with std::sort took ~7.3ms out of a total of ~22ms for inversion and 38ms for inversion+postings_writing!
     // There were only 41991 unique terms... how can sort be so slow? Cache misses?
@@ -320,7 +341,7 @@ public:
     // auto thisElapsed = std::chrono::duration_cast<std::chrono::nanoseconds>( endTime - startTime ).count();
     // std::cout << "terms=" << sz << " SORT time ns=" << thisElapsed << std::endl;
 
-    postingsWriter.startField(field.fieldName);
+    postingsWriter.startField(fieldHandler.fieldName);
     for (size_t tnum=0; tnum<sz; tnum++) {
       auto term = terms[tnum];
       postingsWriter.startTerm(term);
@@ -328,10 +349,9 @@ public:
       term.val().pushDocs(pool, postingsWriter);
       postingsWriter.endTerm(term);
     }
-    postingsWriter.endField(field.fieldName);
-    field.terms.free();
+    postingsWriter.endField(fieldHandler.fieldName);
+    fieldHandler.termsHash.free();
   }
-
 
 };
 

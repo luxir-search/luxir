@@ -149,27 +149,27 @@ public:
 
     Inverter& inverter = getInverter();
 
-    std::vector<Inverter::SegFieldPos*> segFields;
+    std::vector<Inverter::IndexHandler*> handlers;
     // int ndocs = request->docs_size();
 
     if (request.docs_size() > 0) {
       for (auto &doc : request.docs()) {
         size_t nFields = doc.fields_size();
-        if (segFields.size() < nFields) {
-          segFields.resize(nFields);
+        if (handlers.size() < nFields) {
+          handlers.resize(nFields);
         }
 
         inverter.startDoc();
 
+        // TODO: wrap in try/catch here?
+
         int idx = 0;
         for (auto&[fname, fval] : doc.fields()) {
-          auto segField = segFields[idx];
-          if (segField == nullptr || *segField != fname) {
-            segFields[idx] = segField = &inverter.getSegField(fname);
+          auto handler = handlers[idx];
+          if (handler == nullptr || *handler != fname) {
+            handlers[idx] = handler = &inverter.getIndexHandler(fname);
           }
-          auto &sval = fval.s();
-          std::cout << " Indexing " << fname << ":" << sval << std::endl;
-          inverter.index(*segField, const_cast<char *>(sval.data()), sval.size());  // TODO: get rid of the const-cast
+          handler->index(inverter, fval);
           idx++;
         }
 

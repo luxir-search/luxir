@@ -29,11 +29,11 @@ static void BM_Invert(benchmark::State& state, std::string field, bool writePost
   int64_t inverterSz = 0;
   for (auto _ : state) {
     Inverter inverter;
-    Inverter::SegFieldPos& segField = inverter.getSegField(field);
+    Inverter::IndexHandler& fieldHandler = inverter.getIndexHandler(field);
 
     for (int i=0; i<iter;i++) {
       inverter.startDoc();
-      inverter.index(segField, &val[0], (int) val.size());
+      fieldHandler.index(inverter, &val[0], (int) val.size());
       inverter.finishDoc();
     }
 
