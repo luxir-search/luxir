@@ -241,32 +241,45 @@ public:
     // TODO: Need to look up the correct field type in schema.  For now just inline it.
 
     std::string_view suffix = name.substr(name.find_last_of('_'));
+
+    // TEMPORARY: based on the suffix, try to find both the cached FieldType and associated TokenChain
     auto typeIter = typeInfo.find(suffix);
 
     if (typeIter == typeInfo.end()) {
       auto ft = std::make_unique<FieldType>();
       ft->name_ = suffix;
-      ft->flags_ = FieldType::INDEX_DOCS_AND_FREQS_AND_POSITIONS | FieldType::NUM_TOKENS_APPROX;
-
-
-      auto wsTok = std::make_unique<WhitespaceTokenizer>();
-      auto& headRef = *wsTok;
       std::unique_ptr<TokenChain> tc;
-      if (suffix == "_w") {
-        tc = make_unique<TokenChain>(headRef, std::move(wsTok));  // ws only
-      } else if (suffix =="_wl") {
-        auto lowerFilt = std::make_unique<LowercaseFilter>(std::move(wsTok));
-        tc = make_unique<TokenChain>(headRef, std::move(lowerFilt));
+
+      if (suffix == "_i") {
+        ft->flags_ = 0;
+      } else {
+        ft->flags_ = FieldType::INDEX_DOCS_AND_FREQS_AND_POSITIONS | FieldType::NUM_TOKENS_APPROX;
+        auto wsTok = std::make_unique<WhitespaceTokenizer>();
+        auto &headRef = *wsTok;
+        if (suffix == "_w") {
+          tc = make_unique<TokenChain>(headRef, std::move(wsTok));  // ws only
+        } else if (suffix == "_wl") {
+          auto lowerFilt = std::make_unique<LowercaseFilter>(std::move(wsTok));
+          tc = make_unique<TokenChain>(headRef, std::move(lowerFilt));
+        }
       }
       auto [it2, inserted] = typeInfo.try_emplace(suffix, std::move(ft), std::move(tc));
       typeIter = it2;
     }
 
-    FieldType* fieldType = &*typeIter->second.first;
-    TokenChain* tokenChain = &*typeIter->second.second;
+    FieldType& fieldType = *typeIter->second.first;
+    TokenChain* tokenChain = typeIter->second.second.get();
 
-    auto [newIter, inserted] = indexHandlers.try_emplace(name, std::make_unique<PosIndexHandler>(*this, name, *fieldType, tokenChain));
-    return *newIter->second;
+    // Create the correct IndexHandler based on the suffix.  This should probably be moved to FieldType::createIndexHandler()?
+    std::unique_ptr<IndexHandler> fieldHandler;
+    if (suffix == "_i") {
+      fieldHandler = std::make_unique<IntColHandler>(*this, name, fieldType);
+    } else {
+      fieldHandler = std::make_unique<PosIndexHandler>(*this, name, fieldType, tokenChain);
+    }
+
+    auto [newIter, inserted] = indexHandlers.try_emplace(name, std::move(fieldHandler));
+    return *(newIter->second);
   }
 
 
