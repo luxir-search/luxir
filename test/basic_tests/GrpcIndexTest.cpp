@@ -30,6 +30,7 @@ public:
 
     auto& fields = *ureq.add_docs()->mutable_fields();
     fields["text1_w"].set_s("a value");
+    fields["int1_i"].set_i(42);
 
     grpc::Status status = indexerStub->Update(&context, ureq , &response);
 
@@ -76,6 +77,7 @@ public:
         auto& fields = *req.add_docs()->mutable_fields();
         fields["text1_w"].set_s("val1");
         fields["text2_w"].set_s("val2");
+        fields["int1_i"].set_i(42);
 
         /* dump message
         std::string reqStr;

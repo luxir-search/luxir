@@ -93,7 +93,6 @@ public:
       return this->fieldName == sv;
     }
 
-
     virtual void index(Inverter& inverter, char* mutableVal, int len) {
     }
     virtual void index(Inverter& inverter, int64_t) {
@@ -105,6 +104,8 @@ public:
         index(inverter, const_cast<char *>(sval.data()), sval.size());  // TODO: get rid of the const-cast
       }
     }
+
+    virtual void flush(Inverter& inverter, PostingsWriter& postingsWriter) = 0;
 
     friend std::ostream& operator<<(std::ostream &out, const IndexHandler &sf) {
       return out << "{IndexHandler field:" << sf.fieldName << "}";
@@ -181,6 +182,44 @@ public:
       }
     }
 
+    void flush(Inverter &inverter, PostingsWriter &postingsWriter) override {
+      flushPositions(inverter, postingsWriter);
+    }
+
+    void flushPositions(Inverter &inverter, PostingsWriter& postingsWriter) {
+      auto sz = termsHash.size();
+      // gathering and sorting terms for each field could be done in parallel, but it probably doesn't
+      // represent much time.  Fields that can result in their own file should be able to be parallelized easily!
+      auto terms = termsHash.destructiveCompress();
+
+      // Sorting this with std::sort took ~7.3ms out of a total of ~22ms for inversion and 38ms for inversion+postings_writing!
+      // There were only 41991 unique terms... how can sort be so slow? Cache misses?
+      // For cache misses, we could try using a string type with a short-string optimization, or try packing all the strings
+      // for a field together (would need to know what fields have many terms though.)
+      // If strings are short on average, try an inline memcmp!
+      // pdqsort == 6.8ms
+      // spread_sort::string_sort == 3.9ms
+
+      // std::chrono::high_resolution_clock::time_point startTime = std::chrono::high_resolution_clock::now();
+      // std::sort(terms, terms+sz);
+      // boost::sort::pdqsort(terms, terms+sz);
+      boost::sort::spreadsort::string_sort(terms, terms+sz, TermRef::bracket(), TermRef::getsize(), TermRef::lessthan());
+      // auto endTime = std::chrono::high_resolution_clock::now();
+      // auto thisElapsed = std::chrono::duration_cast<std::chrono::nanoseconds>( endTime - startTime ).count();
+      // std::cout << "terms=" << sz << " SORT time ns=" << thisElapsed << std::endl;
+
+      postingsWriter.startField(fieldName);
+      for (size_t tnum=0; tnum<sz; tnum++) {
+        auto term = terms[tnum];
+        postingsWriter.startTerm(term);
+        // push all the docs / positions for this term
+        term.val().pushDocs(inverter.pool, postingsWriter);
+        postingsWriter.endTerm(term);
+      }
+      postingsWriter.endField(fieldName);
+      termsHash.free();
+    }
+
   };
 
   //
@@ -203,7 +242,18 @@ public:
 
     ~IntColHandler() = default;
 
-    void index(Inverter &inverter, int64_t val) {
+    void index(Inverter &inverter, const proto::Val &val) override {
+      if (val.has_i()) {
+        int64_t ival = val.i();
+        indexSingle(inverter, ival);
+      }
+    }
+
+    void index(Inverter &inverter, int64_t int64) override {
+      indexSingle(inverter, int64);
+    }
+
+    void indexSingle(Inverter &inverter, int64_t val) {
       // NOTE: we can't roll these min/max values back on indexing failure, so they may not be optimal.
       if (val < minVal) {
         minVal = val;
@@ -213,6 +263,9 @@ public:
       }
       longStream.addVal(inverter.pool, val);
       docsWithVal.addDoc(inverter.pool, inverter.currDoc);
+    }
+
+    void flush(Inverter &inverter, PostingsWriter &postingsWriter) override {
     }
   };
 
@@ -307,7 +360,7 @@ public:
     return pool.size();
   }
 
-  void writePostings(PostingsWriter& postingsWriter) {
+  void flush(PostingsWriter& postingsWriter) {
     // first gather and sort the fields
     std::vector<IndexHandler*> fields;
     fields.reserve(indexHandlers.size());
@@ -323,48 +376,11 @@ public:
                                          [](const IndexHandler* x, const IndexHandler* y) {return *x < *y;});
 
 
-    for (auto field : fields) {
-      // std::cout << "Writing field " << *field << std::endl;
-
-      // TODO: move this to IndexHandler? Or is greater context needed?
-      writePostings(postingsWriter, *(PosIndexHandler*)field);
+    for (auto fieldHandler : fields) {
+      fieldHandler->flush(*this, postingsWriter);
     }
   }
 
-
-  void writePostings(PostingsWriter& postingsWriter, PosIndexHandler& fieldHandler) {
-    auto sz = fieldHandler.termsHash.size();
-    // gathering and sorting terms for each field could be done in parallel, but it probably doesn't
-    // represent much time.  Fields that can result in their own file should be able to be parallelized easily!
-    auto terms = fieldHandler.termsHash.destructiveCompress();
-
-    // Sorting this with std::sort took ~7.3ms out of a total of ~22ms for inversion and 38ms for inversion+postings_writing!
-    // There were only 41991 unique terms... how can sort be so slow? Cache misses?
-    // For cache misses, we could try using a string type with a short-string optimization, or try packing all the strings
-    // for a field together (would need to know what fields have many terms though.)
-    // If strings are short on average, try an inline memcmp!
-    // pdqsort == 6.8ms
-    // spread_sort::string_sort == 3.9ms
-
-    // std::chrono::high_resolution_clock::time_point startTime = std::chrono::high_resolution_clock::now();
-    // std::sort(terms, terms+sz);
-    // boost::sort::pdqsort(terms, terms+sz);
-    boost::sort::spreadsort::string_sort(terms, terms+sz, TermRef::bracket(), TermRef::getsize(), TermRef::lessthan());
-    // auto endTime = std::chrono::high_resolution_clock::now();
-    // auto thisElapsed = std::chrono::duration_cast<std::chrono::nanoseconds>( endTime - startTime ).count();
-    // std::cout << "terms=" << sz << " SORT time ns=" << thisElapsed << std::endl;
-
-    postingsWriter.startField(fieldHandler.fieldName);
-    for (size_t tnum=0; tnum<sz; tnum++) {
-      auto term = terms[tnum];
-      postingsWriter.startTerm(term);
-      // push all the docs / positions for this term
-      term.val().pushDocs(pool, postingsWriter);
-      postingsWriter.endTerm(term);
-    }
-    postingsWriter.endField(fieldHandler.fieldName);
-    fieldHandler.termsHash.free();
-  }
 
 };
 

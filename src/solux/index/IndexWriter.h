@@ -121,7 +121,7 @@ public:
     std::string genStr = getSortableString(gen);
     PostingsWriter postingsWriter(dir, genStr);
     postingsWriter.setMaxDocUpperBound(inverter->getMaxDoc());
-    inverter->writePostings(postingsWriter);
+    inverter->flush(postingsWriter);
     postingsWriter.finish();
 
     segs.emplace_back(genStr);
