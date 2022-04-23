@@ -493,6 +493,26 @@ bool GRPCServer::waitForStart() {
   return true;
 }
 
+/*** NOTE: after upgrading from grpc1.41 (and dependencies) to grpc1.44 via vcpkg,
+ * valgrind reports a definite memory leak (along with a possible memory leak in abseil):
+    Leak_DefinitelyLost
+    ares_library_init.c
+    10 bytes in 1 blocks are definitely lost in loss record 12 of 76
+    0x4848899 malloc
+    0x11C77D1 default_malloc ares_library_init.c:48
+    0x11CD532 ares_strdup ares_strdup.c:33
+    0x11D3C1D ares__readaddrinfo ares__readaddrinfo.c:62
+    0x11D0FB2 file_lookup ares_getaddrinfo.c:477
+    0x11D10B2 next_lookup ares_getaddrinfo.c:513
+    0x11D1663 ares_getaddrinfo ares_getaddrinfo.c:698
+    0x11C2BCA ares_gethostbyname ares_gethostbyname.c:113
+    0xF94E55 grpc_dns_lookup_ares_continue_after_check_localhost_and_ip_literals_locked grpc_ares_wrapper.cc:875
+    0xF959FA grpc_dns_lookup_ares_impl grpc_ares_wrapper.cc:1069
+    0xF8C8DF grpc_core::AresClientChannelDNSResolver::StartResolvingLocked dns_resolver_ares.cc:454
+    0xF8C710 grpc_core::AresClientChannelDNSResolver::MaybeStartResolvingLocked dns_resolver_ares.cc:443
+
+    Another grpc example (written by someone else) also showed a leak after upgrading.
+ */
 void solux::GRPCServer::shutdown() {
   std::cout << "Shutting down grpc server." << std::endl;
 
