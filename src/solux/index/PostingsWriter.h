@@ -555,6 +555,17 @@ public:
     // OPT: For many fields, the field index and the terms index should perhaps have the same structure (prefix compressed blocks?)
     flushTerms(true);
 
+    // write index into the blocks of the terms dict
+    // TODO: use a more efficient encoding for this array
+    //   - make offsets be from the start of this index array... 32 bit normally fine, but not always for huge field?
+    //   - sequence will be monotonically increasing (or decreasing)... interpolate?
+    // Indexing RAM OPT: for fields with huge number of terms, we could stream this to separate file.  That would also facilitate alignment if it's important.
+    auto termBlockIndexLoc = termOutput.size();
+    assert((int)fieldInfo.termBlockOffsets.size() == ((fieldInfo.numTerms-1) / Postings::TERMS_BLOCK_SIZE) + 1);
+    termOutput.write(&(fieldInfo.termBlockOffsets[0]), fieldInfo.termBlockOffsets.size() * sizeof(int64_t) );
+
+    // Now write the field data, starting with the name.
+    auto fieldLoc = fieldOutput.size();  // TODO... need to eventually write index using this
     fieldOutput.writeStr(fieldName.c_str(), fieldName.size());
 
     // write type here? Hmmm.... but if this block will contain info across multiple types (columns, bkd, etc) then
@@ -562,17 +573,11 @@ public:
     // Which means we should just store, rather than write at this point (and avoid storing anything large)
     fieldOutput.writeVint(0x01);
 
-    fieldOutput.writeVlong(fieldInfo.termsLoc);
+    fieldOutput.writeVlong(termBlockIndexLoc);
+    fieldOutput.writeVlong(fieldInfo.termsLoc);  // If we change termBlockOffsets to be relative to the start of that index, we can remove termsLoc
     fieldOutput.writeVlong(fieldInfo.docsLoc);
     fieldOutput.writeVlong(fieldInfo.posLoc);
     fieldOutput.writeVint(fieldInfo.numTerms);
-    // write index into the blocks of the terms dict
-    // TODO: termBlockOffsets[0] is redundant with fieldInfo.termsOffset and we should be able to skip one of them.
-    // TODO: use a more efficient encoding for this array
-    // RAM OPT: for fields with huge number of terms, we could stream this to separate file.  That would also facilitate alignment if it's important.
-    assert((int)fieldInfo.termBlockOffsets.size() == ((fieldInfo.numTerms-1) / Postings::TERMS_BLOCK_SIZE) + 1);
-
-    fieldOutput.write(&(fieldInfo.termBlockOffsets[0]), fieldInfo.termBlockOffsets.size() * sizeof(int64_t) );
   }
 
   void startDoc(int32_t doc) {

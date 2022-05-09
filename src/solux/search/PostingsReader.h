@@ -97,7 +97,7 @@ class PostingsReader {
   std::vector<std::shared_ptr<InputFile>> files;  // temporary owner of open files
   int32_t maxdoc;
 public:
-  InputFile* tindexFile;
+  InputFile* fieldFile;
   InputFile* termFile;
   InputFile* docFile;
   InputFile* posFile;
@@ -110,14 +110,14 @@ public:
     InputStream segIS = segFile->getInputStream();
     maxdoc = segIS.readVint();
 
-    tindexFile = files.emplace_back(dir.openFile(Postings::getIndexFileName(gen, Postings::FIELDS_FNAME))).get();
+    fieldFile = files.emplace_back(dir.openFile(Postings::getIndexFileName(gen, Postings::FIELDS_FNAME))).get();
     termFile = files.emplace_back(dir.openFile(Postings::getIndexFileName(gen, Postings::TERMS_FNAME))).get();
     docFile = files.emplace_back(dir.openFile(Postings::getIndexFileName(gen, Postings::DOCS_FNAME))).get();
     posFile = files.emplace_back(dir.openFile(Postings::getIndexFileName(gen, Postings::POS_FNAME))).get();
   }
 
-  PostingsReader(InputFile* tindexFile, InputFile* termFile, InputFile* docFile, InputFile* posFile)
-  : tindexFile(tindexFile), termFile(termFile), docFile(docFile), posFile(posFile)
+  PostingsReader(InputFile* fieldFile, InputFile* termFile, InputFile* docFile, InputFile* posFile)
+  : fieldFile(fieldFile), termFile(termFile), docFile(docFile), posFile(posFile)
   {
   }
 
@@ -127,7 +127,7 @@ public:
 
   friend std::ostream& operator<< (std::ostream &out, const PostingsReader &reader) {
     out << "PostingsReader:" << std::endl
-              << "  tindexFile=" << *reader.tindexFile << std::endl
+        << "  fieldFile=" << *reader.fieldFile << std::endl
               << "  termFile=" << *reader.termFile << std::endl
               << "  docFile=" << *reader.docFile << std::endl
               << "  posFile=" << *reader.posFile << std::endl
@@ -147,10 +147,11 @@ class TermIndexReader {
   friend class TermsEnum;
 
 
-  InputStream tindexIS;
+  InputStream fieldIS;
   PostingsReader& postingsReader;
 
   PackedTerm fieldname;
+  int64_t termBlockIndexLoc;  // location of index into the terms blocks
   int64_t termsLoc;
   int64_t docsLoc;
   int64_t posLoc;
@@ -158,41 +159,39 @@ class TermIndexReader {
 
   // actual index into terms
   int32_t numTermBlocks;
-  const int64_t* termBlockOffsets;
 
   // TODO: field number?
 public:
   TermIndexReader(MemPool& pool, PostingsReader& postingsReader) : postingsReader(postingsReader) {
-    tindexIS = postingsReader.tindexFile->getInputStream();
+    fieldIS = postingsReader.fieldFile->getInputStream();
   }
 
   // TODO: should this read into a different structure?
   bool readNextField() {
-    if (tindexIS.left() <= 0) {  // TODO: most likely temporary way to detect end
+    if (fieldIS.left() <= 0) {  // TODO: most likely temporary way to detect end
       return false;
     }
     // See PostingsWriter.endField() for the format written.
-    fieldname = tindexIS.readPackedTerm();
-    auto type = tindexIS.readVint();
-    termsLoc = tindexIS.readVlong();
-    docsLoc = tindexIS.readVlong();
-    posLoc = tindexIS.readVlong();
-    nTerms = tindexIS.readVint();
-    termBlockOffsets = reinterpret_cast<const int64_t*>(tindexIS.ptr());  // offsets from termsLoc
+    fieldname = fieldIS.readPackedTerm();
+    auto type = fieldIS.readVint();
+    termBlockIndexLoc = fieldIS.readVlong();
+    termsLoc = fieldIS.readVlong();
+    docsLoc = fieldIS.readVlong();
+    posLoc = fieldIS.readVlong();
+    nTerms = fieldIS.readVint();
     numTermBlocks = ((nTerms-1) / Postings::TERMS_BLOCK_SIZE) + 1;
-    tindexIS.skip(numTermBlocks * sizeof(int64_t));
     return true;
   }
 
   void readFieldAt(int64_t offset) {
-    tindexIS.seek(offset);
+    fieldIS.seek(offset);
     readNextField();
   }
 
 
-  TermIndexReader(PostingsReader& postingsReader,const InputStream& is) : postingsReader(postingsReader), tindexIS(is) {};
+  TermIndexReader(PostingsReader& postingsReader,const InputStream& is) : postingsReader(postingsReader), fieldIS(is) {};
   TermRef name() { return fieldname; }
-  int numTerms() { return nTerms; }  // TODO: move this down in hierarchy given that we don't know where it will be stored in the future?
+  int numTerms() { return nTerms; }  // TODO: maybe move this down in hierarchy given that we don't know where it will be stored in the future?
 
 
 };
@@ -225,9 +224,14 @@ class TermsEnum {
   int64_t cumulativeDocsSize;
   const char* termHashes;
 
+  // term index level
+  const int64_t* termBlockOffsets;
+
 public:
   TermsEnum(MemPool& pool, PostingsReader& postingsReader, TermIndexReader& tindexReader) : pool(pool), postingsReader(postingsReader), tindexReader(tindexReader) {
     termsIS = postingsReader.termFile->getInputStream();
+    termsIS.seek(tindexReader.termBlockIndexLoc);  // TODO: make a single call to return the pointer of a location?
+    termBlockOffsets = reinterpret_cast<const int64_t*>(termsIS.ptr());  // offsets from termsLoc
     currTerm = PackedTerm(pool.allocate(256)); // TODO: pass in?  this will allocate for each term if called in a loop.  Could also have an init() method to reuse inst?
   }
 
@@ -252,7 +256,7 @@ public:
 
   // seeks to termBlockIndex and reads the block metadata + first term
   void readTermBlock() {
-    termsIS.seek(tindexReader.termsLoc + tindexReader.termBlockOffsets[termBlockIndex]);
+    termsIS.seek(tindexReader.termsLoc + termBlockOffsets[termBlockIndex]);
     startingOrd = termBlockIndex * Postings::TERMS_BLOCK_SIZE;  // we currently have fixed size blocks
     cumulativeDocsSize = 0;
     ordInBlock = 0;
@@ -319,11 +323,11 @@ public:
   }
 
   bool seek(const std::string_view& target) {  // TODO: templatize for anything that looks like a string?
-    auto termBlockEnd = tindexReader.termBlockOffsets + tindexReader.numTermBlocks;
+    auto termBlockEnd = termBlockOffsets + tindexReader.numTermBlocks;
     // Find the first block that is greater than the current term.
     // std::cout << "seek key=" << target << " numBlocks=" << tindexReader.numTermBlocks << std::endl;
 
-    auto blockOffsetPtr = std::upper_bound(tindexReader.termBlockOffsets, termBlockEnd, target,
+    auto blockOffsetPtr = std::upper_bound(termBlockOffsets, termBlockEnd, target,
                                  [&](const std::string_view& key, const int64_t& blockOffset) {
       auto termAtBlock = termsIS.readPackedTerm(tindexReader.termsLoc + blockOffset);
       auto ret = key < termAtBlock;
@@ -334,11 +338,11 @@ public:
 
     // Since the block we found is after, we will find our target term in the
     // previous block (if at all)
-    if (blockOffsetPtr > tindexReader.termBlockOffsets) {
+    if (blockOffsetPtr > termBlockOffsets) {
       blockOffsetPtr--;
     };
 
-    termBlockIndex = blockOffsetPtr - tindexReader.termBlockOffsets;
+    termBlockIndex = blockOffsetPtr - termBlockOffsets;
     readTermBlock();
     return seekInBlock(target);
     // return seekCeilInBlock(target); // use this version to skip comparing hashes
