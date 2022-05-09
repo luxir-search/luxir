@@ -234,7 +234,7 @@ class TermsEnum {
 
   InputStream termsIS;
   PostingsReader& postingsReader;
-  FieldReader& tindexReader;
+  FieldReader& fieldReader;
   MemPool& pool;
 
   PackedTerm currTerm;
@@ -259,7 +259,7 @@ class TermsEnum {
   int32_t numTermBlocks;
 
 public:
-  TermsEnum(MemPool& pool, PostingsReader& postingsReader, FieldReader& fieldReader) : pool(pool), postingsReader(postingsReader), tindexReader(fieldReader) {
+  TermsEnum(MemPool& pool, PostingsReader& postingsReader, FieldReader& fieldReader) : pool(pool), postingsReader(postingsReader), fieldReader(fieldReader) {
     numTermBlocks = ((fieldReader.nTerms-1) / Postings::TERMS_BLOCK_SIZE) + 1;
     termsIS = postingsReader.termFile->getInputStream();
     termsIS.seek(fieldReader.termBlockIndexLoc);  // TODO: make a single call to return the pointer of a location?
@@ -288,16 +288,16 @@ public:
 
   // seeks to termBlockIndex and reads the block metadata + first term
   void readTermBlock() {
-    termsIS.seek(tindexReader.termsLoc + termBlockOffsets[termBlockIndex]);
+    termsIS.seek(fieldReader.termsLoc + termBlockOffsets[termBlockIndex]);
     startingOrd = termBlockIndex * Postings::TERMS_BLOCK_SIZE;  // we currently have fixed size blocks
     cumulativeDocsSize = 0;
     ordInBlock = 0;
-    maxOrdInBlock = std::min(Postings::TERMS_BLOCK_SIZE - 1, tindexReader.numTerms() - startingOrd - 1);
+    maxOrdInBlock = std::min(Postings::TERMS_BLOCK_SIZE - 1, fieldReader.numTerms() - startingOrd - 1);
 
     // see PostingsWriter.flushTerms
     startingTerm = termsIS.readPackedTerm();
-    locOfDocsForTermBlock = tindexReader.docsLoc + termsIS.readVlong();  // fieldOffset + blockOffset for docs
-    locOfPositionsForTermBlock = tindexReader.posLoc + termsIS.readVlong();
+    locOfDocsForTermBlock = fieldReader.docsLoc + termsIS.readVlong();  // fieldOffset + blockOffset for docs
+    locOfPositionsForTermBlock = fieldReader.posLoc + termsIS.readVlong();
 
     memcpy(currTerm.ptr(), startingTerm.ptr(), startingTerm.memorySize());
 
@@ -310,7 +310,7 @@ public:
 
   bool nextTerm() {
     if (ordInBlock == maxOrdInBlock) {
-      if (ord() + 1 >= tindexReader.numTerms()) {  // could also compare number of blocks to detect end.
+      if (ord() + 1 >= fieldReader.numTerms()) {  // could also compare number of blocks to detect end.
         return false;
       }
       termBlockIndex++;
@@ -357,13 +357,13 @@ public:
   bool seek(const std::string_view& target) {  // TODO: templatize for anything that looks like a string?
     auto termBlockEnd = termBlockOffsets + numTermBlocks;
     // Find the first block that is greater than the current term.
-    // std::cout << "seek key=" << target << " numBlocks=" << tindexReader.numTermBlocks << std::endl;
+    // std::cout << "seek key=" << target << " numBlocks=" << fieldReader.numTermBlocks << std::endl;
 
     auto blockOffsetPtr = std::upper_bound(termBlockOffsets, termBlockEnd, target,
                                  [&](const std::string_view& key, const int64_t& blockOffset) {
-      auto termAtBlock = termsIS.readPackedTerm(tindexReader.termsLoc + blockOffset);
+      auto termAtBlock = termsIS.readPackedTerm(fieldReader.termsLoc + blockOffset);
       auto ret = key < termAtBlock;
-      // std::cout << "index=" << (&blockOffset-tindexReader.termBlockOffsets) << " termAtBlock=" << termAtBlock << " ret=" << ret << std::endl;
+      // std::cout << "index=" << (&blockOffset-fieldReader.termBlockOffsets) << " termAtBlock=" << termAtBlock << " ret=" << ret << std::endl;
       return ret;
     }
     );
@@ -475,7 +475,7 @@ class DocsEnum {
   InputStream docIS;
   InputStream posIS;
   PostingsReader& postingsReader;
-  FieldReader& tindexReader;
+  FieldReader& fieldReader;
   TermsEnum& tenum;
   MemPool& pool;
   int32_t docfreq; // number of docs containing this term
@@ -504,7 +504,7 @@ class DocsEnum {
 public:
   DocsEnum(MemPool& pool, PostingsReader& postingsReader, FieldReader& tindexReader, TermsEnum& tenum,
            int32_t* docsScratch=nullptr, int32_t* posScratch=nullptr, int32_t* tfreqScratch=nullptr)
-  : postingsReader(postingsReader), tindexReader(tindexReader), pool(pool), tenum(tenum)
+  : postingsReader(postingsReader), fieldReader(fieldReader), pool(pool), tenum(tenum)
   {
     docBuf=db;
     posBuf=pb;

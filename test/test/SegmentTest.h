@@ -25,7 +25,7 @@ public:
 
 
   std::unique_ptr<PostingsReader> reader;
-  std::unique_ptr<FieldReader> tindexReader;
+  std::unique_ptr<FieldReader> fieldReader;
   std::unique_ptr<TermsEnum> tenum;
   std::unique_ptr<DocsEnum> docsEnum;
 
@@ -66,7 +66,7 @@ public:
     writer->finish();
 
     reader = std::make_unique<PostingsReader>(dir, "10");
-    tindexReader = std::make_unique<FieldReader>(pool, *reader);
+    fieldReader = std::make_unique<FieldReader>(pool, *reader);
 
     // restore the RNG state
     r = rng_snapshot;
@@ -82,6 +82,11 @@ public:
 
     // TODO: refactor this somewhere more useful.  Directory?
     // std::cout << "INDEX SIZE tif=" << tindexFile->size() << " tf=" << termFile->size() << " df=" << docFile->size() << " pf=" << posFile->size() << std::endl;
+  }
+
+  // make a new terms enum .tenum from the current fieldReader
+  void makeTermsEnum() {
+    tenum = std::make_unique<TermsEnum>(pool, *reader, *fieldReader);
   }
 
   uint32_t getPositionDelta(int nPositions) {
@@ -107,6 +112,11 @@ public:
   uint32_t getNumTerms(uint32_t numFields) {
     unused(numFields);
     return r.rint(1u, termsPerFieldMax);
+  }
+
+  void getFieldName(std::string& target, uint32_t fieldNum) {
+    target.resize(13);
+    sprintf(term.data(), "field%08d", fieldNum);
   }
 
 
@@ -168,7 +178,7 @@ public:
       if (numDocs > 0) {
         ASSERT_TRUE(tenum->nextTerm());
         ASSERT_EQ(tenum->term(), term);
-        docsEnum = std::make_unique<DocsEnum>(pool, *reader, *tindexReader, *tenum);
+        docsEnum = std::make_unique<DocsEnum>(pool, *reader, *fieldReader, *tenum);
         numDocsRead = docsEnum->numDocs();
       }
     } else {
@@ -208,9 +218,9 @@ public:
     term.resize(12);
 
     if (read) {
-      tindexReader->readNextField();
-      ASSERT_EQ(fname, tindexReader->name());
-      tenum = std::make_unique<TermsEnum>(pool, *reader, *tindexReader);
+      fieldReader->readNextField();
+      ASSERT_EQ(fname, fieldReader->name());
+      makeTermsEnum();
     } else {
       writer->startField(fname);
     }
@@ -223,7 +233,7 @@ public:
       addTerm(read, term, ndocs, nPos);
     }
     if (read) {
-      ASSERT_EQ(tindexReader->numTerms(), realNumTerms);
+      ASSERT_EQ(fieldReader->numTerms(), realNumTerms);
     } else {
       writer->endField(fname);
     }
@@ -231,12 +241,10 @@ public:
 
   // -1 means a random number is used per field/term/doc
   void addFields(bool read, uint32_t numFields, int64_t nTerms=-1, int64_t nDocs=-1, int64_t nPos=-1) {
-    std::string fname = "field";
-    fname.resize(13);
+    std::string fname;
 
     for (uint32_t i = 0; i < numFields; i++) {
-      // std::format not implemented yet...
-      sprintf(fname.data() + 5, "%08d", i);
+      getFieldName(fname, i);
       uint32_t numTerms = nTerms<0 ? getNumTerms(numFields) : (uint32_t)nTerms;
       addField(read, fname, numTerms, nDocs, nPos);
     }
@@ -248,12 +256,12 @@ public:
     int64_t totDocs = 0;
     int64_t totPositions = 0;
     int64_t ret = 0;
-    FieldReader tindexReader(pool, *reader);
-    while (tindexReader.readNextField()) {
-      TermsEnum tenum(pool, *reader, tindexReader);
+    FieldReader fieldReader(pool, *reader);
+    while (fieldReader.readNextField()) {
+      TermsEnum tenum(pool, *reader, fieldReader);
       while (tenum.nextTerm()) {
         totTerms++;
-        DocsEnum docsEnum(pool, *reader, tindexReader, tenum);
+        DocsEnum docsEnum(pool, *reader, fieldReader, tenum);
         auto ndocs = docsEnum.numDocs();
         for (int i = 0; i < ndocs; i++) {
           auto id = docsEnum.nextDoc();

@@ -69,9 +69,9 @@ static void BM_TermFind(benchmark::State& state, uint64_t maxId, int hitPercent)
 
   seg.initReader();
   PostingsReader& postingsReader = *seg.reader;
-  FieldReader& tindexReader = *seg.tindexReader;
+  FieldReader& tindexReader = *seg.fieldReader;
   ASSERT_EQ(true, tindexReader.readNextField());
-  ASSERT_EQ((std::string_view)fname, seg.tindexReader->name());
+  ASSERT_EQ((std::string_view)fname, seg.fieldReader->name());
   TermsEnum tenum(pool, postingsReader, tindexReader);
 
 
