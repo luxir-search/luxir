@@ -13,6 +13,8 @@
 #include "solux/store/Directory.h"
 #include "solux/search/PostingsReader.h"
 #include "simdcomp/include/codecfactory.h"
+#include "roaring.hh"
+
 
 /**
  * The high level strategy is to write the lowest levels first since higher level information needs/points to that info.
@@ -149,13 +151,13 @@ public:
   std::vector<char> compressed_output;
 
   OutputStream segOutput;     // output stream for segment info file
-  OutputStream tindexOutput;  // output stream for terms index
+  OutputStream fieldOutput;   // output stream for field info
   OutputStream termOutput;    // output stream for termFile
   OutputStream docOutput;     // output stream for docFile
   OutputStream posOutput;     // output stream for posFile
 
   std::unique_ptr<File> segFile; // segment info
-  std::unique_ptr<File> tindexFile; // terms for each field
+  std::unique_ptr<File> fieldFile; // list of fields
   std::unique_ptr<File> termFile; // terms for each field
   std::unique_ptr<File> docFile; // documents for each term
   std::unique_ptr<File> posFile; // positions for each term
@@ -225,13 +227,13 @@ public:
     // TODO: defer file creation until needed, *or* use a RAMDelegatingFile that does so.
     // that does so.
     segFile    = directory.createFile(Postings::getIndexFileName(gen, Postings::SEGMENT_INFO_FNAME));
-    tindexFile = directory.createFile(Postings::getIndexFileName(gen, Postings::TERM_INDEX_FNAME));
+    fieldFile = directory.createFile(Postings::getIndexFileName(gen, Postings::FIELDS_FNAME));
     termFile   = directory.createFile(Postings::getIndexFileName(gen, Postings::TERMS_FNAME));
     docFile    = directory.createFile(Postings::getIndexFileName(gen, Postings::DOCS_FNAME));
     posFile    = directory.createFile(Postings::getIndexFileName(gen, Postings::POS_FNAME));
 
     segOutput.setFile(segFile.get());
-    tindexOutput.setFile(tindexFile.get());
+    fieldOutput.setFile(fieldFile.get());
     termOutput.setFile(termFile.get());
     docOutput.setFile(docFile.get());
     posOutput.setFile(posFile.get());
@@ -253,8 +255,8 @@ public:
     directory.finishFile(*segFile);
     termOutput.close();
     directory.finishFile(*termFile);
-    tindexOutput.close();
-    directory.finishFile(*tindexFile);
+    fieldOutput.close();
+    directory.finishFile(*fieldFile);
   }
 
   // currently needs to be done before finish() is called
@@ -547,20 +549,30 @@ public:
   }
 
   void endField(const std::string& fieldName) {
-    // TODO: investigate inlining small fields in the terms index instead of pointing out to other files.
-    // TODO: For many fields, the field index and the terms index should perhaps have the same structure (prefix compressed blocks?)
+    // OPT: investigate inlining small fields in the terms index instead of pointing out to other files?  If we don't know how large the field will be,
+    // we could always do it after-the-fact if the other outputs are rewindable (i.e. all in memory.)  If not, we could make it so by always starting
+    // with new outputs for every field with first page in RAM.
+    // OPT: For many fields, the field index and the terms index should perhaps have the same structure (prefix compressed blocks?)
     flushTerms(true);
-    tindexOutput.writeStr(fieldName.c_str(), fieldName.size());  // TODO: use fieldNumbers, or don't use field identifier at all... another index should point to this?
-    tindexOutput.writeVlong(fieldInfo.termsLoc);
-    tindexOutput.writeVlong(fieldInfo.docsLoc);
-    tindexOutput.writeVlong(fieldInfo.posLoc);
-    tindexOutput.writeVint(fieldInfo.numTerms);
+
+    fieldOutput.writeStr(fieldName.c_str(), fieldName.size());
+
+    // write type here? Hmmm.... but if this block will contain info across multiple types (columns, bkd, etc) then
+    // we can't move on to next field until all of the different index types for this field have been completed.
+    // Which means we should just store, rather than write at this point (and avoid storing anything large)
+    fieldOutput.writeVint(0x01);
+
+    fieldOutput.writeVlong(fieldInfo.termsLoc);
+    fieldOutput.writeVlong(fieldInfo.docsLoc);
+    fieldOutput.writeVlong(fieldInfo.posLoc);
+    fieldOutput.writeVint(fieldInfo.numTerms);
     // write index into the blocks of the terms dict
-    // TODO: termBlockOffsets[0] is redundant with fieldInfo.termsOffset and we should be able to skip it (should always be 0)
+    // TODO: termBlockOffsets[0] is redundant with fieldInfo.termsOffset and we should be able to skip one of them.
     // TODO: use a more efficient encoding for this array
+    // RAM OPT: for fields with huge number of terms, we could stream this to separate file.  That would also facilitate alignment if it's important.
     assert((int)fieldInfo.termBlockOffsets.size() == ((fieldInfo.numTerms-1) / Postings::TERMS_BLOCK_SIZE) + 1);
 
-    tindexOutput.write(&(fieldInfo.termBlockOffsets[0]), fieldInfo.termBlockOffsets.size() * sizeof(int64_t) );
+    fieldOutput.write(&(fieldInfo.termBlockOffsets[0]), fieldInfo.termBlockOffsets.size() * sizeof(int64_t) );
   }
 
   void startDoc(int32_t doc) {
@@ -593,12 +605,77 @@ public:
     }
   }
 
+
+
+
 private:
   void writeSegmentInfo() {
     assert(maxDocSeen >= 0);
     auto maxdoc = maxDocSeen + 1;
     segOutput.writeVint(maxdoc);
     // Other info we should eventually write: version info, what other files are present, cfs info
+  }
+
+  friend class IntColWriter;
+};
+
+
+
+class IntColWriter {
+  PostingsWriter& postingsWriter;
+  IntColStats* stats;
+
+public:
+  IntColWriter(PostingsWriter& postingsWriter) : postingsWriter(postingsWriter) {
+  }
+
+  void startField(const std::string& fieldName) {
+
+
+
+  }
+
+  //
+  // Integer column writing
+  // TODO: refactor out into a separate (but somehow related) class?
+  //
+  // The passed fieldStats should remain valid until after endField is called.
+  void startFieldIntCol(const std::string& fieldName, IntColStats& fieldStats) {
+    // column writing could be parallelized better by using multiple files and grabbing a free file at this point.
+
+    stats = &fieldStats;
+
+    /*
+    fieldInfo.fieldName = fieldName;
+    fieldInfo.termsLoc = termOutput.size();
+    fieldInfo.docsLoc = docOutput.size();
+    fieldInfo.posLoc = posOutput.size();
+    fieldInfo.termBlockOffsets.resize(0);
+     */
+  }
+
+
+  void addDocsWithVal(roaring::Roaring& roaring) {
+    auto card = roaring.cardinality();
+
+    auto frozenSize = roaring.getFrozenSizeInBytes();
+    auto bufSize = frozenSize + 31; // need space to align
+    std::vector<char> buf(bufSize);  // TODO: replace with something that can write directly to our output streams
+    void* buffer = buf.data();
+    buffer = std::align(32, frozenSize, buffer, bufSize);
+
+
+
+
+  }
+
+  void addInt64(int64_t val) {
+
+  }
+
+  void endField(const std::string& fieldName) {
+
+
   }
 
 

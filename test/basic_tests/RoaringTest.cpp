@@ -26,21 +26,29 @@ TEST_F(RoaringTest, basic) {
 }
 
 TEST_F(RoaringTest, rank) {
+  uint32_t values[] = {100, 105, 110, 120};
   roaring::Roaring r1;
+  for (auto v : values) {
+    r1.add(v);
+  }
   r1.add(100);
   r1.add(105);
   r1.add(110);
   r1.add(120);
 
-  std::vector<char> buf(1024);
+  auto frozenSize = r1.getFrozenSizeInBytes();
+  auto bufSize = frozenSize + 32; // need space to align
+  std::vector<char> buf(bufSize);
+  void* buffer = buf.data();
+  buffer = std::align(32, frozenSize, buffer, bufSize);
 
-  auto portableSize = r1.write(buf.data(), true);
-  std::cout << "portable size = " << portableSize << std::endl;
+  // std::cout << "getSizeInBytes=" << r1.getSizeInBytes(true) << " non-portable=" << r1.getSizeInBytes(false) << " frozen=" << r1.getFrozenSizeInBytes() << std::endl;
 
-  auto otherSz = r1.write(buf.data(), false);
-  std::cout << "non-portable size = " << otherSz << std::endl;
+  r1.writeFrozen((char*)buffer);
 
-  roaring::Roaring r2 = roaring::Roaring::read(buf.data(), false);
+  // roaring::Roaring r2 = roaring::Roaring::read(buf.data(), false);
+  roaring::Roaring r2 = roaring::Roaring::frozenView((char*)buffer, frozenSize);
+
   // std::cout << " deserialized cardinality=" << r2.cardinality() << " sizeInBytes=" << r2.getSizeInBytes() << std::endl;
   ASSERT_EQ(4, r2.cardinality());
 
@@ -51,16 +59,21 @@ TEST_F(RoaringTest, rank) {
   iter.equalorlarger(110);
   ASSERT_EQ(110, *iter);
 
+  int idx = 0;
   for (auto i : r1) {
-    std::cout << "for loop val:" << i << std::endl;
+    ASSERT_EQ(i, values[idx++]);
+    // std::cout << "for loop val:" << i << std::endl;
   }
+
 
   // iterate example
   r1.iterate(
           [](uint32_t val, void* param){
-              std::cout << "val=" << val << std::endl;
+              // can't assert correct values here since lambda with captures can't be converted to function pointer
+              // std::cout << "val=" << val << std::endl;
               return true;  // return false to stop iterating
             }
           , nullptr // this is passed in for every value as "param"
           );
+
 }

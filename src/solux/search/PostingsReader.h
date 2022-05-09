@@ -46,7 +46,7 @@ public:
   static constexpr std::string_view INDEX_INFO_FILE = "s.olux"; // lists all segments in the index
   static constexpr std::string_view PREFIX_FNAME = "s";
   static constexpr std::string_view SEGMENT_INFO_FNAME = "_s";  // info about a single segment
-  static constexpr std::string_view TERM_INDEX_FNAME = "_ti";
+  static constexpr std::string_view FIELDS_FNAME = "_f";
   static constexpr std::string_view TERMS_FNAME = "_t";
   static constexpr std::string_view DOCS_FNAME = "_d";
   static constexpr std::string_view POS_FNAME = "_p";
@@ -58,6 +58,38 @@ public:
 
 
 };
+
+
+class IntColStats {
+  int64_t minval = std::numeric_limits<int64_t>::max();
+  int64_t maxval = std::numeric_limits<int64_t>::min();
+  int32_t nvals = 0;  // this may be redundant (i.e. roaring bitset for docids also knows.
+
+public:
+  void add(int64_t val) {
+    nvals++;
+    if (val < minval) {
+      minval = val;
+    }
+    if (val > maxval) {
+      maxval = val;
+    }
+  }
+
+  int64_t minVal() {
+    return minval;
+  }
+
+  int64_t maxVal() {
+    return maxval;
+  }
+
+  int32_t numVals() {
+    return nvals;
+  }
+};
+
+
 
 // Lowest level postings reader class that needs to correspond to the PostingsWriter class that created the data.
 // PostingsReader should be thread-safe at the top level, but any iterators it supplies would not be.
@@ -78,7 +110,7 @@ public:
     InputStream segIS = segFile->getInputStream();
     maxdoc = segIS.readVint();
 
-    tindexFile = files.emplace_back(dir.openFile(Postings::getIndexFileName(gen, Postings::TERM_INDEX_FNAME))).get();
+    tindexFile = files.emplace_back(dir.openFile(Postings::getIndexFileName(gen, Postings::FIELDS_FNAME))).get();
     termFile = files.emplace_back(dir.openFile(Postings::getIndexFileName(gen, Postings::TERMS_FNAME))).get();
     docFile = files.emplace_back(dir.openFile(Postings::getIndexFileName(gen, Postings::DOCS_FNAME))).get();
     posFile = files.emplace_back(dir.openFile(Postings::getIndexFileName(gen, Postings::POS_FNAME))).get();
@@ -141,6 +173,7 @@ public:
     }
     // See PostingsWriter.endField() for the format written.
     fieldname = tindexIS.readPackedTerm();
+    auto type = tindexIS.readVint();
     termsLoc = tindexIS.readVlong();
     docsLoc = tindexIS.readVlong();
     posLoc = tindexIS.readVlong();

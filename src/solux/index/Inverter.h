@@ -229,8 +229,7 @@ public:
     friend class Inverter;
     LongStream longStream;
     DocStream docsWithVal;
-    int64_t minVal = std::numeric_limits<int64_t>::max();
-    int64_t maxVal = std::numeric_limits<int64_t>::min();
+    IntColStats stats;
 
     FieldType *fieldType;
   public:
@@ -254,18 +253,21 @@ public:
     }
 
     void indexSingle(Inverter &inverter, int64_t val) {
-      // NOTE: we can't roll these min/max values back on indexing failure, so they may not be optimal.
-      if (val < minVal) {
-        minVal = val;
-      }
-      if (val > maxVal) {
-        maxVal = val;
-      }
+      stats.add(val);
       longStream.addVal(inverter.pool, val);
       docsWithVal.addDoc(inverter.pool, inverter.currDoc);
     }
 
-    void flush(Inverter &inverter, PostingsWriter &postingsWriter) override {
+    void flush(Inverter& inverter, PostingsWriter& postingsWriter) override {
+    }
+
+    // TODO: make static and pass everything needed so it's composable
+    void flushIntCol(Inverter& inverter, PostingsWriter& postingsWriter) {
+      IntColWriter writer(postingsWriter);
+      writer.startField(fieldName);
+      writer.addDocsWithVal(docsWithVal.bitset);
+      longStream.pushValues(inverter.pool, writer);
+      writer.endField(fieldName);
     }
   };
 
