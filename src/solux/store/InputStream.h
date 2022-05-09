@@ -22,6 +22,8 @@ public:
 
   int64_t left() const noexcept { return end - pos; }  // how much data is left to read
 
+  int64_t size() const noexcept { return end - start; }
+
   void seek(int64_t offset) {
     pos = start + offset;
     assert(start <= pos && pos <= end);
@@ -73,6 +75,14 @@ public:
 
   inline static uint32_t readStrLen(const char *&pos, const char *end) {
     return readVint(pos, end);
+  }
+
+  // read 4 byte little endian integer
+  uint32_t readInt() {
+    assert(pos + sizeof(uint32_t) <= end);
+    uint32_t val = *(uint32_t*)pos; // potentially unaligned read
+    pos += sizeof(uint32_t);
+    return val;
   }
 
   uint32_t readVint() {

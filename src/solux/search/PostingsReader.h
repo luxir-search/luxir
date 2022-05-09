@@ -23,7 +23,7 @@ namespace solux {
 
 
 class PostingsReader;
-class TermIndexReader;
+class FieldReader;
 class TermsEnum;
 class DocsEnum;
 
@@ -139,15 +139,17 @@ public:
 //
 // IDEA: have something top-level, like a PostingsReader, that is not thread-safe (i.e. per-session/thread)
 // that can cache some things (block encoders, pool, fast terms cache, or whatever)
-// That could just be the TermIndexReader, but we will probably have a higher level than that eventually.
+// That could just be FieldReader, but we will probably have a higher level than that eventually.
 //
 
 // not thread safe
-class TermIndexReader {
+class FieldReader {
   friend class TermsEnum;
 
-
   InputStream fieldIS;
+  int32_t nFields;
+  int32_t currField = -1;
+  int32_t* fieldIndex; // start of the array of field locations
   PostingsReader& postingsReader;
 
   PackedTerm fieldname;
@@ -157,20 +159,55 @@ class TermIndexReader {
   int64_t posLoc;
   int32_t nTerms;
 
-  // actual index into terms
-  int32_t numTermBlocks;
+  void readFieldAt(int64_t offset) {
+    fieldIS.seek(offset);
+    readNextField();
+  }
+
 
   // TODO: field number?
 public:
-  TermIndexReader(MemPool& pool, PostingsReader& postingsReader) : postingsReader(postingsReader) {
+  FieldReader(MemPool& pool, PostingsReader& postingsReader) : postingsReader(postingsReader) {
     fieldIS = postingsReader.fieldFile->getInputStream();
+    fieldIS.seek(fieldIS.size() - sizeof(int32_t));
+    auto fieldLocEnd = fieldIS.ptr();
+    nFields = fieldIS.readInt();
+    fieldIndex = ((int32_t*)(fieldLocEnd)) - nFields;
   }
+
+  FieldReader(MemPool& pool, PostingsReader& postingsReader, const InputStream& is) : postingsReader(postingsReader), fieldIS(is) {};
+
+  int32_t numFields() {
+    return nFields;
+  }
+
+  bool seek(const std::string_view& fieldName) {
+    auto comparator = [&](const int32_t& fieldLoc, const std::string_view& key) {
+      auto fieldNameFound = fieldIS.readPackedTerm(fieldLoc);
+      return fieldNameFound < key;
+    };
+    auto endPtr = fieldIndex+nFields;
+    int32_t* fieldLocPtr = std::lower_bound(fieldIndex, endPtr, fieldName, comparator);
+    if (fieldLocPtr != endPtr) {
+      // This may be slightly repeated work (additional read term and compare), but it may not be worth it to eliminate.
+      auto fieldNameFound = fieldIS.readPackedTerm(*fieldLocPtr);
+      if (fieldNameFound == fieldName) {
+        currField = fieldLocPtr - fieldIndex - 1;  // back up to previous field since we will increment in readNextField
+        return readNextField();
+      }
+    }
+    return false;
+  }
+
 
   // TODO: should this read into a different structure?
   bool readNextField() {
-    if (fieldIS.left() <= 0) {  // TODO: most likely temporary way to detect end
+    if (currField+1 >= nFields) {
       return false;
     }
+    ++currField;
+    fieldIS.seek(fieldIndex[currField]);
+
     // See PostingsWriter.endField() for the format written.
     fieldname = fieldIS.readPackedTerm();
     auto type = fieldIS.readVint();
@@ -179,21 +216,14 @@ public:
     docsLoc = fieldIS.readVlong();
     posLoc = fieldIS.readVlong();
     nTerms = fieldIS.readVint();
-    numTermBlocks = ((nTerms-1) / Postings::TERMS_BLOCK_SIZE) + 1;
     return true;
   }
 
-  void readFieldAt(int64_t offset) {
-    fieldIS.seek(offset);
-    readNextField();
-  }
 
-
-  TermIndexReader(PostingsReader& postingsReader,const InputStream& is) : postingsReader(postingsReader), fieldIS(is) {};
   TermRef name() { return fieldname; }
   int numTerms() { return nTerms; }  // TODO: maybe move this down in hierarchy given that we don't know where it will be stored in the future?
 
-
+  // Any reason to expose field number?
 };
 
 
@@ -204,7 +234,7 @@ class TermsEnum {
 
   InputStream termsIS;
   PostingsReader& postingsReader;
-  TermIndexReader& tindexReader;
+  FieldReader& tindexReader;
   MemPool& pool;
 
   PackedTerm currTerm;
@@ -226,11 +256,13 @@ class TermsEnum {
 
   // term index level
   const int64_t* termBlockOffsets;
+  int32_t numTermBlocks;
 
 public:
-  TermsEnum(MemPool& pool, PostingsReader& postingsReader, TermIndexReader& tindexReader) : pool(pool), postingsReader(postingsReader), tindexReader(tindexReader) {
+  TermsEnum(MemPool& pool, PostingsReader& postingsReader, FieldReader& fieldReader) : pool(pool), postingsReader(postingsReader), tindexReader(fieldReader) {
+    numTermBlocks = ((fieldReader.nTerms-1) / Postings::TERMS_BLOCK_SIZE) + 1;
     termsIS = postingsReader.termFile->getInputStream();
-    termsIS.seek(tindexReader.termBlockIndexLoc);  // TODO: make a single call to return the pointer of a location?
+    termsIS.seek(fieldReader.termBlockIndexLoc);  // TODO: make a single call to return the pointer of a location?
     termBlockOffsets = reinterpret_cast<const int64_t*>(termsIS.ptr());  // offsets from termsLoc
     currTerm = PackedTerm(pool.allocate(256)); // TODO: pass in?  this will allocate for each term if called in a loop.  Could also have an init() method to reuse inst?
   }
@@ -323,7 +355,7 @@ public:
   }
 
   bool seek(const std::string_view& target) {  // TODO: templatize for anything that looks like a string?
-    auto termBlockEnd = termBlockOffsets + tindexReader.numTermBlocks;
+    auto termBlockEnd = termBlockOffsets + numTermBlocks;
     // Find the first block that is greater than the current term.
     // std::cout << "seek key=" << target << " numBlocks=" << tindexReader.numTermBlocks << std::endl;
 
@@ -443,7 +475,7 @@ class DocsEnum {
   InputStream docIS;
   InputStream posIS;
   PostingsReader& postingsReader;
-  TermIndexReader& tindexReader;
+  FieldReader& tindexReader;
   TermsEnum& tenum;
   MemPool& pool;
   int32_t docfreq; // number of docs containing this term
@@ -470,7 +502,7 @@ class DocsEnum {
   }
 
 public:
-  DocsEnum(MemPool& pool, PostingsReader& postingsReader, TermIndexReader& tindexReader, TermsEnum& tenum,
+  DocsEnum(MemPool& pool, PostingsReader& postingsReader, FieldReader& tindexReader, TermsEnum& tenum,
            int32_t* docsScratch=nullptr, int32_t* posScratch=nullptr, int32_t* tfreqScratch=nullptr)
   : postingsReader(postingsReader), tindexReader(tindexReader), pool(pool), tenum(tenum)
   {

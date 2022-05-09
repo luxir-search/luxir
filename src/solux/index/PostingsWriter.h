@@ -162,6 +162,8 @@ public:
   std::unique_ptr<File> docFile; // documents for each term
   std::unique_ptr<File> posFile; // positions for each term
 
+  std::vector<uint32_t> fieldLocs;  // location of each field in fieldFile (TODO: what is the max number of fields we will support?)
+
   // needed to build each block
   std::vector<TermRef> termList;  // list of terms in the current term block
   std::vector<uint32_t> docFileSize;         // size of the data in the docs file for this term (TODO: can we guarantee that this isn't bigger than 2B or 4B?)
@@ -242,6 +244,7 @@ public:
   }
 
   void finish() {
+    writeFieldIndex();
     writeSegmentInfo();
     // TODO: implement compound files for small files
 
@@ -249,14 +252,15 @@ public:
     // optimization in RAMDir
     docOutput.close();
     directory.finishFile(*docFile);
+    fieldOutput.close();
+    directory.finishFile(*fieldFile);
     posOutput.close();
     directory.finishFile(*posFile);
     segOutput.close();
     directory.finishFile(*segFile);
     termOutput.close();
     directory.finishFile(*termFile);
-    fieldOutput.close();
-    directory.finishFile(*fieldFile);
+
   }
 
   // currently needs to be done before finish() is called
@@ -562,10 +566,14 @@ public:
     // Indexing RAM OPT: for fields with huge number of terms, we could stream this to separate file.  That would also facilitate alignment if it's important.
     auto termBlockIndexLoc = termOutput.size();
     assert((int)fieldInfo.termBlockOffsets.size() == ((fieldInfo.numTerms-1) / Postings::TERMS_BLOCK_SIZE) + 1);
-    termOutput.write(&(fieldInfo.termBlockOffsets[0]), fieldInfo.termBlockOffsets.size() * sizeof(int64_t) );
+    termOutput.write(&(fieldInfo.termBlockOffsets[0]), fieldInfo.termBlockOffsets.size() * sizeof(fieldInfo.termBlockOffsets[0]) );
+
+    // keep track of where this field data starts
+    auto fieldLoc = fieldOutput.size();
+    assert(fieldLoc < 0x07FFFFFFF);      // TODO: throw exception if we get too many fields.
+    fieldLocs.push_back(fieldLoc);
 
     // Now write the field data, starting with the name.
-    auto fieldLoc = fieldOutput.size();  // TODO... need to eventually write index using this
     fieldOutput.writeStr(fieldName.c_str(), fieldName.size());
 
     // write type here? Hmmm.... but if this block will contain info across multiple types (columns, bkd, etc) then
@@ -574,7 +582,7 @@ public:
     fieldOutput.writeVint(0x01);
 
     fieldOutput.writeVlong(termBlockIndexLoc);
-    fieldOutput.writeVlong(fieldInfo.termsLoc);  // If we change termBlockOffsets to be relative to the start of that index, we can remove termsLoc
+    fieldOutput.writeVlong(fieldInfo.termsLoc);  // TODO: If we change termBlockOffsets to be relative to the start of that index, we can remove termsLoc
     fieldOutput.writeVlong(fieldInfo.docsLoc);
     fieldOutput.writeVlong(fieldInfo.posLoc);
     fieldOutput.writeVint(fieldInfo.numTerms);
@@ -619,6 +627,14 @@ private:
     auto maxdoc = maxDocSeen + 1;
     segOutput.writeVint(maxdoc);
     // Other info we should eventually write: version info, what other files are present, cfs info
+  }
+
+  void writeFieldIndex() {
+    // location of each field in fieldFile
+    // TODO: align this on 4 byte boundary
+    fieldOutput.write(&(fieldLocs[0]), fieldLocs.size() * sizeof(fieldLocs[0]));
+    // write the size of the array at the end so we can use it to find the start when reading
+    fieldOutput.writeInt((int32_t)fieldLocs.size());
   }
 
   friend class IntColWriter;

@@ -23,7 +23,7 @@ protected:
 
 
   std::unique_ptr<PostingsReader> reader;
-  std::unique_ptr<TermIndexReader> tindexReader;
+  std::unique_ptr<FieldReader> tindexReader;
   std::unique_ptr<TermsEnum> tenum;
   std::unique_ptr<DocsEnum> docsEnum;
 
@@ -50,7 +50,7 @@ protected:
 
     std::string gen = "10";
     reader = std::make_unique<PostingsReader>(dir, "10");
-    tindexReader = std::make_unique<TermIndexReader>(pool, *reader);
+    tindexReader = std::make_unique<FieldReader>(pool, *reader);
 
     // restore the RNG state
     rng = rng_start;
@@ -286,7 +286,7 @@ TEST_F(PostingsTest, basic) {
 
   PostingsReader reader(dir, "10");
 
-  TermIndexReader tindexReader(pool, reader);
+  FieldReader tindexReader(pool, reader);
   while (tindexReader.readNextField()) {
     std::cout << "FIELD NAME name=" << tindexReader.name() << " numTerms=" << tindexReader.numTerms() << std::endl;
 
@@ -347,7 +347,7 @@ TEST_F(PostingsTest, blockPositions) {
 
   PostingsReader reader(dir, "10");
 
-  TermIndexReader tindexReader(pool, reader);
+  FieldReader tindexReader(pool, reader);
   ASSERT_TRUE(tindexReader.readNextField());
   std::cout << "FIELD NAME name=" << tindexReader.name() << " numTerms=" << tindexReader.numTerms() << std::endl;
   ASSERT_EQ(tindexReader.name(), std::string_view("field1"));
@@ -422,7 +422,7 @@ TEST_F(PostingsTest, blockTerms) {
 
   PostingsReader reader(dir, "10");
 
-  TermIndexReader tindexReader(pool, reader);
+  FieldReader tindexReader(pool, reader);
   ASSERT_TRUE(tindexReader.readNextField());
   // std::cout << "FIELD NAME name=" << tindexReader.name() << " numTerms=" << tindexReader.numTerms() << std::endl;
   ASSERT_EQ(tindexReader.name(), std::string_view("field1"));

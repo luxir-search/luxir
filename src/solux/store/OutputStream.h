@@ -124,6 +124,15 @@ public:
     }
   }
 
+  // Write 4 byte integer in little endian format
+  void writeInt(int32_t val) {
+    // In the case that we don't have to write full buffers before flushing, we should simply reserve and cast or memcpy
+    write((val>>0 ) & 0x00ff);
+    write((val>>8 ) & 0x00ff);
+    write((val>>16) & 0x00ff);
+    write((val>>24) & 0x00ff);
+  }
+
   // Write a maximum of 5 bytes in vint format.  Note that this is inefficient for negative numbers.
   void writeVint(uint32_t val) {
     // In the case that we don't have to write full buffers before flushing, we should simply reserve

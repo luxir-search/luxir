@@ -25,7 +25,7 @@ public:
 
 
   std::unique_ptr<PostingsReader> reader;
-  std::unique_ptr<TermIndexReader> tindexReader;
+  std::unique_ptr<FieldReader> tindexReader;
   std::unique_ptr<TermsEnum> tenum;
   std::unique_ptr<DocsEnum> docsEnum;
 
@@ -66,7 +66,7 @@ public:
     writer->finish();
 
     reader = std::make_unique<PostingsReader>(dir, "10");
-    tindexReader = std::make_unique<TermIndexReader>(pool, *reader);
+    tindexReader = std::make_unique<FieldReader>(pool, *reader);
 
     // restore the RNG state
     r = rng_snapshot;
@@ -248,7 +248,7 @@ public:
     int64_t totDocs = 0;
     int64_t totPositions = 0;
     int64_t ret = 0;
-    TermIndexReader tindexReader(pool, *reader);
+    FieldReader tindexReader(pool, *reader);
     while (tindexReader.readNextField()) {
       TermsEnum tenum(pool, *reader, tindexReader);
       while (tenum.nextTerm()) {
