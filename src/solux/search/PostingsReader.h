@@ -50,6 +50,8 @@ public:
   static constexpr std::string_view TERMS_FNAME = "_t";
   static constexpr std::string_view DOCS_FNAME = "_d";
   static constexpr std::string_view POS_FNAME = "_p";
+  static constexpr std::string_view COL_FNAME = "_c";
+
 
 
   static std::string getIndexFileName(const std::string_view& gen, const std::string_view& suffix) {

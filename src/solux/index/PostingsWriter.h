@@ -155,12 +155,14 @@ public:
   OutputStream termOutput;    // output stream for termFile
   OutputStream docOutput;     // output stream for docFile
   OutputStream posOutput;     // output stream for posFile
+  OutputStream colOutput;     // output stream for columns
 
   std::unique_ptr<File> segFile; // segment info
   std::unique_ptr<File> fieldFile; // list of fields
   std::unique_ptr<File> termFile; // terms for each field
   std::unique_ptr<File> docFile; // documents for each term
   std::unique_ptr<File> posFile; // positions for each term
+  std::unique_ptr<File> colFile; // used for columns
 
   std::vector<uint32_t> fieldLocs;  // location of each field in fieldFile (TODO: what is the max number of fields we will support?)
 
@@ -229,10 +231,11 @@ public:
     // TODO: defer file creation until needed, *or* use a RAMDelegatingFile that does so.
     // that does so.
     segFile    = directory.createFile(Postings::getIndexFileName(gen, Postings::SEGMENT_INFO_FNAME));
-    fieldFile = directory.createFile(Postings::getIndexFileName(gen, Postings::FIELDS_FNAME));
+    fieldFile  = directory.createFile(Postings::getIndexFileName(gen, Postings::FIELDS_FNAME));
     termFile   = directory.createFile(Postings::getIndexFileName(gen, Postings::TERMS_FNAME));
     docFile    = directory.createFile(Postings::getIndexFileName(gen, Postings::DOCS_FNAME));
     posFile    = directory.createFile(Postings::getIndexFileName(gen, Postings::POS_FNAME));
+    colFile    = directory.createFile(Postings::getIndexFileName(gen, Postings::COL_FNAME));
 
     segOutput.setFile(segFile.get());
     fieldOutput.setFile(fieldFile.get());
@@ -250,6 +253,8 @@ public:
 
     // minor optimization here - we close the files in sorted order to trigger the
     // optimization in RAMDir
+    colOutput.close();
+    directory.finishFile(*colFile);
     docOutput.close();
     directory.finishFile(*docFile);
     fieldOutput.close();
@@ -257,7 +262,7 @@ public:
     posOutput.close();
     directory.finishFile(*posFile);
     segOutput.close();
-    directory.finishFile(*segFile);
+    directory.finishFile(*segFile);   // TODO... should this be last, or is there a higher level sync mechanism to prevent reading seg file before other files are written?
     termOutput.close();
     directory.finishFile(*termFile);
 
@@ -269,7 +274,7 @@ public:
   }
 
   // Currently only called for a full block of positions.
-  // TODO: move to .cpp unless we template this class
+  // TODO: move to .cpp unless we template this class... allows for removal of the associated include files
   void flushPositions() {
     if (posdeltas.empty()) {
       return;
@@ -645,15 +650,12 @@ private:
 class IntColWriter {
   PostingsWriter& postingsWriter;
   IntColStats* stats;
+  OutputStream& colOutput;
+  int64_t colStart;
+  int64_t idLoc;
 
 public:
-  IntColWriter(PostingsWriter& postingsWriter) : postingsWriter(postingsWriter) {
-  }
-
-  void startField(const std::string& fieldName) {
-
-
-
+  IntColWriter(PostingsWriter& postingsWriter) : postingsWriter(postingsWriter), colOutput(postingsWriter.colOutput) {
   }
 
   //
@@ -665,14 +667,7 @@ public:
     // column writing could be parallelized better by using multiple files and grabbing a free file at this point.
 
     stats = &fieldStats;
-
-    /*
-    fieldInfo.fieldName = fieldName;
-    fieldInfo.termsLoc = termOutput.size();
-    fieldInfo.docsLoc = docOutput.size();
-    fieldInfo.posLoc = posOutput.size();
-    fieldInfo.termBlockOffsets.resize(0);
-     */
+    colStart = colOutput.size();
   }
 
 
@@ -684,10 +679,9 @@ public:
     std::vector<char> buf(bufSize);  // TODO: replace with something that can write directly to our output streams
     void* buffer = buf.data();
     buffer = std::align(32, frozenSize, buffer, bufSize);
-
-
-
-
+    roaring.writeFrozen((char*)buffer);
+    idLoc = colOutput.size();
+    colOutput.write(buffer, frozenSize);
   }
 
   void addInt64(int64_t val) {

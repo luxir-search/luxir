@@ -84,7 +84,7 @@ public:
     // std::cout << "INDEX SIZE tif=" << tindexFile->size() << " tf=" << termFile->size() << " df=" << docFile->size() << " pf=" << posFile->size() << std::endl;
   }
 
-  // make a new terms enum .tenum from the current fieldReader
+  // make a new terms enum .tenum from the current fieldReader... a must if the fieldReader has changed states
   void makeTermsEnum() {
     tenum = std::make_unique<TermsEnum>(pool, *reader, *fieldReader);
   }
