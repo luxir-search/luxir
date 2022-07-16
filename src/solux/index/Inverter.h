@@ -264,7 +264,7 @@ public:
     // TODO: make static and pass everything needed so it's composable
     void flushIntCol(Inverter& inverter, PostingsWriter& postingsWriter) {
       IntColWriter writer(postingsWriter);
-      writer.startField(fieldName);
+      writer.startFieldIntCol(fieldName, stats);
       writer.addDocsWithVal(docsWithVal.bitset);
       longStream.pushValues(inverter.pool, writer);
       writer.endField(fieldName);

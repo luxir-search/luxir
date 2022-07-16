@@ -38,6 +38,12 @@ std::string solux_banner() {
 #ifdef __VERSION__
   ss << " __VERSION__=" << __VERSION__;
 #endif
+#ifdef _GLIBCXX_RELEASE
+  ss << " _GLIBCXX_RELEASE=" << _GLIBCXX_RELEASE;
+#endif
+#ifdef __GLIBCXX__
+  ss << " __GLIBCXX__=" << __GLIBCXX__;
+#endif
 #ifdef __linux__
   ss << " __linux__=" << __linux__;
 #endif

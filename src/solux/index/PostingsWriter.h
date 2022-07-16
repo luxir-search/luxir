@@ -242,6 +242,7 @@ public:
     termOutput.setFile(termFile.get());
     docOutput.setFile(docFile.get());
     posOutput.setFile(posFile.get());
+    colOutput.setFile(colFile.get());
 
     // TODO: if we hit an error, should we clean up any files?
   }

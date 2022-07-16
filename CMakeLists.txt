@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.16)
 project(Solux VERSION 0.1)
-set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED True)
 
 # This keeps dlls and executables together, which makes windows happy.
