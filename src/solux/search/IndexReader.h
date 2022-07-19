@@ -11,8 +11,8 @@ class IndexReader {
 public:
   class Segment {
   public:
-    int64_t base;
-    int ord;  // index of this segment in the list of segments
+    int64_t base;   // global index (ordinal) of the first document in this segment with respect to the list of segments
+    int ord;        // index of this segment in the list of segments
     std::unique_ptr<PostingsReader> reader;
 
     Segment(int64_t base, int ord, std::unique_ptr<PostingsReader>&& postingsReader)

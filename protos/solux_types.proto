@@ -75,7 +75,7 @@ message TopDocs {
   Query query = 1;
   int64 offset = 2;
   optional sint64 limit = 3;
-  bool get_matches = 4;         // return the number of matching documents
+  bool get_number = 4;          // return the number of matching documents
   bool get_scores = 5;          // return the relevancy score for each document returned
   repeated string fields = 6;   // fields to return for each document
   repeated SortSpec sorts = 7;

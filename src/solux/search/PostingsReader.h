@@ -151,21 +151,18 @@ class FieldReader {
   InputStream fieldIS;
   int32_t nFields;
   int32_t currField = -1;
-  int32_t* fieldIndex; // start of the array of field locations
+  int32_t* fieldIndex; // start of the array of field locations, written by PostingsWriter::writeFieldIndex()
   PostingsReader& postingsReader;
 
   PackedTerm fieldname;
+  bool fieldInfoRead = false;      // has field metadata been read for this field?
+
+
   int64_t termBlockIndexLoc;  // location of index into the terms blocks
   int64_t termsLoc;
   int64_t docsLoc;
   int64_t posLoc;
   int32_t nTerms;
-
-  void readFieldAt(int64_t offset) {
-    fieldIS.seek(offset);
-    readNextField();
-  }
-
 
   // TODO: field number?
 public:
@@ -202,7 +199,8 @@ public:
   }
 
 
-  // TODO: should this read into a different structure?
+  // TODO: should this read into a different structure?  Only if we want to iterate over all fields but not read them?
+  // one possible use case: a wildcard in field names (fast iteration would be a bonus)
   bool readNextField() {
     if (currField+1 >= nFields) {
       return false;
@@ -210,20 +208,37 @@ public:
     ++currField;
     fieldIS.seek(fieldIndex[currField]);
 
+    //
     // See PostingsWriter.endField() for the format written.
+    //
     fieldname = fieldIS.readPackedTerm();
-    auto type = fieldIS.readVint();
-    termBlockIndexLoc = fieldIS.readVlong();
-    termsLoc = fieldIS.readVlong();
-    docsLoc = fieldIS.readVlong();
-    posLoc = fieldIS.readVlong();
-    nTerms = fieldIS.readVint();
+    fieldInfoRead = false;
     return true;
+
   }
 
 
   TermRef name() { return fieldname; }
-  int numTerms() { return nTerms; }  // TODO: maybe move this down in hierarchy given that we don't know where it will be stored in the future?
+  int numTerms() {
+    if (!fieldInfoRead) {
+      readFieldInfo();
+    }
+    return nTerms;
+  }  // TODO: maybe move this down in hierarchy given that we don't know where it will be stored in the future?
+
+private:
+  // move to cpp?
+  void readFieldInfo() {
+    if (!fieldInfoRead) {
+      fieldInfoRead = true;
+      auto type = fieldIS.readVint();
+      termBlockIndexLoc = fieldIS.readVlong();
+      termsLoc = fieldIS.readVlong();
+      docsLoc = fieldIS.readVlong();
+      posLoc = fieldIS.readVlong();
+      nTerms = fieldIS.readVint();
+    }
+  }
 
   // Any reason to expose field number?
 };
@@ -262,6 +277,9 @@ class TermsEnum {
 
 public:
   TermsEnum(MemPool& pool, PostingsReader& postingsReader, FieldReader& fieldReader) : pool(pool), postingsReader(postingsReader), fieldReader(fieldReader) {
+    if (!fieldReader.fieldInfoRead) {
+      fieldReader.readFieldInfo();
+    }
     numTermBlocks = ((fieldReader.nTerms-1) / Postings::TERMS_BLOCK_SIZE) + 1;
     termsIS = postingsReader.termFile->getInputStream();
     termsIS.seek(fieldReader.termBlockIndexLoc);  // TODO: make a single call to return the pointer of a location?

@@ -259,14 +259,15 @@ public:
     }
 
     void flush(Inverter& inverter, PostingsWriter& postingsWriter) override {
+      flushIntCol(inverter, postingsWriter);
     }
 
     // TODO: make static and pass everything needed so it's composable
     void flushIntCol(Inverter& inverter, PostingsWriter& postingsWriter) {
       IntColWriter writer(postingsWriter);
       writer.startFieldIntCol(fieldName, stats);
-      writer.addDocsWithVal(docsWithVal.bitset);
       longStream.pushValues(inverter.pool, writer);
+      docsWithVal.pushDocs(inverter.pool, writer);
       writer.endField(fieldName);
     }
   };

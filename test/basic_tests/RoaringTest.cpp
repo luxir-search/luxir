@@ -23,6 +23,22 @@ TEST_F(RoaringTest, basic) {
   }
 
   ASSERT_EQ(count, r1.cardinality());
+
+  /* TODO: roaring isn't good for all (or mostly all) values! Seems worse than raw bitset!!!
+   * either come up with our own format that can handle that case, or store things in the negative sense.
+   * We want to optimize for speed in dense case, and optimize for size in the sparse case.
+  std::cout << "cardinality="  << count << "size1=" << r1.getFrozenSizeInBytes() << std::endl;
+  roaring::Roaring r;
+  for (int i=0; i<1000000; i++) {
+    r.add(i);
+  }
+  std::cout << "1M all set size="  << r.getFrozenSizeInBytes() << std::endl;  // output: 1M all set size=131156
+
+  roaring::Roaring r2;
+  r2.add(1000000-1);
+  std::cout << "1 high bit set size="  << r2.getFrozenSizeInBytes() << std::endl;  // output: 1 high bit set size=11
+  */
+
 }
 
 TEST_F(RoaringTest, rank) {

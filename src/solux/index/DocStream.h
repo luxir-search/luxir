@@ -47,21 +47,13 @@ namespace solux {
 SOLUX_PACKED_START
 class DocStream {
 public:
-  // TODO: FIXME! if this is allocated in MemPool, we would need to run destructors for Roaring!!!
-  // TODO: replace with something simpler that can handle the common cases (per byte... delta, bitmap, run) by
-  // collecting 7 oir 8 values at a time in a queue.
-  roaring::Roaring bitset;
-
   int lastDoc;
-  int firstDocWithoutVal;
-  // Stream docs;
+  int runStart;   // start of the current run
+  int prevRunEnd; // end of the previous run
+  Stream stream;
 
-  DocStream(MemPool &pool) : lastDoc(-1), firstDocWithoutVal(0) {
+  DocStream(MemPool &pool) : lastDoc(-1), runStart(0), prevRunEnd(-1) {
     unused(pool);
-  }
-  DocStream(MemPool &pool, int docid) : DocStream(pool) {
-    // : lastDoc(docid), firstDocWithoutVal(docid==0 ? 1:0) {
-    addDoc(pool, docid);
   }
 
   DocStream(const DocStream &) = delete;
@@ -69,31 +61,47 @@ public:
   void operator=(const DocStream &) = delete;
 
   void addDoc(MemPool &pool, int docid) {
-    unused(pool);
     int delta = docid - lastDoc;
-    assert(delta >= 0);
-    if (delta == 0) return;  // already handled
-    lastDoc = docid;
-    if (docid == firstDocWithoutVal) {
-      // Only possible if everything is full!  This avoids using the bitset in the all-full case.
-      firstDocWithoutVal++;
-      return;
+    assert(delta > 0);
+    if (delta != 1) {
+      // end of a run
+      int runSize = lastDoc - runStart + 1;
+      int gap = runStart - prevRunEnd;
+      // TODO: this will be very inefficient if we add every other doc. Add support for bitmaps?
+      // add support for delta coding?
+      // This will add a zero-size run at the start that we could avoid but is it worth the extra check in here?
+      stream.writeVInt(pool, gap);
+      stream.writeVInt(pool, runSize);
+      runStart = docid;
+      prevRunEnd = lastDoc;
     }
-    bitset.add(docid);
-  }
 
+    lastDoc = docid;
+  }
 
   /// Calls sink.startDoc(int docid) only for each doc
   template <class PostingsConsumer>
   void pushDocs(MemPool& pool, PostingsConsumer& sink) {
-    unused(pool);
-    for (int i=0; i<firstDocWithoutVal; i++) {
-      sink.startDoc(i);
+    int runPtr = -1;
+
+    StreamReader dstream(stream, pool);
+    while (!dstream.eof()) {
+      int gap = dstream.readVint();
+      int runSize = dstream.readVint();
+      runPtr += gap;
+      for (int i = 0; i<runSize; i++) {
+        sink.startDoc(runPtr + i);
+      }
+      runPtr += runSize - 1;  // next gap is from the end of this run
     }
-    for (int v : bitset) {
-      sink.startDoc(v);
+
+    // handle last run
+    for (int docid = runStart; docid <=lastDoc; docid++) {
+      sink.startDoc(docid);
     }
   }
+
+  // TODO: add a more specific PostingsConsumer that can communicate runs to a compressed bitset builder.
 
 
 } SOLUX_PACKED_END;

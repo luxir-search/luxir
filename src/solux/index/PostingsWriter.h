@@ -647,22 +647,23 @@ private:
 };
 
 
-
+//
+// Integer column writing
+//
 class IntColWriter {
   PostingsWriter& postingsWriter;
   IntColStats* stats;
   OutputStream& colOutput;
   int64_t colStart;
   int64_t idLoc;
+  int32_t numDocsWithValue = 0;  // number of docs with a value, derived from addDocsWithVal
+  int32_t nAdded = 0;            // number of values added. redundant with numDocsWithValue, for sanity check
 
 public:
   IntColWriter(PostingsWriter& postingsWriter) : postingsWriter(postingsWriter), colOutput(postingsWriter.colOutput) {
   }
 
-  //
-  // Integer column writing
-  // TODO: refactor out into a separate (but somehow related) class?
-  //
+
   // The passed fieldStats should remain valid until after endField is called.
   void startFieldIntCol(const std::string& fieldName, IntColStats& fieldStats) {
     // column writing could be parallelized better by using multiple files and grabbing a free file at this point.
@@ -673,8 +674,7 @@ public:
 
 
   void addDocsWithVal(roaring::Roaring& roaring) {
-    auto card = roaring.cardinality();
-
+    numDocsWithValue = roaring.cardinality();;
     auto frozenSize = roaring.getFrozenSizeInBytes();
     auto bufSize = frozenSize + 31; // need space to align
     std::vector<char> buf(bufSize);  // TODO: replace with something that can write directly to our output streams
@@ -682,15 +682,28 @@ public:
     buffer = std::align(32, frozenSize, buffer, bufSize);
     roaring.writeFrozen((char*)buffer);
     idLoc = colOutput.size();
+    // TODO: what alignment requirements do we have for reading?
     colOutput.write(buffer, frozenSize);
   }
 
-  void addInt64(int64_t val) {
+  // target for DocStream.pushDocs
+  void startDoc(int32_t docid) {
+    numDocsWithValue++;
 
   }
 
-  void endField(const std::string& fieldName) {
 
+  void addInt64(int64_t val) {
+    nAdded++;
+    // temporary worst-case implementation with no compression
+    colOutput.writeLong(val);
+  }
+
+  void endField(const std::string& fieldName) {
+    // write any necessary index into encoded blocks here (assuming it's small enough to keep in memory)
+
+    assert(numDocsWithValue == nAdded); // TODO: turn into actual exception
+    // TODO: write pointers (or add pointers to list to later be serialized)
 
   }
 
