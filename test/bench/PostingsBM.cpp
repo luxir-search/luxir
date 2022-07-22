@@ -58,43 +58,59 @@ BM_Postings/readDocsTail                 446 ns          438 ns      1628727 doc
 // percentReadPos is the percentage of documents for which we decide to read it's positions.
 // pass 0 to just read documents or 100 to always read positions.
 static void BM_Postings(benchmark::State& state, int nTerms, int nDocs, int nPosPerDoc, int percentReadPos=100) {
-  // std::cout << "RANGE: " << state.range(0) << std::endl;
 
-  solux::SegmentTest seg;
+  // std::cout << "BM_Postings START" << std::endl;
 
+  auto seg = std::make_unique<solux::SegmentTest>();
 
-  seg.r.init(1);  // keep seed the same for performance benchmark
-  seg.initWriter();
-  seg.addFields(false, 1, nTerms, nDocs, nPosPerDoc);
-  seg.initReader();
-  seg.addFields(true, 1, nTerms, nDocs, nPosPerDoc);  // verify reading
+  if (!solux::unit_tests) {
+    seg->r.init(1);  // keep seed the same for performance benchmark
+  }
+
+  seg->initWriter();
+  seg->addFields(false, 1, nTerms, nDocs, nPosPerDoc);
+  seg->initReader();
+  seg->addFields(true, 1, nTerms, nDocs, nPosPerDoc);  // verify reading
 
   uint64_t tterms=0, tdocs=0, tpos=0;
+  // std::cout << "\tBM_Postings starting for loop" << std::endl;
+  uint64_t iter = 0;
   for (auto _ : state) {
+    iter++;
     if (solux::unit_tests) {
+      // Under clang debug, if we pause timing, it causes things to get very slow.
+
+      // std::cout << "\tBM_Postings PauseTiming" << std::endl;
+      // state.PauseTiming();  // PauseTiming and ResumeTiming are very slow (~200ns)! Don't use in conjunction with anything fast!
       // add a new different index each time if we are running unit tests
-      state.PauseTiming();  // PauseTiming and ResumeTiming are very slow (~200ns)! Don't use in conjunction with anything fast!
-      seg.initWriter();
-      seg.addFields(false, 1, nTerms, nDocs, nPosPerDoc);
-      seg.initReader();
-      state.ResumeTiming();
+      // seg = std::make_unique<solux::SegmentTest>();
+      // seg->r.init(solux::SoluxTest::rng());
+      seg->initWriter();
+      seg->addFields(false, 1, nTerms, nDocs, nPosPerDoc);
+      seg->initReader();
+      //      state.ResumeTiming();
+      // std::cout << "\tBM_Postings ResumeTiming" << std::endl;
     }
 
     uint64_t fingerprint = 1;
-    benchmark::DoNotOptimize( std::tie(fingerprint, tterms, tdocs, tpos) = seg.readFingerprint(percentReadPos) );
+    benchmark::DoNotOptimize( std::tie(fingerprint, tterms, tdocs, tpos) = seg->readFingerprint(percentReadPos) );
     // benchmark::DoNotOptimize(fingerprint); // this causes fingerprint to be 0???? (when I tie'd directly to seg.readFingerprint()) compiler bug?
     benchmark::ClobberMemory();
     if (percentReadPos >= 100) {
-      ASSERT_EQ(seg.fingerprint, fingerprint);
+      ASSERT_EQ(seg->fingerprint, fingerprint);
       ASSERT_EQ(nTerms * nDocs * nPosPerDoc, tpos);
     }
     ASSERT_EQ(tdocs, nDocs * nTerms);
     ASSERT_EQ(tterms, nTerms);
+    // std::cout << "\tterms=" << tterms << " docs=" << tdocs << " pos=" << tpos << std::endl;
   }
 
   state.counters["terms"] = tterms;
   state.counters["docs"] = tdocs;
   state.counters["pos"] = tpos;
+
+  // std::cout << "\tBM_Postings END iter=" << iter << std::endl;
+  solux::unused(iter);
 }
 
 

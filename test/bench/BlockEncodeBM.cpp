@@ -57,13 +57,13 @@ static void BM_blockDecode(benchmark::State& state, std::string codecName, bool 
 
   for (auto _ : state) {
     if (solux::unit_tests) {
-      state.PauseTiming();  // Only use in unit tests or slow tests!  See BenchTimer
+      // state.PauseTiming();  // Only use in unit tests or slow tests!  See BenchTimer
       fillBlock(rng, &values[0], (uint32_t) values.size(), sorted);
       // some codecs modify the input array (calculating deltas in place), so make a copy.
       orig = values;
       encodedSz = encoded.size();
       codec->encodeBlock(&values[0], values.size(), &encoded[0], encodedSz);
-      state.ResumeTiming();
+      // state.ResumeTiming();
     }
 
     decodedSz = decoded.size();
@@ -72,10 +72,10 @@ static void BM_blockDecode(benchmark::State& state, std::string codecName, bool 
     benchmark::ClobberMemory();
 
     if (solux::unit_tests) {
-      state.PauseTiming();
+      // state.PauseTiming();
       ASSERT_EQ(nvalues, decodedSz);
       ASSERT_EQ(orig, decoded);
-      state.ResumeTiming();
+      // state.ResumeTiming();
     }
   }
 

@@ -51,9 +51,18 @@ public:
   }
 
   void initWriter() {
-    fingerprint = 0;
-    pool.rewind(save);
     dir = RAMDir();  // remove all files?
+
+    writer.release();
+    reader.release();
+    fieldReader.release();
+    tenum.release();
+    docsEnum.release();
+
+    pool.rewind(save);
+
+    fingerprint = 0;
+
     writer = std::make_unique<PostingsWriter>(dir, "10");
 
     // save the RNG state
