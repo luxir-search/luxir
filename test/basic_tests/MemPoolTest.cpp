@@ -25,6 +25,9 @@ TEST_F(MemPoolTest, rewind) {
   pool.rewind(savePoint);
   // check that the size matches again
   ASSERT_EQ(sz, pool.size());
+
+
+
 #ifndef MEMPOOL_MALLOC
   char* bb = pool.allocate(3);
   ASSERT_EQ(b, bb);
@@ -36,6 +39,19 @@ TEST_F(MemPoolTest, rewind) {
 #else
   // not much to check if we are using malloc
 #endif
+
+
+  // now a scope guard
+  sz = pool.size();
+  {
+    auto guard = pool.rewindScopeGuard();
+    char* x = pool.allocate(3);
+    *x = 'x';
+    char* y = pool.allocate(4);
+    *y = 'y';
+    ASSERT_GT(pool.size(), sz);
+  }
+  ASSERT_EQ(pool.size(), sz);
 }
 
 TEST_F(MemPoolTest, randRewind) {

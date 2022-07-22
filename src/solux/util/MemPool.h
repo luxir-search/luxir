@@ -244,6 +244,26 @@ public:
 #endif
   }
 
+  class ScopeGuard {
+    MemPool& pool;
+    save_point savePoint;
+  public:
+    explicit ScopeGuard(MemPool& pool, const save_point& savePoint) : pool(pool), savePoint(savePoint){}
+    explicit ScopeGuard(MemPool& pool) : pool(pool), savePoint(pool.getSavePoint()){}
+    ~ScopeGuard() {
+      pool.rewind(savePoint);
+    }
+    ScopeGuard(const ScopeGuard&) = delete;
+    ScopeGuard(ScopeGuard&&) = delete;
+    ScopeGuard& operator=(const ScopeGuard&) = delete;
+    ScopeGuard& operator=(ScopeGuard&&) = delete;
+  };
+
+  ScopeGuard rewindScopeGuard() {
+    return ScopeGuard(*this);
+  }
+
+
   void nextBuffer();
 };
 
