@@ -53,11 +53,11 @@ public:
   void initWriter() {
     dir = RAMDir();  // remove all files?
 
-    writer.release();
-    reader.release();
-    fieldReader.release();
-    tenum.release();
-    docsEnum.release();
+    docsEnum.reset();
+    tenum.reset();
+    fieldReader.reset();
+    writer.reset();
+    reader.reset();
 
     pool.rewind(save);
 

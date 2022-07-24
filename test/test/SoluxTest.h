@@ -58,8 +58,8 @@ public:
   static Rng rng;
   static uint64_t rng_seed;
 
-  // Thread safe delayed creation of the executor
-  tf::Executor& executor() {
+  // Thread safe delayed creation of the taskflow executor
+  static tf::Executor& executor() {
     std::call_once(initExecutorFlag,[]{tfExecutor = std::make_unique<tf::Executor>(); });
     return *tfExecutor.get();
   }

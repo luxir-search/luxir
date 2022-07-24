@@ -47,10 +47,11 @@ namespace solux {
 SOLUX_PACKED_START
 class DocStream {
 public:
+  Stream stream;
   int lastDoc;
   int runStart;   // start of the current run
   int prevRunEnd; // end of the previous run
-  Stream stream;
+
 
   DocStream(MemPool &pool) : lastDoc(-1), runStart(0), prevRunEnd(-1) {
     unused(pool);

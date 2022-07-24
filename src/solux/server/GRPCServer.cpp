@@ -15,8 +15,8 @@
 using namespace solux;
 
 
-GRPCServer::GRPCServer()
-  : startLatch(1) {
+GRPCServer::GRPCServer(int nthreads)
+  : startLatch(1), startLatchThreads(nthreads), nthreads(nthreads) {
 }
 
 // NOTE: as of gRPC 1.39 there is a new C++ async callback API: https://github.com/grpc/grpc/pull/25728 in addition to an EventEngine
@@ -37,8 +37,6 @@ void solux::GRPCServer::run() {
   builder.RegisterService(&indexerService);
   builder.RegisterService(&searcherService);
 
-  int nthreads = std::max(1u, std::thread::hardware_concurrency());
-  nthreads = 2; // TODO TODO TODO FIXME: delete this line in the future... this is just to lower the number of threads to make debugging easier
   threads.reserve(nthreads);
   threadInfos.reserve(nthreads);
 
@@ -448,9 +446,7 @@ public:
 
 void GRPCServer::runThread(ThreadInfo& threadInfo) {
   // wait for the server to start before trying to use it.
-  if (!waitForStart()) {
-    return;
-  };
+  startLatch.wait();
 
   // Used to test that a client request will still be handled correctly if it comes in before we've registered the calls
   // std::this_thread::sleep_for (std::chrono::seconds(10));
@@ -462,6 +458,15 @@ void GRPCServer::runThread(ThreadInfo& threadInfo) {
   new IndexerUpdateCall(*this, indexerService, threadInfo);
   new IndexerUpdateStreamingCall(*this, indexerService, threadInfo);
   new SearcherSearchStreamingCall(*this, searcherService, threadInfo);
+
+  /*
+   * This startLatchThreads was added because shutting down the server very quickly would generate this failed assertion:
+   * E0723 22:24:54.308864118 3078 server_cc.cc:216]  assertion failed: grpc_server_request_registered_call( server_->server(), registered_method, &call_, &context_->deadline_, context_->client_metadata_.arr(), payload, call_cq_->cq(), notification_cq->cq(), this) == GRPC_CALL_OK
+   * It only happened in release mode (not debug mode) presumably because of timing.  Now GRPCServer::waitForStart()
+   * waits for the calls to be registered into the completion queue before signalling that we are ready.
+   * Best guess is that it was these registrations that were failing after the competion queue was shut down.
+   */
+  startLatchThreads.count_down(); // signal that we registered calls
 
   while (true) {
     void* tag;  // uniquely identifies a request.
@@ -489,7 +494,7 @@ void GRPCServer::runThread(ThreadInfo& threadInfo) {
 
 
 bool GRPCServer::waitForStart() {
-  startLatch.wait();
+  startLatchThreads.wait();
   return true;
 }
 

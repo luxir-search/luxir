@@ -262,7 +262,6 @@ public:
 
 
 protected:
-
   void writeBytes(void* ptr, uint32_t nbytes) {
     out.write(ptr, nbytes);
   }
