@@ -191,6 +191,15 @@ static uint64_t allocFree(int iterations, int taskno, Allocator& allocator) {
   return info;
 };
 
+// minimal work to test that threading isn't introducing too much overhead
+template <class Allocator>
+static uint64_t allocFreeDummy(int iterations, int taskno, Allocator& allocator) {
+  char* ptr = (char*)allocator.allocate(1);
+  uint64_t ret = (uint64_t)ptr;
+  allocator.deallocate(ptr,1);
+  return ret + taskno + iterations;
+}
+
 template <typename Allocator>
 inline void benchAllocFree(benchmark::State& state) {
   auto numThreads = state.range(0);
@@ -205,6 +214,7 @@ inline void benchAllocFree(benchmark::State& state) {
     allocators.emplace_back(std::make_unique<Allocator>());
     auto task = taskflow.emplace(
             [&,i](){allocFree<Allocator>(iterations, i, *allocators[i]);}
+            // [&,i](){allocFreeDummy<Allocator>(iterations, i, *allocators[i]);}
     );
     task.precede(doneTask);
   }

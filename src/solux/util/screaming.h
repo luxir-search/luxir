@@ -4,6 +4,8 @@
 #include <vector>
 #include <bit>
 #include <cstring>
+#include <memory_resource>
+#include <sstream>
 #include <assert.h>
 
 
@@ -37,8 +39,8 @@ namespace screaming {
 // word_type and index_type must be unsigned types.
 // Example  OpenBitSet<65536, uint64_t, uint32_t> mySet;
 //
-// As no bounds checking is done, this can also be used as the basis for dynamically sized bitsets
-// (just avoid using any methods that rely on size)
+// This can also be used as the basis for dynamically sized bitsets, just
+// don't use methods that rely on size.
 template <uint64_t size_, typename word_type_, typename index_type_>
 class OpenBitSet {
 public:
@@ -48,34 +50,64 @@ public:
   static constexpr index_type sizeInBytes = size / 8;
   static constexpr index_type numWords = sizeInBytes / sizeof(word_type);
   // number of bits to shift to get the word index. std::bit_width is 1+log2(x), so sub 1 to get back to log2(x)
-  static constexpr uint8_t wordShift = std::bit_width(sizeof(word_type) * 8) - 1;
-  static constexpr word_type wordMask = sizeof(word_type) * 8 - 1;     // mask to get the index within a word
+  static constexpr uint8_t wordShift = std::bit_width(sizeof(word_type) * 8) - 1; // shift to get word of index
+  static constexpr word_type wordMask = sizeof(word_type) * 8 - 1;     // mask to get the bit index within a word
   static constexpr word_type allBitsSet = ~((word_type)(0));
-
+  static constexpr index_type MAX_INDEX = std::numeric_limits<index_type>::max();  // maximum value for the index type
   word_type* words;
+
+  OpenBitSet() = default;  // trivial constructor so this can be part of a union
 
   // Create a bitset view over existing memory.
   explicit OpenBitSet(word_type* pointer) : words(pointer) {
   }
 
+
   void set(index_type val) {
+    assert(val < size);
     index_type wordIdx = val >> wordShift;
     uint8_t bitIdx = val & wordMask;
-    words[wordIdx] |= (1 << bitIdx);
+    words[wordIdx] |= (word_type)1 << bitIdx;
   }
 
-  bool get(index_type val) {
+  bool get(index_type val) const {
+    assert(val < size);
     index_type wordIdx = val >> wordShift;
     uint8_t bitIdx = val & wordMask;
-    return words[wordIdx] & (1 << bitIdx);
+    return words[wordIdx] & ((word_type)1 << bitIdx);
   }
 
   // returns 0 or 1
-  int getInt(index_type val) {
+  int getInt(index_type val) const {
+    assert(val < size);
     index_type wordIdx = val >> wordShift;
     uint8_t bitIdx = val & wordMask;
     return (words[wordIdx] >> bitIdx) & 0x01;
   }
+
+
+  // Returns the next set bit or MAX_INDEX if none exists.
+  index_type nextSetBit(index_type val) const {
+    assert(val < size);
+    index_type wordIdx = val >> wordShift;
+    uint8_t bitIdx = val & wordMask;
+    word_type word = words[wordIdx] >> bitIdx;
+
+    if (word != 0) {
+      return  val + std::countr_zero(word);
+    }
+
+    for (auto i = wordIdx + 1; i < numWords; i++) {
+      word = words[i];
+      if (word != 0) {
+        auto foundIdx = std::countr_zero(word);
+        return (i << wordShift) + foundIdx;
+      }
+    }
+
+    return MAX_INDEX;
+  }
+
 
   void clear() {
     std::memset(words, 0, sizeInBytes);
@@ -89,7 +121,7 @@ public:
 
   // These are static so they can be used more easily in other contexts, with different offsets, etc.
   template <class Callable>
-  static void visitZeroes(word_type* words, index_type numWords, Callable callable) {
+  static void visitZeroes(const word_type* words, index_type numWords, Callable callable) {
     for (index_type i=0; i<numWords; i++) {
       word_type word = ~words[i];  // flip bits and find the ones
       uint8_t bitIdx = 0;
@@ -103,7 +135,7 @@ public:
   }
 
   template <class Callable>
-  static void visitOnes(word_type* words, index_type numWords, Callable callable) {
+  static void visitOnes(const word_type* words, index_type numWords, Callable callable) {
     for (index_type i=0; i<numWords; i++) {
       word_type word = words[i];
       uint8_t bitIdx = 0;
@@ -120,8 +152,11 @@ public:
 
 
 // The Screaming Bitset read-only implementation.  Use screaming::Builder to build one.
-// Hmmm, we could also allow the creation of iterators from a bare pointer.  Perhaps this
-// class should be optional, but cache things that iterators may need?
+// This is currently limited to int32 indexes, hence only supports 2^31-1 bits.
+// The largest value is reserved for NO_VALUE.
+// We use a signed integer here to avoid unsigned bugs and for code that is simpler when
+// there is a value below the first "real" value (i.e. iterators can be started at -1)
+// and when the sentinel for NO_VALUE is above all other values.
 class BitSet {
 public:
   static constexpr uint8_t  BUCKET_BITS = 16;
@@ -129,6 +164,8 @@ public:
   static constexpr uint32_t BUCKET_SPARSE_MAX = BUCKET_SIZE / 8 / sizeof(uint16_t);   // max cardinality to express as sparse bucket
   static constexpr uint32_t BUCKET_NEG_MIN = BUCKET_SIZE - BUCKET_SIZE / 8; // min cardinality to express as neg set
   using Bits = OpenBitSet<BUCKET_SIZE, uint64_t, uint32_t>; // type for the bits only of a bit bucket
+  static constexpr int32_t NO_VALUE = std::numeric_limits<int32_t>::max();
+
 
   typedef struct {
     uint16_t upperBits; // upper 16 bits of all values in this bucket
@@ -136,27 +173,167 @@ public:
     uint32_t offset;    // location of the data for this bucket
   } BucketDescriptor;
 
-
+  char* start;
+  BucketDescriptor* descriptors;
   uint16_t nBuckets;
 
 
-  typedef struct SPARSE_BUCKET {
+  explicit BitSet(void* pointerToEnd) {
+    nBuckets = *((uint16_t*)pointerToEnd - 1);
+    descriptors = (BucketDescriptor*)((char*)pointerToEnd - sizeof(uint16_t) - nBuckets * sizeof(BucketDescriptor));
+    // the size of all the buckets is the offset of the last bucket plus the size of that bucket
+    auto lastDescriptor = descriptors[nBuckets - 1];
+    auto sizeOfAllBuckets = lastDescriptor.offset + blockBytes(lastDescriptor);
+    start = ((char*)descriptors) - sizeOfAllBuckets;
+  }
+  /*
+  BitSet(const BitSet& other) = default;
+  BitSet& operator=(const BitSet& other) = default;
+*/
+
+
+
+  class Iterator {
+    // const BitSet& set;
+    const BitSet* set;
+    int32_t curr = -1;
+    int32_t bucketIdx = -1;
+    uint32_t bucketBase;
+    int32_t bucketSize = 0;
+    uint16_t lowerBits;
+
+    typedef struct {
+      uint16_t* values;
+      int32_t index;
+    } SparseBucket;
+
+    typedef struct {
+      Bits obs;
+      // future: try caching currentword
+      // Bits::word_type currWord;
+      // uint16_t wordIdx;
+      // uint8_t wordShift;  // how much currWord as been right shifted already
+    } DenseBucket;
+
+    union Bucket {
+      SparseBucket sparse;
+      DenseBucket bits;
+    } bucket;
+
+    // enum that takes 16 bits
+    enum BucketType : std::uint8_t
+    {
+      SPARSE,
+      DENSE,
+      NEGATIVE
+    };
+
+    BucketType bucketType;
+
+  public:
+    Iterator(const BitSet& set) : set(&set) {
+      bucketType = SPARSE;
+      bucket.sparse.index = -1;
+    }
+
+    int32_t val() {
+      return curr;
+    }
+
+    int32_t next() {
+      switch (bucketType) {
+        case SPARSE:
+          if (bucket.sparse.index + 1 >= bucketSize) {  // this will trigger on first call
+            return nextBucket();
+          }
+          return sparseNext();
+        case DENSE:
+          return denseNextMaybe();
+      }
+    }
+
+    int32_t advance(int32_t target) {
+      return -1;
+    }
+
+
+    // only valid if we are in a sparse bucket and there are more values to read in that bucket
+    int32_t sparseNext() {
+      uint16_t nextInBucket = bucket.sparse.values[++bucket.sparse.index];
+      curr = bucketBase + nextInBucket;
+      return curr;
+    }
+
+    // only valid if we are within a bitset bucket and there are more values
+    int32_t denseNext() {
+      auto localIndex = uint16_t(curr + 1);
+      // if localIndex==0 then we wrapped
+      auto localFound = bucket.bits.obs.nextSetBit(localIndex);
+      curr = localFound + bucketBase;
+      return curr;
+    }
+
+    // only valid if we are within a bitset bucket, but we don't know if there is another value in this bucket
+    // and may have to advance to the next bucket to get it.
+    int32_t denseNextMaybe() {
+      auto localIndex = uint16_t(curr + 1);
+      // if localIndex==0 then we wrapped
+      auto localFound = localIndex == 0 ? Bits::MAX_INDEX : bucket.bits.obs.nextSetBit(localIndex);
+      if (localFound != Bits::MAX_INDEX) {
+        curr = localFound + bucketBase;
+        return curr;
+      }
+      return nextBucket();
+    }
+
+
+  protected:
+    int32_t nextBucket() {
+      if (bucketIdx+1 >= set->nBuckets) {
+        curr = NO_VALUE;
+        return curr;
+      }
+      bucketIdx++;
+      BucketDescriptor& desc = set->descriptors[bucketIdx];
+      bucketBase = desc.upperBits << BUCKET_BITS;
+      bucketSize = desc.size + 1;
+      if (bucketSize <= BUCKET_SPARSE_MAX) {
+        bucketType = SPARSE;
+        bucket.sparse.index = -1;
+        bucket.sparse.values = (uint16_t*)(set->start + desc.offset);
+        return sparseNext();
+      } else {
+        bucketType = DENSE;
+ // nocommit - make this an immutable object?
+        bucket.bits.obs.words = (Bits::word_type*)(set->start + desc.offset);
+        curr = bucketBase - 1;
+        return denseNext();
+      }
+    }
 
   };
 
 
 
-  BitSet(void* pointerToEnd) {
-    nBuckets = *((uint16_t*)pointerToEnd - 1);
-  }
 
+protected:
+
+  // the number of bytes taken up by a block
+  int blockBytes(const BucketDescriptor& desc) {
+    int sz = (int)desc.size + 1;
+    if (sz <= BUCKET_SPARSE_MAX) {
+      return sz * sizeof(uint16_t);
+    } else {
+      return BUCKET_SIZE / 8;
+    }
+  }
 
 };
 
 
 
 
-// TODO: make a base class / derived class so we can change the flushing mechanism.
+template <class Derived>
 class Builder {
 public:
   using Bits = BitSet::Bits;
@@ -166,16 +343,15 @@ protected:
   using BucketDescriptor = BitSet::BucketDescriptor;
 
   // number of bucket descriptors per scratch buffer
-  const uint32_t maxDescriptors = (SCRATCH_SIZE - sizeof(char*)) / sizeof(BucketDescriptor);
 
   uint16_t *values;
   Bits bits;
 
-
   uint32_t currBucket = 0;
   uint32_t bucketSize = 0;  // number of values in the current bucket
   uint32_t totalCard = 0;   // total cardinality of the set so far
-  int bucketIdx = -1;       // index of the bucket descriptor within the current scratch space
+  uint32_t numBuckets = 0;  // number of flushed buckets
+  uint32_t bucketIdx = 0;   // index of the bucket descriptor within the current scratch space
 
   uint32_t bucketStart = 0;
 
@@ -183,26 +359,31 @@ protected:
   void* startScratch;    // the first scratch buffer
   void* scratch;         // the current scratch buffer
   uint32_t scratchSize;  // size of each scratch buffer
+  const uint32_t maxDescriptors;
+
 public:
   Builder(void* buf8192_a, void* buf8192_b, void* scratchBuf, uint32_t scratchSize) :
-         maxDescriptors((scratchSize - sizeof(char*)) / sizeof(BucketDescriptor)),
          values((uint16_t*)buf8192_a),
          bits((Bits::word_type*)buf8192_b),
          startScratch(scratchBuf),
          scratch(scratchBuf),
-         scratchSize(scratchSize) {
+         scratchSize(scratchSize),
+         maxDescriptors((scratchSize - sizeof(char*)) / sizeof(BucketDescriptor))
+         {
 
 
 
 
   }
 
-  void add(uint32_t val) {
+  void add(int32_t val) {
     auto bucket = val >> BitSet::BUCKET_BITS;
     auto lowerBits = (uint16_t)val;
     if (bucket != currBucket) {
-      assert(currBucket > bucket);
+      assert(bucket > currBucket);
       flushBucket();
+      currBucket = bucket;
+      bucketSize = 0;
     }
     if (bucketSize >= BitSet::BUCKET_SPARSE_MAX) {
       // start using bitmap instead
@@ -217,6 +398,50 @@ public:
     totalCard++;
   }
 
+
+  // flushes and returns the total size of the compressed bitset
+  uint32_t flush() {
+    flushBucket();
+
+    uint32_t descriptorStart = bucketStart; // offset of where we are writing descriptors
+    uint32_t totalSize = bucketStart;
+
+    // write bucket descriptors
+    void* scratchBuf = startScratch;
+    for (int nDescriptors = 0; nDescriptors < numBuckets; nDescriptors += maxDescriptors) {
+      auto descriptorsInBuffer = std::min(maxDescriptors, numBuckets - nDescriptors);
+      uint32_t writeSize = descriptorsInBuffer * sizeof(BucketDescriptor);
+      write(scratchBuf, writeSize);
+      totalSize += writeSize;
+      void* tmp = scratchBuf;
+      if (scratchBuf != scratch) {
+        // not at the last buffer yet, so follow link at the end of this buffer
+        scratchBuf = *(void**)((char*)scratchBuf + scratchSize - sizeof(char*));
+      }
+      if (tmp != startScratch) {
+        // deallocate all but the first start scratch buffer
+        static_cast<Derived*>(this)->deallocateScratch(tmp);
+      }
+    }
+
+    // Last, write the number of buckets.  TODO: what about 65536 buckets?
+    // Should this be coded as numBuckets-1 as well?  That means we can't represent 0 buckets.
+    // We could also handle by using 65535 to represent both 65535 and 65536 and writing a dummy
+    // bucket at the end to distinguish.  Or we could use the passed in cardinality and say that
+    // 0 is not a valid set.
+    uint16_t shortNumBuckets = numBuckets;
+    write(&shortNumBuckets, sizeof(uint16_t));
+    totalSize += sizeof(uint16_t);
+
+    return totalSize;
+  }
+
+
+protected:
+  void write(void *ptr, uint32_t nbytes) {
+    static_cast<Derived*>(this)->writeBytes(ptr, nbytes);
+  }
+
   void flushBucket() {
     if (bucketSize == 0) {
       // this can happen if nothing was added for the first bucket.
@@ -226,13 +451,14 @@ public:
     uint32_t writeSize = 0;
 
     // find space for our bucket descriptor
-    if (++bucketIdx >= maxDescriptors) {
+    if (bucketIdx >= maxDescriptors) {
       auto oldScratch = scratch;
-      scratch = allocateScratch();
-      *(char**)((char*)oldScratch + scratchSize - sizeof(char*)) = scratch;  // link old block to new block
+      scratch = static_cast<Derived*>(this)->allocateScratch();
+      *(void**)((char*)oldScratch + scratchSize - sizeof(char*)) = scratch;  // link old block to new block
       bucketIdx = 0;
     }
     BucketDescriptor& desc = ((BucketDescriptor*)scratch)[bucketIdx];
+    bucketIdx++;
     desc.upperBits = currBucket;
     desc.size = bucketSize - 1;
     desc.offset = bucketStart;
@@ -240,37 +466,70 @@ public:
     if (bucketSize <= BitSet::BUCKET_SPARSE_MAX) {
       // TODO: if (nVals <= 2) {}
       writeSize = bucketSize * sizeof(uint16_t);
-      writeBytes((void *) values, writeSize);
+      write((void *) values, writeSize);
     } else {
       // fill in the rest of the bits from the buffered values
-      for (uint32_t i=0; i < bucketSize; i++) {
-        bits.set(currBucket + values[i]);
+      for (uint32_t i=0; i < BitSet::BUCKET_SPARSE_MAX; i++) {
+        bits.set(values[i]);
       }
 
       // TODO: store as negative set if too big
       writeSize = Bits::sizeInBytes;
-      writeBytes((void *) bits.words, writeSize);
+      write((void *) bits.words, writeSize);
     }
 
+    numBuckets++;
     bucketStart += writeSize;
     bucketSize = 0;
   }
 
-  void flush() {
+
+  /* functions that need to be implemented by derived class
+  void writeBytes(void* ptr, uint32_t nbytes) {
   }
 
+  // return a new buffer of size scratchSize, used to keep track of bucket info
+  // until flush() is called.
+  void* allocateScratch() {
+  }
+  */
+};
 
+class StringStreamBuilder : public Builder<StringStreamBuilder> {
+  friend class Builder;
+  std::pmr::memory_resource* resource;
+  std::ostringstream& out;
+public:
+  explicit StringStreamBuilder(std::ostringstream& target, std::pmr::memory_resource* resource = std::pmr::get_default_resource()) :
+          Builder(resource->allocate(8192), resource->allocate(8192), resource->allocate(SCRATCH_SIZE), SCRATCH_SIZE),
+          resource(resource),
+          out(target)
+  {
+  }
+
+  ~StringStreamBuilder() {
+    resource->deallocate(startScratch, SCRATCH_SIZE);
+    resource->deallocate(bits.words, 8192);
+    resource->deallocate(values, 8192);
+  }
 
 protected:
-  void writeBytes(void* ptr, uint32_t nbytes) {
-    out.write(ptr, nbytes);
+  // only for use by base class
+  void writeBytes(void *ptr, uint32_t nbytes) {
+    out.write((char*)ptr, nbytes);
   }
 
-  // return a new buffer of size Builder::SCRATCH_SIZE, used to keep track of bucket info
-  // until flush() is called.
-  char* allocateScratch() {
+  void *allocateScratch() {
+    return resource->allocate(scratchSize);
   }
+
+  void deallocateScratch(void* ptr) {
+    resource->deallocate(ptr, scratchSize);
+  }
+
 };
+
+
 
 
 }
