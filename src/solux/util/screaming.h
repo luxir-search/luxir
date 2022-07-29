@@ -57,6 +57,8 @@ public:
   word_type* words;
 
   OpenBitSet() = default;  // trivial constructor so this can be part of a union
+  OpenBitSet(const OpenBitSet& other) = default;
+  OpenBitSet& operator=(const OpenBitSet& other) = default;
 
   // Create a bitset view over existing memory.
   explicit OpenBitSet(word_type* pointer) : words(pointer) {
@@ -164,7 +166,7 @@ public:
   static constexpr uint32_t BUCKET_SPARSE_MAX = BUCKET_SIZE / 8 / sizeof(uint16_t);   // max cardinality to express as sparse bucket
   static constexpr uint32_t BUCKET_NEG_MIN = BUCKET_SIZE - BUCKET_SIZE / 8; // min cardinality to express as neg set
   using Bits = OpenBitSet<BUCKET_SIZE, uint64_t, uint32_t>; // type for the bits only of a bit bucket
-  static constexpr int32_t NO_VALUE = std::numeric_limits<int32_t>::max();
+  static constexpr int32_t END = std::numeric_limits<int32_t>::max();
 
 
   typedef struct {
@@ -173,12 +175,12 @@ public:
     uint32_t offset;    // location of the data for this bucket
   } BucketDescriptor;
 
-  char* start;
-  BucketDescriptor* descriptors;
+  const char* start;
+  const BucketDescriptor* descriptors;
   uint16_t nBuckets;
 
 
-  explicit BitSet(void* pointerToEnd) {
+  explicit BitSet(const void* pointerToEnd) {
     nBuckets = *((uint16_t*)pointerToEnd - 1);
     descriptors = (BucketDescriptor*)((char*)pointerToEnd - sizeof(uint16_t) - nBuckets * sizeof(BucketDescriptor));
     // the size of all the buckets is the offset of the last bucket plus the size of that bucket
@@ -218,6 +220,7 @@ public:
     union Bucket {
       SparseBucket sparse;
       DenseBucket bits;
+      Bucket(){};
     } bucket;
 
     // enum that takes 16 bits
@@ -236,7 +239,7 @@ public:
       bucket.sparse.index = -1;
     }
 
-    int32_t val() {
+    int32_t val() const {
       return curr;
     }
 
@@ -290,11 +293,11 @@ public:
   protected:
     int32_t nextBucket() {
       if (bucketIdx+1 >= set->nBuckets) {
-        curr = NO_VALUE;
+        curr = END;
         return curr;
       }
       bucketIdx++;
-      BucketDescriptor& desc = set->descriptors[bucketIdx];
+      const BucketDescriptor& desc = set->descriptors[bucketIdx];
       bucketBase = desc.upperBits << BUCKET_BITS;
       bucketSize = desc.size + 1;
       if (bucketSize <= BUCKET_SPARSE_MAX) {
@@ -304,8 +307,7 @@ public:
         return sparseNext();
       } else {
         bucketType = DENSE;
- // nocommit - make this an immutable object?
-        bucket.bits.obs.words = (Bits::word_type*)(set->start + desc.offset);
+        bucket.bits.obs = Bits((Bits::word_type*)(set->start + desc.offset));
         curr = bucketBase - 1;
         return denseNext();
       }
@@ -509,7 +511,7 @@ public:
 
   ~StringStreamBuilder() {
     resource->deallocate(startScratch, SCRATCH_SIZE);
-    resource->deallocate(bits.words, 8192);
+    resource->deallocate((void *) bits.words, 8192);
     resource->deallocate(values, 8192);
   }
 

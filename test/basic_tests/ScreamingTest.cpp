@@ -1,0 +1,293 @@
+
+#include <gtest/gtest.h>
+#include <iostream>
+#include <vector>
+#include "test/SoluxTest.h"
+#include "solux/util/screaming.h"
+
+using namespace solux;
+
+class ScreamingTest : public solux::SoluxTest {
+public:
+
+  // Utility class to make it easier to test screaming bitset
+  class SetStuff {
+  public:
+    Rng rng;
+    std::ostringstream out;
+    screaming::StringStreamBuilder builder;
+    std::string resultStr;
+    size_t numBytes;
+    const char* ptrToEnd;
+    std::vector<screaming::BitSet::Bits::word_type> buf;  // used by obs
+    screaming::BitSet::Bits obs;  // 64K small bit set
+    std::unique_ptr<screaming::BitSet> bitset;
+    std::unique_ptr<screaming::BitSet::Iterator> iter;
+    uint64_t addHash = 1;
+    int base = 0; // the base of the current bucket
+    int curr = -1;  // the current value added
+    int nAdds = 0;
+
+    SetStuff(const Rng& rng = SoluxTest::rng) : rng(rng), builder(out) {
+      buf.resize(screaming::BitSet::Bits::numWords);
+      obs = screaming::BitSet::Bits(&buf[0]);
+    }
+
+    void add(int val) {
+      if (val <= curr || val == 0x7fffffff) return;
+      curr = val;
+      addHash = addHash * 31 + val;
+      builder.add(val);
+      nAdds++;
+    }
+
+    bool nextBucket(int nbuckets = 1) {
+      int newBase = base + 0x00010000 * nbuckets;
+      if (newBase < 0) {
+        return false;
+      }
+      base = newBase;
+      return true;
+    }
+
+    int bucketMax() {
+      return base | 0x0ffff;
+    }
+
+    int leftInBucket() {
+      return bucketMax() - curr;
+    }
+
+    void addInBucket() {
+      if (leftInBucket() > 0) {
+        add(curr + 1 + rng.rint(leftInBucket()));
+      }
+    }
+
+    void addSmallBucket() {
+      // either small or big type of sparse buckets to better test boundaries
+      int card = rng.rbool() ? rng.rint(1,5) : (int)(screaming::BitSet::BUCKET_SPARSE_MAX - rng.rint(3));
+      addSmallBucket(card);
+    }
+
+    // This also works for buckets that are slightly bigger than a sparse bucket (to test that boundary)
+    void addSmallBucket(int cardinality) {
+      if (base < 0) return;
+      auto card = cardinality;
+      int r = rng.rint(100);
+      if (r<5) {  // 5% of the time, start near first value
+        add(base + rng.rint(1,3));
+        --card;
+        if (r<10) --card;  // account for last value
+      }
+
+      for (int i=0; i<card; i++) {
+        auto gap = rng.rint(1, 65536/cardinality);
+        add(curr + gap);
+      }
+
+      if (r>=5 && r < 10) { // 5% of the time, end around highest value
+        add(bucketMax() - rng.rint(3));
+      }
+
+      nextBucket();
+    }
+
+
+    // TODO: add a mostly full bucket...
+    void addBucket() {
+      int r = rng.rint(100);
+      if (r<50) {
+        addSmallBucket();
+      } else {
+        if (r < 60) {
+          // just over the number of entries to transition to a bitmap
+          int card = (int) (screaming::BitSet::BUCKET_SPARSE_MAX + 1 + rng.rint(3));
+          addSmallBucket(card);
+        } else {
+          // random bucket
+          addMidBucket();
+        }
+      }
+    }
+
+    void addMidBucket() {
+      if (base < 0) return;
+      // fill bitset word at a time
+      for (auto& elem : buf) {
+        elem = rng() & rng() & rng();   // ~12.5% of the bits set, to speed up processing
+      }
+
+      // since zero words have special handling in bitsets, zero out a random word or two (esp near beginning or end)
+      if (rng.rbool()) {
+        buf[rng.rint(2)] = 0;
+      }
+      if (rng.rbool()) {
+        buf[buf.size() - 1 - rng.rint(2)] = 0;
+      }
+
+      // now iterate over bits and add to our builder
+      int val = -1;
+      for(;val < (int)screaming::BitSet::Bits::size - 1;) {
+        val = (int)obs.nextSetBit(val + 1);
+        if (val == (int)screaming::BitSet::Bits::MAX_INDEX) break;
+        add(base + val);
+      }
+
+      nextBucket();
+    }
+
+
+    screaming::BitSet& finishBuild() {
+      numBytes = builder.flush();
+      resultStr = out.str();
+      // ASSERT_EQ(numBytes, resultStr.size());   // can't use ASSERT_EQ in this context
+      EXPECT_EQ(numBytes, resultStr.size());
+      ptrToEnd = resultStr.c_str() + resultStr.size();
+      bitset = std::make_unique<screaming::BitSet>(ptrToEnd);
+      iter = std::make_unique<screaming::BitSet::Iterator>(*bitset);
+      return *bitset;
+    }
+
+    bool verifyIterator() {
+      int card = 0;
+      uint64_t itHash = 1;
+      screaming::BitSet::Iterator it(*bitset);
+      for(;;) {
+        auto val = it.next();
+        if (val == screaming::BitSet::END) break;
+        itHash = itHash * 31 + val;
+        card++;
+      }
+      EXPECT_EQ(card, nAdds);
+      // std::cout << "nAdds=" << nAdds << std::endl;
+      EXPECT_EQ(addHash, itHash);
+      return addHash == itHash;
+    }
+  };
+
+
+};
+
+TEST_F(ScreamingTest, basic) {
+  std::ostringstream ss;
+  screaming::StringStreamBuilder builder(ss);
+  builder.add(0xabcdef);
+  auto nbytes = builder.flush();
+  std::string result = ss.str();
+  // std::cout << "Screaming bitset size = " << nbytes << std::endl;
+  ASSERT_EQ(result.size(), nbytes);
+
+  void* ptrToEnd = (void*)(result.c_str() + result.size());
+  screaming::BitSet bs(ptrToEnd);
+
+  screaming::BitSet::Iterator iter(bs);
+  ASSERT_EQ(iter.val(), -1); // start off at -1
+  ASSERT_EQ(iter.next(), 0xabcdef);
+  ASSERT_EQ(iter.val(), 0xabcdef);
+  ASSERT_EQ(iter.next(), screaming::BitSet::END);
+  ASSERT_EQ(iter.val(), screaming::BitSet::END);
+
+  // every other bit set for a dense test
+  std::ostringstream buf;
+  screaming::StringStreamBuilder bld(buf);
+  for (int i=0; i<65536; i+= 2) {
+    bld.add(i);
+  }
+  nbytes = bld.flush();
+  result = buf.str();
+  ptrToEnd = (void*)(result.c_str() + result.size());
+  bs = screaming::BitSet(ptrToEnd);
+  iter = screaming::BitSet::Iterator(bs);
+  ASSERT_EQ(result.size(), nbytes);
+  for (int i=0; i<65536; i+=2) {
+    ASSERT_EQ(iter.next(), i);
+    ASSERT_EQ(iter.val(), i);
+  }
+  ASSERT_EQ(iter.next(), screaming::BitSet::END);
+  ASSERT_EQ(iter.val(), screaming::BitSet::END);
+
+  SetStuff set;
+  set.addMidBucket();
+  set.addMidBucket();
+  set.addMidBucket();
+  set.finishBuild();
+  set.verifyIterator();
+  ASSERT_GT(set.nAdds, 0); // make sure the random bucket logic is actually working to add docs.
+
+  SetStuff set2;
+  set2.addMidBucket();
+  set2.addSmallBucket();
+  set2.addMidBucket();
+  set2.addSmallBucket();
+  set2.nextBucket(1000);
+  set2.addMidBucket();
+  set2.addSmallBucket();
+  set2.finishBuild();
+  set2.verifyIterator();
+}
+
+TEST_F(ScreamingTest, manyBuckets) {
+  // This is to test that handling many bucket descriptors works
+  SetStuff set;
+  set.addSmallBucket();
+  set.addMidBucket();
+  for (int i=0; i<32000; i++) {
+    if ((i&0x0ff) == 0) {
+      // skip a bucket once in a while
+      set.nextBucket();
+    } else {
+      set.addSmallBucket(1 + rng.rint(3));
+    }
+  }
+  set.addSmallBucket();
+  set.addMidBucket();
+
+  set.finishBuild();
+  set.verifyIterator();
+}
+
+TEST_F(ScreamingTest, allBuckets) {
+  // This is to test handling the maximum number of buckets
+  SetStuff set;
+  for (int i=0; i<32768; i++) {
+    if ((i&0x0ff) == 0) {
+      // skip a bucket once in a while
+      set.nextBucket();
+    } else {
+      set.addSmallBucket(1 + rng.rint(3));
+    }
+  }
+  set.finishBuild();
+  set.verifyIterator();
+}
+
+
+TEST_F(ScreamingTest, randomSets) {
+  int iter=100;
+  for (int i=0; i<iter; i++) {
+    int nBuckets = rng.rint(1,5);
+    SetStuff set;
+
+    for (int j=0; j<nBuckets; j++) {
+      if (set.base < 0) break;  // base wrapped around... no more buckets
+
+      // sometimes skip a few buckets
+      if (rng.rbool()) {
+        set.nextBucket(rng.rint(1000));
+        if (set.base < 0) break;
+      }
+
+      set.addBucket();
+    }
+
+    // sometimes fill the last bucket
+    if (rng.rbool() && set.base >= 0 && set.base < 0x7fff0000) {
+      set.base = 0x7fff0000;
+      set.addBucket();
+    }
+
+    set.finishBuild();
+    set.verifyIterator();
+  }
+}
