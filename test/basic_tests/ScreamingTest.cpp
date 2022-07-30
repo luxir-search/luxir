@@ -4,6 +4,7 @@
 #include <vector>
 #include "test/SoluxTest.h"
 #include "solux/util/screaming.h"
+#include "solux/index/ScreamingBuilder.h"
 
 using namespace solux;
 
@@ -11,33 +12,38 @@ class ScreamingTest : public solux::SoluxTest {
 public:
 
   // Utility class to make it easier to test screaming bitset
-  class SetStuff {
+  class BldBase {
   public:
     Rng rng;
-    std::ostringstream out;
-    screaming::StringStreamBuilder builder;
-    std::string resultStr;
+
     size_t numBytes;
+    std::string resultStr;
     const char* ptrToEnd;
     std::vector<screaming::BitSet::Bits::word_type> buf;  // used by obs
     screaming::BitSet::Bits obs;  // 64K small bit set
     std::unique_ptr<screaming::BitSet> bitset;
-    std::unique_ptr<screaming::BitSet::Iterator> iter;
     uint64_t addHash = 1;
     int base = 0; // the base of the current bucket
     int curr = -1;  // the current value added
     int nAdds = 0;
 
-    SetStuff(const Rng& rng = SoluxTest::rng) : rng(rng), builder(out) {
+    BldBase(const Rng& rng = SoluxTest::rng) : rng(rng) {
       buf.resize(screaming::BitSet::Bits::numWords);
       obs = screaming::BitSet::Bits(&buf[0]);
     }
+
+    virtual ~BldBase() = default;
+
+    virtual void virtAdd(int val) = 0;
+
+    virtual void finishBuild() = 0;
+
 
     void add(int val) {
       if (val <= curr || val == 0x7fffffff) return;
       curr = val;
       addHash = addHash * 31 + val;
-      builder.add(val);
+      virtAdd(val);
       nAdds++;
     }
 
@@ -138,16 +144,7 @@ public:
     }
 
 
-    screaming::BitSet& finishBuild() {
-      numBytes = builder.flush();
-      resultStr = out.str();
-      // ASSERT_EQ(numBytes, resultStr.size());   // can't use ASSERT_EQ in this context
-      EXPECT_EQ(numBytes, resultStr.size());
-      ptrToEnd = resultStr.c_str() + resultStr.size();
-      bitset = std::make_unique<screaming::BitSet>(ptrToEnd);
-      iter = std::make_unique<screaming::BitSet::Iterator>(*bitset);
-      return *bitset;
-    }
+
 
     bool verifyIterator() {
       int card = 0;
@@ -206,6 +203,61 @@ public:
   };
 
 
+  class OutputStreamBuilder : public BldBase {
+  public:
+
+    MemPool pool;
+    RAMFile ramFile = {""};
+    OutputStream os{&ramFile};
+    ScreamingBuilder builder{pool, os};
+
+    OutputStreamBuilder(const Rng& rng = SoluxTest::rng) : BldBase(rng) {
+    }
+
+    virtual void virtAdd(int val) override {
+      builder.add(val);
+    }
+
+    virtual void finishBuild() override {
+      numBytes = builder.flush();
+      os.close();
+      numBytes = ramFile.size();
+      resultStr.resize(numBytes);
+      ramFile.copyTo(&resultStr[0]);
+      EXPECT_EQ(numBytes, resultStr.size());
+      ptrToEnd = resultStr.c_str() + resultStr.size();
+      bitset = std::make_unique<screaming::BitSet>(ptrToEnd);
+    }
+
+    virtual ~OutputStreamBuilder() = default;
+  };
+
+  class SStreamBuilder : public BldBase {
+  public:
+    std::ostringstream out;
+    screaming::StringStreamBuilder builder{out};
+    std::string resultStr;
+
+    SStreamBuilder(const Rng& rng = SoluxTest::rng) : BldBase(rng) {
+    }
+
+    virtual void virtAdd(int val) override {
+      builder.add(val);
+    }
+
+    virtual void finishBuild() override {
+      numBytes = builder.flush();
+      resultStr = out.str();
+      // ASSERT_EQ(numBytes, resultStr.size());   // can't use ASSERT_EQ in this context
+      EXPECT_EQ(numBytes, resultStr.size());
+      ptrToEnd = resultStr.c_str() + resultStr.size();
+      bitset = std::make_unique<screaming::BitSet>(ptrToEnd);
+    }
+
+    virtual ~SStreamBuilder() = default;
+  };
+
+
 };
 
 TEST_F(ScreamingTest, basic) {
@@ -258,7 +310,7 @@ TEST_F(ScreamingTest, basic) {
       int sz = 1;
       // int sz = 4097;
       // std::cout << "trying seed " << i << " size " << sz << std::endl;
-      SetStuff set(rng);
+      SStreamBuilder set(rng);
       set.addSmallBucket(sz);
       set.addSmallBucket(4097);
       set.finishBuild();
@@ -268,7 +320,7 @@ TEST_F(ScreamingTest, basic) {
 
 
   {
-    SetStuff set;
+    SStreamBuilder set;
     set.addMidBucket();
     set.addMidBucket();
     set.addMidBucket();
@@ -278,7 +330,7 @@ TEST_F(ScreamingTest, basic) {
   }
 
   {
-    SetStuff set;
+    OutputStreamBuilder set;
     set.addMidBucket();
     set.addSmallBucket();
     set.addMidBucket();
@@ -293,7 +345,7 @@ TEST_F(ScreamingTest, basic) {
 
 TEST_F(ScreamingTest, manyBuckets) {
   // This is to test that handling many bucket descriptors works
-  SetStuff set;
+  SStreamBuilder set;
   set.addSmallBucket();
   set.addMidBucket();
   for (int i=0; i<32000; i++) {
@@ -313,7 +365,7 @@ TEST_F(ScreamingTest, manyBuckets) {
 
 TEST_F(ScreamingTest, allBuckets) {
   // This is to test handling the maximum number of buckets
-  SetStuff set;
+  OutputStreamBuilder set;
   for (int i=0; i<32768; i++) {
     if ((i&0x0ff) == 0) {
       // skip a bucket once in a while
@@ -331,7 +383,13 @@ TEST_F(ScreamingTest, randomSets) {
   int iter=100;
   for (int i=0; i<iter; i++) {
     int nBuckets = rng.rint(1,5);
-    SetStuff set;
+    std::unique_ptr<BldBase> bldBase;
+    if (rng.rbool()) {
+      bldBase = std::make_unique<SStreamBuilder>();
+    } else {
+      bldBase = std::make_unique<OutputStreamBuilder>();
+    }
+    BldBase& set = *bldBase;
 
     for (int j=0; j<nBuckets; j++) {
       if (set.base < 0) break;  // base wrapped around... no more buckets

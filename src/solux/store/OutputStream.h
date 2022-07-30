@@ -39,15 +39,15 @@ class OutputStream {
   char *start = nullptr;
   char *end = nullptr;
   size_t flushedSize = 0; // number of bytes that have been flushed to the source
-  File *target = nullptr;
+  File *target;
 
 public:
   // By not requiring the File target up-front, we can directly include OutputStream instances in other
   // classes even if file creation is deferred.
-  explicit OutputStream() {}
+  explicit OutputStream(File* target = nullptr) : target(target) {}
 
   // An initial buffer to use.  It's lifetime should exceed the lifetime of this OutputStream and associated File.
-  explicit OutputStream(char *beginInitialBuffer, char *endInitialBuffer) {
+  explicit OutputStream(char *beginInitialBuffer, char *endInitialBuffer, File* target = nullptr) : target(target) {
     start = pos = beginInitialBuffer;
     end = endInitialBuffer;
   }
