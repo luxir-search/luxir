@@ -164,6 +164,45 @@ public:
       EXPECT_EQ(addHash, itHash);
       return addHash == itHash;
     }
+
+    bool verifyIteratorSkips() {
+      int card = 0;
+      uint64_t itHash = 1;
+      screaming::BitSet::Iterator it(*bitset);
+      std::vector<screaming::BitSet::Iterator> iters;
+      for (int i=0; i<8; i++) {
+        iters.emplace_back(*bitset);
+      }
+      int last = it.val();
+      for(;;) {
+        int val = it.next();
+        auto gap = (int64_t)val - last;  // this can exceed signed int
+        int seekTarget = last + 1 + rng.rint(gap);
+        assert(seekTarget > last && seekTarget <= val);
+        auto& skipIter = iters[rng.rint(iters.size())];
+        if (skipIter.val() < last && rng.rbool()) {
+          // mix in some calls to next()
+          int n = skipIter.next();
+          assert(n <= last);
+        }
+        // std::cout << "\tseeking target=" << seekTarget << " expected val=" << val << " last=" << last << std::endl;
+
+        last = val;
+
+        int seekResult = skipIter.advance(seekTarget);
+        if (val != seekResult) {
+          EXPECT_EQ(val, seekResult);
+        }
+
+        if (val == screaming::BitSet::END) break;
+        itHash = itHash * 31 + val;
+        card++;
+      }
+      EXPECT_EQ(card, nAdds);
+      // std::cout << "nAdds=" << nAdds << std::endl;
+      EXPECT_EQ(addHash, itHash);
+      return addHash == itHash;
+    }
   };
 
 
@@ -188,6 +227,11 @@ TEST_F(ScreamingTest, basic) {
   ASSERT_EQ(iter.next(), screaming::BitSet::END);
   ASSERT_EQ(iter.val(), screaming::BitSet::END);
 
+  screaming::BitSet::Iterator iter2(bs);
+  ASSERT_EQ(iter2.advance(0x01cdef), 0xabcdef);
+  ASSERT_EQ(iter2.advance(0xabcfff), screaming::BitSet::END);
+
+
   // every other bit set for a dense test
   std::ostringstream buf;
   screaming::StringStreamBuilder bld(buf);
@@ -207,24 +251,44 @@ TEST_F(ScreamingTest, basic) {
   ASSERT_EQ(iter.next(), screaming::BitSet::END);
   ASSERT_EQ(iter.val(), screaming::BitSet::END);
 
-  SetStuff set;
-  set.addMidBucket();
-  set.addMidBucket();
-  set.addMidBucket();
-  set.finishBuild();
-  set.verifyIterator();
-  ASSERT_GT(set.nAdds, 0); // make sure the random bucket logic is actually working to add docs.
+  // code good at finding easily debuggable errors when something else fails.
+  {
+    for (int i=0; i<10; i++) {
+      Rng rng(i);
+      int sz = 1;
+      // int sz = 4097;
+      // std::cout << "trying seed " << i << " size " << sz << std::endl;
+      SetStuff set(rng);
+      set.addSmallBucket(sz);
+      set.addSmallBucket(4097);
+      set.finishBuild();
+      set.verifyIteratorSkips();
+    }
+  }
 
-  SetStuff set2;
-  set2.addMidBucket();
-  set2.addSmallBucket();
-  set2.addMidBucket();
-  set2.addSmallBucket();
-  set2.nextBucket(1000);
-  set2.addMidBucket();
-  set2.addSmallBucket();
-  set2.finishBuild();
-  set2.verifyIterator();
+
+  {
+    SetStuff set;
+    set.addMidBucket();
+    set.addMidBucket();
+    set.addMidBucket();
+    set.finishBuild();
+    set.verifyIterator();
+    ASSERT_GT(set.nAdds, 0); // make sure the random bucket logic is actually working to add docs.
+  }
+
+  {
+    SetStuff set;
+    set.addMidBucket();
+    set.addSmallBucket();
+    set.addMidBucket();
+    set.addSmallBucket();
+    set.nextBucket(1000);
+    set.addMidBucket();
+    set.addSmallBucket();
+    set.finishBuild();
+    set.verifyIterator();
+  }
 }
 
 TEST_F(ScreamingTest, manyBuckets) {
@@ -288,6 +352,7 @@ TEST_F(ScreamingTest, randomSets) {
     }
 
     set.finishBuild();
-    set.verifyIterator();
+    // set.verifyIterator();
+    set.verifyIteratorSkips();
   }
 }

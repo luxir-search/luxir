@@ -163,6 +163,7 @@ class BitSet {
 public:
   static constexpr uint8_t  BUCKET_BITS = 16;
   static constexpr uint32_t BUCKET_SIZE = 1 << BUCKET_BITS; // buckets should be 65536 wide, with all vals sharing top 16 bits
+  static constexpr uint32_t BUCKET_MASK_UPPERBITS = 0xFFFFFFFF << BUCKET_BITS; // 0xFFFF0000
   static constexpr uint32_t BUCKET_SPARSE_MAX = BUCKET_SIZE / 8 / sizeof(uint16_t);   // max cardinality to express as sparse bucket
   static constexpr uint32_t BUCKET_NEG_MIN = BUCKET_SIZE - BUCKET_SIZE / 8; // min cardinality to express as neg set
   using Bits = OpenBitSet<BUCKET_SIZE, uint64_t, uint32_t>; // type for the bits only of a bit bucket
@@ -200,7 +201,7 @@ public:
     const BitSet* set;
     int32_t curr = -1;
     int32_t bucketIdx = -1;
-    uint32_t bucketBase;
+    int32_t bucketBase = -1;
     int32_t bucketSize = 0;
     uint16_t lowerBits;
 
@@ -256,7 +257,43 @@ public:
     }
 
     int32_t advance(int32_t target) {
-      return -1;
+      // If it would make it faster, we could also implement skipping-only iterators where we don't mix next() and advance()
+      // We could also build a bucket index if the set will be used many times for skipping.
+      // We could also try using interpolation to estimate where the value may lie.
+      assert(target > curr);
+      int32_t targetBase = target & BUCKET_MASK_UPPERBITS;
+      if (targetBase != bucketBase) {
+        if (!advanceBucket(targetBase)) {
+          return END;
+        }
+        if (bucketBase > targetBase) {
+          // the current block we advanced to is larger than the target, so just return first doc of that block.
+          return next();
+        }
+      }
+
+      // now we are in the current block, but need to advance to the specific target within the block
+      switch (bucketType) {
+        case SPARSE: {
+          // TODO: check first value to speed up some common cases? Or do exponential search?
+          // This could be a case for a branchless binary search as well.
+          int lowerIdx = bucket.sparse.index + 1;
+          auto startPtr = bucket.sparse.values + lowerIdx;
+          auto endPtr = bucket.sparse.values + bucketSize;
+          uint16_t lowerBits = (uint16_t) target;
+          auto lowerBound = std::lower_bound(startPtr, endPtr, lowerBits);
+          if (lowerBound == endPtr) {
+            // not found, so return the next val in the next bucket.
+            return nextBucket();
+          }
+          bucket.sparse.index = lowerIdx + (lowerBound - startPtr) - 1; // back up one so we can use sparseNext()
+          return sparseNext();
+        }
+        case DENSE:
+          curr = target - 1;
+          return denseNextMaybe();
+      }
+      // unreachable
     }
 
 
@@ -270,7 +307,6 @@ public:
     // only valid if we are within a bitset bucket and there are more values
     int32_t denseNext() {
       auto localIndex = uint16_t(curr + 1);
-      // if localIndex==0 then we wrapped
       auto localFound = bucket.bits.obs.nextSetBit(localIndex);
       curr = localFound + bucketBase;
       return curr;
@@ -279,13 +315,17 @@ public:
     // only valid if we are within a bitset bucket, but we don't know if there is another value in this bucket
     // and may have to advance to the next bucket to get it.
     int32_t denseNextMaybe() {
-      auto localIndex = uint16_t(curr + 1);
-      // if localIndex==0 then we wrapped
-      auto localFound = localIndex == 0 ? Bits::MAX_INDEX : bucket.bits.obs.nextSetBit(localIndex);
-      if (localFound != Bits::MAX_INDEX) {
-        curr = localFound + bucketBase;
-        return curr;
+      int next = curr + 1;
+      if (next < bucketBase + Bits::size) {
+        auto localIndex = uint16_t(next);
+        // if localIndex==0 then we wrapped
+        auto localFound = bucket.bits.obs.nextSetBit(localIndex);
+        if (localFound != Bits::MAX_INDEX) {
+          curr = bucketBase + localFound;
+          return curr;
+        }
       }
+
       return nextBucket();
     }
 
@@ -312,6 +352,36 @@ public:
         return denseNext();
       }
     }
+
+    bool advanceBucket(int32_t targetBase) {
+      uint16_t upperBits = targetBase >> BUCKET_BITS;
+      for (int i=bucketIdx+1; i<set->nBuckets; i++) {
+        auto desc = set->descriptors[i];
+        if (desc.upperBits >= upperBits) {
+          bucketSetup(i);
+          return true;
+        }
+      }
+      return false;
+    }
+
+    void bucketSetup(int bucketIndex) {
+      bucketIdx = bucketIndex;
+      const BucketDescriptor& desc = set->descriptors[bucketIdx];
+      bucketBase = desc.upperBits << BUCKET_BITS;
+      bucketSize = desc.size + 1;
+      if (bucketSize <= BUCKET_SPARSE_MAX) {
+        bucketType = SPARSE;
+        bucket.sparse.index = -1;
+        bucket.sparse.values = (uint16_t*)(set->start + desc.offset);
+      } else {
+        bucketType = DENSE;
+        bucket.bits.obs = Bits((Bits::word_type*)(set->start + desc.offset));
+        curr = bucketBase - 1;
+      }
+    }
+
+
 
   };
 
