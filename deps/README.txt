@@ -3,7 +3,7 @@ Building
 
 Installing dependencies via vcpkg:
 $ cd /opt/vcpkg
-$ ./vcpkg install boost gtest benchmark xxhash parallel-hashmap protobuf grpc taskflow
+$ ./vcpkg install boost gtest benchmark xxhash parallel-hashmap protobuf grpc
 $ ./vcpkg install robin-hood-hashing   #optional... see MapBM.cpp
 # TODO: while having all of boost installed is useful for development, it drags in a ton of dependencies +
 # build time in vcpkg.  We should narrow this to just the parts of boost we need.
@@ -14,7 +14,8 @@ sudo apt install build-essential cmake libboost-dev libboost-doc libgtest-dev li
     libboost-locale-dev libboost-filesystem-dev
 ```
 
-Other 3rd party dependencies.
+Other 3rd party dependencies:
+TBB: the vcpkg version is currently out of date. On Ubuntu 22.04, use sudo apt install libtbb-dev
 
 SIMDCompressionAndIntersection 
 NOTE: The debugging version of libsimdcomp is currently built with -D_GLIBCXX_DEBUG, which is

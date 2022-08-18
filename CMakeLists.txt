@@ -21,7 +21,7 @@ set (Boost_USE_STATIC_LIBS OFF) # enable dynamic linking
 set (Boost_USE_MULTITHREAD ON)  # enable multithreading
 find_package (Boost COMPONENTS REQUIRED thread)
 
-find_package(Taskflow CONFIG REQUIRED)
+find_package(TBB CONFIG REQUIRED)
 
 include_directories(deps)
 include_directories(deps/CRoaring/cpp)
@@ -147,7 +147,7 @@ endif()
 find_path(PARALLEL_HASHMAP_INCLUDE_DIRS "parallel_hashmap/btree.h")
 target_include_directories(solux_lib PRIVATE ${PARALLEL_HASHMAP_INCLUDE_DIRS})
 
-target_link_libraries(solux_lib PRIVATE Taskflow::Taskflow)
+target_link_libraries(solux_lib PRIVATE TBB::tbb)
 target_link_libraries(solux_lib PRIVATE xxHash::xxhash)
 target_link_libraries(solux_lib PRIVATE ${Boost_LIBRARIES})
 target_link_libraries(solux_lib PRIVATE debug simdcomp_ad)

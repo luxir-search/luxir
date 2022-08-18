@@ -2,6 +2,7 @@
 #include <iostream>
 #include <gtest/gtest.h>
 #include <google/protobuf/text_format.h>
+#include "tbb/task_group.h"
 #include "test/SoluxTest.h"
 #include "solux/server/GRPCServer.h"
 
@@ -152,13 +153,13 @@ TEST_F(GrpcIndexTest, streamingHello) {
 // This does not test application logic for thread safety, just the communications infrastructure (and how we use it.)
 // TODO: remove Greeter and add no-op index & query flags
 TEST_F(GrpcIndexTest, threadsafe) {
-  int nTasks = 100; // concurrency will be limited by executor
+  int nTasks = 100; // concurrency will be limited by TBB
   int callsPerTask = 10;
-  auto& exec = executor();
+  tbb::task_group tasks;
 
 
   for (int i=0; i<nTasks; i++) {
-    exec.silent_async(
+    tasks.run(
             [=,this]{
               // std::cout << "STARTED TEST THREAD " << i <<  " worker=" << exec.this_worker_id() << std::endl;
 
@@ -191,7 +192,7 @@ TEST_F(GrpcIndexTest, threadsafe) {
     );
   }
 
-  exec.wait_for_all();
+  tasks.wait();
 }
 
 //
@@ -200,15 +201,14 @@ TEST_F(GrpcIndexTest, threadsafe) {
 // ramping up callsPerTask to hammer things for longer.
 //
 TEST_F(GrpcIndexTest, threadsafeIndex) {
-  auto& exec = executor();
-
-  int nTasks = 32; // concurrency will be limited by executor
+  int nTasks = 32; // concurrency will be limited by TBB
   int callsPerTask = 10;
   int streamingPercent = 20;  // percent of the requests that use streaming, lower than 50% since streaming
                               // requests will often consist of a number of update messages.
+  tbb::task_group tasks;
 
   for (int i=0; i<nTasks; i++) {
-    exec.silent_async(
+    tasks.run(
             [=,this]{
               Rng r(rng_seed + i);
 
@@ -231,7 +231,7 @@ TEST_F(GrpcIndexTest, threadsafeIndex) {
     );
   }
 
-  exec.wait_for_all();
+  tasks.wait();
 }
 
 

@@ -2,6 +2,7 @@
 #include "test/SoluxTest.h"
 #include <memory_resource>
 #include <latch>
+#include "tbb/task_group.h"
 
 #include "solux/util/MemPool.h"
 #include "solux/util/random.h"
@@ -36,8 +37,6 @@ BM_Alloc_MemPool         716 ns          716 ns       977285
     It looks like the unsynchronized pool resource is actually a little
     slower than the default allocator.  But notice the time vs CPU time!
     This was done inside WSL, so we should try to repo/verify outside as well.
-    The threading was also handled by Taskflow, so we should verify that
-    it's faster than just using normal threads.
 
 -------------------------------------------------------------------
 Benchmark                         Time             CPU   Iterations
@@ -205,22 +204,20 @@ inline void benchAllocFree(benchmark::State& state) {
   auto numThreads = state.range(0);
   uint64_t result = 0;
   int iterations = 1024;
-  tf::Executor& exec = SoluxTest::executor();
-  std::vector<std::unique_ptr<tf::Taskflow>> jobs;
+
   std::vector<std::unique_ptr<Allocator>> allocators;
-  tf::Taskflow taskflow;
-  auto doneTask = taskflow.emplace([&](){result++;});
   for (int i=0; i<numThreads; i++) {
     allocators.emplace_back(std::make_unique<Allocator>());
-    auto task = taskflow.emplace(
-            [&,i](){allocFree<Allocator>(iterations, i, *allocators[i]);}
-            // [&,i](){allocFreeDummy<Allocator>(iterations, i, *allocators[i]);}
-    );
-    task.precede(doneTask);
   }
 
   for (auto _ : state) {
-    exec.run(taskflow).wait();
+    tbb::task_group tasks;  // TODO: could create a flow graph outside of this loop to eliminate that overhead.
+    for (int i=0; i<numThreads; i++) {
+        tasks.run([&,i](){
+          allocFree<Allocator>(iterations, i, *allocators[i]);
+        });
+    }
+    tasks.wait();
   }
 };
 

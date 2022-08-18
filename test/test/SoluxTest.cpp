@@ -14,8 +14,7 @@ static uint64_t global_random_seed;
 
 uint64_t SoluxTest::rng_seed;
 Rng SoluxTest::rng;
-std::unique_ptr<tf::Executor> SoluxTest::tfExecutor;
-std::once_flag SoluxTest::initExecutorFlag;
+
 
 class SoluxTestListener : public testing::EmptyTestEventListener {
   uint64_t suiteHash;
