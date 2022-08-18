@@ -195,6 +195,7 @@ protected:
     if (read) {
       ASSERT_EQ(tindexReader->numTerms(), realNumTerms);
     } else {
+      writer->endFieldTerms(fname);
       writer->endField(fname);
     }
   }
@@ -269,6 +270,7 @@ TEST_F(PostingsTest, basic) {
   writer.endDoc(22);
   writer.endTerm(term2);
 
+  writer.endFieldTerms("field1");
   writer.endField("field1");
 
 
@@ -279,6 +281,7 @@ TEST_F(PostingsTest, basic) {
   writer.addPositionDelta(1);
   writer.endDoc(0);
   writer.endTerm(terma);
+  writer.endFieldTerms("field2");
   writer.endField("field2");
 
   writer.finish();
@@ -342,6 +345,7 @@ TEST_F(PostingsTest, blockPositions) {
 
 
   writer.endTerm(term1);
+  writer.endFieldTerms("field1");
   writer.endField("field1");
   writer.finish();
 
@@ -417,6 +421,7 @@ TEST_F(PostingsTest, blockTerms) {
     writer.endDoc(i);
     writer.endTerm(term);
   }
+  writer.endFieldTerms("field1");
   writer.endField("field1");
   writer.finish();
 

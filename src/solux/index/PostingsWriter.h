@@ -14,6 +14,7 @@
 #include "solux/search/PostingsReader.h"
 #include "simdcomp/include/codecfactory.h"
 #include "roaring.hh"
+#include "ScreamingBuilder.h"
 
 
 /**
@@ -139,8 +140,10 @@ class PostingsWriter {
   Directory& directory;
   std::string generation;
   int32_t maxDocSeen = -1; // updated in flushDocs, endTerm
-  int32_t maxDocUpperBound = -1; // this is what the client gives us (Inverter / seg merger)
+  int32_t maxDoc;  // set by caller (IndexWriter)
 public:
+  MemPool pool;
+
 //
 // variable naming:
 // *loc* refers to absolute locations in a file, usually obtained via OutputStream::size()
@@ -189,6 +192,7 @@ public:
   // Should this be refactored into a class?
   struct FieldInfo {
     std::string fieldName;
+    int64_t termBlockIndexLoc;
     int64_t termsLoc;
     int64_t docsLoc;
     int64_t posLoc;
@@ -269,10 +273,14 @@ public:
 
   }
 
-  // currently needs to be done before finish() is called
-  void setMaxDocUpperBound(int max) {
-    maxDocUpperBound = max;
+  void setMaxDoc(int max) {
+    maxDoc = max;
   }
+
+  int32_t getMaxDoc() {
+    return maxDoc;
+  }
+
 
   // Currently only called for a full block of positions.
   // TODO: move to .cpp unless we template this class... allows for removal of the associated include files
@@ -558,7 +566,8 @@ public:
     _startTermBlock(false);
   }
 
-  void endField(const std::string& fieldName) {
+
+  void endFieldTerms(const std::string& fieldName) {
     // OPT: investigate inlining small fields in the terms index instead of pointing out to other files?  If we don't know how large the field will be,
     // we could always do it after-the-fact if the other outputs are rewindable (i.e. all in memory.)  If not, we could make it so by always starting
     // with new outputs for every field with first page in RAM.
@@ -570,10 +579,12 @@ public:
     //   - make offsets be from the start of this index array... 32 bit normally fine, but not always for huge field?
     //   - sequence will be monotonically increasing (or decreasing)... interpolate?
     // Indexing RAM OPT: for fields with huge number of terms, we could stream this to separate file.  That would also facilitate alignment if it's important.
-    auto termBlockIndexLoc = termOutput.size();
+    fieldInfo.termBlockIndexLoc = termOutput.size();
     assert((int)fieldInfo.termBlockOffsets.size() == ((fieldInfo.numTerms-1) / Postings::TERMS_BLOCK_SIZE) + 1);
     termOutput.write(&(fieldInfo.termBlockOffsets[0]), fieldInfo.termBlockOffsets.size() * sizeof(fieldInfo.termBlockOffsets[0]) );
+  }
 
+  void endField(const std::string& fieldName) {
     // keep track of where this field data starts
     auto fieldLoc = fieldOutput.size();
     assert(fieldLoc < 0x07FFFFFFF);      // TODO: throw exception if we get too many fields.
@@ -587,14 +598,15 @@ public:
     // Which means we should just store, rather than write at this point (and avoid storing anything large)
     fieldOutput.writeVint(0x01);
 
-    fieldOutput.writeVlong(termBlockIndexLoc);
+    fieldOutput.writeVlong(fieldInfo.termBlockIndexLoc);
     fieldOutput.writeVlong(fieldInfo.termsLoc);  // TODO: If we change termBlockOffsets to be relative to the start of that index, we can remove termsLoc
     fieldOutput.writeVlong(fieldInfo.docsLoc);
     fieldOutput.writeVlong(fieldInfo.posLoc);
     fieldOutput.writeVint(fieldInfo.numTerms);
   }
 
-  void startDoc(int32_t doc) {
+
+    void startDoc(int32_t doc) {
     unused(doc);
     totalTermFreqPrevDoc = getTotalTermFreq();
 
@@ -651,30 +663,37 @@ private:
 // Integer column writing
 //
 class IntColWriter {
+  MemPool& pool;
   PostingsWriter& postingsWriter;
   IntColStats* stats;
   OutputStream& colOutput;
+  ScreamingBuilder docsWithVal;
   int64_t colStart;
   int64_t idLoc;
-  int32_t numDocsWithValue = 0;  // number of docs with a value, derived from addDocsWithVal
   int32_t nAdded = 0;            // number of values added. redundant with numDocsWithValue, for sanity check
-
 public:
-  IntColWriter(PostingsWriter& postingsWriter) : postingsWriter(postingsWriter), colOutput(postingsWriter.colOutput) {
+
+  // This field writer does not do any visible pool rollbacks, but does allocate from the pool.
+  IntColWriter(MemPool& pool, PostingsWriter& postingsWriter) : pool(pool), postingsWriter(postingsWriter), colOutput(postingsWriter.colOutput),
+                                                                docsWithVal(pool, colOutput) {
+    // TODO: docsWithVal allocates 17K from pool that may not be used... should we try to delay this somehow? (an explicit init function?)
+    // Perhaps the indirection associated with delaying the ScreamingBuilder construction would be optimized away since startDoc() would be
+    // called in a tight loop.
   }
 
+  // refine these APIs as we get more use-cases (like segment merging)
 
   // The passed fieldStats should remain valid until after endField is called.
+  // Should this just be folded into the constructor?
   void startFieldIntCol(const std::string& fieldName, IntColStats& fieldStats) {
     // column writing could be parallelized better by using multiple files and grabbing a free file at this point.
-
     stats = &fieldStats;
     colStart = colOutput.size();
   }
 
 
   void addDocsWithVal(roaring::Roaring& roaring) {
-    numDocsWithValue = roaring.cardinality();;
+    // numDocsWithValue = roaring.cardinality();
     auto frozenSize = roaring.getFrozenSizeInBytes();
     auto bufSize = frozenSize + 31; // need space to align
     std::vector<char> buf(bufSize);  // TODO: replace with something that can write directly to our output streams
@@ -686,10 +705,17 @@ public:
     colOutput.write(buffer, frozenSize);
   }
 
-  // target for DocStream.pushDocs
-  void startDoc(int32_t docid) {
-    numDocsWithValue++;
+  void startDocsWithValue() {
+    idLoc = colOutput.size();
+  }
 
+  // target for DocStream.pushDocs...  currently only for recording what docs have a value.  Should all be done
+  // at once (not interleaved with addInt*)
+  void startDoc(int32_t docid) {
+    docsWithVal.add(docid);
+  }
+
+  void endDocsWithValue() {
   }
 
 
@@ -700,10 +726,18 @@ public:
   }
 
   void endField(const std::string& fieldName) {
+    assert(nAdded == stats->numVals());
+    bool allDocsHaveValue = nAdded == postingsWriter.maxDoc;
+
     // write any necessary index into encoded blocks here (assuming it's small enough to keep in memory)
 
-    assert(numDocsWithValue == nAdded); // TODO: turn into actual exception
+    assert(allDocsHaveValue || docsWithVal.cardinality() == nAdded); // TODO: turn into actual exception
     // TODO: write pointers (or add pointers to list to later be serialized)
+
+    if (!allDocsHaveValue) {
+      auto bytes = docsWithVal.flush();
+    }
+
 
   }
 

@@ -216,6 +216,7 @@ public:
         term.val().pushDocs(inverter.pool, postingsWriter);
         postingsWriter.endTerm(term);
       }
+      postingsWriter.endFieldTerms(fieldName);
       postingsWriter.endField(fieldName);
       termsHash.free();
     }
@@ -264,10 +265,16 @@ public:
 
     // TODO: make static and pass everything needed so it's composable
     void flushIntCol(Inverter& inverter, PostingsWriter& postingsWriter) {
-      IntColWriter writer(postingsWriter);
+      auto guard = postingsWriter.pool.rewindScopeGuard(); // rewind any use by IntColWriter after we are done.
+      IntColWriter writer(postingsWriter.pool, postingsWriter);
+      auto full = stats.numVals() >= postingsWriter.getMaxDoc();
       writer.startFieldIntCol(fieldName, stats);
       longStream.pushValues(inverter.pool, writer);
-      docsWithVal.pushDocs(inverter.pool, writer);
+      if (!full) {
+        writer.startDocsWithValue();
+        docsWithVal.pushDocs(inverter.pool, writer);
+        writer.endDocsWithValue();
+      }
       writer.endField(fieldName);
     }
   };

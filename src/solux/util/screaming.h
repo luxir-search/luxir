@@ -418,10 +418,9 @@ protected:
 
   uint16_t *values;
   Bits bits;
-
+  uint64_t totalCard = 0;   // total cardinality of the set so far (all bits set is 1 bigger than supported in uint32_t)
   uint32_t currBucket = 0;
   uint32_t bucketSize = 0;  // number of values in the current bucket
-  uint32_t totalCard = 0;   // total cardinality of the set so far
   uint32_t numBuckets = 0;  // number of flushed buckets
   uint32_t bucketIdx = 0;   // index of the bucket descriptor within the current scratch space
 
@@ -448,15 +447,19 @@ public:
 
   }
 
+  uint32_t cardinality() {
+    return totalCard;
+  }
+
   void add(int32_t val) {
     auto bucket = val >> BitSet::BUCKET_BITS;
-    auto lowerBits = (uint16_t)val;
     if (bucket != currBucket) {
       assert(bucket > currBucket);
       flushBucket();
       currBucket = bucket;
       bucketSize = 0;
     }
+    auto lowerBits = (uint16_t)val;
     if (bucketSize >= BitSet::BUCKET_SPARSE_MAX) {
       // start using bitmap instead
       if (bucketSize == BitSet::BUCKET_SPARSE_MAX) {

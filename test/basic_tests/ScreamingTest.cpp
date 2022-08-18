@@ -220,6 +220,8 @@ public:
 
     virtual void finishBuild() override {
       numBytes = builder.flush();
+      auto card = builder.cardinality();
+      EXPECT_EQ(nAdds, card);
       os.close();
       numBytes = ramFile.size();
       resultStr.resize(numBytes);
@@ -247,6 +249,8 @@ public:
 
     virtual void finishBuild() override {
       numBytes = builder.flush();
+      auto card = builder.cardinality();
+      EXPECT_EQ(nAdds, card);
       resultStr = out.str();
       // ASSERT_EQ(numBytes, resultStr.size());   // can't use ASSERT_EQ in this context
       EXPECT_EQ(numBytes, resultStr.size());

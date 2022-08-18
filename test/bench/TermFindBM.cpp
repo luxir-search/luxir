@@ -65,6 +65,7 @@ static void BM_TermFind(benchmark::State& state, uint64_t maxId, int hitPercent)
     w.endDoc(docid);
     w.endTerm(term);
   }
+  w.endFieldTerms(fname);
   w.endField(fname);
 
   seg.initReader();
