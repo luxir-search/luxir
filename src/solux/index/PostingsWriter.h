@@ -167,7 +167,6 @@ public:
   std::unique_ptr<File> posFile; // positions for each term
   std::unique_ptr<File> colFile; // used for columns
 
-  std::vector<uint32_t> fieldLocs;  // location of each field in fieldFile (TODO: what is the max number of fields we will support?)
 
   // needed to build each block
   std::vector<TermRef> termList;  // list of terms in the current term block
@@ -189,7 +188,10 @@ public:
   int32_t docsFlushed;  /// number of documents flushed for the current term so far
   int64_t totalTermFreqPrevDoc = 0; // total term freq up through the previous doc
 
-  // Should this be refactored into a class?
+  std::vector<uint64_t> termBlockOffsets;  // offset from termsOffset (for this field) for each term block
+
+
+    // Should this be refactored into a class?
   struct FieldInfo {
     std::string fieldName;
     int64_t termBlockIndexLoc;
@@ -198,11 +200,11 @@ public:
     int64_t posLoc;
     int64_t sumDocFreq;
     int64_t sumTotalTermFreq;
-    std::vector<uint64_t> termBlockOffsets;  // offset from termsOffset (for this field) for each term block
     int numTerms;  // currently only updated in flushTerms()
   };
-  FieldInfo fieldInfo;
+  FieldInfo* fieldInfo;
 
+  std::vector<FieldInfo> fieldInfos;
 
 private:  // some internal utility methods... not for use by indexers
   Postings postings; // contains limits and codecs
@@ -349,16 +351,16 @@ public:
     locOfPositionsForTermBlock = posOutput.size();
     locOfDocsForTermBlock = docOutput.size();
 
-    fieldInfo.termBlockOffsets.push_back( termOutput.size() - fieldInfo.termsLoc);
+    termBlockOffsets.push_back( termOutput.size() - fieldInfo->termsLoc);
   }
 
   void flushTerms(bool endingField) {
     if (termList.empty()) {
-      fieldInfo.termBlockOffsets.pop_back();  // last block has no terms in it.
+      termBlockOffsets.pop_back();  // last block has no terms in it.
       return;
     }
 
-    fieldInfo.numTerms += termList.size();
+    fieldInfo->numTerms += termList.size();
 
     // TODO: find common prefix (i.e. min_prefix_len) for all terms in block and strip it off (same as common prefix of first and last)
     // important for some things that share long prefixes, like URLs for example.
@@ -370,8 +372,8 @@ public:
 
     // Write the terms block header.
     termOutput.writeStr(refdata, reflen);
-    termOutput.writeVlong(locOfDocsForTermBlock - fieldInfo.docsLoc);
-    termOutput.writeVlong(locOfPositionsForTermBlock - fieldInfo.posLoc);
+    termOutput.writeVlong(locOfDocsForTermBlock - fieldInfo->docsLoc);
+    termOutput.writeVlong(locOfPositionsForTermBlock - fieldInfo->posLoc);
 
     int nTerms = termList.size();
 
@@ -557,12 +559,15 @@ public:
   }
 
   void startField(const std::string& fieldName) {
-    fieldInfo.fieldName = fieldName;
-    fieldInfo.termsLoc = termOutput.size();
-    fieldInfo.docsLoc = docOutput.size();
-    fieldInfo.posLoc = posOutput.size();
-    fieldInfo.termBlockOffsets.resize(0);
-    fieldInfo.numTerms = 0;
+    fieldInfo = &fieldInfos.emplace_back();
+    fieldInfo->fieldName = fieldName;
+    fieldInfo->termsLoc = termOutput.size();
+    fieldInfo->docsLoc = docOutput.size();
+    fieldInfo->posLoc = posOutput.size();
+    fieldInfo->numTerms = 0;
+
+    termBlockOffsets.resize(0);
+
     _startTermBlock(false);
   }
 
@@ -579,34 +584,16 @@ public:
     //   - make offsets be from the start of this index array... 32 bit normally fine, but not always for huge field?
     //   - sequence will be monotonically increasing (or decreasing)... interpolate?
     // Indexing RAM OPT: for fields with huge number of terms, we could stream this to separate file.  That would also facilitate alignment if it's important.
-    fieldInfo.termBlockIndexLoc = termOutput.size();
-    assert((int)fieldInfo.termBlockOffsets.size() == ((fieldInfo.numTerms-1) / Postings::TERMS_BLOCK_SIZE) + 1);
-    termOutput.write(&(fieldInfo.termBlockOffsets[0]), fieldInfo.termBlockOffsets.size() * sizeof(fieldInfo.termBlockOffsets[0]) );
+    fieldInfo->termBlockIndexLoc = termOutput.size();
+    assert((int)termBlockOffsets.size() == ((fieldInfo->numTerms-1) / Postings::TERMS_BLOCK_SIZE) + 1);
+    termOutput.write(&(termBlockOffsets[0]), termBlockOffsets.size() * sizeof(termBlockOffsets[0]) );
   }
 
   void endField(const std::string& fieldName) {
-    // keep track of where this field data starts
-    auto fieldLoc = fieldOutput.size();
-    assert(fieldLoc < 0x07FFFFFFF);      // TODO: throw exception if we get too many fields.
-    fieldLocs.push_back(fieldLoc);
-
-    // Now write the field data, starting with the name.
-    fieldOutput.writeStr(fieldName.c_str(), fieldName.size());
-
-    // write type here? Hmmm.... but if this block will contain info across multiple types (columns, bkd, etc) then
-    // we can't move on to next field until all of the different index types for this field have been completed.
-    // Which means we should just store, rather than write at this point (and avoid storing anything large)
-    fieldOutput.writeVint(0x01);
-
-    fieldOutput.writeVlong(fieldInfo.termBlockIndexLoc);
-    fieldOutput.writeVlong(fieldInfo.termsLoc);  // TODO: If we change termBlockOffsets to be relative to the start of that index, we can remove termsLoc
-    fieldOutput.writeVlong(fieldInfo.docsLoc);
-    fieldOutput.writeVlong(fieldInfo.posLoc);
-    fieldOutput.writeVint(fieldInfo.numTerms);
   }
 
 
-    void startDoc(int32_t doc) {
+  void startDoc(int32_t doc) {
     unused(doc);
     totalTermFreqPrevDoc = getTotalTermFreq();
 
@@ -648,7 +635,32 @@ private:
   }
 
   void writeFieldIndex() {
-    // location of each field in fieldFile
+    // TODO: make the field index is position independent.
+
+    std::vector<uint32_t> fieldLocs;  // location of each field in fieldFile (TODO: what is the max number of fields we will support?)
+    fieldLocs.reserve(fieldInfos.size());
+
+    auto fieldsStart = fieldOutput.size();  // where this index starts
+
+    for (auto& finfo : fieldInfos) {
+      auto fieldLoc = fieldOutput.size();
+      fieldLocs.push_back(fieldLoc);
+
+      fieldOutput.writeStr(finfo.fieldName);
+
+      // write type here? Hmmm.... but if this block will contain info across multiple types (columns, bkd, etc) then
+      // we can't move on to next field until all of the different index types for this field have been completed.
+      // Which means we should just store, rather than write at this point (and avoid storing anything large)
+      fieldOutput.writeVint(0x01);
+
+      fieldOutput.writeVlong(finfo.termBlockIndexLoc);
+      fieldOutput.writeVlong(finfo.termsLoc);  // TODO: If we change termBlockOffsets to be relative to the start of that index, we can remove termsLoc
+      fieldOutput.writeVlong(finfo.docsLoc);
+      fieldOutput.writeVlong(finfo.posLoc);
+      fieldOutput.writeVint(finfo.numTerms);
+    }
+
+    // Now write the start of each fieldInfo
     // TODO: align this on 4 byte boundary
     fieldOutput.write(&(fieldLocs[0]), fieldLocs.size() * sizeof(fieldLocs[0]));
     // write the size of the array at the end so we can use it to find the start when reading
@@ -657,6 +669,19 @@ private:
 
   friend class IntColWriter;
 };
+
+
+
+
+class TextWriter {
+public:
+
+
+
+
+};
+
+
 
 
 //
@@ -737,11 +762,11 @@ public:
     if (!allDocsHaveValue) {
       auto bytes = docsWithVal.flush();
     }
-
-
   }
-
-
 };
+
+
+
+
 
 } // end namespace

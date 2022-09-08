@@ -371,7 +371,8 @@ public:
   }
 
   void flush(PostingsWriter& postingsWriter) {
-    // first gather and sort the fields
+    // We could either sort fields first, or after they have been indexed.  Merging segments will presumably
+    // go in sorted field order, so lets do the same thing here and sort first.
     std::vector<IndexHandler*> fields;
     fields.reserve(indexHandlers.size());
     for (auto& entry : indexHandlers) {

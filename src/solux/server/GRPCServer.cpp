@@ -464,7 +464,7 @@ void GRPCServer::runThread(ThreadInfo& threadInfo) {
    * E0723 22:24:54.308864118 3078 server_cc.cc:216]  assertion failed: grpc_server_request_registered_call( server_->server(), registered_method, &call_, &context_->deadline_, context_->client_metadata_.arr(), payload, call_cq_->cq(), notification_cq->cq(), this) == GRPC_CALL_OK
    * It only happened in release mode (not debug mode) presumably because of timing.  Now GRPCServer::waitForStart()
    * waits for the calls to be registered into the completion queue before signalling that we are ready.
-   * Best guess is that it was these registrations that were failing after the competion queue was shut down.
+   * Best guess is that it was these registrations that were failing after the completion queue was shut down.
    */
   startLatchThreads.count_down(); // signal that we registered calls
 

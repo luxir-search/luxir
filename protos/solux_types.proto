@@ -261,6 +261,7 @@ message SingleUpdateResponse {
 message UpdateError {
   // docId... bytes? string?
   string error_message = 1;
+  // for an invalid value for a field, we could actually give that field/value in a more structured way
 }
 
 
