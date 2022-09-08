@@ -635,16 +635,21 @@ private:
   }
 
   void writeFieldIndex() {
-    // TODO: make the field index is position independent.
+    //
+    // This format is position independent.  One just needs a pointer to the end of the final structure.
+    //
+    // Format:
+    // List of field metadata, followed by an array of offsets for each field, followed by the number of fields.
+    //
 
-    std::vector<uint32_t> fieldLocs;  // location of each field in fieldFile (TODO: what is the max number of fields we will support?)
-    fieldLocs.reserve(fieldInfos.size());
+    std::vector<uint32_t> fieldOffs;  // location of each field in fieldFile (TODO: what is the max number of fields we will support?)
+    fieldOffs.reserve(fieldInfos.size());
 
     auto fieldsStart = fieldOutput.size();  // where this index starts
 
     for (auto& finfo : fieldInfos) {
       auto fieldLoc = fieldOutput.size();
-      fieldLocs.push_back(fieldLoc);
+      fieldOffs.push_back(fieldLoc - fieldsStart);  // make the location relative so we can append this to a large file if necessary
 
       fieldOutput.writeStr(finfo.fieldName);
 
@@ -662,9 +667,16 @@ private:
 
     // Now write the start of each fieldInfo
     // TODO: align this on 4 byte boundary
-    fieldOutput.write(&(fieldLocs[0]), fieldLocs.size() * sizeof(fieldLocs[0]));
+    // Now make field offsets relative to the start of the locations array instead of the beginning of fields.
+    // It's minor, but allows us to remove another pointer (to the start of the fields)
+    auto locationsOff = fieldOutput.size() - fieldsStart;
+    for (auto& loc : fieldOffs) {
+      loc = locationsOff - loc;
+    }
+
+    fieldOutput.write(&(fieldOffs[0]), fieldOffs.size() * sizeof(fieldOffs[0]));
     // write the size of the array at the end so we can use it to find the start when reading
-    fieldOutput.writeInt((int32_t)fieldLocs.size());
+    fieldOutput.writeInt((int32_t)fieldOffs.size());
   }
 
   friend class IntColWriter;

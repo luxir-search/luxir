@@ -151,7 +151,8 @@ class FieldReader {
   InputStream fieldIS;
   int32_t nFields;
   int32_t currField = -1;
-  int32_t* fieldIndex; // start of the array of field locations, written by PostingsWriter::writeFieldIndex()
+  uint32_t* fieldOffsets;  // the array of field offsets, written by PostingsWriter::writeFieldIndex()
+  int64_t fieldOffsetsLoc; // location in the file of the above array
   PostingsReader& postingsReader;
 
   PackedTerm fieldname;
@@ -169,9 +170,11 @@ public:
   FieldReader(MemPool& pool, PostingsReader& postingsReader) : postingsReader(postingsReader) {
     fieldIS = postingsReader.fieldFile->getInputStream();
     fieldIS.seek(fieldIS.size() - sizeof(int32_t));
+    fieldOffsetsLoc = fieldIS.offset();
     auto fieldLocEnd = fieldIS.ptr();
     nFields = fieldIS.readInt();
-    fieldIndex = ((int32_t*)(fieldLocEnd)) - nFields;
+    fieldOffsets = ((uint32_t*)(fieldLocEnd)) - nFields;
+    fieldOffsetsLoc -= nFields * sizeof(uint32_t);
   }
 
   FieldReader(MemPool& pool, PostingsReader& postingsReader, const InputStream& is) : postingsReader(postingsReader), fieldIS(is) {};
@@ -181,17 +184,18 @@ public:
   }
 
   bool seek(const std::string_view& fieldName) {
-    auto comparator = [&](const int32_t& fieldLoc, const std::string_view& key) {
-      auto fieldNameFound = fieldIS.readPackedTerm(fieldLoc);
+    auto comparator = [&](const int32_t& fieldOff, const std::string_view& key) {
+      auto fieldNameFound = fieldIS.readPackedTerm(fieldOffsetsLoc - fieldOff);
       return fieldNameFound < key;
     };
-    auto endPtr = fieldIndex+nFields;
-    int32_t* fieldLocPtr = std::lower_bound(fieldIndex, endPtr, fieldName, comparator);
-    if (fieldLocPtr != endPtr) {
+    auto endPtr = fieldOffsets + nFields;
+    uint32_t* fieldOffPtr = std::lower_bound(fieldOffsets, endPtr, fieldName, comparator);
+    if (fieldOffPtr != endPtr) {
       // This may be slightly repeated work (additional read term and compare), but it may not be worth it to eliminate.
-      auto fieldNameFound = fieldIS.readPackedTerm(*fieldLocPtr);
+      auto fieldNameFound = fieldIS.readPackedTerm(fieldOffsetsLoc - *fieldOffPtr);
+
       if (fieldNameFound == fieldName) {
-        currField = fieldLocPtr - fieldIndex - 1;  // back up to previous field since we will increment in readNextField
+        currField = fieldOffPtr - fieldOffsets - 1;  // back up to previous field since we will increment in readNextField
         return readNextField();
       }
     }
@@ -206,7 +210,7 @@ public:
       return false;
     }
     ++currField;
-    fieldIS.seek(fieldIndex[currField]);
+    fieldIS.seek(fieldOffsetsLoc - fieldOffsets[currField]);
 
     //
     // See PostingsWriter.endField() for the format written.
@@ -214,7 +218,6 @@ public:
     fieldname = fieldIS.readPackedTerm();
     fieldInfoRead = false;
     return true;
-
   }
 
 
