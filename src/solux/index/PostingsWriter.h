@@ -139,7 +139,6 @@ namespace solux {
 class PostingsWriter {
   Directory& directory;
   std::string generation;
-  int32_t maxDocSeen = -1; // updated in flushDocs, endTerm
   int32_t maxDoc;  // set by caller (IndexWriter)
 public:
   MemPool pool;
@@ -201,6 +200,13 @@ public:
     int64_t sumDocFreq;
     int64_t sumTotalTermFreq;
     int numTerms;  // currently only updated in flushTerms()
+
+    // column
+    int64_t columnLoc;
+    int64_t docsWithValueEndLoc;
+    int32_t docsWithValue;
+
+    int32_t flags;  // temporary... currently has type info. 0x01 text, 0x02 int col.  In the future, we should decompose and have separate sections for each type
   };
   FieldInfo* fieldInfo;
 
@@ -232,7 +238,7 @@ private:  // some internal utility methods... not for use by indexers
   }
 
 public:
-  PostingsWriter(Directory& dir, const std::string_view& gen) : directory(dir), generation(gen)
+  PostingsWriter(Directory& dir, const std::string_view& gen, int32_t maxDoc) : directory(dir), generation(gen), maxDoc(maxDoc)
   {
     // TODO: defer file creation until needed, *or* use a RAMDelegatingFile that does so.
     // that does so.
@@ -308,7 +314,7 @@ public:
       return;
     }
 
-    maxDocSeen = std::max(maxDocSeen, docs.back());
+    assert(docs.back() < maxDoc); // sanity check to ensure we didn't go over provided maxDoc
 
     // NOTE: some codecs (like s4-fastpfor-d1) modify the input array to calculate deltas!
     // given that we (could) already have deltas, is there an easy way to bypass that part?
@@ -474,7 +480,7 @@ public:
     unused(term);
     auto totalTermFreq = getTotalTermFreq();
     if (docs.size() > 0) {
-      maxDocSeen = std::max(maxDocSeen, docs.back());
+      assert(docs.back() < maxDoc); // sanity check to ensure we didn't go over provided maxDoc
     }
     // TODO: handle case when all docs were deleted for term (and term should no longer appear)
     if (totalTermFreq == 1) {
@@ -565,6 +571,8 @@ public:
     fieldInfo->docsLoc = docOutput.size();
     fieldInfo->posLoc = posOutput.size();
     fieldInfo->numTerms = 0;
+    fieldInfo->flags = 0x01;  // text field
+
 
     termBlockOffsets.resize(0);
 
@@ -628,9 +636,8 @@ public:
 
 private:
   void writeSegmentInfo() {
-    assert(maxDocSeen >= 0);
-    auto maxdoc = maxDocSeen + 1;
-    segOutput.writeVint(maxdoc);
+    assert(maxDoc >= 1);
+    segOutput.writeVint(maxDoc);
     // Other info we should eventually write: version info, what other files are present, cfs info
   }
 
@@ -653,16 +660,23 @@ private:
 
       fieldOutput.writeStr(finfo.fieldName);
 
-      // write type here? Hmmm.... but if this block will contain info across multiple types (columns, bkd, etc) then
-      // we can't move on to next field until all of the different index types for this field have been completed.
-      // Which means we should just store, rather than write at this point (and avoid storing anything large)
-      fieldOutput.writeVint(0x01);
+      if ((finfo.flags & 0x01) != 0) {
+        fieldOutput.writeVint(0x01);
 
-      fieldOutput.writeVlong(finfo.termBlockIndexLoc);
-      fieldOutput.writeVlong(finfo.termsLoc);  // TODO: If we change termBlockOffsets to be relative to the start of that index, we can remove termsLoc
-      fieldOutput.writeVlong(finfo.docsLoc);
-      fieldOutput.writeVlong(finfo.posLoc);
-      fieldOutput.writeVint(finfo.numTerms);
+        fieldOutput.writeVlong(finfo.termBlockIndexLoc);
+        fieldOutput.writeVlong(
+                finfo.termsLoc);  // TODO: If we change termBlockOffsets to be relative to the start of that index, we can remove termsLoc
+        fieldOutput.writeVlong(finfo.docsLoc);
+        fieldOutput.writeVlong(finfo.posLoc);
+        fieldOutput.writeVint(finfo.numTerms);
+      }
+
+      if ((finfo.flags & 0x02) != 0) {
+        fieldOutput.writeVint(0x02);
+        fieldOutput.writeVlong(finfo.docsWithValue);
+        fieldOutput.writeVlong(finfo.docsWithValueEndLoc);
+        fieldOutput.writeVlong(finfo.columnLoc);
+      }
     }
 
     // Now write the start of each fieldInfo
@@ -698,24 +712,27 @@ public:
 
 //
 // Integer column writing
+// TODO: nest these within postings writer? Or use a namespace?
 //
 class IntColWriter {
   MemPool& pool;
   PostingsWriter& postingsWriter;
+  PostingsWriter::FieldInfo& fieldInfo;
   IntColStats* stats;
   OutputStream& colOutput;
   ScreamingBuilder docsWithVal;
   int64_t colStart;
-  int64_t idLoc;
+  int64_t idEndLoc;
   int32_t nAdded = 0;            // number of values added. redundant with numDocsWithValue, for sanity check
 public:
 
   // This field writer does not do any visible pool rollbacks, but does allocate from the pool.
-  IntColWriter(MemPool& pool, PostingsWriter& postingsWriter) : pool(pool), postingsWriter(postingsWriter), colOutput(postingsWriter.colOutput),
+  IntColWriter(MemPool& pool, PostingsWriter& postingsWriter, PostingsWriter::FieldInfo& fieldInfo) : pool(pool), postingsWriter(postingsWriter), fieldInfo(fieldInfo), colOutput(postingsWriter.colOutput),
                                                                 docsWithVal(pool, colOutput) {
     // TODO: docsWithVal allocates 17K from pool that may not be used... should we try to delay this somehow? (an explicit init function?)
     // Perhaps the indirection associated with delaying the ScreamingBuilder construction would be optimized away since startDoc() would be
     // called in a tight loop.
+    fieldInfo.flags = 0x02;  // int col
   }
 
   // refine these APIs as we get more use-cases (like segment merging)
@@ -737,13 +754,12 @@ public:
     void* buffer = buf.data();
     buffer = std::align(32, frozenSize, buffer, bufSize);
     roaring.writeFrozen((char*)buffer);
-    idLoc = colOutput.size();
+    idEndLoc = colOutput.size();
     // TODO: what alignment requirements do we have for reading?
     colOutput.write(buffer, frozenSize);
   }
 
   void startDocsWithValue() {
-    idLoc = colOutput.size();
   }
 
   // target for DocStream.pushDocs...  currently only for recording what docs have a value.  Should all be done
@@ -773,7 +789,15 @@ public:
 
     if (!allDocsHaveValue) {
       auto bytes = docsWithVal.flush();
+      idEndLoc = colOutput.size();
+    } else {
+      idEndLoc = 0; // just to avoid reading uninitialized values
     }
+
+    // FUTURE:write index into value blocks here
+    fieldInfo.docsWithValue = nAdded;
+    fieldInfo.docsWithValueEndLoc = idEndLoc;
+    fieldInfo.columnLoc = colStart;
   }
 };
 

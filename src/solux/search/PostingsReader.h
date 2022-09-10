@@ -9,6 +9,7 @@
 #include <vector>
 #include <string>
 #include <charconv>
+#include <solux/util/screaming.h>
 #include "solux/store/Directory.h"
 #include "solux/store/InputStream.h"
 #include "solux/util/MemPool.h"
@@ -103,6 +104,7 @@ public:
   InputFile* termFile;
   InputFile* docFile;
   InputFile* posFile;
+  InputFile* colFile;
 
   Postings postings; // for codecs... temporary since they aren't necessarily thread safe?
 
@@ -116,6 +118,7 @@ public:
     termFile = files.emplace_back(dir.openFile(Postings::getIndexFileName(gen, Postings::TERMS_FNAME))).get();
     docFile = files.emplace_back(dir.openFile(Postings::getIndexFileName(gen, Postings::DOCS_FNAME))).get();
     posFile = files.emplace_back(dir.openFile(Postings::getIndexFileName(gen, Postings::POS_FNAME))).get();
+    colFile = files.emplace_back(dir.openFile(Postings::getIndexFileName(gen, Postings::COL_FNAME))).get();
   }
 
   PostingsReader(InputFile* fieldFile, InputFile* termFile, InputFile* docFile, InputFile* posFile)
@@ -147,6 +150,7 @@ public:
 // not thread safe
 class FieldReader {
   friend class TermsEnum;
+  friend class IntColReader;
 
   InputStream fieldIS;
   int32_t nFields;
@@ -164,6 +168,12 @@ class FieldReader {
   int64_t docsLoc;
   int64_t posLoc;
   int32_t nTerms;
+
+  // column
+  int32_t docsWithValue;
+  int64_t docsWithValueEndLoc;
+  int64_t columnLoc;
+
 
   // TODO: field number?
 public:
@@ -230,16 +240,25 @@ public:
   }  // TODO: maybe move this down in hierarchy given that we don't know where it will be stored in the future?
 
 private:
-  // move to cpp?
+  // Move to cpp? Or to different type?
   void readFieldInfo() {
     if (!fieldInfoRead) {
       fieldInfoRead = true;
+      // TODO: we could just keep this in compressed format / decode on demand as needed
       auto type = fieldIS.readVint();
-      termBlockIndexLoc = fieldIS.readVlong();
-      termsLoc = fieldIS.readVlong();
-      docsLoc = fieldIS.readVlong();
-      posLoc = fieldIS.readVlong();
-      nTerms = fieldIS.readVint();
+      if (type == 0x01) {
+        termBlockIndexLoc = fieldIS.readVlong();
+        termsLoc = fieldIS.readVlong();
+        docsLoc = fieldIS.readVlong();
+        posLoc = fieldIS.readVlong();
+        nTerms = fieldIS.readVint();
+      } else if (type == 0x02) {
+        docsWithValue = fieldIS.readVint();
+        docsWithValueEndLoc = fieldIS.readVlong();
+        columnLoc = fieldIS.readVlong();
+      } else {
+        // ?
+      }
     }
   }
 
@@ -822,6 +841,143 @@ public:
   // we supported multiple position lists.  Hence prob only worth it when merging small segment into large.
   // How to do position skipping?  Could always pre-pend last position in a block?
 };
+
+
+class IntColReader {
+  InputStream columnIS;
+  PostingsReader &postingsReader;
+  FieldReader &fieldReader;
+  MemPool &pool;
+  int32_t docsWithValue_;
+  screaming::BitSet docs;
+  const int64_t* values;
+
+public:
+  IntColReader(MemPool &pool, PostingsReader &postingsReader, FieldReader &fieldReader) : pool(pool),
+                                                                                          postingsReader(postingsReader),
+                                                                                          fieldReader(fieldReader) {
+    if (!fieldReader.fieldInfoRead) {
+      fieldReader.readFieldInfo();
+    }
+    docsWithValue_ = fieldReader.docsWithValue;
+
+    columnIS = postingsReader.colFile->getInputStream();
+    columnIS.seek(fieldReader.columnLoc);
+
+    if (docsWithValue_ != postingsReader.maxDoc()) {
+      docs.set( columnIS.ptr(fieldReader.docsWithValueEndLoc) );
+    }
+
+    values = reinterpret_cast<const int64_t *>(columnIS.ptr(fieldReader.columnLoc));  // offsets from termsLoc
+  }
+
+  int32_t docsWithValue() {
+    return docsWithValue_;
+  }
+
+
+  class DenseIterator {
+    const int64_t* values;
+    int32_t doc = -1;
+    int32_t max;
+  public:
+    DenseIterator(const IntColReader& col)  {
+      values = col.values;
+      max = col.docsWithValue_;
+    }
+
+    int32_t rank() {
+      return doc;
+    }
+
+    int32_t docId() {
+      return doc;
+    }
+
+    int64_t value() {
+      return values[doc];
+    }
+
+    int32_t next() {
+      if (++doc >= max) {
+        doc = screaming::BitSet::END;
+      }
+      return doc;
+    }
+
+    int64_t valueAtRank(int32_t rank) {
+      assert (rank >= 0 && rank < max);
+      return values[rank];
+    }
+
+    int32_t advance(int32_t target) {
+      assert (target >= 0 && target < max);
+      doc = target;
+      return target;
+    }
+
+  };
+
+
+  class SparseIterator {
+    const IntColReader* col;
+    screaming::BitSet::Iterator docsIter;
+    const int64_t* values;
+    int32_t rank_ = -1;
+    int32_t doc = -1;
+    int32_t maxRank;
+    bool dense;
+  public:
+    SparseIterator(const IntColReader& col) : col(&col), docsIter(col.docs), values(col.values) {
+      maxRank = col.docsWithValue_;
+      dense = col.docs.empty();
+    }
+
+    int32_t docId() {
+      return doc;
+    }
+
+    int32_t rank() {
+      return rank_;
+    }
+
+    int64_t value() {
+      return values[doc];
+    }
+
+    // TODO: directly expose docsIter (or the screaming set) here to enable bulk / direct operations on them?
+
+    int32_t advance(int32_t target) {
+      if (dense) {
+        doc = rank_ = target;
+      } else { // Would a sparse-only iterator (so we don't have the dense code in here) improve performance?
+        doc = docsIter.advance(target);
+      }
+      // TODO: update rank?
+      return doc;
+    }
+
+    int32_t next() {
+      if (rank_+1 >= maxRank) {
+        doc = screaming::BitSet::END;
+        return doc;
+      }
+      rank_++;
+
+      if (dense) {
+        doc++;
+      } else {
+        doc = docsIter.next();
+      }
+
+      return doc;
+    }
+
+
+  };
+
+};
+
 
 
 } // end namespace

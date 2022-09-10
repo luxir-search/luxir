@@ -266,9 +266,14 @@ public:
     // TODO: make static and pass everything needed so it's composable
     void flushIntCol(Inverter& inverter, PostingsWriter& postingsWriter) {
       auto guard = postingsWriter.pool.rewindScopeGuard(); // rewind any use by IntColWriter after we are done.
-      IntColWriter writer(postingsWriter.pool, postingsWriter);
+
+      // TODO: move this to postingsWriter method
+      PostingsWriter::FieldInfo& fieldInfo = postingsWriter.fieldInfos.emplace_back();
+      fieldInfo.fieldName = fieldName;
+
+      IntColWriter writer(postingsWriter.pool, postingsWriter, fieldInfo);
       auto full = stats.numVals() >= postingsWriter.getMaxDoc();
-      writer.startFieldIntCol(fieldName, stats);
+      writer.startFieldIntCol(fieldName, stats);  // TODO: fieldName is redundant now if we are passing in fieldInfo.
       longStream.pushValues(inverter.pool, writer);
       if (!full) {
         writer.startDocsWithValue();

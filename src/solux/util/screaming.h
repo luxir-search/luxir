@@ -180,8 +180,23 @@ public:
   const BucketDescriptor* descriptors;
   uint16_t nBuckets;
 
+  BitSet() {
+    nBuckets = 0;
+  }
 
   explicit BitSet(const void* pointerToEnd) {
+    set(pointerToEnd);
+    /*
+    nBuckets = *((uint16_t*)pointerToEnd - 1);
+    descriptors = (BucketDescriptor*)((char*)pointerToEnd - sizeof(uint16_t) - nBuckets * sizeof(BucketDescriptor));
+    // the size of all the buckets is the offset of the last bucket plus the size of that bucket
+    auto lastDescriptor = descriptors[nBuckets - 1];
+    auto sizeOfAllBuckets = lastDescriptor.offset + blockBytes(lastDescriptor);
+    start = ((char*)descriptors) - sizeOfAllBuckets;
+     */
+  }
+
+  void set(const void* pointerToEnd) {
     nBuckets = *((uint16_t*)pointerToEnd - 1);
     descriptors = (BucketDescriptor*)((char*)pointerToEnd - sizeof(uint16_t) - nBuckets * sizeof(BucketDescriptor));
     // the size of all the buckets is the offset of the last bucket plus the size of that bucket
@@ -189,12 +204,10 @@ public:
     auto sizeOfAllBuckets = lastDescriptor.offset + blockBytes(lastDescriptor);
     start = ((char*)descriptors) - sizeOfAllBuckets;
   }
-  /*
-  BitSet(const BitSet& other) = default;
-  BitSet& operator=(const BitSet& other) = default;
-*/
 
-
+  bool empty() const {
+    return nBuckets == 0;
+  }
 
   class Iterator {
     // const BitSet& set;

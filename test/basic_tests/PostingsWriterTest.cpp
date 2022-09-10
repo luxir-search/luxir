@@ -23,7 +23,7 @@ protected:
 
 
   std::unique_ptr<PostingsReader> reader;
-  std::unique_ptr<FieldReader> tindexReader;
+  std::unique_ptr<FieldReader> fieldReader;
   std::unique_ptr<TermsEnum> tenum;
   std::unique_ptr<DocsEnum> docsEnum;
 
@@ -37,7 +37,7 @@ protected:
   void initWriter() {
     pool.rewind(save);
     dir = RAMDir();  // remove all files?
-    writer = std::make_unique<PostingsWriter>(dir, "10");
+    writer = std::make_unique<PostingsWriter>(dir, "10", 0x7fffffff);  // high maxDoc could cause a problem later, or mess up future "all docs have value" optimizations (norms?)
 
     // save the RNG state
     rng_start = rng;
@@ -50,7 +50,7 @@ protected:
 
     std::string gen = "10";
     reader = std::make_unique<PostingsReader>(dir, "10");
-    tindexReader = std::make_unique<FieldReader>(pool, *reader);
+    fieldReader = std::make_unique<FieldReader>(pool, *reader);
 
     // restore the RNG state
     rng = rng_start;
@@ -142,7 +142,7 @@ protected:
       if (numDocs > 0) {
         ASSERT_TRUE(tenum->nextTerm());
         ASSERT_EQ(tenum->term(), term);
-        docsEnum = std::make_unique<DocsEnum>(pool, *reader, *tindexReader, *tenum);
+        docsEnum = std::make_unique<DocsEnum>(pool, *reader, *fieldReader, *tenum);
         numDocsRead = docsEnum->numDocs();
       }
     } else {
@@ -178,9 +178,9 @@ protected:
     term.resize(12);
 
     if (read) {
-      tindexReader->readNextField();
-      ASSERT_EQ(fname, tindexReader->name());
-      tenum = std::make_unique<TermsEnum>(pool, *reader, *tindexReader);
+      fieldReader->readNextField();
+      ASSERT_EQ(fname, fieldReader->name());
+      tenum = std::make_unique<TermsEnum>(pool, *reader, *fieldReader);
     } else {
       writer->startField(fname);
     }
@@ -193,7 +193,7 @@ protected:
       addTerm(read, term, ndocs);
     }
     if (read) {
-      ASSERT_EQ(tindexReader->numTerms(), realNumTerms);
+      ASSERT_EQ(fieldReader->numTerms(), realNumTerms);
     } else {
       writer->endFieldTerms(fname);
       writer->endField(fname);
@@ -235,7 +235,7 @@ protected:
 TEST_F(PostingsTest, basic) {
   RAMDir dir;
   MemPool pool;
-  PostingsWriter writer(dir, "10");
+  PostingsWriter writer(dir, "10", 100);
   std::string t1 = "term1";
   std::string t2 = "term2";
   std::string ta = "termA";
@@ -289,16 +289,16 @@ TEST_F(PostingsTest, basic) {
 
   PostingsReader reader(dir, "10");
 
-  FieldReader tindexReader(pool, reader);
-  while (tindexReader.readNextField()) {
-    std::cout << "FIELD NAME name=" << tindexReader.name() << " numTerms=" << tindexReader.numTerms() << std::endl;
+  FieldReader fieldReader(pool, reader);
+  while (fieldReader.readNextField()) {
+    std::cout << "FIELD NAME name=" << fieldReader.name() << " numTerms=" << fieldReader.numTerms() << std::endl;
 
-    TermsEnum tenum(pool, reader, tindexReader);
+    TermsEnum tenum(pool, reader, fieldReader);
     while (tenum.nextTerm()) {
       std::cout << "\tTERM=" << tenum.term() << " ord=" << tenum.ord() << std::endl;
       // if (tenum.ord()==0) continue; // skip first term, good for figuring out of second term errors are due to reader or writer.
 
-      DocsEnum docsEnum(pool, reader, tindexReader, tenum);
+      DocsEnum docsEnum(pool, reader, fieldReader, tenum);
       auto ndocs = docsEnum.numDocs();
       std::cout << "\t\tnumDocs=" << docsEnum.numDocs() << " totalTermFreq=" << docsEnum.totalTermFreq() << std::endl;
 
@@ -321,7 +321,7 @@ TEST_F(PostingsTest, basic) {
 TEST_F(PostingsTest, blockPositions) {
   RAMDir dir;
   MemPool pool;
-  PostingsWriter writer(dir, "10");
+  PostingsWriter writer(dir, "10", 44);
   std::string t1 = "term1";
   TermRef term1(pool, t1.data(), t1.size());
 
@@ -351,18 +351,18 @@ TEST_F(PostingsTest, blockPositions) {
 
   PostingsReader reader(dir, "10");
 
-  FieldReader tindexReader(pool, reader);
-  ASSERT_TRUE(tindexReader.readNextField());
-  std::cout << "FIELD NAME name=" << tindexReader.name() << " numTerms=" << tindexReader.numTerms() << std::endl;
-  ASSERT_EQ(tindexReader.name(), std::string_view("field1"));
-  ASSERT_EQ(tindexReader.numTerms(), 1);
+  FieldReader fieldReader(pool, reader);
+  ASSERT_TRUE(fieldReader.readNextField());
+  std::cout << "FIELD NAME name=" << fieldReader.name() << " numTerms=" << fieldReader.numTerms() << std::endl;
+  ASSERT_EQ(fieldReader.name(), std::string_view("field1"));
+  ASSERT_EQ(fieldReader.numTerms(), 1);
 
-  TermsEnum tenum(pool, reader, tindexReader);
+  TermsEnum tenum(pool, reader, fieldReader);
   ASSERT_TRUE(tenum.nextTerm());
   ASSERT_EQ(tenum.ord(), 0);
   ASSERT_EQ(tenum.term(), std::string_view("term1"));
 
-  DocsEnum docsEnum(pool, reader, tindexReader, tenum);
+  DocsEnum docsEnum(pool, reader, fieldReader, tenum);
   ASSERT_EQ(docsEnum.numDocs(), 2);
   ASSERT_EQ(docsEnum.totalTermFreq(), nPos + nPos2);
 
@@ -398,14 +398,14 @@ TEST_F(PostingsTest, blockPositions) {
   }
 
   ASSERT_FALSE(tenum.nextTerm());
-  ASSERT_FALSE(tindexReader.readNextField());
+  ASSERT_FALSE(fieldReader.readNextField());
 }
 
 TEST_F(PostingsTest, blockTerms) {
   RAMDir dir;
   MemPool pool;
-  PostingsWriter writer(dir, "10");
   int nTerms = Postings::TERMS_BLOCK_SIZE + 1;
+  PostingsWriter writer(dir, "10", nTerms);
 
   writer.startField("field1");
 
@@ -427,13 +427,13 @@ TEST_F(PostingsTest, blockTerms) {
 
   PostingsReader reader(dir, "10");
 
-  FieldReader tindexReader(pool, reader);
-  ASSERT_TRUE(tindexReader.readNextField());
-  // std::cout << "FIELD NAME name=" << tindexReader.name() << " numTerms=" << tindexReader.numTerms() << std::endl;
-  ASSERT_EQ(tindexReader.name(), std::string_view("field1"));
-  ASSERT_EQ(tindexReader.numTerms(), nTerms);
+  FieldReader fieldReader(pool, reader);
+  ASSERT_TRUE(fieldReader.readNextField());
+  // std::cout << "FIELD NAME name=" << fieldReader.name() << " numTerms=" << fieldReader.numTerms() << std::endl;
+  ASSERT_EQ(fieldReader.name(), std::string_view("field1"));
+  ASSERT_EQ(fieldReader.numTerms(), nTerms);
 
-  TermsEnum tenum(pool, reader, tindexReader);
+  TermsEnum tenum(pool, reader, fieldReader);
   for (int i=0; i<nTerms; i++) {
     sprintf(tstr.data() + 4, "%08d", i);
 
@@ -442,7 +442,7 @@ TEST_F(PostingsTest, blockTerms) {
     ASSERT_EQ(tenum.term(), tstr);
 
 
-    DocsEnum docsEnum(pool, reader, tindexReader, tenum);
+    DocsEnum docsEnum(pool, reader, fieldReader, tenum);
     ASSERT_EQ(docsEnum.numDocs(), 1);
     ASSERT_EQ(docsEnum.totalTermFreq(), 2);
     ASSERT_EQ(docsEnum.nextDoc(), i);
@@ -457,7 +457,7 @@ TEST_F(PostingsTest, blockTerms) {
   }
 
   ASSERT_FALSE(tenum.nextTerm());
-  ASSERT_FALSE(tindexReader.readNextField());
+  ASSERT_FALSE(fieldReader.readNextField());
 }
 
 
@@ -552,5 +552,88 @@ TEST_F(PostingsTest, randWriteTmp) {
   }
 }
 #endif
+
+
+
+TEST_F(PostingsTest, intCol) {
+  RAMDir dir;
+  MemPool pool;
+  {
+    auto guard = pool.rewindScopeGuard();
+
+    PostingsWriter writer(dir, "10", 3);
+
+    // Temporary API - needs to be changed
+    IntColStats stats;
+    stats.add(77);
+    stats.add(33);
+    stats.add(11);
+
+    auto &finfo = writer.fieldInfos.emplace_back();
+    finfo.fieldName = "ifield1";
+    IntColWriter colWriter(pool, writer, finfo);
+    colWriter.startFieldIntCol("ifield1", stats);
+    colWriter.addInt64(77);
+    colWriter.addInt64(33);
+    colWriter.addInt64(11);
+    colWriter.startDocsWithValue();
+    colWriter.startDoc(0);
+    colWriter.startDoc(1);
+    colWriter.startDoc(2);
+    colWriter.endDocsWithValue();
+    colWriter.endField("ifield1");
+
+    writer.finish();
+  }
+
+  PostingsReader reader(dir, "10");
+  FieldReader fieldReader(pool, reader);
+  ASSERT_TRUE(fieldReader.readNextField());
+  ASSERT_EQ(fieldReader.name(), std::string_view("ifield1"));
+
+  IntColReader colReader(pool, reader, fieldReader);
+  ASSERT_EQ(colReader.docsWithValue(), 3);
+
+  {
+    IntColReader::DenseIterator iter(colReader);
+    ASSERT_EQ(iter.next(), 0);
+    ASSERT_EQ(iter.rank(), 0);
+    ASSERT_EQ(iter.docId(), 0);
+    ASSERT_EQ(iter.value(), 77);
+    ASSERT_EQ(iter.next(), 1);
+    ASSERT_EQ(iter.rank(), 1);
+    ASSERT_EQ(iter.docId(), 1);
+    ASSERT_EQ(iter.value(), 33);
+    ASSERT_EQ(iter.next(), 2);
+    ASSERT_EQ(iter.rank(), 2);
+    ASSERT_EQ(iter.docId(), 2);
+    ASSERT_EQ(iter.value(), 11);
+    ASSERT_EQ(iter.next(), screaming::BitSet::END);
+    ASSERT_EQ(iter.docId(), screaming::BitSet::END);
+  }
+
+  {
+    IntColReader::SparseIterator iter(colReader);
+    ASSERT_EQ(iter.next(), 0);
+    ASSERT_EQ(iter.rank(), 0);
+    ASSERT_EQ(iter.docId(), 0);
+    ASSERT_EQ(iter.value(), 77);
+    ASSERT_EQ(iter.next(), 1);
+    ASSERT_EQ(iter.rank(), 1);
+    ASSERT_EQ(iter.docId(), 1);
+    ASSERT_EQ(iter.value(), 33);
+    ASSERT_EQ(iter.next(), 2);
+    ASSERT_EQ(iter.rank(), 2);
+    ASSERT_EQ(iter.docId(), 2);
+    ASSERT_EQ(iter.value(), 11);
+    ASSERT_EQ(iter.next(), screaming::BitSet::END);
+    ASSERT_EQ(iter.docId(), screaming::BitSet::END);
+  }
+
+
+}
+
+
+
 
 } // end namespace

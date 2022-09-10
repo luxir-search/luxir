@@ -22,7 +22,7 @@ public:
   uint32_t positionsPerDocMax = 10;  // TODO: We don't have support for reading blocks yet, so make sure positionsPerDocMax*docsPerTermMax is less than a positions block size
   uint32_t docsPerTermMax = 10;
   uint32_t termsPerFieldMax = 100;  // TODO: stick to a single term block for now
-
+  int32_t highestDoc = -1;
 
   std::unique_ptr<PostingsReader> reader;
   std::unique_ptr<FieldReader> fieldReader;
@@ -63,7 +63,8 @@ public:
 
     fingerprint = 0;
 
-    writer = std::make_unique<PostingsWriter>(dir, "10");
+    highestDoc = -1;
+    writer = std::make_unique<PostingsWriter>(dir, "10", 0x7fffffff);  // use maximum value for maxDoc... nothing (currently) in text field depends on it.
 
     // save the RNG state
     rng_snapshot = r;
@@ -199,10 +200,10 @@ public:
     uint64_t actualttf = 0;
     for (uint32_t i = 0; i < numDocs; i++) {
       auto docDelta = getDocDelta(numDocs);
-      docid += docDelta;
-      if (docid > INT_MAX) {
+      if (docid + docDelta > INT_MAX) {
         break;
       }
+      docid += docDelta;
       actualDocs++;
       uint32_t numPositions = nPos<0 ? getNumPositions(numDocs) : (uint32_t)nPos;
       addDoc(read, (int) docid, numPositions);
@@ -212,6 +213,7 @@ public:
         // std::cout << "D fingerprint+=" << docid << " total=" << fingerprint << std::endl;
       }
     }
+    highestDoc = std::max(highestDoc, (int)docid);
     if (read) {
       if (numDocs > 0) {
         ASSERT_EQ(actualDocs, numDocsRead);

@@ -18,6 +18,12 @@ public:
 
   const char *ptr() const noexcept { return pos; }
 
+  const char *ptr(int64_t offset) const {
+    const char* p = start + offset;
+    assert(offset >= 0 && p <= end);  // it's OK for p==end since positioning at end is fine, just not reading.
+    return p;
+  }
+
   int64_t offset() const noexcept { return pos - start; }
 
   int64_t left() const noexcept { return end - pos; }  // how much data is left to read
