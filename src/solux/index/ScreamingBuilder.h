@@ -16,11 +16,11 @@ class ScreamingBuilder : public screaming::Builder<ScreamingBuilder> {
   OutputStream& out;
 public:
   ScreamingBuilder(MemPool& pool, OutputStream& out)
-  : Builder(pool.allocate(8192), pool.allocate(8192), pool.allocate(SCRATCH_SIZE), SCRATCH_SIZE), pool(pool), out(out) {
+  : Builder(pool.allocate(screaming::BitSet::SPARSE_CONTAINER_SIZE), pool.allocate(screaming::BitSet::DENSE_CONTAINER_SIZE), pool.allocate(SCRATCH_SIZE), SCRATCH_SIZE), pool(pool), out(out) {
   }
 
-  ScreamingBuilder(MemPool& pool, OutputStream& out, void* buf8192_a, void* buf8192_b, void* scratchBuf, uint32_t scratchSize)
-  : Builder(buf8192_a, buf8192_b, scratchBuf, scratchSize), pool(pool), out(out) {
+  ScreamingBuilder(MemPool& pool, OutputStream& out, void* sparseContainer, void* denseContainer, void* scratchBuf, uint32_t scratchSize)
+  : Builder(sparseContainer, denseContainer, scratchBuf, scratchSize), pool(pool), out(out) {
   }
 
 protected:

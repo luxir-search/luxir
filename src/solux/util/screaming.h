@@ -169,6 +169,11 @@ public:
   using Bits = OpenBitSet<BUCKET_SIZE, uint64_t, uint32_t>; // type for the bits only of a bit bucket
   static constexpr int32_t END = std::numeric_limits<int32_t>::max();
 
+  static constexpr uint32_t RANK_INDEX_SHIFT = 3; // for a dense (bitset) block, store a cumulative popcnt every 8 words
+  static constexpr uint32_t RANK_INDEX_SIZE = (Bits::numWords >> RANK_INDEX_SHIFT) * sizeof(uint16_t);
+  static constexpr uint32_t SPARSE_CONTAINER_SIZE = Bits::sizeInBytes;
+  static constexpr uint32_t DENSE_CONTAINER_SIZE = Bits::sizeInBytes + RANK_INDEX_SIZE;
+
 
   typedef struct {
     uint16_t upperBits; // upper 16 bits of all values in this bucket
@@ -403,13 +408,14 @@ public:
 
 protected:
 
-  // the number of bytes taken up by a block
-  int blockBytes(const BucketDescriptor& desc) {
+  // The number of bytes taken up by a block.
+  // NOTE: this requires knowing if a rank index is being used for dense blocks!
+  static constexpr int blockBytes(const BucketDescriptor& desc) {
     int sz = (int)desc.size + 1;
     if (sz <= BUCKET_SPARSE_MAX) {
       return sz * sizeof(uint16_t);
     } else {
-      return BUCKET_SIZE / 8;
+      return DENSE_CONTAINER_SIZE;
     }
   }
 
@@ -444,20 +450,22 @@ protected:
   void* scratch;         // the current scratch buffer
   uint32_t scratchSize;  // size of each scratch buffer
   const uint32_t maxDescriptors;
+  // rankIndex was initially a runtime switch per Builder, but this requires the iterators to know if a set was built
+  // with a rank index.  Given that the default is only 3% of dense blocks (and nothing otherwise), it doesn't currently
+  // seem worth it to make it switchable.
+  static constexpr bool rankIndex = true;        // store an index to speed up rank/ordinal calculations
 
 public:
-  Builder(void* buf8192_a, void* buf8192_b, void* scratchBuf, uint32_t scratchSize) :
-         values((uint16_t*)buf8192_a),
-         bits((Bits::word_type*)buf8192_b),
+  // buf_sparseContainer and buf_denseContainer should be of size SPARSE_CONTAINER_SIZE and DENSE_CONTAINER_SIZE
+  // SPARSE_CONTAINER_SIZE (max) is 8192 bytes, DENSE_CONTAINER_SIZE is 8448 (3.125% bigger) with RANK_INDEX_SHIFT==3
+  Builder(void* buf_sparseContainer, void* buf_denseContainer, void* scratchBuf, uint32_t scratchSize) :
+         values((uint16_t*)buf_sparseContainer),
+         bits((Bits::word_type*)buf_denseContainer),
          startScratch(scratchBuf),
          scratch(scratchBuf),
          scratchSize(scratchSize),
          maxDescriptors((scratchSize - sizeof(char*)) / sizeof(BucketDescriptor))
          {
-
-
-
-
   }
 
   uint32_t cardinality() {
@@ -563,7 +571,32 @@ protected:
 
       // TODO: store as negative set if too big
       writeSize = Bits::sizeInBytes;
-      write((void *) bits.words, writeSize);
+
+      if (rankIndex) {
+        writeSize = BitSet::DENSE_CONTAINER_SIZE;
+        uint16_t* rankIndexArr = reinterpret_cast<uint16_t*>(bits.words + bits.numWords);
+        uint16_t cumulativeRank = 0;
+        constexpr uint32_t wordsPerCount = (1<<BitSet::RANK_INDEX_SHIFT);
+        // The count represents the cumulative popcnt of the *previous* block, i.e. the first is 0.
+        // We could get rid of that count, at the cost of extra logic.  For iterators, we could also calculate rank
+        // from the nearest count (i.e. not always rounding down), but that logic would likely make things slower
+        // rather than faster. POPCNT on modern processors is fast and the extra branch mispredictions
+        // and code complexity prob wouldn't be worth it.
+        rankIndexArr[0] = 0;
+        // Don't count the last block... it would never be used in our current round-down scheme in the iterator.
+        // This also prevents cumulativeRank from overflowing 16 bits.  The other way to prevent it is to
+        // implement the all-bits-set optimization of skipping the block entirely.
+        for (int i=0; i<bits.numWords - wordsPerCount; i += wordsPerCount) {
+          int rank = 0;
+          for (int j=i; j < i + wordsPerCount; j++) {
+            rank += std::popcount(bits.words[j]);
+          }
+          cumulativeRank += rank;
+          rankIndexArr[(i>>BitSet::RANK_INDEX_SHIFT) + 1] = cumulativeRank;
+        }
+      }
+
+      write(bits.words, writeSize);
     }
 
     numBuckets++;
@@ -589,7 +622,7 @@ class StringStreamBuilder : public Builder<StringStreamBuilder> {
   std::ostringstream& out;
 public:
   explicit StringStreamBuilder(std::ostringstream& target, std::pmr::memory_resource* resource = std::pmr::get_default_resource()) :
-          Builder(resource->allocate(8192), resource->allocate(8192), resource->allocate(SCRATCH_SIZE), SCRATCH_SIZE),
+          Builder(resource->allocate(BitSet::SPARSE_CONTAINER_SIZE), resource->allocate(BitSet::DENSE_CONTAINER_SIZE), resource->allocate(SCRATCH_SIZE), SCRATCH_SIZE),
           resource(resource),
           out(target)
   {
@@ -597,8 +630,8 @@ public:
 
   ~StringStreamBuilder() {
     resource->deallocate(startScratch, SCRATCH_SIZE);
-    resource->deallocate((void *) bits.words, 8192);
-    resource->deallocate(values, 8192);
+    resource->deallocate((void *) bits.words, BitSet::DENSE_CONTAINER_SIZE);
+    resource->deallocate(values, BitSet::SPARSE_CONTAINER_SIZE);
   }
 
 protected:
