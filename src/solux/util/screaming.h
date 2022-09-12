@@ -216,15 +216,16 @@ public:
 
   class Iterator {
     // const BitSet& set;
-    const BitSet* set;
+    const BitSet *set;
     int32_t curr = -1;
     int32_t bucketIdx = -1;
     int32_t bucketBase = -1;
     int32_t bucketSize = 0;
+    int32_t bucketRank = 0; // number of values in all previous buckets
     uint16_t lowerBits;
 
     typedef struct {
-      uint16_t* values;
+      uint16_t *values;
       int32_t index;
     } SparseBucket;
 
@@ -239,12 +240,12 @@ public:
     union Bucket {
       SparseBucket sparse;
       DenseBucket bits;
-      Bucket(){};
+
+      Bucket() {};
     } bucket;
 
     // enum that takes 16 bits
-    enum BucketType : std::uint8_t
-    {
+    enum BucketType : std::uint8_t {
       SPARSE,
       DENSE,
       NEGATIVE
@@ -253,7 +254,7 @@ public:
     BucketType bucketType;
 
   public:
-    Iterator(const BitSet& set) : set(&set) {
+    Iterator(const BitSet &set) : set(&set) {
       bucketType = SPARSE;
       bucket.sparse.index = -1;
     }
@@ -347,6 +348,29 @@ public:
       return nextBucket();
     }
 
+    int32_t rank() {
+      switch (bucketType) {
+        case SPARSE:
+          return bucketRank + bucket.sparse.index;
+        case DENSE:
+          auto localIndex = uint16_t(curr);
+          int rankIdx = localIndex >> (Bits::wordShift + RANK_INDEX_SHIFT);
+          uint16_t *rankIndexArr = reinterpret_cast<uint16_t *>(bucket.bits.obs.words + Bits::numWords);
+          auto rankBase = rankIndexArr[rankIdx];
+          // Now find the rank of words before the current word in our mini-block
+          int wordIndex = localIndex >> Bits::wordShift;
+          constexpr uint16_t miniBlockMask = (1 << RANK_INDEX_SHIFT) - 1;
+          for (int i = wordIndex & ~miniBlockMask; i < wordIndex; i++) {
+            rankBase += std::popcount(bucket.bits.obs.words[i]);
+          }
+          uint8_t bitIdx = localIndex & Bits::wordMask;
+          auto bitsToTheRight = bitIdx == 0 ? 0 : (bucket.bits.obs.words[wordIndex] << (sizeof(Bits::word_type)*8 - bitIdx));
+          rankBase += std::popcount(bitsToTheRight);
+          return bucketRank + rankBase;
+      }
+      // unreachable
+    }
+
 
   protected:
     int32_t nextBucket() {
@@ -354,6 +378,8 @@ public:
         curr = END;
         return curr;
       }
+      bucketRank += bucketSize; // bucketSize is the size of the current bucket, before we advance to the next.
+
       bucketIdx++;
       const BucketDescriptor& desc = set->descriptors[bucketIdx];
       bucketBase = desc.upperBits << BUCKET_BITS;
@@ -374,7 +400,9 @@ public:
     bool advanceBucket(int32_t targetBase) {
       uint16_t upperBits = targetBase >> BUCKET_BITS;
       for (int i=bucketIdx+1; i<set->nBuckets; i++) {
+        bucketRank += bucketSize;
         auto desc = set->descriptors[i];
+        bucketSize = desc.size + 1;
         if (desc.upperBits >= upperBits) {
           bucketSetup(i);
           return true;

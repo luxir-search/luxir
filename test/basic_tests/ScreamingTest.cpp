@@ -173,6 +173,7 @@ public:
       int last = it.val();
       for(;;) {
         int val = it.next();
+
         auto gap = (int64_t)val - last;  // this can exceed signed int
         int seekTarget = last + 1 + rng.rint(gap);
         assert(seekTarget > last && seekTarget <= val);
@@ -192,6 +193,18 @@ public:
         }
 
         if (val == screaming::BitSet::END) break;
+
+        int rank = it.rank();
+        if (card != rank) {
+          rank = it.rank(); // breakpoint here
+          EXPECT_EQ(card, rank);
+        }
+        int rankResult = skipIter.rank();
+        if (rankResult != rank) {
+          rankResult = skipIter.rank(); // breakpoint here
+          EXPECT_EQ(rank, rankResult);
+        }
+
         itHash = itHash * 31 + val;
         card++;
       }
@@ -264,6 +277,9 @@ public:
 
 };
 
+TEST_F(ScreamingTest, debug) {
+}
+
 TEST_F(ScreamingTest, basic) {
   std::ostringstream ss;
   screaming::StringStreamBuilder builder(ss);
@@ -280,13 +296,15 @@ TEST_F(ScreamingTest, basic) {
   ASSERT_EQ(iter.val(), -1); // start off at -1
   ASSERT_EQ(iter.next(), 0xabcdef);
   ASSERT_EQ(iter.val(), 0xabcdef);
+  ASSERT_EQ(iter.rank(), 0);
   ASSERT_EQ(iter.next(), screaming::BitSet::END);
   ASSERT_EQ(iter.val(), screaming::BitSet::END);
 
   screaming::BitSet::Iterator iter2(bs);
   ASSERT_EQ(iter2.advance(0x01cdef), 0xabcdef);
+  ASSERT_EQ(iter2.val(), 0xabcdef);
+  ASSERT_EQ(iter2.rank(), 0);
   ASSERT_EQ(iter2.advance(0xabcfff), screaming::BitSet::END);
-
 
   // every other bit set for a dense test
   std::ostringstream buf;
@@ -303,6 +321,7 @@ TEST_F(ScreamingTest, basic) {
   for (int i=0; i<65536; i+=2) {
     ASSERT_EQ(iter.next(), i);
     ASSERT_EQ(iter.val(), i);
+    ASSERT_EQ(iter.rank(), i>>1);
   }
   ASSERT_EQ(iter.next(), screaming::BitSet::END);
   ASSERT_EQ(iter.val(), screaming::BitSet::END);
