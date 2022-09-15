@@ -349,6 +349,9 @@ public:
     }
 
     int32_t rank() {
+      // If we always want rank on every advance, we could do this more efficiently by updating the rank
+      // in the advance method.
+
       switch (bucketType) {
         case SPARSE:
           return bucketRank + bucket.sparse.index;

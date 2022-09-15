@@ -597,15 +597,12 @@ TEST_F(PostingsTest, intCol) {
   {
     IntColReader::DenseIterator iter(colReader);
     ASSERT_EQ(iter.next(), 0);
-    ASSERT_EQ(iter.rank(), 0);
     ASSERT_EQ(iter.docId(), 0);
     ASSERT_EQ(iter.value(), 77);
     ASSERT_EQ(iter.next(), 1);
-    ASSERT_EQ(iter.rank(), 1);
     ASSERT_EQ(iter.docId(), 1);
     ASSERT_EQ(iter.value(), 33);
     ASSERT_EQ(iter.next(), 2);
-    ASSERT_EQ(iter.rank(), 2);
     ASSERT_EQ(iter.docId(), 2);
     ASSERT_EQ(iter.value(), 11);
     ASSERT_EQ(iter.next(), screaming::BitSet::END);
@@ -613,24 +610,19 @@ TEST_F(PostingsTest, intCol) {
   }
 
   {
-    IntColReader::SparseIterator iter(colReader);
+    IntColReader::Iterator iter(colReader);
     ASSERT_EQ(iter.next(), 0);
-    ASSERT_EQ(iter.rank(), 0);
     ASSERT_EQ(iter.docId(), 0);
     ASSERT_EQ(iter.value(), 77);
     ASSERT_EQ(iter.next(), 1);
-    ASSERT_EQ(iter.rank(), 1);
     ASSERT_EQ(iter.docId(), 1);
     ASSERT_EQ(iter.value(), 33);
     ASSERT_EQ(iter.next(), 2);
-    ASSERT_EQ(iter.rank(), 2);
     ASSERT_EQ(iter.docId(), 2);
     ASSERT_EQ(iter.value(), 11);
     ASSERT_EQ(iter.next(), screaming::BitSet::END);
     ASSERT_EQ(iter.docId(), screaming::BitSet::END);
   }
-
-
 }
 
 

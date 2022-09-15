@@ -350,7 +350,10 @@ public:
     return *(newIter->second);
   }
 
-
+  void setDoc(int32_t docid) {
+    assert (docid >= currDoc);
+    currDoc = docid;
+  }
 
   void startDoc() {
     currDoc++;

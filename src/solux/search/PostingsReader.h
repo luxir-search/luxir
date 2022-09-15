@@ -159,7 +159,7 @@ class FieldReader {
   int64_t fieldOffsetsLoc; // location in the file of the above array
   PostingsReader& postingsReader;
 
-  PackedTerm fieldname;
+  PackedTerm fieldname{nullptr};
   bool fieldInfoRead = false;      // has field metadata been read for this field?
 
 
@@ -193,8 +193,8 @@ public:
     return nFields;
   }
 
-  bool seek(const std::string_view& fieldName) {
-    auto comparator = [&](const int32_t& fieldOff, const std::string_view& key) {
+  [[nodiscard]] bool seek(const std::string_view fieldName) {
+    auto comparator = [&](const int32_t fieldOff, const std::string_view key) {
       auto fieldNameFound = fieldIS.readPackedTerm(fieldOffsetsLoc - fieldOff);
       return fieldNameFound < key;
     };
@@ -215,7 +215,7 @@ public:
 
   // TODO: should this read into a different structure?  Only if we want to iterate over all fields but not read them?
   // one possible use case: a wildcard in field names (fast iteration would be a bonus)
-  bool readNextField() {
+  [[nodiscard]] bool readNextField() {
     if (currField+1 >= nFields) {
       return false;
     }
@@ -243,6 +243,8 @@ private:
   // Move to cpp? Or to different type?
   void readFieldInfo() {
     if (!fieldInfoRead) {
+      assert(fieldIS.left() > 0); // this assert triggers if this fieldReader is unpositioned.
+      assert(!fieldname.isNull());
       fieldInfoRead = true;
       // TODO: we could just keep this in compressed format / decode on demand as needed
       auto type = fieldIS.readVint();
@@ -886,10 +888,6 @@ public:
       max = col.docsWithValue_;
     }
 
-    int32_t rank() {
-      return doc;
-    }
-
     int32_t docId() {
       return doc;
     }
@@ -919,16 +917,16 @@ public:
   };
 
 
-  class SparseIterator {
+  class Iterator {
     const IntColReader* col;
     screaming::BitSet::Iterator docsIter;
     const int64_t* values;
-    int32_t rank_ = -1;
+    int32_t docRank = -1;
     int32_t doc = -1;
     int32_t maxRank;
     bool dense;
   public:
-    SparseIterator(const IntColReader& col) : col(&col), docsIter(col.docs), values(col.values) {
+    Iterator(const IntColReader& col) : col(&col), docsIter(col.docs), values(col.values) {
       maxRank = col.docsWithValue_;
       dense = col.docs.empty();
     }
@@ -937,32 +935,34 @@ public:
       return doc;
     }
 
+    /*** Don't expose this unless needed ... it could be tough to implement for some encodings!
     int32_t rank() {
-      return rank_;
+      return docRank;
     }
+    */
 
     int64_t value() {
-      return values[doc];
+      return values[docRank];
     }
 
     // TODO: directly expose docsIter (or the screaming set) here to enable bulk / direct operations on them?
 
     int32_t advance(int32_t target) {
       if (dense) {
-        doc = rank_ = target;
+        doc = docRank = target;
       } else { // Would a sparse-only iterator (so we don't have the dense code in here) improve performance?
         doc = docsIter.advance(target);
+        docRank = docsIter.rank();
       }
-      // TODO: update rank?
       return doc;
     }
 
     int32_t next() {
-      if (rank_+1 >= maxRank) {
+      if (docRank + 1 >= maxRank) {
         doc = screaming::BitSet::END;
         return doc;
       }
-      rank_++;
+      docRank++;
 
       if (dense) {
         doc++;
@@ -972,8 +972,6 @@ public:
 
       return doc;
     }
-
-
   };
 
 };

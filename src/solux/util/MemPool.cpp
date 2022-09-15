@@ -28,7 +28,7 @@ void MemPool::nextBuffer() {
 
 #ifdef MEMPOOL_MALLOC
 void MemPool::_rewind(const MemPool::save_point& savePoint, uint32_t buffersToSave) {
-  unused(buffersToSave);
+  solux::unused(buffersToSave);
 
   if (pointers.size() < savePoint.first) {
     // exceptions?
