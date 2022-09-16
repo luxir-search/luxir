@@ -41,7 +41,7 @@ static void BM_IndexBook(benchmark::State& state, std::string field, bool writeP
 
     if (writePostings) {
       segTest->initWriter();
-      inverter.flush(*segTest->writer);
+      inverter.flush(*segTest->postingsWriter);
     }
   }
 

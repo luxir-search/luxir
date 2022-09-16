@@ -208,16 +208,19 @@ public:
       // auto thisElapsed = std::chrono::duration_cast<std::chrono::nanoseconds>( endTime - startTime ).count();
       // std::cout << "terms=" << sz << " SORT time ns=" << thisElapsed << std::endl;
 
-      postingsWriter.startField(fieldName);
+      // Either reduce the resource for these, or share across different fields (in the same thread)
+      TextWriter textWriter(postingsWriter);
+
+      textWriter.startField(fieldName);
       for (size_t tnum=0; tnum<sz; tnum++) {
         auto term = terms[tnum];
-        postingsWriter.startTerm(term);
+        textWriter.startTerm(term);
         // push all the docs / positions for this term
-        term.val().pushDocs(inverter.pool, postingsWriter);
-        postingsWriter.endTerm(term);
+        term.val().pushDocs(inverter.pool, textWriter);
+        textWriter.endTerm(term);
       }
-      postingsWriter.endFieldTerms(fieldName);
-      postingsWriter.endField(fieldName);
+      textWriter.endFieldTerms(fieldName);
+      textWriter.endField(fieldName);
       termsHash.free();
     }
 

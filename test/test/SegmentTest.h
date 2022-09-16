@@ -13,7 +13,8 @@ public:
   RAMDir dir;
   MemPool pool;
   MemPool::save_point save = pool.getSavePoint();
-  std::unique_ptr<PostingsWriter> writer;
+  std::unique_ptr<PostingsWriter> postingsWriter;
+  std::unique_ptr<TextWriter> writer;
   std::string field;
   std::string term;
 
@@ -64,7 +65,8 @@ public:
     fingerprint = 0;
 
     highestDoc = -1;
-    writer = std::make_unique<PostingsWriter>(dir, "10", 0x7fffffff);  // use maximum value for maxDoc... nothing (currently) in text field depends on it.
+    postingsWriter = std::make_unique<PostingsWriter>(dir, "10", 0x7fffffff);  // use maximum value for maxDoc... nothing (currently) in text field depends on it.
+    writer = std::make_unique<TextWriter>(*postingsWriter);  // use maximum value for maxDoc... nothing (currently) in text field depends on it.
 
     // save the RNG state
     rng_snapshot = r;
@@ -73,7 +75,7 @@ public:
   }
 
   void initReader() {
-    writer->finish();
+    postingsWriter->finish();
 
     reader = std::make_unique<PostingsReader>(dir, "10");
     fieldReader = std::make_unique<FieldReader>(pool, *reader);

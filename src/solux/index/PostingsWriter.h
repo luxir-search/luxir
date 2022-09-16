@@ -139,18 +139,13 @@ namespace solux {
 class PostingsWriter {
   Directory& directory;
   std::string generation;
-  int32_t maxDoc;  // set by caller (IndexWriter)
+  int32_t maxDoc;  // set by caller
 public:
   MemPool pool;
 
-//
-// variable naming:
-// *loc* refers to absolute locations in a file, usually obtained via OutputStream::size()
-// *off* / *offset* refers to offsets relative to something else (i.e. a location)
-//
 
-  // TODO: pool allocate this
-  std::vector<char> compressed_output;
+
+  std::vector<std::unique_ptr<File>> files;
 
   OutputStream segOutput;     // output stream for segment info file
   OutputStream fieldOutput;   // output stream for field info
@@ -167,29 +162,6 @@ public:
   std::unique_ptr<File> colFile; // used for columns
 
 
-  // needed to build each block
-  std::vector<TermRef> termList;  // list of terms in the current term block
-  std::vector<uint32_t> docFileSize;         // size of the data in the docs file for this term (TODO: can we guarantee that this isn't bigger than 2B or 4B?)
-  std::vector<int32_t> pulsed; // if docFileSize==0, then the term has a single doc/pos that is pulsed, and those values are the next in this list.
-
-  // needed for each term
-  std::vector<int32_t> docs; // list of documents containing a term
-  std::vector<int32_t> tfreqs; // term freqs - number of times the term appears in each document (parallel vector to "docs")
-  std::vector<int32_t> posdeltas; // list of position deltas for the current term (for all documents... per-document positions are not delimited)
-
-
-  int64_t locOfPositionsForTermBlock;
-  int64_t locOfDocsForTermBlock;
-  int64_t locOfPositionsForTerm;
-  int64_t locOfDocsForTerm;
-
-  int64_t positionsHandled;  /// number of positions handled for the current term so far (everything except posdeltas)
-  int32_t docsFlushed;  /// number of documents flushed for the current term so far
-  int64_t totalTermFreqPrevDoc = 0; // total term freq up through the previous doc
-
-  std::vector<uint64_t> termBlockOffsets;  // offset from termsOffset (for this field) for each term block
-
-
     // Should this be refactored into a class?
   struct FieldInfo {
     std::string fieldName;
@@ -203,6 +175,7 @@ public:
 
     // column
     int64_t columnLoc;
+    // these two can be shared with text field for norms if needed
     int64_t docsWithValueEndLoc;
     int32_t docsWithValue;
 
@@ -211,31 +184,6 @@ public:
   FieldInfo* fieldInfo;
 
   std::vector<FieldInfo> fieldInfos;
-
-private:  // some internal utility methods... not for use by indexers
-  Postings postings; // contains limits and codecs
-
-  // number of docs for the current term
-  int32_t getDocFreq() const {
-    return docsFlushed + docs.size();
-  }
-
-  // total number of positions for the current term
-  int64_t getTotalTermFreq() const {
-    return positionsHandled + posdeltas.size();
-  }
-
-  // total number of positions for the current doc
-  int32_t getTermFreq() const {
-    return getTotalTermFreq() - totalTermFreqPrevDoc;
-  }
-
-  // the size the docfile takes
-  int32_t getDocFileSize() const {
-    auto sz = docOutput.size() - locOfDocsForTerm;
-    assert(sz <= UINT_MAX);
-    return sz;
-  }
 
 public:
   PostingsWriter(Directory& dir, const std::string_view& gen, int32_t maxDoc) : directory(dir), generation(gen), maxDoc(maxDoc)
@@ -289,6 +237,163 @@ public:
     return maxDoc;
   }
 
+private:
+  void writeSegmentInfo() {
+    assert(maxDoc >= 1);
+    segOutput.writeVint(maxDoc);
+    // Other info we should eventually write: version info, what other files are present, cfs info
+  }
+
+  void writeFieldIndex() {
+    //
+    // This format is position independent.  One just needs a pointer to the end of the final structure.
+    //
+    // Format:
+    // List of field metadata, followed by an array of offsets for each field, followed by the number of fields.
+    //
+
+    std::vector<uint32_t> fieldOffs;  // location of each field in fieldFile (TODO: what is the max number of fields we will support?)
+    fieldOffs.reserve(fieldInfos.size());
+
+    auto fieldsStart = fieldOutput.size();  // where this index starts
+
+    for (auto& finfo : fieldInfos) {
+      auto fieldLoc = fieldOutput.size();
+      fieldOffs.push_back(fieldLoc - fieldsStart);  // make the location relative so we can append this to a large file if necessary
+
+      fieldOutput.writeStr(finfo.fieldName);
+
+      if ((finfo.flags & 0x01) != 0) {
+        fieldOutput.writeVint(0x01);
+
+        fieldOutput.writeVlong(finfo.termBlockIndexLoc);
+        fieldOutput.writeVlong(
+                finfo.termsLoc);  // TODO: If we change termBlockOffsets to be relative to the start of that index, we can remove termsLoc
+        fieldOutput.writeVlong(finfo.docsLoc);
+        fieldOutput.writeVlong(finfo.posLoc);
+        fieldOutput.writeVint(finfo.numTerms);
+      }
+
+      if ((finfo.flags & 0x02) != 0) {
+        fieldOutput.writeVint(0x02);
+        fieldOutput.writeVlong(finfo.docsWithValue);
+        fieldOutput.writeVlong(finfo.docsWithValueEndLoc);
+        fieldOutput.writeVlong(finfo.columnLoc);
+      }
+    }
+
+    // Now write the start of each fieldInfo
+    // TODO: align this on 4 byte boundary
+    // Now make field offsets relative to the start of the locations array instead of the beginning of fields.
+    // It's minor, but allows us to remove another pointer (to the start of the fields)
+    auto locationsOff = fieldOutput.size() - fieldsStart;
+    for (auto& loc : fieldOffs) {
+      loc = locationsOff - loc;
+    }
+
+    fieldOutput.write(&(fieldOffs[0]), fieldOffs.size() * sizeof(fieldOffs[0]));
+    // write the size of the array at the end so we can use it to find the start when reading
+    fieldOutput.writeInt((int32_t)fieldOffs.size());
+  }
+
+  friend class IntColWriter;
+};
+
+
+
+
+class TextWriter {
+  PostingsWriter& postingsWriter;
+  PostingsWriter::FieldInfo* fieldInfo;
+  OutputStream& termOutput;    // output stream for termFile
+  OutputStream& docOutput;     // output stream for docFile
+  OutputStream& posOutput;     // output stream for posFile
+
+
+  //
+  // variable naming:
+  // *loc* refers to absolute locations in a file, usually obtained via OutputStream::size()
+  // *off* / *offset* refers to offsets relative to something else (i.e. a location)
+  //
+
+  // needed to build each block
+  std::vector<TermRef> termList;  // list of terms in the current term block
+  std::vector<uint32_t> docFileSize;         // size of the data in the docs file for this term (TODO: can we guarantee that this isn't bigger than 2B or 4B?)
+  std::vector<int32_t> pulsed; // if docFileSize==0, then the term has a single doc/pos that is pulsed, and those values are the next in this list.
+
+  // needed for each term
+  std::vector<int32_t> docs; // list of documents containing a term
+  std::vector<int32_t> tfreqs; // term freqs - number of times the term appears in each document (parallel vector to "docs")
+  std::vector<int32_t> posdeltas; // list of position deltas for the current term (for all documents... per-document positions are not delimited)
+
+
+  int64_t locOfPositionsForTermBlock;
+  int64_t locOfDocsForTermBlock;
+  int64_t locOfPositionsForTerm;
+  int64_t locOfDocsForTerm;
+
+  int64_t positionsHandled;  /// number of positions handled for the current term so far (everything except posdeltas)
+  int32_t docsFlushed;  /// number of documents flushed for the current term so far
+  int64_t totalTermFreqPrevDoc = 0; // total term freq up through the previous doc
+
+  std::vector<uint64_t> termBlockOffsets;  // offset from termsOffset (for this field) for each term block
+
+  // TODO: pool allocate this
+  std::vector<char> compressed_output;
+
+private:  // some internal utility methods... not for use by indexers
+  Postings postings; // contains limits and codecs
+
+  // number of docs for the current term
+  int32_t getDocFreq() const {
+    return docsFlushed + docs.size();
+  }
+
+  // total number of positions for the current term
+  int64_t getTotalTermFreq() const {
+    return positionsHandled + posdeltas.size();
+  }
+
+  // total number of positions for the current doc
+  int32_t getTermFreq() const {
+    return getTotalTermFreq() - totalTermFreqPrevDoc;
+  }
+
+  // the size the docfile takes
+  int32_t getDocFileSize() const {
+    auto sz = docOutput.size() - locOfDocsForTerm;
+    assert(sz <= UINT_MAX);
+    return sz;
+  }
+
+public:
+  TextWriter(PostingsWriter& postingsWriter)
+  : TextWriter(postingsWriter, postingsWriter.termOutput, postingsWriter.docOutput, postingsWriter.posOutput) {
+  }
+
+  TextWriter(PostingsWriter& postingsWriter, OutputStream& termOutput, OutputStream& docOutput, OutputStream& posOutput)
+  : postingsWriter(postingsWriter), termOutput(termOutput), docOutput(docOutput),posOutput(posOutput) {
+  }
+
+  void startField(const std::string& fieldName) {
+    PostingsWriter::FieldInfo* finfo = &postingsWriter.fieldInfos.emplace_back(); // TODO: not thread safe if we start using multiple threads to write text fields
+    finfo->fieldName = fieldName;
+    startField(finfo);
+  }
+
+  void startField(PostingsWriter::FieldInfo* finfo) {
+    fieldInfo = finfo;
+    fieldInfo->termsLoc = termOutput.size();
+    fieldInfo->docsLoc = docOutput.size();
+    fieldInfo->posLoc = posOutput.size();
+    fieldInfo->numTerms = 0;
+    fieldInfo->flags = 0x01;  // text field
+
+
+    termBlockOffsets.resize(0);
+
+    _startTermBlock(false);
+  }
 
   // Currently only called for a full block of positions.
   // TODO: move to .cpp unless we template this class... allows for removal of the associated include files
@@ -314,7 +419,7 @@ public:
       return;
     }
 
-    assert(docs.back() < maxDoc); // sanity check to ensure we didn't go over provided maxDoc
+    assert(docs.back() < postingsWriter.getMaxDoc()); // sanity check to ensure we didn't go over provided maxDoc
 
     // NOTE: some codecs (like s4-fastpfor-d1) modify the input array to calculate deltas!
     // given that we (could) already have deltas, is there an easy way to bypass that part?
@@ -324,7 +429,7 @@ public:
     compressed_output.resize(Postings::DOCS_BLOCK_SIZE * sizeof(int32_t) + 1024);
     uint32_t compressedSize = compressed_output.size(); // this gets changed to the actual size
     postings.docCodec.encodeBlock(reinterpret_cast<uint32_t *>(docs.data()), docs.size(), compressed_output.data(),
-                      compressedSize);
+                                  compressedSize);
     docOutput.write(compressed_output.data(), compressedSize);
 
     //
@@ -333,7 +438,7 @@ public:
     compressed_output.resize(Postings::TERMS_BLOCK_SIZE + 1024);
     compressedSize = compressed_output.size(); // this gets changed to the actual size
     postings.tfreqCodec.encodeBlock(reinterpret_cast<uint32_t *>(tfreqs.data()), tfreqs.size(), compressed_output.data(),
-                           compressedSize);
+                                    compressedSize);
     docOutput.write(compressed_output.data(), compressedSize);
 
     docsFlushed += docs.size();
@@ -480,7 +585,7 @@ public:
     unused(term);
     auto totalTermFreq = getTotalTermFreq();
     if (docs.size() > 0) {
-      assert(docs.back() < maxDoc); // sanity check to ensure we didn't go over provided maxDoc
+      assert(docs.back() < postingsWriter.getMaxDoc()); // sanity check to ensure we didn't go over provided maxDoc
     }
     // TODO: handle case when all docs were deleted for term (and term should no longer appear)
     if (totalTermFreq == 1) {
@@ -564,20 +669,7 @@ public:
     }
   }
 
-  void startField(const std::string& fieldName) {
-    fieldInfo = &fieldInfos.emplace_back();
-    fieldInfo->fieldName = fieldName;
-    fieldInfo->termsLoc = termOutput.size();
-    fieldInfo->docsLoc = docOutput.size();
-    fieldInfo->posLoc = posOutput.size();
-    fieldInfo->numTerms = 0;
-    fieldInfo->flags = 0x01;  // text field
 
-
-    termBlockOffsets.resize(0);
-
-    _startTermBlock(false);
-  }
 
 
   void endFieldTerms(const std::string& fieldName) {
@@ -630,80 +722,6 @@ public:
       flushPositions();
     }
   }
-
-
-
-
-private:
-  void writeSegmentInfo() {
-    assert(maxDoc >= 1);
-    segOutput.writeVint(maxDoc);
-    // Other info we should eventually write: version info, what other files are present, cfs info
-  }
-
-  void writeFieldIndex() {
-    //
-    // This format is position independent.  One just needs a pointer to the end of the final structure.
-    //
-    // Format:
-    // List of field metadata, followed by an array of offsets for each field, followed by the number of fields.
-    //
-
-    std::vector<uint32_t> fieldOffs;  // location of each field in fieldFile (TODO: what is the max number of fields we will support?)
-    fieldOffs.reserve(fieldInfos.size());
-
-    auto fieldsStart = fieldOutput.size();  // where this index starts
-
-    for (auto& finfo : fieldInfos) {
-      auto fieldLoc = fieldOutput.size();
-      fieldOffs.push_back(fieldLoc - fieldsStart);  // make the location relative so we can append this to a large file if necessary
-
-      fieldOutput.writeStr(finfo.fieldName);
-
-      if ((finfo.flags & 0x01) != 0) {
-        fieldOutput.writeVint(0x01);
-
-        fieldOutput.writeVlong(finfo.termBlockIndexLoc);
-        fieldOutput.writeVlong(
-                finfo.termsLoc);  // TODO: If we change termBlockOffsets to be relative to the start of that index, we can remove termsLoc
-        fieldOutput.writeVlong(finfo.docsLoc);
-        fieldOutput.writeVlong(finfo.posLoc);
-        fieldOutput.writeVint(finfo.numTerms);
-      }
-
-      if ((finfo.flags & 0x02) != 0) {
-        fieldOutput.writeVint(0x02);
-        fieldOutput.writeVlong(finfo.docsWithValue);
-        fieldOutput.writeVlong(finfo.docsWithValueEndLoc);
-        fieldOutput.writeVlong(finfo.columnLoc);
-      }
-    }
-
-    // Now write the start of each fieldInfo
-    // TODO: align this on 4 byte boundary
-    // Now make field offsets relative to the start of the locations array instead of the beginning of fields.
-    // It's minor, but allows us to remove another pointer (to the start of the fields)
-    auto locationsOff = fieldOutput.size() - fieldsStart;
-    for (auto& loc : fieldOffs) {
-      loc = locationsOff - loc;
-    }
-
-    fieldOutput.write(&(fieldOffs[0]), fieldOffs.size() * sizeof(fieldOffs[0]));
-    // write the size of the array at the end so we can use it to find the start when reading
-    fieldOutput.writeInt((int32_t)fieldOffs.size());
-  }
-
-  friend class IntColWriter;
-};
-
-
-
-
-class TextWriter {
-public:
-
-
-
 
 };
 

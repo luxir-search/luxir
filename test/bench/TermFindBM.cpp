@@ -48,7 +48,7 @@ static void BM_TermFind(benchmark::State& state, uint64_t maxId, int hitPercent)
   std::sort( std::begin(sorted), std::end(sorted),
              [&terms] (int i, int j) { return terms[i] < terms[j]; } );
 
-  PostingsWriter& w = *seg.writer;
+  TextWriter& w = *seg.writer;
   w.startField(fname);
   int32_t fp = 1;
   for (auto docid : sorted) {

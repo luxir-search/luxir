@@ -11,7 +11,8 @@ protected:
   RAMDir dir;
   MemPool pool;
   MemPool::save_point save = pool.getSavePoint();
-  std::unique_ptr<PostingsWriter> writer;
+  std::unique_ptr<PostingsWriter> postingsWriter;
+  std::unique_ptr<TextWriter> writer;
   std::string field;
   std::string term;
 
@@ -37,7 +38,8 @@ protected:
   void initWriter() {
     pool.rewind(save);
     dir = RAMDir();  // remove all files?
-    writer = std::make_unique<PostingsWriter>(dir, "10", 0x7fffffff);  // high maxDoc could cause a problem later, or mess up future "all docs have value" optimizations (norms?)
+    postingsWriter = std::make_unique<PostingsWriter>(dir, "10", 0x7fffffff);  // use maximum value for maxDoc... nothing (currently) in text field depends on it.
+    writer = std::make_unique<TextWriter>(*postingsWriter, postingsWriter->termOutput, postingsWriter->docOutput, postingsWriter->posOutput);  // use maximum value for maxDoc... nothing (currently) in text field depends on it.
 
     // save the RNG state
     rng_start = rng;
@@ -46,7 +48,7 @@ protected:
   }
 
   void initReader() {
-    writer->finish();
+    postingsWriter->finish();
 
     std::string gen = "10";
     reader = std::make_unique<PostingsReader>(dir, "10");
@@ -235,7 +237,9 @@ protected:
 TEST_F(PostingsTest, basic) {
   RAMDir dir;
   MemPool pool;
-  PostingsWriter writer(dir, "10", 100);
+  PostingsWriter postingsWriter(dir, "10", 100);
+  TextWriter writer(postingsWriter);
+
   std::string t1 = "term1";
   std::string t2 = "term2";
   std::string ta = "termA";
@@ -284,7 +288,7 @@ TEST_F(PostingsTest, basic) {
   writer.endFieldTerms("field2");
   writer.endField("field2");
 
-  writer.finish();
+  postingsWriter.finish();
 
 
   PostingsReader reader(dir, "10");
@@ -321,7 +325,8 @@ TEST_F(PostingsTest, basic) {
 TEST_F(PostingsTest, blockPositions) {
   RAMDir dir;
   MemPool pool;
-  PostingsWriter writer(dir, "10", 44);
+  PostingsWriter postingsWriter(dir, "10", 44);
+  TextWriter writer(postingsWriter);
   std::string t1 = "term1";
   TermRef term1(pool, t1.data(), t1.size());
 
@@ -347,7 +352,7 @@ TEST_F(PostingsTest, blockPositions) {
   writer.endTerm(term1);
   writer.endFieldTerms("field1");
   writer.endField("field1");
-  writer.finish();
+  postingsWriter.finish();
 
   PostingsReader reader(dir, "10");
 
@@ -405,8 +410,8 @@ TEST_F(PostingsTest, blockTerms) {
   RAMDir dir;
   MemPool pool;
   int nTerms = Postings::TERMS_BLOCK_SIZE + 1;
-  PostingsWriter writer(dir, "10", nTerms);
-
+  PostingsWriter postingsWriter(dir, "10", nTerms);
+  TextWriter writer(postingsWriter);
   writer.startField("field1");
 
   std::string tstr = "term";
@@ -423,7 +428,7 @@ TEST_F(PostingsTest, blockTerms) {
   }
   writer.endFieldTerms("field1");
   writer.endField("field1");
-  writer.finish();
+  postingsWriter.finish();
 
   PostingsReader reader(dir, "10");
 

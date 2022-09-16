@@ -41,7 +41,7 @@ static void BM_Invert(benchmark::State& state, std::string field, bool writePost
 
     if (writePostings) {
       segTest->initWriter();
-      inverter.flush(*segTest->writer);
+      inverter.flush(*segTest->postingsWriter);
     }
   }
 
