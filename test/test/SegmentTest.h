@@ -248,7 +248,6 @@ public:
     if (read) {
       ASSERT_EQ(fieldReader->numTerms(), realNumTerms);
     } else {
-      writer->endFieldTerms(fname);
       writer->endField(fname);
     }
   }

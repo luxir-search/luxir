@@ -219,7 +219,6 @@ public:
         term.val().pushDocs(inverter.pool, textWriter);
         textWriter.endTerm(term);
       }
-      textWriter.endFieldTerms(fieldName);
       textWriter.endField(fieldName);
       termsHash.free();
     }

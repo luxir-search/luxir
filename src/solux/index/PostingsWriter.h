@@ -670,9 +670,7 @@ public:
   }
 
 
-
-
-  void endFieldTerms(const std::string& fieldName) {
+  void endField(const std::string& fieldName) {
     // OPT: investigate inlining small fields in the terms index instead of pointing out to other files?  If we don't know how large the field will be,
     // we could always do it after-the-fact if the other outputs are rewindable (i.e. all in memory.)  If not, we could make it so by always starting
     // with new outputs for every field with first page in RAM.
@@ -687,9 +685,6 @@ public:
     fieldInfo->termBlockIndexLoc = termOutput.size();
     assert((int)termBlockOffsets.size() == ((fieldInfo->numTerms-1) / Postings::TERMS_BLOCK_SIZE) + 1);
     termOutput.write(&(termBlockOffsets[0]), termBlockOffsets.size() * sizeof(termBlockOffsets[0]) );
-  }
-
-  void endField(const std::string& fieldName) {
   }
 
 
