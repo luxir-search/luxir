@@ -145,6 +145,10 @@ public:
     return PackedTerm(const_cast<char *>(start + location));
   }
 
+  template<class T> T readVal() {
+    return T::read(*this);
+  }
+
   friend std::ostream &operator<<(std::ostream &out, const InputStream &is) {
     // TODO: print out some of the bytes before and after the current position?
     out << "{sz=" << (is.end - is.start) << " left=" << is.left()

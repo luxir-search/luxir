@@ -34,12 +34,27 @@ class OutputStream {
 
   friend class RAMFile;
 
-  // the associated File object controls the lifetime of the Buffer object
+  // the associated File object controls the lifetime of the buffer
   char *pos = nullptr;
   char *start = nullptr;
   char *end = nullptr;
   size_t flushedSize = 0; // number of bytes that have been flushed to the source
   File *target;
+public:
+  // hack - just used by postings writer to know what field number this stream is associated with.
+  // and avoid another level of nesting/indirection just to add it.
+  using sloc_type = uint64_t;  // sloc_type encodes both location/size and stream number into a segment-level location
+  static constexpr uint64_t STREAMNUM_BITS = 16;
+  uint16_t streamNumber;
+
+  static constexpr std::pair<uint64_t,uint16_t> offsetAndStreamNumber(sloc_type loc) {
+    constexpr uint64_t mask = (~uint64_t(0)) >> STREAMNUM_BITS;
+    return {loc & mask, loc >> STREAMNUM_BITS};
+  }
+
+  static constexpr sloc_type encodeSlocation(uint64_t offset, uint16_t streamNum) {
+    return offset + ((sloc_type)streamNum << STREAMNUM_BITS);
+  }
 
 public:
   // By not requiring the File target up-front, we can directly include OutputStream instances in other
@@ -65,6 +80,9 @@ public:
 
   char *ptr() const noexcept { return pos; } // the current position in the buffer
   size_t size() const noexcept { return flushedSize + buffered(); }
+
+  // location code that returns the current offset/size and the stream number
+  uint64_t slocation() const noexcept { return encodeSlocation(size(), streamNumber); }
 
   File *getFile() const noexcept { return target; }
 
@@ -173,6 +191,10 @@ public:
     writeStr(sv.data(), sv.length());
   }
 
+  // Implement write method for any type that has .write(OutputStream& os)
+  template <class T> void writeVal(const T& val) {
+    val.write(*this);
+  }
 };
 
 

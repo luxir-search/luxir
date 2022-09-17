@@ -143,9 +143,8 @@ class PostingsWriter {
 public:
   MemPool pool;
 
-
-
   std::vector<std::unique_ptr<File>> files;
+
 
   OutputStream segOutput;     // output stream for segment info file
   OutputStream fieldOutput;   // output stream for field info
@@ -165,18 +164,18 @@ public:
     // Should this be refactored into a class?
   struct FieldInfo {
     std::string fieldName;
-    int64_t termBlockIndexLoc;
-    int64_t termsLoc;
-    int64_t docsLoc;
-    int64_t posLoc;
+    seg_location termBlockIndexLoc;
+    seg_location termsLoc;
+    seg_location docsLoc;
+    seg_location posLoc;
     int64_t sumDocFreq;
     int64_t sumTotalTermFreq;
-    int numTerms;  // currently only updated in flushTerms()
+    int numTerms;
 
     // column
-    int64_t columnLoc;
+    seg_location columnLoc;
     // these two can be shared with text field for norms if needed
-    int64_t docsWithValueEndLoc;
+    seg_location docsWithValueEndLoc;
     int32_t docsWithValue;
 
     int32_t flags;  // temporary... currently has type info. 0x01 text, 0x02 int col.  In the future, we should decompose and have separate sections for each type
@@ -266,19 +265,18 @@ private:
       if ((finfo.flags & 0x01) != 0) {
         fieldOutput.writeVint(0x01);
 
-        fieldOutput.writeVlong(finfo.termBlockIndexLoc);
-        fieldOutput.writeVlong(
-                finfo.termsLoc);  // TODO: If we change termBlockOffsets to be relative to the start of that index, we can remove termsLoc
-        fieldOutput.writeVlong(finfo.docsLoc);
-        fieldOutput.writeVlong(finfo.posLoc);
+        fieldOutput.writeVal(finfo.termBlockIndexLoc);
+        fieldOutput.writeVal(finfo.termsLoc);  // TODO: If we change termBlockOffsets to be relative to the start of that index, we can remove termsLoc
+        fieldOutput.writeVal(finfo.docsLoc);
+        fieldOutput.writeVal(finfo.posLoc);
         fieldOutput.writeVint(finfo.numTerms);
       }
 
       if ((finfo.flags & 0x02) != 0) {
         fieldOutput.writeVint(0x02);
         fieldOutput.writeVlong(finfo.docsWithValue);
-        fieldOutput.writeVlong(finfo.docsWithValueEndLoc);
-        fieldOutput.writeVlong(finfo.columnLoc);
+        fieldOutput.writeVal(finfo.docsWithValueEndLoc);
+        fieldOutput.writeVal(finfo.columnLoc);
       }
     }
 
@@ -326,6 +324,10 @@ class TextWriter {
   std::vector<int32_t> tfreqs; // term freqs - number of times the term appears in each document (parallel vector to "docs")
   std::vector<int32_t> posdeltas; // list of position deltas for the current term (for all documents... per-document positions are not delimited)
 
+  // base (starting) values int the associated output streams to calculate offsets from
+  int64_t termsLoc;
+  int64_t docsLoc;
+  int64_t posLoc;
 
   int64_t locOfPositionsForTermBlock;
   int64_t locOfDocsForTermBlock;
@@ -337,6 +339,7 @@ class TextWriter {
   int64_t totalTermFreqPrevDoc = 0; // total term freq up through the previous doc
 
   std::vector<uint64_t> termBlockOffsets;  // offset from termsOffset (for this field) for each term block
+  int32_t numTerms; // currently only updated in flushTerms
 
   // TODO: pool allocate this
   std::vector<char> compressed_output;
@@ -383,12 +386,11 @@ public:
 
   void startField(PostingsWriter::FieldInfo* finfo) {
     fieldInfo = finfo;
-    fieldInfo->termsLoc = termOutput.size();
-    fieldInfo->docsLoc = docOutput.size();
-    fieldInfo->posLoc = posOutput.size();
-    fieldInfo->numTerms = 0;
+    termsLoc = termOutput.size();
+    docsLoc = docOutput.size();
+    posLoc = posOutput.size();
+    numTerms = 0;
     fieldInfo->flags = 0x01;  // text field
-
 
     termBlockOffsets.resize(0);
 
@@ -462,7 +464,7 @@ public:
     locOfPositionsForTermBlock = posOutput.size();
     locOfDocsForTermBlock = docOutput.size();
 
-    termBlockOffsets.push_back( termOutput.size() - fieldInfo->termsLoc);
+    termBlockOffsets.push_back( termOutput.size() - termsLoc);
   }
 
   void flushTerms(bool endingField) {
@@ -471,7 +473,7 @@ public:
       return;
     }
 
-    fieldInfo->numTerms += termList.size();
+    numTerms += termList.size();
 
     // TODO: find common prefix (i.e. min_prefix_len) for all terms in block and strip it off (same as common prefix of first and last)
     // important for some things that share long prefixes, like URLs for example.
@@ -483,8 +485,8 @@ public:
 
     // Write the terms block header.
     termOutput.writeStr(refdata, reflen);
-    termOutput.writeVlong(locOfDocsForTermBlock - fieldInfo->docsLoc);
-    termOutput.writeVlong(locOfPositionsForTermBlock - fieldInfo->posLoc);
+    termOutput.writeVlong(locOfDocsForTermBlock - docsLoc);
+    termOutput.writeVlong(locOfPositionsForTermBlock - posLoc);
 
     int nTerms = termList.size();
 
@@ -682,9 +684,14 @@ public:
     //   - make offsets be from the start of this index array... 32 bit normally fine, but not always for huge field?
     //   - sequence will be monotonically increasing (or decreasing)... interpolate?
     // Indexing RAM OPT: for fields with huge number of terms, we could stream this to separate file.  That would also facilitate alignment if it's important.
-    fieldInfo->termBlockIndexLoc = termOutput.size();
-    assert((int)termBlockOffsets.size() == ((fieldInfo->numTerms-1) / Postings::TERMS_BLOCK_SIZE) + 1);
+    fieldInfo->numTerms = numTerms;
+    fieldInfo->termBlockIndexLoc = seg_location(termOutput.size(), termOutput.streamNumber);
+    assert((int)termBlockOffsets.size() == ((numTerms-1) / Postings::TERMS_BLOCK_SIZE) + 1);
     termOutput.write(&(termBlockOffsets[0]), termBlockOffsets.size() * sizeof(termBlockOffsets[0]) );
+
+    fieldInfo->termsLoc = seg_location(termsLoc, termOutput.streamNumber);
+    fieldInfo->docsLoc = seg_location(docsLoc, docOutput.streamNumber);
+    fieldInfo->posLoc = seg_location(posLoc, posOutput.streamNumber);
   }
 
 
@@ -809,8 +816,8 @@ public:
 
     // FUTURE:write index into value blocks here
     fieldInfo.docsWithValue = nAdded;
-    fieldInfo.docsWithValueEndLoc = idEndLoc;
-    fieldInfo.columnLoc = colStart;
+    fieldInfo.docsWithValueEndLoc = seg_location(idEndLoc, colOutput.streamNumber);
+    fieldInfo.columnLoc = seg_location(colStart, colOutput.streamNumber);
   }
 };
 

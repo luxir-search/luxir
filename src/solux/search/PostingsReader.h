@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <assert.h>
 #include <iostream>
+#include <array>
 #include <ostream>
 #include <sstream>
 #include <unordered_map>
@@ -45,21 +46,77 @@ public:
   TFreqCodec& tfreqCodec = posCodec;
 
   static constexpr std::string_view INDEX_INFO_FILE = "s.olux"; // lists all segments in the index
-  static constexpr std::string_view PREFIX_FNAME = "s";
-  static constexpr std::string_view SEGMENT_INFO_FNAME = "_s";  // info about a single segment
+  static constexpr std::string_view PREFIX_FNAME = "s";  // prefix for all data files
+  static constexpr std::string_view SEGMENT_INFO_FNAME = "_s";  // info about a single segment...
   static constexpr std::string_view FIELDS_FNAME = "_f";
   static constexpr std::string_view TERMS_FNAME = "_t";
   static constexpr std::string_view DOCS_FNAME = "_d";
   static constexpr std::string_view POS_FNAME = "_p";
   static constexpr std::string_view COL_FNAME = "_c";
 
+  // Create a sortable string from a number.  It's currently
+  // a base36 representation prefixed with the number of digits-1 to make it sort correctly.
+  // Example: getSortableString(0)->"00", getSortableString(10)->"0a", getSortableString(36)->"110"
+  static std::string getSortableString(uint64_t val) {
+    std::array<char, 14> arr; // Need 13 digits (log(2**64)/log(36)==12.3) plus one for the length prefix.
+    auto start = arr.begin() + 1;  // leave room to write the prefix
+    auto[end, ec] = std::to_chars(start, arr.end(), val, 36);
+    uint8_t extraDigits = end - start - 1;
+    arr[0] = extraDigits <= 9 ? ('0' + extraDigits) : ('a' + (extraDigits - 10));  // base36 prefix
+    return std::string(arr.begin(), end);
+  }
 
-
-  static std::string getIndexFileName(const std::string_view& gen, const std::string_view& suffix) {
+  static std::string getIndexFileName(const std::string_view gen, const std::string_view suffix) {
     return std::string(PREFIX_FNAME).append(gen).append(suffix);
   }
 
+  static std::string getIndexFileName(const std::string_view gen, uint32_t filenum) {
+    std::string s = std::string(PREFIX_FNAME).append(gen);
+    s += '_';
+    s.append(getSortableString(filenum));
+    return s;
+  }
 
+
+
+
+
+};
+
+// A segment-global position (consists of a file number and a file offset)
+// It's made into its own type to enhance type safety so it won't accidentally
+// mix with a plain offset/location.
+class seg_location {
+  uint64_t x;
+  static constexpr uint8_t FILENUM_BITS = 20;
+  static constexpr uint8_t OFFSET_BITS = sizeof(uint64_t)*8 - FILENUM_BITS;
+  static constexpr uint64_t OFFSET_MASK = (~uint64_t(0)) >> FILENUM_BITS;
+
+public:
+  seg_location() noexcept {}
+
+  seg_location(uint64_t offset, uint32_t fnum) noexcept {
+    x = offset + ((uint64_t)fnum << OFFSET_BITS);
+  }
+
+  uint64_t offset() { return x & OFFSET_MASK; }
+  uint32_t filenum() { return x >> OFFSET_BITS; }
+
+  std::pair<uint64_t, uint32_t> decode() const noexcept {
+    return {x & OFFSET_MASK, x >> OFFSET_BITS};
+  }
+
+  void write(OutputStream& os) const {
+    auto [off, fnum] = decode();
+    os.writeVint(fnum);
+    os.writeVlong(off);
+  }
+
+  static seg_location read(InputStream& is) {
+    uint32_t fnum = is.readVint();
+    uint64_t off = is.readVlong();
+    return {off, fnum};
+  }
 };
 
 
@@ -249,15 +306,15 @@ private:
       // TODO: we could just keep this in compressed format / decode on demand as needed
       auto type = fieldIS.readVint();
       if (type == 0x01) {
-        termBlockIndexLoc = fieldIS.readVlong();
-        termsLoc = fieldIS.readVlong();
-        docsLoc = fieldIS.readVlong();
-        posLoc = fieldIS.readVlong();
+        termBlockIndexLoc = fieldIS.readVal<seg_location>().offset();
+        termsLoc = fieldIS.readVal<seg_location>().offset();
+        docsLoc = fieldIS.readVal<seg_location>().offset();
+        posLoc = fieldIS.readVal<seg_location>().offset();
         nTerms = fieldIS.readVint();
       } else if (type == 0x02) {
         docsWithValue = fieldIS.readVint();
-        docsWithValueEndLoc = fieldIS.readVlong();
-        columnLoc = fieldIS.readVlong();
+        docsWithValueEndLoc = fieldIS.readVal<seg_location>().offset();
+        columnLoc = fieldIS.readVal<seg_location>().offset();
       } else {
         // ?
       }
