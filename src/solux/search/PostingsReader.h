@@ -47,12 +47,7 @@ public:
 
   static constexpr std::string_view INDEX_INFO_FILE = "s.olux"; // lists all segments in the index
   static constexpr std::string_view PREFIX_FNAME = "s";  // prefix for all data files
-  static constexpr std::string_view SEGMENT_INFO_FNAME = "_s";  // info about a single segment...
-  static constexpr std::string_view FIELDS_FNAME = "_f";
-  static constexpr std::string_view TERMS_FNAME = "_t";
-  static constexpr std::string_view DOCS_FNAME = "_d";
-  static constexpr std::string_view POS_FNAME = "_p";
-  static constexpr std::string_view COL_FNAME = "_c";
+
 
   // Create a sortable string from a number.  It's currently
   // a base36 representation prefixed with the number of digits-1 to make it sort correctly.
@@ -77,10 +72,6 @@ public:
     return s;
   }
 
-
-
-
-
 };
 
 // A segment-global position (consists of a file number and a file offset)
@@ -95,27 +86,27 @@ class seg_location {
 public:
   seg_location() noexcept {}
 
-  seg_location(uint64_t offset, uint32_t fnum) noexcept {
+  seg_location(uint32_t fnum, uint64_t offset) noexcept {
     x = offset + ((uint64_t)fnum << OFFSET_BITS);
   }
 
-  uint64_t offset() { return x & OFFSET_MASK; }
-  uint32_t filenum() { return x >> OFFSET_BITS; }
+  uint32_t filenum() const noexcept { return x >> OFFSET_BITS; }
+  uint64_t offset() const noexcept { return x & OFFSET_MASK; }
 
-  std::pair<uint64_t, uint32_t> decode() const noexcept {
-    return {x & OFFSET_MASK, x >> OFFSET_BITS};
+  // return filenum, offset pair
+  std::pair< uint32_t, uint64_t> decode() const noexcept {
+    return {x >> OFFSET_BITS, x & OFFSET_MASK};
   }
 
   void write(OutputStream& os) const {
-    auto [off, fnum] = decode();
-    os.writeVint(fnum);
-    os.writeVlong(off);
+    os.writeVint(filenum());
+    os.writeVlong(offset());
   }
 
   static seg_location read(InputStream& is) {
     uint32_t fnum = is.readVint();
     uint64_t off = is.readVlong();
-    return {off, fnum};
+    return {fnum, off};
   }
 };
 
@@ -155,45 +146,56 @@ public:
 // PostingsReader should be thread-safe at the top level, but any iterators it supplies would not be.
 class PostingsReader {
   std::vector<std::shared_ptr<InputFile>> files;  // temporary owner of open files
+  std::vector<InputStream> inputStreams;
   int32_t maxdoc;
 public:
-  InputFile* fieldFile;
-  InputFile* termFile;
-  InputFile* docFile;
-  InputFile* posFile;
-  InputFile* colFile;
+  InputStream firstIS;
 
   Postings postings; // for codecs... temporary since they aren't necessarily thread safe?
 
   // TODO temporary... this will likely be done at a higher level?
   explicit PostingsReader(Directory& dir, std::string_view gen) {
-    auto segFile = dir.openFile(Postings::getIndexFileName(gen, Postings::SEGMENT_INFO_FNAME));
-    InputStream segIS = segFile->getInputStream();
-    maxdoc = segIS.readVint();
+    int nFiles = 6;
+    files.reserve(nFiles);
+    inputStreams.reserve(nFiles);
 
-    fieldFile = files.emplace_back(dir.openFile(Postings::getIndexFileName(gen, Postings::FIELDS_FNAME))).get();
-    termFile = files.emplace_back(dir.openFile(Postings::getIndexFileName(gen, Postings::TERMS_FNAME))).get();
-    docFile = files.emplace_back(dir.openFile(Postings::getIndexFileName(gen, Postings::DOCS_FNAME))).get();
-    posFile = files.emplace_back(dir.openFile(Postings::getIndexFileName(gen, Postings::POS_FNAME))).get();
-    colFile = files.emplace_back(dir.openFile(Postings::getIndexFileName(gen, Postings::COL_FNAME))).get();
+    files.emplace_back(dir.openFile(Postings::getIndexFileName(gen, 0)));
+    inputStreams.emplace_back(files[0]->getInputStream());
+    firstIS = inputStreams[0];
+
+    maxdoc = firstIS.readVint();  // TODO first file is currently just the seg file... that will change shortly!
+
+    for (int i=1; i<nFiles; i++) {
+      files.emplace_back(dir.openFile(Postings::getIndexFileName(gen, i)));
+      inputStreams.emplace_back(files.back()->getInputStream());
+    }
   }
 
-  PostingsReader(InputFile* fieldFile, InputFile* termFile, InputFile* docFile, InputFile* posFile)
-  : fieldFile(fieldFile), termFile(termFile), docFile(docFile), posFile(posFile)
-  {
-  }
-
-  int32_t maxDoc() {
+  int32_t maxDoc() const noexcept {
     return maxdoc;
   }
 
+  InputFile* getFile(uint32_t fnum) {
+    assert(fnum < files.size());
+    return files[fnum].get();
+  }
+
+  // We can't get & cache the InputStream in PostingsReader unless we create them all in the constructor (for thread safety)
+  // But if we're using mmap, that's probably fine?  Would not be fine if we need to read everything in the constructor.
+  InputStream getInputStream(uint32_t fnum) {
+    assert(fnum < inputStreams.size());
+    return inputStreams[fnum];
+  }
+
+  // return an InputStream positioned on the current location specified
+  InputStream getInputStreamSeek(seg_location sloc) {
+    InputStream is = getInputStream(sloc.filenum());
+    is.seek(sloc.offset());
+    return is;
+  }
+
   friend std::ostream& operator<< (std::ostream &out, const PostingsReader &reader) {
-    out << "PostingsReader:" << std::endl
-        << "  fieldFile=" << *reader.fieldFile << std::endl
-              << "  termFile=" << *reader.termFile << std::endl
-              << "  docFile=" << *reader.docFile << std::endl
-              << "  posFile=" << *reader.posFile << std::endl
-            ;
+    out << "PostingsReader: maxDoc=" << reader.maxDoc() << " files=" << reader.files;
     return out;
   }
 };
@@ -206,6 +208,7 @@ public:
 
 // not thread safe
 class FieldReader {
+  friend class DocsEnum;
   friend class TermsEnum;
   friend class IntColReader;
 
@@ -220,22 +223,22 @@ class FieldReader {
   bool fieldInfoRead = false;      // has field metadata been read for this field?
 
 
-  int64_t termBlockIndexLoc;  // location of index into the terms blocks
-  int64_t termsLoc;
-  int64_t docsLoc;
-  int64_t posLoc;
+  seg_location termBlockIndexLoc;  // location of index into the terms blocks
+  seg_location termsLoc;
+  seg_location docsLoc;
+  seg_location posLoc;
   int32_t nTerms;
 
   // column
   int32_t docsWithValue;
-  int64_t docsWithValueEndLoc;
-  int64_t columnLoc;
+  seg_location docsWithValueEndLoc;
+  seg_location columnLoc;
 
 
   // TODO: field number?
 public:
   FieldReader(MemPool& pool, PostingsReader& postingsReader) : postingsReader(postingsReader) {
-    fieldIS = postingsReader.fieldFile->getInputStream();
+    fieldIS = postingsReader.getInputStream(1); // TODO: temporary
     fieldIS.seek(fieldIS.size() - sizeof(int32_t));
     fieldOffsetsLoc = fieldIS.offset();
     auto fieldLocEnd = fieldIS.ptr();
@@ -306,15 +309,15 @@ private:
       // TODO: we could just keep this in compressed format / decode on demand as needed
       auto type = fieldIS.readVint();
       if (type == 0x01) {
-        termBlockIndexLoc = fieldIS.readVal<seg_location>().offset();
-        termsLoc = fieldIS.readVal<seg_location>().offset();
-        docsLoc = fieldIS.readVal<seg_location>().offset();
-        posLoc = fieldIS.readVal<seg_location>().offset();
+        termBlockIndexLoc = fieldIS.readVal<seg_location>();
+        termsLoc = fieldIS.readVal<seg_location>();
+        docsLoc = fieldIS.readVal<seg_location>();
+        posLoc = fieldIS.readVal<seg_location>();
         nTerms = fieldIS.readVint();
       } else if (type == 0x02) {
         docsWithValue = fieldIS.readVint();
-        docsWithValueEndLoc = fieldIS.readVal<seg_location>().offset();
-        columnLoc = fieldIS.readVal<seg_location>().offset();
+        docsWithValueEndLoc = fieldIS.readVal<seg_location>();
+        columnLoc = fieldIS.readVal<seg_location>();
       } else {
         // ?
       }
@@ -332,8 +335,15 @@ class TermsEnum {
 
   InputStream termsIS;
   PostingsReader& postingsReader;
-  FieldReader& fieldReader;
   MemPool& pool;
+
+  // field info copied from fieldReader
+  seg_location termBlockIndexLoc;  // location of index into the terms blocks
+  seg_location termsLoc;
+  seg_location docsLoc;
+  seg_location posLoc;
+  int32_t numTerms;
+
 
   PackedTerm currTerm;
   int32_t ordInBlock = -1; // the term number local to the current block
@@ -357,13 +367,19 @@ class TermsEnum {
   int32_t numTermBlocks;
 
 public:
-  TermsEnum(MemPool& pool, PostingsReader& postingsReader, FieldReader& fieldReader) : pool(pool), postingsReader(postingsReader), fieldReader(fieldReader) {
+  // TODO: don't store fieldReader... copy what is needed! (or use PostingsWriter::FieldInfo reference)
+  TermsEnum(MemPool& pool, PostingsReader& postingsReader, FieldReader& fieldReader) : pool(pool), postingsReader(postingsReader) {
     if (!fieldReader.fieldInfoRead) {
       fieldReader.readFieldInfo();
     }
+    termBlockIndexLoc = fieldReader.termBlockIndexLoc;
+    termsLoc = fieldReader.termsLoc;
+    docsLoc = fieldReader.docsLoc;
+    posLoc = fieldReader.posLoc;
+    numTerms = fieldReader.nTerms;
+
     numTermBlocks = ((fieldReader.nTerms-1) / Postings::TERMS_BLOCK_SIZE) + 1;
-    termsIS = postingsReader.termFile->getInputStream();
-    termsIS.seek(fieldReader.termBlockIndexLoc);  // TODO: make a single call to return the pointer of a location?
+    termsIS = postingsReader.getInputStreamSeek(termBlockIndexLoc);
     termBlockOffsets = reinterpret_cast<const int64_t*>(termsIS.ptr());  // offsets from termsLoc
     currTerm = PackedTerm(pool.allocate(256)); // TODO: pass in?  this will allocate for each term if called in a loop.  Could also have an init() method to reuse inst?
   }
@@ -389,16 +405,16 @@ public:
 
   // seeks to termBlockIndex and reads the block metadata + first term
   void readTermBlock() {
-    termsIS.seek(fieldReader.termsLoc + termBlockOffsets[termBlockIndex]);
+    termsIS.seek(termsLoc.offset() + termBlockOffsets[termBlockIndex]);
     startingOrd = termBlockIndex * Postings::TERMS_BLOCK_SIZE;  // we currently have fixed size blocks
     cumulativeDocsSize = 0;
     ordInBlock = 0;
-    maxOrdInBlock = std::min(Postings::TERMS_BLOCK_SIZE - 1, fieldReader.numTerms() - startingOrd - 1);
+    maxOrdInBlock = std::min(Postings::TERMS_BLOCK_SIZE - 1, numTerms - startingOrd - 1);
 
     // see PostingsWriter.flushTerms
     startingTerm = termsIS.readPackedTerm();
-    locOfDocsForTermBlock = fieldReader.docsLoc + termsIS.readVlong();  // fieldOffset + blockOffset for docs
-    locOfPositionsForTermBlock = fieldReader.posLoc + termsIS.readVlong();
+    locOfDocsForTermBlock = docsLoc.offset() + termsIS.readVlong();  // fieldOffset + blockOffset for docs
+    locOfPositionsForTermBlock = posLoc.offset() + termsIS.readVlong();
 
     memcpy(currTerm.ptr(), startingTerm.ptr(), startingTerm.memorySize());
 
@@ -411,7 +427,7 @@ public:
 
   bool nextTerm() {
     if (ordInBlock == maxOrdInBlock) {
-      if (ord() + 1 >= fieldReader.numTerms()) {  // could also compare number of blocks to detect end.
+      if (ord() + 1 >= numTerms) {  // could also compare number of blocks to detect end.
         return false;
       }
       termBlockIndex++;
@@ -462,7 +478,7 @@ public:
 
     auto blockOffsetPtr = std::upper_bound(termBlockOffsets, termBlockEnd, target,
                                  [&](const std::string_view& key, const int64_t& blockOffset) {
-      auto termAtBlock = termsIS.readPackedTerm(fieldReader.termsLoc + blockOffset);
+      auto termAtBlock = termsIS.readPackedTerm(termsLoc.offset() + blockOffset);
       auto ret = key < termAtBlock;
       // std::cout << "index=" << (&blockOffset-fieldReader.termBlockOffsets) << " termAtBlock=" << termAtBlock << " ret=" << ret << std::endl;
       return ret;
@@ -576,7 +592,6 @@ class DocsEnum {
   InputStream docIS;
   InputStream posIS;
   PostingsReader& postingsReader;
-  FieldReader& fieldReader;
   TermsEnum& tenum;
   MemPool& pool;
   int32_t docfreq; // number of docs containing this term
@@ -603,9 +618,9 @@ class DocsEnum {
   }
 
 public:
-  DocsEnum(MemPool& pool, PostingsReader& postingsReader, FieldReader& tindexReader, TermsEnum& tenum,
+  DocsEnum(MemPool& pool, PostingsReader& postingsReader, TermsEnum& tenum,
            int32_t* docsScratch=nullptr, int32_t* posScratch=nullptr, int32_t* tfreqScratch=nullptr)
-  : postingsReader(postingsReader), fieldReader(fieldReader), pool(pool), tenum(tenum)
+  : postingsReader(postingsReader), pool(pool), tenum(tenum)
   {
     docBuf=db;
     posBuf=pb;
@@ -639,7 +654,8 @@ public:
       locOfDocsForTermBlock = tenum.locOfDocsForTermBlock;
       locOfPositionsForTermBlock = tenum.locOfPositionsForTermBlock;
       cumulativeDocsSize = tenum.cumulativeDocsSize;
-      docIS = postingsReader.docFile->getInputStream();
+      docIS = postingsReader.getInputStream(tenum.docsLoc.filenum());
+
       // see the end of PostingsWiter.endTerm() for the term-specific metadata written there (docfreq, ttf, etc)
 
       // read last byte of docs to get the metadata size
@@ -656,7 +672,7 @@ public:
       startOfDocs = locOfDocsForTermBlock + cumulativeDocsSize - docsSize;
       docIS.seek(startOfDocs);
 
-      posIS = postingsReader.posFile->getInputStream();
+      posIS = postingsReader.getInputStream(tenum.posLoc.filenum());
       posIS.seek(locOfPositionsForTermBlock + posOffset);
       posBufEndDoc = posBufEnd = 0; // no positions read yet
       cumulativeTermFreq = 0;
@@ -920,14 +936,14 @@ public:
     }
     docsWithValue_ = fieldReader.docsWithValue;
 
-    columnIS = postingsReader.colFile->getInputStream();
-    columnIS.seek(fieldReader.columnLoc);
+    columnIS = postingsReader.getInputStreamSeek(fieldReader.columnLoc);
 
+    // docsWithValue is currently guaranteed to be in the same file as columnIS
     if (docsWithValue_ != postingsReader.maxDoc()) {
-      docs.set( columnIS.ptr(fieldReader.docsWithValueEndLoc) );
+      docs.set( columnIS.ptr(fieldReader.docsWithValueEndLoc.offset()) );
     }
 
-    values = reinterpret_cast<const int64_t *>(columnIS.ptr(fieldReader.columnLoc));  // offsets from termsLoc
+    values = reinterpret_cast<const int64_t *>(columnIS.ptr(fieldReader.columnLoc.offset()));  // offsets from termsLoc
   }
 
   int32_t docsWithValue() {

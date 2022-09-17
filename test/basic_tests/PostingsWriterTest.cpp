@@ -39,7 +39,7 @@ protected:
     pool.rewind(save);
     dir = RAMDir();  // remove all files?
     postingsWriter = std::make_unique<PostingsWriter>(dir, "10", 0x7fffffff);  // use maximum value for maxDoc... nothing (currently) in text field depends on it.
-    writer = std::make_unique<TextWriter>(*postingsWriter, postingsWriter->termOutput, postingsWriter->docOutput, postingsWriter->posOutput);  // use maximum value for maxDoc... nothing (currently) in text field depends on it.
+    writer = std::make_unique<TextWriter>(*postingsWriter);  // use maximum value for maxDoc... nothing (currently) in text field depends on it.
 
     // save the RNG state
     rng_start = rng;
@@ -144,7 +144,7 @@ protected:
       if (numDocs > 0) {
         ASSERT_TRUE(tenum->nextTerm());
         ASSERT_EQ(tenum->term(), term);
-        docsEnum = std::make_unique<DocsEnum>(pool, *reader, *fieldReader, *tenum);
+        docsEnum = std::make_unique<DocsEnum>(pool, *reader, *tenum);
         numDocsRead = docsEnum->numDocs();
       }
     } else {
@@ -299,7 +299,7 @@ TEST_F(PostingsTest, basic) {
       std::cout << "\tTERM=" << tenum.term() << " ord=" << tenum.ord() << std::endl;
       // if (tenum.ord()==0) continue; // skip first term, good for figuring out of second term errors are due to reader or writer.
 
-      DocsEnum docsEnum(pool, reader, fieldReader, tenum);
+      DocsEnum docsEnum(pool, reader, tenum);
       auto ndocs = docsEnum.numDocs();
       std::cout << "\t\tnumDocs=" << docsEnum.numDocs() << " totalTermFreq=" << docsEnum.totalTermFreq() << std::endl;
 
@@ -363,7 +363,7 @@ TEST_F(PostingsTest, blockPositions) {
   ASSERT_EQ(tenum.ord(), 0);
   ASSERT_EQ(tenum.term(), std::string_view("term1"));
 
-  DocsEnum docsEnum(pool, reader, fieldReader, tenum);
+  DocsEnum docsEnum(pool, reader, tenum);
   ASSERT_EQ(docsEnum.numDocs(), 2);
   ASSERT_EQ(docsEnum.totalTermFreq(), nPos + nPos2);
 
@@ -442,7 +442,7 @@ TEST_F(PostingsTest, blockTerms) {
     ASSERT_EQ(tenum.term(), tstr);
 
 
-    DocsEnum docsEnum(pool, reader, fieldReader, tenum);
+    DocsEnum docsEnum(pool, reader, tenum);
     ASSERT_EQ(docsEnum.numDocs(), 1);
     ASSERT_EQ(docsEnum.totalTermFreq(), 2);
     ASSERT_EQ(docsEnum.nextDoc(), i);

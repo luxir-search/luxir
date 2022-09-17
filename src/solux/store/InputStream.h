@@ -14,7 +14,9 @@ class InputStream {
 public:
   InputStream() = default;
 
-  InputStream(const char *start, const char *end) : pos(start), start(start), end(end) {}
+  InputStream(const char *start, const char *end) : pos(start), start(start), end(end) {
+    assert(end>=start);
+  }
 
   const char *ptr() const noexcept { return pos; }
 

@@ -143,25 +143,14 @@ class PostingsWriter {
 public:
   MemPool pool;
 
-  std::vector<std::unique_ptr<File>> files;
+  struct DataFile {
+    OutputStream out;
+    std::unique_ptr<File> file;
+    uint32_t fileNum;
+  };
 
 
-  OutputStream segOutput;     // output stream for segment info file
-  OutputStream fieldOutput;   // output stream for field info
-  OutputStream termOutput;    // output stream for termFile
-  OutputStream docOutput;     // output stream for docFile
-  OutputStream posOutput;     // output stream for posFile
-  OutputStream colOutput;     // output stream for columns
-
-  std::unique_ptr<File> segFile; // segment info
-  std::unique_ptr<File> fieldFile; // list of fields
-  std::unique_ptr<File> termFile; // terms for each field
-  std::unique_ptr<File> docFile; // documents for each term
-  std::unique_ptr<File> posFile; // positions for each term
-  std::unique_ptr<File> colFile; // used for columns
-
-
-    // Should this be refactored into a class?
+    // Should this be refactored into a class? Used on read-side as well?
   struct FieldInfo {
     std::string fieldName;
     seg_location termBlockIndexLoc;
@@ -182,28 +171,21 @@ public:
   };
   FieldInfo* fieldInfo;
 
-  std::vector<FieldInfo> fieldInfos;
+  std::vector<DataFile> files;  // TODO! not multi-threaded compat since vector can cause previous entries to move!
+  std::vector<FieldInfo> fieldInfos; // TODO! not multi-threaded compat since vector can cause previous entries to move!
 
 public:
   PostingsWriter(Directory& dir, const std::string_view& gen, int32_t maxDoc) : directory(dir), generation(gen), maxDoc(maxDoc)
   {
     // TODO: defer file creation until needed, *or* use a RAMDelegatingFile that does so.
     // that does so.
-    segFile    = directory.createFile(Postings::getIndexFileName(gen, Postings::SEGMENT_INFO_FNAME));
-    fieldFile  = directory.createFile(Postings::getIndexFileName(gen, Postings::FIELDS_FNAME));
-    termFile   = directory.createFile(Postings::getIndexFileName(gen, Postings::TERMS_FNAME));
-    docFile    = directory.createFile(Postings::getIndexFileName(gen, Postings::DOCS_FNAME));
-    posFile    = directory.createFile(Postings::getIndexFileName(gen, Postings::POS_FNAME));
-    colFile    = directory.createFile(Postings::getIndexFileName(gen, Postings::COL_FNAME));
 
-    segOutput.setFile(segFile.get());
-    fieldOutput.setFile(fieldFile.get());
-    termOutput.setFile(termFile.get());
-    docOutput.setFile(docFile.get());
-    posOutput.setFile(posFile.get());
-    colOutput.setFile(colFile.get());
-
-    // TODO: if we hit an error, should we clean up any files?
+    for (int i=0; i<6; i++) {
+      std::unique_ptr<File> file = directory.createFile(Postings::getIndexFileName(gen, i));
+      files.emplace_back(DataFile{OutputStream{},std::move(file), i});
+      files.back().out.setFile( files.back().file.get());
+      files.back().out.streamNumber = i;
+    }
   }
 
   void finish() {
@@ -211,21 +193,10 @@ public:
     writeSegmentInfo();
     // TODO: implement compound files for small files
 
-    // minor optimization here - we close the files in sorted order to trigger the
-    // optimization in RAMDir
-    colOutput.close();
-    directory.finishFile(*colFile);
-    docOutput.close();
-    directory.finishFile(*docFile);
-    fieldOutput.close();
-    directory.finishFile(*fieldFile);
-    posOutput.close();
-    directory.finishFile(*posFile);
-    segOutput.close();
-    directory.finishFile(*segFile);   // TODO... should this be last, or is there a higher level sync mechanism to prevent reading seg file before other files are written?
-    termOutput.close();
-    directory.finishFile(*termFile);
-
+    for (auto& dataFile : files) {
+      dataFile.out.close();
+      directory.finishFile(*dataFile.file);
+    }
   }
 
   void setMaxDoc(int max) {
@@ -239,7 +210,7 @@ public:
 private:
   void writeSegmentInfo() {
     assert(maxDoc >= 1);
-    segOutput.writeVint(maxDoc);
+    files[0].out.writeVint(maxDoc);
     // Other info we should eventually write: version info, what other files are present, cfs info
   }
 
@@ -251,6 +222,7 @@ private:
     // List of field metadata, followed by an array of offsets for each field, followed by the number of fields.
     //
 
+    OutputStream& fieldOutput = files[1].out;
     std::vector<uint32_t> fieldOffs;  // location of each field in fieldFile (TODO: what is the max number of fields we will support?)
     fieldOffs.reserve(fieldInfos.size());
 
@@ -371,7 +343,7 @@ private:  // some internal utility methods... not for use by indexers
 
 public:
   TextWriter(PostingsWriter& postingsWriter)
-  : TextWriter(postingsWriter, postingsWriter.termOutput, postingsWriter.docOutput, postingsWriter.posOutput) {
+  : TextWriter(postingsWriter, postingsWriter.files[2].out, postingsWriter.files[3].out, postingsWriter.files[4].out) {
   }
 
   TextWriter(PostingsWriter& postingsWriter, OutputStream& termOutput, OutputStream& docOutput, OutputStream& posOutput)
@@ -685,13 +657,13 @@ public:
     //   - sequence will be monotonically increasing (or decreasing)... interpolate?
     // Indexing RAM OPT: for fields with huge number of terms, we could stream this to separate file.  That would also facilitate alignment if it's important.
     fieldInfo->numTerms = numTerms;
-    fieldInfo->termBlockIndexLoc = seg_location(termOutput.size(), termOutput.streamNumber);
+    fieldInfo->termBlockIndexLoc = seg_location(termOutput.streamNumber, termOutput.size());
     assert((int)termBlockOffsets.size() == ((numTerms-1) / Postings::TERMS_BLOCK_SIZE) + 1);
     termOutput.write(&(termBlockOffsets[0]), termBlockOffsets.size() * sizeof(termBlockOffsets[0]) );
 
-    fieldInfo->termsLoc = seg_location(termsLoc, termOutput.streamNumber);
-    fieldInfo->docsLoc = seg_location(docsLoc, docOutput.streamNumber);
-    fieldInfo->posLoc = seg_location(posLoc, posOutput.streamNumber);
+    fieldInfo->termsLoc = seg_location(termOutput.streamNumber, termsLoc);
+    fieldInfo->docsLoc = seg_location(docOutput.streamNumber, docsLoc);
+    fieldInfo->posLoc = seg_location(posOutput.streamNumber, posLoc);
   }
 
 
@@ -747,8 +719,8 @@ class IntColWriter {
 public:
 
   // This field writer does not do any visible pool rollbacks, but does allocate from the pool.
-  IntColWriter(MemPool& pool, PostingsWriter& postingsWriter, PostingsWriter::FieldInfo& fieldInfo) : pool(pool), postingsWriter(postingsWriter), fieldInfo(fieldInfo), colOutput(postingsWriter.colOutput),
-                                                                docsWithVal(pool, colOutput) {
+  IntColWriter(MemPool& pool, PostingsWriter& postingsWriter, PostingsWriter::FieldInfo& fieldInfo)
+  : pool(pool), postingsWriter(postingsWriter), fieldInfo(fieldInfo), colOutput(postingsWriter.files[5].out), docsWithVal(pool, colOutput) {
     // TODO: docsWithVal allocates 17K from pool that may not be used... should we try to delay this somehow? (an explicit init function?)
     // Perhaps the indirection associated with delaying the ScreamingBuilder construction would be optimized away since startDoc() would be
     // called in a tight loop.
@@ -816,8 +788,8 @@ public:
 
     // FUTURE:write index into value blocks here
     fieldInfo.docsWithValue = nAdded;
-    fieldInfo.docsWithValueEndLoc = seg_location(idEndLoc, colOutput.streamNumber);
-    fieldInfo.columnLoc = seg_location(colStart, colOutput.streamNumber);
+    fieldInfo.docsWithValueEndLoc = seg_location(colOutput.streamNumber, idEndLoc);
+    fieldInfo.columnLoc = seg_location(colOutput.streamNumber, colStart);
   }
 };
 

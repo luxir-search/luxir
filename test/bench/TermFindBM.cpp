@@ -69,10 +69,10 @@ static void BM_TermFind(benchmark::State& state, uint64_t maxId, int hitPercent)
 
   seg.initReader();
   PostingsReader& postingsReader = *seg.reader;
-  FieldReader& tindexReader = *seg.fieldReader;
-  ASSERT_EQ(true, tindexReader.readNextField());
+  FieldReader& fieldReader = *seg.fieldReader;
+  ASSERT_EQ(true, fieldReader.readNextField());
   ASSERT_EQ((std::string_view)fname, seg.fieldReader->name());
-  TermsEnum tenum(pool, postingsReader, tindexReader);
+  TermsEnum tenum(pool, postingsReader, fieldReader);
 
 
   int hitFrac = hitPercent==0 ? -1 : hitPercent * 0x00ffff / 100; // convert to a fraction of 0x00ffff
@@ -97,7 +97,7 @@ static void BM_TermFind(benchmark::State& state, uint64_t maxId, int hitPercent)
       if (found) {
         // hits++;
         fingerprint += tenum.term().size();
-        DocsEnum docsEnum(pool, postingsReader, tindexReader, tenum);
+        DocsEnum docsEnum(pool, postingsReader, tenum);
         auto df = docsEnum.numDocs();
         // sumdf += df;
         fingerprint += df;

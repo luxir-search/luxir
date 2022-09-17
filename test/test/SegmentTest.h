@@ -190,7 +190,7 @@ public:
       if (numDocs > 0) {
         ASSERT_TRUE(tenum->nextTerm());
         ASSERT_EQ(tenum->term(), term);
-        docsEnum = std::make_unique<DocsEnum>(pool, *reader, *fieldReader, *tenum);
+        docsEnum = std::make_unique<DocsEnum>(pool, *reader, *tenum);
         numDocsRead = docsEnum->numDocs();
       }
     } else {
@@ -274,7 +274,7 @@ public:
       TermsEnum tenum(pool, *reader, fieldReader);
       while (tenum.nextTerm()) {
         totTerms++;
-        DocsEnum docsEnum(pool, *reader, fieldReader, tenum);
+        DocsEnum docsEnum(pool, *reader, tenum);
         auto ndocs = docsEnum.numDocs();
         for (int i = 0; i < ndocs; i++) {
           auto id = docsEnum.nextDoc();
