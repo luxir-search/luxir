@@ -175,14 +175,16 @@ protected:
     }
   }
 
+  SegFieldInfo fieldInfo;
   void addField(bool read, const std::string &fname, uint32_t numTerms) {
     std::string term = "term";
     term.resize(12);
 
     if (read) {
-      fieldReader->readNextField();
+      ASSERT_TRUE(fieldReader->readNextField());
       ASSERT_EQ(fname, fieldReader->name());
-      tenum = std::make_unique<TermsEnum>(pool, *reader, *fieldReader);
+      fieldReader->readFieldInfo(fieldInfo);
+      tenum = std::make_unique<TermsEnum>(pool, *reader, fieldInfo);
     } else {
       writer->startField(fname);
     }
@@ -195,7 +197,7 @@ protected:
       addTerm(read, term, ndocs);
     }
     if (read) {
-      ASSERT_EQ(fieldReader->numTerms(), realNumTerms);
+      ASSERT_EQ(tenum->numTerms(), realNumTerms);
     } else {
       writer->endField(fname);
     }
@@ -292,9 +294,10 @@ TEST_F(PostingsTest, basic) {
 
   FieldReader fieldReader(pool, reader);
   while (fieldReader.readNextField()) {
-    std::cout << "FIELD NAME name=" << fieldReader.name() << " numTerms=" << fieldReader.numTerms() << std::endl;
-
-    TermsEnum tenum(pool, reader, fieldReader);
+    std::cout << "FIELD NAME name=" << fieldReader.name() << std::endl;
+    SegFieldInfo fieldInfo;
+    fieldReader.readFieldInfo(fieldInfo);
+    TermsEnum tenum(pool, reader, fieldInfo);
     while (tenum.nextTerm()) {
       std::cout << "\tTERM=" << tenum.term() << " ord=" << tenum.ord() << std::endl;
       // if (tenum.ord()==0) continue; // skip first term, good for figuring out of second term errors are due to reader or writer.
@@ -354,11 +357,12 @@ TEST_F(PostingsTest, blockPositions) {
 
   FieldReader fieldReader(pool, reader);
   ASSERT_TRUE(fieldReader.readNextField());
-  std::cout << "FIELD NAME name=" << fieldReader.name() << " numTerms=" << fieldReader.numTerms() << std::endl;
+  std::cout << "FIELD NAME name=" << fieldReader.name() << std::endl;
   ASSERT_EQ(fieldReader.name(), std::string_view("field1"));
-  ASSERT_EQ(fieldReader.numTerms(), 1);
-
-  TermsEnum tenum(pool, reader, fieldReader);
+  SegFieldInfo fieldInfo;
+  fieldReader.readFieldInfo(fieldInfo);
+  TermsEnum tenum(pool, reader, fieldInfo);
+  ASSERT_EQ(tenum.numTerms(), 1);
   ASSERT_TRUE(tenum.nextTerm());
   ASSERT_EQ(tenum.ord(), 0);
   ASSERT_EQ(tenum.term(), std::string_view("term1"));
@@ -431,10 +435,12 @@ TEST_F(PostingsTest, blockTerms) {
   ASSERT_TRUE(fieldReader.readNextField());
   // std::cout << "FIELD NAME name=" << fieldReader.name() << " numTerms=" << fieldReader.numTerms() << std::endl;
   ASSERT_EQ(fieldReader.name(), std::string_view("field1"));
-  ASSERT_EQ(fieldReader.numTerms(), nTerms);
+  SegFieldInfo fieldInfo;
+  fieldReader.readFieldInfo(fieldInfo);
+  TermsEnum tenum(pool, reader, fieldInfo);
+  ASSERT_EQ(tenum.numTerms(), nTerms);
 
-  TermsEnum tenum(pool, reader, fieldReader);
-  for (int i=0; i<nTerms; i++) {
+    for (int i=0; i<nTerms; i++) {
     sprintf(tstr.data() + 4, "%08d", i);
 
     ASSERT_TRUE(tenum.nextTerm());
@@ -590,8 +596,10 @@ TEST_F(PostingsTest, intCol) {
   FieldReader fieldReader(pool, reader);
   ASSERT_TRUE(fieldReader.readNextField());
   ASSERT_EQ(fieldReader.name(), std::string_view("ifield1"));
+  SegFieldInfo fieldInfo;
+  fieldReader.readFieldInfo(fieldInfo);
 
-  IntColReader colReader(pool, reader, fieldReader);
+  IntColReader colReader(pool, reader, fieldInfo);
   ASSERT_EQ(colReader.docsWithValue(), 3);
 
   {

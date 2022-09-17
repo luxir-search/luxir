@@ -188,6 +188,8 @@ namespace solux::test {
     std::string name;
     Inverter* inverter;
     Inverter::IndexHandler* indexHandler;
+
+    SegFieldInfo fieldInfo;
     std::unique_ptr<IntColReader> colReader;
     std::unique_ptr<IntColReader::Iterator> iter;
 
@@ -214,7 +216,8 @@ namespace solux::test {
       if (testIndex.postingsReader.get() == nullptr) { testIndex.initReader(); }
       // position fieldReader
       EXPECT_EQ(true, testIndex.fieldReader->seek(name));
-      colReader = std::make_unique<IntColReader>(testIndex.pool, *testIndex.postingsReader, *testIndex.fieldReader);
+      testIndex.fieldReader->readFieldInfo(fieldInfo);
+      colReader = std::make_unique<IntColReader>(testIndex.pool, *testIndex.postingsReader, fieldInfo);
       ASSERT_EQ(colReader->docsWithValue(), nAdds);
       iter = std::make_unique<IntColReader::Iterator>(*colReader);
     }

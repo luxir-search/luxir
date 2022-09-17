@@ -111,6 +111,7 @@ public:
 };
 
 
+
 class IntColStats {
   int64_t minval = std::numeric_limits<int64_t>::max();
   int64_t maxval = std::numeric_limits<int64_t>::min();
@@ -142,7 +143,7 @@ public:
 
 
 
-// Lowest level postings reader class that needs to correspond to the PostingsWriter class that created the data.
+  // Lowest level postings reader class that needs to correspond to the PostingsWriter class that created the data.
 // PostingsReader should be thread-safe at the top level, but any iterators it supplies would not be.
 class PostingsReader {
   std::vector<std::shared_ptr<InputFile>> files;  // temporary owner of open files
@@ -206,7 +207,27 @@ public:
 // That could just be FieldReader, but we will probably have a higher level than that eventually.
 //
 
-// not thread safe
+
+
+struct SegFieldInfo {
+  PackedTerm fieldname;
+  seg_location termBlockIndexLoc;  // location of index into the terms blocks
+  seg_location termsLoc;
+  seg_location docsLoc;
+  seg_location posLoc;
+  int32_t nTerms;
+
+  // column
+  int32_t docsWithValue;
+  seg_location docsWithValueEndLoc;
+  seg_location columnLoc;
+};
+
+
+
+
+
+  // not thread safe
 class FieldReader {
   friend class DocsEnum;
   friend class TermsEnum;
@@ -221,19 +242,6 @@ class FieldReader {
 
   PackedTerm fieldname{nullptr};
   bool fieldInfoRead = false;      // has field metadata been read for this field?
-
-
-  seg_location termBlockIndexLoc;  // location of index into the terms blocks
-  seg_location termsLoc;
-  seg_location docsLoc;
-  seg_location posLoc;
-  int32_t nTerms;
-
-  // column
-  int32_t docsWithValue;
-  seg_location docsWithValueEndLoc;
-  seg_location columnLoc;
-
 
   // TODO: field number?
 public:
@@ -290,41 +298,36 @@ public:
     return true;
   }
 
-
-  TermRef name() { return fieldname; }
-  int numTerms() {
+  // only valid after readNextField() returns true or seek() returns true.
+  // The SegFieldInfo produced is independent of FieldReader.
+  void readFieldInfo(SegFieldInfo& fieldInfo) {
+    fieldInfo.fieldname = fieldname;
+    assert(fieldIS.left() > 0); // this assert triggers if this fieldReader is unpositioned.
+    assert(!fieldname.isNull());
+    assert(!fieldInfoRead);  // we could back up and re-read based on currField
     if (!fieldInfoRead) {
-      readFieldInfo();
-    }
-    return nTerms;
-  }  // TODO: maybe move this down in hierarchy given that we don't know where it will be stored in the future?
-
-private:
-  // Move to cpp? Or to different type?
-  void readFieldInfo() {
-    if (!fieldInfoRead) {
-      assert(fieldIS.left() > 0); // this assert triggers if this fieldReader is unpositioned.
-      assert(!fieldname.isNull());
       fieldInfoRead = true;
-      // TODO: we could just keep this in compressed format / decode on demand as needed
       auto type = fieldIS.readVint();
       if (type == 0x01) {
-        termBlockIndexLoc = fieldIS.readVal<seg_location>();
-        termsLoc = fieldIS.readVal<seg_location>();
-        docsLoc = fieldIS.readVal<seg_location>();
-        posLoc = fieldIS.readVal<seg_location>();
-        nTerms = fieldIS.readVint();
+        fieldInfo.termBlockIndexLoc = fieldIS.readVal<seg_location>();
+        fieldInfo.termsLoc = fieldIS.readVal<seg_location>();
+        fieldInfo.docsLoc = fieldIS.readVal<seg_location>();
+        fieldInfo.posLoc = fieldIS.readVal<seg_location>();
+        fieldInfo.nTerms = fieldIS.readVint();
       } else if (type == 0x02) {
-        docsWithValue = fieldIS.readVint();
-        docsWithValueEndLoc = fieldIS.readVal<seg_location>();
-        columnLoc = fieldIS.readVal<seg_location>();
+        fieldInfo.docsWithValue = fieldIS.readVint();
+        fieldInfo.docsWithValueEndLoc = fieldIS.readVal<seg_location>();
+        fieldInfo.columnLoc = fieldIS.readVal<seg_location>();
       } else {
         // ?
       }
     }
   }
 
-  // Any reason to expose field number?
+  TermRef name() { return fieldname; }
+
+private:
+
 };
 
 
@@ -337,13 +340,7 @@ class TermsEnum {
   PostingsReader& postingsReader;
   MemPool& pool;
 
-  // field info copied from fieldReader
-  seg_location termBlockIndexLoc;  // location of index into the terms blocks
-  seg_location termsLoc;
-  seg_location docsLoc;
-  seg_location posLoc;
-  int32_t numTerms;
-
+  const SegFieldInfo& fieldInfo;
 
   PackedTerm currTerm;
   int32_t ordInBlock = -1; // the term number local to the current block
@@ -367,21 +364,16 @@ class TermsEnum {
   int32_t numTermBlocks;
 
 public:
-  // TODO: don't store fieldReader... copy what is needed! (or use PostingsWriter::FieldInfo reference)
-  TermsEnum(MemPool& pool, PostingsReader& postingsReader, FieldReader& fieldReader) : pool(pool), postingsReader(postingsReader) {
-    if (!fieldReader.fieldInfoRead) {
-      fieldReader.readFieldInfo();
-    }
-    termBlockIndexLoc = fieldReader.termBlockIndexLoc;
-    termsLoc = fieldReader.termsLoc;
-    docsLoc = fieldReader.docsLoc;
-    posLoc = fieldReader.posLoc;
-    numTerms = fieldReader.nTerms;
-
-    numTermBlocks = ((fieldReader.nTerms-1) / Postings::TERMS_BLOCK_SIZE) + 1;
-    termsIS = postingsReader.getInputStreamSeek(termBlockIndexLoc);
+  // fieldInfo is not copied and should remain valid throughout the lifetime of this TermsEnum and any related classes such as DocsEnum
+  TermsEnum(MemPool& pool, PostingsReader& postingsReader, const SegFieldInfo& fieldInfo) : pool(pool), postingsReader(postingsReader), fieldInfo(fieldInfo) {
+    numTermBlocks = ((fieldInfo.nTerms-1) / Postings::TERMS_BLOCK_SIZE) + 1;
+    termsIS = postingsReader.getInputStreamSeek(fieldInfo.termBlockIndexLoc);
     termBlockOffsets = reinterpret_cast<const int64_t*>(termsIS.ptr());  // offsets from termsLoc
     currTerm = PackedTerm(pool.allocate(256)); // TODO: pass in?  this will allocate for each term if called in a loop.  Could also have an init() method to reuse inst?
+  }
+
+  int32_t numTerms() const {
+    return fieldInfo.nTerms;
   }
 
   int32_t ord() const {
@@ -405,16 +397,16 @@ public:
 
   // seeks to termBlockIndex and reads the block metadata + first term
   void readTermBlock() {
-    termsIS.seek(termsLoc.offset() + termBlockOffsets[termBlockIndex]);
+    termsIS.seek(fieldInfo.termsLoc.offset() + termBlockOffsets[termBlockIndex]);
     startingOrd = termBlockIndex * Postings::TERMS_BLOCK_SIZE;  // we currently have fixed size blocks
     cumulativeDocsSize = 0;
     ordInBlock = 0;
-    maxOrdInBlock = std::min(Postings::TERMS_BLOCK_SIZE - 1, numTerms - startingOrd - 1);
+    maxOrdInBlock = std::min(Postings::TERMS_BLOCK_SIZE - 1, fieldInfo.nTerms - startingOrd - 1);
 
     // see PostingsWriter.flushTerms
     startingTerm = termsIS.readPackedTerm();
-    locOfDocsForTermBlock = docsLoc.offset() + termsIS.readVlong();  // fieldOffset + blockOffset for docs
-    locOfPositionsForTermBlock = posLoc.offset() + termsIS.readVlong();
+    locOfDocsForTermBlock = fieldInfo.docsLoc.offset() + termsIS.readVlong();  // fieldOffset + blockOffset for docs
+    locOfPositionsForTermBlock = fieldInfo.posLoc.offset() + termsIS.readVlong();
 
     memcpy(currTerm.ptr(), startingTerm.ptr(), startingTerm.memorySize());
 
@@ -427,7 +419,7 @@ public:
 
   bool nextTerm() {
     if (ordInBlock == maxOrdInBlock) {
-      if (ord() + 1 >= numTerms) {  // could also compare number of blocks to detect end.
+      if (ord() + 1 >= fieldInfo.nTerms) {  // could also compare number of blocks to detect end.
         return false;
       }
       termBlockIndex++;
@@ -478,7 +470,7 @@ public:
 
     auto blockOffsetPtr = std::upper_bound(termBlockOffsets, termBlockEnd, target,
                                  [&](const std::string_view& key, const int64_t& blockOffset) {
-      auto termAtBlock = termsIS.readPackedTerm(termsLoc.offset() + blockOffset);
+      auto termAtBlock = termsIS.readPackedTerm(fieldInfo.termsLoc.offset() + blockOffset);
       auto ret = key < termAtBlock;
       // std::cout << "index=" << (&blockOffset-fieldReader.termBlockOffsets) << " termAtBlock=" << termAtBlock << " ret=" << ret << std::endl;
       return ret;
@@ -592,7 +584,7 @@ class DocsEnum {
   InputStream docIS;
   InputStream posIS;
   PostingsReader& postingsReader;
-  TermsEnum& tenum;
+  const SegFieldInfo& fieldInfo;
   MemPool& pool;
   int32_t docfreq; // number of docs containing this term
   int64_t ttf;    // totalTermFreq (sum of term freq across all docs for this term)
@@ -618,9 +610,11 @@ class DocsEnum {
   }
 
 public:
+  // After this constructor has finished, this DocsEnum instance is independent of the TermsEnum instance.
+  // This instance *does* rely on fieldInfo that was passed into the TermsEnum instance still being valid.
   DocsEnum(MemPool& pool, PostingsReader& postingsReader, TermsEnum& tenum,
            int32_t* docsScratch=nullptr, int32_t* posScratch=nullptr, int32_t* tfreqScratch=nullptr)
-  : postingsReader(postingsReader), pool(pool), tenum(tenum)
+  : postingsReader(postingsReader), pool(pool), fieldInfo(tenum.fieldInfo)
   {
     docBuf=db;
     posBuf=pb;
@@ -654,7 +648,7 @@ public:
       locOfDocsForTermBlock = tenum.locOfDocsForTermBlock;
       locOfPositionsForTermBlock = tenum.locOfPositionsForTermBlock;
       cumulativeDocsSize = tenum.cumulativeDocsSize;
-      docIS = postingsReader.getInputStream(tenum.docsLoc.filenum());
+      docIS = postingsReader.getInputStream(fieldInfo.docsLoc.filenum());
 
       // see the end of PostingsWiter.endTerm() for the term-specific metadata written there (docfreq, ttf, etc)
 
@@ -672,7 +666,7 @@ public:
       startOfDocs = locOfDocsForTermBlock + cumulativeDocsSize - docsSize;
       docIS.seek(startOfDocs);
 
-      posIS = postingsReader.getInputStream(tenum.posLoc.filenum());
+      posIS = postingsReader.getInputStream(fieldInfo.posLoc.filenum());
       posIS.seek(locOfPositionsForTermBlock + posOffset);
       posBufEndDoc = posBufEnd = 0; // no positions read yet
       cumulativeTermFreq = 0;
@@ -921,33 +915,27 @@ public:
 class IntColReader {
   InputStream columnIS;
   PostingsReader &postingsReader;
-  FieldReader &fieldReader;
+  const SegFieldInfo &fieldInfo;
   MemPool &pool;
-  int32_t docsWithValue_;
   screaming::BitSet docs;
   const int64_t* values;
 
 public:
-  IntColReader(MemPool &pool, PostingsReader &postingsReader, FieldReader &fieldReader) : pool(pool),
+  IntColReader(MemPool &pool, PostingsReader &postingsReader, const SegFieldInfo &fieldInfo) : pool(pool),
                                                                                           postingsReader(postingsReader),
-                                                                                          fieldReader(fieldReader) {
-    if (!fieldReader.fieldInfoRead) {
-      fieldReader.readFieldInfo();
-    }
-    docsWithValue_ = fieldReader.docsWithValue;
-
-    columnIS = postingsReader.getInputStreamSeek(fieldReader.columnLoc);
+                                                                                          fieldInfo(fieldInfo) {
+    columnIS = postingsReader.getInputStreamSeek(fieldInfo.columnLoc);
 
     // docsWithValue is currently guaranteed to be in the same file as columnIS
-    if (docsWithValue_ != postingsReader.maxDoc()) {
-      docs.set( columnIS.ptr(fieldReader.docsWithValueEndLoc.offset()) );
+    if (fieldInfo.docsWithValue != postingsReader.maxDoc()) {
+      docs.set( columnIS.ptr(fieldInfo.docsWithValueEndLoc.offset()) );
     }
 
-    values = reinterpret_cast<const int64_t *>(columnIS.ptr(fieldReader.columnLoc.offset()));  // offsets from termsLoc
+    values = reinterpret_cast<const int64_t *>(columnIS.ptr(fieldInfo.columnLoc.offset()));  // offsets from termsLoc
   }
 
   int32_t docsWithValue() {
-    return docsWithValue_;
+    return fieldInfo.docsWithValue;
   }
 
 
@@ -958,7 +946,7 @@ public:
   public:
     DenseIterator(const IntColReader& col)  {
       values = col.values;
-      max = col.docsWithValue_;
+      max = col.fieldInfo.docsWithValue;
     }
 
     int32_t docId() {
@@ -1000,7 +988,7 @@ public:
     bool dense;
   public:
     Iterator(const IntColReader& col) : col(&col), docsIter(col.docs), values(col.values) {
-      maxRank = col.docsWithValue_;
+      maxRank = col.fieldInfo.docsWithValue;
       dense = col.docs.empty();
     }
 

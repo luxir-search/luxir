@@ -72,7 +72,9 @@ static void BM_TermFind(benchmark::State& state, uint64_t maxId, int hitPercent)
   FieldReader& fieldReader = *seg.fieldReader;
   ASSERT_EQ(true, fieldReader.readNextField());
   ASSERT_EQ((std::string_view)fname, seg.fieldReader->name());
-  TermsEnum tenum(pool, postingsReader, fieldReader);
+  SegFieldInfo fieldInfo;
+  fieldReader.readFieldInfo(fieldInfo);
+  TermsEnum tenum(pool, postingsReader, fieldInfo);
 
 
   int hitFrac = hitPercent==0 ? -1 : hitPercent * 0x00ffff / 100; // convert to a fraction of 0x00ffff

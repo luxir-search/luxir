@@ -96,9 +96,11 @@ public:
     // std::cout << "INDEX SIZE tif=" << tindexFile->size() << " tf=" << termFile->size() << " df=" << docFile->size() << " pf=" << posFile->size() << std::endl;
   }
 
-  // make a new terms enum .tenum from the current fieldReader... a must if the fieldReader has changed states
+  // make a new terms enum .tenum from the current fieldReader... only call if fieldReader has changed states
+  SegFieldInfo fieldInfo;
   void makeTermsEnum() {
-    tenum = std::make_unique<TermsEnum>(pool, *reader, *fieldReader);
+    fieldReader->readFieldInfo(fieldInfo);
+    tenum = std::make_unique<TermsEnum>(pool, *reader, fieldInfo);
   }
 
   uint32_t getPositionDelta(int nPositions) {
@@ -231,7 +233,7 @@ public:
     term.resize(12);
 
     if (read) {
-      fieldReader->readNextField();
+      ASSERT_TRUE(fieldReader->readNextField());
       ASSERT_EQ(fname, fieldReader->name());
       makeTermsEnum();
     } else {
@@ -246,7 +248,7 @@ public:
       addTerm(read, term, ndocs, nPos);
     }
     if (read) {
-      ASSERT_EQ(fieldReader->numTerms(), realNumTerms);
+      ASSERT_EQ(tenum->numTerms(), realNumTerms);
     } else {
       writer->endField(fname);
     }
@@ -270,8 +272,10 @@ public:
     int64_t totPositions = 0;
     int64_t ret = 0;
     FieldReader fieldReader(pool, *reader);
+    SegFieldInfo fieldInfo;
     while (fieldReader.readNextField()) {
-      TermsEnum tenum(pool, *reader, fieldReader);
+      fieldReader.readFieldInfo(fieldInfo);
+      TermsEnum tenum(pool, *reader, fieldInfo);
       while (tenum.nextTerm()) {
         totTerms++;
         DocsEnum docsEnum(pool, *reader, tenum);
