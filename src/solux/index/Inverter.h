@@ -270,8 +270,8 @@ public:
       auto guard = postingsWriter.pool.rewindScopeGuard(); // rewind any use by IntColWriter after we are done.
 
       // TODO: move this to postingsWriter method
-      PostingsWriter::FieldInfo& fieldInfo = postingsWriter.fieldInfos.emplace_back();
-      fieldInfo.fieldName = fieldName;
+      PostingsWriter::IndexFieldInfo& fieldInfo = postingsWriter.fieldInfos.emplace_back();
+      fieldInfo.fieldname = fieldName;
 
       IntColWriter writer(postingsWriter.pool, postingsWriter, fieldInfo);
       auto full = stats.numVals() >= postingsWriter.getMaxDoc();

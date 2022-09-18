@@ -99,7 +99,8 @@ public:
   // is to enable it from a single Inverter (i.e. inverter can split and write to multiple postings writers)
   // TODO: should we be able to provide an inverter instead of get?
   // TODO: currently not thread safe
-  // Only valid until a flush
+  // Only valid until a flush!
+  // Make this a thread-local?
   Inverter &getInverter() {
     if (inverter == nullptr) {
       inverter = std::make_unique<Inverter>();

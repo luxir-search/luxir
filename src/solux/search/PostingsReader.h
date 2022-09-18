@@ -143,8 +143,9 @@ public:
 
 
 
-  // Lowest level postings reader class that needs to correspond to the PostingsWriter class that created the data.
+// Lowest level postings reader class that needs to correspond to the PostingsWriter class that created the data.
 // PostingsReader should be thread-safe at the top level, but any iterators it supplies would not be.
+// This does not contain deleted docs, so instances can be shared by different index versions.
 class PostingsReader {
   std::vector<std::shared_ptr<InputFile>> files;  // temporary owner of open files
   std::vector<InputStream> inputStreams;
@@ -183,6 +184,9 @@ public:
 
   // We can't get & cache the InputStream in PostingsReader unless we create them all in the constructor (for thread safety)
   // But if we're using mmap, that's probably fine?  Would not be fine if we need to read everything in the constructor.
+  // TODO: could also have a mode that opens on demand (and hence synchronizes)... that would be good for something like IndexWriter
+  // that needs to only read the ID field to handle overwrites / deletions.  That file *might* already be open by another IndexReader
+  // though?  How to coordinate?
   InputStream getInputStream(uint32_t fnum) {
     assert(fnum < inputStreams.size());
     return inputStreams[fnum];
@@ -210,7 +214,7 @@ public:
 
 
 struct SegFieldInfo {
-  PackedTerm fieldname;
+  std::string fieldname;
   seg_location termBlockIndexLoc;  // location of index into the terms blocks
   seg_location termsLoc;
   seg_location docsLoc;
@@ -301,7 +305,7 @@ public:
   // only valid after readNextField() returns true or seek() returns true.
   // The SegFieldInfo produced is independent of FieldReader.
   void readFieldInfo(SegFieldInfo& fieldInfo) {
-    fieldInfo.fieldname = fieldname;
+    fieldInfo.fieldname = (std::string_view)fieldname;
     assert(fieldIS.left() > 0); // this assert triggers if this fieldReader is unpositioned.
     assert(!fieldname.isNull());
     assert(!fieldInfoRead);  // we could back up and re-read based on currField

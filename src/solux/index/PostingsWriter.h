@@ -149,30 +149,14 @@ public:
     uint32_t fileNum;
   };
 
-
-    // Should this be refactored into a class? Used on read-side as well?
-  struct FieldInfo {
-    std::string fieldName;
-    seg_location termBlockIndexLoc;
-    seg_location termsLoc;
-    seg_location docsLoc;
-    seg_location posLoc;
+  struct IndexFieldInfo : public SegFieldInfo {
     int64_t sumDocFreq;
     int64_t sumTotalTermFreq;
-    int numTerms;
-
-    // column
-    seg_location columnLoc;
-    // these two can be shared with text field for norms if needed
-    seg_location docsWithValueEndLoc;
-    int32_t docsWithValue;
-
     int32_t flags;  // temporary... currently has type info. 0x01 text, 0x02 int col.  In the future, we should decompose and have separate sections for each type
   };
-  FieldInfo* fieldInfo;
 
   std::vector<DataFile> files;  // TODO! not multi-threaded compat since vector can cause previous entries to move!
-  std::vector<FieldInfo> fieldInfos; // TODO! not multi-threaded compat since vector can cause previous entries to move!
+  std::vector<IndexFieldInfo> fieldInfos; // TODO! not multi-threaded compat since vector can cause previous entries to move!
 
 public:
   PostingsWriter(Directory& dir, const std::string_view& gen, int32_t maxDoc) : directory(dir), generation(gen), maxDoc(maxDoc)
@@ -232,7 +216,7 @@ private:
       auto fieldLoc = fieldOutput.size();
       fieldOffs.push_back(fieldLoc - fieldsStart);  // make the location relative so we can append this to a large file if necessary
 
-      fieldOutput.writeStr(finfo.fieldName);
+      fieldOutput.writeStr(finfo.fieldname);
 
       if ((finfo.flags & 0x01) != 0) {
         fieldOutput.writeVint(0x01);
@@ -241,7 +225,7 @@ private:
         fieldOutput.writeVal(finfo.termsLoc);  // TODO: If we change termBlockOffsets to be relative to the start of that index, we can remove termsLoc
         fieldOutput.writeVal(finfo.docsLoc);
         fieldOutput.writeVal(finfo.posLoc);
-        fieldOutput.writeVint(finfo.numTerms);
+        fieldOutput.writeVint(finfo.nTerms);
       }
 
       if ((finfo.flags & 0x02) != 0) {
@@ -274,7 +258,7 @@ private:
 
 class TextWriter {
   PostingsWriter& postingsWriter;
-  PostingsWriter::FieldInfo* fieldInfo;
+  PostingsWriter::IndexFieldInfo* fieldInfo;
   OutputStream& termOutput;    // output stream for termFile
   OutputStream& docOutput;     // output stream for docFile
   OutputStream& posOutput;     // output stream for posFile
@@ -351,12 +335,12 @@ public:
   }
 
   void startField(const std::string& fieldName) {
-    PostingsWriter::FieldInfo* finfo = &postingsWriter.fieldInfos.emplace_back(); // TODO: not thread safe if we start using multiple threads to write text fields
-    finfo->fieldName = fieldName;
+    PostingsWriter::IndexFieldInfo* finfo = &postingsWriter.fieldInfos.emplace_back(); // TODO: not thread safe if we start using multiple threads to write text fields
+    finfo->fieldname = fieldName;
     startField(finfo);
   }
 
-  void startField(PostingsWriter::FieldInfo* finfo) {
+  void startField(PostingsWriter::IndexFieldInfo* finfo) {
     fieldInfo = finfo;
     termsLoc = termOutput.size();
     docsLoc = docOutput.size();
@@ -656,7 +640,7 @@ public:
     //   - make offsets be from the start of this index array... 32 bit normally fine, but not always for huge field?
     //   - sequence will be monotonically increasing (or decreasing)... interpolate?
     // Indexing RAM OPT: for fields with huge number of terms, we could stream this to separate file.  That would also facilitate alignment if it's important.
-    fieldInfo->numTerms = numTerms;
+    fieldInfo->nTerms = numTerms;
     fieldInfo->termBlockIndexLoc = seg_location(termOutput.streamNumber, termOutput.size());
     assert((int)termBlockOffsets.size() == ((numTerms-1) / Postings::TERMS_BLOCK_SIZE) + 1);
     termOutput.write(&(termBlockOffsets[0]), termBlockOffsets.size() * sizeof(termBlockOffsets[0]) );
@@ -709,7 +693,7 @@ public:
 class IntColWriter {
   MemPool& pool;
   PostingsWriter& postingsWriter;
-  PostingsWriter::FieldInfo& fieldInfo;
+  PostingsWriter::IndexFieldInfo& fieldInfo;
   IntColStats* stats;
   OutputStream& colOutput;
   ScreamingBuilder docsWithVal;
@@ -719,7 +703,7 @@ class IntColWriter {
 public:
 
   // This field writer does not do any visible pool rollbacks, but does allocate from the pool.
-  IntColWriter(MemPool& pool, PostingsWriter& postingsWriter, PostingsWriter::FieldInfo& fieldInfo)
+  IntColWriter(MemPool& pool, PostingsWriter& postingsWriter, PostingsWriter::IndexFieldInfo& fieldInfo)
   : pool(pool), postingsWriter(postingsWriter), fieldInfo(fieldInfo), colOutput(postingsWriter.files[5].out), docsWithVal(pool, colOutput) {
     // TODO: docsWithVal allocates 17K from pool that may not be used... should we try to delay this somehow? (an explicit init function?)
     // Perhaps the indirection associated with delaying the ScreamingBuilder construction would be optimized away since startDoc() would be

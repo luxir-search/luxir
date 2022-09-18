@@ -576,7 +576,7 @@ TEST_F(PostingsTest, intCol) {
     stats.add(11);
 
     auto &finfo = writer.fieldInfos.emplace_back();
-    finfo.fieldName = "ifield1";
+    finfo.fieldname = "ifield1";
     IntColWriter colWriter(pool, writer, finfo);
     colWriter.startFieldIntCol("ifield1", stats);
     colWriter.addInt64(77);
