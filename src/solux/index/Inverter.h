@@ -80,7 +80,7 @@ public:
       }
     }
 
-    virtual void flush(Inverter& inverter, PostingsWriter& postingsWriter) = 0;
+    virtual void flush(Inverter &inverter) = 0;
 
     friend std::ostream& operator<<(std::ostream &out, const IndexHandler &sf) {
       return out << "{IndexHandler field:" << sf.fieldName << "}";
@@ -157,11 +157,11 @@ public:
       }
     }
 
-    void flush(Inverter &inverter, PostingsWriter &postingsWriter) override {
-      flushPositions(inverter, postingsWriter);
+    void flush(Inverter &inverter) override {
+      flushPositions(inverter);
     }
 
-    void flushPositions(Inverter &inverter, PostingsWriter& postingsWriter) {
+    void flushPositions(Inverter &inverter) {
       auto sz = termsHash.size();
       // gathering and sorting terms for each field could be done in parallel, but it probably doesn't
       // represent much time.  Fields that can result in their own file should be able to be parallelized easily!
@@ -184,7 +184,7 @@ public:
       // std::cout << "terms=" << sz << " SORT time ns=" << thisElapsed << std::endl;
 
       // Either reduce the resource for these, or share across different fields (in the same thread)
-      TextWriter textWriter(postingsWriter);
+      TextWriter textWriter(inverter.getPostingsWriter());
 
       textWriter.startField(fieldName);
       for (size_t tnum=0; tnum<sz; tnum++) {
@@ -236,12 +236,13 @@ public:
       docsWithVal.addDoc(inverter.pool, inverter.currDoc);
     }
 
-    void flush(Inverter& inverter, PostingsWriter& postingsWriter) override {
-      flushIntCol(inverter, postingsWriter);
+    void flush(Inverter &inverter) override {
+      flushIntCol(inverter);
     }
 
     // TODO: make static and pass everything needed so it's composable
-    void flushIntCol(Inverter& inverter, PostingsWriter& postingsWriter) {
+    void flushIntCol(Inverter& inverter) {
+      PostingsWriter& postingsWriter = inverter.getPostingsWriter();
       auto guard = postingsWriter.pool.rewindScopeGuard(); // rewind any use by IntColWriter after we are done.
 
       // TODO: move this to postingsWriter method
@@ -376,7 +377,7 @@ public:
 
 
     for (auto fieldHandler : fields) {
-      fieldHandler->flush(*this, postingsWriter);
+      fieldHandler->flush(*this);
     }
 
     getPostingsWriter().finish();
