@@ -18,6 +18,7 @@ namespace solux::test {
     virtual std::optional<int64_t> intVal() {
       return 0;
     }
+    virtual ~ValGen() = default;
   };
 
   class IntSeq : public ValGen {
@@ -53,7 +54,7 @@ namespace solux::test {
     uint64_t seed;
 
   public:
-    RandGen(uint64_t seed) : seed(seed) {
+    explicit RandGen(uint64_t seed) : seed(seed) {
       rng.init(seed);
     }
     void init() override {
@@ -188,16 +189,16 @@ namespace solux::test {
   public:
     TestIndex& testIndex;
     std::string name;
-    Inverter* inverter;
-    Inverter::IndexHandler* indexHandler;
+    Inverter* inverter = nullptr;
+    Inverter::IndexHandler* indexHandler = nullptr;
 
     SegFieldInfo fieldInfo;
     std::unique_ptr<IntColReader> colReader;
     std::unique_ptr<IntColReader::Iterator> iter;
 
     int32_t nAdds = 0;
-    int32_t doc;
-    int64_t v;
+    int32_t doc = -1;
+    int64_t v = 0;
 
     TestField(TestIndex& testIndex, const std::string_view name) : testIndex(testIndex), name(name) {
     }
@@ -207,15 +208,15 @@ namespace solux::test {
       indexHandler = &testIndex.getIndexHandler(name);
     }
 
-    void add(int32_t doc, int64_t val) {
-      inverter->setDoc(doc);
+    void add(int32_t docid, int64_t val) {
+      inverter->setDoc(docid);
       indexHandler->index(*inverter, val);
       nAdds++;
       // std::cout << "ADDED " << name << " doc=" << doc << " val=" << val << std::endl;
     }
 
     void startReading() {
-      if (testIndex.postingsReader.get() == nullptr) { testIndex.initReader(); }
+      if (testIndex.postingsReader == nullptr) { testIndex.initReader(); }
       // position fieldReader
       EXPECT_EQ(true, testIndex.fieldReader->seek(name));
       testIndex.fieldReader->readFieldInfo(fieldInfo);

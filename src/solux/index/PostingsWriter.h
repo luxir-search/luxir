@@ -164,7 +164,7 @@ public:
     // TODO: defer file creation until needed, *or* use a RAMDelegatingFile that does so.
     // that does so.
 
-    for (int i=0; i<6; i++) {
+    for (uint32_t i=0; i<6; i++) {
       std::unique_ptr<File> file = directory.createFile(Postings::getIndexFileName(segid, i));
       files.emplace_back(DataFile{OutputStream{},std::move(file), i});
       files.back().out.setFile( files.back().file.get());
