@@ -27,7 +27,7 @@ inline void fillBlock(Rng& rng, uint64_t maxValue, uint32_t* out, uint32_t outSz
 
 inline void fillBlock(Rng& rng, uint32_t* out, uint32_t outSz, bool sorted) {
   uint32_t maxBits = rng.rint(33);
-  uint64_t maxValue = 1 << maxBits;
+  uint64_t maxValue = maxBits==32 ? 0 : (1 << maxBits);
   return fillBlock(rng, maxValue, out, outSz, sorted);
 }
 

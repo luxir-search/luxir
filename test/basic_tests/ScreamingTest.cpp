@@ -16,18 +16,18 @@ public:
   public:
     Rng rng;
 
-    size_t numBytes;
+    size_t numBytes{};
     std::string resultStr;
-    const char* ptrToEnd;
+    const char* ptrToEnd{};
     std::vector<screaming::BitSet::Bits::word_type> buf;  // used by obs
-    screaming::BitSet::Bits obs;  // 64K small bit set
+    screaming::BitSet::Bits obs{};  // 64K small bit set
     std::unique_ptr<screaming::BitSet> bitset;
     uint64_t addHash = 1;
     int base = 0; // the base of the current bucket
     int curr = -1;  // the current value added
     int nAdds = 0;
 
-    BldBase(const Rng& rng = SoluxTest::rng) : rng(rng) {
+    explicit BldBase(const Rng& rng = SoluxTest::rng) : rng(rng) {
       buf.resize(screaming::BitSet::Bits::numWords);
       obs = screaming::BitSet::Bits(&buf[0]);
     }
@@ -56,20 +56,24 @@ public:
       return true;
     }
 
-    int bucketMax() {
+    int bucketMax() const {
       return base | 0x0ffff;
     }
 
-    int leftInBucket() {
+    /*
+    int leftInBucket() const {
       return bucketMax() - curr;
     }
+     */
 
+
+/*
     void addInBucket() {
       if (leftInBucket() > 0) {
         add(curr + 1 + rng.rint(leftInBucket()));
       }
     }
-
+*/
     void addSmallBucket() {
       // either small or big type of sparse buckets to better test boundaries
       int card = rng.rbool() ? rng.rint(1,5) : (int)(screaming::BitSet::BUCKET_SPARSE_MAX - rng.rint(3));
@@ -146,7 +150,7 @@ public:
 
 
 
-    bool verifyIterator() {
+    bool verifyIterator() const {
       int card = 0;
       uint64_t itHash = 1;
       screaming::BitSet::Iterator it(*bitset);
@@ -175,7 +179,7 @@ public:
         int val = it.next();
 
         auto gap = (int64_t)val - last;  // this can exceed signed int
-        int seekTarget = last + 1 + rng.rint(gap);
+        int seekTarget = last + 1 + (int)rng.rint(gap);
         assert(seekTarget > last && seekTarget <= val);
         auto& skipIter = iters[rng.rint(iters.size())];
         if (skipIter.val() < last && rng.rbool()) {
@@ -224,14 +228,14 @@ public:
     OutputStream os{&ramFile};
     ScreamingBuilder builder{pool, os};
 
-    OutputStreamBuilder(const Rng& rng = SoluxTest::rng) : BldBase(rng) {
+    explicit OutputStreamBuilder(const Rng& rng = SoluxTest::rng) : BldBase(rng) {
     }
 
-    virtual void virtAdd(int val) override {
+    void virtAdd(int val) override {
       builder.add(val);
     }
 
-    virtual void finishBuild() override {
+    void finishBuild() override {
       numBytes = builder.flush();
       auto card = builder.cardinality();
       EXPECT_EQ(nAdds, card);
@@ -244,7 +248,7 @@ public:
       bitset = std::make_unique<screaming::BitSet>(ptrToEnd);
     }
 
-    virtual ~OutputStreamBuilder() = default;
+    ~OutputStreamBuilder() override = default;
   };
 
   class SStreamBuilder : public BldBase {
@@ -253,14 +257,14 @@ public:
     screaming::StringStreamBuilder builder{out};
     std::string resultStr;
 
-    SStreamBuilder(const Rng& rng = SoluxTest::rng) : BldBase(rng) {
+    explicit SStreamBuilder(const Rng& rng = SoluxTest::rng) : BldBase(rng) {
     }
 
-    virtual void virtAdd(int val) override {
+    void virtAdd(int val) override {
       builder.add(val);
     }
 
-    virtual void finishBuild() override {
+    void finishBuild() override {
       numBytes = builder.flush();
       auto card = builder.cardinality();
       EXPECT_EQ(nAdds, card);
@@ -271,7 +275,7 @@ public:
       bitset = std::make_unique<screaming::BitSet>(ptrToEnd);
     }
 
-    virtual ~SStreamBuilder() = default;
+    ~SStreamBuilder() override = default;
   };
 
 
