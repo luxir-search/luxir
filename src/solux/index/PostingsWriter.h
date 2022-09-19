@@ -226,7 +226,7 @@ private:
       auto fieldLoc = fieldOutput.size();
       fieldOffs.push_back(fieldLoc - fieldsStart);  // make the location relative so we can append this to a large file if necessary
 
-      fieldOutput.writeStr(finfo.fieldname);
+      fieldOutput.writePackedTerm(finfo.fieldname);
 
       if ((finfo.flags & 0x01) != 0) {
         fieldOutput.writeVint(0x01);
@@ -346,7 +346,7 @@ public:
 
   void startField(const std::string& fieldName) {
     PostingsWriter::IndexFieldInfo* finfo = &postingsWriter.fieldInfos.emplace_back(); // TODO: not thread safe if we start using multiple threads to write text fields
-    finfo->fieldname = fieldName;
+    finfo->fieldname = PackedTerm(postingsWriter.pool, fieldName); // also not thread safe
     startField(finfo);
   }
 
@@ -637,8 +637,12 @@ public:
     }
   }
 
-
+  // deprecated...
   void endField(const std::string& fieldName) {
+    endField();
+  }
+
+  void endField() {
     // OPT: investigate inlining small fields in the terms index instead of pointing out to other files?  If we don't know how large the field will be,
     // we could always do it after-the-fact if the other outputs are rewindable (i.e. all in memory.)  If not, we could make it so by always starting
     // with new outputs for every field with first page in RAM.
@@ -725,7 +729,7 @@ public:
 
   // The passed fieldStats should remain valid until after endField is called.
   // Should this just be folded into the constructor?
-  void startFieldIntCol(const std::string& fieldName, IntColStats& fieldStats) {
+  void startFieldIntCol(IntColStats& fieldStats) {
     // column writing could be parallelized better by using multiple files and grabbing a free file at this point.
     stats = &fieldStats;
     colStart = colOutput.size();
@@ -764,7 +768,7 @@ public:
     colOutput.writeLong(val);
   }
 
-  void endField(const std::string& fieldName) {
+  void endField() {
     assert(nAdded == stats->numVals());
     bool allDocsHaveValue = nAdded == postingsWriter.maxDoc; // How to get this dynamically?  pass it in?
 

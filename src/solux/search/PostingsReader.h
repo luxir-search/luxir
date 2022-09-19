@@ -214,7 +214,7 @@ public:
 
 
 struct SegFieldInfo {
-  std::string fieldname;
+  PackedTerm fieldname;
   seg_location termBlockIndexLoc;  // location of index into the terms blocks
   seg_location termsLoc;
   seg_location docsLoc;
@@ -305,8 +305,8 @@ public:
   // only valid after readNextField() returns true or seek() returns true.
   // The SegFieldInfo produced is independent of FieldReader.
   void readFieldInfo(SegFieldInfo& fieldInfo) {
-    fieldInfo.fieldname = (std::string_view)fieldname;
-    assert(fieldIS.left() > 0); // this assert triggers if this fieldReader is unpositioned.
+    fieldInfo.fieldname = fieldname;
+    assert(fieldIS.left() > 0); // this triggers if this fieldReader is unpositioned.
     assert(!fieldname.isNull());
     assert(!fieldInfoRead);  // we could back up and re-read based on currField
     if (!fieldInfoRead) {

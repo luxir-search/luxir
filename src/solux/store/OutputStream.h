@@ -185,6 +185,10 @@ public:
     write((char) val);
   }
 
+  void writePackedTerm(PackedTerm term) {
+    write(term.ptr() , term.memorySize());
+  }
+
   void writeStr(const char *data, uint32_t len) {
     writeVint(len);
     write((void *) data, len);

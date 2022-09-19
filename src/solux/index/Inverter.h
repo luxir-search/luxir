@@ -47,11 +47,11 @@ public:
   class IndexHandler {
     friend Inverter;
 
-    std::string fieldName;
+    PackedTerm fieldName;
     FieldType& fieldType;
 
   public:
-    IndexHandler(const std::string_view& fieldName, FieldType& fieldType)
+    IndexHandler(PackedTerm fieldName, FieldType &fieldType)
     : fieldName(fieldName), fieldType(fieldType) {
     }
     virtual ~IndexHandler() = default;
@@ -64,8 +64,16 @@ public:
       return this->fieldName <=> sv;
     }
 
+    auto operator<=>(const PackedTerm& fname) const {
+      return this->fieldName <=> fname;
+    }
+
     auto operator==(const std::string_view& sv) const {
       return this->fieldName == sv;
+    }
+
+    auto operator==(const PackedTerm& fname) const {
+      return this->fieldName == fname;
     }
 
     virtual void index(Inverter& inverter, char* mutableVal, int len) {
@@ -97,7 +105,7 @@ public:
   public:
 
     PosIndexHandler(Inverter &inverter, const std::string_view &fieldName, FieldType& fieldType, TokenChain *tokenChain)
-    : IndexHandler(fieldName, fieldType), termsHash(inverter.pool, 4), tokenChain(tokenChain) {
+    : IndexHandler(PackedTerm(inverter.pool,fieldName), fieldType), termsHash(inverter.pool, 4), tokenChain(tokenChain) {
     }
     PosIndexHandler(PosIndexHandler&& other) = default;
     ~PosIndexHandler() override = default;
@@ -185,8 +193,10 @@ public:
 
       // Either reduce the resource for these, or share across different fields (in the same thread)
       TextWriter textWriter(inverter.getPostingsWriter());
+      PostingsWriter::IndexFieldInfo& fieldInfo = inverter.getPostingsWriter().fieldInfos.emplace_back();
+      fieldInfo.fieldname = fieldName;
 
-      textWriter.startField(fieldName);
+      textWriter.startField(&fieldInfo);
       for (size_t tnum=0; tnum<sz; tnum++) {
         auto term = terms[tnum];
         textWriter.startTerm(term);
@@ -194,7 +204,7 @@ public:
         term.val().pushDocs(inverter.pool, textWriter);
         textWriter.endTerm(term);
       }
-      textWriter.endField(fieldName);
+      textWriter.endField();
       termsHash.free();
     }
 
@@ -212,7 +222,7 @@ public:
     FieldType *fieldType;
   public:
     IntColHandler(Inverter &inverter, const std::string_view &fieldName, FieldType& fieldType)
-            :  IndexHandler(fieldName, fieldType), longStream(inverter.pool), docsWithVal(inverter.pool) {
+            : IndexHandler(PackedTerm(inverter.pool,fieldName), fieldType), longStream(inverter.pool), docsWithVal(inverter.pool) {
     }
 
     IntColHandler(IntColHandler&& other) = default;
@@ -251,14 +261,14 @@ public:
 
       IntColWriter writer(postingsWriter.pool, postingsWriter, fieldInfo);
       auto full = stats.numVals() >= postingsWriter.getMaxDoc();
-      writer.startFieldIntCol(fieldName, stats);  // TODO: fieldName is redundant now if we are passing in fieldInfo.
+      writer.startFieldIntCol(stats);
       longStream.pushValues(inverter.pool, writer);
       if (!full) {
         writer.startDocsWithValue();
         docsWithVal.pushDocs(inverter.pool, writer);
         writer.endDocsWithValue();
       }
-      writer.endField(fieldName);
+      writer.endField();
     }
   };
 
@@ -271,7 +281,7 @@ public:
 
 
   // The returned reference will be valid for the duration of indexing this block.
-  IndexHandler& getIndexHandler(const std::string_view& name) {
+  IndexHandler& getIndexHandler(const std::string_view name) {
     auto iter = indexHandlers.find(name);
     if (iter != indexHandlers.end()) {
       return *iter->second;

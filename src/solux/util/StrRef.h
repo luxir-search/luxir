@@ -140,12 +140,12 @@ public:
 class PackedTerm {
   char *ptr_;
 public:
-  static uint32_t getMaxSize(uint32_t size) { return size + 1; }
+  static uint32_t getMaxSize(uint32_t size) noexcept { return size + 1; }
 
-  static uint32_t getExactSize(uint32_t size) { return size + 1; }
+  static uint32_t getExactSize(uint32_t size) noexcept { return size + 1; }
 
   // returns the number of bytes written to the target... either sz+1 or sz+2
-  inline static uint32_t write(char *target, const void *data, uint32_t sz) {
+  inline static uint32_t write(char *target, const void *data, uint32_t sz) noexcept {
     target[0] = sz;
     memcpy(target + 1, data, (size_t) sz);
     return sz + 1;
@@ -158,7 +158,7 @@ public:
     return target;
   }
 
-  // TODO: keep this a trivial class that doesn't initialize itself?
+  // NOTE: default constructor of PackedTerm does not initialize object.
   PackedTerm() {}
 
   PackedTerm(MemPool &target, const void *data, uint32_t len) {
@@ -169,18 +169,18 @@ public:
   }
 
   // expert: should already point to an instance of this type
-  void init(void *ptr, uint32_t size) {
+  void init(void *ptr, uint32_t size) noexcept {
     ptr_ = reinterpret_cast<char *>(ptr);
   }
 
   // expert: should already point to an instance of this type
   // TODO: make this somehow harder to accidentally use!
-  explicit PackedTerm(void *ptr) : ptr_(reinterpret_cast<char *>(ptr)) {}
+  explicit PackedTerm(void *ptr) noexcept : ptr_(reinterpret_cast<char *>(ptr)) {}
 
-  explicit PackedTerm(void *ptr, uint32_t size) : ptr_(reinterpret_cast<char *>(ptr)) {}
+  explicit PackedTerm(void *ptr, uint32_t size) noexcept : ptr_(reinterpret_cast<char *>(ptr)) {}
 
   // expert: a pointer to the start of the data... not to the first byte of the string!
-  void *ptr() const { return (void *) ptr_; }
+  void *ptr() const noexcept { return (void *) ptr_; }
 
   // the number of bytes in the value, not including the bytes to encode the length
   uint32_t size() const noexcept {
@@ -192,26 +192,26 @@ public:
   }
 
   // returns the unpacked term as a pair of pointer,size
-  std::tuple<const char *, uint32_t> unpack() const {
+  std::tuple<const char *, uint32_t> unpack() const noexcept {
     return {ptr_ + 1, size()};
   };
 
   // expert: Up to you not to misuse this.
-  void setSize(uint32_t sz) { ptr_[0] = (char) sz; }
+  void setSize(uint32_t sz) noexcept { ptr_[0] = (char) sz; }
 
 // TODO: do this in a more standard way
   std::size_t hash_value() const noexcept {
     return Hash::hash(ptr_ + 1, size());
   }
 
-  bool isNull() const { return ptr_ == nullptr; }
+  bool isNull() const noexcept { return ptr_ == nullptr; }
 
   // size of both the length and the data
-  uint32_t memorySize() const {
+  uint32_t memorySize() const noexcept {
     return size() + 1;
   }
 
-  bool operator==(const PackedTerm &other) const {
+  bool operator==(const PackedTerm &other) const noexcept {
     auto sz1 = size();
     auto sz2 = other.size();
 
@@ -223,26 +223,30 @@ public:
     return memcmp(ptr_ + 1, other.ptr_ + 1, sz1) == 0;
   }
 
-  explicit operator std::string_view() const { return std::string_view(data(), size()); }
+  explicit operator std::string_view() const noexcept { return std::string_view(data(), size()); }
 
-  inline friend int operator<=>(const PackedTerm &a, const PackedTerm &b) {
+  inline friend int operator<=>(const PackedTerm &a, const PackedTerm &b) noexcept {
     int datacmp = memcmp(a.data(), b.data(), std::min(a.size(), b.size()));
     return (datacmp != 0) ? datacmp : ((int) a.size() - (int) b.size());
   }
 
-  // functors for use with boost sort
+  inline unsigned char operator[](size_t offset) const noexcept {
+    return ptr_[offset+1];
+  }
+
+    // functors for use with boost sort
   struct lessthan {
-    inline bool operator()(const PackedTerm& x, const PackedTerm& y) const {
+    inline bool operator()(const PackedTerm& x, const PackedTerm& y) const noexcept {
       return x < y;
     }
   };
   struct bracket {
-    inline unsigned char operator()(const PackedTerm& x, size_t offset) const {
+    inline unsigned char operator()(const PackedTerm& x, size_t offset) const noexcept{
       return x.ptr_[offset+1];
     }
   };
   struct getsize {
-    inline size_t operator()(const PackedTerm& x) const { return x.size(); }
+    inline size_t operator()(const PackedTerm& x) const noexcept { return x.size(); }
   };
 
   friend std::ostream &operator<<(std::ostream &out, const PackedTerm &term) {
@@ -269,19 +273,19 @@ inline int operator<=>(const PackedTerm &a, const PackedTerm &b) {
 
 template<typename StringType>
 // StringType just needs size() and data().... which std::string and std::string_view both have.
-inline bool operator==(const PackedTerm &p, const StringType &s) {
+inline bool operator==(const PackedTerm &p, const StringType &s) noexcept {
   auto[data, sz] = p.unpack();
   if (sz != (int) s.size()) return false;
   return memcmp(data, s.data(), sz) == 0;
 }
 
 template<typename StringType>
-inline bool operator==(const StringType &s, const PackedTerm &p) {
+inline bool operator==(const StringType &s, const PackedTerm &p) noexcept {
   return p == s;
 }
 
 template<typename StringType>
-inline int operator<=>(const PackedTerm &p, const StringType &s) {
+inline int operator<=>(const PackedTerm &p, const StringType &s) noexcept {
   auto[data, sz] = p.unpack();
   int datacmp = memcmp(data, s.data(), std::min((int) sz, (int) s.size()));
   return (datacmp != 0) ? datacmp : ((int) sz - (int) s.size());
@@ -291,16 +295,16 @@ inline int operator<=>(const PackedTerm &p, const StringType &s) {
 // don't do const char* versions since we are dealing with binary data
 struct PackedTermHash {
   using is_transparent = void;
-  size_t operator()(const char* data, size_t len) const {
+  size_t operator()(const char* data, size_t len) const noexcept {
     return Hash::hash(data, len);
   }
-  size_t operator()(const PackedTerm& term) const {
+  size_t operator()(const PackedTerm& term) const noexcept {
     return (*this)(term.data(), term.size());
   }
-  size_t operator()(const std::string& str) const {
+  size_t operator()(const std::string& str) const noexcept {
     return (*this)(str.data(), str.size());
   }
-  size_t operator()(const std::string_view& str) const {
+  size_t operator()(const std::string_view& str) const noexcept {
     return (*this)(str.data(), str.size());
   }
 };

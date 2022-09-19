@@ -564,6 +564,8 @@ TEST_F(PostingsTest, randWriteTmp) {
 TEST_F(PostingsTest, intCol) {
   RAMDir dir;
   MemPool pool;
+  auto fname1 = PackedTerm(pool, "ifield1");
+
   {
     auto guard = pool.rewindScopeGuard();
 
@@ -576,9 +578,9 @@ TEST_F(PostingsTest, intCol) {
     stats.add(11);
 
     auto &finfo = writer.fieldInfos.emplace_back();
-    finfo.fieldname = "ifield1";
+    finfo.fieldname = fname1;
     IntColWriter colWriter(pool, writer, finfo);
-    colWriter.startFieldIntCol("ifield1", stats);
+    colWriter.startFieldIntCol(stats);
     colWriter.addInt64(77);
     colWriter.addInt64(33);
     colWriter.addInt64(11);
@@ -587,7 +589,7 @@ TEST_F(PostingsTest, intCol) {
     colWriter.startDoc(1);
     colWriter.startDoc(2);
     colWriter.endDocsWithValue();
-    colWriter.endField("ifield1");
+    colWriter.endField();
 
     writer.finish();
   }
@@ -595,7 +597,7 @@ TEST_F(PostingsTest, intCol) {
   PostingsReader reader(dir, "10");
   FieldReader fieldReader(pool, reader);
   ASSERT_TRUE(fieldReader.readNextField());
-  ASSERT_EQ(fieldReader.name(), std::string_view("ifield1"));
+  ASSERT_EQ(fieldReader.name(), fname1);
   SegFieldInfo fieldInfo;
   fieldReader.readFieldInfo(fieldInfo);
 
