@@ -10,17 +10,14 @@ static void BM_IndexBook(benchmark::State& state, std::string field, bool writeP
 
   Book& book = TestData::data->getBook();
 
-  std::unique_ptr<SegmentTest> segTest;
-  if (writePostings) {
-    segTest = std::make_unique<SegmentTest>();
-  }
-
   int64_t inverterSz = 0;
   char* data = const_cast<char*>(book.text().data());  // TODO: need to make a copy for any analysis that mutates? Make tokenizer do this?
   int sz = docPerPara ? book.sumParaSizes : book.text().size();
 
+  RAMDir dir;
   for (auto _ : state) {
-    Inverter inverter;
+    dir = RAMDir(); // clear files
+    Inverter inverter(dir,"00");
     Inverter::IndexHandler& fieldHandler = inverter.getIndexHandler(field);
 
     if (!docPerPara) {
@@ -40,17 +37,13 @@ static void BM_IndexBook(benchmark::State& state, std::string field, bool writeP
     inverterSz = inverter.memSize();
 
     if (writePostings) {
-      segTest->initWriter();
-      inverter.flush(*segTest->postingsWriter);
+      inverter.flush();
     }
   }
 
   state.counters["rate="] = benchmark::Counter(sz, benchmark::Counter::kIsIterationInvariantRate);
   state.counters["inverterSz"] = inverterSz;
-  if (writePostings) {
-    segTest->initReader();
-    state.counters["indexSz"] = segTest->getIndexSize();
-  }
+  state.counters["indexSz"] = dir.totalFileSize();
 }
 
 

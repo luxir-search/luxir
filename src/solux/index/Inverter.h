@@ -19,54 +19,29 @@ namespace solux {
 using std::iter_swap; // for boost string_sort
 
 
-/***
-Minimum needed to index a single term position:
-   TermValHash (one per field)
-     used to lookup DocStream for the term
-   MemPool
-     where memory comes from
-   Given: docid, position
-
-Inverter has the mapping of field to TermValHash (currently encapsulated in SegFieldIndexed)
-
-
-Minimum needed to index a field value:
-   Cached token stream / analyzer to tokenize the field value.
-   We want this per-type (not per field) to handle the tons-of-fields case.
-
-   What about multi-valued fields and gaps?
-   What about begin/end sentence, para, value? best left to analyzer I guess?
-   What about has-value?
-   What about indexing value and storing value?
-
-   Ever a connection between indexed and stored values??? (what about docvalue ords and the index?)
-
-
-*/
-
-
-
 
 
 class Inverter {
 private:
   int currDoc = -1;  // the current document being indexed
-
-
   std::vector<int> deleted; // use a docstream for this?
 
   // TODO: this is temporary... we should get FieldTypes and TokenChains from the schema somehow
   // and TokenChains should not be shared across different threads.
   phmap::flat_hash_map<std::string, std::pair<std::unique_ptr<FieldType>, std::unique_ptr<TokenChain>>> typeInfo;
 public:
-  // This means we should provide a way to specify a pool to use and then
-  // have a higher level construct that represents an indexing thread.
-  // This way, multiple shards could be handled by one thread.  They would all need to
-  // flush at the same time to release the pool though.
-  // Either that, or completely finish indexing (i.e. flush a segment) for each tenant
-  // every time you get a batch of docs.  Then we could wind back the pool for each different tenant batch.
   MemPool pool;
 
+  // Having a handle to the postings writer means that we can start flushing whenever we want or
+  // even directly write certain dense columns without uninverting first.  It could be directly contained, or
+  // we could have a reference to it.
+  PostingsWriter postingsWriter;
+
+  // TODO: create a class for indexing parameters / config?
+  Inverter(solux::Directory& dir, std::string_view segid) : postingsWriter(dir, segid) {
+  }
+
+  PostingsWriter& getPostingsWriter() { return postingsWriter; }
 
 
   class IndexHandler {
@@ -380,7 +355,10 @@ public:
     return pool.size();
   }
 
-  void flush(PostingsWriter& postingsWriter) {
+  /// finishes indexing this segment (also calls finish on the underlying postings writer)
+  void flush() {
+    getPostingsWriter().setMaxDoc(getMaxDoc());  // TODO: this won't always be accurate currently?
+
     // We could either sort fields first, or after they have been indexed.  Merging segments will presumably
     // go in sorted field order, so lets do the same thing here and sort first.
     std::vector<IndexHandler*> fields;
@@ -400,6 +378,8 @@ public:
     for (auto fieldHandler : fields) {
       fieldHandler->flush(*this, postingsWriter);
     }
+
+    getPostingsWriter().finish();
   }
 
 

@@ -20,15 +20,13 @@ static void BM_Invert(benchmark::State& state, std::string field, bool writePost
     val += std::string_view(termStr.data(), digits);
   }
 
-  std::unique_ptr<SegmentTest> segTest;
-  if (writePostings) {
-    segTest = std::make_unique<SegmentTest>();
-  }
 
   int iter = unit_tests ? 10 : 1000;
   int64_t inverterSz = 0;
+  RAMDir dir;
   for (auto _ : state) {
-    Inverter inverter;
+    dir = RAMDir(); // clear dir
+    Inverter inverter(dir, "00");
     Inverter::IndexHandler& fieldHandler = inverter.getIndexHandler(field);
 
     for (int i=0; i<iter;i++) {
@@ -40,17 +38,13 @@ static void BM_Invert(benchmark::State& state, std::string field, bool writePost
     inverterSz = inverter.memSize();
 
     if (writePostings) {
-      segTest->initWriter();
-      inverter.flush(*segTest->postingsWriter);
+      inverter.flush();
     }
   }
 
   state.counters["rate="] = benchmark::Counter(val.size()*iter, benchmark::Counter::kIsIterationInvariantRate);
   state.counters["inverterSz"] = inverterSz;
-  if (writePostings) {
-    segTest->initReader();
-    state.counters["indexSz"] = segTest->getIndexSize();
-  }
+  state.counters["indexSz"] = dir.totalFileSize();
 }
 
 

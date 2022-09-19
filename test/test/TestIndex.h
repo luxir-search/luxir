@@ -3,6 +3,7 @@
 #include "solux/util/solux_util.h"
 #include "solux/util/random.h"
 #include "solux/index/Inverter.h"
+#include "solux/index/IndexWriter.h"
 #include "solux/index/PostingsWriter.h"
 #include "solux/search/PostingsReader.h"
 #include "test/SoluxTest.h"
@@ -138,9 +139,11 @@ namespace solux::test {
   public:
     RAMDir dir;
     MemPool pool;
-    std::unique_ptr<Inverter> inverter;
+    std::unique_ptr<IndexWriter> iw;
+    Inverter* inverter = nullptr;
     MemPool::save_point save = pool.getSavePoint();
     std::unique_ptr<PostingsWriter> postingsWriter;
+    std::string gen;
 
     std::unique_ptr<PostingsReader> postingsReader;
     std::unique_ptr<FieldReader> fieldReader;
@@ -151,20 +154,19 @@ namespace solux::test {
     }
 
     void initWriter() {
-      inverter = std::make_unique<Inverter>();
+      iw = std::make_unique<IndexWriter>(dir);
+      inverter = &iw->getInverter();
+      gen = inverter->getPostingsWriter().getSegId();
     }
 
     void flush() {
-      if (inverter.get() == nullptr) return;
-      postingsWriter = std::make_unique<PostingsWriter>(dir, "10", inverter->getMaxDoc());
-      inverter->flush(*postingsWriter);
-      postingsWriter->finish();
-      postingsWriter.reset();
-      inverter.reset();
+      if (inverter == nullptr) return;
+      iw->flush();
+      inverter = nullptr;
     }
 
     Inverter& getInverter() {
-      if (inverter.get() == nullptr) {
+      if (inverter == nullptr) {
         initWriter();
       }
       return *inverter;
@@ -175,7 +177,7 @@ namespace solux::test {
     }
 
     void initReader() {
-      postingsReader = std::make_unique<PostingsReader>(dir, "10");
+      postingsReader = std::make_unique<PostingsReader>(dir, gen);
       fieldReader = std::make_unique<FieldReader>(pool, *postingsReader);
     }
 

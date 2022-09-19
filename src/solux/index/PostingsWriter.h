@@ -138,7 +138,7 @@ namespace solux {
 
 class PostingsWriter {
   Directory& directory;
-  std::string generation;
+  std::string segid;
   int32_t maxDoc;  // set by caller
 public:
   MemPool pool;
@@ -159,20 +159,27 @@ public:
   std::vector<IndexFieldInfo> fieldInfos; // TODO! not multi-threaded compat since vector can cause previous entries to move!
 
 public:
-  PostingsWriter(Directory& dir, const std::string_view& gen, int32_t maxDoc) : directory(dir), generation(gen), maxDoc(maxDoc)
+  PostingsWriter(Directory& dir, const std::string_view& segid, int32_t maxDoc=-1) : directory(dir), segid(segid), maxDoc(maxDoc)
   {
     // TODO: defer file creation until needed, *or* use a RAMDelegatingFile that does so.
     // that does so.
 
     for (int i=0; i<6; i++) {
-      std::unique_ptr<File> file = directory.createFile(Postings::getIndexFileName(gen, i));
+      std::unique_ptr<File> file = directory.createFile(Postings::getIndexFileName(segid, i));
       files.emplace_back(DataFile{OutputStream{},std::move(file), i});
       files.back().out.setFile( files.back().file.get());
       files.back().out.streamNumber = i;
     }
   }
 
+  const std::string& getSegId() const {
+    return segid;
+  }
+
   void finish() {
+    if (fieldInfos.empty()) {
+      return;  // already called, or no data added.
+    }
     writeFieldIndex();
     writeSegmentInfo();
     // TODO: implement compound files for small files
@@ -181,6 +188,9 @@ public:
       dataFile.out.close();
       directory.finishFile(*dataFile.file);
     }
+
+    fieldInfos.resize(0);
+    files.resize(0);
   }
 
   void setMaxDoc(int max) {
@@ -756,7 +766,7 @@ public:
 
   void endField(const std::string& fieldName) {
     assert(nAdded == stats->numVals());
-    bool allDocsHaveValue = nAdded == postingsWriter.maxDoc;
+    bool allDocsHaveValue = nAdded == postingsWriter.maxDoc; // How to get this dynamically?  pass it in?
 
     // write any necessary index into encoded blocks here (assuming it's small enough to keep in memory)
 

@@ -20,17 +20,6 @@ namespace solux {
 /// The IndexWriter is a level above Inverter & PostingsWriter that coordinates
 /// indexing activity for a single index / directory.
 class IndexWriter {
-  // Create a sortable string from a number.  It's currently
-  // a base36 representation prefixed with the number of digits to make it sort correctly.
-  std::string getSortableString(uint64_t val) {
-    std::array<char, 14> arr; // Need 13 digits (log(2**64)/log(36)==12.3) plus one for the length prefix.
-    auto[end, ec] = std::to_chars(arr.begin() + 1, arr.end(), val, 36);
-    int digits = end - (arr.begin() + 1);
-    arr[0] = digits <= 9 ? ('0' + digits) : ('a' + (digits - 10));  // base36 prefix
-    return std::string(arr.begin(), end);
-  }
-
-
   // increment a base 36 string
   void incrementGen(std::string &gen) {
     int index = gen.size() - 1;
@@ -103,7 +92,8 @@ public:
   // Make this a thread-local?
   Inverter &getInverter() {
     if (inverter == nullptr) {
-      inverter = std::make_unique<Inverter>();
+      gen++;
+      inverter = std::make_unique<Inverter>(dir, Postings::getSortableString(gen));
     }
     return *inverter;
   }
@@ -119,12 +109,12 @@ public:
     // TODO: check if inverter actually inverted any docs?
 
     gen++;
-    std::string genStr = getSortableString(gen);
-    PostingsWriter postingsWriter(dir, genStr, inverter->getMaxDoc());
-    inverter->flush(postingsWriter);
-    postingsWriter.finish();
+    std::string genStr = Postings::getSortableString(gen);
+    inverter->flush();
+    std::string segid = inverter->getPostingsWriter().getSegId();
+    inverter.reset();
 
-    segs.emplace_back(genStr);
+    segs.emplace_back(segid);
     // write new segments file
     // TODO: TBD if we write new segments files or just use the same name
     auto indexFile = dir.createFile(Postings::INDEX_INFO_FILE);
@@ -136,10 +126,9 @@ public:
     for (auto &seg : segs) {
       indexOut.writeStr(seg);
     }
-    indexOut.flush(true);
+    indexOut.close();
     dir.finishFile(*indexFile);
 
-    inverter.reset();
   }
 
   // TODO: Currently single threaded and protected by the IndexWriter mutex... we need something different

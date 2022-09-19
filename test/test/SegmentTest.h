@@ -65,7 +65,7 @@ public:
     fingerprint = 0;
 
     highestDoc = -1;
-    postingsWriter = std::make_unique<PostingsWriter>(dir, "10", 0x7fffffff);  // use maximum value for maxDoc... nothing (currently) in text field depends on it.
+    postingsWriter = std::make_unique<PostingsWriter>(dir, "00", 0x7fffffff);  // use maximum value for maxDoc... nothing (currently) in text field depends on it.
     writer = std::make_unique<TextWriter>(*postingsWriter);  // use maximum value for maxDoc... nothing (currently) in text field depends on it.
 
     // save the RNG state
@@ -77,7 +77,7 @@ public:
   void initReader() {
     postingsWriter->finish();
 
-    reader = std::make_unique<PostingsReader>(dir, "10");
+    reader = std::make_unique<PostingsReader>(dir, "00");
     fieldReader = std::make_unique<FieldReader>(pool, *reader);
 
     // restore the RNG state

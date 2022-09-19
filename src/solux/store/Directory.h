@@ -106,6 +106,14 @@ public:
     }
   }
 
+  int64_t totalFileSize() {
+    int64_t totalSize = 0;
+    for (const auto&[name, ifile] : files) {
+      totalSize += ifile->size();
+    }
+    return totalSize;
+  };
+
 };
 
 
