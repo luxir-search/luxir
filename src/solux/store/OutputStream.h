@@ -124,7 +124,10 @@ public:
   // Write without bounds checking.  Assumes len <= reserved().
   void unsafeWrite(const void *data, size_t len) {
     assert(len <= reserved());
-    memcpy(pos, data, len);
+    if (len != 0) {
+      // ubsan doesn't like it when we pass memcpy(nullptr,...,0)
+      memcpy(pos, data, len);
+    }
     pos += len;
   }
 
@@ -266,7 +269,10 @@ public:
   // copies size() bytes to the destination
   size_t copyTo(void *dest) {
     char *ptr = (char *) dest;
-    memcpy(ptr, firstBuffer, firstLen);
+    if (firstLen != 0) {
+      // ubsan doesn't like null ptrs even if len==0
+      memcpy(ptr, firstBuffer, firstLen);
+    }
     ptr += firstLen;
     for (const auto&[data, sz] : buffers) {
       // if this overwrites memory, the bug is probably not closing the OutputStream (and hence not truncating the last buffer to the used size)

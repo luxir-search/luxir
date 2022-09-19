@@ -13,8 +13,8 @@ using namespace solux;
 
 class TestConsumer {
 public:
-  int64_t dochash = 1;
-  int64_t poshash = 1;
+  uint64_t dochash = 1;
+  uint64_t poshash = 1;
   int lastDoc = -1;
   int position = 0;
   bool operator==(TestConsumer const&) const = default;

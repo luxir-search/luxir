@@ -50,7 +50,7 @@ static void BM_TermFind(benchmark::State& state, uint64_t maxId, int hitPercent)
 
   TextWriter& w = *seg.writer;
   w.startField(fname);
-  int32_t fp = 1;
+  uint32_t fp = 1;
   for (auto docid : sorted) {
     auto term = terms[docid];
     w.startTerm(term);
@@ -78,7 +78,7 @@ static void BM_TermFind(benchmark::State& state, uint64_t maxId, int hitPercent)
 
 
   int hitFrac = hitPercent==0 ? -1 : hitPercent * 0x00ffff / 100; // convert to a fraction of 0x00ffff
-  int32_t fingerprint = 1;
+  uint32_t fingerprint = 1;
   // int32_t hits = 0; int64_t sumdf = 0; int64_t sumdoc = 0;  // some counters to debug where something is off (when matching lucene)
   for (auto _ : state) {
     // hits = 0; sumdf = 0; sumdoc = 0;

@@ -176,14 +176,14 @@ public:
   }
 
   // returns partial fingerprint for comparison across multiple iterations.
-  int add(const char* term, int tlen, int doc, int pos) {
+  uint64_t add(const char* term, int tlen, int doc, int pos) {
     auto [iter, inserted] = set.try_emplace(std::string_view(term, tlen), pool, doc, pos);
-    int ret;
+    uint64_t ret;
     if (!inserted) {
       iter->val().addDoc(pool, doc, pos);
       ret = iter->val().doctot + iter->val().postot;
     } else {
-      ret = doc*3 + pos*5;
+      ret = uint64_t(doc)*3 + uint64_t(pos)*5;
     }
     return ret;
   }
@@ -209,7 +209,7 @@ public:
   }
 
   // returns partial fingerprint for comparison across multiple iterations.
-  int add(const char* term, int tlen, int doc, int pos) {
+  uint64_t add(const char* term, int tlen, int doc, int pos) {
 
     auto sv = std::string_view(term, tlen);
     auto [iter, inserted] = try_emplace(set,
@@ -227,12 +227,12 @@ public:
 
     // TODO:  try my converter template
     // auto [iter, inserted] = try_emplace(set, std::string_view(term, tlen), pool, term, tlen, doc, pos);
-    int ret;
+    uint64_t ret;
     if (!inserted) {
       iter->val().addDoc(pool, doc, pos);
       ret = iter->val().doctot + iter->val().postot;
     } else {
-      ret = doc*3 + pos*5;
+      ret = uint64_t(doc)*3 + uint64_t(pos)*5;
     }
     return ret;
   }
@@ -260,8 +260,8 @@ public:
   }
 
   // returns partial fingerprint for comparison across multiple iterations.
-  int add(const char* term, int tlen, int doc, int pos) {
-    int ret;
+  uint64_t add(const char* term, int tlen, int doc, int pos) {
+    uint64_t ret;
     // phmap lazy_emplace expects you to construct a pair, so we can lazily create the key as well!
 
     bool inserted = false;
@@ -275,7 +275,7 @@ public:
       v.addDoc(pool, doc, pos);
       ret = v.doctot + v.postot;
     } else {
-      ret = doc*3 + pos*5;
+      ret = uint64_t(doc)*3 + uint64_t(pos)*5;
     }
 
     return ret;
@@ -301,17 +301,17 @@ public:
   }
 
   // returns partial fingerprint for comparison across multiple iterations.
-  int add(const char* term, int tlen, int doc, int pos) {
+  uint64_t add(const char* term, int tlen, int doc, int pos) {
     // auto sv = std::string_view(term,tlen);
     auto sv = key_type(term, tlen); // hamstring phmap for now and don't use heterogeneous lookup (since robinmap can't do it yet, and we want to compare)
     auto [iter, inserted] = map.try_emplace(sv, pool, doc, pos);
-    int ret;
+    uint64_t ret;
     if (!inserted) {
       auto&[k,v] = *iter;
       v.addDoc(pool, doc, pos);
       ret = v.doctot + v.postot;
     } else {
-      ret = doc*3 + pos*5;
+      ret = uint64_t(doc)*3 + uint64_t(pos)*5;
     }
 
     return ret;
@@ -355,7 +355,7 @@ static void BM_invertTemplate(benchmark::State& state) {
   int unique = 0;        // number of terms that turned out to be unique
   long poolsz = 0;
   long mem = 0;
-  int result = 0;
+  uint64_t result = 0;
 
   for (auto _ : state) {
     TestHasher::call_count = 0;

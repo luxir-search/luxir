@@ -48,11 +48,11 @@ public:
     }
 
     bool nextBucket(int nbuckets = 1) {
-      int newBase = base + 0x00010000 * nbuckets;
-      if (newBase < 0) {
+      int64_t newBase = base + 0x00010000 * (int64_t)nbuckets;
+      if (newBase > INT_MAX) {
         return false;
       }
-      base = newBase;
+      base = (int)newBase;
       return true;
     }
 
