@@ -2,6 +2,7 @@
 #include <gtest/gtest.h>
 #include <iostream>
 #include "solux/util/solux_util.h"
+#include "solux/util/heap.h"
 #include "solux/util/TaggedPtr.h"
 
 using namespace std;
@@ -37,6 +38,58 @@ TEST(BasicTest, testCompiler) {
     EXPECT_EQ(*tp2.ptr(), "hi");
     EXPECT_EQ(tp2.tag(), 3);
 }
+
+
+TEST(BasicTest, testPQ) {
+
+
+  /* alternate form... need to use decltype for lambda
+  auto constexpr mycmp = [](double a, double b){return b < a;}; // reversed comparator for a min heap
+  solux::IndirectPQ<float, decltype(mycmp)> pq(vals, valPtrs);
+  */
+
+  {
+    std::vector<float> vals = {50.0, 75.0, 25.0};
+    std::vector<float*> valPtrs;
+    valPtrs.resize(vals.size());
+
+    solux::IndirectPQ<float, std::greater<>> pq(vals, valPtrs);
+    ASSERT_EQ(vals.size(), pq.size());
+    ASSERT_EQ(pq.top(), 25.0);
+    ASSERT_EQ(pq.indexOfTop(), 2);
+    pq.top() = 125;
+    pq.updateTop();
+    ASSERT_EQ(pq.top(), 50.0);
+    ASSERT_EQ(pq.indexOfTop(), 0);
+    pq.removeTop();
+    ASSERT_EQ(pq.top(), 75.0);
+    ASSERT_EQ(pq.indexOfTop(), 1);
+    pq.removeTop();
+    ASSERT_EQ(pq.top(), 125.0);
+    ASSERT_EQ(pq.indexOfTop(), 2);
+    pq.removeTop();
+    ASSERT_EQ(pq.size(), 0);
+  }
+
+  {
+    std::vector<float> vals = {50.0, 75.0, 25.0, 80.0, 40.0};
+    std::vector<float*> valPtrs(3);
+    solux::IndirectPQ<float, std::greater<>> pq(valPtrs, 0);
+    ASSERT_EQ(pq.size(), 0);
+    ASSERT_EQ(nullptr, pq.insertWithOverflow(&vals[4]));  // 40
+    ASSERT_EQ(nullptr, pq.insertWithOverflow(&vals[0]));  // 50
+    ASSERT_EQ(pq.top(), 40.0);
+    ASSERT_EQ(nullptr, pq.insertWithOverflow(&vals[1]));  // 75
+    ASSERT_EQ(pq.top(), 40.0);
+    float* ejected = pq.insertWithOverflow(&vals[3]);     // 80, kicks out 40
+    ASSERT_EQ(&vals[4], ejected);
+    ASSERT_EQ(pq.top(), 50.0);
+    ejected = pq.insertWithOverflow(&vals[2]);            // 25, rejected
+    ASSERT_EQ(&vals[2], ejected);
+    ASSERT_EQ(pq.top(), 50.0);
+  }
+}
+
 
 #if REMOVED_CODE
 char* returnsStackAddr(char* ptr) {

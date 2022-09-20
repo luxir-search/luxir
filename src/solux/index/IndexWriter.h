@@ -173,6 +173,10 @@ public:
   }
 
   // TODO: can merging be decoupled and done by something else?  What about even on a different node?
+  // overwrites would be the only tricky part...
+  void mergeSegments() {
+
+  }
 
 };
 

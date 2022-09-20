@@ -54,7 +54,9 @@ BM_heap<UpdateTopOnly>/1024    3786159 ns      3786167 ns          184 fp=86.595
 
 class HeapStd {
 public:
-  uint64_t calcResult(std::vector<uint32_t *> &dataPointers, uint32_t maxIncrement, uint64_t seed) {
+  static const bool useIdx = false;
+  static uint64_t calcResult(std::vector<uint32_t>& data, std::vector<uint32_t *> &dataPointers, uint32_t maxIncrement, uint64_t seed) {
+    unused(data);
     Rng rng(seed);
     uint64_t ret = 0;
 
@@ -90,7 +92,9 @@ public:
 
 class UpdateTop {
 public:
-  uint64_t calcResult(std::vector<uint32_t *> &dataPointers, uint32_t maxIncrement, uint64_t seed) {
+  static constexpr bool useIdx = false;
+  static uint64_t calcResult(std::vector<uint32_t>& data, std::vector<uint32_t *> &dataPointers, uint32_t maxIncrement, uint64_t seed) {
+    unused(data);
     Rng rng(seed);
     uint64_t ret = 0;
 
@@ -124,9 +128,82 @@ public:
   }
 };
 
+class indirectPQ {
+public:
+  static constexpr bool useIdx = false;
+
+  static uint64_t calcResult(std::vector<uint32_t>& data, std::vector<uint32_t *> &dataPointers, uint32_t maxIncrement, uint64_t seed) {
+    unused(data);
+    // TODO: which constructor is used seems to affect timing (to the tune of ~3%, but consistently)... the seemingly more complex
+    // constructor pq(data, dataPointers, true) is the faster one.
+    // constexpr auto mycomp = [](const uint32_t& a, const uint32_t& b) { return b < a; }; // reversed comparator for min-heap
+    // IndirectPQ<uint32_t, decltype(mycomp)> pq(data, dataPointers, true);
+    IndirectPQ<uint32_t, std::greater<>> pq(dataPointers);
+    // IndirectPQ<uint32_t, decltype(mycomp)> pq(dataPointers);
+
+    Rng rng(seed);
+    uint64_t ret = 0;
+
+    while (pq.size() > 0) {
+      uint32_t currV = pq.top();
+      ret = ret * 31 + currV;
+      pq.top() = currV + rng.rint(1u, maxIncrement);
+      if (pq.top() > currV) { // no overflow
+        pq.updateTop();
+      } else {
+        pq.removeTop();
+      }
+    }
+    return ret;
+  }
+};
+
+
+
+class UpdateTopIdx {
+public:
+  static constexpr bool useIdx = true;
+  static uint64_t calcResult(std::vector<uint32_t>& data, std::vector<uint32_t> &idxArr, uint32_t maxIncrement, uint64_t seed) {
+    Rng rng(seed);
+    uint64_t ret = 0;
+
+    uint32_t* dataArr = &data[0];
+    uint32_t* arr = &idxArr[0];
+
+    auto cmp = [dataArr](int32_t a, int32_t b) {
+      return dataArr[b] < dataArr[a];
+    };  // reversed for a min-heap
+
+    uint32_t end = idxArr.size();  // current size of queue
+    std::make_heap(arr, arr+end, cmp);
+
+    while (end > 0) {
+      uint32_t topIdx = arr[0];
+      uint32_t currV = dataArr[topIdx];
+      ret = ret * 31 + currV;
+      dataArr[topIdx] = currV + rng.rint(1u, maxIncrement);
+
+      if (dataArr[topIdx]  > currV) { // no overflow
+        // just update the top of the heap
+        update_heap_top(arr, arr+end, cmp);
+      } else {
+        // exhausted, need to pop heap top.
+        std::pop_heap(arr, arr+end, cmp);
+        end--;
+      }
+      assert(std::is_heap(arr,arr+end,cmp));
+    }
+
+    return ret;
+  }
+};
+
+
 class UpdateTopOnly { // use our update_heap_top instead of pop_heap
 public:
-  uint64_t calcResult(std::vector<uint32_t *> &dataPointers, uint32_t maxIncrement, uint64_t seed) {
+  static constexpr bool useIdx = false;
+  static uint64_t calcResult(std::vector<uint32_t>& data, std::vector<uint32_t *> &dataPointers, uint32_t maxIncrement, uint64_t seed) {
+    unused(data);
     Rng rng(seed);
     uint64_t ret = 0;
 
@@ -169,6 +246,7 @@ static void BM_heap(benchmark::State& state) {
   uint32_t maxinc = 0xffffffffu / 50;  // average of 100 "advances" before exhausting
   std::vector<uint32_t> origData(maxsz);
   std::vector<uint32_t*> origHeap(maxsz);
+  std::vector<uint32_t> origDataIdx(maxsz);
 
   std::vector<uint32_t> data(maxsz);
   std::vector<uint32_t*> heap(maxsz);
@@ -176,21 +254,26 @@ static void BM_heap(benchmark::State& state) {
   for (uint32_t i=0; i<maxsz; i++) {
     origData[i] = rng.rint(0u, maxinc);
     origHeap[i] = &data[i];
-    dataIdx[i] = i;
+    origDataIdx[i] = i;
   }
 
   HeapImpl heapImpl;
 
   for (auto _ : state) {
     data = origData;  // reset data
-    heap = origHeap;  // reset data
-    result = heapImpl.calcResult(heap, maxinc, 2);
+    if constexpr (heapImpl.useIdx) {
+      dataIdx = origDataIdx;
+      result = heapImpl.calcResult(data, dataIdx, maxinc, 2);
+    } else {
+      heap = origHeap;  // reset data
+      result = heapImpl.calcResult(data, heap, maxinc, 2);
+    }
     benchmark::DoNotOptimize(result);
     benchmark::ClobberMemory();
   }
   ASSERT_TRUE(result != 0);
 
-  state.counters["fp"] = result % 100000;
+  state.counters["fp"] = double(result % 100000);
   state.counters["heapSz"] = maxsz;
   state.counters["inc"] = maxinc;
 }
@@ -200,12 +283,16 @@ static void BM_heap(benchmark::State& state) {
 #ifdef RUN_DISABLED_BENCHMARKS
 BENCHMARK(BM_heap<HeapStd>)->RangeMultiplier(2)->Range(1, 1<<10);
 BENCHMARK(BM_heap<UpdateTop>)->RangeMultiplier(2)->Range(1, 1<<10);
+BENCHMARK(BM_heap<indirectPQ>)->RangeMultiplier(2)->Range(1, 1<<10);
+BENCHMARK(BM_heap<UpdateTopIdx>)->RangeMultiplier(2)->Range(1, 1<<10);
 BENCHMARK(BM_heap<UpdateTopOnly>)->RangeMultiplier(2)->Range(1, 1<<10);
 #else
 inline void hackety_hack() {
   solux::unused(hackety_hack);
   solux::unused(BM_heap<HeapStd>);
   solux::unused(BM_heap<UpdateTop>);
+  solux::unused(BM_heap<indirectPQ>);
+  solux::unused(BM_heap<UpdateTopIdx>);
   solux::unused(BM_heap<UpdateTopOnly>);
 }
 #endif
