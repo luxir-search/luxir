@@ -2,6 +2,7 @@
 #include <iostream>
 #include <fstream>
 #include "TestData.h"
+#include "solux/util/log.h"
 
 namespace fs=std::filesystem;
 
@@ -16,12 +17,12 @@ void Book::readFile() {
   auto fname = fs::temp_directory_path() / "solux" / "book.txt";
   std::ifstream file(fname, std::ios::binary);
   if (!file) {
-    std::cout << "Couldn't read file " << fname << std::endl;
+    LOG_ERROR("Couldn't read file '{}'", (std::string)fname);
   }
   std::stringstream ss;
   ss << file.rdbuf();
   str = ss.str();
-  std::cout << "LENGTH of " << fname << " is " << str.size() << std::endl;
+  LOG_DEBUG("LENGTH of '{}' is {}", (std::string)fname, str.size());
 }
 
 
@@ -79,8 +80,8 @@ void Book::parse() {
   paraOffsets.shrink_to_fit();
   paraSizes.shrink_to_fit();
 
-  std::cout << "nChapters=" << chapterOffsets.size() << " nPara=" << paraOffsets.size()
-            << " maxParaSize=" << maxParaSize << " sumParaSizes=" << sumParaSizes << std::endl;
+  LOG_DEBUG("nChapters={} nPara={} maxParaSize={} sumParaSizes={}"
+            ,chapterOffsets.size(), paraOffsets.size(), maxParaSize, sumParaSizes);
 
   // sanity check
   // std::cout << "FIRST PARA:" << text().substr(paraOffsets[0], paraSizes[0]) << std::endl;

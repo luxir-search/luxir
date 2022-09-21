@@ -7,6 +7,10 @@
 
 using namespace solux;
 
+// TODO - use a different logger for RPC stuff some point
+// redefine DEBUG to TRACE level whish shouldn't currently be logged!
+#define GRPC_DEBUG LOG_TRACE
+
 class GrpcSearchTest : public SoluxTest {
 public:
   std::shared_ptr<grpc::Channel> channel;
@@ -32,7 +36,7 @@ TEST_F(GrpcSearchTest, basic) {
 
   std::string reqStr;
   google::protobuf::TextFormat::PrintToString(req, &reqStr);
-  std::cout << "CLIENT REQ:( " << reqStr << " )" << std::endl;
+  GRPC_DEBUG("CLIENT REQ:( {} )", reqStr);
 
   std::unique_ptr<grpc::ClientReaderWriter<solux::proto::SearchRequest, solux::proto::SearchResponse>> stream = searchStub->Search(&context);
   bool wrote = stream->Write(req);
@@ -43,11 +47,11 @@ TEST_F(GrpcSearchTest, basic) {
   while (stream->Read(&response)) {
     std::string resStr;
     google::protobuf::TextFormat::PrintToString(response, &resStr);
-    std::cout << "CLIENT RESULT:( " << resStr << " )" << std::endl;
+    GRPC_DEBUG("CLIENT RESULT:( {} )", resStr);
   }
 
   grpc::Status status = stream->Finish();
-  std::cout << "STREAMING SEARCH CLIENT FINISHED" << std::endl;
+  GRPC_DEBUG("STREAMING SEARCH CLIENT FINISHED");
   ASSERT_TRUE(status.ok());
 }
 

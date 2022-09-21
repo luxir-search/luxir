@@ -4,6 +4,7 @@
 #include <charconv>
 #include <thread>
 #include <mutex>
+#include <span>
 #include "solux/store/Directory.h"
 #include "solux/store/OutputStream.h"
 #include "solux/store/InputStream.h"
@@ -174,10 +175,8 @@ public:
 
   // TODO: can merging be decoupled and done by something else?  What about even on a different node?
   // overwrites would be the only tricky part...
-  void mergeSegments() {
 
-  }
-
+  void mergeSegments(MemPool &pool, std::span<PostingsReader *> preaders);
 };
 
 // Should there be a single-threaded IndexWriter and a different multi-threaded version?

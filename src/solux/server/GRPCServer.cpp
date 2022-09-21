@@ -14,6 +14,9 @@
 
 using namespace solux;
 
+// TODO - use a different logger for RPC stuff some point
+// redefine DEBUG to TRACE level whish shouldn't currently be logged!
+#define GRPC_DEBUG LOG_TRACE
 
 GRPCServer::GRPCServer(int nthreads)
   : startLatch(1), startLatchThreads(nthreads), nthreads(nthreads) {
@@ -50,7 +53,7 @@ void solux::GRPCServer::run() {
   }
 
   this->server = builder.BuildAndStart();
-  std::cout << "GRPCServer listening on " << server_address << std::endl;
+  GRPC_DEBUG("GRPCServer listening on {}", server_address);
 
   // inform everyone that the server is up and running
   startLatch.count_down();
@@ -62,7 +65,7 @@ void solux::GRPCServer::run() {
   // Wait for the server to shutdown. Note that some other thread must be
   // responsible for shutting down the server for this call to ever return.
   server->Wait();
-  std::cout << "server->Wait() returned!" << std::endl;
+  GRPC_DEBUG("server->Wait() returned!");
 }
 
 
@@ -159,7 +162,7 @@ public:
   int numCalls = 0; // TODO: testing only... remove after stable.
 
   StreamingCallData(GRPCServer& server, AsyncServiceT& service, GRPCServer::ThreadInfo& threadInfo) : CallData(server, threadInfo), service(service), readerWriter(&ctx) {
-    std::cout << "CREATE thread=" << threadInfo.threadno << " this=" << this << std::endl;
+    GRPC_DEBUG("CREATE StreamingCallData this={}", (void*)this);
 
     // see https://stackoverflow.com/questions/60856240/grpc-c-async-server-how-differentiate-between-writesdone-and-broken-connection
     // TODO: not sure the right way to use this event yet.
@@ -169,10 +172,7 @@ public:
 
   virtual void proceed(bool ok, uint32_t tag) override {
     // TODO: include testing for multiple threads calling back to this object (can that even happen?)
-
-    std::cout << "PROCEED thread=" << threadInfo.threadno << " this=" << this << " state=" << state << " ok=" << ok
-              << " numCalls=" << ++numCalls << " tag=" << tag <<  " cancelled=" << ctx.IsCancelled() << std::endl;
-
+    GRPC_DEBUG("PROCEED this={} state={} ok={} numCalls={} tag={} cancelled={}", (void*)this, state, ok, ++numCalls, tag, ctx.IsCancelled());
 
     if (tag == 1) {
       // result of AsyncNotifyWhenDone
@@ -183,7 +183,7 @@ public:
 
     if (!ok && state != CallStatus::READ) {
       // canceled/errored... nothing else to do.
-      std::cout << "Error or shutting down. deleting " << (void*)this << std::endl;
+      GRPC_DEBUG("Error or shutting down. deleting this={}", (void*)this);
       delete this;
       return;
     }
@@ -196,23 +196,25 @@ public:
           // Client ended the stream.
           // TODO: ok==false when we are shutting down as well.... how to tell the difference?  I guess Finish will
           // error out (or complete) if we're shutting down???
-          std::cout << "End of stream!" << std::endl;
+          GRPC_DEBUG("End of stream!");
           grpc::Status st(grpc::StatusCode::OK,"is OK message used/passed?");
 
           // TODO: only finish *after* writing all necessary responses!
           readerWriter.Finish(st,make_tag());
           state = CallStatus::FINISH;
-          std::cout << "After calling Finish. thread=" << threadInfo.threadno << " this=" << this << " state=" << state << " ok="
-                    << " numCalls=" << numCalls << " tag=" << tag <<  " cancelled=" << ctx.IsCancelled() << std::endl;
+          GRPC_DEBUG("After calling Finish. this={} state={} ok={} numCalls={} tag={} cancelled={}", (void*)this, state, ok, numCalls, tag, ctx.IsCancelled());
           break;
         }
 
 
+#ifdef GRPC_DEBUG
         {
           std::string reqStr;
-          google::protobuf::TextFormat::PrintToString(request, &reqStr);
-          std::cout << "Server read new streaming message:( " << reqStr << " )" << std::endl;
+          google::protobuf::TextFormat::PrintToString(request, &reqStr);  // TODO: figure out something better for this
+          GRPC_DEBUG("Server read new streaming message:({})", reqStr);
         }
+#endif
+
         fillResponse();
 
         readerWriter.Write(response, make_tag());
@@ -237,7 +239,7 @@ public:
         break;
 
       default:
-        std::cerr << "Unexpected state " << state << std::endl;
+        LOG_ERROR("Unexpected state {}", state);
         assert(false);
     }
   }
@@ -302,7 +304,7 @@ public:
 class IndexerUpdateCall : public UnaryCallData<solux::proto::UpdateRequest, solux::proto::UpdateResponse, Indexer::AsyncService> {
 public:
   IndexerUpdateCall(GRPCServer& server, Indexer::AsyncService& service, GRPCServer::ThreadInfo& threadInfo) : UnaryCallData(server, service, threadInfo) {
-    std::cout << "Indexer.Update inserting " << (void*)this << std::endl;
+    GRPC_DEBUG("Indexer.Update inserting this={}", (void*)this);
     service.RequestUpdate(&ctx, &request, &responder, threadInfo.cq.get(), threadInfo.cq.get(), make_tag());
   }
 
@@ -310,7 +312,8 @@ public:
     new IndexerUpdateCall(server, service, threadInfo);
   }
   virtual void fillResponse() override {
-    std::cout << "Update GRPCServer peer=" << ctx.peer() << std::endl;
+    GRPC_DEBUG("Update GRPCServer peer={}", ctx.peer());
+
     auto code = handleUpdate(server, request, response);
     unused(code); // TOOD: pass back?
   }
@@ -327,7 +330,7 @@ public:
     for (int i=0; i<request.collection().name_size(); i++) {
       // TODO: walk from our implicit root to find the correct collection.
       if (i == request.collection().name_size()-1) {
-        std::cout << "looking up collection name " << request.collection().name(i) << std::endl;
+        GRPC_DEBUG("Looking up collection name '{}'", request.collection().name(i));
 
         // last element in path, so get collection.
         collection = server.getSoluxNode().getCollection(library.get(), request.collection().name(i));
@@ -339,7 +342,7 @@ public:
       }
     }
 
-    std::cout << "\tindexer got docs: " << request.docs_size() << std::endl;
+    GRPC_DEBUG("\tindexer got docs, num={}", request.docs_size());
     auto shard = collection->getShard();
     auto iw = shard->getIndexWriter();
     iw->update(request);
@@ -382,7 +385,7 @@ public:
     new IndexerUpdateStreamingCall(server, service, threadInfo);
   }
   virtual void fillResponse() override {
-    std::cout << "StreamingUpdate GRPCServer peer=" << ctx.peer() << std::endl;
+    GRPC_DEBUG("StreamingUpdate GRPCServer peer={}", ctx.peer());
     auto ok = IndexerUpdateCall::handleUpdate(server, request, response);
     unused(ok);
   }
@@ -399,7 +402,8 @@ public:
     new SearcherSearchStreamingCall(server, service, threadInfo);
   }
   virtual void fillResponse() override {
-    std::cout << "StreamingSearch GRPCServer peer=" << ctx.peer() << std::endl;
+    GRPC_DEBUG("StreamingSearch GRPCServer peer={}", ctx.peer());
+
     std::shared_ptr<Collection> collection;
 
     if (request.collection().name_size() == 0) {
@@ -410,7 +414,7 @@ public:
     for (int i=0; i<request.collection().name_size(); i++) {
       // TODO: walk from our implicit root to find the correct collection.
       if (i == request.collection().name_size()-1) {
-        std::cout << "looking up collection name " << request.collection().name(i) << std::endl;
+        GRPC_DEBUG("Looking up collection name '{}'", request.collection().name(i));
 
         // last element in path, so get collection.
         collection = server.getSoluxNode().getCollection(library.get(), request.collection().name(i));
@@ -475,13 +479,13 @@ void GRPCServer::runThread(ThreadInfo& threadInfo) {
 
     if (!gotEvent) {
       // shutting down... completion queue should be empty at this point.
-      std::cout << "thread " << threadInfo.threadno << " completionQueue->Next() returned false." << std::endl;
+      GRPC_DEBUG("completionQueue->Next() returned false.");
       break;
     }
 
     if (!ok) {
       // request failed or was terminated.... still call proceed() so that it can be cleaned up
-      std::cout << "thread " << threadInfo.threadno << " ERROR in completionQueue->Next()" << std::endl;
+      GRPC_DEBUG("ERROR in completionQueue->Next()");
     }
 
     CallData::TaggedPtrType taggedPtr = CallData::TaggedPtrType::fromTaggedPtrBits(tag);
@@ -489,7 +493,7 @@ void GRPCServer::runThread(ThreadInfo& threadInfo) {
     callData->proceed(ok, taggedPtr.tag());
   }
 
-  std::cout << "GRPCServer thread shutting down: " << threadInfo << std::endl;
+  GRPC_DEBUG("GRPCServer thread shutting down.");
 }
 
 
@@ -519,7 +523,7 @@ bool GRPCServer::waitForStart() {
     Another grpc example (written by someone else) also showed a leak after upgrading.
  */
 void solux::GRPCServer::shutdown() {
-  std::cout << "Shutting down grpc server." << std::endl;
+  LOG_INFO("Shutting down grpc server.");
 
   // server should be shut down before completion queues
   server->Shutdown();

@@ -73,12 +73,18 @@ bool starts_with(const char * str, const char * prefix)
   return true;
 }
 
-
 int main(int argc, char **argv) {
   gArgc = argc;
   gArgv = argv;
 
   std::cout << solux_banner() << std::endl;
+
+  spdlog::set_pattern("%L %H:%M:%S.%e %s:%# %! %n th=%t %v");
+  spdlog::set_level(spdlog::level::debug); // Set global log level to debug
+
+  LOG_INFO("Logging: compile-time={}, runtime default={}",
+           spdlog::level::level_string_views[SPDLOG_ACTIVE_LEVEL],
+           spdlog::level::level_string_views[spdlog::get_level()]);
 
   // NOTE: argv is actually terminated by NULL!  (i.e. argv[argc]==null_ptr) And google-test actually depends on this!
   std::vector<char *> myargv(argv, argv + argc + 1);

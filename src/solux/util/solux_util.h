@@ -5,6 +5,7 @@
 #include <iostream>
 #include <vector>
 #include <memory.h>
+#include "log.h"
 
 // NOTE: this is better than including xxhash.h since it enables inline. Inverter performance equal to
 // fvn1a when inlined.  25% slower if not inlined.

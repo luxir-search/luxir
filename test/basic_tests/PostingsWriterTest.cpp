@@ -294,27 +294,27 @@ TEST_F(PostingsTest, basic) {
 
   FieldReader fieldReader(pool, reader);
   while (fieldReader.readNextField()) {
-    std::cout << "FIELD NAME name=" << fieldReader.name() << std::endl;
+    LOG_TRACE("FIELD NAME name={}", fieldReader.name());
     SegFieldInfo fieldInfo;
     fieldReader.readFieldInfo(fieldInfo);
     TermsEnum tenum(pool, reader, fieldInfo);
     while (tenum.nextTerm()) {
-      std::cout << "\tTERM=" << tenum.term() << " ord=" << tenum.ord() << std::endl;
+      LOG_TRACE("\tTERM={} ord={}", tenum.term(), tenum.ord());
       // if (tenum.ord()==0) continue; // skip first term, good for figuring out of second term errors are due to reader or writer.
 
       DocsEnum docsEnum(pool, reader, tenum);
       auto ndocs = docsEnum.numDocs();
-      std::cout << "\t\tnumDocs=" << docsEnum.numDocs() << " totalTermFreq=" << docsEnum.totalTermFreq() << std::endl;
+      LOG_TRACE("\t\tnumDocs={} totalTermFreq={}" , docsEnum.numDocs(), docsEnum.totalTermFreq());
 
       for (int i = 0; i < ndocs; i++) {
         auto id = docsEnum.nextDoc();
         auto tfreq = docsEnum.termFreq();
-        std::cout << "\t\t\tdocid=" << id << " termFreq=" << tfreq << std::endl;
+        LOG_TRACE("\t\t\tdocid={} termFreq={}", id, tfreq);
         if (i==1) { continue; }  // test skipping reading a docs positions
         docsEnum.startPositions();
         for (int j = 0; j < tfreq; j++) {
           auto pos = docsEnum.nextPosition();
-          std::cout << "\t\t\t\tpos=" << pos << std::endl;
+          LOG_TRACE("\t\t\t\tpos={}",pos);
         }
       }
     }
@@ -357,7 +357,6 @@ TEST_F(PostingsTest, blockPositions) {
 
   FieldReader fieldReader(pool, reader);
   ASSERT_TRUE(fieldReader.readNextField());
-  std::cout << "FIELD NAME name=" << fieldReader.name() << std::endl;
   ASSERT_EQ(fieldReader.name(), std::string_view("field1"));
   SegFieldInfo fieldInfo;
   fieldReader.readFieldInfo(fieldInfo);
@@ -433,7 +432,6 @@ TEST_F(PostingsTest, blockTerms) {
 
   FieldReader fieldReader(pool, reader);
   ASSERT_TRUE(fieldReader.readNextField());
-  // std::cout << "FIELD NAME name=" << fieldReader.name() << " numTerms=" << fieldReader.numTerms() << std::endl;
   ASSERT_EQ(fieldReader.name(), std::string_view("field1"));
   SegFieldInfo fieldInfo;
   fieldReader.readFieldInfo(fieldInfo);

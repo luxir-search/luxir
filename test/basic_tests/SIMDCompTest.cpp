@@ -144,6 +144,5 @@ TEST_F(SIMDCompTest, testComp) {
 
   mydata2.resize(intersize);
   mydata2.shrink_to_fit();
-  cout << "Intersection size: " << mydata2.size() << "  integers. " << endl;
   ASSERT_EQ(matches, mydata2.size());
 }

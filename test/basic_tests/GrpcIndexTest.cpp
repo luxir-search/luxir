@@ -6,6 +6,10 @@
 #include "test/SoluxTest.h"
 #include "solux/server/GRPCServer.h"
 
+// TODO - use a different logger for RPC stuff some point
+// redefine DEBUG to TRACE level whish shouldn't currently be logged!
+#define GRPC_DEBUG LOG_TRACE
+
 using namespace solux;
 
 class GrpcIndexTest : public SoluxTest {
@@ -139,11 +143,12 @@ TEST_F(GrpcIndexTest, streamingHello) {
   while (stream->Read(&result)) {
     std::string resStr;
     google::protobuf::TextFormat::PrintToString(result, &resStr);
-    std::cout << "CLIENT RESULT:( " << resStr << " )" << std::endl;
+    GRPC_DEBUG("CLIENT RESULT:( {} )", resStr);
   }
 
   grpc::Status status = stream->Finish();
-  std::cout << "CLIENT FINISHED" << std::endl;
+  GRPC_DEBUG("CLIENT FINISED");
+
   ASSERT_TRUE(status.ok());
 }
 
@@ -254,15 +259,15 @@ TEST_F(GrpcIndexTest, addDocs) {
 
   std::string reqStr;
   google::protobuf::TextFormat::PrintToString(ureq, &reqStr);
-  std::cout << "CLIENT REQ:( " << reqStr << " )" << std::endl;
+  GRPC_DEBUG("CLIENT REQ:( {} )", reqStr);
 
   grpc::ClientContext context;
   grpc::Status status = indexerStub->Update(&context, ureq , &response);
 
   if (!status.ok()) {
-    std::cout << "grpc call failed!: " << status.error_code() << " " << status.error_message() << std::endl;
+    LOG_ERROR("grpc call failed!: code={} msg={}", status.error_code(), status.error_message());
   } else {
-    std::cout << "I got id:" << response.responses(0).request_id() << std::endl;
+    GRPC_DEBUG("I got id:{}", response.responses(0).request_id());
   }
 
 }
@@ -282,7 +287,7 @@ TEST_F(GrpcIndexTest, addDocsStream) {
 
   std::string reqStr;
   google::protobuf::TextFormat::PrintToString(req, &reqStr);
-  std::cout << "CLIENT REQ:( " << reqStr << " )" << std::endl;
+  GRPC_DEBUG("CLIENT REQ:( {} )", reqStr);
 
   std::unique_ptr<grpc::ClientReaderWriter<solux::proto::UpdateRequest, solux::proto::UpdateResponse>> stream = indexerStub->UpdateStream(&context);
   bool wrote = stream->Write(req);
@@ -305,11 +310,11 @@ TEST_F(GrpcIndexTest, addDocsStream) {
   while (stream->Read(&response)) {
     std::string resStr;
     google::protobuf::TextFormat::PrintToString(response, &resStr);
-    std::cout << "CLIENT RESULT:( " << resStr << " )" << std::endl;
+    GRPC_DEBUG("CLIENT RESULT:( {} )", resStr);
   }
 
   grpc::Status status = stream->Finish();
-  std::cout << "STREAMING UPDATE CLIENT FINISHED" << std::endl;
+  GRPC_DEBUG("STREAMING UPDATE CLIENT FINISHED");
   ASSERT_TRUE(status.ok());
 }
 

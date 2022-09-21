@@ -328,7 +328,7 @@ public:
     }
   }
 
-  TermRef name() { return fieldname; }
+  PackedTerm name() const noexcept { return fieldname; }
 
 private:
 
