@@ -29,7 +29,19 @@ void Book::readFile() {
 void Book::parse() {
   auto sv = text();
   auto off = sv.find("\nBOOK ONE:") + 1;  // off is offset of the *start* of a non-blank line.
-  auto end = sv.rfind("End of the Project Gutenberg EBook");
+  if (off == sv.npos) {
+    off = 0;
+    LOG_ERROR("Can't find start of book - it may have changed? Using {}", off);
+  }
+  auto end = sv.rfind("*** END OF THE PROJECT GUTENBERG EBOOK");
+  if (end == sv.npos) {
+    end = sv.rfind("End of the Project Gutenberg EBook");
+  }
+  if (end == sv.npos) {
+    end = sv.size() - 1;
+    LOG_ERROR("Can't find end of book - it may have changed? Using {}", end);
+  }
+
 
   size_t maxParaSize = 0;
   sumParaSizes = 0;
