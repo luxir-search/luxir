@@ -217,7 +217,7 @@ public:
     friend class Inverter;
     LongStream longStream;
     DocStream docsWithVal;
-    IntColStats stats;
+    int32_t numVals = 0;
 
     FieldType *fieldType;
   public:
@@ -241,9 +241,9 @@ public:
     }
 
     void indexSingle(Inverter &inverter, int64_t val) {
-      stats.add(val);
       longStream.addVal(inverter.pool, val);
       docsWithVal.addDoc(inverter.pool, inverter.currDoc);
+      numVals++;
     }
 
     void flush(Inverter &inverter) override {
@@ -260,8 +260,8 @@ public:
       fieldInfo.fieldname = fieldName;
 
       IntColWriter writer(postingsWriter.pool, postingsWriter, fieldInfo);
-      auto full = stats.numVals() >= postingsWriter.getMaxDoc();
-      writer.startFieldIntCol(stats);
+      auto full = numVals >= postingsWriter.getMaxDoc();
+      writer.startField();
       longStream.pushValues(inverter.pool, writer);
       if (!full) {
         writer.startDocsWithValue();

@@ -310,11 +310,13 @@ TEST_F(PostingsTest, basic) {
         auto id = docsEnum.nextDoc();
         auto tfreq = docsEnum.termFreq();
         LOG_TRACE("\t\t\tdocid={} termFreq={}", id, tfreq);
+        unused(id); unused(tfreq);
         if (i==1) { continue; }  // test skipping reading a docs positions
         docsEnum.startPositions();
         for (int j = 0; j < tfreq; j++) {
           auto pos = docsEnum.nextPosition();
           LOG_TRACE("\t\t\t\tpos={}",pos);
+          unused(pos);
         }
       }
     }
@@ -569,16 +571,10 @@ TEST_F(PostingsTest, intCol) {
 
     PostingsWriter writer(dir, "10", 3);
 
-    // Temporary API - needs to be changed
-    IntColStats stats;
-    stats.add(77);
-    stats.add(33);
-    stats.add(11);
-
     auto &finfo = writer.fieldInfos.emplace_back();
     finfo.fieldname = fname1;
     IntColWriter colWriter(pool, writer, finfo);
-    colWriter.startFieldIntCol(stats);
+    colWriter.startField();
     colWriter.addInt64(77);
     colWriter.addInt64(33);
     colWriter.addInt64(11);

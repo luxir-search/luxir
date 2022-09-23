@@ -176,7 +176,7 @@ public:
   // TODO: can merging be decoupled and done by something else?  What about even on a different node?
   // overwrites would be the only tricky part...
 
-  void mergeSegments(MemPool &pool, std::span<PostingsReader *> preaders);
+  void mergeSegments(MemPool &pool, std::span<PostingsReader *> preaders, PostingsWriter &postingsWriter);
 };
 
 // Should there be a single-threaded IndexWriter and a different multi-threaded version?

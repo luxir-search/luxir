@@ -152,7 +152,6 @@ public:
   struct IndexFieldInfo : public SegFieldInfo {
     int64_t sumDocFreq;
     int64_t sumTotalTermFreq;
-    int32_t flags;  // temporary... currently has type info. 0x01 text, 0x02 int col.  In the future, we should decompose and have separate sections for each type
   };
 
   std::vector<DataFile> files;  // TODO! not multi-threaded compat since vector can cause previous entries to move!
@@ -708,7 +707,6 @@ class IntColWriter {
   MemPool& pool;
   PostingsWriter& postingsWriter;
   PostingsWriter::IndexFieldInfo& fieldInfo;
-  IntColStats* stats;
   OutputStream& colOutput;
   ScreamingBuilder docsWithVal;
   int64_t colStart;
@@ -729,9 +727,7 @@ public:
 
   // The passed fieldStats should remain valid until after endField is called.
   // Should this just be folded into the constructor?
-  void startFieldIntCol(IntColStats& fieldStats) {
-    // column writing could be parallelized better by using multiple files and grabbing a free file at this point.
-    stats = &fieldStats;
+  void startField() {
     colStart = colOutput.size();
   }
 
@@ -769,7 +765,6 @@ public:
   }
 
   void endField() {
-    assert(nAdded == stats->numVals());
     bool allDocsHaveValue = nAdded == postingsWriter.maxDoc; // How to get this dynamically?  pass it in?
 
     // write any necessary index into encoded blocks here (assuming it's small enough to keep in memory)

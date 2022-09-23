@@ -225,6 +225,8 @@ struct SegFieldInfo {
   int32_t docsWithValue;
   seg_location docsWithValueEndLoc;
   seg_location columnLoc;
+
+  int32_t flags;  // temporary... currently has type info. 0x01 text, 0x02 int col.  In the future, we should decompose and have separate sections for each type
 };
 
 
@@ -312,6 +314,7 @@ public:
     if (!fieldInfoRead) {
       fieldInfoRead = true;
       auto type = fieldIS.readVint();
+      fieldInfo.flags = type;
       if (type == 0x01) {
         fieldInfo.termBlockIndexLoc = fieldIS.readVal<seg_location>();
         fieldInfo.termsLoc = fieldIS.readVal<seg_location>();
@@ -942,6 +945,11 @@ public:
     return fieldInfo.docsWithValue;
   }
 
+  template <class DocAcceptor>
+  void pushDocs(DocAcceptor docAcceptor) {
+    // TODO OPT: push the acceptor right down into screaming bitset! This avoids switching on the bucket type in the bitset!
+    // Make a merging benchmark first though!
+  }
 
   class DenseIterator {
     const int64_t* values;
@@ -1022,6 +1030,7 @@ public:
       return doc;
     }
 
+    // returns the docid corresponding to the next value
     int32_t next() {
       if (docRank + 1 >= maxRank) {
         doc = screaming::BitSet::END;
