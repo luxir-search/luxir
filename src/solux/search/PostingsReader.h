@@ -161,7 +161,12 @@ public:
     files.reserve(nFiles);
     inputStreams.reserve(nFiles);
 
-    files.emplace_back(dir.openFile(Postings::getIndexFileName(gen, 0)));
+    auto segInfoFile = Postings::getIndexFileName(gen, 0);
+    files.emplace_back(dir.openFile(segInfoFile));
+    if (files.back().get() == nullptr) {
+      LOG_ERROR("Can't find/open first segment file {}", segInfoFile);
+      // TODO: throw exception?
+    }
     inputStreams.emplace_back(files[0]->getInputStream());
     firstIS = inputStreams[0];
 
@@ -928,6 +933,8 @@ class IntColReader {
   const int64_t* values;
 
 public:
+  static constexpr int32_t END = std::numeric_limits<int32_t>::max();  // TODO: put this somewhere more generic?
+
   IntColReader(MemPool &pool, PostingsReader &postingsReader, const SegFieldInfo &fieldInfo) : pool(pool),
                                                                                           postingsReader(postingsReader),
                                                                                           fieldInfo(fieldInfo) {
@@ -971,7 +978,7 @@ public:
 
     int32_t next() {
       if (++doc >= max) {
-        doc = screaming::BitSet::END;
+        doc = END;
       }
       return doc;
     }
@@ -1033,7 +1040,7 @@ public:
     // returns the docid corresponding to the next value
     int32_t next() {
       if (docRank + 1 >= maxRank) {
-        doc = screaming::BitSet::END;
+        doc = END;
         return doc;
       }
       docRank++;

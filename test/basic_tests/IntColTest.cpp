@@ -72,7 +72,7 @@ protected:
       EXPECT_EQ(seqVal, val);
     }
     auto doc = fv.testField.nextDoc();
-    EXPECT_EQ(doc, screaming::BitSet::END);
+    EXPECT_EQ(doc, -1);  // for now...
   }
 
   void verifyIntFields(TestIndex& testIndex, std::vector<FieldAndValues>& fieldsValues) {
@@ -107,6 +107,28 @@ TEST_F(IntColTest, basic2) {
   testIndex.flush();
   testIndex.initReader();
   verifyIntFields(testIndex, fvs);
+}
+
+TEST_F(IntColTest, basicMerge) {
+  TestIndex testIndex;
+  TestField f(testIndex, "foo_i");
+  f.startIndexing();
+  f.add(0, 5);
+  testIndex.flush();
+  f.startIndexing();
+  f.add(0, 7);
+  testIndex.flush();
+
+  // TODO: force reopen of IndexReader since that is what mergeSegments uses?
+  testIndex.iw->mergeSegments();
+
+  f.startReading();
+  ASSERT_EQ(1, testIndex.reader->segments().size());
+
+  ASSERT_EQ(0, f.nextDoc());
+  ASSERT_EQ(5, f.val());
+  ASSERT_EQ(1, f.nextDoc());
+  ASSERT_EQ(7, f.val());
 }
 
 TEST_F(IntColTest, rand) {

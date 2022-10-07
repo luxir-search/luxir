@@ -116,6 +116,11 @@ public:
     inverter.reset();
 
     segs.emplace_back(segid);
+
+    writeIndexInfoFile();
+  }
+
+  void writeIndexInfoFile() {
     // write new segments file
     // TODO: TBD if we write new segments files or just use the same name
     auto indexFile = dir.createFile(Postings::INDEX_INFO_FILE);
@@ -129,8 +134,8 @@ public:
     }
     indexOut.close();
     dir.finishFile(*indexFile);
-
   }
+
 
   // TODO: Currently single threaded and protected by the IndexWriter mutex... we need something different
   // in the future that can utilize multi-threading.
@@ -173,8 +178,36 @@ public:
 
   }
 
+  /// mostly for testing merge code currently... there is no concurrency control, etc.
+  void mergeSegments() {
+    // make sure we are getting the latest index reader (wasteful!)
+    indexReader.reset();
+    auto reader = getIndexReader();
+    std::vector<PostingsReader*> preaders;  // TODO: make sure we're not trying to merge a segment that is being built!
+    preaders.reserve(reader->segments().size());
+    for (auto& seg : reader->segments()) {
+      preaders.push_back(&*seg.preader);
+    }
+    // we could calc maxdoc at this point...
+    gen++;  // TODO: not thread safe or logic safe with rest of IW
+    auto genStr = Postings::getSortableString(gen);
+    PostingsWriter pwriter(dir, genStr);
+
+    MemPool pool;
+    mergeSegments(pool, preaders, pwriter);
+
+    // update the list of segments... not safe currently
+    // TODO: add unused segments to the "to be deleted" list
+    segs.clear();
+    segs.push_back(genStr);
+
+    writeIndexInfoFile();  // TODO: currently for testing... we wouldn't normally do this here.
+  }
+
+
   // TODO: can merging be decoupled and done by something else?  What about even on a different node?
   // overwrites would be the only tricky part...
+
 
   void mergeSegments(MemPool &pool, std::span<PostingsReader *> preaders, PostingsWriter &postingsWriter);
 };

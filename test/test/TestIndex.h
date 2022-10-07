@@ -143,11 +143,9 @@ namespace solux::test {
     std::unique_ptr<IndexWriter> iw;
     Inverter* inverter = nullptr;
     MemPool::save_point save = pool.getSavePoint();
-    std::unique_ptr<PostingsWriter> postingsWriter;
     std::string gen;
 
-    std::unique_ptr<PostingsReader> postingsReader;
-    std::unique_ptr<FieldReader> fieldReader;
+    std::shared_ptr<IndexReader> reader;
 
     void clear() {
       pool.rewind(save);
@@ -155,7 +153,9 @@ namespace solux::test {
     }
 
     void initWriter() {
-      iw = std::make_unique<IndexWriter>(dir);
+      if (iw.get() == nullptr) {
+        iw = std::make_unique<IndexWriter>(dir);
+      }
       inverter = &iw->getInverter();
       gen = inverter->getPostingsWriter().getSegId();
     }
@@ -178,8 +178,8 @@ namespace solux::test {
     }
 
     void initReader() {
-      postingsReader = std::make_unique<PostingsReader>(dir, gen);
-      fieldReader = std::make_unique<FieldReader>(pool, *postingsReader);
+      // auto indexReader = iw->getIndexReader();
+      reader = std::make_shared<IndexReader>(dir);
     }
 
 
@@ -192,12 +192,14 @@ namespace solux::test {
     Inverter* inverter = nullptr;
     Inverter::IndexHandler* indexHandler = nullptr;
 
+    // segment-level reading
+    size_t currSeg = -1;
     SegFieldInfo fieldInfo;
     std::unique_ptr<IntColReader> colReader;
     std::unique_ptr<IntColReader::Iterator> iter;
 
     int32_t nAdds = 0;
-    int32_t doc = -1;
+    int64_t doc = -1;
     int64_t v = 0;
 
     TestField(TestIndex& testIndex, const std::string_view name) : testIndex(testIndex), name(name) {
@@ -216,21 +218,52 @@ namespace solux::test {
     }
 
     void startReading() {
-      if (testIndex.postingsReader == nullptr) { testIndex.initReader(); }
-      // position fieldReader
-      EXPECT_EQ(true, testIndex.fieldReader->seek(name));
-      testIndex.fieldReader->readFieldInfo(fieldInfo);
-      colReader = std::make_unique<IntColReader>(testIndex.pool, *testIndex.postingsReader, fieldInfo);
-      ASSERT_EQ(colReader->docsWithValue(), nAdds);
-      iter = std::make_unique<IntColReader::Iterator>(*colReader);
+      testIndex.initReader();  // TODO: don't do this for each field?
+      currSeg = -1;
+      iter.reset();
     }
 
-    int32_t nextDoc() {
-      return doc = iter->next();
+    int64_t nextDoc() {  // TODO: change to int64_t
+      if (iter.get() == nullptr) {
+        auto found = nextSegment();
+        if (!found) return -1; // OR BIG_END. 0x7ffffffff?
+      }
+      for(;;) {
+        doc = iter->next();
+        if (doc != IntColReader::END) {
+          return doc;
+        }
+        auto found = nextSegment();
+        if (!found) return -1; // OR BIG_END. 0x7ffffffff?
+      }
     }
 
     int64_t val() {
       return v = iter->value();
+    }
+
+    bool nextSegment() {
+      auto segments = testIndex.reader->segments();
+
+      // do in a loop to skip segments without the field.
+      for (;;) {
+        if (currSeg + 1 >= segments.size()) {
+          return false;
+        }
+        currSeg++;
+
+        IndexReader::Segment& seg = segments[currSeg];
+        FieldReader fieldReader(testIndex.pool, *seg.preader);
+        auto found = fieldReader.seek(name);
+        if (!found) continue;
+
+        fieldReader.readFieldInfo(fieldInfo);
+        colReader = std::make_unique<IntColReader>(testIndex.pool, *seg.preader, fieldInfo);
+        // EXPECT_EQ(colReader->docsWithValue(), nAdds); // TODO: sum up and only do after final segment has been reached
+        iter = std::make_unique<IntColReader::Iterator>(*colReader);
+        return true;
+      }
+
     }
   };
 

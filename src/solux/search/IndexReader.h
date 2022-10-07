@@ -13,10 +13,10 @@ public:
   public:
     int64_t base;   // global index (ordinal) of the first document in this segment with respect to the list of segments
     int ord;        // index of this segment in the list of segments
-    std::unique_ptr<PostingsReader> reader;
+    std::unique_ptr<PostingsReader> preader;
 
     Segment(int64_t base, int ord, std::unique_ptr<PostingsReader>&& postingsReader)
-            : base(base), ord(ord), reader(std::move(postingsReader)) {
+            : base(base), ord(ord), preader(std::move(postingsReader)) {
     }
 
     /* couldn't get any of these to work with storing directly in vector (when including PostingsReader directly)
@@ -45,13 +45,13 @@ public:
       for (int i=0; i<nsegs; i++) {
         auto s = segmentsIs.readStr();
         segs.emplace_back(maxdoc, i, std::make_unique<PostingsReader>(dir, s));
-        maxdoc += segs.back().reader->maxDoc();
+        maxdoc += segs.back().preader->maxDoc();
       }
       // TODO: sort segments by maxdoc, largest first?  Or make IndexWriter do this when writing segments file?
     }
   }
 
-  const std::vector<Segment>& segments() {
+  const std::span<Segment> segments() {
     return segs;
   }
 

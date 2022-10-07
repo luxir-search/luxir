@@ -41,21 +41,23 @@ public:
 
   void merge() {
     segs.reserve(preaders.size());
+    fieldReaders.reserve(preaders.size());  // This is important since we take pointers to these! Pool allocate later...
 
     int64_t base = 0;
     for (auto preader : preaders) {
       fieldReaders.emplace_back(origPool, *preader);
       FieldReader& fieldReader = fieldReaders.back();
 
-      // remove fieldReaders without any fields
-      if (fieldReader.numFields() == 0) {
-        fieldReaders.pop_back();
-        continue;
+      // position fieldReader on first field and add to segs if it's non-empty
+      if (fieldReader.readNextField()) {
+        segs.emplace_back(preader, &fieldReader, base, (int)segs.size());
+        base += preader->maxDoc();
+      } else {
+        LOG_ERROR("Empty fieldReader!");
       }
-
-      segs.emplace_back(preader, &fieldReader, base, (int)segs.size());
-      base += preader->maxDoc();
     }
+    // after the loop, base will be equal to nDocs
+    postingsWriter.setMaxDoc(base);
 
     auto fnameComp = [](const Segment& a, const Segment& b){ return b.fieldReader->name() < a.fieldReader->name(); };
     std::vector<Segment*> segPtrs(segs.size());
@@ -65,17 +67,16 @@ public:
     mergeFieldInfos.reserve(segs.size());
     while (fieldPQ.size() > 0) {
       mergeFieldInfos.resize(0);
-      auto& top = fieldPQ.top();
-      auto currField = top.fieldReader->name();
+      auto currField = fieldPQ.top().fieldReader->name();
 
       // a redundant compare the first time through here, but simpler code.
-      while (fieldPQ.size() > 0 && currField == top.fieldReader->name()) {
+      while (fieldPQ.size() > 0 && currField == fieldPQ.top().fieldReader->name()) {
         MergeFieldInfo& segField = mergeFieldInfos.emplace_back();
-        top.fieldReader->readFieldInfo(segField.segFieldInfo);
-        segField.seg = &top;  // point to which segment produced the segFieldInfo
+        fieldPQ.top().fieldReader->readFieldInfo(segField.segFieldInfo);
+        segField.seg = &fieldPQ.top();  // point to which segment produced the segFieldInfo
 
         // increment to next field name and fix up heap
-        if (!top.fieldReader->readNextField()) {
+        if (!fieldPQ.top().fieldReader->readNextField()) {
           fieldPQ.removeTop();
         } else {
           fieldPQ.updateTop();
@@ -89,6 +90,9 @@ public:
       // they will be reused.
       mergeField(mergeFieldInfos);
     }
+
+    // TODO: where should postingsWriter be finished?
+    postingsWriter.finish();
   }
 
 private:
@@ -123,52 +127,69 @@ private:
     }
 
     // get/reserve a new fieldInfo from the postingsReader
-    PostingsWriter::IndexFieldInfo& indexFieldInfo = postingsWriter.fieldInfos.emplace_back();
-    indexFieldInfo.fieldname = sortedFields[0]->segFieldInfo.fieldname;  // we should ensure out postingsWriter outlives the lifetime of the postings readers!
-    indexFieldInfo.flags = 0;
+    PostingsWriter::IndexFieldInfo& outputFieldInfo = postingsWriter.fieldInfos.emplace_back();
+    outputFieldInfo.fieldname = sortedFields[0]->segFieldInfo.fieldname;  // we should ensure out postingsWriter outlives the lifetime of the postings readers!
+    outputFieldInfo.flags = 0;
 
 
     MemPool readerPool; // TODO: can this be the same as writerPool?
     if (allFlags & 0x02) { // int column
-      indexFieldInfo.flags |= 0x02;
-      IntColWriter intColWriter(writerPool, postingsWriter, indexFieldInfo);
+      outputFieldInfo.flags |= 0x02;
+      IntColWriter intColWriter(writerPool, postingsWriter, outputFieldInfo);
       intColWriter.startField();
 
-      for (auto* field : sortedFields) {
-        auto baseId = (int32_t)field->seg->base;
 
-        IntColReader reader(readerPool, *field->seg->postingsReader, indexFieldInfo);
+      // TODO: it will be most efficient to write all docids and then write all values rather than try to correlate
+      // them.  EXCEPT in the case of a dense encoding that encodes them together (missingValue, etc)
+      // Expose the raw values in that case???
+
+
+      // if we need to write docs and values together, could have either docs or values push to us
+      // and then in the acceptor, use an iterate over the other.  Pushing both should be
+      // fastest though. TODO: implement screaming bitset pusher, column value pusher
+
+      // TODO: write a batch of docids here after we gain the ability to do them incrementally!
+
+      intColWriter.startDocsWithValue();
+      for (auto* field : sortedFields) {
+        auto baseId = (int32_t) field->seg->base;
+
+        IntColReader reader(readerPool, *field->seg->postingsReader, field->segFieldInfo);
         IntColReader::Iterator colIter(reader);
 
-        // TODO: it will be most efficient to write all docids and then write all values rather than try to correlate
-        // them.  EXCEPT in the case of a dense encoding that encodes them together (missingValue, etc)
-        // Expose the raw values in that case???
-
-
-        // if we need to write docs and values together, could have either docs or values push to us
-        // and then in the acceptor, use an iterate over the other.  Pushing both should be
-        // fastest though.
-
-        // TODO: write a batch of docids here after we gain the ability to do them incrementally!
+        // int32_t highest = field->seg->postingsReader->maxDoc();
+        for(;;) {
+          int32_t localId = colIter.next();
+          if (localId == IntColReader::END) {
+            break;
+          }
+          intColWriter.startDoc(baseId + localId);
+        }
       }
+      intColWriter.endDocsWithValue();
+
 
       for (auto* field : sortedFields) {
         auto baseId = (int32_t) field->seg->base;
 
-        IntColReader reader(readerPool, *field->seg->postingsReader, indexFieldInfo);
+        IntColReader reader(readerPool, *field->seg->postingsReader, field->segFieldInfo);
         IntColReader::Iterator colIter(reader);
 
-        // start off with slowest implementation... just use the iterator
-        intColWriter.startDocsWithValue();
+
+        // int32_t highest = field->seg->postingsReader->maxDoc();
         for(;;) {
           int32_t localId = colIter.next();
+          if (localId == IntColReader::END) {
+            break;
+          }
           int64_t val = colIter.value();
           intColWriter.addInt64(val);
         }
       }
 
-      intColWriter.endDocsWithValue();
       intColWriter.endField();
+    } else {
+      LOG_ERROR("Unknown Type!");
     }
 
   }
@@ -179,6 +200,11 @@ private:
 
 
 
+void IndexWriter::mergeSegments(MemPool &pool, std::span<PostingsReader *> preaders, PostingsWriter &postingsWriter) {
+  SegmentMerger merger(pool, preaders, postingsWriter);
+  merger.merge();
+
+}
 
 
 

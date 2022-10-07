@@ -9,7 +9,8 @@ class InputStream {
   const char *start = nullptr;
   const char *end = nullptr;
   // Future?
-  // size_t offset; // the position of "start" in the file
+  // size_t offset; // the position of "start" in the file?
+  //                // Or perhaps InputStream should always be a 0 based view, and reads should go back to the File?
   // File& source;
 public:
   InputStream() = default;
