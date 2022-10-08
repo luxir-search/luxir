@@ -186,7 +186,7 @@ public:
     std::vector<PostingsReader*> preaders;  // TODO: make sure we're not trying to merge a segment that is being built!
     preaders.reserve(reader->segments().size());
     for (auto& seg : reader->segments()) {
-      preaders.push_back(&*seg.preader);
+      preaders.push_back(&seg.preader);
     }
     // we could calc maxdoc at this point...
     gen++;  // TODO: not thread safe or logic safe with rest of IW

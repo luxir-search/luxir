@@ -178,7 +178,7 @@ public:
     }
   }
 
-  int32_t maxDoc() const noexcept {
+  int32_t numDocs() const noexcept {
     return maxdoc;
   }
 
@@ -205,7 +205,7 @@ public:
   }
 
   friend std::ostream& operator<< (std::ostream &out, const PostingsReader &reader) {
-    out << "PostingsReader: numDocs=" << reader.maxDoc() << " files=" << reader.files;
+    out << "PostingsReader: numDocs=" << reader.numDocs() << " files=" << reader.files;
     return out;
   }
 };
@@ -941,7 +941,7 @@ public:
     columnIS = postingsReader.getInputStreamSeek(fieldInfo.columnLoc);
 
     // docsWithValue is currently guaranteed to be in the same file as columnIS
-    if (fieldInfo.docsWithValue != postingsReader.maxDoc()) {
+    if (fieldInfo.docsWithValue != postingsReader.numDocs()) {
       docs.set( columnIS.ptr(fieldInfo.docsWithValueEndLoc.offset()) );
     }
 

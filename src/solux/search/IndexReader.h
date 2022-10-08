@@ -9,27 +9,22 @@ namespace solux {
 // IndexReader is thread safe
 class IndexReader {
 public:
-  class Segment {
-  public:
-    int64_t base;   // global index (ordinal) of the first document in this segment with respect to the list of segments
-    int ord;        // index of this segment in the list of segments
-    std::unique_ptr<PostingsReader> preader;
 
-    Segment(int64_t base, int ord, std::unique_ptr<PostingsReader>&& postingsReader)
-            : base(base), ord(ord), preader(std::move(postingsReader)) {
+  class Segment {
+    // We could keep this in a separate vector in the IndexReader, it would make our segment array slightly more compact.
+    // We have a separate reference preader that doesn't go through the shared_ptr since the IndexReader is supposed to
+    // be live while it is being searched.
+    std::shared_ptr<PostingsReader> sharedPostingsReader;
+  public:
+    PostingsReader& preader;
+    const int64_t base;   // global index (ordinal/rank) of the first document in this segment with respect to the list of segments
+    const int ord;        // index of this segment in the list of segments
+
+    Segment(std::shared_ptr<PostingsReader> postingsReader, int64_t base, int ord)
+            :  sharedPostingsReader(postingsReader), preader(*sharedPostingsReader), base(base), ord(ord) {
     }
 
-    /* couldn't get any of these to work with storing directly in vector (when including PostingsReader directly)
-     so changed to unique_ptr for now.
-    Segment(int64_t base, int ord, Directory& dir, const std::string_view& gen)
-            : base(base), ord(ord), reader(dir, gen) {}
-
-    Segment(Segment&&) = default;
-
-    template <typename... Args>
-    Segment(int64_t base, int ord, Args&&... args)
-      : base(base), ord(ord), reader(std::forward<Args>(args)...) {}  // error: call to implicitly deleted copy constructor
-    */
+    // TODO: need deleted docs for this segment. Lazy or not?
   };
 
 
@@ -37,6 +32,7 @@ public:
     std::shared_ptr<InputFile> inputFile = dir.openFile(Postings::INDEX_INFO_FILE);
     if (inputFile == nullptr) {
       // throw exception, or just have zero segments?
+      LOG_DEBUG("Empty IndexReader");
     } else {
       InputStream segmentsIs = inputFile->getInputStream();
       gen = segmentsIs.readVlong();
@@ -44,10 +40,9 @@ public:
       segs.reserve(nsegs);
       for (int i=0; i<nsegs; i++) {
         auto s = segmentsIs.readStr();
-        segs.emplace_back(maxdoc, i, std::make_unique<PostingsReader>(dir, s));
-        maxdoc += segs.back().preader->maxDoc();
+        segs.emplace_back(std::move(std::make_shared<PostingsReader>(dir, s)), maxdoc, i);
+        maxdoc += segs.back().preader.numDocs();
       }
-      // TODO: sort segments by maxdoc, largest first?  Or make IndexWriter do this when writing segments file?
     }
   }
 
@@ -60,11 +55,8 @@ public:
   }
 
 private:
-  // TODO: how to handle deleted docs?  Have a different postings reader that actually knows it's own deleted docs
-  // or share a postings reader for all index versions that use it, and keep livedocs at a higher level?
-  // If we start caching anything on PostingsReader, we would want the latter (but that would require using shared_ptr again too.
   std::vector<Segment> segs;
-  uint64_t gen;
+  uint64_t gen = 0;
   int64_t maxdoc = 0;
 };
 

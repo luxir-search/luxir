@@ -51,7 +51,7 @@ public:
       // position fieldReader on first field and add to segs if it's non-empty
       if (fieldReader.readNextField()) {
         segs.emplace_back(preader, &fieldReader, base, (int)segs.size());
-        base += preader->maxDoc();
+        base += preader->numDocs();
       } else {
         LOG_ERROR("Empty fieldReader!");
       }

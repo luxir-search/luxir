@@ -253,12 +253,12 @@ namespace solux::test {
         currSeg++;
 
         IndexReader::Segment& seg = segments[currSeg];
-        FieldReader fieldReader(testIndex.pool, *seg.preader);
+        FieldReader fieldReader(testIndex.pool, seg.preader);
         auto found = fieldReader.seek(name);
         if (!found) continue;
 
         fieldReader.readFieldInfo(fieldInfo);
-        colReader = std::make_unique<IntColReader>(testIndex.pool, *seg.preader, fieldInfo);
+        colReader = std::make_unique<IntColReader>(testIndex.pool, seg.preader, fieldInfo);
         // EXPECT_EQ(colReader->docsWithValue(), nAdds); // TODO: sum up and only do after final segment has been reached
         iter = std::make_unique<IntColReader::Iterator>(*colReader);
         return true;
