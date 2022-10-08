@@ -386,7 +386,7 @@ public:
       return;
     }
 
-    assert(docs.back() < postingsWriter.getMaxDoc()); // sanity check to ensure we didn't go over provided maxDoc
+    assert(docs.back() < postingsWriter.getMaxDoc()); // sanity check to ensure we didn't go over provided numDocs
 
     // NOTE: some codecs (like s4-fastpfor-d1) modify the input array to calculate deltas!
     // given that we (could) already have deltas, is there an easy way to bypass that part?
@@ -552,7 +552,7 @@ public:
     unused(term);
     auto totalTermFreq = getTotalTermFreq();
     if (docs.size() > 0) {
-      assert(docs.back() < postingsWriter.getMaxDoc()); // sanity check to ensure we didn't go over provided maxDoc
+      assert(docs.back() < postingsWriter.getMaxDoc()); // sanity check to ensure we didn't go over provided numDocs
     }
     // TODO: handle case when all docs were deleted for term (and term should no longer appear)
     if (totalTermFreq == 1) {

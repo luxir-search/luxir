@@ -123,12 +123,36 @@ TEST_F(IntColTest, basicMerge) {
   testIndex.iw->mergeSegments();
 
   f.startReading();
-  ASSERT_EQ(1, testIndex.reader->segments().size());
 
+  ASSERT_EQ(2, testIndex.reader->numDocs());
+  ASSERT_EQ(1, testIndex.reader->segments().size());
   ASSERT_EQ(0, f.nextDoc());
   ASSERT_EQ(5, f.val());
   ASSERT_EQ(1, f.nextDoc());
   ASSERT_EQ(7, f.val());
+  ASSERT_EQ(-1, f.nextDoc());
+
+  // test merging of fields that are only in one segment or another
+  TestField f2(testIndex, "foo2_i");
+  f2.startIndexing();
+  f2.add(5, 77);
+
+  testIndex.flush();
+  testIndex.iw->mergeSegments();
+
+  f2.startReading();
+  ASSERT_EQ(8, testIndex.reader->numDocs());
+  ASSERT_EQ(1, testIndex.reader->segments().size());
+  f.startReading();
+  ASSERT_EQ(0, f.nextDoc());
+  ASSERT_EQ(5, f.val());
+  ASSERT_EQ(1, f.nextDoc());
+  ASSERT_EQ(7, f.val());
+  ASSERT_EQ(-1, f.nextDoc());
+
+  ASSERT_EQ(7, f2.nextDoc());
+  ASSERT_EQ(77, f2.val());
+  ASSERT_EQ(-1, f2.nextDoc());
 }
 
 TEST_F(IntColTest, rand) {

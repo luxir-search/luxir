@@ -205,7 +205,7 @@ public:
   }
 
   friend std::ostream& operator<< (std::ostream &out, const PostingsReader &reader) {
-    out << "PostingsReader: maxDoc=" << reader.maxDoc() << " files=" << reader.files;
+    out << "PostingsReader: numDocs=" << reader.maxDoc() << " files=" << reader.files;
     return out;
   }
 };

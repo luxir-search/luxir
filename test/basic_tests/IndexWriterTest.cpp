@@ -31,7 +31,7 @@ TEST_F(IndexWriterTest, singleSeg) {
 
   IndexReader r1(dir);
   ASSERT_EQ(1, r1.segments().size());
-  ASSERT_EQ(1, r1.maxDoc());
+  ASSERT_EQ(1, r1.numDocs());
 
   inverter = &iw.getInverter();
   fieldHandler = &inverter->getIndexHandler(field);
@@ -49,5 +49,5 @@ TEST_F(IndexWriterTest, singleSeg) {
 
   IndexReader r2(dir);
   ASSERT_EQ(2, r2.segments().size());
-  ASSERT_EQ(3, r2.maxDoc());
+  ASSERT_EQ(3, r2.numDocs());
 }

@@ -157,7 +157,7 @@ private:
         IntColReader reader(readerPool, *field->seg->postingsReader, field->segFieldInfo);
         IntColReader::Iterator colIter(reader);
 
-        // int32_t highest = field->seg->postingsReader->maxDoc();
+        // int32_t highest = field->seg->postingsReader->numDocs();
         for(;;) {
           int32_t localId = colIter.next();
           if (localId == IntColReader::END) {
@@ -176,7 +176,7 @@ private:
         IntColReader::Iterator colIter(reader);
 
 
-        // int32_t highest = field->seg->postingsReader->maxDoc();
+        // int32_t highest = field->seg->postingsReader->numDocs();
         for(;;) {
           int32_t localId = colIter.next();
           if (localId == IntColReader::END) {

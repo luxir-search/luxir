@@ -55,7 +55,7 @@ public:
     return segs;
   }
 
-  int64_t maxDoc() {
+  int64_t numDocs() {
     return maxdoc;
   }
 

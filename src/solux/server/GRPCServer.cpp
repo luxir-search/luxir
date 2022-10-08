@@ -436,7 +436,7 @@ public:
           response.set_request_id(request.request_id());
           solux::proto::SearchResult& srsp = (*response.mutable_ops())[opKey];
           solux::proto::DocList& docList = *srsp.mutable_docs();
-          docList.set_matches(reader->maxDoc());
+          docList.set_matches(reader->numDocs());
           break;
         }
         case solux::proto::SearchOp::kFieldFacet:
