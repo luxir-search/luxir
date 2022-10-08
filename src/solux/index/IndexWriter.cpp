@@ -150,6 +150,26 @@ private:
 
       // TODO: write a batch of docids here after we gain the ability to do them incrementally!
 
+
+      // currently all values must be written before all docs
+      for (auto* field : sortedFields) {
+        auto baseId = (int32_t) field->seg->base;
+
+        IntColReader reader(readerPool, *field->seg->postingsReader, field->segFieldInfo);
+        IntColReader::Iterator colIter(reader);
+
+
+        // int32_t highest = field->seg->postingsReader->numDocs();
+        for(;;) {
+          int32_t localId = colIter.next();
+          if (localId == IntColReader::END) {
+            break;
+          }
+          int64_t val = colIter.value();
+          intColWriter.addInt64(val);
+        }
+      }
+
       intColWriter.startDocsWithValue();
       for (auto* field : sortedFields) {
         auto baseId = (int32_t) field->seg->base;
@@ -168,24 +188,6 @@ private:
       }
       intColWriter.endDocsWithValue();
 
-
-      for (auto* field : sortedFields) {
-        auto baseId = (int32_t) field->seg->base;
-
-        IntColReader reader(readerPool, *field->seg->postingsReader, field->segFieldInfo);
-        IntColReader::Iterator colIter(reader);
-
-
-        // int32_t highest = field->seg->postingsReader->numDocs();
-        for(;;) {
-          int32_t localId = colIter.next();
-          if (localId == IntColReader::END) {
-            break;
-          }
-          int64_t val = colIter.value();
-          intColWriter.addInt64(val);
-        }
-      }
 
       intColWriter.endField();
     } else {

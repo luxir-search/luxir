@@ -702,6 +702,7 @@ public:
 //
 // Integer column writing
 // TODO: nest these within postings writer? Or use a namespace?
+// TODO: currently all values must be written before all docs!  Decouple this so we can write columns incrementally!
 //
 class IntColWriter {
   MemPool& pool;
@@ -720,29 +721,11 @@ public:
     // TODO: docsWithVal allocates 17K from pool that may not be used... should we try to delay this somehow? (an explicit init function?)
     // Perhaps the indirection associated with delaying the ScreamingBuilder construction would be optimized away since startDoc() would be
     // called in a tight loop.
-    fieldInfo.flags = 0x02;  // int col
-  }
-
-  // refine these APIs as we get more use-cases (like segment merging)
-
-  // The passed fieldStats should remain valid until after endField is called.
-  // Should this just be folded into the constructor?
-  void startField() {
+    fieldInfo.flags |= 0x02;  // int col
     colStart = colOutput.size();
   }
 
-
-  void addDocsWithVal(roaring::Roaring& roaring) {
-    // numDocsWithValue = roaring.cardinality();
-    auto frozenSize = roaring.getFrozenSizeInBytes();
-    auto bufSize = frozenSize + 31; // need space to align
-    std::vector<char> buf(bufSize);  // TODO: replace with something that can write directly to our output streams
-    void* buffer = buf.data();
-    buffer = std::align(32, frozenSize, buffer, bufSize);
-    roaring.writeFrozen((char*)buffer);
-    idEndLoc = colOutput.size();
-    // TODO: what alignment requirements do we have for reading?
-    colOutput.write(buffer, frozenSize);
+  void startField() {
   }
 
   void startDocsWithValue() {
