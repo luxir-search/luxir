@@ -11,17 +11,17 @@ class IndexReader {
 public:
 
   class Segment {
-    // We could keep this in a separate vector in the IndexReader, it would make our segment array slightly more compact.
-    // We have a separate reference preader that doesn't go through the shared_ptr since the IndexReader is supposed to
-    // be live while it is being searched.
     std::shared_ptr<PostingsReader> sharedPostingsReader;
   public:
-    PostingsReader& preader;
     const int64_t base;   // global index (ordinal/rank) of the first document in this segment with respect to the list of segments
     const int ord;        // index of this segment in the list of segments
 
     Segment(std::shared_ptr<PostingsReader> postingsReader, int64_t base, int ord)
-            :  sharedPostingsReader(postingsReader), preader(*sharedPostingsReader), base(base), ord(ord) {
+            :  sharedPostingsReader(postingsReader), base(base), ord(ord) {
+    }
+
+    PostingsReader& postingsReader() {
+      return *sharedPostingsReader;
     }
 
     // TODO: need deleted docs for this segment. Lazy or not?
@@ -40,11 +40,15 @@ public:
       segs.reserve(nsegs);
       for (int i=0; i<nsegs; i++) {
         auto s = segmentsIs.readStr();
+        std::shared_ptr<std::string> x;
+        x.get();
         segs.emplace_back(std::move(std::make_shared<PostingsReader>(dir, s)), maxdoc, i);
-        maxdoc += segs.back().preader.numDocs();
+        maxdoc += segs.back().postingsReader().numDocs();
       }
     }
   }
+
+  // TODO: implement postingsReader sharing by passing in another IndexReader for reference.
 
   const std::span<Segment> segments() {
     return segs;
