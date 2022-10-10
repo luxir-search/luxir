@@ -154,8 +154,9 @@ public:
     int64_t sumTotalTermFreq;
   };
 
-  std::vector<DataFile> files;  // TODO! not multi-threaded compat since vector can cause previous entries to move!
-  std::vector<IndexFieldInfo> fieldInfos; // TODO! not multi-threaded compat since vector can cause previous entries to move!
+  // These are dequeues so elements don't move
+  std::deque<DataFile> files;
+  std::deque<IndexFieldInfo> fieldInfos;
 
 public:
   PostingsWriter(Directory& dir, const std::string_view& segid, int32_t maxDoc=-1) : directory(dir), segid(segid), maxDoc(maxDoc)
@@ -163,7 +164,7 @@ public:
     // TODO: defer file creation until needed, *or* use a RAMDelegatingFile that does so.
     // that does so.
 
-    for (uint32_t i=0; i<6; i++) {
+    for (uint32_t i=0; i<7; i++) {
       std::unique_ptr<File> file = directory.createFile(Postings::getIndexFileName(segid, i));
       files.emplace_back(DataFile{OutputStream{},std::move(file), i});
       files.back().out.setFile( files.back().file.get());
@@ -226,10 +227,9 @@ private:
       fieldOffs.push_back(fieldLoc - fieldsStart);  // make the location relative so we can append this to a large file if necessary
 
       fieldOutput.writePackedTerm(finfo.fieldname);
+      fieldOutput.writeVint(finfo.flags);
 
       if ((finfo.flags & 0x01) != 0) {
-        fieldOutput.writeVint(0x01);
-
         fieldOutput.writeVal(finfo.termBlockIndexLoc);
         fieldOutput.writeVal(finfo.termsLoc);  // TODO: If we change termBlockOffsets to be relative to the start of that index, we can remove termsLoc
         fieldOutput.writeVal(finfo.docsLoc);
@@ -238,7 +238,6 @@ private:
       }
 
       if ((finfo.flags & 0x02) != 0) {
-        fieldOutput.writeVint(0x02);
         fieldOutput.writeVlong(finfo.docsWithValue);
         fieldOutput.writeVal(finfo.docsWithValueEndLoc);
         fieldOutput.writeVal(finfo.columnLoc);
@@ -697,6 +696,68 @@ public:
 };
 
 
+class DocsWriter {
+  ScreamingBuilder builder;
+  OutputStream& idOutput;
+public:
+
+  /// This writer currently *always* writes at least 2 bytes (the number of buckets) in the screaming bitset.
+  /// Decisions should be made at a higher level to not use this for 0 or all-bits-set scenarios.
+  /// This writer allocates from "pool" but does not rewind.  It is safe to release after finish() is called.
+  DocsWriter(MemPool& pool, OutputStream& output) : builder(pool, output), idOutput(output) {
+  }
+
+  // TODO: optionally use a different encoding for few numbers of docs or low maxdoc... ScreamingBitset is
+  // really only competitive when maxdoc is high.  That could be decided at finish(), or could even
+  // be built into the ScreamingBitset format as well...  The limit could also be a function of maxdoc, so
+  // we could avoid using for small indexes / segments altogether.  DocsReader could encapsulate a bitset or
+  // a list of decoded docs (and we could populate that from different formats such as the lowest-bit-is-tfreq)
+  // used in termdoc postings.
+
+  // For direct column building we want something that waits for the first gap before starting to write.
+  // It's also a shame to use up an OutputStream if what we would have to buffer in memory is small.
+
+  // Docs should be added in order!
+  void addDoc(int32_t docid) {
+    builder.add(docid);
+  }
+
+  // Same as addDoc... it's named startDoc target for DocStream.pushDocs.
+  void startDoc(int32_t docid) {
+    builder.add(docid);
+  }
+
+  int32_t finish() {
+    builder.flush();
+    return builder.cardinality();
+  }
+};
+
+
+class DocsWithValWriter {
+  OutputStream& idOutput;
+  DocsWriter docsWriter;
+  // int64_t startLoc;
+  PostingsWriter::IndexFieldInfo& fieldInfo;
+
+  // This field writer does not do any visible pool rollbacks, but does allocate from the pool.
+  DocsWithValWriter(MemPool& pool, PostingsWriter& postingsWriter, PostingsWriter::IndexFieldInfo& fieldInfo)
+  : idOutput(postingsWriter.files[6].out), docsWriter(pool,idOutput), fieldInfo(fieldInfo)
+  {
+    // startLoc = idOutput.size();
+  }
+
+  // Same as addDoc... it's named startDoc target for DocStream.pushDocs.
+  void startDoc(int32_t docid) {
+    docsWriter.startDoc(docid);
+  }
+
+  void finish() {
+    fieldInfo.docsWithValue = docsWriter.finish();
+    int64_t endLoc = idOutput.size();
+    fieldInfo.docsWithValueEndLoc = seg_location(idOutput.streamNumber, endLoc);
+  }
+};
 
 
 //

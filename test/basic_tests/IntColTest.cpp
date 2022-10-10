@@ -175,3 +175,23 @@ TEST_F(IntColTest, rand) {
   testIndex.initReader();
   verifyIntFields(testIndex, fvs);
 }
+
+
+TEST_F(IntColTest, textLen) {
+  TestIndex testIndex;
+  TestField f(testIndex, "foo_w");
+  f.startIndexing();
+  f.add(1, "now is the time");
+  f.add(3, "");
+  f.add(5, "hi");
+  testIndex.flush();
+  f.startReading();
+
+  ASSERT_EQ(1, f.nextDoc());
+  ASSERT_EQ(4, f.val());
+  ASSERT_EQ(3, f.nextDoc());
+  ASSERT_EQ(0, f.val());
+  ASSERT_EQ(5, f.nextDoc());
+  ASSERT_EQ(1, f.val());
+  ASSERT_EQ(-1, f.nextDoc());
+}

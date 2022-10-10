@@ -42,8 +42,7 @@ namespace solux {
 // count could be just a single byte to save space as well.
 
 
-// Documents matching a term.
-// Should we use the same doclist to count what docs have a value for something?
+/// List of documents (for docs-in-a-term, docs-with-value, etc)
 SOLUX_PACKED_START
 class DocStream {
 public:
@@ -80,7 +79,7 @@ public:
     lastDoc = docid;
   }
 
-  /// Calls sink.startDoc(int docid) only for each doc
+  /// Calls sink.startDoc(int docid) only for each doc   // TODO: if I make this a callable, I could use lambdas?
   template <class PostingsConsumer>
   void pushDocs(MemPool& pool, PostingsConsumer& sink) {
     int runPtr = -1;

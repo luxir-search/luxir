@@ -91,8 +91,7 @@ public:
     auto inputFile = std::make_shared<RAMInputFile>(std::move(singleBuffer), sz);
 
     // See if new file name is greater than all others produced (this is common by design)
-    if (files.empty() || files.back().first <
-                         file.name()) {  // TODO: what is clang-tidy's problem with this line??? It suggests replacing "<" with nullptr !??
+    if (files.empty() || files.back().first < file.name()) {
       files.emplace_back(file.name(), std::move(inputFile));
     } else {
       auto[found, iter] = find(file.name());
@@ -116,19 +115,5 @@ public:
 
 };
 
-
-// TODO: make filenames naturally sortable... prefix with the number of digits following.
-// Extensions won't mess up this scheme since even if the "." is included in the sort, ord(".") < ord("0")
-// Also prefix with an "s" for solux?   s10 s11 s12 .. s1z .. s210 s211 s2
-// Multiple indexes in the same directory with a custom prefix (or prefix with the index name?)
-// For the segments file... perhaps name it s_<version> since _ is between A and a (use caps for base36 and then the segments file will be last)
-// Although I think we should have a cfs format that packs *everything* into a single file.
-// Maybe name an all-in-one cfs the same as the segments file, so we only have to look at single files.
-// TODO: what about different document types / tables?  Essentially mini indexes.
-// What about multiple shards in a single directory?  Just have efficient dirs and have multiple dirs instead?
-// How about setting overrides in a directory? Like number of partitions?  Seems like that should be at a higher / pluggable level.
-
-// That would mess up the option to sync all files and then write a segments file, but many file systems don't need that.
-// We should have a flexible enough container format to be able to include or pull out whatever files we want.
 
 } // end namespace

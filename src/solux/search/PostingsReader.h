@@ -45,9 +45,11 @@ public:
   PositionsCodec posCodec;
   TFreqCodec& tfreqCodec = posCodec;
 
+  // Filename related utilities.  We try to keep filenames short for many reasons, including
+  // being able to fit in short-string optimization.
+
   static constexpr std::string_view INDEX_INFO_FILE = "s.olux"; // lists all segments in the index
   static constexpr std::string_view PREFIX_FNAME = "s";  // prefix for all data files
-
 
   // Create a sortable string from a number.  It's currently
   // a base36 representation prefixed with the number of digits-1 to make it sort correctly.
@@ -65,10 +67,21 @@ public:
     return std::string(PREFIX_FNAME).append(gen).append(suffix);
   }
 
+  /// Filename for the segment given the segment gen/number and the file number.
+  /// Example: the 3rd file in the 4th segment produced would be "s04_03"
   static std::string getIndexFileName(const std::string_view gen, uint32_t filenum) {
     std::string s = std::string(PREFIX_FNAME).append(gen);
     s += '_';
     s.append(getSortableString(filenum));
+    return s;
+  }
+
+  /// A file that contains deletes for the segment.  deleteGen==0 implies no deletes.
+  static std::string getDeleteFileName(const std::string_view gen, uint64_t deleteGen) {
+    std::string s = std::string(PREFIX_FNAME).append(gen);
+    s += '_';
+    s += '_'; // use double underscore to prevent clashes with other index filenames
+    s.append(getSortableString(deleteGen));
     return s;
   }
 
@@ -312,21 +325,21 @@ public:
   // only valid after readNextField() returns true or seek() returns true.
   // The SegFieldInfo produced is independent of FieldReader.
   void readFieldInfo(SegFieldInfo& fieldInfo) {
-    fieldInfo.fieldname = fieldname;
     assert(fieldIS.left() > 0); // this triggers if this fieldReader is unpositioned.
     assert(!fieldname.isNull());
     assert(!fieldInfoRead);  // we could back up and re-read based on currField
     if (!fieldInfoRead) {
       fieldInfoRead = true;
-      auto type = fieldIS.readVint();
-      fieldInfo.flags = type;
-      if (type == 0x01) {
+      fieldInfo.fieldname = fieldname;
+      fieldInfo.flags = fieldIS.readVint();
+      if (fieldInfo.flags & 0x01) {
         fieldInfo.termBlockIndexLoc = fieldIS.readVal<seg_location>();
         fieldInfo.termsLoc = fieldIS.readVal<seg_location>();
         fieldInfo.docsLoc = fieldIS.readVal<seg_location>();
         fieldInfo.posLoc = fieldIS.readVal<seg_location>();
         fieldInfo.nTerms = fieldIS.readVint();
-      } else if (type == 0x02) {
+      }
+      if (fieldInfo.flags & 0x02) {
         fieldInfo.docsWithValue = fieldIS.readVint();
         fieldInfo.docsWithValueEndLoc = fieldIS.readVal<seg_location>();
         fieldInfo.columnLoc = fieldIS.readVal<seg_location>();
@@ -923,29 +936,54 @@ public:
   // How to do position skipping?  Could always pre-pend last position in a block?
 };
 
+class DocsReader {
+  screaming::BitSet bits;
+  int32_t ndocs;
+
+public:
+
+  // initialize from docsWithValue for the field if it exists
+  DocsReader(MemPool &pool, PostingsReader &postingsReader, const SegFieldInfo &fieldInfo) {
+    unused(pool);
+    ndocs = fieldInfo.docsWithValue;
+
+    // docsWithValue is currently guaranteed to be in the same file as columnIS
+    if (ndocs != postingsReader.numDocs()) {
+      InputStream docsWithValIs = postingsReader.getInputStreamSeek(fieldInfo.columnLoc);
+      bits.set( docsWithValIs.ptr(fieldInfo.docsWithValueEndLoc.offset()) );
+    }
+  }
+
+  int32_t numDocs() const noexcept {
+    return ndocs;
+  }
+
+  bool hasBitset() const noexcept {
+    return !bits.empty();
+  }
+
+  const screaming::BitSet& bitset() const noexcept {
+    return bits;
+  }
+};
+
+
 
 class IntColReader {
+  DocsReader docs;
   InputStream columnIS;
-  PostingsReader &postingsReader;
   const SegFieldInfo &fieldInfo;
-  MemPool &pool;
-  screaming::BitSet docs;
   const int64_t* values;
 
 public:
   static constexpr int32_t END = std::numeric_limits<int32_t>::max();  // TODO: put this somewhere more generic?
 
-  IntColReader(MemPool &pool, PostingsReader &postingsReader, const SegFieldInfo &fieldInfo) : pool(pool),
-                                                                                          postingsReader(postingsReader),
-                                                                                          fieldInfo(fieldInfo) {
+  IntColReader(MemPool &pool, PostingsReader &postingsReader, const SegFieldInfo &fieldInfo) :
+  docs(pool, postingsReader, fieldInfo),
+  fieldInfo(fieldInfo)
+  {
     columnIS = postingsReader.getInputStreamSeek(fieldInfo.columnLoc);
-
-    // docsWithValue is currently guaranteed to be in the same file as columnIS
-    if (fieldInfo.docsWithValue != postingsReader.numDocs()) {
-      docs.set( columnIS.ptr(fieldInfo.docsWithValueEndLoc.offset()) );
-    }
-
-    values = reinterpret_cast<const int64_t *>(columnIS.ptr(fieldInfo.columnLoc.offset()));  // offsets from termsLoc
+    values = reinterpret_cast<const int64_t *>(columnIS.ptr(fieldInfo.columnLoc.offset()));
   }
 
   int32_t docsWithValue() {
@@ -1006,9 +1044,9 @@ public:
     int32_t maxRank;
     bool dense;
   public:
-    Iterator(const IntColReader& col) : col(&col), docsIter(col.docs), values(col.values) {
+    Iterator(const IntColReader& col) : col(&col), docsIter(col.docs.bitset()), values(col.values) {
       maxRank = col.fieldInfo.docsWithValue;
-      dense = col.docs.empty();
+      dense = !col.docs.hasBitset();
     }
 
     int32_t docId() {

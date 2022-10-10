@@ -11,16 +11,16 @@ class IndexReader {
 public:
 
   class Segment {
-    std::shared_ptr<PostingsReader> sharedPostingsReader;
+    const std::shared_ptr<PostingsReader> sharedPostingsReader;
   public:
     const int64_t base;   // global index (ordinal/rank) of the first document in this segment with respect to the list of segments
     const int ord;        // index of this segment in the list of segments
 
-    Segment(std::shared_ptr<PostingsReader> postingsReader, int64_t base, int ord)
-            :  sharedPostingsReader(postingsReader), base(base), ord(ord) {
+    Segment(std::shared_ptr<PostingsReader>&& postingsReader, int64_t base, int ord)
+            :  sharedPostingsReader(std::move(postingsReader)), base(base), ord(ord) {
     }
 
-    PostingsReader& postingsReader() {
+    PostingsReader& postingsReader() const noexcept {
       return *sharedPostingsReader;
     }
 

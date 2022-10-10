@@ -186,6 +186,7 @@ public:
   uint16_t nBuckets;
 
   BitSet() {
+    // if nBuckets==0, none of the other pointers are touched
     nBuckets = 0;
   }
 
@@ -215,8 +216,7 @@ public:
   }
 
   class Iterator {
-    // const BitSet& set;
-    const BitSet *set;
+    const BitSet *set;  // could also try making a direct copy so there's no indirection?
     int32_t curr = -1;
     int32_t bucketIdx = -1;
     int32_t bucketBase = -1;

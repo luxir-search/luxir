@@ -198,6 +198,8 @@ namespace solux::test {
     std::unique_ptr<IntColReader> colReader;
     std::unique_ptr<IntColReader::Iterator> iter;
 
+    // TODO: we should separate the "has value" from int column... it can be shared across all fields!
+
     int32_t nAdds = 0;
     int64_t doc = -1;
     int64_t v = 0;
@@ -214,7 +216,12 @@ namespace solux::test {
       inverter->setDoc(docid);
       indexHandler->index(*inverter, val);
       nAdds++;
-      // std::cout << "ADDED " << name << " doc=" << doc << " val=" << val << std::endl;
+    }
+
+    void add(int32_t docid, std::string_view val) {
+      inverter->setDoc(docid);
+      indexHandler->index(*inverter, (char*)val.data(), val.size());
+      nAdds++;
     }
 
     void startReading() {
@@ -224,7 +231,7 @@ namespace solux::test {
     }
 
     int64_t nextDoc() {  // TODO: change to int64_t
-      if (iter.get() == nullptr) {
+      if (iter == nullptr) {
         auto found = nextSegment();
         if (!found) return -1; // OR BIG_END. 0x7ffffffff?
       }

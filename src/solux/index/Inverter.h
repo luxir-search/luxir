@@ -95,6 +95,78 @@ public:
     }
   };
 
+
+  //
+  // Info for one single valued column
+  //
+  class IntColHandler : public IndexHandler {
+    friend class Inverter;
+    LongStream longStream;
+    DocStream docsWithVal;
+    int32_t numVals = 0;
+  public:
+    IntColHandler(Inverter &inverter, const std::string_view &fieldName, FieldType& fieldType)
+            : IndexHandler(PackedTerm(inverter.pool,fieldName), fieldType), longStream(inverter.pool), docsWithVal(inverter.pool) {
+    }
+
+    IntColHandler(Inverter &inverter, PackedTerm fieldName, FieldType& fieldType, IndexHandler& parent)
+            : IndexHandler(fieldName, fieldType), longStream(inverter.pool), docsWithVal(inverter.pool) {
+    }
+
+    IntColHandler(IntColHandler&& other) = default;
+
+    ~IntColHandler() = default;
+
+    void index(Inverter &inverter, const proto::Val &val) override {
+      if (val.has_i()) {
+        int64_t ival = val.i();
+        indexSingle(inverter, ival);
+      }
+    }
+
+    void index(Inverter &inverter, int64_t int64) override {
+      indexSingle(inverter, int64);
+    }
+
+    void indexSingle(Inverter &inverter, int64_t val) {
+      longStream.addVal(inverter.pool, val);
+      docsWithVal.addDoc(inverter.pool, inverter.currDoc);
+      numVals++;
+    }
+
+    void flush(Inverter &inverter) override {
+      flushIntCol(inverter);
+    }
+
+    // TODO: make static and pass everything needed so it's composable
+    void flushIntCol(Inverter& inverter) {
+      PostingsWriter& postingsWriter = inverter.getPostingsWriter();
+
+      // TODO: move this to postingsWriter method
+      PostingsWriter::IndexFieldInfo& fieldInfo = postingsWriter.fieldInfos.emplace_back();
+      flushIntCol(inverter, fieldInfo);
+    }
+
+    // This is the version called directly from text field for norms
+    void flushIntCol(Inverter& inverter, PostingsWriter::IndexFieldInfo& fieldInfo) {
+      PostingsWriter& postingsWriter = inverter.getPostingsWriter();
+      auto guard = postingsWriter.pool.rewindScopeGuard(); // rewind any use by IntColWriter after we are done.
+      fieldInfo.fieldname = fieldName;
+
+      IntColWriter writer(postingsWriter.pool, postingsWriter, fieldInfo);
+      auto full = numVals >= postingsWriter.getMaxDoc();
+      writer.startField();
+      longStream.pushValues(inverter.pool, writer);
+      if (!full) {
+        writer.startDocsWithValue();
+        docsWithVal.pushDocs(inverter.pool, writer);
+        writer.endDocsWithValue();
+      }
+      writer.endField();
+    }
+  };
+
+
   // indexes text with positions
   class PosIndexHandler : public IndexHandler {
     friend Inverter;
@@ -102,10 +174,15 @@ public:
     TermValHash<DocFreqPosStream> termsHash;  // the set of terms contained in this field
     TokenChain *tokenChain;  // TODO: change to ref?  is this nullable?
 
+    IntColHandler fieldLengthCol;  // to store the field length needed for scoring among other things.
   public:
 
     PosIndexHandler(Inverter &inverter, const std::string_view &fieldName, FieldType& fieldType, TokenChain *tokenChain)
-    : IndexHandler(PackedTerm(inverter.pool,fieldName), fieldType), termsHash(inverter.pool, 4), tokenChain(tokenChain) {
+            : IndexHandler(PackedTerm(inverter.pool,fieldName), fieldType),
+            termsHash(inverter.pool, 4),
+            tokenChain(tokenChain),
+            fieldLengthCol(inverter, this->fieldName, this->fieldType, *this)
+            {
     }
     PosIndexHandler(PosIndexHandler&& other) = default;
     ~PosIndexHandler() override = default;
@@ -155,14 +232,9 @@ public:
         }
       }
 
-      // segField.sumTotalTermFreq += numTokens;
-      if (numTokens > 0) {
-        // todo: index field length (for normalization / scoring) if we're indexing norms
-        // todo: add to "document has field" if we're not indexing norms, or if we need
-        // an index into sparse norms.  Same thing for any field with sparse docvalues...
-        // Can these "document has field" sets be deduped?  Keep a hash of all others written
-        // so far and if the hash compares, then compare the sets.
-      }
+      // We index the length even if all tokens were removed somehow, because we still want
+      // to record that there was a doc for this field.
+      fieldLengthCol.indexSingle(inverter, numTokens);
     }
 
     void flush(Inverter &inverter) override {
@@ -206,71 +278,14 @@ public:
       }
       textWriter.endField();
       termsHash.free();
+
+      // now flush the field length column
+      fieldLengthCol.flushIntCol(inverter, fieldInfo);
     }
 
   };
 
-  //
-  // Info for one single valued column
-  //
-  class IntColHandler : public IndexHandler {
-    friend class Inverter;
-    LongStream longStream;
-    DocStream docsWithVal;
-    int32_t numVals = 0;
 
-    FieldType *fieldType;
-  public:
-    IntColHandler(Inverter &inverter, const std::string_view &fieldName, FieldType& fieldType)
-            : IndexHandler(PackedTerm(inverter.pool,fieldName), fieldType), longStream(inverter.pool), docsWithVal(inverter.pool) {
-    }
-
-    IntColHandler(IntColHandler&& other) = default;
-
-    ~IntColHandler() = default;
-
-    void index(Inverter &inverter, const proto::Val &val) override {
-      if (val.has_i()) {
-        int64_t ival = val.i();
-        indexSingle(inverter, ival);
-      }
-    }
-
-    void index(Inverter &inverter, int64_t int64) override {
-      indexSingle(inverter, int64);
-    }
-
-    void indexSingle(Inverter &inverter, int64_t val) {
-      longStream.addVal(inverter.pool, val);
-      docsWithVal.addDoc(inverter.pool, inverter.currDoc);
-      numVals++;
-    }
-
-    void flush(Inverter &inverter) override {
-      flushIntCol(inverter);
-    }
-
-    // TODO: make static and pass everything needed so it's composable
-    void flushIntCol(Inverter& inverter) {
-      PostingsWriter& postingsWriter = inverter.getPostingsWriter();
-      auto guard = postingsWriter.pool.rewindScopeGuard(); // rewind any use by IntColWriter after we are done.
-
-      // TODO: move this to postingsWriter method
-      PostingsWriter::IndexFieldInfo& fieldInfo = postingsWriter.fieldInfos.emplace_back();
-      fieldInfo.fieldname = fieldName;
-
-      IntColWriter writer(postingsWriter.pool, postingsWriter, fieldInfo);
-      auto full = numVals >= postingsWriter.getMaxDoc();
-      writer.startField();
-      longStream.pushValues(inverter.pool, writer);
-      if (!full) {
-        writer.startDocsWithValue();
-        docsWithVal.pushDocs(inverter.pool, writer);
-        writer.endDocsWithValue();
-      }
-      writer.endField();
-    }
-  };
 
 
   // OPTIMIZATION: since we only do additions and not deletions, a monotonic allocator that had destructor
