@@ -121,6 +121,7 @@ public:
     }
   }
 
+  // TODO: untested
   // These are static so they can be used more easily in other contexts, with different offsets, etc.
   template <class Callable>
   static void visitZeroes(const word_type* words, index_type numWords, Callable callable) {
@@ -136,6 +137,7 @@ public:
     }
   }
 
+  // TODO: untested
   template <class Callable>
   static void visitOnes(const word_type* words, index_type numWords, Callable callable) {
     for (index_type i=0; i<numWords; i++) {
@@ -147,6 +149,17 @@ public:
         word >>= (bitIdx + 1);
         callable(i * sizeof(word_type) * 8 + bitIdx);
       }
+    }
+  }
+
+  // TODO: untested.  This should be a faster way than shifting the word.  Compiler explorer shows that the
+  // clearing-the-lowest-bit code is translated to BLSR (x86), which also eliminates a separate test for 0
+  template <class Callable>
+  static void visitOnes(uint64_t word, Callable callable) {
+    while (word != 0) {
+      auto foundIdx = std::countr_zero(word);
+      word = word & (word - 1); // clears the lowest bit
+      callable(foundIdx);
     }
   }
 
@@ -367,7 +380,13 @@ public:
             rankBase += std::popcount(bucket.bits.obs.words[i]);
           }
           uint8_t bitIdx = localIndex & Bits::wordMask;
-          auto bitsToTheRight = bitIdx == 0 ? 0 : (bucket.bits.obs.words[wordIndex] << (sizeof(Bits::word_type)*8 - bitIdx));
+          // shift off our bit and everything higher to get the bits to the right
+          // auto bitsToTheRight = bitIdx == 0 ? 0 : (bucket.bits.obs.words[wordIndex] << (sizeof(Bits::word_type)*8 - bitIdx));
+
+          // REPLACEMENT: mask off our bit and all bits higher. This doesn't need a test for 0 and
+          // compiles down to a single BZHI instruction (Intel Haswell-2013, AMD Excavator-2015)
+          auto bitsToTheRight = bucket.bits.obs.words[wordIndex] & ((Bits::word_type(1) << bitIdx)-1);
+
           rankBase += std::popcount(bitsToTheRight);
           return bucketRank + rankBase;
       }
