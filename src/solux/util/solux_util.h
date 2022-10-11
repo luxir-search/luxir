@@ -32,15 +32,6 @@ namespace solux {
 template<typename... Args>
 inline void unused(Args &&...) {}
 
-// Returns true if x is a power of two. Will also return true for x==0, so check for that separately if needed.
-inline bool isPowerOfTwo(int x) {
-  return ((x > 0) && !(x & (x - 1)));
-}
-
-inline bool isPowerOfTwo(unsigned int x) {
-  return ((x != 0) && !(x & (x - 1)));
-}
-
 
 // generic vector ostream
 template<typename T>

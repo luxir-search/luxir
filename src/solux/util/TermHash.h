@@ -122,7 +122,7 @@ public:
 
 template<class T>
 void TermHash<T>::newTable(unsigned newSize) {
-  assert(newSize > 0 && isPowerOfTwo(newSize));
+  assert(newSize > 0 && std::has_single_bit(newSize));  // has_single_bit is the same as being a power of two
 
   // this was often twice as fast in some cases - zeroing is not as well optimized it seems
   table_ = reinterpret_cast<TermHash<T>::composite_type *>( new char[newSize * sizeof(TermHash<T>::composite_type)]());

@@ -207,7 +207,7 @@ public:
 
 template<class T, class Hasher>
 void TermValHash<T,Hasher>::newTable(unsigned newSize) {
-  assert(newSize > 0 && isPowerOfTwo(newSize));
+  assert(newSize > 0 && std::has_single_bit(newSize));
 
   // this was often twice as fast in some cases - zeroing is not as well optimized for some types it seems
   table_ = reinterpret_cast<TermValHash<T,Hasher>::entry_type *>( new char[newSize * sizeof(TermValHash<T,Hasher>::entry_type)]() );
