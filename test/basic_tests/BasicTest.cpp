@@ -1,6 +1,7 @@
 
 #include <gtest/gtest.h>
 #include <iostream>
+#include <solux/util/random.h>
 #include "solux/util/solux_util.h"
 #include "solux/util/heap.h"
 #include "solux/util/TaggedPtr.h"
@@ -87,6 +88,29 @@ TEST(BasicTest, testPQ) {
     ejected = pq.insertWithOverflow(&vals[2]);            // 25, rejected
     ASSERT_EQ(&vals[2], ejected);
     ASSERT_EQ(pq.top(), 50.0);
+  }
+
+  {
+    int n = 100;
+    solux::Rng rng;
+    std::vector<int> vals(n);
+    for (auto& val : vals) {
+      val = rng.rint(1000000);
+    }
+    std::vector<int> sorted = vals;
+    std::ranges::sort(sorted);
+
+    std::vector<int*> ptrs(vals.size());
+    solux::IndirectPQ<int, std::greater<>> pq(vals, ptrs, false);
+
+    ASSERT_EQ(pq.top(), sorted[0]);
+
+    for (auto expected : sorted) {
+      ASSERT_EQ(pq.top(), expected);
+      auto idx = pq.indexOfTop();
+      ASSERT_EQ(vals[idx], expected);
+      pq.removeTop();
+    }
   }
 }
 

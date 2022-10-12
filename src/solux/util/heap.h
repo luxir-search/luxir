@@ -54,7 +54,7 @@ class IndirectPQ {
   static constexpr auto ptrcomp = [](const T* a, const T* b) { return Comp()(*a,*b); };
 
   void makeHeap() {
-    std::make_heap(pointers.data(), end);
+    std::make_heap(pointers.data(), end, ptrcomp);
   }
   void fillPointers(std::span<T> arr) {
     assert(pointers.size() >= arr.size());
