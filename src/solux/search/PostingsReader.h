@@ -170,7 +170,7 @@ public:
 
   // TODO temporary... this will likely be done at a higher level?
   explicit PostingsReader(Directory& dir, std::string_view gen) {
-    int nFiles = 6;
+    int nFiles = 7;
     files.reserve(nFiles);
     inputStreams.reserve(nFiles);
 
@@ -949,8 +949,9 @@ public:
 
     // docsWithValue is currently guaranteed to be in the same file as columnIS
     if (ndocs != postingsReader.numDocs()) {
-      InputStream docsWithValIs = postingsReader.getInputStreamSeek(fieldInfo.columnLoc);
-      bits.set( docsWithValIs.ptr(fieldInfo.docsWithValueEndLoc.offset()) );
+      InputStream docsWithValIs = postingsReader.getInputStreamSeek(fieldInfo.docsWithValueEndLoc);
+      // bits.set( docsWithValIs.ptr(fieldInfo.docsWithValueEndLoc.offset()) );
+      bits.set( docsWithValIs.ptr() );
     }
   }
 

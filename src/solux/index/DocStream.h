@@ -70,6 +70,9 @@ public:
       // TODO: this will be very inefficient if we add every other doc. Add support for bitmaps?
       // add support for delta coding?
       // This will add a zero-size run at the start that we could avoid but is it worth the extra check in here?
+      // We could use low bit of gap to signal runSize==1 if it's common (shift actual gap left by 1)
+      // Then the worst case would be 110110110  (gap of 1, runsize of 2, so 2 bytes for every 3 docs)
+      // Or we could use 5 bits for start of gap vint and 3 bits for start of run vint.
       stream.writeVInt(pool, gap);
       stream.writeVInt(pool, runSize);
       runStart = docid;
@@ -328,7 +331,9 @@ public:
 
   void addVal(MemPool &pool, int64_t val) {
     // XOR with previous value will remove common high bits (including high bits of successive negative values)
-    // TODO: should we calculate other statistics at this point (min, max, gcd?)
+    // TODO: should we calculate other statistics at this point (min, max, gcd?)  Seems like yes because we would
+    // have this info when merging segments, but we won't for the initial segment (because it will be built
+    // incrementally when reading from this stream, not buffered completely in memory.)
     int64_t code = lastVal ^ val;
     storage.writeVLong(pool, code);
     lastVal = val;

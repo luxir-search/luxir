@@ -369,14 +369,15 @@ public:
         case SPARSE:
           return bucketRank + bucket.sparse.index;
         case DENSE:
+          // if bit buckets were 64 byte aligned, then every miniblock of 8 words would be exactly a cache line.
           auto localIndex = uint16_t(curr);
-          int rankIdx = localIndex >> (Bits::wordShift + RANK_INDEX_SHIFT);
+          auto rankIdx = localIndex >> (Bits::wordShift + RANK_INDEX_SHIFT);
           uint16_t *rankIndexArr = reinterpret_cast<uint16_t *>(bucket.bits.obs.words + Bits::numWords);
           auto rankBase = rankIndexArr[rankIdx];
           // Now find the rank of words before the current word in our mini-block
-          int wordIndex = localIndex >> Bits::wordShift;
+          auto wordIndex = localIndex >> Bits::wordShift;
           constexpr uint16_t miniBlockMask = (1 << RANK_INDEX_SHIFT) - 1;
-          for (int i = wordIndex & ~miniBlockMask; i < wordIndex; i++) {
+          for (auto i = wordIndex & ~miniBlockMask; i < wordIndex; i++) {
             rankBase += std::popcount(bucket.bits.obs.words[i]);
           }
           uint8_t bitIdx = localIndex & Bits::wordMask;
@@ -385,6 +386,8 @@ public:
 
           // REPLACEMENT: mask off our bit and all bits higher. This doesn't need a test for 0 and
           // compiles down to a single BZHI instruction (Intel Haswell-2013, AMD Excavator-2015)
+          // Another alternative is word & ~(-1 << bitIdx), but it appears that gcc and clang recognize
+          // these as equivalent.
           auto bitsToTheRight = bucket.bits.obs.words[wordIndex] & ((Bits::word_type(1) << bitIdx)-1);
 
           rankBase += std::popcount(bitsToTheRight);

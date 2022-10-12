@@ -150,19 +150,41 @@ public:
     // This is the version called directly from text field for norms
     void flushIntCol(Inverter& inverter, PostingsWriter::IndexFieldInfo& fieldInfo) {
       PostingsWriter& postingsWriter = inverter.getPostingsWriter();
-      auto guard = postingsWriter.pool.rewindScopeGuard(); // rewind any use by IntColWriter after we are done.
       fieldInfo.fieldname = fieldName;
-
-      IntColWriter writer(postingsWriter.pool, postingsWriter, fieldInfo);
       auto full = numVals >= postingsWriter.getMaxDoc();
-      writer.startField();
-      longStream.pushValues(inverter.pool, writer);
-      if (!full) {
-        writer.startDocsWithValue();
-        docsWithVal.pushDocs(inverter.pool, writer);
-        writer.endDocsWithValue();
+
+      // push values
+      {
+        auto guard = postingsWriter.pool.rewindScopeGuard();
+        IntColWriter writer(postingsWriter.pool, postingsWriter, fieldInfo);
+        writer.startField();
+        // TODO: not having the docids here makes it impossible to do a dense field encoding!  Of course that's
+        // not really possible if we're writing the column directly and incrementally since we don't know
+        // min, max, numbits, gcd, etc.  But we *could* know that stuff when merging segments!
+        // For direct incremental columns, and for merging, we could have a IntColWriter method that accepts (docid,val)
+        // For that, we could have versions of push that take a number of values to push so we can have the best
+        // of both worlds.
+        // We could also be told it's a required field, in which case we would always chose a dense encoding unless
+        // all bits are somehow needed.  In that case, we would decode blocks of docs so we could feed doc/val
+        // pairs to the inverter.  A co-routine generator might be perfect for this (one that fills blocks, not
+        // individual values)
+        longStream.pushValues(inverter.pool, writer);
+        writer.finish();
       }
-      writer.endField();
+
+      // push docs
+      {
+        auto guard = postingsWriter.pool.rewindScopeGuard();
+        // TODO: when things go parallel, we don't want to reserve an OutputStream if this is dense.
+        DocsWithValWriter docsWriter(inverter.pool, postingsWriter, fieldInfo);
+        if (!full) {
+          docsWithVal.pushDocs(inverter.pool, docsWriter);
+          docsWriter.finish();
+        } else {
+          docsWriter.finishDense(numVals);
+        }
+      }
+
     }
   };
 
@@ -296,6 +318,8 @@ public:
 
 
   // The returned reference will be valid for the duration of indexing this block.
+  // TODO: a version that gets a set at a time, so the inverter can pick the best columns to write directly?
+  // What about adjusting number of files on postings writer? We should be able to make that dynamic up until a max.
   IndexHandler& getIndexHandler(const std::string_view name) {
     auto iter = indexHandlers.find(name);
     if (iter != indexHandlers.end()) {

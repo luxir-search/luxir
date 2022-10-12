@@ -61,6 +61,7 @@ public:
 
     auto fnameComp = [](const Segment& a, const Segment& b){ return b.fieldReader->name() < a.fieldReader->name(); };
     std::vector<Segment*> segPtrs(segs.size());
+    // IndirectPQ<Segment, decltype(fnameComp)> fieldPQ(segs, segPtrs, false);
     IndirectPQ<Segment, decltype(fnameComp)> fieldPQ(segs, segPtrs, false);
 
     std::vector<MergeFieldInfo> mergeFieldInfos;
@@ -170,26 +171,31 @@ private:
         }
       }
 
-      intColWriter.startDocsWithValue();
-      for (auto* field : sortedFields) {
-        auto baseId = (int32_t) field->seg->base;
+      bool full = false; // TODO: calculate if this column is dense!
 
-        IntColReader reader(readerPool, *field->seg->postingsReader, field->segFieldInfo);
-        IntColReader::Iterator colIter(reader);
+      if (!full) {
+        DocsWithValWriter docsWriter(writerPool, postingsWriter, outputFieldInfo);
+        for (auto *field: sortedFields) {
+          auto baseId = (int32_t) field->seg->base;
 
-        // int32_t highest = field->seg->postingsReader->numDocs();
-        for(;;) {
-          int32_t localId = colIter.next();
-          if (localId == IntColReader::END) {
-            break;
+          IntColReader reader(readerPool, *field->seg->postingsReader, field->segFieldInfo);
+          IntColReader::Iterator colIter(reader);
+
+          int32_t highest = field->seg->postingsReader->numDocs();
+          for (;;) {
+            int32_t localId = colIter.next();
+            if (localId == IntColReader::END) {
+              break;
+            }
+            assert(localId < highest);
+            docsWriter.startDoc(baseId + localId);
           }
-          intColWriter.startDoc(baseId + localId);
         }
+        docsWriter.finish();
       }
-      intColWriter.endDocsWithValue();
 
 
-      intColWriter.endField();
+      intColWriter.finish();
     } else {
       LOG_ERROR("Unknown Type!");
     }

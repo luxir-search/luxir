@@ -578,12 +578,13 @@ TEST_F(PostingsTest, intCol) {
     colWriter.addInt64(77);
     colWriter.addInt64(33);
     colWriter.addInt64(11);
-    colWriter.startDocsWithValue();
-    colWriter.startDoc(0);
-    colWriter.startDoc(1);
-    colWriter.startDoc(2);
-    colWriter.endDocsWithValue();
-    colWriter.endField();
+    colWriter.finish();
+
+    DocsWithValWriter docsWriter(pool, writer, finfo);
+    docsWriter.startDoc(0);
+    docsWriter.startDoc(1);
+    docsWriter.startDoc(2);
+    docsWriter.finish();
 
     writer.finish();
   }

@@ -86,14 +86,30 @@ protected:
 
 
 TEST_F(IntColTest, basic) {
-  TestIndex testIndex;
-  TestField f(testIndex, "foo_i");
-  f.startIndexing();
-  f.add(0, 5);
-  testIndex.flush();
-  f.startReading();
-  ASSERT_EQ(0, f.nextDoc());
-  ASSERT_EQ(5, f.val());
+  {
+    TestIndex testIndex;
+    TestField f(testIndex, "foo_i");
+    f.startIndexing();
+    f.add(0, 5);
+    testIndex.flush();
+    f.startReading();
+    ASSERT_EQ(0, f.nextDoc());
+    ASSERT_EQ(5, f.val());
+    ASSERT_EQ(-1, f.nextDoc());
+  }
+
+  // now test sparse
+  {
+    TestIndex testIndex;
+    TestField f(testIndex, "foo_i");
+    f.startIndexing();
+    f.add(100000, 5);
+    testIndex.flush();
+    f.startReading();
+    ASSERT_EQ(100000, f.nextDoc());
+    ASSERT_EQ(5, f.val());
+    ASSERT_EQ(-1, f.nextDoc());
+  }
 }
 
 TEST_F(IntColTest, basic2) {

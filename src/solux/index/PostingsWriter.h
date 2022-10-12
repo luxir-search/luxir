@@ -738,8 +738,9 @@ class DocsWithValWriter {
   OutputStream& idOutput;
   DocsWriter docsWriter;
   // int64_t startLoc;
-  PostingsWriter::IndexFieldInfo& fieldInfo;
+  PostingsWriter::IndexFieldInfo& fieldInfo; // don't have to store if we pass it to finish
 
+public:
   // This field writer does not do any visible pool rollbacks, but does allocate from the pool.
   DocsWithValWriter(MemPool& pool, PostingsWriter& postingsWriter, PostingsWriter::IndexFieldInfo& fieldInfo)
   : idOutput(postingsWriter.files[6].out), docsWriter(pool,idOutput), fieldInfo(fieldInfo)
@@ -757,6 +758,14 @@ class DocsWithValWriter {
     int64_t endLoc = idOutput.size();
     fieldInfo.docsWithValueEndLoc = seg_location(idOutput.streamNumber, endLoc);
   }
+
+  // Signal that the column has all docs present. No docs should be added in this case, but the count
+  // in fieldInfo should be filled in.
+  void finishDense(int32_t numDocs) {
+    fieldInfo.docsWithValue = numDocs;
+    // this is a valid location, so use numDocs and see if it matches numDocs of segment to tell if there is data to read
+    fieldInfo.docsWithValueEndLoc = seg_location(0,0);
+  }
 };
 
 
@@ -764,43 +773,29 @@ class DocsWithValWriter {
 // Integer column writing
 // TODO: nest these within postings writer? Or use a namespace?
 // TODO: currently all values must be written before all docs!  Decouple this so we can write columns incrementally!
+// To increase locality and decrease seeks, we could ensure that docsWithValue always immediately follow the values.
+// We could use an OutputStream that writes to RAM or even a MemPool implementation (or OutputStream writing to MemPool)
 //
 class IntColWriter {
-  MemPool& pool;
   PostingsWriter& postingsWriter;
   PostingsWriter::IndexFieldInfo& fieldInfo;
   OutputStream& colOutput;
-  ScreamingBuilder docsWithVal;
   int64_t colStart;
   int64_t idEndLoc;
   int32_t nAdded = 0;            // number of values added. redundant with numDocsWithValue, for sanity check
 public:
 
-  // This field writer does not do any visible pool rollbacks, but does allocate from the pool.
+  // This class allocates from the pool but does not do any visible rollbacks.
   IntColWriter(MemPool& pool, PostingsWriter& postingsWriter, PostingsWriter::IndexFieldInfo& fieldInfo)
-  : pool(pool), postingsWriter(postingsWriter), fieldInfo(fieldInfo), colOutput(postingsWriter.files[5].out), docsWithVal(pool, colOutput) {
+  : postingsWriter(postingsWriter), fieldInfo(fieldInfo), colOutput(postingsWriter.files[5].out) {
     // TODO: docsWithVal allocates 17K from pool that may not be used... should we try to delay this somehow? (an explicit init function?)
     // Perhaps the indirection associated with delaying the ScreamingBuilder construction would be optimized away since startDoc() would be
     // called in a tight loop.
-    fieldInfo.flags |= 0x02;  // int col
     colStart = colOutput.size();
   }
 
   void startField() {
   }
-
-  void startDocsWithValue() {
-  }
-
-  // target for DocStream.pushDocs...  currently only for recording what docs have a value.  Should all be done
-  // at once (not interleaved with addInt*)
-  void startDoc(int32_t docid) {
-    docsWithVal.add(docid);
-  }
-
-  void endDocsWithValue() {
-  }
-
 
   void addInt64(int64_t val) {
     nAdded++;
@@ -808,24 +803,13 @@ public:
     colOutput.writeLong(val);
   }
 
-  void endField() {
-    bool allDocsHaveValue = nAdded == postingsWriter.maxDoc; // How to get this dynamically?  pass it in?
-
-    // write any necessary index into encoded blocks here (assuming it's small enough to keep in memory)
-
-    assert(allDocsHaveValue || docsWithVal.cardinality() == nAdded); // TODO: turn into actual exception
-    // TODO: write pointers (or add pointers to list to later be serialized)
-
-    if (!allDocsHaveValue) {
-      auto bytes = docsWithVal.flush();
-      idEndLoc = colOutput.size();
-    } else {
-      idEndLoc = 0; // just to avoid reading uninitialized values
-    }
+  // returns number of values written
+  int32_t finish() {
+    bool allDocsHaveValue = nAdded == postingsWriter.getMaxDoc();
 
     // FUTURE:write index into value blocks here
+    fieldInfo.flags |= 0x02;  // int64 values
     fieldInfo.docsWithValue = nAdded;
-    fieldInfo.docsWithValueEndLoc = seg_location(colOutput.streamNumber, idEndLoc);
     fieldInfo.columnLoc = seg_location(colOutput.streamNumber, colStart);
   }
 };
