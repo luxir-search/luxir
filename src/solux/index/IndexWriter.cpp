@@ -155,6 +155,7 @@ private:
       // currently all values must be written before all docs
       for (auto* field : sortedFields) {
         auto baseId = (int32_t) field->seg->base;
+        unused(baseId);
 
         IntColReader reader(readerPool, *field->seg->postingsReader, field->segFieldInfo);
         IntColReader::Iterator colIter(reader);

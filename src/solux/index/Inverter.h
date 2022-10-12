@@ -78,8 +78,10 @@ public:
     }
 
     virtual void index(Inverter& inverter, char* mutableVal, int len) {
+      unused(inverter, mutableVal, len);
     }
-    virtual void index(Inverter& inverter, int64_t) {
+    virtual void index(Inverter& inverter, int64_t val) {
+      unused(inverter, val);
     }
 
     virtual void index(Inverter& inverter, const proto::Val& val) {
@@ -112,6 +114,7 @@ public:
 
     IntColHandler(Inverter &inverter, PackedTerm fieldName, FieldType& fieldType, IndexHandler& parent)
             : IndexHandler(fieldName, fieldType), longStream(inverter.pool), docsWithVal(inverter.pool) {
+      unused(parent);
     }
 
     ~IntColHandler() override = default;

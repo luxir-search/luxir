@@ -250,7 +250,7 @@ public:
     if (read) {
       ASSERT_EQ(tenum->numTerms(), realNumTerms);
     } else {
-      writer->endField(fname);
+      writer->endField();
     }
   }
 

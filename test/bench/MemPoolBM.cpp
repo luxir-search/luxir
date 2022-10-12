@@ -202,7 +202,6 @@ static uint64_t allocFreeDummy(int iterations, int taskno, Allocator& allocator)
 template <typename Allocator>
 inline void benchAllocFree(benchmark::State& state) {
   auto numThreads = state.range(0);
-  uint64_t result = 0;
   int iterations = 1024;
 
   std::vector<std::unique_ptr<Allocator>> allocators;

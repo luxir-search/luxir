@@ -482,7 +482,7 @@ public:
         // 3 bits of prefix length starting at 0 (7 means this is followed by another byte encoding the prefix length)
         // ORIG FORMAT to support lengths to 32K: 5 bits of suffix length starting at 1 (32 means this is followed by
         // another vInt encoding the suffix length (and add 32) we start at 1 for the suffix since that is the min
-        // suffix length (otherwise it would be the same term)
+        // suffix length (otherwise it would be the same term))
         // NEW: term lengths are limited to one byte, so 32 means just read the second byte for the exact suffix len.
         auto suffixLen = tlen - prefixLen;
         auto prefCode = (prefixLen < 7) ? (prefixLen << 5u) : (7u << 5u);
@@ -508,7 +508,7 @@ public:
       // We need pointer into the docs file.  Currently coded as the size in the docs file that *this* term takes up.  Hence
       // One needs the doc pointer for the previous term to know the start of the docs block for this term.
       // That's not good if we want to add skipping to the terms list... but maybe that's OK since we always access
-      // a doc block from it's tail anyway.  We could save a little space (smaller doc skipping index) if we didn't need
+      // a doc block from its tail anyway.  We could save a little space (smaller doc skipping index) if we didn't need
       // to encode the start of the block there though.
 
       // This is also where we "pulse" (directly include) a term that only has a single doc and position.
@@ -635,11 +635,6 @@ public:
     }
   }
 
-  // deprecated...
-  void endField(const std::string& fieldName) {
-    endField();
-  }
-
   void endField() {
     // OPT: investigate inlining small fields in the terms index instead of pointing out to other files?  If we don't know how large the field will be,
     // we could always do it after-the-fact if the other outputs are rewindable (i.e. all in memory.)  If not, we could make it so by always starting
@@ -698,13 +693,12 @@ public:
 
 class DocsWriter {
   ScreamingBuilder builder;
-  OutputStream& idOutput;
 public:
 
   /// This writer currently *always* writes at least 2 bytes (the number of buckets) in the screaming bitset.
   /// Decisions should be made at a higher level to not use this for 0 or all-bits-set scenarios.
   /// This writer allocates from "pool" but does not rewind.  It is safe to release after finish() is called.
-  DocsWriter(MemPool& pool, OutputStream& output) : builder(pool, output), idOutput(output) {
+  DocsWriter(MemPool& pool, OutputStream& output) : builder(pool, output) {
   }
 
   // TODO: optionally use a different encoding for few numbers of docs or low maxdoc... ScreamingBitset is
@@ -781,16 +775,13 @@ class IntColWriter {
   PostingsWriter::IndexFieldInfo& fieldInfo;
   OutputStream& colOutput;
   int64_t colStart;
-  int64_t idEndLoc;
   int32_t nAdded = 0;            // number of values added. redundant with numDocsWithValue, for sanity check
 public:
 
   // This class allocates from the pool but does not do any visible rollbacks.
   IntColWriter(MemPool& pool, PostingsWriter& postingsWriter, PostingsWriter::IndexFieldInfo& fieldInfo)
   : postingsWriter(postingsWriter), fieldInfo(fieldInfo), colOutput(postingsWriter.files[5].out) {
-    // TODO: docsWithVal allocates 17K from pool that may not be used... should we try to delay this somehow? (an explicit init function?)
-    // Perhaps the indirection associated with delaying the ScreamingBuilder construction would be optimized away since startDoc() would be
-    // called in a tight loop.
+    unused(pool, postingsWriter);
     colStart = colOutput.size();
   }
 
@@ -805,7 +796,7 @@ public:
 
   // returns number of values written
   int32_t finish() {
-    bool allDocsHaveValue = nAdded == postingsWriter.getMaxDoc();
+    // bool allDocsHaveValue = nAdded == postingsWriter.getMaxDoc();
 
     // FUTURE:write index into value blocks here
     fieldInfo.flags |= 0x02;  // int64 values

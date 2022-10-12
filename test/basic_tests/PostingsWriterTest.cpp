@@ -199,7 +199,7 @@ protected:
     if (read) {
       ASSERT_EQ(tenum->numTerms(), realNumTerms);
     } else {
-      writer->endField(fname);
+      writer->endField();
     }
   }
 
@@ -275,7 +275,7 @@ TEST_F(PostingsTest, basic) {
   writer.endDoc(22);
   writer.endTerm(term2);
 
-  writer.endField("field1");
+  writer.endField();
 
 
   writer.startField("field2");
@@ -285,7 +285,7 @@ TEST_F(PostingsTest, basic) {
   writer.addPositionDelta(1);
   writer.endDoc(0);
   writer.endTerm(terma);
-  writer.endField("field2");
+  writer.endField();
 
   postingsWriter.finish();
 
@@ -352,7 +352,7 @@ TEST_F(PostingsTest, blockPositions) {
 
 
   writer.endTerm(term1);
-  writer.endField("field1");
+  writer.endField();
   postingsWriter.finish();
 
   PostingsReader reader(dir, "10");
@@ -427,7 +427,7 @@ TEST_F(PostingsTest, blockTerms) {
     writer.endDoc(i);
     writer.endTerm(term);
   }
-  writer.endField("field1");
+  writer.endField();
   postingsWriter.finish();
 
   PostingsReader reader(dir, "10");

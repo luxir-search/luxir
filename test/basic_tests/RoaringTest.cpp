@@ -85,6 +85,7 @@ TEST_F(RoaringTest, rank) {
   // iterate example
   r1.iterate(
           [](uint32_t val, void* param){
+              unused(val,param);
               // can't assert correct values here since lambda with captures can't be converted to function pointer
               // std::cout << "val=" << val << std::endl;
               return true;  // return false to stop iterating

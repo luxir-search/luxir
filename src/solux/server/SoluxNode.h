@@ -78,30 +78,36 @@ public:
   // and represent metadata in the hierarchy.  This choice needs to be informed by the external representation
   // of collections.
 
-  std::shared_ptr<Collection> getCollection(const std::string_view& name) {
+  std::shared_ptr<Collection> getCollection(std::string_view name) {
+    unused(name);
     return collection;
   }
 
-  std::shared_ptr<Collection> getCollection(Library* library, const std::string_view& name) {
+  std::shared_ptr<Collection> getCollection(Library* library, std::string_view name) {
+    unused(library, name);
     return collection;
   }
 
-  std::shared_ptr<Library> getLibrary(const std::string_view& name) {
+  std::shared_ptr<Library> getLibrary(std::string_view name) {
+    unused(name);
     return root; // TODO: temporary
   }
 
-  std::shared_ptr<Library> getLibrary(Library* parent, const std::string_view& name) {
+  std::shared_ptr<Library> getLibrary(Library* parent, std::string_view name) {
+    unused(parent, name);
     if (parent == nullptr) {
       return root;
     }
     return root; // TODO: look up sub-library
   }
 
-  std::shared_ptr<Library> createLibrary(const std::string_view& name) {
+  std::shared_ptr<Library> createLibrary(std::string_view name) {
+    unused(name);
     return {};
   }
 
-  std::shared_ptr<Collection> createCollection(Library* library, const std::string_view& name) {
+  std::shared_ptr<Collection> createCollection(Library* library, std::string_view name) {
+    unused(library, name);
     return {};
   }
 

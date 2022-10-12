@@ -11,43 +11,68 @@ using namespace solux;
 /*
  We get a good benefit to updating top, even when comparisons are extremely cheap!
  (and small heaps will be common when merging segments in solux)
-NOTE: the third variant (using std::pop_heap instead of solux::update_heap_top when actually
- popping the heap is slower!  This means the code/alg could still be improved, even though
- it's a win over a pop_heap/push_heap pair.
+NOTE: the UpdateTopOnly variant that uses solux::update_heap_top to pop as well is slower than
+ using std::heap_pop (the UpdateTop variant).  This menas our update_heap_top could still be improved
+ even though it's still a win over a pop_heap/push_heap pair.
 
-BM_heap<HeapStd>/1                 283 ns          283 ns      2473990 fp=60.846k heapSz=1 inc=85.8993M
-BM_heap<HeapStd>/2                 867 ns          867 ns       811567 fp=44.171k heapSz=2 inc=85.8993M
-BM_heap<HeapStd>/4                2154 ns         2153 ns       323482 fp=33.224k heapSz=4 inc=85.8993M
-BM_heap<HeapStd>/8                4836 ns         4836 ns       145425 fp=82.394k heapSz=8 inc=85.8993M
-BM_heap<HeapStd>/16              10860 ns        10860 ns        64461 fp=39.814k heapSz=16 inc=85.8993M
-BM_heap<HeapStd>/32              27184 ns        27184 ns        25595 fp=28.994k heapSz=32 inc=85.8993M
-BM_heap<HeapStd>/64             141802 ns       141803 ns         4922 fp=54.48k heapSz=64 inc=85.8993M
-BM_heap<HeapStd>/128            355947 ns       355948 ns         1972 fp=1.982k heapSz=128 inc=85.8993M
-BM_heap<HeapStd>/256            844061 ns       844063 ns          824 fp=78.669k heapSz=256 inc=85.8993M
-BM_heap<HeapStd>/512           1896734 ns      1896738 ns          369 fp=4.785k heapSz=512 inc=85.8993M
-BM_heap<HeapStd>/1024          4214839 ns      4214853 ns          166 fp=86.595k heapSz=1024 inc=85.8993M
-BM_heap<UpdateTop>/1               222 ns          222 ns      3145728 fp=60.846k heapSz=1 inc=85.8993M
-BM_heap<UpdateTop>/2               597 ns          597 ns      1167607 fp=44.171k heapSz=2 inc=85.8993M
-BM_heap<UpdateTop>/4              1329 ns         1329 ns       526949 fp=33.224k heapSz=4 inc=85.8993M
-BM_heap<UpdateTop>/8              2886 ns         2886 ns       243580 fp=82.394k heapSz=8 inc=85.8993M
-BM_heap<UpdateTop>/16             6703 ns         6703 ns       103145 fp=39.814k heapSz=16 inc=85.8993M
-BM_heap<UpdateTop>/32            16722 ns        16722 ns        42134 fp=28.994k heapSz=32 inc=85.8993M
-BM_heap<UpdateTop>/64           114205 ns       114205 ns         6178 fp=54.48k heapSz=64 inc=85.8993M
-BM_heap<UpdateTop>/128          299698 ns       299699 ns         2350 fp=1.982k heapSz=128 inc=85.8993M
-BM_heap<UpdateTop>/256          717777 ns       717779 ns          969 fp=78.669k heapSz=256 inc=85.8993M
-BM_heap<UpdateTop>/512         1687674 ns      1687678 ns          419 fp=4.785k heapSz=512 inc=85.8993M
-BM_heap<UpdateTop>/1024        3863422 ns      3863430 ns          183 fp=86.595k heapSz=1024 inc=85.8993M
-BM_heap<UpdateTopOnly>/1           265 ns          265 ns      2634123 fp=60.846k heapSz=1 inc=85.8993M
-BM_heap<UpdateTopOnly>/2           635 ns          635 ns      1111284 fp=44.171k heapSz=2 inc=85.8993M
-BM_heap<UpdateTopOnly>/4          1519 ns         1519 ns       463298 fp=33.224k heapSz=4 inc=85.8993M
-BM_heap<UpdateTopOnly>/8          3642 ns         3642 ns       193078 fp=82.394k heapSz=8 inc=85.8993M
-BM_heap<UpdateTopOnly>/16         8686 ns         8686 ns        80553 fp=39.814k heapSz=16 inc=85.8993M
-BM_heap<UpdateTopOnly>/32        20335 ns        20335 ns        34324 fp=28.994k heapSz=32 inc=85.8993M
-BM_heap<UpdateTopOnly>/64       114431 ns       114431 ns         6039 fp=54.48k heapSz=64 inc=85.8993M
-BM_heap<UpdateTopOnly>/128      306944 ns       306945 ns         2273 fp=1.982k heapSz=128 inc=85.8993M
-BM_heap<UpdateTopOnly>/256      737429 ns       737431 ns          952 fp=78.669k heapSz=256 inc=85.8993M
-BM_heap<UpdateTopOnly>/512     1673131 ns      1673136 ns          421 fp=4.785k heapSz=512 inc=85.8993M
-BM_heap<UpdateTopOnly>/1024    3786159 ns      3786167 ns          184 fp=86.595k heapSz=1024 inc=85.8993M
+--------------------------------------------------------------------------------------
+Benchmark                            Time             CPU   Iterations UserCounters...
+--------------------------------------------------------------------------------------
+BM_heap<HeapStd>/1                 235 ns          235 ns      2940261 fp=60.846k heapSz=1 inc=85.8993M
+BM_heap<HeapStd>/2                 746 ns          746 ns       935688 fp=44.171k heapSz=2 inc=85.8993M
+BM_heap<HeapStd>/4                2214 ns         2214 ns       317943 fp=33.224k heapSz=4 inc=85.8993M
+BM_heap<HeapStd>/8                4555 ns         4555 ns       153293 fp=82.394k heapSz=8 inc=85.8993M
+BM_heap<HeapStd>/16              10600 ns        10600 ns        70455 fp=39.814k heapSz=16 inc=85.8993M
+BM_heap<HeapStd>/32              24197 ns        24197 ns        28803 fp=28.994k heapSz=32 inc=85.8993M
+BM_heap<HeapStd>/64             138199 ns       138200 ns         5002 fp=54.48k heapSz=64 inc=85.8993M
+BM_heap<HeapStd>/128            346165 ns       346166 ns         2035 fp=1.982k heapSz=128 inc=85.8993M
+BM_heap<HeapStd>/256            815782 ns       815784 ns          858 fp=78.669k heapSz=256 inc=85.8993M
+BM_heap<HeapStd>/512           1840102 ns      1840107 ns          380 fp=4.785k heapSz=512 inc=85.8993M
+BM_heap<HeapStd>/1024          4125422 ns      4125430 ns          170 fp=86.595k heapSz=1024 inc=85.8993M
+BM_heap<UpdateTop>/1               212 ns          212 ns      3308968 fp=60.846k heapSz=1 inc=85.8993M
+BM_heap<UpdateTop>/2               592 ns          592 ns      1189410 fp=44.171k heapSz=2 inc=85.8993M
+BM_heap<UpdateTop>/4              1315 ns         1315 ns       533500 fp=33.224k heapSz=4 inc=85.8993M
+BM_heap<UpdateTop>/8              2831 ns         2831 ns       246493 fp=82.394k heapSz=8 inc=85.8993M
+BM_heap<UpdateTop>/16             6757 ns         6757 ns       104389 fp=39.814k heapSz=16 inc=85.8993M
+BM_heap<UpdateTop>/32            15884 ns        15884 ns        43840 fp=28.994k heapSz=32 inc=85.8993M
+BM_heap<UpdateTop>/64           109331 ns       109332 ns         6341 fp=54.48k heapSz=64 inc=85.8993M
+BM_heap<UpdateTop>/128          287359 ns       287359 ns         2432 fp=1.982k heapSz=128 inc=85.8993M
+BM_heap<UpdateTop>/256          692402 ns       692404 ns         1009 fp=78.669k heapSz=256 inc=85.8993M
+BM_heap<UpdateTop>/512         1571691 ns      1571693 ns          442 fp=4.785k heapSz=512 inc=85.8993M
+BM_heap<UpdateTop>/1024        3532082 ns      3532086 ns          194 fp=86.595k heapSz=1024 inc=85.8993M
+BM_heap<indirectPQ>/1              213 ns          213 ns      3274524 fp=60.846k heapSz=1 inc=85.8993M
+BM_heap<indirectPQ>/2              615 ns          615 ns      1135151 fp=44.171k heapSz=2 inc=85.8993M
+BM_heap<indirectPQ>/4             1301 ns         1301 ns       532143 fp=33.224k heapSz=4 inc=85.8993M
+BM_heap<indirectPQ>/8             2904 ns         2904 ns       243741 fp=82.394k heapSz=8 inc=85.8993M
+BM_heap<indirectPQ>/16            6523 ns         6523 ns       105288 fp=39.814k heapSz=16 inc=85.8993M
+BM_heap<indirectPQ>/32           16476 ns        16476 ns        42395 fp=28.994k heapSz=32 inc=85.8993M
+BM_heap<indirectPQ>/64          111391 ns       111392 ns         6302 fp=54.48k heapSz=64 inc=85.8993M
+BM_heap<indirectPQ>/128         292012 ns       292012 ns         2402 fp=1.982k heapSz=128 inc=85.8993M
+BM_heap<indirectPQ>/256         694250 ns       694251 ns          998 fp=78.669k heapSz=256 inc=85.8993M
+BM_heap<indirectPQ>/512        1618223 ns      1618226 ns          434 fp=4.785k heapSz=512 inc=85.8993M
+BM_heap<indirectPQ>/1024       3757810 ns      3757817 ns          188 fp=86.595k heapSz=1024 inc=85.8993M
+BM_heap<UpdateTopIdx>/1            301 ns          301 ns      2315344 fp=60.846k heapSz=1 inc=85.8993M
+BM_heap<UpdateTopIdx>/2            717 ns          717 ns       969175 fp=44.171k heapSz=2 inc=85.8993M
+BM_heap<UpdateTopIdx>/4           1613 ns         1613 ns       434508 fp=33.224k heapSz=4 inc=85.8993M
+BM_heap<UpdateTopIdx>/8           3783 ns         3783 ns       183220 fp=82.394k heapSz=8 inc=85.8993M
+BM_heap<UpdateTopIdx>/16          9019 ns         9019 ns        78243 fp=39.814k heapSz=16 inc=85.8993M
+BM_heap<UpdateTopIdx>/32         20946 ns        20946 ns        33148 fp=28.994k heapSz=32 inc=85.8993M
+BM_heap<UpdateTopIdx>/64        120482 ns       120482 ns         5835 fp=54.48k heapSz=64 inc=85.8993M
+BM_heap<UpdateTopIdx>/128       318579 ns       318577 ns         2201 fp=1.982k heapSz=128 inc=85.8993M
+BM_heap<UpdateTopIdx>/256       759204 ns       759206 ns          922 fp=78.669k heapSz=256 inc=85.8993M
+BM_heap<UpdateTopIdx>/512      1738472 ns      1738475 ns          398 fp=4.785k heapSz=512 inc=85.8993M
+BM_heap<UpdateTopIdx>/1024     3940907 ns      3940915 ns          177 fp=86.595k heapSz=1024 inc=85.8993M
+BM_heap<UpdateTopOnly>/1           239 ns          239 ns      2956996 fp=60.846k heapSz=1 inc=85.8993M
+BM_heap<UpdateTopOnly>/2           630 ns          630 ns      1092804 fp=44.171k heapSz=2 inc=85.8993M
+BM_heap<UpdateTopOnly>/4          1471 ns         1471 ns       478788 fp=33.224k heapSz=4 inc=85.8993M
+BM_heap<UpdateTopOnly>/8          3182 ns         3182 ns       218524 fp=82.394k heapSz=8 inc=85.8993M
+BM_heap<UpdateTopOnly>/16         7776 ns         7776 ns        90064 fp=39.814k heapSz=16 inc=85.8993M
+BM_heap<UpdateTopOnly>/32        18432 ns        18432 ns        37619 fp=28.994k heapSz=32 inc=85.8993M
+BM_heap<UpdateTopOnly>/64       113990 ns       113990 ns         6191 fp=54.48k heapSz=64 inc=85.8993M
+BM_heap<UpdateTopOnly>/128      300503 ns       300503 ns         2340 fp=1.982k heapSz=128 inc=85.8993M
+BM_heap<UpdateTopOnly>/256      723013 ns       723014 ns          975 fp=78.669k heapSz=256 inc=85.8993M
+BM_heap<UpdateTopOnly>/512     1683227 ns      1683230 ns          415 fp=4.785k heapSz=512 inc=85.8993M
+BM_heap<UpdateTopOnly>/1024    3867436 ns      3867444 ns          181 fp=86.595k heapSz=1024 inc=85.8993M
  */
 
 
@@ -134,8 +159,6 @@ public:
 
   static uint64_t calcResult(std::vector<uint32_t>& data, std::vector<uint32_t *> &dataPointers, uint32_t maxIncrement, uint64_t seed) {
     unused(data);
-    // TODO: which constructor is used seems to affect timing (to the tune of ~3%, but consistently)... the seemingly more complex
-    // constructor pq(data, dataPointers, true) is the faster one.
     // constexpr auto mycomp = [](const uint32_t& a, const uint32_t& b) { return b < a; }; // reversed comparator for min-heap
     // IndirectPQ<uint32_t, decltype(mycomp)> pq(data, dataPointers, true);
     IndirectPQ<uint32_t, std::greater<>> pq(dataPointers);

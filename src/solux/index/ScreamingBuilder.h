@@ -34,6 +34,7 @@ protected:
   }
 
   void deallocateScratch(void *ptr) {
+    unused(ptr);
   }
 
 };

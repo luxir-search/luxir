@@ -116,6 +116,7 @@ public:
   }
 
   virtual void proceed(bool ok, uint32_t tag) override {
+    unused(tag);
     // std::cout << "UnaryCallData.proceed(" << ok << ") this=" << (void*)this << std::endl;
     if (!ok) {
       // canceled/errored... nothing else to do.
