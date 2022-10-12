@@ -811,6 +811,7 @@ public:
     fieldInfo.flags |= 0x02;  // int64 values
     fieldInfo.docsWithValue = nAdded;
     fieldInfo.columnLoc = seg_location(colOutput.streamNumber, colStart);
+    return nAdded;
   }
 };
 

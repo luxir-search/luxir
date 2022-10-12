@@ -50,6 +50,7 @@ public:
     PackedTerm fieldName;
     FieldType& fieldType;
 
+    IndexHandler(IndexHandler& other) = delete; // let's not move any of these
   public:
     IndexHandler(PackedTerm fieldName, FieldType &fieldType)
     : fieldName(fieldName), fieldType(fieldType) {
@@ -113,9 +114,7 @@ public:
             : IndexHandler(fieldName, fieldType), longStream(inverter.pool), docsWithVal(inverter.pool) {
     }
 
-    IntColHandler(IntColHandler&& other) = default;
-
-    ~IntColHandler() = default;
+    ~IntColHandler() override = default;
 
     void index(Inverter &inverter, const proto::Val &val) override {
       if (val.has_i()) {
@@ -206,7 +205,6 @@ public:
             fieldLengthCol(inverter, this->fieldName, this->fieldType, *this)
             {
     }
-    PosIndexHandler(PosIndexHandler&& other) = default;
     ~PosIndexHandler() override = default;
 
     void index(Inverter& inverter, const proto::Val& val) override {

@@ -50,7 +50,7 @@ public:
 
       // position fieldReader on first field and add to segs if it's non-empty
       if (fieldReader.readNextField()) {
-        segs.emplace_back(preader, &fieldReader, base, (int)segs.size());
+        segs.push_back({preader, &fieldReader, base, (int)segs.size()});  // clang didn't like emplace_back for this
         base += preader->numDocs();
       } else {
         LOG_ERROR("Empty fieldReader!");
