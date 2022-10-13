@@ -675,7 +675,7 @@ public:
       cumulativeDocsSize = tenum.cumulativeDocsSize;
       docIS = postingsReader.getInputStream(fieldInfo.docsLoc.filenum());
 
-      // see the end of PostingsWiter.endTerm() for the term-specific metadata written there (docfreq, ttf, etc)
+      // see the end of PostingsWriter.endTerm() for the term-specific metadata written there (docfreq, ttf, etc)
 
       // read last byte of docs to get the metadata size
       docIS.seek(locOfDocsForTermBlock + cumulativeDocsSize - 1);
