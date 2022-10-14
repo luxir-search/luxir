@@ -150,8 +150,6 @@ public:
   };
 
   struct IndexFieldInfo : public SegFieldInfo {
-    int64_t sumDocFreq;
-    int64_t sumTotalTermFreq;
   };
 
   // These are dequeues so elements don't move
@@ -228,6 +226,7 @@ private:
 
       fieldOutput.writePackedTerm(finfo.fieldname);
       fieldOutput.writeVint(finfo.flags);
+      fieldOutput.writeVlong(finfo.docsWithField);
 
       if ((finfo.flags & 0x01) != 0) {
         fieldOutput.writeVal(finfo.termBlockIndexLoc);
@@ -235,11 +234,12 @@ private:
         fieldOutput.writeVal(finfo.docsLoc);
         fieldOutput.writeVal(finfo.posLoc);
         fieldOutput.writeVint(finfo.nTerms);
+        fieldOutput.writeVlong(finfo.sumDocFreq - finfo.nTerms);            // sumDocFreq >= nTerms
+        fieldOutput.writeVlong(finfo.sumTotalTermFreq - finfo.sumDocFreq);  // sumTotalTermFreq >= sumDocFreq
       }
 
       if ((finfo.flags & 0x02) != 0) {
-        fieldOutput.writeVlong(finfo.docsWithValue);
-        fieldOutput.writeVal(finfo.docsWithValueEndLoc);
+        fieldOutput.writeVal(finfo.docsWithFieldEndLoc);
         fieldOutput.writeVal(finfo.columnLoc);
       }
     }
@@ -303,6 +303,8 @@ class TextWriter {
   int64_t totalTermFreqPrevDoc = 0; // total term freq up through the previous doc
 
   std::vector<uint64_t> termBlockOffsets;  // offset from termsOffset (for this field) for each term block
+  int64_t sumTotalTermFreq = 0; // updated in endTerm
+  int64_t sumDocFreq = 0; // updated in endTerm
   int32_t numTerms; // currently only updated in flushTerms
 
   // TODO: pool allocate this
@@ -550,12 +552,14 @@ public:
   void endTerm(TermRef term) {
     unused(term);
     auto totalTermFreq = getTotalTermFreq();
+    sumTotalTermFreq += totalTermFreq;
     if (docs.size() > 0) {
       assert(docs.back() < postingsWriter.getMaxDoc()); // sanity check to ensure we didn't go over provided numDocs
     }
     // TODO: handle case when all docs were deleted for term (and term should no longer appear)
     if (totalTermFreq == 1) {
       assert(getDocFileSize()==0 && docs.size()==1 && posdeltas.size() == 1);
+      sumDocFreq += 1;
       docFileSize.push_back(0);
       // the doc+position will be remembered to be included directly in the term dictionary (i.e. pulsing)
       pulsed.push_back(docs[0]);
@@ -614,6 +618,7 @@ public:
       auto metadataStart = docOutput.size();
 
       auto docfreq = getDocFreq();
+      sumDocFreq += docfreq;
       auto ttfCode = totalTermFreq - docfreq;
       // offset from start of positions in term dict block
       auto posOffset = locOfPositionsForTerm - locOfPositionsForTermBlock;
@@ -648,6 +653,9 @@ public:
     //   - sequence will be monotonically increasing (or decreasing)... interpolate?
     // Indexing RAM OPT: for fields with huge number of terms, we could stream this to separate file.  That would also facilitate alignment if it's important.
     fieldInfo->nTerms = numTerms;
+    fieldInfo->sumDocFreq = sumDocFreq;
+    fieldInfo->sumTotalTermFreq = sumTotalTermFreq;
+
     fieldInfo->termBlockIndexLoc = seg_location(termOutput.streamNumber, termOutput.size());
     assert((int)termBlockOffsets.size() == ((numTerms-1) / Postings::TERMS_BLOCK_SIZE) + 1);
     termOutput.write(&(termBlockOffsets[0]), termBlockOffsets.size() * sizeof(termBlockOffsets[0]) );
@@ -748,17 +756,17 @@ public:
   }
 
   void finish() {
-    fieldInfo.docsWithValue = docsWriter.finish();
+    fieldInfo.docsWithField = docsWriter.finish();
     int64_t endLoc = idOutput.size();
-    fieldInfo.docsWithValueEndLoc = seg_location(idOutput.streamNumber, endLoc);
+    fieldInfo.docsWithFieldEndLoc = seg_location(idOutput.streamNumber, endLoc);
   }
 
   // Signal that the column has all docs present. No docs should be added in this case, but the count
   // in fieldInfo should be filled in.
   void finishDense(int32_t numDocs) {
-    fieldInfo.docsWithValue = numDocs;
+    fieldInfo.docsWithField = numDocs;
     // this is a valid location, so use numDocs and see if it matches numDocs of segment to tell if there is data to read
-    fieldInfo.docsWithValueEndLoc = seg_location(0,0);
+    fieldInfo.docsWithFieldEndLoc = seg_location(0, 0);
   }
 };
 
@@ -767,7 +775,7 @@ public:
 // Integer column writing
 // TODO: nest these within postings writer? Or use a namespace?
 // TODO: currently all values must be written before all docs!  Decouple this so we can write columns incrementally!
-// To increase locality and decrease seeks, we could ensure that docsWithValue always immediately follow the values.
+// To increase locality and decrease seeks, we could ensure that docsWithField always immediately follow the values.
 // We could use an OutputStream that writes to RAM or even a MemPool implementation (or OutputStream writing to MemPool)
 //
 class IntColWriter {
@@ -800,7 +808,7 @@ public:
 
     // FUTURE:write index into value blocks here
     fieldInfo.flags |= 0x02;  // int64 values
-    fieldInfo.docsWithValue = nAdded;
+    fieldInfo.docsWithField = nAdded;
     fieldInfo.columnLoc = seg_location(colOutput.streamNumber, colStart);
     return nAdded;
   }

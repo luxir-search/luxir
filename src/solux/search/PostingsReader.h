@@ -238,10 +238,17 @@ struct SegFieldInfo {
   seg_location docsLoc;
   seg_location posLoc;
   int32_t nTerms;
+  int32_t docsWithField;
+
+  // I don't know if things like nTerms, sumDocFreq, sumTotalTermFreq will stay in fieldInfo
+  // or perhaps be moved into the terms section of the postings (i.e. pushed down so one needs
+  // a TermsEnum to read them).  To be safe, we should only access through TermsEnum for now.
+  // Only reason to keep at this level would be if they are sometimes needed even without a TermsEnum.
+  int64_t sumDocFreq;
+  int64_t sumTotalTermFreq;
 
   // column
-  int32_t docsWithValue;
-  seg_location docsWithValueEndLoc;
+  seg_location docsWithFieldEndLoc;
   seg_location columnLoc;
 
   int32_t flags;  // temporary... currently has type info. 0x01 text, 0x02 int col.  In the future, we should decompose and have separate sections for each type
@@ -251,7 +258,7 @@ struct SegFieldInfo {
 
 
 
-  // not thread safe
+/// Not thread safe
 class FieldReader {
   friend class DocsEnum;
   friend class TermsEnum;
@@ -332,16 +339,18 @@ public:
       fieldInfoRead = true;
       fieldInfo.fieldname = fieldname;
       fieldInfo.flags = fieldIS.readVint();
+      fieldInfo.docsWithField = fieldIS.readVint();
       if (fieldInfo.flags & 0x01) {
         fieldInfo.termBlockIndexLoc = fieldIS.readVal<seg_location>();
         fieldInfo.termsLoc = fieldIS.readVal<seg_location>();
         fieldInfo.docsLoc = fieldIS.readVal<seg_location>();
         fieldInfo.posLoc = fieldIS.readVal<seg_location>();
         fieldInfo.nTerms = fieldIS.readVint();
+        fieldInfo.sumDocFreq = fieldInfo.nTerms + fieldIS.readVlong();
+        fieldInfo.sumTotalTermFreq = fieldInfo.sumDocFreq + fieldIS.readVlong();
       }
       if (fieldInfo.flags & 0x02) {
-        fieldInfo.docsWithValue = fieldIS.readVint();
-        fieldInfo.docsWithValueEndLoc = fieldIS.readVal<seg_location>();
+        fieldInfo.docsWithFieldEndLoc = fieldIS.readVal<seg_location>();
         fieldInfo.columnLoc = fieldIS.readVal<seg_location>();
       } else {
         // ?
@@ -399,6 +408,26 @@ public:
 
   int32_t numTerms() const {
     return fieldInfo.nTerms;
+  }
+
+  int32_t docsWithField() const {
+    return fieldInfo.docsWithField;
+  }
+
+  /// sumDocFreq is a field-level stat:
+  /// The docFreq of a term is the number of documents it appears in. sumDocFreq is the sum across all terms in this field.
+  /// If sumDocFreq() == docsWithField() then every document contains only one term (or the same term repeated.)  May be
+  /// useful for detecting single-valued fields even if they were not marked as such.
+  int64_t sumDocFreq() const {
+    return fieldInfo.sumDocFreq;
+  }
+
+  /// sumTotalTermFreq is a field-level stat:
+  /// termFreq is the number of times the term appears in a single document.
+  /// totalTermFreq is the number of times the term appears across all documents in this segment.
+  /// sumTotalTermFreq is the sum of totalTermFreq for all terms in this field (i.e. number of tokens indexed)
+  int64_t sumTotalTermFreq() const {
+    return fieldInfo.sumTotalTermFreq;
   }
 
   int32_t ord() const {
@@ -707,6 +736,15 @@ public:
     return ttf;
   }
 
+  /// the document this iterator is currently positions on
+  int32_t docId() {
+    return docid;
+  }
+
+  /// number of times the term appears in the current document
+  int32_t termFreq() {
+    return tfreq;
+  }
 
   int32_t nextDocOld() {
     if (docsSize != 0) {
@@ -800,9 +838,6 @@ public:
     return docid;
   }
 
-  int32_t termFreq() {
-    return tfreq;
-  }
 
   void startPositions() {
     pos = 0;
@@ -942,15 +977,15 @@ class DocsReader {
 
 public:
 
-  // initialize from docsWithValue for the field if it exists
+  // initialize from docsWithField for the field if it exists
   DocsReader(MemPool &pool, PostingsReader &postingsReader, const SegFieldInfo &fieldInfo) {
     unused(pool);
-    ndocs = fieldInfo.docsWithValue;
+    ndocs = fieldInfo.docsWithField;
 
-    // docsWithValue is currently guaranteed to be in the same file as columnIS
+    // docsWithField is currently guaranteed to be in the same file as columnIS
     if (ndocs != postingsReader.numDocs()) {
-      InputStream docsWithValIs = postingsReader.getInputStreamSeek(fieldInfo.docsWithValueEndLoc);
-      // bits.set( docsWithValIs.ptr(fieldInfo.docsWithValueEndLoc.offset()) );
+      InputStream docsWithValIs = postingsReader.getInputStreamSeek(fieldInfo.docsWithFieldEndLoc);
+      // bits.set( docsWithValIs.ptr(fieldInfo.docsWithFieldEndLoc.offset()) );
       bits.set( docsWithValIs.ptr() );
     }
   }
@@ -988,7 +1023,7 @@ public:
   }
 
   int32_t docsWithValue() {
-    return fieldInfo.docsWithValue;
+    return fieldInfo.docsWithField;
   }
 
   template <class DocAcceptor>
@@ -1004,7 +1039,7 @@ public:
   public:
     DenseIterator(const IntColReader& col)  {
       values = col.values;
-      max = col.fieldInfo.docsWithValue;
+      max = col.fieldInfo.docsWithField;
     }
 
     int32_t docId() {
@@ -1046,7 +1081,7 @@ public:
     bool dense;
   public:
     Iterator(const IntColReader& col) : col(&col), docsIter(col.docs.bitset()), values(col.values) {
-      maxRank = col.fieldInfo.docsWithValue;
+      maxRank = col.fieldInfo.docsWithField;
       dense = !col.docs.hasBitset();
     }
 

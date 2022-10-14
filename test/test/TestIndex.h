@@ -193,16 +193,22 @@ namespace solux::test {
     Inverter::IndexHandler* indexHandler = nullptr;
 
     // segment-level reading
-    size_t currSeg = -1;
+    int currSeg = -1;
     SegFieldInfo fieldInfo;
     std::unique_ptr<IntColReader> colReader;
     std::unique_ptr<IntColReader::Iterator> iter;
+    std::unique_ptr<TermsEnum> tenum;
+
+
 
     // TODO: we should separate the "has value" from int column... it can be shared across all fields!
 
     int32_t nAdds = 0;
     int64_t doc = -1;
     int64_t v = 0;
+
+
+
 
     TestField(TestIndex& testIndex, const std::string_view name) : testIndex(testIndex), name(name) {
     }
@@ -225,7 +231,7 @@ namespace solux::test {
     }
 
     void startReading() {
-      testIndex.initReader();  // TODO: don't do this for each field?
+      testIndex.initReader();  // TODO: don't do this for each field, it will invalidate previous pointers!
       currSeg = -1;
       iter.reset();
     }
@@ -254,24 +260,39 @@ namespace solux::test {
 
       // do in a loop to skip segments without the field.
       for (;;) {
-        if (currSeg + 1 >= segments.size()) {
+        if (currSeg + 1 >= (int)segments.size()) {
           return false;
         }
         currSeg++;
 
-        IndexReader::Segment& seg = segments[currSeg];
+        IndexReader::Segment &seg = segments[currSeg];
         FieldReader fieldReader(testIndex.pool, seg.postingsReader());
         auto found = fieldReader.seek(name);
         if (!found) continue;
 
         fieldReader.readFieldInfo(fieldInfo);
         colReader = std::make_unique<IntColReader>(testIndex.pool, seg.postingsReader(), fieldInfo);
-        // EXPECT_EQ(colReader->docsWithValue(), nAdds); // TODO: sum up and only do after final segment has been reached
+        // EXPECT_EQ(colReader->docsWithField(), nAdds); // TODO: sum up and only do after final segment has been reached
         iter = std::make_unique<IntColReader::Iterator>(*colReader);
         return true;
       }
-
     }
+
+    IndexReader::Segment* currentSegment() {
+      if (currSeg < 0) { nextSegment(); }
+      if (testIndex.reader == nullptr || currSeg >= (int)testIndex.reader->segments().size()) {
+        LOG_ERROR("TestField {} not reading any segment", name);
+        return nullptr;
+      }
+      return &testIndex.reader->segments()[currSeg];
+    }
+
+    TermsEnum createTermsEnum() {
+      if (currSeg < 0) { nextSegment(); }
+      return TermsEnum(testIndex.pool, currentSegment()->postingsReader(), fieldInfo);
+    }
+
+
   };
 
   struct FieldAndValues {

@@ -1,12 +1,10 @@
 #pragma once
+#include <span>
 #include "PostingsReader.h"
 
 namespace solux {
 
-
-// TODO: how to handle multi-reader (say for most common use case of multiple shards in same node?)
-
-// IndexReader is thread safe
+/// IndexReader is thread safe
 class IndexReader {
 public:
 
@@ -50,11 +48,11 @@ public:
 
   // TODO: implement postingsReader sharing by passing in another IndexReader for reference.
 
-  const std::span<Segment> segments() {
+  const std::span<Segment> segments() noexcept {
     return segs;
   }
 
-  int64_t numDocs() {
+  int64_t numDocs() const noexcept {
     return maxdoc;
   }
 
