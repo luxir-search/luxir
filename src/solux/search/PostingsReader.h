@@ -244,6 +244,8 @@ struct SegFieldInfo {
   // or perhaps be moved into the terms section of the postings (i.e. pushed down so one needs
   // a TermsEnum to read them).  To be safe, we should only access through TermsEnum for now.
   // Only reason to keep at this level would be if they are sometimes needed even without a TermsEnum.
+  // They could be written right before the termBlock offsets that termBlockIndexLoc points to.
+  // One advantage of keeping this stuff here is it makes the TermBlockOffsets fixed size.
   int64_t sumDocFreq;
   int64_t sumTotalTermFreq;
 
@@ -434,6 +436,8 @@ public:
     return startingOrd + ordInBlock;
   }
 
+  /// NOTE: the returned term is invalidated if this TermsEnum is moved off this
+  /// term (i.e. the moment next() or seek() is called). Make a copy if you wish to keep it!
   PackedTerm term() const {
     return currTerm;
   }
