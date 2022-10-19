@@ -91,6 +91,25 @@ TEST(BasicTest, testPQ) {
   }
 
   {
+    std::vector<float> vals = {50.0, 75.0, 25.0, 80.0, 40.0};
+    std::vector<int> valPtrs(3);
+    solux::IndexedPQ<float, std::greater<>> pq(vals, valPtrs, 0);
+    ASSERT_EQ(pq.size(), 0);
+    ASSERT_EQ(false, pq.insertWithOverflow(40.0f));  // 40
+    ASSERT_EQ(false, pq.insertWithOverflow(50.0f));  // 50
+    ASSERT_EQ(pq.top(), 40.0);
+    ASSERT_EQ(false, pq.insertWithOverflow(75.0f));  // 75
+    ASSERT_EQ(pq.top(), 40.0);
+    bool ejected = pq.insertWithOverflow(80.0f);     // 80, kicks out 40
+    ASSERT_EQ(ejected, true);
+    ASSERT_EQ(pq.top(), 50.0);
+    ejected = pq.insertWithOverflow(25);            // 25, rejected
+    ASSERT_EQ(ejected, false);
+    ASSERT_EQ(pq.top(), 50.0);
+  }
+
+
+  {
     int n = 100;
     solux::Rng rng;
     std::vector<int> vals(n);
@@ -103,13 +122,19 @@ TEST(BasicTest, testPQ) {
     std::vector<int*> ptrs(vals.size());
     solux::IndirectPQ<int, std::greater<>> pq(vals, ptrs, false);
 
+    std::vector<int> indexes(vals.size());
+    solux::IndexedPQ<int, std::greater<>> indexedPQ(vals, indexes);
+
     ASSERT_EQ(pq.top(), sorted[0]);
 
     for (auto expected : sorted) {
       ASSERT_EQ(pq.top(), expected);
+      ASSERT_EQ(indexedPQ.top(), expected);
       auto idx = pq.indexOfTop();
       ASSERT_EQ(vals[idx], expected);
+      ASSERT_EQ(idx, indexedPQ.indexOfTop());
       pq.removeTop();
+      indexedPQ.removeTop();
     }
   }
 }

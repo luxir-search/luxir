@@ -181,6 +181,30 @@ public:
   }
 };
 
+class indexedPQ {
+public:
+  static constexpr bool useIdx = true;
+
+  static uint64_t calcResult(std::vector<uint32_t>& data, std::vector<uint32_t> &idxArr, uint32_t maxIncrement, uint64_t seed) {
+    unused(data);
+    IndexedPQ<uint32_t, std::greater<>, uint32_t> pq(data, idxArr, false);
+
+    Rng rng(seed);
+    uint64_t ret = 0;
+
+    while (pq.size() > 0) {
+      uint32_t currV = pq.top();
+      ret = ret * 31 + currV;
+      pq.top() = currV + rng.rint(1u, maxIncrement);
+      if (pq.top() > currV) { // no overflow
+        pq.updateTop();
+      } else {
+        pq.removeTop();
+      }
+    }
+    return ret;
+  }
+};
 
 
 class UpdateTopIdx {
@@ -296,7 +320,7 @@ static void BM_heap(benchmark::State& state) {
   }
   ASSERT_TRUE(result != 0);
 
-  state.counters["fp"] = double(result % 100000);
+  state.counters["fp"] = double(result % 100000);  // TODO: the fingerprint is different between gcc and clang!!! Why?
   state.counters["heapSz"] = maxsz;
   state.counters["inc"] = maxinc;
 }
@@ -307,6 +331,7 @@ static void BM_heap(benchmark::State& state) {
 BENCHMARK(BM_heap<HeapStd>)->RangeMultiplier(2)->Range(1, 1<<10);
 BENCHMARK(BM_heap<UpdateTop>)->RangeMultiplier(2)->Range(1, 1<<10);
 BENCHMARK(BM_heap<indirectPQ>)->RangeMultiplier(2)->Range(1, 1<<10);
+BENCHMARK(BM_heap<indexedPQ>)->RangeMultiplier(2)->Range(1, 1<<10);
 BENCHMARK(BM_heap<UpdateTopIdx>)->RangeMultiplier(2)->Range(1, 1<<10);
 BENCHMARK(BM_heap<UpdateTopOnly>)->RangeMultiplier(2)->Range(1, 1<<10);
 #else
@@ -315,6 +340,7 @@ inline void hackety_hack() {
   solux::unused(BM_heap<HeapStd>);
   solux::unused(BM_heap<UpdateTop>);
   solux::unused(BM_heap<indirectPQ>);
+  solux::unused(BM_heap<indexedPQ>);
   solux::unused(BM_heap<UpdateTopIdx>);
   solux::unused(BM_heap<UpdateTopOnly>);
 }

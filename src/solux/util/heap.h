@@ -2,6 +2,7 @@
 
 #include <assert.h>
 #include <span>
+#include <numeric>
 
 namespace solux {
 
@@ -135,6 +136,112 @@ public:
     return ejected;
   }
 };
+
+
+/// Directly using std::make_heap is error-prone when dealing with indirection, esp if you have an array of
+/// elements that you don't want to change the order of (hence indirection) and you want to know the slot
+/// of the original element on top (for accessing parallel arrays)
+/// \tparam T
+/// \tparam Comp
+template <class T, class Comp, typename index_type=int>
+class IndexedPQ {
+  std::span<T> underlying;
+  std::span<index_type> heap;
+  index_type heapSize; // the current heap size
+
+  auto comparator() {
+    return [&](index_type a, index_type b) { return Comp()(underlying[a],underlying[b]); };
+  }
+
+  auto end() {
+    return heap.begin() + heapSize;
+  }
+
+  void makeHeap() {
+    std::make_heap(heap.begin(), end(), comparator());
+  }
+
+public:
+
+  IndexedPQ(std::span<T> underlying, std::span<index_type> indexes, bool fillIndexes=true)
+  : underlying(underlying), heap(indexes), heapSize(indexes.size())
+  {
+    assert(underlying.size() >= indexes.size());
+    if (fillIndexes) {
+      assert(underlying.size() == indexes.size());
+      std::iota(indexes.begin(), indexes.end(), index_type(0));
+    }
+    makeHeap();
+  }
+
+  IndexedPQ(std::span<T> underlying, std::span<index_type> indexes, index_type size)
+          : underlying(underlying), heap(indexes), heapSize(size)
+  {
+    assert(underlying.size() >= indexes.size());
+    assert(heapSize <= indexes.size());
+    makeHeap();
+  }
+
+  // Reference to the top element.
+  T& top() {
+    return underlying[heap.front()];
+  }
+
+  size_t size() {
+    return heapSize;
+  }
+
+  size_t capacity() {
+    return heap.size();
+  }
+
+  /// Index of the top element in the original array
+  index_type indexOfTop() {
+    return heap.front();
+  }
+
+  /// Call this to re-heapify after top() was modified
+  void updateTop() {
+    update_heap_top(heap.begin(), end(), comparator());
+  }
+
+  /// The returned reference will be invalidated by any insert.
+  T& removeTop() {
+    std::pop_heap(heap.begin(), end(), comparator());
+    --heapSize;
+    return underlying[heap[heapSize]];
+  }
+
+  void insert(const T& elem) {
+    assert(heapSize < heap.size());
+    underlying[heapSize] = elem;
+    heap[heapSize] = heapSize;
+    heapSize++;
+    std::push_heap(heap.begin(), end(), comparator());
+  }
+
+  /// If capacity has been reached, the largest element is removed (i.e. heap keeps smallest)
+  /// If this is a min-heap (common in solux), then we are keeping everything larger than the offered value.
+  /// @returns true if the new element caused the previous top() to be ejected.
+  bool insertWithOverflow(const T& elem) {
+    if (heapSize < heap.size()) {
+      insert(elem);
+      return false;
+    }
+
+    // if the priority queue is full, then we only want to insert the new value if it is
+    // less than the current root.
+    if (Comp()(elem, top())) {
+      top() = elem; // overwrite the previous top
+      updateTop();
+      return true;
+    } else {
+      return false;
+    }
+  }
+
+};
+
 
 
 } // end namespace solux
