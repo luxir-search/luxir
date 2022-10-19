@@ -88,6 +88,13 @@ TEST(BasicTest, testPQ) {
     ejected = pq.insertWithOverflow(&vals[2]);            // 25, rejected
     ASSERT_EQ(&vals[2], ejected);
     ASSERT_EQ(pq.top(), 50.0);
+
+    valPtrs[0] = &vals[4];  // 40
+    valPtrs[1] = &vals[2];  // 25
+    solux::IndirectPQ<float, std::greater<>> pq2(vals, valPtrs, size_t(2));
+    ASSERT_EQ(pq2.size(), 2);
+    ASSERT_EQ(pq2.top(), 25.0f);
+    ASSERT_EQ(pq2.indexOfTop(), 2);
   }
 
   {
@@ -120,7 +127,7 @@ TEST(BasicTest, testPQ) {
     std::ranges::sort(sorted);
 
     std::vector<int*> ptrs(vals.size());
-    solux::IndirectPQ<int, std::greater<>> pq(vals, ptrs, false);
+    solux::IndirectPQ<int, std::greater<>> pq(vals, ptrs);
 
     std::vector<int> indexes(vals.size());
     solux::IndexedPQ<int, std::greater<>> indexedPQ(vals, indexes);

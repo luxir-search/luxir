@@ -140,9 +140,9 @@ public:
 class PackedTerm {
   char *ptr_;
 public:
-  static uint32_t getMaxSize(uint32_t size) noexcept { return size + 1; }
-
-  static uint32_t getExactSize(uint32_t size) noexcept { return size + 1; }
+  static constexpr uint32_t MAX_LEN = 255;
+  static constexpr uint32_t getMemSize(uint32_t size) noexcept { return size + 1; }
+  static constexpr uint32_t getExactMemSize(uint32_t size) noexcept { return size + 1; }
 
   // returns the number of bytes written to the target... either sz+1 or sz+2
   inline static uint32_t write(char *target, const void *data, uint32_t sz) noexcept {
@@ -152,7 +152,7 @@ public:
   }
 
   inline static char *write(MemPool &targetPool, const void *data, uint32_t sz) {
-    auto totalSz = getExactSize(sz);
+    auto totalSz = getExactMemSize(sz);
     auto target = targetPool.allocate(totalSz);
     write(target, data, sz);
     return target;
@@ -166,6 +166,14 @@ public:
   }
   PackedTerm(MemPool &target, std::string_view s) {
     ptr_ = write(target, s.data(), s.size());
+  }
+
+  // Expert: Copies this PackedTerm to the target.  The target should have at least the same
+  // memory size as this PackedTerm.  The target length is ignored and then overwritten.
+  // The number of bytes written is returned.
+  uint32_t copyTo(PackedTerm& target) const noexcept {
+    auto nbytes = getMemSize(size());
+    memcpy(target.ptr_, ptr_, nbytes);
   }
 
   // expert: should already point to an instance of this type

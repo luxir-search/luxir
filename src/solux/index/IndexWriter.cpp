@@ -62,7 +62,7 @@ public:
     auto fnameComp = [](const Segment& a, const Segment& b){ return b.fieldReader->name() < a.fieldReader->name(); };
     std::vector<Segment*> segPtrs(segs.size());
     // IndirectPQ<Segment, decltype(fnameComp)> fieldPQ(segs, segPtrs, false);
-    IndirectPQ<Segment, decltype(fnameComp)> fieldPQ(segs, segPtrs, false);
+    IndirectPQ<Segment, decltype(fnameComp)> fieldPQ(segs, segPtrs);
 
     std::vector<MergeFieldInfo> mergeFieldInfos;
     mergeFieldInfos.reserve(segs.size());
@@ -97,6 +97,25 @@ public:
   }
 
 private:
+
+  // add docs and positions from the provided DocsEnum
+  void addDocsPos(TextWriter& textWriter, DocsEnum& docsEnum, int32_t base) {
+    for(;;) {
+      int32_t docid = docsEnum.nextDoc();
+      if (docid == INT_MAX) break;
+      int32_t newDocid = base + docid;
+      textWriter.startDoc(newDocid);
+      docsEnum.startPositions();
+      int32_t lastPos = 0;
+      for(;;) {
+        auto pos = docsEnum.nextPosition();
+        if (pos == INT_MAX) break;
+        textWriter.addPositionDelta(pos - lastPos);
+        lastPos = pos;
+      }
+      textWriter.endDoc(newDocid);
+    }
+  }
 
   void mergeField(std::vector<MergeFieldInfo>& mergeFieldInfos) {
     MemPool& writerPool = origPool;  // needs to be different when we move to multi-threaded
@@ -134,6 +153,69 @@ private:
 
 
     MemPool readerPool; // TODO: can this be the same as writerPool?
+
+    if (allFlags & 0x01) {
+      auto readerPoolGuard = readerPool.rewindScopeGuard();
+      outputFieldInfo.flags |= 0x01;
+      TextWriter textWriter(postingsWriter);
+      textWriter.startField(&outputFieldInfo);
+
+      // Collect TermsEnum for each segment.  Keep track of the index so we can visit in ascending order one at a time.
+      struct TermsEnumIdx {
+        TermsEnum tenum;
+        size_t idx;
+      };
+      std::vector<TermsEnumIdx> tenums;  // TODO: a term enum may get pretty large... may not want contiguous if many segs?      std::vector<TermsEnum> tenums;
+      tenums.reserve(sortedFields.size());
+      std::vector<TermsEnumIdx*> tenumPtrs;
+      tenumPtrs.reserve(sortedFields.size());
+
+      for (size_t idx = 0; idx<tenums.size(); idx++) {
+        auto field = sortedFields[idx];
+        tenums.emplace_back(TermsEnumIdx{TermsEnum(readerPool, *field->seg->postingsReader, field->segFieldInfo), idx});
+        // Position on the first term.  If none, don't add to the PQ
+        if (tenums.back().tenum.nextTerm()) {
+          tenumPtrs.push_back(&tenums.back());
+        }
+      }
+
+      auto termCmp = [](const TermsEnumIdx& a, const TermsEnumIdx& b){
+        int cmp = b.tenum.term() <=> a.tenum.term();
+        return cmp < 0 || (cmp == 0 && b.idx < a.idx);  // tiebreak by index so we visit segments in order
+      };
+      IndirectPQ<TermsEnumIdx, decltype(termCmp)> termPQ(tenums, tenumPtrs, false);
+
+      // iterate through the terms in sorted order
+      while (termPQ.size() > 0) {
+        TermsEnumIdx& first = termPQ.top();
+        // Need to make a copy of the term since it will be invalidated after tenum.nextTerm()
+        // is called.  It needs to exist until the end of textWriter (currently).  See comments on startTerm()
+        // for ideas.
+        PackedTerm term(readerPool, std::string_view(first.tenum.term()));
+        textWriter.startTerm(term);
+
+        do {
+          TermsEnumIdx& entry = termPQ.top();
+          // need to create the docsEnum while the termsEnum is still positioned on the term.
+          DocsEnum docsEnum(readerPool, *sortedFields[entry.idx]->seg->postingsReader, entry.tenum);
+          addDocsPos(textWriter, docsEnum, sortedFields[entry.idx]->seg->base);
+
+          // advance that entry to the next term, removing from pq if exhausted.
+          if (entry.tenum.nextTerm()) {
+            termPQ.updateTop();
+          } else {
+            termPQ.removeTop();
+          }
+          // continue while more enums are positioned on the same term
+        } while (termPQ.size() > 0 && termPQ.top().tenum.term() == term);
+
+        textWriter.endTerm(term);
+      }
+
+      textWriter.endField();
+    }
+
+
     if (allFlags & 0x02) { // int column
       outputFieldInfo.flags |= 0x02;
       IntColWriter intColWriter(writerPool, postingsWriter, outputFieldInfo);
@@ -197,10 +279,7 @@ private:
 
 
       intColWriter.finish();
-    } else {
-      LOG_ERROR("Unknown Type!");
     }
-
   }
 
 

@@ -57,7 +57,7 @@ class IndirectPQ {
   void makeHeap() {
     std::make_heap(pointers.data(), end, ptrcomp);
   }
-  void fillPointers(std::span<T> arr) {
+  void fillPtrs(std::span<T> arr) {
     assert(pointers.size() >= arr.size());
     auto sz = size();
     for (size_t i=0; i<sz; i++) {
@@ -74,17 +74,24 @@ public:
   }
 
   /// Form an indirect priority queue of size initialSize, and limited in capacity to pointers.size()
-  explicit IndirectPQ(std::span<T*> pointers, size_t initialSize)
+  IndirectPQ(std::span<T*> pointers, size_t initialSize)
           : pointers(pointers), end(pointers.data() + initialSize), reference(nullptr) {
     makeHeap();
   }
 
+  /// Form an indirect priority queue of size initialSize, and limited in capacity to pointers.size()
+  IndirectPQ(std::span<T> arr, std::span<T*> pointers, size_t initialSize)
+          : pointers(pointers), end(pointers.data() + initialSize), reference(arr.data()) {
+    assert(arr.size() >= pointers.size());
+    assert(pointers.size() >= initialSize);
+    makeHeap();
+  }
 
-  IndirectPQ(std::span<T> arr, std::span<T*> pointers, bool pointersPrefilled=false)
+  IndirectPQ(std::span<T> arr, std::span<T*> pointers, bool fillPointers=true)
   : pointers(pointers), end(pointers.data() + arr.size()), reference(arr.data()) {
     auto sz = arr.size();
-    if (!pointersPrefilled) {
-      fillPointers(arr);
+    if (fillPointers) {
+      fillPtrs(arr);
     }
     makeHeap();
   }
@@ -205,11 +212,16 @@ public:
     update_heap_top(heap.begin(), end(), comparator());
   }
 
-  /// The returned reference will be invalidated by any insert.
-  T& removeTop() {
+  /// Returns the index of the removed element
+  index_type removeTopIndex() {
     std::pop_heap(heap.begin(), end(), comparator());
     --heapSize;
-    return underlying[heap[heapSize]];
+    return heap[heapSize];  // should we return the underlying index instead?
+  }
+
+  /// Any insert will invalidate / overwrite the element returned.
+  T& removeTop() {
+    return underlying[removeTopIndex()];
   }
 
   void insert(const T& elem) {

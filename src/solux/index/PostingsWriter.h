@@ -541,6 +541,11 @@ public:
   }
 
 
+  /// NOTE! The provided term ref should be valid for the lifetime of this TextWriter (or at least until endField())
+  // TODO: We could do better for merging... instead of having to keep all terms around in memory until the field
+  // ends, we could provide a callback or another signal (perhaps a bool return from endField()) to release
+  // the term storage.  We could also have a startTerm(std::string_view) and an associated pool that we could
+  // roll back after we flush a term block.
   void startTerm(TermRef term) {
     termList.push_back(term);  // we don't really need the term name at this point (could add in endTerm), but it might be nice for debugging / exceptions?
     docsFlushed = 0;

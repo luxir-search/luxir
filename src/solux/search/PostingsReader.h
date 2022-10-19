@@ -405,7 +405,7 @@ public:
     numTermBlocks = ((fieldInfo.nTerms-1) / Postings::TERMS_BLOCK_SIZE) + 1;
     termsIS = postingsReader.getInputStreamSeek(fieldInfo.termBlockIndexLoc);
     termBlockOffsets = reinterpret_cast<const int64_t*>(termsIS.ptr());  // offsets from termsLoc
-    currTerm = PackedTerm(pool.allocate(256)); // TODO: pass in?  this will allocate for each term if called in a loop.  Could also have an init() method to reuse inst?
+    currTerm = PackedTerm(pool.allocate(PackedTerm::getMemSize(PackedTerm::MAX_LEN)));
   }
 
   int32_t numTerms() const {
@@ -732,10 +732,12 @@ public:
     }
   }
 
+  /// number of documents containing the term
   int32_t numDocs() {
     return docfreq;
   }
 
+  /// sum of term freq across all documents (i.e. total number of appearances for this term)
   int32_t totalTermFreq() {
     return ttf;
   }

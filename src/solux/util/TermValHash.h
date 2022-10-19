@@ -28,9 +28,9 @@ class TermValRef : public TermRef {
 private:
 
 public:
-  static unsigned getMaxSize(unsigned strBytes) { return TermRef::getMaxSize(strBytes) + sizeof(V); }
+  static unsigned getMaxSize(unsigned strBytes) { return TermRef::getMemSize(strBytes) + sizeof(V); }
 
-  static unsigned getExactSize(unsigned strBytes) { return TermRef::getExactSize(strBytes) + sizeof(V); }
+  static unsigned getExactSize(unsigned strBytes) { return TermRef::getExactMemSize(strBytes) + sizeof(V); }
 
   // Expert!
   // create a reference to a ValKey pair that already exists in memory.
