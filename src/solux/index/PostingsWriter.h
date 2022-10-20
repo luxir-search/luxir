@@ -646,10 +646,6 @@ public:
   }
 
   void endField() {
-    // OPT: investigate inlining small fields in the terms index instead of pointing out to other files?  If we don't know how large the field will be,
-    // we could always do it after-the-fact if the other outputs are rewindable (i.e. all in memory.)  If not, we could make it so by always starting
-    // with new outputs for every field with first page in RAM.
-    // OPT: For many fields, the field index and the terms index should perhaps have the same structure (prefix compressed blocks?)
     flushTerms(true);
 
     // write index into the blocks of the terms dict
@@ -662,6 +658,7 @@ public:
     fieldInfo->sumTotalTermFreq = sumTotalTermFreq;
 
     fieldInfo->termBlockIndexLoc = seg_location(termOutput.streamNumber, termOutput.size());
+    // one way this assert can fail is if numTerms==0, but I think so far this always represents a bug elsewhere.
     assert((int)termBlockOffsets.size() == ((numTerms-1) / Postings::TERMS_BLOCK_SIZE) + 1);
     termOutput.write(&(termBlockOffsets[0]), termBlockOffsets.size() * sizeof(termBlockOffsets[0]) );
 

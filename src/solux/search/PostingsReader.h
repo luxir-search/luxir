@@ -668,6 +668,9 @@ class DocsEnum {
   }
 
 public:
+  /// sentinel value used for both docs and positions
+  static constexpr int32_t END = std::numeric_limits<int32_t>::max();
+
   // After this constructor has finished, this DocsEnum instance is independent of the TermsEnum instance.
   // This instance *does* rely on fieldInfo that was passed into the TermsEnum instance still being valid.
   DocsEnum(MemPool& pool, PostingsReader& postingsReader, TermsEnum& tenum,

@@ -291,7 +291,53 @@ namespace solux::test {
       if (currSeg < 0) { nextSegment(); }
       return TermsEnum(testIndex.pool, currentSegment()->postingsReader(), fieldInfo);
     }
+    DocsEnum createDocsEnum(TermsEnum& termsEnum) {
+      if (currSeg < 0) { nextSegment(); }
+      return DocsEnum(testIndex.pool, currentSegment()->postingsReader(), termsEnum);
+    }
 
+    // the format of the array is [docid, termfreq, pos1, pos2, ..., docid2, termfreq2, ...]
+    std::vector<int32_t>& readDocsAndPositions(std::vector<int32_t>& target, TermsEnum& termsEnum) {
+      DocsEnum docsEnum = createDocsEnum(termsEnum);
+      target.resize(0);
+      auto numDocs = 0;
+      for (;;) {
+        auto docid = docsEnum.nextDoc();
+        if (docid == DocsEnum::END) break;
+        numDocs++;
+        target.push_back(docid);
+        target.push_back(docsEnum.termFreq());
+        docsEnum.startPositions();
+        for (int32_t i = 0; i < docsEnum.termFreq(); i++) {
+          target.push_back(docsEnum.nextPosition());
+        }
+        EXPECT_EQ(docsEnum.nextPosition(), DocsEnum::END);
+      }
+      EXPECT_EQ(numDocs, docsEnum.numDocs());
+      return target;
+    }
+
+    std::vector<int32_t> readDocsAndPositions(TermsEnum& termsEnum) {
+      std::vector<int32_t> target;
+      return readDocsAndPositions(target, termsEnum);
+    }
+
+    std::vector<int32_t>& readDocsAndPositions(std::vector<int32_t>& target, DocsEnum& docsEnum) {
+      target.resize(0);
+      int32_t docid = docsEnum.nextDoc();
+      if (docid == DocsEnum::END) {
+        return target;
+      }
+      target.push_back(docid);
+      docsEnum.startPositions();
+      for(;;) {
+        int32_t pos = docsEnum.nextPosition();
+        if (pos != DocsEnum::END) {
+          target.push_back(pos);
+        }
+      }
+      return target;
+    }
 
   };
 

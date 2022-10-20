@@ -170,7 +170,7 @@ private:
       std::vector<TermsEnumIdx*> tenumPtrs;
       tenumPtrs.reserve(sortedFields.size());
 
-      for (size_t idx = 0; idx<tenums.size(); idx++) {
+      for (size_t idx = 0; idx<sortedFields.size(); idx++) {
         auto field = sortedFields[idx];
         tenums.emplace_back(TermsEnumIdx{TermsEnum(readerPool, *field->seg->postingsReader, field->segFieldInfo), idx});
         // Position on the first term.  If none, don't add to the PQ
