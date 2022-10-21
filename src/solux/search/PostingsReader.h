@@ -294,6 +294,10 @@ public:
     return nFields;
   }
 
+  // TODO: we could make a readFieldInfo(std::string_view fieldName) that is thread safe (doesn't modify the FieldReader)
+  // Although it might just be simpler to make a copy?
+  // IndexReader could return an array of const FieldReaders
+
   [[nodiscard]] bool seek(const std::string_view fieldName) {
     auto comparator = [&](const int32_t fieldOff, const std::string_view key) {
       auto fieldNameFound = fieldIS.readPackedTerm(fieldOffsetsLoc - fieldOff);
@@ -405,7 +409,7 @@ public:
     numTermBlocks = ((fieldInfo.nTerms-1) / Postings::TERMS_BLOCK_SIZE) + 1;
     termsIS = postingsReader.getInputStreamSeek(fieldInfo.termBlockIndexLoc);
     termBlockOffsets = reinterpret_cast<const int64_t*>(termsIS.ptr());  // offsets from termsLoc
-    currTerm = PackedTerm(pool.allocate(PackedTerm::getMemSize(PackedTerm::MAX_LEN)));
+    currTerm = PackedTerm(pool.alloc(PackedTerm::getMemSize(PackedTerm::MAX_LEN)));
   }
 
   int32_t numTerms() const {

@@ -68,7 +68,6 @@ TEST_F(MemPoolTest, alloc) {
 
   // now try custom allocator
   {
-    std::cout << "STARTING MAP" << std::endl;
     std::map<int, X, std::less<>, MemPool::allocator<std::pair<const int, X>>> map(pool.getAllocator());
     map.try_emplace(1, cons_calls, des_calls);
     ASSERT_EQ(cons_calls, start_cons_calls+1);
@@ -82,20 +81,51 @@ TEST_F(MemPoolTest, alloc) {
 #endif
   }
   ASSERT_EQ(cons_calls, des_calls);
+
+  start_size = pool.size();
+  start_cons_calls = cons_calls;
+
+  // now try MemPool with polymorphic allocator with standard vector
+  {
+    pmr::polymorphic_allocator<X> pmr_alloc(&pool);
+    std::vector<X, std::pmr::polymorphic_allocator<X>> myvec(pmr_alloc);
+    myvec.reserve(4);
+    myvec.emplace_back(cons_calls, des_calls);
+    ASSERT_EQ(cons_calls, start_cons_calls+1);
+    myvec.emplace_back(cons_calls, des_calls);
+    ASSERT_EQ(cons_calls, start_cons_calls+2);
+    ASSERT_TRUE(size_t(pool.size() - start_size) > sizeof(X)*myvec.size());
+  }
+  ASSERT_EQ(cons_calls, des_calls);
+
+  start_size = pool.size();
+  start_cons_calls = cons_calls;
+
+  // now try mempool as a memory_resource with std::pmr::vector
+  {
+    std::pmr::vector<X> myvec(&pool);
+    myvec.reserve(4);
+    myvec.emplace_back(cons_calls, des_calls);
+    ASSERT_EQ(cons_calls, start_cons_calls+1);
+    myvec.emplace_back(cons_calls, des_calls);
+    ASSERT_EQ(cons_calls, start_cons_calls+2);
+    ASSERT_TRUE(size_t(pool.size() - start_size) > sizeof(X)*myvec.size());
+  }
+  ASSERT_EQ(cons_calls, des_calls);
 }
 
 TEST_F(MemPoolTest, rewind) {
   MemPool pool;
   ASSERT_EQ(pool.size(), 0);
-  pool.allocate(3);
+  pool.alloc(3);
   ASSERT_EQ(pool.size(), 3);
-  char* a = pool.allocate(2);
+  char* a = pool.alloc(2);
   unused(a);
   auto savePoint = pool.getSavePoint();
   auto sz = pool.size();
-  char* b = pool.allocate(3);
+  char* b = pool.alloc(3);
   *b = 'b';
-  char* c = pool.allocate(4);
+  char* c = pool.alloc(4);
   *c = 'c';
   pool.rewind(savePoint);
   // check that the size matches again
@@ -104,7 +134,7 @@ TEST_F(MemPoolTest, rewind) {
 
 
 #ifndef MEMPOOL_MALLOC
-  char* bb = pool.allocate(3);
+  char* bb = pool.alloc(3);
   ASSERT_EQ(b, bb);
   assert(*bb != 'b');  // in debug mode, we should have stomped on the memory
 #ifdef NDEBUG
@@ -120,9 +150,9 @@ TEST_F(MemPoolTest, rewind) {
   sz = pool.size();
   {
     auto guard = pool.rewindScopeGuard();
-    char* x = pool.allocate(3);
+    char* x = pool.alloc(3);
     *x = 'x';
-    char* y = pool.allocate(4);
+    char* y = pool.alloc(4);
     *y = 'y';
     ASSERT_GT(pool.size(), sz);
   }
@@ -147,7 +177,7 @@ TEST_F(MemPoolTest, randRewind) {
     int nallocs = rng.rint(6);
     for (int i=0; i<nallocs; i++) {
       int allocSz = rng.rint(1, MemPool::BYTE_BLOCK_SIZE);
-      char* x = pool.allocate(allocSz);
+      char* x = pool.alloc(allocSz);
       x[0] = 'A';  // touch beginning and end
       x[allocSz-1] = 'A';
     }
@@ -159,18 +189,18 @@ TEST_F(MemPoolTest, randRewind) {
 TEST_F(MemPoolTest, boundary) {
   MemPool pool;
   size_t sz = MemPool::BYTE_BLOCK_SIZE;
-  char* a = pool.allocate(1);
+  char* a = pool.alloc(1);
   unused(a);
   auto savePoint = pool.getSavePoint();
   auto poolSz = pool.size();
   char* p = pool.ptr();
-  char* b = pool.allocate(sz - 1);  // should be room for this.
+  char* b = pool.alloc(sz - 1);  // should be room for this.
   ASSERT_EQ(p, b);
   pool.rewind(savePoint);
   ASSERT_EQ(poolSz, pool.size());
   savePoint = pool.getSavePoint();
   ASSERT_EQ(p, pool.ptr());
-  char* bb = pool.allocate(sz);  // should not be room for this.
+  char* bb = pool.alloc(sz);  // should not be room for this.
   ASSERT_NE(p, bb);
   *bb = 'b';
 
@@ -181,7 +211,7 @@ TEST_F(MemPoolTest, boundary) {
   mem[0] = 'A'; // try to avoid the malloc being optimized away
 
   ASSERT_EQ(p, pool.ptr());
-  char* bbb = pool.allocate(sz);  // should not be room for this, but when we allocate new space, we should have remembered previous buffer!
+  char* bbb = pool.alloc(sz);  // should not be room for this, but when we allocate new space, we should have remembered previous buffer!
   ASSERT_EQ(bb,bbb);
 #ifdef NDEBUG
   // check if we got the same buffer in non-debug mode and that the data wasn't touched

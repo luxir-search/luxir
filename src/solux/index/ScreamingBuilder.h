@@ -16,7 +16,8 @@ class ScreamingBuilder : public screaming::Builder<ScreamingBuilder> {
   OutputStream& out;
 public:
   ScreamingBuilder(MemPool& pool, OutputStream& out)
-  : Builder(pool.allocate(screaming::BitSet::SPARSE_CONTAINER_SIZE), pool.allocate(screaming::BitSet::DENSE_CONTAINER_SIZE), pool.allocate(SCRATCH_SIZE), SCRATCH_SIZE), pool(pool), out(out) {
+  : Builder(pool.alloc(screaming::BitSet::SPARSE_CONTAINER_SIZE), pool.alloc(screaming::BitSet::DENSE_CONTAINER_SIZE),
+            pool.alloc(SCRATCH_SIZE), SCRATCH_SIZE), pool(pool), out(out) {
   }
 
   ScreamingBuilder(MemPool& pool, OutputStream& out, void* sparseContainer, void* denseContainer, void* scratchBuf, uint32_t scratchSize)
@@ -30,7 +31,7 @@ protected:
   }
 
   void *allocateScratch() {
-    return pool.allocate(scratchSize);
+    return pool.alloc(scratchSize);
   }
 
   void deallocateScratch(void *ptr) {

@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <assert.h>
 #include <unordered_set>
+#include <memory_resource>
 
 #include "solux_util.h"
 
@@ -74,10 +75,29 @@ u_ptr<T> make_unique_at(void* storage, Args&&... args) {
 }
 
 
-
-class MemPool {
+/// MemPool implements pmr::memory_resource, but it can also be used directly without virtual dispatch
+/// overhead.  Just use getAllocator() for a non-pmr allocator, or use alloc() functions directly.
+/// Do not use allocate() directly as is a pmr::memory_resource method that will use virtual methods.
+class MemPool final : public std::pmr::memory_resource {
 public:
 
+    // implement pmr::memory_resource
+    // NOTE: this will mean that allocate() dispatches to a virtual method!
+    // if you want to avoid that, use alloc() instead.
+private:
+  void *do_allocate(size_t __bytes, size_t __alignment) override {
+    return alloc(__bytes, __alignment);
+  }
+
+  void do_deallocate(void *__p, size_t __bytes, size_t __alignment) override {
+      unused(__p, __bytes, __alignment);
+  }
+
+  bool do_is_equal(const memory_resource &__other) const noexcept override {
+    return this == &__other;
+  }
+
+public:
   /// A custom allocator that uses a MemPool. All allocators that use the same pool are
   /// considered equal.
   template <typename T> class allocator {
@@ -91,8 +111,7 @@ public:
     }
 
     T* allocate(std::size_t n) {
-      pool.align(alignof(T));
-      return static_cast<T*>((void*)pool.allocate(n * sizeof(T)));
+      return static_cast<T*>((void*)pool.alloc(n * sizeof(T), alignof(T)));
     }
 
     void deallocate(T* p, std::size_t n) {
@@ -138,7 +157,7 @@ public:
 
   template <typename T, typename... Args>
   u_ptr<T> make_unique(Args&&... args) {
-    char* storage = allocate(sizeof(T));
+    char* storage = alloc(sizeof(T));
     return make_unique_at<T>(storage, std::forward<Args>(args)...);
   }
 
@@ -232,8 +251,21 @@ public:
   }
 
 
-  char *allocate(size_t size) {
+  char *alloc(size_t size) {
 #ifndef MEMPOOL_MALLOC
+    int newEnd = reserveBBP(size);
+    auto p = ptr();
+    pos = newEnd;
+    return p;
+#else
+    allocateBBP(size);
+    return pointers.back().get();
+#endif
+  }
+
+  char *alloc(size_t size, size_t alignment) {
+#ifndef MEMPOOL_MALLOC
+    align(alignment);
     int newEnd = reserveBBP(size);
     auto p = ptr();
     pos = newEnd;
@@ -261,8 +293,11 @@ public:
 
   void align(size_t alignment = 8) {
 #ifndef MEMPOOL_MALLOC
+    // Do the alignment on the pointer and not the position so that we can handle larger alignments than the default
     // this can bring us past the end of the block, but that's ok
-    pos = (pos + (alignment - 1)) & -alignment;
+    auto p = ptr();
+    char* newPtr = (char*)(((size_t)p + alignment - 1) & ~(alignment - 1));
+    pos = newPtr - buffer;
 #else
 #endif
   }

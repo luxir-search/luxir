@@ -340,7 +340,7 @@ static void BM_invertTemplate(benchmark::State& state) {
   static constexpr int RAND_POOL_SIZE = 16384;  // make power of two so we can efficiently mask.
 
   // block of random data
-  char* data = pool.allocate(RAND_POOL_SIZE);
+  char* data = pool.alloc(RAND_POOL_SIZE);
   auto data64 = (uint64_t*)data;
   for (int i=0; i<(int)(RAND_POOL_SIZE/sizeof(uint64_t)); i++) {
     data64[i] = r();

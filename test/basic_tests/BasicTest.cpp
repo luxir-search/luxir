@@ -20,7 +20,7 @@ TEST(BasicTest, testCompiler) {
     EXPECT_EQ(4, sizeof(unsigned));
 
     SOLUX_PACKED_START
-    struct s2 {
+    struct alignas(1) s2 {
       int64_t x;
       char c;
     } SOLUX_PACKED_END;

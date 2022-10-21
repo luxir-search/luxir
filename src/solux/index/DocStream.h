@@ -166,7 +166,7 @@ public:
 //     want to avoid the contention.
 
 SOLUX_PACKED_START
-class DocFreqPosStream {
+class alignas(1) DocFreqPosStream {
   Stream docs;
   Stream positions;
   int lastDoc;      // we only write lastDoc when we receive a new doc

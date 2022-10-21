@@ -47,7 +47,7 @@ public:
   template<typename... Args>
   void initTV(MemPool &pool, const std::string_view& str, Args &&... args) {
     // pool.align(); // Cost=~4 bytes per unique term... doesn't seem to be worth it from benchmarks so far.
-    auto target = pool.allocate(getExactSize(str.size()));
+    auto target = pool.alloc(getExactSize(str.size()));
     new(target) V(std::forward<Args>(args)...);    // construct the value
     auto strStart = target + sizeof(V);
     TermRef::write(strStart, str.data(), str.size());  // copy the string following the value

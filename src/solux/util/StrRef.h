@@ -79,7 +79,7 @@ public:
 
   StrRef(MemPool &target, const void *data, uint32_t len) {
     assert((len & 0xffff0000) == 0);
-    auto p = target.allocate(len);
+    auto p = target.alloc(len);
     memcpy(p, data, len);
     init(p, len);
   }
@@ -153,7 +153,7 @@ public:
 
   inline static char *write(MemPool &targetPool, const void *data, uint32_t sz) {
     auto totalSz = getExactMemSize(sz);
-    auto target = targetPool.allocate(totalSz);
+    auto target = targetPool.alloc(totalSz);
     write(target, data, sz);
     return target;
   }

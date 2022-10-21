@@ -41,14 +41,15 @@ BM_Alloc_MemPool         716 ns          716 ns       977285
 -------------------------------------------------------------------
 Benchmark                         Time             CPU   Iterations
 -------------------------------------------------------------------
-BM_AllocFree_default/1     10608454 ns        30434 ns         1000
-BM_AllocFree_default/8     15147544 ns        86153 ns         1000
-BM_AllocFree_default/16    16755401 ns       158202 ns         1000
-BM_AllocFree_std_pool/1    12475539 ns        31116 ns         1000
-BM_AllocFree_std_pool/8    16707314 ns        85468 ns         1000
-BM_AllocFree_std_pool/16   18341609 ns       155103 ns         1000
-BM_AllocSmall_std_mono         1442 ns         1442 ns       482492
-BM_AllocSmall_MemPool          1473 ns         1473 ns       477944
+BM_AllocSmall_std             14960 ns        14960 ns        47626
+BM_AllocSmall_std_mono         1415 ns         1415 ns       487702
+BM_AllocSmall_MemPool          1437 ns         1437 ns       485280
+BM_AllocFree_default/1     10513498 ns     10513488 ns           67
+BM_AllocFree_default/8     12343269 ns     11600178 ns           59
+BM_AllocFree_default/16    16736317 ns     14930504 ns           49
+BM_AllocFree_std_pool/1    12306869 ns     12306774 ns           57
+BM_AllocFree_std_pool/8    15114711 ns     14096988 ns           50
+BM_AllocFree_std_pool/16   17871094 ns     16231363 ns           43
  */
 
 
@@ -64,38 +65,30 @@ public:
   };
 };
 
-/*
-// wrapper around standard allocator (since type isn't available in c++ standards?)
-template <size_t initSize, size_t defaultAlignment>
-class default_allocator : public std::pmr::memory_resource {
-  std::allocator<> allocator;
+
+// wrapper around standard allocator that keeps track of all it's pointers
+class default_allocator {
+  std::vector<std::unique_ptr<char[]>> pointers;
 public:
   default_allocator() {
-
   }
 
-  void *allocate(std::size_t bytes, std::size_t alignment = defaultAlignment) {
-    return allocator.allocate(bytes, alignment);
-  };
-  void *deallocate(void* ptr, std::size_t bytes, std::size_t alignment = defaultAlignment) {
-    return allocator.deallocate(ptr, bytes, alignment);
+  void *allocate(std::size_t bytes, std::size_t alignment = 1) {
+    void *ptr = new(std::align_val_t(alignment)) char[bytes];
+    pointers.emplace_back(std::unique_ptr<char[]>((char*)ptr));
+    return &*pointers.back().get();
   };
 };
-*/
 
-  /*
-// wrapper to change default initSize and align size. This doesn't inherit from me
-template <size_t initSize, size_t defaultAlignSize>
-class pmr_wrapper {
-public:
-  std::pmr::monotonic_buffer_resource
-  void* allocate(std::size_t bytes, std::size_t alignment = defaultAlignSize) {
 
+template <class Allocator>
+static char* alloc(Allocator& allocator, size_t bytes) {
+  if constexpr (std::is_same_v<Allocator, MemPool>) {
+    return (char*)allocator.alloc(bytes);
+  } else {
+    return (char*)allocator.allocate(bytes);
   }
-
-
-};
-*/
+}
 
 template <class Allocator>
 static uint64_t smallAlloc(solux::Rng& rng) {
@@ -103,7 +96,10 @@ static uint64_t smallAlloc(solux::Rng& rng) {
   auto info = rng();
   for (int i=0; i<500; i++) {   // 500 allocations should fit in first block
     auto sz = (rng()&0x003f)+1;  // up to 64 bytes
-    char* ptr = (char*)allocator.allocate(sz);
+
+    // If the Allocator is of type MemPool, use alloc method else use allocate method.
+    char* ptr = alloc<Allocator>(allocator, sz);
+
     if (ptr == nullptr) {
       std::cout << "ERROR! null pointer!" << std::endl;
     }
@@ -125,6 +121,10 @@ inline void benchAlloc(benchmark::State& state) {
   }
 };
 
+static void BM_AllocSmall_std(benchmark::State& state) {
+  benchAlloc<default_allocator>(state);
+}
+
 static void BM_AllocSmall_std_mono(benchmark::State& state) {
   // benchAlloc<std::pmr::monotonic_buffer_resource>(state);
   benchAlloc<pmr_resource<32768,1>>(state);  // test monotonic_buffer_resource with same starting size as MemPool
@@ -144,7 +144,8 @@ static uint64_t allocFree(int iterations, int taskno, Allocator& allocator) {
   solux::Rng rng(taskno+1);
   auto info = rng();
   int max = 1024;
-  char** buffers = (char**)allocator.allocate(sizeof(char*)*max);
+  char** buffers = (char**) alloc<Allocator>(allocator, sizeof(char *) * max);
+
   int nbuf = 0;
 
   for (int i=0; i<iterations; i++) {
@@ -152,7 +153,7 @@ static uint64_t allocFree(int iterations, int taskno, Allocator& allocator) {
     for (int j = 0; j<nalloc; j++) {
       auto sz = ((rng() & 0x00f) + 1) * 16;  // only 16 different allocation sizes (which are multiples of 16)
       // should a good scenario for a pool allocator
-      char *ptr = (char *) allocator.allocate(sz);
+      char *ptr = (char *) alloc<Allocator>(allocator, sz);
       if (ptr == nullptr) {
         std::cout << "ERROR! null pointer!" << std::endl;
       }
@@ -193,7 +194,7 @@ static uint64_t allocFree(int iterations, int taskno, Allocator& allocator) {
 // minimal work to test that threading isn't introducing too much overhead
 template <class Allocator>
 static uint64_t allocFreeDummy(int iterations, int taskno, Allocator& allocator) {
-  char* ptr = (char*)allocator.allocate(1);
+  char* ptr = (char*) allocator.alloc(1);
   uint64_t ret = (uint64_t)ptr;
   allocator.deallocate(ptr,1);
   return ret + taskno + iterations;
@@ -220,6 +221,7 @@ inline void benchAllocFree(benchmark::State& state) {
   }
 };
 
+BENCHMARK(BM_AllocSmall_std);
 BENCHMARK(BM_AllocSmall_std_mono);
 BENCHMARK(BM_AllocSmall_MemPool);
 
