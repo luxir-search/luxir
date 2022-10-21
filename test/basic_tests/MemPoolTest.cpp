@@ -17,6 +17,24 @@ public:
   X(int& cons_calls, int& des_calls) : cons_calls(cons_calls), des_calls(des_calls) {
     this->cons_calls++;
   }
+
+  X(const X& other) : cons_calls(other.cons_calls), des_calls(other.des_calls) {
+    // std::cout << "X COPY CONSTRUCTOR CALLED!" << std::endl;
+    this->cons_calls++;
+  }
+
+  /*  If you use emplace() rather than try_emplace() and call with emplace(1,X(2,3))
+   *  then you will need a copy or move constructor to work correctly.
+  X(const X& other) : cons_calls(other.cons_calls), des_calls(other.des_calls) {
+    // std::cout << "X COPY CONSTRUCTOR CALLED!" << std::endl;
+    this->cons_calls++;
+  }
+
+  X(X&& other) : cons_calls(other.cons_calls), des_calls(other.des_calls) {
+    // std::cout << "X MOVE CONSTRUCTOR CALLED!" << std::endl;
+  }
+  */
+
   ~X() {
     des_calls++;
   }
@@ -28,6 +46,7 @@ TEST_F(MemPoolTest, alloc) {
   MemPool pool;
   int cons_calls = 0;
   int des_calls = 0;
+  auto start_size = pool.size();
   {
     auto x = pool.make_unique<X>(cons_calls, des_calls);
     auto y = pool.make_unique<X>(cons_calls, des_calls);
@@ -36,9 +55,33 @@ TEST_F(MemPoolTest, alloc) {
     ASSERT_TRUE(z == nullptr);
     ASSERT_EQ(cons_calls, 3);
     ASSERT_EQ(des_calls, 0);
+
+#ifndef MEMPOOL_MALLOC
+    ASSERT_EQ(pool.size()-start_size, 3*sizeof(X));
+#endif
   }
   ASSERT_EQ(cons_calls, 3);
   ASSERT_EQ(des_calls, 3);
+
+  start_size = pool.size();
+  int start_cons_calls = cons_calls;
+
+  // now try custom allocator
+  {
+    std::cout << "STARTING MAP" << std::endl;
+    std::map<int, X, std::less<>, MemPool::allocator<std::pair<const int, X>>> map(pool.getAllocator());
+    map.try_emplace(1, cons_calls, des_calls);
+    ASSERT_EQ(cons_calls, start_cons_calls+1);
+    map.try_emplace(2, cons_calls, des_calls);
+    ASSERT_EQ(cons_calls, start_cons_calls+2);
+    map.try_emplace(3, cons_calls, des_calls);
+    ASSERT_EQ(cons_calls, start_cons_calls+3);
+
+#ifndef MEMPOOL_MALLOC
+    ASSERT_TRUE(size_t(pool.size() - start_size) > sizeof(*map.begin())*map.size());
+#endif
+  }
+  ASSERT_EQ(cons_calls, des_calls);
 }
 
 TEST_F(MemPoolTest, rewind) {

@@ -73,8 +73,44 @@ u_ptr<T> make_unique_at(void* storage, Args&&... args) {
   return u_ptr<T>(pointer);
 }
 
+
+
 class MemPool {
 public:
+
+  /// A custom allocator that uses a MemPool. All allocators that use the same pool are
+  /// considered equal.
+  template <typename T> class allocator {
+  public:
+    using value_type = T;
+    MemPool& pool;
+    explicit allocator(MemPool& pool) : pool(pool) {
+    }
+    // We need this templated to work for classes like std::map
+    template <typename U> allocator(const allocator<U>& other) : pool(other.pool) {
+    }
+
+    T* allocate(std::size_t n) {
+      pool.align(alignof(T));
+      return static_cast<T*>((void*)pool.allocate(n * sizeof(T)));
+    }
+
+    void deallocate(T* p, std::size_t n) {
+    }
+
+    template <typename U> bool operator==(const allocator<U>& other) const {
+      return &pool == &other.pool;
+    }
+    template <typename U> bool operator!=(const allocator<U>& other) const {
+      return !(*this == other);
+    }
+  };
+
+  allocator<char> getAllocator() {
+    return allocator<char>(*this);
+  }
+
+
 #ifndef MEMPOOL_MALLOC
   using save_point = char *;
 #else
