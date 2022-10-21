@@ -146,8 +146,8 @@ if(ROBIN_HOOD_HASHING)
   target_include_directories(solux_lib PRIVATE ${ROBIN_HOOD_HASHING_INCLUDE_DIRS})
 endif()
 
-find_path(PARALLEL_HASHMAP_INCLUDE_DIRS "parallel_hashmap/btree.h")
-target_include_directories(solux_lib PRIVATE ${PARALLEL_HASHMAP_INCLUDE_DIRS})
+find_path(GTL_INCLUDE_DIRS "gtl/bit_vector.hpp")
+target_include_directories(solux_lib PRIVATE ${GTL_INCLUDE_DIRS})
 
 target_link_libraries(solux_lib PRIVATE TBB::tbb)
 target_link_libraries(solux_lib PRIVATE xxHash::xxhash)

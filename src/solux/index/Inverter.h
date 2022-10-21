@@ -2,7 +2,7 @@
 
 #include <algorithm>
 #include <boost/sort/spreadsort/string_sort.hpp>
-#include <parallel_hashmap/phmap.h>
+#include "gtl/phmap.hpp"
 #include "solux/util/MemPool.h"
 #include "solux/FieldType.h"
 #include "solux/util/TermValHash.h"
@@ -28,7 +28,8 @@ private:
 
   // TODO: this is temporary... we should get FieldTypes and TokenChains from the schema somehow
   // and TokenChains should not be shared across different threads.
-  phmap::flat_hash_map<std::string, std::pair<std::unique_ptr<FieldType>, std::unique_ptr<TokenChain>>> typeInfo;
+  gtl::flat_hash_map<std::string, std::pair<std::unique_ptr<FieldType>, std::unique_ptr<TokenChain>>> typeInfo;
+
 public:
   MemPool pool;
 
@@ -315,7 +316,7 @@ public:
   // support would be good here.  Or we could add to our MemPool and manually destruct later.
   // This could also be a Set with a little more work since the fieldname is already in the value.
   // We don't want the values to move since clients can cache and reuse when indexing.
-  phmap::flat_hash_map<std::string, std::unique_ptr<IndexHandler>> indexHandlers;
+  gtl::flat_hash_map<std::string, std::unique_ptr<IndexHandler>> indexHandlers;
 
 
   // The returned reference will be valid for the duration of indexing this block.

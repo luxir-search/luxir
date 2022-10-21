@@ -3,7 +3,7 @@
 #include "solux/util/solux_util.h"
 #include "solux/util/StrRef.h"
 #include "solux/util/TermValHash.h"
-#include <parallel_hashmap/phmap.h>
+#include "gtl/phmap.hpp"
 #ifdef ROBIN_HOOD_HASHING
 #include <robin_hood.h>
 #endif
@@ -13,10 +13,10 @@ using namespace solux;
 
 
 template<class T, class Hash, class Eq, class Alloc = std::allocator<T>>
-class flat_set : public phmap::flat_hash_set<T, Hash, Eq, Alloc> {
+class flat_set : public gtl::flat_hash_set<T, Hash, Eq, Alloc> {
 public:
-  using Base = phmap::priv::raw_hash_set<
-          phmap::priv::FlatHashSetPolicy<T>, Hash, Eq, Alloc>;
+  using Base = gtl::priv::raw_hash_set<
+          gtl::priv::FlatHashSetPolicy<T>, Hash, Eq, Alloc>;
   using iterator = typename Base::iterator;
 
 
@@ -245,16 +245,16 @@ public:
     return set.capacity() * (sizeof(typename phtype::key_type)+1);  // this will only be correct for flat set?
   }
 };
-using PHFlatSet = PHSet<phmap::flat_hash_set<TermValRef<FakeDocStream>,TestHasher,PackedTermEqual>>;
-using PHFlatParSet = PHSet<phmap::parallel_flat_hash_set<TermValRef<FakeDocStream>,TestHasher,PackedTermEqual>>;
-using PHNodeSet = PHSet<phmap::node_hash_set<TermValRef<FakeDocStream>,TestHasher,PackedTermEqual>>;
+using PHFlatSet = PHSet<gtl::flat_hash_set<TermValRef<FakeDocStream>,TestHasher,PackedTermEqual>>;
+using PHFlatParSet = PHSet<gtl::parallel_flat_hash_set<TermValRef<FakeDocStream>,TestHasher,PackedTermEqual>>;
+using PHNodeSet = PHSet<gtl::node_hash_set<TermValRef<FakeDocStream>,TestHasher,PackedTermEqual>>;
 
 
 
 class PHFlatMap {
 public:
   MemPool& pool;
-  phmap::flat_hash_map<PackedTerm, FakeDocStream, TestHasher, PackedTermEqual> map;
+  gtl::flat_hash_map<PackedTerm, FakeDocStream, TestHasher, PackedTermEqual> map;
 
   PHFlatMap(MemPool& pool, int initialCapacity) : pool(pool), map(initialCapacity) {
   }
@@ -434,8 +434,8 @@ static void BM_invertTemplate(benchmark::State& state) {
 // TODO: try different sizes... could just be a sizing / resizing issue?  For that, need key sizing.
 
 
-using StrPHFlatMap = SimpleMap<phmap::flat_hash_map<std::string, FakeDocStream, TestHasher, PackedTermEqual>>;
-using SVPHFlatMap = SimpleMap<phmap::flat_hash_map<std::string_view, FakeDocStream, TestHasher, PackedTermEqual>>;
+using StrPHFlatMap = SimpleMap<gtl::flat_hash_map<std::string, FakeDocStream, TestHasher, PackedTermEqual>>;
+using SVPHFlatMap = SimpleMap<gtl::flat_hash_map<std::string_view, FakeDocStream, TestHasher, PackedTermEqual>>;
 using SVstdMap = SimpleMap<std::unordered_map<std::string_view, FakeDocStream, TestHasher, PackedTermEqual>>;
 
 // BENCHMARK(BM_invertTemplate<OldTermValHash>); // doesn't work, so we'll use this longer form
@@ -501,7 +501,7 @@ BM_invertSVstdMap_mean            64080090 ns     64080268 ns           60 fp=11
 [[maybe_unused]] void BM_dealloc(benchmark::State& state) {
   MemPool pool;
   // using Set = phmap::flat_hash_set<TermValRef<FakeDocStream>,TestHasher,PackedTermEqual>;
-  using Set = phmap::flat_hash_set<std::string_view>;
+  using Set = gtl::flat_hash_set<std::string_view>;
   Set* set;
 
   auto sv = std::string_view("hello");

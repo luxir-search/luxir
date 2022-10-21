@@ -62,7 +62,7 @@ public:
 
 private:
   std::string name;
-  phmap::parallel_flat_hash_map<std::string, std::shared_ptr<Collection>> collections;
+  gtl::parallel_flat_hash_map<std::string, std::shared_ptr<Collection>> collections;
   friend class SoluxNode;
 };
 

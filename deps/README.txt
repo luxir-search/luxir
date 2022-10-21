@@ -3,7 +3,7 @@ Building
 
 Installing dependencies via vcpkg:
 $ cd /opt/vcpkg
-$ ./vcpkg install boost gtest benchmark xxhash parallel-hashmap protobuf grpc spdlog
+$ ./vcpkg install boost gtest benchmark xxhash gtl protobuf grpc spdlog
 $ ./vcpkg install robin-hood-hashing   #optional... see MapBM.cpp
 # TODO: while having all of boost installed is useful for development, it drags in a ton of dependencies +
 # build time in vcpkg.  We should narrow this to just the parts of boost we need.
