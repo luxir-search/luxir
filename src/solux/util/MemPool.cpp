@@ -1,6 +1,7 @@
 
 #include "MemPool.h"
 
+namespace solux {
 
 MemPool::MemPool() {
   nextBuffer();
@@ -97,3 +98,5 @@ void MemPool::_rewind(const MemPool::save_point& savePoint, uint32_t buffersToSa
   pos = savePoint - buffer;
 }
 #endif
+
+} // end namespace solux

@@ -49,6 +49,30 @@
 // these pointers to get how much memory was used for an operation as well.
 //
 
+
+namespace solux {
+
+// a deleter that only calls the destructor but doesn't delete the memory.
+template <typename T>
+struct no_delete {
+  void operator()(T* ptr) {
+    ptr->~T();
+  }
+};
+
+/// solux::u_ptr<T> is a unique_ptr that calls the destructor but doesn't call delete.
+/// It can be used to allocate objects from a pool but track the lifetime outside of the pool.
+/// The pool should obviously not be rewound or destroyed while there are still u_ptrs to objects.
+template <typename T>
+using u_ptr = std::unique_ptr<T, no_delete<T>>;
+
+/// Make a unique_ptr to T at a given address.
+template <typename T, typename... Args>
+u_ptr<T> make_unique_at(void* storage, Args&&... args) {
+  T* pointer = new (storage) T(std::forward<Args>(args)...);
+  return u_ptr<T>(pointer);
+}
+
 class MemPool {
 public:
 #ifndef MEMPOOL_MALLOC
@@ -76,6 +100,17 @@ public:
   /** Current head buffer */
   char *buffer = nullptr;
 
+  template <typename T, typename... Args>
+  u_ptr<T> make_unique(Args&&... args) {
+    char* storage = allocate(sizeof(T));
+    return make_unique_at<T>(storage, std::forward<Args>(args)...);
+  }
+
+  template <typename T, typename... Args>
+  u_ptr<T> make_unique_align(size_t alignment, Args&&... args) {
+    align(alignment);
+    return make_unique<T>(std::forward<Args>(args)...);
+  }
 
   // TODO: keep track of high water mark?
   // TODO: keep debugging statistics? (number of pool allocations, size breakdown, wasted space at end of blocks, etc..)
@@ -89,16 +124,18 @@ public:
   // TODO: accept an upstream allocator / memory resource
 
   MemPool(const MemPool &) = delete;
-  MemPool& operator=(const MemPool&) = delete;
+
+  MemPool &operator=(const MemPool &) = delete;
 
   MemPool();
+
   ~MemPool();
 
 
   // TODO: avoid using ptr() directly since it won't work when switching to malloc
-  char* ptr() { return buffer + pos; }
+  char *ptr() { return buffer + pos; }
 
-  char* ptr(int bbAddr) const {
+  char *ptr(int bbAddr) const {
 #ifndef MEMPOOL_MALLOC
     return buffers[bbAddr >> BYTE_BLOCK_SHIFT] + (bbAddr & BYTE_BLOCK_MASK);
 #else
@@ -159,7 +196,7 @@ public:
   }
 
 
-  char* allocate(size_t size) {
+  char *allocate(size_t size) {
 #ifndef MEMPOOL_MALLOC
     int newEnd = reserveBBP(size);
     auto p = ptr();
@@ -171,13 +208,13 @@ public:
 #endif
   }
 
-    // do allocation and return both the normal pointer as well as the short pool specific pointer (bbptr)
-    std::pair<char *, int> allocateAddrs(uint32_t size) {
+  // do allocation and return both the normal pointer as well as the short pool specific pointer (bbptr)
+  std::pair<char *, int> allocateAddrs(uint32_t size) {
 #ifndef MEMPOOL_MALLOC
     int newEnd = reserveBBP(size);
     int bbAddr = bbAddress();
     auto p = ptr();
-      pos = newEnd;
+    pos = newEnd;
     return {p, bbAddr};
 #else
     auto bbAddr = allocateBBP(size);
@@ -186,13 +223,13 @@ public:
 #endif
   };
 
-    void align() {
+  void align(size_t alignment = 8) {
 #ifndef MEMPOOL_MALLOC
-        unsigned align = 8;
-      pos = (pos + (align - 1)) & -align;
+    // this can bring us past the end of the block, but that's ok
+    pos = (pos + (alignment - 1)) & -alignment;
 #else
 #endif
-    }
+  }
 
   template<class T>
   int allocateTypeAligned(T *&out) {
@@ -208,23 +245,23 @@ public:
 #endif
   }
 
-  bool scribble(char* p, size_t len) {
+  bool scribble(char *p, size_t len) {
     memset(p, SCRIBBLE_CHAR, len);
     return true;
   }
 
-  void _rewind(const save_point& savePoint, uint32_t buffersToSave);
+  void _rewind(const save_point &savePoint, uint32_t buffersToSave);
 
   /// Rewinds to the rewindPoint, effectively deallocating all allocations after that point.
   /// buffersToSave is the number of buffers to hold in reserve for use during subsequent pool expansions.
   /// If you are going to be repeating some type of work you just did, and hence expect the same order of
   /// magnitude of memory allocation, consider passing INT_MAX.  Otherwise, 1 may be a good general purpose choice.
   /// 0 may be better if one has many pools.
-  void rewind(const save_point& savePoint, uint32_t buffersToSave=1) {
+  void rewind(const save_point &savePoint, uint32_t buffersToSave = 1) {
 #ifndef MEMPOOL_MALLOC
     if (savePoint >= buffer && savePoint <= buffer + BYTE_BLOCK_SIZE) {  // TODO: check boundary condition here...
       // fast path: same buffer
-      assert(scribble(savePoint, ptr()-savePoint));  // scribble from the save point to the current point
+      assert(scribble(savePoint, ptr() - savePoint));  // scribble from the save point to the current point
       // if sp==buffer+pos, then pos=sp-buffer to restore.
       pos = savePoint - buffer;
     } else {
@@ -245,18 +282,24 @@ public:
   }
 
   class ScopeGuard {
-    MemPool& pool;
+    MemPool &pool;
     save_point savePoint;
   public:
-    explicit ScopeGuard(MemPool& pool, const save_point& savePoint) : pool(pool), savePoint(savePoint){}
-    explicit ScopeGuard(MemPool& pool) : pool(pool), savePoint(pool.getSavePoint()){}
+    explicit ScopeGuard(MemPool &pool, const save_point &savePoint) : pool(pool), savePoint(savePoint) {}
+
+    explicit ScopeGuard(MemPool &pool) : pool(pool), savePoint(pool.getSavePoint()) {}
+
     ~ScopeGuard() {
       pool.rewind(savePoint);
     }
-    ScopeGuard(const ScopeGuard&) = delete;
-    ScopeGuard(ScopeGuard&&) = delete;
-    ScopeGuard& operator=(const ScopeGuard&) = delete;
-    ScopeGuard& operator=(ScopeGuard&&) = delete;
+
+    ScopeGuard(const ScopeGuard &) = delete;
+
+    ScopeGuard(ScopeGuard &&) = delete;
+
+    ScopeGuard &operator=(const ScopeGuard &) = delete;
+
+    ScopeGuard &operator=(ScopeGuard &&) = delete;
   };
 
   ScopeGuard rewindScopeGuard() {
@@ -268,3 +311,4 @@ public:
 };
 
 
+} // end namespace

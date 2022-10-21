@@ -8,6 +8,38 @@ class MemPoolTest : public solux::SoluxTest {
 protected:
 };
 
+class X {
+public:
+  int& cons_calls;
+  int& des_calls;
+  solux::u_ptr<X> nested;
+
+  X(int& cons_calls, int& des_calls) : cons_calls(cons_calls), des_calls(des_calls) {
+    this->cons_calls++;
+  }
+  ~X() {
+    des_calls++;
+  }
+};
+
+
+// test allocation of objects
+TEST_F(MemPoolTest, alloc) {
+  MemPool pool;
+  int cons_calls = 0;
+  int des_calls = 0;
+  {
+    auto x = pool.make_unique<X>(cons_calls, des_calls);
+    auto y = pool.make_unique<X>(cons_calls, des_calls);
+    auto z = pool.make_unique<X>(cons_calls, des_calls);
+    y->nested = std::move(z);
+    ASSERT_TRUE(z == nullptr);
+    ASSERT_EQ(cons_calls, 3);
+    ASSERT_EQ(des_calls, 0);
+  }
+  ASSERT_EQ(cons_calls, 3);
+  ASSERT_EQ(des_calls, 3);
+}
 
 TEST_F(MemPoolTest, rewind) {
   MemPool pool;
