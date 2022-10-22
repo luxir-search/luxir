@@ -74,7 +74,6 @@ u_ptr<T> make_unique_at(void* storage, Args&&... args) {
   return u_ptr<T>(pointer);
 }
 
-
 /// MemPool implements pmr::memory_resource, but it can also be used directly without virtual dispatch
 /// overhead.  Just use getAllocator() for a non-pmr allocator, or use alloc() functions directly.
 /// Do not use allocate() directly as is a pmr::memory_resource method that will use virtual methods.
@@ -109,6 +108,8 @@ public:
     // We need this templated to work for classes like std::map
     template <typename U> allocator(const allocator<U>& other) : pool(other.pool) {
     }
+
+    template<typename U> struct rebind { typedef allocator<U> other; };
 
     T* allocate(std::size_t n) {
       return static_cast<T*>((void*)pool.alloc(n * sizeof(T), alignof(T)));
@@ -163,8 +164,20 @@ public:
 
   template <typename T, typename... Args>
   u_ptr<T> make_unique_align(size_t alignment, Args&&... args) {
-    align(alignment);
-    return make_unique<T>(std::forward<Args>(args)...);
+    char* storage = alloc(sizeof(T), alignment);
+    return make_unique_at<T>(storage, std::forward<Args>(args)...);
+  }
+
+  template <typename T, typename... Args>
+  T* make(Args&&... args) {
+    char* storage = alloc(sizeof(T));
+    return new (storage) T(std::forward<Args>(args)...);
+  }
+
+  template <typename T, typename... Args>
+  T* make_align(size_t alignment, Args&&... args) {
+    char* storage = alloc(sizeof(T), alignment);
+    return new (storage) T(std::forward<Args>(args)...);
   }
 
   // TODO: keep track of high water mark?
