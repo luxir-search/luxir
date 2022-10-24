@@ -19,7 +19,10 @@ void MemPool::nextBuffer() {
     // reuse previously allocated block
     buffer = buffers[bufferIdx];
   } else {
-    buffer = new char[BYTE_BLOCK_SIZE];  // not 0 initialized
+    if (buffers.capacity() == 0) {
+      buffers.reserve(16);
+    }
+    buffer = new char[BYTE_BLOCK_SIZE];   // not 0 initialized
     buffers.emplace_back(buffer);
   }
   // for new allocations, we want to let memory checkers find reads from uninitialized memory

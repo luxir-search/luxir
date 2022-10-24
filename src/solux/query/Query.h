@@ -34,7 +34,35 @@ namespace solux {
 // hierarchy unless we translate everything into Protobuf classes.
 //
 
+/// A map from KeyType to a vector of pointers to ValType.
+/// The map internals, the vector, and the instances of ValType are all pool allocated.
+/// The pointers to ValType are unique_ptr with a custom deleter that only calls the destructor.
+template <typename KeyType, typename ValType>
+class PoolMapVec {
+public:
+  // This is mostly a helper class since it was hard to get the types right the first time.
 
+  using key_type = KeyType;
+  using value_type = ValType;
+  using valptr = u_ptr<value_type>;
+  using vec_type = std::vector<valptr, MemPool::allocator<valptr>>;
+  using mapped_type = vec_type;
+  using pair_type = std::pair<const key_type, vec_type>;
+  using map_type = gtl::node_hash_map<key_type, vec_type, std::hash<std::string_view>, std::equal_to<>, MemPool::allocator<pair_type>>;
+  // Using a node_hash_map in a pool will lead to less memory wasted if the map is resized.
+
+
+  MemPool& pool;
+  map_type map;
+
+  PoolMapVec(MemPool& pool, size_t initialMapSize) : pool(pool), map(initialMapSize, pool.getAllocator()) {}
+
+  vec_type& insertOrGet(const key_type& key) {
+    return map.try_emplace(key, pool.getAllocator()).first->second;
+  }
+};
+
+// NOTE: no virtual destructor, so subclasses of Query should be made trivially destructible
 class Query {
 public:
   class Context;
@@ -43,52 +71,167 @@ public:
 
   /// Returns a non-owning pointer to the created weight.  The Query::Context
   /// is responsible for the lifecycle of the created Weight.
-  virtual Query::Weight* createWeight(Query::Context context, float boost=1.0f) = 0;
-  virtual ~Query() = default;
-
+  // TODO: pass down flags like NEED_SCORES, etc
+  virtual Query::Weight* createWeight(Query::Context& context) = 0;
 
   /// Gives context to a Query (i.e. what index it's being used on amongst other things) when creating weights
   class Context {
   public:
     MemPool& pool;
     IndexReader& topReader;
-    Weight* top;
+    Weight* top = nullptr;
 
-    // OPT: may want to cache SegFieldInfo instances, FieldStats, TermStats,
-    // TermsEnum, DocsEnum, SimScorers, etc in case terms and fields are used more than once?
+    // TODO: put in pool
+    std::vector<FieldReader> fieldReaders;
+    using SegFieldInfoMap = PoolMapVec<std::string_view, SegFieldInfo>;
+    SegFieldInfoMap segFieldInfoMap;
+
+
+    Context(MemPool& pool, IndexReader& topReader)
+    : pool(pool), topReader(topReader), segFieldInfoMap(pool, 4) {
+
+      for (auto& segment : topReader.segments()) {
+        fieldReaders.emplace_back(pool, segment.postingsReader());
+      }
+    }
+
+    // return number of segments
+    int numSegments() const noexcept {
+      return topReader.segments().size();
+    }
+
+    std::span<u_ptr<SegFieldInfo>> getSegFieldInfos(std::string_view fieldName) {
+      auto numSegs = numSegments();
+
+      // TODO: what if this is a non-existant field? We probably should not cache that (esp somewhere that could
+      // lead to unbounded growth, like if we moved this segFieldInfo cache to the IndexReader
+
+      auto &vec = segFieldInfoMap.insertOrGet(fieldName);
+      if (vec.size() == 0) {
+        vec.resize(numSegs);
+        for (int i = 0; i < numSegs; ++i) {
+          if (fieldReaders[i].seek(fieldName)) {
+            vec[i] = pool.make_unique<SegFieldInfo>();
+            fieldReaders[i].readFieldInfo(*vec[i]);
+          } else {
+            vec[i] = nullptr;
+          }
+        }
+      }
+
+      return vec;
+    }
   };
 
   // A weight is created by a query for a specific index
   class Weight {
+  protected:
+    Query::Context& context;
   public:
+    Weight(Query::Context& context) : context(context) {}
 
+    // Create a scorer for a specific segment in the specific MemPool
+    virtual Query::Scorer* createScorer(IndexReader::Segment& segment, MemPool& target) = 0;
 
-    virtual ~Weight() = default;
+    // NOTE: no virtual destructor, so subclasses should be made trivially destructible
   };
 
   class Scorer {
   public:
+    virtual int32_t next() = 0;
+    virtual int32_t advance(int32_t docid) = 0;
+    virtual bool advanceExact (int32_t docid) = 0;
+    /// doc we are positioned on
+    virtual int32_t docId() = 0;
+    /// term frequency for current doc
+    virtual int termFreq() = 0;
+    virtual float score() = 0;
 
-    virtual ~Scorer() = default;
+    // NOTE: no virtual destructor, so subclasses should be made trivially destructible
   };
 };
 
 
-
+// TODO: can we get rid of destructors?
 class TermQuery final : public Query {
+protected:
+  std::string_view field;
+  std::string_view term;
+  float boost;
 public:
+  // TermQuery constructor
+  TermQuery(std::string_view field, std::string_view term, float boost=1.0f) : field(field), term(term), boost(boost) {}
 
-  TermQuery::Weight *createWeight(Query::Context context, float boost) override {
-    return new TermQuery::Weight();
+  std::string_view getField() const {
+    return field;
+  }
+  std::string_view getTerm() const {
+    return term;
   }
 
-  ~TermQuery() override = default;
-
+  TermQuery::Weight* createWeight(Query::Context& context) override {
+    TermQuery::Weight* weight = context.pool.make<TermQuery::Weight>(context, *this);
+    return weight;
+  }
 
   class Weight final : public Query::Weight {
+  protected:
+    TermQuery &query;
+    std::span<u_ptr<SegFieldInfo>> segFieldInfos;
   public:
+    Similarity::FieldStats fieldStats;
+    Similarity::TermStats termStats;
 
-    virtual ~Weight() = default;
+    Similarity::BM25Scorer* simScorer;
+
+    Weight(Query::Context& context, TermQuery& query) : Query::Weight(context), query(query) {
+      calcFieldStats(fieldStats, termStats);
+      simScorer = context.pool.make<Similarity::BM25Scorer>(Similarity().getScorer(1.0f, fieldStats, termStats));
+    }
+
+
+    // calculate aggregate field and term statistics
+    // (TODO: share fieldStats)
+    void calcFieldStats(Similarity::FieldStats& fieldStats, Similarity::TermStats& termStats) {
+      fieldStats.maxDoc = context.topReader.numDocs();
+
+      auto numSegs = context.numSegments();
+      segFieldInfos = context.getSegFieldInfos(query.getField());
+
+      for (int i = 0; i < numSegs; ++i) {
+        auto& segFieldInfo = segFieldInfos[i];
+        if (segFieldInfo) {
+          TermsEnum termsEnum(context.pool, context.topReader.segments()[i].postingsReader(), *segFieldInfo);
+          // add the stats from this termsEnum to fieldStats
+          fieldStats.sumTotalTermFreq += termsEnum.sumTotalTermFreq();
+          fieldStats.sumDocFreq += termsEnum.sumDocFreq();
+          fieldStats.docsWithField += termsEnum.docsWithField();
+
+          // We currently need DocsEnum to get the termStats
+          if (termsEnum.seek(query.getTerm())) {
+            DocsEnum docsEnum(context.pool, context.topReader.segments()[i].postingsReader(), termsEnum);
+            termStats.docFreq += docsEnum.numDocs();
+            termStats.totalTermFreq += docsEnum.totalTermFreq();
+          }
+        }
+      }
+    }
+
+    TermQuery::Scorer* createScorer(IndexReader::Segment &segment, MemPool &targetPool) override {
+      // TODO: cache the DocsEnum from when we had to calculate the term stats?
+      auto* segFieldInfo = segFieldInfos[segment.ord].get();
+      assert(segFieldInfo != nullptr);  // we should never get this far if the field doesn't exist in this segment... but perhaps as a general mechanism we should return nullptr here?
+      TermsEnum termsEnum(context.pool, segment.postingsReader(), *segFieldInfo);
+      if (!termsEnum.seek(query.getTerm())) {
+        return nullptr;
+      }
+      // If we create a new DocsEnum each time, then we can put it in the targetPool.  If we cache it, it should be
+      // cached elsewhere (like the context pool?)
+      DocsEnum* docsEnum = targetPool.make<DocsEnum>(targetPool, segment.postingsReader(), termsEnum);
+      IntColReader* normsReader = targetPool.make<IntColReader>(targetPool, segment.postingsReader(), *segFieldInfo);
+      return targetPool.make<TermQuery::Scorer>(*docsEnum, *normsReader, *simScorer);
+    }
+
   };
 
   class Scorer final : public Query::Scorer {
@@ -97,35 +240,37 @@ public:
     // IntColReader normsReader; // prob not necessary?
     IntColReader::Iterator normsIter;
     Similarity::BM25Scorer& simScorer; // todo: pass this in, it could be shared
+    // point back to weight?  Require TermWeight? Or what if we want to use this from other types of queries though?
+    // pass in the ord of this segment? or the actual IndexReader::Segment& seg;
 
     Scorer(DocsEnum& docsEnum,  IntColReader& normsReader, Similarity::BM25Scorer& simScorer)
     : docsEnum(docsEnum), normsIter(normsReader), simScorer(simScorer)
     {
     }
 
-    int32_t next() {
+    int32_t next() override {
       return docsEnum.nextDoc();
     }
 
-    int32_t advance(int32_t docid) {
+    int32_t advance(int32_t docid) override {
       return -1;
     }
 
-    bool advanceExact (int32_t docid) {
+    bool advanceExact (int32_t docid) override {
       return -1;
     }
 
     /// doc we are positioned on
-    int32_t docId() {
+    int32_t docId() override {
       return docsEnum.docId();
     }
 
     /// term frequency for current doc
-    int termFreq() {
+    int termFreq() override {
       return docsEnum.termFreq();
     }
 
-    float score() {
+    float score() override {
       auto docid = docsEnum.docId();
       int32_t tf = docsEnum.termFreq();
       int32_t normDoc = normsIter.advance(docid);
@@ -136,8 +281,6 @@ public:
 
     // make a pusher / visitor for term scorer?
 
-
-    virtual ~Scorer() = default;
   };
 
 };

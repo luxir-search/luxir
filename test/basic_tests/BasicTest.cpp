@@ -23,9 +23,10 @@ TEST(BasicTest, testCompiler) {
     struct alignas(1) s2 {
       int64_t x;
       char c;
+      int32_t z;
     } SOLUX_PACKED_END;
 
-    EXPECT_EQ(9, sizeof(s2));  // make sure that the packed attribute does not pad the end
+    EXPECT_EQ(sizeof(int64_t)+sizeof(char)+sizeof(int32_t), sizeof(s2));  // make sure there is no padding
 
     // tagged pointer on heap
     TaggedPtr<std::string> tp(new std::string("hi"),5);

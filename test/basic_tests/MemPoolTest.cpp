@@ -1,5 +1,6 @@
 #include "test/SoluxTest.h"
 #include "solux/util/MemPool.h"
+#include "gtl/phmap.hpp"
 
 using namespace std;
 using namespace solux;
@@ -129,7 +130,7 @@ TEST_F(MemPoolTest, alloc) {
     auto poolPtr = pool.ptr();
 #endif
 
-    using Map = std::unordered_map<keytype, valtype, std::hash<std::string_view>, std::equal_to<>, MemPool::allocator<pairtype>>;
+    using Map = gtl::node_hash_map<keytype, valtype, std::hash<std::string_view>, std::equal_to<>, MemPool::allocator<pairtype>>;
     Map map(pool.getAllocator());
     {
       valtype v1(pool.getAllocator());

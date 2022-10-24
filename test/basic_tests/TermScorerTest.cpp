@@ -51,7 +51,7 @@ TEST_F(TermScorerTest, singleSeg) {
     Similarity::FieldStats fieldStats;
     fieldStats.sumTotalTermFreq = tenum.sumTotalTermFreq();
     fieldStats.sumDocFreq = tenum.sumDocFreq();
-    fieldStats.docCount = tenum.docsWithField();
+    fieldStats.docsWithField = tenum.docsWithField();
     fieldStats.maxDoc = f.currentSegment()->postingsReader().numDocs();
 
     Similarity::TermStats termStats;
@@ -74,6 +74,28 @@ TEST_F(TermScorerTest, singleSeg) {
     ASSERT_EQ(termScorer.next(), 7);
     ASSERT_EQ(termScorer.termFreq(), 1);
     ASSERT_EQ(termScorer.score(), 0.37098017f);
+    ASSERT_EQ(termScorer.next(), PostingsReader::END);
+
+
+    // Now try from the beginning:
+    {
+      auto poolFree = testIndex.pool.rewindScopeGuard();
+      TermQuery tq("foo_w", "to");
+      Query::Context qContext(testIndex.pool, *testIndex.reader);
+
+      auto* weight = tq.createWeight(qContext);
+      TermQuery::Scorer& scorer = *dynamic_cast<TermQuery::Scorer*>( weight->createScorer(qContext.topReader.segments()[0], testIndex.pool) );
+      ASSERT_EQ(scorer.next(), 5);
+      ASSERT_EQ(scorer.docId(), 5);
+      ASSERT_EQ(scorer.termFreq(), 2);
+      ASSERT_EQ(scorer.score(), 0.36330473f);
+      ASSERT_EQ(scorer.next(), 7);
+      ASSERT_EQ(scorer.termFreq(), 1);
+      ASSERT_EQ(scorer.score(), 0.37098017f);
+      ASSERT_EQ(termScorer.next(), PostingsReader::END);
+    }
+
+
   }
 
 

@@ -170,12 +170,14 @@ public:
 
   template <typename T, typename... Args>
   T* make(Args&&... args) {
+    static_assert(std::is_trivially_destructible<T>::value, "type for MemPool::make() must be trivially destructible");
     char* storage = alloc(sizeof(T));
     return new (storage) T(std::forward<Args>(args)...);
   }
 
   template <typename T, typename... Args>
   T* make_align(size_t alignment, Args&&... args) {
+    static_assert(std::is_trivially_destructible<T>::value, "type for MemPool::make() must be trivially destructible");
     char* storage = alloc(sizeof(T), alignment);
     return new (storage) T(std::forward<Args>(args)...);
   }

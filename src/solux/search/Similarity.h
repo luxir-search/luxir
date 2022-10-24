@@ -101,10 +101,18 @@ public:
   /// shards or remote indexes (if global scoring is desired)
   class FieldStats {
   public:
-    int64_t maxDoc;
-    int64_t docCount;
-    int64_t sumTotalTermFreq;
-    int64_t sumDocFreq;
+    int64_t maxDoc = 0;
+    int64_t docsWithField = 0;
+    int64_t sumTotalTermFreq = 0;
+    int64_t sumDocFreq = 0;
+
+    /// add another FieldStats to this one
+    void add(const FieldStats& other) {
+      maxDoc += other.maxDoc;
+      docsWithField += other.docsWithField;
+      sumTotalTermFreq += other.sumTotalTermFreq;
+      sumDocFreq += other.sumDocFreq;
+    }
   };
 
   /// Stats for a term in a specific field, used in scoring.  Represents the stats for a term in a field
@@ -112,8 +120,14 @@ public:
   /// shards or remote indexes (if global scoring is desired)
   class TermStats {
   public:
-    int64_t docFreq;
-    int64_t totalTermFreq;
+    int64_t docFreq = 0;
+    int64_t totalTermFreq = 0;
+
+    /// add another TermStats to this one
+    void add(const TermStats& other) {
+      docFreq += other.docFreq;
+      totalTermFreq += other.totalTermFreq;
+    }
   };
 
 
@@ -155,11 +169,11 @@ public:
   }
 
   float idf(const FieldStats& fieldStats, const TermStats& termStats) {
-    return idf(termStats.docFreq, fieldStats.docCount);
+    return idf(termStats.docFreq, fieldStats.docsWithField);
   }
 
   float avgFieldLength(const FieldStats& fieldStats) {
-    return (float) ((double)fieldStats.sumTotalTermFreq / (double)fieldStats.docCount);
+    return (float) ((double)fieldStats.sumTotalTermFreq / (double)fieldStats.docsWithField);
   }
 
 };

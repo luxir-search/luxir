@@ -168,6 +168,9 @@ public:
 
   Postings postings; // for codecs... temporary since they aren't necessarily thread safe?
 
+  // used as a sentinal value for docs and positions iterators in a single segment.
+  static constexpr int32_t END = std::numeric_limits<int32_t>::max();
+
   // TODO temporary... this will likely be done at a higher level?
   explicit PostingsReader(Directory& dir, std::string_view gen) {
     int nFiles = 7;

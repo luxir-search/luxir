@@ -18,6 +18,8 @@ class END {
 //   is any reason to have to know the number of allocated bytes.  If we only want to support
 //   4GB, the current pointer could be an offset (BB address) instead of a 64 bit pointer.
 //   Reminder to align the malloc'd blocks to 64B as well.
+// We should be able to do a version that takes up 16 bytes (char* ptr, char[8] data)
+//   and keeps current level packed in ptr.  The block sizes would be 8, 8, 16, 16, 32, 32, 32, 64,...
 
 // Hmmm, when there are 3 streams together, it would be better coded as
 // ptr,ptr,ptr,len,len,len to avoid extra padding!  termdoc, termpos
