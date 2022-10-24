@@ -9,18 +9,51 @@ using namespace solux::test;
 
 class TermScorerTest : public SoluxTest {
 protected:
+
+  std::vector<const char*> text = {
+          "now is the time",
+          "for all good men",
+          "to come to the aid of their country",
+          "to the moon!"
+  };
+
+  // Field stats for the above field values:
+  // docCount == 4
+  // maxDoc == 8 (0 through 7)
+  // sumTotalTermFreq = 19
+  // sumDocFreq = 18 (just one overlap... "to" appears twice in doc 5)
+  // numTerms = 15  (repeated terms are "to":3, "the":"3", hence 15+2extra+2extra = 19 sumTotalTermFreq
+
+  // Term stats for the term "to" in the above field.
+  // docFreq == 2
+  // totalTermFreq = 3
+  int testScores(Query::Scorer* scorer, std::vector<int> expectedDocs, std::vector<float> expectedScores) {
+    if (scorer == nullptr) {
+      EXPECT_EQ(expectedDocs.size(), 0);
+      return 0;
+    }
+    for (size_t i=0; i<expectedDocs.size(); i++) {
+      EXPECT_EQ(expectedDocs[i], scorer->next());
+      EXPECT_EQ(expectedScores[i], scorer->score());
+    }
+    EXPECT_EQ(scorer->next(), PostingsReader::END);
+    return 0;
+  }
+
+
 };
 
 
 TEST_F(TermScorerTest, singleSeg) {
+
   {
     TestIndex testIndex;
     TestField f(testIndex, "foo_w");
     f.startIndexing();
-    f.add(1, "now is the time");
-    f.add(3, "for all good men");
-    f.add(5, "to come to the aid of their country");
-    f.add(7, "to the moon!");
+    f.add(1, text[0]);
+    f.add(3, text[1]);
+    f.add(5, text[2]);
+    f.add(7, text[3]);
     testIndex.flush();
     f.startReading();
 
@@ -84,18 +117,83 @@ TEST_F(TermScorerTest, singleSeg) {
       Query::Context qContext(testIndex.pool, *testIndex.reader);
 
       auto* weight = tq.createWeight(qContext);
-      TermQuery::Scorer& scorer = *dynamic_cast<TermQuery::Scorer*>( weight->createScorer(qContext.topReader.segments()[0], testIndex.pool) );
-      ASSERT_EQ(scorer.next(), 5);
-      ASSERT_EQ(scorer.docId(), 5);
-      ASSERT_EQ(scorer.termFreq(), 2);
-      ASSERT_EQ(scorer.score(), 0.36330473f);
-      ASSERT_EQ(scorer.next(), 7);
-      ASSERT_EQ(scorer.termFreq(), 1);
-      ASSERT_EQ(scorer.score(), 0.37098017f);
-      ASSERT_EQ(termScorer.next(), PostingsReader::END);
+      TermQuery::Scorer* scorer = dynamic_cast<TermQuery::Scorer*>( weight->createScorer(qContext.topReader.segments()[0], testIndex.pool) );
+      testScores(scorer, {5,7}, {0.36330473f,0.37098017f} );
     }
+  }
+}
 
 
+TEST_F(TermScorerTest, multiSeg) {
+  {
+    TestIndex testIndex;
+    TestField f(testIndex, "foo_w");
+    f.startIndexing();
+    f.add(1, text[0]);
+    f.add(3, text[1]);
+    testIndex.flush();
+    f.startIndexing();
+    f.add(2, text[2]);
+    f.add(4, text[3]);
+    testIndex.flush();
+    f.startReading();
+
+    {
+      auto poolFree = testIndex.pool.rewindScopeGuard();
+      TermQuery tq("foo_w", "to");
+      Query::Context qContext(testIndex.pool, *testIndex.reader);
+
+      auto* weight = tq.createWeight(qContext);
+      // put the scorer creation in a separate scope to test that it's OK to rewind the pool after we are done with a single scorer.
+      {
+        auto g1 = testIndex.pool.rewindScopeGuard();
+        TermQuery::Scorer *scorer = dynamic_cast<TermQuery::Scorer *>( weight->createScorer(
+                qContext.topReader.segments()[0], testIndex.pool));
+        testScores(scorer, {}, {}); // first segment doesn't have "to"
+      }
+      {
+        auto g2 = testIndex.pool.rewindScopeGuard();
+        TermQuery::Scorer *scorer = dynamic_cast<TermQuery::Scorer *>( weight->createScorer(
+                qContext.topReader.segments()[1], testIndex.pool));
+        testScores(scorer, {2,4}, {0.36330473f,0.37098017f});
+      }
+    }
+  }
+
+  // Now try the test again with "to" in both segments this time.
+  {
+    TestIndex testIndex;
+    TestField f(testIndex, "foo_w");
+    f.startIndexing();
+    f.add(1, text[0]);
+    f.add(3, text[2]);
+    testIndex.flush();
+    f.startIndexing();
+    f.add(2, text[1]);
+    f.add(4, text[3]);
+    testIndex.flush();
+    f.startReading();
+
+    {
+      auto poolFree = testIndex.pool.rewindScopeGuard();
+      TermQuery tq("foo_w", "to");
+      Query::Context qContext(testIndex.pool, *testIndex.reader);
+
+      auto* weight = tq.createWeight(qContext);
+      // put the scorer creation in a separate scope to test that it's OK to rewind the pool after we are done with a single scorer.
+      {
+        auto g1 = testIndex.pool.rewindScopeGuard();
+        TermQuery::Scorer *scorer = dynamic_cast<TermQuery::Scorer *>( weight->createScorer(
+                qContext.topReader.segments()[0], testIndex.pool));
+        testScores(scorer, {3}, {0.36330473f});
+      }
+      {
+        auto g2 = testIndex.pool.rewindScopeGuard();
+        TermQuery::Scorer *scorer = dynamic_cast<TermQuery::Scorer *>( weight->createScorer(
+                qContext.topReader.segments()[1], testIndex.pool));
+        testScores(scorer, {4}, {0.37098017f});
+      }
+    }
   }
 
 
