@@ -593,9 +593,9 @@ public:
       // TODO: pull this out into codec?
       // TODO: for a list above a certain size, bisect with a skip?  Wait for good benchmarks to implement this.  It seems like
       //   it would only speed up rare/rare term conjunctions.  Might help common terms in small segments too though.
-      // TODO: make first delta an actual delta from the last block... not from 0.  Not too important though given that that this is only sub-optimal
+      // TODO: make first delta an actual delta from the last block... not from -1.  Not too important though given that that this is only sub-optimal
       //   when the docfreq is larger than the doc block size.
-      int lastdoc = 0;
+      int32_t lastdoc = -1;
       assert(docs.size() == tfreqs.size());
       for (int i=0; i<(int)docs.size(); i++) {
         assert(docs[i] > lastdoc || i==0);

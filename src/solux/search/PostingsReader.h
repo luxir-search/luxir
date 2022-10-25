@@ -693,7 +693,7 @@ public:
     // TODO: package those dependencies in a struct that can be simply assigned?  Or if there is enough overlap, simply copy the complete tenum?
     // Or we could invert the responsibility and make the client copy the tenum if they are going to change it.
     docsSize = tenum.docsSize;
-    docid = 0; // we delta-encode, so start from 0.  TODO: should we start at -1?  As it is now, a term with all docs will yield a delta list of 0,1,1,1,1... not optimal for RLE
+    docid = -1;
 
     if (docsSize == 0) {
       // postings pulsed
@@ -812,8 +812,8 @@ public:
         // std::cout << "read tfreq block: " << std::endl;
       } else {
         // decode whole tail?
-        // int32_t id = docid;  // PostingsWriter currently uses 0 for tail base, not lastDoc
-        int32_t id = 0;
+        // int32_t id = docid;  // PostingsWriter currently uses -1 for tail base, not lastDoc
+        int32_t id = -1;
         for (int i=0; i<leftToRead; i++) {
           // see PostingsWriter.endTerm() for format of non-block encoded docs/freqs
           uint32_t doccode = docIS.readVint();
