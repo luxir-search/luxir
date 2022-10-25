@@ -9,6 +9,7 @@
 #include <assert.h>
 #include <unordered_set>
 #include <memory_resource>
+#include <span>
 
 #include "solux_util.h"
 
@@ -174,12 +175,33 @@ public:
     char* storage = alloc(sizeof(T));
     return new (storage) T(std::forward<Args>(args)...);
   }
-
   template <typename T, typename... Args>
   T* make_align(size_t alignment, Args&&... args) {
     static_assert(std::is_trivially_destructible<T>::value, "type for MemPool::make() must be trivially destructible");
     char* storage = alloc(sizeof(T), alignment);
     return new (storage) T(std::forward<Args>(args)...);
+  }
+
+  template <typename T, typename... Args>
+  std::vector<T, MemPool::allocator<T>>* make_vec(Args&&... args) {
+    static_assert(std::is_trivially_destructible<T>::value, "element type for MemPool::make_vec() must be trivially destructible");
+    char* storage = alloc(sizeof(std::vector<T, MemPool::allocator<T>>), 8);
+    return new (storage) std::vector<T, MemPool::allocator<T>>(std::forward<Args>(args)..., getAllocator());
+  }
+
+  // make an array of default initialized elements
+  template <typename T>
+  T* make_arr(size_t size) {
+    static_assert(std::is_trivially_destructible<T>::value, "element type for MemPool::make_arr() must be trivially destructible");
+    char* storage = alloc(sizeof(T)*size, alignof(T));
+    return new (storage) T[size]();  // default initialize or uninitialized?
+  }
+
+  template <typename T>
+  std::span<T> copy_span(std::span<T> span) {
+    T* arr = make_arr<T>(span.size());
+    std::copy(span.begin(), span.end(), arr);
+    return {arr, span.size()};
   }
 
   // TODO: keep track of high water mark?

@@ -10,8 +10,9 @@ namespace solux {
 /// As in std::make_heap, this establishes a max-heap using the given less-than comparison function.
 /// This can replace a std::pop_heap followed by a std::push_heap
 /// Do not call on an empty heap.
+/// Returns true if the heap was changed.
 template <class RandomIt, class LessCompare>
-void update_heap_top(RandomIt begin, RandomIt end, LessCompare comp) {
+bool update_heap_top(RandomIt begin, RandomIt end, LessCompare comp) {
   auto arr = begin - 1;  // 1 based array since that is how heap offsets work.
   size_t sz = end - begin + 1;  // size of our 1 based array
   assert(sz >= 1);
@@ -39,6 +40,7 @@ void update_heap_top(RandomIt begin, RandomIt end, LessCompare comp) {
 
   // found the spot for the new value
   arr[empty] = std::move(newVal);
+  return empty != 1;
 };
 
 /// Directly using std::make_heap is error-prone when dealing with indirection, esp if you have an array of
@@ -52,7 +54,7 @@ class IndirectPQ {
   T** end;
   T* reference;  // a reference to the start of the original array, only used to calculate index if needed by client.
 
-  static constexpr auto ptrcomp = [](const T* a, const T* b) { return Comp()(*a,*b); };
+  static constexpr auto ptrcomp = [](T* a, T* b) { return Comp()(*a,*b); };
 
   void makeHeap() {
     std::make_heap(pointers.data(), end, ptrcomp);
@@ -110,8 +112,9 @@ public:
     return &top() - reference;
   }
 
-  /// Call this to re-heapify after top() was modified
-  void updateTop() {
+  /// Call this to re-heapify after top() was modified.
+  /// Returns true if the heap was changed (i.e. false of the top element was not moved)
+  bool updateTop() {
     update_heap_top(pointers.data(), end, ptrcomp);
   }
 
@@ -119,6 +122,21 @@ public:
     std::pop_heap(pointers.data(), end, ptrcomp);
     --end;
     return **end;
+  }
+
+  /// Removes the element at the given index from the heap by swapping the end element with this element
+  /// and decrementing the size.  This is O(1) but does not preserve the heap invariant.  You must call
+  /// heapify() to restore the heap invariant before calling any methods that depend on it.
+  T& remove(size_t idx) {
+    assert(idx < size());
+    std::swap(pointers[idx], pointers[size()-1]);
+    --end;
+    return **end;
+  }
+
+  /// restores heap invariant
+  void heapify() {
+    std::make_heap(pointers.data(), end, ptrcomp);
   }
 
   /// If capacity has been reached, the largest element is removed and returned (i.e. heap keeps smallest)

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <solux/util/heap.h>
 #include "solux/util/MemPool.h"
 #include "solux/search/IndexReader.h"
 #include "solux/search/Similarity.h"
@@ -131,7 +132,7 @@ public:
     Weight(Query::Context& context) : context(context) {}
 
     // Create a scorer for a specific segment in the specific MemPool
-    virtual Query::Scorer* createScorer(IndexReader::Segment& segment, MemPool& target) = 0;
+    virtual Query::Scorer* createScorer(MemPool& target, IndexReader::Segment& segment) = 0;
 
     // NOTE: no virtual destructor, so subclasses should be made trivially destructible
   };
@@ -144,7 +145,6 @@ public:
     /// doc we are positioned on
     virtual int32_t docId() = 0;
     /// term frequency for current doc
-    virtual int termFreq() = 0;
     virtual float score() = 0;
 
     // NOTE: no virtual destructor, so subclasses should be made trivially destructible
@@ -152,7 +152,6 @@ public:
 };
 
 
-// TODO: can we get rid of destructors?
 class TermQuery final : public Query {
 protected:
   std::string_view field;
@@ -217,7 +216,7 @@ public:
       }
     }
 
-    TermQuery::Scorer* createScorer(IndexReader::Segment &segment, MemPool &targetPool) override {
+    TermQuery::Scorer* createScorer(MemPool &targetPool, IndexReader::Segment &segment) override {
       // TODO: cache the DocsEnum from when we had to calculate the term stats?
       auto* segFieldInfo = segFieldInfos[segment.ord].get();
       assert(segFieldInfo != nullptr);  // we should never get this far if the field doesn't exist in this segment... but perhaps as a general mechanism we should return nullptr here?
@@ -265,11 +264,6 @@ public:
       return docsEnum.docId();
     }
 
-    /// term frequency for current doc
-    int termFreq() override {
-      return docsEnum.termFreq();
-    }
-
     float score() override {
       auto docid = docsEnum.docId();
       int32_t tf = docsEnum.termFreq();
@@ -279,12 +273,179 @@ public:
       return simScorer.score((float)tf, encodedNorm);
     }
 
+    /// term frequency for current doc
+    int termFreq()  {
+      return docsEnum.termFreq();
+    }
+
     // make a pusher / visitor for term scorer?
 
   };
 
 };
 
+
+
+class BooleanQuery : public Query {
+  std::span<Query*> mandatory;
+  std::span<Query*> optional;
+  std::span<Query*> prohibited;
+  std::span<Query*> filter;
+
+public:
+  BooleanQuery(std::span<Query*> mandatory, std::span<Query*> optional, std::span<Query*> prohibited, std::span<Query*> filter)
+  : mandatory(mandatory), optional(optional), prohibited(prohibited), filter(filter)
+  {
+  }
+
+  Weight *createWeight(Context &context) override {
+    return context.pool.make<BooleanQuery::Weight>(context, *this);
+  }
+
+  class Weight : public Query::Weight {
+    BooleanQuery &query;
+    std::span<Query::Weight*> optionalWeights;
+
+  public:
+    Weight(Query::Context &context, BooleanQuery &query) : Query::Weight(context), query(query)
+    {
+      optionalWeights = {context.pool.make_arr<Query::Weight*>(query.optional.size()), query.optional.size()};
+      for (int i=0; i<query.optional.size(); ++i) {
+        optionalWeights[i] = query.optional[i]->createWeight(context);
+      }
+    }
+
+
+    Query::Scorer *createScorer(MemPool &targetPool, IndexReader::Segment &segment) override {
+      auto& scorers = *targetPool.make_vec<Query::Scorer*>();
+      scorers.reserve(query.optional.size());
+      for (auto* weight : optionalWeights) {
+        auto* scorer = weight->createScorer(targetPool, segment);
+        if (scorer != nullptr) {
+          scorers.push_back(scorer);
+        }
+      }
+
+      if (scorers.size() == 0) {
+        return nullptr;
+      }
+
+      if (scorers.size() == 1) {
+        return scorers[0];
+      }
+
+      return targetPool.make<DisjunctionScorer>(targetPool, scorers);
+    }
+  };
+
+  class Scorer : public Query::Scorer {
+  public:
+    Scorer() {}
+
+    int32_t next() override {
+      return -1;
+    }
+
+    int32_t advance(int32_t docid) override {
+      return -1;
+    }
+
+    bool advanceExact (int32_t docid) override {
+      return -1;
+    }
+
+    /// doc we are positioned on
+    int32_t docId() override {
+      return -1;
+    }
+
+    float score() override {
+      return -1;
+    }
+  };
+
+  class DisjunctionScorer : public Query::Scorer {
+    std::span<Query::Scorer*> origScorers;
+    std::span<Query::Scorer*> scorers;
+
+    // TODO: OPT: heapifying with virtual methods prob isn't a good idea... pull out and save the docid.
+    constexpr static auto idComparator = [](Query::Scorer& a, Query::Scorer& b) { return b.docId() < a.docId(); };
+
+    IndirectPQ<Query::Scorer, decltype(idComparator)> pq;
+
+    int32_t docid = -1;
+  public:
+    DisjunctionScorer(MemPool& pool, std::span<Query::Scorer*> scorers)
+    :origScorers(scorers),
+    scorers(pool.copy_span(scorers)),
+    pq(this->scorers)
+    {
+    }
+
+    int32_t next() override {
+      int currid = docid;
+
+      // if pq.size()==0, then should have previously returned END and so next() should not be called after that.
+      assert(pq.size() > 0);
+      assert(pq.top().docId() == docid);
+
+      docid = pq.top().next();
+      for (;;) {
+        if (docid == PostingsReader::END) {
+          pq.removeTop();
+          if (pq.size() == 0) {
+            break;
+          }
+        } else {
+          bool changed = pq.updateTop();
+          if (!changed) {
+            // we didn't change the top scorer, so we are done.
+            break;
+          }
+        }
+
+        // OK, heap was changed, so lets look at the lowest id now.
+        docid = pq.top().docId();
+        if (docid <= currid) {  // really, it should never be less, just equal if multiple scorers matched the same doc
+          docid = pq.top().next();
+        }
+      }
+
+      return docid;
+    }
+
+    int32_t advance(int32_t docid) override {
+      return -1;
+    }
+
+    bool advanceExact (int32_t docid) override {
+      return -1;
+    }
+
+    /// doc we are positioned on
+    int32_t docId() override {
+      return docid;
+    }
+
+    float score() override {
+      assert(docid = pq.top().docId());
+      float score = pq.top().score();
+      int increments = 0;
+      // If we ever had a huge disjunction, we don't really need to look at all of them for matches.  But equal
+      // ids could be on the left or the right of the heap, so just loop over all scorers for now.
+      for (int i=1; i<pq.size(); i++) {
+        auto id = scorers[i]->docId();
+        assert(id >= docid);
+        if (id == docid) {
+          score += scorers[i]->score();
+        }
+      }
+      return score;
+    }
+  };
+
+
+};
 
 
 
