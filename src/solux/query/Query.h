@@ -366,7 +366,7 @@ public:
         if (optionalScorers.size() == 1) {
           optScorer = optionalScorers[0];
         } else {
-          optScorer = targetPool.make<DisjunctionScorer>(targetPool, optionalScorers);
+          optScorer = targetPool.make<BooleanQuery::DisjunctionScorer>(targetPool, optionalScorers);
         }
       }
 
@@ -375,8 +375,7 @@ public:
       } else if (optScorer == nullptr) {
         return mandScorer;
       } else {
-        // TODO: combine mandatory and optional
-        return nullptr;
+        return targetPool.make<BooleanQuery::MandOptScorer>(targetPool, mandScorer, optScorer);
       }
     }
   };
@@ -395,6 +394,51 @@ public:
 
     float score() override {
       return -1;
+    }
+  };
+
+  class MandOptScorer : public Query::Scorer {
+    Query::Scorer *mandScorer;
+    Query::Scorer *optScorer;
+    int32_t id = -1;
+    int32_t optId = -1;
+  public:
+    MandOptScorer(MemPool& targetPool, Query::Scorer *mandScorer, Query::Scorer *optScorer) : mandScorer(mandScorer), optScorer(optScorer) {
+      unused(targetPool);
+    }
+
+    int32_t docId() override {
+      return id;
+    }
+
+    int32_t next() override {
+      id = mandScorer->next();
+      return id;
+    }
+
+    int32_t advance(int32_t docid) override {
+      id = mandScorer->advance(docid);
+      return id;
+    }
+
+    bool advanceExact(int32_t docid) override {
+      if (mandScorer->advanceExact(docid)) {
+        id = docid;
+      }
+      return id;
+    }
+
+    float score() override {
+      float score = mandScorer->score();
+      if (optId < id) {
+        if (optScorer->advanceExact(id)) {
+          optId = id;
+        }
+      }
+      if (optId == id) {
+        score += optScorer->score();
+      }
+      return score;
     }
   };
 
@@ -509,14 +553,6 @@ public:
       }
 
       return docid;
-    }
-
-    int32_t advance(int32_t docid) override {
-      return -1;
-    }
-
-    bool advanceExact (int32_t docid) override {
-      return -1;
     }
 
     /// doc we are positioned on
