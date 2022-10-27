@@ -412,14 +412,16 @@ public:
 
     // internal utility method where first scorer has already been advanced and is equal to the target.
     int32_t doNext(int32_t target) {
-      auto firstScorer = scorers[0];
+      auto* firstScorer = scorers[0];
+
       outer:
       for (;;) {
         for (int j = 1; j < scorers.size(); j++) {
-          int id = scorers[j]->advance(target);
+          int32_t id = scorers[j]->advance(target);
+          assert(id >= target);
           if (id > target) {
             target = firstScorer->advance(target);
-            goto outer;  // could perhaps replace with j=0; continue; but that seems potentially worse?
+            goto outer;  // could perhaps replace with "j=0; continue;" but that seems potentially worse?
           }
         }
         // if we made it through the loop, all scorers matched (maybe at END)

@@ -5,6 +5,7 @@
 #include <array>
 #include <cassert>
 #include <bit>
+#include "solux/util/solux_util.h"
 
 namespace solux {
 
@@ -149,6 +150,7 @@ public:
     BM25Scorer(float boost, float k1, float b, float idf, float avgdl);
 
     float score(float termFreq, int64_t encodedNorm) {
+      solux::unused(boost,k1,b,idf,avgdl); // already folded in
       // Adapted from lucene, see BM25Similarity.java for more details.
       auto normInverse = invNorm[ (uint8_t)encodedNorm ];
       return weight - weight / (1.0f + termFreq * normInverse);

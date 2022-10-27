@@ -115,7 +115,7 @@ public:
   /// Call this to re-heapify after top() was modified.
   /// Returns true if the heap was changed (i.e. false of the top element was not moved)
   bool updateTop() {
-    update_heap_top(pointers.data(), end, ptrcomp);
+    return update_heap_top(pointers.data(), end, ptrcomp);
   }
 
   T& removeTop() {

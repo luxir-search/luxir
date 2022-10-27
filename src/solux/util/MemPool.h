@@ -117,6 +117,7 @@ public:
     }
 
     void deallocate(T* p, std::size_t n) {
+      unused(p,n);
     }
 
     template <typename U> bool operator==(const allocator<U>& other) const {
