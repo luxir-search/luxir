@@ -140,8 +140,14 @@ public:
   class Scorer {
   public:
     virtual int32_t next() = 0;
-    virtual int32_t advance(int32_t docid) = 0;
-    virtual bool advanceExact (int32_t docid) = 0;
+    virtual int32_t advance(int32_t docid) {
+      int32_t doc;
+      while ((doc = next()) < docid) {}
+      return doc;
+    }
+    virtual bool advanceExact (int32_t docid) {
+      return advance(docid) == docid;
+    }
     /// doc we are positioned on
     virtual int32_t docId() = 0;
     /// term frequency for current doc
@@ -251,14 +257,6 @@ public:
       return docsEnum.nextDoc();
     }
 
-    int32_t advance(int32_t docid) override {
-      return -1;
-    }
-
-    bool advanceExact (int32_t docid) override {
-      return -1;
-    }
-
     /// doc we are positioned on
     int32_t docId() override {
       return docsEnum.docId();
@@ -304,37 +302,82 @@ public:
 
   class Weight : public Query::Weight {
     BooleanQuery &query;
+    std::span<Query::Weight*> mandatoryWeights;
     std::span<Query::Weight*> optionalWeights;
 
-  public:
-    Weight(Query::Context &context, BooleanQuery &query) : Query::Weight(context), query(query)
-    {
-      optionalWeights = {context.pool.make_arr<Query::Weight*>(query.optional.size()), query.optional.size()};
-      for (int i=0; i<query.optional.size(); ++i) {
-        optionalWeights[i] = query.optional[i]->createWeight(context);
+    // TODO: make these static (and refactor to query) so other queries can use them?
+    // Returns a span of Weights, corresponding to the given span of Queries. Some weights can be null.
+    std::span<Query::Weight*> createWeights(MemPool &targetPool, Query::Context& context, std::span<Query*> queries) {
+      if (queries.size() == 0) {
+        return {};
       }
+      auto weights = targetPool.make_arr<Query::Weight*>(queries.size());
+      for (int i=0; i<queries.size(); ++i) {
+        weights[i] = queries[i]->createWeight(context);
+      }
+      return {weights, queries.size()};
     }
 
-
-    Query::Scorer *createScorer(MemPool &targetPool, IndexReader::Segment &segment) override {
+    std::span<Query::Scorer*> createScorers(MemPool &targetPool, IndexReader::Segment &segment, std::span<Query::Weight*> weights) {
+      if (weights.size() == 0) {
+        return {};
+      }
+      // could optimize for 1 as well, but not a big deal.
       auto& scorers = *targetPool.make_vec<Query::Scorer*>();
-      scorers.reserve(query.optional.size());
-      for (auto* weight : optionalWeights) {
+      scorers.reserve(weights.size());
+      for (auto* weight : weights) {
         auto* scorer = weight->createScorer(targetPool, segment);
         if (scorer != nullptr) {
           scorers.push_back(scorer);
         }
       }
+      return scorers;
+    }
 
-      if (scorers.size() == 0) {
+
+  public:
+    Weight(Query::Context &context, BooleanQuery &query) : Query::Weight(context), query(query)
+    {
+      mandatoryWeights = createWeights(context.pool, context, query.mandatory);
+      optionalWeights = createWeights(context.pool, context, query.optional);
+    }
+
+
+
+    Query::Scorer *createScorer(MemPool &targetPool, IndexReader::Segment &segment) override {
+      auto mandatoryScorers = createScorers(targetPool, segment, mandatoryWeights);
+      // if some mandatory scorers are missing then it's impossible to match this segment
+      if (mandatoryScorers.size() < query.mandatory.size()) {
         return nullptr;
       }
 
-      if (scorers.size() == 1) {
-        return scorers[0];
+      Query::Scorer* mandScorer = nullptr;
+      if (mandatoryScorers.size() > 0) {
+        if (mandatoryScorers.size() == 1) {
+          mandScorer = mandatoryScorers[0];
+        } else {
+          mandScorer = targetPool.make<BooleanQuery::ConjunctionScorer>(targetPool, mandatoryScorers);
+        }
       }
 
-      return targetPool.make<DisjunctionScorer>(targetPool, scorers);
+      auto optionalScorers = createScorers(targetPool, segment, optionalWeights);
+      Query::Scorer* optScorer = nullptr;
+      if (optionalScorers.size() > 0) {
+        if (optionalScorers.size() == 1) {
+          optScorer = optionalScorers[0];
+        } else {
+          optScorer = targetPool.make<DisjunctionScorer>(targetPool, optionalScorers);
+        }
+      }
+
+      if (mandScorer == nullptr) {
+        return optScorer;
+      } else if (optScorer == nullptr) {
+        return mandScorer;
+      } else {
+        // TODO: combine mandatory and optional
+        return nullptr;
+      }
     }
   };
 
@@ -345,15 +388,6 @@ public:
     int32_t next() override {
       return -1;
     }
-
-    int32_t advance(int32_t docid) override {
-      return -1;
-    }
-
-    bool advanceExact (int32_t docid) override {
-      return -1;
-    }
-
     /// doc we are positioned on
     int32_t docId() override {
       return -1;
@@ -364,8 +398,70 @@ public:
     }
   };
 
+
+  class ConjunctionScorer : public Query::Scorer {
+    std::span<Query::Scorer*> scorers;
+
+    // TODO: OPT: heapifying with virtual methods prob isn't a good idea... pull out and save the docid.
+    constexpr static auto idComparator = [](Query::Scorer& a, Query::Scorer& b) { return b.docId() < a.docId(); };
+
+    // with a ton of clauses, a maxHeap could help with quickly finding the largest number to skip to.
+
+    int32_t docid = -1;
+
+
+    // internal utility method where first scorer has already been advanced and is equal to the target.
+    int32_t doNext(int32_t target) {
+      auto firstScorer = scorers[0];
+      outer:
+      for (;;) {
+        for (int j = 1; j < scorers.size(); j++) {
+          int id = scorers[j]->advance(target);
+          if (id > target) {
+            target = firstScorer->advance(target);
+            goto outer;  // could perhaps replace with j=0; continue; but that seems potentially worse?
+          }
+        }
+        // if we made it through the loop, all scorers matched (maybe at END)
+        docid = target;
+        return docid;
+      }
+      // unreachable
+    }
+
+  public:
+    // The passed in span of scorers will be modified (rearranged).
+    ConjunctionScorer(MemPool& pool, std::span<Query::Scorer*> scorers)
+            : scorers(scorers)
+    {
+    }
+
+    int32_t next() override {
+      return doNext(scorers[0]->next());
+    }
+
+    int32_t advance(int32_t docid) override {
+      return doNext(scorers[0]->advance(docid));
+    }
+
+    /// doc we are positioned on
+    int32_t docId() override {
+      return docid;
+    }
+
+    float score() override {
+      float score = 0.0f;
+      for (auto* scorer : scorers) {
+        assert(scorer->docId() == docid);
+        score += scorer->score();
+      }
+      return score;
+    }
+  };
+
+
+
   class DisjunctionScorer : public Query::Scorer {
-    std::span<Query::Scorer*> origScorers;
     std::span<Query::Scorer*> scorers;
 
     // TODO: OPT: heapifying with virtual methods prob isn't a good idea... pull out and save the docid.
@@ -375,10 +471,9 @@ public:
 
     int32_t docid = -1;
   public:
+    // The passed in span of scorers will be modified (rearranged).
     DisjunctionScorer(MemPool& pool, std::span<Query::Scorer*> scorers)
-    :origScorers(scorers),
-    scorers(pool.copy_span(scorers)),
-    pq(this->scorers)
+    : scorers(scorers), pq(scorers)
     {
     }
 

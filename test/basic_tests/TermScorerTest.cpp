@@ -212,13 +212,14 @@ TEST_F(TermScorerTest, boolScore) {
     testIndex.flush();
     f.startReading();
 
-    TermQuery a("foo_w", "to");   // appears in text[2,3] (docs 2,4)
-    TermQuery b("foo_w", "the");  // appears in text[0,2,3] (docs 1,2,4)
-    std::vector<Query *> queries = {&a, &b};
-    BooleanQuery q({}, queries, {}, {});
 
-    // The "to" scorer should be null for seg 0
+    // The "to" scorer should be null for seg 0 in this test
     {
+      TermQuery a("foo_w", "to");   // appears in text[2,3] (docs 2,4)
+      TermQuery b("foo_w", "the");  // appears in text[0,2,3] (docs 1,2,4)
+      std::vector<Query *> queries = {&a, &b};
+      BooleanQuery q({}, queries, {}, {});
+
       auto poolFree = testIndex.pool.rewindScopeGuard();
       Query::Context qContext(testIndex.pool, *testIndex.reader);
       auto *weight = q.createWeight(qContext);
@@ -236,5 +237,32 @@ TEST_F(TermScorerTest, boolScore) {
         testScores(scorer, {2, 4}, {0.48997432f, 0.5618766f});
       }
     }
+
+
+    // conjunction scorer
+    {
+      TermQuery a("foo_w", "to");   // appears in text[2,3] (docs 2,4)
+      TermQuery b("foo_w", "the");  // appears in text[0,2,3] (docs 1,2,4)
+      std::vector<Query *> queries = {&a, &b};
+      BooleanQuery q(queries, {}, {}, {});
+
+      auto poolFree = testIndex.pool.rewindScopeGuard();
+      Query::Context qContext(testIndex.pool, *testIndex.reader);
+      auto *weight = q.createWeight(qContext);
+      // put the scorer creation in a separate scope to test that it's OK to rewind the pool after we are done with a single scorer.
+      {
+        auto g = testIndex.pool.rewindScopeGuard();
+        Query::Scorer *scorer = weight->createScorer(
+                testIndex.pool, qContext.topReader.segments()[0]);
+        testScores(scorer, {}, {});
+      }
+      {
+        auto g = testIndex.pool.rewindScopeGuard();
+        Query::Scorer *scorer = weight->createScorer(
+                testIndex.pool, qContext.topReader.segments()[1]);
+        testScores(scorer, {2, 4}, {0.48997432f, 0.5618766f});
+      }
+    }
+
   }
 }
