@@ -214,6 +214,7 @@ TEST_F(TermScorerTest, boolScore) {
 
     TermQuery to("foo_w", "to");   // appears in text[2,3] (docs 2,4)
     TermQuery the("foo_w", "the");  // appears in text[0,2,3] (docs 1,2,4)
+    TermQuery moon("foo_w", "moon!");  // appears in text[3] (docs 4)
 
     // The "to" scorer should be null for seg 0 in this test
     {
@@ -310,6 +311,62 @@ TEST_F(TermScorerTest, boolScore) {
       }
     }
 
+
+    // add single prohibited clause
+    {
+      std::vector<Query *> mand = {&the};
+      std::vector<Query *> opt = {&to};
+      std::vector<Query *> neg = {&moon};
+
+      BooleanQuery q(mand, opt, neg, {});
+
+      auto poolFree = testIndex.pool.rewindScopeGuard();
+      Query::Context qContext(testIndex.pool, *testIndex.reader);
+      auto *weight = q.createWeight(qContext);
+      // put the scorer creation in a separate scope to test that it's OK to rewind the pool after we are done with a single scorer.
+      {
+        auto g = testIndex.pool.rewindScopeGuard();
+        Query::Scorer *scorer = weight->createScorer(
+                testIndex.pool, qContext.topReader.segments()[0]);
+        testScores(scorer, {1}, {0.17332031f});
+      }
+      {
+        auto g = testIndex.pool.rewindScopeGuard();
+        Query::Scorer *scorer = weight->createScorer(
+                testIndex.pool, qContext.topReader.segments()[1]);
+        testScores(scorer, {2}, {0.48997432f});
+      }
+    }
+
+    // add more prohibited clauses
+    {
+      TermQuery does_not_exist("foo_w", "does_not_exist");
+      TermQuery time("foo_w", "time");  // matches doc 1
+      TermQuery men("foo_w", "men");  // matches doc 3
+
+      std::vector<Query *> mand = {&the};
+      std::vector<Query *> opt = {&to};
+      std::vector<Query *> neg = {&does_not_exist, &moon, &time, &men};
+
+      BooleanQuery q(mand, opt, neg, {});
+
+      auto poolFree = testIndex.pool.rewindScopeGuard();
+      Query::Context qContext(testIndex.pool, *testIndex.reader);
+      auto *weight = q.createWeight(qContext);
+      // put the scorer creation in a separate scope to test that it's OK to rewind the pool after we are done with a single scorer.
+      {
+        auto g = testIndex.pool.rewindScopeGuard();
+        Query::Scorer *scorer = weight->createScorer(
+                testIndex.pool, qContext.topReader.segments()[0]);
+        testScores(scorer, {}, {});
+      }
+      {
+        auto g = testIndex.pool.rewindScopeGuard();
+        Query::Scorer *scorer = weight->createScorer(
+                testIndex.pool, qContext.topReader.segments()[1]);
+        testScores(scorer, {2}, {0.48997432f});
+      }
+    }
 
   }
 }

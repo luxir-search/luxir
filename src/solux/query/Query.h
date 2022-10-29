@@ -284,7 +284,7 @@ public:
 
 
 
-class BooleanQuery : public Query {
+class BooleanQuery final : public Query {
   std::span<Query*> mandatory;
   std::span<Query*> optional;
   std::span<Query*> prohibited;
@@ -300,10 +300,11 @@ public:
     return context.pool.make<BooleanQuery::Weight>(context, *this);
   }
 
-  class Weight : public Query::Weight {
+  class Weight final : public Query::Weight {
     BooleanQuery &query;
     std::span<Query::Weight*> mandatoryWeights;
     std::span<Query::Weight*> optionalWeights;
+    std::span<Query::Weight*> prohibitedWeights;
 
     // TODO: make these static (and refactor to query) so other queries can use them?
     // Returns a span of Weights, corresponding to the given span of Queries. Some weights can be null.
@@ -340,6 +341,7 @@ public:
     {
       mandatoryWeights = createWeights(context.pool, context, query.mandatory);
       optionalWeights = createWeights(context.pool, context, query.optional);
+      prohibitedWeights = createWeights(context.pool, context, query.prohibited);
     }
 
 
@@ -370,17 +372,33 @@ public:
         }
       }
 
+      // Find the current top scorer... mandatory, optional, or a combination.
+      Query::Scorer* boolScorer = nullptr;
       if (mandScorer == nullptr) {
-        return optScorer;
+        boolScorer = optScorer;
       } else if (optScorer == nullptr) {
-        return mandScorer;
+        boolScorer = mandScorer;
       } else {
-        return targetPool.make<BooleanQuery::MandOptScorer>(targetPool, mandScorer, optScorer);
+        boolScorer = targetPool.make<BooleanQuery::MandOptScorer>(targetPool, mandScorer, optScorer);
       }
+
+      // Now apply prohibited clauses
+      auto prohibitedScorers = createScorers(targetPool, segment, prohibitedWeights);
+      Query::Scorer* prohibitedScorer = nullptr;
+      if (prohibitedScorers.size() > 0) {
+        if (prohibitedScorers.size() == 1) {
+          prohibitedScorer = prohibitedScorers[0];
+        } else {
+          prohibitedScorer = targetPool.make<BooleanQuery::DisjunctionScorer>(targetPool, prohibitedScorers);
+        }
+        boolScorer = targetPool.make<BooleanQuery::MandNotScorer>(targetPool, boolScorer, prohibitedScorer);
+      }
+
+      return boolScorer;
     }
   };
 
-  class Scorer : public Query::Scorer {
+  class Scorer final : public Query::Scorer {
   public:
     Scorer() {}
 
@@ -397,7 +415,7 @@ public:
     }
   };
 
-  class MandOptScorer : public Query::Scorer {
+  class MandOptScorer final : public Query::Scorer {
     Query::Scorer *mandScorer;
     Query::Scorer *optScorer;
     int32_t id = -1;
@@ -442,8 +460,58 @@ public:
     }
   };
 
+  class MandNotScorer final : public Query::Scorer {
+    Query::Scorer *mandScorer;
+    Query::Scorer *notScorer;
+    int32_t id = -1;
+    int32_t notid = -1;
+  public:
+    MandNotScorer(MemPool& targetPool, Query::Scorer *mandScorer, Query::Scorer *notScorer) : mandScorer(mandScorer), notScorer(notScorer) {
+      unused(targetPool);
+    }
 
-  class ConjunctionScorer : public Query::Scorer {
+    int32_t docId() override {
+      return id;
+    }
+
+    int32_t next() override {
+      id = mandScorer->next();
+      return doNext();
+    }
+
+    int32_t advance(int32_t docid) override {
+      id = mandScorer->advance(docid);
+      return doNext();
+    }
+
+    bool advanceExact(int32_t docid) override {
+      return advance(docid) == docid;
+    }
+
+    float score() override {
+      return mandScorer->score();
+    }
+
+  private:
+
+    // mandScorer should be advanced and id set before calling this
+    int32_t doNext() {
+      while(id != PostingsReader::END) {
+        if (notid < id) {
+          notid = notScorer->advance(id);
+        }
+        if (notid > id) {
+          return id;
+        }
+        // at this point, notid == id, so we need to try another id by calling next again.
+        id = mandScorer->next();
+      }
+      return id;  // only way to reach here is if we hit the end
+    }
+  };
+
+
+  class ConjunctionScorer final : public Query::Scorer {
     std::span<Query::Scorer*> scorers;
 
     // TODO: OPT: heapifying with virtual methods prob isn't a good idea... pull out and save the docid.
@@ -507,7 +575,7 @@ public:
 
 
 
-  class DisjunctionScorer : public Query::Scorer {
+  class DisjunctionScorer final : public Query::Scorer {
     std::span<Query::Scorer*> scorers;
 
     // TODO: OPT: heapifying with virtual methods prob isn't a good idea... pull out and save the docid.
