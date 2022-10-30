@@ -368,5 +368,57 @@ TEST_F(TermScorerTest, boolScore) {
       }
     }
 
+    // mandatory clause with filter
+    {
+      std::vector<Query *> mand = {&the};
+      std::vector<Query *> filter = {&to};
+
+      BooleanQuery q(mand, {}, {}, filter);  // this should match the same as a "to" and "the" conjunction, but score differently.
+
+
+      auto poolFree = testIndex.pool.rewindScopeGuard();
+      Query::Context qContext(testIndex.pool, *testIndex.reader);
+      auto *weight = q.createWeight(qContext);
+      // put the scorer creation in a separate scope to test that it's OK to rewind the pool after we are done with a single scorer.
+      {
+        auto g = testIndex.pool.rewindScopeGuard();
+        Query::Scorer *scorer = weight->createScorer(
+                testIndex.pool, qContext.topReader.segments()[0]);
+        testScores(scorer, {}, {});
+      }
+      {
+        auto g = testIndex.pool.rewindScopeGuard();
+        Query::Scorer *scorer = weight->createScorer(
+                testIndex.pool, qContext.topReader.segments()[1]);
+        testScores(scorer, {2, 4}, {0.1266696f, 0.19089644f});
+      }
+    }
+
+    // optional clause with filter
+    {
+      std::vector<Query *> opt = {&the};
+      std::vector<Query *> filter = {&to};
+
+      BooleanQuery q({}, opt, {}, filter);  // this should match the same as a "to" and "the" conjunction, but score differently.
+
+
+      auto poolFree = testIndex.pool.rewindScopeGuard();
+      Query::Context qContext(testIndex.pool, *testIndex.reader);
+      auto *weight = q.createWeight(qContext);
+      // put the scorer creation in a separate scope to test that it's OK to rewind the pool after we are done with a single scorer.
+      {
+        auto g = testIndex.pool.rewindScopeGuard();
+        Query::Scorer *scorer = weight->createScorer(
+                testIndex.pool, qContext.topReader.segments()[0]);
+        testScores(scorer, {}, {});
+      }
+      {
+        auto g = testIndex.pool.rewindScopeGuard();
+        Query::Scorer *scorer = weight->createScorer(
+                testIndex.pool, qContext.topReader.segments()[1]);
+        testScores(scorer, {2, 4}, {0.1266696f, 0.19089644f});
+      }
+    }
+
   }
 }

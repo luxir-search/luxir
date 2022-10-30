@@ -305,6 +305,7 @@ public:
     std::span<Query::Weight*> mandatoryWeights;
     std::span<Query::Weight*> optionalWeights;
     std::span<Query::Weight*> prohibitedWeights;
+    std::span<Query::Weight*> filterWeights;
 
     // TODO: make these static (and refactor to query) so other queries can use them?
     // Returns a span of Weights, corresponding to the given span of Queries. Some weights can be null.
@@ -342,14 +343,21 @@ public:
       mandatoryWeights = createWeights(context.pool, context, query.mandatory);
       optionalWeights = createWeights(context.pool, context, query.optional);
       prohibitedWeights = createWeights(context.pool, context, query.prohibited);
+      filterWeights = createWeights(context.pool, context, query.filter);
     }
 
 
 
     Query::Scorer *createScorer(MemPool &targetPool, IndexReader::Segment &segment) override {
       auto mandatoryScorers = createScorers(targetPool, segment, mandatoryWeights);
-      // if some mandatory scorers are missing then it's impossible to match this segment
       if (mandatoryScorers.size() < query.mandatory.size()) {
+        // if any mandatory scorers are missing for this segment, then it's impossible to match.
+        return nullptr;
+      }
+
+      auto filterScorers = createScorers(targetPool, segment, filterWeights);
+      if (filterScorers.size() < query.filter.size()) {
+        // if any filters are missing for this segment, then it's impossible to match
         return nullptr;
       }
 
@@ -358,7 +366,7 @@ public:
         if (mandatoryScorers.size() == 1) {
           mandScorer = mandatoryScorers[0];
         } else {
-          mandScorer = targetPool.make<BooleanQuery::ConjunctionScorer>(targetPool, mandatoryScorers);
+          mandScorer = targetPool.make<BooleanQuery::ConjunctionScorer>(targetPool, mandatoryScorers, filterScorers);
         }
       }
 
@@ -375,7 +383,16 @@ public:
       // Find the current top scorer... mandatory, optional, or a combination.
       Query::Scorer* boolScorer = nullptr;
       if (mandScorer == nullptr) {
+        if (optScorer == nullptr) {
+          return nullptr;
+        }
         boolScorer = optScorer;
+        // if there were no mandatory clauses then we still need to handle any filter clauses.
+        if (filterScorers.size() > 0) {
+          std::span<Query::Scorer*> optSpan(targetPool.make_arr<Query::Scorer*>(1), 1);
+          optSpan[0] = optScorer;
+          boolScorer = targetPool.make<BooleanQuery::ConjunctionScorer>(targetPool, optSpan, filterScorers);
+        }
       } else if (optScorer == nullptr) {
         boolScorer = mandScorer;
       } else {
@@ -512,7 +529,8 @@ public:
 
 
   class ConjunctionScorer final : public Query::Scorer {
-    std::span<Query::Scorer*> scorers;
+    std::span<Query::Scorer*> scorers;    // just the mandatory scorers
+    std::span<Query::Scorer*> allScorers; // mandatory scorers combined with filter scorers
 
     // TODO: OPT: heapifying with virtual methods prob isn't a good idea... pull out and save the docid.
     constexpr static auto idComparator = [](Query::Scorer& a, Query::Scorer& b) { return b.docId() < a.docId(); };
@@ -524,12 +542,12 @@ public:
 
     // internal utility method where first scorer has already been advanced and is equal to the target.
     int32_t doNext(int32_t target) {
-      auto* firstScorer = scorers[0];
+      auto* firstScorer = allScorers[0];
 
       outer:
       for (;;) {
-        for (int j = 1; j < scorers.size(); j++) {
-          int32_t id = scorers[j]->advance(target);
+        for (int j = 1; j < allScorers.size(); j++) {
+          int32_t id = allScorers[j]->advance(target);
           assert(id >= target);
           if (id > target) {
             target = firstScorer->advance(target);
@@ -545,17 +563,26 @@ public:
 
   public:
     // The passed in span of scorers will be modified (rearranged).
-    ConjunctionScorer(MemPool& pool, std::span<Query::Scorer*> scorers)
+    ConjunctionScorer(MemPool& pool, std::span<Query::Scorer*> scorers, std::span<Query::Scorer*> filterScorers)
             : scorers(scorers)
     {
+      // combine the filterScorers with the mandatory scorers
+      if (filterScorers.size() != 0) {
+        allScorers = {pool.make_arr<Query::Scorer*>(scorers.size() + filterScorers.size()), scorers.size() + filterScorers.size()};
+        std::ranges::copy(filterScorers, allScorers.begin());
+        std::ranges::copy(scorers, allScorers.begin() + filterScorers.size());
+        // TODO: if any mandatory scorers are boosted to 0, we could remove them from scorers (keeping them in allScorers) for when score() is called.
+      } else {
+        allScorers = scorers;
+      }
     }
 
     int32_t next() override {
-      return doNext(scorers[0]->next());
+      return doNext(allScorers[0]->next());
     }
 
     int32_t advance(int32_t docid) override {
-      return doNext(scorers[0]->advance(docid));
+      return doNext(allScorers[0]->advance(docid));
     }
 
     /// doc we are positioned on
