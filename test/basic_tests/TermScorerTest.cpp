@@ -3,6 +3,7 @@
 #include "test/TestIndex.h"
 #include "solux/search/PostingsReader.h"
 #include "solux/query/Query.h"
+#include "solux/query/PhraseQuery.h"
 
 using namespace solux;
 using namespace solux::test;
@@ -36,7 +37,8 @@ protected:
       EXPECT_EQ(expectedDocs[i], scorer->next());
       EXPECT_EQ(expectedScores[i], scorer->score());
     }
-    EXPECT_EQ(scorer->next(), PostingsReader::END);
+    int32_t doc = scorer->next();
+    EXPECT_EQ(doc, PostingsReader::END);
     return 0;
   }
 
@@ -417,6 +419,58 @@ TEST_F(TermScorerTest, boolScore) {
         Query::Scorer *scorer = weight->createScorer(
                 testIndex.pool, qContext.topReader.segments()[1]);
         testScores(scorer, {2, 4}, {0.1266696f, 0.19089644f});
+      }
+    }
+
+
+    // phrase scoring (add idfs of terms, and termfreq is number of occurances of phrase)
+    // optional clause with filter
+    {
+      std::vector<std::string_view> terms = {"to", "the"};
+      std::vector<std::int32_t> positions = {0,1};
+
+      PhraseQuery q("foo_w", terms, positions);
+
+      auto poolFree = testIndex.pool.rewindScopeGuard();
+      Query::Context qContext(testIndex.pool, *testIndex.reader);
+      auto *weight = q.createWeight(qContext);
+      // put the scorer creation in a separate scope to test that it's OK to rewind the pool after we are done with a single scorer.
+      {
+        auto g = testIndex.pool.rewindScopeGuard();
+        Query::Scorer *scorer = weight->createScorer(
+                testIndex.pool, qContext.topReader.segments()[0]);
+        testScores(scorer, {}, {});
+      }
+      {
+        auto g = testIndex.pool.rewindScopeGuard();
+        Query::Scorer *scorer = weight->createScorer(
+                testIndex.pool, qContext.topReader.segments()[1]);
+        testScores(scorer, {2, 4}, {0.37283403f, 0.56187654f});
+      }
+    }
+
+    // reversed phrase shouldn't match anything
+    {
+      std::vector<std::string_view> terms = {"the", "to"};
+      std::vector<std::int32_t> positions = {0,1};
+
+      PhraseQuery q("foo_w", terms, positions);
+
+      auto poolFree = testIndex.pool.rewindScopeGuard();
+      Query::Context qContext(testIndex.pool, *testIndex.reader);
+      auto *weight = q.createWeight(qContext);
+      // put the scorer creation in a separate scope to test that it's OK to rewind the pool after we are done with a single scorer.
+      {
+        auto g = testIndex.pool.rewindScopeGuard();
+        Query::Scorer *scorer = weight->createScorer(
+                testIndex.pool, qContext.topReader.segments()[0]);
+        testScores(scorer, {}, {});
+      }
+      {
+        auto g = testIndex.pool.rewindScopeGuard();
+        Query::Scorer *scorer = weight->createScorer(
+                testIndex.pool, qContext.topReader.segments()[1]);
+        testScores(scorer, {}, {});
       }
     }
 
