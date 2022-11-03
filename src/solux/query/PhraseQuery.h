@@ -9,7 +9,10 @@ class PhraseQuery final : public Query {
   std::span<std::string_view> terms;
   std::span<int32_t> positions;
 public:
-  PhraseQuery(std::string_view field, std::span<std::string_view> terms, std::span<int32_t> positions) : field(field), terms(terms), positions(positions) {
+  PhraseQuery(std::string_view field, std::span<std::string_view> terms, std::span<int32_t> positions) : field(field),
+                                                                                                         terms(terms),
+                                                                                                         positions(
+                                                                                                                 positions) {
     assert(terms.size() == positions.size());
     assert(terms.size() >= 2);
   }
@@ -26,7 +29,7 @@ public:
     return positions;
   }
 
-  Weight *createWeight(Context &context) override {
+  Weight* createWeight(Context& context) override {
     return context.pool.make<PhraseQuery::Weight>(context, *this);
   }
 
@@ -37,7 +40,7 @@ public:
     std::span<CachedTermInfo*> cachedTermInfos;
     Similarity::BM25Scorer* simScorer;
   public:
-    explicit Weight(Query::Context& context, PhraseQuery &query) : Query::Weight(context), query(query) {
+    explicit Weight(Query::Context& context, PhraseQuery& query) : Query::Weight(context), query(query) {
       cachedFieldInfo = context.getCachedFieldInfo(query.getField());
       if (cachedFieldInfo != nullptr) {
         cachedTermInfos = context.pool.make_span<CachedTermInfo*>(query.getTerms().size());
@@ -51,12 +54,13 @@ public:
             return;
           }
           idf += similarity.idf(cachedFieldInfo->fieldStats, cachedTermInfos[i]->termStats);
-          simScorer = context.pool.make<Similarity::BM25Scorer>(similarity.getScorer(1.0f, cachedFieldInfo->fieldStats, (float)idf));
+          simScorer = context.pool.make<Similarity::BM25Scorer>(
+                  similarity.getScorer(1.0f, cachedFieldInfo->fieldStats, (float) idf));
         }
       }
     }
 
-    Scorer *createScorer(MemPool &targetPool, IndexReader::Segment &segment) override {
+    Scorer* createScorer(MemPool& targetPool, IndexReader::Segment& segment) override {
       if (cachedFieldInfo == nullptr) {
         return nullptr;
       }
@@ -130,7 +134,7 @@ public:
         for (int j = 1; j < docsEnums.size(); j++) {
           int32_t adjustedTarget = target + positions[j];
           // prev comparison to largestPossiblePos should keep adjustedTarget from overflowing.
-          int32_t p = docsEnums[j]->advancePosition((int32_t)adjustedTarget);
+          int32_t p = docsEnums[j]->advancePosition((int32_t) adjustedTarget);
           assert(p >= adjustedTarget);
           if (p > adjustedTarget) {
             // we overshot, so we need to advance the first enum and try again
@@ -154,13 +158,12 @@ public:
     }
 
 
-
   public:
-    Scorer(MemPool& targetPool, std::span<DocsEnum*> docsEnums, std::span<int32_t> positions, IntColReader& normsReader, Similarity::BM25Scorer& simScorer)
-            : docsEnums(docsEnums), positions(positions), normsIter(normsReader), simScorer(simScorer)
-    {
+    Scorer(MemPool& targetPool, std::span<DocsEnum*> docsEnums, std::span<int32_t> positions, IntColReader& normsReader,
+           Similarity::BM25Scorer& simScorer)
+            : docsEnums(docsEnums), positions(positions), normsIter(normsReader), simScorer(simScorer) {
       int32_t maxOff = 0;
-      for (auto pos : positions) {
+      for (auto pos: positions) {
         maxOff = std::max(maxOff, pos);
       }
       largestPossiblePos = PostingsReader::END - 1 - maxOff;
@@ -176,7 +179,7 @@ public:
 
     bool confirmMatch() {
       freq = 0;
-      for (auto* docsEnum : docsEnums) {
+      for (auto* docsEnum: docsEnums) {
         docsEnum->startPositions();
       }
       return doNextPosition(docsEnums[0]->advancePosition(positions[0]) - positions[0]) != PostingsReader::END;
@@ -194,7 +197,7 @@ public:
 
     int32_t advance(int32_t docid) override {
       advanceApprox(docid);
-      for(;;) {
+      for (;;) {
         if (docid == PostingsReader::END) {
           return PostingsReader::END;
         }
@@ -221,7 +224,7 @@ public:
       int32_t normDoc = normsIter.advance(docid);
       assert(normDoc == docid);
       auto encodedNorm = normsIter.value();
-      return simScorer.score((float)freq, encodedNorm);
+      return simScorer.score((float) freq, encodedNorm);
     }
   };
 

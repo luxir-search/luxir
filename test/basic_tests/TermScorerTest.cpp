@@ -1,9 +1,10 @@
 #include "gtest/gtest.h"
 #include "test/SoluxTest.h"
 #include "test/TestIndex.h"
-#include "solux/search/PostingsReader.h"
-#include "solux/query/Query.h"
+#include "solux/query/TermQuery.h"
 #include "solux/query/PhraseQuery.h"
+#include "solux/query/BooleanQuery.h"
+
 
 using namespace solux;
 using namespace solux::test;
