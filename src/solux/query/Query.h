@@ -42,6 +42,9 @@ template <typename KeyType, typename ValType>
 class PoolMapVec {
 public:
   // This is mostly a helper class since it was hard to get the types right the first time.
+  // Example:
+  // using SegFieldInfoMap = PoolMapVec<std::string_view, SegFieldInfo>;
+  // SegFieldInfoMap segFieldInfoMap;
 
   using key_type = KeyType;
   using value_type = ValType;
@@ -63,6 +66,23 @@ public:
   }
 };
 
+struct CachedTermInfo {
+  int32_t sharedCount = 0;
+  Similarity::TermStats termStats = {};
+  Similarity::BM25Scorer* simScorer = nullptr;  // This may be null even if other elements are fille in (phrase query would have different one)
+  std::span<DocsEnum*> docsEnums = {}; // TODO: cache align if they will be used in multiple threads
+};
+
+struct CachedFieldInfo {
+  std::span<SegFieldInfo*> segInfos = {};
+  Similarity::FieldStats fieldStats = {};
+  std::span<TermsEnum*> termsEnums = {};  // TODO: cache align if they will be used in multiple threads
+  gtl::node_hash_map<std::string_view, CachedTermInfo, std::hash<std::string_view>, std::equal_to<>, MemPool::allocator<std::pair<const std::string_view, CachedTermInfo>>> termInfos;
+
+  CachedFieldInfo(MemPool& pool, size_t initialMapSize=4) : termInfos(initialMapSize, pool.getAllocator()) {}
+};
+
+
 // NOTE: no virtual destructor, so subclasses of Query should be made trivially destructible
 class Query {
 public:
@@ -82,17 +102,19 @@ public:
     IndexReader& topReader;
     Weight* top = nullptr;
 
-    // TODO: put in pool
-    std::vector<FieldReader> fieldReaders;
-    using SegFieldInfoMap = PoolMapVec<std::string_view, SegFieldInfo>;
-    SegFieldInfoMap segFieldInfoMap;
-
+    std::span<FieldReader> fieldReaders;
+    gtl::node_hash_map<std::string_view, CachedFieldInfo, std::hash<std::string_view>, std::equal_to<>, MemPool::allocator<std::pair<const std::string_view, CachedFieldInfo>>> fieldInfoMap;
 
     Context(MemPool& pool, IndexReader& topReader)
-    : pool(pool), topReader(topReader), segFieldInfoMap(pool, 4) {
+    : pool(pool), topReader(topReader), fieldInfoMap(4, pool.getAllocator()) {
 
-      for (auto& segment : topReader.segments()) {
-        fieldReaders.emplace_back(pool, segment.postingsReader());
+      auto numSegs = numSegments();
+
+      // allocate the raw space (then use operator placement new) since we don't have a default constructor
+      fieldReaders = {(FieldReader*)pool.alloc(sizeof(FieldReader)*numSegs, alignof(FieldReader)), numSegs};
+
+      for (auto i = 0; i < numSegs; i++) {
+        new (&fieldReaders[i]) FieldReader(pool, topReader.segments()[i].postingsReader());
       }
     }
 
@@ -101,30 +123,101 @@ public:
       return topReader.segments().size();
     }
 
-    std::span<u_ptr<SegFieldInfo>> getSegFieldInfos(std::string_view fieldName) {
+    std::span<SegFieldInfo*> readSegInfos(std::string_view field) {
       auto numSegs = numSegments();
-
-      // TODO: what if this is a non-existant field? We probably should not cache that (esp somewhere that could
-      // lead to unbounded growth, like if we moved this segFieldInfo cache to the IndexReader
-
-      auto &vec = segFieldInfoMap.insertOrGet(fieldName);
-      if (vec.size() == 0) {
-        vec.resize(numSegs);
-        for (int i = 0; i < numSegs; ++i) {
-          if (fieldReaders[i].seek(fieldName)) {
-            vec[i] = pool.make_unique<SegFieldInfo>();
-            fieldReaders[i].readFieldInfo(*vec[i]);
-          } else {
-            vec[i] = nullptr;
-          }
+      int foundCount = 0;
+      auto savepoint = pool.getSavePoint();
+      std::span<SegFieldInfo*> segInfos = {pool.make_arr<SegFieldInfo*>(numSegs), numSegs};
+      for (int i = 0; i < numSegs; ++i) {
+        if (fieldReaders[i].seek(field)) {
+          segInfos[i] = pool.make<SegFieldInfo>();
+          fieldReaders[i].readFieldInfo(*segInfos[i]);
+          foundCount++;
+        } else {
+          segInfos[i] = nullptr;
         }
       }
-
-      return vec;
+      if (foundCount == 0) {
+        pool.rewind(savepoint);
+        return {};
+      }
+      return segInfos;
     }
+
+    /// Returns nullptr if the field is not found in any segment
+    CachedFieldInfo* getCachedFieldInfo(std::string_view field) {
+      auto [iter, inserted] = fieldInfoMap.try_emplace(field, pool, 4);
+      CachedFieldInfo& result = iter->second;
+      if (!inserted) {
+        return &result;
+      }
+
+      result.segInfos = readSegInfos(field);
+      if (result.segInfos.empty()) {
+        // field doesn't exist in any segment.
+        fieldInfoMap.erase(iter);
+        // we can't rewind the pool here because we still emplaced on the map.  We could do a lookup first if it's important.
+        return nullptr;
+      }
+
+      // TODO: make caching of the terms enums optional?
+      auto numSegs = numSegments();
+      result.termsEnums = {pool.make_arr<TermsEnum *>(numSegs), numSegs};
+      for (int i = 0; i < numSegs; ++i) {
+        auto &segFieldInfo = result.segInfos[i];
+        if (!segFieldInfo) {
+          result.termsEnums[i] = nullptr;
+          continue;
+        }
+        TermsEnum *termsEnum = pool.make<TermsEnum>(pool, topReader.segments()[i].postingsReader(), *segFieldInfo);
+        result.termsEnums[i] = termsEnum;
+
+        // add the stats from this termsEnum to fieldStats
+        result.fieldStats.sumTotalTermFreq += termsEnum->sumTotalTermFreq();
+        result.fieldStats.sumDocFreq += termsEnum->sumDocFreq();
+        result.fieldStats.docsWithField += termsEnum->docsWithField();
+      }
+
+      return &result;
+    }
+
+    CachedTermInfo* getCachedTerminfo(CachedFieldInfo& cachedFieldInfo, std::string_view term) {
+      auto [iter, inserted] = cachedFieldInfo.termInfos.try_emplace(term);
+      CachedTermInfo& result = iter->second;
+      if (!inserted) {
+        result.sharedCount++;
+        return &result;
+      }
+
+      auto savepoint = pool.getSavePoint();
+      auto numSegs = numSegments();
+      int foundInSegCount = 0;
+      result.docsEnums = {pool.make_arr<DocsEnum*>(numSegs), numSegs};
+      for (int i = 0; i < numSegs; ++i) {
+        auto& termsEnum = cachedFieldInfo.termsEnums[i];
+        if (!termsEnum || !termsEnum->seek(term)) {
+          result.docsEnums[i] = nullptr;
+          continue;
+        }
+        foundInSegCount++;
+        DocsEnum* docsEnum = pool.make<DocsEnum>(pool, topReader.segments()[i].postingsReader(), *termsEnum);
+        result.docsEnums[i] = docsEnum;
+        result.termStats.docFreq += docsEnum->numDocs();
+        result.termStats.totalTermFreq += docsEnum->totalTermFreq();
+      }
+
+      if (foundInSegCount == 0) {
+        pool.rewind(savepoint);
+        cachedFieldInfo.termInfos.erase(iter);
+        return nullptr;
+      }
+
+      return &result;
+    }
+
   };
 
-  // A weight is created by a query for a specific index
+  // A weight is created by a query for execution over a specific index
   class Weight {
   protected:
     Query::Context& context;
@@ -182,50 +275,36 @@ public:
   class Weight final : public Query::Weight {
   protected:
     TermQuery &query;
-    std::span<u_ptr<SegFieldInfo>> segFieldInfos;
+    CachedFieldInfo* cachedFieldInfo =  nullptr;
+    CachedTermInfo* cachedTermInfo = nullptr;
   public:
-    Similarity::FieldStats fieldStats;
-    Similarity::TermStats termStats;
-
-    Similarity::BM25Scorer* simScorer;
-
     Weight(Query::Context& context, TermQuery& query) : Query::Weight(context), query(query) {
-      calcFieldStats(fieldStats, termStats);
-      simScorer = context.pool.make<Similarity::BM25Scorer>(Similarity().getScorer(1.0f, fieldStats, termStats));
-    }
-
-
-    // calculate aggregate field and term statistics
-    // (TODO: share fieldStats)
-    void calcFieldStats(Similarity::FieldStats& fieldStats, Similarity::TermStats& termStats) {
-      fieldStats.maxDoc = context.topReader.numDocs();
-
-      auto numSegs = context.numSegments();
-      segFieldInfos = context.getSegFieldInfos(query.getField());
-
-      for (int i = 0; i < numSegs; ++i) {
-        auto& segFieldInfo = segFieldInfos[i];
-        if (segFieldInfo) {
-          TermsEnum termsEnum(context.pool, context.topReader.segments()[i].postingsReader(), *segFieldInfo);
-          // add the stats from this termsEnum to fieldStats
-          fieldStats.sumTotalTermFreq += termsEnum.sumTotalTermFreq();
-          fieldStats.sumDocFreq += termsEnum.sumDocFreq();
-          fieldStats.docsWithField += termsEnum.docsWithField();
-
-          // We currently need DocsEnum to get the termStats
-          if (termsEnum.seek(query.getTerm())) {
-            DocsEnum docsEnum(context.pool, context.topReader.segments()[i].postingsReader(), termsEnum);
-            termStats.docFreq += docsEnum.numDocs();
-            termStats.totalTermFreq += docsEnum.totalTermFreq();
-          }
+      cachedFieldInfo = context.getCachedFieldInfo(query.getField());
+      if (cachedFieldInfo != nullptr) {
+        cachedTermInfo = context.getCachedTerminfo(*cachedFieldInfo, query.getTerm());
+      }
+      if (cachedTermInfo != nullptr) {
+        if (cachedTermInfo->simScorer == nullptr) {
+          cachedTermInfo->simScorer = context.pool.make<Similarity::BM25Scorer>(Similarity().getScorer(1.0f, cachedFieldInfo->fieldStats, cachedTermInfo->termStats));
         }
       }
     }
 
+
+
     TermQuery::Scorer* createScorer(MemPool &targetPool, IndexReader::Segment &segment) override {
-      // TODO: cache the DocsEnum from when we had to calculate the term stats?
-      auto* segFieldInfo = segFieldInfos[segment.ord].get();
-      assert(segFieldInfo != nullptr);  // we should never get this far if the field doesn't exist in this segment... but perhaps as a general mechanism we should return nullptr here?
+      if (cachedTermInfo == nullptr) {
+        // term doesn't exist in any segment
+        return nullptr;
+      }
+      DocsEnum* docsEnum = cachedTermInfo->docsEnums[segment.ord];
+      if (docsEnum == nullptr) {
+        // term doesn't exist in this segment
+        return nullptr;
+      }
+
+
+      /* code before caching...
       TermsEnum termsEnum(context.pool, segment.postingsReader(), *segFieldInfo);
       if (!termsEnum.seek(query.getTerm())) {
         return nullptr;
@@ -233,8 +312,16 @@ public:
       // If we create a new DocsEnum each time, then we can put it in the targetPool.  If we cache it, it should be
       // cached elsewhere (like the context pool?)
       DocsEnum* docsEnum = targetPool.make<DocsEnum>(targetPool, segment.postingsReader(), termsEnum);
+       */
+
+      if (cachedTermInfo->sharedCount > 0) {
+        // This cachedTerm is shared, so we need to make a copy of the DocsEnum
+        docsEnum = targetPool.make<DocsEnum>(targetPool, *docsEnum);
+      }
+
+      auto* segFieldInfo = cachedFieldInfo->segInfos[segment.ord]; // this segFieldInfo can't be null at this point
       IntColReader* normsReader = targetPool.make<IntColReader>(targetPool, segment.postingsReader(), *segFieldInfo);
-      return targetPool.make<TermQuery::Scorer>(*docsEnum, *normsReader, *simScorer);
+      return targetPool.make<TermQuery::Scorer>(*docsEnum, *normsReader, *cachedTermInfo->simScorer);
     }
 
   };

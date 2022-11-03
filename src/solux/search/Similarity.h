@@ -5,6 +5,7 @@
 #include <array>
 #include <cassert>
 #include <bit>
+#include <span>
 #include "solux/util/solux_util.h"
 
 namespace solux {
@@ -165,6 +166,14 @@ public:
     return BM25Scorer(boost, k1, b, idf_, avgdl);
   }
 
+  BM25Scorer getScorer(float boost, const FieldStats& fieldStats, std::span<TermStats*> termStatsList) {
+    double idf_ = 0.0;
+    for (auto termStats : termStatsList) {
+      idf_ += idf(fieldStats, *termStats);
+    }
+    auto avgdl = avgFieldLength(fieldStats);
+    return BM25Scorer(boost, k1, b, idf_, avgdl);
+  }
 
   float idf(int64_t docFreq, int64_t docCount) {
     return (float) std::log1p( (docCount - docFreq + 0.5L) / (docFreq + 0.5L) );

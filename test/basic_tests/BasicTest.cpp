@@ -19,14 +19,18 @@ TEST(BasicTest, testCompiler) {
     EXPECT_EQ(4, sizeof(int));
     EXPECT_EQ(4, sizeof(unsigned));
 
+    // We don't require <=256, it's just a sanity check (i.e. we haven't seen it happen)
+    EXPECT_TRUE(std::hardware_destructive_interference_size > 0 && std::hardware_destructive_interference_size <= 256);
+
     SOLUX_PACKED_START
     struct alignas(1) s2 {
       int64_t x;
       char c;
       int32_t z;
+      char d;
     } SOLUX_PACKED_END;
 
-    EXPECT_EQ(sizeof(int64_t)+sizeof(char)+sizeof(int32_t), sizeof(s2));  // make sure there is no padding
+    EXPECT_EQ(sizeof(int64_t)+sizeof(char)*2+sizeof(int32_t), sizeof(s2));  // make sure there is no padding
 
     // tagged pointer on heap
     TaggedPtr<std::string> tp(new std::string("hi"),5);

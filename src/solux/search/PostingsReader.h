@@ -443,7 +443,7 @@ public:
     return startingOrd + ordInBlock;
   }
 
-  /// NOTE: the returned term is invalidated if this TermsEnum is moved off this
+  /// NOTE: the returned term is invalidated/changed if this TermsEnum is moved off this
   /// term (i.e. the moment next() or seek() is called). Make a copy if you wish to keep it!
   PackedTerm term() const {
     return currTerm;
@@ -528,7 +528,7 @@ public:
     readTermMetadata();
   }
 
-  bool seek(const std::string_view& target) {  // TODO: templatize for anything that looks like a string?
+  bool seek(std::string_view target) {
     auto termBlockEnd = termBlockOffsets + numTermBlocks;
     // Find the first block that is greater than the current term.
     // std::cout << "seek key=" << target << " numBlocks=" << fieldReader.numTermBlocks << std::endl;
@@ -554,7 +554,7 @@ public:
     // return seekCeilInBlock(target); // use this version to skip comparing hashes
   }
 
-  bool seekInBlock(const std::string_view& target) {
+  bool seekInBlock(std::string_view target) {
     // TODO: rather than hashing every segment, have an option to pass it in?
     char hash = (char)XXH3_64bits(target.data(), target.size());
     int lastOrd = ordInBlock - 1; // check the current term we are on.
@@ -588,7 +588,7 @@ public:
   }
 
 
-  bool seekCeilInBlock(const std::string_view& target) {
+  bool seekCeilInBlock(std::string_view target) {
     auto cmp = term() <=> target;
     // std::cout << " comparing with first " << term() << ": eq=" << (cmp==0) << " gt=" <<  (cmp>0) << std::endl;
     if (cmp == 0) return true;
@@ -650,7 +650,7 @@ class DocsEnum {
   InputStream posIS;
   PostingsReader& postingsReader;
   const SegFieldInfo& fieldInfo;
-  MemPool& pool;
+  MemPool* pool;
   int32_t docfreq; // number of docs containing this term
   int64_t ttf;    // totalTermFreq (sum of term freq across all docs for this term)
 
@@ -682,7 +682,7 @@ public:
   // This instance *does* rely on fieldInfo that was passed into the TermsEnum instance still being valid.
   DocsEnum(MemPool& pool, PostingsReader& postingsReader, TermsEnum& tenum,
            int32_t* docsScratch=nullptr, int32_t* posScratch=nullptr, int32_t* tfreqScratch=nullptr)
-  : postingsReader(postingsReader), pool(pool), fieldInfo(tenum.fieldInfo)
+  : postingsReader(postingsReader), pool(&pool), fieldInfo(tenum.fieldInfo)
   {
     docBuf=db;
     posBuf=pb;
@@ -695,6 +695,7 @@ public:
     docsSize = tenum.docsSize;
     docid = -1;
 
+    // TODO: look into deferring filling the buffer until we need it, then we can avoid allocating the buffers for a shared DocsEnum.
     if (docsSize == 0) {
       // postings pulsed
       docfreq = 1;
@@ -742,6 +743,18 @@ public:
     }
   }
 
+  DocsEnum(const DocsEnum& other) = delete;
+
+  DocsEnum(MemPool& pool, const DocsEnum& other) : postingsReader(other.postingsReader), fieldInfo(other.fieldInfo) {
+    memcpy(this, &other, sizeof(DocsEnum));  // is there a better way to copy everything that can be copied so we don't forget anything?
+    // re-point the internal pointers
+    this->pool = &pool; // new pool (currently unused though since buffers are immediate)
+    docBuf = db;
+    posBuf = pb;
+    tfreqBuf = tb;
+    // If buffers cease to be immediate, we need to copy in the pulsed docs/positions/freqs (first element)
+  }
+
   /// number of documents containing the term
   int32_t numDocs() {
     return docfreq;
@@ -786,7 +799,7 @@ public:
       // Boundary analysis: if docfreq==1 and docOrd==1 (meaning we already read ord 0, but not 1), we are done.
       if (leftToRead <= 0) {
         assert(leftToRead == 0);
-        docid = INT_MAX;
+        docid = PostingsReader::END;
         return docid;
       }
 
@@ -932,8 +945,8 @@ public:
       if (leftToRead <= 0) {
         assert(posOrd == cumulativeTermFreq); // should not have gone past
         // TODO: set pos to something, or keep last valid position?
-        pos = INT_MAX;
-        return pos;  // or -1?
+        pos = PostingsReader::END;
+        return pos;
       }
 
       // we moved to a new doc, but still have positions decoded in the buffer.
