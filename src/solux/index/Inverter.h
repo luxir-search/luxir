@@ -238,7 +238,7 @@ public:
       tc.head.setMutableValue(mutableVal, len);
 
       int numTokens = 0;
-      int pos = 0;
+      int pos = -1;
       Token &tok = tc.head.getToken();
       TokenStream& tail = *tc.tail;
       int docid = inverter.currDoc;

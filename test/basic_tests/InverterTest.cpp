@@ -16,7 +16,7 @@ public:
   uint64_t dochash = 1;
   uint64_t poshash = 1;
   int lastDoc = -1;
-  int position = 0;
+  int position = -1;
   bool operator==(TestConsumer const&) const = default;
 
   void startDoc(int docid) {
@@ -24,13 +24,14 @@ public:
     ASSERT_GT(docid , lastDoc);
     dochash = dochash*29 + lastDoc;
     lastDoc = docid;
-    position = 0;
+    position = -1;
   }
   void endDoc(int docid) {
     ASSERT_EQ(docid, lastDoc);
     dochash = dochash*29 + lastDoc;
   }
   void addPositionDelta(int delta) {
+    // std::cout << "\t\tdelta=" << delta << " pos=" << position << " pos+delta=" << position+delta << std::endl;
     position += delta;
     ASSERT_GT(position, -1);  // TODO: can positions be 0?
     poshash = poshash*29 + position;
@@ -80,19 +81,19 @@ TEST_F(InverterTest, simplePos) {
   // This code should be tested with maximum optimization flags.
   //
   MemPool pool;
-  DocFreqPosStream docstream(pool, 3,2);
+  DocFreqPosStream docstream(pool, 3,1);
   TestConsumer c1;
   c1.startDoc(3); c1.addPositionDelta(2); c1.endDoc(3);
   TestConsumer c;
   docstream.pushDocs(pool, c);
   ASSERT_EQ(c1, c);
 
-  DocFreqPosStream ds2(pool, 3,2);
+  DocFreqPosStream ds2(pool, 3,1);
   ds2.addDoc(pool, 5, 6);
   ds2.addDoc(pool, 5, 13);
   c1 = TestConsumer();
   c1.startDoc(3); c1.addPositionDelta(2); c1.endDoc(3);
-  c1.startDoc(5); c1.addPositionDelta(6); c1.addPositionDelta(7); c1.endDoc(5);
+  c1.startDoc(5); c1.addPositionDelta(7); c1.addPositionDelta(7); c1.endDoc(5);
   c = TestConsumer();
   ds2.pushDocs(pool, c);
   ASSERT_EQ(c1, c);
@@ -110,14 +111,14 @@ TEST_F(InverterTest, interleavedPos) {
 
   int iter=100;
   for (int i=0; i<iter; i++) {
-    DocFreqPosStream d1(pool, 3, 2);
+    DocFreqPosStream d1(pool, 3, 1);
     TestConsumer c1;
     c1.startDoc(3);
     c1.addPositionDelta(2);
     //addPositions(pool, d1, c1, rng.rint(10)); // sometimes add 0 additional positions to test boundaries.
     c1.endDoc(3);
 
-    DocFreqPosStream d2(pool, 4, 5);
+    DocFreqPosStream d2(pool, 4, 4);
     TestConsumer c2;
     c2.startDoc(4);
     c2.addPositionDelta(5);

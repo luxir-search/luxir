@@ -104,7 +104,7 @@ protected:
     } else {
       writer->startDoc(docid);
     }
-    uint64_t position = 0;
+    uint64_t position = -1;
     uint32_t actualPositions = 0;
     for (uint32_t i = 0; i < numPositions; i++) {   // TODO: introduce constants for limits
       auto delta = getPositionDelta(numPositions);
@@ -379,7 +379,7 @@ TEST_F(PostingsTest, blockPositions) {
   // if (false)  // skip reading positions
   {
     docsEnum.startPositions();
-    uint32_t lastPos = 0;
+    int32_t lastPos = -1;
     for (int i = 0; i < tfreq; i++) {
       auto pos = docsEnum.nextPosition();
       auto posDelta = pos - lastPos;
@@ -394,7 +394,7 @@ TEST_F(PostingsTest, blockPositions) {
   ASSERT_EQ(tfreq2, nPos2);
   {
     docsEnum.startPositions();
-    uint32_t lastPos = 0;
+    int32_t lastPos = -1;
     for (int i = 0; i < tfreq; i++) {
       auto pos = docsEnum.nextPosition();
       auto posDelta = pos - lastPos;
@@ -440,7 +440,7 @@ TEST_F(PostingsTest, blockTerms) {
   TermsEnum tenum(pool, reader, fieldInfo);
   ASSERT_EQ(tenum.numTerms(), nTerms);
 
-    for (int i=0; i<nTerms; i++) {
+  for (int i=0; i<nTerms; i++) {
     sprintf(tstr.data() + 4, "%08d", i);
 
     ASSERT_TRUE(tenum.nextTerm());
@@ -455,8 +455,8 @@ TEST_F(PostingsTest, blockTerms) {
     ASSERT_EQ(docsEnum.termFreq(), 2);
 
     docsEnum.startPositions();
+    ASSERT_EQ(docsEnum.nextPosition(), i*2-1);
     ASSERT_EQ(docsEnum.nextPosition(), i*2);
-    ASSERT_EQ(docsEnum.nextPosition(), i*2 + 1);
     ASSERT_EQ(docsEnum.nextPosition(), INT_MAX);  // TODO: replace with constant
 
     ASSERT_EQ(docsEnum.nextDoc(), INT_MAX);

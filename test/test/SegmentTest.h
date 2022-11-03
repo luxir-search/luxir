@@ -152,8 +152,8 @@ public:
     } else {
       writer->startDoc(docid);
     }
-    uint64_t position = 0;
-    uint32_t actualPositions = 0;
+    int64_t position = -1;
+    int32_t actualPositions = 0;
     for (uint32_t i = 0; i < numPositions; i++) {   // TODO: introduce constants for limits
       auto delta = getPositionDelta(numPositions);
       position += delta;

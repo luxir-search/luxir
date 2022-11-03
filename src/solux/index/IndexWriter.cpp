@@ -106,7 +106,7 @@ private:
       int32_t newDocid = base + docid;
       textWriter.startDoc(newDocid);
       docsEnum.startPositions();
-      int32_t lastPos = 0;
+      int32_t lastPos = -1;
       for(;;) {
         auto pos = docsEnum.nextPosition();
         if (pos == INT_MAX) break;

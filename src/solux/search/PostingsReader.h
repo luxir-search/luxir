@@ -792,6 +792,10 @@ public:
     return docid;
   }
 
+  // we also have a next() to align with scorers
+  int32_t next() {
+    return nextDoc();
+  }
 
   int32_t nextDoc() {
     if (docBufIdx >= docBufEnd) {
@@ -868,8 +872,15 @@ public:
   }
 
 
+  int32_t advance(int32_t target) {
+    while (docid < target) {
+      nextDoc();
+    }
+    return docid;
+  }
+
   void startPositions() {
-    pos = 0;
+    pos = -1;
     while (posOrd < posOrdStart) {
       // need to skip some positions.
       auto numToSkip = posOrdStart - posOrd;
@@ -989,6 +1000,13 @@ public:
     // And given that there is no data dependency in this hot loop, it's unclear if it would help at all.
     posOrd++;
     pos += delta;
+    return pos;
+  }
+
+  int32_t advancePosition(int32_t target) {
+    while (pos < target) {
+      nextPosition();
+    }
     return pos;
   }
 

@@ -39,19 +39,19 @@ TEST_F(TextMergeTest, basicMerge) {
   TermsEnum tenum = f.createTermsEnum();
   ASSERT_EQ(tenum.nextTerm(), true);
   ASSERT_EQ(std::string_view(tenum.term()), "both");
-  ASSERT_EQ(f.readDocsAndPositions(tenum), (std::vector<int32_t>{0, 2, 2, 4,   1, 2, 1, 3}));
+  ASSERT_EQ(f.readDocsAndPositions(tenum), (std::vector<int32_t>{0, 2, 1, 3,   1, 2, 0, 2}));
   ASSERT_EQ(tenum.nextTerm(), true);
   ASSERT_EQ(std::string_view(tenum.term()), "seg1");
-  ASSERT_EQ(f.readDocsAndPositions(tenum), (std::vector<int32_t>{0, 2, 1, 3}));
+  ASSERT_EQ(f.readDocsAndPositions(tenum), (std::vector<int32_t>{0, 2, 0, 2}));
   ASSERT_EQ(tenum.nextTerm(), true);
   ASSERT_EQ(std::string_view(tenum.term()), "seg1a");
-  ASSERT_EQ(f.readDocsAndPositions(tenum), (std::vector<int32_t>{0, 1, 5}));
+  ASSERT_EQ(f.readDocsAndPositions(tenum), (std::vector<int32_t>{0, 1, 4}));
   ASSERT_EQ(tenum.nextTerm(), true);
   ASSERT_EQ(std::string_view(tenum.term()), "seg2");
-  ASSERT_EQ(f.readDocsAndPositions(tenum), (std::vector<int32_t>{1, 2, 2, 4}));
+  ASSERT_EQ(f.readDocsAndPositions(tenum), (std::vector<int32_t>{1, 2, 1, 3}));
   ASSERT_EQ(tenum.nextTerm(), true);
   ASSERT_EQ(std::string_view(tenum.term()), "seg2a");
-  ASSERT_EQ(f.readDocsAndPositions(tenum), (std::vector<int32_t>{1, 1, 5}));
+  ASSERT_EQ(f.readDocsAndPositions(tenum), (std::vector<int32_t>{1, 1, 4}));
   ASSERT_EQ(tenum.nextTerm(), false);
 
   // Now lets test merging a new field
@@ -70,7 +70,7 @@ TEST_F(TextMergeTest, basicMerge) {
   TermsEnum tenum2 = f2.createTermsEnum();
   ASSERT_EQ(tenum2.nextTerm(), true);
   ASSERT_EQ(std::string_view(tenum2.term()), "yeah!");
-  ASSERT_EQ(f2.readDocsAndPositions(tenum2), (std::vector<int32_t>{2, 1, 1}));
+  ASSERT_EQ(f2.readDocsAndPositions(tenum2), (std::vector<int32_t>{2, 1, 0}));
   ASSERT_EQ(tenum2.nextTerm(), false);
 
   // Make sure the original is still there...
@@ -79,6 +79,6 @@ TEST_F(TextMergeTest, basicMerge) {
   ASSERT_EQ(tenum_f1.docsWithField(), 2);
   ASSERT_EQ(tenum_f1.nextTerm(), true);
   ASSERT_EQ(std::string_view(tenum_f1.term()), "both");
-  ASSERT_EQ(f.readDocsAndPositions(tenum_f1), (std::vector<int32_t>{0, 2, 2, 4,   1, 2, 1, 3}));
+  ASSERT_EQ(f.readDocsAndPositions(tenum_f1), (std::vector<int32_t>{0, 2, 1, 3,   1, 2, 0, 2}));
 }
 

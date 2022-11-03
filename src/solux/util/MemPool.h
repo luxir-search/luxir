@@ -199,6 +199,12 @@ public:
   }
 
   template <typename T>
+  std::span<T> make_span(size_t size) {
+    T* arr = make_arr<T>(size);
+    return {arr, size};
+  }
+
+  template <typename T>
   std::span<T> copy_span(std::span<T> span) {
     T* arr = make_arr<T>(span.size());
     std::copy(span.begin(), span.end(), arr);

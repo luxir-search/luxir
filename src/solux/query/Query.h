@@ -71,6 +71,21 @@ struct CachedTermInfo {
   Similarity::TermStats termStats = {};
   Similarity::BM25Scorer* simScorer = nullptr;  // This may be null even if other elements are fille in (phrase query would have different one)
   std::span<DocsEnum*> docsEnums = {}; // TODO: cache align if they will be used in multiple threads
+
+  /// Get a possibly-cached DocsEnum for use. This means cloning it if the cached one is shared.
+  DocsEnum* useDocsEnum(MemPool& targetPool, IndexReader::Segment& segment) {
+    auto* docsEnum = docsEnums[segment.ord];
+    if (docsEnum == nullptr) {
+      return nullptr;
+    }
+    if (sharedCount > 0) {
+      // This cachedTerm is shared, so we need to make a copy of the DocsEnum
+      docsEnum = targetPool.make<DocsEnum>(targetPool, *docsEnum);
+    }
+    return docsEnum;
+  }
+
+
 };
 
 struct CachedFieldInfo {
@@ -297,7 +312,7 @@ public:
         // term doesn't exist in any segment
         return nullptr;
       }
-      DocsEnum* docsEnum = cachedTermInfo->docsEnums[segment.ord];
+      DocsEnum* docsEnum = cachedTermInfo->useDocsEnum(targetPool, segment);
       if (docsEnum == nullptr) {
         // term doesn't exist in this segment
         return nullptr;
@@ -313,11 +328,6 @@ public:
       // cached elsewhere (like the context pool?)
       DocsEnum* docsEnum = targetPool.make<DocsEnum>(targetPool, segment.postingsReader(), termsEnum);
        */
-
-      if (cachedTermInfo->sharedCount > 0) {
-        // This cachedTerm is shared, so we need to make a copy of the DocsEnum
-        docsEnum = targetPool.make<DocsEnum>(targetPool, *docsEnum);
-      }
 
       auto* segFieldInfo = cachedFieldInfo->segInfos[segment.ord]; // this segFieldInfo can't be null at this point
       IntColReader* normsReader = targetPool.make<IntColReader>(targetPool, segment.postingsReader(), *segFieldInfo);

@@ -191,7 +191,8 @@ public:
 
   DocFreqPosStream(MemPool &pool, int docid, int pos) : lastDoc(docid), lastDocDelta(docid), docFreq(1),
                                                         termFreq(1), lastPos(pos) {
-    positions.writeVInt(pool, pos);
+    lastPos = -1;
+    writePos(pool, pos);
   }
 
   DocFreqPosStream(const DocFreqPosStream &) = delete;
@@ -216,7 +217,7 @@ public:
       termFreq = 1;
       lastDoc = docid;
       lastDocDelta = delta;
-      lastPos = 0;
+      lastPos = -1;
       writePos(pool, pos);
     }
   }

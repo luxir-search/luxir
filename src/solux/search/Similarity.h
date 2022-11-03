@@ -90,10 +90,10 @@ public:
 // See the Lucene javadoc for BM25Similarity for more info.
 //
 class Similarity {
+public:
   const float k1;
   const float b;
 
-public:
   Similarity(float k1=1.2f, float b=0.75f)
   : k1(k1), b(b) {
   }
@@ -162,6 +162,11 @@ public:
   // Pass in field stats and term stats to get a scorer for this Similarity
   BM25Scorer getScorer(float boost, const FieldStats& fieldStats, const TermStats& termStats) {
     auto idf_ = idf(fieldStats, termStats);
+    auto avgdl = avgFieldLength(fieldStats);
+    return BM25Scorer(boost, k1, b, idf_, avgdl);
+  }
+
+  BM25Scorer getScorer(float boost, const FieldStats& fieldStats, float idf_) {
     auto avgdl = avgFieldLength(fieldStats);
     return BM25Scorer(boost, k1, b, idf_, avgdl);
   }
