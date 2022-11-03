@@ -34,9 +34,9 @@ protected:
       EXPECT_EQ(expectedDocs.size(), 0);
       return 0;
     }
-    for (size_t i=0; i<expectedDocs.size(); i++) {
+    for (size_t i = 0; i < expectedDocs.size(); i++) {
       EXPECT_EQ(expectedDocs[i], scorer->next());
-      EXPECT_EQ(expectedScores[i], scorer->score());
+      EXPECT_FLOAT_EQ(expectedScores[i], scorer->score());
     }
     int32_t doc = scorer->next();
     EXPECT_EQ(doc, PostingsReader::END);
@@ -120,8 +120,9 @@ TEST_F(TermScorerTest, singleSeg) {
       Query::Context qContext(testIndex.pool, *testIndex.reader);
 
       auto* weight = tq.createWeight(qContext);
-      TermQuery::Scorer* scorer = dynamic_cast<TermQuery::Scorer*>( weight->createScorer(testIndex.pool, qContext.topReader.segments()[0]) );
-      testScores(scorer, {5,7}, {0.36330473f,0.37098017f} );
+      TermQuery::Scorer* scorer = dynamic_cast<TermQuery::Scorer*>( weight->createScorer(testIndex.pool,
+                                                                                         qContext.topReader.segments()[0]));
+      testScores(scorer, {5, 7}, {0.36330473f, 0.37098017f});
     }
   }
 }
@@ -150,15 +151,15 @@ TEST_F(TermScorerTest, multiSeg) {
       // put the scorer creation in a separate scope to test that it's OK to rewind the pool after we are done with a single scorer.
       {
         auto g1 = testIndex.pool.rewindScopeGuard();
-        TermQuery::Scorer *scorer = dynamic_cast<TermQuery::Scorer *>( weight->createScorer(
+        TermQuery::Scorer* scorer = dynamic_cast<TermQuery::Scorer*>( weight->createScorer(
                 testIndex.pool, qContext.topReader.segments()[0]));
         testScores(scorer, {}, {}); // first segment doesn't have "to"
       }
       {
         auto g2 = testIndex.pool.rewindScopeGuard();
-        TermQuery::Scorer *scorer = dynamic_cast<TermQuery::Scorer *>( weight->createScorer(
+        TermQuery::Scorer* scorer = dynamic_cast<TermQuery::Scorer*>( weight->createScorer(
                 testIndex.pool, qContext.topReader.segments()[1]));
-        testScores(scorer, {2,4}, {0.36330473f,0.37098017f});
+        testScores(scorer, {2, 4}, {0.36330473f, 0.37098017f});
       }
     }
   }
@@ -186,13 +187,13 @@ TEST_F(TermScorerTest, multiSeg) {
       // put the scorer creation in a separate scope to test that it's OK to rewind the pool after we are done with a single scorer.
       {
         auto g1 = testIndex.pool.rewindScopeGuard();
-        TermQuery::Scorer *scorer = dynamic_cast<TermQuery::Scorer *>( weight->createScorer(
+        TermQuery::Scorer* scorer = dynamic_cast<TermQuery::Scorer*>( weight->createScorer(
                 testIndex.pool, qContext.topReader.segments()[0]));
         testScores(scorer, {3}, {0.36330473f});
       }
       {
         auto g2 = testIndex.pool.rewindScopeGuard();
-        TermQuery::Scorer *scorer = dynamic_cast<TermQuery::Scorer *>( weight->createScorer(
+        TermQuery::Scorer* scorer = dynamic_cast<TermQuery::Scorer*>( weight->createScorer(
                 testIndex.pool, qContext.topReader.segments()[1]));
         testScores(scorer, {4}, {0.37098017f});
       }
@@ -221,22 +222,22 @@ TEST_F(TermScorerTest, boolScore) {
 
     // The "to" scorer should be null for seg 0 in this test
     {
-      std::vector<Query *> queries = {&to, &the};
+      std::vector<Query*> queries = {&to, &the};
       BooleanQuery q({}, queries, {}, {});
 
       auto poolFree = testIndex.pool.rewindScopeGuard();
       Query::Context qContext(testIndex.pool, *testIndex.reader);
-      auto *weight = q.createWeight(qContext);
+      auto* weight = q.createWeight(qContext);
       // put the scorer creation in a separate scope to test that it's OK to rewind the pool after we are done with a single scorer.
       {
         auto g = testIndex.pool.rewindScopeGuard();
-        Query::Scorer *scorer = weight->createScorer(
+        Query::Scorer* scorer = weight->createScorer(
                 testIndex.pool, qContext.topReader.segments()[0]);
         testScores(scorer, {1}, {0.17332031f});
       }
       {
         auto g = testIndex.pool.rewindScopeGuard();
-        Query::Scorer *scorer = weight->createScorer(
+        Query::Scorer* scorer = weight->createScorer(
                 testIndex.pool, qContext.topReader.segments()[1]);
         testScores(scorer, {2, 4}, {0.48997432f, 0.5618766f});
       }
@@ -245,22 +246,22 @@ TEST_F(TermScorerTest, boolScore) {
 
     // conjunction scorer
     {
-      std::vector<Query *> queries = {&to, &the};
+      std::vector<Query*> queries = {&to, &the};
       BooleanQuery q(queries, {}, {}, {});
 
       auto poolFree = testIndex.pool.rewindScopeGuard();
       Query::Context qContext(testIndex.pool, *testIndex.reader);
-      auto *weight = q.createWeight(qContext);
+      auto* weight = q.createWeight(qContext);
       // put the scorer creation in a separate scope to test that it's OK to rewind the pool after we are done with a single scorer.
       {
         auto g = testIndex.pool.rewindScopeGuard();
-        Query::Scorer *scorer = weight->createScorer(
+        Query::Scorer* scorer = weight->createScorer(
                 testIndex.pool, qContext.topReader.segments()[0]);
         testScores(scorer, {}, {});
       }
       {
         auto g = testIndex.pool.rewindScopeGuard();
-        Query::Scorer *scorer = weight->createScorer(
+        Query::Scorer* scorer = weight->createScorer(
                 testIndex.pool, qContext.topReader.segments()[1]);
         testScores(scorer, {2, 4}, {0.48997432f, 0.5618766f});
       }
@@ -268,23 +269,23 @@ TEST_F(TermScorerTest, boolScore) {
 
     // mix of conjunction, disjunction
     {
-      std::vector<Query *> mand = {&to};
-      std::vector<Query *> opt = {&the};
+      std::vector<Query*> mand = {&to};
+      std::vector<Query*> opt = {&the};
       BooleanQuery q(mand, opt, {}, {});
 
       auto poolFree = testIndex.pool.rewindScopeGuard();
       Query::Context qContext(testIndex.pool, *testIndex.reader);
-      auto *weight = q.createWeight(qContext);
+      auto* weight = q.createWeight(qContext);
       // put the scorer creation in a separate scope to test that it's OK to rewind the pool after we are done with a single scorer.
       {
         auto g = testIndex.pool.rewindScopeGuard();
-        Query::Scorer *scorer = weight->createScorer(
+        Query::Scorer* scorer = weight->createScorer(
                 testIndex.pool, qContext.topReader.segments()[0]);
         testScores(scorer, {}, {});
       }
       {
         auto g = testIndex.pool.rewindScopeGuard();
-        Query::Scorer *scorer = weight->createScorer(
+        Query::Scorer* scorer = weight->createScorer(
                 testIndex.pool, qContext.topReader.segments()[1]);
         testScores(scorer, {2, 4}, {0.48997432f, 0.5618766f});
       }
@@ -292,23 +293,23 @@ TEST_F(TermScorerTest, boolScore) {
 
     // mix of conjunction, disjunction opposite order
     {
-      std::vector<Query *> mand = {&the};
-      std::vector<Query *> opt = {&to};
+      std::vector<Query*> mand = {&the};
+      std::vector<Query*> opt = {&to};
       BooleanQuery q(mand, opt, {}, {});
 
       auto poolFree = testIndex.pool.rewindScopeGuard();
       Query::Context qContext(testIndex.pool, *testIndex.reader);
-      auto *weight = q.createWeight(qContext);
+      auto* weight = q.createWeight(qContext);
       // put the scorer creation in a separate scope to test that it's OK to rewind the pool after we are done with a single scorer.
       {
         auto g = testIndex.pool.rewindScopeGuard();
-        Query::Scorer *scorer = weight->createScorer(
+        Query::Scorer* scorer = weight->createScorer(
                 testIndex.pool, qContext.topReader.segments()[0]);
         testScores(scorer, {1}, {0.17332031f});
       }
       {
         auto g = testIndex.pool.rewindScopeGuard();
-        Query::Scorer *scorer = weight->createScorer(
+        Query::Scorer* scorer = weight->createScorer(
                 testIndex.pool, qContext.topReader.segments()[1]);
         testScores(scorer, {2, 4}, {0.48997432f, 0.5618766f});
       }
@@ -317,25 +318,25 @@ TEST_F(TermScorerTest, boolScore) {
 
     // add single prohibited clause
     {
-      std::vector<Query *> mand = {&the};
-      std::vector<Query *> opt = {&to};
-      std::vector<Query *> neg = {&moon};
+      std::vector<Query*> mand = {&the};
+      std::vector<Query*> opt = {&to};
+      std::vector<Query*> neg = {&moon};
 
       BooleanQuery q(mand, opt, neg, {});
 
       auto poolFree = testIndex.pool.rewindScopeGuard();
       Query::Context qContext(testIndex.pool, *testIndex.reader);
-      auto *weight = q.createWeight(qContext);
+      auto* weight = q.createWeight(qContext);
       // put the scorer creation in a separate scope to test that it's OK to rewind the pool after we are done with a single scorer.
       {
         auto g = testIndex.pool.rewindScopeGuard();
-        Query::Scorer *scorer = weight->createScorer(
+        Query::Scorer* scorer = weight->createScorer(
                 testIndex.pool, qContext.topReader.segments()[0]);
         testScores(scorer, {1}, {0.17332031f});
       }
       {
         auto g = testIndex.pool.rewindScopeGuard();
-        Query::Scorer *scorer = weight->createScorer(
+        Query::Scorer* scorer = weight->createScorer(
                 testIndex.pool, qContext.topReader.segments()[1]);
         testScores(scorer, {2}, {0.48997432f});
       }
@@ -347,25 +348,25 @@ TEST_F(TermScorerTest, boolScore) {
       TermQuery time("foo_w", "time");  // matches doc 1
       TermQuery men("foo_w", "men");  // matches doc 3
 
-      std::vector<Query *> mand = {&the};
-      std::vector<Query *> opt = {&to};
-      std::vector<Query *> neg = {&does_not_exist, &moon, &time, &men};
+      std::vector<Query*> mand = {&the};
+      std::vector<Query*> opt = {&to};
+      std::vector<Query*> neg = {&does_not_exist, &moon, &time, &men};
 
       BooleanQuery q(mand, opt, neg, {});
 
       auto poolFree = testIndex.pool.rewindScopeGuard();
       Query::Context qContext(testIndex.pool, *testIndex.reader);
-      auto *weight = q.createWeight(qContext);
+      auto* weight = q.createWeight(qContext);
       // put the scorer creation in a separate scope to test that it's OK to rewind the pool after we are done with a single scorer.
       {
         auto g = testIndex.pool.rewindScopeGuard();
-        Query::Scorer *scorer = weight->createScorer(
+        Query::Scorer* scorer = weight->createScorer(
                 testIndex.pool, qContext.topReader.segments()[0]);
         testScores(scorer, {}, {});
       }
       {
         auto g = testIndex.pool.rewindScopeGuard();
-        Query::Scorer *scorer = weight->createScorer(
+        Query::Scorer* scorer = weight->createScorer(
                 testIndex.pool, qContext.topReader.segments()[1]);
         testScores(scorer, {2}, {0.48997432f});
       }
@@ -373,25 +374,26 @@ TEST_F(TermScorerTest, boolScore) {
 
     // mandatory clause with filter
     {
-      std::vector<Query *> mand = {&the};
-      std::vector<Query *> filter = {&to};
+      std::vector<Query*> mand = {&the};
+      std::vector<Query*> filter = {&to};
 
-      BooleanQuery q(mand, {}, {}, filter);  // this should match the same as a "to" and "the" conjunction, but score differently.
+      BooleanQuery q(mand, {}, {},
+                     filter);  // this should match the same as a "to" and "the" conjunction, but score differently.
 
 
       auto poolFree = testIndex.pool.rewindScopeGuard();
       Query::Context qContext(testIndex.pool, *testIndex.reader);
-      auto *weight = q.createWeight(qContext);
+      auto* weight = q.createWeight(qContext);
       // put the scorer creation in a separate scope to test that it's OK to rewind the pool after we are done with a single scorer.
       {
         auto g = testIndex.pool.rewindScopeGuard();
-        Query::Scorer *scorer = weight->createScorer(
+        Query::Scorer* scorer = weight->createScorer(
                 testIndex.pool, qContext.topReader.segments()[0]);
         testScores(scorer, {}, {});
       }
       {
         auto g = testIndex.pool.rewindScopeGuard();
-        Query::Scorer *scorer = weight->createScorer(
+        Query::Scorer* scorer = weight->createScorer(
                 testIndex.pool, qContext.topReader.segments()[1]);
         testScores(scorer, {2, 4}, {0.1266696f, 0.19089644f});
       }
@@ -399,25 +401,26 @@ TEST_F(TermScorerTest, boolScore) {
 
     // optional clause with filter
     {
-      std::vector<Query *> opt = {&the};
-      std::vector<Query *> filter = {&to};
+      std::vector<Query*> opt = {&the};
+      std::vector<Query*> filter = {&to};
 
-      BooleanQuery q({}, opt, {}, filter);  // this should match the same as a "to" and "the" conjunction, but score differently.
+      BooleanQuery q({}, opt, {},
+                     filter);  // this should match the same as a "to" and "the" conjunction, but score differently.
 
 
       auto poolFree = testIndex.pool.rewindScopeGuard();
       Query::Context qContext(testIndex.pool, *testIndex.reader);
-      auto *weight = q.createWeight(qContext);
+      auto* weight = q.createWeight(qContext);
       // put the scorer creation in a separate scope to test that it's OK to rewind the pool after we are done with a single scorer.
       {
         auto g = testIndex.pool.rewindScopeGuard();
-        Query::Scorer *scorer = weight->createScorer(
+        Query::Scorer* scorer = weight->createScorer(
                 testIndex.pool, qContext.topReader.segments()[0]);
         testScores(scorer, {}, {});
       }
       {
         auto g = testIndex.pool.rewindScopeGuard();
-        Query::Scorer *scorer = weight->createScorer(
+        Query::Scorer* scorer = weight->createScorer(
                 testIndex.pool, qContext.topReader.segments()[1]);
         testScores(scorer, {2, 4}, {0.1266696f, 0.19089644f});
       }
@@ -428,23 +431,23 @@ TEST_F(TermScorerTest, boolScore) {
     // optional clause with filter
     {
       std::vector<std::string_view> terms = {"to", "the"};
-      std::vector<std::int32_t> positions = {0,1};
+      std::vector<std::int32_t> positions = {0, 1};
 
-      PhraseQuery q("foo_w", terms, positions);
+      PhraseQuery phrase("foo_w", terms, positions);
 
       auto poolFree = testIndex.pool.rewindScopeGuard();
       Query::Context qContext(testIndex.pool, *testIndex.reader);
-      auto *weight = q.createWeight(qContext);
+      auto* weight = phrase.createWeight(qContext);
       // put the scorer creation in a separate scope to test that it's OK to rewind the pool after we are done with a single scorer.
       {
         auto g = testIndex.pool.rewindScopeGuard();
-        Query::Scorer *scorer = weight->createScorer(
+        Query::Scorer* scorer = weight->createScorer(
                 testIndex.pool, qContext.topReader.segments()[0]);
         testScores(scorer, {}, {});
       }
       {
         auto g = testIndex.pool.rewindScopeGuard();
-        Query::Scorer *scorer = weight->createScorer(
+        Query::Scorer* scorer = weight->createScorer(
                 testIndex.pool, qContext.topReader.segments()[1]);
         testScores(scorer, {2, 4}, {0.37283403f, 0.56187654f});
       }
@@ -459,19 +462,46 @@ TEST_F(TermScorerTest, boolScore) {
 
       auto poolFree = testIndex.pool.rewindScopeGuard();
       Query::Context qContext(testIndex.pool, *testIndex.reader);
-      auto *weight = q.createWeight(qContext);
+      auto* weight = q.createWeight(qContext);
       // put the scorer creation in a separate scope to test that it's OK to rewind the pool after we are done with a single scorer.
       {
         auto g = testIndex.pool.rewindScopeGuard();
-        Query::Scorer *scorer = weight->createScorer(
+        Query::Scorer* scorer = weight->createScorer(
                 testIndex.pool, qContext.topReader.segments()[0]);
         testScores(scorer, {}, {});
       }
       {
         auto g = testIndex.pool.rewindScopeGuard();
-        Query::Scorer *scorer = weight->createScorer(
+        Query::Scorer* scorer = weight->createScorer(
                 testIndex.pool, qContext.topReader.segments()[1]);
         testScores(scorer, {}, {});
+      }
+    }
+
+    // test that reused terms are handled correctly (i.e. cached docsenum are cloned when needed)
+    {
+      std::vector<std::string_view> terms = {"to", "the"};
+      std::vector<std::int32_t> positions = {0, 1};
+      PhraseQuery phrase("foo_w", terms, positions);
+
+      std::vector<Query*> queries = {&to, &the, &phrase};
+      BooleanQuery q({}, queries, {}, {});
+
+      auto poolFree = testIndex.pool.rewindScopeGuard();
+      Query::Context qContext(testIndex.pool, *testIndex.reader);
+      auto* weight = q.createWeight(qContext);
+      // put the scorer creation in a separate scope to test that it's OK to rewind the pool after we are done with a single scorer.
+      {
+        auto g = testIndex.pool.rewindScopeGuard();
+        Query::Scorer* scorer = weight->createScorer(
+                testIndex.pool, qContext.topReader.segments()[0]);
+        testScores(scorer, {1}, {0.17332031f});
+      }
+      {
+        auto g = testIndex.pool.rewindScopeGuard();
+        Query::Scorer* scorer = weight->createScorer(
+                testIndex.pool, qContext.topReader.segments()[1]);
+        testScores(scorer, {2, 4}, {0.86280835f, 1.1237532f});
       }
     }
 
