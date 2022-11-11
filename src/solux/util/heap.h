@@ -274,4 +274,79 @@ public:
 
 
 
+/// We don't use std::priority_queue since it doesn't allow direct access to the underlying storage.
+/// \tparam T
+/// \tparam Comp
+template <class T, class Comp>
+class DirectPQ {
+  std::span<T> heap;
+  size_t heapSize; // the current heap size, not the max/capacity
+  static constexpr Comp comp{};
+
+  auto end() {
+    return heap.begin() + heapSize;
+  }
+public:
+  DirectPQ(std::span<T> heap, size_t currentSize=0) : heap(heap), heapSize(currentSize) {
+    std::make_heap(heap.begin(), end(), comp);
+  }
+
+  // Reference to the top element.
+  T& top() {
+    return heap.front();
+  }
+
+  size_t size() {
+    return heapSize;
+  }
+
+  size_t capacity() {
+    return heap.size();
+  }
+
+  /// Call this to re-heapify after top() was modified
+  void updateTop() {
+    update_heap_top(heap.begin(), end(), comp);
+  }
+
+  /// Any insert will invalidate / overwrite the reference returned.
+  T& removeTop() {
+    std::pop_heap(heap.begin(), end(), comp);
+    --heapSize;
+    return heap[heapSize];
+  }
+
+  /// Insert only if max size has not been reached.  Use insertWithOverflow otherwise.
+  void insert(const T& elem) {
+    assert(heapSize < heap.size());
+    heap[heapSize] = elem;
+    heapSize++;
+    std::push_heap(heap.begin(), end(), comp);
+  }
+
+  /// If capacity has been reached, the largest element is removed (i.e. heap keeps smallest)
+  /// If this is a min-heap (common in solux), then we are keeping everything larger than the offered value.
+  /// @returns true if the new element caused the previous top() to be ejected.
+  bool insertWithOverflow(const T& elem) {
+    if (heapSize < heap.size()) {
+      insert(elem);
+      return false;
+    }
+
+    // if the priority queue is full, then we only want to insert the new value if it is
+    // less than the current root.
+    if (comp(elem, top())) {
+      top() = elem; // overwrite the previous top
+      updateTop();
+      return true;
+    } else {
+      return false;
+    }
+  }
+
+};
+
+
+
+
 } // end namespace solux
