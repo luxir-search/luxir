@@ -79,7 +79,7 @@ int main(int argc, char **argv) {
 
   std::cout << solux_banner() << std::endl;
 
-  spdlog::set_pattern("%L %H:%M:%S.%e %s:%# %! %n th=%t %v");
+  spdlog::set_pattern("%L %H:%M:%S.%e %s:%# %! %n T%t %v");
   spdlog::set_level(spdlog::level::debug); // Set global log level to debug
 
   LOG_INFO("Logging: compile-time={}, runtime default={}",

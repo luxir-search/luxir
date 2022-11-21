@@ -15,8 +15,9 @@
 using namespace solux;
 
 // TODO - use a different logger for RPC stuff some point
-// redefine DEBUG to TRACE level whish shouldn't currently be logged!
-#define GRPC_DEBUG LOG_TRACE
+// redefine DEBUG to TRACE level which shouldn't currently be logged!
+// #define GRPC_DEBUG LOG_TRACE
+#define GRPC_DEBUG LOG_DEBUG
 
 GRPCServer::GRPCServer(int nthreads)
   : startLatch(1), startLatchThreads(nthreads), nthreads(nthreads) {
@@ -149,6 +150,301 @@ public:
   virtual void fillResponse() = 0;
 };
 
+template <class RequestT, class ResponseT, class AsyncServiceT>
+class BiStreamingRequest : public CallData {
+public:
+
+  // We want to support two streaming use-cases:
+  // 1) common case of a single response for a single request
+  //    ideally use a single arena for both
+  // 2) multiple responses for a single request
+  //    each response should be in a separate arena so they can be freed separately
+  // We also need to buffer responses since only one write can be outstanding at once.
+
+  class SingleRequest {
+    BiStreamingRequest* parent;
+    google::protobuf::Arena arena;
+    RequestT* request;
+    ResponseT* response;
+
+  public:
+
+    SingleRequest(BiStreamingRequest* parent) : parent(parent) {
+      request = google::protobuf::Arena::CreateMessage<RequestT>(&arena);
+      response = nullptr;
+    }
+
+    RequestT& getRequest() {
+      return *request;
+    }
+
+    BiStreamingRequest& getParent() {
+      return *parent;
+    }
+
+    /// Get a Response that is linked to this request by virtue of being allocated in the same arena.
+    /// This should not be used if there are going to be a large number of responses for a single request.
+    ResponseT& getResponse() {
+      if (response == nullptr) {
+        response = google::protobuf::Arena::CreateMessage<ResponseT>(&arena);
+      }
+      return *response;
+    }
+
+    // we are done using the SingleRequest, so minimize memory usage if desired.
+    void clear() {
+      // Q: are heap allocated std::string data freed when the arena is cleared or destroyed?
+      arena.Reset();
+      // TODO: reusing (calling Clear()) the prequest/response objects could be more efficient since protobuf strings are still heap allocated.
+      request = nullptr;
+      response = nullptr;
+    }
+
+    // prepare this SingleRequest to be used again.
+    void init() {
+      request = google::protobuf::Arena::CreateMessage<RequestT>(&arena);
+    }
+
+    // future support for cancellation
+    bool isCancelled() {
+      return false;
+    }
+  };
+
+  /// A response that is not linked to the request (i.e. not allocated in the same arena).
+  class SeparateResponse {
+    google::protobuf::Arena arena;
+    ResponseT* response;
+  public:
+    SeparateResponse() {
+      response = google::protobuf::Arena::CreateMessage<ResponseT>(&arena);
+    }
+
+    ResponseT& getResponse() {
+      return *response;
+    }
+
+    // we are done using the SingleRequest, so minimize memory usage if desired.
+    void clear() {
+      // Q: are heap allocated std::string data freed when the arena is cleared or destroyed?
+      arena.Reset();
+      response = nullptr;
+    }
+  };
+
+  struct PendingResponse {
+    SingleRequest* req;
+    SeparateResponse* rsp;
+  };
+
+  std::mutex mutex;
+  AsyncServiceT& service;
+  grpc::ServerAsyncReaderWriter<ResponseT,RequestT> readerWriter;
+
+  // The current request object (req->request) that is being read into.
+  SingleRequest* req = nullptr;
+
+  // these are protected by the mutex
+  std::deque<PendingResponse> pending;  // pending writes
+  std::vector<SingleRequest*> requestPool;
+
+  bool errored = false;    // if true, something happened and additional reads/writes should fail.
+  bool readsDone = false;  // true when client ends the stream and we can't read any more messages
+  bool writeOutstanding = false;  // if true, a write was requested but not yet completed.  Only one write can be outstanding at a time in a streaming RPC.
+  int32_t reqOutstanding = 0;  // number of requests currently outstanding
+
+  // these are the tags we use in the completion queue to know what event/operation finished in the completion queue.
+  enum CallTags { READ = 1, WRITE = 2, FINISH = 3, CONNECT = 4, ASYNC_NOTIFY_WHEN_DONE = 5 };
+
+  int numCalls = 0; // TODO: testing only... remove after stable.
+
+
+
+  BiStreamingRequest(GRPCServer& server, AsyncServiceT& service, GRPCServer::ThreadInfo& threadInfo) : CallData(server, threadInfo), service(service), readerWriter(&ctx) {
+    GRPC_DEBUG("CREATE StreamingCallData this={}", (void*)this);
+
+    // see https://stackoverflow.com/questions/60856240/grpc-c-async-server-how-differentiate-between-writesdone-and-broken-connection
+    // TODO: not sure the right way to use this event yet.
+    ctx.AsyncNotifyWhenDone(make_tag(CallTags::ASYNC_NOTIFY_WHEN_DONE));
+  }
+
+  SingleRequest* getSingleRequest() {
+    SingleRequest* req = nullptr;
+
+    {
+      const std::lock_guard<std::mutex> lock(mutex);
+      reqOutstanding++;
+      if (!requestPool.empty()) {
+        req = requestPool.back();
+        requestPool.pop_back();
+        req->init();
+      }
+    }
+
+    if (!req) {
+      req = new SingleRequest(this);
+    }
+
+    return req;
+  }
+
+
+  // mutex is held when calling this method
+  void doWrite(const PendingResponse& pr) {
+    assert(!writeOutstanding);
+    writeOutstanding = true;
+    ResponseT* response = pr.rsp != nullptr ? &pr.rsp->getResponse() : &pr.req->getResponse();
+    readerWriter.Write(*response, make_tag(WRITE));
+    release(pr);
+  }
+
+  // mutex is held when calling this method
+  void release(const PendingResponse& pr) {
+    if (pr.req != nullptr) {
+      if (requestPool.size() < 10) {
+        requestPool.push_back(pr.req);
+      } else {
+        delete pr.req;
+      }
+    }
+    if (pr.rsp != nullptr) {
+      delete pr.rsp;
+    }
+  }
+
+  // mutex is held when calling this method
+  void maybeSendFinish() {
+    // TODO: what if errored state?
+    if (readsDone && pending.empty() && !writeOutstanding && reqOutstanding <= 0) {
+      // There are no other outstanding requests, so we can finish now.
+      readerWriter.Finish(grpc::Status::OK, make_tag(FINISH));
+      GRPC_DEBUG("After calling Finish. this={} numCalls={} cancelled={}", (void*)this, numCalls, ctx.IsCancelled());
+    }
+  }
+
+  void writeFinished(bool ok) {
+    {
+      const std::lock_guard<std::mutex> lock(mutex);
+
+      if (!ok) {
+        readsDone = true;  // is this needed? Our Read() call should also be returned with !ok and do the same thing?
+      }
+      assert(writeOutstanding);
+      writeOutstanding = false;
+      if (!pending.empty()) {
+        PendingResponse& pendingResponse = pending.front();
+        doWrite(pendingResponse);
+        pending.pop_front();
+      } else {
+        maybeSendFinish();
+      }
+    }
+  }
+
+
+
+  // initiate a read by creating a new request and requesting a read from the completion queue.
+  void readRequest() {
+    assert(req == nullptr);
+    req = getSingleRequest();
+    readerWriter.Read(&req->getRequest(), make_tag(READ));
+  }
+
+
+  /// finishCount is the number of outstanding requests that this write will complete.
+  /// 0 if further writes will happen for the same request.
+  /// 1 if the request is done and this is the last write.
+  /// 2 or more if this write effectively coalesces responses to multiple requests.
+  /// @returns the number of currently buffered write requests
+  size_t respond(SingleRequest* singleReq, SeparateResponse* rsp=nullptr, int32_t finishCount=1) {
+    {
+      const std::lock_guard<std::mutex> lock(mutex);
+
+      reqOutstanding -= finishCount;
+      if (writeOutstanding) {
+        // we can't write until the previous write is done.
+        pending.emplace_back(PendingResponse{singleReq, rsp});
+      } else {
+        doWrite(PendingResponse{singleReq, rsp});
+      }
+
+      return pending.size();
+    }
+  }
+
+
+  virtual void proceed(bool ok, uint32_t tag) override {
+    // If we have a single thread per completion queue, then this can only be called from that thread.
+    // Multiple threads is a little more unclear... There can only be one Read being completed at once (since only one can be outstanding)
+    // and the same for writes.  But one thread could be notifying of a read and one of a write?
+    // It's also unclear when ASYNC_NOTIFY_WHEN_DONE can be returned.
+
+    // Ending the stream: currently outstanding requests will always cause a Write request to be done, hence we can just
+    // check in writeFinished() if we are done and call Finish() if so.
+
+    GRPC_DEBUG("PROCEED this={} ok={} numCalls={} tag={} cancelled={}", (void*)this, ok, ++numCalls, tag, ctx.IsCancelled());
+
+    switch(tag) {
+      case READ:
+        if (!ok) {
+          // Client ended the stream.
+          // TODO: ok==false when we are shutting down as well.... how to tell the difference?  I guess Write / Finish will
+          // error out if we're shutting down???
+          GRPC_DEBUG("End of stream!");
+          readsDone = true;
+          {
+            const std::lock_guard<std::mutex> lock(mutex);
+            reqOutstanding--;  // this read request is done
+            delete req;
+            req = nullptr;
+
+            maybeSendFinish();
+          }
+          break;
+        }
+
+        // call handleRequest before requesting the next read. This allows for a flow control mechanism
+        // where at some point handleRequest can block / help perform tasks if heavily loaded.
+        handleRequest(*req);
+        req = nullptr;
+        readRequest();
+        break;
+      case WRITE:
+        // Last write succeeded.  Now check if we have any more pending.
+        writeFinished(ok);
+        break;
+      case FINISH:
+        delete this;  // deleting self... be careful there are no guards/destructors (like the mutex) that fire off after this!
+        // TODO: change to a return code and have the caller dispose of this object?
+        break;
+      case CONNECT:
+        if (!ok) {
+          assert(reqOutstanding == 0);  // first event... should be nothing outstanding.
+          delete this;
+          break;
+        }
+
+        // create a new instance of this to handle additional streaming calls.
+        createNew();
+        readRequest();
+        break;
+      case ASYNC_NOTIFY_WHEN_DONE:
+        // In a simple test where the client sends two requests, calls finish, then reads the responses,
+        // the last 3 events in the queue are Read(ok=false), ASYNC_NOTIFY_WHEN_DONE(ok=true), and FINISH(ok=true).
+        // It doesn't seem like we currently need this event.
+        GRPC_DEBUG("ASYNC_NOTIFY_WHEN_DONE {}", (void*)this);
+        break;
+      default:
+        // we tag everything going into the queue, so this shouldn't happen.
+        LOG_ERROR("Unknown tag {} on {}", tag, (void*)this);
+        break;
+    }
+  }
+
+  virtual void createNew() = 0;
+  virtual void handleRequest(SingleRequest& req) = 0;
+};
+
 
 template <class RequestT, class ResponseT, class AsyncServiceT>
 class StreamingCallData : public CallData {
@@ -181,14 +477,12 @@ public:
       return;
     }
 
-
     if (!ok && state != CallStatus::READ) {
       // canceled/errored... nothing else to do.
       GRPC_DEBUG("Error or shutting down. deleting this={}", (void*)this);
       delete this;
       return;
     }
-
 
     switch (state) {
       case CallStatus::READ:
@@ -249,19 +543,24 @@ public:
   virtual void fillResponse() = 0;
 };
 
-class SayHelloStreamingCall : public StreamingCallData<HelloRequest, HelloReply, Greeter::AsyncService> {
+class SayHelloStreamingCall : public BiStreamingRequest<HelloRequest, HelloReply, Greeter::AsyncService> {
 public:
-  SayHelloStreamingCall(GRPCServer& server, Greeter::AsyncService& service, GRPCServer::ThreadInfo& threadInfo) : StreamingCallData(server, service, threadInfo) {
+  SayHelloStreamingCall(GRPCServer& server, Greeter::AsyncService& service, GRPCServer::ThreadInfo& threadInfo) : BiStreamingRequest(server, service, threadInfo) {
     //     void RequestSayHelloStreaming(::grpc::ServerContext* context, ::grpc::ServerAsyncReaderWriter< ::solux::HelloReply, ::solux::HelloRequest>* stream, ::grpc::CompletionQueue* new_call_cq, ::grpc::ServerCompletionQueue* notification_cq, void *tag) {
-    service.RequestSayHelloStreaming(&ctx, &readerWriter, threadInfo.cq.get(), threadInfo.cq.get(), make_tag());
+    service.RequestSayHelloStreaming(&ctx, &readerWriter, threadInfo.cq.get(), threadInfo.cq.get(), make_tag(CONNECT));
   }
 
   virtual void createNew() override {
     new SayHelloStreamingCall(server, service, threadInfo);
   }
-  virtual void fillResponse() override {
+
+  void handleRequest(SingleRequest& req) override {
+
+    auto& request = req.getRequest();
+    auto& response = req.getResponse();
     std::string prefix("HelloStreaming ");
     response.set_message(prefix + request.name());
+    respond(&req);
     // std::cout << "req name:" << request.name() << std::endl;
   }
 };
@@ -482,11 +781,6 @@ void GRPCServer::runThread(ThreadInfo& threadInfo) {
       // shutting down... completion queue should be empty at this point.
       GRPC_DEBUG("completionQueue->Next() returned false.");
       break;
-    }
-
-    if (!ok) {
-      // request failed or was terminated.... still call proceed() so that it can be cleaned up
-      GRPC_DEBUG("ERROR in completionQueue->Next()");
     }
 
     CallData::TaggedPtrType taggedPtr = CallData::TaggedPtrType::fromTaggedPtrBits(tag);

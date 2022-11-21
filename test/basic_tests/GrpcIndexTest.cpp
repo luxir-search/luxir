@@ -147,7 +147,7 @@ TEST_F(GrpcIndexTest, streamingHello) {
   }
 
   grpc::Status status = stream->Finish();
-  GRPC_DEBUG("CLIENT FINISED");
+  GRPC_DEBUG("CLIENT FINISHED");
 
   ASSERT_TRUE(status.ok());
 }

@@ -23,6 +23,10 @@ service Greeter {
 // The request message containing the user's name.
 message HelloRequest {
   string name = 1;
+  int32 response_count = 2;
+  int32 sleep_ms_min = 3;
+  int32 sleep_ms_max = 4;
+  bool debug = 5;
 }
 
 // The response message containing the greetings
