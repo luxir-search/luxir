@@ -19,6 +19,7 @@ using namespace solux;
    RESULTS:
      MemPool and std::pmr::monotonic_buffer_resource are the same speed on g++, but MemPool is faster on clang.
      Protobuf Arena does really well considering that it's allocation is thread safe!
+     Pre-allocating the memory for the Arena does not help (this is testing *many* small allocations though)
 
 g++: Release (NDEBUG) __OPTIMIZE__=1 __cplusplus=202100 __GNUC__=12 __VERSION__=12.2.0 _GLIBCXX_RELEASE=12 __GLIBCXX__=20220819 __linux__=1
 ------------------------------------------------------------
@@ -28,6 +29,7 @@ BM_AllocSmall_std           14696 ns        14696 ns        47707
 BM_AllocSmall_std_mono       1384 ns         1384 ns       507392
 BM_AllocSmall_MemPool        1413 ns         1413 ns       493202
 BM_AllocSmall_Arena          1492 ns         1492 ns       473429
+BM_AllocSmall_ArenaPreAlloc  1498 ns         1498 ns       467081
 
 clang: Release (NDEBUG) __OPTIMIZE__=1 __cplusplus=202101 __clang__=1 __GNUC__=4 __VERSION__=Ubuntu Clang 15.0.5 _GLIBCXX_RELEASE=12 __GLIBCXX__=20220819 __linux__=1
 ------------------------------------------------------------
@@ -68,16 +70,22 @@ public:
   };
 };
 
-// wrapper for protobuf Arena so we can try different arena options
-template <size_t initSize, size_t defaultAlignment>
+// wrapper for protobuf Arena so we can try different arena options. initSize is the size of the pre-allocated block
+// which is normally 0.
+template <size_t allocSize, size_t defaultAlignment, size_t initSize=0>
 class arena_resource {
 public:
+  char startBuffer[initSize];
   google::protobuf::ArenaOptions options;
   google::protobuf::Arena arena;
 
-  static google::protobuf::ArenaOptions getOptions() {
+  google::protobuf::ArenaOptions getOptions() {
     google::protobuf::ArenaOptions options;
-    options.start_block_size = 32768;
+    options.start_block_size = allocSize;
+    if (initSize > 0) {
+      options.initial_block = startBuffer;
+      options.initial_block_size = initSize;
+    }
     return options;
   }
 
@@ -161,6 +169,10 @@ static void BM_AllocSmall_MemPool(benchmark::State& state) {
 static void BM_AllocSmall_Arena(benchmark::State& state) {
   benchAlloc<arena_resource<32768,1>>(state);
 }
+static void BM_AllocSmall_ArenaPreAlloc(benchmark::State& state) {
+  benchAlloc<arena_resource<32768,1,32768>>(state);
+}
+
 
 //////////////////////////////////////////////////////////////////////
 
@@ -252,6 +264,7 @@ BENCHMARK(BM_AllocSmall_std);
 BENCHMARK(BM_AllocSmall_std_mono);
 BENCHMARK(BM_AllocSmall_MemPool);
 BENCHMARK(BM_AllocSmall_Arena);
+BENCHMARK(BM_AllocSmall_ArenaPreAlloc);
 
 // #define RUN_DISABLED_BENCHMARKS
 #ifdef RUN_DISABLED_BENCHMARKS
