@@ -2,6 +2,7 @@
 #include "test/SoluxTest.h"
 #include <memory_resource>
 #include <latch>
+#include <google/protobuf/arena.h>
 #include "tbb/task_group.h"
 
 #include "solux/util/MemPool.h"
@@ -10,27 +11,32 @@
 
 using namespace solux;
 
-/* solux::MemPool vs std::pmr::monotonic_buffer_resource
+/* solux::MemPool vs std::pmr::monotonic_buffer_resource vs protobuf3 Arena
    By default (linux/g++12), std::pmr::monotonic_buffer_resource starts with an initial allocation size of 1024+64.
    Subsequent allocation sizes multiply the large part (1024) by 1.5 and then add 64.
-   For a fair comparison with MemPool, we should start of with the same allocation size.
+   For a fair comparison with MemPool, we start with the same allocation size.
 
    RESULTS:
      MemPool and std::pmr::monotonic_buffer_resource are the same speed on g++, but MemPool is faster on clang.
+     Protobuf Arena does really well considering that it's allocation is thread safe!
 
-g++: Release (NDEBUG) __OPTIMIZE__=1 __cplusplus=202100 __GNUC__=12 __VERSION__=12.1.0 _GLIBCXX_RELEASE=12 __GLIBCXX__=20220513 __linux__=1
+g++: Release (NDEBUG) __OPTIMIZE__=1 __cplusplus=202100 __GNUC__=12 __VERSION__=12.2.0 _GLIBCXX_RELEASE=12 __GLIBCXX__=20220819 __linux__=1
 ------------------------------------------------------------
 Benchmark                  Time             CPU   Iterations
 ------------------------------------------------------------
-BM_Alloc_std_mono       1432 ns         1432 ns       489553
-BM_Alloc_MemPool        1452 ns         1452 ns       483181
+BM_AllocSmall_std           14696 ns        14696 ns        47707
+BM_AllocSmall_std_mono       1384 ns         1384 ns       507392
+BM_AllocSmall_MemPool        1413 ns         1413 ns       493202
+BM_AllocSmall_Arena          1492 ns         1492 ns       473429
 
-clang: Release (NDEBUG) __OPTIMIZE__=1 __cplusplus=202101 __clang__=1 __GNUC__=4 __VERSION__=Ubuntu Clang 14.0.6 _GLIBCXX_RELEASE=12 __GLIBCXX__=20220513 __linux__=1
+clang: Release (NDEBUG) __OPTIMIZE__=1 __cplusplus=202101 __clang__=1 __GNUC__=4 __VERSION__=Ubuntu Clang 15.0.5 _GLIBCXX_RELEASE=12 __GLIBCXX__=20220819 __linux__=1
 ------------------------------------------------------------
 Benchmark                  Time             CPU   Iterations
 ------------------------------------------------------------
-BM_Alloc_std_mono       1379 ns         1379 ns       508991
-BM_Alloc_MemPool         716 ns          716 ns       977285
+BM_AllocSmall_std           14670 ns        14670 ns        47230
+BM_AllocSmall_std_mono       1354 ns         1354 ns       533164
+BM_AllocSmall_MemPool         580 ns          580 ns      1210302
+BM_AllocSmall_Arena          1214 ns         1214 ns       573933
 */
 
 /*  std::allocator vs std::pmr::unsynchronized_pool_resource
@@ -41,9 +47,6 @@ BM_Alloc_MemPool         716 ns          716 ns       977285
 -------------------------------------------------------------------
 Benchmark                         Time             CPU   Iterations
 -------------------------------------------------------------------
-BM_AllocSmall_std             14960 ns        14960 ns        47626
-BM_AllocSmall_std_mono         1415 ns         1415 ns       487702
-BM_AllocSmall_MemPool          1437 ns         1437 ns       485280
 BM_AllocFree_default/1     10513498 ns     10513488 ns           67
 BM_AllocFree_default/8     12343269 ns     11600178 ns           59
 BM_AllocFree_default/16    16736317 ns     14930504 ns           49
@@ -63,6 +66,28 @@ public:
   void *allocate(std::size_t bytes, std::size_t alignment = defaultAlignment) {
     return std::pmr::monotonic_buffer_resource::allocate(bytes, alignment);
   };
+};
+
+// wrapper for protobuf Arena so we can try different arena options
+template <size_t initSize, size_t defaultAlignment>
+class arena_resource {
+public:
+  google::protobuf::ArenaOptions options;
+  google::protobuf::Arena arena;
+
+  static google::protobuf::ArenaOptions getOptions() {
+    google::protobuf::ArenaOptions options;
+    options.start_block_size = 32768;
+    return options;
+  }
+
+  // constructor that uses arena options
+  arena_resource() : options(getOptions()), arena(options) {
+  }
+
+  void *allocate(std::size_t bytes, std::size_t alignment = defaultAlignment) {
+    return arena.AllocateAligned(bytes, alignment);
+  }
 };
 
 
@@ -133,7 +158,9 @@ static void BM_AllocSmall_std_mono(benchmark::State& state) {
 static void BM_AllocSmall_MemPool(benchmark::State& state) {
   benchAlloc<MemPool>(state);
 }
-
+static void BM_AllocSmall_Arena(benchmark::State& state) {
+  benchAlloc<arena_resource<32768,1>>(state);
+}
 
 //////////////////////////////////////////////////////////////////////
 
@@ -224,6 +251,7 @@ inline void benchAllocFree(benchmark::State& state) {
 BENCHMARK(BM_AllocSmall_std);
 BENCHMARK(BM_AllocSmall_std_mono);
 BENCHMARK(BM_AllocSmall_MemPool);
+BENCHMARK(BM_AllocSmall_Arena);
 
 // #define RUN_DISABLED_BENCHMARKS
 #ifdef RUN_DISABLED_BENCHMARKS
