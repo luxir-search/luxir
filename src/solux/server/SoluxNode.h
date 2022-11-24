@@ -1,6 +1,7 @@
 #pragma once
 #include "solux/store/Directory.h"
 #include "solux/index/IndexWriter.h"
+#include "oneapi/tbb/task_arena.h"
 
 namespace solux {
 
@@ -111,6 +112,10 @@ public:
     return {};
   }
 
+  oneapi::tbb::task_arena& getTaskArena() {
+    return taskArena;
+  }
+
 private:
 
   void createSingletons() {
@@ -125,6 +130,8 @@ private:
   RAMDir dir;
   std::shared_ptr<Shard> shard;
   std::shared_ptr<Collection> collection;
+
+  oneapi::tbb::task_arena taskArena;
 };
 
 }

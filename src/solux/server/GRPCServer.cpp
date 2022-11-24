@@ -5,11 +5,13 @@
 #include <google/protobuf/text_format.h>
 #include <grpcpp/health_check_service_interface.h>
 #include <grpcpp/ext/proto_server_reflection_plugin.h>
+#include <solux/util/random.h>
 #include "GRPCServer.h"
 #include "SoluxNode.h"
 #include "solux/index/IndexWriter.h"
 #include "solux/util/solux_util.h"
 #include "solux/util/TaggedPtr.h"
+#include <oneapi/tbb/task_group.h>
 
 
 using namespace solux;
@@ -161,97 +163,24 @@ public:
   //    each response should be in a separate arena so they can be freed separately
   // We also need to buffer responses since only one write can be outstanding at once.
 
-  class SingleRequest {
-    BiStreamingRequest* parent;
-    google::protobuf::Arena arena;
-    RequestT* request;
-    ResponseT* response;
-
-  public:
-
-    SingleRequest(BiStreamingRequest* parent) : parent(parent) {
-      request = google::protobuf::Arena::CreateMessage<RequestT>(&arena);
-      response = nullptr;
-    }
-
-    RequestT& getRequest() {
-      return *request;
-    }
-
-    BiStreamingRequest& getParent() {
-      return *parent;
-    }
-
-    /// Get a Response that is linked to this request by virtue of being allocated in the same arena.
-    /// This should not be used if there are going to be a large number of responses for a single request.
-    ResponseT& getResponse() {
-      if (response == nullptr) {
-        response = google::protobuf::Arena::CreateMessage<ResponseT>(&arena);
-      }
-      return *response;
-    }
-
-    // we are done using the SingleRequest, so minimize memory usage if desired.
-    void clear() {
-      // Q: are heap allocated std::string data freed when the arena is cleared or destroyed?
-      arena.Reset();
-      // TODO: reusing (calling Clear()) the prequest/response objects could be more efficient since protobuf strings are still heap allocated.
-      request = nullptr;
-      response = nullptr;
-    }
-
-    // prepare this SingleRequest to be used again.
-    void init() {
-      request = google::protobuf::Arena::CreateMessage<RequestT>(&arena);
-    }
-
-    // future support for cancellation
-    bool isCancelled() {
-      return false;
-    }
-  };
-
-  /// A response that is not linked to the request (i.e. not allocated in the same arena).
-  class SeparateResponse {
-    google::protobuf::Arena arena;
-    ResponseT* response;
-  public:
-    SeparateResponse() {
-      response = google::protobuf::Arena::CreateMessage<ResponseT>(&arena);
-    }
-
-    ResponseT& getResponse() {
-      return *response;
-    }
-
-    // we are done using the SingleRequest, so minimize memory usage if desired.
-    void clear() {
-      // Q: are heap allocated std::string data freed when the arena is cleared or destroyed?
-      arena.Reset();
-      response = nullptr;
-    }
-  };
-
-  struct PendingResponse {
-    SingleRequest* req;
-    SeparateResponse* rsp;
-  };
+  using callback_type = std::function<void(google::protobuf::Message*)>;
+  using MessageAndCallback = std::pair<google::protobuf::Message*, callback_type>;
+  constexpr static size_t ARENA_BUF_SIZE = 1024;  // size of first buffer to give to the arena (includes space for arena itself!)
 
   std::mutex mutex;
   AsyncServiceT& service;
   grpc::ServerAsyncReaderWriter<ResponseT,RequestT> readerWriter;
 
   // The current request object (req->request) that is being read into.
-  SingleRequest* req = nullptr;
+  RequestT* req = nullptr;
 
   // these are protected by the mutex
-  std::deque<PendingResponse> pending;  // pending writes
-  std::vector<SingleRequest*> requestPool;
-
+  std::deque<MessageAndCallback> pending;  // pending writes
   bool errored = false;    // if true, something happened and additional reads/writes should fail.
   bool readsDone = false;  // true when client ends the stream and we can't read any more messages
   bool writeOutstanding = false;  // if true, a write was requested but not yet completed.  Only one write can be outstanding at a time in a streaming RPC.
-  int32_t reqOutstanding = 0;  // number of requests currently outstanding
+  bool finishSent = false;  // if true, we sent a finish.
+  int32_t responsesExpected = 0;  // number of future responses to requests we are expecting.
 
   // these are the tags we use in the completion queue to know what event/operation finished in the completion queue.
   enum CallTags { READ = 1, WRITE = 2, FINISH = 3, CONNECT = 4, ASYNC_NOTIFY_WHEN_DONE = 5 };
@@ -268,56 +197,30 @@ public:
     ctx.AsyncNotifyWhenDone(make_tag(CallTags::ASYNC_NOTIFY_WHEN_DONE));
   }
 
-  SingleRequest* getSingleRequest() {
-    SingleRequest* req = nullptr;
-
-    {
-      const std::lock_guard<std::mutex> lock(mutex);
-      reqOutstanding++;
-      if (!requestPool.empty()) {
-        req = requestPool.back();
-        requestPool.pop_back();
-        req->init();
-      }
+  virtual ~BiStreamingRequest() {
+    // release arena of req
+    if (req) {
+      releaseArena(req->GetArena());
+      req = nullptr;
     }
-
-    if (!req) {
-      req = new SingleRequest(this);
-    }
-
-    return req;
   }
 
 
   // mutex is held when calling this method
-  void doWrite(const PendingResponse& pr) {
+  void doWrite(ResponseT* response, const callback_type& callback) {
     assert(!writeOutstanding);
     writeOutstanding = true;
-    ResponseT* response = pr.rsp != nullptr ? &pr.rsp->getResponse() : &pr.req->getResponse();
     readerWriter.Write(*response, make_tag(WRITE));
-    release(pr);
-  }
-
-  // mutex is held when calling this method
-  void release(const PendingResponse& pr) {
-    if (pr.req != nullptr) {
-      if (requestPool.size() < 10) {
-        requestPool.push_back(pr.req);
-      } else {
-        delete pr.req;
-      }
-    }
-    if (pr.rsp != nullptr) {
-      delete pr.rsp;
-    }
+    callback(response);
   }
 
   // mutex is held when calling this method
   void maybeSendFinish() {
     // TODO: what if errored state?
-    if (readsDone && pending.empty() && !writeOutstanding && reqOutstanding <= 0) {
+    if (!finishSent && readsDone && pending.empty() && !writeOutstanding && responsesExpected <= 0) {
       // There are no other outstanding requests, so we can finish now.
       readerWriter.Finish(grpc::Status::OK, make_tag(FINISH));
+      finishSent = true;
       GRPC_DEBUG("After calling Finish. this={} numCalls={} cancelled={}", (void*)this, numCalls, ctx.IsCancelled());
     }
   }
@@ -327,13 +230,14 @@ public:
       const std::lock_guard<std::mutex> lock(mutex);
 
       if (!ok) {
+        errored = true;
         readsDone = true;  // is this needed? Our Read() call should also be returned with !ok and do the same thing?
       }
       assert(writeOutstanding);
       writeOutstanding = false;
       if (!pending.empty()) {
-        PendingResponse& pendingResponse = pending.front();
-        doWrite(pendingResponse);
+        auto& pendingResponse = pending.front();
+        doWrite((ResponseT*)pendingResponse.first, pendingResponse.second);
         pending.pop_front();
       } else {
         maybeSendFinish();
@@ -342,33 +246,49 @@ public:
   }
 
 
-
-  // initiate a read by creating a new request and requesting a read from the completion queue.
+  // request a read
   void readRequest() {
-    assert(req == nullptr);
-    req = getSingleRequest();
-    readerWriter.Read(&req->getRequest(), make_tag(READ));
+    if (req == nullptr) {
+      req = createRequestMessage();
+    }
+    readerWriter.Read(req, make_tag(READ));
   }
 
 
-  /// finishCount is the number of outstanding requests that this write will complete.
+  /// response is the message to send back to the client.
+  /// callback will be called with the response message after Write has been called and it is safe to free it.
+  /// The callback object itself may be copied and called later, so it must be safe to do so.
+  /// finishCount is the number of outstanding requests that this write will complete (i.e. responsesExpected is decremented).
   /// 0 if further writes will happen for the same request.
   /// 1 if the request is done and this is the last write.
   /// 2 or more if this write effectively coalesces responses to multiple requests.
   /// @returns the number of currently buffered write requests
-  size_t respond(SingleRequest* singleReq, SeparateResponse* rsp=nullptr, int32_t finishCount=1) {
+  size_t respond(ResponseT* response, const callback_type& callback, int32_t finishCount=1) {
     {
       const std::lock_guard<std::mutex> lock(mutex);
 
-      reqOutstanding -= finishCount;
+      responsesExpected -= finishCount;
       if (writeOutstanding) {
         // we can't write until the previous write is done.
-        pending.emplace_back(PendingResponse{singleReq, rsp});
+        pending.emplace_back(MessageAndCallback{response, callback});
       } else {
-        doWrite(PendingResponse{singleReq, rsp});
+        doWrite(response, callback);
       }
 
       return pending.size();
+    }
+  }
+
+  /// Decrement the count of the number of outstanding requests that need a response.
+  /// This can be used when something bad happened with a request and we don't want to send a response.
+  /// This can also be used when multiple responses are sent for a request, but one doesn't know the order the
+  /// responses will be completed.
+  void decrementOutstanding(int32_t finishCount=1) {
+    {
+      const std::lock_guard<std::mutex> lock(mutex);
+      responsesExpected -= finishCount;
+      // Maybe we didn't send finish earlier because there were outstanding responses for requests.  Check again.
+      maybeSendFinish();
     }
   }
 
@@ -394,19 +314,29 @@ public:
           readsDone = true;
           {
             const std::lock_guard<std::mutex> lock(mutex);
-            reqOutstanding--;  // this read request is done
-            delete req;
-            req = nullptr;
-
+            responsesExpected--;  // this read request is done
             maybeSendFinish();
           }
           break;
         }
 
-        // call handleRequest before requesting the next read. This allows for a flow control mechanism
+        {
+          const std::lock_guard<std::mutex> lock(mutex);
+          responsesExpected++;  // expect this request will eventually cause a response
+        }
+
+        // call handleRequest before requesting the next read. This allows for the handler to directly call respond()
+        // or to copy what is needed from the request object.  When this is the case, it can be reused.
+        //
+        // This also allows for a flow control mechanism
         // where at some point handleRequest can block / help perform tasks if heavily loaded.
-        handleRequest(*req);
-        req = nullptr;
+        {
+          bool ownershipPassed = handleRequest(req);
+          if (ownershipPassed) {
+            req = nullptr;
+          }
+        }
+
         readRequest();
         break;
       case WRITE:
@@ -414,12 +344,13 @@ public:
         writeFinished(ok);
         break;
       case FINISH:
-        delete this;  // deleting self... be careful there are no guards/destructors (like the mutex) that fire off after this!
-        // TODO: change to a return code and have the caller dispose of this object?
+        // deleting self... be careful there are no destructors or scope guards that depend on
+        // this object (like the mutex) that fire off after this!
+        delete this;
         break;
       case CONNECT:
         if (!ok) {
-          assert(reqOutstanding == 0);  // first event... should be nothing outstanding.
+          assert(responsesExpected == 0 && writeOutstanding == 0);  // first event... should be no requests outstanding.
           delete this;
           break;
         }
@@ -432,7 +363,6 @@ public:
         // In a simple test where the client sends two requests, calls finish, then reads the responses,
         // the last 3 events in the queue are Read(ok=false), ASYNC_NOTIFY_WHEN_DONE(ok=true), and FINISH(ok=true).
         // It doesn't seem like we currently need this event.
-        GRPC_DEBUG("ASYNC_NOTIFY_WHEN_DONE {}", (void*)this);
         break;
       default:
         // we tag everything going into the queue, so this shouldn't happen.
@@ -441,8 +371,37 @@ public:
     }
   }
 
+  /// This creates a request message with an Arena.  The arena may be used for other purposes as well.
+  /// Use releaseArena() to destroy both the Arena and the message.  The pointer to the arena
+  /// may be obtained from the message.
+  RequestT* createRequestMessage() {
+    auto arena = createArena();
+    return google::protobuf::Arena::CreateMessage<RequestT>(arena);
+  }
+
+  /// Creates an arena on the heap that also has the first buffer allocated as part of that allocation.
+  /// use releaseArena to free it.
+  google::protobuf::Arena* createArena() {
+    // heap allocate the first buffer and the arena together
+    char* buf = (char*)::operator new(ARENA_BUF_SIZE);
+    auto* arena = new (buf) google::protobuf::Arena(
+            buf+sizeof(google::protobuf::Arena),
+            ARENA_BUF_SIZE-sizeof(google::protobuf::Arena));
+    return arena;
+  }
+
+  /// Frees an arena created by this class.
+  void releaseArena(google::protobuf::Arena* arena) {
+    arena->Reset();
+    ::operator delete(arena, ARENA_BUF_SIZE);
+  }
+
   virtual void createNew() = 0;
-  virtual void handleRequest(SingleRequest& req) = 0;
+
+  /// Return true if you have taken ownership of the request message.
+  /// If so, a new one will be created for the next request. If false,
+  /// the request will be reused for the next request.
+  virtual bool handleRequest(RequestT* request) = 0;
 };
 
 
@@ -554,14 +513,49 @@ public:
     new SayHelloStreamingCall(server, service, threadInfo);
   }
 
-  void handleRequest(SingleRequest& req) override {
+  void fillResponse(HelloReply* response, HelloRequest* request, int responseNum) {
+    response->set_message("Hello " + request->name());
+    response->set_response_number(responseNum);
 
-    auto& request = req.getRequest();
-    auto& response = req.getResponse();
-    std::string prefix("HelloStreaming ");
-    response.set_message(prefix + request.name());
-    respond(&req);
-    // std::cout << "req name:" << request.name() << std::endl;
+    // sleep a random amount of time between the given min and max microseconds
+    if (request->max_sleep_us() > 0) {
+      auto now = std::chrono::high_resolution_clock::now();
+      solux::Rng rng(now.time_since_epoch().count());
+      auto sleepUs = rng.rint(request->min_sleep_us(), request->max_sleep_us());
+      std::this_thread::sleep_for(std::chrono::microseconds(sleepUs));
+    }
+  }
+
+  bool handleRequest(HelloRequest* request) override {
+    // if sync, we want to launch on a task_group and wait for it.
+    bool takeOwnership = false;
+
+    if (!request->async()) {
+      oneapi::tbb::task_group tg;
+
+      for (int i = 0; i < request->response_count(); i++) {
+        tg.run([this, request, i] {
+          auto arena = createArena();
+          HelloReply* response = google::protobuf::Arena::CreateMessage<HelloReply>(arena);
+          fillResponse(response, request, i);
+          respond(response,
+                  [this](auto* response) { this->releaseArena(response->GetArena()); },
+                  0);
+        });
+      }
+      tg.wait();
+
+      // Since we don't know the order the responses will be generated, we can't set "last" on the last one.
+      decrementOutstanding();
+      return takeOwnership;  // request object can be reused.
+    }
+
+    // if async, we want to launch on a non-local task arena.
+
+
+    // if sync, we can create our own task group on the stack and wait for it to complete.
+    // TODO
+    auto& taskArena = server.getSoluxNode().getTaskArena();
   }
 };
 

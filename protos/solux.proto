@@ -23,15 +23,22 @@ service Greeter {
 // The request message containing the user's name.
 message HelloRequest {
   string name = 1;
-  int32 response_count = 2;
-  int32 sleep_ms_min = 3;
-  int32 sleep_ms_max = 4;
-  bool debug = 5;
+  int32 response_count = 2;  // how many responses to send back
+  // the minimum and maximum amount of time to wait before responding (in microseconds)
+  int32 min_sleep_us = 3;
+  int32 max_sleep_us = 4;
+  int32 n_threads = 5;
+  // if async==true, the receiving thread will not take part in request processing (will just hand off to other threads)
+  // if false, the receiving thread will participate (possibly along with other threads) in request processing until
+  // all requests are processed.
+  bool async = 6;
+  bool debug = 7;
 }
 
 // The response message containing the greetings
 message HelloReply {
   string message = 1;
+  int32 response_number = 2;
 }
 
 

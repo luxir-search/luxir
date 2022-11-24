@@ -1,6 +1,7 @@
 
 #include <gtest/gtest.h>
 #include <iostream>
+#include <new>
 #include <solux/util/random.h>
 #include "solux/util/solux_util.h"
 #include "solux/util/heap.h"
@@ -19,8 +20,10 @@ TEST(BasicTest, testCompiler) {
     EXPECT_EQ(4, sizeof(int));
     EXPECT_EQ(4, sizeof(unsigned));
 
+#ifdef REMOVED // not implemented in clang yet
     // We don't require <=256, it's just a sanity check (i.e. we haven't seen it happen)
     EXPECT_TRUE(std::hardware_destructive_interference_size > 0 && std::hardware_destructive_interference_size <= 256);
+#endif
 
     SOLUX_PACKED_START
     struct alignas(1) s2 {

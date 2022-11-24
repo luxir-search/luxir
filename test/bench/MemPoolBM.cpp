@@ -18,7 +18,8 @@ using namespace solux;
 
    RESULTS:
      MemPool and std::pmr::monotonic_buffer_resource are the same speed on g++, but MemPool is faster on clang.
-     Protobuf Arena does really well considering that it's allocation is thread safe!
+     Protobuf Arena does really well considering that it's allocation is thread safe!  Although it will allocate
+     a new block for each thread that allocates from it.
      Pre-allocating the memory for the Arena does not help (this is testing *many* small allocations though)
 
 g++: Release (NDEBUG) __OPTIMIZE__=1 __cplusplus=202100 __GNUC__=12 __VERSION__=12.2.0 _GLIBCXX_RELEASE=12 __GLIBCXX__=20220819 __linux__=1
