@@ -410,102 +410,6 @@ public:
 };
 
 
-template <class RequestT, class ResponseT, class AsyncServiceT>
-class StreamingCallData : public CallData {
-public:
-  RequestT request;
-  ResponseT response;
-  AsyncServiceT& service;
-  grpc::ServerAsyncReaderWriter<ResponseT,RequestT> readerWriter;
-  enum CallStatus { READ = 1, WRITE = 2, CONNECT = 3, FINISH = 5 };
-
-  CallStatus state;
-  int numCalls = 0; // TODO: testing only... remove after stable.
-
-  StreamingCallData(GRPCServer& server, AsyncServiceT& service, GRPCServer::ThreadInfo& threadInfo) : CallData(server, threadInfo), service(service), readerWriter(&ctx) {
-    GRPC_DEBUG("CREATE StreamingCallData this={}", (void*)this);
-
-    // see https://stackoverflow.com/questions/60856240/grpc-c-async-server-how-differentiate-between-writesdone-and-broken-connection
-    // TODO: not sure the right way to use this event yet.
-    ctx.AsyncNotifyWhenDone(make_tag(1));
-    state = CONNECT;
-  }
-
-  virtual void proceed(bool ok, uint32_t tag) override {
-    // TODO: include testing for multiple threads calling back to this object (can that even happen?)
-    GRPC_DEBUG("PROCEED this={} state={} ok={} numCalls={} tag={} cancelled={}", (void*)this, state, ok, ++numCalls, tag, ctx.IsCancelled());
-
-    if (tag == 1) {
-      // result of AsyncNotifyWhenDone
-      // TODO: how should we make use of this?
-      return;
-    }
-
-    if (!ok && state != CallStatus::READ) {
-      // canceled/errored... nothing else to do.
-      GRPC_DEBUG("Error or shutting down. deleting this={}", (void*)this);
-      delete this;
-      return;
-    }
-
-    switch (state) {
-      case CallStatus::READ:
-
-        if (!ok) {
-          // Client ended the stream.
-          // TODO: ok==false when we are shutting down as well.... how to tell the difference?  I guess Finish will
-          // error out (or complete) if we're shutting down???
-          GRPC_DEBUG("End of stream!");
-          grpc::Status st(grpc::StatusCode::OK,"is OK message used/passed?");
-
-          // TODO: only finish *after* writing all necessary responses!
-          readerWriter.Finish(st,make_tag());
-          state = CallStatus::FINISH;
-          GRPC_DEBUG("After calling Finish. this={} state={} ok={} numCalls={} tag={} cancelled={}", (void*)this, state, ok, numCalls, tag, ctx.IsCancelled());
-          break;
-        }
-
-
-#ifdef GRPC_DEBUG
-        {
-          std::string reqStr;
-          google::protobuf::TextFormat::PrintToString(request, &reqStr);  // TODO: figure out something better for this
-          GRPC_DEBUG("Server read new streaming message:({})", reqStr);
-        }
-#endif
-
-        fillResponse();
-
-        readerWriter.Write(response, make_tag());
-
-        // TODO: we should be able to do multiple reads before the first write if we want.
-        state = CallStatus::WRITE;
-        break;
-
-      case CallStatus::WRITE:
-        readerWriter.Read(&request, make_tag());
-        state = CallStatus::READ;
-        break;
-
-      case CallStatus::CONNECT:
-        createNew();
-        readerWriter.Read(&request, make_tag());
-        state = CallStatus::READ;
-        break;
-
-      case CallStatus::FINISH:
-        delete this;
-        break;
-
-      default:
-        LOG_ERROR("Unexpected state {}", state);
-        assert(false);
-    }
-  }
-
-  virtual void createNew() = 0;
-  virtual void fillResponse() = 0;
-};
 
 class SayHelloStreamingCall : public BiStreamingRequest<HelloRequest, HelloReply, Greeter::AsyncService> {
 public:
@@ -713,33 +617,47 @@ public:
 //   1) N streaming clients connected to N server threads, handing out messages to M indexing threads partitioned by docid
 //
 
-class IndexerUpdateStreamingCall : public StreamingCallData<solux::proto::UpdateRequest, solux::proto::UpdateResponse, Indexer::AsyncService> {
+class IndexerUpdateStreamingCall : public BiStreamingRequest<solux::proto::UpdateRequest, solux::proto::UpdateResponse, Indexer::AsyncService> {
 public:
-  IndexerUpdateStreamingCall(GRPCServer& server, Indexer::AsyncService& service, GRPCServer::ThreadInfo& threadInfo) : StreamingCallData(server, service, threadInfo) {
-    service.RequestUpdateStream(&ctx, &readerWriter, threadInfo.cq.get(), threadInfo.cq.get(), make_tag());
+  IndexerUpdateStreamingCall(GRPCServer& server, Indexer::AsyncService& service, GRPCServer::ThreadInfo& threadInfo) : BiStreamingRequest(server, service, threadInfo) {
+    service.RequestUpdateStream(&ctx, &readerWriter, threadInfo.cq.get(), threadInfo.cq.get(), make_tag(CONNECT));
   }
 
   virtual void createNew() override {
     new IndexerUpdateStreamingCall(server, service, threadInfo);
   }
-  virtual void fillResponse() override {
-    GRPC_DEBUG("StreamingUpdate GRPCServer peer={}", ctx.peer());
-    auto ok = IndexerUpdateCall::handleUpdate(server, request, response);
+
+  bool handleRequest(proto::UpdateRequest* request) override {
+    auto arena = request->GetArena();
+    auto response = arena->CreateMessage<proto::UpdateResponse>(arena);
+    auto ok = IndexerUpdateCall::handleUpdate(server, *request, *response);
     unused(ok);
+    respond(response, [this](auto* response) { this->releaseArena(response->GetArena()); });
+    return true;
   }
 };
 
 //   rpc search(stream solux.proto.SearchRequest) returns (stream solux.proto.SearchResponse) {}
-class SearcherSearchStreamingCall : public StreamingCallData<solux::proto::SearchRequest, solux::proto::SearchResponse, Searcher::AsyncService> {
+class SearcherSearchStreamingCall : public BiStreamingRequest<solux::proto::SearchRequest, solux::proto::SearchResponse, Searcher::AsyncService> {
 public:
-  SearcherSearchStreamingCall(GRPCServer& server, Searcher::AsyncService& service, GRPCServer::ThreadInfo& threadInfo) : StreamingCallData(server, service, threadInfo) {
-    service.RequestSearch(&ctx, &readerWriter, threadInfo.cq.get(), threadInfo.cq.get(), make_tag());
+  SearcherSearchStreamingCall(GRPCServer& server, Searcher::AsyncService& service, GRPCServer::ThreadInfo& threadInfo) : BiStreamingRequest(server, service, threadInfo) {
+    service.RequestSearch(&ctx, &readerWriter, threadInfo.cq.get(), threadInfo.cq.get(), make_tag(CONNECT));
   }
 
   virtual void createNew() override {
     new SearcherSearchStreamingCall(server, service, threadInfo);
   }
-  virtual void fillResponse() override {
+
+  bool handleRequest(solux::proto::SearchRequest* request) override {
+    auto arena = request->GetArena();
+    auto response = arena->CreateMessage<solux::proto::SearchResponse>(arena);
+    fillResponse(*request, *response);
+    respond(response, [this](auto* response) { this->releaseArena(response->GetArena()); });
+    return true;
+  }
+
+
+  void fillResponse(solux::proto::SearchRequest& request, solux::proto::SearchResponse& response)  {
     GRPC_DEBUG("StreamingSearch GRPCServer peer={}", ctx.peer());
 
     std::shared_ptr<Collection> collection;
