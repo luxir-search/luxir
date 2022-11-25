@@ -7,8 +7,9 @@
 #include "solux/server/GRPCServer.h"
 
 // TODO - use a different logger for RPC stuff some point
-// redefine DEBUG to TRACE level whish shouldn't currently be logged!
+// redefine DEBUG to TRACE level which shouldn't currently be logged!
 #define GRPC_DEBUG LOG_TRACE
+// #define GRPC_DEBUG LOG_DEBUG
 
 using namespace solux;
 
@@ -128,23 +129,111 @@ TEST_F(GrpcIndexTest, streamingHello) {
   solux::HelloReply result;
   grpc::ClientContext context;  // need a new one for each RPC
 
+  // The grpc write and read interfaces are specified to be thread-safe with respect to each other, which should mean
+  // that we can have a separate thread reading responses while the main thread is writing requests.
   std::unique_ptr<grpc::ClientReaderWriter<HelloRequest,HelloReply>> stream = greeterStub->SayHelloStreaming(&context);
 
+  req.set_async(false);
+  req.set_min_sleep_us(1);
+  req.set_max_sleep_us(100);
+
+  int numRequests = 0;
   req.set_name("A");
   bool wrote = stream->Write(req);
   ASSERT_TRUE(wrote);
+  numRequests++;
+
   req.set_name("B");
   wrote = stream->Write(req);
   ASSERT_TRUE(wrote);
+  numRequests++;
+
+  req.set_name("C");
+  req.set_response_count(2);
+  wrote = stream->Write(req);
+  ASSERT_TRUE(wrote);
+  numRequests += 2;
 
   bool ok1 = stream->WritesDone();  // can replace with WriteLast? is it more efficient?
   ASSERT_TRUE(ok1);
 
+  int numResponses = 0;
   while (stream->Read(&result)) {
+    numResponses++;
     std::string resStr;
     google::protobuf::TextFormat::PrintToString(result, &resStr);
     GRPC_DEBUG("CLIENT RESULT:( {} )", resStr);
   }
+
+  ASSERT_EQ(numRequests, numResponses);
+
+  grpc::Status status = stream->Finish();
+  GRPC_DEBUG("CLIENT FINISHED");
+
+  ASSERT_TRUE(status.ok());
+}
+
+
+// Single streaming request with many requests + multiple responses per request over that stream.
+// Commenting out the lock guard in BiStreamingRequest::respond() should cause this test to fail sometimes.
+TEST_F(GrpcIndexTest, streamingHello2) {
+  Rng r = SoluxTest::rng;
+
+  solux::HelloRequest req;
+  solux::HelloReply result;
+  grpc::ClientContext context;  // need a new one for each RPC
+
+  std::unique_ptr<grpc::ClientReaderWriter<HelloRequest,HelloReply>> stream = greeterStub->SayHelloStreaming(&context);
+
+  oneapi::tbb::task_group tasks;
+
+  const int64_t numRequests = 100;
+  int64_t numResponsesExpected = 0;
+  int64_t numResponses = 0;
+
+  tasks.run(
+          [&] {
+            while (stream->Read(&result)) {
+              numResponses++;
+              /*
+              std::string resStr;
+              google::protobuf::TextFormat::PrintToString(result, &resStr);
+              GRPC_DEBUG("CLIENT RESULT:( {} )", resStr);
+               */
+            }
+          });
+
+  int sleepMin = 1;
+  int sleepMax = 20;
+  int maxResponsesPerRequest = 4;
+
+  req.set_name("A");
+  for (int i=0; i<numRequests; i++) {
+    req.set_async(true);
+    if (r.rbool()) {
+      req.set_min_sleep_us(sleepMin);
+      req.set_max_sleep_us(sleepMax);
+    } else {
+      req.set_min_sleep_us(0);
+      req.set_max_sleep_us(0);
+    }
+    req.set_min_sleep_us(sleepMin);
+    req.set_max_sleep_us(sleepMax);
+    int responseCount = r.rint(maxResponsesPerRequest) + 1;
+    req.set_response_count(responseCount);
+    numResponsesExpected += responseCount;
+
+    bool wrote = stream->Write(req);
+    ASSERT_TRUE(wrote);
+  }
+
+  bool ok = stream->WritesDone();
+  ASSERT_TRUE(ok);
+
+  // Wait to read all responses.  How to do a timeout if one never comes?
+  tasks.wait();
+
+  ASSERT_EQ(numResponsesExpected, numResponses);
 
   grpc::Status status = stream->Finish();
   GRPC_DEBUG("CLIENT FINISHED");

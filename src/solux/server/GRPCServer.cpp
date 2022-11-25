@@ -18,8 +18,8 @@ using namespace solux;
 
 // TODO - use a different logger for RPC stuff some point
 // redefine DEBUG to TRACE level which shouldn't currently be logged!
-// #define GRPC_DEBUG LOG_TRACE
-#define GRPC_DEBUG LOG_DEBUG
+#define GRPC_DEBUG LOG_TRACE
+// #define GRPC_DEBUG LOG_DEBUG
 
 GRPCServer::GRPCServer(int nthreads)
   : startLatch(1), startLatchThreads(nthreads), nthreads(nthreads) {
@@ -263,6 +263,8 @@ public:
   /// 1 if the request is done and this is the last write.
   /// 2 or more if this write effectively coalesces responses to multiple requests.
   /// @returns the number of currently buffered write requests
+  /// NOTE: calling with finishCount>0 may eventually cause "this" to be deleted in another thread,
+  /// so make it the last thing you do with "this" in the calling code.
   size_t respond(ResponseT* response, const callback_type& callback, int32_t finishCount=1) {
     {
       const std::lock_guard<std::mutex> lock(mutex);
@@ -283,6 +285,7 @@ public:
   /// This can be used when something bad happened with a request and we don't want to send a response.
   /// This can also be used when multiple responses are sent for a request, but one doesn't know the order the
   /// responses will be completed.
+  /// NOTE: this may eventually cause "this" to be deleted in another thread, so make it the last thing you do with "this" in the calling code.
   void decrementOutstanding(int32_t finishCount=1) {
     {
       const std::lock_guard<std::mutex> lock(mutex);
@@ -302,7 +305,8 @@ public:
     // Ending the stream: currently outstanding requests will always cause a Write request to be done, hence we can just
     // check in writeFinished() if we are done and call Finish() if so.
 
-    GRPC_DEBUG("PROCEED this={} ok={} numCalls={} tag={} cancelled={}", (void*)this, ok, ++numCalls, tag, ctx.IsCancelled());
+    GRPC_DEBUG("PROCEED this={} ok={} numCalls={} tag={} cancelled={} responsesExpected={} readsDone={} writeOutstanding={} pwrites={}",
+               (void*)this, ok, ++numCalls, tag, ctx.IsCancelled(), responsesExpected, readsDone, writeOutstanding, pending.size());
 
     switch(tag) {
       case READ:
@@ -314,12 +318,13 @@ public:
           readsDone = true;
           {
             const std::lock_guard<std::mutex> lock(mutex);
-            responsesExpected--;  // this read request is done
             maybeSendFinish();
           }
           break;
         }
 
+        // respond() can be called before handleRequest returns, so we need to increment the number of
+        // outstanding requests before that.
         {
           const std::lock_guard<std::mutex> lock(mutex);
           responsesExpected++;  // expect this request will eventually cause a response
@@ -526,36 +531,75 @@ public:
     }
   }
 
+  void doMultipleResponse(HelloRequest* request) {
+    oneapi::tbb::task_group tg;
+
+    for (int i = 0; i < request->response_count(); i++) {
+      tg.run([this, request, i] {
+        auto arena = createArena();
+        HelloReply* response = google::protobuf::Arena::CreateMessage<HelloReply>(arena);
+        fillResponse(response, request, i+1);
+        respond(response,
+                [this](auto* response) { this->releaseArena(response->GetArena()); },
+                0);  // never call with >0 here since we don't know the order of execution and that could end things prematurely.
+      });
+    }
+    tg.wait();
+  }
+
   bool handleRequest(HelloRequest* request) override {
-    // if sync, we want to launch on a task_group and wait for it.
-    bool takeOwnership = false;
 
-    if (!request->async()) {
-      oneapi::tbb::task_group tg;
+    // single sync response, do the simplest way.
+    if (request->response_count() <= 1) {
+      // if sync, respond
+      if (!request->async()) {
+        // NOTE: we still can't use a single cached response object here because this call could be interleaved with
+        // other calls that cause buffering of the responses and hence we don't know when the response will actually
+        // be sent.  We would need to implement caching of responses.
+        auto arena = createArena();
+        HelloReply* response = google::protobuf::Arena::CreateMessage<HelloReply>(arena);
+        fillResponse(response, request, 1);
+        respond(response,
+                [this](auto* response) { this->releaseArena(response->GetArena()); },
+                1);
 
-      for (int i = 0; i < request->response_count(); i++) {
-        tg.run([this, request, i] {
-          auto arena = createArena();
-          HelloReply* response = google::protobuf::Arena::CreateMessage<HelloReply>(arena);
-          fillResponse(response, request, i);
-          respond(response,
-                  [this](auto* response) { this->releaseArena(response->GetArena()); },
-                  0);
-        });
+        return false; // don't take ownership of request object
       }
-      tg.wait();
 
-      // Since we don't know the order the responses will be generated, we can't set "last" on the last one.
-      decrementOutstanding();
-      return takeOwnership;  // request object can be reused.
+      // if async, but single response (this will be most common in solux probably), then we can just use the
+      // arena of the request object.
+      auto arena = request->GetArena();
+      // Create the response object immediately so it's in the same arena buffer as the request object.
+      // If it's created in a different thread, a different arena buffer will be used.
+      // In reality, this would probably only help responses that don't need to further allocate.
+      HelloReply* response = google::protobuf::Arena::CreateMessage<HelloReply>(arena);
+      auto& taskArena = server.getSoluxNode().getTaskArena();
+
+      taskArena.enqueue([this,request,response]() {
+        this->fillResponse(response, request, 1);
+        this->respond(response,
+                      [this](auto* response) { this->releaseArena(response->GetArena()); },
+                      1);
+        // since the arena of the response will be freed, that will take care of the
+        // request as well.
+      });
+      return true; // take ownership of request object
     }
 
-    // if async, we want to launch on a non-local task arena.
+    if (!request->async()) {
+      doMultipleResponse(request);
+      decrementOutstanding();
+      return false; // don't take ownership of request object.. we don't need it anymore.
+    }
 
-
-    // if sync, we can create our own task group on the stack and wait for it to complete.
-    // TODO
+    // if async, take ownership of request object so we can refer to it later.
     auto& taskArena = server.getSoluxNode().getTaskArena();
+    taskArena.enqueue([this,request]() {
+      this->doMultipleResponse(request);
+      this->releaseArena(request->GetArena());
+      this->decrementOutstanding();
+    });
+    return true; // take ownership of request object
   }
 };
 
