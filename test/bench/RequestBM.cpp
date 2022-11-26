@@ -39,13 +39,14 @@ static void BM_Req(benchmark::State& state, int writers, int readers, bool async
   int64_t loops = 0;
 
   auto start = std::chrono::high_resolution_clock::now();
-  int64_t inside_duration = 0;
+  // int64_t inside_duration = 0;
   for (auto _ : state) {
     // auto inside_start = std::chrono::high_resolution_clock::now();
 
     std::atomic_int32_t expectedResponses;
     std::atomic_bool writesDone(false);
 
+    // moving this outside the loop (and using a latch to wait) made less than 2% difference.
     tasks.run(
             [&] {
               int32_t numResponses = 0;
@@ -105,6 +106,7 @@ static void BM_Req(benchmark::State& state, int writers, int readers, bool async
   // Also, measuring the wall time from outside of the loop and inside of the loop is very different... gtest must be doing a bunch of stuff for the setup.
   // Measuring duration from inside the loop matches the Time column in gtest output that is seemingly used when UseRealTime() is set.
   // LOG_INFO("totalReads: {} totalWrites: {} loops: {} myduration={} inside_duration={}", totalReads, totalWrites, loops, duration, inside_duration/loops);
+  unused(duration);
 }
 
 

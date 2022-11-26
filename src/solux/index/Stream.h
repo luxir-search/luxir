@@ -219,18 +219,18 @@ class StreamReader {
 public:
   StreamReader(const Stream &source, const MemPool &pool) : pool_(pool) {
     remaining_ = source.size(pool_);
+    sliceSize_ = Stream::FIRST_LEVEL_SIZE;
 
     // position ptr on first character, or null if none
     if (remaining_ <= Stream::FIRST_LEVEL_SIZE) {
       if (remaining_ == 0) {
         ptr_ = nullptr;
+        remainingInSlice_ = 0; // not really needed, but getting rid of compiler warnings
       } else {
         ptr_ = reinterpret_cast<const char *>(&source.bbStart_);
-        sliceSize_ = Stream::FIRST_LEVEL_SIZE;
         remainingInSlice_ = static_cast<uint8_t>(remaining_);
       }
     } else {
-      sliceSize_ = Stream::FIRST_LEVEL_SIZE;
       int bbStart = source.bbStart_;
       // nocommit memcpy(&bbStart, &source.bbStart_, sizeof(int));  // This is just trying to tell the compiler that bbStart_ was written through an alias, so get the actual bytes!
       initFromBBPointer(bbStart);

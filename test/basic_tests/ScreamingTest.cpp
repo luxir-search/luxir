@@ -185,7 +185,7 @@ public:
         if (skipIter.val() < last && rng.rbool()) {
           // mix in some calls to next()
           int n = skipIter.next();
-          assert(n <= last);
+          EXPECT_TRUE(n <= last);
         }
         // std::cout << "\tseeking target=" << seekTarget << " expected val=" << val << " last=" << last << std::endl;
 
