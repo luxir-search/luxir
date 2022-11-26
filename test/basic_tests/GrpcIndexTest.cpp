@@ -2,7 +2,7 @@
 #include <iostream>
 #include <gtest/gtest.h>
 #include <google/protobuf/text_format.h>
-#include "tbb/task_group.h"
+#include "oneapi/tbb/task_group.h"
 #include "test/SoluxTest.h"
 #include "solux/server/GRPCServer.h"
 

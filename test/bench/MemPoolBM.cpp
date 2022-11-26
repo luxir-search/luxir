@@ -277,8 +277,8 @@ static void BM_AllocFree_std_pool(benchmark::State& state) {
   benchAllocFree<std::pmr::unsynchronized_pool_resource>(state);
 }
 
-BENCHMARK(BM_AllocFree_default)->Range(1,16)->RangeMultiplier(2);
-BENCHMARK(BM_AllocFree_std_pool)->Range(1,16)->RangeMultiplier(2);
+BENCHMARK(BM_AllocFree_default)->Range(1,16)->RangeMultiplier(2)->UseRealTime();
+BENCHMARK(BM_AllocFree_std_pool)->Range(1,16)->RangeMultiplier(2)->UseRealTime();
 
 #else
 inline void hackety_hack() {

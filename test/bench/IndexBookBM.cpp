@@ -41,14 +41,14 @@ static void BM_IndexBook(benchmark::State& state, std::string field, bool writeP
     }
   }
 
-  state.counters["rate="] = benchmark::Counter(sz, benchmark::Counter::kIsIterationInvariantRate);
+  state.counters["rate"] = benchmark::Counter(sz, benchmark::Counter::kIsIterationInvariantRate);
   state.counters["inverterSz"] = inverterSz;
   state.counters["indexSz"] = dir.totalFileSize();
 }
 
 
 
-BENCHMARK_CAPTURE(BM_IndexBook, ws, "text_w", false, false);             // index whole book as single doc, invert only
-BENCHMARK_CAPTURE(BM_IndexBook, ws_postings, "text_w", true, false);     // index whole book as single doc
-BENCHMARK_CAPTURE(BM_IndexBook, para_ws, "text_w", false, true);         // index paragraph-per-doc, invert only
-BENCHMARK_CAPTURE(BM_IndexBook, para_ws_postings, "text_w", true, true); // index paragraph-per-ddoc
+BENCHMARK_CAPTURE(BM_IndexBook, ws, "text_w", false, false)->UseRealTime();             // index whole book as single doc, invert only
+BENCHMARK_CAPTURE(BM_IndexBook, ws_postings, "text_w", true, false)->UseRealTime();     // index whole book as single doc
+BENCHMARK_CAPTURE(BM_IndexBook, para_ws, "text_w", false, true)->UseRealTime();         // index paragraph-per-doc, invert only
+BENCHMARK_CAPTURE(BM_IndexBook, para_ws_postings, "text_w", true, true)->UseRealTime(); // index paragraph-per-ddoc

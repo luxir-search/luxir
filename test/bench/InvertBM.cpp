@@ -49,6 +49,6 @@ static void BM_Invert(benchmark::State& state, std::string field, bool writePost
 
 
 
-BENCHMARK_CAPTURE(BM_Invert, ws, "text_w", false);
-BENCHMARK_CAPTURE(BM_Invert, ws_lc, "text_wl", false);
-BENCHMARK_CAPTURE(BM_Invert, ws_postings, "text_w", true);
+BENCHMARK_CAPTURE(BM_Invert, ws, "text_w", false)->UseRealTime();
+BENCHMARK_CAPTURE(BM_Invert, ws_lc, "text_wl", false)->UseRealTime();
+BENCHMARK_CAPTURE(BM_Invert, ws_postings, "text_w", true)->UseRealTime();
