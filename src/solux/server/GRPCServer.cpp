@@ -398,7 +398,7 @@ public:
   /// Frees an arena created by this class.
   void releaseArena(google::protobuf::Arena* arena) {
     arena->Reset();
-    ::operator delete(arena, ARENA_BUF_SIZE);
+    ::operator delete(arena);
   }
 
   virtual void createNew() = 0;
