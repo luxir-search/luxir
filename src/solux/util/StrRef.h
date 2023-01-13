@@ -134,6 +134,24 @@ public:
 };
 
 
+class PackedTerm;
+
+/// A lazy PackedTerm like a string_view meant for heterogeneous lookup in containers via try_emplace.
+/// This is a reference to data that can optionally be used to create a durable PackedTerm by copying the data into
+/// the MemPool target.  The lifetime of "data" should outlive the LazyPackedTerm.
+class LazyPackedTerm final {
+  MemPool &target;
+  const void* data_;
+  uint32_t size_;
+public:
+  LazyPackedTerm(MemPool &target, const void *data, uint32_t size) : target(target), data_(data), size_(size) {}
+  const char* data() const { return (const char*) data_; }
+  uint32_t size() const { return size_; }
+  MemPool& targetPool() const { return target; }
+
+  operator std::string_view() const noexcept { return std::string_view(data(), size()); }
+};
+
 // A term has a byte of size (0-255) followed directly by the data.
 // NOTE: if this is overlaid over zeroes, isNull() will return true.
 // By default, *no* initialization is done.
@@ -161,11 +179,16 @@ public:
   // NOTE: default constructor of PackedTerm does not initialize object.
   PackedTerm() {}
 
+  // these constructors copy data into the target pool
   PackedTerm(MemPool &target, const void *data, uint32_t len) {
     ptr_ = write(target, data, len);
   }
   PackedTerm(MemPool &target, std::string_view s) {
     ptr_ = write(target, s.data(), s.size());
+  }
+  // making this explicit didn't work for boost::unordered_flat_map try_emplace with heterogeneous lookup
+  explicit PackedTerm(const LazyPackedTerm& lazy) {
+    ptr_ = write(lazy.targetPool(), lazy.data(), lazy.size());
   }
 
   // Expert: Copies this PackedTerm to the target.  The target should have at least the same
@@ -181,8 +204,7 @@ public:
     ptr_ = reinterpret_cast<char *>(ptr);
   }
 
-  // expert: should already point to an instance of this type
-  // TODO: make this somehow harder to accidentally use!
+  // expert: should already point to an instance of this type, and a copy of the data is *not* made.
   explicit PackedTerm(void *ptr) noexcept : ptr_(reinterpret_cast<char *>(ptr)) {}
 
   explicit PackedTerm(void *ptr, uint32_t size) noexcept : ptr_(reinterpret_cast<char *>(ptr)) {}
@@ -309,6 +331,9 @@ struct PackedTermHash {
   size_t operator()(const PackedTerm& term) const noexcept {
     return (*this)(term.data(), term.size());
   }
+  size_t operator()(const LazyPackedTerm& term) const noexcept {
+    return (*this)(term.data(), term.size());
+  }
   size_t operator()(const std::string& str) const noexcept {
     return (*this)(str.data(), str.size());
   }
@@ -320,6 +345,12 @@ struct PackedTermHash {
 struct PackedTermEqual {
   using is_transparent = void;
   bool operator()(const PackedTerm& lhs, const PackedTerm& rhs) const noexcept {
+    return lhs == rhs;
+  }
+  bool operator()(const PackedTerm& lhs, const LazyPackedTerm& rhs) const noexcept {
+    return lhs == rhs;
+  }
+  bool operator()(const LazyPackedTerm& lhs, const PackedTerm& rhs) const noexcept {
     return lhs == rhs;
   }
   bool operator()(const PackedTerm& lhs, const std::string_view& rhs) const noexcept {

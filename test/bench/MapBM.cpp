@@ -4,6 +4,8 @@
 #include "solux/util/StrRef.h"
 #include "solux/util/TermValHash.h"
 #include "gtl/phmap.hpp"
+#include "boost/unordered/unordered_flat_map.hpp"
+#include "boost/unordered/unordered_flat_set.hpp"
 #ifdef ROBIN_HOOD_HASHING
 #include <robin_hood.h>
 #endif
@@ -119,6 +121,10 @@ struct TestHasher {
   }
 
   size_t operator()(const PackedTerm& term) const {
+    return h(term.data(), term.size());
+  }
+
+  size_t operator()(const LazyPackedTerm& term) const {
     return h(term.data(), term.size());
   }
 
@@ -290,6 +296,46 @@ public:
   }
 };
 
+
+class BoostFlatMap {
+public:
+  MemPool& pool;
+  // boost::unordered_flat_map<PackedTerm, FakeDocStream, TestHasher, PackedTermEqual> map;
+  // std::unordered_map<PackedTerm, FakeDocStream, TestHasher, PackedTermEqual> map;
+  gtl::flat_hash_map<PackedTerm, FakeDocStream, TestHasher, PackedTermEqual> map;
+  // gtl is the only map that currently works correctly with LazyPackedTerm.  If "explicit" is removed from
+  // the constructor, then the others will compile but not be lazy (i.e. a lookup of existing key will
+  // still copy the key to the MemPool)
+
+  BoostFlatMap(MemPool& pool, int initialCapacity) : pool(pool), map(initialCapacity) {
+  }
+
+  // returns partial fingerprint for comparison across multiple iterations.
+  uint64_t add(const char* term, int tlen, int doc, int pos) {
+    uint64_t ret;
+
+    auto [iter, inserted] = map.try_emplace(LazyPackedTerm(pool, term, tlen), pool, doc, pos);
+
+    if (!inserted) {
+      auto&[k,v] = *iter;
+      v.addDoc(pool, doc, pos);
+      ret = v.doctot + v.postot;
+    } else {
+      ret = uint64_t(doc)*3 + uint64_t(pos)*5;
+    }
+
+    return ret;
+  }
+
+  int size() {  // number of terms
+    return (int)map.size();
+  }
+
+  long mem() {  // additional mem usage... framework will take care of pool usage.
+    return map.bucket_count() * sizeof(decltype(map)::value_type);
+  }
+};
+
 template <typename MapType>
 class SimpleMap {
 public:
@@ -436,6 +482,7 @@ static void BM_invertTemplate(benchmark::State& state) {
 
 using StrPHFlatMap = SimpleMap<gtl::flat_hash_map<std::string, FakeDocStream, TestHasher, PackedTermEqual>>;
 using SVPHFlatMap = SimpleMap<gtl::flat_hash_map<std::string_view, FakeDocStream, TestHasher, PackedTermEqual>>;
+using SVBoostFlatMap = SimpleMap<boost::unordered_flat_map<std::string_view, FakeDocStream, TestHasher, PackedTermEqual>>;
 using SVstdMap = SimpleMap<std::unordered_map<std::string_view, FakeDocStream, TestHasher, PackedTermEqual>>;
 
 // BENCHMARK(BM_invertTemplate<OldTermValHash>); // doesn't work, so we'll use this longer form
@@ -447,12 +494,16 @@ static void BM_mapPHFlatParSet(benchmark::State& state) { BM_invertTemplate<PHFl
 BENCHMARK(BM_mapPHFlatParSet);
 static void BM_mapPHNodeSet(benchmark::State& state) { BM_invertTemplate<PHNodeSet>(state); }
 BENCHMARK(BM_mapPHNodeSet);
+static void BM_mapBoostFlatMap(benchmark::State& state) { BM_invertTemplate<BoostFlatMap>(state); }
+BENCHMARK(BM_mapBoostFlatMap);
 static void BM_mapPHFlatMap(benchmark::State& state) { BM_invertTemplate<PHFlatMap>(state); }
 BENCHMARK(BM_mapPHFlatMap);
 static void BM_mapStrPHFlatMap(benchmark::State& state) { BM_invertTemplate<StrPHFlatMap>(state); }
 BENCHMARK(BM_mapStrPHFlatMap);
 static void BM_mapSVPHFlatMap(benchmark::State& state) { BM_invertTemplate<SVPHFlatMap>(state); }
 BENCHMARK(BM_mapSVPHFlatMap);
+static void BM_mapSVBoostFlatMap(benchmark::State& state) { BM_invertTemplate<SVBoostFlatMap>(state); }
+BENCHMARK(BM_mapSVBoostFlatMap);
 static void BM_mapSVstdMap(benchmark::State& state) { BM_invertTemplate<SVstdMap>(state); }
 BENCHMARK(BM_mapSVstdMap);
 
