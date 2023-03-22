@@ -310,6 +310,73 @@ public:
   };
 
 
+  // single-valued string field (indexed and stored)
+  class StringIndexHandler : public IndexHandler {
+    friend Inverter;
+
+    // TODO: for unique fields like "id", this could be TermValHash<int32_t>
+    TermValHash<DocStream> termsHash;  // the set of terms contained in this field
+
+  public:
+    StringIndexHandler(Inverter &inverter, const std::string_view &fieldName, FieldType& fieldType)
+            : IndexHandler(PackedTerm(inverter.pool,fieldName), fieldType),
+              termsHash(inverter.pool, 4) {
+    }
+    ~StringIndexHandler() override = default;
+
+    void index(Inverter& inverter, const proto::Val& val) override {
+      std::string_view v;
+
+      if (val.has_s()) {
+        v = val.s();
+      } else if (val.has_bin()) {
+        v = val.bin();
+      }
+      // TODO: handle arrays as well.
+
+      indexSingle(inverter, v);
+    }
+
+    void indexSingle(Inverter& inverter, std::string_view term) {
+      // TODO: error check if term is too long to index.
+      auto[entry, inserted] = termsHash.try_emplace(term, termsHash.getMemPool());
+      unused(inserted);
+      entry->val().addDoc(termsHash.getMemPool(), inverter.currDoc);
+    }
+
+    void flush(Inverter& inverter) override {
+      auto sz = termsHash.size();
+      auto terms = termsHash.destructiveCompress();
+      boost::sort::spreadsort::string_sort(terms, terms+sz, TermRef::bracket(), TermRef::getsize(), TermRef::lessthan());
+
+      TextWriter textWriter(inverter.getPostingsWriter());
+      PostingsWriter::IndexFieldInfo& fieldInfo = inverter.getPostingsWriter().fieldInfos.emplace_back();
+      fieldInfo.fieldname = fieldName;
+
+      // For ordinals, we already know the number of unique terms, so we can use an optimal number of bits right off the bat
+      // for dense fields.  Then we could simply memcpy the ordinals into the postings file.
+      std::vector<int> docToOrd(inverter.currDoc+1, 0); // This is very inefficient temporary implementation.
+      // ord vec must me 0 initialized since that is value that means "missing".
+
+      textWriter.startField(&fieldInfo);
+      for (size_t tnum=0; tnum<sz; tnum++) {
+        auto term = terms[tnum];
+        textWriter.startTerm(term);
+        // push all the docs for this term to the TextWriter, as well as record the ordinal for each doc
+        term.val().forEachDoc(inverter.pool, [&](int docid) {
+          textWriter.startDoc(docid);
+          textWriter.endDoc(docid);
+          docToOrd[docid] = tnum + 1;  // +1 because 0 means "missing"
+        });
+        textWriter.endTerm(term);
+      }
+      textWriter.endField();
+      termsHash.free();
+
+      // TODO: need to write the ordinals to the postings file.
+    }
+
+  };
 
 
   // OPTIMIZATION: since we only do additions and not deletions, a monotonic allocator that had destructor
@@ -338,6 +405,9 @@ public:
     // TODO: Need to look up the correct field type in schema.  For now just inline it.
 
     std::string_view suffix = name.substr(name.find_last_of('_'));
+    if (suffix.empty() && name == "id") {
+      suffix = "_s";
+    }
 
     // TEMPORARY: based on the suffix, try to find both the cached FieldType and associated TokenChain
     auto typeIter = typeInfo.find(suffix);
@@ -349,6 +419,8 @@ public:
 
       if (suffix == "_i") {
         ft->flags_ = 0;
+      } else if (suffix == "_s") {
+        ft->flags_ = FieldType::INDEX_DOCS;
       } else {
         ft->flags_ = FieldType::INDEX_DOCS_AND_FREQS_AND_POSITIONS | FieldType::NUM_TOKENS_APPROX;
         auto wsTok = std::make_unique<WhitespaceTokenizer>();
@@ -371,6 +443,8 @@ public:
     std::unique_ptr<IndexHandler> fieldHandler;
     if (suffix == "_i") {
       fieldHandler = std::make_unique<IntColHandler>(*this, name, fieldType);
+    } else if (suffix == "_s") {
+      fieldHandler = std::make_unique<StringIndexHandler>(*this, name, fieldType);
     } else {
       fieldHandler = std::make_unique<PosIndexHandler>(*this, name, fieldType, tokenChain);
     }

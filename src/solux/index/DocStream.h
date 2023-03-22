@@ -82,7 +82,7 @@ public:
     lastDoc = docid;
   }
 
-  /// Calls sink.startDoc(int docid) only for each doc   // TODO: if I make this a callable, I could use lambdas?
+  /// Calls sink.startDoc(int docid) only for each doc
   template <class PostingsConsumer>
   void pushDocs(MemPool& pool, PostingsConsumer& sink) {
     int runPtr = -1;
@@ -103,6 +103,29 @@ public:
       sink.startDoc(docid);
     }
   }
+
+  // Method that takes a lambda to call for each docid
+  template <class F>
+  void forEachDoc(MemPool& pool, F f) {
+    int runPtr = -1;
+
+    StreamReader dstream(stream, pool);
+    while (!dstream.eof()) {
+      int gap = dstream.readVint();
+      int runSize = dstream.readVint();
+      runPtr += gap;
+      for (int i = 0; i<runSize; i++) {
+        f(runPtr + i);
+      }
+      runPtr += runSize - 1;  // next gap is from the end of this run
+    }
+
+    // handle last run
+    for (int docid = runStart; docid <=lastDoc; docid++) {
+      f(docid);
+    }
+  }
+
 
   // TODO: add a more specific PostingsConsumer that can communicate runs to a compressed bitset builder.
 
