@@ -236,7 +236,7 @@ namespace solux::test {
       iter.reset();
     }
 
-    int64_t nextDoc() {  // TODO: change to int64_t
+    int64_t nextDoc() {
       if (iter == nullptr) {
         auto found = nextSegment();
         if (!found) return -1; // OR BIG_END. 0x7ffffffff?

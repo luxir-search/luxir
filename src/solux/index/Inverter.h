@@ -337,6 +337,10 @@ public:
       indexSingle(inverter, v);
     }
 
+    void index(Inverter& inverter, char* mutableVal, int len) override {
+      indexSingle(inverter, std::string_view(mutableVal, len));
+    }
+
     void indexSingle(Inverter& inverter, std::string_view term) {
       // TODO: error check if term is too long to index.
       auto[entry, inserted] = termsHash.try_emplace(term, termsHash.getMemPool());
@@ -345,10 +349,13 @@ public:
     }
 
     void flush(Inverter& inverter) override {
-      auto sz = termsHash.size();
-      auto terms = termsHash.destructiveCompress();
-      boost::sort::spreadsort::string_sort(terms, terms+sz, TermRef::bracket(), TermRef::getsize(), TermRef::lessthan());
+      int32_t numVals = termsHash.size();
+      auto full = numVals >= inverter.postingsWriter.getMaxDoc();
 
+      auto terms = termsHash.destructiveCompress();
+      boost::sort::spreadsort::string_sort(terms, terms+numVals, TermRef::bracket(), TermRef::getsize(), TermRef::lessthan());
+
+      // TODO: TextWriter should be refactored (or templated) to handle strings without positions.
       TextWriter textWriter(inverter.getPostingsWriter());
       PostingsWriter::IndexFieldInfo& fieldInfo = inverter.getPostingsWriter().fieldInfos.emplace_back();
       fieldInfo.fieldname = fieldName;
@@ -359,12 +366,14 @@ public:
       // ord vec must me 0 initialized since that is value that means "missing".
 
       textWriter.startField(&fieldInfo);
-      for (size_t tnum=0; tnum<sz; tnum++) {
+      for (size_t tnum=0; tnum<numVals; tnum++) {
         auto term = terms[tnum];
         textWriter.startTerm(term);
         // push all the docs for this term to the TextWriter, as well as record the ordinal for each doc
         term.val().forEachDoc(inverter.pool, [&](int docid) {
+          // LOG_INFO("WRITE docid={}, tnum={}", docid, tnum);
           textWriter.startDoc(docid);
+          textWriter.addPositionDelta(1); // add a dummy position for now since we are using TextWriter, which expects them.
           textWriter.endDoc(docid);
           docToOrd[docid] = tnum + 1;  // +1 because 0 means "missing"
         });
@@ -373,7 +382,36 @@ public:
       textWriter.endField();
       termsHash.free();
 
-      // TODO: need to write the ordinals to the postings file.
+      // Write the ordinals to the postings file.
+      {
+        auto guard = inverter.pool.rewindScopeGuard();
+        IntColWriter ordCol(inverter.pool, inverter.postingsWriter, fieldInfo);
+        ordCol.startField();
+        for (int docid = 0; docid <= inverter.currDoc; docid++) {
+          int32_t ord = docToOrd[docid];
+          if (ord != 0) {
+            ordCol.addInt64(ord);
+          }
+        }
+        ordCol.finish();
+      }
+
+      {
+        auto guard = inverter.pool.rewindScopeGuard();
+        DocsWithValWriter docsWriter(inverter.pool, inverter.postingsWriter, fieldInfo);
+        if (!full) {
+          for (int docid = 0; docid <= inverter.currDoc; docid++) {
+            int32_t ord = docToOrd[docid];
+            if (ord != 0) {
+              docsWriter.startDoc(docid);
+            }
+          }
+          docsWriter.finish();
+        } else {
+          docsWriter.finishDense(numVals);
+        }
+      }
+
     }
 
   };
