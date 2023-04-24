@@ -262,8 +262,7 @@ private:
 };
 
 
-
-
+// TODO: we need a specialization of this for when positions are not required (indexed string fields)
 class TextWriter {
   PostingsWriter& postingsWriter;
   PostingsWriter::IndexFieldInfo* fieldInfo;
@@ -356,7 +355,7 @@ public:
     docsLoc = docOutput.size();
     posLoc = posOutput.size();
     numTerms = 0;
-    fieldInfo->flags = 0x01;  // text field
+    fieldInfo->flags |= 0x01;  // text field
 
     termBlockOffsets.resize(0);
 
@@ -546,12 +545,14 @@ public:
   // ends, we could provide a callback or another signal (perhaps a bool return from endField()) to release
   // the term storage.  We could also have a startTerm(std::string_view) and an associated pool that we could
   // roll back after we flush a term block.
-  void startTerm(TermRef term) {
-    termList.push_back(term);  // we don't really need the term name at this point (could add in endTerm), but it might be nice for debugging / exceptions?
+  // returns 1-based ordinal of term in this field
+  int32_t startTerm(TermRef term) {
     docsFlushed = 0;
     positionsHandled = 0;
     locOfPositionsForTerm = posOutput.size();
     locOfDocsForTerm = docOutput.size();
+    termList.push_back(term);  // we don't really need the term name at this point (could add in endTerm), but it might be nice for debugging / exceptions?
+    return numTerms + termList.size();
   }
 
   void endTerm(TermRef term) {

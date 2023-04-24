@@ -256,7 +256,7 @@ struct SegFieldInfo {
   seg_location docsWithFieldEndLoc;
   seg_location columnLoc;
 
-  int32_t flags;  // temporary... currently has type info. 0x01 text, 0x02 int col.  In the future, we should decompose and have separate sections for each type
+  int32_t flags = 0;  // temporary... currently has type info. 0x01 text, 0x02 int col, 0x04 indexed str col.  In the future, we should decompose and have separate sections for each type
 };
 
 

@@ -255,6 +255,10 @@ namespace solux::test {
       return v = iter->value();
     }
 
+    int64_t ord() {
+      return v = iter->value();
+    }
+
     bool nextSegment() {
       auto segments = testIndex.reader->segments();
 

@@ -359,6 +359,7 @@ public:
       TextWriter textWriter(inverter.getPostingsWriter());
       PostingsWriter::IndexFieldInfo& fieldInfo = inverter.getPostingsWriter().fieldInfos.emplace_back();
       fieldInfo.fieldname = fieldName;
+      fieldInfo.flags = 0x04; // ord column
 
       // For ordinals, we already know the number of unique terms, so we can use an optimal number of bits right off the bat
       // for dense fields.  Then we could simply memcpy the ordinals into the postings file.

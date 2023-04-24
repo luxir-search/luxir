@@ -117,7 +117,29 @@ private:
     }
   }
 
+  // add docs and ordinals from the provided DocsEnum (for string column, record ord in docToOrd for each doc, to be written later)
+  void addDocsOrds(TextWriter& textWriter, DocsEnum& docsEnum, int32_t base, std::vector<int32_t>& docToOrd, int32_t ord) {
+    for(;;) {
+      int32_t docid = docsEnum.nextDoc();
+      if (docid == INT_MAX) break;
+      int32_t newDocid = base + docid;
+      docToOrd[newDocid] = ord;
+      textWriter.startDoc(newDocid);
+      docsEnum.startPositions();
+      int32_t lastPos = -1;
+      for(;;) {
+        auto pos = docsEnum.nextPosition();
+        if (pos == INT_MAX) break;
+        textWriter.addPositionDelta(pos - lastPos);
+        lastPos = pos;
+      }
+      textWriter.endDoc(newDocid);
+    }
+  }
+
   void mergeField(std::vector<MergeFieldInfo>& mergeFieldInfos) {
+    int32_t nDocs = postingsWriter.getMaxDoc();
+
     MemPool& writerPool = origPool;  // needs to be different when we move to multi-threaded
     MemPool::ScopeGuard guard(writerPool);
 
@@ -151,6 +173,12 @@ private:
     outputFieldInfo.fieldname = sortedFields[0]->segFieldInfo.fieldname;  // we should ensure out postingsWriter outlives the lifetime of the postings readers!
     outputFieldInfo.flags = 0;
 
+    // if this is a string column, we need to collect the ordinals for each doc
+    bool isOrdCol = (allFlags & 0x04) != 0;
+    std::vector<int32_t> docToOrd;
+    if (isOrdCol) {
+      docToOrd.resize(nDocs);
+    }
 
     MemPool readerPool; // TODO: can this be the same as writerPool?
 
@@ -192,12 +220,21 @@ private:
         // is called.  It needs to exist until the end of textWriter (currently).  See comments on startTerm()
         // for ideas.
         PackedTerm term(readerPool, std::string_view(first.tenum.term()));
-        textWriter.startTerm(term);
+        auto termOrd = textWriter.startTerm(term);
 
         do {
           TermsEnumIdx& entry = termPQ.top();
           // need to create the docsEnum while the termsEnum is still positioned on the term.
           DocsEnum docsEnum(readerPool, *sortedFields[entry.idx]->seg->postingsReader, entry.tenum);
+
+          if (isOrdCol) {
+            // this is a string column, so keep track of the ordinals for each doc
+            addDocsOrds(textWriter, docsEnum, sortedFields[entry.idx]->seg->base, docToOrd, termOrd);
+          } else {
+            // text field, so add docs with positions to the textWriter
+            addDocsPos(textWriter, docsEnum, sortedFields[entry.idx]->seg->base);
+          }
+
           addDocsPos(textWriter, docsEnum, sortedFields[entry.idx]->seg->base);
 
           // advance that entry to the next term, removing from pq if exhausted.
@@ -216,7 +253,47 @@ private:
     }
 
 
-    if (allFlags & 0x02) { // int column
+    if (isOrdCol) {
+      outputFieldInfo.flags |= 0x04;
+
+      // Write the ordinals to the postings file.
+      // This is pretty much repeated code from Inverter::StringIndexHandler
+      int32_t missingCount = 0;
+
+      {
+        auto guard = writerPool.rewindScopeGuard();
+        IntColWriter ordCol(writerPool, postingsWriter, outputFieldInfo);
+        ordCol.startField();
+        for (int docid = 0; docid < docToOrd.size(); docid++) {
+          int32_t ord = docToOrd[docid];
+          if (ord != 0) {
+            ordCol.addInt64(ord);
+          } else {
+            missingCount++;
+          }
+        }
+        ordCol.finish();
+      }
+
+      bool full = missingCount == 0 && docToOrd.size() == nDocs;
+
+      {
+        auto guard = writerPool.rewindScopeGuard();
+        DocsWithValWriter docsWriter(writerPool, postingsWriter, outputFieldInfo);
+        if (!full) {
+          for (int docid = 0; docid < docToOrd.size(); docid++) {
+            int32_t ord = docToOrd[docid];
+            if (ord != 0) {
+              docsWriter.startDoc(docid);
+            }
+          }
+          docsWriter.finish();
+        } else {
+          docsWriter.finishDense(nDocs);
+        }
+      }
+
+    } else if (allFlags & 0x02) { // int column (ordCol will currently have this flag set too, hense the else-if)
       outputFieldInfo.flags |= 0x02;
       IntColWriter intColWriter(writerPool, postingsWriter, outputFieldInfo);
       intColWriter.startField();
