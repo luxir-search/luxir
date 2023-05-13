@@ -3,6 +3,7 @@
 #include <assert.h>
 #include <span>
 #include <numeric>
+#include <algorithm>
 
 namespace solux {
 

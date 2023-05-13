@@ -4,6 +4,7 @@
 #include "solux/util/MemPool.h"
 #include "solux/search/IndexReader.h"
 #include "solux/search/Similarity.h"
+#include "gtl/phmap.hpp"
 
 namespace solux {
 
