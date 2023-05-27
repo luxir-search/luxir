@@ -102,12 +102,11 @@ message Query {
     BooleanQuery boolean = 2;
     bool all = 3;                   // selects all documents
     string field = 4;               // selects all documents with the given field name.  // TODO: what about field regex?
-
+    PhraseQuery phrase = 5;         // selects all documents with a phrase
 
     // TODO: a looser string match that will auto-convert to correct type
     // TODO: a text query type (parsed by QueryParser)
     // TODO: wildcard query
-    // TODO: phrase query
     // TODO: function?
 
 

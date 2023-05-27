@@ -4,7 +4,7 @@
 #include <boost/sort/spreadsort/string_sort.hpp>
 #include "gtl/phmap.hpp"
 #include "solux/util/MemPool.h"
-#include "solux/FieldType.h"
+#include "solux/schema/Schema.h"
 #include "solux/util/TermValHash.h"
 #include "DocStream.h"
 #include "PostingsWriter.h"
@@ -26,20 +26,24 @@ private:
   int currDoc = -1;  // the current document being indexed
   std::vector<int> deleted; // use a docstream for this?
 
-  // TODO: this is temporary... we should get FieldTypes and TokenChains from the schema somehow
-  // and TokenChains should not be shared across different threads.
-  gtl::flat_hash_map<std::string, std::pair<std::unique_ptr<FieldType>, std::unique_ptr<TokenChain>>> typeInfo;
-
+  std::function<std::shared_ptr<Schema>()> schemaProvider;
 public:
   MemPool pool;
 
   // Having a handle to the postings writer means that we can start flushing whenever we want or
-  // even directly write certain dense columns without uninverting first.  It could be directly contained, or
-  // we could have a reference to it.
+  // even directly write certain dense columns without uninverting first.
+  // For now, we'll directly contain it, but in the future we may want to pass it in.
   PostingsWriter postingsWriter;
 
-  // TODO: create a class for indexing parameters / config?
-  Inverter(solux::Directory& dir, std::string_view segid) : postingsWriter(dir, segid) {
+  std::shared_ptr<Schema> schema;
+
+  Inverter(solux::Directory& dir, std::string_view segid, const std::function<std::shared_ptr<Schema>()>& schemaProvider = {}) : postingsWriter(dir, segid) {
+    // this is a test schemaProvider for convenience
+    if (!schemaProvider) {
+      this->schemaProvider = [&]() {
+        return Schema::createSchema();
+      };
+    }
   }
 
   PostingsWriter& getPostingsWriter() { return postingsWriter; }
@@ -49,11 +53,11 @@ public:
     friend Inverter;
 
     PackedTerm fieldName;
-    FieldType& fieldType;
+    std::shared_ptr<FieldType> fieldType;
 
     IndexHandler(IndexHandler& other) = delete; // let's not move any of these
   public:
-    IndexHandler(PackedTerm fieldName, FieldType &fieldType)
+    IndexHandler(PackedTerm fieldName, const std::shared_ptr<FieldType>& fieldType)
     : fieldName(fieldName), fieldType(fieldType) {
     }
     virtual ~IndexHandler() = default;
@@ -109,11 +113,11 @@ public:
     DocStream docsWithVal;
     int32_t numVals = 0;
   public:
-    IntColHandler(Inverter &inverter, const std::string_view &fieldName, FieldType& fieldType)
+    IntColHandler(Inverter &inverter, const std::string_view &fieldName, const std::shared_ptr<FieldType>& fieldType)
             : IndexHandler(PackedTerm(inverter.pool,fieldName), fieldType), longStream(inverter.pool), docsWithVal(inverter.pool) {
     }
 
-    IntColHandler(Inverter &inverter, PackedTerm fieldName, FieldType& fieldType, IndexHandler& parent)
+    IntColHandler(Inverter &inverter, PackedTerm fieldName, const std::shared_ptr<FieldType>& fieldType, IndexHandler& parent)
             : IndexHandler(fieldName, fieldType), longStream(inverter.pool), docsWithVal(inverter.pool) {
       unused(parent);
     }
@@ -197,18 +201,24 @@ public:
     friend Inverter;
 
     TermValHash<DocFreqPosStream> termsHash;  // the set of terms contained in this field
-    TokenChain *tokenChain;  // TODO: change to ref?  is this nullable?
+    std::unique_ptr<TokenChain> tokenChain;
 
     IntColHandler fieldLengthCol;  // to store the field length needed for scoring among other things.
   public:
 
-    PosIndexHandler(Inverter &inverter, const std::string_view &fieldName, FieldType& fieldType, TokenChain *tokenChain)
+    PosIndexHandler(Inverter &inverter, const std::string_view &fieldName, const std::shared_ptr<FieldType>& fieldType)
             : IndexHandler(PackedTerm(inverter.pool,fieldName), fieldType),
             termsHash(inverter.pool, 4),
-            tokenChain(tokenChain),
             fieldLengthCol(inverter, this->fieldName, this->fieldType, *this)
-            {
+    {
+
+      // Future optimization: cache the analyzer for the type if it isn't field-specific
+      // This can help with memory consumption when the same analyzer can be used for many fields.
+
+      // downcast to TextFieldType to get the analyzer
+      tokenChain = ((TextFieldType&)*fieldType).createAnalyzer(fieldName);
     }
+
     ~PosIndexHandler() override = default;
 
     void index(Inverter& inverter, const proto::Val& val) override {
@@ -318,7 +328,7 @@ public:
     TermValHash<DocStream> termsHash;  // the set of terms contained in this field
 
   public:
-    StringIndexHandler(Inverter &inverter, const std::string_view &fieldName, FieldType& fieldType)
+    StringIndexHandler(Inverter &inverter, const std::string_view &fieldName, const std::shared_ptr<FieldType>& fieldType)
             : IndexHandler(PackedTerm(inverter.pool,fieldName), fieldType),
               termsHash(inverter.pool, 4) {
     }
@@ -434,63 +444,9 @@ public:
       return *iter->second;
     }
 
-    // How do we incorporate schema changes? Or do we?
-    // If we get a whole new schema, we would still need to hold onto all old ones if anything points back to them
-    // without a shared pointer?
-    // What if we turned FieldType into a value type
-    // and used std::variant / std::visit?
-    // Perhaps used named analysis chains... this would also facilitate specifying different ones at query time
-
-    // TODO: Need to look up the correct field type in schema.  For now just inline it.
-
-    std::string_view suffix = name.substr(name.find_last_of('_'));
-    if (suffix.empty() && name == "id") {
-      suffix = "_s";
-    }
-
-    // TEMPORARY: based on the suffix, try to find both the cached FieldType and associated TokenChain
-    auto typeIter = typeInfo.find(suffix);
-
-    if (typeIter == typeInfo.end()) {
-      auto ft = std::make_unique<FieldType>();
-      ft->name_ = suffix;
-      std::unique_ptr<TokenChain> tc;
-
-      if (suffix == "_i") {
-        ft->flags_ = 0;
-      } else if (suffix == "_s") {
-        ft->flags_ = FieldType::INDEX_DOCS;
-      } else {
-        ft->flags_ = FieldType::INDEX_DOCS_AND_FREQS_AND_POSITIONS | FieldType::NUM_TOKENS_APPROX;
-        auto wsTok = std::make_unique<WhitespaceTokenizer>();
-        auto &headRef = *wsTok;
-        if (suffix == "_w") {
-          tc = make_unique<TokenChain>(headRef, std::move(wsTok));  // ws only
-        } else if (suffix == "_wl") {
-          auto lowerFilt = std::make_unique<LowercaseFilter>(std::move(wsTok));
-          tc = make_unique<TokenChain>(headRef, std::move(lowerFilt));
-        }
-      }
-      auto [it2, inserted] = typeInfo.try_emplace(suffix, std::move(ft), std::move(tc));
-      typeIter = it2;
-    }
-
-    FieldType& fieldType = *typeIter->second.first;
-    TokenChain* tokenChain = typeIter->second.second.get();
-
-    // Create the correct IndexHandler based on the suffix.  This should probably be moved to FieldType::createIndexHandler()?
-    std::unique_ptr<IndexHandler> fieldHandler;
-    if (suffix == "_i") {
-      fieldHandler = std::make_unique<IntColHandler>(*this, name, fieldType);
-    } else if (suffix == "_s") {
-      fieldHandler = std::make_unique<StringIndexHandler>(*this, name, fieldType);
-    } else {
-      fieldHandler = std::make_unique<PosIndexHandler>(*this, name, fieldType, tokenChain);
-    }
-
-    auto [newIter, inserted] = indexHandlers.try_emplace(name, std::move(fieldHandler));
-    return *(newIter->second);
+    return createIndexHandler(name);
   }
+
 
   void setDoc(int32_t docid) {
     assert (docid >= currDoc);
@@ -512,8 +468,6 @@ public:
   void deleteDoc(int docid) {
     deleted.push_back(docid);
   }
-
-  void index(Document &doc);
 
   size_t memSize() {
     // TODO: take into account more than just the pool
@@ -546,6 +500,9 @@ public:
 
     getPostingsWriter().finish();
   }
+
+private:
+  IndexHandler& createIndexHandler(const std::string_view name);
 
 
 };

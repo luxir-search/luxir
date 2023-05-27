@@ -7,7 +7,7 @@ namespace solux {
 
 /// There should normally be a single SoluxNode instance per process.
 /// A single SoluxNode can host many indexes.
-/// There still *may* be multiple SoluxNodes instances per process, but it's currently more for testing.
+/// There still *may* be multiple SoluxNode instances per process, but it's currently more for testing.
 
 
 class Library;
@@ -15,9 +15,15 @@ class Collection;
 class SoluxNode;
 
 class Shard {
+  Collection& collection; // hard reference to the collection that owns this shard
   std::shared_ptr<Directory> dir;  // does this need to be shared_ptr?  Perhaps not if we have a shared ptr to a parent object (Shard or Collection?)
   std::shared_ptr<IndexWriter> iw;
+
 public:
+  explicit Shard(Collection& collection) : collection(collection) {
+    // dir = std::make_shared<RAMDir>();
+    // iw = std::make_shared<IndexWriter>(*dir);
+  }
   // TODO: we don't want to be in the position of having more than ine IW pointing at the index/dir... this suggests that instead of
   // having the ability for it to come and go, it should be a singleton (which could still be created on demand) that
   // can dump most of it's state for low memory usage?  Then this method would not return a shared_ptr, but a simple reference.
@@ -32,18 +38,23 @@ public:
   friend class SoluxNode;
 };
 
-
+class Schema;
 
 // A single logical collection of docs which may
 // consist of multiple shards.
 class Collection {
   std::string name;
+  std::shared_ptr<Schema> schema;
   std::shared_ptr<Shard> shard;
   std::vector<std::shared_ptr<Shard>> shards;
 public:
 
   std::shared_ptr<Shard> getShard() {
     return shard;
+  }
+
+  std::shared_ptr<Schema> getSchema() {
+    return schema;
   }
 
   friend class Library;
@@ -118,12 +129,7 @@ public:
 
 private:
 
-  void createSingletons() {
-    collection = std::make_shared<Collection>();
-    collection->shard = std::make_shared<Shard>();
-    collection->shard->dir = std::make_shared<RAMDir>();
-    collection->shard->iw = std::make_shared<IndexWriter>(*collection->shard->dir);
-  }
+  void createSingletons();
 
   std::shared_ptr<Library> root;
   // temporary singletons
