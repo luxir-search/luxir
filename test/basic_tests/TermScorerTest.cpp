@@ -1,3 +1,4 @@
+#include <solux/query/AllQuery.h>
 #include "gtest/gtest.h"
 #include "test/SoluxTest.h"
 #include "test/TestIndex.h"
@@ -196,6 +197,29 @@ TEST_F(TermScorerTest, multiSeg) {
         TermQuery::Scorer* scorer = dynamic_cast<TermQuery::Scorer*>( weight->createScorer(
                 testIndex.pool, qContext.topReader.segments()[1]));
         testScores(scorer, {4}, {0.37098017f});
+      }
+    }
+
+
+    // try an all-scorer
+    {
+      auto poolFree = testIndex.pool.rewindScopeGuard();
+      float score = 0.0f; // current expected score for an all-scorer is 0.0f
+      AllQuery allQuery;
+      Query::Context qContext(testIndex.pool, *testIndex.reader);
+      auto* weight = allQuery.createWeight(qContext);
+      // put the scorer creation in a separate scope to test that it's OK to rewind the pool after we are done with a single scorer.
+      {
+        auto g1 = testIndex.pool.rewindScopeGuard();
+        AllQuery::Scorer* scorer = dynamic_cast<AllQuery::Scorer*>( weight->createScorer(
+                testIndex.pool, qContext.topReader.segments()[0]));
+        testScores(scorer, {0,1,2,3}, {score, score, score, score});
+      }
+      {
+        auto g2 = testIndex.pool.rewindScopeGuard();
+        AllQuery::Scorer* scorer = dynamic_cast<AllQuery::Scorer*>( weight->createScorer(
+                testIndex.pool, qContext.topReader.segments()[1]));
+        testScores(scorer, {0,1,2,3,4}, {score, score, score, score, score});
       }
     }
   }
