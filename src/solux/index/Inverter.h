@@ -215,8 +215,9 @@ public:
       // Future optimization: cache the analyzer for the type if it isn't field-specific
       // This can help with memory consumption when the same analyzer can be used for many fields.
 
-      // downcast to TextFieldType to get the analyzer
-      tokenChain = ((TextFieldType&)*fieldType).createAnalyzer(fieldName);
+      // downcast to TextFieldType to get the analyzer. Use of dynamic_cast is OK this is only done once per field.
+      auto textFieldType = dynamic_cast<TextFieldType*>(fieldType.get());
+      tokenChain = textFieldType-> createAnalyzer(fieldName);
     }
 
     ~PosIndexHandler() override = default;

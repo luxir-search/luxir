@@ -5,13 +5,17 @@
 #include <google/protobuf/text_format.h>
 #include <grpcpp/health_check_service_interface.h>
 #include <grpcpp/ext/proto_server_reflection_plugin.h>
-#include <solux/util/random.h>
+#include <oneapi/tbb/task_group.h>
+
 #include "GRPCServer.h"
 #include "SoluxNode.h"
+#include "solux/util/random.h"
 #include "solux/index/IndexWriter.h"
 #include "solux/util/solux_util.h"
 #include "solux/util/TaggedPtr.h"
-#include <oneapi/tbb/task_group.h>
+#include "solux/query/ProtobufQueryParser.h"
+#include "solux/search/Collector.h"
+
 
 
 using namespace solux;
@@ -682,17 +686,69 @@ public:
       }
     }
 
+    MemPool responsePool; // this pool will be used for storing the parsed query and the search results
+    auto schema = collection->getSchema();
+    auto shard = collection->getShard();
+    auto iw = shard->getIndexWriter();
+    std::shared_ptr<IndexReader> reader = iw->getIndexReader();
+    response.set_request_id(request.request_id());
+
     for (auto& [opKey, searchOp] : request.ops()) {
       switch (searchOp.kind_case()) {
         case solux::proto::SearchOp::kTopDocs:
         {
-          auto shard = collection->getShard();
-          auto iw = shard->getIndexWriter();
-          std::shared_ptr<IndexReader> reader = iw->getIndexReader();
-          response.set_request_id(request.request_id());
-          solux::proto::SearchResult& srsp = (*response.mutable_ops())[opKey];
-          solux::proto::DocList& docList = *srsp.mutable_docs();
-          docList.set_matches(reader->numDocs());
+          auto& topDocsReq = searchOp.top_docs();
+          /*
+          message TopDocs {
+                  Query query = 1;
+                  int64 offset = 2;
+                  optional sint64 limit = 3;
+                  bool get_number = 4;          // return the number of matching documents
+                  bool get_scores = 5;          // return the relevancy score for each document returned
+                  repeated string fields = 6;   // fields to return for each document
+                  repeated SortSpec sorts = 7;
+          }
+          */
+
+          ProtobufQueryParser parser(responsePool, *schema);
+          Query* query = parser.parse(topDocsReq.query());
+          int64_t offset = topDocsReq.offset();
+          unused(offset); // TODO
+          int64_t specifiedLimit = topDocsReq.has_limit() ? topDocsReq.limit() : 10;
+          // limit to actual number of docs in the index (or all if limit == -1)
+          int64_t limit = specifiedLimit<0 ? reader->numDocs() : std::min(specifiedLimit, reader->numDocs());
+
+          // TODO: Maybe use a per-thread stack-pool for stuff that is fine to rewind and the requestPool for stuff that needs to be kept around for the duration of the request?
+          // But if we go increasingly multi-threaded, stuff we want to keep around should perhaps just use the request/response protobuf arena.
+          MemPool& searchPool = responsePool;
+          {
+            auto poolFree = searchPool.rewindScopeGuard();
+            Query::Context qContext(searchPool, *reader);
+            auto* weight = query->createWeight(qContext);
+
+            TopDocsCollector collector(limit);
+
+            // loop through each segment, creating a scorer from the weight and collecting all the matches
+            for (auto& segment : qContext.topReader.segments()) {
+              auto segmentFree = searchPool.rewindScopeGuard();
+              Query::Scorer* scorer = weight->createScorer(searchPool, segment);
+              for(;;) {
+                auto doc = scorer->next();
+                if (doc == PostingsReader::END) {
+                  break;
+                }
+                auto score = scorer->score();
+                collector.collect(segment.ord, doc, score);
+              }
+            }
+
+            collector.sort();
+            // fill in the response object from the topdocs collector
+            solux::proto::SearchResult& srsp = (*response.mutable_ops())[opKey];
+            solux::proto::DocList& docList = *srsp.mutable_docs();
+            docList.set_matches(collector.totalHits());
+          }
+
           break;
         }
         case solux::proto::SearchOp::kFieldFacet:

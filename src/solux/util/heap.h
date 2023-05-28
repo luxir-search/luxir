@@ -293,15 +293,15 @@ public:
   }
 
   // Reference to the top element.
-  T& top() {
+  T& top() const {
     return heap.front();
   }
 
-  size_t size() {
+  size_t size() const {
     return heapSize;
   }
 
-  size_t capacity() {
+  size_t capacity() const {
     return heap.size();
   }
 

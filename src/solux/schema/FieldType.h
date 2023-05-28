@@ -15,8 +15,8 @@ namespace solux {
 class FieldType {
 public:
   enum Type {
+    STRING,   // unanalyzed string field
     TEXT,     // analyzed text field (if indexed)
-    STRING,   // unanalyzed text field (if indexed)
     BIN,      // binary field
     INT,
     FLOAT
