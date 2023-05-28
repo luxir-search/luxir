@@ -717,6 +717,8 @@ public:
           int64_t specifiedLimit = topDocsReq.has_limit() ? topDocsReq.limit() : 10;
           // limit to actual number of docs in the index (or all if limit == -1)
           int64_t limit = specifiedLimit<0 ? reader->numDocs() : std::min(specifiedLimit, reader->numDocs());
+          int64_t totalHits = 0;
+
 
           // TODO: Maybe use a per-thread stack-pool for stuff that is fine to rewind and the requestPool for stuff that needs to be kept around for the duration of the request?
           // But if we go increasingly multi-threaded, stuff we want to keep around should perhaps just use the request/response protobuf arena.
@@ -726,7 +728,7 @@ public:
             Query::Context qContext(searchPool, *reader);
             auto* weight = query->createWeight(qContext);
 
-            TopDocsCollector collector(limit);
+            TopDocsCollector collector(limit != 0 ? limit : 1);
 
             // loop through each segment, creating a scorer from the weight and collecting all the matches
             for (auto& segment : qContext.topReader.segments()) {
@@ -737,16 +739,23 @@ public:
                 if (doc == PostingsReader::END) {
                   break;
                 }
-                auto score = scorer->score();
-                collector.collect(segment.ord, doc, score);
+                totalHits++;
+                if (limit > 0) {
+                  auto score = scorer->score();
+                  collector.collect(segment.ord, doc, score);
+                }
               }
             }
 
-            collector.sort();
+            if (limit > 0) {
+              collector.sort();
+              // totalHits = collector.totalHits();
+            }
+
             // fill in the response object from the topdocs collector
             solux::proto::SearchResult& srsp = (*response.mutable_ops())[opKey];
             solux::proto::DocList& docList = *srsp.mutable_docs();
-            docList.set_matches(collector.totalHits());
+            docList.set_matches(totalHits);
           }
 
           break;
