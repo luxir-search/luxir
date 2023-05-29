@@ -277,6 +277,7 @@ TEST_F(GrpcIndexTest, threadsafe) {
                 } else {
                   status = greeterStub->SayHello2(&context, req, &result);
                 }
+                assert(status.ok());
 
                 // std::cout << "Got response " << result.message() <<  std::endl;
 
@@ -354,7 +355,7 @@ TEST_F(GrpcIndexTest, addDocs) {
   grpc::Status status = indexerStub->Update(&context, ureq , &response);
 
   if (!status.ok()) {
-    LOG_ERROR("grpc call failed!: code={} msg={}", status.error_code(), status.error_message());
+    LOG_ERROR("grpc call failed!: code={} msg={}", (int)status.error_code(), status.error_message());
   } else {
     GRPC_DEBUG("I got id:{}", response.responses(0).request_id());
   }

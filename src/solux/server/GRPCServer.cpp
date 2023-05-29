@@ -10,7 +10,6 @@
 #include "GRPCServer.h"
 #include "SoluxNode.h"
 #include "solux/util/random.h"
-#include "solux/index/IndexWriter.h"
 #include "solux/util/solux_util.h"
 #include "solux/util/TaggedPtr.h"
 #include "solux/query/ProtobufQueryParser.h"
@@ -198,7 +197,12 @@ public:
 
     // see https://stackoverflow.com/questions/60856240/grpc-c-async-server-how-differentiate-between-writesdone-and-broken-connection
     // TODO: not sure the right way to use this event yet.
-    ctx.AsyncNotifyWhenDone(make_tag(CallTags::ASYNC_NOTIFY_WHEN_DONE));
+
+    // NOTE: ASYNC_NOTIFY_WHEN_DONE can come in *after* the FINISH event (i.e. AFTER this object has been deleted!)
+    // Hence we must not use it like this.
+    // If we ever need to check for cancellation, then we will need ASYNC_NOTIFY_WHEN_DONE.  Perhaps delete only
+    // after both Finish and ASYNC_NOTIFY_WHEN_DONE have been received?
+    // ctx.AsyncNotifyWhenDone(make_tag(CallTags::ASYNC_NOTIFY_WHEN_DONE));
   }
 
   virtual ~BiStreamingRequest() {
@@ -309,6 +313,7 @@ public:
     // Ending the stream: currently outstanding requests will always cause a Write request to be done, hence we can just
     // check in writeFinished() if we are done and call Finish() if so.
 
+    // NOTE: isCancelled can only be safely called after ASYNC_NOTIFY_WHEN_DONE has been returned.
     GRPC_DEBUG("PROCEED this={} ok={} numCalls={} tag={} cancelled={} responsesExpected={} readsDone={} writeOutstanding={} pwrites={}",
                (void*)this, ok, ++numCalls, tag, ctx.IsCancelled(), responsesExpected, readsDone, writeOutstanding, pending.size());
 
@@ -372,6 +377,7 @@ public:
         // In a simple test where the client sends two requests, calls finish, then reads the responses,
         // the last 3 events in the queue are Read(ok=false), ASYNC_NOTIFY_WHEN_DONE(ok=true), and FINISH(ok=true).
         // It doesn't seem like we currently need this event.
+        // NOTE: this event has been removed (see comments in the constructor)
         break;
       default:
         // we tag everything going into the queue, so this shouldn't happen.
@@ -591,8 +597,14 @@ public:
     GRPC_DEBUG("\tindexer got docs, num={}", request.docs_size());
     auto shard = collection->getShard();
     auto iw = shard->getIndexWriter();
-    iw->update(request);
-    iw->flush();
+
+    if (request.docs_size() != 0) {
+      iw->update(request);
+      iw->flush(); // TODO: remove this at some point...
+    } else {
+      // thread safety testing... only happened when we had actual docs.  try to simulate with a sleep.
+      std::this_thread::sleep_for(std::chrono::microseconds (100));
+    }
 
     auto& singleResponse = *response.add_responses();
     singleResponse.set_request_id(request.request_id());
@@ -632,12 +644,12 @@ public:
   }
 
   bool handleRequest(proto::UpdateRequest* request) override {
-    auto arena = request->GetArena();
-    auto response = arena->CreateMessage<proto::UpdateResponse>(arena);
+    auto* arena = request->GetArena();
+    auto* response = arena->CreateMessage<proto::UpdateResponse>(arena);
     auto ok = IndexerUpdateCall::handleUpdate(server, *request, *response);
     unused(ok);
     respond(response, [this](auto* response) { this->releaseArena(response->GetArena()); });
-    return true;
+    return true; // take ownership of request object since we used its arena
   }
 };
 
@@ -806,6 +818,7 @@ void GRPCServer::runThread(ThreadInfo& threadInfo) {
 
     CallData::TaggedPtrType taggedPtr = CallData::TaggedPtrType::fromTaggedPtrBits(tag);
     CallData* callData = taggedPtr.ptr();
+    GRPC_DEBUG("PRECALL: this={} tag={} ok={}", (void*)callData, taggedPtr.tag(), ok);
     callData->proceed(ok, taggedPtr.tag());
   }
 
