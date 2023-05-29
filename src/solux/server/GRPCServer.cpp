@@ -852,7 +852,7 @@ bool GRPCServer::waitForStart() {
     Another grpc example (written by someone else) also showed a leak after upgrading.
  */
 void solux::GRPCServer::shutdown() {
-  LOG_INFO("Shutting down grpc server.");
+  LOG_INFO("Shutting down solux grpc server.");
 
   // server should be shut down before completion queues
   server->Shutdown();
