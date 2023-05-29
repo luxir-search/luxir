@@ -116,6 +116,7 @@ int main(int argc, char **argv) {
   solux::unit_tests = !std::any_of(myargv.begin(), myargv.end()-1,  [](char* s){return strcmp(s,"--bench")==0;} );
 
   // init gtest so things like --gtest_break_on_failure work in benchmarks.
+  myargc = myargv.size() - 1;  // minus-one because of the null terminator
   testing::InitGoogleTest(&myargc, &(myargv[0]));
   myargv.resize(myargc);  // InitGoogleTest removed params it handled
 
