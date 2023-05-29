@@ -66,7 +66,7 @@ public:
       return this->fieldName <=> other.fieldName;
     }
 
-    auto operator<=>(const std::string_view& sv) const {
+    auto operator<=>(std::string_view sv) const {
       return this->fieldName <=> sv;
     }
 
@@ -74,7 +74,7 @@ public:
       return this->fieldName <=> fname;
     }
 
-    auto operator==(const std::string_view& sv) const {
+    auto operator==(std::string_view sv) const {
       return this->fieldName == sv;
     }
 

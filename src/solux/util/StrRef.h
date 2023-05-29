@@ -337,7 +337,7 @@ struct PackedTermHash {
   size_t operator()(const std::string& str) const noexcept {
     return (*this)(str.data(), str.size());
   }
-  size_t operator()(const std::string_view& str) const noexcept {
+  size_t operator()(std::string_view str) const noexcept {
     return (*this)(str.data(), str.size());
   }
 };
@@ -353,10 +353,10 @@ struct PackedTermEqual {
   bool operator()(const LazyPackedTerm& lhs, const PackedTerm& rhs) const noexcept {
     return lhs == rhs;
   }
-  bool operator()(const PackedTerm& lhs, const std::string_view& rhs) const noexcept {
+  bool operator()(const PackedTerm& lhs, std::string_view rhs) const noexcept {
     return lhs == rhs;
   }
-  bool operator()(const std::string_view& lhs, const PackedTerm& rhs) const noexcept {
+  bool operator()(std::string_view lhs, const PackedTerm& rhs) const noexcept {
     return lhs == rhs;
   }
   bool operator()(const PackedTerm& lhs, const std::string& rhs) const noexcept {
@@ -365,7 +365,7 @@ struct PackedTermEqual {
   bool operator()(const std::string& lhs, const PackedTerm& rhs) const noexcept {
     return lhs == rhs;
   }
-  bool operator()(const std::string_view& lhs, const std::string_view& rhs) const noexcept {
+  bool operator()(std::string_view lhs, std::string_view rhs) const noexcept {
     return lhs == rhs;
   }
 };

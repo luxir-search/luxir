@@ -194,7 +194,7 @@ public:
     write((void *) data, len);
   }
 
-  void writeStr(const std::string_view& sv) {
+  void writeStr(std::string_view sv) {
     writeStr(sv.data(), sv.length());
   }
 
@@ -260,7 +260,7 @@ class RAMFile : public File {
 public:
   constexpr static uint32_t START_BUFFER_SIZE = 1024;  // size of first allocated buffer (subsequent buffers may be bigger)... mostly for testing.
 
-  RAMFile(const std::string_view& name) : File(name) {
+  RAMFile(std::string_view name) : File(name) {
   }
 
   ~RAMFile() override = default;

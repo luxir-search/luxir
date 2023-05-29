@@ -157,7 +157,7 @@ public:
   std::deque<IndexFieldInfo> fieldInfos;
 
 public:
-  PostingsWriter(Directory& dir, const std::string_view& segid, int32_t maxDoc=-1) : directory(dir), segid(segid), maxDoc(maxDoc)
+  PostingsWriter(Directory& dir, std::string_view segid, int32_t maxDoc=-1) : directory(dir), segid(segid), maxDoc(maxDoc)
   {
     // TODO: defer file creation until needed, *or* use a RAMDelegatingFile that does so.
     // that does so.

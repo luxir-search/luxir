@@ -45,7 +45,7 @@ public:
   V &val() const { return *valPtr(); }
 
   template<typename... Args>
-  void initTV(MemPool &pool, const std::string_view& str, Args &&... args) {
+  void initTV(MemPool &pool, std::string_view str, Args &&... args) {
     // pool.align(); // Cost=~4 bytes per unique term... doesn't seem to be worth it from benchmarks so far.
     auto target = pool.alloc(getExactSize(str.size()));
     new(target) V(std::forward<Args>(args)...);    // construct the value
@@ -60,7 +60,7 @@ public:
   }
 
   template<typename... Args>
-  TermValRef(MemPool &pool, const std::string_view& str, Args &&... args) {
+  TermValRef(MemPool &pool, std::string_view str, Args &&... args) {
     initTV(pool, str, std::forward<Args>(args)...);
   }
 
@@ -155,7 +155,7 @@ public:
   }
 
   template<typename... Args>
-  std::pair<iterator, bool> try_emplace(const std::string_view& str, Args &&... args) {
+  std::pair<iterator, bool> try_emplace(std::string_view str, Args &&... args) {
     if (elements_ >= capacity_) {
       rehash();
     }

@@ -534,7 +534,7 @@ public:
     // std::cout << "seek key=" << target << " numBlocks=" << fieldReader.numTermBlocks << std::endl;
 
     auto blockOffsetPtr = std::upper_bound(termBlockOffsets, termBlockEnd, target,
-                                 [&](const std::string_view& key, const int64_t& blockOffset) {
+                                 [&](std::string_view key, const int64_t& blockOffset) {
       auto termAtBlock = termsIS.readPackedTerm(fieldInfo.termsLoc.offset() + blockOffset);
       auto ret = key < termAtBlock;
       // std::cout << "index=" << (&blockOffset-fieldReader.termBlockOffsets) << " termAtBlock=" << termAtBlock << " ret=" << ret << std::endl;
