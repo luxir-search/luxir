@@ -5,6 +5,7 @@
 #include <iostream>
 #include <vector>
 #include <memory.h>
+#include <experimental/scope>
 #include "log.h"
 
 // NOTE: this is better than including xxhash.h since it enables inline. Inverter performance equal to
@@ -13,7 +14,11 @@
 #define XXH_PRIVATE_API
 #include <xxh3.h>
 
+
 namespace solux {
+
+template <class T>
+using scope_exit = std::experimental::scope_exit<T>;
 
 // gcc and msvc have different ways of specifying packing of structs :-(
 // use SOLUX_PACKED_START class X{} SOLUX_PACKED_END;

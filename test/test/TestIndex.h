@@ -156,13 +156,14 @@ namespace solux::test {
       if (iw.get() == nullptr) {
         iw = std::make_unique<IndexWriter>(dir);
       }
-      inverter = &iw->getInverter();
+      inverter = &iw->obtainInverter();
       gen = inverter->getPostingsWriter().getSegId();
     }
 
     void flush() {
       if (inverter == nullptr) return;
-      iw->flush();
+      iw->releaseInverter(*inverter);
+      iw->commit();
       inverter = nullptr;
     }
 

@@ -600,7 +600,7 @@ public:
 
     if (request.docs_size() != 0) {
       iw->update(request);
-      iw->flush(); // TODO: remove this at some point...
+      iw->commit(); // TODO: remove this at some point...
     } else {
       // thread safety testing... only happened when we had actual docs.  try to simulate with a sleep.
       std::this_thread::sleep_for(std::chrono::microseconds (100));

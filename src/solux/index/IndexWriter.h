@@ -5,6 +5,7 @@
 #include <thread>
 #include <mutex>
 #include <span>
+#include "boost/unordered/unordered_flat_map.hpp"
 #include "solux/store/Directory.h"
 #include "solux/store/OutputStream.h"
 #include "solux/store/InputStream.h"
@@ -49,10 +50,14 @@ public:
 
   Directory &dir;
   uint64_t gen;
-  std::unique_ptr<Inverter> inverter;
   std::vector<std::string> segs;  // all of the referenced segments (TODO: replace with something containing more info when needed)
 
   std::shared_ptr<IndexReader> indexReader;
+
+  // TODO: change mutex used to protect the inverter lists.
+  boost::unordered_flat_map<Inverter*, std::unique_ptr<Inverter>> idleInverters;
+  boost::unordered_flat_map<Inverter*, std::unique_ptr<Inverter>> busyInverters;
+
 
   explicit IndexWriter(Directory &dir) : dir(dir) {
     std::shared_ptr<InputFile> segFile = dir.openFile(Postings::INDEX_INFO_FILE);
@@ -83,42 +88,54 @@ public:
     return indexReader;
   }
 
-
-
-  // What about multiple inverters on the same thread (because of sharding)?  Another alternative (if micro-sharding will be common)
-  // is to enable it from a single Inverter (i.e. inverter can split and write to multiple postings writers)
-  // TODO: should we be able to provide an inverter instead of get?
-  // TODO: currently not thread safe
-  // Only valid until a flush!
-  // Make this a thread-local?
-  Inverter &getInverter() {
-    if (inverter == nullptr) {
-      gen++;
-      inverter = std::make_unique<Inverter>(dir, Postings::getSortableString(gen));
+  void releaseInverter(Inverter& inverter) {
+    const std::lock_guard<std::mutex> lock(indexMutex);
+    auto it = busyInverters.find(&inverter);
+    if (it == busyInverters.end()) {
+      throw std::runtime_error("Inverter not found in busyInverters");
     }
-    return *inverter;
+
+    // TODO: update and check global statistics
+    // TODO: if the inverter is over a certain size, flush it
+    // TODO: if inverter is one we were waiting for before a commit, update that info (on a commit request, take a snapshot of the busy inverters?)
+
+    idleInverters.emplace(&inverter, std::move(it->second));
+    busyInverters.erase(it);
   }
 
-  // Use proto3 for segments file?  Easier back compat / modification?
-
-  // TODO: currently not thread safe
-  // just pass in Inverter here?
-  void flush() {
+  Inverter& obtainInverter() {
     const std::lock_guard<std::mutex> lock(indexMutex);
+    if (idleInverters.empty()) {
+      gen++;
+      std::string genStr = Postings::getSortableString(gen);
+      auto newInverter = std::make_unique<Inverter>(dir, genStr);
+      Inverter* newInverterPtr = newInverter.get();
+      busyInverters.emplace(newInverterPtr, std::move(newInverter));
+      return *newInverterPtr;
+    } else {
+      auto it = idleInverters.begin();
+      Inverter& inverter = *it->second;
+      busyInverters.emplace(&inverter, std::move(it->second));
+      idleInverters.erase(it);
+      return inverter;
+    }
+  }
 
-    if (inverter == nullptr) return;
-    // TODO: check if inverter actually inverted any docs?
-
-    gen++;
-    std::string genStr = Postings::getSortableString(gen);
-    inverter->flush();
-    std::string segid = inverter->getPostingsWriter().getSegId();
-    inverter.reset();
-
-    segs.emplace_back(segid);
-
+  // Currently only commits idle inverters!
+  void commit() {
+    const std::lock_guard<std::mutex> lock(indexMutex);
+    // TODO: can copy the map and then iterate over the copy to avoid holding the lock for too long
+    while (!idleInverters.empty()) {
+      auto it = idleInverters.begin();
+      auto& inverter = *it->second;
+      inverter.flush();
+      std::string segid = inverter.getPostingsWriter().getSegId();
+      segs.emplace_back(segid);
+      idleInverters.erase(it);
+    }
     writeIndexInfoFile();
   }
+
 
   void writeIndexInfoFile() {
     // write new segments file
@@ -139,16 +156,15 @@ public:
 
   // TODO: Currently single threaded and protected by the IndexWriter mutex... we need something different
   // in the future that can utilize multi-threading.
+  // TODO: this should perhaps be moved to the grpc specific code.
   void update(solux::proto::UpdateRequest& request) {
-    const std::lock_guard<std::mutex> lock(indexMutex);
-
-    Inverter& inverter = getInverter();
+    Inverter& inverter = obtainInverter();  // TODO: make sure to release it on exceptions (use a unique_ptr with a custom deleter?)
 
     std::vector<Inverter::IndexHandler*> handlers;
     // int ndocs = request->docs_size();
 
     if (request.docs_size() > 0) {
-      for (auto &doc : request.docs()) {
+      for (const auto &doc : request.docs()) {
         size_t nFields = doc.fields_size();
         if (handlers.size() < nFields) {
           handlers.resize(nFields);
@@ -159,7 +175,7 @@ public:
         // TODO: wrap in try/catch here?
 
         int idx = 0;
-        for (auto&[fname, fval] : doc.fields()) {
+        for (const auto&[fname, fval] : doc.fields()) {
           auto handler = handlers[idx];
           if (handler == nullptr || *handler != fname) {
             handlers[idx] = handler = &inverter.getIndexHandler(fname);
@@ -176,6 +192,7 @@ public:
       std::cout << "\tindexer got columns: " << request.columns().columns_size() << std::endl;
     }
 
+    releaseInverter(inverter);
   }
 
   /// mostly for testing merge code currently... there is no concurrency control, etc.
