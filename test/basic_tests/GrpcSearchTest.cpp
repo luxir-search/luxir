@@ -32,7 +32,11 @@ TEST_F(GrpcSearchTest, basic) {
 
   req.mutable_collection()->add_name("main");
   auto& ops = *req.mutable_ops();
-  ops["q"].mutable_top_docs()->mutable_query()->set_all(true);
+  // invalid utf8 looks to be validated by both libprotobuf on both serialization and deserialization! Is there a way to stop this?
+  // It actually still works and passes the test, but it generates ERROR output to stderr.
+  // std::string key = "q\xc3\x01";
+  std::string key = "q";
+  ops[key].mutable_top_docs()->mutable_query()->set_all(true);
 
   std::string reqStr;
   google::protobuf::TextFormat::PrintToString(req, &reqStr);
@@ -48,6 +52,7 @@ TEST_F(GrpcSearchTest, basic) {
     std::string resStr;
     google::protobuf::TextFormat::PrintToString(response, &resStr);
     GRPC_DEBUG("CLIENT RESULT:( {} )", resStr);
+    auto& rsp = response.ops().at(key);  // make sure the key was unadulterated
   }
 
   grpc::Status status = stream->Finish();
