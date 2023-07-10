@@ -1,4 +1,5 @@
 #include <gtest/gtest.h>
+#include <stdatomic.h>
 
 #include "solux/store/Directory.h"
 #include "oneapi/tbb/task_group.h"
@@ -15,11 +16,14 @@ protected:
   class UpdateMessage {
   public:
     int64_t commitNum = 0;
+    std::atomic_int leftToFlush = 0; // number of segments left to flush
   };
 
 
   class IW {
   public:
+    oneapi::tbb::task_arena taskArena;
+
     // for testing only, not necessary for strategy
     int expectedCommitNum = 0;
     int totalCommits = 0;
@@ -29,8 +33,11 @@ protected:
     // index lock
     std::mutex indexLock;
 
+    using SegFlushNodeType = tbb::flow::multifunction_node<UpdateMessage*, std::tuple<UpdateMessage*>>;
+
     // flow graph to handle commits
     std::unique_ptr<tbb::flow::function_node<UpdateMessage*, UpdateMessage*> > commitMain;
+    std::unique_ptr<SegFlushNodeType > segFlushNode; // called when a segment is flushed
     std::unique_ptr<tbb::flow::sequencer_node<UpdateMessage*> > sequencer;
     std::unique_ptr<tbb::flow::function_node<UpdateMessage*, UpdateMessage*> > commitFinishNode;
     tbb::flow::graph commitGraph;
@@ -41,6 +48,17 @@ protected:
         this->commitBody(*msg);
         return msg;
       });
+
+      segFlushNode = std::make_unique<SegFlushNodeType>(commitGraph, tbb::flow::unlimited,
+       [this](UpdateMessage* msg, SegFlushNodeType::output_ports_type& op) {
+         this->flushSeg(*msg);
+         int left = --msg->leftToFlush;
+         if (left <= 0) {
+           // no more flushes left to wait for, so put message to output port.
+           std::get<0>(op).try_put(msg);
+         }
+      });
+
       sequencer = std::make_unique<tbb::flow::sequencer_node<UpdateMessage*> >(commitGraph, [](UpdateMessage* msg) ->std::size_t { return msg->commitNum; });
 
       // make the commitFinishNode single-threaded so that commits can't get reordered.
@@ -51,7 +69,9 @@ protected:
         return msg;
       });
 
-      tbb::flow::make_edge(*commitMain, *sequencer);
+
+      // tbb::flow::make_edge(*commitMain, *segFlushNode);
+      tbb::flow::make_edge(*segFlushNode, *sequencer);
       tbb::flow::make_edge(*sequencer, *commitFinishNode);
     }
 
@@ -69,18 +89,43 @@ protected:
       assert(success);
     }
 
+
+    void commitBody(UpdateMessage& umsg) {
+      int numSegs = 10;
+      umsg.leftToFlush = numSegs;
+
+      for (int i=0; i<numSegs; i++) {
+        // do async so things can get mixed up a bit between messages
+        taskArena.execute([this, &umsg] {
+          std::this_thread::sleep_for(std::chrono::milliseconds(1));
+          this->segFlushNode->try_put(&umsg);
+        });
+        // segFlushNode->try_put(&umsg);
+      }
+    }
+
+#ifdef REMOVED
     void commitBody(UpdateMessage& umsg) {
       tbb::task_group taskGroup;
       int numSegs = 10;
       // in the real IW, this won't be so easy because some of the segments that need to be flushed may be in use.
+      // option1: create a sub-graph with an async node for each segment that is outstanding (that can be called after
+      // a flush has completed).
+      // option 2: create a multi-function node that can be called when a segment has finished flushing.  When all
+      // needed segments have finished flushing, send the update message to the next node.  This can be a simple count
+      // to tell if we need to wait for more segments.
+      // TODO: still need to figure out how to work in segment merges.
+      //   if a commit is pending, perhaps wait until that commit finishes before looking at what segments we can merge.
+      //   This could optimize then case when we have 13 small segments coming but we decide to merge only 10 of them?
       for (int i = 0; i < numSegs; i++) {
         taskGroup.run([this, &umsg] { this->flushSeg(umsg); });
       }
       taskGroup.wait();
     }
+#endif
 
     void flushSeg(UpdateMessage& umsg) {
-      LOG_INFO("  flush for commit {}", umsg.commitNum);
+      LOG_INFO("  flush for commit {} flushLeft={}", umsg.commitNum, umsg.leftToFlush.load());
 
       flushSegCount++;
       // sleep for a millisecond to simulate flushing a segment
@@ -91,6 +136,7 @@ protected:
 
     void finish(UpdateMessage& msg) {
       LOG_INFO("  finish for commit {}", msg.commitNum);
+      EXPECT_EQ(0, msg.leftToFlush);
       // check that the commits finish in order
       std::unique_lock<std::mutex> lock(indexLock);
       EXPECT_EQ(msg.commitNum, expectedCommitNum);
@@ -106,7 +152,6 @@ protected:
     IW iw;
 
     // now launch a certain number of commit tasks in parallel
-    oneapi::tbb::task_arena ta(16);
     oneapi::tbb::task_group tg;
     for (int i = 0; i < numTasks; i++) {
       tg.run([&iw] { iw.commit(); });
