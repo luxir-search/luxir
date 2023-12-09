@@ -39,7 +39,7 @@ protected:
     std::unique_ptr<tbb::flow::function_node<UpdateMessage*, UpdateMessage*> > commitMain;
     std::unique_ptr<SegFlushNodeType > segFlushNode; // called when a segment is flushed
     std::unique_ptr<tbb::flow::sequencer_node<UpdateMessage*> > sequencer;
-    std::unique_ptr<tbb::flow::function_node<UpdateMessage*, UpdateMessage*> > commitFinishNode;
+    std::unique_ptr<tbb::flow::function_node<UpdateMessage*, UpdateMessage*> > commitFinishNode;  // TODO: error here... nothing to read from output port?
     tbb::flow::graph commitGraph;
 
     IW() {
@@ -172,8 +172,74 @@ protected:
   }
 };
 
+#define DISABLED_TEST
 #ifdef DISABLED_TEST
 TEST_F(TBBTest, TBBCommitStrat) {
   testCommitStrat(1000);
+}
+#endif
+
+
+// #define DISABLED_TEST2
+#ifdef DISABLED_TEST2
+// RESULT: Yes, if we send to a node and it has no one to read from is output port, buffering is done and we eventually run out of memory!
+// If this happens in our production code, how can we test for it?
+// Adding the rejecting policy to the function_node did not help for some reason... presumably because tbb::flow::unlimited?
+// It's unclear when we are just seeing creation of tasks running ahead of the graph as well.
+// Testing with a multifunction node *and* with a Msg that is the size of the pointer, I see no growth.
+//   Perhaps TBB has some code that handles things differently for large messages?
+TEST_F(TBBTest, testNoConsumer) {
+  struct Msg {
+    // char data[1024];  // something big so we can see any buffering
+    char data[8];  // something the size of a pointer
+  };
+
+  struct Empty{};
+
+  using MyNodeType = tbb::flow::multifunction_node<Msg, std::tuple<Msg>>;
+
+  std::atomic_int count = 0;
+
+
+  {
+    // std::unique_ptr<tbb::flow::function_node<Msg, Msg, tbb::flow::rejecting> > fnode;
+    std::unique_ptr<tbb::flow::function_node<Msg, Empty> > fnode2;
+    std::unique_ptr<MyNodeType> fnode;
+    tbb::flow::graph commitGraph;
+
+    fnode = std::make_unique<MyNodeType>(commitGraph, 32,
+                                         [&](Msg msg, MyNodeType::output_ports_type& op) {
+                                           // increment count
+                                            count++;
+                                         });
+
+
+    // fnode = std::make_unique<tbb::flow::function_node<Msg, Msg, tbb::flow::rejecting> >(commitGraph, tbb::flow::unlimited,
+    // fnode = std::make_unique<tbb::flow::function_node<Msg, Msg, tbb::flow::rejecting> >(commitGraph, 1,
+    fnode2 = std::make_unique<tbb::flow::function_node<Msg, Empty> >(commitGraph, tbb::flow::unlimited,
+                                                                  [&](Msg msg) -> Empty {
+                                                                    count++;
+                                                                    return {};
+                                                                  });
+
+    int numTasks = 100000000;
+    oneapi::tbb::task_group tg;
+    for (int i = 0; i < numTasks; i++) {
+      // tg.run( [&]{
+                bool success = fnode->try_put(Msg());
+                // bool success = fnode2->try_put(Msg());
+                if (false && i % 1000000 == 0) {
+                  // sleep for a bit to give time for tasks to execute
+                  std::cout << "i=" << i << " count=" << count << std::endl;
+                  std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+                }
+                ASSERT_TRUE(success);
+      //        }
+      // );
+    }
+
+    tg.wait();
+  }
+
 }
 #endif

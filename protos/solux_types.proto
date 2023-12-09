@@ -227,24 +227,17 @@ message UpdateRequest {
 
   Target collection = 3;
 
-  // TODO:
-  // possible parameters: commitWithin,
-  // optional batchId - in streaming request/responses, used to tell what batch has been indexed
-  // optional stream - what logical stream this batch is part of (don't reorder docs in the same stream)
-  //   or should this just be a separate streaming request for a separate stream?  That might be more difficult for some clients.
-
-
-
-  // TODO: should docs/columns be wrapped in "oneof" (if so, need wrapper for "repeated Map docs")
-
-  // documents represented as multiple rows... less efficient since field names are repeated for each document
+  // Documents represented as multiple rows... less efficient since field names are repeated for each document
   repeated Map docs = 4;
 
   // Column representation of a batch of documents.  All columns should have the same length.
-  // For very sparse columns that you do not wish to represent as columns, use a special
+  // For very sparse fields that you do not wish to represent as a column, use a special
   // field name of "_fields_" with a value of ColMap for per-document sparse values.  This is
   // effectively a mix of column oriented and row oriented.
   Columns columns = 5;
+
+  // Commit within this many milliseconds. 0 means as soon as previous documents have been indexed.
+  optional int32 commit_within = 6;
 }
 
 // The response to an update request, or one or more update requests in streaming mode.
