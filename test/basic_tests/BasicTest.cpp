@@ -3,6 +3,7 @@
 #include <iostream>
 #include <new>
 #include <solux/util/random.h>
+#include <boost/unordered/unordered_flat_map.hpp>
 #include "solux/util/solux_util.h"
 #include "solux/util/heap.h"
 #include "solux/util/TaggedPtr.h"
@@ -154,6 +155,35 @@ TEST(BasicTest, testPQ) {
   }
 }
 
+TEST(BasicTest, testMap) {
+  // test boost's unordered_flat_map behavior of iteration and erase().
+  // some notes said that erase() was non-standard (i.e. didn't return the next item), but it seems to work fine.
+  {
+    boost::unordered_flat_map<uint64_t, uint64_t> map;
+    map[1] = 1;
+    map[7] = 7;
+    map[100] = 100;
+    map[5] = 5;
+    map[20] = 20;
+    map[25] = 25;
+    map[17] = 17;
+    map[15] = 15;
+
+    for (auto iter = map.begin(); iter != map.end(); ) {
+      if (iter->first & 0x01) { // delete odd entries
+        iter = map.erase(iter);
+      } else {
+        iter++;
+      }
+    }
+
+    ASSERT_EQ(2, map.size());
+    // verify that the remaining entries are even
+    for (auto iter = map.begin(); iter != map.end(); iter++) {
+      ASSERT_EQ(0, iter->first & 0x01);
+    }
+  }
+}
 
 #if REMOVED_CODE
 char* returnsStackAddr(char* ptr) {
