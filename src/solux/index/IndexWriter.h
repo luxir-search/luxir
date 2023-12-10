@@ -18,8 +18,8 @@
 #include "protos/solux_types.pb.h"
 
 // redefine DEBUG to TRACE level which shouldn't currently be logged!
-// #define INDEX_DEBUG LOG_TRACE
-#define INDEX_DEBUG LOG_DEBUG
+#define INDEX_DEBUG LOG_TRACE
+// #define INDEX_DEBUG LOG_DEBUG
 
 namespace solux {
 
@@ -135,6 +135,13 @@ public:
 
   std::unique_ptr<tbb::flow::sequencer_node<UpdateMessage*> > commitSequencerNode;
   std::unique_ptr<UpdateMessageMultiFunc> commitFinishNode;
+
+  ~IndexWriter() {
+    // without this, in gcc release mode we can get a crash when the IndexWriter is destroyed, even when
+    // the graph wasn't used. Presumably because the test was so fast and there was some async initialization
+    // of the graph still going on?
+    updateGraph.wait_for_all();
+  }
 
   explicit IndexWriter(Directory &dir) : dir(dir) {
     std::shared_ptr<InputFile> segFile = dir.openFile(Postings::INDEX_INFO_FILE);
