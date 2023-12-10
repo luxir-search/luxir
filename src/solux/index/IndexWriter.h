@@ -17,8 +17,29 @@
 // we may want to decouple from protobuf in the future, but for now it makes it easy to develop
 #include "protos/solux_types.pb.h"
 
+// redefine DEBUG to TRACE level which shouldn't currently be logged!
+// #define INDEX_DEBUG LOG_TRACE
+#define INDEX_DEBUG LOG_DEBUG
 
 namespace solux {
+
+// An update message to be processed by the TBB update flow graph.
+// This was an inner class to IndexWriter, but it can't be forward declared in Inverter that way.
+class UpdateMessage {
+public:
+  // update protobuf message
+  solux::proto::UpdateRequest* req;  // The request object may become unavailable after the callback is called
+  std::function<void(UpdateMessage*)> callback;    // Called after the update has completed
+  bool commit = false;                // commit after this update is done?
+  uint64_t seqNum;                    // The sequence number of this update, used to ensure updates are processed in order when needed
+  uint64_t commitNum;                 // The commit number of this update, used to ensure commits are finished in order
+
+  // Number of segments left to flush, protected by same mutex that protects the inverter lists.
+  // making this an atomic is not enough to avoid race conditions since we also depend on coordination with
+  // inverter->updateMessage, among other things.
+  uint32_t leftToFlush = 0;
+};
+
 
 /// The IndexWriter is a level above Inverter & PostingsWriter that coordinates
 /// indexing activity for a single index / directory.
@@ -51,25 +72,21 @@ public:
 
   Directory &dir;
   uint64_t gen;
+
+  // segs is currently only used when writing the index info file.
   std::vector<std::string> segs;  // all of the referenced segments (TODO: replace with something containing more info when needed)
 
   std::shared_ptr<IndexReader> indexReader;
 
-  // TODO: change mutex used to protect the inverter lists.
+  // protected by indexMutex
   boost::unordered_flat_map<Inverter*, std::unique_ptr<Inverter>> idleInverters;
   boost::unordered_flat_map<Inverter*, std::unique_ptr<Inverter>> busyInverters;
   boost::unordered_flat_map<Inverter*, std::unique_ptr<Inverter>> flushingInverters;
 
+  // sequence numbers for updates and commits.  protected by indexMutex
+  std::atomic_uint64_t updateNumber = 0;
+  std::atomic_uint64_t commitNumber = 0;
 
-  // An update message to be processed by the TBB update flow graph
-  class UpdateMessage {
-  public:
-    // update protobuf message
-    solux::proto::UpdateRequest* req;  // The request object may become unavailable after the callback is called
-    std::function<void(UpdateMessage*)> callback;    // Called after the update has completed
-    uint64_t seqNum;                    // The sequence number of this update, used to ensure updates are processed in order when needed
-    uint64_t commitNum;                 // The commit number of this update, used to ensure commits are finished in order
-  };
 
 
   // Goals of the TBB flow graph for updates:
@@ -98,8 +115,7 @@ public:
   // See TBBTest.cpp for a test of the TBB parts of this strategy.
   //
   // Failures:
-  //  - if something fails, we need to still flow it through the graph so the sequencers are happy (i.e. so they
-  //    won't block updates / commits that come after.
+  //  - if something fails, we need to still flow it through the graph so the sequencers are updated.
 
   using UpdateMessageFunc = tbb::flow::function_node<UpdateMessage*, UpdateMessage*>;
   using UpdateMessageMultiFunc = tbb::flow::multifunction_node<UpdateMessage*, std::tuple<UpdateMessage*>>;
@@ -114,7 +130,7 @@ public:
   // TODO: what if no one reads from this node??? Will it buffer output and eventually fail or block? Or because
   // there is no edge does it just drop.  Make a test for this!
 
-  using InverterMultiFunc = tbb::flow::multifunction_node<UpdateMessage*, std::tuple<UpdateMessage*>>;
+  using InverterMultiFunc = tbb::flow::multifunction_node<Inverter*, std::tuple<UpdateMessage*>>;
   std::unique_ptr<InverterMultiFunc> segmentFlushNode;
 
   std::unique_ptr<tbb::flow::sequencer_node<UpdateMessage*> > commitSequencerNode;
@@ -155,6 +171,7 @@ public:
     // then make sure that the updates are finished in order so all updates are done before a commit is processed.
     updateSequencerNode = std::make_unique<tbb::flow::sequencer_node<UpdateMessage*> >(updateGraph,
       [](UpdateMessage* msg) -> size_t {
+        INDEX_DEBUG("updateSequencerNode: msg={} seqNum={}", (void*)msg, msg->seqNum);
         return msg->seqNum;
       });
 
@@ -172,18 +189,13 @@ public:
 
     // now the commit nodes
     segmentFlushNode = std::make_unique<InverterMultiFunc>(updateGraph, tbb::flow::unlimited,
-      [this](UpdateMessage* msg, InverterMultiFunc::output_ports_type& op) {
-         this->flushSegBody(*msg);
-         int left = 1; // --msg->leftToFlush; // TODO
-         if (left <= 0) {
-           // no more flushes left to wait for, so put message to output port.
-           // is there an advantage to doing it this way (using an edge) vs just doing a try_put on the node directly?
-           std::get<0>(op).try_put(msg);
-         }
+      [this](Inverter* inverter, InverterMultiFunc::output_ports_type& op) {
+         this->segmentFlushBody(*inverter);
     });
 
     commitSequencerNode = std::make_unique<tbb::flow::sequencer_node<UpdateMessage*> >(updateGraph,
       [](UpdateMessage* msg) -> size_t {
+        INDEX_DEBUG("commitSequencerNode: msg={} commitNum={}", (void*)&msg, msg->commitNum);
         return msg->commitNum;
       });
 
@@ -193,25 +205,154 @@ public:
          // std::get<0>(op).try_put(msg);
     });
 
-    // connect the segment flush + commit nodes
-    tbb::flow::make_edge(*segmentFlushNode, *commitSequencerNode);
     tbb::flow::make_edge(*commitSequencerNode, *commitFinishNode);
   }
 
   void startUpdateBody(UpdateMessage& msg) {
+    // if the start node can reject updates, then assigning sequence numbers should be done after that.
+    // Sequences must start at 0 for the sequencer nodes.
+    msg.seqNum = updateNumber++;
+    if (msg.commit) {
+      msg.commitNum = commitNumber++;
+    }
+    INDEX_DEBUG("startUpdateBody: msg={} seqNum={} commitNum={}", (void*)&msg, msg.seqNum, msg.commitNum);
   }
+
   void processUpdateBody(UpdateMessage& msg) {
+    INDEX_DEBUG("processUpdateBody: msg={}", (void*)&msg);
+    update(*msg.req);
   }
+
   void finishUpdateBody(UpdateMessage& msg) {
+    INDEX_DEBUG("finishUpdateBody: msg={}", (void*)&msg);
+
     // If this update has a commit, we could either kick it off here, or send a message to a commit node.
     // Gathering the required inverters as quickly as possible might be good (i.e. do it here)
     // Aside: if each inverter keeps track of the highest (and lowest?) update message it has seen, could that be used somehow?
     //  - could avoid dragging in an unneeded inverter.
+
+    if (msg.commit) {
+      initiateCommit(msg);
+    }
+
+    if (!msg.commit && msg.callback) {
+      msg.callback(&msg);
+      // don't access msg after this point, it could be deleted.
+    }
   }
 
-  void flushSegBody(UpdateMessage& msg) {
+  void initiateCommit(UpdateMessage& msg) {
+    INDEX_DEBUG("initiateCommit: msg={} STARTING", (void*)&msg);
+
+    {
+      const std::lock_guard<std::mutex> lock(indexMutex);
+
+      // first look at any flushing inverters that are not marked for a commit yet
+      // and mark them if necessary.
+      for (auto it = flushingInverters.begin(); it != flushingInverters.end(); it++) {
+        if (it->second->lowestUpdateNum <= msg.seqNum && it->second->updateMessage == nullptr) {
+          it->second->updateMessage = &msg;
+          msg.leftToFlush++;
+        }
+      }
+
+      // now look at all idle inverters and initiate a flush if necessary.
+      for (auto it = idleInverters.begin(); it != idleInverters.end(); it++) {
+        if (it->second->lowestUpdateNum <= msg.seqNum) {
+          if (it->second->updateMessage == nullptr) {
+            it->second->updateMessage = &msg;
+            msg.leftToFlush++;
+          } else {
+            // this would be a bug since we should never have an idle inverter that is part of a commit.
+            LOG_ERROR("Idle inverter is part of a commit.");
+          }
+
+          // move the inverter to the flushing list
+          auto [flushingIt, success] = flushingInverters.emplace(it->first, std::move(it->second));
+          idleInverters.erase(it);
+          // send the inverter to the segment flush node
+          segmentFlushNode->try_put(flushingIt->second.get());
+        }
+      }
+
+      // Any inverters that are busy should be marked so that when they are released they can be flushed.
+      for (auto it = busyInverters.begin(); it != busyInverters.end(); it++) {
+        if (it->second->lowestUpdateNum <= msg.seqNum) {
+          it->second->updateMessage = &msg;
+          msg.leftToFlush++;
+        }
+      }
+
+      INDEX_DEBUG("initiateCommit: msg={} leftToFlush={}", (void*)&msg, msg.leftToFlush);
+
+      // Normally a commit would be kicked off by the last segment flushing.  But if there are no segments to flush,
+      // we need to kick it off here.
+      if (msg.leftToFlush == 0) {
+        commitSequencerNode->try_put(&msg);
+      }
+    } // end mutex protected section
   }
+
+  // Inverter for the segment should already be in the flushingInverters list.
+  // This is called in parallel.
+  void segmentFlushBody(Inverter& inverter) {
+    INDEX_DEBUG("segmentFlushBody: inverter={}", (void*)&inverter);
+
+    {
+      // TODO FIXME: flushing is not yet thread safe... one reason is that Directory is not yet thread safe.
+      const std::lock_guard<std::mutex> lock(indexMutex);
+      inverter.flush();
+    }
+    std::string segid = inverter.getPostingsWriter().getSegId();
+
+    std::unique_ptr<Inverter> inverterPtr;
+
+    bool triggerCommit = false;
+    {
+      const std::lock_guard<std::mutex> lock(indexMutex);
+
+      // segments are flushed in parallel, so the segids are not in order... (or in the completed order.) should be fine.
+      segs.emplace_back(segid);
+
+      // remove the inverter from the flushingInverters set, but remember it until the end of this function.
+      auto it = flushingInverters.find(&inverter);
+      if (it == flushingInverters.end()) {
+        assert(false);
+      }
+      inverterPtr = std::move(it->second);
+      flushingInverters.erase(it);
+
+      // The mutex protects against races in the setting of inverter.updateMessage as well as leftToFlush.
+      // Higher level logical races protected against would be kicking off a segment flush and then that completing and
+      // kicking off a commit before the next segment flush is kicked off.
+      if (inverter.updateMessage != nullptr) {
+        if (--inverter.updateMessage->leftToFlush == 0) {
+          triggerCommit = true;
+        }
+      }
+    }
+
+    // It shouldn't be a big deal to do a try_put inside the sync block, but it's safe to do outside.
+    if (triggerCommit) {
+      commitSequencerNode->try_put(inverter.updateMessage);
+    }
+
+    // the inverter (inverterPtr) should go out of scope and be deleted at this point
+  }
+
+  // called from the commitFinishNode which has concurrency==1 (single-threaded)
   void finishCommitBody(UpdateMessage& msg) {
+    INDEX_DEBUG("finishCommitBody: msg={}", (void*)&msg);
+    // TODO: if nothing actually changed, we could skip writing a new commit at this point.
+    {
+      const std::lock_guard<std::mutex> lock(indexMutex);
+      writeIndexInfoFile();
+    }
+
+    if (msg.callback) {
+      msg.callback(&msg);
+      // don't access msg after this point, it could be deleted.
+    }
   }
 
 
@@ -233,15 +374,23 @@ public:
     const std::lock_guard<std::mutex> lock(indexMutex);
     auto it = busyInverters.find(&inverter);
     if (it == busyInverters.end()) {
-      throw std::runtime_error("Inverter not found in busyInverters");
+      LOG_ERROR("Inverter not found in busy list.");
+      assert(false);  // should never happen
     }
 
     // TODO: update and check global statistics
     // TODO: if the inverter is over a certain size, flush it
-    // TODO: if inverter is one we were waiting for before a commit, update that info (on a commit request, take a snapshot of the busy inverters?)
 
-    idleInverters.emplace(&inverter, std::move(it->second));
-    busyInverters.erase(it);
+    // if this inverter is part of a commit, initiate a flush.
+    if (inverter.updateMessage != nullptr) {
+      flushingInverters.emplace(&inverter, std::move(it->second));
+      it = busyInverters.erase(it);
+      segmentFlushNode->try_put(&inverter);
+    } else {
+      // return inverter to idle pool
+      idleInverters.emplace(&inverter, std::move(it->second));
+      busyInverters.erase(it);
+    }
   }
 
   Inverter& obtainInverter() {
@@ -306,10 +455,16 @@ public:
   }
 
 
-  // TODO: Currently single threaded and protected by the IndexWriter mutex... we need something different
-  // in the future that can utilize multi-threading.
-  // TODO: this should perhaps be moved to the grpc specific code.
+  // TODO: this should perhaps be moved to the grpc specific code?
   void update(solux::proto::UpdateRequest& request) {
+    // if there are no docs, then we can just return before grabbing an inverter.
+    if (request.docs_size() == 0) {
+      if (request.has_columns()) {
+        std::cout << "\tindexer got columns (not yet implemented!): " << request.columns().columns_size() << std::endl;
+      }
+      return;
+    }
+
     Inverter& inverter = obtainInverter();  // TODO: make sure to release it on exceptions (use a unique_ptr with a custom deleter?)
 
     std::vector<Inverter::IndexHandler*> handlers;
@@ -338,10 +493,6 @@ public:
 
         inverter.finishDoc();
       }
-    }
-
-    if (request.has_columns()) {
-      std::cout << "\tindexer got columns (not yet implemented!): " << request.columns().columns_size() << std::endl;
     }
 
     releaseInverter(inverter);

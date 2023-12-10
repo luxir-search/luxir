@@ -172,7 +172,7 @@ protected:
   }
 };
 
-#define DISABLED_TEST
+// #define DISABLED_TEST
 #ifdef DISABLED_TEST
 TEST_F(TBBTest, TBBCommitStrat) {
   testCommitStrat(1000);

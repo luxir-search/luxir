@@ -598,6 +598,7 @@ public:
     auto shard = collection->getShard();
     auto iw = shard->getIndexWriter();
 
+    /** first test iteration before TBB update graph
     if (request.docs_size() != 0) {
       iw->update(request);
       iw->commit(); // TODO: remove this at some point...
@@ -605,6 +606,25 @@ public:
       // thread safety testing... only happened when we had actual docs.  try to simulate with a sleep.
       std::this_thread::sleep_for(std::chrono::microseconds (100));
     }
+    */
+
+    // use update graph, but make it synchronous by waiting for the callback
+    std::latch latch(1);
+    UpdateMessage updateMessage;
+    updateMessage.req = &request;
+    updateMessage.commit = true;
+    updateMessage.callback = [&latch](UpdateMessage* updateMessage) {
+      LOG_DEBUG("callback msg={}", (void*)updateMessage);
+      latch.count_down();
+    };
+    bool success = iw->startUpdateNode->try_put(&updateMessage);
+    if (!success) {
+      throw std::runtime_error("failed to put update message into startUpdateNode");
+    }
+    LOG_DEBUG("waiting for latch msg={}", (void*)&updateMessage);
+    latch.wait();
+    // NOTE! If all threads submit updates and block, then there are no threads available to process the update graph.
+    // Deadlock results.
 
     auto& singleResponse = *response.add_responses();
     singleResponse.set_request_id(request.request_id());

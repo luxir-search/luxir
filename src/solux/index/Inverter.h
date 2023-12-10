@@ -19,7 +19,7 @@ namespace solux {
 using std::iter_swap; // for boost string_sort
 
 
-
+class UpdateMessage;
 
 class Inverter {
 private:
@@ -36,6 +36,12 @@ public:
   PostingsWriter postingsWriter;
 
   std::shared_ptr<Schema> schema;
+
+  // If the flush of this inverter is part of a commit, then this will point to that update message.
+  // It is set asynchronously and consumed by the IndexWriter and is not used by the Inverter itself.
+  UpdateMessage* updateMessage = nullptr;
+  // The lowest update number that this inverter is part of. Managed by the IndexWriter.
+  uint64_t lowestUpdateNum = 0;
 
   Inverter(solux::Directory& dir, std::string_view segid, const std::function<std::shared_ptr<Schema>()>& schemaProvider = {}) : postingsWriter(dir, segid) {
     // this is a test schemaProvider for convenience
