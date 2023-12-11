@@ -121,6 +121,153 @@ public:
     } // end for(;;)
   }
 
+
+  // This version of streaming updates uses a separate reader thread to avoid deadlock that can happen above if we insist on
+  // writing more messages and the server is waiting for us to read more.
+  void doStreamingUpdates2(Rng& r, int nMessages) {
+    solux::proto::UpdateRequest req;
+    solux::proto::UpdateResponse response;
+    grpc::ClientContext context;  // need a new one for each RPC
+
+    std::unique_ptr<grpc::ClientReaderWriter<solux::proto::UpdateRequest, solux::proto::UpdateResponse>> stream = indexerStub->UpdateStream(&context);
+
+    int nWrites=0;
+    int nReads=0;
+
+    // create a normal thread to read responses
+    std::thread reader = std::thread([&] {
+      while (stream->Read(&response)) {
+        nReads++;
+        if (nReads == nWrites) break;
+        /*
+        std::string resStr;
+        google::protobuf::TextFormat::PrintToString(response, &resStr);
+        std::cout << "CLIENT RESULT:( " << resStr << " )" << std::endl;
+         */
+      }
+    });
+
+    oneapi::tbb::task_group tg;
+    tg.run(
+            [&] {
+              while (stream->Read(&response)) {
+                nReads++;
+                if (nReads == nWrites) break;
+                /*
+                std::string resStr;
+                google::protobuf::TextFormat::PrintToString(response, &resStr);
+                std::cout << "CLIENT RESULT:( " << resStr << " )" << std::endl;
+                 */
+              }
+            });
+
+    do {
+        nWrites++;
+
+        solux::proto::UpdateRequest req;
+        req.mutable_collection()->add_name("main");
+
+        auto& fields = *req.add_docs()->mutable_fields();
+        fields["text1_w"].set_s("val1");
+        fields["text2_w"].set_s("val2");
+        fields["int1_i"].set_i(42);
+
+        /* dump message
+        std::string reqStr;
+        google::protobuf::TextFormat::PrintToString(req, &reqStr);
+        std::cout << "CLIENT REQ:( " << reqStr << " )" << std::endl;
+         */
+
+        // on last message, randomly use WriteLast or WritesDone
+        if (nWrites == nMessages && r.rbool()) {
+          stream->WriteLast(req, grpc::WriteOptions());
+          // hmmm, return type of WriteLast is void
+        } else {
+          bool wrote = stream->Write(req);
+          ASSERT_TRUE(wrote);
+
+          // I could also test delaying this call (doing a read inbetween sometimes)
+          if (nWrites == nMessages) {
+            bool ok = stream->WritesDone();
+            ASSERT_TRUE(ok);
+          }
+        }
+    } while (nWrites < nMessages);
+
+    tg.wait();
+    EXPECT_EQ(nWrites, nReads);
+  }
+
+  void doThreadSafeIndex(int nTasks, int callsPerTask, int streamingPercent) {
+
+    tbb::task_group tasks;
+
+    for (int i=0; i<nTasks; i++) {
+      tasks.run(
+              [=,this]{
+
+                Rng r(rng_seed + i);
+
+                // std::cout << "STARTED TEST THREAD " << i <<  " worker=" << exec.this_worker_id() << std::endl;
+
+                int nCalls = 0;
+
+                while (nCalls < callsPerTask) {
+                  if (r.rint(0, 100) < streamingPercent) {
+                    int left = callsPerTask - nCalls;
+                    int nStream = left == 1 ? 1 : r.rint(left) + 1;
+                    doStreamingUpdates(r, nStream);
+                    nCalls += nStream;
+                  } else {
+                    doSingleUpdate();
+                    nCalls++;
+                  }
+                }
+
+              }
+      );
+    }
+
+    tasks.wait();
+  }
+
+  void doThreadSafeIndex2(int nTasks, int callsPerTask, int streamingPercent) {
+
+    std::unique_ptr<std::thread> threads[nTasks];
+
+    for (int i=0; i<nTasks; i++) {
+      threads[i] = std::make_unique<std::thread>(
+              [=,this]{
+
+                Rng r(rng_seed + i);
+
+                // std::cout << "STARTED TEST THREAD " << i <<  " worker=" << exec.this_worker_id() << std::endl;
+
+                int nCalls = 0;
+
+                while (nCalls < callsPerTask) {
+                  if (r.rint(0, 100) < streamingPercent) {
+                    int left = callsPerTask - nCalls;
+                    int nStream = left == 1 ? 1 : r.rint(left) + 1;
+                    doStreamingUpdates(r, nStream);
+                    nCalls += nStream;
+                  } else {
+                    doSingleUpdate();
+                    nCalls++;
+                  }
+                }
+
+              }
+      );
+    }
+
+    // wait for all the threads
+    for (int i=0; i<nTasks; i++) {
+      threads[i]->join();
+    }
+  }
+
+
 };
 
 
@@ -296,39 +443,24 @@ TEST_F(GrpcIndexTest, threadsafe) {
 // ramping up callsPerTask to hammer things for longer.
 //
 TEST_F(GrpcIndexTest, threadsafeIndex) {
-  // int nTasks = 32; // concurrency will be limited by TBB
+
+  // int nTasks = 10;
   int nTasks = 2; // FIXME when indexer doesn't block (too many concurrent calls will deadlock)
   // int callsPerTask = 10;
   int callsPerTask = 2; // FIXME when indexer doesn't block
   int streamingPercent = 20;  // percent of the requests that use streaming, lower than 50% since streaming
-                              // requests will often consist of a number of update messages.
-  tbb::task_group tasks;
+  // requests will often consist of a number of update messages.
 
-  for (int i=0; i<nTasks; i++) {
-    tasks.run(
-            [=,this]{
-              Rng r(rng_seed + i);
-
-              // std::cout << "STARTED TEST THREAD " << i <<  " worker=" << exec.this_worker_id() << std::endl;
-
-              int nCalls = 0;
-
-              while (nCalls < callsPerTask) {
-                if (r.rint(0,100) < streamingPercent) {
-                  int left = callsPerTask-nCalls;
-                  int nStream = left==1 ? 1 : r.rint(left) + 1;
-                  doStreamingUpdates(r, nStream);
-                  nCalls += nStream;
-                } else {
-                  doSingleUpdate();
-                  nCalls++;
-                }
-              }
-            }
-    );
-  }
-
-  tasks.wait();
+  tbb::task_arena arena(4);
+  arena.execute(
+          [&,this]{
+            tbb::this_task_arena::isolate(
+                    [&,this]{
+                      doThreadSafeIndex(nTasks, callsPerTask, streamingPercent);
+                    }
+            );
+          }
+  );
 }
 
 
@@ -412,5 +544,5 @@ TEST_F(GrpcIndexTest, addDocsStream) {
 
 
 TEST_F(GrpcIndexTest, addDocsStream2) {
-  doStreamingUpdates(rng, 10);
+  doStreamingUpdates2(rng, 10);
 }

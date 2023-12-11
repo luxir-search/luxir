@@ -1,7 +1,7 @@
 #include <gtest/gtest.h>
 #include <stdatomic.h>
 
-#include <utility>
+#include "solux/util/thread.h"
 
 #include "solux/store/Directory.h"
 #include "oneapi/tbb/task_group.h"
@@ -242,6 +242,57 @@ TEST_F(TBBTest, testNoConsumer) {
 
     tg.wait();
   }
+
+}
+#endif
+
+
+void foo() {
+
+  // create a graph and a multi-function node
+  oneapi::tbb::flow::graph g;
+  using MyNodeType = tbb::flow::multifunction_node<Blocker*, std::tuple<Blocker*>>;
+  MyNodeType notifier2(g, tbb::flow::unlimited, [](Blocker* blocker, MyNodeType::output_ports_type& op) {
+    blocker->notify();
+  });
+  MyNodeType notifier(g, tbb::flow::unlimited, [&](Blocker* blocker, MyNodeType::output_ports_type& op) {
+    // std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    // blocker->notify();
+    notifier2.try_put(blocker); // exercise more of the graph machinery
+  });
+
+  int n=1000;
+  std::vector<std::unique_ptr<Blocker>> blockers;
+  for (int i=0; i<n; i++) {
+    blockers.emplace_back(std::make_unique<Blocker>([i,&notifier,&blockers]{
+      notifier.try_put(blockers[i].get());
+    }));
+  }
+
+  // create a task group
+  oneapi::tbb::task_group tg;
+  for (int i=0; i<n; i++) {
+    tg.run([i,&blockers]{
+      blockers[i]->wait();
+    });
+  }
+
+  tg.wait();
+}
+
+// #define DISABLED_TEST3
+#ifdef DISABLED_TEST3
+TEST_F(TBBTest, testBlocker) {
+  // TODO: why does the blocker strategy still deadlock when used with indexing??? is it the test threads?
+
+  oneapi::tbb::task_arena arena(8);
+
+  arena.execute([&]{
+    for (int i=0; i<100; i++) {
+      foo();
+    }
+  });
+
 
 }
 #endif
