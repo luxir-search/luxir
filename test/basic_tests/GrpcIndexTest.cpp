@@ -134,19 +134,6 @@ public:
     int nWrites=0;
     int nReads=0;
 
-    // create a normal thread to read responses
-    std::thread reader = std::thread([&] {
-      while (stream->Read(&response)) {
-        nReads++;
-        if (nReads == nWrites) break;
-        /*
-        std::string resStr;
-        google::protobuf::TextFormat::PrintToString(response, &resStr);
-        std::cout << "CLIENT RESULT:( " << resStr << " )" << std::endl;
-         */
-      }
-    });
-
     oneapi::tbb::task_group tg;
     tg.run(
             [&] {
@@ -443,17 +430,20 @@ TEST_F(GrpcIndexTest, threadsafe) {
 // ramping up callsPerTask to hammer things for longer.
 //
 TEST_F(GrpcIndexTest, threadsafeIndex) {
-
-  // int nTasks = 10;
-  int nTasks = 2; // FIXME when indexer doesn't block (too many concurrent calls will deadlock)
-  // int callsPerTask = 10;
-  int callsPerTask = 2; // FIXME when indexer doesn't block
+  int nTasks = 10;
+  int callsPerTask = 10;
   int streamingPercent = 20;  // percent of the requests that use streaming, lower than 50% since streaming
   // requests will often consist of a number of update messages.
 
-  tbb::task_arena arena(4);
+  // doThreadSafeIndex(nTasks, callsPerTask, streamingPercent);
+
+  // too many concurrent requests here will cause deadlock.  It may just be because
+  // we do task_group.wait() on the client side, and that can perhaps steal work from our server side?
+  // Need a separate process to test higher concurrency levels.
+  tbb::task_arena arena(std::thread::hardware_concurrency()/2);
   arena.execute(
           [&,this]{
+            // TODO: not sure if this isolate does anything useful here or not.
             tbb::this_task_arena::isolate(
                     [&,this]{
                       doThreadSafeIndex(nTasks, callsPerTask, streamingPercent);
@@ -461,6 +451,7 @@ TEST_F(GrpcIndexTest, threadsafeIndex) {
             );
           }
   );
+
 }
 
 
@@ -544,5 +535,5 @@ TEST_F(GrpcIndexTest, addDocsStream) {
 
 
 TEST_F(GrpcIndexTest, addDocsStream2) {
-  doStreamingUpdates2(rng, 10);
+  doStreamingUpdates(rng, 10);
 }

@@ -257,7 +257,8 @@ public:
       // first look at any flushing inverters that are not marked for a commit yet
       // and mark them if necessary.
       for (auto it = flushingInverters.begin(); it != flushingInverters.end(); it++) {
-        if (it->second->lowestUpdateNum <= msg.seqNum && it->second->updateMessage == nullptr) {
+        if (it->second->updateMessage == nullptr && it->second->lowestUpdateNum) {
+          INDEX_DEBUG("\tinitiateCommit: msg={} marking flushing inverter={} for commit", (void*)&msg, (void*)it->second.get());
           it->second->updateMessage = &msg;
           msg.leftToFlush++;
         }
@@ -267,6 +268,7 @@ public:
       for (auto it = idleInverters.begin(); it != idleInverters.end(); it++) {
         if (it->second->lowestUpdateNum <= msg.seqNum) {
           if (it->second->updateMessage == nullptr) {
+            INDEX_DEBUG("\tinitiateCommit: msg={} marking idle inverter={} for commit", (void*)&msg, (void*)it->second.get());
             it->second->updateMessage = &msg;
             msg.leftToFlush++;
           } else {
@@ -284,7 +286,8 @@ public:
 
       // Any inverters that are busy should be marked so that when they are released they can be flushed.
       for (auto it = busyInverters.begin(); it != busyInverters.end(); it++) {
-        if (it->second->lowestUpdateNum <= msg.seqNum) {
+        if (it->second->updateMessage == nullptr && it->second->lowestUpdateNum <= msg.seqNum) {
+          INDEX_DEBUG("\tinitiateCommit: msg={} marking busy inverter={} for commit", (void*)&msg, (void*)it->second.get());
           it->second->updateMessage = &msg;
           msg.leftToFlush++;
         }
@@ -303,7 +306,8 @@ public:
   // Inverter for the segment should already be in the flushingInverters list.
   // This is called in parallel.
   void segmentFlushBody(Inverter& inverter) {
-    INDEX_DEBUG("segmentFlushBody: inverter={}", (void*)&inverter);
+    INDEX_DEBUG("segmentFlushBody: inverter={} msg={} msg.leftToFlush={}", (void*)&inverter, (void*)inverter.updateMessage,
+                inverter.updateMessage == nullptr ? -1 : inverter.updateMessage->leftToFlush);
 
     {
       // TODO FIXME: flushing is not yet thread safe... one reason is that Directory is not yet thread safe.
@@ -390,10 +394,12 @@ public:
 
     // if this inverter is part of a commit, initiate a flush.
     if (inverter.updateMessage != nullptr) {
+      INDEX_DEBUG("releaseInverter: inverter={} message={} triggering flush.", (void*)&inverter, (void*)inverter.updateMessage);
       flushingInverters.emplace(&inverter, std::move(it->second));
       it = busyInverters.erase(it);
       segmentFlushNode->try_put(&inverter);
     } else {
+      INDEX_DEBUG("releaseInverter: inverter={} adding back to idleInverters.", (void*)&inverter);
       // return inverter to idle pool
       idleInverters.emplace(&inverter, std::move(it->second));
       busyInverters.erase(it);

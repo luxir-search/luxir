@@ -668,11 +668,54 @@ public:
 
   bool handleRequest(proto::UpdateRequest* request) override {
     auto* arena = request->GetArena();
-    auto* response = arena->CreateMessage<proto::UpdateResponse>(arena);
-    auto ok = IndexerUpdateCall::handleUpdate(server, *request, *response);
-    unused(ok);
-    respond(response, [this](auto* response) { this->releaseArena(response->GetArena()); });
-    return true; // take ownership of request object since we used its arena
+
+    std::shared_ptr<Collection> collection;
+
+    if (request->collection().name_size() == 0) {
+      // TODO: do we support default collections (implicitly defined by something like an api-key?)
+    }
+
+    std::shared_ptr<Library> library = server.getSoluxNode().getLibrary(nullptr, "");
+    for (int i=0; i<request->collection().name_size(); i++) {
+      // TODO: walk from our implicit root to find the correct collection.
+      if (i == request->collection().name_size()-1) {
+                GRPC_DEBUG("Looking up collection name '{}'", request->collection().name(i));
+
+        // last element in path, so get collection.
+        collection = server.getSoluxNode().getCollection(library.get(), request->collection().name(i));
+        // TODO: handle lookup failure
+      } else {
+        // not last element... get sub-library
+        library = server.getSoluxNode().getLibrary(library.get(), request->collection().name(i));
+        // TODO: handle lookup failure
+      }
+    }
+
+            GRPC_DEBUG("\tindexer got docs, num={}", request->docs_size());
+    auto shard = collection->getShard();
+    auto iw = shard->getIndexWriter();
+
+
+    UpdateMessage* updateMessage = new UpdateMessage; // TODO arena allocate this.
+    updateMessage->req = request;
+    updateMessage->commit = true;
+    updateMessage->callback = [this](UpdateMessage* updateMessage) {
+      // LOG_DEBUG("callback msg={}", (void*)updateMessage);
+      // create response from request arena
+      auto* arena = updateMessage->req->GetArena();
+      auto* response = arena->CreateMessage<proto::UpdateResponse>(arena);
+      auto& singleResponse = *response->add_responses();
+      singleResponse.set_request_id(updateMessage->req->request_id());
+
+      this->respond(response,
+                    [this](auto* response) { this->releaseArena(response->GetArena()); },
+                    1);
+      delete updateMessage; // TODO arena allocate this
+    };
+
+    iw->startUpdateNode->try_put(updateMessage);
+
+    return true; // take ownership of request object since we used its arena (and we are handling async)
   }
 };
 
