@@ -33,6 +33,8 @@ GRPCServer::GRPCServer(int nthreads)
 // interface that may help with integration with external event loops.
 // adapted from the grpc helloworld example
 void solux::GRPCServer::run() {
+  pthread_setname_np(pthread_self(), "solux_grpc_main");
+
   std::string server_address("0.0.0.0:50051");
 
   grpc::EnableDefaultHealthCheckService(true);
@@ -803,6 +805,10 @@ public:
 };
 
 void GRPCServer::runThread(ThreadInfo& threadInfo) {
+  // linux-only: give threads a nice name for debugging.
+  std::string tname = "solux_grpc_" + std::to_string(threadInfo.threadno);
+  pthread_setname_np(pthread_self(), tname.c_str());
+
   // wait for the server to start before trying to use it.
   startLatch.wait();
 
