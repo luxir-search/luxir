@@ -14,6 +14,7 @@
 #include "solux/util/TaggedPtr.h"
 #include "solux/query/ProtobufQueryParser.h"
 #include "solux/search/Collector.h"
+#include "solux/util/thread.h"
 
 
 
@@ -608,23 +609,23 @@ public:
     }
     */
 
-    // use update graph, but make it synchronous by waiting for the callback
-    std::latch latch(1);
     UpdateMessage updateMessage;
+
+    Blocker blocker([&]{
+      bool success = iw->startUpdateNode->try_put(&updateMessage);
+      if (!success) {
+        throw std::runtime_error("failed to put update message into startUpdateNode");
+      }
+    });
+
     updateMessage.req = &request;
     updateMessage.commit = true;
-    updateMessage.callback = [&latch](UpdateMessage* updateMessage) {
-      LOG_DEBUG("callback msg={}", (void*)updateMessage);
-      latch.count_down();
+    updateMessage.callback = [&blocker](UpdateMessage* updateMessage) {
+      // LOG_DEBUG("callback msg={}", (void*)updateMessage);
+      blocker.notify();
     };
-    bool success = iw->startUpdateNode->try_put(&updateMessage);
-    if (!success) {
-      throw std::runtime_error("failed to put update message into startUpdateNode");
-    }
-    LOG_DEBUG("waiting for latch msg={}", (void*)&updateMessage);
-    latch.wait();
-    // NOTE! If all threads submit updates and block, then there are no threads available to process the update graph.
-    // Deadlock results.
+
+    blocker.wait(); // the callback will unblock this.
 
     auto& singleResponse = *response.add_responses();
     singleResponse.set_request_id(request.request_id());

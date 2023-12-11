@@ -1,6 +1,8 @@
 #include <gtest/gtest.h>
 #include <stdatomic.h>
 
+#include <utility>
+
 #include "solux/store/Directory.h"
 #include "oneapi/tbb/task_group.h"
 #include "oneapi/tbb/flow_graph.h"
