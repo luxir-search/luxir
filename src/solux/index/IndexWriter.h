@@ -310,8 +310,8 @@ public:
                 inverter.updateMessage == nullptr ? -1 : inverter.updateMessage->leftToFlush);
 
     {
-      // TODO FIXME: flushing is not yet thread safe... one reason is that Directory is not yet thread safe.
-      const std::lock_guard<std::mutex> lock(indexMutex);
+      // uncomment to serialize inverter flushing
+      // const std::lock_guard<std::mutex> lock(indexMutex);
       inverter.flush();
     }
     std::string segid = inverter.getPostingsWriter().getSegId();

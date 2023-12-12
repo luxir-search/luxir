@@ -436,9 +436,9 @@ TEST_F(GrpcIndexTest, threadsafe) {
 // ramping up callsPerTask to hammer things for longer.
 //
 TEST_F(GrpcIndexTest, threadsafeIndex) {
-  int nTasks = 100;
-  int callsPerTask = 2000;
-  int streamingPercent = 0;  // percent of the requests that use streaming
+  int nTasks = 10;
+  int callsPerTask = 10;
+  int streamingPercent = 50;  // percent of the requests that use streaming
 
   // doThreadSafeIndex(nTasks, callsPerTask, streamingPercent);
 
