@@ -74,6 +74,12 @@ public:
         }
       }
 
+      // if writes are far enough ahead of reads, do a read regardless of the random choice above
+      if (nWrites - nReads > 10) {
+        doRead = true;
+        doWrite = false;
+      }
+
       if (doWrite) {
         nWrites++;
 
@@ -430,10 +436,9 @@ TEST_F(GrpcIndexTest, threadsafe) {
 // ramping up callsPerTask to hammer things for longer.
 //
 TEST_F(GrpcIndexTest, threadsafeIndex) {
-  int nTasks = 10;
-  int callsPerTask = 10;
-  int streamingPercent = 20;  // percent of the requests that use streaming, lower than 50% since streaming
-  // requests will often consist of a number of update messages.
+  int nTasks = 100;
+  int callsPerTask = 2000;
+  int streamingPercent = 0;  // percent of the requests that use streaming
 
   // doThreadSafeIndex(nTasks, callsPerTask, streamingPercent);
 

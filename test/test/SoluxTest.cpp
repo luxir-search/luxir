@@ -129,13 +129,18 @@ int main(int argc, char **argv) {
   std::thread serverThread([&server](){server.run();});
   server.waitForStart();
 
-  if (!solux::unit_tests) {
-    benchmark::Initialize(&myargc, &(myargv[0]));
-    benchmark::RunSpecifiedBenchmarks();
-    ret = testing::Test::HasFatalFailure();
-  } else {
-    ret = RUN_ALL_TESTS();
-  }
+  // Run tests / benchmarks in their own TBB arena.
+  // It's not clear at this point if it will help anything, but we do want to separate as much as possible.
+  tbb::task_arena test_arena;
+  test_arena.execute([&] {
+    if (!solux::unit_tests) {
+      benchmark::Initialize(&myargc, &(myargv[0]));
+      benchmark::RunSpecifiedBenchmarks();
+      ret = testing::Test::HasFatalFailure();
+    } else {
+      ret = RUN_ALL_TESTS();
+    }
+  });
 
   server.shutdown();
   serverThread.join();

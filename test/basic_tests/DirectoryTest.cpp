@@ -1,6 +1,7 @@
 
 #include <gtest/gtest.h>
 #include <iostream>
+#include <oneapi/tbb/task_group.h>
 
 #include "solux/store/Directory.h"
 #include "test/SoluxTest.h"
@@ -9,9 +10,7 @@ using namespace solux;
 
 class DirectoryTest : public solux::SoluxTest {
 protected:
-  void addFile(Directory& dir, const std::string& name, const std::string& data, std::vector<std::string>& resultListing) {
-    resultListing.resize(0);
-
+  void addFile(Directory& dir, const std::string& name, const std::string& data) {
     std::unique_ptr<File> f = dir.createFile(name);
     OutputStream os;
     char arr[6];
@@ -29,6 +28,7 @@ protected:
     dir.finishFile(*f);
 
     // check if dir contents are in sorted order
+    std::vector<std::string> resultListing;
     dir.listFiles(resultListing);
     for (uint32_t i=1; i<resultListing.size(); i++) {
       ASSERT_LT(resultListing[i-1], resultListing[i]);
@@ -55,20 +55,24 @@ protected:
     dir.listFiles(lst);
     ASSERT_EQ(lst.size(), 0);
 
-    addFile(dir, "f5", "12345", lst);
+    addFile(dir, "f5", "12345");
+    lst.resize(0); dir.listFiles(lst);
     ASSERT_EQ("f5", lst[0]);
 
     // add file at end
-    addFile(dir, "f5a", "123456", lst);
+    addFile(dir, "f5a", "123456");
+    lst.resize(0); dir.listFiles(lst);
     ASSERT_EQ("f5a", lst[1]);
 
     // add file at start
     std::string aaa_data = "123456789abcdefghijklmnopqrstuvwxyz";
-    addFile(dir, "aaa", aaa_data, lst);
+    addFile(dir, "aaa", aaa_data);
+    lst.resize(0); dir.listFiles(lst);
     ASSERT_EQ("aaa", lst[0]);
 
     // add file in middle
-    addFile(dir, "bbb", "qwertyuiop", lst);
+    addFile(dir, "bbb", "qwertyuiop");
+    lst.resize(0); dir.listFiles(lst);
     ASSERT_EQ("bbb", lst[1]);
 
     // remove a non-existing file
@@ -100,10 +104,34 @@ protected:
     ASSERT_EQ(data.size(), aaa_data.size());
     ASSERT_EQ(0, memcmp(data.data(), aaa_data.data(), data.size()));
   }
+
+  // create a test method to test for thread safety
+  void doDirThreaded(Directory& dir) {
+    // 64 reliably failed for me if I removed one of the lock guards in RAMDir
+     int nFiles = 64; // this must be a power of two!
+
+     tbb::task_group tg;
+     int filenum = 0;
+     for (int i=0; i<nFiles; i++) {
+       filenum = (filenum + 123456789) % nFiles; // adding an odd number will do a complete traversal for a table of size power of two
+       tg.run([this, &dir, filenum]() {
+         std::string name = "file" + std::to_string(filenum);
+         std::string data = "data" + std::to_string(filenum);
+         addFile(dir, name, data);
+       });
+     }
+     tg.wait();
+  }
+
 };
 
 
 TEST_F(DirectoryTest, ramdir) {
   RAMDir dir;
   doDir(dir);
+}
+
+TEST_F(DirectoryTest, ramdirThreads) {
+  RAMDir dir;
+  doDirThreaded(dir);
 }

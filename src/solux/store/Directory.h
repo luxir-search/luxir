@@ -25,7 +25,7 @@ public:
   virtual void finishFile(File &file) = 0;
 };
 
-// TODO: currently not thread safe
+
 class RAMDir : public Directory {
 public:
   using OutputFileType = RAMFile;
@@ -35,6 +35,7 @@ public:
 private:
   using entry_type = std::pair<std::string, InputReferenceType>;
   using iterator_type = std::vector<entry_type>::iterator;
+  std::mutex mutex;
 
   // RAMDir uses a sorted vector to minimize the additional space requirements when there are tons of directories.
   // Insertion will be fast since files are also generally produced in sorted order (although removing old ones will be slightly slower)
@@ -50,9 +51,16 @@ private:
   }
 
 public:
+  RAMDir() = default;
 
+  // Only used by tests to clear (e.g. dir = RAMDir())
+  void operator=(RAMDir&& other) {
+    std::lock_guard<std::mutex> lock(mutex);
+    files = std::move(other.files);
+  }
 
   void listFiles(std::vector<std::string> &target) override {
+    std::lock_guard<std::mutex> lock(mutex);
     target.reserve(files.size());
     for (const auto&[name, ifile] : files) {
       target.push_back(name);
@@ -60,6 +68,7 @@ public:
   }
 
   std::shared_ptr<InputFile> openFile(const std::string_view &name) override {
+    std::lock_guard<std::mutex> lock(mutex);
     auto[found, iter] = find(name);
     if (found) {
       return iter->second;
@@ -69,6 +78,7 @@ public:
   }
 
   bool deleteFile(const std::string_view &name) override {
+    std::lock_guard<std::mutex> lock(mutex);
     auto[found, iter] = find(name);
     if (found) {
       files.erase(iter);
@@ -90,22 +100,26 @@ public:
     ramFile.copyTo(singleBuffer.get());
     auto inputFile = std::make_shared<RAMInputFile>(std::move(singleBuffer), sz);
 
-    // See if new file name is greater than all others produced (this is common by design)
-    if (files.empty() || files.back().first < file.name()) {
-      files.emplace_back(file.name(), std::move(inputFile));
-    } else {
-      auto[found, iter] = find(file.name());
-      if (found) {
-        // overwrite
-        *iter = {file.name(), std::move(inputFile)};
+    {
+      std::lock_guard<std::mutex> lock(mutex);
+      // See if new file name is greater than all others produced (this is common by design)
+      if (files.empty() || files.back().first < file.name()) {
+        files.emplace_back(file.name(), std::move(inputFile));
       } else {
-        // insert
-        files.insert(iter, {file.name(), std::move(inputFile)});
+        auto [found, iter] = find(file.name());
+        if (found) {
+          // overwrite
+          *iter = {file.name(), std::move(inputFile)};
+        } else {
+          // insert
+          files.insert(iter, {file.name(), std::move(inputFile)});
+        }
       }
     }
   }
 
   int64_t totalFileSize() {
+    std::lock_guard<std::mutex> lock(mutex);
     int64_t totalSize = 0;
     for (const auto&[name, ifile] : files) {
       totalSize += ifile->size();
