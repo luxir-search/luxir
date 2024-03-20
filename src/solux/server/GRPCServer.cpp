@@ -623,6 +623,7 @@ public:
     updateMessage.req = &request;
     updateMessage.commit = true;
     updateMessage.callback = [&blocker](UpdateMessage* updateMessage) {
+      unused(updateMessage);
       // LOG_DEBUG("callback msg={}", (void*)updateMessage);
       blocker.notify();
     };
@@ -667,7 +668,7 @@ public:
   }
 
   bool handleRequest(proto::UpdateRequest* request) override {
-    auto* arena = request->GetArena();
+    // auto* arena = request->GetArena();
 
     std::shared_ptr<Collection> collection;
 
@@ -703,7 +704,7 @@ public:
       // LOG_DEBUG("callback msg={}", (void*)updateMessage);
       // create response from request arena
       auto* arena = updateMessage->req->GetArena();
-      auto* response = arena->CreateMessage<proto::UpdateResponse>(arena);
+      auto* response = google::protobuf::Arena::CreateMessage<proto::UpdateResponse>(arena);
       auto& singleResponse = *response->add_responses();
       singleResponse.set_request_id(updateMessage->req->request_id());
 

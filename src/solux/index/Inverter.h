@@ -384,7 +384,7 @@ public:
       // ord vec must me 0 initialized since that is value that means "missing".
 
       textWriter.startField(&fieldInfo);
-      for (size_t tnum=0; tnum<numVals; tnum++) {
+      for (int32_t tnum=0; tnum<numVals; tnum++) {
         auto term = terms[tnum];
         textWriter.startTerm(term);
         // push all the docs for this term to the TextWriter, as well as record the ordinal for each doc

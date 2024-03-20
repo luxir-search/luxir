@@ -264,7 +264,7 @@ private:
         auto guard = writerPool.rewindScopeGuard();
         IntColWriter ordCol(writerPool, postingsWriter, outputFieldInfo);
         ordCol.startField();
-        for (int docid = 0; docid < docToOrd.size(); docid++) {
+        for (int32_t docid = 0; docid < (int32_t)docToOrd.size(); docid++) {
           int32_t ord = docToOrd[docid];
           if (ord != 0) {
             ordCol.addInt64(ord);
@@ -275,13 +275,13 @@ private:
         ordCol.finish();
       }
 
-      bool full = missingCount == 0 && docToOrd.size() == nDocs;
+      bool full = missingCount == 0 && (int32_t)docToOrd.size() == nDocs;
 
       {
         auto guard = writerPool.rewindScopeGuard();
         DocsWithValWriter docsWriter(writerPool, postingsWriter, outputFieldInfo);
         if (!full) {
-          for (int docid = 0; docid < docToOrd.size(); docid++) {
+          for (int32_t docid = 0; docid < (int32_t)docToOrd.size(); docid++) {
             int32_t ord = docToOrd[docid];
             if (ord != 0) {
               docsWriter.startDoc(docid);

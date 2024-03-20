@@ -53,6 +53,7 @@ TEST_F(GrpcSearchTest, basic) {
     google::protobuf::TextFormat::PrintToString(response, &resStr);
     GRPC_DEBUG("CLIENT RESULT:( {} )", resStr);
     auto& rsp = response.ops().at(key);  // make sure the key was unadulterated
+    ASSERT_TRUE(rsp.has_docs());
   }
 
   grpc::Status status = stream->Finish();

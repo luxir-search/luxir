@@ -253,9 +253,11 @@ void foo() {
   oneapi::tbb::flow::graph g;
   using MyNodeType = tbb::flow::multifunction_node<Blocker*, std::tuple<Blocker*>>;
   MyNodeType notifier2(g, tbb::flow::unlimited, [](Blocker* blocker, MyNodeType::output_ports_type& op) {
+    unused(op);
     blocker->notify();
   });
   MyNodeType notifier(g, tbb::flow::unlimited, [&](Blocker* blocker, MyNodeType::output_ports_type& op) {
+    unused(op);
     // std::this_thread::sleep_for(std::chrono::milliseconds(1));
     // blocker->notify();
     notifier2.try_put(blocker); // exercise more of the graph machinery

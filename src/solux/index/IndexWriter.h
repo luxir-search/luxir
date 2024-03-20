@@ -25,6 +25,9 @@ namespace solux {
 
 // An update message to be processed by the TBB update flow graph.
 // This was an inner class to IndexWriter, but it can't be forward declared in Inverter that way.
+// TODO: it may be more flexible to use inheritance here instead of a callback.  That would allow more
+// data members to be added as well as allowing to call back to the implementation to do the indexing
+// with an inverter (i.e. we could get the protobuf code out of IW).
 class UpdateMessage {
 public:
   // update protobuf message
@@ -185,6 +188,7 @@ public:
     // updates flow into the updateFinishNode in order which is single threaded and ensures that updates are finished in order.
     updateFinishNode = std::make_unique<UpdateMessageMultiFunc>(updateGraph, 1,
       [this](UpdateMessage* msg, UpdateMessageMultiFunc::output_ports_type& op) {
+         unused(op);
          this->finishUpdateBody(*msg);
          // std::get<0>(op).try_put(msg);
     });
@@ -197,7 +201,8 @@ public:
     // now the commit nodes
     segmentFlushNode = std::make_unique<InverterMultiFunc>(updateGraph, tbb::flow::unlimited,
       [this](Inverter* inverter, InverterMultiFunc::output_ports_type& op) {
-         this->segmentFlushBody(*inverter);
+        unused(op);
+        this->segmentFlushBody(*inverter);
     });
 
     commitSequencerNode = std::make_unique<tbb::flow::sequencer_node<UpdateMessage*> >(updateGraph,
@@ -208,7 +213,8 @@ public:
 
     commitFinishNode = std::make_unique<UpdateMessageMultiFunc>(updateGraph, 1,
       [this](UpdateMessage* msg, UpdateMessageMultiFunc::output_ports_type& op) {
-         this->finishCommitBody(*msg);
+        unused(op);
+        this->finishCommitBody(*msg);
          // std::get<0>(op).try_put(msg);
     });
 
