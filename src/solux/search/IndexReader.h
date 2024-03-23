@@ -38,6 +38,7 @@ public:
       segs.reserve(nsegs);
       for (int i=0; i<nsegs; i++) {
         auto s = segmentsIs.readStr();
+        int32_t nDocs = segmentsIs.readVint();
         std::shared_ptr<std::string> x;
         x.get();
         segs.emplace_back(std::move(std::make_shared<PostingsReader>(dir, s)), maxdoc, i);

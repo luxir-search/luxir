@@ -140,6 +140,7 @@ class PostingsWriter {
   Directory& directory;
   std::string segid;
   int32_t maxDoc;  // set by caller
+  int64_t sizeInBytes = 0; // total size of all files written
 public:
   MemPool pool;
 
@@ -183,6 +184,7 @@ public:
     // TODO: implement compound files for small files
 
     for (auto& dataFile : files) {
+      sizeInBytes += dataFile.out.size();
       dataFile.out.close();
       directory.finishFile(*dataFile.file);
     }
@@ -199,10 +201,15 @@ public:
     return maxDoc;
   }
 
+  int64_t getSizeInBytes() {
+    return sizeInBytes;
+  }
+
 private:
   void writeSegmentInfo() {
     assert(maxDoc >= 1);
     files[0].out.writeVint(maxDoc);
+    // TODO: write approx segment size?
     // Other info we should eventually write: version info, what other files are present, cfs info
   }
 

@@ -169,6 +169,10 @@ public:
       for (int i = 0; i < nSegs; i++) {
         auto s = segmentsIs.readStr();
         segs.emplace_back(SegInfo(s));
+        // having ndocs in the list of segments is redundant with info in the segment itself and may be removed later.
+        // for now it makes it easy to populate nDocs for merge decisions.
+        int32_t nDocs = segmentsIs.readVint();
+        segs.back().nDocs = nDocs;
       }
     }
 
@@ -330,7 +334,9 @@ public:
       // const std::lock_guard<std::mutex> lock(indexMutex);
       inverter.flush();
     }
-    std::string segid = inverter.getPostingsWriter().getSegId();
+
+    SegInfo segInfo(inverter.getPostingsWriter().getSegId());
+    segInfo.nDocs = inverter.getPostingsWriter().getMaxDoc();
 
     std::unique_ptr<Inverter> inverterPtr;
 
@@ -339,7 +345,7 @@ public:
       const std::lock_guard<std::mutex> lock(indexMutex);
 
       // segments are flushed in parallel, so the segids are not in order... (or in the completed order.) should be fine.
-      segs.emplace_back(segid);
+      segs.emplace_back(segInfo);
 
       // remove the inverter from the flushingInverters set, but remember it until the end of this function.
       auto it = flushingInverters.find(&inverter);
@@ -478,6 +484,7 @@ public:
     indexOut.writeVint(segs.size());
     for (auto &seg : segs) {
       indexOut.writeStr(seg.segId);
+      indexOut.writeVint(seg.nDocs); // TODO: remove this redundancy in the future?
     }
     indexOut.close();
     dir.finishFile(*indexFile);
