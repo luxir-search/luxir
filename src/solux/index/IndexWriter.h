@@ -47,7 +47,7 @@ public:
 /// The IndexWriter is a level above Inverter & PostingsWriter that coordinates
 /// indexing activity for a single index / directory.
 class IndexWriter {
-  // increment a base 36 string
+  // increment a base 36 string that is prefixed with the number of digits.
   void incrementGen(std::string &gen) {
     int index = gen.size() - 1;
     for (;;) {
@@ -72,12 +72,22 @@ class IndexWriter {
   std::mutex indexReaderMutex;
 
 public:
+  class SegInfo {
+  public:
+    std::string segId;
+    // write segment info (size,docs) segments file as well so we don't have to open the segment to determine it?
+    int64_t sizeInBytes = 0;
+    int32_t nDocs = 0;
+
+    SegInfo(std::string_view segId) : segId(segId) {}
+    // TODO: cache the postings reader here for deletes?
+  };
 
   Directory &dir;
   uint64_t gen;
 
   // segs is currently only used when writing the index info file.
-  std::vector<std::string> segs;  // all of the referenced segments (TODO: replace with something containing more info when needed)
+  std::vector<SegInfo> segs;
 
   std::shared_ptr<IndexReader> indexReader;
 
@@ -158,7 +168,7 @@ public:
       segs.reserve(nSegs);
       for (int i = 0; i < nSegs; i++) {
         auto s = segmentsIs.readStr();
-        segs.emplace_back(s);
+        segs.emplace_back(SegInfo(s));
       }
     }
 
@@ -467,7 +477,7 @@ public:
     indexOut.writeVlong(gen);
     indexOut.writeVint(segs.size());
     for (auto &seg : segs) {
-      indexOut.writeStr(seg);
+      indexOut.writeStr(seg.segId);
     }
     indexOut.close();
     dir.finishFile(*indexFile);
@@ -538,7 +548,7 @@ public:
     // update the list of segments... not safe currently
     // TODO: add unused segments to the "to be deleted" list
     segs.clear();
-    segs.push_back(genStr);
+    segs.emplace_back(SegInfo(genStr));
 
     writeIndexInfoFile();  // TODO: currently for testing... we wouldn't normally do this here.
   }
