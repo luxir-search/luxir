@@ -6,6 +6,7 @@
 #include <mutex>
 #include <span>
 #include "boost/unordered/unordered_flat_map.hpp"
+#include "boost/unordered/unordered_flat_set.hpp"
 #include "oneapi/tbb/flow_graph.h"
 #include "solux/store/Directory.h"
 #include "solux/store/OutputStream.h"
@@ -72,22 +73,50 @@ class IndexWriter {
   std::mutex indexReaderMutex;
 
 public:
+  // TODO TODO - should these be heap allocated so we can pass around pointers to them?
+  // TODO - contain an index that points back to their place in the array (easy removal?)
+  // TODO - be a *set* instead, just like idleInverters?
+  // TODO - is there a way to use boost::unordered_flat_set instead of map?
   class SegInfo {
   public:
     std::string segId;
     // write segment info (size,docs) segments file as well so we don't have to open the segment to determine it?
     int64_t sizeInBytes = 0;
     int32_t nDocs = 0;
+    int32_t mergeLevel = 0;
 
     SegInfo(std::string_view segId) : segId(segId) {}
     // TODO: cache the postings reader here for deletes?
   };
 
+
+  // Heterogeneous hasher
+  struct Hash {
+    using is_transparent = void;
+
+    // hash on unique_ptr<T> should be equivalent to hash on T*
+    template <class T>
+    size_t operator()(const T& t) const {
+      return std::hash<T>{}(t);
+    }
+  };
+
+  // Heterogeneous comparator
+  struct AddrEqual {
+    using is_transparent = void;
+    // heterogeneous compare for pointer types (i.e. raw pointers, smart pointers, etc.)
+    template <class T, class U>
+    bool operator()(const T& t, const U& u) const {
+      return std::to_address(t) == std::to_address(u);
+    }
+  };
+
+
   Directory &dir;
   uint64_t gen;
 
-  // segs is currently only used when writing the index info file.
-  std::vector<SegInfo> segs;
+  // currently protected by indexMutex
+  boost::unordered::unordered_flat_set<std::unique_ptr<SegInfo>, Hash, AddrEqual> segs;
 
   std::shared_ptr<IndexReader> indexReader;
 
@@ -168,11 +197,12 @@ public:
       segs.reserve(nSegs);
       for (int i = 0; i < nSegs; i++) {
         auto s = segmentsIs.readStr();
-        segs.emplace_back(SegInfo(s));
+        int32_t nDocs = segmentsIs.readVint();
         // having ndocs in the list of segments is redundant with info in the segment itself and may be removed later.
         // for now it makes it easy to populate nDocs for merge decisions.
-        int32_t nDocs = segmentsIs.readVint();
-        segs.back().nDocs = nDocs;
+        auto segInfo = std::make_unique<SegInfo>(s);
+        segInfo->nDocs = nDocs;
+        segs.emplace(std::move(segInfo));
       }
     }
 
@@ -335,8 +365,8 @@ public:
       inverter.flush();
     }
 
-    SegInfo segInfo(inverter.getPostingsWriter().getSegId());
-    segInfo.nDocs = inverter.getPostingsWriter().getMaxDoc();
+    auto segInfo = std::make_unique<SegInfo>(inverter.getPostingsWriter().getSegId());
+    segInfo->nDocs = inverter.getPostingsWriter().getMaxDoc();
 
     std::unique_ptr<Inverter> inverterPtr;
 
@@ -345,7 +375,7 @@ public:
       const std::lock_guard<std::mutex> lock(indexMutex);
 
       // segments are flushed in parallel, so the segids are not in order... (or in the completed order.) should be fine.
-      segs.emplace_back(segInfo);
+      segs.emplace(std::move(segInfo));
 
       // remove the inverter from the flushingInverters set, but remember it until the end of this function.
       auto it = flushingInverters.find(&inverter);
@@ -446,18 +476,7 @@ public:
     }
   }
 
-  // Currently only commits idle inverters!
-  // future strategy: record a list of busy inverters and flush them when they are released.
-  // Multiple commits in flight:
-  //   - index info files must be written in order
-  //      - can we dynamically make one commit task depend on the other?
-  //   - on a second commit, make sure we only flush inverters *not* marked to be flushed by other commits.
-  //   - on a commit, mark all inverters as to be flushed by this commit.
-  //   - segment merges may complete before or after, so the commit writes the latest list of segments.
-  //     - flushing small segments first could give an opportunity to merge them before the commit.
-  // we can have multiple commits in flight, but we need to make sure that
-  // the index info file is written in the correct order.
-
+  // TODO: this is test commit code.  Needs to migrate to use the TBB flow graph.
   void commit() {
     const std::lock_guard<std::mutex> lock(indexMutex);
     // TODO: can copy the map and then iterate over the copy to avoid holding the lock for too long
@@ -466,7 +485,9 @@ public:
       auto& inverter = *it->second;
       inverter.flush();
       std::string segid = inverter.getPostingsWriter().getSegId();
-      segs.emplace_back(segid);
+      auto segInfo = std::make_unique<SegInfo>(segid);
+      segInfo->nDocs = inverter.getPostingsWriter().getMaxDoc();
+      segs.emplace(std::move(segInfo));
       idleInverters.erase(it);
     }
     writeIndexInfoFile();
@@ -482,9 +503,28 @@ public:
 
     indexOut.writeVlong(gen);
     indexOut.writeVint(segs.size());
-    for (auto &seg : segs) {
-      indexOut.writeStr(seg.segId);
-      indexOut.writeVint(seg.nDocs); // TODO: remove this redundancy in the future?
+    // TODO: should we write out segments in order of size or creation?
+
+    // Sort the list of segments by the segId.
+    // Some tests rely on not reordering segments.
+    std::vector<SegInfo*> sortedSegs;
+    sortedSegs.reserve(this->segs.size());
+    for (auto& seg : this->segs) {
+      sortedSegs.push_back(seg.get());
+    }
+    std::sort(sortedSegs.begin(), sortedSegs.end(), [](const SegInfo* a, const SegInfo* b) {
+      /*
+      // first sort on number of documents (largest first), then on segment id (smallest first)
+      if (a->nDocs != b->nDocs) {
+        return a->nDocs > b->nDocs;
+      }
+       */
+      return a->segId < b->segId;
+    });
+
+    for (auto seg : sortedSegs) {
+      indexOut.writeStr(seg->segId);
+      indexOut.writeVint(seg->nDocs); // TODO: remove this redundancy in the future?
     }
     indexOut.close();
     dir.finishFile(*indexFile);
@@ -534,6 +574,63 @@ public:
     releaseInverter(inverter);
   }
 
+  // These should live in a merge policy presumably
+  int MERGE_FACTOR = 10;
+  int MERGE_DOCS_FLOOR = 1000;  // all segments below this will be counted as level 0
+  bool mergeRunning = false;
+
+  /*
+  // Limit ourselves to a single merge running at once.  If we want more parallelism,
+  // it would probably be desirable to just increase the parallelism within a single merge.
+  void maybeMergeSegments() {
+    std::vector<SegInfo> segsCopy;
+    {
+      const std::lock_guard<std::mutex> lock(indexMutex);
+      if (mergeRunning) {
+        return;
+      }
+      if (segs.size() < MERGE_FACTOR) {
+        return;
+      }
+
+      // calculate level for each segment
+      for (auto& seg : segs) {
+        if (seg.nDocs < MERGE_DOCS_FLOOR) {
+          seg.mergeLevel = 0;
+        } else {
+          seg.mergeLevel = 1;
+        }
+      }
+
+      // make a copy of the segment list and work on it with the lock released?
+      // Downside is that multiple threads may do this calculation at the same time... but it should only
+      // be called after a segment flush has completed, hence be pretty rare.
+      segsCopy = segs;
+    }
+
+    std::vector<int32_t> levelCounts(10);
+
+    // logM(x) = log2(x)/log2(M) where M is merge factor.  Calculate 1/log2(M) once and cache.
+    float inverseLogM = 1.0f / log2(MERGE_FACTOR);
+    for (auto& seg : segsCopy) {
+      // calculate the merge level
+      if (seg.nDocs < MERGE_DOCS_FLOOR) {
+        seg.mergeLevel = 0;
+      } else {
+        int32_t adjustedDocs = seg.nDocs - MERGE_DOCS_FLOOR + 1;
+        seg.mergeLevel = (int32_t) (log2(adjustedDocs) * inverseLogM);
+      }
+      if (seg.mergeLevel >= levelCounts.size()) {
+        levelCounts.resize(seg.mergeLevel + 1);
+      }
+      levelCounts[seg.mergeLevel]++;
+    }
+
+
+  }
+  */
+
+
   /// mostly for testing merge code currently... there is no concurrency control, etc.
   void mergeSegments() {
     // make sure we are getting the latest index reader (wasteful!)
@@ -555,7 +652,9 @@ public:
     // update the list of segments... not safe currently
     // TODO: add unused segments to the "to be deleted" list
     segs.clear();
-    segs.emplace_back(SegInfo(genStr));
+    auto segInfo = std::make_unique<SegInfo>(genStr);
+    segInfo->nDocs = pwriter.getMaxDoc();
+    segs.emplace(std::move(segInfo));
 
     writeIndexInfoFile();  // TODO: currently for testing... we wouldn't normally do this here.
   }
