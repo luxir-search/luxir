@@ -7,6 +7,7 @@
 #include <span>
 #include "boost/unordered/unordered_flat_map.hpp"
 #include "boost/unordered/unordered_flat_set.hpp"
+#include "boost/unordered/concurrent_flat_map.hpp"
 #include "oneapi/tbb/flow_graph.h"
 #include "solux/store/Directory.h"
 #include "solux/store/OutputStream.h"
@@ -73,10 +74,6 @@ class IndexWriter {
   std::mutex indexReaderMutex;
 
 public:
-  // TODO TODO - should these be heap allocated so we can pass around pointers to them?
-  // TODO - contain an index that points back to their place in the array (easy removal?)
-  // TODO - be a *set* instead, just like idleInverters?
-  // TODO - is there a way to use boost::unordered_flat_set instead of map?
   class SegInfo {
   public:
     std::string segId;
@@ -84,39 +81,32 @@ public:
     int64_t sizeInBytes = 0;
     int32_t nDocs = 0;
     int32_t mergeLevel = 0;
+    bool merging = false;  // set to true when a merge is in progress with this segment as input.
+
+    // atomic shared pointer since it could be set / mutated by either the IW (setting or clearing),
+    // or by IndexReader opening code.
+    std::atomic<std::shared_ptr<PostingsReader>> sharedPostingsReader;
 
     SegInfo(std::string_view segId) : segId(segId) {}
     // TODO: cache the postings reader here for deletes?
   };
 
-
-  // Heterogeneous hasher
-  struct Hash {
-    using is_transparent = void;
-
-    // hash on unique_ptr<T> should be equivalent to hash on T*
-    template <class T>
-    size_t operator()(const T& t) const {
-      return std::hash<T>{}(t);
-    }
-  };
-
-  // Heterogeneous comparator
-  struct AddrEqual {
-    using is_transparent = void;
-    // heterogeneous compare for pointer types (i.e. raw pointers, smart pointers, etc.)
-    template <class T, class U>
-    bool operator()(const T& t, const U& u) const {
-      return std::to_address(t) == std::to_address(u);
-    }
+  // TODO: perhaps make this a subclass of UpdateMessage?  This may make it easier to expose merge requests through
+  // the gRPC API.
+  class MergeMessage {
+  public:
+    std::vector<SegInfo*> segs; // the segments to merge
+    std::function<void(UpdateMessage*)> callback;    // Called after the merge has completed.
   };
 
 
   Directory &dir;
   uint64_t gen;
 
-  // currently protected by indexMutex
-  boost::unordered::unordered_flat_set<std::unique_ptr<SegInfo>, Hash, AddrEqual> segs;
+  // This was made a concurrent map so that postings readers can be easily shared to open
+  // new IndexReaders.  Modification of the map is still currently protected by the indexMutex
+  // since the original code was written that way.
+  boost::unordered::concurrent_flat_map<std::string, std::unique_ptr<SegInfo>> segInfoMap;
 
   std::shared_ptr<IndexReader> indexReader;
 
@@ -178,6 +168,9 @@ public:
   std::unique_ptr<tbb::flow::sequencer_node<UpdateMessage*> > commitSequencerNode;
   std::unique_ptr<UpdateMessageMultiFunc> commitFinishNode;
 
+  using MergeMessageMultiFunc = tbb::flow::multifunction_node<MergeMessage, std::tuple<void*>>;
+  std::unique_ptr<MergeMessageMultiFunc> mergeSegmentsNode;
+
   ~IndexWriter() {
     // without this, in gcc release mode we can get a crash when the IndexWriter is destroyed, even when
     // the graph wasn't used. Presumably because the test was so fast and there was some async initialization
@@ -194,7 +187,7 @@ public:
       InputStream segmentsIs = segFile->getInputStream();
       gen = segmentsIs.readVlong();
       int nSegs = segmentsIs.readVint();
-      segs.reserve(nSegs);
+      segInfoMap.reserve(nSegs);
       for (int i = 0; i < nSegs; i++) {
         auto s = segmentsIs.readStr();
         int32_t nDocs = segmentsIs.readVint();
@@ -202,7 +195,7 @@ public:
         // for now it makes it easy to populate nDocs for merge decisions.
         auto segInfo = std::make_unique<SegInfo>(s);
         segInfo->nDocs = nDocs;
-        segs.emplace(std::move(segInfo));
+        segInfoMap.emplace(segInfo->segId, std::move(segInfo));
       }
     }
 
@@ -263,6 +256,13 @@ public:
     });
 
     tbb::flow::make_edge(*commitSequencerNode, *commitFinishNode);
+
+    // single threaded
+    mergeSegmentsNode = std::make_unique<MergeMessageMultiFunc>(updateGraph, 1,
+      [this](MergeMessage msg, MergeMessageMultiFunc::output_ports_type& op) {
+        unused(op);
+        this->mergeSegmentsBody(msg);
+    });
   }
 
   void startUpdateBody(UpdateMessage& msg) {
@@ -375,7 +375,7 @@ public:
       const std::lock_guard<std::mutex> lock(indexMutex);
 
       // segments are flushed in parallel, so the segids are not in order... (or in the completed order.) should be fine.
-      segs.emplace(std::move(segInfo));
+      segInfoMap.emplace(segInfo->segId, std::move(segInfo));
 
       // remove the inverter from the flushingInverters set, but remember it until the end of this function.
       auto it = flushingInverters.find(&inverter);
@@ -487,7 +487,7 @@ public:
       std::string segid = inverter.getPostingsWriter().getSegId();
       auto segInfo = std::make_unique<SegInfo>(segid);
       segInfo->nDocs = inverter.getPostingsWriter().getMaxDoc();
-      segs.emplace(std::move(segInfo));
+      segInfoMap.emplace(segInfo->segId, std::move(segInfo));
       idleInverters.erase(it);
     }
     writeIndexInfoFile();
@@ -501,17 +501,17 @@ public:
     OutputStream indexOut;
     indexOut.setFile(&*indexFile);
 
-    indexOut.writeVlong(gen);
-    indexOut.writeVint(segs.size());
+
     // TODO: should we write out segments in order of size or creation?
 
     // Sort the list of segments by the segId.
     // Some tests rely on not reordering segments.
     std::vector<SegInfo*> sortedSegs;
-    sortedSegs.reserve(this->segs.size());
-    for (auto& seg : this->segs) {
-      sortedSegs.push_back(seg.get());
-    }
+    sortedSegs.reserve(this->segInfoMap.size());
+    segInfoMap.visit_all([&sortedSegs](auto& elem) {
+      sortedSegs.push_back(elem.second.get());
+    });
+
     std::sort(sortedSegs.begin(), sortedSegs.end(), [](const SegInfo* a, const SegInfo* b) {
       /*
       // first sort on number of documents (largest first), then on segment id (smallest first)
@@ -522,6 +522,8 @@ public:
       return a->segId < b->segId;
     });
 
+    indexOut.writeVlong(gen);
+    indexOut.writeVint(sortedSegs.size());
     for (auto seg : sortedSegs) {
       indexOut.writeStr(seg->segId);
       indexOut.writeVint(seg->nDocs); // TODO: remove this redundancy in the future?
@@ -575,60 +577,104 @@ public:
   }
 
   // These should live in a merge policy presumably
-  int MERGE_FACTOR = 10;
-  int MERGE_DOCS_FLOOR = 1000;  // all segments below this will be counted as level 0
+  uint32_t MERGE_FACTOR = 10;
+  uint32_t MERGE_DOCS_FLOOR = 1000;  // all segments below this will be counted as level 0
   bool mergeRunning = false;
 
-  /*
-  // Limit ourselves to a single merge running at once.  If we want more parallelism,
-  // it would probably be desirable to just increase the parallelism within a single merge.
+
+  // TODO: we could alternately pass in the last segment flushed to speed up the merge decision.
+  // Merges should be asynchronous... i.e. they should not block the calling thread, a commit, or any updates.
   void maybeMergeSegments() {
-    std::vector<SegInfo> segsCopy;
+    std::vector<SegInfo*> segsCopy;
     {
       const std::lock_guard<std::mutex> lock(indexMutex);
       if (mergeRunning) {
         return;
       }
-      if (segs.size() < MERGE_FACTOR) {
+      if (segInfoMap.size() < MERGE_FACTOR) {
         return;
       }
+      // Make a copy of the segment list and work on it with the lock released?
+      // No... not with pointers since a merge could both kick off and delete segments before we continue.
+      // We could set mergeRunning to true and then release the lock and work on the copy.
+      mergeRunning = true;
 
-      // calculate level for each segment
-      for (auto& seg : segs) {
-        if (seg.nDocs < MERGE_DOCS_FLOOR) {
-          seg.mergeLevel = 0;
-        } else {
-          seg.mergeLevel = 1;
-        }
-      }
-
-      // make a copy of the segment list and work on it with the lock released?
-      // Downside is that multiple threads may do this calculation at the same time... but it should only
-      // be called after a segment flush has completed, hence be pretty rare.
-      segsCopy = segs;
+      segsCopy.reserve(this->segInfoMap.size());
+      segInfoMap.visit_all([&segsCopy](auto& elem) {
+        segsCopy.push_back(elem.second.get());
+      });
     }
 
-    std::vector<int32_t> levelCounts(10);
+    int32_t mergeLevel = -1;
+    int32_t level0 = 0;
 
-    // logM(x) = log2(x)/log2(M) where M is merge factor.  Calculate 1/log2(M) once and cache.
-    float inverseLogM = 1.0f / log2(MERGE_FACTOR);
-    for (auto& seg : segsCopy) {
-      // calculate the merge level
-      if (seg.nDocs < MERGE_DOCS_FLOOR) {
-        seg.mergeLevel = 0;
-      } else {
-        int32_t adjustedDocs = seg.nDocs - MERGE_DOCS_FLOOR + 1;
-        seg.mergeLevel = (int32_t) (log2(adjustedDocs) * inverseLogM);
+    // first try common case of a 0 level merge
+    for (auto seg : segsCopy) {
+      if (seg->nDocs < MERGE_DOCS_FLOOR) {
+        level0++;
       }
-      if (seg.mergeLevel >= levelCounts.size()) {
-        levelCounts.resize(seg.mergeLevel + 1);
+    }
+
+    if (level0 >= MERGE_FACTOR) {
+      mergeLevel = 0;
+    } else if (level0 < MERGE_FACTOR && segsCopy.size() >= level0 + MERGE_FACTOR) {
+      // look for merges at all levels
+      std::vector<int32_t> levelCounts;
+      // logM(x) = log2(x)/log2(M) where M is merge factor.  Calculate 1/log2(M) once and cache.
+      float inverseLogM = 1.0f / log2(MERGE_FACTOR);
+      for (auto& seg : segsCopy) {
+        // calculate the merge level
+        if (seg->nDocs < MERGE_DOCS_FLOOR) {
+          seg->mergeLevel = 0;
+        } else {
+          int32_t adjustedDocs = seg->nDocs - MERGE_DOCS_FLOOR + 1;
+          seg->mergeLevel = (int32_t) (log2(adjustedDocs) * inverseLogM);
+        }
+        if (seg->mergeLevel >= levelCounts.size()) {
+          levelCounts.resize(seg->mergeLevel + 1);
+        }
+        levelCounts[seg->mergeLevel]++;
       }
-      levelCounts[seg.mergeLevel]++;
+
+      int32_t mergeLevel = -1;
+      for (int i = 0; i < levelCounts.size(); i++) {
+        if (levelCounts[i] >= MERGE_FACTOR) {
+          mergeLevel = i;
+          break;
+        }
+      }
+    }
+
+    if (mergeLevel < 0) {
+      // no merge needed
+      const std::lock_guard<std::mutex> lock(indexMutex);
+      mergeRunning = false;
+      return;
+    }
+  }
+
+  // called from the mergeSegmentsNode which has concurrency==1 (single-threaded)
+  // This is passed SegInfo pointers, which should be safe since the only place where segments
+  // are currently deleted is via a merge.
+  // FUTURE: what if we want to be able to drop all segments or drop certain segments.  Frame that as a merge to
+  // maintain that invariant?
+  void mergeSegmentsBody(MergeMessage& msg) {
+    std::shared_ptr<IndexReader> reader;
+    // make sure we are getting the latest index reader (wasteful!)
+    {
+      const std::lock_guard<std::mutex> lock(indexReaderMutex);
+      indexReader.reset();
+      reader = getIndexReader();
+    }
+
+    std::vector<PostingsReader*> preaders;
+    preaders.reserve(msg.segs.size());
+    for (auto segInfo : msg.segs) {
+
     }
 
 
   }
-  */
 
 
   /// mostly for testing merge code currently... there is no concurrency control, etc.
@@ -651,10 +697,10 @@ public:
 
     // update the list of segments... not safe currently
     // TODO: add unused segments to the "to be deleted" list
-    segs.clear();
+    segInfoMap.clear();
     auto segInfo = std::make_unique<SegInfo>(genStr);
     segInfo->nDocs = pwriter.getMaxDoc();
-    segs.emplace(std::move(segInfo));
+    segInfoMap.emplace(segInfo->segId, std::move(segInfo));
 
     writeIndexInfoFile();  // TODO: currently for testing... we wouldn't normally do this here.
   }
