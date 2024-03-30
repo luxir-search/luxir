@@ -168,16 +168,17 @@ public:
 
   Postings postings; // for codecs... temporary since they aren't necessarily thread safe?
 
-  // used as a sentinal value for docs and positions iterators in a single segment.
+  // used as a sentinel value for docs and positions iterators in a single segment.
   static constexpr int32_t END = std::numeric_limits<int32_t>::max();
 
   // TODO temporary... this will likely be done at a higher level?
-  explicit PostingsReader(Directory& dir, std::string_view gen) {
+  explicit PostingsReader(Directory& dir, uint64_t segId) {
     int nFiles = 7;
     files.reserve(nFiles);
     inputStreams.reserve(nFiles);
 
-    auto segInfoFile = Postings::getIndexFileName(gen, 0);
+    std::string segStr = Postings::getSortableString(segId);
+    auto segInfoFile = Postings::getIndexFileName(segStr, 0);
     files.emplace_back(dir.openFile(segInfoFile));
     if (files.back().get() == nullptr) {
       LOG_ERROR("Can't find/open first segment file {}", segInfoFile);
@@ -189,7 +190,7 @@ public:
     maxdoc = firstIS.readVint();  // TODO first file is currently just the seg file... that will change shortly!
 
     for (int i=1; i<nFiles; i++) {
-      files.emplace_back(dir.openFile(Postings::getIndexFileName(gen, i)));
+      files.emplace_back(dir.openFile(Postings::getIndexFileName(segStr, i)));
       inputStreams.emplace_back(files.back()->getInputStream());
     }
   }

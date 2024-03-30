@@ -138,11 +138,11 @@ namespace solux {
 
 class PostingsWriter {
   Directory& directory;
-  std::string segid;
   int32_t maxDoc;  // set by caller
   int64_t sizeInBytes = 0; // total size of all files written
 public:
   MemPool pool;
+  uint64_t segId;
 
   struct DataFile {
     OutputStream out;
@@ -158,21 +158,22 @@ public:
   std::deque<IndexFieldInfo> fieldInfos;
 
 public:
-  PostingsWriter(Directory& dir, std::string_view segid, int32_t maxDoc=-1) : directory(dir), segid(segid), maxDoc(maxDoc)
+  PostingsWriter(Directory& dir, uint64_t segId, int32_t maxDoc=-1) : directory(dir), maxDoc(maxDoc), segId(segId)
   {
     // TODO: defer file creation until needed, *or* use a RAMDelegatingFile that does so.
     // that does so.
 
+    std::string segStr = Postings::getSortableString(segId);
     for (uint32_t i=0; i<7; i++) {
-      std::unique_ptr<File> file = directory.createFile(Postings::getIndexFileName(segid, i));
+      std::unique_ptr<File> file = directory.createFile(Postings::getIndexFileName(segStr, i));
       files.emplace_back(DataFile{OutputStream{},std::move(file), i});
       files.back().out.setFile( files.back().file.get());
       files.back().out.streamNumber = i;
     }
   }
 
-  const std::string& getSegId() const {
-    return segid;
+  uint64_t getSegId() const {
+    return segId;
   }
 
   void finish() {

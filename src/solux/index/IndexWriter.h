@@ -72,11 +72,12 @@ class IndexWriter {
 
   std::mutex indexMutex;
   std::mutex indexReaderMutex;
+  std::mutex segInfoMutex;
 
 public:
   class SegInfo {
   public:
-    std::string segId;
+    uint64_t segId;
     // write segment info (size,docs) segments file as well so we don't have to open the segment to determine it?
     int64_t sizeInBytes = 0;
     int32_t nDocs = 0;
@@ -87,8 +88,7 @@ public:
     // or by IndexReader opening code.
     std::atomic<std::shared_ptr<PostingsReader>> sharedPostingsReader;
 
-    SegInfo(std::string_view segId) : segId(segId) {}
-    // TODO: cache the postings reader here for deletes?
+    SegInfo(uint64_t segId, int nDocs) : segId(segId), nDocs(nDocs) {}
   };
 
   // TODO: perhaps make this a subclass of UpdateMessage?  This may make it easier to expose merge requests through
@@ -96,21 +96,26 @@ public:
   class MergeMessage {
   public:
     std::vector<SegInfo*> segs; // the segments to merge
-    std::function<void(UpdateMessage*)> callback;    // Called after the merge has completed.
+    std::function<void(MergeMessage*)> callback;    // Called after the merge has completed.
   };
 
+  Directory& dir;
+  std::atomic_uint64_t gen;  // the last segId generated
 
-  Directory &dir;
-  uint64_t gen;
-
-  // This was made a concurrent map so that postings readers can be easily shared to open
-  // new IndexReaders.  Modification of the map is still currently protected by the indexMutex
-  // since the original code was written that way.
-  boost::unordered::concurrent_flat_map<std::string, std::unique_ptr<SegInfo>> segInfoMap;
+  // Tracks current segments in the index.  Keyed by uint64_t segId.
+  // There needs to be higher level protection for transactions like replacing N segments with a new merged segment.
+  // Protected by segInfoMutex.
+  boost::unordered::unordered_flat_map<uint64_t, std::unique_ptr<SegInfo>> segInfos;
+  // boost::unordered::unordered_flat_set<std::unique_ptr<SegInfo>, SegIdHash, SegIdEqual> segInfos;
+  // boost::unordered::unordered_flat_set can't currently be used because it lacks an extract() method, which is
+  // the only way of removing a move-only object from the set.
 
   std::shared_ptr<IndexReader> indexReader;
 
+  // In the future, we way want to get an inverter by segment id (delete handling?).
+  // We could convert to unordered_flat_set keyed by uint64_t segId, just like segInfos.
   // protected by indexMutex
+  // If we don't need to look up by segment id, we could just use a vector for idleInverters.
   boost::unordered_flat_map<Inverter*, std::unique_ptr<Inverter>> idleInverters;
   boost::unordered_flat_map<Inverter*, std::unique_ptr<Inverter>> busyInverters;
   boost::unordered_flat_map<Inverter*, std::unique_ptr<Inverter>> flushingInverters;
@@ -186,16 +191,14 @@ public:
     } else {
       InputStream segmentsIs = segFile->getInputStream();
       gen = segmentsIs.readVlong();
-      int nSegs = segmentsIs.readVint();
-      segInfoMap.reserve(nSegs);
-      for (int i = 0; i < nSegs; i++) {
-        auto s = segmentsIs.readStr();
+      auto nSegs = segmentsIs.readVint();
+      segInfos.reserve(nSegs);
+      for (auto i = 0u; i < nSegs; i++) {
+        auto segId = segmentsIs.readVlong();
         int32_t nDocs = segmentsIs.readVint();
         // having ndocs in the list of segments is redundant with info in the segment itself and may be removed later.
         // for now it makes it easy to populate nDocs for merge decisions.
-        auto segInfo = std::make_unique<SegInfo>(s);
-        segInfo->nDocs = nDocs;
-        segInfoMap.emplace(segInfo->segId, std::move(segInfo));
+        segInfos.emplace(segId, std::make_unique<SegInfo>(segId, nDocs));
       }
     }
 
@@ -365,8 +368,7 @@ public:
       inverter.flush();
     }
 
-    auto segInfo = std::make_unique<SegInfo>(inverter.getPostingsWriter().getSegId());
-    segInfo->nDocs = inverter.getPostingsWriter().getMaxDoc();
+    auto segInfo = std::make_unique<SegInfo>(inverter.getPostingsWriter().segId, inverter.getPostingsWriter().getMaxDoc());
 
     std::unique_ptr<Inverter> inverterPtr;
 
@@ -375,7 +377,7 @@ public:
       const std::lock_guard<std::mutex> lock(indexMutex);
 
       // segments are flushed in parallel, so the segids are not in order... (or in the completed order.) should be fine.
-      segInfoMap.emplace(segInfo->segId, std::move(segInfo));
+      segInfos.emplace(segInfo->segId, std::move(segInfo));
 
       // remove the inverter from the flushingInverters set, but remember it until the end of this function.
       auto it = flushingInverters.find(&inverter);
@@ -461,9 +463,7 @@ public:
   Inverter& obtainInverter() {
     const std::lock_guard<std::mutex> lock(indexMutex);
     if (idleInverters.empty()) {
-      gen++;
-      std::string genStr = Postings::getSortableString(gen);
-      auto newInverter = std::make_unique<Inverter>(dir, genStr);
+      auto newInverter = std::make_unique<Inverter>(dir, ++gen);
       Inverter* newInverterPtr = newInverter.get();
       busyInverters.emplace(newInverterPtr, std::move(newInverter));
       return *newInverterPtr;
@@ -484,10 +484,7 @@ public:
       auto it = idleInverters.begin();
       auto& inverter = *it->second;
       inverter.flush();
-      std::string segid = inverter.getPostingsWriter().getSegId();
-      auto segInfo = std::make_unique<SegInfo>(segid);
-      segInfo->nDocs = inverter.getPostingsWriter().getMaxDoc();
-      segInfoMap.emplace(segInfo->segId, std::move(segInfo));
+      segInfos.emplace(inverter.getPostingsWriter().segId, std::make_unique<SegInfo>(inverter.getPostingsWriter().segId, inverter.getPostingsWriter().getMaxDoc()));
       idleInverters.erase(it);
     }
     writeIndexInfoFile();
@@ -507,10 +504,10 @@ public:
     // Sort the list of segments by the segId.
     // Some tests rely on not reordering segments.
     std::vector<SegInfo*> sortedSegs;
-    sortedSegs.reserve(this->segInfoMap.size());
-    segInfoMap.visit_all([&sortedSegs](auto& elem) {
-      sortedSegs.push_back(elem.second.get());
-    });
+    sortedSegs.reserve(segInfos.size());
+    for (auto& seg : segInfos) {
+      sortedSegs.push_back(seg.second.get());
+    }
 
     std::sort(sortedSegs.begin(), sortedSegs.end(), [](const SegInfo* a, const SegInfo* b) {
       /*
@@ -525,7 +522,7 @@ public:
     indexOut.writeVlong(gen);
     indexOut.writeVint(sortedSegs.size());
     for (auto seg : sortedSegs) {
-      indexOut.writeStr(seg->segId);
+      indexOut.writeVlong(seg->segId);
       indexOut.writeVint(seg->nDocs); // TODO: remove this redundancy in the future?
     }
     indexOut.close();
@@ -577,8 +574,8 @@ public:
   }
 
   // These should live in a merge policy presumably
-  uint32_t MERGE_FACTOR = 10;
-  uint32_t MERGE_DOCS_FLOOR = 1000;  // all segments below this will be counted as level 0
+  int32_t MERGE_FACTOR = 10;
+  int32_t MERGE_DOCS_FLOOR = 1000;  // all segments below this will be counted as level 0
   bool mergeRunning = false;
 
 
@@ -591,7 +588,7 @@ public:
       if (mergeRunning) {
         return;
       }
-      if (segInfoMap.size() < MERGE_FACTOR) {
+      if ((int)segInfos.size() < MERGE_FACTOR) {
         return;
       }
       // Make a copy of the segment list and work on it with the lock released?
@@ -599,10 +596,10 @@ public:
       // We could set mergeRunning to true and then release the lock and work on the copy.
       mergeRunning = true;
 
-      segsCopy.reserve(this->segInfoMap.size());
-      segInfoMap.visit_all([&segsCopy](auto& elem) {
-        segsCopy.push_back(elem.second.get());
-      });
+      segsCopy.reserve(segInfos.size());
+      for (auto& seg : segInfos) {
+        segsCopy.push_back(seg.second.get());
+      }
     }
 
     int32_t mergeLevel = -1;
@@ -617,7 +614,7 @@ public:
 
     if (level0 >= MERGE_FACTOR) {
       mergeLevel = 0;
-    } else if (level0 < MERGE_FACTOR && segsCopy.size() >= level0 + MERGE_FACTOR) {
+    } else if (level0 < MERGE_FACTOR && (int)segsCopy.size() >= level0 + MERGE_FACTOR) {
       // look for merges at all levels
       std::vector<int32_t> levelCounts;
       // logM(x) = log2(x)/log2(M) where M is merge factor.  Calculate 1/log2(M) once and cache.
@@ -630,14 +627,13 @@ public:
           int32_t adjustedDocs = seg->nDocs - MERGE_DOCS_FLOOR + 1;
           seg->mergeLevel = (int32_t) (log2(adjustedDocs) * inverseLogM);
         }
-        if (seg->mergeLevel >= levelCounts.size()) {
+        if (seg->mergeLevel >= (int)levelCounts.size()) {
           levelCounts.resize(seg->mergeLevel + 1);
         }
         levelCounts[seg->mergeLevel]++;
       }
 
-      int32_t mergeLevel = -1;
-      for (int i = 0; i < levelCounts.size(); i++) {
+      for (auto i = 0u; i < levelCounts.size(); i++) {
         if (levelCounts[i] >= MERGE_FACTOR) {
           mergeLevel = i;
           break;
@@ -659,21 +655,61 @@ public:
   // FUTURE: what if we want to be able to drop all segments or drop certain segments.  Frame that as a merge to
   // maintain that invariant?
   void mergeSegmentsBody(MergeMessage& msg) {
-    std::shared_ptr<IndexReader> reader;
-    // make sure we are getting the latest index reader (wasteful!)
     {
-      const std::lock_guard<std::mutex> lock(indexReaderMutex);
-      indexReader.reset();
-      reader = getIndexReader();
+      // grab or open all of the postings readers
+      std::vector<std::shared_ptr<PostingsReader>> preaders;
+      preaders.reserve(msg.segs.size());
+      for (auto segInfo: msg.segs) {
+        preaders.emplace_back(segInfo->sharedPostingsReader.load());
+        if (!preaders.back()) {
+          preaders.back() = std::make_shared<PostingsReader>(dir, segInfo->segId);
+          segInfo->sharedPostingsReader.store(preaders.back());
+        }
+      }
+
+      MemPool pool;
+
+      // copy the preaders to a vector of pointers for our underlying merge code.
+      std::vector<PostingsReader*> preaderPtrs;
+      preaderPtrs.reserve(preaders.size());
+      for (auto& preader : preaders) {
+        preaderPtrs.push_back(preader.get());
+      }
+
+      PostingsWriter pwriter(dir, ++gen);
+      mergeSegments(pool, preaderPtrs, pwriter);
+
+      // now remove the merged segments from the segInfos and add the new segment.
+      // Any removed segments that were not part of a previous commit can be deleted immediately.
+      // If segments were part of a previous commit, then we need to write out a new info file *before* removing the index files.
+      // Example scenario: merge starts, commit happens, merge finishes, crash.
+      std::vector<std::unique_ptr<SegInfo>> removedSegs;
+      {
+        const std::lock_guard<std::mutex> lock(indexMutex);
+        for (auto segInfo : msg.segs) {
+          auto it = segInfos.find(segInfo->segId);
+          assert(it != segInfos.end());
+          if (it == segInfos.end()) {
+            LOG_ERROR("Segment not found in segInfos.");
+            assert(false);
+          }
+          removedSegs.emplace_back(std::move(it->second));
+          segInfos.erase(it);
+        }
+
+        // Create & add the new SegmentInfo
+        segInfos.emplace(pwriter.getSegId(), std::make_unique<SegInfo>(pwriter.getSegId(), pwriter.getMaxDoc()));
+
+        // write the new index info file
+        writeIndexInfoFile();
+      }
+
+
+    } // end of scope for preaders, pool, and pwriter
+
+    if (msg.callback) {
+      msg.callback(&msg);
     }
-
-    std::vector<PostingsReader*> preaders;
-    preaders.reserve(msg.segs.size());
-    for (auto segInfo : msg.segs) {
-
-    }
-
-
   }
 
 
@@ -688,19 +724,16 @@ public:
       preaders.push_back(&seg.postingsReader());
     }
     // we could calc maxdoc at this point...
-    gen++;  // TODO: not thread safe or logic safe with rest of IW
-    auto genStr = Postings::getSortableString(gen);
-    PostingsWriter pwriter(dir, genStr);
+    uint64_t segId = gen++;
+    PostingsWriter pwriter(dir, segId);
 
     MemPool pool;
     mergeSegments(pool, preaders, pwriter);
 
     // update the list of segments... not safe currently
     // TODO: add unused segments to the "to be deleted" list
-    segInfoMap.clear();
-    auto segInfo = std::make_unique<SegInfo>(genStr);
-    segInfo->nDocs = pwriter.getMaxDoc();
-    segInfoMap.emplace(segInfo->segId, std::move(segInfo));
+    segInfos.clear();
+    segInfos.emplace(segId, std::make_unique<SegInfo>(segId, pwriter.getMaxDoc()));
 
     writeIndexInfoFile();  // TODO: currently for testing... we wouldn't normally do this here.
   }

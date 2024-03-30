@@ -29,7 +29,7 @@ public:
   IndexReader(Directory& dir) {
     std::shared_ptr<InputFile> inputFile = dir.openFile(Postings::INDEX_INFO_FILE);
     if (inputFile == nullptr) {
-      // throw exception, or just have zero segments?
+      // throw exception, or just have zero segments? Or a single segment with no docs?
       LOG_DEBUG("Empty IndexReader");
     } else {
       InputStream segmentsIs = inputFile->getInputStream();
@@ -37,11 +37,9 @@ public:
       int nsegs = segmentsIs.readVint();
       segs.reserve(nsegs);
       for (int i=0; i<nsegs; i++) {
-        auto s = segmentsIs.readStr();
+        uint64_t segId = segmentsIs.readVlong();
         int32_t nDocs = segmentsIs.readVint();
-        std::shared_ptr<std::string> x;
-        x.get();
-        segs.emplace_back(std::move(std::make_shared<PostingsReader>(dir, s)), maxdoc, i);
+        segs.emplace_back(std::make_shared<PostingsReader>(dir, segId), maxdoc, i);
         maxdoc += segs.back().postingsReader().numDocs();
       }
     }

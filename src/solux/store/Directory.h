@@ -6,6 +6,7 @@
 
 namespace solux {
 
+// Implementations of Directory are thread safe.
 class Directory {
 public:
   // TODO: add a prefix option?
@@ -40,6 +41,8 @@ private:
   // RAMDir uses a sorted vector to minimize the additional space requirements when there are tons of directories.
   // Insertion will be fast since files are also generally produced in sorted order (although removing old ones will be slightly slower)
   // We should still benchmark (time and space) vs a good ordered_map implementation in the future though.
+  // TODO: bulk operations (open/delete) could be done more efficiently (by prefix)
+  // TODO: C++23 has a std::flat_set now (as does boost), so we could use that.
   std::vector<entry_type> files;
 
   // returns <found,iterator> pair... iterator is the element if found==true or the insertion point if found==false.

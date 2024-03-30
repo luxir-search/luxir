@@ -17,7 +17,7 @@ static void BM_IndexBook(benchmark::State& state, std::string field, bool writeP
   RAMDir dir;
   for (auto _ : state) {
     dir = RAMDir(); // clear files
-    Inverter inverter(dir,"00");
+    Inverter inverter(dir, 0);
     Inverter::IndexHandler& fieldHandler = inverter.getIndexHandler(field);
 
     if (!docPerPara) {

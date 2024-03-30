@@ -38,7 +38,7 @@ protected:
   void initWriter() {
     pool.rewind(save);
     dir = RAMDir();  // remove all files?
-    postingsWriter = std::make_unique<PostingsWriter>(dir, "10", 0x7fffffff);  // use maximum value for numDocs... nothing (currently) in text field depends on it.
+    postingsWriter = std::make_unique<PostingsWriter>(dir, 0, 0x7fffffff);  // use maximum value for numDocs... nothing (currently) in text field depends on it.
     writer = std::make_unique<TextWriter>(*postingsWriter);  // use maximum value for numDocs... nothing (currently) in text field depends on it.
 
     // save the RNG state
@@ -50,8 +50,7 @@ protected:
   void initReader() {
     postingsWriter->finish();
 
-    std::string gen = "10";
-    reader = std::make_unique<PostingsReader>(dir, "10");
+    reader = std::make_unique<PostingsReader>(dir, 0);
     fieldReader = std::make_unique<FieldReader>(pool, *reader);
 
     // restore the RNG state
@@ -238,7 +237,7 @@ protected:
 TEST_F(PostingsTest, basic) {
   RAMDir dir;
   MemPool pool;
-  PostingsWriter postingsWriter(dir, "10", 100);
+  PostingsWriter postingsWriter(dir, 0, 100);
   TextWriter writer(postingsWriter);
 
   std::string t1 = "term1";
@@ -290,7 +289,7 @@ TEST_F(PostingsTest, basic) {
   postingsWriter.finish();
 
 
-  PostingsReader reader(dir, "10");
+  PostingsReader reader(dir, 0);
 
   FieldReader fieldReader(pool, reader);
   while (fieldReader.readNextField()) {
@@ -327,7 +326,7 @@ TEST_F(PostingsTest, basic) {
 TEST_F(PostingsTest, blockPositions) {
   RAMDir dir;
   MemPool pool;
-  PostingsWriter postingsWriter(dir, "10", 44);
+  PostingsWriter postingsWriter(dir, 0, 44);
   TextWriter writer(postingsWriter);
   std::string t1 = "term1";
   TermRef term1(pool, t1.data(), t1.size());
@@ -355,7 +354,7 @@ TEST_F(PostingsTest, blockPositions) {
   writer.endField();
   postingsWriter.finish();
 
-  PostingsReader reader(dir, "10");
+  PostingsReader reader(dir, 0);
 
   FieldReader fieldReader(pool, reader);
   ASSERT_TRUE(fieldReader.readNextField());
@@ -411,7 +410,7 @@ TEST_F(PostingsTest, blockTerms) {
   RAMDir dir;
   MemPool pool;
   int nTerms = Postings::TERMS_BLOCK_SIZE + 1;
-  PostingsWriter postingsWriter(dir, "10", nTerms);
+  PostingsWriter postingsWriter(dir, 0, nTerms);
   TextWriter writer(postingsWriter);
   writer.startField("field1");
 
@@ -430,7 +429,7 @@ TEST_F(PostingsTest, blockTerms) {
   writer.endField();
   postingsWriter.finish();
 
-  PostingsReader reader(dir, "10");
+  PostingsReader reader(dir, 0);
 
   FieldReader fieldReader(pool, reader);
   ASSERT_TRUE(fieldReader.readNextField());
@@ -569,7 +568,7 @@ TEST_F(PostingsTest, intCol) {
   {
     auto guard = pool.rewindScopeGuard();
 
-    PostingsWriter writer(dir, "10", 3);
+    PostingsWriter writer(dir, 0, 3);
 
     auto &finfo = writer.fieldInfos.emplace_back();
     finfo.fieldname = fname1;
@@ -589,7 +588,7 @@ TEST_F(PostingsTest, intCol) {
     writer.finish();
   }
 
-  PostingsReader reader(dir, "10");
+  PostingsReader reader(dir, 0);
   FieldReader fieldReader(pool, reader);
   ASSERT_TRUE(fieldReader.readNextField());
   ASSERT_EQ(fieldReader.name(), fname1);

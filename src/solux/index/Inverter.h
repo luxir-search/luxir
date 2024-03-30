@@ -43,7 +43,7 @@ public:
   // The lowest update number that this inverter is part of. Managed by the IndexWriter.
   uint64_t lowestUpdateNum = 0;
 
-  Inverter(solux::Directory& dir, std::string_view segid, const std::function<std::shared_ptr<Schema>()>& schemaProvider = {}) : postingsWriter(dir, segid) {
+  Inverter(solux::Directory& dir, uint64_t segId, const std::function<std::shared_ptr<Schema>()>& schemaProvider = {}) : postingsWriter(dir, segId) {
     // this is a test schemaProvider for convenience
     if (!schemaProvider) {
       this->schemaProvider = [&]() {
