@@ -19,14 +19,8 @@ public:
 TEST_F(IndexWriterTest, singleSeg) {
   RAMDir dir;
   IndexWriter iw(dir);
-  // auto* inverter = &iw.getInverter();
   auto* inverter = &iw.obtainInverter();
   auto* fieldHandler = &inverter->getIndexHandler(field);
-  /* not needed
-  std::experimental::scope_exit close([&] {
-    if (inverter != nullptr) iw.releaseInverter(*inverter);
-  });
-  */
 
   std::string doc1 = "now is the time for all good men";
   inverter->startDoc();
@@ -58,4 +52,5 @@ TEST_F(IndexWriterTest, singleSeg) {
   IndexReader r2(dir);
   ASSERT_EQ(2, r2.segments().size());
   ASSERT_EQ(3, r2.numDocs());
+  ASSERT_GT(r2.generation(), r1.generation());
 }

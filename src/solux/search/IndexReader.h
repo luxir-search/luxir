@@ -47,6 +47,11 @@ public:
 
   // TODO: implement postingsReader sharing by passing in another IndexReader for reference.
 
+  // The version of the index. Every time an index changes, it's generation number increases by at least 1.
+  uint64_t generation() const noexcept {
+    return gen;
+  }
+
   const std::span<Segment> segments() noexcept {
     return segs;
   }
