@@ -15,7 +15,7 @@
 #include "solux/query/ProtobufQueryParser.h"
 #include "solux/search/Collector.h"
 #include "solux/util/thread.h"
-
+#include "ProtoUpdateMessage.h"
 
 
 using namespace solux;
@@ -611,7 +611,21 @@ public:
     }
     */
 
-    UpdateMessage updateMessage;
+
+    class BlockingUpdateMessage : public ProtoUpdateMessage {
+    public:
+      Blocker* blockerPtr;
+      virtual void done(IndexWriter& iw) override {
+        unused(iw);
+        blockerPtr->notify();
+      }
+      // TODO: FIXME: TESTING: override commitWithin to always cause commit for now
+      virtual int32_t commitWithin() override {
+        return -1;
+      }
+    };
+
+    BlockingUpdateMessage updateMessage;
 
     Blocker blocker([&]{
       bool success = iw->startUpdateNode->try_put(&updateMessage);
@@ -620,15 +634,11 @@ public:
       }
     });
 
-    updateMessage.req = &request;
-    updateMessage.commit = true;
-    updateMessage.callback = [&blocker](UpdateMessage* updateMessage) {
-      unused(updateMessage);
-      // LOG_DEBUG("callback msg={}", (void*)updateMessage);
-      blocker.notify();
-    };
 
-    blocker.wait(); // the callback will unblock this.
+    updateMessage.req = &request;
+    updateMessage.blockerPtr = &blocker;
+
+    blocker.wait(); // This kicks off the async work, and the callback (call to done()) will unblock this.
 
     auto& singleResponse = *response.add_responses();
     singleResponse.set_request_id(request.request_id());
@@ -697,22 +707,31 @@ public:
     auto iw = shard->getIndexWriter();
 
 
-    UpdateMessage* updateMessage = new UpdateMessage; // TODO arena allocate this.
-    updateMessage->req = request;
-    updateMessage->commit = true;
-    updateMessage->callback = [this](UpdateMessage* updateMessage) {
-      // LOG_DEBUG("callback msg={}", (void*)updateMessage);
-      // create response from request arena
-      auto* arena = updateMessage->req->GetArena();
-      auto* response = google::protobuf::Arena::CreateMessage<proto::UpdateResponse>(arena);
-      auto& singleResponse = *response->add_responses();
-      singleResponse.set_request_id(updateMessage->req->request_id());
+    class Update : public ProtoUpdateMessage {
+    public:
+      IndexerUpdateStreamingCall* parent;
+      virtual void done(IndexWriter& iw) override {
+        unused(iw);
+        // LOG_DEBUG("done msg={}", (void*)this);
+        // create response from request arena
+        auto* arena = req->GetArena();
+        auto* response = google::protobuf::Arena::CreateMessage<proto::UpdateResponse>(arena);
+        auto& singleResponse = *response->add_responses();
+        singleResponse.set_request_id(req->request_id());
 
-      this->respond(response,
-                    [this](auto* response) { this->releaseArena(response->GetArena()); },
-                    1);
-      delete updateMessage; // TODO arena allocate this
+        // By the time this response is done, *this* object will already be deleted, so don't
+        // reference anything in this Update instance.
+        auto* p = parent;
+        parent->respond(response,
+                      [p](auto* response) { p->releaseArena(response->GetArena()); },
+                      1);
+        delete this; // TODO arena allocate this
+      }
     };
+
+    Update* updateMessage = new Update; // TODO arena allocate this.
+    updateMessage->parent = this;
+    updateMessage->req = request;
 
     iw->startUpdateNode->try_put(updateMessage);
 

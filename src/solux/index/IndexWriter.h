@@ -6,8 +6,6 @@
 #include <mutex>
 #include <span>
 #include "boost/unordered/unordered_flat_map.hpp"
-#include "boost/unordered/unordered_flat_set.hpp"
-#include "boost/unordered/concurrent_flat_map.hpp"
 #include "oneapi/tbb/flow_graph.h"
 #include "solux/store/Directory.h"
 #include "solux/store/OutputStream.h"
@@ -16,33 +14,39 @@
 #include "Inverter.h"
 #include "PostingsWriter.h"
 
-// we may want to decouple from protobuf in the future, but for now it makes it easy to develop
-#include "protos/solux_types.pb.h"
-
 // redefine DEBUG to TRACE level which shouldn't currently be logged!
 #define INDEX_DEBUG LOG_TRACE
 // #define INDEX_DEBUG LOG_DEBUG
 
 namespace solux {
 
+
+class IndexWriter;
+
 // An update message to be processed by the TBB update flow graph.
-// This was an inner class to IndexWriter, but it can't be forward declared in Inverter that way.
-// TODO: it may be more flexible to use inheritance here instead of a callback.  That would allow more
-// data members to be added as well as allowing to call back to the implementation to do the indexing
-// with an inverter (i.e. we could get the protobuf code out of IW).
+// See ProtoUpdateMessage.h/cpp for protobuf update handling code
 class UpdateMessage {
 public:
-  // update protobuf message
-  solux::proto::UpdateRequest* req;  // The request object may become unavailable after the callback is called
-  std::function<void(UpdateMessage*)> callback;    // Called after the update has completed
-  bool commit = false;                // commit after this update is done?
+  virtual ~UpdateMessage() {}
+
+  // 0 means no commit.  -1 means immediate commit.  Other values are commit-within milliseconds.
+  virtual int32_t commitWithin() { return -1; }
+
+  // For now, we will allow the handler to obtain/release an inverter.  We could also optionally pass it
+  // as a param in the future if obtain/release becomes more complex.
+  virtual void handle(IndexWriter& iw) = 0;
+
+  // Called after all operations are complete.  Would typically delete this instance if it was heap allocated.
+  // Consumers of UpdateMessage will not touch it after this call.
+  virtual void done(IndexWriter& iw) = 0;
+
   uint64_t seqNum;                    // The sequence number of this update, used to ensure updates are processed in order when needed
   uint64_t commitNum;                 // The commit number of this update, used to ensure commits are finished in order
 
   // Number of segments left to flush, protected by same mutex that protects the inverter lists.
   // making this an atomic is not enough to avoid race conditions since we also depend on coordination with
   // inverter->updateMessage, among other things.
-  uint32_t leftToFlush = 0;
+  uint32_t leftToFlush = 0;  // internal use only
 };
 
 
@@ -72,7 +76,6 @@ class IndexWriter {
 
   std::mutex indexMutex;
   std::mutex indexReaderMutex;
-  std::mutex segInfoMutex;
 
 public:
   class SegInfo {
@@ -104,7 +107,7 @@ public:
 
   // Tracks current segments in the index.  Keyed by uint64_t segId.
   // There needs to be higher level protection for transactions like replacing N segments with a new merged segment.
-  // Protected by segInfoMutex.
+  // protected by indexMutex
   boost::unordered::unordered_flat_map<uint64_t, std::unique_ptr<SegInfo>> segInfos;
   // boost::unordered::unordered_flat_set<std::unique_ptr<SegInfo>, SegIdHash, SegIdEqual> segInfos;
   // boost::unordered::unordered_flat_set can't currently be used because it lacks an extract() method, which is
@@ -173,7 +176,7 @@ public:
   std::unique_ptr<tbb::flow::sequencer_node<UpdateMessage*> > commitSequencerNode;
   std::unique_ptr<UpdateMessageMultiFunc> commitFinishNode;
 
-  using MergeMessageMultiFunc = tbb::flow::multifunction_node<MergeMessage, std::tuple<void*>>;
+  using MergeMessageMultiFunc = tbb::flow::multifunction_node<MergeMessage*, std::tuple<void*>>;
   std::unique_ptr<MergeMessageMultiFunc> mergeSegmentsNode;
 
   ~IndexWriter() {
@@ -251,6 +254,7 @@ public:
         return msg->commitNum;
       });
 
+    // must be single-threaded
     commitFinishNode = std::make_unique<UpdateMessageMultiFunc>(updateGraph, 1,
       [this](UpdateMessage* msg, UpdateMessageMultiFunc::output_ports_type& op) {
         unused(op);
@@ -260,11 +264,11 @@ public:
 
     tbb::flow::make_edge(*commitSequencerNode, *commitFinishNode);
 
-    // single threaded
+    // must be single-threaded
     mergeSegmentsNode = std::make_unique<MergeMessageMultiFunc>(updateGraph, 1,
-      [this](MergeMessage msg, MergeMessageMultiFunc::output_ports_type& op) {
+      [this](MergeMessage* msg, MergeMessageMultiFunc::output_ports_type& op) {
         unused(op);
-        this->mergeSegmentsBody(msg);
+        this->mergeSegmentsBody(*msg);
     });
   }
 
@@ -272,7 +276,7 @@ public:
     // if the start node can reject updates, then assigning sequence numbers should be done after that.
     // Sequences must start at 0 for the sequencer nodes.
     msg.seqNum = updateNumber++;
-    if (msg.commit) {
+    if (msg.commitWithin() == -1) {
       msg.commitNum = commitNumber++;
     }
     INDEX_DEBUG("startUpdateBody: msg={} seqNum={} commitNum={}", (void*)&msg, msg.seqNum, msg.commitNum);
@@ -280,7 +284,7 @@ public:
 
   void processUpdateBody(UpdateMessage& msg) {
     INDEX_DEBUG("processUpdateBody: msg={}", (void*)&msg);
-    update(*msg.req);
+    msg.handle(*this);
   }
 
   void finishUpdateBody(UpdateMessage& msg) {
@@ -291,13 +295,10 @@ public:
     // Aside: if each inverter keeps track of the highest (and lowest?) update message it has seen, could that be used somehow?
     //  - could avoid dragging in an unneeded inverter.
 
-    if (msg.commit) {
+    if (msg.commitWithin() == -1) {
       initiateCommit(msg);
-    }
-
-    if (!msg.commit && msg.callback) {
-      msg.callback(&msg);
-      // don't access msg after this point, it could be deleted.
+    } else {
+      msg.done(*this);
     }
   }
 
@@ -409,15 +410,9 @@ public:
   void finishCommitBody(UpdateMessage& msg) {
     INDEX_DEBUG("finishCommitBody: msg={}", (void*)&msg);
     // TODO: if nothing actually changed, we could skip writing a new commit at this point.
-    {
-      const std::lock_guard<std::mutex> lock(indexMutex);
-      writeIndexInfoFile();
-    }
 
-    if (msg.callback) {
-      msg.callback(&msg);
-      // don't access msg after this point, it could be deleted.
-    }
+    writeIndexInfoFile();
+    msg.done(*this); // don't access msg after this point, it could be deleted.
   }
 
 
@@ -478,22 +473,30 @@ public:
 
   // TODO: this is test commit code.  Needs to migrate to use the TBB flow graph.
   void commit() {
-    const std::lock_guard<std::mutex> lock(indexMutex);
-    // TODO: can copy the map and then iterate over the copy to avoid holding the lock for too long
-    while (!idleInverters.empty()) {
-      auto it = idleInverters.begin();
-      auto& inverter = *it->second;
-      inverter.flush();
-      segInfos.emplace(inverter.getPostingsWriter().segId, std::make_unique<SegInfo>(inverter.getPostingsWriter().segId, inverter.getPostingsWriter().getMaxDoc()));
-      idleInverters.erase(it);
+    {
+      const std::lock_guard<std::mutex> lock(indexMutex);
+      // TODO: can copy the map and then iterate over the copy to avoid holding the lock for too long
+      while (!idleInverters.empty()) {
+        auto it = idleInverters.begin();
+        auto& inverter = *it->second;
+        inverter.flush();
+        segInfos.emplace(inverter.getPostingsWriter().segId,
+                         std::make_unique<SegInfo>(inverter.getPostingsWriter().segId,
+                                                   inverter.getPostingsWriter().getMaxDoc()));
+        idleInverters.erase(it);
+      }
     }
+
     writeIndexInfoFile();
   }
 
 
+  // This is only called from the finishCommit node, which has concurrency==1 (single-threaded)
+  // hence we only need to protect against changes in the segInfos map, not multiple invocations of this method.
   void writeIndexInfoFile() {
     // write new segments file
     // TODO: TBD if we write new segments files or just use the same name
+    // Since this could involve network or IO, we should do it outside the lock.
     auto indexFile = dir.createFile(Postings::INDEX_INFO_FILE);
     OutputStream indexOut;
     indexOut.setFile(&*indexFile);
@@ -501,77 +504,45 @@ public:
 
     // TODO: should we write out segments in order of size or creation?
 
-    // Sort the list of segments by the segId.
-    // Some tests rely on not reordering segments.
-    std::vector<SegInfo*> sortedSegs;
-    sortedSegs.reserve(segInfos.size());
-    for (auto& seg : segInfos) {
-      sortedSegs.push_back(seg.second.get());
-    }
+    // need to lock the indexMutex to get a consistent view of the segments.
+    // writing the info should be fast (no IO since it should all be buffered in mem)
+    {
+      const std::lock_guard<std::mutex> lock(indexMutex);
 
-    std::sort(sortedSegs.begin(), sortedSegs.end(), [](const SegInfo* a, const SegInfo* b) {
-      /*
-      // first sort on number of documents (largest first), then on segment id (smallest first)
-      if (a->nDocs != b->nDocs) {
-        return a->nDocs > b->nDocs;
+      // Sort the list of segments by the segId.
+      // Some tests rely on not reordering segments.
+      std::vector<SegInfo*> sortedSegs;
+      sortedSegs.reserve(segInfos.size());
+      for (auto& seg: segInfos) {
+        sortedSegs.push_back(seg.second.get());
       }
-       */
-      return a->segId < b->segId;
-    });
 
-    indexOut.writeVlong(gen);
-    indexOut.writeVint(sortedSegs.size());
-    for (auto seg : sortedSegs) {
-      indexOut.writeVlong(seg->segId);
-      indexOut.writeVint(seg->nDocs); // TODO: remove this redundancy in the future?
+      std::sort(sortedSegs.begin(), sortedSegs.end(), [](const SegInfo* a, const SegInfo* b) {
+        /*
+        // first sort on number of documents (largest first), then on segment id (smallest first)
+        if (a->nDocs != b->nDocs) {
+          return a->nDocs > b->nDocs;
+        }
+         */
+        return a->segId < b->segId;
+      });
+
+      indexOut.writeVlong(gen);
+      indexOut.writeVint(sortedSegs.size());
+      for (auto seg: sortedSegs) {
+        indexOut.writeVlong(seg->segId);
+        indexOut.writeVint(seg->nDocs); // TODO: remove this redundancy in the future?
+      }
+
+      // TODO: do we need to track exactly what was committed? Or at least the committed "gen"?
     }
+
+    // now actually do the IO outside of the lock
     indexOut.close();
     dir.finishFile(*indexFile);
   }
 
 
-  // TODO: this should perhaps be moved to the grpc specific code?
-  void update(solux::proto::UpdateRequest& request) {
-    // if there are no docs, then we can just return before grabbing an inverter.
-    if (request.docs_size() == 0) {
-      if (request.has_columns()) {
-        std::cout << "\tindexer got columns (not yet implemented!): " << request.columns().columns_size() << std::endl;
-      }
-      return;
-    }
-
-    Inverter& inverter = obtainInverter();  // TODO: make sure to release it on exceptions (use a unique_ptr with a custom deleter?)
-
-    std::vector<Inverter::IndexHandler*> handlers;
-    // int ndocs = request->docs_size();
-
-    if (request.docs_size() > 0) {
-      for (const auto &doc : request.docs()) {
-        size_t nFields = doc.fields_size();
-        if (handlers.size() < nFields) {
-          handlers.resize(nFields);
-        }
-
-        inverter.startDoc();
-
-        // TODO: wrap in try/catch here?
-
-        int idx = 0;
-        for (const auto&[fname, fval] : doc.fields()) {
-          auto handler = handlers[idx];
-          if (handler == nullptr || *handler != fname) {
-            handlers[idx] = handler = &inverter.getIndexHandler(fname);
-          }
-          handler->index(inverter, fval);
-          idx++;
-        }
-
-        inverter.finishDoc();
-      }
-    }
-
-    releaseInverter(inverter);
-  }
 
   // These should live in a merge policy presumably
   int32_t MERGE_FACTOR = 10;
@@ -656,7 +627,7 @@ public:
   // maintain that invariant?
   void mergeSegmentsBody(MergeMessage& msg) {
     {
-      // grab or open all of the postings readers
+      // grab or open all the postings readers
       std::vector<std::shared_ptr<PostingsReader>> preaders;
       preaders.reserve(msg.segs.size());
       for (auto segInfo: msg.segs) {
@@ -669,7 +640,8 @@ public:
 
       MemPool pool;
 
-      // copy the preaders to a vector of pointers for our underlying merge code.
+      // Copy the preaders to a vector of pointers for our underlying merge code.
+      // this is temprary... mergers will need more info at some point to handle deletes.
       std::vector<PostingsReader*> preaderPtrs;
       preaderPtrs.reserve(preaders.size());
       for (auto& preader : preaders) {
@@ -699,17 +671,16 @@ public:
 
         // Create & add the new SegmentInfo
         segInfos.emplace(pwriter.getSegId(), std::make_unique<SegInfo>(pwriter.getSegId(), pwriter.getMaxDoc()));
-
-        // write the new index info file
-        writeIndexInfoFile();
       }
 
+      // TODO: we need to go through finishCommit node so that it remains single threaded!
+      // Slipping into the normal commit order should be fine since finishing a commit always grabs
+      // the latest list of segments (i.e. there is no going back in time)
 
+      writeIndexInfoFile();
     } // end of scope for preaders, pool, and pwriter
 
-    if (msg.callback) {
-      msg.callback(&msg);
-    }
+    // TODO: FIXME: finishCommitNode->try_put(&msg);
   }
 
 

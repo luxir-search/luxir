@@ -227,13 +227,14 @@ message UpdateRequest {
 
   Target collection = 3;
 
-  // Documents represented as multiple rows... less efficient since field names are repeated for each document
+  // Documents represented as multiple rows... less efficient since field names are repeated for each document.
+  // Using the same field order for each row will make things slightly more efficient.
   repeated Map docs = 4;
 
   // Column representation of a batch of documents.  All columns should have the same length.
   // For very sparse fields that you do not wish to represent as a column, use a special
-  // field name of "_fields_" with a value of ColMap for per-document sparse values.  This is
-  // effectively a mix of column oriented and row oriented.
+  // field name of "_fields_" with a value of ColMap for per-document sparse values.  This will
+  // effectively enable a mix of column oriented and row oriented.
   Columns columns = 5;
 
   // Commit within this many milliseconds. 0 means as soon as previous documents have been indexed.
