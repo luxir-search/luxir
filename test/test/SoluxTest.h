@@ -39,15 +39,6 @@ namespace solux {
 
 
 
-//
-// TODO: switch from std::cout to some sort of logging framework where we can disable output like this by default and
-// easily enable for debugging.  Research NanoLog more... only has support for printf type formatters
-// (i.e. logging a vector of string wouldn't work...) but perhaps we could come up with some macros that check if a message would be logged
-// and only then generate a string from an object.  Or, start with something with better support / adoption (and Windows support), like spdlog.
-// Also: investigate g3log's crash resistance / logging.
-//
-
-
 
 class SoluxTest : public ::testing::Test {
 public:
@@ -62,13 +53,13 @@ public:
   }
 
   SoluxTest() {
-    /***
+    /*
     auto test = testing::UnitTest::GetInstance();
     auto testinfo = test->current_test_info();
     const char* name = testinfo->name();
     const char* suite_name = testinfo->test_suite_name();
     std::cout << "SoluxTest: name=" << name << " suite_name=" << suite_name  << " rng_seed=" << rng_seed << std::endl;
-     ***/
+    */
   }
 
   ~SoluxTest() override {

@@ -18,6 +18,7 @@ public:
   std::shared_ptr<grpc::Channel> channel;
   std::unique_ptr<solux::Greeter::Stub> greeterStub;
   std::unique_ptr<solux::Indexer::Stub> indexerStub;
+  std::unique_ptr<solux::Searcher::Stub> searchStub;
 
   GrpcIndexTest() {
     // channels are thread safe
@@ -25,6 +26,7 @@ public:
     channel = grpc::CreateChannel("localhost:50051", grpc::InsecureChannelCredentials());
     greeterStub = solux::Greeter::NewStub(channel);
     indexerStub = solux::Indexer::NewStub(channel);
+    searchStub = solux::Searcher::NewStub(channel);
   }
 
   void doSingleUpdate() {
@@ -541,4 +543,57 @@ TEST_F(GrpcIndexTest, addDocsStream) {
 
 TEST_F(GrpcIndexTest, addDocsStream2) {
   doStreamingUpdates(rng, 10);
+}
+
+TEST_F(GrpcIndexTest, visibility) {
+  // Setup request
+
+  // Write Stream
+  grpc::ClientContext wcontext;  // need a new one for each RPC
+  std::unique_ptr<grpc::ClientReaderWriter<solux::proto::UpdateRequest, solux::proto::UpdateResponse>> wstream = indexerStub->UpdateStream(&wcontext);
+
+  // Read Stream
+  grpc::ClientContext rcontext;  // need a new one for each RPC
+  std::unique_ptr<grpc::ClientReaderWriter<solux::proto::SearchRequest, solux::proto::SearchResponse>> rstream = searchStub->Search(&rcontext);
+
+  solux::proto::UpdateRequest req;
+  solux::proto::UpdateResponse response;
+
+  req.mutable_collection()->add_name("main");
+
+  auto& fields = *req.add_docs()->mutable_fields();
+  fields["text1_w"].set_s("x1");
+  fields["text2_w"].set_s("x2");
+
+
+  std::string reqStr;
+  google::protobuf::TextFormat::PrintToString(req, &reqStr);
+          GRPC_DEBUG("CLIENT REQ:( {} )", reqStr);
+
+  bool wrote = wstream->Write(req);
+  ASSERT_TRUE(wrote);
+
+  solux::proto::UpdateRequest req2;
+  req2.mutable_collection()->add_name("main");  // TODO: allow this to not be set if same as last message!
+
+  auto& fields2 = *req2.add_docs()->mutable_fields();
+  fields2["text1_w"].set_s("x3");
+  fields2["text2_w"].set_s("x4");
+  fields2["text3_w"].set_s("x5");
+
+  wrote = wstream->Write(req2);
+  ASSERT_TRUE(wrote);
+
+  bool ok = wstream->WritesDone();  // can replace with WriteLast? is it more efficient?
+  ASSERT_TRUE(ok);
+
+  while (wstream->Read(&response)) {
+    std::string resStr;
+    google::protobuf::TextFormat::PrintToString(response, &resStr);
+    GRPC_DEBUG("CLIENT RESULT:( {} )", resStr);
+  }
+
+  grpc::Status status = wstream->Finish();
+  GRPC_DEBUG("STREAMING UPDATE CLIENT FINISHED");
+  ASSERT_TRUE(status.ok());
 }

@@ -29,9 +29,6 @@ class UpdateMessage {
 public:
   virtual ~UpdateMessage() {}
 
-  // 0 means no commit.  -1 means immediate commit.  Other values are commit-within milliseconds.
-  virtual int32_t commitWithin() { return -1; }
-
   // For now, we will allow the handler to obtain/release an inverter.  We could also optionally pass it
   // as a param in the future if obtain/release becomes more complex.
   virtual void handle(IndexWriter& iw) = 0;
@@ -40,6 +37,19 @@ public:
   // Consumers of UpdateMessage will not touch it after this call.
   virtual void done(IndexWriter& iw) = 0;
 
+  // See docs in solux.proto:UpdateRequest
+  // NOTE: These values should be kept in sync with the protobuf definition.
+  enum CommitType {
+    NO_COMMIT = 0,         // the default
+    COMMIT = 1,            // ensure new data is searchable
+    SILENT_COMMIT = 2,     // the commit will be "silent" (won't necessarily cause new searchers to be opened)
+    // CONSISTENT_COMMIT = 3; // FUTURE - ensure distributed searchers will see new data
+  };
+  CommitType commit;
+  int32_t commit_within;  // TODO: implement this
+
+
+  // Filled in by the IndexWriter when the message is received.
   uint64_t seqNum;                    // The sequence number of this update, used to ensure updates are processed in order when needed
   uint64_t commitNum;                 // The commit number of this update, used to ensure commits are finished in order
 
@@ -105,6 +115,10 @@ public:
   Directory& dir;
   std::atomic_uint64_t gen;  // the last segId generated
 
+  uint64_t lastCommitedGen = 0;  // the last index gen that was committed
+  std::shared_ptr<IndexReader> indexReader;
+
+
   // Tracks current segments in the index.  Keyed by uint64_t segId.
   // There needs to be higher level protection for transactions like replacing N segments with a new merged segment.
   // protected by indexMutex
@@ -113,7 +127,6 @@ public:
   // boost::unordered::unordered_flat_set can't currently be used because it lacks an extract() method, which is
   // the only way of removing a move-only object from the set.
 
-  std::shared_ptr<IndexReader> indexReader;
 
   // In the future, we way want to get an inverter by segment id (delete handling?).
   // We could convert to unordered_flat_set keyed by uint64_t segId, just like segInfos.
@@ -276,7 +289,7 @@ public:
     // if the start node can reject updates, then assigning sequence numbers should be done after that.
     // Sequences must start at 0 for the sequencer nodes.
     msg.seqNum = updateNumber++;
-    if (msg.commitWithin() == -1) {
+    if (msg.commit != UpdateMessage::NO_COMMIT) {
       msg.commitNum = commitNumber++;
     }
     INDEX_DEBUG("startUpdateBody: msg={} seqNum={} commitNum={}", (void*)&msg, msg.seqNum, msg.commitNum);
@@ -295,7 +308,7 @@ public:
     // Aside: if each inverter keeps track of the highest (and lowest?) update message it has seen, could that be used somehow?
     //  - could avoid dragging in an unneeded inverter.
 
-    if (msg.commitWithin() == -1) {
+    if (msg.commit != UpdateMessage::NO_COMMIT) {
       initiateCommit(msg);
     } else {
       msg.done(*this);

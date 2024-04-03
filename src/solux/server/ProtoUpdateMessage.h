@@ -9,11 +9,9 @@ namespace solux {
 class ProtoUpdateMessage : public UpdateMessage {
 public:
   solux::proto::UpdateRequest* req;  // The request object may become unavailable after the callback is called
-
-  // 0 means no commit.  -1 means immediate commit.  Other values are commit-within milliseconds.
-  virtual int32_t commitWithin() override {
-    return -1; // TODO: FIXME: this should not be hard-coded.
-    // return req->commit_within();
+  ProtoUpdateMessage(solux::proto::UpdateRequest* req) : req(req) {
+    commit = static_cast<CommitType>(req->commit());
+    commit_within = req->commit_within();
   }
 
   // For now, we will allow the handler to obtain/release an inverter.  We could also optionally pass it

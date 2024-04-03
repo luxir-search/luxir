@@ -615,17 +615,16 @@ public:
     class BlockingUpdateMessage : public ProtoUpdateMessage {
     public:
       Blocker* blockerPtr;
+      BlockingUpdateMessage(solux::proto::UpdateRequest* req) : ProtoUpdateMessage(req) {
+        commit = UpdateMessage::CommitType::COMMIT;     // TODO: FIXME: TESTING: always do commit for now
+      }
       virtual void done(IndexWriter& iw) override {
         unused(iw);
         blockerPtr->notify();
       }
-      // TODO: FIXME: TESTING: override commitWithin to always cause commit for now
-      virtual int32_t commitWithin() override {
-        return -1;
-      }
     };
 
-    BlockingUpdateMessage updateMessage;
+    BlockingUpdateMessage updateMessage(&request);
 
     Blocker blocker([&]{
       bool success = iw->startUpdateNode->try_put(&updateMessage);
@@ -633,9 +632,7 @@ public:
         throw std::runtime_error("failed to put update message into startUpdateNode");
       }
     });
-
-
-    updateMessage.req = &request;
+    
     updateMessage.blockerPtr = &blocker;
 
     blocker.wait(); // This kicks off the async work, and the callback (call to done()) will unblock this.
@@ -710,6 +707,7 @@ public:
     class Update : public ProtoUpdateMessage {
     public:
       IndexerUpdateStreamingCall* parent;
+      Update(proto::UpdateRequest* req, IndexerUpdateStreamingCall* parent) : ProtoUpdateMessage(req), parent(parent) {}
       virtual void done(IndexWriter& iw) override {
         unused(iw);
         // LOG_DEBUG("done msg={}", (void*)this);
@@ -729,9 +727,8 @@ public:
       }
     };
 
-    Update* updateMessage = new Update; // TODO arena allocate this.
-    updateMessage->parent = this;
-    updateMessage->req = request;
+    Update* updateMessage = new Update(req, this); // TODO arena allocate this.
+
 
     iw->startUpdateNode->try_put(updateMessage);
 

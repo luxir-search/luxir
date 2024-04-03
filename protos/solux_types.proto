@@ -11,57 +11,31 @@ option objc_class_prefix = "Solux";
 package solux.proto;
 
 
-/*
- Using the well-known-type of google.protobuf.Struct doc = 1
- allows {"doc":{"myint":77, "mystr":"foo"}}
- Unfortunately, that's not enough types!
- Replicating Struct myself requires this really verbose JSON to send to evans:
-{
-  "doc": {
-    "fields": {
-      "myint": {
-        "number_value": 77
-      },
-      "mystr": {
-        "string_value": "foo"
-      }
-    }
-  }
-}
-*/
-
-
-// Proto notes:
-// can't repeat oneof fields or map fields
-// can't have map as value in map
-
-
 /// The target of this operation
 message Target {
   repeated string name = 1;  // qualified collection name
 
-  // An API-key could reference an existing Library that would be the root for further qualifying the collection name.
-  // Thus a user would not need to know where in the hierarchy they are.  Responses containing collection names should
-  // likewise only contain collection names qualified from this reference point.
+  // Solux developers implementing a multi-tenant system could use an API-key (at a higher level... not in solux) as
+  // a starting point akin to a current-working-directory to qualify the collection name.
+  // Responses containing collection names should likewise be relative.
 }
 
-//
-// TODO: provide a way to specify if client wants a stable view of the index across multiple related searches!
-// One option is a top-level flag (but how to tell when to release if one wants a long collection?  perhaps
-// require a separate call when consistency is desired?  Have another optional flag to release?
-// It could also be a reservation (5 sec?) rather than a hard requirement.
-// Multiple related searches could perhaps even save/use variables?
-//
+// Top-level search request that can contain multiple search operations.
 message SearchRequest {
   // request_id is optional and opaque (server does not care what the value is).  If provided, the server will
-  // use it in the response.  Only really needed when a client streams multiple requests in the same RPC.
+  // echo it in the response.  Only really needed when a client streams multiple requests in the same RPC.
   bytes request_id = 1;
   Target collection = 2;
 
+  // Multiple search operations in a single request.
   // An alternative could be to put the tag/name in the SearchOp itself
   map<string, SearchOp> ops = 3;
+
+  // index view freshness requirement in milliseconds. 0 (the default) means latest commit must be used.
+  optional int32 freshness = 4;
 }
 
+// Different types of top-level search operations.
 message SearchOp {
   oneof kind {
     TopDocs top_docs = 1;
@@ -237,8 +211,20 @@ message UpdateRequest {
   // effectively enable a mix of column oriented and row oriented.
   Columns columns = 5;
 
-  // Commit within this many milliseconds. 0 means as soon as previous documents have been indexed.
-  optional int32 commit_within = 6;
+  enum CommitType {
+    NO_COMMIT = 0;         // the default
+    COMMIT = 1;            // ensure new data is searchable
+    SILENT_COMMIT = 2;     // the commit will be "silent" (won't necessarily cause new searchers to be opened)
+    // CONSISTENT_COMMIT = 3; // FUTURE - ensure distributed searchers will see new data
+  }
+  CommitType commit = 6;
+
+  // Commit within this many milliseconds.  Does not have an effect if commit is NO_COMMIT.
+  // This parameter can be useful to ensure that too many commits aren't being done that can hurt
+  // both indexing and search performance, but still places an upper bound on how stale the data can be.
+  // If CommitType != NO_COMMIT, the default value of 0 causes an immediate commit before the response is sen,
+  // while a positive value will not wait for the commit before the response is sent.
+  optional int32 commit_within = 7;
 }
 
 // The response to an update request, or one or more update requests in streaming mode.
