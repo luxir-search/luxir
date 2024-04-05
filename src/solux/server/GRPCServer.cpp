@@ -616,7 +616,7 @@ public:
     public:
       Blocker* blockerPtr;
       BlockingUpdateMessage(solux::proto::UpdateRequest* req) : ProtoUpdateMessage(req) {
-        commit = UpdateMessage::CommitType::COMMIT;     // TODO: FIXME: TESTING: always do commit for now
+        // commit = UpdateMessage::CommitType::COMMIT;     // TODO: FIXME: TESTING: always do commit for now
       }
       virtual void done(IndexWriter& iw) override {
         unused(iw);
@@ -632,7 +632,7 @@ public:
         throw std::runtime_error("failed to put update message into startUpdateNode");
       }
     });
-    
+
     updateMessage.blockerPtr = &blocker;
 
     blocker.wait(); // This kicks off the async work, and the callback (call to done()) will unblock this.
@@ -751,6 +751,8 @@ public:
     auto arena = request->GetArena();
     auto response = arena->CreateMessage<solux::proto::SearchResponse>(arena);
     fillResponse(*request, *response);
+    // TODO: FIXME - this is currently synchronous for everything.  We need to make it async
+    // unless it is a very short operation.
     respond(response, [this](auto* response) { this->releaseArena(response->GetArena()); });
     return true;
   }
@@ -785,7 +787,7 @@ public:
     auto schema = collection->getSchema();
     auto shard = collection->getShard();
     auto iw = shard->getIndexWriter();
-    std::shared_ptr<IndexReader> reader = iw->getIndexReader();
+    std::shared_ptr<IndexReader> reader = iw->getIndexReader(request.freshness_us());
     response.set_request_id(request.request_id());
 
     for (auto& [opKey, searchOp] : request.ops()) {
@@ -817,6 +819,8 @@ public:
 
           // TODO: Maybe use a per-thread stack-pool for stuff that is fine to rewind and the requestPool for stuff that needs to be kept around for the duration of the request?
           // But if we go increasingly multi-threaded, stuff we want to keep around should perhaps just use the request/response protobuf arena.
+          // Each thread could have it's own thread local MemPool for stuff that is truly temporary (will be rewound
+          // before task is completed.
           MemPool& searchPool = responsePool;
           {
             auto poolFree = searchPool.rewindScopeGuard();

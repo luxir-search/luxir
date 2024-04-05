@@ -52,5 +52,5 @@ TEST_F(IndexWriterTest, singleSeg) {
   IndexReader r2(dir);
   ASSERT_EQ(2, r2.segments().size());
   ASSERT_EQ(3, r2.numDocs());
-  ASSERT_GT(r2.generation(), r1.generation());
+  ASSERT_GT(r2.commitTime(), r1.commitTime());
 }

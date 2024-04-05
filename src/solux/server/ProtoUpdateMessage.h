@@ -11,7 +11,7 @@ public:
   solux::proto::UpdateRequest* req;  // The request object may become unavailable after the callback is called
   ProtoUpdateMessage(solux::proto::UpdateRequest* req) : req(req) {
     commit = static_cast<CommitType>(req->commit());
-    commit_within = req->commit_within();
+    commit_within = req->commit_within_us();
   }
 
   // For now, we will allow the handler to obtain/release an inverter.  We could also optionally pass it

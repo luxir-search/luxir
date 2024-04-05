@@ -33,7 +33,8 @@ public:
       LOG_DEBUG("Empty IndexReader");
     } else {
       InputStream segmentsIs = inputFile->getInputStream();
-      gen = segmentsIs.readVlong();
+      commitTimeUs = segmentsIs.readVlong();
+      auto gen = segmentsIs.readVlong();
       int nsegs = segmentsIs.readVint();
       segs.reserve(nsegs);
       for (int i=0; i<nsegs; i++) {
@@ -43,13 +44,15 @@ public:
         maxdoc += segs.back().postingsReader().numDocs();
       }
     }
+    LOG_DEBUG("IndexReader opened with {} segments and {} docs", segs.size(), maxdoc);
   }
 
   // TODO: implement postingsReader sharing by passing in another IndexReader for reference.
 
-  // The version of the index. Every time an index changes, it's generation number increases by at least 1.
-  uint64_t generation() const noexcept {
-    return gen;
+  // The time in microseconds when this version of the index was committed.  Guaranteed to be strictly increasing
+  // with new versions of the index.
+  uint64_t commitTime() const noexcept {
+    return commitTimeUs;
   }
 
   const std::span<Segment> segments() noexcept {
@@ -62,8 +65,8 @@ public:
 
 private:
   std::vector<Segment> segs;
-  uint64_t gen = 0;
   int64_t maxdoc = 0;
+  int64_t commitTimeUs = 0;
 };
 
 }

@@ -136,11 +136,18 @@ public:
   boost::unordered_flat_map<Inverter*, std::unique_ptr<Inverter>> busyInverters;
   boost::unordered_flat_map<Inverter*, std::unique_ptr<Inverter>> flushingInverters;
 
-  // sequence numbers for updates and commits.  protected by indexMutex
+  // sequence numbers for updates and commits.
   std::atomic_uint64_t updateNumber = 0;
   std::atomic_uint64_t commitNumber = 0;
 
+  // In an update response, we could return an update number, or a commit number, or even a monotonic time.
+  // This would allow a searching client to specify a time to search up to.
+  // Time of the last commit (since 1970 epoch) in microseconds. Guaranteed to be strictly increasing.
+  std::atomic_uint64_t lastCommitTime;
+  std::atomic_uint64_t lastAdvertisedCommitTime;
 
+  // TODO: could also have a single high resolution "timer" that is used to timestamp everything.
+  // set on every update message.  Could be used to version later.
 
   // Goals of the TBB flow graph for updates:
   //   - make sure that a commit waits for all update messages to be processed (in the same stream at least)
@@ -206,9 +213,11 @@ public:
       // TODO: verify directory has no other index files? (i.e. this would tend to indicate corruption)
     } else {
       InputStream segmentsIs = segFile->getInputStream();
+      lastCommitTime = lastAdvertisedCommitTime = segmentsIs.readVlong();
       gen = segmentsIs.readVlong();
       auto nSegs = segmentsIs.readVint();
       segInfos.reserve(nSegs);
+      // TODO: maintain segment order by recording ord in segments file.
       for (auto i = 0u; i < nSegs; i++) {
         auto segId = segmentsIs.readVlong();
         int32_t nDocs = segmentsIs.readVint();
@@ -432,14 +441,27 @@ public:
 
 
   // return a copy of the shared_ptr so that the instance it points to will never change while in use.
-  std::shared_ptr<IndexReader> getIndexReader() {
+  std::shared_ptr<IndexReader> getIndexReader(uint64_t freshness_us = 0) {
     const std::lock_guard<std::mutex> lock(indexReaderMutex);
-    if (indexReader.get() != nullptr) {
-      return indexReader;
+    bool needNewReader = false;
+    if (!indexReader) {
+      needNewReader = true;
+    } else {
+      // is there a new commit?
+      if (lastAdvertisedCommitTime > indexReader->commitTime()) {
+        // check if we want this new commit based on freshness requirement
+        if (freshness_us == 0 || std::chrono::duration_cast<std::chrono::microseconds>(
+          std::chrono::system_clock::now().time_since_epoch()).count() - indexReader->commitTime() > freshness_us) {
+          needNewReader = true;
+        }
+      }
     }
 
-    std::shared_ptr<IndexReader> newReader = std::make_shared<IndexReader>(dir);
-    indexReader = newReader;
+    // TODO: FIXME: this blocks other threads from getting the current reader.
+    if (needNewReader) {
+      indexReader = std::make_shared<IndexReader>(dir);
+    }
+
     return indexReader;
   }
 
@@ -469,6 +491,8 @@ public:
   }
 
   Inverter& obtainInverter() {
+    // IDEA: should we prefer grabbing the inverter with the most docs?  Idea would be to
+    // have a couple of really large segments that will need less merging?
     const std::lock_guard<std::mutex> lock(indexMutex);
     if (idleInverters.empty()) {
       auto newInverter = std::make_unique<Inverter>(dir, ++gen);
@@ -514,6 +538,12 @@ public:
     OutputStream indexOut;
     indexOut.setFile(&*indexFile);
 
+    // get timestamp in microseconds
+    uint64_t now_us = std::chrono::duration_cast<std::chrono::microseconds>(
+      std::chrono::system_clock::now().time_since_epoch()).count();
+    if (now_us <= lastCommitTime) {
+      now_us = lastCommitTime + 1;
+    }
 
     // TODO: should we write out segments in order of size or creation?
 
@@ -540,19 +570,23 @@ public:
         return a->segId < b->segId;
       });
 
+      indexOut.writeVlong(now_us);
       indexOut.writeVlong(gen);
       indexOut.writeVint(sortedSegs.size());
       for (auto seg: sortedSegs) {
         indexOut.writeVlong(seg->segId);
         indexOut.writeVint(seg->nDocs); // TODO: remove this redundancy in the future?
       }
-
       // TODO: do we need to track exactly what was committed? Or at least the committed "gen"?
     }
 
-    // now actually do the IO outside of the lock
+    // now actually do the IO outside the lock
     indexOut.close();
     dir.finishFile(*indexFile);
+
+    // advertise this commit only after the file is closed.
+    lastCommitTime = now_us;
+    lastAdvertisedCommitTime = now_us;
   }
 
 

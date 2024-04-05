@@ -29,12 +29,13 @@ public:
     searchStub = solux::Searcher::NewStub(channel);
   }
 
-  void doSingleUpdate() {
+  void doSingleUpdate(bool commit) {
     solux::proto::UpdateRequest ureq;
     solux::proto::UpdateResponse response;
     grpc::ClientContext context;
 
     ureq.mutable_collection()->add_name("main");
+    ureq.set_commit(commit ? solux::proto::UpdateRequest::COMMIT : solux::proto::UpdateRequest::NO_COMMIT);
 
     auto& fields = *ureq.add_docs()->mutable_fields();
     fields["text1_w"].set_s("a value");
@@ -45,10 +46,29 @@ public:
     ASSERT_TRUE(status.ok());
   }
 
+  int64_t getDocCount() {
+    // Read Stream
+    grpc::ClientContext rcontext;  // need a new one for each RPC
+    std::unique_ptr<grpc::ClientReaderWriter<solux::proto::SearchRequest, solux::proto::SearchResponse>> rstream = searchStub->Search(&rcontext);
+
+    solux::proto::SearchRequest sreq;
+    sreq.mutable_collection()->add_name("main");
+    auto& ops = *sreq.mutable_ops();
+    ops["q"].mutable_top_docs()->mutable_query()->set_all(true);
+
+    bool wrote = rstream->Write(sreq);
+    EXPECT_TRUE(wrote);
+
+    solux::proto::SearchResponse sresponse;
+    bool read = rstream->Read(&sresponse);
+    EXPECT_TRUE(read);
+    return sresponse.ops().at("q").docs().matches();
+  }
+
   // How we do things here in the client isn't actually ok depending on how the server is implemented and could
   // lead to deadlock if we are insisting on writing more messages and the server is waiting for us to read more.
   // Ideally, a separate thread is used for reading the responses.  This should also increase efficiency/throughput.
-  void doStreamingUpdates(Rng& r, int nMessages) {
+  void doStreamingUpdates(Rng& r, int nMessages, int commitPercent) {
     solux::proto::UpdateRequest req;
     solux::proto::UpdateResponse response;
     grpc::ClientContext context;  // need a new one for each RPC
@@ -87,6 +107,9 @@ public:
 
         solux::proto::UpdateRequest req;
         req.mutable_collection()->add_name("main");
+        if (r.rint(0, 100) < commitPercent) {
+          req.set_commit(solux::proto::UpdateRequest::COMMIT);
+        }
 
         auto& fields = *req.add_docs()->mutable_fields();
         fields["text1_w"].set_s("val1");
@@ -193,7 +216,7 @@ public:
     EXPECT_EQ(nWrites, nReads);
   }
 
-  void doThreadSafeIndex(int nTasks, int callsPerTask, int streamingPercent) {
+  void doThreadSafeIndex(int nTasks, int callsPerTask, int streamingPercent, int commitPercent) {
 
     tbb::task_group tasks;
 
@@ -211,10 +234,10 @@ public:
                   if (r.rint(0, 100) < streamingPercent) {
                     int left = callsPerTask - nCalls;
                     int nStream = left == 1 ? 1 : r.rint(left) + 1;
-                    doStreamingUpdates(r, nStream);
+                    doStreamingUpdates(r, nStream, commitPercent);
                     nCalls += nStream;
                   } else {
-                    doSingleUpdate();
+                    doSingleUpdate(r.rint(100) < commitPercent);
                     nCalls++;
                   }
                 }
@@ -226,7 +249,7 @@ public:
     tasks.wait();
   }
 
-  void doThreadSafeIndex2(int nTasks, int callsPerTask, int streamingPercent) {
+  void doThreadSafeIndex2(int nTasks, int callsPerTask, int streamingPercent, int commitPercent) {
 
     std::unique_ptr<std::thread> threads[nTasks];
 
@@ -244,10 +267,10 @@ public:
                   if (r.rint(0, 100) < streamingPercent) {
                     int left = callsPerTask - nCalls;
                     int nStream = left == 1 ? 1 : r.rint(left) + 1;
-                    doStreamingUpdates(r, nStream);
+                    doStreamingUpdates(r, nStream, commitPercent);
                     nCalls += nStream;
                   } else {
-                    doSingleUpdate();
+                    doSingleUpdate(r.rint(100) < commitPercent);
                     nCalls++;
                   }
                 }
@@ -441,6 +464,7 @@ TEST_F(GrpcIndexTest, threadsafeIndex) {
   int nTasks = 10;
   int callsPerTask = 10;
   int streamingPercent = 50;  // percent of the requests that use streaming
+  int commitPercent = 10;
 
   // doThreadSafeIndex(nTasks, callsPerTask, streamingPercent);
 
@@ -453,7 +477,7 @@ TEST_F(GrpcIndexTest, threadsafeIndex) {
             // TODO: not sure if this isolate does anything useful here or not.
             tbb::this_task_arena::isolate(
                     [&,this]{
-                      doThreadSafeIndex(nTasks, callsPerTask, streamingPercent);
+                      doThreadSafeIndex(nTasks, callsPerTask, streamingPercent, commitPercent);
                     }
             );
           }
@@ -542,7 +566,7 @@ TEST_F(GrpcIndexTest, addDocsStream) {
 
 
 TEST_F(GrpcIndexTest, addDocsStream2) {
-  doStreamingUpdates(rng, 10);
+  doStreamingUpdates(rng, 10,50);
 }
 
 TEST_F(GrpcIndexTest, visibility) {
@@ -552,41 +576,60 @@ TEST_F(GrpcIndexTest, visibility) {
   grpc::ClientContext wcontext;  // need a new one for each RPC
   std::unique_ptr<grpc::ClientReaderWriter<solux::proto::UpdateRequest, solux::proto::UpdateResponse>> wstream = indexerStub->UpdateStream(&wcontext);
 
-  // Read Stream
-  grpc::ClientContext rcontext;  // need a new one for each RPC
-  std::unique_ptr<grpc::ClientReaderWriter<solux::proto::SearchRequest, solux::proto::SearchResponse>> rstream = searchStub->Search(&rcontext);
 
-  solux::proto::UpdateRequest req;
-  solux::proto::UpdateResponse response;
+  {
+    solux::proto::UpdateRequest req;
+    solux::proto::UpdateResponse response;
 
-  req.mutable_collection()->add_name("main");
+    req.mutable_collection()->add_name("main");
 
-  auto& fields = *req.add_docs()->mutable_fields();
-  fields["text1_w"].set_s("x1");
-  fields["text2_w"].set_s("x2");
+    auto& fields = *req.add_docs()->mutable_fields();
+    fields["text1_w"].set_s("x1");
+    fields["text2_w"].set_s("x2");
 
+    std::string reqStr;
+    google::protobuf::TextFormat::PrintToString(req, &reqStr);
+            GRPC_DEBUG("CLIENT REQ:( {} )", reqStr);
 
-  std::string reqStr;
-  google::protobuf::TextFormat::PrintToString(req, &reqStr);
-          GRPC_DEBUG("CLIENT REQ:( {} )", reqStr);
+    bool wrote = wstream->Write(req);
+    ASSERT_TRUE(wrote);
 
-  bool wrote = wstream->Write(req);
-  ASSERT_TRUE(wrote);
+    // wait for the write response
+    bool read = wstream->Read(&response);
+    ASSERT_TRUE(read);
+  }
 
-  solux::proto::UpdateRequest req2;
-  req2.mutable_collection()->add_name("main");  // TODO: allow this to not be set if same as last message!
+  ASSERT_EQ(0, getDocCount());
 
-  auto& fields2 = *req2.add_docs()->mutable_fields();
-  fields2["text1_w"].set_s("x3");
-  fields2["text2_w"].set_s("x4");
-  fields2["text3_w"].set_s("x5");
+  {
+    solux::proto::UpdateRequest req;
+    solux::proto::UpdateResponse response;
 
-  wrote = wstream->Write(req2);
-  ASSERT_TRUE(wrote);
+    req.mutable_collection()->add_name("main");
+    req.set_commit(solux::proto::UpdateRequest::COMMIT);
+
+    auto& fields = *req.add_docs()->mutable_fields();
+    fields["text1_w"].set_s("x3");
+    fields["text2_w"].set_s("x4");
+
+    std::string reqStr;
+    google::protobuf::TextFormat::PrintToString(req, &reqStr);
+    GRPC_DEBUG("CLIENT REQ:( {} )", reqStr);
+
+    bool wrote = wstream->Write(req);
+    ASSERT_TRUE(wrote);
+
+    // wait for the write response
+    bool read = wstream->Read(&response);
+    ASSERT_TRUE(read);
+  }
+
+  ASSERT_EQ(2, getDocCount());
 
   bool ok = wstream->WritesDone();  // can replace with WriteLast? is it more efficient?
   ASSERT_TRUE(ok);
 
+  solux::proto::UpdateResponse response;
   while (wstream->Read(&response)) {
     std::string resStr;
     google::protobuf::TextFormat::PrintToString(response, &resStr);
