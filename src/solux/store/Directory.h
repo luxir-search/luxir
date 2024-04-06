@@ -24,6 +24,11 @@ public:
   // gives more flexibility in implementation without having every File have to point back to it's
   // owning Directory.
   virtual void finishFile(File &file) = 0;
+
+  // remove all files from the directory
+  virtual void clear() = 0;
+
+  virtual ~Directory() = default;
 };
 
 
@@ -129,6 +134,11 @@ public:
     }
     return totalSize;
   };
+
+  void clear() override {
+    std::lock_guard<std::mutex> lock(mutex);
+    files.clear();
+  }
 
 };
 

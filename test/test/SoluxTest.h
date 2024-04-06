@@ -1,5 +1,6 @@
 #pragma once
 #include <gtest/gtest.h>
+#include <solux/server/SoluxNode.h>
 #include "solux/util/solux_util.h"
 #include "solux/util/random.h"
 
@@ -44,7 +45,7 @@ class SoluxTest : public ::testing::Test {
 public:
   static Rng rng;
   static uint64_t rng_seed;
-
+  static solux::SoluxNode* soluxNode;
 
   // This is called from a listener with a seed that is different for every test.
   inline static void init_test(uint64_t seed) {
@@ -71,6 +72,12 @@ public:
   void TearDown() override {
   }
 
+  void clearCollection(std::string_view collectionName="main") {
+    auto collection = soluxNode->getCollection(collectionName);
+    if (collection) {
+      collection->getShard()->getIndexWriter()->testDeleteAllData();
+    }
+  }
 };
 
 } // end namespace

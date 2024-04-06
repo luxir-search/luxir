@@ -33,7 +33,7 @@ public:
       LOG_DEBUG("Empty IndexReader");
     } else {
       InputStream segmentsIs = inputFile->getInputStream();
-      commitTimeUs = segmentsIs.readVlong();
+      commitTimeUs = segmentsIs.readLong();
       auto gen = segmentsIs.readVlong();
       int nsegs = segmentsIs.readVint();
       segs.reserve(nsegs);
@@ -44,7 +44,7 @@ public:
         maxdoc += segs.back().postingsReader().numDocs();
       }
     }
-    LOG_DEBUG("IndexReader opened with {} segments and {} docs", segs.size(), maxdoc);
+    LOG_DEBUG("IndexReader opened with {} segments and {} docs, commitTime={}", segs.size(), maxdoc, commitTimeUs);
   }
 
   // TODO: implement postingsReader sharing by passing in another IndexReader for reference.

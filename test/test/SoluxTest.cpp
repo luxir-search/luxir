@@ -14,6 +14,7 @@ static uint64_t global_random_seed;
 
 uint64_t SoluxTest::rng_seed;
 Rng SoluxTest::rng;
+SoluxNode* SoluxTest::soluxNode;
 
 
 class SoluxTestListener : public testing::EmptyTestEventListener {
@@ -124,6 +125,7 @@ int main(int argc, char **argv) {
 
   int ret = 0;
   solux::GRPCServer server;
+  solux::SoluxTest::soluxNode = &server.getSoluxNode();
 
   // TODO: pull this out and only do it on demand if the specific test needs it?
   std::thread serverThread([&server](){server.run();});

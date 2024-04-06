@@ -213,7 +213,7 @@ public:
       // TODO: verify directory has no other index files? (i.e. this would tend to indicate corruption)
     } else {
       InputStream segmentsIs = segFile->getInputStream();
-      lastCommitTime = lastAdvertisedCommitTime = segmentsIs.readVlong();
+      lastCommitTime = lastAdvertisedCommitTime = segmentsIs.readLong();
       gen = segmentsIs.readVlong();
       auto nSegs = segmentsIs.readVint();
       segInfos.reserve(nSegs);
@@ -386,7 +386,7 @@ public:
                 inverter.updateMessage == nullptr ? -1 : inverter.updateMessage->leftToFlush);
 
     {
-      // uncomment to serialize inverter flushing
+      // uncomment to serialize inverter flushing (for testing purposes)
       // const std::lock_guard<std::mutex> lock(indexMutex);
       inverter.flush();
     }
@@ -420,7 +420,7 @@ public:
       }
     }
 
-    // It shouldn't be a big deal to do a try_put inside the sync block, but it's safe to do outside.
+    // It shouldn't be a big deal to do a try_put inside the sync block, but it's safe to do outside anyway.
     if (triggerCommit) {
       commitSequencerNode->try_put(inverter.updateMessage);
     }
@@ -458,6 +458,11 @@ public:
     }
 
     // TODO: FIXME: this blocks other threads from getting the current reader.
+    // C++20 has waiting on atomic variables, that might be an easy way to prevent this.
+    // Tricky part will be handing different requests with different freshness requirements.  Multiple readers
+    // with different timestamps could be opening at once.  It's also the wrong tool if opening an IndexReader
+    // can take too long since blocking a thread won't allow other threads to perform other work.
+    // We should see if there is a TBB friendly way to do this.
     if (needNewReader) {
       indexReader = std::make_shared<IndexReader>(dir);
     }
@@ -545,6 +550,8 @@ public:
       now_us = lastCommitTime + 1;
     }
 
+    INDEX_DEBUG("writeIndexInfoFile: now_us={} lastCommitTime={} diff={}", now_us, lastCommitTime.load(), now_us - lastCommitTime.load());
+
     // TODO: should we write out segments in order of size or creation?
 
     // need to lock the indexMutex to get a consistent view of the segments.
@@ -570,7 +577,7 @@ public:
         return a->segId < b->segId;
       });
 
-      indexOut.writeVlong(now_us);
+      indexOut.writeLong(now_us);  // don't use Vlong since this is a big number
       indexOut.writeVlong(gen);
       indexOut.writeVint(sortedSegs.size());
       for (auto seg: sortedSegs) {
@@ -762,8 +769,47 @@ public:
 
 
   void mergeSegments(MemPool &pool, std::span<PostingsReader *> preaders, PostingsWriter &postingsWriter);
+
+
+  // called from tests only to remove all data.
+  void testDeleteAllData() {
+    INDEX_DEBUG("testDeleteAllData: deleting all data.");
+    // what for things in the execution graph to finish.
+    updateGraph.wait_for_all();
+
+    const std::lock_guard<std::mutex> lock(indexMutex);
+    // check if there are any unflushed segments
+    if (!busyInverters.empty() || !flushingInverters.empty()) {
+      LOG_ERROR("Error trying to clear index. There are busy or flushing inverters!");
+      return;
+    }
+    if (mergeRunning) {
+      LOG_ERROR("Error trying to clear index. There is a merge running!");
+      return;
+    }
+
+    // dump the current IndexReader
+    {
+      const std::lock_guard<std::mutex> lock(indexReaderMutex);
+      indexReader.reset();
+    }
+
+    // drop all idle inverters (unflushed segments)
+    idleInverters.clear();
+
+    // drop all segments
+    segInfos.clear();
+
+    // drop all index files
+    dir.clear();
+
+    lastCommitTime = lastAdvertisedCommitTime = 0;
+
+    // don't touch commitNumber or updateNumber... the TBB graph relies on the exact sequence of numbers.
+  }
+
+
 };
 
-// Should there be a single-threaded IndexWriter and a different multi-threaded version?
 
 }

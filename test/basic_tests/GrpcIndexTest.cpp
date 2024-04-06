@@ -570,12 +570,12 @@ TEST_F(GrpcIndexTest, addDocsStream2) {
 }
 
 TEST_F(GrpcIndexTest, visibility) {
-  // Setup request
+   clearCollection();
+   ASSERT_EQ(0, getDocCount());
 
   // Write Stream
   grpc::ClientContext wcontext;  // need a new one for each RPC
   std::unique_ptr<grpc::ClientReaderWriter<solux::proto::UpdateRequest, solux::proto::UpdateResponse>> wstream = indexerStub->UpdateStream(&wcontext);
-
 
   {
     solux::proto::UpdateRequest req;
@@ -626,7 +626,7 @@ TEST_F(GrpcIndexTest, visibility) {
 
   ASSERT_EQ(2, getDocCount());
 
-  bool ok = wstream->WritesDone();  // can replace with WriteLast? is it more efficient?
+  bool ok = wstream->WritesDone();
   ASSERT_TRUE(ok);
 
   solux::proto::UpdateResponse response;

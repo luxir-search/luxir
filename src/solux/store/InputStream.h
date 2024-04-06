@@ -65,7 +65,7 @@ public:
     uint32_t val = b & 0x7f;
     for (int shift = 7; (b & 0x80) != 0; shift += 7) {
       b = *pos++;
-      val |= (b & 0x7f) << shift;
+      val |= uint32_t(b & 0x7f) << shift;
     }
     assert(pos <= end);
     return val;
@@ -73,10 +73,10 @@ public:
 
   inline static uint64_t readVlong(const char *&pos, const char *end) {
     char b = *pos++;
-    uint32_t val = b & 0x7f;
+    uint64_t val = b & 0x7f;
     for (int shift = 7; (b & 0x80) != 0; shift += 7) {
       b = *pos++;
-      val |= (b & 0x7f) << shift;
+      val |= uint64_t(b & 0x7f) << shift;
     }
     assert(pos <= end);
     return val;
