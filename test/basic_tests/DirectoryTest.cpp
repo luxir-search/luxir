@@ -135,3 +135,59 @@ TEST_F(DirectoryTest, ramdirThreads) {
   RAMDir dir;
   doDirThreaded(dir);
 }
+
+TEST_F(DirectoryTest, dataTypes) {
+  RAMDir dir;
+  std::unique_ptr<File> f = dir.createFile("f1");
+  OutputStream os;
+  os.setFile(f.get());
+
+  Rng r = rng;  // take a snapshot for replayability
+  // write a bunch of different width integers and longs
+
+  int iterations = 5;  // results in file size of ~19K
+
+  for (int iter=0; iter<iterations; iter++) {
+    for (int i = 0; i < 65; i++) {
+      // max value of uint64_t defined in C++ headers is std::numeric_limits<uint64_t>::max()
+      uint64_t mask = std::numeric_limits<uint64_t>::max() >> (64 - i);
+      uint64_t val = r.rlong() & mask;
+      os.writeStr(std::to_string(val));
+      os.write((char) val);
+      os.writeInt((int32_t) val);
+      os.writeInt(-(int32_t) val);
+      os.writeVint((uint32_t) val);
+      os.writeVint(-(uint32_t) val);
+      os.writeLong((int64_t) val);
+      os.writeLong(-(int64_t) val);
+      os.writeVlong((uint64_t) val);
+      os.writeVlong(-(uint64_t) val);
+    }
+  }
+
+  os.close();
+  dir.finishFile(*f);
+
+  auto input = dir.openFile("f1");
+  auto is = input->getInputStream();
+  LOG_ERROR("file size={}", is.size());
+
+  r = rng;  // replay same random numbers
+  for (int iter=0; iter<iterations; iter++) {
+    for (int i = 0; i < 65; i++) {
+      uint64_t mask = std::numeric_limits<uint64_t>::max() >> (64 - i);
+      uint64_t val = r.rlong() & mask;
+      ASSERT_EQ(std::to_string(val), is.readStr());
+      ASSERT_EQ((char) val, is.readByte());
+      ASSERT_EQ((int32_t) val, is.readInt());
+      ASSERT_EQ(-(int32_t) val, is.readInt());
+      ASSERT_EQ((uint32_t) val, is.readVint());
+      ASSERT_EQ(-(uint32_t) val, is.readVint());
+      ASSERT_EQ((int64_t) val, is.readLong());
+      ASSERT_EQ(-(int64_t) val, is.readLong());
+      ASSERT_EQ((uint64_t) val, is.readVlong());
+      ASSERT_EQ(-(uint64_t) val, is.readVlong());
+    }
+  }
+
+}

@@ -86,11 +86,19 @@ public:
     return readVint(pos, end);
   }
 
-  // read 4 byte little endian integer
-  uint32_t readInt() {
+  // read signed 4 byte little endian integer
+  int32_t readInt() {
     assert(pos + sizeof(uint32_t) <= end);
     uint32_t val = *(uint32_t*)pos; // potentially unaligned read
     pos += sizeof(uint32_t);
+    return val;
+  }
+
+  // read signed 8 byte little endian integer
+  int64_t readLong() {
+    assert(pos + sizeof(uint64_t) <= end);
+    int64_t val = *(int64_t*)pos; // potentially unaligned read
+    pos += sizeof(int64_t);
     return val;
   }
 
@@ -100,7 +108,7 @@ public:
     // TODO: try replacing with a loop to 4 (to avoid running long if data is bad)
     for (int shift = 7; (b & 0x80) != 0; shift += 7) {
       b = readByte();
-      val |= (b & 0x7f) << shift;
+      val |= uint32_t(b & 0x7f) << shift;
     }
     return val;
   }
@@ -111,7 +119,7 @@ public:
     // TODO: try a loop to 8 (to avoid running long if data is bad)
     for (int shift = 7; (b & 0x80) != 0; shift += 7) {
       b = readByte();
-      val |= (b & 0x7f) << shift;
+      val |= uint64_t(b & 0x7f) << shift;
     }
     return val;
   }
