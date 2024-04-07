@@ -2,6 +2,7 @@
 
 #include <vector>
 #include <string_view>
+#include "gtl/btree.hpp"
 #include "OutputStream.h"
 
 namespace solux {
@@ -39,24 +40,8 @@ public:
   using InputReferenceType = std::shared_ptr<InputFileType>;
 
 private:
-  using entry_type = std::pair<std::string, InputReferenceType>;
-  using iterator_type = std::vector<entry_type>::iterator;
+  gtl::btree_map<std::string, InputReferenceType> files;
   std::mutex mutex;
-
-  // RAMDir uses a sorted vector to minimize the additional space requirements when there are tons of directories.
-  // Insertion will be fast since files are also generally produced in sorted order (although removing old ones will be slightly slower)
-  // We should still benchmark (time and space) vs a good ordered_map implementation in the future though.
-  // TODO: bulk operations (open/delete) could be done more efficiently (by prefix)
-  // TODO: C++23 has a std::flat_set now (as does boost), so we could use that.
-  std::vector<entry_type> files;
-
-  // returns <found,iterator> pair... iterator is the element if found==true or the insertion point if found==false.
-  std::pair<bool, iterator_type> find(const std::string_view &name) {
-    auto iter = std::lower_bound(files.begin(), files.end(), name,
-                                 [&](const entry_type &x, const std::string_view &key) { return x.first < key; }
-    );
-    return {!(iter == files.end() || iter->first != name), iter};
-  }
 
 public:
   RAMDir() = default;
@@ -77,9 +62,10 @@ public:
 
   std::shared_ptr<InputFile> openFile(const std::string_view &name) override {
     std::lock_guard<std::mutex> lock(mutex);
-    auto[found, iter] = find(name);
-    if (found) {
-      return iter->second;
+
+    auto find = files.find(name);
+    if (find != files.end()) {
+      return find->second;
     } else {
       return {};
     }
@@ -87,13 +73,8 @@ public:
 
   bool deleteFile(const std::string_view &name) override {
     std::lock_guard<std::mutex> lock(mutex);
-    auto[found, iter] = find(name);
-    if (found) {
-      files.erase(iter);
-      return true;
-    } else {
-      return false;
-    }
+
+    return files.erase(name);
   }
 
   std::unique_ptr<File> createFile(const std::string_view &name) override {
@@ -110,19 +91,10 @@ public:
 
     {
       std::lock_guard<std::mutex> lock(mutex);
-      // See if new file name is greater than all others produced (this is common by design)
-      if (files.empty() || files.back().first < file.name()) {
-        files.emplace_back(file.name(), std::move(inputFile));
-      } else {
-        auto [found, iter] = find(file.name());
-        if (found) {
-          // overwrite
-          *iter = {file.name(), std::move(inputFile)};
-        } else {
-          // insert
-          files.insert(iter, {file.name(), std::move(inputFile)});
-        }
-      }
+
+      // overwrite existing entries.
+      // TODO: we take pains to add files in order, so we should try a hint to add it at the end of the list.
+      files[file.name()] = std::move(inputFile);
     }
   }
 
