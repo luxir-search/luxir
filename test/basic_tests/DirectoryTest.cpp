@@ -88,8 +88,30 @@ protected:
     ASSERT_EQ(true, found);
 
     // make sure it's gone
-    auto input = dir.openFile("bbb");
-    ASSERT_TRUE(input.get() == nullptr);
+    {
+      auto input = dir.openFile("bbb");
+      ASSERT_TRUE(input.get() == nullptr);
+    }
+    
+    // Test delete by prefix
+    addFile(dir, "bb1", "yeah");
+    addFile(dir, "bbx2", "dude");
+    addFile(dir, "bbx3", "wow");
+    addFile(dir, "bb4", "zonks");
+
+    dir.deletePrefix("bbx");
+    {
+      auto input = dir.openFile("bb1");
+      ASSERT_TRUE(input.get() != nullptr);
+      input = dir.openFile("bbx2");
+      ASSERT_TRUE(input.get() == nullptr);
+      input = dir.openFile("bbx3");
+      ASSERT_TRUE(input.get() == nullptr);
+      input = dir.openFile("bb4");
+      ASSERT_TRUE(input.get() != nullptr);
+    }
+    // remove remaining test files for delete-prefix
+    dir.deletePrefix("bb");
 
     lst.resize(0);
     dir.listFiles(lst);

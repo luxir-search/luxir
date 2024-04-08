@@ -14,12 +14,22 @@ public:
   // appends a list of names to the referenced vector
   virtual void listFiles(std::vector<std::string> &target) = 0;
 
-  virtual std::shared_ptr<InputFile> openFile(const std::string_view &name) = 0;
+  virtual std::shared_ptr<InputFile> openFile(const std::string_view name) = 0;
 
-  virtual std::unique_ptr<File> createFile(const std::string_view &name) = 0;
+  virtual std::unique_ptr<File> createFile(const std::string_view name) = 0;
 
   // Returns true if file was found and deleted, false if not found.
-  virtual bool deleteFile(const std::string_view &name) = 0;
+  virtual bool deleteFile(const std::string_view name) = 0;
+
+  virtual void deletePrefix(const std::string_view prefix) {
+    std::vector<std::string> files;
+    listFiles(files);
+    for (const auto &file : files) {
+      if (file.starts_with(prefix)) {
+        deleteFile(file);
+      }
+    }
+  }
 
   // Make the file readable to others through the Directory.  Putting this on the Directory class
   // gives more flexibility in implementation without having every File have to point back to it's
@@ -52,7 +62,7 @@ public:
     files = std::move(other.files);
   }
 
-  void listFiles(std::vector<std::string> &target) override {
+  void listFiles(std::vector<std::string>& target) override {
     std::lock_guard<std::mutex> lock(mutex);
     target.reserve(files.size());
     for (const auto&[name, ifile] : files) {
@@ -60,7 +70,7 @@ public:
     }
   }
 
-  std::shared_ptr<InputFile> openFile(const std::string_view &name) override {
+  std::shared_ptr<InputFile> openFile(const std::string_view name) override {
     std::lock_guard<std::mutex> lock(mutex);
 
     auto find = files.find(name);
@@ -71,13 +81,26 @@ public:
     }
   }
 
-  bool deleteFile(const std::string_view &name) override {
+  bool deleteFile(const std::string_view name) override {
     std::lock_guard<std::mutex> lock(mutex);
 
     return files.erase(name);
   }
 
-  std::unique_ptr<File> createFile(const std::string_view &name) override {
+  void deletePrefix(const std::string_view prefix) override {
+    std::lock_guard<std::mutex> lock(mutex);
+
+    // Would erase range be more efficient here?  The number of items
+    // to be erased is relatively small (number of files in a segment)
+    for (auto it = files.lower_bound(prefix); it != files.end(); ) {
+      if (!it->first.starts_with(prefix)) {
+        break;
+      }
+      it = files.erase(it);
+    }
+  }
+
+  std::unique_ptr<File> createFile(const std::string_view name) override {
     return std::make_unique<OutputFileType>(name);
   }
 
