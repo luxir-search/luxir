@@ -635,6 +635,7 @@ public:
 
     updateMessage.blockerPtr = &blocker;
 
+
     blocker.wait(); // This kicks off the async work, and the callback (call to done()) will unblock this.
 
     auto& singleResponse = *response.add_responses();

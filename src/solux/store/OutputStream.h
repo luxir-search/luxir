@@ -291,6 +291,8 @@ public:
 
 class InputFile {
 public:
+  virtual ~InputFile() = default;
+
   virtual size_t size() = 0;
 
   // Reads all of the file and returns a pointer to the data, which should be valid as long as the InputFile is valid.

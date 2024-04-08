@@ -67,6 +67,10 @@ public:
     return std::string(PREFIX_FNAME).append(gen).append(suffix);
   }
 
+  static std::string getIndexFileNamePrefix(uint64_t segId) {
+    return std::string(PREFIX_FNAME).append(getSortableString(segId));
+  }
+
   /// Filename for the segment given the segment gen/number and the file number.
   /// Example: the 3rd file in the 4th segment produced would be "s04_03"
   static std::string getIndexFileName(const std::string_view gen, uint32_t filenum) {

@@ -34,7 +34,6 @@ public:
     } else {
       InputStream segmentsIs = inputFile->getInputStream();
       commitTimeUs = segmentsIs.readLong();
-      auto gen = segmentsIs.readVlong();
       int nsegs = segmentsIs.readVint();
       segs.reserve(nsegs);
       for (int i=0; i<nsegs; i++) {

@@ -115,6 +115,8 @@ public:
     {
       std::lock_guard<std::mutex> lock(mutex);
 
+      files.emplace_hint(files.end(), file.name(), inputFile);
+
       // overwrite existing entries.
       // TODO: we take pains to add files in order, so we should try a hint to add it at the end of the list.
       files[file.name()] = std::move(inputFile);

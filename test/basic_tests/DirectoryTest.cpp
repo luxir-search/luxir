@@ -92,7 +92,7 @@ protected:
       auto input = dir.openFile("bbb");
       ASSERT_TRUE(input.get() == nullptr);
     }
-    
+
     // Test delete by prefix
     addFile(dir, "bb1", "yeah");
     addFile(dir, "bbx2", "dude");
@@ -119,12 +119,14 @@ protected:
     ASSERT_EQ("f5", lst[1]);
 
     // test delete of open file
-    input = dir.openFile("aaa");
-    found = dir.deleteFile("aaa");
-    ASSERT_EQ(true, found);
-    auto data = input->read();
-    ASSERT_EQ(data.size(), aaa_data.size());
-    ASSERT_EQ(0, memcmp(data.data(), aaa_data.data(), data.size()));
+    {
+      auto input = dir.openFile("aaa");
+      found = dir.deleteFile("aaa");
+      ASSERT_EQ(true, found);
+      auto data = input->read();
+      ASSERT_EQ(data.size(), aaa_data.size());
+      ASSERT_EQ(0, memcmp(data.data(), aaa_data.data(), data.size()));
+    }
   }
 
   // create a test method to test for thread safety
