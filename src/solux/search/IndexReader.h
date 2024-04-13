@@ -27,22 +27,39 @@ public:
 
 
   IndexReader(Directory& dir) {
-    std::shared_ptr<InputFile> inputFile = dir.openFile(Postings::INDEX_INFO_FILE);
-    if (inputFile == nullptr) {
-      // throw exception, or just have zero segments? Or a single segment with no docs?
-      LOG_DEBUG("Empty IndexReader");
-    } else {
-      InputStream segmentsIs = inputFile->getInputStream();
-      commitTimeUs = segmentsIs.readLong();
-      int nsegs = segmentsIs.readVint();
-      segs.reserve(nsegs);
-      for (int i=0; i<nsegs; i++) {
-        uint64_t segId = segmentsIs.readVlong();
-        int32_t nDocs = segmentsIs.readVint();
-        segs.emplace_back(std::make_shared<PostingsReader>(dir, segId), maxdoc, i);
-        maxdoc += segs.back().postingsReader().numDocs();
+    // because old segments could be merged away before we have a chance to read them, we need
+    // to check if there is a new index info file and retry the open if so.
+    uint64_t lastCommitTime = 0;
+    bool retry = false;
+    do {
+      std::shared_ptr<InputFile> inputFile = dir.openFile(Postings::INDEX_INFO_FILE);
+      if (inputFile == nullptr) {
+        // throw exception, or just have zero segments? Or a single segment with no docs?
+        LOG_DEBUG("Empty IndexReader");
+      } else {
+        try {
+          InputStream segmentsIs = inputFile->getInputStream();
+          commitTimeUs = segmentsIs.readLong();
+          int nsegs = segmentsIs.readVint();
+          segs.reserve(nsegs);
+          for (int i = 0; i < nsegs; i++) {
+            uint64_t segId = segmentsIs.readVlong();
+            int32_t nDocs = segmentsIs.readVint();
+            segs.emplace_back(std::make_shared<PostingsReader>(dir, segId), maxdoc, i);
+            maxdoc += segs.back().postingsReader().numDocs();
+          }
+        } catch (std::filesystem::filesystem_error& e) {
+          // if this is the second time we've tried this same commit point, then throw the exception
+          LOG_ERROR("Error reading IndexReader: {}", e.what());
+          if (commitTimeUs > lastCommitTime) {
+            lastCommitTime = commitTimeUs;
+            retry = true;
+          } else {
+            throw;
+          }
+        }
       }
-    }
+    } while(retry);
     LOG_DEBUG("IndexReader opened with {} segments and {} docs, commitTime={}", segs.size(), maxdoc, commitTimeUs);
   }
 

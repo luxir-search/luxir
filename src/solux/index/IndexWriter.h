@@ -6,6 +6,7 @@
 #include <mutex>
 #include <span>
 #include <solux/util/thread.h>
+#include <solux/util/Signal.h>
 #include "boost/unordered/unordered_flat_map.hpp"
 #include "oneapi/tbb/flow_graph.h"
 #include "solux/store/Directory.h"
@@ -16,8 +17,8 @@
 #include "PostingsWriter.h"
 
 // redefine DEBUG to TRACE level which shouldn't currently be logged!
-#define INDEX_DEBUG LOG_TRACE
-// #define INDEX_DEBUG LOG_DEBUG
+// #define INDEX_DEBUG LOG_TRACE
+#define INDEX_DEBUG LOG_DEBUG
 
 namespace solux {
 
@@ -159,6 +160,9 @@ public:
           }
         }
       }
+
+      // debugging
+      LOG_DEBUG("update: seg={} segLevel={} segLevelCount={} mergeLevel={}", (void*)seg, !seg?-1:seg->mergeLevel, !seg?-1:levelCounts[seg->mergeLevel], mergeLevel);
 
       return mergeLevel;
     }
@@ -489,7 +493,7 @@ public:
       const std::lock_guard<std::mutex> lock(indexMutex);
 
       // segments are flushed in parallel, so the segids are not in order... (or in the completed order.) should be fine.
-      segInfos.emplace(segInfo->segId, std::move(segInfo));
+      auto iter = segInfos.emplace(segInfo->segId, std::move(segInfo));
 
       // remove the inverter from the flushingInverters set, but remember it until the end of this function.
       auto it = flushingInverters.find(&inverter);
@@ -510,7 +514,7 @@ public:
 
       // Check if we should merge anything.
       // We do this with the lock held since segInfo could go away otherwise.
-      mergePolicy->maybeMergeSegments(segInfo.get());
+      mergePolicy->maybeMergeSegments(iter.first->second.get());
     }
 
     // It shouldn't be a big deal to do a try_put inside the sync block, but it's safe to do outside anyway.
@@ -666,6 +670,8 @@ public:
     }
 
     INDEX_DEBUG("writeIndexInfoFile: now_us={} lastCommitTime={} diff={}", now_us, lastCommitTime.load(), now_us - lastCommitTime.load());
+    uint64_t numDocs = 0;
+    uint64_t numSegs = 0;
 
     // TODO: should we write out segments in order of size or creation?
 
@@ -673,6 +679,7 @@ public:
     // writing the info should be fast (no IO since it should all be buffered in mem)
     {
       const std::lock_guard<std::mutex> lock(indexMutex);
+      numSegs = segInfos.size();
 
       // Sort the list of segments by the segId.
       // Some tests rely on not reordering segments.
@@ -700,6 +707,7 @@ public:
         if (seg->commitTime == 0) {  // keep track of the first commit this segment appeared in.
           seg->commitTime = now_us;
         }
+        numDocs += seg->nDocs;
       }
     }
 
@@ -710,6 +718,8 @@ public:
     // advertise this commit only after the file is closed.
     lastCommitTime = now_us;
     lastAdvertisedCommitTime = now_us;
+
+    INDEX_DEBUG("\twriteIndexInfoFile DONE: commitTime={} numDocs={} numSegs={}", now_us, numDocs, numSegs);
   }
 
 
@@ -729,6 +739,8 @@ public:
         }
       }
     }
+
+    solux::Signal::emit("mergeStart", (void*)msg.mergeLevel, (void*)segs.size());
 
     // We need a way to do deletes after the commit has finished.  Create a new Msg that wraps the old one for this.
     class CommitDeleteMsg : public UpdateMessage {
@@ -799,6 +811,9 @@ public:
           } else {
             toDeleteSegs.emplace_back(std::move(it->second));
           }
+
+          // finally remove the entry from segInfos
+          segInfos.erase(it);
         }
 
         // Create & add the new SegmentInfo

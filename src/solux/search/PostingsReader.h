@@ -11,6 +11,7 @@
 #include <string>
 #include <charconv>
 #include <solux/util/screaming.h>
+#include <filesystem>
 #include "solux/store/Directory.h"
 #include "solux/store/InputStream.h"
 #include "solux/util/MemPool.h"
@@ -164,7 +165,7 @@ public:
 // PostingsReader should be thread-safe at the top level, but any iterators it supplies would not be.
 // This does not contain deleted docs, so instances can be shared by different index versions.
 class PostingsReader {
-  std::vector<std::shared_ptr<InputFile>> files;  // temporary owner of open files
+  std::vector<std::shared_ptr<InputFile>> files;  // keeps files live while this PostingsReader is live.
   std::vector<InputStream> inputStreams;
   int32_t maxdoc;
 public:
@@ -175,7 +176,6 @@ public:
   // used as a sentinel value for docs and positions iterators in a single segment.
   static constexpr int32_t END = std::numeric_limits<int32_t>::max();
 
-  // TODO temporary... this will likely be done at a higher level?
   explicit PostingsReader(Directory& dir, uint64_t segId) {
     int nFiles = 7;
     files.reserve(nFiles);
@@ -185,8 +185,9 @@ public:
     auto segInfoFile = Postings::getIndexFileName(segStr, 0);
     files.emplace_back(dir.openFile(segInfoFile));
     if (files.back().get() == nullptr) {
-      LOG_ERROR("Can't find/open first segment file {}", segInfoFile);
-      // TODO: throw exception?
+      throw std::filesystem::filesystem_error(
+              std::format("Can't find/open first segment file '{}'", segInfoFile),
+              std::make_error_code(std::errc::no_such_file_or_directory));
     }
     inputStreams.emplace_back(files[0]->getInputStream());
     firstIS = inputStreams[0];
@@ -195,6 +196,11 @@ public:
 
     for (int i=1; i<nFiles; i++) {
       files.emplace_back(dir.openFile(Postings::getIndexFileName(segStr, i)));
+      if (files.back().get() == nullptr) {
+        throw std::filesystem::filesystem_error(
+                std::format("Can't find/open segment file '{}'", Postings::getIndexFileName(segStr, i)),
+                std::make_error_code(std::errc::no_such_file_or_directory));
+      }
       inputStreams.emplace_back(files.back()->getInputStream());
     }
   }
