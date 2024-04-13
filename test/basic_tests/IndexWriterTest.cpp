@@ -122,6 +122,7 @@ TEST_F(IndexWriterTest, autoMerge) {
     ASSERT_EQ(MERGE_FACTOR - 1, reader->numDocs());
 
     addDoc(iw);
+
     // MERGE_FACTOR segments of the same size will set off an auto-merge.
     // For this reason, we need a callback to try grabbing the new IndexReader before the merge completes.
     // We need to block the merge operation until we've grabbed a new reader.
@@ -138,16 +139,37 @@ TEST_F(IndexWriterTest, autoMerge) {
     // later.
     // NOTE: this deadlocked since the wait() in the commit call work-steals the mergeSegments task (which will
     // only be un-blocked after the commit call completes).
-    iw.commit();
+    // Seems like we can't have both the commit work and the merge work be on the same thread.
 
+    /* deadlock version
+    iw.commit();
     // pre-merge view
     reader = iw.getIndexReader();
     ASSERT_EQ(reader->numDocs(), MERGE_FACTOR);
     ASSERT_EQ(reader->segments().size(), MERGE_FACTOR);
-
     mergeStart.count_down(); // let the merge continue
+    */
+
+    // What about using an async callback?
+    // What if I force it to be called from a separate thread?
+
+    // finish commit callback
+    auto finishCommit = [&]() {
+      auto reader = iw.getIndexReader();
+      mergeStart.count_down();  // let merge continue
+      EXPECT_EQ(reader->numDocs(), MERGE_FACTOR);
+      EXPECT_EQ(reader->segments().size(), MERGE_FACTOR);
+    };
+
+    iw.commit(UpdateMessage::CommitType::COMMIT, false, std::move(finishCommit));
+    /* not needed to avoid deadlock... using a callback and not a blocker that could work-steal was enough.
+    arena.execute([&](){
+      iw.commit(UpdateMessage::CommitType::COMMIT, false, std::move(finishCommit));
+    });
+    */
 
     // Now wait until the merge completes.
+    // If the commit is run in the same thread, this call can work-steal the mergeSegments task and deadlock.
     iw.updateGraph.wait_for_all();
 
     reader = iw.getIndexReader();

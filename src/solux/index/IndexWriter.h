@@ -17,8 +17,8 @@
 #include "PostingsWriter.h"
 
 // redefine DEBUG to TRACE level which shouldn't currently be logged!
-// #define INDEX_DEBUG LOG_TRACE
-#define INDEX_DEBUG LOG_DEBUG
+#define INDEX_DEBUG LOG_TRACE
+// #define INDEX_DEBUG LOG_DEBUG
 
 namespace solux {
 
@@ -161,8 +161,7 @@ public:
         }
       }
 
-      // debugging
-      LOG_DEBUG("update: seg={} segLevel={} segLevelCount={} mergeLevel={}", (void*)seg, !seg?-1:seg->mergeLevel, !seg?-1:levelCounts[seg->mergeLevel], mergeLevel);
+      INDEX_DEBUG("update: seg={} segLevel={} segLevelCount={} mergeLevel={}", (void*)seg, !seg?-1:seg->mergeLevel, !seg?-1:levelCounts[seg->mergeLevel], mergeLevel);
 
       return mergeLevel;
     }
@@ -383,6 +382,7 @@ public:
     mergeSegmentsNode = std::make_unique<MergeMessageMultiFunc>(updateGraph, 1,
       [this](MergeMessage* msg, MergeMessageMultiFunc::output_ports_type& op) {
         unused(op);
+        INDEX_DEBUG("mergeSegmentsNode: msg={}", (void*)&msg, msg->commitNum);
         this->mergeSegmentsBody(*msg);
     });
   }
@@ -611,11 +611,12 @@ public:
   }
 
   // TODO: this is test commit code.  Needs to migrate to use the TBB flow graph.
-  void commit(UpdateMessage::CommitType commitType=UpdateMessage::COMMIT, bool wait=true) {
+  void commit(UpdateMessage::CommitType commitType=UpdateMessage::COMMIT, bool wait=true, std::function <void()>&& callback={})  {
 
     class BlockingUpdateMessage : public UpdateMessage {
     public:
       Blocker* blockerPtr = nullptr;
+      std::function <void()> callback;
       void handle(IndexWriter& iw) override {
         unused(iw);
       }
@@ -624,6 +625,9 @@ public:
         if (blockerPtr) {
           blockerPtr->notify();  // if blocking, *this* will be on the stack, so no delete.
         } else {
+          if (callback) {
+            callback();
+          }
           delete this;  // not blocking, so *this* was heap allocated.
         }
       }
@@ -632,6 +636,7 @@ public:
     if (!wait) {
       BlockingUpdateMessage* updateMessage = new BlockingUpdateMessage();
       updateMessage->commit = commitType;
+      updateMessage->callback = std::move(callback);
       auto success = startUpdateNode->try_put(updateMessage);
       assert(success);
       return;

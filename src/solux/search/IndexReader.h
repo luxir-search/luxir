@@ -2,6 +2,10 @@
 #include <span>
 #include "PostingsReader.h"
 
+// redefine DEBUG to TRACE level which shouldn't currently be logged!
+#define IREADER_DEBUG LOG_TRACE
+// #define IREADER_DEBUG LOG_DEBUG
+
 namespace solux {
 
 /// IndexReader is thread safe
@@ -60,7 +64,7 @@ public:
         }
       }
     } while(retry);
-    LOG_DEBUG("IndexReader opened with {} segments and {} docs, commitTime={}", segs.size(), maxdoc, commitTimeUs);
+    IREADER_DEBUG("IndexReader opened with {} segments and {} docs, commitTime={}", segs.size(), maxdoc, commitTimeUs);
   }
 
   // TODO: implement postingsReader sharing by passing in another IndexReader for reference.
