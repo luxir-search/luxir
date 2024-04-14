@@ -29,6 +29,7 @@ class SoluxTestListener : public testing::EmptyTestEventListener {
 
   void OnTestStart(const testing::TestInfo &test_info) override {
     // std::cout << "STARTING TEST " << test_info.name() << std::endl;
+    solux::Signal::clear(); // clear all listeners before each test
     auto testnameHash = Hash::hash(test_info.name(), strlen(test_info.name()));
     rng_seed = (suiteHash << 32) +
                testnameHash;  // these are currently 32 bit hashes (from Hash::hash) so combine by shifting.

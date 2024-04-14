@@ -37,4 +37,9 @@ void Signal::unlisten(std::string_view name) {
   }
 }
 
+void Signal::clear() {
+  std::lock_guard<std::mutex> lock(Signal_mutex);
+  callbacks.reset();
+}
+
 } // namespace solux

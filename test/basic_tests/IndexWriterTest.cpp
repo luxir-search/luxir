@@ -105,6 +105,9 @@ TEST_F(IndexWriterTest, getReader) {
 
 // Test automatic merging kick-off
 TEST_F(IndexWriterTest, autoMerge) {
+  // This scope guard no longer needed since SoluxTest clears all listeners.
+  // auto cleaner = solux::scope_guard([](){ solux::Signal::unlisten("mergeStart");});
+
   for (int iter=0; iter<100; iter++) {
     RAMDir dir;
     IndexWriter iw(dir);

@@ -5,7 +5,7 @@
 #include <iostream>
 #include <vector>
 #include <memory.h>
-#include <experimental/scope>
+#include <type_traits>
 #include "log.h"
 
 // NOTE: this is better than including xxhash.h since it enables inline. Inverter performance equal to
@@ -17,8 +17,23 @@
 
 namespace solux {
 
-template <class T>
-using scope_exit = std::experimental::scope_exit<T>;
+// This scope guard will call the function when it goes out of scope.
+// lvalues are not copied/moved, rvalues are moved.
+// Example:
+//    auto cleaner = solux::scope_guard([](){ solux::Signal::unlisten("mergeStart");});  // lambda is moved
+//    auto cb = [](){ solux::Signal::unlisten("mergeStart");
+//    auto cleaner2 = solux::scope_guard(cb);  // lambda is not moved, only referenced.
+// Make sure the callback doesn't throw!
+template<typename F>
+class scope_guard {
+  public:
+    F func;
+  scope_guard(F&& f): func(std::forward<F>(f)) {}
+    ~scope_guard() { func();  }
+};
+template<typename F> scope_guard(F&& frv) -> scope_guard<F>;
+
+
 
 // gcc and msvc have different ways of specifying packing of structs :-(
 // use SOLUX_PACKED_START class X{} SOLUX_PACKED_END;
