@@ -127,9 +127,7 @@ public:
     MergePolicy(IndexWriter& iw) : iw(iw) {}
 
     // re-calculate the merges from scratch (i.e. not incrementally)
-    int32_t refresh() {
-
-    }
+    // int32_t refresh()
 
     // Update the merge level of a segment and return the segment level to merge, or -1 if no merge needed.
     // If seg is nullptr, then we check all segment levels for a merge.
@@ -188,8 +186,9 @@ public:
 
       class MyMergeMessage : public MergeMessage {
       public:
-        void handle(IndexWriter& iw) override {}
+        void handle(IndexWriter& iw) override { unused(iw); }
         void done(IndexWriter& iw) override {
+          unused(iw);
           delete this;
         }
       };
@@ -610,39 +609,45 @@ public:
     }
   }
 
-  // TODO: this is test commit code.  Needs to migrate to use the TBB flow graph.
-  void commit(UpdateMessage::CommitType commitType=UpdateMessage::COMMIT, bool wait=true, std::function <void()>&& callback={})  {
 
-    class BlockingUpdateMessage : public UpdateMessage {
+  // Asynchronous commit that calls the callback when the commit is finished.  This should be preferred over blocking.
+  void commit(std::function <void()>&& callback, UpdateMessage::CommitType commitType=UpdateMessage::COMMIT) {
+    class UpdateMessageWithCallback : public UpdateMessage {
     public:
-      Blocker* blockerPtr = nullptr;
       std::function <void()> callback;
       void handle(IndexWriter& iw) override {
         unused(iw);
       }
-      virtual void done(IndexWriter& iw) override {
+      void done(IndexWriter& iw) override {
         unused(iw);
-        if (blockerPtr) {
-          blockerPtr->notify();  // if blocking, *this* will be on the stack, so no delete.
-        } else {
-          if (callback) {
-            callback();
-          }
-          delete this;  // not blocking, so *this* was heap allocated.
-        }
+        callback();
+        delete this;
       }
     };
 
-    if (!wait) {
-      BlockingUpdateMessage* updateMessage = new BlockingUpdateMessage();
-      updateMessage->commit = commitType;
-      updateMessage->callback = std::move(callback);
-      auto success = startUpdateNode->try_put(updateMessage);
-      assert(success);
-      return;
-    }
+    UpdateMessageWithCallback* updateMessage = new UpdateMessageWithCallback();
+    updateMessage->commit = commitType;
+    updateMessage->callback = std::move(callback);
+    auto success = startUpdateNode->try_put(updateMessage);
+    assert(success);
+  }
 
+  // Synchronous commit.  This will effectively block but enter work-stealing mode if there is other work to do.
+  // If one is not careful, this work-stealing can result in deadlocks.  Consider using the async version.
+  void commit(UpdateMessage::CommitType commitType=UpdateMessage::COMMIT) {
+    class BlockingUpdateMessage : public UpdateMessage {
+    public:
+      Blocker* blockerPtr = nullptr;
+      void handle(IndexWriter& iw) override {
+        unused(iw);
+      }
+      void done(IndexWriter& iw) override {
+        unused(iw);
+        blockerPtr->notify();
+      }
+    };
 
+    // all stack allocated since we will be waiting for completion.
     BlockingUpdateMessage updateMessage;
     updateMessage.commit = commitType;
 
@@ -655,6 +660,7 @@ public:
 
     blocker.wait(); // This kicks off the async work, and the callback (call to done()) will unblock this.
   }
+
 
 
   // This is only called from the finishCommit node, which has concurrency==1 (single-threaded)
@@ -725,6 +731,7 @@ public:
     lastAdvertisedCommitTime = now_us;
 
     INDEX_DEBUG("\twriteIndexInfoFile DONE: commitTime={} numDocs={} numSegs={}", now_us, numDocs, numSegs);
+    unused(numSegs);
   }
 
 
@@ -745,7 +752,7 @@ public:
       }
     }
 
-    solux::Signal::emit("mergeStart", (void*)msg.mergeLevel, (void*)segs.size());
+    solux::Signal::emit("mergeStart", (void*)(int64_t)msg.mergeLevel, (void*)segs.size());
 
     // We need a way to do deletes after the commit has finished.  Create a new Msg that wraps the old one for this.
     class CommitDeleteMsg : public UpdateMessage {

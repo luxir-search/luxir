@@ -164,7 +164,7 @@ TEST_F(IndexWriterTest, autoMerge) {
       EXPECT_EQ(reader->segments().size(), MERGE_FACTOR);
     };
 
-    iw.commit(UpdateMessage::CommitType::COMMIT, false, std::move(finishCommit));
+    iw.commit(std::move(finishCommit), UpdateMessage::CommitType::COMMIT);
     /* not needed to avoid deadlock... using a callback and not a blocker that could work-steal was enough.
     arena.execute([&](){
       iw.commit(UpdateMessage::CommitType::COMMIT, false, std::move(finishCommit));
