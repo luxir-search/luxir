@@ -472,17 +472,22 @@ TEST_F(GrpcIndexTest, threadsafeIndex) {
   // we do task_group.wait() on the client side, and that can perhaps steal work from our server side?
   // Need a separate process to test higher concurrency levels.
   tbb::task_arena arena(std::thread::hardware_concurrency()/2);
-  arena.execute(
-          [&,this]{
-            // TODO: not sure if this isolate does anything useful here or not.
-            tbb::this_task_arena::isolate(
-                    [&,this]{
-                      doThreadSafeIndex(nTasks, callsPerTask, streamingPercent, commitPercent);
-                    }
-            );
-          }
+  tbb::task_group group;
+  arena.execute([&,this] {
+                  group.run(
+                          [&, this] {
+                            // TODO: not sure if this isolate does anything useful here or not.
+                            tbb::this_task_arena::isolate(
+                                    [&, this] {
+                                      doThreadSafeIndex(nTasks, callsPerTask, streamingPercent, commitPercent);
+                                    }
+                            );
+                          }
+                  );
+                }
   );
 
+  group.wait();
 }
 
 

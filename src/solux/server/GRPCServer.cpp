@@ -627,7 +627,7 @@ public:
     BlockingUpdateMessage updateMessage(&request);
 
     Blocker blocker([&]{
-      bool success = iw->startUpdateNode->try_put(&updateMessage);
+      bool success = iw->submitUpdate(&updateMessage);
       if (!success) {
         throw std::runtime_error("failed to put update message into startUpdateNode");
       }
@@ -731,7 +731,7 @@ public:
     Update* updateMessage = new Update(req, this); // TODO arena allocate this.
 
 
-    iw->startUpdateNode->try_put(updateMessage);
+    iw->submitUpdate(updateMessage);
 
     return true; // take ownership of request object since we used its arena (and we are handling async)
   }

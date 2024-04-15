@@ -49,6 +49,7 @@ Inverter::IndexHandler& Inverter::createIndexHandler(const std::string_view name
 
 
   auto [newIter, inserted] = indexHandlers.try_emplace(name, std::move(fieldHandler));
+  assert(inserted);  // we should never (currently) be trying to overwrite an existing handler
   return *(newIter->second);
 }
 

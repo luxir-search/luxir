@@ -126,8 +126,24 @@ public:
 
     MergePolicy(IndexWriter& iw) : iw(iw) {}
 
+    void setMergeFactor(int32_t mergeFactor) {
+      MERGE_FACTOR = mergeFactor;
+      inverseLogM = 1.0f / log2(MERGE_FACTOR);
+    }
+
+    void setMergeDocsFloor(int32_t mergeDocsFloor) {
+      MERGE_DOCS_FLOOR = mergeDocsFloor;
+    }
+
     // re-calculate the merges from scratch (i.e. not incrementally)
-    // int32_t refresh()
+    // does not kick off any merges.
+    void refresh() {
+      std::lock_guard<std::mutex> lock(iw.indexMutex);
+      levelCounts.clear();
+      for (auto& [segId, seg] : iw.segInfos) {
+        update(seg.get());
+      }
+    }
 
     // Update the merge level of a segment and return the segment level to merge, or -1 if no merge needed.
     // If seg is nullptr, then we check all segment levels for a merge.
@@ -386,6 +402,15 @@ public:
     });
   }
 
+  // Submit an update to the task graph.
+  bool submitUpdate(UpdateMessage* msg) {
+    // this is currently a simple submit to the startUpdateNode, but could be more complex in the future.
+    // We could also eliminate the startUpdateNode completely and just submit to the processUpdateNode
+    // after setting the sequence numbers.
+    return startUpdateNode->try_put(msg);
+  }
+
+private:
   void startUpdateBody(UpdateMessage& msg) {
     // if the start node can reject updates, then assigning sequence numbers should be done after that.
     // Sequences must start at 0 for the sequencer nodes.
@@ -535,7 +560,7 @@ public:
 
 
 
-
+public:
   // return a copy of the shared_ptr so that the instance it points to will never change while in use.
   std::shared_ptr<IndexReader> getIndexReader(uint64_t freshness_us = 0) {
     const std::lock_guard<std::mutex> lock(indexReaderMutex);
@@ -628,7 +653,7 @@ public:
     UpdateMessageWithCallback* updateMessage = new UpdateMessageWithCallback();
     updateMessage->commit = commitType;
     updateMessage->callback = std::move(callback);
-    auto success = startUpdateNode->try_put(updateMessage);
+    auto success = submitUpdate(updateMessage);
     assert(success);
   }
 
@@ -652,7 +677,7 @@ public:
     updateMessage.commit = commitType;
 
     Blocker blocker([&]{
-      bool success = startUpdateNode->try_put(&updateMessage);
+      bool success = submitUpdate(&updateMessage);
       assert(success);
     });
 
@@ -735,7 +760,7 @@ public:
   }
 
 
-
+private:
   // called from the mergeSegmentsNode which has concurrency==1 (single-threaded)
   void mergeSegmentsBody(MergeMessage& msg) {
     std::vector<SegInfo*> segs;
@@ -863,7 +888,7 @@ public:
     }
   }
 
-
+public:
   /// mostly for testing merge code currently... there is no concurrency control, etc.
   void mergeSegments() {
     // make sure we are getting the latest index reader (wasteful!)
@@ -934,6 +959,31 @@ public:
     lastCommitTime = lastAdvertisedCommitTime = 0;
 
     // don't touch commitNumber or updateNumber... the TBB graph relies on the exact sequence of numbers.
+  }
+
+
+  void debugInfo() {
+    {
+      std::lock_guard<std::mutex> lock(indexMutex);
+      LOG_INFO("IndexWriter: segInfos.size={} idleInverters.size={} busyInverters.size={} flushingInverters.size={}",
+               segInfos.size(), idleInverters.size(), busyInverters.size(), flushingInverters.size());
+      LOG_INFO("\tupdateNumber={} commitNumber={} lastCommitTime={} lastAdvertisedCommitTime={}",
+               updateNumber.load(), commitNumber.load(), lastCommitTime.load(), lastAdvertisedCommitTime.load());
+      LOG_INFO("\tmergePolicy->mergeRunning={}", mergePolicy->mergeRunning);
+      for (auto& [segId, seg] : segInfos) {
+        LOG_INFO("\t\tsegId={} nDocs={} mergeLevel={} commitTime={}", segId, seg->nDocs, seg->mergeLevel, seg->commitTime);
+      }
+    }
+
+    {
+      std::lock_guard<std::mutex> lock(indexReaderMutex);
+      LOG_INFO("IndexWriter: indexReader={} ", (void*)indexReader.get());
+      if (indexReader.get()) {
+        LOG_INFO("\tindexReader->commitTime={}", indexReader->commitTime());
+      }
+    }
+
+    // Debug info on TBB graph?
   }
 
 

@@ -3,10 +3,14 @@
 #include <iostream>
 #include <solux/index/Inverter.h>
 #include <latch>
+#include <solux/server/ProtoUpdateMessage.h>
 
 #include "solux/index/IndexWriter.h"
 #include "solux/search/IndexReader.h"
 #include "test/SoluxTest.h"
+
+#define TEST_DEBUG LOG_TRACE
+// #define TEST_DEBUG LOG_DEBUG
 
 using namespace std;
 using namespace solux;
@@ -108,10 +112,14 @@ TEST_F(IndexWriterTest, autoMerge) {
   // This scope guard no longer needed since SoluxTest clears all listeners.
   // auto cleaner = solux::scope_guard([](){ solux::Signal::unlisten("mergeStart");});
 
-  for (int iter=0; iter<100; iter++) {
+  auto iterations = 1;  // increase for more thorough testing
+  for (auto iter=0; iter<iterations; iter++) {
     RAMDir dir;
     IndexWriter iw(dir);
-    int MERGE_FACTOR = 10;
+    int MERGE_FACTOR = 3;
+    iw.mergePolicy->setMergeDocsFloor(1);
+    iw.mergePolicy->setMergeFactor(MERGE_FACTOR);
+    iw.mergePolicy->refresh();  // should be a no-op at this point since no existing segs.
 
     // add  segments
     for (int i = 0; i < MERGE_FACTOR - 1; i++) {
@@ -179,4 +187,230 @@ TEST_F(IndexWriterTest, autoMerge) {
     ASSERT_EQ(reader->numDocs(), MERGE_FACTOR);
     ASSERT_EQ(reader->segments().size(), 1);
   }
+}
+
+
+// Multithreaded test of IndexWriter updates, commits, merges, and IndexReader reopen during those.
+TEST_F(IndexWriterTest, multiThreaded) {
+  int requestThreads = 4;
+  int docsToAdd = 100;
+  int percentReads = 20;
+  int percentCommits = 50;  // really stress segment flushing / merging
+
+  RAMDir dir;
+  IndexWriter iw(dir);
+  int MERGE_FACTOR = 3;
+  iw.mergePolicy->setMergeDocsFloor(1);
+  iw.mergePolicy->setMergeFactor(MERGE_FACTOR);
+  iw.mergePolicy->refresh();  // should be a no-op at this point since no existing segs.
+
+  std::atomic_long docsRequested(0);
+  std::atomic_long docsAdded(0);
+  std::atomic_long docsVisible(0);
+  std::atomic_long commitsRequested(0);
+  std::atomic_long commits(0);
+
+  class UpdateInfo {
+  public:
+    int32_t seqNum;
+    short numAdds;
+    byte commitType;
+  };
+  std::vector<UpdateInfo> updates;
+  updates.reserve(docsToAdd*2);
+  std::mutex testMutex;
+
+
+  class TestProtoUpdateMessage : public ProtoUpdateMessage {
+  public:
+    solux::proto::UpdateRequest updateRequest;
+    std::function<void(TestProtoUpdateMessage&)> callback = nullptr;
+    TestProtoUpdateMessage(std::function<void(TestProtoUpdateMessage&)> callback) : ProtoUpdateMessage(&updateRequest), callback(callback) {}
+
+    void done(IndexWriter& iw) override {
+      unused(iw);
+      if (callback) {
+        callback(*this);
+      }
+      delete this;
+    }
+  };
+
+  auto cb = [&](TestProtoUpdateMessage& msg) {
+            TEST_DEBUG("done called! adds in this request={}", updateRequest.docs_size());
+    if (msg.updateRequest.commit() == solux::proto::UpdateRequest::COMMIT) {
+      commits++;
+    }
+    docsAdded += msg.updateRequest.docs_size();
+    {
+      std::lock_guard<std::mutex> lock(testMutex);
+      for (int i = 0; i < msg.updateRequest.docs_size(); i++) {
+        UpdateInfo ui;
+        ui.seqNum = msg.seqNum;
+        ui.numAdds = msg.updateRequest.docs_size();
+        ui.commitType = (byte)msg.commit;
+        updates.push_back(ui);
+      }
+    }
+
+#ifdef REMOVED
+    // this isn't valid test code since done() messages *can* be called out of order.  Updates with a commit
+    // have to go through further through the pipeline and can thus have their done() method called later.
+    auto localLastUpdateSeen = lastUpdateSeen.load();
+    if ((int64_t)msg.seqNum < localLastUpdateSeen) {
+      LOG_ERROR("Out of order update done()! {} vs {}", msg.seqNum, localLastUpdateSeen);
+      FAIL();
+    }
+    if ((int64_t)msg.seqNum != localLastUpdateSeen + 1) {
+      LOG_ERROR("Update done() skipped a sequence number! this={} last={}", msg.seqNum, localLastUpdateSeen);
+      FAIL();
+    }
+    while ((int64_t)msg.seqNum > localLastUpdateSeen) {
+      lastUpdateSeen.compare_exchange_weak(localLastUpdateSeen, (int64_t)msg.seqNum);
+      localLastUpdateSeen = lastUpdateSeen.load();
+    }
+#endif
+
+  };
+
+
+
+  try {
+    tbb::task_group tasks;
+
+    for (int iter = 0; iter < requestThreads; iter++) {
+      tasks.run([&]() {
+                  try {
+                    bool writesDone = false;
+                    for (;;) {
+                      if (writesDone || rng.rint(100) < percentReads) {
+                        auto reader = iw.getIndexReader();
+                        auto localDocsVisible = reader->numDocs();
+                        auto globalDocsVisible = docsVisible.load();
+                        // make sure we don't go backwards with respect to number of visible documents.
+                        EXPECT_GE(localDocsVisible, globalDocsVisible);
+                        while (localDocsVisible > globalDocsVisible) {
+                          if (!docsVisible.compare_exchange_weak(globalDocsVisible, localDocsVisible)) {
+                            globalDocsVisible = docsVisible.load();
+                          }
+                        }
+
+                        // LOG_DEBUG("\tvisible docs: {} segs: {}", localDocsVisible, reader->segments().size());
+
+                        if (globalDocsVisible >= docsToAdd && globalDocsVisible >= docsAdded) {
+                          // we've seen all the docs
+                          break;
+                        }
+                      }
+
+                      // NOTE: since write submission is async and done in a loop, this can pile up a lot of writes in the queue
+                      // really fast!  Perhaps we should yield when docsRequested - docsAdded is too large?
+                      if (!writesDone) {
+                        auto* msg = new TestProtoUpdateMessage(cb);
+                        solux::proto::UpdateRequest* ureq = &msg->updateRequest;
+                        bool doCommit = rng.rint(100) < percentCommits;
+                        int64_t numAdds = rng.rint(doCommit ? 0 : 1,
+                                                   3);  // lower bound on number of adds is 0 if we're going to commit
+
+                        // make sure we don't go over the number of docs we want to add
+                        // this makes it harder to figure out when we should do final commits.
+                        if (numAdds > 0) {
+                          for (;;) {
+                            auto localDocsRequested = docsRequested.load();
+                            numAdds = std::min(numAdds, docsToAdd - localDocsRequested);
+                            if (numAdds == 0) {
+                              doCommit = true;  // turn into a commit if it wasn't already.
+                            }
+                            assert(localDocsRequested + numAdds <= docsToAdd);  // sanity check
+                            if (docsRequested.compare_exchange_weak(localDocsRequested, localDocsRequested + numAdds)) {
+                              break;
+                            }
+                          }
+                        }
+
+                        ureq->set_commit(doCommit ? solux::proto::UpdateRequest::COMMIT : solux::proto::UpdateRequest::NO_COMMIT);
+                        // Normal ProtoUpdateMessage sets commit from request in constructor. Since that has already passed, need to do it manually here.
+                        msg->commit = doCommit ? UpdateMessage::CommitType::COMMIT : UpdateMessage::CommitType::NO_COMMIT;
+                        for (int i = 0; i < numAdds; i++) {
+                          auto& fields = *ureq->add_docs()->mutable_fields();
+                          fields[field].set_s("now is the time for all");
+                        }
+
+                        if (doCommit) {
+                          commitsRequested++;
+                        }
+
+                        if (doCommit && docsRequested.load() >= docsToAdd) {
+                          // we're done with writes as long as we ended with a commit.
+                          writesDone = true;
+                        }
+
+                        TEST_DEBUG("\tsubmitting update with {} adds, commit={}", numAdds, doCommit);
+                        auto success = iw.submitUpdate(msg);
+                        if (!success) {
+                          FAIL();
+                        }
+                      }
+
+                      TEST_DEBUG("\t\tdocsRequested: {}, docsAdded: {}, docsVisible: {}, commitsRequested: {}, commits: {}",
+                              docsRequested.load(), docsAdded.load(), docsVisible.load(), commitsRequested.load(),
+                              commits.load());
+                    }
+                    TEST_DEBUG("Done with request thread");
+
+                  } catch (std::exception& e) {
+                    LOG_ERROR("################# Exception in request thread: {}", e.what());
+                    FAIL();
+                  }
+                }
+
+      );
+    }
+
+    tasks.wait();
+    iw.updateGraph.wait_for_all();
+
+    // If request threads are failing to stop, but this block of code above tasks.wait() and uncomment the sleep
+    // std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+    while (docsRequested.load() < docsToAdd || docsVisible.load() < docsToAdd) {
+      auto reader = iw.getIndexReader();
+      LOG_INFO("### Main Thread docsRequested: {}, docsAdded: {}, docsVisible: {}, commitsRequested: {}, commits: {}",
+              docsRequested.load(), docsAdded.load(), reader->numDocs(), commitsRequested.load(), commits.load());
+
+
+      if (docsRequested.load() >= docsToAdd && reader->numDocs() < docsToAdd) {
+        if (iw.lastAdvertisedCommitTime != reader->commitTime()) {
+          LOG_ERROR("Reader not seeing last advertised commit time! {} vs {}", iw.lastAdvertisedCommitTime.load(), reader->commitTime());
+        }
+
+        iw.debugInfo();
+
+        // let's look at the last number of commits:
+        int start = std::max(0, (int)updates.size() - 100);
+        for (int i = start; i < (int)updates.size(); i++) {
+          auto& ui = updates[i];
+          LOG_INFO("{}: seqNum={} numAdds={} commitType={}", i, ui.seqNum, ui.numAdds, ui.commitType);
+        }
+
+        iw.commit();
+        reader = iw.getIndexReader();
+        if (reader->numDocs() == docsToAdd) {
+          LOG_ERROR("FINAL COMMIT MADE DOCS VISIBLE! Test Bug or IW bug?");
+          FAIL();
+        } else {
+          break;
+        }
+      }
+    }
+
+
+  } catch (std::exception& e) {
+    LOG_ERROR("################# Exception in main thread: {}", e.what());
+    FAIL();
+  }
+
+  EXPECT_EQ(docsRequested.load(), docsToAdd);
+  EXPECT_EQ(docsRequested.load(), docsAdded.load());
+  EXPECT_EQ(docsRequested.load(), docsVisible.load());
+  EXPECT_EQ(commitsRequested.load(), commits.load());
 }
