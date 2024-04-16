@@ -103,8 +103,13 @@ public:
     // write segment info (size,docs) segments file as well so we don't have to open the segment to determine it?
     int64_t sizeInBytes = 0;
     int32_t nDocs = 0;
-    int32_t mergeLevel = 0;
+    int32_t mergeLevel = -1;
     bool merging = false;  // set to true when a merge is in progress with this segment as input.
+
+    // Set to true when this segment is being removed from the index. The reason it's not just immediately
+    // removed is that if it was part of a published commit, we need to keep it around until the next commit.
+    // It should not count as a segment for merge purposes.
+    bool beingRemoved = false;
 
     // atomic shared pointer since it could be set / mutated by either the IW (setting or clearing),
     // or by IndexReader opening code.
@@ -117,6 +122,7 @@ public:
   class MergePolicy {
     std::vector<SegInfo*> segsCopy;
     std::vector<int32_t> levelCounts;
+    int32_t segCount = 0;  // a sanity check that we are in-sync with segments in the IndexWriter.
   public:
     IndexWriter& iw;
     bool mergeRunning = false;
@@ -124,6 +130,7 @@ public:
     int32_t MERGE_DOCS_FLOOR = 1000;  // all segments below this will be counted as level 0
     float inverseLogM = 1.0f / log2(MERGE_FACTOR);
 
+    // Methods with _ prefix should be called with the indexMutex already locked.
     MergePolicy(IndexWriter& iw) : iw(iw) {}
 
     void setMergeFactor(int32_t mergeFactor) {
@@ -139,20 +146,49 @@ public:
     // does not kick off any merges.
     void refresh() {
       std::lock_guard<std::mutex> lock(iw.indexMutex);
+      _refresh();
+    }
+
+    void _refresh() {
+      segCount = 0;
       levelCounts.clear();
       for (auto& [segId, seg] : iw.segInfos) {
-        update(seg.get());
+        _update(seg.get());
+      }
+    }
+
+    void _sanityCheck() {
+
+#ifdef REMOVED
+      // count up segments that aren't being removed:
+      int count = 0;
+      for (auto& [segId, seg] : iw.segInfos) {
+        if (!seg->beingRemoved) {
+          count++;
+        } else {
+          LOG_ERROR("Encountered a segment being removed, which should never happen currently. segId={}", segId);
+        }
+      }
+#endif
+
+      if ((size_t)segCount != iw.segInfos.size()) {
+        LOG_ERROR(
+                "Internal Error, please report. MergePolicy segCount {} does not match live segment count of {}.",
+                segCount, iw.segInfos.size());
+        _refresh();  // Fix the bug.  This currently no longer triggers, but is left here for defensive reasons.
       }
     }
 
     // Update the merge level of a segment and return the segment level to merge, or -1 if no merge needed.
     // If seg is nullptr, then we check all segment levels for a merge.
     // Call with indexMutex locked.
-    int32_t update(SegInfo* seg) {
+    int32_t _update(SegInfo* seg) {
       // assert that the index mutex is locked
       int32_t mergeLevel = -1;
 
       if (seg != nullptr) {
+        segCount++;
+
         if (seg->nDocs < MERGE_DOCS_FLOOR) {
           seg->mergeLevel = 0;
         } else {
@@ -181,18 +217,20 @@ public:
     }
 
     // Call with indexMutex locked.
-    void remove(SegInfo* seg) {
+    void _remove(SegInfo* seg) {
+      segCount--;
+      seg->beingRemoved = true;
       if (seg->mergeLevel >= 0) {
         levelCounts[seg->mergeLevel]--;
       }
     }
 
     // Call with indexMutex locked
-    void maybeMergeSegments(SegInfo* seg) {
+    void _maybeMergeSegments(SegInfo* seg) {
       int mergeLevel = -1;
       {
         // const std::lock_guard<std::mutex> lock(iw.indexMutex);
-        mergeLevel = update(seg);
+        mergeLevel = _update(seg);
         if (mergeLevel < 0 || mergeRunning) {
           return;
         }
@@ -330,7 +368,7 @@ public:
         // having ndocs in the list of segments is redundant with info in the segment itself and may be removed later.
         // for now it makes it easy to populate nDocs for merge decisions.
         auto it = segInfos.emplace(segId, std::make_unique<SegInfo>(segId, nDocs));
-        mergePolicy->update(it.first->second.get());
+        mergePolicy->_update(it.first->second.get());
       }
     }
 
@@ -538,7 +576,7 @@ private:
 
       // Check if we should merge anything.
       // We do this with the lock held since segInfo could go away otherwise.
-      mergePolicy->maybeMergeSegments(iter.first->second.get());
+      mergePolicy->_maybeMergeSegments(iter.first->second.get());
     }
 
     // It shouldn't be a big deal to do a try_put inside the sync block, but it's safe to do outside anyway.
@@ -775,6 +813,10 @@ private:
           segs.push_back(seg.second.get());
         }
       }
+
+      // Sanity check this merge. a bug in testDeleteAllData led to merge accounting getting out-of-sync
+      // with actual segments and resulted in a merge loop.
+      mergePolicy->_sanityCheck();
     }
 
     solux::Signal::emit("mergeStart", (void*)(int64_t)msg.mergeLevel, (void*)segs.size());
@@ -832,7 +874,7 @@ private:
       {
         const std::lock_guard<std::mutex> lock(indexMutex);
         for (auto segInfo : segs) {
-          mergePolicy->remove(segInfo);
+          mergePolicy->_remove(segInfo);
           auto it = segInfos.find(segInfo->segId);
           assert(it != segInfos.end());
           if (it == segInfos.end()) {
@@ -855,7 +897,7 @@ private:
 
         // Create & add the new SegmentInfo
         auto newSegInfo = std::make_unique<SegInfo>(pwriter.getSegId(), pwriter.getMaxDoc());
-        mergePolicy->update(newSegInfo.get());
+        mergePolicy->_update(newSegInfo.get());
         segInfos.emplace(pwriter.getSegId(), std::move(newSegInfo));
       } // end index lock
 
@@ -876,6 +918,7 @@ private:
       commitDeleteMsg->prevMsg = &msg;
 
       // Bypass the sequencer node and go directly to the commit node so we don't have to flow through the complete graph.
+      // This is fine since we don't care how the commit interleaves with other updates or commits.
       commitFinishNode->try_put(commitDeleteMsg.release());
     } else {
       msg.done(*this);
@@ -884,7 +927,7 @@ private:
     // check if we need another merge
     {
       const std::lock_guard<std::mutex> lock(indexMutex);
-      mergePolicy->maybeMergeSegments(nullptr);
+      mergePolicy->_maybeMergeSegments(nullptr);
     }
   }
 
@@ -922,44 +965,50 @@ public:
   void mergeSegments(MemPool &pool, std::span<PostingsReader *> preaders, PostingsWriter &postingsWriter);
 
 
-  // called from tests only to remove all data.
+  // Called from tests only to remove all data.
+  // This is difficult to get right though... we should really add the ability to empty the index through
+  // the API and then use that (prob through the merge code since it's the only place segments are removed)
   void testDeleteAllData() {
-    INDEX_DEBUG("testDeleteAllData: deleting all data.");
+            INDEX_DEBUG("testDeleteAllData: deleting all data.");
     // wait for things in the execution graph to finish.
     updateGraph.wait_for_all();
 
-    const std::lock_guard<std::mutex> lock(indexMutex);
-    // check if there are any unflushed segments
-    // TODO: just dropping the segments may not be safe in the future, it may leave stuff around in the directory
-    // (or even open files in the future).  We should probably do a commit first before we drop?
-    if (!busyInverters.empty() || !flushingInverters.empty()) {
-      LOG_ERROR("Error trying to clear index. There are busy or flushing inverters!");
-      return;
-    }
-    if (mergePolicy && mergePolicy->mergeRunning) {
-      LOG_ERROR("Error trying to clear index. There is a merge running!");
-      return;
-    }
-
-    // dump the current IndexReader
     {
-      const std::lock_guard<std::mutex> lock(indexReaderMutex);
-      indexReader.reset();
+      const std::lock_guard<std::mutex> lock(indexMutex);
+      // check if there are any unflushed segments
+      // TODO: just dropping the segments may not be safe in the future, it may leave stuff around in the directory
+      // (or even open files in the future).  We should probably do a commit first before we drop?
+      if (!busyInverters.empty() || !flushingInverters.empty()) {
+        LOG_ERROR("Error trying to clear index. There are busy or flushing inverters!");
+        return;
+      }
+      if (mergePolicy && mergePolicy->mergeRunning) {
+        LOG_ERROR("Error trying to clear index. There is a merge running!");
+        return;
+      }
+
+      // dump the current IndexReader
+      {
+        const std::lock_guard<std::mutex> lock(indexReaderMutex);
+        indexReader.reset();
+      }
+
+      // drop all idle inverters (unflushed segments)
+      idleInverters.clear();
+
+      // drop all segments
+      segInfos.clear();
+
+      // drop all index files
+      dir.clear();
+
+      lastCommitTime = lastAdvertisedCommitTime = 0;
     }
-
-    // drop all idle inverters (unflushed segments)
-    idleInverters.clear();
-
-    // drop all segments
-    segInfos.clear();
-
-    // drop all index files
-    dir.clear();
-
-    lastCommitTime = lastAdvertisedCommitTime = 0;
+    mergePolicy->refresh();  // we can't call this with lock held since it tries to acquire.
 
     // don't touch commitNumber or updateNumber... the TBB graph relies on the exact sequence of numbers.
   }
+
 
 
   void debugInfo() {

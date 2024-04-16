@@ -217,7 +217,10 @@ TEST_F(IndexWriterTest, multiThreaded) {
     byte commitType;
   };
   std::vector<UpdateInfo> updates;
-  updates.reserve(docsToAdd*2);
+  bool recordUpdates = false;
+  if (recordUpdates) {
+    updates.reserve(docsToAdd * 2);
+  }
   std::mutex testMutex;
 
 
@@ -242,7 +245,7 @@ TEST_F(IndexWriterTest, multiThreaded) {
       commits++;
     }
     docsAdded += msg.updateRequest.docs_size();
-    {
+    if (recordUpdates) {
       std::lock_guard<std::mutex> lock(testMutex);
       for (int i = 0; i < msg.updateRequest.docs_size(); i++) {
         UpdateInfo ui;
@@ -385,7 +388,10 @@ TEST_F(IndexWriterTest, multiThreaded) {
 
         iw.debugInfo();
 
-        // let's look at the last number of commits:
+        // let's look at the last number of updates:
+        if (!recordUpdates) {
+          LOG_INFO("Test: consider re-running with recordUpdates=true in this test to see the last updates");
+        }
         int start = std::max(0, (int)updates.size() - 100);
         for (int i = start; i < (int)updates.size(); i++) {
           auto& ui = updates[i];
