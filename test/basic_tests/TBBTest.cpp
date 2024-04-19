@@ -247,57 +247,73 @@ TEST_F(TBBTest, testNoConsumer) {
 #endif
 
 
-void foo() {
+void doBlockers(int n) {
+
+  class MyBlocker : public Blocker {
+  public:
+    std::atomic_int status = 0;
+    void wait() {
+      // LOG_DEBUG("BLOCKING this={}", (void*)this);
+      Blocker::wait();
+      // LOG_DEBUG("UNBLOCK  this={}", (void*)this);
+    }
+
+    void notify() {
+      // LOG_DEBUG("NOTIFY   this={} status=", (void*)this, status.load());
+      Blocker::notify();
+    }
+  };
 
   // create a graph and a multi-function node
   oneapi::tbb::flow::graph g;
-  using MyNodeType = tbb::flow::multifunction_node<Blocker*, std::tuple<Blocker*>>;
-  MyNodeType notifier2(g, tbb::flow::unlimited, [](Blocker* blocker, MyNodeType::output_ports_type& op) {
+  using MyNodeType = tbb::flow::multifunction_node<MyBlocker*, std::tuple<Blocker*>>;
+  MyNodeType notifier2(g, tbb::flow::unlimited, [](MyBlocker* blocker, MyNodeType::output_ports_type& op) {
     unused(op);
+    blocker->status = 1;
     blocker->notify();
   });
-  MyNodeType notifier(g, tbb::flow::unlimited, [&](Blocker* blocker, MyNodeType::output_ports_type& op) {
+  MyNodeType notifier(g, tbb::flow::unlimited, [&](MyBlocker* blocker, MyNodeType::output_ports_type& op) {
     unused(op);
     // std::this_thread::sleep_for(std::chrono::milliseconds(1));
     // blocker->notify();
     notifier2.try_put(blocker); // exercise more of the graph machinery
   });
 
-  int n=1000;
-  std::vector<std::unique_ptr<Blocker>> blockers;
+  std::vector<std::unique_ptr<MyBlocker>> blockers;
   for (int i=0; i<n; i++) {
-    blockers.emplace_back(std::make_unique<Blocker>());
+    blockers.emplace_back(std::make_unique<MyBlocker>());
     // notifier.try_put(blockers.back().get());
   }
 
   // create a task group
   oneapi::tbb::task_group tg;
   for (int i=0; i<n; i++) {
-    tg.run([&]{
+    tg.run([&,i]{
       blockers[i]->wait();
+      EXPECT_EQ(1, blockers[i]->status.load());  // if wait returned, notify must have been called.
     });
-    tg.run([&]{
+    tg.run([&,i]{
       // cause some blockers to call wait() first, others call notify() first.
       notifier.try_put(blockers[(i+n/2)%n].get());
     });
   }
 
   tg.wait();
+  g.wait_for_all();
 }
 
-// #define DISABLED_TEST3
-#ifdef DISABLED_TEST3
 TEST_F(TBBTest, testBlocker) {
-  // TODO: why does the blocker strategy still deadlock when used with indexing??? is it the test threads?
+  doBlockers(100);
+}
 
+//#define DISABLED_TEST3
+#ifdef DISABLED_TEST3
+TEST_F(TBBTest, testBlockerStress) {
   oneapi::tbb::task_arena arena(8);
-
   arena.execute([&]{
     for (int i=0; i<100; i++) {
-      foo();
+      doBlockers(1000);
     }
   });
-
-
 }
 #endif
