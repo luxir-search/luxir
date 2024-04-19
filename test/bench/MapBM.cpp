@@ -6,6 +6,7 @@
 #include "gtl/phmap.hpp"
 #include "boost/unordered/unordered_flat_map.hpp"
 #include "boost/unordered/unordered_flat_set.hpp"
+// boost unordered_flat_set does not have a try_emplace or lazy_emplace, so it is not clear how to use.
 #ifdef ROBIN_HOOD_HASHING
 #include <robin_hood.h>
 #endif

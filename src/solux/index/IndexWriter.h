@@ -700,13 +700,13 @@ public:
   void commit(UpdateMessage::CommitType commitType=UpdateMessage::COMMIT) {
     class BlockingUpdateMessage : public UpdateMessage {
     public:
-      Blocker* blockerPtr = nullptr;
+      Blocker blocker;
       void handle(IndexWriter& iw) override {
         unused(iw);
       }
       void done(IndexWriter& iw) override {
         unused(iw);
-        blockerPtr->notify();
+        blocker.notify();
       }
     };
 
@@ -714,14 +714,10 @@ public:
     BlockingUpdateMessage updateMessage;
     updateMessage.commit = commitType;
 
-    Blocker blocker([&]{
-      bool success = submitUpdate(&updateMessage);
-      assert(success);
-    });
+    bool success = submitUpdate(&updateMessage);
+    assert(success);
 
-    updateMessage.blockerPtr = &blocker;
-
-    blocker.wait(); // This kicks off the async work, and the callback (call to done()) will unblock this.
+    updateMessage.blocker.wait();
   }
 
 

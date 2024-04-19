@@ -614,29 +614,20 @@ public:
 
     class BlockingUpdateMessage : public ProtoUpdateMessage {
     public:
-      Blocker* blockerPtr;
+      Blocker blocker;
       BlockingUpdateMessage(solux::proto::UpdateRequest* req) : ProtoUpdateMessage(req) {
-        // commit = UpdateMessage::CommitType::COMMIT;     // TODO: FIXME: TESTING: always do commit for now
       }
       virtual void done(IndexWriter& iw) override {
         unused(iw);
-        blockerPtr->notify();
+        blocker.notify();
       }
     };
 
     BlockingUpdateMessage updateMessage(&request);
+    bool success = iw->submitUpdate(&updateMessage);
+    assert(success);
 
-    Blocker blocker([&]{
-      bool success = iw->submitUpdate(&updateMessage);
-      if (!success) {
-        throw std::runtime_error("failed to put update message into startUpdateNode");
-      }
-    });
-
-    updateMessage.blockerPtr = &blocker;
-
-
-    blocker.wait(); // This kicks off the async work, and the callback (call to done()) will unblock this.
+    updateMessage.blocker.wait();
 
     auto& singleResponse = *response.add_responses();
     singleResponse.set_request_id(request.request_id());

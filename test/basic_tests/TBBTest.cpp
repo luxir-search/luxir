@@ -266,16 +266,19 @@ void foo() {
   int n=1000;
   std::vector<std::unique_ptr<Blocker>> blockers;
   for (int i=0; i<n; i++) {
-    blockers.emplace_back(std::make_unique<Blocker>([i,&notifier,&blockers]{
-      notifier.try_put(blockers[i].get());
-    }));
+    blockers.emplace_back(std::make_unique<Blocker>());
+    // notifier.try_put(blockers.back().get());
   }
 
   // create a task group
   oneapi::tbb::task_group tg;
   for (int i=0; i<n; i++) {
-    tg.run([i,&blockers]{
+    tg.run([&]{
       blockers[i]->wait();
+    });
+    tg.run([&]{
+      // cause some blockers to call wait() first, others call notify() first.
+      notifier.try_put(blockers[(i+n/2)%n].get());
     });
   }
 
