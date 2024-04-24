@@ -1,4 +1,6 @@
 #pragma once
+
+#include "solux/search/SearchEngine.h"
 #include "solux/store/Directory.h"
 #include "solux/index/IndexWriter.h"
 #include "oneapi/tbb/task_arena.h"
@@ -84,6 +86,7 @@ class SoluxNode {
 public:
   SoluxNode() {
     createSingletons();
+    searchEngine = std::make_unique<SearchEngine>(*this);
   }
 
   // ALTERNATIVE: instead of nested maps, we could also have a single map directly to Collection or Shard objects
@@ -127,10 +130,16 @@ public:
     return taskArena;
   }
 
+  SearchEngine& getSearchEngine() {
+    return *searchEngine;
+  }
+
+
 private:
 
   void createSingletons();
 
+  std::unique_ptr<SearchEngine> searchEngine;
   std::shared_ptr<Library> root;
   // temporary singletons
   RAMDir dir;

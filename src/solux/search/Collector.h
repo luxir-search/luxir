@@ -76,8 +76,17 @@ class TopDocsCollector {
     return pq.size();
   }
 
+  void merge(TopDocsCollector& other) {
+    // In some scenarios, popping the top of the other heap until it's no longer competitive will be faster,
+    // while in other scenarios just a linear scan of the other heap will be faster.
+    // We'll just do a linear scan for now.
+    for (int i = 0; i < other.size(); i++) {
+      collect(other.topDocs[i].doc.segment(), other.topDocs[i].doc.docId(), other.topDocs[i].score);
+    }
+  }
 
   // Since we use min-heap comparators in our priority queues, the list will be reverse-sorted (smallest last)
+  // Repeated calls to pop() on the priority queue will also return the docs in order.
   void sort() {
     std::sort_heap(topDocs.begin(), topDocs.begin() + pq.size(), scoreComp);
   }

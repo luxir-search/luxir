@@ -18,6 +18,11 @@ public:
     g.reserve_wait();
   }
 
+  // If this blocker is used in a loop, call this again to cause the next call to wait() to block again.
+  void reserve_wait() {
+    g.reserve_wait();
+  }
+
   // enter TBB work-stealing loop until someone else calls blocker.notify()
   void wait() {
     g.wait_for_all();  // this "blocks" (but enters TBB work stealing loop)
