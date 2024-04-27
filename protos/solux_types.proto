@@ -153,7 +153,7 @@ message SearchResult {
 message DocList {
   sint64 matches = 1;
   float max_score = 2;
-  Columns columns = 3;
+  map<string, Column> columns = 3;
   int64 offset = 4;
   bool more = 5; // expect more results to be streamed back?
 }
@@ -337,6 +337,8 @@ message Column {
 
 message ColInt {
   optional sint64 missing_val = 1;
+  // we could also use a bitset for missing values, but that might be slightly harder to use for some people?
+  // bytes missing_bits = 3;
   repeated sint64 v = 2;
 }
 

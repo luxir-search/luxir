@@ -39,6 +39,11 @@ public:
     std::function<void(Request&)> callback;
     MemPool requestPool;
 
+    // TODO: abstract task dispatching here?  i.e. a run method that can run in a task-group, or run immediately.
+    virtual void run(std::function<void()>&& task) {
+      task();
+    }
+
     Request(SearchEngine& engine, solux::proto::SearchRequest& proto, google::protobuf::Arena& reqArena): engine(engine), proto(proto), reqArena(reqArena) {
     }
   };
@@ -75,6 +80,10 @@ public:
     Query* query;
     Query::Weight* weight;
     int64_t topCount;  // maximum number of docs to return.
+
+    std::string_view name;  // what search operation was this for?
+    const solux::proto::TopDocs* topDocsProto;  // the relevant part of the protobuf request
+
     std::function<void(QueryReq&)> callback;
 
     // Concurrent merge strategy:
@@ -165,9 +174,13 @@ public:
       }
     }
 
-
-
-
+    void start() {
+      for (int32_t i=0; i<req.reader->segments().size(); i++) {
+        req.run([this, i]() {
+          this->collect(i);
+        });
+      }
+    }
   };
 
 
@@ -197,13 +210,14 @@ public:
   }
 
 
-
   void submitBody(SearchEngine::Request& req) {
-    // We probably want to parse all up-front in a single task so we understand all
-    // of the dependencies.  We can always revisit if this becomes an issue.
+    // We probably want to parse all up-front in a single task to understand dependencies.
+    // of the dependencies.
     // In the future, things like acquiring the indexreader should also be done in a task since it could take a while.
 
     solux::proto::SearchRequest& proto = req.proto;
+
+    QueryReq* queryReq = nullptr;  // only support a single query for now.
 
     for (auto& [opKey, searchOp] : proto.ops()) {
       switch (searchOp.kind_case()) {
@@ -233,24 +247,206 @@ public:
 
           auto* qcontext = google::protobuf::Arena::Create<Query::Context>(&req.reqArena, req.requestPool, *req.reader);
           auto* qr = google::protobuf::Arena::Create<QueryReq>(&req.reqArena, req, *qcontext, query, limit);
+          qr->callback = [this](QueryReq& qr) {
+            fillQueryTopNResponse(qr);
+          };
+          qr->name = opKey;  // stringview to the key in the map.  This *should* be stable give that we don't modify the request.
+          qr->topDocsProto = &topDocsReq;
 
-          // todo: set callback to do the next step
-
+          queryReq = qr;
         } // end case
           break;
       } // end switch
     } // end for ever searchOp
 
+    if (queryReq != nullptr) {
+      // We have a query to run
+      queryReq->start();
+    } else {
+      // no queries to run, so we are done.
+      req.callback(req);
+    }
+  }
+
+  // this is currently called afer all segments have been collected
+  void fillQueryTopNResponse(QueryReq& qr) {
+    // For a single response, we can use the same arena as the request.
+    // TODO: move this elsewhere.  It will be shared by different queries, and query parts.  perhaps finalResponse on the request object?
+    auto* rspProto = google::protobuf::Arena::Create<solux::proto::SearchResponse>(&qr.req.reqArena);
+    rspProto->set_request_id(qr.req.proto.request_id());
+    auto& searchResultProto = rspProto->mutable_ops()->operator[](qr.name);
+    auto* docListProto = searchResultProto.mutable_docs();
+
+//    message DocList {
+//       sint64 matches = 1;
+//       float max_score = 2;
+//       Columns columns = 3;
+//       int64 offset = 4;
+//       bool more = 5; // expect more results to be streamed back?
+//    }
+
+    // grab the TopDocs from the collector and fill in the fields.
+    auto& collector = qr.collectorHolder.load()->collector;
+    docListProto->set_offset(0);
+
+    if (qr.topDocsProto->get_number()) {
+      docListProto->set_matches(collector.totalHits());
+    }
+
+    // Should we somehow do auto-sizing of return messages?
+    // We could load largest field first and cut it off after it gets big enough.  That can't really be
+    // parallelized easily though.
+    // We could also do it based on index data of the average column size.
+
+    int columnSize = collector.size();  // return all docs in the collector for now.
+
+    if (columnSize > 0) {
+      bool returnScores = qr.topDocsProto->get_scores();
+      collector.sort();
+
+      // sort the documents so we can access them in order of both segment and docid
+      std::vector<uint8_t> sortedIdx(columnSize); // works up to 256 docs.
+      for (int i=0; i<columnSize; i++) {
+        sortedIdx[i] = i;
+      }
+      // for small int lists, std::sort is faster than radix sort.
+      std::sort(sortedIdx.begin(), sortedIdx.end(), [&collector](auto a, auto b) {
+        return collector.topDocs[a].doc < collector.topDocs[b].doc;
+      });
+
+      auto& columnsProto = *docListProto->mutable_columns();
+
+      // Lets look at the stored fields
+      for (std::string_view field : qr.topDocsProto->fields()) {
+        // should we allow _scores_ as a field name?
+        if (field == "_score_") {
+          // TODO: if we are going to allow this, we would need to check earlier int he code to make sure we are recording scores.
+          returnScores = true;
+          continue;
+        }
+
+        // look up the field in the schema
+        auto& fieldType = *qr.req.schema->getFieldTypeEx(field);
+        switch (fieldType.type()) {
+          case FieldType::Type::INT: {
+            auto& intColProto = columnsProto[field];
+            auto& intCol = *intColProto.mutable_col_i();
+            auto& intsProto = *intCol.mutable_v();
+            // intCol.set_missing_val(0); // TODO.... get from schema? Set even if all values present?
+            intsProto.Reserve(columnSize);
+            std::span<int64_t> target(&intsProto[0], &intsProto[columnSize-1]);
+            assert(target.size() == columnSize);  // Ensure protobuf is contiguous (is this guaranteed or impl detail?)
+            loadIntCol(qr.req, field, fieldType, collector, sortedIdx, target, std::numeric_limits<int64_t>::min());
+          }
+          break;
+        } // int field
+      }  // for each field
+
+      // fill in scores if requested
+      if (returnScores) {
+        auto& scoresProto = columnsProto["_score_"];
+        auto& floatColProto = *scoresProto.mutable_col_f();
+        auto& floatsProto = *floatColProto.mutable_v();
+        // floatColProto.set_missing_val(-1.0f); // TODO
+        floatsProto.Reserve(columnSize);
+        for (int i=0; i<columnSize; i++) {
+          floatsProto.Add(collector.topDocs[i].score);
+        }
+      }
+    }
+  }
+
+  // TODO: abstract the iterator over the documents since we will have different ways of getting the ids.  Perhaps just a callable that returns a segdoc given an index?
+  void loadIntCol(SearchEngine::Request& req, std::string_view field, FieldType& fieldType, const TopDocsCollector& collector, const std::span<uint8_t> sortedIdx, std::span<int64_t> target, int64_t missingVal) {
+    MemPool scratchPool;
+
+    // find ranges of documents in each segment
+    int start = 0;
+    int end = sortedIdx.size() - 1;
+    auto& topDocs = collector.topDocs;
+
+    while(start < sortedIdx.size()) {
+      auto startSeg = topDocs[sortedIdx[start]].doc.segment();
+      auto endSeg = topDocs[sortedIdx[end]].doc.segment();
+      while (endSeg != startSeg) {
+        auto mid = (start + end) >> 1;  // no chance of overflow since small range.
+        endSeg = topDocs[sortedIdx[mid]].doc.segment();
+        if (endSeg != startSeg) {
+          end = mid;
+          continue;
+        }
+        // At this point, seg(mid) == startSeg, but we probably jumped over the true end which
+        // is somewhere between [mid, end).
+        // We could do another exponential search to move mid up while still the same seg, but
+        // may not be worth it given the small list sizes.  The previous phase of moving the end pointer down
+        // handles the bad case of many segments and one doc per segment.
+        // Just linear search to find the end for now.
+        for (int i=mid+1; i<end; i++) {
+          if (topDocs[sortedIdx[i]].doc.segment() != startSeg) {
+            end = i-1;
+            break;
+          }
+        }
+      }
+
+      loadIntColSeg(req.reader->segments()[startSeg].postingsReader(), field, fieldType, collector, sortedIdx.subspan(start, end-start+1), target, missingVal, startSeg, scratchPool);
+      start++;
+    }
 
   }
 
+  void loadIntColSeg(PostingsReader& postingsReader, std::string_view field, FieldType& fieldType, const TopDocsCollector& collector, const std::span<uint8_t> sortedIdx, std::span<int64_t> target, int64_t missingVal, int32_t segNum, MemPool& scratch) {
+    auto guard = scratch.rewindScopeGuard();
+    FieldReader fieldReader(scratch, postingsReader);
+    bool found = fieldReader.seek(field);
+    if (!found) {
+      // field not found in this segment.  fill missing values
+      for (auto idx : sortedIdx) {
+        target[idx] = missingVal;
+      }
+      return;
+    }
 
-  void doFindTopN(QueryReq& qr) {
+    SegFieldInfo segFieldInfo;
+    fieldReader.readFieldInfo(segFieldInfo);
+    IntColReader intColReader(scratch, postingsReader, segFieldInfo);
+    IntColReader::Iterator iter(intColReader);
 
+    int32_t next = -1;
+    for (auto idx : sortedIdx) {
+      auto segdoc = collector.topDocs[sortedIdx[idx]].doc;
+      assert(segdoc.segment() == segNum);
+      int32_t docid = segdoc.docId();
+      if (docid < next) {
+        target[idx] = missingVal;
+        continue;
+      }
 
+      if (docid > next) {
+        next = iter.advance(docid);
+      }
 
-
+      if (docid == next) {
+        target[idx] = iter.value();
+      } else {
+        target[idx] = missingVal;
+      }
+    }
   }
+
+  void loadStoredFields() {
+    // We need the spec of what fields to load.  A column-wise load would be more efficient, and
+    // we should probably default to a column representation for returned results as well.
+    // Unfortunately, filling in values in-place across multiple tasks would most likely lead to bad cache effects
+    // via false-sharing.
+
+    // If we wanted to do batches of less than 256, we could use byte indexes (plus an offset) into the sorted docs.
+
+    // How to implement returning all fields?  We can check per-field if the number of fields is small, but
+    // otherwise (maybe) add index info for what fields a document has?  Or maybe just for dynamic fields?
+  }
+
+
 
   SearchEngine(const SearchEngine&) = delete;
   SearchEngine& operator=(const SearchEngine&) = delete;
