@@ -7,6 +7,7 @@
 #include <span>
 #include <solux/util/thread.h>
 #include <solux/util/Signal.h>
+#include <solux/server/SoluxError.h>
 #include "boost/unordered/unordered_flat_map.hpp"
 #include "oneapi/tbb/flow_graph.h"
 #include "solux/store/Directory.h"
@@ -59,6 +60,8 @@ public:
   // making this an atomic is not enough to avoid race conditions since we also depend on coordination with
   // inverter->updateMessage, among other things.
   uint32_t leftToFlush = 0;  // internal use only
+
+  ErrorHolder result;
 };
 
 class MergeMessage : public UpdateMessage {
@@ -461,7 +464,12 @@ private:
 
   void processUpdateBody(UpdateMessage& msg) {
     INDEX_DEBUG("processUpdateBody: msg={}", (void*)&msg);
-    msg.handle(*this);
+    try {
+      msg.handle(*this);
+    } catch (std::exception& e) {
+      INDEX_DEBUG("processUpdateBody Exception Caught: exception={}", (void*)&msg, e.what());
+      msg.result.setException(e);
+    }
   }
 
   void finishUpdateBody(UpdateMessage& msg) {
@@ -540,10 +548,13 @@ private:
     INDEX_DEBUG("segmentFlushBody: inverter={} msg={} msg.leftToFlush={}", (void*)&inverter, (void*)inverter.updateMessage,
                 inverter.updateMessage == nullptr ? -1 : inverter.updateMessage->leftToFlush);
 
-    {
+    try {
       // uncomment to serialize inverter flushing (for testing purposes)
       // const std::lock_guard<std::mutex> lock(indexMutex);
       inverter.flush();
+    } catch (std::exception& e) {
+      LOG_ERROR("Exception caught while flushing inverter: {}", e.what());
+      // Now what?  This is pretty catastrophic.
     }
 
     auto segInfo = std::make_unique<SegInfo>(inverter.getPostingsWriter().segId, inverter.getPostingsWriter().getMaxDoc());

@@ -163,23 +163,23 @@ public:
   }
 
   // Async version of index.  Docs will be moved into the update message.
-  void index(const Doc&& doc, std::function<void()>&& callback,
+  void index(Doc&& doc, std::function<void(ErrorHolder& result)>&& callback,
              UpdateMessage::CommitType commitType = UpdateMessage::NO_COMMIT) {
     index(std::vector<Doc>{doc}, std::move(callback), commitType);
   }
 
 
   // Async version of index.  Docs will be moved into the update message.
-  void index(const std::vector<Doc>&& docs, std::function<void()>&& callback,
+  void index(std::vector<Doc>&& docs, std::function<void(ErrorHolder& result)>&& callback,
              UpdateMessage::CommitType commitType = UpdateMessage::NO_COMMIT) {
     auto writer = collection().getShard()->getIndexWriter();
 
     class UpdateMessageWithCallback : public SimpleUpdateMessage {
     public:
-      std::function<void()> callback;
+      std::function<void(ErrorHolder& result)> callback;
       const std::vector<Doc> docs;
 
-      UpdateMessageWithCallback(const std::vector<Doc>&& docs) : docs(std::move(docs)) {
+      UpdateMessageWithCallback(std::vector<Doc>&& docs) : docs(std::move(docs)) {
       }
 
       void handle(IndexWriter& iw) override {
@@ -188,7 +188,7 @@ public:
 
       void done(IndexWriter& iw) override {
         unused(iw);
-        callback();
+        callback(result);
         delete this;
       }
     };

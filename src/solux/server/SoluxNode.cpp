@@ -3,6 +3,14 @@
 
 namespace solux {
 
+SoluxNode::SoluxNode() {
+  createSingletons();
+  searchEngine = std::make_unique<SearchEngine>(*this);
+}
+
+SoluxNode::~SoluxNode() {
+}
+
 void SoluxNode::createSingletons() {
   collection = std::make_shared<Collection>();
   collection->schema = Schema::createSchema();

@@ -1,9 +1,9 @@
 #pragma once
 
-#include "solux/search/SearchEngine.h"
 #include "solux/store/Directory.h"
 #include "solux/index/IndexWriter.h"
 #include "oneapi/tbb/task_arena.h"
+#include "solux/search/SearchEngine.h"
 
 namespace solux {
 
@@ -11,7 +11,7 @@ namespace solux {
 /// A single SoluxNode can host many indexes.
 /// There still *may* be multiple SoluxNode instances per process, but it's currently more for testing.
 
-
+class SearchEngine;
 class Library;
 class Collection;
 class SoluxNode;
@@ -84,10 +84,8 @@ private:
 
 class SoluxNode {
 public:
-  SoluxNode() {
-    createSingletons();
-    searchEngine = std::make_unique<SearchEngine>(*this);
-  }
+  SoluxNode();
+  ~SoluxNode();
 
   // ALTERNATIVE: instead of nested maps, we could also have a single map directly to Collection or Shard objects
   // and represent metadata in the hierarchy.  This choice needs to be informed by the external representation
