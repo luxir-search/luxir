@@ -216,6 +216,19 @@ TEST_F(MemPoolTest, rewind) {
     ASSERT_GT(pool.size(), sz);
   }
   ASSERT_EQ(pool.size(), sz);
+
+  // thread local rewind
+  auto poolGuard = MemPool::threadLocalPoolGuard();
+  sz = poolGuard.pool().size();
+  {
+    auto poolGuard = MemPool::threadLocalPoolGuard();
+    char* x = poolGuard.pool().alloc(3);
+    *x = 'x';
+    char* y = poolGuard.pool().alloc(4);
+    *y = 'y';
+    ASSERT_GT(poolGuard.pool().size(), sz);
+  }
+  ASSERT_EQ(poolGuard.pool().size(), sz);
 }
 
 TEST_F(MemPoolTest, randRewind) {
