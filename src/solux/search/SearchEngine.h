@@ -2,7 +2,7 @@
 
 #include <solux/query/ProtobufQueryParser.h>
 #include <oneapi/tbb/flow_graph.h>
-#include "solux/server/SoluxNode.h"
+#include <solux/server/SoluxNode.h>
 #include "protos/solux_types.pb.h"
 #include "IndexReader.h"
 #include "Collector.h"
@@ -10,7 +10,10 @@
 namespace solux {
 
 class SoluxNode;
-
+class Collection;
+class Library;
+class IndexReader;
+class Schema;
 
 
 /// The SearchEngine is a singleton owned by the SoluxNode object and is responsible for
@@ -25,6 +28,8 @@ public:
 
   }
 
+  class Response;
+
   // The top-level request for the SearchEngine.
   class Request {
     // Thoughts: if there are many different types of callbacks, then subclassing could be a better match.
@@ -32,20 +37,36 @@ public:
     // allows for a lambda to be passed in, which can be much more concise.
   public:
     SearchEngine& engine;
+    // we should try to minimize the amount that these protobuf classes are used in case we need to move to a
+    // more efficient implementation later.  Or even different formats like arrow.
     solux::proto::SearchRequest& proto;
     google::protobuf::Arena& reqArena;
     std::shared_ptr<IndexReader> reader;
     std::shared_ptr<Schema> schema;
-    std::function<void(Request&)> callback;
     MemPool requestPool;
+    oneapi::tbb::task_group* tg = nullptr;  // optional top-level task group for this request.
 
-    // TODO: abstract task dispatching here?  i.e. a run method that can run in a task-group, or run immediately.
-    virtual void run(std::function<void()>&& task) {
-      task();
-    }
 
     Request(SearchEngine& engine, solux::proto::SearchRequest& proto, google::protobuf::Arena& reqArena): engine(engine), proto(proto), reqArena(reqArena) {
     }
+
+    /// Call this to send a response back to the client (or cause it to be buffered).  This can be called multiple times for a single request.
+    /// replyComplete will be called when the response has actually been written and is no longer needed.
+    virtual int reply(Response& response) { return 0;};
+
+    /// This is called when we are finished with the response object (e.g. it has been written to a socket and not just buffered)
+    /// Solux's streaming async grpc needs to keep track of when more responses are expected.  If no more responses are
+    /// expected, "last" will be set to true.  The object representing the streaming request in the gRPC server will
+    /// be deleted after this call with "last==true" and should not be used again.
+    virtual void replyCallback(Response& response, bool last) {};
+    // TODO: pull up the "last" part of this callback into a grpc streaming-server specific subclass?  It may not
+    // make sense for a local request.  After all, the number of responses will often be dynamic
+    // and not known ahead of time.
+
+    /// This will be called last after all responses have been sent back to the client.
+    /// This is the place to do final cleanup (such as deleting or resetting the Arena)
+    /// It may delete *this*, so nothing else should be accessed after this is called.
+    virtual void done() {};
   };
 
   // A response object that can be used to send back results to the client.
@@ -67,7 +88,7 @@ public:
     // Data lifetime can vary a bit... think about sending query response back first, then facet response later.
     //
     // It feels like we are duplicating TBB graph stuff here.  Maybe we should do a high level wait-for-all per search
-    // request?  BUT long streaming search would then lock out everyone else?
+    // request?
 
     Response(SearchEngine::Request& req, solux::proto::SearchResponse* proto=nullptr, google::protobuf::Arena* rspArena=nullptr): req(req), proto(proto), rspArena(rspArena) {
     }
@@ -103,16 +124,18 @@ public:
     };
     std::atomic<CollectorHolder*> collectorHolder;
 
-    // TODO: consider getting rid of the "req" parameter to make this more generic (usable standalone, etc)
-    QueryReq(SearchEngine::Request& req, Query::Context& qcontext, Query* query, int64_t topCount, std::function<void(QueryReq&)>callback={}): req(req), qcontext(qcontext), callback(std::move(callback)) {
+    //  req, *qcontext, query, limit
+    QueryReq(SearchEngine::Request& req, Query::Context& qcontext, Query* query, int64_t topCount, std::function<void(QueryReq&)>callback={})
+    : req(req), qcontext(qcontext), query(query), topCount(topCount), callback(std::move(callback)) {
       weight = query->createWeight(qcontext);
     }
 
     CollectorHolder* getCollector() {
       auto holder = collectorHolder.exchange(nullptr);
       if (holder == nullptr) {
-        holder = new CollectorHolder(topCount);
+        holder = new CollectorHolder({TopDocsCollector(topCount), 0, true});
       }
+      return holder;
     }
 
     /// Merge one collector into the other and return the merged collector.  It could be either a or b.
@@ -163,20 +186,30 @@ public:
 
     void collect(int32_t segnum) {
       // get other resources we need first before obtaining the collector.
+      MemPool scratch;
+      auto scorer = weight->createScorer(scratch, qcontext.topReader.segments()[segnum]);
 
-
-
-      auto holder = getCollector();
+      auto* holder = getCollector();
+      auto& collector = holder->collector;
+      for(;;) {
+        auto doc = scorer->next();
+        if (doc == PostingsReader::END) {
+          break;
+        }
+        auto score = scorer->score();
+        collector.collect(segnum, doc, score);
+      }
 
       if (releaseCollector(holder)) {
         // we are done, so we can call the callback
+        // we could use a nested task_group to wait until we are done here as well.
         callback(*this);
       }
     }
 
-    void start() {
+    void start(oneapi::tbb::task_group* tg) {
       for (int32_t i=0; i<req.reader->segments().size(); i++) {
-        req.run([this, i]() {
+        task_group_run(tg, [this, i]() {
           this->collect(i);
         });
       }
@@ -191,7 +224,7 @@ public:
   // TODO: enable the ability to return partial results (i.e. query and facet results separately,
   // or multiple queries separately, or intermediate facet results!)
 
-  void submit(SearchEngine::Request* req) {
+  void submit(SearchEngine::Request& req) {
     // we need to figure out what the dependencies are for the search request and then
     // fire off the top-level requests.
 
@@ -207,17 +240,20 @@ public:
     //  - send back separate results as each part is ready
     // We may not know ahead of time if the results will be large?  In which case, we'll need to
     //  decide to stream back more results even if client requested single-response (based on some limit?)
+
+
+    submitBody(req);
   }
 
 
   void submitBody(SearchEngine::Request& req) {
+    getResources(req);
+
     // We probably want to parse all up-front in a single task to understand dependencies.
-    // of the dependencies.
-    // In the future, things like acquiring the indexreader should also be done in a task since it could take a while.
 
     solux::proto::SearchRequest& proto = req.proto;
 
-    QueryReq* queryReq = nullptr;  // only support a single query for now.
+    std::vector<QueryReq*> queryReqs;
 
     for (auto& [opKey, searchOp] : proto.ops()) {
       switch (searchOp.kind_case()) {
@@ -249,33 +285,60 @@ public:
           auto* qr = google::protobuf::Arena::Create<QueryReq>(&req.reqArena, req, *qcontext, query, limit);
           qr->callback = [this](QueryReq& qr) {
             fillQueryTopNResponse(qr);
+            // If faceting is done per-segment, that could be kicked off after each segment is done.
+            // If so, should probably have a separate task_group to launch the faceting tasks? Depends on how
+            // we use the task_group for the query (call wait vs configure a callback)
           };
           qr->name = opKey;  // stringview to the key in the map.  This *should* be stable give that we don't modify the request.
           qr->topDocsProto = &topDocsReq;
 
-          queryReq = qr;
+          queryReqs.push_back(qr);
         } // end case
           break;
       } // end switch
     } // end for ever searchOp
 
-    if (queryReq != nullptr) {
-      // We have a query to run
-      queryReq->start();
-    } else {
-      // no queries to run, so we are done.
-      req.callback(req);
+
+    for (auto& [opKey, searchOp] : proto.ops()) {
+      switch (searchOp.kind_case()) {
+        case solux::proto::SearchOp::kFieldFacet: {
+          auto& facetReq = searchOp.field_facet();
+        } // end case
+          break;
+        default:
+          // already handled, or ignoring for now
+          break;
+      } // end switch
+    }
+
+    // launch all top-level queries
+    for (auto qr : queryReqs) {
+      qr->start(req.tg);
+    }
+
+    // do we need to special case when there we no queries or facets?
+    if (req.tg != nullptr) {
+      req.tg->wait();
     }
   }
 
-  // this is currently called afer all segments have been collected
+
+  /// get needed resources such as the index reader and schema
+  void getResources(SearchEngine::Request& req);
+
+
+  // This is currently called after all segments have been collected for a TopN query to
+  // fill out a DocList proto message.
   void fillQueryTopNResponse(QueryReq& qr) {
     // For a single response, we can use the same arena as the request.
     // TODO: move this elsewhere.  It will be shared by different queries, and query parts.  perhaps finalResponse on the request object?
     auto* rspProto = google::protobuf::Arena::Create<solux::proto::SearchResponse>(&qr.req.reqArena);
+    Response& response = *google::protobuf::Arena::Create<Response>(&qr.req.reqArena, qr.req, rspProto, &qr.req.reqArena);
+
     rspProto->set_request_id(qr.req.proto.request_id());
     auto& searchResultProto = rspProto->mutable_ops()->operator[](qr.name);
     auto* docListProto = searchResultProto.mutable_docs();
+
 
 //    message DocList {
 //       sint64 matches = 1;
@@ -301,6 +364,9 @@ public:
     int columnSize = collector.size();  // return all docs in the collector for now.
 
     if (columnSize > 0) {
+      oneapi::tbb::task_group loadColumnsTaskGroup;
+      oneapi::tbb::task_group* tg = qr.req.tg == nullptr ? nullptr : &loadColumnsTaskGroup;
+
       bool returnScores = qr.topDocsProto->get_scores();
       collector.sort();
 
@@ -310,9 +376,21 @@ public:
         sortedIdx[i] = i;
       }
       // for small int lists, std::sort is faster than radix sort.
-      std::sort(sortedIdx.begin(), sortedIdx.end(), [&collector](auto a, auto b) {
-        return collector.topDocs[a].doc < collector.topDocs[b].doc;
+      auto& topDocs = collector.topDocs;
+      std::sort(sortedIdx.begin(), sortedIdx.end(), [&topDocs](auto a, auto b) {
+        return topDocs[a].doc < topDocs[b].doc;
       });
+      // calculate the segment runs just once so they can be used to load multiple fields.
+      std::vector<uint8_t> sortedIdxRunLen(columnSize);  // how many docs in a row are from the same segment
+      for (int i=0; i<columnSize;) {
+        auto seg = topDocs[sortedIdx[i]].doc.segment();
+        int runLen = 1;
+        while (i+runLen < columnSize && topDocs[sortedIdx[i+runLen]].doc.segment() == seg) {
+          runLen++;
+        }
+        sortedIdxRunLen[i] = runLen;
+        i += runLen;
+      }
 
       auto& columnsProto = *docListProto->mutable_columns();
 
@@ -333,13 +411,16 @@ public:
             auto& intCol = *intColProto.mutable_col_i();
             auto& intsProto = *intCol.mutable_v();
             // intCol.set_missing_val(0); // TODO.... get from schema? Set even if all values present?
-            intsProto.Reserve(columnSize);
-            std::span<int64_t> target(&intsProto[0], &intsProto[columnSize-1]);
-            assert(target.size() == columnSize);  // Ensure protobuf is contiguous (is this guaranteed or impl detail?)
-            loadIntCol(qr.req, field, fieldType, collector, sortedIdx, target, std::numeric_limits<int64_t>::min());
-          }
+            auto missingVal = std::numeric_limits<int64_t>::min();
+            // intsProto.Reserve(columnSize);
+            intsProto.Resize(columnSize, missingVal);  // fill with missing values (0 for now
+            std::span<int64_t> target(&intsProto[0], &intsProto[0]+columnSize);
+            assert(&intsProto[columnSize-1] >= target.data() && &intsProto[columnSize-1] < target.data() + columnSize); // Ensure protobuf is contiguous (is this guaranteed or impl detail?)
+            // TODO: directly filling in a shared array with different threads may have false-sharing cache performance issues.
+            loadIntCol(qr.req, field, fieldType, collector, sortedIdx, sortedIdxRunLen, target, missingVal, tg);
+          } // int field
           break;
-        } // int field
+        } // end switch on fieldType
       }  // for each field
 
       // fill in scores if requested
@@ -353,54 +434,62 @@ public:
           floatsProto.Add(collector.topDocs[i].score);
         }
       }
+
+      // To continue after all fields are loaded, we could have a callback that counts down and then calls a final callback
+      // to launch the next task, or we could just use a nested task_group and call wait.
+      if (tg != nullptr) {
+        tg->wait();
+      }
     }
+
+    // send back the response
+    qr.req.reply(response);
   }
+
+  // Message to load part of an integer column.  One reason for bundling info like this is that it can be passed
+  // easily or captured by a lambda and asigned to a std::function without heap allocation.
+  // EDIT: actually, TBB task_group.run() is a template function that eventually requests thread local pool allocation, so
+  // the std::function limitation of heap allocation with over 2 pointers doesn't apply.
+  /*
+  struct IntColSeg {
+    std::string_view field;
+    TopDocsCollector& collector;
+    std::span<uint8_t> sortedIdx;
+    std::span<int64_t> target;
+    int64_t missingVal;
+  };
+   */
 
   // TODO: abstract the iterator over the documents since we will have different ways of getting the ids.  Perhaps just a callable that returns a segdoc given an index?
-  void loadIntCol(SearchEngine::Request& req, std::string_view field, FieldType& fieldType, const TopDocsCollector& collector, const std::span<uint8_t> sortedIdx, std::span<int64_t> target, int64_t missingVal) {
+  void loadIntCol(SearchEngine::Request& req, std::string_view field, FieldType& fieldType,
+                  const TopDocsCollector& collector, const std::span<uint8_t> sortedIdx, const std::span<uint8_t> sortedIdxRunLen, std::span<int64_t> target, int64_t missingVal,
+                  oneapi::tbb::task_group* tg)
+  {
     MemPool scratchPool;
 
-    // find ranges of documents in each segment
-    int start = 0;
-    int end = sortedIdx.size() - 1;
     auto& topDocs = collector.topDocs;
-
-    while(start < sortedIdx.size()) {
-      auto startSeg = topDocs[sortedIdx[start]].doc.segment();
-      auto endSeg = topDocs[sortedIdx[end]].doc.segment();
-      while (endSeg != startSeg) {
-        auto mid = (start + end) >> 1;  // no chance of overflow since small range.
-        endSeg = topDocs[sortedIdx[mid]].doc.segment();
-        if (endSeg != startSeg) {
-          end = mid;
-          continue;
-        }
-        // At this point, seg(mid) == startSeg, but we probably jumped over the true end which
-        // is somewhere between [mid, end).
-        // We could do another exponential search to move mid up while still the same seg, but
-        // may not be worth it given the small list sizes.  The previous phase of moving the end pointer down
-        // handles the bad case of many segments and one doc per segment.
-        // Just linear search to find the end for now.
-        for (int i=mid+1; i<end; i++) {
-          if (topDocs[sortedIdx[i]].doc.segment() != startSeg) {
-            end = i-1;
-            break;
-          }
-        }
-      }
-
-      loadIntColSeg(req.reader->segments()[startSeg].postingsReader(), field, fieldType, collector, sortedIdx.subspan(start, end-start+1), target, missingVal, startSeg, scratchPool);
-      start++;
+    int start = 0;
+    // iterate over the segment runs
+    while (start < sortedIdx.size()) {
+      auto runlen = sortedIdxRunLen[start];
+      auto segSpan = sortedIdx.subspan(start, runlen);
+      task_group_run(tg, [this, &req, &field, &fieldType, &collector, segSpan, target, missingVal]() {
+        loadIntColSeg(*req.reader, field, fieldType, collector, segSpan, target, missingVal);
+      });
+      start += runlen;
     }
-
   }
 
-  void loadIntColSeg(PostingsReader& postingsReader, std::string_view field, FieldType& fieldType, const TopDocsCollector& collector, const std::span<uint8_t> sortedIdx, std::span<int64_t> target, int64_t missingVal, int32_t segNum, MemPool& scratch) {
+  void loadIntColSeg(IndexReader& reader, std::string_view field, FieldType& fieldType, const TopDocsCollector& collector, const std::span<uint8_t> sortedIdx, std::span<int64_t> target, int64_t missingVal) {
+    // Hmm, we could also just pass in a segment and not the whole reader.
+    MemPool scratch;
+    auto segNum = collector.topDocs[sortedIdx[0]].doc.segment();
+    auto& postingsReader = reader.segments()[segNum].postingsReader();
     auto guard = scratch.rewindScopeGuard();
     FieldReader fieldReader(scratch, postingsReader);
     bool found = fieldReader.seek(field);
     if (!found) {
-      // field not found in this segment.  fill missing values
+      // field not found in this segment.  fill missing values.
       for (auto idx : sortedIdx) {
         target[idx] = missingVal;
       }
