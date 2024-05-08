@@ -374,7 +374,7 @@ public:
   /// 0 may be better if one has many pools.
   void rewind(const save_point &savePoint, uint32_t buffersToSave = 1) {
 #ifndef MEMPOOL_MALLOC
-    if (savePoint >= buffer && savePoint <= buffer + BYTE_BLOCK_SIZE) {  // TODO: check boundary condition here...
+    if (savePoint >= buffer && savePoint <= buffer + BYTE_BLOCK_SIZE) {
       // fast path: same buffer
       assert(scribble(savePoint, ptr() - savePoint));  // scribble from the save point to the current point
       // if sp==buffer+pos, then pos=sp-buffer to restore.
@@ -397,15 +397,19 @@ public:
   }
 
   class ScopeGuard {
-    MemPool &pool;
+    MemPool &pool_;
     save_point savePoint;
   public:
-    explicit ScopeGuard(MemPool &pool, const save_point &savePoint) : pool(pool), savePoint(savePoint) {}
+    explicit ScopeGuard(MemPool &pool, const save_point &savePoint) : pool_(pool), savePoint(savePoint) {}
 
-    explicit ScopeGuard(MemPool &pool) : pool(pool), savePoint(pool.getSavePoint()) {}
+    explicit ScopeGuard(MemPool &pool) : pool_(pool), savePoint(pool.getSavePoint()) {}
+
+    MemPool& pool() {
+      return pool_;
+    }
 
     ~ScopeGuard() {
-      pool.rewind(savePoint);
+      pool_.rewind(savePoint);
     }
 
     ScopeGuard(const ScopeGuard &) = delete;
@@ -421,6 +425,19 @@ public:
     return ScopeGuard(*this);
   }
 
+  static MemPool& threadLocal() {
+    thread_local std::unique_ptr<MemPool> pool;
+    if (!pool) {
+      pool = std::make_unique<MemPool>();
+    }
+    return *pool;
+  }
+
+  /// Convenience method so you don't forget to rewind the pool when it goes out of scope.
+  /// Call .pool() on the returned ScopeGuard to get the pool.
+  static ScopeGuard threadLocalPoolGuard() {
+    return ScopeGuard(threadLocal());
+  }
 
   void nextBuffer();
 };

@@ -131,7 +131,7 @@ public:
     }
 
     CollectorHolder* getCollector() {
-      auto holder = collectorHolder.exchange(nullptr);
+      auto* holder = collectorHolder.exchange(nullptr);
       if (holder == nullptr) {
         holder = new CollectorHolder({TopDocsCollector(topCount), 0, true});
       }
@@ -170,7 +170,7 @@ public:
       holder->segmentsMerged++;
 
       for(;;) {
-        bool allSegsMerged = holder->segmentsMerged == req.reader->segments().size();
+        bool allSegsMerged = (holder->segmentsMerged == req.reader->segments().size());
         holder = collectorHolder.exchange(holder);
         if (holder == nullptr) {
           return allSegsMerged;
@@ -185,19 +185,22 @@ public:
     }
 
     void collect(int32_t segnum) {
-      // get other resources we need first before obtaining the collector.
-      MemPool scratch;
-      auto scorer = weight->createScorer(scratch, qcontext.topReader.segments()[segnum]);
+      CollectorHolder* holder = nullptr;
+      {
+        auto poolGuard = MemPool::threadLocalPoolGuard();
+        auto scorer = weight->createScorer(poolGuard.pool(), qcontext.topReader.segments()[segnum]);
 
-      auto* holder = getCollector();
-      auto& collector = holder->collector;
-      for(;;) {
-        auto doc = scorer->next();
-        if (doc == PostingsReader::END) {
-          break;
+        // wait until last moment to obtain collector.
+        holder = getCollector();
+        auto& collector = holder->collector;
+        for (;;) {
+          auto doc = scorer->next();
+          if (doc == PostingsReader::END) {
+            break;
+          }
+          auto score = scorer->score();
+          collector.collect(segnum, doc, score);
         }
-        auto score = scorer->score();
-        collector.collect(segnum, doc, score);
       }
 
       if (releaseCollector(holder)) {
@@ -465,8 +468,6 @@ public:
                   const TopDocsCollector& collector, const std::span<uint8_t> sortedIdx, const std::span<uint8_t> sortedIdxRunLen, std::span<int64_t> target, int64_t missingVal,
                   oneapi::tbb::task_group* tg)
   {
-    MemPool scratchPool;
-
     auto& topDocs = collector.topDocs;
     int start = 0;
     // iterate over the segment runs
@@ -482,11 +483,10 @@ public:
 
   void loadIntColSeg(IndexReader& reader, std::string_view field, FieldType& fieldType, const TopDocsCollector& collector, const std::span<uint8_t> sortedIdx, std::span<int64_t> target, int64_t missingVal) {
     // Hmm, we could also just pass in a segment and not the whole reader.
-    MemPool scratch;
     auto segNum = collector.topDocs[sortedIdx[0]].doc.segment();
     auto& postingsReader = reader.segments()[segNum].postingsReader();
-    auto guard = scratch.rewindScopeGuard();
-    FieldReader fieldReader(scratch, postingsReader);
+    auto poolGuard = MemPool::threadLocalPoolGuard();
+    FieldReader fieldReader(poolGuard.pool(), postingsReader);
     bool found = fieldReader.seek(field);
     if (!found) {
       // field not found in this segment.  fill missing values.
@@ -498,7 +498,7 @@ public:
 
     SegFieldInfo segFieldInfo;
     fieldReader.readFieldInfo(segFieldInfo);
-    IntColReader intColReader(scratch, postingsReader, segFieldInfo);
+    IntColReader intColReader(poolGuard.pool(), postingsReader, segFieldInfo);
     IntColReader::Iterator iter(intColReader);
 
     int32_t next = -1;
