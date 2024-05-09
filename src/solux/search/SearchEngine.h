@@ -3,6 +3,7 @@
 #include <solux/query/ProtobufQueryParser.h>
 #include <oneapi/tbb/flow_graph.h>
 #include <solux/server/SoluxNode.h>
+#include <solux/util/proto.h>
 #include "protos/solux_types.pb.h"
 #include "IndexReader.h"
 #include "Collector.h"
@@ -40,33 +41,40 @@ public:
     // we should try to minimize the amount that these protobuf classes are used in case we need to move to a
     // more efficient implementation later.  Or even different formats like arrow.
     solux::proto::SearchRequest& proto;
-    google::protobuf::Arena& reqArena;
+    google::protobuf::Arena& arena;
     std::shared_ptr<IndexReader> reader;
     std::shared_ptr<Schema> schema;
     MemPool requestPool;
     oneapi::tbb::task_group* tg = nullptr;  // optional top-level task group for this request.
 
 
-    Request(SearchEngine& engine, solux::proto::SearchRequest& proto, google::protobuf::Arena& reqArena): engine(engine), proto(proto), reqArena(reqArena) {
+    Request(SearchEngine& engine, solux::proto::SearchRequest& proto): engine(engine), proto(proto), arena(*proto.GetArena()) {
     }
 
     /// Call this to send a response back to the client (or cause it to be buffered).  This can be called multiple times for a single request.
     /// replyComplete will be called when the response has actually been written and is no longer needed.
-    virtual int reply(Response& response) { return 0;};
+    /// Returns the number of buffered responses (0 if the response was written immediately).
+    virtual int reply(Response& response) = 0;
 
-    /// This is called when we are finished with the response object (e.g. it has been written to a socket and not just buffered)
-    /// Solux's streaming async grpc needs to keep track of when more responses are expected.  If no more responses are
-    /// expected, "last" will be set to true.  The object representing the streaming request in the gRPC server will
-    /// be deleted after this call with "last==true" and should not be used again.
-    virtual void replyCallback(Response& response, bool last) {};
-    // TODO: pull up the "last" part of this callback into a grpc streaming-server specific subclass?  It may not
-    // make sense for a local request.  After all, the number of responses will often be dynamic
-    // and not known ahead of time.
+    /// This is called when the reply has completed (e.g. it has been written to a socket and not just buffered)
+    /// This may be called from a gRPC server thread (and with a mutex locked), so it should be fast.
+    virtual void replyCallback(Response& response) {
+      bool last = response.last;
+      // if this response used a different Arena, release it.
+      if (&response.arena != &arena) {
+        releaseArena(&response.arena);
+      }
+      if (last) {
+        done();
+      }
+    };
 
     /// This will be called last after all responses have been sent back to the client.
     /// This is the place to do final cleanup (such as deleting or resetting the Arena)
     /// It may delete *this*, so nothing else should be accessed after this is called.
-    virtual void done() {};
+    virtual void done() {
+      releaseArena(&arena);
+    };
   };
 
   // A response object that can be used to send back results to the client.
@@ -74,23 +82,22 @@ public:
   class Response {
   public:
     SearchEngine::Request& req;
-    solux::proto::SearchResponse* proto;
-    google::protobuf::Arena* rspArena;
+    google::protobuf::Arena& arena;
+    solux::proto::SearchResponse& proto;
+    bool last = true;  // if true, this is the last response for the request.
+    // TODO: we could add a callback here to facilitate chaining of responses (i.e. for streaming results, etc)
 
-    // we could either create a data-structure that represents the dependencies, and
-    // then query that data structure to determine what to do next, or we could
-    // have a callback that is called when a stage of the request is done that
-    // could launch new sub-requests.
-    //
-    // How is data passed from one stage to the next?  We could have a map here.
-    // Or perhaps the callback could be called with the result (i.e. callbacks would be typed differently)
-    // How to implement the join node (need to wait for 2 parts of a query?)
-    // Data lifetime can vary a bit... think about sending query response back first, then facet response later.
-    //
-    // It feels like we are duplicating TBB graph stuff here.  Maybe we should do a high level wait-for-all per search
-    // request?
+    Response(SearchEngine::Request& req, google::protobuf::Arena& arena, bool last)
+    : req(req), arena(arena), proto(*google::protobuf::Arena::Create<solux::proto::SearchResponse>(&arena)), last(last)
+    {
+    }
 
-    Response(SearchEngine::Request& req, solux::proto::SearchResponse* proto=nullptr, google::protobuf::Arena* rspArena=nullptr): req(req), proto(proto), rspArena(rspArena) {
+    // Arena allocate a Response object.
+    static Response* create(SearchEngine::Request& req, bool last=true) {
+      // If this is the last message, just use the same arena as the response since they will have
+      // the same lifetimes.
+      auto* arena = last ? &req.arena : createArena();
+      return google::protobuf::Arena::Create<Response>(arena, req, *arena, last);
     }
   };
 
@@ -211,6 +218,15 @@ public:
     }
 
     void start(oneapi::tbb::task_group* tg) {
+      // FIXME! If there are no segments, our callback will never be done!
+      // instead of a callback, perhaps a separate task group that we wait on
+      // and then proceed to the next phase?
+      // We could do everything with a callback model (like continuation passing),
+      // and a single task_group at the top,
+      // or we could use lots of nested parallelism with task groups.
+      // One benefit of callbacks might be more resistance to deadlock. Need to think about
+      // under what circumstances deadlock can happen (it happened easier to me by accident than I would have thought).
+
       for (int32_t i=0; i<req.reader->segments().size(); i++) {
         task_group_run(tg, [this, i]() {
           this->collect(i);
@@ -221,31 +237,25 @@ public:
 
 
 
-  // Next question... where does the Query go for a query request?
-  // TODO: named queries?
 
-  // TODO: enable the ability to return partial results (i.e. query and facet results separately,
-  // or multiple queries separately, or intermediate facet results!)
 
   void submit(SearchEngine::Request& req) {
-    // we need to figure out what the dependencies are for the search request and then
-    // fire off the top-level requests.
+    try {
+      submitBody(req);
+    } catch (std::exception& e) {
+      LOG_ERROR("Unexpected exception: {}", e.what());
+      // TODO: FIXME
+      // Send back an error response *if* we never sent back the final response.
+      // Failure to do so would keep the StreamingCall alive indefinitely waiting for us to send a response.
+      // There could be other tasks running that are still sending responses.. so we need to wait
+      // on the task_group for all activity to stop.
+      // Unfortunately... if we use a callback from the streaming call to launch more work, we still can't know
+      // when things are actually done!  We also can't look at "req", since it may have already been deleted!
+      // If it was deleted, then the final response was sent, and we don't need to do anything else here.
 
-    // Example with 2 independent queries: for each query
-    // we need to:
-    // 1. create a Query object
-    // 2. find top N ids
-    // 3. load/fill-in stored fields
-    // 4. reply with the results
-    // NOTE: that step 3+4 may have many steps / responses if streaming back large result sets!
-    // For replies we could:
-    //  - send back a single response with all the results
-    //  - send back separate results as each part is ready
-    // We may not know ahead of time if the results will be large?  In which case, we'll need to
-    //  decide to stream back more results even if client requested single-response (based on some limit?)
-
-
-    submitBody(req);
+      // In the future, we could keep track of active requests in the SearchEngine as a way to cancel them.
+      // TODO: how do we handle a client closing when we are still processing a request?  Need a test for this!
+    }
   }
 
 
@@ -284,8 +294,8 @@ public:
           // limit to actual number of docs in the index (or all if limit == -1)
           int64_t limit = specifiedLimit < 0 ? req.reader->numDocs() : std::min(specifiedLimit, req.reader->numDocs());
 
-          auto* qcontext = google::protobuf::Arena::Create<Query::Context>(&req.reqArena, req.requestPool, *req.reader);
-          auto* qr = google::protobuf::Arena::Create<QueryReq>(&req.reqArena, req, *qcontext, query, limit);
+          auto* qcontext = google::protobuf::Arena::Create<Query::Context>(&req.arena, req.requestPool, *req.reader);
+          auto* qr = google::protobuf::Arena::Create<QueryReq>(&req.arena, req, *qcontext, query, limit);
           qr->callback = [this](QueryReq& qr) {
             fillQueryTopNResponse(qr);
             // If faceting is done per-segment, that could be kicked off after each segment is done.
@@ -333,14 +343,12 @@ public:
   // This is currently called after all segments have been collected for a TopN query to
   // fill out a DocList proto message.
   void fillQueryTopNResponse(QueryReq& qr) {
-    // For a single response, we can use the same arena as the request.
     // TODO: move this elsewhere.  It will be shared by different queries, and query parts.  perhaps finalResponse on the request object?
-    auto* rspProto = google::protobuf::Arena::Create<solux::proto::SearchResponse>(&qr.req.reqArena);
-    Response& response = *google::protobuf::Arena::Create<Response>(&qr.req.reqArena, qr.req, rspProto, &qr.req.reqArena);
+    Response& response = *Response::create(qr.req, true);
 
-    rspProto->set_request_id(qr.req.proto.request_id());
-    auto& searchResultProto = rspProto->mutable_ops()->operator[](qr.name);
-    auto* docListProto = searchResultProto.mutable_docs();
+    response.proto.set_request_id(qr.req.proto.request_id());
+    auto& searchResultProto = response.proto.mutable_ops()->operator[](qr.name);
+    auto& docListProto = *searchResultProto.mutable_docs();
 
 
 //    message DocList {
@@ -353,10 +361,10 @@ public:
 
     // grab the TopDocs from the collector and fill in the fields.
     auto& collector = qr.collectorHolder.load()->collector;
-    docListProto->set_offset(0);
+    docListProto.set_offset(0);
 
     if (qr.topDocsProto->get_number()) {
-      docListProto->set_matches(collector.totalHits());
+      docListProto.set_matches(collector.totalHits());
     }
 
     // Should we somehow do auto-sizing of return messages?
@@ -395,7 +403,7 @@ public:
         i += runLen;
       }
 
-      auto& columnsProto = *docListProto->mutable_columns();
+      auto& columnsProto = *docListProto.mutable_columns();
 
       // Lets look at the stored fields
       for (std::string_view field : qr.topDocsProto->fields()) {
@@ -423,6 +431,8 @@ public:
             loadIntCol(qr.req, field, fieldType, collector, sortedIdx, sortedIdxRunLen, target, missingVal, tg);
           } // int field
           break;
+          default:
+            break;
         } // end switch on fieldType
       }  // for each field
 
@@ -450,7 +460,7 @@ public:
   }
 
   // Message to load part of an integer column.  One reason for bundling info like this is that it can be passed
-  // easily or captured by a lambda and asigned to a std::function without heap allocation.
+  // easily or captured by a lambda and assigned to a std::function without heap allocation.
   // EDIT: actually, TBB task_group.run() is a template function that eventually requests thread local pool allocation, so
   // the std::function limitation of heap allocation with over 2 pointers doesn't apply.
   /*

@@ -15,6 +15,7 @@
 #include "solux/query/ProtobufQueryParser.h"
 #include "solux/search/Collector.h"
 #include "solux/util/thread.h"
+#include "solux/util/proto.h"
 #include "ProtoUpdateMessage.h"
 
 
@@ -292,7 +293,7 @@ public:
     }
   }
 
-  /// Decrement the count of the number of outstanding requests that need a response.
+  /// Decrement the count of the number of outstanding responses expected.
   /// This can be used when something bad happened with a request and we don't want to send a response.
   /// This can also be used when multiple responses are sent for a request, but one doesn't know the order the
   /// responses will be completed.
@@ -397,23 +398,6 @@ public:
     return google::protobuf::Arena::CreateMessage<RequestT>(arena);
   }
 
-  /// Creates an arena on the heap that also has the first buffer allocated as part of that allocation.
-  /// use releaseArena to free it.
-  google::protobuf::Arena* createArena() {
-    // heap allocate the first buffer and the arena together
-    char* buf = (char*)::operator new(ARENA_BUF_SIZE);
-    auto* arena = new (buf) google::protobuf::Arena(
-            buf+sizeof(google::protobuf::Arena),
-            ARENA_BUF_SIZE-sizeof(google::protobuf::Arena));
-    return arena;
-  }
-
-  /// Frees an arena created by this class.
-  void releaseArena(google::protobuf::Arena* arena) {
-    arena->Reset();
-    ::operator delete(arena);
-  }
-
   virtual void createNew() = 0;
 
   /// Return true if you have taken ownership of the request message.
@@ -457,7 +441,7 @@ public:
         HelloReply* response = google::protobuf::Arena::CreateMessage<HelloReply>(arena);
         fillResponse(response, request, i+1);
         respond(response,
-                [this](auto* response) { this->releaseArena(response->GetArena()); },
+                [this](auto* response) { releaseArena(response->GetArena()); },
                 0);  // never call with >0 here since we don't know the order of execution and that could end things prematurely.
       });
     }
@@ -477,7 +461,7 @@ public:
         HelloReply* response = google::protobuf::Arena::CreateMessage<HelloReply>(arena);
         fillResponse(response, request, 1);
         respond(response,
-                [this](auto* response) { this->releaseArena(response->GetArena()); },
+                [](auto* response) { releaseArena(response->GetArena()); },
                 1);
 
         return false; // don't take ownership of request object
@@ -495,7 +479,7 @@ public:
       taskArena.enqueue([this,request,response]() {
         this->fillResponse(response, request, 1);
         this->respond(response,
-                      [this](auto* response) { this->releaseArena(response->GetArena()); },
+                      [](auto* response) { releaseArena(response->GetArena()); },
                       1);
         // since the arena of the response will be freed, that will take care of the
         // request as well.
@@ -513,7 +497,7 @@ public:
     auto& taskArena = server.getSoluxNode().getTaskArena();
     taskArena.enqueue([this,request]() {
       this->doMultipleResponse(request);
-      this->releaseArena(request->GetArena());
+      releaseArena(request->GetArena());
       this->decrementOutstanding();
     });
     return true; // take ownership of request object
@@ -713,7 +697,7 @@ public:
         // reference anything in this Update instance.
         auto* p = parent;
         parent->respond(response,
-                      [p](auto* response) { p->releaseArena(response->GetArena()); },
+                      [p](auto* response) { releaseArena(response->GetArena()); },
                       1);
         delete this; // TODO arena allocate this
       }
@@ -739,13 +723,49 @@ public:
     new SearcherSearchStreamingCall(server, service, threadInfo);
   }
 
+
   bool handleRequest(solux::proto::SearchRequest* request) override {
+    auto& engine = server.getSoluxNode().getSearchEngine();
     auto arena = request->GetArena();
-    auto response = arena->CreateMessage<solux::proto::SearchResponse>(arena);
-    fillResponse(*request, *response);
-    // TODO: FIXME - this is currently synchronous for everything.  We need to make it async
-    // unless it is a very short operation.
-    respond(response, [this](auto* response) { this->releaseArena(response->GetArena()); });
+
+    // Two ways to do synchronous:
+    //   1) pass thread_group as null
+    //   2) make a local thread_group, use that and wait() for it.
+    // In both cases, there may be issues with multiple-responses? The first response will be written,
+    // but since only one write can be outstanding at the same time, we won't have the chance
+    // to get "write complete" from the completion queue, and any further writes will be buffered.
+    // If we implement flow control, we could deadlock.  Hence, if operating synchronously, we can't do
+    // flow control and multiple responses after the first will all be buffered.
+    // One solution is to only allow single-response requests in synchronous mode.  It could be disastrous
+    // for a large streaming response.
+
+    class GRPCSearchRequest : public SearchEngine::Request {
+    public:
+      SearcherSearchStreamingCall* parent;
+      GRPCSearchRequest(SearchEngine& engine, solux::proto::SearchRequest& proto) : SearchEngine::Request(engine, proto) {
+      }
+
+      int reply(SearchEngine::Response& response) override {
+        auto buffered = parent->respond(&response.proto,
+                        // cause replyCallback() to be called after the write is done.
+                        [this, &response](auto* responseProto) {
+          unused(responseProto);
+          assert(responseProto == &response.proto);
+          this->replyCallback(response);
+        });
+        return (int)buffered;
+      }
+    };
+
+    auto& req = *google::protobuf::Arena::Create<GRPCSearchRequest>(arena, engine, *request);
+    req.parent = this;
+    req.tg = nullptr; // start off synchronous only
+    engine.submit(req);
+
+    // Always return true (i.e. we have taken control of the request object thus it can't be reused)
+    // The issue is that even for a single simple synchronous request, there may be other responses
+    // that are concurrently being written to this connection.  Hence, our write may be buffered
+    // and since it's connected to the request object via Arena, we can't reuse that request object.
     return true;
   }
 
