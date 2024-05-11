@@ -19,23 +19,47 @@ class Schema;
 
 /// The SearchEngine is a singleton owned by the SoluxNode object and is responsible for
 /// executing search requests.  It is the main entry point for the search subsystem.
+//
+// NOTES:
+//  Lifetime management is the difficult part to coordinate between the Request and the GRPC Call (SearcherSearchStreamingCall) object.
+//  1) The engine needs to say what response is the final response for this request.  That can result in the Call object being deleted
+//     after the response callback is called.
+//  2) After the callback for the final response is called, the engine calls Request.done() which typically deletes the Request object.
+//  3) The request object being deleted is asynchronous and can happen before or after SearchEngine::submit returns.
+//
+//  Error handling:
+//    If an exception is thrown, we need to send back an error response if we haven't already sent the final response.
+//    This might happen concurrently while other tasks are executing... tough to coordinate! Failure to send a
+//    final response would keep the StreamingCall alive indefinitely.
+//
+//    We could wait for all tasks to finish before checking if we've sent a final response, and if not, do so.
+//    Even this is hard to implement, because new work may be launched asynchronously from the response callback (a natural
+//    way to implement streaming while limiting buffering).  We actually can't even look at "req" any longer to see if
+//    the final response was sent since it could have been deleted already!
+//
+//    Proposed Error handling solution:
+//      - Have a single place to send the final response (*after* the top level task_group.wait() returns).
+//        This ensures that everything else except the final response is done and we know exactly what
+//        state we are in.
+//      - To handle the issue of thinking we are done, but more work will be kicked off via a response callback,
+//        we would need to keep a task alive (in a wait / send loop that work steals), or call task_group.reserve()
+//        to keep the task_group alive until we are really done.
+//
+// In the future, we could keep track of active requests in the SearchEngine as a way to cancel them.
+//
 class SearchEngine {
   SoluxNode& node;
-  // exccution graph
-  oneapi::tbb::flow::graph graph;
-  oneapi::tbb::task_group group;
+
+  // oneapi::tbb::flow::graph graph;
 public:
   SearchEngine(SoluxNode& node): node(node) {
-
   }
 
   class Response;
 
   // The top-level request for the SearchEngine.
   class Request {
-    // Thoughts: if there are many different types of callbacks, then subclassing could be a better match.
-    // if there is only one callback when done, then std::function could be a better match as it
-    // allows for a lambda to be passed in, which can be much more concise.
+    friend class SearchEngine;
   public:
     SearchEngine& engine;
     // we should try to minimize the amount that these protobuf classes are used in case we need to move to a
@@ -46,10 +70,11 @@ public:
     std::shared_ptr<Schema> schema;
     MemPool requestPool;
     oneapi::tbb::task_group* tg = nullptr;  // optional top-level task group for this request.
-
+    Response* lastResponse = nullptr;
 
     Request(SearchEngine& engine, solux::proto::SearchRequest& proto): engine(engine), proto(proto), arena(*proto.GetArena()) {
     }
+    virtual ~Request() = default;
 
     /// Call this to send a response back to the client (or cause it to be buffered).  This can be called multiple times for a single request.
     /// replyComplete will be called when the response has actually been written and is no longer needed.
@@ -218,19 +243,16 @@ public:
     }
 
     void start(oneapi::tbb::task_group* tg) {
-      // FIXME! If there are no segments, our callback will never be done!
-      // instead of a callback, perhaps a separate task group that we wait on
-      // and then proceed to the next phase?
-      // We could do everything with a callback model (like continuation passing),
-      // and a single task_group at the top,
-      // or we could use lots of nested parallelism with task groups.
-      // One benefit of callbacks might be more resistance to deadlock. Need to think about
-      // under what circumstances deadlock can happen (it happened easier to me by accident than I would have thought).
-
       for (int32_t i=0; i<req.reader->segments().size(); i++) {
         task_group_run(tg, [this, i]() {
           this->collect(i);
         });
+      }
+
+      // handle special case of no segments.
+      if (req.reader->segments().size() == 0) {
+        // we are done, so we can call the callback
+        callback(*this);
       }
     }
   };
@@ -242,25 +264,22 @@ public:
   void submit(SearchEngine::Request& req) {
     try {
       submitBody(req);
+
+
+
     } catch (std::exception& e) {
       LOG_ERROR("Unexpected exception: {}", e.what());
-      // TODO: FIXME
-      // Send back an error response *if* we never sent back the final response.
-      // Failure to do so would keep the StreamingCall alive indefinitely waiting for us to send a response.
-      // There could be other tasks running that are still sending responses.. so we need to wait
-      // on the task_group for all activity to stop.
-      // Unfortunately... if we use a callback from the streaming call to launch more work, we still can't know
-      // when things are actually done!  We also can't look at "req", since it may have already been deleted!
-      // If it was deleted, then the final response was sent, and we don't need to do anything else here.
 
-      // In the future, we could keep track of active requests in the SearchEngine as a way to cancel them.
-      // TODO: how do we handle a client closing when we are still processing a request?  Need a test for this!
     }
   }
 
 
   void submitBody(SearchEngine::Request& req) {
     getResources(req);
+
+    req.lastResponse = Response::create(req, true);
+    req.lastResponse->proto.set_request_id(req.proto.request_id());
+
 
     // We probably want to parse all up-front in a single task to understand dependencies.
 
@@ -333,6 +352,9 @@ public:
     if (req.tg != nullptr) {
       req.tg->wait();
     }
+
+    // send back the final response
+    req.reply(*req.lastResponse);
   }
 
 
@@ -343,10 +365,9 @@ public:
   // This is currently called after all segments have been collected for a TopN query to
   // fill out a DocList proto message.
   void fillQueryTopNResponse(QueryReq& qr) {
-    // TODO: move this elsewhere.  It will be shared by different queries, and query parts.  perhaps finalResponse on the request object?
-    Response& response = *Response::create(qr.req, true);
+    // for now, just use the response object from the request.
+    auto& response = *qr.req.lastResponse;
 
-    response.proto.set_request_id(qr.req.proto.request_id());
     auto& searchResultProto = response.proto.mutable_ops()->operator[](qr.name);
     auto& docListProto = *searchResultProto.mutable_docs();
 
@@ -360,7 +381,15 @@ public:
 //    }
 
     // grab the TopDocs from the collector and fill in the fields.
-    auto& collector = qr.collectorHolder.load()->collector;
+    auto* collectorHolder = qr.collectorHolder.load(std::memory_order_relaxed);
+
+    if (collectorHolder == nullptr) {
+      // no results
+      docListProto.set_matches(0);
+      return;
+    }
+
+    auto& collector = collectorHolder->collector;
     docListProto.set_offset(0);
 
     if (qr.topDocsProto->get_number()) {
@@ -375,8 +404,9 @@ public:
     int columnSize = collector.size();  // return all docs in the collector for now.
 
     if (columnSize > 0) {
-      oneapi::tbb::task_group loadColumnsTaskGroup;
-      oneapi::tbb::task_group* tg = qr.req.tg == nullptr ? nullptr : &loadColumnsTaskGroup;
+      // std::optional keeps constructor from being called if not needed.  We could also pool allocate it.
+      std::optional<oneapi::tbb::task_group> loadColumnsTaskGroup;
+      oneapi::tbb::task_group* tg = qr.req.tg ? &loadColumnsTaskGroup.emplace() : nullptr;
 
       bool returnScores = qr.topDocsProto->get_scores();
       collector.sort();
@@ -454,9 +484,6 @@ public:
         tg->wait();
       }
     }
-
-    // send back the response
-    qr.req.reply(response);
   }
 
   // Message to load part of an integer column.  One reason for bundling info like this is that it can be passed

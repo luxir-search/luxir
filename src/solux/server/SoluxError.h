@@ -28,8 +28,9 @@ public:
   }
 };
 
-// A generic error holder to propagate errors and return values.  Currently designed to be cheap if no errors.
+// A generic thread-safe error holder to propagate errors and return values.  Currently designed to be cheap if no errors.
 class ErrorHolder {
+private:
   // different threads may try to set an error state concurrently, so we need some level of concurrency control.
   std::atomic<SoluxError*> error;
 public:
@@ -38,13 +39,15 @@ public:
   ErrorHolder& operator=(const ErrorHolder& other) = delete;
 
   ~ErrorHolder() {
-    if (error) {
-      delete error;
+    if (errored()) {
+      // If the relaxed load indicated there was an error, we need to do an actual acquire load to safely delete.
+      delete error.load(std::memory_order_acquire);
     }
   }
 
   // Sets a new error only if no error is already set and returns nullptr if successful.
   // If there was an error previously set, no modification is made and the previous error is returned.
+  // For thread safety, make all modifications to the SoluxError before setting it.
   SoluxError* setSoluxError(std::unique_ptr<SoluxError>&& e) {
     SoluxError* err = e.release();
     SoluxError* expected = nullptr;
@@ -80,17 +83,18 @@ public:
     return !ok();
   }
 
-  const char* what() {
-    SoluxError* err = error.load();
+  std::string_view what() const {
+    SoluxError* err = error.load(std::memory_order_acquire);
     if (err) {
-      return err->what().c_str();
+      return err->what();
     } else {
       return "(ok)";
     }
   }
 
-  SoluxError* getError() {
-    return error.load();
+  // Don't use this method to check for an error, use !ok() or errored() instead.
+  SoluxError* getError() const {
+    return error.load(std::memory_order_acquire);
   }
 };
 

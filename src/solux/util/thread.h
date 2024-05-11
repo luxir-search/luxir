@@ -4,6 +4,16 @@
 namespace solux {
 
 
+/// enqueue/run a task in a task_group, or run it directly if the task_group is null.
+template <typename F>
+void task_group_run(oneapi::tbb::task_group* tg, F&& f) {
+  if (tg) {
+    tg->run(std::forward<F>(f));
+  } else {
+    std::forward<F>(f)();
+  }
+}
+
 
 // A simple (but heavyweight) class like a latch so that one can block waiting on an async action to complete.
 // When this class waits, it enters the TBB work stealing loop.

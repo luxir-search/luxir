@@ -7,7 +7,9 @@ namespace solux::test {
 
 // Idea: think of making a reference-version (i.e. std::string_view, std::span) of this class for use in main code.
 
-using FieldVal = std::variant<bool, int64_t, float, double, std::string>;
+using FieldVal = std::variant<bool, int64_t, float, double, std::string,
+                              std::vector<bool>, std::vector<int64_t>, std::vector<float>, std::vector<double>, std::vector<std::string>
+>;
 
 struct NameVal {
   std::string name;
@@ -29,41 +31,7 @@ Doc flatdoc(T1 arg1, T2 arg2, Args... args) {
   return vec;
 };
 
-/*
- * class UpdateMessage {
-public:
-  virtual ~UpdateMessage() {}
 
-  // For now, we will allow the handler to obtain/release an inverter.  We could also optionally pass it
-  // as a param in the future if obtain/release becomes more complex.
-  virtual void handle(IndexWriter& iw) = 0;
-
-  // Called after all operations are complete.  Would typically delete this instance if it was heap allocated.
-  // Consumers of UpdateMessage will not touch it after this call.
-  virtual void done(IndexWriter& iw) = 0;
-
-  // See docs in solux.proto:UpdateRequest
-  // NOTE: These values should be kept in sync with the protobuf definition.
-  enum CommitType {
-    NO_COMMIT = 0,         // the default
-    COMMIT = 1,            // ensure new data is searchable
-    SILENT_COMMIT = 2,     // the commit will be "silent" (won't necessarily cause new searchers to be opened)
-    // CONSISTENT_COMMIT = 3; // FUTURE - ensure distributed searchers will see new data
-  };
-  CommitType commit;
-  int32_t commit_within;  // TODO: implement this
-
-
-  // Filled in by the IndexWriter when the message is received.
-  uint64_t seqNum;                    // The sequence number of this update, used to ensure updates are processed in order when needed
-  uint64_t commitNum;                 // The commit number of this update, used to ensure commits are finished in order
-
-  // Number of segments left to flush, protected by same mutex that protects the inverter lists.
-  // making this an atomic is not enough to avoid race conditions since we also depend on coordination with
-  // inverter->updateMessage, among other things.
-  uint32_t leftToFlush = 0;  // internal use only
-};
- */
 
 
 class CollectionHelper {
@@ -200,6 +168,11 @@ public:
     assert(success);
   }
 
+  /// Removes all data in the collection.
+  void clear() {
+    auto writer = collection().getShard()->getIndexWriter();
+    writer->testDeleteAllData();
+  }
 };
 
 

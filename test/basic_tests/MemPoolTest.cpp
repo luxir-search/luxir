@@ -218,17 +218,27 @@ TEST_F(MemPoolTest, rewind) {
   ASSERT_EQ(pool.size(), sz);
 
   // thread local rewind
-  auto poolGuard = MemPool::threadLocalPoolGuard();
-  sz = poolGuard.pool().size();
+  auto outer = MemPool::threadLocalPoolGuard();
+  sz = outer.pool().size();
   {
     auto poolGuard = MemPool::threadLocalPoolGuard();
+    ASSERT_EQ(&poolGuard.pool(), &outer.pool());  // same thread, should be same pool
     char* x = poolGuard.pool().alloc(3);
     *x = 'x';
+    auto sz2 = poolGuard.pool().size();
+    {
+      // make sure nested is fine.
+      auto poolGuard2 = MemPool::threadLocalPoolGuard();
+      ASSERT_EQ(&poolGuard2.pool(), &outer.pool());  // same thread, should be same pool
+      char* y = poolGuard2.pool().alloc(5);
+      *y = 'y';
+    }
+    ASSERT_EQ(poolGuard.pool().size(), sz2);
     char* y = poolGuard.pool().alloc(4);
     *y = 'y';
     ASSERT_GT(poolGuard.pool().size(), sz);
   }
-  ASSERT_EQ(poolGuard.pool().size(), sz);
+  ASSERT_EQ(outer.pool().size(), sz);
 }
 
 TEST_F(MemPoolTest, randRewind) {

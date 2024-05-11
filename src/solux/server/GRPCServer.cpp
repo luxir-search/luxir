@@ -738,6 +738,10 @@ public:
     // flow control and multiple responses after the first will all be buffered.
     // One solution is to only allow single-response requests in synchronous mode.  It could be disastrous
     // for a large streaming response.
+    //
+    // Deadlock: if we synchronously handle a response here, it should not do work-stealing, as I believe
+    // this could lead to deadlock (anything waiting for a response callback would be vulnerable).
+    // TBB isolation should be able to prevent this, as could avoiding TBB (pass thread_group==null)
 
     class GRPCSearchRequest : public SearchEngine::Request {
     public:
@@ -748,10 +752,10 @@ public:
       int reply(SearchEngine::Response& response) override {
         auto buffered = parent->respond(&response.proto,
                         // cause replyCallback() to be called after the write is done.
-                        [this, &response](auto* responseProto) {
+                        [&response](auto* responseProto) {
           unused(responseProto);
           assert(responseProto == &response.proto);
-          this->replyCallback(response);
+          response.req.replyCallback(response);
         });
         return (int)buffered;
       }
