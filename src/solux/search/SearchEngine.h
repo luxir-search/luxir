@@ -113,7 +113,7 @@ public:
     // TODO: we could add a callback here to facilitate chaining of responses (i.e. for streaming results, etc)
 
     Response(SearchEngine::Request& req, google::protobuf::Arena& arena, bool last)
-    : req(req), arena(arena), proto(*google::protobuf::Arena::Create<solux::proto::SearchResponse>(&arena)), last(last)
+    : req(req), arena(arena), proto(*google::protobuf::Arena::CreateMessage<solux::proto::SearchResponse>(&arena)), last(last)
     {
     }
 
@@ -160,6 +160,13 @@ public:
     QueryReq(SearchEngine::Request& req, Query::Context& qcontext, Query* query, int64_t topCount, std::function<void(QueryReq&)>callback={})
     : req(req), qcontext(qcontext), query(query), topCount(topCount), callback(std::move(callback)) {
       weight = query->createWeight(qcontext);
+    }
+
+    ~QueryReq() {
+      auto* holder = collectorHolder.load(std::memory_order_relaxed);
+      if (holder != nullptr && holder->heapAllocated) {
+        delete holder;
+      }
     }
 
     CollectorHolder* getCollector() {
