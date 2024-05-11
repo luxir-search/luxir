@@ -40,6 +40,8 @@ message SearchOp {
   oneof kind {
     TopDocs top_docs = 1;
     // future: function (or leave that as a query type?)
+
+    // TODO: hmmm, should different facet types be be encapsulated by a single "Facet" message?
     FieldFacet field_facet = 8;
     // future: something like terms component... stream out all terms of one or more (or all) fields
   }
@@ -53,6 +55,9 @@ message TopDocs {
   bool get_scores = 5;          // return the relevancy score for each document returned
   repeated string fields = 6;   // fields to return for each document
   repeated SortSpec sorts = 7;
+
+  // A set of named filters on the main query.
+  repeated NamedQuery filter = 15;
 }
 
 message SortSpec {
@@ -96,6 +101,12 @@ message Match {
   Val val = 2;   // if val is an Array, this could be used for TermsQuery as well...  how to tell if scoring or not though?
 }
 
+// Attach a name to a query so it can be referenced by other queries or facets.
+message NamedQuery {
+  string name = 1;
+  Query query = 2;
+}
+
 message BooleanQuery {
   repeated Query filter = 1;       // required clauses that do not add to the score
   repeated Query required = 2;     // required clauses that do add to the score
@@ -106,13 +117,23 @@ message BooleanQuery {
 
 message PhraseQuery {
   string field = 1;
+
+  // Only set one of these.  A protobuf "oneof" was originally used, but it adds extra levels of indirection
+  string text = 2;               // un-analyzed text that should yield multiple words when analyzed. ex: "Thomas Anderson"
+  repeated string words = 3;     // un-analyzed list of words. ex: ["Yonik","Seeley"]
+  repeated string terms = 4;     // analyzed list of terms as strings
+  repeated bytes terms_bin = 5;  // analyzed list of binary (raw bytes) terms
+
+  /*
   oneof kind {
-    string text = 2;      // unanalyzed text that should yield multiple words when analyzed. ex: "Thomas Anderson"
-    ArrStr words = 3;     // unanalyzed list of words. ex: ["Yonik","Seeley"]
+    string text = 2;      // un-analyzed text that should yield multiple words when analyzed. ex: "Thomas Anderson"
+    ArrStr words = 3;     // un-analyzed list of words. ex: ["Yonik","Seeley"]
     ArrStr terms = 4;     // analyzed list of terms as strings
-    ArrStr terms_bin = 5; // analyzed list of binary terms
+    ArrBin terms_bin = 5; // analyzed list of binary terms
     // TermPositionList term_positions = 4;  // list of terms with explicit relative positions
   }
+  */
+
   // TODO: add a parameter for slop?
   repeated int32 positions = 15; // optional positions of the terms
 }
@@ -137,6 +158,16 @@ message FieldFacet {
   map<string, SearchOp> ops = 2;  // sub-facets or search operations performed per bucket
 }
 
+// A "domain" defines a set of documents to do computations over (like facets)
+message Domain {
+  string op_name = 1;                 // The name of a search operation that yields a set of documents. If missing
+                                      // The first TopDocs operation in the request is assumed.
+  optional Query root = 2;            // Resets the domain to this root query.
+  repeated string include_filter = 3; // Names of filters to apply (normally not needed unless a new root was selected)
+                                      // A special name of "*" means all filters applied to the reference domain.
+  repeated string exclude_filter = 4; // Names of filters to exclude (i.e. not apply) Used for multi-select faceting.
+  repeated NamedQuery filter = 5;     // Additional named filters to apply
+}
 
 // Top-level response to a Search request
 message SearchResponse {
