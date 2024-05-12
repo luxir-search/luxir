@@ -34,7 +34,7 @@ public:
     // because old segments could be merged away before we have a chance to read them, we need
     // to check if there is a new index info file and retry the open if so.
     uint64_t lastCommitTime = 0;
-    bool retry;
+    bool retry = false;
     do {
       if (retry) {
         IREADER_DEBUG("Retrying IndexReader open");

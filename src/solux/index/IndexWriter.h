@@ -102,10 +102,10 @@ public:
   class SegInfo {
   public:
     uint64_t segId;
-    uint64_t commitTime;  // earliest commit this segment was part of.
+    uint64_t commitTime = 0;  // earliest commit this segment was part of.
     // write segment info (size,docs) segments file as well so we don't have to open the segment to determine it?
     int64_t sizeInBytes = 0;
-    int32_t nDocs = 0;
+    int32_t nDocs;
     int32_t mergeLevel = -1;
     bool merging = false;  // set to true when a merge is in progress with this segment as input.
 

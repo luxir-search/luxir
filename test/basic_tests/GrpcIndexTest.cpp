@@ -55,6 +55,7 @@ public:
     sreq.mutable_collection()->add_name("main");
     auto& ops = *sreq.mutable_ops();
     ops["q"].mutable_top_docs()->mutable_query()->set_all(true);
+    ops["q"].mutable_top_docs()->set_get_number(true);
 
     bool wrote = rstream->Write(sreq);
     EXPECT_TRUE(wrote);
