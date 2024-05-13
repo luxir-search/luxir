@@ -65,6 +65,7 @@ public:
 
   // will never be called
   void replyCallback(SearchEngine::Response& response) override {
+    unused(response);
   }
 
   // should be called by user
@@ -87,7 +88,10 @@ public:
 TEST_F(SearchEngineTest, basic) {
   CollectionHelper helper;
   helper.clear();
-  helper.index(flatdoc("foo_w","how now brown cow", "foo_i", 17), UpdateMessage::COMMIT);
+  helper.index(flatdoc("foo_w","how now brown cow", "foo_i", 17, "color_s","red"),UpdateMessage::COMMIT);
+  helper.index(flatdoc("foo_w","charlie brown", "foo_i", 23, "color_s","blue"),UpdateMessage::NO_COMMIT);
+  helper.index(flatdoc("foo_w","brown", "foo_i", 5, "color_s","brown"),UpdateMessage::COMMIT);
+  // should be 2 segments now.
 
   auto* lreq = LocalReq::create(soluxNode->getSearchEngine());
   lreq->proto.mutable_collection()->add_name("main");
@@ -101,6 +105,9 @@ TEST_F(SearchEngineTest, basic) {
   query.set_field("foo_w");
   query.mutable_val()->set_s("brown");
   topDocs.mutable_fields()->Add("foo_i");
+  topDocs.mutable_fields()->Add("color_s");
+  // topDocs.mutable_fields()->Add("noexist_i");
+  // topDocs.mutable_fields()->Add("noexist_s");
 
   /* phrase query not yet parsed
   auto& terms = *ops["q"].mutable_top_docs()->mutable_query()->mutable_phrase()->mutable_terms();
@@ -114,9 +121,16 @@ TEST_F(SearchEngineTest, basic) {
 
   ASSERT_EQ(lreq->proto.request_id(),  lreq->responses[0]->proto.request_id());
   auto& docs = lreq->responses[0]->proto.ops().at("q").docs();
-  ASSERT_EQ(1, docs.matches());
-  ASSERT_EQ(2, docs.columns_size());
-  ASSERT_EQ(17, docs.columns().at("foo_i").col_i().v(0));
+  ASSERT_EQ(3, docs.matches());
+  ASSERT_EQ(3, docs.columns_size());
+
+  // docs will be ordered by shortest field first since term freq is same for all.
+  ASSERT_EQ(5, docs.columns().at("foo_i").col_i().v(0));
+  ASSERT_EQ("brown", docs.columns().at("color_s").col_s().v(0));
+  ASSERT_EQ(23, docs.columns().at("foo_i").col_i().v(1));
+  ASSERT_EQ("blue", docs.columns().at("color_s").col_s().v(1));
+  ASSERT_EQ(17, docs.columns().at("foo_i").col_i().v(2));
+  ASSERT_EQ("red", docs.columns().at("color_s").col_s().v(2));
 
   lreq->done();
 }

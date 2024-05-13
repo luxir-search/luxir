@@ -345,11 +345,9 @@ message ArrInt32 {
 
 message ColStr {
   // this will cause an additional tag (byte) per string value, but strings are normally somewhat larger anyway
-  repeated google.protobuf.StringValue v = 1;
- /*
+  // repeated google.protobuf.StringValue v = 1;
   optional string missingVal = 1;
   repeated string v = 2;
- */
 }
 
 // The distinction between a column and an array is that column values are somehow "nullable".

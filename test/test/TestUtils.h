@@ -114,7 +114,7 @@ public:
 
       void done(IndexWriter& iw) override {
         unused(iw);
-        LOG_DEBUG("BlockingUpdateMessage done!");
+        // LOG_DEBUG("BlockingUpdateMessage done!");
         blocker.notify();
       }
     };

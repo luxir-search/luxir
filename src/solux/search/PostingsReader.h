@@ -450,6 +450,7 @@ public:
     return fieldInfo.sumTotalTermFreq;
   }
 
+  // 0 based ords
   int32_t ord() const {
     return startingOrd + ordInBlock;
   }
@@ -598,6 +599,7 @@ public:
     }
   }
 
+  // 0-based ords
   void seekOrd(int32_t targetOrd) {
     assert(targetOrd >= 0 && targetOrd < fieldInfo.nTerms);
     if (targetOrd < ord() || targetOrd > startingOrd + maxOrdInBlock) {

@@ -468,6 +468,20 @@ public:
             loadIntCol(qr.req, field, fieldType, collector, sortedIdx, sortedIdxRunLen, target, missingVal, tg);
           } // int field
           break;
+          case FieldType::Type::STRING: {
+            auto& strColProto = columnsProto[field];
+            auto& strCol = *strColProto.mutable_col_s();
+            auto& stringsProto = *strCol.mutable_v();
+            stringsProto.Reserve(columnSize);
+            std::string missingVal;
+            // under the covers, the vector contains pointers, not elements (i.e. vector<std::string*>)
+            for (int i=0; i<columnSize; i++) {
+              stringsProto.Add("");
+            }
+            auto* start = stringsProto.mutable_data();
+            std::span<std::string*> target(start, start + columnSize);
+            loadStrCol(qr.req, field, fieldType, collector, sortedIdx, sortedIdxRunLen, target, "", tg);
+          } // string field
           default:
             break;
         } // end switch on fieldType
@@ -487,6 +501,7 @@ public:
 
       // To continue after all fields are loaded, we could have a callback that counts down and then calls a final callback
       // to launch the next task, or we could just use a nested task_group and call wait.
+      // One advantage to waiting is that we can mempool allocate temporary stuff and then deallocate it again when wait returns.
       if (tg != nullptr) {
         tg->wait();
       }
@@ -525,6 +540,7 @@ public:
     }
   }
 
+
   void loadIntColSeg(IndexReader& reader, std::string_view field, FieldType& fieldType, const TopDocsCollector& collector, const std::span<uint8_t> sortedIdx, std::span<int64_t> target, int64_t missingVal) {
     // Hmm, we could also just pass in a segment and not the whole reader.
     auto segNum = collector.topDocs[sortedIdx[0]].doc.segment();
@@ -547,7 +563,7 @@ public:
 
     int32_t next = -1;
     for (auto idx : sortedIdx) {
-      auto segdoc = collector.topDocs[sortedIdx[idx]].doc;
+      auto segdoc = collector.topDocs[idx].doc;
       assert(segdoc.segment() == segNum);
       int32_t docid = segdoc.docId();
       if (docid < next) {
@@ -563,6 +579,76 @@ public:
         target[idx] = iter.value();
       } else {
         target[idx] = missingVal;
+      }
+    }
+  }
+
+  void loadStrCol(SearchEngine::Request& req, std::string_view field, FieldType& fieldType,
+                  const TopDocsCollector& collector, const std::span<uint8_t> sortedIdx, const std::span<uint8_t> sortedIdxRunLen, std::span<std::string*> target, std::string_view missingVal,
+                  oneapi::tbb::task_group* tg)
+  {
+    auto& topDocs = collector.topDocs;
+    int start = 0;
+    // iterate over the segment runs
+    while (start < sortedIdx.size()) {
+      auto runlen = sortedIdxRunLen[start];
+      auto segSpan = sortedIdx.subspan(start, runlen);
+      task_group_run(tg, [this, &req, &field, &fieldType, &collector, segSpan, target, missingVal]() {
+        loadStrColSeg(*req.reader, field, fieldType, collector, segSpan, target, missingVal);
+      });
+      start += runlen;
+    }
+  }
+
+
+  void loadStrColSeg(IndexReader& reader, std::string_view field, FieldType& fieldType, const TopDocsCollector& collector, const std::span<uint8_t> sortedIdx, std::span<std::string*> target, std::string_view missingVal) {
+    // Hmm, we could also just pass in a segment and not the whole reader.
+    auto segNum = collector.topDocs[sortedIdx[0]].doc.segment();
+    auto& postingsReader = reader.segments()[segNum].postingsReader();
+    auto poolGuard = MemPool::threadLocalPoolGuard();
+    FieldReader fieldReader(poolGuard.pool(), postingsReader);
+    bool found = fieldReader.seek(field);
+    if (!found) {
+      // field not found in this segment.  fill missing values.
+      for (auto idx : sortedIdx) {
+        *target[idx] = missingVal;
+      }
+      return;
+    }
+
+    SegFieldInfo segFieldInfo;
+    fieldReader.readFieldInfo(segFieldInfo);
+    IntColReader intColReader(poolGuard.pool(), postingsReader, segFieldInfo);
+    IntColReader::Iterator iter(intColReader);
+    TermsEnum tenum(poolGuard.pool(), postingsReader, segFieldInfo);
+
+    int32_t next = -1;
+    int32_t lastOrd = -1;
+    for (auto idx : sortedIdx) {
+      auto segdoc = collector.topDocs[idx].doc;
+      assert(segdoc.segment() == segNum);
+      int32_t docid = segdoc.docId();
+      if (docid < next) {
+        *target[idx] = missingVal;
+        continue;
+      }
+
+      if (docid > next) {
+        next = iter.advance(docid);
+      }
+
+      if (docid == next) {
+        auto ord = iter.value();
+        // an ord of 0 means "missing", which we shouldn't encounter since we are using an iterator over docs?
+        assert(ord != 0);
+        if (ord != lastOrd) {
+          lastOrd = ord;
+          tenum.seekOrd((int32_t)ord-1);  // term ords are 0 based.
+        }
+        *target[idx] = (std::string_view) tenum.term();
+        // TODO: sort the ords for better seek performance (if within same term block), and for better ord deduping.
+      } else {
+        *target[idx] = missingVal;
       }
     }
   }
