@@ -598,6 +598,20 @@ public:
     }
   }
 
+  void seekOrd(int32_t targetOrd) {
+    assert(targetOrd >= 0 && targetOrd < fieldInfo.nTerms);
+    if (targetOrd < ord() || targetOrd > startingOrd + maxOrdInBlock) {
+      // even if we were in the right block, we don't have the capability to go backwards or rewind
+      termBlockIndex = uint32_t(targetOrd) / Postings::TERMS_BLOCK_SIZE;
+      readTermBlock();
+    }
+    while (ord() < targetOrd) {
+      // nextTerm();
+      readNextTermInBlock();
+    }
+    assert(ord() == targetOrd);
+  }
+
 
   bool seekCeilInBlock(std::string_view target) {
     auto cmp = term() <=> target;

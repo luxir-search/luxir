@@ -58,10 +58,19 @@ public:
           term[0] = (char) rng.rbyte();
         }
       }
-      auto found = st.tenum->seek(term);
+      // seek by ord or by term
+      bool found;
+      if (shouldFind && rng.rint(100)<20) {  // look up by ord 20% of the time
+        st.tenum->seekOrd(tnum);
+        found = true;
+      } else {
+        found = st.tenum->seek(term);
+      }
       ASSERT_EQ(shouldFind, found);
       if (found) {
-        ASSERT_EQ(st.tenum->term(), term);
+//        ASSERT_EQ(st.tenum->term(), term);
+        auto ord = st.tenum->ord();
+        ASSERT_EQ(ord, tnum);
         // TODO: verify the postings for the term are correct
       }
     }

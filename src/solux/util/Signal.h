@@ -13,7 +13,6 @@ namespace solux {
 // a scope_guard:
 //    auto cleaner = solux::scope_guard([](){ solux::Signal::unlisten("mergeStart");});
 class Signal {
-  // boost flat_map of callbacks
   using callback_type = std::function<void*(void*, void*, void*)>;
   using map_type = boost::unordered_flat_map<std::string_view, callback_type>;
   static std::unique_ptr<map_type> callbacks;
@@ -30,7 +29,7 @@ public:
       [[likely]]
       return nullptr;
     }
-    // call non-inline method to do the rest to minimize code bloat.
+    // call non-inline method to do the best to minimize code bloat.
     return emit_(name, a, b, c);
   }
 
