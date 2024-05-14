@@ -14,7 +14,7 @@ std::unique_ptr<U32Codec> U32CodecFactory::getCodec(const std::string& name) {
   } else if (name=="SimpleCodec") {
     return std::make_unique<SimpleCodec>();
   }
-  return std::unique_ptr<U32Codec>();
+  return {};
 }
 
 } // end namespace

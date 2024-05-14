@@ -29,7 +29,7 @@ public:
     searchStub = solux::Searcher::NewStub(channel);
   }
 
-  void doSingleUpdate(bool commit) {
+  void doSingleUpdate(bool commit, int64_t docnum=0) {
     solux::proto::UpdateRequest ureq;
     solux::proto::UpdateResponse response;
     grpc::ClientContext context;
@@ -69,7 +69,7 @@ public:
   // How we do things here in the client isn't actually ok depending on how the server is implemented and could
   // lead to deadlock if we are insisting on writing more messages and the server is waiting for us to read more.
   // Ideally, a separate thread is used for reading the responses.  This should also increase efficiency/throughput.
-  void doStreamingUpdates(Rng& r, int nMessages, int commitPercent) {
+  void doStreamingUpdates(Rng& r, int64_t nMessages, int commitPercent, int64_t docnum=-1) {
     solux::proto::UpdateRequest req;
     solux::proto::UpdateResponse response;
     grpc::ClientContext context;  // need a new one for each RPC
@@ -217,71 +217,49 @@ public:
     EXPECT_EQ(nWrites, nReads);
   }
 
-  void doThreadSafeIndex(int nTasks, int callsPerTask, int streamingPercent, int commitPercent) {
 
-    tbb::task_group tasks;
+  void doThreadSafeIndex(int nThreads, int64_t nDocs, int streamingPercent, int commitPercent) {
 
-    for (int i=0; i<nTasks; i++) {
-      tasks.run(
-              [=,this]{
+    // we use threads here instead of tasks because there was an issue with task_group::wait
+    // stealing work that somehow led to a deadlock.
+    std::unique_ptr<std::thread> threads[nThreads];
 
-                Rng r(rng_seed + i);
+    std::atomic_int64_t docsIndexed = 0;
 
-                // std::cout << "STARTED TEST THREAD " << i <<  " worker=" << exec.this_worker_id() << std::endl;
-
-                int nCalls = 0;
-
-                while (nCalls < callsPerTask) {
-                  if (r.rint(0, 100) < streamingPercent) {
-                    int left = callsPerTask - nCalls;
-                    int nStream = left == 1 ? 1 : r.rint(left) + 1;
-                    doStreamingUpdates(r, nStream, commitPercent);
-                    nCalls += nStream;
-                  } else {
-                    doSingleUpdate(r.rint(100) < commitPercent);
-                    nCalls++;
-                  }
-                }
-
-              }
-      );
-    }
-
-    tasks.wait();
-  }
-
-  void doThreadSafeIndex2(int nTasks, int callsPerTask, int streamingPercent, int commitPercent) {
-
-    std::unique_ptr<std::thread> threads[nTasks];
-
-    for (int i=0; i<nTasks; i++) {
+    for (int i=0; i<nThreads; i++) {
       threads[i] = std::make_unique<std::thread>(
-              [=,this]{
-
+              [=,&docsIndexed,this]{
                 Rng r(rng_seed + i);
-
                 // std::cout << "STARTED TEST THREAD " << i <<  " worker=" << exec.this_worker_id() << std::endl;
+                for (;;) {
+                  bool streaming = r.rint(0, 100) < streamingPercent;
+                  // first, reserve our document numbers so we know exactly what will be indexed
+                  int64_t sz = streaming ? r.rint(1, 10) : 1;
+                  int64_t docnumStart = 0;
+                  do {
+                    int64_t docnumStart = docsIndexed.load(std::memory_order_relaxed);
+                    if (docnumStart + sz >= nDocs) {
+                      sz = nDocs - docnumStart;
+                      if (sz <= 0) {
+                        return;
+                      }
+                    }
+                  } while (!docsIndexed.compare_exchange_weak(docnumStart, docnumStart + sz, std::memory_order_relaxed));
 
-                int nCalls = 0;
-
-                while (nCalls < callsPerTask) {
-                  if (r.rint(0, 100) < streamingPercent) {
-                    int left = callsPerTask - nCalls;
-                    int nStream = left == 1 ? 1 : r.rint(left) + 1;
-                    doStreamingUpdates(r, nStream, commitPercent);
-                    nCalls += nStream;
+                  if (streaming) {
+                    doStreamingUpdates(r, sz, commitPercent);
                   } else {
-                    doSingleUpdate(r.rint(100) < commitPercent);
-                    nCalls++;
+                    for (int j=0; j<sz; j++) {
+                      doSingleUpdate(r.rint(100) < commitPercent);
+                    }
                   }
                 }
-
               }
       );
     }
 
     // wait for all the threads
-    for (int i=0; i<nTasks; i++) {
+    for (int i=0; i<nThreads; i++) {
       threads[i]->join();
     }
   }
@@ -462,33 +440,12 @@ TEST_F(GrpcIndexTest, threadsafe) {
 // ramping up callsPerTask to hammer things for longer.
 //
 TEST_F(GrpcIndexTest, threadsafeIndex) {
-  int nTasks = 10;
-  int callsPerTask = 10;
+  int nThreads = 32;
+  int64_t nDocs = 100;  // pump this up for good stress testing.
   int streamingPercent = 50;  // percent of the requests that use streaming
   int commitPercent = 10;
 
-  // doThreadSafeIndex(nTasks, callsPerTask, streamingPercent);
-
-  // too many concurrent requests here will cause deadlock.  It may just be because
-  // we do task_group.wait() on the client side, and that can perhaps steal work from our server side?
-  // Need a separate process to test higher concurrency levels.
-  tbb::task_arena arena(std::thread::hardware_concurrency()/2);
-  tbb::task_group group;
-  arena.execute([&,this] {
-                  group.run(
-                          [&, this] {
-                            // TODO: not sure if this isolate does anything useful here or not.
-                            tbb::this_task_arena::isolate(
-                                    [&, this] {
-                                      doThreadSafeIndex(nTasks, callsPerTask, streamingPercent, commitPercent);
-                                    }
-                            );
-                          }
-                  );
-                }
-  );
-
-  group.wait();
+  doThreadSafeIndex(nThreads, nDocs, streamingPercent, commitPercent);
 }
 
 

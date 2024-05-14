@@ -8,7 +8,7 @@
 using namespace solux;
 
 // TODO - use a different logger for RPC stuff some point
-// redefine DEBUG to TRACE level whish shouldn't currently be logged!
+// redefine DEBUG to TRACE level which shouldn't currently be logged!
 #define GRPC_DEBUG LOG_TRACE
 
 class GrpcSearchTest : public SoluxTest {
@@ -59,5 +59,15 @@ TEST_F(GrpcSearchTest, basic) {
   grpc::Status status = stream->Finish();
   GRPC_DEBUG("STREAMING SEARCH CLIENT FINISHED");
   ASSERT_TRUE(status.ok());
+}
+
+// codecs are not currently thread safe.
+// we should create a test that fails before we fix this.
+// We should create a big test index (i.e. not "main") that can be reused by multiple tests.
+TEST_F(GrpcSearchTest, threadsafe) {
+  // idea: do a series of searches in a single thread and record the results.  then use multiple threads and see
+  // if the results are the same.
+
+
 }
 

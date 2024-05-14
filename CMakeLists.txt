@@ -19,7 +19,7 @@ IF (Boost_FOUND)
 endif()
 set (Boost_USE_STATIC_LIBS OFF) # enable dynamic linking
 set (Boost_USE_MULTITHREAD ON)  # enable multithreading
-find_package (Boost COMPONENTS REQUIRED thread)
+find_package (Boost COMPONENTS REQUIRED core thread sort)
 
 find_package(TBB CONFIG REQUIRED)
 find_package(spdlog CONFIG REQUIRED)
