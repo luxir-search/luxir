@@ -229,16 +229,19 @@ public:
         auto poolGuard = MemPool::threadLocalPoolGuard();
         auto scorer = weight->createScorer(poolGuard.pool(), qcontext.topReader.segments()[segnum]);
 
-        // wait until last moment to obtain collector.
+        // Wait until last moment to obtain collector in hopes of reusing an existing one.
         holder = getCollector();
-        auto& collector = holder->collector;
-        for (;;) {
-          auto doc = scorer->next();
-          if (doc == PostingsReader::END) {
-            break;
+
+        if (scorer != nullptr) {
+          auto& collector = holder->collector;
+          for (;;) {
+            auto doc = scorer->next();
+            if (doc == PostingsReader::END) {
+              break;
+            }
+            auto score = scorer->score();
+            collector.collect(segnum, doc, score);
           }
-          auto score = scorer->score();
-          collector.collect(segnum, doc, score);
         }
       }
 

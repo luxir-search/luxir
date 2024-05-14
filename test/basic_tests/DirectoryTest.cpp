@@ -194,7 +194,7 @@ TEST_F(DirectoryTest, dataTypes) {
 
   auto input = dir.openFile("f1");
   auto is = input->getInputStream();
-  LOG_ERROR("file size={}", is.size());
+  // LOG_ERROR("file size={}", is.size());
 
   r = rng;  // replay same random numbers
   for (int iter=0; iter<iterations; iter++) {

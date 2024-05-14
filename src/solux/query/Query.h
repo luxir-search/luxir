@@ -243,7 +243,7 @@ public:
   public:
     Weight(Query::Context& context) : context(context) {}
 
-    // Create a scorer for a specific segment in the specific MemPool
+    // Create a scorer for a specific segment in the specific MemPool.  Can return null if no docs match!
     virtual Query::Scorer* createScorer(MemPool& target, IndexReader::Segment& segment) = 0;
 
     // NOTE: no virtual destructor, so subclasses should be made trivially destructible
