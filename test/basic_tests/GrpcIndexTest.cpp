@@ -303,8 +303,10 @@ public:
     ch.commit();
   }
 
+  using RequestCreator = std::function<void(int64_t docid, solux::proto::SearchRequest&)>;
+  using ResponseChecker = std::function<void(int64_t docid, const solux::proto::SearchResponse&)>;
 
-  void doStreamingSearches(Rng& r, int64_t startDoc, int64_t nMessages, int64_t nDocs) {
+  void doStreamingSearches(Rng& r, int64_t startDoc, int64_t nMessages, int64_t nDocs, RequestCreator& reqCreator, ResponseChecker& respChecker) {
     solux::proto::SearchRequest req;
     solux::proto::SearchResponse response;
     grpc::ClientContext context;  // need a new one for each RPC
@@ -334,28 +336,16 @@ public:
 
       // if writes are far enough ahead of reads, do a read regardless of the random choice above.
       // If the server side implements throttling, we may need to reduce the number of outstanding here.
-      // if (nWrites - nReads > 10) {  //  NOCOMMIT
-      if (nWrites - nReads > 0) {  // do completely single-threaded to see if basic code is working
+      if (nWrites - nReads > 10) {
+      // if (nWrites - nReads > 0) {  // do completely single-threaded to see if basic code is working
         doRead = true;
         doWrite = false;
       }
 
       if (doWrite) {
         solux::proto::SearchRequest req;
-        req.mutable_collection()->add_name("main");
-        // try to retrieve the document we just indexed
         auto docId = (startDoc + nWrites) % nDocs;
-        auto& topDocs = *(*req.mutable_ops())["q"].mutable_top_docs();
-        topDocs.set_get_number(true);
-        for (auto& field : retrieveFields) {
-          topDocs.mutable_fields()->Add(field);
-        }
-
-        auto& topQuery = *topDocs.mutable_query()->mutable_match();
-        topQuery.set_field("id");
-        topQuery.mutable_val()->set_s(std::to_string(docId));
-        req.set_request_id(std::to_string(docId));  // set request id to the id so we know what doc we are looking for
-
+        reqCreator(docId, req);
         nWrites++;
 
         // on last message, randomly use WriteLast or WritesDone
@@ -378,25 +368,15 @@ public:
         bool read = stream->Read(&response);
         ASSERT_TRUE(read);
         auto docId = (startDoc + nReads) % nDocs;
-        // std::cout << "CLIENT RESULT:( " << response.DebugString() << " )" << std::endl;
-        auto& docList = response.ops().at("q").docs();
-        ASSERT_EQ(1, docList.matches());
-        ASSERT_EQ(docList.columns_size(), retrieveFields.size()); // this might change in the future.
-        verifyDoc(docId, docList.columns());
+        respChecker(docId, response);
         nReads++;
-
-        /*
-        std::string resStr;
-        google::protobuf::TextFormat::PrintToString(response, &resStr);
-        std::cout << "CLIENT RESULT:( " << resStr << " )" << std::endl;
-        */
       }
 
     } // end for(;;)
   }
 
 
-  void doThreadSafeSearch(int nThreads, int64_t nQueries, int64_t nDocs) {
+  void doThreadSafeSearch(int nThreads, int64_t nQueries, int64_t nDocs, RequestCreator& reqCreator, ResponseChecker& respChecker) {
     // we use threads here instead of tasks because there was an issue with task_group::wait
     // stealing work that somehow led to a deadlock.
     std::unique_ptr<std::thread> threads[nThreads];
@@ -405,7 +385,7 @@ public:
 
     for (int i=0; i<nThreads; i++) {
       threads[i] = std::make_unique<std::thread>(
-              [=,&queries,this]{
+              [&,i,this]{
                 Rng r(rng_seed + i);
                 // std::cout << "STARTED TEST THREAD " << i <<  " worker=" << exec.this_worker_id() << std::endl;
                 for (;;) {
@@ -413,7 +393,7 @@ public:
 
                   auto qnum = queries.fetch_add(sz, std::memory_order_relaxed);
                   if (qnum >= nQueries) break;
-                  doStreamingSearches(r, qnum, sz, nDocs);
+                  doStreamingSearches(r, qnum, sz, nDocs, reqCreator, respChecker);
                 }
               }
       );
@@ -602,12 +582,74 @@ TEST_F(GrpcIndexTest, threadsafe) {
 //
 TEST_F(GrpcIndexTest, threadsafeIndex) {
   int nThreads = 32;
-  int64_t nDocs = 100;  // pump this up for good stress testing.
+  int64_t nDocs = 10000;  // pump this up for good stress testing.
   int streamingPercent = 50;  // percent of the requests that use streaming
   int commitPercent = 10;
 
   doThreadSafeIndex(nThreads, nDocs, streamingPercent, commitPercent);
-  doThreadSafeSearch(nThreads, nDocs, nDocs);
+
+  RequestCreator requestCreator = [&](int64_t docid, solux::proto::SearchRequest& req) {
+    req.mutable_collection()->add_name("main");
+    // try to retrieve the document we just indexed
+    auto& topDocs = *(*req.mutable_ops())["q"].mutable_top_docs();
+    topDocs.set_get_number(true);
+    for (auto& field : retrieveFields) {
+      topDocs.mutable_fields()->Add(field);
+    }
+
+    auto& topQuery = *topDocs.mutable_query()->mutable_match();
+    topQuery.set_field("id");
+    topQuery.mutable_val()->set_s(std::to_string(docid));
+    req.set_request_id(std::to_string(docid));  // set request id to the id so we know what doc we are looking for
+  };
+
+  ResponseChecker responseChecker = [&](int64_t docid, const solux::proto::SearchResponse& response) {
+    auto& docList = response.ops().at("q").docs();
+    ASSERT_EQ(1, docList.matches());
+    ASSERT_EQ(docList.columns_size(), retrieveFields.size()); // this might change in the future.
+    verifyDoc(docid, docList.columns());
+  };
+
+  doThreadSafeSearch(nThreads, nDocs, nDocs, requestCreator, responseChecker);
+
+  // Now let's do a test designed to uncover non-thread-safety of the codecs in SIMDCompressionLib
+  // unpacking blocks of docids, frequencies, or positions concurrently should do it.
+
+  RequestCreator reqc2 = [&](int64_t docid, solux::proto::SearchRequest& req) {
+    req.mutable_collection()->add_name("main");
+    // try to retrieve the document we just indexed
+    auto& topDocs = *(*req.mutable_ops())["q"].mutable_top_docs();
+    topDocs.set_get_number(true);
+    auto& topQuery = *topDocs.mutable_query()->mutable_match();
+    // the field t2_w contains integers from 1-10, 1-100, and 1-1000.  So if we search for
+    // something like "0" it should match > 11% of the docs and use block compression in the codec
+    // provided there are enough docs in the index (otherwise tail compression is used).
+    topQuery.set_field("t2_w");
+    topQuery.mutable_val()->set_s(std::to_string(docid % 10));
+    req.set_request_id(std::to_string(docid));
+  };
+
+  // record the number of hits per docid in a boost flat unordered map
+  boost::unordered::unordered_flat_map<int64_t, int64_t> hits;
+
+  ResponseChecker respc2 = [&](int64_t docid, const solux::proto::SearchResponse& response) {
+    auto& docList = response.ops().at("q").docs();
+    // not too much to check here... just record the hits we got
+    hits[docid % 10] = docList.matches();
+  };
+
+  // this pass records the number of hits per t2_w:[0 - 10]
+  doThreadSafeSearch(1, 10, nDocs, reqc2, respc2);
+
+  // now we can check the hits to see if we got the expected number of hits for each t2_w:[0 - 10]
+  ResponseChecker respc2verify = [&](int64_t docid, const solux::proto::SearchResponse& response) {
+    auto& docList = response.ops().at("q").docs();
+    ASSERT_EQ(hits[docid % 10], docList.matches());
+  };
+
+  // With 10K docs and 32 threads, this reliably fails when using the non-thread-safe SIMDCompressionLib codecs.
+  // 1000 docs is enough to get it to fail sometimes, often with ASAN detecting a double-free in SIMDCompressionLib.
+  doThreadSafeSearch(nThreads, nDocs*10, nDocs, reqc2, respc2verify);
 }
 
 
