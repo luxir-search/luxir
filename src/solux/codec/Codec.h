@@ -80,22 +80,29 @@ public:
 // Wraps types of SIMDCompressionLib::IntegerCODEC
 template <class Type>  // Type should be subclass of SIMDCompressionLib::IntegerCODEC
 class IntegerCODECTypeWrapper : public U32Codec {
-  Type codec;
+  thread_local static std::unique_ptr<Type> codec;
 public:
 
   IntegerCODECTypeWrapper() {
     // codec = std::make_unique<Type>();
   }
 
+  Type& getCodec() {
+    if (!codec) {
+      codec = std::make_unique<Type>();
+    }
+    return *codec;
+  }
+
   void encodeBlock(uint32_t* in, uint32_t inSz, char* out, uint32_t &outSz) override {
     size_t compressedSize = outSz / sizeof(uint32_t); // this gets changed to the actual size... simdcomp lib uses size in units of words.
-    codec.encodeArray(in, inSz, (uint32_t*)out, compressedSize);
+    getCodec().encodeArray(in, inSz, (uint32_t*)out, compressedSize);
     outSz = compressedSize * sizeof(uint32_t);  // convert to bytes
   }
 
   uint32_t decodeBlock(const char* in, uint32_t inSz, uint32_t* out, uint32_t &outSz) override {
     uint64_t recoveredSz = outSz;
-    auto endPtr = codec.decodeArray( (uint32_t*)in, inSz / sizeof(uint32_t), out, recoveredSz);
+    auto endPtr = getCodec().decodeArray( (uint32_t*)in, inSz / sizeof(uint32_t), out, recoveredSz);
     outSz = recoveredSz;
     auto bytesRead = (char*)endPtr - in;
     assert(bytesRead <= inSz);
@@ -103,6 +110,7 @@ public:
   }
 };
 
-
+template<typename T>
+thread_local std::unique_ptr<T> IntegerCODECTypeWrapper<T>::codec = nullptr;
 
 } // end namespace
