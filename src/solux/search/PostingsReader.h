@@ -42,9 +42,9 @@ public:
   using TFreqCodec = PositionsCodec; // same type, but should also share instances for better performance
 
   // These could be static if we made them thread safe...
-  DocsCodec docCodec;
-  PositionsCodec posCodec;
-  TFreqCodec& tfreqCodec = posCodec;
+  static DocsCodec docCodec;
+  static PositionsCodec posCodec;
+  static TFreqCodec& tfreqCodec;
 
   // Filename related utilities.  We try to keep filenames short for many reasons, including
   // being able to fit in short-string optimization.
@@ -170,8 +170,6 @@ class PostingsReader {
   int32_t maxdoc;
 public:
   InputStream firstIS;
-
-  Postings postings; // for codecs... temporary since they aren't necessarily thread safe?
 
   // used as a sentinel value for docs and positions iterators in a single segment.
   static constexpr int32_t END = std::numeric_limits<int32_t>::max();
@@ -839,7 +837,7 @@ public:
       // like lastBlockEncodedPosOrd, but for docs.
       if (leftToRead >= Postings::DOCS_BLOCK_SIZE) {
         uint32_t outSz = Postings::DOCS_BLOCK_SIZE;
-        auto bytesRead = postingsReader.postings.docCodec.decodeBlock(docIS.ptr(), docIS.left(), (uint32_t*)docBuf, outSz);
+        auto bytesRead = Postings::docCodec.decodeBlock(docIS.ptr(), docIS.left(), (uint32_t*)docBuf, outSz);
         docIS.skip(bytesRead);
         assert(outSz == Postings::DOCS_BLOCK_SIZE);
         docBufIdx = 0;
@@ -848,7 +846,7 @@ public:
 
         // TODO: we should really decode term freqs lazily in case they aren't needed... but this is far simpler for now.
         outSz = Postings::DOCS_BLOCK_SIZE;  // currently parallel to docs, so must be same block size
-        bytesRead = postingsReader.postings.tfreqCodec.decodeBlock(docIS.ptr(), docIS.left(), (uint32_t*)tfreqBuf, outSz);
+        bytesRead = Postings::tfreqCodec.decodeBlock(docIS.ptr(), docIS.left(), (uint32_t*)tfreqBuf, outSz);
         docIS.skip(bytesRead);
         assert(outSz == Postings::DOCS_BLOCK_SIZE);
         tfreqBufIdx = 0;
@@ -934,7 +932,7 @@ public:
         // std::cout << "skipping blocks: id=" << docid << " numToSkip=" << numToSkip << std::endl;
         // For now, just decode the whole block.  Optimize this later.
         uint32_t outSz = Postings::POSITIONS_BLOCK_SIZE;
-        auto bytesRead = postingsReader.postings.posCodec.decodeBlock(posIS.ptr(), posIS.left(), (uint32_t*)posBuf, outSz);
+        auto bytesRead = Postings::posCodec.decodeBlock(posIS.ptr(), posIS.left(), (uint32_t*)posBuf, outSz);
         posIS.skip(bytesRead);
         assert(outSz == Postings::POSITIONS_BLOCK_SIZE);
         posBufIdx = 0;
@@ -963,7 +961,7 @@ public:
       // OK load block of positions.  This could be optimized by only loading the relevant part.
       // If this enum wants all positions, we should just decode everything.
       uint32_t outSz = Postings::POSITIONS_BLOCK_SIZE;
-      auto bytesRead = postingsReader.postings.posCodec.decodeBlock(posIS.ptr(), posIS.left(), (uint32_t*)posBuf, outSz);
+      auto bytesRead = Postings::posCodec.decodeBlock(posIS.ptr(), posIS.left(), (uint32_t*)posBuf, outSz);
       posIS.skip(bytesRead);
       assert(outSz == Postings::POSITIONS_BLOCK_SIZE);
       posBufIdx = 0;
@@ -1000,7 +998,7 @@ public:
           // read a new block of positions
           // TODO: refactor reading a new block (not skipping) to one place?
           uint32_t outSz = Postings::POSITIONS_BLOCK_SIZE;
-          auto bytesRead = postingsReader.postings.posCodec.decodeBlock(posIS.ptr(), posIS.left(), (uint32_t*)posBuf, outSz);
+          auto bytesRead = Postings::posCodec.decodeBlock(posIS.ptr(), posIS.left(), (uint32_t*)posBuf, outSz);
           posIS.skip(bytesRead);
           assert(outSz == Postings::POSITIONS_BLOCK_SIZE);
           posBufIdx = 0;

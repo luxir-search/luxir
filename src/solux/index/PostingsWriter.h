@@ -318,8 +318,6 @@ class TextWriter {
   std::vector<char> compressed_output;
 
 private:  // some internal utility methods... not for use by indexers
-  Postings postings; // contains limits and codecs
-
   // number of docs for the current term
   int32_t getDocFreq() const {
     return docsFlushed + docs.size();
@@ -378,7 +376,7 @@ public:
     }
     compressed_output.resize(Postings::POSITIONS_BLOCK_SIZE * sizeof(int32_t) + 1024);
     uint32_t compressedSize = compressed_output.size(); // this gets changed to the actual size
-    postings.posCodec.encodeBlock(reinterpret_cast<uint32_t *>(posdeltas.data()), posdeltas.size(), compressed_output.data(),
+    Postings::posCodec.encodeBlock(reinterpret_cast<uint32_t *>(posdeltas.data()), posdeltas.size(), compressed_output.data(),
                                   compressedSize);
     posOutput.write(compressed_output.data(), compressedSize);
 
@@ -403,7 +401,7 @@ public:
 
     compressed_output.resize(Postings::DOCS_BLOCK_SIZE * sizeof(int32_t) + 1024);
     uint32_t compressedSize = compressed_output.size(); // this gets changed to the actual size
-    postings.docCodec.encodeBlock(reinterpret_cast<uint32_t *>(docs.data()), docs.size(), compressed_output.data(),
+    Postings::docCodec.encodeBlock(reinterpret_cast<uint32_t *>(docs.data()), docs.size(), compressed_output.data(),
                                   compressedSize);
     docOutput.write(compressed_output.data(), compressedSize);
 
@@ -412,7 +410,7 @@ public:
     //
     compressed_output.resize(Postings::TERMS_BLOCK_SIZE + 1024);
     compressedSize = compressed_output.size(); // this gets changed to the actual size
-    postings.tfreqCodec.encodeBlock(reinterpret_cast<uint32_t *>(tfreqs.data()), tfreqs.size(), compressed_output.data(),
+    Postings::tfreqCodec.encodeBlock(reinterpret_cast<uint32_t *>(tfreqs.data()), tfreqs.size(), compressed_output.data(),
                                     compressedSize);
     docOutput.write(compressed_output.data(), compressedSize);
 

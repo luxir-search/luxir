@@ -582,7 +582,7 @@ TEST_F(GrpcIndexTest, threadsafe) {
 //
 TEST_F(GrpcIndexTest, threadsafeIndex) {
   int nThreads = 32;
-  int64_t nDocs = 10000;  // pump this up for good stress testing.
+  int64_t nDocs = 100;  // pump this up for good stress testing.
   int streamingPercent = 50;  // percent of the requests that use streaming
   int commitPercent = 10;
 

@@ -16,6 +16,7 @@ namespace solux {
 // IDEA: even if multiple scratch buffers are needed, there could be a single method
 // that returns the size of all needed scratch buffers (plus any possible alignment overhead needed.)
 // The codec would be responsible for splitting up the single passed array.
+// Update: SIMDCompressionLib codecs were made thread safe via thread_local.
 class U32Codec {
 public:
   virtual ~U32Codec() = default;
