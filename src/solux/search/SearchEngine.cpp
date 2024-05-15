@@ -3,6 +3,7 @@
 namespace solux {
 
 
+
 void SearchEngine::getResources(SearchEngine::Request& req) {
   // look up the correct index reader and the associated schema
   std::shared_ptr<Collection> collection;

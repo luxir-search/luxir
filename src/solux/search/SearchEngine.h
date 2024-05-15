@@ -268,21 +268,22 @@ public:
   };
 
 
-
-
-
-  void submit(SearchEngine::Request& req) {
+  void submit(SearchEngine::Request& req, bool parallel = true) {
     try {
+      std::optional<oneapi::tbb::task_group> stackTg;
+      oneapi::tbb::task_group* tg;
+      if (parallel && req.tg == nullptr) {
+        req.tg = &stackTg.emplace();
+      }
+      tg = req.tg;
       submitBody(req);
-
-
-
+      if (tg) {
+        tg->wait();
+      }
     } catch (std::exception& e) {
       LOG_ERROR("Unexpected exception: {}", e.what());
-
     }
   }
-
 
   void submitBody(SearchEngine::Request& req) {
     getResources(req);
@@ -536,7 +537,7 @@ public:
     while (start < sortedIdx.size()) {
       auto runlen = sortedIdxRunLen[start];
       auto segSpan = sortedIdx.subspan(start, runlen);
-      task_group_run(tg, [this, &req, &field, &fieldType, &collector, segSpan, target, missingVal]() {
+      task_group_run(tg, [this, &req, field, &fieldType, &collector, segSpan, target, missingVal]() {
         loadIntColSeg(*req.reader, field, fieldType, collector, segSpan, target, missingVal);
       });
       start += runlen;
@@ -596,7 +597,7 @@ public:
     while (start < sortedIdx.size()) {
       auto runlen = sortedIdxRunLen[start];
       auto segSpan = sortedIdx.subspan(start, runlen);
-      task_group_run(tg, [this, &req, &field, &fieldType, &collector, segSpan, target, missingVal]() {
+      task_group_run(tg, [this, &req, field, &fieldType, &collector, segSpan, target, missingVal]() {
         loadStrColSeg(*req.reader, field, fieldType, collector, segSpan, target, missingVal);
       });
       start += runlen;
