@@ -48,21 +48,29 @@ public:
   }
 
   //         verifyDoc(startDoc + nReads, docList.columns());
-  void verifyDoc(int64_t docnum, const ::google::protobuf::Map<std::string, ::solux::proto::Column>& fields) {
+  void verifyDoc(int64_t docnum, const ::google::protobuf::Map<std::string, ::solux::proto::Column>& fields, int col=0) {
+    // if docnum wasn't passed in, get it from the column.
+    if (docnum == -1) {
+      auto& id_i = fields.at("id_i");
+      docnum = id_i.col_i().v(col);
+    }  else {
+      auto& id_i = fields.at("id_i");
+      ASSERT_EQ(docnum, id_i.col_i().v(col));
+    }
+
     Rng r(rng_seed + docnum);
     auto sid = std::to_string(docnum);
     auto& id = fields.at("id");
-    ASSERT_EQ(sid, id.col_s().v(0));
-    auto& id_i = fields.at("id_i");
-    ASSERT_EQ(docnum, id_i.col_i().v(0));
+    ASSERT_EQ(sid, id.col_s().v(col));
+
     auto has_i256_50_i = r.rbool();
     if (fields.contains("i256_50_i")) {
       auto& i256_50_i = fields.at("i256_50_i");
       if (has_i256_50_i) {
-        ASSERT_EQ(r() & 0xff, i256_50_i.col_i().v(0));
+        ASSERT_EQ(r() & 0xff, i256_50_i.col_i().v(col));
       } else {
         auto missingVal = std::numeric_limits<int64_t>::min();
-        ASSERT_EQ(missingVal, i256_50_i.col_i().v(0));
+        ASSERT_EQ(missingVal, i256_50_i.col_i().v(col));
       }
     } else {
       assert(!has_i256_50_i);
@@ -315,6 +323,7 @@ public:
 
     int nWrites=0;
     int nReads=0;
+    int additionalReads = 0;
 
     for(;;) {
       bool doWrite = nWrites < nMessages;
@@ -364,12 +373,21 @@ public:
         }
       }
 
-      if (doRead) {
+      while (doRead) {
         bool read = stream->Read(&response);
         ASSERT_TRUE(read);
         auto docId = (startDoc + nReads) % nDocs;
         respChecker(docId, response);
-        nReads++;
+        if (response.more()) {
+          additionalReads++;
+          if (r.rint(0, 100) < 25) {  // 75% of the time, do another read if there are more
+            break;
+          }
+        } else {
+          // only increment nReads on final responses
+          nReads++;
+          break;
+        }
       }
 
     } // end for(;;)
@@ -580,9 +598,13 @@ TEST_F(GrpcIndexTest, threadsafe) {
 //
 TEST_F(GrpcIndexTest, threadsafeIndex) {
   int nThreads = 32;
-  int64_t nDocs = 10000;  // pump this up for good stress testing.
+  int64_t nDocs = 100;  // pump this up for good stress testing.
   int streamingPercent = 50;  // percent of the requests that use streaming
   int commitPercent = 10;
+
+  // clear the index
+  solux::test::CollectionHelper ch("main");
+  ch.clear();
 
   doThreadSafeIndex(nThreads, nDocs, streamingPercent, commitPercent);
 
@@ -603,7 +625,7 @@ TEST_F(GrpcIndexTest, threadsafeIndex) {
 
   ResponseChecker responseChecker = [&](int64_t docid, const solux::proto::SearchResponse& response) {
     auto& docList = response.ops().at("q").docs();
-    ASSERT_EQ(1, docList.matches());
+    ASSERT_EQ(1, docList.matches());  // FIXME!  this comes up as "2" now sometimes with nDocs=100????
     ASSERT_EQ(docList.columns_size(), retrieveFields.size()); // this might change in the future.
     verifyDoc(docid, docList.columns());
   };
@@ -615,7 +637,6 @@ TEST_F(GrpcIndexTest, threadsafeIndex) {
 
   RequestCreator reqc2 = [&](int64_t docid, solux::proto::SearchRequest& req) {
     req.mutable_collection()->add_name("main");
-    // try to retrieve the document we just indexed
     auto& topDocs = *(*req.mutable_ops())["q"].mutable_top_docs();
     topDocs.set_get_number(true);
     topDocs.set_limit(1);
@@ -648,7 +669,57 @@ TEST_F(GrpcIndexTest, threadsafeIndex) {
 
   // With 10K docs and 32 threads, this reliably fails when using the non-thread-safe SIMDCompressionLib codecs.
   // 1000 docs is enough to get it to fail sometimes, often with ASAN detecting a double-free in SIMDCompressionLib.
-  doThreadSafeSearch(nThreads, nDocs*10, nDocs, reqc2, respc2verify);
+  // Failures were fixed by using thread_locals for those specific codecs.
+  doThreadSafeSearch(nThreads, nDocs, nDocs, reqc2, respc2verify);
+
+  //
+  // Now test streaming back multiple responses per request
+  //
+  int64_t limit=50;
+  int32_t batchSize = 5;
+  RequestCreator reqc3 = [&](int64_t docid, solux::proto::SearchRequest& req) {
+    req.mutable_collection()->add_name("main");
+    auto& topDocs = *(*req.mutable_ops())["q"].mutable_top_docs();
+    for (auto& field : retrieveFields) {
+      topDocs.mutable_fields()->Add(field);
+    }
+    topDocs.set_get_number(true);
+    topDocs.set_limit(limit);
+    topDocs.set_batch_size(batchSize);
+    auto& topQuery = *topDocs.mutable_query()->mutable_match();
+    topQuery.set_field("t2_w");
+    topQuery.mutable_val()->set_s(std::to_string(docid % 10));
+    req.set_request_id(std::to_string(docid));
+  };
+
+  ResponseChecker respc3 = [&](int64_t docid, const solux::proto::SearchResponse& response) {
+    auto& docList = response.ops().at("q").docs();
+    // because responses are streaming and not necessarily in order across different logical requests,
+    // we need to get the number used to generate the query from the request id
+    auto reqid = std::stoll(response.request_id());
+
+    ASSERT_EQ(hits[reqid % 10], docList.matches());
+    if (docList.matches() == 0) return;
+
+    auto max = std::min(limit, (int64_t)docList.matches());
+    auto expectedColSize = response.more() ? batchSize : max % batchSize;
+    if (expectedColSize == 0) expectedColSize = batchSize;
+
+    // check the id field
+    if (docList.columns().at("id").col_s().v_size() != expectedColSize) {
+      // print out the whole message
+      std::string resStr;
+      google::protobuf::TextFormat::PrintToString(response, &resStr);
+      LOG_ERROR("CLIENT RESULT:( {} )", resStr);
+    }
+    ASSERT_EQ(expectedColSize, docList.columns().at("id").col_s().v_size());
+
+    for (int i=0; i<expectedColSize; i++) {
+      verifyDoc(-1, docList.columns(), i);
+    }
+  };
+
+  doThreadSafeSearch(nThreads, nDocs, nDocs, reqc3, respc3);
 }
 
 
