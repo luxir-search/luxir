@@ -287,10 +287,12 @@ TEST_F(IndexWriterTest, multiThreaded) {
                     bool writesDone = false;
                     for (;;) {
                       if (writesDone || rng.rint(100) < percentReads) {
+                        // do this *before* opening the reader, so we can ensure that the reader should see at least
+                        // that many updates.
+                        auto globalDocsVisible = docsVisible.load();
+
                         auto reader = iw.getIndexReader();
                         auto localDocsVisible = reader->numDocs();
-                        auto globalDocsVisible = docsVisible.load();
-                        // make sure we don't go backwards with respect to number of visible documents.
                         EXPECT_GE(localDocsVisible, globalDocsVisible);
                         while (localDocsVisible > globalDocsVisible) {
                           if (!docsVisible.compare_exchange_weak(globalDocsVisible, localDocsVisible)) {
