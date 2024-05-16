@@ -76,12 +76,14 @@ class TopDocsCollector {
     return pq.size();
   }
 
+  // merge other into this.
   void merge(TopDocsCollector& other) {
     // In some scenarios, popping the top of the other heap until it's no longer competitive will be faster,
     // while in other scenarios just a linear scan of the other heap will be faster.
     // We'll just do a linear scan for now.
     auto newHitCount = hitCount + other.hitCount;
-    // since min-heap has smallest element at position 0, it should be more efficient to start from the other end.
+    // Since min-heap has smallest element at position 0, it should be more efficient to start from the other end.
+    // Future possible optimization: if we do a whole level of a min-tree without any insertions, we could stop early.
     for (int i = other.size() - 1; i >= 0; i--) {
       collect(other.topDocs[i].doc.segment(), other.topDocs[i].doc.docId(), other.topDocs[i].score);
     }

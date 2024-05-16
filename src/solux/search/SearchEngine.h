@@ -115,6 +115,8 @@ public:
     Response(SearchEngine::Request& req, google::protobuf::Arena& arena, bool last)
     : req(req), arena(arena), proto(*google::protobuf::Arena::CreateMessage<solux::proto::SearchResponse>(&arena)), last(last)
     {
+      // set the response id to match the request id.
+      proto.set_request_id(req.proto.request_id());
     }
 
     // Arena allocate a Response object.
@@ -289,8 +291,6 @@ public:
     getResources(req);
 
     req.lastResponse = Response::create(req, true);
-    req.lastResponse->proto.set_request_id(req.proto.request_id());
-
 
     // We probably want to parse all up-front in a single task to understand dependencies.
 
@@ -376,13 +376,6 @@ public:
   // This is currently called after all segments have been collected for a TopN query to
   // fill out a DocList proto message.
   void fillQueryTopNResponse(QueryReq& qr) {
-    // for now, just use the response object from the request.
-    auto& response = *qr.req.lastResponse;
-
-    auto& searchResultProto = response.proto.mutable_ops()->operator[](qr.name);
-    auto& docListProto = *searchResultProto.mutable_docs();
-
-
 //    message DocList {
 //       sint64 matches = 1;
 //       float max_score = 2;
@@ -391,36 +384,61 @@ public:
 //       bool more = 5; // expect more results to be streamed back?
 //    }
 
-    // grab the TopDocs from the collector and fill in the fields.
+    // Grab the TopDocs from the collector and fill in the fields.  Search is done, so we don't need
+    // the atomic at all here.
     auto* collectorHolder = qr.collectorHolder.load(std::memory_order_relaxed);
 
     if (collectorHolder == nullptr) {
-      // no results
+      auto& response = *qr.req.lastResponse;
+      auto& searchResultProto = response.proto.mutable_ops()->operator[](qr.name);
+      auto& docListProto = *searchResultProto.mutable_docs();
       docListProto.set_matches(0);
       return;
     }
 
     auto& collector = collectorHolder->collector;
-    docListProto.set_offset(0);
-
-    if (qr.topDocsProto->get_number()) {
-      docListProto.set_matches(collector.totalHits());
+    collector.sort();
+    auto numCollected = collector.size();
+    int32_t maxBatchSize = qr.topDocsProto->batch_size();
+    if (maxBatchSize <= 0) {
+      maxBatchSize = 10;  // what should the default be?
+    } else if (maxBatchSize > 256) {
+      maxBatchSize = 256;
     }
 
-    // Should we somehow do auto-sizing of return messages?
-    // We could load largest field first and cut it off after it gets big enough.  That can't really be
-    // parallelized easily though.
-    // We could also do it based on index data of the average column size.
+    int64_t offset = qr.topDocsProto->offset();
 
-    int columnSize = collector.size();  // return all docs in the collector for now.
+    for(;;) {
+      int32_t columnSize = std::min((int64_t)maxBatchSize, numCollected - offset);
 
-    if (columnSize > 0) {
+      bool lastResponse = offset + columnSize == numCollected;
+      auto& response = lastResponse ? *qr.req.lastResponse : *Response::create(qr.req, lastResponse);
+      auto& searchResultProto = response.proto.mutable_ops()->operator[](qr.name);
+      auto& docListProto = *searchResultProto.mutable_docs();
+      docListProto.set_offset(offset);
+      if (!lastResponse) {
+        docListProto.set_more(true);
+        response.proto.set_more(true);  // also set at the response level for easier client handling.
+      }
+
+      if (qr.topDocsProto->get_number()) {
+        docListProto.set_matches(collector.totalHits());
+      }
+
+      // Should we somehow do auto-sizing of return messages?
+      // We could load largest field first and cut it off after it gets big enough.  That can't really be
+      // parallelized easily though.
+      // We could also do it based on index data of the average column size.
+
+      if (columnSize == 0) {
+        break;
+      }
+
       // std::optional keeps constructor from being called if not needed.  We could also pool allocate it.
       std::optional<oneapi::tbb::task_group> loadColumnsTaskGroup;
       oneapi::tbb::task_group* tg = qr.req.tg ? &loadColumnsTaskGroup.emplace() : nullptr;
 
       bool returnScores = qr.topDocsProto->get_scores();
-      collector.sort();
 
       // sort the documents so we can access them in order of both segment and docid
       std::vector<uint8_t> sortedIdx(columnSize); // works up to 256 docs.
@@ -428,16 +446,17 @@ public:
         sortedIdx[i] = i;
       }
       // for small int lists, std::sort is faster than radix sort.
+      // wherever topdocs is indexed, we need to add the offset.
       auto& topDocs = collector.topDocs;
-      std::sort(sortedIdx.begin(), sortedIdx.end(), [&topDocs](auto a, auto b) {
-        return topDocs[a].doc < topDocs[b].doc;
+      std::sort(sortedIdx.begin(), sortedIdx.end(), [&topDocs,offset](auto a, auto b) {
+        return topDocs[offset + a].doc < topDocs[offset + b].doc;
       });
       // calculate the segment runs just once so they can be used to load multiple fields.
       std::vector<uint8_t> sortedIdxRunLen(columnSize);  // how many docs in a row are from the same segment
-      for (int i=0; i<columnSize;) {
-        auto seg = topDocs[sortedIdx[i]].doc.segment();
+      for (int i = 0; i < columnSize;) {
+        auto seg = topDocs[offset + sortedIdx[i]].doc.segment();
         int runLen = 1;
-        while (i+runLen < columnSize && topDocs[sortedIdx[i+runLen]].doc.segment() == seg) {
+        while (i + runLen < columnSize && topDocs[offset + sortedIdx[i + runLen]].doc.segment() == seg) {
           runLen++;
         }
         sortedIdxRunLen[i] = runLen;
@@ -447,7 +466,7 @@ public:
       auto& columnsProto = *docListProto.mutable_columns();
 
       // Lets look at the stored fields
-      for (std::string_view field : qr.topDocsProto->fields()) {
+      for (std::string_view field: qr.topDocsProto->fields()) {
         // should we allow _scores_ as a field name?
         if (field == "_score_") {
           // TODO: if we are going to allow this, we would need to check earlier int he code to make sure we are recording scores.
@@ -466,12 +485,13 @@ public:
             auto missingVal = std::numeric_limits<int64_t>::min();
             // intsProto.Reserve(columnSize);
             intsProto.Resize(columnSize, missingVal);  // fill with missing values (0 for now
-            std::span<int64_t> target(&intsProto[0], &intsProto[0]+columnSize);
-            assert(&intsProto[columnSize-1] >= target.data() && &intsProto[columnSize-1] < target.data() + columnSize); // Ensure protobuf is contiguous (is this guaranteed or impl detail?)
+            std::span<int64_t> target(&intsProto[0], &intsProto[0] + columnSize);
+            assert(&intsProto[columnSize - 1] >= target.data() && &intsProto[columnSize - 1] < target.data() +
+                                                                                               columnSize); // Ensure protobuf is contiguous (is this guaranteed or impl detail?)
             // TODO: directly filling in a shared array with different threads may have false-sharing cache performance issues.
-            loadIntCol(qr.req, field, fieldType, collector, sortedIdx, sortedIdxRunLen, target, missingVal, tg);
+            loadIntCol(qr.req, field, fieldType, collector, offset, sortedIdx, sortedIdxRunLen, target, missingVal, tg);
           } // int field
-          break;
+            break;
           case FieldType::Type::STRING: {
             auto& strColProto = columnsProto[field];
             auto& strCol = *strColProto.mutable_col_s();
@@ -479,12 +499,12 @@ public:
             stringsProto.Reserve(columnSize);
             std::string missingVal;
             // under the covers, the vector contains pointers, not elements (i.e. vector<std::string*>)
-            for (int i=0; i<columnSize; i++) {
+            for (int i = 0; i < columnSize; i++) {
               stringsProto.Add("");
             }
             auto* start = stringsProto.mutable_data();
             std::span<std::string*> target(start, start + columnSize);
-            loadStrCol(qr.req, field, fieldType, collector, sortedIdx, sortedIdxRunLen, target, "", tg);
+            loadStrCol(qr.req, field, fieldType, collector, offset, sortedIdx, sortedIdxRunLen, target, "", tg);
           } // string field
           default:
             break;
@@ -498,8 +518,8 @@ public:
         auto& floatsProto = *floatColProto.mutable_v();
         // floatColProto.set_missing_val(-1.0f); // TODO
         floatsProto.Reserve(columnSize);
-        for (int i=0; i<columnSize; i++) {
-          floatsProto.Add(collector.topDocs[i].score);
+        for (int i = 0; i < columnSize; i++) {
+          floatsProto.Add(collector.topDocs[offset + i].score);
         }
       }
 
@@ -509,7 +529,26 @@ public:
       if (tg != nullptr) {
         tg->wait();
       }
-    }
+
+      // if this is the last response, just return.  Otherwise, we need to send the response and continue.
+      if (!lastResponse) {
+        auto numBuffered = qr.req.reply(response);
+        // This code currently serializes the produce-batch, send-batch loop.
+        // We could get better throughput by loading the fields for multiple batches at once.
+        // TODO: we also need some flow control to limit the number of buffered responses.
+        // Do we need to distinguish between buffered writes from *this* logical request vs others?
+        // Probably not, except for the fact that we need at least *one* of the outstanding writes
+        // to be ours so we can unblock when it's written.
+        // Due to race conditions (callback being called *before* we decide we need to block), we should
+        // probably block on the *next* reply, not the current one.
+      }
+
+      if (lastResponse) {
+        break;
+      }
+
+      offset += columnSize;
+    }  // end for
   }
 
   // Message to load part of an integer column.  One reason for bundling info like this is that it can be passed
@@ -528,7 +567,7 @@ public:
 
   // TODO: abstract the iterator over the documents since we will have different ways of getting the ids.  Perhaps just a callable that returns a segdoc given an index?
   void loadIntCol(SearchEngine::Request& req, std::string_view field, FieldType& fieldType,
-                  const TopDocsCollector& collector, const std::span<uint8_t> sortedIdx, const std::span<uint8_t> sortedIdxRunLen, std::span<int64_t> target, int64_t missingVal,
+                  const TopDocsCollector& collector, int64_t offset, const std::span<uint8_t> sortedIdx, const std::span<uint8_t> sortedIdxRunLen, std::span<int64_t> target, int64_t missingVal,
                   oneapi::tbb::task_group* tg)
   {
     auto& topDocs = collector.topDocs;
@@ -537,17 +576,17 @@ public:
     while (start < sortedIdx.size()) {
       auto runlen = sortedIdxRunLen[start];
       auto segSpan = sortedIdx.subspan(start, runlen);
-      task_group_run(tg, [this, &req, field, &fieldType, &collector, segSpan, target, missingVal]() {
-        loadIntColSeg(*req.reader, field, fieldType, collector, segSpan, target, missingVal);
+      task_group_run(tg, [this, &req, field, &fieldType, &collector, offset, segSpan, target, missingVal]() {
+        loadIntColSeg(*req.reader, field, fieldType, collector, offset, segSpan, target, missingVal);
       });
       start += runlen;
     }
   }
 
 
-  void loadIntColSeg(IndexReader& reader, std::string_view field, FieldType& fieldType, const TopDocsCollector& collector, const std::span<uint8_t> sortedIdx, std::span<int64_t> target, int64_t missingVal) {
+  void loadIntColSeg(IndexReader& reader, std::string_view field, FieldType& fieldType, const TopDocsCollector& collector, int64_t offset, const std::span<uint8_t> sortedIdx, std::span<int64_t> target, int64_t missingVal) {
     // Hmm, we could also just pass in a segment and not the whole reader.
-    auto segNum = collector.topDocs[sortedIdx[0]].doc.segment();
+    auto segNum = collector.topDocs[offset + sortedIdx[0]].doc.segment();
     auto& postingsReader = reader.segments()[segNum].postingsReader();
     auto poolGuard = MemPool::threadLocalPoolGuard();
     FieldReader fieldReader(poolGuard.pool(), postingsReader);
@@ -567,7 +606,7 @@ public:
 
     int32_t next = -1;
     for (auto idx : sortedIdx) {
-      auto segdoc = collector.topDocs[idx].doc;
+      auto segdoc = collector.topDocs[offset + idx].doc;
       assert(segdoc.segment() == segNum);
       int32_t docid = segdoc.docId();
       if (docid < next) {
@@ -588,7 +627,7 @@ public:
   }
 
   void loadStrCol(SearchEngine::Request& req, std::string_view field, FieldType& fieldType,
-                  const TopDocsCollector& collector, const std::span<uint8_t> sortedIdx, const std::span<uint8_t> sortedIdxRunLen, std::span<std::string*> target, std::string_view missingVal,
+                  const TopDocsCollector& collector, int64_t offset, const std::span<uint8_t> sortedIdx, const std::span<uint8_t> sortedIdxRunLen, std::span<std::string*> target, std::string_view missingVal,
                   oneapi::tbb::task_group* tg)
   {
     auto& topDocs = collector.topDocs;
@@ -597,17 +636,18 @@ public:
     while (start < sortedIdx.size()) {
       auto runlen = sortedIdxRunLen[start];
       auto segSpan = sortedIdx.subspan(start, runlen);
-      task_group_run(tg, [this, &req, field, &fieldType, &collector, segSpan, target, missingVal]() {
-        loadStrColSeg(*req.reader, field, fieldType, collector, segSpan, target, missingVal);
+      task_group_run(tg, [this, &req, field, &fieldType, &collector, offset, segSpan, target, missingVal]() {
+        loadStrColSeg(*req.reader, field, fieldType, collector, offset, segSpan, target, missingVal);
       });
       start += runlen;
     }
   }
 
 
-  void loadStrColSeg(IndexReader& reader, std::string_view field, FieldType& fieldType, const TopDocsCollector& collector, const std::span<uint8_t> sortedIdx, std::span<std::string*> target, std::string_view missingVal) {
+  // TODO: abstract this better so we have a single function that can be called with a id provider, and a value acceptor.
+  void loadStrColSeg(IndexReader& reader, std::string_view field, FieldType& fieldType, const TopDocsCollector& collector, int64_t offset, const std::span<uint8_t> sortedIdx, std::span<std::string*> target, std::string_view missingVal) {
     // Hmm, we could also just pass in a segment and not the whole reader.
-    auto segNum = collector.topDocs[sortedIdx[0]].doc.segment();
+    auto segNum = collector.topDocs[offset + sortedIdx[0]].doc.segment();
     auto& postingsReader = reader.segments()[segNum].postingsReader();
     auto poolGuard = MemPool::threadLocalPoolGuard();
     FieldReader fieldReader(poolGuard.pool(), postingsReader);
@@ -629,7 +669,7 @@ public:
     int32_t next = -1;
     int32_t lastOrd = -1;
     for (auto idx : sortedIdx) {
-      auto segdoc = collector.topDocs[idx].doc;
+      auto segdoc = collector.topDocs[offset + idx].doc;
       assert(segdoc.segment() == segNum);
       int32_t docid = segdoc.docId();
       if (docid < next) {

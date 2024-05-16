@@ -576,9 +576,7 @@ TEST_F(GrpcIndexTest, threadsafe) {
 }
 
 //
-// With the first simplistic multi-threading support in IndexWriter (just a single Inverter protected by a mutex)
-// this test quickly crashed after the mutex was removed.  When investigating thread safety and indexing, consider
-// ramping up callsPerTask to hammer things for longer.
+// Stress test multi-threaded indexing and searching.
 //
 TEST_F(GrpcIndexTest, threadsafeIndex) {
   int nThreads = 32;
@@ -620,6 +618,7 @@ TEST_F(GrpcIndexTest, threadsafeIndex) {
     // try to retrieve the document we just indexed
     auto& topDocs = *(*req.mutable_ops())["q"].mutable_top_docs();
     topDocs.set_get_number(true);
+    topDocs.set_limit(1);
     auto& topQuery = *topDocs.mutable_query()->mutable_match();
     // the field t2_w contains integers from 1-10, 1-100, and 1-1000.  So if we search for
     // something like "0" it should match > 11% of the docs and use block compression in the codec

@@ -49,15 +49,17 @@ message SearchOp {
 
 message TopDocs {
   Query query = 1;
-  int64 offset = 2;
-  optional sint64 limit = 3;
-  bool get_number = 4;          // return the number of matching documents
-  bool get_scores = 5;          // return the relevancy score for each document returned
-  repeated string fields = 6;   // fields to return for each document
-  repeated SortSpec sorts = 7;
-
   // A set of named filters on the main query.
-  repeated NamedQuery filter = 15;
+  repeated NamedQuery filter = 2;
+  int64 offset = 3;
+  optional sint64 limit = 4;
+  bool get_number = 5;          // return the number of matching documents
+  bool get_scores = 6;          // return the relevancy score for each document returned
+  repeated string fields = 7;   // fields to return for each document
+  repeated SortSpec sorts = 8;
+  int32 batch_size = 9;         // maximum number of documents to return in a single streaming response
+                                // if max_batch_size >= limit, multiple responses may be generated
+                                // The solux server may choose a lower value to protect against large in-memory responses.
 }
 
 message SortSpec {
@@ -173,6 +175,7 @@ message Domain {
 message SearchResponse {
   bytes request_id = 1;
   map<string, SearchResult> ops = 2;
+  bool more = 15;  // if true, expect at least one more streaming response to the logical request.
 }
 
 message SearchResult {

@@ -93,45 +93,105 @@ TEST_F(SearchEngineTest, basic) {
   helper.index(flatdoc("foo_w","brown", "foo_i", 5, "color_s","brown"),UpdateMessage::COMMIT);
   // should be 2 segments now.
 
-  auto* lreq = LocalReq::create(soluxNode->getSearchEngine());
-  lreq->proto.mutable_collection()->add_name("main");
-  lreq->proto.set_request_id("myrequestid");
+  {
+    auto* lreq = LocalReq::create(soluxNode->getSearchEngine());
+    lreq->proto.mutable_collection()->add_name("main");
+    lreq->proto.set_request_id("myrequestid");
 
-  auto& ops = *lreq->proto.mutable_ops();
-  auto& topDocs = *ops["q"].mutable_top_docs();
-  topDocs.set_get_number(true);
-  topDocs.set_get_scores(true);
-  auto& query = *topDocs.mutable_query()->mutable_match();
-  query.set_field("foo_w");
-  query.mutable_val()->set_s("brown");
-  topDocs.mutable_fields()->Add("foo_i");
-  topDocs.mutable_fields()->Add("color_s");
-  // topDocs.mutable_fields()->Add("noexist_i");
-  // topDocs.mutable_fields()->Add("noexist_s");
+    auto& ops = *lreq->proto.mutable_ops();
+    auto& topDocs = *ops["q"].mutable_top_docs();
+    topDocs.set_get_number(true);
+    topDocs.set_get_scores(true);
+    auto& query = *topDocs.mutable_query()->mutable_match();
+    query.set_field("foo_w");
+    query.mutable_val()->set_s("brown");
+    topDocs.mutable_fields()->Add("foo_i");
+    topDocs.mutable_fields()->Add("color_s");
+    // topDocs.mutable_fields()->Add("noexist_i");
+    // topDocs.mutable_fields()->Add("noexist_s");
 
-  /* phrase query not yet parsed
-  auto& terms = *ops["q"].mutable_top_docs()->mutable_query()->mutable_phrase()->mutable_terms();
-  terms.Add("foo");
-  terms.Add("bar");
-   */
+    /* phrase query not yet parsed
+    auto& terms = *ops["q"].mutable_top_docs()->mutable_query()->mutable_phrase()->mutable_terms();
+    terms.Add("foo");
+    terms.Add("bar");
+     */
 
 
-  lreq->engine.submit(*lreq);
-  // LOG_DEBUG("ENGINE REQ: {}", lreq->toString());
+    lreq->engine.submit(*lreq, false);
+    // LOG_DEBUG("ENGINE REQ: {}", lreq->toString());
 
-  ASSERT_EQ(lreq->proto.request_id(),  lreq->responses[0]->proto.request_id());
-  auto& docs = lreq->responses[0]->proto.ops().at("q").docs();
-  ASSERT_EQ(3, docs.matches());
-  ASSERT_EQ(3, docs.columns_size());
+    ASSERT_EQ(lreq->proto.request_id(), lreq->responses[0]->proto.request_id());
+    auto& docs = lreq->responses[0]->proto.ops().at("q").docs();
+    ASSERT_EQ(3, docs.matches());
+    ASSERT_EQ(3, docs.columns_size());
 
-  // docs will be ordered by shortest field first since term freq is same for all.
-  ASSERT_EQ(5, docs.columns().at("foo_i").col_i().v(0));
-  ASSERT_EQ("brown", docs.columns().at("color_s").col_s().v(0));
-  ASSERT_EQ(23, docs.columns().at("foo_i").col_i().v(1));
-  ASSERT_EQ("blue", docs.columns().at("color_s").col_s().v(1));
-  ASSERT_EQ(17, docs.columns().at("foo_i").col_i().v(2));
-  ASSERT_EQ("red", docs.columns().at("color_s").col_s().v(2));
+    // docs will be ordered by shortest field first since term freq is same for all.
+    ASSERT_EQ(5, docs.columns().at("foo_i").col_i().v(0));
+    ASSERT_EQ("brown", docs.columns().at("color_s").col_s().v(0));
+    ASSERT_EQ(23, docs.columns().at("foo_i").col_i().v(1));
+    ASSERT_EQ("blue", docs.columns().at("color_s").col_s().v(1));
+    ASSERT_EQ(17, docs.columns().at("foo_i").col_i().v(2));
+    ASSERT_EQ("red", docs.columns().at("color_s").col_s().v(2));
 
-  lreq->done();
+    lreq->done();
+  }
+
+  // now lets do the same request, but try to get multiple responses.
+  {
+    auto* lreq = LocalReq::create(soluxNode->getSearchEngine());
+    lreq->proto.mutable_collection()->add_name("main");
+    lreq->proto.set_request_id("myrequestid");
+    auto& ops = *lreq->proto.mutable_ops();
+    auto& topDocs = *ops["q"].mutable_top_docs();
+    topDocs.set_get_number(true);
+    topDocs.set_get_scores(true);
+    auto& query = *topDocs.mutable_query()->mutable_match();
+    query.set_field("foo_w");
+    query.mutable_val()->set_s("brown");
+    topDocs.mutable_fields()->Add("foo_i");
+    topDocs.mutable_fields()->Add("color_s");
+    topDocs.set_batch_size(2);
+
+    lreq->engine.submit(*lreq, false);
+// LOG_DEBUG("ENGINE REQ: {}", lreq->toString());
+
+    ASSERT_EQ(lreq->proto.request_id(), lreq->responses[0]->proto.request_id());
+    auto& docs = lreq->responses[0]->proto.ops().at("q").docs();
+    ASSERT_EQ(3, docs.matches());
+    ASSERT_EQ(3, docs.columns_size());
+
+    // docs will be ordered by shortest field first since term freq is same for all.
+    ASSERT_EQ(2, docs.columns().at("foo_i").col_i().v_size());  // only the first 2 docs this time.  should I explicitly return the number of docs in this batch?
+    ASSERT_EQ(2, docs.columns().at("color_s").col_s().v_size());  // only the first 2 docs this time.  should I explicitly return the number of docs in this batch?
+    ASSERT_EQ(5, docs.columns().at("foo_i").col_i().v(0));
+    ASSERT_EQ("brown", docs.columns().at("color_s").col_s().v(0));
+    ASSERT_EQ(23, docs.columns().at("foo_i").col_i().v(1));
+    ASSERT_EQ("blue", docs.columns().at("color_s").col_s().v(1));
+    // check that "more" flags are set both at DocList level and at Response level
+    ASSERT_TRUE(docs.more());
+    ASSERT_TRUE(lreq->responses[0]->proto.more());
+
+
+    ASSERT_EQ(lreq->proto.request_id(), lreq->responses[1]->proto.request_id());
+    auto& docs2 = lreq->responses[1]->proto.ops().at("q").docs();
+    ASSERT_EQ(3, docs2.matches());
+    ASSERT_EQ(2, docs2.offset());
+    ASSERT_EQ(3, docs2.columns_size());
+    ASSERT_EQ(1, docs2.columns().at("foo_i").col_i().v_size());  // only the first 2 docs this time.  should I explicitly return the number of docs in this batch?
+    ASSERT_EQ(1, docs2.columns().at("color_s").col_s().v_size());
+
+    // docs will be ordered by shortest field first since term freq is same for all.
+    ASSERT_EQ(17, docs2.columns().at("foo_i").col_i().v(0));
+    ASSERT_EQ("red", docs2.columns().at("color_s").col_s().v(0));
+    // check that more flags are false at DocList level and at Response level
+    ASSERT_FALSE(docs2.more());
+    ASSERT_FALSE(lreq->responses[1]->proto.more());
+
+    lreq->done();
+
+
+
+  }
+
 }
 

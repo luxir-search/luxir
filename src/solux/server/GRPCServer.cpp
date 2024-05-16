@@ -763,8 +763,7 @@ public:
 
     auto& req = *google::protobuf::Arena::Create<GRPCSearchRequest>(arena, engine, *request);
     req.parent = this;
-    req.tg = nullptr; // start off synchronous only
-    engine.submit(req);
+    engine.submit(req, false);  // nocommit non-parallel
 
     // Always return true (i.e. we have taken control of the request object thus it can't be reused)
     // The issue is that even for a single simple synchronous request, there may be other responses
