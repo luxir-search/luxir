@@ -29,7 +29,7 @@ public:
 
   void directAppend(uint32_t i, uint32_t val) { data[i][sizes[i]++] = val; }
 
-  const uint32_t *get(int i) { return data[i]; }
+  const uint32_t* get(int i) { return data[i]; }
 
   void ensureCapacity(int i, uint32_t datatoadd) {
     assert(i>= 0 && i <= 32);
@@ -139,7 +139,11 @@ void SoluxPFOR::encodeBlock(uint32_t* in, uint32_t inSz, char* out, uint32_t& ou
     codec = (soluxPfor = std::make_unique<SoluxPForType>()).get();
   }
   size_t compressedSize = outSz / sizeof(uint32_t); // this gets changed to the actual size... simdcomp lib uses size in units of words.
-  codec->encodeArray(in, inSz, (uint32_t*)out, compressedSize);
+
+  // encode single block only
+  assert(inSz == 128);
+  auto prev = _mm_set1_epi32(0);
+  codec->__encodeArray(in, 128, (uint32_t*)out, compressedSize, prev);
   outSz = compressedSize * sizeof(uint32_t);  // convert to bytes
 }
 
@@ -148,12 +152,13 @@ uint32_t SoluxPFOR::decodeBlock(const char* in, uint32_t inSz, uint32_t* out, ui
   if (codec == nullptr) {
     codec = (soluxPfor = std::make_unique<SoluxPForType>()).get();
   }
-  uint64_t recoveredSz = outSz;
-  auto endPtr = codec->decodeArray( (uint32_t*)in, inSz / sizeof(uint32_t), out, recoveredSz);
-  outSz = recoveredSz;
-  auto bytesRead = (char*)endPtr - in;
-  assert(bytesRead <= inSz);
-  return bytesRead;
+
+  // decode single block only
+  assert(outSz == 128);
+  size_t wordsRead;  // amount of compressed data read (in units of words instead of bytes)
+  auto prev = _mm_set1_epi32(0);
+  codec->__decodeArray((uint32_t*)in, wordsRead, out, 128, prev);
+  return wordsRead * sizeof(uint32_t);
 }
 
 }  // namespace solux

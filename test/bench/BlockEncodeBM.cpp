@@ -96,7 +96,7 @@ BENCHMARK_CAPTURE(BM_blockDecode, SimpleCodec, "SimpleCodec", false);
 BENCHMARK_CAPTURE(BM_blockDecode, FastPFor, "FastPFor", false); // ->Range(8, 8<<10);
 BENCHMARK_CAPTURE(BM_blockDecode, SIMDFastPFor, "SIMDFastPFor", false);
 BENCHMARK_CAPTURE(BM_blockDecode, SIMDFastPForDelta1, "SIMDFastPForDelta1", true);
-BENCHMARK_CAPTURE(BM_blockDecode, SoluxPFOR, "SoluxPFOR", true);
+BENCHMARK_CAPTURE(BM_blockDecode, SoluxPFOR, "SoluxPFOR", false);
 
 
 } // end solux

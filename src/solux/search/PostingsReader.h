@@ -37,7 +37,8 @@ public:
   static constexpr int32_t POSITIONS_BLOCK_SIZE = 128;
   static constexpr int32_t DOCS_BLOCK_SIZE = 128;
 
-  using PositionsCodec = IntegerCODECTypeWrapper<SIMDCompressionLib::FastPFor<4, false>>;
+  // using PositionsCodec = IntegerCODECTypeWrapper<SIMDCompressionLib::FastPFor<4, false>>;
+  using PositionsCodec = SoluxPFOR;
   using DocsCodec = IntegerCODECTypeWrapper<SIMDCompressionLib::SIMDFastPFor<4, SIMDCompressionLib::RegularDeltaSIMD>>;
   using TFreqCodec = PositionsCodec; // same type, but should also share instances for better performance
 

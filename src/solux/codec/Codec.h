@@ -86,7 +86,7 @@ public:
     uint64_t recoveredSz = outSz;
     auto endPtr = getCodec().decodeArray( (uint32_t*)in, inSz / sizeof(uint32_t), out, recoveredSz);
     outSz = recoveredSz;
-    auto bytesRead = (char*)endPtr - in;
+    auto bytesRead = (char*)endPtr - (char*)in;
     assert(bytesRead <= inSz);
     return bytesRead;
   }
