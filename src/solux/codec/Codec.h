@@ -10,13 +10,7 @@
 namespace solux {
 
 
-// TODO: Enable these methods to be thread-safe by passing in scratch buffers,
-// or passing in a pool that can be allocated from?  We would want to pass scratch buffers / pool
-// even if threads had their own copies to avoid heap memory allocation anyway.
-// IDEA: even if multiple scratch buffers are needed, there could be a single method
-// that returns the size of all needed scratch buffers (plus any possible alignment overhead needed.)
-// The codec would be responsible for splitting up the single passed array.
-// Update: SIMDCompressionLib codecs were made thread safe via thread_local.
+
 class U32Codec {
 public:
   virtual ~U32Codec() = default;
@@ -54,31 +48,18 @@ public:
   }
 };
 
-
-// Wraps types of SIMDCompressionLib::IntegerCODEC instance
-class IntegerCODECWrapper : public U32Codec {
-  std::unique_ptr<SIMDCompressionLib::IntegerCODEC> codec;
+class SoluxPFOR : public U32Codec {
 public:
+  ~SoluxPFOR() override = default;
 
-  explicit IntegerCODECWrapper(std::unique_ptr<SIMDCompressionLib::IntegerCODEC> codec) : codec(std::move(codec)) {
-  }
+  void encodeBlock(uint32_t* in, uint32_t inSz, char* out, uint32_t &outSz) override;
 
-  void encodeBlock(uint32_t* in, uint32_t inSz, char* out, uint32_t &outSz) override {
-    size_t compressedSize = outSz / sizeof(uint32_t); // this gets changed to the actual size... simdcomp lib uses size in units of words.
-    codec->encodeArray(in, inSz, (uint32_t*)out, compressedSize);
-    outSz = compressedSize * sizeof(uint32_t);  // convert to bytes
-  }
-
-  uint32_t decodeBlock(const char* in, uint32_t inSz, uint32_t* out, uint32_t &outSz) override {
-    uint64_t recoveredSz = outSz;
-    codec->decodeArray( (uint32_t*)in, inSz / sizeof(uint32_t), out, recoveredSz);
-    outSz = recoveredSz;
-    return inSz*sizeof(uint32_t);
-  }
+  uint32_t decodeBlock(const char* in, uint32_t inSz, uint32_t* out, uint32_t &outSz) override;
 };
 
 
-// Wraps types of SIMDCompressionLib::IntegerCODEC
+// Wraps types of SIMDCompressionLib::IntegerCODEC to make them thread-safe (via thread-local)
+// and to translate the interface to U32Codec
 template <class Type>  // Type should be subclass of SIMDCompressionLib::IntegerCODEC
 class IntegerCODECTypeWrapper : public U32Codec {
   thread_local static std::unique_ptr<Type> codec;

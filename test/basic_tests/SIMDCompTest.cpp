@@ -31,12 +31,14 @@ TEST_F(SIMDCompTest, testComp) {
   // after we have an optimized version.
 //  codecs.emplace("pfor32", shared_ptr<IntegerCODEC>(new CompositeCodec<SIMDFastPFor<1, RegularDeltaSIMD>, leftovercodec>()));  // 25 bits
 //  codecs.emplace("pfor64", shared_ptr<IntegerCODEC>(new CompositeCodec<SIMDFastPFor<2, RegularDeltaSIMD>, leftovercodec>()));  // 13 bits
-//  codecs.emplace("pfor128", shared_ptr<IntegerCODEC>(new CompositeCodec<SIMDFastPFor<4, RegularDeltaSIMD>, leftovercodec>()));  // 8.13 bits
+codecs.emplace("pfor128", shared_ptr<IntegerCODEC>(new CompositeCodec<SIMDFastPFor<4, RegularDeltaSIMD>, leftovercodec>()));  // 8.13 bits
 //  codecs.emplace("pfor256", shared_ptr<IntegerCODEC>(new CompositeCodec<SIMDFastPFor<8, RegularDeltaSIMD>, leftovercodec>()));  // 7.88 bits
+//  codecs.emplace("streamvbyte", shared_ptr<IntegerCODEC>(new StreamVByteD1()));  // 10.2 bits/integer
 
 
   //sorted integers.
-  size_t N = 256;    // for N=256:  s4-bp128-d4 = 9.63 bits/int   s4-bp128-d1 = 8.63     s4-fastpfor-d1 = 7.88
+  // size_t N = 256;    // for N=256:  s4-bp128-d4 = 9.63 bits/int   s4-bp128-d1 = 8.63     s4-fastpfor-d1 = 7.88
+  size_t N = 128;    // for N=256:  s4-bp128-d4 = 9.63 bits/int   s4-bp128-d1 = 8.63     s4-fastpfor-d1 = 7.88
   uint32_t val = 0;
   vector<uint32_t> mydata(N);
   for (uint32_t i = 0; i < N; ++i) {

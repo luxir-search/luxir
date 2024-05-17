@@ -35,52 +35,59 @@ inline void fillBlock(Rng& rng, uint32_t* out, uint32_t outSz, bool sorted) {
 
 static void BM_blockDecode(benchmark::State& state, std::string codecName, bool sorted) {
   // std::cout << "state.range[0]=" << state.range(0) << std::endl;
-  Rng rng(1);
+  Rng rng(SoluxTest::rng_seed);
 
   auto codec = U32CodecFactory::getCodec(codecName);
 
-  std::vector<uint32_t> values;
-  std::vector<uint32_t> decoded;
-  std::vector<char> encoded;
+  std::vector<std::vector<uint32_t>> values;
+  std::vector<std::vector<uint32_t>> decoded;
+  std::vector<std::vector<char>> encoded;
+  std::vector<uint32_t> maxValues = {1<<3,1<<5,1<<7,1<<9,1<<11,1<<13,1<<15,1<<17,1<<19,1<<21};  // 10 diff sizes
 
   uint32_t nvalues = INT_BLOCK_SIZE;
-  values.resize(nvalues);
-  decoded.resize(nvalues);
-  encoded.resize(nvalues*sizeof(uint32_t) * 2);  // may result in SIMDCompressionLib::NotEnoughStorage if not big enough
 
-  fillBlock(rng, &values[0], (uint32_t) values.size(), sorted);
-  // some codecs modify the input array (calculating deltas in place), so make a copy.
-  std::vector<uint32_t> orig(values);
-  uint32_t encodedSz = encoded.size();
-  codec->encodeBlock(&values[0], values.size(), &encoded[0], encodedSz);
-  uint32_t decodedSz = 0;
+  values.resize(maxValues.size());
+  encoded.resize(maxValues.size());
+  decoded.resize(maxValues.size());
 
-  for (auto _ : state) {
-    if (solux::unit_tests) {
-      // state.PauseTiming();  // Only use in unit tests or slow tests!  See BenchTimer
-      fillBlock(rng, &values[0], (uint32_t) values.size(), sorted);
-      // some codecs modify the input array (calculating deltas in place), so make a copy.
-      orig = values;
-      encodedSz = encoded.size();
-      codec->encodeBlock(&values[0], values.size(), &encoded[0], encodedSz);
-      // state.ResumeTiming();
-    }
-
-    decodedSz = decoded.size();
-    codec->decodeBlock(&encoded[0], encodedSz, &decoded[0], decodedSz);
-    benchmark::DoNotOptimize(&decoded[0]);
-    benchmark::ClobberMemory();
-
-    if (solux::unit_tests) {
-      // state.PauseTiming();
-      ASSERT_EQ(nvalues, decodedSz);
-      ASSERT_EQ(orig, decoded);
-      // state.ResumeTiming();
-    }
+  for (auto i = 0; i<maxValues.size(); i++) {
+    values[i].resize(nvalues);
+    decoded[i].resize(nvalues);
+    encoded[i].resize(nvalues*sizeof(uint32_t) * 2);  // may result in SIMDCompressionLib::NotEnoughStorage if not big enough
+    fillBlock(rng, maxValues[i], &values[i][0], nvalues, sorted);
+    // some codecs modify the input array (calculating deltas in place), so make a copy.
+    std::vector<uint32_t> orig(values[i]);
+    uint32_t encodedSz = encoded[i].size();
+    codec->encodeBlock(&orig[0], nvalues, &encoded[i][0], encodedSz);
+    encoded[i].resize(encodedSz);
   }
 
-  ASSERT_EQ(nvalues, decodedSz);
-  ASSERT_EQ(orig, decoded);
+
+  for (auto _ : state) {
+
+    for (int i=0; i<maxValues.size(); i++) {
+      uint32_t decodedSz = decoded[i].size();
+      codec->decodeBlock(&encoded[i][0], encoded[i].size(), &decoded[i][0], decodedSz);
+      ASSERT_EQ(nvalues, decodedSz);
+
+      if (solux::unit_tests) {
+        // state.PauseTiming();
+        ASSERT_EQ(nvalues, decodedSz);
+        ASSERT_EQ(values[i], decoded[i]);
+        // state.ResumeTiming();
+      }
+    }
+
+    benchmark::DoNotOptimize(&decoded);
+    benchmark::ClobberMemory();
+  }
+
+  // calculate total size of encoded data
+  double totalSz = 0;
+  for (auto& enc : encoded) {
+    totalSz += enc.size();
+  }
+  state.counters["size"] = totalSz;
 };
 
 
@@ -89,6 +96,7 @@ BENCHMARK_CAPTURE(BM_blockDecode, SimpleCodec, "SimpleCodec", false);
 BENCHMARK_CAPTURE(BM_blockDecode, FastPFor, "FastPFor", false); // ->Range(8, 8<<10);
 BENCHMARK_CAPTURE(BM_blockDecode, SIMDFastPFor, "SIMDFastPFor", false);
 BENCHMARK_CAPTURE(BM_blockDecode, SIMDFastPForDelta1, "SIMDFastPForDelta1", true);
+BENCHMARK_CAPTURE(BM_blockDecode, SoluxPFOR, "SoluxPFOR", true);
 
 
 } // end solux
