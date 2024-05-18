@@ -50,6 +50,10 @@ public:
 
 class SoluxPFOR : public U32Codec {
 public:
+  // Micro-benchmarks show decoding 256 takes about 35% longer to 50% longer (with stack bitpacker) than 128.
+  // So that's still a savings for dense iteration, but a drawback for very sparse.
+  const static uint32_t BLOCK_SIZE = 128;
+
   ~SoluxPFOR() override = default;
 
   void encodeBlock(uint32_t* in, uint32_t inSz, char* out, uint32_t &outSz) override;
@@ -57,6 +61,15 @@ public:
   uint32_t decodeBlock(const char* in, uint32_t inSz, uint32_t* out, uint32_t &outSz) override;
 };
 
+// delta version of the codec
+class SoluxPFORd : public U32Codec {
+public:
+  ~SoluxPFORd() override = default;
+
+  void encodeBlock(uint32_t* in, uint32_t inSz, char* out, uint32_t &outSz) override;
+
+  uint32_t decodeBlock(const char* in, uint32_t inSz, uint32_t* out, uint32_t &outSz) override;
+};
 
 // Wraps types of SIMDCompressionLib::IntegerCODEC to make them thread-safe (via thread-local)
 // and to translate the interface to U32Codec

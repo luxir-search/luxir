@@ -34,12 +34,13 @@ class DocsEnum;
 class Postings {
 public:
   static constexpr int32_t TERMS_BLOCK_SIZE = 32;
-  static constexpr int32_t POSITIONS_BLOCK_SIZE = 128;
-  static constexpr int32_t DOCS_BLOCK_SIZE = 128;
+  static constexpr int32_t POSITIONS_BLOCK_SIZE = SoluxPFOR::BLOCK_SIZE;
+  static constexpr int32_t DOCS_BLOCK_SIZE =  SoluxPFOR::BLOCK_SIZE;
 
   // using PositionsCodec = IntegerCODECTypeWrapper<SIMDCompressionLib::FastPFor<4, false>>;
   using PositionsCodec = SoluxPFOR;
-  using DocsCodec = IntegerCODECTypeWrapper<SIMDCompressionLib::SIMDFastPFor<4, SIMDCompressionLib::RegularDeltaSIMD>>;
+  // using DocsCodec = IntegerCODECTypeWrapper<SIMDCompressionLib::SIMDFastPFor<4, SIMDCompressionLib::RegularDeltaSIMD>>;
+  using DocsCodec = SoluxPFORd;
   using TFreqCodec = PositionsCodec; // same type, but should also share instances for better performance
 
   // These could be static if we made them thread safe...

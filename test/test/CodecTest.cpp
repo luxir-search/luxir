@@ -15,6 +15,8 @@ std::unique_ptr<U32Codec> U32CodecFactory::getCodec(const std::string& name) {
     return std::make_unique<SimpleCodec>();
   } else if (name=="SoluxPFOR") {
     return std::make_unique<SoluxPFOR>();
+  } else if (name=="SoluxPFORd") {
+    return std::make_unique<SoluxPFORd>();
   }
   return {};
 }

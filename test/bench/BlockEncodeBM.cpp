@@ -8,7 +8,7 @@
 
 namespace solux {
 
-constexpr uint32_t INT_BLOCK_SIZE = 128;
+constexpr uint32_t INT_BLOCK_SIZE = SoluxPFOR::BLOCK_SIZE;
 
 // TODO: how to chose distribution?  bias toward small values?
 // figure out if sorting is needed based on codec?
@@ -97,6 +97,7 @@ BENCHMARK_CAPTURE(BM_blockDecode, FastPFor, "FastPFor", false); // ->Range(8, 8<
 BENCHMARK_CAPTURE(BM_blockDecode, SIMDFastPFor, "SIMDFastPFor", false);
 BENCHMARK_CAPTURE(BM_blockDecode, SIMDFastPForDelta1, "SIMDFastPForDelta1", true);
 BENCHMARK_CAPTURE(BM_blockDecode, SoluxPFOR, "SoluxPFOR", false);
+BENCHMARK_CAPTURE(BM_blockDecode, SoluxPFORd, "SoluxPFORd", true);
 
 
 } // end solux
