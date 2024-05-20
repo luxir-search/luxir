@@ -918,15 +918,20 @@ public:
     } else {
       // TODO: figure out how much buffer space we actually need.  For codec writes two extra 32 bit values (min and max)
       // and I don't think any more space is needed.
-      std::vector<char> compressed_output(ivalues.size() * sizeof(int32_t) + 8);
+      std::vector<char> compressed_output(ivalues.size() * sizeof(int32_t) + 32);
       uint32_t compressedSize = compressed_output.size(); // this gets changed to the actual size
       Postings::numericCodec.encodeBlock((uint32_t*)ivalues.data(), ivalues.size(), compressed_output.data(), compressedSize);
-      if (compressedSize > ivalues.size() * sizeof(int32_t) + 8) {
+      /*
+      if (compressedSize > ivalues.size() * sizeof(int32_t) + 32) {
         // debugging check.... something is causing an issue (Heap-buffer-overflow)
         LOG_ERROR("IntColWriter: compressed size too large in field {}, num={}, min={}, max={}, csize={}", (std::string_view)fieldInfo.fieldname, ivalues.size(), min, max, compressedSize);
       }
-        // write the compressed block (which includes the size of the block at the start
+      */
+
       colOutput.write(compressed_output.data(), compressedSize);
+      // SIMDFor implementation can read up to 31 extra bytes after the end of compressedSize.
+      // In this case we are fine because we write extra info after the last block (like BlockInfo array) which
+      // is always larger than that.  See SoluxSIMDFor comment.
     }
   }
 

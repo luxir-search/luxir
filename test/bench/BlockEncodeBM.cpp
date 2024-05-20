@@ -8,7 +8,8 @@
 
 namespace solux {
 
-constexpr uint32_t INT_BLOCK_SIZE = SoluxPFOR::BLOCK_SIZE;
+//constexpr uint32_t INT_BLOCK_SIZE = SoluxPFOR::BLOCK_SIZE;
+constexpr uint32_t INT_BLOCK_SIZE = Postings::NUMERIC_BLOCK_SIZE;
 
 // TODO: how to chose distribution?  bias toward small values?
 // figure out if sorting is needed based on codec?
@@ -33,7 +34,7 @@ inline void fillBlock(Rng& rng, uint32_t* out, uint32_t outSz, bool sorted) {
 
 
 
-static void BM_blockDecode(benchmark::State& state, std::string codecName, bool sorted, bool testSelect=false) {
+static void BM_blockDecode(benchmark::State& state, std::string codecName, uint32_t blockSize, bool sorted, bool testSelect=false) {
   // std::cout << "state.range[0]=" << state.range(0) << std::endl;
   Rng rng(SoluxTest::global_random_seed);  // make same data for different test variants
 
@@ -44,7 +45,7 @@ static void BM_blockDecode(benchmark::State& state, std::string codecName, bool 
   std::vector<std::vector<char>> encoded;
   std::vector<uint32_t> maxValues = {1<<3,1<<5,1<<7,1<<9,1<<11,1<<13,1<<15,1<<17,1<<19,1<<21};  // 10 diff sizes
 
-  uint32_t nvalues = INT_BLOCK_SIZE;
+  uint32_t nvalues = blockSize;
 
   values.resize(maxValues.size());
   encoded.resize(maxValues.size());
@@ -67,13 +68,17 @@ static void BM_blockDecode(benchmark::State& state, std::string codecName, bool 
 
     for (int i=0; i<maxValues.size(); i++) {
       if (testSelect) {
-        // single value decode
-        size_t which = rng.rint(INT_BLOCK_SIZE);
-        // dynamic cast to IntegerCODECTypeWrapper<SIMDCompressionLib::SIMDFrameOfReference>>
+        for (int j=0; j<10; j++) {
+          // single value decode
+          size_t which = rng.rint(blockSize);
+          // dynamic cast to IntegerCODECTypeWrapper<SIMDCompressionLib::SIMDFrameOfReference>>
 
-        auto* pfor = (IntegerCODECTypeWrapper<SIMDCompressionLib::SIMDFrameOfReference>*) codec.get();
-        auto val = pfor->getCodec().select((uint32_t*) &encoded[i][0], which);
-        ASSERT_EQ(values[i][which], val);
+          // auto* pfor = (IntegerCODECTypeWrapper<SIMDCompressionLib::SIMDFrameOfReference>*) codec.get();
+          // auto val = pfor->getCodec().select((uint32_t*) &encoded[i][0], which);
+          auto val = codec->select(&encoded[i][0], values[i].size(), which);
+
+          ASSERT_EQ(values[i][which], val);
+        }
       } else {
         // block decode
         uint32_t decodedSz = decoded[i].size();
@@ -103,15 +108,18 @@ static void BM_blockDecode(benchmark::State& state, std::string codecName, bool 
 
 
 // TODO: is there a way to get test name and avoid the duplication with codec here?
-BENCHMARK_CAPTURE(BM_blockDecode, SimpleCodec, "SimpleCodec", false);
-BENCHMARK_CAPTURE(BM_blockDecode, FastPFor, "FastPFor", false); // ->Range(8, 8<<10);
-BENCHMARK_CAPTURE(BM_blockDecode, SIMDFastPFor, "SIMDFastPFor", false);
-BENCHMARK_CAPTURE(BM_blockDecode, SIMDFastPForDelta1, "SIMDFastPForDelta1", true);
-BENCHMARK_CAPTURE(BM_blockDecode, SoluxPFOR, "SoluxPFOR", false);
-BENCHMARK_CAPTURE(BM_blockDecode, SoluxPFORd, "SoluxPFORd", true);
-BENCHMARK_CAPTURE(BM_blockDecode, SIMDFor, "SIMDFor", false);
-BENCHMARK_CAPTURE(BM_blockDecode, SIMDFor_select, "SIMDFor", false, true);
-BENCHMARK_CAPTURE(BM_blockDecode, ForCODEC, "ForCODEC", false);
+BENCHMARK_CAPTURE(BM_blockDecode, SimpleCodec, "SimpleCodec", INT_BLOCK_SIZE, false);
+BENCHMARK_CAPTURE(BM_blockDecode, FastPFor, "FastPFor", INT_BLOCK_SIZE, false); // ->Range(8, 8<<10);
+BENCHMARK_CAPTURE(BM_blockDecode, SIMDFastPFor, "SIMDFastPFor", INT_BLOCK_SIZE, false);
+BENCHMARK_CAPTURE(BM_blockDecode, SIMDFastPForDelta1, "SIMDFastPForDelta1", INT_BLOCK_SIZE, true);
+BENCHMARK_CAPTURE(BM_blockDecode, SoluxPFOR128, "SoluxPFOR", 128, false);  // these two codecs only do 128
+BENCHMARK_CAPTURE(BM_blockDecode, SoluxPFORd128, "SoluxPFORd", 128, true);
+BENCHMARK_CAPTURE(BM_blockDecode, SIMDFor, "SIMDFor", INT_BLOCK_SIZE, false);
+BENCHMARK_CAPTURE(BM_blockDecode, SIMDFor_select, "SIMDFor", INT_BLOCK_SIZE, false, true);
+BENCHMARK_CAPTURE(BM_blockDecode, SoluxSIMDFor, "SoluxSIMDFor", INT_BLOCK_SIZE, false);
+BENCHMARK_CAPTURE(BM_blockDecode, SoluxSIMDFor_select, "SoluxSIMDFor", INT_BLOCK_SIZE, false, true);
+BENCHMARK_CAPTURE(BM_blockDecode, ForCODEC, "ForCODEC", INT_BLOCK_SIZE, false);
+BENCHMARK_CAPTURE(BM_blockDecode, ForCODEC_select, "ForCODEC", INT_BLOCK_SIZE, false, true);
 
 
 } // end solux

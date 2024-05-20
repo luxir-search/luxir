@@ -23,6 +23,8 @@ std::unique_ptr<U32Codec> U32CodecFactory::getCodec(const std::string& name) {
     return std::make_unique<IntegerCODECTypeWrapper<SIMDCompressionLib::ForCODEC>>();
   } else if (name=="SoluxFor") {
     return std::make_unique<SoluxFor>();
+  } else if (name=="SoluxSIMDFor") {
+    return std::make_unique<SoluxSIMDFor>();
   }
 
   return {};

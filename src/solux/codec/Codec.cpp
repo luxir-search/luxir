@@ -2,6 +2,12 @@
 
 namespace solux {
 
+
+uint32_t staticselect(SoluxSIMDFor& c, const char* compressed, uint32_t blockSize, uint32_t index) {
+  return c.select(compressed, blockSize, index);
+}
+
+
 /**
  * This is a modified version of BasicSortedBitPacker from SIMDCompressionLib
  * that removes all the dynamic memory allocation.

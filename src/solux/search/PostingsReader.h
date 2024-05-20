@@ -43,7 +43,7 @@ public:
   // using DocsCodec = IntegerCODECTypeWrapper<SIMDCompressionLib::SIMDFastPFor<4, SIMDCompressionLib::RegularDeltaSIMD>>;
   using DocsCodec = SoluxPFORd;
   using TFreqCodec = PositionsCodec; // same type, but should also share instances for better performance
-  using NumericCodec = SoluxFor;
+  using NumericCodec = SoluxSIMDFor;
 
   // These could be static if we made them thread safe...
   static DocsCodec docCodec;

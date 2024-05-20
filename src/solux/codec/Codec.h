@@ -23,6 +23,13 @@ public:
   // outSz is updated to reflect how many ints were written.
   // returns the number of bytes read from the input.
   virtual uint32_t decodeBlock(const char* in, uint32_t inSz, uint32_t* out, uint32_t &outSz) = 0;
+
+  virtual uint32_t select(const char* compressed, uint32_t blockSize, uint32_t index) {
+    unused(compressed);
+    unused(blockSize);
+    unused(index);
+    throw new std::runtime_error("select not implemented for this codec");
+  }
 };
 
 // U64 codec can handle both 32 and 64 bit integers.
@@ -88,6 +95,9 @@ public:
   uint32_t decodeBlock(const char* in, uint32_t inSz, uint32_t* out, uint32_t &outSz) override;
 };
 
+/// NOTE: due to the way SIMD is implemented, reads can happen past the end of the block.
+/// As long as reads are valid for up to 16-31 bytes past the end of the block, we are fine.
+/// Add 16 and then round up to 16 bytes.
 class SoluxSIMDFor : public U32Codec {
   // this codec seems thread safe.  The class has no state.
   SIMDCompressionLib::SIMDFrameOfReference codec;
@@ -98,15 +108,7 @@ public:
     // call the internal version that skips writing the number of values
     // The first two words written are the min and max values.  If we need to calculate these ourselves, they could
     // be passed in?  We will really need gcd coding to handle things like dates and doubles.
-
-    // simd_compress_length seems to not be working for all lengths.
-    // lets try handling the tail ourselves.
-
-    // uint32_t roundedInSz = inSz / 4 * 4;
     auto end = codec.simd_compress_length(in, inSz, (uint32_t*)out);
-
-
-
     assert((char*)end - (char*)out <= outSz);  // if not enough space passed in, we overran buffer.
     outSz = (char*)end - (char*)out;
   }
@@ -118,36 +120,43 @@ public:
     return (char*)end - in;
   }
 
+  static uint32_t staticselect(const char* compressed, uint32_t blockSize, uint32_t index) {
+    SoluxSIMDFor c;
+    return c.select(compressed, blockSize, index);
+  }
+
   // blockSize is the number of values in this specific block, not necessarily our large block size of 16K
-  // TODO: this select code does not work! The layout of the SIMD version of FOR is not the same as the original.
   uint32_t select(const char* compressed, uint32_t blockSize, uint32_t index) {
-    // adapted from uint32_t SIMDCompressionLib::FrameOfReference::select()
+    // This is adapted from SIMDCompressionLib::SIMDFrameOfReference::select
     uint32_t* in = (uint32_t*)compressed;
+    // uint32_t length = *in;
+    // in++;
     uint32_t m = *in;
     ++in;
     uint32_t M = *in;
     ++in;
-    uint32_t b = std::bit_width(M - m);
-    if (b == 32) {
+    uint32_t bit = std::bit_width(M - m); // TODO: is this equiv to bits()?
+    if (bit == 32) {
       return in[index];
+    } else if (bit == 0) {
+      return m;  // all values equal, nothing encoded.  This was missing from original, leading to OOB read.
     }
-    uint32_t packedlength = blockSize / 32 * 32;
-    if (index > packedlength) {
-      uint32_t packedsizeinwords = packedlength * b / 32;
-      return m + in[packedsizeinwords + index - packedlength];
-    }
-    const uint32_t bitoffset = index * b; /* how many bits  */
-    const uint32_t firstword = bitoffset / 32;
-    const uint32_t secondword = (bitoffset + b - 1) / 32;
-    const uint32_t firstpart = in[firstword] >> (bitoffset % 32);
-    const uint32_t mask = (1 << b) - 1;
-    if (firstword == secondword) {
-      /* easy common case */
+    in += index / 128 * 4 * bit;
+    const uint32_t slot = index % 128; // TODO: fixme use uints here!  First inspect ASM and verify it matters.
+    const uint32_t lane = slot % 4;               /* we have 4 interleaved lanes */
+    const uint32_t bitsinlane = (slot / 4) * bit; /* how many bits in lane */
+    const uint32_t firstwordinlane = bitsinlane / 32;
+    const uint32_t secondwordinlane = (bitsinlane + bit - 1) / 32;
+    const uint32_t firstpart =
+            in[4 * firstwordinlane + lane] >> (bitsinlane % 32);
+    const uint32_t mask = (1 << bit) - 1;
+    if (firstwordinlane == secondwordinlane) {
+      /* easy common case*/
       return m + (firstpart & mask);
     } else {
       /* harder case where we need to combine two words */
-      const uint32_t secondpart = in[firstword + 1];
-      const int usablebitsinfirstword = 32 - (bitoffset % 32);
+      const uint32_t secondpart = in[4 * firstwordinlane + 4 + lane];
+      const uint32_t usablebitsinfirstword = 32 - (bitsinlane % 32);
       return m + ((firstpart | (secondpart << usablebitsinfirstword)) & mask);
     }
   }
@@ -175,7 +184,7 @@ public:
   }
 
   // blockSize is the number of values in this specific block, not necessarily our large block size of 16K
-  uint32_t select(const char* compressed, uint32_t blockSize, uint32_t index) {
+  uint32_t select(const char* compressed, uint32_t blockSize, uint32_t index) override final {
     return codec.select((uint32_t*)compressed,  index);
   }
 };
@@ -199,20 +208,34 @@ public:
     return *codec;
   }
 
-  void encodeBlock(uint32_t* in, uint32_t inSz, char* out, uint32_t &outSz) override {
-    size_t compressedSize = outSz / sizeof(uint32_t); // this gets changed to the actual size... simdcomp lib uses size in units of words.
-    getCodec().encodeArray(in, inSz, (uint32_t*)out, compressedSize);
+  void encodeBlock(uint32_t* in, uint32_t inSz, char* out, uint32_t& outSz) override {
+    size_t compressedSize = outSz /
+                            sizeof(uint32_t); // this gets changed to the actual size... simdcomp lib uses size in units of words.
+    getCodec().encodeArray(in, inSz, (uint32_t*) out, compressedSize);
     outSz = compressedSize * sizeof(uint32_t);  // convert to bytes
   }
 
-  uint32_t decodeBlock(const char* in, uint32_t inSz, uint32_t* out, uint32_t &outSz) override {
+  uint32_t decodeBlock(const char* in, uint32_t inSz, uint32_t* out, uint32_t& outSz) override {
     uint64_t recoveredSz = outSz;
-    auto endPtr = getCodec().decodeArray( (uint32_t*)in, inSz / sizeof(uint32_t), out, recoveredSz);
+    auto endPtr = getCodec().decodeArray((uint32_t*) in, inSz / sizeof(uint32_t), out, recoveredSz);
     outSz = recoveredSz;
-    auto bytesRead = (char*)endPtr - (char*)in;
+    auto bytesRead = (char*) endPtr - (char*) in;
     // TODO: FIXME: this is triggering with IntegerCODECTypeWrapper::ForCODEC assert(bytesRead <= inSz);
     return bytesRead;
   }
+
+
+  uint32_t select(const char* compressed, uint32_t blockSize, uint32_t index) override {
+    // check if Type is SIMDCompressionLib::ForCODEC
+    if constexpr (std::is_same<Type, SIMDCompressionLib::ForCODEC>::value) {
+      return getCodec().select((uint32_t*) compressed, index);
+    } else if constexpr(std::is_same<Type, SIMDCompressionLib::SIMDFrameOfReference>::value) {
+      return getCodec().select((uint32_t*) compressed, index);
+    }
+      throw new std::runtime_error("select not implemented for this codec");
+  }
+
+
 };
 
 template<typename T>
