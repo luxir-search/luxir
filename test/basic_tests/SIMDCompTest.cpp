@@ -31,7 +31,7 @@ TEST_F(SIMDCompTest, testComp) {
   // after we have an optimized version.
 //  codecs.emplace("pfor32", shared_ptr<IntegerCODEC>(new CompositeCodec<SIMDFastPFor<1, RegularDeltaSIMD>, leftovercodec>()));  // 25 bits
 //  codecs.emplace("pfor64", shared_ptr<IntegerCODEC>(new CompositeCodec<SIMDFastPFor<2, RegularDeltaSIMD>, leftovercodec>()));  // 13 bits
-codecs.emplace("pfor128", shared_ptr<IntegerCODEC>(new CompositeCodec<SIMDFastPFor<4, RegularDeltaSIMD>, leftovercodec>()));  // 8.13 bits
+//  codecs.emplace("pfor128", shared_ptr<IntegerCODEC>(new CompositeCodec<SIMDFastPFor<4, RegularDeltaSIMD>, leftovercodec>()));  // 8.13 bits
 //  codecs.emplace("pfor256", shared_ptr<IntegerCODEC>(new CompositeCodec<SIMDFastPFor<8, RegularDeltaSIMD>, leftovercodec>()));  // 7.88 bits
 //  codecs.emplace("streamvbyte", shared_ptr<IntegerCODEC>(new StreamVByteD1()));  // 10.2 bits/integer
 

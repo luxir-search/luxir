@@ -10,8 +10,7 @@ namespace solux {
 // Global random seed that is the same for all tests in a run.
 // For now, same as google's random seed used to shuffle tests, but google only uses values [0,99999] so
 // we might want to be able to initialize it some other way in the future.
-static uint64_t global_random_seed;
-
+uint64_t SoluxTest::global_random_seed;
 uint64_t SoluxTest::rng_seed;
 Rng SoluxTest::rng;
 SoluxNode* SoluxTest::soluxNode;
@@ -24,7 +23,7 @@ class SoluxTestListener : public testing::EmptyTestEventListener {
   void OnTestSuiteStart(const testing::TestSuite &suite) override {
     // std::cout << "STARTING SUITE " << suite.name() << std::endl;
     suiteHash = Hash::hash(suite.name(), strlen(suite.name()));
-    suiteHash += global_random_seed;
+    suiteHash += SoluxTest::global_random_seed;
   }
 
   void OnTestStart(const testing::TestInfo &test_info) override {
@@ -33,7 +32,7 @@ class SoluxTestListener : public testing::EmptyTestEventListener {
     auto testnameHash = Hash::hash(test_info.name(), strlen(test_info.name()));
     rng_seed = (suiteHash << 32) +
                testnameHash;  // these are currently 32 bit hashes (from Hash::hash) so combine by shifting.
-    rng_seed += global_random_seed;
+    rng_seed += SoluxTest::global_random_seed;
     SoluxTest::init_test(rng_seed);
   }
 
@@ -49,7 +48,7 @@ public:
     // std::cout << "SoluxEnvironment:SetUp()" << std::endl;
     testing::UnitTest::GetInstance()->listeners().Append(new SoluxTestListener);
     auto gtest_random_seed = testing::UnitTest::GetInstance()->random_seed();
-    global_random_seed = gtest_random_seed;
+    SoluxTest::global_random_seed = gtest_random_seed;
   }
 
   // Override this to define how to tear down the environment.

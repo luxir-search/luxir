@@ -36,17 +36,20 @@ public:
   static constexpr int32_t TERMS_BLOCK_SIZE = 32;
   static constexpr int32_t POSITIONS_BLOCK_SIZE = SoluxPFOR::BLOCK_SIZE;
   static constexpr int32_t DOCS_BLOCK_SIZE =  SoluxPFOR::BLOCK_SIZE;
+  static constexpr int32_t NUMERIC_BLOCK_SIZE = 16384;
 
   // using PositionsCodec = IntegerCODECTypeWrapper<SIMDCompressionLib::FastPFor<4, false>>;
   using PositionsCodec = SoluxPFOR;
   // using DocsCodec = IntegerCODECTypeWrapper<SIMDCompressionLib::SIMDFastPFor<4, SIMDCompressionLib::RegularDeltaSIMD>>;
   using DocsCodec = SoluxPFORd;
   using TFreqCodec = PositionsCodec; // same type, but should also share instances for better performance
+  using NumericCodec = SoluxFor;
 
   // These could be static if we made them thread safe...
   static DocsCodec docCodec;
   static PositionsCodec posCodec;
   static TFreqCodec& tfreqCodec;
+  static NumericCodec numericCodec;
 
   // Filename related utilities.  We try to keep filenames short for many reasons, including
   // being able to fit in short-string optimization.
@@ -265,7 +268,8 @@ struct SegFieldInfo {
 
   // column
   seg_location docsWithFieldEndLoc;
-  seg_location columnLoc;
+  seg_location columnMeta;   // info about the blocks of the column
+  seg_location columnLoc;    // location of the column data
 
   int32_t flags = 0;  // temporary... currently has type info. 0x01 text, 0x02 int col, 0x04 indexed str col.  In the future, we should decompose and have separate sections for each type
 };
@@ -372,6 +376,7 @@ public:
       if (fieldInfo.flags & 0x02) {
         fieldInfo.docsWithFieldEndLoc = fieldIS.readVal<seg_location>();
         fieldInfo.columnLoc = fieldIS.readVal<seg_location>();
+        fieldInfo.columnMeta = fieldIS.readVal<seg_location>();
       } else {
         // ?
       }
@@ -1080,20 +1085,32 @@ public:
 
 
 class IntColReader {
-  DocsReader docs;
-  InputStream columnIS;
-  const SegFieldInfo &fieldInfo;
-  const int64_t* values;
-
 public:
   static constexpr int32_t END = std::numeric_limits<int32_t>::max();  // TODO: put this somewhere more generic?
 
+  struct NumericBlockInfo {
+    int64_t gcd;
+    int64_t min;
+    int64_t max;
+    int64_t format; // currently number of bits if <= 32.
+    int64_t blockOffset;  // byte offset of compressed block from the start of the column
+  };
+
+private:
+  DocsReader docs;
+  InputStream columnIS;
+  const SegFieldInfo &fieldInfo;
+  const NumericBlockInfo* blockMeta;  // array of block metadata
+  const char* blocks;                 // start of the compressed blocks of data
+
+public:
   IntColReader(MemPool &pool, PostingsReader &postingsReader, const SegFieldInfo &fieldInfo) :
   docs(pool, postingsReader, fieldInfo),
   fieldInfo(fieldInfo)
   {
     columnIS = postingsReader.getInputStreamSeek(fieldInfo.columnLoc);
-    values = reinterpret_cast<const int64_t *>(columnIS.ptr(fieldInfo.columnLoc.offset()));
+    blockMeta = reinterpret_cast<const NumericBlockInfo *>(columnIS.ptr(fieldInfo.columnMeta.offset()));
+    blocks = reinterpret_cast<const char *>(columnIS.ptr(fieldInfo.columnLoc.offset()));
   }
 
   int32_t docsWithValue() {
@@ -1107,38 +1124,49 @@ public:
   }
 
   class DenseIterator {
-    const int64_t* values;
-    int32_t doc = -1;
+    const NumericBlockInfo* blockMeta;  // array of block metadata
+    const char* blocks;                 // start of the compressed blocks of data
+    int32_t id = -1; // id is actually rank if this is dense
     int32_t max;
+    const char* blockStart;
   public:
-    DenseIterator(const IntColReader& col)  {
-      values = col.values;
+    DenseIterator(const IntColReader& col) : blockMeta(col.blockMeta), blocks(col.blocks) {
       max = col.fieldInfo.docsWithField;
     }
 
     int32_t docId() {
-      return doc;
+      return id;
     }
 
     int64_t value() {
-      return values[doc];
+      return valueAtRank(id);
     }
 
     int32_t next() {
-      if (++doc >= max) {
-        doc = END;
+      if (++id >= max) {
+        id = END;
       }
-      return doc;
+      return id;
     }
 
     int64_t valueAtRank(int32_t rank) {
       assert (rank >= 0 && rank < max);
-      return values[rank];
+      auto block = (uint32_t)rank / Postings::NUMERIC_BLOCK_SIZE;
+      auto rankInBlock = (uint32_t)rank % Postings::NUMERIC_BLOCK_SIZE;
+      const char* blockStart = blocks + blockMeta[block].blockOffset;
+      auto valuesInBlock = uint32_t(max) % Postings::NUMERIC_BLOCK_SIZE;
+      if (blockMeta[block].format <= 32) {
+        auto unscaled = Postings::numericCodec.select(blockStart, valuesInBlock, rankInBlock);
+        return unscaled * blockMeta[block].gcd + blockMeta[block].min;
+      } else {
+        // 64-bit, temp impl uncompressed
+        return reinterpret_cast<const int64_t*>(blockStart)[rankInBlock];
+      }
     }
 
     int32_t advance(int32_t target) {
       assert (target >= 0 && target < max);
-      doc = target;
+      id = target;
       return target;
     }
 
@@ -1146,15 +1174,15 @@ public:
 
 
   class Iterator {
-    const IntColReader* col;
+    const IntColReader& col;
     screaming::BitSet::Iterator docsIter;
-    const int64_t* values;
+    DenseIterator denseIter;
     int32_t docRank = -1;
     int32_t doc = -1;
     int32_t maxRank;
     bool dense;
   public:
-    Iterator(const IntColReader& col) : col(&col), docsIter(col.docs.bitset()), values(col.values) {
+    Iterator(const IntColReader& col) : col(col), docsIter(col.docs.bitset()), denseIter(col) {
       maxRank = col.fieldInfo.docsWithField;
       dense = !col.docs.hasBitset();
     }
@@ -1170,7 +1198,7 @@ public:
     */
 
     int64_t value() {
-      return values[docRank];
+      return denseIter.valueAtRank(docRank);
     }
 
     // TODO: directly expose docsIter (or the screaming set) here to enable bulk / direct operations on them?

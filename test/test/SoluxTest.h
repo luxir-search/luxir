@@ -44,7 +44,8 @@ namespace solux {
 class SoluxTest : public ::testing::Test {
 public:
   static Rng rng;
-  static uint64_t rng_seed;
+  static uint64_t global_random_seed;  // same for all tests in a given run
+  static uint64_t rng_seed;  // different for each test, but based on global_random_seed
   static solux::SoluxNode* soluxNode;
 
   // This is called from a listener with a seed that is different for every test.

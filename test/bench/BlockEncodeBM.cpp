@@ -33,9 +33,9 @@ inline void fillBlock(Rng& rng, uint32_t* out, uint32_t outSz, bool sorted) {
 
 
 
-static void BM_blockDecode(benchmark::State& state, std::string codecName, bool sorted) {
+static void BM_blockDecode(benchmark::State& state, std::string codecName, bool sorted, bool testSelect=false) {
   // std::cout << "state.range[0]=" << state.range(0) << std::endl;
-  Rng rng(SoluxTest::rng_seed);
+  Rng rng(SoluxTest::global_random_seed);  // make same data for different test variants
 
   auto codec = U32CodecFactory::getCodec(codecName);
 
@@ -66,15 +66,26 @@ static void BM_blockDecode(benchmark::State& state, std::string codecName, bool 
   for (auto _ : state) {
 
     for (int i=0; i<maxValues.size(); i++) {
-      uint32_t decodedSz = decoded[i].size();
-      codec->decodeBlock(&encoded[i][0], encoded[i].size(), &decoded[i][0], decodedSz);
-      ASSERT_EQ(nvalues, decodedSz);
+      if (testSelect) {
+        // single value decode
+        size_t which = rng.rint(INT_BLOCK_SIZE);
+        // dynamic cast to IntegerCODECTypeWrapper<SIMDCompressionLib::SIMDFrameOfReference>>
 
-      if (solux::unit_tests) {
-        // state.PauseTiming();
+        auto* pfor = (IntegerCODECTypeWrapper<SIMDCompressionLib::SIMDFrameOfReference>*) codec.get();
+        auto val = pfor->getCodec().select((uint32_t*) &encoded[i][0], which);
+        ASSERT_EQ(values[i][which], val);
+      } else {
+        // block decode
+        uint32_t decodedSz = decoded[i].size();
+        codec->decodeBlock(&encoded[i][0], encoded[i].size(), &decoded[i][0], decodedSz);
         ASSERT_EQ(nvalues, decodedSz);
-        ASSERT_EQ(values[i], decoded[i]);
-        // state.ResumeTiming();
+
+        if (solux::unit_tests) {
+          // state.PauseTiming();
+          ASSERT_EQ(nvalues, decodedSz);
+          ASSERT_EQ(values[i], decoded[i]);
+          // state.ResumeTiming();
+        }
       }
     }
 
@@ -98,6 +109,9 @@ BENCHMARK_CAPTURE(BM_blockDecode, SIMDFastPFor, "SIMDFastPFor", false);
 BENCHMARK_CAPTURE(BM_blockDecode, SIMDFastPForDelta1, "SIMDFastPForDelta1", true);
 BENCHMARK_CAPTURE(BM_blockDecode, SoluxPFOR, "SoluxPFOR", false);
 BENCHMARK_CAPTURE(BM_blockDecode, SoluxPFORd, "SoluxPFORd", true);
+BENCHMARK_CAPTURE(BM_blockDecode, SIMDFor, "SIMDFor", false);
+BENCHMARK_CAPTURE(BM_blockDecode, SIMDFor_select, "SIMDFor", false, true);
+BENCHMARK_CAPTURE(BM_blockDecode, ForCODEC, "ForCODEC", false);
 
 
 } // end solux
