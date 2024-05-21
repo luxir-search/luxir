@@ -106,6 +106,14 @@ public:
     pos += numBytes;
   }
 
+  /// align the output to the given alignment (based on the total size of the file, not the current buffer)
+  /// we use a non-zero fill value to better catch bugs (which zeroes can obscure)
+  void align(size_t alignment, uint8_t fill = 0x11) {
+    while((size() % alignment) != 0) {
+      write(fill);
+    }
+  }
+
   void write(char b) {
     if (pos == end) [[unlikely]] {
       flush();

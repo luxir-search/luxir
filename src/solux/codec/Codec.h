@@ -7,6 +7,22 @@
 // TODO: eventually hide this in the cpp
 #include "simdcomp/include/codecfactory.h"
 
+// these are defined in frameofreference.cpp in SIMDCompressionAndIntersection
+// need to remove "static" from some so we can access them.
+__m128i* simdpackFOR_length(uint32_t initvalue, const uint32_t *in,
+                              int length, __m128i *out,
+                              const uint32_t bit);
+void simdpackFOR(uint32_t initvalue, const uint32_t *in, __m128i *out,
+                   const uint32_t bit);
+const __m128i* simdunpackFOR_length(uint32_t initvalue,
+                                      const __m128i *in, int length,
+                                      uint32_t *out, const uint32_t bit);
+void simdunpackFOR(uint32_t initvalue, const __m128i *in, uint32_t *out,
+                     const uint32_t bit);
+void simdmaxmin_length(const uint32_t *in, uint32_t length,
+                         uint32_t *getmin, uint32_t *getmax);
+
+
 namespace solux {
 
 
@@ -95,6 +111,7 @@ public:
   uint32_t decodeBlock(const char* in, uint32_t inSz, uint32_t* out, uint32_t &outSz) override;
 };
 
+
 /// NOTE: due to the way SIMD is implemented, reads can happen past the end of the block.
 /// As long as reads are valid for up to 16-31 bytes past the end of the block, we are fine.
 /// Add 16 and then round up to 16 bytes.
@@ -104,20 +121,85 @@ class SoluxSIMDFor : public U32Codec {
 public:
   ~SoluxSIMDFor() override = default;
 
-  void encodeBlock(uint32_t* in, uint32_t inSz, char* out, uint32_t &outSz) override final {
+
+  void encodeWithMeta(uint32_t* in, uint32_t inSz, char* target, uint32_t &outSz, uint32_t minval, uint8_t bits) {
+    uint32_t* out = (uint32_t*)target;
+    uint32_t k = 0;
+    for (; k + 128 <= inSz; k += 128, in += 128) {
+      simdpackFOR(minval, in, (__m128i *)out, bits);
+      out += bits * 4;
+    }
+    if (inSz != k)
+      out = (uint32_t *)simdpackFOR_length(minval, in, inSz - k, (__m128i *)out, bits);
+    in += inSz - k;
+    outSz = (char*)out - target;
+  }
+
+
+  uint32_t decodeWithMeta(const char* encoded, uint32_t inSz, uint32_t* out, uint32_t &outSz, uint32_t minval, uint8_t bits) {
+    const uint32_t* in = (const uint32_t*)encoded;
+    for (uint32_t k = 0; k < outSz / 128; ++k) {
+      simdunpackFOR(minval, (const __m128i *)(in + 4 * bits * k), out + 128 * k, bits);
+    }
+    out = out + outSz / 128 * 128;
+    in = in + outSz / 128 * 4 * bits;
+    if ((outSz % 128) != 0) {
+      in = (const uint32_t*) simdunpackFOR_length(
+              minval, (__m128i*) in, outSz - outSz / 128 * 128, out, bits);
+    }
+    return (char*)in - encoded;
+  }
+
+
+  void encodeBlock(uint32_t* in, uint32_t inSz, char* target, uint32_t &outSz) override final {
+    uint32_t* out = (uint32_t*)target;
+    // This should be equivalent to a call to simd_compress_length.  We just want
+    // to lower the number of code paths now that we have encodeWithMeta (and exercise it).
+    if (inSz == 0) {
+      outSz=0;
+      return;
+    }
+    uint32_t m, M;
+    simdmaxmin_length(in, inSz, &m, &M);
+    int b = std::bit_width(static_cast<uint32_t>(M - m));
+    out[0] = m;
+    ++out;
+    out[0] = M;
+    ++out;
+
+    encodeWithMeta(in, inSz, (char*)out, outSz, m, b);
+    outSz += 2 * sizeof(uint32_t);
+
+    /* // previous code before encodeWithMeta
     // call the internal version that skips writing the number of values
     // The first two words written are the min and max values.  If we need to calculate these ourselves, they could
     // be passed in?  We will really need gcd coding to handle things like dates and doubles.
     auto end = codec.simd_compress_length(in, inSz, (uint32_t*)out);
     assert((char*)end - (char*)out <= outSz);  // if not enough space passed in, we overran buffer.
     outSz = (char*)end - (char*)out;
+     */
   }
 
   // NOTE: the return type is not always correct.  There seems to be an issue with the underlying codec.simd_uncompress_length.
-  uint32_t decodeBlock(const char* in, uint32_t inSz, uint32_t* out, uint32_t &outSz) override final {
+  uint32_t decodeBlock(const char* compressed, uint32_t inSz, uint32_t* out, uint32_t &outSz) override final {
+    const uint32_t* in = (const uint32_t*)compressed;
+    if (outSz == 0) {
+      outSz = 0;
+      return 0;
+    }
+    uint32_t m = in[0];
+    ++in;
+    uint32_t M = in[0];
+    ++in;
+    int b = std::bit_width(static_cast<uint32_t>(M - m));
+
+    auto readSize = decodeWithMeta((const char*)in, inSz - 2 * sizeof(uint32_t), out, outSz, m, b);
+    return readSize + 2 * sizeof(uint32_t);
+    /*
     auto end = codec.simd_uncompress_length((uint32_t*)in, out, outSz);
     // don't update outSize, we depend on it already being correct.
     return (char*)end - in;
+    */
   }
 
   static uint32_t staticselect(const char* compressed, uint32_t blockSize, uint32_t index) {

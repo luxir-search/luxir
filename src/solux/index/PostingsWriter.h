@@ -882,6 +882,8 @@ public:
     }
 
     uint32_t bits = std::bit_width((uint64_t)((max - min) / gcd));
+    colOutput.align(4); // just a guess for now... we should really test.
+    // the original SIMD code wrote length, min, max (which is 12 bytes, only 4 byte aligned when the SIMD magic starts happening)
     int64_t off = colOutput.size() - colStart;
     blockInfo.push_back({gcd, min, max, bits, off});
 

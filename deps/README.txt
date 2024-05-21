@@ -44,13 +44,14 @@ index fb5666538..35732451e 100644
 ### for simdcomp (TODO: automate / integrate into build system if we keep the whole thing)
 # remove _GLIBCXX_DEBUG flags from Makefile
 $ git clone git@github.com:lemire/SIMDCompressionAndIntersection.git simdcomp
-$ cd simdcomp
-$ DEBUG=1 make
-$ cp libSIMDCompressionAndIntersection.a libsimdcomp_ad.a
-$ make clean
-$ make
-$ cp libSIMDCompressionAndIntersection.a libsimdcomp_a.a
-$ make clean
+# apply simdcomp.diff
+  cd simdcomp
+  DEBUG=1 make
+  cp libSIMDCompressionAndIntersection.a libsimdcomp_ad.a
+  make clean
+  make
+  cp libSIMDCompressionAndIntersection.a libsimdcomp_a.a
+  make clean
 ### for CRoaring
 $ cd deps; git clone https://github.com/RoaringBitmap/CRoaring
 $ cd CRoaring; git co tags/v0.4.0
