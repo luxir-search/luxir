@@ -192,7 +192,6 @@ TEST_F(IntColTest, rand) {
   verifyIntFields(testIndex, fvs);
 }
 
-
 TEST_F(IntColTest, textLen) {
   {
     TestIndex testIndex;

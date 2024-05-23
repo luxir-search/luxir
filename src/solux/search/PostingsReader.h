@@ -1086,7 +1086,10 @@ public:
 
 class IntColReader {
 public:
-  static constexpr int32_t END = std::numeric_limits<int32_t>::max();  // TODO: put this somewhere more generic?
+  // Sentinel values.  ENDDOC is used when indexing documents, since there are only 2B in a segment.
+  constexpr static int32_t ENDDOC = std::numeric_limits<int32_t>::max();
+  // ENDINDEX is used when indexing values, since there can be more than 2B in a segment due to multi-valued fields.
+  constexpr static int64_t ENDINDEX = std::numeric_limits<int64_t>::max();
 
   struct NumericBlockInfo {
     int64_t gcd;
@@ -1123,56 +1126,59 @@ public:
     // Make a merging benchmark first though!
   }
 
+  // An iterator over dense int values.  It needs to support more than int32 indexes because
+  // of multi-valued fields (i.e. even if you only have 2B docs, a column could have > 4B values).
   class DenseIterator {
     const NumericBlockInfo* blockMeta;  // array of block metadata
     const char* blocks;                 // start of the compressed blocks of data
-    int32_t id = -1; // id is actually rank if this is dense
-    int32_t max;
-    const char* blockStart;
+    int64_t index_ = -1;
+    int64_t max;
   public:
+
     DenseIterator(const IntColReader& col) : blockMeta(col.blockMeta), blocks(col.blocks) {
       max = col.fieldInfo.docsWithField;
     }
 
-    int32_t docId() {
-      return id;
+    int64_t index() {
+      return index_;
     }
 
     int64_t value() {
-      return valueAtRank(id);
+      return valueAtRank(index_);
     }
 
-    int32_t next() {
-      if (++id >= max) {
-        id = END;
+    int64_t next() {
+      if (++index_ >= max) {
+        index_ = ENDINDEX;
       }
-      return id;
+      return index_;
     }
 
-    int64_t valueAtRank(int32_t rank) {
+    int64_t valueAtRank(int64_t rank) {
       assert (rank >= 0 && rank < max);
-      auto block = (uint32_t)rank / Postings::NUMERIC_BLOCK_SIZE;
-      auto rankInBlock = (uint32_t)rank % Postings::NUMERIC_BLOCK_SIZE;
-      const char* blockStart = blocks + blockMeta[block].blockOffset;
+      auto blockNum = (uint64_t)rank / Postings::NUMERIC_BLOCK_SIZE;
+      auto rankInBlock = (uint64_t)rank % Postings::NUMERIC_BLOCK_SIZE;
+      auto& block = blockMeta[blockNum];
+      const char* blockStart = blocks + block.blockOffset;
       auto valuesInBlock = uint32_t(max) % Postings::NUMERIC_BLOCK_SIZE;
-      if (blockMeta[block].format <= 32) {
+      if (block.format <= 32) {
         auto unscaled = Postings::numericCodec.select(blockStart, valuesInBlock, rankInBlock);
-        return unscaled * blockMeta[block].gcd + blockMeta[block].min;
+        return unscaled * block.gcd + block.min;
       } else {
         // 64-bit, temp impl uncompressed
         return reinterpret_cast<const int64_t*>(blockStart)[rankInBlock];
       }
     }
 
-    int32_t advance(int32_t target) {
+    int64_t advance(int64_t target) {
       assert (target >= 0 && target < max);
-      id = target;
+      index_ = target;
       return target;
     }
-
   };
 
 
+  // This is an iterator over documents, so indexes will always be 32 bit.
   class Iterator {
     const IntColReader& col;
     screaming::BitSet::Iterator docsIter;
@@ -1182,12 +1188,13 @@ public:
     int32_t maxRank;
     bool dense;
   public:
+
     Iterator(const IntColReader& col) : col(col), docsIter(col.docs.bitset()), denseIter(col) {
       maxRank = col.fieldInfo.docsWithField;
       dense = !col.docs.hasBitset();
     }
 
-    int32_t docId() {
+    int64_t docId() {
       return doc;
     }
 
@@ -1216,7 +1223,7 @@ public:
     // returns the docid corresponding to the next value
     int32_t next() {
       if (docRank + 1 >= maxRank) {
-        doc = END;
+        doc = ENDDOC;
         return doc;
       }
       docRank++;

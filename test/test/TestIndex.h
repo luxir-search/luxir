@@ -244,7 +244,7 @@ namespace solux::test {
       }
       for(;;) {
         doc = iter->next();
-        if (doc != IntColReader::END) {
+        if (doc != IntColReader::ENDDOC) {
           return doc;
         }
         auto found = nextSegment();

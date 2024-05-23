@@ -77,10 +77,33 @@ protected:
     }
   }
 
+  template <typename T>  // int64_t vs uint64_t
+  int bitWidth(T* values, int nvalues) {
+    // test gcd
+    auto g = values[0];
+    auto min = values[0];
+    auto max = values[0];
+    for (int i = 0; i < nvalues; i++) {
+      LOG_INFO("\t\tvalues[{}]={:x}", i, values[i]);
+      g = std::gcd(g, values[i]);
+      min = std::min(min, values[i]);
+      max = std::max(max, values[i]);
+    }
+    auto bits = std::bit_width(uint64_t((max - min)/g));
+    LOG_INFO("\tgcd={:x} min={:x} max={:x} max-min={:x} max/gcd={:x} min/gcd={:x} (max-min)/gcd={:x} bits={}",
+             g, min, max, max-min, max/g, min/g, (max-min)/g, bits);
+    return bits;
+  }
+
 };
 
 
 TEST_F(ForTest, basic) {
+  std::vector<double> v{1.0, -2.0, 3.0, 4.0, -5.0, 1.3};
+  LOG_INFO("bits<uint64_t>={} bits<int64_t>={}", bitWidth((uint64_t*)v.data(), v.size()), bitWidth((int64_t*)v.data(), v.size()));
+  // for positive and negative whole numbers (as doubles), we want to calculate in unsigned space (or convert the doubles)
+  // But a simple 1.3 blows us out to full 64 bit space.
+
   // test({255+100,100,101,101,101});
   test({7});
   test({3,5});

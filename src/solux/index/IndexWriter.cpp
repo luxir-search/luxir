@@ -323,7 +323,7 @@ private:
         // int32_t highest = field->seg->postingsReader->numDocs();
         for(;;) {
           int32_t localId = colIter.next();
-          if (localId == IntColReader::END) {
+          if (localId == IntColReader::ENDDOC) {
             break;
           }
           int64_t val = colIter.value();
@@ -344,7 +344,7 @@ private:
           [[maybe_unused]] int32_t highest = field->seg->postingsReader->numDocs();
           for (;;) {
             int32_t localId = colIter.next();
-            if (localId == IntColReader::END) {
+            if (localId == IntColReader::ENDDOC) {
               break;
             }
             assert(localId < highest);
