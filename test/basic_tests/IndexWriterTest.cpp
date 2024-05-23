@@ -117,7 +117,6 @@ TEST_F(IndexWriterTest, autoMerge) {
     RAMDir dir;
     IndexWriter iw(dir);
     int MERGE_FACTOR = 3;
-    iw.mergePolicy->setMergeDocsFloor(1);
     iw.mergePolicy->setMergeFactor(MERGE_FACTOR);
     iw.mergePolicy->refresh();  // should be a no-op at this point since no existing segs.
 
@@ -200,7 +199,6 @@ TEST_F(IndexWriterTest, multiThreaded) {
   RAMDir dir;
   IndexWriter iw(dir);
   int MERGE_FACTOR = 3;
-  iw.mergePolicy->setMergeDocsFloor(1);
   iw.mergePolicy->setMergeFactor(MERGE_FACTOR);
   iw.mergePolicy->refresh();  // should be a no-op at this point since no existing segs.
 

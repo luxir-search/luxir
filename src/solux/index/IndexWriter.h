@@ -130,7 +130,12 @@ public:
     IndexWriter& iw;
     bool mergeRunning = false;
     int32_t MERGE_FACTOR = 10;
-    int32_t MERGE_DOCS_FLOOR = 1000;  // all segments below this will be counted as level 0
+    // TODO: Hmmm, a high merge floor can lead to some O^N2 behavior: see https://issues.apache.org/jira/browse/LUCENE-10574
+    // Perhaps an alternative would be to remove the floor and then kick off merges like normal, *but*
+    // when a merge happens at tier 3, sweep up all the smaller segments as well.  I'm not sure this
+    // really makes sense though since it would only occasionally fix the "many small segments" problem, and
+    // it is the indexing pattern that is causing the issue.  Perhaps this should be fixed by the user
+    // through an API that requests a more aggressive merge to sweep up small segments.
     float inverseLogM = 1.0f / log2(MERGE_FACTOR);
 
     // Methods with _ prefix should be called with the indexMutex already locked.
@@ -139,10 +144,6 @@ public:
     void setMergeFactor(int32_t mergeFactor) {
       MERGE_FACTOR = mergeFactor;
       inverseLogM = 1.0f / log2(MERGE_FACTOR);
-    }
-
-    void setMergeDocsFloor(int32_t mergeDocsFloor) {
-      MERGE_DOCS_FLOOR = mergeDocsFloor;
     }
 
     // re-calculate the merges from scratch (i.e. not incrementally)
@@ -192,11 +193,11 @@ public:
       if (seg != nullptr) {
         segCount++;
 
-        if (seg->nDocs < MERGE_DOCS_FLOOR) {
+        // For MERGE_FACTOR 10, docs 0-9 = level 0, 10-99 = level 2, etc.
+        if (seg->nDocs < MERGE_FACTOR) {
           seg->mergeLevel = 0;
         } else {
-          int32_t adjustedDocs = seg->nDocs - MERGE_DOCS_FLOOR + 1;
-          seg->mergeLevel = (int32_t) (log2(adjustedDocs) * inverseLogM);
+          seg->mergeLevel = (int32_t) (log2(seg->nDocs) * inverseLogM);
         }
         if (seg->mergeLevel >= (int) levelCounts.size()) {
           levelCounts.resize(seg->mergeLevel + 1);
