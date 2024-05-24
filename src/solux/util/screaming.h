@@ -361,6 +361,8 @@ public:
       return nextBucket();
     }
 
+    // NOTE: if one is calling next() followed by rank(), it's more efficient to just increment the previous rank by 1.
+    // This is only useful in conjunction with advance.
     int32_t rank() {
       // If we always want rank on every advance, we could do this more efficiently by updating the rank
       // in the advance method.
