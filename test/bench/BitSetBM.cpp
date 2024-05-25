@@ -1,5 +1,4 @@
 #include <charconv>
-#include <test/SegmentTest.h>
 #include "bench/solux_bench.h"
 #include "solux/index/Inverter.h"
 
@@ -13,7 +12,7 @@ static void BM_BitSet(benchmark::State& state, int32_t blocks, bool getRank) {
   int32_t doc = -1;
   int32_t limit = 65536*blocks;  // stop at blocksize so we know what we are testing and don't have a tail block.
   for (;;) {
-    doc += (rng() & 0x03) + 1;  // add 1-4 docs (gap of 0-3)
+    doc += (int32_t)(rng() & 0x03) + 1;  // add 1-4 docs (gap of 0-3)
     if (doc >= limit) break;
     builder.add(doc);
   }

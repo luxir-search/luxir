@@ -8,6 +8,7 @@
 #include "solux/util/TermValHash.h"
 #include "DocStream.h"
 #include "PostingsWriter.h"
+#include "IntColWriter.h"
 
 // so IndexHandler can consume protobuf types
 #include "protos/solux_types.pb.h"

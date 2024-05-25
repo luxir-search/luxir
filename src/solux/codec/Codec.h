@@ -217,14 +217,14 @@ public:
     ++in;
     uint32_t M = *in;
     ++in;
-    uint32_t bit = std::bit_width(M - m); // TODO: is this equiv to bits()?
+    uint32_t bit = std::bit_width(M - m);
     if (bit == 32) {
       return in[index];
     } else if (bit == 0) {
       return m;  // all values equal, nothing encoded.  This was missing from original, leading to OOB read.
     }
     in += index / 128 * 4 * bit;
-    const uint32_t slot = index % 128; // TODO: fixme use uints here!  First inspect ASM and verify it matters.
+    const uint32_t slot = index % 128;
     const uint32_t lane = slot % 4;               /* we have 4 interleaved lanes */
     const uint32_t bitsinlane = (slot / 4) * bit; /* how many bits in lane */
     const uint32_t firstwordinlane = bitsinlane / 32;
