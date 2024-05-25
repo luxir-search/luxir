@@ -5,6 +5,14 @@
 namespace solux {
 
 
+// Some logical columns have multiple underlying columns implementing them:
+// A sparse multi-valued integer column:
+//   1) a dense array of single integer values (usually compressed)
+//   2) a monotonic array that gives the start (or end) index into (1) for docs that have a value
+//   3) a screaming bitset of docs containing the field
+//
+
+
 class IntColReader {
 public:
   // Sentinel values.  ENDDOC is used when indexing documents, since there are only 2B in a segment.
@@ -20,6 +28,7 @@ public:
     int64_t format; // currently number of bits if <= 32.
     int64_t blockOffset;  // byte offset of compressed block from the start of the column
   };
+
 
 private:
   DocsReader docs;
@@ -169,6 +178,40 @@ public:
 
 };
 
+// Monotonic int col
+class MonoColReader {
+public:
+  // For monotonic fields, we store the slope of the line and interpolate the values (and store
+  // the delta from the expected value).
+  // Instead of using floating point math when decoding, we use a scaled slope and do integer math.
+  // Our integral slope estimate should be within .25 of the expected value calculated with doubles.
+  // This leaves the rest of the bits to interpolate large values: 2^64/(16384*4) = 2.8e14
+  constexpr static uint64_t MONOTONIC_SLOPE_SCALE = Postings::NUMERIC_BLOCK_SIZE * 4;
 
+  using NumericBlockInfo = IntColReader::NumericBlockInfo;
+private:
+  InputStream columnIS;
+  const SegFieldInfo& fieldInfo;
+  const IntColReader::NumericBlockInfo* blockMeta;  // array of block metadata
+  const char* blocks;                 // start of the compressed blocks of data
+
+
+  MonoColReader(MemPool &pool, PostingsReader &postingsReader, const SegFieldInfo &fieldInfo) :
+          fieldInfo(fieldInfo)
+  {
+    columnIS = postingsReader.getInputStreamSeek(fieldInfo.columnLoc);
+    blockMeta = reinterpret_cast<const NumericBlockInfo *>(columnIS.ptr(fieldInfo.columnMeta.offset()));
+    blocks = reinterpret_cast<const char *>(columnIS.ptr(fieldInfo.columnLoc.offset()));
+  }
+
+  int32_t numValues() {
+    // The way we currently use MonoColReader, it's always one-for-one with the number of docs with a field value.
+    // We could chose to implement sparse values with this sometimes, and then we'd need to return maxDoc.
+    return fieldInfo.docsWithField;
+  }
+
+
+
+};
 
 } // end namespace

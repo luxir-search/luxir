@@ -271,6 +271,9 @@ struct SegFieldInfo {
   seg_location columnMeta;   // info about the blocks of the column
   seg_location columnLoc;    // location of the column data
 
+  seg_location monoMeta;     // monotonic int column metadata
+  seg_location monoLoc;
+
   int32_t flags = 0;  // temporary... currently has type info. 0x01 text, 0x02 int col, 0x04 indexed str col.  In the future, we should decompose and have separate sections for each type
 };
 

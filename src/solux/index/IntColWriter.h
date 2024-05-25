@@ -46,6 +46,8 @@ public:
   }
 };
 
+
+
 class IntColWriter {
 public:
   constexpr static uint32_t BLOCK_SIZE = Postings::NUMERIC_BLOCK_SIZE;
@@ -61,7 +63,11 @@ private:
   std::vector<int64_t> values;
   std::vector<int32_t> ivalues;
 
+
 public:
+  bool monotonic = false;  // are we writing monotonic values
+
+
   // This class allocates from the pool but does not do any visible rollbacks.
   IntColWriter(MemPool& pool, PostingsWriter& postingsWriter, PostingsWriter::IndexFieldInfo& fieldInfo)
           : postingsWriter(postingsWriter), fieldInfo(fieldInfo), colOutput(postingsWriter.files[5].out) {
@@ -89,21 +95,73 @@ public:
     int64_t gcd = arr[0];
     int64_t min = arr[0];
     int64_t max = arr[0];
-    for (size_t i=1; i<arr.size(); i++) {
-      min = std::min(min, arr[i]);
-      max = std::max(max, arr[i]);
-      // If gcd hits 1 it can't change from that.  If it's 0, it could still go up.
-      if (gcd != 1) {
-        gcd = std::gcd(gcd, arr[i]);
+    uint32_t bits;
+
+    if (monotonic) {
+      max = arr[arr.size()-1];
+      double slope = arr.size() == 1 ? 0 : (max - min) / (arr.size() - 1);
+
+      uint64_t scaled_slope = (uint64_t)(slope * MonoColReader::MONOTONIC_SLOPE_SCALE);
+      uint64_t maxZZ = 0;
+      ivalues.reserve(arr.size());
+      ivalues.resize(0);
+      for (size_t i=0; i<arr.size(); i++) {
+        uint64_t expected = min + (uint64_t)(i * scaled_slope / BLOCK_SIZE);
+        int64_t delta = arr[i] - expected;
+        // zigzag encode to make positive
+        uint64_t zz = (delta >> 63) ^ (delta << 1);
+        // make sure we don't overflow 32 bit deltas
+        if (zz > std::numeric_limits<uint32_t>::max()) {
+          // We should only need more than 32 bits if individual values can be more than 32 bits in size.
+          // This currently isn't the case.
+          throw std::runtime_error(std::format("IntColWriter: monotonic delta too large: field={} delta={} slope={}"
+                                               ,(std::string_view)fieldInfo.fieldname, delta, slope));
+        }
+        arr[i] = zz;
+        maxZZ = std::max(maxZZ, zz);
+      }
+      bits = std::bit_width(maxZZ);
+      gcd = scaled_slope;  // reuse gcd for our scaled slope.
+
+      // Currently or For codec can only handle 32 bit integers, so we need to make a copy.
+      // We should make a version that can accept 64 bit integers that just use the lower half.
+      ivalues.reserve(arr.size());
+      ivalues.resize(0);
+      for (size_t i=0; i<arr.size(); i++) {
+        ivalues.push_back((int32_t)arr[i]);
+      }
+
+    } else {
+      // normal (non-monotonic case)
+
+      for (size_t i = 1; i < arr.size(); i++) {
+        min = std::min(min, arr[i]);
+        max = std::max(max, arr[i]);
+        // If gcd hits 1 it can't change from that.  If it's 0, it could still go up.
+        if (gcd != 1) {
+          gcd = std::gcd(gcd, arr[i]);
+        }
+      }
+
+      // get number of bits needed to represent values if we divide everything by the gcd
+      if (gcd == 0) {
+        gcd = 1;  // all values 0... we can't divide by 0 though.
+      }
+
+      bits = std::bit_width((uint64_t) ((max - min) / gcd));
+
+      // Currently or For codec can only handle 32 bit integers, so we need to make a copy.
+      // We should make a version that can accept 64 bit integers that just use the lower half.
+      if (bits <= 32) {
+        ivalues.reserve(arr.size());
+        ivalues.resize(0);
+        for (size_t i = 0; i < arr.size(); i++) {
+          ivalues.push_back((arr[i] - min) / gcd);
+          assert(int64_t(ivalues.back()) * gcd + min == arr[i]);
+        }
       }
     }
 
-    // get number of bits needed to represent values if we divide everything by the gcd
-    if (gcd == 0) {
-      gcd = 1;  // all values 0... we can't divide by 0 though.
-    }
-
-    uint32_t bits = std::bit_width((uint64_t)((max - min) / gcd));
     colOutput.align(4); // just a guess for now... we should really test.
     // the original SIMD code wrote length, min, max (which is 12 bytes, only 4 byte aligned when the SIMD magic starts happening)
     int64_t off = colOutput.size() - colStart;
@@ -116,16 +174,6 @@ public:
       colOutput.write((const char*)arr.data(), arr.size() * sizeof(int64_t));
       return;
     }
-
-    // Currently or For codec can only handle 32 bit integers, so we need to make a copy.
-    // We should make a version that can accept 64 bit integers that just use the lower half.
-    ivalues.reserve(arr.size());
-    for (size_t i=0; i<arr.size(); i++) {
-      ivalues.push_back((arr[i] - min) / gcd);
-      assert(int64_t(ivalues.back()) * gcd + min == arr[i]);
-    }
-
-
 
     // codec calculates its own min and max... it's redundant with what we have done here,
     // and the integers we pass will always have a min of 0 now.
@@ -169,13 +217,27 @@ public:
 
     // TODO: for dense iteration, we prob don't want to unpack a whole block at once.  We should be
     // able to unpack some multiple of 128 values at a time and keep the same speed?
-    fieldInfo.columnMeta = seg_location(colOutput.streamNumber, colOutput.size());
+    auto metaLoc = seg_location(colOutput.streamNumber, colOutput.size());
+    if (monotonic) {
+      fieldInfo.monoMeta = metaLoc;
+    } else {
+      fieldInfo.columnMeta = metaLoc;
+    }
+
     // the number of blocks can be derived from nAdded.
     colOutput.write((const char*)blockInfo.data(), blockInfo.size() * sizeof(IntColReader::NumericBlockInfo));
 
-    fieldInfo.flags |= 0x02;  // int64 values
-    fieldInfo.docsWithField = nAdded;
-    fieldInfo.columnLoc = seg_location(colOutput.streamNumber, colStart);
+    if (monotonic) {
+      fieldInfo.flags |= 0x08;   // monotonic int values
+      // we don't try to set docsWithField here because monotonic ints are not used alone.  someone
+      // else will always set it.
+      fieldInfo.monoLoc = seg_location(colOutput.streamNumber, colStart);
+    } else {
+      fieldInfo.flags |= 0x02;  // int64 values
+      fieldInfo.docsWithField = nAdded;
+      fieldInfo.columnLoc = seg_location(colOutput.streamNumber, colStart);
+    }
+
     return nAdded;
   }
 };
