@@ -1,6 +1,6 @@
 #include "bench/solux_bench.h"
 #include "test/SegmentTest.h"
-#include "solux/search/PostingsReader.h"
+#include "solux/reader/PostingsReader.h"
 
 /* Results of postings reading before position blocks are supported (just reading vints directly,
  * without decoding into intermediate array:

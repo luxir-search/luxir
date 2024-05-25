@@ -2,7 +2,7 @@
 
 #include "bench/solux_bench.h"
 #include "test/SegmentTest.h"
-#include "solux/search/PostingsReader.h"
+#include "solux/reader/PostingsReader.h"
 #include "solux/index/PostingsWriter.h"
 
 

@@ -1,5 +1,5 @@
 #include "solux/index/PostingsWriter.h"
-#include "solux/search/PostingsReader.h"
+#include "solux/reader/PostingsReader.h"
 #include "gtest/gtest.h"
 #include "test/SoluxTest.h"
 #include "test/SegmentTest.h"

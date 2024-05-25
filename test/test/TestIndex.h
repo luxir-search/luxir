@@ -5,7 +5,7 @@
 #include "solux/index/Inverter.h"
 #include "solux/index/IndexWriter.h"
 #include "solux/index/PostingsWriter.h"
-#include "solux/search/PostingsReader.h"
+#include "solux/reader/PostingsReader.h"
 #include "test/SoluxTest.h"
 #include <vector>
 

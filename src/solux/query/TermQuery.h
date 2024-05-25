@@ -1,7 +1,7 @@
 #pragma once
 
 #include "Query.h"
-#include "solux/search/IntColReader.h"
+#include "solux/reader/IntColReader.h"
 
 namespace solux {
 

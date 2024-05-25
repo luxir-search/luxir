@@ -1,7 +1,7 @@
 #pragma once
 #include <tuple>
 #include "solux/index/PostingsWriter.h"
-#include "solux/search/PostingsReader.h"
+#include "solux/reader/PostingsReader.h"
 #include "solux/util/random.h"
 #include "gtest/gtest.h"
 

@@ -11,7 +11,7 @@
 #include "solux/util/StrRef.h"
 #include "solux/store/OutputStream.h"
 #include "solux/store/Directory.h"
-#include "solux/search/PostingsReader.h"
+#include "solux/reader/PostingsReader.h"
 #include "simdcomp/include/codecfactory.h"
 #include "roaring.hh"
 #include "ScreamingBuilder.h"

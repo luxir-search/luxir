@@ -1,6 +1,6 @@
 #pragma once
 #include <span>
-#include "PostingsReader.h"
+#include "solux/reader/PostingsReader.h"
 
 // redefine DEBUG to TRACE level which shouldn't currently be logged!
 #define IREADER_DEBUG LOG_TRACE
