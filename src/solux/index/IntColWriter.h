@@ -47,7 +47,6 @@ public:
 };
 
 
-
 class IntColWriter {
 public:
   constexpr static uint32_t BLOCK_SIZE = Postings::NUMERIC_BLOCK_SIZE;
@@ -63,11 +62,7 @@ private:
   std::vector<int64_t> values;
   std::vector<int32_t> ivalues;
 
-
 public:
-  bool monotonic = false;  // are we writing monotonic values
-
-
   // This class allocates from the pool but does not do any visible rollbacks.
   IntColWriter(MemPool& pool, PostingsWriter& postingsWriter, PostingsWriter::IndexFieldInfo& fieldInfo)
           : postingsWriter(postingsWriter), fieldInfo(fieldInfo), colOutput(postingsWriter.files[5].out) {
@@ -95,73 +90,21 @@ public:
     int64_t gcd = arr[0];
     int64_t min = arr[0];
     int64_t max = arr[0];
-    uint32_t bits;
-
-    if (monotonic) {
-      max = arr[arr.size()-1];
-      double slope = arr.size() == 1 ? 0 : (max - min) / (arr.size() - 1);
-
-      uint64_t scaled_slope = (uint64_t)(slope * MonoColReader::MONOTONIC_SLOPE_SCALE);
-      uint64_t maxZZ = 0;
-      ivalues.reserve(arr.size());
-      ivalues.resize(0);
-      for (size_t i=0; i<arr.size(); i++) {
-        uint64_t expected = min + (uint64_t)(i * scaled_slope / BLOCK_SIZE);
-        int64_t delta = arr[i] - expected;
-        // zigzag encode to make positive
-        uint64_t zz = (delta >> 63) ^ (delta << 1);
-        // make sure we don't overflow 32 bit deltas
-        if (zz > std::numeric_limits<uint32_t>::max()) {
-          // We should only need more than 32 bits if individual values can be more than 32 bits in size.
-          // This currently isn't the case.
-          throw std::runtime_error(std::format("IntColWriter: monotonic delta too large: field={} delta={} slope={}"
-                                               ,(std::string_view)fieldInfo.fieldname, delta, slope));
-        }
-        arr[i] = zz;
-        maxZZ = std::max(maxZZ, zz);
-      }
-      bits = std::bit_width(maxZZ);
-      gcd = scaled_slope;  // reuse gcd for our scaled slope.
-
-      // Currently or For codec can only handle 32 bit integers, so we need to make a copy.
-      // We should make a version that can accept 64 bit integers that just use the lower half.
-      ivalues.reserve(arr.size());
-      ivalues.resize(0);
-      for (size_t i=0; i<arr.size(); i++) {
-        ivalues.push_back((int32_t)arr[i]);
-      }
-
-    } else {
-      // normal (non-monotonic case)
-
-      for (size_t i = 1; i < arr.size(); i++) {
-        min = std::min(min, arr[i]);
-        max = std::max(max, arr[i]);
-        // If gcd hits 1 it can't change from that.  If it's 0, it could still go up.
-        if (gcd != 1) {
-          gcd = std::gcd(gcd, arr[i]);
-        }
-      }
-
-      // get number of bits needed to represent values if we divide everything by the gcd
-      if (gcd == 0) {
-        gcd = 1;  // all values 0... we can't divide by 0 though.
-      }
-
-      bits = std::bit_width((uint64_t) ((max - min) / gcd));
-
-      // Currently or For codec can only handle 32 bit integers, so we need to make a copy.
-      // We should make a version that can accept 64 bit integers that just use the lower half.
-      if (bits <= 32) {
-        ivalues.reserve(arr.size());
-        ivalues.resize(0);
-        for (size_t i = 0; i < arr.size(); i++) {
-          ivalues.push_back((arr[i] - min) / gcd);
-          assert(int64_t(ivalues.back()) * gcd + min == arr[i]);
-        }
+    for (size_t i=1; i<arr.size(); i++) {
+      min = std::min(min, arr[i]);
+      max = std::max(max, arr[i]);
+      // If gcd hits 1 it can't change from that.  If it's 0, it could still go up.
+      if (gcd != 1) {
+        gcd = std::gcd(gcd, arr[i]);
       }
     }
 
+    // get number of bits needed to represent values if we divide everything by the gcd
+    if (gcd == 0) {
+      gcd = 1;  // all values 0... we can't divide by 0 though.
+    }
+
+    uint32_t bits = std::bit_width((uint64_t)((max - min) / gcd));
     colOutput.align(4); // just a guess for now... we should really test.
     // the original SIMD code wrote length, min, max (which is 12 bytes, only 4 byte aligned when the SIMD magic starts happening)
     int64_t off = colOutput.size() - colStart;
@@ -174,6 +117,17 @@ public:
       colOutput.write((const char*)arr.data(), arr.size() * sizeof(int64_t));
       return;
     }
+
+    // Currently or For codec can only handle 32 bit integers, so we need to make a copy.
+    // We should make a version that can accept 64 bit integers that just use the lower half.
+    ivalues.reserve(arr.size());
+    ivalues.resize(0);
+    for (size_t i=0; i<arr.size(); i++) {
+      ivalues.push_back((arr[i] - min) / gcd);
+      assert(int64_t(ivalues.back()) * gcd + min == arr[i]);
+    }
+
+
 
     // codec calculates its own min and max... it's redundant with what we have done here,
     // and the integers we pass will always have a min of 0 now.
@@ -192,7 +146,9 @@ public:
       // and I don't think any more space is needed.
       std::vector<char> compressed_output(ivalues.size() * sizeof(int32_t) + 32);
       uint32_t compressedSize = compressed_output.size(); // this gets changed to the actual size
-      Postings::numericCodec.encodeBlock((uint32_t*)ivalues.data(), ivalues.size(), compressed_output.data(), compressedSize);
+      // Postings::numericCodec.encodeBlock((uint32_t*)ivalues.data(), ivalues.size(), compressed_output.data(), compressedSize);
+      Postings::numericCodec.encodeWithMeta((uint32_t*)ivalues.data(), ivalues.size(), compressed_output.data(), compressedSize, 0, bits);
+      //   void encodeWithMeta(uint32_t* in, uint32_t inSz, char* target, uint32_t &outSz, uint32_t minval, uint8_t bits) {
       /*
       if (compressedSize > ivalues.size() * sizeof(int32_t) + 32) {
         // debugging check.... something is causing an issue (Heap-buffer-overflow)
@@ -217,32 +173,125 @@ public:
 
     // TODO: for dense iteration, we prob don't want to unpack a whole block at once.  We should be
     // able to unpack some multiple of 128 values at a time and keep the same speed?
-    auto metaLoc = seg_location(colOutput.streamNumber, colOutput.size());
-    if (monotonic) {
-      fieldInfo.monoMeta = metaLoc;
-    } else {
-      fieldInfo.columnMeta = metaLoc;
-    }
-
+    fieldInfo.columnMeta = seg_location(colOutput.streamNumber, colOutput.size());
     // the number of blocks can be derived from nAdded.
     colOutput.write((const char*)blockInfo.data(), blockInfo.size() * sizeof(IntColReader::NumericBlockInfo));
 
-    if (monotonic) {
-      fieldInfo.flags |= 0x08;   // monotonic int values
-      // we don't try to set docsWithField here because monotonic ints are not used alone.  someone
-      // else will always set it.
-      fieldInfo.monoLoc = seg_location(colOutput.streamNumber, colStart);
-    } else {
-      fieldInfo.flags |= 0x02;  // int64 values
-      fieldInfo.docsWithField = nAdded;
-      fieldInfo.columnLoc = seg_location(colOutput.streamNumber, colStart);
-    }
-
+    fieldInfo.flags |= 0x02;  // int64 values
+    fieldInfo.docsWithField = nAdded;
+    fieldInfo.columnLoc = seg_location(colOutput.streamNumber, colStart);
     return nAdded;
   }
 };
 
 
+class MonotonicWriter {
+public:
+  constexpr static uint32_t BLOCK_SIZE = Postings::NUMERIC_BLOCK_SIZE;
 
+private:
+  MemPool& pool;
+  OutputStream& out;
+  size_t colStart;
+  size_t nAdded = 0;
+
+  std::vector<IntColReader::NumericBlockInfo> blockInfo;
+  std::vector<int64_t> values;
+  std::vector<int32_t> ivalues;
+
+public:
+  /// column metadata that is filled in / valid after finish() is called.
+  seg_location blockLoc;
+  seg_location metaLoc;
+
+  MonotonicWriter(MemPool& pool, OutputStream& out) : pool(pool), out(out) {
+    unused(pool);
+    colStart = out.size();
+  }
+
+  void startField() {
+  }
+
+  void addInt64(int64_t val) {
+    nAdded++;
+    values.push_back(val);
+    // values[nAdded % BLOCK_SIZE] = val;
+    // if (nAdded % BLOCK_SIZE == 0) {
+    if (values.size() == BLOCK_SIZE) {
+      addBlock(values);
+      values.resize(0);
+    }
+  }
+
+  void addBlock(std::span<int64_t> arr) {
+    auto intercept = arr.front();
+    auto max = arr.back();
+
+    double slope = arr.size() == 1 ? 0 : (max - intercept) / (arr.size() - 1);
+    uint64_t scaled_slope = (uint64_t)(slope * MonoColReader::MONOTONIC_SLOPE_SCALE);
+
+    // deltas from the expected (interpolated) value
+    int64_t minDelta = 0;
+    int64_t maxDelta = 0;
+
+    for (size_t i=0; i<arr.size(); i++) {
+      uint64_t expected = intercept + (uint64_t)(i * scaled_slope / MonoColReader::MONOTONIC_SLOPE_SCALE);
+      int64_t delta = expected - arr[i];
+      minDelta = std::min(minDelta, delta);
+      maxDelta = std::max(maxDelta, delta);
+    }
+
+    auto bits = std::bit_width(uint64_t(maxDelta - minDelta));
+    if (bits > sizeof(int32_t)) {
+      // We should only need more than 32 bits if individual values can be more than 32 bits in size.
+      // This currently isn't the case.
+      throw std::runtime_error(std::format("MonotonicWriter: monotonic delta too large: slope={} minDelta={} maxDelta={}",
+                                           slope, minDelta, maxDelta));
+    }
+
+    // We could zig-zag encode to make all of the deltas positive, but we can save a little by just
+    // lowering the intercept by minDelta.  Although this will raise the average delta, it should not
+    // change the maximum number of bits needed to represent the largest.
+    intercept += minDelta;
+
+    // Currently or For codec can only handle 32 bit integers, so we need to make a copy.
+    // We should make a version that can accept 64 bit integers that just use the lower half.
+    ivalues.reserve(arr.size());
+    ivalues.resize(0);
+    for (size_t i=0; i<arr.size(); i++) {
+      uint64_t expected = intercept + (uint64_t)(i * scaled_slope / BLOCK_SIZE);
+      uint32_t delta = (uint32_t)(expected - arr[i]);
+      assert(delta >= 0);
+      assert((uint64_t(scaled_slope * i) / MonoColReader::MONOTONIC_SLOPE_SCALE) + delta == arr[i]);
+      ivalues.push_back(delta);
+    }
+
+    // TODO: we should probably use a faster codec for random access for this.
+    std::vector<char> compressed_output(ivalues.size() * sizeof(int32_t) + 32);
+    uint32_t compressedSize = compressed_output.size(); // this gets changed to the actual size
+    // Postings::numericCodec.encodeBlock((uint32_t*)ivalues.data(), ivalues.size(), compressed_output.data(), compressedSize);
+    Postings::numericCodec.encodeWithMeta((uint32_t*)ivalues.data(), ivalues.size(), compressed_output.data(), compressedSize, 0, bits);
+    out.write(compressed_output.data(), compressedSize);
+    // SIMDFor implementation can read up to 31 extra bytes after the end of compressedSize.
+    // In this case we are fine because we write extra info after the last block (like BlockInfo array) which
+    // is always larger than that.  See SoluxSIMDFor comment.
+  }
+
+  // returns number of values written and sets metadata to be read.
+  size_t finish() {
+    // bool allDocsHaveValue = nAdded == postingsWriter.getMaxDoc();
+    if (!values.empty()) {
+      addBlock(values);
+      values.resize(0);
+    }
+
+    blockLoc = seg_location(out.streamNumber, colStart);
+    metaLoc = seg_location(out.streamNumber, out.size());
+
+    // the number of blocks can be derived from nAdded.
+    out.write((const char*)blockInfo.data(), blockInfo.size() * sizeof(IntColReader::NumericBlockInfo));
+  }
+
+};
 
 } // end namespace

@@ -122,24 +122,25 @@ public:
   ~SoluxSIMDFor() override = default;
 
 
-  void encodeWithMeta(uint32_t* in, uint32_t inSz, char* target, uint32_t &outSz, uint32_t minval, uint8_t bits) {
-    uint32_t* out = (uint32_t*)target;
+  void encodeWithMeta(uint32_t* in, uint32_t inSz, char* target, uint32_t& outSz, uint32_t minval, uint8_t bits) {
+    uint32_t* out = (uint32_t*) target;
     uint32_t k = 0;
     for (; k + 128 <= inSz; k += 128, in += 128) {
-      simdpackFOR(minval, in, (__m128i *)out, bits);
+      simdpackFOR(minval, in, (__m128i*) out, bits);
       out += bits * 4;
     }
     if (inSz != k)
-      out = (uint32_t *)simdpackFOR_length(minval, in, inSz - k, (__m128i *)out, bits);
+      out = (uint32_t*) simdpackFOR_length(minval, in, inSz - k, (__m128i*) out, bits);
     in += inSz - k;
-    outSz = (char*)out - target;
+    outSz = (char*) out - target;
   }
 
 
-  uint32_t decodeWithMeta(const char* encoded, uint32_t inSz, uint32_t* out, uint32_t &outSz, uint32_t minval, uint8_t bits) {
-    const uint32_t* in = (const uint32_t*)encoded;
+  uint32_t
+  decodeWithMeta(const char* encoded, uint32_t inSz, uint32_t* out, uint32_t& outSz, uint32_t minval, uint8_t bits) {
+    const uint32_t* in = (const uint32_t*) encoded;
     for (uint32_t k = 0; k < outSz / 128; ++k) {
-      simdunpackFOR(minval, (const __m128i *)(in + 4 * bits * k), out + 128 * k, bits);
+      simdunpackFOR(minval, (const __m128i*) (in + 4 * bits * k), out + 128 * k, bits);
     }
     out = out + outSz / 128 * 128;
     in = in + outSz / 128 * 4 * bits;
@@ -147,16 +148,16 @@ public:
       in = (const uint32_t*) simdunpackFOR_length(
               minval, (__m128i*) in, outSz - outSz / 128 * 128, out, bits);
     }
-    return (char*)in - encoded;
+    return (char*) in - encoded;
   }
 
 
-  void encodeBlock(uint32_t* in, uint32_t inSz, char* target, uint32_t &outSz) override final {
-    uint32_t* out = (uint32_t*)target;
+  void encodeBlock(uint32_t* in, uint32_t inSz, char* target, uint32_t& outSz) override final {
+    uint32_t* out = (uint32_t*) target;
     // This should be equivalent to a call to simd_compress_length.  We just want
     // to lower the number of code paths now that we have encodeWithMeta (and exercise it).
     if (inSz == 0) {
-      outSz=0;
+      outSz = 0;
       return;
     }
     uint32_t m, M;
@@ -167,7 +168,7 @@ public:
     out[0] = M;
     ++out;
 
-    encodeWithMeta(in, inSz, (char*)out, outSz, m, b);
+    encodeWithMeta(in, inSz, (char*) out, outSz, m, b);
     outSz += 2 * sizeof(uint32_t);
 
     /* // previous code before encodeWithMeta
@@ -181,8 +182,8 @@ public:
   }
 
   // NOTE: the return type is not always correct.  There seems to be an issue with the underlying codec.simd_uncompress_length.
-  uint32_t decodeBlock(const char* compressed, uint32_t inSz, uint32_t* out, uint32_t &outSz) override final {
-    const uint32_t* in = (const uint32_t*)compressed;
+  uint32_t decodeBlock(const char* compressed, uint32_t inSz, uint32_t* out, uint32_t& outSz) override final {
+    const uint32_t* in = (const uint32_t*) compressed;
     if (outSz == 0) {
       outSz = 0;
       return 0;
@@ -193,7 +194,7 @@ public:
     ++in;
     int b = std::bit_width(static_cast<uint32_t>(M - m));
 
-    auto readSize = decodeWithMeta((const char*)in, inSz - 2 * sizeof(uint32_t), out, outSz, m, b);
+    auto readSize = decodeWithMeta((const char*) in, inSz - 2 * sizeof(uint32_t), out, outSz, m, b);
     return readSize + 2 * sizeof(uint32_t);
     /*
     auto end = codec.simd_uncompress_length((uint32_t*)in, out, outSz);
@@ -207,10 +208,11 @@ public:
     return c.select(compressed, blockSize, index);
   }
 
-  // blockSize is the number of values in this specific block, not necessarily our large block size of 16K
-  uint32_t select(const char* compressed, uint32_t blockSize, uint32_t index) {
+  // nValues is the number of values in this specific block, not necessarily our large block size of 16K
+  // It's needed when tail-compression (partial block) is different than block compression.
+  uint32_t select(const char* compressed, uint32_t nValues, uint32_t index) {
     // This is adapted from SIMDCompressionLib::SIMDFrameOfReference::select
-    uint32_t* in = (uint32_t*)compressed;
+    uint32_t* in = (uint32_t*) compressed;
     // uint32_t length = *in;
     // in++;
     uint32_t m = *in;
@@ -240,6 +242,34 @@ public:
       const uint32_t secondpart = in[4 * firstwordinlane + 4 + lane];
       const uint32_t usablebitsinfirstword = 32 - (bitsinlane % 32);
       return m + ((firstpart | (secondpart << usablebitsinfirstword)) & mask);
+    }
+  }
+
+  inline uint32_t selectWithMeta(const char* compressed, uint32_t blockSize, uint32_t index, uint32_t minval, uint8_t bits) {
+    // This is adapted from SIMDCompressionLib::SIMDFrameOfReference::select
+    uint32_t* in = (uint32_t*) compressed;
+    if (bits == 32) {
+      return in[index];
+    } else if (bits == 0) {
+      return minval;  // all values equal, nothing encoded.  This was missing from original, leading to OOB read.
+    }
+    in += index / 128 * 4 * bits;
+    const uint32_t slot = index % 128;
+    const uint32_t lane = slot % 4;               /* we have 4 interleaved lanes */
+    const uint32_t bitsinlane = (slot / 4) * bits; /* how many bits in lane */
+    const uint32_t firstwordinlane = bitsinlane / 32;
+    const uint32_t secondwordinlane = (bitsinlane + bits - 1) / 32;
+    const uint32_t firstpart =
+            in[4 * firstwordinlane + lane] >> (bitsinlane % 32);
+    const uint32_t mask = (1 << bits) - 1;
+    if (firstwordinlane == secondwordinlane) {
+      /* easy common case*/
+      return minval + (firstpart & mask);
+    } else {
+      /* harder case where we need to combine two words */
+      const uint32_t secondpart = in[4 * firstwordinlane + 4 + lane];
+      const uint32_t usablebitsinfirstword = 32 - (bitsinlane % 32);
+      return minval + ((firstpart | (secondpart << usablebitsinfirstword)) & mask);
     }
   }
 };

@@ -92,7 +92,58 @@ public:
       auto& block = blockMeta[blockNum];
       const char* blockStart = blocks + block.blockOffset;
       // depending ont the exact format, valuesInBlock may not be needed.
-      auto valuesInBlock = uint32_t(max) % Postings::NUMERIC_BLOCK_SIZE;
+      auto valuesInBlock = (blockNum == uint64_t(max) / Postings::NUMERIC_BLOCK_SIZE) ? uint32_t(max) % Postings::NUMERIC_BLOCK_SIZE : Postings::NUMERIC_BLOCK_SIZE;
+      if (block.format <= 32) {
+        auto unscaled = Postings::numericCodec.selectWithMeta(blockStart, valuesInBlock, rankInBlock, 0, block.format);
+        return unscaled * block.gcd + block.min;
+      } else {
+        // 64-bit, temp impl uncompressed
+        return reinterpret_cast<const int64_t*>(blockStart)[rankInBlock];
+      }
+    }
+
+    int64_t advance(int64_t target) {
+      assert (target >= 0 && target < max);
+      index_ = target;
+      return target;
+    }
+  };
+
+  // TODO - decode subblocks (128) at a time.
+  class DenseBulkIterator {
+    const NumericBlockInfo* blockMeta;  // array of block metadata
+    const char* blocks;                 // start of the compressed blocks of data
+    int64_t index_ = -1;
+    int64_t max;
+  public:
+
+    DenseBulkIterator(const IntColReader& col) : blockMeta(col.blockMeta), blocks(col.blocks) {
+      max = col.fieldInfo.docsWithField;
+    }
+
+    int64_t index() {
+      return index_;
+    }
+
+    int64_t value() {
+      return valueAtRank(index_);
+    }
+
+    int64_t next() {
+      if (++index_ >= max) {
+        index_ = ENDINDEX;
+      }
+      return index_;
+    }
+
+    int64_t valueAtRank(int64_t rank) {
+      assert (rank >= 0 && rank < max);
+      auto blockNum = (uint64_t)rank / Postings::NUMERIC_BLOCK_SIZE;
+      auto rankInBlock = (uint64_t)rank % Postings::NUMERIC_BLOCK_SIZE;
+      auto& block = blockMeta[blockNum];
+      const char* blockStart = blocks + block.blockOffset;
+      // depending ont the exact format, valuesInBlock may not be needed.
+      auto valuesInBlock = (blockNum == uint64_t(max) / Postings::NUMERIC_BLOCK_SIZE) ? uint32_t(max) % Postings::NUMERIC_BLOCK_SIZE : Postings::NUMERIC_BLOCK_SIZE;
       if (block.format <= 32) {
         auto unscaled = Postings::numericCodec.select(blockStart, valuesInBlock, rankInBlock);
         return unscaled * block.gcd + block.min;
@@ -108,7 +159,6 @@ public:
       return target;
     }
   };
-
 
   // This is an iterator over documents, so indexes will always be 32 bit.
   class Iterator {
@@ -178,7 +228,7 @@ public:
 
 };
 
-// Monotonic int col
+// Monotonic int col.  Currently supports 32 bit indexes and 64 bit outputs.
 class MonoColReader {
 public:
   // For monotonic fields, we store the slope of the line and interpolate the values (and store
@@ -204,13 +254,25 @@ private:
     blocks = reinterpret_cast<const char *>(columnIS.ptr(fieldInfo.columnLoc.offset()));
   }
 
-  int32_t numValues() {
+  int32_t numValues() const {
     // The way we currently use MonoColReader, it's always one-for-one with the number of docs with a field value.
     // We could chose to implement sparse values with this sometimes, and then we'd need to return maxDoc.
     return fieldInfo.docsWithField;
   }
 
-
+  int64_t valueAtRank(int32_t rank) const {
+    assert (rank >= 0 && rank < numValues());
+    auto blockNum = (uint64_t)rank / Postings::NUMERIC_BLOCK_SIZE;
+    auto rankInBlock = (uint64_t)rank % Postings::NUMERIC_BLOCK_SIZE;
+    auto& block = blockMeta[blockNum];
+    const char* blockStart = blocks + block.blockOffset;
+    // depending on the exact format, valuesInBlock may not be needed.
+    auto valuesInBlock = (blockNum == uint64_t(numValues()) / Postings::NUMERIC_BLOCK_SIZE) ? uint32_t(numValues()) % Postings::NUMERIC_BLOCK_SIZE : Postings::NUMERIC_BLOCK_SIZE;
+    assert(block.format <=32);
+    auto unscaled = Postings::numericCodec.select(blockStart, valuesInBlock, rankInBlock);
+    int64_t scaled = block.min + uint64_t(uint64_t(unscaled) * block.gcd) / MONOTONIC_SLOPE_SCALE;
+    return scaled;
+  }
 
 };
 
