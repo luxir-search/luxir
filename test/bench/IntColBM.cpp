@@ -5,8 +5,8 @@
 
 using namespace solux;
 
-
-static void BM_IntCol(benchmark::State& state, int32_t nDocs, int32_t docDelta, int64_t maxVal, bool advance) {
+template <class IterType>
+static void BM_IntCol(benchmark::State& state, int32_t nDocs, int32_t docDelta, int64_t maxVal, int skip) {
   Rng rng(0);
   test::TestIndex testIndex;
   test::TestField testField(testIndex, "foo_i");
@@ -35,7 +35,7 @@ static void BM_IntCol(benchmark::State& state, int32_t nDocs, int32_t docDelta, 
     count = 0;
 
     IntColReader::Iterator it(intColReader);
-    if (!advance) {
+    if (skip==1) {
       while (it.next() != IntColReader::ENDDOC) {
         ret += it.value();
         count++;
@@ -44,7 +44,7 @@ static void BM_IntCol(benchmark::State& state, int32_t nDocs, int32_t docDelta, 
       // skipping
       int32_t doc = -1;
       for(;;) {
-        doc = it.advance(doc+3);
+        doc = it.advance(doc+skip);
         if (doc == IntColReader::ENDDOC) {
           break;
         }
@@ -56,13 +56,29 @@ static void BM_IntCol(benchmark::State& state, int32_t nDocs, int32_t docDelta, 
     benchmark::DoNotOptimize(ret);
   }
 
+  state.counters["fp"] = ret;  // sanity check.
   state.counters["count"] = count;  // sanity check.
   state.counters["rate"] = benchmark::Counter(count, benchmark::Counter::kIsIterationInvariantRate);
 }
 
+void BM_IntColSparse(benchmark::State& state, int32_t nDocs, int32_t docDelta, int64_t maxVal, int skip) {
+  BM_IntCol<IntColReader::SparseIterator>(state, nDocs, docDelta, maxVal, skip);
+}
+void BM_IntColBulk(benchmark::State& state, int32_t nDocs, int32_t docDelta, int64_t maxVal, int skip) {
+  BM_IntCol<IntColReader::BulkIterator>(state, nDocs, docDelta, maxVal, skip);
+}
 
+// When we test sparse sets for performance, the most interesting case is when it's still a bitset in the block.
+// Search code will spend much less time in very sparse sets.
 constexpr int32_t nDocs = 65536;
-BENCHMARK_CAPTURE(BM_IntCol, denseIter, nDocs, 1, 1100, false);
-BENCHMARK_CAPTURE(BM_IntCol, sparseIter, nDocs, 4, 1100, false);
-BENCHMARK_CAPTURE(BM_IntCol, denseSkip, nDocs, 1, 1100, true);
-BENCHMARK_CAPTURE(BM_IntCol, sparseSkip, nDocs, 4, 1100, true);
+BENCHMARK_CAPTURE(BM_IntColSparse, denseIter,   nDocs, 1, 1100, 1);
+BENCHMARK_CAPTURE(BM_IntColSparse, sparseIter,  nDocs, 4, 1100, 1);
+BENCHMARK_CAPTURE(BM_IntColSparse, denseSkip3,  nDocs, 1, 1100, 3);
+BENCHMARK_CAPTURE(BM_IntColSparse, denseSkip27, nDocs, 1, 1100, 27);
+BENCHMARK_CAPTURE(BM_IntColSparse, sparseSkip,  nDocs, 4, 1100, 1);
+
+BENCHMARK_CAPTURE(BM_IntColBulk,   denseIter,   nDocs, 1, 1100, 1);
+BENCHMARK_CAPTURE(BM_IntColBulk,   sparseIter,  nDocs, 4, 1100, 1);
+BENCHMARK_CAPTURE(BM_IntColBulk,   denseSkip3,  nDocs, 1, 1100, 3);
+BENCHMARK_CAPTURE(BM_IntColBulk,   denseSkip27, nDocs, 1, 1100, 27);
+BENCHMARK_CAPTURE(BM_IntColBulk,   sparseSkip,  nDocs, 4, 1100, 1);
