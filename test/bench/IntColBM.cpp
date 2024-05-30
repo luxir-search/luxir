@@ -34,7 +34,7 @@ static void BM_IntCol(benchmark::State& state, int32_t nDocs, int32_t docDelta, 
     ret = 0;
     count = 0;
 
-    IntColReader::Iterator it(intColReader);
+    IterType it(intColReader);
     if (skip==1) {
       while (it.next() != IntColReader::ENDDOC) {
         ret += it.value();
@@ -71,14 +71,17 @@ void BM_IntColBulk(benchmark::State& state, int32_t nDocs, int32_t docDelta, int
 // When we test sparse sets for performance, the most interesting case is when it's still a bitset in the block.
 // Search code will spend much less time in very sparse sets.
 constexpr int32_t nDocs = 65536;
-BENCHMARK_CAPTURE(BM_IntColSparse, denseIter,   nDocs, 1, 1100, 1);
-BENCHMARK_CAPTURE(BM_IntColSparse, sparseIter,  nDocs, 4, 1100, 1);
-BENCHMARK_CAPTURE(BM_IntColSparse, denseSkip3,  nDocs, 1, 1100, 3);
-BENCHMARK_CAPTURE(BM_IntColSparse, denseSkip27, nDocs, 1, 1100, 27);
-BENCHMARK_CAPTURE(BM_IntColSparse, sparseSkip,  nDocs, 4, 1100, 1);
 
+// IntColSparse uses iterators that decode a value at a time.
+BENCHMARK_CAPTURE(BM_IntColSparse, denseIter,   nDocs, 1, 1100, 1);  // docs are dense, iterate over all values
+BENCHMARK_CAPTURE(BM_IntColSparse, sparseIter,  nDocs, 4, 1100, 1);  // docs are sparse, iterate over all values
+BENCHMARK_CAPTURE(BM_IntColSparse, denseSkip3,  nDocs, 1, 1100, 3);  // docs are dense, use skipping of size 3
+BENCHMARK_CAPTURE(BM_IntColSparse, denseSkip27, nDocs, 1, 1100, 27); // docs are dense, use skipping of size 27
+BENCHMARK_CAPTURE(BM_IntColSparse, sparseSkip3, nDocs, 4, 1100, 3);  // docs are sparse, use skipping of size 3
+
+// IntColBulk uses iterators that decode a block at a time.
 BENCHMARK_CAPTURE(BM_IntColBulk,   denseIter,   nDocs, 1, 1100, 1);
 BENCHMARK_CAPTURE(BM_IntColBulk,   sparseIter,  nDocs, 4, 1100, 1);
 BENCHMARK_CAPTURE(BM_IntColBulk,   denseSkip3,  nDocs, 1, 1100, 3);
 BENCHMARK_CAPTURE(BM_IntColBulk,   denseSkip27, nDocs, 1, 1100, 27);
-BENCHMARK_CAPTURE(BM_IntColBulk,   sparseSkip,  nDocs, 4, 1100, 1);
+BENCHMARK_CAPTURE(BM_IntColBulk,   sparseSkip3, nDocs, 4, 1100, 3);

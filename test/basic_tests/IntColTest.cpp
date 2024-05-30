@@ -234,3 +234,100 @@ TEST_F(IntColTest, textLen) {
 
 
 }
+
+TEST_F(IntColTest, testMono) {
+  {
+    RAMDir dir;
+    auto file = dir.createFile("mono");
+    OutputStream out(file.get());
+    MemPool pool;
+    MonoWriter w(pool, out);
+    w.addInt64(10);
+    w.addInt64(25); // +5 over line
+    w.addInt64(28); // -2 over line
+    w.addInt64(40);
+    // total range of 7 for deltas from expected means bits should be 3.
+    int nVals = w.finish();
+    out.close();
+    dir.finishFile(*file);
+
+    auto in = dir.openFile("mono");
+    InputStream is(in->getInputStream());
+    MonoReader r(pool, is, w.metaLoc.offset(), w.blockLoc.offset(), nVals);
+
+    ASSERT_EQ(nVals, r.numValues());
+    ASSERT_EQ(10, r.valueAt(0));
+    ASSERT_EQ(25, r.valueAt(1));
+    ASSERT_EQ(28, r.valueAt(2));
+    ASSERT_EQ(40, r.valueAt(3));
+  }
+
+  // test a single value (special case because you can't take the slope)
+  {
+    RAMDir dir;
+    auto file = dir.createFile("mono");
+    OutputStream out(file.get());
+    MemPool pool;
+    MonoWriter w(pool, out);
+    w.addInt64(123);
+    // total range of 7 for deltas from expected means bits should be 3.
+    int nVals = w.finish();
+    out.close();
+    dir.finishFile(*file);
+
+    auto in = dir.openFile("mono");
+    InputStream is(in->getInputStream());
+    MonoReader r(pool, is, w.metaLoc.offset(), w.blockLoc.offset(), nVals);
+
+    ASSERT_EQ(nVals, r.numValues());
+    ASSERT_EQ(123, r.valueAt(0));
+  }
+}
+
+TEST_F(IntColTest, testMonoBig) {
+  for (int iter=0; iter<1; iter++) {
+    RAMDir dir;
+    auto file = dir.createFile("mono");
+    OutputStream out(file.get());
+    MemPool pool;
+    MonoWriter w(pool, out);
+    int32_t deltaMax = rng() & std::numeric_limits<int32_t>::max();
+    switch (rng.rint(4)) {
+      case 0:
+        deltaMax &= 0xff;
+        break;
+      case 1:
+        deltaMax &= 0xfff;
+        break;
+      case 2:
+        deltaMax &= 0xfffff;
+        break;
+      default:
+        break;
+    }
+    if (deltaMax==0) deltaMax=1;
+    auto num = rng.rint(MonoReader::BLOCK_SIZE * 3);
+    if (rng.rint(100) < 20) {
+      num = MonoReader::BLOCK_SIZE * rng.rint(1,3) + rng.rint(3)-1;  // sometimes test exactly block size +-1
+    }
+
+    Rng rand = rng;
+
+    for (auto i = 0u; i < num; i++) {
+      w.addInt64(rand.rint(deltaMax));
+    }
+
+    int nVals = w.finish();
+    out.close();
+    dir.finishFile(*file);
+
+    auto in = dir.openFile("mono");
+    InputStream is(in->getInputStream());
+    MonoReader r(pool, is, w.metaLoc.offset(), w.blockLoc.offset(), nVals);
+
+    rand = rng;  // reset the rng so we can produce the same sequence of numbers.
+    for (auto i = 0u; i < num; i++) {
+      ASSERT_EQ(rand.rint(deltaMax), r.valueAt(i));
+    }
+  }
+}

@@ -599,7 +599,7 @@ TEST_F(PostingsTest, intCol) {
   ASSERT_EQ(colReader.docsWithValue(), 3);
 
   {
-    IntColReader::DenseIterator iter(colReader);
+    IntColReader::DenseValues iter(colReader);
     ASSERT_EQ(iter.next(), 0);
     ASSERT_EQ(iter.index(), 0);
     ASSERT_EQ(iter.value(), 77);

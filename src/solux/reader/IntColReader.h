@@ -59,14 +59,14 @@ public:
 
   // An iterator over dense int values.  It needs to support more than int32 indexes because
   // of multi-valued fields (i.e. even if you only have 2B docs, a column could have > 4B values).
-  class DenseIterator {
+  class DenseValues {
     const NumericBlockInfo* blockMeta;  // array of block metadata
     const char* blocks;                 // start of the compressed blocks of data
     int64_t index_ = -1;
     int64_t max;
   public:
 
-    DenseIterator(const IntColReader& col) : blockMeta(col.blockMeta), blocks(col.blocks) {
+    DenseValues(const IntColReader& col) : blockMeta(col.blockMeta), blocks(col.blocks) {
       max = col.fieldInfo.docsWithField;
     }
 
@@ -111,7 +111,7 @@ public:
   };
 
   /// Decodes sub-blocks at a time when one needs a decent percent of the values.
-  class DenseBulkIterator {
+  class BulkValues {
     constexpr static uint32_t BULK_DECODE = 128;
     const NumericBlockInfo* blockMeta;  // array of block metadata
     const char* blocks;                 // start of the compressed blocks of data
@@ -122,7 +122,7 @@ public:
     int64_t decoded[BULK_DECODE];
   public:
 
-    DenseBulkIterator(const IntColReader& col) : blockMeta(col.blockMeta), blocks(col.blocks) {
+    BulkValues(const IntColReader& col) : blockMeta(col.blockMeta), blocks(col.blocks) {
       max = col.fieldInfo.docsWithField;
     }
 
@@ -189,76 +189,13 @@ public:
 
   };
 
-  // This is an iterator over documents, so indexes will always be 32 bit.
-  class IteratorX {
-    const IntColReader& col;
-    screaming::BitSet::Iterator docsIter;
-    DenseIterator denseIter;
-    int32_t docRank = -1;
-    int32_t doc = -1;
-    int32_t maxRank;
-    bool dense;
-  public:
-
-    IteratorX(const IntColReader& col) : col(col), docsIter(col.docs.bitset()), denseIter(col) {
-      maxRank = col.fieldInfo.docsWithField;
-      dense = !col.docs.hasBitset();
-    }
-
-    int64_t docId() {
-      return doc;
-    }
-
-    /*** Don't expose this unless needed ... it could be tough to implement for some encodings!
-    int32_t rank() {
-      return docRank;
-    }
-    */
-
-    int64_t value() {
-      return denseIter.valueAt(docRank);
-    }
-
-    // TODO: directly expose docsIter (or the screaming set) here to enable bulk / direct operations on them?
-
-    int32_t advance(int32_t target) {
-      if (dense) {
-        if (target >= maxRank) {
-          doc = ENDDOC;
-        } else {
-          doc = docRank = target;
-        }
-      } else { // Would a sparse-only iterator (so we don't have the dense code in here) improve performance?
-        doc = docsIter.advance(target);
-        docRank = docsIter.rank();
-      }
-      return doc;
-    }
-
-    // returns the docid corresponding to the next value
-    int32_t next() {
-      if (docRank + 1 >= maxRank) {
-        doc = ENDDOC;
-        return doc;
-      }
-      docRank++;
-
-      if (dense) {
-        doc++;
-      } else {
-        doc = docsIter.next();
-      }
-
-      return doc;
-    }
-  };
 
   // This is an iterator over documents, so indexes will always be 32 bit.
-  template <class DenseValueIterator>
+  template <class DenseValueImpl>
   class DocIterator {
     const IntColReader& col;
     screaming::BitSet::Iterator docsIter;
-    DenseValueIterator valueIter;
+    DenseValueImpl valueIter;
     int32_t docRank = -1;
     int32_t doc = -1;
     int32_t maxRank;
@@ -318,8 +255,8 @@ public:
     }
   };
 
- using SparseIterator = DocIterator<DenseBulkIterator>;  // decodes individual values (good for big skipping)
- using BulkIterator = DocIterator<DenseBulkIterator>;  // decodes blocks of values (good for iterating or small skipping)
+ using SparseIterator = DocIterator<DenseValues>;  // decodes individual values (good for big skipping)
+ using BulkIterator = DocIterator<BulkValues>;  // decodes blocks of values (good for iterating or small skipping)
  using Iterator = BulkIterator;
 
   // class MonotonicReader
@@ -327,48 +264,66 @@ public:
 };
 
 // Monotonic int col.  Currently supports 32 bit indexes and 64 bit outputs.
-class MonoColReader {
+class MonoReader {
 public:
+  constexpr static uint32_t BLOCK_SIZE = Postings::NUMERIC_BLOCK_SIZE;
   // For monotonic fields, we store the slope of the line and interpolate the values (and store
   // the delta from the expected value).
   // Instead of using floating point math when decoding, we use a scaled slope and do integer math.
   // Our integral slope estimate should be within .25 of the expected value calculated with doubles.
   // This leaves the rest of the bits to interpolate large values: 2^64/(16384*4) = 2.8e14
-  constexpr static uint64_t MONOTONIC_SLOPE_SCALE = Postings::NUMERIC_BLOCK_SIZE * 4;
+  constexpr static uint64_t SLOPE_SCALE = BLOCK_SIZE * 4;
 
-  using NumericBlockInfo = IntColReader::NumericBlockInfo;
+  // either make this struct packed, or round it out so there won't be any undefined padding between elements.
+  SOLUX_PACKED_START
+  struct BlockInfo {
+    uint64_t blockOffset;
+    uint64_t scaledSlope;
+    int32_t intercept;
+    uint8_t bits;
+  } SOLUX_PACKED_END;
+
 private:
   InputStream columnIS;
-  const SegFieldInfo& fieldInfo;
-  const IntColReader::NumericBlockInfo* blockMeta;  // array of block metadata
-  const char* blocks;                 // start of the compressed blocks of data
+  const BlockInfo* blockMeta;  // array of block metadata
+  const char* blocks;          // start of the compressed blocks of data
+  int32_t nValues;
 
-
-  MonoColReader(MemPool &pool, PostingsReader &postingsReader, const SegFieldInfo &fieldInfo) :
-          fieldInfo(fieldInfo)
+public:
+  MonoReader(MemPool &pool, PostingsReader &postingsReader, seg_location metaLoc, seg_location blockLoc, int32_t nValues)
   {
-    columnIS = postingsReader.getInputStreamSeek(fieldInfo.columnLoc);
-    blockMeta = reinterpret_cast<const NumericBlockInfo *>(columnIS.ptr(fieldInfo.columnMeta.offset()));
-    blocks = reinterpret_cast<const char *>(columnIS.ptr(fieldInfo.columnLoc.offset()));
+    columnIS = postingsReader.getInputStreamSeek(blockLoc);
+    blocks = columnIS.ptr();
+    assert(metaLoc.filenum() == blockLoc.filenum());
+    blockMeta = reinterpret_cast<const BlockInfo *>(columnIS.ptr(metaLoc.offset()));
+    this->nValues = nValues;
+  }
+
+  MonoReader(MemPool &pool, InputStream is, int64_t metaLoc, int64_t blockLoc, int32_t nValues)
+  {
+    columnIS = is;
+    blocks = columnIS.ptr(blockLoc);
+    blockMeta = reinterpret_cast<const BlockInfo *>(columnIS.ptr(metaLoc));
+    this->nValues = nValues;
   }
 
   int32_t numValues() const {
-    // The way we currently use MonoColReader, it's always one-for-one with the number of docs with a field value.
-    // We could chose to implement sparse values with this sometimes, and then we'd need to return maxDoc.
-    return fieldInfo.docsWithField;
+    return nValues;
   }
 
-  int64_t valueAtRank(int32_t rank) const {
-    assert (rank >= 0 && rank < numValues());
-    auto blockNum = (uint64_t)rank / Postings::NUMERIC_BLOCK_SIZE;
-    auto rankInBlock = (uint64_t)rank % Postings::NUMERIC_BLOCK_SIZE;
+  int64_t valueAt(int32_t index) const {
+    assert (index >= 0 && index < nValues);
+    auto blockNum = (uint64_t)index / BLOCK_SIZE;
+    auto rankInBlock = (uint64_t)index % BLOCK_SIZE;
     auto& block = blockMeta[blockNum];
     const char* blockStart = blocks + block.blockOffset;
+    if (block.bits > 32) {
+      return reinterpret_cast<const int64_t*>(blockStart)[rankInBlock];
+    }
     // depending on the exact format, valuesInBlock may not be needed.
-    auto valuesInBlock = (blockNum == uint64_t(numValues()) / Postings::NUMERIC_BLOCK_SIZE) ? uint32_t(numValues()) % Postings::NUMERIC_BLOCK_SIZE : Postings::NUMERIC_BLOCK_SIZE;
-    assert(block.format <=32);
-    auto unscaled = Postings::numericCodec.select(blockStart, valuesInBlock, rankInBlock);
-    int64_t scaled = block.min + uint64_t(uint64_t(unscaled) * block.gcd) / MONOTONIC_SLOPE_SCALE;
+    auto valuesInBlock = (blockNum == uint64_t(nValues) / BLOCK_SIZE) ? uint32_t(nValues) % BLOCK_SIZE : BLOCK_SIZE;
+    auto delta = Postings::numericCodec.selectWithMeta(blockStart, valuesInBlock, rankInBlock, 0, block.bits);
+    int64_t scaled = uint64_t(rankInBlock * block.scaledSlope) / SLOPE_SCALE + block.intercept + delta;
     return scaled;
   }
 

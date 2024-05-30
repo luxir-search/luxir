@@ -127,13 +127,6 @@ public:
       assert(int64_t(ivalues.back()) * gcd + min == arr[i]);
     }
 
-
-
-    // codec calculates its own min and max... it's redundant with what we have done here,
-    // and the integers we pass will always have a min of 0 now.
-    // We should also be able to write an internal mini-block at a time (128 values for For) so we don't have to buffer
-    // the whole output block.
-
     if (false && bits > 28) {  // future... need to manage our own metadata (bits,min) for this to work on reading side.
       // If too many bits are needed, simply copy the values to the output stream.  For something like hashes that
       // normally consume the whole range, we don't want to get lucky and save 1 bit in just 1 block since that
@@ -185,26 +178,23 @@ public:
 };
 
 
-class MonotonicWriter {
-public:
-  constexpr static uint32_t BLOCK_SIZE = Postings::NUMERIC_BLOCK_SIZE;
-
+class MonoWriter {
 private:
   MemPool& pool;
   OutputStream& out;
   size_t colStart;
   size_t nAdded = 0;
 
-  std::vector<IntColReader::NumericBlockInfo> blockInfo;
+  std::vector<MonoReader::BlockInfo> blockInfo;
   std::vector<int64_t> values;
   std::vector<int32_t> ivalues;
 
 public:
-  /// column metadata that is filled in / valid after finish() is called.
+  /// "output" column metadata that is filled in / valid after finish() is called.
   seg_location blockLoc;
   seg_location metaLoc;
 
-  MonotonicWriter(MemPool& pool, OutputStream& out) : pool(pool), out(out) {
+  MonoWriter(MemPool& pool, OutputStream& out) : pool(pool), out(out) {
     unused(pool);
     colStart = out.size();
   }
@@ -217,7 +207,7 @@ public:
     values.push_back(val);
     // values[nAdded % BLOCK_SIZE] = val;
     // if (nAdded % BLOCK_SIZE == 0) {
-    if (values.size() == BLOCK_SIZE) {
+    if (values.size() == MonoReader::BLOCK_SIZE) {
       addBlock(values);
       values.resize(0);
     }
@@ -228,41 +218,41 @@ public:
     auto max = arr.back();
 
     double slope = arr.size() == 1 ? 0 : (max - intercept) / (arr.size() - 1);
-    uint64_t scaled_slope = (uint64_t)(slope * MonoColReader::MONOTONIC_SLOPE_SCALE);
+    uint64_t scaled_slope = (uint64_t)(slope * MonoReader::SLOPE_SCALE);
 
     // deltas from the expected (interpolated) value
     int64_t minDelta = 0;
     int64_t maxDelta = 0;
 
     for (size_t i=0; i<arr.size(); i++) {
-      uint64_t expected = intercept + (uint64_t)(i * scaled_slope / MonoColReader::MONOTONIC_SLOPE_SCALE);
-      int64_t delta = expected - arr[i];
+      uint64_t expected = intercept + (uint64_t)(i * scaled_slope / MonoReader::SLOPE_SCALE);
+      int64_t delta = arr[i] - expected;
       minDelta = std::min(minDelta, delta);
       maxDelta = std::max(maxDelta, delta);
     }
 
     auto bits = std::bit_width(uint64_t(maxDelta - minDelta));
-    if (bits > sizeof(int32_t)) {
-      // We should only need more than 32 bits if individual values can be more than 32 bits in size.
-      // This currently isn't the case.
-      throw std::runtime_error(std::format("MonotonicWriter: monotonic delta too large: slope={} minDelta={} maxDelta={}",
-                                           slope, minDelta, maxDelta));
-    }
-
     // We could zig-zag encode to make all of the deltas positive, but we can save a little by just
     // lowering the intercept by minDelta.  Although this will raise the average delta, it should not
     // change the maximum number of bits needed to represent the largest.
     intercept += minDelta;
+    blockInfo.push_back({out.size(), scaled_slope, intercept, (uint8_t)bits});
 
-    // Currently or For codec can only handle 32 bit integers, so we need to make a copy.
+    if (bits > 32) {
+      out.write((const char*)arr.data(), arr.size() * sizeof(int64_t));
+      return;
+    }
+
+    // Currently our For codec can only handle 32 bit integers, so we need to make a copy.
     // We should make a version that can accept 64 bit integers that just use the lower half.
     ivalues.reserve(arr.size());
     ivalues.resize(0);
     for (size_t i=0; i<arr.size(); i++) {
-      uint64_t expected = intercept + (uint64_t)(i * scaled_slope / BLOCK_SIZE);
-      uint32_t delta = (uint32_t)(expected - arr[i]);
-      assert(delta >= 0);
-      assert((uint64_t(scaled_slope * i) / MonoColReader::MONOTONIC_SLOPE_SCALE) + delta == arr[i]);
+      uint64_t expected = intercept + (uint64_t)(i * scaled_slope / MonoReader::SLOPE_SCALE);
+      uint32_t delta = (uint32_t)(arr[i] - expected);
+      // if bits=32, this assert may not be true (and we changed delta to be unsigned to account for this)
+      // assert(delta >= 0);
+      assert((uint64_t(scaled_slope * i) / MonoReader::SLOPE_SCALE) + delta + intercept == arr[i]);
       ivalues.push_back(delta);
     }
 
@@ -289,7 +279,8 @@ public:
     metaLoc = seg_location(out.streamNumber, out.size());
 
     // the number of blocks can be derived from nAdded.
-    out.write((const char*)blockInfo.data(), blockInfo.size() * sizeof(IntColReader::NumericBlockInfo));
+    out.write((const char*)blockInfo.data(), blockInfo.size() * sizeof(MonoReader::BlockInfo));
+    return nAdded;
   }
 
 };
