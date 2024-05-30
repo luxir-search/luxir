@@ -96,7 +96,7 @@ int main(int argc, char **argv) {
   if (help) {
     std::cout << std::endl
               << "Solux unit tests and benchmarks combined.  When running unit tests, benchmarks are also" << std::endl
-              << "run with a smaller minTime to make them quick.  Override this by passing --benchmark_min_time=Ns."  << std::endl
+              << "run with with --benchmark_min_time=1x to make them quick.  Override this by passing --benchmark_min_time=Ns."  << std::endl
               << "One can also run benchmarks only with normal google benchmark defaults by passing --bench."  << std::endl
               << "Even when running benchmarks only, some google test flags are still honored, such as " << std::endl
               << "--gtest_break_on_failure for debugging." << std::endl
@@ -180,8 +180,8 @@ TEST(Benchmarks, all) {
 
     if (!hasMinTime && solux::unit_tests) {
       // turn down the time it takes to run tests if the benchmarks are just being run as part of unit tests
-      myargv.push_back(const_cast<char *>("--benchmark_min_time=.01s"));
-      std::cout << "\tNOTE: setting --benchmark_min_time=.01s" << std::endl;
+      myargv.push_back(const_cast<char *>("--benchmark_min_time=1x"));
+      std::cout << "\tNOTE: setting --benchmark_min_time=1x" << std::endl;
     }
 
     // TODO: should we use file instead of console output when running benchmarks as a unit test?
