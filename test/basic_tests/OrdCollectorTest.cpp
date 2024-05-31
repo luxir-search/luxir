@@ -19,6 +19,8 @@ TEST_F(OrdCollectorTest, basic) {
   oc.add(4, 17);
   oc.add(1, 19);
 
+  ASSERT_TRUE(oc.multiValued());
+
   ASSERT_FALSE(oc.hasValues(0));
   ASSERT_TRUE(oc.hasValues(1));
   ASSERT_TRUE(oc.hasValues(2));

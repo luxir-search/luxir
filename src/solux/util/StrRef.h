@@ -322,7 +322,6 @@ inline int operator<=>(const PackedTerm &p, const StringType &s) noexcept {
 }
 
 // Hashers and Comparators to use for heterogeneous lookup.
-// don't do const char* versions since we are dealing with binary data
 struct PackedTermHash {
   using is_transparent = void;
   size_t operator()(const char* data, size_t len) const noexcept {
@@ -339,6 +338,9 @@ struct PackedTermHash {
   }
   size_t operator()(std::string_view str) const noexcept {
     return (*this)(str.data(), str.size());
+  }
+  size_t operator()(const char* str) const noexcept {
+    return (*this)((std::string_view)str);
   }
 };
 

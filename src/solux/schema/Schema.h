@@ -1,15 +1,16 @@
 #pragma once
 
-
+#include "boost/unordered/unordered_flat_map.hpp"
 #include "FieldType.h"
-#include "gtl/phmap.hpp"
+#include "solux/util/StrRef.h"
+
 
 namespace solux {
 
 // Schema objects are currently immutable.
 class Schema {
 public:
-  using map_type = gtl::flat_hash_map<std::string, std::shared_ptr<FieldType>>;
+  using map_type = boost::unordered_flat_map<std::string, std::shared_ptr<FieldType>, PackedTermHash, PackedTermEqual>;
   using iterator = map_type::iterator;
   using const_iterator = map_type::const_iterator;
 
@@ -70,7 +71,9 @@ public:
     // id, _i, _s, _w, _wl
     schema->fieldTypeMap["id"] = std::make_shared<StrFieldType>("id");
     schema->fieldTypeMap["_s"] = std::make_shared<StrFieldType>("_s");
+    schema->fieldTypeMap["_ss"] = std::make_shared<StrFieldType>("_ss", FieldType::INDEX_DOCS | FieldType::MULTI_VALUED);
     schema->fieldTypeMap["_i"] = std::make_shared<IntFieldType>("_i");
+    schema->fieldTypeMap["_i"] = std::make_shared<IntFieldType>("_is", FieldType::INDEX_DOCS | FieldType::MULTI_VALUED);
     schema->fieldTypeMap["_w"] = std::make_shared<TextFieldType>("_w");
     schema->fieldTypeMap["_wl"] = std::make_shared<TextFieldType>("_wl");  // hacky code in TextFieldType will look at name to produce different token chains
     return schema;

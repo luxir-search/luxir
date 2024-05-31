@@ -335,6 +335,44 @@ public:
 } SOLUX_PACKED_END;
 
 
+SOLUX_PACKED_START
+class IntDeltaStream {
+public:
+  Stream storage;
+  int32_t lastVal;
+
+  IntDeltaStream(MemPool &pool) : lastVal(0) {
+    unused(pool);
+  }
+
+  IntDeltaStream(MemPool &pool, int32_t val) : lastVal(val) {
+    storage.writeVInt(pool, val);
+  }
+
+  IntDeltaStream(const IntStream &) = delete;
+  void operator=(const IntStream &) = delete;
+
+  void addVal(MemPool &pool, int32_t val) {
+    assert(val >= lastVal);
+    int32_t code = val - lastVal;
+    storage.writeVInt(pool, code);
+    lastVal = val;
+  }
+
+  /// Calls sink(int32_t val)
+  template <class PostingsConsumer>
+  void pushValues(MemPool& pool, PostingsConsumer&& sink) {
+    StreamReader vstream(storage, pool);
+    int32_t prev = 0;
+    while (!vstream.eof()) {
+      int32_t code = vstream.readVint();
+      int32_t val = prev + code;
+      prev = val;
+      sink(val);
+    }
+  }
+} SOLUX_PACKED_END;
+
 // list of integers
 SOLUX_PACKED_START
 class LongStream {

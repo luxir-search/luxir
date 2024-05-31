@@ -13,6 +13,7 @@ class OrdCollector {
   MemPool& pool;
   // This isn't good for sparse fields... we should probably have a version that uses a hash table as well.
   std::vector<int32_t> ords;
+  bool multiValued_ = false; // multiple values encountered for a docid?
 public:
   OrdCollector(MemPool& pool, int32_t numDocs) : pool(pool), ords(numDocs)
   {}
@@ -32,6 +33,7 @@ public:
       int streamAddr = v & 0x7fffffff;
       stream = (IntDeltaStream*)pool.ptr(streamAddr);
     } else {
+      multiValued_ = true;
       // need to convert from a single value to a stream
       auto [ptr, streamAddr] = pool.allocateAddrs(sizeof(IntDeltaStream));  // IntDeltaStream is current 22 bytes, relatively heavyweight.
       stream = new (ptr) IntDeltaStream(pool);
@@ -43,6 +45,10 @@ public:
 
   bool hasValues(int32_t docid) const {
     return ords[docid] != 0;
+  }
+
+  bool multiValued() const {
+    return multiValued_;
   }
 
   // calls acceptor(int32_t ord) for each ord for the given docid

@@ -262,9 +262,9 @@ public:
     // Postings::numericCodec.encodeBlock((uint32_t*)ivalues.data(), ivalues.size(), compressed_output.data(), compressedSize);
     Postings::numericCodec.encodeWithMeta((uint32_t*)ivalues.data(), ivalues.size(), compressed_output.data(), compressedSize, 0, bits);
     out.write(compressed_output.data(), compressedSize);
-    // SIMDFor implementation can read up to 31 extra bytes after the end of compressedSize.
-    // In this case we are fine because we write extra info after the last block (like BlockInfo array) which
-    // is always larger than that.  See SoluxSIMDFor comment.
+    // SIMDFor implementation can read up to 31 extra bytes after the end of compressedSize.  See SoluxSIMDFor comment.
+    // TODO: FIXME just a single MonoReader::BlockInfo that come after the blocks may not be enough!
+    // We could always pad the end of a file rather than pad each field.
   }
 
   // returns number of values written and sets metadata to be read.

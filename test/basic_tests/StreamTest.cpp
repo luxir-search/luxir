@@ -104,4 +104,17 @@ TEST_F(StreamTest, randStream) {
   }
 }
 
+TEST_F(StreamTest, deltStream) {
+  MemPool pool;
+  IntDeltaStream stream(pool);
+
+  stream.addVal(pool, 7);
+  stream.addVal(pool, 11);
+  stream.addVal(pool, 23);
+
+  int32_t sum = 0;
+  stream.pushValues(pool, [&](int32_t val){ sum += val; });
+  ASSERT_EQ(7 + 11 + 23, sum);
+}
+
 } // end namespace

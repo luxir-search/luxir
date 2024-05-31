@@ -119,6 +119,7 @@ public:
     int64_t max;
     int64_t decodedStart = -1;
     int64_t decodedMax = 0;
+    // OPT: when max < BULK_DECODE, we don't need this much space.  We could pool allocate if we need to save more memory.
     int64_t decoded[BULK_DECODE];
   public:
 
@@ -211,11 +212,9 @@ public:
       return doc;
     }
 
-    /*** Don't expose this unless needed ... it could be tough to implement for some encodings!
     int32_t rank() {
       return docRank;
     }
-    */
 
     int64_t value() {
       return valueIter.valueAt(docRank);
@@ -259,9 +258,8 @@ public:
  using BulkIterator = DocIterator<BulkValues>;  // decodes blocks of values (good for iterating or small skipping)
  using Iterator = BulkIterator;
 
-  // class MonotonicReader
-
 };
+
 
 // Monotonic int col.  Currently supports 32 bit indexes and 64 bit outputs.
 class MonoReader {

@@ -92,14 +92,24 @@ public:
     virtual void index(Inverter& inverter, char* mutableVal, int len) {
       unused(inverter, mutableVal, len);
     }
+    virtual void index(Inverter& inverter, std::span<const std::string* const> vals) {
+      unused(inverter,vals);
+    }
     virtual void index(Inverter& inverter, int64_t val) {
       unused(inverter, val);
+    }
+    virtual void index(Inverter& inverter, std::span<int64_t> vals) {
+      unused(inverter, vals);
     }
 
     virtual void index(Inverter& inverter, const proto::Val& val) {
       if (val.has_s()) {
         auto &sval = val.s();
         index(inverter, const_cast<char *>(sval.data()), sval.size());  // TODO: get rid of the const-cast
+      } else if (val.has_arr_s()) {
+        auto& arr = val.arr_s().v();
+        std::span<const std::string* const> values(arr.data(), arr.size());
+        index(inverter, values);
       }
     }
 
@@ -334,6 +344,7 @@ public:
 
     // TODO: for unique fields like "id", this could be TermValHash<int32_t>
     TermValHash<DocStream> termsHash;  // the set of terms contained in this field
+    size_t maxValues = 1;  // maximum number of values seen for a single doc
 
   public:
     StringIndexHandler(Inverter &inverter, const std::string_view &fieldName, const std::shared_ptr<FieldType>& fieldType)
@@ -366,7 +377,16 @@ public:
       entry->val().addDoc(termsHash.getMemPool(), inverter.currDoc);
     }
 
+    void index(Inverter& inverter, std::span<const std::string* const> vals) override {
+      for (auto val : vals) {
+        indexSingle(inverter, *val);
+      }
+      maxValues = std::max(maxValues, vals.size());
+    }
+
     void flush(Inverter& inverter) override {
+      auto guard = MemPool::threadLocalPoolGuard();
+
       int32_t numVals = termsHash.size();
       auto full = numVals >= inverter.postingsWriter.getMaxDoc();
 
@@ -378,6 +398,9 @@ public:
       PostingsWriter::IndexFieldInfo& fieldInfo = inverter.getPostingsWriter().fieldInfos.emplace_back();
       fieldInfo.fieldname = fieldName;
       fieldInfo.flags = 0x04; // ord column
+      if (maxValues > 1) {
+        fieldInfo.flags |= (1<<31);  // multi-valued
+      }
 
       // For ordinals, we already know the number of unique terms, so we can use an optimal number of bits right off the bat
       // for dense fields.  Then we could simply memcpy the ordinals into the postings file.
@@ -389,7 +412,7 @@ public:
         auto term = terms[tnum];
         textWriter.startTerm(term);
         // push all the docs for this term to the TextWriter, as well as record the ordinal for each doc
-        term.val().forEachDoc(inverter.pool, [&](int docid) {
+        term.val().forEachDoc(guard.pool(), [&](int docid) {
           // LOG_INFO("WRITE docid={}, tnum={}", docid, tnum);
           textWriter.startDoc(docid);
           textWriter.addPositionDelta(1); // add a dummy position for now since we are using TextWriter, which expects them.
@@ -403,8 +426,8 @@ public:
 
       // Write the ordinals to the postings file.
       {
-        auto guard = inverter.pool.rewindScopeGuard();
-        IntColWriter ordCol(inverter.pool, inverter.postingsWriter, fieldInfo);
+        auto g2 = guard.pool().rewindScopeGuard();
+        IntColWriter ordCol(guard.pool(), inverter.postingsWriter, fieldInfo);
         ordCol.startField();
         for (int docid = 0; docid <= inverter.currDoc; docid++) {
           int32_t ord = docToOrd[docid];
@@ -416,8 +439,8 @@ public:
       }
 
       {
-        auto guard = inverter.pool.rewindScopeGuard();
-        DocsWithValWriter docsWriter(inverter.pool, inverter.postingsWriter, fieldInfo);
+        auto g2 = guard.pool().rewindScopeGuard();
+        DocsWithValWriter docsWriter(guard.pool(), inverter.postingsWriter, fieldInfo);
         if (!full) {
           for (int docid = 0; docid <= inverter.currDoc; docid++) {
             int32_t ord = docToOrd[docid];
