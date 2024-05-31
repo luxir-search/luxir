@@ -150,10 +150,12 @@ public:
     uint32_t fileNum;
   };
 
+  // IndexFieldInfo adds extra info needed at index time to SegFieldInfo.
   struct IndexFieldInfo : public SegFieldInfo {
   };
 
   // These are dequeues so elements don't move
+  // TODO: put these in the pool?
   std::deque<DataFile> files;
   std::deque<IndexFieldInfo> fieldInfos;
 
@@ -233,10 +235,13 @@ private:
       fieldOffs.push_back(fieldLoc - fieldsStart);  // make the location relative so we can append this to a large file if necessary
 
       fieldOutput.writePackedTerm(finfo.fieldname);
+      fieldOutput.writeVint(finfo.type);
       fieldOutput.writeVint(finfo.flags);
       fieldOutput.writeVlong(finfo.docsWithField);
 
-      if ((finfo.flags & 0x01) != 0) {
+      //  nocommit     if ((finfo.flags & 0x01) != 0) {
+      // TODO: we could perhaps also tell by something like nTerms > 0?
+      if ((finfo.flags & FieldType::INDEX_DOCS) != 0) {
         fieldOutput.writeVal(finfo.termBlockIndexLoc);
         fieldOutput.writeVal(finfo.termsLoc);  // TODO: If we change termBlockOffsets to be relative to the start of that index, we can remove termsLoc
         fieldOutput.writeVal(finfo.docsLoc);
@@ -246,11 +251,13 @@ private:
         fieldOutput.writeVlong(finfo.sumTotalTermFreq - finfo.sumDocFreq);  // sumTotalTermFreq >= sumDocFreq
       }
 
-      if ((finfo.flags & 0x02) != 0) {
-        fieldOutput.writeVal(finfo.docsWithFieldEndLoc);
-        fieldOutput.writeVal(finfo.columnLoc);
-        fieldOutput.writeVal(finfo.columnMeta);
-      }
+      // Things that have an int col: text fields (for norms), int col, float col, double col, string col (for ords)
+      // Things that would not have an int col in the future - index only non-text fields, or text fields w/o norms,
+      // or stored-only fields in a column family.  For now, just assume there is always a column.
+      // if ((finfo.flags & 0x02) != 0) {
+      fieldOutput.writeVal(finfo.docsWithFieldEndLoc);
+      fieldOutput.writeVal(finfo.columnLoc);
+      fieldOutput.writeVal(finfo.columnMeta);
     }
 
     // Now write the start of each fieldInfo
@@ -350,9 +357,12 @@ public:
   : postingsWriter(postingsWriter), termOutput(termOutput), docOutput(docOutput),posOutput(posOutput) {
   }
 
+  // TODO: FIXME: this is for tests, but it doesn't set the flags / type properly!
   void startField(const std::string& fieldName) {
     PostingsWriter::IndexFieldInfo* finfo = &postingsWriter.fieldInfos.emplace_back(); // TODO: not thread safe if we start using multiple threads to write text fields
     finfo->fieldname = PackedTerm(postingsWriter.pool, fieldName); // also not thread safe
+    finfo->type = FieldType::TEXT;
+    finfo->flags = FieldType::INDEX_DOCS_FREQS_POSITIONS;
     startField(finfo);
   }
 
@@ -362,7 +372,7 @@ public:
     docsLoc = docOutput.size();
     posLoc = posOutput.size();
     numTerms = 0;
-    fieldInfo->flags |= 0x01;  // text field
+    // nocommit fieldInfo->flags |= 0x01;  // text field
 
     termBlockOffsets.resize(0);
 

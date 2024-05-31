@@ -12,6 +12,7 @@
 #include <charconv>
 #include <solux/util/screaming.h>
 #include <filesystem>
+#include <solux/schema/FieldType.h>
 #include "solux/store/Directory.h"
 #include "solux/store/InputStream.h"
 #include "solux/util/MemPool.h"
@@ -250,6 +251,8 @@ public:
 
 struct SegFieldInfo {
   PackedTerm fieldname;
+  FieldType::Type type;  // really only need a byte here
+  int32_t flags;
   seg_location termBlockIndexLoc;  // location of index into the terms blocks
   seg_location termsLoc;
   seg_location docsLoc;
@@ -273,8 +276,6 @@ struct SegFieldInfo {
 
   seg_location monoMeta;     // monotonic int column metadata
   seg_location monoLoc;
-
-  int32_t flags = 0;  // temporary... currently has type info. 0x01 text, 0x02 int col, 0x04 indexed str col.  In the future, we should decompose and have separate sections for each type
 };
 
 
@@ -365,9 +366,10 @@ public:
     if (!fieldInfoRead) {
       fieldInfoRead = true;
       fieldInfo.fieldname = fieldname;
+      fieldInfo.type = static_cast<FieldType::Type>(fieldIS.readVint());
       fieldInfo.flags = fieldIS.readVint();
       fieldInfo.docsWithField = fieldIS.readVint();
-      if (fieldInfo.flags & 0x01) {
+      if (fieldInfo.flags & FieldType::INDEX_DOCS) {
         fieldInfo.termBlockIndexLoc = fieldIS.readVal<seg_location>();
         fieldInfo.termsLoc = fieldIS.readVal<seg_location>();
         fieldInfo.docsLoc = fieldIS.readVal<seg_location>();
@@ -376,13 +378,10 @@ public:
         fieldInfo.sumDocFreq = fieldInfo.nTerms + fieldIS.readVlong();
         fieldInfo.sumTotalTermFreq = fieldInfo.sumDocFreq + fieldIS.readVlong();
       }
-      if (fieldInfo.flags & 0x02) {
-        fieldInfo.docsWithFieldEndLoc = fieldIS.readVal<seg_location>();
-        fieldInfo.columnLoc = fieldIS.readVal<seg_location>();
-        fieldInfo.columnMeta = fieldIS.readVal<seg_location>();
-      } else {
-        // ?
-      }
+
+      fieldInfo.docsWithFieldEndLoc = fieldIS.readVal<seg_location>();
+      fieldInfo.columnLoc = fieldIS.readVal<seg_location>();
+      fieldInfo.columnMeta = fieldIS.readVal<seg_location>();
     }
   }
 

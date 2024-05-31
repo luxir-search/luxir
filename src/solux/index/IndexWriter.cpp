@@ -164,17 +164,25 @@ private:
     // TODO: check if fields are compatible!
     // TODO: gather other stats to help us build the field (like if it's a dense field!)
     int32_t allFlags = 0;
+    FieldType::Type type = FieldType::Type::NONE;
     for (auto* field : sortedFields) {
+      if (type == FieldType::Type::NONE) {
+        type = field->segFieldInfo.type;
+      } else if (type != field->segFieldInfo.type) {
+        LOG_ERROR("Field types don't match! {} {}", (int)type, (int)field->segFieldInfo.type);
+        // now what?
+      }
       allFlags |= field->segFieldInfo.flags;
     }
 
     // get/reserve a new fieldInfo from the postingsReader
     PostingsWriter::IndexFieldInfo& outputFieldInfo = postingsWriter.fieldInfos.emplace_back();
     outputFieldInfo.fieldname = sortedFields[0]->segFieldInfo.fieldname;  // we should ensure out postingsWriter outlives the lifetime of the postings readers!
-    outputFieldInfo.flags = 0;
+    outputFieldInfo.type = type;
+    outputFieldInfo.flags = allFlags;
 
     // if this is a string column, we need to collect the ordinals for each doc
-    bool isOrdCol = (allFlags & 0x04) != 0;
+    bool isOrdCol = (type == FieldType::Type::STRING);
     std::vector<int32_t> docToOrd;
     if (isOrdCol) {
       docToOrd.resize(nDocs);
@@ -182,9 +190,9 @@ private:
 
     MemPool readerPool; // TODO: can this be the same as writerPool?
 
-    if (allFlags & 0x01) {
+    if (allFlags & FieldType::INDEX_DOCS) {
       auto readerPoolGuard = readerPool.rewindScopeGuard();
-      outputFieldInfo.flags |= 0x01;
+      // nocommit outputFieldInfo.flags |= 0x01;
       TextWriter textWriter(postingsWriter);
       textWriter.startField(&outputFieldInfo);
 
@@ -254,7 +262,7 @@ private:
 
 
     if (isOrdCol) {
-      outputFieldInfo.flags |= 0x04;
+      // nocommit outputFieldInfo.flags |= 0x04;
 
       // Write the ordinals to the postings file.
       // This is pretty much repeated code from Inverter::StringIndexHandler
@@ -293,8 +301,9 @@ private:
         }
       }
 
-    } else if (allFlags & 0x02) { // int column (ordCol will currently have this flag set too, hense the else-if)
-      outputFieldInfo.flags |= 0x02;
+    // nocommit } else if (allFlags & 0x02) { // int column (ordCol will currently have this flag set too, hense the else-if)
+    } else { // int column that is not an ord column (assume all other field types have this (currently true)
+      // nocommit outputFieldInfo.flags |= 0x02;
       IntColWriter intColWriter(writerPool, postingsWriter, outputFieldInfo);
       intColWriter.startField();
 

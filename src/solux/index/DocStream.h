@@ -104,7 +104,8 @@ public:
     }
   }
 
-  // Method that takes a lambda to call for each docid
+  /// Calls f(int docid) for each doc.
+  /// The pool passed here must be the same pool used to build the stream.
   template <class F>
   void forEachDoc(MemPool& pool, F f) {
     int runPtr = -1;

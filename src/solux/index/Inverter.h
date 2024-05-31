@@ -168,13 +168,15 @@ public:
 
       // TODO: move this to postingsWriter method
       PostingsWriter::IndexFieldInfo& fieldInfo = postingsWriter.fieldInfos.emplace_back();
+      fieldInfo.fieldname = fieldName;
+      fieldInfo.type = fieldType->type();
+      fieldInfo.flags = fieldType->flags_;
       flushIntCol(inverter, fieldInfo);
     }
 
     // This is the version called directly from text field for norms
     void flushIntCol(Inverter& inverter, PostingsWriter::IndexFieldInfo& fieldInfo) {
       PostingsWriter& postingsWriter = inverter.getPostingsWriter();
-      fieldInfo.fieldname = fieldName;
       auto full = numVals >= postingsWriter.getMaxDoc();
 
       // push values
@@ -319,6 +321,8 @@ public:
       TextWriter textWriter(inverter.getPostingsWriter());
       PostingsWriter::IndexFieldInfo& fieldInfo = inverter.getPostingsWriter().fieldInfos.emplace_back();
       fieldInfo.fieldname = fieldName;
+      fieldInfo.type = fieldType->type();
+      fieldInfo.flags = fieldType->flags_;
 
       textWriter.startField(&fieldInfo);
       for (size_t tnum=0; tnum<sz; tnum++) {
@@ -397,10 +401,10 @@ public:
       TextWriter textWriter(inverter.getPostingsWriter());
       PostingsWriter::IndexFieldInfo& fieldInfo = inverter.getPostingsWriter().fieldInfos.emplace_back();
       fieldInfo.fieldname = fieldName;
-      fieldInfo.flags = 0x04; // ord column
-      if (maxValues > 1) {
-        fieldInfo.flags |= (1<<31);  // multi-valued
-      }
+      fieldInfo.type = fieldType->type();
+      fieldInfo.flags = fieldType->flags_;
+      // nocommit fieldInfo.flags = 0x04; // ord column
+
 
       // For ordinals, we already know the number of unique terms, so we can use an optimal number of bits right off the bat
       // for dense fields.  Then we could simply memcpy the ordinals into the postings file.
@@ -412,7 +416,7 @@ public:
         auto term = terms[tnum];
         textWriter.startTerm(term);
         // push all the docs for this term to the TextWriter, as well as record the ordinal for each doc
-        term.val().forEachDoc(guard.pool(), [&](int docid) {
+        term.val().forEachDoc(inverter.pool, [&](int docid) {
           // LOG_INFO("WRITE docid={}, tnum={}", docid, tnum);
           textWriter.startDoc(docid);
           textWriter.addPositionDelta(1); // add a dummy position for now since we are using TextWriter, which expects them.

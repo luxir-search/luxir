@@ -15,6 +15,7 @@ namespace solux {
 class FieldType {
 public:
   enum Type {
+    NONE=0,
     STRING,   // unanalyzed string field
     TEXT,     // analyzed text field (if indexed)
     BIN,      // binary field
@@ -36,7 +37,7 @@ public:
   int flags_;
 
   // constructor
-  FieldType(std::string_view name, FieldType::Type type, bool multiValued=false, int flags=0) :
+  FieldType(std::string_view name, FieldType::Type type, bool multiValued, int flags) :
     name_(name), type_(type), flags_(flags) {
     if (multiValued) {
       flags_ |= MULTI_VALUED;
@@ -74,7 +75,7 @@ public:
 class TextFieldType : public FieldType {
   // TODO: optional list of token filters, etc...
 public:
-  TextFieldType(std::string_view name, int flags=INDEX_DOCS_FREQS_POSITIONS) : FieldType(name, FieldType::TEXT, flags) {}
+  TextFieldType(std::string_view name, bool multiValued = false, int flags=INDEX_DOCS_FREQS_POSITIONS) : FieldType(name, FieldType::TEXT, multiValued, flags) {}
 
   // Right now, our analyzer only consists of a TokenChain.  We could either fold other analyzer methods into TextFieldType, or
   // fill out an Analyzer class (only needed if it needs state of its own?)

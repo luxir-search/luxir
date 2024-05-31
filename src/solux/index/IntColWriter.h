@@ -39,7 +39,7 @@ public:
     // bool allDocsHaveValue = nAdded == postingsWriter.getMaxDoc();
 
     // FUTURE:write index into value blocks here
-    fieldInfo.flags |= 0x02;  // int64 values
+    // nocommit fieldInfo.flags |= 0x02;  // int64 values
     fieldInfo.docsWithField = nAdded;
     fieldInfo.columnLoc = seg_location(colOutput.streamNumber, colStart);
     return nAdded;
@@ -170,7 +170,7 @@ public:
     // the number of blocks can be derived from nAdded.
     colOutput.write((const char*)blockInfo.data(), blockInfo.size() * sizeof(IntColReader::NumericBlockInfo));
 
-    fieldInfo.flags |= 0x02;  // int64 values
+    // nocommit fieldInfo.flags |= 0x02;  // int64 values
     fieldInfo.docsWithField = nAdded;
     fieldInfo.columnLoc = seg_location(colOutput.streamNumber, colStart);
     return nAdded;
