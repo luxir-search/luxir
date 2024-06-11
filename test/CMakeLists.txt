@@ -20,4 +20,4 @@ endif()
 
 set(SOLUX_TMP "$ENV{TMP}/solux")
 file(MAKE_DIRECTORY ${SOLUX_TMP})
-download("${SOLUX_TMP}/book.txt" http://www.gutenberg.org/files/2600/2600-0.txt 18431bda910e27c8bf15df63a67b15bbe3d1acf104b402e81af9a464ed2a8622)
+download("${SOLUX_TMP}/book.txt" http://www.gutenberg.org/files/2600/2600-0.txt e4bcf9042609b62c7de72a6f1b311f54c412943a9d641b7efcf79a464b5f31c8)
