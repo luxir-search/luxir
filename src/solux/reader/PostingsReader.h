@@ -293,14 +293,14 @@ class FieldReader {
   int32_t currField = -1;
   uint32_t* fieldOffsets;  // the array of field offsets, written by PostingsWriter::writeFieldIndex()
   int64_t fieldOffsetsLoc; // location in the file of the above array
-  PostingsReader& postingsReader;
 
   PackedTerm fieldname{nullptr};
   bool fieldInfoRead = false;      // has field metadata been read for this field?
 
   // TODO: field number?
 public:
-  FieldReader(MemPool& pool, PostingsReader& postingsReader) : postingsReader(postingsReader) {
+  FieldReader(MemPool& pool, PostingsReader& postingsReader) {
+    unused(pool);
     fieldIS = postingsReader.getInputStream(1); // TODO: temporary
     fieldIS.seek(fieldIS.size() - sizeof(int32_t));
     fieldOffsetsLoc = fieldIS.offset();
@@ -310,7 +310,9 @@ public:
     fieldOffsetsLoc -= nFields * sizeof(uint32_t);
   }
 
-  FieldReader(MemPool& pool, PostingsReader& postingsReader, const InputStream& is) : postingsReader(postingsReader), fieldIS(is) {};
+  FieldReader(MemPool& pool, PostingsReader& postingsReader, const InputStream& is) : fieldIS(is) {
+    unused(pool, postingsReader);
+  };
 
   int32_t numFields() {
     return nFields;

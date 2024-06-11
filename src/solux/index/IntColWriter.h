@@ -236,7 +236,7 @@ public:
     // lowering the intercept by minDelta.  Although this will raise the average delta, it should not
     // change the maximum number of bits needed to represent the largest.
     intercept += minDelta;
-    blockInfo.push_back({out.size(), scaled_slope, intercept, (uint8_t)bits});
+    blockInfo.push_back({out.size(), scaled_slope, (int32_t)intercept, (uint8_t)bits});
 
     if (bits > 32) {
       out.write((const char*)arr.data(), arr.size() * sizeof(int64_t));
@@ -252,7 +252,7 @@ public:
       uint32_t delta = (uint32_t)(arr[i] - expected);
       // if bits=32, this assert may not be true (and we changed delta to be unsigned to account for this)
       // assert(delta >= 0);
-      assert((uint64_t(scaled_slope * i) / MonoReader::SLOPE_SCALE) + delta + intercept == arr[i]);
+      assert(intercept + (uint64_t(scaled_slope * i) / MonoReader::SLOPE_SCALE) + delta == arr[i]);
       ivalues.push_back(delta);
     }
 

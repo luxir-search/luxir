@@ -51,6 +51,7 @@ protected:
 
     memcpy(buffer.get(), encoded.data(), encoded.size());
     auto bytesRead = codec.decodeBlock(buffer.get(), encoded.size(), (uint32_t*)decoded.data(), decodedSize);
+    unused(bytesRead);
     ASSERT_EQ(decodedSize, values.size());
     // ASSERT_EQ(bytesRead, encoded.size());  // this isn't always true! must be a bug in underlying codec.
     ASSERT_EQ(values, decoded);
@@ -58,7 +59,7 @@ protected:
 
   void select() {
     // select
-    for (int i = 0; i < values.size(); i++) {
+    for (uint32_t i = 0u; i < values.size(); i++) {
       auto val = codec.select(buffer.get(), values.size(), i);
 
       /* for directly testing SIMDFrameOfReference:
@@ -68,26 +69,26 @@ protected:
       auto val = c.select((uint32_t*)buf, i);
       */
 
-      if (val != values[i]) {
+      if ((int32_t)val != values[i]) {
         LOG_ERROR("i={} val={} values[i]={} arr_size={}", i, val, values[i], values.size());
         // put debugger here:
         // val = codec.select(encoded.data(), values.size(), i);
       }
-      ASSERT_EQ(val, values[i]);
+      ASSERT_EQ((int32_t)val, values[i]);
     }
   }
 
   template <typename T>  // int64_t vs uint64_t
-  int bitWidth(T* values, int nvalues) {
+  int bitWidth(T* vals, int nvalues) {
     // test gcd
-    auto g = values[0];
-    auto min = values[0];
-    auto max = values[0];
+    auto g = vals[0];
+    auto min = vals[0];
+    auto max = vals[0];
     for (int i = 0; i < nvalues; i++) {
-      LOG_INFO("\t\tvalues[{}]={:x}", i, values[i]);
-      g = std::gcd(g, values[i]);
-      min = std::min(min, values[i]);
-      max = std::max(max, values[i]);
+      LOG_INFO("\t\tvalues[{}]={:x}", i, vals[i]);
+      g = std::gcd(g, vals[i]);
+      min = std::min(min, vals[i]);
+      max = std::max(max, vals[i]);
     }
     auto bits = std::bit_width(uint64_t((max - min)/g));
     LOG_INFO("\tgcd={:x} min={:x} max={:x} max-min={:x} max/gcd={:x} min/gcd={:x} (max-min)/gcd={:x} bits={}",

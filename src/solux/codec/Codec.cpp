@@ -250,7 +250,7 @@ static void __decodeBlock(uint32_t *in, size_t &length, uint32_t *out) {
   // for (uint32_t run = 0; run < nvalue / BlockSize; ++run, out += BlockSize) {
     const uint8_t b = *bytep++;
     const uint8_t cexcept = *bytep++;
-    for (int k = 0; k < BlockSize; k += 128) {
+    for (uint32_t k = 0; k < BlockSize; k += 128) {
       if (arraydispatch)  /// hmmm, is this switched? -YCS
         SIMDCompressionLib::simdunpack(reinterpret_cast<const __m128i *>(in), out + k, b);
       else

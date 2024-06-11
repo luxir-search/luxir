@@ -693,6 +693,7 @@ TEST_F(GrpcIndexTest, threadsafeIndex) {
   };
 
   ResponseChecker respc3 = [&](int64_t docid, const solux::proto::SearchResponse& response) {
+    unused(docid);
     auto& docList = response.ops().at("q").docs();
     // because responses are streaming and not necessarily in order across different logical requests,
     // we need to get the number used to generate the query from the request id

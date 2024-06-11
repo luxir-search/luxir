@@ -211,7 +211,7 @@ public:
       holder->segmentsMerged++;
 
       for(;;) {
-        bool allSegsMerged = (holder->segmentsMerged == req.reader->segments().size());
+        bool allSegsMerged = (size_t(holder->segmentsMerged) == req.reader->segments().size());
         holder = collectorHolder.exchange(holder);
         if (holder == nullptr) {
           return allSegsMerged;
@@ -222,7 +222,7 @@ public:
           holder = mergeCollector(holder, other);
         }
       }
-      [[unreachable]];
+      // [[unreachable]];
     }
 
     void collect(int32_t segnum) {
@@ -255,7 +255,7 @@ public:
     }
 
     void start(oneapi::tbb::task_group* tg) {
-      for (int32_t i=0; i<req.reader->segments().size(); i++) {
+      for (int32_t i=0; (int32_t)i<req.reader->segments().size(); i++) {
         task_group_run(tg, [this, i]() {
           this->collect(i);
         });
@@ -533,6 +533,7 @@ public:
       // if this is the last response, just return.  Otherwise, we need to send the response and continue.
       if (!lastResponse) {
         auto numBuffered = qr.req.reply(response);
+        unused(numBuffered);
         // This code currently serializes the produce-batch, send-batch loop.
         // We could get better throughput by loading the fields for multiple batches at once.
         // TODO: we also need some flow control to limit the number of buffered responses.
@@ -570,10 +571,9 @@ public:
                   const TopDocsCollector& collector, int64_t offset, const std::span<uint8_t> sortedIdx, const std::span<uint8_t> sortedIdxRunLen, std::span<int64_t> target, int64_t missingVal,
                   oneapi::tbb::task_group* tg)
   {
-    auto& topDocs = collector.topDocs;
-    int start = 0;
+    int32_t start = 0;
     // iterate over the segment runs
-    while (start < sortedIdx.size()) {
+    while (start < (int32_t)sortedIdx.size()) {
       auto runlen = sortedIdxRunLen[start];
       auto segSpan = sortedIdx.subspan(start, runlen);
       task_group_run(tg, [this, &req, field, &fieldType, &collector, offset, segSpan, target, missingVal]() {
@@ -585,6 +585,7 @@ public:
 
 
   void loadIntColSeg(IndexReader& reader, std::string_view field, FieldType& fieldType, const TopDocsCollector& collector, int64_t offset, const std::span<uint8_t> sortedIdx, std::span<int64_t> target, int64_t missingVal) {
+    unused(fieldType);
     // Hmm, we could also just pass in a segment and not the whole reader.
     auto segNum = collector.topDocs[offset + sortedIdx[0]].doc.segment();
     auto& postingsReader = reader.segments()[segNum].postingsReader();
@@ -630,7 +631,6 @@ public:
                   const TopDocsCollector& collector, int64_t offset, const std::span<uint8_t> sortedIdx, const std::span<uint8_t> sortedIdxRunLen, std::span<std::string*> target, std::string_view missingVal,
                   oneapi::tbb::task_group* tg)
   {
-    auto& topDocs = collector.topDocs;
     int start = 0;
     // iterate over the segment runs
     while (start < sortedIdx.size()) {
@@ -646,6 +646,7 @@ public:
 
   // TODO: abstract this better so we have a single function that can be called with a id provider, and a value acceptor.
   void loadStrColSeg(IndexReader& reader, std::string_view field, FieldType& fieldType, const TopDocsCollector& collector, int64_t offset, const std::span<uint8_t> sortedIdx, std::span<std::string*> target, std::string_view missingVal) {
+    unused(fieldType);
     // Hmm, we could also just pass in a segment and not the whole reader.
     auto segNum = collector.topDocs[offset + sortedIdx[0]].doc.segment();
     auto& postingsReader = reader.segments()[segNum].postingsReader();

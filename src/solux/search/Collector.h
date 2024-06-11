@@ -152,7 +152,7 @@ public:
     hitCount++;
     if (score > minCompetitiveVal) {
       topDocs.push_back({score, segdoc(segment, docid)});
-      if (topDocs.size() >= (k<<1)) {
+      if (topDocs.size() >= uint64_t(k<<1)) {
         dropHalf();
       }
     }
@@ -167,7 +167,7 @@ public:
   }
 
   void sort() {
-    if (topDocs.size() > k) {
+    if (topDocs.size() > uint64_t(k)) {
       dropHalf();
     }
     std::sort(topDocs.begin(), topDocs.end(), scoreComp);
