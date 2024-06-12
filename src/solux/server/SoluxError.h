@@ -3,7 +3,7 @@
 #include <memory>
 #include <string>
 #include <exception>
-#include <stacktrace>
+// #include <stacktrace>
 #include "solux/util/log.h"
 
 namespace solux {

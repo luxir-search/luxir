@@ -100,16 +100,19 @@ public:
 };
 
 
-// wrapper around standard allocator that keeps track of all it's pointers
+
 class default_allocator {
-  std::vector<std::unique_ptr<char[]>> pointers;
+  // keep valgrind happy by using a deleter that matches the alignment of the allocation
+  constexpr static auto deleter = [](char* ptr) { operator delete[] (ptr, std::align_val_t(1)); };
+  using ptype = std::unique_ptr<char[], decltype(deleter)>;
+  std::vector<ptype> pointers;
 public:
   default_allocator() {
   }
 
   void *allocate(std::size_t bytes, std::size_t alignment = 1) {
-    void *ptr = new(std::align_val_t(alignment)) char[bytes];
-    pointers.emplace_back(std::unique_ptr<char[]>((char*)ptr));
+    auto ptr = new(std::align_val_t(alignment)) char[bytes];
+    pointers.emplace_back((char*)ptr, deleter);
     return &*pointers.back().get();
   };
 };

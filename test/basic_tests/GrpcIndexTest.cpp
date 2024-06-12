@@ -266,7 +266,7 @@ public:
 
     // we use threads here instead of tasks because there was an issue with task_group::wait
     // stealing work that somehow led to a deadlock.
-    std::unique_ptr<std::thread> threads[nThreads];
+    std::vector<std::unique_ptr<std::thread>> threads(nThreads);
 
     std::atomic_int64_t docsIndexed = 0;
 
@@ -391,13 +391,14 @@ public:
       }
 
     } // end for(;;)
+    unused(additionalReads);
   }
 
 
   void doThreadSafeSearch(int nThreads, int64_t nQueries, int64_t nDocs, RequestCreator& reqCreator, ResponseChecker& respChecker) {
     // we use threads here instead of tasks because there was an issue with task_group::wait
     // stealing work that somehow led to a deadlock.
-    std::unique_ptr<std::thread> threads[nThreads];
+    std::vector<std::unique_ptr<std::thread>> threads(nThreads);
 
     std::atomic_int64_t queries = 0;
 

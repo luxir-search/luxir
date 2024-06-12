@@ -252,7 +252,7 @@ public:
       uint32_t delta = (uint32_t)(arr[i] - expected);
       // if bits=32, this assert may not be true (and we changed delta to be unsigned to account for this)
       // assert(delta >= 0);
-      assert(intercept + (uint64_t(scaled_slope * i) / MonoReader::SLOPE_SCALE) + delta == arr[i]);
+      assert(int64_t((uint64_t(scaled_slope * i) / MonoReader::SLOPE_SCALE) + delta + intercept) == arr[i]);
       ivalues.push_back(delta);
     }
 

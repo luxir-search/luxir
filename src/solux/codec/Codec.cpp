@@ -196,7 +196,7 @@ constexpr auto arraydispatch = true;  // doesn't seem to matter much.
   for (uint32_t run = 0; run < nvalue / BlockSize; ++run, out += BlockSize) {
     const uint8_t b = *bytep++;
     const uint8_t cexcept = *bytep++;
-    for (int k = 0; k < BlockSize; k += 128) {
+    for (uint32_t k = 0; k < BlockSize; k += 128) {
       if (arraydispatch)  /// hmmm, is this switched? -YCS
         SIMDCompressionLib::simdunpack(reinterpret_cast<const __m128i *>(in), out + k, b);
       else
@@ -280,6 +280,7 @@ static void __decodeBlock(uint32_t *in, size_t &length, uint32_t *out) {
 }
 
 inline static uint32_t decBlock(const char* in, uint32_t inSz, uint32_t* out, uint32_t& outSz) {
+  unused(inSz);
   /* Not needed when we are using our own stack based bit-packer */
 /*
   auto codec = soluxPfor.get();

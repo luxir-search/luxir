@@ -138,6 +138,7 @@ public:
 
   uint32_t
   decodeWithMeta(const char* encoded, uint32_t inSz, uint32_t* out, uint32_t& outSz, uint32_t minval, uint8_t bits) {
+    unused(inSz);
     const uint32_t* in = (const uint32_t*) encoded;
     for (uint32_t k = 0; k < outSz / 128; ++k) {
       simdunpackFOR(minval, (const __m128i*) (in + 4 * bits * k), out + 128 * k, bits);
@@ -210,7 +211,8 @@ public:
 
   // nValues is the number of values in this specific block, not necessarily our large block size of 16K
   // It's needed when tail-compression (partial block) is different than block compression.
-  uint32_t select(const char* compressed, uint32_t nValues, uint32_t index) {
+  uint32_t select(const char* compressed, uint32_t nValues, uint32_t index) override {
+    unused(nValues);
     // This is adapted from SIMDCompressionLib::SIMDFrameOfReference::select
     uint32_t* in = (uint32_t*) compressed;
     // uint32_t length = *in;
@@ -247,6 +249,7 @@ public:
 
   inline uint32_t selectWithMeta(const char* compressed, uint32_t blockSize, uint32_t index, uint32_t minval, uint8_t bits) {
     // This is adapted from SIMDCompressionLib::SIMDFrameOfReference::select
+    unused(blockSize);
     uint32_t* in = (uint32_t*) compressed;
     if (bits == 32) {
       return in[index];
@@ -297,6 +300,7 @@ public:
 
   // blockSize is the number of values in this specific block, not necessarily our large block size of 16K
   uint32_t select(const char* compressed, uint32_t blockSize, uint32_t index) override final {
+    unused(blockSize);
     return codec.select((uint32_t*)compressed,  index);
   }
 };
@@ -338,6 +342,7 @@ public:
 
 
   uint32_t select(const char* compressed, uint32_t blockSize, uint32_t index) override {
+    unused(blockSize);
     // check if Type is SIMDCompressionLib::ForCODEC
     if constexpr (std::is_same<Type, SIMDCompressionLib::ForCODEC>::value) {
       return getCodec().select((uint32_t*) compressed, index);

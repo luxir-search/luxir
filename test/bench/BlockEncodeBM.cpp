@@ -51,7 +51,7 @@ static void BM_blockDecode(benchmark::State& state, std::string codecName, uint3
   encoded.resize(maxValues.size());
   decoded.resize(maxValues.size());
 
-  for (auto i = 0; i<maxValues.size(); i++) {
+  for (auto i = 0u; i<maxValues.size(); i++) {
     values[i].resize(nvalues);
     decoded[i].resize(nvalues);
     encoded[i].resize(nvalues*sizeof(uint32_t) * 2);  // may result in SIMDCompressionLib::NotEnoughStorage if not big enough
@@ -66,9 +66,9 @@ static void BM_blockDecode(benchmark::State& state, std::string codecName, uint3
 
   for (auto _ : state) {
 
-    for (int i=0; i<maxValues.size(); i++) {
+    for (auto i=0u; i<maxValues.size(); i++) {
       if (testSelect) {
-        for (int j=0; j<10; j++) {
+        for (auto j=0u; j<10; j++) {
           // single value decode
           size_t which = rng.rint(blockSize);
           // dynamic cast to IntegerCODECTypeWrapper<SIMDCompressionLib::SIMDFrameOfReference>>

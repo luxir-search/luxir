@@ -441,7 +441,7 @@ public:
         HelloReply* response = google::protobuf::Arena::CreateMessage<HelloReply>(arena);
         fillResponse(response, request, i+1);
         respond(response,
-                [this](auto* response) { releaseArena(response->GetArena()); },
+                [](auto* response) { releaseArena(response->GetArena()); },
                 0);  // never call with >0 here since we don't know the order of execution and that could end things prematurely.
       });
     }

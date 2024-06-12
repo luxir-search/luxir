@@ -541,7 +541,7 @@ public:
     //   - try it as a do-while loop... easier branch prediction?
 
     // try and catch unoptimal prefix compression (we had a bug before)
-    assert(prefixLen == len || data[prefixLen] != *termsIS.ptr());
+    assert(uint32_t(prefixLen) == len || data[prefixLen] != *termsIS.ptr());
 
     termsIS.read(const_cast<char*>(data + prefixLen), suffixLen);
     currTerm.setSize(prefixLen + suffixLen);
@@ -720,6 +720,7 @@ public:
            int32_t* docsScratch=nullptr, int32_t* posScratch=nullptr, int32_t* tfreqScratch=nullptr)
   : postingsReader(postingsReader), pool(&pool), fieldInfo(tenum.fieldInfo)
   {
+    unused(docsScratch, posScratch, tfreqScratch);
     docBuf=db;
     posBuf=pb;
     tfreqBuf=tb;
@@ -961,6 +962,7 @@ public:
         // std::cout << "skipping in position tail: id=" << docid << " numToSkip=" << numToSkip << std::endl;
         for (int i=0; i<numToSkip; i++) {
           auto delta = posIS.readVint();
+          unused(delta);
           // TODO: a faster skipVint (potentially)? inlining should already eliminate the dead code though.
         }
         posOrd += numToSkip;

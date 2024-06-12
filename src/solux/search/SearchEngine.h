@@ -255,7 +255,7 @@ public:
     }
 
     void start(oneapi::tbb::task_group* tg) {
-      for (int32_t i=0; (int32_t)i<req.reader->segments().size(); i++) {
+      for (int32_t i=0; i < (int32_t)req.reader->segments().size(); i++) {
         task_group_run(tg, [this, i]() {
           this->collect(i);
         });
@@ -631,7 +631,7 @@ public:
                   const TopDocsCollector& collector, int64_t offset, const std::span<uint8_t> sortedIdx, const std::span<uint8_t> sortedIdxRunLen, std::span<std::string*> target, std::string_view missingVal,
                   oneapi::tbb::task_group* tg)
   {
-    int start = 0;
+    size_t start = 0;
     // iterate over the segment runs
     while (start < sortedIdx.size()) {
       auto runlen = sortedIdxRunLen[start];
