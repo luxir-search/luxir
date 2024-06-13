@@ -66,7 +66,7 @@ public:
 
     highestDoc = -1;
     postingsWriter = std::make_unique<PostingsWriter>(dir, 0, 0x7fffffff);  // use maximum value for numDocs... nothing (currently) in text field depends on it.
-    writer = std::make_unique<TextWriter>(*postingsWriter);  // use maximum value for numDocs... nothing (currently) in text field depends on it.
+    // writer = std::make_unique<TextWriter>(*postingsWriter);  // use maximum value for numDocs... nothing (currently) in text field depends on it.
 
     // save the RNG state
     rng_snapshot = r;
@@ -237,6 +237,7 @@ public:
       ASSERT_EQ(fname, fieldReader->name());
       makeTermsEnum();
     } else {
+      writer = std::make_unique<TextWriter>(*postingsWriter);
       writer->startField(fname);
     }
     int realNumTerms = 0;
@@ -251,6 +252,7 @@ public:
       ASSERT_EQ(tenum->numTerms(), realNumTerms);
     } else {
       writer->endField();
+      writer.reset();
     }
   }
 

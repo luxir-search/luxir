@@ -25,7 +25,7 @@ protected:
     uint32_t encodedSize = encoded.size();
     codec.encodeBlock((uint32_t*)values.data(), values.size(), encoded.data(), encodedSize);
     encoded.resize(encodedSize);
-    LOG_INFO("native nvals={} encoded size={}", values.size(), encoded.size());
+    // LOG_INFO("native nvals={} encoded size={}", values.size(), encoded.size());
   }
 
   void test() {
@@ -100,8 +100,8 @@ protected:
 
 
 TEST_F(ForTest, basic) {
-  std::vector<double> v{1.0, -2.0, 3.0, 4.0, -5.0, 1.3};
-  LOG_INFO("bits<uint64_t>={} bits<int64_t>={}", bitWidth((uint64_t*)v.data(), v.size()), bitWidth((int64_t*)v.data(), v.size()));
+  // std::vector<double> v{1.0, -2.0, 3.0, 4.0, -5.0, 1.3};
+  // LOG_INFO("bits<uint64_t>={} bits<int64_t>={}", bitWidth((uint64_t*)v.data(), v.size()), bitWidth((int64_t*)v.data(), v.size()));
   // for positive and negative whole numbers (as doubles), we want to calculate in unsigned space (or convert the doubles)
   // But a simple 1.3 blows us out to full 64 bit space.
 

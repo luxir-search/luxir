@@ -60,6 +60,10 @@ public:
 
   void operator=(const DocStream &) = delete;
 
+  int32_t getLastDoc() const {
+    return lastDoc;
+  }
+
   void addDoc(MemPool &pool, int docid) {
     int delta = docid - lastDoc;
     assert(delta > 0);

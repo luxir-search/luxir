@@ -47,25 +47,27 @@ static void BM_TermFind(benchmark::State& state, uint64_t maxId, int hitPercent)
   std::iota( std::begin(sorted), std::end(sorted), 0 );
   std::sort( std::begin(sorted), std::end(sorted),
              [&terms] (int i, int j) { return terms[i] < terms[j]; } );
-
-  TextWriter& w = *seg.writer;
-  w.startField(fname);
   uint32_t fp = 1;
-  for (auto docid : sorted) {
-    auto term = terms[docid];
-    w.startTerm(term);
-    fp += term.size();
-    int df = 1;
-    fp += df;
-    w.startDoc(docid);
-    fp += docid;
-    for (int j=0; j<nPosPerDoc; j++) {
-      w.addPositionDelta(1);
+
+  {
+    TextWriter w(*seg.postingsWriter.get());
+    w.startField(fname);
+    for (auto docid: sorted) {
+      auto term = terms[docid];
+      w.startTerm(term);
+      fp += term.size();
+      int df = 1;
+      fp += df;
+      w.startDoc(docid);
+      fp += docid;
+      for (int j = 0; j < nPosPerDoc; j++) {
+        w.addPositionDelta(1);
+      }
+      w.endDoc(docid);
+      w.endTerm(term);
     }
-    w.endDoc(docid);
-    w.endTerm(term);
+    w.endField();
   }
-  w.endField();
 
   seg.initReader();
   PostingsReader& postingsReader = *seg.reader;

@@ -140,6 +140,11 @@ class PostingsWriter {
   Directory& directory;
   int32_t maxDoc;  // set by caller
   int64_t sizeInBytes = 0; // total size of all files written
+
+  // files available for use, sorted so largest are at the back.  This is done to keep the smallest files small
+  // so they can be just appended to the end of a large file (when we implement that functionallity.)
+  std::vector<OutputStream*> freeFiles;
+  std::string segStr;
 public:
   MemPool pool;
   uint64_t segId;
@@ -162,17 +167,62 @@ public:
 public:
   PostingsWriter(Directory& dir, uint64_t segId, int32_t maxDoc=-1) : directory(dir), maxDoc(maxDoc), segId(segId)
   {
-    // TODO: defer file creation until needed, *or* use a RAMDelegatingFile that does so.
-    // that does so.
 
-    std::string segStr = Postings::getSortableString(segId);
+    segStr = Postings::getSortableString(segId);
     for (uint32_t i=0; i<7; i++) {
       std::unique_ptr<File> file = directory.createFile(Postings::getIndexFileName(segStr, i));
       files.emplace_back(DataFile{OutputStream{},std::move(file), i});
       files.back().out.setFile( files.back().file.get());
       files.back().out.streamNumber = i;
+      freeFiles.push_back(&files.back().out);
     }
   }
+
+  // make sure that numFiles can be obtained, and if not create more.
+  void reserveFiles(size_t numFiles) {
+    while (freeFiles.size() < numFiles) {
+      uint32_t fnum = (uint32_t)files.size();
+      // TODO: in the future, if this does IO, we may not want to lock?
+      std::unique_ptr<File> file = directory.createFile(Postings::getIndexFileName(segStr, fnum));
+      files.emplace_back(DataFile{OutputStream{},std::move(file), fnum});
+      files.back().out.setFile( files.back().file.get());
+      files.back().out.streamNumber = fnum;
+      // insert at front of free list to maintain sorted order.
+      freeFiles.insert(freeFiles.begin(), &files.back().out);
+    }
+  }
+
+  OutputStream& obtainOutputStream() {
+    return *obtainOutputStreams<1>()[0];
+  }
+
+  void releaseOutputStream(OutputStream& os) {
+    releaseOutputStreams(std::array{&os});
+  }
+
+  // TODO: make these thread safe before making flushing or merging multi-threaded.
+  template <std::size_t N>
+  std::array<OutputStream*, N> obtainOutputStreams() {
+    reserveFiles(N);
+    std::array<OutputStream*, N> os;
+    std::copy(freeFiles.end() - N, freeFiles.end(), os.begin());
+    freeFiles.resize(freeFiles.size() - N);
+    return os;
+  }
+
+  // TODO: make these thread safe before making flushing or merging multi-threaded.
+  template <std::size_t N>
+  void releaseOutputStreams(std::array<OutputStream*, N>&& os) {
+    auto compareBySize = [](const OutputStream* a, const OutputStream* b) {
+      return a->size() < b->size();
+    };
+
+    for (OutputStream* stream : os) {
+      auto it = std::upper_bound(freeFiles.begin(), freeFiles.end(), stream, compareBySize);
+      freeFiles.insert(it, stream);
+    }
+  }
+
 
   uint64_t getSegId() const {
     return segId;
@@ -304,7 +354,7 @@ class TextWriter {
   std::vector<int32_t> posdeltas; // list of position deltas for the current term (for all documents... per-document positions are not delimited)
 
   // base (starting) values int the associated output streams to calculate offsets from
-  int64_t termsLoc;
+  int64_t termsLoc=0;
   int64_t docsLoc;
   int64_t posLoc;
 
@@ -350,12 +400,27 @@ private:  // some internal utility methods... not for use by indexers
 
 public:
   TextWriter(PostingsWriter& postingsWriter)
-  : TextWriter(postingsWriter, postingsWriter.files[2].out, postingsWriter.files[3].out, postingsWriter.files[4].out) {
+  : TextWriter(postingsWriter, postingsWriter.obtainOutputStreams<3>())  // nocommit... original streams were 2,3,4
+  {
   }
 
-  TextWriter(PostingsWriter& postingsWriter, OutputStream& termOutput, OutputStream& docOutput, OutputStream& posOutput)
-  : postingsWriter(postingsWriter), termOutput(termOutput), docOutput(docOutput),posOutput(posOutput) {
+  TextWriter(PostingsWriter& postingsWriter, std::array<OutputStream*,3> streams)
+  : postingsWriter(postingsWriter), termOutput(*streams[0]), docOutput(*streams[1]), posOutput(*streams[2])
+  {
   }
+
+  void releaseStreams() {
+    if (termsLoc != -1) {
+      postingsWriter.releaseOutputStreams(std::array{&termOutput, &docOutput, &posOutput});
+      termsLoc = -1;  // signal that we already cleaned up.
+    }
+  }
+
+  ~TextWriter() {
+    // this is only to make sure we don't leak streams if endField isn't called (i.e. an exception is thrown)
+    releaseStreams();
+  }
+
 
   // TODO: FIXME: this is for tests, but it doesn't set the flags / type properly!
   void startField(const std::string& fieldName) {
@@ -367,6 +432,9 @@ public:
   }
 
   void startField(PostingsWriter::IndexFieldInfo* finfo) {
+    if (termsLoc == -1) {
+      throw std::runtime_error("startField called twice!");
+    }
     fieldInfo = finfo;
     termsLoc = termOutput.size();
     docsLoc = docOutput.size();
@@ -663,6 +731,7 @@ public:
     }
   }
 
+  // This should only be called once.  Multiple fields are not handled any longer.
   void endField() {
     flushTerms(true);
 
@@ -683,6 +752,8 @@ public:
     fieldInfo->termsLoc = seg_location(termOutput.streamNumber, termsLoc);
     fieldInfo->docsLoc = seg_location(docOutput.streamNumber, docsLoc);
     fieldInfo->posLoc = seg_location(posOutput.streamNumber, posLoc);
+
+    releaseStreams();
   }
 
 

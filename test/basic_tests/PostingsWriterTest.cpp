@@ -39,7 +39,7 @@ protected:
     pool.rewind(save);
     dir = RAMDir();  // remove all files?
     postingsWriter = std::make_unique<PostingsWriter>(dir, 0, 0x7fffffff);  // use maximum value for numDocs... nothing (currently) in text field depends on it.
-    writer = std::make_unique<TextWriter>(*postingsWriter);  // use maximum value for numDocs... nothing (currently) in text field depends on it.
+    // writer = std::make_unique<TextWriter>(*postingsWriter);
 
     // save the RNG state
     rng_start = rng;
@@ -185,6 +185,7 @@ protected:
       fieldReader->readFieldInfo(fieldInfo);
       tenum = std::make_unique<TermsEnum>(pool, *reader, fieldInfo);
     } else {
+      writer = std::make_unique<TextWriter>(*postingsWriter);
       writer->startField(fname);
     }
     int realNumTerms = 0;
@@ -199,6 +200,7 @@ protected:
       ASSERT_EQ(tenum->numTerms(), realNumTerms);
     } else {
       writer->endField();
+      writer.reset();
     }
   }
 
@@ -238,8 +240,6 @@ TEST_F(PostingsTest, basic) {
   RAMDir dir;
   MemPool pool;
   PostingsWriter postingsWriter(dir, 0, 100);
-  TextWriter writer(postingsWriter);
-
   std::string t1 = "term1";
   std::string t2 = "term2";
   std::string ta = "termA";
@@ -247,44 +247,50 @@ TEST_F(PostingsTest, basic) {
   TermRef term2(pool, t2.data(), t2.size());
   TermRef terma(pool, ta.data(), ta.size());
 
-  writer.startField("field1");
-  writer.startTerm(term1);  // single doc, single position... this should be pulsed
-  writer.startDoc(44);
-  writer.addPositionDelta(1);
-  writer.endDoc(44);
-  writer.startDoc(55);
-  writer.addPositionDelta(555);
-  writer.addPositionDelta(111);
-  writer.endDoc(55);
-  writer.startDoc(56);
-  writer.addPositionDelta(7);
-  writer.addPositionDelta(2);
-  writer.endDoc(56);
-  writer.endTerm(term1);
+  {
+    TextWriter writer(postingsWriter);
 
-  writer.startTerm(term2);
-  writer.startDoc(7);
-  writer.addPositionDelta(5);
-  writer.addPositionDelta(3);
-  writer.addPositionDelta(10);
-  writer.endDoc(7);
-  writer.startDoc(22);
-  writer.addPositionDelta(0);
-  writer.addPositionDelta(300);
-  writer.endDoc(22);
-  writer.endTerm(term2);
+    writer.startField("field1");
+    writer.startTerm(term1);  // single doc, single position... this should be pulsed
+    writer.startDoc(44);
+    writer.addPositionDelta(1);
+    writer.endDoc(44);
+    writer.startDoc(55);
+    writer.addPositionDelta(555);
+    writer.addPositionDelta(111);
+    writer.endDoc(55);
+    writer.startDoc(56);
+    writer.addPositionDelta(7);
+    writer.addPositionDelta(2);
+    writer.endDoc(56);
+    writer.endTerm(term1);
 
-  writer.endField();
+    writer.startTerm(term2);
+    writer.startDoc(7);
+    writer.addPositionDelta(5);
+    writer.addPositionDelta(3);
+    writer.addPositionDelta(10);
+    writer.endDoc(7);
+    writer.startDoc(22);
+    writer.addPositionDelta(0);
+    writer.addPositionDelta(300);
+    writer.endDoc(22);
+    writer.endTerm(term2);
 
+    writer.endField();
+  }
+  {
+    TextWriter writer(postingsWriter);
 
-  writer.startField("field2");
-  writer.startTerm(terma);
-  writer.startDoc(0);
-  writer.addPositionDelta(3);
-  writer.addPositionDelta(1);
-  writer.endDoc(0);
-  writer.endTerm(terma);
-  writer.endField();
+    writer.startField("field2");
+    writer.startTerm(terma);
+    writer.startDoc(0);
+    writer.addPositionDelta(3);
+    writer.addPositionDelta(1);
+    writer.endDoc(0);
+    writer.endTerm(terma);
+    writer.endField();
+  }
 
   postingsWriter.finish();
 
