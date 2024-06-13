@@ -12,7 +12,7 @@
 
 // so IndexHandler can consume protobuf types
 #include "protos/solux_types.pb.h"
-
+#include "OrdCollector.h"
 
 
 namespace solux {
@@ -378,7 +378,10 @@ public:
       // TODO: error check if term is too long to index.
       auto[entry, inserted] = termsHash.try_emplace(term, termsHash.getMemPool());
       unused(inserted);
-      entry->val().addDoc(termsHash.getMemPool(), inverter.currDoc);
+      // don't record duplicates for the same doc.
+      if (entry->val().getLastDoc() != inverter.currDoc) {
+        entry->val().addDoc(termsHash.getMemPool(), inverter.currDoc);
+      }
     }
 
     void index(Inverter& inverter, std::span<const std::string* const> vals) override {
@@ -408,8 +411,10 @@ public:
 
       // For ordinals, we already know the number of unique terms, so we can use an optimal number of bits right off the bat
       // for dense fields.  Then we could simply memcpy the ordinals into the postings file.
-      std::vector<int> docToOrd(inverter.currDoc+1, 0); // This is very inefficient temporary implementation.
+      // std::vector<int> docToOrd(inverter.currDoc+1, 0); // This is very inefficient temporary implementation.
       // ord vec must me 0 initialized since that is value that means "missing".
+      OrdCollector ords(inverter.pool, inverter.currDoc+1);
+
 
       textWriter.startField(&fieldInfo);
       for (int32_t tnum=0; tnum<numVals; tnum++) {
@@ -421,7 +426,10 @@ public:
           textWriter.startDoc(docid);
           textWriter.addPositionDelta(1); // add a dummy position for now since we are using TextWriter, which expects them.
           textWriter.endDoc(docid);
-          docToOrd[docid] = tnum + 1;  // +1 because 0 means "missing"
+
+          // single-valued version.
+          // docToOrd[docid] = tnum + 1;  // +1 because 0 means "missing"
+          ords.add(docid, tnum+1);
         });
         textWriter.endTerm(term);
       }
@@ -429,15 +437,38 @@ public:
       termsHash.free();
 
       // Write the ordinals to the postings file.
+      // If this is a multivalued field, then we also need to write to another column that
+      // indicates the end of the values for this doc.  If we want it adjacent, we could wait and traverse the stream
+      // again, or we could write it in parallel to a different output.
       {
         auto g2 = guard.pool().rewindScopeGuard();
         IntColWriter ordCol(guard.pool(), inverter.postingsWriter, fieldInfo);
+        OutputStream* endRankStream = nullptr;
+        std::unique_ptr<MonoWriter> endRankWriter;
+        if (ords.multiValued()) {
+          // get the output stream to write the mono values to
+          // TODO endRankStream = inverter.postingsWriter.
+        }
+
         ordCol.startField();
+        int64_t nValues = 0;
         for (int docid = 0; docid <= inverter.currDoc; docid++) {
+          ords.pushValues(docid, [&](int32_t ord) {
+            ordCol.addInt64(ord);
+            nValues++;
+          });
+
+
+          if (ords.multiValued()) {
+            // write the end rank
+          }
+
+          /*** single-valued version
           int32_t ord = docToOrd[docid];
           if (ord != 0) {
             ordCol.addInt64(ord);
           }
+          */
         }
         ordCol.finish();
       }
@@ -447,10 +478,15 @@ public:
         DocsWithValWriter docsWriter(guard.pool(), inverter.postingsWriter, fieldInfo);
         if (!full) {
           for (int docid = 0; docid <= inverter.currDoc; docid++) {
+            if (ords.hasValues(docid)) {
+              docsWriter.startDoc(docid);
+            }
+            /* single valued version
             int32_t ord = docToOrd[docid];
             if (ord != 0) {
               docsWriter.startDoc(docid);
             }
+            */
           }
           docsWriter.finish();
         } else {
