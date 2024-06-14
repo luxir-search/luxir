@@ -589,7 +589,8 @@ TEST_F(PostingsTest, intCol) {
       colWriter.addInt64(33);
       colWriter.addInt64(11);
       colWriter.finish();
-
+    }
+    {
       DocsWithValWriter docsWriter(pool, writer, finfo);
       docsWriter.startDoc(0);
       docsWriter.startDoc(1);
@@ -599,6 +600,11 @@ TEST_F(PostingsTest, intCol) {
 
     writer.finish();
   }
+
+  // All this should have been able to be done in a single segment file.
+  std::vector<std::string> files;
+  dir.listFiles(files);
+  ASSERT_EQ(files.size(), 1);
 
   PostingsReader reader(dir, 0);
   FieldReader fieldReader(pool, reader);

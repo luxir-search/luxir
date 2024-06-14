@@ -169,15 +169,6 @@ public:
   PostingsWriter(Directory& dir, uint64_t segId, int32_t maxDoc=-1) : directory(dir), maxDoc(maxDoc), segId(segId)
   {
     segStr = Postings::getSortableString(segId);
-
-    for (uint32_t i=0; i<7; i++) {
-      std::unique_ptr<File> file = directory.createFile(Postings::getIndexFileName(segStr, i));
-      files.emplace_back(DataFile{OutputStream{},std::move(file), i});
-      files.back().out.setFile( files.back().file.get());
-      files.back().out.streamNumber = i;
-      freeFiles.push_back(&files.back().out);
-    }
-
   }
 
   // make sure that numFiles can be obtained, and if not create more.
