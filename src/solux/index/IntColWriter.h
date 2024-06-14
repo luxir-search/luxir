@@ -20,9 +20,13 @@ public:
 
   // This class allocates from the pool but does not do any visible rollbacks.
   IntColWriterSimple(MemPool& pool, PostingsWriter& postingsWriter, PostingsWriter::IndexFieldInfo& fieldInfo)
-  : postingsWriter(postingsWriter), fieldInfo(fieldInfo), colOutput(postingsWriter.files[5].out) {
-    unused(pool, postingsWriter);
+  : postingsWriter(postingsWriter), fieldInfo(fieldInfo), colOutput(postingsWriter.obtainOutputStream()) {
+    unused(pool);
     colStart = colOutput.size();
+  }
+
+  ~IntColWriterSimple() {
+    postingsWriter.releaseOutputStream(colOutput);
   }
 
   void startField() {
@@ -65,9 +69,13 @@ private:
 public:
   // This class allocates from the pool but does not do any visible rollbacks.
   IntColWriter(MemPool& pool, PostingsWriter& postingsWriter, PostingsWriter::IndexFieldInfo& fieldInfo)
-          : postingsWriter(postingsWriter), fieldInfo(fieldInfo), colOutput(postingsWriter.files[5].out) {
-    unused(pool, postingsWriter);
+          : postingsWriter(postingsWriter), fieldInfo(fieldInfo), colOutput(postingsWriter.obtainOutputStream()) {
+    unused(pool);
     colStart = colOutput.size();
+  }
+
+  ~IntColWriter() {
+    postingsWriter.releaseOutputStream(colOutput);
   }
 
   void startField() {

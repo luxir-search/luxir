@@ -145,15 +145,17 @@ class PostingsWriter {
   // so they can be just appended to the end of a large file (when we implement that functionallity.)
   std::vector<OutputStream*> freeFiles;
   std::string segStr;
-public:
-  MemPool pool;
-  uint64_t segId;
 
   struct DataFile {
     OutputStream out;
     std::unique_ptr<File> file;
     uint32_t fileNum;
   };
+  std::deque<DataFile> files;
+
+public:
+  MemPool pool;
+  uint64_t segId;
 
   // IndexFieldInfo adds extra info needed at index time to SegFieldInfo.
   struct IndexFieldInfo : public SegFieldInfo {
@@ -161,14 +163,13 @@ public:
 
   // These are dequeues so elements don't move
   // TODO: put these in the pool?
-  std::deque<DataFile> files;
   std::deque<IndexFieldInfo> fieldInfos;
 
 public:
   PostingsWriter(Directory& dir, uint64_t segId, int32_t maxDoc=-1) : directory(dir), maxDoc(maxDoc), segId(segId)
   {
-
     segStr = Postings::getSortableString(segId);
+
     for (uint32_t i=0; i<7; i++) {
       std::unique_ptr<File> file = directory.createFile(Postings::getIndexFileName(segStr, i));
       files.emplace_back(DataFile{OutputStream{},std::move(file), i});
@@ -176,6 +177,7 @@ public:
       files.back().out.streamNumber = i;
       freeFiles.push_back(&files.back().out);
     }
+
   }
 
   // make sure that numFiles can be obtained, and if not create more.
@@ -232,6 +234,12 @@ public:
     if (fieldInfos.empty()) {
       return;  // already called, or no data added.
     }
+    // make sure we have at least one file
+    reserveFiles(1);
+
+    // Make sure that there are no outstanding files.
+    // Do this for non-debug mode as well?
+    assert(freeFiles.size() == files.size());
     writeFieldIndex();
     writeSegmentInfo();
     // TODO: implement compound files for small files
@@ -752,8 +760,6 @@ public:
     fieldInfo->termsLoc = seg_location(termOutput.streamNumber, termsLoc);
     fieldInfo->docsLoc = seg_location(docOutput.streamNumber, docsLoc);
     fieldInfo->posLoc = seg_location(posOutput.streamNumber, posLoc);
-
-    releaseStreams();
   }
 
 
@@ -830,15 +836,20 @@ public:
 class DocsWithValWriter {
   OutputStream& idOutput;
   DocsWriter docsWriter;
+  PostingsWriter& postingsWriter;
   // int64_t startLoc;
   PostingsWriter::IndexFieldInfo& fieldInfo; // don't have to store if we pass it to finish
 
 public:
   // This field writer does not do any visible pool rollbacks, but does allocate from the pool.
   DocsWithValWriter(MemPool& pool, PostingsWriter& postingsWriter, PostingsWriter::IndexFieldInfo& fieldInfo)
-  : idOutput(postingsWriter.files[6].out), docsWriter(pool,idOutput), fieldInfo(fieldInfo)
+  : idOutput(postingsWriter.obtainOutputStream()), docsWriter(pool,idOutput), postingsWriter(postingsWriter), fieldInfo(fieldInfo)
   {
     // startLoc = idOutput.size();
+  }
+
+  ~DocsWithValWriter() {
+    postingsWriter.releaseOutputStream(idOutput);
   }
 
   // Same as addDoc... it's named startDoc target for DocStream.pushDocs.

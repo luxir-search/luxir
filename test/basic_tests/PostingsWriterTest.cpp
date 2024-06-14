@@ -333,31 +333,33 @@ TEST_F(PostingsTest, blockPositions) {
   RAMDir dir;
   MemPool pool;
   PostingsWriter postingsWriter(dir, 0, 44);
-  TextWriter writer(postingsWriter);
-  std::string t1 = "term1";
-  TermRef term1(pool, t1.data(), t1.size());
-
-  writer.startField("field1");
-  writer.startTerm(term1);
-  writer.startDoc(42);
   int nPos = Postings::POSITIONS_BLOCK_SIZE * 2 + 2; // TODO: parameterize
   int delta = 2;
-  for (int i = 0; i < nPos; i++) {
-    writer.addPositionDelta(delta);
-  }
-  writer.endDoc(42);
-
-  writer.startDoc(43);
   int nPos2 = Postings::POSITIONS_BLOCK_SIZE * 2 + 2; // TODO: parameterize
   int delta2 = 3;
-  for (int i = 0; i < nPos; i++) {
-    writer.addPositionDelta(delta2);
+  {
+    TextWriter writer(postingsWriter);
+    std::string t1 = "term1";
+    TermRef term1(pool, t1.data(), t1.size());
+
+    writer.startField("field1");
+    writer.startTerm(term1);
+    writer.startDoc(42);
+
+    for (int i = 0; i < nPos; i++) {
+      writer.addPositionDelta(delta);
+    }
+    writer.endDoc(42);
+
+    writer.startDoc(43);
+    for (int i = 0; i < nPos; i++) {
+      writer.addPositionDelta(delta2);
+    }
+    writer.endDoc(43);
+
+    writer.endTerm(term1);
+    writer.endField();
   }
-  writer.endDoc(43);
-
-
-  writer.endTerm(term1);
-  writer.endField();
   postingsWriter.finish();
 
   PostingsReader reader(dir, 0);
@@ -417,24 +419,26 @@ TEST_F(PostingsTest, blockTerms) {
   MemPool pool;
   int nTerms = Postings::TERMS_BLOCK_SIZE + 1;
   PostingsWriter postingsWriter(dir, 0, nTerms);
-  TextWriter writer(postingsWriter);
-  writer.startField("field1");
-
   std::string tstr = "term";
   tstr.resize(12);
-  for (int i=0; i<nTerms; i++) {
-    sprintf(tstr.data() + 4, "%08d", i);
-    TermRef term(pool, tstr.data(), tstr.size());
-    writer.startTerm(term);
-    writer.startDoc(i);
-    writer.addPositionDelta(i*2);
-    writer.addPositionDelta(1);
-    writer.endDoc(i);
-    writer.endTerm(term);
-  }
-  writer.endField();
-  postingsWriter.finish();
+  {
+    TextWriter writer(postingsWriter);
+    writer.startField("field1");
 
+
+    for (int i = 0; i < nTerms; i++) {
+      sprintf(tstr.data() + 4, "%08d", i);
+      TermRef term(pool, tstr.data(), tstr.size());
+      writer.startTerm(term);
+      writer.startDoc(i);
+      writer.addPositionDelta(i * 2);
+      writer.addPositionDelta(1);
+      writer.endDoc(i);
+      writer.endTerm(term);
+    }
+    writer.endField();
+  }
+  postingsWriter.finish();
   PostingsReader reader(dir, 0);
 
   FieldReader fieldReader(pool, reader);
@@ -578,18 +582,20 @@ TEST_F(PostingsTest, intCol) {
 
     auto &finfo = writer.fieldInfos.emplace_back();
     finfo.fieldname = fname1;
-    IntColWriter colWriter(pool, writer, finfo);
-    colWriter.startField();
-    colWriter.addInt64(77);
-    colWriter.addInt64(33);
-    colWriter.addInt64(11);
-    colWriter.finish();
+    {
+      IntColWriter colWriter(pool, writer, finfo);
+      colWriter.startField();
+      colWriter.addInt64(77);
+      colWriter.addInt64(33);
+      colWriter.addInt64(11);
+      colWriter.finish();
 
-    DocsWithValWriter docsWriter(pool, writer, finfo);
-    docsWriter.startDoc(0);
-    docsWriter.startDoc(1);
-    docsWriter.startDoc(2);
-    docsWriter.finish();
+      DocsWithValWriter docsWriter(pool, writer, finfo);
+      docsWriter.startDoc(0);
+      docsWriter.startDoc(1);
+      docsWriter.startDoc(2);
+      docsWriter.finish();
+    }
 
     writer.finish();
   }
