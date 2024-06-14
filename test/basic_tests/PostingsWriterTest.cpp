@@ -580,8 +580,7 @@ TEST_F(PostingsTest, intCol) {
 
     PostingsWriter writer(dir, 0, 3);
 
-    auto &finfo = writer.fieldInfos.emplace_back();
-    finfo.fieldname = fname1;
+    auto &finfo = writer.addField(fname1);
     {
       IntColWriter colWriter(pool, writer, finfo);
       colWriter.startField();

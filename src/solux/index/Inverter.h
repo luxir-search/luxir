@@ -167,8 +167,7 @@ public:
       PostingsWriter& postingsWriter = inverter.getPostingsWriter();
 
       // TODO: move this to postingsWriter method
-      PostingsWriter::IndexFieldInfo& fieldInfo = postingsWriter.fieldInfos.emplace_back();
-      fieldInfo.fieldname = fieldName;
+      PostingsWriter::IndexFieldInfo& fieldInfo = postingsWriter.addField(fieldName);
       fieldInfo.type = fieldType->type();
       fieldInfo.flags = fieldType->flags_;
       flushIntCol(inverter, fieldInfo);
@@ -176,13 +175,14 @@ public:
 
     // This is the version called directly from text field for norms
     void flushIntCol(Inverter& inverter, PostingsWriter::IndexFieldInfo& fieldInfo) {
+      auto& pool = MemPool::threadLocal();
       PostingsWriter& postingsWriter = inverter.getPostingsWriter();
       auto full = numVals >= postingsWriter.getMaxDoc();
 
       // push values
       {
-        auto guard = postingsWriter.pool.rewindScopeGuard();
-        IntColWriter writer(postingsWriter.pool, postingsWriter, fieldInfo);
+        auto guard = pool.rewindScopeGuard();
+        IntColWriter writer(pool, postingsWriter, fieldInfo);
         writer.startField();
         // TODO: not having the docids here makes it impossible to do a dense field encoding!  Of course that's
         // not really possible if we're writing the column directly and incrementally since we don't know
@@ -200,9 +200,9 @@ public:
 
       // push docs
       {
-        auto guard = postingsWriter.pool.rewindScopeGuard();
+        auto guard = pool.rewindScopeGuard();
         // TODO: when things go parallel, we don't want to reserve an OutputStream if this is dense.
-        DocsWithValWriter docsWriter(inverter.pool, postingsWriter, fieldInfo);
+        DocsWithValWriter docsWriter(pool, postingsWriter, fieldInfo);
         if (!full) {
           docsWithVal.pushDocs(inverter.pool, docsWriter);
           docsWriter.finish();
@@ -319,8 +319,7 @@ public:
 
       // Either reduce the resource for these, or share across different fields (in the same thread)
       TextWriter textWriter(inverter.getPostingsWriter());
-      PostingsWriter::IndexFieldInfo& fieldInfo = inverter.getPostingsWriter().fieldInfos.emplace_back();
-      fieldInfo.fieldname = fieldName;
+      PostingsWriter::IndexFieldInfo& fieldInfo = inverter.getPostingsWriter().addField(fieldName);
       fieldInfo.type = fieldType->type();
       fieldInfo.flags = fieldType->flags_;
 
@@ -402,8 +401,7 @@ public:
 
       // TODO: TextWriter should be refactored (or templated) to handle strings without positions.
       TextWriter textWriter(inverter.getPostingsWriter());
-      PostingsWriter::IndexFieldInfo& fieldInfo = inverter.getPostingsWriter().fieldInfos.emplace_back();
-      fieldInfo.fieldname = fieldName;
+      PostingsWriter::IndexFieldInfo& fieldInfo = inverter.getPostingsWriter().addField(fieldName);
       fieldInfo.type = fieldType->type();
       fieldInfo.flags = fieldType->flags_;
       // nocommit fieldInfo.flags = 0x04; // ord column
@@ -443,25 +441,21 @@ public:
       {
         auto g2 = guard.pool().rewindScopeGuard();
         IntColWriter ordCol(guard.pool(), inverter.postingsWriter, fieldInfo);
-        OutputStream* endRankStream = nullptr;
-        std::unique_ptr<MonoWriter> endRankWriter;
-        if (ords.multiValued()) {
-          // get the output stream to write the mono values to
-          // TODO endRankStream = inverter.postingsWriter.
-        }
+        u_ptr<MonoWriter> endRankWriter = ords.multiValued() ? guard.pool().make_unique<MonoWriter>(guard.pool(), inverter.getPostingsWriter().obtainOutputStream()) : nullptr;
 
         ordCol.startField();
         int64_t nValues = 0;
         for (int docid = 0; docid <= inverter.currDoc; docid++) {
+          auto prevNValues = nValues;
           ords.pushValues(docid, [&](int32_t ord) {
             ordCol.addInt64(ord);
             nValues++;
           });
 
-
-          if (ords.multiValued()) {
-            // write the end rank
+          if (prevNValues != nValues && endRankWriter) {
+            endRankWriter->addInt64(nValues);
           }
+          prevNValues = nValues;
 
           /*** single-valued version
           int32_t ord = docToOrd[docid];
@@ -471,6 +465,11 @@ public:
           */
         }
         ordCol.finish();
+        if (endRankWriter) {
+          endRankWriter->finish();
+          fieldInfo.monoLoc = endRankWriter->blockLoc;
+          fieldInfo.monoMeta = endRankWriter->metaLoc;
+        }
       }
 
       {

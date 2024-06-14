@@ -137,6 +137,12 @@
 namespace solux {
 
 class PostingsWriter {
+public:
+  // IndexFieldInfo adds extra info needed at index time to SegFieldInfo.
+  struct IndexFieldInfo : public SegFieldInfo {
+  };
+
+private:
   Directory& directory;
   int32_t maxDoc;  // set by caller
   int64_t sizeInBytes = 0; // total size of all files written
@@ -152,24 +158,34 @@ class PostingsWriter {
     uint32_t fileNum;
   };
   std::deque<DataFile> files;
-
-public:
-  MemPool pool;
-  uint64_t segId;
-
-  // IndexFieldInfo adds extra info needed at index time to SegFieldInfo.
-  struct IndexFieldInfo : public SegFieldInfo {
-  };
-
   // These are dequeues so elements don't move
   // TODO: put these in the pool?
   std::deque<IndexFieldInfo> fieldInfos;
+public:
+  MemPool pool;  // perhaps migrate to googles Arena if segment writing becomes multi-threaded.
+  uint64_t segId;
 
 public:
   PostingsWriter(Directory& dir, uint64_t segId, int32_t maxDoc=-1) : directory(dir), maxDoc(maxDoc), segId(segId)
   {
     segStr = Postings::getSortableString(segId);
   }
+
+  // not thread-safe
+  IndexFieldInfo& addField(PackedTerm fieldName) {
+    fieldInfos.emplace_back(); // we should get default-initialization with this.
+    fieldInfos.back().fieldname = fieldName;
+    assert(fieldInfos.back().monoMeta.offset() == 0);
+    return fieldInfos.back();
+  }
+
+  // not thread-safe
+  // copies the fieldName into the pool associated with this PostingsWriter.
+  IndexFieldInfo& addField(std::string_view fieldName) {
+    // making the PackedTerm in the pool also not thread safe
+    return addField(PackedTerm(pool, fieldName));
+  }
+
 
   // make sure that numFiles can be obtained, and if not create more.
   void reserveFiles(size_t numFiles) {
@@ -276,6 +292,8 @@ private:
     // List of field metadata, followed by an array of offsets for each field, followed by the number of fields.
     //
 
+    // IDEA: for few fields, we could just skip the compression and memcpy the whole struct.
+
     OutputStream& fieldOutput = files[0].out;
     std::vector<uint32_t> fieldOffs;  // location of each field in fieldFile (TODO: what is the max number of fields we will support?)
     fieldOffs.reserve(fieldInfos.size());
@@ -310,6 +328,10 @@ private:
       fieldOutput.writeVal(finfo.docsWithFieldEndLoc);
       fieldOutput.writeVal(finfo.columnLoc);
       fieldOutput.writeVal(finfo.columnMeta);
+
+      // for now, always write mono col info.  If we want to make it optional, we need a flag for it.
+      fieldOutput.writeVal(finfo.monoMeta);
+      fieldOutput.writeVal(finfo.monoLoc);
     }
 
     // Now write the start of each fieldInfo
@@ -425,8 +447,7 @@ public:
 
   // TODO: FIXME: this is for tests, but it doesn't set the flags / type properly!
   void startField(const std::string& fieldName) {
-    PostingsWriter::IndexFieldInfo* finfo = &postingsWriter.fieldInfos.emplace_back(); // TODO: not thread safe if we start using multiple threads to write text fields
-    finfo->fieldname = PackedTerm(postingsWriter.pool, fieldName); // also not thread safe
+    PostingsWriter::IndexFieldInfo* finfo = &postingsWriter.addField(fieldName);
     finfo->type = FieldType::TEXT;
     finfo->flags = FieldType::INDEX_DOCS_FREQS_POSITIONS;
     startField(finfo);

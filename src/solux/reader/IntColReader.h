@@ -279,6 +279,7 @@ public:
     uint64_t scaledSlope;
     int32_t intercept;
     uint8_t bits;
+    uint8_t _padding[3]={0,0,0};
   } SOLUX_PACKED_END;
 
 private:

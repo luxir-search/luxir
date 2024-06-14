@@ -199,6 +199,11 @@ private:
 
 public:
   /// "output" column metadata that is filled in / valid after finish() is called.
+  /// Both are currently needed for MonoReader.
+  // We could write the block offset relative to the metaLoc
+  // in the metadata itself to save SegFieldInfo space, but it's unclear if we will end up wanting start + size
+  // of everything in the future to read partial files on demand (in which case, we would want loc + size and
+  // be able to calculate everything else from that.
   seg_location blockLoc;
   seg_location metaLoc;
 

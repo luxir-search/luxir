@@ -176,8 +176,7 @@ private:
     }
 
     // get/reserve a new fieldInfo from the postingsReader
-    PostingsWriter::IndexFieldInfo& outputFieldInfo = postingsWriter.fieldInfos.emplace_back();
-    outputFieldInfo.fieldname = sortedFields[0]->segFieldInfo.fieldname;  // we should ensure out postingsWriter outlives the lifetime of the postings readers!
+    PostingsWriter::IndexFieldInfo& outputFieldInfo = postingsWriter.addField(sortedFields[0]->segFieldInfo.fieldname);
     outputFieldInfo.type = type;
     outputFieldInfo.flags = allFlags;
 

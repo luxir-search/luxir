@@ -86,7 +86,8 @@ public:
     lastDoc = docid;
   }
 
-  /// Calls sink.startDoc(int docid) only for each doc
+  /// Calls sink.startDoc(int docid) only for each doc.
+  /// pool is the source pool that was used to build the stream.
   template <class PostingsConsumer>
   void pushDocs(MemPool& pool, PostingsConsumer& sink) {
     int runPtr = -1;

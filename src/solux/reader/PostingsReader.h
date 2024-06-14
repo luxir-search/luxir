@@ -262,7 +262,7 @@ public:
 struct SegFieldInfo {
   PackedTerm fieldname;
   FieldType::Type type;  // really only need a byte here
-  int32_t flags;
+  int32_t flags;  // from FieldType
   seg_location termBlockIndexLoc;  // location of index into the terms blocks
   seg_location termsLoc;
   seg_location docsLoc;
@@ -394,6 +394,9 @@ public:
       fieldInfo.docsWithFieldEndLoc = fieldIS.readVal<seg_location>();
       fieldInfo.columnLoc = fieldIS.readVal<seg_location>();
       fieldInfo.columnMeta = fieldIS.readVal<seg_location>();
+
+      fieldInfo.monoMeta = fieldIS.readVal<seg_location>();
+      fieldInfo.monoLoc = fieldIS.readVal<seg_location>();
     }
   }
 
