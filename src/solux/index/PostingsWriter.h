@@ -269,9 +269,12 @@ public:
 private:
   void writeSegmentInfo() {
     assert(maxDoc >= 1);
-    files[0].out.writeVint(maxDoc);
-    // TODO: write approx segment size?
-    // Other info we should eventually write: version info, what other files are present, cfs info
+    OutputStream& out = files[0].out;
+    auto outStart = out.size();
+    out.writeVint(maxDoc);
+    out.writeVint(files.size());
+    auto segInfoSize = out.size() - outStart;
+    out.writeInt(segInfoSize);
   }
 
   void writeFieldIndex() {
@@ -282,7 +285,7 @@ private:
     // List of field metadata, followed by an array of offsets for each field, followed by the number of fields.
     //
 
-    OutputStream& fieldOutput = files[1].out;
+    OutputStream& fieldOutput = files[0].out;
     std::vector<uint32_t> fieldOffs;  // location of each field in fieldFile (TODO: what is the max number of fields we will support?)
     fieldOffs.reserve(fieldInfos.size());
 
@@ -319,9 +322,9 @@ private:
     }
 
     // Now write the start of each fieldInfo
-    // TODO: align this on 4 byte boundary
     // Now make field offsets relative to the start of the locations array instead of the beginning of fields.
     // It's minor, but allows us to remove another pointer (to the start of the fields)
+    fieldOutput.align(4);
     auto locationsOff = fieldOutput.size() - fieldsStart;
     for (auto& loc : fieldOffs) {
       loc = locationsOff - loc;
@@ -332,7 +335,6 @@ private:
     fieldOutput.writeInt((int32_t)fieldOffs.size());
   }
 
-  friend class IntColWriter;
 };
 
 

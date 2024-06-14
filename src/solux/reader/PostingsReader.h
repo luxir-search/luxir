@@ -173,6 +173,7 @@ public:
 class PostingsReader {
   std::vector<std::shared_ptr<InputFile>> files;  // keeps files live while this PostingsReader is live.
   std::vector<InputStream> inputStreams;
+  int64_t segInfoOffset;  // after this is segInfo, before this is the field index
   int32_t maxdoc;
 public:
   InputStream firstIS;
@@ -181,9 +182,6 @@ public:
   static constexpr int32_t END = std::numeric_limits<int32_t>::max();
 
   explicit PostingsReader(Directory& dir, uint64_t segId) {
-    int nFiles = 7;
-    files.reserve(nFiles);
-    inputStreams.reserve(nFiles);
 
     std::string segStr = Postings::getSortableString(segId);
     auto segInfoFile = Postings::getIndexFileName(segStr, 0);
@@ -196,7 +194,17 @@ public:
     inputStreams.emplace_back(files[0]->getInputStream());
     firstIS = inputStreams[0];
 
-    maxdoc = firstIS.readVint();  // TODO first file is currently just the seg file... that will change shortly!
+    // seek to the end of firstIs and read the size of the segmentInfo
+    // See PostingsWriter.writeSegmentInfo
+    firstIS.seek(firstIS.size() - sizeof(int32_t));
+    auto segInfoSize = firstIS.readInt();
+    segInfoOffset = firstIS.size() - sizeof(int32_t) - segInfoSize;
+    firstIS.seek(segInfoOffset);
+    maxdoc = firstIS.readVint();
+    int nFiles = firstIS.readVint();
+
+    files.reserve(nFiles);
+    inputStreams.reserve(nFiles);
 
     for (int i=1; i<nFiles; i++) {
       files.emplace_back(dir.openFile(Postings::getIndexFileName(segStr, i)));
@@ -239,6 +247,8 @@ public:
     out << "PostingsReader: numDocs=" << reader.numDocs() << " files=" << reader.files;
     return out;
   }
+
+  friend class FieldReader;
 };
 
 //
@@ -301,8 +311,8 @@ class FieldReader {
 public:
   FieldReader(MemPool& pool, PostingsReader& postingsReader) {
     unused(pool);
-    fieldIS = postingsReader.getInputStream(1); // TODO: temporary
-    fieldIS.seek(fieldIS.size() - sizeof(int32_t));
+    fieldIS = postingsReader.getInputStream(0);
+    fieldIS.seek(postingsReader.segInfoOffset - sizeof(int32_t));
     fieldOffsetsLoc = fieldIS.offset();
     auto fieldLocEnd = fieldIS.ptr();
     nFields = fieldIS.readInt();
