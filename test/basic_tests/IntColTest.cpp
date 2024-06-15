@@ -289,6 +289,7 @@ TEST_F(IntColTest, testMonoBig) {
     RAMDir dir;
     auto file = dir.createFile("mono");
     OutputStream out(file.get());
+    out.writeStr("SOMETHING");
     MemPool pool;
     MonoWriter w(pool, out);
     int32_t deltaMax = rng() & std::numeric_limits<int32_t>::max();

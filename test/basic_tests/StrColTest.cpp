@@ -1,9 +1,8 @@
-#include "solux/index/Inverter.h"
-#include "solux/index/PostingsWriter.h"
-#include "solux/reader/PostingsReader.h"
+
 #include "gtest/gtest.h"
 #include "test/SoluxTest.h"
 #include "test/TestIndex.h"
+#include "test/TestUtils.h"
 #include <vector>
 
 using namespace solux;
@@ -140,7 +139,7 @@ TEST_F(StrColTest, basicMerge) {
 
 
 TEST_F(StrColTest, multiValued) {
-/*
+
   {
     // single doc, single valued (but multi-valued field)
     TestIndex testIndex;
@@ -153,7 +152,6 @@ TEST_F(StrColTest, multiValued) {
     ASSERT_EQ(1, f.ord());
     ASSERT_EQ(-1, f.nextDoc());
   }
-*/
 
   {
     // single doc, multi-valued
@@ -166,10 +164,31 @@ TEST_F(StrColTest, multiValued) {
     ASSERT_EQ(0, f.nextDoc());
     std::vector<int64_t> ords;
     f.ords(ords);
-    std::vector<int64_t> expected = {1, 2};
-    ASSERT_EQ(expected, ords);
+    ASSERT_EQ(ords, vec(1l,2l));
     ASSERT_EQ(-1, f.nextDoc());
   }
 
+  {
+    // multiple docs, multi-valued
+    TestIndex testIndex;
+    TestField f(testIndex, "foo_ss");
+    f.startIndexing();
+    f.addStrings(5, {"b", "a"});
+    f.addStrings(10, {"c","c"});  // handle duplicates (or throw an error)
+    f.addStrings(15, {"c", "b", "a"});
+    testIndex.flush();
+    f.startReading();
+    ASSERT_EQ(5, f.nextDoc());
+    std::vector<int64_t> ords;
+    f.ords(ords);
+    ASSERT_EQ(ords, vec(1l,2l));
+    ASSERT_EQ(10, f.nextDoc());
+    f.ords(ords);
+    ASSERT_EQ(ords, vec(3l));
+    ASSERT_EQ(15, f.nextDoc());
+    f.ords(ords);
+    ASSERT_EQ(ords, vec(1l,2l,3l));
+    ASSERT_EQ(-1, f.nextDoc());
+  }
 
 }

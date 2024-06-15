@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include "SoluxTest.h"
 #include "solux/index/IndexWriter.h"
 
@@ -17,6 +18,16 @@ struct NameVal {
 };
 
 using Doc = std::vector<NameVal>;
+
+template <typename... Args>
+constexpr auto arr(Args&&... args) {
+  return std::to_array({std::forward<Args>(args)...});
+}
+
+template<typename... Args>
+auto vec(Args&&... args) {
+  return std::vector{std::forward<Args>(args)...};
+}
 
 // allow construction of a Doc with just alternating names and values. Example:
 // auto doc1 = flatdoc("name1", 1, "name2", 2.0, "name3", "hi");

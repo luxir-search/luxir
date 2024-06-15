@@ -206,7 +206,7 @@ public:
     // lowering the intercept by minDelta.  Although this will raise the average delta, it should not
     // change the maximum number of bits needed to represent the largest.
     intercept += minDelta;
-    blockInfo.push_back({out.size(), scaled_slope, (int32_t)intercept, (uint8_t)bits});
+    blockInfo.push_back({out.size() - colStart, scaled_slope, (int32_t)intercept, (uint8_t)bits});
 
     if (bits > 32) {
       out.write((const char*)arr.data(), arr.size() * sizeof(int64_t));
