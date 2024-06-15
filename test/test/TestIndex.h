@@ -299,7 +299,7 @@ namespace solux::test {
         if (!found) continue;
 
         fieldReader.readFieldInfo(fieldInfo);
-        colReader = std::make_unique<IntColReader>(testIndex.pool, seg.postingsReader(), fieldInfo);
+        colReader = std::make_unique<IntColReader>(testIndex.pool, seg.postingsReader(), fieldInfo); // todo nocommit, when will pool rollback be done?
         // EXPECT_EQ(colReader->docsWithField(), nAdds); // TODO: sum up and only do after final segment has been reached
         iter = std::make_unique<IntColReader::Iterator>(*colReader);
         return true;

@@ -140,7 +140,7 @@ TEST_F(StrColTest, basicMerge) {
 
 
 TEST_F(StrColTest, multiValued) {
-  /*
+/*
   {
     // single doc, single valued (but multi-valued field)
     TestIndex testIndex;
@@ -154,7 +154,7 @@ TEST_F(StrColTest, multiValued) {
     ASSERT_EQ(-1, f.nextDoc());
   }
 */
-  /* nocommit
+
   {
     // single doc, multi-valued
     TestIndex testIndex;
@@ -170,6 +170,6 @@ TEST_F(StrColTest, multiValued) {
     ASSERT_EQ(expected, ords);
     ASSERT_EQ(-1, f.nextDoc());
   }
-*/
+
 
 }

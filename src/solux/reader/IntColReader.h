@@ -119,8 +119,10 @@ public:
     columnIS = postingsReader.getInputStreamSeek(fieldInfo.columnLoc);
     blocks = reinterpret_cast<const char *>(columnIS.ptr());
     blockMeta = reinterpret_cast<const NumericBlockInfo *>(blocks + fieldInfo.columnMetaOff);
-    if (fieldInfo.monoMetaOff > 0) {
+    if (fieldInfo.monoLoc.offset() > 0) {
       endRankReader = pool.make<MonoReader>(pool, postingsReader, fieldInfo.monoLoc, fieldInfo.monoMetaOff, fieldInfo.docsWithField);
+    } else {
+      endRankReader = nullptr;
     }
   }
 
@@ -165,7 +167,7 @@ public:
   public:
 
     DenseValues(const IntColReader& col) : blockMeta(col.blockMeta), blocks(col.blocks) {
-      max = col.fieldInfo.docsWithField;
+      max = col.fieldInfo.numValues;
     }
 
     int64_t index() {
@@ -222,7 +224,7 @@ public:
   public:
 
     BulkValues(const IntColReader& col) : blockMeta(col.blockMeta), blocks(col.blocks) {
-      max = col.fieldInfo.docsWithField;
+      max = col.fieldInfo.numValues;
     }
 
     int64_t index() {
