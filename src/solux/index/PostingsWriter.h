@@ -173,9 +173,9 @@ public:
 
   // not thread-safe
   IndexFieldInfo& addField(PackedTerm fieldName) {
-    fieldInfos.emplace_back(); // we should get default-initialization with this.
+    fieldInfos.emplace_back(); // we should get default-initialization with this for the SegFieldInfo members
     fieldInfos.back().fieldname = fieldName;
-    assert(fieldInfos.back().monoMeta.offset() == 0);
+    assert(fieldInfos.back().monoLoc.offset() == 0 && fieldInfos.back().monoMetaOff == 0 && fieldInfos.back().columnMetaOff == 0);
     return fieldInfos.back();
   }
 
@@ -196,6 +196,10 @@ public:
       files.emplace_back(DataFile{OutputStream{},std::move(file), fnum});
       files.back().out.setFile( files.back().file.get());
       files.back().out.streamNumber = fnum;
+      // writing something at the start of the file acts as a sanity check, and also makes file locations of 0
+      // invalid (and thus distinguishable from default-initialized).
+      // TODO: think about embedding other info such as the segment id and file number?
+      files.back().out.writeStr("SOLUX001");
       // insert at front of free list to maintain sorted order.
       freeFiles.insert(freeFiles.begin(), &files.back().out);
     }
@@ -327,11 +331,12 @@ private:
       // if ((finfo.flags & 0x02) != 0) {
       fieldOutput.writeVal(finfo.docsWithFieldEndLoc);
       fieldOutput.writeVal(finfo.columnLoc);
-      fieldOutput.writeVal(finfo.columnMeta);
+      fieldOutput.writeVlong(finfo.columnMetaOff);
+      fieldOutput.writeVlong(finfo.numValues);
 
       // for now, always write mono col info.  If we want to make it optional, we need a flag for it.
-      fieldOutput.writeVal(finfo.monoMeta);
       fieldOutput.writeVal(finfo.monoLoc);
+      fieldOutput.writeVlong(finfo.monoMetaOff);
     }
 
     // Now write the start of each fieldInfo

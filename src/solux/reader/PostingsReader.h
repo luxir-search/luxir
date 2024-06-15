@@ -281,11 +281,12 @@ struct SegFieldInfo {
 
   // column
   seg_location docsWithFieldEndLoc;
-  seg_location columnMeta;   // info about the blocks of the column
-  seg_location columnLoc;    // location of the column data
+  seg_location columnLoc;    // location of the start of the column
+  int64_t columnMetaOff;     // offset from the start of the column to the metadata
+  int64_t numValues;         // numValues in the column. for singleValued fields, docsWithField == numValues
 
-  seg_location monoMeta;     // monotonic int column metadata
-  seg_location monoLoc;
+  seg_location monoLoc;   // location of the monotonic column
+  int64_t monoMetaOff;    // offset from the start of the mono column to the metadata
 };
 
 
@@ -393,10 +394,11 @@ public:
 
       fieldInfo.docsWithFieldEndLoc = fieldIS.readVal<seg_location>();
       fieldInfo.columnLoc = fieldIS.readVal<seg_location>();
-      fieldInfo.columnMeta = fieldIS.readVal<seg_location>();
+      fieldInfo.columnMetaOff = fieldIS.readVlong();
+      fieldInfo.numValues = fieldIS.readVlong();
 
-      fieldInfo.monoMeta = fieldIS.readVal<seg_location>();
       fieldInfo.monoLoc = fieldIS.readVal<seg_location>();
+      fieldInfo.monoMetaOff = fieldIS.readVlong();
     }
   }
 
@@ -413,8 +415,8 @@ class TermsEnum {
   friend class DocsEnum;
 
   InputStream termsIS;
-  PostingsReader& postingsReader;
   MemPool& pool;
+  PostingsReader& postingsReader;
 
   const SegFieldInfo& fieldInfo;
 
@@ -731,7 +733,7 @@ public:
   // This instance *does* rely on fieldInfo that was passed into the TermsEnum instance still being valid.
   DocsEnum(MemPool& pool, PostingsReader& postingsReader, TermsEnum& tenum,
            int32_t* docsScratch=nullptr, int32_t* posScratch=nullptr, int32_t* tfreqScratch=nullptr)
-  : postingsReader(postingsReader), pool(&pool), fieldInfo(tenum.fieldInfo)
+  : postingsReader(postingsReader), fieldInfo(tenum.fieldInfo), pool(&pool)
   {
     unused(docsScratch, posScratch, tfreqScratch);
     docBuf=db;

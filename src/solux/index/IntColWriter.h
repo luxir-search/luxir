@@ -10,45 +10,6 @@ namespace solux {
 // To increase locality and decrease seeks, we could ensure that docsWithField always immediately follow the values.
 // We could use an OutputStream that writes to RAM or even a MemPool implementation (or OutputStream writing to MemPool)
 //
-class IntColWriterSimple {
-  PostingsWriter& postingsWriter;
-  PostingsWriter::IndexFieldInfo& fieldInfo;
-  OutputStream& colOutput;
-  int64_t colStart;
-  int32_t nAdded = 0;            // number of values added. redundant with numDocsWithValue, for sanity check
-public:
-
-  // This class allocates from the pool but does not do any visible rollbacks.
-  IntColWriterSimple(MemPool& pool, PostingsWriter& postingsWriter, PostingsWriter::IndexFieldInfo& fieldInfo)
-  : postingsWriter(postingsWriter), fieldInfo(fieldInfo), colOutput(postingsWriter.obtainOutputStream()) {
-    unused(pool);
-    colStart = colOutput.size();
-  }
-
-  ~IntColWriterSimple() {
-    postingsWriter.releaseOutputStream(colOutput);
-  }
-
-  void startField() {
-  }
-
-  void addInt64(int64_t val) {
-    nAdded++;
-    // temporary worst-case implementation with no compression
-    colOutput.writeLong(val);
-  }
-
-  // returns number of values written
-  int32_t finish() {
-    // bool allDocsHaveValue = nAdded == postingsWriter.getMaxDoc();
-
-    // FUTURE:write index into value blocks here
-    // nocommit fieldInfo.flags |= 0x02;  // int64 values
-    fieldInfo.docsWithField = nAdded;
-    fieldInfo.columnLoc = seg_location(colOutput.streamNumber, colStart);
-    return nAdded;
-  }
-};
 
 
 class IntColWriter {
@@ -60,7 +21,7 @@ private:
   PostingsWriter::IndexFieldInfo& fieldInfo;
   OutputStream& colOutput;
   size_t colStart;
-  size_t nAdded = 0;            // number of values added. redundant with numDocsWithValue, for sanity check
+  int64_t nAdded = 0;
 
   std::vector<IntColReader::NumericBlockInfo> blockInfo;
   std::vector<int64_t> values;
@@ -130,9 +91,9 @@ public:
     // We should make a version that can accept 64 bit integers that just use the lower half.
     ivalues.reserve(arr.size());
     ivalues.resize(0);
-    for (size_t i=0; i<arr.size(); i++) {
-      ivalues.push_back((arr[i] - min) / gcd);
-      assert(int64_t(ivalues.back()) * gcd + min == arr[i]);
+    for (auto v : arr) {
+      ivalues.push_back(int32_t((v - min) / gcd));  // guaranteed to fit since bits <=32
+      assert(int64_t(ivalues.back()) * gcd + min == v);
     }
 
     if (false && bits > 28) {  // future... need to manage our own metadata (bits,min) for this to work on reading side.
@@ -165,22 +126,18 @@ public:
   }
 
   // returns number of values written
-  int32_t finish() {
+  int64_t finish() {
     // bool allDocsHaveValue = nAdded == postingsWriter.getMaxDoc();
     if (!values.empty()) {
       addBlock(values);
       values.resize(0);
     }
 
-    // TODO: for dense iteration, we prob don't want to unpack a whole block at once.  We should be
-    // able to unpack some multiple of 128 values at a time and keep the same speed?
-    fieldInfo.columnMeta = seg_location(colOutput.streamNumber, colOutput.size());
+    fieldInfo.columnLoc = seg_location(colOutput.streamNumber, colStart);
+    fieldInfo.columnMetaOff = colOutput.size() - colStart;
     // the number of blocks can be derived from nAdded.
     colOutput.write((const char*)blockInfo.data(), blockInfo.size() * sizeof(IntColReader::NumericBlockInfo));
-
-    // nocommit fieldInfo.flags |= 0x02;  // int64 values
-    fieldInfo.docsWithField = nAdded;
-    fieldInfo.columnLoc = seg_location(colOutput.streamNumber, colStart);
+    fieldInfo.numValues = nAdded;  // TODO: do this here?
     return nAdded;
   }
 };
@@ -200,16 +157,16 @@ private:
 public:
   /// "output" column metadata that is filled in / valid after finish() is called.
   /// Both are currently needed for MonoReader.
-  // We could write the block offset relative to the metaLoc
-  // in the metadata itself to save SegFieldInfo space, but it's unclear if we will end up wanting start + size
-  // of everything in the future to read partial files on demand (in which case, we would want loc + size and
-  // be able to calculate everything else from that.
   seg_location blockLoc;
-  seg_location metaLoc;
+  int64_t metaOff;
 
   MonoWriter(MemPool& pool, OutputStream& out) : pool(pool), out(out) {
-    unused(pool);
+    unused(this->pool);
     colStart = out.size();
+  }
+
+  OutputStream& getOutputStream() {
+    return out;
   }
 
   void startField() {
@@ -288,8 +245,14 @@ public:
       values.resize(0);
     }
 
+    // If we added enough values, ensure alignment of the block meta array.
+    if (nAdded >= 128) {  // This is just a guess and the exact value is not needed for correctness.
+      out.align(8);
+    }
+    // TODO: we should align the blocks as well if we know we will add enough values.
+
     blockLoc = seg_location(out.streamNumber, colStart);
-    metaLoc = seg_location(out.streamNumber, out.size());
+    metaOff = out.size() - colStart;
 
     // the number of blocks can be derived from nAdded.
     out.write((const char*)blockInfo.data(), blockInfo.size() * sizeof(MonoReader::BlockInfo));

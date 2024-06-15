@@ -253,7 +253,7 @@ TEST_F(IntColTest, testMono) {
 
     auto in = dir.openFile("mono");
     InputStream is(in->getInputStream());
-    MonoReader r(pool, is, w.metaLoc.offset(), w.blockLoc.offset(), nVals);
+    MonoReader r(pool, is, w.blockLoc.offset(), w.metaOff, nVals);
 
     ASSERT_EQ(nVals, r.numValues());
     ASSERT_EQ(10, r.valueAt(0));
@@ -277,7 +277,7 @@ TEST_F(IntColTest, testMono) {
 
     auto in = dir.openFile("mono");
     InputStream is(in->getInputStream());
-    MonoReader r(pool, is, w.metaLoc.offset(), w.blockLoc.offset(), nVals);
+    MonoReader r(pool, is, w.blockLoc.offset(), w.metaOff, nVals);
 
     ASSERT_EQ(nVals, r.numValues());
     ASSERT_EQ(123, r.valueAt(0));
@@ -323,7 +323,7 @@ TEST_F(IntColTest, testMonoBig) {
 
     auto in = dir.openFile("mono");
     InputStream is(in->getInputStream());
-    MonoReader r(pool, is, w.metaLoc.offset(), w.blockLoc.offset(), nVals);
+    MonoReader r(pool, is, w.blockLoc.offset(), w.metaOff, nVals);
 
     rand = rng;  // reset the rng so we can produce the same sequence of numbers.
     for (auto i = 0u; i < num; i++) {

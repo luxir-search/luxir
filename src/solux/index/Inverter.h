@@ -92,6 +92,11 @@ public:
     virtual void index(Inverter& inverter, char* mutableVal, int len) {
       unused(inverter, mutableVal, len);
     }
+    // yuck.  this is to handle an array of strings in protobuf (without creating a new list)
+    virtual void index(Inverter& inverter, std::span<std::string_view> vals) {
+      unused(inverter,vals);
+    }
+    // yuck.  this is to handle an array of strings in protobuf (without creating a new list)
     virtual void index(Inverter& inverter, std::span<const std::string* const> vals) {
       unused(inverter,vals);
     }
@@ -363,8 +368,13 @@ public:
         v = val.s();
       } else if (val.has_bin()) {
         v = val.bin();
+      } else if (val.has_arr_s()) {
+        auto& arr = val.arr_s().v();
+        std::span<const std::string* const> values(arr.data(), arr.size());
+        index(inverter, values);
+        return;
       }
-      // TODO: handle arrays as well.
+      // TODO: handle arrays of binary as well
 
       indexSingle(inverter, v);
     }
@@ -388,9 +398,19 @@ public:
         indexSingle(inverter, *val);
       }
       maxValues = std::max(maxValues, vals.size());
+      // TODO: check if fieldType allows multiple values?
+    }
+
+    void index(Inverter& inverter, std::span<std::string_view> vals) override {
+      for (auto val: vals) {
+        indexSingle(inverter, val);
+      }
+      maxValues = std::max(maxValues, vals.size());
+      // TODO: check if fieldType allows multiple values?
     }
 
     void flush(Inverter& inverter) override {
+      auto nDocs = inverter.getMaxDoc();
       auto guard = MemPool::threadLocalPoolGuard();
 
       int32_t numVals = termsHash.size();
@@ -411,7 +431,7 @@ public:
       // for dense fields.  Then we could simply memcpy the ordinals into the postings file.
       // std::vector<int> docToOrd(inverter.currDoc+1, 0); // This is very inefficient temporary implementation.
       // ord vec must me 0 initialized since that is value that means "missing".
-      OrdCollector ords(inverter.pool, inverter.currDoc+1);
+      OrdCollector ords(inverter.pool, nDocs);
 
 
       textWriter.startField(&fieldInfo);
@@ -441,11 +461,14 @@ public:
       {
         auto g2 = guard.pool().rewindScopeGuard();
         IntColWriter ordCol(guard.pool(), inverter.postingsWriter, fieldInfo);
+
+        // If the field is multi-valued, we write the end value rank for each docid.  Thus, the values for any
+        // docid are values[endRank[docid-1]:endRank[docid])
         u_ptr<MonoWriter> endRankWriter = ords.multiValued() ? guard.pool().make_unique<MonoWriter>(guard.pool(), inverter.getPostingsWriter().obtainOutputStream()) : nullptr;
 
         ordCol.startField();
         int64_t nValues = 0;
-        for (int docid = 0; docid <= inverter.currDoc; docid++) {
+        for (int docid = 0; docid < nDocs; docid++) {
           auto prevNValues = nValues;
           ords.pushValues(docid, [&](int32_t ord) {
             ordCol.addInt64(ord);
@@ -468,7 +491,8 @@ public:
         if (endRankWriter) {
           endRankWriter->finish();
           fieldInfo.monoLoc = endRankWriter->blockLoc;
-          fieldInfo.monoMeta = endRankWriter->metaLoc;
+          fieldInfo.monoMetaOff = endRankWriter->metaOff;
+          inverter.postingsWriter.releaseOutputStream(endRankWriter->getOutputStream());
         }
       }
 
@@ -476,7 +500,7 @@ public:
         auto g2 = guard.pool().rewindScopeGuard();
         DocsWithValWriter docsWriter(guard.pool(), inverter.postingsWriter, fieldInfo);
         if (!full) {
-          for (int docid = 0; docid <= inverter.currDoc; docid++) {
+          for (int docid = 0; docid < nDocs; docid++) {
             if (ords.hasValues(docid)) {
               docsWriter.startDoc(docid);
             }
@@ -489,7 +513,7 @@ public:
           }
           docsWriter.finish();
         } else {
-          docsWriter.finishDense(numVals);
+          docsWriter.finishDense(nDocs);
         }
       }
 

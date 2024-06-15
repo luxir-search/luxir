@@ -5,14 +5,87 @@
 namespace solux {
 
 
+
+// Monotonic int col.  Currently supports 32 bit indexes and 64 bit outputs.
+class MonoReader {
+public:
+  constexpr static uint32_t BLOCK_SIZE = Postings::NUMERIC_BLOCK_SIZE;
+  // For monotonic fields, we store the slope of the line and interpolate the values (and store
+  // the delta from the expected value).
+  // Instead of using floating point math when decoding, we use a scaled slope and do integer math.
+  // Our integral slope estimate should be within .25 of the expected value calculated with doubles.
+  // This leaves the rest of the bits to interpolate large values: 2^64/(16384*4) = 2.8e14
+  constexpr static uint64_t SLOPE_SCALE = BLOCK_SIZE * 4;
+
+  // either make this struct packed, or round it out so there won't be any undefined padding between elements.
+  SOLUX_PACKED_START
+  struct BlockInfo {
+    uint64_t blockOffset;
+    uint64_t scaledSlope;
+    int32_t intercept;
+    uint8_t bits;
+    uint8_t _padding[3]={0,0,0};
+  } SOLUX_PACKED_END;
+
+protected:
+  InputStream columnIS;
+  const BlockInfo* blockMeta;  // array of block metadata
+  const char* blocks;          // start of the compressed blocks of data
+  int32_t nValues;
+
+public:
+  MonoReader(MemPool &pool, PostingsReader &postingsReader, seg_location loc, int64_t metaOff, int32_t nValues)
+  {
+    columnIS = postingsReader.getInputStreamSeek(loc);
+    blocks = columnIS.ptr();
+    blockMeta = reinterpret_cast<const BlockInfo *>(blocks + metaOff);
+    this->nValues = nValues;
+  }
+
+  MonoReader(MemPool &pool, InputStream is, int64_t loc, int64_t metaOff, int32_t nValues)
+  {
+    columnIS = is;
+    blocks = columnIS.ptr(loc);
+    blockMeta = reinterpret_cast<const BlockInfo *>(blocks + metaOff);
+    this->nValues = nValues;
+  }
+
+  [[nodiscard]] int32_t numValues() const {
+    return nValues;
+  }
+
+  [[nodiscard]] int64_t valueAt(int32_t index) const {
+    assert (index >= 0 && index < nValues);
+    auto blockNum = (uint64_t)index / BLOCK_SIZE;
+    auto rankInBlock = (uint64_t)index % BLOCK_SIZE;
+    auto& block = blockMeta[blockNum];
+    const char* blockStart = blocks + block.blockOffset;
+    if (block.bits > 32) {
+      return reinterpret_cast<const int64_t*>(blockStart)[rankInBlock];
+    }
+    // depending on the exact format, valuesInBlock may not be needed.
+    auto valuesInBlock = (blockNum == uint64_t(nValues) / BLOCK_SIZE) ? uint32_t(nValues) % BLOCK_SIZE : BLOCK_SIZE;
+    auto delta = Postings::numericCodec.selectWithMeta(blockStart, valuesInBlock, rankInBlock, 0, block.bits);
+    int64_t scaled = uint64_t(rankInBlock * block.scaledSlope) / SLOPE_SCALE + block.intercept + delta;
+    return scaled;
+  }
+
+  // Retrieve values[index-1], values[index].  If index is 0, the first value is 0.
+  [[nodiscard]] std::pair<int64_t, int64_t> valuesAt(int32_t index) const {
+    auto v1 = index > 0 ? valueAt(index - 1) : 0;
+    auto v2 = valueAt(index);
+    return {v1, v2};
+  }
+
+};
+
+
 // Some logical columns have multiple underlying columns implementing them:
 // A sparse multi-valued integer column:
 //   1) a dense array of single integer values (usually compressed)
 //   2) a monotonic array that gives the start (or end) index into (1) for docs that have a value
 //   3) a screaming bitset of docs containing the field
 //
-
-
 class IntColReader {
 public:
   // Sentinel values.  ENDDOC is used when indexing documents, since there are only 2B in a segment.
@@ -36,6 +109,7 @@ private:
   const SegFieldInfo &fieldInfo;
   const NumericBlockInfo* blockMeta;  // array of block metadata
   const char* blocks;                 // start of the compressed blocks of data
+  MonoReader* endRankReader;          // optional, exists if multi-valued.
 
 public:
   IntColReader(MemPool &pool, PostingsReader &postingsReader, const SegFieldInfo &fieldInfo) :
@@ -43,12 +117,36 @@ public:
   fieldInfo(fieldInfo)
   {
     columnIS = postingsReader.getInputStreamSeek(fieldInfo.columnLoc);
-    blockMeta = reinterpret_cast<const NumericBlockInfo *>(columnIS.ptr(fieldInfo.columnMeta.offset()));
-    blocks = reinterpret_cast<const char *>(columnIS.ptr(fieldInfo.columnLoc.offset()));
+    blocks = reinterpret_cast<const char *>(columnIS.ptr());
+    blockMeta = reinterpret_cast<const NumericBlockInfo *>(blocks + fieldInfo.columnMetaOff);
+    if (fieldInfo.monoMetaOff > 0) {
+      endRankReader = pool.make<MonoReader>(pool, postingsReader, fieldInfo.monoLoc, fieldInfo.monoMetaOff, fieldInfo.docsWithField);
+    }
+  }
+
+  // Number of values in field.  For a multi-valued field, this will be greater than docsWithValue
+  int64_t numValues() {
+    return fieldInfo.numValues;
   }
 
   int32_t docsWithValue() {
     return fieldInfo.docsWithField;
+  }
+
+  bool multiValued() {
+    return endRankReader != nullptr;
+  }
+
+  /// Retrieves the start and end ranks into the values for the given rank.
+  /// only valid if multiValued() is true
+  std::pair<int64_t, int64_t> getStartEndRank(int32_t index) {
+    return endRankReader->valuesAt(index);
+  }
+
+  /// Retrieves the start rank into the values for the given rank.
+  /// only valid if multiValued() is true
+  int64_t getStartRank(int32_t index) {
+    return index == 0 ? 0 : endRankReader->valueAt(index-1);
   }
 
   template <class DocAcceptor>
@@ -194,6 +292,7 @@ public:
   // This is an iterator over documents, so indexes will always be 32 bit.
   template <class DenseValueImpl>
   class DocIterator {
+  protected:
     const IntColReader& col;
     screaming::BitSet::Iterator docsIter;
     DenseValueImpl valueIter;
@@ -208,6 +307,10 @@ public:
       dense = !col.docs.hasBitset();
     }
 
+    DenseValueImpl& values() {
+      return valueIter;
+    }
+
     int64_t docId() {
       return doc;
     }
@@ -216,6 +319,8 @@ public:
       return docRank;
     }
 
+    /// for single-valued fields only!  For multi-valued
+    /// use values() to get the start and end ranks.
     int64_t value() {
       return valueIter.valueAt(docRank);
     }
@@ -260,72 +365,5 @@ public:
 
 };
 
-
-// Monotonic int col.  Currently supports 32 bit indexes and 64 bit outputs.
-class MonoReader {
-public:
-  constexpr static uint32_t BLOCK_SIZE = Postings::NUMERIC_BLOCK_SIZE;
-  // For monotonic fields, we store the slope of the line and interpolate the values (and store
-  // the delta from the expected value).
-  // Instead of using floating point math when decoding, we use a scaled slope and do integer math.
-  // Our integral slope estimate should be within .25 of the expected value calculated with doubles.
-  // This leaves the rest of the bits to interpolate large values: 2^64/(16384*4) = 2.8e14
-  constexpr static uint64_t SLOPE_SCALE = BLOCK_SIZE * 4;
-
-  // either make this struct packed, or round it out so there won't be any undefined padding between elements.
-  SOLUX_PACKED_START
-  struct BlockInfo {
-    uint64_t blockOffset;
-    uint64_t scaledSlope;
-    int32_t intercept;
-    uint8_t bits;
-    uint8_t _padding[3]={0,0,0};
-  } SOLUX_PACKED_END;
-
-private:
-  InputStream columnIS;
-  const BlockInfo* blockMeta;  // array of block metadata
-  const char* blocks;          // start of the compressed blocks of data
-  int32_t nValues;
-
-public:
-  MonoReader(MemPool &pool, PostingsReader &postingsReader, seg_location metaLoc, seg_location blockLoc, int32_t nValues)
-  {
-    columnIS = postingsReader.getInputStreamSeek(blockLoc);
-    blocks = columnIS.ptr();
-    assert(metaLoc.filenum() == blockLoc.filenum());
-    blockMeta = reinterpret_cast<const BlockInfo *>(columnIS.ptr(metaLoc.offset()));
-    this->nValues = nValues;
-  }
-
-  MonoReader(MemPool &pool, InputStream is, int64_t metaLoc, int64_t blockLoc, int32_t nValues)
-  {
-    columnIS = is;
-    blocks = columnIS.ptr(blockLoc);
-    blockMeta = reinterpret_cast<const BlockInfo *>(columnIS.ptr(metaLoc));
-    this->nValues = nValues;
-  }
-
-  int32_t numValues() const {
-    return nValues;
-  }
-
-  int64_t valueAt(int32_t index) const {
-    assert (index >= 0 && index < nValues);
-    auto blockNum = (uint64_t)index / BLOCK_SIZE;
-    auto rankInBlock = (uint64_t)index % BLOCK_SIZE;
-    auto& block = blockMeta[blockNum];
-    const char* blockStart = blocks + block.blockOffset;
-    if (block.bits > 32) {
-      return reinterpret_cast<const int64_t*>(blockStart)[rankInBlock];
-    }
-    // depending on the exact format, valuesInBlock may not be needed.
-    auto valuesInBlock = (blockNum == uint64_t(nValues) / BLOCK_SIZE) ? uint32_t(nValues) % BLOCK_SIZE : BLOCK_SIZE;
-    auto delta = Postings::numericCodec.selectWithMeta(blockStart, valuesInBlock, rankInBlock, 0, block.bits);
-    int64_t scaled = uint64_t(rankInBlock * block.scaledSlope) / SLOPE_SCALE + block.intercept + delta;
-    return scaled;
-  }
-
-};
 
 } // end namespace

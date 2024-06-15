@@ -231,6 +231,12 @@ namespace solux::test {
       nAdds++;
     }
 
+    void addStrings(int32_t docid, std::vector<std::string_view>&& vals) {
+      inverter->setDoc(docid);
+      indexHandler->index(*inverter, vals);
+      nAdds++;
+    }
+
     void startReading() {
       testIndex.initReader();  // TODO: don't do this for each field, it will invalidate previous pointers!
       currSeg = -1;
@@ -258,6 +264,23 @@ namespace solux::test {
 
     int64_t ord() {
       return v = iter->value();
+    }
+
+    void vals(std::vector<int64_t>& target) {
+      target.resize(0);
+      if (!colReader->multiValued()) {
+        target.push_back(val());
+      } else {
+        auto docrank = iter->rank();
+        auto [startRank, endRank] = colReader->getStartEndRank(docrank);
+        for (auto vrank = startRank; vrank < endRank; vrank++) {
+          target.push_back(iter->values().valueAt(vrank));
+        }
+      }
+    }
+
+    void ords(std::vector<int64_t>& target) {
+      vals(target);
     }
 
     bool nextSegment() {
