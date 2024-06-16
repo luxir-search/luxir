@@ -154,7 +154,7 @@ TEST_F(StrColTest, multiValued) {
   }
 
   {
-    // single doc, multi-valued
+    // single doc, multi-valued, dense
     TestIndex testIndex;
     TestField f(testIndex, "foo_ss");
     f.startIndexing();
@@ -162,6 +162,22 @@ TEST_F(StrColTest, multiValued) {
     testIndex.flush();
     f.startReading();
     ASSERT_EQ(0, f.nextDoc());
+    std::vector<int64_t> ords;
+    f.ords(ords);
+    ASSERT_EQ(ords, vec(1l, 2l));
+    ASSERT_EQ(-1, f.nextDoc());
+  }
+
+  {
+    // single doc, multi-valued, sparse (designed to trigger a bug
+    // where inverter would think column was dense because numValues==numDocs
+    TestIndex testIndex;
+    TestField f(testIndex, "foo_ss");
+    f.startIndexing();
+    f.addStrings(1, {"b", "a"});
+    testIndex.flush();
+    f.startReading();
+    ASSERT_EQ(1, f.nextDoc());
     std::vector<int64_t> ords;
     f.ords(ords);
     ASSERT_EQ(ords, vec(1l, 2l));

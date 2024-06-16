@@ -413,19 +413,16 @@ public:
       auto nDocs = inverter.getMaxDoc();
       auto guard = MemPool::threadLocalPoolGuard();
 
-      int32_t numVals = termsHash.size();
-      auto full = numVals >= inverter.postingsWriter.getMaxDoc();  // FIXME nocommit - this is no longer true with muttiValued! come up w/ test that fails?
+      int32_t uniqueVals = termsHash.size();
 
       auto terms = termsHash.destructiveCompress();
-      boost::sort::spreadsort::string_sort(terms, terms+numVals, TermRef::bracket(), TermRef::getsize(), TermRef::lessthan());
+      boost::sort::spreadsort::string_sort(terms, terms+uniqueVals, TermRef::bracket(), TermRef::getsize(), TermRef::lessthan());
 
       // TODO: TextWriter should be refactored (or templated) to handle strings without positions.
       TextWriter textWriter(inverter.getPostingsWriter());
       PostingsWriter::IndexFieldInfo& fieldInfo = inverter.getPostingsWriter().addField(fieldName);
       fieldInfo.type = fieldType->type();
       fieldInfo.flags = fieldType->flags_;
-      // nocommit fieldInfo.flags = 0x04; // ord column
-
 
       // For ordinals, we already know the number of unique terms, so we can use an optimal number of bits right off the bat
       // for dense fields.  Then we could simply memcpy the ordinals into the postings file.
@@ -435,7 +432,7 @@ public:
 
 
       textWriter.startField(&fieldInfo);
-      for (int32_t tnum=0; tnum<numVals; tnum++) {
+      for (int32_t tnum=0; tnum < uniqueVals; tnum++) {
         auto term = terms[tnum];
         textWriter.startTerm(term);
         // push all the docs for this term to the TextWriter, as well as record the ordinal for each doc
@@ -495,6 +492,8 @@ public:
           inverter.postingsWriter.releaseOutputStream(endRankWriter->getOutputStream());
         }
       }
+
+      bool full = ords.docsWithValue() == nDocs;
 
       {
         auto g2 = guard.pool().rewindScopeGuard();
