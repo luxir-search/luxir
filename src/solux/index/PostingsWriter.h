@@ -860,7 +860,7 @@ class DocsWithValWriter {
   PostingsWriter::IndexFieldInfo& fieldInfo; // don't have to store if we pass it to finish
 
 public:
-  // This field writer does not do any visible pool rollbacks, but does allocate from the pool.
+  // TODO: fixme... this obtains an outputStream and hence should not be used if the field is dense.
   DocsWithValWriter(MemPool& pool, PostingsWriter& postingsWriter, PostingsWriter::IndexFieldInfo& fieldInfo)
   : idOutput(postingsWriter.obtainOutputStream()), docsWriter(pool,idOutput), postingsWriter(postingsWriter), fieldInfo(fieldInfo)
   {
@@ -878,8 +878,7 @@ public:
 
   void finish() {
     fieldInfo.docsWithField = docsWriter.finish();
-    int64_t endLoc = idOutput.size();
-    fieldInfo.docsWithFieldEndLoc = seg_location(idOutput.streamNumber, endLoc);
+    fieldInfo.docsWithFieldEndLoc = idOutput.slocation();
   }
 
   // Signal that the column has all docs present. No docs should be added in this case, but the count
@@ -887,7 +886,7 @@ public:
   void finishDense(int32_t numDocs) {
     fieldInfo.docsWithField = numDocs;
     // this is a valid location, so use numDocs and see if it matches numDocs of segment to tell if there is data to read
-    fieldInfo.docsWithFieldEndLoc = seg_location(0, 0);
+    fieldInfo.docsWithFieldEndLoc = {0,0};
   }
 };
 

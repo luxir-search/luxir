@@ -9,6 +9,7 @@
 #include "DocStream.h"
 #include "PostingsWriter.h"
 #include "IntColWriter.h"
+#include "OrdColWriter.h"
 
 // so IndexHandler can consume protobuf types
 #include "protos/solux_types.pb.h"
@@ -430,7 +431,6 @@ public:
       // ord vec must me 0 initialized since that is value that means "missing".
       OrdCollector ords(guard.pool(), nDocs);
 
-
       textWriter.startField(&fieldInfo);
       for (int32_t tnum=0; tnum < uniqueVals; tnum++) {
         auto term = terms[tnum];
@@ -451,71 +451,8 @@ public:
       textWriter.endField();
       termsHash.free();
 
-      // Write the ordinals to the postings file.
-      // If this is a multivalued field, then we also need to write to another column that
-      // indicates the end of the values for this doc.  If we want it adjacent, we could wait and traverse the stream
-      // again, or we could write it in parallel to a different output.
-      {
-        auto g2 = guard.pool().rewindScopeGuard();
-        IntColWriter ordCol(guard.pool(), inverter.postingsWriter, fieldInfo);
-
-        // If the field is multi-valued, we write the end value rank for each docid.  Thus, the values for any
-        // docid are values[endRank[docid-1]:endRank[docid])
-        u_ptr<MonoWriter> endRankWriter = ords.multiValued() ? guard.pool().make_unique<MonoWriter>(guard.pool(), inverter.getPostingsWriter().obtainOutputStream()) : nullptr;
-
-        ordCol.startField();
-        int64_t nValues = 0;
-        for (int docid = 0; docid < nDocs; docid++) {
-          auto prevNValues = nValues;
-          ords.pushValues(docid, [&](int32_t ord) {
-            ordCol.addInt64(ord);
-            nValues++;
-          });
-
-          if (prevNValues != nValues && endRankWriter) {
-            endRankWriter->addInt64(nValues);
-          }
-          prevNValues = nValues;
-
-          /*** single-valued version
-          int32_t ord = docToOrd[docid];
-          if (ord != 0) {
-            ordCol.addInt64(ord);
-          }
-          */
-        }
-        ordCol.finish();
-        if (endRankWriter) {
-          endRankWriter->finish();
-          fieldInfo.monoLoc = endRankWriter->blockLoc;
-          fieldInfo.monoMetaOff = endRankWriter->metaOff;
-          inverter.postingsWriter.releaseOutputStream(endRankWriter->getOutputStream());
-        }
-      }
-
-      bool full = ords.docsWithValue() == nDocs;
-
-      {
-        auto g2 = guard.pool().rewindScopeGuard();
-        DocsWithValWriter docsWriter(guard.pool(), inverter.postingsWriter, fieldInfo);
-        if (!full) {
-          for (int docid = 0; docid < nDocs; docid++) {
-            if (ords.hasValues(docid)) {
-              docsWriter.startDoc(docid);
-            }
-            /* single valued version
-            int32_t ord = docToOrd[docid];
-            if (ord != 0) {
-              docsWriter.startDoc(docid);
-            }
-            */
-          }
-          docsWriter.finish();
-        } else {
-          docsWriter.finishDense(nDocs);
-        }
-      }
-
+      OrdColWriter ordsWriter(guard.pool(), inverter.postingsWriter, fieldInfo, ords);
+      ordsWriter.finish();
     }
 
   };

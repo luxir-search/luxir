@@ -4,7 +4,41 @@
 
 namespace solux {
 
-class File;
+class OutputStream;
+
+// A segment-global position (consists of a file number and a file offset)
+// It's made into its own type to enhance type safety so it won't accidentally
+// mix with a plain offset/location.
+class seg_location {
+  uint64_t x;
+  static constexpr uint8_t FILENUM_BITS = 20;
+  static constexpr uint8_t OFFSET_BITS = sizeof(uint64_t)*8 - FILENUM_BITS;
+  static constexpr uint64_t OFFSET_MASK = (~uint64_t(0)) >> FILENUM_BITS;
+
+public:
+  seg_location() noexcept {}
+
+  seg_location(uint32_t fnum, uint64_t offset) noexcept {
+    x = offset + ((uint64_t)fnum << OFFSET_BITS);
+  }
+
+  uint32_t filenum() const noexcept { return x >> OFFSET_BITS; }
+  uint64_t offset() const noexcept { return x & OFFSET_MASK; }
+
+  // return filenum, offset pair
+  std::pair< uint32_t, uint64_t> decode() const noexcept {
+    return {x >> OFFSET_BITS, x & OFFSET_MASK};
+  }
+
+  void write(OutputStream& os) const; // defined after OutputStream
+
+  static seg_location read(InputStream& is) {
+    uint32_t fnum = is.readVint();
+    uint64_t off = is.readVlong();
+    return {fnum, off};
+  }
+};
+
 
 class OutputStream;
 
@@ -41,19 +75,11 @@ class OutputStream {
   size_t flushedSize = 0; // number of bytes that have been flushed to the source
   File *target;
 public:
-  // hack - just used by postings writer to know what field number this stream is associated with.
-  // and avoid another level of nesting/indirection just to add it.
-  using sloc_type = uint64_t;  // sloc_type encodes both location/size and stream number into a segment-level location
-  static constexpr uint64_t STREAMNUM_BITS = 16;
+  // just used by postings writer to know what field number this stream is associated with.
   uint16_t streamNumber;
 
-  static constexpr std::pair<uint64_t,uint16_t> offsetAndStreamNumber(sloc_type loc) {
-    constexpr uint64_t mask = (~uint64_t(0)) >> STREAMNUM_BITS;
-    return {loc & mask, loc >> STREAMNUM_BITS};
-  }
-
-  static constexpr sloc_type encodeSlocation(uint64_t offset, uint16_t streamNum) {
-    return offset + ((sloc_type)streamNum << STREAMNUM_BITS);
+  seg_location slocation() const {
+    return seg_location(streamNumber, size());
   }
 
 public:
@@ -80,9 +106,6 @@ public:
 
   char *ptr() const noexcept { return pos; } // the current position in the buffer
   size_t size() const noexcept { return flushedSize + buffered(); }
-
-  // location code that returns the current offset/size and the stream number
-  uint64_t slocation() const noexcept { return encodeSlocation(size(), streamNumber); }
 
   File *getFile() const noexcept { return target; }
 
@@ -211,6 +234,12 @@ public:
     val.write(*this);
   }
 };
+
+
+inline void seg_location::write(OutputStream& os) const {
+  os.writeVint(filenum());
+  os.writeVlong(offset());
+}
 
 
 // TODO: make a RAMDelegatingFile that starts out in RAM and after a certain size spills to (and delegates to) another

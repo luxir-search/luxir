@@ -264,60 +264,14 @@ private:
       textWriter.endField();
     }
 
-
     if (isOrdCol) {
-      auto& ords = ordCollector.value();
-
-      // Write the ordinals to the postings file.
-      // This is pretty much repeated code from Inverter::StringIndexHandler - TODO: refactor to own Writer.
-      {
-        auto guard = pool.rewindScopeGuard();
-        IntColWriter ordCol(pool, postingsWriter, outputFieldInfo);
-        ordCol.startField();
-
-        u_ptr<MonoWriter> endRankWriter = ords.multiValued() ? guard.pool().make_unique<MonoWriter>(guard.pool(), postingsWriter.obtainOutputStream()) : nullptr;
-
-        int64_t nValues = 0;
-        for (int docid = 0; docid < nDocs; docid++) {
-          auto prev = nValues;
-          ords.pushValues(docid, [&](int32_t ord) {
-            ordCol.addInt64(ord);
-            nValues++;
-          });
-
-          if (prev != nValues && endRankWriter) {
-            endRankWriter->addInt64(nValues);
-          }
-          prev = nValues;
-        }
-
-        ordCol.finish();
-        if (endRankWriter) {
-          endRankWriter->finish();
-          outputFieldInfo.monoLoc = endRankWriter->blockLoc;
-          outputFieldInfo.monoMetaOff = endRankWriter->metaOff;
-          postingsWriter.releaseOutputStream(endRankWriter->getOutputStream());
-        }
-      }
-
-      bool full = (ordCollector->docsWithValue() == nDocs);
-
-      {
-        auto guard = pool.rewindScopeGuard();
-        DocsWithValWriter docsWriter(pool, postingsWriter, outputFieldInfo);
-        if (!full) {
-          for (int docid = 0; docid < nDocs; docid++) {
-            if (ords.hasValues(docid)) {
-              docsWriter.startDoc(docid);
-            }
-          }
-          docsWriter.finish();
-        } else {
-          docsWriter.finishDense(nDocs);
-        }
-      }
-
-    // nocommit } else if (allFlags & 0x02) { // int column (ordCol will currently have this flag set too, hense the else-if)
+      // auto guard = pool.rewindScopeGuard();
+      OrdColWriter ordsWriter(pool, postingsWriter, outputFieldInfo, ordCollector.value());
+      ordsWriter.finish();
+      // nothing is done after this in this method, so we can let the normal destructors clean up.
+      // ordCollector.reset();
+      // ordPool.reset();
+      
     } else { // int column that is not an ord column (assume all other field types have this (currently true)
       // nocommit outputFieldInfo.flags |= 0x02;
       IntColWriter intColWriter(pool, postingsWriter, outputFieldInfo);

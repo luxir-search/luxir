@@ -98,41 +98,6 @@ public:
 
 };
 
-// A segment-global position (consists of a file number and a file offset)
-// It's made into its own type to enhance type safety so it won't accidentally
-// mix with a plain offset/location.
-class seg_location {
-  uint64_t x;
-  static constexpr uint8_t FILENUM_BITS = 20;
-  static constexpr uint8_t OFFSET_BITS = sizeof(uint64_t)*8 - FILENUM_BITS;
-  static constexpr uint64_t OFFSET_MASK = (~uint64_t(0)) >> FILENUM_BITS;
-
-public:
-  seg_location() noexcept {}
-
-  seg_location(uint32_t fnum, uint64_t offset) noexcept {
-    x = offset + ((uint64_t)fnum << OFFSET_BITS);
-  }
-
-  uint32_t filenum() const noexcept { return x >> OFFSET_BITS; }
-  uint64_t offset() const noexcept { return x & OFFSET_MASK; }
-
-  // return filenum, offset pair
-  std::pair< uint32_t, uint64_t> decode() const noexcept {
-    return {x >> OFFSET_BITS, x & OFFSET_MASK};
-  }
-
-  void write(OutputStream& os) const {
-    os.writeVint(filenum());
-    os.writeVlong(offset());
-  }
-
-  static seg_location read(InputStream& is) {
-    uint32_t fnum = is.readVint();
-    uint64_t off = is.readVlong();
-    return {fnum, off};
-  }
-};
 
 
 
@@ -1082,10 +1047,8 @@ public:
     unused(pool);
     ndocs = fieldInfo.docsWithField;
 
-    // docsWithField is currently guaranteed to be in the same file as columnIS
     if (ndocs != postingsReader.numDocs()) {
       InputStream docsWithValIs = postingsReader.getInputStreamSeek(fieldInfo.docsWithFieldEndLoc);
-      // bits.set( docsWithValIs.ptr(fieldInfo.docsWithFieldEndLoc.offset()) );
       bits.set( docsWithValIs.ptr() );
     }
   }
