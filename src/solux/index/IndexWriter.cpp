@@ -271,7 +271,7 @@ private:
       // nothing is done after this in this method, so we can let the normal destructors clean up.
       // ordCollector.reset();
       // ordPool.reset();
-      
+
     } else { // int column that is not an ord column (assume all other field types have this (currently true)
       // nocommit outputFieldInfo.flags |= 0x02;
       IntColWriter intColWriter(pool, postingsWriter, outputFieldInfo);
