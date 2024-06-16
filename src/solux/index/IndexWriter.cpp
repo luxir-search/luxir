@@ -24,7 +24,6 @@ class SegmentMerger {
     Segment* seg;  // points to the segment that produced this.
   };
 
-  MemPool& origPool;
   std::span<PostingsReader *> preaders;
   PostingsWriter& postingsWriter;
 
@@ -34,23 +33,26 @@ class SegmentMerger {
 public:
 
 
-  SegmentMerger(MemPool& pool, std::span<PostingsReader *> preaders, PostingsWriter& postingsWriter)
-  : origPool(pool), preaders(preaders), postingsWriter(postingsWriter) {
-
+  SegmentMerger(std::span<PostingsReader *> preaders, PostingsWriter& postingsWriter)
+  : preaders(preaders), postingsWriter(postingsWriter)
+  {
   }
 
   void merge() {
+    auto guard = MemPool::threadLocalPoolGuard();
+    auto& pool = guard.pool();
+
     segs.reserve(preaders.size());
     fieldReaders.reserve(preaders.size());  // This is important since we take pointers to these! Pool allocate later...
 
     int64_t base = 0;
     for (auto preader : preaders) {
-      fieldReaders.emplace_back(origPool, *preader);
+      fieldReaders.emplace_back(pool, *preader);
       FieldReader& fieldReader = fieldReaders.back();
 
       // position fieldReader on first field and add to segs if it's non-empty
       if (fieldReader.readNextField()) {
-        segs.push_back({preader, &fieldReader, base, (int)segs.size()});  // clang didn't like emplace_back for this
+        segs.emplace_back(preader, &fieldReader, base, (int)segs.size());
         base += preader->numDocs();
       } else {
         LOG_ERROR("Empty fieldReader!");
@@ -118,12 +120,12 @@ private:
   }
 
   // add docs and ordinals from the provided DocsEnum (for string column, record ord in docToOrd for each doc, to be written later)
-  void addDocsOrds(TextWriter& textWriter, DocsEnum& docsEnum, int32_t base, std::vector<int32_t>& docToOrd, int32_t ord) {
+  void addDocsOrds(TextWriter& textWriter, DocsEnum& docsEnum, int32_t base, OrdCollector& docToOrd, int32_t ord) {
     for(;;) {
       int32_t docid = docsEnum.nextDoc();
       if (docid == INT_MAX) break;
       int32_t newDocid = base + docid;
-      docToOrd[newDocid] = ord;
+      docToOrd.add(newDocid, ord);
       textWriter.startDoc(newDocid);
       docsEnum.startPositions();
       int32_t lastPos = -1;
@@ -139,9 +141,8 @@ private:
 
   void mergeField(std::vector<MergeFieldInfo>& mergeFieldInfos) {
     int32_t nDocs = postingsWriter.getMaxDoc();
-
-    MemPool& writerPool = origPool;  // needs to be different when we move to multi-threaded
-    MemPool::ScopeGuard guard(writerPool);
+    auto poolGuard = MemPool::threadLocalPoolGuard();
+    auto& pool = poolGuard.pool();
 
     // sort mergeFieldInfos so we can add docids low to high.
     // This is a simple O(n+m) sort where n=number of segments and m is number of segments with this specific field.
@@ -182,15 +183,19 @@ private:
 
     // if this is a string column, we need to collect the ordinals for each doc
     bool isOrdCol = (type == FieldType::Type::STRING);
-    std::vector<int32_t> docToOrd;
+    std::optional<OrdCollector> ordCollector;
+    // use a separate pool for the ordCollector since the ords will be built at the same time as the postings are read/written,
+    // and we want to roll back much of that allocation, but preserve the ords.
+    std::optional<MemPool> ordPool;
     if (isOrdCol) {
-      docToOrd.resize(nDocs);
+      ordPool.emplace();
+      ordCollector.emplace(ordPool.value(), nDocs);
     }
 
     MemPool readerPool; // TODO: can this be the same as writerPool?
 
     if (allFlags & FieldType::INDEX_DOCS) {
-      auto readerPoolGuard = readerPool.rewindScopeGuard();
+      auto readerPoolGuard = pool.rewindScopeGuard();
       // nocommit outputFieldInfo.flags |= 0x01;
       TextWriter textWriter(postingsWriter);
       textWriter.startField(&outputFieldInfo);
@@ -207,7 +212,7 @@ private:
 
       for (size_t idx = 0; idx<sortedFields.size(); idx++) {
         auto field = sortedFields[idx];
-        tenums.emplace_back(TermsEnumIdx{TermsEnum(readerPool, *field->seg->postingsReader, field->segFieldInfo), idx});
+        tenums.emplace_back(TermsEnumIdx{TermsEnum(pool, *field->seg->postingsReader, field->segFieldInfo), idx});
         // Position on the first term.  If none, don't add to the PQ
         if (tenums.back().tenum.nextTerm()) {
           tenumPtrs.push_back(&tenums.back());
@@ -226,17 +231,17 @@ private:
         // Need to make a copy of the term since it will be invalidated after tenum.nextTerm()
         // is called.  It needs to exist until the end of textWriter (currently).  See comments on startTerm()
         // for ideas.
-        PackedTerm term(readerPool, std::string_view(first.tenum.term()));
+        PackedTerm term(pool, std::string_view(first.tenum.term()));
         auto termOrd = textWriter.startTerm(term);
 
         do {
           TermsEnumIdx& entry = termPQ.top();
           // need to create the docsEnum while the termsEnum is still positioned on the term.
-          DocsEnum docsEnum(readerPool, *sortedFields[entry.idx]->seg->postingsReader, entry.tenum);
+          DocsEnum docsEnum(pool, *sortedFields[entry.idx]->seg->postingsReader, entry.tenum);
 
           if (isOrdCol) {
             // this is a string column, so keep track of the ordinals for each doc
-            addDocsOrds(textWriter, docsEnum, sortedFields[entry.idx]->seg->base, docToOrd, termOrd);
+            addDocsOrds(textWriter, docsEnum, sortedFields[entry.idx]->seg->base, ordCollector.value(), termOrd);
           } else {
             // text field, so add docs with positions to the textWriter
             addDocsPos(textWriter, docsEnum, sortedFields[entry.idx]->seg->base);
@@ -261,36 +266,48 @@ private:
 
 
     if (isOrdCol) {
-      // nocommit outputFieldInfo.flags |= 0x04;
+      auto& ords = ordCollector.value();
 
       // Write the ordinals to the postings file.
-      // This is pretty much repeated code from Inverter::StringIndexHandler
-      int32_t missingCount = 0;
-
+      // This is pretty much repeated code from Inverter::StringIndexHandler - TODO: refactor to own Writer.
       {
-        auto guard = writerPool.rewindScopeGuard();
-        IntColWriter ordCol(writerPool, postingsWriter, outputFieldInfo);
+        auto guard = pool.rewindScopeGuard();
+        IntColWriter ordCol(pool, postingsWriter, outputFieldInfo);
         ordCol.startField();
-        for (int32_t docid = 0; docid < (int32_t)docToOrd.size(); docid++) {
-          int32_t ord = docToOrd[docid];
-          if (ord != 0) {
+
+        u_ptr<MonoWriter> endRankWriter = ords.multiValued() ? guard.pool().make_unique<MonoWriter>(guard.pool(), postingsWriter.obtainOutputStream()) : nullptr;
+
+        int64_t nValues = 0;
+        for (int docid = 0; docid < nDocs; docid++) {
+          auto prev = nValues;
+          ords.pushValues(docid, [&](int32_t ord) {
             ordCol.addInt64(ord);
-          } else {
-            missingCount++;
+            nValues++;
+          });
+
+          if (prev != nValues && endRankWriter) {
+            endRankWriter->addInt64(nValues);
           }
+          prev = nValues;
         }
+
         ordCol.finish();
+        if (endRankWriter) {
+          endRankWriter->finish();
+          outputFieldInfo.monoLoc = endRankWriter->blockLoc;
+          outputFieldInfo.monoMetaOff = endRankWriter->metaOff;
+          postingsWriter.releaseOutputStream(endRankWriter->getOutputStream());
+        }
       }
 
-      bool full = missingCount == 0 && (int32_t)docToOrd.size() == nDocs;
+      bool full = (ordCollector->docsWithValue() == nDocs);
 
       {
-        auto guard = writerPool.rewindScopeGuard();
-        DocsWithValWriter docsWriter(writerPool, postingsWriter, outputFieldInfo);
+        auto guard = pool.rewindScopeGuard();
+        DocsWithValWriter docsWriter(pool, postingsWriter, outputFieldInfo);
         if (!full) {
-          for (int32_t docid = 0; docid < (int32_t)docToOrd.size(); docid++) {
-            int32_t ord = docToOrd[docid];
-            if (ord != 0) {
+          for (int docid = 0; docid < nDocs; docid++) {
+            if (ords.hasValues(docid)) {
               docsWriter.startDoc(docid);
             }
           }
@@ -303,7 +320,7 @@ private:
     // nocommit } else if (allFlags & 0x02) { // int column (ordCol will currently have this flag set too, hense the else-if)
     } else { // int column that is not an ord column (assume all other field types have this (currently true)
       // nocommit outputFieldInfo.flags |= 0x02;
-      IntColWriter intColWriter(writerPool, postingsWriter, outputFieldInfo);
+      IntColWriter intColWriter(pool, postingsWriter, outputFieldInfo);
       intColWriter.startField();
 
 
@@ -342,7 +359,7 @@ private:
       bool full = false; // TODO: calculate if this column is dense!
 
       if (!full) {
-        DocsWithValWriter docsWriter(writerPool, postingsWriter, outputFieldInfo);
+        DocsWithValWriter docsWriter(pool, postingsWriter, outputFieldInfo);
         for (auto *field: sortedFields) {
           auto baseId = (int32_t) field->seg->base;
 
@@ -374,7 +391,8 @@ private:
 
 
 void IndexWriter::mergeSegments(MemPool &pool, std::span<PostingsReader *> preaders, PostingsWriter &postingsWriter) {
-  SegmentMerger merger(pool, preaders, postingsWriter);
+  unused(pool);
+  SegmentMerger merger(preaders, postingsWriter);
   merger.merge();
 
 }

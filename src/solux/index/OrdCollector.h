@@ -11,10 +11,16 @@ namespace solux {
 // for any given docid.
 class OrdCollector {
   MemPool& pool;
-  // This isn't good for sparse fields... we should probably have a version that uses a hash table as well.
+  // TODO: OPT: This isn't good for sparse fields... we should probably have a version that uses a hash table as well.
+  // Or, we could have a SparseOrdCollector that inherits from OrdCollector (or just uses the same interface).
+  // Merge logic would be able to tell which implementation should be used based on stats of the fields to be merged.
   std::vector<int32_t> ords;
   bool multiValued_ = false; // multiple values encountered for a docid?
+  int32_t docsWithValue_ = 0;
 public:
+  /// Ord collector adds ords to the pool over time, so be sure you don't rewind the pool
+  /// before you are done with the OrdCollector.  Or more specifically, if X is the pool size
+  /// after the last call to add(), then don't rewind the pool to a size less than X.
   OrdCollector(MemPool& pool, int32_t numDocs) : pool(pool), ords(numDocs)
   {}
 
@@ -25,6 +31,7 @@ public:
     auto v = ords[docid];
     if (v == 0) {
       ords[docid] = ord;
+      docsWithValue_++;
       return;
     }
     IntDeltaStream* stream;
@@ -49,6 +56,10 @@ public:
 
   bool multiValued() const {
     return multiValued_;
+  }
+
+  int32_t docsWithValue() const {
+    return docsWithValue_;
   }
 
   // calls acceptor(int32_t ord) for each ord for the given docid

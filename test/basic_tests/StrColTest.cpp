@@ -164,7 +164,7 @@ TEST_F(StrColTest, multiValued) {
     ASSERT_EQ(0, f.nextDoc());
     std::vector<int64_t> ords;
     f.ords(ords);
-    ASSERT_EQ(ords, vec(1l,2l));
+    ASSERT_EQ(ords, vec(1l, 2l));
     ASSERT_EQ(-1, f.nextDoc());
   }
 
@@ -174,21 +174,52 @@ TEST_F(StrColTest, multiValued) {
     TestField f(testIndex, "foo_ss");
     f.startIndexing();
     f.addStrings(5, {"b", "a"});
-    f.addStrings(10, {"c","c"});  // handle duplicates (or throw an error)
+    f.addStrings(10, {"c", "c"});  // handle duplicates (or throw an error)
     f.addStrings(15, {"c", "b", "a"});
     testIndex.flush();
     f.startReading();
     ASSERT_EQ(5, f.nextDoc());
     std::vector<int64_t> ords;
     f.ords(ords);
-    ASSERT_EQ(ords, vec(1l,2l));
+    ASSERT_EQ(ords, vec(1l, 2l));
     ASSERT_EQ(10, f.nextDoc());
     f.ords(ords);
     ASSERT_EQ(ords, vec(3l));
     ASSERT_EQ(15, f.nextDoc());
     f.ords(ords);
-    ASSERT_EQ(ords, vec(1l,2l,3l));
+    ASSERT_EQ(ords, vec(1l, 2l, 3l));
     ASSERT_EQ(-1, f.nextDoc());
   }
 
+  // multi-valued dense merge, with one segment being single-valued
+  {
+    TestIndex testIndex;
+    TestField f(testIndex, "foo_ss");
+    f.startIndexing();
+    f.addStrings(0, {"a"});
+    f.addStrings(1, {"c"});
+    testIndex.flush();
+    f.startIndexing();
+    f.addStrings(0, {"c", "b", "a"});
+    f.addStrings(1, {"b"});
+    testIndex.flush();
+
+    testIndex.iw->mergeSegments();
+    f.startReading();
+    std::vector<int64_t> ords;
+    ASSERT_EQ(0, f.nextDoc());
+    f.ords(ords);
+    ASSERT_EQ(ords, vec(1l));
+    ASSERT_EQ(1, f.nextDoc());
+    f.ords(ords);
+    ASSERT_EQ(ords, vec(3l));
+    ASSERT_EQ(2, f.nextDoc());
+    f.ords(ords);
+    ASSERT_EQ(ords, vec(1l, 2l, 3l));
+    ASSERT_EQ(3, f.nextDoc());
+    f.ords(ords);
+    ASSERT_EQ(ords, vec(2l));
+    ASSERT_EQ(-1, f.nextDoc());
+  }
 }
+

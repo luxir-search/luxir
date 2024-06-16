@@ -414,7 +414,7 @@ public:
       auto guard = MemPool::threadLocalPoolGuard();
 
       int32_t numVals = termsHash.size();
-      auto full = numVals >= inverter.postingsWriter.getMaxDoc();
+      auto full = numVals >= inverter.postingsWriter.getMaxDoc();  // FIXME nocommit - this is no longer true with muttiValued! come up w/ test that fails?
 
       auto terms = termsHash.destructiveCompress();
       boost::sort::spreadsort::string_sort(terms, terms+numVals, TermRef::bracket(), TermRef::getsize(), TermRef::lessthan());
@@ -431,7 +431,7 @@ public:
       // for dense fields.  Then we could simply memcpy the ordinals into the postings file.
       // std::vector<int> docToOrd(inverter.currDoc+1, 0); // This is very inefficient temporary implementation.
       // ord vec must me 0 initialized since that is value that means "missing".
-      OrdCollector ords(inverter.pool, nDocs);
+      OrdCollector ords(guard.pool(), nDocs);
 
 
       textWriter.startField(&fieldInfo);
