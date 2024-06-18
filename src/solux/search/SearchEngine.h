@@ -4,6 +4,7 @@
 #include <oneapi/tbb/flow_graph.h>
 #include <solux/server/SoluxNode.h>
 #include <solux/util/proto.h>
+#include <ranges>
 #include "protos/solux_types.pb.h"
 #include "IndexReader.h"
 #include "Collector.h"
@@ -406,12 +407,18 @@ public:
       maxBatchSize = 256;
     }
 
+    // starting offset into the topDocs list as specified by the request.
     int64_t offset = qr.topDocsProto->offset();
+    auto batches = collector.scoreDocs() | std::views::drop(offset) | std::views::chunk(maxBatchSize);
 
-    for(;;) {
-      int32_t columnSize = std::min((int64_t)maxBatchSize, numCollected - offset);
+    // we want to ensure we always enter the loop at least once, so we use iterators instead of range-based for.
+    for (auto batchIter = batches.begin();; batchIter++) {
+      if (batchIter == batches.end() && batches.size() > 0) {
+        // we reached then end of the non-zero length list
+        break;
+      }
 
-      bool lastResponse = offset + columnSize == numCollected;
+      bool lastResponse = batchIter == batches.end() || std::next(batchIter) == batches.end();
       auto& response = lastResponse ? *qr.req.lastResponse : *Response::create(qr.req, lastResponse);
       auto& searchResultProto = response.proto.mutable_ops()->operator[](qr.name);
       auto& docListProto = *searchResultProto.mutable_docs();
@@ -430,9 +437,14 @@ public:
       // parallelized easily though.
       // We could also do it based on index data of the average column size.
 
-      if (columnSize == 0) {
+      if (batchIter == batches.end()) {
+        // no batch to process.
         break;
       }
+
+      auto batch = *batchIter;
+      auto segDocs = batch | std::views::transform([](auto& sd) { return sd.doc; });
+      int columnSize = segDocs.size();
 
       // std::optional keeps constructor from being called if not needed.  We could also pool allocate it.
       std::optional<oneapi::tbb::task_group> loadColumnsTaskGroup;
@@ -440,28 +452,23 @@ public:
 
       bool returnScores = qr.topDocsProto->get_scores();
 
-      // sort the documents so we can access them in order of both segment and docid
-      std::vector<uint8_t> sortedIdx(columnSize); // works up to 256 docs.
-      for (int i=0; i<columnSize; i++) {
-        sortedIdx[i] = i;
-      }
+      // indirect sort the documents so we can access them in order of both segment and docid
+      std::vector<uint8_t> sortedIdx(segDocs.size()); // uint8_t works for up to 256 docs.
+      std::iota(sortedIdx.begin(), sortedIdx.end(), 0);
       // for small int lists, std::sort is faster than radix sort.
-      // wherever topdocs is indexed, we need to add the offset.
-      auto& topDocs = collector.topDocs;
-      std::sort(sortedIdx.begin(), sortedIdx.end(), [&topDocs,offset](auto a, auto b) {
-        return topDocs[offset + a].doc < topDocs[offset + b].doc;
+      std::ranges::sort(sortedIdx, [&segDocs](auto a, auto b) {
+        return segDocs[a] < segDocs[b];
       });
-      // calculate the segment runs just once so they can be used to load multiple fields.
-      std::vector<uint8_t> sortedIdxRunLen(columnSize);  // how many docs in a row are from the same segment
-      for (int i = 0; i < columnSize;) {
-        auto seg = topDocs[offset + sortedIdx[i]].doc.segment();
-        int runLen = 1;
-        while (i + runLen < columnSize && topDocs[offset + sortedIdx[i + runLen]].doc.segment() == seg) {
-          runLen++;
-        }
-        sortedIdxRunLen[i] = runLen;
-        i += runLen;
-      }
+
+      // calculate segment run lengths so they can be reused when retrieving each column.
+      auto bySeg = sortedIdx
+                   | std::views::chunk_by([&segDocs](auto a, auto b) {
+        return segDocs[a].segment() == segDocs[b].segment();
+      })
+                   | std::views::transform([](const auto& run) { return (uint8_t)run.size(); });
+
+      std::vector<uint8_t> segRunLength;
+      std::ranges::copy(bySeg, std::back_inserter(segRunLength));
 
       auto& columnsProto = *docListProto.mutable_columns();
 
@@ -489,7 +496,7 @@ public:
             assert(&intsProto[columnSize - 1] >= target.data() && &intsProto[columnSize - 1] < target.data() +
                                                                                                columnSize); // Ensure protobuf is contiguous (is this guaranteed or impl detail?)
             // TODO: directly filling in a shared array with different threads may have false-sharing cache performance issues.
-            loadIntCol(qr.req, field, fieldType, collector, offset, sortedIdx, sortedIdxRunLen, target, missingVal, tg);
+            loadIntCol(qr.req, field, fieldType, collector, offset, sortedIdx, segRunLength, target, missingVal, tg);
           } // int field
             break;
           case FieldType::Type::STRING: {
@@ -504,7 +511,7 @@ public:
             }
             auto* start = stringsProto.mutable_data();
             std::span<std::string*> target(start, start + columnSize);
-            loadStrCol(qr.req, field, fieldType, collector, offset, sortedIdx, sortedIdxRunLen, target, "", tg);
+            loadStrCol(qr.req, field, fieldType, collector, offset, sortedIdx, segRunLength, target, "", tg);
           } // string field
           default:
             break;
@@ -544,10 +551,6 @@ public:
         // probably block on the *next* reply, not the current one.
       }
 
-      if (lastResponse) {
-        break;
-      }
-
       offset += columnSize;
     }  // end for
   }
@@ -568,13 +571,11 @@ public:
 
   // TODO: abstract the iterator over the documents since we will have different ways of getting the ids.  Perhaps just a callable that returns a segdoc given an index?
   void loadIntCol(SearchEngine::Request& req, std::string_view field, FieldType& fieldType,
-                  const TopDocsCollector& collector, int64_t offset, const std::span<uint8_t> sortedIdx, const std::span<uint8_t> sortedIdxRunLen, std::span<int64_t> target, int64_t missingVal,
+                  const TopDocsCollector& collector, int64_t offset, const std::span<uint8_t> sortedIdx, const std::span<uint8_t> segRunLength, std::span<int64_t> target, int64_t missingVal,
                   oneapi::tbb::task_group* tg)
   {
     int32_t start = 0;
-    // iterate over the segment runs
-    while (start < (int32_t)sortedIdx.size()) {
-      auto runlen = sortedIdxRunLen[start];
+    for(auto runlen : segRunLength) {
       auto segSpan = sortedIdx.subspan(start, runlen);
       task_group_run(tg, [this, &req, field, &fieldType, &collector, offset, segSpan, target, missingVal]() {
         loadIntColSeg(*req.reader, field, fieldType, collector, offset, segSpan, target, missingVal);
@@ -628,13 +629,12 @@ public:
   }
 
   void loadStrCol(SearchEngine::Request& req, std::string_view field, FieldType& fieldType,
-                  const TopDocsCollector& collector, int64_t offset, const std::span<uint8_t> sortedIdx, const std::span<uint8_t> sortedIdxRunLen, std::span<std::string*> target, std::string_view missingVal,
+                  const TopDocsCollector& collector, int64_t offset, const std::span<uint8_t> sortedIdx, const std::span<uint8_t> segRunLength, std::span<std::string*> target, std::string_view missingVal,
                   oneapi::tbb::task_group* tg)
   {
     size_t start = 0;
     // iterate over the segment runs
-    while (start < sortedIdx.size()) {
-      auto runlen = sortedIdxRunLen[start];
+    for(auto runlen : segRunLength) {
       auto segSpan = sortedIdx.subspan(start, runlen);
       task_group_run(tg, [this, &req, field, &fieldType, &collector, offset, segSpan, target, missingVal]() {
         loadStrColSeg(*req.reader, field, fieldType, collector, offset, segSpan, target, missingVal);

@@ -61,6 +61,7 @@ public:
     }
 
     // TODO: we should do this at the same time now, not as a separate pass.
+    // If we want them adjacent in the file, we could write to a buffer (docsWithValue will never be that large).
     bool full = (ords.docsWithValue() == nDocs);
 
     // currently "full" is determined via fieldInfo.docsWithField, so there is nothing else to write if full.

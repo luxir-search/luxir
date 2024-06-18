@@ -95,10 +95,14 @@ class TopDocsCollector {
 
   // Since we use min-heap comparators in our priority queues, the list will be reverse-sorted (smallest last)
   // Repeated calls to pop() on the priority queue will also return the docs in order.
-  void sort() {
+  std::span<ScoreDoc> sort() {
     std::sort_heap(topDocs.begin(), topDocs.begin() + pq.size(), scoreComp);
+    return {topDocs.data(), pq.size()};
   }
 
+  std::span<ScoreDoc> scoreDocs() {
+    return {topDocs.data(), pq.size()};
+  }
 };
 
 

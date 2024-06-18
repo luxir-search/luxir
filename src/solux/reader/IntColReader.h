@@ -361,9 +361,50 @@ public:
     }
   };
 
- using SparseIterator = DocIterator<DenseValues>;  // decodes individual values (good for big skipping)
- using BulkIterator = DocIterator<BulkValues>;  // decodes blocks of values (good for iterating or small skipping)
- using Iterator = BulkIterator;
+  using SparseIterator = DocIterator<DenseValues>;  // decodes individual values (good for big skipping)
+  using BulkIterator = DocIterator<BulkValues>;  // decodes blocks of values (good for iterating or small skipping)
+  using Iterator = BulkIterator;
+
+  /// docids is a sorted range of docids to load values for in a multi-valued field.
+  /// calls callback(size_t input_index, int32_t docid, std::span<int64_t> values) for each docid that has any values.
+  static void getValuesForSorted(MemPool& pool, PostingsReader& postingsReader, SegFieldInfo& segFieldInfo, std::ranges::input_range auto docids, auto&& callback) {
+    IntColReader intColReader(pool, postingsReader, segFieldInfo);
+    IntColReader::Iterator iter(intColReader);
+
+    int32_t foundid = -1;
+    std::vector<int64_t> valuesVec;  // TODO: make a vector that starts off in the pool?
+    std::array<int64_t, 10> values;  // stack values to avoid allocation for small multi-valued fields.
+    std::span<int64_t> single(values.data(), 1);
+    size_t idx = 0;
+    for (int32_t docid : docids) {
+      if (foundid < docid) {
+        foundid = iter.advance(docid);
+      }
+      if (foundid == docid) {
+        if (!intColReader.multiValued()) {
+          single[0] = iter.value();
+          callback(idx, docid, single);
+        } else {
+          auto [start, end] = intColReader.getStartEndRank(iter.rank());
+          auto n = end - start;
+          std::span<int64_t> outSpan;
+          if (n <= values.size()) {
+            outSpan = std::span(values.data(), n);
+          } else {
+            valuesVec.resize(n);
+            outSpan = valuesVec;
+          }
+          for (int64_t vrank = 0; vrank < n; vrank++) {
+            outSpan[vrank] = iter.values().valueAt(start + vrank);
+          }
+          callback(idx, docid, outSpan);
+        }
+      } else if (foundid == IntColReader::ENDDOC) {
+        break;
+      }
+      idx++;
+    }
+  }
 
 };
 

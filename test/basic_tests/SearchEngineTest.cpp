@@ -47,7 +47,7 @@ public:
   virtual ~LocalReq() {
     for (auto* response : responses) {
       if (&response->arena != &arena) {
-        LOG_DEBUG("releasing response arena!");
+        LOG_TRACE("releasing response arena!");
         releaseArena(&response->arena);
       }
     }
@@ -86,6 +86,8 @@ public:
 
 
 TEST_F(SearchEngineTest, basic) {
+  bool para = true;
+
   CollectionHelper helper;
   helper.clear();
   helper.index(flatdoc("foo_w","how now brown cow", "foo_i", 17, "color_s","red"),UpdateMessage::COMMIT);
@@ -117,7 +119,7 @@ TEST_F(SearchEngineTest, basic) {
      */
 
 
-    lreq->engine.submit(*lreq, false);
+    lreq->engine.submit(*lreq, para);
     // LOG_DEBUG("ENGINE REQ: {}", lreq->toString());
 
     ASSERT_EQ(lreq->proto.request_id(), lreq->responses[0]->proto.request_id());
@@ -152,7 +154,7 @@ TEST_F(SearchEngineTest, basic) {
     topDocs.mutable_fields()->Add("color_s");
     topDocs.set_batch_size(2);
 
-    lreq->engine.submit(*lreq, false);
+    lreq->engine.submit(*lreq, para);
 // LOG_DEBUG("ENGINE REQ: {}", lreq->toString());
 
     ASSERT_EQ(lreq->proto.request_id(), lreq->responses[0]->proto.request_id());
@@ -188,10 +190,34 @@ TEST_F(SearchEngineTest, basic) {
     ASSERT_FALSE(lreq->responses[1]->proto.more());
 
     lreq->done();
-
-
-
   }
 
+  {
+    // new let's try for 3 responses
+
+    auto* lreq = LocalReq::create(soluxNode->getSearchEngine());
+    lreq->proto.mutable_collection()->add_name("main");
+    lreq->proto.set_request_id("myrequestid");
+    auto& ops = *lreq->proto.mutable_ops();
+    auto& topDocs = *ops["q"].mutable_top_docs();
+    topDocs.set_get_number(true);
+    topDocs.set_get_scores(true);
+    auto& query = *topDocs.mutable_query()->mutable_match();
+    query.set_field("foo_w");
+    query.mutable_val()->set_s("brown");
+    topDocs.mutable_fields()->Add("foo_i");
+    topDocs.mutable_fields()->Add("color_s");
+    topDocs.set_batch_size(1);
+    topDocs.set_limit(7);
+
+    lreq->engine.submit(*lreq, para);
+    ASSERT_EQ(3, lreq->responses.size());
+    // check offsets are correct
+    ASSERT_EQ(0, lreq->responses[0]->proto.ops().at("q").docs().offset());
+    ASSERT_EQ(1, lreq->responses[1]->proto.ops().at("q").docs().offset());
+    ASSERT_EQ(2, lreq->responses[2]->proto.ops().at("q").docs().offset());
+
+    lreq->done();
+  }
 }
 
