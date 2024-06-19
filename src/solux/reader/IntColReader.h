@@ -367,7 +367,7 @@ public:
 
   /// docids is a sorted range of docids to load values for in a multi-valued field.
   /// calls callback(size_t input_index, int32_t docid, std::span<int64_t> values) for each docid that has any values.
-  static void getValuesForSorted(MemPool& pool, PostingsReader& postingsReader, SegFieldInfo& segFieldInfo, std::ranges::input_range auto docids, auto&& callback) {
+  static void getValues(MemPool& pool, PostingsReader& postingsReader, SegFieldInfo& segFieldInfo, std::ranges::input_range auto&& sortedIds, auto&& callback) {
     IntColReader intColReader(pool, postingsReader, segFieldInfo);
     IntColReader::Iterator iter(intColReader);
 
@@ -376,7 +376,7 @@ public:
     std::array<int64_t, 10> values;  // stack values to avoid allocation for small multi-valued fields.
     std::span<int64_t> single(values.data(), 1);
     size_t idx = 0;
-    for (int32_t docid : docids) {
+    for (int32_t docid : sortedIds) {
       if (foundid < docid) {
         foundid = iter.advance(docid);
       }
@@ -405,6 +405,29 @@ public:
       idx++;
     }
   }
+
+  /// docids is a sorted range of docids to load values for in a multi-valued field.
+  /// calls callback(size_t input_index, int32_t docid, int64_t value) for each docid that has any values.
+  static void getSingleValues(MemPool& pool, PostingsReader& postingsReader, SegFieldInfo& segFieldInfo, std::ranges::input_range auto&& sortedDocIds, auto&& callback) {
+    IntColReader intColReader(pool, postingsReader, segFieldInfo);
+    IntColReader::Iterator iter(intColReader);
+    assert(!intColReader.multiValued());
+    int32_t foundid = -1;
+    size_t idx = 0;
+    for (int32_t docid : sortedDocIds) {
+      if (foundid < docid) {
+        foundid = iter.advance(docid);
+      }
+      if (foundid == docid) {
+        auto v = iter.value();
+        callback(idx, docid, v);
+      } else if (foundid == IntColReader::ENDDOC) {
+        break;
+      }
+      idx++;
+    }
+  }
+
 
 };
 

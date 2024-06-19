@@ -127,6 +127,9 @@ public:
       auto* arena = last ? &req.arena : createArena();
       return google::protobuf::Arena::Create<Response>(arena, req, *arena, last);
     }
+
+    // named columns, part of DocList or part of a FacetResult.
+    using ColumnsType = google::protobuf::Map<std::string, solux::proto::Column>;
   };
 
   class QueryReq {
@@ -461,6 +464,7 @@ public:
       });
 
       // calculate segment run lengths so they can be reused when retrieving each column.
+      // we don't actually store the generated runs from the view since that would take 16x the memory (up to 4K)
       auto bySeg = sortedIdx
                    | std::views::chunk_by([&segDocs](auto a, auto b) {
         return segDocs[a].segment() == segDocs[b].segment();
@@ -472,7 +476,7 @@ public:
 
       auto& columnsProto = *docListProto.mutable_columns();
 
-      // Lets look at the stored fields
+      // Let's look at the fields we should retrieve
       for (std::string_view field: qr.topDocsProto->fields()) {
         // should we allow _scores_ as a field name?
         if (field == "_score_") {
@@ -483,25 +487,16 @@ public:
 
         // look up the field in the schema
         auto& fieldType = *qr.req.schema->getFieldTypeEx(field);
+
         switch (fieldType.type()) {
           case FieldType::Type::INT: {
-            auto& intColProto = columnsProto[field];
-            auto& intCol = *intColProto.mutable_col_i();
-            auto& intsProto = *intCol.mutable_v();
-            // intCol.set_missing_val(0); // TODO.... get from schema? Set even if all values present?
-            auto missingVal = std::numeric_limits<int64_t>::min();
-            // intsProto.Reserve(columnSize);
-            intsProto.Resize(columnSize, missingVal);  // fill with missing values (0 for now
-            std::span<int64_t> target(&intsProto[0], &intsProto[0] + columnSize);
-            assert(&intsProto[columnSize - 1] >= target.data() && &intsProto[columnSize - 1] < target.data() +
-                                                                                               columnSize); // Ensure protobuf is contiguous (is this guaranteed or impl detail?)
-            // TODO: directly filling in a shared array with different threads may have false-sharing cache performance issues.
-            loadIntCol(qr.req, field, fieldType, collector, offset, sortedIdx, segRunLength, target, missingVal, tg);
+            // TODO: how to decide if a column should be sparse?  Allow client to opt-in for sparse columns.
+            loadIntCol(qr.req, field, fieldType, segDocs, sortedIdx, segRunLength, columnsProto, tg);
           } // int field
             break;
           case FieldType::Type::STRING: {
-            auto& strColProto = columnsProto[field];
-            auto& strCol = *strColProto.mutable_col_s();
+            auto& fieldCol = columnsProto[field];  // output Column in the protobuf
+            auto& strCol = *fieldCol.mutable_col_s();
             auto& stringsProto = *strCol.mutable_v();
             stringsProto.Reserve(columnSize);
             std::string missingVal;
@@ -555,31 +550,54 @@ public:
     }  // end for
   }
 
-  // Message to load part of an integer column.  One reason for bundling info like this is that it can be passed
-  // easily or captured by a lambda and assigned to a std::function without heap allocation.
-  // EDIT: actually, TBB task_group.run() is a template function that eventually requests thread local pool allocation, so
-  // the std::function limitation of heap allocation with over 2 pointers doesn't apply.
-  /*
-  struct IntColSeg {
-    std::string_view field;
-    TopDocsCollector& collector;
-    std::span<uint8_t> sortedIdx;
-    std::span<int64_t> target;
-    int64_t missingVal;
-  };
-   */
 
-  // TODO: abstract the iterator over the documents since we will have different ways of getting the ids.  Perhaps just a callable that returns a segdoc given an index?
+  // We are guaranteed that the resources passed here will remain valid for any subtasks added to "tg" (i.e. the
+  // caller waits on "tg" before releasing the resources).
   void loadIntCol(SearchEngine::Request& req, std::string_view field, FieldType& fieldType,
-                  const TopDocsCollector& collector, int64_t offset, const std::span<uint8_t> sortedIdx, const std::span<uint8_t> segRunLength, std::span<int64_t> target, int64_t missingVal,
-                  oneapi::tbb::task_group* tg)
+                   std::ranges::input_range auto& segDocs, std::span<uint8_t> sortedIdx, const std::span<uint8_t> segRunLength,
+                   Response::ColumnsType& columnsProto, oneapi::tbb::task_group* tg)
   {
+    auto& fieldCol = columnsProto[field];  // output Column in the protobuf
+    auto& intCol = *fieldCol.mutable_col_i();
+    auto& intsProto = *intCol.mutable_v();
+    // intCol.set_missing_val(0); // TODO.... get from schema? Set even if all values present?
+    auto missingVal = std::numeric_limits<int64_t>::min();
+    auto columnSize = segDocs.size();
+    intsProto.Resize(columnSize, missingVal);  // fill with missing values
+    std::span<int64_t> target(&intsProto[0], &intsProto[0] + columnSize);
+    // Ensure protobuf is contiguous (is this guaranteed or impl detail?)
+    assert(&intsProto[columnSize - 1] >= target.data() && &intsProto[columnSize - 1] < target.data() +columnSize);
+
+    // iterate over the segment runs, loading values for each segment (possibly in a new task)
     int32_t start = 0;
     for(auto runlen : segRunLength) {
-      auto segSpan = sortedIdx.subspan(start, runlen);
-      task_group_run(tg, [this, &req, field, &fieldType, &collector, offset, segSpan, target, missingVal]() {
-        loadIntColSeg(*req.reader, field, fieldType, collector, offset, segSpan, target, missingVal);
+      auto idxSpan = sortedIdx.subspan(start, runlen);
+      // capture by-value parameters by-value again since this method will return before the lambda is executed.
+      task_group_run(tg, [this, idxSpan, &req, field, &fieldType, &segDocs, target]() {
+        // a view of the segdocs for a single segment, in ascending order.
+        auto sortedSegDocs = idxSpan | std::views::transform([&segDocs](auto idx) { return segDocs[idx]; });
+        auto segNum = sortedSegDocs[0].segment();
+        // extract the docids from the sorted segdocs
+        auto sortedDocs = sortedSegDocs | std::views::transform([](const auto& sd) { return sd.docId(); });
+
+        auto& postingsReader = req.reader->segments()[segNum].postingsReader();
+        auto poolGuard = MemPool::threadLocalPoolGuard();
+        FieldReader fieldReader(poolGuard.pool(), postingsReader);
+        bool found = fieldReader.seek(field);
+        if (!found) {
+          return;
+        }
+        SegFieldInfo segFieldInfo;
+        fieldReader.readFieldInfo(segFieldInfo);
+        // callback handler to put values back in the correct slot.
+        auto valHandler = [&target,&idxSpan,&segDocs](size_t idx, int32_t doc, int64_t val) {
+          assert(segDocs[idxSpan[idx]].docId() == doc);
+          // translate back to the original index
+          target[idxSpan[idx]] = val;
+        };
+        IntColReader::getSingleValues(poolGuard.pool(), postingsReader, segFieldInfo, sortedDocs, valHandler);
       });
+
       start += runlen;
     }
   }
