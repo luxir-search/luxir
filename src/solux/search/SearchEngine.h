@@ -495,18 +495,7 @@ public:
           } // int field
             break;
           case FieldType::Type::STRING: {
-            auto& fieldCol = columnsProto[field];  // output Column in the protobuf
-            auto& strCol = *fieldCol.mutable_col_s();
-            auto& stringsProto = *strCol.mutable_v();
-            stringsProto.Reserve(columnSize);
-            std::string missingVal;
-            // under the covers, the vector contains pointers, not elements (i.e. vector<std::string*>)
-            for (int i = 0; i < columnSize; i++) {
-              stringsProto.Add("");
-            }
-            auto* start = stringsProto.mutable_data();
-            std::span<std::string*> target(start, start + columnSize);
-            loadStrCol(qr.req, field, fieldType, collector, offset, sortedIdx, segRunLength, target, "", tg);
+            loadStrCol(qr.req, field, fieldType, segDocs, sortedIdx, segRunLength, columnsProto, tg);
           } // string field
           default:
             break;
@@ -573,6 +562,56 @@ public:
     for(auto runlen : segRunLength) {
       auto idxSpan = sortedIdx.subspan(start, runlen);
       // capture by-value parameters by-value again since this method will return before the lambda is executed.
+      // Don't specify a default capture, going across task boundaries should be very explicit.
+      task_group_run(tg, [this, idxSpan, &req, field, &fieldType, &segDocs, target]() {
+        // a view of the segdocs for a single segment, in ascending order.
+        auto sortedSegDocs = idxSpan | std::views::transform([&segDocs](auto idx) { return segDocs[idx]; });
+        auto segNum = sortedSegDocs[0].segment();
+        // extract the docids from the sorted segdocs
+        auto sortedDocs = sortedSegDocs | std::views::transform([](const auto& sd) { return sd.docId(); });
+
+        auto& postingsReader = req.reader->segments()[segNum].postingsReader();
+        auto poolGuard = MemPool::threadLocalPoolGuard();
+        // callback handler to put values back in the correct slot.  The task lambda captured by value when necessary
+        // already, so it's fine to capture by ref here.
+        auto valHandler = [&](size_t idx, int32_t doc, int64_t val) {
+          assert(segDocs[idxSpan[idx]].docId() == doc);
+          // translate back to the original index
+          target[idxSpan[idx]] = val;
+        };
+        IntColReader::getSingleValues(poolGuard.pool(), postingsReader, field, sortedDocs, valHandler);
+      });
+
+      start += runlen;
+    }
+  }
+
+
+  void loadStrCol(SearchEngine::Request& req, std::string_view field, FieldType& fieldType,
+                  std::ranges::input_range auto& segDocs, std::span<uint8_t> sortedIdx, const std::span<uint8_t> segRunLength,
+                  Response::ColumnsType& columnsProto, oneapi::tbb::task_group* tg)
+  {
+    auto columnSize = segDocs.size();
+    auto& fieldCol = columnsProto[field];  // output Column in the protobuf
+    auto& strCol = *fieldCol.mutable_col_s();
+    auto& stringsProto = *strCol.mutable_v();
+    stringsProto.Reserve(columnSize);
+    std::string missingVal;
+    // under the covers, the vector contains pointers, not elements (i.e. vector<std::string*>)
+    for (int i = 0; i < columnSize; i++) {
+      stringsProto.Add("");
+    }
+    auto* arrstart = stringsProto.mutable_data();
+    std::span<std::string*> target(arrstart, arrstart + columnSize);  // this is what we will be filling in.
+
+
+    // iterate over the segment runs, loading values for each segment (possibly in a new task)
+    // much of this code will be the same as loading the IntCol, but we are retrieving ords
+    // and need to look them up.
+    int32_t start = 0;
+    for(auto runlen : segRunLength) {
+      auto idxSpan = sortedIdx.subspan(start, runlen);
+      // capture by-value parameters by-value again since this method will return before the lambda is executed.
       task_group_run(tg, [this, idxSpan, &req, field, &fieldType, &segDocs, target]() {
         // a view of the segdocs for a single segment, in ascending order.
         auto sortedSegDocs = idxSpan | std::views::transform([&segDocs](auto idx) { return segDocs[idx]; });
@@ -589,12 +628,20 @@ public:
         }
         SegFieldInfo segFieldInfo;
         fieldReader.readFieldInfo(segFieldInfo);
-        // callback handler to put values back in the correct slot.
-        auto valHandler = [&target,&idxSpan,&segDocs](size_t idx, int32_t doc, int64_t val) {
-          assert(segDocs[idxSpan[idx]].docId() == doc);
+        // we need the terms enum to lookup the string value for each ord
+        TermsEnum tenum(poolGuard.pool(), postingsReader, segFieldInfo);
+
+        // callback handler to convert ord to string and to put values back in the correct slot.
+        auto valHandler = [&](size_t idx, int32_t doc, int64_t val) {
+          assert(segDocs[idxSpan[idx]].docId() == doc && val > 0);
           // translate back to the original index
-          target[idxSpan[idx]] = val;
+          // TODO: we could introduce a cache here to avoid repeated lookups for the same term.
+          // it could be map<int64_t, string_view or string*> since the protobuf values won't be moving around.
+          tenum.seekOrd((int32_t)val-1);  // term ords are 0 based.
+          // LHS is a std::string&, so this makes a copy (which we need to do since tenum.term() will soon be invalidated.)
+          *target[idxSpan[idx]] = (std::string_view)tenum.term();
         };
+
         IntColReader::getSingleValues(poolGuard.pool(), postingsReader, segFieldInfo, sortedDocs, valHandler);
       });
 
@@ -603,126 +650,11 @@ public:
   }
 
 
-  void loadIntColSeg(IndexReader& reader, std::string_view field, FieldType& fieldType, const TopDocsCollector& collector, int64_t offset, const std::span<uint8_t> sortedIdx, std::span<int64_t> target, int64_t missingVal) {
-    unused(fieldType);
-    // Hmm, we could also just pass in a segment and not the whole reader.
-    auto segNum = collector.topDocs[offset + sortedIdx[0]].doc.segment();
-    auto& postingsReader = reader.segments()[segNum].postingsReader();
-    auto poolGuard = MemPool::threadLocalPoolGuard();
-    FieldReader fieldReader(poolGuard.pool(), postingsReader);
-    bool found = fieldReader.seek(field);
-    if (!found) {
-      // field not found in this segment.  fill missing values.
-      for (auto idx : sortedIdx) {
-        target[idx] = missingVal;
-      }
-      return;
-    }
-
-    SegFieldInfo segFieldInfo;
-    fieldReader.readFieldInfo(segFieldInfo);
-    IntColReader intColReader(poolGuard.pool(), postingsReader, segFieldInfo);
-    IntColReader::Iterator iter(intColReader);
-
-    int32_t next = -1;
-    for (auto idx : sortedIdx) {
-      auto segdoc = collector.topDocs[offset + idx].doc;
-      assert(segdoc.segment() == segNum);
-      int32_t docid = segdoc.docId();
-      if (docid < next) {
-        target[idx] = missingVal;
-        continue;
-      }
-
-      if (docid > next) {
-        next = iter.advance(docid);
-      }
-
-      if (docid == next) {
-        target[idx] = iter.value();
-      } else {
-        target[idx] = missingVal;
-      }
-    }
-  }
-
-  void loadStrCol(SearchEngine::Request& req, std::string_view field, FieldType& fieldType,
-                  const TopDocsCollector& collector, int64_t offset, const std::span<uint8_t> sortedIdx, const std::span<uint8_t> segRunLength, std::span<std::string*> target, std::string_view missingVal,
-                  oneapi::tbb::task_group* tg)
-  {
-    size_t start = 0;
-    // iterate over the segment runs
-    for(auto runlen : segRunLength) {
-      auto segSpan = sortedIdx.subspan(start, runlen);
-      task_group_run(tg, [this, &req, field, &fieldType, &collector, offset, segSpan, target, missingVal]() {
-        loadStrColSeg(*req.reader, field, fieldType, collector, offset, segSpan, target, missingVal);
-      });
-      start += runlen;
-    }
-  }
-
-
-  // TODO: abstract this better so we have a single function that can be called with a id provider, and a value acceptor.
-  void loadStrColSeg(IndexReader& reader, std::string_view field, FieldType& fieldType, const TopDocsCollector& collector, int64_t offset, const std::span<uint8_t> sortedIdx, std::span<std::string*> target, std::string_view missingVal) {
-    unused(fieldType);
-    // Hmm, we could also just pass in a segment and not the whole reader.
-    auto segNum = collector.topDocs[offset + sortedIdx[0]].doc.segment();
-    auto& postingsReader = reader.segments()[segNum].postingsReader();
-    auto poolGuard = MemPool::threadLocalPoolGuard();
-    FieldReader fieldReader(poolGuard.pool(), postingsReader);
-    bool found = fieldReader.seek(field);
-    if (!found) {
-      // field not found in this segment.  fill missing values.
-      for (auto idx : sortedIdx) {
-        *target[idx] = missingVal;
-      }
-      return;
-    }
-
-    SegFieldInfo segFieldInfo;
-    fieldReader.readFieldInfo(segFieldInfo);
-    IntColReader intColReader(poolGuard.pool(), postingsReader, segFieldInfo);
-    IntColReader::Iterator iter(intColReader);
-    TermsEnum tenum(poolGuard.pool(), postingsReader, segFieldInfo);
-
-    int32_t next = -1;
-    int32_t lastOrd = -1;
-    for (auto idx : sortedIdx) {
-      auto segdoc = collector.topDocs[offset + idx].doc;
-      assert(segdoc.segment() == segNum);
-      int32_t docid = segdoc.docId();
-      if (docid < next) {
-        *target[idx] = missingVal;
-        continue;
-      }
-
-      if (docid > next) {
-        next = iter.advance(docid);
-      }
-
-      if (docid == next) {
-        auto ord = iter.value();
-        // an ord of 0 means "missing", which we shouldn't encounter since we are using an iterator over docs?
-        assert(ord != 0);
-        if (ord != lastOrd) {
-          lastOrd = ord;
-          tenum.seekOrd((int32_t)ord-1);  // term ords are 0 based.
-        }
-        *target[idx] = (std::string_view) tenum.term();
-        // TODO: sort the ords for better seek performance (if within same term block), and for better ord deduping.
-      } else {
-        *target[idx] = missingVal;
-      }
-    }
-  }
-
   void loadStoredFields() {
     // We need the spec of what fields to load.  A column-wise load would be more efficient, and
     // we should probably default to a column representation for returned results as well.
     // Unfortunately, filling in values in-place across multiple tasks would most likely lead to bad cache effects
     // via false-sharing.
-
-    // If we wanted to do batches of less than 256, we could use byte indexes (plus an offset) into the sorted docs.
 
     // How to implement returning all fields?  We can check per-field if the number of fields is small, but
     // otherwise (maybe) add index info for what fields a document has?  Or maybe just for dynamic fields?

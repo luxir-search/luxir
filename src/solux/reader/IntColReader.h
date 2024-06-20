@@ -428,6 +428,18 @@ public:
     }
   }
 
+  /// see getSingleValues(), but starting with a field name.
+  static void getSingleValues(MemPool& pool, PostingsReader& postingsReader, std::string_view field, std::ranges::input_range auto&& sortedDocIds, auto&& callback) {
+    FieldReader fieldReader(pool, postingsReader);
+    bool found = fieldReader.seek(field);
+    if (!found) {
+      return;
+    }
+    SegFieldInfo segFieldInfo;
+    fieldReader.readFieldInfo(segFieldInfo);
+
+    getSingleValues(pool, postingsReader, segFieldInfo, sortedDocIds, callback);
+  }
 
 };
 
