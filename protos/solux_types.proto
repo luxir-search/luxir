@@ -126,34 +126,10 @@ message PhraseQuery {
   repeated string terms = 4;     // analyzed list of terms as strings
   repeated bytes terms_bin = 5;  // analyzed list of binary (raw bytes) terms
 
-  /*
-  oneof kind {
-    string text = 2;      // un-analyzed text that should yield multiple words when analyzed. ex: "Thomas Anderson"
-    ArrStr words = 3;     // un-analyzed list of words. ex: ["Yonik","Seeley"]
-    ArrStr terms = 4;     // analyzed list of terms as strings
-    ArrBin terms_bin = 5; // analyzed list of binary terms
-    // TermPositionList term_positions = 4;  // list of terms with explicit relative positions
-  }
-  */
-
   // TODO: add a parameter for slop?
   repeated int32 positions = 15; // optional positions of the terms
 }
 
-/*** This was used in PhraseQuery, but we switched to a column format.
-message TermPosition {
-  string field = 1;   // TODO: is there a good usecase for phrase across different fields?
-  oneof kind {
-    string word = 2;  // unanalyzed term at this position
-    bytes term = 3;   // analyzed term at this position
-  }
-  int32 position = 4;
-}
-
-message TermPositionList {
-  repeated TermPosition term_positions;
-}
-***/
 
 message FieldFacet {
   string field = 1;
@@ -339,6 +315,28 @@ message ArrBin {
   repeated bytes v = 1;
 }
 
+// Array of arrays, used in columns for multi-valued fields.  One could use
+// ArrVal instead, but this has less indirection and stronger typing.
+message ArrArrStr {
+  repeated ArrStr v = 1;
+}
+
+message ArrArrInt {
+  repeated ArrInt v = 1;
+}
+
+message ArrArrFloat {
+  repeated ArrFloat v = 1;
+}
+
+message ArrArrDouble {
+  repeated ArrDouble v = 1;
+}
+
+message ArrArrBin {
+  repeated ArrBin v = 1;
+}
+
 // although the encoding is the same, the stub mapping is not and could blow up memory for large arrays
 // if we always use 64 byte ints.
 // TODO: if we can do custom decoding, an array that specifies a min/max would be even more efficient
@@ -362,6 +360,11 @@ message Column {
     ColInt col_i = 2;
     ColFloat col_f = 3;
     ColDouble col_d = 4;
+    ArrArrStr multi_s = 5;  // name col_ss? (after dynamic field naming convention in solr)?
+    ArrArrInt multi_i = 6;
+    ArrArrFloat multi_f = 7;
+    ArrArrDouble multi_d = 8;
+
     ColMap col_map = 14;
     ArrVal col_val = 15; // array-of-value is already nullable, so we don't have a separate column type for it
   }

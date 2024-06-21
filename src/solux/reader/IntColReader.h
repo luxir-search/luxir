@@ -366,15 +366,16 @@ public:
   using Iterator = BulkIterator;
 
   /// docids is a sorted range of docids to load values for in a multi-valued field.
-  /// calls callback(size_t input_index, int32_t docid, std::span<int64_t> values) for each docid that has any values.
+  /// calls
+  ///    callback(size_t input_index, int32_t docid, int64_t value, int64_t value_index, int64_t numValues)
+  /// for each docid that has any values.
+  /// For example, if docids[4]==1000, and docid 1000 has values {10, 11, 12}, then the callbacks would be:
+  /// callback(4, 1000, 10, 0, 3), callback(4, 1000, 11, 1, 3), callback(4, 1000, 12, 2, 3).
   static void getValues(MemPool& pool, PostingsReader& postingsReader, SegFieldInfo& segFieldInfo, std::ranges::input_range auto&& sortedIds, auto&& callback) {
     IntColReader intColReader(pool, postingsReader, segFieldInfo);
     IntColReader::Iterator iter(intColReader);
 
     int32_t foundid = -1;
-    std::vector<int64_t> valuesVec;  // TODO: make a vector that starts off in the pool?
-    std::array<int64_t, 10> values;  // stack values to avoid allocation for small multi-valued fields.
-    std::span<int64_t> single(values.data(), 1);
     size_t idx = 0;
     for (int32_t docid : sortedIds) {
       if (foundid < docid) {
@@ -382,22 +383,15 @@ public:
       }
       if (foundid == docid) {
         if (!intColReader.multiValued()) {
-          single[0] = iter.value();
-          callback(idx, docid, single);
+          auto val = iter.value();
+          callback(idx, docid, val, 0, 1);
         } else {
           auto [start, end] = intColReader.getStartEndRank(iter.rank());
           auto n = end - start;
-          std::span<int64_t> outSpan;
-          if (n <= values.size()) {
-            outSpan = std::span(values.data(), n);
-          } else {
-            valuesVec.resize(n);
-            outSpan = valuesVec;
-          }
           for (int64_t vrank = 0; vrank < n; vrank++) {
-            outSpan[vrank] = iter.values().valueAt(start + vrank);
+            auto val = iter.values().valueAt(start + vrank);
+            callback(idx, docid, val, vrank, n);
           }
-          callback(idx, docid, outSpan);
         }
       } else if (foundid == IntColReader::ENDDOC) {
         break;
