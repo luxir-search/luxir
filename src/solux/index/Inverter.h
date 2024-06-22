@@ -90,8 +90,12 @@ public:
       return this->fieldName == fname;
     }
 
-    virtual void index(Inverter& inverter, char* mutableVal, int len) {
-      unused(inverter, mutableVal, len);
+    virtual void index(Inverter& inverter, char* val) {
+      assert(false && "Don't Use This!");
+    }
+
+    virtual void index(Inverter& inverter, std::string_view val) {
+      unused(inverter, val);
     }
     // yuck.  this is to handle an array of strings in protobuf (without creating a new list)
     virtual void index(Inverter& inverter, std::span<std::string_view> vals) {
@@ -110,8 +114,7 @@ public:
 
     virtual void index(Inverter& inverter, const proto::Val& val) {
       if (val.has_s()) {
-        auto &sval = val.s();
-        index(inverter, const_cast<char *>(sval.data()), sval.size());  // TODO: get rid of the const-cast
+        index(inverter, val.s());
       } else if (val.has_arr_s()) {
         auto& arr = val.arr_s().v();
         std::span<const std::string* const> values(arr.data(), arr.size());
@@ -249,29 +252,26 @@ public:
 
     void index(Inverter& inverter, const proto::Val& val) override {
       // TODO: handle bytes
-      char* mutableValue = nullptr;
-      int len = 0;
+      std::string_view sv;
       if (val.has_s()) {
-        auto &sval = val.s();
-        mutableValue = const_cast<char *>(sval.data());  // TODO: get rid of the const-cast
-        len = sval.size();
+        sv = val.s();
       } else if (val.has_bin()) {
-        // TODO: handle binary
+        sv = val.bin();
       }
 
       // TODO: handle arrays as well.  Hard to do in virtual methods where you can't use templates though.
 
-      indexSingle(inverter, mutableValue, len);
+      indexSingle(inverter, sv);
     }
 
-    void index(Inverter &inverter, char *mutableVal, int len) override {
-      indexSingle(inverter, mutableVal, len);
+    void index(Inverter& inverter, std::string_view val) override {
+      indexSingle(inverter, val);
     }
 
     // TODO: handle multi-valued. Or is that a diff subclass?
-    void indexSingle(Inverter& inverter, char* mutableVal, int len) {
+    void indexSingle(Inverter& inverter, std::string_view val) {
       TokenChain& tc = *tokenChain;
-      tc.head.setMutableValue(mutableVal, len);
+      tc.head.setValue(val);
 
       int numTokens = 0;
       int pos = -1;
@@ -380,8 +380,8 @@ public:
       indexSingle(inverter, v);
     }
 
-    void index(Inverter& inverter, char* mutableVal, int len) override {
-      indexSingle(inverter, std::string_view(mutableVal, len));
+    void index(Inverter& inverter, std::string_view val) override {
+      indexSingle(inverter, val);
     }
 
     void indexSingle(Inverter& inverter, std::string_view term) {

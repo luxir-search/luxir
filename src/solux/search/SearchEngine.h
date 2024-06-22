@@ -593,16 +593,35 @@ public:
   {
     auto columnSize = segDocs.size();
     auto& fieldCol = columnsProto[field];  // output Column in the protobuf
-    auto& strCol = *fieldCol.mutable_col_s();
-    auto& stringsProto = *strCol.mutable_v();
-    stringsProto.Reserve(columnSize);
-    std::string missingVal;
-    // under the covers, the vector contains pointers, not elements (i.e. vector<std::string*>)
-    for (int i = 0; i < columnSize; i++) {
-      stringsProto.Add("");
+    std::span<std::string*> starget; // single valued target
+    std::span<solux::proto::ArrStr*> mtarget;  // multi-valued target
+
+    if (!fieldType.multiValued()) {
+      auto& strCol = *fieldCol.mutable_col_s();
+      auto& stringsProto = *strCol.mutable_v();
+      stringsProto.Reserve(columnSize);
+      std::string missingVal;
+      // under the covers, the vector contains pointers, not elements (i.e. vector<std::string*>)
+      for (int i = 0; i < columnSize; i++) {
+        stringsProto.Add("");
+      }
+      auto* arrstart = stringsProto.mutable_data();
+      starget = {arrstart, arrstart + columnSize};
+    } else {
+      // multi-valued field type (even if only one value per doc currently)
+      auto& strCol = *fieldCol.mutable_multi_s();
+      auto& arrArrProto = *strCol.mutable_v();  // v is a repeated ArrStr
+      arrArrProto.Reserve(columnSize);
+      for (int i = 0; i < columnSize; i++) {
+        arrArrProto.Add();
+      }
+      // arrArrProto is implemented as a vector<ArrStr*> under the covers (RepeatedPtrField), so our span
+      // should be of pointers.
+      solux::proto::ArrStr** arrstart = arrArrProto.mutable_data();
+      auto** arrEnd = arrstart + columnSize;
+      assert(&arrArrProto.Get(columnSize-1) == arrstart[columnSize-1]); // sanity check that arr is actually contiguous.
+      mtarget = {arrstart, columnSize};
     }
-    auto* arrstart = stringsProto.mutable_data();
-    std::span<std::string*> target(arrstart, arrstart + columnSize);  // this is what we will be filling in.
 
 
     // iterate over the segment runs, loading values for each segment (possibly in a new task)
@@ -612,7 +631,8 @@ public:
     for(auto runlen : segRunLength) {
       auto idxSpan = sortedIdx.subspan(start, runlen);
       // capture by-value parameters by-value again since this method will return before the lambda is executed.
-      task_group_run(tg, [this, idxSpan, &req, field, &fieldType, &segDocs, target]() {
+      // also capture anything on the stack in this function by-value.
+      task_group_run(tg, [this, idxSpan, &req, field, &fieldType, &segDocs, starget, mtarget]() {
         // a view of the segdocs for a single segment, in ascending order.
         auto sortedSegDocs = idxSpan | std::views::transform([&segDocs](auto idx) { return segDocs[idx]; });
         auto segNum = sortedSegDocs[0].segment();
@@ -631,18 +651,36 @@ public:
         // we need the terms enum to lookup the string value for each ord
         TermsEnum tenum(poolGuard.pool(), postingsReader, segFieldInfo);
 
-        // callback handler to convert ord to string and to put values back in the correct slot.
-        auto valHandler = [&](size_t idx, int32_t doc, int64_t val) {
-          assert(segDocs[idxSpan[idx]].docId() == doc && val > 0);
-          // translate back to the original index
-          // TODO: we could introduce a cache here to avoid repeated lookups for the same term.
-          // it could be map<int64_t, string_view or string*> since the protobuf values won't be moving around.
-          tenum.seekOrd((int32_t)val-1);  // term ords are 0 based.
-          // LHS is a std::string&, so this makes a copy (which we need to do since tenum.term() will soon be invalidated.)
-          *target[idxSpan[idx]] = (std::string_view)tenum.term();
-        };
+        if (!fieldType.multiValued()) {
+          // callback handler to convert ord to string and to put values back in the correct slot.
+          auto valHandler = [&](size_t idx, int32_t doc, int64_t val) {
+            assert(segDocs[idxSpan[idx]].docId() == doc && val > 0);
+            // translate back to the original index
+            // TODO: we could introduce a cache here to avoid repeated lookups for the same term.
+            // it could be map<int64_t, string_view or string*> since the protobuf values won't be moving around.
+            tenum.seekOrd((int32_t) val - 1);  // term ords are 0 based.
+            // LHS is a std::string&, so this makes a copy (which we need to do since tenum.term() will soon be invalidated.)
+            *starget[idxSpan[idx]] = (std::string_view) tenum.term();
+          };
 
-        IntColReader::getSingleValues(poolGuard.pool(), postingsReader, segFieldInfo, sortedDocs, valHandler);
+          IntColReader::getSingleValues(poolGuard.pool(), postingsReader, segFieldInfo, sortedDocs, valHandler);
+        } else {
+          // multi-valued handling
+          auto valHandler = [&](size_t idx, int32_t doc, int64_t val, int64_t valIdx, int64_t numVals) {
+            assert(segDocs[idxSpan[idx]].docId() == doc && val > 0);
+            solux::proto::ArrStr& target = *mtarget[idxSpan[idx]];
+            if (valIdx == 0) {
+              // first value for this doc.
+              target.mutable_v()->Reserve(numVals);
+            }
+            tenum.seekOrd((int32_t) val - 1);  // term ords are 0 based.
+            auto v = (std::string_view) tenum.term();
+            auto* strProto = target.mutable_v()->Add();
+            *strProto = v;
+          };
+
+          IntColReader::getValues(poolGuard.pool(), postingsReader, segFieldInfo, sortedDocs, valHandler);
+        }
       });
 
       start += runlen;

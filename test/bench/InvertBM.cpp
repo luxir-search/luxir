@@ -31,7 +31,7 @@ static void BM_Invert(benchmark::State& state, std::string field, bool writePost
 
     for (int i=0; i<iter;i++) {
       inverter.startDoc();
-      fieldHandler.index(inverter, &val[0], (int) val.size());
+      fieldHandler.index(inverter, val);
       inverter.finishDoc();
     }
 

@@ -84,13 +84,16 @@ public:
   std::unique_ptr<TokenChain> createAnalyzer(std::string_view fieldName) {
     unused(fieldName);
     std::unique_ptr<TokenChain> tc;
-    auto wsTok = std::make_unique<WhitespaceTokenizer>();
-    auto &headRef = *wsTok;
 
     // hack to just drive off of the name for now
     if (name_ == "_w") {
+      auto wsTok = std::make_unique<NoCopyWhitespaceTokenizer>();
+      auto &headRef = *wsTok;
       tc = make_unique<TokenChain>(headRef, std::move(wsTok));  // ws only
     } else if (name_ == "_wl") {
+      // auto wsTok = std::make_unique<WhitespaceTokenizer>();
+      auto wsTok = std::make_unique<WhitespaceTokenizer>();
+      auto &headRef = *wsTok;
       auto lowerFilt = std::make_unique<LowercaseFilter>(std::move(wsTok));
       tc = make_unique<TokenChain>(headRef, std::move(lowerFilt));
     }

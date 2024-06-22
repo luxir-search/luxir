@@ -11,7 +11,6 @@ static void BM_IndexBook(benchmark::State& state, std::string field, bool writeP
   Book& book = TestData::data->getBook();
 
   int64_t inverterSz = 0;
-  char* data = const_cast<char*>(book.text().data());  // TODO: need to make a copy for any analysis that mutates? Make tokenizer do this?
   int sz = docPerPara ? book.sumParaSizes : book.text().size();
 
   RAMDir dir;
@@ -23,13 +22,13 @@ static void BM_IndexBook(benchmark::State& state, std::string field, bool writeP
     if (!docPerPara) {
       // index whole book as a single document
       inverter.startDoc();
-      fieldHandler.index(inverter, data, sz);
+      fieldHandler.index(inverter, book.text());
       inverter.finishDoc();
     } else {
       // index each paragraph as its own document
       for (int i=0; i<(int)book.paraOffsets.size(); i++) {
         inverter.startDoc();
-        fieldHandler.index(inverter, data + book.paraOffsets[i], book.paraSizes[i]);
+        fieldHandler.index(inverter, book.text().substr(book.paraOffsets[i], book.paraSizes[i]));
         inverter.finishDoc();
       }
     }

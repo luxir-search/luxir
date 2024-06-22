@@ -49,17 +49,17 @@ public:
 
 class Tokenizer : public TokenStream {
 protected:
-  char *start_ = nullptr;
-  char *end_ = nullptr;
+  const char *start_ = nullptr;
+  const char *end_ = nullptr;
   Token token;
 public:
   Tokenizer() : TokenStream(token) {}
 
   /// The value this points to should exist for the duration of the analysis and may be changed in place!
-  void setMutableValue(char *val, int len) {
-    assert(len >= 0); // do we mave a max size as well?
-    start_ = val;
-    end_ = val + len;
+  void setValue(std::string_view val) {
+    assert(val.size() >= 0); // do we mave a max size as well?
+    start_ = val.data();
+    end_ = start_ + val.size();
   }
 };
 
@@ -73,14 +73,14 @@ public:
   TokenStream& source() { return *tokSource; }
 };
 
-
-
+// A version of WhitespaceTokenizer that makes a copy of the input
 class WhitespaceTokenizer : public Tokenizer {
+  std::vector<char> output;
 
   // increments over a single whitespace char.
   // assumes ptr is less than end
   // after returning ptr may be equal to end
-  static bool incrementOverWhitespace(char *&ptr, const char *end) {
+  static bool incrementOverWhitespace(const char*& ptr, const char* end) {
     unused(end); // we don't check multiple bytes yet
     char ch = *ptr;
     // all whitespace chars are either less than ' ' or take up more than one UTF8 byte, so the first byte will be negative!
@@ -96,7 +96,65 @@ class WhitespaceTokenizer : public Tokenizer {
   }
 
 public:
-  WhitespaceTokenizer() : Tokenizer() {}
+  WhitespaceTokenizer() : Tokenizer() {
+  }
+
+  virtual bool incrementToken(bool first) override {
+    unused(first);
+    // first reset the token state
+    token.clear();
+
+    // first eat whitespace
+    do {
+      if (start_ >= end_) return false;
+    } while (incrementOverWhitespace(start_, end_));
+
+    // first non-whitespace, guaranteed to have start_ < end_
+    auto* mystart = start_;
+
+    // Going to the next character may place us on the second octet of a UTF8 sequence.
+    // That's OK as long as our incrementOverWhitespace routine can handle that.
+    // It's also guaranteed that this first character is not whitespace, so we don't need
+    // to correctly match higher code points for whitespace.
+    start_++;
+
+    for (;;) {
+      auto* myend = start_;
+      if (start_ >= end_ || incrementOverWhitespace(start_, end_)) {
+        // If we hit whitespace, we will have already skipped over the first whitespace char for the next call
+        output.resize(myend - mystart);
+        memcpy(&output[0], mystart, output.size());  // std::copy doesn't know if ranges overlap and uses mmove
+        token.ptr = output.data();
+        token.end = token.ptr + output.size();
+        return true;
+      }
+      start_++;
+    }
+  }
+};
+
+class NoCopyWhitespaceTokenizer : public Tokenizer {
+
+  // increments over a single whitespace char.
+  // assumes ptr is less than end
+  // after returning ptr may be equal to end
+  static bool incrementOverWhitespace(const char *&ptr, const char *end) {
+    unused(end); // we don't check multiple bytes yet
+    char ch = *ptr;
+    // all whitespace chars are either less than ' ' or take up more than one UTF8 byte, so the first byte will be negative!
+    // this does rely on char being signed
+    if ((signed char) ch > (signed char) ' ') return false;
+    if (ch == ' ' || ch == '\n' || ch == '\t' || ch == '\r') {
+      ++ptr;
+      return true;
+    }  // use the shift-trick here?
+
+    // TODO: 0xA0 (non-breaking space) and the other unicode space chars (or java space chars)
+    return false;
+  }
+
+public:
+  NoCopyWhitespaceTokenizer() : Tokenizer() {}
 
   // TODO: somehow add a method that could be used via templates
   // or something that could be inlined (i.e. delegation via templates)
@@ -112,7 +170,7 @@ public:
     } while (incrementOverWhitespace(start_, end_));
 
     // first non-whitespace, guaranteed to have start_ < end_
-    token.ptr = start_;
+    token.ptr = const_cast<char *>(start_);
 
     // Going to the next character may place us on the second octet of a UTF8 sequence.
     // That's OK as long as our incrementOverWhitespace routine can handle that.
@@ -121,7 +179,7 @@ public:
     start_++;
 
     for (;;) {
-      token.end = start_;
+      token.end = const_cast<char *>(start_);
       if (start_ >= end_ || incrementOverWhitespace(start_, end_)) {
         // If we hit whitespace, we will have already skipped over the first whitespace char for the next call
         return true;
@@ -132,7 +190,7 @@ public:
 
   // An inlineable push version for performance experimentation
   template<class Sink>
-  inline static void process(char *val, int len, Sink sink) {
+  inline static void process(const char *val, int len, Sink sink) {
     const char *end = val + len;
 
     for (;;) {

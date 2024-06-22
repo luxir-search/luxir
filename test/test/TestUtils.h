@@ -79,10 +79,11 @@ private:
             handler.index(inverter, std::get<double>(val));
             break;
           case 4: {
-            std::string copy = std::get<std::string>(val);  // TODO: revisit changing the input string in the indexer!
-            handler.index(inverter, copy.data(), copy.size());
+            handler.index(inverter, std::get<std::string>(val));
             break;
+
           }
+
           default:
             throw std::runtime_error("Unknown type in Doc");
         }

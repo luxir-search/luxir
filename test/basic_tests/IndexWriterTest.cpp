@@ -24,7 +24,7 @@ public:
     auto* fieldHandler = &inverter->getIndexHandler(field);
     std::string doc1 = "test";
     inverter->startDoc();
-    fieldHandler->index(*inverter, doc1.data(), doc1.size());
+    fieldHandler->index(*inverter, doc1);
     inverter->finishDoc();
     iw.releaseInverter(*inverter);
   }
@@ -39,7 +39,7 @@ TEST_F(IndexWriterTest, simple) {
 
   std::string doc1 = "now is the time for all good men";
   inverter->startDoc();
-  fieldHandler->index(*inverter, doc1.data(), doc1.size());
+  fieldHandler->index(*inverter, doc1);
   inverter->finishDoc();
 
   iw.releaseInverter(*inverter);
@@ -54,11 +54,11 @@ TEST_F(IndexWriterTest, simple) {
 
   doc1 = "to come to the aid";
   inverter->startDoc();
-  fieldHandler->index(*inverter, doc1.data(), doc1.size());
+  fieldHandler->index(*inverter, doc1);
   inverter->finishDoc();
   doc1 = "of their country";
   inverter->startDoc();
-  fieldHandler->index(*inverter, doc1.data(), doc1.size());
+  fieldHandler->index(*inverter, doc1);
   inverter->finishDoc();
 
   iw.releaseInverter(*inverter);
