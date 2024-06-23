@@ -29,6 +29,18 @@ auto vec(Args&&... args) {
   return std::vector{std::forward<Args>(args)...};
 }
 
+// make a vector of string (as opposed to string_view or const char*)
+template<typename... Args>
+auto vecs(Args&&... args) {
+  return std::vector<std::string>{std::forward<Args>(args)...};
+}
+
+// make a vector of string_view (as opposed to string or const char*)
+template<typename... Args>
+auto vecsv(Args&&... args) {
+    return std::vector<std::string_view>{std::forward<Args>(args)...};
+}
+
 // allow construction of a Doc with just alternating names and values. Example:
 // auto doc1 = flatdoc("name1", 1, "name2", 2.0, "name3", "hi");
 template<typename T1, typename T2, typename... Args>
@@ -43,7 +55,10 @@ Doc flatdoc(T1 arg1, T2 arg2, Args... args) {
 };
 
 
-
+template<class... Ts>
+struct overloaded : Ts... { using Ts::operator()...; };
+template<class... Ts>
+overloaded(Ts...) -> overloaded<Ts...>;
 
 class CollectionHelper {
 private:
@@ -65,28 +80,45 @@ private:
       for (auto& nv: doc) {
         auto& handler = inverter.getIndexHandler(nv.name);
         auto& val = nv.val;
-        switch (val.index()) {
-          case 0:
-            handler.index(inverter, std::get<bool>(val));
-            break;
-          case 1:
-            handler.index(inverter, std::get<int64_t>(val));
-            break;
-          case 2:
-            handler.index(inverter, std::get<float>(val));
-            break;
-          case 3:
-            handler.index(inverter, std::get<double>(val));
-            break;
-          case 4: {
-            handler.index(inverter, std::get<std::string>(val));
-            break;
 
-          }
+        /*
+        std::visit([&](auto&& arg) {
+          // using T = std::decay_t<decltype(arg)>;
+          // if constexpr (std::is_same_v<T, int64_t>)
+          handler.index(inverter, arg);
+        }, val);
+        */
 
-          default:
-            throw std::runtime_error("Unknown type in Doc");
-        }
+        std::visit(overloaded{
+                [&](bool v){handler.index(inverter, v); },
+                [&](int64_t v){handler.index(inverter, v); },
+                [&](float v){handler.index(inverter, v); },
+                [&](double v){handler.index(inverter, v); },
+                [&](std::string v){handler.index(inverter, v); },
+                [&](std::vector<bool> v){
+                  unused(v);
+                  // handler.index(inverter, v);
+                  },
+                [&](std::vector<int64_t> v){
+                  handler.index(inverter, v);
+                  },
+                [&](std::vector<float> v){
+                  unused(v);
+                  // handler.index(inverter, v);
+                  },
+                [&](std::vector<double> v){
+                  unused(v);
+                  // handler.index(inverter, v);
+                  },
+                [&](std::vector<std::string> v){
+                  // stack allocate... obviously not for anything large.
+                  auto arr = (std::string_view*)alloca(v.size() * sizeof(std::string_view));
+                  std::span<std::string_view> sv(arr, v.size());
+                  std::ranges::copy(v, sv.begin());
+                  handler.index(inverter, sv);
+                }
+        }, val);
+
       }
       inverter.finishDoc();
     }
