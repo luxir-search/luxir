@@ -30,7 +30,7 @@ public:
     searchStub = solux::Searcher::NewStub(channel);
   }
 
-  constexpr static std::array<const char*, 3> retrieveFields = {"id", "id_i", "i256_50_i"};
+  constexpr static std::array<const char*, 4> retrieveFields = {"id", "id_i", "i256_50_i", "s3_256_50_ss"};
 
   // fill in the protobuf for a document based on the document number in a completely deterministic way
   void fillDoc(int64_t docnum, solux::proto::Map& doc) {
@@ -42,6 +42,24 @@ public:
     fields["id_i"].set_i(docnum);
     if (r.rbool()) {
       fields["i256_50_i"].set_i(r() & 0xff);  // 50% of the time as a value between 0 and 255
+    }
+    if (r.rbool()) {
+      size_t n = r.rint(1,4); // 1-3 values
+      // up to 3 values with 256 unique values 50% of the time.
+      auto& arr = *fields["s3_256_50_ss"].mutable_arr_s()->mutable_v();
+      arr.Reserve(n);
+      // for sorted-set, we don't want repeated values.
+      int curr = 0;
+      for (size_t i=0; i<n; i++) {
+        curr += r.rint(0, 255/3);
+        std::string v;
+        v += '0'+i;  // this makes sure the terms will be sorted.  Not a requirement for indexing, but for testing (without sorting).
+        v += std::to_string(curr);
+        arr.Add(std::move(v));
+      }
+      if (n == 2) {
+        std::swap(arr[0], arr[1]); // mix it up some, just to test that indexing order doesn't matter.
+      }
     }
     fields["t_w"].set_s(std::format("{} {}", sid, "common"));  // unique term + common term
     fields["t2_w"].set_s(std::format("{} {} {}", r.rint(0,10), r.rint(0,100), r.rint(0,1000)));
@@ -75,6 +93,26 @@ public:
     } else {
       assert(!has_i256_50_i);
     }
+
+    auto has_s3_256_50ss = r.rbool();
+    if (fields.contains("s3_256_50_ss")) {
+      size_t n = has_s3_256_50ss ? r.rint(1,4) : 0; // expected number of values
+
+      auto& s3_256_50ss = fields.at("s3_256_50_ss");
+      auto& arr = s3_256_50ss.multi_s().v(col).v();
+      ASSERT_EQ(n, arr.size());
+      int curr = 0;
+      for (size_t i=0; i<n; i++) {
+        curr += r.rint(0, 255/3);
+        std::string v;
+        v += '0'+i;  // this makes sure the terms will be sorted.  Not a requirement for indexing, but for testing (without sorting).
+        v += std::to_string(curr);
+        ASSERT_EQ(v, arr[i]);
+      }
+    } else {
+      assert(!has_s3_256_50ss);
+    }
+
   }
 
 

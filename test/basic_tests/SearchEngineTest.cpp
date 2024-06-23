@@ -144,7 +144,7 @@ TEST_F(SearchEngineTest, basic) {
     ASSERT_EQ(0, docs.columns().at("colors_ss").multi_s().v(1).v_size()); // missing for this doc
     ASSERT_EQ(1, docs.columns().at("colors_ss").multi_s().v(2).v_size()); // single-valued for this doc
     ASSERT_EQ("black", docs.columns().at("colors_ss").multi_s().v(2).v(0));
-    
+
     lreq->done();
   }
 
