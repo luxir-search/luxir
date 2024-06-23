@@ -85,6 +85,8 @@ public:
     // NOTE: this will mean that allocate() dispatches to a virtual method!
     // if you want to avoid that, use alloc() instead.
 private:
+  static thread_local std::unique_ptr<MemPool> pool;
+
   void *do_allocate(size_t __bytes, size_t __alignment) override {
     return alloc(__bytes, __alignment);
   }
@@ -425,8 +427,8 @@ public:
     return ScopeGuard(*this);
   }
 
+
   static MemPool& threadLocal() {
-    thread_local std::unique_ptr<MemPool> pool;
     if (!pool) {
       pool = std::make_unique<MemPool>();
     }
@@ -437,6 +439,16 @@ public:
   /// Call .pool() on the returned ScopeGuard to get the pool.
   static ScopeGuard threadLocalPoolGuard() {
     return ScopeGuard(threadLocal());
+  }
+
+  // Checks that any thread-local pools are empty.
+  static bool sanityCheck() {
+    if (pool && pool->size() > 0) {
+      LOG_ERROR("Thread-local pool not empty! size={}", pool->size());
+      pool.reset();  // just delete the pool so we don't leak memory
+      return false;
+    }
+    return true;
   }
 
   void nextBuffer();

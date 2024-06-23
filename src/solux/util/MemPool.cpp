@@ -3,6 +3,8 @@
 
 namespace solux {
 
+thread_local std::unique_ptr<MemPool> MemPool::pool;
+
 MemPool::MemPool() {
   nextBuffer();
 }

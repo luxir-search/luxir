@@ -818,6 +818,7 @@ void GRPCServer::runThread(ThreadInfo& threadInfo) {
     CallData* callData = taggedPtr.ptr();
     GRPC_DEBUG("PRECALL: this={} tag={} ok={}", (void*)callData, taggedPtr.tag(), ok);
     callData->proceed(ok, taggedPtr.tag());
+    assert(MemPool::sanityCheck());
   }
 
   GRPC_DEBUG("GRPCServer thread shutting down.");

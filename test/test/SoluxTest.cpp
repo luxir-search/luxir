@@ -36,6 +36,10 @@ class SoluxTestListener : public testing::EmptyTestEventListener {
     SoluxTest::init_test(rng_seed);
   }
 
+  void OnTestEnd(const testing::TestInfo &test_info) override {
+    // std::cout << "ENDING TEST " << test_info.name() << std::endl;
+    assert(MemPool::sanityCheck());
+  }
 };
 
 
