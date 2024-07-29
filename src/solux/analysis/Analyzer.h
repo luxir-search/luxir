@@ -57,7 +57,7 @@ public:
 
   /// The value this points to should exist for the duration of the analysis and may be changed in place!
   void setValue(std::string_view val) {
-    assert(val.size() >= 0); // do we mave a max size as well?
+    // do we have a max size?
     start_ = val.data();
     end_ = start_ + val.size();
   }
