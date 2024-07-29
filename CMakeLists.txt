@@ -74,60 +74,8 @@ elseif (CMAKE_CXX_COMPILER_ID STREQUAL "MSVC")
   #add_link_options("/nodefaultlib:msvcrt")
 endif()
 
-
-
-#
-# grpc/protobuf, adapted from the helloworld example
-#
-set(protobuf_MODULE_COMPATIBLE TRUE)
-find_package(Protobuf CONFIG REQUIRED)
-message(STATUS "Using protobuf ${Protobuf_VERSION}")
-
-set(_PROTOBUF_LIBPROTOBUF protobuf::libprotobuf)
-set(_REFLECTION gRPC::grpc++_reflection)
-if(CMAKE_CROSSCOMPILING)
-  find_program(_PROTOBUF_PROTOC protoc)
-else()
-  set(_PROTOBUF_PROTOC $<TARGET_FILE:protobuf::protoc>)
-endif()
-
-# Find gRPC installation
-# Looks for gRPCConfig.cmake file installed by gRPC's cmake installation.
-find_package(gRPC CONFIG REQUIRED)
-message(STATUS "Using gRPC ${gRPC_VERSION}")
-
-set(_GRPC_GRPCPP gRPC::grpc++)
-if(CMAKE_CROSSCOMPILING)
-  find_program(_GRPC_CPP_PLUGIN_EXECUTABLE grpc_cpp_plugin)
-else()
-  set(_GRPC_CPP_PLUGIN_EXECUTABLE $<TARGET_FILE:gRPC::grpc_cpp_plugin>)
-endif()
-
-# Proto file
-get_filename_component(solux_proto "./protos/solux.proto" ABSOLUTE)
-get_filename_component(solux_types_proto "./protos/solux_types.proto" ABSOLUTE)
-get_filename_component(solux_proto_path "${solux_proto}" PATH)
-
-# Generated sources
-set(solux_proto_srcs "${CMAKE_CURRENT_BINARY_DIR}/solux.pb.cc" "${CMAKE_CURRENT_BINARY_DIR}/solux_types.pb.cc")
-set(solux_proto_hdrs "${CMAKE_CURRENT_BINARY_DIR}/solux.pb.h" "${CMAKE_CURRENT_BINARY_DIR}/solux_types.pb.h")
-set(solux_grpc_srcs "${CMAKE_CURRENT_BINARY_DIR}/solux.grpc.pb.cc")
-set(solux_grpc_hdrs "${CMAKE_CURRENT_BINARY_DIR}/solux.grpc.pb.h")
-add_custom_command(
-        OUTPUT "${solux_proto_srcs}" "${solux_proto_hdrs}" "${solux_grpc_srcs}" "${solux_grpc_hdrs}"
-        COMMAND ${_PROTOBUF_PROTOC}
-        ARGS --grpc_out "${CMAKE_CURRENT_BINARY_DIR}" --experimental_allow_proto3_optional
-        --cpp_out "${CMAKE_CURRENT_BINARY_DIR}"
-        -I "${solux_proto_path}"
-        --plugin=protoc-gen-grpc="${_GRPC_CPP_PLUGIN_EXECUTABLE}"
-        "${solux_proto}" "${solux_types_proto}"
-        DEPENDS "${solux_proto}")
-
-# Include generated *.pb.h files
+# Include protobuf/grpc generated *.pb.h files
 include_directories("${CMAKE_CURRENT_BINARY_DIR}")
-########### end grpc/protobuf
-
-
 
 file(GLOB_RECURSE Proj_SOURCES src/*.cpp src/*.h)
 list(FILTER Proj_SOURCES EXCLUDE REGEX .*/main.cpp)
