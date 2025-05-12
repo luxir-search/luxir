@@ -209,7 +209,7 @@ public:
     assert(topCount > 0);
     // assign slot indexes to start off with, just to see what the performance would be.
     // downside is that this uses max memory to start, even if no hits.
-    topDocs.reserve(topCount*2);
+    topDocs.resize(topCount*2);
     indexes.reserve(topCount*2);
     for (int i = 0; i < topCount*2; i++) {
       indexes.push_back(i);
