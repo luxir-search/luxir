@@ -3,15 +3,36 @@ Building
 
 Installing dependencies via vcpkg:
 $ cd /opt/vcpkg
-$ ./vcpkg install boost gtest benchmark xxhash gtl protobuf grpc spdlog lz4
+$ ./vcpkg install boost-core boost-sort boost-thread gtest benchmark xxhash gtl protobuf grpc spdlog lz4
 $ ./vcpkg install robin-hood-hashing   #optional... see MapBM.cpp
-# TODO: while having all of boost installed is useful for development, it drags in a ton of dependencies +
-# build time in vcpkg.  We should narrow this to just the parts of boost we need.
+
+NOTE: when using address sanitizer, newer gRCP/proto will be hit with "use after poison" errors
+if the libraries themselves are not built with address sanitizer.  Easiest way is this:
+diff --git a/triplets/x64-linux.cmake b/triplets/x64-linux.cmake
+index 8822134560..777ce1ea65 100644
+--- a/triplets/x64-linux.cmake
++++ b/triplets/x64-linux.cmake
+@@ -4,3 +4,7 @@ set(VCPKG_LIBRARY_LINKAGE static)
+
+ set(VCPKG_CMAKE_SYSTEM_NAME Linux)
+
++#YCS
++set(VCPKG_CXX_FLAGS "-g -fno-omit-frame-pointer -fsanitize=address")
++set(VCPKG_C_FLAGS "-g -fno-omit-frame-pointer -fsanitize=address")
++set(VCPKG_LINKER_FLAGS "-g -fno-omit-frame-pointer -fsanitize=address")
+
+NOTE: clang++-20 has issues compiling with current version of spdlog (5/2025)
+  (spdlog 1.15.3, fmt 11.0.2)  the issue is fmt needs to be 11.2  https://github.com/microsoft/vcpkg/pull/45295
+  I hacked local vcpkg_clang dirs to use a spdlog with bundled fmt 11.2
+NOTE: gcc-15 has issues compiling with protobuf with address sanitization (5/2025)
+  https://github.com/protocolbuffers/protobuf/issues/21333
+NOTE: vcpkg compiled with gcc-15, then google::protobuf::TextFormat::PrintToString dies when project
+      compiled with clang-19
+NOTE: compile times (debugging asan) gcc-15=1:51  clang-20=1:23
 
 Ubuntu:
 ```
-sudo apt install build-essential cmake libboost-dev libboost-doc libgtest-dev libboost-chrono-dev \
-    libboost-locale-dev libboost-filesystem-dev
+sudo apt install libtbb-dev    #TODO - try the tbb in vcpkg
 ```
 
 Other 3rd party dependencies:
