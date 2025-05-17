@@ -1,0 +1,123 @@
+{
+  "version" : 9,
+  "cmakeMinimumRequired" : {
+    "major" : 3,
+    "minor" : 21,
+    "patch" : 0
+  },
+ "configurePresets": [
+    {
+      "name": "base",
+      "hidden": true,
+      "generator": "Ninja",
+      "cacheVariables": {
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
+        "CMAKE_VERBOSE_MAKEFILE:BOOL": "ON"
+      }
+    },
+    {
+      "name": "base-debug",
+      "inherits": "base",
+      "hidden": true,
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug"
+      }
+    },
+    {
+      "name": "base-release",
+      "inherits": "base",
+      "hidden": true,
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release"
+      }
+    },
+    {
+      "name": "base-benchmarks",
+      "inherits": "base",
+      "hidden": true,
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo"
+      }
+    },
+
+    {
+      "name": "base-clang",
+      "hidden": true,
+      "cacheVariables": {
+        "CMAKE_C_COMPILER": "clang",
+        "CMAKE_CXX_COMPILER": "clang++"
+      }
+    },
+    {
+      "name": "base-gcc",
+      "hidden": true,
+      "cacheVariables": {
+        "CMAKE_C_COMPILER": "gcc",
+        "CMAKE_CXX_COMPILER": "g++"
+      }
+    },
+
+    {
+      "name": "features-asan",
+      "hidden": true,
+      "cacheVariables": {
+        "CMAKE_CXX_FLAGS": "-g -fsanitize=address -fno-omit-frame-pointer",
+        "CMAKE_EXE_LINKER_FLAGS": "-fsanitize=address",
+        "CMAKE_SHARED_LINKER_FLAGS": "-fsanitize=address",
+        "CMAKE_MODULE_LINKER_FLAGS": "-fsanitize=address"
+      }
+    },
+
+    {
+      "name": "gcc-debug",
+      "inherits": ["base", "base-gcc", "base-debug"],
+      "displayName": "GCC Debug",
+      "toolchainFile": "/opt/vcpkg/scripts/buildsystems/vcpkg.cmake"
+    },
+    {
+      "name": "gcc-release",
+      "inherits": ["base", "base-gcc", "base-release"],
+      "displayName": "GCC Release",
+      "toolchainFile": "/opt/vcpkg/scripts/buildsystems/vcpkg.cmake"
+    },
+    {
+      "name": "gcc-debug-asan",
+      "inherits": ["base", "base-gcc", "base-debug", "features-asan"],
+      "displayName": "GCC Debug ASAN",
+      "toolchainFile": "/opt/vcpkg_asan/scripts/buildsystems/vcpkg.cmake"
+    },
+    {
+      "name": "gcc-release-asan",
+      "inherits": ["base", "base-gcc", "base-release", "features-asan"],
+      "displayName": "GCC Release ASAN",
+      "toolchainFile": "/opt/vcpkg_asan/scripts/buildsystems/vcpkg.cmake"
+    },
+    {
+      "name": "clang-debug",
+      "inherits": ["base", "base-clang", "base-debug"],
+      "displayName": "Clang Debug",
+      "toolchainFile": "/opt/vcpkg_clang/scripts/buildsystems/vcpkg.cmake"
+    },
+    {
+      "name": "clang-release",
+      "inherits": ["base", "base-clang", "base-release"],
+      "displayName": "Clang Release",
+      "toolchainFile": "/opt/vcpkg_clang/scripts/buildsystems/vcpkg.cmake"
+    },
+    {
+      "name": "clang-debug-asan",
+      "inherits": ["base", "base-clang", "base-debug", "features-asan"],
+      "displayName": "Clang Debug ASAN",
+      "toolchainFile": "/opt/vcpkg_clang_asan/scripts/buildsystems/vcpkg.cmake"
+    },
+    {
+      "name": "clang-release-asan",
+      "inherits": ["base", "base-clang", "base-release", "features-asan"],
+      "displayName": "Clang Release ASAN",
+      "toolchainFile": "/opt/vcpkg_clang_asan/scripts/buildsystems/vcpkg.cmake"
+    }
+
+
+    
+  ]
+}
