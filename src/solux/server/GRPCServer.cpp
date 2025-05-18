@@ -19,8 +19,7 @@
 #include "ProtoUpdateMessage.h"
 
 
-using namespace solux;
-
+namespace solux {
 // TODO - use a different logger for RPC stuff some point
 // redefine DEBUG to TRACE level which shouldn't currently be logged!
 #define GRPC_DEBUG LOG_TRACE
@@ -663,7 +662,7 @@ public:
     for (int i=0; i<request->collection().name_size(); i++) {
       // TODO: walk from our implicit root to find the correct collection.
       if (i == request->collection().name_size()-1) {
-                GRPC_DEBUG("Looking up collection name '{}'", request->collection().name(i));
+        GRPC_DEBUG("Looking up collection name '{}'", request->collection().name(i));
 
         // last element in path, so get collection.
         collection = server.getSoluxNode().getCollection(library.get(), request->collection().name(i));
@@ -675,7 +674,7 @@ public:
       }
     }
 
-            GRPC_DEBUG("\tindexer got docs, num={}", request->docs_size());
+    GRPC_DEBUG("\tindexer got docs, num={}", request->docs_size());
     auto shard = collection->getShard();
     auto iw = shard->getIndexWriter();
 
@@ -867,3 +866,5 @@ void solux::GRPCServer::shutdown() {
   }
 
 }
+
+} //  namespace solux
