@@ -8,35 +8,10 @@
 
 namespace solux {
 
-//
-// The nature of dynamic (not known ahead of time) nested queries is such that they can't be practically templated.
-// I think a rational decision is to start with the same polymorphic model as lucene and then see what falls out
-// and how we can improve common cases.  We may need codegen to do a really good job of it.
-// Standard virtual method polymorphism will be easiest to work with and can be used to set up faster
-// execution strategies.
-//
-// Another way to increase performance in the face of virtual functions is to use batch scoring for
-// inexpensive queries.  We need to figure out / model cost and then batch score low cost clauses first.
-//
-// Re: variant / visit:
-// https://www.reddit.com/r/cpp/comments/kst2pu/with_stdvariant_you_choose_either_performance_or/
-// https://www.reddit.com/r/cpp/comments/ktyxqa/variants_suck_but_you_can_get_good_performance/
-//
-// Perhaps something like variant *could* make sense over the lowest-level doc iterators.
-//
-
 // Overview:
 // - Query represents a user query.
 // - Weight is created by a Query for a specific index
 // - Scorer is created by a Weight for a specific segment
-//
-
-// Since we will normally be starting with a Protobuf Query, can we drive things from that
-// and directly create Weight objects?  Still, we perhaps need a parsing-like phase where we
-// figure out what a match on a field means (i.e. if we need to tokenize, lowercase, etc...)
-// We also eventually want a simple string parser (to directly handle user queries) and maybe
-// even a Lucene-compatible parser.  If so, we're probably still going to want the Query
-// hierarchy unless we translate everything into Protobuf classes.
 //
 
 /// A map from KeyType to a vector of pointers to ValType.
@@ -98,7 +73,7 @@ struct CachedFieldInfo {
   std::span<TermsEnum*> termsEnums = {};  // TODO: cache align if they will be used in multiple threads
   gtl::node_hash_map<std::string_view, CachedTermInfo, std::hash<std::string_view>, std::equal_to<>, MemPool::allocator<std::pair<const std::string_view, CachedTermInfo>>> termInfos;
 
-  CachedFieldInfo(MemPool& pool, size_t initialMapSize=4) : termInfos(initialMapSize, pool.getAllocator()) {}
+  explicit CachedFieldInfo(MemPool& pool, size_t initialMapSize=4) : termInfos(initialMapSize, pool.getAllocator()) {}
 };
 
 
@@ -138,7 +113,7 @@ public:
     }
 
     // return number of segments
-    int numSegments() const noexcept {
+    size_t numSegments() const noexcept {
       return topReader.segments().size();
     }
 
@@ -237,6 +212,7 @@ public:
   };
 
   // A weight is created by a query for execution over a specific index
+  // It does not have a virtual destructor, so subclasses should be made trivially destructible.
   class Weight {
   protected:
     Query::Context& context;
@@ -249,6 +225,7 @@ public:
     // NOTE: no virtual destructor, so subclasses should be made trivially destructible
   };
 
+  // NOTE: no virtual destructor, so subclasses of Query should be made trivially destructible
   class Scorer {
   public:
     virtual int32_t next() = 0;

@@ -91,6 +91,7 @@ public:
     }
 
     virtual void index(Inverter& inverter, char* val) {
+      unused(inverter, val);
       assert(false && "Don't Use This!");
     }
 

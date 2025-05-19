@@ -66,6 +66,7 @@ class SoluxTestListener : public testing::EmptyTestEventListener {
   }
 
   void OnTestEnd(const testing::TestInfo &test_info) override {
+    unused(test_info);
     // std::cout << "ENDING TEST " << test_info.name() << std::endl;
     assert(MemPool::sanityCheck());
   }

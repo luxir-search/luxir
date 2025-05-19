@@ -42,6 +42,7 @@ static void BM_BitSet(benchmark::State& state, int32_t blocks, bool getRank) {
   state.counters["rate"] = benchmark::Counter(count, benchmark::Counter::kIsIterationInvariantRate);
 }
 
+#ifdef REMOVED
 static void BM_BitSet_block(benchmark::State& state, int32_t blocks, bool getRank) {
   Rng rng;
   std::ostringstream ss;
@@ -80,6 +81,7 @@ static void BM_BitSet_block(benchmark::State& state, int32_t blocks, bool getRan
   state.counters["count"] = count;
   state.counters["rate"] = benchmark::Counter(count, benchmark::Counter::kIsIterationInvariantRate);
 }
+#endif
 
 BENCHMARK_CAPTURE(BM_BitSet, denseIter, 1, false);
 BENCHMARK_CAPTURE(BM_BitSet, denseIterRank, 1, true);

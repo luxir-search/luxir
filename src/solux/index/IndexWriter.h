@@ -802,7 +802,7 @@ public:
     lastAdvertisedCommitTime = now_us;
 
     INDEX_DEBUG("\twriteIndexInfoFile DONE: commitTime={} numDocs={} numSegs={}", now_us, numDocs, numSegs);
-    unused(numSegs);
+    unused(numSegs, numDocs);
   }
 
 
