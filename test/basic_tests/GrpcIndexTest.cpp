@@ -736,7 +736,8 @@ TEST_F(GrpcIndexTest, threadsafeIndex) {
     auto& docList = response.ops().at("q").docs();
     // because responses are streaming and not necessarily in order across different logical requests,
     // we need to get the number used to generate the query from the request id
-    auto reqid = std::stoll(response.request_id());
+    long long reqid;
+    std::from_chars(response.request_id().data(), response.request_id().data() + response.request_id().size(), reqid);
 
     ASSERT_EQ(hits[reqid % 10], docList.matches());
     if (docList.matches() == 0) return;
