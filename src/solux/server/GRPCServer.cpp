@@ -394,7 +394,7 @@ public:
   /// may be obtained from the message.
   RequestT* createRequestMessage() {
     auto arena = createArena();
-    return google::protobuf::Arena::CreateMessage<RequestT>(arena);
+    return google::protobuf::Arena::Create<RequestT>(arena);
   }
 
   virtual void createNew() = 0;
@@ -437,7 +437,7 @@ public:
     for (int i = 0; i < request->response_count(); i++) {
       tg.run([this, request, i] {
         auto arena = createArena();
-        HelloReply* response = google::protobuf::Arena::CreateMessage<HelloReply>(arena);
+        HelloReply* response = google::protobuf::Arena::Create<HelloReply>(arena);
         fillResponse(response, request, i+1);
         respond(response,
                 [](auto* response) { releaseArena(response->GetArena()); },
@@ -457,7 +457,7 @@ public:
         // other calls that cause buffering of the responses and hence we don't know when the response will actually
         // be sent.  We would need to implement caching of responses.
         auto arena = createArena();
-        HelloReply* response = google::protobuf::Arena::CreateMessage<HelloReply>(arena);
+        HelloReply* response = google::protobuf::Arena::Create<HelloReply>(arena);
         fillResponse(response, request, 1);
         respond(response,
                 [](auto* response) { releaseArena(response->GetArena()); },
@@ -472,7 +472,7 @@ public:
       // Create the response object immediately so it's in the same arena buffer as the request object.
       // If it's created in a different thread, a different arena buffer will be used.
       // In reality, this would probably only help responses that don't need to further allocate.
-      HelloReply* response = google::protobuf::Arena::CreateMessage<HelloReply>(arena);
+      HelloReply* response = google::protobuf::Arena::Create<HelloReply>(arena);
       auto& taskArena = server.getSoluxNode().getTaskArena();
 
       taskArena.enqueue([this,request,response]() {
@@ -688,7 +688,7 @@ public:
         // LOG_DEBUG("done msg={}", (void*)this);
         // create response from request arena
         auto* arena = req->GetArena();
-        auto* response = google::protobuf::Arena::CreateMessage<proto::UpdateResponse>(arena);
+        auto* response = google::protobuf::Arena::Create<proto::UpdateResponse>(arena);
         auto& singleResponse = *response->add_responses();
         singleResponse.set_request_id(req->request_id());
 

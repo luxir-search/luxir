@@ -35,8 +35,7 @@ public:
   /// Heap allocate an Arena (if null) and use it to create a LocalReq object and proto::SearchRequest
   static LocalReq* create(SearchEngine& engine, google::protobuf::Arena* arena = nullptr) {
     arena = arena ? arena : createArena();
-    // NOTE: using Create() instead of CreateMessage() for the protobuf message resulted in failure when deallocating!
-    auto* SearchRequestProto = google::protobuf::Arena::CreateMessage<solux::proto::SearchRequest>(arena);
+    auto* SearchRequestProto = google::protobuf::Arena::Create<solux::proto::SearchRequest>(arena);
     auto* localReq = google::protobuf::Arena::Create<LocalReq>(arena, engine, *SearchRequestProto);
     return localReq;
   }

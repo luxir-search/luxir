@@ -114,7 +114,7 @@ public:
     // TODO: we could add a callback here to facilitate chaining of responses (i.e. for streaming results, etc)
 
     Response(SearchEngine::Request& req, google::protobuf::Arena& arena, bool last)
-    : req(req), arena(arena), proto(*google::protobuf::Arena::CreateMessage<solux::proto::SearchResponse>(&arena)), last(last)
+    : req(req), arena(arena), proto(*google::protobuf::Arena::Create<solux::proto::SearchResponse>(&arena)), last(last)
     {
       // set the response id to match the request id.
       proto.set_request_id(req.proto.request_id());
