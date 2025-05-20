@@ -8,6 +8,7 @@
 #include "protos/solux_types.pb.h"
 #include "IndexReader.h"
 #include "Collector.h"
+#include "Facet.h"
 
 namespace solux {
 
@@ -139,6 +140,7 @@ public:
     Query* query;
     Query::Weight* weight;
     int64_t topCount;  // maximum number of docs to return.
+    std::vector<std::vector<bool>>* allMatches = nullptr;
 
     std::string_view name;  // what search operation was this for?
     const solux::proto::TopDocs* topDocsProto;  // the relevant part of the protobuf request
@@ -238,12 +240,20 @@ public:
         // Wait until last moment to obtain collector in hopes of reusing an existing one.
         holder = getCollector();
 
+        std::vector<bool>* currBitset = allMatches ? &(*allMatches)[segnum] : nullptr;
+        if (currBitset) {
+          currBitset->resize(req.reader->numDocs());
+        }
+
         if (scorer != nullptr) {
           auto& collector = holder->collector;
           for (;;) {
             auto doc = scorer->next();
             if (doc == PostingsReader::END) {
               break;
+            }
+            if (currBitset) {
+              (*currBitset)[doc] = true;
             }
             auto score = scorer->score();
             collector.collect(segnum, doc, score);
@@ -350,6 +360,10 @@ public:
       switch (searchOp.kind_case()) {
         case solux::proto::SearchOp::kFieldFacet: {
           auto& facetReq = searchOp.field_facet();
+          auto facetField = facetReq.field();
+          //arena allocate FacetReq
+          auto* facet = google::protobuf::Arena::Create<FacetReq>(&req.arena, *req.reader, facetField);
+          queryReqs[0]->allMatches = &facet->allMatches;
         } // end case
           break;
         default:
