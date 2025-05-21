@@ -160,6 +160,7 @@ message SearchResponse {
 message SearchResult {
   oneof kind {
     DocList docs = 1;
+    FacetResult facet = 2;
   }
 }
 
@@ -176,7 +177,7 @@ message DocList {
 // What about special buckets then?  Map to a column number?  See FacetResponse below for a prototype column response
 message BucketList {
   repeated Bucket buckets = 1;
-  sint64 num_buckets = 2;  // The total number of buckets *if* it was requested.  This can be expensive to calculate.
+  sint64 total_buckets = 2;  // The total number of buckets *if* it was requested.  This can be expensive to calculate.
   int64 offset = 3;
   // TODO: a more flag if streaming for this bucket list?
 }
@@ -187,13 +188,12 @@ message Bucket {
   map<string, SearchResult> ops = 3;
 }
 
-message FacetResponse {
-  sint64 num_buckets =  1;
-  // TODO: for a field facet, the values will be string,binary,integer, or boolean.  We could also use
-  // the array type embedded in a single Val (i.e. don't have this field repeated) for a tighter response type.
-  repeated Val bucket_ids = 2;
+message FacetResult {
+  sint64 total_buckets =  1; // The total number of buckets *if* it was requested.  This can be expensive to calculate.
+  Column bucket_ids = 2;
   repeated int64 counts = 3;
   Columns columns = 4;  // other custom values requested for this facet, like min(price) for example
+  int64 offset = 5;
 }
 
 
