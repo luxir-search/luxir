@@ -119,6 +119,8 @@ TEST_F(SearchEngineTest, basic) {
     terms.Add("bar");
      */
 
+    auto& facet = *ops["f"].mutable_field_facet();
+    facet.set_field("foo_i");
 
     lreq->engine.submit(*lreq, para);
     // LOG_DEBUG("ENGINE REQ: {}", lreq->toString());
@@ -143,6 +145,13 @@ TEST_F(SearchEngineTest, basic) {
     ASSERT_EQ(0, docs.columns().at("colors_ss").multi_s().v(1).v_size()); // missing for this doc
     ASSERT_EQ(1, docs.columns().at("colors_ss").multi_s().v(2).v_size()); // single-valued for this doc
     ASSERT_EQ("black", docs.columns().at("colors_ss").multi_s().v(2).v(0));
+
+    // check the facet
+    ASSERT_EQ(3, lreq->responses[0]->proto.ops().at("f").facet().bucket_ids().col_i().v_size());
+    ASSERT_EQ(3, lreq->responses[0]->proto.ops().at("f").facet().counts().size());
+    ASSERT_EQ(1, lreq->responses[0]->proto.ops().at("f").facet().counts().at(0));
+    ASSERT_EQ(1, lreq->responses[0]->proto.ops().at("f").facet().counts().at(1));
+    ASSERT_EQ(1, lreq->responses[0]->proto.ops().at("f").facet().counts().at(2));
 
     lreq->done();
   }

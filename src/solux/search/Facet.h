@@ -17,6 +17,7 @@ public:
   FacetReq(IndexReader& reader, std::string_view fieldName, std::string_view facetName)
   : reader(reader), fieldName(fieldName), facetName(facetName) {
     allMatches.resize(reader.segments().size());
+    allCounts.resize(reader.segments().size());
   }
 
   void facetSeg(int32_t segnum) {
