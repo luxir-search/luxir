@@ -61,13 +61,3 @@ TEST_F(GrpcSearchTest, basic) {
   ASSERT_TRUE(status.ok());
 }
 
-// codecs are not currently thread safe.
-// we should create a test that fails before we fix this.
-// We should create a big test index (i.e. not "main") that can be reused by multiple tests.
-TEST_F(GrpcSearchTest, threadsafe) {
-  // idea: do a series of searches in a single thread and record the results.  then use multiple threads and see
-  // if the results are the same.
-
-
-}
-
