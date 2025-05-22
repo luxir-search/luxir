@@ -3,26 +3,31 @@
 #include <string_view>
 #include <vector>
 
+#include "DocSet.h"
 #include "IndexReader.h"
 
 namespace solux {
+
+class FacetDomain {
+public:
+  std::vector<DocSet> allMatches;
+};
+
 class FacetReq {
   IndexReader& reader;
   std::string_view fieldName;
   int64_t limit;
 public:
   std::string_view facetName;
-  std::vector<std::vector<bool>> allMatches;
   std::vector<boost::unordered_flat_map<int64_t, int64_t>> allCounts;
 
   FacetReq(IndexReader& reader, std::string_view fieldName, std::string_view facetName, int64_t limit)
   : reader(reader), fieldName(fieldName), facetName(facetName), limit(limit) {
-    allMatches.resize(reader.segments().size());
     allCounts.resize(reader.segments().size());
   }
 
-  void facetSeg(int32_t segnum) {
-    std::vector<bool>& matches = allMatches[segnum];
+  void facetSeg(FacetDomain& domain, int32_t segnum) {
+    std::vector<bool>& matches = domain.allMatches[segnum].docs;
     boost::unordered_flat_map<int64_t, int64_t>& count = allCounts[segnum];
     auto& postingsReader = reader.segments()[segnum].postingsReader();
     auto poolGuard = MemPool::threadLocalPoolGuard();

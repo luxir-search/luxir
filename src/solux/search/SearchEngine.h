@@ -140,7 +140,8 @@ public:
     Query* query;
     Query::Weight* weight;
     int64_t topCount;  // maximum number of docs to return.
-    FacetReq* facet = nullptr;
+    std::vector<FacetReq*>* facets = nullptr;
+    FacetDomain* dom = nullptr;  // the domain for the facet
 
     std::string_view name;  // what search operation was this for?
     const solux::proto::TopDocs* topDocsProto;  // the relevant part of the protobuf request
@@ -240,7 +241,7 @@ public:
         // Wait until last moment to obtain collector in hopes of reusing an existing one.
         holder = getCollector();
 
-        std::vector<bool>* currBitset = facet ? &facet->allMatches[segnum] : nullptr;
+        std::vector<bool>* currBitset = dom ? &dom->allMatches[segnum].docs : nullptr;
         if (currBitset) {
           currBitset->resize(req.reader->numDocs());
         }
@@ -272,8 +273,10 @@ public:
       for (int32_t i=0; i < (int32_t)req.reader->segments().size(); i++) {
         task_group_run(tg, [this, i]() {
           this->collect(i);
-          if (facet != nullptr) {
-            facet->facetSeg(i);
+          if (facets != nullptr) {
+            for (auto* facet : *facets) {
+              facet->facetSeg(*dom, i);
+            }
           }
         });
       }
@@ -314,6 +317,8 @@ public:
     solux::proto::SearchRequest& proto = req.proto;
 
     std::vector<QueryReq*> queryReqs;
+    std::vector<FacetReq*> facetReqs;
+    FacetDomain dom;
 
     for (auto& [opKey, searchOp] : proto.ops()) {
       switch (searchOp.kind_case()) {
@@ -358,7 +363,6 @@ public:
       } // end switch
     } // end for ever searchOp
 
-    FacetReq* facet = nullptr;
     for (auto& [opKey, searchOp] : proto.ops()) {
       switch (searchOp.kind_case()) {
         case solux::proto::SearchOp::kFieldFacet: {
@@ -369,14 +373,19 @@ public:
             limit = facetReq.limit();
           }
           //arena allocate FacetReq
-          facet = google::protobuf::Arena::Create<FacetReq>(&req.arena, *req.reader, facetField, opKey, limit);
-          queryReqs[0]->facet = facet;
+          FacetReq* facet = google::protobuf::Arena::Create<FacetReq>(&req.arena, *req.reader, facetField, opKey, limit);
+          facetReqs.push_back(facet);
         } // end case
           break;
         default:
           // already handled, or ignoring for now
           break;
       } // end switch
+    }
+    if (!facetReqs.empty()) {
+      queryReqs[0]->facets = &facetReqs;
+      queryReqs[0]->dom = &dom;
+      dom.allMatches.resize(req.reader->segments().size());
     }
 
     // launch all top-level queries
@@ -389,7 +398,7 @@ public:
       req.tg->wait();
     }
 
-    if (facet) {
+    for (auto* facet: facetReqs) {
       auto& response = *req.lastResponse;
       auto& searchResultProto = response.proto.mutable_ops()->operator[](facet->facetName);
       auto& facetResultProto = *searchResultProto.mutable_facet();
