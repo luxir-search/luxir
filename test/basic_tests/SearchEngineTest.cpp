@@ -148,6 +148,9 @@ TEST_F(SearchEngineTest, basic) {
 
     // check the facet
     ASSERT_EQ(3, lreq->responses[0]->proto.ops().at("f").facet().bucket_ids().col_i().v_size());
+    ASSERT_EQ(5, lreq->responses[0]->proto.ops().at("f").facet().bucket_ids().col_i().v(0));
+    ASSERT_EQ(17, lreq->responses[0]->proto.ops().at("f").facet().bucket_ids().col_i().v(1));
+    ASSERT_EQ(23, lreq->responses[0]->proto.ops().at("f").facet().bucket_ids().col_i().v(2));
     ASSERT_EQ(3, lreq->responses[0]->proto.ops().at("f").facet().counts().size());
     ASSERT_EQ(1, lreq->responses[0]->proto.ops().at("f").facet().counts().at(0));
     ASSERT_EQ(1, lreq->responses[0]->proto.ops().at("f").facet().counts().at(1));

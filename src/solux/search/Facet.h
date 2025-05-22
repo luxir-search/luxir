@@ -50,27 +50,39 @@ public:
     }
   }
 
-  void mergeCounts() {
-    // merge all the counts from all segments into the first map
+  void facetResult(solux::proto::FacetResult& facetResultProto) {
+    // merge all the counts from all segments into the largest map
     auto& counts = allCounts[0];
     for (size_t i = 1; i < allCounts.size(); i++) {
       auto& segCounts = allCounts[i];
+      // its faster to merge the smaller map into the larger one
+      if (segCounts.size() > counts.size()) {
+        std::swap(counts, segCounts);
+      }
       for (auto [val, count] : segCounts) {
         counts[val] += count;
       }
+      segCounts.clear();
     }
-  }
-
-  void facetResult(solux::proto::FacetResult& facetResultProto) {
-    mergeCounts();
+    std::vector<std::pair<int64_t, int64_t>> countVec;
+    for (auto [val, count] : counts) {
+      countVec.emplace_back(val, count);
+    }
+    counts.clear();
+    std::sort(countVec.begin(), countVec.end(), [](auto& a, auto& b) {
+      if (a.second != b.second ) {
+        return a.second > b.second;
+      }
+      return a.first < b.first;
+    });
 
     // fill in the facet result proto
     auto& bucketIds = *facetResultProto.mutable_bucket_ids()->mutable_col_i();
     auto& bucketIdsArr = *bucketIds.mutable_v();
     auto& countsArr = *facetResultProto.mutable_counts();
-    bucketIdsArr.Reserve(allCounts[0].size());
-    countsArr.Reserve(allCounts[0].size());
-    for (auto [val, count] : allCounts[0]) {
+    bucketIdsArr.Reserve(countVec.size());
+    countsArr.Reserve(countVec.size());
+    for (auto [val, count] : countVec) {
       bucketIdsArr.Add(val);
       countsArr.Add(count);
     }
