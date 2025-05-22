@@ -9,13 +9,14 @@ namespace solux {
 class FacetReq {
   IndexReader& reader;
   std::string_view fieldName;
+  int64_t limit;
 public:
   std::string_view facetName;
   std::vector<std::vector<bool>> allMatches;
   std::vector<boost::unordered_flat_map<int64_t, int64_t>> allCounts;
 
-  FacetReq(IndexReader& reader, std::string_view fieldName, std::string_view facetName)
-  : reader(reader), fieldName(fieldName), facetName(facetName) {
+  FacetReq(IndexReader& reader, std::string_view fieldName, std::string_view facetName, int64_t limit)
+  : reader(reader), fieldName(fieldName), facetName(facetName), limit(limit) {
     allMatches.resize(reader.segments().size());
     allCounts.resize(reader.segments().size());
   }
@@ -75,6 +76,9 @@ public:
       }
       return a.first < b.first;
     });
+    if (limit >= 0 && limit < countVec.size()) {
+      countVec.resize(limit);
+    }
 
     // fill in the facet result proto
     auto& bucketIds = *facetResultProto.mutable_bucket_ids()->mutable_col_i();

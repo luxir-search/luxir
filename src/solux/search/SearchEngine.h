@@ -364,8 +364,12 @@ public:
         case solux::proto::SearchOp::kFieldFacet: {
           auto& facetReq = searchOp.field_facet();
           auto facetField = facetReq.field();
+          auto limit = 5; // default limit
+          if (facetReq.has_limit()) {
+            limit = facetReq.limit();
+          }
           //arena allocate FacetReq
-          facet = google::protobuf::Arena::Create<FacetReq>(&req.arena, *req.reader, facetField, opKey);
+          facet = google::protobuf::Arena::Create<FacetReq>(&req.arena, *req.reader, facetField, opKey, limit);
           queryReqs[0]->facet = facet;
         } // end case
           break;

@@ -158,6 +158,41 @@ TEST_F(SearchEngineTest, basic) {
 
     lreq->done();
   }
+  {
+    auto* lreq = LocalReq::create(soluxNode->getSearchEngine());
+    lreq->proto.mutable_collection()->add_name("main");
+    lreq->proto.set_request_id("myrequestid");
+
+    auto& ops = *lreq->proto.mutable_ops();
+    auto& topDocs = *ops["q"].mutable_top_docs();
+    topDocs.set_get_number(true);
+    topDocs.set_get_scores(true);
+    auto& query = *topDocs.mutable_query()->mutable_match();
+    query.set_field("foo_w");
+    query.mutable_val()->set_s("brown");
+    topDocs.mutable_fields()->Add("foo_i");
+    topDocs.mutable_fields()->Add("color_s");
+    topDocs.mutable_fields()->Add("colors_ss");
+    auto ncols = topDocs.fields().size() + 1; // +1 for _score_
+
+    auto& facet = *ops["f"].mutable_field_facet();
+    facet.set_field("foo_i");
+    facet.set_limit(2);
+
+    lreq->engine.submit(*lreq, para);
+    // LOG_DEBUG("ENGINE REQ: {}", lreq->toString());
+
+
+    // check the facet
+    ASSERT_EQ(2, lreq->responses[0]->proto.ops().at("f").facet().bucket_ids().col_i().v_size());
+    ASSERT_EQ(5, lreq->responses[0]->proto.ops().at("f").facet().bucket_ids().col_i().v(0));
+    ASSERT_EQ(17, lreq->responses[0]->proto.ops().at("f").facet().bucket_ids().col_i().v(1));
+    ASSERT_EQ(2, lreq->responses[0]->proto.ops().at("f").facet().counts().size());
+    ASSERT_EQ(1, lreq->responses[0]->proto.ops().at("f").facet().counts().at(0));
+    ASSERT_EQ(1, lreq->responses[0]->proto.ops().at("f").facet().counts().at(1));
+
+    lreq->done();
+  }
 
   // now lets do the same request, but try to get multiple responses.
   {
