@@ -688,7 +688,7 @@ TEST_F(GrpcIndexTest, threadsafeIndex) {
     req.set_request_id(std::to_string(docid));
   };
 
-  // record the number of hits per docid in a boost flat unordered map
+  // record the number of hits per query in a boost flat unordered map
   boost::unordered::unordered_flat_map<int64_t, int64_t> hits;
 
   ResponseChecker respc2 = [&](int64_t docid, const solux::proto::SearchResponse& response) {

@@ -73,7 +73,7 @@ public:
     schema->fieldTypeMap["_s"] = std::make_shared<StrFieldType>("_s");
     schema->fieldTypeMap["_ss"] = std::make_shared<StrFieldType>("_ss", FieldType::INDEX_DOCS | FieldType::MULTI_VALUED);
     schema->fieldTypeMap["_i"] = std::make_shared<IntFieldType>("_i");
-    schema->fieldTypeMap["_i"] = std::make_shared<IntFieldType>("_is", FieldType::INDEX_DOCS | FieldType::MULTI_VALUED);
+    schema->fieldTypeMap["_is"] = std::make_shared<IntFieldType>("_is", FieldType::INDEX_DOCS | FieldType::MULTI_VALUED);
     schema->fieldTypeMap["_w"] = std::make_shared<TextFieldType>("_w");
     schema->fieldTypeMap["_wl"] = std::make_shared<TextFieldType>("_wl");  // hacky code in TextFieldType will look at name to produce different token chains
     return schema;
