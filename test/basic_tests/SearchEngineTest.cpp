@@ -179,6 +179,10 @@ TEST_F(SearchEngineTest, basic) {
     facet.set_field("foo_i");
     facet.set_limit(2);
 
+    auto& faucet = *ops["f2"].mutable_field_facet();
+    faucet.set_field("foo_i");
+    faucet.set_limit(1);
+
     lreq->engine.submit(*lreq, para);
     // LOG_DEBUG("ENGINE REQ: {}", lreq->toString());
 
@@ -190,6 +194,12 @@ TEST_F(SearchEngineTest, basic) {
     ASSERT_EQ(2, lreq->responses[0]->proto.ops().at("f").facet().counts().size());
     ASSERT_EQ(1, lreq->responses[0]->proto.ops().at("f").facet().counts().at(0));
     ASSERT_EQ(1, lreq->responses[0]->proto.ops().at("f").facet().counts().at(1));
+
+    //check the second facet
+    ASSERT_EQ(1, lreq->responses[0]->proto.ops().at("f2").facet().bucket_ids().col_i().v_size());
+    ASSERT_EQ(5, lreq->responses[0]->proto.ops().at("f2").facet().bucket_ids().col_i().v(0));
+    ASSERT_EQ(1, lreq->responses[0]->proto.ops().at("f2").facet().counts().size());
+    ASSERT_EQ(1, lreq->responses[0]->proto.ops().at("f2").facet().counts().at(0));
 
     lreq->done();
   }
