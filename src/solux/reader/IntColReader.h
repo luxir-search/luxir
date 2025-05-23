@@ -7,6 +7,7 @@ namespace solux {
 
 
 // Monotonic int col.  Currently supports 32 bit indexes and 64 bit outputs.
+// TODO: need a block iterator for bulk-reading values.
 class MonoReader {
 public:
   constexpr static uint32_t BLOCK_SIZE = Postings::NUMERIC_BLOCK_SIZE;

@@ -107,17 +107,77 @@ public:
     return engine();
   }
 
-  // templates to try to work with ints, longs, signed, unsigned, w/o casting.
-  // mod is a relatively slow operation... consider working with a mask to limit the value
-  // in inner loops where performance may matter.
-  template<typename T>
-  T rint(T max) {
+
+  /*
+   * rint() methods use simple modulo division.  This introduces a slight bias (esp for large limits)
+   * but is probably the fastest way if the limit/max being passed in is a constant since
+   * optimizers will normally replace that division with other bitwise operations.
+   */
+  uint64_t rint(uint64_t max) {
+    return engine() % max;
+  }
+  uint32_t rint(uint32_t max) {
+    return static_cast<uint32_t>(engine()) % max;
+  }
+  int64_t rint(int64_t max) {
     return (engine()&0x7fffffffffffffff) % max;
+  }
+  int32_t rint(int32_t max) {
+    return (engine()&0x7fffffff) % max;
+  }
+
+
+  //
+  // Instead of using "%", use Daniel Lemire's nearly-divisionless random integer generation
+  // https://lemire.me/blog/2019/06/06/nearly-divisionless-random-integer-generation-on-various-systems/
+  // This is good if bias is not acceptable, or if the limit is not a constant as viewed by the compiler.
+  //
+  uint64_t rint2(uint64_t s) {
+    uint64_t x = engine();
+    auto m = static_cast<__uint128_t>(x) * static_cast<__uint128_t>(s);
+    auto l = static_cast<uint64_t>(m);
+    if (l < s) {
+      uint64_t t = -s % s;
+      while (l < t) {
+        x = engine() ;
+        m = static_cast<__uint128_t>(x) * static_cast<__uint128_t>(s);
+        l = static_cast<uint64_t>(m);
+      }
+    }
+    return m >> 64;
+  }
+
+  uint32_t rint2(uint32_t s) {
+    auto x = static_cast<uint32_t>(engine());
+    auto m = static_cast<uint64_t>(x) * static_cast<uint64_t>(s);
+    auto l = static_cast<uint32_t>(m);
+    if (l < s) {
+      uint32_t t = -s % s;
+      while (l < t) {
+        x = engine() ;
+        m = static_cast<uint64_t>(x) * static_cast<uint64_t>(s);
+        l = static_cast<uint32_t>(m);
+      }
+    }
+    return m >> 32;
+  }
+
+  int64_t rint2(int64_t max) {
+    return static_cast<int64_t>( rint(static_cast<uint64_t>(max)) );
+  }
+
+  int32_t rint2(int32_t max) {
+    return static_cast<int32_t>( rint(static_cast<uint32_t>(max)) );
   }
 
   template<typename T>
   T rint(T min, T max) {
     return (rint(max - min) + min);
+  }
+
+  template<typename T>
+  T rint2(T min, T max) {
+    return (rint2(max - min) + min);
   }
 
   bool rbool() {
