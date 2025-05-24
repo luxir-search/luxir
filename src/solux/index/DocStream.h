@@ -337,6 +337,18 @@ public:
     }
   }
 
+  // lambda / callable version
+  void visitValues(MemPool& pool, auto&& sink) {
+    StreamReader vstream(storage, pool);
+    int32_t prev = 0;
+    while (!vstream.eof()) {
+      int32_t code = vstream.readVint();
+      int32_t val = prev ^ code;
+      prev = val;
+      sink(val);
+    }
+  }
+
 
 } SOLUX_PACKED_END;
 

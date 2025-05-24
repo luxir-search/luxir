@@ -41,7 +41,11 @@ Inverter::IndexHandler& Inverter::createIndexHandler(const std::string_view name
       fieldHandler = std::make_unique<StringIndexHandler>(*this, name, fieldType);
       break;
     case FieldType::Type::INT:
-      fieldHandler = std::make_unique<IntColHandler>(*this, name, fieldType);
+      if (fieldType->multiValued()) {
+        fieldHandler = std::make_unique<MultiIntColHandler>(*this, name, fieldType);
+      } else {
+        fieldHandler = std::make_unique<IntColHandler>(*this, name, fieldType);
+      }
       break;
     default:
       throw std::runtime_error("Unknown field type: " + std::string(name));

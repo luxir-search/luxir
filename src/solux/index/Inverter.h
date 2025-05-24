@@ -109,7 +109,7 @@ public:
     virtual void index(Inverter& inverter, int64_t val) {
       unused(inverter, val);
     }
-    virtual void index(Inverter& inverter, std::span<int64_t> vals) {
+    virtual void index(Inverter& inverter, std::span<const int64_t> vals) {
       unused(inverter, vals);
     }
 
@@ -224,6 +224,116 @@ public:
     }
   };
 
+  class MultiIntColHandler : public IndexHandler {
+    friend class Inverter;
+    LongStream longStream;
+    IntStream lengthStream;
+    DocStream docsWithVal;
+    int64_t numVals = 0;
+    int32_t numDocs = 0;
+
+  public:
+    MultiIntColHandler(Inverter& inverter, const std::string_view& fieldName,
+                       const std::shared_ptr<FieldType>& fieldType)
+      : IndexHandler(PackedTerm(inverter.pool, fieldName), fieldType), longStream(inverter.pool),
+        lengthStream(inverter.pool), docsWithVal(inverter.pool) {
+    }
+
+    ~MultiIntColHandler() override = default;
+
+    void index(Inverter& inverter, const proto::Val& val) override {
+      if (val.has_i()) {
+        index(inverter, val.i());
+      } else if (val.has_arr_i()) {
+        auto& arr = val.arr_i().v();
+        std::span<const int64_t> values(arr.data(), arr.size());
+        index(inverter, values);
+      }
+    }
+
+    void index(Inverter& inverter, int64_t int64) override {
+      indexMulti(inverter, {&int64, 1});
+    }
+
+    void index(Inverter& inverter, std::span<const int64_t> vals) override {
+      indexMulti(inverter, vals);
+    }
+
+    void indexMulti(Inverter& inverter, std::span<const int64_t> values) {
+      for (auto& val : values) {
+        longStream.addVal(inverter.pool, val);
+        numVals++;
+      }
+      docsWithVal.addDoc(inverter.pool, inverter.currDoc);
+      lengthStream.addVal(inverter.pool, values.size());
+      numDocs++;
+    }
+
+    void flush(Inverter& inverter) override {
+      flushIntCol(inverter);
+    }
+
+    // TODO: make static and pass everything needed so it's composable
+    void flushIntCol(Inverter& inverter) {
+      PostingsWriter& postingsWriter = inverter.getPostingsWriter();
+
+      // TODO: move this to postingsWriter method
+      PostingsWriter::IndexFieldInfo& fieldInfo = postingsWriter.addField(fieldName);
+      fieldInfo.type = fieldType->type();
+      fieldInfo.flags = fieldType->flags_;
+      flushIntCol(inverter, fieldInfo);
+    }
+
+    // This is the version called directly from text field for norms
+    void flushIntCol(Inverter& inverter, PostingsWriter::IndexFieldInfo& fieldInfo) {
+      auto& pool = MemPool::threadLocal();
+      PostingsWriter& postingsWriter = inverter.getPostingsWriter();
+      auto full = numDocs >= postingsWriter.getMaxDoc();
+
+      // push values
+      {
+        auto guard = pool.rewindScopeGuard();
+        IntColWriter writer(pool, postingsWriter, fieldInfo);
+        writer.startField();
+        longStream.pushValues(inverter.pool, writer);
+        writer.finish();
+      }
+
+      // push docs
+      {
+        auto guard = pool.rewindScopeGuard();
+        // TODO: when things go parallel, we don't want to reserve an OutputStream if this is dense.
+        DocsWithValWriter docsWriter(pool, postingsWriter, fieldInfo);
+        if (!full) {
+          docsWithVal.pushDocs(inverter.pool, docsWriter);
+          docsWriter.finish();
+        }
+        else {
+          docsWriter.finishDense(numDocs);
+        }
+      }
+
+      // push lengths
+      {
+        auto guard = pool.rewindScopeGuard();
+        OutputStream& out = postingsWriter.obtainOutputStream();
+        MonoWriter endRankWriter(pool, out);
+        int64_t endRank = 0;
+
+        lengthStream.visitValues(pool, [&endRank, &endRankWriter](auto val) {
+          endRank += val;
+          endRankWriter.addInt64(endRank);
+        });
+
+        endRankWriter.finish();
+        fieldInfo.monoLoc = endRankWriter.blockLoc;
+        fieldInfo.monoMetaOff = endRankWriter.metaOff;
+        // TODO - if exception happens, we need to release the stream
+        postingsWriter.releaseOutputStream(out);
+      }
+
+    }
+  };
 
   // indexes text with positions
   class PosIndexHandler : public IndexHandler {
