@@ -13,6 +13,7 @@ class OrdColWriter {
   OrdCollector& ords;
   IntColWriter colWriter;
   u_ptr<MonoWriter> endRankWriter;
+  OutputStreamPtr endRankOutput;
 public:
   OrdColWriter(MemPool& pool, PostingsWriter& postingsWriter, PostingsWriter::IndexFieldInfo& fieldInfo, OrdCollector& ords)
   : pool(pool), postingsWriter(postingsWriter), fieldInfo(fieldInfo), ords(ords),
@@ -21,7 +22,8 @@ public:
     if (ords.multiValued()) {
       // If this is a multivalued field, then we also need to write to another column that
       // indicates the end of the values for this doc.
-      endRankWriter = pool.make_unique<MonoWriter>(pool, postingsWriter.obtainOutputStream());
+      endRankOutput = postingsWriter.getOutputStream();
+      endRankWriter = pool.make_unique<MonoWriter>(pool, *endRankOutput);
     }
   }
 
@@ -55,7 +57,7 @@ public:
         endRankWriter->finish();
         fieldInfo.monoLoc = endRankWriter->blockLoc;
         fieldInfo.monoMetaOff = endRankWriter->metaOff;
-        postingsWriter.releaseOutputStream(endRankWriter->getOutputStream());
+        endRankOutput.reset();
         endRankWriter.reset();
       }
     }

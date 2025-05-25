@@ -337,8 +337,8 @@ private:
       intColWriter.finish();
       if (outputFieldInfo.flags & FieldType::MULTI_VALUED) {
         auto guard = pool.rewindScopeGuard();
-        OutputStream& out = postingsWriter.obtainOutputStream();
-        MonoWriter endRankWriter(pool, out);
+        OutputStreamPtr out = postingsWriter.getOutputStream();
+        MonoWriter endRankWriter(pool, *out);
         int64_t endRankBase = 0;
 
         for (auto* field : sortedFields) {
@@ -359,8 +359,6 @@ private:
         endRankWriter.finish();
         outputFieldInfo.monoLoc = endRankWriter.blockLoc;
         outputFieldInfo.monoMetaOff = endRankWriter.metaOff;
-        // TODO - if exception happens, we need to release the stream
-        postingsWriter.releaseOutputStream(out);
       }
     }
   }

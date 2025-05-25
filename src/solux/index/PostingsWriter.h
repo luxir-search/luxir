@@ -205,34 +205,57 @@ public:
     }
   }
 
-  OutputStream& obtainOutputStream() {
-    return *obtainOutputStreams<1>()[0];
-  }
+  // Custom deleter that holds a reference to the factory (PostingsWriter) that was used to obtain it.
+  class OutputStreamDeleter {
+  public:
+    explicit OutputStreamDeleter(PostingsWriter* factory) : factory(factory) {}
+    OutputStreamDeleter() : factory(nullptr) {}
 
-  void releaseOutputStream(OutputStream& os) {
-    releaseOutputStreams(std::array{&os});
+    void operator()(OutputStream* os) const {
+      if (os != nullptr) {
+        factory->releaseOutputStream(os);
+      }
+    }
+
+  private:
+    PostingsWriter* factory;
+  };
+
+  typedef std::unique_ptr<OutputStream, OutputStreamDeleter> OutputStreamPtr;
+
+  // TODO: make these thread safe before making flushing or merging multi-threaded.
+  OutputStreamPtr getOutputStream() {
+    return std::move(getOutputStreams<1>()[0]);
   }
 
   // TODO: make these thread safe before making flushing or merging multi-threaded.
   template <std::size_t N>
-  std::array<OutputStream*, N> obtainOutputStreams() {
+  std::array<OutputStreamPtr, N> getOutputStreams() {
     reserveFiles(N);
-    std::array<OutputStream*, N> os;
-    std::copy(freeFiles.end() - N, freeFiles.end(), os.begin());
-    freeFiles.resize(freeFiles.size() - N);
+    std::array<OutputStreamPtr, N> os;
+    for (size_t i = 0; i < N; ++i) {
+      os[i] = OutputStreamPtr(freeFiles.back(), OutputStreamDeleter(this));
+      freeFiles.pop_back();
+    }
     return os;
   }
 
   // TODO: make these thread safe before making flushing or merging multi-threaded.
-  template <std::size_t N>
-  void releaseOutputStreams(std::array<OutputStream*, N>&& os) {
+  void releaseOutputStream(OutputStream* os) {
     auto compareBySize = [](const OutputStream* a, const OutputStream* b) {
       return a->size() < b->size();
     };
+    auto it = std::upper_bound(freeFiles.begin(), freeFiles.end(), os, compareBySize);
+    freeFiles.insert(it, os);
+  }
 
-    for (OutputStream* stream : os) {
-      auto it = std::upper_bound(freeFiles.begin(), freeFiles.end(), stream, compareBySize);
-      freeFiles.insert(it, stream);
+  // TODO: make these thread safe before making flushing or merging multi-threaded.
+  void releaseOutputStreams(std::span<OutputStreamPtr> streams) {
+    auto compareBySize = [](const OutputStream* a, const OutputStream* b) {
+      return a->size() < b->size();
+    };
+    for (auto& streamPtr : streams) {
+      releaseOutputStream(streamPtr.release());
     }
   }
 
@@ -356,10 +379,15 @@ private:
 };
 
 
+using OutputStreamPtr = PostingsWriter::OutputStreamPtr;  // for convenience
+
+
 // TODO: we need a specialization of this for when positions are not required (indexed string fields)
 class TextWriter {
   PostingsWriter& postingsWriter;
   PostingsWriter::IndexFieldInfo* fieldInfo;
+
+  std::array<OutputStreamPtr, 3> streams; // holders for the streams we are using.
   OutputStream& termOutput;    // output stream for termFile
   OutputStream& docOutput;     // output stream for docFile
   OutputStream& posOutput;     // output stream for posFile
@@ -428,27 +456,9 @@ private:  // some internal utility methods... not for use by indexers
 
 public:
   TextWriter(PostingsWriter& postingsWriter)
-  : TextWriter(postingsWriter, postingsWriter.obtainOutputStreams<3>())  // nocommit... original streams were 2,3,4
+  : postingsWriter(postingsWriter), streams(postingsWriter.getOutputStreams<3>()), termOutput(*streams[0]), docOutput(*streams[1]), posOutput(*streams[2])
   {
   }
-
-  TextWriter(PostingsWriter& postingsWriter, std::array<OutputStream*,3> streams)
-  : postingsWriter(postingsWriter), termOutput(*streams[0]), docOutput(*streams[1]), posOutput(*streams[2])
-  {
-  }
-
-  void releaseStreams() {
-    if (termsLoc != -1) {
-      postingsWriter.releaseOutputStreams(std::array{&termOutput, &docOutput, &posOutput});
-      termsLoc = -1;  // signal that we already cleaned up.
-    }
-  }
-
-  ~TextWriter() {
-    // this is only to make sure we don't leak streams if endField isn't called (i.e. an exception is thrown)
-    releaseStreams();
-  }
-
 
   // TODO: FIXME: this is for tests, but it doesn't set the flags / type properly!
   void startField(const std::string& fieldName) {
@@ -853,7 +863,7 @@ public:
 
 
 class DocsWithValWriter {
-  OutputStream& idOutput;
+  OutputStreamPtr idOutput;
   DocsWriter docsWriter;
   PostingsWriter& postingsWriter;
   // int64_t startLoc;
@@ -862,13 +872,9 @@ class DocsWithValWriter {
 public:
   // TODO: fixme... this obtains an outputStream and hence should not be used if the field is dense.
   DocsWithValWriter(MemPool& pool, PostingsWriter& postingsWriter, PostingsWriter::IndexFieldInfo& fieldInfo)
-  : idOutput(postingsWriter.obtainOutputStream()), docsWriter(pool,idOutput), postingsWriter(postingsWriter), fieldInfo(fieldInfo)
+  : idOutput(postingsWriter.getOutputStream()), docsWriter(pool,*idOutput), postingsWriter(postingsWriter), fieldInfo(fieldInfo)
   {
     // startLoc = idOutput.size();
-  }
-
-  ~DocsWithValWriter() {
-    postingsWriter.releaseOutputStream(idOutput);
   }
 
   // Same as addDoc... it's named startDoc target for DocStream.pushDocs.
@@ -878,7 +884,7 @@ public:
 
   void finish() {
     fieldInfo.docsWithField = docsWriter.finish();
-    fieldInfo.docsWithFieldEndLoc = idOutput.slocation();
+    fieldInfo.docsWithFieldEndLoc = idOutput->slocation();
   }
 
   // Signal that the column has all docs present. No docs should be added in this case, but the count

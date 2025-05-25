@@ -316,8 +316,8 @@ public:
       // push lengths
       {
         auto guard = pool.rewindScopeGuard();
-        OutputStream& out = postingsWriter.obtainOutputStream();
-        MonoWriter endRankWriter(pool, out);
+        OutputStreamPtr out = postingsWriter.getOutputStream();
+        MonoWriter endRankWriter(pool, *out);
         int64_t endRank = 0;
 
         lengthStream.visitValues(pool, [&endRank, &endRankWriter](auto val) {
@@ -328,8 +328,6 @@ public:
         endRankWriter.finish();
         fieldInfo.monoLoc = endRankWriter.blockLoc;
         fieldInfo.monoMetaOff = endRankWriter.metaOff;
-        // TODO - if exception happens, we need to release the stream
-        postingsWriter.releaseOutputStream(out);
       }
 
     }
