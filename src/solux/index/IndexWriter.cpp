@@ -296,16 +296,16 @@ private:
         unused(baseId);
 
         IntColReader reader(readerPool, *field->seg->postingsReader, field->segFieldInfo);
-        IntColReader::Iterator colIter(reader);
+        IntColReader::BulkValues values(reader);
 
 
         // int32_t highest = field->seg->postingsReader->numDocs();
         for(;;) {
-          int32_t localId = colIter.next();
-          if (localId == IntColReader::ENDDOC) {
+          auto index = values.next();
+          if (index == IntColReader::ENDINDEX) {
             break;
           }
-          int64_t val = colIter.value();
+          int64_t val = values.value();
           intColWriter.addInt64(val);
         }
       }
@@ -335,6 +335,33 @@ private:
 
 
       intColWriter.finish();
+      if (outputFieldInfo.flags & FieldType::MULTI_VALUED) {
+        auto guard = pool.rewindScopeGuard();
+        OutputStream& out = postingsWriter.obtainOutputStream();
+        MonoWriter endRankWriter(pool, out);
+        int64_t endRankBase = 0;
+
+        for (auto* field : sortedFields) {
+          if (field->segFieldInfo.flags & FieldType::MULTI_VALUED) {
+            continue;
+          }
+          // open IntColReader for each segment
+          IntColReader reader(readerPool, *field->seg->postingsReader, field->segFieldInfo);
+          MonoReader* endRankReader = reader.getEndRankReader();
+          assert(endRankReader != nullptr);
+          int64_t endRank;
+          for (int i = 0; i < endRankReader->numValues(); i++) {
+            endRank = endRankBase + endRankReader->valueAt(i);
+            endRankWriter.addInt64(endRank);
+          }
+          endRankBase = endRank;
+        }
+        endRankWriter.finish();
+        outputFieldInfo.monoLoc = endRankWriter.blockLoc;
+        outputFieldInfo.monoMetaOff = endRankWriter.metaOff;
+        // TODO - if exception happens, we need to release the stream
+        postingsWriter.releaseOutputStream(out);
+      }
     }
   }
 

@@ -127,6 +127,11 @@ public:
     }
   }
 
+  //get underlying endRankReader, null if not multi-valued. Valid as long as IntColReader is valid.
+   MonoReader* getEndRankReader() {
+    return endRankReader;
+  }
+
   // Number of values in field.  For a multi-valued field, this will be greater than docsWithValue
   int64_t numValues() {
     return fieldInfo.numValues;
@@ -243,6 +248,7 @@ public:
       }
       if (index_ >= max) {
         index_ = ENDINDEX;
+        return index_;
       }
       decodeBlock(index_);
       return index_;
