@@ -24,6 +24,11 @@ constexpr auto arr(Args&&... args) {
   return std::to_array({std::forward<Args>(args)...});
 }
 
+template <typename... Args>
+constexpr auto arr_i(Args... args) -> std::array<int64_t, sizeof...(Args)> {
+  return { { static_cast<int64_t>(args)... } };
+}
+
 template<typename... Args>
 auto vec(Args&&... args) {
   return std::vector{std::forward<Args>(args)...};

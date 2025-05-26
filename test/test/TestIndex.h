@@ -225,6 +225,12 @@ namespace solux::test {
       nAdds++;
     }
 
+    void add(int32_t docid, std::span<const int64_t> vals) {
+      inverter->setDoc(docid);
+      indexHandler->index(*inverter, vals);
+      nAdds++;
+    }
+
     void add(int32_t docid, std::string_view val) {
       inverter->setDoc(docid);
       indexHandler->index(*inverter, val);
