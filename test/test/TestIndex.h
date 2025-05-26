@@ -136,6 +136,9 @@ namespace solux::test {
   };
 
 
+// The TestIndex class is for testing low-level indexing functionality.  It was first introduced before there were
+// any higher-level features.  It also acts as a compatibility layer between low level tests
+// and actual solux APIs as they change over time.
   class TestIndex {
   public:
     RAMDir dir;
@@ -210,7 +213,8 @@ namespace solux::test {
 
 
 
-
+// TestField is a generic field that can write and read from the TestIndex, and iterate over values of all segments.
+// One must use the correct methods depending on the type of the field to get sane results.
     TestField(TestIndex& testIndex, const std::string_view name) : testIndex(testIndex), name(name) {
     }
 

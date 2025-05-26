@@ -24,6 +24,8 @@ constexpr auto arr(Args&&... args) {
   return std::to_array({std::forward<Args>(args)...});
 }
 
+// Make an array of int64_t from a list of any integral values.
+// This can be necessary since there are no integer literals in C++ that are guaranteed to be int64_t.
 template <typename... Args>
 constexpr auto arr_i(Args... args) -> std::array<int64_t, sizeof...(Args)> {
   return { { static_cast<int64_t>(args)... } };
@@ -32,6 +34,13 @@ constexpr auto arr_i(Args... args) -> std::array<int64_t, sizeof...(Args)> {
 template<typename... Args>
 auto vec(Args&&... args) {
   return std::vector{std::forward<Args>(args)...};
+}
+
+// Make a vec_i (vector of int64_t) from a list of any integral values.
+// This can be necessary since there are no integer literals in C++ that are guaranteed to be int64_t.
+template<typename... Args>
+auto vec_i(Args&&... args) {
+  return std::vector<int64_t>{static_cast<int64_t>(args)...};
 }
 
 // make a vector of string (as opposed to string_view or const char*)

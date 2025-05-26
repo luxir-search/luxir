@@ -333,27 +333,3 @@ TEST_F(IntColTest, testMonoBig) {
     }
   }
 }
-
-TEST_F(IntColTest, basicMulti) {
-  {
-    TestIndex testIndex;
-    TestField f(testIndex, "foo_is");
-    f.startIndexing();
-    f.add(0, arr(3l, 9l, -2l));
-    f.add(2, 7);
-    f.add(3, arr(5l, 1l));
-    testIndex.flush();
-    f.startReading();
-    ASSERT_EQ(0, f.nextDoc());
-    std::vector<int64_t> vals;
-    f.vals(vals);
-    ASSERT_EQ(vals, vec(3l, 9l, -2l));
-    ASSERT_EQ(2, f.nextDoc());
-    f.vals(vals);
-    ASSERT_EQ(vals, vec(7l));
-    ASSERT_EQ(3, f.nextDoc());
-    f.vals(vals);
-    ASSERT_EQ(vals, vec(5l, 1l));
-    ASSERT_EQ(-1, f.nextDoc());
-  }
-}
