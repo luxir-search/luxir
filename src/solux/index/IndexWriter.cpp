@@ -342,9 +342,7 @@ private:
         int64_t endRankBase = 0;
 
         for (auto* field : sortedFields) {
-          if (field->segFieldInfo.flags & FieldType::MULTI_VALUED) {
-            continue;
-          }
+          assert(field->segFieldInfo.flags & FieldType::MULTI_VALUED);
           // open IntColReader for each segment
           IntColReader reader(readerPool, *field->seg->postingsReader, field->segFieldInfo);
           MonoReader* endRankReader = reader.getEndRankReader();

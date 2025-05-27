@@ -35,7 +35,6 @@ TEST_F(IntColMultiTest, basic) {
   ASSERT_EQ(-1, f.nextDoc());
 }
 
-#ifdef TEST_FAILS // TODO FIXME
 // same docs as above, but in multiple segments that get merged together.
 TEST_F(IntColMultiTest, segMerge) {
   TestIndex testIndex;
@@ -45,7 +44,7 @@ TEST_F(IntColMultiTest, segMerge) {
   testIndex.flush();
   f.startIndexing();
   f.add(1, 7);
-  f.add(3, arr_i(5, 1));
+  f.add(2, arr_i(5, 1));
   testIndex.flush();
   testIndex.iw->mergeSegments();
 
@@ -63,4 +62,3 @@ TEST_F(IntColMultiTest, segMerge) {
   ASSERT_EQ(vals, vec_i(5, 1));
   ASSERT_EQ(-1, f.nextDoc());
 }
-#endif
