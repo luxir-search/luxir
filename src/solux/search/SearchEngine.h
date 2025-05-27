@@ -584,23 +584,42 @@ public:
                    Response::ColumnsType& columnsProto, oneapi::tbb::task_group* tg)
   {
     auto& fieldCol = columnsProto[field];  // output Column in the protobuf
-    auto& intCol = *fieldCol.mutable_col_i();
-    auto& intsProto = *intCol.mutable_v();
-    // intCol.set_missing_val(0); // TODO.... get from schema? Set even if all values present?
-    auto missingVal = std::numeric_limits<int64_t>::min();
+    //load a span for the single valued or multi valued target
+    std::span<int64_t> starget; // single valued target
+    std::span<solux::proto::ArrInt*> mtarget;  // multi-valued target
     auto columnSize = segDocs.size();
-    intsProto.Resize(columnSize, missingVal);  // fill with missing values
-    std::span<int64_t> target(&intsProto[0], &intsProto[0] + columnSize);
-    // Ensure protobuf is contiguous (is this guaranteed or impl detail?)
-    assert(&intsProto[columnSize - 1] >= target.data() && &intsProto[columnSize - 1] < target.data() +columnSize);
 
+    if (!fieldType.multiValued()) {
+      auto& intCol = *fieldCol.mutable_col_i();
+      auto& intsProto = *intCol.mutable_v();
+      // intCol.set_missing_val(0); // TODO.... get from schema? Set even if all values present?
+      auto missingVal = std::numeric_limits<int64_t>::min();
+      intsProto.Resize(columnSize, missingVal);  // fill with missing values
+      starget = {&intsProto[0], &intsProto[0] + columnSize};
+      // Ensure protobuf is contiguous (is this guaranteed or impl detail?)
+      assert(&intsProto[columnSize - 1] >= starget.data() && &intsProto[columnSize - 1] < starget.data() +columnSize);
+    } else {
+      // multi-valued field type (even if only one value per doc currently)
+      auto& intCol = *fieldCol.mutable_multi_i();
+      auto& arrArrProto = *intCol.mutable_v();  // v is a repeated ArrInt
+      arrArrProto.Reserve(columnSize);
+      for (int i = 0; i < columnSize; i++) {
+        arrArrProto.Add();
+      }
+      // arrArrProto is implemented as a vector<ArrInt*> under the covers (RepeatedPtrField), so our span
+      // should be of pointers.
+      solux::proto::ArrInt** arrstart = arrArrProto.mutable_data();
+      auto** arrEnd = arrstart + columnSize;
+      assert(&arrArrProto.Get(columnSize-1) == arrstart[columnSize-1]); // sanity check that arr is actually contiguous.
+      mtarget = {arrstart, columnSize};
+    }
     // iterate over the segment runs, loading values for each segment (possibly in a new task)
     int32_t start = 0;
     for(auto runlen : segRunLength) {
       auto idxSpan = sortedIdx.subspan(start, runlen);
       // capture by-value parameters by-value again since this method will return before the lambda is executed.
       // Don't specify a default capture, going across task boundaries should be very explicit.
-      task_group_run(tg, [this, idxSpan, &req, field, &fieldType, &segDocs, target]() {
+      task_group_run(tg, [this, idxSpan, &req, field, &fieldType, &segDocs, starget, mtarget]() {
         // a view of the segdocs for a single segment, in ascending order.
         auto sortedSegDocs = idxSpan | std::views::transform([&segDocs](auto idx) { return segDocs[idx]; });
         auto segNum = sortedSegDocs[0].segment();
@@ -609,14 +628,37 @@ public:
 
         auto& postingsReader = req.reader->segments()[segNum].postingsReader();
         auto poolGuard = MemPool::threadLocalPoolGuard();
-        // callback handler to put values back in the correct slot.  The task lambda captured by value when necessary
-        // already, so it's fine to capture by ref here.
-        auto valHandler = [&](size_t idx, int32_t doc, int64_t val) {
-          assert(segDocs[idxSpan[idx]].docId() == doc);
-          // translate back to the original index
-          target[idxSpan[idx]] = val;
-        };
-        IntColReader::getSingleValues(poolGuard.pool(), postingsReader, field, sortedDocs, valHandler);
+        FieldReader fieldReader(poolGuard.pool(), postingsReader);
+        bool found = fieldReader.seek(field);
+        if (!found) {
+          return;
+        }
+        SegFieldInfo segFieldInfo;
+        fieldReader.readFieldInfo(segFieldInfo);
+
+        if (!fieldType.multiValued()) {
+          // callback handler to put values back in the correct slot.  The task lambda captured by value when necessary
+          // already, so it's fine to capture by ref here.
+          auto valHandler = [&](size_t idx, int32_t doc, int64_t val) {
+            assert(segDocs[idxSpan[idx]].docId() == doc);
+            // translate back to the original index
+            starget[idxSpan[idx]] = val;
+          };
+          IntColReader::getSingleValues(poolGuard.pool(), postingsReader, segFieldInfo, sortedDocs, valHandler);
+        } else {
+          // multi-valued handling
+          auto valHandler = [&](size_t idx, int32_t doc, int64_t val, int64_t valIdx, int64_t numVals) {
+            assert(segDocs[idxSpan[idx]].docId() == doc && val > 0);
+            solux::proto::ArrInt& target = *mtarget[idxSpan[idx]];
+            if (valIdx == 0) {
+              // first value for this doc.
+              target.mutable_v()->Reserve(numVals);
+            }
+            target.mutable_v()->Add(val);
+          };
+
+          IntColReader::getValues(poolGuard.pool(), postingsReader, segFieldInfo, sortedDocs, valHandler);
+        }
       });
 
       start += runlen;

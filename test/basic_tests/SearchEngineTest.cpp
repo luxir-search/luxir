@@ -89,8 +89,8 @@ TEST_F(SearchEngineTest, basic) {
 
   CollectionHelper helper;
   helper.clear();
-  helper.index(flatdoc("foo_w","how now brown cow", "foo_i", 17, "color_s","red", "colors_ss", "black"),UpdateMessage::COMMIT);
-  helper.index(flatdoc("foo_w","charlie brown", "foo_i", 23, "color_s","blue"),UpdateMessage::NO_COMMIT);
+  helper.index(flatdoc("foo_w","how now brown cow", "foo_i", 17, "color_s","red", "colors_ss", "black", "prices_is", vec_i(20, 35, 45)),UpdateMessage::COMMIT);
+  helper.index(flatdoc("foo_w","charlie brown", "foo_i", 23, "color_s","blue", "prices_is", 30),UpdateMessage::NO_COMMIT);
   helper.index(flatdoc("foo_w","brown", "foo_i", 5, "color_s","brown", "colors_ss",vecs("red","green")),UpdateMessage::COMMIT);
   // should be 2 segments now.
 
@@ -109,6 +109,7 @@ TEST_F(SearchEngineTest, basic) {
     topDocs.mutable_fields()->Add("foo_i");
     topDocs.mutable_fields()->Add("color_s");
     topDocs.mutable_fields()->Add("colors_ss");
+    topDocs.mutable_fields()->Add("prices_is");
     auto ncols = topDocs.fields().size() + 1; // +1 for _score_
     // topDocs.mutable_fields()->Add("noexist_i");
     // topDocs.mutable_fields()->Add("noexist_s");
@@ -145,6 +146,15 @@ TEST_F(SearchEngineTest, basic) {
     ASSERT_EQ(0, docs.columns().at("colors_ss").multi_s().v(1).v_size()); // missing for this doc
     ASSERT_EQ(1, docs.columns().at("colors_ss").multi_s().v(2).v_size()); // single-valued for this doc
     ASSERT_EQ("black", docs.columns().at("colors_ss").multi_s().v(2).v(0));
+
+    // check the multi-valued integers
+    ASSERT_EQ(3, docs.columns().at("prices_is").multi_i().v(0).v_size());
+    ASSERT_EQ(20, docs.columns().at("prices_is").multi_i().v(0).v(0));
+    ASSERT_EQ(35, docs.columns().at("prices_is").multi_i().v(0).v(1));
+    ASSERT_EQ(45, docs.columns().at("prices_is").multi_i().v(0).v(2));
+    ASSERT_EQ(1, docs.columns().at("prices_is").multi_i().v(1).v_size()); // single-valued for this doc
+    ASSERT_EQ(30, docs.columns().at("prices_is").multi_i().v(1).v(0));
+    ASSERT_EQ(0, docs.columns().at("prices_is").multi_i().v(2).v_size()); // missing for this doc
 
     // check the facet
     ASSERT_EQ(3, lreq->responses[0]->proto.ops().at("f").facet().bucket_ids().col_i().v_size());
