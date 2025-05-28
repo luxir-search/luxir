@@ -137,7 +137,8 @@ message PhraseQuery {
 message FieldFacet {
   string field = 1;
   sint64 limit = 2;         // maximum number of buckets to return
-  map<string, SearchOp> ops = 3;  // sub-facets or search operations performed per bucket
+  bool missing = 3;
+  map<string, SearchOp> ops = 4;  // sub-facets or search operations performed per bucket
 }
 
 // A "domain" defines a set of documents to do computations over (like facets)
@@ -193,8 +194,9 @@ message FacetResult {
   sint64 total_buckets =  1; // The total number of buckets *if* it was requested.  This can be expensive to calculate.
   Column bucket_ids = 2;
   repeated int64 counts = 3;
-  Columns columns = 4;  // other custom values requested for this facet, like min(price) for example
-  int64 offset = 5;
+  int64 missing = 4; // the number of documents that do not have this field
+  Columns columns = 5;  // other custom values requested for this facet, like min(price) for example
+  int64 offset = 6;
 }
 
 

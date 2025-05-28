@@ -17,12 +17,14 @@ class FacetReq {
   IndexReader& reader;
   std::string_view fieldName;
   int64_t limit;
+  bool missing;
+  int missing_num = 0;
 public:
   std::string_view facetName;
   std::vector<boost::unordered_flat_map<int64_t, int64_t>> allCounts;
 
-  FacetReq(IndexReader& reader, std::string_view fieldName, std::string_view facetName, int64_t limit)
-  : reader(reader), fieldName(fieldName), facetName(facetName), limit(limit) {
+  FacetReq(IndexReader& reader, std::string_view fieldName, std::string_view facetName, int64_t limit, bool missing)
+  : reader(reader), fieldName(fieldName), facetName(facetName), limit(limit), missing(missing) {
     allCounts.resize(reader.segments().size());
   }
 
@@ -38,7 +40,7 @@ public:
     }
     SegFieldInfo segFieldInfo;
     fieldReader.readFieldInfo(segFieldInfo);
-    // this is a single valued int field for now, so we need to read the value for each doc
+    // this is a int field for now, so we need to read the value for each doc
     // and accumulate counts per value.
     IntColReader intColReader(poolGuard.pool(), postingsReader, segFieldInfo);
     IntColReader::Iterator intColIter(intColReader);
@@ -61,6 +63,8 @@ public:
             count[val]++;
           }
         }
+      } else {
+        missing_num++;
       }
     }
   }
@@ -103,6 +107,9 @@ public:
     for (auto [val, count] : countVec) {
       bucketIdsArr.Add(val);
       countsArr.Add(count);
+    }
+    if (missing) {
+      facetResultProto.set_missing(missing_num);
     }
 
 
