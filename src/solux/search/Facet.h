@@ -50,8 +50,17 @@ public:
         intColIter.advance(docid);
       }
       if (intColIter.docId() == docid) {
-        auto val = intColIter.value();
-        count[val]++;
+        if (!intColReader.multiValued()) {
+          auto val = intColIter.value();
+          count[val]++;
+        } else {
+          auto [start, end] = intColReader.getStartEndRank(intColIter.rank());
+          auto n = end - start;
+          for (int64_t vrank = 0; vrank < n; vrank++) {
+            auto val = intColIter.values().valueAt(start + vrank);
+            count[val]++;
+          }
+        }
       }
     }
   }
