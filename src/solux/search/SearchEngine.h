@@ -374,7 +374,7 @@ public:
           }
           auto missing = facetReq.missing();
           //arena allocate FacetReq
-          FacetReq* facet = google::protobuf::Arena::Create<FacetReq>(&req.arena, *req.reader, facetField, opKey, limit, missing);
+          FacetReq* facet = google::protobuf::Arena::Create<IntFacetReq>(&req.arena, *req.reader, facetField, opKey, limit, missing);
           facetReqs.push_back(facet);
         } // end case
           break;

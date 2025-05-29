@@ -2,6 +2,7 @@
 #include "protos/solux_types.pb.h"
 #include <string_view>
 #include <vector>
+#include <gtl/btree.hpp>
 
 #include "DocSet.h"
 #include "IndexReader.h"
@@ -14,6 +15,7 @@ public:
 };
 
 class FacetReq {
+protected:
   IndexReader& reader;
   std::string_view fieldName;
   int64_t limit;
@@ -27,6 +29,17 @@ public:
   : reader(reader), fieldName(fieldName), facetName(facetName), limit(limit), missing(missing) {
     allCounts.resize(reader.segments().size());
   }
+  virtual ~FacetReq() = default;
+  virtual void facetSeg(FacetDomain& domain, int32_t segnum) = 0; // facet a single segment
+  virtual void facetResult(solux::proto::FacetResult& facetResultProto) = 0; // merge all segments and fill in the result proto
+};
+
+class IntFacetBaseReq : public FacetReq {
+public:
+  IntFacetBaseReq(IndexReader& reader, std::string_view fieldName, std::string_view facetName, int64_t limit, bool missing) :
+  FacetReq(reader, fieldName, facetName, limit, missing){}
+
+  virtual ~IntFacetBaseReq() = default;
 
   void facetSeg(FacetDomain& domain, int32_t segnum) {
     std::vector<bool>& matches = domain.allMatches[segnum].docs;
@@ -69,6 +82,12 @@ public:
       }
     }
   }
+};
+
+class IntFacetReq : public IntFacetBaseReq {
+public:
+  IntFacetReq(IndexReader& reader, std::string_view fieldName, std::string_view facetName, int64_t limit, bool missing) :
+  IntFacetBaseReq(reader, fieldName, facetName, limit, missing){}
 
   void facetResult(solux::proto::FacetResult& facetResultProto) {
     // merge all the counts from all segments into the largest map
@@ -107,6 +126,57 @@ public:
     countsArr.Reserve(countVec.size());
     for (auto [val, count] : countVec) {
       bucketIdsArr.Add(val);
+      countsArr.Add(count);
+    }
+    if (missing) {
+      facetResultProto.set_missing(missing_num);
+    }
+
+
+  }
+};
+
+class StrFacetReq : public IntFacetBaseReq {
+public:
+  StrFacetReq(IndexReader& reader, std::string_view fieldName, std::string_view facetName, int64_t limit, bool missing) :
+  IntFacetBaseReq(reader, fieldName, facetName, limit, missing){}
+
+  void facetResult(solux::proto::FacetResult& facetResultProto) {
+    // merge all the counts from all segments into the largest map
+    gtl::btree_map<std::string, int64_t> counts;
+
+    for (size_t i = 0; i < allCounts.size(); i++) {
+      auto& segCounts = allCounts[i];
+      auto& postingsReader = reader.segments()[i].postingsReader();
+      auto poolGuard = MemPool::threadLocalPoolGuard();
+      FieldReader fieldReader(poolGuard.pool(), postingsReader);
+      SegFieldInfo segFieldInfo;
+      fieldReader.readFieldInfo(segFieldInfo);
+      TermsEnum tenum(poolGuard.pool(), postingsReader, segFieldInfo);
+      for (auto [ord, count] : segCounts) {
+        tenum.seekOrd(ord - 1);
+        std::string_view termView = (std::string_view) tenum.term();
+        counts[std::string(termView)] += count;
+      }
+      segCounts.clear();
+    }
+
+    // fill in the facet result proto
+    auto& bucketIds = *facetResultProto.mutable_bucket_ids()->mutable_col_s();
+    auto& bucketIdsArr = *bucketIds.mutable_v();
+    auto& countsArr = *facetResultProto.mutable_counts();
+    auto returnSize = counts.size();
+    if (limit >= 0 && limit < counts.size()) {
+      returnSize = limit;
+    }
+    bucketIdsArr.Reserve(returnSize);
+    countsArr.Reserve(returnSize);
+    for (auto [val, count] : counts) {
+      if (limit >= 0 && limit <= bucketIdsArr.size()) {
+        break; // we reached the limit
+      }
+      auto* strptr = bucketIdsArr.Add();
+      *strptr = val; // copy the string
       countsArr.Add(count);
     }
     if (missing) {
