@@ -3,7 +3,7 @@
 #include <gtest/gtest.h>
 #include <google/protobuf/text_format.h>
 #include "test/SoluxTest.h"
-#include "test/TestUtils.h"
+#include "test/CollectionHelper.h"
 #include "solux/server/GRPCServer.h"
 
 using namespace solux;

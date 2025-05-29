@@ -5,7 +5,7 @@
 #include "oneapi/tbb/task_group.h"
 #include "test/SoluxTest.h"
 #include "solux/server/GRPCServer.h"
-#include "test/TestUtils.h"
+#include "test/CollectionHelper.h"
 
 // TODO - use a different logger for RPC stuff some point
 // redefine DEBUG to TRACE level which shouldn't currently be logged!
