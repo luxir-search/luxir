@@ -36,6 +36,7 @@ public:
     FieldReader fieldReader(poolGuard.pool(), postingsReader);
     bool found = fieldReader.seek(fieldName);
     if (!found) {
+      missing_num += std::count(matches.begin(), matches.end(), true);
       return;
     }
     SegFieldInfo segFieldInfo;

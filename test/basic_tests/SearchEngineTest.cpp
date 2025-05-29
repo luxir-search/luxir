@@ -124,9 +124,13 @@ TEST_F(SearchEngineTest, basic) {
     facet.set_field("foo_i");
     auto& facet2 = *ops["f2"].mutable_field_facet();
     facet2.set_field("prices_is");
+    facet2.set_missing(true); // include missing values in the facet
+    auto& facet3 = *ops["f3"].mutable_field_facet();
+    facet3.set_field("noexist_i");
+    facet3.set_missing(true); // include missing values in the facet
 
     lreq->engine.submit(*lreq, para);
-    // LOG_DEBUG("ENGINE REQ: {}", lreq->toString());
+    //LOG_DEBUG("ENGINE REQ: {}", lreq->toString());
 
     ASSERT_EQ(lreq->proto.request_id(), lreq->responses[0]->proto.request_id());
     auto& docs = lreq->responses[0]->proto.ops().at("q").docs();
@@ -167,6 +171,8 @@ TEST_F(SearchEngineTest, basic) {
     ASSERT_EQ(1, lreq->responses[0]->proto.ops().at("f").facet().counts().at(0));
     ASSERT_EQ(1, lreq->responses[0]->proto.ops().at("f").facet().counts().at(1));
     ASSERT_EQ(1, lreq->responses[0]->proto.ops().at("f").facet().counts().at(2));
+    //check for the abscence of missing
+    ASSERT_FALSE(lreq->responses[0]->proto.ops().at("f").facet().has_missing());
 
     // check the second facet
     ASSERT_EQ(3, lreq->responses[0]->proto.ops().at("f2").facet().bucket_ids().col_i().v_size());
@@ -177,6 +183,11 @@ TEST_F(SearchEngineTest, basic) {
     ASSERT_EQ(2, lreq->responses[0]->proto.ops().at("f2").facet().counts().at(0));
     ASSERT_EQ(1, lreq->responses[0]->proto.ops().at("f2").facet().counts().at(1));
     ASSERT_EQ(1, lreq->responses[0]->proto.ops().at("f2").facet().counts().at(2));
+    ASSERT_EQ(1, lreq->responses[0]->proto.ops().at("f2").facet().missing());
+
+    //check the third facet
+    ASSERT_EQ(0, lreq->responses[0]->proto.ops().at("f3").facet().bucket_ids().col_i().v_size());
+    ASSERT_EQ(3, lreq->responses[0]->proto.ops().at("f3").facet().missing());
 
     lreq->done();
   }
