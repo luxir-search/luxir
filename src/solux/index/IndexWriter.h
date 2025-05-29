@@ -269,7 +269,8 @@ public:
   // Tracks current segments in the index.  Keyed by uint64_t segId.
   // There needs to be higher level protection for transactions like replacing N segments with a new merged segment.
   // protected by indexMutex
-  boost::unordered::unordered_flat_map<uint64_t, std::unique_ptr<SegInfo>> segInfos;
+  using SegMap = boost::unordered_flat_map<uint64_t, std::unique_ptr<SegInfo>>;
+  SegMap segInfos;
   // boost::unordered::unordered_flat_set<std::unique_ptr<SegInfo>, SegIdHash, SegIdEqual> segInfos;
   // boost::unordered::unordered_flat_set can't currently be used because it lacks an extract() method, which is
   // the only way of removing a move-only object from the set.
@@ -459,6 +460,8 @@ private:
     msg.seqNum = updateNumber++;
     if (msg.commit != UpdateMessage::NO_COMMIT) {
       msg.commitNum = commitNumber++;
+    } else {
+      msg.commitNum = 0;
     }
     INDEX_DEBUG("startUpdateBody: msg={} seqNum={} commitNum={}", (void*)&msg, msg.seqNum, msg.commitNum);
   }
@@ -549,10 +552,12 @@ private:
     INDEX_DEBUG("segmentFlushBody: inverter={} msg={} msg.leftToFlush={}", (void*)&inverter, (void*)inverter.updateMessage,
                 inverter.updateMessage == nullptr ? -1 : inverter.updateMessage->leftToFlush);
 
+    bool success;
     try {
       // uncomment to serialize inverter flushing (for testing purposes)
       // const std::lock_guard<std::mutex> lock(indexMutex);
-      inverter.flush();
+      success = inverter.flush();
+      INDEX_DEBUG("segmentFlushBody: inverter={} flushed successfully for segment {}", (void*)&inverter, inverter.getPostingsWriter().segId);
     } catch (std::exception& e) {
       LOG_ERROR("Exception caught while flushing inverter: {}", e.what());
       // Now what?  This is pretty catastrophic.
@@ -567,7 +572,11 @@ private:
       const std::lock_guard<std::mutex> lock(indexMutex);
 
       // segments are flushed in parallel, so the segids are not in order... (or in the completed order.) should be fine.
-      auto iter = segInfos.emplace(segInfo->segId, std::move(segInfo));
+      std::pair<SegMap::iterator, bool> iter;
+      if (success) {
+        iter = segInfos.emplace(segInfo->segId, std::move(segInfo));
+        assert(iter.second);  // should never already exist
+      }
 
       // remove the inverter from the flushingInverters set, but remember it until the end of this function.
       auto it = flushingInverters.find(&inverter);
@@ -588,7 +597,9 @@ private:
 
       // Check if we should merge anything.
       // We do this with the lock held since segInfo could go away otherwise.
-      mergePolicy->_maybeMergeSegments(iter.first->second.get());
+      if (success) {
+        mergePolicy->_maybeMergeSegments(iter.first->second.get());
+      }
     }
 
     // It shouldn't be a big deal to do a try_put inside the sync block, but it's safe to do outside anyway.
@@ -790,6 +801,7 @@ public:
           seg->commitTime = now_us;
         }
         numDocs += seg->nDocs;
+        INDEX_DEBUG("\tsegId={} nDocs={} commitTime={}", seg->segId, seg->nDocs, seg->commitTime);
       }
     }
 

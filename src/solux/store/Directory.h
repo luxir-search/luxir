@@ -4,6 +4,11 @@
 #include <string_view>
 #include "gtl/btree.hpp"
 #include "OutputStream.h"
+#include "solux/util/log.h"
+
+// redefine DEBUG to TRACE level which shouldn't currently be logged!
+#define DIR_DEBUG LOG_TRACE
+// #define DIR_DEBUG LOG_DEBUG
 
 namespace solux {
 
@@ -75,8 +80,12 @@ public:
 
     auto find = files.find(name);
     if (find != files.end()) {
+      // redefine DEBUG to TRACE level which shouldn't currently be logged!
+      // #define INDEX_DEBUG LOG_TRACE
+      DIR_DEBUG("DIR openFile: found file {} size={}", name, find->second->size());
       return find->second;
     } else {
+      DIR_DEBUG("DIR openFile: file {} not found", name);
       return {};
     }
   }
@@ -84,7 +93,9 @@ public:
   bool deleteFile(const std::string_view name) override {
     std::lock_guard<std::mutex> lock(mutex);
 
-    return files.erase(name);
+    bool success = files.erase(name);
+    DIR_DEBUG("DIR deleteFile {} success={}", name, success);
+    return success;
   }
 
   void deletePrefix(const std::string_view prefix) override {
@@ -101,10 +112,13 @@ public:
   }
 
   std::unique_ptr<File> createFile(const std::string_view name) override {
+    DIR_DEBUG("DIR about to createFile {}", name);
     return std::make_unique<OutputFileType>(name);
   }
 
   void finishFile(File &file) override {
+    DIR_DEBUG("DIR about to finishFile {} size={}", file.name(), file.size());
+
     auto &ramFile = dynamic_cast<OutputFileType &>(file);
     auto sz = ramFile.size();
     // don't use make_unique as it uselessly zeroes memory first.
@@ -133,6 +147,7 @@ public:
   };
 
   void clear() override {
+    DIR_DEBUG("DIR about to clear all files");
     std::lock_guard<std::mutex> lock(mutex);
     files.clear();
   }

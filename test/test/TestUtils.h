@@ -77,11 +77,15 @@ overloaded(Ts...) -> overloaded<Ts...>;
 class CollectionHelper {
 private:
   std::shared_ptr<Collection> collection_;
+  std::counting_semaphore<1'000'000> indexSemaphore; // semaphore to limit concurrent indexing operations
 
   class SimpleUpdateMessage : public UpdateMessage {
   public:
 
     void indexMulti(IndexWriter& iw, std::span<const Doc> docs) {
+      if (docs.empty()) {
+        return; // nothing to index, avoid grabbing an inverter.
+      }
       auto& inverter = iw.obtainInverter();
       for (auto& doc: docs) {
         indexSingle(inverter, doc);
@@ -139,7 +143,10 @@ private:
   };
 
 public:
-  CollectionHelper(std::string_view name = "main") {
+  // indexConcurrency is the number of concurrent indexing operations allowed before blocking.
+  CollectionHelper(std::string_view name = "main", size_t indexConcurrency = 100)
+  : indexSemaphore(indexConcurrency)
+  {
     collection_ = SoluxTest::soluxNode->getCollection(name);
   }
 
@@ -231,6 +238,13 @@ public:
     auto writer = collection().getShard()->getIndexWriter();
     writer->testDeleteAllData();
   }
+
+
+  // Directly get a handler to the IndexWriter for more low-level control of indexing operations.
+  std::shared_ptr<IndexWriter> getIndexWriter() {
+    return collection().getShard()->getIndexWriter();
+  }
+
 };
 
 

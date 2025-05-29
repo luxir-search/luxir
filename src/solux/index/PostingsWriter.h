@@ -264,10 +264,13 @@ public:
     return segId;
   }
 
-  void finish() {
+  // returns true if anything was written.
+  bool finish() {
+
     if (fieldInfos.empty()) {
-      return;  // already called, or no data added.
+      return false;  // already called, or no data added.
     }
+
     // make sure we have at least one file
     reserveFiles(1);
 
@@ -286,6 +289,7 @@ public:
 
     fieldInfos.resize(0);
     files.resize(0);
+    return true;
   }
 
   void setMaxDoc(int max) {
@@ -302,7 +306,8 @@ public:
 
 private:
   void writeSegmentInfo() {
-    assert(maxDoc >= 1);
+    // TODO: if maxDoc==0, does this cause issues elsewhere?
+    // assert(maxDoc >= 1);
     OutputStream& out = files[0].out;
     auto outStart = out.size();
     out.writeVint(maxDoc);
@@ -371,7 +376,9 @@ private:
       loc = locationsOff - loc;
     }
 
-    fieldOutput.write(&(fieldOffs[0]), fieldOffs.size() * sizeof(fieldOffs[0]));
+    if (fieldOffs.size() > 0) {
+      fieldOutput.write(&(fieldOffs[0]), fieldOffs.size() * sizeof(fieldOffs[0]));
+    }
     // write the size of the array at the end so we can use it to find the start when reading
     fieldOutput.writeInt((int32_t)fieldOffs.size());
   }

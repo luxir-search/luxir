@@ -614,7 +614,8 @@ public:
   }
 
   /// finishes indexing this segment (also calls finish on the underlying postings writer)
-  void flush() {
+  /// returns true on success if anything was written.
+  bool flush() {
     getPostingsWriter().setMaxDoc(getMaxDoc());  // TODO: this won't always be accurate currently?
 
     // We could either sort fields first, or after they have been indexed.  Merging segments will presumably
@@ -637,7 +638,7 @@ public:
       fieldHandler->flush(*this);
     }
 
-    getPostingsWriter().finish();
+    return getPostingsWriter().finish();
   }
 
 private:
