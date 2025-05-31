@@ -3,9 +3,12 @@
 #include <string_view>
 #include <vector>
 #include <gtl/btree.hpp>
+#include <boost/unordered/unordered_flat_map.hpp>
 
 #include "DocSet.h"
 #include "IndexReader.h"
+#include "solux/reader/IntColReader.h"
+#include "solux/schema/Schema.h"
 
 namespace solux {
 
@@ -24,6 +27,8 @@ protected:
 public:
   std::string_view facetName;
   std::vector<boost::unordered_flat_map<int64_t, int64_t>> allCounts;
+
+  static FacetReq* createFieldFacetReq(Schema &schema, std::string_view facetName, const proto::FieldFacet& facetReq, google::protobuf::Arena& arena, IndexReader& reader);
 
   FacetReq(IndexReader& reader, std::string_view fieldName, std::string_view facetName, int64_t limit, bool missing)
   : reader(reader), fieldName(fieldName), facetName(facetName), limit(limit), missing(missing) {
@@ -147,10 +152,17 @@ public:
 
     for (size_t i = 0; i < allCounts.size(); i++) {
       auto& segCounts = allCounts[i];
+      if (segCounts.empty()) {
+        continue; // no counts for this segment
+      }
       auto& postingsReader = reader.segments()[i].postingsReader();
       auto poolGuard = MemPool::threadLocalPoolGuard();
       FieldReader fieldReader(poolGuard.pool(), postingsReader);
       SegFieldInfo segFieldInfo;
+      bool found = fieldReader.seek(fieldName);
+      if (!found) {
+        continue;
+      }
       fieldReader.readFieldInfo(segFieldInfo);
       TermsEnum tenum(poolGuard.pool(), postingsReader, segFieldInfo);
       for (auto [ord, count] : segCounts) {

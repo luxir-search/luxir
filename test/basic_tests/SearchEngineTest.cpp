@@ -89,9 +89,9 @@ TEST_F(SearchEngineTest, basic) {
 
   CollectionHelper helper;
   helper.clear();
-  helper.index(flatdoc("foo_w","how now brown cow", "foo_i", 17, "color_s","red", "colors_ss", "black", "prices_is", vec_i(20, 35, 45)),UpdateMessage::COMMIT);
+  helper.index(flatdoc("foo_w","how now brown cow", "foo_i", 17, "color_s","red", "colors_ss", "red", "prices_is", vec_i(20, 35, 45)),UpdateMessage::COMMIT);
   helper.index(flatdoc("foo_w","charlie brown", "foo_i", 23, "color_s","blue", "prices_is", 35),UpdateMessage::NO_COMMIT);
-  helper.index(flatdoc("foo_w","brown", "foo_i", 5, "color_s","brown", "colors_ss",vecs("red","green")),UpdateMessage::COMMIT);
+  helper.index(flatdoc("foo_w","brown", "foo_i", 5, "color_s","brown", "colors_ss",vecs("red","black")),UpdateMessage::COMMIT);
   // should be 2 segments now.
 
   {
@@ -128,9 +128,13 @@ TEST_F(SearchEngineTest, basic) {
     auto& facet3 = *ops["f3"].mutable_field_facet();
     facet3.set_field("noexist_i");
     facet3.set_missing(true); // include missing values in the facet
+    auto& facet4 = *ops["f4"].mutable_field_facet();
+    facet4.set_field("color_s");
+    auto& facet5 = *ops["f5"].mutable_field_facet();
+    facet5.set_field("colors_ss");
 
     lreq->engine.submit(*lreq, para);
-    //LOG_DEBUG("ENGINE REQ: {}", lreq->toString());
+    LOG_DEBUG("ENGINE REQ: {}", lreq->toString());
 
     ASSERT_EQ(lreq->proto.request_id(), lreq->responses[0]->proto.request_id());
     auto& docs = lreq->responses[0]->proto.ops().at("q").docs();
@@ -188,6 +192,24 @@ TEST_F(SearchEngineTest, basic) {
     //check the third facet
     ASSERT_EQ(0, lreq->responses[0]->proto.ops().at("f3").facet().bucket_ids().col_i().v_size());
     ASSERT_EQ(3, lreq->responses[0]->proto.ops().at("f3").facet().missing());
+
+    // check the fourth facet
+    ASSERT_EQ(3, lreq->responses[0]->proto.ops().at("f4").facet().bucket_ids().col_s().v_size());
+    ASSERT_EQ("blue", lreq->responses[0]->proto.ops().at("f4").facet().bucket_ids().col_s().v(0));
+    ASSERT_EQ("brown", lreq->responses[0]->proto.ops().at("f4").facet().bucket_ids().col_s().v(1));
+    ASSERT_EQ("red", lreq->responses[0]->proto.ops().at("f4").facet().bucket_ids().col_s().v(2));
+    ASSERT_EQ(3, lreq->responses[0]->proto.ops().at("f4").facet().counts().size());
+    ASSERT_EQ(1, lreq->responses[0]->proto.ops().at("f4").facet().counts().at(0));
+    ASSERT_EQ(1, lreq->responses[0]->proto.ops().at("f4").facet().counts().at(1));
+    ASSERT_EQ(1, lreq->responses[0]->proto.ops().at("f4").facet().counts().at(2));
+
+    // check the fifth facet
+    ASSERT_EQ(2, lreq->responses[0]->proto.ops().at("f5").facet().bucket_ids().col_s().v_size());
+    ASSERT_EQ("red", lreq->responses[0]->proto.ops().at("f5").facet().bucket_ids().col_s().v(0));
+    ASSERT_EQ("black", lreq->responses[0]->proto.ops().at("f5").facet().bucket_ids().col_s().v(1));
+    ASSERT_EQ(2, lreq->responses[0]->proto.ops().at("f5").facet().counts().size());
+    ASSERT_EQ(2, lreq->responses[0]->proto.ops().at("f5").facet().counts().at(0));
+    ASSERT_EQ(1, lreq->responses[0]->proto.ops().at("f5").facet().counts().at(1));
 
     lreq->done();
   }
