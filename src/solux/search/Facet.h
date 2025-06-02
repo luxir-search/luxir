@@ -24,14 +24,15 @@ protected:
   int64_t limit;
   bool missing;
   int missing_num = 0;
+  int64_t minCount; // minimum count for a facet to be included in the result
 public:
   std::string_view facetName;
   std::vector<boost::unordered_flat_map<int64_t, int64_t>> allCounts;
 
   static FacetReq* createFieldFacetReq(Schema &schema, std::string_view facetName, const proto::FieldFacet& facetReq, google::protobuf::Arena& arena, IndexReader& reader);
 
-  FacetReq(IndexReader& reader, std::string_view fieldName, std::string_view facetName, int64_t limit, bool missing)
-  : reader(reader), fieldName(fieldName), facetName(facetName), limit(limit), missing(missing) {
+  FacetReq(IndexReader& reader, std::string_view fieldName, std::string_view facetName, int64_t limit, int64_t minCount, bool missing)
+  : reader(reader), fieldName(fieldName), facetName(facetName), limit(limit), minCount(minCount), missing(missing) {
     allCounts.resize(reader.segments().size());
   }
   virtual ~FacetReq() = default;
@@ -41,8 +42,8 @@ public:
 
 class IntFacetBaseReq : public FacetReq {
 public:
-  IntFacetBaseReq(IndexReader& reader, std::string_view fieldName, std::string_view facetName, int64_t limit, bool missing) :
-  FacetReq(reader, fieldName, facetName, limit, missing){}
+  IntFacetBaseReq(IndexReader& reader, std::string_view fieldName, std::string_view facetName, int64_t limit, int64_t minCount, bool missing) :
+  FacetReq(reader, fieldName, facetName, limit, minCount, missing){}
 
   virtual ~IntFacetBaseReq() = default;
 
@@ -91,8 +92,8 @@ public:
 
 class IntFacetReq : public IntFacetBaseReq {
 public:
-  IntFacetReq(IndexReader& reader, std::string_view fieldName, std::string_view facetName, int64_t limit, bool missing) :
-  IntFacetBaseReq(reader, fieldName, facetName, limit, missing){}
+  IntFacetReq(IndexReader& reader, std::string_view fieldName, std::string_view facetName, int64_t limit, int64_t minCount, bool missing) :
+  IntFacetBaseReq(reader, fieldName, facetName, limit, minCount, missing){}
 
   void facetResult(solux::proto::FacetResult& facetResultProto) {
     // merge all the counts from all segments into the largest map
@@ -110,7 +111,9 @@ public:
     }
     std::vector<std::pair<int64_t, int64_t>> countVec;
     for (auto [val, count] : counts) {
-      countVec.emplace_back(val, count);
+      if (minCount == -1 || count >= minCount) {
+        countVec.emplace_back(val, count);
+      }
     }
     counts.clear();
     std::sort(countVec.begin(), countVec.end(), [](auto& a, auto& b) {
@@ -143,8 +146,8 @@ public:
 
 class StrFacetReq : public IntFacetBaseReq {
 public:
-  StrFacetReq(IndexReader& reader, std::string_view fieldName, std::string_view facetName, int64_t limit, bool missing) :
-  IntFacetBaseReq(reader, fieldName, facetName, limit, missing){}
+  StrFacetReq(IndexReader& reader, std::string_view fieldName, std::string_view facetName, int64_t limit, int64_t minCount, bool missing) :
+  IntFacetBaseReq(reader, fieldName, facetName, limit, minCount, missing){}
 
   void facetResult(solux::proto::FacetResult& facetResultProto) {
     // merge all the counts from all segments into the largest map
@@ -175,7 +178,9 @@ public:
 
     std::vector<std::pair<std::string, int64_t>> countVec;
     for (auto [val, count] : counts) {
-      countVec.emplace_back(val, count);
+      if (minCount == -1 || count >= minCount) {
+        countVec.emplace_back(val, count);
+      }
     }
     counts.clear();
     std::sort(countVec.begin(), countVec.end(), [](auto& a, auto& b) {

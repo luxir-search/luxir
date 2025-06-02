@@ -63,9 +63,15 @@ TEST_F(SearchEngineTest, basic) {
     facet4.set_field("color_s");
     auto& facet5 = *ops["f5"].mutable_field_facet();
     facet5.set_field("colors_ss");
+    auto& facet6 = *ops["f6"].mutable_field_facet();
+    facet6.set_field("prices_is");
+    facet6.set_mincount(2);
+    auto& facet7 = *ops["f7"].mutable_field_facet();
+    facet7.set_field("colors_ss");
+    facet7.set_mincount(2);
 
     lreq->engine.submit(*lreq, para);
-    LOG_DEBUG("ENGINE REQ: {}", lreq->toString());
+    //LOG_DEBUG("ENGINE REQ: {}", lreq->toString());
 
     ASSERT_EQ(lreq->proto.request_id(), lreq->responses[0]->proto.request_id());
     auto& docs = lreq->responses[0]->proto.ops().at("q").docs();
@@ -140,6 +146,18 @@ TEST_F(SearchEngineTest, basic) {
     ASSERT_EQ(2, lreq->responses[0]->proto.ops().at("f5").facet().counts().size());
     ASSERT_EQ(2, lreq->responses[0]->proto.ops().at("f5").facet().counts().at(0));
     ASSERT_EQ(1, lreq->responses[0]->proto.ops().at("f5").facet().counts().at(1));
+
+    //check the sixth facet
+    ASSERT_EQ(1, lreq->responses[0]->proto.ops().at("f6").facet().bucket_ids().col_i().v_size());
+    ASSERT_EQ(35, lreq->responses[0]->proto.ops().at("f6").facet().bucket_ids().col_i().v(0));
+    ASSERT_EQ(1, lreq->responses[0]->proto.ops().at("f6").facet().counts().size());
+    ASSERT_EQ(2, lreq->responses[0]->proto.ops().at("f6").facet().counts().at(0));
+
+    //check the seventh facet
+    ASSERT_EQ(1, lreq->responses[0]->proto.ops().at("f7").facet().bucket_ids().col_s().v_size());
+    ASSERT_EQ("red", lreq->responses[0]->proto.ops().at("f7").facet().bucket_ids().col_s().v(0));
+    ASSERT_EQ(1, lreq->responses[0]->proto.ops().at("f7").facet().counts().size());
+    ASSERT_EQ(2, lreq->responses[0]->proto.ops().at("f7").facet().counts().at(0));
 
     lreq->done();
   }

@@ -137,8 +137,9 @@ message PhraseQuery {
 message FieldFacet {
   string field = 1;
   sint64 limit = 2;         // maximum number of buckets to return
-  bool missing = 3;
-  map<string, SearchOp> ops = 4;  // sub-facets or search operations performed per bucket
+  int64 mincount = 3; // the minimum count of a bucket to be included in the response
+  bool missing = 4;
+  map<string, SearchOp> ops = 5;  // sub-facets or search operations performed per bucket
 }
 
 // A "domain" defines a set of documents to do computations over (like facets)
