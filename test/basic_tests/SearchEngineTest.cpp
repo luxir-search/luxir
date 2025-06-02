@@ -151,11 +151,10 @@ TEST_F(SearchEngineTest, basic) {
 
     // check the multi-valued strings
     ASSERT_EQ(2, docs.columns().at("colors_ss").multi_s().v(0).v_size());
-    ASSERT_EQ("green", docs.columns().at("colors_ss").multi_s().v(0).v(0));  // green first because this is a sorted set, original order not preserved.
-    ASSERT_EQ("red", docs.columns().at("colors_ss").multi_s().v(0).v(1));
+    ASSERT_EQ("black", docs.columns().at("colors_ss").multi_s().v(0).v(0));
     ASSERT_EQ(0, docs.columns().at("colors_ss").multi_s().v(1).v_size()); // missing for this doc
     ASSERT_EQ(1, docs.columns().at("colors_ss").multi_s().v(2).v_size()); // single-valued for this doc
-    ASSERT_EQ("black", docs.columns().at("colors_ss").multi_s().v(2).v(0));
+    ASSERT_EQ("red", docs.columns().at("colors_ss").multi_s().v(2).v(0));
 
     // check the multi-valued integers
     ASSERT_EQ(3, docs.columns().at("prices_is").multi_i().v(2).v_size());

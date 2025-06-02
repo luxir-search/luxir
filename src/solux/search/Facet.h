@@ -148,7 +148,7 @@ public:
 
   void facetResult(solux::proto::FacetResult& facetResultProto) {
     // merge all the counts from all segments into the largest map
-    gtl::btree_map<std::string, int64_t> counts;
+    boost::unordered_flat_map<std::string, int64_t> counts;
 
     for (size_t i = 0; i < allCounts.size(); i++) {
       auto& segCounts = allCounts[i];
@@ -173,20 +173,28 @@ public:
       segCounts.clear();
     }
 
+    std::vector<std::pair<std::string, int64_t>> countVec;
+    for (auto [val, count] : counts) {
+      countVec.emplace_back(val, count);
+    }
+    counts.clear();
+    std::sort(countVec.begin(), countVec.end(), [](auto& a, auto& b) {
+      if (a.second != b.second ) {
+        return a.second > b.second;
+      }
+      return a.first < b.first;
+    });
+    if (limit >= 0 && limit < countVec.size()) {
+      countVec.resize(limit);
+    }
+
     // fill in the facet result proto
     auto& bucketIds = *facetResultProto.mutable_bucket_ids()->mutable_col_s();
     auto& bucketIdsArr = *bucketIds.mutable_v();
     auto& countsArr = *facetResultProto.mutable_counts();
-    auto returnSize = counts.size();
-    if (limit >= 0 && limit < counts.size()) {
-      returnSize = limit;
-    }
-    bucketIdsArr.Reserve(returnSize);
-    countsArr.Reserve(returnSize);
-    for (auto [val, count] : counts) {
-      if (limit >= 0 && limit <= bucketIdsArr.size()) {
-        break; // we reached the limit
-      }
+    bucketIdsArr.Reserve(countVec.size());
+    countsArr.Reserve(countVec.size());
+    for (auto [val, count] : countVec) {
       auto* strptr = bucketIdsArr.Add();
       *strptr = val; // copy the string
       countsArr.Add(count);
