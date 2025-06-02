@@ -177,6 +177,69 @@ public:
     return collection().getShard()->getIndexWriter();
   }
 
+  /// Given a number of documents, a merge factor, and an index shape, calculate the number of
+  /// documents that should be in each segment.  The "shape" is a string that lists the
+  /// number of segments at each level, starting with the largest level.
+  /// For example, a shape of "935" means 9 large segments, 3 segments roughly mergeSegment smaller, and 5 segments
+  /// roughly mergeSegment smaller than that.
+  /// The docsPerSeg vector will be filled in with the number of documents in each segment, largest to smallest.
+  static void calcSegSizes(int64_t nDocs, int mergeFactor, std::string_view shape, std::vector<int32_t>& docsPerSeg) {
+    docsPerSeg.clear();
+    std::vector<int32_t> segsPerTier;
+    for (char c : shape) {
+      if (c > '9') {
+        segsPerTier.push_back(c-'a' + 10);  // base 36 - convert 'a' to 10, 'b' to 11, etc.
+      } else {
+        segsPerTier.push_back(c - '0');  // convert char to int
+      }
+    }
+
+    double totalWeight = 0.0;
+    double currentLevelSize = 1;
+    // slightly larger than mergeFactor to avoid rounding errors putting different tier segments at the same level
+    // according to the mergePolicy in IndexWriter.
+    double effectiveMergeFactor = mergeFactor * 1.05;
+
+    // First, calculate the total "weight" of all segments combined.
+    // We start from the smallest segments (end of the shape string) and move to the largest.
+    for (int i = shape.length() - 1; i >= 0; --i) {
+      totalWeight += segsPerTier[i] * currentLevelSize;
+      currentLevelSize *= effectiveMergeFactor;
+    }
+
+    // If there's no weight, we can't distribute documents.
+    if (totalWeight == 0) {
+      return;
+    }
+
+    // now calculate what everything should be scaled by
+    double scale = nDocs / totalWeight;
+
+    // Now, calculate the size of each segment, from largest to smallest level.
+    int power = segsPerTier.size() - 1;
+
+    for (auto nSegs : segsPerTier) {
+      int32_t docs = scale * std::pow(effectiveMergeFactor, power);
+      if (docs < 1) break; // no more segments to add, we are done.
+      for (int i = 0; i < nSegs; ++i) {
+        docsPerSeg.push_back(docs);
+      }
+      power--;
+    }
+
+    // Find how much we are off from nDocs.
+    int64_t diff = nDocs - std::accumulate(docsPerSeg.begin(), docsPerSeg.end(), 0LL);
+
+    // if we need more docs, add to largest segment to avoid triggering a merge.
+    if (diff > 0) {
+      docsPerSeg[0] += diff; // add to the first segment
+    } else if (diff < 0) {
+      // too many docs... reduce size of smallest segment.
+      docsPerSeg.back() += diff;
+      assert(docsPerSeg.back() >= 0); // should never go negative or 0
+    }
+  }
+
 };
 
 
