@@ -140,7 +140,8 @@ message FieldFacet {
   sint64 limit = 2;         // maximum number of buckets to return
   int64 mincount = 3; // the minimum count of a bucket to be included in the response
   bool missing = 4;
-  map<string, SearchOp> ops = 5;  // sub-facets or search operations performed per bucket
+  SortSpec sort = 5; // how to sort the buckets, if not specified, the default is by count descending
+  map<string, SearchOp> ops = 6;  // sub-facets or search operations performed per bucket
 }
 
 message RangeFacet {
@@ -150,7 +151,8 @@ message RangeFacet {
   int64 gap = 4; // the size of each bucket in the range
   int64 mincount = 5; // the minimum count of a bucket to be included in the response
   bool missing = 6;
-  map<string, SearchOp> ops = 7;  // sub-facets or search operations performed per bucket
+  SortSpec sort = 7; // how to sort the buckets, if not specified, the default is by bucket id ascending
+  map<string, SearchOp> ops = 8;  // sub-facets or search operations performed per bucket
 }
 
 // A "domain" defines a set of documents to do computations over (like facets)

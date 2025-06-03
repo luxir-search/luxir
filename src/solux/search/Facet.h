@@ -290,9 +290,6 @@ public:
     }
     counts.clear();
     std::sort(countVec.begin(), countVec.end(), [](auto& a, auto& b) {
-      if (a.second != b.second ) {
-        return a.second > b.second;
-      }
       return a.first < b.first;
     });
     if (limit >= 0 && limit < countVec.size()) {
