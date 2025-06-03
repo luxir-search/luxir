@@ -46,6 +46,7 @@ message SearchOp {
 
     // TODO: hmmm, should different facet types be be encapsulated by a single "Facet" message?
     FieldFacet field_facet = 8;
+    RangeFacet range_facet = 9;
     // future: something like terms component... stream out all terms of one or more (or all) fields
   }
 }
@@ -140,6 +141,16 @@ message FieldFacet {
   int64 mincount = 3; // the minimum count of a bucket to be included in the response
   bool missing = 4;
   map<string, SearchOp> ops = 5;  // sub-facets or search operations performed per bucket
+}
+
+message RangeFacet {
+  string field = 1;
+  sint64 start = 2; // inclusive start of the range
+  sint64 end = 3;   // exclusive end of the range
+  int64 gap = 4; // the size of each bucket in the range
+  int64 mincount = 5; // the minimum count of a bucket to be included in the response
+  bool missing = 6;
+  map<string, SearchOp> ops = 7;  // sub-facets or search operations performed per bucket
 }
 
 // A "domain" defines a set of documents to do computations over (like facets)
