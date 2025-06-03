@@ -9,6 +9,7 @@
 #include "IndexReader.h"
 #include "Collector.h"
 #include "Facet.h"
+#include "solux/util/AtomicMerger.h"
 
 namespace solux {
 
@@ -148,53 +149,15 @@ public:
 
     std::function<void(QueryReq&)> callback;
 
-    // Concurrent merge strategy:
-    // Rather than a mutex, we can just use a single atomic pointer to a TopDocsCollector.
-    // On merge, if the pointer is null, just set.  If it's not null, grab it and merge, then try to set again.
-    // This plays well with a single thread handling multiple segments (no merging necessary, should be close to
-    // serial performance).
-    // This is not algorithmically optimal merging (a PQ of collectors would be better), but this would result in less
-    // memory usage. If we did want to delay merging, then we could still use the single-atomic-pointer
-    // approach, and create a linked list of collectors to merge later.
-    // This also allows us to maintain a counter to tell when we are done without having another atomic variable.
-
-    struct CollectorHolder {
+    class MergeableCollector : public MergeableData {
+    public:
+      // QueryReq* queryReq;  // the query request that this collector is for
       TopDocsCollector collector;
-      int32_t segmentsMerged;  // the number of segments that this collector represents
-      bool heapAllocated;  // if true, call delete on the collector when it is no longer needed.
-    };
-    std::atomic<CollectorHolder*> collectorHolder;
-
-    //  req, *qcontext, query, limit
-    QueryReq(SearchEngine::Request& req, Query::Context& qcontext, Query* query, int64_t topCount, std::function<void(QueryReq&)>callback={})
-    : req(req), qcontext(qcontext), query(query), topCount(topCount), callback(std::move(callback)) {
-      weight = query->createWeight(qcontext);
-    }
-
-    ~QueryReq() {
-      auto* holder = collectorHolder.load(std::memory_order_relaxed);
-      if (holder != nullptr && holder->heapAllocated) {
-        delete holder;
+      MergeableCollector(size_t topCount) : collector(topCount) {
+        // collector.queryReq = queryReq;
       }
-    }
 
-    CollectorHolder* getCollector() {
-      auto* holder = collectorHolder.exchange(nullptr);
-      if (holder == nullptr) {
-        holder = new CollectorHolder({TopDocsCollector(topCount), 0, true});
-      }
-      return holder;
-    }
-
-    /// Merge one collector into the other and return the merged collector.  It could be either a or b.
-    CollectorHolder* mergeCollector(CollectorHolder* a, CollectorHolder* b) {
-
-      // If one is heap allocated and the other is not, then we can just merge into the non-heap allocated collector.
-      if (a->heapAllocated ^ b->heapAllocated) {
-        if (a->heapAllocated) {
-          std::swap(a,b);
-        }
-      } else {
+      static MergeableCollector* merge(MergeableCollector* a, MergeableCollector* b) {
         // merge the smaller collector into the larger collector, or if both the same size, merge
         // the less competitive collector into the more competitive collector.
         if (a->collector.size() < b->collector.size()
@@ -202,44 +165,38 @@ public:
         {
           std::swap(a,b);
         }
+
+        a->collector.merge(b->collector);
+        return a;
       }
+    };
 
-      a->collector.merge(b->collector);
-      a->segmentsMerged += b->segmentsMerged;
-      if (b->heapAllocated) {
-        delete b;
-      }
+    AtomicMerger<MergeableCollector> collectorMerger;
 
-      return a;
-    }
+    //  req, *qcontext, query, limit
+    QueryReq(SearchEngine::Request& req, Query::Context& qcontext, Query* query, int64_t topCount, std::function<void(QueryReq&)>callback={})
+    : req(req), qcontext(qcontext), query(query), topCount(topCount), callback(std::move(callback)), collectorMerger(nullptr,nullptr) {
+      weight = query->createWeight(qcontext);
 
-    /// returns true if all segments have been collected and merged
-    bool releaseCollector(CollectorHolder* holder) {
-      holder->segmentsMerged++;
+      collectorMerger.creator = [this]() {
+        return new MergeableCollector(this->topCount);
+      };
+      collectorMerger.destroyer = [](MergeableCollector* data) {
+        delete data;
+      };
 
-      for(;;) {
-        bool allSegsMerged = (size_t(holder->segmentsMerged) == req.reader->segments().size());
-        holder = collectorHolder.exchange(holder);
-        if (holder == nullptr) {
-          return allSegsMerged;
-        }
-        // try to grab the other collector to merge
-        auto other = collectorHolder.exchange(nullptr);
-        if (other != nullptr) {
-          holder = mergeCollector(holder, other);
-        }
-      }
-      // [[unreachable]];
     }
 
     void collect(int32_t segnum) {
-      CollectorHolder* holder = nullptr;
+      MergeableCollector* data = nullptr;
+      auto numSegs = req.reader->segments().size();
+
       {
         auto poolGuard = MemPool::threadLocalPoolGuard();
         auto scorer = weight->createScorer(poolGuard.pool(), qcontext.topReader.segments()[segnum]);
 
         // Wait until last moment to obtain collector in hopes of reusing an existing one.
-        holder = getCollector();
+        data = collectorMerger.obtain();
 
         std::vector<bool>* currBitset = dom ? &dom->allMatches[segnum].docs : nullptr;
         if (currBitset) {
@@ -247,7 +204,7 @@ public:
         }
 
         if (scorer != nullptr) {
-          auto& collector = holder->collector;
+          auto& collector = data->collector;
           for (;;) {
             auto doc = scorer->next();
             if (doc == PostingsReader::END) {
@@ -262,13 +219,14 @@ public:
         }
       }
 
-      if (releaseCollector(holder)) {
+      auto count = collectorMerger.release(data);
+      if (count == numSegs) {
         // we are done, so we can call the callback
         // we could use a nested task_group to wait until we are done here as well.
         callback(*this);
       }
     }
-
+    
     void start(oneapi::tbb::task_group* tg) {
       for (int32_t i=0; i < (int32_t)req.reader->segments().size(); i++) {
         task_group_run(tg, [this, i]() {
@@ -437,11 +395,10 @@ public:
 //       bool more = 5; // expect more results to be streamed back?
 //    }
 
-    // Grab the TopDocs from the collector and fill in the fields.  Search is done, so we don't need
-    // the atomic at all here.
-    auto* collectorHolder = qr.collectorHolder.load(std::memory_order_relaxed);
+    // Grab the TopDocs from the collector and fill in the fields.
+    auto* mergeableCollector = qr.collectorMerger.getData();  // search is done, so it's safe to access this now.
 
-    if (collectorHolder == nullptr) {
+    if (mergeableCollector == nullptr) {
       auto& response = *qr.req.lastResponse;
       auto& searchResultProto = response.proto.mutable_ops()->operator[](qr.name);
       auto& docListProto = *searchResultProto.mutable_docs();
@@ -449,7 +406,7 @@ public:
       return;
     }
 
-    auto& collector = collectorHolder->collector;
+    auto& collector = mergeableCollector->collector;
     collector.sort();
     auto numCollected = collector.size();
     int32_t maxBatchSize = qr.topDocsProto->batch_size();
@@ -724,6 +681,7 @@ public:
       // capture by-value parameters by-value again since this method will return before the lambda is executed.
       // also capture anything on the stack in this function by-value.
       task_group_run(tg, [this, idxSpan, &req, field, &fieldType, &segDocs, starget, mtarget]() {
+        unused(this);
         // a view of the segdocs for a single segment, in ascending order.
         auto sortedSegDocs = idxSpan | std::views::transform([&segDocs](auto idx) { return segDocs[idx]; });
         auto segNum = sortedSegDocs[0].segment();

@@ -55,8 +55,8 @@ public:
   {
   }
 
-  AtomicMerger(std::function<T*()> creator,
-               std::function<void(T*)> destroyer)
+  AtomicMerger(std::function<T*()>&& creator,
+               std::function<void(T*)>&& destroyer)
       : creator(std::move(creator)), destroyer(std::move(destroyer))
   {
   }
@@ -74,19 +74,19 @@ public:
     return data;
   }
 
-  /// Releases the data, possibly merging it with existing data, and returns the total number of Data objects
-  /// that have been released.
+  /// Releases the data, possibly merging it with existing data, and returns the total number of times
+  /// release() has been called.
   /// Do *not* access this pointer after it has been released, as it may be deleted or merging/merged with another instance.
   int64_t release(T* data) {
     data->count++;
     for (;;) {
       auto count = data->count;  // grab the count before we try to put back, to avoid races
-      data = ptr.exchange(data);
+      data = ptr.exchange(data, std::memory_order_acq_rel);
       if (data == nullptr) {
         return count;
       }
       // try to grab the other mergeable to merge
-      auto other = ptr.exchange(nullptr);
+      auto other = ptr.exchange(nullptr, std::memory_order_acquire);
       if (other != nullptr) {
         auto newCount = data->count + other->count;
         T* newData = nullptr;
@@ -115,6 +115,13 @@ public:
       // so continue the loop.
     }
   }
+
+  /// Returns the current Mergeable data.  This pointer may be null if no data was obtained/released.
+  /// This should not be used while processing / merging is still in progress.
+  T* getData() const {
+    return ptr.load(std::memory_order_acquire);
+  }
+
 };
 
 
