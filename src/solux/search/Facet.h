@@ -9,6 +9,7 @@
 #include "IndexReader.h"
 #include "solux/reader/IntColReader.h"
 #include "solux/schema/Schema.h"
+#include "solux/util/AtomicMerger.h"
 
 namespace solux {
 
@@ -91,32 +92,87 @@ public:
 };
 
 class IntFacetReq : public IntFacetBaseReq {
+  class MergeableIntFacet : public MergeableData {
+  public:
+    boost::unordered_flat_map<int64_t, int64_t> counts;
+
+    static MergeableIntFacet* merge(MergeableIntFacet* a, MergeableIntFacet* b) {
+      // merge the smaller collector into the larger collector, or if both the same size, merge
+      // the less competitive collector into the more competitive collector.
+      if (a->counts.size() < b->counts.size()) {
+        std::swap(a,b);
+      }
+
+      for (auto [val, count] : b->counts) {
+        a->counts[val] += count;
+      }
+      return a;
+    }
+  };
+
+  AtomicMerger<MergeableIntFacet> countMerger;
 public:
   IntFacetReq(IndexReader& reader, std::string_view fieldName, std::string_view facetName, int64_t limit, int64_t minCount, bool missing) :
   IntFacetBaseReq(reader, fieldName, facetName, limit, minCount, missing){}
 
-  void facetResult(solux::proto::FacetResult& facetResultProto) {
-    // merge all the counts from all segments into the largest map
-    auto& counts = allCounts[0];
-    for (size_t i = 1; i < allCounts.size(); i++) {
-      auto& segCounts = allCounts[i];
-      // its faster to merge the smaller map into the larger one
-      if (segCounts.size() > counts.size()) {
-        std::swap(counts, segCounts);
-      }
-      for (auto [val, count] : segCounts) {
-        counts[val] += count;
-      }
-      segCounts.clear();
+  //TODO: refactor out repeated code
+  void facetSeg(FacetDomain& domain, int32_t segnum) override {
+    std::vector<bool>& matches = domain.allMatches[segnum].docs;
+    auto* mergeableData = countMerger.obtain();
+    boost::unordered_flat_map<int64_t, int64_t>& count = mergeableData->counts;
+    auto& postingsReader = reader.segments()[segnum].postingsReader();
+    auto poolGuard = MemPool::threadLocalPoolGuard();
+    FieldReader fieldReader(poolGuard.pool(), postingsReader);
+    bool found = fieldReader.seek(fieldName);
+    if (!found) {
+      //TODO: FIXME this isn't thread safe
+      missing_num += std::count(matches.begin(), matches.end(), true);
+      countMerger.release(mergeableData);
+      return;
     }
+    SegFieldInfo segFieldInfo;
+    fieldReader.readFieldInfo(segFieldInfo);
+    // this is a int field for now, so we need to read the value for each doc
+    // and accumulate counts per value.
+    IntColReader intColReader(poolGuard.pool(), postingsReader, segFieldInfo);
+    IntColReader::Iterator intColIter(intColReader);
+    for (int32_t docid = 0; docid < matches.size(); docid++) {
+      if (!matches[docid]) {
+        continue;
+      }
+      if (intColIter.docId() < docid ) {
+        intColIter.advance(docid);
+      }
+      if (intColIter.docId() == docid) {
+        if (!intColReader.multiValued()) {
+          auto val = intColIter.value();
+          count[val]++;
+        } else {
+          auto [start, end] = intColReader.getStartEndRank(intColIter.rank());
+          auto n = end - start;
+          for (int64_t vrank = 0; vrank < n; vrank++) {
+            auto val = intColIter.values().valueAt(start + vrank);
+            count[val]++;
+          }
+        }
+      } else {
+        missing_num++;
+      }
+    }
+    countMerger.release(mergeableData);
+  }
+
+  void facetResult(solux::proto::FacetResult& facetResultProto) {
+    auto* mergedData = countMerger.obtain();
+    auto& counts = mergedData->counts;
     std::vector<std::pair<int64_t, int64_t>> countVec;
     for (auto [val, count] : counts) {
-      if (minCount == -1 || count >= minCount) {
+      if (count >= minCount) {
         countVec.emplace_back(val, count);
       }
     }
-    counts.clear();
-    std::sort(countVec.begin(), countVec.end(), [](auto& a, auto& b) {
+    delete mergedData;
+    std::sort(countVec.begin(), countVec.end(), [](const auto& a, const auto& b) {
       if (a.second != b.second ) {
         return a.second > b.second;
       }
