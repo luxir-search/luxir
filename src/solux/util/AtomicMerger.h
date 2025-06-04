@@ -81,11 +81,12 @@ public:
     data->count++;
     for (;;) {
       auto count = data->count;  // grab the count before we try to put back, to avoid races
-      data = ptr.exchange(data, std::memory_order_acq_rel);
+      data = ptr.exchange(data, std::memory_order_release);
       if (data == nullptr) {
         return count;
       }
-      // try to grab the other mergeable to merge
+      // try to grab the other mergeable to merge.  The memory_order_acquire will
+      // also cause memory pointed at by "data" to be valid here.
       auto other = ptr.exchange(nullptr, std::memory_order_acquire);
       if (other != nullptr) {
         auto newCount = data->count + other->count;
