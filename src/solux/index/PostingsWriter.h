@@ -17,7 +17,13 @@
 #include "ScreamingBuilder.h"
 
 
+namespace solux {
+
 /**
+ * PostingsWriter is used to write the postings for a segment.
+ * A single Inverter uses/owns a PostingsWriter.
+ * PostingsWriter is currently single-threaded, but will be made multithreaded in the future for faster flushing.
+ *
  * The high level strategy is to write the lowest levels first since higher level information needs/points to that info.
  *
  * For all terms in a field:
@@ -27,115 +33,6 @@
  *     - Write the termdoc info (doc,termfreq,pointer_to_positions) and remember the number as docfreq
  *   - Write the term info (term,docfreq,pointer_to_docs)
  */
-
-
-
-// Reference for lucene's posting format:
-// https://lucene.apache.org/core/8_3_0/core/org/apache/lucene/codecs/lucene50/Lucene50PostingsFormat.html
-// https://lucene.apache.org/core/8_6_0/core/org/apache/lucene/codecs/
-
-// TODO: consider using roaring bitmaps for high density docids?  Requires knowing the approx docfreq up front?
-// Would be great for index-term based faceting!
-// presumably not for positions since they would almost never be dense?  Although it would be good for parallel field query (color:blue size:large in same position)
-// It might make it harder to seek to the positions for any document as well (depends on iteration speed since for a given docId, we need to find
-// it's relative position in the ID list, so we can match that relative position in the positions list.  Maybe reserve for fields that don't
-// index positions, or have it as an additional option for fields that do.
-// https://github.com/RoaringBitmap/CRoaring   https://arxiv.org/abs/1709.07821
-// http://db.ucsd.edu/wp-content/uploads/2017/03/sidm338-wangA.pdf (comparison between bitmaps and inverted list compression)
-//   TODO: where is the source code for the alternate versions
-
-// TODO: in debug mode, keep track of how much space everything takes?
-// We should try to enable this in non-debug mode too... CheckIndex type of func.
-
-// We can't rely on exact index stats (docfreq) from the input, since documents may be deleted.  We won't know until we iterate over the postings
-// and match against deleted documents (when merging)
-
-
-// How to handle different indexing styles (positions vs not?)
-// templatize that somehow?
-
-
-
-// Term Index Ideas:
-// Do a simple binary search for term first?
-// - strip off common prefix
-// - pad all starts out to 4 bytes to do a quick compare?
-//    - maybe even have a dense int[] of these...
-//       - if adjacent bucket has same value, then we know we need to look further.  Could have an exception mechanism for additional chars,
-//         or could simply look directly at the terms list.
-//       - for that matter... we could start by doing a binary search directly on the terms dictionary w/o an index!
-//         - just need a block number -> offset map.  How to compress the offsets?
-//            -- ideas: align blocks.  interpolation.  can we assume term index will not be > 32 bits??? calculate max size of block and max number of terms.
-//                  - important to use exceptions for long strings if we do this as well to cap the max size of a block.
-//    - investigate a serialized hash table?
-// - have an exception mechanism for long terms, so we get better locality?  where would they be written though?  Another file?
-// - We could have some internal skipping if for every term that shares no prefix bytes with the previous term, we encode the offset of the next
-// term like that.  Unclear how often it would be useful (i.e. only when the starting term mismatches with the seek term)
-//     - actually... at the beginning of the block, we could also store the number of shared prefix bytes for the whole block N.  then we could
-//       point to the term which mismatches at term N+1
-//       - could this be generalized more? #terms that share N additional bytes (we can skip ahead if the seek term is greater than that number of bytes
-//         - could we include enough info that it would be redundant with the number of bytes shared from the prev term?
-//         - if we completely generalized it and had large block sizes... this seems very much like a trie/fst? ( esp if the number of shared terms is a delta
-//           over the last.)
-//         - could also optionally put a hash/jump table at the start of the block based on the next char/substring.
-// - being able to skip forward sort of requires encoding backwards so you can encode offsets?
-// - STORE a minimum term length.  All additional lengths are implied to be in excess of this.  This will help with fixed-length things like UUIDs!
-// - could also add a second level to the terms (like a skip list)... encode every 8th or 16th term as if they were adjacent.
-//    - or multi-level skip list...  store ords (0,64) then (0+32,64+32), then (0+16,0+32+16,64+16,64+32+16).  Each term would be encoded relative to
-//      the term to it's left AT THE SAME LEVEL.  Also have an offset index (which could now actually be effectively utilized) to skip to the lowest level
-//      block.  For example, if we've deduced that the term we want is greater than 64, but less than 64+16, how do we seek to term #65?
-//      We also want to be able to skip the skip pointers themselves.
-//      There is another way to do the skip pointers... depth first rather than breadth first (0,64), (0+32), (0+16), (leaf 1-15), (32+16), (leaf 17-31), ...
-//      Depth first may be a little easier to understand, but breadth first may have better locality at the top of the tree.
-//      An index per-doc for skip terms, and an index per mini-block start for leaf terms?  Or, with each skip term, could put an offset of where to go for the
-//      term to it's right.  The term to it's left would always be adjacent (next), but since that hasn't been written yet, it would be hard to put inline.
-//      For depth-first encoding, just encode all the terms in order (including skip terms), but on a skip term, encode it relative to the last on it's own level.
-//      May be easiest to start with.  Encoding and full decoding will thus need a stack of states, but seeking would not.  It would slow down bulk decoding / scanning
-//      a little, but still prob worth it given weight on lookups.
-//      - pulsing: inline (with a good way of skipping it all) or reference the Nth pulsed term (or delta) and look up in separate space?
-//        - for docs-only, might be a good place to use a 2 bit code to indicate number of additional bytes... then can do branchless skip.  Also doable
-//          with doc+pos, but slightly more complicated.  What bit/code indicates pulsing though?  doc-position delta of 0?  We can make this delta smaller
-//          using a small amount of alignment (4 byte alignment means single vint byte stores length to 512 instead of 128... likewise, can add a minimum
-//          known block size.  Ensure padding so we can always read a full 4 bytes and mask it off rather than byte at a time.
-//      - for mini-block offsets, try to find something that doesn't need to be decoded?
-//      - defer other block metadata decoding in case the term isn't found (which will be the common case for IDs in a multi-segment index?)
-//      - also record the max(prefix_from_prev_term)? feels like this could be used to optimize how much of previous term to copy when moving to next?
-//         -- single byte if we move to 8 bit term length.
-//      - things like docfreq, position offset, etc, can be in the docs file to make the terms more compact.... but the base can be in the terms block
-//        - block encoding (pfordelta) would make for smaller index overall, but increase the size of the terms data and require decoding the block.
-//          - we could also still encode position offsets, but put them in the positions file (after all of the positions)
-//
-// - TODO: make fixed block size adjustable and store in index as power of two (2^N)
-
-// What is stored in TermBlockHeader:
-//    full starting term, block_prefix_size, max_term_size?, min_suffix_size (useful? would reduce length bytes needed for many large terms (uncomressed uuid?)
-//    starting_ordinal, number of terms in this block (needed for variable sized blocks only... starting ordinal could be repositioned to allow binary search)
-//    docsFP, posFP, payFP        // postings-metadata:  even if we chose not to store metadata in the terms block, these can still be used as a base to delta-code.
-//    docDeltaMin // this could be figured out at compile time (the theoretical minimum), or could be the minimum for this block.
-// encoding: varint-GB (TODO: try SSE "stream vbyte")  OR provide a way to skip unneeded metadata (anything not needed for a miss)
-// How to get to the index (or any other data written after the full block has been written?)
-//   - could index from the end of the block.  Have some metadata at the start and some at the end?
-//     Or could put all metadata at the end.  If the string still points at the start of the block, we could be passed the end of the block by looking
-//     at the start of the next block.
-//     Or we could just buffer the complete block. No terms block should be overly large.
-//
-
-// Docs file:
-// Lucene interleaves blocks of documents and frequencies. Lucene does not encode a positions offset for each document... instead
-// the termfreq is summed for all documents through the current document.  This is used to calculate how many positions need to be
-// skipped (there are no delimiters between positions of different documents for the same term.)
-// FUTURE: we could investigate putting positions from different terms together as well.
-
-
-//   See Lucene84PostingsWriter.
-// What if we wanted to use roaring bitset for docs?  How to find the freqs?
-// don't need skip data for the docs, but still would for freq_start & position_start.
-// buffer the whole freq output and put it after the docs?  Or put it in the positions file? Or somewhere else?
-// FIRST ITERATION: use whatever we would for leftover small enough to not encode in a block.
-//   <doc_delta_code>  // doc delta or
-
-namespace solux {
-
 class PostingsWriter {
 public:
   // IndexFieldInfo adds extra info needed at index time to SegFieldInfo.

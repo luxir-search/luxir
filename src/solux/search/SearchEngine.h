@@ -226,7 +226,7 @@ public:
         callback(*this);
       }
     }
-    
+
     void start(oneapi::tbb::task_group* tg) {
       for (int32_t i=0; i < (int32_t)req.reader->segments().size(); i++) {
         task_group_run(tg, [this, i]() {
