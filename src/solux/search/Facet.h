@@ -356,15 +356,15 @@ public:
     }
 
     // fill in the facet result proto
-    auto& bucketIds = *facetResultProto.mutable_bucket_ids()->mutable_col_s();
+    auto& bucketIds = *facetResultProto.mutable_bucket_ids()->mutable_multi_i();
     auto& bucketIdsArr = *bucketIds.mutable_v();
     auto& countsArr = *facetResultProto.mutable_counts();
     bucketIdsArr.Reserve(countVec.size());
     countsArr.Reserve(countVec.size());
     for (auto [val, count] : countVec) {
-      auto* strptr = bucketIdsArr.Add();
-      // create a string for the range
-      *strptr = std::to_string(start + val * gap) + "-" + std::to_string(start + (val + 1) * gap);
+      auto& pair = *bucketIdsArr.Add();
+      pair.mutable_v()->Add(start + val * gap);
+      pair.mutable_v()->Add(start + (val + 1) * gap);
       countsArr.Add(count);
     }
     if (missing) {

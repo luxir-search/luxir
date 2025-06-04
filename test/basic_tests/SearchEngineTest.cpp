@@ -165,9 +165,11 @@ TEST_F(SearchEngineTest, basic) {
     ASSERT_EQ(2, lreq->responses[0]->proto.ops().at("f7").facet().counts().at(0));
 
     //check the eighth facet
-    ASSERT_EQ(2, lreq->responses[0]->proto.ops().at("f8").facet().bucket_ids().col_s().v_size());
-    ASSERT_EQ("-5-15", lreq->responses[0]->proto.ops().at("f8").facet().bucket_ids().col_s().v(0));
-    ASSERT_EQ("15-35", lreq->responses[0]->proto.ops().at("f8").facet().bucket_ids().col_s().v(1));
+    ASSERT_EQ(2, lreq->responses[0]->proto.ops().at("f8").facet().bucket_ids().multi_i().v_size());
+    ASSERT_EQ(-5, lreq->responses[0]->proto.ops().at("f8").facet().bucket_ids().multi_i().v(0).v(0));
+    ASSERT_EQ(15, lreq->responses[0]->proto.ops().at("f8").facet().bucket_ids().multi_i().v(0).v(1));
+    ASSERT_EQ(15, lreq->responses[0]->proto.ops().at("f8").facet().bucket_ids().multi_i().v(1).v(0));
+    ASSERT_EQ(35, lreq->responses[0]->proto.ops().at("f8").facet().bucket_ids().multi_i().v(1).v(1));
     ASSERT_EQ(2, lreq->responses[0]->proto.ops().at("f8").facet().counts().size());
     ASSERT_EQ(1, lreq->responses[0]->proto.ops().at("f8").facet().counts().at(0));
     ASSERT_EQ(2, lreq->responses[0]->proto.ops().at("f8").facet().counts().at(1));
