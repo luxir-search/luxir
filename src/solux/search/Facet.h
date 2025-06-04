@@ -56,6 +56,7 @@ public:
     FieldReader fieldReader(poolGuard.pool(), postingsReader);
     bool found = fieldReader.seek(fieldName);
     if (!found) {
+      //TODO FIXME: Not thread safe
       missing_num += std::count(matches.begin(), matches.end(), true);
       return;
     }
@@ -95,6 +96,7 @@ class IntFacetReq : public IntFacetBaseReq {
   class MergeableIntFacet : public MergeableData {
   public:
     boost::unordered_flat_map<int64_t, int64_t> counts;
+    int64_t missing_num = 0; // number of missing values in this segment
 
     static MergeableIntFacet* merge(MergeableIntFacet* a, MergeableIntFacet* b) {
       // merge the smaller collector into the larger collector, or if both the same size, merge
@@ -106,6 +108,7 @@ class IntFacetReq : public IntFacetBaseReq {
       for (auto [val, count] : b->counts) {
         a->counts[val] += count;
       }
+      a->missing_num += b->missing_num;
       return a;
     }
   };
@@ -125,8 +128,7 @@ public:
     FieldReader fieldReader(poolGuard.pool(), postingsReader);
     bool found = fieldReader.seek(fieldName);
     if (!found) {
-      //TODO: FIXME this isn't thread safe
-      missing_num += std::count(matches.begin(), matches.end(), true);
+      mergeableData->missing_num += std::count(matches.begin(), matches.end(), true);
       countMerger.release(mergeableData);
       return;
     }
@@ -156,7 +158,7 @@ public:
           }
         }
       } else {
-        missing_num++;
+        mergeableData->missing_num++;
       }
     }
     countMerger.release(mergeableData);
@@ -171,6 +173,7 @@ public:
         countVec.emplace_back(val, count);
       }
     }
+    auto missing_count = mergedData->missing_num;
     delete mergedData;
     std::sort(countVec.begin(), countVec.end(), [](const auto& a, const auto& b) {
       if (a.second != b.second ) {
@@ -193,7 +196,7 @@ public:
       countsArr.Add(count);
     }
     if (missing) {
-      facetResultProto.set_missing(missing_num);
+      facetResultProto.set_missing(missing_count);
     }
 
 
