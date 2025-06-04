@@ -1,46 +1,8 @@
 #pragma once
 
 #include "Stream.h"
-#include "roaring.hh"
 
 namespace solux {
-
-// if for whatever reason we needed to access the string from the given DocStream,
-// we could add the string directly following the value
-// (only for string types that have the length info in the data itself? perhaps just standardize on that?)
-
-
-// FUTURE OPTIMIZATION: Use a separate MemPool that is 64 byte aligned (cache line)
-// and use the extra space at the end as buffer space.  Instead of using it as the head of the byte stream,
-// we can avoid a cache miss by always using it, and copying out the bytes when full.
-// Current sizes: Stream=18  DocStream=26  DocFreqStream=34 DocFreqPosStream=56
-// So for DocFreqPosStream we would want to round up to 128 bytes.
-// DOWNSIDE: indexing unique ids would take up quite a bit more room?  Maybe not too much though since the
-// term itself is after the DocStream and also in the cache line.
-// Maybe just special case unique terms! All we need to store is a single lastDoc with the term!
-//
-// Also, if we have a local buffer (not in the linked list), then we don't need the starting small
-// buffers to save memory any more!  We could just always use 64 byte chunks in the linked list, and the
-// overhead wouldn't be horrible... 4/64==6%.  And if all chunks in the MemPool are 64 byte aligned,
-// then so could offsets, and we could address 4GB*64 in one pool with 4 bytes.  We could also investigate
-// wasting a little more memory and using a full pointer (8 bytes) to point to the next chunk and potentially
-// avoid a miss on the vector of pointers in the MemPool?  Presumably that vector should be hot though
-// and a miss should be unlikely?
-//
-
-
-// DocValues that are indexed: can we just record <id><value> pairs in a stream and then index after the fact?
-// OR, use the indexed version to drive the docValue writing (esp if it's ord based)
-// Hints on whether the values would be unique or not would be very helpful.  It could be a "uniqueness" value on the field?
-// With high uniqueness, we would still have to do the inversion work (find all docs with a value), but
-// the intermediate storage would be much less and should be more efficient.
-// An adaptive solution might be interesting, but complicated.  Could index 1000 terms, and then if the number of
-// docs per term is low enough, switch to just recording value+id pairs.  Going from term->docvalues is sort of like
-// UnInvertedField in Solr.
-// IDEA: implement an iterative RLE for indexed values (no positions / term-freqs)... if delta==1, then just increment a counter.
-// otherwise.  possible encoding: leading bit 0: just normal 7 bit delta, leading bits 10: normal vint, leading bits 11: vint followed by count
-// count could be just a single byte to save space as well.
-
 
 /// List of documents (for docs-in-a-term, docs-with-value, etc)
 SOLUX_PACKED_START

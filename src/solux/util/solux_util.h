@@ -5,8 +5,6 @@
 #include <iostream>
 #include <vector>
 #include <memory.h>
-#include <type_traits>
-#include "log.h"
 
 // NOTE: this is better than including xxhash.h since it enables inline. Inverter performance equal to
 // fvn1a when inlined.  25% slower if not inlined.
@@ -147,10 +145,6 @@ public:
     // return XXH64(key, len, seed);
     return XXH3_64bits_withSeed(key, len, seed);
   }
-
-
-
-
 
 };
 

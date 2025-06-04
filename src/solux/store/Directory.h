@@ -2,9 +2,9 @@
 
 #include <vector>
 #include <string_view>
-#include "gtl/btree.hpp"
-#include "OutputStream.h"
+#include <gtl/btree.hpp>
 #include "solux/util/log.h"
+#include "OutputStream.h"
 
 // redefine DEBUG to TRACE level which shouldn't currently be logged!
 #define DIR_DEBUG LOG_TRACE

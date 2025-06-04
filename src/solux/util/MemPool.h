@@ -7,11 +7,11 @@
 #include <tuple>
 #include <algorithm>
 #include <assert.h>
-#include <unordered_set>
 #include <memory_resource>
 #include <span>
 
 #include "solux_util.h"
+#include "solux/util/log.h"
 
 
 // #define MEMPOOL_MALLOC true   // use malloc/new for each individual allocation for better memory checking with checkers
@@ -50,7 +50,8 @@
 // rewind to that end point.  Useful for quickly adding a few docs to a random index.  Can compare
 // these pointers to get how much memory was used for an operation as well.
 //
-
+// TODO: support allocating larger blocks of memory than BYTE_BLOCK_SIZE.
+//
 
 namespace solux {
 

@@ -1,5 +1,5 @@
 #pragma once
-#include "oneapi/tbb/flow_graph.h"
+#include <oneapi/tbb/flow_graph.h>
 
 namespace solux {
 

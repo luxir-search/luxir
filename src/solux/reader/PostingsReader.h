@@ -22,10 +22,6 @@
 
 namespace solux {
 
-// TODO: should the PostingsReader class be determining what files to open, or should a higher level class determine
-// that and pass the opened files?  For now, assume the latter.
-
-
 class PostingsReader;
 class FieldReader;
 class TermsEnum;
@@ -152,6 +148,10 @@ public:
     auto segInfoFile = Postings::getIndexFileName(segStr, 0);
     files.emplace_back(dir.openFile(segInfoFile));
     if (files.back().get() == nullptr) {
+      // TODO FIXME: this is the only place in the codebase where we throw an exception
+      // for a non-error condition (we don't synchronize with the writer, so a merge may have deleted
+      // the segment file we were trying to open).  For debugging purposes, it would be nice to
+      // migrate away from exceptions so that exceptions should never happen unless testing error scenarios.
       throw std::filesystem::filesystem_error(
               std::format("Can't find/open first segment file '{}'", segInfoFile),
               std::make_error_code(std::errc::no_such_file_or_directory));

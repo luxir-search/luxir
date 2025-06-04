@@ -4,8 +4,6 @@
 
 namespace solux {
 
-
-
 // Monotonic int col.  Currently supports 32 bit indexes and 64 bit outputs.
 // TODO: need a block iterator for bulk-reading values.
 class MonoReader {
@@ -35,7 +33,7 @@ protected:
   int32_t nValues;
 
 public:
-  MonoReader(MemPool &pool, PostingsReader &postingsReader, seg_location loc, int64_t metaOff, int32_t nValues)
+  MonoReader(MemPool& pool, PostingsReader &postingsReader, seg_location loc, int64_t metaOff, int32_t nValues)
   {
     columnIS = postingsReader.getInputStreamSeek(loc);
     blocks = columnIS.ptr();
@@ -43,7 +41,7 @@ public:
     this->nValues = nValues;
   }
 
-  MonoReader(MemPool &pool, InputStream is, int64_t loc, int64_t metaOff, int32_t nValues)
+  MonoReader(MemPool& pool, InputStream is, int64_t loc, int64_t metaOff, int32_t nValues)
   {
     columnIS = is;
     blocks = columnIS.ptr(loc);

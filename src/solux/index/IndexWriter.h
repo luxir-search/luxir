@@ -1,19 +1,17 @@
 #pragma once
 
 #include <string>
-#include <charconv>
-#include <thread>
 #include <mutex>
 #include <span>
-#include <solux/util/thread.h>
-#include <solux/util/Signal.h>
-#include <solux/server/SoluxError.h>
-#include "boost/unordered/unordered_flat_map.hpp"
-#include "oneapi/tbb/flow_graph.h"
+#include <boost/unordered/unordered_flat_map.hpp>
+#include <oneapi/tbb/flow_graph.h>
 #include "solux/store/Directory.h"
 #include "solux/store/OutputStream.h"
 #include "solux/store/InputStream.h"
 #include "solux/search/IndexReader.h"
+#include "solux/util/thread.h"
+#include "solux/util/Signal.h"
+#include "solux/server/SoluxError.h"
 #include "Inverter.h"
 #include "PostingsWriter.h"
 
@@ -116,7 +114,7 @@ public:
 
     // atomic shared pointer since it could be set / mutated by either the IW (setting or clearing),
     // or by IndexReader opening code.
-    std::atomic<std::shared_ptr<PostingsReader>> sharedPostingsReader;
+    std::atomic<std::shared_ptr<PostingsReader>> sharedPostingsReader = nullptr;
 
     SegInfo(uint64_t segId, int nDocs) : segId(segId), nDocs(nDocs) {}
   };

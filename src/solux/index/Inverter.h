@@ -2,7 +2,7 @@
 
 #include <algorithm>
 #include <boost/sort/spreadsort/string_sort.hpp>
-#include "gtl/phmap.hpp"
+#include <gtl/phmap.hpp>
 #include "solux/util/MemPool.h"
 #include "solux/schema/Schema.h"
 #include "solux/util/TermValHash.h"

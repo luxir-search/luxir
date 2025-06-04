@@ -6,7 +6,9 @@ namespace solux {
 
 //
 // Integer column writing
-// TODO: currently all values must be written before all docs!  Decouple this so we can write columns incrementally!
+// TODO: currently all values must be written before all docs!  Decouple this so we can write columns incrementally?
+// Wait until we implement deleted docs (and hence we need to know the docids as we write the values) before thinking
+// about how to refactor this.
 // To increase locality and decrease seeks, we could ensure that docsWithField always immediately follow the values.
 // We could use an OutputStream that writes to RAM or even a MemPool implementation (or OutputStream writing to MemPool)
 //

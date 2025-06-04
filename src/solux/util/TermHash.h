@@ -5,18 +5,7 @@
 
 namespace solux {
 
-// TODO: look at rapidjson to figure out the lowest impedance mismatch to go from json->document?
-// TODO: try something like an existing dense hash map in comparison?
-// TODO: store T (SegmentTerm for instance) right next to the term in the MemPool!
-// - Only advantage is on a resize... SegmentTerm would not need to be copied?
-// OPT: store first few term bytes next to pointer in the table? (faster sorting) store hash right next to pointer? (faster table resize)
-
-
-//
-// This was roughly 3 times as fast as std::unordered_map<std::string,int64_t> for inserting a bunch of 16 byte keys, 40% faster for subsequent lookups
-// Need to compare against something better like abseil now... perhaps figure out how to inherit from abseil or folly's map
-// Or make Str constructors take a BBPool so we can use try_emplace?
-
+// A hash table for terms, using TermRef as the key.
 template<class T>
 class TermHash {
   void newTable(unsigned newSize);
@@ -150,7 +139,6 @@ void TermHash<T>::rehash() {
         slot = slot & mask_;
         composite_type *newslot = table_ + slot;
         if (newslot->first.isNull()) {
-//          *newslot = *oldslot;  // TODO: try memcpy to see if it's more optimized
           *newslot = std::move(*oldslot);
           break;
         }

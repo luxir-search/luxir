@@ -1,10 +1,9 @@
 #pragma once
-#include "protos/solux_types.pb.h"
 #include <string_view>
 #include <vector>
-#include <gtl/btree.hpp>
 #include <boost/unordered/unordered_flat_map.hpp>
 
+#include "protos/solux_types.pb.h"
 #include "DocSet.h"
 #include "IndexReader.h"
 #include "solux/reader/IntColReader.h"

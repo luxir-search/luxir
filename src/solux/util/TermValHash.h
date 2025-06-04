@@ -7,11 +7,6 @@
 
 namespace solux {
 
-// TODO: figure out if/how we can use abseil or folly F14, phmap or robin_hood hash maps that have SIMD lookups.
-// If we can't use directly, perhaps a hacked version?
-// Also phmap::flat_hash_set
-
-
 // A reference to an adjacent string key and arbitrary value, for better memory locality
 // The current implementation stores Val+Key contiguously and points in the middle (to the start of the Key).
 //
@@ -21,7 +16,6 @@ namespace solux {
 // FUTURE: if we align in the pool, we could use that alignment space after the key... perhaps even round to
 // the cache line (64bytes on x86)
 //
-
 
 template<class V>
 class TermValRef : public TermRef {

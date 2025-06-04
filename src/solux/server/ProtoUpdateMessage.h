@@ -1,7 +1,6 @@
 #pragma once
 
 #include "solux/index/IndexWriter.h"
-#include "solux/schema/Schema.h"
 #include "protos/solux.grpc.pb.h"
 
 namespace solux {

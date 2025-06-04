@@ -1,11 +1,9 @@
 #pragma once
 
 #include <thread>
-#include <grpcpp/grpcpp.h>
-#include <grpcpp/health_check_service_interface.h>
-#include <grpcpp/ext/proto_server_reflection_plugin.h>
-#include "protos/solux.grpc.pb.h"
 #include <latch>
+#include <grpcpp/grpcpp.h>
+#include "protos/solux.grpc.pb.h"
 #include "SoluxNode.h"
 
 namespace solux {
