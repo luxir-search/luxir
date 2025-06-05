@@ -8,6 +8,9 @@ using namespace solux;
 template<typename T>
 static void BM_Collector(benchmark::State& state, int32_t nDocs, bool sorted) {
   // Rng rng(SoluxTest::rng_seed);
+  if (solux::unit_tests) {
+    nDocs = 100; // for unit tests, use a smaller number of docs
+  }
   Rng rng(1);
    uint32_t topK = state.range(0); // number of iterators / streams to merge
 
@@ -35,9 +38,24 @@ static void BM_CollectorMedI(benchmark::State& state, int32_t nDocs, bool sorted
   BM_Collector<TopScoreCollectorI>(state, nDocs, sorted);
 }
 
+
+
+// #define RUN_DISABLED_BENCHMARKS
+#ifdef RUN_DISABLED_BENCHMARKS
 constexpr int32_t ndocs = 1000000;
+
 BENCHMARK_CAPTURE(BM_CollectorPQ, rand, ndocs, false)->Range(1, 1<<10);
 BENCHMARK_CAPTURE(BM_CollectorMed, rand, ndocs, false)->Range(1, 1<<10);
 BENCHMARK_CAPTURE(BM_CollectorMedI, rand, ndocs, false)->Range(1, 1<<10);
 BENCHMARK_CAPTURE(BM_CollectorPQ, sorted, ndocs, true)->Range(1, 1<<10);
 BENCHMARK_CAPTURE(BM_CollectorMed, sorted, ndocs, true)->Range(1, 1<<10);
+#else
+inline void hackety_hack() {
+  solux::unused(hackety_hack);
+  solux::unused(BM_CollectorPQ);
+  solux::unused(BM_CollectorMed);
+  solux::unused(BM_CollectorMedI);
+  solux::unused(BM_CollectorPQ);
+  solux::unused(BM_CollectorMed);
+}
+#endif
