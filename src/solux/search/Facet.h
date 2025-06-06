@@ -35,7 +35,9 @@ public:
   virtual void facetSeg(FacetDomain& domain, int32_t segnum) = 0; // facet a single segment
   virtual void facetResult(solux::proto::FacetResult& facetResultProto) = 0; // merge all segments and fill in the result proto
 
-  bool facetSegIntCol(FacetDomain& domain, int32_t segnum, int64_t& missing, auto callback) {
+  //
+  // missing and segFieldInfo are out parameters that only are filled in if true is returned
+  bool facetSegIntCol(FacetDomain& domain, int32_t segnum, int64_t& missing, SegFieldInfo& segFieldInfo, auto callback) {
     std::vector<bool>& matches = domain.allMatches[segnum].docs;
     auto& postingsReader = reader.segments()[segnum].postingsReader();
     auto poolGuard = MemPool::threadLocalPoolGuard();
@@ -45,7 +47,6 @@ public:
       missing += std::count(matches.begin(), matches.end(), true);
       return false;
     }
-    SegFieldInfo segFieldInfo;
     fieldReader.readFieldInfo(segFieldInfo);
     // this is a int field for now, so we need to read the value for each doc
     // and accumulate counts per value.
@@ -117,7 +118,8 @@ public:
   void facetSeg(FacetDomain& domain, int32_t segnum) override {
     std::unique_ptr<MergeableIntFacet> mergeableData(countMerger.obtain());
     boost::unordered_flat_map<int64_t, int64_t>& count = mergeableData->counts;
-    facetSegIntCol(domain, segnum, mergeableData->missing_num, [&](int32_t docid, int64_t val) {
+    SegFieldInfo segFieldInfo;
+    facetSegIntCol(domain, segnum, mergeableData->missing_num, segFieldInfo, [&](int32_t docid, int64_t val) {
       count[val]++;
     });
     countMerger.release(mergeableData.release());
@@ -190,49 +192,25 @@ public:
   IntFacetBaseReq(reader, fieldName, facetName, limit, minCount, missing){}
 
   void facetSeg(FacetDomain& domain, int32_t segnum) override {
-    std::vector<bool>& matches = domain.allMatches[segnum].docs;
+    SegFieldInfo segFieldInfo;
     boost::unordered_flat_map<int64_t, int64_t> count;
     int64_t missing_num = 0;
-    auto& postingsReader = reader.segments()[segnum].postingsReader();
-    auto poolGuard = MemPool::threadLocalPoolGuard();
-    FieldReader fieldReader(poolGuard.pool(), postingsReader);
-    bool found = fieldReader.seek(fieldName);
-    if (!found) {
-      auto* mergeableData = countMerger.obtain();
-      mergeableData->missing_num += std::count(matches.begin(), matches.end(), true);
-      countMerger.release(mergeableData);
+    facetSegIntCol(domain, segnum, missing_num, segFieldInfo,
+      [&](int32_t docid, int64_t val) {count[val]++;});
+
+    if (count.empty()) {
+      // no values found, so we can just return
+      if (missing_num > 0) {
+        auto* mergeableData = countMerger.obtain();
+        mergeableData->missing_num += missing_num;
+        countMerger.release(mergeableData);
+      }
       return;
     }
-    SegFieldInfo segFieldInfo;
-    fieldReader.readFieldInfo(segFieldInfo);
-    // this is a int field for now, so we need to read the value for each doc
-    // and accumulate counts per value.
-    IntColReader intColReader(poolGuard.pool(), postingsReader, segFieldInfo);
-    IntColReader::Iterator intColIter(intColReader);
-    for (int32_t docid = 0; docid < matches.size(); docid++) {
-      if (!matches[docid]) {
-        continue;
-      }
-      if (intColIter.docId() < docid ) {
-        intColIter.advance(docid);
-      }
-      if (intColIter.docId() == docid) {
-        if (!intColReader.multiValued()) {
-          auto val = intColIter.value();
-          count[val]++;
-        } else {
-          auto [start, end] = intColReader.getStartEndRank(intColIter.rank());
-          auto n = end - start;
-          for (int64_t vrank = 0; vrank < n; vrank++) {
-            auto val = intColIter.values().valueAt(start + vrank);
-            count[val]++;
-          }
-        }
-      } else {
-        missing_num++;
-      }
-    }
-    auto* mergeableData = countMerger.obtain();
+    PostingsReader& postingsReader = reader.segments()[segnum].postingsReader();
+    auto poolGuard = MemPool::threadLocalPoolGuard();
+
+    std::unique_ptr<MergeableStrFacet> mergeableData(countMerger.obtain());
     mergeableData->missing_num += missing_num;
     TermsEnum tenum(poolGuard.pool(), postingsReader, segFieldInfo);
     for (auto [ord, count] : count) {
@@ -240,7 +218,7 @@ public:
       std::string_view termView = (std::string_view) tenum.term();
       mergeableData->counts[std::string(termView)] += count;
     }
-    countMerger.release(mergeableData);
+    countMerger.release(mergeableData.release());
   }
 
   void facetResult(solux::proto::FacetResult& facetResultProto) override {
@@ -297,51 +275,13 @@ public:
 
   void facetSeg(FacetDomain& domain, int32_t segnum) override {
     std::vector<bool>& matches = domain.allMatches[segnum].docs;
-    auto* mergeableData = countMerger.obtain();
-    boost::unordered_flat_map<int64_t, int64_t>& count = mergeableData->counts;
-    auto& postingsReader = reader.segments()[segnum].postingsReader();
-    auto poolGuard = MemPool::threadLocalPoolGuard();
-    FieldReader fieldReader(poolGuard.pool(), postingsReader);
-    bool found = fieldReader.seek(fieldName);
-    if (!found) {
-      mergeableData->missing_num += std::count(matches.begin(), matches.end(), true);
-      countMerger.release(mergeableData);
-      return;
-    }
+    std::unique_ptr<IntFacetReq::MergeableIntFacet> mergeableData(countMerger.obtain());
     SegFieldInfo segFieldInfo;
-    fieldReader.readFieldInfo(segFieldInfo);
-    // this is a int field for now, so we need to read the value for each doc
-    // and accumulate counts per value.
-    IntColReader intColReader(poolGuard.pool(), postingsReader, segFieldInfo);
-    IntColReader::Iterator intColIter(intColReader);
-    for (int32_t docid = 0; docid < matches.size(); docid++) {
-      if (!matches[docid]) {
-        continue;
-      }
-      if (intColIter.docId() < docid ) {
-        intColIter.advance(docid);
-      }
-      if (intColIter.docId() == docid) {
-        if (!intColReader.multiValued()) {
-          auto val = intColIter.value();
-          if (val >= start && val < end) {
-            count[(val-start)/gap]++;
-          }
-        } else {
-          auto [start, end] = intColReader.getStartEndRank(intColIter.rank());
-          auto n = end - start;
-          for (int64_t vrank = 0; vrank < n; vrank++) {
-            auto val = intColIter.values().valueAt(start + vrank);
-            if (val >= start && val < end) {
-              count[(val-start)/gap]++;
-            }
-          }
-        }
-      } else {
-        mergeableData->missing_num++;
-      }
-    }
-    countMerger.release(mergeableData);
+    boost::unordered_flat_map<int64_t, int64_t>& count = mergeableData->counts;
+    facetSegIntCol(domain, segnum, mergeableData->missing_num, segFieldInfo, [&](int32_t docid, int64_t val) {
+      count[(val-start)/gap]++;
+    });
+    countMerger.release(mergeableData.release());
   }
 
   void facetResult(solux::proto::FacetResult& facetResultProto) override {
