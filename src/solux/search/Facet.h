@@ -26,17 +26,56 @@ protected:
   int64_t minCount; // minimum count for a facet to be included in the result
 public:
   std::string_view facetName;
-  std::vector<boost::unordered_flat_map<int64_t, int64_t>> allCounts;
 
   static FacetReq* createFieldFacetReq(Schema &schema, std::string_view facetName, const proto::FieldFacet& facetReq, google::protobuf::Arena& arena, IndexReader& reader);
 
   FacetReq(IndexReader& reader, std::string_view fieldName, std::string_view facetName, int64_t limit, int64_t minCount, bool missing)
-  : reader(reader), fieldName(fieldName), facetName(facetName), limit(limit), minCount(minCount), missing(missing) {
-    allCounts.resize(reader.segments().size());
-  }
+  : reader(reader), fieldName(fieldName), facetName(facetName), limit(limit), minCount(minCount), missing(missing) {}
   virtual ~FacetReq() = default;
   virtual void facetSeg(FacetDomain& domain, int32_t segnum) = 0; // facet a single segment
   virtual void facetResult(solux::proto::FacetResult& facetResultProto) = 0; // merge all segments and fill in the result proto
+
+  bool facetSegIntCol(FacetDomain& domain, int32_t segnum, int64_t& missing, auto callback) {
+    std::vector<bool>& matches = domain.allMatches[segnum].docs;
+    auto& postingsReader = reader.segments()[segnum].postingsReader();
+    auto poolGuard = MemPool::threadLocalPoolGuard();
+    FieldReader fieldReader(poolGuard.pool(), postingsReader);
+    bool found = fieldReader.seek(fieldName);
+    if (!found) {
+      missing += std::count(matches.begin(), matches.end(), true);
+      return false;
+    }
+    SegFieldInfo segFieldInfo;
+    fieldReader.readFieldInfo(segFieldInfo);
+    // this is a int field for now, so we need to read the value for each doc
+    // and accumulate counts per value.
+    IntColReader intColReader(poolGuard.pool(), postingsReader, segFieldInfo);
+    IntColReader::Iterator intColIter(intColReader);
+    for (int32_t docid = 0; docid < matches.size(); docid++) {
+      if (!matches[docid]) {
+        continue;
+      }
+      if (intColIter.docId() < docid ) {
+        intColIter.advance(docid);
+      }
+      if (intColIter.docId() == docid) {
+        if (!intColReader.multiValued()) {
+          auto val = intColIter.value();
+          callback(docid, val);
+        } else {
+          auto [start, end] = intColReader.getStartEndRank(intColIter.rank());
+          auto n = end - start;
+          for (int64_t vrank = 0; vrank < n; vrank++) {
+            auto val = intColIter.values().valueAt(start + vrank);
+            callback(docid, val);
+          }
+        }
+      } else {
+        missing++;
+      }
+    }
+    return true;
+  }
 };
 
 class IntFacetBaseReq : public FacetReq {
@@ -75,50 +114,13 @@ public:
   IntFacetReq(IndexReader& reader, std::string_view fieldName, std::string_view facetName, int64_t limit, int64_t minCount, bool missing) :
   IntFacetBaseReq(reader, fieldName, facetName, limit, minCount, missing){}
 
-  //TODO: refactor out repeated code
   void facetSeg(FacetDomain& domain, int32_t segnum) override {
-    std::vector<bool>& matches = domain.allMatches[segnum].docs;
-    auto* mergeableData = countMerger.obtain();
+    std::unique_ptr<MergeableIntFacet> mergeableData(countMerger.obtain());
     boost::unordered_flat_map<int64_t, int64_t>& count = mergeableData->counts;
-    auto& postingsReader = reader.segments()[segnum].postingsReader();
-    auto poolGuard = MemPool::threadLocalPoolGuard();
-    FieldReader fieldReader(poolGuard.pool(), postingsReader);
-    bool found = fieldReader.seek(fieldName);
-    if (!found) {
-      mergeableData->missing_num += std::count(matches.begin(), matches.end(), true);
-      countMerger.release(mergeableData);
-      return;
-    }
-    SegFieldInfo segFieldInfo;
-    fieldReader.readFieldInfo(segFieldInfo);
-    // this is a int field for now, so we need to read the value for each doc
-    // and accumulate counts per value.
-    IntColReader intColReader(poolGuard.pool(), postingsReader, segFieldInfo);
-    IntColReader::Iterator intColIter(intColReader);
-    for (int32_t docid = 0; docid < matches.size(); docid++) {
-      if (!matches[docid]) {
-        continue;
-      }
-      if (intColIter.docId() < docid ) {
-        intColIter.advance(docid);
-      }
-      if (intColIter.docId() == docid) {
-        if (!intColReader.multiValued()) {
-          auto val = intColIter.value();
-          count[val]++;
-        } else {
-          auto [start, end] = intColReader.getStartEndRank(intColIter.rank());
-          auto n = end - start;
-          for (int64_t vrank = 0; vrank < n; vrank++) {
-            auto val = intColIter.values().valueAt(start + vrank);
-            count[val]++;
-          }
-        }
-      } else {
-        mergeableData->missing_num++;
-      }
-    }
-    countMerger.release(mergeableData);
+    facetSegIntCol(domain, segnum, mergeableData->missing_num, [&](int32_t docid, int64_t val) {
+      count[val]++;
+    });
+    countMerger.release(mergeableData.release());
   }
 
   void facetResult(solux::proto::FacetResult& facetResultProto) override {
