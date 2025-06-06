@@ -148,9 +148,6 @@ public:
 
   // TODO: make these thread safe before making flushing or merging multi-threaded.
   void releaseOutputStreams(std::span<OutputStreamPtr> streams) {
-    auto compareBySize = [](const OutputStream* a, const OutputStream* b) {
-      return a->size() < b->size();
-    };
     for (auto& streamPtr : streams) {
       releaseOutputStream(streamPtr.release());
     }
@@ -778,6 +775,7 @@ public:
   DocsWithValWriter(MemPool& pool, PostingsWriter& postingsWriter, PostingsWriter::IndexFieldInfo& fieldInfo)
   : idOutput(postingsWriter.getOutputStream()), docsWriter(pool,*idOutput), postingsWriter(postingsWriter), fieldInfo(fieldInfo)
   {
+    unused(this->postingsWriter);
     // startLoc = idOutput.size();
   }
 

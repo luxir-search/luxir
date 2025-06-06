@@ -20,8 +20,8 @@ static void BM_BitSet(benchmark::State& state, int32_t blocks, bool getRank) {
   const auto& encoded = ss.str();
   screaming::BitSet bs(&encoded[0] + encoded.size());
 
-  int64_t ret;
-  int64_t count;
+  int64_t ret = 0;
+  int64_t count = 0;
   for (auto _ : state) {
     ret = 0;
     count = 0;

@@ -123,6 +123,7 @@ public:
 
     bool success = writer->submitUpdate(&updateMessage);
     assert(success);
+    unused(success);
 
     updateMessage.blocker.wait();
   }
@@ -163,6 +164,7 @@ public:
     updateMessage->callback = std::move(callback);
     auto success = writer->submitUpdate(updateMessage);
     assert(success);
+    unused(success);
   }
 
   /// Removes all data in the collection.

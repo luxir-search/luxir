@@ -33,13 +33,14 @@ public:
 TEST_F(AtomicMergerTest, basic) {
   // auto count = 100'000'000;
   auto count = 1000;
-  auto requestsPerThread = count / std::thread::hardware_concurrency();
+  auto requestsPerThread = count / (int)std::thread::hardware_concurrency();
   count = requestsPerThread * std::thread::hardware_concurrency(); // round down to a multiple of threads
   std::atomic<int64_t> largestValue(0);
 
   // spin up a number of threads to test the AtomicMerger
   std::vector<std::thread> threads;
-  for (int i = 0; i < std::thread::hardware_concurrency(); ++i) {
+  int nThreads = (int)std::thread::hardware_concurrency();
+  for (int i = 0; i < nThreads; ++i) {
     threads.emplace_back([this, requestsPerThread, &largestValue] {
       int64_t num = 0;
       for (int j = 0; j < requestsPerThread; ++j) {

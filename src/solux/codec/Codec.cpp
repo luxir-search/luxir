@@ -166,6 +166,7 @@ void SoluxPFORd::encodeBlock(uint32_t* in, uint32_t inSz, char* out, uint32_t& o
   return encBlock(in, inSz, out, outSz);
 }
 
+#ifdef CURRENTLY_FOR_REFERENCE_ONLY
 // modified version of SIMDFastPFor::__decodeArray that just puts our bitpacker on the stack.
 // void __decodeArray(SoluxBitPacker& bpacker, uint32_t *in, size_t &length, uint32_t *out,   // could also pass in bpacker from thread-local instance
 static void __decodeArray(uint32_t *in, size_t &length, uint32_t *out, const size_t nvalue) {
@@ -224,6 +225,7 @@ constexpr auto arraydispatch = true;  // doesn't seem to matter much.
 
   assert(in == headerin + wheremeta);
 }
+#endif // current for reference only
 
 // modified version of __decodeArray where nvalue == BlockSize.
 // this allowed us to get rid of unpackpointers

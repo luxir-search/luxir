@@ -76,7 +76,7 @@ TEST_F(SearchEngineTest, basic) {
     facet8.set_gap(20);
 
     lreq->engine.submit(*lreq, para);
-    LOG_DEBUG("ENGINE REQ: {}", lreq->toString());
+    // LOG_DEBUG("ENGINE REQ: {}", lreq->toString());
 
     ASSERT_EQ(lreq->proto.request_id(), lreq->responses[0]->proto.request_id());
     auto& docs = lreq->responses[0]->proto.ops().at("q").docs();
@@ -195,6 +195,7 @@ TEST_F(SearchEngineTest, basic) {
     topDocs.mutable_fields()->Add("color_s");
     topDocs.mutable_fields()->Add("colors_ss");
     auto ncols = topDocs.fields().size() + 1; // +1 for _score_
+    unused(ncols);
 
     auto& facet = *ops["f"].mutable_field_facet();
     facet.set_field("foo_i");

@@ -4,7 +4,7 @@
 
 namespace solux {
 
-
+SOLUX_PACKED_START
 class segdoc {
   int32_t docid;  // docid must be first. It forms the lowest bits of a little-endian int64_t.
   int32_t seg;
@@ -24,7 +24,7 @@ public:
     // compare both segment and docid with a single comparison.
     return reinterpret_cast<const int64_t &>(*this) <=> reinterpret_cast<const int64_t &>(other);
   }
-};
+} SOLUX_PACKED_END;
 
 
 
@@ -258,6 +258,7 @@ public:
 
   // merge other into this.
   void merge(TopDocsCollector& other) {
+    unused(other);
     /*
      * not implemented yet.
      */

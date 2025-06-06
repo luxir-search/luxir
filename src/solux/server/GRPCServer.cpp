@@ -696,7 +696,7 @@ public:
         // reference anything in this Update instance.
         auto* p = parent;
         parent->respond(response,
-                      [p](auto* response) { releaseArena(response->GetArena()); },
+                      [p](auto* response) { unused(p); releaseArena(response->GetArena()); },
                       1);
         delete this; // TODO arena allocate this
       }

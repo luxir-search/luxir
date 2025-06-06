@@ -189,7 +189,7 @@ public:
 
     void collect(int32_t segnum) {
       MergeableCollector* data = nullptr;
-      auto numSegs = req.reader->segments().size();
+      int64_t numSegs = (int64_t)req.reader->segments().size();
 
       {
         auto poolGuard = MemPool::threadLocalPoolGuard();
@@ -318,6 +318,8 @@ public:
           queryReqs.push_back(qr);
         } // end case
           break;
+        default:
+          break; // we only care about query ops for this pass.
       } // end switch
     } // end for ever searchOp
 
@@ -409,6 +411,7 @@ public:
     auto& collector = mergeableCollector->collector;
     collector.sort();
     auto numCollected = collector.size();
+    unused(numCollected);
     int32_t maxBatchSize = qr.topDocsProto->batch_size();
     if (maxBatchSize <= 0) {
       maxBatchSize = 10;  // what should the default be?
@@ -572,13 +575,12 @@ public:
       auto& intCol = *fieldCol.mutable_multi_i();
       auto& arrArrProto = *intCol.mutable_v();  // v is a repeated ArrInt
       arrArrProto.Reserve(columnSize);
-      for (int i = 0; i < columnSize; i++) {
+      for (auto i = 0u; i < columnSize; i++) {
         arrArrProto.Add();
       }
       // arrArrProto is implemented as a vector<ArrInt*> under the covers (RepeatedPtrField), so our span
       // should be of pointers.
       solux::proto::ArrInt** arrstart = arrArrProto.mutable_data();
-      auto** arrEnd = arrstart + columnSize;
       assert(&arrArrProto.Get(columnSize-1) == arrstart[columnSize-1]); // sanity check that arr is actually contiguous.
       mtarget = {arrstart, columnSize};
     }
@@ -589,6 +591,7 @@ public:
       // capture by-value parameters by-value again since this method will return before the lambda is executed.
       // Don't specify a default capture, going across task boundaries should be very explicit.
       task_group_run(tg, [this, idxSpan, &req, field, &fieldType, &segDocs, starget, mtarget]() {
+        unused(this);
         // a view of the segdocs for a single segment, in ascending order.
         auto sortedSegDocs = idxSpan | std::views::transform([&segDocs](auto idx) { return segDocs[idx]; });
         auto segNum = sortedSegDocs[0].segment();
@@ -650,7 +653,7 @@ public:
       stringsProto.Reserve(columnSize);
       std::string missingVal;
       // under the covers, the vector contains pointers, not elements (i.e. vector<std::string*>)
-      for (int i = 0; i < columnSize; i++) {
+      for (auto i = 0u; i < columnSize; i++) {
         stringsProto.Add("");
       }
       auto* arrstart = stringsProto.mutable_data();
@@ -660,13 +663,12 @@ public:
       auto& strCol = *fieldCol.mutable_multi_s();
       auto& arrArrProto = *strCol.mutable_v();  // v is a repeated ArrStr
       arrArrProto.Reserve(columnSize);
-      for (int i = 0; i < columnSize; i++) {
+      for (auto i = 0u; i < columnSize; i++) {
         arrArrProto.Add();
       }
       // arrArrProto is implemented as a vector<ArrStr*> under the covers (RepeatedPtrField), so our span
       // should be of pointers.
       solux::proto::ArrStr** arrstart = arrArrProto.mutable_data();
-      auto** arrEnd = arrstart + columnSize;
       assert(&arrArrProto.Get(columnSize-1) == arrstart[columnSize-1]); // sanity check that arr is actually contiguous.
       mtarget = {arrstart, columnSize};
     }

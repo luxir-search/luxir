@@ -23,6 +23,7 @@ class Shard {
 
 public:
   explicit Shard(Collection& collection) : collection(collection) {
+    unused(this->collection);
     // dir = std::make_shared<RAMDir>();
     // iw = std::make_shared<IndexWriter>(*dir);
   }

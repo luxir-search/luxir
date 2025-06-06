@@ -57,8 +57,10 @@ public:
           for (int i = 0; i < nsegs; i++) {
             uint64_t segId = segmentsIs.readVlong();
             int32_t nDocs = segmentsIs.readVint();
+            unused(nDocs);
             segs.emplace_back(std::make_shared<PostingsReader>(dir, segId), maxdoc, i);
             maxdoc += segs.back().postingsReader().numDocs();
+            assert(nDocs == segs.back().postingsReader().numDocs());
           }
         } catch (std::filesystem::filesystem_error& e) {
           // if this is the second time we've tried this same commit point, then throw the exception
@@ -95,7 +97,7 @@ public:
 private:
   std::vector<Segment> segs;
   int64_t maxdoc = 0;
-  int64_t commitTimeUs = 0;
+  uint64_t commitTimeUs = 0;
 };
 
 }

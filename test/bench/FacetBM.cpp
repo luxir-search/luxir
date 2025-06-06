@@ -10,6 +10,7 @@ using namespace solux::test;
 
 
 static void buildIndex(CollectionHelper& helper, int64_t nDocs, std::span<const int32_t> docsPerSeg) {
+  unused(nDocs);
   helper.clear();
 
 #ifdef REMOVED

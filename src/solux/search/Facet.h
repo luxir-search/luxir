@@ -22,22 +22,33 @@ protected:
   IndexReader& reader;
   std::string_view fieldName;
   int64_t limit;
-  bool missing;
   int64_t minCount; // minimum count for a facet to be included in the result
+  bool missing;
+
 public:
   std::string_view facetName;
 
   static FacetReq* createFieldFacetReq(Schema &schema, std::string_view facetName, const proto::FieldFacet& facetReq, google::protobuf::Arena& arena, IndexReader& reader);
 
   FacetReq(IndexReader& reader, std::string_view fieldName, std::string_view facetName, int64_t limit, int64_t minCount, bool missing)
-  : reader(reader), fieldName(fieldName), facetName(facetName), limit(limit), minCount(minCount), missing(missing) {}
+  : reader(reader), fieldName(fieldName),  limit(limit), minCount(minCount), missing(missing), facetName(facetName) {}
   virtual ~FacetReq() = default;
+
+  /// Facet over the given domain for a single segment.
+  /// This is called in parallel for multiple segments.
   virtual void facetSeg(FacetDomain& domain, int32_t segnum) = 0; // facet a single segment
+
+  ///  Fills in the facet result proto after all segments have been faceted.
   virtual void facetResult(solux::proto::FacetResult& facetResultProto) = 0; // merge all segments and fill in the result proto
 
-  //
-  // missing and segFieldInfo are out parameters that only are filled in if true is returned
-  bool facetSegIntCol(FacetDomain& domain, int32_t segnum, int64_t& missing, SegFieldInfo& segFieldInfo, auto callback) {
+protected:
+
+  // utility template method that calls callback with (int32 docid, int64_t value) for each doc in the domain that has
+  // a value in the int column field (single or multi-valued).
+  // missing is an out parameter that is incremented for every domain doc that does not have the field.
+  // segFieldInfo is passed in uninitializsed and filled in if the field exists in the segment.
+  // The value returned is if the field exists in the segment.
+  bool facetSegIntCol(FacetDomain& domain, int32_t segnum, int64_t& missing, SegFieldInfo& segFieldInfo, auto&& callback) {
     std::vector<bool>& matches = domain.allMatches[segnum].docs;
     auto& postingsReader = reader.segments()[segnum].postingsReader();
     auto poolGuard = MemPool::threadLocalPoolGuard();
@@ -52,7 +63,7 @@ public:
     // and accumulate counts per value.
     IntColReader intColReader(poolGuard.pool(), postingsReader, segFieldInfo);
     IntColReader::Iterator intColIter(intColReader);
-    for (int32_t docid = 0; docid < matches.size(); docid++) {
+    for (int32_t docid = 0; docid < (int32_t)matches.size(); docid++) {
       if (!matches[docid]) {
         continue;
       }
@@ -120,6 +131,7 @@ public:
     boost::unordered_flat_map<int64_t, int64_t>& count = mergeableData->counts;
     SegFieldInfo segFieldInfo;
     facetSegIntCol(domain, segnum, mergeableData->missing_num, segFieldInfo, [&](int32_t docid, int64_t val) {
+      unused(docid);
       count[val]++;
     });
     countMerger.release(mergeableData.release());
@@ -142,7 +154,7 @@ public:
       }
       return a.first < b.first;
     });
-    if (limit >= 0 && limit < countVec.size()) {
+    if (limit >= 0 && limit < (int64_t)countVec.size()) {
       countVec.resize(limit);
     }
 
@@ -196,7 +208,10 @@ public:
     boost::unordered_flat_map<int64_t, int64_t> count;
     int64_t missing_num = 0;
     facetSegIntCol(domain, segnum, missing_num, segFieldInfo,
-      [&](int32_t docid, int64_t val) {count[val]++;});
+      [&](int32_t docid, int64_t val) {
+        unused(docid);
+        count[val]++;
+      });
 
     if (count.empty()) {
       // no values found, so we can just return
@@ -239,7 +254,7 @@ public:
       }
       return a.first < b.first;
     });
-    if (limit >= 0 && limit < countVec.size()) {
+    if (limit >= 0 && limit < (int64_t)countVec.size()) {
       countVec.resize(limit);
     }
 
@@ -274,11 +289,11 @@ public:
   virtual ~IntFacetRangeReq() = default;
 
   void facetSeg(FacetDomain& domain, int32_t segnum) override {
-    std::vector<bool>& matches = domain.allMatches[segnum].docs;
     std::unique_ptr<IntFacetReq::MergeableIntFacet> mergeableData(countMerger.obtain());
     SegFieldInfo segFieldInfo;
     boost::unordered_flat_map<int64_t, int64_t>& count = mergeableData->counts;
     facetSegIntCol(domain, segnum, mergeableData->missing_num, segFieldInfo, [&](int32_t docid, int64_t val) {
+      unused(docid);
       count[(val-start)/gap]++;
     });
     countMerger.release(mergeableData.release());
@@ -298,7 +313,7 @@ public:
     std::sort(countVec.begin(), countVec.end(), [](auto& a, auto& b) {
       return a.first < b.first;
     });
-    if (limit >= 0 && limit < countVec.size()) {
+    if (limit >= 0 && limit < (int64_t)countVec.size()) {
       countVec.resize(limit);
     }
 

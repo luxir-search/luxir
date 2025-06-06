@@ -34,7 +34,7 @@ public:
   // This class allocates from the pool but does not do any visible rollbacks.
   IntColWriter(MemPool& pool, PostingsWriter& postingsWriter, PostingsWriter::IndexFieldInfo& fieldInfo)
           : postingsWriter(postingsWriter), fieldInfo(fieldInfo), holder(postingsWriter.getOutputStream()), colOutput(*holder) {
-    unused(pool);
+    unused(pool, this->postingsWriter);
     colStart = colOutput.size();
   }
 
