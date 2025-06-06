@@ -240,6 +240,31 @@ public:
     }
   }
 
+  //
+  // returns true if the current index matches the shape of the given docsPerSeg.
+  // This is for the purpose of reusing the index from the previous benchmark / test.
+  //
+  bool indexMatchesShape(std::span<const int32_t> docsPerSeg) {
+    // See if we can reuse the index from the previous benchmark.
+    auto iw = getIndexWriter();
+
+    // get the IndexReader
+    auto reader = iw->getIndexReader();
+    auto readerSegs = reader->segments().size();
+    bool reuseIndex = readerSegs == docsPerSeg.size();
+    // check each segment size
+    if (reuseIndex) {
+      for (size_t i=0; i<docsPerSeg.size(); i++) {
+        auto& seg = reader->segments()[i];
+        if (seg.postingsReader().numDocs() != docsPerSeg[i]) {
+          reuseIndex = false;
+          break;
+        }
+      }
+    }
+    return reuseIndex;
+  }
+
 };
 
 
