@@ -25,9 +25,8 @@ public:
   // inverter->updateMessage, among other things.
   uint32_t leftToFlush = 0;  // internal use only
 
-  std::deque<Inverter::DeletesData> deletesList;  // deletes that need to be applied to all segments.
+  MultiDeletesData multiDeletesData;  // the deletes data for this commit, if any.  This is moved from the Inverter when the segment is flushed.
 };
-
 
 // An update message to be processed by the TBB update flow graph.
 // See ProtoUpdateMessage.h/cpp for protobuf update handling code

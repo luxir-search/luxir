@@ -12,9 +12,9 @@
 #include "OrdColWriter.h"
 
 // so IndexHandler can consume protobuf types
+#include "DeletesData.h"
 #include "protos/solux_types.pb.h"
 #include "OrdCollector.h"
-
 
 namespace solux {
 
@@ -46,17 +46,7 @@ public:
   // The lowest update number that this inverter is part of. Managed by the IndexWriter.
   uint64_t lowestUpdateNum = 0;
 
-  class DeletesData {
-  public:
-    // FUTURE OPT: use a separate MemPool for the "id" field to avoid copying the id string in order to
-    // transfer it to SegInfo and outlive this Inverter's lifetime.  Explicit deletes could also
-    // go in that pool.  std::string is too big for this anyway (heap allocation aside)
-    // Could make a stream API for Arena that is shared for all inverters that will be part of a commit.
-    std::vector<std::string> deletedIds;
-    std::vector<int64_t> deletedVersions;  // the versions of the Ids in the deletedIds field.  Could delta encode.
-  };
-
-  DeletesData deletesData;
+  std::unique_ptr<DeletesData> deletesData;
 
 
   Inverter(solux::Directory& dir, uint64_t segId, const std::function<std::shared_ptr<Schema>()>& schemaProvider = {}) : postingsWriter(dir, segId) {
@@ -71,14 +61,16 @@ public:
   PostingsWriter& getPostingsWriter() { return postingsWriter; }
 
   bool hasDeletions() {
-    return deletesData.deletedIds.size() > 0;
+    return deletesData.get() != nullptr;
   }
 
   // deletes are remembered for now and applied when the segment is flushed.
   // the version passed should be the version from the UpdateMessage sequence.
-  void deleteId(std::string_view id, int64_t version) {
-    deletesData.deletedIds.emplace_back(id);
-    deletesData.deletedVersions.emplace_back(version);
+  void deleteId(std::string_view id, uint64_t version) {
+    if (deletesData == nullptr) {
+      deletesData = std::make_unique<DeletesData>();
+    }
+    deletesData.get()->deleteId(id, version);
   }
 
   /// This is what clients should call to index the fields of a document.

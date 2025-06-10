@@ -54,12 +54,15 @@ public:
   class SegInfo {
   public:
     uint64_t segId;
-    uint64_t deletesVersion = 0;  // the latest version of the deletes that this segment contains, or 0 if no deletes.
+    int32_t nDocs;
+    int32_t mergeLevel = -1;
+    uint64_t deletesGen = 0;  // the latest version of the deletes that this segment contains, or 0 if no deletes.
+    uint64_t mergedDeletesGen = 0;  // if this segment was merged into another, what deletesVersion was used.
+    uint64_t mergedIntoSegId = 0;  // segId of the segment this segment was merged into.
     uint64_t commitTime = 0;  // earliest commit this segment was part of.
     // write segment info (size,docs) segments file as well so we don't have to open the segment to determine it?
     int64_t sizeInBytes = 0;
-    int32_t nDocs;
-    int32_t mergeLevel = -1;
+
     bool merging = false;  // set to true when a merge is in progress with this segment as input.
 
     // Set to true when this segment is being removed from the index. The reason it's not just immediately
@@ -74,10 +77,18 @@ public:
     // info about the min and max versions of documents in this segment, derived from the update message sequence number.
     // this can help us determine if we can skip applying deletes to this segment from another segment.
     uint64_t minVersion = 0;
-    uint64_t maxVersion = 0;
-    Inverter::DeletesData deletesData;  // the deletes data for this segment, if any.  This is set by the Inverter when the segment is flushed.
+    uint64_t maxVersion = 0;  // do we use maxVersion?
+
+    // "personal" deletes to be applied to this segment.  Only used to catch up when merging was happening concurrently
+    // with applying deletions and hence they could not be applied to this segment yet.  See finishCommitBody()
+    // where deletes are applied.  This is a shared_ptr because multiple merges may have been done that need to
+    // apply deletes.  We don't really need the thread safety of shared_ptr, could switch to boost::intrusive_ptr
+    // for straight ref counting.
+    std::vector<std::shared_ptr<MultiDeletesData>> personalDeletes;
 
     SegInfo(uint64_t segId, int nDocs) : segId(segId), nDocs(nDocs) {}
+
+
   };
 
 
@@ -569,7 +580,12 @@ private:
         }
       }
 
-      // TODO: move deletes from the inverter to the relevant commit info.
+      // move any deletes from the inverter to the relevant commit info.
+      if (inverter.hasDeletions()) {
+        CommitInfo& commitInfo = inverter.commitInfo ? *inverter.commitInfo : *nextCommitInfo;
+        INDEX_DEBUG("segmentFlushBody: inverter={} moving deletes to commitInfo={}", (void*)&inverter, (void*)&commitInfo);
+        commitInfo.multiDeletesData.deletesData.emplace_back(std::move(inverter.deletesData));
+      }
 
       // Check if we should merge anything.
       // We do this with the lock held since segInfo could go away otherwise.
@@ -586,21 +602,134 @@ private:
     // the inverter (inverterPtr) should go out of scope and be deleted at this point
   }
 
+  // This applies deletes and writes out the new segments file.
   // called from the commitFinishNode which has concurrency==1 (single-threaded)
   void finishCommitBody(UpdateMessage& msg) {
     INDEX_DEBUG("finishCommitBody: msg={}", (void*)&msg);
     // TODO: if nothing actually changed, we could skip writing a new commit at this point.
 
     // Apply deletes from all segments that were part of this commit to all segments in the index.
-    // This must be mutually exclusive with segment merging.  Segment merging should also not
-    // be allowed to merge a segment with deletes to apply.
-    // TODO: I need to move this seg deletion code up before maybeMergeSegments() is called?
+    // This must be mutually exclusive with segment merging, or we must do some form of optimistic concurrency.
+
+    // Optimistic concurrency for deletes strategy:
+    // 1. With index lock held: grab list of all segments and mark them as being part of a commit.  This will
+    //    prevent the SegmentInfo from being deleted.
+    // 2. Apply deletes to all of the snapshot segments.
+    // 3. Write the segments file with the snapshot.
+    // 4. With index lock held: check if any new segments were created by merging.  If so, it's our job
+    //    to apply deletes to those segments as well.  If any of the segments in our snapshot are marked
+    //    as being merged, then signal the segmentMerger to transfer the deletes to those new segments.
+    //    NOTE: both conditions could be true, some segments merged, some segments in process of being merged.
+    //    NOTE: instead of applying deletes to the new segments, we could just wait for the
+    //          next commit (which will use that new segment) to apply the deletes attached to it.
+
+    // THOUGHT: what if a segment with personal deletes is merged?  Need to merge the personal deletes
+    // of all segments as well?  Or else segment merger needs to handle that.  The latter would get
+    // rid of the personal deletes faster, but would mean that it could be concurrent with applying deletes
+    // in finishCommitBody().
 
 
-    writeIndexInfoFile();
+    // TODO: segmentMerger sends a message with no commit info currently....
+    auto maxDeleteVersion = msg.commitInfo == nullptr ? 0 : msg.commitInfo->multiDeletesData.getLargestVersion();
+
+    std::vector<SegInfo*> segs;
+    std::vector<SegInfo*> segsWithPersonalDeletes;
+    std::vector<SegInfo*> segsToApplyDeletes;
+
+    {
+      const std::lock_guard<std::mutex> lock(indexMutex);
+      segs.reserve(segInfos.size());
+      // grab all segments and mark them as being part of a commit.
+      for (auto& [segId, seg] : segInfos) {
+        segs.push_back(seg.get());
+        if (seg->commitTime == 0) {
+          seg->commitTime = 1;  // for marking it in use only... it will be updated later when writing segments file.
+        }
+        if (!seg->personalDeletes.empty()) {
+          // this segment has personal deletes that need to be applied.
+          segsWithPersonalDeletes.push_back(seg.get());
+        }
+        if (seg->minVersion < maxDeleteVersion) {
+          // this segment has deletes that need to be applied.
+          segsToApplyDeletes.push_back(seg.get());
+        }
+      }
+    }
+
+    // TODO: segmentMerger sends a message with no commit info currently....
+    if (msg.commitInfo) {
+      CommitInfo& commitInfo = *msg.commitInfo;
+      if (commitInfo.multiDeletesData.empty()) {
+        INDEX_DEBUG("finishCommitBody: msg={} no deletes to apply.", (void*)&msg);
+      } else {
+        INDEX_DEBUG("finishCommitBody: msg={} applying deletes to {} segments.", (void*)&msg, segs.size());
+
+        // TODO: parallelize this.
+        for (auto seg : segsToApplyDeletes) {
+          applyDeletes(*seg, commitInfo.multiDeletesData);
+        }
+      }
+    }
+
+    // now check if any of the segments were merged without necessary deletes applied.
+    {
+      const std::lock_guard<std::mutex> lock(indexMutex);
+      bool mergedOldVersion = false;
+
+
+      // check if any segments were merged that need deletes applied.
+      for (auto& seg : segs) {
+        if (seg->mergedDeletesGen != 0 && seg->mergedDeletesGen != seg->deletesGen) {
+          // we changed the deletesVersion of the segment, but an older one was merged.
+          // that new segment could also have been merged, so we need to go through all of the
+          // segments and see if the deletes on this commit might apply to it.
+          // this segment was merged, so we need to apply deletes to it.
+          INDEX_DEBUG("finishCommitBody: msg={} segment {} was merged with old deletes.", (void*)&msg, seg->segId);
+          mergedOldVersion = true;
+          break;
+        }
+      }
+
+      if (mergedOldVersion) {
+        // add personal deletes to all new segments that could be applicable.
+        // first make a shared_ptr and then move the deletes from the commit info to it.
+        CommitInfo& commitInfo = *msg.commitInfo;
+
+        std::shared_ptr<MultiDeletesData> multiDeletesDataPtr = std::make_shared<MultiDeletesData>();
+        *multiDeletesDataPtr = std::move(commitInfo.multiDeletesData);
+
+        // now add these deletes to any new applicable segments
+        auto numSegmentsMissingDeletes = 0;  // sanity check - we should find some.
+
+        // Check the up-to-date segments.
+        for (auto& [segId, seg] : segInfos) {
+          if (seg->minVersion < maxDeleteVersion) {
+            // this segment has deletes that need to be applied, so append to it's personal deletes.
+            INDEX_DEBUG("finishCommitBody: msg={} segment {} adding personal deletes", (void*)&msg, segId);
+            numSegmentsMissingDeletes++;
+            seg->personalDeletes.push_back(multiDeletesDataPtr);  // copy the shared_ptr
+          }
+        }
+
+        if (numSegmentsMissingDeletes == 0) {
+          LOG_ERROR("Internal Error, a segment was merged with old deletes, but no merged segments were found that needed deletes applied.");
+        }
+      }
+    }  // end index lock
+
+    // write the segments file with the snapshot of segments we took at the beginning.
+    writeIndexInfoFile(segs);
     msg.done(*this); // don't access msg after this point, it could be deleted.
   }
 
+  void applyDeletes(std::span<SegInfo*> segs, MultiDeletesData& multiDeletesData) {
+    // TODO
+  }
+
+  // apply the given deletes to a segment, in addition to any personal deletes that may be present.
+  void applyDeletes(SegInfo& seg, MultiDeletesData& multiDeletesData) {
+    // TODO
+  }
 
 
 public:
@@ -725,6 +854,63 @@ public:
     updateMessage.blocker.wait();
   }
 
+  // This is only called from the finishCommit node, which has concurrency==1 (single-threaded)
+  // hence we only need to protect against changes in the segInfos map, not multiple invocations of this method.
+  // The passed span of segments may be reordered after this is finished.
+  void writeIndexInfoFile(std::span<SegInfo*> segs) {
+    // We should be able to write the segments file without holding the indexMutex,
+    // as long as we access only fields that should not change.
+
+    auto indexFile = dir.createFile(Postings::INDEX_INFO_FILE);
+    OutputStream indexOut;
+    indexOut.setFile(&*indexFile);
+
+    // get timestamp in microseconds
+    uint64_t now_us = std::chrono::duration_cast<std::chrono::microseconds>(
+      std::chrono::system_clock::now().time_since_epoch()).count();
+    if (now_us <= lastCommitTime) {
+      now_us = lastCommitTime + 1;
+    }
+
+    INDEX_DEBUG("writeIndexInfoFile: now_us={} lastCommitTime={} diff={}", now_us, lastCommitTime.load(), now_us - lastCommitTime.load());
+    uint64_t numDocs = 0;
+    uint64_t numSegs = 0;
+
+    // Sort the list of segments by the segId.
+    // Some tests rely on not reordering segments.
+    std::sort(segs.begin(), segs.end(), [](const SegInfo* a, const SegInfo* b) {
+         /*
+         // first sort on number of documents (largest first), then on segment id (smallest first)
+         if (a->nDocs != b->nDocs) {
+           return a->nDocs > b->nDocs;
+         }
+          */
+         return a->segId < b->segId;
+       });
+
+      indexOut.writeLong(now_us);  // don't use Vlong since this is a big number
+      indexOut.writeVint(segs.size());
+      for (auto seg: segs) {
+        indexOut.writeVlong(seg->segId);
+        indexOut.writeVint(seg->nDocs); // TODO: remove this redundancy in the future?
+        if (seg->commitTime <= 1) {  // keep track of the first commit this segment appeared in.
+          seg->commitTime = now_us;
+        }
+        // TODO FIXME - write out other info: segment minVersion, deletesGen.
+        numDocs += seg->nDocs;
+        INDEX_DEBUG("\tsegId={} nDocs={} commitTime={}", seg->segId, seg->nDocs, seg->commitTime);
+      }
+
+    indexOut.close();
+    dir.finishFile(*indexFile);
+
+    // advertise this commit only after the file is closed.
+    lastCommitTime = now_us;
+    lastAdvertisedCommitTime = now_us;
+
+    INDEX_DEBUG("\twriteIndexInfoFile DONE: commitTime={} numDocs={} numSegs={}", now_us, numDocs, numSegs);
+    unused(numSegs, numDocs);
+  }
 
 
   // This is only called from the finishCommit node, which has concurrency==1 (single-threaded)
@@ -813,6 +999,7 @@ private:
       for (auto& seg: segInfos) {
         if (seg.second->mergeLevel == msg.mergeLevel || msg.maxSegments == 1) {
           segs.push_back(seg.second.get());
+          segs.back()->merging = true;  // mark as being merged - see finishCommitBody
         }
       }
 
@@ -868,6 +1055,9 @@ private:
       PostingsWriter pwriter(dir, ++lastSegId);
       mergeSegments(pool, preaderPtrs, pwriter);
 
+      // Create the new SegInfo for the output segment.
+      auto newSegInfo = std::make_unique<SegInfo>(pwriter.getSegId(), pwriter.getMaxDoc());
+
       // now remove the merged segments from the segInfos and add the new segment.
       // Any removed segments that were not part of a previous commit can be deleted immediately.
       // If segments were part of a previous commit, then we need to write out a new info file *before* removing the index files.
@@ -876,6 +1066,7 @@ private:
       {
         const std::lock_guard<std::mutex> lock(indexMutex);
         for (auto segInfo : segs) {
+          segInfo->mergedIntoSegId = newSegInfo->segId;  // mark the segment as merged into the new segment
           mergePolicy->_remove(segInfo);
           auto it = segInfos.find(segInfo->segId);
           assert(it != segInfos.end());
@@ -888,17 +1079,25 @@ private:
             if (!commitDeleteMsg) {
               commitDeleteMsg = std::make_unique<CommitDeleteMsg>();
             }
+            // This makes it so the SegInfo data structure is also not deleted.
             commitDeleteMsg->removedSegs.emplace_back(std::move(it->second));
           } else {
             toDeleteSegs.emplace_back(std::move(it->second));
           }
 
-          // finally remove the entry from segInfos
+          // if the segment had personal deletes, we need to transfer them to the new segment.
+          if (!segInfo->personalDeletes.empty()) {
+            INDEX_DEBUG("Merging personal deletes from segId={} to newSegId={}", segInfo->segId, newSegInfo->segId);
+            newSegInfo->personalDeletes.insert(newSegInfo->personalDeletes.end(),
+                                               std::make_move_iterator(segInfo->personalDeletes.begin()),
+                                               std::make_move_iterator(segInfo->personalDeletes.end()));
+          }
+
+          // finally remove the old entry from segInfos
           segInfos.erase(it);
         }
 
-        // Create & add the new SegmentInfo
-        auto newSegInfo = std::make_unique<SegInfo>(pwriter.getSegId(), pwriter.getMaxDoc());
+        // add new segInfo to the index
         mergePolicy->_update(newSegInfo.get());
         segInfos.emplace(pwriter.getSegId(), std::move(newSegInfo));
       } // end index lock
