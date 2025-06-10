@@ -21,7 +21,7 @@ namespace solux {
 using std::iter_swap; // for boost string_sort
 
 
-class UpdateMessage;
+class CommitInfo;
 
 class Inverter {
 private:
@@ -29,6 +29,7 @@ private:
   std::vector<int> deleted; // use a docstream for this?
 
   std::function<std::shared_ptr<Schema>()> schemaProvider;
+
 public:
   MemPool pool;
 
@@ -39,11 +40,24 @@ public:
 
   std::shared_ptr<Schema> schema;
 
-  // If the flush of this inverter is part of a commit, then this will point to that update message.
+  // If the flush of this inverter is part of a commit, then this will point to the CommitInfo
   // It is set asynchronously and consumed by the IndexWriter and is not used by the Inverter itself.
-  UpdateMessage* updateMessage = nullptr;
+  CommitInfo* commitInfo = nullptr;
   // The lowest update number that this inverter is part of. Managed by the IndexWriter.
   uint64_t lowestUpdateNum = 0;
+
+  class DeletesData {
+  public:
+    // FUTURE OPT: use a separate MemPool for the "id" field to avoid copying the id string in order to
+    // transfer it to SegInfo and outlive this Inverter's lifetime.  Explicit deletes could also
+    // go in that pool.  std::string is too big for this anyway (heap allocation aside)
+    // Could make a stream API for Arena that is shared for all inverters that will be part of a commit.
+    std::vector<std::string> deletedIds;
+    std::vector<int64_t> deletedVersions;  // the versions of the Ids in the deletedIds field.  Could delta encode.
+  };
+
+  DeletesData deletesData;
+
 
   Inverter(solux::Directory& dir, uint64_t segId, const std::function<std::shared_ptr<Schema>()>& schemaProvider = {}) : postingsWriter(dir, segId) {
     // this is a test schemaProvider for convenience
@@ -56,7 +70,18 @@ public:
 
   PostingsWriter& getPostingsWriter() { return postingsWriter; }
 
+  bool hasDeletions() {
+    return deletesData.deletedIds.size() > 0;
+  }
 
+  // deletes are remembered for now and applied when the segment is flushed.
+  // the version passed should be the version from the UpdateMessage sequence.
+  void deleteId(std::string_view id, int64_t version) {
+    deletesData.deletedIds.emplace_back(id);
+    deletesData.deletedVersions.emplace_back(version);
+  }
+
+  /// This is what clients should call to index the fields of a document.
   class IndexHandler {
     friend Inverter;
 

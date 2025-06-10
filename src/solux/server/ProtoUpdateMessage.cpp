@@ -1,5 +1,5 @@
 #include "ProtoUpdateMessage.h"
-#include "solux/schema/Schema.h"
+#include "solux/index/IndexWriter.h"
 
 namespace solux {
 

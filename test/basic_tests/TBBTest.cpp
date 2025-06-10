@@ -249,7 +249,7 @@ TEST_F(TBBTest, testNoConsumer) {
 #endif
 
 
-void doBlockers(int n) {
+static void doBlockers(int n) {
 
   class MyBlocker : public Blocker {
   public:
@@ -319,4 +319,3 @@ TEST_F(TBBTest, testBlockerStress) {
   });
 }
 #endif
-

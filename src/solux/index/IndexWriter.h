@@ -14,59 +14,13 @@
 #include "solux/server/SoluxError.h"
 #include "Inverter.h"
 #include "PostingsWriter.h"
+#include "UpdateMessage.h"
 
 // redefine DEBUG to TRACE level which shouldn't currently be logged!
 #define INDEX_DEBUG LOG_TRACE
 // #define INDEX_DEBUG LOG_DEBUG
 
 namespace solux {
-
-
-class IndexWriter;
-
-// An update message to be processed by the TBB update flow graph.
-// See ProtoUpdateMessage.h/cpp for protobuf update handling code
-class UpdateMessage {
-public:
-  virtual ~UpdateMessage() {}
-
-  // For now, we will allow the handler to obtain/release an inverter.  We could also optionally pass it
-  // as a param in the future if obtain/release becomes more complex.
-  virtual void handle(IndexWriter& iw) = 0;
-
-  // Called after all operations are complete.  Would typically delete this instance if it was heap allocated.
-  // Consumers of UpdateMessage will not touch it after this call.
-  virtual void done(IndexWriter& iw) = 0;
-
-  // See docs in solux.proto:UpdateRequest
-  // NOTE: These values should be kept in sync with the protobuf definition.
-  enum CommitType {
-    NO_COMMIT = 0,         // the default
-    COMMIT = 1,            // ensure new data is searchable
-    SILENT_COMMIT = 2,     // the commit will be "silent" (won't necessarily cause new searchers to be opened)
-    // CONSISTENT_COMMIT = 3; // FUTURE - ensure distributed searchers will see new data
-  };
-  CommitType commit;
-  int32_t commit_within;  // TODO: implement this
-
-
-  // Filled in by the IndexWriter when the message is received.
-  uint64_t seqNum;                    // The sequence number of this update, used to ensure updates are processed in order when needed
-  uint64_t commitNum;                 // The commit number of this update, used to ensure commits are finished in order
-
-  // Number of segments left to flush, protected by same mutex that protects the inverter lists.
-  // making this an atomic is not enough to avoid race conditions since we also depend on coordination with
-  // inverter->updateMessage, among other things.
-  uint32_t leftToFlush = 0;  // internal use only
-
-  ErrorHolder result;
-};
-
-class MergeMessage : public UpdateMessage {
-public:
-  int32_t mergeLevel = -1;  // Segment level to merge.  -1 means unspecified.
-  int32_t maxSegments = 0;  // Merge down to this number of segments.
-};
 
 
 /// The IndexWriter is a level above Inverter & PostingsWriter that coordinates
@@ -100,6 +54,7 @@ public:
   class SegInfo {
   public:
     uint64_t segId;
+    uint64_t deletesVersion = 0;  // the latest version of the deletes that this segment contains, or 0 if no deletes.
     uint64_t commitTime = 0;  // earliest commit this segment was part of.
     // write segment info (size,docs) segments file as well so we don't have to open the segment to determine it?
     int64_t sizeInBytes = 0;
@@ -115,6 +70,12 @@ public:
     // atomic shared pointer since it could be set / mutated by either the IW (setting or clearing),
     // or by IndexReader opening code.
     std::atomic<std::shared_ptr<PostingsReader>> sharedPostingsReader = nullptr;
+
+    // info about the min and max versions of documents in this segment, derived from the update message sequence number.
+    // this can help us determine if we can skip applying deletes to this segment from another segment.
+    uint64_t minVersion = 0;
+    uint64_t maxVersion = 0;
+    Inverter::DeletesData deletesData;  // the deletes data for this segment, if any.  This is set by the Inverter when the segment is flushed.
 
     SegInfo(uint64_t segId, int nDocs) : segId(segId), nDocs(nDocs) {}
   };
@@ -286,14 +247,15 @@ public:
   std::atomic_uint64_t updateNumber = 0;
   std::atomic_uint64_t commitNumber = 0;
 
+  // commit info for the index, used to track deletes.
+  // This is moved to the UpdateMessage when a commit is processed and a new one is created for the next commit.
+  std::unique_ptr<CommitInfo> nextCommitInfo;
+
   // In an update response, we could return an update number, or a commit number, or even a monotonic time.
   // This would allow a searching client to specify a time to search up to.
   // Time of the last commit (since 1970 epoch) in microseconds. Guaranteed to be strictly increasing.
   std::atomic_uint64_t lastCommitTime;
   std::atomic_uint64_t lastAdvertisedCommitTime;
-
-  // TODO: could also have a single high resolution "timer" that is used to timestamp everything.
-  // set on every update message.  Could be used to version later.
 
   // Goals of the TBB flow graph for updates:
   //   - make sure that a commit waits for all update messages to be processed (in the same stream at least)
@@ -322,6 +284,13 @@ public:
   //
   // Failures:
   //  - if something fails, we need to still flow it through the graph so the sequencers are updated.
+  //
+  // Delete strategy:
+  //  - Each inverter has its own delete queue.
+  //  - When a segment is flushed, it's deletes are moved to the global deletes queue.
+  //  - When a commit happens, the deletes are applied to all segments.
+  //    - applying deletes to segments is mutually exclusive with segment merges.
+
 
   using UpdateMessageFunc = tbb::flow::function_node<UpdateMessage*, UpdateMessage*>;
   using UpdateMessageMultiFunc = tbb::flow::multifunction_node<UpdateMessage*, std::tuple<UpdateMessage*>>;
@@ -354,6 +323,7 @@ public:
 
   explicit IndexWriter(Directory &dir) : dir(dir) {
     mergePolicy = std::make_unique<MergePolicy>(*this);  // defer creation until needed?
+    nextCommitInfo = std::make_unique<CommitInfo>();
     std::shared_ptr<InputFile> segFile = dir.openFile(Postings::INDEX_INFO_FILE);
     if (segFile.get() == nullptr) {
       lastSegId = 0;
@@ -495,23 +465,29 @@ private:
     {
       const std::lock_guard<std::mutex> lock(indexMutex);
 
+      // Grab the global commit info and move it to the UpdateMessage.
+      msg.commitInfo = std::move(nextCommitInfo);
+      nextCommitInfo = std::make_unique<CommitInfo>();
+      auto& commitInfo = *msg.commitInfo;
+      commitInfo.updateMessage = &msg;  // set the update message that triggered this commit
+
       // first look at any flushing inverters that are not marked for a commit yet
       // and mark them if necessary.
       for (auto it = flushingInverters.begin(); it != flushingInverters.end(); it++) {
-        if (it->second->updateMessage == nullptr && it->second->lowestUpdateNum) {
+        if (it->second->commitInfo == nullptr && it->second->lowestUpdateNum) {
           INDEX_DEBUG("\tinitiateCommit: msg={} marking flushing inverter={} for commit", (void*)&msg, (void*)it->second.get());
-          it->second->updateMessage = &msg;
-          msg.leftToFlush++;
+          it->second->commitInfo = &commitInfo;
+          commitInfo.leftToFlush++;
         }
       }
 
       // now look at all idle inverters and initiate a flush if necessary.
       for (auto it = idleInverters.begin(); it != idleInverters.end(); it++) {
         if (it->second->lowestUpdateNum <= msg.seqNum) {
-          if (it->second->updateMessage == nullptr) {
+          if (it->second->commitInfo == nullptr) {
             INDEX_DEBUG("\tinitiateCommit: msg={} marking idle inverter={} for commit", (void*)&msg, (void*)it->second.get());
-            it->second->updateMessage = &msg;
-            msg.leftToFlush++;
+            it->second->commitInfo = &commitInfo;
+            commitInfo.leftToFlush++;
           } else {
             // this would be a bug since we should never have an idle inverter that is part of a commit.
             LOG_ERROR("Idle inverter is part of a commit.");
@@ -527,18 +503,18 @@ private:
 
       // Any inverters that are busy should be marked so that when they are released they can be flushed.
       for (auto it = busyInverters.begin(); it != busyInverters.end(); it++) {
-        if (it->second->updateMessage == nullptr && it->second->lowestUpdateNum <= msg.seqNum) {
+        if (it->second->commitInfo == nullptr && it->second->lowestUpdateNum <= msg.seqNum) {
           INDEX_DEBUG("\tinitiateCommit: msg={} marking busy inverter={} for commit", (void*)&msg, (void*)it->second.get());
-          it->second->updateMessage = &msg;
-          msg.leftToFlush++;
+          it->second->commitInfo = &commitInfo;
+          commitInfo.leftToFlush++;
         }
       }
 
-      INDEX_DEBUG("initiateCommit: msg={} leftToFlush={}", (void*)&msg, msg.leftToFlush);
+      INDEX_DEBUG("initiateCommit: msg={} leftToFlush={}", (void*)&msg, msg.commitInfo->leftToFlush);
 
       // Normally a commit would be kicked off by the last segment flushing.  But if there are no segments to flush,
       // we need to kick it off here.
-      if (msg.leftToFlush == 0) {
+      if (commitInfo.leftToFlush == 0) {
         commitSequencerNode->try_put(&msg);
       }
     } // end mutex protected section
@@ -547,8 +523,8 @@ private:
   // Inverter for the segment should already be in the flushingInverters list.
   // This is called in parallel.
   void segmentFlushBody(Inverter& inverter) {
-    INDEX_DEBUG("segmentFlushBody: inverter={} msg={} msg.leftToFlush={}", (void*)&inverter, (void*)inverter.updateMessage,
-                inverter.updateMessage == nullptr ? -1 : inverter.updateMessage->leftToFlush);
+    INDEX_DEBUG("segmentFlushBody: inverter={} commitInfo={} msg.leftToFlush={}", (void*)&inverter, (void*)inverter.commitInfo,
+                inverter.commitInfo == nullptr ? -1 : inverter.commitInfo->leftToFlush);
 
     bool success;
     try {
@@ -587,11 +563,13 @@ private:
       // The mutex protects against races in the setting of inverter.updateMessage as well as leftToFlush.
       // Higher level logical races protected against would be kicking off a segment flush and then that completing and
       // kicking off a commit before the next segment flush is kicked off.
-      if (inverter.updateMessage != nullptr) {
-        if (--inverter.updateMessage->leftToFlush == 0) {
+      if (inverter.commitInfo != nullptr) {
+        if (--inverter.commitInfo->leftToFlush == 0) {
           triggerCommit = true;
         }
       }
+
+      // TODO: move deletes from the inverter to the relevant commit info.
 
       // Check if we should merge anything.
       // We do this with the lock held since segInfo could go away otherwise.
@@ -602,7 +580,7 @@ private:
 
     // It shouldn't be a big deal to do a try_put inside the sync block, but it's safe to do outside anyway.
     if (triggerCommit) {
-      commitSequencerNode->try_put(inverter.updateMessage);
+      commitSequencerNode->try_put(inverter.commitInfo->updateMessage);
     }
 
     // the inverter (inverterPtr) should go out of scope and be deleted at this point
@@ -612,6 +590,12 @@ private:
   void finishCommitBody(UpdateMessage& msg) {
     INDEX_DEBUG("finishCommitBody: msg={}", (void*)&msg);
     // TODO: if nothing actually changed, we could skip writing a new commit at this point.
+
+    // Apply deletes from all segments that were part of this commit to all segments in the index.
+    // This must be mutually exclusive with segment merging.  Segment merging should also not
+    // be allowed to merge a segment with deletes to apply.
+    // TODO: I need to move this seg deletion code up before maybeMergeSegments() is called?
+
 
     writeIndexInfoFile();
     msg.done(*this); // don't access msg after this point, it could be deleted.
@@ -662,8 +646,8 @@ public:
     // TODO: if the inverter is over a certain size, flush it
 
     // if this inverter is part of a commit, initiate a flush.
-    if (inverter.updateMessage != nullptr) {
-      INDEX_DEBUG("releaseInverter: inverter={} message={} triggering flush.", (void*)&inverter, (void*)inverter.updateMessage);
+    if (inverter.commitInfo != nullptr) {
+      INDEX_DEBUG("releaseInverter: inverter={} message={} triggering flush.", (void*)&inverter, (void*)inverter.commitInfo->updateMessage);
       flushingInverters.emplace(&inverter, std::move(it->second));
       it = busyInverters.erase(it);
       segmentFlushNode->try_put(&inverter);
