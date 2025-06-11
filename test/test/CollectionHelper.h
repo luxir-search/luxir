@@ -19,6 +19,8 @@ private:
         return; // nothing to index, avoid grabbing an inverter.
       }
       auto& inverter = iw.obtainInverter();
+      inverter.updateVersions(this->updateVersion);
+
       for (auto& doc: docs) {
         indexSingle(inverter, doc);
       }

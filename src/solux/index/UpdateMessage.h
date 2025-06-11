@@ -18,12 +18,14 @@ class UpdateMessage;
 class CommitInfo {
 public:
   UpdateMessage* updateMessage = nullptr;  // The update message that triggered this commit.
-  uint64_t commitNum = 0;  // The commit number of this commit, used to ensure commits are finished in order
 
+  // highest update version in this commit, including deletes and the commit message itself.
+  uint64_t highestUpdateVersion = 0;
+  uint64_t indexGen = 0;  // set when the IndexInfo file is written.
   // Number of segments left to flush, protected by same mutex that protects the inverter lists.
   // making this an atomic is not enough to avoid race conditions since we also depend on coordination with
   // inverter->updateMessage, among other things.
-  uint32_t leftToFlush = 0;  // internal use only
+  uint32_t leftToFlush = 0;
 
   MultiDeletesData multiDeletesData;  // the deletes data for this commit, if any.  This is moved from the Inverter when the segment is flushed.
 };
@@ -54,9 +56,9 @@ public:
   int32_t commit_within;  // TODO: implement this
 
 
-  // Filled in by the IndexWriter when the message is received.
-  uint64_t seqNum;                    // The sequence number of this update, used to ensure updates are processed in order when needed
-  uint64_t commitNum;                 // The commit number of this update, used to ensure commits are finished in order
+  /// Filled in by the IndexWriter when the message is received.  Do not change.
+  uint64_t updateVersion;             // The version of this update, used to ensure updates are processed in order when needed
+  uint64_t commitNum;                 // The 0-based commit number of this update, used to ensure commits are finished in order
   std::unique_ptr<CommitInfo> commitInfo;  // Commit info for this update, if any.  This is set by the IndexWriter when the commit is processed.
 
   ErrorHolder result;

@@ -411,3 +411,25 @@ message ColMap {
   repeated Map v = 1;
 }
 
+//
+// Index Management
+//
+
+message IndexInfo {
+  uint64 version = 1;                // Version of the index format
+  uint64 commit_time = 2;            // Commit time of this index (microseconds since epoch)
+  uint64 index_gen = 3;              // Generation of this index (incremented on each commit)
+  uint64 update_version = 4;         // Highest update version in this index (incremented on each update)
+  repeated SegmentInfo segments = 5; // List if segments in this index
+}
+
+// Per segment information
+message SegmentInfo {
+  uint64 seg_id = 1;                    // Unique identifier for the segment
+  uint64 deletes_gen = 2;               // What deletes version to use for the segment (0 if no deletes)
+  uint64 min_version = 3;               // Minimum update version in this segment
+  uint64 max_version = 4;               // Maximum update version in this segment
+  int32  max_doc = 5;                   // Number of documents in this segment (ignoring deletes)
+  int32  deletes = 6;                   // Number of deleted documents in this segment
+}
+

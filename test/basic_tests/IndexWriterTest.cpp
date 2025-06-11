@@ -247,7 +247,7 @@ TEST_F(IndexWriterTest, multiThreaded) {
       std::lock_guard<std::mutex> lock(testMutex);
       for (int i = 0; i < msg.updateRequest.docs_size(); i++) {
         UpdateInfo ui;
-        ui.seqNum = msg.seqNum;
+        ui.seqNum = msg.updateVersion;
         ui.numAdds = msg.updateRequest.docs_size();
         ui.commitType = (byte)msg.commit;
         updates.push_back(ui);

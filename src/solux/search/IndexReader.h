@@ -1,6 +1,9 @@
 #pragma once
 #include <span>
 #include "solux/reader/PostingsReader.h"
+#include "protos/solux_types.pb.h"
+#include <google/protobuf/io/coded_stream.h>
+#include <google/protobuf/io/zero_copy_stream_impl_lite.h>
 
 // redefine DEBUG to TRACE level which shouldn't currently be logged!
 #define IREADER_DEBUG LOG_TRACE
@@ -50,13 +53,24 @@ public:
         try {
           IREADER_DEBUG("Opening IndexReader");
           InputStream segmentsIs = inputFile->getInputStream();
-          commitTimeUs = segmentsIs.readLong();
+          
+          // Read the protobuf message
+          solux::proto::IndexInfo indexInfo;
+          google::protobuf::io::ArrayInputStream arrayStream(segmentsIs.ptr(), segmentsIs.left());
+          google::protobuf::io::CodedInputStream codedStream(&arrayStream);
+          
+          if (!indexInfo.ParseFromCodedStream(&codedStream)) {
+            throw std::runtime_error("Failed to parse IndexInfo protobuf");
+          }
+          
+          commitTimeUs = indexInfo.commit_time();
           IREADER_DEBUG("\tOpening IndexReader, commitTime={}", commitTimeUs);
-          int nsegs = segmentsIs.readVint();
-          segs.reserve(nsegs);
-          for (int i = 0; i < nsegs; i++) {
-            uint64_t segId = segmentsIs.readVlong();
-            int32_t nDocs = segmentsIs.readVint();
+          
+          segs.reserve(indexInfo.segments_size());
+          for (int i = 0; i < indexInfo.segments_size(); i++) {
+            const auto& segment = indexInfo.segments(i);
+            uint64_t segId = segment.seg_id();
+            int32_t nDocs = segment.max_doc();
             unused(nDocs);
             segs.emplace_back(std::make_shared<PostingsReader>(dir, segId), maxdoc, i);
             maxdoc += segs.back().postingsReader().numDocs();
@@ -86,7 +100,7 @@ public:
     return commitTimeUs;
   }
 
-  const std::span<Segment> segments() noexcept {
+  std::span<Segment> segments() noexcept {
     return segs;
   }
 

@@ -15,6 +15,9 @@
 #include "Inverter.h"
 #include "PostingsWriter.h"
 #include "UpdateMessage.h"
+#include "protos/solux_types.pb.h"
+#include <google/protobuf/io/coded_stream.h>
+#include <google/protobuf/io/zero_copy_stream_impl_lite.h>
 
 // redefine DEBUG to TRACE level which shouldn't currently be logged!
 #define INDEX_DEBUG LOG_TRACE
@@ -54,21 +57,18 @@ public:
   class SegInfo {
   public:
     uint64_t segId;
-    int32_t nDocs;
-    int32_t mergeLevel = -1;
+    int32_t maxDoc;            // one-past-highest-doc (doesn't count deletes)
+    int32_t deletes = 0;      // number of deletes in latest deletesGen.
+    int32_t mergeLevel = -1;  // maintained by the MergePolicy.
     uint64_t deletesGen = 0;  // the latest version of the deletes that this segment contains, or 0 if no deletes.
     uint64_t mergedDeletesGen = 0;  // if this segment was merged into another, what deletesVersion was used.
     uint64_t mergedIntoSegId = 0;  // segId of the segment this segment was merged into.
-    uint64_t commitTime = 0;  // earliest commit this segment was part of.
+    uint64_t commitTime = 0;  // time when this segment was first committed as part of the index.
     // write segment info (size,docs) segments file as well so we don't have to open the segment to determine it?
     int64_t sizeInBytes = 0;
 
     bool merging = false;  // set to true when a merge is in progress with this segment as input.
 
-    // Set to true when this segment is being removed from the index. The reason it's not just immediately
-    // removed is that if it was part of a published commit, we need to keep it around until the next commit.
-    // It should not count as a segment for merge purposes.
-    bool beingRemoved = false;
 
     // atomic shared pointer since it could be set / mutated by either the IW (setting or clearing),
     // or by IndexReader opening code.
@@ -77,7 +77,7 @@ public:
     // info about the min and max versions of documents in this segment, derived from the update message sequence number.
     // this can help us determine if we can skip applying deletes to this segment from another segment.
     uint64_t minVersion = 0;
-    uint64_t maxVersion = 0;  // do we use maxVersion?
+    uint64_t maxVersion = 0;
 
     // "personal" deletes to be applied to this segment.  Only used to catch up when merging was happening concurrently
     // with applying deletions and hence they could not be applied to this segment yet.  See finishCommitBody()
@@ -86,7 +86,7 @@ public:
     // for straight ref counting.
     std::vector<std::shared_ptr<MultiDeletesData>> personalDeletes;
 
-    SegInfo(uint64_t segId, int nDocs) : segId(segId), nDocs(nDocs) {}
+    SegInfo(uint64_t segId, int nDocs) : segId(segId), maxDoc(nDocs) {}
 
 
   };
@@ -132,19 +132,6 @@ public:
     }
 
     void _sanityCheck() {
-
-#ifdef REMOVED
-      // count up segments that aren't being removed:
-      int count = 0;
-      for (auto& [segId, seg] : iw.segInfos) {
-        if (!seg->beingRemoved) {
-          count++;
-        } else {
-          LOG_ERROR("Encountered a segment being removed, which should never happen currently. segId={}", segId);
-        }
-      }
-#endif
-
       if ((size_t)segCount != iw.segInfos.size()) {
         LOG_ERROR(
                 "Internal Error, please report. MergePolicy segCount {} does not match live segment count of {}.",
@@ -163,11 +150,11 @@ public:
       if (seg != nullptr) {
         segCount++;
 
-        // For MERGE_FACTOR 10, docs 0-9 = level 0, 10-99 = level 2, etc.
-        if (seg->nDocs < MERGE_FACTOR) {
+        // For MERGE_FACTOR 10, docs 0-9 = level 0, 10-99 = level 1, etc.
+        if (seg->maxDoc < MERGE_FACTOR) {
           seg->mergeLevel = 0;
         } else {
-          seg->mergeLevel = (int32_t) (log2(seg->nDocs) * inverseLogM);
+          seg->mergeLevel = (int32_t) (log2(seg->maxDoc) * inverseLogM);
         }
         if (seg->mergeLevel >= (int) levelCounts.size()) {
           levelCounts.resize(seg->mergeLevel + 1);
@@ -193,7 +180,6 @@ public:
     // Call with indexMutex locked.
     void _remove(SegInfo* seg) {
       segCount--;
-      seg->beingRemoved = true;
       if (seg->mergeLevel >= 0) {
         levelCounts[seg->mergeLevel]--;
       }
@@ -254,9 +240,18 @@ public:
   boost::unordered_flat_map<Inverter*, std::unique_ptr<Inverter>> busyInverters;
   boost::unordered_flat_map<Inverter*, std::unique_ptr<Inverter>> flushingInverters;
 
-  // sequence numbers for updates and commits.
-  std::atomic_uint64_t updateNumber = 0;
-  std::atomic_uint64_t commitNumber = 0;
+  // The last updateNumber generated (the first update number generated will be 1)
+  uint64_t updateNumber = 0;
+  // Read from the index when this IW instance was created.  Does not change.
+  // sequence numbers for TBB serializers are calculated via updateVersion - updateBase - 1.
+  uint64_t updateBase = 0;
+
+  // Used for sequencing update messages containing commits.
+  // Not used for index_gen since not every commit will end up changing the index.
+  uint64_t commitNumber = 0;
+
+  // last index generation number... incremented before each commit.
+  uint64_t indexGen = 0;
 
   // commit info for the index, used to track deletes.
   // This is moved to the UpdateMessage when a commit is processed and a new one is created for the next commit.
@@ -294,13 +289,14 @@ public:
   // See TBBTest.cpp for a test of the TBB parts of this strategy.
   //
   // Failures:
-  //  - if something fails, we need to still flow it through the graph so the sequencers are updated.
+  //  - TODO: if something fails, we need to still flow it through the graph so the sequencers are updated.
   //
-  // Delete strategy:
+  // Deletes strategy:
   //  - Each inverter has its own delete queue.
-  //  - When a segment is flushed, it's deletes are moved to the global deletes queue.
+  //  - When a segment is flushed, it's deletes are moved to the current CommitInfo.
   //  - When a commit happens, the deletes are applied to all segments.
-  //    - applying deletes to segments is mutually exclusive with segment merges.
+  //    - applying deletes to segments doesn't work well with concurrent segment merges.
+  //      See see finishCommitBody() for how we handle this.
 
 
   using UpdateMessageFunc = tbb::flow::function_node<UpdateMessage*, UpdateMessage*>;
@@ -313,8 +309,6 @@ public:
   std::unique_ptr<UpdateMessageFunc> processUpdateNode;
   std::unique_ptr<tbb::flow::sequencer_node<UpdateMessage*> > updateSequencerNode;
   std::unique_ptr<UpdateMessageMultiFunc> updateFinishNode;
-  // TODO: what if no one reads from this node??? Will it buffer output and eventually fail or block? Or because
-  // there is no edge does it just drop.  Make a test for this!
 
   using InverterMultiFunc = tbb::flow::multifunction_node<Inverter*, std::tuple<UpdateMessage*>>;
   std::unique_ptr<InverterMultiFunc> segmentFlushNode;
@@ -341,18 +335,38 @@ public:
       // TODO: verify directory has no other index files? (i.e. this would tend to indicate corruption)
     } else {
       InputStream segmentsIs = segFile->getInputStream();
-      lastCommitTime = lastAdvertisedCommitTime = segmentsIs.readLong();
-      auto nSegs = segmentsIs.readVint();
-      segInfos.reserve(nSegs);
-      // TODO: maintain segment order by recording ord in segments file.
-      for (auto i = 0u; i < nSegs; i++) {
-        auto segId = segmentsIs.readVlong();
+      
+      google::protobuf::Arena arena;
+      proto::IndexInfo& indexInfo = *google::protobuf::Arena::Create<proto::IndexInfo>(&arena);
+      google::protobuf::io::ArrayInputStream arrayStream(segmentsIs.ptr(), segmentsIs.left());
+      google::protobuf::io::CodedInputStream codedStream(&arrayStream);
+      
+      if (!indexInfo.ParseFromCodedStream(&codedStream)) {
+        throw std::runtime_error("Failed to parse IndexInfo protobuf");
+      }
+
+      lastCommitTime = lastAdvertisedCommitTime = indexInfo.commit_time();
+      indexGen = indexInfo.index_gen();
+      updateBase = indexInfo.update_version() + 1;
+      segInfos.reserve(indexInfo.segments_size());
+
+      // TODO: maybe maintain segment order by recording ord in segments file.
+      for (int i = 0; i < indexInfo.segments_size(); i++) {
+        const auto& segment = indexInfo.segments(i);
+        auto segId = segment.seg_id();
         lastSegId = std::max(lastSegId.load(), segId);
-        int32_t nDocs = segmentsIs.readVint();
+        int32_t nDocs = segment.max_doc();
         // having ndocs in the list of segments is redundant with info in the segment itself and may be removed later.
         // for now it makes it easy to populate nDocs for merge decisions.
-        auto it = segInfos.emplace(segId, std::make_unique<SegInfo>(segId, nDocs));
-        mergePolicy->_update(it.first->second.get());
+        auto [iter, success] = segInfos.emplace(segId, std::make_unique<SegInfo>(segId, nDocs));
+        assert(success);  // should be no repeated segments
+        auto& seg = *iter->second;
+        seg.deletesGen = segment.deletes_gen();
+        seg.minVersion = segment.min_version();
+        seg.maxVersion = segment.max_version();
+        seg.deletes = segment.deletes();
+        seg.commitTime = indexInfo.commit_time();
+        mergePolicy->_update(&seg);
       }
     }
 
@@ -374,9 +388,9 @@ public:
 
     // then make sure that the updates are finished in order so all updates are done before a commit is processed.
     updateSequencerNode = std::make_unique<tbb::flow::sequencer_node<UpdateMessage*> >(updateGraph,
-      [](UpdateMessage* msg) -> size_t {
+      [this](UpdateMessage* msg) -> size_t {
         INDEX_DEBUG("updateSequencerNode: msg={} seqNum={}", (void*)msg, msg->seqNum);
-        return msg->seqNum;
+        return msg->updateVersion - this->updateBase - 1;   // get a 0 based sequence number for the sequencer node;
       });
 
     // updates flow into the updateFinishNode in order which is single threaded and ensures that updates are finished in order.
@@ -436,7 +450,7 @@ private:
   void startUpdateBody(UpdateMessage& msg) {
     // if the start node can reject updates, then assigning sequence numbers should be done after that.
     // Sequences must start at 0 for the sequencer nodes.
-    msg.seqNum = updateNumber++;
+    msg.updateVersion = ++updateNumber;
     if (msg.commit != UpdateMessage::NO_COMMIT) {
       msg.commitNum = commitNumber++;
     } else {
@@ -485,7 +499,7 @@ private:
       // first look at any flushing inverters that are not marked for a commit yet
       // and mark them if necessary.
       for (auto it = flushingInverters.begin(); it != flushingInverters.end(); it++) {
-        if (it->second->commitInfo == nullptr && it->second->lowestUpdateNum) {
+        if (it->second->commitInfo == nullptr && it->second->minVersion) {
           INDEX_DEBUG("\tinitiateCommit: msg={} marking flushing inverter={} for commit", (void*)&msg, (void*)it->second.get());
           it->second->commitInfo = &commitInfo;
           commitInfo.leftToFlush++;
@@ -494,7 +508,7 @@ private:
 
       // now look at all idle inverters and initiate a flush if necessary.
       for (auto it = idleInverters.begin(); it != idleInverters.end(); it++) {
-        if (it->second->lowestUpdateNum <= msg.seqNum) {
+        if (it->second->minVersion <= msg.updateVersion) {
           if (it->second->commitInfo == nullptr) {
             INDEX_DEBUG("\tinitiateCommit: msg={} marking idle inverter={} for commit", (void*)&msg, (void*)it->second.get());
             it->second->commitInfo = &commitInfo;
@@ -514,7 +528,7 @@ private:
 
       // Any inverters that are busy should be marked so that when they are released they can be flushed.
       for (auto it = busyInverters.begin(); it != busyInverters.end(); it++) {
-        if (it->second->commitInfo == nullptr && it->second->lowestUpdateNum <= msg.seqNum) {
+        if (it->second->commitInfo == nullptr && it->second->minVersion <= msg.updateVersion) {
           INDEX_DEBUG("\tinitiateCommit: msg={} marking busy inverter={} for commit", (void*)&msg, (void*)it->second.get());
           it->second->commitInfo = &commitInfo;
           commitInfo.leftToFlush++;
@@ -532,7 +546,7 @@ private:
   }
 
   // Inverter for the segment should already be in the flushingInverters list.
-  // This is called in parallel.
+  // This is called in parallel.  The inverter will be deleted.
   void segmentFlushBody(Inverter& inverter) {
     INDEX_DEBUG("segmentFlushBody: inverter={} commitInfo={} msg.leftToFlush={}", (void*)&inverter, (void*)inverter.commitInfo,
                 inverter.commitInfo == nullptr ? -1 : inverter.commitInfo->leftToFlush);
@@ -549,6 +563,9 @@ private:
     }
 
     auto segInfo = std::make_unique<SegInfo>(inverter.getPostingsWriter().segId, inverter.getPostingsWriter().getMaxDoc());
+    segInfo->minVersion = inverter.minVersion;
+    segInfo->maxVersion = inverter.maxVersion;
+    // TODO FUTURE: set deletes + deletesGen for deleted docs from errors or overwrites in the same inverter.
 
     std::unique_ptr<Inverter> inverterPtr;
 
@@ -718,7 +735,7 @@ private:
     }  // end index lock
 
     // write the segments file with the snapshot of segments we took at the beginning.
-    writeIndexInfoFile(segs);
+    writeIndexInfoFile(segs, msg.commitInfo.get());
     msg.done(*this); // don't access msg after this point, it could be deleted.
   }
 
@@ -857,15 +874,16 @@ public:
   // This is only called from the finishCommit node, which has concurrency==1 (single-threaded)
   // hence we only need to protect against changes in the segInfos map, not multiple invocations of this method.
   // The passed span of segments may be reordered after this is finished.
-  void writeIndexInfoFile(std::span<SegInfo*> segs) {
+  void writeIndexInfoFile(std::span<SegInfo*> segs, CommitInfo* commitInfo = nullptr) {
     // We should be able to write the segments file without holding the indexMutex,
-    // as long as we access only fields that should not change.
+    // as long as we access only fields that should not change on SegInfo.
+    // deletes + deletesGen won't change because we only apply deletes in finishCommitBody().
 
     auto indexFile = dir.createFile(Postings::INDEX_INFO_FILE);
     OutputStream indexOut;
     indexOut.setFile(&*indexFile);
 
-    // get timestamp in microseconds
+    // get timestamp in microseconds and make sure it is increasing and unique.
     uint64_t now_us = std::chrono::duration_cast<std::chrono::microseconds>(
       std::chrono::system_clock::now().time_since_epoch()).count();
     if (now_us <= lastCommitTime) {
@@ -888,101 +906,77 @@ public:
          return a->segId < b->segId;
        });
 
-      indexOut.writeLong(now_us);  // don't use Vlong since this is a big number
-      indexOut.writeVint(segs.size());
-      for (auto seg: segs) {
-        indexOut.writeVlong(seg->segId);
-        indexOut.writeVint(seg->nDocs); // TODO: remove this redundancy in the future?
-        if (seg->commitTime <= 1) {  // keep track of the first commit this segment appeared in.
-          seg->commitTime = now_us;
-        }
-        // TODO FIXME - write out other info: segment minVersion, deletesGen.
-        numDocs += seg->nDocs;
-        INDEX_DEBUG("\tsegId={} nDocs={} commitTime={}", seg->segId, seg->nDocs, seg->commitTime);
-      }
+    uint64_t updateVersion = 0;
+    uint64_t thisIndexGen = ++indexGen;  // increment the index generation for this commit.
+    if (commitInfo) {
+      // if we have a commit info, use the update version from it.
+      updateVersion = commitInfo->updateMessage->updateVersion;
+      commitInfo->indexGen = thisIndexGen;
+    } else {
+      // Otherwise, use the current update base.  This is only for older tests.
+      updateVersion = updateBase + 1;
+    }
 
+    // Build the protobuf message
+    google::protobuf::Arena arena;
+    proto::IndexInfo& indexInfo = *google::protobuf::Arena::Create<proto::IndexInfo>(&arena);
+    indexInfo.set_commit_time(now_us);
+    indexInfo.set_version(1);
+    indexInfo.set_index_gen(thisIndexGen);
+    indexInfo.set_update_version(updateVersion);
+    indexInfo.mutable_segments()->Reserve(segs.size());
+
+    for (auto seg: segs) {
+      auto* segmentInfo = indexInfo.add_segments();
+      segmentInfo->set_seg_id(seg->segId);
+      segmentInfo->set_max_doc(seg->maxDoc);
+      segmentInfo->set_deletes_gen(seg->deletesGen);
+      segmentInfo->set_min_version(seg->minVersion);
+      segmentInfo->set_max_version(seg->maxVersion);
+      segmentInfo->set_deletes(seg->deletes);
+      
+      if (seg->commitTime <= 1) {  // keep track of the first commit this segment appeared in.
+        seg->commitTime = now_us;
+      }
+      numDocs += seg->maxDoc;
+      INDEX_DEBUG("\tsegId={} nDocs={} commitTime={}", seg->segId, seg->nDocs, seg->commitTime);
+    }
+
+    // Serialize the protobuf message - TODO: hook into other serialization methods to avoid string
+    std::string serialized;
+    serialized.reserve(200 + segs.size() * 24);
+    if (!indexInfo.SerializeToString(&serialized)) {
+      throw std::runtime_error("Failed to serialize IndexInfo protobuf");
+    }
+    
+    indexOut.write(serialized.data(), serialized.size());
     indexOut.close();
     dir.finishFile(*indexFile);
+
+    INDEX_DEBUG("\twriteIndexInfoFile DONE: commitTime={} numDocs={} numSegs={}", now_us, numDocs, numSegs);
+    unused(numSegs, numDocs);
 
     // advertise this commit only after the file is closed.
     lastCommitTime = now_us;
     lastAdvertisedCommitTime = now_us;
-
-    INDEX_DEBUG("\twriteIndexInfoFile DONE: commitTime={} numDocs={} numSegs={}", now_us, numDocs, numSegs);
-    unused(numSegs, numDocs);
   }
 
 
-  // This is only called from the finishCommit node, which has concurrency==1 (single-threaded)
-  // hence we only need to protect against changes in the segInfos map, not multiple invocations of this method.
+  // Onlt called from test code.
   void writeIndexInfoFile() {
-    // write new segments file
-    // TODO: TBD if we write new segments files or just use the same name
-    // Since this could involve network or IO, we should do it outside the lock.
-    auto indexFile = dir.createFile(Postings::INDEX_INFO_FILE);
-    OutputStream indexOut;
-    indexOut.setFile(&*indexFile);
-
-    // get timestamp in microseconds
-    uint64_t now_us = std::chrono::duration_cast<std::chrono::microseconds>(
-      std::chrono::system_clock::now().time_since_epoch()).count();
-    if (now_us <= lastCommitTime) {
-      now_us = lastCommitTime + 1;
-    }
-
-    INDEX_DEBUG("writeIndexInfoFile: now_us={} lastCommitTime={} diff={}", now_us, lastCommitTime.load(), now_us - lastCommitTime.load());
-    uint64_t numDocs = 0;
-    uint64_t numSegs = 0;
-
-    // TODO: should we write out segments in order of size or creation?
-
+    std::vector<SegInfo*> segs;
+    
     // need to lock the indexMutex to get a consistent view of the segments.
-    // writing the info should be fast (no IO since it should all be buffered in mem)
     {
       const std::lock_guard<std::mutex> lock(indexMutex);
-      numSegs = segInfos.size();
-
-      // Sort the list of segments by the segId.
-      // Some tests rely on not reordering segments.
-      std::vector<SegInfo*> sortedSegs;
-      sortedSegs.reserve(segInfos.size());
-      for (auto& seg: segInfos) {
-        sortedSegs.push_back(seg.second.get());
-      }
-
-      std::sort(sortedSegs.begin(), sortedSegs.end(), [](const SegInfo* a, const SegInfo* b) {
-        /*
-        // first sort on number of documents (largest first), then on segment id (smallest first)
-        if (a->nDocs != b->nDocs) {
-          return a->nDocs > b->nDocs;
-        }
-         */
-        return a->segId < b->segId;
-      });
-
-      indexOut.writeLong(now_us);  // don't use Vlong since this is a big number
-      indexOut.writeVint(sortedSegs.size());
-      for (auto seg: sortedSegs) {
-        indexOut.writeVlong(seg->segId);
-        indexOut.writeVint(seg->nDocs); // TODO: remove this redundancy in the future?
-        if (seg->commitTime == 0) {  // keep track of the first commit this segment appeared in.
-          seg->commitTime = now_us;
-        }
-        numDocs += seg->nDocs;
-        INDEX_DEBUG("\tsegId={} nDocs={} commitTime={}", seg->segId, seg->nDocs, seg->commitTime);
+      segs.reserve(segInfos.size());
+      for (auto& [segId, seg] : segInfos) {
+        segs.push_back(seg.get());
       }
     }
-
-    // now actually do the IO outside the lock
-    indexOut.close();
-    dir.finishFile(*indexFile);
-
-    // advertise this commit only after the file is closed.
-    lastCommitTime = now_us;
-    lastAdvertisedCommitTime = now_us;
-
-    INDEX_DEBUG("\twriteIndexInfoFile DONE: commitTime={} numDocs={} numSegs={}", now_us, numDocs, numSegs);
-    unused(numSegs, numDocs);
+    
+    // Call the parameterized version
+    writeIndexInfoFile(segs);
   }
 
 
@@ -1011,6 +1005,8 @@ private:
     solux::Signal::emit("mergeStart", (void*)(int64_t)msg.mergeLevel, (void*)segs.size());
 
     // We need a way to do deletes after the commit has finished.  Create a new Msg that wraps the old one for this.
+    // We could alternately have a std::vector of SegInfo to delete, and have it happen in post-commit
+    // for any segments no longer part of the committed index.
     class CommitDeleteMsg : public UpdateMessage {
     public:
       UpdateMessage* prevMsg;
@@ -1114,6 +1110,8 @@ private:
 
 
     // if we need a commit, send to the finishCommit node
+    // TODO: FIXME: with deletes, this is now a problem sending directly to commitFinishNode w/o CommitInfo -
+    // that could expose a flushed segment that does not have deletes applied yet (those deletes are on a CommitInfo!)
     if (commitDeleteMsg) {
       commitDeleteMsg->commit = UpdateMessage::COMMIT;
       commitDeleteMsg->prevMsg = &msg;
@@ -1218,10 +1216,10 @@ public:
       LOG_INFO("IndexWriter: segInfos.size={} idleInverters.size={} busyInverters.size={} flushingInverters.size={}",
                segInfos.size(), idleInverters.size(), busyInverters.size(), flushingInverters.size());
       LOG_INFO("\tupdateNumber={} commitNumber={} lastCommitTime={} lastAdvertisedCommitTime={}",
-               updateNumber.load(), commitNumber.load(), lastCommitTime.load(), lastAdvertisedCommitTime.load());
+               updateNumber, commitNumber, lastCommitTime.load(), lastAdvertisedCommitTime.load());
       LOG_INFO("\tmergePolicy->mergeRunning={}", mergePolicy->mergeRunning);
       for (auto& [segId, seg] : segInfos) {
-        LOG_INFO("\t\tsegId={} nDocs={} mergeLevel={} commitTime={}", segId, seg->nDocs, seg->mergeLevel, seg->commitTime);
+        LOG_INFO("\t\tsegId={} nDocs={} mergeLevel={} commitTime={}", segId, seg->maxDoc, seg->mergeLevel, seg->commitTime);
       }
     }
 

@@ -48,6 +48,7 @@ void ProtoUpdateMessage::handle(IndexWriter& iw) {
   // TODO: FIXME: if we hit an exception here, we still want to release the inverter! Use a guard like a
   // unique_ptr with a custom deleter.
   Inverter& inverter = iw.obtainInverter();
+  inverter.updateVersions(this->updateVersion);
   update(*req, iw, inverter);
   iw.releaseInverter(inverter);
 }
