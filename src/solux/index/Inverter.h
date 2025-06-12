@@ -46,6 +46,7 @@ public:
 
   // The lowest and highest update numbers for this inverter, including deletes.
   // Should be updated by calls to updateVersions() after obtaining the inverter.
+  uint64_t currVersion = 0;
   uint64_t minVersion = 0;
   uint64_t maxVersion = 0;
 
@@ -63,7 +64,7 @@ public:
 
   PostingsWriter& getPostingsWriter() { return postingsWriter; }
 
-  // for segmentVersions to be set correctly, this should be called after
+  // for segmentVersions, adds, and deletes to be versioned correctly, this should be called after
   // obtaining the inverter
   void updateVersions(uint64_t version) {
     if (minVersion != 0) {
@@ -72,6 +73,7 @@ public:
       minVersion = std::min(minVersion, version);
     }
     maxVersion = std::max(maxVersion, version);
+    currVersion = version;
   }
 
   bool hasDeletions() {

@@ -805,22 +805,24 @@ public:
     }
   }
 
-  Inverter& obtainInverter() {
+  // Obtains an inverter for writing documents and sets it's updateVersion.
+  Inverter& obtainInverter(uint64_t updateVersion = 0) {
     // IDEA: should we prefer grabbing the inverter with the most docs?  Idea would be to
     // have a couple of really large segments that will need less merging?
+    Inverter* inverter = nullptr;
     const std::lock_guard<std::mutex> lock(indexMutex);
     if (idleInverters.empty()) {
       auto newInverter = std::make_unique<Inverter>(dir, ++lastSegId);
-      Inverter* newInverterPtr = newInverter.get();
-      busyInverters.emplace(newInverterPtr, std::move(newInverter));
-      return *newInverterPtr;
+      inverter = newInverter.get();
+      busyInverters.emplace(inverter, std::move(newInverter));
     } else {
       auto it = idleInverters.begin();
-      Inverter& inverter = *it->second;
-      busyInverters.emplace(&inverter, std::move(it->second));
+      inverter = it->first;
+      busyInverters.emplace(inverter, std::move(it->second));
       idleInverters.erase(it);
-      return inverter;
     }
+    inverter->updateVersions(updateVersion);
+    return *inverter;
   }
 
 

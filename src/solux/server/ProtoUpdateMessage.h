@@ -6,11 +6,26 @@
 namespace solux {
 
 class ProtoUpdateMessage : public UpdateMessage {
+private:
+  // response is created on-demand.
+  proto::UpdateResponse* response;  // The response object is created in the same arena as the request.
+
 public:
-  solux::proto::UpdateRequest* req;  // The request object may become unavailable after the callback is called
-  ProtoUpdateMessage(solux::proto::UpdateRequest* req) : req(req) {
+  proto::UpdateRequest* req;  // The request object may become unavailable after the callback is called
+
+  ProtoUpdateMessage(proto::UpdateRequest* req, proto::UpdateResponse* rsp=nullptr) : response(rsp), req(req) {
     commit = static_cast<CommitType>(req->commit());
     commit_within = req->commit_within_us();
+  }
+
+  proto::UpdateResponse* getResponse() {
+    if (response == nullptr) {
+      assert(req->GetArena() != nullptr);
+      response = google::protobuf::Arena::Create<proto::UpdateResponse>(req->GetArena());
+      response->set_request_id(req->request_id());
+      response->set_status(proto::UpdateResponse::OK);  // default status
+    }
+    return response;
   }
 
   // For now, we will allow the handler to obtain/release an inverter.  We could also optionally pass it

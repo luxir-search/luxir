@@ -598,7 +598,7 @@ public:
     class BlockingUpdateMessage : public ProtoUpdateMessage {
     public:
       Blocker blocker;
-      BlockingUpdateMessage(solux::proto::UpdateRequest* req) : ProtoUpdateMessage(req) {
+      BlockingUpdateMessage(solux::proto::UpdateRequest* req, solux::proto::UpdateResponse* response) : ProtoUpdateMessage(req, response) {
       }
       virtual void done(IndexWriter& iw) override {
         unused(iw);
@@ -606,14 +606,12 @@ public:
       }
     };
 
-    BlockingUpdateMessage updateMessage(&request);
+    BlockingUpdateMessage updateMessage(&request, &response);
     bool success = iw->submitUpdate(&updateMessage);
     assert(success);
 
     updateMessage.blocker.wait();
 
-    auto& singleResponse = *response.add_responses();
-    singleResponse.set_request_id(request.request_id());
     return grpc::Status::OK;
   }
 };
@@ -686,16 +684,11 @@ public:
       virtual void done(IndexWriter& iw) override {
         unused(iw);
         // LOG_DEBUG("done msg={}", (void*)this);
-        // create response from request arena
-        auto* arena = req->GetArena();
-        auto* response = google::protobuf::Arena::Create<proto::UpdateResponse>(arena);
-        auto& singleResponse = *response->add_responses();
-        singleResponse.set_request_id(req->request_id());
 
         // By the time this response is done, *this* object will already be deleted, so don't
         // reference anything in this Update instance.
         auto* p = parent;
-        parent->respond(response,
+        parent->respond(this->getResponse(),
                       [p](auto* response) { unused(p); releaseArena(response->GetArena()); },
                       1);
         delete this; // TODO arena allocate this
@@ -704,7 +697,8 @@ public:
 
     Update* updateMessage = new Update(req, this); // TODO arena allocate this.
 
-
+    // TODO: test if submitting a task to an arena that does this would cause the updateMessage to start
+    // faster.  A standalone test would be easist to see this.
     iw->submitUpdate(updateMessage);
 
     return true; // take ownership of request object since we used its arena (and we are handling async)

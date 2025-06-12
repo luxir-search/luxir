@@ -255,23 +255,49 @@ message UpdateRequest {
   // If CommitType != NO_COMMIT, the default value of 0 causes an immediate commit before the response is sent,
   // while a positive value will not wait for the commit before the response is sent.
   uint64 commit_within_us = 7;
+
+  // Document IDs to delete.
+  repeated string delete_ids = 8;
+
+  // If true, existing documents with the same ID will be overwritten by documents in this request.
+  bool overwrite = 9;
+
+  // If true, all documents in this request must be successfully indexed or none will be.
+  bool all_or_none = 10;
+
+  // If true, return the ids of indexed documents in the response.
+  bool return_ids = 11;
 }
 
 // The response to an update request, or one or more update requests in streaming mode.
 message UpdateResponse {
-  repeated SingleUpdateResponse responses = 1;
-}
-
-message SingleUpdateResponse {
+  // This is the request_id from the UpdateRequest, if it was set.
   bytes request_id = 1;
-  repeated UpdateError errors = 2;
+
+  // The update version assigned to the update request.
+  uint64 update_version = 2;
+
+  enum Status {
+    UNKNOWN = 0;          // the default
+    OK = 1;               // the update was successful
+    PARTIAL = 2;          // some documents were updated, but some failed
+    ERROR = 3;            // the update failed completely
+  }
+
+  Status status = 3;
+
+  // ids of documents that were successfully indexed, if return_ids was set to true in the request.
+  repeated string ids = 4;
+
+  message Error {
+    string id = 1;  // the id of the document that failed to update
+    string error_message = 2;
+    // for an invalid value for a field, we could actually give that field/value in a more structured way
+  }
+  repeated Error errors = 5;
 }
 
-message UpdateError {
-  // docId... bytes? string?
-  string error_message = 1;
-  // for an invalid value for a field, we could actually give that field/value in a more structured way
-}
+
 
 
 // name : value

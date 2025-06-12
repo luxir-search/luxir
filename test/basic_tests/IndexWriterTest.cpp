@@ -226,6 +226,9 @@ TEST_F(IndexWriterTest, multiThreaded) {
   public:
     solux::proto::UpdateRequest updateRequest;
     std::function<void(TestProtoUpdateMessage&)> callback = nullptr;
+
+    // note - we are passing a not-yet-constructed UpdateRequest to the base class constructor... this isn't generally
+    // safe so if is test fails, we need to fix this (a holder class for the request and the ProtoUpdateMessage?
     TestProtoUpdateMessage(std::function<void(TestProtoUpdateMessage&)> callback) : ProtoUpdateMessage(&updateRequest), callback(callback) {}
 
     void done(IndexWriter& iw) override {
