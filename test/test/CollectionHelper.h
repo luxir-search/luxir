@@ -2,6 +2,8 @@
 
 #include "TestUtils.h"
 #include "solux/index/IndexWriter.h"
+#include "solux/server/ProtoUpdateMessage.h"
+#include <google/protobuf/arena.h>
 
 namespace solux::test {
 
@@ -11,70 +13,50 @@ private:
   std::shared_ptr<Collection> collection_;
   std::counting_semaphore<1'000'000> indexSemaphore; // semaphore to limit concurrent indexing operations
 
-  class SimpleUpdateMessage : public UpdateMessage {
-  public:
 
-    void indexMulti(IndexWriter& iw, std::span<const Doc> docs) {
-      if (docs.empty()) {
-        return; // nothing to index, avoid grabbing an inverter.
-      }
-      auto& inverter = iw.obtainInverter();
-      inverter.updateVersions(this->updateVersion);
+  // Helper function to convert Doc to protobuf Map
+  static void convertDocToProto(const Doc& doc, proto::Map& map) {
 
-      for (auto& doc: docs) {
-        indexSingle(inverter, doc);
-      }
-      iw.releaseInverter(inverter);
+    for (const auto& nv : doc) {
+      auto& val = (*map.mutable_fields())[nv.name];
+      
+      std::visit(overloaded{
+        [&](bool v) { val.set_b(v); },
+        [&](int64_t v) { val.set_i(v); },
+        [&](float v) { val.set_f(v); },
+        [&](double v) { val.set_d(v); },
+        [&](const std::string& v) { val.set_s(v); },
+        [&](const std::vector<bool>& v) {
+          unused(v);
+          // TODO: handle bool arrays if needed
+        },
+        [&](const std::vector<int64_t>& v) {
+          auto* arr = val.mutable_arr_i();
+          for (auto i : v) {
+            arr->add_v(i);
+          }
+        },
+        [&](const std::vector<float>& v) {
+          auto* arr = val.mutable_arr_f();
+          for (auto f : v) {
+            arr->add_v(f);
+          }
+        },
+        [&](const std::vector<double>& v) {
+          auto* arr = val.mutable_arr_d();
+          for (auto d : v) {
+            arr->add_v(d);
+          }
+        },
+        [&](const std::vector<std::string>& v) {
+          auto* arr = val.mutable_arr_s();
+          for (const auto& s : v) {
+            arr->add_v(s);
+          }
+        }
+      }, nv.val);
     }
-
-    void indexSingle(Inverter& inverter, const Doc& doc) {
-      inverter.startDoc();
-      for (auto& nv: doc) {
-        auto& handler = inverter.getIndexHandler(nv.name);
-        auto& val = nv.val;
-
-        /*
-        std::visit([&](auto&& arg) {
-          // using T = std::decay_t<decltype(arg)>;
-          // if constexpr (std::is_same_v<T, int64_t>)
-          handler.index(inverter, arg);
-        }, val);
-        */
-
-        std::visit(overloaded{
-                [&](bool v){handler.index(inverter, v); },
-                [&](int64_t v){handler.index(inverter, v); },
-                [&](float v){handler.index(inverter, v); },
-                [&](double v){handler.index(inverter, v); },
-                [&](std::string v){handler.index(inverter, v); },
-                [&](std::vector<bool> v){
-                  unused(v);
-                  // handler.index(inverter, v);
-                  },
-                [&](std::vector<int64_t> v){
-                  handler.index(inverter, v);
-                  },
-                [&](std::vector<float> v){
-                  unused(v);
-                  // handler.index(inverter, v);
-                  },
-                [&](std::vector<double> v){
-                  unused(v);
-                  // handler.index(inverter, v);
-                  },
-                [&](std::vector<std::string> v){
-                  // stack allocate... obviously not for anything large.
-                  auto arr = (std::string_view*)alloca(v.size() * sizeof(std::string_view));
-                  std::span<std::string_view> sv(arr, v.size());
-                  std::ranges::copy(v, sv.begin());
-                  handler.index(inverter, sv);
-                }
-        }, val);
-
-      }
-      inverter.finishDoc();
-    }
-  };
+  }
 
 public:
   // indexConcurrency is the number of concurrent indexing operations allowed before blocking.
@@ -99,30 +81,34 @@ public:
   void index(std::span<const Doc> docs, UpdateMessage::CommitType commitType = UpdateMessage::NO_COMMIT) {
     auto writer = collection().getShard()->getIndexWriter();
 
-    class BlockingUpdateMessage : public SimpleUpdateMessage {
+    class BlockingProtoUpdateMessage : public ProtoUpdateMessage {
     public:
-      std::span<const Doc> docs;
       Blocker blocker;
-
-      explicit BlockingUpdateMessage(std::span<const Doc> docs) : docs(docs) {
-      }
-
-      void handle(IndexWriter& iw) override {
-        indexMulti(iw, docs);
+      
+      explicit BlockingProtoUpdateMessage(proto::UpdateRequest* req) 
+        : ProtoUpdateMessage(req) {
       }
 
       void done(IndexWriter& iw) override {
         unused(iw);
-        // LOG_DEBUG("BlockingUpdateMessage done!");
         blocker.notify();
       }
     };
 
-
-    // all stack allocated since we will be waiting for completion.
-    BlockingUpdateMessage updateMessage(docs);
-    updateMessage.commit = commitType;
-
+    google::protobuf::Arena arena;
+    auto* request = google::protobuf::Arena::Create<proto::UpdateRequest>(&arena);
+    
+    // Convert docs to protobuf format
+    for (const auto& doc : docs) {
+      convertDocToProto(doc, *request->add_docs());
+    }
+    
+    // Set commit type
+    request->set_commit(static_cast<proto::UpdateRequest::CommitType>(commitType));
+    
+    // Create and submit the update message
+    BlockingProtoUpdateMessage updateMessage(request);
+    
     bool success = writer->submitUpdate(&updateMessage);
     assert(success);
     unused(success);
@@ -142,16 +128,13 @@ public:
              UpdateMessage::CommitType commitType = UpdateMessage::NO_COMMIT) {
     auto writer = collection().getShard()->getIndexWriter();
 
-    class UpdateMessageWithCallback : public SimpleUpdateMessage {
+    class ProtoUpdateMessageWithCallback : public ProtoUpdateMessage {
     public:
       std::function<void(ErrorHolder& result)> callback;
-      const std::vector<Doc> docs;
-
-      UpdateMessageWithCallback(std::vector<Doc>&& docs) : docs(std::move(docs)) {
-      }
-
-      void handle(IndexWriter& iw) override {
-        indexMulti(iw, docs);
+      std::unique_ptr<google::protobuf::Arena> arena;
+      
+      ProtoUpdateMessageWithCallback(proto::UpdateRequest* req, std::unique_ptr<google::protobuf::Arena> arena) 
+        : ProtoUpdateMessage(req), arena(std::move(arena)) {
       }
 
       void done(IndexWriter& iw) override {
@@ -161,9 +144,21 @@ public:
       }
     };
 
-    UpdateMessageWithCallback* updateMessage = new UpdateMessageWithCallback(std::move(docs));
-    updateMessage->commit = commitType;
+    // Create protobuf request on heap-allocated arena (will be deleted in done())
+    auto arena = std::make_unique<google::protobuf::Arena>();
+    auto* request = google::protobuf::Arena::Create<proto::UpdateRequest>(arena.get());
+    
+    // Convert docs to protobuf format
+    for (const auto& doc : docs) {
+      convertDocToProto(doc, *request->add_docs());
+    }
+    
+    // Set commit type
+    request->set_commit(static_cast<proto::UpdateRequest::CommitType>(commitType));
+    
+    auto* updateMessage = new ProtoUpdateMessageWithCallback(request, std::move(arena));
     updateMessage->callback = std::move(callback);
+    
     auto success = writer->submitUpdate(updateMessage);
     assert(success);
     unused(success);
