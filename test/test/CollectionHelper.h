@@ -130,6 +130,55 @@ public:
     return result;
   }
 
+  IndexResult deleteByIds(std::span<const std::string> ids, UpdateMessage::CommitType commitType = UpdateMessage::NO_COMMIT) {
+    auto writer = collection().getShard()->getIndexWriter();
+
+    class BlockingProtoUpdateMessage : public ProtoUpdateMessage {
+    public:
+      Blocker blocker;
+      IndexResult* result;
+      
+      explicit BlockingProtoUpdateMessage(proto::UpdateRequest* req, IndexResult* result = nullptr) 
+        : ProtoUpdateMessage(req), result(result) {
+      }
+
+      void done(IndexWriter& iw) override {
+        unused(iw);
+        if (result) {
+          result->updateVersion = updateVersion;
+          result->success = !ProtoUpdateMessage::result.errored();
+        }
+        blocker.notify();
+      }
+    };
+
+    google::protobuf::Arena arena;
+    auto* request = google::protobuf::Arena::Create<proto::UpdateRequest>(&arena);
+    
+    // Add delete IDs
+    for (const auto& id : ids) {
+      request->add_delete_ids(id);
+    }
+    
+    // Set commit type
+    request->set_commit(static_cast<proto::UpdateRequest::CommitType>(commitType));
+    
+    // Create and submit the update message
+    IndexResult result;
+    BlockingProtoUpdateMessage updateMessage(request, &result);
+    
+    bool success = writer->submitUpdate(&updateMessage);
+    assert(success);
+    unused(success);
+
+    updateMessage.blocker.wait();
+    return result;
+  }
+
+  IndexResult deleteById(const std::string& id, UpdateMessage::CommitType commitType = UpdateMessage::NO_COMMIT) {
+    return deleteByIds({&id, 1}, commitType);
+  }
+
 
   // Async version of index.  Docs will be moved into the update message.
   void index(Doc&& doc, std::function<void(const IndexResult& result)>&& callback,

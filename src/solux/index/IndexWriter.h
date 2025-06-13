@@ -739,14 +739,10 @@ private:
     msg.done(*this); // don't access msg after this point, it could be deleted.
   }
 
-  void applyDeletes(std::span<SegInfo*> segs, MultiDeletesData& multiDeletesData) {
-    // TODO
-  }
+  void applyDeletes(std::span<SegInfo*> segs, MultiDeletesData& multiDeletesData);
 
   // apply the given deletes to a segment, in addition to any personal deletes that may be present.
-  void applyDeletes(SegInfo& seg, MultiDeletesData& multiDeletesData) {
-    // TODO
-  }
+  void applyDeletes(SegInfo& seg, MultiDeletesData& multiDeletesData);
 
 
 public:

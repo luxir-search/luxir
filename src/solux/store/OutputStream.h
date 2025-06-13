@@ -316,7 +316,7 @@ public:
     }
     ptr += firstLen;
     for (const auto&[data, sz] : buffers) {
-      // if this overwrites memory, the bug is probably not closing the OutputStream (and hence not truncating the last buffer to the used size)
+      /// if this overwrites memory, the bug is probably not closing the OutputStream (and hence not truncating the last buffer to the used size)
       assert(ptr - (char *) dest <= fileSize);
       memcpy(ptr, data.get(), sz);
       ptr += sz;

@@ -470,3 +470,35 @@ TEST_F(IndexWriterTest, versionFieldOverwrite) {
   bool foundDoc3 = containsDoc(docs, expectedDoc3);
   EXPECT_TRUE(foundDoc3);
 }
+
+// Test deletion functionality - verify delete bitmaps are written correctly  
+TEST_F(IndexWriterTest, deletionInfrastructure) {
+  using namespace solux::test;
+  
+  CollectionHelper helper("main");
+  helper.clear();
+
+  // Add 3 documents with versions (overwrite=true adds _version_ field)
+  Doc doc1 = flatdoc("id", "doc1", "text_w", "hello world");
+  auto result1 = helper.index(doc1, UpdateMessage::COMMIT, true);
+
+  Doc doc2 = flatdoc("id", "doc2", "text_w", "goodbye world");
+  helper.index(doc2, UpdateMessage::COMMIT, true);
+
+  Doc doc3 = flatdoc("id", "doc3", "text_w", "test document");
+  auto result3 = helper.index(doc3, UpdateMessage::COMMIT, true);
+
+  
+  // Delete doc2
+  auto deleteResult = helper.deleteById("doc2", UpdateMessage::COMMIT);
+  EXPECT_TRUE(deleteResult.success);
+  EXPECT_GT(deleteResult.updateVersion, result3.updateVersion);
+  
+  // Verify that the delete was applied at the index level
+  auto indexWriter = helper.getIndexWriter();
+  // Get a fresh IndexReader after the delete commit
+  auto indexReader = indexWriter->getIndexReader(0);  // Force fresh reader
+
+  // TODO: implement the verification logic here
+
+}

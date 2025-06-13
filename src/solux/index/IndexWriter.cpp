@@ -1,5 +1,8 @@
 #include "IndexWriter.h"
 #include "solux/util/heap.h"
+#include "solux/index/ScreamingBuilder.h"
+#include "solux/reader/IntColReader.h"
+#include "solux/reader/PostingsReader.h"
 
 namespace solux {
 
@@ -372,6 +375,138 @@ void IndexWriter::mergeSegments(MemPool &pool, std::span<PostingsReader *> pread
   SegmentMerger merger(preaders, postingsWriter);
   merger.merge();
 
+}
+
+void IndexWriter::applyDeletes(std::span<SegInfo*> segs, MultiDeletesData& multiDeletesData) {
+  for (SegInfo* seg : segs) {
+    applyDeletes(*seg, multiDeletesData);
+  }
+}
+
+void IndexWriter::applyDeletes(SegInfo& seg, MultiDeletesData& multiDeletesData) {
+  if (multiDeletesData.empty()) {
+    return;
+  }
+
+  MemPool pool;
+  
+  // Read the segment to find documents that should be deleted
+  PostingsReader reader(dir, seg.segId);
+  
+  // Set to track deleted documents
+  std::vector<int32_t> deletedDocs;
+  
+  // Read the "id" field using TermsEnum
+  FieldReader fieldReader(pool, reader);
+  if (!fieldReader.seek("id")) {
+    LOG_WARN("applyDeletes: segment {} has no 'id' field", seg.segId);
+    return;
+  }
+  
+  SegFieldInfo idFieldInfo;
+  fieldReader.readFieldInfo(idFieldInfo);
+  TermsEnum termsEnum(pool, reader, idFieldInfo);
+  
+  // Also get the "_version_" field for version comparison
+  FieldReader versionFieldReader(pool, reader);
+  SegFieldInfo versionFieldInfo;
+  bool hasVersionField = false;
+  if (versionFieldReader.seek("_version_")) {
+    versionFieldReader.readFieldInfo(versionFieldInfo);
+    hasVersionField = true;
+  }
+  
+  // Helper function to process deletes from a DeletesData
+  auto processDeletes = [&](const DeletesData& deletesData) {
+    for (size_t i = 0; i < deletesData.deletedIds.size(); i++) {
+      const std::string& deleteId = deletesData.deletedIds[i];
+      uint64_t deleteVersion = deletesData.deletedVersions[i];
+      
+      // Seek to the specific ID term
+      if (termsEnum.seek(deleteId)) {
+        // Found the ID term, now get documents containing this ID
+        DocsEnum docsEnum(pool, reader, termsEnum);
+        
+        int32_t docId = docsEnum.next();
+        while (docId != DocsEnum::END) {
+          bool shouldDelete = true;
+          
+          // If version field exists, check if document version is less than delete version
+          if (hasVersionField) {
+            std::vector<int32_t> singleDoc = {docId};
+            uint64_t docVersion = 0;
+            
+            IntColReader::getSingleValues(pool, reader, versionFieldInfo, singleDoc,
+              [&](size_t, int32_t, int64_t version) {
+                docVersion = (uint64_t)version;
+              });
+            
+            // Only delete if document version is less than delete version
+            shouldDelete = (docVersion < deleteVersion);
+          }
+          
+          if (shouldDelete) {
+            deletedDocs.push_back(docId);
+          }
+          
+          docId = docsEnum.next();
+        }
+      }
+    }
+  };
+  
+  // Process personal deletes for this segment
+  for (const auto& personalDelete : seg.personalDeletes) {
+    for (const auto& deletesData : personalDelete->deletesData) {
+      processDeletes(*deletesData);
+    }
+  }
+  
+  // Process deletes from multiDeletesData
+  for (const auto& deletesData : multiDeletesData.deletesData) {
+    processDeletes(*deletesData);
+  }
+  
+  // If we found any documents to delete, write a new delete generation
+  if (!deletedDocs.empty()) {
+    auto newDeletesGen = seg.deletesGen + 1;
+    // Sort deleted docs for efficient bitmap creation and remove duplicates
+    std::sort(deletedDocs.begin(), deletedDocs.end());
+    deletedDocs.erase(std::unique(deletedDocs.begin(), deletedDocs.end()), deletedDocs.end());
+    
+    // Only proceed if we still have deletes after deduplication
+    if (!deletedDocs.empty()) {
+
+      // Write the delete bitmap file
+      std::string deleteFileName = Postings::getDeleteFileName(
+        Postings::getSortableString(seg.segId), newDeletesGen);
+      
+      auto deleteFile = dir.createFile(deleteFileName);
+
+      OutputStream out(deleteFile.get());
+
+      // Build and write the screaming bitset
+      ScreamingBuilder builder(pool, out);
+      for (int32_t docId : deletedDocs) {
+        builder.add(docId);
+      }
+      builder.flush();
+      out.close();
+
+      dir.finishFile(*deleteFile);
+
+      // Update the segment metadata.  Even though we are the only ones changing this,
+      // we should still grab the indexMutex to ensure consistency and cause a write barrier.
+      {
+        const std::lock_guard<std::mutex> lock(indexMutex);
+        seg.deletes += (int32_t)deletedDocs.size();
+        seg.deletesGen++;
+      }
+
+      LOG_INFO("Applied {} deletes to segment {} (new delete generation: {})", 
+               deletedDocs.size(), seg.segId, seg.deletesGen);
+    }
+  }
 }
 
 
