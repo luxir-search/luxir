@@ -4,10 +4,16 @@
 namespace solux {
 
 
-static void update(solux::proto::UpdateRequest& request, IndexWriter& iw, Inverter& inverter) {
+static void update(ProtoUpdateMessage& msg, IndexWriter& iw, Inverter& inverter) {
   unused(iw);
+  auto& request = *msg.req;
   std::vector<Inverter::IndexHandler*> handlers;
-  // int ndocs = request->docs_size();
+  Inverter::IndexHandler* versionHandler = nullptr;
+  
+  // Get version handler once if overwrite is enabled
+  if (request.overwrite()) {
+    versionHandler = &inverter.getIndexHandler("_version_");
+  }
 
   if (request.docs_size() > 0) {
     for (const auto &doc : request.docs()) {
@@ -28,6 +34,11 @@ static void update(solux::proto::UpdateRequest& request, IndexWriter& iw, Invert
         }
         handler->index(inverter, fval);
         idx++;
+      }
+
+      // Add _version_ field when overwrite is enabled
+      if (versionHandler != nullptr) {
+        versionHandler->index(inverter, static_cast<int64_t>(msg.updateVersion));
       }
 
       inverter.finishDoc();
@@ -63,7 +74,7 @@ void ProtoUpdateMessage::handle(IndexWriter& iw) {
 
   // Process document additions
   if (req->docs_size() > 0) {
-    update(*req, iw, inverter);
+    update(*this, iw, inverter);
   }
   
   iw.releaseInverter(inverter);

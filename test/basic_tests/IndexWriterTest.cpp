@@ -1,6 +1,7 @@
 
 #include <gtest/gtest.h>
 #include <iostream>
+#include <limits>
 #include <solux/index/Inverter.h>
 #include <latch>
 #include <solux/server/ProtoUpdateMessage.h>
@@ -8,6 +9,7 @@
 #include "solux/index/IndexWriter.h"
 #include "solux/search/IndexReader.h"
 #include "test/SoluxTest.h"
+#include "test/CollectionHelper.h"
 
 #define TEST_DEBUG LOG_TRACE
 // #define TEST_DEBUG LOG_DEBUG
@@ -422,4 +424,49 @@ TEST_F(IndexWriterTest, multiThreaded) {
   EXPECT_EQ(docsRequested.load(), docsAdded.load());
   EXPECT_EQ(docsRequested.load(), docsVisible.load());
   EXPECT_EQ(commitsRequested.load(), commits.load());
+}
+
+
+// Test that _version_ field is present when overwrite=true and absent otherwise
+TEST_F(IndexWriterTest, versionFieldOverwrite) {
+  using namespace solux::test;
+  
+  CollectionHelper helper("main");
+  helper.clear();
+
+  Doc doc1 = flatdoc("id", "doc1", "text_w", "hello world");
+  helper.index(doc1, UpdateMessage::COMMIT, false);
+
+  Doc doc2 = flatdoc("id", "doc2", "text_w", "hello version world");
+  auto result2 = helper.index(doc2, UpdateMessage::COMMIT, true);
+
+  Doc doc3 = flatdoc("id", "doc3", "text_w", "hello third world");
+  auto result3 = helper.index(doc3, UpdateMessage::COMMIT, true);
+  
+  EXPECT_GT(result3.updateVersion, result2.updateVersion);
+
+  auto* req = LocalReq::create(helper.getSearchEngine());
+  auto docs = req->collection("main")
+                 .allQuery()
+                 .fields({"id", "text_w", "_version_"})
+                 .limit(-1)
+                 .execute()
+                 .getDocs();
+
+
+  req->done();
+  ASSERT_EQ(3, docs.size());
+  
+  Doc expectedDoc1 = flatdoc("id", "doc1", "_version_", std::numeric_limits<int64_t>::min());
+  Doc expectedDoc2 = flatdoc("id", "doc2", "_version_", (int64_t)(result2.updateVersion));
+  Doc expectedDoc3 = flatdoc("id", "doc3", "_version_", (int64_t)(result3.updateVersion));
+  
+  bool foundDoc1 = containsDoc(docs, expectedDoc1);
+  EXPECT_TRUE(foundDoc1);
+
+  bool foundDoc2 = containsDoc(docs, expectedDoc2);
+  EXPECT_TRUE(foundDoc2);
+
+  bool foundDoc3 = containsDoc(docs, expectedDoc3);
+  EXPECT_TRUE(foundDoc3);
 }

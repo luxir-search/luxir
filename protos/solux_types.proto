@@ -393,7 +393,7 @@ message ArrInt32 {
 message ColStr {
   // this will cause an additional tag (byte) per string value, but strings are normally somewhat larger anyway
   // repeated google.protobuf.StringValue v = 1;
-  string missingVal = 1;
+  string missing_val = 1;
   repeated string v = 2;
 }
 
