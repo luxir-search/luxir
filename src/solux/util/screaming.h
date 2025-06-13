@@ -4,6 +4,7 @@
 #include <vector>
 #include <bit>
 #include <cstring>
+#include <memory>
 #include <memory_resource>
 #include <sstream>
 #include <assert.h>
@@ -46,8 +47,8 @@ class OpenBitSet {
 public:
   using word_type = word_type_;
   using index_type = index_type_;
-  static constexpr uint64_t size = size_;
-  static constexpr index_type sizeInBytes = size / 8;
+  static constexpr uint64_t fixedSize = size_;
+  static constexpr index_type sizeInBytes = fixedSize / 8;
   static constexpr index_type numWords = sizeInBytes / sizeof(word_type);
   // number of bits to shift to get the word index. std::bit_width is 1+log2(x), so sub 1 to get back to log2(x)
   static constexpr uint8_t wordShift = std::bit_width(sizeof(word_type) * 8) - 1; // shift to get word of index
@@ -66,14 +67,14 @@ public:
 
 
   void set(index_type val) {
-    assert(val < size);
+    assert(val < fixedSize);
     index_type wordIdx = val >> wordShift;
     uint8_t bitIdx = val & wordMask;
     words[wordIdx] |= (word_type)1 << bitIdx;
   }
 
   bool get(index_type val) const {
-    assert(val < size);
+    assert(val < fixedSize);
     index_type wordIdx = val >> wordShift;
     uint8_t bitIdx = val & wordMask;
     return words[wordIdx] & ((word_type)1 << bitIdx);
@@ -81,7 +82,7 @@ public:
 
   // returns 0 or 1
   int getInt(index_type val) const {
-    assert(val < size);
+    assert(val < fixedSize);
     index_type wordIdx = val >> wordShift;
     uint8_t bitIdx = val & wordMask;
     return (words[wordIdx] >> bitIdx) & 0x01;
@@ -90,7 +91,7 @@ public:
 
   // Returns the next set bit or MAX_INDEX if none exists.
   index_type nextSetBit(index_type val) const {
-    assert(val < size);
+    assert(val < fixedSize);
     index_type wordIdx = val >> wordShift;
     uint8_t bitIdx = val & wordMask;
     word_type word = words[wordIdx] >> bitIdx;
@@ -163,6 +164,61 @@ public:
     }
   }
 
+};
+
+
+/// A bitset with int32_t for indexes with a size that is given at runtime.
+/// This only creates a view over existing memory.
+class FixedBitSet : public OpenBitSet<std::numeric_limits<int32_t>::max(), uint64_t, uint32_t> {
+  using OBS = OpenBitSet;
+  uint32_t nbits;
+public:
+  FixedBitSet(uint64_t* ptr, int32_t nbits) : OpenBitSet(ptr), nbits(nbits) {
+  }
+
+  /// number of words needed to store nbit bits
+  static size_t sizeInWords(int32_t nbits) {
+    assert(nbits >= 0);
+    uint64_t sz = static_cast<uint64_t>(nbits);
+    assert(sz <= OBS::fixedSize);
+    // do we need to round up to a multiple of word_type?
+    uint64_t numWords = (sz + sizeof(uint64_t)*8 - 1) / (sizeof(uint64_t) * 8); // round up to nearest word
+    return numWords * sizeof(uint64_t);
+  }
+
+  static std::unique_ptr<uint64_t[]> allocate(int32_t nbits) {
+    return std::make_unique<uint64_t[]>(sizeInWords(nbits));
+  }
+
+  uint32_t size() const {
+    return nbits;
+  }
+
+  void set(int32_t index) {
+    index_type val = static_cast<index_type>(index);
+    assert(index >= 0 && val < nbits);
+    return OBS::set(val);
+  }
+
+  bool get(int32_t index) const {
+    index_type val = static_cast<index_type>(index);
+    assert(index >= 0 && val < nbits);
+    return OBS::get(val);
+  }
+
+  // returns 0 or 1
+  int getInt(int32_t index) const {
+    index_type val = static_cast<index_type>(index);
+    assert(index >= 0 && val < nbits);
+    return OBS::getInt(val);
+  }
+
+  // Returns the next set bit starting at the given index, or MAX_INDEX if none exists.
+  index_type nextSetBit(int32_t index) const {
+    index_type val = static_cast<index_type>(index);
+    assert(index >= 0 && val < nbits);
+    return OBS::nextSetBit(val);
+  }
 };
 
 
@@ -348,7 +404,7 @@ public:
     // and may have to advance to the next bucket to get it.
     int32_t denseNextMaybe() {
       int next = curr + 1;
-      if (next < bucketBase + Bits::size) {
+      if (next < bucketBase + Bits::fixedSize) {
         auto localIndex = uint16_t(next);
         // if localIndex==0 then we wrapped
         auto localFound = bucket.bits.obs.nextSetBit(localIndex);
@@ -672,7 +728,7 @@ protected:
 };
 
 class StringStreamBuilder : public Builder<StringStreamBuilder> {
-  friend class Builder;
+  friend class screaming::Builder<StringStreamBuilder>;
   std::pmr::memory_resource* resource;
   std::ostringstream& out;
 public:

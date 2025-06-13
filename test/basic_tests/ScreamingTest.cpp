@@ -138,7 +138,7 @@ public:
 
       // now iterate over bits and add to our builder
       int val = -1;
-      for(;val < (int)screaming::BitSet::Bits::size - 1;) {
+      for(;val < (int)screaming::BitSet::Bits::fixedSize - 1;) {
         val = (int)obs.nextSetBit(val + 1);
         if (val == (int)screaming::BitSet::Bits::MAX_INDEX) break;
         add(base + val);
