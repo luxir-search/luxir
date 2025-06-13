@@ -3,10 +3,16 @@
 #include "TestUtils.h"
 #include "solux/index/IndexWriter.h"
 #include "solux/server/ProtoUpdateMessage.h"
+#include "solux/search/SearchEngine.h"
+#include "LocalReq.h"
 #include <google/protobuf/arena.h>
 
 namespace solux::test {
 
+struct IndexResult {
+  uint64_t updateVersion;
+  bool success;
+};
 
 class CollectionHelper {
 private:
@@ -74,23 +80,28 @@ public:
     collection().getShard()->getIndexWriter()->commit();
   }
 
-  void index(const Doc& doc, UpdateMessage::CommitType commitType = UpdateMessage::NO_COMMIT) {
-    index({&doc,1}, commitType);
+  IndexResult index(const Doc& doc, UpdateMessage::CommitType commitType = UpdateMessage::NO_COMMIT, bool overwrite = false) {
+    return index({&doc,1}, commitType, overwrite);
   }
 
-  void index(std::span<const Doc> docs, UpdateMessage::CommitType commitType = UpdateMessage::NO_COMMIT) {
+  IndexResult index(std::span<const Doc> docs, UpdateMessage::CommitType commitType = UpdateMessage::NO_COMMIT, bool overwrite = false) {
     auto writer = collection().getShard()->getIndexWriter();
 
     class BlockingProtoUpdateMessage : public ProtoUpdateMessage {
     public:
       Blocker blocker;
+      IndexResult* result;
       
-      explicit BlockingProtoUpdateMessage(proto::UpdateRequest* req) 
-        : ProtoUpdateMessage(req) {
+      explicit BlockingProtoUpdateMessage(proto::UpdateRequest* req, IndexResult* result = nullptr) 
+        : ProtoUpdateMessage(req), result(result) {
       }
 
       void done(IndexWriter& iw) override {
         unused(iw);
+        if (result) {
+          result->updateVersion = updateVersion;
+          result->success = !ProtoUpdateMessage::result.errored();
+        }
         blocker.notify();
       }
     };
@@ -103,34 +114,38 @@ public:
       convertDocToProto(doc, *request->add_docs());
     }
     
-    // Set commit type
+    // Set commit type and overwrite flag
     request->set_commit(static_cast<proto::UpdateRequest::CommitType>(commitType));
+    request->set_overwrite(overwrite);
     
     // Create and submit the update message
-    BlockingProtoUpdateMessage updateMessage(request);
+    IndexResult result;
+    BlockingProtoUpdateMessage updateMessage(request, &result);
     
     bool success = writer->submitUpdate(&updateMessage);
     assert(success);
     unused(success);
 
     updateMessage.blocker.wait();
-  }
-
-  // Async version of index.  Docs will be moved into the update message.
-  void index(Doc&& doc, std::function<void(ErrorHolder& result)>&& callback,
-             UpdateMessage::CommitType commitType = UpdateMessage::NO_COMMIT) {
-    index(std::vector<Doc>{doc}, std::move(callback), commitType);
+    return result;
   }
 
 
   // Async version of index.  Docs will be moved into the update message.
-  void index(std::vector<Doc>&& docs, std::function<void(ErrorHolder& result)>&& callback,
-             UpdateMessage::CommitType commitType = UpdateMessage::NO_COMMIT) {
+  void index(Doc&& doc, std::function<void(const IndexResult& result)>&& callback,
+             UpdateMessage::CommitType commitType = UpdateMessage::NO_COMMIT, bool overwrite = false) {
+    index(std::vector<Doc>{doc}, std::move(callback), commitType, overwrite);
+  }
+
+
+  // Async version of index.  Docs will be moved into the update message.
+  void index(std::vector<Doc>&& docs, std::function<void(const IndexResult& result)>&& callback,
+             UpdateMessage::CommitType commitType = UpdateMessage::NO_COMMIT, bool overwrite = false) {
     auto writer = collection().getShard()->getIndexWriter();
 
     class ProtoUpdateMessageWithCallback : public ProtoUpdateMessage {
     public:
-      std::function<void(ErrorHolder& result)> callback;
+      std::function<void(const IndexResult& result)> callback;
       std::unique_ptr<google::protobuf::Arena> arena;
       
       ProtoUpdateMessageWithCallback(proto::UpdateRequest* req, std::unique_ptr<google::protobuf::Arena> arena) 
@@ -139,6 +154,9 @@ public:
 
       void done(IndexWriter& iw) override {
         unused(iw);
+        IndexResult result;
+        result.updateVersion = updateVersion;
+        result.success = !ProtoUpdateMessage::result.errored();
         callback(result);
         delete this;
       }
@@ -153,8 +171,9 @@ public:
       convertDocToProto(doc, *request->add_docs());
     }
     
-    // Set commit type
+    // Set commit type and overwrite flag
     request->set_commit(static_cast<proto::UpdateRequest::CommitType>(commitType));
+    request->set_overwrite(overwrite);
     
     auto* updateMessage = new ProtoUpdateMessageWithCallback(request, std::move(arena));
     updateMessage->callback = std::move(callback);
@@ -174,6 +193,11 @@ public:
   // Directly get a handler to the IndexWriter for more low-level control of indexing operations.
   std::shared_ptr<IndexWriter> getIndexWriter() {
     return collection().getShard()->getIndexWriter();
+  }
+
+  // Get the search engine for creating LocalReq objects
+  SearchEngine& getSearchEngine() {
+    return SoluxTest::soluxNode->getSearchEngine();
   }
 
   /// Given a number of documents, a merge factor, and an index shape, calculate the number of

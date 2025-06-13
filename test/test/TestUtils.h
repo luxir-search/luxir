@@ -1,6 +1,8 @@
 #pragma once
 
 #include <array>
+#include <map>
+#include <string>
 #include "SoluxTest.h"
 #include "solux/index/IndexWriter.h"
 
@@ -73,5 +75,125 @@ template<class... Ts>
 struct overloaded : Ts... { using Ts::operator()...; };
 template<class... Ts>
 overloaded(Ts...) -> overloaded<Ts...>;
+
+// Utility function to compare Doc objects for testing
+inline bool docEquals(const Doc& doc1, const Doc& doc2) {
+  if (doc1.size() != doc2.size()) {
+    return false;
+  }
+
+  // Fast path assuming the docs have the same order of fields.
+  // If they do, we can compare them directly without creating maps.
+  // If they don't then create maps for comparison to avoid O(n^2) complexity.
+  size_t i = 0;
+  for (; i < doc1.size(); ++i) {
+    if (doc1[i].name != doc2[i].name) {
+      break;
+    }
+    if (doc1[i].val != doc2[i].val) {
+      return false; // values don't match.
+    }
+  }
+  if (i == doc1.size()) {
+    return true; // All fields matched in order
+  }
+  
+  // Create maps for easier comparison (field name -> value)
+  boost::unordered_flat_map<std::string_view, FieldVal> map1, map2;
+  for (const auto& nv : doc1) {
+    map1[nv.name] = nv.val;
+  }
+  for (const auto& nv : doc2) {
+    map2[nv.name] = nv.val;
+  }
+  
+  if (map1.size() != map2.size()) {
+    return false;
+  }
+  
+  for (const auto& [name, val1] : map1) {
+    auto it = map2.find(name);
+    if (it == map2.end()) {
+      return false; // Field not found in doc2
+    }
+    
+    if (val1 != it->second) {
+      return false; // Values don't match
+    }
+  }
+  
+  return true;
+}
+
+// Function to find a Doc in a vector that matches the given doc
+inline bool containsDoc(const std::vector<Doc>& docs, const Doc& target) {
+  for (const auto& doc : docs) {
+    if (docEquals(doc, target)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// Function to print a Doc for debugging
+inline std::string docToString(const Doc& doc) {
+  std::string result = "{";
+  bool first = true;
+  for (const auto& nv : doc) {
+    if (!first) result += ", ";
+    first = false;
+    
+    result += nv.name + ": ";
+    std::visit(overloaded{
+      [&](bool v) { result += (v ? "true" : "false"); },
+      [&](int64_t v) { result += std::to_string(v); },
+      [&](float v) { result += std::to_string(v); },
+      [&](double v) { result += std::to_string(v); },
+      [&](const std::string& v) { result += "\"" + v + "\""; },
+      [&](const std::vector<bool>& v) { 
+        result += "[";
+        for (size_t i = 0; i < v.size(); ++i) {
+          if (i > 0) result += ",";
+          result += (v[i] ? "true" : "false");
+        }
+        result += "]";
+      },
+      [&](const std::vector<int64_t>& v) { 
+        result += "[";
+        for (size_t i = 0; i < v.size(); ++i) {
+          if (i > 0) result += ",";
+          result += std::to_string(v[i]);
+        }
+        result += "]";
+      },
+      [&](const std::vector<float>& v) { 
+        result += "[";
+        for (size_t i = 0; i < v.size(); ++i) {
+          if (i > 0) result += ",";
+          result += std::to_string(v[i]);
+        }
+        result += "]";
+      },
+      [&](const std::vector<double>& v) { 
+        result += "[";
+        for (size_t i = 0; i < v.size(); ++i) {
+          if (i > 0) result += ",";
+          result += std::to_string(v[i]);
+        }
+        result += "]";
+      },
+      [&](const std::vector<std::string>& v) { 
+        result += "[";
+        for (size_t i = 0; i < v.size(); ++i) {
+          if (i > 0) result += ",";
+          result += "\"" + v[i] + "\"";
+        }
+        result += "]";
+      }
+    }, nv.val);
+  }
+  result += "}";
+  return result;
+}
 
 } // solux::test
