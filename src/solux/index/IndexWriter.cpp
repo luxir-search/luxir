@@ -503,8 +503,8 @@ void IndexWriter::applyDeletes(SegInfo& seg, MultiDeletesData& multiDeletesData)
         seg.deletesGen++;
       }
 
-      LOG_INFO("Applied {} deletes to segment {} (new delete generation: {})", 
-               deletedDocs.size(), seg.segId, seg.deletesGen);
+      INDEX_DEBUG("Applied {} deletes to segment {} (new delete generation: {})", 
+                  deletedDocs.size(), seg.segId, seg.deletesGen);
     }
   }
 }

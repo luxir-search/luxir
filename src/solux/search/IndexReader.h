@@ -1,5 +1,7 @@
 #pragma once
 #include <span>
+#include <filesystem>
+#include <system_error>
 #include "solux/reader/PostingsReader.h"
 #include "solux/util/screaming.h"
 #include "protos/solux_types.pb.h"
@@ -38,29 +40,34 @@ public:
     
     auto deleteFile = dir.openFile(deleteFileName);
     if (deleteFile == nullptr) {
-      LOG_WARN("Delete file {} not found for segment {} (deletesGen={})", deleteFileName, segId, deletesGen);
-      return;
+      // Delete file not found - this indicates the index has changed between reading segments 
+      // and opening delete files. Throw filesystem_error to trigger IndexReader retry logic.
+      std::string msg = fmt::format("Delete file {} not found for segment {} (deletesGen={})", 
+                                   deleteFileName, segId, deletesGen);
+      throw std::filesystem::filesystem_error(msg, deleteFileName, 
+                                             std::make_error_code(std::errc::no_such_file_or_directory));
     }
     LOG_DEBUG("Successfully opened delete file {} for segment {}", deleteFileName, segId);
     
     InputStream deleteStream = deleteFile->getInputStream();
-    screaming::BitSet deleteBitset(deleteStream.ptr() + deleteStream.size());
+    
+    // Create DeleteData first with stored stream to ensure proper lifetime
+    deleteData = std::make_unique<DeleteData>();
+    deleteData->deleteFile = std::move(deleteFile);
+    deleteData->deleteStream = std::move(deleteStream);
+    
+    // Now create BitSet from the stored stream's memory
+    deleteData->bits.set(deleteData->deleteStream.ptr() + deleteData->deleteStream.size());
 
     int32_t numDeleted = 0;
     // Count deleted documents
-    screaming::BitSet::Iterator iter(deleteBitset);
+    screaming::BitSet::Iterator iter(deleteData->bits);
     int32_t deletedDoc = iter.next();
     while (deletedDoc != screaming::BitSet::END) {
       numDeleted++;
       deletedDoc = iter.next();
     }
-
-    deleteData = std::make_unique<DeleteData>(
-      std::move(deleteBitset),
-      std::move(deleteFile),
-      std::move(deleteStream),
-      numDeleted
-    );
+    deleteData->numDeleted = numDeleted;
 
     LOG_DEBUG("Loaded {} deleted documents from {} for segment {}", 
               numDeleted, deleteFileName, segId);
@@ -76,10 +83,13 @@ public:
   }
   
   bool hasDeletes() const {
-    return deleteData != nullptr;
+    return deleteData != nullptr && deleteData->numDeleted > 0;
   }
   
   int32_t numDeletedDocs() const {
+    if (!deleteData) {
+      return 0;
+    }
     return deleteData->numDeleted;
   }
 };
@@ -207,7 +217,7 @@ public:
     return segs;
   }
 
-  int64_t numDocs() const noexcept {
+  int64_t maxDoc() const noexcept {
     return maxdoc;
   }
 

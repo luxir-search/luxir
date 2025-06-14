@@ -2,6 +2,7 @@
 #include <gtest/gtest.h>
 #include <iostream>
 #include <limits>
+#include <filesystem>
 #include <solux/index/Inverter.h>
 #include <latch>
 #include <solux/server/ProtoUpdateMessage.h>
@@ -49,7 +50,7 @@ TEST_F(IndexWriterTest, simple) {
 
   IndexReader r1(dir);
   ASSERT_EQ(1, r1.segments().size());
-  ASSERT_EQ(1, r1.numDocs());
+  ASSERT_EQ(1, r1.maxDoc());
 
   inverter = &iw.obtainInverter();
   fieldHandler = &inverter->getIndexHandler(field);
@@ -68,7 +69,7 @@ TEST_F(IndexWriterTest, simple) {
 
   IndexReader r2(dir);
   ASSERT_EQ(2, r2.segments().size());
-  ASSERT_EQ(3, r2.numDocs());
+  ASSERT_EQ(3, r2.maxDoc());
   ASSERT_GT(r2.commitTime(), r1.commitTime());
 }
 
@@ -77,7 +78,7 @@ TEST_F(IndexWriterTest, getReader) {
   RAMDir dir;
   IndexWriter iw(dir);
   auto reader = iw.getIndexReader();
-  ASSERT_EQ(0, reader->numDocs());
+  ASSERT_EQ(0, reader->maxDoc());
   ASSERT_EQ(0, reader->segments().size());  // could change depending on impl
 
   addDoc(iw);
@@ -89,7 +90,7 @@ TEST_F(IndexWriterTest, getReader) {
   // now make it visible.
   iw.commit();
   reader = iw.getIndexReader();
-  ASSERT_EQ(1, reader->numDocs());
+  ASSERT_EQ(1, reader->maxDoc());
   ASSERT_EQ(1, reader->segments().size());
 
   // now add another doc, commit, but get a reader with permissive freshness
@@ -104,7 +105,7 @@ TEST_F(IndexWriterTest, getReader) {
   // now test a reader that is not fresh enough
   reader2 = iw.getIndexReader(1);  // can be up to 1 microseconds old! (0 is a special case, so we just chose smallest value we can)
   ASSERT_NE(reader, reader2);  // It's possible this could spuriously fail if the sleep wasn't long enough or the system clock is changed.
-  ASSERT_EQ(2, reader2->numDocs());
+  ASSERT_EQ(2, reader2->maxDoc());
   ASSERT_EQ(2, reader2->segments().size());
 }
 
@@ -131,7 +132,7 @@ TEST_F(IndexWriterTest, autoMerge) {
     // make sure we're making the segments we think we are:
     auto reader = iw.getIndexReader();
     ASSERT_EQ(MERGE_FACTOR - 1, reader->segments().size());
-    ASSERT_EQ(MERGE_FACTOR - 1, reader->numDocs());
+    ASSERT_EQ(MERGE_FACTOR - 1, reader->maxDoc());
 
     addDoc(iw);
 
@@ -157,7 +158,7 @@ TEST_F(IndexWriterTest, autoMerge) {
     iw.commit();
     // pre-merge view
     reader = iw.getIndexReader();
-    ASSERT_EQ(reader->numDocs(), MERGE_FACTOR);
+    ASSERT_EQ(reader->maxDoc(), MERGE_FACTOR);
     ASSERT_EQ(reader->segments().size(), MERGE_FACTOR);
     mergeStart.count_down(); // let the merge continue
     */
@@ -169,7 +170,7 @@ TEST_F(IndexWriterTest, autoMerge) {
     auto finishCommit = [&]() {
       auto reader = iw.getIndexReader();
       mergeStart.count_down();  // let merge continue
-      EXPECT_EQ(reader->numDocs(), MERGE_FACTOR);
+      EXPECT_EQ(reader->maxDoc(), MERGE_FACTOR);
       EXPECT_EQ(reader->segments().size(), MERGE_FACTOR);
     };
 
@@ -185,7 +186,7 @@ TEST_F(IndexWriterTest, autoMerge) {
     iw.updateGraph.wait_for_all();
 
     reader = iw.getIndexReader();
-    ASSERT_EQ(reader->numDocs(), MERGE_FACTOR);
+    ASSERT_EQ(reader->maxDoc(), MERGE_FACTOR);
     ASSERT_EQ(reader->segments().size(), 1);
   }
 }
@@ -295,7 +296,7 @@ TEST_F(IndexWriterTest, multiThreaded) {
                         auto globalDocsVisible = docsVisible.load();
 
                         auto reader = iw.getIndexReader();
-                        auto localDocsVisible = reader->numDocs();
+                        auto localDocsVisible = reader->maxDoc();
                         EXPECT_GE(localDocsVisible, globalDocsVisible);
                         while (localDocsVisible > globalDocsVisible) {
                           if (!docsVisible.compare_exchange_weak(globalDocsVisible, localDocsVisible)) {
@@ -383,10 +384,10 @@ TEST_F(IndexWriterTest, multiThreaded) {
     while (docsRequested.load() < docsToAdd || docsVisible.load() < docsToAdd) {
       auto reader = iw.getIndexReader();
       LOG_INFO("### Main Thread docsRequested: {}, docsAdded: {}, docsVisible: {}, commitsRequested: {}, commits: {}",
-              docsRequested.load(), docsAdded.load(), reader->numDocs(), commitsRequested.load(), commits.load());
+              docsRequested.load(), docsAdded.load(), reader->maxDoc(), commitsRequested.load(), commits.load());
 
 
-      if (docsRequested.load() >= docsToAdd && reader->numDocs() < docsToAdd) {
+      if (docsRequested.load() >= docsToAdd && reader->maxDoc() < docsToAdd) {
         if (iw.lastAdvertisedCommitTime != reader->commitTime()) {
           LOG_ERROR("Reader not seeing last advertised commit time! {} vs {}", iw.lastAdvertisedCommitTime.load(), reader->commitTime());
         }
@@ -405,7 +406,7 @@ TEST_F(IndexWriterTest, multiThreaded) {
 
         iw.commit();
         reader = iw.getIndexReader();
-        if (reader->numDocs() == docsToAdd) {
+        if (reader->maxDoc() == docsToAdd) {
           LOG_ERROR("FINAL COMMIT MADE DOCS VISIBLE! Test Bug or IW bug?");
           FAIL();
         } else {
@@ -471,7 +472,7 @@ TEST_F(IndexWriterTest, versionFieldOverwrite) {
   EXPECT_TRUE(foundDoc3);
 }
 
-// Test deletion functionality - verify delete bitmaps are written correctly  
+// Test deletion functionality - verify delete infrastructure works  
 TEST_F(IndexWriterTest, deletionInfrastructure) {
   using namespace solux::test;
   
@@ -480,7 +481,7 @@ TEST_F(IndexWriterTest, deletionInfrastructure) {
 
   // Add 3 documents with versions (overwrite=true adds _version_ field)
   Doc doc1 = flatdoc("id", "doc1", "text_w", "hello world");
-  auto result1 = helper.index(doc1, UpdateMessage::COMMIT, true);
+  helper.index(doc1, UpdateMessage::COMMIT, true);
 
   Doc doc2 = flatdoc("id", "doc2", "text_w", "goodbye world");
   helper.index(doc2, UpdateMessage::COMMIT, true);
@@ -499,6 +500,50 @@ TEST_F(IndexWriterTest, deletionInfrastructure) {
   // Get a fresh IndexReader after the delete commit
   auto indexReader = indexWriter->getIndexReader(0);  // Force fresh reader
 
-  // TODO: implement the verification logic here
+  // Check that at least one segment has deletes applied
+  bool foundDeletes = false;
+  int32_t totalDeletesFound = 0;
+  
+  for (const auto& segment : indexReader->segments()) {
+    const auto& segInfo = segment.segInfo;
+    
+    if (segInfo.deletes > 0) {
+      foundDeletes = true;
+      totalDeletesFound += segInfo.deletes;
+      
+      // Verify delete metadata is consistent
+      EXPECT_GT(segInfo.deletes_gen, 0);
+      EXPECT_TRUE(segment.deletedDocs().hasDeletes());
+      EXPECT_EQ(segment.deletedDocs().numDeletedDocs(), segInfo.deletes);
+      
+      // Verify delete bitmap functionality
+      int32_t numDocs = segment.postingsReader().numDocs();
+      int32_t deletedCount = 0;
+      
+      for (int32_t docId = 0; docId < numDocs; docId++) {
+        if (segment.deletedDocs().isDeleted(docId)) {
+          deletedCount++;
+        }
+      }
+      
+      EXPECT_EQ(deletedCount, segInfo.deletes);
+      
+      LOG_TRACE("Segment {} has {} deletes (generation {}), verified {} deleted docs of {} total", 
+                segInfo.seg_id, segInfo.deletes, segInfo.deletes_gen, 
+                deletedCount, numDocs);
+    } else {
+      // Segments without deletes should have consistent state
+      EXPECT_EQ(segInfo.deletes_gen, 0);
+      EXPECT_FALSE(segment.deletedDocs().hasDeletes());
+      EXPECT_EQ(segment.deletedDocs().numDeletedDocs(), 0);
+    }
+  }
+  
+  // Verify we found the expected delete
+  EXPECT_TRUE(foundDeletes);
+  EXPECT_EQ(totalDeletesFound, 1);
+  
+  LOG_TRACE("Delete infrastructure verification completed: {} segments checked, {} total deletes found", 
+            indexReader->segments().size(), totalDeletesFound);
 
 }

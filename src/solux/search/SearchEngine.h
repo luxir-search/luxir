@@ -200,7 +200,7 @@ public:
 
         std::vector<bool>* currBitset = dom ? &dom->allMatches[segnum].docs : nullptr;
         if (currBitset) {
-          currBitset->resize(req.reader->numDocs());
+          currBitset->resize(req.reader->maxDoc());
         }
 
         if (scorer != nullptr) {
@@ -302,7 +302,7 @@ public:
           unused(offset); // TODO
           int64_t specifiedLimit = topDocsReq.has_limit() ? topDocsReq.limit() : 10;
           // limit to actual number of docs in the index (or all if limit == -1)
-          int64_t limit = specifiedLimit < 0 ? req.reader->numDocs() : std::min(specifiedLimit, req.reader->numDocs());
+          int64_t limit = specifiedLimit < 0 ? req.reader->maxDoc() : std::min(specifiedLimit, req.reader->maxDoc());
 
           auto* qcontext = google::protobuf::Arena::Create<Query::Context>(&req.arena, req.requestPool, *req.reader);
           auto* qr = google::protobuf::Arena::Create<QueryReq>(&req.arena, req, *qcontext, query, limit);

@@ -19,12 +19,11 @@
 #include <google/protobuf/io/coded_stream.h>
 #include <google/protobuf/io/zero_copy_stream_impl_lite.h>
 
+namespace solux {
+
 // redefine DEBUG to TRACE level which shouldn't currently be logged!
 #define INDEX_DEBUG LOG_TRACE
 // #define INDEX_DEBUG LOG_DEBUG
-
-namespace solux {
-
 
 /// The IndexWriter is a level above Inverter & PostingsWriter that coordinates
 /// indexing activity for a single index / directory.
@@ -389,7 +388,7 @@ public:
     // then make sure that the updates are finished in order so all updates are done before a commit is processed.
     updateSequencerNode = std::make_unique<tbb::flow::sequencer_node<UpdateMessage*> >(updateGraph,
       [this](UpdateMessage* msg) -> size_t {
-        INDEX_DEBUG("updateSequencerNode: msg={} seqNum={}", (void*)msg, msg->seqNum);
+        INDEX_DEBUG("updateSequencerNode: msg={} updateVersion={}", (void*)msg, msg->updateVersion);
         return msg->updateVersion - this->updateBase - 1;   // get a 0 based sequence number for the sequencer node;
       });
 
@@ -456,7 +455,7 @@ private:
     } else {
       msg.commitNum = 0;
     }
-    INDEX_DEBUG("startUpdateBody: msg={} seqNum={} commitNum={}", (void*)&msg, msg.seqNum, msg.commitNum);
+    INDEX_DEBUG("startUpdateBody: msg={} updateVersion={} commitNum={}", (void*)&msg, msg.updateVersion, msg.commitNum);
   }
 
   void processUpdateBody(UpdateMessage& msg) {
@@ -897,8 +896,8 @@ public:
     std::sort(segs.begin(), segs.end(), [](const SegInfo* a, const SegInfo* b) {
          /*
          // first sort on number of documents (largest first), then on segment id (smallest first)
-         if (a->nDocs != b->nDocs) {
-           return a->nDocs > b->nDocs;
+         if (a->maxDoc != b->maxDoc) {
+           return a->maxDoc > b->maxDoc;
          }
           */
          return a->segId < b->segId;
@@ -937,7 +936,7 @@ public:
         seg->commitTime = now_us;
       }
       numDocs += seg->maxDoc;
-      INDEX_DEBUG("\tsegId={} nDocs={} commitTime={}", seg->segId, seg->nDocs, seg->commitTime);
+      INDEX_DEBUG("\tsegId={} maxDoc={} commitTime={}", seg->segId, seg->maxDoc, seg->commitTime);
     }
 
     // Serialize the protobuf message - TODO: hook into other serialization methods to avoid string

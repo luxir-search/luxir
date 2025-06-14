@@ -30,7 +30,7 @@ TEST_F(TextMergeTest, basicMerge) {
   f.startReading();
 
   // test docs-with-value
-  ASSERT_EQ(2, testIndex.reader->numDocs());
+  ASSERT_EQ(2, testIndex.reader->maxDoc());
   ASSERT_EQ(1, testIndex.reader->segments().size());
   ASSERT_EQ(0, f.nextDoc());
   ASSERT_EQ(1, f.nextDoc());
@@ -62,7 +62,7 @@ TEST_F(TextMergeTest, basicMerge) {
   testIndex.iw->mergeSegments();
 
   f2.startReading();
-  ASSERT_EQ(3, testIndex.reader->numDocs());
+  ASSERT_EQ(3, testIndex.reader->maxDoc());
   ASSERT_EQ(1, testIndex.reader->segments().size());
   ASSERT_EQ(2, f2.nextDoc());
   ASSERT_EQ(-1, f2.nextDoc());

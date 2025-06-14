@@ -141,7 +141,7 @@ TEST_F(IntColTest, basicMerge) {
 
   f.startReading();
 
-  ASSERT_EQ(2, testIndex.reader->numDocs());
+  ASSERT_EQ(2, testIndex.reader->maxDoc());
   ASSERT_EQ(1, testIndex.reader->segments().size());
   ASSERT_EQ(0, f.nextDoc());
   ASSERT_EQ(5, f.val());
@@ -158,7 +158,7 @@ TEST_F(IntColTest, basicMerge) {
   testIndex.iw->mergeSegments();
 
   f2.startReading();
-  ASSERT_EQ(8, testIndex.reader->numDocs());
+  ASSERT_EQ(8, testIndex.reader->maxDoc());
   ASSERT_EQ(1, testIndex.reader->segments().size());
   f.startReading();
   ASSERT_EQ(0, f.nextDoc());
