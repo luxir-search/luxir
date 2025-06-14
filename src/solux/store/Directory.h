@@ -121,8 +121,7 @@ public:
 
     auto &ramFile = dynamic_cast<OutputFileType &>(file);
     auto sz = ramFile.size();
-    // don't use make_unique as it uselessly zeroes memory first.
-    std::unique_ptr<char[]> singleBuffer(new char[sz]);
+    std::unique_ptr<char[]> singleBuffer = std::make_unique_for_overwrite<char[]>(sz);
     ramFile.copyTo(singleBuffer.get());
     auto inputFile = std::make_shared<RAMInputFile>(std::move(singleBuffer), sz);
 

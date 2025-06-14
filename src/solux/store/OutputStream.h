@@ -257,8 +257,6 @@ class RAMFile : public File {
   uint32_t firstLen = 0;
 
   void newBuffer(size_t size) {
-    // buffers.emplace_back( std::make_pair(std::unique_ptr<char[]>( new char[size]), size) );
-    // buffers.emplace_back( std::unique_ptr<char[]>( new char[size]), size );
     buffers.emplace_back(new char[size], size);
   }
 

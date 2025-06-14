@@ -11,7 +11,6 @@
 
 
 namespace screaming {
-
 // Screaming bitsets... a play on (and inspired by) Roaring Bitmaps
 
 // Design:
@@ -37,7 +36,7 @@ namespace screaming {
 
 // As in Solr, we need a bitset that doesn't hide its implementation.
 // size (number of bits) should be an exact multiple of word_type
-// word_type and index_type must be unsigned types.
+// word_type must be an unsigned type.
 // Example  OpenBitSet<65536, uint64_t, uint32_t> mySet;
 //
 // This can also be used as the basis for dynamically sized bitsets, just
@@ -49,7 +48,7 @@ public:
   using index_type = index_type_;
   static constexpr uint64_t fixedSize = size_;
   static constexpr index_type sizeInBytes = fixedSize / 8;
-  static constexpr index_type numWords = sizeInBytes / sizeof(word_type);
+  static constexpr index_type fixedNumWords = sizeInBytes / sizeof(word_type);
   // number of bits to shift to get the word index. std::bit_width is 1+log2(x), so sub 1 to get back to log2(x)
   static constexpr uint8_t wordShift = std::bit_width(sizeof(word_type) * 8) - 1; // shift to get word of index
   static constexpr word_type wordMask = sizeof(word_type) * 8 - 1;     // mask to get the bit index within a word
@@ -67,14 +66,14 @@ public:
 
 
   void set(index_type val) {
-    assert(val < fixedSize);
+    assert(val >= 0 && val < fixedSize);
     index_type wordIdx = val >> wordShift;
     uint8_t bitIdx = val & wordMask;
     words[wordIdx] |= (word_type)1 << bitIdx;
   }
 
   bool get(index_type val) const {
-    assert(val < fixedSize);
+    assert(val >= 0 && val < fixedSize);
     index_type wordIdx = val >> wordShift;
     uint8_t bitIdx = val & wordMask;
     return words[wordIdx] & ((word_type)1 << bitIdx);
@@ -82,7 +81,7 @@ public:
 
   // returns 0 or 1
   int getInt(index_type val) const {
-    assert(val < fixedSize);
+    assert(val >= 0 && val < fixedSize);
     index_type wordIdx = val >> wordShift;
     uint8_t bitIdx = val & wordMask;
     return (words[wordIdx] >> bitIdx) & 0x01;
@@ -90,8 +89,10 @@ public:
 
 
   // Returns the next set bit or MAX_INDEX if none exists.
-  index_type nextSetBit(index_type val) const {
-    assert(val < fixedSize);
+  // Assumes that any unused high bits in the last word are cleared.
+  // If that is not the case, this can return a value >= size.
+  index_type nextSetBit(index_type val, index_type numWords = fixedNumWords) const {
+    assert(val >= 0 && val < fixedSize);
     index_type wordIdx = val >> wordShift;
     uint8_t bitIdx = val & wordMask;
     word_type word = words[wordIdx] >> bitIdx;
@@ -116,8 +117,8 @@ public:
     std::memset(words, 0, sizeInBytes);
   }
 
-  void flip() {
-    for (index_type i = 0; i<numWords; i++) {
+  void flip(index_type numWords = fixedNumWords) {
+    for (index_type i = 0; i<fixedNumWords; i++) {
       words[i] = ~words[i];
     }
   }
@@ -168,57 +169,121 @@ public:
 
 
 /// A bitset with int32_t for indexes with a size that is given at runtime.
-/// This only creates a view over existing memory.
-class FixedBitSet : public OpenBitSet<std::numeric_limits<int32_t>::max(), uint64_t, uint32_t> {
+/// FixedBitSet is non-owning. It only creates a view over existing memory.
+class FixedBitSet : public OpenBitSet<std::numeric_limits<int32_t>::max(), uint64_t, int32_t> {
   using OBS = OpenBitSet;
-  uint32_t nbits;
+  const int32_t nbits;
+  const uint32_t nwords;
 public:
-  FixedBitSet(uint64_t* ptr, int32_t nbits) : OpenBitSet(ptr), nbits(nbits) {
+  FixedBitSet(uint64_t* ptr, int32_t nbits) : OpenBitSet(ptr), nbits(nbits), nwords(sizeInWords(nbits)) {
+    assert(nbits >= 0 && nbits <= OBS::fixedSize);
+    assert(ptr != nullptr || nbits == 0); // if nbits is 0, we can have a null pointer
   }
 
   /// number of words needed to store nbit bits
   static size_t sizeInWords(int32_t nbits) {
     assert(nbits >= 0);
-    uint64_t sz = static_cast<uint64_t>(nbits);
-    assert(sz <= OBS::fixedSize);
-    // do we need to round up to a multiple of word_type?
-    uint64_t numWords = (sz + sizeof(uint64_t)*8 - 1) / (sizeof(uint64_t) * 8); // round up to nearest word
-    return numWords * sizeof(uint64_t);
+    // since we went from signed to unsigned, we can add to sz without overflow issues.
+    uint32_t numWords = ((uint32_t)nbits + sizeof(uint64_t)*8 - 1) / (sizeof(uint64_t) * 8); // round up to nearest word
+    return numWords;
   }
 
-  static std::unique_ptr<uint64_t[]> allocate(int32_t nbits) {
-    return std::make_unique<uint64_t[]>(sizeInWords(nbits));
+  /// Allocate and return a bitset initialized with initialVal
+  static std::unique_ptr<uint64_t[]> allocate(int32_t nbits, bool initialVal=false) {
+    if (initialVal == false) {
+      // guaranteed value-initialized, so will be all zeroes
+      return std::make_unique<uint64_t[]>(sizeInWords(nbits));
+    } else {
+      // want all 1 bits.
+      auto numWords = sizeInWords(nbits);
+      auto ptr = std::make_unique_for_overwrite<uint64_t[]>(numWords);
+      std::memset(ptr.get(), 0xFF, numWords * sizeof(uint64_t));
+
+      auto usedBits = nbits % (sizeof(uint64_t) * 8);
+      // clear the high bits that are not used with a right shift
+      if (usedBits > 0) {
+        auto unusedBits = sizeof(uint64_t) * 8 - usedBits;
+        ptr[numWords - 1] >>= unusedBits;
+      }
+      return ptr;
+    }
   }
 
-  uint32_t size() const {
+  int32_t size() const {
     return nbits;
   }
 
   void set(int32_t index) {
-    index_type val = static_cast<index_type>(index);
-    assert(index >= 0 && val < nbits);
-    return OBS::set(val);
+    assert(index < nbits);
+    OBS::set(index);
   }
 
   bool get(int32_t index) const {
-    index_type val = static_cast<index_type>(index);
-    assert(index >= 0 && val < nbits);
-    return OBS::get(val);
+    assert(index < nbits);
+    return OBS::get(index);
   }
 
   // returns 0 or 1
   int getInt(int32_t index) const {
-    index_type val = static_cast<index_type>(index);
-    assert(index >= 0 && val < nbits);
-    return OBS::getInt(val);
+    assert(index < nbits);
+    return OBS::getInt(index);
   }
 
   // Returns the next set bit starting at the given index, or MAX_INDEX if none exists.
   index_type nextSetBit(int32_t index) const {
-    index_type val = static_cast<index_type>(index);
-    assert(index >= 0 && val < nbits);
-    return OBS::nextSetBit(val);
+    assert(index < nbits);
+    return OBS::nextSetBit(index, nwords);
   }
+
+  // Clear a bit at the given index
+  void clear(int32_t index) {
+    assert(index >= 0 && index < nbits);
+    index_type wordIdx = index >> OBS::wordShift;
+    uint8_t bitIdx = index & OBS::wordMask;
+    words[wordIdx] &= ~((word_type)1 << bitIdx);
+  }
+
+  // Returns the next clear bit starting at the given index, or MAX_INDEX if none exists.
+  index_type nextClearBit(int32_t index) const {
+    assert(index >= 0 && index <= nbits);
+    index_type wordIdx = index >> OBS::wordShift;
+    uint8_t bitIdx = index & OBS::wordMask;
+    
+    // Check the current word first, starting from the given bit
+    word_type word = ~words[wordIdx];  // invert to find clear bits
+    word &= ~((word_type(1) << bitIdx) - 1);  // mask off bits before index
+    
+    if (word != 0) {
+      int32_t result = (wordIdx << OBS::wordShift) + std::countr_zero(word);
+      if (result < nbits) {
+        return result;
+      }
+    }
+    
+    // Check subsequent words
+    for (auto i = wordIdx + 1; i < nwords; i++) {
+      word = ~words[i];  // invert to find clear bits
+      if (word != 0) {
+        int32_t result = (i << OBS::wordShift) + std::countr_zero(word);
+        if (result < nbits) {
+          return result;
+        }
+      }
+    }
+    
+    return MAX_INDEX;
+  }
+};
+
+
+/// An owning implementation of FixedBitSet that allocates its own memory.
+class RAMFixedBitSet : public FixedBitSet {
+  using OBS = OpenBitSet;
+public:
+  std::unique_ptr<uint64_t[]> ownedWords;
+
+  RAMFixedBitSet(int32_t nbits, bool initialVal=false) : FixedBitSet(allocate(nbits, initialVal).release(), nbits),
+  ownedWords(words) {}
 };
 
 
@@ -239,7 +304,7 @@ public:
   static constexpr int32_t END = std::numeric_limits<int32_t>::max();
 
   static constexpr uint32_t RANK_INDEX_SHIFT = 3; // for a dense (bitset) block, store a cumulative popcnt every 8 words
-  static constexpr uint32_t RANK_INDEX_SIZE = (Bits::numWords >> RANK_INDEX_SHIFT) * sizeof(uint16_t);
+  static constexpr uint32_t RANK_INDEX_SIZE = (Bits::fixedNumWords >> RANK_INDEX_SHIFT) * sizeof(uint16_t);
   static constexpr uint32_t SPARSE_CONTAINER_SIZE = Bits::sizeInBytes;
   static constexpr uint32_t DENSE_CONTAINER_SIZE = Bits::sizeInBytes + RANK_INDEX_SIZE;
 
@@ -430,7 +495,7 @@ public:
           // if bit buckets were 64 byte aligned, then every miniblock of 8 words would be exactly a cache line.
           auto localIndex = uint16_t(curr);
           auto rankIdx = localIndex >> (Bits::wordShift + RANK_INDEX_SHIFT);
-          uint16_t *rankIndexArr = reinterpret_cast<uint16_t *>(bucket.bits.obs.words + Bits::numWords);
+          uint16_t *rankIndexArr = reinterpret_cast<uint16_t *>(bucket.bits.obs.words + Bits::fixedNumWords);
           auto rankBase = rankIndexArr[rankIdx];
           // Now find the rank of words before the current word in our mini-block
           auto wordIndex = localIndex >> Bits::wordShift;
@@ -685,7 +750,7 @@ protected:
 
       if (rankIndex) {
         writeSize = BitSet::DENSE_CONTAINER_SIZE;
-        uint16_t* rankIndexArr = reinterpret_cast<uint16_t*>(bits.words + bits.numWords);
+        uint16_t* rankIndexArr = reinterpret_cast<uint16_t*>(bits.words + bits.fixedNumWords);
         uint16_t cumulativeRank = 0;
         constexpr uint32_t wordsPerCount = (1<<BitSet::RANK_INDEX_SHIFT);
         // The count represents the cumulative popcnt of the *previous* block, i.e. the first is 0.
@@ -697,7 +762,7 @@ protected:
         // Don't count the last block... it would never be used in our current round-down scheme in the iterator.
         // This also prevents cumulativeRank from overflowing 16 bits.  The other way to prevent it is to
         // implement the all-bits-set optimization of skipping the block entirely.
-        for (int i=0; i<bits.numWords - wordsPerCount; i += wordsPerCount) {
+        for (int i=0; i<bits.fixedNumWords - wordsPerCount; i += wordsPerCount) {
           int rank = 0;
           for (int j=i; j < i + wordsPerCount; j++) {
             rank += std::popcount(bits.words[j]);

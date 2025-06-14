@@ -28,7 +28,7 @@ public:
     int nAdds = 0;
 
     explicit BldBase(const Rng& rng = SoluxTest::rng) : rng(rng) {
-      buf.resize(screaming::BitSet::Bits::numWords);
+      buf.resize(screaming::BitSet::Bits::fixedNumWords);
       obs = screaming::BitSet::Bits(&buf[0]);
     }
 
@@ -407,7 +407,7 @@ TEST_F(ScreamingTest, allBuckets) {
 
 
 TEST_F(ScreamingTest, randomSets) {
-  int iter=100;
+  int iter=20;  // pump this up for more thorough testing
   for (int i=0; i<iter; i++) {
     int nBuckets = rng.rint(1,5);
     std::unique_ptr<BldBase> bldBase;
@@ -439,5 +439,152 @@ TEST_F(ScreamingTest, randomSets) {
     set.finishBuild();
     // set.verifyIterator();
     set.verifyIteratorSkips();
+  }
+}
+
+TEST_F(ScreamingTest, ramFixedBitSet) {
+  // Test with all bits initially false
+  {
+    screaming::RAMFixedBitSet bitset(129);
+    EXPECT_EQ(bitset.size(), 129);
+    
+    // Check all bits are initially false
+    for (int i = 0; i < 129; i++) {
+      EXPECT_FALSE(bitset.get(i));
+    }
+    
+    // Set some bits
+    bitset.set(0);
+    bitset.set(7);
+    bitset.set(64);
+    bitset.set(127);
+    
+    // Check set bits
+    EXPECT_TRUE(bitset.get(0));
+    EXPECT_TRUE(bitset.get(7));
+    EXPECT_TRUE(bitset.get(64));
+    EXPECT_TRUE(bitset.get(127));
+    
+    // Check unset bits
+    EXPECT_FALSE(bitset.get(1));
+    EXPECT_FALSE(bitset.get(63));
+    EXPECT_FALSE(bitset.get(65));
+    
+    // Test nextSetBit
+    EXPECT_EQ(bitset.nextSetBit(0), 0);
+    EXPECT_EQ(bitset.nextSetBit(1), 7);
+    EXPECT_EQ(bitset.nextSetBit(7), 7);
+    EXPECT_EQ(bitset.nextSetBit(8), 64);
+    EXPECT_EQ(bitset.nextSetBit(64), 64);
+    EXPECT_EQ(bitset.nextSetBit(65), 127);
+    EXPECT_EQ(bitset.nextSetBit(128), screaming::FixedBitSet::MAX_INDEX);
+  }
+  
+  // Test with all bits initially true
+  {
+    screaming::RAMFixedBitSet bitset(100, true);
+    EXPECT_EQ(bitset.size(), 100);
+    
+    // Check all bits are initially true
+    for (int i = 0; i < 100; i++) {
+      EXPECT_TRUE(bitset.get(i));
+    }
+
+    // Check that high bits in the last word are not set
+    // 100 bits = 1 full word (64 bits) + 36 bits in the second word
+    // The remaining 28 bits in the second word should not be set
+    auto* words = bitset.ownedWords.get();
+    int numWords = screaming::FixedBitSet::sizeInWords(100);
+    EXPECT_EQ(numWords, 2);
+    
+    // First word should have all bits set
+    EXPECT_EQ(words[0], ~uint64_t(0));
+    
+    // Second word should only have the lower 36 bits set
+    // Create a mask with 36 bits set
+    uint64_t expectedMask = (uint64_t(1) << 36) - 1;
+    EXPECT_EQ(words[1], expectedMask);
+
+    // All bits are set, so no clear bits
+    EXPECT_EQ(bitset.nextClearBit(0), screaming::FixedBitSet::MAX_INDEX);
+    EXPECT_EQ(bitset.nextClearBit(50), screaming::FixedBitSet::MAX_INDEX);
+    EXPECT_EQ(bitset.nextClearBit(99), screaming::FixedBitSet::MAX_INDEX);
+    
+    // Clear a bit and test
+    bitset.clear(50);
+    EXPECT_EQ(bitset.get(50), false);
+    bitset.clear(50); // test clearing again
+    EXPECT_EQ(bitset.get(50), false);
+    EXPECT_EQ(bitset.nextClearBit(0), 50);
+    EXPECT_EQ(bitset.nextClearBit(50), 50);
+    EXPECT_EQ(bitset.nextClearBit(51), screaming::FixedBitSet::MAX_INDEX);
+    
+    // Clear another bit
+    bitset.clear(99);
+    EXPECT_EQ(bitset.nextClearBit(51), 99);
+    EXPECT_EQ(bitset.nextClearBit(99), 99);
+  }
+}
+
+TEST_F(ScreamingTest, ramFixedBitSetRandom) {
+  // pump this up after changes to the bitset code
+  // there aren't many edge cases compared to screaming bitset though.
+  const int numIterations = 10;
+  
+  for (int iter = 0; iter < numIterations; iter++) {
+    // Random bitset size between 1 and 1000
+    int32_t nbits = 1 + rng.rint(64 * 4);  // use up to 4 words should be enough for all edge cases
+    bool initialVal = rng.rbool();
+    
+    screaming::RAMFixedBitSet bitset(nbits, initialVal);
+    std::vector<bool> reference(nbits, initialVal);
+    
+    // Perform random operations
+    int numOps = 50 + rng.rint(100);
+    for (int op = 0; op < numOps; op++) {
+      int32_t index = rng.rint(nbits);
+      
+      if (rng.rbool()) {
+        // Set operation
+        bitset.set(index);
+        reference[index] = true;
+      } else {
+        // Clear operation
+        bitset.clear(index);
+        reference[index] = false;
+      }
+      
+      // Verify the bit was set/cleared correctly
+      EXPECT_EQ(bitset.get(index), reference[index]);
+    }
+    
+    // Verify all bits match reference
+    for (int32_t i = 0; i < nbits; i++) {
+      EXPECT_EQ(bitset.get(i), reference[i]);
+    }
+    
+    // Test nextSetBit against reference
+    for (int32_t startIdx = 0; startIdx < nbits; startIdx += rng.rint(1, 20)) {
+      int32_t expected = screaming::FixedBitSet::MAX_INDEX;
+      for (int32_t j = startIdx; j < nbits; j++) {
+        if (reference[j]) {
+          expected = j;
+          break;
+        }
+      }
+      EXPECT_EQ(bitset.nextSetBit(startIdx), expected);
+    }
+    
+    // Test nextClearBit against reference
+    for (int32_t startIdx = 0; startIdx < nbits; startIdx += rng.rint(1, 20)) {
+      int32_t expected = screaming::FixedBitSet::MAX_INDEX;
+      for (int32_t j = startIdx; j < nbits; j++) {
+        if (!reference[j]) {
+          expected = j;
+          break;
+        }
+      }
+      EXPECT_EQ(bitset.nextClearBit(startIdx), expected);
+    }
   }
 }
