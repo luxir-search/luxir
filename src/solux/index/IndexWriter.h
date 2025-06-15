@@ -57,10 +57,10 @@ public:
   public:
     uint64_t segId;
     int32_t maxDoc;            // one-past-highest-doc (doesn't count deletes)
-    int32_t deletes = 0;      // number of deletes in latest deletesGen.
+    int32_t liveDocs = 0;      // number of live documents in latest liveGen.
     int32_t mergeLevel = -1;  // maintained by the MergePolicy.
-    uint64_t deletesGen = 0;  // the latest version of the deletes that this segment contains, or 0 if no deletes.
-    uint64_t mergedDeletesGen = 0;  // if this segment was merged into another, what deletesVersion was used.
+    uint64_t liveGen = 0;  // the latest version of the deletes that this segment contains, or 0 if no deletes.
+    uint64_t mergedLiveGen = 0;  // if this segment was merged into another, what deletesVersion was used.
     uint64_t mergedIntoSegId = 0;  // segId of the segment this segment was merged into.
     uint64_t commitTime = 0;  // time when this segment was first committed as part of the index.
     // write segment info (size,docs) segments file as well so we don't have to open the segment to determine it?
@@ -85,7 +85,7 @@ public:
     // for straight ref counting.
     std::vector<std::shared_ptr<MultiDeletesData>> personalDeletes;
 
-    SegInfo(uint64_t segId, int nDocs) : segId(segId), maxDoc(nDocs) {}
+    SegInfo(uint64_t segId, int nDocs) : segId(segId), maxDoc(nDocs), liveDocs(nDocs) {}
 
 
   };
@@ -360,10 +360,10 @@ public:
         auto [iter, success] = segInfos.emplace(segId, std::make_unique<SegInfo>(segId, nDocs));
         assert(success);  // should be no repeated segments
         auto& seg = *iter->second;
-        seg.deletesGen = segment.deletes_gen();
+        seg.liveGen = segment.live_gen();
         seg.minVersion = segment.min_version();
         seg.maxVersion = segment.max_version();
-        seg.deletes = segment.deletes();
+        seg.liveDocs = segment.live_docs();
         seg.commitTime = indexInfo.commit_time();
         mergePolicy->_update(&seg);
       }
@@ -564,7 +564,7 @@ private:
     auto segInfo = std::make_unique<SegInfo>(inverter.getPostingsWriter().segId, inverter.getPostingsWriter().getMaxDoc());
     segInfo->minVersion = inverter.minVersion;
     segInfo->maxVersion = inverter.maxVersion;
-    // TODO FUTURE: set deletes + deletesGen for deleted docs from errors or overwrites in the same inverter.
+    // TODO FUTURE: set liveDocs + liveGen for deleted docs from errors or overwrites in the same inverter.
 
     std::unique_ptr<Inverter> inverterPtr;
 
@@ -695,7 +695,7 @@ private:
 
       // check if any segments were merged that need deletes applied.
       for (auto& seg : segs) {
-        if (seg->mergedDeletesGen != 0 && seg->mergedDeletesGen != seg->deletesGen) {
+        if (seg->mergedLiveGen != 0 && seg->mergedLiveGen != seg->liveGen) {
           // we changed the deletesVersion of the segment, but an older one was merged.
           // that new segment could also have been merged, so we need to go through all of the
           // segments and see if the deletes on this commit might apply to it.
@@ -874,7 +874,7 @@ public:
   void writeIndexInfoFile(std::span<SegInfo*> segs, CommitInfo* commitInfo = nullptr) {
     // We should be able to write the segments file without holding the indexMutex,
     // as long as we access only fields that should not change on SegInfo.
-    // deletes + deletesGen won't change because we only apply deletes in finishCommitBody().
+    // liveDocs + liveGen won't change because we only apply deletes in finishCommitBody().
 
     auto indexFile = dir.createFile(Postings::INDEX_INFO_FILE);
     OutputStream indexOut;
@@ -927,10 +927,10 @@ public:
       auto* segmentInfo = indexInfo.add_segments();
       segmentInfo->set_seg_id(seg->segId);
       segmentInfo->set_max_doc(seg->maxDoc);
-      segmentInfo->set_deletes_gen(seg->deletesGen);
+      segmentInfo->set_live_gen(seg->liveGen);
       segmentInfo->set_min_version(seg->minVersion);
       segmentInfo->set_max_version(seg->maxVersion);
-      segmentInfo->set_deletes(seg->deletes);
+      segmentInfo->set_live_docs(seg->liveDocs);
       
       if (seg->commitTime <= 1) {  // keep track of the first commit this segment appeared in.
         seg->commitTime = now_us;

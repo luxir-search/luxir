@@ -483,8 +483,10 @@ TEST_F(IndexWriterTest, deletionInfrastructure) {
   Doc doc1 = flatdoc("id", "doc1", "text_w", "hello world");
   helper.index(doc1, UpdateMessage::COMMIT, true);
 
+  // for now, put the doc to be deleted in a seg with another doc since we
+  // haven't implemented the logic to drop an entire segment!
   Doc doc2 = flatdoc("id", "doc2", "text_w", "goodbye world");
-  helper.index(doc2, UpdateMessage::COMMIT, true);
+  helper.index(doc2, UpdateMessage::NO_COMMIT, true);
 
   Doc doc3 = flatdoc("id", "doc3", "text_w", "test document");
   auto result3 = helper.index(doc3, UpdateMessage::COMMIT, true);
@@ -503,47 +505,86 @@ TEST_F(IndexWriterTest, deletionInfrastructure) {
   // Check that at least one segment has deletes applied
   bool foundDeletes = false;
   int32_t totalDeletesFound = 0;
+  int32_t totalLiveDocs = 0;
   
   for (const auto& segment : indexReader->segments()) {
     const auto& segInfo = segment.segInfo;
-    
-    if (segInfo.deletes > 0) {
+    totalDeletesFound += segment.numDeletes();
+    totalLiveDocs += segment.numLive();
+
+    if (segInfo.live_gen > 0) {
       foundDeletes = true;
-      totalDeletesFound += segInfo.deletes;
-      
+
       // Verify delete metadata is consistent
-      EXPECT_GT(segInfo.deletes_gen, 0);
-      EXPECT_TRUE(segment.deletedDocs().hasDeletes());
-      EXPECT_EQ(segment.deletedDocs().numDeletedDocs(), segInfo.deletes);
+      EXPECT_GT(segInfo.live_gen, 0);
+      EXPECT_NE(segment.liveDocs(), nullptr);
+      EXPECT_EQ(segment.numLive(), segInfo.live_docs);
       
       // Verify delete bitmap functionality
       int32_t numDocs = segment.postingsReader().numDocs();
       int32_t deletedCount = 0;
       
+      auto* liveDocs = segment.liveDocs();
+      ASSERT_NE(liveDocs, nullptr);
+      const auto& bitset = liveDocs->bitset();
+      
       for (int32_t docId = 0; docId < numDocs; docId++) {
-        if (segment.deletedDocs().isDeleted(docId)) {
+        if (!bitset.get(docId)) {  // if not live, then deleted
           deletedCount++;
         }
       }
       
-      EXPECT_EQ(deletedCount, segInfo.deletes);
+      EXPECT_EQ(deletedCount, segInfo.max_doc - segInfo.live_docs);
       
-      LOG_TRACE("Segment {} has {} deletes (generation {}), verified {} deleted docs of {} total", 
-                segInfo.seg_id, segInfo.deletes, segInfo.deletes_gen, 
+      LOG_TRACE("Segment {} has {} live docs (generation {}), verified {} deleted docs of {} total", 
+                segInfo.seg_id, segInfo.live_docs, segInfo.live_gen, 
                 deletedCount, numDocs);
     } else {
       // Segments without deletes should have consistent state
-      EXPECT_EQ(segInfo.deletes_gen, 0);
-      EXPECT_FALSE(segment.deletedDocs().hasDeletes());
-      EXPECT_EQ(segment.deletedDocs().numDeletedDocs(), 0);
+      EXPECT_EQ(segInfo.live_gen, 0);
+      EXPECT_EQ(segment.liveDocs(), nullptr);
+      EXPECT_EQ(segment.numDeletes(), 0);
     }
   }
   
   // Verify we found the expected delete
   EXPECT_TRUE(foundDeletes);
   EXPECT_EQ(totalDeletesFound, 1);
+  EXPECT_EQ(totalLiveDocs, 2);  // Should have 2 live docs (doc1 and doc3)
+  
+  // Delete infrastructure verification completed
   
   LOG_TRACE("Delete infrastructure verification completed: {} segments checked, {} total deletes found", 
             indexReader->segments().size(), totalDeletesFound);
 
+  // Now test deleting the same document again - should not create a new live_gen
+  uint64_t originalLiveGen = 0;
+  for (const auto& segment : indexReader->segments()) {
+    const auto& segInfo = segment.segInfo;
+    if (segment.numDeletes() > 0) {
+      originalLiveGen = segInfo.live_gen;
+      break;
+    }
+  }
+  
+  EXPECT_GT(originalLiveGen, 0);  // Should have found a segment with deletes
+  
+  // Delete the same document again
+  auto deleteResult2 = helper.deleteById("doc2", UpdateMessage::COMMIT);
+  EXPECT_TRUE(deleteResult2.success);
+  
+  // Get a fresh IndexReader after the second delete
+  auto indexReader2 = indexWriter->getIndexReader();
+  
+  // Verify that live_gen did not increment (no new deletes should be applied)
+  bool foundDeletedSegment = false;
+  for (const auto& segment : indexReader2->segments()) {
+    const auto& segInfo = segment.segInfo;
+    if (segment.numDeletes() > 0) {
+      foundDeletedSegment = true;
+      EXPECT_EQ(segInfo.live_gen, originalLiveGen);
+      EXPECT_EQ(segInfo.live_docs, 1);
+    }
+  }
+  EXPECT_TRUE(foundDeletedSegment);
 }

@@ -3,6 +3,8 @@
 #include "solux/index/ScreamingBuilder.h"
 #include "solux/reader/IntColReader.h"
 #include "solux/reader/PostingsReader.h"
+#include "solux/index/PostingsWriter.h"
+#include <cstring>
 
 namespace solux {
 
@@ -388,13 +390,27 @@ void IndexWriter::applyDeletes(SegInfo& seg, MultiDeletesData& multiDeletesData)
     return;
   }
 
-  MemPool pool;
+  auto guard = MemPool::threadLocalPoolGuard();
+  MemPool& pool = guard.pool();
   
   // Read the segment to find documents that should be deleted
   PostingsReader reader(dir, seg.segId);
+  int32_t maxDocId = reader.numDocs();
   
-  // Set to track deleted documents
-  std::vector<int32_t> deletedDocs;
+  // Load existing LiveDocs if they exist
+  std::shared_ptr<LiveDocs> existingLiveDocs;
+  if (seg.liveGen > 0) {
+    existingLiveDocs = LiveDocs::create(dir, seg.segId, seg.liveGen, maxDocId);
+  }
+  
+  // We'll allocate the FixedBitSet only when we find the first new delete
+  std::unique_ptr<screaming::RAMFixedBitSet> liveBits;
+
+  // currLiveBits points to the FixedBitSet that should be used to check for live documents.
+  // it starts off pointing to the existing live documents, but switches to the new liveBits.
+  const screaming::FixedBitSet* currLiveBits = existingLiveDocs ? &existingLiveDocs->bitset() : nullptr;
+  int32_t numLiveDocs = existingLiveDocs ? existingLiveDocs->numLive() : maxDocId;
+  int32_t newDeletesCount = 0;
   
   // Read the "id" field using TermsEnum
   FieldReader fieldReader(pool, reader);
@@ -426,11 +442,18 @@ void IndexWriter::applyDeletes(SegInfo& seg, MultiDeletesData& multiDeletesData)
       if (termsEnum.seek(deleteId)) {
         // Found the ID term, now get documents containing this ID
         DocsEnum docsEnum(pool, reader, termsEnum);
-        
-        int32_t docId = docsEnum.next();
-        while (docId != DocsEnum::END) {
+
+        for (int32_t docId = docsEnum.next(); docId != DocsEnum::END; docId = docsEnum.next()) {
+          // first check if the document has already been deleted.  If so, we don't need
+          // to check the version or do anything else.
+          if (currLiveBits && !currLiveBits->get(docId)) {
+            // Document is already deleted, skip it
+            continue;
+          }
+
+          // doc is live, so check the _version_ field if it exists.
           bool shouldDelete = true;
-          
+
           // If version field exists, check if document version is less than delete version
           if (hasVersionField) {
             std::vector<int32_t> singleDoc = {docId};
@@ -446,10 +469,23 @@ void IndexWriter::applyDeletes(SegInfo& seg, MultiDeletesData& multiDeletesData)
           }
           
           if (shouldDelete) {
-            deletedDocs.push_back(docId);
+            // Allocate the bitset on first new delete
+            if (!liveBits) {
+              liveBits = std::make_unique<screaming::RAMFixedBitSet>(maxDocId, true);
+
+              // If we have existing deletes, copy them using memcpy
+              if (existingLiveDocs) {
+                const auto& existingBitset = existingLiveDocs->bitset();
+                size_t wordsSize = screaming::FixedBitSet::sizeInWords(maxDocId) * sizeof(uint64_t);
+                std::memcpy(liveBits->words, existingBitset.words, wordsSize);
+              }
+            }
+
+            // Mark the document as deleted
+            liveBits->clear(docId);
+            numLiveDocs--;
+            newDeletesCount++;
           }
-          
-          docId = docsEnum.next();
         }
       }
     }
@@ -467,45 +503,45 @@ void IndexWriter::applyDeletes(SegInfo& seg, MultiDeletesData& multiDeletesData)
     processDeletes(*deletesData);
   }
   
-  // If we found any documents to delete, write a new delete generation
-  if (!deletedDocs.empty()) {
-    auto newDeletesGen = seg.deletesGen + 1;
-    // Sort deleted docs for efficient bitmap creation and remove duplicates
-    std::sort(deletedDocs.begin(), deletedDocs.end());
-    deletedDocs.erase(std::unique(deletedDocs.begin(), deletedDocs.end()), deletedDocs.end());
+
+  
+  // If we found any new documents to delete, write a new delete generation
+  if (newDeletesCount > 0) {
+    auto newLiveGen = seg.liveGen + 1;
+
+    // Write the delete bitmap file
+    std::string deleteFileName = Postings::getDeleteFileName(
+      Postings::getSortableString(seg.segId), newLiveGen);
     
-    // Only proceed if we still have deletes after deduplication
-    if (!deletedDocs.empty()) {
+    auto deleteFile = dir.createFile(deleteFileName);
 
-      // Write the delete bitmap file
-      std::string deleteFileName = Postings::getDeleteFileName(
-        Postings::getSortableString(seg.segId), newDeletesGen);
-      
-      auto deleteFile = dir.createFile(deleteFileName);
+    OutputStream out(deleteFile.get());
 
-      OutputStream out(deleteFile.get());
+    // Write new format header
+    out.writeBytes(Postings::SOLUX_HEADER);  // "SOLUX001"
+    out.writeLong(1);  // the format info
+    out.writeInt(maxDocId);
+    out.writeInt(numLiveDocs);  // number of bits set
 
-      // Build and write the screaming bitset
-      ScreamingBuilder builder(pool, out);
-      for (int32_t docId : deletedDocs) {
-        builder.add(docId);
+    // Write the live docs bitset data (already 64-bit aligned after 24-byte header)
+    size_t bitsDataSize = screaming::FixedBitSet::sizeInWords(maxDocId) * sizeof(uint64_t);
+    out.write(liveBits->words, bitsDataSize);
+    out.close();
+
+    dir.finishFile(*deleteFile);
+
+    INDEX_DEBUG("Applied {} new deletes to segment {} (new delete generation: {}, total live docs: {})",
+                newDeletesCount, seg.segId, seg.liveGen, seg.liveDocs);
+
+    // Update segment metadata only after successfully writing the delete file to avoid races.
+    {
+      const std::lock_guard<std::mutex> lock(indexMutex);
+      seg.liveDocs = numLiveDocs;  // Set to live document count
+      if (newDeletesCount > 0) {
+        seg.liveGen++;
       }
-      builder.flush();
-      out.close();
-
-      dir.finishFile(*deleteFile);
-
-      // Update the segment metadata.  Even though we are the only ones changing this,
-      // we should still grab the indexMutex to ensure consistency and cause a write barrier.
-      {
-        const std::lock_guard<std::mutex> lock(indexMutex);
-        seg.deletes += (int32_t)deletedDocs.size();
-        seg.deletesGen++;
-      }
-
-      INDEX_DEBUG("Applied {} deletes to segment {} (new delete generation: {})", 
-                  deletedDocs.size(), seg.segId, seg.deletesGen);
     }
+
   }
 }
 

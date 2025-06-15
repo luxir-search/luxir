@@ -178,11 +178,7 @@ public:
 
   // Write 4 byte integer in little endian format
   void writeInt(int32_t val) {
-    // In the case that we don't have to write full buffers before flushing, we should simply reserve and cast or memcpy
-    write((val>>0 ) & 0x00ff);
-    write((val>>8 ) & 0x00ff);
-    write((val>>16) & 0x00ff);
-    write((val>>24) & 0x00ff);
+    write((void*)&val, sizeof(val));
   }
 
   // Write 8 byte long integer in little endian format
@@ -220,13 +216,21 @@ public:
     write(term.ptr() , term.memorySize());
   }
 
+  // Writes a prefix-length encoded string.
   void writeStr(const char *data, uint32_t len) {
     writeVint(len);
     write((void *) data, len);
   }
 
+  // Writes a prefix-length encoded string.
   void writeStr(std::string_view sv) {
     writeStr(sv.data(), sv.length());
+  }
+
+  // This is a convenience method that writes the bytes without the length prefix.
+  // It is used for writing byte arrays that are not strings.
+  void writeBytes(std::string_view sv) {
+    write(sv.data(), sv.length());
   }
 
   // Implement write method for any type that has .write(OutputStream& os)

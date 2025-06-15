@@ -52,7 +52,9 @@ public:
   // being able to fit in short-string optimization.
 
   static constexpr std::string_view INDEX_INFO_FILE = "s.olux"; // lists all segments in the index
-  static constexpr std::string_view PREFIX_FNAME = "s";  // prefix for all data files
+  static constexpr std::string_view PREFIX_FNAME = "s";         // prefix for all data files
+  static constexpr std::string_view SOLUX_HEADER = "SOLUX001";  // every data file starts with this header
+
 
   // Create a sortable string from a number.  It's currently
   // a base36 representation prefixed with the number of digits-1 to make it sort correctly.

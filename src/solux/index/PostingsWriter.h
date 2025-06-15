@@ -96,7 +96,7 @@ public:
       // writing something at the start of the file acts as a sanity check, and also makes file locations of 0
       // invalid (and thus distinguishable from default-initialized).
       // TODO: think about embedding other info such as the segment id and file number?
-      files.back().out.writeStr("SOLUX001");
+      files.back().out.writeStr(Postings::SOLUX_HEADER);
       // insert at front of free list to maintain sorted order.
       freeFiles.insert(freeFiles.begin(), &files.back().out);
     }
