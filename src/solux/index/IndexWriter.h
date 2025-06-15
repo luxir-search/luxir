@@ -230,6 +230,9 @@ public:
   // boost::unordered::unordered_flat_set can't currently be used because it lacks an extract() method, which is
   // the only way of removing a move-only object from the set.
 
+  // Segments marked for deletion (all docs deleted) - will be removed after next commit
+  // protected by indexMutex
+  std::vector<std::unique_ptr<SegInfo>> segmentsToDelete;
 
   // In the future, we way want to get an inverter by segment id (delete handling?).
   // We could convert to unordered_flat_set keyed by uint64_t segId, just like segInfos.
@@ -693,7 +696,7 @@ private:
       bool mergedOldVersion = false;
 
 
-      // check if any segments were merged that need deletes applied.
+      // Check if any segments were merged before deletes were applied.
       for (auto& seg : segs) {
         if (seg->mergedLiveGen != 0 && seg->mergedLiveGen != seg->liveGen) {
           // we changed the deletesVersion of the segment, but an older one was merged.
@@ -708,11 +711,10 @@ private:
 
       if (mergedOldVersion) {
         // add personal deletes to all new segments that could be applicable.
-        // first make a shared_ptr and then move the deletes from the commit info to it.
+        // first make a shared_ptr from the commit info to it.
         CommitInfo& commitInfo = *msg.commitInfo;
 
-        std::shared_ptr<MultiDeletesData> multiDeletesDataPtr = std::make_shared<MultiDeletesData>();
-        *multiDeletesDataPtr = std::move(commitInfo.multiDeletesData);
+        std::shared_ptr<MultiDeletesData> multiDeletesDataPtr = std::make_shared<MultiDeletesData>(std::move(commitInfo.multiDeletesData));
 
         // now add these deletes to any new applicable segments
         auto numSegmentsMissingDeletes = 0;  // sanity check - we should find some.
@@ -720,7 +722,7 @@ private:
         // Check the up-to-date segments.
         for (auto& [segId, seg] : segInfos) {
           if (seg->minVersion < maxDeleteVersion) {
-            // this segment has deletes that need to be applied, so append to it's personal deletes.
+            // this segment has deletes that need to be applied, so append to its personal deletes.
             INDEX_DEBUG("finishCommitBody: msg={} segment {} adding personal deletes", (void*)&msg, segId);
             numSegmentsMissingDeletes++;
             seg->personalDeletes.push_back(multiDeletesDataPtr);  // copy the shared_ptr
@@ -733,9 +735,62 @@ private:
       }
     }  // end index lock
 
-    // write the segments file with the snapshot of segments we took at the beginning.
-    writeIndexInfoFile(segs, msg.commitInfo.get());
-    msg.done(*this); // don't access msg after this point, it could be deleted.
+    // Check if any of the segments are now empty and remove them if so.
+    std::vector<SegInfo*> segsToKeep;
+    segs.reserve(segs.size());
+    {
+      const std::lock_guard<std::mutex> lock(indexMutex);
+      for (auto& seg : segs) {
+        if (seg->liveDocs == 0) {
+          // this segment is empty, so we can delete it.
+          INDEX_DEBUG("finishCommitBody: msg={} segment {} is empty, moving to delete list.", (void*)&msg, seg->segId);
+          moveSegmentToDelete(seg->segId);
+        } else {
+          // this segment has live documents, so keep it.
+          segsToKeep.push_back(seg);
+        }
+      }
+    }
+
+    // write the segments file with only the segments that have live documents
+    writeIndexInfoFile(segsToKeep, msg.commitInfo.get());
+
+    msg.done(*this); // don't access msg after this point, it is now invalid.
+
+    // handling deletions should probably be done asynchronously elsewhere,
+    // but we'll just do it here for now.
+
+    // Delete segment files only after the IndexInfo file is written.
+    std::vector<std::unique_ptr<SegInfo>> localDeleteList;
+    {
+      const std::lock_guard<std::mutex> lock(indexMutex);
+      localDeleteList = std::move(segmentsToDelete);
+    }
+
+    // now delete the segments outside of the mutex.
+    // In the future, if we wanted to support windows, we need a background deleter to
+    // retry deletes after some time in case they are still open.
+    for (auto& seg : localDeleteList) {
+      // TODO: check if the segment was part of the commit we just finished
+      // and don't delete it if it was (unless it was being deleted for having 0 size).
+      INDEX_DEBUG("finishCommitBody: deleting segment {}", seg->segId);
+      dir.deletePrefix(Postings::getIndexFileNamePrefix(seg->segId));
+      seg.reset();  // deletes the in-memory segment info
+    }
+
+  }
+
+  // Move a segment from segInfos to segmentsToDelete for deferred deletion
+  // Call with indexMutex already locked.
+  void moveSegmentToDelete(uint64_t segId) {
+    auto it = segInfos.find(segId);
+    if (it != segInfos.end()) {
+      SegInfo* seg = it->second.get();
+      INDEX_DEBUG("Moving empty segment {} to deletion list (liveDocs={})", seg->segId, seg->liveDocs);
+      // Remove from merge policy
+      mergePolicy->_remove(seg);
+      segInfos.erase(it);
+    }
   }
 
   void applyDeletes(std::span<SegInfo*> segs, MultiDeletesData& multiDeletesData);

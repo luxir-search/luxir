@@ -11,6 +11,7 @@
 #include "solux/search/IndexReader.h"
 #include "test/SoluxTest.h"
 #include "test/CollectionHelper.h"
+#include "test/TestUtils.h"
 
 #define TEST_DEBUG LOG_TRACE
 // #define TEST_DEBUG LOG_DEBUG
@@ -587,4 +588,23 @@ TEST_F(IndexWriterTest, deletionInfrastructure) {
     }
   }
   EXPECT_TRUE(foundDeletedSegment);
+
+  // Test deleting doc3 to verify entire segment deletion
+  // First, let's record the current number of segments
+  auto initialSegmentCount = indexReader2->segments().size();
+  
+  // Delete doc3 (which should be in its own segment)
+  auto deleteResult3 = helper.deleteById("doc3", UpdateMessage::COMMIT);
+  EXPECT_TRUE(deleteResult3.success);
+  EXPECT_GT(deleteResult3.updateVersion, deleteResult2.updateVersion);
+  
+  // Get a fresh IndexReader after deleting doc3
+  auto indexReader3 = indexWriter->getIndexReader(0);  // Force fresh reader
+  
+  // Verify that the segment containing doc3 has been completely removed
+  auto finalSegmentCount = indexReader3->segments().size();
+  EXPECT_LT(finalSegmentCount, initialSegmentCount);
+  
+  // Verify we now have only 1 live document (doc1)
+  EXPECT_EQ(indexReader3->maxDoc(), 1);
 }
