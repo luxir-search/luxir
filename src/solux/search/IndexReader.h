@@ -34,18 +34,26 @@ public:
 
   // Static factory method to create LiveDocs from delete bitmap file.  Do not call this if liveGen is 0 (no
   // deletes for this segment).  A nullptr is returned in the case that there are deletions but we couldn't
-  // find the delete file (this is not necessarily and error, the index could have changed already).
-  static std::shared_ptr<LiveDocs> create(Directory& dir, uint64_t segId, uint64_t liveGen, int32_t maxDoc) {
+  // find the delete file (this is not necessarily an error, the index could have changed already).
+  // If missingFileOK is false, missing files will throw exceptions instead of returning nullptr.
+  static std::shared_ptr<LiveDocs> create(Directory& dir, uint64_t segId, uint64_t liveGen, int32_t maxDoc, bool missingFileOK = true) {
     assert(liveGen > 0 && maxDoc > 0);
     std::string deleteFileName = Postings::getDeleteFileName(
       Postings::getSortableString(segId), liveGen);
     
     auto deleteFile = dir.openFile(deleteFileName);
     if (deleteFile == nullptr) {
-      // Delete file not found - return nullptr instead of throwing
-      IREADER_DEBUG("Delete file {} not found for segment {} (liveGen={})", 
-                deleteFileName, segId, liveGen);
-      return nullptr;
+      if (missingFileOK) {
+        // Delete file not found - return nullptr instead of throwing
+        IREADER_DEBUG("Delete file {} not found for segment {} (liveGen={})", 
+                  deleteFileName, segId, liveGen);
+        return nullptr;
+      } else {
+        throw std::filesystem::filesystem_error(
+                std::format("Delete file {} not found for segment {} (liveGen={})", 
+                           deleteFileName, segId, liveGen),
+                std::make_error_code(std::errc::no_such_file_or_directory));
+      }
     }
     IREADER_DEBUG("Successfully opened delete file {} for segment {}", deleteFileName, segId);
     
@@ -59,14 +67,12 @@ public:
     auto headerSize =  Postings::SOLUX_HEADER.size() + sizeof(uint64_t) + sizeof(int32_t) + sizeof(int32_t);
     // Minimum size check
     if (dataSize < headerSize) {
-      LOG_ERROR("Delete file {} is too small: {} bytes", deleteFileName, dataSize);
-      return nullptr;
+      throw std::runtime_error(std::format("Delete file {} is too small: {} bytes", deleteFileName, dataSize));
     }
     
     // Check magic number
     if (std::memcmp(data, Postings::SOLUX_HEADER.data(), Postings::SOLUX_HEADER.size()) != 0) {
-      LOG_ERROR("Delete file {} has invalid magic number", deleteFileName);
-      return nullptr;
+      throw std::runtime_error(std::format("Delete file {} has invalid magic number", deleteFileName));
     }
 
     deleteStream.skip(Postings::SOLUX_HEADER.size());
@@ -75,28 +81,24 @@ public:
     int32_t numLiveDocs = deleteStream.readInt();
 
     if (format != 1) {
-      LOG_ERROR("Delete file {} has unsupported format: {}", deleteFileName, format);
-      return nullptr;
+      throw std::runtime_error(std::format("Delete file {} has unsupported format: {}", deleteFileName, format));
     }
 
     if (fileMaxDoc != maxDoc) {
-      LOG_ERROR("Delete file {} maxDoc mismatch: {} (expected {})", 
-                deleteFileName, fileMaxDoc, maxDoc);
-      return nullptr;
+      throw std::runtime_error(std::format("Delete file {} maxDoc mismatch: {} (expected {})", 
+                deleteFileName, fileMaxDoc, maxDoc));
     }
     
     if (numLiveDocs < 0 || numLiveDocs > maxDoc) {
-      LOG_ERROR("Delete file {} has invalid numLiveDocs: {} (maxDoc={})", 
-                deleteFileName, numLiveDocs, maxDoc);
-      return nullptr;
+      throw std::runtime_error(std::format("Delete file {} has invalid numLiveDocs: {} (maxDoc={})", 
+                deleteFileName, numLiveDocs, maxDoc));
     }
     
     // Validate file size
     size_t expectedSize = deleteStream.offset() + screaming::FixedBitSet::sizeInWords(maxDoc) * sizeof(uint64_t);
     if (deleteStream.size() != expectedSize) {
-      LOG_ERROR("Delete file {} size mismatch: {} bytes (expected {})", 
-                deleteFileName, dataSize, expectedSize);
-      return nullptr;
+      throw std::runtime_error(std::format("Delete file {} size mismatch: {} bytes (expected {})", 
+                deleteFileName, dataSize, expectedSize));
     }
     
     // FixedBitSet with live docs - memory map directly!
@@ -194,71 +196,68 @@ public:
         // throw exception, or just have zero segments? Or a single segment with no docs?
         IREADER_DEBUG("Empty IndexReader");
       } else {
-        try {
-          IREADER_DEBUG("Opening IndexReader");
-          InputStream segmentsIs = inputFile->getInputStream();
-          
-          // Read the protobuf message
-          solux::proto::IndexInfo indexInfo;
-          google::protobuf::io::ArrayInputStream arrayStream(segmentsIs.ptr(), segmentsIs.left());
-          google::protobuf::io::CodedInputStream codedStream(&arrayStream);
-          
-          if (!indexInfo.ParseFromCodedStream(&codedStream)) {
-            throw std::runtime_error("Failed to parse IndexInfo protobuf");
-          }
-          
-          IREADER_DEBUG("\tOpening IndexReader, commitTime={}", commitTimeUs);
-          if (lastCommitTime > 0 && indexInfo.commit_time() <= lastCommitTime) {
-            // No new commit, just return the existing segments
-            IREADER_DEBUG("Retry index open did not get new IndexInfo file.");
-            throw std::runtime_error("IndexReader open retry failed.");
-          }
-          commitTimeUs = indexInfo.commit_time();
+        IREADER_DEBUG("Opening IndexReader");
+        InputStream segmentsIs = inputFile->getInputStream();
+        
+        // Read the protobuf message
+        solux::proto::IndexInfo indexInfo;
+        google::protobuf::io::ArrayInputStream arrayStream(segmentsIs.ptr(), segmentsIs.left());
+        google::protobuf::io::CodedInputStream codedStream(&arrayStream);
+        
+        if (!indexInfo.ParseFromCodedStream(&codedStream)) {
+          throw std::runtime_error("Failed to parse IndexInfo protobuf");
+        }
+        
+        IREADER_DEBUG("\tOpening IndexReader, commitTime={}", commitTimeUs);
+        if (lastCommitTime > 0 && indexInfo.commit_time() <= lastCommitTime) {
+          // No new commit, continue with missingFileOK=false so we get proper exceptions
+          IREADER_DEBUG("Retry index open did not get new IndexInfo file, will try with missingFileOK=false.");
+        }
+        commitTimeUs = indexInfo.commit_time();
 
-          segs.reserve(indexInfo.segments_size());
-          for (int i = 0; i < indexInfo.segments_size(); i++) {
-            const auto& segment = indexInfo.segments(i);
-            uint64_t segId = segment.seg_id();
-            uint64_t liveGen = segment.live_gen();
-            int32_t nDocs = segment.max_doc();
-            unused(nDocs);
-            
-            auto postingsReader = std::make_shared<PostingsReader>(dir, segId);
-            std::shared_ptr<LiveDocs> liveDocs;
-            
-            if (liveGen > 0) {
-              liveDocs = LiveDocs::create(dir, segId, liveGen, nDocs);
-              if (!liveDocs) {
-                // Failed to create LiveDocs (delete file not found) - trigger retry
-                lastCommitTime = commitTimeUs;  // Update last commit time to avoid infinite loop
-                retry = true;
-                break;  // Break out of the segments loop to retry
-              }
-            }
-            // If liveGen == 0, liveDocs remains nullptr (no deletes)
-
-            Segment::SegmentInfo segmentInfo;
-            segmentInfo.seg_id = segId;
-            segmentInfo.live_gen = liveGen;
-            segmentInfo.min_version = segment.min_version();
-            segmentInfo.max_version = segment.max_version();
-            segmentInfo.max_doc = nDocs;
-            segmentInfo.live_docs = segment.live_docs();
-
-            segs.emplace_back(std::move(postingsReader), std::move(liveDocs), segmentInfo, maxdoc, i);
-            maxdoc += segs.back().postingsReader().numDocs();
-            assert(nDocs == segs.back().postingsReader().numDocs());
-          }
-        } catch (std::filesystem::filesystem_error& e) {
-          // if this is the second time we've tried this same commit point, then throw the exception
-          if (commitTimeUs > lastCommitTime) {
-            IREADER_DEBUG("Error reading IndexReader: {}, will retry.", e.what());
-            lastCommitTime = commitTimeUs;
+        segs.reserve(indexInfo.segments_size());
+        for (int i = 0; i < indexInfo.segments_size(); i++) {
+          const auto& segment = indexInfo.segments(i);
+          uint64_t segId = segment.seg_id();
+          uint64_t liveGen = segment.live_gen();
+          int32_t nDocs = segment.max_doc();
+          unused(nDocs);
+          
+          // Determine if this is the first attempt for this commit time
+          bool isFirstAttempt = (commitTimeUs > lastCommitTime);
+          bool missingFileOK = isFirstAttempt;
+          
+          auto postingsReader = PostingsReader::create(dir, segId, missingFileOK);
+          if (!postingsReader) {
+            // Failed to create PostingsReader (segment files not found) - trigger retry
+            lastCommitTime = commitTimeUs;  // Update last commit time to avoid infinite loop
             retry = true;
-          } else {
-            IREADER_DEBUG("Error reading IndexReader: {}, THROWING ", e.what());
-            throw;
+            break;  // Break out of the segments loop to retry
           }
+          
+          std::shared_ptr<LiveDocs> liveDocs;
+          if (liveGen > 0) {
+            liveDocs = LiveDocs::create(dir, segId, liveGen, nDocs, missingFileOK);
+            if (!liveDocs) {
+              // Failed to create LiveDocs (delete file not found) - trigger retry
+              lastCommitTime = commitTimeUs;  // Update last commit time to avoid infinite loop
+              retry = true;
+              break;  // Break out of the segments loop to retry
+            }
+          }
+          // If liveGen == 0, liveDocs remains nullptr (no deletes)
+
+          Segment::SegmentInfo segmentInfo;
+          segmentInfo.seg_id = segId;
+          segmentInfo.live_gen = liveGen;
+          segmentInfo.min_version = segment.min_version();
+          segmentInfo.max_version = segment.max_version();
+          segmentInfo.max_doc = nDocs;
+          segmentInfo.live_docs = segment.live_docs();
+
+          segs.emplace_back(std::move(postingsReader), std::move(liveDocs), segmentInfo, maxdoc, i);
+          maxdoc += segs.back().postingsReader().numDocs();
+          assert(nDocs == segs.back().postingsReader().numDocs());
         }
       }
     } while(retry);

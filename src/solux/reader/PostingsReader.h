@@ -144,20 +144,60 @@ public:
   // used as a sentinel value for docs and positions iterators in a single segment.
   static constexpr int32_t END = std::numeric_limits<int32_t>::max();
 
-  explicit PostingsReader(Directory& dir, uint64_t segId) {
-
+  // Static factory method to create PostingsReader with optional handling of missing files.
+  // Returns nullptr if missingFileOK=true and any required files are missing.
+  static std::shared_ptr<PostingsReader> create(Directory& dir, uint64_t segId, bool missingFileOK = false) {
     std::string segStr = Postings::getSortableString(segId);
     auto segInfoFile = Postings::getIndexFileName(segStr, 0);
-    files.emplace_back(dir.openFile(segInfoFile));
-    if (files.back().get() == nullptr) {
-      // TODO FIXME: this is the only place in the codebase where we throw an exception
-      // for a non-error condition (we don't synchronize with the writer, so a merge may have deleted
-      // the segment file we were trying to open).  For debugging purposes, it would be nice to
-      // migrate away from exceptions so that exceptions should never happen unless testing error scenarios.
+    auto firstFile = dir.openFile(segInfoFile);
+    
+    if (firstFile == nullptr) {
+      if (missingFileOK) {
+        return nullptr;
+      }
       throw std::filesystem::filesystem_error(
               std::format("Can't find/open first segment file '{}'", segInfoFile),
               std::make_error_code(std::errc::no_such_file_or_directory));
     }
+
+    // Try to create the PostingsReader - use private constructor
+    auto reader = std::shared_ptr<PostingsReader>(new PostingsReader());
+    if (!reader->initializeFromFiles(dir, segId, missingFileOK)) {
+      return nullptr;  // Missing files and missingFileOK=true
+    }
+    return reader;
+  }
+
+  explicit PostingsReader(Directory& dir, uint64_t segId) {
+    auto reader = create(dir, segId, false);
+    // This should never fail since missingFileOK=false, but just in case
+    if (!reader) {
+      throw std::filesystem::filesystem_error(
+              "Failed to create PostingsReader", 
+              std::make_error_code(std::errc::no_such_file_or_directory));
+    }
+    *this = std::move(*reader);
+  }
+
+private:
+  // Private default constructor for factory method
+  PostingsReader() = default;
+
+  // Initialize from files, returns false if missing files and missingFileOK=true
+  bool initializeFromFiles(Directory& dir, uint64_t segId, bool missingFileOK) {
+    std::string segStr = Postings::getSortableString(segId);
+    auto segInfoFile = Postings::getIndexFileName(segStr, 0);
+    files.emplace_back(dir.openFile(segInfoFile));
+    
+    if (files.back().get() == nullptr) {
+      if (missingFileOK) {
+        return false;
+      }
+      throw std::filesystem::filesystem_error(
+              std::format("Can't find/open first segment file '{}'", segInfoFile),
+              std::make_error_code(std::errc::no_such_file_or_directory));
+    }
+    
     inputStreams.emplace_back(files[0]->getInputStream());
     firstIS = inputStreams[0];
 
@@ -176,13 +216,19 @@ public:
     for (int i=1; i<nFiles; i++) {
       files.emplace_back(dir.openFile(Postings::getIndexFileName(segStr, i)));
       if (files.back().get() == nullptr) {
+        if (missingFileOK) {
+          return false;
+        }
         throw std::filesystem::filesystem_error(
                 std::format("Can't find/open segment file '{}'", Postings::getIndexFileName(segStr, i)),
                 std::make_error_code(std::errc::no_such_file_or_directory));
       }
       inputStreams.emplace_back(files.back()->getInputStream());
     }
+    return true;
   }
+
+public:
 
   int32_t numDocs() const noexcept {
     return maxdoc;
