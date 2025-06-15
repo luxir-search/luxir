@@ -9,6 +9,7 @@
 
 #include "solux/index/IndexWriter.h"
 #include "solux/search/IndexReader.h"
+#include "solux/reader/PostingsReader.h"
 #include "test/SoluxTest.h"
 #include "test/CollectionHelper.h"
 #include "test/TestUtils.h"
@@ -607,4 +608,55 @@ TEST_F(IndexWriterTest, deletionInfrastructure) {
   
   // Verify we now have only 1 live document (doc1)
   EXPECT_EQ(indexReader3->maxDoc(), 1);
+  
+  // Record the segment ID that should have been deleted (doc3's segment)
+  // We need to capture this before adding another document that helps triggers the deletion
+  // The deletion happens asynchronously.
+  uint64_t deletedSegmentId = 0;
+  for (const auto& segment : indexReader2->segments()) {
+    bool foundInFinalReader = false;
+    for (const auto& finalSegment : indexReader3->segments()) {
+      if (finalSegment.segInfo.seg_id == segment.segInfo.seg_id) {
+        foundInFinalReader = true;
+        break;
+      }
+    }
+    if (!foundInFinalReader) {
+      deletedSegmentId = segment.segInfo.seg_id;
+      break;
+    }
+  }
+  EXPECT_GT(deletedSegmentId, 0); // Should have found a deleted segment
+  
+  // Add another document to force another commit, which should wait long enough for the segment to be deleted.
+  Doc doc4 = flatdoc("id", "doc4", "text_w", "final document");
+  helper.index(doc4, UpdateMessage::COMMIT, true);
+  
+  // Verify that the index files for the deleted segment have actually been removed
+  // The deletePrefix method should have removed all files starting with the segment prefix
+  std::string deletedPrefix = Postings::getIndexFileNamePrefix(deletedSegmentId);
+
+  // Check that no files exist with the deleted segment prefix
+  // Use the Directory's listFiles method to get all files
+  auto& dir = helper.getIndexWriter()->dir;
+  std::vector<std::string> allFiles;
+  dir.listFiles(allFiles);
+  
+  // Verify that no files exist with the deleted segment's prefix
+  for (const auto& filename : allFiles) {
+    EXPECT_FALSE(filename.starts_with(deletedPrefix)) 
+      << "File " << filename << " should have been deleted by deletePrefix() but still exists";
+  }
+  
+  // Verify the new document is searchable and we now have 2 documents
+  auto* req2 = LocalReq::create(helper.getSearchEngine());
+  auto finalDocs2 = req2->collection("main")
+                      .allQuery()
+                      .fields({"id"})
+                      .limit(-1)
+                      .execute()
+                      .getDocs();
+  req2->done();
+  
+  EXPECT_EQ(2, finalDocs2.size()); // doc1 and doc4
 }

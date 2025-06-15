@@ -789,6 +789,8 @@ private:
       INDEX_DEBUG("Moving empty segment {} to deletion list (liveDocs={})", seg->segId, seg->liveDocs);
       // Remove from merge policy
       mergePolicy->_remove(seg);
+      // Move the segment to deletion list instead of just erasing it
+      segmentsToDelete.push_back(std::move(it->second));
       segInfos.erase(it);
     }
   }
