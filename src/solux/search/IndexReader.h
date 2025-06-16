@@ -95,7 +95,7 @@ public:
     }
     
     // Validate file size
-    size_t expectedSize = deleteStream.offset() + screaming::FixedBitSet::sizeInWords(maxDoc) * sizeof(uint64_t);
+    int64_t expectedSize = deleteStream.offset() + screaming::FixedBitSet::sizeInWords(maxDoc) * sizeof(uint64_t);
     if (deleteStream.size() != expectedSize) {
       throw std::runtime_error(std::format("Delete file {} size mismatch: {} bytes (expected {})", 
                 deleteFileName, dataSize, expectedSize));
