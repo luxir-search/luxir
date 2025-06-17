@@ -17,6 +17,7 @@
 #include "solux/index/IndexWriter.h"
 #include "solux/search/IndexReader.h"
 #include "solux/reader/PostingsReader.h"
+#include "solux/util/Signal.h"
 #include "test/SoluxTest.h"
 #include "test/CollectionHelper.h"
 #include "test/LocalReq.h"

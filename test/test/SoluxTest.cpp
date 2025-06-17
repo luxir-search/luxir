@@ -10,6 +10,8 @@
 // https://github.com/abseil/abseil-cpp/issues/1747
 // https://github.com/llvm/llvm-project/issues/102443
 #include "absl/base/config.h"
+#include "solux/util/Signal.h"
+
 namespace absl {
 ABSL_NAMESPACE_BEGIN
 namespace log_internal {

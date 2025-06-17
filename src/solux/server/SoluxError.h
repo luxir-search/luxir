@@ -123,8 +123,6 @@ public:
   // If there was an error previously set, no modification is made and the previous error is returned.
   SoluxError* setException(const std::exception& e) {
     auto err = std::make_unique<SoluxError>(e);
-    // std::stacktrace coming in gcc14 (but not sure if it will provide exception backtrace)
-    // msg += "\n" + boost::stacktrace::to_string(boost::stacktrace::stacktrace());  // not in a released version of boost yet
     LOG_ERROR(err->what());
     return setSoluxError(std::move(err));
   }

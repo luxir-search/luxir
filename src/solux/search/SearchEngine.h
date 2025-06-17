@@ -11,6 +11,7 @@
 #include "Facet.h"
 #include "solux/util/AtomicMerger.h"
 #include "solux/server/SoluxError.h"
+#include "solux/util/thread.h"
 
 namespace solux {
 
