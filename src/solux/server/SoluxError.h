@@ -3,11 +3,70 @@
 #include <memory>
 #include <string>
 #include <exception>
-// #include <stacktrace>
+#include <stacktrace>
+#include <execinfo.h>
+#include <cxxabi.h>
 #include "solux/util/log.h"
 
 namespace solux {
 
+// Helper function to get stack trace
+inline std::string getStackTrace() {
+  constexpr int maxFrames = 20;
+  void* array[maxFrames];
+  int size = backtrace(array, maxFrames);
+  char** strings = backtrace_symbols(array, size);
+  
+  std::string result;
+  for (int i = 0; i < size; i++) {
+    // Try to demangle C++ names
+    char* mangled_name = nullptr;
+    char* offset_begin = nullptr;
+    char* offset_end = nullptr;
+    
+    // Find parentheses and +address offset surrounding mangled name
+    for (char* p = strings[i]; *p; ++p) {
+      if (*p == '(') {
+        mangled_name = p;
+      } else if (*p == '+') {
+        offset_begin = p;
+      } else if (*p == ')' && offset_begin) {
+        offset_end = p;
+        break;
+      }
+    }
+    
+    if (mangled_name && offset_begin && offset_end && mangled_name < offset_begin) {
+      *mangled_name++ = '\0';
+      *offset_begin++ = '\0';
+      *offset_end = '\0';
+      
+      int status;
+      char* real_name = abi::__cxa_demangle(mangled_name, nullptr, nullptr, &status);
+      if (status == 0) {
+        result += "  ";
+        result += strings[i];
+        result += "(";
+        result += real_name;
+        result += "+";
+        result += offset_begin;
+        result += ")\n";
+        free(real_name);
+      } else {
+        result += "  ";
+        result += strings[i];
+        result += "\n";
+      }
+    } else {
+      result += "  ";
+      result += strings[i];
+      result += "\n";
+    }
+  }
+  
+  free(strings);
+  return result;
+}
 
 // TODO: have subclasses that can have more specific info?
 // Example: ids (outside of the error message) of the document(s) that caused the error, etc.
@@ -20,6 +79,8 @@ public:
 
   SoluxError(const std::exception& e) : eptr(std::current_exception()) {
     message = std::string("Unexpected exception: ").append(e.what());
+    message += "\nStack trace:\n";
+    message += getStackTrace();
     error_code = 1;
   }
 
