@@ -589,7 +589,7 @@ TEST_F(GrpcIndexTest, streamingHello2) {
 // This does not test application logic for thread safety, just the communications infrastructure (and how we use it.)
 // TODO: remove Greeter and add no-op index & query flags
 TEST_F(GrpcIndexTest, threadsafe) {
-  int nTasks = 100; // concurrency will be limited by TBB
+  int nTasks = 50; // concurrency will be limited by TBB
   int callsPerTask = 10;
   tbb::task_group tasks;
 

@@ -386,7 +386,7 @@ void IndexWriter::applyDeletes(std::span<SegInfo*> segs, MultiDeletesData& multi
 }
 
 void IndexWriter::applyDeletes(SegInfo& seg, MultiDeletesData& multiDeletesData) {
-  if (multiDeletesData.empty()) {
+  if (multiDeletesData.empty() && seg.personalDeletes.empty()) {
     return;
   }
 

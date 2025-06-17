@@ -32,13 +32,27 @@ static void update(ProtoUpdateMessage& msg, IndexWriter& iw, Inverter& inverter)
         if (handler == nullptr || *handler != fname) {
           handlers[idx] = handler = &inverter.getIndexHandler(fname);
         }
+
+        // Handle "id" field overwriting by queueing a delete for previous versions.
+        // TODO: should this be pulled out into a separate handler?
+        if (versionHandler != nullptr && fname == "id") {
+          // assume string id field
+          std::string idValue;
+          if (fval.has_s()) {
+            idValue = fval.s();
+          } else if (fval.has_bin()) {
+            idValue = std::string(fval.bin());
+          } else {
+            // TODO error out.
+            continue;
+          }
+          inverter.deleteId(idValue, msg.updateVersion);
+          // add the version to the _version_ field
+          versionHandler->index(inverter, static_cast<int64_t>(msg.updateVersion));
+        }
+
         handler->index(inverter, fval);
         idx++;
-      }
-
-      // Add _version_ field when overwrite is enabled
-      if (versionHandler != nullptr) {
-        versionHandler->index(inverter, static_cast<int64_t>(msg.updateVersion));
       }
 
       inverter.finishDoc();

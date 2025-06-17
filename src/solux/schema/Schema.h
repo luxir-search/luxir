@@ -28,9 +28,12 @@ public:
     auto it = fieldTypeMap.find(fieldName);
     if (it == fieldTypeMap.end()) {
       // try a suffix match
-      std::string_view suffix = fieldName.substr(fieldName.find_last_of('_'));
-      if (!suffix.empty()) {
-        it = fieldTypeMap.find(suffix);
+      auto underscorePos = fieldName.find_last_of('_');
+      if (underscorePos != std::string_view::npos) {
+        std::string_view suffix = fieldName.substr(underscorePos);
+        if (!suffix.empty()) {
+          it = fieldTypeMap.find(suffix);
+        }
       }
     }
     return it;

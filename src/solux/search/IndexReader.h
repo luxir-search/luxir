@@ -182,6 +182,8 @@ public:
   IndexReader(Directory& dir) {
     // because old segments could be merged away before we have a chance to read them, we need
     // to check if there is a new index info file and retry the open if so.
+    // This could be optimized by saving the segments we did read properly in case they are still in the index.
+    // But we should really have a postings getter abstraction that can provide already opened readers and livedocs
     uint64_t lastCommitTime = 0;
     bool retry = false;
     do {
@@ -193,8 +195,7 @@ public:
       }
       std::shared_ptr<InputFile> inputFile = dir.openFile(Postings::INDEX_INFO_FILE);
       if (inputFile == nullptr) {
-        // throw exception, or just have zero segments? Or a single segment with no docs?
-        IREADER_DEBUG("Empty IndexReader");
+        IREADER_DEBUG("No {} file, Empty IndexReader", Postings::INDEX_INFO_FILE);
       } else {
         IREADER_DEBUG("Opening IndexReader");
         InputStream segmentsIs = inputFile->getInputStream();
@@ -207,13 +208,16 @@ public:
         if (!indexInfo.ParseFromCodedStream(&codedStream)) {
           throw std::runtime_error("Failed to parse IndexInfo protobuf");
         }
-        
-        IREADER_DEBUG("\tOpening IndexReader, commitTime={}", commitTimeUs);
-        if (lastCommitTime > 0 && indexInfo.commit_time() <= lastCommitTime) {
+
+        commitTimeUs = indexInfo.commit_time();
+        bool missingFileOK = true;  // Allow missing files on first attempt
+        IREADER_DEBUG("\tOpening IndexReader, commitTime={} nSegs={} gen={}", indexInfo.commit_time(), indexInfo.segments_size(), indexInfo.index_gen());
+        if (commitTimeUs == lastCommitTime) {
           // No new commit, continue with missingFileOK=false so we get proper exceptions
           IREADER_DEBUG("Retry index open did not get new IndexInfo file, will try with missingFileOK=false.");
+          missingFileOK = false;  // On retry, we expect files to be present
         }
-        commitTimeUs = indexInfo.commit_time();
+        lastCommitTime = commitTimeUs;
 
         segs.reserve(indexInfo.segments_size());
         for (int i = 0; i < indexInfo.segments_size(); i++) {
@@ -222,15 +226,10 @@ public:
           uint64_t liveGen = segment.live_gen();
           int32_t nDocs = segment.max_doc();
           unused(nDocs);
-          
-          // Determine if this is the first attempt for this commit time
-          bool isFirstAttempt = (commitTimeUs > lastCommitTime);
-          bool missingFileOK = isFirstAttempt;
-          
+
           auto postingsReader = PostingsReader::create(dir, segId, missingFileOK);
           if (!postingsReader) {
             // Failed to create PostingsReader (segment files not found) - trigger retry
-            lastCommitTime = commitTimeUs;  // Update last commit time to avoid infinite loop
             retry = true;
             break;  // Break out of the segments loop to retry
           }
@@ -240,7 +239,6 @@ public:
             liveDocs = LiveDocs::create(dir, segId, liveGen, nDocs, missingFileOK);
             if (!liveDocs) {
               // Failed to create LiveDocs (delete file not found) - trigger retry
-              lastCommitTime = commitTimeUs;  // Update last commit time to avoid infinite loop
               retry = true;
               break;  // Break out of the segments loop to retry
             }

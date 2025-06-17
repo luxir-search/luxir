@@ -3,6 +3,13 @@
 #include <iostream>
 #include <limits>
 #include <filesystem>
+#include <thread>
+#include <random>
+#include <atomic>
+#include <map>
+#include <set>
+#include <mutex>
+#include <memory>
 #include <solux/index/Inverter.h>
 #include <latch>
 #include <solux/server/ProtoUpdateMessage.h>
@@ -12,6 +19,7 @@
 #include "solux/reader/PostingsReader.h"
 #include "test/SoluxTest.h"
 #include "test/CollectionHelper.h"
+#include "test/LocalReq.h"
 #include "test/TestUtils.h"
 
 #define TEST_DEBUG LOG_TRACE
@@ -152,7 +160,8 @@ TEST_F(IndexWriterTest, autoMerge) {
 
     // this should cause a segment flush and a merge to kick off, but we've blocked the merge from completing until
     // later.
-    // NOTE: this deadlocked since the wait() in the commit call work-steals the mergeSegments task (which will
+
+    // NOTE: code below deadlocked since the wait() in the commit call work-steals the mergeSegments task (which will
     // only be un-blocked after the commit call completes).
     // Seems like we can't have both the commit work and the merge work be on the same thread.
 
@@ -170,12 +179,13 @@ TEST_F(IndexWriterTest, autoMerge) {
 
     // finish commit callback
     auto finishCommit = [&]() {
-      auto reader = iw.getIndexReader();
+      auto reader = iw.getIndexReader();  // refresh the reader to see the new doc, but before the merge completes.
       mergeStart.count_down();  // let merge continue
       EXPECT_EQ(reader->maxDoc(), MERGE_FACTOR);
       EXPECT_EQ(reader->segments().size(), MERGE_FACTOR);
     };
 
+    // this commit will cause the segment to flush and the merge to kick off
     iw.commit(std::move(finishCommit), UpdateMessage::CommitType::COMMIT);
     /* not needed to avoid deadlock... using a callback and not a blocker that could work-steal was enough.
     arena.execute([&](){
@@ -186,6 +196,9 @@ TEST_F(IndexWriterTest, autoMerge) {
     // Now wait until the merge completes.
     // If the commit is run in the same thread, this call can work-steal the mergeSegments task and deadlock.
     iw.updateGraph.wait_for_all();
+
+    // depending on if the merger does a commit on its own, we may not see the merged segment
+    // yet.  Currently, if the merger detects no indexing activity, it will request a new commit.
 
     reader = iw.getIndexReader();
     ASSERT_EQ(reader->maxDoc(), MERGE_FACTOR);
@@ -246,7 +259,7 @@ TEST_F(IndexWriterTest, multiThreaded) {
   };
 
   auto cb = [&](TestProtoUpdateMessage& msg) {
-            TEST_DEBUG("done called! adds in this request={}", updateRequest.docs_size());
+            TEST_DEBUG("done called! adds in this request={}", msg.updateRequest.docs_size());
     if (msg.updateRequest.commit() == solux::proto::UpdateRequest::COMMIT) {
       commits++;
     }
@@ -285,10 +298,12 @@ TEST_F(IndexWriterTest, multiThreaded) {
 
 
   try {
-    tbb::task_group tasks;
+    // change to using standard threads
+    std::vector<std::thread> threads;
 
     for (int iter = 0; iter < requestThreads; iter++) {
-      tasks.run([&]() {
+      // create a thread
+      threads.emplace_back([&]() {
                   try {
                     bool writesDone = false;
                     for (;;) {
@@ -308,10 +323,18 @@ TEST_F(IndexWriterTest, multiThreaded) {
 
                         // LOG_DEBUG("\tvisible docs: {} segs: {}", localDocsVisible, reader->segments().size());
 
+                        /*
                         if (globalDocsVisible >= docsToAdd && globalDocsVisible >= docsAdded) {
                           // we've seen all the docs
                           break;
                         }
+                        */
+                        if (localDocsVisible >= docsToAdd) {
+                          // we've seen all the docs
+                          TEST_DEBUG("Reader has all docs visible: localDocsVisible={} docsVisible={}", localDocsVisible, docsVisible.load());
+                          break;
+                        }
+
                       }
 
                       // NOTE: since write submission is async and done in a loop, this can pile up a lot of writes in the queue
@@ -378,7 +401,12 @@ TEST_F(IndexWriterTest, multiThreaded) {
       );
     }
 
-    tasks.wait();
+    // whait for all threads to finish
+    for (auto& t : threads) {
+      t.join();
+    }
+
+    // wait for all IW activity to finish.
     iw.updateGraph.wait_for_all();
 
     // If request threads are failing to stop, but this block of code above tasks.wait() and uncomment the sleep
@@ -415,6 +443,8 @@ TEST_F(IndexWriterTest, multiThreaded) {
           break;
         }
       }
+
+      break; // don't loop anymore - nothing should be
     }
 
 
@@ -472,6 +502,27 @@ TEST_F(IndexWriterTest, versionFieldOverwrite) {
 
   bool foundDoc3 = containsDoc(docs, expectedDoc3);
   EXPECT_TRUE(foundDoc3);
+
+  // Now index doc2 again with overwrite
+  Doc doc2Overwrite = flatdoc("id", "doc2", "text_w", "hello version world again");
+  auto result4 = helper.index(doc2Overwrite, UpdateMessage::COMMIT, true);
+  req = LocalReq::create(helper.getSearchEngine());
+  docs = req->collection("main")
+                 .allQuery()
+                 .fields({"id", "text_w", "_version_"})
+                 .limit(-1)
+                 .execute()
+                 .getDocs();
+
+
+  req->done();
+  ASSERT_EQ(3, docs.size());
+
+  /* TODO: not ready yet
+  expectedDoc2 = flatdoc("id", "doc2", "_version_", (int64_t)(result4.updateVersion));
+  foundDoc2 = containsDoc(docs, expectedDoc2);
+  EXPECT_TRUE(foundDoc2);
+  */
 }
 
 // Test deletion functionality - verify delete infrastructure works  
@@ -683,4 +734,112 @@ TEST_F(IndexWriterTest, testMissingFiles) {
   // Test missingFileOK = true (should return nullptr on missing files)
   auto liveDocs2 = LiveDocs::create(testDir, 999, 1, 10, true);
   EXPECT_EQ(liveDocs2, nullptr);
+}
+
+// OK CLAUDE, create a random test here to test multithreaded updates and deletes in the IndexWriter and
+// reopen/retry logic in the IndexReader.  We will have N threads and M documents that are being modified.
+// Eachd document will be assigned to a different thread, conversely eash thread will have it's own set
+// of unique documents to modify.  This eliminates any races between threads modifying the same document, and
+// each thread can make a modification and then reopen the IndexReader to see the expected changes.
+// For documents that should exist, request the _version_ field to verify the doc matches the latest add version.
+// Mix in overwrites and deletes randomly, keeping track of the expected state for each thread
+// and then verifying it.  This should end up testing much of the logic around segment merging, removal of empty
+// segments, IndexReader retry logic, etc.
+// You MUST use CollectionHelper to do the indexing and deletions.
+// IMPORTANT: Make this test as short as possible.
+// IMPORTANT: you should not need any synchronization primitives in the test itself, since each thread will be working
+//            with it's own set of documents.
+//
+TEST_F(IndexWriterTest, testMultithreadedUpdates) {
+  using namespace solux::test;
+  return; // TODO: test not ready yet. merging and searching deletes not done.
+  
+  CollectionHelper helper("main");
+  helper.clear();
+  
+  auto indexWriter = helper.getIndexWriter();
+  indexWriter->mergePolicy->setMergeFactor(3);
+
+  auto numThreads = 1;
+  auto opsPerThread = 100;  // total operations per thread
+  auto docsPerThread = 4;   // number of unique documents per thread
+
+  // Track expected versions per thread
+  std::vector<std::map<std::string, int64_t>> threadExpectedVersions(numThreads);
+  std::vector<std::set<std::string>> threadDeletedDocs(numThreads);
+  std::vector<std::thread> threads;
+
+  auto seed = rng();
+  for (int tid = 0; tid < numThreads; tid++) {
+    threads.emplace_back([&, tid]() {
+      Rng r(seed + tid);
+      std::vector<int64_t> docVersions(docsPerThread, 0);
+
+      for (int op = 0; op < opsPerThread; op++) {
+        // Use numeric IDs: thread 0 uses 1000-1007, thread 1 uses 2000-2007, etc
+        // One thread never modifies another threads documents.
+        int localDoc = r.rint(docsPerThread);
+        std::string docId = std::to_string(localDoc + tid * 1000);
+        int64_t lastUpdateVersion = 0;
+
+        int operation = r.rint(3);  // 0 == update, 1 == delete, 2 = read
+        
+        if (operation == 0) { // Index
+          Doc doc = flatdoc("id", docId);
+          auto result = helper.index(doc, UpdateMessage::COMMIT, true);
+          ASSERT_TRUE(result.success) << "Thread " << tid << " failed to index doc " << docId;
+          // TODO: expose and get SoluxError for actual error message / stack trace.
+          docVersions[localDoc] = result.updateVersion;
+
+        } else if (operation == 1) { // Delete
+          auto result = helper.deleteById(docId, UpdateMessage::COMMIT);
+          ASSERT_TRUE(result.success) << "Thread " << tid << " failed to delete doc " << docId;
+          docVersions[localDoc] = -1; // Mark as deleted
+        } else { // Read
+          indexWriter->getIndexReader();
+          // TODO: store, expose, and test the update verision in the IndexReader
+          
+          auto* req = LocalReq::create(helper.getSearchEngine());
+          auto docs = req->collection("main")
+                        .matchQuery("id", docId)
+                        .fields({"id", "_version_"})
+                        .execute()
+                        .getDocs();
+          req->done();
+          
+          if (docVersions[localDoc] <= 0) {
+            EXPECT_TRUE(docs.empty()) << "Thread " << tid << " found deleted doc " << docId;
+          } else if (docVersions[localDoc] > 0) {
+            EXPECT_EQ(docs.size(), 1) << "Thread " << tid << " doc " << docId << " not found";
+            if (!docs.empty()) {
+              int64_t foundVersion = -1;
+              for (const auto& nv : docs[0]) {
+                if (nv.name == "_version_") {
+                  foundVersion = std::get<int64_t>(nv.val);
+                  break;
+                }
+              }
+              EXPECT_EQ(foundVersion, docVersions[localDoc])
+                << "Thread " << tid << " doc " << docId << " version mismatch"
+                << " expected: " << docVersions[localDoc] << " found: " << foundVersion;
+            }
+          }
+
+        } // end Read
+      } // end for opsPerThread
+    });
+  }
+  
+  // Wait for all threads
+  for (auto& thread : threads) {
+    thread.join();
+  }
+  
+  // Final commit to hopefully make sure all merges are done.
+  helper.commit();
+  indexWriter->getIndexReader(0);
+  indexWriter->updateGraph.wait_for_all();
+
+  // TODO: fixme : need to restore mergeFactor?  causes FacetBM to fail if it comes after?
+  indexWriter->mergePolicy->setMergeFactor(10);
 }

@@ -10,6 +10,7 @@
 #include "Collector.h"
 #include "Facet.h"
 #include "solux/util/AtomicMerger.h"
+#include "solux/server/SoluxError.h"
 
 namespace solux {
 
@@ -262,6 +263,7 @@ public:
       }
     } catch (std::exception& e) {
       LOG_ERROR("Unexpected exception: {}", e.what());
+      LOG_ERROR("Stack trace:\n{}", solux::getStackTrace());
     }
   }
 
