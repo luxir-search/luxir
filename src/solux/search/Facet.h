@@ -295,6 +295,9 @@ public:
     boost::unordered_flat_map<int64_t, int64_t>& count = mergeableData->counts;
     facetSegIntCol(domain, segnum, mergeableData->missing_num, segFieldInfo, [&](int32_t docid, int64_t val) {
       unused(docid);
+      if (val < start || val >= end) {
+        return; // value is out of range
+      }
       count[(val-start)/gap]++;
     });
     countMerger.release(mergeableData.release());
@@ -327,7 +330,8 @@ public:
     for (auto [val, count] : countVec) {
       auto& pair = *bucketIdsArr.Add();
       pair.mutable_v()->Add(start + val * gap);
-      pair.mutable_v()->Add(start + (val + 1) * gap);
+      int64_t bucketEnd = start + (val + 1) * gap;
+      pair.mutable_v()->Add(std::min(bucketEnd, end));
       countsArr.Add(count);
     }
     if (missing) {

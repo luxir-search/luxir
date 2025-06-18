@@ -72,7 +72,7 @@ TEST_F(SearchEngineTest, basic) {
     auto& facet8 = *ops["f8"].mutable_range_facet();
     facet8.set_field("foo_i");
     facet8.set_start(-5);
-    facet8.set_end(35);
+    facet8.set_end(34);
     facet8.set_gap(20);
 
     lreq->engine.submit(*lreq, para);
@@ -169,7 +169,7 @@ TEST_F(SearchEngineTest, basic) {
     ASSERT_EQ(-5, lreq->responses[0]->proto.ops().at("f8").facet().bucket_ids().multi_i().v(0).v(0));
     ASSERT_EQ(15, lreq->responses[0]->proto.ops().at("f8").facet().bucket_ids().multi_i().v(0).v(1));
     ASSERT_EQ(15, lreq->responses[0]->proto.ops().at("f8").facet().bucket_ids().multi_i().v(1).v(0));
-    ASSERT_EQ(35, lreq->responses[0]->proto.ops().at("f8").facet().bucket_ids().multi_i().v(1).v(1));
+    ASSERT_EQ(34, lreq->responses[0]->proto.ops().at("f8").facet().bucket_ids().multi_i().v(1).v(1));
     ASSERT_EQ(2, lreq->responses[0]->proto.ops().at("f8").facet().counts().size());
     ASSERT_EQ(1, lreq->responses[0]->proto.ops().at("f8").facet().counts().at(0));
     ASSERT_EQ(2, lreq->responses[0]->proto.ops().at("f8").facet().counts().at(1));
