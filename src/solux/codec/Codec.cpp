@@ -3,6 +3,12 @@
 namespace solux {
 
 
+IndexCodec::DocsCodec IndexCodec::docCodec;
+IndexCodec::PositionsCodec IndexCodec::posCodec;
+IndexCodec::TFreqCodec& IndexCodec::tfreqCodec = IndexCodec::posCodec;
+IndexCodec::NumericCodec IndexCodec::numericCodec;
+
+
 uint32_t staticselect(SoluxSIMDFor& c, const char* compressed, uint32_t blockSize, uint32_t index) {
   return c.select(compressed, blockSize, index);
 }

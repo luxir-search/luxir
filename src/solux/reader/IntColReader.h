@@ -2,6 +2,8 @@
 
 #include "DocsReader.h"
 #include "PostingsReader.h"
+#include "Postings.h"
+#include "solux/codec/Codec.h"
 
 namespace solux {
 
@@ -65,7 +67,7 @@ public:
     }
     // depending on the exact format, valuesInBlock may not be needed.
     auto valuesInBlock = (blockNum == uint64_t(nValues) / BLOCK_SIZE) ? uint32_t(nValues) % BLOCK_SIZE : BLOCK_SIZE;
-    auto delta = Postings::numericCodec.selectWithMeta(blockStart, valuesInBlock, rankInBlock, 0, block.bits);
+    auto delta = IndexCodec::numericCodec.selectWithMeta(blockStart, valuesInBlock, rankInBlock, 0, block.bits);
     int64_t scaled = uint64_t(rankInBlock * block.scaledSlope) / SLOPE_SCALE + block.intercept + delta;
     return scaled;
   }
@@ -200,7 +202,7 @@ public:
       // depending ont the exact format, valuesInBlock may not be needed.
       auto valuesInBlock = (blockNum == uint64_t(max) / Postings::NUMERIC_BLOCK_SIZE) ? uint32_t(max) % Postings::NUMERIC_BLOCK_SIZE : Postings::NUMERIC_BLOCK_SIZE;
       if (block.format <= 32) {
-        auto unscaled = Postings::numericCodec.selectWithMeta(blockStart, valuesInBlock, rankInBlock, 0, block.format);
+        auto unscaled = IndexCodec::numericCodec.selectWithMeta(blockStart, valuesInBlock, rankInBlock, 0, block.format);
         return unscaled * block.gcd + block.min;
       } else {
         // 64-bit, temp impl uncompressed
@@ -269,7 +271,7 @@ public:
       uint32_t num = decodedMax - decodedStart;
       if (block.format <= 32) {
         uint32_t ints[BULK_DECODE];
-        Postings::numericCodec.decodeWithMeta(subBlockStart, littleBlockSize,
+        IndexCodec::numericCodec.decodeWithMeta(subBlockStart, littleBlockSize,
                                               ints, num, 0, block.format);
         for (uint32_t i = 0; i < num; i++) {
           decoded[i] = ints[i] * block.gcd + block.min;

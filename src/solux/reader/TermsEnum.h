@@ -1,6 +1,7 @@
 #pragma once
 
 #include "FieldReader.h"
+#include "Postings.h"
 
 namespace solux {
 class TermsEnum {

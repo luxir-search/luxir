@@ -15,6 +15,7 @@
 #include "simdcomp/include/codecfactory.h"
 #include "roaring.hh"
 #include "ScreamingBuilder.h"
+#include "solux/codec/Codec.h"
 #include "solux/schema/FieldType.h"
 
 
@@ -394,7 +395,7 @@ public:
     }
     compressed_output.resize(Postings::POSITIONS_BLOCK_SIZE * sizeof(int32_t) + 1024);
     uint32_t compressedSize = compressed_output.size(); // this gets changed to the actual size
-    Postings::posCodec.encodeBlock(reinterpret_cast<uint32_t *>(posdeltas.data()), posdeltas.size(), compressed_output.data(),
+    IndexCodec::posCodec.encodeBlock(reinterpret_cast<uint32_t *>(posdeltas.data()), posdeltas.size(), compressed_output.data(),
                                   compressedSize);
     posOutput.write(compressed_output.data(), compressedSize);
 
@@ -419,7 +420,7 @@ public:
 
     compressed_output.resize(Postings::DOCS_BLOCK_SIZE * sizeof(int32_t) + 1024);
     uint32_t compressedSize = compressed_output.size(); // this gets changed to the actual size
-    Postings::docCodec.encodeBlock(reinterpret_cast<uint32_t *>(docs.data()), docs.size(), compressed_output.data(),
+    IndexCodec::docCodec.encodeBlock(reinterpret_cast<uint32_t *>(docs.data()), docs.size(), compressed_output.data(),
                                   compressedSize);
     docOutput.write(compressed_output.data(), compressedSize);
 
@@ -428,7 +429,7 @@ public:
     //
     compressed_output.resize(Postings::TERMS_BLOCK_SIZE + 1024);
     compressedSize = compressed_output.size(); // this gets changed to the actual size
-    Postings::tfreqCodec.encodeBlock(reinterpret_cast<uint32_t *>(tfreqs.data()), tfreqs.size(), compressed_output.data(),
+    IndexCodec::tfreqCodec.encodeBlock(reinterpret_cast<uint32_t *>(tfreqs.data()), tfreqs.size(), compressed_output.data(),
                                     compressedSize);
     docOutput.write(compressed_output.data(), compressedSize);
 

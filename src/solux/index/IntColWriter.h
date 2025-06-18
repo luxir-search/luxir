@@ -108,7 +108,7 @@ public:
       std::vector<char> compressed_output(ivalues.size() * sizeof(int32_t) + 32);
       uint32_t compressedSize = compressed_output.size(); // this gets changed to the actual size
       // Postings::numericCodec.encodeBlock((uint32_t*)ivalues.data(), ivalues.size(), compressed_output.data(), compressedSize);
-      Postings::numericCodec.encodeWithMeta((uint32_t*)ivalues.data(), ivalues.size(), compressed_output.data(), compressedSize, 0, bits);
+      IndexCodec::numericCodec.encodeWithMeta((uint32_t*)ivalues.data(), ivalues.size(), compressed_output.data(), compressedSize, 0, bits);
       //   void encodeWithMeta(uint32_t* in, uint32_t inSz, char* target, uint32_t &outSz, uint32_t minval, uint8_t bits) {
       /*
       if (compressedSize > ivalues.size() * sizeof(int32_t) + 32) {
@@ -229,7 +229,7 @@ public:
     std::vector<char> compressed_output(ivalues.size() * sizeof(int32_t) + 32);
     uint32_t compressedSize = compressed_output.size(); // this gets changed to the actual size
     // Postings::numericCodec.encodeBlock((uint32_t*)ivalues.data(), ivalues.size(), compressed_output.data(), compressedSize);
-    Postings::numericCodec.encodeWithMeta((uint32_t*)ivalues.data(), ivalues.size(), compressed_output.data(), compressedSize, 0, bits);
+    IndexCodec::numericCodec.encodeWithMeta((uint32_t*)ivalues.data(), ivalues.size(), compressed_output.data(), compressedSize, 0, bits);
     out.write(compressed_output.data(), compressedSize);
     // SIMDFor implementation can read up to 31 extra bytes after the end of compressedSize.  See SoluxSIMDFor comment.
     // TODO: FIXME just a single MonoReader::BlockInfo that come after the blocks may not be enough!

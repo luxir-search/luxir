@@ -1,6 +1,7 @@
 #pragma once
 
 #include "TermsEnum.h"
+#include "solux/codec/Codec.h"
 
 namespace solux {
 // TODO: templatize to be able to instrument, implement checkindex, etc...
@@ -204,7 +205,7 @@ public:
       // like lastBlockEncodedPosOrd, but for docs.
       if (leftToRead >= Postings::DOCS_BLOCK_SIZE) {
         uint32_t outSz = Postings::DOCS_BLOCK_SIZE;
-        auto bytesRead = Postings::docCodec.decodeBlock(docIS.ptr(), docIS.left(), (uint32_t*)docBuf, outSz);
+        auto bytesRead = IndexCodec::docCodec.decodeBlock(docIS.ptr(), docIS.left(), (uint32_t*)docBuf, outSz);
         docIS.skip(bytesRead);
         assert(outSz == Postings::DOCS_BLOCK_SIZE);
         docBufIdx = 0;
@@ -213,7 +214,7 @@ public:
 
         // TODO: we should really decode term freqs lazily in case they aren't needed... but this is far simpler for now.
         outSz = Postings::DOCS_BLOCK_SIZE;  // currently parallel to docs, so must be same block size
-        bytesRead = Postings::tfreqCodec.decodeBlock(docIS.ptr(), docIS.left(), (uint32_t*)tfreqBuf, outSz);
+        bytesRead = IndexCodec::tfreqCodec.decodeBlock(docIS.ptr(), docIS.left(), (uint32_t*)tfreqBuf, outSz);
         docIS.skip(bytesRead);
         assert(outSz == Postings::DOCS_BLOCK_SIZE);
         tfreqBufIdx = 0;
@@ -299,7 +300,7 @@ public:
         // std::cout << "skipping blocks: id=" << docid << " numToSkip=" << numToSkip << std::endl;
         // For now, just decode the whole block.  Optimize this later.
         uint32_t outSz = Postings::POSITIONS_BLOCK_SIZE;
-        auto bytesRead = Postings::posCodec.decodeBlock(posIS.ptr(), posIS.left(), (uint32_t*)posBuf, outSz);
+        auto bytesRead = IndexCodec::posCodec.decodeBlock(posIS.ptr(), posIS.left(), (uint32_t*)posBuf, outSz);
         posIS.skip(bytesRead);
         assert(outSz == Postings::POSITIONS_BLOCK_SIZE);
         posBufIdx = 0;
@@ -329,7 +330,7 @@ public:
       // OK load block of positions.  This could be optimized by only loading the relevant part.
       // If this enum wants all positions, we should just decode everything.
       uint32_t outSz = Postings::POSITIONS_BLOCK_SIZE;
-      auto bytesRead = Postings::posCodec.decodeBlock(posIS.ptr(), posIS.left(), (uint32_t*)posBuf, outSz);
+      auto bytesRead = IndexCodec::posCodec.decodeBlock(posIS.ptr(), posIS.left(), (uint32_t*)posBuf, outSz);
       posIS.skip(bytesRead);
       assert(outSz == Postings::POSITIONS_BLOCK_SIZE);
       posBufIdx = 0;
@@ -366,7 +367,7 @@ public:
           // read a new block of positions
           // TODO: refactor reading a new block (not skipping) to one place?
           uint32_t outSz = Postings::POSITIONS_BLOCK_SIZE;
-          auto bytesRead = Postings::posCodec.decodeBlock(posIS.ptr(), posIS.left(), (uint32_t*)posBuf, outSz);
+          auto bytesRead = IndexCodec::posCodec.decodeBlock(posIS.ptr(), posIS.left(), (uint32_t*)posBuf, outSz);
           posIS.skip(bytesRead);
           assert(outSz == Postings::POSITIONS_BLOCK_SIZE);
           posBufIdx = 0;

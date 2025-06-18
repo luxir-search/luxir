@@ -1171,7 +1171,7 @@ void IndexWriter::applyDeletes(SegInfo& seg, MultiDeletesData& multiDeletesData)
     auto newLiveGen = seg.liveGen + 1;
 
     // Write the delete bitmap file
-    std::string deleteFileName = Postings::getDeleteFileName(
+    std::string deleteFileName = Postings::getLiveDocsFileName(
       Postings::getSortableString(seg.segId), newLiveGen);
 
     auto deleteFile = dir.createFile(deleteFileName);

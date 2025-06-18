@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <cassert>
 #include "solux/util/solux_util.h"
+#include "solux/reader/Postings.h"
 
 // TODO: eventually hide this in the cpp
 #include "simdcomp/include/codecfactory.h"
@@ -92,7 +93,7 @@ class SoluxPFOR : public U32Codec {
 public:
   // Micro-benchmarks show decoding 256 takes about 35% longer to 50% longer (with stack bitpacker) than 128.
   // So that's still a savings for dense iteration, but a drawback for very sparse.
-  const static uint32_t BLOCK_SIZE = 128;
+  const static uint32_t BLOCK_SIZE = Postings::DOCS_BLOCK_SIZE; // NOTE! should be 128.
 
   ~SoluxPFOR() override = default;
 
@@ -357,5 +358,24 @@ public:
 
 template<typename T>
 thread_local std::unique_ptr<T> IntegerCODECTypeWrapper<T>::codec = nullptr;
+
+
+class IndexCodec {
+public:
+
+
+  // using PositionsCodec = IntegerCODECTypeWrapper<SIMDCompressionLib::FastPFor<4, false>>;
+  using PositionsCodec = SoluxPFOR;
+  // using DocsCodec = IntegerCODECTypeWrapper<SIMDCompressionLib::SIMDFastPFor<4, SIMDCompressionLib::RegularDeltaSIMD>>;
+  using DocsCodec = SoluxPFORd;
+  using TFreqCodec = PositionsCodec; // same type, but should also share instances for better performance
+  using NumericCodec = SoluxSIMDFor;
+
+  static DocsCodec docCodec;
+  static PositionsCodec posCodec;
+  static TFreqCodec& tfreqCodec;
+  static NumericCodec numericCodec;
+};
+
 
 } // end namespace

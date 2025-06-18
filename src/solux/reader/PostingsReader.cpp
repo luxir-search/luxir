@@ -1,12 +1,9 @@
 #include "PostingsReader.h"
 
+#include <filesystem>
+#include "Postings.h"
+
 namespace solux {
-
-Postings::DocsCodec Postings::docCodec;
-Postings::PositionsCodec Postings::posCodec;
-Postings::TFreqCodec& Postings::tfreqCodec = Postings::posCodec;
-Postings::NumericCodec Postings::numericCodec;
-
 
 
 // Initialize from files, returns false if missing files and missingFileOK=true

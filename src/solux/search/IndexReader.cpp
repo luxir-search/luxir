@@ -1,4 +1,5 @@
 #include "IndexReader.h"
+#include "solux/reader/Postings.h"
 
 #include "protos/solux_types.pb.h"
 #include <google/protobuf/io/coded_stream.h>
@@ -8,7 +9,7 @@ namespace solux {
 
 std::shared_ptr<LiveDocs> LiveDocs::create(Directory& dir, uint64_t segId, uint64_t liveGen, int32_t maxDoc, bool missingFileOK) {
   assert(liveGen > 0 && maxDoc > 0);
-  std::string deleteFileName = Postings::getDeleteFileName(
+  std::string deleteFileName = Postings::getLiveDocsFileName(
     Postings::getSortableString(segId), liveGen);
 
   auto deleteFile = dir.openFile(deleteFileName);
