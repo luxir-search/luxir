@@ -4,6 +4,8 @@
 #include "test/SoluxTest.h"
 #include<boost/container/static_vector.hpp>
 
+#include "solux/index/IntColWriter.h"
+
 namespace solux {
 
 class PostingsTest : public SoluxTest {

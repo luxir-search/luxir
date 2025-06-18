@@ -1,7 +1,16 @@
-
 #include "Inverter.h"
 
+#include <algorithm>
+#include <boost/sort/spreadsort/string_sort.hpp>
+#include "solux/schema/Schema.h"
+
+// include the actual index handlers
+#include "solux/index/handler/IntColHandler.h"
+#include "solux/index/handler/StrColHandler.h"
+#include "solux/index/handler/FullTextHandler.h"
+
 namespace solux {
+
 
 Inverter::IndexHandler& Inverter::createIndexHandler(const std::string_view name) {
   // perhaps this part should be moved to Schema?
@@ -35,16 +44,16 @@ Inverter::IndexHandler& Inverter::createIndexHandler(const std::string_view name
 
   switch (fieldType->type()) {
     case FieldType::Type::TEXT:
-      fieldHandler = std::make_unique<PosIndexHandler>(*this, name, fieldType);
+      fieldHandler = std::make_unique<handler::FullTextHandler>(*this, name, fieldType);
       break;
     case FieldType::Type::STRING:
-      fieldHandler = std::make_unique<StringIndexHandler>(*this, name, fieldType);
+      fieldHandler = std::make_unique<handler::StrColHandler>(*this, name, fieldType);
       break;
     case FieldType::Type::INT:
       if (fieldType->multiValued()) {
-        fieldHandler = std::make_unique<MultiIntColHandler>(*this, name, fieldType);
+        fieldHandler = std::make_unique<handler::MultiIntColHandler>(*this, name, fieldType);
       } else {
-        fieldHandler = std::make_unique<IntColHandler>(*this, name, fieldType);
+        fieldHandler = std::make_unique<handler::IntColHandler>(*this, name, fieldType);
       }
       break;
     default:
@@ -56,5 +65,33 @@ Inverter::IndexHandler& Inverter::createIndexHandler(const std::string_view name
   assert(inserted);  // we should never (currently) be trying to overwrite an existing handler
   return *(newIter->second);
 }
+
+
+bool Inverter::flush() {
+  getPostingsWriter().setMaxDoc(getMaxDoc());  // TODO: this won't always be accurate currently?
+
+  // We could either sort fields first, or after they have been indexed.  Merging segments will presumably
+  // go in sorted field order, so lets do the same thing here and sort first.
+  std::vector<IndexHandler*> fields;
+  fields.reserve(indexHandlers.size());
+  for (auto& entry : indexHandlers) {
+    fields.push_back(entry.second.get());
+  }
+
+  // For normal usecases, spreadsort will fall back to pdqsort (less than 1000 fields, but we want to
+  // take care of the outliers as well (esp when it doesn't hurt the average case)
+  boost::sort::spreadsort::string_sort(fields.begin(), fields.end(),
+                                       [](const IndexHandler* x, size_t offset) {return x->fieldName[offset];},
+                                       [](const IndexHandler* x) {return x->fieldName.size();},
+                                       [](const IndexHandler* x, const IndexHandler* y) {return *x < *y;});
+
+
+  for (auto fieldHandler : fields) {
+    fieldHandler->flush(*this);
+  }
+
+  return getPostingsWriter().finish();
+}
+
 
 } // end namespace

@@ -7,6 +7,8 @@
 #include "test/TestUtils.h"
 #include <vector>
 
+#include "solux/index/IntColWriter.h"
+
 using namespace solux;
 using namespace solux::test;
 

@@ -1,7 +1,9 @@
 #include <gtest/gtest.h>
 #include <iostream>
 
+#include "solux/index/DocStream.h"
 #include "solux/index/Inverter.h"
+#include "solux/util/TermValHash.h"
 
 using namespace std;
 using namespace solux;

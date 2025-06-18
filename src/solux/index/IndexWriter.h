@@ -224,8 +224,7 @@ public:
   // protected by indexMutex
   std::vector<std::unique_ptr<SegInfo>> segmentsToDelete;
 
-  // In the future, we way want to get an inverter by segment id (delete handling?).
-  // We could convert to unordered_flat_set keyed by uint64_t segId, just like segInfos.
+
   // protected by indexMutex
   // If we don't need to look up by segment id, we could just use a vector for idleInverters.
   boost::unordered_flat_map<Inverter*, std::unique_ptr<Inverter>> idleInverters;

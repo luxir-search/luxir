@@ -1,5 +1,7 @@
 #pragma once
 #include "IndexWriter.h"
+#include "OrdCollector.h"
+#include "OrdColWriter.h"
 
 // This file is only included in IndexWriter.cpp
 
