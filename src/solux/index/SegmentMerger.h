@@ -2,6 +2,7 @@
 #include "IndexWriter.h"
 #include "OrdCollector.h"
 #include "OrdColWriter.h"
+#include "solux/reader/DocsEnum.h"
 
 // This file is only included in IndexWriter.cpp
 

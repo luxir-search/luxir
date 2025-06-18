@@ -7,6 +7,7 @@
 #include "DocSet.h"
 #include "IndexReader.h"
 #include "solux/reader/IntColReader.h"
+#include "solux/reader/TermsEnum.h"
 #include "solux/schema/Schema.h"
 #include "solux/util/AtomicMerger.h"
 

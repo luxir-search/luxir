@@ -3,7 +3,6 @@
 #include <cstdint>
 #include <assert.h>
 #include <iostream>
-#include <ostream>
 #include <sstream>
 #include <unordered_map>
 #include <vector>
@@ -12,9 +11,11 @@
 #include "solux/store/OutputStream.h"
 #include "solux/store/Directory.h"
 #include "solux/reader/PostingsReader.h"
+#include "solux/reader/FieldReader.h"
 #include "simdcomp/include/codecfactory.h"
 #include "roaring.hh"
 #include "ScreamingBuilder.h"
+#include "solux/schema/FieldType.h"
 
 
 namespace solux {

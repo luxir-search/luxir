@@ -3,6 +3,9 @@
 #include <solux/util/heap.h>
 #include "solux/util/MemPool.h"
 #include "solux/search/IndexReader.h"
+#include "solux/reader/FieldReader.h"
+#include "solux/reader/TermsEnum.h"
+#include "solux/reader/DocsEnum.h"
 #include "solux/search/Similarity.h"
 #include "gtl/phmap.hpp"
 

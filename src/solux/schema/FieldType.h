@@ -1,6 +1,5 @@
 #pragma once
 
-#include "solux/util/MemPool.h"
 #include "solux/analysis/Analyzer.h"
 
 #include <memory>

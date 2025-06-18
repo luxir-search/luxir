@@ -1,5 +1,6 @@
 #pragma once
 
+#include "DocsReader.h"
 #include "PostingsReader.h"
 
 namespace solux {
