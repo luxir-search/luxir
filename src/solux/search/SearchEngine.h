@@ -1,12 +1,13 @@
 #pragma once
 
-#include <solux/query/ProtobufQueryParser.h>
 #include <oneapi/tbb/flow_graph.h>
-#include <solux/server/SoluxNode.h>
-#include <solux/util/proto.h>
 #include <ranges>
-#include "protos/solux_types.pb.h"
-#include "IndexReader.h"
+
+#include "solux/query/ProtobufQueryParser.h"
+#include "solux/server/SoluxNode.h"
+#include "solux/util/proto.h"
+
+#include "SearchRequest.h"
 #include "Collector.h"
 #include "Facet.h"
 #include "solux/util/AtomicMerger.h"
@@ -60,85 +61,9 @@ public:
   SearchEngine(SoluxNode& node): node(node) {
   }
 
-  class Response;
-
-  // The top-level request for the SearchEngine.
-  class Request {
-    friend class SearchEngine;
-  public:
-    SearchEngine& engine;
-    // we should try to minimize the amount that these protobuf classes are used in case we need to move to a
-    // more efficient implementation later.  Or even different formats like arrow.
-    solux::proto::SearchRequest& proto;
-    google::protobuf::Arena& arena;
-    std::shared_ptr<IndexReader> reader;
-    std::shared_ptr<Schema> schema;
-    MemPool requestPool;
-    oneapi::tbb::task_group* tg = nullptr;  // optional top-level task group for this request.
-    Response* lastResponse = nullptr;
-
-    Request(SearchEngine& engine, solux::proto::SearchRequest& proto): engine(engine), proto(proto), arena(*proto.GetArena()) {
-    }
-    virtual ~Request() = default;
-
-    /// Call this to send a response back to the client (or cause it to be buffered).  This can be called multiple times for a single request.
-    /// replyComplete will be called when the response has actually been written and is no longer needed.
-    /// Returns the number of buffered responses (0 if the response was written immediately).
-    virtual int reply(Response& response) = 0;
-
-    /// This is called when the reply has completed (e.g. it has been written to a socket and not just buffered)
-    /// This may be called from a gRPC server thread (and with a mutex locked), so it should be fast.
-    virtual void replyCallback(Response& response) {
-      bool last = response.last;
-      // if this response used a different Arena, release it.
-      if (&response.arena != &arena) {
-        releaseArena(&response.arena);
-      }
-      if (last) {
-        done();
-      }
-    };
-
-    /// This will be called last after all responses have been sent back to the client.
-    /// This is the place to do final cleanup (such as deleting or resetting the Arena)
-    /// It may delete *this*, so nothing else should be accessed after this is called.
-    virtual void done() {
-      releaseArena(&arena);
-    };
-  };
-
-  // A response object that can be used to send back results to the client.
-  // One or more responses can be sent back for a single request.
-  class Response {
-  public:
-    SearchEngine::Request& req;
-    google::protobuf::Arena& arena;
-    solux::proto::SearchResponse& proto;
-    bool last = true;  // if true, this is the last response for the request.
-    // TODO: we could add a callback here to facilitate chaining of responses (i.e. for streaming results, etc)
-
-    Response(SearchEngine::Request& req, google::protobuf::Arena& arena, bool last)
-    : req(req), arena(arena), proto(*google::protobuf::Arena::Create<solux::proto::SearchResponse>(&arena)), last(last)
-    {
-      // set the response id to match the request id.
-      proto.set_request_id(req.proto.request_id());
-    }
-
-    // Arena allocate a Response object.
-    static Response* create(SearchEngine::Request& req, bool last=true) {
-      // If this is the last message, just use the same arena as the response since they will have
-      // the same lifetimes.
-      auto* arena = last ? &req.arena : createArena();
-      return google::protobuf::Arena::Create<Response>(arena, req, *arena, last);
-    }
-
-    // named columns, part of DocList or part of a FacetResult.
-    using ColumnsType = google::protobuf::Map<std::string, solux::proto::Column>;
-  };
-
   class QueryReq {
   public:
-    SearchEngine::Request& req;
+    SearchRequest& req;
     Query::Context& qcontext;
     Query* query;
     Query::Weight* weight;
@@ -176,7 +101,7 @@ public:
     AtomicMerger<MergeableCollector> collectorMerger;
 
     //  req, *qcontext, query, limit
-    QueryReq(SearchEngine::Request& req, Query::Context& qcontext, Query* query, int64_t topCount, std::function<void(QueryReq&)>callback={})
+    QueryReq(SearchRequest& req, Query::Context& qcontext, Query* query, int64_t topCount, std::function<void(QueryReq&)>callback={})
     : req(req), qcontext(qcontext), query(query), topCount(topCount), callback(std::move(callback)), collectorMerger(nullptr,nullptr) {
       weight = query->createWeight(qcontext);
 
@@ -250,7 +175,7 @@ public:
   };
 
 
-  void submit(SearchEngine::Request& req, bool parallel = true) {
+  void submit(SearchRequest& req, bool parallel = true) {
     try {
       std::optional<oneapi::tbb::task_group> stackTg;
       oneapi::tbb::task_group* tg;
@@ -268,10 +193,10 @@ public:
     }
   }
 
-  void submitBody(SearchEngine::Request& req) {
+  void submitBody(SearchRequest& req) {
     getResources(req);
 
-    req.lastResponse = Response::create(req, true);
+    req.lastResponse = SearchResponse::create(req, true);
 
     // We probably want to parse all up-front in a single task to understand dependencies.
 
@@ -386,7 +311,7 @@ public:
 
 
   /// get needed resources such as the index reader and schema
-  void getResources(SearchEngine::Request& req);
+  void getResources(SearchRequest& req);
 
 
   // This is currently called after all segments have been collected for a TopN query to
@@ -434,7 +359,7 @@ public:
       }
 
       bool lastResponse = batchIter == batches.end() || std::next(batchIter) == batches.end();
-      auto& response = lastResponse ? *qr.req.lastResponse : *Response::create(qr.req, lastResponse);
+      auto& response = lastResponse ? *qr.req.lastResponse : *SearchResponse::create(qr.req, lastResponse);
       auto& searchResultProto = response.proto.mutable_ops()->operator[](qr.name);
       auto& docListProto = *searchResultProto.mutable_docs();
       docListProto.set_offset(offset);
@@ -554,9 +479,9 @@ public:
 
   // We are guaranteed that the resources passed here will remain valid for any subtasks added to "tg" (i.e. the
   // caller waits on "tg" before releasing the resources).
-  void loadIntCol(SearchEngine::Request& req, std::string_view field, FieldType& fieldType,
+  void loadIntCol(SearchRequest& req, std::string_view field, FieldType& fieldType,
                    std::ranges::input_range auto& segDocs, std::span<uint8_t> sortedIdx, const std::span<uint8_t> segRunLength,
-                   Response::ColumnsType& columnsProto, oneapi::tbb::task_group* tg)
+                   SearchResponse::ColumnsType& columnsProto, oneapi::tbb::task_group* tg)
   {
     auto& fieldCol = columnsProto[field];  // output Column in the protobuf
     //load a span for the single valued or multi valued target
@@ -641,9 +566,9 @@ public:
   }
 
 
-  void loadStrCol(SearchEngine::Request& req, std::string_view field, FieldType& fieldType,
+  void loadStrCol(SearchRequest& req, std::string_view field, FieldType& fieldType,
                   std::ranges::input_range auto& segDocs, std::span<uint8_t> sortedIdx, const std::span<uint8_t> segRunLength,
-                  Response::ColumnsType& columnsProto, oneapi::tbb::task_group* tg)
+                  SearchResponse::ColumnsType& columnsProto, oneapi::tbb::task_group* tg)
   {
     auto columnSize = segDocs.size();
     auto& fieldCol = columnsProto[field];  // output Column in the protobuf

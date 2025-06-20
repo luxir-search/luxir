@@ -5,9 +5,9 @@
 namespace solux::test {
 
 
-class LocalReq : public SearchEngine::Request {
+class LocalReq : public SearchRequest {
 public:
-  std::vector<SearchEngine::Response*> responses;
+  std::vector<SearchResponse*> responses;
 
   /// Heap allocate an Arena (if null) and use it to create a LocalReq object and proto::SearchRequest
   static LocalReq* create(SearchEngine& engine, google::protobuf::Arena* arena = nullptr) {
@@ -17,7 +17,7 @@ public:
     return localReq;
   }
 
-  LocalReq(SearchEngine& engine, solux::proto::SearchRequest& proto) : Request(engine, proto) {
+  LocalReq(SearchEngine& engine, solux::proto::SearchRequest& proto) : SearchRequest(engine, proto) {
   }
 
   virtual ~LocalReq() {
@@ -29,7 +29,7 @@ public:
     }
   }
 
-  int reply(SearchEngine::Response& response) override {
+  int reply(SearchResponse& response) override {
     responses.push_back(&response);
     /*
     std::string reqStr;
@@ -40,7 +40,7 @@ public:
   }
 
   // will never be called
-  void replyCallback(SearchEngine::Response& response) override {
+  void replyCallback(SearchResponse& response) override {
     unused(response);
   }
 

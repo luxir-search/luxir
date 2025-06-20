@@ -736,13 +736,13 @@ public:
     // this could lead to deadlock (anything waiting for a response callback would be vulnerable).
     // TBB isolation should be able to prevent this, as could avoiding TBB (pass thread_group==null)
 
-    class GRPCSearchRequest : public SearchEngine::Request {
+    class GRPCSearchRequest : public SearchRequest {
     public:
       SearcherSearchStreamingCall* parent;
-      GRPCSearchRequest(SearchEngine& engine, solux::proto::SearchRequest& proto) : SearchEngine::Request(engine, proto) {
+      GRPCSearchRequest(SearchEngine& engine, solux::proto::SearchRequest& proto) : SearchRequest(engine, proto) {
       }
 
-      int reply(SearchEngine::Response& response) override {
+      int reply(SearchResponse& response) override {
         auto buffered = parent->respond(&response.proto,
                         // cause replyCallback() to be called after the write is done.
                         [&response](auto* responseProto) {

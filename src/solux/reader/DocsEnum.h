@@ -7,6 +7,8 @@ namespace solux {
 // TODO: templatize to be able to instrument, implement checkindex, etc...
 // TODO: investigate writing a version of this based on continuations and see how it performs?
 // TODO: some of this internal state could be removed... we only need some of it in the constructor?
+// Implementation note: moving block reading of docs and positions to cpp files and just leaving the hot path
+// in the header resulted in >3% performance loss for docs, and >5% loss for positions.
 class DocsEnum {
   // Position ordinals are indexes into the term-global positions list for non-pulsed positions.
   // Thus the max posOrd should thus be totalTermFreq (except in the case of a single pulsed term,
