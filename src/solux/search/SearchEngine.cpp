@@ -1,8 +1,41 @@
 #include "SearchEngine.h"
+#include "ProtobufSearchParser.h"
 
 namespace solux {
 
+void SearchEngine::submitBody(SearchRequest& req) {
+  getResources(req);
+  req.lastResponse = SearchResponse::create(req, true);
 
+  ProtobufSearchParser parser(req);
+  auto* root = parser.parse();
+  std::unique_ptr<SearchOp::Calculator> calc(root->createCalculator(nullptr, -1));
+  calc->calc(req.tg, -1, nullptr);
+
+  if (req.tg) {
+    req.tg->wait();
+  }
+
+  // TODO: error handling here?
+
+  // Send back the final response.  Do not access req after this point as it
+  // maybe asynchronously deleted.
+  req.reply(*req.lastResponse);
+}
+
+void SearchEngine::submit(SearchRequest& req, bool parallel) {
+  // Ideas: we could keep track of executing requests here, and provide ways to list / cancel them?
+  try {
+    std::optional<oneapi::tbb::task_group> stackTg;
+    if (parallel && req.tg == nullptr) {
+      req.tg = &stackTg.emplace();
+    }
+    submitBody(req);
+  } catch (std::exception& e) {
+    LOG_ERROR("Unexpected exception: {}", e.what());
+    LOG_ERROR("Stack trace:\n{}", solux::getStackTrace());
+  }
+}
 
 void SearchEngine::getResources(SearchRequest& req) {
   // look up the correct index reader and the associated schema

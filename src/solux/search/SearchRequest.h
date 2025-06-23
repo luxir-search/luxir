@@ -1,5 +1,8 @@
 #pragma once
 
+#include <mutex>
+#include <oneapi/tbb/task_group.h>
+
 #include "protos/solux_types.pb.h"
 #include "IndexReader.h"
 #include "solux/schema/Schema.h"
@@ -23,6 +26,7 @@ public:
   MemPool requestPool;
   oneapi::tbb::task_group* tg = nullptr; // optional top-level task group for this request.
   SearchResponse* lastResponse = nullptr;
+  std::mutex mutex;
 
   SearchRequest(SearchEngine& engine, solux::proto::SearchRequest& proto): engine(engine), proto(proto),
                                                                            arena(*proto.GetArena()) {

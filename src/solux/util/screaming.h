@@ -213,6 +213,14 @@ public:
     return nbits;
   }
 
+  int32_t card() const {
+    int32_t count = 0;
+    for (int32_t i = 0; i < nwords; i++) {
+      count += std::popcount(words[i]);
+    }
+    return count;
+  }
+
   void set(int32_t index) {
     assert(index < nbits);
     OBS::set(index);
@@ -221,6 +229,15 @@ public:
   bool get(int32_t index) const {
     assert(index < nbits);
     return OBS::get(index);
+  }
+
+  bool operator[](int32_t index) const {
+    assert(index < nbits);
+    return OBS::get(index);
+  }
+
+  bool operator[](size_t index) const {
+    return OBS::get((int32_t)index);
   }
 
   // returns 0 or 1

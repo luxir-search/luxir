@@ -1,5 +1,7 @@
 #pragma once
 #include <span>
+
+#include "DocSet.h"
 #include "solux/reader/PostingsReader.h"
 #include "solux/util/screaming.h"
 
@@ -12,18 +14,16 @@ namespace solux {
 /// LiveDocs holds the live document bitmap for a segment
 class LiveDocs {
 private:
-  screaming::FixedBitSet liveBits;                    // The actual bitset (memory mapped)
+  BitDocSet docSet;                                   // The actual bitset (memory mapped)
   std::shared_ptr<InputFile> deleteFile;              // Keep file alive for memory mapping
-  int32_t numLiveDocs = 0;
 
 public:
-  LiveDocs() : liveBits(nullptr, 0) {}
+  LiveDocs() : docSet(FixedBitSet(nullptr, 0)) {}
 
   LiveDocs(uint64_t* mappedMemory, int32_t maxDocCount, 
            std::shared_ptr<InputFile>&& file, int32_t numLive)
-      : liveBits(mappedMemory, maxDocCount),
-        deleteFile(std::move(file)), 
-        numLiveDocs(numLive) {}
+      : docSet(FixedBitSet(mappedMemory, maxDocCount), numLive),
+        deleteFile(std::move(file)) {}
 
   // Static factory method to create LiveDocs from delete bitmap file.  Do not call this if liveGen is 0 (no
   // deletes for this segment).  A nullptr is returned in the case that there are deletions but we couldn't
@@ -33,19 +33,24 @@ public:
   
   // Get the underlying FixedBitSet for direct access
   const screaming::FixedBitSet& bitset() const {
-    return liveBits;
+    return docSet.bits();
+  }
+
+  // Get the underlying BitDocSet for direct access
+  BitDocSet& docset() {
+    return docSet;
   }
 
   int32_t numDeletes() const {
-    return liveBits.size() - numLiveDocs;
+    return size() - numLive();
   }
   
   int32_t numLive() const {
-    return numLiveDocs;
+    return docSet.cachedCard();
   }
   
-  int32_t maxDoc() const {
-    return liveBits.size();
+  int32_t size() const {
+    return docSet.bits().size();
   }
 };
 
@@ -82,8 +87,12 @@ public:
     }
 
     // returns null if all docs are live (no deletes)
-    const LiveDocs* liveDocs() const noexcept {
+    LiveDocs* liveDocs() const noexcept {
       return sharedLiveDocs.get();
+    }
+
+    int32_t maxDoc() const noexcept {
+      return segInfo.max_doc;
     }
 
     // Get number of deleted documents

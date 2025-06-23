@@ -1,11 +1,13 @@
 #pragma once
 #include <gtest/gtest.h>
-#include "solux/util/solux_util.h"
 #include "solux/util/random.h"
 #include "solux/index/Inverter.h"
 #include "solux/index/IndexWriter.h"
 #include "solux/index/PostingsWriter.h"
 #include "solux/reader/PostingsReader.h"
+#include "solux/reader/TermsEnum.h"
+#include "solux/reader/DocsEnum.h"
+#include "solux/reader/IntColReader.h"
 #include "test/SoluxTest.h"
 #include <vector>
 

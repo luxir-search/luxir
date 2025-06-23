@@ -7,6 +7,8 @@
 #include "LocalReq.h"
 #include <google/protobuf/arena.h>
 
+#include "solux/util/thread.h"
+
 namespace solux::test {
 
 struct IndexResult {

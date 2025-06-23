@@ -198,10 +198,11 @@ static void BM_Facet(benchmark::State& state, int64_t nDocs, std::string_view sh
 constexpr int32_t nDocs = 10'000'000;
 constexpr const char* shape = "9555"; // 9 segments, 555 docs per segment
 
-
+#ifdef REMOVED
+//  FIXME
 BENCHMARK_CAPTURE(BM_FacetBuildIndex, build,              nDocs, shape);
 BENCHMARK_CAPTURE(BM_Facet, u10k_i,            nDocs, shape, "all", "u10k_i", false);
 BENCHMARK_CAPTURE(BM_Facet, u10k_i_para,       nDocs, shape, "all", "u10k_i", true);
 BENCHMARK_CAPTURE(BM_Facet, short_u10k_s,      nDocs, shape, "all", "short_u10k_s", false);
 BENCHMARK_CAPTURE(BM_Facet, short_u10k_s_para, nDocs, shape, "all", "short_u10k_s", true);
-
+#endif

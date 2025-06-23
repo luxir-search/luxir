@@ -15,7 +15,7 @@ namespace solux {
 
 class FacetDomain {
 public:
-  std::vector<DocSet> allMatches;
+  std::vector<BitDocSet> allMatches;
 };
 
 class FacetReq {
@@ -50,13 +50,13 @@ protected:
   // segFieldInfo is passed in uninitializsed and filled in if the field exists in the segment.
   // The value returned is if the field exists in the segment.
   bool facetSegIntCol(FacetDomain& domain, int32_t segnum, int64_t& missing, SegFieldInfo& segFieldInfo, auto&& callback) {
-    std::vector<bool>& matches = domain.allMatches[segnum].docs;
+    auto& matches = domain.allMatches[segnum].bits();
     auto& postingsReader = reader.segments()[segnum].postingsReader();
     auto poolGuard = MemPool::threadLocalPoolGuard();
     FieldReader fieldReader(poolGuard.pool(), postingsReader);
     bool found = fieldReader.seek(fieldName);
     if (!found) {
-      missing += std::count(matches.begin(), matches.end(), true);
+      missing += matches.card();
       return false;
     }
     fieldReader.readFieldInfo(segFieldInfo);

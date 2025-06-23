@@ -64,6 +64,8 @@ message TopDocs {
   int32 batch_size = 9;         // maximum number of documents to return in a single streaming response
                                 // if max_batch_size >= limit, multiple responses may be generated
                                 // The solux server may choose a lower value to protect against large in-memory responses.
+
+  map<string, SearchOp> ops = 15;  // sub-facets or search operations performed over docs that match this query.
 }
 
 message SortSpec {
@@ -169,50 +171,37 @@ message Domain {
 // Top-level response to a Search request
 message SearchResponse {
   bytes request_id = 1;
-  map<string, SearchResult> ops = 2;
+  map<string, Val> ops = 2; // the results of the search operations in the request, keyed by operation name.
   bool more = 15;  // if true, expect at least one more streaming response to the logical request.
 }
 
-message SearchResult {
-  oneof kind {
-    DocList docs = 1;
-    FacetResult facet = 2;
-  }
-}
 
 message DocList {
   sint64 matches = 1;
   float max_score = 2;
   map<string, Column> columns = 3;
   int64 offset = 4;
-  bool more = 5; // expect more results to be streamed back?
+  map<string, Val> ops = 14; // sub-operation results performed on the TopDocs query.
+  bool more = 15; // expect more results to be streamed back?
 }
 
-// TODO: a column format for facets for better efficiency (so string names and protobuf tags aren't repeated for each bucket?)
-// may be more efficient client language mapping as well?
-// What about special buckets then?  Map to a column number?  See FacetResponse below for a prototype column response
-message BucketList {
-  repeated Bucket buckets = 1;
-  sint64 total_buckets = 2;  // The total number of buckets *if* it was requested.  This can be expensive to calculate.
-  int64 offset = 3;
-  // TODO: a more flag if streaming for this bucket list?
-}
-
-message Bucket {
-  Val val = 1;
-  sint64 count = 2;
-  map<string, SearchResult> ops = 3;
-}
 
 message FacetResult {
   sint64 total_buckets =  1; // The total number of buckets *if* it was requested.  This can be expensive to calculate.
   Column bucket_ids = 2;
   repeated int64 counts = 3;
   int64 missing = 4; // the number of documents that do not have this field
-  Columns columns = 5;  // other custom values requested for this facet, like min(price) for example
+  map<string, Val> ops = 22;  // sub-operation results performed per bucket, like a sub-facet or statistics.
   int64 offset = 6;
 }
 
+// When facet sub-operations are returned separately, a Bucket is used to represent a single facet bucket
+// as a placeholder in the response for the sub-operation results.
+// Alternatively, we could return a partial result at the top level, with a path specifier.
+message Bucket {
+  Val bucket_id = 1;
+  map<string, Val> ops = 3;
+}
 
 
 //
@@ -333,6 +322,8 @@ message Val {
     ArrFloat arr_f = 12;
     ArrDouble arr_d = 13;
     ArrBin arr_bin = 14;
+    DocList docs = 100; // a list of documents, used for search results
+    FacetResult facet = 101; // result of a facet operation
   }
 }
 

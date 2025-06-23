@@ -1,5 +1,5 @@
 #include "solux/index/PostingsWriter.h"
-#include "solux/reader/PostingsReader.h"
+#include "solux/reader/DocsEnum.h"
 #include "gtest/gtest.h"
 #include "test/SoluxTest.h"
 #include<boost/container/static_vector.hpp>

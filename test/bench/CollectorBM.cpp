@@ -1,7 +1,6 @@
-#include <charconv>
-#include <test/SegmentTest.h>
+
 #include "bench/solux_bench.h"
-#include "solux/index/Inverter.h"
+#include "solux/search/Collector.h"
 
 using namespace solux;
 
