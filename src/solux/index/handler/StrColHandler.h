@@ -81,6 +81,7 @@ public:
     auto guard = MemPool::threadLocalPoolGuard();
 
     int32_t uniqueVals = termsHash.size();
+    assert(uniqueVals > 0);
 
     auto terms = termsHash.destructiveCompress();
     boost::sort::spreadsort::string_sort(terms, terms + uniqueVals, TermRef::bracket(), TermRef::getsize(),

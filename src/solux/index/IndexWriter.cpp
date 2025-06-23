@@ -582,11 +582,9 @@ void IndexWriter::finishCommitBody(UpdateMessage& msg) {
       }
 
       if (numSegmentsMissingDeletes == 0) {
-        // Is this really guaranteed to be an error? We handle some potential races by carefully ordering
-        // and realizing that delete application is idempotent.  Although we do stick to merging to what
-        // liveGen we said we did, so I guess this should never happen.
-        LOG_ERROR(
-          "Internal Error, a segment was merged with old deletes, but no merged segments were found that needed deletes applied.");
+        // One was this can happen is if a merger resulted in totally dropping a segment.
+        INDEX_DEBUG(
+          "A segment was merged with old deletes, but no merged segments were found that needed deletes applied. Was segment deleted?");
       }
     }
   } // end index lock
@@ -790,9 +788,13 @@ void IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
   // This is safe since the only place where segments are deleted is in a merge, and this has concurrency==1
   {
     const std::lock_guard<std::mutex> lock(indexMutex);
-    for (auto& seg : segInfos) {
-      if (seg.second->mergeLevel == msg.mergeLevel || msg.maxSegments == 1) {
-        segs.push_back(seg.second.get());
+    for (auto& [segId, seg] : segInfos) {
+      if (seg->mergeLevel == msg.mergeLevel || msg.maxSegments == 1) {
+        if (seg->liveDocs == 0) {
+          // it's possible to see this right after commit handler applied deletes, but before it has a chance to delete the segment.
+          continue;
+        }
+        segs.push_back(seg.get());
         INDEX_DEBUG("mergeSegmentsBody: will merge {}", *segs.back());
 
         // mark as being merged so they won't be deleted - see finishCommitBody
@@ -808,6 +810,12 @@ void IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
     // Sanity check this merge. a bug in testDeleteAllData led to merge accounting getting out-of-sync
     // with actual segments and resulted in a merge loop.
     mergePolicy->_sanityCheck();
+  }
+  if (segs.empty()) {
+    // This is possible if a merge was correctly triggered, but all of the segments were deleted.
+    INDEX_DEBUG("mergeSegmentsBody: no segments to merge for msg={}", (void*)&msg);
+    msg.done(*this);
+    return; // nothing to merge
   }
 
   solux::Signal::emit("mergeStart", (void*)(int64_t)msg.mergeLevel, (void*)segs.size());
@@ -826,8 +834,29 @@ void IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
 
     MemPool pool;
 
+    // Load liveDocs (the version we got a snapshot for) each segment to be merged
+    std::vector<std::shared_ptr<LiveDocs>> liveDocsVec;
+    std::vector<LiveDocs*> liveDocsPtrs;
+    liveDocsVec.reserve(segs.size());
+    liveDocsPtrs.reserve(segs.size());
+    
+    for (auto segInfo : segs) {
+      if (segInfo->mergedLiveGen > 0) {
+        // Load liveDocs for this segment
+        auto liveDocs = LiveDocs::create(dir, segInfo->segId, segInfo->mergedLiveGen, segInfo->maxDoc);
+        if (!liveDocs) {
+          // TODO: need to retry... liveGen may have changed
+        }
+        liveDocsVec.push_back(liveDocs);
+        liveDocsPtrs.push_back(liveDocs.get());
+      } else {
+        // No deletes for this segment
+        liveDocsVec.push_back(nullptr);
+        liveDocsPtrs.push_back(nullptr);
+      }
+    }
+    
     // Copy the preaders to a vector of pointers for our underlying merge code.
-    // this is temporary... mergers will need more info at some point to handle deletes.
     std::vector<PostingsReader*> preaderPtrs;
     preaderPtrs.reserve(preaders.size());
     for (auto& preader : preaders) {
@@ -838,7 +867,7 @@ void IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
 
     // Do the actual merge.
     // TODO: catch any errors and restore state / clean up.
-    SegmentMerger merger(preaderPtrs, pwriter);
+    SegmentMerger merger(preaderPtrs, liveDocsPtrs, pwriter);
     merger.merge();
 
     // Create the new SegInfo for the output segment.
@@ -866,9 +895,11 @@ void IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
         moveSegmentToDelete(segInfo->segId);
       }
 
-      // add new segInfo to the index
-      mergePolicy->_update(newSegInfo.get());
-      segInfos.emplace(pwriter.getSegId(), std::move(newSegInfo));
+      // add new segInfo to the index if it has any docs.
+      if (newSegInfo->liveDocs > 0) {
+        mergePolicy->_update(newSegInfo.get());
+        segInfos.emplace(pwriter.getSegId(), std::move(newSegInfo));
+      }
     } // end index lock
 
     tryDeleteSegments(); // try to delete segments that are now empty
@@ -935,15 +966,18 @@ void IndexWriter::mergeSegments() {
   indexReader.reset();
   auto reader = getIndexReader();
   std::vector<PostingsReader*> preaders; // TODO: make sure we're not trying to merge a segment that is being built!
+  std::vector<LiveDocs*> liveDocsPtrs;
   preaders.reserve(reader->segments().size());
+  liveDocsPtrs.reserve(reader->segments().size());
   for (auto& seg : reader->segments()) {
     preaders.push_back(&seg.postingsReader());
+    liveDocsPtrs.push_back(seg.liveDocs());
   }
   // we could calc maxdoc at this point...
   uint64_t segId = ++lastSegId;
   PostingsWriter pwriter(dir, segId);
 
-  SegmentMerger merger(preaders, pwriter);
+  SegmentMerger merger(preaders, liveDocsPtrs, pwriter);
   merger.merge();
 
   // update the list of segments... not safe currently

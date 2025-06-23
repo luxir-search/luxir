@@ -844,3 +844,203 @@ TEST_F(IndexWriterTest, testMultithreadedUpdates) {
   // TODO: fixme : need to restore mergeFactor?  causes FacetBM to fail if it comes after?
   indexWriter->mergePolicy->setMergeFactor(10);
 }
+
+// Test segment merging with deleted documents
+TEST_F(IndexWriterTest, segmentMergerWithDeletes) {
+  using namespace solux::test;
+  
+  CollectionHelper helper("main");
+  helper.clear();
+  
+  auto indexWriter = helper.getIndexWriter();
+  indexWriter->mergePolicy->setMergeFactor(3);
+  
+  // Create first segment with doc1
+  Doc doc1 = flatdoc("id", "doc1", "text_w", "hello world");
+  helper.index(doc1, UpdateMessage::COMMIT, true);
+  
+  // Create second segment with doc2 and doc3 together (tests reordering when doc2 is deleted)
+  Doc doc2 = flatdoc("id", "doc2", "text_w", "goodbye world");
+  Doc doc3 = flatdoc("id", "doc3", "text_w", "test document");
+  helper.index(doc2, UpdateMessage::NO_COMMIT, true);
+  helper.index(doc3, UpdateMessage::COMMIT, true);
+  
+  // Verify we have 2 segments
+  auto reader1 = indexWriter->getIndexReader();
+  EXPECT_EQ(2, reader1->segments().size());
+  EXPECT_EQ(3, reader1->maxDoc());
+  
+  // Delete doc2 (should be in the second segment with doc3)
+  helper.deleteById("doc2", UpdateMessage::COMMIT);
+  
+  // Verify the delete was applied
+  auto reader2 = indexWriter->getIndexReader();
+  bool foundDeletes = false;
+  for (const auto& segment : reader2->segments()) {
+    LOG_INFO("Segment {}: maxDoc={}, liveDocs={}, numDeletes={}, numLive={}", 
+             segment.segInfo.seg_id, segment.segInfo.max_doc, 
+             segment.segInfo.live_docs, segment.numDeletes(), segment.numLive());
+    if (segment.numDeletes() > 0) {
+      foundDeletes = true;
+      EXPECT_EQ(1, segment.numDeletes());
+      EXPECT_EQ(1, segment.numLive());
+    }
+  }
+  EXPECT_TRUE(foundDeletes);
+  
+  // Add third segment to trigger merge (3 segments total, mergeFactor=3)
+  Doc doc4 = flatdoc("id", "doc4", "text_w", "trigger merge");
+  helper.index(doc4, UpdateMessage::COMMIT, true);
+  
+  // Wait for merge to complete
+  indexWriter->updateGraph.wait_for_all();
+  
+  // Get fresh reader
+  auto reader3 = indexWriter->getIndexReader();
+  
+  LOG_INFO("After merge: {} segments, {} total docs", reader3->segments().size(), reader3->maxDoc());
+  for (const auto& segment : reader3->segments()) {
+    LOG_INFO("Merged segment {}: maxDoc={}, liveDocs={}, numDeletes={}, numLive={}", 
+             segment.segInfo.seg_id, segment.segInfo.max_doc, 
+             segment.segInfo.live_docs, segment.numDeletes(), segment.numLive());
+  }
+  
+  // Should have fewer segments now due to merge (likely 1 merged segment)
+  EXPECT_LE(reader3->segments().size(), 2);
+  
+  // Should have 3 live documents (doc1, doc3, doc4) - doc2 was deleted and should be excluded from merge
+  EXPECT_EQ(3, reader3->maxDoc());
+  
+  // Verify we can still search and find the expected documents
+  auto* req = LocalReq::create(helper.getSearchEngine());
+  auto docs = req->collection("main")
+                 .allQuery()
+                 .fields({"id"})
+                 .limit(-1)
+                 .execute()
+                 .getDocs();
+  req->done();
+  
+  EXPECT_EQ(3, docs.size());
+  
+  // Verify doc2 is not in results
+  bool foundDoc1 = false, foundDoc3 = false, foundDoc4 = false, foundDoc2 = false;
+  for (const auto& doc : docs) {
+    for (const auto& nv : doc) {
+      if (nv.name == "id") {
+        std::string id = std::get<std::string>(nv.val);
+        if (id == "doc1") foundDoc1 = true;
+        if (id == "doc2") foundDoc2 = true;
+        if (id == "doc3") foundDoc3 = true;
+        if (id == "doc4") foundDoc4 = true;
+      }
+    }
+  }
+  
+  EXPECT_TRUE(foundDoc1);
+  EXPECT_FALSE(foundDoc2); // This should be deleted
+  EXPECT_TRUE(foundDoc3);
+  EXPECT_TRUE(foundDoc4);
+}
+
+
+
+// Test that tests remapping of docs and positions after segment merging and deletes.
+TEST_F(IndexWriterTest, DISABLED_segmentMergerPositions) {
+  using namespace solux::test;
+
+  int docsPerSeg = 10;
+  int numSegs = 5;
+
+  CollectionHelper helper("main");
+  helper.clear();
+
+  auto indexWriter = helper.getIndexWriter();
+  indexWriter->mergePolicy->setMergeFactor(numSegs);
+
+  // Track which documents we're deleting for verification later
+  std::set<std::string> deletedIds;
+
+  std::set<std::string> deletes;
+
+  // create 3 segments and delete a random document before committing.
+  for (int seg = 0; seg < numSegs; seg++) {
+    for (int doc = 0; doc < docsPerSeg; doc++) {
+      int id = seg * 100 + doc; // Unique ID for each document
+      std::string idStr = "doc" + std::to_string(id);
+      // Use same text content to avoid unique term issues during merging
+      Doc d = flatdoc("id", id, "text_w", "hello world " + idStr);
+      helper.index(d, UpdateMessage::NO_COMMIT, true);
+    }
+    // now delete some random document in this segment
+    // don't delete all of them since we want enough segments to merge together.
+    auto nDeletes = rng.rint(1,docsPerSeg-1);
+    for (int del = 0; del < nDeletes; del++) {
+      int deleteDocId = seg * 100 + (rng.rint(docsPerSeg)); // Delete random doc in each segment
+      std::string deleteIdStr = "doc" + std::to_string(deleteDocId);
+      deletedIds.insert(deleteIdStr);
+      helper.deleteById(deleteIdStr, UpdateMessage::NO_COMMIT);
+    }
+    // now finally commit
+    helper.commit();
+  }
+
+  // wait for all merges to complete
+  indexWriter->updateGraph.wait_for_all();
+
+  // verify we have a single segment
+  auto reader = indexWriter->getIndexReader();
+  EXPECT_EQ(1, reader->segments().size()) << "Should have 1 segment after merging";
+
+  auto numDocs = numSegs * docsPerSeg - deletedIds.size();
+
+  // verify deletions have been squeezed out
+  EXPECT_EQ(numDocs, reader->maxDoc());
+
+  // Comprehensive verification of document mapping and search functionality
+  for (int seg = 0; seg < numSegs; seg++) {
+    for (int doc = 0; doc < docsPerSeg; doc++) {
+      int id = seg * 100 + doc;
+      std::string idStr = "doc" + std::to_string(id);
+      std::string termStr = "term" + std::to_string(doc);
+      
+      // Test 1: Verify term/match queries on the "id" field retrieve the correct "id"
+      auto* req = LocalReq::create(helper.getSearchEngine());
+      auto docs = req->collection("main")
+                     .matchQuery("id", idStr)
+                     .fields({"id"})
+                     .execute()
+                     .getDocs();
+      req->done();
+
+      bool wasDeleted = deletedIds.find(idStr) != deletedIds.end();
+      if (wasDeleted) {
+        ASSERT_TRUE(docs.empty());
+      } else {
+        ASSERT_EQ(docs.size(), 1);
+        bool foundId = false;
+        for (const auto& nv : docs[0]) {
+          if (nv.name == "id" && std::get<std::string>(nv.val) == idStr) {
+            foundId = true;
+          }
+        }
+        EXPECT_TRUE(foundId);
+      }
+
+      // Test 2: Verify term/match queries on the "text_w" field for "world" retrieve documents with valid IDs
+      req = LocalReq::create(helper.getSearchEngine());
+      docs = req->collection("main")
+                .matchQuery("text_w", "world")
+                .fields({"id", })
+                .execute()
+                .getDocs();
+      req->done();
+
+      // should be all docs
+      EXPECT_EQ(numDocs, docs.size());
+      
+      // TODO: need to do phrase query.
+
+    }
+  }
+}

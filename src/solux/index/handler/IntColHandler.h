@@ -72,7 +72,6 @@ public:
     {
       auto guard = pool.rewindScopeGuard();
       IntColWriter writer(pool, postingsWriter, fieldInfo);
-      writer.startField();
       // TODO: not having the docids here makes it impossible to do a dense field encoding!  Of course that's
       // not really possible if we're writing the column directly and incrementally since we don't know
       // min, max, numbits, gcd, etc.  But we *could* know that stuff when merging segments!
@@ -176,7 +175,6 @@ public:
     {
       auto guard = pool.rewindScopeGuard();
       IntColWriter writer(pool, postingsWriter, fieldInfo);
-      writer.startField();
       longStream.pushValues(inverter.pool, writer);
       writer.finish();
     }

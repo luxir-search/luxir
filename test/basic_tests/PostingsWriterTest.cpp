@@ -585,7 +585,6 @@ TEST_F(PostingsTest, intCol) {
     auto &finfo = writer.addField(fname1);
     {
       IntColWriter colWriter(pool, writer, finfo);
-      colWriter.startField();
       colWriter.addInt64(77);
       colWriter.addInt64(33);
       colWriter.addInt64(11);

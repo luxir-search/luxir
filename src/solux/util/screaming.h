@@ -661,7 +661,7 @@ public:
          {
   }
 
-  uint32_t cardinality() {
+  uint32_t cardinality() const {
     return totalCard;
   }
 

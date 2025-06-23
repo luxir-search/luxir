@@ -38,9 +38,6 @@ public:
     colStart = colOutput.size();
   }
 
-  void startField() {
-  }
-
   void addInt64(int64_t val) {
     nAdded++;
     values.push_back(val);
@@ -166,9 +163,6 @@ public:
 
   OutputStream& getOutputStream() {
     return out;
-  }
-
-  void startField() {
   }
 
   void addInt64(int64_t val) {

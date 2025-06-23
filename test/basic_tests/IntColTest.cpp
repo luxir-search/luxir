@@ -138,7 +138,6 @@ TEST_F(IntColTest, basicMerge) {
   f.add(0, 7);
   testIndex.flush();
 
-  // TODO: force reopen of IndexReader since that is what mergeSegments uses?
   testIndex.iw->mergeSegments();
 
   f.startReading();

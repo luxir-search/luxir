@@ -729,6 +729,7 @@ public:
 
 
 class DocsWriter {
+  friend class DocsWithValWriter;
   ScreamingBuilder builder;
 public:
 
@@ -784,6 +785,10 @@ public:
   // Same as addDoc... it's named startDoc target for DocStream.pushDocs.
   void startDoc(int32_t docid) {
     docsWriter.startDoc(docid);
+  }
+
+  int32_t numAdded() const{
+    return docsWriter.builder.cardinality();
   }
 
   void finish() {

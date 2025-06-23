@@ -36,7 +36,6 @@ public:
     {
       auto guard = pool.rewindScopeGuard();
       IntColWriter ordCol(pool, postingsWriter, fieldInfo);
-      ordCol.startField();
 
       int64_t nValues = 0;
       for (int docid = 0; docid < nDocs; docid++) {

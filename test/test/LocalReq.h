@@ -85,6 +85,16 @@ public:
     return *this;
   }
 
+  // Add a phrase query to a top_docs operation
+  LocalReq& phraseQuery(const std::string& field, std::initializer_list<std::string> words, const std::string& opName = "q") {
+    auto& query = *topDocs(opName).mutable_query()->mutable_phrase();
+    query.set_field(field);
+    for (const auto& word : words) {
+      *query.mutable_words()->Add() = word;
+    }
+    return *this;
+  }
+
   // Add fields to return in search results
   LocalReq& fields(std::initializer_list<std::string> fieldNames, const std::string& opName = "q") {
     auto& td = topDocs(opName);

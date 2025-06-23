@@ -122,10 +122,14 @@ public:
     blocks = reinterpret_cast<const char *>(columnIS.ptr());
     blockMeta = reinterpret_cast<const NumericBlockInfo *>(blocks + fieldInfo.columnMetaOff);
     if (fieldInfo.monoLoc.offset() > 0) {
-      endRankReader = pool.make<MonoReader>(pool, postingsReader, fieldInfo.monoLoc, fieldInfo.monoMetaOff, fieldInfo.docsWithField);
+      endRankReader = pool.make_align<MonoReader>(8, pool, postingsReader, fieldInfo.monoLoc, fieldInfo.monoMetaOff, fieldInfo.docsWithField);
     } else {
       endRankReader = nullptr;
     }
+  }
+
+  DocsReader& docsReader() {
+    return docs;
   }
 
   //get underlying endRankReader, null if not multi-valued. Valid as long as IntColReader is valid.
