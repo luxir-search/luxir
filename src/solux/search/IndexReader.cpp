@@ -2,6 +2,7 @@
 #include "solux/reader/Postings.h"
 
 #include "protos/solux_types.pb.h"
+#include <google/protobuf/arena.h>
 #include <google/protobuf/io/coded_stream.h>
 #include <google/protobuf/io/zero_copy_stream_impl_lite.h>
 
@@ -89,13 +90,21 @@ IndexReader::IndexReader(Directory& dir) {
   // But we should really have a postings getter abstraction that can provide already opened readers and livedocs
   uint64_t lastCommitTime = 0;
   bool retry = false;
+  
+  google::protobuf::Arena arena;
+  
   do {
     if (retry) {
       IREADER_DEBUG("Retrying IndexReader open");
       segs.clear();
       maxdoc = 0;
       retry = false;
+      // Clear arena to prevent unbounded growth
+      arena.Reset();
     }
+    
+    auto* indexInfo = google::protobuf::Arena::Create<solux::proto::IndexInfo>(&arena);
+    
     std::shared_ptr<InputFile> inputFile = dir.openFile(Postings::INDEX_INFO_FILE);
     if (inputFile == nullptr) {
       IREADER_DEBUG("No {} file, Empty IndexReader", Postings::INDEX_INFO_FILE);
@@ -104,19 +113,18 @@ IndexReader::IndexReader(Directory& dir) {
       IREADER_DEBUG("Opening IndexReader");
       InputStream segmentsIs = inputFile->getInputStream();
 
-      // Read the protobuf message
-      solux::proto::IndexInfo indexInfo;
-      google::protobuf::io::ArrayInputStream arrayStream(segmentsIs.ptr(), segmentsIs.left());
+      google::protobuf::io::ArrayInputStream arrayStream(segmentsIs.ptr(), (int)segmentsIs.left());
       google::protobuf::io::CodedInputStream codedStream(&arrayStream);
 
-      if (!indexInfo.ParseFromCodedStream(&codedStream)) {
+      if (!indexInfo->ParseFromCodedStream(&codedStream)) {
         throw std::runtime_error("Failed to parse IndexInfo protobuf");
       }
+      assert(codedStream.ConsumedEntireMessage());
 
-      commitTimeUs = indexInfo.commit_time();
+      commitTimeUs = indexInfo->commit_time();
       bool missingFileOK = true; // Allow missing files on first attempt
-      IREADER_DEBUG("\tOpening IndexReader, commitTime={} nSegs={} gen={}", indexInfo.commit_time(),
-                    indexInfo.segments_size(), indexInfo.index_gen());
+      IREADER_DEBUG("\tOpening IndexReader, commitTime={} nSegs={} gen={}", indexInfo->commit_time(),
+                    indexInfo->segments_size(), indexInfo->index_gen());
       if (commitTimeUs == lastCommitTime) {
         // No new commit, continue with missingFileOK=false so we get proper exceptions
         IREADER_DEBUG("Retry index open did not get new IndexInfo file, will try with missingFileOK=false.");
@@ -124,9 +132,9 @@ IndexReader::IndexReader(Directory& dir) {
       }
       lastCommitTime = commitTimeUs;
 
-      segs.reserve(indexInfo.segments_size());
-      for (int i = 0; i < indexInfo.segments_size(); i++) {
-        const auto& segment = indexInfo.segments(i);
+      segs.reserve(indexInfo->segments_size());
+      for (int i = 0; i < indexInfo->segments_size(); i++) {
+        const auto& segment = indexInfo->segments(i);
         uint64_t segId = segment.seg_id();
         uint64_t liveGen = segment.live_gen();
         int32_t nDocs = segment.max_doc();
