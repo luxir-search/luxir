@@ -3,6 +3,7 @@
 #include "SearchRequest.h"
 #include "ops/RootOp.h"
 #include "ops/SearchOp.h"
+#include "ops/FacetOp.h"
 #include "ops/TopDocsReq.h"
 #include "solux/query/ProtobufQueryParser.h"
 
@@ -49,6 +50,12 @@ public:
       case solux::proto::SearchOp::kTopDocs: {
         return parseTopDocs(name, searchOp.top_docs());
       }
+      case solux::proto::SearchOp::kFieldFacet: {
+        auto& facetReq = searchOp.field_facet();
+        auto* facet = FacetReq::createFieldFacetReq(req, name, facetReq, req.arena);
+        return facet;
+      } // end case
+        break;
       default:
         throw std::runtime_error("Unknown search operation");
     }

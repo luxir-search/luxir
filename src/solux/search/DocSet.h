@@ -55,6 +55,10 @@ public:
     card_ = card;
   }
 
+  bool get(int32_t docid) const {
+    return bits_.get(docid);
+  }
+
   const FixedBitSet& bits() const {
     return bits_;
   };
