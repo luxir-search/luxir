@@ -239,3 +239,76 @@ TEST_F(StrColTest, multiValued) {
   }
 }
 
+TEST_F(StrColTest, deleteAndMerge) {
+  TestIndex testIndex;
+  TestField f(testIndex, "foo_s");
+  
+  // Add documents in first segment
+  f.startIndexing();
+  f.add(5, "hello");    // will be ord 1
+  f.add(7, "world");    // will be ord 2  
+  f.add(11, "test");    // will be ord 3
+  testIndex.deleteDoc(7);  // delete the middle document
+  testIndex.flush();
+  
+  // Add document in second segment
+  f.startIndexing();
+  f.add(0, "apple");    // will be doc10 after merge and term will be ord 1tes
+  testIndex.flush();
+  
+  // Merge segments - this should trigger the merge bug
+  testIndex.iw->mergeSegments();
+  
+
+  f.startReading();
+  ASSERT_EQ(5, f.nextDoc());
+  ASSERT_EQ(2, f.ord());  // "hello" 
+  ASSERT_EQ(10, f.nextDoc());
+  ASSERT_EQ(3, f.ord());  // "test"
+  ASSERT_EQ(11, f.nextDoc());
+  ASSERT_EQ(1, f.ord());  // "test"
+  ASSERT_EQ(-1, f.nextDoc());
+}
+
+TEST_F(StrColTest, deleteAndMergeMultiValued) {
+  TestIndex testIndex;
+  TestField f(testIndex, "foo_ss");
+  
+  // Add documents in first segment
+  f.startIndexing();
+  f.addStrings(5, {"hello", "world"});    // hello=ord 2, world=ord 6
+  f.addStrings(7, {"test", "data", "hello", "string", "banana"});  // both unique terms and terms in other docs.
+  f.addStrings(11, {"final", "string"});  // final=ord 3, string=ord 4
+  testIndex.deleteDoc(7);  // delete the middle document
+  testIndex.flush();
+  
+  // Add document in second segment
+  f.startIndexing();
+  f.addStrings(0, {"apple", "banana"});   // apple=ord 1, banana=ord 2 (before global merge)
+  testIndex.flush();
+  
+  // Merge segments - this should trigger the merge bug
+  testIndex.iw->mergeSegments();
+  
+  // After merge, global ordinals should be:
+  // "apple"=1, "banana"=2, "final"=3, "hello"=4, "string"=5, "world"=6
+  // (deleted terms "data" and "test" should not appear)
+  
+  f.startReading();
+  std::vector<int64_t> ords;
+  
+  ASSERT_EQ(5, f.nextDoc());
+  f.ords(ords);
+  ASSERT_EQ(ords, vec(4l, 6l));  // "hello"=4, "world"=6
+  
+  ASSERT_EQ(10, f.nextDoc());  // renumbered from 11
+  f.ords(ords);
+  ASSERT_EQ(ords, vec(3l, 5l));  // "final"=3, "string"=5
+  
+  ASSERT_EQ(11, f.nextDoc());  // renumbered from 0 in second segment
+  f.ords(ords);
+  ASSERT_EQ(ords, vec(1l, 2l));  // "apple"=1, "banana"=2
+  
+  ASSERT_EQ(-1, f.nextDoc());
+}
+
