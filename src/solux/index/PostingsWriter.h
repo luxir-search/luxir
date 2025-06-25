@@ -17,6 +17,8 @@
 #include "ScreamingBuilder.h"
 #include "solux/codec/Codec.h"
 #include "solux/schema/FieldType.h"
+#include "solux/util/screaming.h"
+#include "LiveDocsWriter.h"
 
 
 namespace solux {
@@ -68,6 +70,10 @@ public:
   PostingsWriter(Directory& dir, uint64_t segId, int32_t maxDoc=-1) : directory(dir), maxDoc(maxDoc), segId(segId)
   {
     segStr = Postings::getSortableString(segId);
+  }
+
+  Directory& getDirectory() {
+    return directory;
   }
 
   // not thread-safe
@@ -199,6 +205,10 @@ public:
   int64_t getSizeInBytes() {
     return sizeInBytes;
   }
+
+  // Write liveDocs bitmap for documents that were marked as deleted during indexing
+  // Returns the liveGen (generation number) used for the file, or 0 if no file was written
+  uint64_t writeLiveDocs(const screaming::FixedBitSet& liveBits, int32_t numLiveDocs);
 
 private:
   void writeSegmentInfo() {

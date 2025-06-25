@@ -46,6 +46,9 @@ public:
 
   std::unique_ptr<DeletesData> deletesData;
 
+  // Populated after flush() if there were deleted documents
+  uint64_t liveGen = 0;
+  int32_t liveDocs = 0;
 
   Inverter(solux::Directory& dir, uint64_t segId, const std::function<std::shared_ptr<Schema>()>& schemaProvider = {}) : postingsWriter(dir, segId) {
     // this is a test schemaProvider for convenience

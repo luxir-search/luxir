@@ -2,6 +2,7 @@
 
 #include "solux/store/OutputStream.h"
 #include "solux/store/InputStream.h"
+#include "LiveDocsWriter.h"
 
 #include "protos/solux_types.pb.h"
 #include <google/protobuf/io/coded_stream.h>
@@ -363,7 +364,13 @@ void IndexWriter::segmentFlushBody(Inverter& inverter) {
                                            inverter.getPostingsWriter().getMaxDoc());
   segInfo->minVersion = inverter.minVersion;
   segInfo->maxVersion = inverter.maxVersion;
-  // TODO FUTURE: set liveDocs + liveGen for deleted docs from errors or overwrites in the same inverter.
+  // Set liveDocs + liveGen for deleted docs from errors during indexing
+  if (inverter.liveGen > 0) {
+    segInfo->liveGen = inverter.liveGen;
+    segInfo->liveDocs = inverter.liveDocs;
+  } else {
+    segInfo->liveDocs = segInfo->maxDoc;
+  }
 
   std::unique_ptr<Inverter> inverterPtr;
 
@@ -1204,29 +1211,15 @@ void IndexWriter::applyDeletes(SegInfo& seg, MultiDeletesData& multiDeletesData)
   if (newDeletesCount > 0) {
     auto newLiveGen = seg.liveGen + 1;
 
-    // Write the delete bitmap file
-    std::string deleteFileName = Postings::getLiveDocsFileName(
-      Postings::getSortableString(seg.segId), newLiveGen);
-
-    auto deleteFile = dir.createFile(deleteFileName);
-
-    OutputStream out(deleteFile.get());
-
-    // Write new format header
-    out.writeBytes(Postings::SOLUX_HEADER); // "SOLUX001"
-    out.writeLong(1); // the format info
-    out.writeInt(maxDocId);
-    out.writeInt(numLiveDocs); // number of bits set
-
-    // Write the live docs bitset data (already 64-bit aligned after 24-byte header)
-    size_t bitsDataSize = screaming::FixedBitSet::sizeInWords(maxDocId) * sizeof(uint64_t);
-    out.write(liveBits->words, bitsDataSize);
-    out.close();
-
-    dir.finishFile(*deleteFile);
+    // Use LiveDocsWriter to write the delete file
+    bool success = LiveDocsWriter::writeLiveDocs(dir, seg.segId, newLiveGen, *liveBits, maxDocId, numLiveDocs);
+    if (!success) {
+      LOG_ERROR("Failed to write liveDocs file for segment {} with liveGen {}", seg.segId, newLiveGen);
+      return;
+    }
 
     INDEX_DEBUG("Applied {} new deletes to segment {} (new delete generation: {}, total live docs: {})",
-                newDeletesCount, seg.segId, seg.liveGen, seg.liveDocs);
+                newDeletesCount, seg.segId, newLiveGen, numLiveDocs);
 
     // Update segment metadata only after successfully writing the delete file to avoid races.
     {

@@ -90,6 +90,36 @@ bool Inverter::flush() {
     fieldHandler->flush(*this);
   }
 
+  // Handle deleted documents if any
+  if (!deleted.empty()) {
+    // Create a FixedBitSet with all bits initially set (all docs are live)
+    int32_t maxDocId = getMaxDoc();
+    screaming::RAMFixedBitSet liveBits(maxDocId, true);
+    
+    // Mark deleted documents
+    int32_t numDeleted = 0;
+    for (int32_t docId : deleted) {
+      assert(docId >= 0 && docId < maxDocId);
+      if (liveBits.get(docId)) {
+        liveBits.clear(docId);
+        numDeleted++;
+      }
+    }
+    
+    // Calculate number of live documents
+    int32_t numLiveDocs = maxDocId - numDeleted;
+
+
+    // Write the liveDocs file and get the liveGen
+    liveGen = 1;  // start with generation 1 for the first liveDocs file
+    liveDocs = numLiveDocs;
+    LiveDocsWriter::writeLiveDocs(postingsWriter.getDirectory(), postingsWriter.segId, liveGen, liveBits, maxDocId, numLiveDocs);
+  } else {
+    // No deletes
+    liveGen = 0;
+    liveDocs = getMaxDoc();
+  }
+
   return getPostingsWriter().finish();
 }
 

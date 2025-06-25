@@ -1044,3 +1044,59 @@ TEST_F(IndexWriterTest, DISABLED_segmentMergerPositions) {
     }
   }
 }
+
+// Test deletes by docid during indexing (when something goes wrong)
+TEST_F(IndexWriterTest, inverterDeletes) {
+  RAMDir dir;
+  IndexWriter iw(dir);
+  
+  // Get an inverter and index some documents, marking some as deleted
+  auto& inverter = iw.obtainInverter(1);
+  auto& fieldHandler = inverter.getIndexHandler(field);
+  
+  // Add some normal documents
+  inverter.startDoc(); // doc 0
+  fieldHandler.index(inverter, "hello world");
+  inverter.finishDoc();
+  
+  inverter.startDoc(); // doc 1
+  fieldHandler.index(inverter, "test document");
+  inverter.finishDoc();
+  
+  // Simulate an error on doc 2 - mark it as deleted
+  inverter.startDoc(); // doc 2
+  // Simulate partial indexing...
+  inverter.deleteDoc(2);
+  inverter.finishDoc();
+  
+  inverter.startDoc(); // doc 3
+  fieldHandler.index(inverter, "another test");
+  inverter.finishDoc();
+  
+  // Mark doc 1 as deleted too
+  inverter.deleteDoc(1);
+  
+  // Release the inverter to trigger flush
+  iw.releaseInverter(inverter);
+  iw.commit();
+  
+  // Verify the segment was created with the correct live docs
+  auto reader = iw.getIndexReader();
+  ASSERT_EQ(1, reader->segments().size());
+  
+  const auto& segment = reader->segments()[0];
+  ASSERT_EQ(4, segment.maxDoc()); // 4 documents total
+  ASSERT_EQ(2, segment.numDeletes()); // 2 deleted
+  ASSERT_EQ(2, segment.segInfo.live_docs); // 2 live
+  
+  // Check that liveDocs were written correctly
+  auto* liveDocs = segment.liveDocs();
+  ASSERT_NE(nullptr, liveDocs);
+  
+  // Verify which documents are live
+  const auto& bitset = liveDocs->bitset();
+  EXPECT_TRUE(bitset.get(0));  // doc 0 is live
+  EXPECT_FALSE(bitset.get(1)); // doc 1 is deleted
+  EXPECT_FALSE(bitset.get(2)); // doc 2 is deleted
+  EXPECT_TRUE(bitset.get(3));  // doc 3 is live
+}
