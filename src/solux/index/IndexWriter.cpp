@@ -368,6 +368,9 @@ void IndexWriter::segmentFlushBody(Inverter& inverter) {
   if (inverter.liveGen > 0) {
     segInfo->liveGen = inverter.liveGen;
     segInfo->liveDocs = inverter.liveDocs;
+    assert(segInfo->liveDocs <= segInfo->maxDoc);
+    // liveDocs == 0 (empty segment) should be dropped later during commit.
+    // We still need to carry over deletes-by-string-id
   } else {
     segInfo->liveDocs = segInfo->maxDoc;
   }

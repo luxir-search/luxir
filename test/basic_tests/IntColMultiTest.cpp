@@ -62,3 +62,38 @@ TEST_F(IntColMultiTest, segMerge) {
   ASSERT_EQ(vals, vec_i(5, 1));
   ASSERT_EQ(-1, f.nextDoc());
 }
+
+TEST_F(IntColMultiTest, deleteAndMerge) {
+  TestIndex testIndex;
+  TestField f(testIndex, "foo_is");
+  
+  // Add first document in first segment
+  f.startIndexing();
+  f.add(5, arr_i(10, 20));
+  f.add(7, arr_i(30));
+  f.add(11, arr_i(40,50,60));
+  testIndex.deleteDoc(7);
+  testIndex.flush();
+  
+  // Add second document in second segment
+  f.startIndexing();
+  f.add(0, arr_i(100, 200));
+  testIndex.flush();
+  
+  // Merge segments - this should trigger the merge bug
+  testIndex.iw->mergeSegments();
+  
+  // Should only see the first document after merge
+  f.startReading();
+  ASSERT_EQ(5, f.nextDoc());
+  std::vector<int64_t> vals;
+  f.vals(vals);
+  ASSERT_EQ(vals, vec_i(10, 20));
+  ASSERT_EQ(10, f.nextDoc());
+  f.vals(vals);
+  ASSERT_EQ(vals, vec_i(40, 50, 60));
+  ASSERT_EQ(11, f.nextDoc());
+  f.vals(vals);
+  ASSERT_EQ(vals, vec_i(100,200));
+  ASSERT_EQ(-1, f.nextDoc());
+}

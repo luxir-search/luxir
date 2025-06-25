@@ -183,6 +183,10 @@ namespace solux::test {
       return getInverter().getIndexHandler(name);
     }
 
+    void deleteDoc(int32_t docid) {
+      getInverter().deleteDoc(docid);
+    }
+
     void initReader() {
       // auto indexReader = iw->getIndexReader();
       reader = std::make_shared<IndexReader>(dir);

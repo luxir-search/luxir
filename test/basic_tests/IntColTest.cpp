@@ -286,6 +286,20 @@ TEST_F(IntColTest, testMono) {
   }
 }
 
+TEST_F(IntColTest, basicDelete) {
+  TestIndex testIndex;
+  TestField f(testIndex, "foo_i");
+  f.startIndexing();
+  f.add(0, 10);
+  f.add(1, 20);
+  testIndex.deleteDoc(1);
+  testIndex.flush();
+  f.startReading();
+  ASSERT_EQ(0, f.nextDoc());
+  ASSERT_EQ(10, f.val());
+  ASSERT_EQ(-1, f.nextDoc());
+}
+
 TEST_F(IntColTest, testMonoBig) {
   for (int iter=0; iter<1; iter++) {
     RAMDir dir;
