@@ -46,7 +46,7 @@ public:
         subCalcs.reserve(op.subOps.size());
         for (auto& [key, subOp] : op.subOps) {
           auto* subCalc = subOp->createCalculator(this, -1);
-          subCalcs.push_back(subCalc);
+          subCalcs.emplace_back(subCalc);
         }
       }
     }
@@ -87,7 +87,7 @@ public:
     // Arena allocate?
     // We could have std::variant of DocSet.
     std::vector<std::unique_ptr<DocSet>> output;
-    std::vector<Calculator*> subCalcs;
+    std::vector<std::unique_ptr<Calculator>> subCalcs;
 
     void calc(oneapi::tbb::task_group* tg, int32_t segnum, solux::DocSet* domain) override {
       tg->run([this, tg, segnum, domain]() {

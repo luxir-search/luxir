@@ -51,8 +51,6 @@ TEST_F(SearchEngineTest, basic) {
     terms.Add("bar");
      */
 
-#ifdef REMOVED
-    // FIXME
     auto& facet = *ops["f"].mutable_field_facet();
     facet.set_field("foo_i");
     auto& facet2 = *ops["f2"].mutable_field_facet();
@@ -76,6 +74,8 @@ TEST_F(SearchEngineTest, basic) {
     facet8.set_start(-5);
     facet8.set_end(34);
     facet8.set_gap(20);
+#ifdef REMOVED
+    // FIXME
 #endif
 
     lreq->engine.submit(*lreq, para);
@@ -110,8 +110,6 @@ TEST_F(SearchEngineTest, basic) {
     ASSERT_EQ(35, docs.columns().at("prices_is").multi_i().v(1).v(0));
     ASSERT_EQ(0, docs.columns().at("prices_is").multi_i().v(0).v_size()); // missing for this doc
 
-#ifdef REMOVED
-    // FIXME
     // check the facet
     ASSERT_EQ(3, lreq->responses[0]->proto.ops().at("f").facet().bucket_ids().col_i().v_size());
     ASSERT_EQ(5, lreq->responses[0]->proto.ops().at("f").facet().bucket_ids().col_i().v(0));
@@ -178,6 +176,9 @@ TEST_F(SearchEngineTest, basic) {
     ASSERT_EQ(2, lreq->responses[0]->proto.ops().at("f8").facet().counts().size());
     ASSERT_EQ(1, lreq->responses[0]->proto.ops().at("f8").facet().counts().at(0));
     ASSERT_EQ(2, lreq->responses[0]->proto.ops().at("f8").facet().counts().at(1));
+
+#ifdef REMOVED
+    // FIXME
 #endif
 
     lreq->done();

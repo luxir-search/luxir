@@ -56,6 +56,24 @@ public:
         return facet;
       } // end case
         break;
+      case solux::proto::SearchOp::kRangeFacet: {
+        auto& facetReq = searchOp.range_facet();
+        auto facetField = facetReq.field();
+        auto start = facetReq.start();
+        auto end = facetReq.end();
+        auto gap = facetReq.has_gap() ? facetReq.gap() : 1; // default gap is 1
+        if (gap <= 0) {
+          gap = 1; // ensure gap is positive
+        }
+        int64_t minCount = -1;
+        if (facetReq.has_mincount()) {
+          minCount = facetReq.mincount();
+        }
+        auto missing = facetReq.missing();
+        FacetReq* facet = google::protobuf::Arena::Create<IntFacetRangeReq>(&req.arena, req, facetField, name, start, end, gap, minCount, missing);
+        return facet;
+      }
+        break;
       default:
         throw std::runtime_error("Unknown search operation");
     }

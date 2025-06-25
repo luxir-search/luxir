@@ -661,15 +661,12 @@ TEST_F(GrpcIndexTest, threadsafeIndex) {
     topQuery.mutable_val()->set_s(std::to_string(docid));
     req.set_request_id(std::to_string(docid));  // set request id to the id so we know what doc we are looking for
 
-#ifdef REMOVED
-    // FIXME
     // Sometimes add integer facet request for id_i
     if (SplitMix64(docid)() % 100 < percentFacet) {
-      auto& facet = *(*req.mutable_ops())["f"].mutable_field_facet();
+      auto& facet = *(*topDocs.mutable_ops())["f"].mutable_field_facet();
       facet.set_field("id_i");
       facet.set_limit(10);
     }
-#endif
   };
 
   ResponseChecker responseChecker = [&](int64_t docid, const solux::proto::SearchResponse& response) {
@@ -678,18 +675,15 @@ TEST_F(GrpcIndexTest, threadsafeIndex) {
     ASSERT_EQ(docList.columns_size(), retrieveFields.size()); // this might change in the future.
     verifyDoc(docid, docList.columns());
 
-#ifdef REMOVED
-    // FIXME
     // do same calculation to see if facet was requested
     if (SplitMix64(docid)() % 100 < percentFacet) {
       // verify the facet response.  It should be a single bucket with id_i=docid and count=1
-      auto& facetResult = response.ops().at("f").facet();
+      auto& facetResult = docList.ops().at("f").facet();
       ASSERT_EQ(1, facetResult.bucket_ids().col_i().v().size());
       ASSERT_EQ(docid, facetResult.bucket_ids().col_i().v()[0]);
       ASSERT_EQ(1, facetResult.counts().size());
       ASSERT_EQ(1, facetResult.counts()[0]);
     }
-#endif
   };
 
   doThreadSafeSearch(nThreads, nDocs, nDocs, requestCreator, responseChecker);
