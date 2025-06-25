@@ -200,7 +200,7 @@ public:
     return currDoc;
   }
 
-  // mark the current doc as deleted if something went wrong.
+  /// mark the doc as deleted if something went wrong indexing it.
   void deleteDoc(int docid) {
     deleted.push_back(docid);
   }

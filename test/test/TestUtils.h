@@ -98,30 +98,22 @@ inline bool docEquals(const Doc& doc1, const Doc& doc2) {
     return true; // All fields matched in order
   }
   
-  // Create maps for easier comparison (field name -> value)
-  boost::unordered_flat_map<std::string_view, FieldVal> map1, map2;
-  for (const auto& nv : doc1) {
-    map1[nv.name] = nv.val;
+  // Create a map for easier comparison (field name -> value)
+  boost::unordered_flat_map<std::string_view, const FieldVal*> map1, map2;
+  for (auto& nv : doc1) {
+    map1[nv.name] = &nv.val;
   }
-  for (const auto& nv : doc2) {
-    map2[nv.name] = nv.val;
-  }
-  
-  if (map1.size() != map2.size()) {
-    return false;
-  }
-  
-  for (const auto& [name, val1] : map1) {
-    auto it = map2.find(name);
-    if (it == map2.end()) {
-      return false; // Field not found in doc2
+
+  // iterate over the second doc, looking up in the first map
+  for (const auto& [name,val] : doc2) {
+    auto it = map1.find(name);
+    if (it == map1.end()) {
+      return false;
     }
-    
-    if (val1 != it->second) {
-      return false; // Values don't match
+    if (*(it->second) != val) {
+      return false;
     }
   }
-  
   return true;
 }
 

@@ -22,6 +22,24 @@ class SegmentMerger {
     bool hasDeletes() {
       return !remap.empty();
     }
+
+    // returns a pair of (mappedDocId, isDeleted)
+    std::pair<int32_t, bool> remapDocId(int32_t localId) const {
+      bool isDeleted = false;
+      int32_t mappedDoc;
+      if (!remap.empty()) {
+        mappedDoc = remap[localId];
+        if (mappedDoc == -1) {
+          isDeleted = true;
+        }
+      } else {
+        mappedDoc = localId;
+      }
+      mappedDoc += base;
+      return {mappedDoc, isDeleted};
+    }
+
+
   };
 
   struct MergeFieldInfo {
@@ -440,7 +458,8 @@ private:
 
     for (size_t segnum = 0; segnum < sortedFields.size(); segnum++) {
       auto* field = sortedFields[segnum];
-      auto base = segs[segnum].base;
+      auto& seg = segs[segnum];
+      auto base = seg.base;
 
       if (field == nullptr) {
         // If the field didn't exist for this segment, then output can't be dense.
@@ -453,6 +472,8 @@ private:
         }
         continue; // no values to write, so skip to next segment.
       }
+
+      assert(field->seg == &seg);
 
       IntColReader& reader = *pool.make_align<IntColReader>(8, pool, *field->seg->postingsReader, field->segFieldInfo);
       MonoReader* endRankReader = reader.getEndRankReader();
@@ -478,7 +499,10 @@ private:
       // variable naming: In suffix is for reading, Out suffix is for writing.
 
       int32_t localId = -1;
-      int32_t maxDocIn = field->seg->postingsReader->numDocs();
+      int32_t maxDocIn = seg.postingsReader->numDocs();
+
+      // we don't need to check liveDocs since we have the doc mapping.
+      // auto* liveBits = liveDocs[seg.ord] ? &liveDocs[seg.ord]->bitset() : nullptr;
 
       int64_t lastEndRankIn = 0;
       int32_t docRankIn = -1;  // rank of the doc we are on, faster than figuring out from docsIter.
@@ -493,8 +517,27 @@ private:
           break;
         }
 
-        int32_t mappedDoc = field->seg->remap.empty() ? localId : field->seg->remap[localId];
-        mappedDoc += base;
+        auto [mappedDoc, isDeleted] = seg.remapDocId(localId);
+
+        if (isDeleted) {
+          //
+          // nothing needs to be adjusted for single-valued fields.
+          //   - docRankIn will still be incremented and be correct for reading
+          //   - mappedDoc already contains the adjustments for the docsWithValues (docsWriter)
+          // for multi-valued fields, we need to read how many values there were for this deleted doc.
+          //   - end rank values written need to be adjusted down by the number of values.
+          //     (adjust endRankBase by the number of values skipped)
+          //   - lastEndRankIn needs to be maintained correctly (that's how we tell how many values a doc has)
+          if (endRankReader) {
+            int64_t endRank = endRankReader->valueAt(docRankIn);
+            auto nVals = endRank - lastEndRankIn;
+            endRankBase -= nVals; // adjust the base down by the number of values skipped.
+            lastEndRankIn = endRank;
+          }
+          continue;
+        }
+
+
         if (docsWriter) {
           docsWriter->startDoc(mappedDoc);
         }
