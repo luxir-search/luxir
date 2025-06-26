@@ -7,6 +7,7 @@
 #include "solux/search/DocSet.h"
 #include "solux/search/IndexReader.h"
 #include "SearchOp.h"
+#include "solux/reader/DocsEnum.h"
 #include "solux/reader/IntColReader.h"
 #include "solux/reader/TermsEnum.h"
 #include "solux/schema/Schema.h"
@@ -19,14 +20,13 @@ public:
 };
 
 class FacetReq : public SearchOp {
-protected:
+public:
   IndexReader& reader;
   std::string_view fieldName;
   int64_t limit;
   int64_t minCount; // minimum count for a facet to be included in the result
   bool missing;
 
-public:
   std::string_view facetName;
 
   static FacetReq* createFieldFacetReq(SearchRequest& req, std::string_view facetName, const proto::FieldFacet& facetReq,
@@ -331,6 +331,140 @@ public:
   };
 };
 
+class FullTextFacetReq : public FacetReq {
+  class MergeableStrFacet : public MergeableData {
+  public:
+    boost::unordered_flat_map<std::string, int64_t> counts;
+    int64_t missing_num = 0; // number of missing values in this segment
+
+    static MergeableStrFacet* merge(MergeableStrFacet* a, MergeableStrFacet* b) {
+      // merge the smaller collector into the larger collector, or if both the same size, merge
+      // the less competitive collector into the more competitive collector.
+      if (a->counts.size() < b->counts.size()) {
+        std::swap(a,b);
+      }
+
+      for (auto [val, count] : b->counts) {
+        a->counts[val] += count;
+      }
+      a->missing_num += b->missing_num;
+      return a;
+    }
+  };
+
+public:
+  FullTextFacetReq(SearchRequest& req, std::string_view fieldName, std::string_view facetName, int64_t limit, int64_t minCount, bool missing) :
+  FacetReq(req, fieldName, facetName, limit, minCount, missing){}
+
+  class Calc : public Calculator {
+    AtomicMerger<MergeableStrFacet> countMerger;
+  public:
+    Calc(SearchOp& op, Calculator* parent) : Calculator(op, parent){}
+    StrFacetReq& thisOp() {
+      return (StrFacetReq&)getOp();
+    }
+
+    solux::proto::Val* getTargetForSub(solux::proto::SearchResponse* searchResponse, Calculator* sub) override {
+      return nullptr;
+    };
+    void calc(oneapi::tbb::task_group* tg, int32_t segnum, DocSet* domain) override {
+      SegFieldInfo segFieldInfo;
+      int64_t missing_num = 0;
+      auto& facetReq = (FacetReq&)getOp();
+      BitDocSet* bitDocs = (BitDocSet*) domain;
+      auto* domainBits = bitDocs ? &bitDocs->bits() : nullptr;
+      std::unique_ptr<MergeableStrFacet> mergeableData(countMerger.obtain());
+      boost::unordered_flat_map<std::string, int64_t>& counts = mergeableData->counts;
+
+      auto& postingsReader = thisOp().reader.segments()[segnum].postingsReader();
+      int32_t maxDoc = postingsReader.maxDoc();
+      auto poolGuard = MemPool::threadLocalPoolGuard();
+      FieldReader fieldReader(poolGuard.pool(), postingsReader);
+      bool found = fieldReader.seek(thisOp().fieldName);
+      if (!found) {
+        if (bitDocs) {
+          // TODO: missing needs to be moved to mergeable data
+          thisOp().missing += bitDocs->card();
+        } else {
+          thisOp().missing += maxDoc;
+        }
+        return;
+      }
+      fieldReader.readFieldInfo(segFieldInfo);
+      TermsEnum tenum(poolGuard.pool(), postingsReader, segFieldInfo);
+      while (tenum.nextTerm()) {
+        int64_t count = 0;
+        DocsEnum denum(poolGuard.pool(), postingsReader, tenum);
+        while (true) {
+          auto doc = denum.nextDoc();
+          if (doc == DocsEnum::END) {
+            break; // no more docs for this term
+          }
+          if (domainBits && !domainBits->get(doc)) {
+            continue; // this doc is not in the domain
+          }
+          count++;
+        }
+        // use heterogeneous lookup in the future to avoid creating string when not needed
+        counts[(std::string) (std::string_view) tenum.term()] += count;
+      }
+      auto merged = countMerger.release(mergeableData.release());
+      if (merged == thisOp().reader.segments().size()) {
+        facetResult();
+      }
+    }
+
+    void facetResult() {
+      auto* myVal = getTarget(nullptr);
+      solux::proto::FacetResult& facetResultProto = *myVal->mutable_facet();
+      auto minCount = thisOp().minCount;
+      auto limit = thisOp().limit;
+      auto missing = thisOp().missing;
+
+      auto* mergedData = countMerger.obtain();
+      auto& counts = mergedData->counts;
+
+      std::vector<std::pair<std::string, int64_t>> countVec;
+      for (auto [val, count] : counts) {
+        if (minCount == -1 || count >= minCount) {
+          countVec.emplace_back(val, count);
+        }
+      }
+      auto missing_count = mergedData->missing_num;
+      delete mergedData;
+      std::sort(countVec.begin(), countVec.end(), [](auto& a, auto& b) {
+        if (a.second != b.second ) {
+          return a.second > b.second;
+        }
+        return a.first < b.first;
+      });
+      if (limit >= 0 && limit < (int64_t)countVec.size()) {
+        countVec.resize(limit);
+      }
+
+      // fill in the facet result proto
+      auto& bucketIds = *facetResultProto.mutable_bucket_ids()->mutable_col_s();
+      auto& bucketIdsArr = *bucketIds.mutable_v();
+      auto& countsArr = *facetResultProto.mutable_counts();
+      bucketIdsArr.Reserve(countVec.size());
+      countsArr.Reserve(countVec.size());
+      for (auto [val, count] : countVec) {
+        auto* strptr = bucketIdsArr.Add();
+        *strptr = val; // copy the string
+        countsArr.Add(count);
+      }
+      if (missing) {
+        facetResultProto.set_missing(missing_count);
+      }
+    }
+
+
+    };
+  Calculator* createCalculator(Calculator* parent, int64_t slot) override {
+    return new Calc(*this, parent);
+  }
+};
+
 class IntFacetRangeReq : public FacetReq {
   int64_t start;
   int64_t end;
@@ -447,6 +581,9 @@ inline FacetReq* FacetReq::createFieldFacetReq(SearchRequest& req, std::string_v
       break;
     case FieldType::Type::STRING:
       facet = google::protobuf::Arena::Create<StrFacetReq>(&arena, req, facetField, facetName, limit, minCount, missing);
+      break;
+    case FieldType::Type::TEXT:
+      facet = google::protobuf::Arena::Create<FullTextFacetReq>(&arena, req, facetField, facetName, limit, minCount, missing);
       break;
     default: ;
   }
