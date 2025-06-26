@@ -267,6 +267,10 @@ namespace solux::test {
       for(;;) {
         doc = iter->next();
         if (doc != IntColReader::ENDDOC) {
+          auto* liveDocs = testIndex.reader->segments()[currSeg].liveDocs();
+          if (liveDocs && !liveDocs->bitset().get(doc)) {
+            continue; // deleted
+          }
           return doc;
         }
         auto found = nextSegment();

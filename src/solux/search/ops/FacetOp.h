@@ -49,7 +49,7 @@ public:
     auto* domainBits = bitDocs ? &bitDocs->bits() : nullptr;
 
     auto& postingsReader = reader.segments()[segnum].postingsReader();
-    int32_t maxDoc = postingsReader.numDocs();
+    int32_t maxDoc = postingsReader.maxDoc();
     auto poolGuard = MemPool::threadLocalPoolGuard();
     FieldReader fieldReader(poolGuard.pool(), postingsReader);
     bool found = fieldReader.seek(fieldName);

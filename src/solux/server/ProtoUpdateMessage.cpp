@@ -43,7 +43,7 @@ static void update(ProtoUpdateMessage& msg, IndexWriter& iw, Inverter& inverter)
           } else if (fval.has_bin()) {
             idValue = std::string(fval.bin());
           } else {
-            // TODO error out.
+            throw std::runtime_error("id field must be a string or binary value");
             continue;
           }
           inverter.deleteId(idValue, msg.updateVersion);

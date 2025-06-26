@@ -89,7 +89,7 @@ TEST_F(TermScorerTest, singleSeg) {
     fieldStats.sumTotalTermFreq = tenum.sumTotalTermFreq();
     fieldStats.sumDocFreq = tenum.sumDocFreq();
     fieldStats.docsWithField = tenum.docsWithField();
-    fieldStats.maxDoc = f.currentSegment()->postingsReader().numDocs();
+    fieldStats.maxDoc = f.currentSegment()->postingsReader().maxDoc();
 
     Similarity::TermStats termStats;
     termStats.docFreq = denum.numDocs();

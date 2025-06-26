@@ -40,7 +40,7 @@ private:
 
 public:
 
-  int32_t numDocs() const noexcept {
+  int32_t maxDoc() const noexcept {
     return maxdoc;
   }
 

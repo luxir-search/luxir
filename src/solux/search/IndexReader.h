@@ -123,11 +123,16 @@ public:
     return maxdoc;
   }
 
+  int64_t liveDocs() const noexcept {
+    return livedocs;
+  }
+
   IndexReader(Directory& dir);
 
 private:
   std::vector<Segment> segs;
   int64_t maxdoc = 0;
+  int64_t livedocs = 0;
   uint64_t commitTimeUs = 0;
 };
 

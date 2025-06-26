@@ -330,7 +330,7 @@ public:
     if (reuseIndex) {
       for (size_t i=0; i<docsPerSeg.size(); i++) {
         auto& seg = reader->segments()[i];
-        if (seg.postingsReader().numDocs() != docsPerSeg[i]) {
+        if (seg.postingsReader().maxDoc() != docsPerSeg[i]) {
           reuseIndex = false;
           break;
         }

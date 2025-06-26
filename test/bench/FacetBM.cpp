@@ -81,7 +81,7 @@ static void BM_FacetBuildIndex(benchmark::State& state, int64_t nDocs, std::stri
   // check each segment size
   for (size_t i=0; i<docsPerSeg.size(); i++) {
     auto& seg = reader->segments()[i];
-    ASSERT_EQ(seg.postingsReader().numDocs(), docsPerSeg[i]);
+    ASSERT_EQ(seg.postingsReader().maxDoc(), docsPerSeg[i]);
   }
 
 

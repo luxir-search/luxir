@@ -75,7 +75,7 @@ public:
       auto segLiveDocs = liveDocs[i];
       
       LOG_INFO("SegmentMerger: segment {}, maxDoc={}, liveDocs={}",
-               i, preader->numDocs(), segLiveDocs ? segLiveDocs->numLive() : preader->numDocs());
+               i, preader->maxDoc(), segLiveDocs ? segLiveDocs->numLive() : preader->maxDoc());
       
       fieldReaders.emplace_back(pool, *preader);
       FieldReader& fieldReader = fieldReaders.back();
@@ -83,7 +83,7 @@ public:
       // position fieldReader on first field and add to segs if it's non-empty
       if (fieldReader.readNextField()) {
         // Calculate number of live documents
-        int32_t numLive = segLiveDocs ? segLiveDocs->numLive() : preader->numDocs();
+        int32_t numLive = segLiveDocs ? segLiveDocs->numLive() : preader->maxDoc();
         
         segs.emplace_back(preader, &fieldReader, numLive, totalLive, (int)segs.size());
         LOG_INFO("SegmentMerger: added segment to merge, base={}, numLive={}", totalLive, numLive);
@@ -149,7 +149,7 @@ private:
     if (liveDocs == nullptr) {
       return; // no deletes, so nothing to do.
     }
-    int32_t maxDoc = seg.postingsReader->numDocs();
+    int32_t maxDoc = seg.postingsReader->maxDoc();
     assert(liveDocs->size() == maxDoc); // make sure this is the right liveDocs for the segment.
     target.resize(maxDoc);
     int32_t newDocId = 0;
@@ -391,7 +391,7 @@ private:
         IntColReader reader(pool, *field->seg->postingsReader, field->segFieldInfo);
         IntColReader::Iterator colIter(reader);
 
-        [[maybe_unused]] int32_t highest = field->seg->postingsReader->numDocs();
+        [[maybe_unused]] int32_t highest = field->seg->postingsReader->maxDoc();
         for (;;) {
           int32_t localId = colIter.next();
           if (localId == IntColReader::ENDDOC) {
@@ -499,7 +499,7 @@ private:
       // variable naming: In suffix is for reading, Out suffix is for writing.
 
       int32_t localId = -1;
-      int32_t maxDocIn = seg.postingsReader->numDocs();
+      int32_t maxDocIn = seg.postingsReader->maxDoc();
 
       // we don't need to check liveDocs since we have the doc mapping.
       // auto* liveBits = liveDocs[seg.ord] ? &liveDocs[seg.ord]->bitset() : nullptr;

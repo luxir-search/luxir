@@ -35,6 +35,23 @@ public:
     }
     return deletedVersions.front();
   }
+
+  std::string toString(size_t max=10) const {
+    std::string s;
+    s += "(sz=" + std::to_string(deletedIds.size()) + "; ids=";
+    auto n = std::min(deletedIds.size(), max);
+    s.reserve(deletedIds.size() * 20);
+    for (size_t i = 0; i < n; i++) {
+      if (i > 0) {
+        s += ",";
+      }
+      s += deletedIds[i];
+      s += ':';
+      s += std::to_string(deletedVersions[i]);
+    }
+    s += ")";
+    return s;
+  }
 };
 
 // DeletesData from multiple inverters.

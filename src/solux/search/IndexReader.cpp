@@ -98,6 +98,7 @@ IndexReader::IndexReader(Directory& dir) {
       IREADER_DEBUG("Retrying IndexReader open");
       segs.clear();
       maxdoc = 0;
+      livedocs = 0;
       retry = false;
       // Clear arena to prevent unbounded growth
       arena.Reset();
@@ -167,8 +168,9 @@ IndexReader::IndexReader(Directory& dir) {
         segmentInfo.live_docs = segment.live_docs();
 
         segs.emplace_back(std::move(postingsReader), std::move(liveDocs), segmentInfo, maxdoc, i);
-        maxdoc += segs.back().postingsReader().numDocs();
-        assert(nDocs == segs.back().postingsReader().numDocs());
+        maxdoc += segs.back().postingsReader().maxDoc();
+        livedocs += segs.back().numLive();
+        assert(nDocs == segs.back().postingsReader().maxDoc());
       }
     }
   }

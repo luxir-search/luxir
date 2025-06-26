@@ -212,14 +212,14 @@ void IndexWriter::releaseInverter(Inverter& inverter) {
 
   // if this inverter is part of a commit, initiate a flush.
   if (inverter.commitInfo != nullptr) {
-    INDEX_DEBUG("releaseInverter: inverter={} message={} triggering flush.", (void*)&inverter,
+    INDEX_DEBUG("releaseInverter: inverter={} message={} triggering flush.", inverter,
                 (void*)inverter.commitInfo->updateMessage);
     flushingInverters.emplace(&inverter, std::move(it->second));
     it = busyInverters.erase(it);
     segmentFlushNode->try_put(&inverter);
   }
   else {
-    INDEX_DEBUG("releaseInverter: inverter={} adding back to idleInverters.", (void*)&inverter);
+    INDEX_DEBUG("releaseInverter: inverter={} adding back to idleInverters.", inverter);
     // return inverter to idle pool
     idleInverters.emplace(&inverter, std::move(it->second));
     busyInverters.erase(it);
@@ -294,7 +294,7 @@ void IndexWriter::initiateCommit(UpdateMessage& msg) {
     for (auto it = flushingInverters.begin(); it != flushingInverters.end(); it++) {
       if (it->second->commitInfo == nullptr && it->second->minVersion) {
         INDEX_DEBUG("\tinitiateCommit: msg={} marking flushing inverter={} for commit", (void*)&msg,
-                    (void*)it->second.get());
+                    *it->second.get());
         it->second->commitInfo = &commitInfo;
         commitInfo.leftToFlush++;
       }
@@ -305,7 +305,7 @@ void IndexWriter::initiateCommit(UpdateMessage& msg) {
       if (it->second->minVersion <= msg.updateVersion) {
         if (it->second->commitInfo == nullptr) {
           INDEX_DEBUG("\tinitiateCommit: msg={} marking idle inverter={} for commit", (void*)&msg,
-                      (void*)it->second.get());
+                      *it->second.get());
           it->second->commitInfo = &commitInfo;
           commitInfo.leftToFlush++;
         }
@@ -326,7 +326,7 @@ void IndexWriter::initiateCommit(UpdateMessage& msg) {
     for (auto it = busyInverters.begin(); it != busyInverters.end(); it++) {
       if (it->second->commitInfo == nullptr && it->second->minVersion <= msg.updateVersion) {
         INDEX_DEBUG("\tinitiateCommit: msg={} marking busy inverter={} for commit", (void*)&msg,
-                    (void*)it->second.get());
+                    *it->second.get());
         it->second->commitInfo = &commitInfo;
         commitInfo.leftToFlush++;
       }
@@ -345,7 +345,7 @@ void IndexWriter::initiateCommit(UpdateMessage& msg) {
 // Inverter for the segment should already be in the flushingInverters list.
 // This is called in parallel.  The inverter will be deleted.
 void IndexWriter::segmentFlushBody(Inverter& inverter) {
-  INDEX_DEBUG("segmentFlushBody: inverter={} commitInfo={} msg.leftToFlush={}", (void*)&inverter,
+  INDEX_DEBUG("segmentFlushBody: inverter={} commitInfo={} msg.leftToFlush={}", inverter,
               (void*)inverter.commitInfo,
               inverter.commitInfo == nullptr ? -1 : inverter.commitInfo->leftToFlush);
 
@@ -409,7 +409,7 @@ void IndexWriter::segmentFlushBody(Inverter& inverter) {
     // move any deletes from the inverter to the relevant commit info.
     if (inverter.hasDeletions()) {
       CommitInfo& commitInfo = inverter.commitInfo ? *inverter.commitInfo : *nextCommitInfo;
-      INDEX_DEBUG("segmentFlushBody: inverter={} moving deletes to commitInfo={}", (void*)&inverter,
+      INDEX_DEBUG("segmentFlushBody: inverter={} moving deletes to commitInfo={}", inverter,
                   (void*)&commitInfo);
       commitInfo.multiDeletesData.deletesData.emplace_back(std::move(inverter.deletesData));
     }
@@ -517,11 +517,12 @@ void IndexWriter::finishCommitBody(UpdateMessage& msg) {
 
     // Check if any segments were merged before deletes were applied.
     for (auto& seg : segs) {
-      if (seg->mergedLiveGen != 0) {
+      INDEX_TRACE("postApplyDeletes CHECK seg{}", *seg);
+      if (seg->mergedLiveGen >= 0) {
         // segment was merged.
-        if (seg->mergedLiveGen == seg->liveGen) {
+        if (seg->mergedLiveGen == (int64_t)seg->liveGen) {
           // this segment was merged (or is currently merging) with the latest liveGen, so no issues. We've applied all deletes,
-          // so we can drop any personal deletes to save space. Merger does not currently try to apply personal deletes.
+          // so we can drop any personal deletes to save space. Merger does not try to apply personal deletes.
           seg->personalDeletes.clear();
           INDEX_DEBUG("finishCommitBody: msg={} segment {} was merged with latest liveGen {}", (void*)&msg, seg->name(),
                       seg->liveGen);
@@ -529,9 +530,12 @@ void IndexWriter::finishCommitBody(UpdateMessage& msg) {
         }
 
         if (seg->merging == true) {
+          INDEX_DEBUG("Detected merging segments with old deletes {}", *seg);
           startedMergingOldVersions.push_back(seg);
         }
         else {
+          INDEX_DEBUG("Detected finished merge of segment with old deletes {}", *seg);
+
           finishedMergingOldVersions.push_back(seg);
           // since this segment was already merged, we can just move it's personal deletes off
           personalDeletes.insert(personalDeletes.end(),
@@ -564,10 +568,19 @@ void IndexWriter::finishCommitBody(UpdateMessage& msg) {
       if (!startedMergingOldVersions.empty()) {
         auto& seg = *startedMergingOldVersions.front();
         // no segments were merged, so we can just apply deletes to the new segments.
-        LOG_DEBUG("finishCommitBody: Added personal deletes currently merging {} deletes={}", seg,
+        INDEX_DEBUG("finishCommitBody: Added personal deletes currently merging {} deletes={}", seg,
                   (void*)multiDeletesDataPtr.get());
         seg.personalDeletes.push_back(multiDeletesDataPtr); // copy the shared_ptr
+
+#if SPDLOG_ACTIVE_LEVEL <= SPDLOG_LEVEL_TRACE
+        for (auto& s : seg.personalDeletes) {
+          for (auto& d : s->deletesData) {
+            INDEX_TRACE("\tpersonal deletes: {}", d->toString());
+          }
+        }
+#endif
       }
+
 
       // For segments that were already merged, look for new segments to attach personal deletes to.
       // They won't be applied immediately, but will be the next time this commit code is entered.
@@ -855,6 +868,8 @@ void IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
         // Load liveDocs for this segment
         auto liveDocs = LiveDocs::create(dir, segInfo->segId, segInfo->mergedLiveGen, segInfo->maxDoc);
         if (!liveDocs) {
+          throw std::runtime_error("Failed to load liveDocs for segment " + std::to_string(segInfo->segId) +
+                                   " gen=" + std::to_string(segInfo->mergedLiveGen));
           // TODO: need to retry... liveGen may have changed
         }
         liveDocsVec.push_back(liveDocs);
@@ -1101,7 +1116,7 @@ void IndexWriter::applyDeletes(SegInfo& seg, MultiDeletesData& multiDeletesData)
 
   // Read the segment to find documents that should be deleted
   PostingsReader reader(dir, seg.segId);
-  int32_t maxDocId = reader.numDocs();
+  int32_t maxDocId = reader.maxDoc();
 
   // Load existing LiveDocs if they exist
   std::shared_ptr<LiveDocs> existingLiveDocs;
@@ -1144,6 +1159,9 @@ void IndexWriter::applyDeletes(SegInfo& seg, MultiDeletesData& multiDeletesData)
       const std::string& deleteId = deletesData.deletedIds[i];
       uint64_t deleteVersion = deletesData.deletedVersions[i];
 
+      INDEX_TRACE("applyDeletes: looking up term '{}' with version {} in segment {}",
+               deleteId, deleteVersion, seg.segId);
+
       // Seek to the specific ID term
       if (termsEnum.seek(deleteId)) {
         // Found the ID term, now get documents containing this ID
@@ -1170,6 +1188,9 @@ void IndexWriter::applyDeletes(SegInfo& seg, MultiDeletesData& multiDeletesData)
                                             docVersion = (uint64_t)version;
                                           });
 
+            INDEX_TRACE("applyDeletes: found version {} for docId {} in segment {}",
+                     docId, docVersion, seg.segId);
+
             // Only delete if document version is less than delete version
             shouldDelete = (docVersion < deleteVersion);
           }
@@ -1185,15 +1206,19 @@ void IndexWriter::applyDeletes(SegInfo& seg, MultiDeletesData& multiDeletesData)
                 size_t wordsSize = screaming::FixedBitSet::sizeInWords(maxDocId) * sizeof(uint64_t);
                 std::memcpy(liveBits->words, existingBitset.words, wordsSize);
               }
+
+              // then set existingLiveDocs to this so we are checking against the new bitset
+              currLiveBits = liveBits.get();
             }
 
+            INDEX_TRACE("applyDeletes: marking docId {} as deleted in segment {}",
+                     docId, seg.segId);
             // Mark the document as deleted
             liveBits->clear(docId);
-            numLiveDocs--;
             newDeletesCount++;
           }
         }
-      }
+      } // end if termsEnum.seek()
     }
   };
 
@@ -1213,6 +1238,7 @@ void IndexWriter::applyDeletes(SegInfo& seg, MultiDeletesData& multiDeletesData)
   // If we found any new documents to delete, write a new delete generation
   if (newDeletesCount > 0) {
     auto newLiveGen = seg.liveGen + 1;
+    numLiveDocs -= newDeletesCount; // Update live document count
 
     // Use LiveDocsWriter to write the delete file
     bool success = LiveDocsWriter::writeLiveDocs(dir, seg.segId, newLiveGen, *liveBits, maxDocId, numLiveDocs);
@@ -1227,10 +1253,9 @@ void IndexWriter::applyDeletes(SegInfo& seg, MultiDeletesData& multiDeletesData)
     // Update segment metadata only after successfully writing the delete file to avoid races.
     {
       const std::lock_guard<std::mutex> lock(indexMutex);
-      seg.liveDocs = numLiveDocs; // Set to live document count
-      if (newDeletesCount > 0) {
-        seg.liveGen++;
-      }
+      seg.liveDocs = numLiveDocs;
+      assert(seg.liveGen + 1 == newLiveGen); // no one should be doing this concurrently.
+      seg.liveGen = newLiveGen;
     }
 
   }

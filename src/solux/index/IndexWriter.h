@@ -14,6 +14,7 @@
 
 namespace solux {
 
+#define INDEX_TRACE LOG_TRACE
 // redefine DEBUG to TRACE level which shouldn't currently be logged!
 #define INDEX_DEBUG LOG_TRACE
 // #define INDEX_DEBUG LOG_DEBUG
@@ -26,7 +27,7 @@ namespace solux {
     int32_t liveDocs = 0;      // number of live documents in latest liveGen.
     int32_t mergeLevel = -1;  // maintained by the MergePolicy.
     uint64_t liveGen = 0;  // the latest version of the deletes that this segment contains, or 0 if no deletes.
-    uint64_t mergedLiveGen = 0;  // if this segment was merged into another, what deletesVersion was used.
+    int64_t mergedLiveGen = -1;  // if this segment was merged into another, what liveGen was used.
     uint64_t mergedIntoSegId = 0;  // segId of the segment this segment was merged into.
     uint64_t commitTime = 0;  // last time this segment was committed as part of the index.
     // write segment info (size,docs) segments file as well so we don't have to open the segment to determine it?
@@ -150,6 +151,7 @@ public:
         if (++levelCounts[seg->mergeLevel] >= MERGE_FACTOR) {
           mergeLevel = seg->mergeLevel;
         }
+        INDEX_DEBUG("merge level update: seg={} segLevel={} segLevelCount={} mergeLevel={}", *seg, !seg?-1:seg->mergeLevel, !seg?-1:levelCounts[seg->mergeLevel], mergeLevel);
       } else {
         // check all levels
         for (auto i = 0u; i < levelCounts.size(); i++) {
@@ -158,9 +160,9 @@ public:
             break;
           }
         }
+        INDEX_DEBUG("merge level update: seg=ALL mergeLevel={}", mergeLevel);
       }
 
-      INDEX_DEBUG("merge level update: seg={} segLevel={} segLevelCount={} mergeLevel={}", *seg, !seg?-1:seg->mergeLevel, !seg?-1:levelCounts[seg->mergeLevel], mergeLevel);
 
       return mergeLevel;
     }

@@ -14,7 +14,7 @@ public:
     unused(pool);
     ndocs = fieldInfo.docsWithField;
 
-    if (ndocs != postingsReader.numDocs()) {
+    if (ndocs != postingsReader.maxDoc()) {
       InputStream docsWithValIs = postingsReader.getInputStreamSeek(fieldInfo.docsWithFieldEndLoc);
       bits.set( docsWithValIs.ptr() );
     }

@@ -116,8 +116,8 @@ int main(int argc, char **argv) {
 
   std::cout << solux_banner() << std::endl;
 
-  // spdlog::set_pattern("%L %H:%M:%S.%e %s:%# %! %n T%t %v");  // this includes the method name, which messes with alignment too much
-  spdlog::set_pattern("%L %H:%M:%S.%e %s:%# T%t %v");
+  // spdlog::set_pattern("%L %H:%M:%S.%e T%t %s:%# %v");  // thread id before source so it lines up.
+  spdlog::set_pattern("%L %H:%M:%S.%f T%t %s:%# %v");  // microseconds instead of milliseconds
   spdlog::set_level(spdlog::level::debug); // Set global log level to debug
 
   LOG_INFO("Logging: compile-time={}, runtime default={}",

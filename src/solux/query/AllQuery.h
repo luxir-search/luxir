@@ -33,7 +33,7 @@ public:
     int32_t docid = -1;
     int32_t lastDoc;
 
-    Scorer(solux::IndexReader::Segment& segment) : segment(segment), lastDoc(segment.postingsReader().numDocs() - 1) {
+    Scorer(solux::IndexReader::Segment& segment) : segment(segment), lastDoc(segment.postingsReader().maxDoc() - 1) {
     }
 
     int32_t next() override {

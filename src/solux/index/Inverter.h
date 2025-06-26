@@ -195,12 +195,16 @@ public:
   void finishDoc() {
   }
 
-  int32_t getMaxDoc() {
+  int32_t getMaxDoc() const {
     return currDoc + 1;
   }
 
   int32_t getDoc() {
     return currDoc;
+  }
+
+  int64_t getSegId() const {
+    return postingsWriter.segId;
   }
 
   /// mark the doc as deleted if something went wrong indexing it.
@@ -222,6 +226,10 @@ private:
 
 
 };
+
+inline std::string format_as(const Inverter& inverter) {
+  return fmt::format("(seg={} max={})",  Postings::getIndexFileNamePrefix(inverter.getSegId()), inverter.getMaxDoc());
+}
 
 } // end namespace
 
