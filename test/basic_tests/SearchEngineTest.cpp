@@ -74,12 +74,11 @@ TEST_F(SearchEngineTest, basic) {
     facet8.set_start(-5);
     facet8.set_end(34);
     facet8.set_gap(20);
-#ifdef REMOVED
-    // FIXME
-#endif
+    auto& facet9 = *ops["f9"].mutable_field_facet();
+    facet9.set_field("foo_w");
 
     lreq->engine.submit(*lreq, para);
-    // LOG_DEBUG("ENGINE REQ: {}", lreq->toString());
+     //LOG_DEBUG("ENGINE REQ: {}", lreq->toString());
 
     ASSERT_EQ(lreq->proto.request_id(), lreq->responses[0]->proto.request_id());
     auto& docs = lreq->responses[0]->proto.ops().at("q").docs();
@@ -177,9 +176,19 @@ TEST_F(SearchEngineTest, basic) {
     ASSERT_EQ(1, lreq->responses[0]->proto.ops().at("f8").facet().counts().at(0));
     ASSERT_EQ(2, lreq->responses[0]->proto.ops().at("f8").facet().counts().at(1));
 
-#ifdef REMOVED
-    // FIXME
-#endif
+    //check the ninth facet
+    ASSERT_EQ(5, lreq->responses[0]->proto.ops().at("f9").facet().bucket_ids().col_s().v_size());
+    ASSERT_EQ("brown", lreq->responses[0]->proto.ops().at("f9").facet().bucket_ids().col_s().v(0));
+    ASSERT_EQ("charlie", lreq->responses[0]->proto.ops().at("f9").facet().bucket_ids().col_s().v(1));
+    ASSERT_EQ("cow", lreq->responses[0]->proto.ops().at("f9").facet().bucket_ids().col_s().v(2));
+    ASSERT_EQ("how", lreq->responses[0]->proto.ops().at("f9").facet().bucket_ids().col_s().v(3));
+    ASSERT_EQ("now", lreq->responses[0]->proto.ops().at("f9").facet().bucket_ids().col_s().v(4));
+    ASSERT_EQ(5, lreq->responses[0]->proto.ops().at("f9").facet().counts().size());
+    ASSERT_EQ(3, lreq->responses[0]->proto.ops().at("f9").facet().counts().at(0));
+    ASSERT_EQ(1, lreq->responses[0]->proto.ops().at("f9").facet().counts().at(1));
+    ASSERT_EQ(1, lreq->responses[0]->proto.ops().at("f9").facet().counts().at(2));
+    ASSERT_EQ(1, lreq->responses[0]->proto.ops().at("f9").facet().counts().at(3));
+    ASSERT_EQ(1, lreq->responses[0]->proto.ops().at("f9").facet().counts().at(4));
 
     lreq->done();
   }
