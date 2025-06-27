@@ -86,6 +86,10 @@ public:
 
   void flushPositions(Inverter& inverter) {
     auto sz = termsHash.size();
+    if (sz == 0) {
+      return;  // Drop the field if it has no terms.
+    }
+
     // gathering and sorting terms for each field could be done in parallel, but it probably doesn't
     // represent much time.  Fields that can result in their own file should be able to be parallelized easily!
     auto terms = termsHash.destructiveCompress();
@@ -122,7 +126,7 @@ public:
       textWriter.endTerm(term);
     }
     textWriter.endField();
-    termsHash.free();
+    termsHash.free();  // free up memory early.
 
     // now flush the field length column
     fieldLengthCol.flushIntCol(inverter, fieldInfo);

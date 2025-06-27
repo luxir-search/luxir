@@ -77,11 +77,14 @@ public:
   }
 
   void flush(Inverter& inverter) override {
+    int32_t uniqueVals = termsHash.size();
+    if (uniqueVals == 0) {
+      return; // drop the field.
+    }
+
     auto nDocs = inverter.getMaxDoc();
     auto guard = MemPool::threadLocalPoolGuard();
 
-    int32_t uniqueVals = termsHash.size();
-    assert(uniqueVals > 0);
 
     auto terms = termsHash.destructiveCompress();
     boost::sort::spreadsort::string_sort(terms, terms + uniqueVals, TermRef::bracket(), TermRef::getsize(),

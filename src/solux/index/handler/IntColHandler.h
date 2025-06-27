@@ -53,6 +53,9 @@ public:
 
   // TODO: make static and pass everything needed so it's composable
   void flushIntCol(Inverter& inverter) {
+    if (numVals == 0) {
+      return;  // drop the field.
+    }
     PostingsWriter& postingsWriter = inverter.getPostingsWriter();
 
     // TODO: move this to postingsWriter method
@@ -156,6 +159,9 @@ public:
 
   // TODO: make static and pass everything needed so it's composable
   void flushIntCol(Inverter& inverter) {
+    if (numVals == 0) {
+      return;  // drop the field.
+    }
     PostingsWriter& postingsWriter = inverter.getPostingsWriter();
 
     // TODO: move this to postingsWriter method
