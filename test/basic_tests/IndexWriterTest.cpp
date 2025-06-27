@@ -17,6 +17,8 @@
 #include "solux/index/IndexWriter.h"
 #include "solux/search/IndexReader.h"
 #include "solux/reader/PostingsReader.h"
+#include "solux/reader/FieldReader.h"
+#include "solux/util/MemPool.h"
 #include "solux/util/Signal.h"
 #include "test/SoluxTest.h"
 #include "test/CollectionHelper.h"
@@ -1098,4 +1100,51 @@ TEST_F(IndexWriterTest, inverterDeletes) {
   EXPECT_FALSE(bitset.get(1)); // doc 1 is deleted
   EXPECT_FALSE(bitset.get(2)); // doc 2 is deleted
   EXPECT_TRUE(bitset.get(3));  // doc 3 is live
+}
+
+// Test that fields are removed from the index after document deletion and merging
+TEST_F(IndexWriterTest, removeFields) {
+  using namespace solux::test;
+  
+  CollectionHelper helper("main");
+  helper.clear();
+  
+  auto indexWriter = helper.getIndexWriter();
+
+  // Add document with all field types
+  Doc bigDoc = flatdoc(
+    "id", "doc1",
+    "text_w", "hello world fulltext search",
+    "string_s", "single_value",
+    "string_ss", std::vector<std::string>{"multi1", "multi2", "multi3"},
+    "int_i", 42,
+    "int_is", std::vector<int64_t>{100, 200, 300}
+  );
+  helper.index(bigDoc, UpdateMessage::COMMIT, true);
+  
+  // Add dummy document to prevent empty segment
+  Doc dummyDoc = flatdoc("id", "doc2");
+  helper.index(dummyDoc, UpdateMessage::NO_COMMIT, true);
+  
+  // Delete the big document
+  helper.deleteById("doc1", UpdateMessage::COMMIT);
+  
+  indexWriter->mergeSegments();  // synchronous merge
+
+  // Get fresh reader after merge
+  auto reader = indexWriter->getIndexReader();
+  ASSERT_EQ(1, reader->segments().size());
+  ASSERT_EQ(reader->liveDocs(), reader->maxDoc());
+
+  auto guard = MemPool::threadLocalPoolGuard();
+  // Verify fields from deleted document are gone after merge
+  for (const auto& segment : reader->segments()) {
+    FieldReader fieldsReader(guard.pool(), const_cast<PostingsReader&>(segment.postingsReader()));
+    EXPECT_TRUE(fieldsReader.seek("id")); // id field should remain
+    EXPECT_FALSE(fieldsReader.seek("text_w"));
+    EXPECT_FALSE(fieldsReader.seek("string_s"));
+    EXPECT_FALSE(fieldsReader.seek("string_ss"));
+    EXPECT_FALSE(fieldsReader.seek("int_i"));
+    EXPECT_FALSE(fieldsReader.seek("int_is"));
+  }
 }
