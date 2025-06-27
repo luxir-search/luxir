@@ -597,7 +597,11 @@ public:
     if (docs.size() > 0) {
       assert(docs.back() < postingsWriter.getMaxDoc()); // sanity check to ensure we didn't go over provided numDocs
     }
-    // TODO: handle case when all docs were deleted for term (and term should no longer appear)
+    if (totalTermFreq == 0) {
+      // term with no documents, remove term we just added
+      termList.pop_back();
+      return;
+    }
     if (totalTermFreq == 1) {
       assert(getDocFileSize()==0 && docs.size()==1 && posdeltas.size() == 1);
       sumDocFreq += 1;

@@ -270,7 +270,7 @@ TEST_F(StrColTest, deleteAndMerge) {
   ASSERT_EQ(-1, f.nextDoc());
 }
 
-TEST_F(StrColTest, DISABLED_deleteAndMergeMultiValued) {
+TEST_F(StrColTest, deleteAndMergeMultiValued) {
   TestIndex testIndex;
   TestField f(testIndex, "foo_ss");
   
