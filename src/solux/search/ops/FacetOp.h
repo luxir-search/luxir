@@ -44,7 +44,7 @@ public:
   // missing is an out parameter that is incremented for every domain doc that does not have the field.
   // segFieldInfo is passed in uninitializsed and filled in if the field exists in the segment.
   // The value returned is if the field exists in the segment.
-  bool facetSegIntCol(DocSet* domain, int32_t segnum, int64_t& missing, SegFieldInfo& segFieldInfo, auto&& callback) {
+  bool facetSegIntCol(DocSet* domain, int32_t segnum, int64_t& missing_num, SegFieldInfo& segFieldInfo, auto&& callback) {
     BitDocSet* bitDocs = (BitDocSet*) domain;
     auto* domainBits = bitDocs ? &bitDocs->bits() : nullptr;
 
@@ -55,9 +55,9 @@ public:
     bool found = fieldReader.seek(fieldName);
     if (!found) {
       if (bitDocs) {
-        missing += bitDocs->card();
+        missing_num += bitDocs->card();
       } else {
-        missing += maxDoc;
+        missing_num += maxDoc;
       }
       return false;
     }
@@ -86,7 +86,7 @@ public:
           }
         }
       } else {
-        missing++;
+        missing_num++;
       }
     }
     return true;
@@ -383,10 +383,9 @@ public:
       bool found = fieldReader.seek(thisOp().fieldName);
       if (!found) {
         if (bitDocs) {
-          // TODO: missing needs to be moved to mergeable data
-          thisOp().missing += bitDocs->card();
+          mergeableData->missing_num += bitDocs->card();
         } else {
-          thisOp().missing += maxDoc;
+          mergeableData->missing_num += maxDoc;
         }
         return;
       }
