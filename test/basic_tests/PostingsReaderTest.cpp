@@ -63,10 +63,14 @@ public:
       if (shouldFind && rng.rint(100)<20) {  // look up by ord 20% of the time
         st.tenum->seekOrd(tnum);
         found = true;
+        ASSERT_EQ(shouldFind, found) << " tnum=" << tnum << " term='" << term << "'";
       } else {
         found = st.tenum->seek(term);
+        if (found != shouldFind) {
+          found = st.tenum->seek(term);  // place breakpoint here to debug
+        }
+        ASSERT_EQ(shouldFind, found) << " tnum=" << tnum << " term='" << term << "'";
       }
-      ASSERT_EQ(shouldFind, found);
       if (found) {
 //        ASSERT_EQ(st.tenum->term(), term);
         auto ord = st.tenum->ord();

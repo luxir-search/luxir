@@ -157,7 +157,8 @@ public:
 class PackedTerm {
   char *ptr_;
 public:
-  static constexpr uint32_t MAX_LEN = 255;
+  static constexpr uint32_t MAX_LEN = 255;  // maximum length of the string bytes (not including the size byte)
+  static constexpr uint32_t MAX_BYTES = MAX_LEN + 1; // the maximum number of bytes in the data, including the size byte
   static constexpr uint32_t getMemSize(uint32_t size) noexcept { return size + 1; }
   static constexpr uint32_t getExactMemSize(uint32_t size) noexcept { return size + 1; }
 

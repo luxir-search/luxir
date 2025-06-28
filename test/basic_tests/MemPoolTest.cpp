@@ -1,3 +1,5 @@
+#include <boost/sort/spreadsort/string_sort.hpp>
+
 #include "test/SoluxTest.h"
 #include "solux/util/MemPool.h"
 #include "gtl/phmap.hpp"

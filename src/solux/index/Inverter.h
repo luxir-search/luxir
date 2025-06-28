@@ -121,11 +121,6 @@ public:
       return this->fieldName == fname;
     }
 
-    virtual void index(Inverter& inverter, char* val) {
-      unused(inverter, val);
-      assert(false && "Don't Use This!");
-    }
-
     virtual void index(Inverter& inverter, std::string_view val) {
       unused(inverter, val);
     }

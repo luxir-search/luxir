@@ -75,7 +75,6 @@ TEST_F(StrColTest, basic) {
 
 
 TEST_F(StrColTest, basicMerge) {
-
   // dense merge
   {
     TestIndex testIndex;

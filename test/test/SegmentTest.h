@@ -7,7 +7,9 @@
 
 namespace solux {
 
-// create and test a random segment
+// Create and test a random segment
+// This is old code that was used to test low level reading and writing before there was higher level
+// functionality like Inverter and IndexHandlers. This should no longer be used for new tests.
 class SegmentTest {
 public:
   RAMDir dir;
@@ -37,10 +39,30 @@ public:
   uint64_t fingerprint = 0;  // sum of all docs and positions calculated when writing
   uint64_t indexSize = 0;
 
+  // terms are added in order (and not resorted), so the term must sort according to the term number.
   static void makeTerm(int termNum, std::string& target) {
-    target.resize(12);
-    memcpy(target.data(), "term", 4);
-    sprintf(target.data() + 4, "%08d", termNum);
+    // prefix lengths less than 7 and suffix lengths less than 32 are encoded in a single byte.
+    SplitMix64 localRng(termNum);
+    auto code = localRng();
+
+    bool moreSuffix = ((code) & 0x03) == 0;  // 1/4th of the time add more suffix
+    code >>= 4;
+    auto slen = moreSuffix ? code & 0x3f : 0;  // extra suffix to 63
+    code >>= 8;
+
+
+    std::string_view data = "now is the time for all good men to come to the aid of their country.";
+    assert(data.size() >= 63);
+    target.clear();
+    target.reserve( slen + 12);
+
+    char buf[20];
+    sprintf(buf, "term%08d", termNum);
+    target.append(buf);
+
+    if (moreSuffix) {
+      target.append(data.data(), slen);
+    }
   }
 
 
@@ -229,8 +251,7 @@ public:
   }
 
   void addField(bool read, const std::string &fname, uint32_t numTerms, int64_t nDocs=-1, int64_t nPos=-1) {
-    std::string term = "term";
-    term.resize(12);
+    std::string term;
 
     if (read) {
       ASSERT_TRUE(fieldReader->readNextField());
@@ -242,8 +263,7 @@ public:
     }
     int realNumTerms = 0;
     for (uint32_t i = 0; i < numTerms; i++) {
-      // std::format not implemented yet...
-      sprintf(term.data() + 4, "%08d", i);
+      makeTerm(i, term);
       auto ndocs = nDocs<0 ? getNumDocs(numTerms) : (uint32_t)nDocs;
       if (ndocs > 0) ++realNumTerms;  // if number of docs for term ends up being 0, we should drop the term.
       addTerm(read, term, ndocs, nPos);

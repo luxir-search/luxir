@@ -739,20 +739,7 @@ TEST_F(IndexWriterTest, testMissingFiles) {
   EXPECT_EQ(liveDocs2, nullptr);
 }
 
-// OK CLAUDE, create a random test here to test multithreaded updates and deletes in the IndexWriter and
-// reopen/retry logic in the IndexReader.  We will have N threads and M documents that are being modified.
-// Eachd document will be assigned to a different thread, conversely eash thread will have it's own set
-// of unique documents to modify.  This eliminates any races between threads modifying the same document, and
-// each thread can make a modification and then reopen the IndexReader to see the expected changes.
-// For documents that should exist, request the _version_ field to verify the doc matches the latest add version.
-// Mix in overwrites and deletes randomly, keeping track of the expected state for each thread
-// and then verifying it.  This should end up testing much of the logic around segment merging, removal of empty
-// segments, IndexReader retry logic, etc.
-// You MUST use CollectionHelper to do the indexing and deletions.
-// IMPORTANT: Make this test as short as possible.
-// IMPORTANT: you should not need any synchronization primitives in the test itself, since each thread will be working
-//            with it's own set of documents.
-//
+
 TEST_F(IndexWriterTest, testMultithreadedUpdates) {
   using namespace solux::test;
   return; // TODO: test not ready yet. merging and searching deletes not done.
@@ -946,8 +933,11 @@ TEST_F(IndexWriterTest, segmentMergerWithDeletes) {
 }
 
 
-
+//
 // Test that tests remapping of docs and positions after segment merging and deletes.
+// This test also  inadvertently tests the case where a merge and commit happen concurrently,
+// and the merge merges a segment before deletes have been applied and "personalDeletes" come into play.
+//
 TEST_F(IndexWriterTest, segmentMergerPositions) {
   using namespace solux::test;
   rng = Rng(1);  // reproducible for now.
@@ -968,8 +958,16 @@ TEST_F(IndexWriterTest, segmentMergerPositions) {
     for (int doc = 0; doc < docsPerSeg; doc++) {
       int id = seg * 100 + doc; // Unique ID for each document
       std::string idStr = "doc" + std::to_string(id);
-      // Use same text content to avoid unique term issues during merging
-      Doc d = flatdoc("id", idStr, "text_w", "hello world " + idStr);
+
+      // Add a random number of terms to the text field to make positions of following terms different.
+      int nTerms = rng.rint(1, 10);
+      std::string textField = "";
+      for (int i=0; i<nTerms; i++) {
+        textField += " term" + std::to_string(i);
+      }
+      textField += " hello world ";
+      textField += idStr;
+      Doc d = flatdoc("id", idStr, "text_w", textField);
       helper.index(d, UpdateMessage::NO_COMMIT, true);
     }
     // now delete some random document in this segment
@@ -981,24 +979,25 @@ TEST_F(IndexWriterTest, segmentMergerPositions) {
       deletedIds.insert(deleteIdStr);
       helper.deleteById(deleteIdStr, UpdateMessage::NO_COMMIT);
     }
-    // now finally commit
+    // now finally commit (this tends to kick off the merge at the same time as deletes are applied!)
     helper.commit();
   }
 
   // wait for all merges to complete
   indexWriter->updateGraph.wait_for_all();
 
+  // force another merge to squeeze out deletes
+  indexWriter->mergeSegments();
+
   // verify we have a single segment
   auto reader = indexWriter->getIndexReader();
-  EXPECT_EQ(1, reader->segments().size()) << "Should have 1 segment after merging";
+  EXPECT_EQ(1, reader->segments().size());
 
   auto numDocs = numSegs * docsPerSeg - deletedIds.size();
 
-  // verify deletions have been accounted for.
-  // Because the merge could have started before the commit, deletes may have been applied after the merge.
-  EXPECT_EQ(numDocs, reader->liveDocs());
+  EXPECT_EQ(numDocs, reader->maxDoc());
 
-  // Comprehensive verification of document mapping and search functionality
+  // verify document remapping
   for (int seg = 0; seg < numSegs; seg++) {
     for (int doc = 0; doc < docsPerSeg; doc++) {
       int id = seg * 100 + doc;
@@ -1039,12 +1038,32 @@ TEST_F(IndexWriterTest, segmentMergerPositions) {
 
       // should be all docs
       EXPECT_EQ(numDocs, docs.size());
-      
+
+      // Test 3: Verify term/match queries on the "text_w" field for the id term is on the right doc.
+      req = LocalReq::create(helper.getSearchEngine());
+      docs = req->collection("main")
+                .matchQuery("text_w", idStr)
+                .fields({"id", })
+                .execute()
+                .getDocs();
+      req->done();
+
+      // should be a single result if not deleted.
+      if (wasDeleted) {
+        EXPECT_EQ(0, docs.size());
+      } else {
+        EXPECT_EQ(1, docs.size());
+        EXPECT_EQ(idStr, std::get<std::string>(docs[0][0].val));
+      }
+
+
+
       // TODO: need to do phrase query.
 
     }
   }
 }
+
 
 // Test deletes by docid during indexing (when something goes wrong)
 TEST_F(IndexWriterTest, inverterDeletes) {
@@ -1101,6 +1120,7 @@ TEST_F(IndexWriterTest, inverterDeletes) {
   EXPECT_FALSE(bitset.get(2)); // doc 2 is deleted
   EXPECT_TRUE(bitset.get(3));  // doc 3 is live
 }
+
 
 // Test that fields are removed from the index after document deletion and merging
 TEST_F(IndexWriterTest, removeFields) {

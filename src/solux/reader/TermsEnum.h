@@ -41,7 +41,7 @@ public:
     numTermBlocks = ((fieldInfo.nTerms-1) / Postings::TERMS_BLOCK_SIZE) + 1;
     termsIS = postingsReader.getInputStreamSeek(fieldInfo.termBlockIndexLoc);
     termBlockOffsets = reinterpret_cast<const int64_t*>(termsIS.ptr());  // offsets from termsLoc
-    currTerm = PackedTerm(pool.alloc(PackedTerm::getMemSize(PackedTerm::MAX_LEN)));
+    currTerm = PackedTerm(pool.alloc(PackedTerm::getMemSize(PackedTerm::MAX_BYTES)));
   }
 
   int32_t numTerms() const {
@@ -139,7 +139,7 @@ public:
     if (prefixLen == 7) {
       prefixLen = termsIS.readByte();
     }
-    if (suffixLen == 31) {
+    if (suffixLen == 32) {
       suffixLen = termsIS.readByte();
     }
 
