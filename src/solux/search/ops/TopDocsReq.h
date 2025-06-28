@@ -226,7 +226,7 @@ public:
     unused(numCollected);
     int32_t maxBatchSize = qr.topDocsProto.batch_size();
     if (maxBatchSize <= 0) {
-      maxBatchSize = 10;  // what should the default be?
+      maxBatchSize = 100;  // what should the default be?
     } else if (maxBatchSize > 256) {
       maxBatchSize = 256;
     }

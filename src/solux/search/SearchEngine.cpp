@@ -5,6 +5,7 @@ namespace solux {
 
 void SearchEngine::submitBody(SearchRequest& req) {
   getResources(req);
+  // LOG_DEBUG("submitBody: IndexReader commitTime={}", req.reader->commitTime());
   req.lastResponse = SearchResponse::create(req, true);
 
   ProtobufSearchParser parser(req);

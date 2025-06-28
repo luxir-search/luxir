@@ -110,6 +110,12 @@ public:
     return *this;
   }
 
+  // Set batch size for streaming responses
+  LocalReq& batchSize(int32_t batchSize, std::string_view opName = "q") {
+    topDocs(opName).set_batch_size(batchSize);
+    return *this;
+  }
+
   // Enable match count and scores
   LocalReq& withStats(std::string_view opName = "q") {
     auto& td = topDocs(opName);

@@ -940,9 +940,8 @@ TEST_F(IndexWriterTest, segmentMergerWithDeletes) {
 //
 TEST_F(IndexWriterTest, segmentMergerPositions) {
   using namespace solux::test;
-  rng = Rng(1);  // reproducible for now.
-  int docsPerSeg = 3;
-  int numSegs = 2;
+  int docsPerSeg = 10;
+  int numSegs = 10;
 
   CollectionHelper helper("main");
   helper.clear();
@@ -987,9 +986,6 @@ TEST_F(IndexWriterTest, segmentMergerPositions) {
   // wait for previous merge to finish.
   indexWriter->updateGraph.wait_for_all();
 
-  // sleep one second
-  std::this_thread::sleep_for(std::chrono::seconds(1));
-
   // force another merge to squeeze out deletes
   indexWriter->mergeSegments();
 
@@ -1001,6 +997,18 @@ TEST_F(IndexWriterTest, segmentMergerPositions) {
 
   EXPECT_EQ(numDocs, reader->maxDoc());
 
+  // Test 2: Verify term/match queries on the "text_w" field for "world" retrieve documents with valid IDs
+  auto* req = LocalReq::create(helper.getSearchEngine());
+  auto docs = req->collection("main")
+            .matchQuery("text_w", "world")
+            .limit(-1)
+            .fields({"id", })
+            .execute()
+            .getDocs();
+  req->done();
+
+  // should be all docs
+  ASSERT_EQ(numDocs, docs.size());
   // verify document remapping
   for (int seg = 0; seg < numSegs; seg++) {
     for (int doc = 0; doc < docsPerSeg; doc++) {
@@ -1008,8 +1016,8 @@ TEST_F(IndexWriterTest, segmentMergerPositions) {
       std::string idStr = "doc" + std::to_string(id);
 
       // Test 1: Verify term/match queries on the "id" field retrieve the correct "id"
-      auto* req = LocalReq::create(helper.getSearchEngine());
-      auto docs = req->collection("main")
+      req = LocalReq::create(helper.getSearchEngine());
+      docs = req->collection("main")
                      .matchQuery("id", idStr)
                      .fields({"id"})
                      .execute()
@@ -1024,19 +1032,7 @@ TEST_F(IndexWriterTest, segmentMergerPositions) {
         ASSERT_EQ(idStr, std::get<std::string>(docs[0][0].val));
       }
 
-      // Test 2: Verify term/match queries on the "text_w" field for "world" retrieve documents with valid IDs
-      req = LocalReq::create(helper.getSearchEngine());
-      docs = req->collection("main")
-                .matchQuery("text_w", "world")
-                .fields({"id", })
-                .execute()
-                .getDocs();
-      req->done();
-
-      // should be all docs
-      ASSERT_EQ(numDocs, docs.size());
-
-      // Test 3: Verify term/match queries on the "text_w" field for the id term is on the right doc.
+      // Verify term/match queries on the "text_w" field for the id term is on the right doc.
       req = LocalReq::create(helper.getSearchEngine());
       docs = req->collection("main")
                 .matchQuery("text_w", idStr)
@@ -1053,8 +1049,7 @@ TEST_F(IndexWriterTest, segmentMergerPositions) {
         ASSERT_EQ(idStr, std::get<std::string>(docs[0][0].val));
       }
 
-
-      // Test 4: Verify that the positions lookups are correct.
+      // Verify that the positions lookups are correct.
       req = LocalReq::create(helper.getSearchEngine());
       docs = req->collection("main")
                 .phraseQuery("text_w", {"world", idStr})
