@@ -72,6 +72,7 @@ public:
   : indexSemaphore(indexConcurrency)
   {
     collection_ = SoluxTest::soluxNode->getCollection(name);
+    getIndexWriter()->mergePolicy->setMergeFactor(10);  // reset in case other tests forget.
   }
 
   Collection& collection() {

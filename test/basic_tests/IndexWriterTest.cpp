@@ -1147,8 +1147,9 @@ TEST_F(IndexWriterTest, removeFields) {
   helper.index(dummyDoc, UpdateMessage::NO_COMMIT, true);
   
   // Delete the big document
-  helper.deleteById("doc1", UpdateMessage::COMMIT);
-  
+  helper.deleteById("doc1", UpdateMessage::NO_COMMIT);
+  helper.commit();
+
   indexWriter->mergeSegments();  // synchronous merge
 
   // Get fresh reader after merge
@@ -1159,7 +1160,7 @@ TEST_F(IndexWriterTest, removeFields) {
   auto guard = MemPool::threadLocalPoolGuard();
   // Verify fields from deleted document are gone after merge
   for (const auto& segment : reader->segments()) {
-    FieldReader fieldsReader(guard.pool(), const_cast<PostingsReader&>(segment.postingsReader()));
+    FieldReader fieldsReader(guard.pool(), segment.postingsReader());
     EXPECT_TRUE(fieldsReader.seek("id")); // id field should remain
     EXPECT_FALSE(fieldsReader.seek("text_w"));
     EXPECT_FALSE(fieldsReader.seek("string_s"));

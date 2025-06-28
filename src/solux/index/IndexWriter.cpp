@@ -843,6 +843,13 @@ void IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
 
   solux::Signal::emit("mergeStart", (void*)(int64_t)msg.mergeLevel, (void*)segs.size());
 
+  // Sort the list of segments by the segId.
+  // Some tests rely on not reordering segments.
+  std::sort(segs.begin(), segs.end(), [](const SegInfo* a, const SegInfo* b) {
+    return a->segId < b->segId;
+  });
+
+
   {
     // grab or open all the postings readers
     std::vector<std::shared_ptr<PostingsReader>> preaders;
@@ -854,8 +861,6 @@ void IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
         segInfo->sharedPostingsReader.store(preaders.back());
       }
     }
-
-    MemPool pool;
 
     // Load liveDocs (the version we got a snapshot for) each segment to be merged
     std::vector<std::shared_ptr<LiveDocs>> liveDocsVec;
@@ -940,9 +945,6 @@ void IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
   // We could look to see if there are any busy inverters - if so, indexing is still happening.
   // Also maybe only do if there are no more merges.
 
-  // TODO: if we have a merge message, with a commit on it, we should submit a commit message
-  // that wraps this message and doesn't call done() until the commit is finished.
-  msg.done(*this);
 
 
   // check if we should send a commit so the new segment gets referenced.
@@ -962,18 +964,21 @@ void IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
     // send a commit message to force a commit.
     class CommitMessage : public UpdateMessage {
     public:
+      MergeMessage* origMessage;
       void handle(IndexWriter& iw) override {
         unused(iw);
       }
 
       void done(IndexWriter& iw) override {
         unused(iw);
-        delete this; // delete the message after done
+        origMessage->done(iw);
+        delete this;
       }
     };
 
     CommitMessage* commitMessage = new CommitMessage();
     commitMessage->commit = UpdateMessage::COMMIT;
+    commitMessage->origMessage = &msg;
     INDEX_DEBUG("mergeSegmentsBody: requesting commit. msg={}", (void*)commitMessage);
     this->submitUpdate(commitMessage);
   }
@@ -981,12 +986,45 @@ void IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
     INDEX_DEBUG(
       "mergeSegmentsBody: merge done, but not triggering commit since there are busy, flushing, or idle inverters.");
   }
+
+  if (!triggerCommit) {
+    msg.done(*this);
+  }
+}
+
+// This is currently for tests only and blocks until all indexing activity has ceased!
+void IndexWriter::mergeSegments() {
+  class BlockingMergeMessage : public MergeMessage {
+  public:
+    Blocker blocker;
+
+    void handle(IndexWriter& iw) override {
+      unused(iw);
+    }
+
+    void done(IndexWriter& iw) override {
+      unused(iw);
+      blocker.notify();
+    }
+  };
+
+  // all stack allocated since we will be waiting for completion.
+  BlockingMergeMessage mergeMessage;
+  mergeMessage.maxSegments = 1;
+
+  mergeSegmentsNode->try_put(&mergeMessage);
+
+  mergeMessage.blocker.wait();
+  // at this point, a new commit hasn't been done yet, so let's wait for
+  // everything to finish.
+
+  updateGraph.wait_for_all(); // wait for commit to finish before returning.
+  // this->commit();
 }
 
 
-/// TEST CODE
-/// Only for test code... there is no concurrency control, etc.
-void IndexWriter::mergeSegments() {
+
+#ifdef REMOVED
   // make sure we are getting the latest index reader (wasteful!)
   indexReader.reset();
   auto reader = getIndexReader();
@@ -1024,6 +1062,7 @@ void IndexWriter::mergeSegments() {
   // Call the parameterized version w/o commit info
   writeIndexInfoFile(segs);
 }
+#endif
 
 
 /// TEST CODE (called from tests)
