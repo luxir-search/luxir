@@ -1014,12 +1014,8 @@ void IndexWriter::mergeSegments() {
 
   mergeSegmentsNode->try_put(&mergeMessage);
 
+  // If merge code decides to commit, this call back won't be done until the commit is finished.
   mergeMessage.blocker.wait();
-  // at this point, a new commit hasn't been done yet, so let's wait for
-  // everything to finish.
-
-  updateGraph.wait_for_all(); // wait for commit to finish before returning.
-  // this->commit();
 }
 
 

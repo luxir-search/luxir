@@ -1,5 +1,6 @@
 #pragma once
 
+#include "PhraseQuery.h"
 #include "solux/query/Query.h"
 #include "solux/query/TermQuery.h"
 #include "solux/query/AllQuery.h"
@@ -55,11 +56,47 @@ public:
     std::unreachable();
   }
 
+  solux::Query* parsePhrase(const solux::proto::PhraseQuery& phraseQuery) {
+    std::string_view field = phraseQuery.field();
+    FieldType& fieldType = *schema.getFieldTypeEx(field);
+    if (fieldType.type() != FieldType::Type::TEXT) {
+      throw std::runtime_error(std::format("Phrase query on non-text field: {}", field));
+    }
+
+    // PhraseQuery(std::string_view field, std::span<std::string_view> terms, std::span<int32_t> positions) : field(field),
+
+    auto sz = phraseQuery.words().size();
+
+    auto terms = pool.make_span<std::string_view>(sz);
+    std::span<const int32_t> positions(phraseQuery.positions().begin(), (size_t)phraseQuery.positions().size());
+
+    for (int i=0; i < sz; i++) {
+      terms[i] = phraseQuery.words(i);
+    }
+
+    if (positions.size() > 0 && positions.size() != sz) {
+      throw std::runtime_error(std::format("Phrase query positions size {} does not match words size {}", positions.size(), sz));
+    }
+
+    if (positions.empty()) {
+      auto pos = pool.make_span<int32_t>(sz);
+      for (int i=0; i<sz; i++) {
+        pos[i] = i;  // positions are just the index in the phrase
+      }
+      positions = pos;  // use the default positions
+    }
+
+    return pool.make<solux::PhraseQuery>(field, terms, positions);
+  }
+
 
   solux::Query* parse(const solux::proto::Query& pquery) {
     switch(pquery.kind_case()) {
       case solux::proto::Query::kMatch: {
         return parseMatch(pquery.match());
+      }
+      case solux::proto::Query::kPhrase: {
+        return parsePhrase(pquery.phrase());
       }
       case solux::proto::Query::kAll: {
         return pool.make<solux::AllQuery>();

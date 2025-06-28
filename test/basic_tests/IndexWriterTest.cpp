@@ -968,6 +968,7 @@ TEST_F(IndexWriterTest, segmentMergerPositions) {
       textField += " hello world ";
       textField += idStr;
       Doc d = flatdoc("id", idStr, "text_w", textField);
+      // LOG_DEBUG("Indexing doc:{} text_w:{}", idStr, textField);
       helper.index(d, UpdateMessage::NO_COMMIT, true);
     }
     // now delete some random document in this segment
@@ -983,8 +984,11 @@ TEST_F(IndexWriterTest, segmentMergerPositions) {
     helper.commit();
   }
 
-  // wait for all merges to complete
+  // wait for previous merge to finish.
   indexWriter->updateGraph.wait_for_all();
+
+  // sleep one second
+  std::this_thread::sleep_for(std::chrono::seconds(1));
 
   // force another merge to squeeze out deletes
   indexWriter->mergeSegments();
@@ -1002,8 +1006,7 @@ TEST_F(IndexWriterTest, segmentMergerPositions) {
     for (int doc = 0; doc < docsPerSeg; doc++) {
       int id = seg * 100 + doc;
       std::string idStr = "doc" + std::to_string(id);
-      std::string termStr = "term" + std::to_string(doc);
-      
+
       // Test 1: Verify term/match queries on the "id" field retrieve the correct "id"
       auto* req = LocalReq::create(helper.getSearchEngine());
       auto docs = req->collection("main")
@@ -1018,13 +1021,7 @@ TEST_F(IndexWriterTest, segmentMergerPositions) {
         ASSERT_TRUE(docs.empty());
       } else {
         ASSERT_EQ(docs.size(), 1);
-        bool foundId = false;
-        for (const auto& nv : docs[0]) {
-          if (nv.name == "id" && std::get<std::string>(nv.val) == idStr) {
-            foundId = true;
-          }
-        }
-        EXPECT_TRUE(foundId);
+        ASSERT_EQ(idStr, std::get<std::string>(docs[0][0].val));
       }
 
       // Test 2: Verify term/match queries on the "text_w" field for "world" retrieve documents with valid IDs
@@ -1037,7 +1034,7 @@ TEST_F(IndexWriterTest, segmentMergerPositions) {
       req->done();
 
       // should be all docs
-      EXPECT_EQ(numDocs, docs.size());
+      ASSERT_EQ(numDocs, docs.size());
 
       // Test 3: Verify term/match queries on the "text_w" field for the id term is on the right doc.
       req = LocalReq::create(helper.getSearchEngine());
@@ -1050,15 +1047,29 @@ TEST_F(IndexWriterTest, segmentMergerPositions) {
 
       // should be a single result if not deleted.
       if (wasDeleted) {
-        EXPECT_EQ(0, docs.size());
+        ASSERT_EQ(0, docs.size());
       } else {
-        EXPECT_EQ(1, docs.size());
-        EXPECT_EQ(idStr, std::get<std::string>(docs[0][0].val));
+        ASSERT_EQ(1, docs.size());
+        ASSERT_EQ(idStr, std::get<std::string>(docs[0][0].val));
       }
 
 
+      // Test 4: Verify that the positions lookups are correct.
+      req = LocalReq::create(helper.getSearchEngine());
+      docs = req->collection("main")
+                .phraseQuery("text_w", {"world", idStr})
+                .fields({"id", })
+                .execute()
+                .getDocs();
+      req->done();
 
-      // TODO: need to do phrase query.
+      // should be a single result if not deleted.
+      if (wasDeleted) {
+        ASSERT_EQ(0, docs.size());
+      } else {
+        ASSERT_EQ(1, docs.size());
+        ASSERT_EQ(idStr, std::get<std::string>(docs[0][0].val));
+      }
 
     }
   }

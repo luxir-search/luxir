@@ -1,15 +1,16 @@
 #pragma once
 
 #include "Query.h"
+#include "solux/reader/IntColReader.h"
 
 namespace solux {
 
 class PhraseQuery final : public Query {
   std::string_view field;
   std::span<std::string_view> terms;
-  std::span<int32_t> positions;
+  std::span<const int32_t> positions;
 public:
-  PhraseQuery(std::string_view field, std::span<std::string_view> terms, std::span<int32_t> positions) : field(field),
+  PhraseQuery(std::string_view field, std::span<std::string_view> terms, std::span<const int32_t> positions) : field(field),
                                                                                                          terms(terms),
                                                                                                          positions(
                                                                                                                  positions) {
@@ -25,7 +26,7 @@ public:
     return terms;
   }
 
-  [[nodiscard]] std::span<int32_t> getPositions() const {
+  [[nodiscard]] std::span<const int32_t> getPositions() const {
     return positions;
   }
 
@@ -79,16 +80,18 @@ public:
           return nullptr;
         }
       }
-      auto pos = targetPool.copy_span<int32_t>(query.getPositions());
 
-      return targetPool.make<PhraseQuery::Scorer>(targetPool, docsEnums, pos, *normsReader, *simScorer);
+      // no need to make copy, the query will outlive the scorers.
+      // auto pos = targetPool.copy_span<const int32_t>(query.getPositions());
+
+      return targetPool.make<PhraseQuery::Scorer>(targetPool, docsEnums, query.getPositions(), *normsReader, *simScorer);
     }
   };
 
 
   class Scorer final : public Query::Scorer {
     std::span<DocsEnum*> docsEnums;
-    std::span<int32_t> positions;
+    std::span<const int32_t> positions;
     // IntColReader normsReader; // prob not necessary?
     IntColReader::Iterator normsIter;
     Similarity::BM25Scorer& simScorer;
@@ -109,7 +112,8 @@ public:
           int32_t id = docsEnums[j]->advance(target);
           assert(id >= target);
           if (id > target) {
-            target = firstEnum->advance(target);
+            // TODO: explicitly handle END here for faster termination?
+            target = firstEnum->advance(id);
             goto outer;  // could perhaps replace with "j=0; continue;" but that seems potentially worse?
           }
         }
@@ -159,7 +163,7 @@ public:
 
 
   public:
-    Scorer(MemPool& targetPool, std::span<DocsEnum*> docsEnums, std::span<int32_t> positions, IntColReader& normsReader,
+    Scorer(MemPool& targetPool, std::span<DocsEnum*> docsEnums, std::span<const int32_t> positions, IntColReader& normsReader,
            Similarity::BM25Scorer& simScorer)
             : docsEnums(docsEnums), positions(positions), normsIter(normsReader), simScorer(simScorer) {
       int32_t maxOff = 0;

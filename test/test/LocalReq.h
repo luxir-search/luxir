@@ -61,18 +61,18 @@ public:
   // Convenience methods to make common operations easier
 
   // Set collection name easily
-  LocalReq& collection(const std::string& name) {
+  LocalReq& collection(std::string_view name) {
     proto.mutable_collection()->add_name(name);
     return *this;
   }
 
   // Get or create a top_docs operation with the given name
-  proto::TopDocs& topDocs(const std::string& opName = "q") {
+  proto::TopDocs& topDocs(std::string_view opName = "q") {
     return *proto.mutable_ops()->operator[](opName).mutable_top_docs();
   }
 
   // Add a match query to a top_docs operation
-  LocalReq& matchQuery(const std::string& field, const std::string& value, const std::string& opName = "q") {
+  LocalReq& matchQuery(std::string_view field, std::string_view value, std::string_view opName = "q") {
     auto& query = *topDocs(opName).mutable_query()->mutable_match();
     query.set_field(field);
     query.mutable_val()->set_s(value);
@@ -80,13 +80,13 @@ public:
   }
 
   // Add an "all documents" query
-  LocalReq& allQuery(const std::string& opName = "q") {
+  LocalReq& allQuery(std::string_view opName = "q") {
     topDocs(opName).mutable_query()->set_all(true);
     return *this;
   }
 
   // Add a phrase query to a top_docs operation
-  LocalReq& phraseQuery(const std::string& field, std::initializer_list<std::string> words, const std::string& opName = "q") {
+  LocalReq& phraseQuery(std::string_view field, std::initializer_list<std::string> words, std::string_view opName = "q") {
     auto& query = *topDocs(opName).mutable_query()->mutable_phrase();
     query.set_field(field);
     for (const auto& word : words) {
@@ -96,7 +96,7 @@ public:
   }
 
   // Add fields to return in search results
-  LocalReq& fields(std::initializer_list<std::string> fieldNames, const std::string& opName = "q") {
+  LocalReq& fields(std::initializer_list<std::string> fieldNames, std::string_view opName = "q") {
     auto& td = topDocs(opName);
     for (const auto& field : fieldNames) {
       *td.mutable_fields()->Add() = field;
@@ -105,13 +105,13 @@ public:
   }
 
   // Set limit for number of results
-  LocalReq& limit(int64_t maxResults, const std::string& opName = "q") {
+  LocalReq& limit(int64_t maxResults, std::string_view opName = "q") {
     topDocs(opName).set_limit(maxResults);
     return *this;
   }
 
   // Enable match count and scores
-  LocalReq& withStats(const std::string& opName = "q") {
+  LocalReq& withStats(std::string_view opName = "q") {
     auto& td = topDocs(opName);
     td.set_get_number(true);
     td.set_get_scores(true);
@@ -125,7 +125,7 @@ public:
   }
 
   // Get the search results as Doc objects for easy comparison
-  std::vector<Doc> getDocs(const std::string& opName = "q") {
+  std::vector<Doc> getDocs(std::string_view opName = "q") {
     if (responses.empty()) {
       return {};
     }
@@ -139,7 +139,7 @@ public:
   }
 
   // Get number of matches
-  int64_t getMatchCount(const std::string& opName = "q") {
+  int64_t getMatchCount(std::string_view opName = "q") {
     if (responses.empty()) return 0;
     auto it = responses[0]->proto.ops().find(opName);
     if (it == responses[0]->proto.ops().end() || !it->second.has_docs()) {
