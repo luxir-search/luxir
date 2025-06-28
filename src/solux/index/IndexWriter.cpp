@@ -805,7 +805,7 @@ void IndexWriter::writeIndexInfoFile(std::span<SegInfo*> segs, CommitInfo* commi
 // We also mark segments that are going to be merged, so the commit code knows about them.
 void IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
   std::vector<SegInfo*> segs;
-  segs.reserve(mergePolicy->MERGE_FACTOR * 2);
+  segs.reserve(mergePolicy->mergeFactor * 2);
 
   // We grab the list of segments to merge with the lock held, but use them outside of the lock.
   // This is safe since the only place where segments are deleted is in a merge, and this has concurrency==1

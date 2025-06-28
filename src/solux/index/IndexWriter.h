@@ -16,8 +16,8 @@ namespace solux {
 
 #define INDEX_TRACE LOG_TRACE
 // redefine DEBUG to TRACE level which shouldn't currently be logged!
-#define INDEX_DEBUG LOG_TRACE
-// #define INDEX_DEBUG LOG_DEBUG
+// #define INDEX_DEBUG LOG_TRACE
+#define INDEX_DEBUG LOG_DEBUG
 
 // this is currently outside of the IW class just so we can format it in loggin.
   class SegInfo {
@@ -86,23 +86,24 @@ public:
     std::vector<int32_t> levelCounts;
     int32_t segCount = 0;  // a sanity check that we are in-sync with segments in the IndexWriter.
   public:
+    static constexpr int32_t DEFAULT_MERGE_FACTOR = 10;
     IndexWriter& iw;
     bool mergeRunning = false;
-    int32_t MERGE_FACTOR = 10;
+    int32_t mergeFactor = DEFAULT_MERGE_FACTOR;
     // TODO: Hmmm, a high merge floor can lead to some O^N2 behavior: see https://issues.apache.org/jira/browse/LUCENE-10574
     // Perhaps an alternative would be to remove the floor and then kick off merges like normal, *but*
     // when a merge happens at tier 3, sweep up all the smaller segments as well.  I'm not sure this
     // really makes sense though since it would only occasionally fix the "many small segments" problem, and
     // it is the indexing pattern that is causing the issue.  Perhaps this should be fixed by the user
     // through an API that requests a more aggressive merge to sweep up small segments.
-    float inverseLogM = 1.0f / log2(MERGE_FACTOR);
+    float inverseLogM = 1.0f / log2(mergeFactor);
 
     // Methods with _ prefix should be called with the indexMutex already locked.
     MergePolicy(IndexWriter& iw) : iw(iw) {}
 
     void setMergeFactor(int32_t mergeFactor) {
-      MERGE_FACTOR = mergeFactor;
-      inverseLogM = 1.0f / log2(MERGE_FACTOR);
+      this->mergeFactor = std::max(2,mergeFactor);
+      inverseLogM = 1.0f / log2(this->mergeFactor);
     }
 
     // re-calculate the merges from scratch (i.e. not incrementally)
@@ -140,7 +141,7 @@ public:
         segCount++;
 
         // For MERGE_FACTOR 10, docs 0-9 = level 0, 10-99 = level 1, etc.
-        if (seg->maxDoc < MERGE_FACTOR) {
+        if (seg->maxDoc < mergeFactor) {
           seg->mergeLevel = 0;
         } else {
           seg->mergeLevel = (int32_t) (log2(seg->maxDoc) * inverseLogM);
@@ -148,14 +149,14 @@ public:
         if (seg->mergeLevel >= (int) levelCounts.size()) {
           levelCounts.resize(seg->mergeLevel + 1);
         }
-        if (++levelCounts[seg->mergeLevel] >= MERGE_FACTOR) {
+        if (++levelCounts[seg->mergeLevel] >= mergeFactor) {
           mergeLevel = seg->mergeLevel;
         }
         INDEX_DEBUG("merge level update: seg={} segLevel={} segLevelCount={} mergeLevel={}", *seg, !seg?-1:seg->mergeLevel, !seg?-1:levelCounts[seg->mergeLevel], mergeLevel);
       } else {
         // check all levels
         for (auto i = 0u; i < levelCounts.size(); i++) {
-          if (levelCounts[i] >= MERGE_FACTOR) {
+          if (levelCounts[i] >= mergeFactor) {
             mergeLevel = i;
             break;
           }
