@@ -742,17 +742,16 @@ TEST_F(IndexWriterTest, testMissingFiles) {
 
 TEST_F(IndexWriterTest, testMultithreadedUpdates) {
   using namespace solux::test;
-  return; // TODO: test not ready yet. merging and searching deletes not done.
-  
+
   CollectionHelper helper("main");
   helper.clear();
   
   auto indexWriter = helper.getIndexWriter();
   indexWriter->mergePolicy->setMergeFactor(3);
 
-  auto numThreads = 1;
-  auto opsPerThread = 100;  // total operations per thread
-  auto docsPerThread = 4;   // number of unique documents per thread
+  auto numThreads = 16;
+  auto opsPerThread = 50;  // total operations per thread
+  auto docsPerThread = 4;   // number of unique documents per thread.. keep this low to generate high contention.
 
   // Track expected versions per thread
   std::vector<std::map<std::string, int64_t>> threadExpectedVersions(numThreads);
@@ -777,13 +776,13 @@ TEST_F(IndexWriterTest, testMultithreadedUpdates) {
         if (operation == 0) { // Index
           Doc doc = flatdoc("id", docId);
           auto result = helper.index(doc, UpdateMessage::COMMIT, true);
-          ASSERT_TRUE(result.success) << "Thread " << tid << " failed to index doc " << docId;
+          ASSERT_TRUE(result.success);
           // TODO: expose and get SoluxError for actual error message / stack trace.
           docVersions[localDoc] = result.updateVersion;
 
         } else if (operation == 1) { // Delete
           auto result = helper.deleteById(docId, UpdateMessage::COMMIT);
-          ASSERT_TRUE(result.success) << "Thread " << tid << " failed to delete doc " << docId;
+          ASSERT_TRUE(result.success);
           docVersions[localDoc] = -1; // Mark as deleted
         } else { // Read
           indexWriter->getIndexReader();
@@ -829,9 +828,6 @@ TEST_F(IndexWriterTest, testMultithreadedUpdates) {
   helper.commit();
   indexWriter->getIndexReader(0);
   indexWriter->updateGraph.wait_for_all();
-
-  // TODO: fixme : need to restore mergeFactor?  causes FacetBM to fail if it comes after?
-  indexWriter->mergePolicy->setMergeFactor(10);
 }
 
 // Test segment merging with deleted documents
