@@ -4,6 +4,7 @@
 #include "ops/RootOp.h"
 #include "ops/SearchOp.h"
 #include "ops/FacetOp.h"
+#include "ops/StatsOp.h"
 #include "ops/TopDocsReq.h"
 #include "solux/query/ProtobufQueryParser.h"
 
@@ -74,6 +75,15 @@ public:
         return facet;
       }
         break;
+        case solux::proto::SearchOp::kGenOp: {
+          if (searchOp.gen_op().name() == "avg" || searchOp.gen_op().name() == "average") {
+            auto& avgOp = searchOp.gen_op();
+            auto* avg = google::protobuf::Arena::Create<AvgOp>(&req.arena, req, name, avgOp.args(0).s());
+            return avg;
+          } else {
+            throw std::runtime_error("Unknown generic operation: " + std::string(searchOp.gen_op().name()));
+          }
+        }
       default:
         throw std::runtime_error("Unknown search operation");
     }

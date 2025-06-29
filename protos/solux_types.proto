@@ -47,8 +47,15 @@ message SearchOp {
     // TODO: hmmm, should different facet types be be encapsulated by a single "Facet" message?
     FieldFacet field_facet = 8;
     RangeFacet range_facet = 9;
+    GenOp gen_op = 15;
     // future: something like terms component... stream out all terms of one or more (or all) fields
   }
+}
+
+// A generic operation that is not strongly typed.
+message GenOp {
+  string name = 1;       // the name of the operation
+  repeated Val args = 2; // arguments to the operation
 }
 
 message TopDocs {

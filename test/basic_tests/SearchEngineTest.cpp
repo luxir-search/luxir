@@ -76,9 +76,12 @@ TEST_F(SearchEngineTest, basic) {
     facet8.set_gap(20);
     auto& facet9 = *ops["f9"].mutable_field_facet();
     facet9.set_field("foo_w");
+    auto& avg = *ops["avg"].mutable_gen_op();
+    avg.set_name("avg");
+    avg.mutable_args()->Add()->set_s("foo_i");
 
     lreq->engine.submit(*lreq, para);
-     //LOG_DEBUG("ENGINE REQ: {}", lreq->toString());
+    // LOG_DEBUG("ENGINE REQ: {}", lreq->toString());
 
     ASSERT_EQ(lreq->proto.request_id(), lreq->responses[0]->proto.request_id());
     auto& docs = lreq->responses[0]->proto.ops().at("q").docs();
@@ -189,6 +192,9 @@ TEST_F(SearchEngineTest, basic) {
     ASSERT_EQ(1, lreq->responses[0]->proto.ops().at("f9").facet().counts().at(2));
     ASSERT_EQ(1, lreq->responses[0]->proto.ops().at("f9").facet().counts().at(3));
     ASSERT_EQ(1, lreq->responses[0]->proto.ops().at("f9").facet().counts().at(4));
+
+    // check the avg
+    ASSERT_EQ(lreq->responses[0]->proto.ops().at("avg").d(), 15);
 
     lreq->done();
   }

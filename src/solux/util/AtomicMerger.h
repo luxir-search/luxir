@@ -11,7 +11,7 @@ concept Mergeable = requires(T t, T* a, T* b) {
   // Must have a 'count' member that is convertible to int64_t.
   // Number of instances that have been released (finished)
   // This count is maintained by the AtomicMerger and returned by the release() method.
-  { t.count } -> std::convertible_to<int64_t>;
+  { t.releaseCount } -> std::convertible_to<int64_t>;
 
   // Must have a static 'merge' method that takes two T* and returns a T*.
   // The merge method should merge the two instances and return a pointer to the merged instance.
@@ -23,7 +23,7 @@ concept Mergeable = requires(T t, T* a, T* b) {
 // Optional convenience base class for Mergeable.
 class MergeableData {
 public:
-  int64_t count = 0;
+  int64_t releaseCount = 0;
 };
 
 /// AtomicMerger implements a thread-safe concurrent way to merge data that is collected from multiple segments.
@@ -78,18 +78,18 @@ public:
   /// release() has been called.
   /// Do *not* access this pointer after it has been released, as it may be deleted or merging/merged with another instance.
   int64_t release(T* data) {
-    data->count++;
+    data->releaseCount++;
     for (;;) {
-      auto count = data->count;  // grab the count before we try to put back, to avoid races
+      auto releaseCount = data->releaseCount;  // grab the count before we try to put back, to avoid races
       data = ptr.exchange(data, std::memory_order_release);
       if (data == nullptr) {
-        return count;
+        return releaseCount;
       }
       // try to grab the other mergeable to merge.  The memory_order_acquire will
       // also cause memory pointed at by "data" to be valid here.
       auto other = ptr.exchange(nullptr, std::memory_order_acquire);
       if (other != nullptr) {
-        auto newCount = data->count + other->count;
+        auto newReleaseCount = data->releaseCount + other->releaseCount;
         T* newData = nullptr;
         try {
           newData = T::merge(data, other);
@@ -109,7 +109,7 @@ public:
           destroyer(other);
         }
         data = newData;
-        data->count = newCount; // update the count to include the merged data
+        data->releaseCount = newReleaseCount; // update the count to include the merged data
       }
       // Either we successfully merged, or we got a nullptr (someone else grabbed it before us).
       // in both cases, we still have a pointer to try and put back into the atomic,
