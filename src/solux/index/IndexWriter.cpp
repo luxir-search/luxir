@@ -468,8 +468,9 @@ void IndexWriter::finishCommitBody(UpdateMessage& msg) {
     // grab all segments and mark them as being part of a commit.
     for (auto& [segId, seg] : segInfos) {
       segs.push_back(seg.get());
-      seg->commitTime = lastCommit; // IMPORTANT - for marking it in use for the last commit to prevent its deletion.
-
+      if (seg->commitTime == 0) {
+        seg->commitTime = 1; // IMPORTANT - for marking it in use to prevent its deletion.
+      }
       if (!seg->personalDeletes.empty()) {
         // this segment has personal deletes that need to be applied.
         segsToApplyDeletes.push_back(seg.get());
@@ -633,11 +634,16 @@ void IndexWriter::finishCommitBody(UpdateMessage& msg) {
 
   // Only move the segment to the delete list after the new IndexInfo file is written.
   // This way it should be safe for other threads to also try deletions.
+  // NOTE: we did have a call to tryDeleteSegments() from the merge code as well, but
+  // there was a race condition: writeIndexInfoFile() was updating the commitTime of
+  // the segments before updating lastCommitTime, so a segment could be deleted in that period.
+  // The race is fixable (always use "1" for a segment being committed, etc), but it's
+  // easier for now to just call tryDeleteSegments() in this method.
   if (!toDelete.empty()) {
     const std::lock_guard<std::mutex> lock(indexMutex);
     for (auto& seg : toDelete) {
-      seg->commitTime = 0; // mark as not being part of the last commit so it may be deleted immediately.
       moveSegmentToDelete(seg->segId);
+      seg->commitTime = 0; // mark as not being part of the last commit so it may be deleted immediately.
     }
   }
 
@@ -667,7 +673,8 @@ void IndexWriter::tryDeleteSegments() {
       // NOTE! we can observe seg->commitTime > lastCommit because the segments file
       // may be in the process of being written out, and lastCommitTime is only
       // updated *after* the IndexInfo file is written.
-      if (seg->merging || seg->commitTime >= lastCommit) {
+      // commitTime==1 means it's about to be committed (don't want try-delete call from segment merger to delete it).
+      if (seg->merging || seg->commitTime >= lastCommit || seg->commitTime == 1) {
         segmentsToDelete.push_back(std::move(seg)); // keep it in the list, we can't delete it yet.
       }
     }
@@ -932,7 +939,8 @@ void IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
       }
     } // end index lock
 
-    tryDeleteSegments(); // try to delete segments that are now empty
+    // This races with the commit code (see comments in finishCommitBody()).
+    // tryDeleteSegments(); // try to delete segments that are now empty
 
     // even though we're not quite done yet, it's OK if another merge is checked/submitted since
     // we've updated segInfos and the mergePolicy.
