@@ -10,8 +10,10 @@
 #include <set>
 #include <mutex>
 #include <memory>
-#include <solux/index/Inverter.h>
 #include <latch>
+
+#include <oneapi/tbb/flow_graph.h>
+#include <solux/index/Inverter.h>
 #include <solux/server/ProtoUpdateMessage.h>
 
 #include "solux/index/IndexWriter.h"
@@ -739,7 +741,11 @@ TEST_F(IndexWriterTest, testMissingFiles) {
   EXPECT_EQ(liveDocs2, nullptr);
 }
 
-
+//
+// This is one of the main tests for testing multithreaded updates with deletes and segment
+// merges.  If changes are made to the IndexWriter, pump up opsPerThread to really stress
+// test the system.
+//
 TEST_F(IndexWriterTest, testMultithreadedUpdates) {
   using namespace solux::test;
 
@@ -747,20 +753,109 @@ TEST_F(IndexWriterTest, testMultithreadedUpdates) {
   helper.clear();
   
   auto indexWriter = helper.getIndexWriter();
-  indexWriter->mergePolicy->setMergeFactor(3);
+  indexWriter->mergePolicy->setMergeFactor(3);  // low merge factor to stress merge concurrency with other operations
 
   auto numThreads = 16;
   auto opsPerThread = 50;  // total operations per thread
-  auto docsPerThread = 4;   // number of unique documents per thread.. keep this low to generate high contention.
+  auto docsPerThread = 4;  // number of unique documents per thread.. keep this low to generate high contention.
 
-  // Track expected versions per thread
-  std::vector<std::map<std::string, int64_t>> threadExpectedVersions(numThreads);
-  std::vector<std::set<std::string>> threadDeletedDocs(numThreads);
+
   std::vector<std::thread> threads;
-
   auto seed = rng();
-  for (int tid = 0; tid < numThreads; tid++) {
-    threads.emplace_back([&, tid]() {
+
+#ifdef TBB_TEST_VERSION
+  std::atomic<bool> done(false);
+
+  std::thread deadlockDetector([&]() {
+    while (!done.load()) {
+      uint64_t lastUpdateNumber = indexWriter->updateNumber;
+      std::this_thread::sleep_for(std::chrono::seconds(1));
+      if (indexWriter->updateNumber == lastUpdateNumber) {
+        LOG_ERROR("Deadlock detector: No Indexing activity for 1 second!");
+        try {
+          // If an uncaught exception occured in the updateGraph, waiting for all will throw it.
+          indexWriter->updateGraph.wait_for_all();
+        } catch (const std::exception& e) {
+          LOG_ERROR("Deadlock detector caught exception: {}", e.what());
+        }
+      }
+    }
+  });
+
+  oneapi::tbb::task_arena arena(numThreads);
+
+  arena.execute([&]() {
+    oneapi::tbb::task_group tg;
+
+    for (int tid = 0; tid < numThreads; tid++) {
+        tg.run([&, tid]() {
+        Rng r(seed + tid);
+        std::vector<int64_t> docVersions(docsPerThread, 0);
+
+        for (int op = 0; op < opsPerThread; op++) {
+          // Use numeric IDs: thread 0 uses 1000-1007, thread 1 uses 2000-2007, etc
+          // One thread never modifies another threads documents.
+          int localDoc = r.rint(docsPerThread);
+          std::string docId = std::to_string(localDoc + tid * 1000);
+          int64_t lastUpdateVersion = 0;
+
+          int operation = r.rint(3);  // 0 == update, 1 == delete, 2 = read
+
+          if (operation == 0) { // Index
+            Doc doc = flatdoc("id", docId);
+            auto result = helper.index(doc, UpdateMessage::COMMIT, true);
+            ASSERT_TRUE(result.success);
+            // TODO: expose and get SoluxError for actual error message / stack trace.
+            docVersions[localDoc] = result.updateVersion;
+
+          } else if (operation == 1) { // Delete
+            auto result = helper.deleteById(docId, UpdateMessage::COMMIT);
+            ASSERT_TRUE(result.success);
+            docVersions[localDoc] = -1; // Mark as deleted
+          } else { // Read
+            indexWriter->getIndexReader();
+            // TODO: store, expose, and test the update verision in the IndexReader
+
+            auto* req = LocalReq::create(helper.getSearchEngine());
+            auto docs = req->collection("main")
+                          .matchQuery("id", docId)
+                          .fields({"id", "_version_"})
+                          .execute()
+                          .getDocs();
+            req->done();
+
+            if (docVersions[localDoc] <= 0) {
+              EXPECT_TRUE(docs.empty());
+            } else if (docVersions[localDoc] > 0) {
+              EXPECT_EQ(docs.size(), 1);
+              if (!docs.empty()) {
+                int64_t foundVersion = -1;
+                for (const auto& nv : docs[0]) {
+                  if (nv.name == "_version_") {
+                    foundVersion = std::get<int64_t>(nv.val);
+                    break;
+                  }
+                }
+                EXPECT_EQ(foundVersion, docVersions[localDoc])
+                  << "Thread " << tid << " doc " << docId << " version mismatch"
+                  << " expected: " << docVersions[localDoc] << " found: " << foundVersion;
+              }
+            }
+
+          } // end Read
+        } // end for opsPerThread
+      });
+    }
+
+    tg.wait(); // wait for all threads to finish.
+  }); // arena.execute
+
+  done.store(true); // signal the deadlock detector to stop
+  deadlockDetector.join();
+#endif
+
+   for (int tid = 0; tid < numThreads; tid++) {
+      threads.emplace_back([&, tid]() {
       Rng r(seed + tid);
       std::vector<int64_t> docVersions(docsPerThread, 0);
 
@@ -772,7 +867,7 @@ TEST_F(IndexWriterTest, testMultithreadedUpdates) {
         int64_t lastUpdateVersion = 0;
 
         int operation = r.rint(3);  // 0 == update, 1 == delete, 2 = read
-        
+
         if (operation == 0) { // Index
           Doc doc = flatdoc("id", docId);
           auto result = helper.index(doc, UpdateMessage::COMMIT, true);
@@ -787,7 +882,7 @@ TEST_F(IndexWriterTest, testMultithreadedUpdates) {
         } else { // Read
           indexWriter->getIndexReader();
           // TODO: store, expose, and test the update verision in the IndexReader
-          
+
           auto* req = LocalReq::create(helper.getSearchEngine());
           auto docs = req->collection("main")
                         .matchQuery("id", docId)
@@ -795,7 +890,7 @@ TEST_F(IndexWriterTest, testMultithreadedUpdates) {
                         .execute()
                         .getDocs();
           req->done();
-          
+
           if (docVersions[localDoc] <= 0) {
             EXPECT_TRUE(docs.empty()) << "Thread " << tid << " found deleted doc " << docId;
           } else if (docVersions[localDoc] > 0) {
@@ -818,15 +913,13 @@ TEST_F(IndexWriterTest, testMultithreadedUpdates) {
       } // end for opsPerThread
     });
   }
-  
+
   // Wait for all threads
   for (auto& thread : threads) {
     thread.join();
   }
-  
-  // Final commit to hopefully make sure all merges are done.
-  helper.commit();
-  indexWriter->getIndexReader(0);
+
+  // make sure we don't leave any tasks in the updateGraph
   indexWriter->updateGraph.wait_for_all();
 }
 
@@ -862,7 +955,7 @@ TEST_F(IndexWriterTest, segmentMergerWithDeletes) {
   auto reader2 = indexWriter->getIndexReader();
   bool foundDeletes = false;
   for (const auto& segment : reader2->segments()) {
-    LOG_INFO("Segment {}: maxDoc={}, liveDocs={}, numDeletes={}, numLive={}", 
+    LOG_TRACE("Segment {}: maxDoc={}, liveDocs={}, numDeletes={}, numLive={}",
              segment.segInfo.seg_id, segment.segInfo.max_doc, 
              segment.segInfo.live_docs, segment.numDeletes(), segment.numLive());
     if (segment.numDeletes() > 0) {
@@ -883,9 +976,9 @@ TEST_F(IndexWriterTest, segmentMergerWithDeletes) {
   // Get fresh reader
   auto reader3 = indexWriter->getIndexReader();
   
-  LOG_INFO("After merge: {} segments, {} total docs", reader3->segments().size(), reader3->maxDoc());
+  LOG_TRACE("After merge: {} segments, {} total docs", reader3->segments().size(), reader3->maxDoc());
   for (const auto& segment : reader3->segments()) {
-    LOG_INFO("Merged segment {}: maxDoc={}, liveDocs={}, numDeletes={}, numLive={}", 
+    LOG_TRACE("Merged segment {}: maxDoc={}, liveDocs={}, numDeletes={}, numLive={}",
              segment.segInfo.seg_id, segment.segInfo.max_doc, 
              segment.segInfo.live_docs, segment.numDeletes(), segment.numLive());
   }

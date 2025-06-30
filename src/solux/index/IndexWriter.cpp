@@ -100,17 +100,19 @@ IndexWriter::IndexWriter(Directory& dir) : dir(dir) {
   // This could be done in a quick synchronized block instead... and could then be safely inspected by the client
   // if necessary before submitting to the actual processing graph.
   startUpdateNode = std::make_unique<UpdateMessageFunc>(updateGraph, 1,
-                                                        [this](UpdateMessage* msg) -> UpdateMessage* {
-                                                          this->startUpdateBody(*msg);
-                                                          return msg;
-                                                        });
+    [this](UpdateMessage* msg) -> UpdateMessage* {
+      // exceptions should be impossible here
+      this->startUpdateBody(*msg);
+      return msg;
+    });
 
   // next, the node to actually process the update, indexing documents, etc.
   processUpdateNode = std::make_unique<UpdateMessageFunc>(updateGraph, tbb::flow::unlimited,
-                                                          [this](UpdateMessage* msg) -> UpdateMessage* {
-                                                            this->processUpdateBody(*msg);
-                                                            return msg;
-                                                          });
+    [this](UpdateMessage* msg) -> UpdateMessage* {
+      // exceptions handled in processUpdateBody()
+      this->processUpdateBody(*msg);
+      return msg;
+    });
 
   // then make sure that the updates are finished in order so all updates are done before a commit is processed.
   updateSequencerNode = std::make_unique<tbb::flow::sequencer_node<UpdateMessage*>>(updateGraph,
@@ -121,12 +123,13 @@ IndexWriter::IndexWriter(Directory& dir) : dir(dir) {
 
   // updates flow into the updateFinishNode in order which is single threaded and ensures that updates are finished in order.
   updateFinishNode = std::make_unique<UpdateMessageMultiFunc>(updateGraph, 1,
-                                                              [this](UpdateMessage* msg,
-                                                                     UpdateMessageMultiFunc::output_ports_type& op) {
-                                                                unused(op);
-                                                                this->finishUpdateBody(*msg);
-                                                                // std::get<0>(op).try_put(msg);
-                                                              });
+    [this](UpdateMessage* msg,
+    UpdateMessageMultiFunc::output_ports_type& op) {
+      unused(op);
+      // exceptions handled in finishUpdateBody()
+      this->finishUpdateBody(*msg);
+      // std::get<0>(op).try_put(msg);
+    });
 
   // connect the update nodes
   tbb::flow::make_edge(*startUpdateNode, *processUpdateNode);
@@ -135,11 +138,12 @@ IndexWriter::IndexWriter(Directory& dir) : dir(dir) {
 
   // now the commit nodes
   segmentFlushNode = std::make_unique<InverterMultiFunc>(updateGraph, tbb::flow::unlimited,
-                                                         [this](Inverter* inverter,
-                                                                InverterMultiFunc::output_ports_type& op) {
-                                                           unused(op);
-                                                           this->segmentFlushBody(*inverter);
-                                                         });
+    [this](Inverter* inverter,
+    InverterMultiFunc::output_ports_type& op) {
+      unused(op);
+      // TODO: handle exceptions
+      this->segmentFlushBody(*inverter);
+    });
 
   commitSequencerNode = std::make_unique<tbb::flow::sequencer_node<UpdateMessage*>>(updateGraph,
     [](UpdateMessage* msg) -> size_t {
@@ -149,25 +153,48 @@ IndexWriter::IndexWriter(Directory& dir) : dir(dir) {
 
   // must be single-threaded
   commitFinishNode = std::make_unique<UpdateMessageMultiFunc>(updateGraph, 1,
-                                                              [this](UpdateMessage* msg,
-                                                                     UpdateMessageMultiFunc::output_ports_type& op) {
-                                                                unused(op);
-                                                                this->finishCommitBody(*msg);
-                                                                // std::get<0>(op).try_put(msg);
-                                                              });
+    [this](UpdateMessage* msg,
+    UpdateMessageMultiFunc::output_ports_type& op) {
+      unused(op);
+      try {
+        this->finishCommitBody(*msg);
+      }
+      catch (std::exception& e) {
+        LOG_ERROR("finishCommitBody Exception Caught: exception={}",
+          e.what());
+        try {
+          msg->result.setException(e);
+          msg->done(*this);
+        }
+        catch (std::exception& e2) {
+          LOG_ERROR("finishCommitBody Exception Caught in error handling cleanup done: exception={}",
+            e2.what());
+          // we can't do much here, just log it.
+        }
+      }
+    });
 
   tbb::flow::make_edge(*commitSequencerNode, *commitFinishNode);
 
   // must be single-threaded
   mergeSegmentsNode = std::make_unique<MergeMessageMultiFunc>(updateGraph, 1,
-                                                              [this](MergeMessage* msg,
-                                                                     MergeMessageMultiFunc::output_ports_type& op) {
-                                                                unused(op);
-                                                                INDEX_DEBUG(
-                                                                  "mergeSegmentsNode: msg={}", (void*)&msg,
-                                                                  msg->commitNum);
-                                                                this->mergeSegmentsBody(*msg);
-                                                              });
+    [this](MergeMessage* msg,
+    MergeMessageMultiFunc::output_ports_type& op) {
+      unused(op);
+      INDEX_DEBUG("mergeSegmentsNode: msg={}", (void*)&msg,  msg->commitNum);
+      try {
+        this->mergeSegmentsBody(*msg);
+      } catch (std::exception& e) {
+        LOG_ERROR("mergeSegmentsNode Exception Caught: exception={}", e.what());
+        try {
+          msg->result.setException(e);
+          msg->done(*this);  // TODO: could exception have happened after commit was requested (and hence I shouldn't call done here?)
+        } catch (std::exception& e2) {
+          LOG_ERROR("mergeSegmentsNode Exception Caught in error handling cleanup done: exception={}", e2.what());
+          // we can't do much here, just log it.
+        }
+      }
+    });
 }
 
 IndexWriter::~IndexWriter() {
@@ -270,10 +297,12 @@ void IndexWriter::commit(UpdateMessage::CommitType commitType) {
   BlockingUpdateMessage updateMessage;
   updateMessage.commit = commitType;
 
+  INDEX_DEBUG("SYNC_COMMIT_START: msg={}", (void*)&updateMessage);
   bool success = submitUpdate(&updateMessage);
   assert(success);
 
   updateMessage.blocker.wait();
+  INDEX_DEBUG("SYNC_COMMIT_END: msg={}", (void*)&updateMessage);
 }
 
 
@@ -460,6 +489,7 @@ void IndexWriter::finishCommitBody(UpdateMessage& msg) {
 
   std::vector<SegInfo*> segs;
   std::vector<SegInfo*> segsToApplyDeletes;
+  // std::vector<std::shared_ptr<MultiDeletesData>> personalDeletes;
 
   {
     const std::lock_guard<std::mutex> lock(indexMutex);
@@ -483,6 +513,7 @@ void IndexWriter::finishCommitBody(UpdateMessage& msg) {
   }
 
   // If a segmentMerge kicks off here, it could be merging segments without deletes applied yet.
+  // We check for that after we finish applying deletes.
 
   CommitInfo& commitInfo = *msg.commitInfo;
   if (segsToApplyDeletes.empty()) {
@@ -494,6 +525,9 @@ void IndexWriter::finishCommitBody(UpdateMessage& msg) {
     // This is where seg.liveGen can change!
     // TODO: parallelize this.
     for (auto seg : segsToApplyDeletes) {
+      // Can personal deletes be mutated elsewhere?
+      // mergeSegmentsBody can add personalDeletes to a *new* segment, but it does it under the indexMutex lock,
+      // so we will either see the new segment with its personal deletes, or not see the segment at all.
       applyDeletes(*seg, commitInfo.multiDeletesData);
     }
   }
@@ -616,7 +650,6 @@ void IndexWriter::finishCommitBody(UpdateMessage& msg) {
   // Check if any of the segments are now empty and remove them from the list.
   std::vector<SegInfo*> segsToKeep;
   std::vector<SegInfo*> toDelete;
-  segs.reserve(segs.size());
   {
     const std::lock_guard<std::mutex> lock(indexMutex);
     for (auto& seg : segs) {
@@ -660,34 +693,37 @@ void IndexWriter::finishCommitBody(UpdateMessage& msg) {
 // Segments that are being merged will not be deleted.
 // Segments that are in the last commit will not be deleted.
 void IndexWriter::tryDeleteSegments() {
-  // Delete segment files only after the IndexInfo file is written.
-  // Do not delete any segments that are being merged.
-  std::vector<std::unique_ptr<SegInfo>> localDeleteList;
-  localDeleteList.reserve(segmentsToDelete.size());
-  {
-    const std::lock_guard<std::mutex> lock(indexMutex);
-    auto lastCommit = lastCommitTime.load(std::memory_order::relaxed);
-    // grab all segments and put back ones we shouldn't delete yet.
-    std::swap(localDeleteList, segmentsToDelete);
-    for (auto& seg : localDeleteList) {
-      // NOTE! we can observe seg->commitTime > lastCommit because the segments file
-      // may be in the process of being written out, and lastCommitTime is only
-      // updated *after* the IndexInfo file is written.
-      // commitTime==1 means it's about to be committed (don't want try-delete call from segment merger to delete it).
-      if (seg->merging || seg->commitTime >= lastCommit || seg->commitTime == 1) {
-        segmentsToDelete.push_back(std::move(seg)); // keep it in the list, we can't delete it yet.
+  try {
+    // Delete segment files only after the IndexInfo file is written.
+    // Do not delete any segments that are being merged.
+    std::vector<std::unique_ptr<SegInfo>> localDeleteList;
+    {
+      const std::lock_guard<std::mutex> lock(indexMutex);
+      auto lastCommit = lastCommitTime.load(std::memory_order::relaxed);
+      // grab all segments and put back ones we shouldn't delete yet.
+      std::swap(localDeleteList, segmentsToDelete);
+      for (auto& seg : localDeleteList) {
+        // NOTE! we can observe seg->commitTime > lastCommit because the segments file
+        // may be in the process of being written out, and lastCommitTime is only
+        // updated *after* the IndexInfo file is written.
+        // commitTime==1 means it's about to be committed (don't want try-delete call from segment merger to delete it).
+        if (seg->merging || seg->commitTime >= lastCommit || seg->commitTime == 1) {
+          segmentsToDelete.push_back(std::move(seg)); // keep it in the list, we can't delete it yet.
+        }
       }
     }
-  }
 
-  // Now delete the segments outside of the mutex.
-  // In the future, if we wanted to support windows, we need a background deleter to
-  // retry deletes after some time in case they are still open.
-  for (auto& seg : localDeleteList) {
-    if (!seg) continue; // skip null segments
-    INDEX_DEBUG("Deleting files {}", *seg);
-    dir.deletePrefix(Postings::getIndexFileNamePrefix(seg->segId));
-    seg.reset(); // deletes the in-memory segment info
+    // Now delete the segments outside of the mutex.
+    // In the future, if we wanted to support windows, we need a background deleter to
+    // retry deletes after some time in case they are still open.
+    for (auto& seg : localDeleteList) {
+      if (!seg) continue; // skip null segments
+      INDEX_DEBUG("Deleting files {}", *seg);
+      dir.deletePrefix(Postings::getIndexFileNamePrefix(seg->segId));
+      seg.reset(); // deletes the in-memory segment info
+    }
+  } catch (std::exception& e) {
+    LOG_ERROR("Exception caught while deleting segments: {}", e.what());
   }
 }
 

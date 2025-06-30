@@ -14,7 +14,9 @@ void SearchEngine::submitBody(SearchRequest& req) {
   calc->calc(req.tg, -1, nullptr);
 
   if (req.tg) {
+    LOG_TRACE("SearchRequest: waiting for task group to finish for req={}", (void*)&req);
     req.tg->wait();
+    LOG_TRACE("SearchRequest: DONE! will call reply next. req={}", (void*)&req);
   }
 
   // TODO: error handling here?
@@ -34,7 +36,6 @@ void SearchEngine::submit(SearchRequest& req, bool parallel) {
     submitBody(req);
   } catch (std::exception& e) {
     LOG_ERROR("Unexpected exception: {}", e.what());
-    LOG_ERROR("Stack trace:\n{}", solux::getStackTrace());
   }
 }
 

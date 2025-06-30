@@ -105,6 +105,7 @@ public:
           result->updateVersion = updateVersion;
           result->success = !ProtoUpdateMessage::result.errored();
         }
+        INDEX_TRACE("SYNC_INDEX_NOTIFY: msg={}", (void*)this);
         blocker.notify();
       }
     };
@@ -124,12 +125,14 @@ public:
     // Create and submit the update message
     IndexResult result;
     BlockingProtoUpdateMessage updateMessage(request, &result);
-    
+
+    INDEX_TRACE("SYNC_INDEX_START: msg={}", (void*)&updateMessage);
     bool success = writer->submitUpdate(&updateMessage);
     assert(success);
     unused(success);
 
     updateMessage.blocker.wait();
+    INDEX_TRACE("SYNC_INDEX_END: msg={}", (void*)&updateMessage);
     return result;
   }
 
@@ -151,6 +154,7 @@ public:
           result->updateVersion = updateVersion;
           result->success = !ProtoUpdateMessage::result.errored();
         }
+        INDEX_TRACE("SYNC_DELETEBYID_NOTIFY: msg={}", (void*)this);
         blocker.notify();
       }
     };
@@ -169,12 +173,15 @@ public:
     // Create and submit the update message
     IndexResult result;
     BlockingProtoUpdateMessage updateMessage(request, &result);
-    
+
+    INDEX_TRACE("SYNC_DELETEBYID_START: msg={}", (void*)&updateMessage);
+
     bool success = writer->submitUpdate(&updateMessage);
     assert(success);
     unused(success);
 
     updateMessage.blocker.wait();
+    INDEX_TRACE("SYNC_DELETEBYID_END: msg={}", (void*)&updateMessage);
     return result;
   }
 

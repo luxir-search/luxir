@@ -7,6 +7,9 @@
 
 // This file is only included in IndexWriter.cpp
 
+#define MERGER_DEBUG LOG_TRACE
+// #define MERGER_DEBUG LOG_DEBUG
+
 namespace solux {
 
 class SegmentMerger {
@@ -74,7 +77,7 @@ public:
       auto preader = preaders[i];
       auto segLiveDocs = liveDocs[i];
       
-      LOG_INFO("SegmentMerger: segment {}, maxDoc={}, liveDocs={}",
+      MERGER_DEBUG("SegmentMerger: segment {}, maxDoc={}, liveDocs={}",
                i, preader->maxDoc(), segLiveDocs ? segLiveDocs->numLive() : preader->maxDoc());
       
       fieldReaders.emplace_back(pool, *preader);
@@ -86,7 +89,7 @@ public:
         int32_t numLive = segLiveDocs ? segLiveDocs->numLive() : preader->maxDoc();
         
         segs.emplace_back(preader, &fieldReader, numLive, totalLive, (int)segs.size());
-        LOG_INFO("SegmentMerger: added segment to merge, base={}, numLive={}", totalLive, numLive);
+        MERGER_DEBUG("SegmentMerger: added segment to merge, base={}, numLive={}", totalLive, numLive);
         totalLive += numLive; // Count only live documents for base offset
       } else {
         LOG_ERROR("Empty fieldReader!");
@@ -95,7 +98,7 @@ public:
     // Set maxDoc to total number of live documents
     postingsWriter.setMaxDoc(totalLive);
 
-    LOG_INFO("SegmentMerger: total live docs to merge: {}", totalLive);
+    MERGER_DEBUG("SegmentMerger: total live docs to merge: {}", totalLive);
 
     // Now build the docId maps based on liveDocs, then release the liveDocs.
     for (size_t i = 0; i < segs.size(); i++) {

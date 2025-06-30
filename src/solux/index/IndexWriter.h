@@ -16,8 +16,8 @@ namespace solux {
 
 #define INDEX_TRACE LOG_TRACE
 // redefine DEBUG to TRACE level which shouldn't currently be logged!
-// #define INDEX_DEBUG LOG_TRACE
-#define INDEX_DEBUG LOG_DEBUG
+#define INDEX_DEBUG LOG_TRACE
+// #define INDEX_DEBUG LOG_DEBUG
 
 // this is currently outside of the IW class just so we can format it in loggin.
   class SegInfo {
@@ -49,7 +49,8 @@ namespace solux {
     // where deletes are applied.  This is a shared_ptr because multiple merges may have been done that need to
     // apply deletes.  We don't really need the thread safety of shared_ptr, could switch to boost::intrusive_ptr
     // for straight ref counting.
-    std::vector<std::shared_ptr<MultiDeletesData>> personalDeletes;
+    using PersonalDeletes = std::vector<std::shared_ptr<MultiDeletesData>>;
+    PersonalDeletes personalDeletes;
 
     SegInfo(uint64_t segId, int nDocs) : segId(segId), maxDoc(nDocs), liveDocs(nDocs) {}
 
@@ -353,16 +354,27 @@ private:
     try {
       msg.handle(*this);
     } catch (std::exception& e) {
-      INDEX_DEBUG("processUpdateBody Exception Caught: exception={}", (void*)&msg, e.what());
+      LOG_ERROR("processUpdateBody Exception Caught: exception={}", (void*)&msg, e.what());
       msg.result.setException(e);
+      // message should continue flowing to finishUpdateBody so the sequencers stay happy.
     }
   }
 
   void finishUpdateBody(UpdateMessage& msg) {
     INDEX_DEBUG("finishUpdateBody: msg={}", (void*)&msg);
+    bool doneWithMessage = true;
     if (msg.commit != UpdateMessage::NO_COMMIT) {
-      initiateCommit(msg);
-    } else {
+      doneWithMessage = false;
+      try {
+        initiateCommit(msg);
+      } catch (std::exception& e) {
+        LOG_ERROR("finishUpdateBody Exception Caught: exception={}", (void*)&msg, e.what());
+        msg.result.setException(e);
+        doneWithMessage = true;
+      }
+    }
+
+    if (doneWithMessage) {
       msg.done(*this);
     }
   }

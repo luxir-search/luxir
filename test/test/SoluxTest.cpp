@@ -160,7 +160,7 @@ int main(int argc, char **argv) {
   testing::AddGlobalTestEnvironment(new solux::SoluxEnvironment());
 
   int ret = 0;
-  solux::GRPCServer server;
+  solux::GRPCServer server;  // TODO: make number of threads configurable via command line args
   solux::SoluxTest::soluxNode = &server.getSoluxNode();
 
   // TODO: pull this out and only do it on demand if the specific test needs it?
