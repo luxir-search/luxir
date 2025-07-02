@@ -177,13 +177,13 @@ TEST_F(MemPoolTest, alloc) {
 
 TEST_F(MemPoolTest, rewind) {
   MemPool pool;
-  ASSERT_EQ(pool.size(), 0);
+  auto sz = pool.size();
   pool.alloc(3);
-  ASSERT_EQ(pool.size(), 3);
+  ASSERT_EQ(pool.size(), sz+3);
   char* a = pool.alloc(2);
   unused(a);
   auto savePoint = pool.getSavePoint();
-  auto sz = pool.size();
+  sz = pool.size();
   char* b = pool.alloc(3);
   *b = 'b';
   char* c = pool.alloc(4);
@@ -264,10 +264,10 @@ TEST_F(MemPoolTest, randRewind) {
     }
     int nallocs = rng.rint(6);
     for (int i=0; i<nallocs; i++) {
-      int allocSz = rng.rint(1, MemPool::BYTE_BLOCK_SIZE);
+      int allocSz = rng.rint(1, MemPool::BYTE_BLOCK_SIZE - MemPool::HEADER_SIZE);
       char* x = pool.alloc(allocSz);
       x[0] = 'A';  // touch beginning and end
-      x[allocSz-1] = 'A';
+      x[allocSz-1] = 'B';
     }
   }
 }
@@ -276,7 +276,7 @@ TEST_F(MemPoolTest, randRewind) {
 // test page boundary conditions efficiently using rewind
 TEST_F(MemPoolTest, boundary) {
   MemPool pool;
-  size_t sz = MemPool::BYTE_BLOCK_SIZE;
+  size_t sz = MemPool::STATIC_BUFFER_SIZE - MemPool::HEADER_SIZE;  // size of a single block minus the header
   char* a = pool.alloc(1);
   unused(a);
   auto savePoint = pool.getSavePoint();

@@ -164,17 +164,17 @@ static void BM_AllocSmall_std(benchmark::State& state) {
 
 static void BM_AllocSmall_std_mono(benchmark::State& state) {
   // benchAlloc<std::pmr::monotonic_buffer_resource>(state);
-  benchAlloc<pmr_resource<32768,1>>(state);  // test monotonic_buffer_resource with same starting size as MemPool
+  benchAlloc<pmr_resource<MemPool::STATIC_BUFFER_SIZE,1>>(state);  // test monotonic_buffer_resource with same starting size as MemPool
 }
 
 static void BM_AllocSmall_MemPool(benchmark::State& state) {
   benchAlloc<MemPool>(state);
 }
 static void BM_AllocSmall_Arena(benchmark::State& state) {
-  benchAlloc<arena_resource<32768,1>>(state);
+  benchAlloc<arena_resource<MemPool::STATIC_BUFFER_SIZE,1>>(state);
 }
 static void BM_AllocSmall_ArenaPreAlloc(benchmark::State& state) {
-  benchAlloc<arena_resource<32768,1,32768>>(state);
+  benchAlloc<arena_resource<MemPool::STATIC_BUFFER_SIZE,1,MemPool::STATIC_BUFFER_SIZE>>(state);
 }
 
 

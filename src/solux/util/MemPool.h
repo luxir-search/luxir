@@ -144,9 +144,11 @@ public:
   static constexpr char SCRIBBLE_CHAR = 'Z';
 
 // TODO - make a lot of this stuff private
+  static constexpr int STATIC_BUFFER_SIZE = 256; // number of bytes allocated with this pool before using heap
   static constexpr int BYTE_BLOCK_SHIFT = 15;
   static constexpr int BYTE_BLOCK_SIZE = 1 << BYTE_BLOCK_SHIFT;
   static constexpr int BYTE_BLOCK_MASK = BYTE_BLOCK_SIZE - 1;
+  static constexpr int HEADER_SIZE = sizeof(int32_t); // size of the header at the beginning of each buffer
 
   // todo - try unique_ptr here and see if it slows anything down
   std::vector<char *> buffers;
@@ -156,10 +158,14 @@ public:
   int bufferIdx = -1;                        // which buffer we are in
 
   /** Where we are in head buffer */
-  int pos = BYTE_BLOCK_SIZE;
+  int pos;
 
   /** Current head buffer */
-  char *buffer = nullptr;
+  char *buffer;
+
+  char staticBuffer[STATIC_BUFFER_SIZE];  // static buffer for small pools
+
+  size_t allocSize = 0;  // sum of all allocations in the pool
 
   template <typename T, typename... Args>
   u_ptr<T> make_unique(Args&&... args) {
@@ -229,10 +235,25 @@ public:
 
   MemPool &operator=(const MemPool &) = delete;
 
-  MemPool();
+  MemPool() {
+    initNewBuffer(staticBuffer, STATIC_BUFFER_SIZE);
+  }
 
   ~MemPool();
 
+  void initNewBuffer(char* newBuffer, int32_t size) {
+    buffers.push_back(newBuffer);
+    bufferIdx++;
+    assert((size_t)bufferIdx == buffers.size() - 1);
+    *(int32_t*)newBuffer = size;
+    buffer = newBuffer;
+    pos = HEADER_SIZE;  // start after the header
+    allocSize += size;
+  }
+
+  uint32_t bufferSize(const char* buf) const {
+    return *(int32_t *)buf;
+  }
 
   // TODO: avoid using ptr() directly since it won't work when switching to malloc
   char *ptr() { return buffer + pos; }
@@ -245,7 +266,7 @@ public:
 #endif
   }
 
-  int bbAddress() {
+  uint32_t bbAddress() {
 #ifndef MEMPOOL_MALLOC
     return (bufferIdx << BYTE_BLOCK_SHIFT) | pos;
 #else
@@ -253,17 +274,17 @@ public:
 #endif
   }
 
-  int size() {
+  size_t size() {
 #ifndef MEMPOOL_MALLOC
-    return bufferIdx * BYTE_BLOCK_SIZE + pos;
+    return allocSize - bufferSize(buffer) + pos;
 #else
     return allocated;
 #endif
   }
 
-  int capacity() {
+  size_t capacity() {
 #ifndef MEMPOOL_MALLOC
-    return buffers.size() * BYTE_BLOCK_SIZE;
+    return allocSize;
 #else
     return size();
 #endif
@@ -274,9 +295,9 @@ public:
   int reserveBBP(uint32_t size) {
     assert(size <= BYTE_BLOCK_SIZE);
     auto newEnd = pos + size;
-    if (newEnd > BYTE_BLOCK_SIZE) {
+    if (newEnd > bufferSize(buffer)) {
       nextBuffer();
-      newEnd = size;
+      newEnd = size + HEADER_SIZE;  // reserve space for the header
     }
     return newEnd;
   }
@@ -312,7 +333,7 @@ public:
 
   char *alloc(size_t size, size_t alignment) {
 #ifndef MEMPOOL_MALLOC
-    align(alignment);
+    align(alignment);  // TODO: align the actual pointer!
     int newEnd = reserveBBP(size);
     auto p = ptr();
     pos = newEnd;
@@ -377,7 +398,7 @@ public:
   /// 0 may be better if one has many pools.
   void rewind(const save_point &savePoint, uint32_t buffersToSave = 1) {
 #ifndef MEMPOOL_MALLOC
-    if (savePoint >= buffer && savePoint <= buffer + BYTE_BLOCK_SIZE) {
+    if (savePoint >= buffer && savePoint <= buffer + bufferSize(buffer)) {
       // fast path: same buffer
       assert(scribble(savePoint, ptr() - savePoint));  // scribble from the save point to the current point
       // if sp==buffer+pos, then pos=sp-buffer to restore.
@@ -444,7 +465,7 @@ public:
 
   // Checks that any thread-local pools are empty.
   static bool sanityCheck() {
-    if (pool && pool->size() > 0) {
+    if (pool && pool->size() > MemPool::HEADER_SIZE) {
       LOG_ERROR("Thread-local pool not empty! size={}", pool->size());
       pool.reset();  // just delete the pool so we don't leak memory
       return false;
