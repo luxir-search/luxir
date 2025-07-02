@@ -90,7 +90,7 @@ public:
     std::vector<std::unique_ptr<Calculator>> subCalcs;
 
     void calc(oneapi::tbb::task_group* tg, int32_t segnum, solux::DocSet* domain) override {
-      tg->run([this, tg, segnum, domain]() {
+      task_group_run(tg, [this, tg, segnum, domain]() {
         doCalc(tg, segnum, domain);
       });
     }
