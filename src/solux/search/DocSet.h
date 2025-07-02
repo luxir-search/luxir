@@ -29,6 +29,8 @@ public:
     card_ = card;
   }
 
+  virtual bool get(int32_t docid) const = 0; // returns true if the docid is in the set
+
   virtual ~DocSet() = default;
 };
 
@@ -38,6 +40,10 @@ public:
   TrueDocSet(int32_t size) {
     card_ = size; // all docs are present
   }
+
+  bool get(int32_t docid) const override {
+    return true; // all docs are present
+  };
 };
 
 
@@ -55,7 +61,7 @@ public:
     card_ = card;
   }
 
-  bool get(int32_t docid) const {
+  bool get(int32_t docid) const override {
     return bits_.get(docid);
   }
 
