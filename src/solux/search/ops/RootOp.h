@@ -14,7 +14,7 @@ public:
   class Calc final : public SearchOp::Calculator {
     std::vector<std::unique_ptr<Calculator>> subCalcs;
   public:
-    Calc(RootOp& op, SearchOp::Calculator* parent) : SearchOp::Calculator(op, parent) {}
+    Calc(RootOp& op, SearchOp::Calculator* parent, int64_t slot, int64_t numSlots) : SearchOp::Calculator(op, parent, slot, numSlots) {}
 
     solux::proto::Val* getTargetForSub(solux::proto::SearchResponse* searchResponse, Calculator* sub) override {
       searchResponse = searchResponse ? searchResponse : &op.req.lastResponse->proto;
@@ -53,8 +53,8 @@ public:
     }
   };
 
-  Calculator* createCalculator(Calculator* parent, int64_t slot = -1) override {
-    return new Calc(*this, nullptr);
+  Calculator* createCalculator(Calculator* parent, int64_t slot = -1, int64_t numSlots = -1) override {
+    return new Calc(*this, nullptr, slot, numSlots);
   }
 
 };

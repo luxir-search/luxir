@@ -32,7 +32,7 @@ public:
       return &(*ourVal->mutable_docs()->mutable_ops())[sub->getOp().name];
     }
 
-    Calc(TopDocsReq& op, Calculator* parent) : SearchOp::Calculator(op, parent), collectorMerger(nullptr, nullptr) {
+    Calc(TopDocsReq& op, Calculator* parent) : SearchOp::Calculator(op, parent, slot, numSlots), collectorMerger(nullptr, nullptr) {
 
       collectorMerger.creator = [&op]() {
         return new MergeableCollector(op.topCount);
@@ -195,7 +195,7 @@ public:
     weight = query->createWeight(qcontext);
   }
 
-  Calculator* createCalculator(Calculator* parent, int64_t slot = -1) override {
+  Calculator* createCalculator(Calculator* parent, int64_t slot = -1, int64_t numSlots = -1) override {
     return new Calc(*this, parent);
   }
 

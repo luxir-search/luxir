@@ -25,8 +25,8 @@ public:
   class Calc : public Calculator {
     AtomicMerger<MergeableSum> sumMerger;
   public:
-    Calc(SearchOp& op, Calculator* parent)
-      : Calculator(op, parent) {
+    Calc(SearchOp& op, Calculator* parent, int64_t slot, int64_t numSlots)
+      : Calculator(op, parent, slot, numSlots) {
     }
     AvgOp& thisOp() {
       return (AvgOp&)getOp();
@@ -88,14 +88,23 @@ public:
         auto sum = mergeableData->sum;
         auto count = mergeableData->count;
         double avg = (double) sum / (double) count;
-        myVal->set_d(avg);
+        if (slot == -1) {
+          myVal->set_d(avg);
+        } else {
+          // TODO: this is not thread safe
+          auto& arr = *myVal->mutable_arr_d();
+          if (arr.v_size() == 0) {
+            arr.mutable_v()->Resize(numSlots, 0.0);
+          }
+          arr.set_v(slot, avg);
+        }
       }
     }
 
   };
 
-  Calculator* createCalculator(Calculator* parent, int64_t slot) override {
-    return new Calc(*this, parent);
+  Calculator* createCalculator(Calculator* parent, int64_t slot, int64_t numSlots = -1) override {
+    return new Calc(*this, parent, slot, numSlots);
   };
 
 };

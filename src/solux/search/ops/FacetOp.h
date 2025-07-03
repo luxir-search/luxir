@@ -132,7 +132,7 @@ public:
   class Calc : public Calculator {
     AtomicMerger<MergeableIntFacet> countMerger;
   public:
-    Calc(SearchOp& op, Calculator* parent) : Calculator(op, parent){}
+    Calc(SearchOp& op, Calculator* parent, int64_t slot, int64_t numSlots) : Calculator(op, parent, slot, numSlots){}
     IntFacetReq& thisOp() {
       return (IntFacetReq&)getOp();
     }
@@ -200,8 +200,8 @@ solux::proto::Val* getTargetForSub(solux::proto::SearchResponse* searchResponse,
     }
   };
 
-  Calculator* createCalculator(Calculator* parent, int64_t slot) override {
-    return new Calc(*this, parent);
+  Calculator* createCalculator(Calculator* parent, int64_t slot, int64_t numSlots = -1) override {
+    return new Calc(*this, parent, slot, numSlots);
   };
 
 
@@ -233,17 +233,28 @@ public:
   IntFacetBaseReq(req, fieldName, facetName, limit, minCount, missing){}
 
   class Calc : public Calculator {
+    std::vector<DocSet*> input;
     AtomicMerger<MergeableStrFacet> countMerger;
   public:
-    Calc(SearchOp& op, Calculator* parent) : Calculator(op, parent){}
+    Calc(SearchOp& op, Calculator* parent, int64_t slot, int64_t numSlots) : Calculator(op, parent, slot, numSlots) {
+      input.resize(op.req.reader->segments().size());
+    }
     StrFacetReq& thisOp() {
       return (StrFacetReq&)getOp();
     }
 
     solux::proto::Val* getTargetForSub(solux::proto::SearchResponse* searchResponse, Calculator* sub) override {
-      return nullptr;
+      auto* ourVal = parent->getTargetForSub(searchResponse, this);
+      // the Val should either be unset, or have a DocList
+      assert(
+        ourVal != nullptr && (ourVal->kind_case() == solux::proto::Val::kFacet
+          || ourVal->kind_case() == solux::proto::Val::KIND_NOT_SET));
+      return &(*ourVal->mutable_facet()->mutable_ops())[sub->getOp().name];
+      //TODO: need to account for slot somehow,  or will subop do that?
     };
     void calc(oneapi::tbb::task_group* tg, int32_t segnum, DocSet* domain) override {
+      //write only to different slots, so no need to synchronize
+      input[segnum] = domain;
       SegFieldInfo segFieldInfo;
       boost::unordered_flat_map<int64_t, int64_t> count;
       int64_t missing_num = 0;
@@ -276,18 +287,18 @@ public:
       }
       auto merged = countMerger.release(mergeableData.release());
       if (merged == thisOp().reader.segments().size()) {
-        facetResult();
+        facetResult(tg);
       }
     };
 
-    void facetResult() {
+    void facetResult(oneapi::tbb::task_group* tg) {
       auto* myVal = getTarget(nullptr);
       solux::proto::FacetResult& facetResultProto = *myVal->mutable_facet();
       auto minCount = thisOp().minCount;
       auto limit = thisOp().limit;
       auto missing = thisOp().missing;
 
-      auto* mergedData = countMerger.obtain();
+      std::unique_ptr<MergeableStrFacet> mergedData(countMerger.obtain());
       auto& counts = mergedData->counts;
 
       std::vector<std::pair<std::string, int64_t>> countVec;
@@ -297,7 +308,6 @@ public:
         }
       }
       auto missing_count = mergedData->missing_num;
-      delete mergedData;
       std::sort(countVec.begin(), countVec.end(), [](auto& a, auto& b) {
         if (a.second != b.second ) {
           return a.second > b.second;
@@ -323,14 +333,56 @@ public:
         facetResultProto.set_missing(missing_count);
       }
 
-
-    }
+      if (thisOp().subOps.empty()) {
+        return; // no sub ops, nothing to do.
+      }
+      for (auto [val, count] : countVec) {
+        std::vector<std::unique_ptr<SearchOp::Calculator>> calculators;
+        calculators.reserve(thisOp().subOps.size());
+        for (auto& [name, subOp] : thisOp().subOps) {
+          auto* subCalc = subOp->createCalculator(this, -1);
+          calculators.emplace_back(subCalc);
+        }
+        for (size_t segnum = 0; segnum < input.size(); segnum++) {
+          SegFieldInfo segFieldInfo;
+          auto& postingsReader = thisOp().reader.segments()[segnum].postingsReader();
+          int32_t maxDoc = postingsReader.maxDoc();
+          auto poolGuard = MemPool::threadLocalPoolGuard();
+          FieldReader fieldReader(poolGuard.pool(), postingsReader);
+          bool found = fieldReader.seek(thisOp().fieldName);
+          if (!found) {
+            continue;
+          }
+          RAMBitDocSet output(maxDoc);
+          fieldReader.readFieldInfo(segFieldInfo);
+          TermsEnum tenum(poolGuard.pool(), postingsReader, segFieldInfo);
+          if (!tenum.seek(val)) {
+            continue;
+          }
+          DocsEnum denum(poolGuard.pool(), postingsReader, tenum);
+          while (true) {
+            auto doc = denum.nextDoc();
+            if (doc == DocsEnum::END) {
+              break; // no more docs for this term
+            }
+            if (!input[segnum]->get(doc)) {
+              continue; // this doc is not in the domain
+            }
+            output.mutableBits().set(doc);
+          }
+          for (auto& subCalc : calculators) {
+            //subCalc->calc(tg, segnum, &output);
+            // no support for subcalcs launching tasks yet
+            subCalc->calc(nullptr, segnum, &output);
+          }
+        }
+      }
+    };
   };
-  Calculator* createCalculator(Calculator* parent, int64_t slot) override {
-    return new Calc(*this, parent);
-  };
+  Calculator* createCalculator(Calculator* parent, int64_t slot, int64_t numSlots) override {
+    return new Calc(*this, parent, slot, numSlots);
+  }
 };
-
 class FullTextFacetReq : public FacetReq {
   class MergeableStrFacet : public MergeableData {
   public:
@@ -359,7 +411,7 @@ public:
   class Calc : public Calculator {
     AtomicMerger<MergeableStrFacet> countMerger;
   public:
-    Calc(SearchOp& op, Calculator* parent) : Calculator(op, parent){}
+    Calc(SearchOp& op, Calculator* parent, int64_t slot, int64_t numSlots) : Calculator(op, parent, slot, numSlots){}
     StrFacetReq& thisOp() {
       return (StrFacetReq&)getOp();
     }
@@ -459,8 +511,8 @@ public:
 
 
     };
-  Calculator* createCalculator(Calculator* parent, int64_t slot) override {
-    return new Calc(*this, parent);
+  Calculator* createCalculator(Calculator* parent, int64_t slot, int64_t numSlots = -1) override {
+    return new Calc(*this, parent, slot, numSlots);
   }
 };
 
@@ -477,7 +529,7 @@ public:
   class Calc : public Calculator {
     AtomicMerger<IntFacetReq::MergeableIntFacet> countMerger;
   public:
-    Calc(SearchOp& op, Calculator* parent) : Calculator(op, parent){}
+    Calc(SearchOp& op, Calculator* parent, int64_t slot, int64_t numSlots) : Calculator(op, parent, slot, numSlots){}
     IntFacetRangeReq& thisOp() {
       return (IntFacetRangeReq&)getOp();
     }
@@ -553,8 +605,8 @@ public:
 
     }
   };
-  Calculator* createCalculator(Calculator* parent, int64_t slot) override {
-    return new Calc(*this, parent);
+  Calculator* createCalculator(Calculator* parent, int64_t slot, int64_t numSlots = -1) override {
+    return new Calc(*this, parent, slot, numSlots);
   };
 };
 

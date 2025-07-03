@@ -20,7 +20,7 @@ public:
   }
 
   class Calculator;
-  virtual Calculator* createCalculator(Calculator* parent, int64_t slot = -1) = 0;
+  virtual Calculator* createCalculator(Calculator* parent, int64_t slot = -1, int64_t numSlots = -1) = 0;
 
   virtual ~SearchOp() = default;
 
@@ -29,10 +29,11 @@ public:
     SearchOp& op;
     Calculator* parent;
     int64_t slot; // the slot this calculator is for, or -1 if not applicable
+    int64_t numSlots;
 
 
   public:
-    Calculator(SearchOp& op, Calculator* parent) : op(op), parent(parent) {}
+    Calculator(SearchOp& op, Calculator* parent, int64_t slot, int64_t numSlots) : op(op), parent(parent), slot(slot), numSlots(numSlots) {}
 
     // Return the target Val for this calculator.
     // If searchResponse is not null, then the subOp wants the path created in the given searchResponse.

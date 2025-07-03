@@ -61,6 +61,12 @@ TEST_F(SearchEngineTest, basic) {
     facet3.set_missing(true); // include missing values in the facet
     auto& facet4 = *ops["f4"].mutable_field_facet();
     facet4.set_field("color_s");
+    {
+      auto& subOps = *facet4.mutable_ops();
+      auto& subAvg = *subOps["avg"].mutable_gen_op();
+      subAvg.set_name("avg");
+      subAvg.mutable_args()->Add()->set_s("foo_i");
+    }
     auto& facet5 = *ops["f5"].mutable_field_facet();
     facet5.set_field("colors_ss");
     auto& facet6 = *ops["f6"].mutable_field_facet();
@@ -81,7 +87,7 @@ TEST_F(SearchEngineTest, basic) {
     avg.mutable_args()->Add()->set_s("foo_i");
 
     lreq->engine.submit(*lreq, para);
-    // LOG_DEBUG("ENGINE REQ: {}", lreq->toString());
+    LOG_DEBUG("ENGINE REQ: {}", lreq->toString());
 
     ASSERT_EQ(lreq->proto.request_id(), lreq->responses[0]->proto.request_id());
     auto& docs = lreq->responses[0]->proto.ops().at("q").docs();
