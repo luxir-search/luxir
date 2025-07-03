@@ -8,31 +8,58 @@ thread_local std::unique_ptr<MemPool> MemPool::pool;
 MemPool::~MemPool() {
   for (auto i = 1u; i<buffers.size(); i++) {
     char* buf = buffers[i];
-    if (i <= bufferIdx) {
+#ifndef NDEBUG
+    if (i <= (size_t)bufferIdx) {
       allocSize -= bufferSize(buf);
     }
+#endif
     assert(scribble(buf, bufferSize(buf)));
     delete[] buf;
   }
   assert(allocSize == STATIC_BUFFER_SIZE);
 }
 
-void MemPool::nextBuffer() {
+void MemPool::nextBuffer(size_t sz) {
+  auto currSize = bufferSize(buffer);
+  auto nextSize = std::min(currSize * 2, BYTE_BLOCK_SIZE);  // double the size of the next buffer
+  if (sz > nextSize) {
+    nextSize = std::bit_ceil(sz + HEADER_SIZE);  // round up to the next block size
+  }
+
   if ((uint32_t)bufferIdx + 1 < buffers.size()) {
-    // reuse previously allocated block
     bufferIdx++;
     buffer = buffers[bufferIdx];
     pos = HEADER_SIZE;
+    auto blockSize = bufferSize(buffer);
+    if (sz + HEADER_SIZE > blockSize) {
+      // buffer wasn't big enough, so replace it.
+      delete[] buffer;
+      buffers[bufferIdx] = nullptr;
+      buffer = buffers[bufferIdx] = new char[nextSize];
+      *(uint32_t*)buffer = nextSize;
+    }
     allocSize += bufferSize(buffer);
   } else {
-    if (buffers.capacity() == 0) {
-      buffers.reserve(16);
-    }
-    initNewBuffer(new char[BYTE_BLOCK_SIZE], BYTE_BLOCK_SIZE);  // not 0 initialized.
+    initNewBuffer(new char[nextSize], nextSize);  // not 0 initialized.
   }
   // for new allocations, we want to let memory checkers find reads from uninitialized memory
   // assert(scribble(buffer,BYTE_BLOCK_SIZE));
   // TODO: use asan poisoning!
+}
+
+char* MemPool::backupAlloc(size_t sz) {
+  nextBuffer(sz);
+  char* p = buffer + pos;
+  pos += sz;
+  return p;
+}
+
+char* MemPool::backupAlloc(size_t sz, size_t alignment) {
+  nextBuffer(sz + alignment - 1);  // reserve enough space for the alignment
+  align(alignment);
+  char* p = buffer + pos;
+  pos += sz;
+  return p;
 }
 
 #ifdef MEMPOOL_MALLOC
@@ -75,7 +102,7 @@ void MemPool::_rewind(const MemPool::save_point& savePoint, uint32_t buffersToSa
   while (buffers.size() > targetLen) {
     auto idx = buffers.size() - 1;
     char* buf = buffers.back();
-    if (idx <= bufferIdx) {
+    if (idx <= (size_t)bufferIdx) {
       allocSize -= bufferSize(buf);
     }
     assert(scribble(buf, bufferSize(buf)));
@@ -109,7 +136,7 @@ void MemPool::_rewind(const MemPool::save_point& savePoint, uint32_t buffersToSa
 #endif
 
   // We're saving the current buffer, but will move off of it, so we need to adjust the allocSize.
-  if (bufferIdx < buffers.size() && bufferIdx != i) {
+  if ((size_t)bufferIdx < buffers.size() && bufferIdx != i) {
     allocSize -= bufferSize(buffer);
   }
 

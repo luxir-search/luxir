@@ -17,45 +17,20 @@ using namespace solux;
    For a fair comparison with MemPool, we start with the same allocation size.
 
    RESULTS:
-     MemPool and std::pmr::monotonic_buffer_resource are the same speed on g++, but MemPool is faster on clang.
      Protobuf Arena does really well considering that it's allocation is thread safe!  Although it will allocate
-     a new block for each thread that allocates from it.
-     Pre-allocating the memory for the Arena does not help (this is testing *many* small allocations though)
+     a new block for each thread that allocates from it, and the performance will be worse for shared
+     library because of the thread-local it uses.
 
-g++: Release (NDEBUG) __OPTIMIZE__=1 __cplusplus=202100 __GNUC__=12 __VERSION__=12.2.0 _GLIBCXX_RELEASE=12 __GLIBCXX__=20220819 __linux__=1
-------------------------------------------------------------
-Benchmark                  Time             CPU   Iterations
-------------------------------------------------------------
-BM_AllocSmall_std           14696 ns        14696 ns        47707
-BM_AllocSmall_std_mono       1384 ns         1384 ns       507392
-BM_AllocSmall_MemPool        1413 ns         1413 ns       493202
-BM_AllocSmall_Arena          1492 ns         1492 ns       473429
-BM_AllocSmall_ArenaPreAlloc  1498 ns         1498 ns       467081
+   ===== gcc15.1 =====
+        5   allocations:  MemPool 1.9x  faster than google Arena w/ preAlloc
+       20   allocations:  MemPool 1.45x faster than google Arena w/ preAlloc
+      100   allocations:  MemPool 1.20x faster than google Arena w/ preAlloc
+     1000   allocations:  MemPool 1.13x faster than google Arena w/ preAlloc
+    10000  allocations:   MemPool 1.14x faster than google Arena w/ preAlloc
+   ===== clang 20.1 =====
+    10000  allocations:   MemPool 1.49x faster than google Arena w/ preAlloc
 
-clang: Release (NDEBUG) __OPTIMIZE__=1 __cplusplus=202101 __clang__=1 __GNUC__=4 __VERSION__=Ubuntu Clang 15.0.5 _GLIBCXX_RELEASE=12 __GLIBCXX__=20220819 __linux__=1
-------------------------------------------------------------
-Benchmark                  Time             CPU   Iterations
-------------------------------------------------------------
-BM_AllocSmall_std           14670 ns        14670 ns        47230
-BM_AllocSmall_std_mono       1354 ns         1354 ns       533164
-BM_AllocSmall_MemPool         580 ns          580 ns      1210302
-BM_AllocSmall_Arena          1214 ns         1214 ns       573933
-*/
 
-/*  std::allocator vs std::pmr::unsynchronized_pool_resource
-    It looks like the unsynchronized pool resource is actually a little
-    slower than the default allocator.  But notice the time vs CPU time!
-    This was done inside WSL, so we should try to repo/verify outside as well.
-
--------------------------------------------------------------------
-Benchmark                         Time             CPU   Iterations
--------------------------------------------------------------------
-BM_AllocFree_default/1     10513498 ns     10513488 ns           67
-BM_AllocFree_default/8     12343269 ns     11600178 ns           59
-BM_AllocFree_default/16    16736317 ns     14930504 ns           49
-BM_AllocFree_std_pool/1    12306869 ns     12306774 ns           57
-BM_AllocFree_std_pool/8    15114711 ns     14096988 ns           50
-BM_AllocFree_std_pool/16   17871094 ns     16231363 ns           43
  */
 
 
@@ -129,16 +104,16 @@ static char* alloc(Allocator& allocator, size_t bytes) {
 
 template <class Allocator>
 static uint64_t smallAlloc(solux::Rng& rng) {
-  Allocator allocator;
   auto info = rng();
-  for (int i=0; i<500; i++) {   // 500 allocations should fit in first block
+  Allocator allocator;
+  for (int i=0; i<50; i++) {
     auto sz = (rng()&0x003f)+1;  // up to 64 bytes
 
     // If the Allocator is of type MemPool, use alloc method else use allocate method.
     char* ptr = alloc<Allocator>(allocator, sz);
 
     if (ptr == nullptr) {
-      std::cout << "ERROR! null pointer!" << std::endl;
+      LOG_ERROR("smallAlloc: null pointer!");
     }
     *ptr = (char)sz;  // use the memory
     // use the address of the memory to try and avoid optimization
@@ -154,7 +129,7 @@ inline void benchAlloc(benchmark::State& state) {
   for (auto _ : state) {
     result += smallAlloc<Allocator>(SoluxTest::rng);
     benchmark::DoNotOptimize(result);
-    benchmark::ClobberMemory();
+    // benchmark::ClobberMemory();
   }
 };
 
@@ -174,7 +149,7 @@ static void BM_AllocSmall_Arena(benchmark::State& state) {
   benchAlloc<arena_resource<MemPool::STATIC_BUFFER_SIZE,1>>(state);
 }
 static void BM_AllocSmall_ArenaPreAlloc(benchmark::State& state) {
-  benchAlloc<arena_resource<MemPool::STATIC_BUFFER_SIZE,1,MemPool::STATIC_BUFFER_SIZE>>(state);
+  benchAlloc<arena_resource<MemPool::STATIC_BUFFER_SIZE*2, 1, MemPool::STATIC_BUFFER_SIZE>>(state);
 }
 
 

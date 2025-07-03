@@ -1,14 +1,11 @@
 #pragma once
 
 #include <memory>
-#include <iostream>
-#include <string.h>
-#include <vector>
-#include <tuple>
 #include <algorithm>
 #include <assert.h>
 #include <memory_resource>
 #include <span>
+#include <boost/container/small_vector.hpp>
 
 #include "solux_util.h"
 #include "solux/util/log.h"
@@ -144,14 +141,11 @@ public:
   static constexpr char SCRIBBLE_CHAR = 'Z';
 
 // TODO - make a lot of this stuff private
-  static constexpr int STATIC_BUFFER_SIZE = 256; // number of bytes allocated with this pool before using heap
-  static constexpr int BYTE_BLOCK_SHIFT = 15;
-  static constexpr int BYTE_BLOCK_SIZE = 1 << BYTE_BLOCK_SHIFT;
-  static constexpr int BYTE_BLOCK_MASK = BYTE_BLOCK_SIZE - 1;
-  static constexpr int HEADER_SIZE = sizeof(int32_t); // size of the header at the beginning of each buffer
-
-  // todo - try unique_ptr here and see if it slows anything down
-  std::vector<char *> buffers;
+  static constexpr uint32_t STATIC_BUFFER_SIZE = 256; // number of bytes allocated with this pool before using heap
+  static constexpr uint32_t BYTE_BLOCK_SHIFT = 15;
+  static constexpr uint32_t BYTE_BLOCK_SIZE = 1 << BYTE_BLOCK_SHIFT;
+  static constexpr uint32_t BYTE_BLOCK_MASK = BYTE_BLOCK_SIZE - 1;
+  static constexpr uint32_t HEADER_SIZE = sizeof(int32_t); // size of the header at the beginning of each buffer
 
   /** index into the buffers array pointing to the current buffer used as the head */
 
@@ -163,9 +157,12 @@ public:
   /** Current head buffer */
   char *buffer;
 
-  char staticBuffer[STATIC_BUFFER_SIZE];  // static buffer for small pools
+  boost::container::small_vector<char*, 4> buffers;
 
   size_t allocSize = 0;  // sum of all allocations in the pool
+
+  char staticBuffer[STATIC_BUFFER_SIZE];  // static buffer for small pools
+
 
   template <typename T, typename... Args>
   u_ptr<T> make_unique(Args&&... args) {
@@ -241,7 +238,7 @@ public:
 
   ~MemPool();
 
-  void initNewBuffer(char* newBuffer, int32_t size) {
+  void initNewBuffer(char* newBuffer, uint32_t size) {
     buffers.push_back(newBuffer);
     bufferIdx++;
     assert((size_t)bufferIdx == buffers.size() - 1);
@@ -249,6 +246,10 @@ public:
     buffer = newBuffer;
     pos = HEADER_SIZE;  // start after the header
     allocSize += size;
+  }
+
+  size_t allocatedSize() const {
+    return allocSize;
   }
 
   uint32_t bufferSize(const char* buf) const {
@@ -296,7 +297,7 @@ public:
     assert(size <= BYTE_BLOCK_SIZE);
     auto newEnd = pos + size;
     if (newEnd > bufferSize(buffer)) {
-      nextBuffer();
+      nextBuffer(size);
       newEnd = size + HEADER_SIZE;  // reserve space for the header
     }
     return newEnd;
@@ -321,10 +322,23 @@ public:
 
   char *alloc(size_t size) {
 #ifndef MEMPOOL_MALLOC
+
+    size_t newPos = pos + size;
+    if (newPos <= bufferSize(buffer)) {
+      // there is enough space in the current buffer
+      char* p = buffer + pos;
+      pos = (int)newPos;
+      return p;
+    } else {
+      return backupAlloc(size);
+    }
+
+    /*
     int newEnd = reserveBBP(size);
     auto p = ptr();
     pos = newEnd;
     return p;
+    */
 #else
     allocateBBP(size);
     return pointers.back().get();
@@ -333,11 +347,16 @@ public:
 
   char *alloc(size_t size, size_t alignment) {
 #ifndef MEMPOOL_MALLOC
-    align(alignment);  // TODO: align the actual pointer!
-    int newEnd = reserveBBP(size);
-    auto p = ptr();
-    pos = newEnd;
-    return p;
+    align(alignment);
+    size_t newPos = pos + size;
+    if (newPos <= bufferSize(buffer)) {
+      // there is enough space in the current buffer
+      char* p = buffer + pos;
+      pos = (int)newPos;
+      return p;
+    } else {
+      return backupAlloc(size, alignment);
+    }
 #else
     allocateBBP(size);
     return pointers.back().get();
@@ -473,7 +492,9 @@ public:
     return true;
   }
 
-  void nextBuffer();
+  void nextBuffer(size_t size);
+  char* backupAlloc(size_t size);
+  char* backupAlloc(size_t size, size_t alignment);
 };
 
 

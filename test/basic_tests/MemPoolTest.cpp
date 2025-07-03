@@ -175,6 +175,25 @@ TEST_F(MemPoolTest, alloc) {
 
 }
 
+TEST_F(MemPoolTest, sizes) {
+#ifndef MEMPOOL_MALLOC
+  MemPool pool;
+  auto savePoint = pool.getSavePoint();
+  ASSERT_EQ(pool.allocatedSize(), MemPool::STATIC_BUFFER_SIZE);
+  char* a = pool.alloc(MemPool::STATIC_BUFFER_SIZE + 1);  // should allocate a new buffer
+  unused(a);
+  ASSERT_EQ(pool.allocatedSize(), MemPool::STATIC_BUFFER_SIZE * 3);  // doubling strategy + original size
+  pool.rewind(savePoint);
+  ASSERT_EQ(pool.allocatedSize(), MemPool::STATIC_BUFFER_SIZE);
+  char* b = pool.alloc(1025);  // should *change* the buffer it had reserved.
+  unused(b);
+  ASSERT_EQ(pool.allocatedSize(), MemPool::STATIC_BUFFER_SIZE + 2048);
+  char* c = pool.alloc(16500);  // should allocate a new buffer of 32K
+  unused(c);
+  ASSERT_EQ(pool.allocatedSize(), MemPool::STATIC_BUFFER_SIZE + 2048 + 32768);
+#endif
+}
+
 TEST_F(MemPoolTest, rewind) {
   MemPool pool;
   auto sz = pool.size();
@@ -264,12 +283,27 @@ TEST_F(MemPoolTest, randRewind) {
     }
     int nallocs = rng.rint(6);
     for (int i=0; i<nallocs; i++) {
-      int allocSz = rng.rint(1, MemPool::BYTE_BLOCK_SIZE - MemPool::HEADER_SIZE);
+      int allocSz = rng.rint(1u, MemPool::BYTE_BLOCK_SIZE - MemPool::HEADER_SIZE);
       char* x = pool.alloc(allocSz);
       x[0] = 'A';  // touch beginning and end
       x[allocSz-1] = 'B';
     }
   }
+}
+
+TEST_F(MemPoolTest, align) {
+  MemPool pool;
+
+  char* a = pool.alloc(1);
+  unused(a);
+  MemPool::allocator<size_t> myalloc(pool);
+  auto* p = myalloc.allocate(8);
+  ASSERT_EQ((size_t)p % 8, 0);
+
+  // test alignment after initial failure to allocate from same block
+  p = myalloc.allocate(MemPool::STATIC_BUFFER_SIZE);
+  ASSERT_EQ((size_t)p % 8, 0);
+
 }
 
 #ifndef MEMPOOL_MALLOC

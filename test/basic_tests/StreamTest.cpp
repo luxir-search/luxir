@@ -85,13 +85,13 @@ TEST_F(StreamTest, basic) {
 }
 
 TEST_F(StreamTest, randStream) {
-  int maxlen = MemPool::BYTE_BLOCK_SIZE * 3;
-  int minBytesToWrite = 1000000;
-  int maxPoolSize = 100000;
+  size_t maxlen = MemPool::BYTE_BLOCK_SIZE * 3;
+  size_t minBytesToWrite = 1000000;
+  size_t maxPoolSize = 100000;
 
   MemPool pool;
   auto save = pool.getSavePoint();
-  int totWritten = 0;
+  size_t totWritten = 0;
   while (totWritten < minBytesToWrite) {
     // test many small, but some big.
     int slen = rng.rint(20);
