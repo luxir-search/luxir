@@ -25,74 +25,75 @@ namespace solux {
 template <typename Key, typename Value>
 class SharedLazyMap {
 public:
-    using Pointer = std::shared_ptr<Value>;
+  using Pointer = std::shared_ptr<Value>;
 
 private:
-    using MapVal = std::variant<Pointer, std::shared_ptr<tbb::task_group>>;
+  using MapVal = std::variant<Pointer, std::shared_ptr<tbb::task_group>>;
 
-    // A single map is used to avoid races between looking up in two maps.
-    boost::unordered::concurrent_flat_map<Key, MapVal> dataMap;
+  // A single map is used to avoid races between looking up in two maps.
+  boost::unordered::concurrent_flat_map<Key, MapVal> dataMap;
+
 public:
+  SharedLazyMap() = default;
 
-    SharedLazyMap() = default;
+  /**
+   * Retrieves the value associated with the given key, or creates it
+   * if it doesn't already exist.
+   */
+  Pointer getOrCreate(const Key& key, std::function<Pointer()> createFunc) {
+    MapVal mapVal;
 
-    /**
-     * Retrieves the value associated with the given key, or creates it
-     * if it doesn't already exist.
-     */
-    Pointer getOrCreate(const Key& key, std::function<Pointer()> createFunc) {
-        MapVal mapVal;
-
-        // insert with the task_group alternative.
-        auto inserted = dataMap.try_emplace_and_cvisit(key, MapVal{},
-            [&](auto& elem) {
-                // LOG_DEBUG("CREATE {}", key);
-                auto tg = std::make_shared<tbb::task_group>();
-                elem.second = tg;
-                mapVal = elem.second;
-                // must create the task when inserting the task_group to prevent race conditions,
-               // otherwise another thread could wait on the task group before we add the create task.
-               // Capture by ref for everything is fine here since all callers will wait on tg.
-               tg->run([&]() {
-                   try {
-                       // we aren't allowed to call dataMap methods inside another dataMap method,
-                       // but this is guaranteed to execute outside/after the try_emplace_and_cvisit method.
-                       Pointer val = createFunc(); // do expensive part outside of visit
-                       dataMap.visit(key, [&createFunc, &val](auto& elem) {
-                           elem.second = std::move(val);
-                       });
-                       // created = true;
-                   } catch (std::exception& e) {
-                       // TODO: how should we clean up?
-                       // LOG_ERROR("Exception caught! {}", e.what());
-                       dataMap.erase(key);  // remove the task_group if we failed to create the value
-                       throw;  // rethrow the exception
-                   }
-               });
-            },
-            [&](const auto& elem) {
-                // LOG_DEBUG("got {}", key);
-                mapVal = elem.second;
-            }
-        );
-
-        // If the value is here, return it.
-        if (std::holds_alternative<Pointer>(mapVal)) {
-            return std::get<Pointer>(mapVal);
-        }
-
-        // If the task_group is present, then wait on it.
-        auto tg = std::get<std::shared_ptr<tbb::task_group>>(mapVal);
-        tg->wait();
-
-        MapVal outVal;
-        auto visited = dataMap.cvisit(key, [&outVal](const auto& elem) {
-            outVal = elem.second;
+    // insert with the task_group alternative.
+    auto inserted = dataMap.try_emplace_and_cvisit(key, MapVal{},
+      [&](auto& elem) {
+        // LOG_DEBUG("CREATE {}", key);
+        auto tg = std::make_shared<tbb::task_group>();
+        elem.second = tg;
+        mapVal = elem.second;
+        // must create the task when inserting the task_group to prevent race conditions,
+        // otherwise another thread could wait on the task group before we add the create task.
+        // Capture by ref for everything is fine here since all callers will wait on tg.
+        tg->run([&]() {
+          try {
+            // we aren't allowed to call dataMap methods inside another dataMap method,
+            // but this is guaranteed to execute outside/after the try_emplace_and_cvisit method.
+            Pointer val = createFunc(); // do expensive part outside of visit
+            dataMap.visit(key, [&createFunc, &val](auto& elem) {
+              elem.second = std::move(val);
+            });
+            // created = true;
+          }
+          catch (std::exception& e) {
+            // TODO: how should we clean up?
+            // LOG_ERROR("Exception caught! {}", e.what());
+            dataMap.erase(key); // remove the task_group if we failed to create the value
+            throw; // rethrow the exception
+          }
         });
-        assert(visited == 1);  // We don't do removals yet.  We should put things in a loop if we do in the future.
-        assert(std::holds_alternative<Pointer>(outVal));
-        return std::get<Pointer>(outVal);
+      },
+      [&](const auto& elem) {
+        // LOG_DEBUG("got {}", key);
+        mapVal = elem.second;
+      }
+    );
+
+    // If the value is here, return it.
+    if (std::holds_alternative<Pointer>(mapVal)) {
+      return std::get<Pointer>(mapVal);
     }
+
+    // If the task_group is present, then wait on it.
+    auto tg = std::get<std::shared_ptr<tbb::task_group>>(mapVal);
+    tg->wait();
+
+    MapVal outVal;
+    auto visited = dataMap.cvisit(key, [&outVal](const auto& elem) {
+      outVal = elem.second;
+    });
+    assert(visited == 1); // We don't do removals yet.  We should put things in a loop if we do in the future.
+    assert(std::holds_alternative<Pointer>(outVal));
+    return std::get<Pointer>(outVal);
+  }
 };
 
 }
