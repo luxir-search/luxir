@@ -17,7 +17,8 @@ void Book::readFile() {
   auto fname = fs::temp_directory_path() / "solux" / "book.txt";
   std::ifstream file(fname, std::ios::binary);
   if (!file) {
-    LOG_ERROR("Couldn't read file '{}'", (std::string)fname);
+    LOG_ERROR("Couldn't read file '{}', try reloading cmake project to download it.", (std::string)fname);
+    return;
   }
   std::stringstream ss;
   ss << file.rdbuf();
@@ -40,6 +41,7 @@ void Book::parse() {
   if (end == sv.npos) {
     end = sv.size() - 1;
     LOG_ERROR("Can't find end of book - it may have changed? Using {}", end);
+    return;
   }
 
 

@@ -9,6 +9,7 @@ using namespace solux;
 static void BM_IndexBook(benchmark::State& state, std::string field, bool writePostings, bool docPerPara) {
 
   Book& book = TestData::data->getBook();
+  ASSERT_FALSE(book.text().empty()) << "Book text is empty!";
 
   int64_t inverterSz = 0;
   int sz = docPerPara ? book.sumParaSizes : book.text().size();
