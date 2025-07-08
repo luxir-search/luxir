@@ -37,9 +37,14 @@ public:
 
     // Return the target Val for this calculator.
     // If searchResponse is not null, then the subOp wants the path created in the given searchResponse.
-    solux::proto::Val* getTarget(solux::proto::SearchResponse* searchResponse) {
+    solux::proto::Val* getTarget(solux::proto::SearchResponse* searchResponse, auto&& visitor) {
       std::lock_guard<std::mutex> lock(op.req.mutex);
-      return parent->getTargetForSub(searchResponse, this);
+      auto* val = parent->getTargetForSub(searchResponse, this);
+      visitor(*val); // call the visitor with the target Val with mutex held.
+      return val;
+    }
+    solux::proto::Val* getTarget(solux::proto::SearchResponse* searchResponse) {
+      return getTarget(searchResponse, [](solux::proto::Val& val){});
     }
 
     // Called by a subCalculator on us to get the target for the subCalculator to set.

@@ -34,7 +34,7 @@ public:
 
     solux::proto::Val* getTargetForSub(solux::proto::SearchResponse* searchResponse, Calculator* sub) override {};
     void calc(oneapi::tbb::task_group* tg, int32_t segnum, DocSet* domain) override {
-      LOG_DEBUG("calc AvgOp: this={} segnum={}, domain={} slot={}", (void*)this, segnum, (void*)domain, slot);
+      //LOG_DEBUG("calc AvgOp: this={} segnum={}, domain={} slot={}", (void*)this, segnum, (void*)domain, slot);
       std::unique_ptr<MergeableSum> mergeableData(sumMerger.obtain());
       SegFieldInfo segFieldInfo;
       int64_t sum = 0;
@@ -48,7 +48,9 @@ public:
       FieldReader fieldReader(poolGuard.pool(), postingsReader);
       bool found = fieldReader.seek(thisOp().fieldName);
       if (!found) {
-        return;  //TODO:  this is a problem.. need to call release
+        auto merged = sumMerger.release(mergeableData.release());
+        checkCompletion(merged);
+        return;
       }
       fieldReader.readFieldInfo(segFieldInfo);
       // this is a int field for now, so we need to read the value for each doc
@@ -81,8 +83,20 @@ public:
       mergeableData->sum += sum;
       mergeableData->count += count;
       auto merged = sumMerger.release(mergeableData.release());
+      checkCompletion(merged);
+    }
+
+    void checkCompletion(int64_t merged) {
       if (merged == thisOp().req.reader->segments().size()) {
-        auto* myVal = getTarget(nullptr);
+        auto* myVal = getTarget(nullptr, [&](solux::proto::Val& val) {
+          if (slot >= 0) {
+            // do array creation with mutex held since different buckets could be calculated in parallel
+            auto& arr = *val.mutable_arr_d();
+            if (arr.v_size() == 0) {
+              arr.mutable_v()->Resize(numSlots, 0.0);
+            }
+          }
+        });
 
 
         std::unique_ptr<MergeableSum> mergeableData(sumMerger.obtain());
@@ -92,11 +106,7 @@ public:
         if (slot == -1) {
           myVal->set_d(avg);
         } else {
-          // TODO: this is not thread safe
           auto& arr = *myVal->mutable_arr_d();
-          if (arr.v_size() == 0) {
-            arr.mutable_v()->Resize(numSlots, 0.0);
-          }
           arr.set_v(slot, avg);
         }
       }
