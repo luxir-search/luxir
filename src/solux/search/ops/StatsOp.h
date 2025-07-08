@@ -34,6 +34,7 @@ public:
 
     solux::proto::Val* getTargetForSub(solux::proto::SearchResponse* searchResponse, Calculator* sub) override {};
     void calc(oneapi::tbb::task_group* tg, int32_t segnum, DocSet* domain) override {
+      LOG_DEBUG("calc AvgOp: this={} segnum={}, domain={} slot={}", (void*)this, segnum, (void*)domain, slot);
       std::unique_ptr<MergeableSum> mergeableData(sumMerger.obtain());
       SegFieldInfo segFieldInfo;
       int64_t sum = 0;
@@ -47,7 +48,7 @@ public:
       FieldReader fieldReader(poolGuard.pool(), postingsReader);
       bool found = fieldReader.seek(thisOp().fieldName);
       if (!found) {
-        return;
+        return;  //TODO:  this is a problem.. need to call release
       }
       fieldReader.readFieldInfo(segFieldInfo);
       // this is a int field for now, so we need to read the value for each doc

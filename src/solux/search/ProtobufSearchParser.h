@@ -54,6 +54,7 @@ public:
       case solux::proto::SearchOp::kFieldFacet: {
         auto& facetReq = searchOp.field_facet();
         auto* facet = FacetReq::createFieldFacetReq(req, name, facetReq, req.arena);
+        addSubs(*facet, searchOp.field_facet().ops());
         return facet;
       } // end case
         break;
@@ -72,6 +73,7 @@ public:
         }
         auto missing = facetReq.missing();
         FacetReq* facet = google::protobuf::Arena::Create<IntFacetRangeReq>(&req.arena, req, facetField, name, start, end, gap, minCount, missing);
+        addSubs(*facet, searchOp.range_facet().ops());
         return facet;
       }
         break;

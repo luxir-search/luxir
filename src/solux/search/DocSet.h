@@ -46,6 +46,18 @@ public:
   };
 };
 
+/// No bits are set (contains no docs).
+class FalseDocSet : public DocSet {
+public:
+  FalseDocSet() {
+    card_ = 0; // no docs are present
+  }
+
+  bool get(int32_t docid) const override {
+    return false; // no docs are present
+  };
+};
+
 
 /// non-owning BitDocSet
 /// Used for segment liveDocs.

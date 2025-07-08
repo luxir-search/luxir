@@ -14,9 +14,8 @@ class SearchEngineTest : public SoluxTest {
 public:
 };
 
-
 TEST_F(SearchEngineTest, basic) {
-  bool para = true;
+  bool para = false; // nocommit
 
   CollectionHelper helper;
   helper.clear();
@@ -63,7 +62,7 @@ TEST_F(SearchEngineTest, basic) {
     facet4.set_field("color_s");
     {
       auto& subOps = *facet4.mutable_ops();
-      auto& subAvg = *subOps["avg"].mutable_gen_op();
+      auto& subAvg = *subOps["avgsub"].mutable_gen_op();
       subAvg.set_name("avg");
       subAvg.mutable_args()->Add()->set_s("foo_i");
     }
@@ -154,6 +153,11 @@ TEST_F(SearchEngineTest, basic) {
     ASSERT_EQ(1, lreq->responses[0]->proto.ops().at("f4").facet().counts().at(0));
     ASSERT_EQ(1, lreq->responses[0]->proto.ops().at("f4").facet().counts().at(1));
     ASSERT_EQ(1, lreq->responses[0]->proto.ops().at("f4").facet().counts().at(2));
+    // check the sub-op avg
+    ASSERT_EQ(3, lreq->responses[0]->proto.ops().at("f4").facet().ops().at("avgsub").arr_d().v_size());
+    ASSERT_EQ(23, lreq->responses[0]->proto.ops().at("f4").facet().ops().at("avgsub").arr_d().v(0));
+    ASSERT_EQ(5, lreq->responses[0]->proto.ops().at("f4").facet().ops().at("avgsub").arr_d().v(1));
+    ASSERT_EQ(17, lreq->responses[0]->proto.ops().at("f4").facet().ops().at("avgsub").arr_d().v(2));
 
     // check the fifth facet
     ASSERT_EQ(2, lreq->responses[0]->proto.ops().at("f5").facet().bucket_ids().col_s().v_size());

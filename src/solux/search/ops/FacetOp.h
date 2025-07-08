@@ -336,46 +336,52 @@ public:
       if (thisOp().subOps.empty()) {
         return; // no sub ops, nothing to do.
       }
+      int64_t slotNum = 0;
       for (auto [val, count] : countVec) {
         std::vector<std::unique_ptr<SearchOp::Calculator>> calculators;
         calculators.reserve(thisOp().subOps.size());
         for (auto& [name, subOp] : thisOp().subOps) {
-          auto* subCalc = subOp->createCalculator(this, -1);
+          auto* subCalc = subOp->createCalculator(this, slotNum, countVec.size());
           calculators.emplace_back(subCalc);
         }
         for (size_t segnum = 0; segnum < input.size(); segnum++) {
           SegFieldInfo segFieldInfo;
+          FalseDocSet emptyDomain;
+          DocSet* newDomain = &emptyDomain;  // NOTE - points to stack object
           auto& postingsReader = thisOp().reader.segments()[segnum].postingsReader();
           int32_t maxDoc = postingsReader.maxDoc();
           auto poolGuard = MemPool::threadLocalPoolGuard();
           FieldReader fieldReader(poolGuard.pool(), postingsReader);
           bool found = fieldReader.seek(thisOp().fieldName);
           if (!found) {
+            //TODO: if field isnt in both segments, still need to call calc
             continue;
           }
           RAMBitDocSet output(maxDoc);
           fieldReader.readFieldInfo(segFieldInfo);
           TermsEnum tenum(poolGuard.pool(), postingsReader, segFieldInfo);
-          if (!tenum.seek(val)) {
-            continue;
-          }
-          DocsEnum denum(poolGuard.pool(), postingsReader, tenum);
-          while (true) {
-            auto doc = denum.nextDoc();
-            if (doc == DocsEnum::END) {
-              break; // no more docs for this term
+          if (tenum.seek(val)) {
+            newDomain = &output; // we will write to output
+            DocsEnum denum(poolGuard.pool(), postingsReader, tenum);
+            while (true) {
+              auto doc = denum.nextDoc();
+              if (doc == DocsEnum::END) {
+                break; // no more docs for this term
+              }
+              if (input[segnum] && !input[segnum]->get(doc)) {
+                continue; // this doc is not in the domain
+              }
+              output.mutableBits().set(doc);
             }
-            if (!input[segnum]->get(doc)) {
-              continue; // this doc is not in the domain
-            }
-            output.mutableBits().set(doc);
           }
           for (auto& subCalc : calculators) {
             //subCalc->calc(tg, segnum, &output);
             // no support for subcalcs launching tasks yet
-            subCalc->calc(nullptr, segnum, &output);
+
+            subCalc->calc(nullptr, segnum, newDomain);
           }
         }
+        slotNum++;
       }
     };
   };
