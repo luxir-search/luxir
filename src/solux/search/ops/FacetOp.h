@@ -353,25 +353,23 @@ public:
           auto poolGuard = MemPool::threadLocalPoolGuard();
           FieldReader fieldReader(poolGuard.pool(), postingsReader);
           bool found = fieldReader.seek(thisOp().fieldName);
-          if (!found) {
-            //TODO: if field isnt in both segments, still need to call calc
-            continue;
-          }
           RAMBitDocSet output(maxDoc);
-          fieldReader.readFieldInfo(segFieldInfo);
-          TermsEnum tenum(poolGuard.pool(), postingsReader, segFieldInfo);
-          if (tenum.seek(val)) {
-            newDomain = &output; // we will write to output
-            DocsEnum denum(poolGuard.pool(), postingsReader, tenum);
-            while (true) {
-              auto doc = denum.nextDoc();
-              if (doc == DocsEnum::END) {
-                break; // no more docs for this term
+          if (found) {
+            fieldReader.readFieldInfo(segFieldInfo);
+            TermsEnum tenum(poolGuard.pool(), postingsReader, segFieldInfo);
+            if (tenum.seek(val)) {
+              newDomain = &output; // we will write to output
+              DocsEnum denum(poolGuard.pool(), postingsReader, tenum);
+              while (true) {
+                auto doc = denum.nextDoc();
+                if (doc == DocsEnum::END) {
+                  break; // no more docs for this term
+                }
+                if (input[segnum] && !input[segnum]->get(doc)) {
+                  continue; // this doc is not in the domain
+                }
+                output.mutableBits().set(doc);
               }
-              if (input[segnum] && !input[segnum]->get(doc)) {
-                continue; // this doc is not in the domain
-              }
-              output.mutableBits().set(doc);
             }
           }
           for (auto& subCalc : calculators) {

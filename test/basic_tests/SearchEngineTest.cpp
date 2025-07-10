@@ -15,7 +15,7 @@ public:
 };
 
 TEST_F(SearchEngineTest, basic) {
-  bool para = false; // nocommit
+  bool para = true;
 
   CollectionHelper helper;
   helper.clear();
