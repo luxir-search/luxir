@@ -72,7 +72,25 @@ public:
   };
 
 
+  class InlineCalculator : public Calculator {
+  public:
+    InlineCalculator(SearchOp& op, Calculator* parent, int64_t slot, int64_t numSlots)
+      : Calculator(op, parent, slot, numSlots) {
+    }
 
+    solux::proto::Val* getTargetForSub(solux::proto::SearchResponse* searchResponse, Calculator* sub) override;
+    void calc(oneapi::tbb::task_group* tg, int32_t segnum, DocSet* domain) override {};
+    virtual void startSeg(int32_t segnum) {};
+    virtual void endSeg(int32_t segnum) {};
+    virtual int insert(void* entry, int64_t docid, int space) = 0;
+    virtual int update(void* entry, int64_t docid) = 0;
+    virtual std::pair<int, int> merge(void* target, void* from) = 0;
+    // mergeNew is called when entry did not exist for target
+    virtual std::pair<int, int> mergeNew(void* target, void* from, int space) = 0;
+    virtual int finalize(void* entry) = 0;
+    virtual int compare(void* a, void* b, int& asize, int& bsize) = 0;
+
+  };
 
 };
 

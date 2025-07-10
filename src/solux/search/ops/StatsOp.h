@@ -111,7 +111,6 @@ public:
         }
       }
     }
-
   };
 
   Calculator* createCalculator(Calculator* parent, int64_t slot, int64_t numSlots = -1) override {
