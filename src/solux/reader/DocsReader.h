@@ -20,6 +20,10 @@ public:
     }
   }
 
+  explicit DocsReader(int32_t docsWithField) {
+    ndocs = docsWithField;
+  }
+
   int32_t numDocs() const noexcept {
     return ndocs;
   }

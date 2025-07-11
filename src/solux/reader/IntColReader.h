@@ -110,24 +110,30 @@ public:
 private:
   DocsReader docs;
   InputStream columnIS;
-  const SegFieldInfo &fieldInfo;
   const NumericBlockInfo* blockMeta;  // array of block metadata
   const char* blocks;                 // start of the compressed blocks of data
-  MonoReader* endRankReader;          // optional, exists if multi-valued.
+  MonoReader* endRankReader = nullptr;          // optional, exists if multi-valued.
+  int64_t nvals;
+  int32_t docsWithField = 0;
 
 public:
   IntColReader(MemPool &pool, PostingsReader &postingsReader, const SegFieldInfo &fieldInfo) :
-  docs(pool, postingsReader, fieldInfo),
-  fieldInfo(fieldInfo)
+  docs(pool, postingsReader, fieldInfo)
   {
+    nvals = fieldInfo.numValues;
+    docsWithField = fieldInfo.docsWithField;
     columnIS = postingsReader.getInputStreamSeek(fieldInfo.columnLoc);
-    blocks = reinterpret_cast<const char *>(columnIS.ptr());
+    blocks = columnIS.ptr();
     blockMeta = reinterpret_cast<const NumericBlockInfo *>(blocks + fieldInfo.columnMetaOff);
     if (fieldInfo.monoLoc.offset() > 0) {
       endRankReader = pool.make_align<MonoReader>(8, pool, postingsReader, fieldInfo.monoLoc, fieldInfo.monoMetaOff, fieldInfo.docsWithField);
-    } else {
-      endRankReader = nullptr;
     }
+  }
+
+  IntColReader(InputStream &is, int64_t columnOff, int64_t columnMetaOff) : docs(0), columnIS(is) {
+    columnIS.seek(columnOff);
+    blocks = columnIS.ptr();
+    blockMeta = reinterpret_cast<const NumericBlockInfo *>(blocks + columnMetaOff);
   }
 
   DocsReader& docsReader() {
@@ -140,15 +146,15 @@ public:
   }
 
   // Number of values in field.  For a multi-valued field, this will be greater than docsWithValue
-  int64_t numValues() {
-    return fieldInfo.numValues;
+  int64_t numValues() const {
+    return nvals;
   }
 
-  int32_t docsWithValue() {
-    return fieldInfo.docsWithField;
+  int32_t docsWithValue() const {
+    return docsWithField;
   }
 
-  bool multiValued() {
+  bool multiValued() const {
     return endRankReader != nullptr;
   }
 
@@ -179,8 +185,7 @@ public:
     int64_t max;
   public:
 
-    DenseValues(const IntColReader& col) : blockMeta(col.blockMeta), blocks(col.blocks) {
-      max = col.fieldInfo.numValues;
+    DenseValues(const IntColReader& col) : blockMeta(col.blockMeta), blocks(col.blocks), max(col.numValues()) {
     }
 
     int64_t index() {
@@ -236,8 +241,7 @@ public:
     int64_t decoded[BULK_DECODE];
   public:
 
-    BulkValues(const IntColReader& col) : blockMeta(col.blockMeta), blocks(col.blocks) {
-      max = col.fieldInfo.numValues;
+    BulkValues(const IntColReader& col) : blockMeta(col.blockMeta), blocks(col.blocks), max(col.numValues()) {
     }
 
     int64_t index() {
@@ -319,7 +323,7 @@ public:
   public:
 
     DocIterator(const IntColReader& col) : col(col), docsIter(col.docs.bitset()), valueIter(col) {
-      maxRank = col.fieldInfo.docsWithField;
+      maxRank = col.docsWithValue();
       dense = !col.docs.hasBitset();
     }
 
