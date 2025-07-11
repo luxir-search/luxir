@@ -584,11 +584,12 @@ TEST_F(PostingsTest, intCol) {
 
     auto &finfo = writer.addField(fname1);
     {
-      IntColWriter colWriter(pool, writer, finfo);
+      auto outputPtr = writer.getOutputStream();
+      IntColWriter colWriter(*outputPtr);
       colWriter.addInt64(77);
       colWriter.addInt64(33);
       colWriter.addInt64(11);
-      colWriter.finish();
+      colWriter.finish(finfo);
     }
     {
       DocsWithValWriter docsWriter(pool, writer, finfo);

@@ -1,5 +1,6 @@
 #pragma once
 
+#include "PostingsWriter.h"
 #include "solux/reader/IntColReader.h"
 
 namespace solux {
@@ -19,9 +20,6 @@ public:
   constexpr static uint32_t BLOCK_SIZE = Postings::NUMERIC_BLOCK_SIZE;
 
 private:
-  PostingsWriter& postingsWriter;
-  PostingsWriter::IndexFieldInfo& fieldInfo;
-  OutputStreamPtr holder;
   OutputStream& colOutput;
   size_t colStart;
   int64_t nAdded = 0;
@@ -31,10 +29,7 @@ private:
   std::vector<int32_t> ivalues;
 
 public:
-  // This class allocates from the pool but does not do any visible rollbacks.
-  IntColWriter(MemPool& pool, PostingsWriter& postingsWriter, PostingsWriter::IndexFieldInfo& fieldInfo)
-          : postingsWriter(postingsWriter), fieldInfo(fieldInfo), holder(postingsWriter.getOutputStream()), colOutput(*holder) {
-    unused(pool, this->postingsWriter);
+  IntColWriter(OutputStream& target) : colOutput(target) {
     colStart = colOutput.size();
   }
 
@@ -121,8 +116,9 @@ public:
     }
   }
 
+  // Fills in fieldInfo with numeric column info.
   // returns number of values written
-  int64_t finish() {
+  int64_t finish(PostingsWriter::IndexFieldInfo& fieldInfo) {
     // bool allDocsHaveValue = nAdded == postingsWriter.getMaxDoc();
     if (!values.empty()) {
       addBlock(values);

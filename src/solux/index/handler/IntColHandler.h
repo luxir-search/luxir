@@ -73,8 +73,8 @@ public:
 
     // push values
     {
-      auto guard = pool.rewindScopeGuard();
-      IntColWriter writer(pool, postingsWriter, fieldInfo);
+      auto outputPtr = postingsWriter.getOutputStream();
+      IntColWriter writer(*outputPtr);
       // TODO: not having the docids here makes it impossible to do a dense field encoding!  Of course that's
       // not really possible if we're writing the column directly and incrementally since we don't know
       // min, max, numbits, gcd, etc.  But we *could* know that stuff when merging segments!
@@ -86,7 +86,7 @@ public:
       // pairs to the inverter.  A co-routine generator might be perfect for this (one that fills blocks, not
       // individual values)
       longStream.pushValues(inverter.pool, writer);
-      writer.finish();
+      writer.finish(fieldInfo);
     }
 
     // push docs
@@ -179,10 +179,10 @@ public:
 
     // push values
     {
-      auto guard = pool.rewindScopeGuard();
-      IntColWriter writer(pool, postingsWriter, fieldInfo);
+      auto outputPtr = postingsWriter.getOutputStream();
+      IntColWriter writer(*outputPtr);
       longStream.pushValues(inverter.pool, writer);
-      writer.finish();
+      writer.finish(fieldInfo);
     }
 
     // push docs

@@ -74,6 +74,8 @@ public:
 
   // Retrieve values[index-1], values[index].  If index is 0, the first value is 0.
   [[nodiscard]] std::pair<int64_t, int64_t> valuesAt(int32_t index) const {
+    // hopefully the compiler can optimize out some of the repeated code involved in getting 2 values?
+    // they may be in different blocks though.
     auto v1 = index > 0 ? valueAt(index - 1) : 0;
     auto v2 = valueAt(index);
     return {v1, v2};

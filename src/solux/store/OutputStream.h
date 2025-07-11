@@ -304,16 +304,15 @@ public:
 
   ~RAMFile() override = default;
 
-  // only valid after flush or close
+  /// only valid after flush or close
   size_t size() override {
     return fileSize;
   }
 
-  // copies size() bytes to the destination
+  /// copies size() bytes to the destination
   size_t copyTo(void *dest) {
     char *ptr = (char *) dest;
-    if (firstLen != 0) {
-      // ubsan doesn't like null ptrs even if len==0
+    if (firstLen != 0) { // ubsan doesn't like null ptrs even if len==0
       memcpy(ptr, firstBuffer, firstLen);
     }
     ptr += firstLen;
@@ -325,6 +324,12 @@ public:
     }
     assert(ptr - (char *) dest == fileSize);
     return ptr - (char *) dest;
+  }
+
+  /// Frees up memory early (optional)
+  /// This invalidates further use of the file or associated output stream.
+  void clear() {
+    buffers.clear();
   }
 };
 

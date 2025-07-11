@@ -11,13 +11,11 @@ class OrdColWriter {
   PostingsWriter& postingsWriter;
   PostingsWriter::IndexFieldInfo& fieldInfo;
   OrdCollector& ords;
-  IntColWriter colWriter;
   u_ptr<MonoWriter> endRankWriter;
   OutputStreamPtr endRankOutput;
 public:
   OrdColWriter(MemPool& pool, PostingsWriter& postingsWriter, PostingsWriter::IndexFieldInfo& fieldInfo, OrdCollector& ords)
-  : pool(pool), postingsWriter(postingsWriter), fieldInfo(fieldInfo), ords(ords),
-    colWriter(pool, postingsWriter, fieldInfo)
+  : pool(pool), postingsWriter(postingsWriter), fieldInfo(fieldInfo), ords(ords)
   {
     if (ords.multiValued()) {
       // If this is a multivalued field, then we also need to write to another column that
@@ -34,8 +32,8 @@ public:
     // Write the ordinals to the postings file.
     // This is pretty much repeated code from Inverter::StringIndexHandler - TODO: refactor to own Writer.
     {
-      auto guard = pool.rewindScopeGuard();
-      IntColWriter ordCol(pool, postingsWriter, fieldInfo);
+      auto outputPtr = postingsWriter.getOutputStream();
+      IntColWriter ordCol(*outputPtr);
 
       int64_t nValues = 0;
       for (int docid = 0; docid < nDocs; docid++) {
@@ -51,7 +49,8 @@ public:
         prev = nValues;
       }
 
-      ordCol.finish();
+      ordCol.finish(fieldInfo);
+
       if (endRankWriter) {
         endRankWriter->finish();
         fieldInfo.monoLoc = endRankWriter->blockLoc;

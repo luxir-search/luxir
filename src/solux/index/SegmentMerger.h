@@ -311,6 +311,7 @@ private:
         // Need to make a copy of the term since it will be invalidated after tenum.nextTerm()
         // is called.  It needs to exist until the end of textWriter (currently).  See comments on startTerm()
         // for ideas.
+        // TODO: FIXME: revisit this! We should add the term to a pool we can roll back as soon as possible.
         PackedTerm term(pool, std::string_view(first.tenum.term()));
         auto termOrd = textWriter.startTerm(term);
 
@@ -362,7 +363,8 @@ private:
     auto poolGuard = MemPool::threadLocalPoolGuard();
     auto& pool = poolGuard.pool();
 
-    IntColWriter intColWriter(pool, postingsWriter, outputFieldInfo);
+    auto outputPtr = postingsWriter.getOutputStream();
+    IntColWriter intColWriter(*outputPtr);
 
     // currently all values must be written before all docs - TODO FIXME - is this still true??
     for (auto* field : sortedFields) {
@@ -408,7 +410,7 @@ private:
     }
 
 
-    intColWriter.finish();
+    intColWriter.finish(outputFieldInfo);
     if (outputFieldInfo.flags & FieldType::MULTI_VALUED) {
       auto guard = pool.rewindScopeGuard();
       OutputStreamPtr out = postingsWriter.getOutputStream();
@@ -444,7 +446,8 @@ private:
     auto poolGuard = MemPool::threadLocalPoolGuard();
     auto& pool = poolGuard.pool();
 
-    auto intColWriter = pool.make_unique_align<IntColWriter>(8, pool, postingsWriter, outputFieldInfo);
+    auto outputPtr = postingsWriter.getOutputStream();
+    auto intColWriter = pool.make_unique_align<IntColWriter>(8, *outputPtr);
 
     u_ptr<DocsWithValWriter> docsWriter = nullptr;  // docs with the field, created on demand if needed
 
@@ -574,8 +577,9 @@ private:
       endRankBase += lastEndRankIn;
     } // for-each-seg
 
-    intColWriter->finish();
+    intColWriter->finish(outputFieldInfo);
     if (docsWriter) {
+      assert(docsWriter->numAdded() == docsWithField);
       if (docsWriter->numAdded() == postingsWriter.getMaxDoc()) {
         // all docs were added.  We may have written stuff into the index,
         // but we can forget it (it will be dropped on the next merge).

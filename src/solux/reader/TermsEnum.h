@@ -68,7 +68,7 @@ public:
     return fieldInfo.sumTotalTermFreq;
   }
 
-  // 0 based ords
+  /// returns the 0-based ordinal of the current term.
   int32_t ord() const {
     return startingOrd + ordInBlock;
   }
@@ -112,6 +112,8 @@ public:
     readTermMetadata();
   }
 
+  /// If there is a next term, this advances to it and returns true.
+  /// Otherwise, no advance is done (i.e. ord() is not changed.)
   bool nextTerm() {
     if (ordInBlock == maxOrdInBlock) {
       if (ord() + 1 >= fieldInfo.nTerms) {  // could also compare number of blocks to detect end.
