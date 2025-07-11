@@ -116,20 +116,38 @@ public:
     }
   }
 
+  struct ColData {
+    int64_t columnLoc;     // location of the start of the column
+    int64_t columnMetaOff; // offset from columnLoc to the start of the block info array
+    int64_t numValues;     // number of values in the column
+  };
+
   // Fills in fieldInfo with numeric column info.
-  // returns number of values written
-  int64_t finish(PostingsWriter::IndexFieldInfo& fieldInfo) {
+  // returns ColData with info about the column needed to read it.
+  ColData finish() {
     // bool allDocsHaveValue = nAdded == postingsWriter.getMaxDoc();
     if (!values.empty()) {
       addBlock(values);
       values.resize(0);
     }
 
-    fieldInfo.columnLoc = seg_location(colOutput.streamNumber, colStart);
-    fieldInfo.columnMetaOff = colOutput.size() - colStart;
+    int64_t metaOff = colOutput.size() - colStart;
+    colOutput.write((const char*)blockInfo.data(), blockInfo.size() * sizeof(IntColReader::NumericBlockInfo));
+
+    return {(int64_t)colStart, metaOff, nAdded};
+  }
+
+
+  // Fills in fieldInfo with numeric column info.
+  // returns number of values written
+  int64_t finish(PostingsWriter::IndexFieldInfo& fieldInfo) {
+    auto data = finish();
+
+    fieldInfo.columnLoc = seg_location(colOutput.streamNumber, data.columnLoc);
+    fieldInfo.columnMetaOff = data.columnMetaOff;
     // the number of blocks can be derived from nAdded.
     colOutput.write((const char*)blockInfo.data(), blockInfo.size() * sizeof(IntColReader::NumericBlockInfo));
-    fieldInfo.numValues = nAdded;  // TODO: do this here?
+    fieldInfo.numValues = data.numValues;  // TODO: do this here?
     return nAdded;
   }
 };

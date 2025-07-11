@@ -7,7 +7,7 @@
 
 namespace solux {
 
-// Monotonic int col.  Currently supports 32 bit indexes and 64 bit outputs.
+// Monotonic int column.
 // TODO: need a block iterator for bulk-reading values.
 class MonoReader {
 public:
@@ -30,33 +30,29 @@ public:
   } SOLUX_PACKED_END;
 
 protected:
-  InputStream columnIS;
   const BlockInfo* blockMeta;  // array of block metadata
   const char* blocks;          // start of the compressed blocks of data
-  int32_t nValues;
+  const int64_t nValues;
 
 public:
-  MonoReader(MemPool& pool, PostingsReader &postingsReader, seg_location loc, int64_t metaOff, int32_t nValues)
+  MonoReader(MemPool& pool, PostingsReader &postingsReader, seg_location loc, int64_t metaOff, int64_t nValues) : nValues(nValues)
   {
-    columnIS = postingsReader.getInputStreamSeek(loc);
+    InputStream columnIS = postingsReader.getInputStreamSeek(loc);
     blocks = columnIS.ptr();
     blockMeta = reinterpret_cast<const BlockInfo *>(blocks + metaOff);
-    this->nValues = nValues;
   }
 
-  MonoReader(MemPool& pool, InputStream is, int64_t loc, int64_t metaOff, int32_t nValues)
+  MonoReader(InputStream& columnIS, int64_t loc, int64_t metaOff, int64_t nValues) : nValues(nValues)
   {
-    columnIS = is;
     blocks = columnIS.ptr(loc);
     blockMeta = reinterpret_cast<const BlockInfo *>(blocks + metaOff);
-    this->nValues = nValues;
   }
 
   [[nodiscard]] int32_t numValues() const {
     return nValues;
   }
 
-  [[nodiscard]] int64_t valueAt(int32_t index) const {
+  [[nodiscard]] int64_t valueAt(int64_t index) const {
     assert (index >= 0 && index < nValues);
     auto blockNum = (uint64_t)index / BLOCK_SIZE;
     auto rankInBlock = (uint64_t)index % BLOCK_SIZE;
@@ -66,14 +62,14 @@ public:
       return reinterpret_cast<const int64_t*>(blockStart)[rankInBlock];
     }
     // depending on the exact format, valuesInBlock may not be needed.
-    auto valuesInBlock = (blockNum == uint64_t(nValues) / BLOCK_SIZE) ? uint32_t(nValues) % BLOCK_SIZE : BLOCK_SIZE;
+    auto valuesInBlock = (blockNum == uint64_t(nValues) / BLOCK_SIZE) ? uint64_t(nValues) % BLOCK_SIZE : BLOCK_SIZE;
     auto delta = IndexCodec::numericCodec.selectWithMeta(blockStart, valuesInBlock, rankInBlock, 0, block.bits);
     int64_t scaled = uint64_t(rankInBlock * block.scaledSlope) / SLOPE_SCALE + block.intercept + delta;
     return scaled;
   }
 
   // Retrieve values[index-1], values[index].  If index is 0, the first value is 0.
-  [[nodiscard]] std::pair<int64_t, int64_t> valuesAt(int32_t index) const {
+  [[nodiscard]] std::pair<int64_t, int64_t> valuesAt(int64_t index) const {
     // hopefully the compiler can optimize out some of the repeated code involved in getting 2 values?
     // they may be in different blocks though.
     auto v1 = index > 0 ? valueAt(index - 1) : 0;

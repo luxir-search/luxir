@@ -295,7 +295,6 @@ class RAMFile : public File {
     flush(os, true);
   }
 
-
 public:
   constexpr static uint32_t START_BUFFER_SIZE = 1024;  // size of first allocated buffer (subsequent buffers may be bigger)... mostly for testing.
 
@@ -330,6 +329,18 @@ public:
   /// This invalidates further use of the file or associated output stream.
   void clear() {
     buffers.clear();
+  }
+
+  /// appends the input RAMFile by stealing its buffers.
+  void destructiveAppend(RAMFile &in) {
+    assert(in.firstBuffer == nullptr); // not implemented yet
+    auto otherSize = in.size();
+    for (auto& pair : in.buffers) {
+      buffers.emplace_back(std::move(pair));
+    }
+    fileSize += otherSize;
+    in.fileSize = 0;
+    in.buffers.clear();
   }
 };
 
