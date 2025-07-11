@@ -82,8 +82,8 @@ public:
     void calc(oneapi::tbb::task_group* tg, int32_t segnum, DocSet* domain) override {};
     virtual void startSeg(int32_t segnum) {};
     virtual void endSeg(int32_t segnum) {};
-    virtual int insert(void* entry, int64_t docid, int space) = 0;
-    virtual int update(void* entry, int64_t docid) = 0;
+    virtual int insert(void* entry, int32_t docid, int space) = 0;
+    virtual int update(void* entry, int32_t docid) = 0;
     virtual std::pair<int, int> merge(void* target, void* from) = 0;
     // mergeNew is called when entry did not exist for target
     virtual std::pair<int, int> mergeNew(void* target, void* from, int space) = 0;
@@ -93,5 +93,92 @@ public:
   };
 
 };
+
+template <typename Key>
+class FacetMap {
+public:
+  boost::unordered_flat_map<Key, char*> map;
+  std::span<SearchOp::InlineCalculator*> calcs;
+  MemPool pool;
+
+  FacetMap(std::span<SearchOp::InlineCalculator*> calcs) : calcs(calcs) {}
+
+  void add(const Key& key, int32_t docid) {
+    auto [iter, inserted] = map.insert(key, nullptr);
+
+    if (inserted) {
+      auto ptr = pool.reserve(sizeof(int64_t));
+      int space = (int)pool.spaceLeft();
+      auto start = ptr;
+      *(int64_t*)ptr = 1;
+      space -= sizeof(int64_t);
+      ptr += sizeof(int64_t);
+      for (auto* calc : calcs) {
+        auto calcSpace = calc->insert(ptr, docid, space);
+        if (calcSpace < 0) {
+          auto newptr = pool.reserve(space + (-calcSpace));
+          memcpy(newptr, start, ptr - start);
+          start = newptr;
+          ptr = newptr + (ptr - start);
+          calcSpace = calc->insert(ptr, docid, space);
+        }
+        space -= calcSpace;
+        ptr += calcSpace;
+      }
+      iter->second = start;  // store the pointer to the start of the entry
+    } else {
+      auto ptr = iter->second;
+      (*(int64_t*)ptr)++;
+      ptr += sizeof(int64_t);
+      for (auto* calc : calcs) {
+        auto calcSpace = calc->update(ptr, docid);
+        assert(calcSpace >= 0);
+        ptr += calcSpace;
+      }
+    }
+  }
+
+  void merge(FacetMap& other) {
+    for (auto [key, otherPtr] : other.map) {
+      auto [iter, inserted] = map.insert(key, nullptr);
+      if (inserted) {
+        auto ptr = pool.reserve(sizeof(int64_t));
+        int space = (int)pool.spaceLeft();
+        auto start = ptr;
+        *(int64_t*)ptr = *(int64_t*)otherPtr;
+        space -= sizeof(int64_t);
+        ptr += sizeof(int64_t);
+        otherPtr += sizeof(int64_t);
+        for (auto* calc : calcs) {
+          auto [calcSpace, otherCalcSpace] = calc->mergeNew(ptr, otherPtr, space);
+          if (calcSpace < 0) {
+            auto newptr = pool.reserve(space + (-calcSpace));
+            memcpy(newptr, start, ptr - start);
+            start = newptr;
+            ptr = newptr + (ptr - start);
+            auto [calcSpace, otherCalcSpace] = calc->mergeNew(ptr, otherPtr, space);
+          }
+          space -= calcSpace;
+          ptr += calcSpace;
+          otherPtr += otherCalcSpace;
+        }
+        iter->second = start;  // store the pointer to the start of the entry
+      } else {
+        auto ptr = iter->second;
+        (*(int64_t*)ptr) += *(int64_t*)otherPtr;
+        ptr += sizeof(int64_t);
+        otherPtr += sizeof(int64_t);
+        for (auto* calc : calcs) {
+          auto [calcSpace, otherCalcSpace] = calc->merge(ptr, otherPtr);
+          assert(calcSpace >= 0);
+          ptr += calcSpace;
+          otherPtr += otherCalcSpace;
+        }
+      }
+    }
+  }
+
+};
+
 
 }

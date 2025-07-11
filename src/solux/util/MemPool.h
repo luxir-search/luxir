@@ -291,10 +291,27 @@ public:
 #endif
   }
 
+  /// space left in the current buffer
+  size_t spaceLeft() {
+    return bufferSize(buffer) - pos;
+  }
+
+  char* reserve(uint32_t size) {
+    assert(size <= BYTE_BLOCK_SIZE - HEADER_SIZE);
+    if (spaceLeft() >= size) {
+      return ptr();
+    }
+    // not enough space in the current buffer, allocate a new one
+    backupAlloc(size);
+    pos -= size;
+    assert(pos == HEADER_SIZE);  // pos should be after the header after allocation
+    return ptr();
+  }
+
   // ensures that there is enough space starting with the current buffer (moving to a new buffer if necessary)
   // and returns the resulting end offset into the last (current) block.
   int reserveBBP(uint32_t size) {
-    assert(size <= BYTE_BLOCK_SIZE);
+    assert(size <= BYTE_BLOCK_SIZE - HEADER_SIZE);
     auto newEnd = pos + size;
     if (newEnd > bufferSize(buffer)) {
       nextBuffer(size);
