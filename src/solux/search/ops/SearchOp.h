@@ -87,7 +87,7 @@ public:
     virtual std::pair<int, int> merge(void* target, void* from) = 0;
     // mergeNew is called when entry did not exist for target
     virtual std::pair<int, int> mergeNew(void* target, void* from, int space) = 0;
-    virtual int finalize(void* entry) = 0;
+    virtual int finalize(void* entry, int64_t count) = 0;
     virtual int compare(void* a, void* b, int& asize, int& bsize) = 0;
 
   };
@@ -126,6 +126,9 @@ public:
         ptr += calcSpace;
       }
       iter->second = start;  // store the pointer to the start of the entry
+      auto allocated = pool.alloc(ptr - start);  // allocate the space used by this entry
+      assert(allocated == start);
+      unused(allocated);
     } else {
       auto ptr = iter->second;
       (*(int64_t*)ptr)++;
@@ -139,7 +142,7 @@ public:
   }
 
   void merge(FacetMap& other) {
-    for (auto [key, otherPtr] : other.map) {
+    for (auto& [key, otherPtr] : other.map) {
       auto [iter, inserted] = map.insert(key, nullptr);
       if (inserted) {
         auto ptr = pool.reserve(sizeof(int64_t));
@@ -163,6 +166,9 @@ public:
           otherPtr += otherCalcSpace;
         }
         iter->second = start;  // store the pointer to the start of the entry
+        auto allocated = pool.alloc(ptr - start);  // allocate the space used by this entry
+        assert(allocated == start);
+        unused(allocated);
       } else {
         auto ptr = iter->second;
         (*(int64_t*)ptr) += *(int64_t*)otherPtr;

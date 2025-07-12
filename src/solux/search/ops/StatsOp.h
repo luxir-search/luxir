@@ -117,5 +117,118 @@ public:
     return new Calc(*this, parent, slot, numSlots);
   };
 
+  class InlineCalc final : public InlineCalculator {
+    struct entry {
+      double val;
+    };
+
+    MemPool pool;
+    MemPool::save_point start;
+    std::optional<FieldReader> fieldReader;
+    std::optional<SegFieldInfo> segFieldInfo;
+    std::optional<IntColReader> intColReader;
+    std::optional<IntColReader::Iterator> intColIter;
+
+  public:
+    InlineCalc(SearchOp& op, Calculator* parent, int64_t slot, int64_t numSlots)
+      : InlineCalculator(op, parent, slot, numSlots) {
+    }
+    AvgOp& thisOp() {
+      return (AvgOp&)getOp();
+    }
+
+    int insert(void* entry, int32_t docid, int space) override {
+      if (space < sizeof(entry)) {
+        return -sizeof(entry); // not enough space to insert
+      }
+      auto* e = (struct entry*)entry;
+      e->val = 0.0;
+      return update(entry, docid);
+    }
+
+    int update(void* entry, int32_t docid) override {
+      auto* e = (struct entry*)entry;
+      if (intColIter) {
+        if (intColIter->docId() < docid) {
+          intColIter->advance(docid);
+        }
+        if (intColIter->docId() == docid) {
+          //if (!intColReader->multiValued()) {
+          e->val += intColIter->value();
+          //} else {
+          //auto [start, end] = intColReader->getStartEndRank(intColIter->rank());
+          //auto n = end - start;
+          //for (int64_t vrank = 0; vrank < n; vrank++) {
+          //e->tot += intColIter->values().valueAt(start + vrank);
+          //}
+          //}
+        }
+      }
+      return sizeof(entry);
+    }
+
+    std::pair<int, int> merge(void* target, void* from) override {
+      auto* e = (struct entry*)target;
+      auto* o = (struct entry*)from;
+      e->val += o->val;
+      return {sizeof(entry), sizeof(entry)};
+    }
+
+    std::pair<int, int> mergeNew(void* target, void* from, int space) override {
+      if (space < sizeof(entry)) {
+        return {-sizeof(entry), sizeof(entry)}; // not enough space to insert
+      }
+      auto* e = (struct entry*)target;
+      e->val = 0.0;
+      return merge(target, from);
+    }
+
+    int finalize(void* entry, int64_t count) override {
+      auto* e = (struct entry*)entry;
+      if (count == 0) {
+        return 0; // no values, nothing to do
+      }
+      e->val /= count; // calculate the average
+      return sizeof(entry);
+    }
+
+    int compare(void* a, void* b, int& asize, int& bsize) override {
+      auto* aentry = (struct entry*)a;
+      auto* bentry = (struct entry*)b;
+      asize = sizeof(entry);
+      bsize = sizeof(entry);
+      if (aentry->val < bentry->val) {
+        return -1;
+      } else if (aentry->val > bentry->val) {
+        return 1;
+      } else {
+        return 0;
+      }
+    }
+
+    void startSeg(int32_t segnum) override {
+      start = pool.getSavePoint();
+      auto& postingsReader = thisOp().req.reader->segments()[segnum].postingsReader();
+      fieldReader.emplace(pool, postingsReader);
+      bool found = fieldReader->seek(thisOp().fieldName);
+      if (!found) {
+        return; // field not found, nothing to do
+      }
+      fieldReader->readFieldInfo(*segFieldInfo);
+      // this is a int field for now, so we need to read the value for each doc
+      // and accumulate counts per value.
+      intColReader.emplace(pool, postingsReader, *segFieldInfo);
+      intColIter.emplace(*intColReader);
+    }
+
+    void endSeg(int32_t segnum) override {
+      intColIter.reset();
+      intColReader.reset();
+      fieldReader.reset();
+      segFieldInfo.reset();
+      pool.rewind(start);
+    };
+  };
+
 };
 }
