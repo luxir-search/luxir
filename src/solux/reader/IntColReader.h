@@ -35,7 +35,7 @@ protected:
   const int64_t nValues;
 
 public:
-  MonoReader(MemPool& pool, PostingsReader &postingsReader, seg_location loc, int64_t metaOff, int64_t nValues) : nValues(nValues)
+  MonoReader(PostingsReader &postingsReader, seg_location loc, int64_t metaOff, int64_t nValues) : nValues(nValues)
   {
     InputStream columnIS = postingsReader.getInputStreamSeek(loc);
     blocks = columnIS.ptr();
@@ -108,13 +108,14 @@ private:
   InputStream columnIS;
   const NumericBlockInfo* blockMeta;  // array of block metadata
   const char* blocks;                 // start of the compressed blocks of data
-  MonoReader* endRankReader = nullptr;          // optional, exists if multi-valued.
+  std::optional<MonoReader> endRankReader;  // exists if multi-valued.
   int64_t nvals;
   int32_t docsWithField = 0;
 
 public:
-  IntColReader(MemPool &pool, PostingsReader &postingsReader, const SegFieldInfo &fieldInfo) :
-  docs(pool, postingsReader, fieldInfo)
+  /// The fieldInfo is only used in the constructor and can be discarded after.
+  IntColReader(PostingsReader &postingsReader, const SegFieldInfo &fieldInfo) :
+  docs(postingsReader, fieldInfo)
   {
     nvals = fieldInfo.numValues;
     docsWithField = fieldInfo.docsWithField;
@@ -122,7 +123,7 @@ public:
     blocks = columnIS.ptr();
     blockMeta = reinterpret_cast<const NumericBlockInfo *>(blocks + fieldInfo.columnMetaOff);
     if (fieldInfo.monoLoc.offset() > 0) {
-      endRankReader = pool.make_align<MonoReader>(8, pool, postingsReader, fieldInfo.monoLoc, fieldInfo.monoMetaOff, fieldInfo.docsWithField);
+      endRankReader.emplace(postingsReader, fieldInfo.monoLoc, fieldInfo.monoMetaOff, fieldInfo.docsWithField);
     }
   }
 
@@ -138,7 +139,7 @@ public:
 
   //get underlying endRankReader, null if not multi-valued. Valid as long as IntColReader is valid.
    MonoReader* getEndRankReader() {
-    return endRankReader;
+    return endRankReader ? &(*endRankReader) : nullptr;
   }
 
   // Number of values in field.  For a multi-valued field, this will be greater than docsWithValue
@@ -151,7 +152,7 @@ public:
   }
 
   bool multiValued() const {
-    return endRankReader != nullptr;
+    return endRankReader.has_value();
   }
 
   /// Retrieves the start and end ranks into the values for the given rank.
@@ -386,7 +387,7 @@ public:
   /// For example, if docids[4]==1000, and docid 1000 has values {10, 11, 12}, then the callbacks would be:
   /// callback(4, 1000, 10, 0, 3), callback(4, 1000, 11, 1, 3), callback(4, 1000, 12, 2, 3).
   static void getValues(MemPool& pool, PostingsReader& postingsReader, SegFieldInfo& segFieldInfo, std::ranges::input_range auto&& sortedIds, auto&& callback) {
-    IntColReader intColReader(pool, postingsReader, segFieldInfo);
+    IntColReader intColReader(postingsReader, segFieldInfo);
     IntColReader::Iterator iter(intColReader);
 
     int32_t foundid = -1;
@@ -417,7 +418,7 @@ public:
   /// docids is a sorted range of docids to load values for in a multi-valued field.
   /// calls callback(size_t input_index, int32_t docid, int64_t value) for each docid that has any values.
   static void getSingleValues(MemPool& pool, PostingsReader& postingsReader, SegFieldInfo& segFieldInfo, std::ranges::input_range auto&& sortedDocIds, auto&& callback) {
-    IntColReader intColReader(pool, postingsReader, segFieldInfo);
+    IntColReader intColReader(postingsReader, segFieldInfo);
     IntColReader::Iterator iter(intColReader);
     assert(!intColReader.multiValued());
     int32_t foundid = -1;

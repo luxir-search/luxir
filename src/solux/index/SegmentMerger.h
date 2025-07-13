@@ -371,7 +371,7 @@ private:
       auto baseId = (int32_t)field->seg->base;
       unused(baseId);
 
-      IntColReader reader(pool, *field->seg->postingsReader, field->segFieldInfo);
+      IntColReader reader(*field->seg->postingsReader, field->segFieldInfo);
       IntColReader::BulkValues values(reader);
 
 
@@ -393,7 +393,7 @@ private:
       for (auto* field : sortedFields) {
         auto baseId = (int32_t)field->seg->base;
 
-        IntColReader reader(pool, *field->seg->postingsReader, field->segFieldInfo);
+        IntColReader reader(*field->seg->postingsReader, field->segFieldInfo);
         IntColReader::Iterator colIter(reader);
 
         [[maybe_unused]] int32_t highest = field->seg->postingsReader->maxDoc();
@@ -420,7 +420,7 @@ private:
       for (auto* field : sortedFields) {
         assert(field->segFieldInfo.flags & FieldType::MULTI_VALUED);
         // open IntColReader for each segment
-        IntColReader reader(pool, *field->seg->postingsReader, field->segFieldInfo);
+        IntColReader reader( *field->seg->postingsReader, field->segFieldInfo);
         MonoReader* endRankReader = reader.getEndRankReader();
         assert(endRankReader != nullptr);
         int64_t endRank;
@@ -481,7 +481,7 @@ private:
 
       assert(field->seg == &seg);
 
-      IntColReader& reader = *pool.make_align<IntColReader>(8, pool, *field->seg->postingsReader, field->segFieldInfo);
+      IntColReader& reader = *pool.make_align<IntColReader>(8, *field->seg->postingsReader, field->segFieldInfo);
       MonoReader* endRankReader = reader.getEndRankReader();
       IntColReader::BulkValues& values = *pool.make_align<IntColReader::BulkValues>(8, reader);
       screaming::BitSet::Iterator* docsIter = nullptr; // null means all docs have values.

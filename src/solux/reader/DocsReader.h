@@ -9,11 +9,10 @@ class DocsReader {
 
 public:
 
-  // initialize from docsWithField for the field if it exists
-  DocsReader(MemPool &pool, PostingsReader &postingsReader, const SegFieldInfo &fieldInfo) {
-    unused(pool);
+  /// initialize from docsWithField for the field if it exists
+  /// fieldInfo is only used in the constructor.
+  DocsReader(PostingsReader &postingsReader, const SegFieldInfo &fieldInfo) {
     ndocs = fieldInfo.docsWithField;
-
     if (ndocs != postingsReader.maxDoc()) {
       InputStream docsWithValIs = postingsReader.getInputStreamSeek(fieldInfo.docsWithFieldEndLoc);
       bits.set( docsWithValIs.ptr() );

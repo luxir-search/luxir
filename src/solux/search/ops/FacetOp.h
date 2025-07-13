@@ -64,7 +64,7 @@ public:
     fieldReader.readFieldInfo(segFieldInfo);
     // this is a int field for now, so we need to read the value for each doc
     // and accumulate counts per value.
-    IntColReader intColReader(poolGuard.pool(), postingsReader, segFieldInfo);
+    IntColReader intColReader(postingsReader, segFieldInfo);
     IntColReader::Iterator intColIter(intColReader);
     for (int32_t docid = 0; docid < maxDoc; docid++) {
       if (bitDocs && !bitDocs->get(docid)) {

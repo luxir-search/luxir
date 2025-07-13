@@ -71,7 +71,7 @@ public:
        */
 
       auto* segFieldInfo = cachedFieldInfo->segInfos[segment.ord]; // this segFieldInfo can't be null at this point
-      solux::IntColReader* normsReader = targetPool.make<solux::IntColReader>(targetPool, segment.postingsReader(),
+      solux::IntColReader* normsReader = targetPool.make<solux::IntColReader>(segment.postingsReader(),
                                                                               *segFieldInfo);
       return targetPool.make<TermQuery::Scorer>(*docsEnum, *normsReader, *cachedTermInfo->simScorer);
     }

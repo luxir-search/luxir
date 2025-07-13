@@ -614,7 +614,7 @@ TEST_F(PostingsTest, intCol) {
   SegFieldInfo fieldInfo;
   fieldReader.readFieldInfo(fieldInfo);
 
-  IntColReader colReader(pool, reader, fieldInfo);
+  IntColReader colReader(reader, fieldInfo);
   ASSERT_EQ(colReader.docsWithValue(), 3);
 
   {

@@ -71,7 +71,7 @@ public:
       }
 
       auto* segFieldInfo = cachedFieldInfo->segInfos[segment.ord]; // this segFieldInfo can't be null at this point
-      auto* normsReader = targetPool.make<IntColReader>(targetPool, segment.postingsReader(), *segFieldInfo);
+      auto* normsReader = targetPool.make<IntColReader>(segment.postingsReader(), *segFieldInfo);
       auto docsEnums = targetPool.make_span<DocsEnum*>(cachedTermInfos.size());
       for (int i = 0; i < cachedTermInfos.size(); i++) {
         docsEnums[i] = cachedTermInfos[i]->useDocsEnum(targetPool, segment);
