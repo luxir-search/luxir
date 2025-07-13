@@ -131,6 +131,16 @@ public:
     columnIS.seek(columnOff);
     blocks = columnIS.ptr();
     blockMeta = reinterpret_cast<const NumericBlockInfo *>(blocks + columnMetaOff);
+    nvals = 0;  // Initialize to 0 - caller should set this if needed
+    docsWithField = 0;
+  }
+
+  IntColReader(InputStream &is, int64_t columnOff, int64_t columnMetaOff, int64_t numValues) : docs(0), columnIS(is) {
+    columnIS.seek(columnOff);
+    blocks = columnIS.ptr();
+    blockMeta = reinterpret_cast<const NumericBlockInfo *>(blocks + columnMetaOff);
+    nvals = numValues;
+    docsWithField = static_cast<int32_t>(numValues);
   }
 
   DocsReader& docsReader() {

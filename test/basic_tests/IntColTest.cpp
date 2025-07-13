@@ -302,6 +302,33 @@ TEST_F(IntColTest, basicDelete) {
   ASSERT_EQ(-1, f.nextDoc());
 }
 
+TEST_F(IntColTest, testMonoRepeatedValues) {
+  // Test case with repeated values [1, 1, 3]
+  RAMDir dir;
+  auto file = dir.createFile("mono");
+  OutputStream out(file.get());
+  MemPool pool;
+  MonoWriter w(pool, out);
+  
+  // Add the problematic sequence
+  w.addInt64(1);
+  w.addInt64(1);
+  w.addInt64(3);
+  
+  int nVals = w.finish();
+  out.close();
+  dir.finishFile(*file);
+  
+  auto in = dir.openFile("mono");
+  InputStream is(in->getInputStream());
+  MonoReader r(is, w.blockLoc.offset(), w.metaOff, nVals);
+  
+  ASSERT_EQ(nVals, r.numValues());
+  ASSERT_EQ(1, r.valueAt(0)) << "First value should be 1";
+  ASSERT_EQ(1, r.valueAt(1)) << "Second value should be 1";
+  ASSERT_EQ(3, r.valueAt(2)) << "Third value should be 3";
+}
+
 TEST_F(IntColTest, testMonoBig) {
   for (int iter=0; iter<1; iter++) {
     RAMDir dir;

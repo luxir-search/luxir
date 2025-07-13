@@ -12,10 +12,28 @@ class IndexReader;
 /// An OrdMap can map between segment ordinals and global ordinals.
 /// This is used for fast sorting and faceting across multiple segments.
 class OrdMap {
+public:
+  struct SegToGlobal {
+    int64_t numOrds;
+    MonoReader* segToGlobal; // null if segment had no values for the field, or if it has all of the values
+  };
+
+private:
+  struct SegToGlobalHolder {
+    int64_t numOrds;
+    std::unique_ptr<MonoReader> segToGlobal;
+
+    SegToGlobal get() const {
+      return {numOrds, segToGlobal.get()};
+    }
+  };
+
+
   std::unique_ptr<char[]> data; // the raw data for the OrdMap
 
-  int64_t nords;
-  std::vector<std::unique_ptr<MonoReader>> segToGlobal;    // per-segment mapping from segment ord to global ord
+  int64_t nOrds;
+  int firstFull = -1; // first segment that has all the ords, or -1 if none
+  std::vector<SegToGlobalHolder> segToGlobal;    // per-segment mapping from segment ord to global ord
   std::optional<IntColReader> firstSegs;  // for each global ord, what is the first segment it appeared in
   std::optional<IntColReader> globDeltas; // for each global ord, what delta was applied to the segment ord to get the global ord
 
@@ -29,33 +47,38 @@ public:
     auto metaSize = dataIS.readInt();
 
     dataIS.seek(end - sizeof(int32_t) - metaSize);
-    nords = dataIS.readVlong();
+    nOrds = dataIS.readVlong();
     auto nSegs = dataIS.readVlong();
     segToGlobal.reserve(nSegs);
     for (auto i = 0u; i < nSegs; i++) {
       auto nValues = dataIS.readVlong();
-      auto loc = dataIS.readVlong();
-      auto metaOff = dataIS.readVlong();
-      if (nValues > 0) {
-        segToGlobal.emplace_back(std::make_unique<MonoReader>(dataIS, start + loc, metaOff, nValues));
+
+      if (nValues > 0 && nValues != nOrds) {
+        auto loc = dataIS.readVlong();
+        auto metaOff = dataIS.readVlong();
+        segToGlobal.emplace_back((int64_t)nValues,
+          std::make_unique<MonoReader>(dataIS, start + loc, metaOff, nValues));
       } else {
-        segToGlobal.emplace_back(nullptr);
+        if (nValues == nOrds && firstFull == -1) {
+          firstFull = (int)i;
+        }
+        segToGlobal.emplace_back((int64_t)nValues, nullptr);
       }
     }
 
     // now the global columns
     auto nValues = dataIS.readVlong();
-    if (nValues > 0) {
+    if (nValues > 0 && firstFull == -1) {  // Create global columns if no segment has all terms
       auto loc = dataIS.readVlong();
       auto metaOff = dataIS.readVlong();
-      firstSegs.emplace(dataIS, start + loc, metaOff);
+      firstSegs.emplace(dataIS, start + loc, metaOff, nValues);
     }
 
     nValues = dataIS.readVlong();
-    if (nValues > 0) {
+    if (nValues > 0 && firstFull == -1) {  // Create global columns if no segment has all terms
       auto loc = dataIS.readVlong();
       auto metaOff = dataIS.readVlong();
-      globDeltas.emplace(dataIS, start + loc, metaOff);
+      globDeltas.emplace(dataIS, start + loc, metaOff, nValues);
     }
   }
 
@@ -63,7 +86,29 @@ public:
   static std::shared_ptr<OrdMap> build(std::string_view field, IndexReader& reader);
   
   /// Get the total number of unique terms across all segments
-  int64_t numOrds() const { return nords; }
+  int64_t numOrds() const { return nOrds; }
+
+  /// Returns -1, or the first segment that has all the ords.
+  int firstFullSeg() const { return firstFull; }
+
+  /// Gets the mapping from segment ord to global ord, or null if the segment had no or all values for the field.
+  SegToGlobal getSegToGlobal(int seg) const {
+    assert(seg >= 0 && seg < (int)segToGlobal.size());
+    return segToGlobal[seg].get();
+  }
+
+  /// Returns the firstSegs IntColReader, or null if not present/needed since at least one segment had all the ords.
+  IntColReader* getFirstSegs() {
+    return firstSegs ? &(*firstSegs) : nullptr;
+  }
+
+  /// Returns the globDeltas IntColReader, or null if not present/needed since at least one segment had all the ords.
+  IntColReader* getGlobDeltas() {
+    return globDeltas ? &(*globDeltas) : nullptr;
+  }
+
+  // TODO: create some convenience mapping classes to handle all the "null" and full-segment edge cases.
+
 };
 
 }

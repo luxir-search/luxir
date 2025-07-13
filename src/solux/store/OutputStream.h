@@ -40,8 +40,6 @@ public:
 };
 
 
-class OutputStream;
-
 class File {
   friend class OutputStream;
 
@@ -287,6 +285,9 @@ class RAMFile : public File {
       os.start = ptr.get();
       os.pos = os.start;
       os.end = os.start + sz;
+    } else {
+      // In case anyone asks the output stream for its size after last flush.
+      os.start = os.pos = os.end = nullptr;
     }
   }
 
@@ -333,6 +334,7 @@ public:
 
   /// appends the input RAMFile by stealing its buffers.
   void destructiveAppend(RAMFile &in) {
+    if (this == &in) return; // no-op
     assert(in.firstBuffer == nullptr); // not implemented yet
     auto otherSize = in.size();
     for (auto& pair : in.buffers) {

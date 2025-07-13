@@ -13,7 +13,7 @@ namespace solux {
 // Format (designed for index-time on-disk as well as on-demand in RAM):
 // [seg1-deltas][seg2-deltas]...[segN-deltas]
 // [firstSegs][globDeltas]
-// [numOrds (vLong)]
+// [numGlobalOrds (vLong)]
 // [numSegs (vLong)]
 // [seg1-meta][seg2-meta]...[segN-meta]
 // [firstSegs-meta][globDeltas-meta]
@@ -23,7 +23,7 @@ namespace solux {
 // Each seg encoded as separate integer column using monotonic compression (MonoWriter).
 //
 // seg1-meta contains MonoWriter metadata (offset, metaOffset, nValues)
-//   nValues (vLong) = number of values in this column.  if nValues == 0, no other metadata is present.
+//   nValues (vLong) = number of values in this column.  if nValues == 0 or numGlobalOrds, no other metadata is present.
 //   offset (vLong) = offset from start of OrdMap (not absolute like the location is in SegFieldInfo)
 //   metaOffset (vLong) = offset from the start of *this* column's start.
 //
@@ -85,21 +85,23 @@ public:
     int segsWithValue = 0;
     for (int i=0; i<nsegs; i++) {
       auto& seg = segs[i];
-      FieldReader fieldReader(pool, seg.postingsReader());
-      if (!fieldReader.seek(field)) {
+      // Allocate FieldReader in pool so it has same lifetime as SegFieldInfo
+      auto* fieldReader = pool.make<FieldReader>(pool, seg.postingsReader());
+      if (!fieldReader->seek(field)) {
         // Field not found in this segment
         allTermsEnums.emplace_back(nullptr);
         continue;
       }
-      SegFieldInfo fieldInfo;  // NOTE! stack! this needs to stay in scope while the TermsEnum is used.
-      fieldReader.readFieldInfo(fieldInfo);
+      auto* fieldInfo = pool.make<SegFieldInfo>();  // Allocate in pool to avoid stack-use-after-scope
+      fieldReader->readFieldInfo(*fieldInfo);
       //       TermsEnumIdx(size_t idx, MemPool& pool, PostingsReader& postingsReader, SegFieldInfo& finfo) : idx(idx), tenum(pool, postingsReader, finfo), deltas(pool) {}
 
 
-      allTermsEnums.emplace_back(pool.make_unique<TermsEnumIdx>(i, pool, seg.postingsReader(), fieldInfo));
+      allTermsEnums.emplace_back(pool.make_unique<TermsEnumIdx>(i, pool, seg.postingsReader(), *fieldInfo));
       // position the TermsEnum on the first term
-      if (allTermsEnums.back()->tenum.nextTerm()) {
-        allTermsEnums.back().reset();  // defensive coding, every field should have at least one term.
+      if (!allTermsEnums.back()->tenum.nextTerm()) {
+        // defensive coding, every field should have at least one term.
+        allTermsEnums.back().reset();
         continue;
       }
       segsWithValue++;
@@ -108,6 +110,13 @@ public:
     if (segsWithValue == 0) {
       return;
     }
+    
+    // Fast path: if only one segment has values, no OrdMap is needed (identity mapping)
+    if (segsWithValue == 1) {
+      return;
+    }
+
+    // TODO: fast path when all segments are full or empty? (i.e. fast path check for full)
 
     // Fill in a compressed version (no nulls) of the TermsEnumIdx pointers for the priority queue.
     auto tenums = pool.make_span<TermsEnumIdx*>(segsWithValue);
@@ -118,21 +127,23 @@ public:
       }
     }
 
-    auto termCmp = [](const TermsEnumIdx& a, const TermsEnumIdx& b){
-      auto cmp = b.tenum.term() <=> a.tenum.term(); // TODO: change spaceship operator on PackedTerm to use std::strong_ordering
+    auto termCmp = [](const TermsEnumIdx& a, const TermsEnumIdx& b) -> bool {
+      // For a min-heap (smallest term first), we need: return true when a > b
+      // This makes std::make_heap put the smallest element at the top
+      auto cmp = a.tenum.term() <=> b.tenum.term();
       if (cmp != 0) {
-        return cmp;
+        return cmp > 0; // return true when a > b (for min-heap)
       }
 
       // tiebreak by number of terms in the segment (largest first) so that "firstSegment" will normally
       // be the same segment for good locality during lookup.
       auto cmp2 = a.tenum.numTerms() - b.tenum.numTerms();
       if (cmp2 != 0) {
-        return cmp2;
+        return cmp2 < 0; // For min-heap: return true when a should come before b in heap order
       }
 
       // tiebreak by index last to prefer first segments over later segments.
-      return (int)(b.idx - a.idx);
+      return a.idx > b.idx; // For min-heap: return true when a should come before b in heap order
     };
     IndirectPQ<TermsEnumIdx, decltype(termCmp)> termPQ(tenums);
 
@@ -152,6 +163,7 @@ public:
     while (termPQ.size() > 0) {
       globalOrd++;
       TermsEnumIdx& first = termPQ.top();
+      
       // There is a tradeoff here.  We need to find other TermsEnumIdx that are positioned on the same term.
       // We could: 1) make a copy of the term and then advance it with updateTop()
       //           2) remove to from the PQ, then after processing all matching segments, advance and reinsert it.
@@ -184,37 +196,39 @@ public:
     }
 
     auto firstSegsInfo = firstSegs.finish();
-    firstSegsOut.flush();
+    firstSegsOut.flush(true);
     auto globDeltasInfo = globDeltas.finish();
-    // remember size, we will append metadata to this
-    auto globDeltasSize = globDeltasOut.size();
-    // Don't call globDeltasOut.flush() yet, we will use it to write metadata
-    auto& metaOut = globDeltasOut;
-    metaOut.writeVlong(allTermsEnums.size());
+    globDeltasOut.flush(true);
 
+    RAMFile metaOutFile("metaOut");
+    OutputStream metaOut(&metaOutFile);
+    metaOut.writeVlong(globalOrd + 1);  // numGlobalOrds
+    metaOut.writeVlong(allTermsEnums.size());  // numSegs
+
+    bool needGlobalDeltas = true;
     int64_t ordMapStart = 0;  // currently just one ord map per file/buffer, and no header.
-
     RAMFile* outFile = nullptr;
     int64_t cumulativeSize = 0;
 
-    // find the first non-empty segment and use its RAMFile as the output.
+    // find the first non-empty and non-full segment and use its RAMFile as the output.
     for (auto& tenum : allTermsEnums) {
-      if (outFile == nullptr && tenum) {
+      bool writeDeltas = tenum && tenum->tenum.numTerms() < (globalOrd + 1);
+      auto nTerms = tenum ? tenum->tenum.numTerms() : 0;
+      if (outFile == nullptr && writeDeltas) {
         outFile = &tenum->deltas.file;
       }
-      if (tenum) {
-        int64_t thisSize = tenum->deltas.out.size();
+      if (writeDeltas) {
         auto numValues = tenum->deltas.writer.finish();
-        tenum->deltas.out.flush();
+        int64_t thisSize = tenum->deltas.out.size();
+        tenum->deltas.out.flush(true);
+        assert(thisSize == tenum->deltas.file.size());
         auto [filenum, loc] = tenum->deltas.writer.blockLoc.decode();
         auto metaOff = tenum->deltas.writer.metaOff;
         auto adjustedLoc = cumulativeSize + loc;
 
         if (outFile == nullptr) {
           outFile = &tenum->deltas.file;
-          thisSize = outFile->size();
         } else {
-          thisSize = tenum->deltas.file.size();
           outFile->destructiveAppend(tenum->deltas.file);
         }
         cumulativeSize += thisSize;
@@ -224,37 +238,47 @@ public:
         metaOut.writeVlong(adjustedLoc);
         metaOut.writeVlong(metaOff);
       } else {
-        metaOut.writeVlong(0);
+        // if empty or full, just write the number of terms.
+        metaOut.writeVlong(nTerms);
       }
     }
 
     if (outFile == nullptr) {
-      // This shouldn't happen since we checked segsWithValue above, and we should not have fields with no values.
-      throw std::runtime_error("InternalError: PLEASE REPORT! OrdMapBuilder no segments with values.");
+      // we don't need to write any deltas for the segments, and that means we don't need
+      // the firstSegs/globDeltas columns either.
+      outFile = &metaOutFile;
+      needGlobalDeltas = false;
     }
 
-    // redundant numValues for the global columns, but it makes reading simpler.
-    assert(firstSegsInfo.numValues == globDeltasInfo.numValues);
+    if (needGlobalDeltas) {
+      // redundant numValues for the global columns, but it makes reading simpler.
+      assert(firstSegsInfo.numValues == globDeltasInfo.numValues);
 
-    metaOut.writeVlong(firstSegsInfo.numValues);
-    metaOut.writeVlong(firstSegsInfo.columnLoc + cumulativeSize);
-    metaOut.writeVlong(firstSegsInfo.columnMetaOff);
-    cumulativeSize += firstSegsOut.size();
-    outFile->destructiveAppend(firstSegsFile);
+      metaOut.writeVlong(firstSegsInfo.numValues);
+      metaOut.writeVlong(firstSegsInfo.columnLoc + cumulativeSize);
+      metaOut.writeVlong(firstSegsInfo.columnMetaOff);
+      cumulativeSize += firstSegsFile.size();
+      outFile->destructiveAppend(firstSegsFile);
+      assert(outFile->size() == cumulativeSize);
 
-    metaOut.writeVlong(globDeltasInfo.numValues);
-    metaOut.writeVlong(globDeltasInfo.columnLoc + cumulativeSize);
-    metaOut.writeVlong(globDeltasInfo.columnMetaOff);
-    cumulativeSize += globDeltasSize;
+
+      metaOut.writeVlong(globDeltasInfo.numValues);
+      metaOut.writeVlong(globDeltasInfo.columnLoc + cumulativeSize);
+      metaOut.writeVlong(globDeltasInfo.columnMetaOff);
+      cumulativeSize += globDeltasFile.size();
+      outFile->destructiveAppend(globDeltasFile);  // globDeltasFile is what we were appending metadata to.
+      assert(outFile->size() == cumulativeSize);
+    }
 
     // finally write the size of the metadata, then we can flush and add to outFile.
-    // at this point metaOut.size() includes both the size of the globalDeltas and the size of the metadata.
-    auto metaSize = metaOut.size() - globDeltasSize;
+    auto metaSize = metaOut.size();
     cumulativeSize += metaSize;
     metaOut.writeInt((int32_t)metaSize);
-    metaOut.flush();
+    metaOut.flush(true);
     cumulativeSize += sizeof(int32_t);
-    outFile->destructiveAppend(globDeltasFile);  // globDeltasFile is what we were appending metadata to.
+    if (outFile != &metaOutFile) {
+      outFile->destructiveAppend(metaOutFile);
+    }
 
     assert(outFile->size() == cumulativeSize);
 
@@ -271,6 +295,7 @@ public:
 // Or we could just make IndexReader easier to construct w/o taking a Directory, etc.
 std::shared_ptr<OrdMap> OrdMap::build(std::string_view field, IndexReader& reader) {
   OrdMapBuilder builder(field, reader);
+  builder.build();
   if (!builder.data) {
     return {};
   }

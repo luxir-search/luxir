@@ -197,6 +197,7 @@ public:
   uint32_t copyTo(PackedTerm& target) const noexcept {
     auto nbytes = getMemSize(size());
     memcpy(target.ptr_, ptr_, nbytes);
+    return nbytes;
   }
 
   // expert: should already point to an instance of this type
