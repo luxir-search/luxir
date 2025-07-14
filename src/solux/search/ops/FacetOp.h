@@ -228,6 +228,24 @@ class StrFacetReq : public IntFacetBaseReq {
     }
   };
 
+  class MergeableStrFacetInline : public MergeableData {
+  public:
+    FacetMap<std::string> counts;
+    int64_t missing_num = 0; // number of missing values in this segment
+
+    static MergeableStrFacetInline* merge(MergeableStrFacetInline* a, MergeableStrFacetInline* b) {
+      // merge the smaller collector into the larger collector, or if both the same size, merge
+      // the less competitive collector into the more competitive collector.
+      if (a->counts.map.size() < b->counts.map.size()) {
+        std::swap(a,b);
+      }
+
+      a->counts.merge(b->counts);
+      a->missing_num += b->missing_num;
+      return a;
+    }
+  };
+
 public:
   StrFacetReq(SearchRequest& req, std::string_view fieldName, std::string_view facetName, int64_t limit, int64_t minCount, bool missing) :
   IntFacetBaseReq(req, fieldName, facetName, limit, minCount, missing){}
@@ -235,6 +253,8 @@ public:
   class Calc : public Calculator {
     std::vector<DocSet*> input;
     AtomicMerger<MergeableStrFacet> countMerger;
+    AtomicMerger<MergeableStrFacetInline> inlineMerger;
+    std::vector<std::unique_ptr<SearchOp::InlineCalculator>> inlineCalcs;
   public:
     Calc(SearchOp& op, Calculator* parent, int64_t slot, int64_t numSlots) : Calculator(op, parent, slot, numSlots) {
       input.resize(op.req.reader->segments().size());
@@ -253,6 +273,10 @@ public:
       //TODO: need to account for slot somehow,  or will subop do that?
     };
     void calc(oneapi::tbb::task_group* tg, int32_t segnum, DocSet* domain) override {
+      if (!inlineCalcs.empty()) {
+        calc2(tg, segnum, domain);
+        return;
+      }
       //write only to different slots, so no need to synchronize
       input[segnum] = domain;
       SegFieldInfo segFieldInfo;
@@ -287,18 +311,44 @@ public:
       }
       auto merged = countMerger.release(mergeableData.release());
       if (merged == thisOp().reader.segments().size()) {
-        facetResult(tg);
+        facetResult(tg, std::unique_ptr<MergeableStrFacet>(countMerger.obtain()), nullptr);
       }
     };
 
-    void facetResult(oneapi::tbb::task_group* tg) {
+    void calc2(oneapi::tbb::task_group* tg, int32_t segnum, DocSet* domain) {
+      //write only to different slots, so no need to synchronize
+      input[segnum] = domain;
+      SegFieldInfo segFieldInfo;
+      PostingsReader& postingsReader = thisOp().reader.segments()[segnum].postingsReader();
+      auto poolGuard = MemPool::threadLocalPoolGuard();
+
+      std::unique_ptr<MergeableStrFacetInline> mergeableData(inlineMerger.obtain());
+      TermsEnum tenum(poolGuard.pool(), postingsReader, segFieldInfo);
+
+      int64_t missing_num = 0;
+      auto& facetReq = (FacetReq&)getOp();
+      facetReq.facetSegIntCol(domain, segnum, missing_num, segFieldInfo,
+        [&](int32_t docid, int64_t val) {
+          tenum.seekOrd(val - 1);
+        std::string_view termView = (std::string_view) tenum.term();
+          mergeableData->counts.add((std::string) termView, docid);
+        });
+
+      mergeableData->missing_num += missing_num;
+
+      auto merged = inlineMerger.release(mergeableData.release());
+      if (merged == thisOp().reader.segments().size()) {
+        facetResult(tg, nullptr, std::unique_ptr<MergeableStrFacetInline>(inlineMerger.obtain()));
+      }
+    }
+
+    void facetResult(oneapi::tbb::task_group* tg, std::unique_ptr<MergeableStrFacet> mergedData, std::unique_ptr<MergeableStrFacetInline> inlineData) {
       auto* myVal = getTarget(nullptr);
       solux::proto::FacetResult& facetResultProto = *myVal->mutable_facet();
       auto minCount = thisOp().minCount;
       auto limit = thisOp().limit;
       auto missing = thisOp().missing;
 
-      std::unique_ptr<MergeableStrFacet> mergedData(countMerger.obtain());
       auto& counts = mergedData->counts;
 
       std::vector<std::pair<std::string, int64_t>> countVec;

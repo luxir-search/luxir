@@ -122,10 +122,6 @@ public:
       double val;
     };
 
-    MemPool pool;
-    MemPool::save_point start;
-    std::optional<FieldReader> fieldReader;
-    std::optional<SegFieldInfo> segFieldInfo;
     std::optional<IntColReader> intColReader;
     std::optional<IntColReader::Iterator> intColIter;
 
@@ -207,26 +203,25 @@ public:
     }
 
     void startSeg(int32_t segnum) override {
-      start = pool.getSavePoint();
+      auto guard = MemPool::threadLocalPoolGuard();
+      auto& pool = guard.pool();
+      SegFieldInfo segFieldInfo;
       auto& postingsReader = thisOp().req.reader->segments()[segnum].postingsReader();
-      fieldReader.emplace(pool, postingsReader);
-      bool found = fieldReader->seek(thisOp().fieldName);
+      FieldReader fieldReader(pool, postingsReader);
+      bool found = fieldReader.seek(thisOp().fieldName);
       if (!found) {
         return; // field not found, nothing to do
       }
-      fieldReader->readFieldInfo(*segFieldInfo);
+      fieldReader.readFieldInfo(segFieldInfo);
       // this is a int field for now, so we need to read the value for each doc
       // and accumulate counts per value.
-      intColReader.emplace(postingsReader, *segFieldInfo);
+      intColReader.emplace(postingsReader, segFieldInfo);
       intColIter.emplace(*intColReader);
     }
 
     void endSeg(int32_t segnum) override {
       intColIter.reset();
       intColReader.reset();
-      fieldReader.reset();
-      segFieldInfo.reset();
-      pool.rewind(start);
     };
   };
 

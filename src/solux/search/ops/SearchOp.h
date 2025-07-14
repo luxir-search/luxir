@@ -102,9 +102,10 @@ public:
   MemPool pool;
 
   FacetMap(std::span<SearchOp::InlineCalculator*> calcs) : calcs(calcs) {}
+  FacetMap() = default;
 
   void add(const Key& key, int32_t docid) {
-    auto [iter, inserted] = map.insert(key, nullptr);
+    auto [iter, inserted] = map.insert({key, nullptr});
 
     if (inserted) {
       auto ptr = pool.reserve(sizeof(int64_t));
@@ -141,9 +142,9 @@ public:
     }
   }
 
-  void merge(FacetMap& other) {
+  void merge(FacetMap<Key>& other) {
     for (auto& [key, otherPtr] : other.map) {
-      auto [iter, inserted] = map.insert(key, nullptr);
+      auto [iter, inserted] = map.insert({key, nullptr});
       if (inserted) {
         auto ptr = pool.reserve(sizeof(int64_t));
         int space = (int)pool.spaceLeft();
