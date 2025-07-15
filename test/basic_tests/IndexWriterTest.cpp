@@ -1266,7 +1266,7 @@ TEST_F(IndexWriterTest, removeFields) {
 }
 
 
-// Test coreGen tracking
+// Test coreGen tracking and segment commit_time
 TEST_F(IndexWriterTest, testCoreGen) {
   using namespace solux::test;
 
@@ -1290,6 +1290,18 @@ TEST_F(IndexWriterTest, testCoreGen) {
   auto reader2 = iw->getIndexReader();
   EXPECT_EQ(initialCoreGen + 1, reader2->coreGen()); // First segment added
   EXPECT_EQ(initialSegments + 1, reader2->segments().size());
+  
+  // Check that the new segment has a commit_time set
+  uint64_t firstSegmentCommitTime = 0;
+  uint64_t firstSegmentId = 0;
+  for (const auto& segment : reader2->segments()) {
+    if (segment.segInfo.max_doc == 3) { // Find our newly added segment
+      firstSegmentCommitTime = segment.segInfo.commit_time;
+      firstSegmentId = segment.segInfo.seg_id;
+      EXPECT_GT(firstSegmentCommitTime, 0) << "First segment should have commit_time set";
+      break;
+    }
+  }
 
   // Add another batch in a new segment
   std::vector<Doc> secondBatch;
@@ -1300,6 +1312,19 @@ TEST_F(IndexWriterTest, testCoreGen) {
   auto reader3 = iw->getIndexReader();
   EXPECT_EQ(initialCoreGen + 2, reader3->coreGen()); // Second segment added
   EXPECT_EQ(initialSegments + 2, reader3->segments().size());
+  
+  // Check that the second segment has a different commit_time
+  uint64_t secondSegmentCommitTime = 0;
+  for (const auto& segment : reader3->segments()) {
+    if (segment.segInfo.max_doc == 2) { // Find the second segment
+      secondSegmentCommitTime = segment.segInfo.commit_time;
+      EXPECT_GT(secondSegmentCommitTime, 0) << "Second segment should have commit_time set";
+      EXPECT_GT(secondSegmentCommitTime, firstSegmentCommitTime);
+    } else if (segment.segInfo.seg_id == firstSegmentId) {
+      // Verify first segment's commit_time hasn't changed
+      EXPECT_EQ(segment.segInfo.commit_time, firstSegmentCommitTime);
+    }
+  }
 
   // Delete a document - this should NOT increment coreGen if segment still has live docs
   uint64_t coreGenBeforeDelete = reader3->coreGen();
@@ -1308,6 +1333,15 @@ TEST_F(IndexWriterTest, testCoreGen) {
   auto reader4 = iw->getIndexReader();
   EXPECT_EQ(coreGenBeforeDelete, reader4->coreGen()); // No segment composition change
   EXPECT_EQ(initialSegments + 2, reader4->segments().size()); // Still have same number of segments
+  
+  // Verify that segment commit_times haven't changed after delete
+  for (const auto& segment : reader4->segments()) {
+    if (segment.segInfo.seg_id == firstSegmentId) {
+      EXPECT_EQ(segment.segInfo.commit_time, firstSegmentCommitTime);
+    } else if (segment.segInfo.max_doc == 2) {
+      EXPECT_EQ(segment.segInfo.commit_time, secondSegmentCommitTime);
+    }
+  }
 
   // Merge segments - this should increment coreGen
   iw->mergePolicy->mergeFactor = 2; // Force merge
@@ -1319,4 +1353,18 @@ TEST_F(IndexWriterTest, testCoreGen) {
 
   auto reader5 = iw->getIndexReader();
   EXPECT_GT(reader5->coreGen(), coreGenBeforeDelete); // Merge changed segments
+  
+  // Check that merged segment has a new commit_time
+  uint64_t mergedSegmentCommitTime = 0;
+  int mergedSegmentCount = 0;
+  for (const auto& segment : reader5->segments()) {
+    // The merged segment should have more docs than any individual segment before
+    if (segment.segInfo.max_doc > 3) {
+      mergedSegmentCommitTime = segment.segInfo.commit_time;
+      mergedSegmentCount++;
+      EXPECT_GT(mergedSegmentCommitTime, 0);
+      EXPECT_GT(mergedSegmentCommitTime, secondSegmentCommitTime);
+    }
+  }
+  EXPECT_EQ(mergedSegmentCount, 1);
 }
