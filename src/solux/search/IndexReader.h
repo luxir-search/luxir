@@ -64,17 +64,18 @@ public:
     const std::shared_ptr<LiveDocs> sharedLiveDocs;
   public:
     struct SegmentInfo {
-      uint64_t seg_id = 1;                    // Unique identifier for the segment
-      uint64_t live_gen = 2;               // What deletes version to use for the segment (0 if no deletes)
-      uint64_t min_version = 3;               // Minimum update version in this segment
-      uint64_t max_version = 4;               // Maximum update version in this segment
-      int32_t  max_doc = 5;                   // Number of documents in this segment (ignoring deletes)
-      int32_t  live_docs = 6;                   // Number of live documents in this segment
+      uint64_t seg_id;          // Unique identifier for the segment
+      uint64_t live_gen;        // What deletes version to use for the segment (0 if no deletes)
+      uint64_t min_version;     // Minimum update version in this segment
+      uint64_t max_version;     // Maximum update version in this segment
+      uint64_t commit_time;     // first time this segment was committed as part of the index
+      int32_t  max_doc;         // Number of live documents in this segment
+      int32_t  live_docs;       // Number of live documents in this segment
     };
 
     const SegmentInfo segInfo;    // metadata read from the index info file about the segment
     const int64_t base;           // global index (ordinal/rank) of the first document in this segment with respect to the list of segments
-    const int32_t ord;                // index of this segment in the list of segments
+    const int32_t ord;            // index of this segment in the list of segments
 
     Segment(std::shared_ptr<PostingsReader>&& postingsReader, std::shared_ptr<LiveDocs>&& liveDocs, 
               SegmentInfo segInfo, int64_t base, int ord)
@@ -126,6 +127,12 @@ public:
   int64_t liveDocs() const noexcept {
     return livedocs;
   }
+  
+  // Get the core generation for this index reader
+  // This can be used as a cache key for structures that depend on segments but don't care about deletes.
+  uint64_t coreGen() const noexcept {
+    return coreGeneration;
+  }
 
   IndexReader(Directory& dir);
 
@@ -134,6 +141,7 @@ private:
   int64_t maxdoc = 0;
   int64_t livedocs = 0;
   uint64_t commitTimeUs = 0;
+  uint64_t coreGeneration = 0;
 };
 
 }

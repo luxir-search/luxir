@@ -1264,3 +1264,59 @@ TEST_F(IndexWriterTest, removeFields) {
     EXPECT_FALSE(fieldsReader.seek("int_is"));
   }
 }
+
+
+// Test coreGen tracking
+TEST_F(IndexWriterTest, testCoreGen) {
+  using namespace solux::test;
+
+  CollectionHelper helper("coreGenTest");
+  helper.clear();
+
+  auto iw = helper.getIndexWriter();
+
+  // Get initial coreGen (may not be 0 due to persistent IndexWriter)
+  auto reader1 = iw->getIndexReader();
+  uint64_t initialCoreGen = reader1->coreGen();
+  size_t initialSegments = reader1->segments().size();
+
+  // Add multiple documents in single segment and commit
+  std::vector<Doc> firstBatch;
+  firstBatch.push_back(flatdoc("id", "doc1"));
+  firstBatch.push_back(flatdoc("id", "doc2"));
+  firstBatch.push_back(flatdoc("id", "doc3"));
+  helper.index(firstBatch, UpdateMessage::COMMIT, true);
+
+  auto reader2 = iw->getIndexReader();
+  EXPECT_EQ(initialCoreGen + 1, reader2->coreGen()); // First segment added
+  EXPECT_EQ(initialSegments + 1, reader2->segments().size());
+
+  // Add another batch in a new segment
+  std::vector<Doc> secondBatch;
+  secondBatch.push_back(flatdoc("id", "doc4"));
+  secondBatch.push_back(flatdoc("id", "doc5"));
+  helper.index(secondBatch, UpdateMessage::COMMIT, true);
+
+  auto reader3 = iw->getIndexReader();
+  EXPECT_EQ(initialCoreGen + 2, reader3->coreGen()); // Second segment added
+  EXPECT_EQ(initialSegments + 2, reader3->segments().size());
+
+  // Delete a document - this should NOT increment coreGen if segment still has live docs
+  uint64_t coreGenBeforeDelete = reader3->coreGen();
+  helper.deleteById("doc1", UpdateMessage::COMMIT);
+
+  auto reader4 = iw->getIndexReader();
+  EXPECT_EQ(coreGenBeforeDelete, reader4->coreGen()); // No segment composition change
+  EXPECT_EQ(initialSegments + 2, reader4->segments().size()); // Still have same number of segments
+
+  // Merge segments - this should increment coreGen
+  iw->mergePolicy->mergeFactor = 2; // Force merge
+  iw->mergeSegments();
+
+  // Add a doc to trigger commit after merge
+  Doc doc6 = flatdoc("id", "doc6", field, "test document 6");
+  helper.index(doc6, UpdateMessage::COMMIT, true);
+
+  auto reader5 = iw->getIndexReader();
+  EXPECT_GT(reader5->coreGen(), coreGenBeforeDelete); // Merge changed segments
+}

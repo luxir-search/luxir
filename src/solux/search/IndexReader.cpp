@@ -125,6 +125,7 @@ IndexReader::IndexReader(Directory& dir) {
       assert(codedStream.ConsumedEntireMessage());
 
       commitTimeUs = indexInfo->commit_time();
+      coreGeneration = indexInfo->core_gen();
       bool missingFileOK = true; // Allow missing files on first attempt
       IREADER_DEBUG("\tOpening IndexReader, commitTime={} nSegs={} gen={}", indexInfo->commit_time(),
                     indexInfo->segments_size(), indexInfo->index_gen());
@@ -167,6 +168,7 @@ IndexReader::IndexReader(Directory& dir) {
         segmentInfo.min_version = segment.min_version();
         segmentInfo.max_version = segment.max_version();
         segmentInfo.max_doc = nDocs;
+        segmentInfo.commit_time = segment.commit_time();
         segmentInfo.live_docs = segment.live_docs();
 
         segs.emplace_back(std::move(postingsReader), std::move(liveDocs), segmentInfo, maxdoc, i);

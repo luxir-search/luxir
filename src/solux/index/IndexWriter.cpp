@@ -73,8 +73,10 @@ IndexWriter::IndexWriter(Directory& dir) : dir(dir) {
 
     lastCommitTime = lastAdvertisedCommitTime = indexInfo.commit_time();
     indexGen = indexInfo.index_gen();
+    coreGen = indexInfo.core_gen();
     updateBase = indexInfo.update_version() + 1;
     segInfos.reserve(indexInfo.segments_size());
+    lastCommittedSegIds.reserve(indexInfo.segments_size());
 
     // TODO: maybe maintain segment order by recording ord in segments file.
     for (int i = 0; i < indexInfo.segments_size(); i++) {
@@ -91,9 +93,13 @@ IndexWriter::IndexWriter(Directory& dir) : dir(dir) {
       seg.minVersion = segment.min_version();
       seg.maxVersion = segment.max_version();
       seg.liveDocs = segment.live_docs();
-      seg.commitTime = indexInfo.commit_time();
+      seg.firstCommitTime = segment.commit_time();  // firstCommitTime is stored in the segment meta.
+      seg.lastCommitTime = indexInfo.commit_time(); // not stored in the segment meta, so use index meta.
       mergePolicy->_update(&seg);
+      lastCommittedSegIds.push_back(segId);
     }
+    // Sort to ensure consistent ordering for comparison (currently not needed since we sort when doing commit)
+    // std::sort(lastCommittedSegIds.begin(), lastCommittedSegIds.end());
   }
 
   // Create the updateGraph.  Start with a serial node that assigns an order to each update command
@@ -493,13 +499,12 @@ void IndexWriter::finishCommitBody(UpdateMessage& msg) {
 
   {
     const std::lock_guard<std::mutex> lock(indexMutex);
-    auto lastCommit = lastCommitTime.load(std::memory_order::relaxed);
     segs.reserve(segInfos.size());
     // grab all segments and mark them as being part of a commit.
     for (auto& [segId, seg] : segInfos) {
       segs.push_back(seg.get());
-      if (seg->commitTime == 0) {
-        seg->commitTime = 1; // IMPORTANT - for marking it in use to prevent its deletion.
+      if (seg->lastCommitTime == 0) {
+        seg->lastCommitTime = 1; // IMPORTANT - for marking it in use to prevent its deletion.
       }
       if (!seg->personalDeletes.empty()) {
         // this segment has personal deletes that need to be applied.
@@ -630,7 +635,7 @@ void IndexWriter::finishCommitBody(UpdateMessage& msg) {
       for (auto& [segId, seg] : segInfos) {
         // TODO: is it possible for any personal deletes to be higher than the maxDeletedVersion here?
         // Uhhh, yes! There could be *no* deletes in a commit other than the personal deletes.
-        if (seg->minVersion < maxAllDeleteVersion && seg->commitTime == 0) {
+        if (seg->minVersion < maxAllDeleteVersion && seg->lastCommitTime == 0) {
           // this segment has deletes that need to be applied, so append to its personal deletes.
           numSegmentsMissingDeletes++;
           // *copy* all of the collected delete sets
@@ -676,7 +681,7 @@ void IndexWriter::finishCommitBody(UpdateMessage& msg) {
     const std::lock_guard<std::mutex> lock(indexMutex);
     for (auto& seg : toDelete) {
       moveSegmentToDelete(seg->segId);
-      seg->commitTime = 0; // mark as not being part of the last commit so it may be deleted immediately.
+      seg->lastCommitTime = 0; // mark as not being part of the last commit so it may be deleted immediately.
     }
   }
 
@@ -707,7 +712,7 @@ void IndexWriter::tryDeleteSegments() {
         // may be in the process of being written out, and lastCommitTime is only
         // updated *after* the IndexInfo file is written.
         // commitTime==1 means it's about to be committed (don't want try-delete call from segment merger to delete it).
-        if (seg->merging || seg->commitTime >= lastCommit || seg->commitTime == 1) {
+        if (seg->merging || seg->lastCommitTime >= lastCommit || seg->lastCommitTime == 1) {
           segmentsToDelete.push_back(std::move(seg)); // keep it in the list, we can't delete it yet.
         }
       }
@@ -778,6 +783,29 @@ void IndexWriter::writeIndexInfoFile(std::span<SegInfo*> segs, CommitInfo* commi
      */
     return a->segId < b->segId;
   });
+  
+  // Check if segment composition has changed
+  bool segsChanged = false;
+  if (segs.size() != lastCommittedSegIds.size()) {
+    segsChanged = true;
+  } else {
+    for (size_t i = 0; i < segs.size(); i++) {
+      if (segs[i]->segId != lastCommittedSegIds[i]) {
+        segsChanged = true;
+        break;
+      }
+    }
+  }
+
+  if (segsChanged) {
+    INDEX_DEBUG("Segment composition changed, incrementing coreGen to {}", coreGen);
+    coreGen++; // Increment core generation when segments change
+    lastCommittedSegIds.clear();
+    lastCommittedSegIds.reserve(segs.size());
+    for (auto seg : segs) {
+      lastCommittedSegIds.push_back(seg->segId);
+    }
+  }
 
   uint64_t updateVersion = 0;
   uint64_t thisIndexGen = ++indexGen; // increment the index generation for this commit.
@@ -798,13 +826,17 @@ void IndexWriter::writeIndexInfoFile(std::span<SegInfo*> segs, CommitInfo* commi
   indexInfo.set_version(1);
   indexInfo.set_index_gen(thisIndexGen);
   indexInfo.set_update_version(updateVersion);
+  indexInfo.set_core_gen(coreGen);
   indexInfo.mutable_segments()->Reserve(segs.size());
 
   for (auto seg : segs) {
     // Update the commit time for the seg. Important to know if this seg is part of the last commit.
     // This does mean that this may be visible before the commit is done and before lastCommitTime is updated.
     // Any comparison with lastCommitTime should be done with this in mind.
-    seg->commitTime = now_us;
+    seg->lastCommitTime = now_us;
+    if (seg->firstCommitTime == 0) {
+      seg->firstCommitTime = now_us;
+    }
 
     auto* segmentInfo = indexInfo.add_segments();
     segmentInfo->set_seg_id(seg->segId);
@@ -812,6 +844,7 @@ void IndexWriter::writeIndexInfoFile(std::span<SegInfo*> segs, CommitInfo* commi
     segmentInfo->set_live_gen(seg->liveGen);
     segmentInfo->set_min_version(seg->minVersion);
     segmentInfo->set_max_version(seg->maxVersion);
+    segmentInfo->set_commit_time(seg->firstCommitTime);
     segmentInfo->set_live_docs(seg->liveDocs);
 
     numDocs += seg->maxDoc;
@@ -1142,13 +1175,21 @@ void IndexWriter::testDeleteAllData() {
 
     // drop all index files
     dir.clear();
+
+    // Hmmm, what about coreGen, indexGen, and lastSegId?
+    // If we use coreGen or indexGen as cache keys, we shouldn't start over.  We could also mix in the
+    // commitTime of the first or last segment to make sure it's the same index.
     lastSegId = 0;
     indexGen = 0;
+    coreGen = 0;
     nextCommitInfo = std::make_unique<CommitInfo>();
 
     lastCommitTime = lastAdvertisedCommitTime = 0;
   }
   mergePolicy->refresh(); // we can't call this with lock held since it tries to acquire.
+
+
+
 
   // don't touch commitNumber or updateNumber... the TBB graph relies on the exact sequence of numbers.
 }
@@ -1164,7 +1205,7 @@ void IndexWriter::debugInfo() {
     LOG_INFO("\tmergePolicy->mergeRunning={}", mergePolicy->mergeRunning);
     for (auto& [segId, seg] : segInfos) {
       LOG_INFO("\t\tsegId={} nDocs={} mergeLevel={} commitTime={}", segId, seg->maxDoc, seg->mergeLevel,
-               seg->commitTime);
+               seg->lastCommitTime);
     }
   }
 

@@ -29,11 +29,12 @@ namespace solux {
     uint64_t liveGen = 0;  // the latest version of the deletes that this segment contains, or 0 if no deletes.
     int64_t mergedLiveGen = -1;  // if this segment was merged into another, what liveGen was used.
     uint64_t mergedIntoSegId = 0;  // segId of the segment this segment was merged into.
-    uint64_t commitTime = 0;  // last time this segment was committed as part of the index.
+    uint64_t firstCommitTime = 0;  // first time this segment was committed as part of the index.
+    uint64_t lastCommitTime = 0;  // last time this segment was committed as part of the index (or 1 if currently committing)
     // write segment info (size,docs) segments file as well so we don't have to open the segment to determine it?
     int64_t sizeInBytes = 0;
 
-    bool merging = false;  // set to true when a merge is in progress with this segment as input.
+    bool merging = false;     // set to true when a merge is in progress with this segment as input.
 
     // atomic shared pointer since it could be set / mutated by either the IW (setting or clearing),
     // or by IndexReader opening code.
@@ -67,7 +68,7 @@ namespace solux {
 
 inline std::string format_as(const SegInfo& seg) {
   return fmt::format("(seg={} max={} live={} lgen={} mlevel={} merging={} mlgen={} mto={} ctime={} minV={} maxV={} pdel={})", seg.name(), seg.maxDoc, seg.liveDocs, seg.liveGen, seg.mergeLevel, seg.merging,
-                     seg.mergedLiveGen, seg.mergedIntoSegId, seg.commitTime, seg.minVersion, seg.maxVersion, seg.personalDeletes.size());
+                     seg.mergedLiveGen, seg.mergedIntoSegId, seg.lastCommitTime, seg.minVersion, seg.maxVersion, seg.personalDeletes.size());
 }
 
 
@@ -247,6 +248,13 @@ public:
 
   // last index generation number... incremented before each commit.
   uint64_t indexGen = 0;
+  
+  // Segment composition generation. Incremented only when the set of segments changes (not for deletes).
+  // This serves as an efficient cache key for structures that depend on segment composition but not deletes.
+  uint64_t coreGen = 0;
+  
+  // Track segment IDs from last commit to detect composition changes
+  std::vector<uint64_t> lastCommittedSegIds;
 
   // commit info for the index, used to track deletes.
   // This is moved to the UpdateMessage when a commit is processed and a new one is created for the next commit.

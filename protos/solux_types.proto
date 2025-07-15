@@ -440,11 +440,12 @@ message ColMap {
 //
 
 message IndexInfo {
-  uint64 version = 1;                // Version of the index format
-  uint64 commit_time = 2;            // Commit time of this index (microseconds since epoch)
-  uint64 index_gen = 3;              // Generation of this index (incremented on each commit)
-  uint64 update_version = 4;         // Highest update version in this index (incremented on each update)
-  repeated SegmentInfo segments = 5; // List if segments in this index
+  uint64 version = 1;                 // Version of the index format
+  uint64 commit_time = 2;             // Commit time of this index (microseconds since epoch)
+  uint64 index_gen = 3;               // Generation of this index (incremented on each commit)
+  uint64 core_gen = 4;                // Segment composition generation (incremented only when segments change, not deletes)
+  uint64 update_version = 5;          // Highest update version in this index (incremented on each update)
+  repeated SegmentInfo segments = 15; // List if segments in this index
 }
 
 // Per segment information
@@ -453,7 +454,8 @@ message SegmentInfo {
   uint64 live_gen = 2;                  // Generation for live docs file (0 = all live, no deletes, no file)
   uint64 min_version = 3;               // Minimum update version in this segment
   uint64 max_version = 4;               // Maximum update version in this segment
-  int32  max_doc = 5;                   // Number of documents in this segment (ignoring deletes)
-  int32  live_docs = 6;                 // Number of non-deleted documents in this segment
+  uint64 commit_time = 5;               // First time this segment was committed (microseconds since epoch)
+  int32  max_doc = 6;                   // Number of documents in this segment (ignoring deletes)
+  int32  live_docs = 7;                 // Number of non-deleted documents in this segment
 }
 
