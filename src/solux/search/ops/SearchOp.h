@@ -21,6 +21,9 @@ public:
 
   class Calculator;
   virtual Calculator* createCalculator(Calculator* parent, int64_t slot = -1, int64_t numSlots = -1) = 0;
+  virtual Calculator* createInlineCalculator(Calculator* parent, int64_t slot = -1, int64_t numSlots = -1) {
+    return nullptr;
+  }
 
   virtual ~SearchOp() = default;
 
@@ -78,7 +81,7 @@ public:
       : Calculator(op, parent, slot, numSlots) {
     }
 
-    solux::proto::Val* getTargetForSub(solux::proto::SearchResponse* searchResponse, Calculator* sub) override;
+    solux::proto::Val* getTargetForSub(solux::proto::SearchResponse* searchResponse, Calculator* sub) override {}
     void calc(oneapi::tbb::task_group* tg, int32_t segnum, DocSet* domain) override {};
     virtual void startSeg(int32_t segnum) {};
     virtual void endSeg(int32_t segnum) {};

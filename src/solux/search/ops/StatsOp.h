@@ -32,7 +32,7 @@ public:
       return (AvgOp&)getOp();
     }
 
-    solux::proto::Val* getTargetForSub(solux::proto::SearchResponse* searchResponse, Calculator* sub) override {};
+    solux::proto::Val* getTargetForSub(solux::proto::SearchResponse* searchResponse, Calculator* sub) override {return nullptr;};
     void calc(oneapi::tbb::task_group* tg, int32_t segnum, DocSet* domain) override {
       //LOG_DEBUG("calc AvgOp: this={} segnum={}, domain={} slot={}", (void*)this, segnum, (void*)domain, slot);
       std::unique_ptr<MergeableSum> mergeableData(sumMerger.obtain());
@@ -115,7 +115,11 @@ public:
 
   Calculator* createCalculator(Calculator* parent, int64_t slot, int64_t numSlots = -1) override {
     return new Calc(*this, parent, slot, numSlots);
-  };
+  }
+
+  Calculator* createInlineCalculator(Calculator* parent, int64_t slot, int64_t numSlots) override {
+    return new InlineCalc(*this, parent, slot, numSlots);
+  }
 
   class InlineCalc final : public InlineCalculator {
     struct entry {
@@ -129,6 +133,11 @@ public:
     InlineCalc(SearchOp& op, Calculator* parent, int64_t slot, int64_t numSlots)
       : InlineCalculator(op, parent, slot, numSlots) {
     }
+
+    ~InlineCalc() override = default;
+    solux::proto::Val* getTargetForSub(solux::proto::SearchResponse* searchResponse, Calculator* sub) override {return nullptr;};
+    void calc(oneapi::tbb::task_group* tg, int32_t segnum, DocSet* domain) override {};
+
     AvgOp& thisOp() {
       return (AvgOp&)getOp();
     }

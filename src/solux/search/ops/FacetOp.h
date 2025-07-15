@@ -273,7 +273,7 @@ public:
       //TODO: need to account for slot somehow,  or will subop do that?
     };
     void calc(oneapi::tbb::task_group* tg, int32_t segnum, DocSet* domain) override {
-      if (!inlineCalcs.empty()) {
+      if (true || !inlineCalcs.empty()) {
         calc2(tg, segnum, domain);
         return;
       }
@@ -311,7 +311,7 @@ public:
       }
       auto merged = countMerger.release(mergeableData.release());
       if (merged == thisOp().reader.segments().size()) {
-        facetResult(tg, std::unique_ptr<MergeableStrFacet>(countMerger.obtain()), nullptr);
+        facetResult(tg, std::unique_ptr<MergeableStrFacet>(countMerger.obtain()));
       }
     };
 
@@ -323,14 +323,19 @@ public:
       auto poolGuard = MemPool::threadLocalPoolGuard();
 
       std::unique_ptr<MergeableStrFacetInline> mergeableData(inlineMerger.obtain());
-      TermsEnum tenum(poolGuard.pool(), postingsReader, segFieldInfo);
-
+      FieldReader fieldReader(poolGuard.pool(), postingsReader);
+      std::optional<TermsEnum> tenum;
+      bool found = fieldReader.seek(thisOp().fieldName);
+      if (found) {
+        fieldReader.readFieldInfo(segFieldInfo);
+        tenum.emplace(poolGuard.pool(), postingsReader, segFieldInfo);
+      }
       int64_t missing_num = 0;
       auto& facetReq = (FacetReq&)getOp();
       facetReq.facetSegIntCol(domain, segnum, missing_num, segFieldInfo,
         [&](int32_t docid, int64_t val) {
-          tenum.seekOrd(val - 1);
-        std::string_view termView = (std::string_view) tenum.term();
+          tenum->seekOrd(val - 1);
+        std::string_view termView = (std::string_view) tenum->term();
           mergeableData->counts.add((std::string) termView, docid);
         });
 
@@ -338,26 +343,27 @@ public:
 
       auto merged = inlineMerger.release(mergeableData.release());
       if (merged == thisOp().reader.segments().size()) {
-        facetResult(tg, nullptr, std::unique_ptr<MergeableStrFacetInline>(inlineMerger.obtain()));
+        facetResult2(tg, std::unique_ptr<MergeableStrFacetInline>(inlineMerger.obtain()));
       }
     }
 
-    void facetResult(oneapi::tbb::task_group* tg, std::unique_ptr<MergeableStrFacet> mergedData, std::unique_ptr<MergeableStrFacetInline> inlineData) {
+    void facetResult(oneapi::tbb::task_group* tg, std::unique_ptr<MergeableStrFacet> mergedData) {
       auto* myVal = getTarget(nullptr);
       solux::proto::FacetResult& facetResultProto = *myVal->mutable_facet();
       auto minCount = thisOp().minCount;
       auto limit = thisOp().limit;
       auto missing = thisOp().missing;
 
-      auto& counts = mergedData->counts;
+      auto missing_count = -1;
 
       std::vector<std::pair<std::string, int64_t>> countVec;
-      for (auto [val, count] : counts) {
-        if (minCount == -1 || count >= minCount) {
-          countVec.emplace_back(val, count);
+        auto& counts = mergedData->counts;
+        for (auto& [val, count] : counts) {
+          if (minCount == -1 || count >= minCount) {
+            countVec.emplace_back(val, count);
+          }
         }
-      }
-      auto missing_count = mergedData->missing_num;
+        missing_count = mergedData->missing_num;
       std::sort(countVec.begin(), countVec.end(), [](auto& a, auto& b) {
         if (a.second != b.second ) {
           return a.second > b.second;
@@ -431,7 +437,98 @@ public:
         }
         slotNum++;
       }
-    };
+    }
+    void facetResult2(oneapi::tbb::task_group* tg, std::unique_ptr<MergeableStrFacetInline> mergedData) {
+      auto* myVal = getTarget(nullptr);
+      solux::proto::FacetResult& facetResultProto = *myVal->mutable_facet();
+      auto minCount = thisOp().minCount;
+      auto limit = thisOp().limit;
+      auto missing = thisOp().missing;
+
+
+      std::vector<std::pair<std::string, char*>> valVec;
+        auto& counts = mergedData->counts.map;
+        for (auto& [key, val] : counts) {
+          int64_t count = *(int64_t*)val;
+          if (minCount == -1 || count >= minCount) {
+            valVec.emplace_back(key, val);
+          }
+        }
+        auto missing_count = mergedData->missing_num;
+      std::sort(valVec.begin(), valVec.end(), [](auto& a, auto& b) {
+        if (*(int64_t*)a.second != *(int64_t*)b.second ) {
+          return *(int64_t*)a.second > *(int64_t*)b.second;
+        }
+        return a.first < b.first;
+      });
+      if (limit >= 0 && limit < (int64_t)valVec.size()) {
+        valVec.resize(limit);
+      }
+
+      // fill in the facet result proto
+      auto& bucketIds = *facetResultProto.mutable_bucket_ids()->mutable_col_s();
+      auto& bucketIdsArr = *bucketIds.mutable_v();
+      auto& countsArr = *facetResultProto.mutable_counts();
+      bucketIdsArr.Reserve(valVec.size());
+      countsArr.Reserve(valVec.size());
+      for (auto [key, val] : valVec) {
+        auto* strptr = bucketIdsArr.Add();
+        *strptr = key; // copy the string
+        countsArr.Add(*(int64_t*)val);
+      }
+      if (missing) {
+        facetResultProto.set_missing(missing_count);
+      }
+
+      if (thisOp().subOps.empty()) {
+        return; // no sub ops, nothing to do.
+      }
+      int64_t slotNum = 0;
+      for (auto [key, val] : valVec) {
+        std::vector<std::unique_ptr<SearchOp::Calculator>> calculators;
+        calculators.reserve(thisOp().subOps.size());
+        for (auto& [name, subOp] : thisOp().subOps) {
+          auto* subCalc = subOp->createCalculator(this, slotNum, valVec.size());
+          calculators.emplace_back(subCalc);
+        }
+        for (size_t segnum = 0; segnum < input.size(); segnum++) {
+          SegFieldInfo segFieldInfo;
+          FalseDocSet emptyDomain;
+          DocSet* newDomain = &emptyDomain;  // NOTE - points to stack object
+          auto& postingsReader = thisOp().reader.segments()[segnum].postingsReader();
+          int32_t maxDoc = postingsReader.maxDoc();
+          auto poolGuard = MemPool::threadLocalPoolGuard();
+          FieldReader fieldReader(poolGuard.pool(), postingsReader);
+          bool found = fieldReader.seek(thisOp().fieldName);
+          RAMBitDocSet output(maxDoc);
+          if (found) {
+            fieldReader.readFieldInfo(segFieldInfo);
+            TermsEnum tenum(poolGuard.pool(), postingsReader, segFieldInfo);
+            if (tenum.seek(key)) {
+              newDomain = &output; // we will write to output
+              DocsEnum denum(poolGuard.pool(), postingsReader, tenum);
+              while (true) {
+                auto doc = denum.nextDoc();
+                if (doc == DocsEnum::END) {
+                  break; // no more docs for this term
+                }
+                if (input[segnum] && !input[segnum]->get(doc)) {
+                  continue; // this doc is not in the domain
+                }
+                output.mutableBits().set(doc);
+              }
+            }
+          }
+          for (auto& subCalc : calculators) {
+            //subCalc->calc(tg, segnum, &output);
+            // no support for subcalcs launching tasks yet
+
+            subCalc->calc(nullptr, segnum, newDomain);
+          }
+        }
+        slotNum++;
+      }
+    }
   };
   Calculator* createCalculator(Calculator* parent, int64_t slot, int64_t numSlots) override {
     return new Calc(*this, parent, slot, numSlots);
