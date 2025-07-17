@@ -30,15 +30,15 @@ public:
 private:
   using MapVal = std::variant<Pointer, std::shared_ptr<tbb::task_group>>;
 
+public:
   // A single map is used to avoid races between looking up in two maps.
   boost::unordered::concurrent_flat_map<Key, MapVal> dataMap;
 
-public:
   SharedLazyMap() = default;
 
   /**
    * Retrieves the value associated with the given key, or creates it
-   * if it doesn't already exist.
+   * if it doesn't already exist.  nullptr values are not stored in the map.
    */
   Pointer getOrCreate(const Key& key, std::function<Pointer()> createFunc) {
     MapVal mapVal;
@@ -58,9 +58,13 @@ public:
             // we aren't allowed to call dataMap methods inside another dataMap method,
             // but this is guaranteed to execute outside/after the try_emplace_and_cvisit method.
             Pointer val = createFunc(); // do expensive part outside of visit
-            dataMap.visit(key, [&createFunc, &val](auto& elem) {
-              elem.second = std::move(val);
-            });
+            if (val) {
+              dataMap.visit(key, [&createFunc, &val](auto& elem) {
+                elem.second = std::move(val);
+              });
+            } else {
+              dataMap.erase(key);
+            }
             // created = true;
           }
           catch (std::exception& e) {
@@ -90,9 +94,15 @@ public:
     auto visited = dataMap.cvisit(key, [&outVal](const auto& elem) {
       outVal = elem.second;
     });
+    /* ONLY true when we cache all values, and we don't cache nullptr
     assert(visited == 1); // We don't do removals yet.  We should put things in a loop if we do in the future.
     assert(std::holds_alternative<Pointer>(outVal));
-    return std::get<Pointer>(outVal);
+    */
+    if (std::holds_alternative<Pointer>(outVal)) {
+      return std::get<Pointer>(outVal);
+    } else {
+      return nullptr;
+    }
   }
 };
 

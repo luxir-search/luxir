@@ -141,11 +141,13 @@ public:
       return OrdMap::build(field, *this);
     });
   }
+
+  SharedLazyMap<std::string, OrdMap> ordMaps; // field -> OrdMap
+
 private:
   std::vector<Segment> segs;
   uint64_t coreGeneration;
   int64_t totalMaxDoc;
-  SharedLazyMap<std::string, OrdMap> ordMaps; // field -> OrdMap
 };
 
 

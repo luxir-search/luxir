@@ -28,16 +28,23 @@ TEST_F(OrdMapTest, EmptyIndex) {
   helper->commit();
   
   auto reader = helper->getIndexWriter()->getIndexReader();
+
+  EXPECT_EQ(reader->coreIndex().ordMaps.dataMap.size(), 0);
+
   auto ordMap = reader->coreIndex().getOrdMap("field1_s");
 
   // OrdMap should be null for empty index
   EXPECT_EQ(ordMap, nullptr);
+  // Make sure the null wasn't cached.
+  EXPECT_EQ(reader->coreIndex().ordMaps.dataMap.size(), 0);
 
   // If field doesn't exist, same thing.
   helper->index({{"otherfield_s", "apple"}, {"id", "1"}}, UpdateMessage::COMMIT);
   helper->index({{"otherfield_s", "banana"}, {"id", "2"}}, UpdateMessage::COMMIT);
   ordMap = reader->coreIndex().getOrdMap("field1_s");
   EXPECT_EQ(ordMap, nullptr);
+  // Make sure the null wasn't cached.
+  EXPECT_EQ(reader->coreIndex().ordMaps.dataMap.size(), 0);
 }
 
 // Single Segment with Simple Terms
@@ -101,6 +108,10 @@ TEST_F(OrdMapTest, MultipleSegmentsDisjointTerms) {
   // Should have firstSegs and globDeltas
   EXPECT_NE(ordMap->getFirstSegs(), nullptr);
   EXPECT_NE(ordMap->getGlobDeltas(), nullptr);
+
+  auto ordMap2 = reader->coreIndex().getOrdMap("field1_s");
+  EXPECT_EQ(ordMap.get(), ordMap2.get()); // should be cached
+
 }
 
 // Multiple Segments with Overlapping Terms
