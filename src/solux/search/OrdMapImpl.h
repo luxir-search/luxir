@@ -1,6 +1,5 @@
 #pragma once
 #include "OrdMap.h"
-#include "IndexReader.h"
 #include "solux/index/IntColWriter.h"
 #include "solux/reader/TermsEnum.h"
 #include "solux/util/heap.h"
@@ -37,7 +36,7 @@ namespace solux {
 
 class OrdMapBuilder {
   std::string_view field;
-  IndexReader& reader;
+  CoreIndex& reader;
 
   // An alternate encoding could just catenate all of the deltas together in one numeric column (non-monotonic)
   // that would have less overhead for small segments.
@@ -63,7 +62,7 @@ class OrdMapBuilder {
   };
 
 public:
-  OrdMapBuilder(std::string_view field, IndexReader& reader) : field(field), reader(reader) {}
+  OrdMapBuilder(std::string_view field, CoreIndex& reader) : field(field), reader(reader) {}
 
   // Build fills these in currently.  In the future, the output may be written to disk.
   std::unique_ptr<char[]> data;
@@ -83,7 +82,7 @@ public:
     allTermsEnums.reserve(nsegs);
 
     int segsWithValue = 0;
-    for (int i=0; i<nsegs; i++) {
+    for (auto i=0u; i<nsegs; i++) {
       auto& seg = segs[i];
       // Allocate FieldReader in pool so it has same lifetime as SegFieldInfo
       auto* fieldReader = pool.make<FieldReader>(pool, seg.postingsReader());
@@ -208,7 +207,7 @@ public:
     bool needGlobalDeltas = true;
     int64_t ordMapStart = 0;  // currently just one ord map per file/buffer, and no header.
     RAMFile* outFile = nullptr;
-    int64_t cumulativeSize = 0;
+    uint64_t cumulativeSize = 0;
 
     // find the first non-empty and non-full segment and use its RAMFile as the output.
     for (auto& tenum : allTermsEnums) {
@@ -219,7 +218,7 @@ public:
       }
       if (writeDeltas) {
         auto numValues = tenum->deltas.writer.finish();
-        int64_t thisSize = tenum->deltas.out.size();
+        auto thisSize = tenum->deltas.out.size();
         tenum->deltas.out.flush(true);
         assert(thisSize == tenum->deltas.file.size());
         auto [filenum, loc] = tenum->deltas.writer.blockLoc.decode();
@@ -293,7 +292,7 @@ public:
 // In the future, we prob want to be able to accept a span of postings readers as well
 // so that IndexWriter could pre-create a OrdMap for a field without constructing an IndexReader.
 // Or we could just make IndexReader easier to construct w/o taking a Directory, etc.
-std::shared_ptr<OrdMap> OrdMap::build(std::string_view field, IndexReader& reader) {
+std::shared_ptr<OrdMap> OrdMap::build(std::string_view field, CoreIndex& reader) {
   OrdMapBuilder builder(field, reader);
   builder.build();
   if (!builder.data) {

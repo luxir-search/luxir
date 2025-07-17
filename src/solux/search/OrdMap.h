@@ -1,13 +1,12 @@
 #pragma once
 #include <memory>
 #include <vector>
-#include <cstdint>
 
 #include "solux/reader/IntColReader.h"
 
 namespace solux {
 
-class IndexReader;
+class CoreIndex;
 
 /// An OrdMap can map between segment ordinals and global ordinals.
 /// This is used for fast sorting and faceting across multiple segments.
@@ -53,13 +52,13 @@ public:
     for (auto i = 0u; i < nSegs; i++) {
       auto nValues = dataIS.readVlong();
 
-      if (nValues > 0 && nValues != nOrds) {
+      if (nValues > 0 && nValues != (uint64_t)nOrds) {
         auto loc = dataIS.readVlong();
         auto metaOff = dataIS.readVlong();
         segToGlobal.emplace_back((int64_t)nValues,
           std::make_unique<MonoReader>(dataIS, start + loc, metaOff, nValues));
       } else {
-        if (nValues == nOrds && firstFull == -1) {
+        if (nValues == (uint64_t)nOrds && firstFull == -1) {
           firstFull = (int)i;
         }
         segToGlobal.emplace_back((int64_t)nValues, nullptr);
@@ -83,7 +82,7 @@ public:
   }
 
   /// Build an OrdMap for the given field across all segments in the reader.
-  static std::shared_ptr<OrdMap> build(std::string_view field, IndexReader& reader);
+  static std::shared_ptr<OrdMap> build(std::string_view field, CoreIndex& reader);
   
   /// Get the total number of unique terms across all segments
   int64_t numOrds() const { return nOrds; }

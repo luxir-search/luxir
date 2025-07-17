@@ -94,7 +94,10 @@ IndexReader::IndexReader(Directory& dir) {
   bool retry = false;
   
   google::protobuf::Arena arena;
-  
+  std::vector<Segment> segs;
+  uint64_t coreGeneration = 0;
+  int64_t maxdoc = 0;
+
   do {
     if (retry) {
       IREADER_DEBUG("Retrying IndexReader open");
@@ -179,7 +182,10 @@ IndexReader::IndexReader(Directory& dir) {
     }
   }
   while (retry);
-  IREADER_DEBUG("IndexReader opened with {} segments and {} docs, commitTime={}", segs.size(), maxdoc, commitTimeUs);
+
+  this->core = std::make_shared<CoreIndex>(std::move(segs), coreGeneration, maxdoc);
+  
+  IREADER_DEBUG("IndexReader opened with {} segments and {} docs, commitTime={}", core->segs.size(), maxdoc, commitTimeUs);
 }
 
 

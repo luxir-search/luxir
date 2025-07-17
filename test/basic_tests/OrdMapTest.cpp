@@ -28,15 +28,15 @@ TEST_F(OrdMapTest, EmptyIndex) {
   helper->commit();
   
   auto reader = helper->getIndexWriter()->getIndexReader();
-  auto ordMap = OrdMap::build("field1_s", *reader);
-  
+  auto ordMap = reader->coreIndex().getOrdMap("field1_s");
+
   // OrdMap should be null for empty index
   EXPECT_EQ(ordMap, nullptr);
 
   // If field doesn't exist, same thing.
   helper->index({{"otherfield_s", "apple"}, {"id", "1"}}, UpdateMessage::COMMIT);
   helper->index({{"otherfield_s", "banana"}, {"id", "2"}}, UpdateMessage::COMMIT);
-  ordMap = OrdMap::build("field1_s", *reader);
+  ordMap = reader->coreIndex().getOrdMap("field1_s");
   EXPECT_EQ(ordMap, nullptr);
 }
 
@@ -56,7 +56,7 @@ TEST_F(OrdMapTest, SingleSegmentSimpleTerms) {
   std::cout << "Number of segments: " << segments.size() << std::endl;
   EXPECT_EQ(segments.size(), 1) << "Expected exactly one segment";
 
-  auto ordMap = OrdMap::build("field1_s", *reader);
+  auto ordMap = reader->coreIndex().getOrdMap("field1_s");
 
   // With only one segment, OrdMap should return nullptr (identity mapping)
   EXPECT_EQ(ordMap, nullptr) << "OrdMap should be null for single segment";
@@ -80,8 +80,8 @@ TEST_F(OrdMapTest, MultipleSegmentsDisjointTerms) {
   helper->commit();
   
   auto reader = helper->getIndexWriter()->getIndexReader();
-  auto ordMap = OrdMap::build("field1_s", *reader);
-  
+  auto ordMap = reader->coreIndex().getOrdMap("field1_s");
+
   ASSERT_NE(ordMap, nullptr);
   EXPECT_EQ(ordMap->numOrds(), 6); // 6 unique terms total
   
@@ -124,7 +124,7 @@ TEST_F(OrdMapTest, MultipleSegmentsOverlappingTerms) {
   helper->commit();
   
   auto reader = helper->getIndexWriter()->getIndexReader();
-  auto ordMap = OrdMap::build("field1_s", *reader);
+  auto ordMap = reader->coreIndex().getOrdMap("field1_s");
   
   ASSERT_NE(ordMap, nullptr);
   EXPECT_EQ(ordMap->numOrds(), 5); // 5 unique terms: apple, banana, cherry, date, elderberry
@@ -163,7 +163,7 @@ TEST_F(OrdMapTest, FieldInSomeSegments) {
   helper->commit();
   
   auto reader = helper->getIndexWriter()->getIndexReader();
-  auto ordMap = OrdMap::build("field1_s", *reader);
+  auto ordMap = reader->coreIndex().getOrdMap("field1_s");
   
   ASSERT_NE(ordMap, nullptr);
   EXPECT_EQ(ordMap->numOrds(), 4); // apple, banana, cherry, date
@@ -203,7 +203,7 @@ TEST_F(OrdMapTest, EmptyFieldInSegment) {
   helper->commit();
   
   auto reader = helper->getIndexWriter()->getIndexReader();
-  auto ordMap = OrdMap::build("field1_s", *reader);
+  auto ordMap = reader->coreIndex().getOrdMap("field1_s");
   
   ASSERT_NE(ordMap, nullptr);
   // Empty string is still a term, so we should have 4 terms: "", "apple", "banana", "cherry"
@@ -233,7 +233,7 @@ TEST_F(OrdMapTest, SegmentWithAllTerms) {
   helper->commit();
   
   auto reader = helper->getIndexWriter()->getIndexReader();
-  auto ordMap = OrdMap::build("field1_s", *reader);
+  auto ordMap = reader->coreIndex().getOrdMap("field1_s");
   
   ASSERT_NE(ordMap, nullptr);
   EXPECT_EQ(ordMap->numOrds(), 4); // apple, banana, cherry, date
@@ -284,7 +284,7 @@ TEST_F(OrdMapTest, SegToGlobalMapping) {
   helper->commit();
   
   auto reader = helper->getIndexWriter()->getIndexReader();
-  auto ordMap = OrdMap::build("field1_s", *reader);
+  auto ordMap = reader->coreIndex().getOrdMap("field1_s");
   
   ASSERT_NE(ordMap, nullptr);
   EXPECT_EQ(ordMap->numOrds(), 5); // apple, banana, cherry, date, elderberry (sorted)
@@ -343,7 +343,7 @@ TEST_F(OrdMapTest, SegToGlobalNullCases) {
   helper->commit();
   
   auto reader = helper->getIndexWriter()->getIndexReader();
-  auto ordMap = OrdMap::build("field1_s", *reader);
+  auto ordMap = reader->coreIndex().getOrdMap("field1_s");
   
   ASSERT_NE(ordMap, nullptr);
   EXPECT_EQ(ordMap->numOrds(), 2); // apple, banana
@@ -396,7 +396,7 @@ TEST_F(OrdMapTest, GlobalToSegmentReverseMapping) {
   helper->commit();
   
   auto reader = helper->getIndexWriter()->getIndexReader();
-  auto ordMap = OrdMap::build("field1_s", *reader);
+  auto ordMap = reader->coreIndex().getOrdMap("field1_s");
   
   ASSERT_NE(ordMap, nullptr);
   EXPECT_EQ(ordMap->numOrds(), 6); // apple, banana, cherry, date, elderberry, fig

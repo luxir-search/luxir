@@ -2,14 +2,17 @@
 #include <span>
 
 #include "DocSet.h"
+#include "OrdMap.h"
 #include "solux/reader/PostingsReader.h"
 #include "solux/util/screaming.h"
+#include "solux/util/SharedLazyMap.h"
 
 // redefine DEBUG to TRACE level which shouldn't currently be logged!
 #define IREADER_DEBUG LOG_TRACE
 // #define IREADER_DEBUG LOG_DEBUG
 
 namespace solux {
+class OrdMap;
 
 /// LiveDocs holds the live document bitmap for a segment
 class LiveDocs {
@@ -55,14 +58,13 @@ public:
 };
 
 
-/// IndexReader is thread safe
-class IndexReader {
-public:
-
   class Segment {
     const std::shared_ptr<PostingsReader> sharedPostingsReader;
     const std::shared_ptr<LiveDocs> sharedLiveDocs;
   public:
+    friend class IndexReader;
+    friend class CoreIndex;
+
     struct SegmentInfo {
       uint64_t seg_id;          // Unique identifier for the segment
       uint64_t live_gen;        // What deletes version to use for the segment (0 if no deletes)
@@ -77,7 +79,7 @@ public:
     const int64_t base;           // global index (ordinal/rank) of the first document in this segment with respect to the list of segments
     const int32_t ord;            // index of this segment in the list of segments
 
-    Segment(std::shared_ptr<PostingsReader>&& postingsReader, std::shared_ptr<LiveDocs>&& liveDocs, 
+    Segment(std::shared_ptr<PostingsReader>&& postingsReader, std::shared_ptr<LiveDocs>&& liveDocs,
               SegmentInfo segInfo, int64_t base, int ord)
             :  sharedPostingsReader(std::move(postingsReader)), sharedLiveDocs(std::move(liveDocs)),
                 segInfo(segInfo), base(base), ord(ord) {
@@ -100,15 +102,59 @@ public:
     int32_t numDeletes() const noexcept {
       return sharedLiveDocs ? sharedLiveDocs->numDeletes() : 0;
     }
-    
-    // Get number of live documents  
+
+    // Get number of live documents
     int32_t numLive() const noexcept {
       return sharedLiveDocs ? sharedLiveDocs->numLive() : segInfo.max_doc;
     }
   };
 
 
+
+/// CoreIndex represents the set of segments of an index without any deletion information.
+/// This allows caching of segment-based structures that don't need to change when documents are deleted.
+/// Multiple IndexReaders can share the same CoreIndex when they have the same coreGeneration.
+class CoreIndex {
+  friend class IndexReader;
+public:
+  /// Construct a CoreIndex with segments
+  CoreIndex(std::vector<Segment>&& segments, uint64_t coreGen, int64_t maxDoc)
+      : segs(std::move(segments)), coreGeneration(coreGen), totalMaxDoc(maxDoc) {}
+
+  /// Get the core generation this index represents
+  uint64_t coreGen() const noexcept {
+    return coreGeneration;
+  }
+
+  /// Get all segments in this core index
+  std::span<Segment> segments() noexcept {
+    return segs;
+  }
+
+  /// Get the total number of documents (including deleted ones)
+  int64_t maxDoc() const noexcept {
+    return totalMaxDoc;
+  }
+
+  std::shared_ptr<OrdMap> getOrdMap(std::string_view field) {
+    return ordMaps.getOrCreate(std::string(field), [this, field]() {
+      return OrdMap::build(field, *this);
+    });
+  }
+private:
+  std::vector<Segment> segs;
+  uint64_t coreGeneration;
+  int64_t totalMaxDoc;
+  SharedLazyMap<std::string, OrdMap> ordMaps; // field -> OrdMap
+};
+
+
+/// IndexReader is thread safe
+class IndexReader {
+public:
   // TODO: implement postingsReader sharing by passing in another IndexReader for reference.
+
+  using Segment = Segment;
 
   // The time in microseconds when this version of the index was committed.  Guaranteed to be strictly increasing
   // with new versions of the index.
@@ -117,11 +163,11 @@ public:
   }
 
   std::span<Segment> segments() noexcept {
-    return segs;
+    return core->segs;
   }
 
   int64_t maxDoc() const noexcept {
-    return maxdoc;
+    return core->totalMaxDoc;
   }
 
   int64_t liveDocs() const noexcept {
@@ -131,17 +177,21 @@ public:
   // Get the core generation for this index reader
   // This can be used as a cache key for structures that depend on segments but don't care about deletes.
   uint64_t coreGen() const noexcept {
-    return coreGeneration;
+    return core->coreGeneration;
+  }
+
+  // Get the CoreIndex for this IndexReader
+  // The CoreIndex contains all segments without deletion information
+  CoreIndex& coreIndex() const noexcept {
+    return *core;
   }
 
   IndexReader(Directory& dir);
 
 private:
-  std::vector<Segment> segs;
-  int64_t maxdoc = 0;
+  std::shared_ptr<CoreIndex> core;
   int64_t livedocs = 0;
   uint64_t commitTimeUs = 0;
-  uint64_t coreGeneration = 0;
 };
 
 }

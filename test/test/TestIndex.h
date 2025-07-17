@@ -313,7 +313,7 @@ namespace solux::test {
         }
         currSeg++;
 
-        IndexReader::Segment &seg = segments[currSeg];
+        Segment &seg = segments[currSeg];
         FieldReader fieldReader(testIndex.pool, seg.postingsReader());
         auto found = fieldReader.seek(name);
         if (!found) continue;
@@ -326,7 +326,7 @@ namespace solux::test {
       }
     }
 
-    IndexReader::Segment* currentSegment() {
+    Segment* currentSegment() {
       if (currSeg < 0) { nextSegment(); }
       if (testIndex.reader == nullptr || currSeg >= (int)testIndex.reader->segments().size()) {
         LOG_ERROR("TestField {} not reading any segment", name);
