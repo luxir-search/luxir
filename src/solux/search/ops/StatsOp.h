@@ -117,7 +117,7 @@ public:
     return new Calc(*this, parent, slot, numSlots);
   }
 
-  Calculator* createInlineCalculator(Calculator* parent, int64_t slot, int64_t numSlots) override {
+  InlineCalculator* createInlineCalculator(Calculator* parent, int64_t slot, int64_t numSlots) override {
     return new InlineCalc(*this, parent, slot, numSlots);
   }
 
@@ -212,6 +212,8 @@ public:
     }
 
     void startSeg(int32_t segnum) override {
+      intColIter.reset();
+      intColReader.reset();
       auto guard = MemPool::threadLocalPoolGuard();
       auto& pool = guard.pool();
       SegFieldInfo segFieldInfo;
@@ -231,8 +233,25 @@ public:
     void endSeg(int32_t segnum) override {
       intColIter.reset();
       intColReader.reset();
-    };
+    }
+
+    void fillResult(std::span<char*> entries) override {
+      auto* myVal = getTarget(nullptr, [&](solux::proto::Val& val) {
+             // do array creation with mutex held since different buckets could be calculated in parallel
+             auto& arr = *val.mutable_arr_d();
+             if (arr.v_size() == 0) {
+               arr.mutable_v()->Resize(entries.size(), 0.0);
+             }
+         });
+      auto& arr = *myVal->mutable_arr_d();
+      for (auto i = 0u; i < entries.size(); i++) {
+        auto e = *(entry*)entries[i];
+        arr.set_v(i, e.val);
+        entries[i] += sizeof(entry); // move to the next entry part
+      }
+    }
   };
+
 
 };
 }

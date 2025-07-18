@@ -20,8 +20,9 @@ public:
   }
 
   class Calculator;
+  class InlineCalculator;
   virtual Calculator* createCalculator(Calculator* parent, int64_t slot = -1, int64_t numSlots = -1) = 0;
-  virtual Calculator* createInlineCalculator(Calculator* parent, int64_t slot = -1, int64_t numSlots = -1) {
+  virtual InlineCalculator* createInlineCalculator(Calculator* parent, int64_t slot = -1, int64_t numSlots = -1) {
     return nullptr;
   }
 
@@ -92,6 +93,7 @@ public:
     virtual std::pair<int, int> mergeNew(void* target, void* from, int space) = 0;
     virtual int finalize(void* entry, int64_t count) = 0;
     virtual int compare(void* a, void* b, int& asize, int& bsize) = 0;
+    virtual void fillResult(std::span<char*>) = 0;
 
   };
 
@@ -184,6 +186,19 @@ public:
           ptr += calcSpace;
           otherPtr += otherCalcSpace;
         }
+      }
+    }
+  }
+
+  void finalize() {
+    for (auto iter : map) {
+      auto ptr = iter.second;
+      auto count = (*(int64_t*)ptr);
+      ptr += sizeof(int64_t);
+      for (auto* calc : calcs) {
+        auto calcSpace = calc->finalize(ptr, count);
+        assert(calcSpace >= 0);
+        ptr += calcSpace;
       }
     }
   }

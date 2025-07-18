@@ -232,7 +232,7 @@ class StrFacetReq : public IntFacetBaseReq {
   public:
     FacetMap<std::string> counts;
     int64_t missing_num = 0; // number of missing values in this segment
-
+    std::vector<SearchOp::InlineCalculator*> inlineCalcs;
     static MergeableStrFacetInline* merge(MergeableStrFacetInline* a, MergeableStrFacetInline* b) {
       // merge the smaller collector into the larger collector, or if both the same size, merge
       // the less competitive collector into the more competitive collector.
@@ -244,6 +244,11 @@ class StrFacetReq : public IntFacetBaseReq {
       a->missing_num += b->missing_num;
       return a;
     }
+    ~MergeableStrFacetInline() {
+      for (auto* calc : inlineCalcs) {
+        delete calc; // clean up the inline calculators
+      }
+    }
   };
 
 public:
@@ -254,11 +259,33 @@ public:
     std::vector<DocSet*> input;
     AtomicMerger<MergeableStrFacet> countMerger;
     AtomicMerger<MergeableStrFacetInline> inlineMerger;
-    std::vector<std::unique_ptr<SearchOp::InlineCalculator>> inlineCalcs;
   public:
     Calc(SearchOp& op, Calculator* parent, int64_t slot, int64_t numSlots) : Calculator(op, parent, slot, numSlots) {
       input.resize(op.req.reader->segments().size());
+
+
+
+
+      inlineMerger.creator = [this]() {
+        auto* p = new MergeableStrFacetInline;
+
+        if (thisOp().limit == -1) {
+
+          for (auto& [key, subop] : thisOp().subOps) {
+            auto* calc = subop->createInlineCalculator(this, -1, -1);
+            if (calc != nullptr) {
+              p->inlineCalcs.push_back(calc);
+            } else {
+
+            }
+          }
+        }
+
+        p->counts.calcs = p->inlineCalcs;
+        return p;
+      };
     }
+
     StrFacetReq& thisOp() {
       return (StrFacetReq&)getOp();
     }
@@ -273,7 +300,7 @@ public:
       //TODO: need to account for slot somehow,  or will subop do that?
     };
     void calc(oneapi::tbb::task_group* tg, int32_t segnum, DocSet* domain) override {
-      if (true || !inlineCalcs.empty()) {
+      if (true) {
         calc2(tg, segnum, domain);
         return;
       }
@@ -316,13 +343,15 @@ public:
     };
 
     void calc2(oneapi::tbb::task_group* tg, int32_t segnum, DocSet* domain) {
-      //write only to different slots, so no need to synchronize
+      std::unique_ptr<MergeableStrFacetInline> mergeableData(inlineMerger.obtain());
+      for (auto* calc : mergeableData->inlineCalcs) {
+        calc->startSeg(segnum);
+      }
       input[segnum] = domain;
       SegFieldInfo segFieldInfo;
       PostingsReader& postingsReader = thisOp().reader.segments()[segnum].postingsReader();
       auto poolGuard = MemPool::threadLocalPoolGuard();
 
-      std::unique_ptr<MergeableStrFacetInline> mergeableData(inlineMerger.obtain());
       FieldReader fieldReader(poolGuard.pool(), postingsReader);
       std::optional<TermsEnum> tenum;
       bool found = fieldReader.seek(thisOp().fieldName);
@@ -444,7 +473,7 @@ public:
       auto minCount = thisOp().minCount;
       auto limit = thisOp().limit;
       auto missing = thisOp().missing;
-
+      mergedData->counts.finalize();
 
       std::vector<std::pair<std::string, char*>> valVec;
         auto& counts = mergedData->counts.map;
@@ -480,14 +509,28 @@ public:
         facetResultProto.set_missing(missing_count);
       }
 
-      if (thisOp().subOps.empty()) {
-        return; // no sub ops, nothing to do.
+      // fill in results from inline calculators
+      std::vector<char*> results;
+      results.reserve(valVec.size());
+      for (auto [key, val] : valVec) {
+        results.push_back(val + sizeof(int64_t));
+      }
+      for (auto calc : mergedData->inlineCalcs) {
+        calc->fillResult(results);
+      }
+
+      auto opers = thisOp().subOps;
+      for (auto& icalc : mergedData->inlineCalcs) {
+        opers.erase(icalc->getOp().name);
+      }
+      if (opers.empty()) {
+        return; // no post sub ops, nothing to do.
       }
       int64_t slotNum = 0;
       for (auto [key, val] : valVec) {
         std::vector<std::unique_ptr<SearchOp::Calculator>> calculators;
-        calculators.reserve(thisOp().subOps.size());
-        for (auto& [name, subOp] : thisOp().subOps) {
+        calculators.reserve(opers.size());
+        for (auto& [name, subOp] : opers) {
           auto* subCalc = subOp->createCalculator(this, slotNum, valVec.size());
           calculators.emplace_back(subCalc);
         }
