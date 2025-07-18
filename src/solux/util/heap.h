@@ -282,7 +282,7 @@ template <class T, class Comp>
 class DirectPQ {
   std::span<T> heap;
   size_t heapSize; // the current heap size, not the max/capacity
-  static constexpr Comp comp{};
+  [[no_unique_address]] Comp comp{};  // Use [[no_unique_address]] to optimize away storage for empty comparators
 
   auto end() {
     return heap.begin() + heapSize;
@@ -290,6 +290,11 @@ class DirectPQ {
 public:
   DirectPQ(std::span<T> heap, size_t currentSize=0) : heap(heap), heapSize(currentSize) {
     std::make_heap(heap.begin(), end(), comp);
+  }
+  
+  DirectPQ(std::span<T> heap, Comp comp, size_t currentSize=0) 
+    : heap(heap), heapSize(currentSize), comp(comp) {
+    std::make_heap(heap.begin(), end(), this->comp);
   }
 
   // Reference to the top element.

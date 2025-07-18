@@ -4,6 +4,8 @@
 #include "solux/query/Query.h"
 #include "solux/reader/IntColReader.h"
 #include "solux/search/Collector.h"
+#include "solux/search/FieldSortCollector.h"
+#include "solux/search/SortField.h"
 #include "solux/search/SearchRequest.h"
 #include "solux/util/AtomicMerger.h"
 
@@ -19,6 +21,8 @@ public:
   Query* query;
   Query::Weight* weight;
   int64_t topCount; // maximum number of docs to return.
+  std::vector<SortField> sortFields;
+  bool useFieldSort = false;
 
 
   class Calc : public SearchOp::Calculator {
@@ -35,7 +39,7 @@ public:
     Calc(TopDocsReq& op, Calculator* parent) : SearchOp::Calculator(op, parent, slot, numSlots), collectorMerger(nullptr, nullptr) {
 
       collectorMerger.creator = [&op]() {
-        return new MergeableCollector(op.topCount);
+        return new MergeableCollector(op.topCount, op.useFieldSort, op.sortFields);
       };
       collectorMerger.destroyer = [](MergeableCollector* data) {
         delete data;
@@ -60,21 +64,35 @@ public:
     class MergeableCollector : public MergeableData {
     public:
       // QueryReq* queryReq;  // the query request that this collector is for
-      TopDocsCollector collector;
+      std::unique_ptr<TopDocsCollector> scoreCollector;
+      std::unique_ptr<FieldSortCollector> fieldCollector;
+      bool useFieldSort;
 
-      MergeableCollector(size_t topCount) : collector(topCount) {
-        // collector.queryReq = queryReq;
+      MergeableCollector(size_t topCount, bool useFieldSort, const std::vector<SortField>& sortFields) 
+        : useFieldSort(useFieldSort) {
+        if (!useFieldSort) {
+          scoreCollector = std::make_unique<TopDocsCollector>(topCount);
+        } else {
+          auto comparator = std::make_unique<MultiFieldComparator>(sortFields, topCount);
+          fieldCollector = std::make_unique<FieldSortCollector>(topCount, std::move(comparator));
+        }
       }
 
       static MergeableCollector* merge(MergeableCollector* a, MergeableCollector* b) {
         // merge the smaller collector into the larger collector, or if both the same size, merge
         // the less competitive collector into the more competitive collector.
-        if (a->collector.size() < b->collector.size()
-          || a->collector.minCompetitiveVal < b->collector.minCompetitiveVal) {
-          std::swap(a, b);
+        if (a->useFieldSort) {
+          if (a->fieldCollector->size() < b->fieldCollector->size()) {
+            std::swap(a, b);
+          }
+          a->fieldCollector->merge(*b->fieldCollector);
+        } else {
+          if (a->scoreCollector->size() < b->scoreCollector->size()
+            || a->scoreCollector->minCompetitiveVal < b->scoreCollector->minCompetitiveVal) {
+            std::swap(a, b);
+          }
+          a->scoreCollector->merge(*b->scoreCollector);
         }
-
-        a->collector.merge(b->collector);
         return a;
       }
     };
@@ -129,21 +147,41 @@ public:
         // TODO: special-case matchAllDocs query for producing the output domain.
 
         if (scorer != nullptr) {
-          auto& collector = data->collector;
-          for (;;) {
-            auto doc = scorer->next();
-            if (doc == PostingsReader::END) {
-              break;
+          if (data->useFieldSort) {
+            data->fieldCollector->setSegment(segnum, &seg.postingsReader());
+            auto& collector = *data->fieldCollector;
+            for (;;) {
+              auto doc = scorer->next();
+              if (doc == PostingsReader::END) {
+                break;
+              }
+              if (domainBits && !domainBits->get(doc)) {
+                continue;
+              }
+              if (outDomain) {
+                outDomain->set(doc);
+              }
+              auto score = scorer->score();
+              collector.collect(segnum, doc, score);
+              segMatches++;
             }
-            if (domainBits && !domainBits->get(doc)) {
-              continue;
+          } else {
+            auto& collector = *data->scoreCollector;
+            for (;;) {
+              auto doc = scorer->next();
+              if (doc == PostingsReader::END) {
+                break;
+              }
+              if (domainBits && !domainBits->get(doc)) {
+                continue;
+              }
+              if (outDomain) {
+                outDomain->set(doc);
+              }
+              auto score = scorer->score();
+              collector.collect(segnum, doc, score);
+              segMatches++;
             }
-            if (outDomain) {
-              outDomain->set(doc);
-            }
-            auto score = scorer->score();
-            collector.collect(segnum, doc, score);
-            segMatches++;
           }
         }
       }
@@ -193,6 +231,47 @@ public:
   TopDocsReq(SearchRequest& req, std::string_view name, const proto::TopDocs& topDocsProto, Query::Context& qcontext, Query* query, int64_t topCount)
     : SearchOp(req, name), topDocsProto(topDocsProto), qcontext(qcontext), query(query), topCount(topCount) {
     weight = query->createWeight(qcontext);
+    
+    // Parse sort fields from protobuf
+    if (topDocsProto.sorts_size() > 0) {
+      useFieldSort = true;
+      for (const auto& sortSpec : topDocsProto.sorts()) {
+        SortField::Type type;
+        
+        // Check for special fields first
+        if (sortSpec.field() == "_score_") {
+            type = SortField::SCORE;
+        } else if (sortSpec.field() == "_docid_") {
+            type = SortField::DOC;
+        } else {
+            // Look up field type in schema
+            auto& fieldType = *req.schema->getFieldTypeEx(sortSpec.field());
+            switch (fieldType.type()) {
+              case FieldType::Type::INT:
+                type = SortField::INT;
+                break;
+              case FieldType::Type::STRING:
+                type = SortField::STRING;
+                break;
+              case FieldType::Type::FLOAT:
+                // TODO: Add float comparator support
+                type = SortField::INT; // Fallback for now
+                break;
+              case FieldType::Type::DOUBLE:
+                // TODO: Add double comparator support
+                type = SortField::INT; // Fallback for now
+                break;
+              default:
+                throw std::runtime_error(std::string("Cannot sort by field type: ") + std::string(sortSpec.field()));
+            }
+        }
+        
+        SortField::SortOrder order = sortSpec.dir() == proto::SortSpec::DESC ? 
+          SortField::DESC : SortField::ASC;
+        FieldComparator::MissingValue missing = FieldComparator::MISSING_LAST;
+        sortFields.emplace_back(sortSpec.field(), type, order, missing);
+      }
+    }
   }
 
   Calculator* createCalculator(Calculator* parent, int64_t slot = -1, int64_t numSlots = -1) override {
@@ -220,9 +299,22 @@ public:
       return;
     }
 
-    auto& collector = mergeableCollector->collector;
-    collector.sort();
-    auto numCollected = collector.size();
+    std::span<TopDocsCollector::ScoreDoc> scoreDocs;
+    std::span<FieldSortCollector::SortDoc> sortDocs;
+    int64_t totalHits = 0;
+    int64_t numCollected = 0;
+    
+    if (mergeableCollector->useFieldSort) {
+      auto& collector = *mergeableCollector->fieldCollector;
+      totalHits = collector.totalHits();
+      sortDocs = collector.sort();
+      numCollected = sortDocs.size();
+    } else {
+      auto& collector = *mergeableCollector->scoreCollector;
+      totalHits = collector.totalHits();
+      scoreDocs = collector.sort();
+      numCollected = scoreDocs.size();
+    }
     unused(numCollected);
     int32_t maxBatchSize = qr.topDocsProto.batch_size();
     if (maxBatchSize <= 0) {
@@ -233,28 +325,30 @@ public:
 
     // starting offset into the topDocs list as specified by the request.
     int64_t offset = qr.topDocsProto.offset();
-    auto batches = collector.scoreDocs() | std::views::drop(offset) | std::views::chunk(maxBatchSize);
+    
+    // Create batches based on collector type
+    // We need to handle the two collector types separately due to different doc types
 
-    // we want to ensure we always enter the loop at least once, so we use iterators instead of range-based for.
-    for (auto batchIter = batches.begin();; batchIter++) {
-      if (batchIter == batches.end() && batches.size() > 0) {
-        // we reached then end of the non-zero length list
-        break;
-      }
+    // Process documents in batches
+    // If no documents were collected, we still need to send an empty response
+    int64_t totalBatches = numCollected > 0 ? numCollected : 1;
+    for (int64_t batchStart = 0; batchStart < totalBatches; batchStart += maxBatchSize) {
+      int64_t batchEnd = std::min(batchStart + maxBatchSize, numCollected);
+      int64_t batchSize = batchEnd - batchStart;
 
-      bool lastResponse = batchIter == batches.end() || std::next(batchIter) == batches.end();
+      bool lastResponse = batchEnd >= numCollected;
       auto& response = lastResponse ? *qr.req.lastResponse : *SearchResponse::create(qr.req, lastResponse);
       auto& searchResultProto = *calc.getTarget(&response.proto);
       // auto& searchResultProto = response.proto.mutable_ops()->operator[](qr.name);
       auto& docListProto = *searchResultProto.mutable_docs();
-      docListProto.set_offset(offset);
+      docListProto.set_offset(offset + batchStart);
       if (!lastResponse) {
         docListProto.set_more(true);
         response.proto.set_more(true);  // also set at the response level for easier client handling.
       }
 
       if (qr.topDocsProto.get_number()) {
-        docListProto.set_matches(collector.totalHits());
+        docListProto.set_matches(totalHits);
       }
 
       // Should we somehow do auto-sizing of return messages?
@@ -262,14 +356,26 @@ public:
       // parallelized easily though.
       // We could also do it based on index data of the average column size.
 
-      if (batchIter == batches.end()) {
-        // no batch to process.
-        break;
+      // Create a vector of segdocs from the appropriate collector
+      std::vector<segdoc> batchSegDocs;
+      
+      if (numCollected > 0) {
+        batchSegDocs.reserve(batchSize);
+        
+        if (mergeableCollector->useFieldSort) {
+          for (int64_t i = batchStart; i < batchEnd; i++) {
+            batchSegDocs.push_back(sortDocs[i].doc);
+          }
+        } else {
+          for (int64_t i = batchStart; i < batchEnd; i++) {
+            batchSegDocs.push_back(scoreDocs[i].doc);
+          }
+        }
       }
-
-      auto batch = *batchIter;
-      auto segDocs = batch | std::views::transform([](auto& sd) { return sd.doc; });
+      
+      auto segDocs = std::span(batchSegDocs);
       int columnSize = segDocs.size();
+      
 
       // std::optional keeps constructor from being called if not needed.  We could also pool allocate it.
       std::optional<oneapi::tbb::task_group> loadColumnsTaskGroup;
@@ -331,8 +437,14 @@ public:
         auto& floatsProto = *floatColProto.mutable_v();
         // floatColProto.set_missing_val(-1.0f); // TODO
         floatsProto.Reserve(columnSize);
-        for (int i = 0; i < columnSize; i++) {
-          floatsProto.Add(collector.topDocs[offset + i].score);
+        if (mergeableCollector->useFieldSort) {
+          for (int i = 0; i < columnSize; i++) {
+            floatsProto.Add(sortDocs[batchStart + i].score);
+          }
+        } else {
+          for (int i = 0; i < columnSize; i++) {
+            floatsProto.Add(scoreDocs[batchStart + i].score);
+          }
         }
       }
 
@@ -357,7 +469,6 @@ public:
         // probably block on the *next* reply, not the current one.
       }
 
-      offset += columnSize;
     }  // end for
   }
 
@@ -373,6 +484,11 @@ public:
     std::span<int64_t> starget; // single valued target
     std::span<solux::proto::ArrInt*> mtarget;  // multi-valued target
     auto columnSize = segDocs.size();
+    
+    // If no documents, skip this field
+    if (columnSize == 0) {
+      return;
+    }
 
     if (!fieldType.multiValued()) {
       auto& intCol = *fieldCol.mutable_col_i();
@@ -380,7 +496,7 @@ public:
       // intCol.set_missing_val(0); // TODO.... get from schema? Set even if all values present?
       auto missingVal = std::numeric_limits<int64_t>::min();
       intsProto.Resize(columnSize, missingVal);  // fill with missing values
-      starget = {&intsProto[0], &intsProto[0] + columnSize};
+      starget = {intsProto.mutable_data(), (size_t)columnSize};
       // Ensure protobuf is contiguous (is this guaranteed or impl detail?)
       assert(&intsProto[columnSize - 1] >= starget.data() && &intsProto[columnSize - 1] < starget.data() +columnSize);
     } else {
@@ -462,6 +578,11 @@ public:
 
     proto::Val valll;
 
+    // If no documents, skip this field
+    if (columnSize == 0) {
+      return;
+    }
+    
     if (!fieldType.multiValued()) {
       auto& strCol = *fieldCol.mutable_col_s();
       auto& stringsProto = *strCol.mutable_v();
@@ -472,7 +593,7 @@ public:
         stringsProto.Add("");
       }
       auto* arrstart = stringsProto.mutable_data();
-      starget = {arrstart, arrstart + columnSize};
+      starget = {arrstart, (size_t)columnSize};
     } else {
       // multi-valued field type (even if only one value per doc currently)
       auto& strCol = *fieldCol.mutable_multi_s();
