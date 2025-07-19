@@ -40,6 +40,12 @@ public:
     z = (z ^ (z >> 27)) * 0x94d049bb133111eb;
     return z ^ (z >> 31);
   }
+
+  // Simple biased modulo division.  Designed to be easily reproducible in other languages like Java.
+  int64_t rint(int64_t max) {
+    // mask off sign bit to ensure it's positive
+    return (operator()() & 0x7fffffffffffffff) % max;
+  }
 };
 
 // Adapted from https://www.romu-random.org/romupaper.pdf  (ORIG LICENSE: Apache 2)

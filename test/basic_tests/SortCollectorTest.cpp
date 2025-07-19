@@ -4,6 +4,9 @@
 #include "test/LocalReq.h"
 #include "solux/search/FieldSortCollector.h"
 #include "solux/search/SortField.h"
+#include "solux/util/random.h"
+#include <charconv>
+#include <algorithm>
 
 using namespace solux;
 using namespace solux::test;
@@ -60,6 +63,11 @@ TEST_F(SortCollectorTest, SortByPriceAscending) {
   ASSERT_GT(idCol.v_size(), 0) << "No id values loaded";
   ASSERT_GT(priceCol.v_size(), 0) << "No price values loaded";
 
+  // Debug: print what we got
+  for (int i = 0; i < idCol.v_size(); i++) {
+    std::cout << "Position " << i << ": " << idCol.v(i) << " price=" << priceCol.v(i) << std::endl;
+  }
+  
   // Verify sort order by price: doc2(50), doc4(75), doc1(100), doc5(100), doc3(150)
   ASSERT_EQ("doc2", idCol.v(0));
   ASSERT_EQ(50, priceCol.v(0));
@@ -499,6 +507,176 @@ TEST_F(SortCollectorTest, LimitOne) {
   // Should get the document with lowest price
   ASSERT_EQ("doc2", idCol.v(0));
   ASSERT_EQ(50, priceCol.v(0));
+  
+  lreq->done();
+}
+
+TEST_F(SortCollectorTest, DeterministicParallelSort) {
+  CollectionHelper helper;
+  helper.clear();
+  
+  // Create multiple segments to trigger parallel execution
+  // First segment
+  for (int i = 1; i <= 100; i++) {
+    helper.index(flatdoc("id_s", "doc" + std::to_string(i), "price_i", i % 10),
+      i == 100 ? UpdateMessage::COMMIT : UpdateMessage::NO_COMMIT);
+  }
+  
+  // Second segment
+  for (int i = 101; i <= 200; i++) {
+    helper.index(flatdoc("id_s", "doc" + std::to_string(i), "price_i", i % 10),
+      i == 200 ? UpdateMessage::COMMIT : UpdateMessage::NO_COMMIT);
+  }
+  
+  // Third segment
+  for (int i = 201; i <= 300; i++) {
+    helper.index(flatdoc("id_s", "doc" + std::to_string(i), "price_i", i % 10),
+      i == 300 ? UpdateMessage::COMMIT : UpdateMessage::NO_COMMIT);
+  }
+  
+  // Run query multiple times to verify deterministic results
+  std::vector<int64_t> fingerprints;
+  
+  for (int run = 0; run < 5; run++) {
+    auto* lreq = LocalReq::create(soluxNode->getSearchEngine());
+    lreq->proto.mutable_collection()->add_name("main");
+    
+    auto& ops = *lreq->proto.mutable_ops();
+    auto& topDocs = *ops["q"].mutable_top_docs();
+    topDocs.set_get_number(true);
+    topDocs.set_limit(50);
+    
+    // Match all documents
+    topDocs.mutable_query()->set_all(true);
+    
+    // Sort by price ascending  
+    auto* sortSpec = topDocs.add_sorts();
+    sortSpec->set_field("price_i");
+    sortSpec->set_dir(proto::SortSpec::ASC);
+    
+    // Request fields to return
+    topDocs.mutable_fields()->Add("id_s");
+    
+    // Run in parallel mode
+    lreq->engine.submit(*lreq, true);
+    
+    auto& docs = lreq->responses[0]->proto.ops().at("q").docs();
+    ASSERT_EQ(300, docs.matches());
+    
+    // Calculate fingerprint of results
+    int64_t fp = docs.matches();
+    const auto& idCol = docs.columns().at("id_s").col_s();
+    for (int i = 0; i < idCol.v_size(); i++) {
+      int64_t id = 0;
+      std::from_chars(idCol.v(i).data() + 3, idCol.v(i).data() + idCol.v(i).size(), id);
+      fp = fp * 31 + id;
+    }
+    
+    fingerprints.push_back(fp);
+    lreq->done();
+  }
+  
+  // Verify all runs produced the same fingerprint
+  for (size_t i = 1; i < fingerprints.size(); i++) {
+    ASSERT_EQ(fingerprints[0], fingerprints[i]) 
+      << "Run " << i << " produced different results (fingerprint mismatch)";
+  }
+}
+
+TEST_F(SortCollectorTest, RandomValuesWithTieBreaking) {
+  CollectionHelper helper;
+  helper.clear();
+  
+  // Track expected results: tuples of (value, docid, segment)
+  struct DocInfo {
+    int32_t value;
+    int32_t docId;
+    int32_t segment;
+    int32_t docInSegment;
+  };
+  std::vector<DocInfo> expectedOrder;
+  
+  // Create multiple segments with random values
+  int docId = 0;
+  const int numSegments = 5;
+  const int docsPerSegment = 20;
+  
+  for (int seg = 0; seg < numSegments; seg++) {
+    SplitMix64 rng(seg); // Predictable random numbers per segment
+    
+    // Index documents for this segment
+    for (int i = 0; i < docsPerSegment; i++) {
+      int32_t value = rng.rint(100); // Random values 0-99
+      
+      helper.index(flatdoc("id_s", std::to_string(docId), "value_i", value), 
+                   UpdateMessage::NO_COMMIT);
+      
+      expectedOrder.push_back({value, docId, seg, i});
+      
+      
+      docId++;
+    }
+    
+    // Commit to create a segment
+    helper.commit();
+  }
+  
+  // Sort expected order: by value descending, then by segment/doc ascending for ties
+  std::sort(expectedOrder.begin(), expectedOrder.end(), 
+    [](const auto& a, const auto& b) {
+      if (a.value != b.value) {
+        return a.value > b.value; // Higher values first (DESC)
+      }
+      // For ties, sort by segment first, then by doc within segment
+      if (a.segment != b.segment) {
+        return a.segment < b.segment;
+      }
+      return a.docInSegment < b.docInSegment;
+    });
+  
+  // Search with sorting
+  auto* lreq = LocalReq::create(soluxNode->getSearchEngine());
+  lreq->proto.mutable_collection()->add_name("main");
+  
+  auto& ops = *lreq->proto.mutable_ops();
+  auto& topDocs = *ops["q"].mutable_top_docs();
+  topDocs.set_get_number(true);
+  topDocs.set_limit(100); // Get all results
+  
+  // Match all documents
+  topDocs.mutable_query()->set_all(true);
+  
+  // Sort by value descending
+  auto* sortSpec = topDocs.add_sorts();
+  sortSpec->set_field("value_i");
+  sortSpec->set_dir(proto::SortSpec::DESC);
+  
+  // Request fields
+  topDocs.mutable_fields()->Add("id_s");
+  topDocs.mutable_fields()->Add("value_i");
+  
+  lreq->engine.submit(*lreq, true); // Run multi-threaded
+  
+  auto& docs = lreq->responses[0]->proto.ops().at("q").docs();
+  
+  ASSERT_EQ(docs.matches(), docId) << "Should match all documents";
+  
+  // Verify results are in expected order
+  const auto& idCol = docs.columns().at("id_s").col_s();
+  const auto& valueCol = docs.columns().at("value_i").col_i();
+  
+  for (int i = 0; i < std::min(idCol.v_size(), (int)expectedOrder.size()); i++) {
+    int64_t actualId = 0;
+    std::from_chars(idCol.v(i).data(), idCol.v(i).data() + idCol.v(i).size(), actualId);
+    int64_t actualValue = valueCol.v(i);
+    
+    ASSERT_EQ(actualId, expectedOrder[i].docId) 
+      << "Position " << i << ": Expected id=" << expectedOrder[i].docId 
+      << " but got id=" << actualId << " (value=" << actualValue << ")";
+    ASSERT_EQ(actualValue, expectedOrder[i].value)
+      << "Position " << i << ": Expected value=" << expectedOrder[i].value 
+      << " but got value=" << actualValue;
+  }
   
   lreq->done();
 }

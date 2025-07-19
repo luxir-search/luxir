@@ -24,6 +24,10 @@ public:
   virtual void setBottom(int32_t slot) = 0;
 
   virtual void copy(int32_t slot, int32_t doc, int32_t segment) = 0;
+  
+  virtual bool isReversed() const { return false; }
+  
+  virtual int64_t getValue(int32_t slot) const { return 0; }
 
   enum MissingValue {
     MISSING_FIRST,
@@ -48,6 +52,9 @@ private:
   int64_t missingValueSubstitute;
 
   int64_t getValueSafe(int32_t doc, int32_t segment) {
+    if (segment < 0 || segment >= (int32_t)segmentReaders.size()) {
+      return missingValueSubstitute;
+    }
     auto& segReader = segmentReaders[segment];
     if (!segReader.hasValues || !segReader.reader) {
       return missingValueSubstitute;
@@ -136,6 +143,17 @@ public:
       val = -val;
     }
     values[slot] = val;
+  }
+  
+  bool isReversed() const override {
+    return reversed;
+  }
+  
+  int64_t getValue(int32_t slot) const override {
+    if (slot >= 0 && slot < (int32_t)values.size()) {
+      return values[slot];
+    }
+    return 0;
   }
 
   ~NumericFieldComparator() {

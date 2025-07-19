@@ -136,6 +136,22 @@ public:
             comp->copy(slot, doc, segment);
         }
     }
+    
+    bool isReversed() const override {
+        // Return the reversed state of the first comparator
+        if (!comparators.empty()) {
+            return comparators[0]->isReversed();
+        }
+        return false;
+    }
+    
+    int64_t getValue(int32_t slot) const override {
+        // Return the value from the first comparator
+        if (!comparators.empty()) {
+            return comparators[0]->getValue(slot);
+        }
+        return 0;
+    }
 };
 
 } // namespace solux

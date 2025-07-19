@@ -21,8 +21,7 @@ public:
   }
 
   auto operator<=>(const segdoc &other) const {
-    // compare both segment and docid with a single comparison.
-    return reinterpret_cast<const int64_t &>(*this) <=> reinterpret_cast<const int64_t &>(other);
+    return std::bit_cast<int64_t>(*this) <=> std::bit_cast<int64_t>(other);
   }
 } SOLUX_PACKED_END;
 
