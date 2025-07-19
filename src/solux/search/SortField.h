@@ -63,7 +63,7 @@ public:
         switch (type) {
             case INT:
             case LONG:
-                return std::make_unique<NumericFieldComparator>(
+                return std::make_unique<SimpleNumericFieldComparator>(
                     fieldName, numHits, isReversed(), missingValue
                 );
             case SCORE:
@@ -149,6 +149,14 @@ public:
         // Return the value from the first comparator
         if (!comparators.empty()) {
             return comparators[0]->getValue(slot);
+        }
+        return 0;
+    }
+    
+    int64_t getDocValue(int32_t docid) override {
+        // For multi-field sort, return the value from the first comparator
+        if (!comparators.empty()) {
+            return comparators[0]->getDocValue(docid);
         }
         return 0;
     }

@@ -178,7 +178,7 @@ static void BM_Query(benchmark::State& state, int64_t nDocs, std::string_view sh
     // sort by some of the string fields
     auto* sortSpec = topDocs.add_sorts();
     sortSpec->set_field(sfield);
-    sortSpec->set_dir(proto::SortSpec::DESC);
+    sortSpec->set_dir(proto::SortSpec::ASC);
 
     lreq->engine.submit(*lreq, para);
 

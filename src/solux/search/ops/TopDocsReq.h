@@ -5,6 +5,7 @@
 #include "solux/reader/IntColReader.h"
 #include "solux/search/Collector.h"
 #include "solux/search/FieldSortCollector.h"
+#include "solux/search/FieldSortCollector2.h"
 #include "solux/search/SortField.h"
 #include "solux/search/SearchRequest.h"
 #include "solux/util/AtomicMerger.h"
@@ -65,7 +66,7 @@ public:
     public:
       // QueryReq* queryReq;  // the query request that this collector is for
       std::unique_ptr<TopDocsCollector> scoreCollector;
-      std::unique_ptr<FieldSortCollector> fieldCollector;
+      std::unique_ptr<FieldSortCollector2> fieldCollector;
       bool useFieldSort;
 
       MergeableCollector(size_t topCount, bool useFieldSort, const std::vector<SortField>& sortFields) 
@@ -74,7 +75,7 @@ public:
           scoreCollector = std::make_unique<TopDocsCollector>(topCount);
         } else {
           auto comparator = std::make_unique<MultiFieldComparator>(sortFields, topCount);
-          fieldCollector = std::make_unique<FieldSortCollector>(topCount, std::move(comparator));
+          fieldCollector = std::make_unique<FieldSortCollector2>(topCount, std::move(comparator));
         }
       }
 
@@ -300,7 +301,7 @@ public:
     }
 
     std::span<TopDocsCollector::ScoreDoc> scoreDocs;
-    std::span<FieldSortCollector::SortDoc> sortDocs;
+    std::span<FieldSortCollector2::SortDoc> sortDocs;
     int64_t totalHits = 0;
     int64_t numCollected = 0;
     
