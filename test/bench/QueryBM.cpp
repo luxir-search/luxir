@@ -21,6 +21,8 @@ static void buildIndex(CollectionHelper& helper, int64_t nDocs, std::span<const 
   int64_t idNum = 0;
   for (size_t segnum=0; segnum<docsPerSeg.size(); segnum++) {
     SplitMix64 r(segnum); // make each segment predictable so segment build order doesn't affect the results.
+   // LOG_ERROR("Segment {} with {} docs, rng={}", segnum, docsPerSeg[segnum], (int64_t)r());
+
     int segDocs = docsPerSeg[segnum];
     Inverter& inverter = iw->obtainInverter();
     Inverter::IndexHandler& s0 = inverter.getIndexHandler("id");
@@ -28,7 +30,9 @@ static void buildIndex(CollectionHelper& helper, int64_t nDocs, std::span<const 
     Inverter::IndexHandler& s2 = inverter.getIndexHandler("short_u10k_s");
     Inverter::IndexHandler& s3 = inverter.getIndexHandler("med_u10_s");
     Inverter::IndexHandler& s4 = inverter.getIndexHandler("med_u10k_s");
-    Inverter::IndexHandler& i1 = inverter.getIndexHandler("u10k_i");
+    Inverter::IndexHandler& i1 = inverter.getIndexHandler("u10_i");
+    Inverter::IndexHandler& i2 = inverter.getIndexHandler("u10k_i");
+    Inverter::IndexHandler& i3 = inverter.getIndexHandler("u10m_i");
 
     std::string s;
     for (int i=0; i<segDocs; i++) {
@@ -50,13 +54,21 @@ static void buildIndex(CollectionHelper& helper, int64_t nDocs, std::span<const 
       s.append(std::to_string(r.rint(100)));
       s4.index(inverter, s);
 
+
+      i1.index(inverter, r.rint(10));
+
       auto iVal = r.rint(10000);
       // ivals.emplace_back(iVal, idNum-1);  // keep track of vals
-      i1.index(inverter, iVal);
+      i2.index(inverter, iVal);
+
+      i1.index(inverter, r.rint(10000000));
+
+
       inverter.finishDoc();
     }
     iw->releaseInverter(inverter);
     helper.commit();
+    // LOG_ERROR("DONE Segment {} rng={}", segnum, (int64_t)r());
   }
 }
 
@@ -201,18 +213,22 @@ static void BM_Query(benchmark::State& state, int64_t nDocs, std::string_view sh
   state.counters["fp"] = fp;  // sanity check.
   state.counters["reused"] = reuseIndex;; // did we reuse the index?
   state.counters["rate"] = benchmark::Counter(state.iterations(),benchmark::Counter::kIsRate);
+  // LOG_ERROR("fingerprint={}", fp); // verified is exactly the same on lucene
 }
 
 
 
 // When we test sparse sets for performance, the most interesting case is when it's still a bitset in the block.
 // Search code will spend much less time in very sparse sets.
-// constexpr int32_t nDocs = 10'000'000;
-constexpr int32_t nDocs = 1000000; // nocommit, temporary
+constexpr int32_t nDocs = 10'000'000;
 constexpr const char* shape = "9555"; // 9 segments, 555 docs per segment
 
 BENCHMARK_CAPTURE(BM_QueryBuildIndex, build,              nDocs, shape);
+BENCHMARK_CAPTURE(BM_Query, u10k_i,            nDocs, shape, "all", "u10_i", false);
+BENCHMARK_CAPTURE(BM_Query, u10k_i_para,       nDocs, shape, "all", "u10_i", true);
 BENCHMARK_CAPTURE(BM_Query, u10k_i,            nDocs, shape, "all", "u10k_i", false);
 BENCHMARK_CAPTURE(BM_Query, u10k_i_para,       nDocs, shape, "all", "u10k_i", true);
+BENCHMARK_CAPTURE(BM_Query, u10m_i,            nDocs, shape, "all", "u10m_i", false);
+BENCHMARK_CAPTURE(BM_Query, u10m_i_para,       nDocs, shape, "all", "u10m_i", true);
 // BENCHMARK_CAPTURE(BM_Query, short_u10k_s,      nDocs, shape, "all", "short_u10k_s", false);
 // BENCHMARK_CAPTURE(BM_Query, short_u10k_s_para, nDocs, shape, "all", "short_u10k_s", true);

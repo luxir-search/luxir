@@ -35,12 +35,14 @@ public:
       const auto& segs = op.req.reader->segments();
       for (auto& subCalc : subCalcs) {
         for (int32_t i = 0; i < (int32_t)segs.size(); i++) {
-          auto& seg = segs[i];
+          // int32_t segnum = (int32_t)segs.size() - 1 - i; // launch in reverse order to get the first segments done first.
+          int32_t segnum = i; // launch in order for later (smaller) segments to start in this thread first.
+          auto& seg = segs[segnum];
           // For the domains, start with live docs.
           DocSet* domainPtr = seg.liveDocs() ? &seg.liveDocs()->docset() : nullptr;
-          task_group_run(tg, [this, i, domainPtr, tg,  &subCalc]() {
+          task_group_run(tg, [this, segnum, domainPtr, tg,  &subCalc]() {
             // call the calc method on each sub-calculator
-              subCalc->calc(tg, i, domainPtr);
+              subCalc->calc(tg, segnum, domainPtr);
           });
         }
 
