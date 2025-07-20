@@ -61,8 +61,7 @@ static void buildIndex(CollectionHelper& helper, int64_t nDocs, std::span<const 
       // ivals.emplace_back(iVal, idNum-1);  // keep track of vals
       i2.index(inverter, iVal);
 
-      i1.index(inverter, r.rint(10000000));
-
+      i3.index(inverter, r.rint(10000000));
 
       inverter.finishDoc();
     }
@@ -117,6 +116,36 @@ static void BM_QueryBuildIndex(benchmark::State& state, int64_t nDocs, std::stri
   state.counters["indexSz"] = totalSize; // size of the index in bytes
 }
 
+
+int64_t scanIntCol(std::string_view field, IndexReader& reader) {
+  int64_t count = 0;
+  for (auto& seg : reader.segments()) {
+    // create a fieldReader and look up the field
+    auto poolGuard = MemPool::threadLocalPoolGuard();
+    FieldReader fieldReader(poolGuard.pool(), seg.postingsReader());
+    bool hasField = fieldReader.seek(field);
+    if (!hasField) {
+      continue;
+    }
+    // read the SegFieldInfo
+    SegFieldInfo fieldInfo;
+    fieldReader.readFieldInfo(fieldInfo);
+    IntColReader colReader(seg.postingsReader(), fieldInfo);
+    IntColReader::Iterator iter(colReader);
+    while (true) {
+      int32_t doc = iter.next();
+      if (doc == IntColReader::ENDDOC) {
+        break;
+      }
+      auto val = iter.value();
+      if (val > 0) {
+        count++;
+      }
+    }
+  }
+  return count;
+}
+
 //
 // TODO: optionally go through grpc for searching to see how much overhead that adds.
 //
@@ -157,6 +186,12 @@ static void BM_Query(benchmark::State& state, int64_t nDocs, std::string_view sh
   for (auto _ : state) {
     int64_t ret = 0;
 
+    // scan int col just to get an idea of what a full scan costs vs all the sort logic.
+    if (qfield=="scan") {
+      fp = scanIntCol(sfield, *helper.getIndexWriter()->getIndexReader());
+      continue;
+    }
+
     auto* lreq = LocalReq::create(SoluxTest::soluxNode->getSearchEngine());
     lreq->proto.mutable_collection()->add_name("main");
     lreq->proto.set_request_id("myrequestid");
@@ -171,14 +206,14 @@ static void BM_Query(benchmark::State& state, int64_t nDocs, std::string_view sh
       matchQuery.set_field(qfield);
       matchQuery.mutable_val()->set_s("0");
     }
-    topDocs.set_limit(100);  // higher limit to exercize the priority queues more
+    topDocs.set_limit(100); // higher limit to exercise the priority queues more
     topDocs.set_get_number(true);
     topDocs.set_get_scores(false);
     topDocs.add_fields("id");
     // sort by some of the string fields
     auto* sortSpec = topDocs.add_sorts();
     sortSpec->set_field(sfield);
-    sortSpec->set_dir(proto::SortSpec::ASC);
+    sortSpec->set_dir(proto::SortSpec::DESC);
 
     lreq->engine.submit(*lreq, para);
 
@@ -220,15 +255,21 @@ static void BM_Query(benchmark::State& state, int64_t nDocs, std::string_view sh
 
 // When we test sparse sets for performance, the most interesting case is when it's still a bitset in the block.
 // Search code will spend much less time in very sparse sets.
-constexpr int32_t nDocs = 10'000'000;
+constexpr int32_t nDocs = 10'000'000; // nocommit
 constexpr const char* shape = "9555"; // 9 segments, 555 docs per segment
 
-BENCHMARK_CAPTURE(BM_QueryBuildIndex, build,              nDocs, shape);
-BENCHMARK_CAPTURE(BM_Query, u10k_i,            nDocs, shape, "all", "u10_i", false);
-BENCHMARK_CAPTURE(BM_Query, u10k_i_para,       nDocs, shape, "all", "u10_i", true);
-BENCHMARK_CAPTURE(BM_Query, u10k_i,            nDocs, shape, "all", "u10k_i", false);
-BENCHMARK_CAPTURE(BM_Query, u10k_i_para,       nDocs, shape, "all", "u10k_i", true);
-BENCHMARK_CAPTURE(BM_Query, u10m_i,            nDocs, shape, "all", "u10m_i", false);
-BENCHMARK_CAPTURE(BM_Query, u10m_i_para,       nDocs, shape, "all", "u10m_i", true);
+SOLUX_BENCHMARK_CAPTURE(BM_QueryBuildIndex, build,              nDocs, shape);
+
+// use this one for profiling...
+// SOLUX_BENCHMARK_CAPTURE(BM_Query, u10_i,            nDocs, shape, "all", "u10_i", false)->MinTime(30);
+// #ifdef REMOVED
+SOLUX_BENCHMARK_CAPTURE(BM_Query, u10_i_scan,        nDocs, shape, "scan","u10_i", false);
+SOLUX_BENCHMARK_CAPTURE(BM_Query, u10_i,             nDocs, shape, "all", "u10_i", false);
+SOLUX_BENCHMARK_CAPTURE(BM_Query, u10_i_para,        nDocs, shape, "all", "u10_i", true);
+SOLUX_BENCHMARK_CAPTURE(BM_Query, u10k_i,            nDocs, shape, "all", "u10k_i", false);
+SOLUX_BENCHMARK_CAPTURE(BM_Query, u10k_i_para,       nDocs, shape, "all", "u10k_i", true);
+SOLUX_BENCHMARK_CAPTURE(BM_Query, u10m_i,            nDocs, shape, "all", "u10m_i", false);
+SOLUX_BENCHMARK_CAPTURE(BM_Query, u10m_i_para,       nDocs, shape, "all", "u10m_i", true);
+// #endif
 // BENCHMARK_CAPTURE(BM_Query, short_u10k_s,      nDocs, shape, "all", "short_u10k_s", false);
 // BENCHMARK_CAPTURE(BM_Query, short_u10k_s_para, nDocs, shape, "all", "short_u10k_s", true);

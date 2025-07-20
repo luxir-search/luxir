@@ -74,7 +74,14 @@ public:
         if (!useFieldSort) {
           scoreCollector = std::make_unique<TopDocsCollector>(topCount);
         } else {
-          auto comparator = std::make_unique<MultiFieldComparator>(sortFields, topCount);
+          std::unique_ptr<FieldComparator> comparator;
+          if (sortFields.size() == 1) {
+            // For single field sort, create the comparator directly
+            comparator = sortFields[0].createComparator(topCount);
+          } else {
+            // For multiple fields, use MultiFieldComparator
+            comparator = std::make_unique<MultiFieldComparator>(sortFields, topCount);
+          }
           fieldCollector = std::make_unique<FieldSortCollector2>(topCount, std::move(comparator));
         }
       }

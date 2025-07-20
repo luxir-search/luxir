@@ -3,6 +3,11 @@
 #include "benchmark/benchmark.h"
 #include "test/SoluxTest.h"
 
+// Solux project benchmarks - always use real time since we extensively use TBB
+// throughout the codebase and CPU time only measures the main thread
+#define SOLUX_BENCHMARK(...) BENCHMARK(__VA_ARGS__)->UseRealTime()
+#define SOLUX_BENCHMARK_CAPTURE(...) BENCHMARK_CAPTURE(__VA_ARGS__)->UseRealTime()
+
 namespace solux {
 
 // true if we are running benchmarks as part of unit tests (i.e. it's ok
