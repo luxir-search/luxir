@@ -67,6 +67,8 @@ TEST_F(SearchEngineTest, basic) {
       subAvg.set_name("avg");
       subAvg.mutable_args()->Add()->set_s("foo_i");
     }
+    facet4.mutable_sort()->set_field("avgsub");
+    facet4.mutable_sort()->set_dir(solux::proto::SortSpec_SortDir_ASC); // sort by avg ascending
     auto& facet5 = *ops["f5"].mutable_field_facet();
     facet5.set_field("colors_ss");
     auto& facet6 = *ops["f6"].mutable_field_facet();
@@ -147,18 +149,18 @@ TEST_F(SearchEngineTest, basic) {
 
     // check the fourth facet
     ASSERT_EQ(3, lreq->responses[0]->proto.ops().at("f4").facet().bucket_ids().col_s().v_size());
-    ASSERT_EQ("blue", lreq->responses[0]->proto.ops().at("f4").facet().bucket_ids().col_s().v(0));
-    ASSERT_EQ("brown", lreq->responses[0]->proto.ops().at("f4").facet().bucket_ids().col_s().v(1));
-    ASSERT_EQ("red", lreq->responses[0]->proto.ops().at("f4").facet().bucket_ids().col_s().v(2));
+    ASSERT_EQ("brown", lreq->responses[0]->proto.ops().at("f4").facet().bucket_ids().col_s().v(0));
+    ASSERT_EQ("red", lreq->responses[0]->proto.ops().at("f4").facet().bucket_ids().col_s().v(1));
+    ASSERT_EQ("blue", lreq->responses[0]->proto.ops().at("f4").facet().bucket_ids().col_s().v(2));
     ASSERT_EQ(3, lreq->responses[0]->proto.ops().at("f4").facet().counts().size());
     ASSERT_EQ(1, lreq->responses[0]->proto.ops().at("f4").facet().counts().at(0));
     ASSERT_EQ(1, lreq->responses[0]->proto.ops().at("f4").facet().counts().at(1));
     ASSERT_EQ(1, lreq->responses[0]->proto.ops().at("f4").facet().counts().at(2));
     // check the sub-op avg
     ASSERT_EQ(3, lreq->responses[0]->proto.ops().at("f4").facet().ops().at("avgsub").arr_d().v_size());
-    ASSERT_EQ(23, lreq->responses[0]->proto.ops().at("f4").facet().ops().at("avgsub").arr_d().v(0));
-    ASSERT_EQ(5, lreq->responses[0]->proto.ops().at("f4").facet().ops().at("avgsub").arr_d().v(1));
-    ASSERT_EQ(17, lreq->responses[0]->proto.ops().at("f4").facet().ops().at("avgsub").arr_d().v(2));
+    ASSERT_EQ(5, lreq->responses[0]->proto.ops().at("f4").facet().ops().at("avgsub").arr_d().v(0));
+    ASSERT_EQ(17, lreq->responses[0]->proto.ops().at("f4").facet().ops().at("avgsub").arr_d().v(1));
+    ASSERT_EQ(23, lreq->responses[0]->proto.ops().at("f4").facet().ops().at("avgsub").arr_d().v(2));
 
     // check the fifth facet
     ASSERT_EQ(2, lreq->responses[0]->proto.ops().at("f5").facet().bucket_ids().col_s().v_size());

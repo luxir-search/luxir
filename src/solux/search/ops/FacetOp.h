@@ -252,8 +252,11 @@ class StrFacetReq : public IntFacetBaseReq {
   };
 
 public:
-  StrFacetReq(SearchRequest& req, std::string_view fieldName, std::string_view facetName, int64_t limit, int64_t minCount, bool missing) :
-  IntFacetBaseReq(req, fieldName, facetName, limit, minCount, missing){}
+  const proto::FieldFacet& fieldFacet;
+
+  StrFacetReq(SearchRequest& req, const proto::FieldFacet& fieldFacet, std::string_view fieldName,
+    std::string_view facetName, int64_t limit, int64_t minCount, bool missing) :
+  IntFacetBaseReq(req, fieldName, facetName, limit, minCount, missing), fieldFacet(fieldFacet){}
 
   class Calc : public Calculator {
     std::vector<DocSet*> input;
@@ -484,12 +487,29 @@ public:
           }
         }
         auto missing_count = mergedData->missing_num;
-      std::sort(valVec.begin(), valVec.end(), [](auto& a, auto& b) {
-        if (*(int64_t*)a.second != *(int64_t*)b.second ) {
-          return *(int64_t*)a.second > *(int64_t*)b.second;
-        }
-        return a.first < b.first;
-      });
+      if (!thisOp().fieldFacet.has_sort()) {
+        std::sort(valVec.begin(), valVec.end(), [](auto& a, auto& b) {
+          if (*(int64_t*)a.second != *(int64_t*)b.second ) {
+            return *(int64_t*)a.second > *(int64_t*)b.second;
+          }
+          return a.first < b.first;
+        });
+      } else if (false) {
+      } else if (false) {
+      } else {
+        std::string_view field = thisOp().fieldFacet.sort().field();
+        auto calc = mergedData->inlineCalcs.front();
+        assert(field == calc->getOp().name);
+        bool reversed = thisOp().fieldFacet.sort().dir() == proto::SortSpec_SortDir_DESC;
+        std::sort(valVec.begin(), valVec.end(), [&calc, reversed](auto& a, auto& b) {
+          int asize, bsize;
+          int  cmp = calc->compare(a.second + sizeof(int64_t), b.second + sizeof(int64_t), asize, bsize);
+          if (cmp == 0) {
+            return a.first < b.first; // tie-break by bucketid asc
+          }
+          return reversed ? cmp > 0 : cmp < 0;
+        });
+      }
       if (limit >= 0 && limit < (int64_t)valVec.size()) {
         valVec.resize(limit);
       }
@@ -825,7 +845,7 @@ inline FacetReq* FacetReq::createFieldFacetReq(SearchRequest& req, std::string_v
       facet = google::protobuf::Arena::Create<IntFacetReq>(&arena, req, facetField, facetName, limit, minCount,  missing);
       break;
     case FieldType::Type::STRING:
-      facet = google::protobuf::Arena::Create<StrFacetReq>(&arena, req, facetField, facetName, limit, minCount, missing);
+      facet = google::protobuf::Arena::Create<StrFacetReq>(&arena, req, facetReq, facetField, facetName, limit, minCount, missing);
       break;
     case FieldType::Type::TEXT:
       facet = google::protobuf::Arena::Create<FullTextFacetReq>(&arena, req, facetField, facetName, limit, minCount, missing);
