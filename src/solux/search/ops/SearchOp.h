@@ -19,11 +19,16 @@ public:
   SearchOp(SearchRequest& req, std::string_view name) : req(req), name(name) {
   }
 
+  virtual void init() {}
+
   class Calculator;
   class InlineCalculator;
   virtual Calculator* createCalculator(Calculator* parent, int64_t slot = -1, int64_t numSlots = -1) = 0;
   virtual InlineCalculator* createInlineCalculator(Calculator* parent, int64_t slot = -1, int64_t numSlots = -1) {
     return nullptr;
+  }
+  virtual bool canInline() {
+    return false;
   }
 
   virtual ~SearchOp() = default;

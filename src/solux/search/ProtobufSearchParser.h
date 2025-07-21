@@ -72,7 +72,7 @@ public:
           minCount = facetReq.mincount();
         }
         auto missing = facetReq.missing();
-        FacetReq* facet = google::protobuf::Arena::Create<IntFacetRangeReq>(&req.arena, req, facetField, name, start, end, gap, minCount, missing);
+        FacetReq* facet = google::protobuf::Arena::Create<IntFacetRangeReq>(&req.arena, req, facetReq, facetField, name, start, end, gap, minCount, missing);
         addSubs(*facet, searchOp.range_facet().ops());
         return facet;
       }

@@ -67,8 +67,9 @@ TEST_F(SearchEngineTest, basic) {
       subAvg.set_name("avg");
       subAvg.mutable_args()->Add()->set_s("foo_i");
     }
-    facet4.mutable_sort()->set_field("avgsub");
-    facet4.mutable_sort()->set_dir(solux::proto::SortSpec_SortDir_ASC); // sort by avg ascending
+    facet4.mutable_sorts()->Add(); // add a sort spec
+    facet4.mutable_sorts(0)->set_field("avgsub");
+    facet4.mutable_sorts(0)->set_dir(solux::proto::SortSpec_SortDir_ASC); // sort by avg ascending
     auto& facet5 = *ops["f5"].mutable_field_facet();
     facet5.set_field("colors_ss");
     auto& facet6 = *ops["f6"].mutable_field_facet();

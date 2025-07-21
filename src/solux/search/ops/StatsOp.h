@@ -121,6 +121,10 @@ public:
     return new InlineCalc(*this, parent, slot, numSlots);
   }
 
+  bool canInline() override {
+    return true; // we can inline this operation
+  }
+
   class InlineCalc final : public InlineCalculator {
     struct entry {
       double val;

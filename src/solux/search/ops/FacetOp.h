@@ -27,17 +27,41 @@ public:
   int64_t minCount; // minimum count for a facet to be included in the result
   bool missing;
 
+  google::protobuf::RepeatedPtrField<proto::SortSpec> sorts;
   std::string_view facetName;
+  std::vector<std::pair<const std::string_view, SearchOp*>> inlineSubOps;
 
   static FacetReq* createFieldFacetReq(SearchRequest& req, std::string_view facetName, const proto::FieldFacet& facetReq,
                                         google::protobuf::Arena& arena);
 
-  FacetReq(SearchRequest& req, std::string_view fieldName, std::string_view facetName, int64_t limit, int64_t minCount, bool missing)
+  FacetReq(SearchRequest& req, std::string_view fieldName, std::string_view facetName, int64_t limit, int64_t minCount, bool missing, google::protobuf::RepeatedPtrField<proto::SortSpec> sorts)
     : SearchOp(req, facetName), reader(*req.reader), fieldName(fieldName), limit(limit), minCount(minCount), missing(missing),
-      facetName(facetName) {
+      facetName(facetName), sorts(sorts) {
   }
 
   virtual ~FacetReq() = default;
+
+  void init() override {
+    if (sorts.empty()) {
+      for (auto& sort : sorts) {
+        auto iter = subOps.find(sort.field());
+        if (iter != subOps.end()) {
+          if (iter->second->canInline()) {
+            inlineSubOps.push_back(*iter);
+            subOps.erase(iter);
+          } else {
+            throw std::runtime_error("Cannot sort by a subop without inline support: " + std::string(iter->second->name));
+          }
+        }
+      }
+    }
+    for (auto& subOp : subOps) {
+      if (subOp.second->canInline()) {
+        inlineSubOps.push_back(subOp);
+        subOps.erase(subOps.find(subOp.first));
+      }
+    }
+  }
 
   // utility template method that calls callback with (int32 docid, int64_t value) for each doc in the domain that has
   // a value in the int column field (single or multi-valued).
@@ -93,16 +117,17 @@ public:
   }
 };
 
-class IntFacetBaseReq : public FacetReq {
+class FieldFacetReq : public FacetReq {
 public:
-  IntFacetBaseReq(SearchRequest& req, std::string_view fieldName, std::string_view facetName, int64_t limit, int64_t minCount, bool missing) :
-  FacetReq(req, fieldName, facetName, limit, minCount, missing){}
+  const proto::FieldFacet& fieldFacet;
+  FieldFacetReq(SearchRequest& req, const proto::FieldFacet& fieldFacet, std::string_view fieldName, std::string_view facetName, int64_t limit, int64_t minCount, bool missing) :
+  FacetReq(req, fieldName, facetName, limit, minCount, missing, fieldFacet.sorts()), fieldFacet(fieldFacet){}
 
-  virtual ~IntFacetBaseReq() = default;
+  virtual ~FieldFacetReq() = default;
 
 };
 
-class IntFacetReq : public IntFacetBaseReq {
+class IntFacetReq : public FieldFacetReq {
 public:
   class MergeableIntFacet : public MergeableData {
   public:
@@ -126,8 +151,8 @@ public:
 private:
   AtomicMerger<MergeableIntFacet> countMerger;
 public:
-  IntFacetReq(SearchRequest& req, std::string_view fieldName, std::string_view facetName, int64_t limit, int64_t minCount, bool missing) :
-  IntFacetBaseReq(req, fieldName, facetName, limit, minCount, missing){}
+  IntFacetReq(SearchRequest& req, const proto::FieldFacet& fieldFacet, std::string_view fieldName, std::string_view facetName, int64_t limit, int64_t minCount, bool missing) :
+  FieldFacetReq(req, fieldFacet, fieldName, facetName, limit, minCount, missing){}
 
   class Calc : public Calculator {
     AtomicMerger<MergeableIntFacet> countMerger;
@@ -207,7 +232,7 @@ solux::proto::Val* getTargetForSub(solux::proto::SearchResponse* searchResponse,
 
 };
 
-class StrFacetReq : public IntFacetBaseReq {
+class StrFacetReq : public FieldFacetReq {
   class MergeableStrFacet : public MergeableData {
   public:
     boost::unordered_flat_map<std::string, int64_t> counts;
@@ -252,11 +277,10 @@ class StrFacetReq : public IntFacetBaseReq {
   };
 
 public:
-  const proto::FieldFacet& fieldFacet;
 
   StrFacetReq(SearchRequest& req, const proto::FieldFacet& fieldFacet, std::string_view fieldName,
     std::string_view facetName, int64_t limit, int64_t minCount, bool missing) :
-  IntFacetBaseReq(req, fieldName, facetName, limit, minCount, missing), fieldFacet(fieldFacet){}
+  FieldFacetReq(req, fieldFacet, fieldName, facetName, limit, minCount, missing){}
 
   class Calc : public Calculator {
     std::vector<DocSet*> input;
@@ -421,54 +445,7 @@ public:
         facetResultProto.set_missing(missing_count);
       }
 
-      if (thisOp().subOps.empty()) {
-        return; // no sub ops, nothing to do.
-      }
-      int64_t slotNum = 0;
-      for (auto [val, count] : countVec) {
-        std::vector<std::unique_ptr<SearchOp::Calculator>> calculators;
-        calculators.reserve(thisOp().subOps.size());
-        for (auto& [name, subOp] : thisOp().subOps) {
-          auto* subCalc = subOp->createCalculator(this, slotNum, countVec.size());
-          calculators.emplace_back(subCalc);
-        }
-        for (size_t segnum = 0; segnum < input.size(); segnum++) {
-          SegFieldInfo segFieldInfo;
-          FalseDocSet emptyDomain;
-          DocSet* newDomain = &emptyDomain;  // NOTE - points to stack object
-          auto& postingsReader = thisOp().reader.segments()[segnum].postingsReader();
-          int32_t maxDoc = postingsReader.maxDoc();
-          auto poolGuard = MemPool::threadLocalPoolGuard();
-          FieldReader fieldReader(poolGuard.pool(), postingsReader);
-          bool found = fieldReader.seek(thisOp().fieldName);
-          RAMBitDocSet output(maxDoc);
-          if (found) {
-            fieldReader.readFieldInfo(segFieldInfo);
-            TermsEnum tenum(poolGuard.pool(), postingsReader, segFieldInfo);
-            if (tenum.seek(val)) {
-              newDomain = &output; // we will write to output
-              DocsEnum denum(poolGuard.pool(), postingsReader, tenum);
-              while (true) {
-                auto doc = denum.nextDoc();
-                if (doc == DocsEnum::END) {
-                  break; // no more docs for this term
-                }
-                if (input[segnum] && !input[segnum]->get(doc)) {
-                  continue; // this doc is not in the domain
-                }
-                output.mutableBits().set(doc);
-              }
-            }
-          }
-          for (auto& subCalc : calculators) {
-            //subCalc->calc(tg, segnum, &output);
-            // no support for subcalcs launching tasks yet
-
-            subCalc->calc(nullptr, segnum, newDomain);
-          }
-        }
-        slotNum++;
-      }
+      doSubops(thisOp().subOps, countVec);
     }
     void facetResult2(oneapi::tbb::task_group* tg, std::unique_ptr<MergeableStrFacetInline> mergedData) {
       auto* myVal = getTarget(nullptr);
@@ -487,7 +464,7 @@ public:
           }
         }
         auto missing_count = mergedData->missing_num;
-      if (!thisOp().fieldFacet.has_sort()) {
+      if (thisOp().fieldFacet.sorts().empty()) {
         std::sort(valVec.begin(), valVec.end(), [](auto& a, auto& b) {
           if (*(int64_t*)a.second != *(int64_t*)b.second ) {
             return *(int64_t*)a.second > *(int64_t*)b.second;
@@ -497,10 +474,10 @@ public:
       } else if (false) {
       } else if (false) {
       } else {
-        std::string_view field = thisOp().fieldFacet.sort().field();
+        std::string_view field = thisOp().fieldFacet.sorts(0).field();
         auto calc = mergedData->inlineCalcs.front();
         assert(field == calc->getOp().name);
-        bool reversed = thisOp().fieldFacet.sort().dir() == proto::SortSpec_SortDir_DESC;
+        bool reversed = thisOp().fieldFacet.sorts(0).dir() == proto::SortSpec_SortDir_DESC;
         std::sort(valVec.begin(), valVec.end(), [&calc, reversed](auto& a, auto& b) {
           int asize, bsize;
           int  cmp = calc->compare(a.second + sizeof(int64_t), b.second + sizeof(int64_t), asize, bsize);
@@ -543,6 +520,10 @@ public:
       for (auto& icalc : mergedData->inlineCalcs) {
         opers.erase(icalc->getOp().name);
       }
+      doSubops(opers, valVec);
+    }
+
+    void doSubops(boost::unordered_flat_map<std::string_view, SearchOp*> &opers, auto& valVec) {
       if (opers.empty()) {
         return; // no post sub ops, nothing to do.
       }
@@ -597,7 +578,7 @@ public:
     return new Calc(*this, parent, slot, numSlots);
   }
 };
-class FullTextFacetReq : public FacetReq {
+class FullTextFacetReq : public FieldFacetReq {
   class MergeableStrFacet : public MergeableData {
   public:
     boost::unordered_flat_map<std::string, int64_t> counts;
@@ -619,8 +600,8 @@ class FullTextFacetReq : public FacetReq {
   };
 
 public:
-  FullTextFacetReq(SearchRequest& req, std::string_view fieldName, std::string_view facetName, int64_t limit, int64_t minCount, bool missing) :
-  FacetReq(req, fieldName, facetName, limit, minCount, missing){}
+  FullTextFacetReq(SearchRequest& req, const proto::FieldFacet& fieldFacet, std::string_view fieldName, std::string_view facetName, int64_t limit, int64_t minCount, bool missing) :
+  FieldFacetReq(req, fieldFacet, fieldName, facetName, limit, minCount, missing){}
 
   class Calc : public Calculator {
     AtomicMerger<MergeableStrFacet> countMerger;
@@ -735,8 +716,8 @@ class IntFacetRangeReq : public FacetReq {
   int64_t end;
   int64_t gap;
 public:
-  IntFacetRangeReq(SearchRequest& req, std::string_view fieldName, std::string_view facetName, int64_t start, int64_t end, int64_t gap, int64_t minCount, bool missing)
-  : FacetReq(req, fieldName, facetName, -1, minCount, missing), start(start), end(end), gap(gap) {}
+  IntFacetRangeReq(SearchRequest& req, proto::RangeFacet rangeFacet, std::string_view fieldName, std::string_view facetName, int64_t start, int64_t end, int64_t gap, int64_t minCount, bool missing)
+  : FacetReq(req, fieldName, facetName, -1, minCount, missing, rangeFacet.sorts()), start(start), end(end), gap(gap) {}
 
   virtual ~IntFacetRangeReq() = default;
 
@@ -842,13 +823,13 @@ inline FacetReq* FacetReq::createFieldFacetReq(SearchRequest& req, std::string_v
 
   switch (ftype->type()) {
     case FieldType::Type::INT:
-      facet = google::protobuf::Arena::Create<IntFacetReq>(&arena, req, facetField, facetName, limit, minCount,  missing);
+      facet = google::protobuf::Arena::Create<IntFacetReq>(&arena, req, facetReq, facetField, facetName, limit, minCount,  missing);
       break;
     case FieldType::Type::STRING:
       facet = google::protobuf::Arena::Create<StrFacetReq>(&arena, req, facetReq, facetField, facetName, limit, minCount, missing);
       break;
     case FieldType::Type::TEXT:
-      facet = google::protobuf::Arena::Create<FullTextFacetReq>(&arena, req, facetField, facetName, limit, minCount, missing);
+      facet = google::protobuf::Arena::Create<FullTextFacetReq>(&arena, req, facetReq, facetField, facetName, limit, minCount, missing);
       break;
     default: ;
   }
