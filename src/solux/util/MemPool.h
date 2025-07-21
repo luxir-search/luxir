@@ -142,7 +142,10 @@ public:
 
 // TODO - make a lot of this stuff private
   static constexpr uint32_t STATIC_BUFFER_SIZE = 256; // number of bytes allocated with this pool before using heap
-  static constexpr uint32_t BYTE_BLOCK_SHIFT = 15;
+
+  // BYTE_BLOCK_SHIFT of 15 gives 32K blocks.  To try and release memory back to the OS (mmap), use a block size of 128K or
+  // larger. 18 gives 256K blocks.
+  static constexpr uint32_t BYTE_BLOCK_SHIFT = 18;
   static constexpr uint32_t BYTE_BLOCK_SIZE = 1 << BYTE_BLOCK_SHIFT;
   static constexpr uint32_t BYTE_BLOCK_MASK = BYTE_BLOCK_SIZE - 1;
   static constexpr uint32_t HEADER_SIZE = sizeof(int32_t); // size of the header at the beginning of each buffer

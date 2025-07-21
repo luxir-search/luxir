@@ -14,6 +14,74 @@ namespace solux {
 // to do things that will mess up timings in the name of better test coverage.)
 extern bool unit_tests;
 
+inline size_t currentRSSKB() {
+  std::ifstream statm("/proc/self/statm");
+  size_t size, resident;
+  statm >> size >> resident;
+  size_t page_size_kb = sysconf(_SC_PAGESIZE) / 1024;
+  return resident * page_size_kb;
+}
+
+inline size_t peakRSSKB() {
+  struct rusage usage;
+  getrusage(RUSAGE_SELF, &usage);
+  return usage.ru_maxrss / 1024;
+}
+
+class RSSWatcher {
+public:
+  std::thread watcherThread;
+  std::atomic<bool> stopRequested = false;
+  size_t sleepns;
+  size_t startRSS = 0;
+  size_t maxRSS = 0;
+  size_t page_size_kb = 0;
+
+  // By default sleep for 1ms between checks.
+  size_t getRSSKB() {
+    std::ifstream statm("/proc/self/statm");
+    size_t size, resident;
+    statm >> size >> resident;
+    return resident * page_size_kb;
+  }
+
+  RSSWatcher(size_t sleepNs = 1000000) {
+    malloc_trim(0);
+    sleepns = sleepNs;
+    page_size_kb = sysconf(_SC_PAGESIZE) / 1024;
+    startRSS = getRSSKB();
+
+    watcherThread = std::thread([this]() {
+      poll();
+    });
+  }
+
+  void poll() {
+    while (!stopRequested) {
+      // sleep for 1ms, then check RSS
+      std::this_thread::sleep_for(std::chrono::nanoseconds(sleepns));
+      size_t rss = getRSSKB();
+      if (rss > maxRSS) {
+        maxRSS = rss;
+      }
+    }
+  }
+
+  // returns delta, max
+  std::pair<size_t, size_t> getDeltaKB() {
+    stopRequested = true;
+    if (watcherThread.joinable()) {
+      watcherThread.join();
+    }
+    // LOG_ERROR("deltaRSS MB={} maxRSS MB={}", (maxRSS - startRSS) / 1024, maxRSS / 1024);
+    return {maxRSS - startRSS, maxRSS};
+  }
+
+  ~RSSWatcher() {
+    getDeltaKB();
+  }
+};
+
 
 ///
 /// A manual benchmark timing class for google benchmark.  To use it, you must turn on manual

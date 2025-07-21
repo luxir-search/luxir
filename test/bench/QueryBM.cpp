@@ -10,7 +10,7 @@ using namespace solux::test;
 
 static std::vector<std::pair<int32_t, int32_t>> ivals;
 
-static void buildIndex(CollectionHelper& helper, int64_t nDocs, std::span<const int32_t> docsPerSeg) {
+void buildBenchIndex(CollectionHelper& helper, int64_t nDocs, std::span<const int32_t> docsPerSeg) {
   unused(nDocs);
   helper.clear();
   ivals.clear();  // Clear the static tracking vector
@@ -26,10 +26,14 @@ static void buildIndex(CollectionHelper& helper, int64_t nDocs, std::span<const 
     int segDocs = docsPerSeg[segnum];
     Inverter& inverter = iw->obtainInverter();
     Inverter::IndexHandler& s0 = inverter.getIndexHandler("id");
+
     Inverter::IndexHandler& s1 = inverter.getIndexHandler("short_u10_s");
     Inverter::IndexHandler& s2 = inverter.getIndexHandler("short_u10k_s");
-    Inverter::IndexHandler& s3 = inverter.getIndexHandler("med_u10_s");
-    Inverter::IndexHandler& s4 = inverter.getIndexHandler("med_u10k_s");
+    Inverter::IndexHandler& s3 = inverter.getIndexHandler("short_u1m_s");
+    Inverter::IndexHandler& s4 = inverter.getIndexHandler("med_u10_s");
+    Inverter::IndexHandler& s5 = inverter.getIndexHandler("med_u10k_s");
+    Inverter::IndexHandler& s6 = inverter.getIndexHandler("med_u1m_s");
+
     Inverter::IndexHandler& i1 = inverter.getIndexHandler("u10_i");
     Inverter::IndexHandler& i2 = inverter.getIndexHandler("u10k_i");
     Inverter::IndexHandler& i3 = inverter.getIndexHandler("u10m_i");
@@ -42,18 +46,24 @@ static void buildIndex(CollectionHelper& helper, int64_t nDocs, std::span<const 
 
       s1.index(inverter, std::to_string(r.rint(10)));
       s2.index(inverter, std::to_string(r.rint(10000)));
+      s3.index(inverter, std::to_string(r.rint(1000000)));
 
       s.resize(0);
       s.append(std::to_string(r.rint(10)));
       s.append("medium_length_string_no_SSO");
-      s3.index(inverter, s);
+      s4.index(inverter, s);
 
       s.resize(0);
       s.append(std::to_string(r.rint(100)));
       s.append("medium_length_string_no_SSO");
       s.append(std::to_string(r.rint(100)));
-      s4.index(inverter, s);
+      s5.index(inverter, s);
 
+      s.resize(0);
+      s.append(std::to_string(r.rint(1000)));
+      s.append("medium_length_string_no_SSO");
+      s.append(std::to_string(r.rint(1000)));
+      s6.index(inverter, s);
 
       i1.index(inverter, r.rint(10));
 
@@ -69,6 +79,11 @@ static void buildIndex(CollectionHelper& helper, int64_t nDocs, std::span<const 
     helper.commit();
     // LOG_ERROR("DONE Segment {} rng={}", segnum, (int64_t)r());
   }
+
+  if (!solux::unit_tests) {
+    malloc_trim(0);
+    std::println(std::cerr,"Post buildBenchIndex - Peak RSS: {} KB, current RSS: KB {}", peakRSSKB(), currentRSSKB());
+  }
 }
 
 static void BM_QueryBuildIndex(benchmark::State& state, int64_t nDocs, std::string_view shape) {
@@ -83,7 +98,7 @@ static void BM_QueryBuildIndex(benchmark::State& state, int64_t nDocs, std::stri
   CollectionHelper::calcSegSizes(nDocs, mergeFactor, shape, docsPerSeg);
 
   for (auto _ : state) {
-    buildIndex(helper, nDocs, docsPerSeg);
+    buildBenchIndex(helper, nDocs, docsPerSeg);
     benchmark::ClobberMemory();
   }
 
@@ -168,7 +183,7 @@ static void BM_Query(benchmark::State& state, int64_t nDocs, std::string_view sh
   bool reuseIndex = helper.indexMatchesShape(docsPerSeg);
   if (!reuseIndex) {
     // build the index if it doesn't exist or is not correct.
-    buildIndex(helper, nDocs, docsPerSeg);
+    buildBenchIndex(helper, nDocs, docsPerSeg);
   }
 
   if (sfield == "u10k_i") {
