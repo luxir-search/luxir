@@ -102,22 +102,20 @@ public:
         }
     }
     
-    int compare(int32_t docA, int32_t segA, int32_t docB, int32_t segB) override {
+    int compare(int32_t docA, int32_t docB) override {
         for (auto& comp : comparators) {
-            int cmp = comp->compare(docA, segA, docB, segB);
+            int cmp = comp->compare(docA, docB);
             if (cmp != 0) {
                 return cmp;
             }
         }
-        
-        segdoc a(segA, docA);
-        segdoc b(segB, docB);
-        return (a > b) - (a < b);
+        // Tiebreaker by doc ID
+        return (docA > docB) - (docA < docB);
     }
     
-    int compareBottom(int32_t doc, int32_t segment) override {
+    int compareBottom(int32_t doc) override {
         for (auto& comp : comparators) {
-            int cmp = comp->compareBottom(doc, segment);
+            int cmp = comp->compareBottom(doc);
             if (cmp != 0) {
                 return cmp;
             }
@@ -131,9 +129,9 @@ public:
         }
     }
     
-    void copy(int32_t slot, int32_t doc, int32_t segment) override {
+    void copy(int32_t slot, int32_t doc) override {
         for (auto& comp : comparators) {
-            comp->copy(slot, doc, segment);
+            comp->copy(slot, doc);
         }
     }
     

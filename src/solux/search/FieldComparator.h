@@ -15,15 +15,20 @@ class FieldComparator {
 public:
   virtual ~FieldComparator() = default;
 
+  // Set the current segment for this comparator
   virtual void setSegment(int32_t segment, PostingsReader* reader) = 0;
 
-  virtual int compare(int32_t docA, int32_t segA, int32_t docB, int32_t segB) = 0;
+  // Compare two documents in the current segment
+  virtual int compare(int32_t docA, int32_t docB) = 0;
 
-  virtual int compareBottom(int32_t doc, int32_t segment) = 0;
+  // Compare a document in the current segment to the bottom value
+  virtual int compareBottom(int32_t doc) = 0;
 
+  // Set the bottom slot for comparison
   virtual void setBottom(int32_t slot) = 0;
 
-  virtual void copy(int32_t slot, int32_t doc, int32_t segment) = 0;
+  // Copy the value from a document in the current segment to a slot
+  virtual void copy(int32_t slot, int32_t doc) = 0;
   
   virtual bool isReversed() const { return false; }
   
@@ -39,143 +44,11 @@ public:
   };
 };
 
-class NumericFieldComparator : public FieldComparator {
-private:
-  struct SegmentReader {
-    IntColReader* reader = nullptr;
-    bool hasValues = false;
-  };
 
-  std::string fieldName;
-  std::vector<SegmentReader> segmentReaders;
-  std::vector<int64_t> values;
-  int64_t bottomValue = 0;
-  int bottomSlot = -1;
-  bool reversed;
-  MissingValue missingValue;
-  int64_t missingValueSubstitute;
 
-  int64_t getValueSafe(int32_t doc, int32_t segment) {
-    if (segment < 0 || segment >= (int32_t)segmentReaders.size()) {
-      return missingValueSubstitute;
-    }
-    auto& segReader = segmentReaders[segment];
-    if (!segReader.hasValues || !segReader.reader) {
-      return missingValueSubstitute;
-    }
-
-    // Use the iterator to find if this doc has a value
-    IntColReader::Iterator iter(*segReader.reader);
-    int32_t foundDoc = iter.advance(doc);
-
-    if (foundDoc != doc) {
-      // Document doesn't have this field
-      return missingValueSubstitute;
-    }
-
-    // Get the value for this document
-    return iter.value();
-  }
-
-public:
-  NumericFieldComparator(const std::string& fieldName, int numHits, bool reversed, MissingValue missingValue)
-    : fieldName(fieldName),
-      values(numHits),
-      reversed(reversed),
-      missingValue(missingValue) {
-
-    missingValueSubstitute = (missingValue == MISSING_FIRST)
-                               ? std::numeric_limits<int64_t>::min()
-                               : std::numeric_limits<int64_t>::max();
-
-    if (reversed) {
-      missingValueSubstitute = -missingValueSubstitute;
-    }
-  }
-
-  void setSegment(int32_t segment, PostingsReader* reader) override {
-    if (segment >= (int32_t)segmentReaders.size()) {
-      segmentReaders.resize(segment + 1);
-    }
-
-    auto& segReader = segmentReaders[segment];
-    segReader.reader = nullptr;
-    segReader.hasValues = false;
-
-    if (!reader) return;
-
-    auto poolGuard = MemPool::threadLocalPoolGuard();
-    FieldReader fieldReader(poolGuard.pool(), *reader);
-    if (fieldReader.seek(fieldName)) {
-      SegFieldInfo fieldInfo;
-      fieldReader.readFieldInfo(fieldInfo);
-      if (fieldInfo.columnLoc.offset() > 0) {
-        segReader.reader = new IntColReader(*reader, fieldInfo);
-        segReader.hasValues = true;
-      }
-    }
-  }
-
-  int compare(int32_t docA, int32_t segA, int32_t docB, int32_t segB) override {
-    int64_t valA = getValueSafe(docA, segA);
-    int64_t valB = getValueSafe(docB, segB);
-
-    if (reversed) {
-      valA = -valA;
-      valB = -valB;
-    }
-
-    return (valA > valB) - (valA < valB);
-  }
-
-  int compareBottom(int32_t doc, int32_t segment) override {
-    int64_t val = getValueSafe(doc, segment);
-    if (reversed) {
-      val = -val;
-    }
-    return (val > bottomValue) - (val < bottomValue);
-  }
-
-  void setBottom(int32_t slot) override {
-    bottomSlot = slot;
-    bottomValue = values[slot];
-  }
-
-  void copy(int32_t slot, int32_t doc, int32_t segment) override {
-    int64_t val = getValueSafe(doc, segment);
-    if (reversed) {
-      val = -val;
-    }
-    values[slot] = val;
-  }
-  
-  bool isReversed() const override {
-    return reversed;
-  }
-  
-  int64_t getValue(int32_t slot) const override {
-    if (slot >= 0 && slot < (int32_t)values.size()) {
-      return values[slot];
-    }
-    return 0;
-  }
-  
-  int64_t getDocValue(int32_t docid) override {
-    // This implementation still requires segment to be passed
-    // For compatibility only - use SimpleNumericFieldComparator instead
-    return 0;
-  }
-
-  ~NumericFieldComparator() {
-    for (auto& segReader : segmentReaders) {
-      delete segReader.reader;
-    }
-  }
-};
-
-// Simplified comparator that only works with the current segment
+// A comparator that can be used in a simplified collector that has values
+// that can be compared across different segments.
 class SimpleNumericFieldComparator : public FieldComparator {
-private:
   std::string fieldName;
   IntColReader* reader = nullptr;
   std::unique_ptr<IntColReader::Iterator> iter;
@@ -196,7 +69,14 @@ public:
                                : std::numeric_limits<int64_t>::max();
     
     if (reversed) {
-      missingValueSubstitute = -missingValueSubstitute;
+      // For descending sort, we need to negate values for comparison.
+      // However, negating INT64_MIN results in INT64_MIN due to two's complement overflow.
+      // To handle this, we use INT64_MAX for MISSING_FIRST and INT64_MIN+1 for MISSING_LAST.
+      if (missingValue == MISSING_FIRST) {
+        missingValueSubstitute = std::numeric_limits<int64_t>::max();
+      } else {
+        missingValueSubstitute = std::numeric_limits<int64_t>::min() + 1;
+      }
     }
   }
   
@@ -236,22 +116,26 @@ public:
       return missingValueSubstitute;
     }
     int64_t value = iter->value();
-    int64_t result = reversed ? -value : value;
-    // std::cout << "  getDocValue(" << docid << ") - found value=" << value << " returning " << result << "\n";
-    return result;
+    // For descending sort, negate the value. Special case for INT64_MIN.
+    if (reversed) {
+      if (value == std::numeric_limits<int64_t>::min()) {
+        // Can't negate INT64_MIN, so use INT64_MAX instead
+        value = std::numeric_limits<int64_t>::max();
+      } else {
+        value = -value;
+      }
+    }
+    // std::cout << "  getDocValue(" << docid << ") - found value=" << value << " returning " << value << "\n";
+    return value;
   }
   
-  // These methods now only work with current segment docs
-  int compare(int32_t docA, int32_t segA, int32_t docB, int32_t segB) override {
-    // This should only be called for same segment
-    assert(segA == currentSegment && segB == currentSegment);
+  int compare(int32_t docA, int32_t docB) override {
     int64_t valA = getDocValue(docA);
     int64_t valB = getDocValue(docB);
     return (valA > valB) - (valA < valB);
   }
   
-  int compareBottom(int32_t doc, int32_t segment) override {
-    assert(segment == currentSegment);
+  int compareBottom(int32_t doc) override {
     int64_t val = getDocValue(doc);
     return (val > bottomValue) - (val < bottomValue);
   }
@@ -262,8 +146,7 @@ public:
     }
   }
   
-  void copy(int32_t slot, int32_t doc, int32_t segment) override {
-    assert(segment == currentSegment);
+  void copy(int32_t slot, int32_t doc) override {
     if (slot >= 0 && slot < (int32_t)values.size()) {
       values[slot] = getDocValue(doc);
     }

@@ -130,4 +130,11 @@ public:
   }
 };
 
+namespace test {
+  class CollectionHelper;
 }
+
+
+void buildBenchIndex(solux::test::CollectionHelper& helper, int64_t nDocs, std::span<const int32_t> docsPerSeg);
+
+} // namespace solux

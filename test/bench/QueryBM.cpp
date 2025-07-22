@@ -10,6 +10,7 @@ using namespace solux::test;
 
 static std::vector<std::pair<int32_t, int32_t>> ivals;
 
+namespace solux {
 void buildBenchIndex(CollectionHelper& helper, int64_t nDocs, std::span<const int32_t> docsPerSeg) {
   unused(nDocs);
   helper.clear();
@@ -21,7 +22,7 @@ void buildBenchIndex(CollectionHelper& helper, int64_t nDocs, std::span<const in
   int64_t idNum = 0;
   for (size_t segnum=0; segnum<docsPerSeg.size(); segnum++) {
     SplitMix64 r(segnum); // make each segment predictable so segment build order doesn't affect the results.
-   // LOG_ERROR("Segment {} with {} docs, rng={}", segnum, docsPerSeg[segnum], (int64_t)r());
+    // LOG_ERROR("Segment {} with {} docs, rng={}", segnum, docsPerSeg[segnum], (int64_t)r());
 
     int segDocs = docsPerSeg[segnum];
     Inverter& inverter = iw->obtainInverter();
@@ -84,6 +85,7 @@ void buildBenchIndex(CollectionHelper& helper, int64_t nDocs, std::span<const in
     malloc_trim(0);
     std::println(std::cerr,"Post buildBenchIndex - Peak RSS: {} KB, current RSS: KB {}", peakRSSKB(), currentRSSKB());
   }
+}
 }
 
 static void BM_QueryBuildIndex(benchmark::State& state, int64_t nDocs, std::string_view shape) {
@@ -171,8 +173,6 @@ static void BM_Query(benchmark::State& state, int64_t nDocs, std::string_view sh
     nDocs = 200;
   }
 
-
-
   //
   // Figure out how many docs in each segment we want.
   //
@@ -196,6 +196,7 @@ static void BM_Query(benchmark::State& state, int64_t nDocs, std::string_view sh
     );
   }
 
+  RSSWatcher watcher;
 
   int64_t fp = -1;
   for (auto _ : state) {
@@ -264,6 +265,9 @@ static void BM_Query(benchmark::State& state, int64_t nDocs, std::string_view sh
   state.counters["reused"] = reuseIndex;; // did we reuse the index?
   state.counters["rate"] = benchmark::Counter(state.iterations(),benchmark::Counter::kIsRate);
   // LOG_ERROR("fingerprint={}", fp); // verified is exactly the same on lucene
+  auto mem = watcher.getDeltaKB();
+  state.counters["RSS_delta"] = mem.first / 1024;
+  state.counters["RSS_max"] = mem.second / 1024;
 }
 
 

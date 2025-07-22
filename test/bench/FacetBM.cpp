@@ -8,7 +8,7 @@
 using namespace solux;
 using namespace solux::test;
 
-void buildBenchIndex(CollectionHelper& helper, int64_t nDocs, std::span<const int32_t> docsPerSeg);
+// buildBenchIndex is declared in solux_bench.h
 
 
 //
