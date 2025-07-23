@@ -16,7 +16,7 @@ class seg_location {
   static constexpr uint64_t OFFSET_MASK = (~uint64_t(0)) >> FILENUM_BITS;
 
 public:
-  seg_location() noexcept {}
+  seg_location() noexcept : x(0) {}
 
   seg_location(uint32_t fnum, uint64_t offset) noexcept {
     x = offset + ((uint64_t)fnum << OFFSET_BITS);
