@@ -42,6 +42,7 @@ public:
   virtual ~FacetReq() = default;
 
   void init() override {
+    SearchOp::init();
     if (sorts.empty()) {
       for (auto& sort : sorts) {
         auto iter = subOps.find(sort.field());
@@ -55,10 +56,13 @@ public:
         }
       }
     }
-    for (auto& subOp : subOps) {
-      if (subOp.second->canInline()) {
-        inlineSubOps.push_back(subOp);
-        subOps.erase(subOps.find(subOp.first));
+    //if there's no limit, more efficient to do inline
+    if (limit == -1) {
+      for (auto& subOp : subOps) {
+        if (subOp.second->canInline()) {
+          inlineSubOps.push_back(subOp);
+          subOps.erase(subOps.find(subOp.first));
+        }
       }
     }
   }
@@ -296,16 +300,10 @@ public:
       inlineMerger.creator = [this]() {
         auto* p = new MergeableStrFacetInline;
 
-        if (thisOp().limit == -1) {
+        for (auto& [key, subop] : thisOp().inlineSubOps) {
+          auto* calc = subop->createInlineCalculator(this, -1, -1);
+          p->inlineCalcs.push_back(calc);
 
-          for (auto& [key, subop] : thisOp().subOps) {
-            auto* calc = subop->createInlineCalculator(this, -1, -1);
-            if (calc != nullptr) {
-              p->inlineCalcs.push_back(calc);
-            } else {
-
-            }
-          }
         }
 
         p->counts.calcs = p->inlineCalcs;
@@ -327,7 +325,7 @@ public:
       //TODO: need to account for slot somehow,  or will subop do that?
     };
     void calc(oneapi::tbb::task_group* tg, int32_t segnum, DocSet* domain) override {
-      if (true) {
+      if (!thisOp().inlineSubOps.empty()) {
         calc2(tg, segnum, domain);
         return;
       }

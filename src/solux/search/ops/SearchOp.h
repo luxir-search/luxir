@@ -19,7 +19,11 @@ public:
   SearchOp(SearchRequest& req, std::string_view name) : req(req), name(name) {
   }
 
-  virtual void init() {}
+  virtual void init() {
+    for (auto& [name, subOp] : subOps) {
+      subOp->init();
+    }
+  }
 
   class Calculator;
   class InlineCalculator;

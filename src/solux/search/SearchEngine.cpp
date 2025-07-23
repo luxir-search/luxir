@@ -10,6 +10,7 @@ void SearchEngine::submitBody(SearchRequest& req) {
 
   ProtobufSearchParser parser(req);
   auto* root = parser.parse();
+  root->init();
   std::unique_ptr<SearchOp::Calculator> calc(root->createCalculator(nullptr, -1));
   calc->calc(req.tg, -1, nullptr);
 
