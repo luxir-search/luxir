@@ -13,7 +13,6 @@
 #include "solux/util/solux_util.h"
 #include "solux/util/TaggedPtr.h"
 #include "solux/query/ProtobufQueryParser.h"
-#include "solux/search/Collector.h"
 #include "solux/util/thread.h"
 #include "solux/util/proto.h"
 #include "ProtoUpdateMessage.h"
@@ -849,16 +848,22 @@ void solux::GRPCServer::shutdown() {
   // server should be shut down before completion queues
   server->Shutdown();
 
+  GRPC_DEBUG("server->Shutdown() returned.");
+
   // calling Shutdown on the completion queue will cause cq->Next() to return false
   // rather than block.
   for (auto& threadInfo : threadInfos) {
+    GRPC_DEBUG("Calling completion queue Shutdown for cq={}", (void*)threadInfo.cq.get());
     threadInfo.cq->Shutdown();
   }
+
+  GRPC_DEBUG("joining threads");
 
   for (auto& thread : threads) {
     thread.join();
   }
 
+  GRPC_DEBUG("shutdown complete");
 }
 
 } //  namespace solux

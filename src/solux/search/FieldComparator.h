@@ -8,6 +8,8 @@
 #include <memory>
 #include <vector>
 #include <limits>
+#include <cassert>
+#include <optional>
 
 namespace solux {
 
@@ -18,25 +20,27 @@ public:
   // Set the current segment for this comparator
   virtual void setSegment(int32_t segment, PostingsReader* reader) = 0;
 
-  // Compare two documents in the current segment
-  virtual int compare(int32_t docA, int32_t docB) = 0;
+  // compare new document to bottom slot
+  virtual int compareBottom(int32_t bottomSlot, segdoc bottomDoc, segdoc newDoc) = 0;
 
-  // Compare a document in the current segment to the bottom value
-  virtual int compareBottom(int32_t doc) = 0;
+  // compare two slots
+  virtual int compare(int32_t slotA, segdoc docA, int32_t slotB, segdoc docB) = 0;
 
-  // Set the bottom slot for comparison
-  virtual void setBottom(int32_t slot) = 0;
+  // compare a slot in this comparator with a slot in another comparator
+  virtual int compare(int32_t slotA, segdoc docA, FieldComparator& other, int32_t slotB, segdoc docB) = 0;
 
-  // Copy the value from a document in the current segment to a slot
-  virtual void copy(int32_t slot, int32_t doc) = 0;
-  
-  virtual bool isReversed() const { return false; }
-  
-  virtual int64_t getValue(int32_t slot) const { return 0; }
-  
-  // Get the sort value for a document in the current segment
-  // The value should already be adjusted for sort order (negated if DESC)
-  virtual int64_t getDocValue(int32_t docid) { return 0; }
+  // Copy the value from a document to a slot.
+  virtual void copy(int32_t slot, segdoc doc) = 0;
+
+  // Copy the value from a different comparator to this comparator
+  virtual void copy(int32_t slot, FieldComparator& other, int32_t otherSlot, segdoc otherDoc) = 0;
+
+  // Get a comparable value that can be used across segments
+  // This should return a value that maintains the same ordering as compareSlots
+  // For numeric fields, this would be the actual value (possibly negated for DESC)
+  // For other fields, this could be a hash or ordinal that preserves ordering
+  // Only used in FieldSortCollector2.
+  virtual int64_t getComparableValue(int32_t slot) const { return 0; }
 
   enum MissingValue {
     MISSING_FIRST,
@@ -50,14 +54,14 @@ public:
 // that can be compared across different segments.
 class SimpleNumericFieldComparator : public FieldComparator {
   std::string fieldName;
-  IntColReader* reader = nullptr;
-  std::unique_ptr<IntColReader::Iterator> iter;
+  std::optional<IntColReader> reader;
+  std::optional<IntColReader::Iterator> iter;
   std::vector<int64_t> values; // Storage for bottom values
-  int64_t bottomValue = 0;
   bool reversed;
   int64_t missingValueSubstitute;
-  int32_t currentSegment = -1;
-  
+  int64_t lastValue = 0;  // TODO: cache the last value lookup in compareBottom so we don't have to re-fetch if competitive
+  segdoc lastDoc = {-1, -1};
+
 public:
   SimpleNumericFieldComparator(const std::string& fieldName, int numHits, bool reversed, MissingValue missingValue)
     : fieldName(fieldName),
@@ -67,25 +71,18 @@ public:
     missingValueSubstitute = (missingValue == MISSING_FIRST)
                                ? std::numeric_limits<int64_t>::min()
                                : std::numeric_limits<int64_t>::max();
-    
+
     if (reversed) {
-      // For descending sort, we need to negate values for comparison.
-      // However, negating INT64_MIN results in INT64_MIN due to two's complement overflow.
-      // To handle this, we use INT64_MAX for MISSING_FIRST and INT64_MIN+1 for MISSING_LAST.
-      if (missingValue == MISSING_FIRST) {
-        missingValueSubstitute = std::numeric_limits<int64_t>::max();
-      } else {
-        missingValueSubstitute = std::numeric_limits<int64_t>::min() + 1;
-      }
+      missingValueSubstitute = -(missingValueSubstitute + 1);
+      // +1 handles inability to negate INT64_MIN:
+      //   MAX + 1 overflows to MIN, which stays min when negated
+      //   MIN + 1 when negated becomes MAX
     }
   }
   
   void setSegment(int32_t segment, PostingsReader* postingsReader) override {
-    currentSegment = segment;
-    
-    // Clean up old reader and iterator
-    delete reader;
-    reader = nullptr;
+    // Reset reader and iterator
+    reader.reset();
     iter.reset();
     
     if (!postingsReader) return;
@@ -96,15 +93,14 @@ public:
       SegFieldInfo fieldInfo;
       fieldReader.readFieldInfo(fieldInfo);
       if (fieldInfo.columnLoc.offset() > 0) {
-        reader = new IntColReader(*postingsReader, fieldInfo);
-        iter = std::make_unique<IntColReader::Iterator>(*reader);
+        reader.emplace(*postingsReader, fieldInfo);
+        iter.emplace(*reader);
       }
     }
   }
   
-  int64_t getDocValue(int32_t docid) override {
-    if (!iter) {
-      // std::cout << "  getDocValue(" << docid << ") - no reader, returning " << missingValueSubstitute << "\n";
+  virtual int64_t getDocValue(int32_t docid) {
+    if (!iter.has_value()) {
       return missingValueSubstitute;
     }
 
@@ -112,60 +108,75 @@ public:
       iter->advance(docid);
     }
     if (iter->docId() > docid) {
-      // std::cout << "  getDocValue(" << docid << ") - doc not found, returning " << missingValueSubstitute << "\n";
       return missingValueSubstitute;
     }
-    int64_t value = iter->value();
-    // For descending sort, negate the value. Special case for INT64_MIN.
+    int64_t origValue = iter->value();
+    int64_t value = origValue;
+    // For descending sort, negate the value.
+    // if we wanted to make this branchless, we could have a an adder and multiplier
+    // but this will be a predictable branch anyway.
     if (reversed) {
-      if (value == std::numeric_limits<int64_t>::min()) {
-        // Can't negate INT64_MIN, so use INT64_MAX instead
-        value = std::numeric_limits<int64_t>::max();
-      } else {
-        value = -value;
-      }
+      value = -(value + 1);
     }
-    // std::cout << "  getDocValue(" << docid << ") - found value=" << value << " returning " << value << "\n";
     return value;
   }
   
-  int compare(int32_t docA, int32_t docB) override {
-    int64_t valA = getDocValue(docA);
-    int64_t valB = getDocValue(docB);
+  int compare(int32_t slotA, segdoc docA, int32_t slotB, segdoc docB) override {
+    // SimpleNumericFieldComparator can ignore segments when comparing values
+    // since numeric values are comparable across segments
+    assert(slotA >= 0 && slotA < (int32_t)values.size());
+    assert(slotB >= 0 && slotB < (int32_t)values.size());
+    int64_t valA = values[slotA];
+    int64_t valB = values[slotB];
     return (valA > valB) - (valA < valB);
   }
   
-  int compareBottom(int32_t doc) override {
-    int64_t val = getDocValue(doc);
-    return (val > bottomValue) - (val < bottomValue);
+  int compareBottom(int32_t bottomSlot, segdoc bottomDoc, segdoc newDoc) override {
+    // Get the bottom value from the slot
+    assert(bottomSlot >= 0 && bottomSlot < (int32_t)values.size());
+    int64_t bottomVal = values[bottomSlot];
+    
+    // Get the new document's value
+    int64_t newVal = getDocValue(newDoc.docId());
+
+    return (bottomVal > newVal) - (bottomVal < newVal);
   }
   
-  void setBottom(int32_t slot) override {
-    if (slot >= 0 && slot < (int32_t)values.size()) {
-      bottomValue = values[slot];
-    }
+  void copy(int32_t slot, segdoc doc) override {
+    assert(slot >= 0 && slot < (int32_t)values.size());
+    int64_t value = getDocValue(doc.docId());
+    values[slot] = value;
   }
   
-  void copy(int32_t slot, int32_t doc) override {
-    if (slot >= 0 && slot < (int32_t)values.size()) {
-      values[slot] = getDocValue(doc);
-    }
+  int64_t getComparableValue(int32_t slot) const override {
+    // For numeric comparator, return the stored value
+    assert(slot >= 0 && slot < (int32_t)values.size());
+    return values[slot];
   }
   
-  bool isReversed() const override {
-    return reversed;
+  int compare(int32_t slotA, segdoc docA, FieldComparator& other, int32_t slotB, segdoc docB) override {
+    // For numeric comparators, we can compare the stored values directly
+    assert(dynamic_cast<SimpleNumericFieldComparator*>(&other) != nullptr);
+    auto* otherNumeric = static_cast<SimpleNumericFieldComparator*>(&other);
+    
+    assert(slotA >= 0 && slotA < (int32_t)values.size());
+    assert(slotB >= 0 && slotB < (int32_t)otherNumeric->values.size());
+    int64_t valA = values[slotA];
+    int64_t valB = otherNumeric->values[slotB];
+    return (valA > valB) - (valA < valB);
   }
   
-  int64_t getValue(int32_t slot) const override {
-    if (slot >= 0 && slot < (int32_t)values.size()) {
-      return values[slot];
-    }
-    return 0;
+  void copy(int32_t slot, FieldComparator& other, int32_t otherSlot, segdoc otherDoc) override {
+    // Copy value from another comparator
+    assert(dynamic_cast<SimpleNumericFieldComparator*>(&other) != nullptr);
+    auto* otherNumeric = static_cast<SimpleNumericFieldComparator*>(&other);
+    
+    assert(slot >= 0 && slot < (int32_t)values.size());
+    assert(otherSlot >= 0 && otherSlot < (int32_t)otherNumeric->values.size());
+    values[slot] = otherNumeric->values[otherSlot];
   }
   
-  ~SimpleNumericFieldComparator() override {
-    delete reader;
-  }
+  ~SimpleNumericFieldComparator() override = default;
 };
 
 } // namespace solux

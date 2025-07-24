@@ -31,11 +31,6 @@ private:
     FieldComparator::MissingValue missingValue;
     
 public:
-    // Constructor taking std::string
-    SortField(const std::string& field, Type type, SortOrder order = DESC, 
-              FieldComparator::MissingValue missing = FieldComparator::MISSING_LAST)
-        : fieldName(field), type(type), order(order), missingValue(missing) {}
-        
     // Constructor taking string_view
     SortField(std::string_view field, Type type, SortOrder order = DESC, 
               FieldComparator::MissingValue missing = FieldComparator::MISSING_LAST)
@@ -102,20 +97,20 @@ public:
         }
     }
     
-    int compare(int32_t docA, int32_t docB) override {
+    int compare(int32_t slotA, segdoc docA, int32_t slotB, segdoc docB) override {
         for (auto& comp : comparators) {
-            int cmp = comp->compare(docA, docB);
+            int cmp = comp->compare(slotA, docA, slotB, docB);
             if (cmp != 0) {
                 return cmp;
             }
         }
-        // Tiebreaker by doc ID
+        // Tiebreaker by segdoc
         return (docA > docB) - (docA < docB);
     }
     
-    int compareBottom(int32_t doc) override {
+    int compareBottom(int32_t bottomSlot, segdoc bottomDoc, segdoc newDoc) override {
         for (auto& comp : comparators) {
-            int cmp = comp->compareBottom(doc);
+            int cmp = comp->compareBottom(bottomSlot, bottomDoc, newDoc);
             if (cmp != 0) {
                 return cmp;
             }
@@ -123,40 +118,49 @@ public:
         return 0;
     }
     
-    void setBottom(int32_t slot) override {
-        for (auto& comp : comparators) {
-            comp->setBottom(slot);
-        }
-    }
     
-    void copy(int32_t slot, int32_t doc) override {
+    void copy(int32_t slot, segdoc doc) override {
         for (auto& comp : comparators) {
             comp->copy(slot, doc);
         }
     }
     
-    bool isReversed() const override {
-        // Return the reversed state of the first comparator
-        if (!comparators.empty()) {
-            return comparators[0]->isReversed();
-        }
-        return false;
-    }
     
-    int64_t getValue(int32_t slot) const override {
-        // Return the value from the first comparator
+    
+    int64_t getComparableValue(int32_t slot) const override {
+        // For multi-field sort, we can't represent the comparison as a single value
+        // Return the value from the first comparator as an approximation
         if (!comparators.empty()) {
-            return comparators[0]->getValue(slot);
+            return comparators[0]->getComparableValue(slot);
         }
         return 0;
     }
     
-    int64_t getDocValue(int32_t docid) override {
-        // For multi-field sort, return the value from the first comparator
-        if (!comparators.empty()) {
-            return comparators[0]->getDocValue(docid);
+    
+    int compare(int32_t slotA, segdoc docA, FieldComparator& other, int32_t slotB, segdoc docB) override {
+        assert(dynamic_cast<MultiFieldComparator*>(&other) != nullptr);
+        auto* otherMulti = static_cast<MultiFieldComparator*>(&other);
+        
+        assert(comparators.size() == otherMulti->comparators.size());
+        
+        for (size_t i = 0; i < comparators.size(); i++) {
+            int cmp = comparators[i]->compare(slotA, docA, *otherMulti->comparators[i], slotB, docB);
+            if (cmp != 0) {
+                return cmp;
+            }
         }
         return 0;
+    }
+    
+    void copy(int32_t slot, FieldComparator& other, int32_t otherSlot, segdoc otherDoc) override {
+        assert(dynamic_cast<MultiFieldComparator*>(&other) != nullptr);
+        auto* otherMulti = static_cast<MultiFieldComparator*>(&other);
+        
+        assert(comparators.size() == otherMulti->comparators.size());
+        
+        for (size_t i = 0; i < comparators.size(); i++) {
+            comparators[i]->copy(slot, *otherMulti->comparators[i], otherSlot, otherDoc);
+        }
     }
 };
 

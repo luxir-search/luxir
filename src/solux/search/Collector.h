@@ -6,7 +6,8 @@ namespace solux {
 
 SOLUX_PACKED_START
 class segdoc {
-  int32_t docid;  // docid must be first. It forms the lowest bits of a little-endian int64_t.
+  // docid must come first in little-endian for it to make up the low bytes of the int64_t
+  int32_t docid;
   int32_t seg;
 public:
   segdoc() {}
@@ -23,6 +24,16 @@ public:
   auto operator<=>(const segdoc &other) const {
     return std::bit_cast<int64_t>(*this) <=> std::bit_cast<int64_t>(other);
   }
+
+  bool operator==(const segdoc &other) const {
+    return std::bit_cast<int64_t>(*this) == std::bit_cast<int64_t>(other);
+  }
+
+  // return negative if this < other, positive if this > other, 0 if equal
+  int64_t compare(const segdoc &other) const {
+    return std::bit_cast<int64_t>(*this) - std::bit_cast<int64_t>(other);
+  }
+
 } SOLUX_PACKED_END;
 
 

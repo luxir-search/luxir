@@ -5,6 +5,7 @@
 #include "solux/util/heap.h"
 #include <vector>
 #include <memory>
+#include <algorithm>
 
 namespace solux {
 
@@ -13,36 +14,40 @@ public:
   struct SortDoc {
     segdoc doc;
     float score;
-    int64_t sortValue;  // The actual field value used for sorting
+    int32_t slot;  // Slot index in the comparator
     
-    SortDoc() : doc(), score(0.0f), sortValue(0) {}
-    SortDoc(segdoc d, float s, int64_t v) : doc(d), score(s), sortValue(v) {}
+    SortDoc() : doc(), score(0.0f), slot(-1) {}
+    SortDoc(segdoc d, float s, int32_t sl) : doc(d), score(s), slot(sl) {}
   };
 
-private:
   int64_t hitCount = 0;
   int64_t topCount;
   std::vector<SortDoc> topDocs;
   std::unique_ptr<FieldComparator> comparator;
   int32_t currentSegment = -1;
+  bool needsSort = true;  // True if heap needs sorting, false if already sorted
 
-  struct FieldSortComparator {
-    FieldSortComparator() {}
+  // Comparator functor that uses the FieldComparator - public for testing
+  struct FieldSortComparatorFunctor {
+    FieldComparator* comparator;
+    
+    FieldSortComparatorFunctor(FieldComparator* comp) : comparator(comp) {}
 
     bool operator()(const SortDoc& docA, const SortDoc& docB) const {
-      // For top-K collection, we need a max-heap regardless of sort order
-      // This way, the "worst" of the K best is at the top and can be replaced
-      // The values are already adjusted for sort order (negated if descending)
-      if (docA.sortValue != docB.sortValue) {
-        return docA.sortValue > docB.sortValue; // MAX heap
+      int cmp = comparator->compare(docA.slot, docA.doc, docB.slot, docB.doc);
+      if (cmp != 0) {
+        // For a compare for an ascending sort, we want the least competitive (highest sortValue) at the top of the heap
+        // This is the normal case for a max-heap, so the sort order is just the natural order.
+        // A < B means A is more competitive.
+        return cmp < 0;
       }
-
-      // For tie-breaking: higher segments/docs should be at top (easier to replace)
-      return docA.doc > docB.doc;
+      
+      // Tie-breaker: use segdoc ascending sort
+      return docA.doc < docB.doc;
     }
   };
 
-  std::unique_ptr<DirectPQ<SortDoc, FieldSortComparator>> pq;
+  std::unique_ptr<DirectPQ<SortDoc, FieldSortComparatorFunctor>> pq;
 
 public:
   FieldSortCollector(int64_t topCount, std::unique_ptr<FieldComparator> comp)
@@ -57,8 +62,8 @@ public:
       topDocs[i] = SortDoc();
     }
 
-    FieldSortComparator compFunc;
-    pq = std::make_unique<DirectPQ<SortDoc, FieldSortComparator>>(topDocs, compFunc);
+    FieldSortComparatorFunctor compFunc(comparator.get());
+    pq = std::make_unique<DirectPQ<SortDoc, FieldSortComparatorFunctor>>(topDocs, compFunc);
   }
 
   ~FieldSortCollector() = default;
@@ -66,32 +71,48 @@ public:
   void setSegment(int32_t segment, PostingsReader* reader) {
     currentSegment = segment;
     comparator->setSegment(segment, reader);
-    // Debug: print segment processing order
-    // std::cout << "FieldSortCollector: Processing segment " << segment << "\n";
   }
 
   void collect(int32_t segment, int32_t docid, float score) {
     hitCount++;
 
-    if (currentSegment != segment) {
-      currentSegment = segment;
-    }
+    segdoc sdoc(segment, docid);
 
-    // Get the sort value directly
-    int64_t sortValue = comparator->getDocValue(docid);
-    SortDoc newDoc(segdoc(segment, docid), score, sortValue);
-    
-    // Debug output
-    // std::cout << "Collecting doc " << docid << " seg " << segment << " sortValue=" << sortValue << "\n";
 
     if (pq->size() < topCount) {
+      // We have space, add to the next slot
       int32_t slot = pq->size();
+      comparator->copy(slot, sdoc);
+      SortDoc newDoc(sdoc, score, slot);
       topDocs[slot] = newDoc;
       pq->insert(newDoc);
+
+      /*
+      // If we just filled the last slot, set bottom to the worst in heap
+      if (pq->size() == topCount) {
+        comparator->setBottom(pq->top().slot);
+      }
+      */
     }
     else {
-      // Use the heap's insertWithOverflow which handles the comparison correctly
-      pq->insertWithOverflow(newDoc);
+      SortDoc& bottom = pq->top();
+
+      int64_t cmp = comparator->compareBottom(bottom.slot, bottom.doc, sdoc);
+      if (cmp == 0) {
+        cmp = bottom.doc.compare(sdoc);
+      }
+      
+      if (cmp > 0) {
+        comparator->copy(bottom.slot, sdoc);
+        bottom = SortDoc(segdoc(segment, docid), score, bottom.slot);
+        
+        pq->updateTop();
+
+        /*
+        // Update bottom to the new worst doc after updateTop
+        comparator->setBottom(pq->top().slot);
+        */
+      }
     }
   }
 
@@ -99,93 +120,62 @@ public:
     // Save the total hit count
     hitCount = hitCount + other.hitCount;
     
-    // If the other collector is empty, nothing to merge
-    if (other.size() == 0) {
-      return;
-    }
-    
-    // Since we can't use the field comparator across segments,
-    // we need to collect all documents and re-sort them.
-    // For now, we'll sort by score and then by segdoc for determinism.
-    
-    // Get all documents from both collectors without modifying them
-    std::vector<SortDoc> allDocs;
-    allDocs.reserve(this->size() + other.size());
-    
-    // Add our documents
-    for (int64_t i = 0; i < this->size(); i++) {
-      allDocs.push_back(topDocs[i]);
-    }
-    
-    // Add other's documents
-    for (int64_t i = 0; i < other.size(); i++) {
-      allDocs.push_back(other.topDocs[i]);
-    }
-    
-    // Sort all documents by their field values and then by segdoc for determinism
-    // The sortValue already has the reversed flag applied (negated if descending)
-    // so we always sort in ascending order of sortValue
-    std::sort(allDocs.begin(), allDocs.end(), [](const SortDoc& a, const SortDoc& b) {
-      if (a.sortValue != b.sortValue) {
-        return a.sortValue < b.sortValue; // Always ascending by stored value
+    // After merge, the heap will need sorting
+    needsSort = true;
+
+    // Iterate through other's documents and conditionally insert into this PQ
+    for (int64_t i = 0; i < other.pq->size(); i++) {
+      const auto& otherDoc = other.topDocs[i];
+      
+      if (pq->size() < topCount) {
+        // We have space, add to the next slot
+        int32_t slot = pq->size();
+        comparator->copy(slot, *other.comparator, otherDoc.slot, otherDoc.doc);
+        SortDoc newDoc(otherDoc.doc, otherDoc.score, slot);
+        topDocs[slot] = newDoc;
+        pq->insert(newDoc);
+      } else {
+        // PQ is full, check if this doc is competitive
+        SortDoc& bottom = pq->top();
+        
+        // Compare other doc with our bottom using cross-comparator compare
+        int cmp = comparator->compare(bottom.slot, bottom.doc, *other.comparator, otherDoc.slot, otherDoc.doc);
+        if (cmp == 0) {
+          // Tie-breaker by segdoc ascending
+          cmp = (bottom.doc > otherDoc.doc) - (bottom.doc < otherDoc.doc);
+        }
+
+        if (cmp > 0) {
+          comparator->copy(bottom.slot, *other.comparator, otherDoc.slot, otherDoc.doc);
+          bottom = SortDoc(otherDoc.doc, otherDoc.score, bottom.slot);
+          pq->updateTop();
+        }
       }
-      // Use segdoc as tiebreaker for determinism
-      // segdoc comparison: compares segment first (high bits), then docid (low bits)
-      return a.doc < b.doc; // Lower segdoc first
-    });
-    
-    // Keep only top K
-    size_t keepCount = std::min(topCount, (int64_t)allDocs.size());
-    
-    // Copy the top K documents to our array
-    for (size_t i = 0; i < keepCount; i++) {
-      topDocs[i] = allDocs[i];
     }
-    
-    // Rebuild the heap with the exact size and documents
-    // Use the DirectPQ constructor that takes currentSize to build heap correctly
-    FieldSortComparator compFunc;
-    pq = std::make_unique<DirectPQ<SortDoc, FieldSortComparator>>(std::span<SortDoc>(topDocs.data(), topCount), compFunc, keepCount);
   }
 
   int64_t totalHits() const {
     return hitCount;
   }
 
-  int64_t size() const {
-    return pq->size();
+  uint64_t size() const {
+    return pq ? pq->size() : 0;
   }
 
   std::span<SortDoc> sort() {
-    int64_t numDocs = pq->size();
+    auto finalSize = size();
     
-    // Debug: print what's in the heap before sorting
-    // std::cout << "Before sort, heap size=" << numDocs << "\n";
-    // for (int i = 0; i < numDocs; i++) {
-    //   std::cout << "  topDocs[" << i << "]: seg=" << topDocs[i].doc.segment() 
-    //             << " doc=" << topDocs[i].doc.docid() 
-    //             << " sortValue=" << topDocs[i].sortValue << "\n";
-    // }
-    
-    std::vector<SortDoc> sorted;
-    sorted.reserve(numDocs);
-
-    while (pq->size() > 0) {
-      sorted.push_back(pq->removeTop());
+    if (needsSort && pq) {
+      // Use sort_heap to convert heap to sorted order, just like other collectors
+      FieldSortComparatorFunctor comp(comparator.get());
+      
+      std::sort_heap(topDocs.begin(), topDocs.begin() + finalSize, comp);
     }
-
-    // We have a max-heap, so removeTop gives us largest sortValue to smallest sortValue
-    // But we want smallest sortValue first (best results first)
-    // So we need to reverse
-    std::reverse(sorted.begin(), sorted.end());
-
-    std::copy(sorted.begin(), sorted.end(), topDocs.begin());
-
-    return {topDocs.data(), numDocs};
+    return {topDocs.data(), finalSize};
   }
 
   std::span<SortDoc> scoreDocs() {
-    return {topDocs.data(), pq->size()};
+    return {topDocs.data(), size()};
   }
 };
 
