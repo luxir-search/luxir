@@ -1,7 +1,7 @@
 #include <filesystem>
 #include <thread>
 #include "SoluxTest.h"
-#include "solux/server/GRPCServer.h"
+#include "GrpcSoluxTest.h"
 #include "solux/solux_main.h"
 #include "benchmark/benchmark.h"
 
@@ -46,6 +46,15 @@ uint64_t SoluxTest::rng_seed;
 Rng SoluxTest::rng;
 SoluxNode* SoluxTest::soluxNode;
 
+GRPCServer* GrpcSoluxTest::server = nullptr;
+std::thread GrpcSoluxTest::serverThread;
+
+void SoluxTest::clearCollection(std::string_view collectionName) {
+  auto collection = soluxNode->getCollection(collectionName);
+  if (collection) {
+    collection->getShard()->getIndexWriter()->testDeleteAllData();
+  }
+}
 
 class SoluxTestListener : public testing::EmptyTestEventListener {
   uint64_t suiteHash;
@@ -138,7 +147,7 @@ int main(int argc, char **argv) {
               << "--gtest_break_on_failure for debugging." << std::endl
               << std::endl
               << "============================== Google Test Help ==============================" << std::endl;
-              testing::InitGoogleTest(&myargc, &(myargv[0]));
+    testing::InitGoogleTest(&myargc, &(myargv[0]));
     std::cout << "\n============================== Google Bench Help =============================" << std::endl;
     benchmark::Initialize(&myargc, &(myargv[0]));
     std::cout << std::endl;
@@ -160,12 +169,8 @@ int main(int argc, char **argv) {
   testing::AddGlobalTestEnvironment(new solux::SoluxEnvironment());
 
   int ret = 0;
-  solux::GRPCServer server;  // TODO: make number of threads configurable via command line args
-  solux::SoluxTest::soluxNode = &server.getSoluxNode();
-
-  // TODO: pull this out and only do it on demand if the specific test needs it?
-  std::thread serverThread([&server](){server.run();});
-  server.waitForStart();
+  solux::SoluxNode node;
+  solux::SoluxTest::soluxNode = &node;
 
   // Run tests / benchmarks in their own TBB arena.
   // It's not clear at this point if it will help anything, but we do want to separate as much as possible.
@@ -180,10 +185,11 @@ int main(int argc, char **argv) {
     }
   });
 
-  server.shutdown();
-  serverThread.join();
+  solux::GrpcSoluxTest::stopServer();
+
   return ret;
 }
+
 
 /** google benchmark arg reference
                    [--benchmark_list_tests={true|false}]

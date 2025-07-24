@@ -13,12 +13,19 @@ public:
   // gRPC performance guidelines suggest having numcpu threads and 2 threads per completion queue.
   // Are those real cpu cores, or the hyper-threaded cores that hardware_concurrency reports?
   // https://grpc.io/docs/guides/performance/
-  GRPCServer(int nthreads = std::max(1u, std::thread::hardware_concurrency() / 2));
-  void run(); // this blocks the current thread
-  void shutdown();
-  bool waitForStart(); // wait for the server to come up, returns false on failure
+  GRPCServer(SoluxNode& node, int nthreads = std::max(1u, std::thread::hardware_concurrency() / 2));
 
-  /// Get the associated SoluxNode.  Only valid for the lifetime of this GRPCServer.
+  /// This starts the server and blocks the current thread until shutdown.
+  void run();
+
+  /// wait for the server to come up, returns false on failure
+  bool waitForStart();
+
+  /// This stops the server and should cause run() to return
+  void shutdown();
+
+
+  /// Get the associated SoluxNode.
   SoluxNode& getSoluxNode() {
     return soluxNode;
   }
@@ -40,7 +47,7 @@ private:
   solux::Indexer::AsyncService indexerService;
   solux::Searcher::AsyncService searcherService;
 
-  SoluxNode soluxNode;  // TODO: this may be passed in later rather than exclusively owned?
+  SoluxNode& soluxNode;
   std::latch startLatch; // triggered when the gRPC server has started (but not the serving threads yet)
   std::latch startLatchThreads;  // count_down when grpc server thread has finished registering listeners
   std::unique_ptr<grpc::Server> server;

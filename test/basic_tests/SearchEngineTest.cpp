@@ -90,7 +90,7 @@ TEST_F(SearchEngineTest, basic) {
     avg.mutable_args()->Add()->set_s("foo_i");
 
     lreq->engine.submit(*lreq, para);
-    LOG_DEBUG("ENGINE REQ: {}", lreq->toString());
+    // LOG_DEBUG("ENGINE REQ: {}", lreq->toString());
 
     ASSERT_EQ(lreq->proto.request_id(), lreq->responses[0]->proto.request_id());
     auto& docs = lreq->responses[0]->proto.ops().at("q").docs();

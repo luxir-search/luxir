@@ -9,7 +9,8 @@ using namespace solux;
 
 int solux_main(int argc, char** argv) {
   unused(argc, argv);
-  GRPCServer server;
+  SoluxNode node;
+  GRPCServer server(node);
   server.run();
   return 0;
 }

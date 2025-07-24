@@ -2,7 +2,7 @@
 #include <iostream>
 #include <gtest/gtest.h>
 #include <google/protobuf/text_format.h>
-#include "test/SoluxTest.h"
+#include "test/GrpcSoluxTest.h"
 #include "solux/server/GRPCServer.h"
 
 using namespace solux;
@@ -11,12 +11,13 @@ using namespace solux;
 // redefine DEBUG to TRACE level which shouldn't currently be logged!
 #define GRPC_DEBUG LOG_TRACE
 
-class GrpcSearchTest : public SoluxTest {
+class GrpcSearchTest : public GrpcSoluxTest {
 public:
   std::shared_ptr<grpc::Channel> channel;
   std::unique_ptr<solux::Searcher::Stub> searchStub;
 
   GrpcSearchTest() {
+    startServer();
     channel = grpc::CreateChannel("localhost:50051", grpc::InsecureChannelCredentials());
     searchStub = solux::Searcher::NewStub(channel);
   }

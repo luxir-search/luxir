@@ -24,13 +24,13 @@ namespace solux {
 #define GRPC_DEBUG LOG_TRACE
 // #define GRPC_DEBUG LOG_DEBUG
 
-GRPCServer::GRPCServer(int nthreads)
-  : startLatch(1), startLatchThreads(nthreads), nthreads(nthreads) {
+GRPCServer::GRPCServer(SoluxNode& node, int nthreads)
+  : soluxNode(node), startLatch(1), startLatchThreads(nthreads), nthreads(nthreads) {
 }
 
 // NOTE: as of gRPC 1.39 there is a new C++ async callback API: https://github.com/grpc/grpc/pull/25728 in addition to an EventEngine
 // interface that may help with integration with external event loops.
-// adapted from the grpc helloworld example
+
 void solux::GRPCServer::run() {
   pthread_setname_np(pthread_self(), "solux_grpc_main");
 

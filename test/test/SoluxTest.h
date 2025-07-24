@@ -1,8 +1,7 @@
 #pragma once
 #include <gtest/gtest.h>
-#include <solux/server/SoluxNode.h>
-#include "solux/util/solux_util.h"
 #include "solux/util/random.h"
+#include "solux/util/solux_util.h"
 
 namespace solux {
 
@@ -39,7 +38,7 @@ namespace solux {
 //   to the Google Test template if using CLion.)
 
 
-
+class SoluxNode;
 
 class SoluxTest : public ::testing::Test {
 public:
@@ -73,12 +72,7 @@ public:
   void TearDown() override {
   }
 
-  void clearCollection(std::string_view collectionName="main") {
-    auto collection = soluxNode->getCollection(collectionName);
-    if (collection) {
-      collection->getShard()->getIndexWriter()->testDeleteAllData();
-    }
-  }
+  void clearCollection(std::string_view collectionName="main");
 };
 
 } // end namespace

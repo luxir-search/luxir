@@ -1,8 +1,9 @@
-#include "test/SoluxTest.h"
-#include "solux/util/SharedLazyMap.h"
 #include <atomic>
 #include <thread>
 #include <vector>
+#include "test/SoluxTest.h"
+#include "solux/util/SharedLazyMap.h"
+#include "solux/util/log.h"
 
 using namespace solux;
 

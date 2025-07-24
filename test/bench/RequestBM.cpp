@@ -2,6 +2,7 @@
 #include "bench/solux_bench.h"
 #include "test/SegmentTest.h"
 #include "solux/server/GRPCServer.h"
+#include "test/GrpcSoluxTest.h"
 
 
 using namespace solux;
@@ -13,6 +14,7 @@ using namespace solux;
 
 static void BM_Req(benchmark::State& state, int writers, int readers, bool async) {
   unused(writers,readers);
+  GrpcSoluxTest::startServer();
 
   std::shared_ptr<grpc::Channel> channel;
   std::unique_ptr<solux::Greeter::Stub> greeterStub;

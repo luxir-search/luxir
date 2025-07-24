@@ -1,7 +1,11 @@
 #pragma once
 #include <chrono>
+#include <sys/resource.h>
+#include <fstream>
+#include <malloc.h>
 #include "benchmark/benchmark.h"
 #include "test/SoluxTest.h"
+
 
 // Solux project benchmarks - always use real time since we extensively use TBB
 // throughout the codebase and CPU time only measures the main thread

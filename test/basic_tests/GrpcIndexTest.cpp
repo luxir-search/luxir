@@ -3,8 +3,7 @@
 #include <gtest/gtest.h>
 #include <google/protobuf/text_format.h>
 #include "oneapi/tbb/task_group.h"
-#include "test/SoluxTest.h"
-#include "solux/server/GRPCServer.h"
+#include "test/GrpcSoluxTest.h"
 #include "test/CollectionHelper.h"
 
 // TODO - use a different logger for RPC stuff some point
@@ -14,7 +13,7 @@
 
 using namespace solux;
 
-class GrpcIndexTest : public SoluxTest {
+class GrpcIndexTest : public GrpcSoluxTest {
 public:
   std::shared_ptr<grpc::Channel> channel;
   std::unique_ptr<solux::Greeter::Stub> greeterStub;
@@ -22,6 +21,7 @@ public:
   std::unique_ptr<solux::Searcher::Stub> searchStub;
 
   GrpcIndexTest() {
+    startServer();
     // channels are thread safe
     // TODO: move channel to somewhere that multiple tests can use it
     channel = grpc::CreateChannel("localhost:50051", grpc::InsecureChannelCredentials());
