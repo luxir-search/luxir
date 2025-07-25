@@ -14,16 +14,16 @@ class OrdMap {
 public:
   struct SegToGlobal {
     int64_t numOrds;
-    MonoReader* segToGlobal; // null if segment had no values for the field, or if it has all of the values
+    MonoReader* deltas; // null if segment had no values for the field, or if it has all of the values
   };
 
 private:
   struct SegToGlobalHolder {
     int64_t numOrds;
-    std::unique_ptr<MonoReader> segToGlobal;
+    std::unique_ptr<MonoReader> deltas;
 
     SegToGlobal get() const {
-      return {numOrds, segToGlobal.get()};
+      return {numOrds, deltas.get()};
     }
   };
 

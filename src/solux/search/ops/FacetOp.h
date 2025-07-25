@@ -237,20 +237,30 @@ solux::proto::Val* getTargetForSub(solux::proto::SearchResponse* searchResponse,
 };
 
 class StrFacetReq : public FieldFacetReq {
+  std::shared_ptr<OrdMap> ordMap;
   class MergeableStrFacet : public MergeableData {
   public:
     boost::unordered_flat_map<std::string, int64_t> counts;
+    boost::unordered_flat_map<int64_t, int64_t> ordCounts;
     int64_t missing_num = 0; // number of missing values in this segment
 
     static MergeableStrFacet* merge(MergeableStrFacet* a, MergeableStrFacet* b) {
       // merge the smaller collector into the larger collector, or if both the same size, merge
       // the less competitive collector into the more competitive collector.
-      if (a->counts.size() < b->counts.size()) {
-        std::swap(a,b);
-      }
-
-      for (auto [val, count] : b->counts) {
-        a->counts[val] += count;
+      if (!a->counts.empty() || !b->counts.empty()) {
+        if (a->counts.size() < b->counts.size()) {
+          std::swap(a, b);
+        }
+        for (auto [val, count] : b->counts) {
+          a->counts[val] += count;
+        }
+      } else {
+        if (a->ordCounts.size() < b->ordCounts.size()) {
+          std::swap(a, b);
+        }
+        for (auto [val, count] : b->ordCounts) {
+          a->ordCounts[val] += count;
+        }
       }
       a->missing_num += b->missing_num;
       return a;
@@ -286,6 +296,11 @@ public:
     std::string_view facetName, int64_t limit, int64_t minCount, bool missing) :
   FieldFacetReq(req, fieldFacet, fieldName, facetName, limit, minCount, missing){}
 
+  void init() override {
+    FacetReq::init();
+    ordMap = req.reader->coreIndex().getOrdMap(fieldName);
+  }
+
   class Calc : public Calculator {
     std::vector<DocSet*> input;
     AtomicMerger<MergeableStrFacet> countMerger;
@@ -315,6 +330,7 @@ public:
       return (StrFacetReq&)getOp();
     }
 
+
     solux::proto::Val* getTargetForSub(solux::proto::SearchResponse* searchResponse, Calculator* sub) override {
       auto* ourVal = parent->getTargetForSub(searchResponse, this);
       // the Val should either be unset, or have a DocList
@@ -328,6 +344,9 @@ public:
       if (!thisOp().inlineSubOps.empty()) {
         calc2(tg, segnum, domain);
         return;
+      } else {
+        //calcOrdMap(tg, segnum, domain);
+        //return;
       }
       //write only to different slots, so no need to synchronize
       input[segnum] = domain;
@@ -401,6 +420,35 @@ public:
       }
     }
 
+    void calcOrdMap(oneapi::tbb::task_group* tg, int32_t segnum, DocSet* domain) {
+      //write only to different slots, so no need to synchronize
+      input[segnum] = domain;
+      SegFieldInfo segFieldInfo;
+      std::unique_ptr<MergeableStrFacet> mergeableData(countMerger.obtain());
+      auto& count = mergeableData->ordCounts;
+      int64_t missing_num = 0;
+      auto& facetReq = (FacetReq&)getOp();
+      MonoReader* deltas = nullptr;
+      if (thisOp().ordMap) {
+        auto segtoGlobal = thisOp().ordMap->getSegToGlobal(segnum);
+        deltas = segtoGlobal.deltas;
+      }
+      facetReq.facetSegIntCol(domain, segnum, missing_num, segFieldInfo,
+        [&](int32_t docid, int64_t ord) {
+          unused(docid);
+          if (deltas) {
+            ord += deltas->valueAt(ord);
+          }
+          count[ord]++;
+        });
+      mergeableData->missing_num += missing_num;
+
+      auto merged = countMerger.release(mergeableData.release());
+      if (merged == thisOp().reader.segments().size()) {
+        facetResult(tg, std::unique_ptr<MergeableStrFacet>(countMerger.obtain()));
+      }
+    }
+
     void facetResult(oneapi::tbb::task_group* tg, std::unique_ptr<MergeableStrFacet> mergedData) {
       auto* myVal = getTarget(nullptr);
       solux::proto::FacetResult& facetResultProto = *myVal->mutable_facet();
@@ -411,6 +459,8 @@ public:
       auto missing_count = -1;
 
       std::vector<std::pair<std::string, int64_t>> countVec;
+
+      if (!mergedData->counts.empty()) {
         auto& counts = mergedData->counts;
         for (auto& [val, count] : counts) {
           if (minCount == -1 || count >= minCount) {
@@ -418,14 +468,38 @@ public:
           }
         }
         missing_count = mergedData->missing_num;
-      std::sort(countVec.begin(), countVec.end(), [](auto& a, auto& b) {
-        if (a.second != b.second ) {
-          return a.second > b.second;
+        std::sort(countVec.begin(), countVec.end(), [](auto& a, auto& b) {
+          if (a.second != b.second ) {
+            return a.second > b.second;
+          }
+          return a.first < b.first;
+        });
+        if (limit >= 0 && limit < (int64_t)countVec.size()) {
+          countVec.resize(limit);
         }
-        return a.first < b.first;
-      });
-      if (limit >= 0 && limit < (int64_t)countVec.size()) {
-        countVec.resize(limit);
+      } else {
+        std::vector<std::pair<int64_t, int64_t>> ordCounts;
+        auto& counts = mergedData->ordCounts;
+        for (auto& [val, count] : counts) {
+          if (minCount == -1 || count >= minCount) {
+            ordCounts.emplace_back(val, count);
+          }
+        }
+        missing_count = mergedData->missing_num;
+        std::sort(ordCounts.begin(), ordCounts.end(), [](auto& a, auto& b) {
+          if (a.second != b.second ) {
+            return a.second > b.second;
+          }
+          return a.first < b.first;
+        });
+        if (limit >= 0 && limit < (int64_t)ordCounts.size()) {
+          ordCounts.resize(limit);
+        }
+        countVec.reserve(ordCounts.size());
+        for (auto [ord, count] : ordCounts) {
+          // TODO: we need a performant glob ord -> str here
+          //countVec.emplace_back(val, count);
+        }
       }
 
       // fill in the facet result proto

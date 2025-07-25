@@ -95,15 +95,15 @@ TEST_F(OrdMapTest, MultipleSegmentsDisjointTerms) {
   // Check segment mappings
   auto seg0Mapping = ordMap->getSegToGlobal(0);
   EXPECT_EQ(seg0Mapping.numOrds, 2); // apple, banana
-  EXPECT_NE(seg0Mapping.segToGlobal, nullptr); // needs mapping
+  EXPECT_NE(seg0Mapping.deltas, nullptr); // needs mapping
   
   auto seg1Mapping = ordMap->getSegToGlobal(1);
   EXPECT_EQ(seg1Mapping.numOrds, 2); // cherry, date
-  EXPECT_NE(seg1Mapping.segToGlobal, nullptr); // needs mapping
+  EXPECT_NE(seg1Mapping.deltas, nullptr); // needs mapping
   
   auto seg2Mapping = ordMap->getSegToGlobal(2);
   EXPECT_EQ(seg2Mapping.numOrds, 2); // elderberry, fig
-  EXPECT_NE(seg2Mapping.segToGlobal, nullptr); // needs mapping
+  EXPECT_NE(seg2Mapping.deltas, nullptr); // needs mapping
   
   // Should have firstSegs and globDeltas
   EXPECT_NE(ordMap->getFirstSegs(), nullptr);
@@ -144,7 +144,7 @@ TEST_F(OrdMapTest, MultipleSegmentsOverlappingTerms) {
   for (int i = 0; i < 3; i++) {
     auto segMapping = ordMap->getSegToGlobal(i);
     EXPECT_GT(segMapping.numOrds, 0);
-    EXPECT_NE(segMapping.segToGlobal, nullptr);
+    EXPECT_NE(segMapping.deltas, nullptr);
   }
   
   // Should have firstSegs and globDeltas
@@ -182,19 +182,19 @@ TEST_F(OrdMapTest, FieldInSomeSegments) {
   // Check mappings - segments without field should have numOrds=0 and null mapping
   auto seg0 = ordMap->getSegToGlobal(0);
   EXPECT_EQ(seg0.numOrds, 2); // has apple, banana
-  EXPECT_NE(seg0.segToGlobal, nullptr);
+  EXPECT_NE(seg0.deltas, nullptr);
   
   auto seg1 = ordMap->getSegToGlobal(1);
   EXPECT_EQ(seg1.numOrds, 0); // no field1
-  EXPECT_EQ(seg1.segToGlobal, nullptr);
+  EXPECT_EQ(seg1.deltas, nullptr);
   
   auto seg2 = ordMap->getSegToGlobal(2);
   EXPECT_EQ(seg2.numOrds, 2); // has cherry, date
-  EXPECT_NE(seg2.segToGlobal, nullptr);
+  EXPECT_NE(seg2.deltas, nullptr);
   
   auto seg3 = ordMap->getSegToGlobal(3);
   EXPECT_EQ(seg3.numOrds, 0); // no field1
-  EXPECT_EQ(seg3.segToGlobal, nullptr);
+  EXPECT_EQ(seg3.deltas, nullptr);
 }
 
 // Empty Field in Segment
@@ -255,7 +255,7 @@ TEST_F(OrdMapTest, SegmentWithAllTerms) {
   // Segments with all terms should have null mapping
   auto seg2 = ordMap->getSegToGlobal(2);
   EXPECT_EQ(seg2.numOrds, 4); // has all 4 terms
-  EXPECT_EQ(seg2.segToGlobal, nullptr); // null because it has all terms
+  EXPECT_EQ(seg2.deltas, nullptr); // null because it has all terms
   
   // When a segment has all terms, we don't need firstSegs/globDeltas
   EXPECT_EQ(ordMap->getFirstSegs(), nullptr);
@@ -264,15 +264,15 @@ TEST_F(OrdMapTest, SegmentWithAllTerms) {
   // Other segments should still have mappings
   auto seg0 = ordMap->getSegToGlobal(0);
   EXPECT_EQ(seg0.numOrds, 1); // only apple
-  EXPECT_NE(seg0.segToGlobal, nullptr);
+  EXPECT_NE(seg0.deltas, nullptr);
   
   auto seg1 = ordMap->getSegToGlobal(1);
   EXPECT_EQ(seg1.numOrds, 1); // only banana
-  EXPECT_NE(seg1.segToGlobal, nullptr);
+  EXPECT_NE(seg1.deltas, nullptr);
   
   auto seg3 = ordMap->getSegToGlobal(3);
   EXPECT_EQ(seg3.numOrds, 2); // banana, cherry
-  EXPECT_NE(seg3.segToGlobal, nullptr);
+  EXPECT_NE(seg3.deltas, nullptr);
 }
 
 // Verify Correct Mappings
@@ -303,34 +303,34 @@ TEST_F(OrdMapTest, SegToGlobalMapping) {
   // Verify segment 0 mapping
   auto seg0 = ordMap->getSegToGlobal(0);
   EXPECT_EQ(seg0.numOrds, 2);
-  ASSERT_NE(seg0.segToGlobal, nullptr);
+  ASSERT_NE(seg0.deltas, nullptr);
   
   // In segment 0: banana=0, date=1
   // In global: apple=0, banana=1, cherry=2, date=3, elderberry=4
   // So mapping should be: 0->1, 1->2
-  EXPECT_EQ(seg0.segToGlobal->valueAt(0), 1); // banana: seg ord 0 -> global ord 1
-  EXPECT_EQ(seg0.segToGlobal->valueAt(1), 2); // date: seg ord 1 -> global ord 2 (actual correct value)
+  EXPECT_EQ(seg0.deltas->valueAt(0), 1); // banana: seg ord 0 -> global ord 1
+  EXPECT_EQ(seg0.deltas->valueAt(1), 2); // date: seg ord 1 -> global ord 2 (actual correct value)
   
   // Verify segment 1 mapping  
   auto seg1 = ordMap->getSegToGlobal(1);
   EXPECT_EQ(seg1.numOrds, 3);
-  ASSERT_NE(seg1.segToGlobal, nullptr);
+  ASSERT_NE(seg1.deltas, nullptr);
   
   // In segment 1: apple=0, cherry=1, elderberry=2
   // Mapping should be: 0->0, 1->1, 2->2
-  EXPECT_EQ(seg1.segToGlobal->valueAt(0), 0); // apple: seg ord 0 -> global ord 0
-  EXPECT_EQ(seg1.segToGlobal->valueAt(1), 1); // cherry: seg ord 1 -> global ord 1 (actual correct value)
-  EXPECT_EQ(seg1.segToGlobal->valueAt(2), 2); // elderberry: seg ord 2 -> global ord 2 (actual correct value)
+  EXPECT_EQ(seg1.deltas->valueAt(0), 0); // apple: seg ord 0 -> global ord 0
+  EXPECT_EQ(seg1.deltas->valueAt(1), 1); // cherry: seg ord 1 -> global ord 1 (actual correct value)
+  EXPECT_EQ(seg1.deltas->valueAt(2), 2); // elderberry: seg ord 2 -> global ord 2 (actual correct value)
   
   // Verify segment 2 mapping
   auto seg2 = ordMap->getSegToGlobal(2);
   EXPECT_EQ(seg2.numOrds, 2);
-  ASSERT_NE(seg2.segToGlobal, nullptr);
+  ASSERT_NE(seg2.deltas, nullptr);
   
   // In segment 2: banana=0, cherry=1
   // Mapping should be: 0->1, 1->1 (updated to match actual correct behavior)
-  EXPECT_EQ(seg2.segToGlobal->valueAt(0), 1); // banana: seg ord 0 -> global ord 1
-  EXPECT_EQ(seg2.segToGlobal->valueAt(1), 1); // cherry: seg ord 1 -> global ord 1 (actual correct value)
+  EXPECT_EQ(seg2.deltas->valueAt(0), 1); // banana: seg ord 0 -> global ord 1
+  EXPECT_EQ(seg2.deltas->valueAt(1), 1); // cherry: seg ord 1 -> global ord 1 (actual correct value)
 }
 
 // Segment-to-Global Mapping - Null Cases
@@ -362,22 +362,22 @@ TEST_F(OrdMapTest, SegToGlobalNullCases) {
   // Segment 0 has all terms - should be null
   auto seg0 = ordMap->getSegToGlobal(0);
   EXPECT_EQ(seg0.numOrds, 2);
-  EXPECT_EQ(seg0.segToGlobal, nullptr); // null for segment with all terms
+  EXPECT_EQ(seg0.deltas, nullptr); // null for segment with all terms
   
   // Segment 1 has no field - should be null
   auto seg1 = ordMap->getSegToGlobal(1);
   EXPECT_EQ(seg1.numOrds, 0);
-  EXPECT_EQ(seg1.segToGlobal, nullptr); // null for segment without field
+  EXPECT_EQ(seg1.deltas, nullptr); // null for segment without field
   
   // Segment 2 has subset - should have mapping
   auto seg2 = ordMap->getSegToGlobal(2);
   EXPECT_EQ(seg2.numOrds, 1);
-  EXPECT_NE(seg2.segToGlobal, nullptr); // has mapping for subset
+  EXPECT_NE(seg2.deltas, nullptr); // has mapping for subset
   
   // Segment 3 has all terms - should be null
   auto seg3 = ordMap->getSegToGlobal(3);
   EXPECT_EQ(seg3.numOrds, 2);
-  EXPECT_EQ(seg3.segToGlobal, nullptr); // null for segment with all terms
+  EXPECT_EQ(seg3.deltas, nullptr); // null for segment with all terms
 
   // check that the global mappings are absent
   EXPECT_EQ(ordMap->getFirstSegs(), nullptr);
@@ -438,9 +438,9 @@ TEST_F(OrdMapTest, GlobalToSegmentReverseMapping) {
     auto segMapping = ordMap->getSegToGlobal(static_cast<int>(segmentIdx));
 
     // If the segment has a forward mapping, verify it maps back correctly
-    if (segMapping.segToGlobal != nullptr) {
-      // segToGlobal stores deltas, so we need to add segmentOrd to get the global ordinal
-      auto storedDelta = segMapping.segToGlobal->valueAt(segmentOrd);
+    if (segMapping.deltas != nullptr) {
+      // deltas stores deltas, so we need to add segmentOrd to get the global ordinal
+      auto storedDelta = segMapping.deltas->valueAt(segmentOrd);
       auto actualGlobalOrd = segmentOrd + storedDelta;
       
       // This test verifies the consistency between forward and reverse mappings
