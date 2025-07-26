@@ -29,6 +29,8 @@ private:
 
 
   std::unique_ptr<char[]> data; // the raw data for the OrdMap
+  int64_t start;
+  int64_t end;
 
   int64_t nOrds;
   int firstFull = -1; // first segment that has all the ords, or -1 if none
@@ -37,7 +39,7 @@ private:
   std::optional<IntColReader> globDeltas; // for each global ord, what delta was applied to the segment ord to get the global ord
 
 public:
-  OrdMap(std::unique_ptr<char[]>&& data, int64_t start, int64_t end) : data(std::move(data)) {
+  OrdMap(std::unique_ptr<char[]>&& data, int64_t start, int64_t end) : data(std::move(data)), start(start), end(end) {
     InputStream dataIS(this->data.get() + start, this->data.get() + start + end);
 
     // Read size of metadata to we can skip to the start of it
@@ -106,6 +108,9 @@ public:
     return globDeltas ? &(*globDeltas) : nullptr;
   }
 
+  size_t sizeInBytes() {
+    return end - start;
+  }
   // TODO: create some convenience mapping classes to handle all the "null" and full-segment edge cases.
 
 };

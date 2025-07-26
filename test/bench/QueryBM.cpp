@@ -196,6 +196,12 @@ static void BM_Query(benchmark::State& state, int64_t nDocs, std::string_view sh
     );
   }
 
+  // if the sortfield ends in _s, we want to make sure to pre-load the OrdMap
+  std::shared_ptr<OrdMap> ordMap;
+  if (sfield.ends_with("_s")) {
+    ordMap = helper.getIndexWriter()->getIndexReader()->coreIndex().getOrdMap(sfield);
+  }
+
   RSSWatcher watcher;
 
   int64_t fp = -1;
@@ -268,6 +274,9 @@ static void BM_Query(benchmark::State& state, int64_t nDocs, std::string_view sh
   auto mem = watcher.getDeltaKB();
   state.counters["RSS_delta"] = mem.first / 1024;
   state.counters["RSS_max"] = mem.second / 1024;
+  if (sfield.ends_with("_s")) {
+    state.counters["OrdMapSz"] = ordMap ? (double)ordMap->sizeInBytes() : 0; // size of the OrdMap in bytes
+  }
 }
 
 
@@ -289,6 +298,10 @@ SOLUX_BENCHMARK_CAPTURE(BM_Query, u10k_i,            nDocs, shape, "all", "u10k_
 SOLUX_BENCHMARK_CAPTURE(BM_Query, u10k_i_para,       nDocs, shape, "all", "u10k_i", true);
 SOLUX_BENCHMARK_CAPTURE(BM_Query, u10m_i,            nDocs, shape, "all", "u10m_i", false);
 SOLUX_BENCHMARK_CAPTURE(BM_Query, u10m_i_para,       nDocs, shape, "all", "u10m_i", true);
+SOLUX_BENCHMARK_CAPTURE(BM_Query, short_u10_s,      nDocs, shape, "all", "short_u10_s", false);
+SOLUX_BENCHMARK_CAPTURE(BM_Query, short_u10_s_para, nDocs, shape, "all", "short_u10_s", true);
+SOLUX_BENCHMARK_CAPTURE(BM_Query, short_u10k_s,      nDocs, shape, "all", "short_u10k_s", false);
+SOLUX_BENCHMARK_CAPTURE(BM_Query, short_u10k_s_para, nDocs, shape, "all", "short_u10k_s", true);
+SOLUX_BENCHMARK_CAPTURE(BM_Query, short_u1m_s,      nDocs, shape, "all", "short_u1m_s", false);
+SOLUX_BENCHMARK_CAPTURE(BM_Query, short_u1m_s_para, nDocs, shape, "all", "short_u1m_s", true);
 // #endif
-// BENCHMARK_CAPTURE(BM_Query, short_u10k_s,      nDocs, shape, "all", "short_u10k_s", false);
-// BENCHMARK_CAPTURE(BM_Query, short_u10k_s_para, nDocs, shape, "all", "short_u10k_s", true);

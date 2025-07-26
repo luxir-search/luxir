@@ -1,6 +1,7 @@
 #pragma once
 
 #include "solux/search/FieldComparator.h"
+#include "solux/search/IndexReader.h"
 #include <memory>
 #include <string>
 #include <vector>
@@ -31,18 +32,9 @@ private:
     FieldComparator::MissingValue missingValue;
     
 public:
-    // Constructor taking string_view
-    SortField(std::string_view field, Type type, SortOrder order = DESC, 
+    SortField(std::string_view field, Type type, SortOrder order = DESC,
               FieldComparator::MissingValue missing = FieldComparator::MISSING_LAST)
         : fieldName(std::string(field)), type(type), order(order), missingValue(missing) {}
-    
-    static SortField scoreSort() {
-        return SortField(std::string("_score_"), SCORE, DESC);
-    }
-    
-    static SortField docSort() {
-        return SortField(std::string("_docid_"), DOC, ASC);
-    }
     
     const std::string& getFieldName() const { return fieldName; }
     Type getType() const { return type; }
@@ -54,18 +46,28 @@ public:
     }
     FieldComparator::MissingValue getMissingValue() const { return missingValue; }
     
-    std::unique_ptr<FieldComparator> createComparator(int numHits) const {
+    std::unique_ptr<FieldComparator> createComparator(int numHits, IndexReader* reader = nullptr) const {
         switch (type) {
             case INT:
             case LONG:
                 return std::make_unique<SimpleNumericFieldComparator>(
                     fieldName, numHits, isReversed(), missingValue
                 );
+            case STRING: {
+                // For string sorting, we need OrdMap for multi-segment sorting
+                std::shared_ptr<OrdMap> ordMap;
+                if (reader && reader->segments().size() > 1) {
+                    // Build OrdMap for multi-segment case
+                    ordMap = reader->coreIndex().getOrdMap(fieldName);
+                }
+                return std::make_unique<GlobalOrdComparator>(
+                    fieldName, ordMap, numHits, isReversed(), missingValue
+                );
+            }
             case SCORE:
             case DOC:
             case FLOAT:
             case DOUBLE:
-            case STRING:
                 throw std::runtime_error("Sort type not yet implemented: " + std::to_string(type));
             default:
                 throw std::runtime_error("Unknown sort type: " + std::to_string(type));
@@ -75,15 +77,14 @@ public:
 };
 
 class MultiFieldComparator : public FieldComparator {
-private:
     std::vector<std::unique_ptr<FieldComparator>> comparators;
     int numHits;
     
 public:
-    MultiFieldComparator(const std::vector<SortField>& sortFields, int numHits) 
+    MultiFieldComparator(const std::vector<SortField>& sortFields, int numHits, IndexReader* reader = nullptr) 
         : numHits(numHits) {
         for (const auto& field : sortFields) {
-            auto comp = field.createComparator(numHits);
+            auto comp = field.createComparator(numHits, reader);
             if (!comp) {
                 throw std::runtime_error("Failed to create comparator for field: " + field.getFieldName());
             }

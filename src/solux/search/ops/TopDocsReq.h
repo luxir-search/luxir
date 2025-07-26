@@ -38,8 +38,8 @@ public:
 
     Calc(TopDocsReq& op, Calculator* parent) : SearchOp::Calculator(op, parent, slot, numSlots), collectorMerger(nullptr, nullptr) {
 
-      collectorMerger.creator = [&op]() {
-        return new MergeableCollector(op.topCount, op.useFieldSort, op.sortFields);
+      collectorMerger.creator = [&op]() -> MergeableCollector* {
+        return new MergeableCollector(op.topCount, op.useFieldSort, op.sortFields, op.req.reader.get());
       };
       collectorMerger.destroyer = [](MergeableCollector* data) {
         delete data;
@@ -68,7 +68,7 @@ public:
       std::unique_ptr<FieldSortCollector> fieldCollector;
       bool useFieldSort;
 
-      MergeableCollector(size_t topCount, bool useFieldSort, const std::vector<SortField>& sortFields) 
+      MergeableCollector(size_t topCount, bool useFieldSort, const std::vector<SortField>& sortFields, IndexReader* reader = nullptr) 
         : useFieldSort(useFieldSort) {
         if (!useFieldSort) {
           scoreCollector = std::make_unique<TopDocsCollector>(topCount);
@@ -76,10 +76,10 @@ public:
           std::unique_ptr<FieldComparator> comparator;
           if (sortFields.size() == 1) {
             // For single field sort, create the comparator directly
-            comparator = sortFields[0].createComparator(topCount);
+            comparator = sortFields[0].createComparator(topCount, reader);
           } else {
             // For multiple fields, use MultiFieldComparator
-            comparator = std::make_unique<MultiFieldComparator>(sortFields, topCount);
+            comparator = std::make_unique<MultiFieldComparator>(sortFields, topCount, reader);
           }
           fieldCollector = std::make_unique<FieldSortCollector>(topCount, std::move(comparator));
         }
