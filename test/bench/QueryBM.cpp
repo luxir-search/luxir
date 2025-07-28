@@ -199,7 +199,14 @@ static void BM_Query(benchmark::State& state, int64_t nDocs, std::string_view sh
   // if the sortfield ends in _s, we want to make sure to pre-load the OrdMap
   std::shared_ptr<OrdMap> ordMap;
   if (sfield.ends_with("_s")) {
-    ordMap = helper.getIndexWriter()->getIndexReader()->coreIndex().getOrdMap(sfield);
+    auto& coreIndex = helper.getIndexWriter()->getIndexReader()->coreIndex();
+    /* basic info for the ordMap
+    ordMap = coreIndex.getOrdMap(sfield);
+    for (int seg = 0; seg < coreIndex.segments().size(); seg++) {
+      auto segToGlob = ordMap ? ordMap->getSegToGlobal(seg) : OrdMap::SegToGlobal();
+      println(std::cout, "OrdMap for segment {} ndocs={} nOrds={} deltas={}", seg, coreIndex.segments()[seg].maxDoc(), segToGlob.numOrds, (void*)segToGlob.deltas);
+    }
+    */
   }
 
   RSSWatcher watcher;

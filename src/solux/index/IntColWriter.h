@@ -212,8 +212,8 @@ public:
     // We could zig-zag encode to make all of the deltas positive, but we can save a little by just
     // lowering the intercept by minDelta.  Although this will raise the average delta, it should not
     // change the maximum number of bits needed to represent the largest.
-    auto adjustedIntercept = intercept + minDelta;
-    blockInfo.push_back({out.size() - colStart, scaled_slope, (int32_t)adjustedIntercept, (uint8_t)bits});
+    intercept += minDelta;
+    blockInfo.push_back({out.size() - colStart, scaled_slope, intercept, (uint8_t)bits});
 
     if (bits > 32) {
       out.write((const char*)arr.data(), arr.size() * sizeof(int64_t));
@@ -226,11 +226,10 @@ public:
     ivalues.resize(0);
     for (size_t i=0; i<arr.size(); i++) {
       uint64_t expected = intercept + (uint64_t)(i * scaled_slope / MonoReader::SLOPE_SCALE);
-      // We need to adjust the delta by minDelta since we adjusted the intercept
-      uint32_t delta = (uint32_t)(arr[i] - expected - minDelta);
+      uint32_t delta = (uint32_t)(arr[i] - expected);
       // if bits=32, this assert may not be true (and we changed delta to be unsigned to account for this)
       // assert(delta >= 0);
-      assert(int64_t((uint64_t(scaled_slope * i) / MonoReader::SLOPE_SCALE) + delta + adjustedIntercept) == arr[i]);
+      assert(int64_t((uint64_t(scaled_slope * i) / MonoReader::SLOPE_SCALE) + delta + intercept) == arr[i]);
       ivalues.push_back(delta);
     }
 

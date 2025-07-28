@@ -330,40 +330,37 @@ TEST_F(IntColTest, testMonoRepeatedValues) {
 }
 
 TEST_F(IntColTest, testMonoBig) {
-  for (int iter=0; iter<1; iter++) {
+  std::vector<int64_t> vals;
+
+  for (int iter=0; iter<2; iter++) {
+    vals.clear();
+    auto nVals = rng.rint(1u,MonoReader::BLOCK_SIZE * 3 + 10);
+    size_t bits;
+    int64_t val = 0;
+    int64_t maxVal;
+
     RAMDir dir;
     auto file = dir.createFile("mono");
     OutputStream out(file.get());
     out.writeStr("SOMETHING");
     MemPool pool;
     MonoWriter w(pool, out);
-    int32_t deltaMax = rng() & std::numeric_limits<int32_t>::max();
-    switch (rng.rint(4)) {
-      case 0:
-        deltaMax &= 0xff;
-        break;
-      case 1:
-        deltaMax &= 0xfff;
-        break;
-      case 2:
-        deltaMax &= 0xfffff;
-        break;
-      default:
-        break;
-    }
-    if (deltaMax==0) deltaMax=1;
-    auto num = rng.rint(MonoReader::BLOCK_SIZE * 3);
-    if (rng.rint(100) < 20) {
-      num = MonoReader::BLOCK_SIZE * rng.rint(1,3) + rng.rint(3)-1;  // sometimes test exactly block size +-1
+
+    for (auto i = 0u; i < nVals; i++) {
+      // when we go to a new block, pick a new max bit width
+      if (i % MonoReader::BLOCK_SIZE == 0) {
+        rng = Rng(rng());
+        bits = rng.rint(0ul, sizeof(int32_t)+10);
+        maxVal = 1 << bits;
+      }
+      int64_t delta = rng.rint(0l, maxVal);
+      val += delta;
+      vals.push_back(val);
+      w.addInt64(val);
     }
 
-    Rng rand = rng;
-
-    for (auto i = 0u; i < num; i++) {
-      w.addInt64(rand.rint(deltaMax));
-    }
-
-    int nVals = w.finish();
+    int outVals = w.finish();
+    ASSERT_EQ(outVals, nVals);
     out.close();
     dir.finishFile(*file);
 
@@ -371,9 +368,33 @@ TEST_F(IntColTest, testMonoBig) {
     InputStream is(in->getInputStream());
     MonoReader r(is, w.blockLoc.offset(), w.metaOff, nVals);
 
-    rand = rng;  // reset the rng so we can produce the same sequence of numbers.
-    for (auto i = 0u; i < num; i++) {
-      ASSERT_EQ(rand.rint(deltaMax), r.valueAt(i));
+    // confirm stateless value retrieval
+    for (auto i = 0u; i < nVals; i++) {
+      ASSERT_EQ(vals[i], r.valueAt(i));
     }
+
+    // confirm stateful (iterator) value retrieval
+    MonoReader::BulkValues bulk(r);
+
+    /*
+    // temp stateful in-order valueAt
+    for (auto i = 0u; i < nVals; i++) {
+      ASSERT_EQ(vals[i], bulk.valueAt(i)) << "Mismatch at index " << i;
+    }
+    */
+
+    for (auto i = 0u; i < nVals; i++) {
+      bulk.advance(i);
+      ASSERT_EQ(i, bulk.index());
+      ASSERT_EQ(vals[i], bulk.value()) << "Mismatch at index " << i;
+      ASSERT_EQ(vals[i], bulk.valueAt(i));
+    }
+
+    // confirm stateful (iterator) random access
+    for (auto i = 0u; i < nVals; i++) {
+      auto idx = rng.rint(0u, nVals);
+      ASSERT_EQ(vals[idx], bulk.valueAt(idx)) << "Mismatch at index " << idx;
+    }
+
   }
 }

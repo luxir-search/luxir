@@ -19,12 +19,14 @@ public:
   // This leaves the rest of the bits to interpolate large values: 2^64/(16384*4) = 2.8e14
   constexpr static uint64_t SLOPE_SCALE = BLOCK_SIZE * 4;
 
+  constexpr static int64_t ENDINDEX = std::numeric_limits<int64_t>::max();
+
   // either make this struct packed, or round it out so there won't be any undefined padding between elements.
   SOLUX_PACKED_START
   struct BlockInfo {
     uint64_t blockOffset;
     uint64_t scaledSlope;
-    int32_t intercept;
+    int64_t intercept;
     uint8_t bits;
     uint8_t _padding[3]={0,0,0};
   } SOLUX_PACKED_END;
@@ -48,7 +50,7 @@ public:
     blockMeta = reinterpret_cast<const BlockInfo *>(blocks + metaOff);
   }
 
-  [[nodiscard]] int32_t numValues() const {
+  [[nodiscard]] int64_t numValues() const {
     return nValues;
   }
 
@@ -77,6 +79,106 @@ public:
     return {v1, v2};
   }
 
+
+  /// Decodes sub-blocks at a time when one needs a decent percent of the values.
+  class BulkValues {
+    constexpr static uint32_t BULK_DECODE = 128;
+    const BlockInfo* blockMeta;  // array of block metadata
+    const char* blocks;                 // start of the compressed blocks of data
+    int64_t index_ = -1;
+    int64_t max;
+    int64_t decodedStart = -1;
+    int64_t decodedMax = 0;
+    // OPT: when max < BULK_DECODE, we don't need this much space.  We could pool allocate if we need to save more memory.
+    int64_t decoded[BULK_DECODE];
+  public:
+
+    BulkValues(const MonoReader& col) : blockMeta(col.blockMeta), blocks(col.blocks), max(col.numValues()) {
+    }
+
+    int64_t index() {
+      return index_;
+    }
+
+    int64_t value() {
+      assert (index_ >= decodedStart && index_ < decodedMax);
+      return decoded[index_ - decodedStart];
+    }
+
+    int64_t next() {
+      if (++index_ < decodedMax) {
+        return index_;
+      }
+      if (index_ >= max) {
+        index_ = ENDINDEX;
+        return index_;
+      }
+      decodeBlock(index_);
+      return index_;
+    }
+
+    void decodeBlock(int64_t index) {
+      // it's not clear to me what type of alignment will work for SoluxSIMDFor here.
+      // For now, we'll be conservative and align to 128.
+      assert (index >= 0 && index < max);
+      uint64_t start = uint64_t(index) / BULK_DECODE * BULK_DECODE;
+      assert(index < start + BULK_DECODE);
+      auto bigBlock = start / Postings::NUMERIC_BLOCK_SIZE;
+      auto littleBlock = start % Postings::NUMERIC_BLOCK_SIZE / BULK_DECODE;
+      auto& block = blockMeta[bigBlock];
+      uint32_t littleBlockSize = BULK_DECODE * block.bits / 8;
+      const char* subBlockStart = blocks + block.blockOffset + littleBlock * littleBlockSize;
+      decodedStart = start;
+      decodedMax = std::min(decodedStart + BULK_DECODE, max);
+      uint32_t num = decodedMax - decodedStart;
+      if (block.bits <= 32) {
+        uint32_t ints[BULK_DECODE];  // the deltas from the expected value
+        IndexCodec::numericCodec.decodeWithMeta(subBlockStart, littleBlockSize,
+                                              ints, num, 0, block.bits);
+
+        /* decoding a single value looks like this:
+        auto valuesInBlock = (blockNum == uint64_t(nValues) / BLOCK_SIZE) ? uint64_t(nValues) % BLOCK_SIZE : BLOCK_SIZE;
+        auto delta = IndexCodec::numericCodec.selectWithMeta(blockStart, valuesInBlock, rankInBlock, 0, block.bits);
+        int64_t scaled = uint64_t(rankInBlock * block.scaledSlope) / SLOPE_SCALE + block.intercept + delta;
+        */
+
+        // rank in big block is just little block times little block size
+        auto rankInBlock = littleBlock * BULK_DECODE;
+        for (uint32_t i = 0; i < num; i++) {
+          // This is really the only difference between IntColReader::BulkValues and MonoReader::BulkValues,
+          // we should try to unify them.
+          int64_t scaled = uint64_t((rankInBlock+i) * block.scaledSlope) / SLOPE_SCALE + block.intercept + ints[i];
+          decoded[i] = scaled;
+        }
+      } else {
+        // 64-bit, temp impl uncompressed
+        auto rankInBlock = (uint64_t)index % Postings::NUMERIC_BLOCK_SIZE;
+        memcpy(decoded, reinterpret_cast<const int64_t*>(blocks + block.blockOffset) + rankInBlock, num * sizeof(int64_t));
+      }
+    }
+
+    int64_t advance(int64_t target) {
+      assert(target > index_);
+      index_ = target;
+      if (index_ < decodedMax) {
+        return index_;
+      }
+      if (index_ >= max) {
+        index_ = ENDINDEX;
+        return index_;
+      }
+      decodeBlock(index_);
+      return index_;
+    }
+
+    int64_t valueAt(int64_t index) {
+      if (index >= decodedMax || index < decodedStart) {
+        decodeBlock(index);
+      }
+      return decoded[index - decodedStart];
+    }
+
+  };
 };
 
 
