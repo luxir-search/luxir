@@ -2,6 +2,7 @@
 #include <memory>
 #include <vector>
 
+#include "IndexReader.h"
 #include "solux/reader/IntColReader.h"
 
 namespace solux {
