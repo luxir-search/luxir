@@ -11,6 +11,7 @@
 #include "solux/reader/IntColReader.h"
 #include "solux/reader/TermsEnum.h"
 #include "solux/schema/Schema.h"
+#include "solux/search/OrdMapStr.h"
 #include "solux/util/AtomicMerger.h"
 
 namespace solux {
@@ -345,8 +346,8 @@ public:
         calc2(tg, segnum, domain);
         return;
       } else {
-        //calcOrdMap(tg, segnum, domain);
-        //return;
+        calcOrdMap(tg, segnum, domain);
+        return;
       }
       //write only to different slots, so no need to synchronize
       input[segnum] = domain;
@@ -436,6 +437,7 @@ public:
       facetReq.facetSegIntCol(domain, segnum, missing_num, segFieldInfo,
         [&](int32_t docid, int64_t ord) {
           unused(docid);
+          ord--; // ordMap is zero-based, int columns are one-based
           if (deltas) {
             ord += deltas->valueAt(ord);
           }
@@ -496,9 +498,11 @@ public:
           ordCounts.resize(limit);
         }
         countVec.reserve(ordCounts.size());
+        auto poolGuard = MemPool::threadLocalPoolGuard();
+        OrdMapStr ordMapStr(poolGuard.pool(), thisOp().ordMap.get(), thisOp().req.reader->coreIndex(), thisOp().fieldName);
         for (auto [ord, count] : ordCounts) {
-          // TODO: we need a performant glob ord -> str here
-          //countVec.emplace_back(val, count);
+          auto val = ordMapStr.ordToStr(ord);
+          countVec.emplace_back(val, count);
         }
       }
 

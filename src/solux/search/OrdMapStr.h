@@ -8,16 +8,18 @@ namespace solux {
 class OrdMapStr {
 public:
   MemPool& pool;
-  OrdMap& ordMap;
+  OrdMap* ordMap;
   CoreIndex& index;
   std::string_view fieldName;
   std::span<TermsEnum*> enums;
   IntColReader::DenseValues* deltas = nullptr;
+  IntColReader::DenseValues* firstSegs = nullptr;
 
-  OrdMapStr(MemPool& pool, OrdMap& ordMap, CoreIndex& index, std::string_view fieldName) : pool(pool), ordMap(ordMap), index(index), fieldName(fieldName) {
+  OrdMapStr(MemPool& pool, OrdMap* ordMap, CoreIndex& index, std::string_view fieldName) : pool(pool), ordMap(ordMap), index(index), fieldName(fieldName) {
     enums = pool.make_span<TermsEnum*>(index.segments().size());
-    if (ordMap.getGlobDeltas()) {
-      deltas = pool.make<IntColReader::DenseValues>(pool, *ordMap.getGlobDeltas());
+    if (ordMap && ordMap->getGlobDeltas()) {
+      deltas = pool.make<IntColReader::DenseValues>(*ordMap->getGlobDeltas());
+      firstSegs = pool.make<IntColReader::DenseValues>(*ordMap->getFirstSegs());
     }
   }
 
@@ -38,25 +40,25 @@ public:
     return tenum;
   }
 
+  //the return string view is only valid until the next call
   std::string_view ordToStr(int64_t ord) {
-    auto* firstSegs = ordMap.getFirstSegs();
     auto segOrd = ord;
-    auto* tenum = nullptr;
+    TermsEnum* tenum = nullptr;
 
     if (firstSegs) {
-      auto firstSeg = firstSegs->get(ord);
+      auto firstSeg = firstSegs->valueAt(ord);
       tenum = getTermsEnum(firstSeg);
       auto delta = deltas->valueAt(ord);
       segOrd -= delta;  // adjust ord to segment ord
     } else {
       // we can just use the terms enum for the first segment that has all ords
-      auto firstFullSeg = ordMap.firstFullSeg();
+      auto firstFullSeg = ordMap->firstFullSeg();
       assert(firstFullSeg != -1);
       tenum = getTermsEnum(firstFullSeg);
     }
 
     tenum->seekOrd(segOrd);
-    return tenum->term();
+    return (std::string_view) tenum->term();
   }
 };
 }
