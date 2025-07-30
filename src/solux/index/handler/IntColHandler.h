@@ -10,7 +10,7 @@ namespace solux::handler {
 //
 // Info for one single valued column
 //
-class IntColHandler : public Inverter::IndexHandler {
+class IntColHandler final : public Inverter::IndexHandler {
   friend class Inverter;
   LongStream longStream;
   DocStream docsWithVal;
@@ -67,7 +67,7 @@ public:
 
   // This is the version called directly from text field for norms
   void flushIntCol(Inverter& inverter, PostingsWriter::IndexFieldInfo& fieldInfo) {
-    auto& pool = MemPool::threadLocal();
+    auto& tmpPool = MemPool::threadLocal();
     PostingsWriter& postingsWriter = inverter.getPostingsWriter();
     auto full = numVals >= postingsWriter.getMaxDoc();
 
@@ -91,9 +91,9 @@ public:
 
     // push docs
     {
-      auto guard = pool.rewindScopeGuard();
+      auto guard = tmpPool.rewindScopeGuard();
       // TODO: when things go parallel, we don't want to reserve an OutputStream if this is dense.
-      DocsWithValWriter docsWriter(pool, postingsWriter, fieldInfo);
+      DocsWithValWriter docsWriter(tmpPool, postingsWriter, fieldInfo);
       if (!full) {
         docsWithVal.pushDocs(inverter.pool, docsWriter);
         docsWriter.finish();

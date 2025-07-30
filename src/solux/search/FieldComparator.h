@@ -184,6 +184,9 @@ public:
 class GlobalOrdComparator : public FieldComparator {
   std::string fieldName;
   std::shared_ptr<OrdMap> ordMap;
+  // Accessing the ord for a document will be in-order and should use a bulk iterator (which IntColReader::Iterator is)
+  // when the domain consists of many documents.
+  // Accessing the deltas to convert to a global ord will not be in-order, and bulk iterator should not be used.
   std::optional<IntColReader> reader;
   std::optional<IntColReader::Iterator> iter;
   std::vector<int64_t> globalOrds; // Storage for global ordinals

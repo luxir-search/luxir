@@ -39,6 +39,7 @@ public:
   }
 };
 
+class RAMFile;
 
 class File {
   friend class OutputStream;
@@ -56,6 +57,9 @@ public:
   const std::string& name() { return name_; }
 
   virtual size_t size() = 0;
+
+  /// appends the input RAMFile by stealing its buffers.
+  virtual void destructiveAppend(RAMFile &in) = 0;
 
   virtual ~File() = default;
 };
@@ -333,6 +337,8 @@ public:
   }
 
   /// appends the input RAMFile by stealing its buffers.
+  /// TODO: if further writes will happen to this file, we could pass the OutputStreams as well and
+  /// set our OutputStream to the other file's OutputStream (or somehow avoid extra flushes and allocations).
   void destructiveAppend(RAMFile &in) {
     if (this == &in) return; // no-op
     assert(in.firstBuffer == nullptr); // not implemented yet

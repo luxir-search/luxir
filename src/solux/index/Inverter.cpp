@@ -6,7 +6,7 @@
 
 // include the actual index handlers
 #include "solux/index/handler/IntColHandler.h"
-#include "solux/index/handler/StrColHandler.h"
+#include "solux/index/handler/StrHandler.h"
 #include "solux/index/handler/FullTextHandler.h"
 
 namespace solux {
@@ -47,7 +47,7 @@ Inverter::IndexHandler& Inverter::createIndexHandler(const std::string_view name
       fieldHandler = std::make_unique<handler::FullTextHandler>(*this, name, fieldType);
       break;
     case FieldType::Type::STRING:
-      fieldHandler = std::make_unique<handler::StrColHandler>(*this, name, fieldType);
+      fieldHandler = std::make_unique<handler::StrHandler>(*this, name, fieldType);
       break;
     case FieldType::Type::INT:
       if (fieldType->multiValued()) {

@@ -23,24 +23,26 @@ public:
     DOUBLE
   };
 
-  static constexpr int INDEX_DOCS = (1 << 0);
-  static constexpr int INDEX_DOCS_FREQS = INDEX_DOCS | (1 << 1);
-  static constexpr int INDEX_DOCS_FREQS_POSITIONS = INDEX_DOCS_FREQS | (1 << 2);
-  static constexpr int NUM_TOKENS_APPROX = (1 << 3);
-  static constexpr int NUM_TOKENS_EXACT = (1 << 4);
-  static constexpr int MULTI_VALUED = (1 << 5);  // Set if the field can have multiple values per document
-  static constexpr int FIELD_SPECIFIC_ANALYZER = (1 << 6);  // Set if different fields using the same type have different analyzers (i.e. don't cache across different fields)
+  using flag_type = int32_t;
 
-  const std::string name_;
+  static constexpr flag_type INDEX_DOCS = (1 << 0);
+  static constexpr flag_type INDEX_DOCS_FREQS = INDEX_DOCS | (1 << 1);
+  static constexpr flag_type INDEX_DOCS_FREQS_POSITIONS = INDEX_DOCS_FREQS | (1 << 2);
+  static constexpr flag_type NUM_TOKENS_APPROX = (1 << 3);
+  static constexpr flag_type NUM_TOKENS_EXACT = (1 << 4);
+  static constexpr flag_type MULTI_VALUED = (1 << 5);  // Set if the field can have multiple values per document
+  static constexpr flag_type FIELD_SPECIFIC_ANALYZER = (1 << 6);  // Set if different fields using the same type have different analyzers (i.e. don't cache across different fields)
+
+  static constexpr flag_type COLUMN_STORED = (1 << 7);  // Set if the field has values stored in a columnar format
+  static constexpr flag_type FIXED_SIZE = (1 << 8);     // if all values have the same size in bytes (for otherwise variable-length fields)
+
   const FieldType::Type type_;
-  int flags_;
+  const std::string name_;
+  flag_type flags_;
 
   // constructor
-  FieldType(std::string_view name, FieldType::Type type, bool multiValued, int flags) :
-    name_(name), type_(type), flags_(flags) {
-    if (multiValued) {
-      flags_ |= MULTI_VALUED;
-    }
+  FieldType(std::string_view name, FieldType::Type type, int flags) :
+     type_(type), name_(name), flags_(flags) {
   }
 
   virtual ~FieldType() = default;
@@ -74,7 +76,7 @@ public:
 class TextFieldType : public FieldType {
   // TODO: optional list of token filters, etc...
 public:
-  TextFieldType(std::string_view name, bool multiValued = false, int flags=INDEX_DOCS_FREQS_POSITIONS) : FieldType(name, FieldType::TEXT, multiValued, flags) {}
+  TextFieldType(std::string_view name, int flags=INDEX_DOCS_FREQS_POSITIONS) : FieldType(name, FieldType::TEXT, flags) {}
 
   // Right now, our analyzer only consists of a TokenChain.  We could either fold other analyzer methods into TextFieldType, or
   // fill out an Analyzer class (only needed if it needs state of its own?)
@@ -103,13 +105,13 @@ public:
 
 class StrFieldType : public FieldType {
 public:
-  StrFieldType(std::string_view name, bool multiValued=false, int flags=INDEX_DOCS) : FieldType(name, FieldType::STRING, multiValued, flags) {
+  StrFieldType(std::string_view name, int flags=INDEX_DOCS | COLUMN_STORED) : FieldType(name, FieldType::STRING, flags) {
   }
 };
 
 class IntFieldType : public FieldType {
 public:
-  IntFieldType(std::string_view name, bool multiValued=false, int flags=0) : FieldType(name, FieldType::INT, multiValued, flags) {
+  IntFieldType(std::string_view name, int flags=COLUMN_STORED) : FieldType(name, FieldType::INT, flags) {
   }
 };
 

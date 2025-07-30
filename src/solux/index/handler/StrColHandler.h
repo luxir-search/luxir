@@ -7,24 +7,40 @@
 #include "solux/util/TermValHash.h"
 
 
-using namespace solux;
+
 namespace solux::handler {
 
-// single-valued string field (indexed and stored)
-class StrColHandler : public Inverter::IndexHandler {
+/// String field handler for column stored only (values are stored verbatim per-doc, values not deduped)
+/// If the string is indexed and stored, see StrHandler.
+/// Values are all stored catenated, with cumulative lengths stored in a monotonic column.
+/// This class also handles binary values.
+class StrColHandler final : public Inverter::IndexHandler {
   friend Inverter;
 
-  // TODO: for unique fields like "id", this could be TermValHash<int32_t>
-  TermValHash<DocStream> termsHash; // the set of terms contained in this field
-  size_t maxValues = 1; // maximum number of values seen for a single doc
+  DocStream docsWithVal; // the set of docs that have this field
+  IntStream lengthStream;
+  // TODO: a RAMFile per field with the current buffer sizes (starting at 1K) is bad for many fields...
+  // We should have initial small buffers pool allocated.
+  // OPT: keep track all the RAMFiles used by the Inverter that are eligible to be directly written
+  // and then start directly writing one or more of them if they get big enough.
+  RAMFile valuesFile;
+  OutputStream valuesOut;
+  int64_t numDocs = 0;
+  int32_t minSize = std::numeric_limits<int32_t>::max();
+  int32_t maxSize = std::numeric_limits<int32_t>::min();
+
+  // size_t maxValues = 1; // maximum number of values seen for a single doc
 
 public:
-  StrColHandler(Inverter& inverter, const std::string_view& fieldName, const std::shared_ptr<FieldType>& fieldType)
+  StrHandler(Inverter& inverter, const std::string_view& fieldName, const std::shared_ptr<FieldType>& fieldType)
     : IndexHandler(PackedTerm(inverter.pool, fieldName), fieldType),
-      termsHash(inverter.pool, 4) {
+  docsWithVal(inverter.pool),
+      valuesFile(fieldName),
+      valuesOut(&valuesFile)  // OutputStream is a wrapper around RAMFile
+  {
   }
 
-  ~StrColHandler() override = default;
+  ~StrHandler() override = default;
 
   void index(Inverter& inverter, const proto::Val& val) override {
     std::string_view v;
@@ -33,13 +49,12 @@ public:
       v = val.s();
     }
     else if (val.has_bin()) {
+      // TODO: only OK if this is a binary type, otherwise we could accept non-unicode and then attempt
+      // to return that as a string later and cause gRPC or someone else up the line to choke.
       v = val.bin();
     }
-    else if (val.has_arr_s()) {
-      auto& arr = val.arr_s().v();
-      std::span<const std::string* const> values(arr.data(), arr.size());
-      index(inverter, values);
-      return;
+    else {
+      throw std::runtime_error("StrColHandler: expected string or binary value, got " + val.DebugString());
     }
     // TODO: handle arrays of binary as well
 
@@ -51,80 +66,76 @@ public:
   }
 
   void indexSingle(Inverter& inverter, std::string_view term) {
-    // TODO: error check if term is too long to index.
-    auto [entry, inserted] = termsHash.try_emplace(term, termsHash.getMemPool());
-    unused(inserted);
-    // don't record duplicates for the same doc.
-    if (entry->val().getLastDoc() != inverter.getDoc()) {
-      entry->val().addDoc(termsHash.getMemPool(), inverter.getDoc());
-    }
-  }
-
-  void index(Inverter& inverter, std::span<const std::string* const> vals) override {
-    for (auto val : vals) {
-      indexSingle(inverter, *val);
-    }
-    maxValues = std::max(maxValues, vals.size());
-    // TODO: check if fieldType allows multiple values?
-  }
-
-  void index(Inverter& inverter, std::span<std::string_view> vals) override {
-    for (auto val : vals) {
-      indexSingle(inverter, val);
-    }
-    maxValues = std::max(maxValues, vals.size());
-    // TODO: check if fieldType allows multiple values?
+    numDocs++;
+    docsWithVal.addDoc(inverter.pool, inverter.getDoc());
+    int32_t valSize = (int32_t)term.size();
+    minSize = std::min(minSize, valSize);
+    maxSize = std::max(maxSize, valSize);
+    lengthStream.addVal(inverter.pool, valSize);
+    valuesOut.write(term.data(), valSize);
   }
 
   void flush(Inverter& inverter) override {
-    int32_t uniqueVals = termsHash.size();
-    if (uniqueVals == 0) {
+    if (numDocs == 0) {
       return; // drop the field.
     }
+    auto& tmpPool = MemPool::threadLocal();
 
-    auto nDocs = inverter.getMaxDoc();
-    auto guard = MemPool::threadLocalPoolGuard();
-
-
-    auto terms = termsHash.destructiveCompress();
-    boost::sort::spreadsort::string_sort(terms, terms + uniqueVals, TermRef::bracket(), TermRef::getsize(),
-                                         TermRef::lessthan());
-
-    // TODO: TextWriter should be refactored (or templated) to handle strings without positions.
-    TextWriter textWriter(inverter.getPostingsWriter());
-    PostingsWriter::IndexFieldInfo& fieldInfo = inverter.getPostingsWriter().addField(fieldName);
+    PostingsWriter& postingsWriter = inverter.getPostingsWriter();
+    PostingsWriter::IndexFieldInfo& fieldInfo = postingsWriter.addField(fieldName);
     fieldInfo.type = fieldType->type();
     fieldInfo.flags = fieldType->flags_;
 
-    // For ordinals, we already know the number of unique terms, so we can use an optimal number of bits right off the bat
-    // for dense fields.  Then we could simply memcpy the ordinals into the postings file.
-    // std::vector<int> docToOrd(inverter.currDoc+1, 0); // This is very inefficient temporary implementation.
-    // ord vec must me 0 initialized since that is value that means "missing".
-    OrdCollector ords(guard.pool(), nDocs);
+    auto maxDoc = inverter.getMaxDoc();
+    auto guard = MemPool::threadLocalPoolGuard();
+    bool full = numDocs == maxDoc;
 
-    textWriter.startField(&fieldInfo);
-    for (int32_t tnum = 0; tnum < uniqueVals; tnum++) {
-      auto term = terms[tnum];
-      textWriter.startTerm(term);
-      // push all the docs for this term to the TextWriter, as well as record the ordinal for each doc
-      term.val().forEachDoc(inverter.pool, [&](int docid) {
-        // LOG_INFO("WRITE docid={}, tnum={}", docid, tnum);
-        textWriter.startDoc(docid);
-        textWriter.addPositionDelta(1);
-        // add a dummy position for now since we are using TextWriter, which expects them.
-        textWriter.endDoc(docid);
-
-        // single-valued version.
-        // docToOrd[docid] = tnum + 1;  // +1 because 0 means "missing"
-        ords.add(docid, tnum + 1);
-      });
-      textWriter.endTerm(term);
+    // Write the values
+    {
+      valuesOut.flush(true);
+      OutputStreamPtr out = postingsWriter.getOutputStream();
+      // TODO: depending on the type, we may want to align here.
+      out->flush();
+      fieldInfo.columnLoc = out->slocation();
+      out->getFile()->destructiveAppend(valuesFile);
+      // right now there is no metadata for these catenated values, so columnMetaOff is just the size of the column.
+      fieldInfo.columnMetaOff = out->size() - fieldInfo.columnLoc.offset();
     }
-    textWriter.endField();
-    termsHash.free();
 
-    OrdColWriter ordsWriter(guard.pool(), inverter.postingsWriter, fieldInfo, ords);
-    ordsWriter.finish();
+
+    // write lengths
+    // TODO: special case when all values are the same size.
+    {
+      auto guard = tmpPool.rewindScopeGuard();
+      OutputStreamPtr out = postingsWriter.getOutputStream();
+      MonoWriter endRankWriter(tmpPool, *out);
+      int64_t endRank = 0;
+
+      lengthStream.visitValues(inverter.pool, [&endRank, &endRankWriter](auto val) {
+        endRank += val;
+        endRankWriter.addInt64(endRank);
+      });
+
+      endRankWriter.finish();
+      fieldInfo.monoLoc = endRankWriter.blockLoc;
+      fieldInfo.monoMetaOff = endRankWriter.metaOff;
+    }
+
+
+    // write docs-with-value
+    {
+      auto guard = tmpPool.rewindScopeGuard();
+      // TODO: when things go parallel, we don't want to reserve an OutputStream if this is dense.
+      DocsWithValWriter docsWriter(tmpPool, postingsWriter, fieldInfo);
+      if (!full) {
+        docsWithVal.pushDocs(inverter.pool, docsWriter);
+        docsWriter.finish();
+      }
+      else {
+        docsWriter.finishDense(maxDoc);
+      }
+    }
+
   }
 
 };

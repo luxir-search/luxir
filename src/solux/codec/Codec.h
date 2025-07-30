@@ -45,7 +45,7 @@ public:
     unused(compressed);
     unused(blockSize);
     unused(index);
-    throw new std::runtime_error("select not implemented for this codec");
+    throw std::runtime_error("select not implemented for this codec");
   }
 };
 
@@ -350,7 +350,7 @@ public:
     } else if constexpr(std::is_same<Type, SIMDCompressionLib::SIMDFrameOfReference>::value) {
       return getCodec().select((uint32_t*) compressed, index);
     }
-      throw new std::runtime_error("select not implemented for this codec");
+      throw std::runtime_error("select not implemented for this codec");
   }
 
 
