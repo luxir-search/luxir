@@ -40,7 +40,7 @@ public:
   /// Get the string value for a document by its rank (index in docs with value).
   /// Returns empty string_view if rank is out of bounds.
   std::string_view valueAt(int32_t rank) const {
-    assert(rank >= 0 && rank <= docsWithField);
+    assert(rank >= 0 && rank < docsWithField);
     auto [startOffset, endOffset] = lengthReader.valuesAt(rank);
     return std::string_view(valuesData + startOffset, endOffset - startOffset);
   }

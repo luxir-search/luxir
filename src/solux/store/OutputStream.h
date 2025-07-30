@@ -47,7 +47,7 @@ class File {
 protected:
   std::string name_;
 
-  virtual void flush(OutputStream &os, bool last) = 0;
+  virtual void flush(OutputStream &os, bool deferNewBuff) = 0;
 
   virtual void close(OutputStream &os) = 0;
 
@@ -59,6 +59,11 @@ public:
   virtual size_t size() = 0;
 
   /// appends the input RAMFile by stealing its buffers.
+  /// IMPORTANT: If an OutputStream is attached to this File and will continue to be used after
+  /// this operation, you must call updateFlushedSize() on the OutputStream to update its size tracking.
+  /// Example: out->updateFlushedSize(out->size() + appendedDataSize);
+  /// Without this update, the OutputStream will not know about the appended data and may return
+  /// incorrect size/offset information.
   virtual void destructiveAppend(RAMFile &in) = 0;
 
   virtual ~File() = default;
@@ -75,6 +80,10 @@ class OutputStream {
   char *start = nullptr;
   char *end = nullptr;
   size_t flushedSize = 0; // number of bytes that have been flushed to the source
+public:
+  // Update flushedSize when external operations change the file size
+  void updateFlushedSize(size_t newSize) { flushedSize = newSize; }
+private:
   File *target;
 public:
   // just used by postings writer to know what field number this stream is associated with.
@@ -109,10 +118,10 @@ public:
   char *ptr() const noexcept { return pos; } // the current position in the buffer
   size_t size() const noexcept { return flushedSize + buffered(); }
 
-  File *getFile() const noexcept { return target; }
+  File *getFile() const noexcept{ return target; }
 
   // don't call flush before close... it would needlessly create a new memory buffer
-  void flush(bool last = false) { target->flush(*this, last); }
+  void flush(bool deferNewBuff = false) { target->flush(*this, deferNewBuff); }
 
   void close() {
     target->close(*this);
@@ -266,7 +275,7 @@ class RAMFile : public File {
     buffers.emplace_back(new char[size], size);
   }
 
-  void flush(OutputStream &os, bool last) override {
+  void flush(OutputStream &os, bool deferNewBuff) override {
     auto thisBufferSize = os.pos - os.start;
     fileSize += thisBufferSize;
     os.flushedSize = fileSize;
@@ -282,15 +291,16 @@ class RAMFile : public File {
       }
     }
 
-    if (!last) {
+    if (!deferNewBuff) {
       // doubling strategy up to 1MiB
-      newBuffer(std::min(prevBufferSize << 1, 0x100000u));
+      auto bufSize = std::max(START_BUFFER_SIZE, std::min(prevBufferSize << 1, 0x100000u));
+      newBuffer(bufSize);
       auto&[ptr, sz] = buffers.back();
       os.start = ptr.get();
       os.pos = os.start;
       os.end = os.start + sz;
     } else {
-      // In case anyone asks the output stream for its size after last flush.
+      // Set pointers to nullptr so next write will trigger a flush (i.e. allocation of new buf)
       os.start = os.pos = os.end = nullptr;
     }
   }
@@ -339,7 +349,8 @@ public:
   /// appends the input RAMFile by stealing its buffers.
   /// TODO: if further writes will happen to this file, we could pass the OutputStreams as well and
   /// set our OutputStream to the other file's OutputStream (or somehow avoid extra flushes and allocations).
-  void destructiveAppend(RAMFile &in) {
+  /// NOTE: Caller must update any attached OutputStream's size tracking after this operation.
+  void destructiveAppend(RAMFile &in) override {
     if (this == &in) return; // no-op
     assert(in.firstBuffer == nullptr); // not implemented yet
     auto otherSize = in.size();

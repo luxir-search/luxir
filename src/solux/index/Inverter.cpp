@@ -5,6 +5,7 @@
 #include "solux/schema/Schema.h"
 
 // include the actual index handlers
+#include "handler/StrColHandler.h"
 #include "solux/index/handler/IntColHandler.h"
 #include "solux/index/handler/StrHandler.h"
 #include "solux/index/handler/FullTextHandler.h"
@@ -47,7 +48,13 @@ Inverter::IndexHandler& Inverter::createIndexHandler(const std::string_view name
       fieldHandler = std::make_unique<handler::FullTextHandler>(*this, name, fieldType);
       break;
     case FieldType::Type::STRING:
-      fieldHandler = std::make_unique<handler::StrHandler>(*this, name, fieldType);
+      if (!fieldType->indexed() && fieldType->hasColumn()) {
+        // If the field is not indexed (column stored only), use StrColHandler
+        fieldHandler = std::make_unique<handler::StrColHandler>(*this, name, fieldType);
+      } else {
+        // indexed and column stored (via ord)
+        fieldHandler = std::make_unique<handler::StrHandler>(*this, name, fieldType);
+      }
       break;
     case FieldType::Type::INT:
       if (fieldType->multiValued()) {

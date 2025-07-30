@@ -3,6 +3,9 @@
 #include "test/SoluxTest.h"
 #include "test/TestIndex.h"
 #include "test/TestUtils.h"
+#include "solux/index/handler/StrColHandler.h"
+#include "solux/reader/StrColReader.h"
+#include "solux/reader/FieldReader.h"
 #include <vector>
 
 using namespace solux;
@@ -308,5 +311,82 @@ TEST_F(StrColTest, deleteAndMergeMultiValued) {
   ASSERT_EQ(ords, vec(1l, 2l));  // "apple"=1, "banana"=2
   
   ASSERT_EQ(-1, f.nextDoc());
+}
+
+TEST_F(StrColTest, strColReaderBasic) {
+  // Test StrColReader for column-only string storage
+  TestIndex testIndex;
+  TestField f(testIndex, "description_sc");
+  
+  // Add documents with some missing values
+  f.startIndexing();
+  f.add(0, "First document description");
+  // Doc 1 has no value
+  f.add(2, "Second doc with text");
+  f.add(3, "");  // Empty string
+  // Doc 4 has no value
+  f.add(5, "Final document with a longer description text");
+  
+  testIndex.flush();
+  
+  // Now read using StrColReader
+  testIndex.initReader();
+  auto& segment = testIndex.reader->segments()[0];
+  auto& postingsReader = segment.postingsReader();
+  FieldReader fieldReader(MemPool::threadLocal(), postingsReader);
+  bool found = fieldReader.seek("description_sc");
+  ASSERT_TRUE(found);
+  
+  SegFieldInfo segFieldInfo;
+  fieldReader.readFieldInfo(segFieldInfo);
+  
+  StrColReader strReader(postingsReader, segFieldInfo);
+  ASSERT_EQ(4, strReader.docsWithValue());  // 4 docs have values (0, 2, 3, 5)
+  
+  // Iterate through docs with values
+  StrColReader::Iterator iter(strReader);
+  
+  ASSERT_EQ(0, iter.advance(0));
+  auto val = iter.value();
+  
+  ASSERT_EQ("First document description", val);
+  
+  ASSERT_EQ(2, iter.next());  // Skip doc 1 which has no value
+  ASSERT_EQ("Second doc with text", iter.value());
+  
+  ASSERT_EQ(3, iter.next());
+  ASSERT_EQ("", iter.value());  // Empty string
+  
+  ASSERT_EQ(5, iter.next());  // Skip doc 4
+  ASSERT_EQ("Final document with a longer description text", iter.value());
+  
+  ASSERT_EQ(StrColReader::Iterator::ENDDOC, iter.next());
+  
+  // Test advance
+  StrColReader::Iterator iter2(strReader);
+  ASSERT_EQ(2, iter2.advance(2));
+  ASSERT_EQ("Second doc with text", iter2.value());
+  
+  ASSERT_EQ(5, iter2.advance(4));  // Advance to 4, but doc 4 has no value, so we get doc 5
+  ASSERT_EQ("Final document with a longer description text", iter2.value());
+  
+  // Test static getValues method
+  std::vector<int32_t> docIds = {0, 1, 2, 3, 4, 5};
+  std::vector<std::pair<int32_t, std::string>> results;
+  
+  StrColReader::getValues(MemPool::threadLocal(), postingsReader, segFieldInfo, docIds,
+    [&results](size_t idx, int32_t docid, std::string_view value) {
+      results.emplace_back(docid, std::string(value));
+    });
+  
+  ASSERT_EQ(4, results.size());
+  ASSERT_EQ(0, results[0].first);
+  ASSERT_EQ("First document description", results[0].second);
+  ASSERT_EQ(2, results[1].first);
+  ASSERT_EQ("Second doc with text", results[1].second);
+  ASSERT_EQ(3, results[2].first);
+  ASSERT_EQ("", results[2].second);
+  ASSERT_EQ(5, results[3].first);
+  ASSERT_EQ("Final document with a longer description text", results[3].second);
 }
 

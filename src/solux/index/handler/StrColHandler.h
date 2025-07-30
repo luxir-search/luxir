@@ -32,15 +32,16 @@ class StrColHandler final : public Inverter::IndexHandler {
   // size_t maxValues = 1; // maximum number of values seen for a single doc
 
 public:
-  StrHandler(Inverter& inverter, const std::string_view& fieldName, const std::shared_ptr<FieldType>& fieldType)
+  StrColHandler(Inverter& inverter, const std::string_view& fieldName, const std::shared_ptr<FieldType>& fieldType)
     : IndexHandler(PackedTerm(inverter.pool, fieldName), fieldType),
-  docsWithVal(inverter.pool),
+      docsWithVal(inverter.pool),
+      lengthStream(inverter.pool),
       valuesFile(fieldName),
-      valuesOut(&valuesFile)  // OutputStream is a wrapper around RAMFile
+      valuesOut(&valuesFile)
   {
   }
 
-  ~StrHandler() override = default;
+  ~StrColHandler() override = default;
 
   void index(Inverter& inverter, const proto::Val& val) override {
     std::string_view v;
@@ -92,12 +93,16 @@ public:
 
     // Write the values
     {
-      valuesOut.flush(true);
+      valuesOut.flush(true);  // Flush but keep the stream usable
+      auto valuesSize = valuesFile.size();
+      
       OutputStreamPtr out = postingsWriter.getOutputStream();
       // TODO: depending on the type, we may want to align here.
-      out->flush();
+      out->flush(true);
       fieldInfo.columnLoc = out->slocation();
       out->getFile()->destructiveAppend(valuesFile);
+      // Update the OutputStream's size tracking after destructiveAppend
+      out->updateFlushedSize(out->size() + valuesSize);
       // right now there is no metadata for these catenated values, so columnMetaOff is just the size of the column.
       fieldInfo.columnMetaOff = out->size() - fieldInfo.columnLoc.offset();
     }

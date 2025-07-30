@@ -10,7 +10,8 @@
 using namespace solux;
 namespace solux::handler {
 
-// single-valued string field (indexed and stored)
+/// Single-valued string field (indexed and column-stored)
+/// The column has ords stored for each doc.  Retrieving the corresponding term is done via TermsEnum.
 class StrHandler final : public Inverter::IndexHandler {
   friend Inverter;
 

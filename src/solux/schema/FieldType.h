@@ -45,6 +45,13 @@ public:
      type_(type), name_(name), flags_(flags) {
   }
 
+  bool isSet(flag_type flag) {
+    return (flags_ & flag);
+  }
+  bool notSet(flag_type flag) {
+    return !(flags_ & flag);
+  }
+
   virtual ~FieldType() = default;
 
   // Return the basic type of the field.
@@ -67,6 +74,7 @@ public:
 
   bool isAnalyzerFieldSpecific() { return (bool) (flags_ & FIELD_SPECIFIC_ANALYZER); }
 
+  bool hasColumn() { return (bool) (flags_ & COLUMN_STORED); }
 
   // TODO: how to share analyzers (potentially expensive) among FieldTypes?
   // One way: Have a parent FieldType in the constructor.
