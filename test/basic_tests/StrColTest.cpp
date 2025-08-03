@@ -437,3 +437,267 @@ TEST_F(StrColTest, fixedSizeOptimization) {
   }
 }
 
+TEST_F(StrColTest, mergeNonIndexedStrCol) {
+  // Test merging of non-indexed string columns (column-only storage)
+  
+  // Simple test first - single doc per segment
+  {
+    TestIndex testIndex;
+    TestField f(testIndex, "simple_sc");
+    
+    // First segment
+    f.startIndexing();
+    f.add(0, "First");
+    testIndex.flush();
+    
+    // Verify first segment alone works
+    testIndex.initReader();
+    auto& seg1 = testIndex.reader->segments()[0];
+    auto& pr1 = seg1.postingsReader();
+    FieldReader fr1(MemPool::threadLocal(), pr1);
+    ASSERT_TRUE(fr1.seek("simple_sc"));
+    SegFieldInfo sfi1;
+    fr1.readFieldInfo(sfi1);
+    // Check the field type and flags
+    ASSERT_EQ(FieldType::Type::STRING, sfi1.type) << "Field type should be STRING";
+    ASSERT_EQ(FieldType::COLUMN_STORED, sfi1.flags) << "Field flags should be COLUMN_STORED only";
+    StrColReader sr1(pr1, sfi1);
+    ASSERT_EQ(1, sr1.docsWithValue());
+    
+    // Second segment
+    f.startIndexing();
+    f.add(0, "Second");
+    testIndex.flush();
+    
+    // Merge segments
+    testIndex.iw->mergeSegments();
+    
+    // Verify merged data
+    testIndex.initReader();
+    ASSERT_EQ(1, testIndex.reader->segments().size());  // Should have 1 merged segment
+    auto& segment = testIndex.reader->segments()[0];
+    auto& postingsReader = segment.postingsReader();
+    FieldReader fieldReader(MemPool::threadLocal(), postingsReader);
+    bool found = fieldReader.seek("simple_sc");
+    ASSERT_TRUE(found) << "Field simple_sc not found after merge";
+    
+    SegFieldInfo segFieldInfo;
+    fieldReader.readFieldInfo(segFieldInfo);
+    
+    StrColReader strReader(postingsReader, segFieldInfo);
+    ASSERT_EQ(2, strReader.docsWithValue()) << "Expected 2 docs with values after merge";
+    
+    StrColReader::Iterator iter(strReader);
+    
+    ASSERT_EQ(0, iter.advance(0));
+    ASSERT_EQ("First", iter.value());
+    
+    ASSERT_EQ(1, iter.next());
+    ASSERT_EQ("Second", iter.value());
+    
+    ASSERT_EQ(StrColReader::Iterator::ENDDOC, iter.next());
+  }
+  
+  // Basic dense merge
+  {
+    TestIndex testIndex;
+    TestField f(testIndex, "content_sc");
+    
+    // First segment
+    f.startIndexing();
+    f.add(0, "First document");
+    f.add(1, "Second document with longer text");
+    testIndex.flush();
+    
+    // Second segment
+    f.startIndexing();
+    f.add(0, "Third doc");
+    f.add(1, "Fourth");
+    testIndex.flush();
+    
+    // Merge segments
+    testIndex.iw->mergeSegments();
+    
+    // Verify merged data
+    testIndex.initReader();
+    auto& segment = testIndex.reader->segments()[0];
+    auto& postingsReader = segment.postingsReader();
+    FieldReader fieldReader(MemPool::threadLocal(), postingsReader);
+    bool found = fieldReader.seek("content_sc");
+    ASSERT_TRUE(found);
+    
+    SegFieldInfo segFieldInfo;
+    fieldReader.readFieldInfo(segFieldInfo);
+    
+    StrColReader strReader(postingsReader, segFieldInfo);
+    ASSERT_EQ(4, strReader.docsWithValue());
+    
+    StrColReader::Iterator iter(strReader);
+    
+    ASSERT_EQ(0, iter.advance(0));
+    ASSERT_EQ("First document", iter.value());
+    
+    ASSERT_EQ(1, iter.next());
+    ASSERT_EQ("Second document with longer text", iter.value());
+    
+    ASSERT_EQ(2, iter.next());
+    ASSERT_EQ("Third doc", iter.value());
+    
+    ASSERT_EQ(3, iter.next());
+    ASSERT_EQ("Fourth", iter.value());
+    
+    ASSERT_EQ(StrColReader::Iterator::ENDDOC, iter.next());
+  }
+  
+  // Sparse merge
+  {
+    TestIndex testIndex;
+    TestField f(testIndex, "sparse_sc");
+    
+    // First segment - sparse
+    f.startIndexing();
+    f.add(10, "Document at 10");
+    f.add(100, "Document at 100");
+    testIndex.flush();
+    
+    // Second segment - sparse
+    f.startIndexing();
+    f.add(5, "Document at 5");
+    f.add(50, "Document at 50");
+    testIndex.flush();
+    
+    // Merge segments
+    testIndex.iw->mergeSegments();
+    
+    // Verify merged data
+    testIndex.initReader();
+    auto& segment = testIndex.reader->segments()[0];
+    auto& postingsReader = segment.postingsReader();
+    FieldReader fieldReader(MemPool::threadLocal(), postingsReader);
+    bool found = fieldReader.seek("sparse_sc");
+    ASSERT_TRUE(found);
+    
+    SegFieldInfo segFieldInfo;
+    fieldReader.readFieldInfo(segFieldInfo);
+    
+    StrColReader strReader(postingsReader, segFieldInfo);
+    ASSERT_EQ(4, strReader.docsWithValue());
+    
+    StrColReader::Iterator iter(strReader);
+    
+    ASSERT_EQ(10, iter.advance(0));
+    ASSERT_EQ("Document at 10", iter.value());
+    
+    ASSERT_EQ(100, iter.next());
+    ASSERT_EQ("Document at 100", iter.value());
+    
+    ASSERT_EQ(106, iter.next());  // 100 + 1 + 5
+    ASSERT_EQ("Document at 5", iter.value());
+    
+    ASSERT_EQ(151, iter.next());  // 100 + 1 + 50
+    ASSERT_EQ("Document at 50", iter.value());
+    
+    ASSERT_EQ(StrColReader::Iterator::ENDDOC, iter.next());
+  }
+  
+  // Merge with deletions
+  {
+    TestIndex testIndex;
+    TestField f(testIndex, "delete_sc");
+    
+    // First segment
+    f.startIndexing();
+    f.add(0, "Keep this");
+    f.add(1, "Delete this");
+    f.add(2, "Also keep this");
+    testIndex.deleteDoc(1);  // Delete middle document
+    testIndex.flush();
+    
+    // Second segment
+    f.startIndexing();
+    f.add(0, "New document");
+    testIndex.flush();
+    
+    // Merge segments
+    testIndex.iw->mergeSegments();
+    
+    // Verify merged data - deleted doc should not appear
+    testIndex.initReader();
+    auto& segment = testIndex.reader->segments()[0];
+    auto& postingsReader = segment.postingsReader();
+    FieldReader fieldReader(MemPool::threadLocal(), postingsReader);
+    bool found = fieldReader.seek("delete_sc");
+    ASSERT_TRUE(found);
+    
+    SegFieldInfo segFieldInfo;
+    fieldReader.readFieldInfo(segFieldInfo);
+    
+    StrColReader strReader(postingsReader, segFieldInfo);
+    ASSERT_EQ(3, strReader.docsWithValue());  // Only 3 docs (deleted one excluded)
+    
+    StrColReader::Iterator iter(strReader);
+    
+    ASSERT_EQ(0, iter.advance(0));
+    ASSERT_EQ("Keep this", iter.value());
+    
+    ASSERT_EQ(1, iter.next());  // Doc 2 becomes doc 1 after deletion
+    ASSERT_EQ("Also keep this", iter.value());
+    
+    ASSERT_EQ(2, iter.next());  // New document from second segment
+    ASSERT_EQ("New document", iter.value());
+    
+    ASSERT_EQ(StrColReader::Iterator::ENDDOC, iter.next());
+  }
+  
+  // Fixed-size optimization preserved during merge
+  {
+    TestIndex testIndex;
+    TestField f(testIndex, "fixed_merge_sc");
+    
+    // First segment - all 5 chars
+    f.startIndexing();
+    f.add(0, "12345");
+    f.add(1, "abcde");
+    testIndex.flush();
+    
+    // Second segment - all 5 chars
+    f.startIndexing();
+    f.add(0, "fghij");
+    f.add(1, "67890");
+    testIndex.flush();
+    
+    // Merge segments
+    testIndex.iw->mergeSegments();
+    
+    // Verify fixed-size optimization is preserved
+    testIndex.initReader();
+    auto& segment = testIndex.reader->segments()[0];
+    auto& postingsReader = segment.postingsReader();
+    FieldReader fieldReader(MemPool::threadLocal(), postingsReader);
+    bool found = fieldReader.seek("fixed_merge_sc");
+    ASSERT_TRUE(found);
+    
+    SegFieldInfo segFieldInfo;
+    fieldReader.readFieldInfo(segFieldInfo);
+    
+    StrColReader strReader(postingsReader, segFieldInfo);
+    ASSERT_EQ(nullptr, strReader.getEndRankReader());  // Should still have no end rank reader
+    
+    StrColReader::Iterator iter(strReader);
+    
+    ASSERT_EQ(0, iter.advance(0));
+    ASSERT_EQ("12345", iter.value());
+    
+    ASSERT_EQ(1, iter.next());
+    ASSERT_EQ("abcde", iter.value());
+    
+    ASSERT_EQ(2, iter.next());
+    ASSERT_EQ("fghij", iter.value());
+    
+    ASSERT_EQ(3, iter.next());
+    ASSERT_EQ("67890", iter.value());
+    
+    ASSERT_EQ(StrColReader::Iterator::ENDDOC, iter.next());
+  }
+}
+

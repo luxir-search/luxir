@@ -3,6 +3,7 @@
 #include "OrdCollector.h"
 #include "OrdColWriter.h"
 #include "solux/reader/DocsEnum.h"
+#include "solux/reader/StrColReader.h"
 #include "solux/search/IndexReader.h"
 
 // This file is only included in IndexWriter.cpp
@@ -264,8 +265,8 @@ private:
     outputFieldInfo.type = type;
     outputFieldInfo.flags = allFlags;
 
-    // if this is a string column, we need to collect the ordinals for each doc
-    bool isOrdCol = (type == FieldType::Type::STRING);
+    // if this is an indexed string column, we need to collect the ordinals for each doc
+    bool isOrdCol = (type == FieldType::Type::STRING) && (allFlags & FieldType::INDEX_DOCS);
     std::optional<OrdCollector> ordCollector;
     // use a separate pool for the ordCollector since the ords will be built at the same time as the postings are read/written,
     // and we want to roll back much of that allocation, but preserve the ords.
@@ -351,6 +352,9 @@ private:
       // ordCollector.reset();
       // ordPool.reset();
 
+    } else if (type == FieldType::Type::STRING && !(allFlags & FieldType::INDEX_DOCS)) {
+      // Non-indexed string column (column-only storage)
+      mergeStrCol(sortedFields, postingsWriter, outputFieldInfo);
     } else {
       // int column that is not an ord column (assume all other field types have this (currently true)
       mergeIntCol2(sortedFields, postingsWriter, outputFieldInfo);
@@ -439,6 +443,152 @@ private:
 
   // If an IntCol has deletions, we can't write the column parts independently (docsWithValue, endRanks, values)
   // like we can if there are no deletions.
+  void mergeStrCol(std::span<MergeFieldInfo*> sortedFields, PostingsWriter& postingsWriter,
+                   PostingsWriter::IndexFieldInfo& outputFieldInfo) {
+    assert(sortedFields.size() == segs.size());  // expect non-compacted fields to make the code a little simpler.
+
+    auto poolGuard = MemPool::threadLocalPoolGuard();
+    auto& pool = poolGuard.pool();
+    
+    // Make sure the field type and flags are properly set
+    // These should already be set by mergeField, but let's make sure
+    assert(outputFieldInfo.type == FieldType::Type::STRING);
+    assert(!(outputFieldInfo.flags & FieldType::INDEX_DOCS));
+
+    // Get output stream for concatenated string values
+    OutputStreamPtr valuesOut = postingsWriter.getOutputStream();
+    outputFieldInfo.columnLoc = valuesOut->slocation();
+    
+    u_ptr<DocsWithValWriter> docsWriter = nullptr;  // docs with the field, created on demand if needed
+    u_ptr<MonoWriter> lengthWriter = nullptr;
+    std::optional<OutputStreamPtr> monoOut;
+    
+    int32_t docsWithField = 0;
+    int32_t minSize = std::numeric_limits<int32_t>::max();
+    int32_t maxSize = std::numeric_limits<int32_t>::min();
+    int64_t cumulativeLength = 0;
+    bool isDense = true;
+    
+    // Process segments in order - since doc remapping is monotonic,
+    // we can simply iterate through each segment sequentially
+    for (size_t segnum = 0; segnum < sortedFields.size(); segnum++) {
+      auto* field = sortedFields[segnum];
+      auto& seg = segs[segnum];
+      
+      if (field == nullptr) {
+        // Field didn't exist for this segment
+        // If segment has live docs, field is sparse
+        if (seg.numLive > 0) {
+          isDense = false;
+          // Create docsWriter if needed and write all docs up to base
+          if (!docsWriter) {
+            docsWriter = pool.make_unique_align<DocsWithValWriter>(8, pool, postingsWriter, outputFieldInfo);
+            for (int32_t i = 0; i < docsWithField; i++) {
+              docsWriter->startDoc(i);
+            }
+          }
+        }
+        continue;
+      }
+      
+      assert(field->seg == &seg);
+      
+      StrColReader reader(*field->seg->postingsReader, field->segFieldInfo);
+      StrColReader::Iterator iter(reader);
+      
+      // Check if this segment's field is sparse
+      if (reader.docsReader().hasBitset() && !docsWriter) {
+        isDense = false;
+        docsWriter = pool.make_unique_align<DocsWithValWriter>(8, pool, postingsWriter, outputFieldInfo);
+        // Backfill all docs written so far
+        for (int32_t i = 0; i < docsWithField; i++) {
+          docsWriter->startDoc(i);
+        }
+      }
+      
+      for (int32_t localId = iter.advance(0); localId != StrColReader::Iterator::ENDDOC; localId = iter.next()) {
+        auto [mappedDoc, isDeleted] = seg.remapDocId(localId);
+        
+        if (isDeleted) {
+          continue;  // Skip deleted documents
+        }
+        
+        // sanity check
+        assert(!isDense || mappedDoc == docsWithField);
+        
+        // Get and write the string value
+        std::string_view value = iter.value();
+        int32_t valueSize = (int32_t)value.size();
+        valuesOut->write(value.data(), valueSize);
+        cumulativeLength += valueSize;
+        
+        minSize = std::min(minSize, valueSize);
+        maxSize = std::max(maxSize, valueSize);
+        
+        // Write cumulative length if variable-sized
+        if (lengthWriter) {
+          lengthWriter->addInt64(cumulativeLength);
+        } else if (docsWithField > 0 && valueSize != minSize) {
+          // First time we see a different size - need to start writing lengths
+          monoOut.emplace(postingsWriter.getOutputStream());
+          lengthWriter = pool.make_unique_align<MonoWriter>(8, pool, *monoOut->get());
+          // Write all previous cumulative lengths (all were minSize)
+          // Note: cumulativeLength already includes the current value
+          for (int32_t i = 1; i <= docsWithField; i++) {
+            lengthWriter->addInt64((int64_t)minSize * i);
+          }
+          // Now write the current cumulative length (which includes the different-sized value)
+          lengthWriter->addInt64(cumulativeLength);
+        }
+        
+        if (docsWriter) {
+          docsWriter->startDoc(mappedDoc);
+        }
+        
+        docsWithField++;
+      }
+    }
+    
+    // Check if we have any values at all
+    if (docsWithField == 0) {
+      outputFieldInfo.docsWithField = 0;
+      outputFieldInfo.columnMetaOff = 0;
+      return;
+    }
+    
+    // Finish writing column data
+    valuesOut->flush(true);
+    outputFieldInfo.columnMetaOff = valuesOut->size() - outputFieldInfo.columnLoc.offset();
+    
+    // Handle lengths/mono column
+    if (lengthWriter) {
+      // Variable-size strings - finish writing lengths
+      lengthWriter->finish();
+      outputFieldInfo.monoLoc = lengthWriter->blockLoc;
+      outputFieldInfo.monoMetaOff = lengthWriter->metaOff;
+    } else {
+      // Fixed-size optimization - store size in monoMetaOff
+      outputFieldInfo.monoLoc = {0, 0};
+      outputFieldInfo.monoMetaOff = minSize;
+    }
+    
+    // Set the number of docs with field
+    outputFieldInfo.docsWithField = docsWithField;
+    
+    // Finish docs-with-value
+    if (docsWriter) {
+      assert(docsWriter->numAdded() == docsWithField);
+      if (docsWriter->numAdded() == postingsWriter.getMaxDoc()) {
+        docsWriter->finishDense(postingsWriter.getMaxDoc());
+      } else {
+        docsWriter->finish();
+      }
+    } else {
+      // All docs have values (dense)
+      outputFieldInfo.docsWithFieldEndLoc = {0, 0};
+    }
+  }
+
   void mergeIntCol2(std::span<MergeFieldInfo*> sortedFields, PostingsWriter& postingsWriter,
                    PostingsWriter::IndexFieldInfo& outputFieldInfo) {
     assert(sortedFields.size() == segs.size());  // expect non-compacted fields to make the code a little simpler.
