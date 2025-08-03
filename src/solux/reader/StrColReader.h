@@ -1,6 +1,7 @@
 #pragma once
 
 #include <string_view>
+#include <optional>
 #include "DocsReader.h"
 #include "PostingsReader.h"
 #include "IntColReader.h"
@@ -15,8 +16,9 @@ private:
   DocsReader docs;
   InputStream valuesIS;      // Stream for concatenated string values
   const char* valuesData;    // Pointer to concatenated string data
-  MonoReader lengthReader;   // Reader for cumulative lengths
+  std::optional<MonoReader> lengthReader;   // Reader for cumulative lengths (empty for fixed-size)
   int32_t docsWithField = 0;
+  int32_t fixedSize = -1;    // -1 for variable size, >= 0 for fixed size
 
 public:
   /// The fieldInfo is only used in the constructor and can be discarded after.
@@ -24,13 +26,24 @@ public:
     docs(postingsReader, fieldInfo),
     valuesIS(postingsReader.getInputStreamSeek(fieldInfo.columnLoc)),
     valuesData(valuesIS.ptr()),
-    lengthReader(postingsReader, fieldInfo.monoLoc, fieldInfo.monoMetaOff, fieldInfo.docsWithField),
     docsWithField(fieldInfo.docsWithField)
   {
+    if (fieldInfo.monoLoc.offset() == 0 && fieldInfo.monoLoc.filenum() == 0) {
+      // Fixed-size mode: monoLoc is null/zero, size is in monoMetaOff
+      fixedSize = (int32_t)fieldInfo.monoMetaOff;
+    } else {
+      // Variable-size mode: create MonoReader
+      lengthReader.emplace(postingsReader, fieldInfo.monoLoc, fieldInfo.monoMetaOff, fieldInfo.docsWithField);
+    }
   }
 
   DocsReader& docsReader() {
     return docs;
+  }
+
+  // get underlying endRankReader, null if all values have the same size.
+  MonoReader* getEndRankReader() {
+    return lengthReader ? &(*lengthReader) : nullptr;
   }
 
   int32_t docsWithValue() const {
@@ -41,8 +54,15 @@ public:
   /// Returns empty string_view if rank is out of bounds.
   std::string_view valueAt(int32_t rank) const {
     assert(rank >= 0 && rank < docsWithField);
-    auto [startOffset, endOffset] = lengthReader.valuesAt(rank);
-    return std::string_view(valuesData + startOffset, endOffset - startOffset);
+    if (fixedSize >= 0) {
+      // Fixed-size mode: direct offset calculation
+      int64_t startOffset = (int64_t)rank * fixedSize;
+      return std::string_view(valuesData + startOffset, fixedSize);
+    } else {
+      // Variable-size mode: use MonoReader
+      auto [startOffset, endOffset] = lengthReader->valuesAt(rank);
+      return std::string_view(valuesData + startOffset, endOffset - startOffset);
+    }
   }
 
   /// Iterator over documents with string values.

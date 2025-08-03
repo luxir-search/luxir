@@ -313,6 +313,7 @@ TEST_F(StrColTest, deleteAndMergeMultiValued) {
   ASSERT_EQ(-1, f.nextDoc());
 }
 
+
 TEST_F(StrColTest, strColReaderBasic) {
   // Test StrColReader for column-only string storage
   TestIndex testIndex;
@@ -388,5 +389,51 @@ TEST_F(StrColTest, strColReaderBasic) {
   ASSERT_EQ("", results[2].second);
   ASSERT_EQ(5, results[3].first);
   ASSERT_EQ("Final document with a longer description text", results[3].second);
+}
+
+
+TEST_F(StrColTest, fixedSizeOptimization) {
+  // Test that fixed-size strings skip the mono column
+  {
+    // All strings same size (10 chars)
+    TestIndex testIndex;
+    TestField f(testIndex, "fixed_sc");
+
+    f.startIndexing();
+    f.add(0, "0123456789");
+    f.add(1, "abcdefghij");
+    f.add(3, "!@#$%^&*()");
+
+    testIndex.flush();
+
+    // Read and verify values
+    testIndex.initReader();
+    auto& segment = testIndex.reader->segments()[0];
+    auto& postingsReader = segment.postingsReader();
+    FieldReader fieldReader(MemPool::threadLocal(), postingsReader);
+    bool found = fieldReader.seek("fixed_sc");
+    ASSERT_TRUE(found);
+
+    SegFieldInfo segFieldInfo;
+    fieldReader.readFieldInfo(segFieldInfo);
+
+    // Test reading with StrColReader
+    StrColReader strReader(postingsReader, segFieldInfo);
+
+    ASSERT_EQ(nullptr, strReader.getEndRankReader());  // No end rank reader for fixed-size strings
+
+    StrColReader::Iterator iter(strReader);
+
+    ASSERT_EQ(0, iter.advance(0));
+    ASSERT_EQ("0123456789", iter.value());
+
+    ASSERT_EQ(1, iter.next());
+    ASSERT_EQ("abcdefghij", iter.value());
+
+    ASSERT_EQ(3, iter.next());
+    ASSERT_EQ("!@#$%^&*()", iter.value());
+
+    ASSERT_EQ(StrColReader::Iterator::ENDDOC, iter.next());
+  }
 }
 

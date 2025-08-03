@@ -109,8 +109,12 @@ public:
 
 
     // write lengths
-    // TODO: special case when all values are the same size.
-    {
+    if (minSize == maxSize) {
+      // All strings have the same size - skip writing mono column
+      // monoLoc remains 0 (default), indicating fixed-size mode
+      fieldInfo.monoMetaOff = minSize;  // Store the fixed element size
+    } else {
+      // Variable size strings - write mono column as before
       auto guard = tmpPool.rewindScopeGuard();
       OutputStreamPtr out = postingsWriter.getOutputStream();
       MonoWriter endRankWriter(tmpPool, *out);

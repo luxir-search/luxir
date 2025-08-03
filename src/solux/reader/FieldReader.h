@@ -5,7 +5,7 @@
 namespace solux {
 struct SegFieldInfo {
   PackedTerm fieldname;
-  FieldType::Type type;  // really only need a byte here
+  FieldType::Type type;
   int32_t flags;  // from FieldType
   seg_location termBlockIndexLoc;  // location of index into the terms blocks
   seg_location termsLoc;
