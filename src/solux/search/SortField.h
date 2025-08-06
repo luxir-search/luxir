@@ -2,6 +2,7 @@
 
 #include "solux/search/FieldComparator.h"
 #include "solux/search/IndexReader.h"
+#include "solux/schema/FieldType.h"
 #include <memory>
 #include <string>
 #include <vector>
@@ -10,16 +11,6 @@ namespace solux {
 
 class SortField {
 public:
-    enum Type {
-        SCORE,
-        DOC,
-        INT,
-        LONG,
-        FLOAT,
-        DOUBLE,
-        STRING
-    };
-    
     enum SortOrder {
         ASC,
         DESC
@@ -27,17 +18,23 @@ public:
     
 private:
     std::string fieldName;
-    Type type;
     SortOrder order;
     FieldComparator::MissingValue missingValue;
+    const FieldType& fieldType_;  // Always required
     
 public:
-    SortField(std::string_view field, Type type, SortOrder order = DESC,
+    // Single constructor that always requires FieldType reference
+    SortField(std::string_view field, const FieldType& fieldType, SortOrder order = DESC,
               FieldComparator::MissingValue missing = FieldComparator::MISSING_LAST)
-        : fieldName(std::string(field)), type(type), order(order), missingValue(missing) {}
+        : fieldName(std::string(field)),
+          order(order),
+          missingValue(missing),
+          fieldType_(fieldType) {}
+    
+public:
     
     const std::string& getFieldName() const { return fieldName; }
-    Type getType() const { return type; }
+    const FieldType& getFieldType() const { return fieldType_; }
     SortOrder getOrder() const { return order; }
     bool isReversed() const { 
         // For ascending order, we want smaller values first (not reversed)
@@ -47,32 +44,49 @@ public:
     FieldComparator::MissingValue getMissingValue() const { return missingValue; }
     
     std::unique_ptr<FieldComparator> createComparator(int numHits, IndexReader* reader = nullptr) const {
-        switch (type) {
-            case INT:
-            case LONG:
+        // Check for special fields
+        if (fieldName == "_score_") {
+            throw std::runtime_error("Score sorting not yet implemented");
+        } else if (fieldName == "_docid_") {
+            throw std::runtime_error("Document ID sorting not yet implemented");
+        }
+        
+        // Handle regular field types based on FieldType
+        switch (const_cast<FieldType&>(fieldType_).type()) {
+            case FieldType::Type::INT:
                 return std::make_unique<SimpleNumericFieldComparator>(
                     fieldName, numHits, isReversed(), missingValue
                 );
-            case STRING: {
-                // For string sorting, we need OrdMap for multi-segment sorting
-                std::shared_ptr<OrdMap> ordMap;
-                if (reader && reader->segments().size() > 1) {
-                    // Build OrdMap for multi-segment case
-                    ordMap = reader->coreIndex().getOrdMap(fieldName);
+                
+            case FieldType::Type::STRING:
+            case FieldType::Type::TEXT: {
+                // Use FieldType information to determine if this is an indexed string field
+                if (const_cast<FieldType&>(fieldType_).isSet(FieldType::INDEX_DOCS)) {
+                    // Use GlobalOrdComparator for indexed string fields
+                    // Build OrdMap only if needed (multi-segment case)
+                    std::shared_ptr<OrdMap> ordMap;
+                    if (reader && reader->segments().size() > 1) {
+                        ordMap = reader->coreIndex().getOrdMap(fieldName);
+                    }
+                    return std::make_unique<GlobalOrdComparator>(
+                        fieldName, ordMap, numHits, isReversed(), missingValue
+                    );
+                } else {
+                    // Use StrColComparator for non-indexed string columns
+                    return std::make_unique<StrColComparator>(
+                        fieldName, numHits, isReversed(), missingValue
+                    );
                 }
-                return std::make_unique<GlobalOrdComparator>(
-                    fieldName, ordMap, numHits, isReversed(), missingValue
-                );
             }
-            case SCORE:
-            case DOC:
-            case FLOAT:
-            case DOUBLE:
-                throw std::runtime_error("Sort type not yet implemented: " + std::to_string(type));
+            
+            case FieldType::Type::FLOAT:
+            case FieldType::Type::DOUBLE:
+                throw std::runtime_error("Float/Double sorting not yet implemented");
+                
             default:
-                throw std::runtime_error("Unknown sort type: " + std::to_string(type));
+                throw std::runtime_error("Unknown field type for sorting: " + 
+                    std::to_string((int)const_cast<FieldType&>(fieldType_).type()));
         }
-        return nullptr;
     }
 };
 

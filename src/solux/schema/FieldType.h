@@ -123,5 +123,17 @@ public:
   }
 };
 
+// Special FieldType for score sorting
+class ScoreFieldType : public FieldType {
+public:
+  ScoreFieldType() : FieldType("_score_", FieldType::FLOAT, 0) {}
+};
+
+// Special FieldType for document ID sorting
+class DocFieldType : public FieldType {
+public:
+  DocFieldType() : FieldType("_docid_", FieldType::INT, 0) {}
+};
+
 
 } // end namespace

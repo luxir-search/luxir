@@ -4,6 +4,7 @@
 #include "solux/reader/PostingsReader.h"
 #include "solux/reader/FieldReader.h"
 #include "solux/reader/IntColReader.h"
+#include "solux/reader/StrColReader.h"
 #include "solux/search/OrdMap.h"
 #include "solux/util/MemPool.h"
 #include <memory>
@@ -324,6 +325,119 @@ public:
   }
   
   ~GlobalOrdComparator() override = default;
+};
+
+// A comparator for non-indexed string columns that compares by value
+class StrColComparator : public FieldComparator {
+  std::string fieldName;
+  std::optional<StrColReader> reader;
+  std::optional<StrColReader::Iterator> iter;
+  std::vector<std::string> values; // Storage for string values
+  int sortMultiplier; // 1 for ascending, -1 for descending
+  std::string missingValueStr;
+  
+public:
+  StrColComparator(const std::string& fieldName, int numHits, bool reversed, MissingValue missingValue)
+    : fieldName(fieldName),
+      values(numHits),
+      sortMultiplier(reversed ? -1 : 1) {
+    
+    // For missing values, use empty string for MISSING_FIRST in ASC (sorts before all others)
+    // or a very high value string for MISSING_LAST in ASC
+    if (missingValue == MISSING_FIRST) {
+      missingValueStr = reversed ? "\xFF\xFF\xFF\xFF" : "";
+    } else {
+      missingValueStr = reversed ? "" : "\xFF\xFF\xFF\xFF";
+    }
+  }
+  
+  void setSegment(int32_t segment, PostingsReader* postingsReader) override {
+    // Reset reader and iterator
+    reader.reset();
+    iter.reset();
+    
+    if (!postingsReader) return;
+    
+    auto poolGuard = MemPool::threadLocalPoolGuard();
+    FieldReader fieldReader(poolGuard.pool(), *postingsReader);
+    if (fieldReader.seek(fieldName)) {
+      SegFieldInfo fieldInfo;
+      fieldReader.readFieldInfo(fieldInfo);
+      if (fieldInfo.columnLoc.offset() > 0) {
+        reader.emplace(*postingsReader, fieldInfo);
+        iter.emplace(*reader);
+      }
+    }
+  }
+  
+  std::string_view getDocValue(int32_t docid) {
+    if (!iter.has_value()) {
+      return missingValueStr;
+    }
+    
+    // Advance iterator to docid if needed
+    if (iter->docId() < docid) {
+      int32_t foundDoc = iter->advance(docid);
+      if (foundDoc == StrColReader::Iterator::ENDDOC || foundDoc > docid) {
+        return missingValueStr;
+      }
+    } else if (iter->docId() > docid) {
+      return missingValueStr;
+    }
+    
+    return iter->value();
+  }
+  
+  int compare(int32_t slotA, segdoc docA, int32_t slotB, segdoc docB) override {
+    assert(slotA >= 0 && slotA < (int32_t)values.size());
+    assert(slotB >= 0 && slotB < (int32_t)values.size());
+    const auto& valA = values[slotA];
+    const auto& valB = values[slotB];
+    int cmp = valA.compare(valB);
+    return sortMultiplier * cmp;
+  }
+  
+  int compareBottom(int32_t bottomSlot, segdoc bottomDoc, segdoc newDoc) override {
+    assert(bottomSlot >= 0 && bottomSlot < (int32_t)values.size());
+    const auto& bottomVal = values[bottomSlot];
+    std::string_view newVal = getDocValue(newDoc.docId());
+    int cmp = bottomVal.compare(newVal);
+    return sortMultiplier * cmp;
+  }
+  
+  void copy(int32_t slot, segdoc doc) override {
+    assert(slot >= 0 && slot < (int32_t)values.size());
+    values[slot] = std::string(getDocValue(doc.docId()));
+  }
+  
+  int64_t getComparableValue(int32_t slot) const override {
+    // String comparator can't easily return a single comparable value
+    // Return 0 as placeholder
+    return 0;
+  }
+  
+  int compare(int32_t slotA, segdoc docA, FieldComparator& other, int32_t slotB, segdoc docB) override {
+    assert(dynamic_cast<StrColComparator*>(&other) != nullptr);
+    auto* otherStr = static_cast<StrColComparator*>(&other);
+    
+    assert(slotA >= 0 && slotA < (int32_t)values.size());
+    assert(slotB >= 0 && slotB < (int32_t)otherStr->values.size());
+    const auto& valA = values[slotA];
+    const auto& valB = otherStr->values[slotB];
+    int cmp = valA.compare(valB);
+    return sortMultiplier * cmp;
+  }
+  
+  void copy(int32_t slot, FieldComparator& other, int32_t otherSlot, segdoc otherDoc) override {
+    assert(dynamic_cast<StrColComparator*>(&other) != nullptr);
+    auto* otherStr = static_cast<StrColComparator*>(&other);
+    
+    assert(slot >= 0 && slot < (int32_t)values.size());
+    assert(otherSlot >= 0 && otherSlot < (int32_t)otherStr->values.size());
+    values[slot] = otherStr->values[otherSlot];
+  }
+  
+  ~StrColComparator() override = default;
 };
 
 } // namespace solux

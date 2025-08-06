@@ -3,6 +3,7 @@
 #include "SearchOp.h"
 #include "solux/query/Query.h"
 #include "solux/reader/IntColReader.h"
+#include "solux/reader/StrColReader.h"
 #include "solux/search/Collector.h"
 #include "solux/search/FieldSortCollector.h"
 #include "solux/search/SortField.h"
@@ -242,41 +243,29 @@ public:
     // Parse sort fields from protobuf
     if (topDocsProto.sorts_size() > 0) {
       useFieldSort = true;
+      // Static instances of special field types
+      static ScoreFieldType scoreType;
+      static DocFieldType docType;
+      
       for (const auto& sortSpec : topDocsProto.sorts()) {
-        SortField::Type type;
-        
-        // Check for special fields first
-        if (sortSpec.field() == "_score_") {
-            type = SortField::SCORE;
-        } else if (sortSpec.field() == "_docid_") {
-            type = SortField::DOC;
-        } else {
-            // Look up field type in schema
-            auto& fieldType = *req.schema->getFieldTypeEx(sortSpec.field());
-            switch (fieldType.type()) {
-              case FieldType::Type::INT:
-                type = SortField::INT;
-                break;
-              case FieldType::Type::STRING:
-                type = SortField::STRING;
-                break;
-              case FieldType::Type::FLOAT:
-                // TODO: Add float comparator support
-                type = SortField::INT; // Fallback for now
-                break;
-              case FieldType::Type::DOUBLE:
-                // TODO: Add double comparator support
-                type = SortField::INT; // Fallback for now
-                break;
-              default:
-                throw std::runtime_error(std::string("Cannot sort by field type: ") + std::string(sortSpec.field()));
-            }
-        }
-        
         SortField::SortOrder order = sortSpec.dir() == proto::SortSpec::DESC ? 
           SortField::DESC : SortField::ASC;
         FieldComparator::MissingValue missing = FieldComparator::MISSING_LAST;
-        sortFields.emplace_back(sortSpec.field(), type, order, missing);
+        
+        // Check for special fields first
+        if (sortSpec.field() == "_score_") {
+            sortFields.emplace_back(sortSpec.field(), scoreType, order, missing);
+        } else if (sortSpec.field() == "_docid_") {
+            sortFields.emplace_back(sortSpec.field(), docType, order, missing);
+        } else {
+            // Look up field type in schema and use new constructor
+            auto fieldTypePtr = req.schema->getFieldTypeEx(sortSpec.field());
+            if (!fieldTypePtr) {
+                throw std::runtime_error(std::string("Field not found in schema: ") + std::string(sortSpec.field()));
+            }
+            // Use the new constructor that accepts FieldType for better comparator selection
+            sortFields.emplace_back(sortSpec.field(), *fieldTypePtr, order, missing);
+        }
       }
     }
   }
@@ -618,8 +607,6 @@ public:
 
 
     // iterate over the segment runs, loading values for each segment (possibly in a new task)
-    // much of this code will be the same as loading the IntCol, but we are retrieving ords
-    // and need to look them up.
     int32_t start = 0;
     for(auto runlen : segRunLength) {
       auto idxSpan = sortedIdx.subspan(start, runlen);
@@ -642,24 +629,41 @@ public:
         }
         SegFieldInfo segFieldInfo;
         fieldReader.readFieldInfo(segFieldInfo);
-        // we need the terms enum to lookup the string value for each ord
-        TermsEnum tenum(poolGuard.pool(), postingsReader, segFieldInfo);
-
+        
+        // Check if this is an indexed string field or a column-only field
+        bool isIndexedString = (segFieldInfo.flags & FieldType::INDEX_DOCS) != 0;
+        
         if (!fieldType.multiValued()) {
-          // callback handler to convert ord to string and to put values back in the correct slot.
-          auto valHandler = [&](size_t idx, int32_t doc, int64_t val) {
-            assert(segDocs[idxSpan[idx]].docId() == doc && val > 0);
-            // translate back to the original index
-            // TODO: we could introduce a cache here to avoid repeated lookups for the same term.
-            // it could be map<int64_t, string_view or string*> since the protobuf values won't be moving around.
-            tenum.seekOrd((int32_t) val - 1);  // term ords are 0 based.
-            // LHS is a std::string&, so this makes a copy (which we need to do since tenum.term() will soon be invalidated.)
-            *starget[idxSpan[idx]] = (std::string_view) tenum.term();
-          };
+          if (isIndexedString) {
+            // Indexed string field - load ordinals and look up strings
+            // we need the terms enum to lookup the string value for each ord
+            TermsEnum tenum(poolGuard.pool(), postingsReader, segFieldInfo);
+            
+            // callback handler to convert ord to string and to put values back in the correct slot.
+            auto valHandler = [&](size_t idx, int32_t doc, int64_t val) {
+              assert(segDocs[idxSpan[idx]].docId() == doc && val > 0);
+              // translate back to the original index
+              // TODO: we could introduce a cache here to avoid repeated lookups for the same term.
+              // it could be map<int64_t, string_view or string*> since the protobuf values won't be moving around.
+              tenum.seekOrd((int32_t) val - 1);  // term ords are 0 based.
+              // LHS is a std::string&, so this makes a copy (which we need to do since tenum.term() will soon be invalidated.)
+              *starget[idxSpan[idx]] = (std::string_view) tenum.term();
+            };
 
-          IntColReader::getSingleValues(poolGuard.pool(), postingsReader, segFieldInfo, sortedDocs, valHandler);
+            IntColReader::getSingleValues(poolGuard.pool(), postingsReader, segFieldInfo, sortedDocs, valHandler);
+          } else {
+            // Non-indexed string column - load values directly from StrColReader
+            auto valHandler = [&](size_t idx, int32_t doc, std::string_view val) {
+              assert(segDocs[idxSpan[idx]].docId() == doc);
+              *starget[idxSpan[idx]] = std::string(val);
+            };
+            
+            StrColReader::getValues(poolGuard.pool(), postingsReader, segFieldInfo, sortedDocs, valHandler);
+          }
         } else {
-          // multi-valued handling
+          // multi-valued handling - currently only supports indexed strings
+          // TODO: Add support for multi-valued non-indexed string columns if needed
+          TermsEnum tenum(poolGuard.pool(), postingsReader, segFieldInfo);
           auto valHandler = [&](size_t idx, int32_t doc, int64_t val, int64_t valIdx, int64_t numVals) {
             assert(segDocs[idxSpan[idx]].docId() == doc && val > 0);
             solux::proto::ArrStr& target = *mtarget[idxSpan[idx]];

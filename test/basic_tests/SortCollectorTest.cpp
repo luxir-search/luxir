@@ -5,6 +5,7 @@
 #include "solux/search/FieldSortCollector.h"
 // #include "solux/search/FieldSortCollector2.h"
 #include "solux/search/SortField.h"
+#include "solux/schema/FieldType.h"
 #include "solux/util/random.h"
 #include <charconv>
 #include <algorithm>
@@ -77,7 +78,9 @@ TEST_F(SortCollectorTest, smallEdge) {
 
   auto reader = helper.getIndexWriter()->getIndexReader();
 
-  SortField sf("price_i", SortField::INT, SortField::ASC);
+  // Create a mock IntFieldType for testing
+  IntFieldType priceType("price_i");
+  SortField sf("price_i", priceType, SortField::ASC);
 
   auto collect = [&](FieldSortCollector& collector, int32_t seg) {
     auto* postingsReader = &reader->segments()[seg].postingsReader();
@@ -164,7 +167,9 @@ TEST_F(SortCollectorTest, randomSmall) {
   CollectionHelper helper;
   helper.clear();
 
-  SortField sf("price_i", SortField::INT, SortField::ASC);
+  // Create a mock IntFieldType for testing
+  IntFieldType priceType("price_i");
+  SortField sf("price_i", priceType, SortField::ASC);
 
   for (int iter=0; iter<iterations; iter++) {
     auto seed = rng();
@@ -990,6 +995,149 @@ TEST_F(SortCollectorTest, DeterministicParallelSort) {
   for (size_t i = 1; i < fingerprints.size(); i++) {
     ASSERT_EQ(fingerprints[0], fingerprints[i]) 
       << "Run " << i << " produced different results (fingerprint mismatch)";
+  }
+}
+
+TEST_F(SortCollectorTest, SortByNonIndexedStringColumn) {
+  CollectionHelper helper;
+  helper.clear();
+  
+  // Add documents with both indexed string fields (_s) and non-indexed string columns (_sc)
+  helper.index(flatdoc("id_s", "doc1", "name_s", "charlie", "description_sc", "third person"), UpdateMessage::NO_COMMIT);
+  helper.index(flatdoc("id_s", "doc2", "name_s", "alice", "description_sc", "first person"), UpdateMessage::NO_COMMIT);
+  helper.index(flatdoc("id_s", "doc3", "name_s", "bob", "description_sc", "second person"), UpdateMessage::COMMIT);
+  
+  // Add more documents to create a second segment
+  helper.index(flatdoc("id_s", "doc4", "name_s", "david", "description_sc", "fourth person"), UpdateMessage::NO_COMMIT);
+  helper.index(flatdoc("id_s", "doc5", "name_s", "alice", "description_sc", "first duplicate"), UpdateMessage::COMMIT);
+  
+  // Test sorting by indexed string field (name_s)
+  {
+    auto* lreq = LocalReq::create(soluxNode->getSearchEngine());
+    lreq->proto.mutable_collection()->add_name("main");
+    
+    auto& ops = *lreq->proto.mutable_ops();
+    auto& topDocs = *ops["q"].mutable_top_docs();
+    topDocs.set_get_number(true);
+    topDocs.set_limit(10);
+    topDocs.mutable_query()->set_all(true);
+    
+    // Sort by indexed string field
+    auto* sortSpec = topDocs.add_sorts();
+    sortSpec->set_field("name_s");
+    sortSpec->set_dir(proto::SortSpec::ASC);
+    
+    topDocs.mutable_fields()->Add("id_s");
+    topDocs.mutable_fields()->Add("name_s");
+    
+    lreq->engine.submit(*lreq, true);
+    
+    auto& docs = lreq->responses[0]->proto.ops().at("q").docs();
+    ASSERT_EQ(5, docs.matches());
+    
+    auto& idCol = docs.columns().at("id_s").col_s();
+    auto& nameCol = docs.columns().at("name_s").col_s();
+    
+    // Verify sort order: alice, alice, bob, charlie, david
+    ASSERT_EQ("alice", nameCol.v(0));
+    ASSERT_EQ("alice", nameCol.v(1));
+    ASSERT_EQ("bob", nameCol.v(2));
+    ASSERT_EQ("charlie", nameCol.v(3));
+    ASSERT_EQ("david", nameCol.v(4));
+    
+    lreq->done();
+  }
+  
+  // Test sorting by non-indexed string column (description_sc)
+  {
+    auto* lreq = LocalReq::create(soluxNode->getSearchEngine());
+    lreq->proto.mutable_collection()->add_name("main");
+    
+    auto& ops = *lreq->proto.mutable_ops();
+    auto& topDocs = *ops["q"].mutable_top_docs();
+    topDocs.set_get_number(true);
+    topDocs.set_limit(10);
+    topDocs.mutable_query()->set_all(true);
+    
+    // Sort by non-indexed string column
+    auto* sortSpec = topDocs.add_sorts();
+    sortSpec->set_field("description_sc");
+    sortSpec->set_dir(proto::SortSpec::ASC);
+    
+    topDocs.mutable_fields()->Add("id_s");
+    topDocs.mutable_fields()->Add("description_sc");
+    
+    lreq->engine.submit(*lreq, true);
+    
+    auto& docs = lreq->responses[0]->proto.ops().at("q").docs();
+    ASSERT_EQ(5, docs.matches());
+    
+    auto& idCol = docs.columns().at("id_s").col_s();
+    auto& descCol = docs.columns().at("description_sc").col_s();
+    
+    // Verify sort order by description: "first duplicate", "first person", "fourth person", "second person", "third person"
+    ASSERT_EQ("first duplicate", descCol.v(0));
+    ASSERT_EQ("doc5", idCol.v(0));
+    
+    ASSERT_EQ("first person", descCol.v(1));
+    ASSERT_EQ("doc2", idCol.v(1));
+    
+    ASSERT_EQ("fourth person", descCol.v(2));
+    ASSERT_EQ("doc4", idCol.v(2));
+    
+    ASSERT_EQ("second person", descCol.v(3));
+    ASSERT_EQ("doc3", idCol.v(3));
+    
+    ASSERT_EQ("third person", descCol.v(4));
+    ASSERT_EQ("doc1", idCol.v(4));
+    
+    lreq->done();
+  }
+  
+  // Test descending sort on non-indexed string column
+  {
+    auto* lreq = LocalReq::create(soluxNode->getSearchEngine());
+    lreq->proto.mutable_collection()->add_name("main");
+    
+    auto& ops = *lreq->proto.mutable_ops();
+    auto& topDocs = *ops["q"].mutable_top_docs();
+    topDocs.set_get_number(true);
+    topDocs.set_limit(10);
+    topDocs.mutable_query()->set_all(true);
+    
+    // Sort by non-indexed string column descending
+    auto* sortSpec = topDocs.add_sorts();
+    sortSpec->set_field("description_sc");
+    sortSpec->set_dir(proto::SortSpec::DESC);
+    
+    topDocs.mutable_fields()->Add("id_s");
+    topDocs.mutable_fields()->Add("description_sc");
+    
+    lreq->engine.submit(*lreq, true);
+    
+    auto& docs = lreq->responses[0]->proto.ops().at("q").docs();
+    ASSERT_EQ(5, docs.matches());
+    
+    auto& idCol = docs.columns().at("id_s").col_s();
+    auto& descCol = docs.columns().at("description_sc").col_s();
+    
+    // Verify descending sort order
+    ASSERT_EQ("third person", descCol.v(0));
+    ASSERT_EQ("doc1", idCol.v(0));
+    
+    ASSERT_EQ("second person", descCol.v(1));
+    ASSERT_EQ("doc3", idCol.v(1));
+    
+    ASSERT_EQ("fourth person", descCol.v(2));
+    ASSERT_EQ("doc4", idCol.v(2));
+    
+    ASSERT_EQ("first person", descCol.v(3));
+    ASSERT_EQ("doc2", idCol.v(3));
+    
+    ASSERT_EQ("first duplicate", descCol.v(4));
+    ASSERT_EQ("doc5", idCol.v(4));
+    
+    lreq->done();
   }
 }
 
