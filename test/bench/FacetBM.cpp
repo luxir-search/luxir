@@ -56,15 +56,18 @@ static void BM_Facet(benchmark::State& state, int64_t nDocs, std::string_view sh
     }
     topDocs.set_get_number(true);
     topDocs.set_get_scores(false);
+
     // add the field we want to facet
-    auto& facet = *ops["f"].mutable_field_facet();
+    auto& topDocsOps = *topDocs.mutable_ops();
+    auto& facet = *topDocsOps["f"].mutable_field_facet();
     facet.set_field(ffield);
     facet.set_limit(5);
 
     lreq->engine.submit(*lreq, para);
     // LOG_DEBUG("ENGINE REQ: {}", lreq->toString());
     // add all the facet counts into the fingerprint "ret"
-    auto& facetResult = lreq->responses[0]->proto.ops().at("f").facet();
+    // auto& facetResult = lreq->responses[0]->proto.ops().at("f").facet();  // top level facets
+    auto& facetResult = lreq->responses[0]->proto.ops().at("q").docs().ops().at("f").facet();
     auto& counts = facetResult.counts();
     if (facetResult.bucket_ids().has_col_i()) {
       auto& bucketIds = facetResult.bucket_ids().col_i();

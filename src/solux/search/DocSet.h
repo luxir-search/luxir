@@ -113,5 +113,43 @@ public:
   }
 };
 
+class DocSetBuilder {
+public:
+  int32_t max;
+  std::vector<int32_t> docs;
+  std::optional<RAMBitDocSet> bitDocs;
+  DocSetBuilder(int32_t max) : max(max) {
+    docs.reserve(max);
+  }
+
+  void add(int32_t docid) {
+    if (bitDocs.has_value()) {
+      bitDocs->mutableBits().set(docid);
+      bitDocs->setCard(bitDocs->card() + 1);
+      return;
+    }
+    if (docs.size() * 32 < max) {
+      docs.emplace_back(docid);
+      return;
+    }
+    bitDocs.emplace(max);
+    for (auto d : docs) {
+      bitDocs->mutableBits().set(d);
+    }
+    bitDocs->mutableBits().set(docid);
+    bitDocs->setCard(docs.size() + 1);
+    docs.clear();
+    docs.shrink_to_fit();
+  }
+
+  std::unique_ptr<DocSet> build() {
+    if (bitDocs.has_value()) {
+      return std::make_unique<RAMBitDocSet>(std::move(*bitDocs));
+    }
+    docs.shrink_to_fit();
+    return std::make_unique<ArrDocSet>(std::move(docs));
+  }
+};
+
 
 }
