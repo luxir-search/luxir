@@ -121,3 +121,7 @@ SOLUX_BENCHMARK_CAPTURE(BM_Facet, short_u1m_s,       nDocs, shape, "all", "short
 SOLUX_BENCHMARK_CAPTURE(BM_Facet, short_u1m_s_para,  nDocs, shape, "all", "short_u1m_s", true);
 SOLUX_BENCHMARK_CAPTURE(BM_Facet, med_u1m_s,         nDocs, shape, "all", "med_u1m_s", false);
 SOLUX_BENCHMARK_CAPTURE(BM_Facet, med_u1m_s_para,    nDocs, shape, "all", "med_u1m_s", true);
+
+// test tiny domain
+SOLUX_BENCHMARK_CAPTURE(BM_Facet, tinyD_u10_i,            nDocs, shape, "short_u1m_s", "u10_i", false);
+SOLUX_BENCHMARK_CAPTURE(BM_Facet, tinyD_u10_i,            nDocs, shape, "short_u1m_s", "u10_i", true);
