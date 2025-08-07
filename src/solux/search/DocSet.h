@@ -6,7 +6,10 @@
 using namespace screaming;
 namespace solux {
 
+class DocSetBuilder;
+
 class DocSet {
+  friend DocSetBuilder;
 protected:
   int32_t card_ = -1;
   virtual int32_t calcCard(){ return -1;};
@@ -104,13 +107,24 @@ public:
 class ArrDocSet : public DocSet {
 protected:
   std::vector<int32_t> docs_;
+
+  int32_t calcCard() override {
+    return static_cast<int32_t>(docs_.size());
+  }
+
 public:
-  ArrDocSet(std::vector<int32_t> docs) : docs_(std::move(docs)) {
+  ArrDocSet(std::vector<int32_t>&& docs) : docs_(std::move(docs)) {
     card_ = static_cast<int32_t>(docs_.size());
   }
   std::span<int32_t> docs() {
     return docs_;
   }
+
+  bool get(int32_t docid) const override {
+    // do a binary search for the docid
+    return std::binary_search(docs_.begin(), docs_.end(), docid);
+  }
+
 };
 
 class DocSetBuilder {
@@ -125,7 +139,7 @@ public:
   void add(int32_t docid) {
     if (bitDocs.has_value()) {
       bitDocs->mutableBits().set(docid);
-      bitDocs->setCard(bitDocs->card() + 1);
+      bitDocs->card_++;
       return;
     }
     if (docs.size() * 32 < max) {
