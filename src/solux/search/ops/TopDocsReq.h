@@ -144,13 +144,10 @@ public:
 
         BitDocSet* bitDocs = (BitDocSet*)domain;  // assume bitDocs for now.
         auto* domainBits = bitDocs ? &bitDocs->bits() : nullptr;
-        FixedBitSet* outDomain = nullptr;
+        std::optional<DocSetBuilder> builder;
         if (output.size() > 0) {
-          auto docset = std::make_unique<RAMBitDocSet>(seg.maxDoc());
-          outDomain = &docset->mutableBits();
-          output[segnum] = std::move(docset);
+          builder.emplace(seg.maxDoc());
         }
-        int32_t segMatches = 0;
 
         // TODO: special-case matchAllDocs query for producing the output domain.
 
@@ -166,12 +163,11 @@ public:
               if (domainBits && !domainBits->get(doc)) {
                 continue;
               }
-              if (outDomain) {
-                outDomain->set(doc);
+              if (builder.has_value()) {
+                builder->add(doc);
               }
               auto score = scorer->score();
               collector.collect(segnum, doc, score);
-              segMatches++;
             }
           } else {
             auto& collector = *data->scoreCollector;
@@ -183,17 +179,18 @@ public:
               if (domainBits && !domainBits->get(doc)) {
                 continue;
               }
-              if (outDomain) {
-                outDomain->set(doc);
+              if (builder.has_value()) {
+                builder->add(doc);
               }
               auto score = scorer->score();
               collector.collect(segnum, doc, score);
-              segMatches++;
             }
           }
         }
+        if (builder.has_value()) {
+          output[segnum] = std::move(builder->build());
+        }
       }
-
       // For maximum parallelism, we want to launch sub-tasks that depend on matching documents
       // as soon as we have that set.  Releasing the collector below could end up
       // doing a substantial amount of work.

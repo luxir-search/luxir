@@ -74,8 +74,15 @@ public:
   // segFieldInfo is passed in uninitializsed and filled in if the field exists in the segment.
   // The value returned is if the field exists in the segment.
   bool facetSegIntCol(DocSet* domain, int32_t segnum, int64_t& missing_num, SegFieldInfo& segFieldInfo, auto&& callback) {
-    BitDocSet* bitDocs = (BitDocSet*) domain;
-    auto* domainBits = bitDocs ? &bitDocs->bits() : nullptr;
+    BitDocSet* bitDocs = nullptr;
+    ArrDocSet* arrDocs = nullptr;
+    if (domain) {
+      if (domain->type == DocSet::Type::BITSET) {
+        bitDocs = (BitDocSet*) domain;
+      } else if (domain->type == DocSet::Type::ARRAY) {
+        arrDocs = (ArrDocSet*) domain;
+      }
+    }
 
     auto& postingsReader = reader.segments()[segnum].postingsReader();
     int32_t maxDoc = postingsReader.maxDoc();
@@ -83,8 +90,8 @@ public:
     FieldReader fieldReader(poolGuard.pool(), postingsReader);
     bool found = fieldReader.seek(fieldName);
     if (!found) {
-      if (bitDocs) {
-        missing_num += bitDocs->card();
+      if (domain) {
+        missing_num += domain->card();
       } else {
         missing_num += maxDoc;
       }
@@ -95,10 +102,8 @@ public:
     // and accumulate counts per value.
     IntColReader intColReader(postingsReader, segFieldInfo);
     IntColReader::Iterator intColIter(intColReader);
-    for (int32_t docid = 0; docid < maxDoc; docid++) {
-      if (bitDocs && !bitDocs->get(docid)) {
-        continue;
-      }
+
+    auto collect = [&](int32_t docid) {
       if (intColIter.docId() < docid ) {
         intColIter.advance(docid);
       }
@@ -116,6 +121,20 @@ public:
         }
       } else {
         missing_num++;
+      }
+    };
+
+
+    if (arrDocs) {
+      for (auto doc : arrDocs->docs()) {
+        collect(doc);
+      }
+    } else {
+      for (int32_t docid = 0; docid < maxDoc; docid++) {
+        if (bitDocs && !bitDocs->get(docid)) {
+          continue;
+        }
+        collect(docid);
       }
     }
     return true;
@@ -754,7 +773,7 @@ public:
         }
         for (size_t segnum = 0; segnum < input.size(); segnum++) {
           SegFieldInfo segFieldInfo;
-          FalseDocSet emptyDomain;
+          ArrDocSet emptyDomain({});
           DocSet* newDomain = &emptyDomain;  // NOTE - points to stack object
           auto& postingsReader = thisOp().reader.segments()[segnum].postingsReader();
           int32_t maxDoc = postingsReader.maxDoc();

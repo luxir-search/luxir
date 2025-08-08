@@ -15,6 +15,14 @@ protected:
   virtual int32_t calcCard(){ return -1;};
 
 public:
+  enum Type {
+    ARRAY = 0,
+    BITSET = 1
+  };
+  const Type type;
+
+  DocSet(Type type): type(type) {}
+
   /// returns the cardinality, which may involve calculating it first if it's not already known.
   int32_t card() {
     if (card_ == -1) {
@@ -37,31 +45,6 @@ public:
   virtual ~DocSet() = default;
 };
 
-/// All bits are set (contains all docs).
-class TrueDocSet : public DocSet {
-public:
-  TrueDocSet(int32_t size) {
-    card_ = size; // all docs are present
-  }
-
-  bool get(int32_t docid) const override {
-    return true; // all docs are present
-  };
-};
-
-/// No bits are set (contains no docs).
-class FalseDocSet : public DocSet {
-public:
-  FalseDocSet() {
-    card_ = 0; // no docs are present
-  }
-
-  bool get(int32_t docid) const override {
-    return false; // no docs are present
-  };
-};
-
-
 /// non-owning BitDocSet
 /// Used for segment liveDocs.
 class BitDocSet : public DocSet {
@@ -69,10 +52,10 @@ protected:
   FixedBitSet bits_; // non-owning bitset
 
 public:
-  BitDocSet(FixedBitSet bits) : bits_(bits) {
+  BitDocSet(FixedBitSet bits) : DocSet(BITSET), bits_(bits) {
   }
 
-  BitDocSet(FixedBitSet bits, int32_t card) : bits_(bits) {
+  BitDocSet(FixedBitSet bits, int32_t card) : DocSet(BITSET), bits_(bits) {
     card_ = card;
   }
 
@@ -98,6 +81,24 @@ public:
 
   RAMBitDocSet(FixedBitSet bits) : BitDocSet(bits) {}
 
+  RAMBitDocSet(RAMBitDocSet&& other) noexcept : BitDocSet(std::move(other.bits_)) {
+    card_ = other.card_;
+    other.bits_.words = nullptr;
+    other.card_ = -1; // invalidate the moved-from object
+  }
+/*
+  RAMBitDocSet& operator=(RAMBitDocSet&& other) noexcept {
+    if (this != &other) {
+      bits_ = other.bits_;
+      bits_.words = other.bits_.words;
+      card_ = other.card_;
+      other.bits_.words = nullptr; // invalidate the moved-from object
+      other.card_ = -1;
+    }
+    return *this;
+  }
+  */
+
   ~RAMBitDocSet() override {
     delete[] bits_.words; // free the allocated memory
   }
@@ -113,9 +114,10 @@ protected:
   }
 
 public:
-  ArrDocSet(std::vector<int32_t>&& docs) : docs_(std::move(docs)) {
+  ArrDocSet(std::vector<int32_t>&& docs) : DocSet(ARRAY), docs_(std::move(docs)) {
     card_ = static_cast<int32_t>(docs_.size());
   }
+
   std::span<int32_t> docs() {
     return docs_;
   }
