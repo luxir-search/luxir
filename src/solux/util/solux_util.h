@@ -47,9 +47,22 @@ template<typename F> scope_guard(F&& frv) -> scope_guard<F>;
 #define SOLUX_PACKED_END __pragma(pack(pop))
 #endif
 
+#if defined(__GNUC__)
+#  define SOLUX_INLINE __attribute__((always_inline))
+#  define SOLUX_NOINLINE __attribute__((noinline))
+#  define SOLUX_RESTRICT __restrict
+#elif defined(_MSC_VER)
+#  define SOLUX_INLINE __forceinline
+#  define SOLUX_NOINLINE __declspec(noinline)
+#  define SOLUX_RESTRICT __restrict
+#else
+#  define SOLUX_INLINE
+#  define SOLUX_NOINLINE
+#  define SOLUX_RESTRICT
+#endif
+
 template<typename... Args>
 inline void unused(Args &&...) {}
-
 
 // generic vector ostream
 template<typename T>

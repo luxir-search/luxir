@@ -74,11 +74,12 @@ public:
   // segFieldInfo is passed in uninitializsed and filled in if the field exists in the segment.
   // The value returned is if the field exists in the segment.
   bool facetSegIntCol(DocSet* domain, int32_t segnum, int64_t& missing_num, SegFieldInfo& segFieldInfo, auto&& callback) {
-    BitDocSet* bitDocs = nullptr;
+    const FixedBitSet* bits = nullptr;
     ArrDocSet* arrDocs = nullptr;
     if (domain) {
       if (domain->type == DocSet::Type::BITSET) {
-        bitDocs = (BitDocSet*) domain;
+        BitDocSet* bitDocs = (BitDocSet*) domain;
+        bits = &bitDocs->bits();
       } else if (domain->type == DocSet::Type::ARRAY) {
         arrDocs = (ArrDocSet*) domain;
       }
@@ -103,7 +104,7 @@ public:
     IntColReader intColReader(postingsReader, segFieldInfo);
     IntColReader::Iterator intColIter(intColReader);
 
-    auto collect = [&](int32_t docid) {
+    auto collect = [&](int32_t docid) SOLUX_INLINE {
       if (intColIter.docId() < docid ) {
         intColIter.advance(docid);
       }
@@ -124,14 +125,13 @@ public:
       }
     };
 
-
     if (arrDocs) {
       for (auto doc : arrDocs->docs()) {
         collect(doc);
       }
     } else {
       for (int32_t docid = 0; docid < maxDoc; docid++) {
-        if (bitDocs && !bitDocs->get(docid)) {
+        if (bits && !bits->get(docid)) {
           continue;
         }
         collect(docid);
@@ -194,7 +194,9 @@ solux::proto::Val* getTargetForSub(solux::proto::SearchResponse* searchResponse,
       boost::unordered_flat_map<int64_t, int64_t>& count = mergeableData->counts;
       SegFieldInfo segFieldInfo;
       auto& facetReq = (FacetReq&)getOp();
-      facetReq.facetSegIntCol(domain, segnum, mergeableData->missing_num, segFieldInfo, [&](int32_t docid, int64_t val) {
+      // After facetSegIntCol was upgraded to handle ArrDocSet and BitDocSet, we saw performance degredation of 20-40%.
+      // Forcing inline on the callback lambda here resolved the issue.
+      facetReq.facetSegIntCol(domain, segnum, mergeableData->missing_num, segFieldInfo, [&](int32_t docid, int64_t val) SOLUX_INLINE {
         unused(docid);
         count[val]++;
       });
@@ -400,7 +402,7 @@ public:
       int64_t missing_num = 0;
       auto& facetReq = (FacetReq&)getOp();
       facetReq.facetSegIntCol(domain, segnum, missing_num, segFieldInfo,
-        [&](int32_t docid, int64_t val) {
+        [&](int32_t docid, int64_t val) SOLUX_INLINE {
           unused(docid);
           count[val]++;
         });
@@ -456,7 +458,7 @@ public:
       int64_t missing_num = 0;
       auto& facetReq = (FacetReq&)getOp();
       facetReq.facetSegIntCol(domain, segnum, missing_num, segFieldInfo,
-        [&](int32_t docid, int64_t val) {
+        [&](int32_t docid, int64_t val)SOLUX_INLINE {
           tenum->seekOrd(val - 1);
         std::string_view termView = (std::string_view) tenum->term();
           mergeableData->counts.add((std::string) termView, docid);
@@ -516,7 +518,7 @@ public:
       }
       if (countMap) {
         facetReq.facetSegIntCol(domain, segnum, missing_num, segFieldInfo,
-          [&](int32_t docid, int64_t ord) {
+          [&](int32_t docid, int64_t ord) SOLUX_INLINE {
             unused(docid);
             ord--; // ordMap is zero-based, int columns are one-based
             if (deltas) {
@@ -534,7 +536,7 @@ public:
           }
         }
         facetReq.facetSegIntCol(domain, segnum, missing_num, segFieldInfo,
-          [&](int32_t docid, int64_t ord) {
+          [&](int32_t docid, int64_t ord) SOLUX_INLINE {
             unused(docid);
             ord--; // ordMap is zero-based, int columns are one-based
             if (deltas) {
@@ -569,7 +571,7 @@ public:
         deltas = segtoGlobal.deltas;
       }
       facetReq.facetSegIntCol(domain, segnum, missing_num, segFieldInfo,
-        [&](int32_t docid, int64_t ord) {
+        [&](int32_t docid, int64_t ord) SOLUX_INLINE {
           unused(docid);
           ord--; // ordMap is zero-based, int columns are one-based
           if (deltas) {
@@ -976,7 +978,7 @@ public:
       auto end = thisOp().end;
       auto gap = thisOp().gap;
       auto& facetReq = (FacetReq&)getOp();
-      facetReq.facetSegIntCol(domain, segnum, mergeableData->missing_num, segFieldInfo, [&](int32_t docid, int64_t val) {
+      facetReq.facetSegIntCol(domain, segnum, mergeableData->missing_num, segFieldInfo, [&](int32_t docid, int64_t val) SOLUX_INLINE {
         unused(docid);
         if (val < start || val >= end) {
           return; // value is out of range

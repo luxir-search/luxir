@@ -2,6 +2,7 @@
 #include <vector>
 #include <span>
 #include <solux/util/screaming.h>
+#include <solux/util/solux_util.h>
 
 using namespace screaming;
 namespace solux {
@@ -84,7 +85,6 @@ public:
   RAMBitDocSet(RAMBitDocSet&& other) noexcept : BitDocSet(std::move(other.bits_)) {
     card_ = other.card_;
     other.bits_.words = nullptr;
-    other.card_ = -1; // invalidate the moved-from object
   }
 /*
   RAMBitDocSet& operator=(RAMBitDocSet&& other) noexcept {
@@ -131,16 +131,17 @@ public:
 
 class DocSetBuilder {
 public:
-  int32_t max;
+  const int32_t max;
   std::vector<int32_t> docs;
   std::optional<RAMBitDocSet> bitDocs;
+  FixedBitSet* bits = nullptr;
   DocSetBuilder(int32_t max) : max(max) {
     docs.reserve(max);
   }
 
-  void add(int32_t docid) {
-    if (bitDocs.has_value()) {
-      bitDocs->mutableBits().set(docid);
+  void add(int32_t docid) SOLUX_INLINE {
+    if (bits) {
+      bits->set(docid);
       bitDocs->card_++;
       return;
     }
@@ -149,6 +150,7 @@ public:
       return;
     }
     bitDocs.emplace(max);
+    bits = &bitDocs->mutableBits();
     for (auto d : docs) {
       bitDocs->mutableBits().set(d);
     }
