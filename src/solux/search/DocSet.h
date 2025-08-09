@@ -136,7 +136,7 @@ public:
   std::optional<RAMBitDocSet> bitDocs;
   FixedBitSet* bits = nullptr;
   DocSetBuilder(int32_t max) : max(max) {
-    docs.reserve(max);
+    //docs.reserve(max/32);
   }
 
   void add(int32_t docid) SOLUX_INLINE {

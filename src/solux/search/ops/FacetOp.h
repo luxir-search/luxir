@@ -130,9 +130,15 @@ public:
         collect(doc);
       }
     } else {
-      for (int32_t docid = 0; docid < maxDoc; docid++) {
-        if (bits && !bits->get(docid)) {
-          continue;
+      int32_t docid = -1;
+      while (docid + 1 < maxDoc) {
+        if (bits) {
+          docid = bits->nextSetBit(docid + 1);
+          if (docid >= maxDoc) {
+            break;
+          }
+        } else {
+          docid++;
         }
         collect(docid);
       }
