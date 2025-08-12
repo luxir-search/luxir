@@ -503,11 +503,18 @@ public:
       fieldReader.readFieldInfo(segFieldInfo);
       auto* countVec = std::get_if<MergeableStrFacet::CountVector>(&mergeableData->counts);
       auto* countMap = std::get_if<MergeableStrFacet::OrdHash>(&mergeableData->counts);
+      int32_t domainSize = domain ? domain->card() : maxDoc;
       if (!countVec && !countMap) {
-        int32_t domainSize = domain ? domain->card() : maxDoc;
-        if (domainSize >= (segFieldInfo.nTerms >> 1)) {
+        if (domainSize >= segFieldInfo.nTerms) {
           mergeableData->counts = MergeableStrFacet::CountVector();
           countVec = &std::get<MergeableStrFacet::CountVector>(mergeableData->counts);
+          if (countVec->empty()) {
+            if (thisOp().ordMap) {
+              countVec->resize(thisOp().ordMap->numOrds());
+            } else {
+              countVec->resize(segFieldInfo.nTerms);
+            }
+          }
 
         } else {
           mergeableData->counts = MergeableStrFacet::OrdHash();
@@ -522,7 +529,33 @@ public:
         auto segtoGlobal = thisOp().ordMap->getSegToGlobal(segnum);
         deltas = segtoGlobal.deltas;
       }
-      if (countMap) {
+
+      if (domainSize >= segFieldInfo.nTerms >> 1) {
+        std::vector<int64_t> localCounts(segFieldInfo.nTerms);
+        facetReq.facetSegIntCol(domain, segnum, missing_num, segFieldInfo,
+          [&](int32_t docid, int64_t ord) SOLUX_INLINE {
+            unused(docid);
+            ord--; // ordMap is zero-based, int columns are one-based
+            localCounts[ord]++;
+          });
+
+        for (int i = 0; i < localCounts.size(); i++) {
+          auto count = localCounts[i];
+          auto ord = i;
+          if (count > 0) {
+            if (deltas) {
+              ord += deltas->valueAt(ord);
+            }
+            if (countMap) {
+              (*countMap)[ord] += count;
+            } else {
+              assert(countVec);
+              (*countVec)[ord] += count;
+            }
+          }
+        }
+
+      } else if (countMap) {
         facetReq.facetSegIntCol(domain, segnum, missing_num, segFieldInfo,
           [&](int32_t docid, int64_t ord) SOLUX_INLINE {
             unused(docid);
@@ -534,13 +567,6 @@ public:
           });
       } else {
         assert(countVec);
-        if (countVec->empty()) {
-          if (thisOp().ordMap) {
-            countVec->resize(thisOp().ordMap->numOrds());
-          } else {
-            countVec->resize(segFieldInfo.nTerms);
-          }
-        }
         facetReq.facetSegIntCol(domain, segnum, missing_num, segFieldInfo,
           [&](int32_t docid, int64_t ord) SOLUX_INLINE {
             unused(docid);
