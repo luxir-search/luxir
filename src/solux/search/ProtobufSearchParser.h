@@ -114,8 +114,18 @@ public:
     // limit to actual number of docs in the index (or all if limit == -1)
     int64_t limit = specifiedLimit < 0 ? req.reader->maxDoc() : std::min(specifiedLimit, req.reader->maxDoc());
 
+    std::span<std::pair<std::string_view, Query*>> filters;
+    if (topDocsReq.filter().size() > 0) {
+      filters = req.requestPool.make_span<std::pair<std::string_view, Query*>>(topDocsReq.filter().size());
+      for (int i = 0; i < topDocsReq.filter().size(); i++) {
+        auto& filter = topDocsReq.filter(i);
+        auto* filterQuery = parser.parse(filter.query());
+        filters[i] = {filter.name(), filterQuery};
+      }
+    }
+
     auto* qcontext = google::protobuf::Arena::Create<Query::Context>(&req.arena, req.requestPool, *req.reader);
-    auto* qr = google::protobuf::Arena::Create<TopDocsReq>(&req.arena, req, name, topDocsReq, *qcontext, query, limit);
+    auto* qr = google::protobuf::Arena::Create<TopDocsReq>(&req.arena, req, name, topDocsReq, *qcontext, query, limit, filters);
 
     addSubs(*qr, topDocsReq.ops());
 

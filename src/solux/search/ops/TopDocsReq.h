@@ -22,6 +22,7 @@ public:
   Query* query;
   Query::Weight* weight;
   int64_t topCount; // maximum number of docs to return.
+  std::span<std::pair<std::string_view, Query*>> filters;
   std::vector<SortField> sortFields;
   bool useFieldSort = false;
 
@@ -233,8 +234,9 @@ public:
 
 
   //  req, *qcontext, query, limit
-  TopDocsReq(SearchRequest& req, std::string_view name, const proto::TopDocs& topDocsProto, Query::Context& qcontext, Query* query, int64_t topCount)
-    : SearchOp(req, name), topDocsProto(topDocsProto), qcontext(qcontext), query(query), topCount(topCount) {
+  TopDocsReq(SearchRequest& req, std::string_view name, const proto::TopDocs& topDocsProto, Query::Context& qcontext, Query* query, int64_t topCount,
+    std::span<std::pair<std::string_view, Query*>> filters)
+    : SearchOp(req, name), topDocsProto(topDocsProto), qcontext(qcontext), query(query), topCount(topCount), filters(filters) {
     weight = query->createWeight(qcontext);
     
     // Parse sort fields from protobuf
