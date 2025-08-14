@@ -23,6 +23,7 @@ public:
   Query::Weight* weight;
   int64_t topCount; // maximum number of docs to return.
   std::span<std::pair<std::string_view, Query*>> filters;
+  std::span<Query::Weight*> filterWeights;
   std::vector<SortField> sortFields;
   bool useFieldSort = false;
 
@@ -238,6 +239,17 @@ public:
     std::span<std::pair<std::string_view, Query*>> filters)
     : SearchOp(req, name), topDocsProto(topDocsProto), qcontext(qcontext), query(query), topCount(topCount), filters(filters) {
     weight = query->createWeight(qcontext);
+
+    // if filters not empty, create a span in the request pool with a weight for each filter
+    if (filters.size() > 0) {
+      // first create span of Query::Weight in the request pool
+      filterWeights = req.requestPool.make_span<Query::Weight*>(filters.size());
+
+      for (int i = 0; i < filters.size(); i++) {
+        auto* filterWeight = filters[i].second->createWeight(qcontext);
+        filterWeights[i] = filterWeight;
+      }
+    }
     
     // Parse sort fields from protobuf
     if (topDocsProto.sorts_size() > 0) {
@@ -682,6 +694,22 @@ public:
 
       start += runlen;
     }
+  }
+
+  std::unique_ptr<DocSet> getDocSet(Query::Weight& weight, int32_t segnum) {
+    auto poolGuard = MemPool::threadLocalPoolGuard();
+    auto* scorer = weight.createScorer(poolGuard.pool(), req.reader->segments()[segnum]);
+    DocSetBuilder builder(req.reader->segments()[segnum].maxDoc());
+    if (scorer != nullptr) {
+      for (;;) {
+        auto doc = scorer->next();
+        if (doc == PostingsReader::END) {
+          break;
+        }
+        builder.add(doc);
+      }
+    }
+    return builder.build();
   }
 
 };
