@@ -9,13 +9,13 @@ class OrdMapStr {
 public:
   MemPool& pool;
   OrdMap* ordMap;
-  CoreIndex& index;
+  IndexReader& index;
   std::string_view fieldName;
   std::span<TermsEnum*> enums;
   IntColReader::DenseValues* deltas = nullptr;
   IntColReader::DenseValues* firstSegs = nullptr;
 
-  OrdMapStr(MemPool& pool, OrdMap* ordMap, CoreIndex& index, std::string_view fieldName) : pool(pool), ordMap(ordMap), index(index), fieldName(fieldName) {
+  OrdMapStr(MemPool& pool, OrdMap* ordMap, IndexReader& index, std::string_view fieldName) : pool(pool), ordMap(ordMap), index(index), fieldName(fieldName) {
     enums = pool.make_span<TermsEnum*>(index.segments().size());
     if (ordMap && ordMap->getGlobDeltas()) {
       deltas = pool.make<IntColReader::DenseValues>(*ordMap->getGlobDeltas());

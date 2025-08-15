@@ -7,7 +7,7 @@
 
 namespace solux {
 
-class CoreIndex;
+class IndexReader;
 
 /// An OrdMap can map between segment ordinals and global ordinals.
 /// This is used for fast sorting and faceting across multiple segments.
@@ -85,7 +85,7 @@ public:
   }
 
   /// Build an OrdMap for the given field across all segments in the reader.
-  static std::shared_ptr<OrdMap> build(std::string_view field, CoreIndex& reader);
+  static std::shared_ptr<OrdMap> build(std::string_view field, IndexReader& reader);
   
   /// Get the total number of unique terms across all segments
   int64_t numOrds() const { return nOrds; }

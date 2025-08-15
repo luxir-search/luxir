@@ -14,7 +14,7 @@ class ProtobufQueryParser {
   Schema& schema;
 public:
   // The provided pool will be used to store the parsed query tree.
-  // We need access to the schema to figure out what types of queries to produce?
+  // We need access to the schema to figure out what types of queries to produce.
   // Both the pool and any parsed protobuf objects must outlive the query tree.
   ProtobufQueryParser(MemPool& pool, Schema& schema) : pool(pool), schema(schema) {
   }

@@ -66,7 +66,7 @@ public:
                     // Build OrdMap only if needed (multi-segment case)
                     std::shared_ptr<OrdMap> ordMap;
                     if (reader && reader->segments().size() > 1) {
-                        ordMap = reader->coreIndex().getOrdMap(fieldName);
+                        ordMap = reader->getOrdMap(fieldName);
                     }
                     return std::make_unique<GlobalOrdComparator>(
                         fieldName, ordMap, numHits, isReversed(), missingValue

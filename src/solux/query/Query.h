@@ -89,10 +89,12 @@ public:
 
   /// Returns a non-owning pointer to the created weight.  The Query::Context
   /// is responsible for the lifecycle of the created Weight.
+  /// A Context is not generally thread-safe, so don't create weights from multiple threads with the same Context.
   // TODO: pass down flags like NEED_SCORES, etc
   virtual Query::Weight* createWeight(Query::Context& context) = 0;
 
   /// Gives context to a Query (i.e. what index it's being used on amongst other things) when creating weights
+  /// A Context is not generally thread-safe, so don't create weights from multiple threads with the same Context.
   class Context {
   public:
     MemPool& pool;
@@ -135,6 +137,7 @@ public:
         }
       }
       if (foundCount == 0) {
+        // no segments have this field, so we can rewind the pool to deallocate the arr
         pool.rewind(savepoint);
         return {};
       }
@@ -222,7 +225,7 @@ public:
   public:
     Weight(Query::Context& context) : context(context) {}
 
-    // Create a scorer for a specific segment in the specific MemPool.  Can return null if no docs match!
+    /// Create a scorer for a specific segment in the specific MemPool.  Can return null if no docs match!
     virtual Query::Scorer* createScorer(MemPool& target, IndexReader::Segment& segment) = 0;
 
     // NOTE: no virtual destructor, so subclasses should be made trivially destructible

@@ -302,7 +302,7 @@ public:
 
     // return a copy of the shared_ptr so that the instance it points to will never change while in use.
   std::shared_ptr<IndexReader> getIndexReader(uint64_t freshness_us = 0) {
-    const std::lock_guard<std::mutex> lock(indexReaderMutex);  // TODO: shouldn't need indexReaderMutex here... use a different one.
+    const std::lock_guard<std::mutex> lock(indexReaderMutex);
     bool needNewReader = false;
     if (!indexReader) {
       needNewReader = true;
@@ -324,7 +324,8 @@ public:
     // can take too long since blocking a thread won't allow other threads to perform other work.
     // We should see if there is a TBB friendly way to do this.
     if (needNewReader) {
-      indexReader = std::make_shared<IndexReader>(dir);
+      auto oldReader = indexReader;  // Keep reference to old reader for potential ordMaps sharing
+      indexReader = std::make_shared<IndexReader>(dir, oldReader.get());
     }
 
     return indexReader;

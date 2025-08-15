@@ -351,7 +351,7 @@ public:
 
   void init() override {
     FacetReq::init();
-    ordMap = req.reader->coreIndex().getOrdMap(fieldName);
+    ordMap = req.reader->getOrdMap(fieldName);
   }
 
   class Calc : public Calculator {
@@ -665,7 +665,7 @@ public:
         }
         countVec.reserve(ordCounts.size());
         auto poolGuard = MemPool::threadLocalPoolGuard();
-        OrdMapStr ordMapStr(poolGuard.pool(), thisOp().ordMap.get(), thisOp().req.reader->coreIndex(), thisOp().fieldName);
+        OrdMapStr ordMapStr(poolGuard.pool(), thisOp().ordMap.get(), *thisOp().req.reader, thisOp().fieldName);
         for (auto [ord, count] : ordCounts) {
           auto val = ordMapStr.ordToStr(ord);
           countVec.emplace_back(val, count);
@@ -693,7 +693,7 @@ public:
         }
         countVec.reserve(ordCounts.size());
         auto poolGuard = MemPool::threadLocalPoolGuard();
-        OrdMapStr ordMapStr(poolGuard.pool(), thisOp().ordMap.get(), thisOp().req.reader->coreIndex(), thisOp().fieldName);
+        OrdMapStr ordMapStr(poolGuard.pool(), thisOp().ordMap.get(), *thisOp().req.reader, thisOp().fieldName);
         for (auto [ord, count] : ordCounts) {
           auto val = ordMapStr.ordToStr(ord);
           countVec.emplace_back(val, count);

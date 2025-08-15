@@ -85,7 +85,7 @@ std::shared_ptr<LiveDocs> LiveDocs::create(Directory& dir, uint64_t segId, uint6
 }
 
 
-IndexReader::IndexReader(Directory& dir) {
+IndexReader::IndexReader(Directory& dir, IndexReader* previousReader) {
   // because old segments could be merged away before we have a chance to read them, we need
   // to check if there is a new index info file and retry the open if so.
   // This could be optimized by saving the segments we did read properly in case they are still in the index.
@@ -94,15 +94,12 @@ IndexReader::IndexReader(Directory& dir) {
   bool retry = false;
   
   google::protobuf::Arena arena;
-  std::vector<Segment> segs;
-  uint64_t coreGeneration = 0;
-  int64_t maxdoc = 0;
 
   do {
     if (retry) {
       IREADER_DEBUG("Retrying IndexReader open");
       segs.clear();
-      maxdoc = 0;
+      totalMaxDoc = 0;
       livedocs = 0;
       retry = false;
       // Clear arena to prevent unbounded growth
@@ -128,7 +125,7 @@ IndexReader::IndexReader(Directory& dir) {
       assert(codedStream.ConsumedEntireMessage());
 
       commitTimeUs = indexInfo->commit_time();
-      coreGeneration = indexInfo->core_gen();
+      this->coreGeneration = indexInfo->core_gen();
       bool missingFileOK = true; // Allow missing files on first attempt
       IREADER_DEBUG("\tOpening IndexReader, commitTime={} nSegs={} gen={}", indexInfo->commit_time(),
                     indexInfo->segments_size(), indexInfo->index_gen());
@@ -147,6 +144,9 @@ IndexReader::IndexReader(Directory& dir) {
         int32_t nDocs = segment.max_doc();
         unused(nDocs);
 
+        // TODO: instead of creating a new PostingsReader, we could check if the previousReader has it already opened.
+        // Also, to be more flexible, we should probably pass in a provider interface that can provide PostingsReaders and LiveDocs
+        // from other sources (like cached in IndexWriter, or from previous IndexReader).
         auto postingsReader = PostingsReader::create(dir, segId, missingFileOK);
         if (!postingsReader) {
           // Failed to create PostingsReader (segment files not found) - trigger retry
@@ -174,8 +174,8 @@ IndexReader::IndexReader(Directory& dir) {
         segmentInfo.commit_time = segment.commit_time();
         segmentInfo.live_docs = segment.live_docs();
 
-        segs.emplace_back(std::move(postingsReader), std::move(liveDocs), segmentInfo, maxdoc, i);
-        maxdoc += segs.back().postingsReader().maxDoc();
+        segs.emplace_back(std::move(postingsReader), std::move(liveDocs), segmentInfo, totalMaxDoc, i);
+        totalMaxDoc += segs.back().postingsReader().maxDoc();
         livedocs += segs.back().numLive();
         assert(nDocs == segs.back().postingsReader().maxDoc());
       }
@@ -183,9 +183,16 @@ IndexReader::IndexReader(Directory& dir) {
   }
   while (retry);
 
-  this->core = std::make_shared<CoreIndex>(std::move(segs), coreGeneration, maxdoc);
-  
-  IREADER_DEBUG("IndexReader opened with {} segments and {} docs, commitTime={}", core->segs.size(), maxdoc, commitTimeUs);
+  // Check if we can share ordMaps from the previous reader
+  if (previousReader && previousReader->coreGen() == this->coreGeneration) {
+    IREADER_DEBUG("Sharing ordMaps from previous IndexReader (coreGen={})", this->coreGeneration);
+    this->ordMaps = previousReader->ordMaps;
+  } else {
+    IREADER_DEBUG("Creating new ordMaps cache (coreGen={})", this->coreGeneration);
+    this->ordMaps = std::make_shared<SharedLazyMap<std::string, OrdMap>>();
+  }
+
+  IREADER_DEBUG("IndexReader opened with {} segments and {} docs, commitTime={}", segs.size(), totalMaxDoc, commitTimeUs);
 }
 
 

@@ -36,7 +36,7 @@ namespace solux {
 
 class OrdMapBuilder {
   std::string_view field;
-  CoreIndex& reader;
+  IndexReader& reader;
 
   // An alternate encoding could just catenate all of the deltas together in one numeric column (non-monotonic)
   // that would have less overhead for small segments.
@@ -62,7 +62,7 @@ class OrdMapBuilder {
   };
 
 public:
-  OrdMapBuilder(std::string_view field, CoreIndex& reader) : field(field), reader(reader) {}
+  OrdMapBuilder(std::string_view field, IndexReader& reader) : field(field), reader(reader) {}
 
   // Build fills these in currently.  In the future, the output may be written to disk.
   std::unique_ptr<char[]> data;
@@ -292,7 +292,7 @@ public:
 // In the future, we prob want to be able to accept a span of postings readers as well
 // so that IndexWriter could pre-create a OrdMap for a field without constructing an IndexReader.
 // Or we could just make IndexReader easier to construct w/o taking a Directory, etc.
-std::shared_ptr<OrdMap> OrdMap::build(std::string_view field, CoreIndex& reader) {
+std::shared_ptr<OrdMap> OrdMap::build(std::string_view field, IndexReader& reader) {
   OrdMapBuilder builder(field, reader);
   builder.build();
   if (!builder.data) {
