@@ -43,6 +43,8 @@ public:
 
   virtual bool get(int32_t docid) const = 0; // returns true if the docid is in the set
 
+  static std::unique_ptr<DocSet> intersect(std::span<DocSet*> sets);
+
   virtual ~DocSet() = default;
 };
 
@@ -158,6 +160,91 @@ public:
     return std::make_unique<ArrDocSet>(std::move(docs));
   }
 };
+
+/// Merge two or more DocSets into a single new DocSet.
+inline std::unique_ptr<DocSet> DocSet::intersect(std::span<DocSet*> sets) {
+  assert(sets.size() > 1);
+  std::sort(sets.begin(), sets.end(), [](DocSet* a, DocSet* b) {
+    return a->card() < b->card();
+  });
+  if (sets[0]->type == BITSET) {
+    auto& firstBits = ((BitDocSet*) sets[0])->bits();
+    RAMFixedBitSet result(firstBits.size());
+    auto nWords = firstBits.sizeInWords(firstBits.size());
+
+    memcpy(result.words, firstBits.words, nWords * sizeof(*result.words));
+    for (int i = 1; i < sets.size(); i++) {
+      assert(sets[i]->type == BITSET);
+      for (int64_t word = 0; word < nWords; word++) {
+        result.words[word] &= ((BitDocSet*)sets[i])->bits().words[word];
+      }
+    }
+    return std::make_unique<RAMBitDocSet>(std::move(result));
+  }
+  // if we get here, we have an array of docids.
+  size_t firstbitset = sets.size();
+  for (auto i = 0u; i < sets.size(); i++) {
+    if (sets[i]->type == BITSET) {
+      firstbitset = i;
+      break;
+    }
+  }
+  std::vector<int32_t> docStore1;
+  std::vector<int32_t> docStore2;
+  std::span<int32_t> firstArr = ((ArrDocSet*)sets[0])->docs();
+  std::vector<int32_t>* outputDocs = &docStore1;
+  std::vector<int32_t>* inputDocs = &docStore2;
+  for (auto doc : firstArr) {
+    bool missing = false;
+    for (int setid = firstbitset; setid < sets.size(); setid++) {
+      if (!((BitDocSet*)sets[setid])->bits().get(doc)) {
+        missing = true;
+        break;
+      }
+    }
+    if (!missing) {
+      outputDocs->emplace_back(doc);
+    }
+  }
+
+  for (int setid = 1; setid < firstbitset; setid++) {
+    std::swap(outputDocs, inputDocs);
+    outputDocs->clear();
+    std::span<int32_t> idocs = *inputDocs;
+    std::span<int32_t> jdocs = ((ArrDocSet*)sets[setid])->docs();
+    int32_t i = 0, j = 0;
+    for (;;) {
+      while (idocs[i] < jdocs[j]) {
+        i++;
+        if (i >= idocs.size()) {
+          goto finish;
+        }
+      }
+      while (idocs[i] > jdocs[j]) {
+        j++;
+        if (j >= jdocs.size()) {
+          goto finish;
+        }
+      }
+      if (idocs[i] == jdocs[j]) {
+        outputDocs->emplace_back(idocs[i]);
+        j++;
+        if (j >= jdocs.size()) {
+          goto finish;
+        }
+      }
+
+
+    }
+    finish:
+    //proceed to the next set
+  }
+  if (outputDocs->empty()) {
+    return std::make_unique<RAMBitDocSet>(0);
+  }
+  outputDocs->shrink_to_fit();
+  return std::make_unique<ArrDocSet>(std::move(*outputDocs));
+}
 
 
 }
