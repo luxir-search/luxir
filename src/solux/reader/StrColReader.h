@@ -6,6 +6,8 @@
 #include "PostingsReader.h"
 #include "IntColReader.h"
 #include "solux/codec/Codec.h"
+#include "solux/store/InputStream.h"
+#include "solux/schema/FieldType.h"
 
 namespace solux {
 
@@ -19,6 +21,7 @@ private:
   std::optional<MonoReader> lengthReader;   // Reader for cumulative lengths (empty for fixed-size)
   int32_t docsWithField = 0;
   int32_t fixedSize = -1;    // -1 for variable size, >= 0 for fixed size
+  bool multiValued = false;  // Whether this field is multi-valued
 
 public:
   /// The fieldInfo is only used in the constructor and can be discarded after.
@@ -26,7 +29,8 @@ public:
     docs(postingsReader, fieldInfo),
     valuesIS(postingsReader.getInputStreamSeek(fieldInfo.columnLoc)),
     valuesData(valuesIS.ptr()),
-    docsWithField(fieldInfo.docsWithField)
+    docsWithField(fieldInfo.docsWithField),
+    multiValued((fieldInfo.flags & FieldType::MULTI_VALUED) != 0)
   {
     if (fieldInfo.monoLoc.offset() == 0 && fieldInfo.monoLoc.filenum() == 0) {
       // Fixed-size mode: monoLoc is null/zero, size is in monoMetaOff
@@ -51,7 +55,6 @@ public:
   }
 
   /// Get the string value for a document by its rank (index in docs with value).
-  /// Returns empty string_view if rank is out of bounds.
   std::string_view valueAt(int32_t rank) const {
     assert(rank >= 0 && rank < docsWithField);
     if (fixedSize >= 0) {
@@ -116,7 +119,7 @@ public:
 
     /// Move to the next document with a value.
     int32_t next() {
-      if (docRank + 1 >= maxRank) {
+      if (docRank >= maxRank - 1) {
         doc = ENDDOC;
         return doc;
       }
@@ -133,6 +136,45 @@ public:
   };
 
   using Iterator = DocIterator;
+  
+  /// returns true if this field is multi-valued
+  bool isMultiValued() const {
+    return multiValued;
+  }
+  
+  /// Parse multi-valued data for a document at given rank
+  /// Calls callback(std::string_view value, int64_t valIdx, int64_t numVals) for each value
+  void parseMultiValuesAt(int32_t rank, auto&& callback) const {
+    assert(multiValued);
+    std::string_view data = valueAt(rank);
+    parseMultiValues(data, callback);
+  }
+  
+  /// Static helper to parse multi-valued data format
+  /// Calls callback(std::string_view value, int64_t valIdx, int64_t numVals) for each value
+  static void parseMultiValues(std::string_view data, auto&& callback) {
+    InputStream dataStream(data.data(), data.data() + data.size());
+    
+    // Read number of values
+    int64_t numVals = dataStream.readVint();
+    
+    // Read each value
+    for (int64_t valIdx = 0; valIdx < numVals; valIdx++) {
+      int64_t valLen;
+      if (valIdx < numVals - 1) {
+        // All values except the last have explicit lengths
+        valLen = dataStream.readVint();
+      } else {
+        // Last value's length is calculated from remaining data
+        valLen = (data.data() + data.size()) - dataStream.ptr();
+      }
+      std::string_view val(dataStream.ptr(), valLen);
+      if (valLen > 0) {
+        dataStream.skip(valLen);
+      }
+      callback(val, valIdx, numVals);
+    }
+  }
 
   /// Get string values for a sorted range of docids.
   /// Calls callback(size_t input_index, int32_t docid, std::string_view value) for each docid that has a value.
@@ -150,6 +192,33 @@ public:
       if (foundid == docid) {
         auto val = iter.value();
         callback(idx, docid, val);
+      } else if (foundid == StrColReader::Iterator::ENDDOC) {
+        break;
+      }
+      idx++;
+    }
+  }
+  
+  /// Get multi-valued string values for a sorted range of docids.
+  /// Calls callback(size_t input_index, int32_t docid, std::string_view value, int64_t valIdx, int64_t numVals) 
+  /// for each value of each docid that has values.
+  static void getMultiValues(MemPool& pool, PostingsReader& postingsReader, SegFieldInfo& segFieldInfo,
+                             std::ranges::input_range auto&& sortedDocIds, auto&& callback) {
+    StrColReader strColReader(postingsReader, segFieldInfo);
+    StrColReader::Iterator iter(strColReader);
+    
+    int32_t foundid = -1;
+    size_t idx = 0;
+    for (int32_t docid : sortedDocIds) {
+      if (foundid < docid) {
+        foundid = iter.advance(docid);
+      }
+      if (foundid == docid) {
+        std::string_view data = iter.value();
+        // Use the centralized parser
+        parseMultiValues(data, [&](std::string_view val, int64_t valIdx, int64_t numVals) {
+          callback(idx, docid, val, valIdx, numVals);
+        });
       } else if (foundid == StrColReader::Iterator::ENDDOC) {
         break;
       }

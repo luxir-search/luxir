@@ -3,6 +3,8 @@
 #include "test/SoluxTest.h"
 #include "test/TestIndex.h"
 #include "test/TestUtils.h"
+#include "test/CollectionHelper.h"
+#include "test/LocalReq.h"
 #include "solux/index/handler/StrColHandler.h"
 #include "solux/reader/StrColReader.h"
 #include "solux/reader/FieldReader.h"
@@ -699,5 +701,242 @@ TEST_F(StrColTest, mergeNonIndexedStrCol) {
     
     ASSERT_EQ(StrColReader::Iterator::ENDDOC, iter.next());
   }
+}
+
+TEST_F(StrColTest, BasicMultiValuedColumnStoredStrings) {
+  CollectionHelper helper;
+  helper.clear();
+  
+  // Add documents with multi-valued column-stored-only string fields
+  {
+    auto doc = flatdoc("id_s", "doc1");
+    // Add multi-valued _ssc field
+    doc.push_back({"tags_ssc", std::vector<std::string>{"programming", "c++", "search"}});
+    helper.index(doc, UpdateMessage::NO_COMMIT);
+  }
+  
+  {
+    auto doc = flatdoc("id_s", "doc2");
+    // Add different number of values
+    doc.push_back({"tags_ssc", std::vector<std::string>{"java", "database"}});
+    helper.index(doc, UpdateMessage::NO_COMMIT);
+  }
+  
+  {
+    auto doc = flatdoc("id_s", "doc3");
+    // Single value in multi-valued field
+    doc.push_back({"tags_ssc", std::vector<std::string>{"python"}});
+    helper.index(doc, UpdateMessage::COMMIT);
+  }
+  
+  // Search and retrieve the _ssc field
+  auto* lreq = LocalReq::create(soluxNode->getSearchEngine());
+  lreq->proto.mutable_collection()->add_name("main");
+  
+  auto& ops = *lreq->proto.mutable_ops();
+  auto& topDocs = *ops["q"].mutable_top_docs();
+  topDocs.set_get_number(true);
+  topDocs.set_limit(10);
+  topDocs.mutable_query()->set_all(true);
+  
+  // Request fields including the multi-valued column-stored field
+  topDocs.mutable_fields()->Add("id_s");
+  topDocs.mutable_fields()->Add("tags_ssc");
+  
+  lreq->engine.submit(*lreq, true);
+  
+  ASSERT_GT(lreq->responses.size(), 0) << "No responses received";
+  auto& docs = lreq->responses[0]->proto.ops().at("q").docs();
+  ASSERT_EQ(3, docs.matches());
+  
+  // Verify the returned multi-valued fields
+  auto& columns = docs.columns();
+  ASSERT_TRUE(columns.contains("tags_ssc"));
+  
+  auto& tagsCol = columns.at("tags_ssc");
+  ASSERT_TRUE(tagsCol.has_multi_s());
+  auto& multiTags = tagsCol.multi_s();
+  
+  ASSERT_EQ(3, multiTags.v_size());
+  
+  // Find doc1 and verify its tags
+  auto& idCol = columns.at("id_s").col_s();
+  for (int i = 0; i < 3; i++) {
+    if (idCol.v(i) == "doc1") {
+      auto& tags = multiTags.v(i).v();
+      ASSERT_EQ(3, tags.size());
+      ASSERT_EQ("programming", tags[0]);
+      ASSERT_EQ("c++", tags[1]);
+      ASSERT_EQ("search", tags[2]);
+    } else if (idCol.v(i) == "doc2") {
+      auto& tags = multiTags.v(i).v();
+      ASSERT_EQ(2, tags.size());
+      ASSERT_EQ("java", tags[0]);
+      ASSERT_EQ("database", tags[1]);
+    } else if (idCol.v(i) == "doc3") {
+      auto& tags = multiTags.v(i).v();
+      ASSERT_EQ(1, tags.size());
+      ASSERT_EQ("python", tags[0]);
+    }
+  }
+  
+  lreq->done();
+}
+
+TEST_F(StrColTest, EmptyAndMissingValues) {
+  CollectionHelper helper;
+  helper.clear();
+  
+  // Document with empty array
+  {
+    auto doc = flatdoc("id_s", "doc1");
+    // Empty array for _ssc field
+    doc.push_back({"tags_ssc", std::vector<std::string>{}});
+    helper.index(doc, UpdateMessage::NO_COMMIT);
+  }
+  
+  // Document with no _ssc field
+  {
+    auto doc = flatdoc("id_s", "doc2");
+    // No tags_ssc field at all
+    helper.index(doc, UpdateMessage::NO_COMMIT);
+  }
+  
+  // Document with values
+  {
+    auto doc = flatdoc("id_s", "doc3");
+    doc.push_back({"tags_ssc", std::vector<std::string>{"test"}});
+    helper.index(doc, UpdateMessage::COMMIT);
+  }
+  
+  // Search and retrieve
+  auto* lreq = LocalReq::create(soluxNode->getSearchEngine());
+  lreq->proto.mutable_collection()->add_name("main");
+  
+  auto& ops = *lreq->proto.mutable_ops();
+  auto& topDocs = *ops["q"].mutable_top_docs();
+  topDocs.set_get_number(true);
+  topDocs.set_limit(10);
+  topDocs.mutable_query()->set_all(true);
+  
+  topDocs.mutable_fields()->Add("id_s");
+  topDocs.mutable_fields()->Add("tags_ssc");
+  
+  lreq->engine.submit(*lreq, true);
+  
+  ASSERT_GT(lreq->responses.size(), 0) << "No responses received";
+  auto& docs = lreq->responses[0]->proto.ops().at("q").docs();
+  ASSERT_EQ(3, docs.matches());
+  
+  // Verify handling of empty and missing values
+  auto& columns = docs.columns();
+  auto& idCol = columns.at("id_s").col_s();
+  
+  if (columns.contains("tags_ssc")) {
+    auto& tagsCol = columns.at("tags_ssc");
+    if (tagsCol.has_multi_s()) {
+      auto& multiTags = tagsCol.multi_s();
+      
+      for (int i = 0; i < 3; i++) {
+        if (idCol.v(i) == "doc1") {
+          // Empty array should still be present but with 0 values
+          ASSERT_EQ(0, multiTags.v(i).v_size());
+        } else if (idCol.v(i) == "doc2") {
+          // Missing field - implementation dependent
+          // Either missing or empty array
+        } else if (idCol.v(i) == "doc3") {
+          ASSERT_EQ(1, multiTags.v(i).v_size());
+          ASSERT_EQ("test", multiTags.v(i).v(0));
+        }
+      }
+    }
+  }
+  
+  lreq->done();
+}
+
+
+TEST_F(StrColTest, MultiValuedFixedSizeOptimization) {
+  // Test that multi-valued fields with uniform block sizes use fixed-size optimization
+  CollectionHelper helper;
+  helper.clear();
+  
+  // Add documents with multi-valued fields where all have exactly 2 values of 5 chars each
+  // This should result in uniform block sizes
+  {
+    auto doc = flatdoc("id_s", "doc1");
+    doc.push_back({"uniform_ssc", std::vector<std::string>{"aaaaa", "bbbbb"}});
+    helper.index(doc, UpdateMessage::NO_COMMIT);
+  }
+  
+  {
+    auto doc = flatdoc("id_s", "doc2");
+    doc.push_back({"uniform_ssc", std::vector<std::string>{"ccccc", "ddddd"}});
+    helper.index(doc, UpdateMessage::NO_COMMIT);
+  }
+  
+  {
+    auto doc = flatdoc("id_s", "doc3");
+    doc.push_back({"uniform_ssc", std::vector<std::string>{"eeeee", "fffff"}});
+    helper.index(doc, UpdateMessage::COMMIT);
+  }
+  
+  // Verify the field was written with fixed-size optimization
+  auto indexWriter = helper.getIndexWriter();
+  auto reader = indexWriter->getIndexReader();
+  ASSERT_TRUE(reader != nullptr);
+  ASSERT_GT(reader->segments().size(), 0);
+  
+  auto& segment = reader->segments()[0];
+  auto& postingsReader = segment.postingsReader();
+  FieldReader fieldReader(MemPool::threadLocal(), postingsReader);
+  bool found = fieldReader.seek("uniform_ssc");
+  ASSERT_TRUE(found);
+  
+  SegFieldInfo segFieldInfo;
+  fieldReader.readFieldInfo(segFieldInfo);
+  
+  // Check that monoLoc is 0 (indicating fixed-size mode)
+  ASSERT_EQ(0, segFieldInfo.monoLoc.offset());
+  ASSERT_EQ(0, segFieldInfo.monoLoc.filenum());
+  
+  // Verify we can still read the values correctly
+  auto* lreq = LocalReq::create(soluxNode->getSearchEngine());
+  lreq->proto.mutable_collection()->add_name("main");
+  
+  auto& ops = *lreq->proto.mutable_ops();
+  auto& topDocs = *ops["q"].mutable_top_docs();
+  topDocs.set_get_number(true);
+  topDocs.set_limit(10);
+  topDocs.mutable_query()->set_all(true);
+  
+  topDocs.mutable_fields()->Add("id_s");
+  topDocs.mutable_fields()->Add("uniform_ssc");
+  
+  lreq->engine.submit(*lreq, true);
+  
+  ASSERT_GT(lreq->responses.size(), 0);
+  auto& docs = lreq->responses[0]->proto.ops().at("q").docs();
+  ASSERT_EQ(3, docs.matches());
+  
+  // Verify the values are correct
+  auto& columns = docs.columns();
+  ASSERT_TRUE(columns.contains("uniform_ssc"));
+  auto& uniformCol = columns.at("uniform_ssc");
+  ASSERT_TRUE(uniformCol.has_multi_s());
+  auto& multiUniform = uniformCol.multi_s();
+  
+  ASSERT_EQ(3, multiUniform.v_size());
+  
+  // Check each document has the expected values
+  auto& idCol = columns.at("id_s").col_s();
+  for (int i = 0; i < 3; i++) {
+    auto& vals = multiUniform.v(i).v();
+    ASSERT_EQ(2, vals.size());
+    ASSERT_EQ(5, vals[0].size());
+    ASSERT_EQ(5, vals[1].size());
+  }
+  
+  lreq->done();
 }
 

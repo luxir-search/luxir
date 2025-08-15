@@ -672,23 +672,39 @@ public:
             StrColReader::getValues(poolGuard.pool(), postingsReader, segFieldInfo, sortedDocs, valHandler);
           }
         } else {
-          // multi-valued handling - currently only supports indexed strings
-          // TODO: Add support for multi-valued non-indexed string columns if needed
-          TermsEnum tenum(poolGuard.pool(), postingsReader, segFieldInfo);
-          auto valHandler = [&](size_t idx, int32_t doc, int64_t val, int64_t valIdx, int64_t numVals) {
-            assert(segDocs[idxSpan[idx]].docId() == doc && val > 0);
-            solux::proto::ArrStr& target = *mtarget[idxSpan[idx]];
-            if (valIdx == 0) {
-              // first value for this doc.
-              target.mutable_v()->Reserve(numVals);
-            }
-            tenum.seekOrd((int32_t) val - 1);  // term ords are 0 based.
-            auto v = (std::string_view) tenum.term();
-            auto* strProto = target.mutable_v()->Add();
-            *strProto = v;
-          };
+          // multi-valued handling
+          if (isIndexedString) {
+            // Indexed multi-valued strings - use ordinal lookup
+            TermsEnum tenum(poolGuard.pool(), postingsReader, segFieldInfo);
+            auto valHandler = [&](size_t idx, int32_t doc, int64_t val, int64_t valIdx, int64_t numVals) {
+              assert(segDocs[idxSpan[idx]].docId() == doc && val > 0);
+              solux::proto::ArrStr& target = *mtarget[idxSpan[idx]];
+              if (valIdx == 0) {
+                // first value for this doc.
+                target.mutable_v()->Reserve(numVals);
+              }
+              tenum.seekOrd((int32_t) val - 1);  // term ords are 0 based.
+              auto v = (std::string_view) tenum.term();
+              auto* strProto = target.mutable_v()->Add();
+              *strProto = v;
+            };
 
-          IntColReader::getValues(poolGuard.pool(), postingsReader, segFieldInfo, sortedDocs, valHandler);
+            IntColReader::getValues(poolGuard.pool(), postingsReader, segFieldInfo, sortedDocs, valHandler);
+          } else {
+            // Non-indexed multi-valued string columns (_ssc fields)
+            auto valHandler = [&](size_t idx, int32_t doc, std::string_view val, int64_t valIdx, int64_t numVals) {
+              assert(segDocs[idxSpan[idx]].docId() == doc);
+              solux::proto::ArrStr& target = *mtarget[idxSpan[idx]];
+              if (valIdx == 0) {
+                // first value for this doc.
+                target.mutable_v()->Reserve(numVals);
+              }
+              auto* strProto = target.mutable_v()->Add();
+              *strProto = std::string(val);
+            };
+            
+            StrColReader::getMultiValues(poolGuard.pool(), postingsReader, segFieldInfo, sortedDocs, valHandler);
+          }
         }
       });
 

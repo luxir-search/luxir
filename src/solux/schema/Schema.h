@@ -76,6 +76,7 @@ public:
     schema->fieldTypeMap["_s"] = std::make_shared<StrFieldType>("_s");
     schema->fieldTypeMap["_sc"] = std::make_shared<StrFieldType>("_sc", FieldType::COLUMN_STORED);
     schema->fieldTypeMap["_ss"] = std::make_shared<StrFieldType>("_ss", FieldType::INDEX_DOCS | FieldType::COLUMN_STORED | FieldType::MULTI_VALUED);
+    schema->fieldTypeMap["_ssc"] = std::make_shared<StrFieldType>("_ssc", FieldType::COLUMN_STORED | FieldType::MULTI_VALUED);
     schema->fieldTypeMap["_i"] = std::make_shared<IntFieldType>("_i");
     schema->fieldTypeMap["_is"] = std::make_shared<IntFieldType>("_is", FieldType::COLUMN_STORED | FieldType::MULTI_VALUED);
     schema->fieldTypeMap["_w"] = std::make_shared<TextFieldType>("_w");

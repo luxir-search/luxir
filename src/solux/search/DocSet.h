@@ -86,18 +86,8 @@ public:
     card_ = other.card_;
     other.bits_.words = nullptr;
   }
-/*
-  RAMBitDocSet& operator=(RAMBitDocSet&& other) noexcept {
-    if (this != &other) {
-      bits_ = other.bits_;
-      bits_.words = other.bits_.words;
-      card_ = other.card_;
-      other.bits_.words = nullptr; // invalidate the moved-from object
-      other.card_ = -1;
-    }
-    return *this;
-  }
-  */
+
+  RAMBitDocSet& operator=(RAMBitDocSet&& other) = delete;
 
   ~RAMBitDocSet() override {
     delete[] bits_.words; // free the allocated memory
