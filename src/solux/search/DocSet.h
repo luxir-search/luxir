@@ -212,35 +212,9 @@ inline std::unique_ptr<DocSet> DocSet::intersect(std::span<DocSet*> sets) {
     outputDocs->clear();
     std::span<int32_t> idocs = *inputDocs;
     std::span<int32_t> jdocs = ((ArrDocSet*)sets[setid])->docs();
-    int32_t i = 0, j = 0;
-    for (;;) {
-      while (idocs[i] < jdocs[j]) {
-        i++;
-        if (i >= idocs.size()) {
-          goto finish;
-        }
-      }
-      while (idocs[i] > jdocs[j]) {
-        j++;
-        if (j >= jdocs.size()) {
-          goto finish;
-        }
-      }
-      if (idocs[i] == jdocs[j]) {
-        outputDocs->emplace_back(idocs[i]);
-        j++;
-        if (j >= jdocs.size()) {
-          goto finish;
-        }
-      }
-
-
-    }
-    finish:
-    //proceed to the next set
-  }
-  if (outputDocs->empty()) {
-    return std::make_unique<RAMBitDocSet>(0);
+    std::set_intersection(idocs.begin(), idocs.end(),
+      jdocs.begin(), jdocs.end(),
+      std::back_inserter(*outputDocs));
   }
   outputDocs->shrink_to_fit();
   return std::make_unique<ArrDocSet>(std::move(*outputDocs));

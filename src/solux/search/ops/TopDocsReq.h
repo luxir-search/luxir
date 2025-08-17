@@ -144,8 +144,6 @@ public:
         // Wait until last moment to obtain collector in hopes of reusing an existing one.
         data = collectorMerger.obtain();
 
-        BitDocSet* bitDocs = (BitDocSet*)domain;  // assume bitDocs for now.
-        auto* domainBits = bitDocs ? &bitDocs->bits() : nullptr;
         std::optional<DocSetBuilder> builder;
         if (output.size() > 0) {
           builder.emplace(seg.maxDoc());
@@ -154,38 +152,92 @@ public:
         // TODO: special-case matchAllDocs query for producing the output domain.
 
         if (scorer != nullptr) {
-          if (data->useFieldSort) {
-            data->fieldCollector->setSegment(segnum, &seg.postingsReader());
-            auto& collector = *data->fieldCollector;
-            for (;;) {
-              auto doc = scorer->next();
-              if (doc == PostingsReader::END) {
-                break;
+          DocSet* filter = domain;
+          std::unique_ptr<DocSet> newDomain;;
+          if (!thisOp().filterWeights.empty()) {
+            std::vector<std::unique_ptr<DocSet>> filters;
+            std::vector<DocSet*> filterPtrs;
+            for (auto weight : thisOp().filterWeights) {
+              filters.push_back(thisOp().getDocSet(*weight, segnum));
+              filterPtrs.push_back(filters.back().get());
+            }
+            if (domain) {
+              filterPtrs.emplace_back(domain);
+            }
+            newDomain = DocSet::intersect(filterPtrs);
+            filter = newDomain.get();
+          }
+          if (filter == nullptr || filter->type == DocSet::BITSET) {
+            BitDocSet* bitDocs = (BitDocSet*)filter;
+            auto* domainBits = bitDocs ? &bitDocs->bits() : nullptr;
+            if (data->useFieldSort) {
+              data->fieldCollector->setSegment(segnum, &seg.postingsReader());
+              auto& collector = *data->fieldCollector;
+              for (;;) {
+                auto doc = scorer->next();
+                if (doc == PostingsReader::END) {
+                  break;
+                }
+                if (domainBits && !domainBits->get(doc)) {
+                  continue;
+                }
+                if (builder.has_value()) {
+                  builder->add(doc);
+                }
+                auto score = scorer->score();
+                collector.collect(segnum, doc, score);
               }
-              if (domainBits && !domainBits->get(doc)) {
-                continue;
+            } else {
+              auto& collector = *data->scoreCollector;
+              for (;;) {
+                auto doc = scorer->next();
+                if (doc == PostingsReader::END) {
+                  break;
+                }
+                if (domainBits && !domainBits->get(doc)) {
+                  continue;
+                }
+                if (builder.has_value()) {
+                  builder->add(doc);
+                }
+                auto score = scorer->score();
+                collector.collect(segnum, doc, score);
               }
-              if (builder.has_value()) {
-                builder->add(doc);
-              }
-              auto score = scorer->score();
-              collector.collect(segnum, doc, score);
             }
           } else {
-            auto& collector = *data->scoreCollector;
-            for (;;) {
-              auto doc = scorer->next();
-              if (doc == PostingsReader::END) {
-                break;
+            assert(filter->type == DocSet::ARRAY);
+            ArrDocSet* arrDocs = (ArrDocSet*)filter;
+            if (data->useFieldSort) {
+              data->fieldCollector->setSegment(segnum, &seg.postingsReader());
+              auto& collector = *data->fieldCollector;
+              for (auto doc : arrDocs->docs()) {
+                if (scorer->docId() < doc) {
+                  scorer->advance(doc);
+                }
+                if (scorer->docId() != doc) {
+                  continue; // this doc does not match the query
+                }
+                if (builder.has_value()) {
+                  builder->add(doc);
+                }
+                auto score = scorer->score();
+                collector.collect(segnum, doc, score);
               }
-              if (domainBits && !domainBits->get(doc)) {
-                continue;
+            } else {
+              auto& collector = *data->scoreCollector;
+              for (auto doc : arrDocs->docs()) {
+                if (scorer->docId() < doc) {
+                  scorer->advance(doc);
+                }
+                if (scorer->docId() != doc) {
+                  continue; // this doc does not match the query
+                }
+                if (builder.has_value()) {
+                  builder->add(doc);
+                }
+                auto score = scorer->score();
+                collector.collect(segnum, doc, score);
               }
-              if (builder.has_value()) {
-                builder->add(doc);
-              }
-              auto score = scorer->score();
-              collector.collect(segnum, doc, score);
             }
           }
         }
