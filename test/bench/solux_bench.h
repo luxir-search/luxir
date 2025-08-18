@@ -29,7 +29,7 @@ inline size_t currentRSSKB() {
 inline size_t peakRSSKB() {
   struct rusage usage;
   getrusage(RUSAGE_SELF, &usage);
-  return usage.ru_maxrss / 1024;
+  return usage.ru_maxrss;
 }
 
 class RSSWatcher {

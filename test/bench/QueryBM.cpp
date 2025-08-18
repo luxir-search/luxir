@@ -21,7 +21,6 @@ void buildBenchIndex(CollectionHelper& helper, int64_t nDocs, std::span<const in
   auto iw = helper.getIndexWriter();
   int64_t idNum = 0;
   for (size_t segnum=0; segnum<docsPerSeg.size(); segnum++) {
-    SplitMix64 r(segnum); // make each segment predictable so segment build order doesn't affect the results.
     // LOG_ERROR("Segment {} with {} docs, rng={}", segnum, docsPerSeg[segnum], (int64_t)r());
 
     int segDocs = docsPerSeg[segnum];
@@ -41,6 +40,8 @@ void buildBenchIndex(CollectionHelper& helper, int64_t nDocs, std::span<const in
 
     std::string s;
     for (int i=0; i<segDocs; i++) {
+      SplitMix64 r(idNum); // make each doc predictable
+
       // add some random values to the index
       inverter.startDoc();
       s0.index(inverter, std::to_string(idNum++));

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "SearchOp.h"
+#include "solux/query/AllQuery.h"
 #include "solux/query/Query.h"
 #include "solux/reader/IntColReader.h"
 #include "solux/reader/StrColReader.h"
@@ -133,23 +134,31 @@ public:
         return;
       }
 
+      // If we have subcalcs and if we determine that we are matching everything, then we can skip collecting
+      // a new domain and just use the existing one.
+      // TODO: put a type field on the query and replace this dynamic cast.
+      bool matchEverything = (dynamic_cast<AllQuery*>(op.query) != nullptr) && thisOp().filters.empty();
+;
       MergeableCollector* data = nullptr;
       int64_t numSegs = (int64_t)op.req.reader->segments().size();
 
       {
         auto poolGuard = MemPool::threadLocalPoolGuard();
         auto& seg = op.qcontext.topReader.segments()[segnum];
-        auto scorer = op.weight->createScorer(poolGuard.pool(), seg);
+        auto* scorer = op.weight->createScorer(poolGuard.pool(), seg);
 
         // Wait until last moment to obtain collector in hopes of reusing an existing one.
         data = collectorMerger.obtain();
 
         std::optional<DocSetBuilder> builder;
         if (output.size() > 0) {
-          builder.emplace(seg.maxDoc());
+          // check if the query is a match-all-docs query with a dynamic cast
+          matchEverything = (dynamic_cast<AllQuery*>(op.query) != nullptr) && thisOp().filters.empty();
+          if (!matchEverything) {
+            builder.emplace(seg.maxDoc());
+          }
         }
 
-        // TODO: special-case matchAllDocs query for producing the output domain.
 
         if (scorer != nullptr) {
           DocSet* filter = domain;
@@ -257,7 +266,8 @@ public:
       // launch the sub-calculators in parallel after that.
       for (int i = subCalcs.size() - 1; i >= 0; i--) {
         // TODO: launch sub-calculators in parallel (except for the first one).
-        subCalcs[i]->calc(tg, segnum, output[segnum].get());
+        auto* newDomain = matchEverything? domain : output[segnum].get();
+        subCalcs[i]->calc(tg, segnum, newDomain);
       }
 
       // Releasing the collector as soon as possible can save merging work.
