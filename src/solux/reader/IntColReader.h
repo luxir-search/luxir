@@ -4,6 +4,7 @@
 #include "PostingsReader.h"
 #include "Postings.h"
 #include "solux/codec/Codec.h"
+#include "solux/store/InputStream.h"
 
 namespace solux {
 
@@ -213,6 +214,8 @@ private:
   std::optional<MonoReader> endRankReader;  // exists if multi-valued.
   int64_t nvals;
   int32_t docsWithField = 0;
+  int64_t columnMin = 0;
+  int64_t columnMax = 0;
 
 public:
   /// The fieldInfo is only used in the constructor and can be discarded after.
@@ -224,6 +227,18 @@ public:
     columnIS = postingsReader.getInputStreamSeek(fieldInfo.columnLoc);
     blocks = columnIS.ptr();
     blockMeta = reinterpret_cast<const NumericBlockInfo *>(blocks + fieldInfo.columnMetaOff);
+    
+    // Read min/max values that come after the block metadata
+    if (nvals > 0) {
+      // Calculate the number of blocks
+      int64_t numBlocks = (nvals + Postings::NUMERIC_BLOCK_SIZE - 1) / Postings::NUMERIC_BLOCK_SIZE;
+      // Min/max are stored right after the block metadata array as vlongs
+      const char* minMaxPtr = blocks + fieldInfo.columnMetaOff + numBlocks * sizeof(NumericBlockInfo);
+      const char* endPtr = blocks + columnIS.size(); // We need an end pointer for safety
+      columnMin = InputStream::readVlong(minMaxPtr, endPtr);
+      columnMax = InputStream::readVlong(minMaxPtr, endPtr);
+    }
+    
     if (fieldInfo.monoLoc.offset() > 0) {
       endRankReader.emplace(postingsReader, fieldInfo.monoLoc, fieldInfo.monoMetaOff, fieldInfo.docsWithField);
     }
@@ -243,6 +258,15 @@ public:
     blockMeta = reinterpret_cast<const NumericBlockInfo *>(blocks + columnMetaOff);
     nvals = numValues;
     docsWithField = static_cast<int32_t>(numValues);
+    
+    // Read min/max values that come after the block metadata
+    if (nvals > 0) {
+      int64_t numBlocks = (nvals + Postings::NUMERIC_BLOCK_SIZE - 1) / Postings::NUMERIC_BLOCK_SIZE;
+      const char* minMaxPtr = blocks + columnMetaOff + numBlocks * sizeof(NumericBlockInfo);
+      const char* endPtr = blocks + columnIS.size();
+      columnMin = InputStream::readVlong(minMaxPtr, endPtr);
+      columnMax = InputStream::readVlong(minMaxPtr, endPtr);
+    }
   }
 
   DocsReader& docsReader() {
@@ -265,6 +289,14 @@ public:
 
   bool multiValued() const {
     return endRankReader.has_value();
+  }
+  
+  int64_t getMin() const {
+    return columnMin;
+  }
+  
+  int64_t getMax() const {
+    return columnMax;
   }
 
   /// Retrieves the start and end ranks into the values for the given rank.

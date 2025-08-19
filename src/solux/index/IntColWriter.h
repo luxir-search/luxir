@@ -23,6 +23,8 @@ private:
   OutputStream& colOutput;
   size_t colStart;
   int64_t nAdded = 0;
+  int64_t overallMin = std::numeric_limits<int64_t>::max();
+  int64_t overallMax = std::numeric_limits<int64_t>::min();
 
   std::vector<IntColReader::NumericBlockInfo> blockInfo;
   std::vector<int64_t> values;
@@ -58,6 +60,10 @@ public:
         gcd = std::gcd(gcd, arr[i]);
       }
     }
+    
+    // Track overall min/max across all blocks
+    overallMin = std::min(overallMin, min);
+    overallMax = std::max(overallMax, max);
 
     // get number of bits needed to represent values if we divide everything by the gcd
     if (gcd == 0) {
@@ -133,6 +139,14 @@ public:
 
     int64_t metaOff = colOutput.size() - colStart;
     colOutput.write((const char*)blockInfo.data(), blockInfo.size() * sizeof(IntColReader::NumericBlockInfo));
+    
+    // Write overall min/max after the block metadata as vlongs
+    if (nAdded == 0) {
+      overallMin = 0;
+      overallMax = 0;
+    }
+    colOutput.writeVlong(overallMin);
+    colOutput.writeVlong(overallMax);
 
     return {(int64_t)colStart, metaOff, nAdded};
   }
@@ -145,8 +159,6 @@ public:
 
     fieldInfo.columnLoc = seg_location(colOutput.streamNumber, data.columnLoc);
     fieldInfo.columnMetaOff = data.columnMetaOff;
-    // the number of blocks can be derived from nAdded.
-    colOutput.write((const char*)blockInfo.data(), blockInfo.size() * sizeof(IntColReader::NumericBlockInfo));
     fieldInfo.numValues = data.numValues;  // TODO: do this here?
     return nAdded;
   }

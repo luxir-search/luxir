@@ -115,6 +115,59 @@ TEST_F(IntColTest, basic) {
   }
 }
 
+// test min/max column metadata
+TEST_F(IntColTest, minMaxValues) {
+  TestIndex testIndex;
+  TestField f(testIndex, "foo_i");
+  f.startIndexing();
+  
+  f.add(0, 100);
+  f.add(1, -50);
+  f.add(2, 200);
+  f.add(3, 0);
+  f.add(4, -100);
+  f.add(5, 150);
+  
+  testIndex.flush();
+  f.startReading();
+  f.nextSegment();
+  
+  ASSERT_EQ(-100, f.colReader->getMin());
+  ASSERT_EQ(200, f.colReader->getMax());
+  
+  ASSERT_EQ(0, f.nextDoc());
+  ASSERT_EQ(100, f.val());
+  ASSERT_EQ(1, f.nextDoc());
+  ASSERT_EQ(-50, f.val());
+  ASSERT_EQ(2, f.nextDoc());
+  ASSERT_EQ(200, f.val());
+  ASSERT_EQ(3, f.nextDoc());
+  ASSERT_EQ(0, f.val());
+  ASSERT_EQ(4, f.nextDoc());
+  ASSERT_EQ(-100, f.val());
+  ASSERT_EQ(5, f.nextDoc());
+  ASSERT_EQ(150, f.val());
+  ASSERT_EQ(-1, f.nextDoc());
+}
+
+TEST_F(IntColTest, minMaxSingleValue) {
+  TestIndex testIndex;
+  TestField f(testIndex, "foo_i");
+  f.startIndexing();
+  
+  // Add a single value
+  f.add(0, 42);
+  
+  testIndex.flush();
+  f.startReading();
+  f.nextSegment();
+  
+  // Min and max should both be 42
+  ASSERT_NE(f.colReader, nullptr);
+  ASSERT_EQ(42, f.colReader->getMin());
+  ASSERT_EQ(42, f.colReader->getMax());
+}
+
 TEST_F(IntColTest, basic2) {
   TestIndex testIndex;
   std::vector<FieldAndValues> fvs;
