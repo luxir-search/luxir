@@ -102,7 +102,7 @@ public:
     // this is a int field for now, so we need to read the value for each doc
     // and accumulate counts per value.
     IntColReader intColReader(postingsReader, segFieldInfo);
-    IntColReader::Iterator intColIter(intColReader);
+    IntColReader::Iterator intColIter(intColReader); // TODO: OPT: use sparse iterator if the domain is sparse.
 
     auto collect = [&](int32_t docid) SOLUX_INLINE {
       if (intColIter.docId() < docid ) {
@@ -113,6 +113,7 @@ public:
           auto val = intColIter.value();
           callback(docid, val);
         } else {
+          // TODO: use bulk iter for dense domain?
           auto [start, end] = intColReader.getStartEndRank(intColIter.rank());
           auto n = end - start;
           for (int64_t vrank = 0; vrank < n; vrank++) {
@@ -126,10 +127,37 @@ public:
     };
 
     if (arrDocs) {
-      for (auto doc : arrDocs->docs()) {
-        collect(doc);
+      IntColReader::SparseIterator iter(intColReader);
+      // single valued case
+      if (!intColReader.multiValued()) {
+        for (auto docid : arrDocs->docs()) {
+          if (iter.docId() < docid ) {
+            iter.advance(docid);
+          }
+          if (iter.docId() == docid) {
+            auto val = iter.value();
+            callback(docid, val);
+          }
+        }
+      } else {
+        // multi-valued case
+        for (auto docid : arrDocs->docs()) {
+          if (iter.docId() < docid ) {
+            iter.advance(docid);
+          }
+          if (iter.docId() == docid) {
+            // TODO: use bulk iter for dense domain?
+            auto [start, end] = intColReader.getStartEndRank(iter.rank());
+            auto n = end - start;
+            for (int64_t vrank = 0; vrank < n; vrank++) {
+              auto val = iter.values().valueAt(start + vrank);
+              callback(docid, val);
+            }
+          }
+        }
       }
     } else {
+      // bit doc set domain
       int32_t docid = -1;
       while (docid + 1 < maxDoc) {
         if (bits) {
