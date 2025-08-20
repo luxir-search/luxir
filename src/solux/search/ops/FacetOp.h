@@ -348,6 +348,13 @@ solux::proto::Val* getTargetForSub(solux::proto::SearchResponse* searchResponse,
   return nullptr;
 };
     void calc(oneapi::tbb::task_group* tg, int32_t segnum, DocSet* domain) override {
+      // Handle empty index case
+      if (segnum == -1) {
+        // Empty index - just generate empty result
+        facetResult();
+        return;
+      }
+      
       std::unique_ptr<MergeableIntFacet> mergeableData(countMerger.obtain());
       SegFieldInfo segFieldInfo;
       auto& facetReq = (FacetReq&)getOp();
@@ -583,6 +590,14 @@ public:
       //TODO: need to account for slot somehow,  or will subop do that?
     };
     void calc(oneapi::tbb::task_group* tg, int32_t segnum, DocSet* domain) override {
+      // Handle empty index case
+      if (segnum == -1) {
+        // Empty index - just generate empty result
+        std::unique_ptr<MergeableStrFacet> mergeableData(countMerger.obtain());
+        facetResult(tg, std::move(mergeableData));
+        return;
+      }
+      
       if (!thisOp().inlineSubOps.empty()) {
         calc2(tg, segnum, domain);
         return;
@@ -1074,6 +1089,13 @@ public:
       return nullptr;
     };
     void calc(oneapi::tbb::task_group* tg, int32_t segnum, DocSet* domain) override {
+      // Handle empty index case
+      if (segnum == -1) {
+        // Empty index - just generate empty result
+        facetResult();
+        return;
+      }
+      
       SegFieldInfo segFieldInfo;
       int64_t missing_num = 0;
       auto& facetReq = (FacetReq&)getOp();
@@ -1192,6 +1214,16 @@ public:
       return nullptr;
     };
     void calc(oneapi::tbb::task_group* tg, int32_t segnum, DocSet* domain) override {
+      // Handle empty index case
+      if (segnum == -1) {
+        // Empty index - need to initialize merger with empty data
+        std::unique_ptr<IntFacetReq::MergeableIntFacet> mergeableData(countMerger.obtain());
+        mergeableData->counts = IntFacetReq::MergeableIntFacet::IntHash();
+        countMerger.release(mergeableData.release());
+        facetResult();
+        return;
+      }
+      
       std::unique_ptr<IntFacetReq::MergeableIntFacet> mergeableData(countMerger.obtain());
       SegFieldInfo segFieldInfo;
       
