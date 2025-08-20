@@ -40,6 +40,13 @@ private:
   std::optional<IntColReader> globDeltas; // for each global ord, what delta was applied to the segment ord to get the global ord
 
 public:
+  // Constructor for single segment with values case (identity mapping)
+  OrdMap(int64_t numOrds, int segmentWithValues) 
+    : data(nullptr), start(0), end(0), nOrds(numOrds), firstFull(segmentWithValues) {
+    // Keep segToGlobal empty - getSegToGlobal will return default values
+    // No global columns needed since one segment has all terms
+  }
+  
   OrdMap(std::unique_ptr<char[]>&& data, int64_t start, int64_t end) : data(std::move(data)), start(start), end(end) {
     InputStream dataIS(this->data.get() + start, this->data.get() + start + end);
 
@@ -95,6 +102,10 @@ public:
 
   /// Gets the mapping from segment ord to global ord, or null if the segment had no or all values for the field.
   SegToGlobal getSegToGlobal(int seg) const {
+    // If segToGlobal is empty (single segment with values case), return default
+    if (segToGlobal.empty()) {
+      return {0, nullptr};
+    }
     assert(seg >= 0 && seg < (int)segToGlobal.size());
     return segToGlobal[seg].get();
   }

@@ -65,8 +65,12 @@ TEST_F(OrdMapTest, SingleSegmentSimpleTerms) {
 
   auto ordMap = reader->getOrdMap("field1_s");
 
-  // With only one segment, OrdMap should return nullptr (identity mapping)
-  EXPECT_EQ(ordMap, nullptr) << "OrdMap should be null for single segment";
+  // With only one segment, OrdMap now returns a valid instance for identity mapping
+  EXPECT_NE(ordMap, nullptr) << "OrdMap should be valid for single segment";
+  
+  // Check that it has the correct properties for single segment
+  EXPECT_EQ(ordMap->firstFullSeg(), 0) << "First full segment should be 0";
+  EXPECT_EQ(ordMap->numOrds(), 3) << "Should have 3 unique terms (apple, banana, cherry)";
 }
 
 // Multiple Segments with Disjoint Terms

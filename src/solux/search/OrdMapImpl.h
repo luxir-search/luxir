@@ -68,6 +68,11 @@ public:
   std::unique_ptr<char[]> data;
   int64_t start = 0;
   int64_t size = 0;
+  
+  // For single segment with values case
+  bool isSingleSegment = false;
+  int segmentWithValues = -1;
+  int64_t numTerms = 0;
 
   void build() {
     auto poolGuard = MemPool::threadLocalPoolGuard();
@@ -112,6 +117,16 @@ public:
     
     // Fast path: if only one segment has values, no OrdMap is needed (identity mapping)
     if (segsWithValue == 1) {
+      // Find which segment has values and get term count from fieldInfo
+      for (size_t i = 0; i < allTermsEnums.size(); i++) {
+        if (allTermsEnums[i]) {
+          // Store values for OrdMap constructor
+          this->segmentWithValues = i;
+          this->numTerms = allTermsEnums[i]->tenum.numTerms();  // Get directly from fieldInfo
+          this->isSingleSegment = true;
+          break;
+        }
+      }
       return;
     }
 
@@ -295,6 +310,13 @@ public:
 std::shared_ptr<OrdMap> OrdMap::build(std::string_view field, IndexReader& reader) {
   OrdMapBuilder builder(field, reader);
   builder.build();
+  
+  // Handle single segment with values case
+  if (builder.isSingleSegment) {
+    return std::make_shared<OrdMap>(builder.numTerms, builder.segmentWithValues);
+  }
+  
+  // Handle normal case or no values case
   if (!builder.data) {
     return {};
   }

@@ -99,42 +99,89 @@ TEST_F(FacetTest, singleSegment) {
   CollectionHelper helper;
   helper.clear();
   
-  // Add some documents with integer field using dynamic field naming
+  // Add some documents with integer and string fields using dynamic field naming
+  std::vector<std::string> colors = {"red", "blue", "green", "red", "blue"};
   for (int i = 0; i < 5; i++) {
-    helper.index(flatdoc("id", std::to_string(i), "price_i", i * 10), UpdateMessage::NO_COMMIT);
+    helper.index(flatdoc("id", std::to_string(i), 
+                        "price_i", i * 10,
+                        "color_s", colors[i]), UpdateMessage::NO_COMMIT);
   }
   helper.commit();
   
-  // Create a search request with faceting
-  auto* lreq = LocalReq::create(soluxNode->getSearchEngine());
-  lreq->proto.mutable_collection()->add_name("main");
-  lreq->proto.set_request_id("test_single_segment");
-  
-  auto& ops = *lreq->proto.mutable_ops();
-  auto& topDocs = *ops["q"].mutable_top_docs();
-  topDocs.set_get_number(true);
-  topDocs.mutable_query()->set_all(true);
-  
-  auto& facet = *ops["f"].mutable_field_facet();
-  facet.set_field("price_i");
-  facet.set_limit(10);
-  
-  lreq->engine.submit(*lreq, true);
-  
-  ASSERT_EQ(1, lreq->responses.size());
-  const auto& facetResult = lreq->responses[0]->proto.ops().at("f").facet();
-  
-  // Should have 5 buckets (0, 10, 20, 30, 40)
-  ASSERT_EQ(5, facetResult.bucket_ids().col_i().v_size());
-  ASSERT_EQ(5, facetResult.counts_size());
-  
-  // Each bucket should have count of 1
-  for (int i = 0; i < 5; i++) {
-    EXPECT_EQ(i * 10, facetResult.bucket_ids().col_i().v(i));
-    EXPECT_EQ(1, facetResult.counts(i));
+  // Test integer faceting
+  {
+    auto* lreq = LocalReq::create(soluxNode->getSearchEngine());
+    lreq->proto.mutable_collection()->add_name("main");
+    lreq->proto.set_request_id("test_single_segment_int");
+    
+    auto& ops = *lreq->proto.mutable_ops();
+    auto& topDocs = *ops["q"].mutable_top_docs();
+    topDocs.set_get_number(true);
+    topDocs.mutable_query()->set_all(true);
+    
+    auto& facet = *ops["f"].mutable_field_facet();
+    facet.set_field("price_i");
+    facet.set_limit(10);
+    
+    lreq->engine.submit(*lreq, true);
+    
+    ASSERT_EQ(1, lreq->responses.size());
+    const auto& facetResult = lreq->responses[0]->proto.ops().at("f").facet();
+    
+    // Should have 5 buckets (0, 10, 20, 30, 40)
+    ASSERT_EQ(5, facetResult.bucket_ids().col_i().v_size());
+    ASSERT_EQ(5, facetResult.counts_size());
+    
+    // Each bucket should have count of 1
+    for (int i = 0; i < 5; i++) {
+      EXPECT_EQ(i * 10, facetResult.bucket_ids().col_i().v(i));
+      EXPECT_EQ(1, facetResult.counts(i));
+    }
+    
+    lreq->done();
   }
   
-  lreq->done();
+  // Test string faceting
+  {
+    auto* lreq = LocalReq::create(soluxNode->getSearchEngine());
+    lreq->proto.mutable_collection()->add_name("main");
+    lreq->proto.set_request_id("test_single_segment_string");
+    
+    auto& ops = *lreq->proto.mutable_ops();
+    auto& topDocs = *ops["q"].mutable_top_docs();
+    topDocs.set_get_number(true);
+    topDocs.mutable_query()->set_all(true);
+    
+    auto& facet = *ops["f_str"].mutable_field_facet();
+    facet.set_field("color_s");
+    facet.set_limit(10);
+    
+    lreq->engine.submit(*lreq, true);
+    
+    ASSERT_EQ(1, lreq->responses.size());
+    const auto& facetResult = lreq->responses[0]->proto.ops().at("f_str").facet();
+    
+    // Should have 3 unique colors
+    ASSERT_EQ(3, facetResult.bucket_ids().col_s().v_size());
+    ASSERT_EQ(3, facetResult.counts_size());
+    
+    // Check the counts for each color
+    // Note: facets are typically sorted by count desc, then by value
+    // We expect: red(2), blue(2), green(1)
+    std::map<std::string, int> expectedCounts = {
+      {"red", 2},
+      {"blue", 2}, 
+      {"green", 1}
+    };
+    
+    for (int i = 0; i < facetResult.bucket_ids().col_s().v_size(); i++) {
+      std::string color = std::string(facetResult.bucket_ids().col_s().v(i));
+      EXPECT_TRUE(expectedCounts.count(color) > 0) << "Unexpected color: " << color;
+      EXPECT_EQ(expectedCounts[color], facetResult.counts(i)) << "Wrong count for color: " << color;
+    }
+    
+    lreq->done();
+  }
 }
 
 TEST_F(FacetTest, multipleSegments) {
