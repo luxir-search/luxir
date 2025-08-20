@@ -72,17 +72,17 @@ static void BM_Facet(benchmark::State& state, int64_t nDocs, std::string_view sh
     if (facetResult.bucket_ids().has_col_i()) {
       auto& bucketIds = facetResult.bucket_ids().col_i();
       for (int i = 0; i < facetResult.counts().size(); i++) {
-        ret = ret * 31 + bucketIds.v(i) * counts[i];
+        ret = ret * 31 + bucketIds.v(i) + counts[i];
       }
     } else if (facetResult.bucket_ids().has_col_s()) {
       auto& bucketIds = facetResult.bucket_ids().col_s();
       for (int i = 0; i < facetResult.counts().size(); i++) {
-        ret = ret * 31 + std::hash<std::string_view>()(bucketIds.v(i)) * counts[i];
+        ret = ret * 31 + java_string_hashcode(bucketIds.v(i)) + counts[i];
       }
     } else if (facetResult.bucket_ids().has_multi_i()) {
       auto& bucketIds = facetResult.bucket_ids().multi_i();
       for (int i = 0; i < facetResult.counts().size(); i++) {
-        ret = ret * 31 + bucketIds.v(i).v(0) * counts[i];
+        ret = ret * 31 + bucketIds.v(i).v(0) + counts[i];
       }
     } else {
       LOG_ERROR("Unknown bucket ids type in facet result: {}", facetResult.bucket_ids().DebugString());
@@ -128,5 +128,9 @@ SOLUX_BENCHMARK_CAPTURE(BM_Facet, med_u1m_s_para,    nDocs, shape, "all", "med_u
 // test different domain sizes
 SOLUX_BENCHMARK_CAPTURE(BM_Facet, tinyD_u10_i,            nDocs, shape, "short_u1m_s", "u10_i", false);
 SOLUX_BENCHMARK_CAPTURE(BM_Facet, tinyD_u10_i,            nDocs, shape, "short_u1m_s", "u10_i", true);
-SOLUX_BENCHMARK_CAPTURE(BM_Facet, bigD_u10_i,            nDocs, shape, "short_u10_s", "u10_i", false);
-SOLUX_BENCHMARK_CAPTURE(BM_Facet, bigD_u10_i,            nDocs, shape, "short_u10_s", "u10_i", true);
+SOLUX_BENCHMARK_CAPTURE(BM_Facet, bigD_u10_i,             nDocs, shape, "short_u10_s", "u10_i", false);
+SOLUX_BENCHMARK_CAPTURE(BM_Facet, bigD_u10_i,             nDocs, shape, "short_u10_s", "u10_i", true);
+SOLUX_BENCHMARK_CAPTURE(BM_Facet, bigD_u10k_s,            nDocs, shape, "short_u10_s", "short_u10k_s", false);
+SOLUX_BENCHMARK_CAPTURE(BM_Facet, bigD_u10k_s,            nDocs, shape, "short_u10_s", "short_u10k_s", true);
+SOLUX_BENCHMARK_CAPTURE(BM_Facet, bigD_u1m_s,             nDocs, shape, "short_u10_s", "short_u1m_s", false);
+SOLUX_BENCHMARK_CAPTURE(BM_Facet, bigD_u1m_s,             nDocs, shape, "short_u10_s", "short_u1m_s", true);

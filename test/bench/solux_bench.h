@@ -14,6 +14,15 @@
 
 namespace solux {
 
+/// Match java's String.hashCode() implementation.
+inline int32_t java_string_hashcode(std::string_view sv) {
+  int32_t hash = 0;
+  for (char c : sv) {
+    hash = 31 * hash + static_cast<int32_t>(c);
+  }
+  return hash;
+}
+
 // true if we are running benchmarks as part of unit tests (i.e. it's ok
 // to do things that will mess up timings in the name of better test coverage.)
 extern bool unit_tests;

@@ -186,21 +186,114 @@ public:
 };
 
 class IntFacetReq : public FieldFacetReq {
+  int64_t globalMin = std::numeric_limits<int64_t>::max();
+  int64_t globalMax = std::numeric_limits<int64_t>::min();
+  bool useVector = false;
 public:
   class MergeableIntFacet : public MergeableData {
   public:
-    boost::unordered_flat_map<int64_t, int64_t> counts;
+    using IntHash = boost::unordered_flat_map<int64_t, int64_t>;
+    using CountVector = std::vector<int64_t>;
+    std::variant<std::monostate, IntHash, CountVector> counts;
     int64_t missing_num = 0; // number of missing values in this segment
+    int64_t minValue = 0; // minimum value in the range (used when counts is a vector)
 
     static MergeableIntFacet* merge(MergeableIntFacet* a, MergeableIntFacet* b) {
+      // Handle uninitialized cases
+      if (std::holds_alternative<std::monostate>(a->counts)) {
+        return b;
+      }
+      if (std::holds_alternative<std::monostate>(b->counts)) {
+        return a;
+      }
+      
       // merge the smaller collector into the larger collector, or if both the same size, merge
       // the less competitive collector into the more competitive collector.
-      if (a->counts.size() < b->counts.size()) {
-        std::swap(a,b);
-      }
-
-      for (auto [val, count] : b->counts) {
-        a->counts[val] += count;
+      if (auto* amap = std::get_if<IntHash>(&a->counts)) {
+        if (auto* bmap = std::get_if<IntHash>(&b->counts)) {
+          // Both are maps
+          if (amap->size() < bmap->size()) {
+            std::swap(a, b);
+            std::swap(amap, bmap);
+          }
+          for (auto [val, count] : *bmap) {
+            (*amap)[val] += count;
+          }
+        } else {
+          // a is map, b is vector
+          auto& bvec = std::get<CountVector>(b->counts);
+          for (size_t i = 0; i < bvec.size(); i++) {
+            if (bvec[i] > 0) {
+              (*amap)[b->minValue + i] += bvec[i];
+            }
+          }
+        }
+      } else if (auto* avec = std::get_if<CountVector>(&a->counts)) {
+        if (auto* bvec = std::get_if<CountVector>(&b->counts)) {
+          // Both are vectors - need to handle potentially different ranges
+          if (a->minValue == b->minValue && avec->size() == bvec->size()) {
+            // Same range - simple addition
+            for (size_t i = 0; i < bvec->size(); i++) {
+              (*avec)[i] += (*bvec)[i];
+            }
+          } else {
+            // Different ranges - calculate combined range
+            int64_t aMax = a->minValue + (int64_t)avec->size() - 1;
+            int64_t bMax = b->minValue + (int64_t)bvec->size() - 1;
+            int64_t newMin = std::min(a->minValue, b->minValue);
+            int64_t newMax = std::max(aMax, bMax);
+            int64_t newRange = newMax - newMin + 1;
+            
+            if (newRange <= 100000) {
+              // Reuse avec - resize if needed (no-op if already large enough)
+              int64_t oldSize = (int64_t)avec->size();
+              avec->resize(newRange);
+              
+              // If the new min is lower, shift existing values to the right
+              if (newMin < a->minValue) {
+                int64_t shift = a->minValue - newMin;
+                // Fill new cells with 0 first (resize may not zero them if growing)
+                for (int64_t i = oldSize; i < newRange; i++) {
+                  (*avec)[i] = 0;
+                }
+                // Move existing values to the right
+                for (int64_t i = oldSize - 1; i >= 0; i--) {
+                  (*avec)[i + shift] = (*avec)[i];
+                  (*avec)[i] = 0;
+                }
+                a->minValue = newMin;
+              }
+              
+              // Add b's values at their correct positions
+              for (size_t i = 0; i < bvec->size(); i++) {
+                (*avec)[b->minValue - a->minValue + i] += (*bvec)[i];
+              }
+            } else {
+              // Range too large - convert to map
+              IntHash newMap;
+              for (size_t i = 0; i < avec->size(); i++) {
+                if ((*avec)[i] > 0) {
+                  newMap[a->minValue + i] = (*avec)[i];
+                }
+              }
+              for (size_t i = 0; i < bvec->size(); i++) {
+                if ((*bvec)[i] > 0) {
+                  newMap[b->minValue + i] += (*bvec)[i];
+                }
+              }
+              a->counts = std::move(newMap);
+            }
+          }
+        } else {
+          // a is vector, b is map
+          auto& bmap = std::get<IntHash>(b->counts);
+          for (auto [val, count] : bmap) {
+            int64_t idx = val - a->minValue;
+            if (idx >= 0 && idx < (int64_t)avec->size()) {
+              (*avec)[idx] += count;
+            }
+          }
+        }
       }
       a->missing_num += b->missing_num;
       return a;
@@ -211,6 +304,37 @@ private:
 public:
   IntFacetReq(SearchRequest& req, const proto::FieldFacet& fieldFacet, std::string_view fieldName, std::string_view facetName, int64_t limit, int64_t minCount, bool missing) :
   FieldFacetReq(req, fieldFacet, fieldName, facetName, limit, minCount, missing){}
+
+  void init() override {
+    FieldFacetReq::init();
+    
+    // Calculate global min/max across all segments
+    for (size_t segnum = 0; segnum < reader.segments().size(); segnum++) {
+      auto& postingsReader = reader.segments()[segnum].postingsReader();
+      auto poolGuard = MemPool::threadLocalPoolGuard();
+      FieldReader fieldReader(poolGuard.pool(), postingsReader);
+      bool found = fieldReader.seek(fieldName);
+      if (!found) continue;
+      
+      SegFieldInfo segFieldInfo;
+      fieldReader.readFieldInfo(segFieldInfo);
+      if (segFieldInfo.numValues == 0) continue;
+      
+      IntColReader intColReader(postingsReader, segFieldInfo);
+      globalMin = std::min(globalMin, intColReader.getMin());
+      globalMax = std::max(globalMax, intColReader.getMax());
+    }
+    
+    // Decide whether to use vector based on global range
+    if (globalMin <= globalMax) {
+      int64_t range = globalMax - globalMin + 1;
+      // Use vector if range is reasonable
+      // TODO: also consider total number of docs
+      if (range > 0 && range <= 100000) {
+        useVector = true;
+      }
+    }
+  }
 
   class Calc : public Calculator {
     AtomicMerger<MergeableIntFacet> countMerger;
@@ -225,15 +349,40 @@ solux::proto::Val* getTargetForSub(solux::proto::SearchResponse* searchResponse,
 };
     void calc(oneapi::tbb::task_group* tg, int32_t segnum, DocSet* domain) override {
       std::unique_ptr<MergeableIntFacet> mergeableData(countMerger.obtain());
-      boost::unordered_flat_map<int64_t, int64_t>& count = mergeableData->counts;
       SegFieldInfo segFieldInfo;
       auto& facetReq = (FacetReq&)getOp();
-      // After facetSegIntCol was upgraded to handle ArrDocSet and BitDocSet, we saw performance degredation of 20-40%.
-      // Forcing inline on the callback lambda here resolved the issue.
-      facetReq.facetSegIntCol(domain, segnum, mergeableData->missing_num, segFieldInfo, [&](int32_t docid, int64_t val) SOLUX_INLINE {
-        unused(docid);
-        count[val]++;
-      });
+      
+      // Initialize storage based on pre-determined type
+      if (std::holds_alternative<std::monostate>(mergeableData->counts)) {
+        // First time initialization - use pre-determined storage type
+        if (thisOp().useVector) {
+          int64_t range = thisOp().globalMax - thisOp().globalMin + 1;
+          mergeableData->counts = MergeableIntFacet::CountVector(range, 0);
+          mergeableData->minValue = thisOp().globalMin;
+        } else {
+          mergeableData->counts = MergeableIntFacet::IntHash();
+        }
+      }
+      
+      // Now do the actual faceting with simple lambdas
+      if (auto* countVec = std::get_if<MergeableIntFacet::CountVector>(&mergeableData->counts)) {
+        // Vector storage - simple array indexing
+        int64_t minVal = mergeableData->minValue;
+        facetReq.facetSegIntCol(domain, segnum, mergeableData->missing_num, segFieldInfo, 
+          [countVec, minVal](int32_t docid, int64_t val) SOLUX_INLINE {
+            unused(docid);
+            (*countVec)[val - minVal]++;
+          });
+      } else {
+        // Map storage - direct value mapping
+        auto* countMap = &std::get<MergeableIntFacet::IntHash>(mergeableData->counts);
+        facetReq.facetSegIntCol(domain, segnum, mergeableData->missing_num, segFieldInfo, 
+          [countMap](int32_t docid, int64_t val) SOLUX_INLINE {
+            unused(docid);
+            (*countMap)[val]++;
+          });
+      }
+      
       auto merged = countMerger.release(mergeableData.release());
       if (merged == thisOp().reader.segments().size()) {
         facetResult();
@@ -248,13 +397,25 @@ solux::proto::Val* getTargetForSub(solux::proto::SearchResponse* searchResponse,
       auto missing = thisOp().missing;
 
       auto* mergedData = countMerger.obtain();
-      auto& counts = mergedData->counts;
       std::vector<std::pair<int64_t, int64_t>> countVec;
-      for (auto [val, count] : counts) {
-        if (count >= minCount) {
-          countVec.emplace_back(val, count);
+      
+      // Handle both storage types
+      if (auto* countMap = std::get_if<MergeableIntFacet::IntHash>(&mergedData->counts)) {
+        // Map storage
+        for (auto [val, count] : *countMap) {
+          if (count >= minCount) {
+            countVec.emplace_back(val, count);
+          }
+        }
+      } else if (auto* countVector = std::get_if<MergeableIntFacet::CountVector>(&mergedData->counts)) {
+        // Vector storage - convert indices back to values
+        for (size_t i = 0; i < countVector->size(); i++) {
+          if ((*countVector)[i] > 0 && (*countVector)[i] >= minCount) {
+            countVec.emplace_back(mergedData->minValue + i, (*countVector)[i]);
+          }
         }
       }
+      
       auto missing_count = mergedData->missing_num;
       delete mergedData;
       std::sort(countVec.begin(), countVec.end(), [](const auto& a, const auto& b) {
@@ -1033,7 +1194,13 @@ public:
     void calc(oneapi::tbb::task_group* tg, int32_t segnum, DocSet* domain) override {
       std::unique_ptr<IntFacetReq::MergeableIntFacet> mergeableData(countMerger.obtain());
       SegFieldInfo segFieldInfo;
-      boost::unordered_flat_map<int64_t, int64_t>& count = mergeableData->counts;
+      
+      // IntFacetRangeReq always uses map storage since ranges can be arbitrary
+      if (std::holds_alternative<std::monostate>(mergeableData->counts)) {
+        mergeableData->counts = IntFacetReq::MergeableIntFacet::IntHash();
+      }
+      auto& count = std::get<IntFacetReq::MergeableIntFacet::IntHash>(mergeableData->counts);
+      
       auto start = thisOp().start;
       auto end = thisOp().end;
       auto gap = thisOp().gap;
@@ -1062,7 +1229,8 @@ public:
       auto gap = thisOp().gap;
 
       auto* mergedData = countMerger.obtain();
-      auto& counts = mergedData->counts;
+      // IntFacetRangeReq always uses map storage
+      auto& counts = std::get<IntFacetReq::MergeableIntFacet::IntHash>(mergedData->counts);
       std::vector<std::pair<int64_t, int64_t>> countVec;
       for (auto [val, count] : counts) {
         if (minCount == -1 || count >= minCount) {
