@@ -24,8 +24,8 @@ namespace solux {
 #define GRPC_DEBUG LOG_TRACE
 // #define GRPC_DEBUG LOG_DEBUG
 
-GRPCServer::GRPCServer(SoluxNode& node, int nthreads)
-  : soluxNode(node), startLatch(1), startLatchThreads(nthreads), nthreads(nthreads) {
+GRPCServer::GRPCServer(SoluxNode& node, int nthreads, int port)
+  : soluxNode(node), startLatch(1), startLatchThreads(nthreads), nthreads(nthreads), requestedPort(port) {
 }
 
 // NOTE: as of gRPC 1.39 there is a new C++ async callback API: https://github.com/grpc/grpc/pull/25728 in addition to an EventEngine
@@ -34,13 +34,15 @@ GRPCServer::GRPCServer(SoluxNode& node, int nthreads)
 void solux::GRPCServer::run() {
   pthread_setname_np(pthread_self(), "solux_grpc_main");
 
-  std::string server_address("0.0.0.0:50051");
+  // Use requestedPort (default 0 for dynamic allocation, or a specific port like 50051)
+  std::string server_address = "0.0.0.0:" + std::to_string(requestedPort);
 
   grpc::EnableDefaultHealthCheckService(true);
   grpc::reflection::InitProtoReflectionServerBuilderPlugin();
   grpc::ServerBuilder builder;
   // Listen on the given address without any authentication mechanism.
-  builder.AddListeningPort(server_address, grpc::InsecureServerCredentials());
+  // The actual port will be stored in serverPort
+  builder.AddListeningPort(server_address, grpc::InsecureServerCredentials(), &serverPort);
   // Register "service" as the instance through which we'll communicate with
   // clients. In this case it corresponds to a *synchronous* service.
 
@@ -61,7 +63,7 @@ void solux::GRPCServer::run() {
   }
 
   this->server = builder.BuildAndStart();
-  GRPC_DEBUG("GRPCServer listening on {}", server_address);
+  LOG_INFO("GRPCServer listening on 0.0.0.0:{}", serverPort);
 
   // inform everyone that the server is up and running
   startLatch.count_down();

@@ -13,7 +13,8 @@ public:
   // gRPC performance guidelines suggest having numcpu threads and 2 threads per completion queue.
   // Are those real cpu cores, or the hyper-threaded cores that hardware_concurrency reports?
   // https://grpc.io/docs/guides/performance/
-  GRPCServer(SoluxNode& node, int nthreads = std::max(1u, std::thread::hardware_concurrency() / 2));
+  // port: The port to listen on. Use 0 for dynamic port allocation (useful for testing).
+  GRPCServer(SoluxNode& node, int nthreads = std::max(1u, std::thread::hardware_concurrency() / 2), int port = 0);
 
   /// This starts the server and blocks the current thread until shutdown.
   void run();
@@ -28,6 +29,11 @@ public:
   /// Get the associated SoluxNode.
   SoluxNode& getSoluxNode() {
     return soluxNode;
+  }
+
+  /// Get the port the server is listening on
+  int getPort() const {
+    return serverPort;
   }
 
 
@@ -54,6 +60,8 @@ private:
   std::vector<std::thread> threads;
   std::vector<ThreadInfo> threadInfos;
   int nthreads;
+  int serverPort = 0;
+  int requestedPort = 0;
 
 
   // this is run for each thread

@@ -1,5 +1,6 @@
 #include <filesystem>
 #include <sstream>
+#include <thread>
 #include "solux/util/solux_util.h"
 #include "solux/server/GRPCServer.h"
 
@@ -10,7 +11,8 @@ using namespace solux;
 int solux_main(int argc, char** argv) {
   unused(argc, argv);
   SoluxNode node;
-  GRPCServer server(node);
+  // Use default port 50051 for production
+  GRPCServer server(node, std::max(1u, std::thread::hardware_concurrency() / 2), 50051);
   server.run();
   return 0;
 }

@@ -15,10 +15,7 @@
 #include "solux/util/AtomicMerger.h"
 
 namespace solux {
-class FacetDomain {
-public:
-  std::vector<BitDocSet> allMatches;
-};
+
 
 class FacetReq : public SearchOp {
 public:

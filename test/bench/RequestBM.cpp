@@ -14,15 +14,9 @@ using namespace solux;
 
 static void BM_Req(benchmark::State& state, int writers, int readers, bool async) {
   unused(writers,readers);
-  GrpcSoluxTest::startServer();
-
-  std::shared_ptr<grpc::Channel> channel;
-  std::unique_ptr<solux::Greeter::Stub> greeterStub;
-  std::unique_ptr<solux::Indexer::Stub> indexerStub;
-
-  // TODO: give ability to point this to an existing external server
-  channel = grpc::CreateChannel("localhost:50051", grpc::InsecureChannelCredentials());
-  greeterStub = solux::Greeter::NewStub(channel);
+  
+  auto channel = GrpcSoluxTest::getChannel();
+  std::unique_ptr<solux::Greeter::Stub> greeterStub = solux::Greeter::NewStub(channel);
 
   solux::HelloRequest req;
   solux::HelloReply result;

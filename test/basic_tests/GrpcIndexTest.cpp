@@ -15,16 +15,12 @@ using namespace solux;
 
 class GrpcIndexTest : public GrpcSoluxTest {
 public:
-  std::shared_ptr<grpc::Channel> channel;
   std::unique_ptr<solux::Greeter::Stub> greeterStub;
   std::unique_ptr<solux::Indexer::Stub> indexerStub;
   std::unique_ptr<solux::Searcher::Stub> searchStub;
 
   GrpcIndexTest() {
-    startServer();
-    // channels are thread safe
-    // TODO: move channel to somewhere that multiple tests can use it
-    channel = grpc::CreateChannel("localhost:50051", grpc::InsecureChannelCredentials());
+    auto channel = getChannel();
     greeterStub = solux::Greeter::NewStub(channel);
     indexerStub = solux::Indexer::NewStub(channel);
     searchStub = solux::Searcher::NewStub(channel);

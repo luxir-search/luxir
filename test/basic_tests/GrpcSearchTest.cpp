@@ -13,12 +13,10 @@ using namespace solux;
 
 class GrpcSearchTest : public GrpcSoluxTest {
 public:
-  std::shared_ptr<grpc::Channel> channel;
   std::unique_ptr<solux::Searcher::Stub> searchStub;
 
   GrpcSearchTest() {
-    startServer();
-    channel = grpc::CreateChannel("localhost:50051", grpc::InsecureChannelCredentials());
+    auto channel = getChannel();
     searchStub = solux::Searcher::NewStub(channel);
   }
 };
