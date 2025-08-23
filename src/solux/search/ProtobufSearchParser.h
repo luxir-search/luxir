@@ -4,6 +4,7 @@
 #include "ops/RootOp.h"
 #include "ops/SearchOp.h"
 #include "ops/FacetOp.h"
+#include "ops/StrFacetOp.h"
 #include "ops/StatsOp.h"
 #include "ops/TopDocsReq.h"
 #include "solux/query/ProtobufQueryParser.h"
@@ -13,6 +14,11 @@ namespace solux {
 class ProtobufSearchParser {
   SearchRequest& req;
   TopDocsReq* firstQuery = nullptr;
+
+
+
+
+
 public:
   // The provided pool will be used to store the parsed query tree.
   // We need access to the schema to figure out what types of queries to produce?
@@ -53,7 +59,7 @@ public:
       }
       case solux::proto::SearchOp::kFieldFacet: {
         auto& facetReq = searchOp.field_facet();
-        auto* facet = FacetReq::createFieldFacetReq(req, name, facetReq, req.arena);
+        auto* facet = createFieldFacetReq(name, facetReq);
         addSubs(*facet, searchOp.field_facet().ops());
         return facet;
       } // end case
@@ -89,6 +95,39 @@ public:
       default:
         throw std::runtime_error("Unknown search operation");
     }
+  }
+
+  FacetReq* createFieldFacetReq(std::string_view facetName, const proto::FieldFacet& facetReq) {
+    auto facetField = facetReq.field();
+    int64_t limit = 5; // default limit
+    if (facetReq.has_limit()) {
+      limit = facetReq.limit();
+    }
+    int64_t minCount = -1;
+    if (facetReq.has_mincount()) {
+      minCount = facetReq.mincount();
+    }
+    auto missing = facetReq.missing();
+    //arena allocate FacetReq
+    FacetReq* facet = nullptr;
+    auto& ftype = req.schema->getFieldTypeEx(facetField);
+
+    switch (ftype->type()) {
+      case FieldType::Type::INT:
+        facet = google::protobuf::Arena::Create<IntFacetReq>(&req.arena, req, facetReq, facetField, facetName, limit, minCount,  missing);
+        break;
+      case FieldType::Type::STRING:
+        facet = google::protobuf::Arena::Create<StrFacetOp>(&req.arena, req, facetReq, facetField, facetName, limit, minCount, missing);
+        break;
+      case FieldType::Type::TEXT:
+        facet = google::protobuf::Arena::Create<FullTextFacetReq>(&req.arena, req, facetReq, facetField, facetName, limit, minCount, missing);
+        break;
+      default: ;
+    }
+    if (facet == nullptr) {
+      throw std::runtime_error("Unknown facet field type: " + std::string(facetField));
+    }
+    return facet;
   }
 
   SearchOp* parseTopDocs(std::string_view name, const solux::proto::TopDocs& topDocsReq) {
