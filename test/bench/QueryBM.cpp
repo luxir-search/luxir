@@ -1,6 +1,8 @@
 #include <charconv>
 #include <latch>
 
+#include <tbb/task_group.h>
+
 #include "bench/solux_bench.h"
 #include "test/CollectionHelper.h"
 #include "test/LocalReq.h"
@@ -8,79 +10,95 @@
 using namespace solux;
 using namespace solux::test;
 
-static std::vector<std::pair<int32_t, int32_t>> ivals;
 
 namespace solux {
 void buildBenchIndex(CollectionHelper& helper, int64_t nDocs, std::span<const int32_t> docsPerSeg) {
   unused(nDocs);
   helper.clear();
-  ivals.clear();  // Clear the static tracking vector
 
   std::vector<std::pair<int32_t, int32_t>> vals;
 
   auto iw = helper.getIndexWriter();
-  int64_t idNum = 0;
-  for (size_t segnum=0; segnum<docsPerSeg.size(); segnum++) {
-    // LOG_ERROR("Segment {} with {} docs, rng={}", segnum, docsPerSeg[segnum], (int64_t)r());
-
-    int segDocs = docsPerSeg[segnum];
-    Inverter& inverter = iw->obtainInverter();
-    Inverter::IndexHandler& s0 = inverter.getIndexHandler("id");
-
-    Inverter::IndexHandler& s1 = inverter.getIndexHandler("short_u10_s");
-    Inverter::IndexHandler& s2 = inverter.getIndexHandler("short_u10k_s");
-    Inverter::IndexHandler& s3 = inverter.getIndexHandler("short_u1m_s");
-    Inverter::IndexHandler& s4 = inverter.getIndexHandler("med_u10_s");
-    Inverter::IndexHandler& s5 = inverter.getIndexHandler("med_u10k_s");
-    Inverter::IndexHandler& s6 = inverter.getIndexHandler("med_u1m_s");
-
-    Inverter::IndexHandler& i1 = inverter.getIndexHandler("u10_i");
-    Inverter::IndexHandler& i2 = inverter.getIndexHandler("u10k_i");
-    Inverter::IndexHandler& i3 = inverter.getIndexHandler("u10m_i");
-
-    std::string s;
-    for (int i=0; i<segDocs; i++) {
-      SplitMix64 r(idNum); // make each doc predictable
-
-      // add some random values to the index
-      inverter.startDoc();
-      s0.index(inverter, std::to_string(idNum++));
-
-      s1.index(inverter, std::to_string(r.rint(10)));
-      s2.index(inverter, std::to_string(r.rint(10000)));
-      s3.index(inverter, std::to_string(r.rint(1000000)));
-
-      s.resize(0);
-      s.append(std::to_string(r.rint(10)));
-      s.append("medium_length_string_no_SSO");
-      s4.index(inverter, s);
-
-      s.resize(0);
-      s.append(std::to_string(r.rint(100)));
-      s.append("medium_length_string_no_SSO");
-      s.append(std::to_string(r.rint(100)));
-      s5.index(inverter, s);
-
-      s.resize(0);
-      s.append(std::to_string(r.rint(1000)));
-      s.append("medium_length_string_no_SSO");
-      s.append(std::to_string(r.rint(1000)));
-      s6.index(inverter, s);
-
-      i1.index(inverter, r.rint(10));
-
-      auto iVal = r.rint(10000);
-      // ivals.emplace_back(iVal, idNum-1);  // keep track of vals
-      i2.index(inverter, iVal);
-
-      i3.index(inverter, r.rint(10000000));
-
-      inverter.finishDoc();
-    }
-    iw->releaseInverter(inverter);
-    helper.commit();
-    // LOG_ERROR("DONE Segment {} rng={}", segnum, (int64_t)r());
+  
+  // Pre-obtain all inverters we need for parallel segment building
+  std::vector<Inverter*> inverters;
+  inverters.reserve(docsPerSeg.size());
+  for (size_t i = 0; i < docsPerSeg.size(); i++) {
+    inverters.push_back(&iw->obtainInverter());
   }
+
+  // Calculate starting document ID for each segment
+  std::vector<int64_t> segmentStartIds;
+  segmentStartIds.reserve(docsPerSeg.size());
+  int64_t idNum = 0;
+  for (size_t i = 0; i < docsPerSeg.size(); i++) {
+    segmentStartIds.push_back(idNum);
+    idNum += docsPerSeg[i];
+  }
+
+  // Build all segments in parallel using TBB task_group
+  tbb::task_group tg;
+  for (size_t segnum = 0; segnum < docsPerSeg.size(); segnum++) {
+    tg.run([&, segnum]() {
+      int segDocs = docsPerSeg[segnum];
+      Inverter& inverter = *inverters[segnum];
+      int64_t localIdNum = segmentStartIds[segnum];
+      
+      Inverter::IndexHandler& s0 = inverter.getIndexHandler("id");
+      Inverter::IndexHandler& s1 = inverter.getIndexHandler("short_u10_s");
+      Inverter::IndexHandler& s2 = inverter.getIndexHandler("short_u10k_s");
+      Inverter::IndexHandler& s3 = inverter.getIndexHandler("short_u1m_s");
+      Inverter::IndexHandler& s4 = inverter.getIndexHandler("med_u10_s");
+      Inverter::IndexHandler& s5 = inverter.getIndexHandler("med_u10k_s");
+      Inverter::IndexHandler& s6 = inverter.getIndexHandler("med_u1m_s");
+      Inverter::IndexHandler& i1 = inverter.getIndexHandler("u10_i");
+      Inverter::IndexHandler& i2 = inverter.getIndexHandler("u10k_i");
+      Inverter::IndexHandler& i3 = inverter.getIndexHandler("u10m_i");
+
+      std::string s;
+      for (int i = 0; i < segDocs; i++) {
+        SplitMix64 r(localIdNum); // make each doc predictable
+
+        // add some random values to the index
+        inverter.startDoc();
+        s0.index(inverter, std::to_string(localIdNum++));
+
+        s1.index(inverter, std::to_string(r.rint(10)));
+        s2.index(inverter, std::to_string(r.rint(10000)));
+        s3.index(inverter, std::to_string(r.rint(1000000)));
+
+        s.resize(0);
+        s.append(std::to_string(r.rint(10)));
+        s.append("medium_length_string_no_SSO");
+        s4.index(inverter, s);
+
+        s.resize(0);
+        s.append(std::to_string(r.rint(100)));
+        s.append("medium_length_string_no_SSO");
+        s.append(std::to_string(r.rint(100)));
+        s5.index(inverter, s);
+
+        s.resize(0);
+        s.append(std::to_string(r.rint(1000)));
+        s.append("medium_length_string_no_SSO");
+        s.append(std::to_string(r.rint(1000)));
+        s6.index(inverter, s);
+
+        i1.index(inverter, r.rint(10));
+
+        auto iVal = r.rint(10000);
+        i2.index(inverter, iVal);
+
+        i3.index(inverter, r.rint(10000000));
+
+        inverter.finishDoc();
+      }
+      iw->releaseInverter(inverter, true);  // immediately request a flush of the segment.
+    });
+  }
+  tg.wait();
+
+  helper.commit();
 
   if (!solux::unit_tests) {
     malloc_trim(0);
@@ -187,16 +205,6 @@ static void BM_Query(benchmark::State& state, int64_t nDocs, std::string_view sh
     buildBenchIndex(helper, nDocs, docsPerSeg);
   }
 
-  if (sfield == "u10k_i") {
-    std::sort(ivals.begin(), ivals.end(), [](const auto& a, const auto& b) {
-        if (a.first == b.first) {
-          return a.second < b.second; // tie break by id ascending
-        }
-        return a.first > b.first; // sort by value descending
-      }
-    );
-  }
-
   // if the sortfield ends in _s, we want to make sure to pre-load the OrdMap
   std::shared_ptr<OrdMap> ordMap;
   if (sfield.ends_with("_s")) {
@@ -256,13 +264,6 @@ static void BM_Query(benchmark::State& state, int64_t nDocs, std::string_view sh
     for (int i = 0; i < idCol.v_size(); i++) {
       int64_t id = 0;
       std::from_chars(idCol.v(i).data(), idCol.v(i).data() + idCol.v(i).size(), id);
-#ifdef REMOVED
-      if (ivals.size() > 0 && sfield == "u10k_i") {
-        // LOG_ERROR("position {} id={} should be id={}", i, id, ivals[i].second);
-        // verify that the results are in the correct order
-        ASSERT_EQ(id, ivals[i].second);
-      }
-#endif
       ret = ret * 31 + id;
     }
 
