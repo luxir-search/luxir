@@ -336,7 +336,7 @@ public:
   Inverter& obtainInverter(uint64_t updateVersion = 0);
 
   // Releases an inverter back to the pool.
-  void releaseInverter(Inverter& inverter);
+  void releaseInverter(Inverter& inverter, bool flush=false);
 
   // Asynchronous commit that calls the callback when the commit is finished.  This should be preferred over blocking.
   void commit(std::function <void()>&& callback, UpdateMessage::CommitType commitType=UpdateMessage::COMMIT);

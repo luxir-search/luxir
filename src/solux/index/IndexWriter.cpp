@@ -232,7 +232,7 @@ Inverter& IndexWriter::obtainInverter(uint64_t updateVersion) {
 }
 
 
-void IndexWriter::releaseInverter(Inverter& inverter) {
+void IndexWriter::releaseInverter(Inverter& inverter, bool flush) {
   const std::lock_guard<std::mutex> lock(indexMutex);
   auto it = busyInverters.find(&inverter);
   if (it == busyInverters.end()) {
@@ -244,9 +244,13 @@ void IndexWriter::releaseInverter(Inverter& inverter) {
   // TODO: if the inverter is over a certain size, flush it
 
   // if this inverter is part of a commit, initiate a flush.
-  if (inverter.commitInfo != nullptr) {
-    INDEX_DEBUG("releaseInverter: inverter={} message={} triggering flush.", inverter,
-                (void*)inverter.commitInfo->updateMessage);
+  if (inverter.commitInfo != nullptr || flush) {
+    if (inverter.commitInfo) {
+      INDEX_DEBUG("inverter={} message={} triggering flush.", inverter,
+                  (void*)inverter.commitInfo->updateMessage);
+    } else {
+      INDEX_DEBUG("inverter={} flush requested.", inverter);
+    }
     flushingInverters.emplace(&inverter, std::move(it->second));
     it = busyInverters.erase(it);
     segmentFlushNode->try_put(&inverter);
@@ -327,7 +331,7 @@ void IndexWriter::initiateCommit(UpdateMessage& msg) {
     // first look at any flushing inverters that are not marked for a commit yet
     // and mark them if necessary.
     for (auto it = flushingInverters.begin(); it != flushingInverters.end(); it++) {
-      if (it->second->commitInfo == nullptr && it->second->minVersion) {
+      if (it->second->commitInfo == nullptr && it->second->minVersion <= msg.updateVersion) {
         INDEX_DEBUG("\tinitiateCommit: msg={} marking flushing inverter={} for commit", (void*)&msg,
                     *it->second.get());
         it->second->commitInfo = &commitInfo;

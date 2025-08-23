@@ -1266,6 +1266,71 @@ TEST_F(IndexWriterTest, removeFields) {
 }
 
 
+// Test concurrent flush and commit - reproduces issue where an already
+// flushing segment may not be included in commit
+TEST_F(IndexWriterTest, concurrentFlushAndCommit) {
+  RAMDir dir;
+  IndexWriter iw(dir);
+  int nDocs = 100;  // 100 docs was enough to reliably reproduce the issue with debug/asan at least
+  
+  // Create a large segment that takes time to flush
+  auto& largeInverter = iw.obtainInverter();
+  auto& largeFieldHandler = largeInverter.getIndexHandler(field);
+  
+  // Add many documents to make flush expensive
+  for (int i = 0; i < nDocs; i++) {
+    largeInverter.startDoc();
+    std::string text = "document " + std::to_string(i) + " with some text to make it bigger";
+    for (int j = 0; j < 10; j++) {
+      text += " extra content " + std::to_string(j);
+    }
+    largeFieldHandler.index(largeInverter, text);
+    largeInverter.finishDoc();
+  }
+  
+  // Create a small segment that's cheap to flush
+  auto& smallInverter = iw.obtainInverter();
+  auto& smallFieldHandler = smallInverter.getIndexHandler(field);
+  
+  smallInverter.startDoc();
+  smallFieldHandler.index(smallInverter, "tiny doc");
+  smallInverter.finishDoc();
+  
+  // Release large inverter with immediate flush request
+  // This starts an async flush of the large segment
+  iw.releaseInverter(largeInverter, true);
+  
+  // Immediately release small inverter without flush request
+  // This should be quick
+  iw.releaseInverter(smallInverter, false);
+  
+  // Now commit - this should wait for the large segment flush to complete
+  // If it doesn't, we'll be missing the large segment
+  iw.commit();
+  
+  // Verify both segments are present
+  auto reader = iw.getIndexReader();
+  ASSERT_EQ(2, reader->segments().size());
+  
+  // Verify we have the correct number of documents
+  int totalDocs = 0;
+  bool foundLargeSegment = false;
+  bool foundSmallSegment = false;
+  
+  for (const auto& segment : reader->segments()) {
+    totalDocs += segment.maxDoc();
+    if (segment.maxDoc() == nDocs) {
+      foundLargeSegment = true;
+    } else if (segment.maxDoc() == 1) {
+      foundSmallSegment = true;
+    }
+  }
+  
+  EXPECT_TRUE(foundLargeSegment);
+  EXPECT_TRUE(foundSmallSegment);
+  EXPECT_EQ(nDocs + 1, totalDocs);
+}
+
 // Test coreGen tracking and segment commit_time
 TEST_F(IndexWriterTest, testCoreGen) {
   using namespace solux::test;
