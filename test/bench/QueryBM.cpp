@@ -47,10 +47,11 @@ void buildBenchIndex(CollectionHelper& helper, int64_t nDocs, std::span<const in
       Inverter::IndexHandler& s0 = inverter.getIndexHandler("id");
       Inverter::IndexHandler& s1 = inverter.getIndexHandler("short_u10_s");
       Inverter::IndexHandler& s2 = inverter.getIndexHandler("short_u10k_s");
-      Inverter::IndexHandler& s3 = inverter.getIndexHandler("short_u1m_s");
-      Inverter::IndexHandler& s4 = inverter.getIndexHandler("med_u10_s");
-      Inverter::IndexHandler& s5 = inverter.getIndexHandler("med_u10k_s");
-      Inverter::IndexHandler& s6 = inverter.getIndexHandler("med_u1m_s");
+      Inverter::IndexHandler& s3 = inverter.getIndexHandler("short_u100k_s");
+      Inverter::IndexHandler& s4 = inverter.getIndexHandler("short_u1m_s");
+      Inverter::IndexHandler& s5 = inverter.getIndexHandler("med_u10_s");
+      Inverter::IndexHandler& s6 = inverter.getIndexHandler("med_u10k_s");
+      Inverter::IndexHandler& s7 = inverter.getIndexHandler("med_u1m_s");
       Inverter::IndexHandler& i1 = inverter.getIndexHandler("u10_i");
       Inverter::IndexHandler& i2 = inverter.getIndexHandler("u10k_i");
       Inverter::IndexHandler& i3 = inverter.getIndexHandler("u10m_i");
@@ -65,24 +66,25 @@ void buildBenchIndex(CollectionHelper& helper, int64_t nDocs, std::span<const in
 
         s1.index(inverter, std::to_string(r.rint(10)));
         s2.index(inverter, std::to_string(r.rint(10000)));
-        s3.index(inverter, std::to_string(r.rint(1000000)));
+        s3.index(inverter, std::to_string(r.rint(100000)));
+        s4.index(inverter, std::to_string(r.rint(1000000)));
 
         s.resize(0);
         s.append(std::to_string(r.rint(10)));
         s.append("medium_length_string_no_SSO");
-        s4.index(inverter, s);
-
-        s.resize(0);
-        s.append(std::to_string(r.rint(100)));
-        s.append("medium_length_string_no_SSO");
-        s.append(std::to_string(r.rint(100)));
         s5.index(inverter, s);
 
         s.resize(0);
+        s.append(std::to_string(r.rint(100)));
+        s.append("medium_length_string_no_SSO");
+        s.append(std::to_string(r.rint(100)));
+        s6.index(inverter, s);
+
+        s.resize(0);
         s.append(std::to_string(r.rint(1000)));
         s.append("medium_length_string_no_SSO");
         s.append(std::to_string(r.rint(1000)));
-        s6.index(inverter, s);
+        s7.index(inverter, s);
 
         i1.index(inverter, r.rint(10));
 
@@ -311,6 +313,8 @@ SOLUX_BENCHMARK_CAPTURE(BM_Query, short_u10_s,      nDocs, shape, "all", "short_
 SOLUX_BENCHMARK_CAPTURE(BM_Query, short_u10_s_para, nDocs, shape, "all", "short_u10_s", true);
 SOLUX_BENCHMARK_CAPTURE(BM_Query, short_u10k_s,      nDocs, shape, "all", "short_u10k_s", false);
 SOLUX_BENCHMARK_CAPTURE(BM_Query, short_u10k_s_para, nDocs, shape, "all", "short_u10k_s", true);
+SOLUX_BENCHMARK_CAPTURE(BM_Query, short_u100k_s,      nDocs, shape, "all", "short_u100k_s", false);
+SOLUX_BENCHMARK_CAPTURE(BM_Query, short_u100k_s_para, nDocs, shape, "all", "short_u100k_s", true);
 SOLUX_BENCHMARK_CAPTURE(BM_Query, short_u1m_s,      nDocs, shape, "all", "short_u1m_s", false);
 SOLUX_BENCHMARK_CAPTURE(BM_Query, short_u1m_s_para, nDocs, shape, "all", "short_u1m_s", true);
 // #endif

@@ -3,6 +3,7 @@
 #include <variant>
 #include <boost/unordered/unordered_flat_map.hpp>
 #include "FacetOp.h"
+#include "SkinnyCounter.h"
 
 namespace solux {
 
@@ -29,18 +30,18 @@ namespace solux {
 
 class StrFacetOp : public FieldFacetReq {
   std::shared_ptr<OrdMap> ordMap;
-  class MergeableStrFacet : public solux::MergeableData {
+  class MergeableStrData : public solux::MergeableData {
   public:
     using StrHash = boost::unordered_flat_map<std::string, int64_t>;
     using OrdHash = boost::unordered_flat_map<int64_t, int64_t>;
     using CountVector = std::vector<int64_t>;
-    std::variant<StrHash, OrdHash, CountVector> counts;
+    std::variant<StrHash, OrdHash, SkinnyCounter8, CountVector> counts;
     int64_t missing_num = 0; // number of missing values in this segment
 
-    static MergeableStrFacet* merge(MergeableStrFacet* a, MergeableStrFacet* b) {
-      // merge the smaller collector into the larger collector, or if both the same size, merge
-      // the less competitive collector into the more competitive collector.
+    static MergeableStrData* merge(MergeableStrData* a, MergeableStrData* b) {
+      // If StrHash is involved at all, it will be the only variant
       if (auto* astr = std::get_if<StrHash>(&a->counts)) {
+        // merge the smaller collector into the larger collector
         auto& bstr = std::get<StrHash>(b->counts);
         if (astr->size() < bstr.size()) {
           std::swap(a, b);
@@ -49,35 +50,92 @@ class StrFacetOp : public FieldFacetReq {
         for (auto [val, count] : bstr) {
           (*astr)[val] += count;
         }
-      } else if (auto* avec = std::get_if<CountVector>(&a->counts)) {
-        if (auto* bvec = std::get_if<CountVector>(&b->counts)) {
-          for (int i = 0; i < bvec->size(); i++) {
+        a->missing_num += b->missing_num;
+        return a;
+      }
+
+      // If either variant is a CountVector, merge the other into it.
+      auto* avec = std::get_if<CountVector>(&a->counts);
+      auto* bvec = std::get_if<CountVector>(&b->counts);
+
+      if (avec || bvec) {
+        // normalize so avec has the CountVector
+        if (!avec) {
+          std::swap(avec, bvec);
+          std::swap(a, b);
+        }
+
+        if (bvec) {
+          for (size_t i = 0u; i < bvec->size(); i++) {
             (*avec)[i] += (*bvec)[i];
           }
-        }  else {
-          auto& bord = std::get<OrdHash>(b->counts);
-          for (auto [val, count] : bord) {
+        } else if (auto* bord = std::get_if<OrdHash>(&b->counts)) {
+          for (auto [val, count] : *bord) {
+            if (val >= 0 && val < (int64_t)avec->size()) {
+              (*avec)[val] += count;
+            }
+          }
+        } else if (auto* bskinny = std::get_if<SkinnyCounter8>(&b->counts)) {
+          for (size_t i = 0u; i < bskinny->counts.size(); i++) {
+            (*avec)[i] += bskinny->counts[i];
+          }
+          for (auto [val, count] : bskinny->overflow) {
             (*avec)[val] += count;
           }
+        } else {
+          // should not happen
+          assert(false);
         }
+
+        a->missing_num += b->missing_num;
+        return a;
       }
-      else if (auto* bvec = std::get_if<CountVector>(&b->counts)) {
-        auto& aord = std::get<OrdHash>(a->counts);
-        for (auto [val, count] : aord) {
-          (*bvec)[val] += count;
-        }
-        std::swap(a, b);
-      } else {
-        auto* aord = &std::get<OrdHash>(a->counts);
-        auto* bord = &std::get<OrdHash>(b->counts);
-        if (aord->size() < bord->size()) {
+
+      // Next up: if either is a SkinnyCounter8, merge the other into it.
+      // We know that we won't have a CountVector at this point.
+      auto* askinny = std::get_if<SkinnyCounter8>(&a->counts);
+      auto* bskinny = std::get_if<SkinnyCounter8>(&b->counts);
+
+      if (askinny || bskinny) {
+        // normalize so askinny has the SkinnyCounter8
+        if (!askinny) {
+          std::swap(askinny, bskinny);
           std::swap(a, b);
-          std::swap(aord, bord);
         }
-        for (auto [val, count] : *bord) {
-          (*aord)[val] += count;
+
+        // normalize so "a" has larger overflow map.
+        if (askinny && bskinny && askinny->overflow.size() < bskinny->overflow.size()) {
+          std::swap(askinny, bskinny);
+          std::swap(a, b);
         }
+
+        if (bskinny) {
+          askinny->merge(*bskinny);
+        } else if (auto* bord = std::get_if<OrdHash>(&b->counts)) {
+          for (auto [val, count] : *bord) {
+            askinny->increment(val, count);
+          }
+        } else {
+          // should not happen
+          assert(false);
+        }
+
+        a->missing_num += b->missing_num;
+        return a;
       }
+
+      // should be only option left.
+      auto* aord = &std::get<OrdHash>(a->counts);
+      auto* bord = &std::get<OrdHash>(b->counts);
+      assert(aord && bord);
+      if (aord->size() < bord->size()) {
+        std::swap(a, b);
+        std::swap(aord, bord);
+      }
+      for (auto [val, count] : *bord) {
+        (*aord)[val] += count;
+      }
+
       a->missing_num += b->missing_num;
       return a;
     }
@@ -119,7 +177,7 @@ public:
 
   class Calc : public Calculator {
     std::vector<DocSet*> input;
-    AtomicMerger<MergeableStrFacet> countMerger;
+    AtomicMerger<MergeableStrData> countMerger;
     AtomicMerger<MergeableStrFacetInline> inlineMerger;
   public:
     Calc(SearchOp& op, Calculator* parent, int64_t slot, int64_t numSlots) : Calculator(op, parent, slot, numSlots) {
@@ -160,7 +218,7 @@ public:
       // Handle empty index case
       if (segnum == -1) {
         // Empty index - just generate empty result
-        std::unique_ptr<MergeableStrFacet> mergeableData(countMerger.obtain());
+        std::unique_ptr<MergeableStrData> mergeableData(countMerger.obtain());
         facetResult(tg, std::move(mergeableData));
         return;
       }
@@ -196,13 +254,13 @@ public:
       PostingsReader& postingsReader = thisOp().reader.segments()[segnum].postingsReader();
       auto poolGuard = MemPool::threadLocalPoolGuard();
 
-      std::unique_ptr<MergeableStrFacet> mergeableData(countMerger.obtain());
+      std::unique_ptr<MergeableStrData> mergeableData(countMerger.obtain());
       mergeableData->missing_num += missing_num;
       TermsEnum tenum(poolGuard.pool(), postingsReader, segFieldInfo);
-      auto* strMap = std::get_if<MergeableStrFacet::StrHash>(&mergeableData->counts);
+      auto* strMap = std::get_if<MergeableStrData::StrHash>(&mergeableData->counts);
       if (!strMap) {
-        mergeableData->counts = MergeableStrFacet::StrHash();
-        strMap = &std::get<MergeableStrFacet::StrHash>(mergeableData->counts);
+        mergeableData->counts = MergeableStrData::StrHash();
+        strMap = &std::get<MergeableStrData::StrHash>(mergeableData->counts);
       }
       for (auto [ord, count] : count) {
         tenum.seekOrd(ord - 1);
@@ -211,7 +269,7 @@ public:
       }
       auto merged = countMerger.release(mergeableData.release());
       if (merged == thisOp().reader.segments().size()) {
-        facetResult(tg, std::unique_ptr<MergeableStrFacet>(countMerger.obtain()));
+        facetResult(tg, std::unique_ptr<MergeableStrData>(countMerger.obtain()));
       }
     };
 
@@ -258,7 +316,7 @@ public:
       auto poolGuard = MemPool::threadLocalPoolGuard();
       FieldReader fieldReader(poolGuard.pool(), postingsReader);
       bool found = fieldReader.seek(thisOp().fieldName);
-      std::unique_ptr<MergeableStrFacet> mergeableData(countMerger.obtain());
+      std::unique_ptr<MergeableStrData> mergeableData(countMerger.obtain());
       if (!found) {
         if (domain) {
           mergeableData->missing_num += domain->card();
@@ -267,31 +325,67 @@ public:
         }
         auto merged = countMerger.release(mergeableData.release());
         if (merged == thisOp().reader.segments().size()) {
-          facetResult(tg, std::unique_ptr<MergeableStrFacet>(countMerger.obtain()));
+          facetResult(tg, std::unique_ptr<MergeableStrData>(countMerger.obtain()));
         }
         return; // field not found, nothing to do
       }
       fieldReader.readFieldInfo(segFieldInfo);
-      auto* countVec = std::get_if<MergeableStrFacet::CountVector>(&mergeableData->counts);
-      auto* countMap = std::get_if<MergeableStrFacet::OrdHash>(&mergeableData->counts);
-      int32_t domainSize = domain ? domain->card() : maxDoc;
-      if (!countVec && !countMap) {
-        if (domainSize >= segFieldInfo.nTerms) {
-          mergeableData->counts = MergeableStrFacet::CountVector();
-          countVec = &std::get<MergeableStrFacet::CountVector>(mergeableData->counts);
-          if (countVec->empty()) {
-            if (thisOp().ordMap) {
-              countVec->resize(thisOp().ordMap->numOrds());
-            } else {
-              countVec->resize(segFieldInfo.nTerms);
-            }
-          }
 
-        } else {
-          mergeableData->counts = MergeableStrFacet::OrdHash();
-          countMap = &std::get<MergeableStrFacet::OrdHash>(mergeableData->counts);
+      auto* countVec = std::get_if<MergeableStrData::CountVector>(&mergeableData->counts);
+      auto* countMap = std::get_if<MergeableStrData::OrdHash>(&mergeableData->counts);
+      auto* countSkinny = std::get_if<SkinnyCounter8>(&mergeableData->counts);
+
+      int32_t domainSize = domain ? domain->card() : maxDoc;
+      int64_t globVals = thisOp().ordMap ? thisOp().ordMap->numOrds() : segFieldInfo.nTerms;
+
+      // want a vector of global ords if the domain size is much larger than the number of unique values
+      // such that a skinny counter would have many overflows.
+      bool wantVec = (domainSize >> 8) >= globVals;
+
+      // if the number of unique values is large compared to the domain size, we want to use a hashmap
+      bool wantHash = (globVals >> 6) >= domainSize;
+
+      // skinny is the default in the middle.
+      bool wantSkinny = !wantVec && !wantHash;
+
+      // A segment that finished before us may have chosen a different storage type.
+      // If they chose a larger storage type (vector or skinny), then we should stick
+      // with that.  If they chose a smaller storage type (hashmap or skinny), then we
+      // can upgrade.  We do the upgrade by pretending we don't have any storage yet
+      // and then merging the old storage into the new storage we create.
+      std::unique_ptr<MergeableStrData> oldMergeableData;
+      if ((wantVec && (countMap || countSkinny))
+        || (wantSkinny && countMap)) {
+        std::swap(mergeableData, oldMergeableData);
+        mergeableData.reset(countMerger.creator()); // create new empty storage
+        mergeableData->releaseCount = oldMergeableData->releaseCount;  // carry over the release count.
+        countMap = nullptr;
+        countSkinny = nullptr;
+      }
+
+      if (!countVec && !countMap && !countSkinny) {
+        if (wantVec) {
+          mergeableData->counts.emplace<MergeableStrData::CountVector>();
+          countVec = &std::get<MergeableStrData::CountVector>(mergeableData->counts);
+          if (countVec->empty()) {
+            countVec->resize(globVals);
+          }
+        } else if (wantHash) {
+          mergeableData->counts.emplace<MergeableStrData::OrdHash>();
+          countMap = &std::get<MergeableStrData::OrdHash>(mergeableData->counts);
+        } else if (wantSkinny) {
+          mergeableData->counts.emplace<SkinnyCounter8>(globVals);
+          countSkinny = &std::get<SkinnyCounter8>(mergeableData->counts);
         }
       }
+
+      if (oldMergeableData) {
+        auto* result = MergeableStrData::merge(mergeableData.get(), oldMergeableData.get());
+        // result should always be the new one we created.
+        assert(result == mergeableData.get());
+        oldMergeableData.reset();  // free up memory from the original one.
+      }
+
 
       int64_t missing_num = 0;
       auto& facetReq = (FacetReq&)getOp();
@@ -301,7 +395,14 @@ public:
         deltas = segtoGlobal.deltas;
       }
 
-      if (domainSize >= segFieldInfo.nTerms >> 1) {
+      // if we want a vector, then there are enough repeats that we should collect
+      // local counts first and then only convert to global ords once.
+      if (countVec) {
+        // TODO: we have a countVec, but if we wanted a map, that means we should
+        // probably not do 2 pass.  Unclear how often this will happen.
+        // NOTE: skip 2 phase if the ords for this segment are the same as global ords!
+
+        // for single-valued, we could get away with int32_t
         std::vector<int64_t> localCounts(segFieldInfo.nTerms);
         facetReq.facetSegIntCol(domain, segnum, missing_num, segFieldInfo,
           [&](int32_t docid, int64_t ord) SOLUX_INLINE {
@@ -317,12 +418,7 @@ public:
             if (deltas) {
               ord += deltas->valueAt(ord);
             }
-            if (countMap) {
-              (*countMap)[ord] += count;
-            } else {
-              assert(countVec);
-              (*countVec)[ord] += count;
-            }
+            (*countVec)[ord] += count;
           }
         }
 
@@ -337,22 +433,45 @@ public:
             (*countMap)[ord]++;
           });
       } else {
-        assert(countVec);
-        facetReq.facetSegIntCol(domain, segnum, missing_num, segFieldInfo,
-          [&](int32_t docid, int64_t ord) SOLUX_INLINE {
-            unused(docid);
-            ord--; // ordMap is zero-based, int columns are one-based
-            if (deltas) {
-              ord += deltas->valueAt(ord);
+        assert(countSkinny);
+        // If localords != globalOrds and expected number of repeats per value is > 2, use a local skinny counter first
+        // and convert to global ords on overflow.
+        if (deltas && domainSize >= (segFieldInfo.nTerms >> 1)) {
+          std::vector<uint8_t> localCounts(segFieldInfo.nTerms);
+          facetReq.facetSegIntCol(domain, segnum, missing_num, segFieldInfo,
+            [&](int32_t docid, int64_t ord) SOLUX_INLINE {
+              unused(docid);
+              ord--; // ordMap is zero-based, int columns are one-based
+              if (++localCounts[ord] == 0) {
+                ord += deltas->valueAt(ord);  // convert to global ord
+                countSkinny->increment(ord, std::numeric_limits<uint8_t>::max() + 1);
+              }
+            });
+          for (size_t i = 0; i < localCounts.size(); i++) {
+            auto count = localCounts[i];
+            if (count > 0) {
+              int64_t ord = i + deltas->valueAt(i);  // convert to global ord
+              countSkinny->increment(ord, count);
             }
-            (*countVec)[ord]++;
-          });
+          }
+        } else {
+          // Not many repeats expected, so just collect global ords directly.
+          facetReq.facetSegIntCol(domain, segnum, missing_num, segFieldInfo,
+            [&](int32_t docid, int64_t ord) SOLUX_INLINE {
+              unused(docid);
+              ord--; // ordMap is zero-based, int columns are one-based
+              if (deltas) {
+                ord += deltas->valueAt(ord);
+              }
+              countSkinny->increment(ord);
+            });
+        }
       }
       mergeableData->missing_num += missing_num;
 
       auto merged = countMerger.release(mergeableData.release());
       if (merged == thisOp().reader.segments().size()) {
-        facetResult(tg, std::unique_ptr<MergeableStrFacet>(countMerger.obtain()));
+        facetResult(tg, std::unique_ptr<MergeableStrData>(countMerger.obtain()));
       }
     }
 
@@ -360,11 +479,11 @@ public:
       //write only to different slots, so no need to synchronize
       input[segnum] = domain;
       SegFieldInfo segFieldInfo;
-      std::unique_ptr<MergeableStrFacet> mergeableData(countMerger.obtain());
-      auto* count = std::get_if<MergeableStrFacet::CountVector>(&mergeableData->counts);
+      std::unique_ptr<MergeableStrData> mergeableData(countMerger.obtain());
+      auto* count = std::get_if<MergeableStrData::CountVector>(&mergeableData->counts);
       if (!count) {
-        mergeableData->counts = MergeableStrFacet::CountVector();
-        count = &std::get<MergeableStrFacet::CountVector>(mergeableData->counts);
+        mergeableData->counts = MergeableStrData::CountVector();
+        count = &std::get<MergeableStrData::CountVector>(mergeableData->counts);
       }
       int64_t missing_num = 0;
       auto& facetReq = (FacetReq&)getOp();
@@ -386,11 +505,11 @@ public:
 
       auto merged = countMerger.release(mergeableData.release());
       if (merged == thisOp().reader.segments().size()) {
-        facetResult(tg, std::unique_ptr<MergeableStrFacet>(countMerger.obtain()));
+        facetResult(tg, std::unique_ptr<MergeableStrData>(countMerger.obtain()));
       }
     }
 
-    void facetResult(oneapi::tbb::task_group* tg, std::unique_ptr<MergeableStrFacet> mergedData) {
+    void facetResult(oneapi::tbb::task_group* tg, std::unique_ptr<MergeableStrData> mergedData) {
       auto* myVal = getTarget(nullptr);
       solux::proto::FacetResult& facetResultProto = *myVal->mutable_facet();
       auto minCount = thisOp().minCount;
@@ -401,7 +520,7 @@ public:
 
       std::vector<std::pair<std::string, int64_t>> countVec;
 
-      if (auto* strCounts = std::get_if<MergeableStrFacet::StrHash>(&mergedData->counts)) {
+      if (auto* strCounts = std::get_if<MergeableStrData::StrHash>(&mergedData->counts)) {
         for (auto& [val, count] : *strCounts) {
           if (minCount == -1 || count >= minCount) {
             countVec.emplace_back(val, count);
@@ -417,42 +536,55 @@ public:
         if (limit >= 0 && limit < (int64_t)countVec.size()) {
           countVec.resize(limit);
         }
-      } else if (auto* mapCounts = std::get_if<MergeableStrFacet::OrdHash>(&mergedData->counts)) {
-        std::vector<std::pair<int64_t, int64_t>> ordCounts;
-        for (auto& [val, count] : *mapCounts) {
-          if (minCount == -1 || count >= minCount) {
-            ordCounts.emplace_back(val, count);
-          }
-        }
-        missing_count = mergedData->missing_num;
-        std::sort(ordCounts.begin(), ordCounts.end(), [](auto& a, auto& b) {
-          if (a.second != b.second ) {
-            return a.second > b.second;
-          }
-          return a.first < b.first;
-        });
-        if (limit >= 0 && limit < (int64_t)ordCounts.size()) {
-          ordCounts.resize(limit);
-        }
-        countVec.reserve(ordCounts.size());
-        auto poolGuard = MemPool::threadLocalPoolGuard();
-        OrdMapStr ordMapStr(poolGuard.pool(), thisOp().ordMap.get(), *thisOp().req.reader, thisOp().fieldName);
-        for (auto [ord, count] : ordCounts) {
-          auto val = ordMapStr.ordToStr(ord);
-          countVec.emplace_back(val, count);
-        }
       } else {
-        auto* vecCounts = &std::get<MergeableStrFacet::CountVector>(mergedData->counts);
+        auto* mapCounts = std::get_if<MergeableStrData::OrdHash>(&mergedData->counts);
+        auto* skinnyCounts = std::get_if<SkinnyCounter8>(&mergedData->counts);
+        auto* vecCounts   = std::get_if<MergeableStrData::CountVector>(&mergedData->counts);
         std::vector<std::pair<int64_t, int64_t>> ordCounts;
-        for (int i = 0; i < vecCounts->size(); i++) {
-          if (minCount == -1) {
-            minCount = 1;
+        auto min = thisOp().minCount == -1 ? 1 : thisOp().minCount;
+
+        if (mapCounts) {
+          for (auto& [val, count] : *mapCounts) {
+            if (count >= min) {
+              ordCounts.emplace_back(val, count);
+            }
           }
-          if ((*vecCounts)[i] >= minCount) {
-            ordCounts.emplace_back(i, (*vecCounts)[i]);
+        } else if (vecCounts) {
+          for (int i = 0; i < vecCounts->size(); i++) {
+            if ((*vecCounts)[i] >= min) {
+              ordCounts.emplace_back(i, (*vecCounts)[i]);
+            }
           }
-        }
+        } else {
+          assert(skinnyCounts);
+          // first go over the overflow counts
+          for (auto [ord, count] : skinnyCounts->overflow) {
+            count += skinnyCounts->counts[ord];
+            skinnyCounts->counts[ord] = 0;
+            if (count >= min) {
+              ordCounts.emplace_back(ord, count);
+            }
+          }
+
+          // if we are sorting by count descending and have a limit, we can stop if the overflow
+          // counts are enough to fill the limit.
+          bool sortingByCountDesc = true;  // FUTURE
+
+          if (sortingByCountDesc && limit != -1 && (int64_t)ordCounts.size() >= limit) {
+            // already have enough counts, from overflow, and they are guaranteed to be larger than anything that didn't overflow.
+          } else {
+            for (int ord = 0; ord < skinnyCounts->counts.size(); ord++) {
+              auto count = skinnyCounts->counts[ord];
+              if (count >= min) {
+                ordCounts.emplace_back(ord, count);
+              }
+            }
+          }
+        }  // end skinnyCounts
+
         missing_count = mergedData->missing_num;
+
+        // TODO: use a heap if we are only keeping a small number of results.
         std::sort(ordCounts.begin(), ordCounts.end(), [](auto& a, auto& b) {
           if (a.second != b.second ) {
             return a.second > b.second;
@@ -470,6 +602,9 @@ public:
           countVec.emplace_back(val, count);
         }
       }
+
+      mergedData.reset();  // free up memory from the merged data, everything should be in countVec now.
+
 
       // fill in the facet result proto
       auto& bucketIds = *facetResultProto.mutable_bucket_ids()->mutable_col_s();
@@ -488,6 +623,8 @@ public:
 
       doSubops(thisOp().subOps, countVec);
     }
+
+
     void facetResult2(oneapi::tbb::task_group* tg, std::unique_ptr<MergeableStrFacetInline> mergedData) {
       auto* myVal = getTarget(nullptr);
       solux::proto::FacetResult& facetResultProto = *myVal->mutable_facet();

@@ -110,27 +110,30 @@ static void BM_Facet(benchmark::State& state, int64_t nDocs, std::string_view sh
 constexpr int32_t nDocs = 10'000'000;
 constexpr const char* shape = "9555"; // 9 segments, 555 docs per segment
 
-SOLUX_BENCHMARK_CAPTURE(BM_Facet, u10_i,            nDocs, shape, "all", "u10_i", false);
-SOLUX_BENCHMARK_CAPTURE(BM_Facet, u10_i_para,       nDocs, shape, "all", "u10_i", true);
-SOLUX_BENCHMARK_CAPTURE(BM_Facet, u10k_i,            nDocs, shape, "all", "u10k_i", false);
-SOLUX_BENCHMARK_CAPTURE(BM_Facet, u10k_i_para,       nDocs, shape, "all", "u10k_i", true);
-SOLUX_BENCHMARK_CAPTURE(BM_Facet, u10m_i,            nDocs, shape, "all", "u10m_i", false);
-SOLUX_BENCHMARK_CAPTURE(BM_Facet, u10m_i_para,       nDocs, shape, "all", "u10m_i", true);
-SOLUX_BENCHMARK_CAPTURE(BM_Facet, short_u10k_s,      nDocs, shape, "all", "short_u10k_s", false);
-SOLUX_BENCHMARK_CAPTURE(BM_Facet, short_u10k_s_para, nDocs, shape, "all", "short_u10k_s", true);
-SOLUX_BENCHMARK_CAPTURE(BM_Facet, med_u10k_s,        nDocs, shape, "all", "med_u10k_s", false);
-SOLUX_BENCHMARK_CAPTURE(BM_Facet, med_u10k_s_para,   nDocs, shape, "all", "med_u10k_s", true);
-SOLUX_BENCHMARK_CAPTURE(BM_Facet, short_u1m_s,       nDocs, shape, "all", "short_u1m_s", false);
-SOLUX_BENCHMARK_CAPTURE(BM_Facet, short_u1m_s_para,  nDocs, shape, "all", "short_u1m_s", true);
-SOLUX_BENCHMARK_CAPTURE(BM_Facet, med_u1m_s,         nDocs, shape, "all", "med_u1m_s", false);
-SOLUX_BENCHMARK_CAPTURE(BM_Facet, med_u1m_s_para,    nDocs, shape, "all", "med_u1m_s", true);
+SOLUX_BENCHMARK_CAPTURE(BM_Facet, u10_i,          nDocs, shape, "all", "u10_i", false);
+SOLUX_BENCHMARK_CAPTURE(BM_Facet, u10_i_para,     nDocs, shape, "all", "u10_i", true);
+SOLUX_BENCHMARK_CAPTURE(BM_Facet, u10k_i,         nDocs, shape, "all", "u10k_i", false);
+SOLUX_BENCHMARK_CAPTURE(BM_Facet, u10k_i_para,    nDocs, shape, "all", "u10k_i", true);
+SOLUX_BENCHMARK_CAPTURE(BM_Facet, u10m_i,         nDocs, shape, "all", "u10m_i", false);
+SOLUX_BENCHMARK_CAPTURE(BM_Facet, u10m_i_para,    nDocs, shape, "all", "u10m_i", true);
+SOLUX_BENCHMARK_CAPTURE(BM_Facet, u10k_s,         nDocs, shape, "all", "short_u10k_s", false);
+SOLUX_BENCHMARK_CAPTURE(BM_Facet, u10k_s_para,    nDocs, shape, "all", "short_u10k_s", true);
+SOLUX_BENCHMARK_CAPTURE(BM_Facet, u100k_s,        nDocs, shape, "all", "short_u100k_s", false);
+SOLUX_BENCHMARK_CAPTURE(BM_Facet, u100k_s_para,   nDocs, shape, "all", "short_u100k_s", true);
+SOLUX_BENCHMARK_CAPTURE(BM_Facet, u1m_s,          nDocs, shape, "all", "short_u1m_s", false);
+SOLUX_BENCHMARK_CAPTURE(BM_Facet, u1m_s_para,     nDocs, shape, "all", "short_u1m_s", true);
+
 
 // test different domain sizes
-SOLUX_BENCHMARK_CAPTURE(BM_Facet, tinyD_u10_i,            nDocs, shape, "short_u1m_s", "u10_i", false);
-SOLUX_BENCHMARK_CAPTURE(BM_Facet, tinyD_u10_i,            nDocs, shape, "short_u1m_s", "u10_i", true);
-SOLUX_BENCHMARK_CAPTURE(BM_Facet, bigD_u10_i,             nDocs, shape, "short_u10_s", "u10_i", false);
-SOLUX_BENCHMARK_CAPTURE(BM_Facet, bigD_u10_i,             nDocs, shape, "short_u10_s", "u10_i", true);
-SOLUX_BENCHMARK_CAPTURE(BM_Facet, bigD_u10k_s,            nDocs, shape, "short_u10_s", "short_u10k_s", false);
-SOLUX_BENCHMARK_CAPTURE(BM_Facet, bigD_u10k_s,            nDocs, shape, "short_u10_s", "short_u10k_s", true);
-SOLUX_BENCHMARK_CAPTURE(BM_Facet, bigD_u1m_s,             nDocs, shape, "short_u10_s", "short_u1m_s", false);
-SOLUX_BENCHMARK_CAPTURE(BM_Facet, bigD_u1m_s,             nDocs, shape, "short_u10_s", "short_u1m_s", true);
+SOLUX_BENCHMARK_CAPTURE(BM_Facet, tinyD_u10_i,      nDocs, shape, "short_u1m_s", "u10_i", false);
+SOLUX_BENCHMARK_CAPTURE(BM_Facet, tinyD_u10_i,      nDocs, shape, "short_u1m_s", "u10_i", true);
+SOLUX_BENCHMARK_CAPTURE(BM_Facet, bigD_u10_i,       nDocs, shape, "short_u10_s", "u10_i", false);
+SOLUX_BENCHMARK_CAPTURE(BM_Facet, bigD_u10_i,       nDocs, shape, "short_u10_s", "u10_i", true);
+SOLUX_BENCHMARK_CAPTURE(BM_Facet, bigD_u10_s,       nDocs, shape, "short_u10_s", "med_u10_s", false);
+SOLUX_BENCHMARK_CAPTURE(BM_Facet, bigD_u10_s,       nDocs, shape, "short_u10_s", "med_u10_s", true);
+SOLUX_BENCHMARK_CAPTURE(BM_Facet, bigD_u10k_s,      nDocs, shape, "short_u10_s", "short_u10k_s", false);
+SOLUX_BENCHMARK_CAPTURE(BM_Facet, bigD_u10k_s,      nDocs, shape, "short_u10_s", "short_u10k_s", true);
+SOLUX_BENCHMARK_CAPTURE(BM_Facet, bigD_u100k_s,     nDocs, shape, "short_u10_s", "short_u100k_s", false);
+SOLUX_BENCHMARK_CAPTURE(BM_Facet, bigD_u100k_s,     nDocs, shape, "short_u10_s", "short_u100k_s", true);
+SOLUX_BENCHMARK_CAPTURE(BM_Facet, bigD_u1m_s,       nDocs, shape, "short_u10_s", "short_u1m_s", false);
+SOLUX_BENCHMARK_CAPTURE(BM_Facet, bigD_u1m_s,       nDocs, shape, "short_u10_s", "short_u1m_s", true);
