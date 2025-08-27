@@ -715,19 +715,17 @@ public:
         }
         for (size_t segnum = 0; segnum < input.size(); segnum++) {
           SegFieldInfo segFieldInfo;
-          ArrDocSet emptyDomain({});
-          DocSet* newDomain = &emptyDomain;  // NOTE - points to stack object
           auto& postingsReader = thisOp().reader.segments()[segnum].postingsReader();
           int32_t maxDoc = postingsReader.maxDoc();
           auto poolGuard = MemPool::threadLocalPoolGuard();
           FieldReader fieldReader(poolGuard.pool(), postingsReader);
           bool found = fieldReader.seek(thisOp().fieldName);
-          RAMBitDocSet output(maxDoc);
+          DocSetBuilder builder(maxDoc);
+          std::unique_ptr<DocSet> bucketDomain;
           if (found) {
             fieldReader.readFieldInfo(segFieldInfo);
             TermsEnum tenum(poolGuard.pool(), postingsReader, segFieldInfo);
             if (tenum.seek(key)) {
-              newDomain = &output; // we will write to output
               DocsEnum denum(poolGuard.pool(), postingsReader, tenum);
               while (true) {
                 auto doc = denum.nextDoc();
@@ -737,15 +735,16 @@ public:
                 if (input[segnum] && !input[segnum]->get(doc)) {
                   continue; // this doc is not in the domain
                 }
-                output.mutableBits().set(doc);
+                builder.add(doc);
               }
+              bucketDomain = builder.build();
             }
           }
           for (auto& subCalc : calculators) {
             //subCalc->calc(tg, segnum, &output);
             // no support for subcalcs launching tasks yet
 
-            subCalc->calc(nullptr, segnum, newDomain);
+            subCalc->calc(nullptr, segnum, bucketDomain.get());
           }
         }
         slotNum++;
