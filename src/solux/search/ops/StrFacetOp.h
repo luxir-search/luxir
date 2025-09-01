@@ -39,8 +39,15 @@ class StrFacetOp : public FieldFacetReq {
     int64_t missing_num = 0; // number of missing values in this segment
 
     static MergeableStrData* merge(MergeableStrData* a, MergeableStrData* b) {
-      // If StrHash is involved at all, it will be the only variant
-      if (auto* astr = std::get_if<StrHash>(&a->counts)) {
+      // start by updating missing_num of both (we will return one or the other)
+      a->missing_num += b->missing_num;
+      b->missing_num = a->missing_num;
+
+      // Could be a string hash by default, not by choice.
+      auto* astr = std::get_if<StrHash>(&a->counts);
+      auto* bstr = std::get_if<StrHash>(&b->counts);
+
+      if (astr && bstr) {
         // merge the smaller collector into the larger collector
         auto& bstr = std::get<StrHash>(b->counts);
         if (astr->size() < bstr.size()) {
@@ -50,9 +57,21 @@ class StrFacetOp : public FieldFacetReq {
         for (auto [val, count] : bstr) {
           (*astr)[val] += count;
         }
-        a->missing_num += b->missing_num;
         return a;
       }
+
+      // if one is a string hash and the other is not, then the string hash must
+      // just be the default value.
+      if (astr) {
+        assert(astr->empty());
+        return b;
+      }
+      if (bstr) {
+        assert(bstr->empty());
+        return a;
+      }
+
+      // No other string hashes at this point.
 
       // If either variant is a CountVector, merge the other into it.
       auto* avec = std::get_if<CountVector>(&a->counts);
@@ -87,7 +106,6 @@ class StrFacetOp : public FieldFacetReq {
           assert(false);
         }
 
-        a->missing_num += b->missing_num;
         return a;
       }
 
@@ -120,7 +138,6 @@ class StrFacetOp : public FieldFacetReq {
           assert(false);
         }
 
-        a->missing_num += b->missing_num;
         return a;
       }
 
@@ -136,7 +153,6 @@ class StrFacetOp : public FieldFacetReq {
         (*aord)[val] += count;
       }
 
-      a->missing_num += b->missing_num;
       return a;
     }
   };
