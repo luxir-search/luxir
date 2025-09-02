@@ -1,8 +1,17 @@
 #include <gtest/gtest.h>
+#include <mutex>
+#include <thread>
+#include <atomic>
+#include <set>
+#include <tbb/task_group.h>
+#include <boost/unordered/unordered_flat_map.hpp>
 #include "test/SoluxTest.h"
 #include "test/CollectionHelper.h"
 #include "test/LocalReq.h"
 #include "test/TestUtils.h"
+#include "solux/util/random.h"
+#include "solux/index/Inverter.h"
+#include "solux/index/IndexWriter.h"
 
 using namespace solux;
 using namespace solux::test;
@@ -168,7 +177,7 @@ TEST_F(FacetTest, singleSegment) {
     // Check the counts for each color
     // Note: facets are typically sorted by count desc, then by value
     // We expect: red(2), blue(2), green(1)
-    std::map<std::string, int> expectedCounts = {
+    boost::unordered_flat_map<std::string, int> expectedCounts = {
       {"red", 2},
       {"blue", 2}, 
       {"green", 1}
@@ -267,4 +276,641 @@ TEST_F(FacetTest, vectorOptimization) {
   }
   
   lreq->done();
+}
+
+//
+// Comprehensive random faceting test class
+//
+class RandomFacetTest : public SoluxTest {
+protected:
+  static constexpr int MERGE_FACTOR = 10;
+  static constexpr int NUM_FIELDS = 8;  // we do a linear search on field names in the document, so keep this small.
+  static constexpr int PERCENT_PARA = 80;  // percent of the time we do parallel faceting on a single request
+
+  // Field definitions with various characteristics
+  struct FieldDef {
+    std::string name;
+    bool isInt;
+    int numUniqueValues;
+    int sparsityPercent;  // 0 = always missing, 100 = always present
+  };
+  
+  // No need for FacetRequest struct anymore - we'll just use the protobuf directly
+  
+  // Model to track documents and calculate facets dynamically
+  class Model {
+  public:
+    std::vector<Doc> docs;
+    
+    void addDoc(const Doc& doc) {
+      docs.push_back(doc);
+    }
+    
+    // Dump model state for debugging
+    void dumpModel(const std::string& field, const proto::Query& query) const {
+      LOG_ERROR("=== Model Dump for field '{}' ===", field);
+      LOG_ERROR("Total docs: {}", docs.size());
+      
+      // Count matching docs and field values
+      boost::unordered_flat_map<std::string, int> valueCounts;
+      boost::unordered_flat_map<int64_t, int> intValueCounts;
+      int matchingDocs = 0;
+      int docsWithField = 0;
+      int missingField = 0;
+      
+      for (const auto& doc : docs) {
+        bool matches = matchesQuery(doc, query);
+        if (!matches) continue;
+        
+        matchingDocs++;
+        bool hasField = false;
+        
+        for (const auto& nv : doc) {
+          if (nv.name == field) {
+            hasField = true;
+            docsWithField++;
+            if (auto* strVal = std::get_if<std::string>(&nv.val)) {
+              valueCounts[*strVal]++;
+            } else if (auto* intVal = std::get_if<int64_t>(&nv.val)) {
+              intValueCounts[*intVal]++;
+            }
+            break;
+          }
+        }
+        
+        if (!hasField) {
+          missingField++;
+        }
+      }
+      
+      std::string queryStr;
+      if (query.has_match()) {
+        queryStr = "match(" + std::string(query.match().field()) + "=" + 
+          (query.match().val().has_s() ? std::string(query.match().val().s()) : 
+           std::to_string(query.match().val().i())) + ")";
+      } else {
+        queryStr = "all";
+      }
+      LOG_ERROR("Query: {}", queryStr);
+      LOG_ERROR("Matching docs: {}", matchingDocs);
+      LOG_ERROR("Docs with field '{}': {}", field, docsWithField);
+      LOG_ERROR("Missing field '{}': {}", field, missingField);
+      
+      if (!valueCounts.empty()) {
+        LOG_ERROR("String value distribution:");
+        std::vector<std::pair<std::string, int>> sortedValues(valueCounts.begin(), valueCounts.end());
+        std::sort(sortedValues.begin(), sortedValues.end());
+        for (const auto& [val, count] : sortedValues) {
+          LOG_ERROR("  '{}': {}", val, count);
+        }
+      }
+      
+      if (!intValueCounts.empty()) {
+        LOG_ERROR("Int value distribution:");
+        std::vector<std::pair<int64_t, int>> sortedIntValues(intValueCounts.begin(), intValueCounts.end());
+        std::sort(sortedIntValues.begin(), sortedIntValues.end());
+        for (const auto& [val, count] : sortedIntValues) {
+          LOG_ERROR("  {}: {}", val, count);
+        }
+      }
+      
+      LOG_ERROR("=== End Model Dump ===");
+    }
+    
+    // Check if a document matches a query
+    bool matchesQuery(const Doc& doc, const proto::Query& query) const {
+      if (query.has_all() && query.all()) {
+        return true;
+      }
+      
+      if (query.has_match()) {
+        const auto& match = query.match();
+        std::string fieldName(match.field());
+        
+        for (const auto& nv : doc) {
+          if (nv.name == fieldName) {
+            if (match.val().has_s()) {
+              if (auto* strVal = std::get_if<std::string>(&nv.val)) {
+                return *strVal == match.val().s();
+              }
+            } else if (match.val().has_i()) {
+              if (auto* intVal = std::get_if<int64_t>(&nv.val)) {
+                return *intVal == match.val().i();
+              }
+            }
+          }
+        }
+        return false;
+      }
+      
+      // TODO: Add support for range, boolean queries
+      return true;  // Default to matching for unsupported query types
+    }
+    
+    // Calculate facet counts for a field over a set of matching documents
+    boost::unordered_flat_map<std::string, int64_t> calculateStringFacets(
+        const std::string& field,
+        const proto::Query& query,
+        int64_t& missingCount) const {
+      
+      boost::unordered_flat_map<std::string, int64_t> counts;
+      missingCount = 0;
+      
+      for (const auto& doc : docs) {
+        if (!matchesQuery(doc, query)) {
+          continue;
+        }
+        
+        bool hasField = false;
+        for (const auto& nv : doc) {
+          if (nv.name == field) {
+            if (auto* strVal = std::get_if<std::string>(&nv.val)) {
+              counts[*strVal]++;
+              hasField = true;
+            }
+          }
+        }
+        
+        if (!hasField) {
+          missingCount++;
+        }
+      }
+      
+      return counts;
+    }
+    
+    boost::unordered_flat_map<int64_t, int64_t> calculateIntFacets(
+        const std::string& field,
+        const proto::Query& query,
+        int64_t& missingCount) const {
+      
+      boost::unordered_flat_map<int64_t, int64_t> counts;
+      missingCount = 0;
+      
+      for (const auto& doc : docs) {
+        if (!matchesQuery(doc, query)) {
+          continue;
+        }
+        
+        bool hasField = false;
+        for (const auto& nv : doc) {
+          if (nv.name == field) {
+            if (auto* intVal = std::get_if<int64_t>(&nv.val)) {
+              counts[*intVal]++;
+              hasField = true;
+            }
+          }
+        }
+        
+        if (!hasField) {
+          missingCount++;
+        }
+      }
+      
+      return counts;
+    }
+    
+    // Apply sorting and limits to facet results
+    template<typename T>
+    std::vector<std::pair<T, int64_t>> sortAndLimitFacets(
+        const boost::unordered_flat_map<T, int64_t>& counts,
+        int limit,
+        int64_t minCount) const {
+      
+      std::vector<std::pair<T, int64_t>> result;
+      for (const auto& [val, count] : counts) {
+        if (count >= minCount) {
+          result.push_back({val, count});
+        }
+      }
+      
+      // Sort by count desc, then value asc
+      std::sort(result.begin(), result.end(), [](const auto& a, const auto& b) {
+        if (a.second != b.second) return a.second > b.second;
+        return a.first < b.first;
+      });
+      
+      if (limit > 0 && result.size() > static_cast<size_t>(limit)) {
+        result.resize(limit);
+      }
+      
+      return result;
+    }
+    
+    // Calculate expected facet results using protobuf
+    proto::Val calculateExpectedFacet(const proto::FieldFacet& facetOp,
+                                      const proto::Query& query) const {
+      proto::Val result;
+      auto* facetResult = result.mutable_facet();
+      
+      std::string fieldName(facetOp.field());
+      int64_t limit = facetOp.limit();
+      int64_t mincount = facetOp.mincount();
+      bool includeMissing = facetOp.missing();
+      
+      // Determine field type from field name convention
+      bool isIntField = fieldName.find("_i") != std::string::npos;
+      
+      // Count values for documents matching the query
+      boost::unordered_flat_map<int64_t, int64_t> intCounts;
+      boost::unordered_flat_map<std::string, int64_t> strCounts;
+      int64_t missingCount = 0;
+      
+      for (const auto& doc : docs) {
+        // Skip documents that don't match the query
+        if (!matchesQuery(doc, query)) {
+          continue;
+        }
+        
+        bool hasField = false;
+        for (const auto& nv : doc) {
+          if (nv.name == fieldName) {
+            hasField = true;
+            if (auto* intVal = std::get_if<int64_t>(&nv.val)) {
+              intCounts[*intVal]++;
+            } else if (auto* strVal = std::get_if<std::string>(&nv.val)) {
+              strCounts[*strVal]++;
+            }
+          }
+        }
+        if (!hasField) {
+          missingCount++;
+        }
+      }
+      
+      // Apply mincount, sort, and limit, then populate protobuf result
+      if (isIntField) {
+        auto sorted = sortAndLimitFacets(intCounts, limit, mincount);
+        auto* bucketIds = facetResult->mutable_bucket_ids()->mutable_col_i();
+        for (const auto& [val, count] : sorted) {
+          bucketIds->add_v(val);
+          facetResult->add_counts(count);
+        }
+      } else {
+        auto sorted = sortAndLimitFacets(strCounts, limit, mincount);
+        auto* bucketIds = facetResult->mutable_bucket_ids()->mutable_col_s();
+        for (const auto& [val, count] : sorted) {
+          bucketIds->add_v(val);
+          facetResult->add_counts(count);
+        }
+      }
+      
+      // Set missing count if requested
+      if (includeMissing) {
+        facetResult->set_missing(missingCount);
+      }
+      
+      // TODO: Handle nested facets in facetOp.ops() recursively
+      
+      return result;
+    }
+  };
+  
+  // Build index with random data using parallel segment construction
+  void buildRandomIndex(CollectionHelper& helper, Model& model, Rng& rng, 
+                       const std::vector<FieldDef>& fields,
+                       int maxSegments = MERGE_FACTOR-1, int maxDocsPerSegment = 100) {
+    helper.clear();
+    
+    // Random number of segments
+    int numSegments = rng.rint(1, std::min(maxSegments, MERGE_FACTOR));
+    
+
+    
+    // Get index writer for parallel segment building
+    auto iw = helper.getIndexWriter();
+    
+    // Pre-obtain inverters for parallel processing
+    std::vector<Inverter*> inverters;
+    inverters.reserve(numSegments);
+    for (int i = 0; i < numSegments; i++) {
+      inverters.push_back(&iw->obtainInverter());
+    }
+    
+    // Track documents for the model
+    std::vector<std::vector<Doc>> segmentDocs(numSegments);
+    
+    // Get a single seed for all segments (don't call rng() inside parallel tasks)
+    uint64_t baseSeed = rng();
+    
+    // Build segments in parallel using TBB
+    tbb::task_group tg;
+    for (int segNum = 0; segNum < numSegments; segNum++) {
+      tg.run([&, segNum, baseSeed]() {
+        Rng segRng(baseSeed + segNum);  // Deterministic seed per segment
+
+        // Pre-calculate which fields should exist in all documents in this segment (5% chance per field)
+        // and which fields should not exist at all in this segment (5% chance per field)
+        boost::container::small_vector<uint8_t,8> fieldExists(fields.size());
+        for (size_t i = 0; i < fields.size(); i++) {
+          fieldExists[i] = segRng.rint(100);
+        }
+
+        Inverter& inverter = *inverters[segNum];
+
+        // Random number of documents per segment
+        int segDocCount = segRng.rint(1, maxDocsPerSegment);
+        
+        // get IndexHandlers for the fields that exist in this segment
+        auto* idHandler = &inverter.getIndexHandler("id");
+        boost::container::small_vector<Inverter::IndexHandler*,8> handlers(fields.size());
+        for (size_t i = 0; i < fields.size(); i++) {
+          if (fieldExists[i] < 5) {
+            continue; // Field does not exist in this segment
+          }
+          handlers[i] = &inverter.getIndexHandler(fields[i].name);
+        }
+        
+        for (int docIdx = 0; docIdx < segDocCount; docIdx++) {
+          Doc doc;
+          int64_t docId = segNum * 10000 + docIdx;
+          doc.push_back({"id", std::to_string(docId)});
+          
+          inverter.startDoc();
+          idHandler->index(inverter, std::to_string(docId));
+          
+          // Add random field values
+          for (size_t fieldIdx = 0; fieldIdx < fields.size(); fieldIdx++) {
+            const auto& field = fields[fieldIdx];
+
+            if (fieldExists[fieldIdx] < 5) {
+              continue;
+            }
+
+            // most of the time do a normal sparsity check
+            if (fieldExists[fieldIdx] < 95 && !(segRng.rint(100) < field.sparsityPercent)) {
+              continue;
+            }
+
+            if (field.isInt) {
+              int64_t val = segRng.rint(field.numUniqueValues);
+              handlers[fieldIdx]->index(inverter, val);
+              doc.push_back({field.name, val});
+            }
+            else {
+              std::string val = "v" + std::to_string(segRng.rint(field.numUniqueValues));
+              handlers[fieldIdx]->index(inverter, val);
+              doc.push_back({field.name, val});
+            }
+
+          }
+          
+          inverter.finishDoc();
+          segmentDocs[segNum].push_back(doc);
+        }
+        
+        iw->releaseInverter(inverter, true);  // Request immediate flush
+      });
+    }
+    tg.wait();
+    
+    // Add all documents to the model
+    for (const auto& segDocs : segmentDocs) {
+      for (const auto& doc : segDocs) {
+        model.addDoc(doc);
+      }
+    }
+    
+    helper.commit();
+  }
+  
+  // Generate a random facet configuration directly on the protobuf
+  static void generateRandomFacet(Rng& rng, proto::FieldFacet* facet, const FieldDef& field) {
+    facet->set_field(field.name);
+    
+    // Random limit - avoid problematic edge cases for now
+    int limitChoice = rng.rint(5);
+    if (limitChoice == 0) {
+      facet->set_limit(-1);  // No limit
+    } else if (limitChoice == 1) {
+      facet->set_limit(1);  // Exactly 1 result
+    } else if (limitChoice == 2) {
+      facet->set_limit(5);  // Small limit
+    } else if (limitChoice == 3) {
+      facet->set_limit(20);  // Medium limit
+    } else {
+      facet->set_limit(rng.rint(1, 50));  // Random limit
+    }
+    
+    // Random mincount - avoid problematic edge cases
+    int mincountChoice = rng.rint(4);
+    if (mincountChoice == 0) {
+      facet->set_mincount(1);  // Default
+    } else if (mincountChoice == 1) {
+      facet->set_mincount(2);  // Slightly higher
+    } else if (mincountChoice == 2) {
+      facet->set_mincount(5);  // Higher threshold
+    } else {
+      facet->set_mincount(rng.rint(1, 3));  // Small random
+    }
+    
+    // Random missing
+    facet->set_missing(rng.rbool());
+    
+    // TODO: Add sub-facets (ops) generation
+  }
+
+public:
+  void runRandomTest(int numIndexes = 20, int requestsPerIndex = 20, 
+                     int maxSegments = MERGE_FACTOR-1, int maxDocsPerSegment = 250) {
+    
+    for (int iteration = 0; iteration < numIndexes; iteration++) {
+      CollectionHelper helper;
+      Model model;
+      
+      // Generate random field definitions for this iteration
+      std::vector<FieldDef> fields;
+      for (int i = 0; i < NUM_FIELDS; i++) {
+        FieldDef field;
+        field.name = "field" + std::to_string(i) + (rng.rbool() ? "_i" : "_s");
+        field.isInt = field.name.ends_with("_i");
+        field.numUniqueValues = 3 + rng.rint(20);  // 3-23 unique values
+        field.sparsityPercent = 20 + rng.rint(70);  // 20%-90% present
+        fields.push_back(field);
+      }
+      
+      // Build index with parallel segment construction
+      buildRandomIndex(helper, model, rng, fields, maxSegments, maxDocsPerSegment);
+      
+      // Run multiple random facet tests on this index in parallel
+      int numParallelTests = requestsPerIndex;
+      
+      // Run tests in parallel using TBB
+      tbb::parallel_for(tbb::blocked_range<int>(0, numParallelTests),
+        [&](const tbb::blocked_range<int>& range) {
+          // Create a local RNG for this thread with deterministic seed
+          Rng localRng(iteration * 1000000 + range.begin());
+          
+          for (int testNum = range.begin(); testNum != range.end(); ++testNum) {
+            // Advance RNG to ensure different seed for each test
+            localRng(); 
+            
+            auto* lreq = LocalReq::create(soluxNode->getSearchEngine());
+            lreq->proto.mutable_collection()->add_name("main");
+            lreq->proto.set_request_id("random_test_" + std::to_string(iteration) + "_" + std::to_string(testNum));
+        
+            auto& ops = *lreq->proto.mutable_ops();
+            
+            // Create a query operation
+            auto& topDocs = *ops["q"].mutable_top_docs();
+            topDocs.set_get_number(true);
+            
+            // Generate query directly: 80% match query, 20% all query
+            proto::Query* query = topDocs.mutable_query();
+            if (localRng.rint(100) < 80 && !fields.empty()) {
+              // Only use string fields for match queries
+              std::vector<int> candidateFields;
+              for (int idx = 0; idx < (int)fields.size(); idx++) {
+                if (!fields[idx].isInt && fields[idx].sparsityPercent >= 50) {
+                  candidateFields.push_back(idx);
+                }
+              }
+              
+              if (!candidateFields.empty()) {
+                int queryFieldIdx = candidateFields[localRng.rint((int)candidateFields.size())];
+                const auto& queryField = fields[queryFieldIdx];
+                auto& matchQuery = *query->mutable_match();
+                matchQuery.set_field(queryField.name);
+                int valueIdx = localRng.rint(queryField.numUniqueValues);
+                matchQuery.mutable_val()->set_s("v" + std::to_string(valueIdx));
+              } else {
+                query->set_all(true);
+              }
+            } else {
+              query->set_all(true);
+            }
+
+            // Decide on root vs nested facets
+            bool useRootFacets = localRng.rint(100) < 10;
+            
+            // Get reference to the correct ops map (root level or under query)
+            auto* opsMap = useRootFacets ? &ops : topDocs.mutable_ops();
+            
+            // Generate random number of facets
+            int numFacets = localRng.rint(1, 6);
+            
+            LOG_TRACE("Creating {} facets, root={}", numFacets, useRootFacets);
+            
+            for (int f = 0; f < numFacets; f++) {
+              int fieldIdx = localRng.rint((int)fields.size());
+              const auto& field = fields[fieldIdx];
+              std::string facetName = "f" + std::to_string(f);
+              
+              // Generate facet directly in the ops map
+              auto& facet = *(*opsMap)[facetName].mutable_field_facet();
+              generateRandomFacet(localRng, &facet, field);
+            }
+        
+            // Execute the request
+            bool para = (rng.rint(100) < PERCENT_PARA);
+            lreq->engine.submit(*lreq, para);
+            
+            ASSERT_EQ(1, lreq->responses.size());
+
+            // Verify facet results
+            const auto& response = lreq->responses[0]->proto;
+            
+            // Verify each facet result against expected values
+            // Iterate over the ops map we populated with facets
+            for (const auto& [facetName, searchOp] : *opsMap) {
+              // Skip non-facet operations (like the query itself if at root level)
+              if (!searchOp.has_field_facet()) {
+                continue;
+              }
+              
+              const auto& facetOp = searchOp.field_facet();
+              
+              // Calculate expected result - now returns proto::Val with FacetResult
+              // Root-level facets should use all docs, nested facets should filter by query
+              proto::Query queryForFacet;
+              if (useRootFacets) {
+                // Root facets operate on all documents
+                queryForFacet.set_all(true);
+              } else {
+                // Nested facets are filtered by the query from the request
+                queryForFacet = topDocs.query();
+              }
+              auto expectedVal = model.calculateExpectedFacet(facetOp, queryForFacet);
+              const auto& expectedFacet = expectedVal.facet();
+              
+              // Extract actual facet result
+              const proto::FacetResult* actualFacet = nullptr;
+              
+              if (useRootFacets) {
+                // Check root-level operations
+                if (response.ops().contains(facetName)) {
+                  actualFacet = &response.ops().at(facetName).facet();
+                }
+              } else {
+                // Check nested operations under query - access through docs().ops()
+                if (response.ops().contains("q") && 
+                    response.ops().at("q").has_docs() &&
+                    response.ops().at("q").docs().ops().contains(facetName)) {
+                  actualFacet = &response.ops().at("q").docs().ops().at(facetName).facet();
+                }
+              }
+              
+              ASSERT_TRUE(actualFacet != nullptr) 
+                << "Iteration " << iteration << ", test " << testNum 
+                << ", facet " << facetName << " - Facet not found in response"
+                << " (useRootFacets=" << useRootFacets << ")";
+              
+              // Verify bucket IDs and counts
+              if (expectedFacet.bucket_ids().has_col_i()) {
+                ASSERT_TRUE(actualFacet->bucket_ids().has_col_i())
+                  << "Expected integer buckets for field " << std::string(facetOp.field());
+                
+                const auto& actualBuckets = actualFacet->bucket_ids().col_i();
+                const auto& expectedBuckets = expectedFacet.bucket_ids().col_i();
+                ASSERT_EQ(actualBuckets.v_size(), expectedBuckets.v_size())
+                  << "Mismatch in number of buckets for facet " << facetName;
+                
+                for (int i = 0; i < actualBuckets.v_size(); i++) {
+                  if (actualBuckets.v(i) != expectedBuckets.v(i)) {
+                    EXPECT_EQ(actualBuckets.v(i), expectedBuckets.v(i))  // place breakpoint here
+                    << "Bucket " << i << " value mismatch for facet " << facetName;
+                  }
+                }
+              } else {
+                ASSERT_TRUE(actualFacet->bucket_ids().has_col_s())
+                  << "Expected string buckets for field " << std::string(facetOp.field());
+                
+                const auto& actualBuckets = actualFacet->bucket_ids().col_s();
+                const auto& expectedBuckets = expectedFacet.bucket_ids().col_s();
+                ASSERT_EQ(actualBuckets.v_size(), expectedBuckets.v_size())
+                  << "Mismatch in number of buckets for facet " << facetName;
+                
+                for (int i = 0; i < actualBuckets.v_size(); i++) {
+                  EXPECT_EQ(actualBuckets.v(i), expectedBuckets.v(i))
+                    << "Bucket " << i << " value mismatch for facet " << facetName;
+                }
+              }
+              
+              // Verify counts
+              ASSERT_EQ(actualFacet->counts_size(), expectedFacet.counts_size())
+                << "Mismatch in number of counts for facet " << facetName;
+              
+              for (int i = 0; i < expectedFacet.counts_size(); i++) {
+                EXPECT_EQ(actualFacet->counts(i), expectedFacet.counts(i))
+                  << "Count mismatch for bucket " << i << " in facet " << facetName;
+              }
+              
+              // Verify missing count if requested
+              if (facetOp.missing()) {
+                EXPECT_EQ(actualFacet->missing(), expectedFacet.missing())
+                  << "Missing count mismatch for facet " << facetName;
+              }
+            }
+            
+            lreq->done();
+          }  // end of for loop in lambda
+        });  // end of parallel_for
+
+    }  // end of iteration loop
+  }  // end of runRandomTest
+};
+
+
+TEST_F(RandomFacetTest, randomFaceting) {
+  runRandomTest(10, 100);  // 10 indexes, 100 requests per index = 1000 total requests (default)
 }
