@@ -10,6 +10,7 @@
 #include "test/LocalReq.h"
 #include "test/TestUtils.h"
 #include "solux/util/random.h"
+#include "solux/util/proto.h"
 #include "solux/index/Inverter.h"
 #include "solux/index/IndexWriter.h"
 
@@ -497,9 +498,87 @@ protected:
       return result;
     }
     
-    // Calculate expected facet results using protobuf
-    proto::Val calculateExpectedFacet(const proto::FieldFacet& facetOp,
-                                      const proto::Query& query) const {
+    // Process all operations in an ops map recursively
+    void processOps(const google::protobuf::Map<std::string, proto::SearchOp>& requestOps,
+                    google::protobuf::Map<std::string, proto::Val>* responseOps) const {
+      
+      for (const auto& [opName, searchOp] : requestOps) {
+        if (searchOp.has_field_facet()) {
+          // Process field facet - facets at root level operate on all documents
+          proto::Query allQuery;
+          allQuery.set_all(true);
+          (*responseOps)[opName] = calculateFieldFacet(searchOp.field_facet(), allQuery);
+        } else if (searchOp.has_top_docs()) {
+          // Process top docs query (which may have nested ops)
+          const auto& topDocs = searchOp.top_docs();
+          proto::Val result;
+          auto* docList = result.mutable_docs();
+          
+          // The query in top_docs defines the domain for nested ops
+          proto::Query effectiveQuery = topDocs.has_query() ? topDocs.query() : proto::Query();
+          if (!effectiveQuery.kind_case()) {
+            effectiveQuery.set_all(true);  // Default to all if no query specified
+          }
+          
+          // Count matches
+          int64_t matches = 0;
+          for (const auto& doc : docs) {
+            if (matchesQuery(doc, effectiveQuery)) {
+              matches++;
+            }
+          }
+          docList->set_matches(matches);
+          
+          // Process any nested operations under this query with the query as their domain
+          if (topDocs.ops_size() > 0) {
+            processOpsWithDomain(topDocs.ops(), docList->mutable_ops(), effectiveQuery);
+          }
+          
+          (*responseOps)[opName] = result;
+        }
+        // Add other operation types as needed
+      }
+    }
+    
+    // Process operations with a specific domain query (for nested ops)
+    void processOpsWithDomain(const google::protobuf::Map<std::string, proto::SearchOp>& requestOps,
+                               google::protobuf::Map<std::string, proto::Val>* responseOps,
+                               const proto::Query& domainQuery) const {
+      
+      for (const auto& [opName, searchOp] : requestOps) {
+        if (searchOp.has_field_facet()) {
+          // Nested facet uses the domain query from its parent
+          (*responseOps)[opName] = calculateFieldFacet(searchOp.field_facet(), domainQuery);
+        } else if (searchOp.has_top_docs()) {
+          // Nested top_docs would combine its query with the domain query
+          // This is more complex and would need proper query combination logic
+          // For now, just using the nested query
+          const auto& topDocs = searchOp.top_docs();
+          proto::Val result;
+          auto* docList = result.mutable_docs();
+          
+          proto::Query effectiveQuery = topDocs.has_query() ? topDocs.query() : domainQuery;
+          
+          int64_t matches = 0;
+          for (const auto& doc : docs) {
+            if (matchesQuery(doc, effectiveQuery)) {
+              matches++;
+            }
+          }
+          docList->set_matches(matches);
+          
+          if (topDocs.ops_size() > 0) {
+            processOpsWithDomain(topDocs.ops(), docList->mutable_ops(), effectiveQuery);
+          }
+          
+          (*responseOps)[opName] = result;
+        }
+      }
+    }
+    
+    // Calculate expected facet results for a single field facet
+    proto::Val calculateFieldFacet(const proto::FieldFacet& facetOp,
+                                   const proto::Query& domainQuery) const {
       proto::Val result;
       auto* facetResult = result.mutable_facet();
       
@@ -511,30 +590,38 @@ protected:
       // Determine field type from field name convention
       bool isIntField = fieldName.find("_i") != std::string::npos;
       
-      // Count values for documents matching the query
+      // Count values for documents matching the domain query
       boost::unordered_flat_map<int64_t, int64_t> intCounts;
       boost::unordered_flat_map<std::string, int64_t> strCounts;
       int64_t missingCount = 0;
       
+      // Track which bucket each doc belongs to for sub-facets
+      std::vector<std::variant<int64_t, std::string>> bucketValues;
+      
       for (const auto& doc : docs) {
-        // Skip documents that don't match the query
-        if (!matchesQuery(doc, query)) {
+        // Skip documents that don't match the domain query
+        if (!matchesQuery(doc, domainQuery)) {
           continue;
         }
         
         bool hasField = false;
+        std::variant<int64_t, std::string> bucketVal;
         for (const auto& nv : doc) {
           if (nv.name == fieldName) {
             hasField = true;
             if (auto* intVal = std::get_if<int64_t>(&nv.val)) {
               intCounts[*intVal]++;
+              bucketVal = *intVal;
             } else if (auto* strVal = std::get_if<std::string>(&nv.val)) {
               strCounts[*strVal]++;
+              bucketVal = *strVal;
             }
           }
         }
         if (!hasField) {
           missingCount++;
+        } else {
+          bucketValues.push_back(bucketVal);
         }
       }
       
@@ -560,7 +647,13 @@ protected:
         facetResult->set_missing(missingCount);
       }
       
-      // TODO: Handle nested facets in facetOp.ops() recursively
+      // Process any nested operations (sub-facets) if present
+      if (facetOp.ops_size() > 0) {
+        // For each bucket, calculate sub-operations with documents filtered to that bucket
+        // This would require creating a filtered domain for each bucket
+        // For now, leaving as TODO since it requires more complex domain filtering
+        // processOps(facetOp.ops(), facetResult->mutable_ops(), bucketSpecificQuery);
+      }
       
       return result;
     }
@@ -810,7 +903,14 @@ public:
             // Verify facet results
             const auto& response = lreq->responses[0]->proto;
             
-            // Verify each facet result against expected values
+            // Calculate expected results for all operations using an arena
+            auto* arena = createArena(4096);  // 4KB initial arena size
+            auto* expectedResponse = google::protobuf::Arena::Create<proto::SearchResponse>(arena);
+            
+            // Process all operations to calculate expected results
+            model.processOps(lreq->proto.ops(), expectedResponse->mutable_ops());
+            
+            // Now verify each facet result against expected values
             // Iterate over the ops map we populated with facets
             for (const auto& [facetName, searchOp] : *opsMap) {
               // Skip non-facet operations (like the query itself if at root level)
@@ -818,20 +918,25 @@ public:
                 continue;
               }
               
-              const auto& facetOp = searchOp.field_facet();
-              
-              // Calculate expected result - now returns proto::Val with FacetResult
-              // Root-level facets should use all docs, nested facets should filter by query
-              proto::Query queryForFacet;
+              // Get expected result from our calculated response
+              const proto::Val* expectedVal = nullptr;
               if (useRootFacets) {
-                // Root facets operate on all documents
-                queryForFacet.set_all(true);
+                // Root-level facet
+                if (expectedResponse->ops().contains(facetName)) {
+                  expectedVal = &expectedResponse->ops().at(facetName);
+                }
               } else {
-                // Nested facets are filtered by the query from the request
-                queryForFacet = topDocs.query();
+                // Nested facet under query
+                if (expectedResponse->ops().contains("q") && 
+                    expectedResponse->ops().at("q").has_docs() &&
+                    expectedResponse->ops().at("q").docs().ops().contains(facetName)) {
+                  expectedVal = &expectedResponse->ops().at("q").docs().ops().at(facetName);
+                }
               }
-              auto expectedVal = model.calculateExpectedFacet(facetOp, queryForFacet);
-              const auto& expectedFacet = expectedVal.facet();
+              
+              ASSERT_TRUE(expectedVal != nullptr && expectedVal->has_facet())
+                << "Expected facet result not found for " << facetName;
+              const auto& expectedFacet = expectedVal->facet();
               
               // Extract actual facet result
               const proto::FacetResult* actualFacet = nullptr;
@@ -858,7 +963,7 @@ public:
               // Verify bucket IDs and counts
               if (expectedFacet.bucket_ids().has_col_i()) {
                 ASSERT_TRUE(actualFacet->bucket_ids().has_col_i())
-                  << "Expected integer buckets for field " << std::string(facetOp.field());
+                  << "Expected integer buckets for field " << std::string(searchOp.field_facet().field());
                 
                 const auto& actualBuckets = actualFacet->bucket_ids().col_i();
                 const auto& expectedBuckets = expectedFacet.bucket_ids().col_i();
@@ -873,7 +978,7 @@ public:
                 }
               } else {
                 ASSERT_TRUE(actualFacet->bucket_ids().has_col_s())
-                  << "Expected string buckets for field " << std::string(facetOp.field());
+                  << "Expected string buckets for field " << std::string(searchOp.field_facet().field());
                 
                 const auto& actualBuckets = actualFacet->bucket_ids().col_s();
                 const auto& expectedBuckets = expectedFacet.bucket_ids().col_s();
@@ -896,11 +1001,14 @@ public:
               }
               
               // Verify missing count if requested
-              if (facetOp.missing()) {
+              if (searchOp.field_facet().missing()) {
                 EXPECT_EQ(actualFacet->missing(), expectedFacet.missing())
                   << "Missing count mismatch for facet " << facetName;
               }
             }
+            
+            // Clean up the arena
+            releaseArena(arena);
             
             lreq->done();
           }  // end of for loop in lambda
