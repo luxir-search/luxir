@@ -132,6 +132,8 @@ public:
           if (iter.docId() == docid) {
             auto val = iter.value();
             callback(docid, val);
+          } else {
+            missing_num++;
           }
         }
       } else {
@@ -148,6 +150,8 @@ public:
               auto val = iter.values().valueAt(start + vrank);
               callback(docid, val);
             }
+          } else {
+            missing_num++;
           }
         }
       }
