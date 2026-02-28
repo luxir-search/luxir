@@ -51,10 +51,12 @@ public:
   int32_t liveDocs = 0;
 
   Inverter(solux::Directory& dir, uint64_t segId, const std::function<std::shared_ptr<Schema>()>& schemaProvider = {}) : postingsWriter(dir, segId) {
-    // this is a test schemaProvider for convenience
-    if (!schemaProvider) {
-      this->schemaProvider = [&]() {
-        return Schema::createSchema();
+    if (schemaProvider) {
+      this->schemaProvider = schemaProvider;
+    } else {
+      // fallback for tests that create Inverters directly
+      this->schemaProvider = []() {
+        return Schema::createDefaultSchema();
       };
     }
   }

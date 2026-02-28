@@ -459,3 +459,53 @@ message SegmentInfo {
   int32  live_docs = 7;                 // Number of non-deleted documents in this segment
 }
 
+//
+// Schema
+//
+
+message AnalyzerDef {
+  string tokenizer = 1;           // e.g., "whitespace", "keyword"
+  repeated string filters = 2;    // e.g., ["lowercase"] — applied in order
+}
+
+message FieldDef {
+  string name = 1;              // field name ("title") or dynamic suffix ("_s", "_wl")
+  string parent = 2;            // inherit properties from this field
+  bool abstract = 3;            // if true, only usable via suffix matching or inheritance
+
+  enum FieldClass {
+    STRING = 0;    // unanalyzed string
+    TEXT = 1;      // analyzed text
+    INT = 2;
+    FLOAT = 3;
+    DOUBLE = 4;
+    BIN = 5;
+  }
+  FieldClass field_class = 4;  // if unset (default), inherited from parent
+
+  bool indexed = 5;
+  bool column_stored = 6;
+  bool multi_valued = 7;
+
+  AnalyzerDef analyzer = 8;            // for TEXT fields; if unset, inherited from parent
+}
+
+message SchemaDef {
+  repeated FieldDef fields = 1;
+}
+
+message SchemaRequest {
+  Target collection = 1;
+
+  enum Mode {
+    MERGE = 0;     // add/update fields, keep existing fields not in this request
+    REPLACE = 1;   // replace entire schema with this definition
+  }
+  Mode mode = 2;
+  SchemaDef schema = 3;
+}
+
+message SchemaResponse {
+  SchemaDef schema = 1;         // the resulting schema after the operation
+}
+

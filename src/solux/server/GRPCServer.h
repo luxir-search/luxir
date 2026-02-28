@@ -52,6 +52,7 @@ private:
   solux::Greeter::AsyncService greeterService;
   solux::Indexer::AsyncService indexerService;
   solux::Searcher::AsyncService searcherService;
+  solux::Admin::AsyncService adminService;
 
   SoluxNode& soluxNode;
   std::latch startLatch; // triggered when the gRPC server has started (but not the serving threads yet)

@@ -3,6 +3,7 @@
 #include "solux/analysis/Analyzer.h"
 
 #include <memory>
+#include <vector>
 
 namespace solux {
 
@@ -35,6 +36,7 @@ public:
 
   static constexpr flag_type COLUMN_STORED = (1 << 7);  // Set if the field has values stored in a columnar format
   static constexpr flag_type FIXED_SIZE = (1 << 8);     // if all values have the same size in bytes (for otherwise variable-length fields)
+  static constexpr flag_type ABSTRACT = (1 << 9);       // Abstract fields are only usable via suffix matching or inheritance
 
   const FieldType::Type type_;
   const std::string name_;
@@ -61,6 +63,8 @@ public:
   // The name of the field type (which is not necessarily the name of the field)
   std::string_view name() { return name_; }
 
+  bool isAbstract() { return (bool) (flags_ & ABSTRACT); }
+
   // TODO: check standard on cast of int to bool (check generated code too)
   bool indexed() { return (bool) (flags_ & INDEX_DOCS_FREQS_POSITIONS); }
 
@@ -82,31 +86,41 @@ public:
 
 
 class TextFieldType : public FieldType {
-  // TODO: optional list of token filters, etc...
 public:
-  TextFieldType(std::string_view name, int flags=INDEX_DOCS_FREQS_POSITIONS) : FieldType(name, FieldType::TEXT, flags) {}
+  std::string tokenizer_;                // e.g., "whitespace", "nocopy_whitespace", "keyword"
+  std::vector<std::string> filters_;     // e.g., {"lowercase"}
 
-  // Right now, our analyzer only consists of a TokenChain.  We could either fold other analyzer methods into TextFieldType, or
-  // fill out an Analyzer class (only needed if it needs state of its own?)
+  TextFieldType(std::string_view name, int flags=INDEX_DOCS_FREQS_POSITIONS,
+                std::string_view tokenizer = "whitespace", std::vector<std::string> filters = {})
+    : FieldType(name, FieldType::TEXT, flags), tokenizer_(tokenizer), filters_(std::move(filters)) {}
 
   // Create a new non-thread-safe analyzer for this text field type
   std::unique_ptr<TokenChain> createAnalyzer(std::string_view fieldName) {
     unused(fieldName);
-    std::unique_ptr<TokenChain> tc;
 
-    // hack to just drive off of the name for now
-    if (name_ == "_w") {
-      auto wsTok = std::make_unique<NoCopyWhitespaceTokenizer>();
-      auto &headRef = *wsTok;
-      tc = make_unique<TokenChain>(headRef, std::move(wsTok));  // ws only
-    } else if (name_ == "_wl") {
-      // auto wsTok = std::make_unique<WhitespaceTokenizer>();
-      auto wsTok = std::make_unique<WhitespaceTokenizer>();
-      auto &headRef = *wsTok;
-      auto lowerFilt = std::make_unique<LowercaseFilter>(std::move(wsTok));
-      tc = make_unique<TokenChain>(headRef, std::move(lowerFilt));
+    // Create tokenizer by name
+    std::unique_ptr<Tokenizer> tok;
+    if (tokenizer_ == "nocopy_whitespace") {
+      tok = std::make_unique<NoCopyWhitespaceTokenizer>();
+    } else if (tokenizer_ == "keyword") {
+      tok = std::make_unique<KeywordTokenizer>();
+    } else {
+      // default: "whitespace"
+      tok = std::make_unique<WhitespaceTokenizer>();
     }
-    return tc;
+
+    auto& headRef = *tok;
+    std::unique_ptr<TokenStream> tail = std::move(tok);
+
+    // Apply filters in order
+    for (const auto& filter : filters_) {
+      if (filter == "lowercase") {
+        tail = std::make_unique<LowercaseFilter>(std::move(tail));
+      }
+      // easy to add more filters here
+    }
+
+    return std::make_unique<TokenChain>(headRef, std::move(tail));
   }
 
 };

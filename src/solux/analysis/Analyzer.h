@@ -215,6 +215,23 @@ public:
 };
 
 
+// KeywordTokenizer passes the entire input as a single token
+class KeywordTokenizer : public Tokenizer {
+public:
+  KeywordTokenizer() : Tokenizer() {}
+
+  virtual bool incrementToken(bool first) override {
+    if (!first) return false;  // only one token
+    token.clear();
+    if (start_ >= end_) return false;
+    token.ptr = const_cast<char*>(start_);
+    token.end = const_cast<char*>(end_);
+    start_ = end_;  // consumed
+    return true;
+  }
+};
+
+
 class LowercaseFilter : public TokenFilter {
 public:
   LowercaseFilter(std::unique_ptr<TokenStream> source) : TokenFilter(std::move(source)) {}

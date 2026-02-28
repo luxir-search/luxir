@@ -51,7 +51,8 @@ namespace solux {
 //    - applying deletes to segments doesn't work well with concurrent segment merges.
 //      See see finishCommitBody() for how we handle this.
 
-IndexWriter::IndexWriter(Directory& dir) : dir(dir) {
+IndexWriter::IndexWriter(Directory& dir, std::function<std::shared_ptr<Schema>()> schemaProvider)
+  : dir(dir), schemaProvider_(std::move(schemaProvider)) {
   mergePolicy = std::make_unique<MergePolicy>(*this); // defer creation until needed?
   nextCommitInfo = std::make_unique<CommitInfo>();
   std::shared_ptr<InputFile> segFile = dir.openFile(Postings::INDEX_INFO_FILE);
@@ -217,7 +218,7 @@ Inverter& IndexWriter::obtainInverter(uint64_t updateVersion) {
   Inverter* inverter = nullptr;
   const std::lock_guard<std::mutex> lock(indexMutex);
   if (idleInverters.empty()) {
-    auto newInverter = std::make_unique<Inverter>(dir, ++lastSegId);
+    auto newInverter = std::make_unique<Inverter>(dir, ++lastSegId, schemaProvider_);
     inverter = newInverter.get();
     busyInverters.emplace(inverter, std::move(newInverter));
   }

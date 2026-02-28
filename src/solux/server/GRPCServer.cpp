@@ -16,6 +16,7 @@
 #include "solux/util/thread.h"
 #include "solux/util/proto.h"
 #include "ProtoUpdateMessage.h"
+#include "solux/schema/Schema.h"
 
 
 namespace solux {
@@ -49,6 +50,7 @@ void solux::GRPCServer::run() {
   builder.RegisterService(&greeterService);
   builder.RegisterService(&indexerService);
   builder.RegisterService(&searcherService);
+  builder.RegisterService(&adminService);
 
   threads.reserve(nthreads);
   threadInfos.reserve(nthreads);
@@ -769,6 +771,69 @@ public:
 
 };
 
+// Helper to resolve a Collection from a Target proto
+static std::shared_ptr<Collection> resolveCollection(GRPCServer& server, const proto::Target& target) {
+  std::shared_ptr<Library> library = server.getSoluxNode().getLibrary(nullptr, "");
+  std::shared_ptr<Collection> collection;
+  for (int i = 0; i < target.name_size(); i++) {
+    if (i == target.name_size() - 1) {
+      collection = server.getSoluxNode().getCollection(library.get(), target.name(i));
+    } else {
+      library = server.getSoluxNode().getLibrary(library.get(), target.name(i));
+    }
+  }
+  if (!collection) {
+    collection = server.getSoluxNode().getCollection("");
+  }
+  return collection;
+}
+
+class AdminSetSchemaCall : public UnaryCallData<proto::SchemaRequest, proto::SchemaResponse, Admin::AsyncService> {
+public:
+  AdminSetSchemaCall(GRPCServer& server, Admin::AsyncService& service, GRPCServer::ThreadInfo& threadInfo)
+    : UnaryCallData(server, service, threadInfo) {
+    service.RequestSetSchema(&ctx, &request, &responder, threadInfo.cq.get(), threadInfo.cq.get(), make_tag());
+  }
+
+  void createNew() override {
+    new AdminSetSchemaCall(server, service, threadInfo);
+  }
+
+  void fillResponse() override {
+    auto collection = resolveCollection(server, request.collection());
+    std::shared_ptr<Schema> newSchema;
+
+    if (request.mode() == proto::SchemaRequest::MERGE) {
+      auto currentSchema = collection->getSchema();
+      newSchema = Schema::fromProto(request.schema(), currentSchema.get());
+    } else {
+      // REPLACE
+      newSchema = Schema::fromProto(request.schema());
+    }
+
+    collection->setSchema(newSchema);
+    newSchema->toProto(response.mutable_schema());
+  }
+};
+
+class AdminGetSchemaCall : public UnaryCallData<proto::SchemaRequest, proto::SchemaResponse, Admin::AsyncService> {
+public:
+  AdminGetSchemaCall(GRPCServer& server, Admin::AsyncService& service, GRPCServer::ThreadInfo& threadInfo)
+    : UnaryCallData(server, service, threadInfo) {
+    service.RequestGetSchema(&ctx, &request, &responder, threadInfo.cq.get(), threadInfo.cq.get(), make_tag());
+  }
+
+  void createNew() override {
+    new AdminGetSchemaCall(server, service, threadInfo);
+  }
+
+  void fillResponse() override {
+    auto collection = resolveCollection(server, request.collection());
+    auto schema = collection->getSchema();
+    schema->toProto(response.mutable_schema());
+  }
+};
+
 void GRPCServer::runThread(ThreadInfo& threadInfo) {
   // linux-only: give threads a nice name for debugging.
   std::string tname = "solux_grpc_" + std::to_string(threadInfo.threadno);
@@ -787,6 +852,8 @@ void GRPCServer::runThread(ThreadInfo& threadInfo) {
   new IndexerUpdateCall(*this, indexerService, threadInfo);
   new IndexerUpdateStreamingCall(*this, indexerService, threadInfo);
   new SearcherSearchStreamingCall(*this, searcherService, threadInfo);
+  new AdminSetSchemaCall(*this, adminService, threadInfo);
+  new AdminGetSchemaCall(*this, adminService, threadInfo);
 
   /*
    * This startLatchThreads was added because shutting down the server very quickly would generate this failed assertion:

@@ -208,6 +208,7 @@ public:
   };  // end MergePolicy
 
   Directory& dir;
+  std::function<std::shared_ptr<Schema>()> schemaProvider_;
 
   // the last segId generated. Atomic since we don't grab any lock in the merge code to generate a new segment id.
   std::atomic_uint64_t lastSegId;
@@ -288,7 +289,7 @@ public:
   std::unique_ptr<MergeMessageMultiFunc> mergeSegmentsNode;
 
 
-  explicit IndexWriter(Directory &dir);
+  explicit IndexWriter(Directory &dir, std::function<std::shared_ptr<Schema>()> schemaProvider = {});
   ~IndexWriter();
 
   // Submit an update to the IndexWriter.

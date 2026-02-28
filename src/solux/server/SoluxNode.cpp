@@ -13,10 +13,13 @@ SoluxNode::~SoluxNode() {
 
 void SoluxNode::createSingletons() {
   collection = std::make_shared<Collection>();
-  collection->schema = Schema::createSchema();
+  collection->setSchema(Schema::createDefaultSchema());
   collection->shard = std::make_shared<Shard>(*collection);
   collection->shard->dir = std::make_shared<RAMDir>();
-  collection->shard->iw = std::make_shared<IndexWriter>(*collection->shard->dir);
+  // Pass a schemaProvider that fetches the schema from the Collection
+  auto* col = collection.get();
+  collection->shard->iw = std::make_shared<IndexWriter>(*collection->shard->dir,
+    [col]() { return col->getSchema(); });
 }
 
 } // namespace solux

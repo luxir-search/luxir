@@ -52,3 +52,8 @@ service Searcher {
   // clients easier (is this the case?)
   rpc Search(stream solux.proto.SearchRequest) returns (stream solux.proto.SearchResponse) {}
 }
+
+service Admin {
+  rpc SetSchema(solux.proto.SchemaRequest) returns (solux.proto.SchemaResponse) {}
+  rpc GetSchema(solux.proto.SchemaRequest) returns (solux.proto.SchemaResponse) {}
+}

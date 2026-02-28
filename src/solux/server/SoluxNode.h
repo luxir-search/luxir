@@ -47,7 +47,7 @@ class Schema;
 // consist of multiple shards.
 class Collection {
   std::string name;
-  std::shared_ptr<Schema> schema;
+  std::atomic<std::shared_ptr<Schema>> schema;  // atomic for lock-free reader access
   std::shared_ptr<Shard> shard;
   std::vector<std::shared_ptr<Shard>> shards;
 public:
@@ -56,8 +56,14 @@ public:
     return shard;
   }
 
+  // Returns current schema (lock-free read)
   std::shared_ptr<Schema> getSchema() {
-    return schema;
+    return schema.load();
+  }
+
+  // Atomically replaces the schema
+  void setSchema(std::shared_ptr<Schema> newSchema) {
+    schema.store(std::move(newSchema));
   }
 
   friend class Library;
