@@ -192,8 +192,8 @@ public:
     PostingsWriter& postingsWriter = inverter.getPostingsWriter();
     PostingsWriter::IndexFieldInfo& fieldInfo = postingsWriter.addField(fieldName);
     fieldInfo.type = fieldType->type();
-    fieldInfo.flags = fieldType->flags_;
-    
+    fieldInfo.flags = fieldType->flags_ & ~FieldType::ABSTRACT;
+
     // The multi-valued flag is determined by the field type, not by the data we saw
     // If we saw multiple values on a single-valued field, we would have already thrown an exception
 

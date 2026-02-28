@@ -115,7 +115,7 @@ public:
     TextWriter textWriter(inverter.getPostingsWriter());
     PostingsWriter::IndexFieldInfo& fieldInfo = inverter.getPostingsWriter().addField(fieldName);
     fieldInfo.type = fieldType->type();
-    fieldInfo.flags = fieldType->flags_;
+    fieldInfo.flags = fieldType->flags_ & ~FieldType::ABSTRACT;
 
     textWriter.startField(&fieldInfo);
     for (size_t tnum = 0; tnum < sz; tnum++) {

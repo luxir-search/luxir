@@ -462,7 +462,7 @@ TEST_F(StrColTest, mergeNonIndexedStrCol) {
     fr1.readFieldInfo(sfi1);
     // Check the field type and flags
     ASSERT_EQ(FieldType::Type::STRING, sfi1.type) << "Field type should be STRING";
-    ASSERT_TRUE(sfi1.flags & FieldType::COLUMN_STORED) << "Field flags should include COLUMN_STORED";
+    ASSERT_EQ(FieldType::COLUMN_STORED, sfi1.flags) << "Field flags should be COLUMN_STORED only";
     StrColReader sr1(pr1, sfi1);
     ASSERT_EQ(1, sr1.docsWithValue());
     
