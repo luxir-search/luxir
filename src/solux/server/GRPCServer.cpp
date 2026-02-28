@@ -144,10 +144,13 @@ public:
       createNew();
 
       // The actual processing.
-      fillResponse();
-
       state = FINISH;
-      responder.Finish(response, grpc::Status::OK, make_tag());
+      try {
+        fillResponse();
+        responder.Finish(response, grpc::Status::OK, make_tag());
+      } catch (const std::exception& e) {
+        responder.Finish(response, grpc::Status(grpc::StatusCode::INTERNAL, e.what()), make_tag());
+      }
       //std::cout << "finish called," << counter++ << std::endl;
     } else {
       // nothing left to do but delete ourselves
