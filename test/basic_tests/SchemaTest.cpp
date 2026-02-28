@@ -184,6 +184,35 @@ TEST_F(SchemaTest, mergeMode) {
 }
 
 
+TEST_F(SchemaTest, mergeWithParentFromBase) {
+  auto baseSchema = Schema::createDefaultSchema();
+
+  // Merge: add "title" that inherits from "_wl" in the base schema
+  proto::SchemaDef mergeDef;
+  auto* f = mergeDef.add_fields();
+  f->set_name("title");
+  f->set_parent("_wl");
+
+  auto merged = Schema::fromProto(mergeDef, baseSchema.get());
+
+  // "title" should inherit TEXT type and analyzer from base's _wl
+  auto* title = merged->getFieldTypePtr("title");
+  ASSERT_NE(nullptr, title);
+  EXPECT_EQ(FieldType::TEXT, title->type());
+  EXPECT_TRUE(title->indexed());
+  EXPECT_FALSE(title->isAbstract());
+
+  auto* textFt = (TextFieldType*)(title);
+  EXPECT_EQ("whitespace", textFt->tokenizer_);
+  ASSERT_EQ(1, textFt->filters_.size());
+  EXPECT_EQ("lowercase", textFt->filters_[0]);
+
+  // Base fields should still be present
+  ASSERT_NE(nullptr, merged->getFieldTypePtr("id"));
+  ASSERT_NE(nullptr, merged->getFieldTypePtr("title_s"));
+}
+
+
 TEST_F(SchemaTest, replaceMode) {
   // Base schema with "title" and "author"
   proto::SchemaDef baseDef;

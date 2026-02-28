@@ -122,16 +122,42 @@ std::shared_ptr<Schema> Schema::fromProto(const proto::SchemaDef& def, const Sch
     defMap[std::string(def.fields(i).name())] = &def.fields(i);
   }
 
-  // If merging, also add existing base fields to defMap so parent references resolve
-  // But only for fields not being overridden by the new def
-  if (base) {
-    // We don't add base fields to defMap — parent references must resolve within the SchemaDef
-    // or the base schema's fields are already in fieldTypeMap and don't need re-resolution.
-  }
-
   // Resolve all fields
   std::unordered_map<std::string, ResolvedField> resolved;
   std::unordered_set<std::string> visiting;
+
+  // Pre-populate resolved map with base schema fields so new fields can reference them as parents.
+  // Fields being overridden by the new def are skipped — they'll be re-resolved from the SchemaDef.
+  if (base) {
+    for (const auto& [name, ft] : base->fieldTypeMap) {
+      if (defMap.contains(name)) continue;
+      ResolvedField r;
+      r.name = name;
+      r.abstract = ft->isAbstract();
+      r.hasFieldClass = true;
+      switch (ft->type()) {
+        case FieldType::STRING: r.fieldClass = proto::FieldDef::STRING; break;
+        case FieldType::TEXT:   r.fieldClass = proto::FieldDef::TEXT; break;
+        case FieldType::INT:    r.fieldClass = proto::FieldDef::INT; break;
+        case FieldType::FLOAT:  r.fieldClass = proto::FieldDef::FLOAT; break;
+        case FieldType::DOUBLE: r.fieldClass = proto::FieldDef::DOUBLE; break;
+        default:                r.fieldClass = proto::FieldDef::BIN; break;
+      }
+      r.hasIndexed = true;
+      r.indexed = ft->indexed();
+      r.hasColumnStored = true;
+      r.columnStored = ft->hasColumn();
+      r.hasMultiValued = true;
+      r.multiValued = ft->multiValued();
+      if (ft->type() == FieldType::TEXT) {
+        auto* textFt = (TextFieldType*)(ft.get());
+        r.hasAnalyzer = true;
+        r.tokenizer = textFt->tokenizer_;
+        r.filters = textFt->filters_;
+      }
+      resolved[name] = std::move(r);
+    }
+  }
 
   for (auto& [name, _] : defMap) {
     resolveField(name, defMap, resolved, visiting);
