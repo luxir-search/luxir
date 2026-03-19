@@ -2,6 +2,7 @@
 
 #include <string>
 #include <vector>
+#include <memory>
 
 // Holds data about deletes during indexing that need to be applied to segments before
 // a commit is made.  Instances start off on the Inverter and are transferred
