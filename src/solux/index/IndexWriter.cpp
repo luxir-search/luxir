@@ -3,6 +3,7 @@
 #include "solux/store/OutputStream.h"
 #include "solux/store/InputStream.h"
 #include "LiveDocsWriter.h"
+#include "solux/schema/Schema.h"
 
 #include "protos/solux_types.pb.h"
 #include <google/protobuf/io/coded_stream.h>
@@ -75,6 +76,7 @@ IndexWriter::IndexWriter(Directory& dir, std::function<std::shared_ptr<Schema>()
     lastCommitTime = lastAdvertisedCommitTime = indexInfo.commit_time();
     indexGen = indexInfo.index_gen();
     coreGen = indexInfo.core_gen();
+    schemaGen_ = indexInfo.schema_gen();
     updateBase = indexInfo.update_version() + 1;
     segInfos.reserve(indexInfo.segments_size());
     lastCommittedSegIds.reserve(indexInfo.segments_size());
@@ -94,6 +96,7 @@ IndexWriter::IndexWriter(Directory& dir, std::function<std::shared_ptr<Schema>()
       seg.minVersion = segment.min_version();
       seg.maxVersion = segment.max_version();
       seg.liveDocs = segment.live_docs();
+      seg.schemaGen = segment.schema_gen();
       seg.firstCommitTime = segment.commit_time();  // firstCommitTime is stored in the segment meta.
       seg.lastCommitTime = indexInfo.commit_time(); // not stored in the segment meta, so use index meta.
       mergePolicy->_update(&seg);
@@ -404,6 +407,7 @@ void IndexWriter::segmentFlushBody(Inverter& inverter) {
                                            inverter.getPostingsWriter().getMaxDoc());
   segInfo->minVersion = inverter.minVersion;
   segInfo->maxVersion = inverter.maxVersion;
+  segInfo->schemaGen = currentSchemaGen();
   // Set liveDocs + liveGen for deleted docs from errors during indexing
   if (inverter.liveGen > 0) {
     segInfo->liveGen = inverter.liveGen;
@@ -832,6 +836,7 @@ void IndexWriter::writeIndexInfoFile(std::span<SegInfo*> segs, CommitInfo* commi
   indexInfo.set_index_gen(thisIndexGen);
   indexInfo.set_update_version(updateVersion);
   indexInfo.set_core_gen(coreGen);
+  indexInfo.set_schema_gen(currentSchemaGen());
   indexInfo.mutable_segments()->Reserve(segs.size());
 
   for (auto seg : segs) {
@@ -851,6 +856,7 @@ void IndexWriter::writeIndexInfoFile(std::span<SegInfo*> segs, CommitInfo* commi
     segmentInfo->set_max_version(seg->maxVersion);
     segmentInfo->set_commit_time(seg->firstCommitTime);
     segmentInfo->set_live_docs(seg->liveDocs);
+    segmentInfo->set_schema_gen(seg->schemaGen);
 
     numDocs += seg->maxDoc;
     INDEX_DEBUG("\t{}", *seg);
@@ -983,6 +989,7 @@ void IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
 
     // Create the new SegInfo for the output segment.
     auto newSegInfo = std::make_unique<SegInfo>(pwriter.getSegId(), pwriter.getMaxDoc());
+    newSegInfo->schemaGen = currentSchemaGen();
 
     // Move old segments to the delete list and add the new segment info.
     std::vector<std::unique_ptr<SegInfo>> toDeleteSegs;

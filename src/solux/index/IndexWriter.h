@@ -40,6 +40,9 @@ namespace solux {
     // or by IndexReader opening code.
     std::atomic<std::shared_ptr<PostingsReader>> sharedPostingsReader = nullptr;
 
+    // Schema generation this segment was indexed under.
+    uint64_t schemaGen = 0;
+
     // info about the min and max versions of documents in this segment, derived from the update message sequence number.
     // this can help us determine if we can skip applying deletes to this segment from another segment.
     uint64_t minVersion = 0;
@@ -67,8 +70,8 @@ namespace solux {
 
 
 inline std::string format_as(const SegInfo& seg) {
-  return fmt::format("(seg={} max={} live={} lgen={} mlevel={} merging={} mlgen={} mto={} ctime={} minV={} maxV={} pdel={})", seg.name(), seg.maxDoc, seg.liveDocs, seg.liveGen, seg.mergeLevel, seg.merging,
-                     seg.mergedLiveGen, seg.mergedIntoSegId, seg.lastCommitTime, seg.minVersion, seg.maxVersion, seg.personalDeletes.size());
+  return fmt::format("(seg={} max={} live={} lgen={} mlevel={} merging={} mlgen={} mto={} ctime={} minV={} maxV={} sgen={} pdel={})", seg.name(), seg.maxDoc, seg.liveDocs, seg.liveGen, seg.mergeLevel, seg.merging,
+                     seg.mergedLiveGen, seg.mergedIntoSegId, seg.lastCommitTime, seg.minVersion, seg.maxVersion, seg.schemaGen, seg.personalDeletes.size());
 }
 
 
@@ -257,6 +260,9 @@ public:
   // Track segment IDs from last commit to detect composition changes
   std::vector<uint64_t> lastCommittedSegIds;
 
+  // Schema generation read from IndexInfo on startup, written on each commit.
+  uint64_t schemaGen_ = 0;
+
   // commit info for the index, used to track deletes.
   // This is moved to the UpdateMessage when a commit is processed and a new one is created for the next commit.
   std::unique_ptr<CommitInfo> nextCommitInfo;
@@ -288,6 +294,18 @@ public:
   using MergeMessageMultiFunc = tbb::flow::multifunction_node<MergeMessage*, std::tuple<void*>>;
   std::unique_ptr<MergeMessageMultiFunc> mergeSegmentsNode;
 
+
+  // Returns the current schema generation from the provider, or the last known value.
+  uint64_t currentSchemaGen() {
+    if (schemaProvider_) {
+      auto schema = schemaProvider_();
+      if (schema) schemaGen_ = schema->gen_;
+    }
+    return schemaGen_;
+  }
+
+  // Returns the schema generation read from IndexInfo (or 0 if none).
+  uint64_t getSchemaGen() const { return schemaGen_; }
 
   explicit IndexWriter(Directory &dir, std::function<std::shared_ptr<Schema>()> schemaProvider = {});
   ~IndexWriter();

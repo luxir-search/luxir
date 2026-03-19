@@ -1,16 +1,14 @@
 #include "Schema.h"
 #include "protos/solux_types.pb.h"
 
+#include <boost/unordered/unordered_flat_set.hpp>
 #include <stdexcept>
-#include <unordered_map>
-#include <unordered_set>
 #include <vector>
 
 namespace solux {
 
 // Resolved state for a single FieldDef during fromProto processing
 struct ResolvedField {
-  std::string name;
   bool abstract = false;
   bool hasFieldClass = false;
   proto::FieldDef::FieldClass fieldClass = proto::FieldDef::STRING;
@@ -25,33 +23,37 @@ struct ResolvedField {
   std::vector<std::string> filters;
 };
 
+using sv_flat_map = boost::unordered_flat_map<std::string_view, const proto::FieldDef*, PackedTermHash, PackedTermEqual>;
+using sv_resolved_map = boost::unordered_flat_map<std::string_view, ResolvedField, PackedTermHash, PackedTermEqual>;
+using sv_flat_set = boost::unordered_flat_set<std::string_view, PackedTermHash, PackedTermEqual>;
+
 // Walk the parent chain and resolve all properties for a field.
-static void resolveField(const std::string& name,
-                         const std::unordered_map<std::string, const proto::FieldDef*>& defMap,
-                         std::unordered_map<std::string, ResolvedField>& resolved,
-                         std::unordered_set<std::string>& visiting) {
+static void resolveField(std::string_view name,
+                         const sv_flat_map& defMap,
+                         sv_resolved_map& resolved,
+                         sv_flat_set& visiting) {
   if (resolved.contains(name)) return;
 
   if (visiting.contains(name)) {
-    throw std::runtime_error("Circular schema inheritance detected involving field: " + name);
+    throw std::runtime_error("Circular schema inheritance detected involving field: " + std::string(name));
   }
   visiting.insert(name);
 
   auto defIt = defMap.find(name);
   if (defIt == defMap.end()) {
-    throw std::runtime_error("Parent field not found in schema: " + name);
+    throw std::runtime_error("Parent field not found in schema: " + std::string(name));
   }
   const proto::FieldDef& def = *defIt->second;
 
   // Resolve parent first if exists
   ResolvedField parentResolved{};
   if (!def.parent().empty()) {
-    resolveField(std::string(def.parent()), defMap, resolved, visiting);
-    parentResolved = resolved[std::string(def.parent())];
+    std::string_view parentName = def.parent();
+    resolveField(parentName, defMap, resolved, visiting);
+    parentResolved = resolved.find(parentName)->second;
   }
 
   ResolvedField r;
-  r.name = name;
   r.abstract = def.abstract();  // NOT inherited
 
   // field_class: use this field's if set, else parent's
@@ -111,20 +113,48 @@ static void resolveField(const std::string& name,
 std::shared_ptr<Schema> Schema::fromProto(const proto::SchemaDef& def, const Schema* base) {
   auto schema = std::make_shared<Schema>();
 
+  // Build the source def to persist. For MERGE mode, merge new fields into the base's source def.
+  if (base && !base->sourceDef_.empty()) {
+    // Parse the base's source def
+    proto::SchemaDef baseSrc;
+    baseSrc.ParseFromString(base->sourceDef_);
+
+    // Build a set of field names from the new def for quick lookup
+    sv_flat_set newFieldNames;
+    for (int i = 0; i < def.fields_size(); i++) {
+      newFieldNames.insert(def.fields(i).name());
+    }
+
+    // Start with base fields that are NOT being overridden
+    proto::SchemaDef mergedSrc;
+    for (int i = 0; i < baseSrc.fields_size(); i++) {
+      if (!newFieldNames.contains(baseSrc.fields(i).name())) {
+        *mergedSrc.add_fields() = baseSrc.fields(i);
+      }
+    }
+    // Add all new fields (including overrides)
+    for (int i = 0; i < def.fields_size(); i++) {
+      *mergedSrc.add_fields() = def.fields(i);
+    }
+    schema->sourceDef_ = mergedSrc.SerializeAsString();
+  } else {
+    schema->sourceDef_ = def.SerializeAsString();
+  }
+
   // If MERGE mode, copy base schema's fields
   if (base) {
     schema->fieldTypeMap = base->fieldTypeMap;
   }
 
   // Build a name->FieldDef map
-  std::unordered_map<std::string, const proto::FieldDef*> defMap;
+  sv_flat_map defMap;
   for (int i = 0; i < def.fields_size(); i++) {
-    defMap[std::string(def.fields(i).name())] = &def.fields(i);
+    defMap[def.fields(i).name()] = &def.fields(i);
   }
 
   // Resolve all fields
-  std::unordered_map<std::string, ResolvedField> resolved;
-  std::unordered_set<std::string> visiting;
+  sv_resolved_map resolved;
+  sv_flat_set visiting;
 
   // Pre-populate resolved map with base schema fields so new fields can reference them as parents.
   // Fields being overridden by the new def are skipped — they'll be re-resolved from the SchemaDef.
@@ -132,7 +162,6 @@ std::shared_ptr<Schema> Schema::fromProto(const proto::SchemaDef& def, const Sch
     for (const auto& [name, ft] : base->fieldTypeMap) {
       if (defMap.contains(name)) continue;
       ResolvedField r;
-      r.name = name;
       r.abstract = ft->isAbstract();
       r.hasFieldClass = true;
       switch (ft->type()) {
@@ -166,7 +195,7 @@ std::shared_ptr<Schema> Schema::fromProto(const proto::SchemaDef& def, const Sch
   // Create FieldType objects from resolved fields
   for (auto& [name, r] : resolved) {
     if (!r.hasFieldClass) {
-      throw std::runtime_error("Field '" + name + "' has no field_class and no parent to inherit from");
+      throw std::runtime_error("Field '" + std::string(name) + "' has no field_class and no parent to inherit from");
     }
 
     // Apply defaults based on field_class if properties were not explicitly set
@@ -223,7 +252,7 @@ std::shared_ptr<Schema> Schema::fromProto(const proto::SchemaDef& def, const Sch
         ft = std::make_shared<IntFieldType>(name, flags);
         break;
       default:
-        throw std::runtime_error("Unsupported field_class for field: " + name);
+        throw std::runtime_error("Unsupported field_class for field: " + std::string(name));
     }
 
     if (r.abstract) ft->flags_ |= FieldType::ABSTRACT;

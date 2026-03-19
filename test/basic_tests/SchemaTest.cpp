@@ -3,6 +3,8 @@
 
 #include "solux/schema/Schema.h"
 #include "solux/schema/FieldType.h"
+#include "solux/store/InputStream.h"
+#include "solux/reader/Postings.h"
 #include "protos/solux_types.pb.h"
 #include "test/SoluxTest.h"
 #include "test/CollectionHelper.h"
@@ -11,6 +13,10 @@
 
 using namespace solux;
 using namespace solux::test;
+
+static std::string schemaFileName(uint64_t gen) {
+  return "_schema_" + Postings::getSortableString(gen);
+}
 
 class SchemaTest : public SoluxTest {};
 
@@ -365,4 +371,265 @@ TEST_F(SchemaTest, missingFieldClass) {
   f->set_name("broken");
 
   EXPECT_THROW(Schema::fromProto(def), std::runtime_error);
+}
+
+
+TEST_F(SchemaTest, schemaPersistence) {
+  CollectionHelper ch;
+  ch.clear();
+
+  // Set a custom schema with an explicit "title" field
+  auto defaultSchema = Schema::createDefaultSchema();
+  proto::SchemaDef customDef;
+  auto* titleField = customDef.add_fields();
+  titleField->set_name("title");
+  titleField->set_field_class(proto::FieldDef::TEXT);
+  titleField->set_indexed(true);
+  titleField->mutable_analyzer()->set_tokenizer("whitespace");
+  titleField->mutable_analyzer()->add_filters("lowercase");
+
+  auto newSchema = Schema::fromProto(customDef, defaultSchema.get());
+  ch.collection().setSchema(newSchema);
+
+  // Verify gen was assigned
+  auto schema = ch.collection().getSchema();
+  EXPECT_GT(schema->gen_, (uint64_t)0);
+  uint64_t gen = schema->gen_;
+
+  // Verify schema file exists in Directory
+  auto& dir = *ch.collection().getShard()->getDirectory();
+  std::string fileName = schemaFileName(gen);
+  auto file = dir.openFile(fileName);
+  ASSERT_NE(nullptr, file.get()) << "Schema file " << fileName << " should exist";
+
+  // Verify we can parse the persisted schema
+  InputStream is = file->getInputStream();
+  proto::SchemaDef persistedDef;
+  ASSERT_TRUE(persistedDef.ParseFromArray(is.ptr(), (int)is.left()));
+
+  // The persisted def should contain "title" field
+  bool foundTitle = false;
+  for (int i = 0; i < persistedDef.fields_size(); i++) {
+    if (persistedDef.fields(i).name() == "title") {
+      foundTitle = true;
+      EXPECT_EQ(proto::FieldDef::TEXT, persistedDef.fields(i).field_class());
+      break;
+    }
+  }
+  EXPECT_TRUE(foundTitle) << "Persisted schema should contain 'title' field";
+
+  ch.clear();
+  ch.collection().setSchema(Schema::createDefaultSchema());
+}
+
+
+TEST_F(SchemaTest, schemaGenIncrements) {
+  CollectionHelper ch;
+  ch.clear();
+
+  auto defaultSchema = Schema::createDefaultSchema();
+
+  // Set schema first time
+  proto::SchemaDef def1;
+  auto* f1 = def1.add_fields();
+  f1->set_name("field1");
+  f1->set_field_class(proto::FieldDef::STRING);
+  auto schema1 = Schema::fromProto(def1, defaultSchema.get());
+  ch.collection().setSchema(schema1);
+  uint64_t gen1 = ch.collection().getSchema()->gen_;
+
+  // Set schema second time
+  proto::SchemaDef def2;
+  auto* f2 = def2.add_fields();
+  f2->set_name("field2");
+  f2->set_field_class(proto::FieldDef::INT);
+  auto schema2 = Schema::fromProto(def2, ch.collection().getSchema().get());
+  ch.collection().setSchema(schema2);
+  uint64_t gen2 = ch.collection().getSchema()->gen_;
+
+  EXPECT_GT(gen2, gen1) << "Schema gen should increment on each setSchema";
+
+  // Old schema file should be cleaned up
+  auto oldFile = ch.collection().getShard()->getDirectory()->openFile(schemaFileName(gen1));
+  EXPECT_EQ(nullptr, oldFile.get()) << "Old schema file should be deleted";
+
+  // New schema file should exist
+  auto newFile = ch.collection().getShard()->getDirectory()->openFile(schemaFileName(gen2));
+  EXPECT_NE(nullptr, newFile.get()) << "New schema file should exist";
+
+  ch.clear();
+  ch.collection().setSchema(Schema::createDefaultSchema());
+}
+
+
+TEST_F(SchemaTest, schemaGenWrittenToIndexInfo) {
+  CollectionHelper ch;
+  ch.clear();
+
+  // Set a custom schema
+  auto defaultSchema = Schema::createDefaultSchema();
+  proto::SchemaDef customDef;
+  auto* f = customDef.add_fields();
+  f->set_name("title");
+  f->set_field_class(proto::FieldDef::TEXT);
+  f->set_indexed(true);
+  f->mutable_analyzer()->set_tokenizer("whitespace");
+
+  auto newSchema = Schema::fromProto(customDef, defaultSchema.get());
+  ch.collection().setSchema(newSchema);
+  uint64_t expectedGen = ch.collection().getSchema()->gen_;
+
+  // Index a doc and commit so IndexInfo gets written
+  Doc doc = {{"id", std::string("1")}, {"title_s", std::string("test")}};
+  ch.index(doc);
+  ch.commit();
+
+  // Read IndexInfo directly and check schema_gen
+  auto& dir = *ch.collection().getShard()->getDirectory();
+  auto indexInfoFile = dir.openFile("s.olux");
+  ASSERT_NE(nullptr, indexInfoFile.get());
+
+  InputStream is = indexInfoFile->getInputStream();
+  proto::IndexInfo indexInfo;
+  ASSERT_TRUE(indexInfo.ParseFromArray(is.ptr(), (int)is.left()));
+  EXPECT_EQ(expectedGen, indexInfo.schema_gen()) << "IndexInfo should contain the current schema_gen";
+
+  // Check that SegmentInfo also has schema_gen
+  ASSERT_GT(indexInfo.segments_size(), 0);
+  EXPECT_EQ(expectedGen, indexInfo.segments(0).schema_gen()) << "SegmentInfo should have schema_gen";
+
+  ch.clear();
+  ch.collection().setSchema(Schema::createDefaultSchema());
+}
+
+
+TEST_F(SchemaTest, schemaLoadOnRestart) {
+  CollectionHelper ch;
+  ch.clear();
+
+  // Set a custom schema with "title" field
+  auto defaultSchema = Schema::createDefaultSchema();
+  proto::SchemaDef customDef;
+  auto* f = customDef.add_fields();
+  f->set_name("title");
+  f->set_field_class(proto::FieldDef::TEXT);
+  f->set_indexed(true);
+  f->mutable_analyzer()->set_tokenizer("whitespace");
+  f->mutable_analyzer()->add_filters("lowercase");
+
+  auto newSchema = Schema::fromProto(customDef, defaultSchema.get());
+  ch.collection().setSchema(newSchema);
+  uint64_t schemaGen = ch.collection().getSchema()->gen_;
+
+  // Index and commit so IndexInfo has schema_gen
+  Doc doc = {{"id", std::string("1")}, {"title_s", std::string("test")}};
+  ch.index(doc);
+  ch.commit();
+
+  // Simulate restart: load latest schema from Directory
+  auto loaded = ch.collection().loadSchema();
+  ASSERT_TRUE(loaded) << "Should successfully load schema from Directory";
+
+  auto loadedSchema = ch.collection().getSchema();
+  EXPECT_EQ(schemaGen, loadedSchema->gen_);
+
+  // The loaded schema should have the "title" field
+  auto* titleFt = loadedSchema->getFieldTypePtr("title");
+  ASSERT_NE(nullptr, titleFt) << "Loaded schema should contain 'title' field";
+  EXPECT_EQ(FieldType::TEXT, titleFt->type());
+
+  // It should also have default fields that were merged in
+  EXPECT_NE(nullptr, loadedSchema->getFieldTypePtr("id"));
+  EXPECT_NE(nullptr, loadedSchema->getFieldTypePtr("title_s"));
+
+  ch.clear();
+  ch.collection().setSchema(Schema::createDefaultSchema());
+}
+
+
+TEST_F(SchemaTest, sourceDef) {
+  // Verify that sourceDef_ preserves the original SchemaDef (including parent references)
+  proto::SchemaDef def;
+
+  auto* parent = def.add_fields();
+  parent->set_name("_wl");
+  parent->set_field_class(proto::FieldDef::TEXT);
+  parent->set_indexed(true);
+  parent->set_abstract(true);
+  parent->mutable_analyzer()->set_tokenizer("whitespace");
+  parent->mutable_analyzer()->add_filters("lowercase");
+
+  auto* child = def.add_fields();
+  child->set_name("title");
+  child->set_parent("_wl");
+
+  auto schema = Schema::fromProto(def);
+  ASSERT_FALSE(schema->sourceDef_.empty());
+
+  // Parse back the sourceDef and verify it has parent references
+  proto::SchemaDef roundtripped;
+  ASSERT_TRUE(roundtripped.ParseFromString(schema->sourceDef_));
+
+  bool foundChild = false;
+  for (int i = 0; i < roundtripped.fields_size(); i++) {
+    if (roundtripped.fields(i).name() == "title") {
+      foundChild = true;
+      EXPECT_EQ("_wl", roundtripped.fields(i).parent())
+        << "sourceDef should preserve parent references";
+      break;
+    }
+  }
+  EXPECT_TRUE(foundChild);
+}
+
+
+TEST_F(SchemaTest, loadSchemaAfterOldFileDeleted) {
+  // Simulates the race where the schema file from IndexInfo's gen was already
+  // cleaned up by a newer setSchema. loadSchema() must find the newer file.
+  // Without the retry logic, this test fails because the only schema file
+  // is manually deleted before calling loadSchema().
+  CollectionHelper ch;
+  ch.clear();
+
+  auto baseSchema = Schema::createDefaultSchema();
+
+  // setSchema — writes _schema.<gen1>
+  proto::SchemaDef def1;
+  auto* f1 = def1.add_fields();
+  f1->set_name("field1");
+  f1->set_field_class(proto::FieldDef::STRING);
+  ch.collection().setSchema(Schema::fromProto(def1, baseSchema.get()));
+  uint64_t gen1 = ch.collection().getSchema()->gen_;
+
+  // Manually delete the schema file to simulate the race
+  auto& dir = *ch.collection().getShard()->getDirectory();
+  ASSERT_TRUE(dir.deleteFile(schemaFileName(gen1)));
+
+  // loadSchema should fail — no schema files remain
+  EXPECT_FALSE(ch.collection().loadSchema()) << "Should fail with no schema files";
+
+  // Now do two setSchema calls so the first gen's file gets cleaned up naturally
+  proto::SchemaDef def2;
+  auto* f2 = def2.add_fields();
+  f2->set_name("field2");
+  f2->set_field_class(proto::FieldDef::INT);
+  ch.collection().setSchema(Schema::fromProto(def2, baseSchema.get()));
+
+  proto::SchemaDef def3;
+  auto* f3 = def3.add_fields();
+  f3->set_name("field3");
+  f3->set_field_class(proto::FieldDef::INT);
+  f3->set_column_stored(true);
+  ch.collection().setSchema(Schema::fromProto(def3, ch.collection().getSchema().get()));
+  uint64_t gen3 = ch.collection().getSchema()->gen_;
+
+  // loadSchema should find the latest file
+  ASSERT_TRUE(ch.collection().loadSchema());
+  auto loadedSchema = ch.collection().getSchema();
+  EXPECT_EQ(gen3, loadedSchema->gen_) << "Should have loaded the newest schema generation";
+  EXPECT_NE(nullptr, loadedSchema->getFieldTypePtr("field3"))
+    << "Loaded schema should contain 'field3' from the newest schema";
+
+  ch.clear();
+  ch.collection().setSchema(Schema::createDefaultSchema());
 }

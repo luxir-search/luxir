@@ -1,5 +1,6 @@
 #pragma once
 
+#include <string>
 #include "solux/store/Directory.h"
 #include "solux/index/IndexWriter.h"
 #include "oneapi/tbb/task_arena.h"
@@ -34,6 +35,10 @@ public:
     return iw;
   }
 
+  std::shared_ptr<Directory> getDirectory() {
+    return dir;
+  }
+
   // TODO: if a shard isn't currently "loaded", should it be removed from the map, or just it's size cut down?
 
   friend class Collection;
@@ -50,6 +55,7 @@ class Collection {
   std::atomic<std::shared_ptr<Schema>> schema;  // atomic for lock-free reader access
   std::shared_ptr<Shard> shard;
   std::vector<std::shared_ptr<Shard>> shards;
+  std::atomic<uint64_t> schemaGen_{1};  // starts at 1 for default schema
 public:
 
   std::shared_ptr<Shard> getShard() {
@@ -61,10 +67,14 @@ public:
     return schema.load();
   }
 
-  // Atomically replaces the schema
-  void setSchema(std::shared_ptr<Schema> newSchema) {
-    schema.store(std::move(newSchema));
-  }
+  // Atomically replaces the schema and persists it to the shard's Directory.
+  void setSchema(std::shared_ptr<Schema> newSchema);
+
+  uint64_t schemaGen() const { return schemaGen_.load(); }
+
+  // Load the latest schema from the Directory.
+  // Returns true if schema was loaded, false if no schema file found.
+  bool loadSchema();
 
   friend class Library;
   friend class SoluxNode;

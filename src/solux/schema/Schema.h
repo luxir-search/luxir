@@ -18,6 +18,8 @@ public:
   using const_iterator = map_type::const_iterator;
 
   map_type fieldTypeMap;
+  uint64_t gen_ = 0;          // schema generation, set when persisted
+  std::string sourceDef_;     // serialized bytes of the original SchemaDef proto (before inheritance resolution)
 
 public:
   Schema() {};

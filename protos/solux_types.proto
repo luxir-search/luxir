@@ -445,6 +445,7 @@ message IndexInfo {
   uint64 index_gen = 3;               // Generation of this index (incremented on each commit)
   uint64 core_gen = 4;                // Segment composition generation (incremented only when segments change, not deletes)
   uint64 update_version = 5;          // Highest update version in this index (incremented on each update)
+  uint64 schema_gen = 6;              // Schema generation (incremented on each schema change)
   repeated SegmentInfo segments = 15; // List if segments in this index
 }
 
@@ -457,6 +458,7 @@ message SegmentInfo {
   uint64 commit_time = 5;               // First time this segment was committed (microseconds since epoch)
   int32  max_doc = 6;                   // Number of documents in this segment (ignoring deletes)
   int32  live_docs = 7;                 // Number of non-deleted documents in this segment
+  uint64 schema_gen = 8;               // Schema generation this segment was indexed under
 }
 
 //

@@ -1,7 +1,9 @@
 #pragma once
 
+#include <charconv>
 #include <cstdint>
 #include <string>
+#include <string_view>
 #include <array>
 
 namespace solux {
@@ -33,6 +35,16 @@ public:
     uint8_t extraDigits = end - start - 1;
     arr[0] = extraDigits <= 9 ? ('0' + extraDigits) : ('a' + (extraDigits - 10));  // base36 prefix
     return std::string(arr.begin(), end);
+  }
+
+  // Parse a sortable string back to a number. Inverse of getSortableString.
+  // Returns 0 on failure.
+  static uint64_t parseSortableString(std::string_view s) {
+    if (s.size() < 2) return 0;
+    s.remove_prefix(1);  // skip the length-prefix char
+    uint64_t val = 0;
+    std::from_chars(s.data(), s.data() + s.size(), val, 36);
+    return val;
   }
 
   static std::string getIndexFileName(const std::string_view gen, const std::string_view suffix) {
