@@ -1280,9 +1280,14 @@ void IndexWriter::applyDeletes(SegInfo& seg, MultiDeletesData& multiDeletesData)
   FieldReader versionFieldReader(pool, reader);
   SegFieldInfo versionFieldInfo;
   bool hasVersionField = false;
+  std::optional<IntColReader> versionColReader;
+  std::optional<IntColReader::DenseValues> versionValues;
   if (versionFieldReader.seek("_version_")) {
     versionFieldReader.readFieldInfo(versionFieldInfo);
     hasVersionField = true;
+    versionColReader.emplace(reader, versionFieldInfo);
+    assert(!versionColReader->multiValued());
+    versionValues.emplace(*versionColReader);
   }
 
   // Helper function to process deletes from a DeletesData
@@ -1314,13 +1319,8 @@ void IndexWriter::applyDeletes(SegInfo& seg, MultiDeletesData& multiDeletesData)
 
           // If version field exists, check if document version is less than delete version
           if (hasVersionField) {
-            std::vector<int32_t> singleDoc = {docId};
-            uint64_t docVersion = 0;
-
-            IntColReader::getSingleValues(pool, reader, versionFieldInfo, singleDoc,
-                                          [&](size_t, int32_t, int64_t version) {
-                                            docVersion = (uint64_t)version;
-                                          });
+            // _version_ is dense (every doc has one), so rank == docId
+            uint64_t docVersion = (uint64_t)versionValues->valueAt(docId);
 
             INDEX_TRACE("applyDeletes: found version {} for docId {} in segment {}",
                      docId, docVersion, seg.segId);
