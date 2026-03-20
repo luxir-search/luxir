@@ -14,6 +14,7 @@
 
 #include <oneapi/tbb/flow_graph.h>
 #include <solux/index/Inverter.h>
+#include <solux/index/DeletesData.h>
 #include <solux/server/ProtoUpdateMessage.h>
 
 #include "solux/index/IndexWriter.h"
@@ -1432,4 +1433,64 @@ TEST_F(IndexWriterTest, testCoreGen) {
     }
   }
   EXPECT_EQ(mergedSegmentCount, 1);
+}
+
+
+TEST_F(IndexWriterTest, deletesDataPacked) {
+  // Increase iter count when making changes to DeletesData to stress test.
+  int iterations = 10;
+
+  for (int iter = 0; iter < iterations; iter++) {
+    uint64_t seed = rng_seed + iter;
+    Rng rng(seed);
+    int numDeletes = (int)rng.rint(1, 1000);
+
+    // Write entries with random ids and versions that can go up or down (testing zigzag delta encoding)
+    DeletesData dd;
+    uint64_t version = 100;  // start above 0 so we can go negative in delta
+    uint64_t minVersion = UINT64_MAX, maxVersion = 0;
+    std::string id;
+    for (int i = 0; i < numDeletes; i++) {
+      int idLen = (int)rng.rint(1, 256);
+      id.resize(idLen);
+      for (int j = 0; j < idLen; j++) {
+        id[j] = (char)rng.rbyte();
+      }
+      // delta in range [-2, +4) so versions mostly increase but can decrease
+      int64_t delta = rng.rint((int64_t)6) - 2;
+      version = (uint64_t)((int64_t)version + delta);
+      dd.deleteId(id, version);
+      if (version < minVersion) minVersion = version;
+      if (version > maxVersion) maxVersion = version;
+    }
+
+    ASSERT_EQ(dd.count(), numDeletes) << "iter=" << iter;
+    ASSERT_EQ(dd.getSmallestVersion(), minVersion) << "iter=" << iter;
+    ASSERT_EQ(dd.getLargestVersion(), maxVersion) << "iter=" << iter;
+
+    // Reseed and verify iterator reproduces the same sequence
+    Rng rng2(seed);
+    int numDeletes2 = (int)rng2.rint(1, 1000);
+    ASSERT_EQ(numDeletes, numDeletes2);
+
+    DeletesData::Iterator it(dd);
+    uint64_t version2 = 100;
+    for (int i = 0; i < numDeletes; i++) {
+      int idLen = (int)rng2.rint(1, 256);
+      id.resize(idLen);
+      for (int j = 0; j < idLen; j++) {
+        id[j] = (char)rng2.rbyte();
+      }
+      int64_t delta2 = rng2.rint((int64_t)6) - 2;
+      version2 = (uint64_t)((int64_t)version2 + delta2);
+
+      ASSERT_TRUE(it.hasNext()) << "iter=" << iter << " i=" << i;
+      auto entry = it.next();
+      ASSERT_EQ(entry.id, std::string_view(id)) << "iter=" << iter << " i=" << i;
+      ASSERT_EQ(entry.version, version2) << "iter=" << iter << " i=" << i;
+    }
+    ASSERT_FALSE(it.hasNext()) << "iter=" << iter;
+
+    // dd.toString();
+  }
 }

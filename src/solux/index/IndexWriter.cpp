@@ -1287,9 +1287,11 @@ void IndexWriter::applyDeletes(SegInfo& seg, MultiDeletesData& multiDeletesData)
 
   // Helper function to process deletes from a DeletesData
   auto processDeletes = [&](const DeletesData& deletesData) {
-    for (size_t i = 0; i < deletesData.deletedIds.size(); i++) {
-      const std::string& deleteId = deletesData.deletedIds[i];
-      uint64_t deleteVersion = deletesData.deletedVersions[i];
+    DeletesData::Iterator it(deletesData);
+    while (it.hasNext()) {
+      auto entry = it.next();
+      auto& deleteId = entry.id;
+      uint64_t deleteVersion = entry.version;
 
       INDEX_TRACE("applyDeletes: looking up term '{}' with version {} in segment {}",
                deleteId, deleteVersion, seg.segId);

@@ -299,6 +299,17 @@ public:
     return bufferSize(buffer) - pos;
   }
 
+  /// Returns pointer to start of data in the current buffer (past the header).
+  char* blockStart() {
+    return buffer + HEADER_SIZE;
+  }
+
+  /// Shrink the last allocation by n bytes (backs up pos).
+  void shrink(int n) {
+    assert(pos - n >= HEADER_SIZE);
+    pos -= n;
+  }
+
   char* reserve(uint32_t size) {
     assert(size <= BYTE_BLOCK_SIZE - HEADER_SIZE);
     if (spaceLeft() >= size) {

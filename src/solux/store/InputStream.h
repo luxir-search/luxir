@@ -1,6 +1,7 @@
 #pragma once
 
 #include "solux/util/StrRef.h"
+#include "solux/util/encoding.h"
 
 namespace solux {
 
@@ -124,6 +125,11 @@ public:
       val |= uint64_t(b & 0x7f) << shift;
     }
     return val;
+  }
+
+  // Read a zig-zag encoded signed long.
+  int64_t readZlong() {
+    return zigzagDecode(readVlong());
   }
 
   uint32_t readStrLen() {
