@@ -2,6 +2,7 @@
 
 #include <string>
 #include "solux/store/Directory.h"
+#include "solux/store/DirectoryFactory.h"
 #include "solux/index/IndexWriter.h"
 #include "oneapi/tbb/task_arena.h"
 #include "solux/search/SearchEngine.h"
@@ -156,8 +157,8 @@ private:
 
   std::unique_ptr<SearchEngine> searchEngine;
   std::shared_ptr<Library> root;
+  std::unique_ptr<DirectoryFactory> dirFactory;
   // temporary singletons
-  RAMDir dir;
   std::shared_ptr<Shard> shard;
   std::shared_ptr<Collection> collection;
 

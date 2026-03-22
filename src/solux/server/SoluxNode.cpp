@@ -97,9 +97,11 @@ SoluxNode::~SoluxNode() {
 }
 
 void SoluxNode::createSingletons() {
+  dirFactory = std::make_unique<RAMDirFactory>();
+
   collection = std::make_shared<Collection>();
   collection->shard = std::make_shared<Shard>(*collection);
-  collection->shard->dir = std::make_shared<RAMDir>();
+  collection->shard->dir = dirFactory->create();
 
   // Set default schema initially (without persisting, gen=0 means not yet persisted)
   auto defaultSchema = Schema::createDefaultSchema();
