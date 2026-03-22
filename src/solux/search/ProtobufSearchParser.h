@@ -116,6 +116,7 @@ public:
       case FieldType::Type::INT:
         facet = google::protobuf::Arena::Create<IntFacetReq>(&req.arena, req, facetReq, facetField, facetName, limit, minCount,  missing);
         break;
+      case FieldType::Type::ID:
       case FieldType::Type::STRING:
         facet = google::protobuf::Arena::Create<StrFacetOp>(&req.arena, req, facetReq, facetField, facetName, limit, minCount, missing);
         break;

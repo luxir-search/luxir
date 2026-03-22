@@ -27,7 +27,7 @@ TEST_F(SchemaTest, defaultSchema) {
   // Concrete fields should be found by exact name
   ASSERT_NE(nullptr, schema->getFieldTypePtr("id"));
   ASSERT_NE(nullptr, schema->getFieldTypePtr("_version_"));
-  EXPECT_EQ(FieldType::STRING, schema->getFieldTypePtr("id")->type());
+  EXPECT_EQ(FieldType::ID, schema->getFieldTypePtr("id")->type());
   EXPECT_EQ(FieldType::INT, schema->getFieldTypePtr("_version_")->type());
   EXPECT_FALSE(schema->getFieldTypePtr("id")->isAbstract());
   EXPECT_FALSE(schema->getFieldTypePtr("_version_")->isAbstract());

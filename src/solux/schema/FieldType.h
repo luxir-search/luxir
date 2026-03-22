@@ -21,7 +21,8 @@ public:
     BIN,      // binary field
     INT,
     FLOAT,
-    DOUBLE
+    DOUBLE,
+    ID        // unique id field
   };
 
   using flag_type = int32_t;
@@ -134,6 +135,13 @@ public:
 class IntFieldType : public FieldType {
 public:
   IntFieldType(std::string_view name, int flags=COLUMN_STORED) : FieldType(name, FieldType::INT, flags) {
+  }
+};
+
+// Unique id field
+class IdFieldType : public FieldType {
+public:
+  IdFieldType(std::string_view name, int flags=INDEX_DOCS | COLUMN_STORED) : FieldType(name, FieldType::ID, flags) {
   }
 };
 

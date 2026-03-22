@@ -44,6 +44,10 @@ public:
   uint64_t minVersion = 0;
   uint64_t maxVersion = 0;
 
+  // When true, indexing an id field will automatically queue a delete for previous
+  // versions and index the _version_ field. Set via setOverwrite() before indexing docs.
+  bool overwrite = false;
+
   std::unique_ptr<DeletesData> deletesData;
 
   // Populated after flush() if there were deleted documents

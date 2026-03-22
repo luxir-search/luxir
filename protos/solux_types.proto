@@ -482,6 +482,7 @@ message FieldDef {
     FLOAT = 3;
     DOUBLE = 4;
     BIN = 5;
+    ID = 6;        // unique id field with co-located version
   }
   FieldClass field_class = 4;  // if unset (default), inherited from parent
 

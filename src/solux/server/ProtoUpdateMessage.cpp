@@ -5,15 +5,9 @@ namespace solux {
 
 
 static void update(ProtoUpdateMessage& msg, IndexWriter& iw, Inverter& inverter) {
-  unused(iw);
+  unused(iw, msg);
   auto& request = *msg.req;
   std::vector<Inverter::IndexHandler*> handlers;
-  Inverter::IndexHandler* versionHandler = nullptr;
-  
-  // Get version handler once if overwrite is enabled
-  if (request.overwrite()) {
-    versionHandler = &inverter.getIndexHandler("_version_");
-  }
 
   if (request.docs_size() > 0) {
     for (const auto &doc : request.docs()) {
@@ -31,24 +25,6 @@ static void update(ProtoUpdateMessage& msg, IndexWriter& iw, Inverter& inverter)
         auto handler = handlers[idx];
         if (handler == nullptr || *handler != fname) {
           handlers[idx] = handler = &inverter.getIndexHandler(fname);
-        }
-
-        // Handle "id" field overwriting by queueing a delete for previous versions.
-        // TODO: should this be pulled out into a separate handler?
-        if (versionHandler != nullptr && fname == "id") {
-          // assume string id field
-          std::string idValue;
-          if (fval.has_s()) {
-            idValue = fval.s();
-          } else if (fval.has_bin()) {
-            idValue = std::string(fval.bin());
-          } else {
-            throw std::runtime_error("id field must be a string or binary value");
-            continue;
-          }
-          inverter.deleteId(idValue, msg.updateVersion);
-          // add the version to the _version_ field
-          versionHandler->index(inverter, static_cast<int64_t>(msg.updateVersion));
         }
 
         handler->index(inverter, fval);
@@ -70,7 +46,7 @@ void ProtoUpdateMessage::handle(IndexWriter& iw) {
 
   // Check if we need an inverter for either deletes or adds
   bool needInverter = req->delete_ids_size() > 0 || req->docs_size() > 0;
-  
+
   if (!needInverter) {
     return;
   }
@@ -78,6 +54,7 @@ void ProtoUpdateMessage::handle(IndexWriter& iw) {
   // TODO: FIXME: if we hit an exception here, we still want to release the inverter! Use a guard like a
   // unique_ptr with a custom deleter.
   Inverter& inverter = iw.obtainInverter(this->updateVersion);
+  inverter.overwrite = req->overwrite();
 
   // Process deletes before adds (shouldn't matter since we just queue deletes)
   if (req->delete_ids_size() > 0) {
@@ -90,7 +67,7 @@ void ProtoUpdateMessage::handle(IndexWriter& iw) {
   if (req->docs_size() > 0) {
     update(*this, iw, inverter);
   }
-  
+
   iw.releaseInverter(inverter);
 }
 

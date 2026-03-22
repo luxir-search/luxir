@@ -58,6 +58,7 @@ public:
                     fieldName, numHits, isReversed(), missingValue
                 );
                 
+            case FieldType::Type::ID:
             case FieldType::Type::STRING:
             case FieldType::Type::TEXT: {
                 // Use FieldType information to determine if this is an indexed string field

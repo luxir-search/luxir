@@ -491,6 +491,7 @@ public:
             loadIntCol(qr.req, field, fieldType, segDocs, sortedIdx, segRunLength, columnsProto, tg);
           } // int field
             break;
+          case FieldType::Type::ID:
           case FieldType::Type::STRING: {
             loadStrCol(qr.req, field, fieldType, segDocs, sortedIdx, segRunLength, columnsProto, tg);
           } // string field

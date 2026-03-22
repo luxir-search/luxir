@@ -45,6 +45,7 @@ public:
         std::string_view val = getString(matchQuery.val());
         return pool.make<solux::TermQuery>(field, val);
       }
+      case FieldType::Type::ID:
       case FieldType::Type::STRING: {
         std::string_view term = getString(matchQuery.val());
         return pool.make<solux::TermQuery>(field, term);

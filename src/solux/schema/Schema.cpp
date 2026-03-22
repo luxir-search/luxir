@@ -165,6 +165,7 @@ std::shared_ptr<Schema> Schema::fromProto(const proto::SchemaDef& def, const Sch
       r.abstract = ft->isAbstract();
       r.hasFieldClass = true;
       switch (ft->type()) {
+        case FieldType::ID:     r.fieldClass = proto::FieldDef::ID; break;
         case FieldType::STRING: r.fieldClass = proto::FieldDef::STRING; break;
         case FieldType::TEXT:   r.fieldClass = proto::FieldDef::TEXT; break;
         case FieldType::INT:    r.fieldClass = proto::FieldDef::INT; break;
@@ -206,6 +207,7 @@ std::shared_ptr<Schema> Schema::fromProto(const proto::SchemaDef& def, const Sch
     if (!r.hasIndexed) {
       // defaults by field_class
       switch (r.fieldClass) {
+        case proto::FieldDef::ID:     indexed = true; break;
         case proto::FieldDef::STRING: indexed = true; break;
         case proto::FieldDef::TEXT:   indexed = true; break;
         case proto::FieldDef::INT:    indexed = false; break;
@@ -214,6 +216,7 @@ std::shared_ptr<Schema> Schema::fromProto(const proto::SchemaDef& def, const Sch
     }
     if (!r.hasColumnStored) {
       switch (r.fieldClass) {
+        case proto::FieldDef::ID:     columnStored = true; break;
         case proto::FieldDef::STRING: columnStored = true; break;
         case proto::FieldDef::TEXT:   columnStored = false; break;
         case proto::FieldDef::INT:    columnStored = true; break;
@@ -239,6 +242,9 @@ std::shared_ptr<Schema> Schema::fromProto(const proto::SchemaDef& def, const Sch
     std::shared_ptr<FieldType> ft;
 
     switch (r.fieldClass) {
+      case proto::FieldDef::ID:
+        ft = std::make_shared<IdFieldType>(name, flags);
+        break;
       case proto::FieldDef::STRING:
         ft = std::make_shared<StrFieldType>(name, flags);
         break;
@@ -271,6 +277,9 @@ void Schema::toProto(proto::SchemaDef* def) const {
 
     // Map FieldType::Type to FieldDef::FieldClass
     switch (ft->type()) {
+      case FieldType::ID:
+        fieldDef->set_field_class(proto::FieldDef::ID);
+        break;
       case FieldType::STRING:
         fieldDef->set_field_class(proto::FieldDef::STRING);
         break;
@@ -341,7 +350,7 @@ std::shared_ptr<Schema> Schema::createDefaultSchema() {
   };
 
   // Concrete fields
-  addField("id", proto::FieldDef::STRING, false, true, true);
+  addField("id", proto::FieldDef::ID, false, true, true);
   addField("_version_", proto::FieldDef::INT, false, false, true);
 
   // Abstract dynamic suffix fields
