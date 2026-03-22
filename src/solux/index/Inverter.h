@@ -7,7 +7,7 @@
 #include "PostingsWriter.h"
 
 // so IndexHandler can consume protobuf types
-#include "DeletesData.h"
+#include "SortedDeletes.h"
 #include "protos/solux_types.pb.h"
 
 namespace solux {
@@ -48,7 +48,8 @@ public:
   // versions and index the _version_ field. Set via setOverwrite() before indexing docs.
   bool overwrite = false;
 
-  std::unique_ptr<DeletesData> deletesData;
+  // Populated by IdHandler::flush() with sorted delete lists.
+  std::unique_ptr<SortedDeletes> sortedDeletes;
 
   // Populated after flush() if there were deleted documents
   uint64_t liveGen = 0;
@@ -80,17 +81,12 @@ public:
   }
 
   bool hasDeletions() {
-    return deletesData.get() != nullptr;
+    return sortedDeletes != nullptr;
   }
 
-  // deletes are remembered for now and applied when the segment is flushed.
-  // the version passed should be the version from the UpdateMessage sequence.
-  void deleteId(std::string_view id, uint64_t version) {
-    if (deletesData == nullptr) {
-      deletesData = std::make_unique<DeletesData>();
-    }
-    deletesData.get()->deleteId(id, version);
-  }
+  // Record an explicit delete-by-id. Routes through IdHandler's delete hash
+  // so all deletes end up as sorted lists after flush.
+  void deleteId(std::string_view id, uint64_t version);
 
   /// This is what clients should call to index the fields of a document.
   class IndexHandler {
@@ -169,6 +165,7 @@ public:
   // This could also be a Set with a little more work since the fieldname is already in the value.
   // We don't want the values to move since clients can cache and reuse when indexing.
   gtl::flat_hash_map<std::string, std::unique_ptr<IndexHandler>> indexHandlers;
+  IndexHandler* idHandler_ = nullptr;  // cached pointer to the IdHandler, set in createIndexHandler
 
 
   // The returned reference will be valid for the duration of indexing this block.

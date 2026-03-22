@@ -129,6 +129,17 @@ public:
     }
   }
 
+  /// Release ownership of the internal table array without freeing it.
+  /// After this call, the caller owns the memory and must eventually
+  /// delete[] reinterpret_cast<char*>(ptr).
+  /// Typically called after destructiveCompress() + sort so the sorted
+  /// array can be transferred to another owner (e.g. SortedDeletes).
+  iterator detachTable() {
+    auto* t = table_;
+    table_ = nullptr;
+    return t;
+  }
+
   [[nodiscard]] MemPool& getMemPool() const { return pool_; }
 
   [[nodiscard]] size_t size() const { return (size_t) elements_; }

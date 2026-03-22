@@ -14,6 +14,17 @@
 namespace solux {
 
 
+void Inverter::deleteId(std::string_view id, uint64_t version) {
+  if (idHandler_ == nullptr) {
+    // Bootstrap: create the id handler via schema lookup if no docs have been indexed yet.
+    // "id" is the schema-defined name for the unique id field.
+    getIndexHandler("id");
+    assert(idHandler_ != nullptr);
+  }
+  static_cast<handler::IdHandler&>(*idHandler_).addDelete(id, version);
+}
+
+
 Inverter::IndexHandler& Inverter::createIndexHandler(const std::string_view name) {
   // perhaps this part should be moved to Schema?
   auto currSchema = schema.get();
@@ -50,6 +61,7 @@ Inverter::IndexHandler& Inverter::createIndexHandler(const std::string_view name
       break;
     case FieldType::Type::ID:
       fieldHandler = std::make_unique<handler::IdHandler>(*this, name, fieldType);
+      idHandler_ = fieldHandler.get();
       break;
     case FieldType::Type::STRING:
       if (!fieldType->indexed() && fieldType->hasColumn()) {

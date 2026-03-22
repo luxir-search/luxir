@@ -455,7 +455,7 @@ void IndexWriter::segmentFlushBody(Inverter& inverter) {
       CommitInfo& commitInfo = inverter.commitInfo ? *inverter.commitInfo : *nextCommitInfo;
       INDEX_DEBUG("segmentFlushBody: inverter={} moving deletes to commitInfo={}", inverter,
                   (void*)&commitInfo);
-      commitInfo.multiDeletesData.deletesData.emplace_back(std::move(inverter.deletesData));
+      commitInfo.multiDeletesData.deletes.emplace_back(std::move(inverter.sortedDeletes));
     }
 
     // Check if we should merge anything.
@@ -623,7 +623,7 @@ void IndexWriter::finishCommitBody(UpdateMessage& msg) {
 
 #if SPDLOG_ACTIVE_LEVEL <= SPDLOG_LEVEL_TRACE
         for (auto& s : seg.personalDeletes) {
-          for (auto& d : s->deletesData) {
+          for (auto& d : s->deletes) {
             INDEX_TRACE("\tpersonal deletes: {}", d->toString());
           }
         }
@@ -1291,13 +1291,11 @@ void IndexWriter::applyDeletes(SegInfo& seg, MultiDeletesData& multiDeletesData)
     versionValues.emplace(*versionColReader);
   }
 
-  // Helper function to process deletes from a DeletesData
-  auto processDeletes = [&](const DeletesData& deletesData) {
-    DeletesData::Iterator it(deletesData);
-    while (it.hasNext()) {
-      auto entry = it.next();
-      auto& deleteId = entry.id;
-      uint64_t deleteVersion = entry.version;
+  // Helper function to process deletes from a single span of entries
+  auto processList = [&](SortedDeletes::EntrySpan list) {
+    for (auto& entry : list) {
+      std::string_view deleteId = (std::string_view)entry;
+      uint64_t deleteVersion = entry.val().version;
 
       INDEX_TRACE("applyDeletes: looking up term '{}' with version {} in segment {}",
                deleteId, deleteVersion, seg.segId);
@@ -1357,16 +1355,22 @@ void IndexWriter::applyDeletes(SegInfo& seg, MultiDeletesData& multiDeletesData)
     }
   };
 
+  auto processDeletes = [&](const SortedDeletes& sortedDeletes) {
+    for (auto& list : sortedDeletes.lists()) {
+      processList(list);
+    }
+  };
+
   // Process personal deletes for this segment
   for (const auto& personalDelete : seg.personalDeletes) {
-    for (const auto& deletesData : personalDelete->deletesData) {
-      processDeletes(*deletesData);
+    for (const auto& sd : personalDelete->deletes) {
+      processDeletes(*sd);
     }
   }
 
   // Process deletes from multiDeletesData
-  for (const auto& deletesData : multiDeletesData.deletesData) {
-    processDeletes(*deletesData);
+  for (const auto& sd : multiDeletesData.deletes) {
+    processDeletes(*sd);
   }
 
 

@@ -8,22 +8,7 @@
 
 namespace solux::handler {
 
-/// Entry stored in the TermValHash for the id field.
-/// Each unique id maps to exactly one document and its version.
-/// Future optimizations:
-///   store variable sized entries... string, vint(docId), vint(version_delta_from_base)
-SOLUX_PACKED_START
-struct IdEntry {
-  int32_t docId;
-  uint64_t version;
-
-  IdEntry(int32_t docId, uint64_t version) : docId(docId), version(version) {}
-
-  friend std::ostream& operator<<(std::ostream& out, const IdEntry& e) {
-    return out << "(doc=" << e.docId << " ver=" << e.version << ")";
-  }
-} SOLUX_PACKED_END;
-
+using solux::IdEntry;
 
 /// Specialized handler for the unique "id" field.
 /// Uses TermValHash<IdEntry> instead of TermValHash<DocStream> for much more compact storage.
@@ -33,16 +18,25 @@ struct IdEntry {
 /// When inverter.overwrite is true, indexing an id automatically:
 ///   - queues a delete for previous versions of this id in other segments
 ///   - indexes currVersion into the _version_ int column
+///
+/// Owns its own MemPool (idPool) so the id string bytes can be transferred
+/// to SortedDeletes after flush, outliving the inverter.
+/// The overwrite hash and optional delete-by-id hash both allocate from idPool.
 class IdHandler final : public Inverter::IndexHandler {
   friend Inverter;
 
-  TermValHash<IdEntry> termsHash;
+  std::unique_ptr<MemPool> idPool;
+  TermValHash<IdEntry> termsHash;            // overwrites: real docs with docId >= 0
+  std::unique_ptr<TermValHash<IdEntry>> deleteHash;  // explicit delete-by-id: docId = -1
+  bool hadOverwrites_ = false;  // true if any indexId() call had overwrite=true
+
   Inverter::IndexHandler* versionHandler = nullptr; // lazily resolved on first overwrite
 
 public:
   IdHandler(Inverter& inverter, const std::string_view& fieldName, const std::shared_ptr<FieldType>& fieldType)
     : IndexHandler(PackedTerm(inverter.pool, fieldName), fieldType),
-      termsHash(inverter.pool, 4) {
+      idPool(std::make_unique<MemPool>()),
+      termsHash(*idPool, 4) {
   }
 
   ~IdHandler() override = default;
@@ -61,10 +55,24 @@ public:
     indexId(inverter, val);
   }
 
+  /// Record an explicit delete-by-id (not an overwrite).
+  void addDelete(std::string_view id, uint64_t version) {
+    if (deleteHash == nullptr) {
+      deleteHash = std::make_unique<TermValHash<IdEntry>>(*idPool, 4);
+    }
+    auto [entry, inserted] = deleteHash->try_emplace(id, -1, version);
+    if (!inserted) {
+      // Same id deleted again — keep the highest version.
+      if (version > entry->val().version) {
+        entry->val().version = version;
+      }
+    }
+  }
+
 private:
   void indexId(Inverter& inverter, std::string_view id) {
     if (inverter.overwrite) {
-      inverter.deleteId(id, inverter.currVersion);
+      hadOverwrites_ = true;
       getVersionHandler(inverter).index(inverter, (int64_t)inverter.currVersion);
     }
 
@@ -85,49 +93,113 @@ private:
     return *versionHandler;
   }
 
+  /// Sort a TermValHash, detach its table, and compute version range.
+  /// Returns {detached table pointer, count, minVersion, maxVersion}.
+  struct SortResult {
+    SortedDeletes::Entry* entries;
+    int32_t count;
+    uint64_t minVersion;
+    uint64_t maxVersion;
+  };
+
+  static SortResult sortAndDetach(TermValHash<IdEntry>& hash) {
+    int32_t count = (int32_t)hash.size();
+    auto* terms = hash.destructiveCompress();
+    boost::sort::spreadsort::string_sort(terms, terms + count, TermRef::bracket(), TermRef::getsize(),
+                                         TermRef::lessthan());
+
+    uint64_t minV = terms[0].val().version;
+    uint64_t maxV = minV;
+    for (int32_t i = 1; i < count; i++) {
+      uint64_t v = terms[i].val().version;
+      if (v < minV) minV = v;
+      if (v > maxV) maxV = v;
+    }
+
+    auto* detached = hash.detachTable();
+    return {detached, count, minV, maxV};
+  }
+
 public:
   void flush(Inverter& inverter) override {
     int32_t uniqueVals = (int32_t)termsHash.size();
-    if (uniqueVals == 0) {
+    bool hasDeletes = deleteHash != nullptr && deleteHash->size() > 0;
+
+    if (uniqueVals == 0 && !hasDeletes) {
       return;
     }
 
-    PostingsWriter& postingsWriter = inverter.getPostingsWriter();
+    // --- Write segment postings/ords from overwrite hash only ---
+    if (uniqueVals > 0) {
+      PostingsWriter& postingsWriter = inverter.getPostingsWriter();
 
-    auto terms = termsHash.destructiveCompress();
-    boost::sort::spreadsort::string_sort(terms, terms + uniqueVals, TermRef::bracket(), TermRef::getsize(),
-                                         TermRef::lessthan());
+      auto terms = termsHash.destructiveCompress();
+      boost::sort::spreadsort::string_sort(terms, terms + uniqueVals, TermRef::bracket(), TermRef::getsize(),
+                                           TermRef::lessthan());
 
-    auto nDocs = inverter.getMaxDoc();
-    auto guard = MemPool::threadLocalPoolGuard();
+      auto nDocs = inverter.getMaxDoc();
+      auto guard = MemPool::threadLocalPoolGuard();
 
-    // Write using TextWriter — same format as StrHandler for now.
-    // TODO: switch to a point-lookup-optimized format (FST or hash-based).
-    TextWriter textWriter(postingsWriter);
-    PostingsWriter::IndexFieldInfo& fieldInfo = postingsWriter.addField(fieldName);
-    // Write as STRING type since we use the same segment format for now
-    fieldInfo.type = FieldType::STRING;
-    fieldInfo.flags = fieldType->flags_ & ~FieldType::ABSTRACT;
+      // Write using TextWriter — same format as StrHandler for now.
+      // TODO: switch to a point-lookup-optimized format (FST or hash-based).
+      TextWriter textWriter(postingsWriter);
+      PostingsWriter::IndexFieldInfo& fieldInfo = postingsWriter.addField(fieldName);
+      // Write as STRING type since we use the same segment format for now
+      fieldInfo.type = FieldType::STRING;
+      fieldInfo.flags = fieldType->flags_ & ~FieldType::ABSTRACT;
 
-    OrdCollector ords(guard.pool(), nDocs);
+      OrdCollector ords(guard.pool(), nDocs);
 
-    textWriter.startField(&fieldInfo);
-    for (int32_t tnum = 0; tnum < uniqueVals; tnum++) {
-      auto term = terms[tnum];
-      textWriter.startTerm(term);
-      // id is unique: exactly one doc per term, docFreq=1, always pulsed
-      textWriter.startDoc(term.val().docId);
-      textWriter.addPositionDelta(1); // dummy position for TextWriter compatibility
-      textWriter.endDoc(term.val().docId);
-      ords.add(term.val().docId, tnum + 1); // +1 because 0 means "missing"
-      textWriter.endTerm(term);
+      textWriter.startField(&fieldInfo);
+      for (int32_t tnum = 0; tnum < uniqueVals; tnum++) {
+        auto term = terms[tnum];
+        textWriter.startTerm(term);
+        // id is unique: exactly one doc per term, docFreq=1, always pulsed
+        textWriter.startDoc(term.val().docId);
+        textWriter.addPositionDelta(1); // dummy position for TextWriter compatibility
+        textWriter.endDoc(term.val().docId);
+        ords.add(term.val().docId, tnum + 1); // +1 because 0 means "missing"
+        textWriter.endTerm(term);
+      }
+      textWriter.endField();
+
+      OrdColWriter ordsWriter(guard.pool(), inverter.postingsWriter, fieldInfo, ords);
+      ordsWriter.finish();
     }
-    textWriter.endField();
 
-    termsHash.free();
+    // --- Produce SortedDeletes from overwrite hash and/or delete hash ---
+    bool hasOverwrites = uniqueVals > 0 && hadOverwrites_;
 
-    OrdColWriter ordsWriter(guard.pool(), inverter.postingsWriter, fieldInfo, ords);
-    ordsWriter.finish();
+    if (!hasOverwrites && !hasDeletes) {
+      // termsHash was used for segment writing but overwrite=false, no delete list needed.
+      termsHash.free();
+      return;
+    }
+
+    auto sortedDeletes = std::make_unique<SortedDeletes>(std::move(idPool));
+
+    if (hasOverwrites) {
+      // termsHash is already sorted from the segment writing above, just detach.
+      // Compute version range.
+      auto* terms = termsHash.detachTable();
+      uint64_t minV = terms[0].val().version;
+      uint64_t maxV = minV;
+      for (int32_t i = 1; i < uniqueVals; i++) {
+        uint64_t v = terms[i].val().version;
+        if (v < minV) minV = v;
+        if (v > maxV) maxV = v;
+      }
+      sortedDeletes->addList(terms, uniqueVals, minV, maxV);
+    } else {
+      termsHash.free();
+    }
+
+    if (hasDeletes) {
+      auto result = sortAndDetach(*deleteHash);
+      sortedDeletes->addList(result.entries, result.count, result.minVersion, result.maxVersion);
+    }
+
+    inverter.sortedDeletes = std::move(sortedDeletes);
   }
 
 };
