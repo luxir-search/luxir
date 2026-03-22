@@ -1194,6 +1194,7 @@ void IndexWriter::testDeleteAllData() {
     lastSegId = 0;
     indexGen = 0;
     coreGen = 0;
+    lastCommittedSegIds.clear();
     nextCommitInfo = std::make_unique<CommitInfo>();
 
     lastCommitTime = lastAdvertisedCommitTime = 0;
