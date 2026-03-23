@@ -1416,8 +1416,11 @@ void IndexWriter::applyDeletes(SegInfo& seg, SortedDeletes::EntrySpan commitDele
   }
 
   // Apply the merged delete span to this segment.
+  // The span is sorted by id, so we use seekForward() to scan the segment's terms
+  // in order, avoiding redundant binary searches across blocks.
   // version==0 entries (non-overwrite adds) are filtered during merge, but can still
   // appear in the single-span fast path which skips the merge.
+  bool firstSeek = true;
   for (auto& entry : deleteSpan) {
     uint64_t deleteVersion = entry.val().version;
     if (deleteVersion == 0) continue;
@@ -1426,8 +1429,11 @@ void IndexWriter::applyDeletes(SegInfo& seg, SortedDeletes::EntrySpan commitDele
     INDEX_TRACE("applyDeletes: looking up term '{}' with version {} in segment {}",
              deleteId, deleteVersion, seg.segId);
 
-    // Seek to the specific ID term
-    if (termsEnum.seek(deleteId)) {
+    // Seek to the specific ID term. First seek uses full binary search to position;
+    // subsequent seeks use seekForward which leverages sorted iteration order.
+    bool found = firstSeek ? termsEnum.seek(deleteId) : termsEnum.seekForward(deleteId);
+    firstSeek = false;
+    if (found) {
       // Found the ID term, now get documents containing this ID
       DocsEnum docsEnum(pool, reader, termsEnum);
 

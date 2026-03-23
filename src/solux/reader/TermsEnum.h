@@ -161,29 +161,27 @@ public:
   }
 
   bool seek(std::string_view target) {
-    auto termBlockEnd = termBlockOffsets + numTermBlocks;
-    // Find the first block that is greater than the current term.
-    // std::cout << "seek key=" << target << " numBlocks=" << fieldReader.numTermBlocks << std::endl;
+    auto blockEnd = termBlockOffsets + numTermBlocks;
 
-    auto blockOffsetPtr = std::upper_bound(termBlockOffsets, termBlockEnd, target,
+    auto blockOffsetPtr = std::upper_bound(termBlockOffsets, blockEnd, target,
                                  [&](std::string_view key, const int64_t& blockOffset) {
       auto termAtBlock = termsIS.readPackedTerm(fieldInfo.termsLoc.offset() + blockOffset);
-      auto ret = key < termAtBlock;
-      // std::cout << "index=" << (&blockOffset-fieldReader.termBlockOffsets) << " termAtBlock=" << termAtBlock << " ret=" << ret << std::endl;
-      return ret;
-    }
-    );
+      return key < termAtBlock;
+    });
 
-    // Since the block we found is after, we will find our target term in the
-    // previous block (if at all)
     if (blockOffsetPtr > termBlockOffsets) {
       blockOffsetPtr--;
-    };
+    }
 
-    termBlockIndex = blockOffsetPtr - termBlockOffsets;
+    termBlockIndex = (int32_t)(blockOffsetPtr - termBlockOffsets);
     readTermBlock();
     return seekInBlock(target);
-    // return seekCeilInBlock(target); // use this version to skip comparing hashes
+  }
+
+  /// Forward-only seek for sorted iteration.
+  /// TODO: optimize to narrow binary search range and avoid reloading same block.
+  bool seekForward(std::string_view target) {
+    return seek(target);
   }
 
   bool seekInBlock(std::string_view target) {

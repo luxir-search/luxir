@@ -479,6 +479,132 @@ TEST_F(PostingsTest, blockTerms) {
 
 
 
+TEST_F(PostingsTest, seekForward) {
+  RAMDir dir;
+  MemPool pool;
+  // Create enough terms to span multiple blocks (TERMS_BLOCK_SIZE=32)
+  int nTerms = Postings::TERMS_BLOCK_SIZE * 3 + 5;  // 101 terms across 4 blocks
+  PostingsWriter postingsWriter(dir, 0, nTerms);
+  std::string tstr = "term";
+  tstr.resize(12);
+
+  // Generate sorted term names: term00000000, term00000001, ...
+  {
+    TextWriter writer(postingsWriter);
+    writer.startField("field1");
+    for (int i = 0; i < nTerms; i++) {
+      sprintf(tstr.data() + 4, "%08d", i);
+      TermRef term(pool, tstr.data(), tstr.size());
+      writer.startTerm(term);
+      writer.startDoc(i);
+      writer.addPositionDelta(1);
+      writer.endDoc(i);
+      writer.endTerm(term);
+    }
+    writer.endField();
+  }
+  postingsWriter.finish();
+
+  PostingsReader reader(dir, 0);
+  FieldReader fieldReader(pool, reader);
+  ASSERT_TRUE(fieldReader.readNextField());
+  SegFieldInfo fieldInfo;
+  fieldReader.readFieldInfo(fieldInfo);
+
+  auto makeTerm = [&](int i) {
+    sprintf(tstr.data() + 4, "%08d", i);
+    return std::string(tstr);
+  };
+
+  // Test 1: seekForward through every term sequentially (same as iterating)
+  {
+    TermsEnum tenum(pool, reader, fieldInfo);
+    ASSERT_TRUE(tenum.seek(makeTerm(0)));
+    ASSERT_EQ(tenum.term(), makeTerm(0));
+    for (int i = 1; i < nTerms; i++) {
+      auto t = makeTerm(i);
+      ASSERT_TRUE(tenum.seekForward(t)) << "seekForward failed for term " << i;
+      ASSERT_EQ(tenum.term(), t);
+    }
+  }
+
+  // Test 2: seekForward skipping terms within the same block
+  {
+    TermsEnum tenum(pool, reader, fieldInfo);
+    ASSERT_TRUE(tenum.seek(makeTerm(0)));
+    // Skip by 3 within block
+    for (int i = 3; i < Postings::TERMS_BLOCK_SIZE; i += 3) {
+      ASSERT_TRUE(tenum.seekForward(makeTerm(i))) << "same-block skip failed for " << i;
+      ASSERT_EQ(tenum.term(), makeTerm(i));
+    }
+  }
+
+  // Test 3: seekForward across block boundaries
+  {
+    TermsEnum tenum(pool, reader, fieldInfo);
+    ASSERT_TRUE(tenum.seek(makeTerm(5)));
+    // Jump across blocks
+    int targets[] = {35, 65, 95, nTerms - 1};
+    for (int t : targets) {
+      ASSERT_TRUE(tenum.seekForward(makeTerm(t))) << "cross-block failed for " << t;
+      ASSERT_EQ(tenum.term(), makeTerm(t));
+    }
+  }
+
+  // Test 4: seekForward for missing terms (between existing terms)
+  {
+    TermsEnum tenum(pool, reader, fieldInfo);
+    ASSERT_TRUE(tenum.seek(makeTerm(0)));
+    // "term00000000x" is between term00000000 and term00000001 lexicographically
+    ASSERT_FALSE(tenum.seekForward("term00000000x"));
+    // Should still be able to find a later term
+    ASSERT_TRUE(tenum.seekForward(makeTerm(10)));
+    ASSERT_EQ(tenum.term(), makeTerm(10));
+  }
+
+  // Test 5: seekForward for term past the end
+  {
+    TermsEnum tenum(pool, reader, fieldInfo);
+    ASSERT_TRUE(tenum.seek(makeTerm(0)));
+    ASSERT_FALSE(tenum.seekForward("zzzzz"));
+  }
+
+  // Test 6: seekForward with seek+DocsEnum interleaved (simulates applyDeletes)
+  {
+    TermsEnum tenum(pool, reader, fieldInfo);
+    ASSERT_TRUE(tenum.seek(makeTerm(2)));
+    DocsEnum docsEnum1(pool, reader, tenum);
+    ASSERT_EQ(docsEnum1.next(), 2);
+
+    ASSERT_TRUE(tenum.seekForward(makeTerm(4)));
+    DocsEnum docsEnum2(pool, reader, tenum);
+    ASSERT_EQ(docsEnum2.next(), 4);
+
+    // Same block seek after DocsEnum
+    ASSERT_TRUE(tenum.seekForward(makeTerm(7)));
+    DocsEnum docsEnum3(pool, reader, tenum);
+    ASSERT_EQ(docsEnum3.next(), 7);
+
+    // Cross-block seek after DocsEnum
+    ASSERT_TRUE(tenum.seekForward(makeTerm(40)));
+    DocsEnum docsEnum4(pool, reader, tenum);
+    ASSERT_EQ(docsEnum4.next(), 40);
+  }
+
+  // Test 7: mix of found and not-found in forward order (simulates sparse delete list)
+  {
+    TermsEnum tenum(pool, reader, fieldInfo);
+    ASSERT_TRUE(tenum.seek(makeTerm(0)));
+    // Seek for a missing term, then the next real term
+    ASSERT_FALSE(tenum.seekForward("term00000003x"));
+    ASSERT_TRUE(tenum.seekForward(makeTerm(5)));
+    ASSERT_FALSE(tenum.seekForward("term00000005x"));
+    ASSERT_TRUE(tenum.seekForward(makeTerm(33)));  // first term of second block
+    ASSERT_FALSE(tenum.seekForward("term00000033x"));
+    ASSERT_TRUE(tenum.seekForward(makeTerm(34)));
+  }
+}
+
 TEST_F(PostingsTest, randTail) {
   // avoid creating a full block of terms, docs, or positions
   positionsPerDocMax = 11;
