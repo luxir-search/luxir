@@ -160,16 +160,17 @@ public:
     readTermMetadata();
   }
 
-  bool seek(std::string_view target) {
+  bool seek(std::string_view target, int32_t firstBlock = 0) {
+    auto blockStart = termBlockOffsets + firstBlock;
     auto blockEnd = termBlockOffsets + numTermBlocks;
 
-    auto blockOffsetPtr = std::upper_bound(termBlockOffsets, blockEnd, target,
+    auto blockOffsetPtr = std::upper_bound(blockStart, blockEnd, target,
                                  [&](std::string_view key, const int64_t& blockOffset) {
       auto termAtBlock = termsIS.readPackedTerm(fieldInfo.termsLoc.offset() + blockOffset);
       return key < termAtBlock;
     });
 
-    if (blockOffsetPtr > termBlockOffsets) {
+    if (blockOffsetPtr > blockStart) {
       blockOffsetPtr--;
     }
 
@@ -178,10 +179,11 @@ public:
     return seekInBlock(target);
   }
 
-  /// Forward-only seek for sorted iteration.
-  /// TODO: optimize to narrow binary search range and avoid reloading same block.
+  /// Forward-only seek for sorted iteration. Narrows the binary search to
+  /// blocks from the current position onward.
   bool seekForward(std::string_view target) {
-    return seek(target);
+    assert(termBlockIndex >= 0);
+    return seek(target, termBlockIndex);
   }
 
   bool seekInBlock(std::string_view target) {
