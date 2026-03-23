@@ -3,7 +3,7 @@ Building
 
 Installing dependencies via vcpkg:
 $ cd /opt/vcpkg
-$ ./vcpkg install boost-core boost-sort boost-thread gtest benchmark xxhash gtl protobuf grpc spdlog lz4
+$ ./vcpkg install boost-core boost-sort boost-thread gtest benchmark xxhash gtl protobuf grpc spdlog lz4 cli11
 $ ./vcpkg install robin-hood-hashing   #optional... see MapBM.cpp
 
 NOTE: when using address sanitizer, newer gRCP/proto will be hit with "use after poison" errors

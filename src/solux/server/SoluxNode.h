@@ -6,6 +6,7 @@
 #include "solux/index/IndexWriter.h"
 #include "oneapi/tbb/task_arena.h"
 #include "solux/search/SearchEngine.h"
+#include "solux/SoluxConfig.h"
 
 namespace solux {
 
@@ -102,8 +103,11 @@ private:
 
 class SoluxNode {
 public:
-  SoluxNode();
+  SoluxNode() : SoluxNode(SoluxConfig{}) {}
+  explicit SoluxNode(SoluxConfig config);
   ~SoluxNode();
+
+  const SoluxConfig& getConfig() const { return config; }
 
   // ALTERNATIVE: instead of nested maps, we could also have a single map directly to Collection or Shard objects
   // and represent metadata in the hierarchy.  This choice needs to be informed by the external representation
@@ -155,6 +159,7 @@ private:
 
   void createSingletons();
 
+  SoluxConfig config;
   std::unique_ptr<SearchEngine> searchEngine;
   std::shared_ptr<Library> root;
   std::unique_ptr<DirectoryFactory> dirFactory;

@@ -1,18 +1,38 @@
 #include <filesystem>
 #include <sstream>
 #include <thread>
+#include "solux/solux_main.h"
 #include "solux/util/solux_util.h"
 #include "solux/server/GRPCServer.h"
+#include "solux/SoluxConfig.h"
 
 namespace fs = std::filesystem;
 
 using namespace solux;
 
 int solux_main(int argc, char** argv) {
-  unused(argc, argv);
-  SoluxNode node;
-  // Use default port 50051 for production
-  GRPCServer server(node, std::max(1u, std::thread::hardware_concurrency() / 2), 50051);
+  std::cout << solux_banner() << std::endl;
+
+  spdlog::set_pattern("%L %H:%M:%S.%f T%t %s:%# %v");
+
+  CLI::App app{"Solux search engine"};
+  SoluxConfig config;
+  config.addOptions(app);
+
+  try {
+    app.parse(argc, argv);
+  } catch (const CLI::ParseError &e) {
+    return app.exit(e);
+  }
+
+  config.apply();
+
+  LOG_INFO("Logging: compile-time={}, runtime={}",
+           spdlog::level::to_string_view((spdlog::level::level_enum)SPDLOG_ACTIVE_LEVEL),
+           spdlog::level::to_string_view(spdlog::get_level()));
+
+  SoluxNode node{config};
+  GRPCServer server(node, config.resolveThreads(), config.port);
   server.run();
   return 0;
 }

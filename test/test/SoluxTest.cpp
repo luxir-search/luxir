@@ -3,6 +3,7 @@
 #include "SoluxTest.h"
 #include "GrpcSoluxTest.h"
 #include "solux/solux_main.h"
+#include "solux/SoluxConfig.h"
 #include "benchmark/benchmark.h"
 
 
@@ -110,44 +111,58 @@ bool unit_tests = true;
 int gArgc;
 char** gArgv;
 
-bool starts_with(const char * str, const char * prefix)
-{
-  while (*prefix != 0) {
-    if (*prefix++ != *str++) {
-      return false;
-    }
-  }
-  return true;
-}
-
 int main(int argc, char **argv) {
   gArgc = argc;
   gArgv = argv;
 
   std::cout << solux_banner() << std::endl;
 
-  // spdlog::set_pattern("%L %H:%M:%S.%e T%t %s:%# %v");  // thread id before source so it lines up.
-  spdlog::set_pattern("%L %H:%M:%S.%f T%t %s:%# %v");  // microseconds instead of milliseconds
-  spdlog::set_level(spdlog::level::debug); // Set global log level to debug
+  spdlog::set_pattern("%L %H:%M:%S.%f T%t %s:%# %v");
 
-  LOG_INFO("Logging: compile-time={}, runtime default={}",
-           spdlog::level::level_string_views[SPDLOG_ACTIVE_LEVEL],
-           spdlog::level::level_string_views[spdlog::get_level()]);
+  // --- CLI11 parsing for our own flags ---
+  CLI::App app{"Solux unit tests and benchmarks combined.\n"
+               "When running unit tests, benchmarks are also run with --benchmark_min_time=1x to make them quick.\n"
+               "Run benchmarks only with normal google benchmark defaults by passing --bench.\n"
+               "Even when running benchmarks only, gtest flags like --gtest_break_on_failure are still honored."};
+  app.set_help_flag();  // disable built-in --help so we can handle it ourselves
+  app.allow_extras();
 
-  // NOTE: argv is actually terminated by NULL!  (i.e. argv[argc]==null_ptr) And google-test actually depends on this!
-  std::vector<char *> myargv(argv, argv + argc + 1);
-  int myargc = myargv.size() - 1;  // minus-one because of the null terminator
+  solux::SoluxConfig config;
+  config.log_level = "debug";  // default to debug for tests
+  config.port = 0;  // dynamic port for test server
+  config.addOptions(app);
 
-  auto help = std::any_of(myargv.begin(), myargv.end()-1,  [](char* s){return strcmp(s,"--help")==0;});
+  bool help = false;
+  bool bench = false;
+  app.add_flag("-h,--help", help, "Print help message and exit");
+  app.add_flag("--bench", bench, "Run benchmarks only (skip unit tests)");
+
+  try {
+    app.parse(argc, argv);
+  } catch (const CLI::ParseError &e) {
+    return app.exit(e);
+  }
+
+  config.apply();
+
+  LOG_INFO("Logging: compile-time={}, runtime={}",
+           spdlog::level::to_string_view((spdlog::level::level_enum)SPDLOG_ACTIVE_LEVEL),
+           spdlog::level::to_string_view(spdlog::get_level()));
+
+  // Build argv from remaining (unrecognized) args for gtest/gbench.
+  auto remaining = app.remaining();
+  std::vector<char *> myargv;
+  myargv.push_back(argv[0]);
+  for (auto &s : remaining) {
+    myargv.push_back(const_cast<char *>(s.c_str()));
+  }
+
   if (help) {
-    std::cout << std::endl
-              << "Solux unit tests and benchmarks combined.  When running unit tests, benchmarks are also" << std::endl
-              << "run with with --benchmark_min_time=1x to make them quick.  Override this by passing --benchmark_min_time=Ns."  << std::endl
-              << "One can also run benchmarks only with normal google benchmark defaults by passing --bench."  << std::endl
-              << "Even when running benchmarks only, some google test flags are still honored, such as " << std::endl
-              << "--gtest_break_on_failure for debugging." << std::endl
-              << std::endl
-              << "============================== Google Test Help ==============================" << std::endl;
+    std::cout << app.help() << std::endl;
+    myargv.push_back(const_cast<char *>("--help"));
+    myargv.push_back(nullptr);
+    int myargc = (int)(myargv.size() - 1);
+    std::cout << "============================== Google Test Help ==============================" << std::endl;
     testing::InitGoogleTest(&myargc, &(myargv[0]));
     std::cout << "\n============================== Google Bench Help =============================" << std::endl;
     benchmark::Initialize(&myargc, &(myargv[0]));
@@ -157,24 +172,23 @@ int main(int argc, char **argv) {
 
   // Turn on shuffling by default since that is how we get different random seeds for each run for
   // our PRNGs.
-  myargv.back() = const_cast<char *>("--gtest_shuffle");  // overwrite the null terminator and add another
-  myargv.push_back(nullptr);
+  myargv.push_back(const_cast<char *>("--gtest_shuffle"));
+  myargv.push_back(nullptr);  // gtest depends on null-terminated argv
+  int myargc = (int)(myargv.size() - 1);
 
-  solux::unit_tests = !std::any_of(myargv.begin(), myargv.end()-1,  [](char* s){return strcmp(s,"--bench")==0;} );
+  solux::unit_tests = !bench;
 
-  // init gtest so things like --gtest_break_on_failure work in benchmarks.
-  myargc = myargv.size() - 1;  // minus-one because of the null terminator
+  // Init gtest so things like --gtest_break_on_failure work even in benchmark-only mode.
   testing::InitGoogleTest(&myargc, &(myargv[0]));
   myargv.resize(myargc);  // InitGoogleTest removed params it handled
 
   testing::AddGlobalTestEnvironment(new solux::SoluxEnvironment());
 
   int ret = 0;
-  solux::SoluxNode node;
+  solux::SoluxNode node{config};
   solux::SoluxTest::soluxNode = &node;
 
   // Run tests / benchmarks in their own TBB arena.
-  // It's not clear at this point if it will help anything, but we do want to separate as much as possible.
   tbb::task_arena test_arena;
   test_arena.execute([&] {
     if (!solux::unit_tests) {
@@ -218,8 +232,8 @@ TEST(Benchmarks, all) {
     std::cout << "Benchmarks being run as part of unit tests. Pass --bench to run just benchmarks with" << std::endl
               << "normal google benchmark defaults." << std::endl;
 
-    // bool hasMinTime = std::any_of(myargv.begin(), myargv.end(),  [](char* s){return starts_with(s,"--benchmark_min_time");} );
-    bool hasMinTime = std::any_of(myargv.begin(), myargv.end()-1,  [](char* s){return starts_with(s,"--benchmark_min_time");} );
+    bool hasMinTime = std::any_of(myargv.begin(), myargv.end()-1,
+        [](char* s){ return std::string_view(s).starts_with("--benchmark_min_time"); });
 
     if (!hasMinTime && solux::unit_tests) {
       // turn down the time it takes to run tests if the benchmarks are just being run as part of unit tests

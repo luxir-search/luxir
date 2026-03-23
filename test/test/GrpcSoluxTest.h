@@ -19,11 +19,9 @@ public:
     }
 
     assert(soluxNode != nullptr);
-    if (nThreads < 0) {
-      server = new GRPCServer(*soluxNode);
-    } else {
-      server = new GRPCServer(*soluxNode, nThreads);
-    }
+    auto& config = soluxNode->getConfig();
+    int threads = nThreads >= 0 ? nThreads : config.resolveThreads();
+    server = new GRPCServer(*soluxNode, threads, config.port);
 
     serverThread = std::thread([](){server->run();});
     server->waitForStart();

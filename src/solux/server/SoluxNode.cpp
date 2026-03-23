@@ -88,7 +88,7 @@ bool Collection::loadSchema() {
 }
 
 
-SoluxNode::SoluxNode() {
+SoluxNode::SoluxNode(SoluxConfig config) : config(std::move(config)) {
   createSingletons();
   searchEngine = std::make_unique<SearchEngine>(*this);
 }

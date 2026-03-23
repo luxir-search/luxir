@@ -23,6 +23,7 @@ find_package (Boost COMPONENTS REQUIRED core thread sort)
 
 find_package(TBB CONFIG REQUIRED)
 find_package(spdlog CONFIG REQUIRED)
+find_package(CLI11 CONFIG REQUIRED)
 
 include_directories(deps)
 include_directories(deps/CRoaring/cpp)
@@ -105,3 +106,4 @@ target_link_libraries(solux_lib PRIVATE optimized simdcomp_a)
 target_link_libraries(solux_lib PRIVATE myproto)
 target_link_libraries(solux_lib PRIVATE roaring)
 target_link_libraries(solux_lib PRIVATE spdlog::spdlog spdlog::spdlog_header_only)
+target_link_libraries(solux_lib PRIVATE CLI11::CLI11)
