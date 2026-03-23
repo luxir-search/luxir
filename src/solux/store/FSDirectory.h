@@ -51,6 +51,7 @@ class FSFile : public File {
   friend class FSDirectory;
 
   std::filesystem::path path_;
+  std::filesystem::path tmpPath_;  // write to temp, rename on finish
   int fd_ = -1;
   size_t fileSize_ = 0;
 
@@ -63,9 +64,9 @@ class FSFile : public File {
 
   void openFd() {
     if (fd_ >= 0) return;
-    fd_ = ::open(path_.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    fd_ = ::open(tmpPath_.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if (fd_ < 0) {
-      throw std::runtime_error("FSFile: failed to create file: " + path_.string() + ": " + strerror(errno));
+      throw std::runtime_error("FSFile: failed to create file: " + tmpPath_.string() + ": " + strerror(errno));
     }
   }
 
@@ -109,7 +110,8 @@ class FSFile : public File {
   }
 
 public:
-  FSFile(std::string_view name, const std::filesystem::path& path) : File(name), path_(path) {}
+  FSFile(std::string_view name, const std::filesystem::path& path)
+      : File(name), path_(path), tmpPath_(path.string() + ".tmp") {}
 
   ~FSFile() override {
     if (fd_ >= 0) {
@@ -221,6 +223,10 @@ public:
       fsFile.openFd();
     }
     fsFile.closeFd();
+    // Atomic rename from temp to final path.  Existing mmap readers of the
+    // old inode are unaffected because rename replaces the directory entry
+    // while the old inode stays alive (held by open fd + mmap).
+    std::filesystem::rename(fsFile.tmpPath_, fsFile.path_);
   }
 
   void clear() override {
