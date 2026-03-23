@@ -74,6 +74,8 @@ class OutputStream {
   friend class File;
 
   friend class RAMFile;
+  friend class FSFile;
+  friend class FSFile;
 
   // the associated File object controls the lifetime of the buffer
   char *pos = nullptr;
@@ -97,12 +99,6 @@ public:
   // By not requiring the File target up-front, we can directly include OutputStream instances in other
   // classes even if file creation is deferred.
   explicit OutputStream(File* target = nullptr) : target(target) {}
-
-  // An initial buffer to use.  It's lifetime should exceed the lifetime of this OutputStream and associated File.
-  explicit OutputStream(char *beginInitialBuffer, char *endInitialBuffer, File* target = nullptr) : target(target) {
-    start = pos = beginInitialBuffer;
-    end = endInitialBuffer;
-  }
 
   size_t buffered() const noexcept { return pos - start; }
 
@@ -268,8 +264,6 @@ class RAMFile : public File {
 
   std::vector<element_type> buffers;
   size_t fileSize = 0;
-  const char *firstBuffer = nullptr;
-  uint32_t firstLen = 0;
 
   void newBuffer(size_t size) {
     buffers.emplace_back(new char[size], size);
@@ -279,20 +273,14 @@ class RAMFile : public File {
     auto thisBufferSize = os.pos - os.start;
     fileSize += thisBufferSize;
     os.flushedSize = fileSize;
-    auto prevBufferSize = START_BUFFER_SIZE / 2;  // set up for first buffer to be 1024
-    if (buffers.empty()) {
-      // If this is the first call to flush, remember whatever buffer is set by the output stream as the first element.
-      firstBuffer = os.start;
-      firstLen = thisBufferSize;
-    } else {
-      prevBufferSize = buffers.back().second;
-      if (os.start == buffers.back().first.get()) {
-        buffers.back().second = thisBufferSize;  // truncate to actually used space
-      }
+
+    if (!buffers.empty() && os.start == buffers.back().first.get()) {
+      buffers.back().second = thisBufferSize;  // truncate to actually used space
     }
 
     if (!deferNewBuff) {
       // doubling strategy up to 1MiB
+      auto prevBufferSize = buffers.empty() ? START_BUFFER_SIZE / 2 : (uint32_t)buffers.back().second;
       auto bufSize = std::max(START_BUFFER_SIZE, std::min(prevBufferSize << 1, 0x100000u));
       newBuffer(bufSize);
       auto&[ptr, sz] = buffers.back();
@@ -300,7 +288,6 @@ class RAMFile : public File {
       os.pos = os.start;
       os.end = os.start + sz;
     } else {
-      // Set pointers to nullptr so next write will trigger a flush (i.e. allocation of new buf)
       os.start = os.pos = os.end = nullptr;
     }
   }
@@ -326,12 +313,7 @@ public:
   /// copies size() bytes to the destination
   size_t copyTo(void *dest) {
     char *ptr = (char *) dest;
-    if (firstLen != 0) { // ubsan doesn't like null ptrs even if len==0
-      memcpy(ptr, firstBuffer, firstLen);
-    }
-    ptr += firstLen;
     for (const auto&[data, sz] : buffers) {
-      /// if this overwrites memory, the bug is probably not closing the OutputStream (and hence not truncating the last buffer to the used size)
       assert(ptr - (char *) dest <= fileSize);
       memcpy(ptr, data.get(), sz);
       ptr += sz;
@@ -352,7 +334,6 @@ public:
   /// NOTE: Caller must update any attached OutputStream's size tracking after this operation.
   void destructiveAppend(RAMFile &in) override {
     if (this == &in) return; // no-op
-    assert(in.firstBuffer == nullptr); // not implemented yet
     auto otherSize = in.size();
     for (auto& pair : in.buffers) {
       buffers.emplace_back(std::move(pair));

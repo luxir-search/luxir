@@ -33,11 +33,6 @@ TEST_F(OutputStreamTest, randWrite) {
     auto f = dir.createFile("rdata");
     OutputStream os;
     ASSERT_EQ(0, os.size());
-    char arr[16];
-    // sometimes start off with a user supplied buffer for the output stream
-    if (r.rbool()) {
-      os = OutputStream(arr, arr+r.rint(sizeof(arr)+1));
-    }
     os.setFile(f.get());
 
     int targetLen = r.rint(rlen-1);

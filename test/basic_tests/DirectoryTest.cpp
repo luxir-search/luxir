@@ -4,6 +4,7 @@
 #include <oneapi/tbb/task_group.h>
 
 #include "solux/store/Directory.h"
+#include "solux/store/FSDirectory.h"
 #include "test/SoluxTest.h"
 
 using namespace solux;
@@ -13,12 +14,6 @@ protected:
   void addFile(Directory& dir, const std::string& name, const std::string& data) {
     std::unique_ptr<File> f = dir.createFile(name);
     OutputStream os;
-    char arr[6];
-    // sometimes start off with a user supplied buffer for the output stream
-    if (rng.rbool()) {
-      os = OutputStream(arr, arr+sizeof(arr));
-    }
-
     os.setFile(f.get());
     os.write(data.data(), data.size());
     // os.write('X');  // make sure test fails with this
@@ -46,7 +41,7 @@ protected:
 
     auto input2 = dir.openFile(name);  // open again... to test out shared_ptr + resource management
     ASSERT_EQ(input->read().size(), input2->read().size());
-    ASSERT_EQ(input->read().data(), input2->read().data());
+    ASSERT_EQ(input->read(), input2->read());
   }
 
   void doDir(Directory& dir) {
@@ -147,6 +142,63 @@ protected:
      tg.wait();
   }
 
+  void doDataTypes(Directory& dir) {
+    std::unique_ptr<File> f = dir.createFile("f1");
+    OutputStream os;
+    os.setFile(f.get());
+
+    Rng r = rng;  // take a snapshot for replayability
+    int iterations = 5;  // results in file size of ~19K
+
+    for (int iter=0; iter<iterations; iter++) {
+      for (int i = 0; i < 65; i++) {
+        uint64_t mask = std::numeric_limits<uint64_t>::max() >> (64 - i);
+        uint64_t val = r.rlong() & mask;
+        os.writeStr(std::to_string(val));
+        os.write((char) val);
+        os.writeInt((int32_t) val);
+        os.writeInt(-(int32_t) val);
+        os.writeVint((uint32_t) val);
+        os.writeVint(-(uint32_t) val);
+        os.writeLong((int64_t) val);
+        os.writeLong(-(int64_t) val);
+        os.writeVlong((uint64_t) val);
+        os.writeVlong(-(uint64_t) val);
+      }
+    }
+
+    os.close();
+    dir.finishFile(*f);
+
+    auto input = dir.openFile("f1");
+    auto is = input->getInputStream();
+
+    r = rng;  // replay same random numbers
+    for (int iter=0; iter<iterations; iter++) {
+      for (int i = 0; i < 65; i++) {
+        uint64_t mask = std::numeric_limits<uint64_t>::max() >> (64 - i);
+        uint64_t val = r.rlong() & mask;
+        ASSERT_EQ(std::to_string(val), is.readStr());
+        ASSERT_EQ((char) val, is.readByte());
+        ASSERT_EQ((int32_t) val, is.readInt());
+        ASSERT_EQ(-(int32_t) val, is.readInt());
+        ASSERT_EQ((uint32_t) val, is.readVint());
+        ASSERT_EQ(-(uint32_t) val, is.readVint());
+        ASSERT_EQ((int64_t) val, is.readLong());
+        ASSERT_EQ(-(int64_t) val, is.readLong());
+        ASSERT_EQ((uint64_t) val, is.readVlong());
+        ASSERT_EQ(-(uint64_t) val, is.readVlong());
+      }
+    }
+  }
+
+  std::filesystem::path getTempDir() {
+    std::string tmpl = (std::filesystem::temp_directory_path() / "solux_test_XXXXXX").string();
+    if (mkdtemp(tmpl.data()) == nullptr) {
+      throw std::runtime_error("Failed to create temp directory");
+    }
+    return tmpl;
+  }
 };
 
 
@@ -162,56 +214,53 @@ TEST_F(DirectoryTest, ramdirThreads) {
 
 TEST_F(DirectoryTest, dataTypes) {
   RAMDir dir;
-  std::unique_ptr<File> f = dir.createFile("f1");
-  OutputStream os;
-  os.setFile(f.get());
+  doDataTypes(dir);
+}
 
-  Rng r = rng;  // take a snapshot for replayability
-  // write a bunch of different width integers and longs
+TEST_F(DirectoryTest, fsdir) {
+  auto path = getTempDir();
+  FSDirectory dir(path);
+  doDir(dir);
+  std::filesystem::remove_all(path);
+}
 
-  int iterations = 5;  // results in file size of ~19K
+TEST_F(DirectoryTest, fsdirThreads) {
+  auto path = getTempDir();
+  FSDirectory dir(path);
+  doDirThreaded(dir);
+  std::filesystem::remove_all(path);
+}
 
-  for (int iter=0; iter<iterations; iter++) {
-    for (int i = 0; i < 65; i++) {
-      // max value of uint64_t defined in C++ headers is std::numeric_limits<uint64_t>::max()
-      uint64_t mask = std::numeric_limits<uint64_t>::max() >> (64 - i);
-      uint64_t val = r.rlong() & mask;
-      os.writeStr(std::to_string(val));
-      os.write((char) val);
-      os.writeInt((int32_t) val);
-      os.writeInt(-(int32_t) val);
-      os.writeVint((uint32_t) val);
-      os.writeVint(-(uint32_t) val);
-      os.writeLong((int64_t) val);
-      os.writeLong(-(int64_t) val);
-      os.writeVlong((uint64_t) val);
-      os.writeVlong(-(uint64_t) val);
-    }
+TEST_F(DirectoryTest, fsdirDataTypes) {
+  auto path = getTempDir();
+  FSDirectory dir(path);
+  doDataTypes(dir);
+  std::filesystem::remove_all(path);
+}
+
+TEST_F(DirectoryTest, fsdirPersistence) {
+  auto path = getTempDir();
+  {
+    FSDirectory dir(path);
+    addFile(dir, "persist1", "hello world");
+    addFile(dir, "persist2", "goodbye world");
   }
+  // Reopen the directory — files should still be there
+  {
+    FSDirectory dir(path);
+    std::vector<std::string> files;
+    dir.listFiles(files);
+    ASSERT_EQ(2, files.size());
+    ASSERT_EQ("persist1", files[0]);
+    ASSERT_EQ("persist2", files[1]);
 
-  os.close();
-  dir.finishFile(*f);
+    auto f = dir.openFile("persist1");
+    ASSERT_TRUE(f != nullptr);
+    ASSERT_EQ("hello world", f->read());
 
-  auto input = dir.openFile("f1");
-  auto is = input->getInputStream();
-  // LOG_ERROR("file size={}", is.size());
-
-  r = rng;  // replay same random numbers
-  for (int iter=0; iter<iterations; iter++) {
-    for (int i = 0; i < 65; i++) {
-      uint64_t mask = std::numeric_limits<uint64_t>::max() >> (64 - i);
-      uint64_t val = r.rlong() & mask;
-      ASSERT_EQ(std::to_string(val), is.readStr());
-      ASSERT_EQ((char) val, is.readByte());
-      ASSERT_EQ((int32_t) val, is.readInt());
-      ASSERT_EQ(-(int32_t) val, is.readInt());
-      ASSERT_EQ((uint32_t) val, is.readVint());
-      ASSERT_EQ(-(uint32_t) val, is.readVint());
-      ASSERT_EQ((int64_t) val, is.readLong());
-      ASSERT_EQ(-(int64_t) val, is.readLong());
-      ASSERT_EQ((uint64_t) val, is.readVlong());
-      ASSERT_EQ(-(uint64_t) val, is.readVlong());
-    }
+    f = dir.openFile("persist2");
+    ASSERT_TRUE(f != nullptr);
+    ASSERT_EQ("goodbye world", f->read());
   }
-
+  std::filesystem::remove_all(path);
 }
