@@ -10,6 +10,8 @@ struct SoluxConfig {
   int port = 50051;
   int threads = 0;  // 0 = auto
   std::string log_level = "info";
+  std::string store = "ram";           // "ram" or "fs"
+  std::string data_dir = "solux_data"; // base path for fs store
 
   /// Register common CLI options on an app, bound to this config's fields.
   void addOptions(CLI::App& app);

@@ -97,7 +97,11 @@ SoluxNode::~SoluxNode() {
 }
 
 void SoluxNode::createSingletons() {
-  dirFactory = std::make_unique<RAMDirFactory>();
+  if (config.store == "fs") {
+    dirFactory = std::make_unique<FSDirFactory>(config.data_dir);
+  } else {
+    dirFactory = std::make_unique<RAMDirFactory>();
+  }
 
   collection = std::make_shared<Collection>();
   collection->shard = std::make_shared<Shard>(*collection);
