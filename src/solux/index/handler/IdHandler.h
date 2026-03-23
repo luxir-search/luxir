@@ -8,8 +8,6 @@
 
 namespace solux::handler {
 
-using solux::IdEntry;
-
 /// Specialized handler for the unique "id" field.
 /// Uses TermValHash<IdEntry> instead of TermValHash<DocStream> for much more compact storage.
 /// Each id is unique (one doc per term), so we store just {docId, version} per entry.
@@ -71,18 +69,23 @@ public:
 
 private:
   void indexId(Inverter& inverter, std::string_view id) {
+    // version=0 marks non-overwrite entries so they can be excluded from the delete list.
+    // Update versions start at 1, so 0 is a safe sentinel.
+    uint64_t version = 0;
     if (inverter.overwrite) {
       hadOverwrites_ = true;
-      getVersionHandler(inverter).index(inverter, (int64_t)inverter.currVersion);
+      version = inverter.currVersion;
+      getVersionHandler(inverter).index(inverter, (int64_t)version);
     }
 
-    auto [entry, inserted] = termsHash.try_emplace(id, inverter.getDoc(), inverter.currVersion);
+    auto [entry, inserted] = termsHash.try_emplace(id, inverter.getDoc(), version);
     if (!inserted) {
       // Same id indexed again. update to latest doc and version.
-      // We *could* mark the old one as deleted here. Overwrite will handle deleting the old one, and
-      // we just allow duplicates if overwrite==false.
       entry->val().docId = inverter.getDoc();
-      entry->val().version = inverter.currVersion;
+      // Keep the overwrite version if we had one, otherwise update
+      if (version > 0 || entry->val().version == 0) {
+        entry->val().version = version;
+      }
     }
   }
 

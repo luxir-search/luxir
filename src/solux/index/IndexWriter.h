@@ -414,7 +414,7 @@ private:
   void tryDeleteSegments();
   void moveSegmentToDelete(uint64_t segId);
   void applyDeletes(std::span<SegInfo*> segs, MultiDeletesData& multiDeletesData);
-  void applyDeletes(SegInfo& seg, MultiDeletesData& multiDeletesData);
+  void applyDeletes(SegInfo& seg, SortedDeletes::EntrySpan commitDeletes);
   void mergeSegmentsBody(MergeMessage& msg);
 
 public:

@@ -26,6 +26,8 @@ public:
 
   static unsigned getExactSize(unsigned strBytes) { return TermRef::getExactMemSize(strBytes) + sizeof(V); }
 
+  TermValRef() = default;
+
   // Expert!
   // create a reference to a ValKey pair that already exists in memory.
   // ptr/len refer to the string portion that directly follows the value.

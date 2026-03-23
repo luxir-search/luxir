@@ -1,5 +1,6 @@
 #include "IndexWriter.h"
 
+#include <boost/sort/spreadsort/string_sort.hpp>
 #include "solux/store/OutputStream.h"
 #include "solux/store/InputStream.h"
 #include "LiveDocsWriter.h"
@@ -538,12 +539,10 @@ void IndexWriter::finishCommitBody(UpdateMessage& msg) {
     INDEX_DEBUG("finishCommitBody: msg={} applying deletes to {} segments.", (void*)&msg, segs.size());
     // This is where seg.liveGen can change!
     // TODO: parallelize this.
-    for (auto seg : segsToApplyDeletes) {
-      // Can personal deletes be mutated elsewhere?
-      // mergeSegmentsBody can add personalDeletes to a *new* segment, but it does it under the indexMutex lock,
-      // so we will either see the new segment with its personal deletes, or not see the segment at all.
-      applyDeletes(*seg, commitInfo.multiDeletesData);
-    }
+    // Can personal deletes be mutated elsewhere?
+    // mergeSegmentsBody can add personalDeletes to a *new* segment, but it does it under the indexMutex lock,
+    // so we will either see the new segment with its personal deletes, or not see the segment at all.
+    applyDeletes(segsToApplyDeletes, commitInfo.multiDeletesData);
   }
 
 
@@ -1233,14 +1232,139 @@ void IndexWriter::debugInfo() {
   // Debug info on TBB graph?
 }
 
+/// A cursor into a sorted EntrySpan for k-way merge.
+namespace {
+
+struct DeletesCursor {
+  const SortedDeletes::Entry* curr;
+  const SortedDeletes::Entry* end;
+
+  bool exhausted() const { return curr >= end; }
+  void advance() { ++curr; }
+  const SortedDeletes::Entry& current() const { return *curr; }
+};
+
+struct DeletesCursorGreater {
+  bool operator()(const DeletesCursor& a, const DeletesCursor& b) const {
+    return a.current() > b.current();  // min-heap: greater means lower priority
+  }
+};
+
+/// K-way merge of pre-sorted entry spans into a single sorted, deduped vector.
+/// Drops unversioned adds (version==0). Deduplicates by id, keeping highest version.
+/// If there's only one input span, returns it directly (no allocation).
+SortedDeletes::EntrySpan mergeDeleteSpans(
+    std::span<const SortedDeletes::EntrySpan> spans,
+    std::vector<SortedDeletes::Entry>& out) {
+
+  using Entry = SortedDeletes::Entry;
+
+  if (spans.empty()) return {};
+  if (spans.size() == 1) return spans[0];
+
+  // Build cursors for non-empty spans
+  boost::container::small_vector<DeletesCursor, 8> cursors;
+  size_t total = 0;
+  for (auto& span : spans) {
+    if (!span.empty()) {
+      cursors.push_back({span.data(), span.data() + span.size()});
+      total += span.size();
+    }
+  }
+
+  if (cursors.empty()) return {};
+  if (cursors.size() == 1) {
+    return {cursors[0].curr, (size_t)(cursors[0].end - cursors[0].curr)};
+  }
+
+  out.reserve(total);
+
+  // K-way merge using a min-heap of cursors
+  DirectPQ<DeletesCursor, DeletesCursorGreater> pq(cursors, cursors.size());
+
+  while (pq.size() > 0) {
+    auto& top = pq.top();
+    // Copy the entry — the reference into the span's backing memory remains valid after
+    // advance/removeTop since entries live in detached TermValHash tables, not in the cursor.
+    Entry entry = top.current();
+    uint64_t bestVersion = entry.val().version;
+
+    top.advance();
+    if (top.exhausted()) {
+      pq.removeTop();
+    } else {
+      pq.updateTop();
+    }
+
+    // Drain any duplicates with the same id from other cursors, keeping highest version
+    while (pq.size() > 0 && (std::string_view)pq.top().current() == (std::string_view)entry) {
+      uint64_t v = pq.top().current().val().version;
+      if (v > bestVersion) bestVersion = v;
+
+      pq.top().advance();
+      if (pq.top().exhausted()) {
+        pq.removeTop();
+      } else {
+        pq.updateTop();
+      }
+    }
+
+    // version==0 marks ids indexed without overwrite — not deletes
+    if (bestVersion > 0) {
+      entry.val().version = bestVersion;
+      out.push_back(entry);
+    }
+  }
+
+  return out;
+}
+
+} // anonymous namespace
+
 void IndexWriter::applyDeletes(std::span<SegInfo*> segs, MultiDeletesData& multiDeletesData) {
+  // Collect commit-level spans
+  boost::container::small_vector<SortedDeletes::EntrySpan, 4> commitSpans;
+  for (const auto& sd : multiDeletesData.deletes) {
+    for (auto& span : sd->lists()) {
+      commitSpans.push_back(span);
+    }
+  }
+
+  // Merge commit-level deletes once — reused across all segments
+  std::vector<SortedDeletes::Entry> mergedBuf;
+  SortedDeletes::EntrySpan commitDeletes = mergeDeleteSpans(commitSpans, mergedBuf);
+
   for (SegInfo* seg : segs) {
-    applyDeletes(*seg, multiDeletesData);
+    applyDeletes(*seg, commitDeletes);
   }
 }
 
-void IndexWriter::applyDeletes(SegInfo& seg, MultiDeletesData& multiDeletesData) {
-  if (multiDeletesData.empty() && seg.personalDeletes.empty()) {
+void IndexWriter::applyDeletes(SegInfo& seg, SortedDeletes::EntrySpan commitDeletes) {
+  if (commitDeletes.empty() && seg.personalDeletes.empty()) {
+    return;
+  }
+
+  // If this segment has personal deletes (rare — only during concurrent merges),
+  // merge them with commit deletes into a combined span.
+  SortedDeletes::EntrySpan deleteSpan = commitDeletes;
+  boost::container::small_vector<SortedDeletes::EntrySpan, 4> allSpans;
+  std::vector<SortedDeletes::Entry> segMergedBuf;
+
+  if (!seg.personalDeletes.empty()) {
+    for (const auto& personalDelete : seg.personalDeletes) {
+      for (const auto& sd : personalDelete->deletes) {
+        for (auto& span : sd->lists()) {
+          allSpans.push_back(span);
+        }
+      }
+    }
+    if (!commitDeletes.empty()) {
+      allSpans.push_back(commitDeletes);
+    }
+    deleteSpan = mergeDeleteSpans(allSpans, segMergedBuf);
+  }
+
+  if (deleteSpan.empty()) {
     return;
   }
 
@@ -1291,95 +1415,65 @@ void IndexWriter::applyDeletes(SegInfo& seg, MultiDeletesData& multiDeletesData)
     versionValues.emplace(*versionColReader);
   }
 
-  // Helper function to process deletes from a single span of entries
-  auto processList = [&](SortedDeletes::EntrySpan list) {
-    for (auto& entry : list) {
-      std::string_view deleteId = (std::string_view)entry;
-      uint64_t deleteVersion = entry.val().version;
+  // Apply the merged delete span to this segment.
+  // version==0 entries (non-overwrite adds) are filtered during merge, but can still
+  // appear in the single-span fast path which skips the merge.
+  for (auto& entry : deleteSpan) {
+    uint64_t deleteVersion = entry.val().version;
+    if (deleteVersion == 0) continue;
+    std::string_view deleteId = (std::string_view)entry;
 
-      INDEX_TRACE("applyDeletes: looking up term '{}' with version {} in segment {}",
-               deleteId, deleteVersion, seg.segId);
+    INDEX_TRACE("applyDeletes: looking up term '{}' with version {} in segment {}",
+             deleteId, deleteVersion, seg.segId);
 
-      // Seek to the specific ID term
-      if (termsEnum.seek(deleteId)) {
-        // Found the ID term, now get documents containing this ID
-        DocsEnum docsEnum(pool, reader, termsEnum);
+    // Seek to the specific ID term
+    if (termsEnum.seek(deleteId)) {
+      // Found the ID term, now get documents containing this ID
+      DocsEnum docsEnum(pool, reader, termsEnum);
 
-        for (int32_t docId = docsEnum.next(); docId != DocsEnum::END; docId = docsEnum.next()) {
-          // first check if the document has already been deleted.  If so, we don't need
-          // to check the version or do anything else.
-          if (currLiveBits && !currLiveBits->get(docId)) {
-            // Document is already deleted, skip it
-            continue;
-          }
+      for (int32_t docId = docsEnum.next(); docId != DocsEnum::END; docId = docsEnum.next()) {
+        if (currLiveBits && !currLiveBits->get(docId)) {
+          continue;
+        }
 
-          // doc is live, so check the _version_ field if it exists.
-          bool shouldDelete = true;
+        bool shouldDelete = true;
 
-          // If version field exists, check if document version is less than delete version
-          if (hasVersionField) {
-            // _version_ is dense (every doc has one), so rank == docId
-            uint64_t docVersion = (uint64_t)versionValues->valueAt(docId);
+        if (hasVersionField) {
+          uint64_t docVersion = (uint64_t)versionValues->valueAt(docId);
 
-            INDEX_TRACE("applyDeletes: found version {} for docId {} in segment {}",
-                     docId, docVersion, seg.segId);
+          INDEX_TRACE("applyDeletes: found version {} for docId {} in segment {}",
+                   docId, docVersion, seg.segId);
 
-            // Only delete if document version is less than delete version
-            shouldDelete = (docVersion < deleteVersion);
-          }
+          shouldDelete = (docVersion < deleteVersion);
+        }
 
-          if (shouldDelete) {
-            // Allocate the bitset on first new delete
-            if (!liveBits) {
-              liveBits = std::make_unique<screaming::RAMFixedBitSet>(maxDocId, true);
+        if (shouldDelete) {
+          if (!liveBits) {
+            liveBits = std::make_unique<screaming::RAMFixedBitSet>(maxDocId, true);
 
-              // If we have existing deletes, copy them using memcpy
-              if (existingLiveDocs) {
-                const auto& existingBitset = existingLiveDocs->bitset();
-                size_t wordsSize = screaming::FixedBitSet::sizeInWords(maxDocId) * sizeof(uint64_t);
-                std::memcpy(liveBits->words, existingBitset.words, wordsSize);
-              }
-
-              // then set existingLiveDocs to this so we are checking against the new bitset
-              currLiveBits = liveBits.get();
+            if (existingLiveDocs) {
+              const auto& existingBitset = existingLiveDocs->bitset();
+              size_t wordsSize = screaming::FixedBitSet::sizeInWords(maxDocId) * sizeof(uint64_t);
+              std::memcpy(liveBits->words, existingBitset.words, wordsSize);
             }
 
-            INDEX_TRACE("applyDeletes: marking docId {} as deleted in segment {}",
-                     docId, seg.segId);
-            // Mark the document as deleted
-            liveBits->clear(docId);
-            newDeletesCount++;
+            currLiveBits = liveBits.get();
           }
+
+          INDEX_TRACE("applyDeletes: marking docId {} as deleted in segment {}",
+                   docId, seg.segId);
+          liveBits->clear(docId);
+          newDeletesCount++;
         }
-      } // end if termsEnum.seek()
-    }
-  };
-
-  auto processDeletes = [&](const SortedDeletes& sortedDeletes) {
-    for (auto& list : sortedDeletes.lists()) {
-      processList(list);
-    }
-  };
-
-  // Process personal deletes for this segment
-  for (const auto& personalDelete : seg.personalDeletes) {
-    for (const auto& sd : personalDelete->deletes) {
-      processDeletes(*sd);
-    }
+      }
+    } // end if termsEnum.seek()
   }
-
-  // Process deletes from multiDeletesData
-  for (const auto& sd : multiDeletesData.deletes) {
-    processDeletes(*sd);
-  }
-
 
   // If we found any new documents to delete, write a new delete generation
   if (newDeletesCount > 0) {
     auto newLiveGen = seg.liveGen + 1;
-    numLiveDocs -= newDeletesCount; // Update live document count
+    numLiveDocs -= newDeletesCount;
 
-    // Use LiveDocsWriter to write the delete file
     bool success = LiveDocsWriter::writeLiveDocs(dir, seg.segId, newLiveGen, *liveBits, maxDocId, numLiveDocs);
     if (!success) {
       LOG_ERROR("Failed to write liveDocs file for segment {} with liveGen {}", seg.segId, newLiveGen);
@@ -1389,18 +1483,13 @@ void IndexWriter::applyDeletes(SegInfo& seg, MultiDeletesData& multiDeletesData)
     INDEX_DEBUG("Applied {} new deletes to segment {} (new delete generation: {}, total live docs: {})",
                 newDeletesCount, seg.segId, newLiveGen, numLiveDocs);
 
-    // Update segment metadata only after successfully writing the delete file to avoid races.
     {
       const std::lock_guard<std::mutex> lock(indexMutex);
       seg.liveDocs = numLiveDocs;
-      assert(seg.liveGen + 1 == newLiveGen); // no one should be doing this concurrently.
+      assert(seg.liveGen + 1 == newLiveGen);
       seg.liveGen = newLiveGen;
     }
-
   }
 }
-
-
-
 
 } // end namespace solux

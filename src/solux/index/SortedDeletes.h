@@ -34,7 +34,7 @@ struct IdEntry {
 ///   - overwrite list: ids from documents indexed with overwrite=true
 ///   - delete-by-id list: explicit delete_ids from the update request
 ///
-/// Both lists are sorted by id, enabling future merge-sort optimizations
+/// Both lists are sorted by id, enabling efficient k-way merge
 /// when applying deletes across multiple inverters.
 class SortedDeletes {
 public:

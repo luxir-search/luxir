@@ -165,7 +165,6 @@ public:
   // This could also be a Set with a little more work since the fieldname is already in the value.
   // We don't want the values to move since clients can cache and reuse when indexing.
   gtl::flat_hash_map<std::string, std::unique_ptr<IndexHandler>> indexHandlers;
-  IndexHandler* idHandler_ = nullptr;  // cached pointer to the IdHandler, set in createIndexHandler
 
 
   // The returned reference will be valid for the duration of indexing this block.
@@ -220,8 +219,8 @@ public:
   bool flush();
 
 private:
+  IndexHandler* idHandler_ = nullptr;  // cached pointer to the IdHandler, set in createIndexHandler
   IndexHandler& createIndexHandler(const std::string_view name);
-
 
 };
 
