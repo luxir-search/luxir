@@ -603,6 +603,147 @@ TEST_F(PostingsTest, seekForward) {
     ASSERT_FALSE(tenum.seekForward("term00000033x"));
     ASSERT_TRUE(tenum.seekForward(makeTerm(34)));
   }
+
+  // Test 8: seekForward every term with DocsEnum (exact applyDeletes pattern)
+  {
+    TermsEnum tenum(pool, reader, fieldInfo);
+    bool first = true;
+    for (int i = 0; i < nTerms; i++) {
+      auto t = makeTerm(i);
+      bool found = first ? tenum.seek(t) : tenum.seekForward(t);
+      first = false;
+      ASSERT_TRUE(found) << "failed at term " << i;
+      ASSERT_EQ(tenum.term(), t);
+      DocsEnum docsEnum(pool, reader, tenum);
+      ASSERT_EQ(docsEnum.next(), i);
+    }
+  }
+
+  // Test 8b: same but skipping every other term (with DocsEnum)
+  {
+    TermsEnum tenum(pool, reader, fieldInfo);
+    bool first = true;
+    for (int i = 0; i < nTerms; i += 2) {
+      auto t = makeTerm(i);
+      bool found = first ? tenum.seek(t) : tenum.seekForward(t);
+      first = false;
+      ASSERT_TRUE(found) << "skip-2 failed at term " << i;
+      ASSERT_EQ(tenum.term(), t);
+      DocsEnum docsEnum(pool, reader, tenum);
+      ASSERT_EQ(docsEnum.next(), i);
+    }
+  }
+
+  // Test 9: seekForward with alternating found/not-found + DocsEnum
+  {
+    TermsEnum tenum(pool, reader, fieldInfo);
+    ASSERT_TRUE(tenum.seek(makeTerm(0)));
+    DocsEnum de0(pool, reader, tenum);
+    ASSERT_EQ(de0.next(), 0);
+
+    for (int i = 1; i < nTerms; i++) {
+      // Seek for a term that doesn't exist (appended 'x')
+      auto missing = makeTerm(i - 1) + "x";
+      ASSERT_FALSE(tenum.seekForward(missing)) << "should miss at " << missing;
+
+      // Then seek for the real term
+      auto t = makeTerm(i);
+      ASSERT_TRUE(tenum.seekForward(t)) << "should find term " << i;
+      ASSERT_EQ(tenum.term(), t);
+      DocsEnum de(pool, reader, tenum);
+      ASSERT_EQ(de.next(), i);
+    }
+  }
+}
+
+// Test seekForward with short numeric IDs similar to the multithreaded overwrite test.
+// These have variable lengths, different prefixes, and less prefix sharing than padded terms.
+TEST_F(PostingsTest, seekForwardNumericIds) {
+  RAMDir dir;
+  MemPool pool;
+
+  // Generate IDs like the multithreaded test: thread*1000 + localDoc
+  // e.g. 1000,1001,1002,1003, 2000,2001,..., 15000,...,15003
+  std::vector<std::string> ids;
+  for (int tid = 0; tid < 16; tid++) {
+    for (int doc = 0; doc < 4; doc++) {
+      ids.push_back(std::to_string(tid * 1000 + doc));
+    }
+  }
+  std::sort(ids.begin(), ids.end());
+
+  int nTerms = (int)ids.size();
+  PostingsWriter postingsWriter(dir, 0, nTerms);
+  {
+    TextWriter writer(postingsWriter);
+    writer.startField("id");
+    for (int i = 0; i < nTerms; i++) {
+      TermRef term(pool, ids[i].data(), ids[i].size());
+      writer.startTerm(term);
+      writer.startDoc(i);
+      writer.addPositionDelta(1);
+      writer.endDoc(i);
+      writer.endTerm(term);
+    }
+    writer.endField();
+  }
+  postingsWriter.finish();
+
+  PostingsReader reader(dir, 0);
+  FieldReader fieldReader(pool, reader);
+  ASSERT_TRUE(fieldReader.readNextField());
+  SegFieldInfo fieldInfo;
+  fieldReader.readFieldInfo(fieldInfo);
+
+  // Test: seek first, then seekForward every remaining term with DocsEnum
+  {
+    TermsEnum tenum(pool, reader, fieldInfo);
+    ASSERT_TRUE(tenum.seek(ids[0]));
+    DocsEnum de0(pool, reader, tenum);
+    ASSERT_EQ(de0.next(), 0);
+
+    for (int i = 1; i < nTerms; i++) {
+      ASSERT_TRUE(tenum.seekForward(ids[i])) << "failed at term " << ids[i] << " (index " << i << ")";
+      ASSERT_EQ(tenum.term(), ids[i]);
+      DocsEnum de(pool, reader, tenum);
+      ASSERT_EQ(de.next(), i);
+    }
+  }
+
+  // Test: alternating found/not-found with DocsEnum (sparse delete pattern)
+  {
+    TermsEnum tenum(pool, reader, fieldInfo);
+    ASSERT_TRUE(tenum.seek(ids[0]));
+    DocsEnum de0(pool, reader, tenum);
+    ASSERT_EQ(de0.next(), 0);
+
+    for (int i = 1; i < nTerms; i++) {
+      // Seek for a missing ID between ids[i-1] and ids[i]
+      std::string missing = ids[i-1] + "x";
+      if (missing < ids[i]) {  // only test if it's actually between them
+        ASSERT_FALSE(tenum.seekForward(missing)) << "should miss " << missing;
+      }
+
+      ASSERT_TRUE(tenum.seekForward(ids[i])) << "should find " << ids[i];
+      ASSERT_EQ(tenum.term(), ids[i]);
+      DocsEnum de(pool, reader, tenum);
+      ASSERT_EQ(de.next(), i);
+    }
+  }
+
+  // Test: seek only even-indexed terms (skip every other)
+  {
+    TermsEnum tenum(pool, reader, fieldInfo);
+    bool first = true;
+    for (int i = 0; i < nTerms; i += 2) {
+      bool found = first ? tenum.seek(ids[i]) : tenum.seekForward(ids[i]);
+      first = false;
+      ASSERT_TRUE(found) << "skip-2 failed for " << ids[i];
+      ASSERT_EQ(tenum.term(), ids[i]);
+      DocsEnum de(pool, reader, tenum);
+      ASSERT_EQ(de.next(), i);
+    }
+  }
 }
 
 TEST_F(PostingsTest, randTail) {

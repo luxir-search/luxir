@@ -208,7 +208,10 @@ public:
   // expert: should already point to an instance of this type, and a copy of the data is *not* made.
   explicit PackedTerm(void *ptr) noexcept : ptr_(reinterpret_cast<char *>(ptr)) {}
 
-  explicit PackedTerm(void *ptr, uint32_t size) noexcept : ptr_(reinterpret_cast<char *>(ptr)) {}
+  // expert: should already point to an instance of this type. The passed size is set for this term.
+  explicit PackedTerm(void *ptr, uint32_t size) noexcept : ptr_(reinterpret_cast<char *>(ptr)) {
+    *(unsigned char*)ptr_ = size;
+  }
 
   // expert: a pointer to the start of the data... not to the first byte of the string!
   void *ptr() const noexcept { return (void *) ptr_; }

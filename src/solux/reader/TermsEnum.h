@@ -41,7 +41,7 @@ public:
     numTermBlocks = ((fieldInfo.nTerms-1) / Postings::TERMS_BLOCK_SIZE) + 1;
     termsIS = postingsReader.getInputStreamSeek(fieldInfo.termBlockIndexLoc);
     termBlockOffsets = reinterpret_cast<const int64_t*>(termsIS.ptr());  // offsets from termsLoc
-    currTerm = PackedTerm(pool.alloc(PackedTerm::getMemSize(PackedTerm::MAX_BYTES)));
+    currTerm = PackedTerm(pool.alloc(PackedTerm::getMemSize(PackedTerm::MAX_BYTES)), 0);
   }
 
   int32_t numTerms() const {
@@ -75,6 +75,7 @@ public:
 
   /// NOTE: the returned term is invalidated/changed if this TermsEnum is moved off this
   /// term (i.e. the moment next() or seek() is called). Make a copy if you wish to keep it!
+  /// If called before nextTerm() or seek() is done, returns a 0 length term.
   PackedTerm term() const {
     return currTerm;
   }
@@ -179,15 +180,38 @@ public:
     return seekInBlock(target);
   }
 
-  /// Forward-only seek for sorted iteration. Narrows the binary search to
-  /// blocks from the current position onward.
+  /// Forward-only seek for sorted iteration. Target must be >= the current term.
+  /// If the target is in the current block, scans forward with nextTerm().
+  /// Otherwise narrows the binary search to blocks from the current position onward.
+  /// Can be called without a prior seek() — the first call will load the first block.
   bool seekForward(std::string_view target) {
-    assert(termBlockIndex >= 0);
-    return seek(target, termBlockIndex);
+    if (termBlockIndex < 0) {
+      // Not yet positioned — load first block
+      termBlockIndex = 0;
+      readTermBlock();
+    }
+
+    int32_t nextBlock = termBlockIndex + 1;
+    bool inCurrentBlock = (nextBlock >= numTermBlocks) ||
+        target < termsIS.readPackedTerm(fieldInfo.termsLoc.offset() + termBlockOffsets[nextBlock]);
+
+    if (inCurrentBlock) {
+      for (;;) {
+        auto cmp = term() <=> target;
+        if (cmp == 0) return true;
+        if (cmp > 0) return false;
+        if (ordInBlock >= maxOrdInBlock) return false;
+        readNextTermInBlock();
+      }
+    }
+
+    // TODO: an exponential search starting that the current block would be more
+    // appropriate than a binary search here.
+    return seek(target, nextBlock);
   }
 
   bool seekInBlock(std::string_view target) {
-    // TODO: rather than hashing every segment, have an option to pass it in?
+    // TODO: rather than hashing every call, have an option to pass it in?
     char hash = (char)XXH3_64bits(target.data(), target.size());
     int lastOrd = ordInBlock - 1; // check the current term we are on.
     for(;;) {
