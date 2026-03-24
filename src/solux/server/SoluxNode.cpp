@@ -96,6 +96,27 @@ SoluxNode::SoluxNode(SoluxConfig config) : config(std::move(config)) {
 SoluxNode::~SoluxNode() {
 }
 
+std::shared_ptr<Collection> SoluxNode::initCollection(const std::string& name) {
+  auto col = std::make_shared<Collection>();
+  col->name = name;
+  col->shard = std::make_shared<Shard>(*col);
+  col->shard->dir = dirFactory->create(name);
+
+  // Set default schema initially (without persisting, gen=0 means not yet persisted)
+  auto defaultSchema = Schema::createDefaultSchema();
+  defaultSchema->gen_ = 0;
+  col->schema.store(std::move(defaultSchema));
+
+  // Pass a schemaProvider that fetches the schema from the Collection
+  auto* colPtr = col.get();
+  col->shard->iw = std::make_shared<IndexWriter>(*col->shard->dir,
+    [colPtr]() { return colPtr->getSchema(); });
+
+  // Load the latest persisted schema if one exists.
+  col->loadSchema();
+  return col;
+}
+
 void SoluxNode::createSingletons() {
   if (config.store == "fs") {
     dirFactory = std::make_unique<FSDirFactory>(config.data_dir);
@@ -103,22 +124,22 @@ void SoluxNode::createSingletons() {
     dirFactory = std::make_unique<RAMDirFactory>();
   }
 
-  collection = std::make_shared<Collection>();
-  collection->shard = std::make_shared<Shard>(*collection);
-  collection->shard->dir = dirFactory->create();
+  root = std::make_shared<Library>();
 
-  // Set default schema initially (without persisting, gen=0 means not yet persisted)
-  auto defaultSchema = Schema::createDefaultSchema();
-  defaultSchema->gen_ = 0;
-  collection->schema.store(std::move(defaultSchema));
+  // Discover existing collections from the store, or create default "main".
+  auto existing = dirFactory->listCollections();
+  if (existing.empty()) {
+    existing.push_back("main");
+  }
 
-  // Pass a schemaProvider that fetches the schema from the Collection
-  auto* col = collection.get();
-  collection->shard->iw = std::make_shared<IndexWriter>(*collection->shard->dir,
-    [col]() { return col->getSchema(); });
+  for (const auto& name : existing) {
+    auto col = initCollection(name);
+    LOG_INFO("Loaded collection: {}", name);
+    root->collections.emplace(name, col);
+  }
 
-  // Load the latest persisted schema if one exists.
-  collection->loadSchema();
+  // Keep backward-compat: set the singleton 'collection' to "main"
+  collection = root->collections.at("main");
 }
 
 } // namespace solux

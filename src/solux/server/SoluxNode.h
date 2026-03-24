@@ -158,6 +158,7 @@ public:
 private:
 
   void createSingletons();
+  std::shared_ptr<Collection> initCollection(const std::string& name);
 
   SoluxConfig config;
   std::unique_ptr<SearchEngine> searchEngine;
