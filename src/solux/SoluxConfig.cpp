@@ -4,15 +4,25 @@
 namespace solux {
 
 void SoluxConfig::addOptions(CLI::App& app) {
-  app.add_option("-p,--port", port, "gRPC listen port")->default_val(port);
-  app.add_option("-t,--threads", threads, "Number of server threads (0 = auto)")->default_val(threads);
   app.add_option("--log-level", log_level, "Log level (trace, debug, info, warn, error, critical)")
       ->default_val(log_level);
-  app.add_option("--store", store, "Storage backend (ram, fs)")
-      ->default_val(store)
+
+  app.add_option("--server.grpc.port,-p", server.grpc.port, "gRPC listen port")
+      ->default_val(server.grpc.port);
+  app.add_option("--server.grpc.threads,-t", server.grpc.threads, "Number of server threads (0 = auto)")
+      ->default_val(server.grpc.threads);
+
+  app.add_option("--store.backend", store.backend, "Storage backend (ram, fs)")
+      ->default_val(store.backend)
       ->check(CLI::IsMember({"ram", "fs"}));
-  app.add_option("--data-dir", data_dir, "Base path for filesystem storage")
-      ->default_val(data_dir);
+  app.add_option("--store.data-dir", store.data_dir, "Base path for filesystem storage")
+      ->default_val(store.data_dir);
+}
+
+void SoluxConfig::normalize() {
+  if (store.backend == "ram" && store.data_dir != "solux_data") {
+    spdlog::warn("store.data-dir is ignored when store.backend=ram");
+  }
 }
 
 void SoluxConfig::apply() const {

@@ -25,6 +25,7 @@ int solux_main(int argc, char** argv) {
     return app.exit(e);
   }
 
+  config.normalize();
   config.apply();
 
   LOG_INFO("Logging: compile-time={}, runtime={}",
@@ -32,7 +33,7 @@ int solux_main(int argc, char** argv) {
            spdlog::level::to_string_view(spdlog::get_level()));
 
   SoluxNode node{config};
-  GRPCServer server(node, config.resolveThreads(), config.port);
+  GRPCServer server(node, config.server.grpc.resolveThreads(), config.server.grpc.port);
   server.run();
   return 0;
 }

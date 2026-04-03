@@ -129,7 +129,7 @@ int main(int argc, char **argv) {
 
   solux::SoluxConfig config;
   config.log_level = "debug";  // default to debug for tests
-  config.port = 0;  // dynamic port for test server
+  config.server.grpc.port = 0;  // dynamic port for test server
   config.addOptions(app);
 
   bool help = false;
@@ -143,6 +143,7 @@ int main(int argc, char **argv) {
     return app.exit(e);
   }
 
+  config.normalize();
   config.apply();
 
   LOG_INFO("Logging: compile-time={}, runtime={}",

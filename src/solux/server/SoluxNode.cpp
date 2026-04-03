@@ -118,8 +118,8 @@ std::shared_ptr<Collection> SoluxNode::initCollection(const std::string& name) {
 }
 
 void SoluxNode::createSingletons() {
-  if (config.store == "fs") {
-    dirFactory = std::make_unique<FSDirFactory>(config.data_dir);
+  if (config.store.backend == "fs") {
+    dirFactory = std::make_unique<FSDirFactory>(config.store.data_dir);
   } else {
     dirFactory = std::make_unique<RAMDirFactory>();
   }
