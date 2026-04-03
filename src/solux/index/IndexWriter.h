@@ -56,6 +56,10 @@ namespace solux {
     using PersonalDeletes = std::vector<std::shared_ptr<MultiDeletesData>>;
     PersonalDeletes personalDeletes;
 
+    // Filenames written for this segment that have not yet been fsynced.
+    // Populated by PostingsWriter::finish() and drained at commit time.
+    std::vector<std::string> unsyncedFiles;
+
     SegInfo(uint64_t segId, int nDocs) : segId(segId), maxDoc(nDocs), liveDocs(nDocs) {}
 
     // firendly name for logs that match the segment filenames for easier debugging.
@@ -413,8 +417,8 @@ private:
   void writeIndexInfoFile(std::span<SegInfo*> segs, CommitInfo* commitInfo = nullptr);
   void tryDeleteSegments();
   void moveSegmentToDelete(uint64_t segId);
-  void applyDeletes(std::span<SegInfo*> segs, MultiDeletesData& multiDeletesData);
-  void applyDeletes(SegInfo& seg, SortedDeletes::EntrySpan commitDeletes);
+  void applyDeletes(std::span<SegInfo*> segs, MultiDeletesData& multiDeletesData, std::vector<std::string>& filesToSync);
+  void applyDeletes(SegInfo& seg, SortedDeletes::EntrySpan commitDeletes, std::vector<std::string>& filesToSync);
   void mergeSegmentsBody(MergeMessage& msg);
 
 public:

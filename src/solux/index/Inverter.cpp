@@ -90,7 +90,7 @@ Inverter::IndexHandler& Inverter::createIndexHandler(const std::string_view name
 }
 
 
-bool Inverter::flush() {
+bool Inverter::flush(std::vector<std::string>* filenames) {
   getPostingsWriter().setMaxDoc(getMaxDoc());  // TODO: this won't always be accurate currently?
 
   // We could either sort fields first, or after they have been indexed.  Merging segments will presumably
@@ -136,14 +136,18 @@ bool Inverter::flush() {
     // Write the liveDocs file and get the liveGen
     liveGen = 1;  // start with generation 1 for the first liveDocs file
     liveDocs = numLiveDocs;
-    LiveDocsWriter::writeLiveDocs(postingsWriter.getDirectory(), postingsWriter.segId, liveGen, liveBits, maxDocId, numLiveDocs);
+    if (filenames) {
+      LiveDocsWriter::writeLiveDocs(postingsWriter.getDirectory(), postingsWriter.segId, liveGen, liveBits, maxDocId, numLiveDocs, *filenames);
+    } else {
+      LiveDocsWriter::writeLiveDocs(postingsWriter.getDirectory(), postingsWriter.segId, liveGen, liveBits, maxDocId, numLiveDocs);
+    }
   } else {
     // No deletes
     liveGen = 0;
     liveDocs = getMaxDoc();
   }
 
-  return getPostingsWriter().finish();
+  return getPostingsWriter().finish(filenames);
 }
 
 

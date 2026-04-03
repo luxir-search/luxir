@@ -167,7 +167,8 @@ public:
   }
 
   // returns true if anything was written.
-  bool finish() {
+  // If filenames is non-null, appends the names of files written (for fsync at commit time).
+  bool finish(std::vector<std::string>* filenames = nullptr) {
 
     if (fieldInfos.empty()) {
       return false;  // already called, or no data added.
@@ -183,10 +184,16 @@ public:
     writeSegmentInfo();
     // TODO: implement compound files for small files
 
+    if (filenames) {
+      filenames->reserve(filenames->size() + files.size());
+    }
     for (auto& dataFile : files) {
       sizeInBytes += dataFile.out.size();
       dataFile.out.close();
       directory.finishFile(*dataFile.file);
+      if (filenames) {
+        filenames->emplace_back(dataFile.file->name());
+      }
     }
 
     fieldInfos.resize(0);

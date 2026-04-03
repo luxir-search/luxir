@@ -229,6 +229,27 @@ public:
     std::filesystem::rename(fsFile.tmpPath_, fsFile.path_);
   }
 
+  // Fsync the given files.  Use "." to fsync the directory itself
+  // (to ensure renames/creates are durable).
+  void sync(std::span<const std::string> filenames) override {
+    for (auto& name : filenames) {
+      int fd;
+      if (name == ".") {
+        fd = ::open(basePath_.c_str(), O_RDONLY);
+      } else {
+        fd = ::open(filePath(name).c_str(), O_RDONLY);
+      }
+      if (fd < 0) {
+        throw std::runtime_error("FSDirectory::sync: failed to open " + name + ": " + strerror(errno));
+      }
+      if (::fsync(fd) < 0) {
+        ::close(fd);
+        throw std::runtime_error("FSDirectory::sync: fsync failed for " + name + ": " + strerror(errno));
+      }
+      ::close(fd);
+    }
+  }
+
   void clear() override {
     for (const auto& entry : std::filesystem::directory_iterator(basePath_)) {
       if (entry.is_regular_file()) {

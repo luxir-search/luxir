@@ -393,11 +393,12 @@ void IndexWriter::segmentFlushBody(Inverter& inverter) {
               (void*)inverter.commitInfo,
               inverter.commitInfo == nullptr ? -1 : inverter.commitInfo->leftToFlush);
 
+  std::vector<std::string> flushedFiles;
   bool success;
   try {
     // uncomment to serialize inverter flushing (for testing purposes)
     // const std::lock_guard<std::mutex> lock(indexMutex);
-    success = inverter.flush();
+    success = inverter.flush(&flushedFiles);
   }
   catch (std::exception& e) {
     LOG_ERROR("Exception caught while flushing inverter: {}", e.what());
@@ -406,6 +407,7 @@ void IndexWriter::segmentFlushBody(Inverter& inverter) {
 
   auto segInfo = std::make_unique<SegInfo>(inverter.getPostingsWriter().segId,
                                            inverter.getPostingsWriter().getMaxDoc());
+  segInfo->unsyncedFiles = std::move(flushedFiles);
   segInfo->minVersion = inverter.minVersion;
   segInfo->maxVersion = inverter.maxVersion;
   segInfo->schemaGen = currentSchemaGen();
@@ -530,6 +532,9 @@ void IndexWriter::finishCommitBody(UpdateMessage& msg) {
   // If a segmentMerge kicks off here, it could be merging segments without deletes applied yet.
   // We check for that after we finish applying deletes.
 
+  // Collect filenames that need to be fsynced before the commit point.
+  std::vector<std::string> filesToSync;
+
   CommitInfo& commitInfo = *msg.commitInfo;
   if (segsToApplyDeletes.empty()) {
     INDEX_DEBUG("finishCommitBody: msg={} no deletes to apply.", (void*)&msg);
@@ -542,7 +547,7 @@ void IndexWriter::finishCommitBody(UpdateMessage& msg) {
     // Can personal deletes be mutated elsewhere?
     // mergeSegmentsBody can add personalDeletes to a *new* segment, but it does it under the indexMutex lock,
     // so we will either see the new segment with its personal deletes, or not see the segment at all.
-    applyDeletes(segsToApplyDeletes, commitInfo.multiDeletesData);
+    applyDeletes(segsToApplyDeletes, commitInfo.multiDeletesData, filesToSync);
   }
 
 
@@ -673,6 +678,23 @@ void IndexWriter::finishCommitBody(UpdateMessage& msg) {
         segsToKeep.push_back(seg);
       }
     }
+  }
+
+  // Collect unsynced segment data files from segments being committed for the first time.
+  for (auto seg : segsToKeep) {
+    if (seg->firstCommitTime == 0 && !seg->unsyncedFiles.empty()) {
+      filesToSync.insert(filesToSync.end(),
+                         std::make_move_iterator(seg->unsyncedFiles.begin()),
+                         std::make_move_iterator(seg->unsyncedFiles.end()));
+      seg->unsyncedFiles.clear();
+    }
+  }
+
+  // Fsync all segment data and liveDocs files before writing the commit point.
+  // "." syncs the directory to make renames durable.
+  if (!filesToSync.empty()) {
+    filesToSync.emplace_back(".");
+    dir.sync(filesToSync);
   }
 
   // write the segments file with only the segments that have live documents
@@ -872,6 +894,10 @@ void IndexWriter::writeIndexInfoFile(std::span<SegInfo*> segs, CommitInfo* commi
   indexOut.close();
   dir.finishFile(*indexFile);
 
+  // Fsync the commit point (INDEX_INFO_FILE) and the directory entry.
+  std::array<std::string, 2> commitFiles = {std::string(Postings::INDEX_INFO_FILE), "."};
+  dir.sync(commitFiles);
+
   INDEX_DEBUG("\twriteIndexInfoFile DONE: commitTime={} nSegs={} gen={} maxDoc={}", now_us, segs.size(), thisIndexGen,
               numDocs);
 
@@ -989,6 +1015,7 @@ void IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
     // Create the new SegInfo for the output segment.
     auto newSegInfo = std::make_unique<SegInfo>(pwriter.getSegId(), pwriter.getMaxDoc());
     newSegInfo->schemaGen = currentSchemaGen();
+    pwriter.finish(&newSegInfo->unsyncedFiles);
 
     // Move old segments to the delete list and add the new segment info.
     std::vector<std::unique_ptr<SegInfo>> toDeleteSegs;
@@ -1126,6 +1153,7 @@ void IndexWriter::mergeSegments() {
 
   SegmentMerger merger(preaders, liveDocsPtrs, pwriter);
   merger.merge();
+  pwriter.finish();
 
   // update the list of segments... not safe currently
   // TODO: add unused segments to the "to be deleted" list
@@ -1321,7 +1349,7 @@ SortedDeletes::EntrySpan mergeDeleteSpans(
 
 } // anonymous namespace
 
-void IndexWriter::applyDeletes(std::span<SegInfo*> segs, MultiDeletesData& multiDeletesData) {
+void IndexWriter::applyDeletes(std::span<SegInfo*> segs, MultiDeletesData& multiDeletesData, std::vector<std::string>& filesToSync) {
   // Collect commit-level spans
   boost::container::small_vector<SortedDeletes::EntrySpan, 4> commitSpans;
   for (const auto& sd : multiDeletesData.deletes) {
@@ -1335,11 +1363,11 @@ void IndexWriter::applyDeletes(std::span<SegInfo*> segs, MultiDeletesData& multi
   SortedDeletes::EntrySpan commitDeletes = mergeDeleteSpans(commitSpans, mergedBuf);
 
   for (SegInfo* seg : segs) {
-    applyDeletes(*seg, commitDeletes);
+    applyDeletes(*seg, commitDeletes, filesToSync);
   }
 }
 
-void IndexWriter::applyDeletes(SegInfo& seg, SortedDeletes::EntrySpan commitDeletes) {
+void IndexWriter::applyDeletes(SegInfo& seg, SortedDeletes::EntrySpan commitDeletes, std::vector<std::string>& filesToSync) {
   if (commitDeletes.empty() && seg.personalDeletes.empty()) {
     return;
   }
@@ -1475,7 +1503,7 @@ void IndexWriter::applyDeletes(SegInfo& seg, SortedDeletes::EntrySpan commitDele
     auto newLiveGen = seg.liveGen + 1;
     numLiveDocs -= newDeletesCount;
 
-    bool success = LiveDocsWriter::writeLiveDocs(dir, seg.segId, newLiveGen, *liveBits, maxDocId, numLiveDocs);
+    bool success = LiveDocsWriter::writeLiveDocs(dir, seg.segId, newLiveGen, *liveBits, maxDocId, numLiveDocs, filesToSync);
     if (!success) {
       LOG_ERROR("Failed to write liveDocs file for segment {} with liveGen {}", seg.segId, newLiveGen);
       return;

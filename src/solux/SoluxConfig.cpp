@@ -3,6 +3,19 @@
 
 namespace solux {
 
+/*
+Rough hierarchy:
+[store]          # storage backend
+[index]          # indexing behavior (ram buffer, etc.)
+[merge]          # merge policy/scheduling
+[cache.filter]   # named cache instances
+[cache.query]
+[query]          # query parsing defaults
+[request]        # request handling (threads, timeouts)
+[search]         # search defaults (hits, etc.)
+*/
+
+
 void SoluxConfig::addOptions(CLI::App& app) {
   app.add_option("--log-level", log_level, "Log level (trace, debug, info, warn, error, critical)")
       ->default_val(log_level);

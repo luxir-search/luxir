@@ -20,7 +20,7 @@ struct ServerConfig {
 };
 
 struct StoreConfig {
-  std::string backend = "ram";           // ram, fs, afs, uring
+  std::string backend = "ram";           // ram, fs
   std::string data_dir = "solux_data";
 };
 

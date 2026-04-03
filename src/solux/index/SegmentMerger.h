@@ -141,8 +141,8 @@ public:
       mergeField(mergeFieldInfos);
     }
 
-    // TODO: where should postingsWriter be finished?
-    postingsWriter.finish();
+    // Caller is responsible for calling postingsWriter.finish()
+    // so it can collect the filenames written.
   }
 
 private:

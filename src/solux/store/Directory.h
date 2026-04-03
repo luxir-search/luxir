@@ -1,5 +1,6 @@
 #pragma once
 
+#include <span>
 #include <vector>
 #include <string_view>
 #include <gtl/btree.hpp>
@@ -40,6 +41,11 @@ public:
   // gives more flexibility in implementation without having every File have to point back to it's
   // owning Directory.
   virtual void finishFile(File &file) = 0;
+
+  // Fsync the given files to ensure durability.
+  // Use "." to fsync the directory itself (to persist renames/creates).
+  // The default implementation is a no-op (e.g. for RAMDir).
+  virtual void sync(std::span<const std::string> filenames) { unused(filenames); }
 
   // remove all files from the directory
   virtual void clear() = 0;
