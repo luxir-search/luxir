@@ -1,6 +1,6 @@
 #pragma once
 
-#include <set>
+#include <boost/unordered/unordered_flat_set.hpp>
 #include "DirectoryFactory.h"
 
 namespace solux {
@@ -23,7 +23,7 @@ class CheckedDirectory : public Directory {
   bool verbose_;
 
   // Files that have been finishFile()'d but not yet sync()'d in this session.
-  std::set<std::string> unsyncedFiles_;
+  boost::unordered_flat_set<std::string> unsyncedFiles_;
   std::mutex mu_;
 
   void reportUnsyncedRead(const std::string& name) {
@@ -72,10 +72,12 @@ public:
   void deletePrefix(std::string_view prefix) override {
     {
       std::lock_guard lock(mu_);
-      std::string prefixStr(prefix);
-      for (auto it = unsyncedFiles_.lower_bound(prefixStr); it != unsyncedFiles_.end();) {
-        if (!it->starts_with(prefix)) break;
-        it = unsyncedFiles_.erase(it);
+      for (auto it = unsyncedFiles_.begin(); it != unsyncedFiles_.end();) {
+        if (it->starts_with(prefix)) {
+          it = unsyncedFiles_.erase(it);
+        } else {
+          ++it;
+        }
       }
     }
     if (verbose_) LOG_DEBUG("CheckedDirectory: deletePrefix({})", prefix);

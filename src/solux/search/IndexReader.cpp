@@ -108,7 +108,9 @@ IndexReader::IndexReader(Directory& dir, IndexReader* previousReader) {
     
     auto* indexInfo = google::protobuf::Arena::Create<solux::proto::IndexInfo>(&arena);
     
-    std::shared_ptr<InputFile> inputFile = dir.openFile(Postings::INDEX_INFO_FILE, true);
+    // Don't use expectSynced here — IndexReader can race with a concurrent
+    // commit that has finished s.olux but not yet synced it.
+    std::shared_ptr<InputFile> inputFile = dir.openFile(Postings::INDEX_INFO_FILE);
     if (inputFile == nullptr) {
       IREADER_DEBUG("No {} file, Empty IndexReader", Postings::INDEX_INFO_FILE);
     }
