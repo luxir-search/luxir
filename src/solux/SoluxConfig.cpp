@@ -30,6 +30,9 @@ void SoluxConfig::addOptions(CLI::App& app) {
       ->check(CLI::IsMember({"ram", "fs"}));
   app.add_option("--store.data-dir", store.data_dir, "Base path for filesystem storage")
       ->default_val(store.data_dir);
+  app.add_option("--store.checked-dir.sync", store.checked_dir.sync, "Check fsync correctness: off, warn, throw")
+      ->default_val(store.checked_dir.sync)
+      ->check(CLI::IsMember({"off", "warn", "throw"}));
 }
 
 void SoluxConfig::normalize() {

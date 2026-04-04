@@ -32,7 +32,7 @@ public:
   // deletes for this segment).  A nullptr is returned in the case that there are deletions but we couldn't
   // find the delete file (this is not necessarily an error, the index could have changed already).
   // If missingFileOK is false, missing files will throw exceptions instead of returning nullptr.
-  static std::shared_ptr<LiveDocs> create(Directory& dir, uint64_t segId, uint64_t liveGen, int32_t maxDoc, bool missingFileOK = true);
+  static std::shared_ptr<LiveDocs> create(Directory& dir, uint64_t segId, uint64_t liveGen, int32_t maxDoc, bool missingFileOK = true, bool expectSynced = false);
   
   // Get the underlying FixedBitSet for direct access
   const screaming::FixedBitSet& bitset() const {

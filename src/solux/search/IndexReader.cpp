@@ -10,12 +10,12 @@
 
 namespace solux {
 
-std::shared_ptr<LiveDocs> LiveDocs::create(Directory& dir, uint64_t segId, uint64_t liveGen, int32_t maxDoc, bool missingFileOK) {
+std::shared_ptr<LiveDocs> LiveDocs::create(Directory& dir, uint64_t segId, uint64_t liveGen, int32_t maxDoc, bool missingFileOK, bool expectSynced) {
   assert(liveGen > 0 && maxDoc > 0);
   std::string deleteFileName = Postings::getLiveDocsFileName(
     Postings::getSortableString(segId), liveGen);
 
-  auto deleteFile = dir.openFile(deleteFileName);
+  auto deleteFile = dir.openFile(deleteFileName, expectSynced);
   if (deleteFile == nullptr) {
     if (missingFileOK) {
       // Delete file not found - return nullptr instead of throwing
@@ -108,7 +108,7 @@ IndexReader::IndexReader(Directory& dir, IndexReader* previousReader) {
     
     auto* indexInfo = google::protobuf::Arena::Create<solux::proto::IndexInfo>(&arena);
     
-    std::shared_ptr<InputFile> inputFile = dir.openFile(Postings::INDEX_INFO_FILE);
+    std::shared_ptr<InputFile> inputFile = dir.openFile(Postings::INDEX_INFO_FILE, true);
     if (inputFile == nullptr) {
       IREADER_DEBUG("No {} file, Empty IndexReader", Postings::INDEX_INFO_FILE);
     }
@@ -147,7 +147,7 @@ IndexReader::IndexReader(Directory& dir, IndexReader* previousReader) {
         // TODO: instead of creating a new PostingsReader, we could check if the previousReader has it already opened.
         // Also, to be more flexible, we should probably pass in a provider interface that can provide PostingsReaders and LiveDocs
         // from other sources (like cached in IndexWriter, or from previous IndexReader).
-        auto postingsReader = PostingsReader::create(dir, segId, missingFileOK);
+        auto postingsReader = PostingsReader::create(dir, segId, missingFileOK, true);
         if (!postingsReader) {
           // Failed to create PostingsReader (segment files not found) - trigger retry
           retry = true;
@@ -156,7 +156,7 @@ IndexReader::IndexReader(Directory& dir, IndexReader* previousReader) {
 
         std::shared_ptr<LiveDocs> liveDocs;
         if (liveGen > 0) {
-          liveDocs = LiveDocs::create(dir, segId, liveGen, nDocs, missingFileOK);
+          liveDocs = LiveDocs::create(dir, segId, liveGen, nDocs, missingFileOK, true);
           if (!liveDocs) {
             // Failed to create LiveDocs (delete file not found) - trigger retry
             retry = true;

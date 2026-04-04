@@ -130,6 +130,7 @@ int main(int argc, char **argv) {
   solux::SoluxConfig config;
   config.log_level = "debug";  // default to debug for tests
   config.server.grpc.port = 0;  // dynamic port for test server
+  config.store.checked_dir.sync = "throw";  // catch missing fsyncs in tests
   config.addOptions(app);
 
   bool help = false;

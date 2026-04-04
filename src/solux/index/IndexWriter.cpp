@@ -57,7 +57,7 @@ IndexWriter::IndexWriter(Directory& dir, std::function<std::shared_ptr<Schema>()
   : dir(dir), schemaProvider_(std::move(schemaProvider)) {
   mergePolicy = std::make_unique<MergePolicy>(*this); // defer creation until needed?
   nextCommitInfo = std::make_unique<CommitInfo>();
-  std::shared_ptr<InputFile> segFile = dir.openFile(Postings::INDEX_INFO_FILE);
+  std::shared_ptr<InputFile> segFile = dir.openFile(Postings::INDEX_INFO_FILE, true);
   if (segFile.get() == nullptr) {
     lastSegId = 0;
     // TODO: verify directory has no other index files? (i.e. this would tend to indicate corruption)

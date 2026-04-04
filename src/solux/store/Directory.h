@@ -20,7 +20,10 @@ public:
   // appends a list of names to the referenced vector
   virtual void listFiles(std::vector<std::string> &target) = 0;
 
-  virtual std::shared_ptr<InputFile> openFile(const std::string_view name) = 0;
+  // Open a file for reading.  If expectSynced is true, the caller asserts that
+  // this file should have been fsynced (e.g. it was referenced from a committed
+  // index).  CheckedDirectory uses this flag to detect missing fsyncs.
+  virtual std::shared_ptr<InputFile> openFile(std::string_view name, bool expectSynced = false) = 0;
 
   virtual std::unique_ptr<File> createFile(const std::string_view name) = 0;
 
@@ -81,7 +84,8 @@ public:
     }
   }
 
-  std::shared_ptr<InputFile> openFile(const std::string_view name) override {
+  std::shared_ptr<InputFile> openFile(std::string_view name, bool expectSynced = false) override {
+    unused(expectSynced);
     std::lock_guard<std::mutex> lock(mutex);
 
     auto find = files.find(name);

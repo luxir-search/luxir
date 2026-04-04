@@ -7,10 +7,10 @@ namespace solux {
 
 
 // Initialize from files, returns false if missing files and missingFileOK=true
-bool PostingsReader::initializeFromFiles(Directory& dir, uint64_t segId, bool missingFileOK) {
+bool PostingsReader::initializeFromFiles(Directory& dir, uint64_t segId, bool missingFileOK, bool expectSynced) {
   std::string segStr = Postings::getSortableString(segId);
   auto segInfoFile = Postings::getIndexFileName(segStr, 0);
-  files.emplace_back(dir.openFile(segInfoFile));
+  files.emplace_back(dir.openFile(segInfoFile, expectSynced));
 
   if (files.back().get() == nullptr) {
     if (missingFileOK) {
@@ -37,7 +37,7 @@ bool PostingsReader::initializeFromFiles(Directory& dir, uint64_t segId, bool mi
   inputStreams.reserve(nFiles);
 
   for (int i=1; i<nFiles; i++) {
-    files.emplace_back(dir.openFile(Postings::getIndexFileName(segStr, i)));
+    files.emplace_back(dir.openFile(Postings::getIndexFileName(segStr, i), expectSynced));
     if (files.back().get() == nullptr) {
       if (missingFileOK) {
         return false;
@@ -51,10 +51,10 @@ bool PostingsReader::initializeFromFiles(Directory& dir, uint64_t segId, bool mi
   return true;
 }
 
-std::shared_ptr<PostingsReader> PostingsReader::create(Directory& dir, uint64_t segId, bool missingFileOK) {
+std::shared_ptr<PostingsReader> PostingsReader::create(Directory& dir, uint64_t segId, bool missingFileOK, bool expectSynced) {
   std::string segStr = Postings::getSortableString(segId);
   auto segInfoFile = Postings::getIndexFileName(segStr, 0);
-  auto firstFile = dir.openFile(segInfoFile);
+  auto firstFile = dir.openFile(segInfoFile, expectSynced);
 
   if (firstFile == nullptr) {
     if (missingFileOK) {
@@ -67,7 +67,7 @@ std::shared_ptr<PostingsReader> PostingsReader::create(Directory& dir, uint64_t 
 
   // Try to create the PostingsReader - use private constructor
   auto reader = std::shared_ptr<PostingsReader>(new PostingsReader());
-  if (!reader->initializeFromFiles(dir, segId, missingFileOK)) {
+  if (!reader->initializeFromFiles(dir, segId, missingFileOK, expectSynced)) {
     return nullptr;  // Missing files and missingFileOK=true
   }
   return reader;

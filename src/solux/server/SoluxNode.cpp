@@ -1,6 +1,7 @@
 #include "SoluxNode.h"
 #include "solux/schema/Schema.h"
 #include "solux/store/InputStream.h"
+#include "solux/store/CheckedDirFactory.h"
 #include "solux/reader/Postings.h"
 #include "protos/solux_types.pb.h"
 
@@ -25,6 +26,9 @@ void Collection::setSchema(std::shared_ptr<Schema> newSchema) {
     out.write(newSchema->sourceDef_.data(), newSchema->sourceDef_.size());
     out.close();
     shard->dir->finishFile(*file);
+
+    std::vector<std::string> syncFiles = {fileName, "."};
+    shard->dir->sync(syncFiles);
 
     // Delete older schema files
     std::vector<std::string> files;
@@ -54,7 +58,7 @@ bool Collection::loadSchema() {
   }
 
   while (!lastSchemaFile.empty()) {
-    auto file = shard->dir->openFile(lastSchemaFile);
+    auto file = shard->dir->openFile(lastSchemaFile, true);
     if (file) {
       InputStream is = file->getInputStream();
       proto::SchemaDef def;
@@ -122,6 +126,11 @@ void SoluxNode::createSingletons() {
     dirFactory = std::make_unique<FSDirFactory>(config.store.data_dir);
   } else {
     dirFactory = std::make_unique<RAMDirFactory>();
+  }
+
+  if (config.store.checked_dir.sync != "off") {
+    auto mode = config.store.checked_dir.sync == "throw" ? CheckedDirMode::THROW : CheckedDirMode::WARN;
+    dirFactory = std::make_unique<CheckedDirFactory>(std::move(dirFactory), mode);
   }
 
   root = std::make_shared<Library>();

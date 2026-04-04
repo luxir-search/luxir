@@ -19,9 +19,14 @@ struct ServerConfig {
   } grpc;
 };
 
+struct CheckedDirConfig {
+  std::string sync = "off";              // off, warn, throw
+};
+
 struct StoreConfig {
   std::string backend = "ram";           // ram, fs
   std::string data_dir = "solux_data";
+  CheckedDirConfig checked_dir;
 };
 
 struct SoluxConfig {

@@ -5,6 +5,7 @@
 
 #include "solux/store/Directory.h"
 #include "solux/store/FSDirectory.h"
+#include "solux/store/CheckedDirFactory.h"
 #include "test/SoluxTest.h"
 
 using namespace solux;
@@ -263,4 +264,90 @@ TEST_F(DirectoryTest, fsdirPersistence) {
     ASSERT_EQ("goodbye world", f->read());
   }
   std::filesystem::remove_all(path);
+}
+
+
+// --- CheckedDirectory tests ---
+
+TEST_F(DirectoryTest, checkedDirThrowsOnUnsyncedExpectSynced) {
+  auto ram = std::make_shared<RAMDir>();
+  CheckedDirectory dir(ram, CheckedDirMode::THROW);
+
+  auto f = dir.createFile("foo");
+  OutputStream os;
+  os.setFile(f.get());
+  os.write("data", 4);
+  os.close();
+  dir.finishFile(*f);
+
+  // Opening without expectSynced is fine
+  ASSERT_NO_THROW(dir.openFile("foo"));
+
+  // Opening with expectSynced on an unsynced file should throw
+  ASSERT_THROW(dir.openFile("foo", true), std::runtime_error);
+
+  // After syncing, expectSynced should succeed
+  std::vector<std::string> syncFiles = {"foo"};
+  dir.sync(syncFiles);
+  ASSERT_NO_THROW(dir.openFile("foo", true));
+}
+
+TEST_F(DirectoryTest, checkedDirWarnMode) {
+  auto ram = std::make_shared<RAMDir>();
+  CheckedDirectory dir(ram, CheckedDirMode::WARN);
+
+  auto f = dir.createFile("bar");
+  OutputStream os;
+  os.setFile(f.get());
+  os.write("data", 4);
+  os.close();
+  dir.finishFile(*f);
+
+  // WARN mode should not throw even with expectSynced on unsynced file
+  ASSERT_NO_THROW(dir.openFile("bar", true));
+}
+
+TEST_F(DirectoryTest, checkedDirDeleteClearsUnsynced) {
+  auto ram = std::make_shared<RAMDir>();
+  CheckedDirectory dir(ram, CheckedDirMode::THROW);
+
+  auto f = dir.createFile("gone");
+  OutputStream os;
+  os.setFile(f.get());
+  os.write("x", 1);
+  os.close();
+  dir.finishFile(*f);
+
+  // Delete the file - should clear it from unsynced tracking
+  dir.deleteFile("gone");
+
+  // Re-add and sync it, then expectSynced should work
+  auto f2 = dir.createFile("gone");
+  OutputStream os2;
+  os2.setFile(f2.get());
+  os2.write("y", 1);
+  os2.close();
+  dir.finishFile(*f2);
+
+  std::vector<std::string> syncFiles = {"gone"};
+  dir.sync(syncFiles);
+  ASSERT_NO_THROW(dir.openFile("gone", true));
+}
+
+TEST_F(DirectoryTest, checkedDirPreExistingFilesAssumedSynced) {
+  auto ram = std::make_shared<RAMDir>();
+
+  // Write a file directly to the underlying RAMDir before wrapping
+  auto f = ram->createFile("pre_existing");
+  OutputStream os;
+  os.setFile(f.get());
+  os.write("old", 3);
+  os.close();
+  ram->finishFile(*f);
+
+  // Now wrap with CheckedDirectory
+  CheckedDirectory dir(ram, CheckedDirMode::THROW);
+
+  // Pre-existing files should be assumed synced
+  ASSERT_NO_THROW(dir.openFile("pre_existing", true));
 }

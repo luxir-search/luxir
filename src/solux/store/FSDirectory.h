@@ -165,7 +165,8 @@ public:
     std::sort(target.begin() + (int64_t)startIdx, target.end());
   }
 
-  std::shared_ptr<InputFile> openFile(std::string_view name) override {
+  std::shared_ptr<InputFile> openFile(std::string_view name, bool expectSynced = false) override {
+    unused(expectSynced);
     auto path = filePath(name);
     int fd = ::open(path.c_str(), O_RDONLY);
     if (fd < 0) {
