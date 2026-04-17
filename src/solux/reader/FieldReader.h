@@ -27,10 +27,18 @@ struct SegFieldInfo {
   seg_location docsWithFieldEndLoc;
   seg_location columnLoc;    // location of the start of the column
   int64_t columnMetaOff;     // offset from the start of the column to the metadata
-  int64_t numValues;         // numValues in the column. for singleValued fields, docsWithField == numValues
+  int64_t numValues;         // total number of values in the column across all docs.
+                             // For single-valued fields numValues == docsWithField; for multi-valued it is >=.
 
   seg_location monoLoc;   // location of the monotonic column
   int64_t monoMetaOff;    // offset from the start of the mono column to the metadata
+
+  // Optional second mono column.  Currently used by StrCol to carry both a per-doc
+  // endRankReader (in monoLoc, only when multi-valued) and a per-value endOffsetReader
+  // (in mono2Loc, only when variable-size).  When mono2Loc is unset and the column is
+  // fixed-size, mono2MetaOff holds the fixed value size.
+  seg_location mono2Loc;
+  int64_t mono2MetaOff;
 };
 
 
@@ -143,6 +151,8 @@ public:
 
       fieldInfo.monoLoc = fieldIS.readVal<seg_location>();
       fieldInfo.monoMetaOff = fieldIS.readVlong();
+      fieldInfo.mono2Loc = fieldIS.readVal<seg_location>();
+      fieldInfo.mono2MetaOff = fieldIS.readVlong();
     }
   }
 

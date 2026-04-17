@@ -12,31 +12,34 @@ namespace solux::handler {
 
 /// String field handler for column stored only (values are stored verbatim per-doc, values not deduped)
 /// If the string is indexed and stored, see StrHandler.
-/// Values are all stored catenated, with cumulative lengths stored in a monotonic column.
 /// This class also handles binary values.
+///
+/// Layout:
+///   - column bytes: concatenated raw value bytes (no inline metadata).
+///   - endOffsetReader (mono2Loc): per-value -> byte offset. Absent when all values are the same
+///     size; in that case mono2MetaOff holds the fixed value size.
+///   - endRankReader (monoLoc): per-doc -> per-value rank boundary. Present only for multi-valued.
 class StrColHandler final : public Inverter::IndexHandler {
   friend Inverter;
 
-  DocStream docsWithVal; // the set of docs that have this field
-  IntStream lengthStream;
+  DocStream docsWithVal;      // set of docs that have this field
+  IntStream valSizeStream;    // per-value sizes (one entry per value)
+  IntStream valCountStream;   // per-doc value counts (one entry per doc with field; only used if multi-valued)
   // TODO: a RAMFile per field with the current buffer sizes (starting at 1K) is bad for many fields...
   // We should have initial small buffers pool allocated.
-  // OPT: keep track all the RAMFiles used by the Inverter that are eligible to be directly written
-  // and then start directly writing one or more of them if they get big enough.
   RAMFile valuesFile;
   OutputStream valuesOut;
   int64_t numDocs = 0;
+  int64_t numValuesTotal = 0;
   int32_t minSize = std::numeric_limits<int32_t>::max();
   int32_t maxSize = std::numeric_limits<int32_t>::min();
-  size_t maxValues = 1; // maximum number of values seen for a single doc
-  int32_t minBlockSize = std::numeric_limits<int32_t>::max(); // For multi-valued: min total block size
-  int32_t maxBlockSize = std::numeric_limits<int32_t>::min(); // For multi-valued: max total block size
 
 public:
   StrColHandler(Inverter& inverter, const std::string_view& fieldName, const std::shared_ptr<FieldType>& fieldType)
     : IndexHandler(PackedTerm(inverter.pool, fieldName), fieldType),
       docsWithVal(inverter.pool),
-      lengthStream(inverter.pool),
+      valSizeStream(inverter.pool),
+      valCountStream(inverter.pool),
       valuesFile(fieldName),
       valuesOut(&valuesFile)
   {
@@ -45,17 +48,13 @@ public:
   ~StrColHandler() override = default;
 
   void index(Inverter& inverter, const proto::Val& val) override {
-    std::string_view v;
-
     if (val.has_s()) {
-      v = val.s();
-      indexSingle(inverter, v);
+      indexSingle(inverter, val.s());
     }
     else if (val.has_bin()) {
       // TODO: only OK if this is a binary type, otherwise we could accept non-unicode and then attempt
       // to return that as a string later and cause gRPC or someone else up the line to choke.
-      v = val.bin();
-      indexSingle(inverter, v);
+      indexSingle(inverter, val.bin());
     }
     else if (val.has_arr_s()) {
       auto& arr = val.arr_s().v();
@@ -84,104 +83,51 @@ public:
   void indexSingle(Inverter& inverter, std::string_view term) {
     numDocs++;
     docsWithVal.addDoc(inverter.pool, inverter.getDoc());
-    int32_t valSize = (int32_t)term.size();
-    minSize = std::min(minSize, valSize);
-    maxSize = std::max(maxSize, valSize);
-    
-    // If this is a multi-valued field type, write inline metadata even for single values
+    addValue(inverter, term);
     if (fieldType->flags_ & FieldType::MULTI_VALUED) {
-      maxValues = std::max(maxValues, size_t(1));
-      int64_t startPos = valuesOut.size();
-      valuesOut.writeVint(1);  // number of values
-      // For single value, we don't need the length - it's implicit from the total size
-      valuesOut.write(term.data(), valSize);
-      int64_t totalSize = valuesOut.size() - startPos;
-      lengthStream.addVal(inverter.pool, totalSize);  // Track total size including metadata
-      // Track min/max block sizes for fixed-size optimization
-      minBlockSize = std::min(minBlockSize, (int32_t)totalSize);
-      maxBlockSize = std::max(maxBlockSize, (int32_t)totalSize);
-    } else {
-      // Single-valued field - write value directly
-      lengthStream.addVal(inverter.pool, valSize);
-      valuesOut.write(term.data(), valSize);
+      valCountStream.addVal(inverter.pool, 1);
     }
   }
 
   void indexMulti(Inverter& inverter, std::span<const std::string* const> vals) {
-    // Check if field is single-valued - if so, throw exception
     if (!(fieldType->flags_ & FieldType::MULTI_VALUED)) {
-      throw std::runtime_error(fmt::format("Field '{}' is single-valued but received multiple values", 
+      throw std::runtime_error(fmt::format("Field '{}' is single-valued but received multiple values",
                                           std::string_view(fieldName)));
     }
-    
-    // Empty arrays still need to be recorded for the document
+
     numDocs++;
     docsWithVal.addDoc(inverter.pool, inverter.getDoc());
-    maxValues = std::max(maxValues, vals.size());
-    
-    int64_t startPos = valuesOut.size();
-    // Write inline metadata: number of values as vint (0 for empty)
-    valuesOut.writeVint(vals.size());
-    
-    // Write each value with its length, except the last one
-    // The last value's length can be calculated from the total size
-    for (size_t i = 0; i < vals.size(); ++i) {
-      const auto* val = vals[i];
-      int32_t valSize = (int32_t)val->size();
-      minSize = std::min(minSize, valSize);
-      maxSize = std::max(maxSize, valSize);
-      
-      // Only write length for all but the last value
-      if (i < vals.size() - 1) {
-        valuesOut.writeVint(valSize);
-      }
-      valuesOut.write(val->data(), valSize);
+    for (const auto* val : vals) {
+      addValue(inverter, std::string_view(*val));
     }
-    
-    int64_t totalSize = valuesOut.size() - startPos;
-    lengthStream.addVal(inverter.pool, totalSize);  // Track total size including metadata
-    // Track min/max block sizes for fixed-size optimization
-    minBlockSize = std::min(minBlockSize, (int32_t)totalSize);
-    maxBlockSize = std::max(maxBlockSize, (int32_t)totalSize);
+    valCountStream.addVal(inverter.pool, (int64_t)vals.size());
   }
-  
+
   void indexMulti(Inverter& inverter, std::span<std::string_view> vals) {
-    // Check if field is single-valued - if so, throw exception
     if (!(fieldType->flags_ & FieldType::MULTI_VALUED)) {
-      throw std::runtime_error(fmt::format("Field '{}' is single-valued but received multiple values", 
+      throw std::runtime_error(fmt::format("Field '{}' is single-valued but received multiple values",
                                           std::string_view(fieldName)));
     }
-    
-    // Empty arrays still need to be recorded for the document
+
     numDocs++;
     docsWithVal.addDoc(inverter.pool, inverter.getDoc());
-    maxValues = std::max(maxValues, vals.size());
-    
-    int64_t startPos = valuesOut.size();
-    // Write inline metadata: number of values as vint (0 for empty)
-    valuesOut.writeVint(vals.size());
-    
-    // Write each value with its length, except the last one
-    // The last value's length can be calculated from the total size
-    for (size_t i = 0; i < vals.size(); ++i) {
-      const auto& val = vals[i];
-      int32_t valSize = (int32_t)val.size();
-      minSize = std::min(minSize, valSize);
-      maxSize = std::max(maxSize, valSize);
-      
-      // Only write length for all but the last value
-      if (i < vals.size() - 1) {
-        valuesOut.writeVint(valSize);
-      }
-      valuesOut.write(val.data(), valSize);
+    for (const auto& val : vals) {
+      addValue(inverter, val);
     }
-    
-    int64_t totalSize = valuesOut.size() - startPos;
-    lengthStream.addVal(inverter.pool, totalSize);  // Track total size including metadata
-    // Track min/max block sizes for fixed-size optimization
-    minBlockSize = std::min(minBlockSize, (int32_t)totalSize);
-    maxBlockSize = std::max(maxBlockSize, (int32_t)totalSize);
+    valCountStream.addVal(inverter.pool, (int64_t)vals.size());
   }
+
+private:
+  void addValue(Inverter& inverter, std::string_view val) {
+    int32_t valSize = (int32_t)val.size();
+    minSize = std::min(minSize, valSize);
+    maxSize = std::max(maxSize, valSize);
+    valuesOut.write(val.data(), valSize);
+    valSizeStream.addVal(inverter.pool, valSize);
+    numValuesTotal++;
+  }
+
+public:
 
   void flush(Inverter& inverter) override {
     if (numDocs == 0) {
@@ -193,80 +139,63 @@ public:
     PostingsWriter::IndexFieldInfo& fieldInfo = postingsWriter.addField(fieldName);
     fieldInfo.type = fieldType->type();
     fieldInfo.flags = fieldType->flags_ & ~FieldType::ABSTRACT;
-
-    // The multi-valued flag is determined by the field type, not by the data we saw
-    // If we saw multiple values on a single-valued field, we would have already thrown an exception
+    fieldInfo.numValues = numValuesTotal;
 
     auto maxDoc = inverter.getMaxDoc();
-    auto guard = MemPool::threadLocalPoolGuard();
     bool full = numDocs == maxDoc;
+    bool multiValued = (fieldInfo.flags & FieldType::MULTI_VALUED) != 0;
+    // When there are no values (e.g., multi-valued field with only empty arrays),
+    // minSize was never updated.  Treat that as fixed-size 0.
+    bool fixedSize = (numValuesTotal == 0) || (minSize == maxSize);
 
-    // Write the values
+    // Write the concatenated value bytes.
     {
-      valuesOut.flush(true);  // Flush but keep the stream usable
+      valuesOut.flush(true);
       auto valuesSize = valuesFile.size();
-      
+
       OutputStreamPtr out = postingsWriter.getOutputStream();
-      // TODO: depending on the type, we may want to align here.
       out->flush(true);
       fieldInfo.columnLoc = out->slocation();
       out->getFile()->destructiveAppend(valuesFile);
-      // Update the OutputStream's size tracking after destructiveAppend
       out->updateFlushedSize(out->size() + valuesSize);
-      // right now there is no metadata for these catenated values, so columnMetaOff is just the size of the column.
+      // no metadata for the raw value bytes; columnMetaOff is the size of the column.
       fieldInfo.columnMetaOff = out->size() - fieldInfo.columnLoc.offset();
     }
 
-
-    // write lengths
-    if (fieldInfo.flags & FieldType::MULTI_VALUED) {
-      // Multi-valued fields - check if all inline metadata blocks are the same size
-      if (minBlockSize == maxBlockSize) {
-        // All blocks have the same size - skip writing mono column
-        // monoLoc remains 0 (default), indicating fixed-size mode
-        fieldInfo.monoMetaOff = minBlockSize;  // Store the fixed block size
-      } else {
-        // Variable-size blocks - write mono column to track cumulative sizes
-        auto guard = tmpPool.rewindScopeGuard();
-        OutputStreamPtr out = postingsWriter.getOutputStream();
-        MonoWriter endRankWriter(tmpPool, *out);
-        int64_t endRank = 0;
-
-        lengthStream.visitValues(inverter.pool, [&endRank, &endRankWriter](auto val) {
-          endRank += val;
-          endRankWriter.addInt64(endRank);
-        });
-
-        endRankWriter.finish();
-        fieldInfo.monoLoc = endRankWriter.blockLoc;
-        fieldInfo.monoMetaOff = endRankWriter.metaOff;
-      }
+    // Write endOffsetReader (mono2) if variable-size; otherwise record the fixed value size.
+    if (fixedSize) {
+      fieldInfo.mono2MetaOff = (numValuesTotal == 0) ? 0 : minSize;
     } else {
-      // Single-valued fields
-      if (minSize == maxSize) {
-        // All strings have the same size - skip writing mono column
-        // monoLoc remains 0 (default), indicating fixed-size mode
-        fieldInfo.monoMetaOff = minSize;  // Store the fixed element size
-      } else {
-        // Variable size strings - write mono column as before
-        auto guard = tmpPool.rewindScopeGuard();
-        OutputStreamPtr out = postingsWriter.getOutputStream();
-        MonoWriter endRankWriter(tmpPool, *out);
-        int64_t endRank = 0;
-
-        lengthStream.visitValues(inverter.pool, [&endRank, &endRankWriter](auto val) {
-          endRank += val;
-          endRankWriter.addInt64(endRank);
-        });
-
-        endRankWriter.finish();
-        fieldInfo.monoLoc = endRankWriter.blockLoc;
-        fieldInfo.monoMetaOff = endRankWriter.metaOff;
-      }
+      auto guard = tmpPool.rewindScopeGuard();
+      OutputStreamPtr out = postingsWriter.getOutputStream();
+      MonoWriter endOffsetWriter(tmpPool, *out);
+      int64_t endOffset = 0;
+      valSizeStream.visitValues(inverter.pool, [&endOffset, &endOffsetWriter](auto val) {
+        endOffset += val;
+        endOffsetWriter.addInt64(endOffset);
+      });
+      endOffsetWriter.finish();
+      fieldInfo.mono2Loc = endOffsetWriter.blockLoc;
+      fieldInfo.mono2MetaOff = endOffsetWriter.metaOff;
     }
 
+    // Write endRankReader (mono) if multi-valued.  Single-valued fields don't need one
+    // because value rank == doc rank.
+    if (multiValued) {
+      auto guard = tmpPool.rewindScopeGuard();
+      OutputStreamPtr out = postingsWriter.getOutputStream();
+      MonoWriter endRankWriter(tmpPool, *out);
+      int64_t endRank = 0;
+      valCountStream.visitValues(inverter.pool, [&endRank, &endRankWriter](auto val) {
+        endRank += val;
+        endRankWriter.addInt64(endRank);
+      });
+      endRankWriter.finish();
+      fieldInfo.monoLoc = endRankWriter.blockLoc;
+      fieldInfo.monoMetaOff = endRankWriter.metaOff;
+    }
 
-    // write docs-with-value
+    // Write docs-with-value.
     {
       auto guard = tmpPool.rewindScopeGuard();
       // TODO: when things go parallel, we don't want to reserve an OutputStream if this is dense.
@@ -279,7 +208,6 @@ public:
         docsWriter.finishDense(maxDoc);
       }
     }
-
   }
 
 };

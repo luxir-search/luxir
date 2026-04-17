@@ -441,46 +441,84 @@ private:
   }
 
 
-  // If an IntCol has deletions, we can't write the column parts independently (docsWithValue, endRanks, values)
-  // like we can if there are no deletions.
+  // Merges non-indexed string/binary columns written by StrColHandler.
+  // Rebuilds the concatenated byte stream, the per-value endOffsetReader (if values are
+  // variable-size), and the per-doc endRankReader (if the field is multi-valued).
   void mergeStrCol(std::span<MergeFieldInfo*> sortedFields, PostingsWriter& postingsWriter,
                    PostingsWriter::IndexFieldInfo& outputFieldInfo) {
-    assert(sortedFields.size() == segs.size());  // expect non-compacted fields to make the code a little simpler.
+    assert(sortedFields.size() == segs.size());
 
     auto poolGuard = MemPool::threadLocalPoolGuard();
     auto& pool = poolGuard.pool();
-    
-    // Make sure the field type and flags are properly set
-    // These should already be set by mergeField, but let's make sure
+
     assert(outputFieldInfo.type == FieldType::Type::STRING);
     assert(!(outputFieldInfo.flags & FieldType::INDEX_DOCS));
 
-    // Get output stream for concatenated string values
+    bool multiValued = (outputFieldInfo.flags & FieldType::MULTI_VALUED) != 0;
+
+    // Output stream for the concatenated value bytes.
     OutputStreamPtr valuesOut = postingsWriter.getOutputStream();
     outputFieldInfo.columnLoc = valuesOut->slocation();
-    
-    u_ptr<DocsWithValWriter> docsWriter = nullptr;  // docs with the field, created on demand if needed
-    u_ptr<MonoWriter> lengthWriter = nullptr;
-    std::optional<OutputStreamPtr> monoOut;
-    
+
+    u_ptr<DocsWithValWriter> docsWriter = nullptr;
+
+    // endOffsetWriter is created lazily the first time we see a value whose size differs
+    // from the first value's size.  Until then we track the uniform size and can skip
+    // writing the mono column.
+    u_ptr<MonoWriter> endOffsetWriter = nullptr;
+    OutputStreamPtr endOffsetOut;
+
+    // endRankWriter is created up-front when the field is multi-valued.
+    u_ptr<MonoWriter> endRankWriter = nullptr;
+    OutputStreamPtr endRankOut;
+    if (multiValued) {
+      endRankOut = postingsWriter.getOutputStream();
+      endRankWriter = pool.make_unique_align<MonoWriter>(8, pool, *endRankOut);
+    }
+
     int32_t docsWithField = 0;
+    int64_t totalValues = 0;
     int32_t minSize = std::numeric_limits<int32_t>::max();
     int32_t maxSize = std::numeric_limits<int32_t>::min();
-    int64_t cumulativeLength = 0;
+    int64_t cumulativeBytes = 0;
     bool isDense = true;
-    
+
+    // Emits one value into the merged output: appends its bytes, updates size tracking,
+    // and writes the corresponding endOffset entry (lazily starting the mono column if
+    // a size mismatch appears).
+    auto emitValue = [&](std::string_view value) {
+      int32_t valueSize = (int32_t)value.size();
+      valuesOut->write(value.data(), valueSize);
+      cumulativeBytes += valueSize;
+      int32_t prevMin = minSize;
+      minSize = std::min(minSize, valueSize);
+      maxSize = std::max(maxSize, valueSize);
+
+      if (endOffsetWriter) {
+        endOffsetWriter->addInt64(cumulativeBytes);
+      } else if (totalValues > 0 && valueSize != prevMin) {
+        // First size mismatch: start writing the mono column and backfill prior values.
+        endOffsetOut = postingsWriter.getOutputStream();
+        endOffsetWriter = pool.make_unique_align<MonoWriter>(8, pool, *endOffsetOut);
+        for (int64_t i = 1; i <= totalValues; i++) {
+          endOffsetWriter->addInt64((int64_t)prevMin * i);
+        }
+        endOffsetWriter->addInt64(cumulativeBytes);
+      }
+      totalValues++;
+    };
+
     // Process segments in order - since doc remapping is monotonic,
-    // we can simply iterate through each segment sequentially
+    // we can simply iterate through each segment sequentially.
     for (size_t segnum = 0; segnum < sortedFields.size(); segnum++) {
       auto* field = sortedFields[segnum];
       auto& seg = segs[segnum];
-      
+
       if (field == nullptr) {
-        // Field didn't exist for this segment
-        // If segment has live docs, field is sparse
+        // Field didn't exist for this segment.  If segment has live docs, the merged
+        // field becomes sparse: create docsWriter and backfill.
         if (seg.numLive > 0) {
           isDense = false;
-          // Create docsWriter if needed and write all docs up to base
           if (!docsWriter) {
             docsWriter = pool.make_unique_align<DocsWithValWriter>(8, pool, postingsWriter, outputFieldInfo);
             for (int32_t i = 0; i < docsWithField; i++) {
@@ -490,92 +528,77 @@ private:
         }
         continue;
       }
-      
+
       assert(field->seg == &seg);
-      
+
       StrColReader reader(*field->seg->postingsReader, field->segFieldInfo);
       StrColReader::Iterator iter(reader);
-      
-      // Check if this segment's field is sparse
+
       if (reader.docsReader().hasBitset() && !docsWriter) {
         isDense = false;
         docsWriter = pool.make_unique_align<DocsWithValWriter>(8, pool, postingsWriter, outputFieldInfo);
-        // Backfill all docs written so far
         for (int32_t i = 0; i < docsWithField; i++) {
           docsWriter->startDoc(i);
         }
       }
-      
+
       for (int32_t localId = iter.advance(0); localId != StrColReader::Iterator::ENDDOC; localId = iter.next()) {
         auto [mappedDoc, isDeleted] = seg.remapDocId(localId);
-        
         if (isDeleted) {
-          continue;  // Skip deleted documents
+          continue;
         }
-        
-        // sanity check
+
         assert(!isDense || mappedDoc == docsWithField);
-        
-        // Get and write the string value
-        std::string_view value = iter.value();
-        int32_t valueSize = (int32_t)value.size();
-        valuesOut->write(value.data(), valueSize);
-        cumulativeLength += valueSize;
-        
-        minSize = std::min(minSize, valueSize);
-        maxSize = std::max(maxSize, valueSize);
-        
-        // Write cumulative length if variable-sized
-        if (lengthWriter) {
-          lengthWriter->addInt64(cumulativeLength);
-        } else if (docsWithField > 0 && valueSize != minSize) {
-          // First time we see a different size - need to start writing lengths
-          monoOut.emplace(postingsWriter.getOutputStream());
-          lengthWriter = pool.make_unique_align<MonoWriter>(8, pool, *monoOut->get());
-          // Write all previous cumulative lengths (all were minSize)
-          // Note: cumulativeLength already includes the current value
-          for (int32_t i = 1; i <= docsWithField; i++) {
-            lengthWriter->addInt64((int64_t)minSize * i);
+
+        if (multiValued) {
+          auto [startRank, endRank] = iter.valueRange();
+          for (int64_t r = startRank; r < endRank; r++) {
+            emitValue(reader.valueAt(r));
           }
-          // Now write the current cumulative length (which includes the different-sized value)
-          lengthWriter->addInt64(cumulativeLength);
+          endRankWriter->addInt64(totalValues);
+        } else {
+          emitValue(iter.value());
         }
-        
+
         if (docsWriter) {
           docsWriter->startDoc(mappedDoc);
         }
-        
+
         docsWithField++;
       }
     }
-    
-    // Check if we have any values at all
+
     if (docsWithField == 0) {
       outputFieldInfo.docsWithField = 0;
       outputFieldInfo.columnMetaOff = 0;
+      outputFieldInfo.numValues = 0;
       return;
     }
-    
-    // Finish writing column data
+
     valuesOut->flush(true);
     outputFieldInfo.columnMetaOff = valuesOut->size() - outputFieldInfo.columnLoc.offset();
-    
-    // Handle lengths/mono column
-    if (lengthWriter) {
-      // Variable-size strings - finish writing lengths
-      lengthWriter->finish();
-      outputFieldInfo.monoLoc = lengthWriter->blockLoc;
-      outputFieldInfo.monoMetaOff = lengthWriter->metaOff;
+    outputFieldInfo.numValues = totalValues;
+
+    // endOffsetReader (mono2)
+    if (endOffsetWriter) {
+      endOffsetWriter->finish();
+      outputFieldInfo.mono2Loc = endOffsetWriter->blockLoc;
+      outputFieldInfo.mono2MetaOff = endOffsetWriter->metaOff;
     } else {
-      // Fixed-size optimization - store size in monoMetaOff
-      outputFieldInfo.monoLoc = {0, 0};
-      outputFieldInfo.monoMetaOff = minSize;
+      // All values are the same size - store size in mono2MetaOff, leave mono2Loc zero.
+      outputFieldInfo.mono2Loc = {0, 0};
+      outputFieldInfo.mono2MetaOff = (totalValues == 0) ? 0 : minSize;
     }
-    
-    // Set the number of docs with field
+
+    // endRankReader (mono)
+    if (endRankWriter) {
+      endRankWriter->finish();
+      outputFieldInfo.monoLoc = endRankWriter->blockLoc;
+      outputFieldInfo.monoMetaOff = endRankWriter->metaOff;
+    }
+
     outputFieldInfo.docsWithField = docsWithField;
-    
-    // Finish docs-with-value
+
     if (docsWriter) {
       assert(docsWriter->numAdded() == docsWithField);
       if (docsWriter->numAdded() == postingsWriter.getMaxDoc()) {
@@ -584,7 +607,6 @@ private:
         docsWriter->finish();
       }
     } else {
-      // All docs have values (dense)
       outputFieldInfo.docsWithFieldEndLoc = {0, 0};
     }
   }
@@ -602,11 +624,11 @@ private:
     u_ptr<DocsWithValWriter> docsWriter = nullptr;  // docs with the field, created on demand if needed
 
     u_ptr<MonoWriter> endRankWriter = nullptr; // null means single valued, otherwise multi-valued
-    std::optional<OutputStreamPtr> monoOut;    // output stream for the monoWriter.
+    OutputStreamPtr monoOut;                   // output stream for the monoWriter.
 
     if (outputFieldInfo.flags & FieldType::MULTI_VALUED) {
-      monoOut.emplace(postingsWriter.getOutputStream());
-      endRankWriter = pool.make_unique_align<MonoWriter>(8, pool, *monoOut->get());
+      monoOut = postingsWriter.getOutputStream();
+      endRankWriter = pool.make_unique_align<MonoWriter>(8, pool, *monoOut);
     }
 
     int64_t endRankBase = 0;  // used to calculate the endRank for each segment, if multivalued.

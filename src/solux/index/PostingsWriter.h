@@ -81,6 +81,7 @@ public:
     fieldInfos.emplace_back(); // we should get default-initialization with this for the SegFieldInfo members
     fieldInfos.back().fieldname = fieldName;
     assert(fieldInfos.back().monoLoc.offset() == 0 && fieldInfos.back().monoMetaOff == 0 && fieldInfos.back().columnMetaOff == 0);
+    assert(fieldInfos.back().mono2Loc.offset() == 0 && fieldInfos.back().mono2MetaOff == 0);
     return fieldInfos.back();
   }
 
@@ -278,6 +279,8 @@ private:
       // for now, always write mono col info.  If we want to make it optional, we need a flag for it.
       fieldOutput.writeVal(finfo.monoLoc);
       fieldOutput.writeVlong(finfo.monoMetaOff);
+      fieldOutput.writeVal(finfo.mono2Loc);
+      fieldOutput.writeVlong(finfo.mono2MetaOff);
     }
 
     // Now write the start of each fieldInfo

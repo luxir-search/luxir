@@ -11,17 +11,24 @@
 
 namespace solux {
 
-/// Reader for string column data written by StrColHandler.
-/// Strings are stored concatenated in columnLoc, with cumulative lengths in monoLoc.
+/// Reader for string/binary column data written by StrColHandler.
+///
+/// Layout:
+///   - column bytes: concatenated raw value bytes.
+///   - endOffsetReader (optional): per-value -> byte offset. Absent when all values are
+///     the same size; in that case fixedSize holds the common value size.
+///   - endRankReader (optional): per-doc -> per-value rank boundary. Present only for
+///     multi-valued fields.  For single-valued, value rank == doc rank.
 class StrColReader {
 private:
   DocsReader docs;
-  InputStream valuesIS;      // Stream for concatenated string values
-  const char* valuesData;    // Pointer to concatenated string data
-  std::optional<MonoReader> lengthReader;   // Reader for cumulative lengths (empty for fixed-size)
+  InputStream valuesIS;                       // Stream for concatenated string values
+  const char* valuesData;                     // Pointer to concatenated string data
+  std::optional<MonoReader> endRankReader;    // per-doc -> end value rank (multi-valued only)
+  std::optional<MonoReader> endOffsetReader;  // per-value -> end byte offset (variable-size only)
   int32_t docsWithField = 0;
-  int32_t fixedSize = -1;    // -1 for variable size, >= 0 for fixed size
-  bool multiValued = false;  // Whether this field is multi-valued
+  int64_t nvals = 0;
+  int32_t fixedSize = -1;                     // -1 for variable size, >= 0 for fixed size
 
 public:
   /// The fieldInfo is only used in the constructor and can be discarded after.
@@ -30,14 +37,15 @@ public:
     valuesIS(postingsReader.getInputStreamSeek(fieldInfo.columnLoc)),
     valuesData(valuesIS.ptr()),
     docsWithField(fieldInfo.docsWithField),
-    multiValued((fieldInfo.flags & FieldType::MULTI_VALUED) != 0)
+    nvals(fieldInfo.numValues)
   {
-    if (fieldInfo.monoLoc.offset() == 0 && fieldInfo.monoLoc.filenum() == 0) {
-      // Fixed-size mode: monoLoc is null/zero, size is in monoMetaOff
-      fixedSize = (int32_t)fieldInfo.monoMetaOff;
+    if (fieldInfo.flags & FieldType::MULTI_VALUED) {
+      endRankReader.emplace(postingsReader, fieldInfo.monoLoc, fieldInfo.monoMetaOff, fieldInfo.docsWithField);
+    }
+    if (fieldInfo.mono2Loc.offset() == 0 && fieldInfo.mono2Loc.filenum() == 0) {
+      fixedSize = (int32_t)fieldInfo.mono2MetaOff;
     } else {
-      // Variable-size mode: create MonoReader
-      lengthReader.emplace(postingsReader, fieldInfo.monoLoc, fieldInfo.monoMetaOff, fieldInfo.docsWithField);
+      endOffsetReader.emplace(postingsReader, fieldInfo.mono2Loc, fieldInfo.mono2MetaOff, fieldInfo.numValues);
     }
   }
 
@@ -45,27 +53,66 @@ public:
     return docs;
   }
 
-  // get underlying endRankReader, null if all values have the same size.
-  MonoReader* getEndRankReader() {
-    return lengthReader ? &(*lengthReader) : nullptr;
-  }
-
   int32_t docsWithValue() const {
     return docsWithField;
   }
 
-  /// Get the string value for a document by its rank (index in docs with value).
-  std::string_view valueAt(int32_t rank) const {
-    assert(rank >= 0 && rank < docsWithField);
-    if (fixedSize >= 0) {
-      // Fixed-size mode: direct offset calculation
-      int64_t startOffset = (int64_t)rank * fixedSize;
-      return std::string_view(valuesData + startOffset, fixedSize);
-    } else {
-      // Variable-size mode: use MonoReader
-      auto [startOffset, endOffset] = lengthReader->valuesAt(rank);
+  /// Total number of values across all docs (equals docsWithValue() for single-valued).
+  int64_t numValues() const {
+    return nvals;
+  }
+
+  bool isMultiValued() const {
+    return endRankReader.has_value();
+  }
+
+  bool isFixedSize() const {
+    return !endOffsetReader.has_value();
+  }
+
+  /// For multi-valued fields, returns the endRankReader which maps per-doc-rank ->
+  /// end value rank (cumulative count).  Use MonoReader::valuesAt(docRank) to get
+  /// [startRank, endRank) for a doc.  Returns nullptr for single-valued fields.
+  /// Binary-searching the returned reader gives the inverse mapping (valueRank -> docRank),
+  /// needed e.g. for vector-index chunk -> doc resolution.
+  /// Valid as long as this StrColReader is valid.
+  MonoReader* getEndRankReader() {
+    return endRankReader ? &(*endRankReader) : nullptr;
+  }
+
+  /// For variable-size fields, returns the endOffsetReader which maps per-value-rank ->
+  /// end byte offset.  Returns nullptr for fixed-size fields; use fixedValueSize() instead.
+  /// Valid as long as this StrColReader is valid.
+  MonoReader* getEndOffsetReader() {
+    return endOffsetReader ? &(*endOffsetReader) : nullptr;
+  }
+
+  /// Fixed value size for fixed-size fields; -1 for variable size.
+  int32_t fixedValueSize() const {
+    return fixedSize;
+  }
+
+  /// Get the value at a given global value rank (0..numValues()-1).
+  std::string_view valueAt(int64_t valueRank) const {
+    assert(valueRank >= 0 && valueRank < nvals);
+    if (endOffsetReader) {
+      auto [startOffset, endOffset] = endOffsetReader->valuesAt(valueRank);
       return std::string_view(valuesData + startOffset, endOffset - startOffset);
     }
+    int64_t startOffset = valueRank * fixedSize;
+    return std::string_view(valuesData + startOffset, fixedSize);
+  }
+
+  /// For single-valued fields, get the value for the doc at a given doc rank.
+  std::string_view singleValueAt(int32_t docRank) const {
+    assert(!isMultiValued());
+    return valueAt(docRank);
+  }
+
+  /// For multi-valued fields, get the [startValueRank, endValueRank) range for a doc.
+  std::pair<int64_t, int64_t> getStartEndValueRank(int32_t docRank) const {
+    assert(isMultiValued());
+    return endRankReader->valuesAt(docRank);
   }
 
   /// Iterator over documents with string values.
@@ -81,8 +128,8 @@ public:
   public:
     static constexpr int32_t ENDDOC = std::numeric_limits<int32_t>::max();
 
-    DocIterator(const StrColReader& reader) : 
-      reader(reader), 
+    DocIterator(const StrColReader& reader) :
+      reader(reader),
       docsIter(reader.docs.bitset()),
       maxRank(reader.docsWithValue()),
       dense(!reader.docs.hasBitset())
@@ -97,9 +144,15 @@ public:
       return docRank;
     }
 
-    /// Get the string value for the current document.
+    /// For single-valued fields, the value for the current doc.
+    /// For multi-valued fields, use values() to iterate the doc's values.
     std::string_view value() const {
-      return reader.valueAt(docRank);
+      return reader.singleValueAt(docRank);
+    }
+
+    /// For multi-valued fields, the [startValueRank, endValueRank) range for the current doc.
+    std::pair<int64_t, int64_t> valueRange() const {
+      return reader.getStartEndValueRank(docRank);
     }
 
     /// Advance to target docid or the next docid >= target.
@@ -136,53 +189,14 @@ public:
   };
 
   using Iterator = DocIterator;
-  
-  /// returns true if this field is multi-valued
-  bool isMultiValued() const {
-    return multiValued;
-  }
-  
-  /// Parse multi-valued data for a document at given rank
-  /// Calls callback(std::string_view value, int64_t valIdx, int64_t numVals) for each value
-  void parseMultiValuesAt(int32_t rank, auto&& callback) const {
-    assert(multiValued);
-    std::string_view data = valueAt(rank);
-    parseMultiValues(data, callback);
-  }
-  
-  /// Static helper to parse multi-valued data format
-  /// Calls callback(std::string_view value, int64_t valIdx, int64_t numVals) for each value
-  static void parseMultiValues(std::string_view data, auto&& callback) {
-    InputStream dataStream(data.data(), data.data() + data.size());
-    
-    // Read number of values
-    int64_t numVals = dataStream.readVint();
-    
-    // Read each value
-    for (int64_t valIdx = 0; valIdx < numVals; valIdx++) {
-      int64_t valLen;
-      if (valIdx < numVals - 1) {
-        // All values except the last have explicit lengths
-        valLen = dataStream.readVint();
-      } else {
-        // Last value's length is calculated from remaining data
-        valLen = (data.data() + data.size()) - dataStream.ptr();
-      }
-      std::string_view val(dataStream.ptr(), valLen);
-      if (valLen > 0) {
-        dataStream.skip(valLen);
-      }
-      callback(val, valIdx, numVals);
-    }
-  }
 
-  /// Get string values for a sorted range of docids.
+  /// Get string values for a sorted range of docids (single-valued fields).
   /// Calls callback(size_t input_index, int32_t docid, std::string_view value) for each docid that has a value.
-  static void getValues(MemPool& pool, PostingsReader& postingsReader, SegFieldInfo& segFieldInfo, 
+  static void getValues(MemPool& pool, PostingsReader& postingsReader, SegFieldInfo& segFieldInfo,
                         std::ranges::input_range auto&& sortedDocIds, auto&& callback) {
     StrColReader strColReader(postingsReader, segFieldInfo);
     StrColReader::Iterator iter(strColReader);
-    
+
     int32_t foundid = -1;
     size_t idx = 0;
     for (int32_t docid : sortedDocIds) {
@@ -190,23 +204,22 @@ public:
         foundid = iter.advance(docid);
       }
       if (foundid == docid) {
-        auto val = iter.value();
-        callback(idx, docid, val);
+        callback(idx, docid, iter.value());
       } else if (foundid == StrColReader::Iterator::ENDDOC) {
         break;
       }
       idx++;
     }
   }
-  
+
   /// Get multi-valued string values for a sorted range of docids.
-  /// Calls callback(size_t input_index, int32_t docid, std::string_view value, int64_t valIdx, int64_t numVals) 
+  /// Calls callback(size_t input_index, int32_t docid, std::string_view value, int64_t valIdx, int64_t numVals)
   /// for each value of each docid that has values.
   static void getMultiValues(MemPool& pool, PostingsReader& postingsReader, SegFieldInfo& segFieldInfo,
                              std::ranges::input_range auto&& sortedDocIds, auto&& callback) {
     StrColReader strColReader(postingsReader, segFieldInfo);
     StrColReader::Iterator iter(strColReader);
-    
+
     int32_t foundid = -1;
     size_t idx = 0;
     for (int32_t docid : sortedDocIds) {
@@ -214,11 +227,12 @@ public:
         foundid = iter.advance(docid);
       }
       if (foundid == docid) {
-        std::string_view data = iter.value();
-        // Use the centralized parser
-        parseMultiValues(data, [&](std::string_view val, int64_t valIdx, int64_t numVals) {
-          callback(idx, docid, val, valIdx, numVals);
-        });
+        auto [startRank, endRank] = iter.valueRange();
+        int64_t numVals = endRank - startRank;
+        for (int64_t v = 0; v < numVals; v++) {
+          auto val = strColReader.valueAt(startRank + v);
+          callback(idx, docid, val, v, numVals);
+        }
       } else if (foundid == StrColReader::Iterator::ENDDOC) {
         break;
       }
@@ -227,7 +241,7 @@ public:
   }
 
   /// Get string values starting with a field name.
-  static void getValues(MemPool& pool, PostingsReader& postingsReader, std::string_view field, 
+  static void getValues(MemPool& pool, PostingsReader& postingsReader, std::string_view field,
                         std::ranges::input_range auto&& sortedDocIds, auto&& callback) {
     FieldReader fieldReader(pool, postingsReader);
     bool found = fieldReader.seek(field);
@@ -236,7 +250,7 @@ public:
     }
     SegFieldInfo segFieldInfo;
     fieldReader.readFieldInfo(segFieldInfo);
-    
+
     getValues(pool, postingsReader, segFieldInfo, sortedDocIds, callback);
   }
 };
