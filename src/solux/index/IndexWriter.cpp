@@ -1,6 +1,7 @@
 #include "IndexWriter.h"
 
 #include <boost/sort/spreadsort/string_sort.hpp>
+#include <oneapi/tbb/task_group.h>
 #include "solux/store/OutputStream.h"
 #include "solux/store/InputStream.h"
 #include "LiveDocsWriter.h"
@@ -518,12 +519,8 @@ void IndexWriter::finishCommitBody(UpdateMessage& msg) {
       if (seg->lastCommitTime == 0) {
         seg->lastCommitTime = 1; // IMPORTANT - for marking it in use to prevent its deletion.
       }
-      if (!seg->personalDeletes.empty()) {
-        // this segment has personal deletes that need to be applied.
-        segsToApplyDeletes.push_back(seg.get());
-      }
-      if (seg->minVersion < maxDeleteVersion) {
-        // this segment has deletes that need to be applied.
+      if (!seg->personalDeletes.empty() || seg->minVersion < maxDeleteVersion) {
+        // this segment has personal deletes and/or commit-level deletes that need to be applied.
         segsToApplyDeletes.push_back(seg.get());
       }
     }
@@ -543,7 +540,6 @@ void IndexWriter::finishCommitBody(UpdateMessage& msg) {
     // TODO: doesn't take into account personal deletes.
     INDEX_DEBUG("finishCommitBody: msg={} applying deletes to {} segments.", (void*)&msg, segs.size());
     // This is where seg.liveGen can change!
-    // TODO: parallelize this.
     // Can personal deletes be mutated elsewhere?
     // mergeSegmentsBody can add personalDeletes to a *new* segment, but it does it under the indexMutex lock,
     // so we will either see the new segment with its personal deletes, or not see the segment at all.
@@ -1362,9 +1358,24 @@ void IndexWriter::applyDeletes(std::span<SegInfo*> segs, MultiDeletesData& multi
   std::vector<SortedDeletes::Entry> mergedBuf;
   SortedDeletes::EntrySpan commitDeletes = mergeDeleteSpans(commitSpans, mergedBuf);
 
+  // Apply deletes to segments in parallel. Each task accumulates into its own
+  // local vector so the inner path doesn't need synchronization, then we splice
+  // results under a mutex once per segment.
+  std::mutex filesToSyncMutex;
+  oneapi::tbb::task_group tg;
   for (SegInfo* seg : segs) {
-    applyDeletes(*seg, commitDeletes, filesToSync);
+    tg.run([this, seg, commitDeletes, &filesToSync, &filesToSyncMutex]() {
+      std::vector<std::string> localFiles;
+      applyDeletes(*seg, commitDeletes, localFiles);
+      if (!localFiles.empty()) {
+        const std::lock_guard<std::mutex> lock(filesToSyncMutex);
+        filesToSync.insert(filesToSync.end(),
+                           std::make_move_iterator(localFiles.begin()),
+                           std::make_move_iterator(localFiles.end()));
+      }
+    });
   }
+  tg.wait();
 }
 
 void IndexWriter::applyDeletes(SegInfo& seg, SortedDeletes::EntrySpan commitDeletes, std::vector<std::string>& filesToSync) {
