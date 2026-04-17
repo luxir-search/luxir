@@ -939,7 +939,89 @@ TEST_F(StrColTest, MultiValuedFixedSizeOptimization) {
     ASSERT_EQ(5, vals[0].size());
     ASSERT_EQ(5, vals[1].size());
   }
-  
+
   lreq->done();
+}
+
+TEST_F(StrColTest, DocValuesManyValuesPerDoc) {
+  // Exercise StrColReader::DocValues on both the variable-size and fixed-size paths
+  // with enough values per doc to cross MonoReader::BulkValues' 128-value sub-block
+  // boundary, catching regressions in block cache management.
+  constexpr int N = 300;
+
+  CollectionHelper helper;
+  helper.clear();
+
+  // Variable-size: every value has a different length (1..N).
+  std::vector<std::string> varValues;
+  varValues.reserve(N);
+  for (int i = 0; i < N; i++) {
+    varValues.emplace_back((size_t)(i + 1), (char)('a' + (i % 26)));
+  }
+
+  // Fixed-size: all values same size, different content.
+  std::vector<std::string> fixValues;
+  fixValues.reserve(N);
+  for (int i = 0; i < N; i++) {
+    std::string v(8, '\0');
+    for (int j = 0; j < 8; j++) v[j] = (char)('a' + ((i + j) % 26));
+    fixValues.emplace_back(std::move(v));
+  }
+
+  {
+    auto doc = flatdoc("id_s", "doc1");
+    doc.push_back({"chunks_ssc", varValues});
+    doc.push_back({"uniform_ssc", fixValues});
+    helper.index(doc, UpdateMessage::COMMIT);
+  }
+
+  auto indexWriter = helper.getIndexWriter();
+  auto reader = indexWriter->getIndexReader();
+  ASSERT_TRUE(reader != nullptr);
+  ASSERT_GT(reader->segments().size(), 0);
+  auto& segment = reader->segments()[0];
+  auto& postingsReader = segment.postingsReader();
+
+  // Variable-size path: endOffsetReader present; BulkValues wraps MonoReader::BulkValues.
+  {
+    FieldReader fr(MemPool::threadLocal(), postingsReader);
+    ASSERT_TRUE(fr.seek("chunks_ssc"));
+    SegFieldInfo sfi;
+    fr.readFieldInfo(sfi);
+    ASSERT_NE(0, sfi.mono2Loc.offset()) << "expected endOffsetReader for variable-size";
+
+    StrColReader strReader(postingsReader, sfi);
+    ASSERT_EQ((int64_t)N, strReader.numValues());
+    ASSERT_TRUE(strReader.isMultiValued());
+    ASSERT_FALSE(strReader.isFixedSize());
+
+    StrColReader::DocValues docValues(strReader);
+    for (int i = 0; i < N; i++) {
+      ASSERT_EQ(varValues[i], docValues.valueAt(i)) << "variable-size valueAt mismatch at " << i;
+    }
+    // Non-sequential access: skipping forward, jumping back, to exercise cache-miss paths.
+    ASSERT_EQ(varValues[250], docValues.valueAt(250));
+    ASSERT_EQ(varValues[50],  docValues.valueAt(50));
+    ASSERT_EQ(varValues[251], docValues.valueAt(251));
+  }
+
+  // Fixed-size path: no endOffsetReader; BulkValues uses pointer arithmetic.
+  {
+    FieldReader fr(MemPool::threadLocal(), postingsReader);
+    ASSERT_TRUE(fr.seek("uniform_ssc"));
+    SegFieldInfo sfi;
+    fr.readFieldInfo(sfi);
+    ASSERT_EQ(0, sfi.mono2Loc.offset()) << "expected no endOffsetReader for fixed-size";
+    ASSERT_EQ(8, sfi.mono2MetaOff);
+
+    StrColReader strReader(postingsReader, sfi);
+    ASSERT_TRUE(strReader.isFixedSize());
+    ASSERT_EQ(8, strReader.fixedValueSize());
+
+    StrColReader::DocValues docValues(strReader);
+    for (int i = 0; i < N; i++) {
+      ASSERT_EQ(fixValues[i], docValues.valueAt(i)) << "fixed-size valueAt mismatch at " << i;
+    }
+  }
 }
 

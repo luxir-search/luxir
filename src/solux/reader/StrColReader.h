@@ -115,6 +115,51 @@ public:
     return endRankReader->valuesAt(docRank);
   }
 
+  /// Per-doc value accessor for sparse doc access patterns (e.g. top-K hits).
+  /// For each matched doc the caller typically reads all values in the doc's rank
+  /// range - those reads cluster in the endOffsetReader, so caching a sub-block of
+  /// offsets avoids repeated block decodes.  Internally wraps MonoReader::BulkValues
+  /// over the endOffsetReader (variable-size); for fixed-size columns it degrades to
+  /// pointer arithmetic.
+  ///
+  /// Use this over the non-caching StrColReader::valueAt() for multi-value fields
+  /// where you retrieve all values for a document.
+  ///
+  /// For high-density access (iterating every doc in the segment) a future BulkValues
+  /// class that also bulks the endRankReader would be a better fit.
+  ///
+  /// Valid as long as the parent StrColReader is valid.  Not thread-safe (one cache
+  /// slot); callers that need concurrent access should construct one per thread.
+  class DocValues {
+    std::optional<MonoReader::BulkValues> offsets;  // absent for fixed-size
+    const char* valuesData;
+    int64_t nvals;
+    int32_t fixedSize;
+  public:
+    DocValues(const StrColReader& reader)
+      : valuesData(reader.valuesData), nvals(reader.nvals), fixedSize(reader.fixedSize) {
+      if (reader.endOffsetReader) {
+        offsets.emplace(*reader.endOffsetReader);
+      }
+    }
+
+    int64_t numValues() const { return nvals; }
+
+    std::string_view valueAt(int64_t valueRank) {
+      assert(valueRank >= 0 && valueRank < nvals);
+      if (!offsets) {
+        int64_t startOffset = valueRank * fixedSize;
+        return std::string_view(valuesData + startOffset, fixedSize);
+      }
+      // MonoReader::BulkValues::valueAt caches a 128-value sub-block.  valueRank-1 and
+      // valueRank usually land in the same cache window, so this is one block decode
+      // (on miss) plus two array reads.
+      int64_t startOffset = valueRank > 0 ? offsets->valueAt(valueRank - 1) : 0;
+      int64_t endOffset = offsets->valueAt(valueRank);
+      return std::string_view(valuesData + startOffset, endOffset - startOffset);
+    }
+  };
+
   /// Iterator over documents with string values.
   class DocIterator {
   private:
@@ -214,11 +259,14 @@ public:
 
   /// Get multi-valued string values for a sorted range of docids.
   /// Calls callback(size_t input_index, int32_t docid, std::string_view value, int64_t valIdx, int64_t numVals)
-  /// for each value of each docid that has values.
+  /// for each value of each docid that has values.  Within-doc value access goes through
+  /// DocValues so consecutive values share a block decode.  The endRankReader is still
+  /// accessed sparsely (once per matched doc), appropriate for top-K style callers.
   static void getMultiValues(MemPool& pool, PostingsReader& postingsReader, SegFieldInfo& segFieldInfo,
                              std::ranges::input_range auto&& sortedDocIds, auto&& callback) {
     StrColReader strColReader(postingsReader, segFieldInfo);
     StrColReader::Iterator iter(strColReader);
+    StrColReader::DocValues docValues(strColReader);
 
     int32_t foundid = -1;
     size_t idx = 0;
@@ -230,8 +278,7 @@ public:
         auto [startRank, endRank] = iter.valueRange();
         int64_t numVals = endRank - startRank;
         for (int64_t v = 0; v < numVals; v++) {
-          auto val = strColReader.valueAt(startRank + v);
-          callback(idx, docid, val, v, numVals);
+          callback(idx, docid, docValues.valueAt(startRank + v), v, numVals);
         }
       } else if (foundid == StrColReader::Iterator::ENDDOC) {
         break;
