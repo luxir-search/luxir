@@ -1,0 +1,210 @@
+#pragma once
+
+#include <lz4.h>
+#include <string_view>
+#include <vector>
+
+#include "FieldReader.h"
+#include "IntColReader.h"
+#include "Postings.h"
+#include "PostingsReader.h"
+#include "solux/util/MemPool.h"
+#include "solux/util/StrRef.h"
+
+namespace solux {
+
+// Reader for stored fields written by StoredFieldsWriter.
+// See StoredFieldsWriter.h for the on-disk layout.
+//
+// Usage:
+//   StoredFieldsReader reader(postingsReader, segFieldInfo);
+//   reader.readDoc(docID,
+//     [](std::string_view name, std::span<const std::string_view> values) {
+//       // receives one callback per field; values has one entry for
+//       // single-valued fields and N entries for multi-valued fields
+//     });
+//
+// Not thread-safe (maintains scratch decompression + value-span buffers).
+class StoredFieldsReader {
+public:
+  StoredFieldsReader(PostingsReader& postingsReader, const SegFieldInfo& fieldInfo)
+    : maxDoc_(postingsReader.maxDoc())
+  {
+    assert(fieldInfo.type == FieldType::BIN);
+    assert(fieldInfo.numValues > 0);
+
+    chunkIS = postingsReader.getInputStream(fieldInfo.columnLoc.filenum());
+    chunksStart = (int64_t)fieldInfo.columnLoc.offset();
+    chunksRegionEnd = chunksStart + fieldInfo.columnMetaOff;
+    numChunks_ = (int32_t)fieldInfo.numValues;
+
+    // Read metadata block (field names) which sits at chunksStart + columnMetaOff.
+    const char* metaPtr = chunkIS.ptr(chunksRegionEnd);
+    const char* end = chunkIS.ptr(chunkIS.size());
+    uint32_t numFields = InputStream::readVint(metaPtr, end);
+    fieldNames_.reserve(numFields);
+    for (uint32_t i = 0; i < numFields; i++) {
+      // PackedTerm layout: one-byte length followed by the string bytes.  The
+      // bytes live in the input stream for the reader's lifetime, so a view
+      // is safe.
+      uint8_t len = (uint8_t)*metaPtr;
+      fieldNames_.emplace_back(metaPtr + 1, len);
+      metaPtr += 1 + len;
+    }
+
+    firstDocCol.emplace(postingsReader, fieldInfo.monoLoc, fieldInfo.monoMetaOff, numChunks_);
+    chunkOffsetCol.emplace(postingsReader, fieldInfo.mono2Loc, fieldInfo.mono2MetaOff, numChunks_ + 1);
+  }
+
+  // Call callback(fieldName, values) once for each field stored for docID.
+  // values is a span of all values for that field entry; single-valued fields
+  // yield a one-element span, multi-valued fields yield the full set.
+  // Docs with nothing stored produce no callbacks.
+  template <class Callback>
+  void readDoc(int32_t docID, Callback&& callback) {
+    assert(docID >= 0 && docID < maxDoc_);
+
+    auto [chunkNum, firstDocInChunk] = findChunk(docID);
+    int32_t firstDocInNext = (chunkNum + 1 < numChunks_)
+        ? (int32_t)firstDocCol->valueAt(chunkNum + 1)
+        : maxDoc_;
+    int32_t numDocsInChunk = firstDocInNext - firstDocInChunk;
+    int32_t docIndex = docID - firstDocInChunk;
+    assert(docIndex >= 0 && docIndex < numDocsInChunk);
+
+    decompressChunk(chunkNum);
+
+    const char* buf = scratch.data();
+    const int32_t* offsets = reinterpret_cast<const int32_t*>(buf);
+    int32_t docStart = offsets[docIndex];
+    int32_t docEnd = (docIndex + 1 < numDocsInChunk)
+        ? offsets[docIndex + 1]
+        : (int32_t)scratch.size();
+    assert(docStart <= docEnd);
+
+    const char* p = buf + docStart;
+    const char* pend = buf + docEnd;
+    uint32_t numFields = InputStream::readVint(p, pend);
+    for (uint32_t i = 0; i < numFields; i++) {
+      uint32_t fid = InputStream::readVint(p, pend);
+      uint32_t numValues = InputStream::readVint(p, pend);
+      assert(fid < fieldNames_.size());
+      std::string_view fieldName = fieldNames_[fid];
+      valueSpanScratch.resize(0);
+      valueSpanScratch.reserve(numValues);
+      for (uint32_t v = 0; v < numValues; v++) {
+        uint32_t length = InputStream::readVint(p, pend);
+        valueSpanScratch.emplace_back(p, length);
+        p += length;
+      }
+      callback(fieldName, std::span<const std::string_view>(valueSpanScratch));
+    }
+    assert(p == pend);
+  }
+
+  int32_t numChunks() const { return numChunks_; }
+  int32_t maxDoc() const { return maxDoc_; }
+
+  // Try to open a StoredFieldsReader for the given resource name in the
+  // segment (default: Postings::STORED_DEFAULT_RESOURCE).  Returns nullptr
+  // if that resource isn't present in the segment.  The FieldReader used
+  // for the lookup is transient — no persistent pool allocations.
+  static std::unique_ptr<StoredFieldsReader> open(
+      PostingsReader& postingsReader,
+      std::string_view resourceName = Postings::STORED_DEFAULT_RESOURCE) {
+    auto& pool = MemPool::threadLocal();
+    auto guard = pool.rewindScopeGuard();
+    FieldReader fieldReader(pool, postingsReader);
+    if (!fieldReader.seek(resourceName)) {
+      return nullptr;
+    }
+    SegFieldInfo fi;
+    fieldReader.readFieldInfo(fi);
+    return std::make_unique<StoredFieldsReader>(postingsReader, fi);
+  }
+
+private:
+  struct ChunkLookup {
+    int32_t chunkNum;
+    int32_t firstDocID;
+  };
+
+  // Interpolation search for the largest chunkNum where
+  // firstDocCol[chunkNum] <= docID.  Chunk size is variable (capped by
+  // uncompressed bytes or doc count), but within a single segment the
+  // docs-per-chunk distribution is usually narrow, so a proportion-based
+  // first guess lands close to the correct chunk and the linear adjust
+  // usually walks zero or one steps.  MonoReader's valueAt is O(1) per
+  // probe but not free (block decode + interpolation), so we only read it
+  // on the probes we actually need.  Worst case (highly skewed doc sizes)
+  // degrades to linear scan from the first guess.
+  //
+  // Returns both the chunk number and the chunk's first docID, which the
+  // caller uses without a redundant valueAt().
+  ChunkLookup findChunk(int32_t docID) const {
+    assert(numChunks_ > 0);
+    int32_t guess = (int32_t)((int64_t)docID * numChunks_ / maxDoc_);
+    if (guess >= numChunks_) guess = numChunks_ - 1;
+    if (guess < 0) guess = 0;
+
+    int32_t firstDoc = (int32_t)firstDocCol->valueAt(guess);
+    if (firstDoc <= docID) {
+      // Walk forward while the next chunk's first doc is also <= docID.
+      // If we advance at all, the new position was already confirmed by
+      // this very probe — no need to verify backward afterwards.
+      while (guess + 1 < numChunks_) {
+        int32_t nextFirst = (int32_t)firstDocCol->valueAt(guess + 1);
+        if (nextFirst > docID) break;
+        guess++;
+        firstDoc = nextFirst;
+      }
+    } else {
+      // Initial guess was too high; walk backward until firstDoc <= docID.
+      do {
+        assert(guess > 0);  // chunk 0's firstDoc is 0 <= any valid docID
+        guess--;
+        firstDoc = (int32_t)firstDocCol->valueAt(guess);
+      } while (firstDoc > docID);
+    }
+    return {guess, firstDoc};
+  }
+
+  void decompressChunk(int32_t chunkNum) {
+    if (chunkNum == cachedChunkNum) {
+      return;
+    }
+    int64_t off = chunkOffsetCol->valueAt(chunkNum);
+    int64_t nextOff = chunkOffsetCol->valueAt(chunkNum + 1);
+
+    const char* chunkPtr = chunkIS.ptr(chunksStart + off);
+    int32_t uncompressedSize;
+    memcpy(&uncompressedSize, chunkPtr, sizeof(int32_t));
+    chunkPtr += sizeof(int32_t);
+    int32_t compressedSize = (int32_t)(nextOff - off) - (int32_t)sizeof(int32_t);
+
+    scratch.resize((size_t)uncompressedSize);
+    int decoded = LZ4_decompress_safe(
+        chunkPtr, scratch.data(), compressedSize, uncompressedSize);
+    if (decoded != uncompressedSize) {
+      throw std::runtime_error("StoredFieldsReader: LZ4 decompression failed");
+    }
+    cachedChunkNum = chunkNum;
+  }
+
+  InputStream chunkIS;
+  int64_t chunksStart = 0;
+  int64_t chunksRegionEnd = 0;
+  int32_t numChunks_ = 0;
+  int32_t maxDoc_ = 0;
+
+  std::vector<std::string_view> fieldNames_;
+
+  std::optional<MonoReader> firstDocCol;     // chunkN -> firstDocID
+  std::optional<MonoReader> chunkOffsetCol;  // chunkN -> file offset (numChunks+1 entries)
+
+  std::vector<char> scratch;
+  std::vector<std::string_view> valueSpanScratch;
+  int32_t cachedChunkNum = -1;
+};
+
+}  // namespace solux

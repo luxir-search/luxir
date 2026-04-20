@@ -1,10 +1,12 @@
 #pragma once
 
 #include <algorithm>
+#include <boost/unordered/unordered_flat_map.hpp>
 #include <gtl/phmap.hpp>
 #include "solux/util/MemPool.h"
 #include "solux/schema/Schema.h"
 #include "PostingsWriter.h"
+#include "StoredFieldsWriter.h"
 
 // so IndexHandler can consume protobuf types
 #include "SortedDeletes.h"
@@ -221,6 +223,24 @@ public:
 
 private:
   IndexHandler* idHandler_ = nullptr;  // cached pointer to the IdHandler, set in createIndexHandler
+  // Stored-fields writers, keyed by resource name.  Lazily populated when
+  // fields with the STORED flag are first indexed.  PackedTermHash/Equal
+  // give transparent lookup by string_view/PackedTerm/std::string.
+  boost::unordered_flat_map<std::string, std::unique_ptr<StoredFieldsWriter>,
+                            PackedTermHash, PackedTermEqual> storedFields_;
+
+  // Get-or-create the StoredFieldsWriter for the named resource (column
+  // family).  config may be null to use defaults.  Called from
+  // createIndexHandler when wrapping a STORED field.
+  StoredFieldsWriter& getOrCreateStoredFields(std::string_view resourceName,
+                                              const StoredFieldType* config) {
+    auto it = storedFields_.find(resourceName);
+    if (it != storedFields_.end()) return *it->second;
+    auto writer = std::make_unique<StoredFieldsWriter>(postingsWriter, resourceName, config);
+    auto [newIt, _] = storedFields_.emplace(std::string(resourceName), std::move(writer));
+    return *newIt->second;
+  }
+
   IndexHandler& createIndexHandler(const std::string_view name);
 
 };

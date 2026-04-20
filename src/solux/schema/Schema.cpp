@@ -161,6 +161,10 @@ std::shared_ptr<Schema> Schema::fromProto(const proto::SchemaDef& def, const Sch
   if (base) {
     for (const auto& [name, ft] : base->fieldTypeMap) {
       if (defMap.contains(name)) continue;
+      // StoredFieldType entries aren't user fields and have no proto form;
+      // they're already preserved via the earlier fieldTypeMap = base->fieldTypeMap
+      // copy, so skip the resolve pipeline for them.
+      if (dynamic_cast<const StoredFieldType*>(ft.get()) != nullptr) continue;
       ResolvedField r;
       r.abstract = ft->isAbstract();
       r.hasFieldClass = true;
@@ -265,12 +269,27 @@ std::shared_ptr<Schema> Schema::fromProto(const proto::SchemaDef& def, const Sch
     schema->fieldTypeMap[name] = std::move(ft);
   }
 
+  // Ensure the default stored-fields resource is available in every schema.
+  // StoredFieldType entries are not serialized through proto (see toProto),
+  // so we materialize the default unconditionally on load.  Users who have
+  // registered named column families must re-add them programmatically.
+  std::string defaultName(Postings::STORED_DEFAULT_RESOURCE);
+  if (schema->fieldTypeMap.find(defaultName) == schema->fieldTypeMap.end()) {
+    schema->fieldTypeMap[defaultName] = std::make_shared<StoredFieldType>(defaultName);
+  }
+
   return schema;
 }
 
 
 void Schema::toProto(proto::SchemaDef* def) const {
   for (const auto& [name, ft] : fieldTypeMap) {
+    // StoredFieldType entries describe per-segment stored-fields resources.
+    // They're managed in-memory (fromProto re-adds the default "_stored_");
+    // custom per-resource config doesn't round-trip through proto yet.
+    if (dynamic_cast<const StoredFieldType*>(ft.get()) != nullptr) {
+      continue;
+    }
     auto* fieldDef = def->add_fields();
     fieldDef->set_name(name);
     fieldDef->set_abstract(ft->isAbstract());
@@ -363,6 +382,9 @@ std::shared_ptr<Schema> Schema::createDefaultSchema() {
   addField("_w", proto::FieldDef::TEXT, true, true, false, false, "nocopy_whitespace");
   addField("_wl", proto::FieldDef::TEXT, true, true, false, false, "whitespace", {"lowercase"});
 
+  // fromProto ensures the default "_stored_" resource is present.  Users can
+  // override or add additional named resources (e.g. "_stored_paragraphs_")
+  // by inserting entries in fieldTypeMap before using the schema.
   return fromProto(def);
 }
 

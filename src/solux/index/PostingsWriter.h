@@ -246,7 +246,21 @@ private:
 
     auto fieldsStart = fieldOutput.size();  // where this index starts
 
-    for (auto& finfo : fieldInfos) {
+    // FieldReader::seek does a binary search over the field offsets array, so
+    // fields must be written in sorted name order.  Callers that flush fields
+    // in sorted order already satisfy this, but some resources (like
+    // stored-fields) are appended at the very end of flush; sort defensively
+    // here to support arbitrary addField ordering.
+    std::vector<IndexFieldInfo*> sortedInfos;
+    sortedInfos.reserve(fieldInfos.size());
+    for (auto& fi : fieldInfos) sortedInfos.push_back(&fi);
+    std::sort(sortedInfos.begin(), sortedInfos.end(),
+              [](const IndexFieldInfo* a, const IndexFieldInfo* b) {
+                return a->fieldname < b->fieldname;
+              });
+
+    for (auto* finfoPtr : sortedInfos) {
+      auto& finfo = *finfoPtr;
       auto fieldLoc = fieldOutput.size();
       fieldOffs.push_back(fieldLoc - fieldsStart);  // make the location relative so we can append this to a large file if necessary
 

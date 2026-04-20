@@ -2,7 +2,9 @@
 #include "IndexWriter.h"
 #include "OrdCollector.h"
 #include "OrdColWriter.h"
+#include "StoredFieldsWriter.h"
 #include "solux/reader/DocsEnum.h"
+#include "solux/reader/StoredFieldsReader.h"
 #include "solux/reader/StrColReader.h"
 #include "solux/search/IndexReader.h"
 
@@ -229,6 +231,17 @@ private:
     auto poolGuard = MemPool::threadLocalPoolGuard();
     auto& pool = poolGuard.pool();
 
+    // Stored-fields resources are segment-wide rather than normal per-field
+    // columns.  Route each one (default or named column family) to a
+    // dedicated merger.  Recognize them by the combination of type=BIN and
+    // flags=STORED set by StoredFieldsWriter::finish().
+    const auto& firstInfo = mergeFieldInfos[0].segFieldInfo;
+    if (firstInfo.type == FieldType::BIN
+        && (firstInfo.flags & FieldType::STORED) != 0) {
+      mergeStoredFields(mergeFieldInfos);
+      return;
+    }
+
     // sort mergeFieldInfos so we can add docids low to high.
     // This is a simple O(n+m) sort where n=number of segments and m is number of segments with this specific field.
     // Simply slot the field into it's place and then compact.
@@ -361,6 +374,51 @@ private:
     }
   }
 
+
+  // Merge one stored-fields resource (default or named column family).
+  // Decompresses each source segment's live docs in merged-docID order and
+  // re-emits them via a fresh StoredFieldsWriter for the same resource name.
+  // Multi-valued fields are preserved as single addValues calls so the
+  // on-disk grouping survives the merge.  Verbatim chunk-copy optimization
+  // is a follow-up.
+  void mergeStoredFields(std::vector<MergeFieldInfo>& mergeFieldInfos) {
+    // Resource name comes from the (identical across segments) field name.
+    std::string_view resourceName(mergeFieldInfos[0].segFieldInfo.fieldname);
+
+    // Build a per-segment reader vector indexed by seg ord.  Null for segments
+    // whose source had no stored-fields resource.
+    std::vector<std::unique_ptr<StoredFieldsReader>> readers(segs.size());
+    for (auto& mfi : mergeFieldInfos) {
+      auto ord = mfi.seg->ord;
+      readers[ord] = std::make_unique<StoredFieldsReader>(
+          *mfi.seg->postingsReader, mfi.segFieldInfo);
+    }
+
+    // Config isn't threaded through the merger yet; writer uses defaults.
+    // When per-family codec/chunk-size becomes meaningful, look up the
+    // StoredFieldType in the current schema here.
+    StoredFieldsWriter writer(postingsWriter, resourceName);
+
+    for (auto& seg : segs) {
+      auto* reader = readers[seg.ord].get();
+      if (!reader) continue;  // segment had no stored-fields; writer pads automatically
+      int32_t maxDocIn = seg.postingsReader->maxDoc();
+      for (int32_t localId = 0; localId < maxDocIn; localId++) {
+        auto [mappedDoc, isDeleted] = seg.remapDocId(localId);
+        if (isDeleted) continue;
+        reader->readDoc(localId,
+            [&](std::string_view name, std::span<const std::string_view> values) {
+          if (values.size() == 1) {
+            writer.addValue(mappedDoc, name, values[0]);
+          } else {
+            writer.addValues(mappedDoc, name, values);
+          }
+        });
+      }
+    }
+
+    writer.finish(postingsWriter.getMaxDoc());
+  }
 
   void mergeIntCol(std::span<MergeFieldInfo*> sortedFields, PostingsWriter& postingsWriter,
                    PostingsWriter::IndexFieldInfo& outputFieldInfo) {

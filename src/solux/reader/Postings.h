@@ -24,6 +24,11 @@ public:
   static constexpr std::string_view PREFIX_FNAME = "s";         // prefix for all data files
   static constexpr std::string_view SOLUX_HEADER = "SOLUX001";  // every data file starts with this header
 
+  // Reserved field name under which the default stored-fields resource is
+  // registered in a segment's per-field index.  Named column families live
+  // in this namespace too (e.g. "_stored_paragraphs_").
+  static constexpr std::string_view STORED_DEFAULT_RESOURCE = "_stored_";
+
 
   // Create a sortable string from a number.  It's currently
   // a base36 representation prefixed with the number of digits-1 to make it sort correctly.

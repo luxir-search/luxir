@@ -1,8 +1,10 @@
 #pragma once
 
 #include "solux/analysis/Analyzer.h"
+#include "solux/reader/Postings.h"
 
 #include <memory>
+#include <string>
 #include <vector>
 
 namespace solux {
@@ -38,6 +40,7 @@ public:
   static constexpr flag_type COLUMN_STORED = (1 << 7);  // Set if the field has values stored in a columnar format
   static constexpr flag_type FIXED_SIZE = (1 << 8);     // if all values have the same size in bytes (for otherwise variable-length fields)
   static constexpr flag_type ABSTRACT = (1 << 9);       // Abstract fields are only usable via suffix matching or inheritance
+  static constexpr flag_type STORED = (1 << 10);        // Set if the field's raw values are kept in the segment's stored-fields resource for per-doc retrieval
 
   const FieldType::Type type_;
   const std::string name_;
@@ -81,6 +84,8 @@ public:
 
   bool hasColumn() { return (bool) (flags_ & COLUMN_STORED); }
 
+  bool isStored() { return (bool) (flags_ & STORED); }
+
   // TODO: how to share analyzers (potentially expensive) among FieldTypes?
   // One way: Have a parent FieldType in the constructor.
 };
@@ -90,6 +95,10 @@ class TextFieldType : public FieldType {
 public:
   std::string tokenizer_;                // e.g., "whitespace", "nocopy_whitespace", "keyword"
   std::vector<std::string> filters_;     // e.g., {"lowercase"}
+  // When STORED is set, the raw value is routed to the stored-fields resource
+  // with this name (default: Postings::STORED_DEFAULT_RESOURCE).  Look the
+  // resource up in the schema to get its config (codec, chunk size).
+  std::string storedResource_ = std::string(Postings::STORED_DEFAULT_RESOURCE);
 
   TextFieldType(std::string_view name, int flags=INDEX_DOCS_FREQS_POSITIONS,
                 std::string_view tokenizer = "whitespace", std::vector<std::string> filters = {})
@@ -143,6 +152,32 @@ class IdFieldType : public FieldType {
 public:
   IdFieldType(std::string_view name, int flags=INDEX_DOCS | COLUMN_STORED) : FieldType(name, FieldType::ID, flags) {
   }
+};
+
+// Describes a stored-fields resource (a per-segment column of LZ4-compressed
+// whole-doc chunks).  Registered in the schema under the resource's own name
+// (e.g. "_stored_" for the default, "_stored_paragraphs_" for a named family).
+// TextFieldType::storedResource_ names which StoredFieldType a STORED text
+// field flushes into.
+class StoredFieldType : public FieldType {
+public:
+  // Codec name.  Only "lz4" is supported in v1; reserved slot for future
+  // codecs (e.g. zstd with a trained dictionary).
+  std::string codec_;
+  // Target uncompressed bytes per chunk before flushing.
+  size_t chunkTargetUncompressed_;
+  // Hard cap on docs per chunk.  A chunk flushes when *either* the byte
+  // target or this doc count is reached, whichever comes first.
+  size_t maxDocsPerChunk_;
+
+  explicit StoredFieldType(std::string_view name,
+                           std::string_view codec = "lz4",
+                           size_t chunkTargetUncompressed = 16 * 1024,
+                           size_t maxDocsPerChunk = 128)
+    : FieldType(name, FieldType::BIN, FieldType::STORED),
+      codec_(codec),
+      chunkTargetUncompressed_(chunkTargetUncompressed),
+      maxDocsPerChunk_(maxDocsPerChunk) {}
 };
 
 // Special FieldType for score sorting

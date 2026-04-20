@@ -7,6 +7,7 @@
 // include the actual index handlers
 #include "handler/IdHandler.h"
 #include "handler/StrColHandler.h"
+#include "handler/StoredFieldWrapperHandler.h"
 #include "solux/index/handler/IntColHandler.h"
 #include "solux/index/handler/StrHandler.h"
 #include "solux/index/handler/FullTextHandler.h"
@@ -84,6 +85,34 @@ Inverter::IndexHandler& Inverter::createIndexHandler(const std::string_view name
   }
 
 
+  // Wrap in a StoredFieldWrapperHandler if the field should also have its raw
+  // values persisted to a stored-fields resource.  v1 only stores TEXT-typed
+  // fields; other types with STORED set are ignored here (STORED on numeric
+  // fields is currently indistinguishable from COLUMN_STORED, which the
+  // normal handler already provides).  The text field selects its target
+  // resource via TextFieldType::storedResource_; config for that resource is
+  // looked up in the schema (a StoredFieldType), falling back to defaults.
+  if (fieldType->isStored() && fieldType->type() == FieldType::Type::TEXT) {
+    auto* textFt = static_cast<TextFieldType*>(fieldType.get());
+    const std::string& resName = textFt->storedResource_;
+    const StoredFieldType* resConfig = nullptr;
+    auto resIt = currSchema->getFieldType(resName);
+    if (resIt != currSchema->end()) {
+      resConfig = dynamic_cast<const StoredFieldType*>(resIt->second.get());
+      if (resConfig == nullptr) {
+        throw std::runtime_error(
+            "Field '" + std::string(name) + "' has STORED set and references '"
+            + resName + "', but that schema entry is not a StoredFieldType");
+      }
+    }
+    // resConfig == nullptr means the resource isn't in the schema; writer
+    // will use defaults.  fromProto auto-registers "_stored_", so this only
+    // happens for custom-named resources the user forgot to register.
+    auto& writer = getOrCreateStoredFields(resName, resConfig);
+    fieldHandler = std::make_unique<handler::StoredFieldWrapperHandler>(
+        *this, name, fieldType, std::move(fieldHandler), &writer);
+  }
+
   auto [newIter, inserted] = indexHandlers.try_emplace(name, std::move(fieldHandler));
   assert(inserted);  // we should never (currently) be trying to overwrite an existing handler
   return *(newIter->second);
@@ -111,6 +140,12 @@ bool Inverter::flush(std::vector<std::string>* filenames) {
 
   for (auto fieldHandler : fields) {
     fieldHandler->flush(*this);
+  }
+
+  // Finalize each stored-fields resource (one per column family used this
+  // segment).
+  for (auto& [_, writer] : storedFields_) {
+    writer->finish(getMaxDoc());
   }
 
   // Handle deleted documents if any
