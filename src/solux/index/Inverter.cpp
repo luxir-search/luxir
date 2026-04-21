@@ -85,30 +85,33 @@ Inverter::IndexHandler& Inverter::createIndexHandler(const std::string_view name
   }
 
 
-  // Wrap in a StoredFieldWrapperHandler if the field should also have its raw
-  // values persisted to a stored-fields resource.  v1 only stores TEXT-typed
-  // fields; other types with STORED set are ignored here (STORED on numeric
-  // fields is currently indistinguishable from COLUMN_STORED, which the
-  // normal handler already provides).  The text field selects its target
-  // resource via TextFieldType::storedResource_; config for that resource is
-  // looked up in the schema (a StoredFieldType), falling back to defaults.
-  if (fieldType->isStored() && fieldType->type() == FieldType::Type::TEXT) {
-    auto* textFt = static_cast<TextFieldType*>(fieldType.get());
-    const std::string& resName = textFt->storedResource_;
+  // Wrap in a StoredFieldWrapperHandler if the field should also have its
+  // raw values persisted to a stored-fields resource.  Applies to TEXT,
+  // STRING, and ID fields.  STORED on numeric fields is currently ignored —
+  // their COLUMN_STORED path already keeps raw values per-doc.
+  //
+  // The target resource is FieldType::storedResource_ (default:
+  // Postings::STORED_DEFAULT_RESOURCE).  Config is looked up in the schema
+  // (a StoredFieldType), falling back to writer defaults if unregistered.
+  if (fieldType->isStored()
+      && (fieldType->type() == FieldType::Type::TEXT
+          || fieldType->type() == FieldType::Type::STRING
+          || fieldType->type() == FieldType::Type::ID)) {
+    const std::string& resourceName = fieldType->storedResource_;
     const StoredFieldType* resConfig = nullptr;
-    auto resIt = currSchema->getFieldType(resName);
+    auto resIt = currSchema->getFieldType(resourceName);
     if (resIt != currSchema->end()) {
       resConfig = dynamic_cast<const StoredFieldType*>(resIt->second.get());
       if (resConfig == nullptr) {
         throw std::runtime_error(
             "Field '" + std::string(name) + "' has STORED set and references '"
-            + resName + "', but that schema entry is not a StoredFieldType");
+            + resourceName + "', but that schema entry is not a StoredFieldType");
       }
     }
     // resConfig == nullptr means the resource isn't in the schema; writer
     // will use defaults.  fromProto auto-registers "_stored_", so this only
     // happens for custom-named resources the user forgot to register.
-    auto& writer = getOrCreateStoredFields(resName, resConfig);
+    auto& writer = getOrCreateStoredFields(resourceName, resConfig);
     fieldHandler = std::make_unique<handler::StoredFieldWrapperHandler>(
         *this, name, fieldType, std::move(fieldHandler), &writer);
   }

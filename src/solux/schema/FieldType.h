@@ -45,6 +45,10 @@ public:
   const FieldType::Type type_;
   const std::string name_;
   flag_type flags_;
+  // When STORED is set, raw values are routed to the stored-fields resource
+  // with this name (default: Postings::STORED_DEFAULT_RESOURCE).  Shared by
+  // TEXT, STRING, and ID.  Ignored by field types that don't support STORED.
+  std::string storedResource_ = std::string(Postings::STORED_DEFAULT_RESOURCE);
 
   // constructor
   FieldType(std::string_view name, FieldType::Type type, int flags) :
@@ -95,10 +99,6 @@ class TextFieldType : public FieldType {
 public:
   std::string tokenizer_;                // e.g., "whitespace", "nocopy_whitespace", "keyword"
   std::vector<std::string> filters_;     // e.g., {"lowercase"}
-  // When STORED is set, the raw value is routed to the stored-fields resource
-  // with this name (default: Postings::STORED_DEFAULT_RESOURCE).  Look the
-  // resource up in the schema to get its config (codec, chunk size).
-  std::string storedResource_ = std::string(Postings::STORED_DEFAULT_RESOURCE);
 
   TextFieldType(std::string_view name, int flags=INDEX_DOCS_FREQS_POSITIONS,
                 std::string_view tokenizer = "whitespace", std::vector<std::string> filters = {})
@@ -157,8 +157,8 @@ public:
 // Describes a stored-fields resource (a per-segment column of LZ4-compressed
 // whole-doc chunks).  Registered in the schema under the resource's own name
 // (e.g. "_stored_" for the default, "_stored_paragraphs_" for a named family).
-// TextFieldType::storedResource_ names which StoredFieldType a STORED text
-// field flushes into.
+// FieldType::storedResource_ names which StoredFieldType a STORED field
+// flushes into.
 class StoredFieldType : public FieldType {
 public:
   // Codec name.  Only "lz4" is supported in v1; reserved slot for future

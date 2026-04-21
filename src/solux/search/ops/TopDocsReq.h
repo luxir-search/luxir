@@ -4,6 +4,7 @@
 #include "solux/query/AllQuery.h"
 #include "solux/query/Query.h"
 #include "solux/reader/IntColReader.h"
+#include "solux/reader/StoredFieldsReader.h"
 #include "solux/reader/StrColReader.h"
 #include "solux/search/Collector.h"
 #include "solux/search/FieldSortCollector.h"
@@ -473,6 +474,11 @@ public:
 
       auto& columnsProto = *docListProto.mutable_columns();
 
+      // Stored-field retrieval is grouped by resource so that multiple stored
+      // fields sharing one resource decompress each chunk only once.
+      boost::unordered_flat_map<std::string_view, std::vector<StoredReq>,
+                                PackedTermHash, PackedTermEqual> storedByResource;
+
       // Let's look at the fields we should retrieve
       for (std::string_view field: qr.topDocsProto.fields()) {
         // should we allow _scores_ as a field name?
@@ -485,20 +491,65 @@ public:
         // look up the field in the schema
         auto& fieldType = *qr.req.schema->getFieldTypeEx(field);
 
+        // Collect any STORED field (column or not) into the candidate map;
+        // the per-resource strategy is decided after the loop.  Rationale:
+        // if some field in a resource is stored-only we'll decompress the
+        // chunk anyway, in which case pulling column-backed peer fields out
+        // of the same chunk is cheaper than doing separate column lookups.
+        auto recordStoredReq = [&](std::string_view resourceName) {
+          std::span<std::string*> starget;
+          std::span<solux::proto::ArrStr*> mtarget;
+          allocStringColumn(columnsProto[field], columnSize, fieldType.multiValued(), starget, mtarget);
+          storedByResource[resourceName].push_back(
+              {field, &fieldType, fieldType.multiValued(), starget, mtarget});
+        };
+
         switch (fieldType.type()) {
           case FieldType::Type::INT: {
             // TODO: how to decide if a column should be sparse?  Allow client to opt-in for sparse columns.
             loadIntCol(qr.req, field, fieldType, segDocs, sortedIdx, segRunLength, columnsProto, tg);
-          } // int field
             break;
+          } // int field
           case FieldType::Type::ID:
           case FieldType::Type::STRING: {
-            loadStrCol(qr.req, field, fieldType, segDocs, sortedIdx, segRunLength, columnsProto, tg);
-          } // string field
+            if (fieldType.isStored()) {
+              recordStoredReq(fieldType.storedResource_);
+            } else if (fieldType.hasColumn()) {
+              loadStrCol(qr.req, field, fieldType, segDocs, sortedIdx, segRunLength, columnsProto, tg);
+            }
+            break;
+          } // string / id field
+          case FieldType::Type::TEXT: {
+            if (fieldType.isStored()) {
+              recordStoredReq(fieldType.storedResource_);
+            }
+            break;
+          }
           default:
             break;
         } // end switch on fieldType
       }  // for each field
+
+      // Per-resource strategy.  If any field in the group is stored-only we
+      // decompress the resource's chunks regardless, so hand the whole
+      // group to loadStoredFields and let it read every field from the
+      // chunk.  If all fields in the group have columns available, skip
+      // stored-fields entirely and read from columns — faster, no
+      // decompression.
+      for (auto& [resourceName, reqs] : storedByResource) {
+        bool anyStoredOnly = std::ranges::any_of(reqs, [](const StoredReq& r) {
+          return !r.fieldType->hasColumn();
+        });
+        if (anyStoredOnly) {
+          loadStoredFields(qr.req, resourceName, std::move(reqs),
+                           segDocs, sortedIdx, segRunLength, tg);
+        } else {
+          for (auto& r : reqs) {
+            loadStrColWithTargets(qr.req, r.fieldName, *r.fieldType, r.starget, r.mtarget,
+                                  segDocs, sortedIdx, segRunLength, tg);
+          }
+        }
+      }
 
       // fill in scores if requested
       if (returnScores) {
@@ -642,135 +693,234 @@ public:
                   SearchResponse::ColumnsType& columnsProto, oneapi::tbb::task_group* tg)
   {
     auto columnSize = segDocs.size();
-    auto& fieldCol = columnsProto[field];  // output Column in the protobuf
-    std::span<std::string*> starget; // single valued target
-    std::span<solux::proto::ArrStr*> mtarget;  // multi-valued target
+    if (columnSize == 0) return;
+    std::span<std::string*> starget;
+    std::span<solux::proto::ArrStr*> mtarget;
+    allocStringColumn(columnsProto[field], columnSize, fieldType.multiValued(), starget, mtarget);
+    loadStrColWithTargets(req, field, fieldType, starget, mtarget, segDocs, sortedIdx, segRunLength, tg);
+  }
 
-    proto::Val valll;
+  // Per-segment body of loadStrCol.  Reads the field's column for one
+  // segment and writes values into starget (single) or mtarget (multi).
+  // No-op if the field isn't in the segment.  Extracted so the stored-fields
+  // path can fall back here when a segment predates the STORED flag.
+  void loadStrColForSegment(SearchRequest& req, std::string_view field, FieldType& fieldType,
+                            std::span<uint8_t> idxSpan, std::ranges::input_range auto& segDocs,
+                            std::span<std::string*> starget, std::span<solux::proto::ArrStr*> mtarget)
+  {
+    auto sortedSegDocs = idxSpan | std::views::transform([&segDocs](auto idx) { return segDocs[idx]; });
+    auto segNum = sortedSegDocs[0].segment();
+    auto sortedDocs = sortedSegDocs | std::views::transform([](const auto& sd) { return sd.docId(); });
 
-    // If no documents, skip this field
-    if (columnSize == 0) {
+    auto& postingsReader = req.reader->segments()[segNum].postingsReader();
+    auto poolGuard = MemPool::threadLocalPoolGuard();
+    FieldReader fieldReader(poolGuard.pool(), postingsReader);
+    bool found = fieldReader.seek(field);
+    if (!found) {
       return;
     }
-    
+    SegFieldInfo segFieldInfo;
+    fieldReader.readFieldInfo(segFieldInfo);
+
+    bool isIndexedString = (segFieldInfo.flags & FieldType::INDEX_DOCS) != 0;
+
     if (!fieldType.multiValued()) {
+      if (isIndexedString) {
+        TermsEnum tenum(poolGuard.pool(), postingsReader, segFieldInfo);
+        auto valHandler = [&](size_t idx, int32_t doc, int64_t val) {
+          assert(segDocs[idxSpan[idx]].docId() == doc && val > 0);
+          tenum.seekOrd((int32_t) val - 1);
+          *starget[idxSpan[idx]] = (std::string_view) tenum.term();
+        };
+        IntColReader::getSingleValues(poolGuard.pool(), postingsReader, segFieldInfo, sortedDocs, valHandler);
+      } else {
+        auto valHandler = [&](size_t idx, int32_t doc, std::string_view val) {
+          assert(segDocs[idxSpan[idx]].docId() == doc);
+          *starget[idxSpan[idx]] = std::string(val);
+        };
+        StrColReader::getValues(poolGuard.pool(), postingsReader, segFieldInfo, sortedDocs, valHandler);
+      }
+    } else {
+      if (isIndexedString) {
+        TermsEnum tenum(poolGuard.pool(), postingsReader, segFieldInfo);
+        auto valHandler = [&](size_t idx, int32_t doc, int64_t val, int64_t valIdx, int64_t numVals) {
+          assert(segDocs[idxSpan[idx]].docId() == doc && val > 0);
+          solux::proto::ArrStr& target = *mtarget[idxSpan[idx]];
+          if (valIdx == 0) target.mutable_v()->Reserve(numVals);
+          tenum.seekOrd((int32_t) val - 1);
+          auto v = (std::string_view) tenum.term();
+          auto* strProto = target.mutable_v()->Add();
+          *strProto = v;
+        };
+        IntColReader::getValues(poolGuard.pool(), postingsReader, segFieldInfo, sortedDocs, valHandler);
+      } else {
+        auto valHandler = [&](size_t idx, int32_t doc, std::string_view val, int64_t valIdx, int64_t numVals) {
+          assert(segDocs[idxSpan[idx]].docId() == doc);
+          solux::proto::ArrStr& target = *mtarget[idxSpan[idx]];
+          if (valIdx == 0) target.mutable_v()->Reserve(numVals);
+          auto* strProto = target.mutable_v()->Add();
+          *strProto = std::string(val);
+        };
+        StrColReader::getMultiValues(poolGuard.pool(), postingsReader, segFieldInfo, sortedDocs, valHandler);
+      }
+    }
+  }
+
+  // One stored-field retrieval request.  Collected per-field during dispatch
+  // then grouped by resource so each (resource, segment) pair is served by a
+  // single StoredFieldsReader — one chunk decompression covers all fields
+  // sharing the resource.
+  struct StoredReq {
+    std::string_view fieldName;
+    FieldType* fieldType;
+    // Exactly one of starget / mtarget is populated (selected by multi flag).
+    bool multi;
+    std::span<std::string*> starget;
+    std::span<solux::proto::ArrStr*> mtarget;
+  };
+
+  // Allocate the output Column (col_s or multi_s) for a TEXT/STRING field
+  // and return spans into its internal storage.  Used by both column
+  // retrieval (loadStrCol) and stored retrieval — the output proto shape is
+  // identical in both cases.  Leaves spans empty when columnSize is 0.
+  void allocStringColumn(solux::proto::Column& fieldCol, size_t columnSize, bool multi,
+                         std::span<std::string*>& starget,
+                         std::span<solux::proto::ArrStr*>& mtarget)
+  {
+    if (columnSize == 0) return;
+    if (!multi) {
       auto& strCol = *fieldCol.mutable_col_s();
       auto& stringsProto = *strCol.mutable_v();
       stringsProto.Reserve(columnSize);
-      std::string missingVal;
-      // under the covers, the vector contains pointers, not elements (i.e. vector<std::string*>)
-      for (auto i = 0u; i < columnSize; i++) {
-        stringsProto.Add("");
-      }
-      auto* arrstart = stringsProto.mutable_data();
-      starget = {arrstart, (size_t)columnSize};
+      for (auto i = 0u; i < columnSize; i++) stringsProto.Add("");
+      starget = {stringsProto.mutable_data(), (size_t)columnSize};
     } else {
-      // multi-valued field type (even if only one value per doc currently)
       auto& strCol = *fieldCol.mutable_multi_s();
-      auto& arrArrProto = *strCol.mutable_v();  // v is a repeated ArrStr
+      auto& arrArrProto = *strCol.mutable_v();
       arrArrProto.Reserve(columnSize);
-      for (auto i = 0u; i < columnSize; i++) {
-        arrArrProto.Add();
-      }
-      // arrArrProto is implemented as a vector<ArrStr*> under the covers (RepeatedPtrField), so our span
-      // should be of pointers.
-      solux::proto::ArrStr** arrstart = arrArrProto.mutable_data();
-      assert(&arrArrProto.Get(columnSize-1) == arrstart[columnSize-1]); // sanity check that arr is actually contiguous.
-      mtarget = {arrstart, columnSize};
+      for (auto i = 0u; i < columnSize; i++) arrArrProto.Add();
+      mtarget = {arrArrProto.mutable_data(), columnSize};
     }
+  }
 
-
-    // iterate over the segment runs, loading values for each segment (possibly in a new task)
+  // loadStrCol when the output spans are already allocated (by the caller's
+  // earlier allocStringColumn).  Dispatches one per-segment task per run.
+  void loadStrColWithTargets(SearchRequest& req, std::string_view field, FieldType& fieldType,
+                             std::span<std::string*> starget, std::span<solux::proto::ArrStr*> mtarget,
+                             std::ranges::input_range auto& segDocs, std::span<uint8_t> sortedIdx,
+                             const std::span<uint8_t> segRunLength, oneapi::tbb::task_group* tg)
+  {
     int32_t start = 0;
-    for(auto runlen : segRunLength) {
+    for (auto runlen : segRunLength) {
       auto idxSpan = sortedIdx.subspan(start, runlen);
-      // capture by-value parameters by-value again since this method will return before the lambda is executed.
-      // also capture anything on the stack in this function by-value.
       task_group_run(tg, [this, idxSpan, &req, field, &fieldType, &segDocs, starget, mtarget]() {
+        loadStrColForSegment(req, field, fieldType, idxSpan, segDocs, starget, mtarget);
+      });
+      start += runlen;
+    }
+  }
+
+  // Copy stored values for one doc into a request's output slot.
+  static void storeValuesInReq(const StoredReq& r, size_t slot, std::span<const std::string_view> values) {
+    if (values.empty()) return;
+    if (!r.multi) {
+      *r.starget[slot] = std::string(values[0]);
+    } else {
+      solux::proto::ArrStr& target = *r.mtarget[slot];
+      target.mutable_v()->Reserve((int)values.size());
+      for (auto v : values) {
+        auto* strProto = target.mutable_v()->Add();
+        *strProto = std::string(v);
+      }
+    }
+  }
+
+  // Dispatch stored-fields retrieval for all fields that share one
+  // resource.  Each segment run launches a single task that opens one
+  // StoredFieldsReader and decodes every field in the group from the
+  // shared decompressed chunk.
+  //
+  // Per-segment the group is partitioned into (a) fields that exist in the
+  // segment's stored-fields resource — served from the chunk — and
+  // (b) fields that don't — served from their column as a fallback, or
+  // left empty if the field also lacks a column.  This handles both
+  // pre-STORED segments (no SFR at all) and partial-stored segments (SFR
+  // present but missing a specific field added later).
+  void loadStoredFields(SearchRequest& req, std::string_view resourceName,
+                        std::vector<StoredReq> reqsOwned,
+                        std::ranges::input_range auto& segDocs, std::span<uint8_t> sortedIdx,
+                        const std::span<uint8_t> segRunLength, oneapi::tbb::task_group* tg)
+  {
+    // Move into a shared_ptr so every segment task can safely reference the
+    // same vector even after this function returns.
+    auto reqs = std::make_shared<std::vector<StoredReq>>(std::move(reqsOwned));
+
+    int32_t start = 0;
+    for (auto runlen : segRunLength) {
+      auto idxSpan = sortedIdx.subspan(start, runlen);
+      task_group_run(tg, [this, idxSpan, &req, resourceName, reqs, &segDocs]() {
         unused(this);
-        // a view of the segdocs for a single segment, in ascending order.
-        auto sortedSegDocs = idxSpan | std::views::transform([&segDocs](auto idx) { return segDocs[idx]; });
-        auto segNum = sortedSegDocs[0].segment();
-        // extract the docids from the sorted segdocs
-        auto sortedDocs = sortedSegDocs | std::views::transform([](const auto& sd) { return sd.docId(); });
-
+        auto segNum = segDocs[idxSpan[0]].segment();
         auto& postingsReader = req.reader->segments()[segNum].postingsReader();
-        auto poolGuard = MemPool::threadLocalPoolGuard();
-        FieldReader fieldReader(poolGuard.pool(), postingsReader);
-        bool found = fieldReader.seek(field);
-        if (!found) {
-          return;
-        }
-        SegFieldInfo segFieldInfo;
-        fieldReader.readFieldInfo(segFieldInfo);
-        
-        // Check if this is an indexed string field or a column-only field
-        bool isIndexedString = (segFieldInfo.flags & FieldType::INDEX_DOCS) != 0;
-        
-        if (!fieldType.multiValued()) {
-          if (isIndexedString) {
-            // Indexed string field - load ordinals and look up strings
-            // we need the terms enum to lookup the string value for each ord
-            TermsEnum tenum(poolGuard.pool(), postingsReader, segFieldInfo);
-            
-            // callback handler to convert ord to string and to put values back in the correct slot.
-            auto valHandler = [&](size_t idx, int32_t doc, int64_t val) {
-              assert(segDocs[idxSpan[idx]].docId() == doc && val > 0);
-              // translate back to the original index
-              // TODO: we could introduce a cache here to avoid repeated lookups for the same term.
-              // it could be map<int64_t, string_view or string*> since the protobuf values won't be moving around.
-              tenum.seekOrd((int32_t) val - 1);  // term ords are 0 based.
-              // LHS is a std::string&, so this makes a copy (which we need to do since tenum.term() will soon be invalidated.)
-              *starget[idxSpan[idx]] = (std::string_view) tenum.term();
-            };
+        auto sfr = StoredFieldsReader::open(postingsReader, resourceName);
 
-            IntColReader::getSingleValues(poolGuard.pool(), postingsReader, segFieldInfo, sortedDocs, valHandler);
-          } else {
-            // Non-indexed string column - load values directly from StrColReader
-            auto valHandler = [&](size_t idx, int32_t doc, std::string_view val) {
-              assert(segDocs[idxSpan[idx]].docId() == doc);
-              *starget[idxSpan[idx]] = std::string(val);
-            };
-            
-            StrColReader::getValues(poolGuard.pool(), postingsReader, segFieldInfo, sortedDocs, valHandler);
+        // Partition reqs: sfrReqs serve from SFR, colReqs fall back to
+        // column.  The fallback is attempted for any STRING/ID field type
+        // (not just fields whose current schema sets hasColumn): older
+        // segments predating a schema change may still have the ord/value
+        // column on disk, and loadStrColForSegment no-ops gracefully if the
+        // field is actually absent.  TEXT fields have no retrievable column
+        // — they stay empty when missing from the segment's SFR.
+        std::vector<StoredReq*> sfrReqs;
+        std::vector<StoredReq*> colReqs;
+        sfrReqs.reserve(reqs->size());
+        for (auto& r : *reqs) {
+          if (sfr && sfr->hasField(r.fieldName)) {
+            sfrReqs.push_back(&r);
+            continue;
+          }
+          auto t = r.fieldType->type();
+          if (t == FieldType::Type::STRING || t == FieldType::Type::ID) {
+            colReqs.push_back(&r);
+          }
+        }
+
+        for (auto* r : colReqs) {
+          loadStrColForSegment(req, r->fieldName, *r->fieldType, idxSpan, segDocs, r->starget, r->mtarget);
+        }
+
+        if (sfrReqs.empty()) return;
+
+        if (sfrReqs.size() == 1) {
+          // Single-field fast path: readFieldById skips other stored
+          // fields in each doc without materializing their value views.
+          // Resolve fid once per segment rather than on every doc call.
+          auto* r = sfrReqs[0];
+          int32_t fid = sfr->fieldId(r->fieldName);
+          assert(fid >= 0);  // partitioning above guarantees presence
+          for (int32_t i = 0; i < (int32_t)idxSpan.size(); i++) {
+            int32_t doc = segDocs[idxSpan[i]].docId();
+            sfr->readFieldById(doc, fid, [&](std::span<const std::string_view> values) {
+              storeValuesInReq(*r, idxSpan[i], values);
+            });
           }
         } else {
-          // multi-valued handling
-          if (isIndexedString) {
-            // Indexed multi-valued strings - use ordinal lookup
-            TermsEnum tenum(poolGuard.pool(), postingsReader, segFieldInfo);
-            auto valHandler = [&](size_t idx, int32_t doc, int64_t val, int64_t valIdx, int64_t numVals) {
-              assert(segDocs[idxSpan[idx]].docId() == doc && val > 0);
-              solux::proto::ArrStr& target = *mtarget[idxSpan[idx]];
-              if (valIdx == 0) {
-                // first value for this doc.
-                target.mutable_v()->Reserve(numVals);
+          // Multi-field path: one readDoc pass per doc, matching each
+          // entry against the sfr-backed request list.  Typical size is
+          // small so a linear scan is fine.
+          for (int32_t i = 0; i < (int32_t)idxSpan.size(); i++) {
+            int32_t doc = segDocs[idxSpan[i]].docId();
+            sfr->readDoc(doc, [&](std::string_view name, std::span<const std::string_view> values) {
+              for (auto* r : sfrReqs) {
+                if (r->fieldName == name) {
+                  storeValuesInReq(*r, idxSpan[i], values);
+                  break;
+                }
               }
-              tenum.seekOrd((int32_t) val - 1);  // term ords are 0 based.
-              auto v = (std::string_view) tenum.term();
-              auto* strProto = target.mutable_v()->Add();
-              *strProto = v;
-            };
-
-            IntColReader::getValues(poolGuard.pool(), postingsReader, segFieldInfo, sortedDocs, valHandler);
-          } else {
-            // Non-indexed multi-valued string columns (_ssc fields)
-            auto valHandler = [&](size_t idx, int32_t doc, std::string_view val, int64_t valIdx, int64_t numVals) {
-              assert(segDocs[idxSpan[idx]].docId() == doc);
-              solux::proto::ArrStr& target = *mtarget[idxSpan[idx]];
-              if (valIdx == 0) {
-                // first value for this doc.
-                target.mutable_v()->Reserve(numVals);
-              }
-              auto* strProto = target.mutable_v()->Add();
-              *strProto = std::string(val);
-            };
-            
-            StrColReader::getMultiValues(poolGuard.pool(), postingsReader, segFieldInfo, sortedDocs, valHandler);
+            });
           }
         }
       });
-
       start += runlen;
     }
   }

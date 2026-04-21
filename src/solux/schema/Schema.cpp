@@ -18,6 +18,13 @@ struct ResolvedField {
   bool columnStored = false;
   bool hasMultiValued = false;
   bool multiValued = false;
+  bool hasStored = false;
+  bool stored = false;
+  // storedResource: empty string means "inherit from parent or use the
+  // default".  hasStoredResource tracks whether any field in the chain set
+  // it explicitly (even to a value that equals the default).
+  bool hasStoredResource = false;
+  std::string storedResource;
   bool hasAnalyzer = false;
   std::string tokenizer;
   std::vector<std::string> filters;
@@ -90,6 +97,24 @@ static void resolveField(std::string_view name,
   } else {
     r.hasMultiValued = parentResolved.hasMultiValued;
     r.multiValued = parentResolved.multiValued;
+  }
+
+  // stored
+  if (def.has_stored()) {
+    r.hasStored = true;
+    r.stored = def.stored();
+  } else {
+    r.hasStored = parentResolved.hasStored;
+    r.stored = parentResolved.stored;
+  }
+
+  // stored_resource
+  if (def.has_stored_resource() && !def.stored_resource().empty()) {
+    r.hasStoredResource = true;
+    r.storedResource = def.stored_resource();
+  } else {
+    r.hasStoredResource = parentResolved.hasStoredResource;
+    r.storedResource = parentResolved.storedResource;
   }
 
   // analyzer: atomic — first non-empty AnalyzerDef in chain wins
@@ -183,6 +208,13 @@ std::shared_ptr<Schema> Schema::fromProto(const proto::SchemaDef& def, const Sch
       r.columnStored = ft->hasColumn();
       r.hasMultiValued = true;
       r.multiValued = ft->multiValued();
+      r.hasStored = true;
+      r.stored = ft->isStored();
+      // Always capture storedResource_: whether the base field had a
+      // non-default value or the default, the rebuilt FieldType below must
+      // end up with the same value.
+      r.hasStoredResource = true;
+      r.storedResource = ft->storedResource_;
       if (ft->type() == FieldType::TEXT) {
         auto* textFt = (TextFieldType*)(ft.get());
         r.hasAnalyzer = true;
@@ -242,6 +274,7 @@ std::shared_ptr<Schema> Schema::fromProto(const proto::SchemaDef& def, const Sch
     }
     if (columnStored) flags |= FieldType::COLUMN_STORED;
     if (multiValued) flags |= FieldType::MULTI_VALUED;
+    if (r.stored) flags |= FieldType::STORED;
 
     std::shared_ptr<FieldType> ft;
 
@@ -266,6 +299,8 @@ std::shared_ptr<Schema> Schema::fromProto(const proto::SchemaDef& def, const Sch
     }
 
     if (r.abstract) ft->flags_ |= FieldType::ABSTRACT;
+    // Apply any resolved storedResource_ override; empty means "keep default".
+    if (!r.storedResource.empty()) ft->storedResource_ = r.storedResource;
     schema->fieldTypeMap[name] = std::move(ft);
   }
 
@@ -329,6 +364,12 @@ void Schema::toProto(proto::SchemaDef* def) const {
     }
     fieldDef->set_column_stored(ft->hasColumn());
     fieldDef->set_multi_valued(ft->multiValued());
+    fieldDef->set_stored(ft->isStored());
+    // Only emit stored_resource when it deviates from the default — keeps
+    // the serialized schema clean for fields that use "_stored_".
+    if (ft->storedResource_ != Postings::STORED_DEFAULT_RESOURCE) {
+      fieldDef->set_stored_resource(ft->storedResource_);
+    }
 
     // Serialize analyzer for TEXT fields
     if (ft->type() == FieldType::TEXT) {
@@ -351,7 +392,8 @@ std::shared_ptr<Schema> Schema::createDefaultSchema() {
                       bool abstract, bool indexed, bool columnStored,
                       bool multiValued = false,
                       const char* tokenizer = nullptr,
-                      std::vector<std::string> filters = {}) {
+                      std::vector<std::string> filters = {},
+                      bool stored = false) {
     auto* f = def.add_fields();
     f->set_name(name);
     f->set_abstract(abstract);
@@ -359,6 +401,7 @@ std::shared_ptr<Schema> Schema::createDefaultSchema() {
     f->set_indexed(indexed);
     f->set_column_stored(columnStored);
     f->set_multi_valued(multiValued);
+    f->set_stored(stored);
     if (tokenizer) {
       auto* a = f->mutable_analyzer();
       a->set_tokenizer(tokenizer);
@@ -381,6 +424,11 @@ std::shared_ptr<Schema> Schema::createDefaultSchema() {
   addField("_is", proto::FieldDef::INT, true, false, true, true);
   addField("_w", proto::FieldDef::TEXT, true, true, false, false, "nocopy_whitespace");
   addField("_wl", proto::FieldDef::TEXT, true, true, false, false, "whitespace", {"lowercase"});
+  // _t: indexed + stored text for full-text retrieval of original values.
+  // Tokenized with whitespace+lowercase (same as _wl) for query-time matching,
+  // and the raw value is kept in the default stored-fields resource so it can
+  // be returned verbatim in search results.
+  addField("_t", proto::FieldDef::TEXT, true, true, false, false, "whitespace", {"lowercase"}, /*stored=*/true);
 
   // fromProto ensures the default "_stored_" resource is present.  Users can
   // override or add additional named resources (e.g. "_stored_paragraphs_")

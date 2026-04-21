@@ -57,6 +57,42 @@ namespace solux {
 // lookups simple: find chunk by interpolating the first-doc column, then
 // numFieldsInDoc=0 means "nothing stored for this doc".
 class StoredFieldsWriter {
+private:
+  PostingsWriter& postingsWriter;
+  std::string resourceName_;
+  size_t chunkTargetUncompressed_;
+  size_t maxDocsPerChunk_;
+  OutputStreamPtr chunkOutput;
+  int64_t chunksStart = 0;
+
+  // field name -> segment-local stored-field id (transparent lookup avoids
+  // materializing a std::string per addValue call).
+  boost::unordered_flat_map<std::string, uint32_t,
+                            PackedTermHash, PackedTermEqual> fieldNameToId;
+  std::vector<PackedTerm> fieldNames;  // indexed by stored-field id
+
+  // Currently-accumulating doc state.
+  int32_t currentDoc = -1;
+  int32_t currentDocFieldCount = 0;
+  std::string currentDocContent;
+
+  // lastFinalizedDoc is the highest docID that has been written into the
+  // chunk (or -1 initially).  Used for empty-doc padding.
+  int32_t lastFinalizedDoc = -1;
+
+  // Current chunk state.
+  std::string chunkBody;  // concatenated doc content (offsets array prepended at flush time)
+  std::vector<int32_t> chunkDocOffsets;  // start offset of each doc within chunkBody
+  int32_t chunkFirstDoc = -1;
+
+  // Completed chunk metadata.
+  std::vector<int64_t> chunkFirstDocs;
+  std::vector<int64_t> chunkFileOffsets;  // relative to chunksStart
+
+  // Reusable scratch buffers (avoid per-chunk reallocation).
+  std::string uncompressedScratch;
+  std::vector<char> compressScratch;
+
 public:
   // Flush trigger defaults.  Overridable per resource via StoredFieldType.
   static constexpr size_t DEFAULT_CHUNK_TARGET = 16 * 1024;
@@ -188,41 +224,6 @@ public:
   }
 
 private:
-  PostingsWriter& postingsWriter;
-  std::string resourceName_;
-  size_t chunkTargetUncompressed_;
-  size_t maxDocsPerChunk_;
-  OutputStreamPtr chunkOutput;
-  int64_t chunksStart = 0;
-
-  // field name -> segment-local stored-field id (transparent lookup avoids
-  // materializing a std::string per addValue call).
-  boost::unordered_flat_map<std::string, uint32_t,
-                            PackedTermHash, PackedTermEqual> fieldNameToId;
-  std::vector<PackedTerm> fieldNames;  // indexed by stored-field id
-
-  // Currently-accumulating doc state.
-  int32_t currentDoc = -1;
-  int32_t currentDocFieldCount = 0;
-  std::string currentDocContent;
-
-  // lastFinalizedDoc is the highest docID that has been written into the
-  // chunk (or -1 initially).  Used for empty-doc padding.
-  int32_t lastFinalizedDoc = -1;
-
-  // Current chunk state.
-  std::string chunkBody;  // concatenated doc content (offsets array prepended at flush time)
-  std::vector<int32_t> chunkDocOffsets;  // start offset of each doc within chunkBody
-  int32_t chunkFirstDoc = -1;
-
-  // Completed chunk metadata.
-  std::vector<int64_t> chunkFirstDocs;
-  std::vector<int64_t> chunkFileOffsets;  // relative to chunksStart
-
-  // Reusable scratch buffers (avoid per-chunk reallocation).
-  std::string uncompressedScratch;
-  std::vector<char> compressScratch;
-
   void transitionToDoc(int32_t docID) {
     assert(docID >= 0);
     assert(docID >= currentDoc);

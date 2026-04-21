@@ -249,6 +249,170 @@ TEST_F(SchemaTest, replaceMode) {
 }
 
 
+TEST_F(SchemaTest, inheritStoredFromParent) {
+  // A child field that inherits from a STORED parent picks up the STORED
+  // flag, and the resulting FieldType has STORED set.
+  proto::SchemaDef def;
+
+  auto* parent = def.add_fields();
+  parent->set_name("_body_");
+  parent->set_field_class(proto::FieldDef::TEXT);
+  parent->set_indexed(true);
+  parent->set_abstract(true);
+  parent->set_stored(true);
+  parent->mutable_analyzer()->set_tokenizer("whitespace");
+
+  // Child: no explicit stored flag; should inherit true.
+  auto* child = def.add_fields();
+  child->set_name("title");
+  child->set_parent("_body_");
+
+  // Child that explicitly disables stored (override wins).
+  auto* child2 = def.add_fields();
+  child2->set_name("summary");
+  child2->set_parent("_body_");
+  child2->set_stored(false);
+
+  auto schema = Schema::fromProto(def);
+
+  auto* title = schema->getFieldTypePtr("title");
+  ASSERT_NE(nullptr, title);
+  EXPECT_TRUE(title->isStored()) << "child should inherit STORED from parent";
+
+  auto* summary = schema->getFieldTypePtr("summary");
+  ASSERT_NE(nullptr, summary);
+  EXPECT_FALSE(summary->isStored()) << "explicit stored=false overrides parent";
+}
+
+TEST_F(SchemaTest, defaultTSuffixIsStored) {
+  // _t dynamic fields should pick up STORED from the default schema.
+  auto schema = Schema::createDefaultSchema();
+  auto* ft = schema->getFieldTypePtr("anything_t");
+  ASSERT_NE(nullptr, ft);
+  EXPECT_EQ(FieldType::TEXT, ft->type());
+  EXPECT_TRUE(ft->isStored());
+  EXPECT_TRUE(ft->indexed());
+}
+
+TEST_F(SchemaTest, storedRoundtripsThroughProto) {
+  // Build a schema with STORED on TEXT and STRING, serialize, deserialize,
+  // and verify STORED survives.
+  proto::SchemaDef def;
+  auto* t = def.add_fields();
+  t->set_name("body");
+  t->set_field_class(proto::FieldDef::TEXT);
+  t->set_indexed(true);
+  t->set_stored(true);
+  auto* s = def.add_fields();
+  s->set_name("tag");
+  s->set_field_class(proto::FieldDef::STRING);
+  s->set_indexed(true);
+  s->set_column_stored(false);
+  s->set_stored(true);
+  // A non-stored field for contrast.
+  auto* p = def.add_fields();
+  p->set_name("plain");
+  p->set_field_class(proto::FieldDef::TEXT);
+  p->set_indexed(true);
+  p->set_stored(false);
+
+  auto original = Schema::fromProto(def);
+  EXPECT_TRUE(original->getFieldTypePtr("body")->isStored());
+  EXPECT_TRUE(original->getFieldTypePtr("tag")->isStored());
+  EXPECT_FALSE(original->getFieldTypePtr("plain")->isStored());
+
+  proto::SchemaDef round;
+  original->toProto(&round);
+  auto loaded = Schema::fromProto(round);
+  EXPECT_TRUE(loaded->getFieldTypePtr("body")->isStored());
+  EXPECT_TRUE(loaded->getFieldTypePtr("tag")->isStored());
+  EXPECT_FALSE(loaded->getFieldTypePtr("plain")->isStored());
+}
+
+TEST_F(SchemaTest, storedResourceRoundtripsThroughProto) {
+  // A custom stored_resource survives toProto -> fromProto; unset fields
+  // keep the default "_stored_".
+  proto::SchemaDef def;
+  auto* custom = def.add_fields();
+  custom->set_name("paragraphs");
+  custom->set_field_class(proto::FieldDef::TEXT);
+  custom->set_indexed(true);
+  custom->set_stored(true);
+  custom->set_stored_resource("_stored_embeddings_");
+
+  auto* defaulted = def.add_fields();
+  defaulted->set_name("body");
+  defaulted->set_field_class(proto::FieldDef::TEXT);
+  defaulted->set_indexed(true);
+  defaulted->set_stored(true);
+
+  auto s1 = Schema::fromProto(def);
+  EXPECT_EQ("_stored_embeddings_", s1->getFieldTypePtr("paragraphs")->storedResource_);
+  EXPECT_EQ("_stored_", s1->getFieldTypePtr("body")->storedResource_);
+
+  proto::SchemaDef round;
+  s1->toProto(&round);
+  auto s2 = Schema::fromProto(round);
+  EXPECT_EQ("_stored_embeddings_", s2->getFieldTypePtr("paragraphs")->storedResource_);
+  EXPECT_EQ("_stored_", s2->getFieldTypePtr("body")->storedResource_);
+}
+
+TEST_F(SchemaTest, storedResourceInheritedFromParent) {
+  // A child inheriting from a parent with a non-default stored_resource
+  // picks up the parent's choice.  Explicit override on the child wins.
+  proto::SchemaDef def;
+
+  auto* parent = def.add_fields();
+  parent->set_name("_emb_");
+  parent->set_field_class(proto::FieldDef::TEXT);
+  parent->set_indexed(true);
+  parent->set_abstract(true);
+  parent->set_stored(true);
+  parent->set_stored_resource("_stored_embeddings_");
+
+  auto* inherit = def.add_fields();
+  inherit->set_name("paragraphs");
+  inherit->set_parent("_emb_");
+
+  auto* override_ = def.add_fields();
+  override_->set_name("captions");
+  override_->set_parent("_emb_");
+  override_->set_stored_resource("_stored_captions_");
+
+  auto s = Schema::fromProto(def);
+  EXPECT_EQ("_stored_embeddings_", s->getFieldTypePtr("paragraphs")->storedResource_);
+  EXPECT_EQ("_stored_captions_", s->getFieldTypePtr("captions")->storedResource_);
+}
+
+TEST_F(SchemaTest, mergePreservesStoredResource) {
+  // MERGE-mode fromProto rebuilds every FieldType from resolved data.  That
+  // rebuild must carry the base schema's stored_resource forward; otherwise
+  // base fields silently lose their custom column-family assignment.
+  proto::SchemaDef baseDef;
+  auto* b = baseDef.add_fields();
+  b->set_name("body");
+  b->set_field_class(proto::FieldDef::TEXT);
+  b->set_indexed(true);
+  b->set_stored(true);
+  b->set_stored_resource("_stored_embeddings_");
+  auto base = Schema::fromProto(baseDef);
+  ASSERT_EQ("_stored_embeddings_", base->getFieldTypePtr("body")->storedResource_);
+
+  // Programmatically-set custom resource (no proto involvement) must also
+  // survive a merge that doesn't mention the field.
+  base->getFieldTypePtr("body")->storedResource_ = "_stored_programmatic_";
+
+  proto::SchemaDef mergeDef;
+  auto* f = mergeDef.add_fields();
+  f->set_name("price");
+  f->set_field_class(proto::FieldDef::INT);
+
+  auto merged = Schema::fromProto(mergeDef, base.get());
+  EXPECT_EQ("_stored_programmatic_", merged->getFieldTypePtr("body")->storedResource_);
+  EXPECT_NE(nullptr, merged->getFieldTypePtr("price"));
+}
+
+
 TEST_F(SchemaTest, roundtrip) {
   auto original = Schema::createDefaultSchema();
 

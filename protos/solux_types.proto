@@ -491,6 +491,14 @@ message FieldDef {
   bool multi_valued = 7;
 
   AnalyzerDef analyzer = 8;            // for TEXT fields; if unset, inherited from parent
+
+  bool stored = 9;              // if true, raw values are kept in the segment's stored-fields resource
+
+  // When stored=true, names the target stored-fields resource (StoredFieldType
+  // entry in the schema).  Empty / unset means the default "_stored_" resource.
+  // Use named resources to group fields into separate column families (e.g.
+  // "_stored_embeddings_" for co-located embedding bytes).
+  string stored_resource = 10;
 }
 
 message SchemaDef {
