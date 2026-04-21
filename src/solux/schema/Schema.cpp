@@ -239,6 +239,7 @@ std::shared_ptr<Schema> Schema::fromProto(const proto::SchemaDef& def, const Sch
     bool indexed = r.indexed;
     bool columnStored = r.columnStored;
     bool multiValued = r.multiValued;
+    bool stored = r.stored;
 
     if (!r.hasIndexed) {
       // defaults by field_class
@@ -262,6 +263,12 @@ std::shared_ptr<Schema> Schema::fromProto(const proto::SchemaDef& def, const Sch
     if (!r.hasMultiValued) {
       multiValued = false;
     }
+    if (!r.hasStored) {
+      // TEXT fields are stored by default so the raw (pre-analysis) value can
+      // be returned in search results.  Other field classes default to false;
+      // STRING/ID already expose their value via the column store.
+      stored = (r.fieldClass == proto::FieldDef::TEXT);
+    }
 
     // Build flags
     FieldType::flag_type flags = 0;
@@ -274,7 +281,7 @@ std::shared_ptr<Schema> Schema::fromProto(const proto::SchemaDef& def, const Sch
     }
     if (columnStored) flags |= FieldType::COLUMN_STORED;
     if (multiValued) flags |= FieldType::MULTI_VALUED;
-    if (r.stored) flags |= FieldType::STORED;
+    if (stored) flags |= FieldType::STORED;
 
     std::shared_ptr<FieldType> ft;
 
@@ -387,13 +394,14 @@ void Schema::toProto(proto::SchemaDef* def) const {
 std::shared_ptr<Schema> Schema::createDefaultSchema() {
   proto::SchemaDef def;
 
-  // Helper lambda to add a field
+  // Helper lambda to add a field.  `stored` is tri-state: -1 means "leave
+  // unset so the field_class default applies", 0/1 set it explicitly.
   auto addField = [&](const char* name, proto::FieldDef::FieldClass fc,
                       bool abstract, bool indexed, bool columnStored,
                       bool multiValued = false,
                       const char* tokenizer = nullptr,
                       std::vector<std::string> filters = {},
-                      bool stored = false) {
+                      int stored = -1) {
     auto* f = def.add_fields();
     f->set_name(name);
     f->set_abstract(abstract);
@@ -401,7 +409,7 @@ std::shared_ptr<Schema> Schema::createDefaultSchema() {
     f->set_indexed(indexed);
     f->set_column_stored(columnStored);
     f->set_multi_valued(multiValued);
-    f->set_stored(stored);
+    if (stored >= 0) f->set_stored(stored != 0);
     if (tokenizer) {
       auto* a = f->mutable_analyzer();
       a->set_tokenizer(tokenizer);
@@ -415,7 +423,8 @@ std::shared_ptr<Schema> Schema::createDefaultSchema() {
   addField("id", proto::FieldDef::ID, false, true, true);
   addField("_version_", proto::FieldDef::INT, false, false, true);
 
-  // Abstract dynamic suffix fields
+  // Abstract dynamic suffix fields.  TEXT suffixes inherit the field_class
+  // default (stored=true) so the raw value can be returned in search results.
   addField("_s", proto::FieldDef::STRING, true, true, true);
   addField("_sc", proto::FieldDef::STRING, true, false, true);
   addField("_ss", proto::FieldDef::STRING, true, true, true, true);
@@ -424,11 +433,7 @@ std::shared_ptr<Schema> Schema::createDefaultSchema() {
   addField("_is", proto::FieldDef::INT, true, false, true, true);
   addField("_w", proto::FieldDef::TEXT, true, true, false, false, "nocopy_whitespace");
   addField("_wl", proto::FieldDef::TEXT, true, true, false, false, "whitespace", {"lowercase"});
-  // _t: indexed + stored text for full-text retrieval of original values.
-  // Tokenized with whitespace+lowercase (same as _wl) for query-time matching,
-  // and the raw value is kept in the default stored-fields resource so it can
-  // be returned verbatim in search results.
-  addField("_t", proto::FieldDef::TEXT, true, true, false, false, "whitespace", {"lowercase"}, /*stored=*/true);
+  addField("_t", proto::FieldDef::TEXT, true, true, false, false, "whitespace", {"lowercase"});
 
   // fromProto ensures the default "_stored_" resource is present.  Users can
   // override or add additional named resources (e.g. "_stored_paragraphs_")

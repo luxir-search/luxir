@@ -26,7 +26,7 @@ public:
     searchStub = solux::Searcher::NewStub(channel);
   }
 
-  constexpr static std::array<const char*, 4> retrieveFields = {"id", "id_i", "i256_50_i", "s3_256_50_ss"};
+  constexpr static std::array<const char*, 6> retrieveFields = {"id", "id_i", "i256_50_i", "s3_256_50_ss", "t_w", "t2_w"};
 
   // fill in the protobuf for a document based on the document number in a completely deterministic way
   void fillDoc(int64_t docnum, solux::proto::Map& doc) {
@@ -109,6 +109,16 @@ public:
       assert(!has_s3_256_50ss);
     }
 
+    // t_w and t2_w are TEXT fields, stored by default, returned as col_s.
+    if (fields.contains("t_w")) {
+      auto& t_w = fields.at("t_w");
+      ASSERT_EQ(std::format("{} {}", sid, "common"), t_w.col_s().v(col));
+    }
+    if (fields.contains("t2_w")) {
+      auto expected = std::format("{} {} {}", r.rint(0,10), r.rint(0,100), r.rint(0,1000));
+      auto& t2_w = fields.at("t2_w");
+      ASSERT_EQ(expected, t2_w.col_s().v(col));
+    }
   }
 
 
