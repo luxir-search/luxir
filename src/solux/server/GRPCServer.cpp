@@ -2,6 +2,7 @@
 #include <string>
 #include <algorithm>
 #include <grpcpp/grpcpp.h>
+#include <absl/strings/str_cat.h>
 #include <google/protobuf/text_format.h>
 #include <grpcpp/health_check_service_interface.h>
 #include <grpcpp/ext/proto_server_reflection_plugin.h>
@@ -425,7 +426,7 @@ public:
   }
 
   void fillResponse(HelloReply* response, HelloRequest* request, int responseNum) {
-    response->set_message("Hello " + request->name());
+    response->set_message(absl::StrCat("Hello ", request->name()));
     response->set_response_number(responseNum);
 
     // sleep a random amount of time between the given min and max microseconds
@@ -522,8 +523,7 @@ public:
     new SayHelloCall(server, service, threadInfo);
   }
   virtual void fillResponse() override {
-    std::string prefix("Hello ");
-    response.set_message(prefix + request.name());
+    response.set_message(absl::StrCat("Hello ", request.name()));
     // std::cout << "req name:" << request.name() << std::endl;
   }
 };
@@ -539,8 +539,7 @@ public:
     new SayHelloCall2(server, service, threadInfo);
   }
   virtual void fillResponse() override {
-    std::string prefix("Hello2 ");
-    response.set_message(prefix + request.name());
+    response.set_message(absl::StrCat("Hello2 ", request.name()));
     // std::cout << "req name:" << request.name() << std::endl;
   }
 };

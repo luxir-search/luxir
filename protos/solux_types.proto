@@ -1,12 +1,7 @@
-edition = "2023";
-
-import "google/protobuf/cpp_features.proto";
-option features.(pb.cpp).string_type = VIEW;
+edition = "2024";
 
 import "google/protobuf/struct.proto";
-import "google/protobuf/wrappers.proto";
 
-option java_multiple_files = true;
 option java_package = "org.apache.solux.types";
 option java_outer_classname = "SoluxTypes";
 option objc_class_prefix = "Solux";

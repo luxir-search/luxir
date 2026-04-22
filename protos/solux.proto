@@ -1,10 +1,7 @@
-edition = "2023";
+edition = "2024";
 
-import "google/protobuf/struct.proto";
-import "google/protobuf/wrappers.proto";
 import "solux_types.proto";
 
-option java_multiple_files = true;
 option java_package = "org.apache.solux";
 option java_outer_classname = "SoluxProto";
 option objc_class_prefix = "Solux";
