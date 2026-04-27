@@ -3,7 +3,7 @@ Building
 
 Installing dependencies via vcpkg:
 $ cd /opt/vcpkg
-$ ./vcpkg install boost-core boost-sort boost-thread gtest benchmark xxhash gtl protobuf grpc spdlog lz4 cli11
+$ ./vcpkg install boost-core boost-sort boost-thread gtest benchmark xxhash gtl protobuf grpc spdlog lz4 cli11 faiss
 $ ./vcpkg install robin-hood-hashing   #optional... see MapBM.cpp
 
 NOTE: when using address sanitizer, newer gRCP/proto will be hit with "use after poison" errors
@@ -21,14 +21,7 @@ index 8822134560..777ce1ea65 100644
 +set(VCPKG_C_FLAGS "-g -fno-omit-frame-pointer -fsanitize=address")
 +set(VCPKG_LINKER_FLAGS "-g -fno-omit-frame-pointer -fsanitize=address")
 
-NOTE: clang++-20 has issues compiling with current version of spdlog (5/2025)
-  (spdlog 1.15.3, fmt 11.0.2)  the issue is fmt needs to be 11.2  https://github.com/microsoft/vcpkg/pull/45295
-  I hacked local vcpkg_clang dirs to use a spdlog with bundled fmt 11.2
-NOTE: gcc-15 has issues compiling with protobuf with address sanitization (5/2025)
-  https://github.com/protocolbuffers/protobuf/issues/21333
-NOTE: vcpkg compiled with gcc-15, then google::protobuf::TextFormat::PrintToString dies when project
-      compiled with clang-19
-NOTE: compile times (debugging asan) gcc-15=1:51  clang-20=1:23
+
 
 Ubuntu:
 ```
@@ -36,7 +29,7 @@ sudo apt install libtbb-dev    #TODO - try the tbb in vcpkg
 ```
 
 Other 3rd party dependencies:
-TBB: the vcpkg version is currently out of date. On Ubuntu 22.04, use sudo apt install libtbb-dev
+TBB: the vcpkg version for TBB is currently out of date. On Ubuntu 22.04, use sudo apt install libtbb-dev
 
 SIMDCompressionAndIntersection 
 NOTE: The debugging version of libsimdcomp is currently built with -D_GLIBCXX_DEBUG, which is
@@ -73,7 +66,3 @@ $ git clone git@github.com:lemire/SIMDCompressionAndIntersection.git simdcomp
   make
   cp libSIMDCompressionAndIntersection.a libsimdcomp_a.a
   make clean
-### for CRoaring
-$ cd deps; git clone https://github.com/RoaringBitmap/CRoaring
-$ cd CRoaring; git co tags/v0.4.0
-

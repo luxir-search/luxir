@@ -50,3 +50,9 @@ _deps
 # clion defaults to using cmake-build-*
 cmake-build-*
 
+# Generated protobuf/gRPC files
+protos/*.pb.cc
+protos/*.pb.h
+protos/*.grpc.pb.cc
+protos/*.grpc.pb.h
+

@@ -27,8 +27,6 @@ find_package(CLI11 CONFIG REQUIRED)
 find_package(lz4 CONFIG REQUIRED)
 
 include_directories(deps)
-include_directories(deps/CRoaring/cpp)
-include_directories(deps/CRoaring/include)
 link_directories(deps/simdcomp)
 
 #Print out all env vars... useful while build system is in development
@@ -87,7 +85,6 @@ add_library(solux_lib STATIC ${Proj_SOURCES})
 add_executable(solux src/solux/main.cpp)
 target_link_libraries(solux solux_lib)
 
-add_subdirectory(deps)
 add_subdirectory(protos)
 add_subdirectory(test)
 
@@ -105,7 +102,6 @@ target_link_libraries(solux_lib PRIVATE ${Boost_LIBRARIES})
 target_link_libraries(solux_lib PRIVATE debug simdcomp_ad)
 target_link_libraries(solux_lib PRIVATE optimized simdcomp_a)
 target_link_libraries(solux_lib PRIVATE myproto)
-target_link_libraries(solux_lib PRIVATE roaring)
 target_link_libraries(solux_lib PRIVATE spdlog::spdlog spdlog::spdlog_header_only)
 target_link_libraries(solux_lib PRIVATE CLI11::CLI11)
 target_link_libraries(solux_lib PRIVATE lz4::lz4)
