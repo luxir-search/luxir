@@ -19,7 +19,7 @@ namespace solux::handler {
 ///   - endOffsetReader (mono2Loc): per-value -> byte offset. Absent when all values are the same
 ///     size; in that case mono2MetaOff holds the fixed value size.
 ///   - endRankReader (monoLoc): per-doc -> per-value rank boundary. Present only for multi-valued.
-class StrColHandler final : public Inverter::IndexHandler {
+class StrColHandler : public Inverter::IndexHandler {
   friend Inverter;
 
   DocStream docsWithVal;      // set of docs that have this field

@@ -324,6 +324,8 @@ message Val {
     ArrFloat arr_f = 12;
     ArrDouble arr_d = 13;
     ArrBin arr_bin = 14;
+    Vector vec = 15;              // single dense vector (single-valued vector field, or one element)
+    ArrVector arr_vec = 16;       // list of vectors (multi-valued vector field per doc)
     DocList docs = 100; // a list of documents, used for search results
     FacetResult facet = 101; // result of a facet operation
   }
@@ -376,6 +378,23 @@ message ArrArrBin {
   repeated ArrBin v = 1;
 }
 
+// A dense vector value.  The kind oneof leaves room for quantized variants
+// (int8, binary, etc.) without breaking wire compatibility — readers detect
+// the encoding via the populated field.  Dimensionality is implicit in the
+// chosen variant: f32.v_size() for the f32 case, byte length / stride for
+// future packed variants.
+message Vector {
+  oneof kind {
+    ArrFloat f32 = 1;
+    // reserved for future quantization (e.g. ArrInt8 int8, bytes binary).
+  }
+}
+
+// A list of vectors, used as a per-doc cell for multi-valued vector fields.
+message ArrVector {
+  repeated Vector v = 1;
+}
+
 // although the encoding is the same, the stub mapping is not and could blow up memory for large arrays
 // if we always use 64 byte ints.
 // TODO: if we can do custom decoding, an array that specifies a min/max would be even more efficient
@@ -406,7 +425,22 @@ message Column {
 
     ColMap col_map = 14;
     ArrVal col_val = 15; // array-of-value is already nullable, so we don't have a separate column type for it
+    ColVector col_vec = 16;    // single-valued vector column: one Vector per doc; missing = unset oneof
+    MultiVector multi_vec = 17; // multi-valued vector column: one ArrVector per doc; missing = empty list
   }
+}
+
+// Single-valued vector column.  Each Vector slot is independently nullable
+// via its empty oneof — no separate missing_val needed.
+message ColVector {
+  repeated Vector v = 1;
+}
+
+// Multi-valued vector column.  Empty ArrVector means "doc does not have the
+// field"; absence is indistinguishable from an empty list, which matches the
+// indexing behavior (an empty list of vectors is not stored).
+message MultiVector {
+  repeated ArrVector v = 1;
 }
 
 message ColInt {
@@ -478,6 +512,7 @@ message FieldDef {
     DOUBLE = 4;
     BIN = 5;
     ID = 6;        // unique id field with co-located version
+    VECTOR = 7;    // dense float vector, stored as a fixed-size binary column
   }
   FieldClass field_class = 4;  // if unset (default), inherited from parent
 
@@ -494,6 +529,16 @@ message FieldDef {
   // Use named resources to group fields into separate column families (e.g.
   // "_stored_embeddings_" for co-located embedding bytes).
   string stored_resource = 10;
+
+  // For VECTOR fields.  If unset, dims is inferred per-segment from the first
+  // indexed value; within a segment all vectors must share the same dims.
+  VectorParams vector = 11;
+}
+
+message VectorParams {
+  // Vector dimensionality.  0 / unset means "infer from first indexed value";
+  // a positive value enforces strict validation at index time.
+  int32 dims = 1;
 }
 
 message SchemaDef {

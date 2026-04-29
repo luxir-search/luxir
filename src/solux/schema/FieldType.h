@@ -24,7 +24,8 @@ public:
     INT,
     FLOAT,
     DOUBLE,
-    ID        // unique id field
+    ID,       // unique id field
+    VECTOR    // dense float vector; column-stored as fixed-size bytes
   };
 
   using flag_type = int32_t;
@@ -152,6 +153,21 @@ class IdFieldType : public FieldType {
 public:
   IdFieldType(std::string_view name, int flags=INDEX_DOCS | COLUMN_STORED) : FieldType(name, FieldType::ID, flags) {
   }
+};
+
+// Dense float vector field.  Values are stored as fixed-size byte blobs
+// through the standard binary-column path (see VectorHandler).  dims_ may be
+// 0, in which case the first indexed value in a segment fixes the segment's
+// per-vector size; a positive dims_ enforces validation at index time.
+class VectorFieldType : public FieldType {
+public:
+  int32_t dims_;
+
+  VectorFieldType(std::string_view name, int32_t dims = 0, int flags = COLUMN_STORED | FIXED_SIZE)
+    : FieldType(name, FieldType::VECTOR, flags), dims_(dims) {
+  }
+
+  int32_t dims() const { return dims_; }
 };
 
 // Describes a stored-fields resource (a per-segment column of LZ4-compressed

@@ -45,9 +45,12 @@ private:
           }
         },
         [&](const std::vector<float>& v) {
-          auto* arr = val.mutable_arr_f();
+          // Treat as a single dense vector — vector<float> is only used for
+          // VECTOR fields in test inputs.  Plain multi-valued FLOAT scalar
+          // fields (if/when added) would need a different FieldVal variant.
+          auto* f32 = val.mutable_vec()->mutable_f32();
           for (auto f : v) {
-            arr->add_v(f);
+            f32->add_v(f);
           }
         },
         [&](const std::vector<double>& v) {
@@ -60,6 +63,14 @@ private:
           auto* arr = val.mutable_arr_s();
           for (const auto& s : v) {
             arr->add_v(s);
+          }
+        },
+        [&](const std::vector<std::vector<float>>& v) {
+          // Multi-valued vectors: one Vector per inner array.
+          auto* arr = val.mutable_arr_vec();
+          for (const auto& inner : v) {
+            auto* f32 = arr->add_v()->mutable_f32();
+            for (auto f : inner) f32->add_v(f);
           }
         }
       }, nv.val);

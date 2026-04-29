@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstring>
 #include "SearchOp.h"
 #include "solux/query/AllQuery.h"
 #include "solux/query/Query.h"
@@ -525,6 +526,10 @@ public:
             }
             break;
           }
+          case FieldType::Type::VECTOR: {
+            loadVectorCol(qr.req, field, fieldType, segDocs, sortedIdx, segRunLength, columnsProto, tg);
+            break;
+          }
           default:
             break;
         } // end switch on fieldType
@@ -818,6 +823,113 @@ public:
       });
       start += runlen;
     }
+  }
+
+  // Decode a VECTOR column's bytes back to floats in the response.
+  //
+  // Single-valued output: Column.col_vec — one Vector per doc; missing docs
+  // leave the slot's kind oneof unset.
+  // Multi-valued output:  Column.multi_vec — one ArrVector per doc; missing
+  // docs (or docs that indexed an empty list) leave an empty ArrVector.
+  void loadVectorCol(SearchRequest& req, std::string_view field, FieldType& fieldType,
+                     std::ranges::input_range auto& segDocs, std::span<uint8_t> sortedIdx,
+                     const std::span<uint8_t> segRunLength,
+                     SearchResponse::ColumnsType& columnsProto, oneapi::tbb::task_group* tg)
+  {
+    auto columnSize = segDocs.size();
+    if (columnSize == 0) return;
+    auto& fieldCol = columnsProto[field];
+
+    if (!fieldType.multiValued()) {
+      auto& vecsProto = *fieldCol.mutable_col_vec()->mutable_v();
+      vecsProto.Reserve(columnSize);
+      for (auto i = 0u; i < columnSize; i++) vecsProto.Add();
+      std::span<solux::proto::Vector*> target{vecsProto.mutable_data(), columnSize};
+
+      int32_t start = 0;
+      for (auto runlen : segRunLength) {
+        auto idxSpan = sortedIdx.subspan(start, runlen);
+        task_group_run(tg, [this, idxSpan, &req, field, &segDocs, target]() {
+          loadVectorColForSegmentSingle(req, field, idxSpan, segDocs, target);
+        });
+        start += runlen;
+      }
+    } else {
+      auto& arrVecsProto = *fieldCol.mutable_multi_vec()->mutable_v();
+      arrVecsProto.Reserve(columnSize);
+      for (auto i = 0u; i < columnSize; i++) arrVecsProto.Add();
+      std::span<solux::proto::ArrVector*> target{arrVecsProto.mutable_data(), columnSize};
+
+      int32_t start = 0;
+      for (auto runlen : segRunLength) {
+        auto idxSpan = sortedIdx.subspan(start, runlen);
+        task_group_run(tg, [this, idxSpan, &req, field, &segDocs, target]() {
+          loadVectorColForSegmentMulti(req, field, idxSpan, segDocs, target);
+        });
+        start += runlen;
+      }
+    }
+  }
+
+  // Copy raw column bytes into a Vector.f32's repeated float buffer.  memcpy
+  // sidesteps alignment of the source bytes (column storage is byte-packed
+  // and not guaranteed 4-byte aligned).
+  static void fillVectorF32(solux::proto::Vector& vec, std::string_view bytes) {
+    assert(bytes.size() % sizeof(float) == 0);
+    int32_t nFloats = (int32_t)(bytes.size() / sizeof(float));
+    auto& fs = *vec.mutable_f32()->mutable_v();
+    fs.Resize(nFloats, 0.0f);
+    std::memcpy(fs.mutable_data(), bytes.data(), bytes.size());
+  }
+
+  void loadVectorColForSegmentSingle(SearchRequest& req, std::string_view field,
+                                     std::span<uint8_t> idxSpan,
+                                     std::ranges::input_range auto& segDocs,
+                                     std::span<solux::proto::Vector*> target)
+  {
+    auto sortedSegDocs = idxSpan | std::views::transform([&segDocs](auto idx) { return segDocs[idx]; });
+    auto segNum = sortedSegDocs[0].segment();
+    auto sortedDocs = sortedSegDocs | std::views::transform([](const auto& sd) { return sd.docId(); });
+
+    auto& postingsReader = req.reader->segments()[segNum].postingsReader();
+    auto poolGuard = MemPool::threadLocalPoolGuard();
+    FieldReader fieldReader(poolGuard.pool(), postingsReader);
+    if (!fieldReader.seek(field)) return;
+    SegFieldInfo segFieldInfo;
+    fieldReader.readFieldInfo(segFieldInfo);
+
+    auto valHandler = [&](size_t idx, int32_t doc, std::string_view bytes) {
+      assert(segDocs[idxSpan[idx]].docId() == doc);
+      unused(doc);
+      fillVectorF32(*target[idxSpan[idx]], bytes);
+    };
+    StrColReader::getValues(poolGuard.pool(), postingsReader, segFieldInfo, sortedDocs, valHandler);
+  }
+
+  void loadVectorColForSegmentMulti(SearchRequest& req, std::string_view field,
+                                    std::span<uint8_t> idxSpan,
+                                    std::ranges::input_range auto& segDocs,
+                                    std::span<solux::proto::ArrVector*> target)
+  {
+    auto sortedSegDocs = idxSpan | std::views::transform([&segDocs](auto idx) { return segDocs[idx]; });
+    auto segNum = sortedSegDocs[0].segment();
+    auto sortedDocs = sortedSegDocs | std::views::transform([](const auto& sd) { return sd.docId(); });
+
+    auto& postingsReader = req.reader->segments()[segNum].postingsReader();
+    auto poolGuard = MemPool::threadLocalPoolGuard();
+    FieldReader fieldReader(poolGuard.pool(), postingsReader);
+    if (!fieldReader.seek(field)) return;
+    SegFieldInfo segFieldInfo;
+    fieldReader.readFieldInfo(segFieldInfo);
+
+    auto valHandler = [&](size_t idx, int32_t doc, std::string_view bytes, int64_t valIdx, int64_t numVals) {
+      assert(segDocs[idxSpan[idx]].docId() == doc);
+      unused(doc);
+      auto* outer = target[idxSpan[idx]]->mutable_v();
+      if (valIdx == 0) outer->Reserve(numVals);
+      fillVectorF32(*outer->Add(), bytes);
+    };
+    StrColReader::getMultiValues(poolGuard.pool(), postingsReader, segFieldInfo, sortedDocs, valHandler);
   }
 
   // Copy stored values for one doc into a request's output slot.

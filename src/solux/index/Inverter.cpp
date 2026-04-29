@@ -8,6 +8,7 @@
 #include "handler/IdHandler.h"
 #include "handler/StrColHandler.h"
 #include "handler/StoredFieldWrapperHandler.h"
+#include "handler/VectorHandler.h"
 #include "solux/index/handler/IntColHandler.h"
 #include "solux/index/handler/StrHandler.h"
 #include "solux/index/handler/FullTextHandler.h"
@@ -79,6 +80,9 @@ Inverter::IndexHandler& Inverter::createIndexHandler(const std::string_view name
       } else {
         fieldHandler = std::make_unique<handler::IntColHandler>(*this, name, fieldType);
       }
+      break;
+    case FieldType::Type::VECTOR:
+      fieldHandler = std::make_unique<handler::VectorHandler>(*this, name, fieldType);
       break;
     default:
       throw std::runtime_error("Unknown field type: " + std::string(name));

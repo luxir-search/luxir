@@ -184,6 +184,10 @@ private:
         numDocs = column.multi_f().v_size();
       } else if (column.has_multi_d()) {
         numDocs = column.multi_d().v_size();
+      } else if (column.has_col_vec()) {
+        numDocs = column.col_vec().v_size();
+      } else if (column.has_multi_vec()) {
+        numDocs = column.multi_vec().v_size();
       }
       break;
     }
@@ -251,10 +255,30 @@ private:
             }
             results[docIdx].push_back({fieldName, std::move(values)});
           }
+        } else if (column.has_col_vec()) {
+          // Single-valued vector column: missing if the slot's kind oneof is unset.
+          const auto& colData = column.col_vec();
+          if (docIdx < (size_t)(colData.v_size()) && colData.v(docIdx).has_f32()) {
+            const auto& f32 = colData.v(docIdx).f32();
+            std::vector<float> values(f32.v().begin(), f32.v().end());
+            results[docIdx].push_back({fieldName, std::move(values)});
+          }
+        } else if (column.has_multi_vec()) {
+          // Multi-valued vector column: empty ArrVector means "no values".
+          const auto& colData = column.multi_vec();
+          if (docIdx < (size_t)(colData.v_size()) && colData.v(docIdx).v_size() > 0) {
+            std::vector<std::vector<float>> values;
+            for (const auto& vec : colData.v(docIdx).v()) {
+              if (vec.has_f32()) {
+                values.emplace_back(vec.f32().v().begin(), vec.f32().v().end());
+              }
+            }
+            results[docIdx].push_back({fieldName, std::move(values)});
+          }
         }
       }
     }
-    
+
     return results;
   }
 };

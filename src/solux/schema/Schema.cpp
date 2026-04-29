@@ -28,6 +28,8 @@ struct ResolvedField {
   bool hasAnalyzer = false;
   std::string tokenizer;
   std::vector<std::string> filters;
+  // 0 means "not set / infer from first indexed value"; > 0 means strict.
+  int32_t vectorDims = 0;
 };
 
 using sv_flat_map = boost::unordered_flat_map<std::string_view, const proto::FieldDef*, PackedTermHash, PackedTermEqual>;
@@ -130,6 +132,12 @@ static void resolveField(std::string_view name,
     r.filters = parentResolved.filters;
   }
 
+  // vector: VectorParams.dims > 0 overrides; otherwise inherit from parent
+  // (0 = not set / infer from first value).
+  r.vectorDims = (def.has_vector() && def.vector().dims() > 0)
+    ? def.vector().dims()
+    : parentResolved.vectorDims;
+
   visiting.erase(name);
   resolved[name] = std::move(r);
 }
@@ -200,6 +208,7 @@ std::shared_ptr<Schema> Schema::fromProto(const proto::SchemaDef& def, const Sch
         case FieldType::INT:    r.fieldClass = proto::FieldDef::INT; break;
         case FieldType::FLOAT:  r.fieldClass = proto::FieldDef::FLOAT; break;
         case FieldType::DOUBLE: r.fieldClass = proto::FieldDef::DOUBLE; break;
+        case FieldType::VECTOR: r.fieldClass = proto::FieldDef::VECTOR; break;
         default:                r.fieldClass = proto::FieldDef::BIN; break;
       }
       r.hasIndexed = true;
@@ -220,6 +229,9 @@ std::shared_ptr<Schema> Schema::fromProto(const proto::SchemaDef& def, const Sch
         r.hasAnalyzer = true;
         r.tokenizer = textFt->tokenizer_;
         r.filters = textFt->filters_;
+      } else if (ft->type() == FieldType::VECTOR) {
+        auto* vecFt = (VectorFieldType*)(ft.get());
+        r.vectorDims = vecFt->dims_;
       }
       resolved[name] = std::move(r);
     }
@@ -301,6 +313,11 @@ std::shared_ptr<Schema> Schema::fromProto(const proto::SchemaDef& def, const Sch
       case proto::FieldDef::INT:
         ft = std::make_shared<IntFieldType>(name, flags);
         break;
+      case proto::FieldDef::VECTOR:
+        // VECTOR is always fixed-size (every value in a segment must share dims).
+        // dims may be 0, meaning "infer from first indexed value".
+        ft = std::make_shared<VectorFieldType>(name, r.vectorDims, flags | FieldType::FIXED_SIZE);
+        break;
       default:
         throw std::runtime_error("Unsupported field_class for field: " + std::string(name));
     }
@@ -359,6 +376,9 @@ void Schema::toProto(proto::SchemaDef* def) const {
       case FieldType::BIN:
         fieldDef->set_field_class(proto::FieldDef::BIN);
         break;
+      case FieldType::VECTOR:
+        fieldDef->set_field_class(proto::FieldDef::VECTOR);
+        break;
       default:
         break;
     }
@@ -385,6 +405,11 @@ void Schema::toProto(proto::SchemaDef* def) const {
       analyzer->set_tokenizer(textFt->tokenizer_);
       for (const auto& filter : textFt->filters_) {
         analyzer->add_filters(filter);
+      }
+    } else if (ft->type() == FieldType::VECTOR) {
+      auto* vecFt = (VectorFieldType*)(ft.get());
+      if (vecFt->dims_ > 0) {
+        fieldDef->mutable_vector()->set_dims(vecFt->dims_);
       }
     }
   }
@@ -434,6 +459,10 @@ std::shared_ptr<Schema> Schema::createDefaultSchema() {
   addField("_w", proto::FieldDef::TEXT, true, true, false, false, "nocopy_whitespace");
   addField("_wl", proto::FieldDef::TEXT, true, true, false, false, "whitespace", {"lowercase"});
   addField("_t", proto::FieldDef::TEXT, true, true, false, false, "whitespace", {"lowercase"});
+  // VECTOR suffixes: single-valued (_v) and multi-valued (_vs).  dims is left
+  // unset on the abstract suffix; concrete fields may pin it via VectorParams.
+  addField("_v", proto::FieldDef::VECTOR, true, false, true);
+  addField("_vs", proto::FieldDef::VECTOR, true, false, true, true);
 
   // fromProto ensures the default "_stored_" resource is present.  Users can
   // override or add additional named resources (e.g. "_stored_paragraphs_")

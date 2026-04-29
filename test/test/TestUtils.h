@@ -11,7 +11,8 @@ namespace solux::test {
 // Idea: think of making a reference-version (i.e. std::string_view, std::span) of this class for use in main code.
 
 using FieldVal = std::variant<bool, int64_t, float, double, std::string,
-                              std::vector<bool>, std::vector<int64_t>, std::vector<float>, std::vector<double>, std::vector<std::string>
+                              std::vector<bool>, std::vector<int64_t>, std::vector<float>, std::vector<double>, std::vector<std::string>,
+                              std::vector<std::vector<float>>  // multi-valued vectors (one float-array per slot)
 >;
 
 struct NameVal {
@@ -174,11 +175,24 @@ inline std::string docToString(const Doc& doc) {
         }
         result += "]";
       },
-      [&](const std::vector<std::string>& v) { 
+      [&](const std::vector<std::string>& v) {
         result += "[";
         for (size_t i = 0; i < v.size(); ++i) {
           if (i > 0) result += ",";
           result += "\"" + v[i] + "\"";
+        }
+        result += "]";
+      },
+      [&](const std::vector<std::vector<float>>& v) {
+        result += "[";
+        for (size_t i = 0; i < v.size(); ++i) {
+          if (i > 0) result += ",";
+          result += "[";
+          for (size_t j = 0; j < v[i].size(); ++j) {
+            if (j > 0) result += ",";
+            result += std::to_string(v[i][j]);
+          }
+          result += "]";
         }
         result += "]";
       }
