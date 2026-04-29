@@ -839,11 +839,8 @@ TEST_F(IndexWriterTest, testMultithreadedUpdates) {
               EXPECT_EQ(docs.size(), 1);
               if (!docs.empty()) {
                 int64_t foundVersion = -1;
-                for (const auto& nv : docs[0]) {
-                  if (nv.name == "_version_") {
-                    foundVersion = std::get<int64_t>(nv.val);
-                    break;
-                  }
+                if (auto* val = find(docs[0], "_version_")) {
+                  foundVersion = std::get<int64_t>(*val);
                 }
                 EXPECT_EQ(foundVersion, docVersions[localDoc])
                   << "Thread " << tid << " doc " << docId << " version mismatch"
@@ -906,11 +903,8 @@ TEST_F(IndexWriterTest, testMultithreadedUpdates) {
             EXPECT_EQ(docs.size(), 1) << "Thread " << tid << " doc " << docId << " not found";
             if (!docs.empty()) {
               int64_t foundVersion = -1;
-              for (const auto& nv : docs[0]) {
-                if (nv.name == "_version_") {
-                  foundVersion = std::get<int64_t>(nv.val);
-                  break;
-                }
+              if (auto* val = find(docs[0], "_version_")) {
+                foundVersion = std::get<int64_t>(*val);
               }
               EXPECT_EQ(foundVersion, docVersions[localDoc])
                 << "Thread " << tid << " doc " << docId << " version mismatch"
@@ -1013,14 +1007,12 @@ TEST_F(IndexWriterTest, segmentMergerWithDeletes) {
   // Verify doc2 is not in results
   bool foundDoc1 = false, foundDoc3 = false, foundDoc4 = false, foundDoc2 = false;
   for (const auto& doc : docs) {
-    for (const auto& nv : doc) {
-      if (nv.name == "id") {
-        std::string id = std::get<std::string>(nv.val);
-        if (id == "doc1") foundDoc1 = true;
-        if (id == "doc2") foundDoc2 = true;
-        if (id == "doc3") foundDoc3 = true;
-        if (id == "doc4") foundDoc4 = true;
-      }
+    if (auto* val = find(doc, "id")) {
+      const auto& id = std::get<std::string>(*val);
+      if (id == "doc1") foundDoc1 = true;
+      if (id == "doc2") foundDoc2 = true;
+      if (id == "doc3") foundDoc3 = true;
+      if (id == "doc4") foundDoc4 = true;
     }
   }
   

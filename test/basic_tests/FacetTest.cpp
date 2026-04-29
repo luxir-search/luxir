@@ -324,22 +324,14 @@ protected:
         if (!matches) continue;
         
         matchingDocs++;
-        bool hasField = false;
-        
-        for (const auto& nv : doc) {
-          if (nv.name == field) {
-            hasField = true;
-            docsWithField++;
-            if (auto* strVal = std::get_if<std::string>(&nv.val)) {
-              valueCounts[*strVal]++;
-            } else if (auto* intVal = std::get_if<int64_t>(&nv.val)) {
-              intValueCounts[*intVal]++;
-            }
-            break;
+        if (auto* val = find(doc, field)) {
+          docsWithField++;
+          if (auto* strVal = std::get_if<std::string>(val)) {
+            valueCounts[*strVal]++;
+          } else if (auto* intVal = std::get_if<int64_t>(val)) {
+            intValueCounts[*intVal]++;
           }
-        }
-        
-        if (!hasField) {
+        } else {
           missingField++;
         }
       }
@@ -386,19 +378,15 @@ protected:
       
       if (query.has_match()) {
         const auto& match = query.match();
-        std::string fieldName(match.field());
-        
-        for (const auto& nv : doc) {
-          if (nv.name == fieldName) {
-            if (match.val().has_s()) {
-              if (auto* strVal = std::get_if<std::string>(&nv.val)) {
-                return *strVal == match.val().s();
-              }
-            } else if (match.val().has_i()) {
-              if (auto* intVal = std::get_if<int64_t>(&nv.val)) {
-                return *intVal == match.val().i();
-              }
-            }
+        auto* val = find(doc, match.field());
+        if (!val) return false;
+        if (match.val().has_s()) {
+          if (auto* strVal = std::get_if<std::string>(val)) {
+            return *strVal == match.val().s();
+          }
+        } else if (match.val().has_i()) {
+          if (auto* intVal = std::get_if<int64_t>(val)) {
+            return *intVal == match.val().i();
           }
         }
         return false;
@@ -423,23 +411,21 @@ protected:
         }
         
         bool hasField = false;
-        for (const auto& nv : doc) {
-          if (nv.name == field) {
-            if (auto* strVal = std::get_if<std::string>(&nv.val)) {
-              counts[*strVal]++;
-              hasField = true;
-            }
+        if (auto* val = find(doc, field)) {
+          if (auto* strVal = std::get_if<std::string>(val)) {
+            counts[*strVal]++;
+            hasField = true;
           }
         }
-        
+
         if (!hasField) {
           missingCount++;
         }
       }
-      
+
       return counts;
     }
-    
+
     boost::unordered_flat_map<int64_t, int64_t> calculateIntFacets(
         const std::string& field,
         const proto::Query& query,
@@ -454,15 +440,13 @@ protected:
         }
         
         bool hasField = false;
-        for (const auto& nv : doc) {
-          if (nv.name == field) {
-            if (auto* intVal = std::get_if<int64_t>(&nv.val)) {
-              counts[*intVal]++;
-              hasField = true;
-            }
+        if (auto* val = find(doc, field)) {
+          if (auto* intVal = std::get_if<int64_t>(val)) {
+            counts[*intVal]++;
+            hasField = true;
           }
         }
-        
+
         if (!hasField) {
           missingCount++;
         }
@@ -604,24 +588,18 @@ protected:
           continue;
         }
         
-        bool hasField = false;
         std::variant<int64_t, std::string> bucketVal;
-        for (const auto& nv : doc) {
-          if (nv.name == fieldName) {
-            hasField = true;
-            if (auto* intVal = std::get_if<int64_t>(&nv.val)) {
-              intCounts[*intVal]++;
-              bucketVal = *intVal;
-            } else if (auto* strVal = std::get_if<std::string>(&nv.val)) {
-              strCounts[*strVal]++;
-              bucketVal = *strVal;
-            }
+        if (auto* val = find(doc, fieldName)) {
+          if (auto* intVal = std::get_if<int64_t>(val)) {
+            intCounts[*intVal]++;
+            bucketVal = *intVal;
+          } else if (auto* strVal = std::get_if<std::string>(val)) {
+            strCounts[*strVal]++;
+            bucketVal = *strVal;
           }
-        }
-        if (!hasField) {
-          missingCount++;
-        } else {
           bucketValues.push_back(bucketVal);
+        } else {
+          missingCount++;
         }
       }
       

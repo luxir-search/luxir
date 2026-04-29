@@ -22,6 +22,15 @@ struct NameVal {
 
 using Doc = std::vector<NameVal>;
 
+// Linear lookup for a field by name. Returns nullptr if not present.
+// Docs are tiny (a handful of fields), so a scan beats hashing.
+inline const FieldVal* find(const Doc& doc, std::string_view name) {
+  for (const auto& nv : doc) {
+    if (nv.name == name) return &nv.val;
+  }
+  return nullptr;
+}
+
 template <typename... Args>
 constexpr auto arr(Args&&... args) {
   return std::to_array({std::forward<Args>(args)...});

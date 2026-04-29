@@ -180,12 +180,11 @@ TEST_F(VectorColTest, grpcSingleFieldsRoundTrip) {
   // Results may come back in any order; check both ids are present with matching vectors.
   bool sawA = false, sawB = false;
   for (auto& d : docs) {
-    std::string id;
-    std::vector<float> vec;
-    for (auto& nv : d) {
-      if (nv.name == "id") id = std::get<std::string>(nv.val);
-      else if (nv.name == "vec_v") vec = std::get<std::vector<float>>(nv.val);
-    }
+    auto* idVal = find(d, "id");
+    auto* vecVal = find(d, "vec_v");
+    if (!idVal) continue;
+    const auto& id = std::get<std::string>(*idVal);
+    const auto& vec = std::get<std::vector<float>>(*vecVal);
     if (id == "a") {
       sawA = true;
       ASSERT_EQ(3u, vec.size());
@@ -229,12 +228,11 @@ TEST_F(VectorColTest, grpcMultiFieldsRoundTrip) {
   ASSERT_EQ(2u, docs.size());
   bool sawA = false, sawB = false;
   for (auto& d : docs) {
-    std::string id;
-    std::vector<std::vector<float>> vecs;
-    for (auto& nv : d) {
-      if (nv.name == "id") id = std::get<std::string>(nv.val);
-      else if (nv.name == "emb_vs") vecs = std::get<std::vector<std::vector<float>>>(nv.val);
-    }
+    auto* idVal = find(d, "id");
+    auto* vecsVal = find(d, "emb_vs");
+    if (!idVal) continue;
+    const auto& id = std::get<std::string>(*idVal);
+    const auto& vecs = std::get<std::vector<std::vector<float>>>(*vecsVal);
     if (id == "a") {
       sawA = true;
       EXPECT_EQ(aVecs, vecs);
