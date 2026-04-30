@@ -109,7 +109,7 @@ public:
           callback(docid, val);
         } else {
           // TODO: use bulk iter for dense domain?
-          auto [start, end] = intColReader.getStartEndRank(intColIter.rank());
+          auto [start, end] = intColReader.getStartEndValueRank(intColIter.rank());
           auto n = end - start;
           for (int64_t vrank = 0; vrank < n; vrank++) {
             auto val = intColIter.values().valueAt(start + vrank);
@@ -144,7 +144,7 @@ public:
           }
           if (iter.docId() == docid) {
             // TODO: use bulk iter for dense domain?
-            auto [start, end] = intColReader.getStartEndRank(iter.rank());
+            auto [start, end] = intColReader.getStartEndValueRank(iter.rank());
             auto n = end - start;
             for (int64_t vrank = 0; vrank < n; vrank++) {
               auto val = iter.values().valueAt(start + vrank);

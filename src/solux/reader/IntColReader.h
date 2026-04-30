@@ -211,7 +211,7 @@ private:
   InputStream columnIS;
   const NumericBlockInfo* blockMeta;  // array of block metadata
   const char* blocks;                 // start of the compressed blocks of data
-  std::optional<MonoReader> endRankReader;  // exists if multi-valued.
+  std::optional<MonoReader> endValueRankReader;  // exists if multi-valued.
   int64_t nvals;
   int32_t docsWithField = 0;
   int64_t columnMin = 0;
@@ -240,7 +240,7 @@ public:
     }
     
     if (fieldInfo.monoLoc.offset() > 0) {
-      endRankReader.emplace(postingsReader, fieldInfo.monoLoc, fieldInfo.monoMetaOff, fieldInfo.docsWithField);
+      endValueRankReader.emplace(postingsReader, fieldInfo.monoLoc, fieldInfo.monoMetaOff, fieldInfo.docsWithField);
     }
   }
 
@@ -273,9 +273,9 @@ public:
     return docs;
   }
 
-  //get underlying endRankReader, null if not multi-valued. Valid as long as IntColReader is valid.
-   MonoReader* getEndRankReader() {
-    return endRankReader ? &(*endRankReader) : nullptr;
+  //get underlying endValueRankReader, null if not multi-valued. Valid as long as IntColReader is valid.
+   MonoReader* getEndValueRankReader() {
+    return endValueRankReader ? &(*endValueRankReader) : nullptr;
   }
 
   // Number of values in field.  For a multi-valued field, this will be greater than docsWithValue
@@ -288,7 +288,7 @@ public:
   }
 
   bool multiValued() const {
-    return endRankReader.has_value();
+    return endValueRankReader.has_value();
   }
   
   int64_t getMin() const {
@@ -299,16 +299,16 @@ public:
     return columnMax;
   }
 
-  /// Retrieves the start and end ranks into the values for the given rank.
+  /// Retrieves the [startValueRank, endValueRank) range for the given doc rank.
   /// only valid if multiValued() is true
-  std::pair<int64_t, int64_t> getStartEndRank(int32_t index) {
-    return endRankReader->valuesAt(index);
+  std::pair<int64_t, int64_t> getStartEndValueRank(int32_t docRank) {
+    return endValueRankReader->valuesAt(docRank);
   }
 
-  /// Retrieves the start rank into the values for the given rank.
+  /// Retrieves the start value rank for the given doc rank.
   /// only valid if multiValued() is true
-  int64_t getStartRank(int32_t index) {
-    return index == 0 ? 0 : endRankReader->valueAt(index-1);
+  int64_t getStartValueRank(int32_t docRank) {
+    return docRank == 0 ? 0 : endValueRankReader->valueAt(docRank - 1);
   }
 
   template <class DocAcceptor>
@@ -545,7 +545,7 @@ public:
           auto val = iter.value();
           callback(idx, docid, val, 0, 1);
         } else {
-          auto [start, end] = intColReader.getStartEndRank(iter.rank());
+          auto [start, end] = intColReader.getStartEndValueRank(iter.rank());
           auto n = end - start;
           for (int64_t vrank = 0; vrank < n; vrank++) {
             auto val = iter.values().valueAt(start + vrank);

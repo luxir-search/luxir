@@ -18,7 +18,7 @@ namespace solux::handler {
 ///   - column bytes: concatenated raw value bytes (no inline metadata).
 ///   - endOffsetReader (mono2Loc): per-value -> byte offset. Absent when all values are the same
 ///     size; in that case mono2MetaOff holds the fixed value size.
-///   - endRankReader (monoLoc): per-doc -> per-value rank boundary. Present only for multi-valued.
+///   - endValueRankReader (monoLoc): per-doc -> per-value rank boundary. Present only for multi-valued.
 class StrColHandler : public Inverter::IndexHandler {
   friend Inverter;
 
@@ -179,20 +179,20 @@ public:
       fieldInfo.mono2MetaOff = endOffsetWriter.metaOff;
     }
 
-    // Write endRankReader (mono) if multi-valued.  Single-valued fields don't need one
+    // Write endValueRankReader (mono) if multi-valued.  Single-valued fields don't need one
     // because value rank == doc rank.
     if (multiValued) {
       auto guard = tmpPool.rewindScopeGuard();
       OutputStreamPtr out = postingsWriter.getOutputStream();
-      MonoWriter endRankWriter(tmpPool, *out);
-      int64_t endRank = 0;
-      valCountStream.visitValues(inverter.pool, [&endRank, &endRankWriter](auto val) {
-        endRank += val;
-        endRankWriter.addInt64(endRank);
+      MonoWriter endValueRankWriter(tmpPool, *out);
+      int64_t endValueRank = 0;
+      valCountStream.visitValues(inverter.pool, [&endValueRank, &endValueRankWriter](auto val) {
+        endValueRank += val;
+        endValueRankWriter.addInt64(endValueRank);
       });
-      endRankWriter.finish();
-      fieldInfo.monoLoc = endRankWriter.blockLoc;
-      fieldInfo.monoMetaOff = endRankWriter.metaOff;
+      endValueRankWriter.finish();
+      fieldInfo.monoLoc = endValueRankWriter.blockLoc;
+      fieldInfo.monoMetaOff = endValueRankWriter.metaOff;
     }
 
     // Write docs-with-value.

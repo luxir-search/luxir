@@ -11,7 +11,7 @@ namespace solux {
 /// schema does not need to declare dims.
 ///
 /// For single-valued fields, vectorAt(docRank) returns one span per doc.
-/// For multi-valued, valueRange(docRank) gives [startRank, endRank) and
+/// For multi-valued, valueRange(docRank) gives [startValueRank, endValueRank) and
 /// vectorAtRank(r) returns the r-th vector in the flat per-segment list.
 class VectorReader {
   StrColReader strCol_;
@@ -45,7 +45,7 @@ public:
     return vectorAtRank((int64_t)docRank);
   }
 
-  /// Multi-valued accessor: [startRank, endRank) of the given doc rank.
+  /// Multi-valued accessor: [startValueRank, endValueRank) of the given doc rank.
   /// Caller iterates with vectorAtRank to materialize each vector.
   std::pair<int64_t, int64_t> valueRange(int32_t docRank) const {
     assert(isMultiValued());

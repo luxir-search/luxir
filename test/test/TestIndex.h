@@ -292,8 +292,8 @@ namespace solux::test {
         target.push_back(val());
       } else {
         auto docrank = iter->rank();
-        auto [startRank, endRank] = colReader->getStartEndRank(docrank);
-        for (auto vrank = startRank; vrank < endRank; vrank++) {
+        auto [startValueRank, endValueRank] = colReader->getStartEndValueRank(docrank);
+        for (auto vrank = startValueRank; vrank < endValueRank; vrank++) {
           target.push_back(iter->values().valueAt(vrank));
         }
       }

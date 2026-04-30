@@ -203,17 +203,17 @@ public:
     {
       auto guard = pool.rewindScopeGuard();
       OutputStreamPtr out = postingsWriter.getOutputStream();
-      MonoWriter endRankWriter(pool, *out);
-      int64_t endRank = 0;
+      MonoWriter endValueRankWriter(pool, *out);
+      int64_t endValueRank = 0;
 
-      lengthStream.visitValues(pool, [&endRank, &endRankWriter](auto val) {
-        endRank += val;
-        endRankWriter.addInt64(endRank);
+      lengthStream.visitValues(pool, [&endValueRank, &endValueRankWriter](auto val) {
+        endValueRank += val;
+        endValueRankWriter.addInt64(endValueRank);
       });
 
-      endRankWriter.finish();
-      fieldInfo.monoLoc = endRankWriter.blockLoc;
-      fieldInfo.monoMetaOff = endRankWriter.metaOff;
+      endValueRankWriter.finish();
+      fieldInfo.monoLoc = endValueRankWriter.blockLoc;
+      fieldInfo.monoMetaOff = endValueRankWriter.metaOff;
     }
 
   }

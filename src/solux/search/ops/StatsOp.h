@@ -70,7 +70,7 @@ public:
             sum += val;
             count++;
           } else {
-            auto [start, end] = intColReader.getStartEndRank(intColIter.rank());
+            auto [start, end] = intColReader.getStartEndValueRank(intColIter.rank());
             auto n = end - start;
             for (int64_t vrank = 0; vrank < n; vrank++) {
               auto val = intColIter.values().valueAt(start + vrank);
@@ -165,7 +165,7 @@ public:
           //if (!intColReader->multiValued()) {
           e->val += intColIter->value();
           //} else {
-          //auto [start, end] = intColReader->getStartEndRank(intColIter->rank());
+          //auto [start, end] = intColReader->getStartEndValueRank(intColIter->rank());
           //auto n = end - start;
           //for (int64_t vrank = 0; vrank < n; vrank++) {
           //e->tot += intColIter->values().valueAt(start + vrank);

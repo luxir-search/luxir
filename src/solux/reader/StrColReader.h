@@ -17,14 +17,14 @@ namespace solux {
 ///   - column bytes: concatenated raw value bytes.
 ///   - endOffsetReader (optional): per-value -> byte offset. Absent when all values are
 ///     the same size; in that case fixedSize holds the common value size.
-///   - endRankReader (optional): per-doc -> per-value rank boundary. Present only for
+///   - endValueRankReader (optional): per-doc -> per-value rank boundary. Present only for
 ///     multi-valued fields.  For single-valued, value rank == doc rank.
 class StrColReader {
 private:
   DocsReader docs;
   InputStream valuesIS;                       // Stream for concatenated string values
   const char* valuesData;                     // Pointer to concatenated string data
-  std::optional<MonoReader> endRankReader;    // per-doc -> end value rank (multi-valued only)
+  std::optional<MonoReader> endValueRankReader;    // per-doc -> end value rank (multi-valued only)
   std::optional<MonoReader> endOffsetReader;  // per-value -> end byte offset (variable-size only)
   int32_t docsWithField = 0;
   int64_t nvals = 0;
@@ -40,7 +40,7 @@ public:
     nvals(fieldInfo.numValues)
   {
     if (fieldInfo.flags & FieldType::MULTI_VALUED) {
-      endRankReader.emplace(postingsReader, fieldInfo.monoLoc, fieldInfo.monoMetaOff, fieldInfo.docsWithField);
+      endValueRankReader.emplace(postingsReader, fieldInfo.monoLoc, fieldInfo.monoMetaOff, fieldInfo.docsWithField);
     }
     if (fieldInfo.mono2Loc.offset() == 0 && fieldInfo.mono2Loc.filenum() == 0) {
       fixedSize = (int32_t)fieldInfo.mono2MetaOff;
@@ -63,21 +63,21 @@ public:
   }
 
   bool isMultiValued() const {
-    return endRankReader.has_value();
+    return endValueRankReader.has_value();
   }
 
   bool isFixedSize() const {
     return !endOffsetReader.has_value();
   }
 
-  /// For multi-valued fields, returns the endRankReader which maps per-doc-rank ->
+  /// For multi-valued fields, returns the endValueRankReader which maps per-doc-rank ->
   /// end value rank (cumulative count).  Use MonoReader::valuesAt(docRank) to get
-  /// [startRank, endRank) for a doc.  Returns nullptr for single-valued fields.
+  /// [startValueRank, endValueRank) for a doc.  Returns nullptr for single-valued fields.
   /// Binary-searching the returned reader gives the inverse mapping (valueRank -> docRank),
   /// needed e.g. for vector-index chunk -> doc resolution.
   /// Valid as long as this StrColReader is valid.
-  MonoReader* getEndRankReader() {
-    return endRankReader ? &(*endRankReader) : nullptr;
+  MonoReader* getEndValueRankReader() {
+    return endValueRankReader ? &(*endValueRankReader) : nullptr;
   }
 
   /// For variable-size fields, returns the endOffsetReader which maps per-value-rank ->
@@ -112,7 +112,7 @@ public:
   /// For multi-valued fields, get the [startValueRank, endValueRank) range for a doc.
   std::pair<int64_t, int64_t> getStartEndValueRank(int32_t docRank) const {
     assert(isMultiValued());
-    return endRankReader->valuesAt(docRank);
+    return endValueRankReader->valuesAt(docRank);
   }
 
   /// Per-doc value accessor for sparse doc access patterns (e.g. top-K hits).
@@ -126,7 +126,7 @@ public:
   /// where you retrieve all values for a document.
   ///
   /// For high-density access (iterating every doc in the segment) a future BulkValues
-  /// class that also bulks the endRankReader would be a better fit.
+  /// class that also bulks the endValueRankReader would be a better fit.
   ///
   /// Valid as long as the parent StrColReader is valid.  Not thread-safe (one cache
   /// slot); callers that need concurrent access should construct one per thread.
@@ -260,7 +260,7 @@ public:
   /// Get multi-valued string values for a sorted range of docids.
   /// Calls callback(size_t input_index, int32_t docid, std::string_view value, int64_t valIdx, int64_t numVals)
   /// for each value of each docid that has values.  Within-doc value access goes through
-  /// DocValues so consecutive values share a block decode.  The endRankReader is still
+  /// DocValues so consecutive values share a block decode.  The endValueRankReader is still
   /// accessed sparsely (once per matched doc), appropriate for top-K style callers.
   static void getMultiValues(MemPool& pool, PostingsReader& postingsReader, SegFieldInfo& segFieldInfo,
                              std::ranges::input_range auto&& sortedDocIds, auto&& callback) {
@@ -275,10 +275,10 @@ public:
         foundid = iter.advance(docid);
       }
       if (foundid == docid) {
-        auto [startRank, endRank] = iter.valueRange();
-        int64_t numVals = endRank - startRank;
+        auto [startValueRank, endValueRank] = iter.valueRange();
+        int64_t numVals = endValueRank - startValueRank;
         for (int64_t v = 0; v < numVals; v++) {
-          callback(idx, docid, docValues.valueAt(startRank + v), v, numVals);
+          callback(idx, docid, docValues.valueAt(startValueRank + v), v, numVals);
         }
       } else if (foundid == StrColReader::Iterator::ENDDOC) {
         break;

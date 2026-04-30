@@ -476,32 +476,32 @@ private:
     if (outputFieldInfo.flags & FieldType::MULTI_VALUED) {
       auto guard = pool.rewindScopeGuard();
       OutputStreamPtr out = postingsWriter.getOutputStream();
-      MonoWriter endRankWriter(pool, *out);
-      int64_t endRankBase = 0;
+      MonoWriter endValueRankWriter(pool, *out);
+      int64_t endValueRankBase = 0;
 
       for (auto* field : sortedFields) {
         assert(field->segFieldInfo.flags & FieldType::MULTI_VALUED);
         // open IntColReader for each segment
         IntColReader reader( *field->seg->postingsReader, field->segFieldInfo);
-        MonoReader* endRankReader = reader.getEndRankReader();
-        assert(endRankReader != nullptr);
-        int64_t endRank;
-        for (int i = 0; i < endRankReader->numValues(); i++) {
-          endRank = endRankBase + endRankReader->valueAt(i);
-          endRankWriter.addInt64(endRank);
+        MonoReader* endValueRankReader = reader.getEndValueRankReader();
+        assert(endValueRankReader != nullptr);
+        int64_t endValueRank;
+        for (int i = 0; i < endValueRankReader->numValues(); i++) {
+          endValueRank = endValueRankBase + endValueRankReader->valueAt(i);
+          endValueRankWriter.addInt64(endValueRank);
         }
-        endRankBase = endRank;
+        endValueRankBase = endValueRank;
       }
-      endRankWriter.finish();
-      outputFieldInfo.monoLoc = endRankWriter.blockLoc;
-      outputFieldInfo.monoMetaOff = endRankWriter.metaOff;
+      endValueRankWriter.finish();
+      outputFieldInfo.monoLoc = endValueRankWriter.blockLoc;
+      outputFieldInfo.monoMetaOff = endValueRankWriter.metaOff;
     }
   }
 
 
   // Merges non-indexed string/binary columns written by StrColHandler.
   // Rebuilds the concatenated byte stream, the per-value endOffsetReader (if values are
-  // variable-size), and the per-doc endRankReader (if the field is multi-valued).
+  // variable-size), and the per-doc endValueRankReader (if the field is multi-valued).
   void mergeStrCol(std::span<MergeFieldInfo*> sortedFields, PostingsWriter& postingsWriter,
                    PostingsWriter::IndexFieldInfo& outputFieldInfo) {
     assert(sortedFields.size() == segs.size());
@@ -526,12 +526,12 @@ private:
     u_ptr<MonoWriter> endOffsetWriter = nullptr;
     OutputStreamPtr endOffsetOut;
 
-    // endRankWriter is created up-front when the field is multi-valued.
-    u_ptr<MonoWriter> endRankWriter = nullptr;
-    OutputStreamPtr endRankOut;
+    // endValueRankWriter is created up-front when the field is multi-valued.
+    u_ptr<MonoWriter> endValueRankWriter = nullptr;
+    OutputStreamPtr endValueRankOut;
     if (multiValued) {
-      endRankOut = postingsWriter.getOutputStream();
-      endRankWriter = pool.make_unique_align<MonoWriter>(8, pool, *endRankOut);
+      endValueRankOut = postingsWriter.getOutputStream();
+      endValueRankWriter = pool.make_unique_align<MonoWriter>(8, pool, *endValueRankOut);
     }
 
     int32_t docsWithField = 0;
@@ -609,11 +609,11 @@ private:
         assert(!isDense || mappedDoc == docsWithField);
 
         if (multiValued) {
-          auto [startRank, endRank] = iter.valueRange();
-          for (int64_t r = startRank; r < endRank; r++) {
+          auto [startValueRank, endValueRank] = iter.valueRange();
+          for (int64_t r = startValueRank; r < endValueRank; r++) {
             emitValue(reader.valueAt(r));
           }
-          endRankWriter->addInt64(totalValues);
+          endValueRankWriter->addInt64(totalValues);
         } else {
           emitValue(iter.value());
         }
@@ -648,11 +648,11 @@ private:
       outputFieldInfo.mono2MetaOff = (totalValues == 0) ? 0 : minSize;
     }
 
-    // endRankReader (mono)
-    if (endRankWriter) {
-      endRankWriter->finish();
-      outputFieldInfo.monoLoc = endRankWriter->blockLoc;
-      outputFieldInfo.monoMetaOff = endRankWriter->metaOff;
+    // endValueRankReader (mono)
+    if (endValueRankWriter) {
+      endValueRankWriter->finish();
+      outputFieldInfo.monoLoc = endValueRankWriter->blockLoc;
+      outputFieldInfo.monoMetaOff = endValueRankWriter->metaOff;
     }
 
     outputFieldInfo.docsWithField = docsWithField;
@@ -681,15 +681,15 @@ private:
 
     u_ptr<DocsWithValWriter> docsWriter = nullptr;  // docs with the field, created on demand if needed
 
-    u_ptr<MonoWriter> endRankWriter = nullptr; // null means single valued, otherwise multi-valued
+    u_ptr<MonoWriter> endValueRankWriter = nullptr; // null means single valued, otherwise multi-valued
     OutputStreamPtr monoOut;                   // output stream for the monoWriter.
 
     if (outputFieldInfo.flags & FieldType::MULTI_VALUED) {
       monoOut = postingsWriter.getOutputStream();
-      endRankWriter = pool.make_unique_align<MonoWriter>(8, pool, *monoOut);
+      endValueRankWriter = pool.make_unique_align<MonoWriter>(8, pool, *monoOut);
     }
 
-    int64_t endRankBase = 0;  // used to calculate the endRank for each segment, if multivalued.
+    int64_t endValueRankBase = 0;  // used to calculate the endValueRank for each segment, if multivalued.
     int32_t docsWithField = 0;
 
     for (size_t segnum = 0; segnum < sortedFields.size(); segnum++) {
@@ -712,7 +712,7 @@ private:
       assert(field->seg == &seg);
 
       IntColReader& reader = *pool.make_align<IntColReader>(8, *field->seg->postingsReader, field->segFieldInfo);
-      MonoReader* endRankReader = reader.getEndRankReader();
+      MonoReader* endValueRankReader = reader.getEndValueRankReader();
       IntColReader::BulkValues& values = *pool.make_align<IntColReader::BulkValues>(8, reader);
       screaming::BitSet::Iterator* docsIter = nullptr; // null means all docs have values.
       if (reader.docsReader().hasBitset()) {
@@ -728,9 +728,9 @@ private:
 
       // Strategy:
       //   - read nextDocWithValue
-      //   - if multiValued, read next endRank and calculate number of values (use previous endRank)
+      //   - if multiValued, read next endValueRank and calculate number of values (use previous endValueRank)
       //   - read that many values and write that many values (1 if single valued)
-      //   - write mapped docWithValue, write mapped endRank, write values.
+      //   - write mapped docWithValue, write mapped endValueRank, write values.
       //   - if the doc is deleted, still do reads, but skip the writes.
       // variable naming: In suffix is for reading, Out suffix is for writing.
 
@@ -740,7 +740,7 @@ private:
       // we don't need to check liveDocs since we have the doc mapping.
       // auto* liveBits = liveDocs[seg.ord] ? &liveDocs[seg.ord]->bitset() : nullptr;
 
-      int64_t lastEndRankIn = 0;
+      int64_t lastEndValueRankIn = 0;
       int32_t docRankIn = -1;  // rank of the doc we are on, faster than figuring out from docsIter.
       for (;;) {
         if (docsIter) {
@@ -762,13 +762,13 @@ private:
           //   - mappedDoc already contains the adjustments for the docsWithValues (docsWriter)
           // for multi-valued fields, we need to read how many values there were for this deleted doc.
           //   - end rank values written need to be adjusted down by the number of values.
-          //     (adjust endRankBase by the number of values skipped)
-          //   - lastEndRankIn needs to be maintained correctly (that's how we tell how many values a doc has)
-          if (endRankReader) {
-            int64_t endRank = endRankReader->valueAt(docRankIn);
-            auto nVals = endRank - lastEndRankIn;
-            endRankBase -= nVals; // adjust the base down by the number of values skipped.
-            lastEndRankIn = endRank;
+          //     (adjust endValueRankBase by the number of values skipped)
+          //   - lastEndValueRankIn needs to be maintained correctly (that's how we tell how many values a doc has)
+          if (endValueRankReader) {
+            int64_t endValueRank = endValueRankReader->valueAt(docRankIn);
+            auto nVals = endValueRank - lastEndValueRankIn;
+            endValueRankBase -= nVals; // adjust the base down by the number of values skipped.
+            lastEndValueRankIn = endValueRank;
           }
           continue;
         }
@@ -779,22 +779,22 @@ private:
         }
 
         docsWithField++;
-        if (endRankReader) {
+        if (endValueRankReader) {
           //  multi-valued
           // TODO: OPT: use a bulk iterator for the ranks.
-          int64_t endRank = endRankReader->valueAt(docRankIn);
+          int64_t endValueRank = endValueRankReader->valueAt(docRankIn);
 
-          // write the new endRank
-          endRankWriter->addInt64(endRankBase + endRank);
+          // write the new endValueRank
+          endValueRankWriter->addInt64(endValueRankBase + endValueRank);
 
           // transfer the values
-          for (int64_t inRank = lastEndRankIn; inRank < endRank; inRank++) {
+          for (int64_t inRank = lastEndValueRankIn; inRank < endValueRank; inRank++) {
             auto val = values.valueAt(inRank);
             intColWriter->addInt64(val);
           }
 
-          // TODO: if doc was deleted, then adjust endRankBase down by nValues.
-          lastEndRankIn = endRank;
+          // TODO: if doc was deleted, then adjust endValueRankBase down by nValues.
+          lastEndValueRankIn = endValueRank;
         } else {
           // single-valued
           auto val = values.valueAt(docRankIn);
@@ -802,9 +802,9 @@ private:
         }
       }
 
-      // endRankBase was already adjusted down for deletes, do just add the last endRankIn to
+      // endValueRankBase was already adjusted down for deletes, do just add the last endValueRankIn to
       // get the new base.
-      endRankBase += lastEndRankIn;
+      endValueRankBase += lastEndValueRankIn;
     } // for-each-seg
 
     intColWriter->finish(outputFieldInfo);
@@ -823,10 +823,10 @@ private:
       outputFieldInfo.docsWithField = postingsWriter.getMaxDoc();
       outputFieldInfo.docsWithFieldEndLoc = {0, 0};
     }
-    if (endRankWriter) {
-      endRankWriter->finish();
-      outputFieldInfo.monoLoc = endRankWriter->blockLoc;
-      outputFieldInfo.monoMetaOff = endRankWriter->metaOff;
+    if (endValueRankWriter) {
+      endValueRankWriter->finish();
+      outputFieldInfo.monoLoc = endValueRankWriter->blockLoc;
+      outputFieldInfo.monoMetaOff = endValueRankWriter->metaOff;
     }
   }
 

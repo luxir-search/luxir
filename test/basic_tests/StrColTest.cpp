@@ -422,7 +422,7 @@ TEST_F(StrColTest, fixedSizeOptimization) {
     // Test reading with StrColReader
     StrColReader strReader(postingsReader, segFieldInfo);
 
-    ASSERT_EQ(nullptr, strReader.getEndRankReader());  // No end rank reader for fixed-size strings
+    ASSERT_EQ(nullptr, strReader.getEndValueRankReader());  // No end rank reader for fixed-size strings
 
     StrColReader::Iterator iter(strReader);
 
@@ -683,7 +683,7 @@ TEST_F(StrColTest, mergeNonIndexedStrCol) {
     fieldReader.readFieldInfo(segFieldInfo);
     
     StrColReader strReader(postingsReader, segFieldInfo);
-    ASSERT_EQ(nullptr, strReader.getEndRankReader());  // Should still have no end rank reader
+    ASSERT_EQ(nullptr, strReader.getEndValueRankReader());  // Should still have no end rank reader
     
     StrColReader::Iterator iter(strReader);
     
@@ -863,7 +863,7 @@ TEST_F(StrColTest, MultiValuedFixedSizeOptimization) {
   
   // Add documents with multi-valued fields where all values are the same size (5 chars).
   // This exercises the fixed-size path where no endOffsetReader is needed; the per-doc
-  // endRankReader is still present because it's a multi-valued field.
+  // endValueRankReader is still present because it's a multi-valued field.
   {
     auto doc = flatdoc("id_s", "doc1");
     doc.push_back({"uniform_ssc", std::vector<std::string>{"aaaaa", "bbbbb"}});
@@ -897,11 +897,11 @@ TEST_F(StrColTest, MultiValuedFixedSizeOptimization) {
   SegFieldInfo segFieldInfo;
   fieldReader.readFieldInfo(segFieldInfo);
   
-  // Fixed-size multi-valued: endOffsetReader (mono2Loc) is absent, endRankReader (monoLoc) is present.
+  // Fixed-size multi-valued: endOffsetReader (mono2Loc) is absent, endValueRankReader (monoLoc) is present.
   ASSERT_EQ(0, segFieldInfo.mono2Loc.offset());
   ASSERT_EQ(0, segFieldInfo.mono2Loc.filenum());
   ASSERT_EQ(5, segFieldInfo.mono2MetaOff);  // fixed value size
-  ASSERT_NE(0, segFieldInfo.monoLoc.offset());  // endRankReader present for multi-valued
+  ASSERT_NE(0, segFieldInfo.monoLoc.offset());  // endValueRankReader present for multi-valued
   
   // Verify we can still read the values correctly
   auto* lreq = LocalReq::create(soluxNode->getSearchEngine());

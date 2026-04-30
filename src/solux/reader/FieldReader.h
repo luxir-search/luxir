@@ -34,9 +34,9 @@ struct SegFieldInfo {
   int64_t monoMetaOff;    // offset from the start of the mono column to the metadata
 
   // Optional second mono column.  Currently used by StrCol to carry both a per-doc
-  // endRankReader (in monoLoc, only when multi-valued) and a per-value endOffsetReader
-  // (in mono2Loc, only when variable-size).  When mono2Loc is unset and the column is
-  // fixed-size, mono2MetaOff holds the fixed value size.
+  // endValueRankReader (in monoLoc, only when multi-valued) and a per-value
+  // endOffsetReader (in mono2Loc, only when variable-size).  When mono2Loc is unset
+  // and the column is fixed-size, mono2MetaOff holds the fixed value size.
   seg_location mono2Loc;
   int64_t mono2MetaOff;
 };

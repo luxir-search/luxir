@@ -11,8 +11,8 @@ class OrdColWriter {
   PostingsWriter& postingsWriter;
   PostingsWriter::IndexFieldInfo& fieldInfo;
   OrdCollector& ords;
-  u_ptr<MonoWriter> endRankWriter;
-  OutputStreamPtr endRankOutput;
+  u_ptr<MonoWriter> endValueRankWriter;
+  OutputStreamPtr endValueRankOutput;
 public:
   OrdColWriter(MemPool& pool, PostingsWriter& postingsWriter, PostingsWriter::IndexFieldInfo& fieldInfo, OrdCollector& ords)
   : pool(pool), postingsWriter(postingsWriter), fieldInfo(fieldInfo), ords(ords)
@@ -20,8 +20,8 @@ public:
     if (ords.multiValued()) {
       // If this is a multivalued field, then we also need to write to another column that
       // indicates the end of the values for this doc.
-      endRankOutput = postingsWriter.getOutputStream();
-      endRankWriter = pool.make_unique<MonoWriter>(pool, *endRankOutput);
+      endValueRankOutput = postingsWriter.getOutputStream();
+      endValueRankWriter = pool.make_unique<MonoWriter>(pool, *endValueRankOutput);
     }
   }
 
@@ -43,20 +43,20 @@ public:
           nValues++;
         });
 
-        if (prev != nValues && endRankWriter) {
-          endRankWriter->addInt64(nValues);
+        if (prev != nValues && endValueRankWriter) {
+          endValueRankWriter->addInt64(nValues);
         }
         prev = nValues;
       }
 
       ordCol.finish(fieldInfo);
 
-      if (endRankWriter) {
-        endRankWriter->finish();
-        fieldInfo.monoLoc = endRankWriter->blockLoc;
-        fieldInfo.monoMetaOff = endRankWriter->metaOff;
-        endRankOutput.reset();
-        endRankWriter.reset();
+      if (endValueRankWriter) {
+        endValueRankWriter->finish();
+        fieldInfo.monoLoc = endValueRankWriter->blockLoc;
+        fieldInfo.monoMetaOff = endValueRankWriter->metaOff;
+        endValueRankOutput.reset();
+        endValueRankWriter.reset();
       }
     }
 
