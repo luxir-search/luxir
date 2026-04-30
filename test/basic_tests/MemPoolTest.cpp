@@ -2,7 +2,8 @@
 
 #include "test/SoluxTest.h"
 #include "solux/util/MemPool.h"
-#include "gtl/phmap.hpp"
+#include "solux/util/StrRef.h"
+#include <boost/unordered/unordered_node_map.hpp>
 
 using namespace std;
 using namespace solux;
@@ -132,7 +133,7 @@ TEST_F(MemPoolTest, alloc) {
     auto poolPtr = pool.ptr();
 #endif
 
-    using Map = gtl::node_hash_map<keytype, valtype, std::hash<std::string_view>, std::equal_to<>, MemPool::allocator<pairtype>>;
+    using Map = boost::unordered_node_map<keytype, valtype, PackedTermHash, PackedTermEqual, MemPool::allocator<pairtype>>;
     Map map(pool.getAllocator());
     {
       valtype v1(pool.getAllocator());

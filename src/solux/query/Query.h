@@ -2,12 +2,13 @@
 
 #include <solux/util/heap.h>
 #include "solux/util/MemPool.h"
+#include "solux/util/StrRef.h"
 #include "solux/search/IndexReader.h"
 #include "solux/reader/FieldReader.h"
 #include "solux/reader/TermsEnum.h"
 #include "solux/reader/DocsEnum.h"
 #include "solux/search/Similarity.h"
-#include "gtl/phmap.hpp"
+#include <boost/unordered/unordered_node_map.hpp>
 
 namespace solux {
 
@@ -34,8 +35,8 @@ public:
   using vec_type = std::vector<valptr, MemPool::allocator<valptr>>;
   using mapped_type = vec_type;
   using pair_type = std::pair<const key_type, vec_type>;
-  using map_type = gtl::node_hash_map<key_type, vec_type, std::hash<std::string_view>, std::equal_to<>, MemPool::allocator<pair_type>>;
-  // Using a node_hash_map in a pool will lead to less memory wasted if the map is resized.
+  using map_type = boost::unordered_node_map<key_type, vec_type, PackedTermHash, PackedTermEqual, MemPool::allocator<pair_type>>;
+  // Using a node-based map in a pool will lead to less memory wasted if the map is resized.
 
 
   MemPool& pool;
@@ -74,7 +75,7 @@ struct CachedFieldInfo {
   std::span<SegFieldInfo*> segInfos = {};
   Similarity::FieldStats fieldStats = {};
   std::span<TermsEnum*> termsEnums = {};  // TODO: cache align if they will be used in multiple threads
-  gtl::node_hash_map<std::string_view, CachedTermInfo, std::hash<std::string_view>, std::equal_to<>, MemPool::allocator<std::pair<const std::string_view, CachedTermInfo>>> termInfos;
+  boost::unordered_node_map<std::string_view, CachedTermInfo, PackedTermHash, PackedTermEqual, MemPool::allocator<std::pair<const std::string_view, CachedTermInfo>>> termInfos;
 
   explicit CachedFieldInfo(MemPool& pool, size_t initialMapSize=4) : termInfos(initialMapSize, pool.getAllocator()) {}
 };
@@ -102,7 +103,7 @@ public:
     // Weight* top = nullptr;  // if we don't need a top-weight, we can reuse a Context for multiple queries in the same request.
 
     std::span<FieldReader> fieldReaders;
-    gtl::node_hash_map<std::string_view, CachedFieldInfo, std::hash<std::string_view>, std::equal_to<>, MemPool::allocator<std::pair<const std::string_view, CachedFieldInfo>>> fieldInfoMap;
+    boost::unordered_node_map<std::string_view, CachedFieldInfo, PackedTermHash, PackedTermEqual, MemPool::allocator<std::pair<const std::string_view, CachedFieldInfo>>> fieldInfoMap;
 
     Context(MemPool& pool, IndexReader& topReader)
     : pool(pool), topReader(topReader), fieldInfoMap(4, pool.getAllocator()) {
