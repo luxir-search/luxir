@@ -2,7 +2,6 @@
 
 #include <algorithm>
 #include <boost/unordered/unordered_flat_map.hpp>
-#include <gtl/phmap.hpp>
 #include "solux/util/MemPool.h"
 #include "solux/schema/Schema.h"
 #include "PostingsWriter.h"
@@ -162,11 +161,11 @@ public:
 
 
 
-  // OPTIMIZATION: since we only do additions and not deletions, a monotonic allocator that had destructor
-  // support would be good here.  Or we could add to our MemPool and manually destruct later.
   // This could also be a Set with a little more work since the fieldname is already in the value.
   // We don't want the values to move since clients can cache and reuse when indexing.
-  gtl::flat_hash_map<std::string, std::unique_ptr<IndexHandler>> indexHandlers;
+  // Handlers are pool-allocated; u_ptr destroys them without freeing.
+  boost::unordered_flat_map<std::string, u_ptr<IndexHandler>,
+                            PackedTermHash, PackedTermEqual> indexHandlers;
 
 
   // The returned reference will be valid for the duration of indexing this block.

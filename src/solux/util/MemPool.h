@@ -52,19 +52,26 @@
 
 namespace solux {
 
-// a deleter that only calls the destructor but doesn't delete the memory.
-template <typename T>
+// A deleter that only calls the destructor but doesn't delete the memory.
+// Non-template so that u_ptr<Derived> and u_ptr<Base> share a deleter type — that lets
+// unique_ptr's standard converting assignment work for u_ptr<Derived> -> u_ptr<Base>
+// (with the usual requirement that the base has a virtual destructor).
 struct no_delete {
-  void operator()(T* ptr) {
-    ptr->~T();
-  }
+  no_delete() = default;
+  no_delete(const no_delete&) = default;
+  no_delete(no_delete&&) = default;
+  no_delete& operator=(const no_delete&) = default;
+  no_delete& operator=(no_delete&&) = default;
+
+  template <typename T>
+  void operator()(T* ptr) const noexcept { ptr->~T(); }
 };
 
 /// solux::u_ptr<T> is a unique_ptr that calls the destructor but doesn't call delete.
 /// It can be used to allocate objects from a pool but track the lifetime outside of the pool.
 /// The pool should obviously not be rewound or destroyed while there are still u_ptrs to objects.
 template <typename T>
-using u_ptr = std::unique_ptr<T, no_delete<T>>;
+using u_ptr = std::unique_ptr<T, no_delete>;
 
 /// Make a unique_ptr to T at a given address.
 template <typename T, typename... Args>

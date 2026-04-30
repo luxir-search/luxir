@@ -53,36 +53,36 @@ Inverter::IndexHandler& Inverter::createIndexHandler(const std::string_view name
   }
 
   // Create the correct IndexHandler based on the suffix.  This could be moved to FieldType::createIndexHandler()?
-  std::unique_ptr<IndexHandler> fieldHandler;
+  u_ptr<IndexHandler> fieldHandler;
 
   const std::shared_ptr<FieldType>& fieldType = ftIter->second;
 
   switch (fieldType->type()) {
     case FieldType::Type::TEXT:
-      fieldHandler = std::make_unique<handler::FullTextHandler>(*this, name, fieldType);
+      fieldHandler = pool.make_unique<handler::FullTextHandler>(*this, name, fieldType);
       break;
     case FieldType::Type::ID:
-      fieldHandler = std::make_unique<handler::IdHandler>(*this, name, fieldType);
+      fieldHandler = pool.make_unique<handler::IdHandler>(*this, name, fieldType);
       idHandler_ = fieldHandler.get();
       break;
     case FieldType::Type::STRING:
       if (!fieldType->indexed() && fieldType->hasColumn()) {
         // If the field is not indexed (column stored only), use StrColHandler
-        fieldHandler = std::make_unique<handler::StrColHandler>(*this, name, fieldType);
+        fieldHandler = pool.make_unique<handler::StrColHandler>(*this, name, fieldType);
       } else {
         // indexed and column stored (via ord)
-        fieldHandler = std::make_unique<handler::StrHandler>(*this, name, fieldType);
+        fieldHandler = pool.make_unique<handler::StrHandler>(*this, name, fieldType);
       }
       break;
     case FieldType::Type::INT:
       if (fieldType->multiValued()) {
-        fieldHandler = std::make_unique<handler::MultiIntColHandler>(*this, name, fieldType);
+        fieldHandler = pool.make_unique<handler::MultiIntColHandler>(*this, name, fieldType);
       } else {
-        fieldHandler = std::make_unique<handler::IntColHandler>(*this, name, fieldType);
+        fieldHandler = pool.make_unique<handler::IntColHandler>(*this, name, fieldType);
       }
       break;
     case FieldType::Type::VECTOR:
-      fieldHandler = std::make_unique<handler::VectorHandler>(*this, name, fieldType);
+      fieldHandler = pool.make_unique<handler::VectorHandler>(*this, name, fieldType);
       break;
     default:
       throw std::runtime_error("Unknown field type: " + std::string(name));
@@ -116,11 +116,11 @@ Inverter::IndexHandler& Inverter::createIndexHandler(const std::string_view name
     // will use defaults.  fromProto auto-registers "_stored_", so this only
     // happens for custom-named resources the user forgot to register.
     auto& writer = getOrCreateStoredFields(resourceName, resConfig);
-    fieldHandler = std::make_unique<handler::StoredFieldWrapperHandler>(
+    fieldHandler = pool.make_unique<handler::StoredFieldWrapperHandler>(
         *this, name, fieldType, std::move(fieldHandler), &writer);
   }
 
-  auto [newIter, inserted] = indexHandlers.try_emplace(name, std::move(fieldHandler));
+  auto [newIter, inserted] = indexHandlers.try_emplace(std::string(name), std::move(fieldHandler));
   assert(inserted);  // we should never (currently) be trying to overwrite an existing handler
   return *(newIter->second);
 }

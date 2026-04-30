@@ -20,7 +20,7 @@ class StoredFieldWrapperHandler final : public Inverter::IndexHandler {
 public:
   StoredFieldWrapperHandler(Inverter& inverter, std::string_view name,
                             const std::shared_ptr<FieldType>& fieldType,
-                            std::unique_ptr<IndexHandler> inner,
+                            u_ptr<IndexHandler> inner,
                             StoredFieldsWriter* writer)
     : IndexHandler(PackedTerm(inverter.pool, name), fieldType),
       inner_(std::move(inner)),
@@ -74,7 +74,7 @@ public:
   IndexHandler* inner() { return inner_.get(); }
 
 private:
-  std::unique_ptr<IndexHandler> inner_;
+  u_ptr<IndexHandler> inner_;
   StoredFieldsWriter* writer_;
 };
 

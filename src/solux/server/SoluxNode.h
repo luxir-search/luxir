@@ -1,6 +1,7 @@
 #pragma once
 
 #include <string>
+#include <gtl/phmap.hpp>
 #include "solux/store/Directory.h"
 #include "solux/store/DirectoryFactory.h"
 #include "solux/index/IndexWriter.h"
