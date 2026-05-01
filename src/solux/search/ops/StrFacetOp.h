@@ -284,7 +284,7 @@ public:
         (*strMap)[std::string(termView)] += count;
       }
       auto merged = countMerger.release(mergeableData.release());
-      if (merged == thisOp().reader.segments().size()) {
+      if ((size_t)merged == thisOp().reader.segments().size()) {
         facetResult(tg, std::unique_ptr<MergeableStrData>(countMerger.obtain()));
       }
     };
@@ -318,7 +318,7 @@ public:
       mergeableData->missing_num += missing_num;
 
       auto merged = inlineMerger.release(mergeableData.release());
-      if (merged == thisOp().reader.segments().size()) {
+      if ((size_t)merged == thisOp().reader.segments().size()) {
         facetResult2(tg, std::unique_ptr<MergeableStrFacetInline>(inlineMerger.obtain()));
       }
     }
@@ -340,7 +340,7 @@ public:
           mergeableData->missing_num += maxDoc;
         }
         auto merged = countMerger.release(mergeableData.release());
-        if (merged == thisOp().reader.segments().size()) {
+        if ((size_t)merged == thisOp().reader.segments().size()) {
           facetResult(tg, std::unique_ptr<MergeableStrData>(countMerger.obtain()));
         }
         return; // field not found, nothing to do
@@ -427,7 +427,7 @@ public:
             localCounts[ord]++;
           });
 
-        for (int i = 0; i < localCounts.size(); i++) {
+        for (size_t i = 0; i < localCounts.size(); i++) {
           auto count = localCounts[i];
           auto ord = i;
           if (count > 0) {
@@ -486,7 +486,7 @@ public:
       mergeableData->missing_num += missing_num;
 
       auto merged = countMerger.release(mergeableData.release());
-      if (merged == thisOp().reader.segments().size()) {
+      if ((size_t)merged == thisOp().reader.segments().size()) {
         facetResult(tg, std::unique_ptr<MergeableStrData>(countMerger.obtain()));
       }
     }
@@ -520,7 +520,7 @@ public:
       mergeableData->missing_num += missing_num;
 
       auto merged = countMerger.release(mergeableData.release());
-      if (merged == thisOp().reader.segments().size()) {
+      if ((size_t)merged == thisOp().reader.segments().size()) {
         facetResult(tg, std::unique_ptr<MergeableStrData>(countMerger.obtain()));
       }
     }
@@ -566,7 +566,7 @@ public:
             }
           }
         } else if (vecCounts) {
-          for (int i = 0; i < vecCounts->size(); i++) {
+          for (size_t i = 0; i < vecCounts->size(); i++) {
             if ((*vecCounts)[i] >= min) {
               ordCounts.emplace_back(i, (*vecCounts)[i]);
             }
@@ -589,7 +589,7 @@ public:
           if (sortingByCountDesc && limit != -1 && (int64_t)ordCounts.size() >= limit) {
             // already have enough counts, from overflow, and they are guaranteed to be larger than anything that didn't overflow.
           } else {
-            for (int ord = 0; ord < skinnyCounts->counts.size(); ord++) {
+            for (size_t ord = 0; ord < skinnyCounts->counts.size(); ord++) {
               auto count = skinnyCounts->counts[ord];
               if (count >= min) {
                 ordCounts.emplace_back(ord, count);

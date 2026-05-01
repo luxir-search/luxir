@@ -19,14 +19,14 @@ public:
   }
 
   void SOLUX_INLINE increment(KeyType key) {
-    assert(key >=0 && key < max);
+    assert(key >=0 && (size_t)key < max);
     if (++counts[key] == 0) {
       overflow[key] += std::numeric_limits<SkinnyType>::max() + 1;
     };
   }
 
   void SOLUX_INLINE increment(KeyType key, ValType val) {
-    assert(key >=0 && key < max && val >= 0);
+    assert(key >=0 && (size_t)key < max && val >= 0);
     size_t tot = (size_t)counts[key] + val;
     if (tot > std::numeric_limits<SkinnyType>::max()) {
       counts[key] = 0;

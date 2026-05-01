@@ -313,7 +313,7 @@ public:
 
   /// Shrink the last allocation by n bytes (backs up pos).
   void shrink(int n) {
-    assert(pos - n >= HEADER_SIZE);
+    assert((int)pos - n >= (int)HEADER_SIZE);
     pos -= n;
   }
 

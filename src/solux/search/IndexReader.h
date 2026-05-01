@@ -117,7 +117,7 @@ class IndexReader {
 public:
   // TODO: implement postingsReader sharing by passing in another IndexReader for reference.
 
-  using Segment = Segment;
+  using Segment = ::solux::Segment;
 
   // The time in microseconds when this version of the index was committed.  Guaranteed to be strictly increasing
   // with new versions of the index.

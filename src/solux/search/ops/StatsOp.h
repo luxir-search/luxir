@@ -40,7 +40,6 @@ public:
       int64_t sum = 0;
       int64_t count = 0;
       BitDocSet* bitDocs = (BitDocSet*) domain;
-      auto* domainBits = bitDocs ? &bitDocs->bits() : nullptr;
 
       auto& postingsReader = thisOp().req.reader->segments()[segnum].postingsReader();
       int32_t maxDoc = postingsReader.maxDoc();
@@ -87,7 +86,7 @@ public:
     }
 
     void checkCompletion(int64_t merged) {
-      if (merged == thisOp().req.reader->segments().size()) {
+      if ((size_t)merged == thisOp().req.reader->segments().size()) {
         auto* myVal = getTarget(nullptr, [&](solux::proto::Val& val) {
           if (slot >= 0) {
             // do array creation with mutex held since different buckets could be calculated in parallel
@@ -147,8 +146,8 @@ public:
     }
 
     int insert(void* entry, int32_t docid, int space) override {
-      if (space < sizeof(entry)) {
-        return -sizeof(entry); // not enough space to insert
+      if (space < (int)sizeof(entry)) {
+        return -(int)sizeof(entry); // not enough space to insert
       }
       auto* e = (struct entry*)entry;
       e->val = 0.0;
@@ -184,8 +183,8 @@ public:
     }
 
     std::pair<int, int> mergeNew(void* target, void* from, int space) override {
-      if (space < sizeof(entry)) {
-        return {-sizeof(entry), sizeof(entry)}; // not enough space to insert
+      if (space < (int)sizeof(entry)) {
+        return {-(int)sizeof(entry), (int)sizeof(entry)}; // not enough space to insert
       }
       auto* e = (struct entry*)target;
       e->val = 0.0;

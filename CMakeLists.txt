@@ -56,7 +56,8 @@ if (CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
           "$<$<CONFIG:RELEASE>:-g>"
 #          "$<$<CONFIG:DEBUG>:-D_GLIBCXX_DEBUG>"
   )
-  add_compile_options(-Wall -Wextra)
+  # -Wno-unused-parameter: many virtual overrides must keep base-class signature; renaming params would just be noise.
+  add_compile_options(-Wall -Wextra -Wno-unused-parameter)
   # NOTE: simdcomp lib is compiled with -D_GLIBCXX_DEBUG for debugging lib by default... and if our files aren't, it causes a segv
   # so make sure they match.  For now, we remove that flag from simdcomp.
 elseif (CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
@@ -65,7 +66,7 @@ elseif (CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
           "$<$<CONFIG:RELEASE>:-g>"
 #          "$<$<CONFIG:DEBUG>:-D_GLIBCXX_DEBUG>"
   )
-  add_compile_options(-Wall -Wextra)
+  add_compile_options(-Wall -Wextra -Wno-unused-parameter)
 elseif (CMAKE_CXX_COMPILER_ID STREQUAL "Intel")
 elseif (CMAKE_CXX_COMPILER_ID STREQUAL "MSVC")
   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -D__SSSE3__ -arch:AVX")

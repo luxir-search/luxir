@@ -514,7 +514,7 @@ TEST_F(IndexWriterTest, versionFieldOverwrite) {
 
   // Now index doc2 again with overwrite
   Doc doc2Overwrite = flatdoc("id", "doc2", "text_w", "hello version world again");
-  auto result4 = helper.index(doc2Overwrite, UpdateMessage::COMMIT, true);
+  helper.index(doc2Overwrite, UpdateMessage::COMMIT, true);
   req = LocalReq::create(helper.getSearchEngine());
   docs = req->collection("main")
                  .allQuery()
@@ -870,7 +870,6 @@ TEST_F(IndexWriterTest, testMultithreadedUpdates) {
         // One thread never modifies another threads documents.
         int localDoc = r.rint(docsPerThread);
         std::string docId = std::to_string(localDoc + tid * 1000);
-        int64_t lastUpdateVersion = 0;
 
         int operation = r.rint(3);  // 0 == update, 1 == delete, 2 = read
 
@@ -980,9 +979,9 @@ TEST_F(IndexWriterTest, segmentMergerWithDeletes) {
   auto reader3 = indexWriter->getIndexReader();
   
   LOG_TRACE("After merge: {} segments, {} total docs", reader3->segments().size(), reader3->maxDoc());
-  for (const auto& segment : reader3->segments()) {
+  for ([[maybe_unused]] const auto& segment : reader3->segments()) {
     LOG_TRACE("Merged segment {}: maxDoc={}, liveDocs={}, numDeletes={}, numLive={}",
-             segment.segInfo.seg_id, segment.segInfo.max_doc, 
+             segment.segInfo.seg_id, segment.segInfo.max_doc,
              segment.segInfo.live_docs, segment.numDeletes(), segment.numLive());
   }
   

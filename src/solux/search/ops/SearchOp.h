@@ -91,7 +91,7 @@ public:
       : Calculator(op, parent, slot, numSlots) {
     }
 
-    solux::proto::Val* getTargetForSub(solux::proto::SearchResponse* searchResponse, Calculator* sub) override {}
+    solux::proto::Val* getTargetForSub(solux::proto::SearchResponse* searchResponse, Calculator* sub) override { return nullptr; }
     void calc(oneapi::tbb::task_group* tg, int32_t segnum, DocSet* domain) override {};
     virtual void startSeg(int32_t segnum) {};
     virtual void endSeg(int32_t segnum) {};
@@ -174,7 +174,7 @@ public:
             memcpy(newptr, start, ptr - start);
             start = newptr;
             ptr = newptr + (ptr - start);
-            auto [calcSpace, otherCalcSpace] = calc->mergeNew(ptr, otherPtr, space);
+            std::tie(calcSpace, otherCalcSpace) = calc->mergeNew(ptr, otherPtr, space);
           }
           space -= calcSpace;
           ptr += calcSpace;

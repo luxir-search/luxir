@@ -137,7 +137,7 @@ public:
       bitDocs->card_++;
       return;
     }
-    if (docs.size() * 32 < max) {
+    if (docs.size() * 32 < (size_t)max) {
       docs.emplace_back(docid);
       return;
     }
@@ -173,9 +173,9 @@ inline std::unique_ptr<DocSet> DocSet::intersect(std::span<DocSet*> sets) {
     auto nWords = firstBits.sizeInWords(firstBits.size());
 
     memcpy(result.words, firstBits.words, nWords * sizeof(*result.words));
-    for (int i = 1; i < sets.size(); i++) {
+    for (size_t i = 1; i < sets.size(); i++) {
       assert(sets[i]->type == BITSET);
-      for (int64_t word = 0; word < nWords; word++) {
+      for (size_t word = 0; word < nWords; word++) {
         result.words[word] &= ((BitDocSet*)sets[i])->bits().words[word];
       }
     }
@@ -196,7 +196,7 @@ inline std::unique_ptr<DocSet> DocSet::intersect(std::span<DocSet*> sets) {
   std::vector<int32_t>* inputDocs = &docStore2;
   for (auto doc : firstArr) {
     bool missing = false;
-    for (int setid = firstbitset; setid < sets.size(); setid++) {
+    for (size_t setid = firstbitset; setid < sets.size(); setid++) {
       if (!((BitDocSet*)sets[setid])->bits().get(doc)) {
         missing = true;
         break;
@@ -207,7 +207,7 @@ inline std::unique_ptr<DocSet> DocSet::intersect(std::span<DocSet*> sets) {
     }
   }
 
-  for (int setid = 1; setid < firstbitset; setid++) {
+  for (size_t setid = 1; setid < firstbitset; setid++) {
     std::swap(outputDocs, inputDocs);
     outputDocs->clear();
     std::span<int32_t> idocs = *inputDocs;

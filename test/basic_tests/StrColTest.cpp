@@ -932,7 +932,6 @@ TEST_F(StrColTest, MultiValuedFixedSizeOptimization) {
   ASSERT_EQ(3, multiUniform.v_size());
   
   // Check each document has the expected values
-  auto& idCol = columns.at("id_s").col_s();
   for (int i = 0; i < 3; i++) {
     auto& vals = multiUniform.v(i).v();
     ASSERT_EQ(2, vals.size());

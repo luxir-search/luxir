@@ -32,7 +32,7 @@ public:
 
   FacetReq(SearchRequest& req, std::string_view fieldName, std::string_view facetName, int64_t limit, int64_t minCount, bool missing, google::protobuf::RepeatedPtrField<proto::SortSpec> sorts)
     : SearchOp(req, facetName), reader(*req.reader), fieldName(fieldName), limit(limit), minCount(minCount), missing(missing),
-      facetName(facetName), sorts(sorts) {
+      sorts(sorts), facetName(facetName) {
   }
 
   virtual ~FacetReq() = default;
@@ -390,7 +390,7 @@ solux::proto::Val* getTargetForSub(solux::proto::SearchResponse* searchResponse,
       }
       
       auto merged = countMerger.release(mergeableData.release());
-      if (merged == thisOp().reader.segments().size()) {
+      if ((size_t)merged == thisOp().reader.segments().size()) {
         facetResult();
       }
     };
@@ -504,8 +504,6 @@ public:
       }
       
       SegFieldInfo segFieldInfo;
-      int64_t missing_num = 0;
-      auto& facetReq = (FacetReq&)getOp();
       BitDocSet* bitDocs = (BitDocSet*) domain;
       auto* domainBits = bitDocs ? &bitDocs->bits() : nullptr;
       std::unique_ptr<MergeableStrFacet> mergeableData(countMerger.obtain());
@@ -543,7 +541,7 @@ public:
         counts[(std::string) (std::string_view) tenum.term()] += count;
       }
       auto merged = countMerger.release(mergeableData.release());
-      if (merged == thisOp().reader.segments().size()) {
+      if ((size_t)merged == thisOp().reader.segments().size()) {
         facetResult();
       }
     }
@@ -652,7 +650,7 @@ public:
         count[(val-start)/gap]++;
       });
       auto merged = countMerger.release(mergeableData.release());
-      if (merged == thisOp().reader.segments().size()) {
+      if ((size_t)merged == thisOp().reader.segments().size()) {
         facetResult();
       }
     };

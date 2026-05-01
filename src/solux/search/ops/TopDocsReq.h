@@ -42,7 +42,7 @@ public:
       return &(*ourVal->mutable_docs()->mutable_ops())[sub->getOp().name];
     }
 
-    Calc(TopDocsReq& op, Calculator* parent) : SearchOp::Calculator(op, parent, slot, numSlots), collectorMerger(nullptr, nullptr) {
+    Calc(TopDocsReq& op, Calculator* parent) : SearchOp::Calculator(op, parent, -1, -1), collectorMerger(nullptr, nullptr) {
 
       collectorMerger.creator = [&op]() -> MergeableCollector* {
         return new MergeableCollector(op.topCount, op.useFieldSort, op.sortFields, op.req.reader.get());
@@ -309,7 +309,7 @@ public:
       // first create span of Query::Weight in the request pool
       filterWeights = req.requestPool.make_span<Query::Weight*>(filters.size());
 
-      for (int i = 0; i < filters.size(); i++) {
+      for (size_t i = 0; i < filters.size(); i++) {
         auto* filterWeight = filters[i].second->createWeight(qcontext);
         filterWeights[i] = filterWeight;
       }

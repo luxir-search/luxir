@@ -1035,9 +1035,8 @@ TEST_F(SortCollectorTest, SortByNonIndexedStringColumn) {
     auto& docs = lreq->responses[0]->proto.ops().at("q").docs();
     ASSERT_EQ(5, docs.matches());
     
-    auto& idCol = docs.columns().at("id_s").col_s();
     auto& nameCol = docs.columns().at("name_s").col_s();
-    
+
     // Verify sort order: alice, alice, bob, charlie, david
     ASSERT_EQ("alice", nameCol.v(0));
     ASSERT_EQ("alice", nameCol.v(1));

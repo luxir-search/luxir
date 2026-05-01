@@ -34,6 +34,8 @@
 #include <tuple>
 #include <algorithm>
 #include <assert.h>
+#include <concepts>
+#include <type_traits>
 #include "solux_util.h"
 #include "MemPool.h"
 
@@ -306,6 +308,8 @@ inline int operator<=>(const PackedTerm &a, const PackedTerm &b) {
 */
 
 template<typename StringType>
+  requires (!std::is_base_of_v<PackedTerm, std::remove_cvref_t<StringType>>
+            && !std::same_as<std::remove_cvref_t<StringType>, PackedTerm>)
 // StringType just needs size() and data().... which std::string and std::string_view both have.
 inline bool operator==(const PackedTerm &p, const StringType &s) noexcept {
   auto[data, sz] = p.unpack();
@@ -314,11 +318,15 @@ inline bool operator==(const PackedTerm &p, const StringType &s) noexcept {
 }
 
 template<typename StringType>
+  requires (!std::is_base_of_v<PackedTerm, std::remove_cvref_t<StringType>>
+            && !std::same_as<std::remove_cvref_t<StringType>, PackedTerm>)
 inline bool operator==(const StringType &s, const PackedTerm &p) noexcept {
   return p == s;
 }
 
 template<typename StringType>
+  requires (!std::is_base_of_v<PackedTerm, std::remove_cvref_t<StringType>>
+            && !std::same_as<std::remove_cvref_t<StringType>, PackedTerm>)
 inline int operator<=>(const PackedTerm &p, const StringType &s) noexcept {
   auto[data, sz] = p.unpack();
   int datacmp = memcmp(data, s.data(), std::min((int) sz, (int) s.size()));
