@@ -267,6 +267,13 @@ public:
   // Schema generation read from IndexInfo on startup, written on each commit.
   uint64_t schemaGen_ = 0;
 
+  // Aux indexes (vector ANN, future autocomplete, ...) currently published in
+  // the IndexInfo file.  Read from s.olux at open, mutated only by the commit
+  // pipeline (single-threaded via the commitFinishNode).  Used for carry-forward
+  // (entries not rebuilt by this commit are preserved) and orphan-file cleanup
+  // (files referenced by the previous list but not the new one are deleted).
+  std::vector<proto::AuxIndexInfo> currentAuxIndexes_;
+
   // commit info for the index, used to track deletes.
   // This is moved to the UpdateMessage when a commit is processed and a new one is created for the next commit.
   std::unique_ptr<CommitInfo> nextCommitInfo;
@@ -414,7 +421,15 @@ private:
   void initiateCommit(UpdateMessage& msg);
   void segmentFlushBody(Inverter& inverter);
   void finishCommitBody(UpdateMessage& msg);
-  void writeIndexInfoFile(std::span<SegInfo*> segs, CommitInfo* commitInfo = nullptr);
+  void writeIndexInfoFile(std::span<SegInfo*> segs, CommitInfo* commitInfo = nullptr,
+                          std::span<const proto::AuxIndexInfo> auxIndexes = {});
+  std::vector<proto::AuxIndexInfo> buildAuxIndexes(const UpdateMessage& msg,
+                                                   std::span<SegInfo*> segsToKeep,
+                                                   std::vector<std::string>& outFilesToSync);
+  // Delete files referenced by `oldList` that aren't referenced by `newList`.
+  // Call only after the new IndexInfo file is durable.
+  void deleteOrphanedAuxFiles(const std::vector<proto::AuxIndexInfo>& oldList,
+                              const std::vector<proto::AuxIndexInfo>& newList);
   void tryDeleteSegments();
   void moveSegmentToDelete(uint64_t segId);
   void applyDeletes(std::span<SegInfo*> segs, MultiDeletesData& multiDeletesData, std::vector<std::string>& filesToSync);

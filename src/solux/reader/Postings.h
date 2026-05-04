@@ -69,6 +69,22 @@ public:
     return s;
   }
 
+  /// Filename for an aux-index file (see AuxIndexInfo in solux_types.proto).
+  /// Format: "s_<name>_<sortable_gen>_<sortable_fnum>".  The leading "s_" prefix
+  /// disambiguates from segment files (which are "s<base36>" without an underscore
+  /// after the prefix).  <name> is opaque to the file layer; callers conventionally
+  /// use "<kind_short>.<field>" (e.g. "vec.title_v") so files group naturally on ls.
+  static std::string getAuxIndexFileName(std::string_view name, uint64_t gen, uint32_t fnum) {
+    std::string s(PREFIX_FNAME);
+    s += '_';
+    s.append(name);
+    s += '_';
+    s.append(getSortableString(gen));
+    s += '_';
+    s.append(getSortableString(fnum));
+    return s;
+  }
+
   /// A file that contains deletes for the segment.  deleteGen==0 implies no deletes.
   static std::string getLiveDocsFileName(const std::string_view gen, uint64_t liveGen) {
     std::string s = std::string(PREFIX_FNAME).append(gen);

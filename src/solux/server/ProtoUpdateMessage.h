@@ -16,6 +16,10 @@ public:
   ProtoUpdateMessage(proto::UpdateRequest* req, proto::UpdateResponse* rsp=nullptr) : response(rsp), req(req) {
     commit = static_cast<CommitType>(req->commit());
     commit_within = req->commit_within_us();
+    buildAuxIndexes.reserve(req->build_aux_indexes_size());
+    for (const auto& name : req->build_aux_indexes()) {
+      buildAuxIndexes.emplace_back(name);
+    }
   }
 
   proto::UpdateResponse* getResponse() {

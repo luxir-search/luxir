@@ -30,6 +30,13 @@ struct ResolvedField {
   std::vector<std::string> filters;
   // 0 means "not set / infer from first indexed value"; > 0 means strict.
   int32_t vectorDims = 0;
+  // Tracks whether any field in the chain set metric explicitly.  Default is NONE
+  // (storage-only); a non-NONE value means an ANN aux index will be built when
+  // the field is targeted by UpdateRequest.build_aux_indexes.
+  bool hasVectorMetric = false;
+  VectorFieldType::Metric vectorMetric = VectorFieldType::METRIC_NONE;
+  bool hasVectorNormalized = false;
+  bool vectorNormalized = false;
 };
 
 using sv_flat_map = boost::unordered_flat_map<std::string_view, const proto::FieldDef*, PackedTermHash, PackedTermEqual>;
@@ -138,6 +145,26 @@ static void resolveField(std::string_view name,
     ? def.vector().dims()
     : parentResolved.vectorDims;
 
+  // vector metric: explicit set on this field overrides; otherwise inherit.
+  // proto NONE (0) is treated as "not set" so default-initialized VectorParams
+  // doesn't clobber an inherited metric.
+  if (def.has_vector() && def.vector().metric() != proto::VectorParams::NONE) {
+    r.hasVectorMetric = true;
+    r.vectorMetric = (VectorFieldType::Metric)def.vector().metric();
+  } else {
+    r.hasVectorMetric = parentResolved.hasVectorMetric;
+    r.vectorMetric = parentResolved.vectorMetric;
+  }
+
+  // vector normalized: explicit set on this field overrides; otherwise inherit.
+  if (def.has_vector() && def.vector().has_normalized()) {
+    r.hasVectorNormalized = true;
+    r.vectorNormalized = def.vector().normalized();
+  } else {
+    r.hasVectorNormalized = parentResolved.hasVectorNormalized;
+    r.vectorNormalized = parentResolved.vectorNormalized;
+  }
+
   visiting.erase(name);
   resolved[name] = std::move(r);
 }
@@ -232,6 +259,10 @@ std::shared_ptr<Schema> Schema::fromProto(const proto::SchemaDef& def, const Sch
       } else if (ft->type() == FieldType::VECTOR) {
         auto* vecFt = (VectorFieldType*)(ft.get());
         r.vectorDims = vecFt->dims_;
+        r.hasVectorMetric = true;
+        r.vectorMetric = vecFt->metric_;
+        r.hasVectorNormalized = true;
+        r.vectorNormalized = vecFt->normalized_;
       }
       resolved[name] = std::move(r);
     }
@@ -316,7 +347,8 @@ std::shared_ptr<Schema> Schema::fromProto(const proto::SchemaDef& def, const Sch
       case proto::FieldDef::VECTOR:
         // VECTOR is always fixed-size (every value in a segment must share dims).
         // dims may be 0, meaning "infer from first indexed value".
-        ft = std::make_shared<VectorFieldType>(name, r.vectorDims, flags | FieldType::FIXED_SIZE);
+        ft = std::make_shared<VectorFieldType>(name, r.vectorDims, flags | FieldType::FIXED_SIZE,
+                                               r.vectorMetric, r.vectorNormalized);
         break;
       default:
         throw std::runtime_error("Unsupported field_class for field: " + std::string(name));
@@ -410,6 +442,12 @@ void Schema::toProto(proto::SchemaDef* def) const {
       auto* vecFt = (VectorFieldType*)(ft.get());
       if (vecFt->dims_ > 0) {
         fieldDef->mutable_vector()->set_dims(vecFt->dims_);
+      }
+      if (vecFt->metric_ != VectorFieldType::METRIC_NONE) {
+        fieldDef->mutable_vector()->set_metric((proto::VectorParams::Metric)vecFt->metric_);
+      }
+      if (vecFt->normalized_) {
+        fieldDef->mutable_vector()->set_normalized(true);
       }
     }
   }

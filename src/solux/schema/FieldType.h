@@ -159,15 +159,39 @@ public:
 // through the standard binary-column path (see VectorHandler).  dims_ may be
 // 0, in which case the first indexed value in a segment fixes the segment's
 // per-vector size; a positive dims_ enforces validation at index time.
+//
+// metric_ controls whether a FAISS ANN aux index is built.  NONE means
+// storage-only; L2 / IP / COSINE pick the metric used when the field is
+// targeted by UpdateRequest.build_aux_indexes.
 class VectorFieldType : public FieldType {
 public:
-  int32_t dims_;
+  enum Metric {
+    METRIC_NONE = 0,
+    METRIC_L2 = 1,
+    METRIC_IP = 2,
+    METRIC_COSINE = 3,
+  };
 
-  VectorFieldType(std::string_view name, int32_t dims = 0, int flags = COLUMN_STORED | FIXED_SIZE)
-    : FieldType(name, FieldType::VECTOR, flags), dims_(dims) {
+  int32_t dims_;
+  Metric metric_;
+  // Caller asserts incoming vectors are unit-norm — the COSINE build path
+  // skips its copy + renormalize step.  Ignored for non-COSINE metrics.
+  bool normalized_;
+
+  VectorFieldType(std::string_view name, int32_t dims = 0,
+                  int flags = COLUMN_STORED | FIXED_SIZE,
+                  Metric metric = METRIC_NONE,
+                  bool normalized = false)
+    : FieldType(name, FieldType::VECTOR, flags),
+      dims_(dims), metric_(metric), normalized_(normalized) {
   }
 
   int32_t dims() const { return dims_; }
+  Metric metric() const { return metric_; }
+  bool normalized() const { return normalized_; }
+
+  // True iff a FAISS aux index should be built for this field when requested.
+  bool buildsAnnIndex() const { return metric_ != METRIC_NONE; }
 };
 
 // Describes a stored-fields resource (a per-segment column of LZ4-compressed

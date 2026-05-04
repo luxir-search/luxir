@@ -258,6 +258,13 @@ message UpdateRequest {
 
   // If true, return the ids of indexed documents in the response.
   bool return_ids = 11;
+
+  // Rebuild aux indexes as part of this commit.  No effect if commit == NO_COMMIT.
+  //   []                 — no rebuild
+  //   ["*"]              — rebuild every eligible aux index in the schema
+  //   ["vec.title_v"]    — rebuild this one (matched against AuxIndexInfo.name)
+  //   ["vec.*"]          — (future) glob-match by prefix
+  repeated string build_aux_indexes = 12;
 }
 
 // The response to an update request, or one or more update requests in streaming mode.
@@ -476,6 +483,31 @@ message IndexInfo {
   uint64 update_version = 5;          // Highest update version in this index (incremented on each update)
   uint64 schema_gen = 6;              // Schema generation (incremented on each schema change)
   repeated SegmentInfo segments = 15; // List if segments in this index
+
+  // Auxiliary indexes built across (some or all) segments at a particular commit.
+  // Vector ANN indexes today; future: autocomplete, spell-correction, etc.
+  repeated AuxIndexInfo aux_indexes = 16;
+}
+
+// An auxiliary (non-segment) index built at a particular commit.
+// Files use the naming convention "s_<name>_<sortable_gen>_<sortable_fnum>".
+message AuxIndexInfo {
+  string kind = 1;             // e.g. "vector_faiss"
+  string field = 2;            // empty if not field-scoped
+  string name = 3;             // unique identifier; convention: "<kind_short>.<field>" (e.g. "vec.title_v")
+  uint64 gen = 4;              // index_gen this aux index was built at
+  uint64 commit_time = 5;      // microseconds since epoch
+  repeated string files = 6;   // segment-style filenames that comprise this aux index
+  bytes opaque_meta = 7;       // kind-specific metadata blob
+
+  // Index core_gen this aux was built against.  On the next commit, an aux
+  // entry is carried forward only if its built_core_gen matches the new
+  // commit's core_gen — otherwise it's invalidated and its files deleted.
+  // Use this for aux kinds that embed segment-specific references (e.g. vector
+  // indexes mapping to (segId, localDoc)) and become incorrect after merges.
+  // Aux kinds robust to segment changes (future autocomplete, spell-check)
+  // should leave this at 0, which disables the check.
+  uint64 built_core_gen = 8;
 }
 
 // Per segment information
@@ -539,6 +571,23 @@ message VectorParams {
   // Vector dimensionality.  0 / unset means "infer from first indexed value";
   // a positive value enforces strict validation at index time.
   int32 dims = 1;
+
+  // ANN distance metric.  NONE = storage-only (no FAISS / kNN index built);
+  // L2 / IP / COSINE select the metric for the FAISS aux index produced
+  // when the field is included in UpdateRequest.build_aux_indexes.
+  enum Metric {
+    NONE = 0;
+    L2 = 1;
+    IP = 2;
+    COSINE = 3;
+  }
+  Metric metric = 2;
+
+  // Caller asserts that all values for this field are already L2-normalized
+  // (unit length).  Lets the COSINE build path skip the per-build copy +
+  // normalization and add vectors directly to FAISS via inner-product.
+  // No effect on non-COSINE metrics.  Trust-only: not validated at index time.
+  bool normalized = 3;
 }
 
 message SchemaDef {

@@ -25,6 +25,11 @@ find_package(TBB CONFIG REQUIRED)
 find_package(spdlog CONFIG REQUIRED)
 find_package(CLI11 CONFIG REQUIRED)
 find_package(lz4 CONFIG REQUIRED)
+# FAISS for vector ANN aux indexes (gcc vcpkg presets only).
+# FAISS exports OpenMP::OpenMP_CXX in its imported-target interface, so we must
+# locate OpenMP before find_package(faiss).
+find_package(OpenMP REQUIRED)
+find_package(faiss CONFIG REQUIRED)
 
 include_directories(deps)
 link_directories(deps/simdcomp)
@@ -106,3 +111,4 @@ target_link_libraries(solux_lib PRIVATE myproto)
 target_link_libraries(solux_lib PRIVATE spdlog::spdlog spdlog::spdlog_header_only)
 target_link_libraries(solux_lib PRIVATE CLI11::CLI11)
 target_link_libraries(solux_lib PRIVATE lz4::lz4)
+target_link_libraries(solux_lib PRIVATE faiss)

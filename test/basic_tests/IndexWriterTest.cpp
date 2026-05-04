@@ -246,13 +246,21 @@ TEST_F(IndexWriterTest, multiThreaded) {
 
 
   class TestProtoUpdateMessage : public ProtoUpdateMessage {
+  private:
+    // Heap-allocate the request and hand its address to the base class — that way
+    // the proto is fully constructed before any base-class code touches it.  The
+    // owner unique_ptr is initialized after the base (member init follows base
+    // init) and just adopts the same pointer for cleanup at destruction time.
+    std::unique_ptr<solux::proto::UpdateRequest> updateRequestOwner_;
   public:
-    solux::proto::UpdateRequest updateRequest;
+    solux::proto::UpdateRequest& updateRequest;
     std::function<void(TestProtoUpdateMessage&)> callback = nullptr;
 
-    // note - we are passing a not-yet-constructed UpdateRequest to the base class constructor... this isn't generally
-    // safe so if is test fails, we need to fix this (a holder class for the request and the ProtoUpdateMessage?
-    TestProtoUpdateMessage(std::function<void(TestProtoUpdateMessage&)> callback) : ProtoUpdateMessage(&updateRequest), callback(callback) {}
+    TestProtoUpdateMessage(std::function<void(TestProtoUpdateMessage&)> callback)
+      : ProtoUpdateMessage(new solux::proto::UpdateRequest()),
+        updateRequestOwner_(this->req),
+        updateRequest(*updateRequestOwner_),
+        callback(callback) {}
 
     void done(IndexWriter& iw) override {
       unused(iw);

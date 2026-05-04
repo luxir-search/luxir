@@ -21,7 +21,14 @@ public:
 
   // highest update version in this commit, including deletes and the commit message itself.
   uint64_t highestUpdateVersion = 0;
-  uint64_t indexGen = 0;  // set when the IndexInfo file is written.
+  // The index generation this commit will be published under.  Assigned by
+  // finishCommitBody once segsToKeep is finalized, then read by everything that
+  // produces commit-stage artifacts (aux index builders, IndexInfo writer).
+  uint64_t indexGen = 0;
+  // The segment-composition generation this commit will be published under.
+  // Assigned alongside indexGen in finishCommitBody.  Equal to the previous
+  // commit's core_gen if segment composition is unchanged, else previous + 1.
+  uint64_t coreGen = 0;
   // Number of segments left to flush, protected by same mutex that protects the inverter lists.
   // making this an atomic is not enough to avoid race conditions since we also depend on coordination with
   // inverter->updateMessage, among other things.
@@ -54,6 +61,13 @@ public:
   };
   CommitType commit;
   int32_t commit_within;  // TODO: implement this
+
+  // Aux index rebuild request, applied during this commit (no effect if commit == NO_COMMIT).
+  // See proto UpdateRequest.build_aux_indexes for semantics:
+  //   empty       = no rebuild
+  //   ["*"]       = rebuild all eligible
+  //   ["vec.foo"] = rebuild this specific aux index
+  std::vector<std::string> buildAuxIndexes;
 
 
   /// Filled in by the IndexWriter when the message is received.  Do not change.

@@ -1,6 +1,7 @@
 #include "IndexWriter.h"
 
 #include <boost/sort/spreadsort/string_sort.hpp>
+#include <boost/unordered/unordered_flat_set.hpp>
 #include <oneapi/tbb/task_group.h>
 #include "solux/store/OutputStream.h"
 #include "solux/store/InputStream.h"
@@ -14,6 +15,7 @@
 #include "solux/util/Signal.h"
 #include "solux/util/thread.h"
 #include "SegmentMerger.h"
+#include "VectorIndexBuilder.h"
 
 
 namespace solux {
@@ -106,6 +108,13 @@ IndexWriter::IndexWriter(Directory& dir, std::function<std::shared_ptr<Schema>()
     }
     // Sort to ensure consistent ordering for comparison (currently not needed since we sort when doing commit)
     // std::sort(lastCommittedSegIds.begin(), lastCommittedSegIds.end());
+
+    // Pull aux indexes forward so the next commit can carry them and so we
+    // know which files the previous commit referenced (for orphan cleanup).
+    currentAuxIndexes_.reserve(indexInfo.aux_indexes_size());
+    for (int i = 0; i < indexInfo.aux_indexes_size(); i++) {
+      currentAuxIndexes_.push_back(indexInfo.aux_indexes(i));
+    }
   }
 
   // Create the updateGraph.  Start with a serial node that assigns an order to each update command
@@ -675,6 +684,12 @@ void IndexWriter::finishCommitBody(UpdateMessage& msg) {
       }
     }
   }
+  // Sort segsToKeep by segId now (rather than later in writeIndexInfoFile) so
+  // every commit-stage step — buildAuxIndexes, IndexInfo serialization, and
+  // future query-time derivation of FAISS-id -> segment mapping — sees the
+  // same canonical segment order.
+  std::sort(segsToKeep.begin(), segsToKeep.end(),
+            [](const SegInfo* a, const SegInfo* b) { return a->segId < b->segId; });
 
   // Collect unsynced segment data files from segments being committed for the first time.
   for (auto seg : segsToKeep) {
@@ -686,6 +701,38 @@ void IndexWriter::finishCommitBody(UpdateMessage& msg) {
     }
   }
 
+  // Decide the new index + core generations once, up front, so every downstream
+  // piece (aux indexes, IndexInfo file) refers to the same values.  Stashed on
+  // CommitInfo so they travel with the message.
+  //
+  // segsToKeep is final at this point, so we can determine whether segment
+  // composition changed and mutate coreGen + lastCommittedSegIds now rather
+  // than deferring to writeIndexInfoFile.
+  if (msg.commitInfo) {
+    msg.commitInfo->indexGen = ++indexGen;
+
+    bool segsChanged = (segsToKeep.size() != lastCommittedSegIds.size());
+    if (!segsChanged) {
+      boost::unordered_flat_set<uint64_t> oldIds(lastCommittedSegIds.begin(),
+                                                  lastCommittedSegIds.end());
+      for (auto* s : segsToKeep) {
+        if (!oldIds.contains(s->segId)) { segsChanged = true; break; }
+      }
+    }
+    if (segsChanged) {
+      coreGen++;
+      lastCommittedSegIds.clear();
+      lastCommittedSegIds.reserve(segsToKeep.size());
+      for (auto* s : segsToKeep) lastCommittedSegIds.push_back(s->segId);
+      INDEX_DEBUG("Segment composition changed, incremented coreGen to {}", coreGen);
+    }
+    msg.commitInfo->coreGen = coreGen;
+  }
+
+  // Build aux (vector) indexes if requested.  Done before the IndexInfo file is
+  // written so the file references the new aux artifacts atomically.
+  auto auxIndexInfos = buildAuxIndexes(msg, segsToKeep, filesToSync);
+
   // Fsync all segment data and liveDocs files before writing the commit point.
   // "." syncs the directory to make renames durable.
   if (!filesToSync.empty()) {
@@ -694,7 +741,13 @@ void IndexWriter::finishCommitBody(UpdateMessage& msg) {
   }
 
   // write the segments file with only the segments that have live documents
-  writeIndexInfoFile(segsToKeep, msg.commitInfo.get());
+  writeIndexInfoFile(segsToKeep, msg.commitInfo.get(), auxIndexInfos);
+
+  // Aux index housekeeping: now that the new IndexInfo is durable, files
+  // from the previous list that aren't in the new one are unreferenced.
+  // Then publish the new list for the next commit's carry-forward.
+  deleteOrphanedAuxFiles(currentAuxIndexes_, auxIndexInfos);
+  currentAuxIndexes_ = std::move(auxIndexInfos);
 
   // Only move the segment to the delete list after the new IndexInfo file is written.
   // This way it should be safe for other threads to also try deletions.
@@ -775,10 +828,123 @@ void IndexWriter::moveSegmentToDelete(uint64_t segId) {
 }
 
 
+// Produce the aux index list to publish in this commit's IndexInfo.
+//
+// Semantics:
+//   - First, filter the previous list:
+//       * Entries with built_core_gen > 0 and != newCoreGen are dropped
+//         (segment composition changed → segment-mapped indexes like FAISS
+//         are stale; their files will be cleaned up after the commit).
+//       * Entries with built_core_gen == 0 are always carried forward
+//         (aux kinds robust to segment changes — future autocomplete, etc).
+//   - Then, if the message requested rebuilds, build matching fields, drop
+//     any carried entries whose names get rebuilt, and append the new ones.
+//
+// Aux index files are appended to outFilesToSync so they share the pre-commit
+// fsync.  Called from finishCommitBody after deletes have been applied but
+// before writeIndexInfoFile.  finishCommitBody must have set
+// msg.commitInfo->indexGen to the gen this commit will be published under.
+std::vector<proto::AuxIndexInfo> IndexWriter::buildAuxIndexes(
+    const UpdateMessage& msg,
+    std::span<SegInfo*> segsToKeep,
+    std::vector<std::string>& outFilesToSync) {
+  // finishCommitBody assigns indexGen + coreGen up front so all commit-stage
+  // artifacts share these values.
+  assert(msg.commitInfo && msg.commitInfo->indexGen > 0);
+  uint64_t newCoreGen = msg.commitInfo->coreGen;
+
+  // Step 1: filter previous list by core gen.  Build a set of "still valid"
+  // names (segment-dependent entries whose built_core_gen matches the new
+  // core gen) — rebuilding those would produce identical output, so we tell
+  // the builder to skip them.
+  std::vector<proto::AuxIndexInfo> carried;
+  carried.reserve(currentAuxIndexes_.size());
+  boost::unordered_flat_set<std::string> stillValid;
+  for (const auto& prev : currentAuxIndexes_) {
+    if (prev.built_core_gen() == 0 || prev.built_core_gen() == newCoreGen) {
+      carried.push_back(prev);
+      if (prev.built_core_gen() == newCoreGen) {
+        stillValid.emplace(prev.name());
+      }
+    }
+  }
+
+  // Step 2: if no rebuild requested, return carried list as-is.
+  if (msg.buildAuxIndexes.empty() || !schemaProvider_ || segsToKeep.empty()) {
+    return carried;
+  }
+  auto schema = schemaProvider_();
+  if (!schema) return carried;
+
+  // Step 3: build new entries for matching fields.
+  // Hold the PostingsReader shared_ptrs alive for the duration of the build,
+  // then point the builder's input struct at the raw pointers.  segsToKeep is
+  // already sorted by segId at finishCommitBody time.
+  std::vector<std::shared_ptr<PostingsReader>> prHolders;
+  std::vector<VectorIndexBuilder::SegInput> inputs;
+  prHolders.reserve(segsToKeep.size());
+  inputs.reserve(segsToKeep.size());
+  for (auto* seg : segsToKeep) {
+    auto pr = seg->sharedPostingsReader.load();
+    if (!pr) {
+      pr = std::make_shared<PostingsReader>(dir, seg->segId);
+      seg->sharedPostingsReader.store(pr);
+    }
+    inputs.push_back({seg->segId, pr.get()});
+    prHolders.push_back(std::move(pr));
+  }
+
+  VectorIndexBuilder vb(dir, std::span<const VectorIndexBuilder::SegInput>(inputs),
+                        *schema, msg.commitInfo->indexGen, newCoreGen);
+  auto newlyBuilt = vb.build(msg.buildAuxIndexes, stillValid, outFilesToSync);
+
+  // Step 4: merge — drop carried entries whose name was rebuilt, then append.
+  boost::unordered_flat_set<std::string> rebuiltNames;
+  rebuiltNames.reserve(newlyBuilt.size());
+  for (const auto& info : newlyBuilt) rebuiltNames.emplace(info.name());
+
+  std::vector<proto::AuxIndexInfo> merged;
+  merged.reserve(carried.size() + newlyBuilt.size());
+  for (const auto& prev : carried) {
+    if (!rebuiltNames.contains(std::string(prev.name()))) {
+      merged.push_back(prev);
+    }
+  }
+  for (auto& info : newlyBuilt) {
+    merged.push_back(std::move(info));
+  }
+  return merged;
+}
+
+
+// After a successful IndexInfo write, delete files referenced by the previous
+// aux index list that aren't referenced by the new one.  Carried-forward
+// entries appear in both lists, so their files survive.  Files written by a
+// rebuild for a given name supersede files from the previous build of the same
+// name and the old ones get cleaned up here.
+void IndexWriter::deleteOrphanedAuxFiles(const std::vector<proto::AuxIndexInfo>& oldList,
+                                         const std::vector<proto::AuxIndexInfo>& newList) {
+  boost::unordered_flat_set<std::string> keep;
+  for (const auto& info : newList) {
+    for (const auto& f : info.files()) keep.emplace(f);
+  }
+  for (const auto& info : oldList) {
+    for (const auto& f : info.files()) {
+      std::string fname(f);
+      if (!keep.contains(fname)) {
+        INDEX_DEBUG("deleteOrphanedAuxFiles: deleting {}", fname);
+        dir.deleteFile(fname);
+      }
+    }
+  }
+}
+
+
 // This is only called from the finishCommit node, which has concurrency==1 (single-threaded)
 // hence we only need to protect against changes in the segInfos map, not multiple invocations of this method.
 // The passed span of segments may be reordered after this is finished.
-void IndexWriter::writeIndexInfoFile(std::span<SegInfo*> segs, CommitInfo* commitInfo) {
+void IndexWriter::writeIndexInfoFile(std::span<SegInfo*> segs, CommitInfo* commitInfo,
+                                     std::span<const proto::AuxIndexInfo> auxIndexes) {
   // We should be able to write the segments file without holding the indexMutex,
   // as long as we access only fields that should not change on SegInfo.
   // liveDocs + liveGen won't change because we only apply deletes in finishCommitBody().
@@ -798,50 +964,42 @@ void IndexWriter::writeIndexInfoFile(std::span<SegInfo*> segs, CommitInfo* commi
               now_us - lastCommitTime.load());
   uint64_t numDocs = 0;
 
-  // Sort the list of segments by the segId.
-  // Some tests rely on not reordering segments.
-  std::sort(segs.begin(), segs.end(), [](const SegInfo* a, const SegInfo* b) {
-    /*
-    // first sort on number of documents (largest first), then on segment id (smallest first)
-    if (a->maxDoc != b->maxDoc) {
-      return a->maxDoc > b->maxDoc;
-    }
-     */
-    return a->segId < b->segId;
-  });
+  // Caller (finishCommitBody) sorts by segId before us so aux-index building
+  // sees the same canonical order.  Defensive sort for the test-only no-commitInfo
+  // path where the caller hasn't sorted.
+  if (!commitInfo) {
+    std::sort(segs.begin(), segs.end(),
+              [](const SegInfo* a, const SegInfo* b) { return a->segId < b->segId; });
+  }
+  assert(std::is_sorted(segs.begin(), segs.end(),
+                        [](const SegInfo* a, const SegInfo* b) { return a->segId < b->segId; }));
   
-  // Check if segment composition has changed
-  bool segsChanged = false;
-  if (segs.size() != lastCommittedSegIds.size()) {
-    segsChanged = true;
-  } else {
-    for (size_t i = 0; i < segs.size(); i++) {
-      if (segs[i]->segId != lastCommittedSegIds[i]) {
-        segsChanged = true;
-        break;
-      }
-    }
-  }
-
-  if (segsChanged) {
-    INDEX_DEBUG("Segment composition changed, incrementing coreGen to {}", coreGen);
-    coreGen++; // Increment core generation when segments change
-    lastCommittedSegIds.clear();
-    lastCommittedSegIds.reserve(segs.size());
-    for (auto seg : segs) {
-      lastCommittedSegIds.push_back(seg->segId);
-    }
-  }
-
   uint64_t updateVersion = 0;
-  uint64_t thisIndexGen = ++indexGen; // increment the index generation for this commit.
+  uint64_t thisIndexGen;
   if (commitInfo) {
-    // if we have a commit info, use the update version from it.
+    // finishCommitBody assigned indexGen + coreGen up front (and updated
+    // lastCommittedSegIds at the same time) so aux-index building and this
+    // write share single values.
+    assert(commitInfo->indexGen > 0);
+    thisIndexGen = commitInfo->indexGen;
     updateVersion = commitInfo->updateMessage->updateVersion;
-    commitInfo->indexGen = thisIndexGen;
   }
   else {
-    // Otherwise, use the current update base.  This is only for older tests.
+    // Test-only path (no commitInfo): assign on the fly, including the
+    // segsChanged check that finishCommitBody normally performs.
+    bool segsChanged = (segs.size() != lastCommittedSegIds.size());
+    if (!segsChanged) {
+      for (size_t i = 0; i < segs.size(); i++) {
+        if (segs[i]->segId != lastCommittedSegIds[i]) { segsChanged = true; break; }
+      }
+    }
+    if (segsChanged) {
+      coreGen++;
+      lastCommittedSegIds.clear();
+      lastCommittedSegIds.reserve(segs.size());
+      for (auto seg : segs) lastCommittedSegIds.push_back(seg->segId);
+    }
+    thisIndexGen = ++indexGen;
     updateVersion = updateBase + 1;
   }
 
@@ -877,6 +1035,15 @@ void IndexWriter::writeIndexInfoFile(std::span<SegInfo*> segs, CommitInfo* commi
 
     numDocs += seg->maxDoc;
     INDEX_DEBUG("\t{}", *seg);
+  }
+
+  // Carry over aux indexes built during this commit.
+  for (const auto& aux : auxIndexes) {
+    auto* dst = indexInfo.add_aux_indexes();
+    *dst = aux;
+    if (dst->commit_time() == 0) {
+      dst->set_commit_time(now_us);
+    }
   }
 
   // Serialize the protobuf message - TODO: hook into other serialization methods to avoid string
@@ -1218,6 +1385,7 @@ void IndexWriter::testDeleteAllData() {
     indexGen = 0;
     coreGen = 0;
     lastCommittedSegIds.clear();
+    currentAuxIndexes_.clear();
     nextCommitInfo = std::make_unique<CommitInfo>();
 
     lastCommitTime = lastAdvertisedCommitTime = 0;

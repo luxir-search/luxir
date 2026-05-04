@@ -1,6 +1,7 @@
 #pragma once
 
 #include "FieldReader.h"
+#include "solux/util/screaming.h"
 
 namespace solux {
 class DocsReader {
