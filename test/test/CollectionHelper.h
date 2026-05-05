@@ -90,8 +90,30 @@ public:
     return *collection_;
   }
 
-  void commit() {
-    collection().getShard()->getIndexWriter()->commit();
+  void commit(const std::vector<std::string>& buildAuxIndexes = {}) {
+    auto writer = collection().getShard()->getIndexWriter();
+    if (buildAuxIndexes.empty()) {
+      writer->commit();
+      return;
+    }
+
+    class BlockingProtoUpdateMessage : public ProtoUpdateMessage {
+    public:
+      Blocker blocker;
+      explicit BlockingProtoUpdateMessage(proto::UpdateRequest* req) : ProtoUpdateMessage(req) {}
+      void done(IndexWriter& iw) override { unused(iw); blocker.notify(); }
+    };
+
+    google::protobuf::Arena arena;
+    auto* request = google::protobuf::Arena::Create<proto::UpdateRequest>(&arena);
+    request->set_commit(proto::UpdateRequest::COMMIT);
+    for (const auto& n : buildAuxIndexes) request->add_build_aux_indexes(n);
+
+    BlockingProtoUpdateMessage msg(request);
+    bool success = writer->submitUpdate(&msg);
+    assert(success);
+    unused(success);
+    msg.blocker.wait();
   }
 
   IndexResult index(const Doc& doc, UpdateMessage::CommitType commitType = UpdateMessage::NO_COMMIT, bool overwrite = false) {

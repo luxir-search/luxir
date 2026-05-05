@@ -61,25 +61,6 @@ std::unique_ptr<faiss::Index> readFaissIndex(Directory& dir, std::string_view fn
   return std::unique_ptr<faiss::Index>(faiss::read_index(&r));
 }
 
-// Submits a commit request with build_aux_indexes set.
-void commitWithAuxBuild(IndexWriter& writer, const std::vector<std::string>& names) {
-  google::protobuf::Arena arena;
-  auto* req = google::protobuf::Arena::Create<proto::UpdateRequest>(&arena);
-  req->set_commit(proto::UpdateRequest::COMMIT);
-  for (const auto& n : names) req->add_build_aux_indexes(n);
-
-  class BlockingMsg : public ProtoUpdateMessage {
-  public:
-    Blocker blocker;
-    explicit BlockingMsg(proto::UpdateRequest* r) : ProtoUpdateMessage(r) {}
-    void done(IndexWriter& iw) override { unused(iw); blocker.notify(); }
-  };
-
-  BlockingMsg msg(req);
-  ASSERT_TRUE(writer.submitUpdate(&msg));
-  msg.blocker.wait();
-}
-
 // Install a schema where _v has metric=L2.
 void enableL2OnVecSuffix(Collection& col) {
   proto::SchemaDef def;
@@ -117,7 +98,7 @@ TEST_F(VectorIndexBuilderTest, basicBuildSingleSegment) {
   }
 
   // Trigger a commit that also rebuilds all aux indexes.
-  commitWithAuxBuild(*h.getIndexWriter(), {"*"});
+  h.commit({"*"});
 
   auto& shardDir = h.getIndexWriter()->dir;
 
@@ -177,7 +158,7 @@ TEST_F(VectorIndexBuilderTest, buildAcrossMultipleSegments) {
   }
 
   // Final commit triggers the build over all three segments.
-  commitWithAuxBuild(*h.getIndexWriter(), {"vec.embedding_v"});
+  h.commit({"vec.embedding_v"});
 
   google::protobuf::Arena arena;
   auto* info = readIndexInfo(h.getIndexWriter()->dir, arena);
@@ -206,7 +187,7 @@ TEST_F(VectorIndexBuilderTest, selectorMiss) {
 
   Doc d = flatdoc("id", std::string("a"), "embedding_v", std::vector<float>{1, 2, 3});
   h.index(d);
-  commitWithAuxBuild(*h.getIndexWriter(), {"vec.does_not_exist_v"});
+  h.commit({"vec.does_not_exist_v"});
 
   google::protobuf::Arena arena;
   auto* info = readIndexInfo(h.getIndexWriter()->dir, arena);
@@ -225,7 +206,7 @@ TEST_F(VectorIndexBuilderTest, carryForwardOnDeleteOnlyCommit) {
   Doc d2 = flatdoc("id", std::string("b"), "embedding_v", std::vector<float>{0, 1, 0});
   h.index(d1);
   h.index(d2);
-  commitWithAuxBuild(*h.getIndexWriter(), {"*"});
+  h.commit({"*"});
 
   google::protobuf::Arena arena1;
   auto* info1 = readIndexInfo(h.getIndexWriter()->dir, arena1);
@@ -259,7 +240,7 @@ TEST_F(VectorIndexBuilderTest, invalidatedOnSegmentChange) {
 
   Doc d1 = flatdoc("id", std::string("a"), "embedding_v", std::vector<float>{1, 0, 0});
   h.index(d1);
-  commitWithAuxBuild(*h.getIndexWriter(), {"*"});
+  h.commit({"*"});
 
   google::protobuf::Arena arena1;
   auto* info1 = readIndexInfo(h.getIndexWriter()->dir, arena1);
@@ -288,7 +269,7 @@ TEST_F(VectorIndexBuilderTest, rebuildDeletesPreviousFiles) {
 
   Doc d1 = flatdoc("id", std::string("a"), "embedding_v", std::vector<float>{1, 0, 0});
   h.index(d1);
-  commitWithAuxBuild(*h.getIndexWriter(), {"*"});
+  h.commit({"*"});
 
   google::protobuf::Arena arena1;
   auto* info1 = readIndexInfo(h.getIndexWriter()->dir, arena1);
@@ -298,7 +279,7 @@ TEST_F(VectorIndexBuilderTest, rebuildDeletesPreviousFiles) {
   // Add a new doc and rebuild — produces a fresh gen of files.
   Doc d2 = flatdoc("id", std::string("b"), "embedding_v", std::vector<float>{0, 1, 0});
   h.index(d2);
-  commitWithAuxBuild(*h.getIndexWriter(), {"*"});
+  h.commit({"*"});
 
   google::protobuf::Arena arena2;
   auto* info2 = readIndexInfo(h.getIndexWriter()->dir, arena2);
@@ -343,7 +324,7 @@ TEST_F(VectorIndexBuilderTest, cosineRenormalizesByDefault) {
   Doc d2 = flatdoc("id", std::string("b"), "v_v", std::vector<float>{0, 5, 0});
   h.index(d1);
   h.index(d2);
-  commitWithAuxBuild(*h.getIndexWriter(), {"*"});
+  h.commit({"*"});
 
   google::protobuf::Arena arena;
   auto* info = readIndexInfo(h.getIndexWriter()->dir, arena);
@@ -388,7 +369,7 @@ TEST_F(VectorIndexBuilderTest, normalizedFlagSkipsRenorm) {
   Doc d2 = flatdoc("id", std::string("b"), "v_v", std::vector<float>{0, 1, 0});
   h.index(d1);
   h.index(d2);
-  commitWithAuxBuild(*h.getIndexWriter(), {"*"});
+  h.commit({"*"});
 
   google::protobuf::Arena arena;
   auto* info = readIndexInfo(h.getIndexWriter()->dir, arena);
@@ -417,7 +398,7 @@ TEST_F(VectorIndexBuilderTest, rebuildSkippedWhenStillValid) {
   Doc d2 = flatdoc("id", std::string("b"), "embedding_v", std::vector<float>{0, 1, 0});
   h.index(d1);
   h.index(d2);
-  commitWithAuxBuild(*h.getIndexWriter(), {"*"});
+  h.commit({"*"});
 
   google::protobuf::Arena arena1;
   auto* info1 = readIndexInfo(h.getIndexWriter()->dir, arena1);
@@ -429,7 +410,7 @@ TEST_F(VectorIndexBuilderTest, rebuildSkippedWhenStillValid) {
   // valid; the original file should still be on disk and referenced.
   std::vector<std::string> ids{"a"};
   h.deleteByIds(ids);
-  commitWithAuxBuild(*h.getIndexWriter(), {"*"});
+  h.commit({"*"});
 
   google::protobuf::Arena arena2;
   auto* info2 = readIndexInfo(h.getIndexWriter()->dir, arena2);
@@ -470,7 +451,7 @@ TEST_F(VectorIndexBuilderTest, cosineRenormChunkBoundaries) {
     Doc d = flatdoc("id", "doc" + std::to_string(i), "v_v", vecs[i]);
     h.index(d);
   }
-  commitWithAuxBuild(*h.getIndexWriter(), {"*"});
+  h.commit({"*"});
 
   google::protobuf::Arena arena;
   auto* info = readIndexInfo(h.getIndexWriter()->dir, arena);
@@ -505,7 +486,7 @@ TEST_F(VectorIndexBuilderTest, metricNoneIsIneligible) {
 
   Doc d = flatdoc("id", std::string("a"), "embedding_v", std::vector<float>{1, 2, 3});
   h.index(d);
-  commitWithAuxBuild(*h.getIndexWriter(), {"*"});
+  h.commit({"*"});
 
   google::protobuf::Arena arena;
   auto* info = readIndexInfo(h.getIndexWriter()->dir, arena);
