@@ -51,8 +51,9 @@ public:
   // Consumers of UpdateMessage will not touch it after this call.
   virtual void done(IndexWriter& iw) = 0;
 
-  // See docs in solux.proto:UpdateRequest
-  // NOTE: These values should be kept in sync with the protobuf definition.
+  // Internal commit-kind enum.  The proto API exposes commit-or-not via presence of
+  // proto::CommitParams; SILENT_COMMIT and CONSISTENT_COMMIT are placeholders for future
+  // wiring (no internal branches act on them yet).
   enum CommitType {
     NO_COMMIT = 0,         // the default
     COMMIT = 1,            // ensure new data is searchable
@@ -63,7 +64,7 @@ public:
   int32_t commit_within;  // TODO: implement this
 
   // Aux index rebuild request, applied during this commit (no effect if commit == NO_COMMIT).
-  // See proto UpdateRequest.build_aux_indexes for semantics:
+  // See proto CommitParams.build_aux_indexes for semantics:
   //   empty       = no rebuild
   //   ["*"]       = rebuild all eligible
   //   ["vec.foo"] = rebuild this specific aux index

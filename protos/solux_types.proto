@@ -210,6 +210,29 @@ message Bucket {
 //  Indexing
 //
 
+// Parameters governing how a commit is performed.  Presence of this message in an
+// UpdateRequest indicates the request should commit; absence means no commit.
+message CommitParams {
+  // Commit within this many microseconds.
+  // This parameter can be useful to ensure that too many commits aren't being done that can hurt
+  // both indexing and search performance, but still places an upper bound on how stale the data can be.
+  // The default value of 0 causes an immediate commit before the response is sent,
+  // while a positive value will not wait for the commit before the response is sent.
+  uint64 commit_within_us = 1;
+
+  // Rebuild aux indexes as part of this commit.
+  //   []                 — no rebuild
+  //   ["*"]              — rebuild every eligible aux index in the schema
+  //   ["vec.title_v"]    — rebuild this one (matched against AuxIndexInfo.name)
+  //   ["vec.*"]          — (future) glob-match by prefix
+  // When non-empty, wait_for_merges is implicitly enabled so the aux build sees post-merge segments.
+  repeated string build_aux_indexes = 2;
+
+  // If true, this commit will wait for any in-flight merges to finish before publishing.
+  // Implicitly true when build_aux_indexes is non-empty.
+  bool wait_for_merges = 3;
+}
+
 message UpdateRequest {
   // request_id is optional and opaque (server does not care what the value is).  If provided, the server will
   // use it in the UpdateResponse.  This is useful for the client to correlate requests and responses in
@@ -232,39 +255,20 @@ message UpdateRequest {
   // effectively enable a mix of column oriented and row oriented.
   Columns columns = 5;
 
-  enum CommitType {
-    NO_COMMIT = 0;         // the default
-    COMMIT = 1;            // ensure new data is searchable
-    SILENT_COMMIT = 2;     // the commit will be "silent" (won't necessarily cause new searchers to be opened)
-    // CONSISTENT_COMMIT = 3; // FUTURE - ensure distributed searchers will see new data
-  }
-  CommitType commit = 6;
-
-  // Commit within this many microseconds.  Does not have an effect if commit is NO_COMMIT.
-  // This parameter can be useful to ensure that too many commits aren't being done that can hurt
-  // both indexing and search performance, but still places an upper bound on how stale the data can be.
-  // If CommitType != NO_COMMIT, the default value of 0 causes an immediate commit before the response is sent,
-  // while a positive value will not wait for the commit before the response is sent.
-  uint64 commit_within_us = 7;
-
   // Document IDs to delete.
-  repeated string delete_ids = 8;
+  repeated string delete_ids = 6;
 
   // If true, existing documents with the same ID will be overwritten by documents in this request.
-  bool overwrite = 9;
+  bool overwrite = 7;
 
   // If true, all documents in this request must be successfully indexed or none will be.
-  bool all_or_none = 10;
+  bool all_or_none = 8;
 
   // If true, return the ids of indexed documents in the response.
-  bool return_ids = 11;
+  bool return_ids = 9;
 
-  // Rebuild aux indexes as part of this commit.  No effect if commit == NO_COMMIT.
-  //   []                 — no rebuild
-  //   ["*"]              — rebuild every eligible aux index in the schema
-  //   ["vec.title_v"]    — rebuild this one (matched against AuxIndexInfo.name)
-  //   ["vec.*"]          — (future) glob-match by prefix
-  repeated string build_aux_indexes = 12;
+  // Commit parameters.  If present, this request will commit; if absent, no commit is performed.
+  CommitParams commit = 10;
 }
 
 // The response to an update request, or one or more update requests in streaming mode.

@@ -106,8 +106,8 @@ public:
 
     google::protobuf::Arena arena;
     auto* request = google::protobuf::Arena::Create<proto::UpdateRequest>(&arena);
-    request->set_commit(proto::UpdateRequest::COMMIT);
-    for (const auto& n : buildAuxIndexes) request->add_build_aux_indexes(n);
+    auto* params = request->mutable_commit();
+    for (const auto& n : buildAuxIndexes) params->add_build_aux_indexes(n);
 
     BlockingProtoUpdateMessage msg(request);
     bool success = writer->submitUpdate(&msg);
@@ -152,9 +152,9 @@ public:
     }
     
     // Set commit type and overwrite flag
-    request->set_commit(static_cast<proto::UpdateRequest::CommitType>(commitType));
+    if (commitType != UpdateMessage::NO_COMMIT) request->mutable_commit();
     request->set_overwrite(overwrite);
-    
+
     // Create and submit the update message
     IndexResult result;
     BlockingProtoUpdateMessage updateMessage(request, &result);
@@ -201,8 +201,8 @@ public:
     }
     
     // Set commit type
-    request->set_commit(static_cast<proto::UpdateRequest::CommitType>(commitType));
-    
+    if (commitType != UpdateMessage::NO_COMMIT) request->mutable_commit();
+
     // Create and submit the update message
     IndexResult result;
     BlockingProtoUpdateMessage updateMessage(request, &result);
@@ -264,9 +264,9 @@ public:
     }
     
     // Set commit type and overwrite flag
-    request->set_commit(static_cast<proto::UpdateRequest::CommitType>(commitType));
+    if (commitType != UpdateMessage::NO_COMMIT) request->mutable_commit();
     request->set_overwrite(overwrite);
-    
+
     auto* updateMessage = new ProtoUpdateMessageWithCallback(request, std::move(arena));
     updateMessage->callback = std::move(callback);
     

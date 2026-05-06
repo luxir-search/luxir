@@ -218,6 +218,7 @@ TEST_F(IndexWriterTest, multiThreaded) {
   int docsToAdd = 100;
   int percentReads = 20;
   int percentCommits = 50;  // really stress segment flushing / merging
+  int percentWaitForMerges = 30;  // of commits, fraction that wait for in-flight merges before publishing
 
   RAMDir dir;
   IndexWriter iw(dir);
@@ -273,7 +274,7 @@ TEST_F(IndexWriterTest, multiThreaded) {
 
   auto cb = [&](TestProtoUpdateMessage& msg) {
             TEST_DEBUG("done called! adds in this request={}", msg.updateRequest.docs_size());
-    if (msg.updateRequest.commit() == solux::proto::UpdateRequest::COMMIT) {
+    if (msg.updateRequest.has_commit()) {
       commits++;
     }
     docsAdded += msg.updateRequest.docs_size();
@@ -375,7 +376,13 @@ TEST_F(IndexWriterTest, multiThreaded) {
                           }
                         }
 
-                        ureq->set_commit(doCommit ? solux::proto::UpdateRequest::COMMIT : solux::proto::UpdateRequest::NO_COMMIT);
+                        if (doCommit) {
+                          auto* params = ureq->mutable_commit();
+                          if (rng.rint(100) < percentWaitForMerges) {
+                            params->set_wait_for_merges(true);
+                            msg->waitForMerges = true;
+                          }
+                        }
                         // Normal ProtoUpdateMessage sets commit from request in constructor. Since that has already passed, need to do it manually here.
                         msg->commit = doCommit ? UpdateMessage::CommitType::COMMIT : UpdateMessage::CommitType::NO_COMMIT;
                         for (int i = 0; i < numAdds; i++) {

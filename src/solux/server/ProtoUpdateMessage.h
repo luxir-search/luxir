@@ -14,11 +14,17 @@ public:
   proto::UpdateRequest* req;  // The request object may become unavailable after the callback is called
 
   ProtoUpdateMessage(proto::UpdateRequest* req, proto::UpdateResponse* rsp=nullptr) : response(rsp), req(req) {
-    commit = static_cast<CommitType>(req->commit());
-    commit_within = req->commit_within_us();
-    buildAuxIndexes.reserve(req->build_aux_indexes_size());
-    for (const auto& name : req->build_aux_indexes()) {
-      buildAuxIndexes.emplace_back(name);
+    if (req->has_commit()) {
+      commit = COMMIT;
+      const auto& params = req->commit();
+      commit_within = params.commit_within_us();
+      waitForMerges = params.wait_for_merges();
+      buildAuxIndexes.reserve(params.build_aux_indexes_size());
+      for (const auto& name : params.build_aux_indexes()) {
+        buildAuxIndexes.emplace_back(name);
+      }
+    } else {
+      commit = NO_COMMIT;
     }
   }
 

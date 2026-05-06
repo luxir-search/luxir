@@ -122,13 +122,16 @@ public:
   }
 
 
-  void doSingleUpdate(bool commit, int64_t docnum=0) {
+  void doSingleUpdate(bool commit, int64_t docnum=0, bool waitForMerges=false) {
     solux::proto::UpdateRequest ureq;
     solux::proto::UpdateResponse response;
     grpc::ClientContext context;
 
     ureq.mutable_collection()->add_name("main");
-    ureq.set_commit(commit ? solux::proto::UpdateRequest::COMMIT : solux::proto::UpdateRequest::NO_COMMIT);
+    if (commit) {
+      auto* params = ureq.mutable_commit();
+      if (waitForMerges) params->set_wait_for_merges(true);
+    }
 
     fillDoc(docnum, *ureq.add_docs());
 
@@ -160,7 +163,7 @@ public:
   // How we do things here in the client isn't actually ok depending on how the server is implemented and could
   // lead to deadlock if we are insisting on writing more messages and the server is waiting for us to read more.
   // Ideally, a separate thread is used for reading the responses.  This should also increase efficiency/throughput.
-  void doStreamingUpdates(Rng& r, int64_t nMessages, int commitPercent, int64_t docnum=-1) {
+  void doStreamingUpdates(Rng& r, int64_t nMessages, int commitPercent, int64_t docnum=-1, int waitForMergesPercent=0) {
     solux::proto::UpdateRequest req;
     solux::proto::UpdateResponse response;
     grpc::ClientContext context;  // need a new one for each RPC
@@ -199,7 +202,10 @@ public:
         solux::proto::UpdateRequest req;
         req.mutable_collection()->add_name("main");
         if (r.rint(0, 100) < commitPercent) {
-          req.set_commit(solux::proto::UpdateRequest::COMMIT);
+          auto* params = req.mutable_commit();
+          if (r.rint(0, 100) < waitForMergesPercent) {
+            params->set_wait_for_merges(true);
+          }
         }
 
         fillDoc(docnum + nWrites, *req.add_docs());
@@ -306,7 +312,7 @@ public:
   }
 
 
-  void doThreadSafeIndex(int nThreads, int64_t nDocs, int streamingPercent, int commitPercent) {
+  void doThreadSafeIndex(int nThreads, int64_t nDocs, int streamingPercent, int commitPercent, int waitForMergesPercent=0) {
 
     // we use threads here instead of tasks because there was an issue with task_group::wait
     // stealing work that somehow led to a deadlock.
@@ -335,10 +341,12 @@ public:
                   } while (!docsIndexed.compare_exchange_weak(docnumStart, docnumStart + sz, std::memory_order_relaxed));
 
                   if (streaming) {
-                    doStreamingUpdates(r, sz, commitPercent, docnumStart);
+                    doStreamingUpdates(r, sz, commitPercent, docnumStart, waitForMergesPercent);
                   } else {
                     ASSERT_EQ(sz, 1);
-                    doSingleUpdate(r.rint(100) < commitPercent, docnumStart);
+                    bool commit = r.rint(100) < commitPercent;
+                    bool waitForMerges = commit && r.rint(100) < waitForMergesPercent;
+                    doSingleUpdate(commit, docnumStart, waitForMerges);
                   }
                 }
               }
@@ -646,13 +654,14 @@ TEST_F(GrpcIndexTest, threadsafeIndex) {
   int64_t nDocs = 100;  // pump this up for good stress testing.
   int streamingPercent = 50;  // percent of the requests that use streaming
   int commitPercent = 10;
+  int waitForMergesPercent = 30;  // of commits, fraction that wait for in-flight merges before publishing
   uint32_t percentFacet = 50; // percent of the requests that use facets
 
   // clear the index
   solux::test::CollectionHelper ch("main");
   ch.clear();
 
-  doThreadSafeIndex(nThreads, nDocs, streamingPercent, commitPercent);
+  doThreadSafeIndex(nThreads, nDocs, streamingPercent, commitPercent, waitForMergesPercent);
 
   RequestCreator requestCreator = [&](int64_t docid, solux::proto::SearchRequest& req) {
     req.mutable_collection()->add_name("main");
@@ -907,7 +916,7 @@ TEST_F(GrpcIndexTest, visibility) {
     solux::proto::UpdateResponse response;
 
     req.mutable_collection()->add_name("main");
-    req.set_commit(solux::proto::UpdateRequest::COMMIT);
+    req.mutable_commit();
 
     auto& fields = *req.add_docs()->mutable_fields();
     fields["text1_w"].set_s("x3");
