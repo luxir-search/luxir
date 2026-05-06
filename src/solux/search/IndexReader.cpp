@@ -1,7 +1,9 @@
 #include "IndexReader.h"
 #include "solux/reader/Postings.h"
+#include "solux/reader/VectorAuxReader.h"
 
 #include "protos/solux_types.pb.h"
+#include <boost/unordered/unordered_flat_map.hpp>
 #include <google/protobuf/arena.h>
 #include <google/protobuf/io/coded_stream.h>
 #include <google/protobuf/io/zero_copy_stream_impl_lite.h>
@@ -95,10 +97,21 @@ IndexReader::IndexReader(Directory& dir, IndexReader* previousReader) {
   
   google::protobuf::Arena arena;
 
+  // Index previous reader's aux readers by name for cheap reuse when the new
+  // commit carried the entry forward (same gen + built_core_gen).  FAISS
+  // deserialization is the expensive part; reuse keeps reopens cheap.
+  boost::unordered_flat_map<std::string, std::shared_ptr<AuxReader>> prevAuxByName;
+  if (previousReader) {
+    for (const auto& r : previousReader->auxReadersList) {
+      prevAuxByName.emplace(std::string(r->getName()), r);
+    }
+  }
+
   do {
     if (retry) {
       IREADER_DEBUG("Retrying IndexReader open");
       segs.clear();
+      auxReadersList.clear();
       totalMaxDoc = 0;
       livedocs = 0;
       retry = false;
@@ -180,6 +193,46 @@ IndexReader::IndexReader(Directory& dir, IndexReader* previousReader) {
         totalMaxDoc += segs.back().postingsReader().maxDoc();
         livedocs += segs.back().numLive();
         assert(nDocs == segs.back().postingsReader().maxDoc());
+      }
+
+      // Aux indexes: open inside the same retry loop so a missing aux file
+      // converts to a re-parse of IndexInfo (writer deletes orphaned aux files
+      // only after publishing the new IndexInfo, so the retry will see a
+      // referenceable list).  Unknown-kind entries are skipped silently.
+      if (!retry) {
+        for (int i = 0; i < indexInfo->aux_indexes_size(); i++) {
+          const auto& info = indexInfo->aux_indexes(i);
+
+          // Reuse from the previous reader when name + gen + built_core_gen
+          // all match — the writer carry-forward logic guarantees the files
+          // are byte-identical in that case.
+          auto prevIt = prevAuxByName.find(std::string(info.name()));
+          if (prevIt != prevAuxByName.end()
+              && prevIt->second->getGen() == info.gen()
+              && prevIt->second->getBuiltCoreGen() == info.built_core_gen()) {
+            IREADER_DEBUG("Reusing aux reader '{}' (gen={}) from previous IndexReader",
+                          info.name(), info.gen());
+            auxReadersList.push_back(prevIt->second);
+            continue;
+          }
+
+          // Dispatch by kind.  Unknown kinds are silently skipped so older
+          // binaries can read indexes that contain newer aux kinds.
+          std::shared_ptr<AuxReader> aux;
+          if (info.kind() == VectorAuxReader::KIND) {
+            aux = VectorAuxReader::open(dir, info, missingFileOK);
+          } else {
+            IREADER_DEBUG("Skipping unknown aux kind '{}' for '{}'", info.kind(), info.name());
+            continue;
+          }
+
+          if (!aux) {
+            IREADER_DEBUG("Aux file missing for '{}' — triggering retry", info.name());
+            retry = true;
+            break;
+          }
+          auxReadersList.push_back(std::move(aux));
+        }
       }
     }
   }

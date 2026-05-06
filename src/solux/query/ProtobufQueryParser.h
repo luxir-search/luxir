@@ -4,6 +4,7 @@
 #include "solux/query/Query.h"
 #include "solux/query/TermQuery.h"
 #include "solux/query/AllQuery.h"
+#include "solux/query/KnnQuery.h"
 #include "solux/schema/Schema.h"
 #include "protos/solux.grpc.pb.h"
 
@@ -91,6 +92,29 @@ public:
   }
 
 
+  solux::Query* parseKnn(const solux::proto::KnnQuery& knnQuery) {
+    std::string_view field = knnQuery.field();
+    FieldType& fieldType = *schema.getFieldTypeEx(field);
+    if (fieldType.type() != FieldType::Type::VECTOR) {
+      throw std::runtime_error(std::format("KnnQuery on non-vector field: {}", field));
+    }
+    if (!knnQuery.query().has_f32()) {
+      throw std::runtime_error(std::format(
+        "KnnQuery for field '{}' is missing query vector (only f32 supported in v1)", field));
+    }
+    const auto& f32 = knnQuery.query().f32().v();
+    // RepeatedField<float> is contiguous; the proto storage outlives the
+    // pool-allocated query tree (request arena), so pointing into it is safe.
+    std::span<const float> queryVec(f32.data(), (size_t)f32.size());
+
+    int32_t k = knnQuery.k();
+    if (k <= 0) {
+      throw std::runtime_error(std::format("KnnQuery for field '{}' must have k > 0 (got {})", field, k));
+    }
+
+    return pool.make<solux::KnnQuery>(field, queryVec, k);
+  }
+
   solux::Query* parse(const solux::proto::Query& pquery) {
     switch(pquery.kind_case()) {
       case solux::proto::Query::kMatch: {
@@ -101,6 +125,9 @@ public:
       }
       case solux::proto::Query::kAll: {
         return pool.make<solux::AllQuery>();
+      }
+      case solux::proto::Query::kKnn: {
+        return parseKnn(pquery.knn());
       }
       default:
         throw std::runtime_error(std::format("Unknown query type for proto field {} ({})", (int)pquery.kind_case(), pquery.GetDescriptor()->FindFieldByNumber(pquery.kind_case())->name()));

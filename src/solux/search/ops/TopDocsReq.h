@@ -299,48 +299,58 @@ public:
 
 
   //  req, *qcontext, query, limit
+  // NOTE: keep this constructor nothrow.  TopDocsReq is created via
+  // google::protobuf::Arena::Create<TopDocsReq>, which registers
+  // ~TopDocsReq() with the arena *before* the body runs.  A throw mid-ctor
+  // leaves a half-constructed object scheduled for cleanup, and
+  // ~TopDocsReq() crashes on uninitialized members during arena reset.
+  // All work that can throw (Weight construction, schema lookups for sort
+  // fields) goes in init(), which runs after the object is fully built.
   TopDocsReq(SearchRequest& req, std::string_view name, const proto::TopDocs& topDocsProto, Query::Context& qcontext, Query* query, int64_t topCount,
     std::span<std::pair<std::string_view, Query*>> filters)
-    : SearchOp(req, name), topDocsProto(topDocsProto), qcontext(qcontext), query(query), topCount(topCount), filters(filters) {
-    weight = query->createWeight(qcontext);
+    : SearchOp(req, name), topDocsProto(topDocsProto), qcontext(qcontext), query(query),
+      weight(nullptr), topCount(topCount), filters(filters) {
+  }
 
-    // if filters not empty, create a span in the request pool with a weight for each filter
-    if (filters.size() > 0) {
-      // first create span of Query::Weight in the request pool
-      filterWeights = req.requestPool.make_span<Query::Weight*>(filters.size());
+  // Build sort fields, the main weight, and the filter weights here rather
+  // than in the ctor so that throwing paths (schema field-not-found, kNN
+  // dim mismatch, etc.) propagate cleanly out of submitBody.  See ctor
+  // comment for the arena-cleanup hazard.
+  void init() override {
+    SearchOp::init();
 
-      for (size_t i = 0; i < filters.size(); i++) {
-        auto* filterWeight = filters[i].second->createWeight(qcontext);
-        filterWeights[i] = filterWeight;
-      }
-    }
-    
-    // Parse sort fields from protobuf
+    // Sort fields can throw if the schema doesn't have the field.
     if (topDocsProto.sorts_size() > 0) {
       useFieldSort = true;
       // Static instances of special field types
       static ScoreFieldType scoreType;
       static DocFieldType docType;
-      
+
       for (const auto& sortSpec : topDocsProto.sorts()) {
-        SortField::SortOrder order = sortSpec.dir() == proto::SortSpec::DESC ? 
+        SortField::SortOrder order = sortSpec.dir() == proto::SortSpec::DESC ?
           SortField::DESC : SortField::ASC;
         FieldComparator::MissingValue missing = FieldComparator::MISSING_LAST;
-        
-        // Check for special fields first
+
         if (sortSpec.field() == "_score_") {
-            sortFields.emplace_back(sortSpec.field(), scoreType, order, missing);
+          sortFields.emplace_back(sortSpec.field(), scoreType, order, missing);
         } else if (sortSpec.field() == "_docid_") {
-            sortFields.emplace_back(sortSpec.field(), docType, order, missing);
+          sortFields.emplace_back(sortSpec.field(), docType, order, missing);
         } else {
-            // Look up field type in schema and use new constructor
-            auto fieldTypePtr = req.schema->getFieldTypeEx(sortSpec.field());
-            if (!fieldTypePtr) {
-                throw std::runtime_error(std::string("Field not found in schema: ") + std::string(sortSpec.field()));
-            }
-            // Use the new constructor that accepts FieldType for better comparator selection
-            sortFields.emplace_back(sortSpec.field(), *fieldTypePtr, order, missing);
+          auto fieldTypePtr = req.schema->getFieldTypeEx(sortSpec.field());
+          if (!fieldTypePtr) {
+            throw std::runtime_error(std::string("Field not found in schema: ") + std::string(sortSpec.field()));
+          }
+          sortFields.emplace_back(sortSpec.field(), *fieldTypePtr, order, missing);
         }
+      }
+    }
+
+    // Weight ctors run validation that can throw (e.g. KnnQuery dim check).
+    weight = query->createWeight(qcontext);
+    if (filters.size() > 0) {
+      filterWeights = req.requestPool.make_span<Query::Weight*>(filters.size());
+      for (size_t i = 0; i < filters.size(); i++) {
+        filterWeights[i] = filters[i].second->createWeight(qcontext);
       }
     }
   }

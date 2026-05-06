@@ -3,6 +3,7 @@
 
 #include "DocSet.h"
 #include "OrdMap.h"
+#include "solux/reader/AuxReader.h"
 #include "solux/reader/PostingsReader.h"
 #include "solux/util/screaming.h"
 #include "solux/util/SharedLazyMap.h"
@@ -129,6 +130,26 @@ public:
     return segs;
   }
 
+  // Aux readers for entries in the parsed IndexInfo.aux_indexes (in the same
+  // order).  Unknown-kind entries are omitted, so this list may be shorter
+  // than IndexInfo.aux_indexes.
+  std::span<const std::shared_ptr<AuxReader>> auxReaders() const noexcept {
+    return auxReadersList;
+  }
+
+  // Returns the aux reader with the given name, or nullptr if not present.
+  // Names are unique across an index (e.g. "vec.title_v").
+  // TODO: replace this O(n) scan with a name → AuxReader hash map populated
+  // at IndexReader construction.  Fine for v1 (≤ a handful of aux entries
+  // per shard); revisit if we add many cheap aux kinds (autocomplete,
+  // spell-check) so the per-query lookup count grows.
+  std::shared_ptr<AuxReader> getAuxReader(std::string_view name) const {
+    for (const auto& r : auxReadersList) {
+      if (r->getName() == name) return r;
+    }
+    return nullptr;
+  }
+
   int64_t maxDoc() const noexcept {
     return totalMaxDoc;
   }
@@ -158,6 +179,7 @@ public:
 
 private:
   std::vector<Segment> segs;
+  std::vector<std::shared_ptr<AuxReader>> auxReadersList;
   uint64_t coreGeneration = 0;
   int64_t totalMaxDoc = 0;
   int64_t livedocs = 0;

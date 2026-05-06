@@ -92,6 +92,7 @@ message Query {
     bool all = 3;                   // selects all documents
     string field = 4;               // selects all documents with the given field name.  // TODO: what about field regex?
     PhraseQuery phrase = 5;         // selects all documents with a phrase
+    KnnQuery knn = 6;               // approximate nearest-neighbor over a vector field
 
     // TODO: a looser string match that will auto-convert to correct type
     // TODO: a text query type (parsed by QueryParser)
@@ -102,6 +103,25 @@ message Query {
   }
 
 
+}
+
+// Approximate-nearest-neighbor query against a vector field's FAISS aux
+// index (kind="vector_faiss").  Requires the field to have been built into
+// the index via UpdateRequest.CommitParams.build_aux_indexes (or "*").
+//
+// V1 limitations:
+//   - Single-valued vector fields only (multi-valued vectors aren't yet
+//     mapped to docs).
+//   - The query vector's dimensionality must match the index.
+//
+// Deleted-doc vectors live in the FAISS index until the next rebuild;
+// liveDocs filtering happens *inside* the FAISS search via an IDSelector,
+// so callers always get exactly `k` live results (or fewer if the index has
+// fewer than k live vectors).
+message KnnQuery {
+  string field = 1;        // vector field name (e.g. "embedding_v")
+  Vector query = 2;        // query vector — must match the field's dims
+  int32 k = 3;             // number of nearest neighbors to return
 }
 
   // use NamedValue here instead? Repeat field so this can be used to query multiple fields at once? Add a field glob/regex?
