@@ -334,6 +334,14 @@ void IndexWriter::commit(UpdateMessage::CommitType commitType) {
 void IndexWriter::initiateCommit(UpdateMessage& msg) {
   INDEX_DEBUG("initiateCommit: msg={} STARTING", (void*)&msg);
 
+  // A commit that requests aux index builds must run finishCommitBody after
+  // any in-flight merges have finished — otherwise the merge-triggered
+  // synthetic commit can race in behind us, bump coreGen, and invalidate the
+  // aux we just built.  Same gating mechanism as flushes (leftToFlush).
+  if (!msg.buildAuxIndexes.empty()) {
+    msg.waitForMerges = true;
+  }
+
   {
     const std::lock_guard<std::mutex> lock(indexMutex);
 
@@ -342,6 +350,17 @@ void IndexWriter::initiateCommit(UpdateMessage& msg) {
     nextCommitInfo = std::make_unique<CommitInfo>();
     auto& commitInfo = *msg.commitInfo;
     commitInfo.updateMessage = &msg; // set the update message that triggered this commit
+
+    // Register with the merge gate.  Invariant: every member of
+    // waitingForMerges has +1 on leftToFlush while a merge is running.
+    // If we're joining mid-merge, self-bump so the merge tail's decrement
+    // walk picks us up.
+    if (msg.waitForMerges) {
+      waitingForMerges.push_back(&msg);
+      if (mergePolicy->mergeRunning) {
+        commitInfo.leftToFlush++;
+      }
+    }
 
     // first look at any flushing inverters that are not marked for a commit yet
     // and mark them if necessary.
@@ -391,9 +410,20 @@ void IndexWriter::initiateCommit(UpdateMessage& msg) {
     // Normally a commit would be kicked off by the last segment flushing.  But if there are no segments to flush,
     // we need to kick it off here.
     if (commitInfo.leftToFlush == 0) {
-      commitSequencerNode->try_put(&msg);
+      _releaseToCommitSequencer(&msg);
     }
   } // end mutex protected section
+}
+
+// Caller must hold indexMutex.
+void IndexWriter::_releaseToCommitSequencer(UpdateMessage* msg) {
+  if (msg->waitForMerges) {
+    auto it = std::find(waitingForMerges.begin(), waitingForMerges.end(), msg);
+    if (it != waitingForMerges.end()) {
+      waitingForMerges.erase(it);
+    }
+  }
+  commitSequencerNode->try_put(msg);
 }
 
 // Inverter for the segment should already be in the flushingInverters list.
@@ -434,7 +464,6 @@ void IndexWriter::segmentFlushBody(Inverter& inverter) {
 
   std::unique_ptr<Inverter> inverterPtr;
 
-  bool triggerCommit = false;
   {
     const std::lock_guard<std::mutex> lock(indexMutex);
     INDEX_DEBUG("segmentFlushBody: inverter {} flushed. Adding {}", (void*)&inverter, *segInfo);
@@ -454,15 +483,6 @@ void IndexWriter::segmentFlushBody(Inverter& inverter) {
     inverterPtr = std::move(it->second);
     flushingInverters.erase(it);
 
-    // The mutex protects against races in the setting of inverter.updateMessage as well as leftToFlush.
-    // Higher level logical races protected against would be kicking off a segment flush and then that completing and
-    // kicking off a commit before the next segment flush is kicked off.
-    if (inverter.commitInfo != nullptr) {
-      if (--inverter.commitInfo->leftToFlush == 0) {
-        triggerCommit = true;
-      }
-    }
-
     // move any deletes from the inverter to the relevant commit info.
     if (inverter.hasDeletions()) {
       CommitInfo& commitInfo = inverter.commitInfo ? *inverter.commitInfo : *nextCommitInfo;
@@ -471,16 +491,27 @@ void IndexWriter::segmentFlushBody(Inverter& inverter) {
       commitInfo.multiDeletesData.deletes.emplace_back(std::move(inverter.sortedDeletes));
     }
 
-    // Check if we should merge anything.
+    // Check if we should merge anything.  Must happen *before* the leftToFlush
+    // decrement: if this flush triggers a merge and the inverter's commit is
+    // a member of waitingForMerges, _maybeMergeSegments will bump its
+    // leftToFlush.  Doing the bump first ensures the subsequent decrement
+    // doesn't prematurely fire triggerCommit (and release the message into
+    // commitSequencerNode while a merge still holds it as a waiter).
     // We do this with the lock held since segInfo could go away otherwise.
     if (success) {
       mergePolicy->_maybeMergeSegments(iter.first->second.get());
     }
-  }
 
-  // It shouldn't be a big deal to do a try_put inside the sync block, but it's safe to do outside anyway.
-  if (triggerCommit) {
-    commitSequencerNode->try_put(inverter.commitInfo->updateMessage);
+    // The mutex protects against races in the setting of inverter.updateMessage as well as leftToFlush.
+    // Higher level logical races protected against would be kicking off a segment flush and then that completing and
+    // kicking off a commit before the next segment flush is kicked off.
+    // Release inside the same lock block so a concurrent _maybeMergeSegments
+    // can't bump leftToFlush back up between our 0-check and the try_put.
+    if (inverter.commitInfo != nullptr) {
+      if (--inverter.commitInfo->leftToFlush == 0) {
+        _releaseToCommitSequencer(inverter.commitInfo->updateMessage);
+      }
+    }
   }
 
   // the inverter (inverterPtr) should go out of scope and be deleted at this point
@@ -1112,6 +1143,27 @@ void IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
   if (segs.empty()) {
     // This is possible if a merge was correctly triggered, but all of the segments were deleted.
     INDEX_DEBUG("mergeSegmentsBody: no segments to merge for msg={}", (void*)&msg);
+    // Nothing merged, so no synthetic commit needed — but we still need to
+    // balance the gate: clear mergeRunning, chain a follow-up merge if some
+    // other level is now full, and decrement leftToFlush on every member of
+    // waitingForMerges to undo our start-bump.  Same ordering as the normal
+    // merge tail: chain check before decrement, so a chain re-bump can keep
+    // a commit waiting.
+    {
+      const std::lock_guard<std::mutex> lock(indexMutex);
+      mergePolicy->mergeRunning = false;
+      mergePolicy->_maybeMergeSegments(nullptr);
+      std::vector<UpdateMessage*> toRelease;
+      for (auto* waitingMsg : waitingForMerges) {
+        assert(waitingMsg->commitInfo);
+        if (--waitingMsg->commitInfo->leftToFlush == 0) {
+          toRelease.push_back(waitingMsg);
+        }
+      }
+      for (auto* releasedMsg : toRelease) {
+        _releaseToCommitSequencer(releasedMsg);
+      }
+    }
     msg.done(*this);
     return; // nothing to merge
   }
@@ -1211,10 +1263,6 @@ void IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
 
     // This races with the commit code (see comments in finishCommitBody()).
     // tryDeleteSegments(); // try to delete segments that are now empty
-
-    // even though we're not quite done yet, it's OK if another merge is checked/submitted since
-    // we've updated segInfos and the mergePolicy.
-    mergePolicy->mergeRunning = false;
   } // end of scope for preaders, pool, and pwriter
 
 
@@ -1225,16 +1273,45 @@ void IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
 
 
 
-  // check if we should send a commit so the new segment gets referenced.
+  // Coordinate merge teardown with the commit-with-aux gate.  Order under
+  // indexMutex matters:
+  //   1. mergeRunning = false.
+  //   2. Possibly chain a follow-up merge.  This re-sets mergeRunning and
+  //      bumps leftToFlush on every member of waitingForMerges.
+  //   3. Decrement leftToFlush on every member of waitingForMerges to undo
+  //      our own bump, collecting any that hit zero.
+  // Doing (2) before (3) is the "wait for the merge wave" semantic: if a
+  // chain re-bumps before we decrement, net change is zero and the commit
+  // keeps waiting; if no chain, the decrement may release.
   bool triggerCommit = false;
   {
     const std::lock_guard<std::mutex> lock(indexMutex);
+    mergePolicy->mergeRunning = false;
     auto anotherMerge = mergePolicy->_maybeMergeSegments(nullptr);
-    if (!anotherMerge) {
+
+    std::vector<UpdateMessage*> toRelease;
+    for (auto* waitingMsg : waitingForMerges) {
+      assert(waitingMsg->commitInfo);
+      if (--waitingMsg->commitInfo->leftToFlush == 0) {
+        toRelease.push_back(waitingMsg);
+      }
+    }
+
+    // Synthetic commit only fires when nothing else will publish the
+    // merged segment.  Skip it if any commit-with-aux is in waitingForMerges
+    // (those commits will publish the merged segment via their own
+    // IndexInfo write and would otherwise race with a synthetic on a
+    // coreGen bump).  toRelease members are still in waitingForMerges at
+    // this point so the empty check covers them.
+    if (!anotherMerge && waitingForMerges.empty()) {
       if (busyInverters.empty() && flushingInverters.empty() && idleInverters.empty()) {
         // no indexing activity, so let's trigger a commit.
         triggerCommit = true;
       }
+    }
+
+    for (auto* releasedMsg : toRelease) {
+      _releaseToCommitSequencer(releasedMsg);
     }
   }
 

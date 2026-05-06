@@ -209,6 +209,14 @@ public:
 
       MyMergeMessage* msg = new MyMergeMessage();
       msg->mergeLevel = mergeLevel;
+      // Maintain the invariant that every member of waitingForMerges has +1
+      // on leftToFlush while a merge is running.  The merge tail walks the
+      // list again to undo this; late joiners (added between now and merge
+      // end) self-bump in initiateCommit since they observe mergeRunning.
+      for (auto* waitingMsg : iw.waitingForMerges) {
+        assert(waitingMsg->commitInfo);
+        waitingMsg->commitInfo->leftToFlush++;
+      }
       iw.mergeSegmentsNode->try_put(msg);
       return true;
     }
@@ -243,6 +251,15 @@ public:
   boost::unordered_flat_map<Inverter*, std::unique_ptr<Inverter>> idleInverters;
   boost::unordered_flat_map<Inverter*, std::unique_ptr<Inverter>> busyInverters;
   boost::unordered_flat_map<Inverter*, std::unique_ptr<Inverter>> flushingInverters;
+
+  // Commits whose finishCommitBody must wait for in-flight merges to complete
+  // (i.e. msg.waitForMerges was set).  Invariant: while a merge is running,
+  // every member has +1 on its commitInfo.leftToFlush.  Maintained by the
+  // four mutation points: add (initiateCommit, with self-bump if mergeRunning),
+  // remove (_releaseToCommitSequencer when leftToFlush hit 0), merge start
+  // (bumps every member), merge tail (decrements every member, possibly
+  // re-bumped by a chain merge first).  Protected by indexMutex.
+  std::vector<UpdateMessage*> waitingForMerges;
 
   // The last updateNumber generated (the first update number generated will be 1)
   uint64_t updateNumber = 0;
@@ -419,6 +436,11 @@ private:
   }
 
   void initiateCommit(UpdateMessage& msg);
+  // Submit a message into commitSequencerNode.  If the message was a member of
+  // waitingForMerges (msg.waitForMerges set), de-register it under indexMutex
+  // before the try_put so subsequent merges don't bump a counter nobody reads.
+  // Caller must hold indexMutex.
+  void _releaseToCommitSequencer(UpdateMessage* msg);
   void segmentFlushBody(Inverter& inverter);
   void finishCommitBody(UpdateMessage& msg);
   void writeIndexInfoFile(std::span<SegInfo*> segs, CommitInfo* commitInfo = nullptr,

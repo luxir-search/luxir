@@ -69,6 +69,15 @@ public:
   //   ["vec.foo"] = rebuild this specific aux index
   std::vector<std::string> buildAuxIndexes;
 
+  // Set to true to make this commit wait for any in-flight (or chained) merges
+  // before it runs finishCommitBody.  The merge code uses leftToFlush as the
+  // gate: every in-flight merge bumps the counter when it starts and
+  // decrements it when it finishes.  Auto-set to true by initiateCommit when
+  // buildAuxIndexes is non-empty so the aux build sees post-merge segments
+  // and the merge-triggered synthetic commit can't race in afterward and
+  // invalidate the aux on a coreGen bump.
+  bool waitForMerges = false;
+
 
   /// Filled in by the IndexWriter when the message is received.  Do not change.
   uint64_t updateVersion;             // The version of this update, used to ensure updates are processed in order when needed
