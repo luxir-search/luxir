@@ -493,17 +493,17 @@ TEST_F(SchemaTest, indexAndSearchWithExplicitField) {
 TEST_F(SchemaTest, fieldClassDefaults) {
   proto::SchemaDef def;
 
-  // STRING field with no explicit flags — should get default indexed=true, column_stored=true
+  // STRING field with no explicit flags - should get default indexed=true, column_stored=true
   auto* f1 = def.add_fields();
   f1->set_name("str_field");
   f1->set_field_class(proto::FieldDef::STRING);
 
-  // INT field with no explicit flags — should get default indexed=false, column_stored=true
+  // INT field with no explicit flags - should get default indexed=false, column_stored=true
   auto* f2 = def.add_fields();
   f2->set_name("int_field");
   f2->set_field_class(proto::FieldDef::INT);
 
-  // TEXT field with no explicit flags — should get default indexed=true, column_stored=false
+  // TEXT field with no explicit flags - should get default indexed=true, column_stored=false
   auto* f3 = def.add_fields();
   f3->set_name("text_field");
   f3->set_field_class(proto::FieldDef::TEXT);
@@ -530,7 +530,7 @@ TEST_F(SchemaTest, fieldClassDefaults) {
 TEST_F(SchemaTest, missingFieldClass) {
   proto::SchemaDef def;
 
-  // Field with no field_class and no parent — should error
+  // Field with no field_class and no parent - should error
   auto* f = def.add_fields();
   f->set_name("broken");
 
@@ -757,7 +757,7 @@ TEST_F(SchemaTest, loadSchemaAfterOldFileDeleted) {
 
   auto baseSchema = Schema::createDefaultSchema();
 
-  // setSchema — writes _schema.<gen1>
+  // setSchema - writes _schema.<gen1>
   proto::SchemaDef def1;
   auto* f1 = def1.add_fields();
   f1->set_name("field1");
@@ -769,7 +769,7 @@ TEST_F(SchemaTest, loadSchemaAfterOldFileDeleted) {
   auto& dir = *ch.collection().getShard()->getDirectory();
   ASSERT_TRUE(dir.deleteFile(schemaFileName(gen1)));
 
-  // loadSchema should fail — no schema files remain
+  // loadSchema should fail - no schema files remain
   EXPECT_FALSE(ch.collection().loadSchema()) << "Should fail with no schema files";
 
   // Now do two setSchema calls so the first gen's file gets cleaned up naturally

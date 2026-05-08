@@ -45,7 +45,7 @@ private:
           }
         },
         [&](const std::vector<float>& v) {
-          // Treat as a single dense vector — vector<float> is only used for
+          // Treat as a single dense vector - vector<float> is only used for
           // VECTOR fields in test inputs.  Plain multi-valued FLOAT scalar
           // fields (if/when added) would need a different FieldVal variant.
           auto* f32 = val.mutable_vec()->mutable_f32();

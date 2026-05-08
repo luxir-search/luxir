@@ -180,7 +180,7 @@ public:
   // and the string_views inside it are only valid during the callback
   // (see the class-level lifetime contract).  Returns true if at least
   // one entry was found.  Skips non-matching fields without materializing
-  // value views — cheap to call even on docs with many stored fields.
+  // value views - cheap to call even on docs with many stored fields.
   template <class Callback>
   bool readFieldById(int32_t docID, int32_t targetFid, Callback&& callback) {
     assert(docID >= 0 && docID < maxDoc_);
@@ -237,7 +237,7 @@ public:
   // Try to open a StoredFieldsReader for the given resource name in the
   // segment (default: Postings::STORED_DEFAULT_RESOURCE).  Returns nullptr
   // if that resource isn't present in the segment.  The FieldReader used
-  // for the lookup is transient — no persistent pool allocations.
+  // for the lookup is transient - no persistent pool allocations.
   static std::unique_ptr<StoredFieldsReader> open(
       PostingsReader& postingsReader,
       std::string_view resourceName = Postings::STORED_DEFAULT_RESOURCE) {
@@ -284,7 +284,7 @@ private:
     if (firstDoc <= docID) {
       // Walk forward while the next chunk's first doc is also <= docID.
       // If we advance at all, the new position was already confirmed by
-      // this very probe — no need to verify backward afterwards.
+      // this very probe - no need to verify backward afterwards.
       while (guess + 1 < numChunks_) {
         int32_t nextFirst = (int32_t)firstDocCol->valueAt(guess + 1);
         if (nextFirst > docID) break;

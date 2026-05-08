@@ -121,7 +121,7 @@ IndexReader::IndexReader(Directory& dir, IndexReader* previousReader) {
     
     auto* indexInfo = google::protobuf::Arena::Create<solux::proto::IndexInfo>(&arena);
     
-    // Don't use expectSynced here — IndexReader can race with a concurrent
+    // Don't use expectSynced here - IndexReader can race with a concurrent
     // commit that has finished s.olux but not yet synced it.
     std::shared_ptr<InputFile> inputFile = dir.openFile(Postings::INDEX_INFO_FILE);
     if (inputFile == nullptr) {
@@ -204,7 +204,7 @@ IndexReader::IndexReader(Directory& dir, IndexReader* previousReader) {
           const auto& info = indexInfo->aux_indexes(i);
 
           // Reuse from the previous reader when name + gen + built_core_gen
-          // all match — the writer carry-forward logic guarantees the files
+          // all match - the writer carry-forward logic guarantees the files
           // are byte-identical in that case.
           auto prevIt = prevAuxByName.find(std::string(info.name()));
           if (prevIt != prevAuxByName.end()
@@ -227,7 +227,7 @@ IndexReader::IndexReader(Directory& dir, IndexReader* previousReader) {
           }
 
           if (!aux) {
-            IREADER_DEBUG("Aux file missing for '{}' — triggering retry", info.name());
+            IREADER_DEBUG("Aux file missing for '{}' - triggering retry", info.name());
             retry = true;
             break;
           }

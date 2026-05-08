@@ -246,7 +246,7 @@ TEST_F(DirectoryTest, fsdirPersistence) {
     addFile(dir, "persist1", "hello world");
     addFile(dir, "persist2", "goodbye world");
   }
-  // Reopen the directory — files should still be there
+  // Reopen the directory - files should still be there
   {
     FSDirectory dir(path);
     std::vector<std::string> files;

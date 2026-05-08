@@ -81,11 +81,11 @@ protected:
   }
 };
 
-// Basic ordering: query nearest the first stored vector → that doc lands at
+// Basic ordering: query nearest the first stored vector -> that doc lands at
 // the top, scores monotonically decreasing for further-away docs.
 //
-// Interleaves docs *without* the vector field so the column is sparse —
-// exercises valueRank → docRank lookup (without the lookup, the FAISS-id of
+// Interleaves docs *without* the vector field so the column is sparse -
+// exercises valueRank -> docRank lookup (without the lookup, the FAISS-id of
 // the second vector would map to docRank 1, which is a no-vector doc).
 TEST_F(KnnQueryTest, basicOrdering) {
   CollectionHelper h("main");
@@ -95,7 +95,7 @@ TEST_F(KnnQueryTest, basicOrdering) {
   // Mix of vector docs ("a","b","c","d") and bare-id docs ("g1","g2","g3").
   // Doc-rank order: a, g1, b, g2, c, g3, d.  Value-rank order (ranks of docs
   // with vectors): a=0, b=1, c=2, d=3.  If the code mistakenly used valueRank
-  // as docRank, it would return ids "a","b","c" — which happen to be wrong
+  // as docRank, it would return ids "a","b","c" - which happen to be wrong
   // (the doc at rank 1 is "g1", not "b").
   h.index(flatdoc("id", std::string("a"), "embedding_v", std::vector<float>{1, 0, 0, 0}));
   h.index(flatdoc("id", std::string("g1")));
@@ -112,7 +112,7 @@ TEST_F(KnnQueryTest, basicOrdering) {
   EXPECT_EQ(req->getMatchCount(), 3);
   auto ids = resultIds(*req);
   ASSERT_EQ(ids.size(), 3u);
-  EXPECT_EQ(ids[0], "a");  // exact match — distance 0
+  EXPECT_EQ(ids[0], "a");  // exact match - distance 0
   // The other three vector docs are equidistant (d^2 = 2 each).  Just check
   // they're all from the vector set, not a no-vector doc.
   std::set<std::string> withVec{"a", "b", "c", "d"};
@@ -124,9 +124,9 @@ TEST_F(KnnQueryTest, basicOrdering) {
 }
 
 // Multi-segment: each segment contributes its share to the top-K, and the
-// FAISS-id → (segment, docRank) mapping is correct.  Interleaves no-vector
-// docs in seg0 and seg1 so the per-segment columns are sparse — surfaces
-// off-by-one if the valueRank → docRank lookup is wrong on a per-segment
+// FAISS-id -> (segment, docRank) mapping is correct.  Interleaves no-vector
+// docs in seg0 and seg1 so the per-segment columns are sparse - surfaces
+// off-by-one if the valueRank -> docRank lookup is wrong on a per-segment
 // basis (different segments have different sparse layouts).
 TEST_F(KnnQueryTest, multiSegment) {
   CollectionHelper h("main");
@@ -158,7 +158,7 @@ TEST_F(KnnQueryTest, multiSegment) {
   // The two closest are seg0's docs; third is the seg1 [0.1, 0.9, 0] (closer
   // than [0, 1, 0] or seg2's vector).  We assert the set rather than order
   // since within-segment results land in docId order, not score order, in
-  // the response (TopDocsReq sorts by score globally — verify "s0_a" is #1).
+  // the response (TopDocsReq sorts by score globally - verify "s0_a" is #1).
   EXPECT_EQ(ids[0], "s0_a");
   std::set<std::string> got(ids.begin(), ids.end());
   EXPECT_TRUE(got.count("s0_a"));
@@ -173,7 +173,7 @@ TEST_F(KnnQueryTest, multiSegment) {
 // so we always get exactly k live results back.
 //
 // Mixes in a no-vector doc ("g") so the column is sparse.  Without the
-// valueRank → docRank lookup, IDSelector::is_member would test the wrong
+// valueRank -> docRank lookup, IDSelector::is_member would test the wrong
 // docRank against liveDocs and either filter the wrong doc or fail to filter
 // the deleted one.
 TEST_F(KnnQueryTest, filtersDeletedDocs) {
@@ -181,12 +181,12 @@ TEST_F(KnnQueryTest, filtersDeletedDocs) {
   h.clear();
   installVecSchema(h.collection(), proto::VectorParams::L2);
 
-  // Layout (docRank → id, vector):
-  //   0 → a [1, 0, 0]
-  //   1 → g (no vector)
-  //   2 → b [0.9, 0.1, 0]
-  //   3 → c [0, 1, 0]
-  //   4 → d [0, 0, 1]
+  // Layout (docRank -> id, vector):
+  //   0 -> a [1, 0, 0]
+  //   1 -> g (no vector)
+  //   2 -> b [0.9, 0.1, 0]
+  //   3 -> c [0, 1, 0]
+  //   4 -> d [0, 0, 1]
   // Delete docRank 0 (=a).  If IDSelector mistakenly used valueRank as
   // docRank, deleting "a" would be checked against docRank 0 (correct here
   // by coincidence), but deleting "b" would check docRank 1 (=g, irrelevant)
@@ -198,7 +198,7 @@ TEST_F(KnnQueryTest, filtersDeletedDocs) {
   h.index(flatdoc("id", std::string("d"), "embedding_v", std::vector<float>{0, 0, 1}));
   h.commit({"*"});
 
-  // Delete "b" specifically — at docRank 2 (different from valueRank 1).
+  // Delete "b" specifically - at docRank 2 (different from valueRank 1).
   std::vector<std::string> ids{"b"};
   h.deleteByIds(ids, UpdateMessage::COMMIT);
 
@@ -233,8 +233,8 @@ TEST_F(KnnQueryTest, manyDeletes) {
   }
   h.commit({"*"});
 
-  // Delete the 4 closest — d4 and d5 are the only live docs.  Without
-  // IDSelector this would need overfetchFactor ≥ 4; with it, k=2 just works.
+  // Delete the 4 closest - d4 and d5 are the only live docs.  Without
+  // IDSelector this would need overfetchFactor >= 4; with it, k=2 just works.
   std::vector<std::string> dels{"d0", "d1", "d2", "d3"};
   h.deleteByIds(dels, UpdateMessage::COMMIT);
 
@@ -249,7 +249,7 @@ TEST_F(KnnQueryTest, manyDeletes) {
   req->done();
 }
 
-// Missing aux index: indexing without ever calling build → the field has no
+// Missing aux index: indexing without ever calling build -> the field has no
 // FAISS aux entry.  Query should return no hits, not throw.
 TEST_F(KnnQueryTest, missingAuxIndexReturnsEmpty) {
   CollectionHelper h("main");
@@ -275,7 +275,7 @@ TEST_F(KnnQueryTest, missingAuxIndexReturnsEmpty) {
 // checking that the response carries no docs and the engine logged the error.
 //
 // Note: this used to crash the arena because TopDocsReq's ctor called
-// createWeight, and Arena::Create registers ~T() before the body runs — a
+// createWeight, and Arena::Create registers ~T() before the body runs - a
 // throwing ctor would leave a half-constructed object scheduled for cleanup.
 // The fix moved createWeight to TopDocsReq::init(), which runs after the
 // object is fully constructed and registered, so a throw here unwinds
@@ -299,7 +299,7 @@ TEST_F(KnnQueryTest, dimMismatchReturnsEmpty) {
 
 // Cosine: stored vectors get unit-normalized at build; the query is also
 // normalized before search, so direction-only matches score IP=1.  Verifies
-// the actual numeric scores returned, not just doc order — catches
+// the actual numeric scores returned, not just doc order - catches
 // regressions in either FAISS-side normalization (build-time renorm of
 // stored vectors, query-side renorm in KnnQuery::Weight) or scoreFromDist
 // for COSINE (which currently passes IP through unchanged).
@@ -310,16 +310,16 @@ TEST_F(KnnQueryTest, cosineMetric) {
 
   // Three vectors in distinct directions, all non-unit length so the
   // normalize paths actually do work:
-  //   - "east" and "east_far" both point +x (parallel) → cosine=1 vs query.
-  //   - "north" points +y (orthogonal) → cosine=0.
-  //   - "back" points -x (antiparallel) → cosine=-1.
+  //   - "east" and "east_far" both point +x (parallel) -> cosine=1 vs query.
+  //   - "north" points +y (orthogonal) -> cosine=0.
+  //   - "back" points -x (antiparallel) -> cosine=-1.
   h.index(flatdoc("id", std::string("east"), "embedding_v", std::vector<float>{2, 0, 0}));
   h.index(flatdoc("id", std::string("east_far"), "embedding_v", std::vector<float>{5, 0, 0}));
   h.index(flatdoc("id", std::string("north"), "embedding_v", std::vector<float>{0, 3, 0}));
   h.index(flatdoc("id", std::string("back"), "embedding_v", std::vector<float>{-4, 0, 0}));
   h.commit({"*"});
 
-  // Non-unit query in +x direction — gets normalized inside KnnQuery::Weight.
+  // Non-unit query in +x direction - gets normalized inside KnnQuery::Weight.
   auto* req = makeKnnReq(*soluxNode, "embedding_v", {7, 0, 0}, 4);
   req->execute();
 
@@ -354,9 +354,9 @@ TEST_F(KnnQueryTest, l2Scores) {
   installVecSchema(h.collection(), proto::VectorParams::L2);
 
   // Squared distances from query [0,0]:
-  //   "exact"  [0,0]    → 0   → score 1.0
-  //   "one"    [1,0]    → 1   → score 0.5
-  //   "two"    [2,0]    → 4   → score 0.2
+  //   "exact"  [0,0]    -> 0   -> score 1.0
+  //   "one"    [1,0]    -> 1   -> score 0.5
+  //   "two"    [2,0]    -> 4   -> score 0.2
   h.index(flatdoc("id", std::string("exact"), "embedding_v", std::vector<float>{0, 0}));
   h.index(flatdoc("id", std::string("one"), "embedding_v", std::vector<float>{1, 0}));
   h.index(flatdoc("id", std::string("two"), "embedding_v", std::vector<float>{2, 0}));

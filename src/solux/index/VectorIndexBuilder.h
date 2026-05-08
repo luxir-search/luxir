@@ -28,7 +28,7 @@ namespace solux {
 /// vector column of every segment in `segments` (in the order given) is added
 /// to FAISS, so at query time the mapping can be derived from each segment's
 /// numValues.  Vector columns include rows for deleted docs (deletes are
-/// tracked via liveDocs separately), so those vectors land in FAISS too —
+/// tracked via liveDocs separately), so those vectors land in FAISS too -
 /// the query layer is expected to filter against current liveDocs.
 ///
 /// V1: IndexFlatL2 / IndexFlatIP only, single-valued vectors only.
@@ -60,11 +60,11 @@ public:
       indexGen_(indexGen), coreGen_(coreGen) {}
 
   /// Build aux indexes for vector fields matching `selectors`.
-  ///   selectors == ["*"]      — every eligible field
-  ///   selectors == ["vec.X"]  — exact match on aux index name
+  ///   selectors == ["*"]      - every eligible field
+  ///   selectors == ["vec.X"]  - exact match on aux index name
   /// `skipNames` contains aux names whose previously-built entry is still
   /// valid for this commit (built_core_gen matches current coreGen).  These
-  /// are skipped — rebuilding would produce bit-identical output, so the
+  /// are skipped - rebuilding would produce bit-identical output, so the
   /// caller should keep the carried-forward entry instead.
   /// Returned AuxIndexInfo entries should be appended to IndexInfo.aux_indexes
   /// alongside any carried entries.  File names of every produced file are

@@ -45,6 +45,12 @@ public:
 
   static std::unique_ptr<DocSet> intersect(std::span<DocSet*> sets);
 
+  /// Union two or more DocSets into a single new DocSet.  All BITSET inputs
+  /// must share a size (caller's responsibility - typically all from the same
+  /// segment's maxDoc).  Result is BITSET if any input is BITSET, otherwise
+  /// ARRAY.
+  static std::unique_ptr<DocSet> union_(std::span<DocSet*> sets);
+
   virtual ~DocSet() = default;
 };
 
@@ -53,6 +59,13 @@ public:
 class BitDocSet : public DocSet {
 protected:
   FixedBitSet bits_; // non-owning bitset
+
+  // Lazy popcount.  card() will call this once on first query and cache the
+  // result in DocSet::card_; if the caller already knows the cardinality
+  // (e.g. liveDocs), use the explicit-card ctor to skip the popcount entirely.
+  int32_t calcCard() override {
+    return bits_.card();
+  }
 
 public:
   BitDocSet(FixedBitSet bits) : DocSet(BITSET), bits_(bits) {
@@ -81,8 +94,6 @@ public:
 class RAMBitDocSet : public BitDocSet {
 public:
   RAMBitDocSet(int32_t size) : BitDocSet(FixedBitSet(FixedBitSet::allocate(size, false).release(), size)) {}
-
-  RAMBitDocSet(FixedBitSet bits) : BitDocSet(bits) {}
 
   RAMBitDocSet(RAMBitDocSet&& other) noexcept : BitDocSet(std::move(other.bits_)) {
     card_ = other.card_;
@@ -169,17 +180,18 @@ inline std::unique_ptr<DocSet> DocSet::intersect(std::span<DocSet*> sets) {
   });
   if (sets[0]->type == BITSET) {
     auto& firstBits = ((BitDocSet*) sets[0])->bits();
-    RAMFixedBitSet result(firstBits.size());
-    auto nWords = firstBits.sizeInWords(firstBits.size());
-
-    memcpy(result.words, firstBits.words, nWords * sizeof(*result.words));
+    auto nbits = firstBits.size();
+    auto nWords = firstBits.sizeInWords(nbits);
+    auto result = std::make_unique<RAMBitDocSet>(nbits);
+    auto& bits = result->mutableBits();
+    memcpy(bits.words, firstBits.words, nWords * sizeof(*bits.words));
     for (size_t i = 1; i < sets.size(); i++) {
       assert(sets[i]->type == BITSET);
       for (size_t word = 0; word < nWords; word++) {
-        result.words[word] &= ((BitDocSet*)sets[i])->bits().words[word];
+        bits.words[word] &= ((BitDocSet*)sets[i])->bits().words[word];
       }
     }
-    return std::make_unique<RAMBitDocSet>(std::move(result));
+    return result;
   }
   // if we get here, we have an array of docids.
   size_t firstbitset = sets.size();
@@ -218,6 +230,68 @@ inline std::unique_ptr<DocSet> DocSet::intersect(std::span<DocSet*> sets) {
   }
   outputDocs->shrink_to_fit();
   return std::make_unique<ArrDocSet>(std::move(*outputDocs));
+}
+
+inline std::unique_ptr<DocSet> DocSet::union_(std::span<DocSet*> sets) {
+  assert(sets.size() > 1);
+
+  // If any input is BITSET, the result is a BITSET sized to match.  All
+  // BITSETs must share a size (asserted via memcpy of identical word counts).
+  size_t firstBitset = sets.size();
+  for (size_t i = 0; i < sets.size(); i++) {
+    if (sets[i]->type == BITSET) {
+      firstBitset = i;
+      break;
+    }
+  }
+
+  if (firstBitset < sets.size()) {
+    auto& firstBits = ((BitDocSet*)sets[firstBitset])->bits();
+    auto nbits = firstBits.size();
+    auto nWords = firstBits.sizeInWords(nbits);
+    auto result = std::make_unique<RAMBitDocSet>(nbits);
+    auto& bits = result->mutableBits();
+    memcpy(bits.words, firstBits.words, nWords * sizeof(*bits.words));
+
+    for (size_t i = 0; i < sets.size(); i++) {
+      if (i == firstBitset) continue;
+      if (sets[i]->type == BITSET) {
+        auto& other = ((BitDocSet*)sets[i])->bits();
+        assert(other.size() == nbits);
+        for (size_t w = 0; w < nWords; w++) {
+          bits.words[w] |= other.words[w];
+        }
+      } else {
+        for (auto doc : ((ArrDocSet*)sets[i])->docs()) {
+          bits.set(doc);
+        }
+      }
+    }
+    return result;
+  }
+
+  // All ARRAYs -> N-way sort-merge using std::set_union with two scratch
+  // buffers, ping-ponging the running output.
+  std::vector<int32_t> buf0;
+  std::vector<int32_t> buf1;
+  std::span<int32_t> a = ((ArrDocSet*)sets[0])->docs();
+  std::span<int32_t> b = ((ArrDocSet*)sets[1])->docs();
+  std::vector<int32_t>* current = &buf0;
+  current->reserve(a.size() + b.size());
+  std::set_union(a.begin(), a.end(), b.begin(), b.end(), std::back_inserter(*current));
+
+  std::vector<int32_t>* scratch = &buf1;
+  for (size_t i = 2; i < sets.size(); i++) {
+    auto next = ((ArrDocSet*)sets[i])->docs();
+    scratch->clear();
+    scratch->reserve(current->size() + next.size());
+    std::set_union(current->begin(), current->end(),
+                   next.begin(), next.end(),
+                   std::back_inserter(*scratch));
+    std::swap(current, scratch);
+  }
+  current->shrink_to_fit();
+  return std::make_unique<ArrDocSet>(std::move(*current));
 }
 
 

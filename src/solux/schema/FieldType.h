@@ -174,7 +174,7 @@ public:
 
   int32_t dims_;
   Metric metric_;
-  // Caller asserts incoming vectors are unit-norm — the COSINE build path
+  // Caller asserts incoming vectors are unit-norm - the COSINE build path
   // skips its copy + renormalize step.  Ignored for non-COSINE metrics.
   bool normalized_;
 

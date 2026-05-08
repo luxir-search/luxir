@@ -53,7 +53,7 @@
 namespace solux {
 
 // A deleter that only calls the destructor but doesn't delete the memory.
-// Non-template so that u_ptr<Derived> and u_ptr<Base> share a deleter type — that lets
+// Non-template so that u_ptr<Derived> and u_ptr<Base> share a deleter type - that lets
 // unique_ptr's standard converting assignment work for u_ptr<Derived> -> u_ptr<Base>
 // (with the usual requirement that the base has a virtual destructor).
 struct no_delete {

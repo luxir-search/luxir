@@ -45,7 +45,7 @@ public:
     } else if (val.has_bin()) {
       indexId(inverter, val.bin());
     }
-    // TODO: Missing id value is silently ignored — same as other string fields.
+    // TODO: Missing id value is silently ignored - same as other string fields.
     // Validation should happen at a higher level?
   }
 
@@ -60,7 +60,7 @@ public:
     }
     auto [entry, inserted] = deleteHash->try_emplace(id, -1, version);
     if (!inserted) {
-      // Same id deleted again — keep the highest version.
+      // Same id deleted again - keep the highest version.
       if (version > entry->val().version) {
         entry->val().version = version;
       }
@@ -143,7 +143,7 @@ public:
       auto nDocs = inverter.getMaxDoc();
       auto guard = MemPool::threadLocalPoolGuard();
 
-      // Write using TextWriter — same format as StrHandler for now.
+      // Write using TextWriter - same format as StrHandler for now.
       // TODO: switch to a point-lookup-optimized format (FST or hash-based).
       TextWriter textWriter(postingsWriter);
       PostingsWriter::IndexFieldInfo& fieldInfo = postingsWriter.addField(fieldName);

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "solux/query/Query.h"
+#include "solux/search/DocSet.h"
 
 namespace solux {
 
@@ -276,5 +277,53 @@ public:
 
 
 };
+
+// Drive a per-segment Scorer through the optional `filter` domain, feeding (doc, score)
+// into `collector`.  If `builder` is non-null, also records every matched doc for use as
+// a sub-op domain (see TopDocsReq's per-segment subCalc dispatch).  Templated on Collector
+// so both score-only and field-sort collectors can use the same loop, and so FusionOp can
+// reuse it for per-source evaluation without dragging TopDocsReq's MergeableCollector along.
+//
+// Precondition: caller is responsible for any per-segment setup on `collector`.  In
+// particular, FieldSortCollector requires `setSegment(segnum, &postingsReader)` to be
+// called before this; TopDocsCollector has no per-segment setup.
+template <typename Collector>
+void collectTopK(int32_t segnum, Query::Scorer* scorer, DocSet* filter,
+                 DocSetBuilder* builder, Collector& collector) {
+  if (filter == nullptr || filter->type == DocSet::BITSET) {
+    BitDocSet* bitDocs = (BitDocSet*)filter;
+    auto* domainBits = bitDocs ? &bitDocs->bits() : nullptr;
+    for (;;) {
+      auto doc = scorer->next();
+      if (doc == PostingsReader::END) {
+        break;
+      }
+      if (domainBits && !domainBits->get(doc)) {
+        continue;
+      }
+      if (builder) {
+        builder->add(doc);
+      }
+      auto score = scorer->score();
+      collector.collect(segnum, doc, score);
+    }
+  } else {
+    assert(filter->type == DocSet::ARRAY);
+    ArrDocSet* arrDocs = (ArrDocSet*)filter;
+    for (auto doc : arrDocs->docs()) {
+      if (scorer->docId() < doc) {
+        scorer->advance(doc);
+      }
+      if (scorer->docId() != doc) {
+        continue;
+      }
+      if (builder) {
+        builder->add(doc);
+      }
+      auto score = scorer->score();
+      collector.collect(segnum, doc, score);
+    }
+  }
+}
 
 } // namespace solux

@@ -248,7 +248,7 @@ TEST_F(IndexWriterTest, multiThreaded) {
 
   class TestProtoUpdateMessage : public ProtoUpdateMessage {
   private:
-    // Heap-allocate the request and hand its address to the base class — that way
+    // Heap-allocate the request and hand its address to the base class - that way
     // the proto is fully constructed before any base-class code touches it.  The
     // owner unique_ptr is initialized after the base (member init follows base
     // init) and just adopts the same pointer for cleanup at destruction time.
@@ -556,7 +556,7 @@ TEST_F(IndexWriterTest, deletionInfrastructure) {
   CollectionHelper helper("main");
   helper.clear();
 
-  // Delete-by-id on a fresh/empty index — exercises the delete-only inverter path
+  // Delete-by-id on a fresh/empty index - exercises the delete-only inverter path
   // where no documents are indexed but deletes still need to flow through IdHandler.
   auto earlyDelete = helper.deleteById("nonexistent", UpdateMessage::COMMIT);
   EXPECT_TRUE(earlyDelete.success);

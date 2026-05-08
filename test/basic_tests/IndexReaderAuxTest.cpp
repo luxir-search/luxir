@@ -90,7 +90,7 @@ TEST_F(IndexReaderAuxTest, opensVectorAuxAfterBuild) {
   EXPECT_FLOAT_EQ(dists[0], 0.0f);
 }
 
-// No aux entries → reader has no aux readers (default schema, no metric).
+// No aux entries -> reader has no aux readers (default schema, no metric).
 TEST_F(IndexReaderAuxTest, noAuxEntriesIsEmpty) {
   CollectionHelper h("main");
   h.clear();
@@ -105,7 +105,7 @@ TEST_F(IndexReaderAuxTest, noAuxEntriesIsEmpty) {
 
 // Verifies that an IndexReader opened after a rebuild commit (which deletes
 // the previous gen's aux file) finds the new file cleanly.  Does NOT actually
-// trigger the retry loop — by the time the reader parses IndexInfo, it
+// trigger the retry loop - by the time the reader parses IndexInfo, it
 // already references the new file, so the first open attempt succeeds.  See
 // retryEscalatesWhenAuxFilePersistentlyMissing for a test that actually
 // exercises the retry path.
@@ -164,7 +164,7 @@ TEST_F(IndexReaderAuxTest, opensCleanlyAfterRebuild) {
   ASSERT_NE(aux2, nullptr);
   auto* vaux2 = dynamic_cast<VectorAuxReader*>(aux2.get());
   ASSERT_NE(vaux2, nullptr);
-  // Two docs across two segments → ntotal == 2.
+  // Two docs across two segments -> ntotal == 2.
   EXPECT_EQ(vaux2->getFaissIndex()->ntotal, 2);
 }
 
@@ -176,7 +176,7 @@ TEST_F(IndexReaderAuxTest, opensCleanlyAfterRebuild) {
 // loop's escalation path end-to-end.
 //
 // Truly *successful* retries (where a concurrent commit republishes during
-// the retry window) need a Directory wrapper that can simulate the race —
+// the retry window) need a Directory wrapper that can simulate the race -
 // not in scope for this test.
 TEST_F(IndexReaderAuxTest, retryEscalatesWhenAuxFilePersistentlyMissing) {
   CollectionHelper h("main");
@@ -202,7 +202,7 @@ TEST_F(IndexReaderAuxTest, retryEscalatesWhenAuxFilePersistentlyMissing) {
   }
   ASSERT_TRUE(dir.deleteFile(auxFile));
 
-  // IndexReader open should retry once (missing file → re-parse), then on
+  // IndexReader open should retry once (missing file -> re-parse), then on
   // the second attempt see the same commit time and escalate to throw.
   EXPECT_THROW(
     { auto r = std::make_shared<IndexReader>(dir); },
@@ -229,7 +229,7 @@ TEST_F(IndexReaderAuxTest, reusesAuxReaderOnCarryForward) {
   auto aux1 = reader1->getAuxReader("vec.embedding_v");
   ASSERT_NE(aux1, nullptr);
 
-  // Delete-only commit: segment composition unchanged → coreGen unchanged →
+  // Delete-only commit: segment composition unchanged -> coreGen unchanged ->
   // aux entry carried forward with identical name/gen/built_core_gen.
   std::vector<std::string> ids{"a"};
   h.deleteByIds(ids, UpdateMessage::COMMIT);
@@ -239,12 +239,12 @@ TEST_F(IndexReaderAuxTest, reusesAuxReaderOnCarryForward) {
   auto aux2 = reader2->getAuxReader("vec.embedding_v");
   ASSERT_NE(aux2, nullptr);
 
-  // Same shared_ptr target — reused, not re-deserialized.
+  // Same shared_ptr target - reused, not re-deserialized.
   EXPECT_EQ(aux1.get(), aux2.get())
     << "aux reader should be reused across reopens when the entry is carried forward";
 }
 
-// New build (different gen / different built_core_gen) → previous reader's
+// New build (different gen / different built_core_gen) -> previous reader's
 // aux is NOT reused; a fresh AuxReader is constructed.
 TEST_F(IndexReaderAuxTest, rebuildsAuxReaderOnNewGen) {
   CollectionHelper h("main");
@@ -259,7 +259,7 @@ TEST_F(IndexReaderAuxTest, rebuildsAuxReaderOnNewGen) {
   auto aux1 = reader1->getAuxReader("vec.embedding_v");
   ASSERT_NE(aux1, nullptr);
 
-  // Add a doc + rebuild — produces a new gen of files; coreGen also bumps
+  // Add a doc + rebuild - produces a new gen of files; coreGen also bumps
   // because segment composition changed.
   h.index(flatdoc("id", std::string("b"), "embedding_v", std::vector<float>{0, 1, 0}));
   h.commit({"*"});

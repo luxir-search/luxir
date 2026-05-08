@@ -80,7 +80,7 @@ public:
       for (auto& s : perSegHits) s = {};
 
       // Find the aux reader for this field.  Missing (e.g. field never had
-      // its FAISS index built) yields zero hits — graceful degradation.
+      // its FAISS index built) yields zero hits - graceful degradation.
       std::string auxName("vec.");
       auxName.append(query.getField());
       auto aux = reader.getAuxReader(auxName);
@@ -103,7 +103,7 @@ public:
       faiss::Index* faissIdx = vaux->getFaissIndex();
       if (!faissIdx || faissIdx->ntotal == 0) return;
 
-      // Per-segment vector counts → cumulative prefix for FAISS-id → segment
+      // Per-segment vector counts -> cumulative prefix for FAISS-id -> segment
       // mapping.  Builder added segments in ord order skipping zero-vector
       // ones, and our IndexInfo segments are in the same canonical order, so
       // the prefix sum lines up: zero-vector segments contribute a zero range.
@@ -111,7 +111,7 @@ public:
       // Within a segment, FAISS ids correspond to *value ranks* (0 ..
       // numVectors), which equals docRank only when every doc has the field.
       // For sparse fields (some docs without a vector), we need a
-      // valueRank → docRank lookup; we materialize one per sparse segment
+      // valueRank -> docRank lookup; we materialize one per sparse segment
       // by iterating the DocsReader bitmap.  Dense segments leave the inner
       // span empty as a sentinel meaning "valueRank == docRank".
       std::span<int64_t> prefix = context.pool.make_span<int64_t>(numSegs + 1);
@@ -134,7 +134,7 @@ public:
           }
           segCount = vr.numVectors();
 
-          // Build the sparse-field valueRank → docRank lookup if needed.
+          // Build the sparse-field valueRank -> docRank lookup if needed.
           auto& dr = vr.strColReader().docsReader();
           if (dr.hasBitset() && segCount > 0) {
             auto v2d = context.pool.make_span<int32_t>((size_t)segCount);
@@ -150,7 +150,7 @@ public:
         prefix[i + 1] = prefix[i] + segCount;
       }
       if (prefix[numSegs] != faissIdx->ntotal) {
-        // Drift between the FAISS index and the column data — implies the aux
+        // Drift between the FAISS index and the column data - implies the aux
         // entry was built against a different segment composition than what's
         // currently published.  Should be impossible because IndexWriter
         // invalidates aux entries on coreGen change.
@@ -159,7 +159,7 @@ public:
           faissIdx->ntotal, prefix[numSegs], query.getField()));
       }
 
-      // Optionally normalize the query for COSINE — stored vectors were
+      // Optionally normalize the query for COSINE - stored vectors were
       // normalized at build, so we need a unit query for cosine = IP semantics
       // to hold.  Done into a local copy; the caller's span is unmodified.
       std::vector<float> queryBuf;
@@ -173,7 +173,7 @@ public:
       // Use a faiss::IDSelector to filter deleted docs *inside* the search,
       // so we ask for exactly k and never under-deliver due to liveDocs
       // post-filtering.  The selector closes over `prefix`, `v2dPerSeg`, and
-      // segment liveDocs — all live for the duration of search() (pool /
+      // segment liveDocs - all live for the duration of search() (pool /
       // IndexReader scoped).
       LiveDocsSelector selector(prefix, v2dPerSeg, reader.segments());
       faiss::SearchParameters params;
@@ -192,7 +192,7 @@ public:
       std::vector<std::vector<Hit>> perSegBuf(numSegs);
       for (int64_t i = 0; i < kReq; i++) {
         faiss::idx_t fid = ids[i];
-        if (fid < 0) continue;  // FAISS pad — no more live results
+        if (fid < 0) continue;  // FAISS pad - no more live results
         int32_t ord = findSeg((int64_t)fid, prefix);
         if (ord < 0) continue;
         int32_t valueRank = (int32_t)((int64_t)fid - prefix[ord]);
@@ -246,10 +246,10 @@ public:
 
 private:
   // Convert FAISS's per-metric distance to a "higher is better" score.
-  //   L2:    FAISS returns squared distance — invert to 1/(1+d).
-  //   IP:    FAISS returns dot product — already higher-is-better.
+  //   L2:    FAISS returns squared distance - invert to 1/(1+d).
+  //   IP:    FAISS returns dot product - already higher-is-better.
   //   COSINE: stored as IP over normalized vectors (builder normalized,
-  //           query is normalized at search time) — same as IP.
+  //           query is normalized at search time) - same as IP.
   static float scoreFromDist(float dist, int32_t metric) {
     switch (metric) {
       case proto::VectorParams::L2:
@@ -274,9 +274,9 @@ private:
   }
 
   /// faiss::IDSelector that maps a FAISS id to (segment ord, docRank) via
-  /// the precomputed prefix sums + per-segment valueRank→docRank lookup,
+  /// the precomputed prefix sums + per-segment valueRank->docRank lookup,
   /// then consults the segment's liveDocs.  FAISS calls is_member(id) for
-  /// every candidate during search and skips those that return false — so
+  /// every candidate during search and skips those that return false - so
   /// deleted-doc vectors never make it into the result list.
   ///
   /// For IndexFlat this doesn't reduce the scan cost (we still touch every
@@ -285,7 +285,7 @@ private:
   /// selection.
   class LiveDocsSelector : public faiss::IDSelector {
     std::span<const int64_t> prefix;
-    // Per-segment valueRank → docRank.  Empty inner span for dense segments
+    // Per-segment valueRank -> docRank.  Empty inner span for dense segments
     // (every doc has the field; valueRank == docRank).
     std::span<const std::span<const int32_t>> v2dPerSeg;
     std::span<IndexReader::Segment> segs;

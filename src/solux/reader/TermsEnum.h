@@ -183,10 +183,10 @@ public:
   /// Forward-only seek for sorted iteration. Target must be >= the current term.
   /// If the target is in the current block, scans forward with nextTerm().
   /// Otherwise narrows the binary search to blocks from the current position onward.
-  /// Can be called without a prior seek() — the first call will load the first block.
+  /// Can be called without a prior seek() - the first call will load the first block.
   bool seekForward(std::string_view target) {
     if (termBlockIndex < 0) {
-      // Not yet positioned — load first block
+      // Not yet positioned - load first block
       termBlockIndex = 0;
       readTermBlock();
     }

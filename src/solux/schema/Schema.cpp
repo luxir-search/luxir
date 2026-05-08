@@ -126,7 +126,7 @@ static void resolveField(std::string_view name,
     r.storedResource = parentResolved.storedResource;
   }
 
-  // analyzer: atomic — first non-empty AnalyzerDef in chain wins
+  // analyzer: atomic - first non-empty AnalyzerDef in chain wins
   if (def.has_analyzer() && (!def.analyzer().tokenizer().empty() || def.analyzer().filters_size() > 0)) {
     r.hasAnalyzer = true;
     r.tokenizer = std::string(def.analyzer().tokenizer());
@@ -217,7 +217,7 @@ std::shared_ptr<Schema> Schema::fromProto(const proto::SchemaDef& def, const Sch
   sv_flat_set visiting;
 
   // Pre-populate resolved map with base schema fields so new fields can reference them as parents.
-  // Fields being overridden by the new def are skipped — they'll be re-resolved from the SchemaDef.
+  // Fields being overridden by the new def are skipped - they'll be re-resolved from the SchemaDef.
   if (base) {
     for (const auto& [name, ft] : base->fieldTypeMap) {
       if (defMap.contains(name)) continue;
@@ -424,7 +424,7 @@ void Schema::toProto(proto::SchemaDef* def) const {
     fieldDef->set_column_stored(ft->hasColumn());
     fieldDef->set_multi_valued(ft->multiValued());
     fieldDef->set_stored(ft->isStored());
-    // Only emit stored_resource when it deviates from the default — keeps
+    // Only emit stored_resource when it deviates from the default - keeps
     // the serialized schema clean for fields that use "_stored_".
     if (ft->storedResource_ != Postings::STORED_DEFAULT_RESOURCE) {
       fieldDef->set_stored_resource(ft->storedResource_);

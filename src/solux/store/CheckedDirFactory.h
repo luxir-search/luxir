@@ -13,7 +13,7 @@ enum class CheckedDirMode {
 /// Directory wrapper that validates fsync correctness and optionally logs operations.
 /// Tracks files that have been finished via finishFile() but not yet synced via sync().
 /// When openFile() is called with expectSynced=true on such a file, it reports the
-/// gap — either as a log warning (production) or an exception (tests).
+/// gap - either as a log warning (production) or an exception (tests).
 ///
 /// Files that already existed in the directory before this wrapper was created
 /// (e.g. from a previous session) are assumed to have been properly synced.

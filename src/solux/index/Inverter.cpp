@@ -91,7 +91,7 @@ Inverter::IndexHandler& Inverter::createIndexHandler(const std::string_view name
 
   // Wrap in a StoredFieldWrapperHandler if the field should also have its
   // raw values persisted to a stored-fields resource.  Applies to TEXT,
-  // STRING, and ID fields.  STORED on numeric fields is currently ignored —
+  // STRING, and ID fields.  STORED on numeric fields is currently ignored -
   // their COLUMN_STORED path already keeps raw values per-doc.
   //
   // The target resource is FieldType::storedResource_ (default:

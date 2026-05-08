@@ -89,7 +89,7 @@ public:
     }
 
     // Decode opaque_meta produced by VectorIndexBuilder: int32 dims, int32 metric.
-    // Older entries without opaque_meta still work — we fall back to idx->d for
+    // Older entries without opaque_meta still work - we fall back to idx->d for
     // dims and report metric=0 (unknown).
     int32_t dimsMeta = 0;
     int32_t metricMeta = 0;
@@ -103,7 +103,7 @@ public:
     // TODO: zero-copy IndexFlat path.  IndexFlat's on-disk bytes are the same
     // float vectors we already store in the column; read_index unconditionally
     // copies them into IndexFlatCodes::codes (its owned std::vector<uint8_t>),
-    // so we pay 1× extra RAM per flat aux index.  When/if we keep flat as a
+    // so we pay 1x extra RAM per flat aux index.  When/if we keep flat as a
     // production path (e.g. small-segment optimization, where building HNSW
     // doesn't pay off), skip writing the FAISS file in the builder and run
     // brute-force kNN at search time directly over the mmap'd vector column
@@ -121,7 +121,7 @@ public:
     //     mmap path is wired through read_index(const char* fname, ...), not
     //     IOReader, so it bypasses Directory; (2) builder must write the
     //     sidecar .ivfdata layout.  Cleanest long-term fix is a custom
-    //     faiss::InvertedLists subclass backed by a Solux InputFile — we own
+    //     faiss::InvertedLists subclass backed by a Solux InputFile - we own
     //     the on-disk layout, IO_FLAG_MMAP becomes irrelevant, and FAISS
     //     reads through Directory regardless of impl.  Non-trivial but
     //     unblocks IVF cleanly.

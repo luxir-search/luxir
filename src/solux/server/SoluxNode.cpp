@@ -77,7 +77,7 @@ bool Collection::loadSchema() {
       return true;
     }
 
-    // File was deleted by a concurrent setSchema — rescan for the latest.
+    // File was deleted by a concurrent setSchema - rescan for the latest.
     lastSchemaFile.clear();
     files.clear();
     shard->dir->listFiles(files);

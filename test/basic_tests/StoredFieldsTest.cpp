@@ -41,7 +41,7 @@ protected:
   struct StoredDoc {
     std::vector<std::pair<std::string, std::vector<std::string>>> vals;
 
-    // Flatten to (fieldName, firstValue) — convenience for single-valued checks.
+    // Flatten to (fieldName, firstValue) - convenience for single-valued checks.
     std::vector<std::pair<std::string, std::string>> flat() const {
       std::vector<std::pair<std::string, std::string>> out;
       for (const auto& [name, values] : vals) {
@@ -501,7 +501,7 @@ TEST_F(StoredFieldsTest, manyFieldsVarintBoundary) {
   ASSERT_EQ(d0.size(), (size_t)N_FIELDS);
   // Field order is the order handlers were first created.  Handler-sort is
   // alphabetical, so "f0", "f1", ... in lexicographic order.  We don't
-  // assert that exact ordering — just that every (fN, vN) pair is present.
+  // assert that exact ordering - just that every (fN, vN) pair is present.
   std::set<std::pair<std::string, std::string>> got(d0.begin(), d0.end());
   ASSERT_EQ(got.size(), (size_t)N_FIELDS);
   for (int i = 0; i < N_FIELDS; i++) {
@@ -550,7 +550,7 @@ TEST_F(StoredFieldsSearchTest, returnsStoredTextInSearch) {
   // Start from the default schema (which has "id" and the "_stored_" resource)
   // and add two explicit TEXT fields with STORED set: "body" single-valued and
   // "tags" multi-valued.  This variant bypasses proto and installs FieldTypes
-  // directly — complements the round-trip-through-proto coverage elsewhere.
+  // directly - complements the round-trip-through-proto coverage elsewhere.
   auto schema = Schema::createDefaultSchema();
   schema->fieldTypeMap["body"] = std::make_shared<TextFieldType>(
       "body",
@@ -625,7 +625,7 @@ TEST_F(StoredFieldsSearchTest, defaultTSuffixIsStored) {
   req->done();
 
   ASSERT_EQ(2, docs.size());
-  // Raw (not lowercased) values come back — the _t analyzer lowercases for
+  // Raw (not lowercased) values come back - the _t analyzer lowercases for
   // indexing/search, but stored fields preserve the original bytes.
   EXPECT_TRUE(containsDoc(docs, flatdoc("id", std::string("a"),
                                         "body_t", std::string("The Quick Brown Fox"))));
@@ -709,7 +709,7 @@ TEST_F(StoredFieldsSearchTest, storedStringField) {
 
 // A STRING field that is BOTH column-stored and STORED retrieves through the
 // column (faster; no LZ4 decompression).  The stored-fields copy is written
-// but unused for retrieval — it's only consulted when there is no column.
+// but unused for retrieval - it's only consulted when there is no column.
 TEST_F(StoredFieldsSearchTest, columnPreferredOverStored) {
   using namespace solux::test;
 
@@ -751,8 +751,8 @@ TEST_F(StoredFieldsSearchTest, columnPreferredOverStored) {
 }
 
 // stored_resource on FieldDef routes a TEXT field to a named column family.
-// Two fields in two different resources should retrieve independently —
-// different chunks, different decompression — and the right values land
+// Two fields in two different resources should retrieve independently -
+// different chunks, different decompression - and the right values land
 // in the response.
 TEST_F(StoredFieldsSearchTest, customStoredResourceFromProto) {
   using namespace solux::test;
@@ -843,14 +843,14 @@ TEST_F(StoredFieldsSearchTest, storedIdField) {
 // Silent-data-loss regression: a STRING field with a column written in an
 // older segment, plus newer segments written after STORED was enabled on
 // that field.  Retrieval should pull from stored fields for new segments
-// and fall back to the column for old ones — no empty slots.
+// and fall back to the column for old ones - no empty slots.
 TEST_F(StoredFieldsSearchTest, preStoredSegmentFallbackToColumn) {
   using namespace solux::test;
 
   CollectionHelper ch;
   ch.clear();
 
-  // Segment 1: schema has the STRING field WITHOUT stored — only column.
+  // Segment 1: schema has the STRING field WITHOUT stored - only column.
   {
     auto schema = Schema::createDefaultSchema();
     proto::SchemaDef def;
@@ -966,7 +966,7 @@ TEST_F(StoredFieldsSearchTest, opportunisticStoredPullsColumnPeerFromChunk) {
 
 // Multiple stored TEXT fields sharing the default resource are processed in
 // one pass per segment (no N-chunk decompression blow-up).  This test
-// covers the grouping path — correctness only; we can't easily observe the
+// covers the grouping path - correctness only; we can't easily observe the
 // decompression count from test code.
 TEST_F(StoredFieldsSearchTest, multipleFieldsShareResource) {
   using namespace solux::test;

@@ -335,7 +335,7 @@ void IndexWriter::initiateCommit(UpdateMessage& msg) {
   INDEX_DEBUG("initiateCommit: msg={} STARTING", (void*)&msg);
 
   // A commit that requests aux index builds must run finishCommitBody after
-  // any in-flight merges have finished — otherwise the merge-triggered
+  // any in-flight merges have finished - otherwise the merge-triggered
   // synthetic commit can race in behind us, bump coreGen, and invalidate the
   // aux we just built.  Same gating mechanism as flushes (leftToFlush).
   if (!msg.buildAuxIndexes.empty()) {
@@ -716,8 +716,8 @@ void IndexWriter::finishCommitBody(UpdateMessage& msg) {
     }
   }
   // Sort segsToKeep by segId now (rather than later in writeIndexInfoFile) so
-  // every commit-stage step — buildAuxIndexes, IndexInfo serialization, and
-  // future query-time derivation of FAISS-id -> segment mapping — sees the
+  // every commit-stage step - buildAuxIndexes, IndexInfo serialization, and
+  // future query-time derivation of FAISS-id -> segment mapping - sees the
   // same canonical segment order.
   std::sort(segsToKeep.begin(), segsToKeep.end(),
             [](const SegInfo* a, const SegInfo* b) { return a->segId < b->segId; });
@@ -864,10 +864,10 @@ void IndexWriter::moveSegmentToDelete(uint64_t segId) {
 // Semantics:
 //   - First, filter the previous list:
 //       * Entries with built_core_gen > 0 and != newCoreGen are dropped
-//         (segment composition changed → segment-mapped indexes like FAISS
+//         (segment composition changed -> segment-mapped indexes like FAISS
 //         are stale; their files will be cleaned up after the commit).
 //       * Entries with built_core_gen == 0 are always carried forward
-//         (aux kinds robust to segment changes — future autocomplete, etc).
+//         (aux kinds robust to segment changes - future autocomplete, etc).
 //   - Then, if the message requested rebuilds, build matching fields, drop
 //     any carried entries whose names get rebuilt, and append the new ones.
 //
@@ -886,7 +886,7 @@ std::vector<proto::AuxIndexInfo> IndexWriter::buildAuxIndexes(
 
   // Step 1: filter previous list by core gen.  Build a set of "still valid"
   // names (segment-dependent entries whose built_core_gen matches the new
-  // core gen) — rebuilding those would produce identical output, so we tell
+  // core gen) - rebuilding those would produce identical output, so we tell
   // the builder to skip them.
   std::vector<proto::AuxIndexInfo> carried;
   carried.reserve(currentAuxIndexes_.size());
@@ -929,7 +929,7 @@ std::vector<proto::AuxIndexInfo> IndexWriter::buildAuxIndexes(
                         *schema, msg.commitInfo->indexGen, newCoreGen);
   auto newlyBuilt = vb.build(msg.buildAuxIndexes, stillValid, outFilesToSync);
 
-  // Step 4: merge — drop carried entries whose name was rebuilt, then append.
+  // Step 4: merge - drop carried entries whose name was rebuilt, then append.
   boost::unordered_flat_set<std::string> rebuiltNames;
   rebuiltNames.reserve(newlyBuilt.size());
   for (const auto& info : newlyBuilt) rebuiltNames.emplace(info.name());
@@ -1143,7 +1143,7 @@ void IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
   if (segs.empty()) {
     // This is possible if a merge was correctly triggered, but all of the segments were deleted.
     INDEX_DEBUG("mergeSegmentsBody: no segments to merge for msg={}", (void*)&msg);
-    // Nothing merged, so no synthetic commit needed — but we still need to
+    // Nothing merged, so no synthetic commit needed - but we still need to
     // balance the gate: clear mergeRunning, chain a follow-up merge if some
     // other level is now full, and decrement leftToFlush on every member of
     // waitingForMerges to undo our start-bump.  Same ordering as the normal
@@ -1553,7 +1553,7 @@ SortedDeletes::EntrySpan mergeDeleteSpans(
 
   while (pq.size() > 0) {
     auto& top = pq.top();
-    // Copy the entry — the reference into the span's backing memory remains valid after
+    // Copy the entry - the reference into the span's backing memory remains valid after
     // advance/removeTop since entries live in detached TermValHash tables, not in the cursor.
     Entry entry = top.current();
     uint64_t bestVersion = entry.val().version;
@@ -1578,7 +1578,7 @@ SortedDeletes::EntrySpan mergeDeleteSpans(
       }
     }
 
-    // version==0 marks ids indexed without overwrite — not deletes
+    // version==0 marks ids indexed without overwrite - not deletes
     if (bestVersion > 0) {
       entry.val().version = bestVersion;
       out.push_back(entry);
@@ -1599,7 +1599,7 @@ void IndexWriter::applyDeletes(std::span<SegInfo*> segs, MultiDeletesData& multi
     }
   }
 
-  // Merge commit-level deletes once — reused across all segments
+  // Merge commit-level deletes once - reused across all segments
   std::vector<SortedDeletes::Entry> mergedBuf;
   SortedDeletes::EntrySpan commitDeletes = mergeDeleteSpans(commitSpans, mergedBuf);
 
@@ -1628,7 +1628,7 @@ void IndexWriter::applyDeletes(SegInfo& seg, SortedDeletes::EntrySpan commitDele
     return;
   }
 
-  // If this segment has personal deletes (rare — only during concurrent merges),
+  // If this segment has personal deletes (rare - only during concurrent merges),
   // merge them with commit deletes into a combined span.
   SortedDeletes::EntrySpan deleteSpan = commitDeletes;
   boost::container::small_vector<SortedDeletes::EntrySpan, 4> allSpans;

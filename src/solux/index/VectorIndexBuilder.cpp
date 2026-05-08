@@ -165,7 +165,7 @@ VectorIndexBuilder::buildField(std::string_view fieldName,
     if (!index) {
       // IndexFlat keeps the entire vector array in process memory
       // (IndexFlatCodes::codes is just a std::vector<uint8_t>).  Peak RAM
-      // during build is roughly 2× the vector data: once in the source column
+      // during build is roughly 2x the vector data: once in the source column
       // (mmap or RAM), once in FAISS.  write_index streams its output, so the
       // serialization step doesn't add a third copy.
       // For collections that don't fit in RAM, switch to an IndexIVF* variant
@@ -175,7 +175,7 @@ VectorIndexBuilder::buildField(std::string_view fieldName,
 
     // Vector storage is contiguous (fixed-size column), so for the no-renorm
     // path we can hand FAISS the whole block at once.  No live filtering:
-    // deleted-doc vectors stay in the index until the next rebuild — query
+    // deleted-doc vectors stay in the index until the next rebuild - query
     // layer filters.
     const float* base = (const float*)vr.vectorAtRank(0).data();
     if ((ft.metric_ == VectorFieldType::METRIC_COSINE) && !ft.normalized_) {
@@ -199,7 +199,7 @@ VectorIndexBuilder::buildField(std::string_view fieldName,
     ntotal += numVals;
   }
 
-  // No segment had any values — nothing to build.  Skip emitting an AuxIndexInfo.
+  // No segment had any values - nothing to build.  Skip emitting an AuxIndexInfo.
   if (!index) {
     LOG_INFO("VectorIndexBuilder: field {} has no vectors; skipping", fieldName);
     return std::nullopt;

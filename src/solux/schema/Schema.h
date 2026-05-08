@@ -36,7 +36,7 @@ public:
       if (it->second->isAbstract()) return fieldTypeMap.end();
       return it;
     }
-    // Not found — try a suffix match
+    // Not found - try a suffix match
     auto underscorePos = fieldName.find_last_of('_');
     if (underscorePos != std::string_view::npos && underscorePos > 0) {
       std::string_view suffix = fieldName.substr(underscorePos);

@@ -126,7 +126,7 @@ TEST_F(VectorIndexBuilderTest, basicBuildSingleSegment) {
   EXPECT_FLOAT_EQ(dists[0], 0.0f);
 }
 
-// Empty selectors → no aux index is built even on a populated index.
+// Empty selectors -> no aux index is built even on a populated index.
 TEST_F(VectorIndexBuilderTest, noBuildWhenSelectorsEmpty) {
   CollectionHelper h("main");
   h.clear();
@@ -140,7 +140,7 @@ TEST_F(VectorIndexBuilderTest, noBuildWhenSelectorsEmpty) {
   EXPECT_EQ(0, info->aux_indexes_size());
 }
 
-// Multiple segments — ntotal must equal the live-doc count across segments,
+// Multiple segments - ntotal must equal the live-doc count across segments,
 // and the metric file's mapping should round-trip (segId, localDoc) correctly.
 TEST_F(VectorIndexBuilderTest, buildAcrossMultipleSegments) {
   CollectionHelper h("main");
@@ -179,7 +179,7 @@ TEST_F(VectorIndexBuilderTest, buildAcrossMultipleSegments) {
   EXPECT_EQ(fileMetric, (int32_t)proto::VectorParams::L2);
 }
 
-// Selector miss: name doesn't match any field → no aux index built.
+// Selector miss: name doesn't match any field -> no aux index built.
 TEST_F(VectorIndexBuilderTest, selectorMiss) {
   CollectionHelper h("main");
   h.clear();
@@ -215,7 +215,7 @@ TEST_F(VectorIndexBuilderTest, carryForwardOnDeleteOnlyCommit) {
   std::vector<std::string> origFiles(info1->aux_indexes(0).files().begin(),
                                      info1->aux_indexes(0).files().end());
 
-  // Delete one doc and commit — segment composition unchanged.
+  // Delete one doc and commit - segment composition unchanged.
   std::vector<std::string> ids{"a"};
   h.deleteByIds(ids, UpdateMessage::COMMIT);
 
@@ -276,7 +276,7 @@ TEST_F(VectorIndexBuilderTest, rebuildDeletesPreviousFiles) {
   std::vector<std::string> oldFiles(info1->aux_indexes(0).files().begin(),
                                     info1->aux_indexes(0).files().end());
 
-  // Add a new doc and rebuild — produces a fresh gen of files.
+  // Add a new doc and rebuild - produces a fresh gen of files.
   Doc d2 = flatdoc("id", std::string("b"), "embedding_v", std::vector<float>{0, 1, 0});
   h.index(d2);
   h.commit({"*"});
@@ -332,7 +332,7 @@ TEST_F(VectorIndexBuilderTest, cosineRenormalizesByDefault) {
   auto idx = readFaissIndex(h.getIndexWriter()->dir, info->aux_indexes(0).files(0));
   EXPECT_EQ(idx->metric_type, faiss::METRIC_INNER_PRODUCT);
 
-  // Unit-length query in doc-a's direction — IP against the (now-normalized)
+  // Unit-length query in doc-a's direction - IP against the (now-normalized)
   // stored vectors should be 1.0 for doc-a, 0.0 for doc-b.
   std::vector<float> query{1, 0, 0};
   std::vector<faiss::idx_t> ids(2);
@@ -361,7 +361,7 @@ TEST_F(VectorIndexBuilderTest, normalizedFlagSkipsRenorm) {
 
   // Pre-normalized: each vector is unit-length.  We deliberately use
   // vectors that would land elsewhere if the builder *did* renormalize a
-  // copy, but since they're already unit-length the result is the same —
+  // copy, but since they're already unit-length the result is the same -
   // what we're really verifying is that no extra copy/normalize is
   // performed (logically: the search returns identical results to passing
   // these through faiss directly without normalization).
@@ -387,7 +387,7 @@ TEST_F(VectorIndexBuilderTest, normalizedFlagSkipsRenorm) {
 }
 
 // Requesting a rebuild when nothing has changed (coreGen unchanged, entry
-// still valid) should NOT rewrite the file — the carried-forward entry's
+// still valid) should NOT rewrite the file - the carried-forward entry's
 // existing files survive untouched.
 TEST_F(VectorIndexBuilderTest, rebuildSkippedWhenStillValid) {
   CollectionHelper h("main");
@@ -422,9 +422,9 @@ TEST_F(VectorIndexBuilderTest, rebuildSkippedWhenStillValid) {
 
 // Cosine renormalization happens in fixed-size chunks so a single segment with
 // many vectors doesn't blow up memory.  Set a tiny chunk size and verify the
-// loop boundaries — every vector still ends up correctly normalized.
+// loop boundaries - every vector still ends up correctly normalized.
 TEST_F(VectorIndexBuilderTest, cosineRenormChunkBoundaries) {
-  // Force a chunk size of 2 vectors × 4 floats × 4 bytes = 32 bytes per chunk.
+  // Force a chunk size of 2 vectors x 4 floats x 4 bytes = 32 bytes per chunk.
   // With 7 vectors this exercises 4 chunks (sizes 2, 2, 2, 1).
   size_t saved = VectorIndexBuilder::renormChunkBytes;
   VectorIndexBuilder::renormChunkBytes = 32;
@@ -460,7 +460,7 @@ TEST_F(VectorIndexBuilderTest, cosineRenormChunkBoundaries) {
   ASSERT_EQ(idx->ntotal, (faiss::idx_t)vecs.size());
 
   // Each input, after L2 normalization, queried back against itself should
-  // hit IP=1.0 — confirms every chunk got normalized correctly.
+  // hit IP=1.0 - confirms every chunk got normalized correctly.
   for (size_t i = 0; i < vecs.size(); i++) {
     auto v = vecs[i];
     float norm = 0.0f;

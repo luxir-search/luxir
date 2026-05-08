@@ -120,7 +120,7 @@ message Query {
 // fewer than k live vectors).
 message KnnQuery {
   string field = 1;        // vector field name (e.g. "embedding_v")
-  Vector query = 2;        // query vector — must match the field's dims
+  Vector query = 2;        // query vector - must match the field's dims
   int32 k = 3;             // number of nearest neighbors to return
 }
 
@@ -241,10 +241,10 @@ message CommitParams {
   uint64 commit_within_us = 1;
 
   // Rebuild aux indexes as part of this commit.
-  //   []                 — no rebuild
-  //   ["*"]              — rebuild every eligible aux index in the schema
-  //   ["vec.title_v"]    — rebuild this one (matched against AuxIndexInfo.name)
-  //   ["vec.*"]          — (future) glob-match by prefix
+  //   []                 - no rebuild
+  //   ["*"]              - rebuild every eligible aux index in the schema
+  //   ["vec.title_v"]    - rebuild this one (matched against AuxIndexInfo.name)
+  //   ["vec.*"]          - (future) glob-match by prefix
   // When non-empty, wait_for_merges is implicitly enabled so the aux build sees post-merge segments.
   repeated string build_aux_indexes = 2;
 
@@ -410,7 +410,7 @@ message ArrArrBin {
 }
 
 // A dense vector value.  The kind oneof leaves room for quantized variants
-// (int8, binary, etc.) without breaking wire compatibility — readers detect
+// (int8, binary, etc.) without breaking wire compatibility - readers detect
 // the encoding via the populated field.  Dimensionality is implicit in the
 // chosen variant: f32.v_size() for the f32 case, byte length / stride for
 // future packed variants.
@@ -462,7 +462,7 @@ message Column {
 }
 
 // Single-valued vector column.  Each Vector slot is independently nullable
-// via its empty oneof — no separate missing_val needed.
+// via its empty oneof - no separate missing_val needed.
 message ColVector {
   repeated Vector v = 1;
 }
@@ -526,7 +526,7 @@ message AuxIndexInfo {
 
   // Index core_gen this aux was built against.  On the next commit, an aux
   // entry is carried forward only if its built_core_gen matches the new
-  // commit's core_gen — otherwise it's invalidated and its files deleted.
+  // commit's core_gen - otherwise it's invalidated and its files deleted.
   // Use this for aux kinds that embed segment-specific references (e.g. vector
   // indexes mapping to (segId, localDoc)) and become incorrect after merges.
   // Aux kinds robust to segment changes (future autocomplete, spell-check)
@@ -552,7 +552,7 @@ message SegmentInfo {
 
 message AnalyzerDef {
   string tokenizer = 1;           // e.g., "whitespace", "keyword"
-  repeated string filters = 2;    // e.g., ["lowercase"] — applied in order
+  repeated string filters = 2;    // e.g., ["lowercase"] - applied in order
 }
 
 message FieldDef {

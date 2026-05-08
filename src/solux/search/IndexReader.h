@@ -139,8 +139,8 @@ public:
 
   // Returns the aux reader with the given name, or nullptr if not present.
   // Names are unique across an index (e.g. "vec.title_v").
-  // TODO: replace this O(n) scan with a name → AuxReader hash map populated
-  // at IndexReader construction.  Fine for v1 (≤ a handful of aux entries
+  // TODO: replace this O(n) scan with a name -> AuxReader hash map populated
+  // at IndexReader construction.  Fine for v1 (<= a handful of aux entries
   // per shard); revisit if we add many cheap aux kinds (autocomplete,
   // spell-check) so the per-query lookup count grows.
   std::shared_ptr<AuxReader> getAuxReader(std::string_view name) const {
