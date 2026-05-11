@@ -304,7 +304,10 @@ TEST_F(DirectoryTest, checkedDirWarnMode) {
   dir.finishFile(*f);
 
   // WARN mode should not throw even with expectSynced on unsynced file
-  ASSERT_NO_THROW(dir.openFile("bar", true));
+  {
+    LogLevelGuard quiet;  // expected: unsynced-read warn
+    ASSERT_NO_THROW(dir.openFile("bar", true));
+  }
 }
 
 TEST_F(DirectoryTest, checkedDirDeleteClearsUnsynced) {

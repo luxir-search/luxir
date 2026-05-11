@@ -261,7 +261,10 @@ TEST_F(KnnQueryTest, missingAuxIndexReturnsEmpty) {
           UpdateMessage::COMMIT);
 
   auto* req = makeKnnReq(*soluxNode, "embedding_v", {1, 0, 0}, 5);
-  req->execute();
+  {
+    LogLevelGuard quiet;  // expected: KnnQuery debug-logs "no aux index"
+    req->execute();
+  }
 
   EXPECT_EQ(req->getMatchCount(), 0);
   EXPECT_EQ(resultIds(*req).size(), 0u);
@@ -290,7 +293,10 @@ TEST_F(KnnQueryTest, dimMismatchReturnsEmpty) {
 
   // Query is 3-d but index is 4-d.
   auto* req = makeKnnReq(*soluxNode, "embedding_v", {1, 0, 0}, 1);
-  req->execute();
+  {
+    LogLevelGuard quiet;  // expected: dim-mismatch warns
+    req->execute();
+  }
   EXPECT_EQ(req->getMatchCount(), 0);
   EXPECT_EQ(resultIds(*req).size(), 0u);
 

@@ -24,3 +24,34 @@ namespace solux {
 #define LOG_TRACE SPDLOG_TRACE
 #define LOG_WARN SPDLOG_WARN
 #define LOG_ERROR SPDLOG_ERROR
+
+namespace solux {
+
+// RAII guard that temporarily raises the global spdlog level threshold so
+// lower-severity messages are suppressed, restoring the previous level on
+// destruction.  Useful around code paths that are expected to emit a log
+// message (e.g. tests that intentionally trigger an error) to keep output
+// clean enough that real issues stand out.
+//
+// Default threshold is `err`, which suppresses warn and below - the common
+// case for "I know this block will warn / log debug, hush it".
+//
+//   {
+//     LogLevelGuard quiet;  // suppress warn and below
+//     req->execute();
+//   }
+class LogLevelGuard {
+  spdlog::level::level_enum prev;
+public:
+  explicit LogLevelGuard(spdlog::level::level_enum level = spdlog::level::err) : prev(spdlog::get_level()) {
+    spdlog::set_level(level);
+  }
+  ~LogLevelGuard() {
+    spdlog::set_level(prev);
+  }
+
+  LogLevelGuard(const LogLevelGuard&) = delete;
+  LogLevelGuard& operator=(const LogLevelGuard&) = delete;
+};
+
+} // namespace solux
