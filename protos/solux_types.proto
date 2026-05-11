@@ -194,6 +194,7 @@ message Domain {
 message SearchResponse {
   bytes request_id = 1;
   map<string, Val> ops = 2; // the results of the search operations in the request, keyed by operation name.
+  string error = 3;         // If non-empty, the request failed.  ops may be empty or partial.
   bool more = 15;  // if true, expect at least one more streaming response to the logical request.
 }
 

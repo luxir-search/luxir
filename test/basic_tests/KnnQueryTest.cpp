@@ -294,6 +294,10 @@ TEST_F(KnnQueryTest, dimMismatchReturnsEmpty) {
   EXPECT_EQ(req->getMatchCount(), 0);
   EXPECT_EQ(resultIds(*req).size(), 0u);
 
+  // A single response is returned with the error string populated.
+  ASSERT_EQ(req->responses.size(), 1u);
+  EXPECT_NE(req->responses[0]->proto.error().find("dims 3 do not match index dims 4"), std::string::npos);
+
   req->done();
 }
 
