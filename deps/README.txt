@@ -6,7 +6,7 @@ $ cd /opt/vcpkg
 $ ./vcpkg install boost-core boost-sort boost-thread gtest benchmark xxhash gtl protobuf grpc spdlog lz4 cli11 faiss
 $ ./vcpkg install robin-hood-hashing   #optional... see MapBM.cpp
 
-NOTE: when using address sanitizer, newer gRCP/proto will be hit with "use after poison" errors
+NOTE: when using address sanitizer, newer gRPC/proto will be hit with "use after poison" errors
 if the libraries themselves are not built with address sanitizer.  Easiest way is this:
 diff --git a/triplets/x64-linux.cmake b/triplets/x64-linux.cmake
 index 8822134560..777ce1ea65 100644
@@ -17,19 +17,20 @@ index 8822134560..777ce1ea65 100644
  set(VCPKG_CMAKE_SYSTEM_NAME Linux)
 
 +#YCS
-+set(VCPKG_CXX_FLAGS "-g -fno-omit-frame-pointer -fsanitize=address")
-+set(VCPKG_C_FLAGS "-g -fno-omit-frame-pointer -fsanitize=address")
++set(VCPKG_CXX_FLAGS "-g -fno-omit-frame-pointer -fsanitize=address -mavx -mssse3 -march=native -mtune=native")
++set(VCPKG_C_FLAGS "-g -fno-omit-frame-pointer -fsanitize=address -mavx -mssse3 -march=native -mtune=native")
 +set(VCPKG_LINKER_FLAGS "-g -fno-omit-frame-pointer -fsanitize=address")
 
-
+NOTE: -mavx -mssse3 -march=native -mtune=native MUST be in VCPKG_CXX_FLAGS / VCPKG_C_FLAGS for
+the non-asan vcpkg roots too (e.g. /opt/vcpkg/triplets/x64-linux.cmake), matching the project's
+release CXXFLAGS. Without this, protobuf::Map<string, ...>::find() will silently return end()
+for entries that iteration sees, in release builds only. Underlying cause of failures was abseil hash
+changing with these compilation flags set.
 
 Ubuntu:
 ```
-sudo apt install libtbb-dev    #TODO - try the tbb in vcpkg
+sudo apt install libtbb-dev    #TODO - try the tbb in vcpkg now.
 ```
-
-Other 3rd party dependencies:
-TBB: the vcpkg version for TBB is currently out of date. On Ubuntu 22.04, use sudo apt install libtbb-dev
 
 SIMDCompressionAndIntersection 
 NOTE: The debugging version of libsimdcomp is currently built with -D_GLIBCXX_DEBUG, which is
