@@ -8,65 +8,67 @@
 #include <boost/unordered/unordered_flat_map.hpp>
 
 #include "SearchOp.h"
+#include "TopDocsReq.h"
 #include "solux/query/Query.h"
-#include "solux/search/Collector.h"
 #include "solux/search/DocSet.h"
 #include "solux/search/EmitDocs.h"
-#include "solux/search/FieldSortCollector.h"
-#include "solux/search/SortField.h"
-#include "solux/util/AtomicMerger.h"
+#include "solux/search/MergeableCollector.h"
 #include "solux/util/MemPool.h"
 #include "solux/util/thread.h"
 
 namespace solux {
 
 
-// Hybrid-search fusion: runs N named source queries (each a full TopDocs spec)
-// across all segments and merges their per-source ranked lists into one fused
-// list.  V1 implements Reciprocal Rank Fusion: fused_score(d) = sum over
-// sources s of 1 / (k + rank_s(d)), where rank_s(d) is d's 1-based rank in
-// source s's ranked output (0 if d does not appear).  Standard k = 60.
+// Hybrid-search fusion: runs N named source queries (each a full TopDocs)
+// across all segments and merges their per-source ranked lists into one
+// fused list.  V1 implements Reciprocal Rank Fusion: fused_score(d) =
+// sum over sources s of 1 / (k + rank_s(d)), where rank_s(d) is d's
+// 1-based rank in source s's ranked output (0 if d does not appear).
+// Standard k = 60.
 //
-// The Fusion-level filter is computed once per segment and shared across all
-// sources.  Per-source filters (if any) are intersected with the shared
-// filter at scoring time.
+// Each source is a child TopDocsReq with its rankingSink wired to deliver
+// the merged top-K back here.  This means TopDocsReq's per-segment
+// scoring/collection machinery is reused as-is (filters, sort modes,
+// match-everything optimization) - FusionOp only orchestrates the shared
+// filter and the cross-source fusion step.
 //
-// V1 limitations: sub-ops (Fusion.ops) are not yet supported; the parser
-// rejects them before constructing the FusionOp.
+// The Fusion-level filter is computed once per segment and passed to every
+// source as its domain.  Per-source filters (if any) are intersected by
+// the source's TopDocsReq with the incoming domain.
+//
+// V1 limitations: top-level Fusion sub-ops (over the union of source
+// matches) are not yet wired; the parser rejects them.
 class FusionOp : public SearchOp {
 public:
-  // Per-source state populated from the source's TopDocs proto.
-  struct Source {
-    std::string_view name;
-    const proto::TopDocs* sourceProto;
-    Query* query;
-    Query::Weight* weight = nullptr;
-    int64_t topCount;
-    std::vector<SortField> sortFields;
-    bool useFieldSort = false;
-    std::span<std::pair<std::string_view, Query*>> filters;
-    std::span<Query::Weight*> filterWeights;
-  };
-
   const proto::Fusion& fusionProto;
-  Query::Context& qcontext;
-  std::vector<Source> sources;
+  // Each source is a full TopDocsReq parented to this FusionOp.  Their
+  // rankingSinks are set by the parser to deliver to FusionOp::Calc.
+  std::vector<TopDocsReq*> sources;
   int64_t topCount;
   std::span<std::pair<std::string_view, Query*>> filters;  // shared fusion-level filters
   std::span<Query::Weight*> filterWeights;
   int32_t rrfK = 60;
 
-  // See TopDocsReq's ctor comment about the arena-cleanup hazard: keep this
-  // ctor nothrow.  ProtobufSearchParser fully populates each Source (sort
-  // fields, Weight, filter weights) and validates RRF parameters before
-  // calling Arena::Create<FusionOp>.
+  // Nothrow ctor (Arena::Create hazard - see TopDocsReq's ctor comment).
+  // ProtobufSearchParser builds each source TopDocsReq (with rankingSink
+  // wired) and the filter weights before allocation.
   FusionOp(SearchRequest& req, std::string_view name, const proto::Fusion& fusionProto,
-           Query::Context& qcontext, std::vector<Source>&& sources, int64_t topCount,
+           std::vector<TopDocsReq*>&& sources, int64_t topCount,
            std::span<std::pair<std::string_view, Query*>> filters,
            std::span<Query::Weight*> filterWeights, int32_t rrfK)
-    : SearchOp(req, name), fusionProto(fusionProto), qcontext(qcontext),
+    : SearchOp(req, name), fusionProto(fusionProto),
       sources(std::move(sources)), topCount(topCount), filters(filters),
       filterWeights(filterWeights), rrfK(rrfK) {
+  }
+
+  // Sources are not in `subOps` (different lifecycle: they deliver via
+  // rankingSink rather than emit), so SearchOp::init() does not reach
+  // them - walk them explicitly here.
+  void init() override {
+    SearchOp::init();
+    for (auto* src : sources) {
+      src->init();
+    }
   }
 
   // Resolve a single filter Weight to a DocSet for one segment.  Mirrors
@@ -89,85 +91,30 @@ public:
 
   class Calc : public SearchOp::Calculator {
   public:
-    // Same shape as TopDocsReq::Calc::MergeableCollector.  Duplicated here
-    // rather than shared because the type is small and the surface is
-    // private to ops; we can lift it to its own header if a third user
-    // appears.
-    class MergeableCollector : public MergeableData {
-    public:
-      std::unique_ptr<TopDocsCollector> scoreCollector;
-      std::unique_ptr<FieldSortCollector> fieldCollector;
-      bool useFieldSort;
+    // One sub-calc per source TopDocsReq.  Each is a TopDocsReq::Calc that
+    // collects across all segments and ultimately fires its rankingSink,
+    // delivering its merged collector to this Calc.
+    std::vector<std::unique_ptr<SearchOp::Calculator>> sourceCalcs;
 
-      MergeableCollector(size_t topCount, bool useFieldSort,
-                         const std::vector<SortField>& sortFields,
-                         IndexReader* reader = nullptr)
-        : useFieldSort(useFieldSort) {
-        if (!useFieldSort) {
-          scoreCollector = std::make_unique<TopDocsCollector>(topCount);
-        } else {
-          std::unique_ptr<FieldComparator> comparator;
-          if (sortFields.size() == 1) {
-            comparator = sortFields[0].createComparator(topCount, reader);
-          } else {
-            comparator = std::make_unique<MultiFieldComparator>(sortFields, topCount, reader);
-          }
-          fieldCollector = std::make_unique<FieldSortCollector>(topCount, std::move(comparator));
-        }
-      }
+    // Per-source merged collectors, populated by acceptSourceRanking.
+    // Index parallel to op.sources.  Null entries mean the empty-index
+    // path or an all-segments-empty source.
+    std::vector<MergeableCollector*> deliveredCollectors;
 
-      static MergeableCollector* merge(MergeableCollector* a, MergeableCollector* b) {
-        if (a->useFieldSort) {
-          if (a->fieldCollector->size() < b->fieldCollector->size()) {
-            std::swap(a, b);
-          }
-          a->fieldCollector->merge(*b->fieldCollector);
-        } else {
-          if (a->scoreCollector->size() < b->scoreCollector->size()
-            || a->scoreCollector->minCompetitiveVal < b->scoreCollector->minCompetitiveVal) {
-            std::swap(a, b);
-          }
-          a->scoreCollector->merge(*b->scoreCollector);
-        }
-        return a;
-      }
-    };
-
-    // One merger per source.  unique_ptr because AtomicMerger holds an atomic
-    // pointer and is non-movable.
-    struct SourceState {
-      AtomicMerger<MergeableCollector> merger;
-      SourceState() : merger(nullptr, nullptr) {}
-    };
-    std::vector<std::unique_ptr<SourceState>> sourceStates;
-
-    // Shared filter per segment, kept alive by Calc until fusion fires.
-    // Indexed by segnum; only populated when filterWeights is non-empty.
+    // Shared filter DocSet per segment, kept alive until fusion emits.
     std::vector<std::unique_ptr<DocSet>> segFilters;
 
-    // Counts source completions (each source finishing across all segments
-    // increments this).  When it reaches numSources, fusion fires.
-    std::atomic<int32_t> sourcesFinished{0};
+    // Number of sources that have delivered their ranking.  When this hits
+    // op.sources.size(), the last delivery launches doFusion.
+    std::atomic<int32_t> sourcesDelivered{0};
 
     Calc(FusionOp& op, Calculator* parent) : SearchOp::Calculator(op, parent, -1, -1) {
       auto numSources = op.sources.size();
       auto numSegs = op.req.reader->segments().size();
-      sourceStates.reserve(numSources);
-      // op.sources is moved into FusionOp at construction and never resized
-      // afterward, so the per-source pointer captured below stays valid for
-      // the lifetime of Calc.
-      for (size_t s = 0; s < numSources; s++) {
-        auto state = std::make_unique<SourceState>();
-        Source* srcPtr = &op.sources[s];
-        IndexReader* reader = op.req.reader.get();
-        state->merger.creator = [srcPtr, reader]() -> MergeableCollector* {
-          return new MergeableCollector(srcPtr->topCount, srcPtr->useFieldSort,
-                                        srcPtr->sortFields, reader);
-        };
-        state->merger.destroyer = [](MergeableCollector* data) {
-          delete data;
-        };
-        sourceStates.emplace_back(std::move(state));
+      sourceCalcs.reserve(numSources);
+      deliveredCollectors.assign(numSources, nullptr);
+      for (auto* src : op.sources) {
+        sourceCalcs.emplace_back(src->createCalculator(this, -1));
       }
       segFilters.resize(numSegs);
     }
@@ -187,16 +134,19 @@ public:
       auto& op = thisOp();
 
       if (segnum < 0) {
-        // Empty-index case: no segments, no per-source tasks will run.  Go
-        // straight to emit; doFusion sees nullptr collectors for every source
-        // and writes an empty DocList.
-        task_group_run(tg, [this]() { doFusion(); });
+        // Empty-index case: hand each source a -1 dispatch so they fire
+        // their rankingSink with a null collector.  Once all sources have
+        // delivered, doFusion writes an empty DocList.
+        for (auto& sc : sourceCalcs) {
+          sc->calc(tg, -1, nullptr);
+        }
         return;
       }
 
-      // Compute the shared filter once for this segment.  Build per-segment
-      // filter DocSets from the fusion-level filter weights and intersect
-      // with the incoming domain (typically liveDocs from RootOp).
+      // Compute the shared filter once per segment.  Intersect the
+      // fusion-level filter weights with the incoming domain (typically
+      // liveDocs from RootOp) and stash the result so it stays alive
+      // until every source has finished using it.
       DocSet* sharedFilter = domain;
       if (!op.filterWeights.empty()) {
         std::vector<std::unique_ptr<DocSet>> filterDocSets;
@@ -216,72 +166,30 @@ public:
         sharedFilter = segFilters[segnum].get();
       }
 
-      // Dispatch one task per source.  Each task collects top-K for its
-      // source over this segment, then atomically signals fusion if it was
-      // the last segment for this source AND every other source is also
-      // done.
-      auto numSegs = (int64_t)op.req.reader->segments().size();
-      auto numSources = (int64_t)op.sources.size();
-      for (size_t s = 0; s < op.sources.size(); s++) {
-        task_group_run(tg, [this, s, segnum, sharedFilter, tg, numSegs, numSources]() {
-          runSource(s, segnum, sharedFilter, tg, numSegs, numSources);
-        });
+      // Dispatch each source's TopDocsReq::Calc::calc with the shared
+      // filter as its domain.  The source will intersect with its own
+      // filterWeights, collect top-K, and ultimately invoke rankingSink
+      // which lands in acceptSourceRanking below.
+      for (auto& sc : sourceCalcs) {
+        sc->calc(tg, segnum, sharedFilter);
       }
     }
 
-    void runSource(size_t sourceIdx, int32_t segnum, DocSet* sharedFilter,
-                   oneapi::tbb::task_group* tg, int64_t numSegs, int64_t numSources) {
-      auto& op = thisOp();
-      auto& src = op.sources[sourceIdx];
-      auto& state = *sourceStates[sourceIdx];
+    // Called by each source TopDocsReq's rankingSink when its top-K is
+    // merged across all segments.  `mc` may be null on the empty-index
+    // path.  `idx` is the source's position in op.sources, captured by
+    // the parser when wiring the rankingSink.
+    void acceptSourceRanking(size_t idx, MergeableCollector* mc) {
+      deliveredCollectors[idx] = mc;
 
-      MergeableCollector* data = nullptr;
-      {
-        auto poolGuard = MemPool::threadLocalPoolGuard();
-        auto& seg = op.qcontext.topReader.segments()[segnum];
-        auto* scorer = src.weight->createScorer(poolGuard.pool(), seg);
-
-        data = state.merger.obtain();
-
-        if (scorer != nullptr) {
-          DocSet* filter = sharedFilter;
-          std::unique_ptr<DocSet> mergedFilter;
-          if (!src.filterWeights.empty()) {
-            std::vector<std::unique_ptr<DocSet>> perSrcFilters;
-            std::vector<DocSet*> filterPtrs;
-            perSrcFilters.reserve(src.filterWeights.size());
-            filterPtrs.reserve(src.filterWeights.size() + 1);
-            for (auto* w : src.filterWeights) {
-              perSrcFilters.push_back(op.getDocSet(*w, segnum));
-              filterPtrs.push_back(perSrcFilters.back().get());
-            }
-            if (sharedFilter) filterPtrs.push_back(sharedFilter);
-            if (filterPtrs.size() > 1) {
-              mergedFilter = DocSet::intersect(filterPtrs);
-              filter = mergedFilter.get();
-            } else {
-              mergedFilter = std::move(perSrcFilters[0]);
-              filter = mergedFilter.get();
-            }
-          }
-
-          if (data->useFieldSort) {
-            data->fieldCollector->setSegment(segnum, &seg.postingsReader());
-            collectTopK(segnum, scorer, filter, nullptr, *data->fieldCollector);
-          } else {
-            collectTopK(segnum, scorer, filter, nullptr, *data->scoreCollector);
-          }
-        }
-      }
-
-      auto count = state.merger.release(data);
-      if (count == numSegs) {
-        // This source has finished all segments.  Bump the global source
-        // counter; the source that arrives last fires fusion.
-        auto finished = sourcesFinished.fetch_add(1, std::memory_order_acq_rel) + 1;
-        if (finished == numSources) {
-          task_group_run(tg, [this]() { doFusion(); });
-        }
+      // Release side of this fetch_add publishes the deliveredCollectors[idx]
+      // write above; the last thread's acquire side observes all prior
+      // publishes, so the plain reads in doFusion see every slot.
+      auto finished = sourcesDelivered.fetch_add(1, std::memory_order_acq_rel) + 1;
+      if (finished == (int32_t)thisOp().sources.size()) {
+        // Inline call matches TopDocsReq::doneCollecting -> fillQueryTopNResponse
+        // pattern: emitDocsResponse manages its own task scheduling internally.
+        doFusion();
       }
     }
 
@@ -297,13 +205,11 @@ public:
       auto& op = thisOp();
       int32_t k = op.rrfK;
 
-      // Per-source ranked doc lists.  Holding them as vectors of segdoc
-      // keeps the inner loops branch-free and avoids carrying the
-      // SortDoc/ScoreDoc shape further.
+      // Pull each source's ranked docs out of its delivered collector.
       std::vector<std::vector<segdoc>> rankedPerSource;
       rankedPerSource.reserve(op.sources.size());
       for (size_t s = 0; s < op.sources.size(); s++) {
-        auto* mc = sourceStates[s]->merger.getData();
+        auto* mc = deliveredCollectors[s];
         std::vector<segdoc> docs;
         if (mc != nullptr) {
           if (mc->useFieldSort) {

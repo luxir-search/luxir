@@ -56,7 +56,9 @@ public:
   SearchOp* parseOp(std::string_view name, const solux::proto::SearchOp& searchOp) {
     switch (searchOp.kind_case()) {
       case solux::proto::SearchOp::kTopDocs: {
-        return parseTopDocs(name, searchOp.top_docs());
+        auto* qr = parseTopDocs(name, searchOp.top_docs());
+        addSubs(*qr, searchOp.top_docs().ops());
+        return qr;
       }
       case solux::proto::SearchOp::kFusion: {
         return parseFusion(name, searchOp.fusion());
@@ -189,7 +191,10 @@ public:
     return weights;
   }
 
-  SearchOp* parseTopDocs(std::string_view name, const solux::proto::TopDocs& topDocsReq) {
+  // Build a TopDocsReq from a TopDocs proto.  Caller decides whether to
+  // attach sub-ops (the kTopDocs path in parseOp does; parseFusion does
+  // not, since per-source ops are ignored by spec).
+  TopDocsReq* parseTopDocs(std::string_view name, const solux::proto::TopDocs& topDocsReq) {
     /*
     message TopDocs {
             Query query = 1;
@@ -226,8 +231,6 @@ public:
       std::move(parsedSorts.sortFields), parsedSorts.useFieldSort,
       filters, filterWeights);
 
-    addSubs(*qr, topDocsReq.ops());
-
     if (firstQuery == nullptr) {
       firstQuery = qr;
     }
@@ -263,42 +266,44 @@ public:
     }
     int32_t rrfK = fusionProto.rrf().k() > 0 ? fusionProto.rrf().k() : 60;
 
-    ProtobufQueryParser parser(req.requestPool, *req.schema);
-    auto* qcontext = Query::Context::create(&req.arena, req.requestPool, *req.reader);
-
-    // Fully populate each Source (sort fields, Weight, filter weights)
-    // before Arena::Create<FusionOp>.
-    std::vector<FusionOp::Source> sources;
+    // Build each source as a full TopDocsReq, wired to deliver its merged
+    // collector back to the FusionOp::Calc instead of self-emitting.  The
+    // sink closure captures nothing at parse time; it resolves the parent
+    // FusionOp::Calc at runtime via the source Calc's parent pointer.
+    // Per-source `ops` are intentionally not attached (Fusion spec ignores
+    // them).
+    std::vector<TopDocsReq*> sources;
     sources.reserve(fusionProto.sources().size());
     for (auto& [srcName, srcProto] : fusionProto.sources()) {
-      FusionOp::Source src;
-      src.name = srcName;
-      src.sourceProto = &srcProto;
-      src.query = parser.parse(srcProto.query());
-      int64_t srcSpecifiedLimit = srcProto.has_limit() ? srcProto.limit() : 10;
-      src.topCount = srcSpecifiedLimit < 0
-        ? req.reader->maxDoc()
-        : std::min(srcSpecifiedLimit, req.reader->maxDoc());
-      src.filters = parseNamedFilters(parser, srcProto.filter());
-
-      auto parsedSorts = parseSorts(srcProto.sorts());
-      src.sortFields = std::move(parsedSorts.sortFields);
-      src.useFieldSort = parsedSorts.useFieldSort;
-      src.weight = src.query->createWeight(*qcontext);
-      src.filterWeights = buildFilterWeights(src.filters, *qcontext);
-
-      sources.emplace_back(std::move(src));
+      size_t idx = sources.size();
+      auto* src = parseTopDocs(srcName, srcProto);
+      src->rankingSink = [idx](TopDocsReq::Calc& calc, MergeableCollector* mc) {
+        static_cast<FusionOp::Calc*>(calc.getParent())->acceptSourceRanking(idx, mc);
+      };
+      sources.push_back(src);
     }
 
+    ProtobufQueryParser parser(req.requestPool, *req.schema);
     auto sharedFilters = parseNamedFilters(parser, fusionProto.filter());
-    auto sharedFilterWeights = buildFilterWeights(sharedFilters, *qcontext);
+    // Reuse the first source's qcontext to build the shared filter
+    // weights.  All sources share the same reader/pool, so any qcontext
+    // works; reusing one avoids an otherwise-unneeded allocation.
+    auto sharedFilterWeights = buildFilterWeights(sharedFilters, sources.front()->qcontext);
 
     int64_t specifiedLimit = fusionProto.has_limit() ? fusionProto.limit() : 10;
     int64_t limit = specifiedLimit < 0 ? req.reader->maxDoc() : std::min(specifiedLimit, req.reader->maxDoc());
 
     auto* fusion = google::protobuf::Arena::Create<FusionOp>(
-      &req.arena, req, name, fusionProto, *qcontext, std::move(sources), limit,
+      &req.arena, req, name, fusionProto, std::move(sources), limit,
       sharedFilters, sharedFilterWeights, rrfK);
+
+    // Sources are children of this FusionOp in the SearchOp tree but not
+    // in `subOps` (different lifecycle - they deliver via rankingSink
+    // rather than emit).  Set parent so any downstream code that walks up
+    // the tree finds the right ancestor.
+    for (auto* src : fusion->sources) {
+      src->parent = fusion;
+    }
 
     return fusion;
   }

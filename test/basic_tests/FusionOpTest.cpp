@@ -185,31 +185,30 @@ TEST_F(FusionOpTest, sharedFilter) {
 
 // Multi-segment: exercises the AtomicMerger path where per-source results
 // are produced across segments and merged before fusion fires.  Three
-// commits => three segments.
+// commits => three segments.  Also exercises the field-sort path for a
+// source: "banana" sorts by prio_i DESC instead of by BM25, so its rank
+// order is driven by an indexed value rather than by score.
 //
-// Field lengths are picked so each source's BM25 ordering is strict (shorter
-// field = higher score), letting us assert exact fused scores.  IDF and
-// avgdl are accumulated globally across segments, so ordering is determined
-// purely by per-doc field length.
-//
-//   apple matchers (length): a(1), b(2), d(3), e(4) -> apple ranks 1..4
-//   banana matchers:         b(2), d(3), e(4), c(5) -> banana ranks 1..4
+//   apple matchers (BM25, field length): a(1), b(2), d(3), e(4)
+//                                        -> apple ranks 1..4
+//   banana matchers (prio_i DESC):       d(50), c(40), e(20), b(10)
+//                                        -> banana ranks 1..4
 TEST_F(FusionOpTest, rrfMultiSegment) {
   CollectionHelper h("main");
   h.clear();
 
   // Seg 0: a (apple only), b (both).
-  h.index(flatdoc("id", std::string("a"), "foo_w", "apple"));
-  h.index(flatdoc("id", std::string("b"), "foo_w", "apple banana"));
+  h.index(flatdoc("id", std::string("a"), "foo_w", "apple",              "prio_i", (int64_t)50));
+  h.index(flatdoc("id", std::string("b"), "foo_w", "apple banana",       "prio_i", (int64_t)10));
   h.commit();
 
   // Seg 1: d (both), c (banana only).
-  h.index(flatdoc("id", std::string("d"), "foo_w", "apple banana d1"));
-  h.index(flatdoc("id", std::string("c"), "foo_w", "banana c1 c2 c3 c4"));
+  h.index(flatdoc("id", std::string("d"), "foo_w", "apple banana d1",    "prio_i", (int64_t)50));
+  h.index(flatdoc("id", std::string("c"), "foo_w", "banana c1 c2 c3 c4", "prio_i", (int64_t)40));
   h.commit();
 
   // Seg 2: e (both).
-  h.index(flatdoc("id", std::string("e"), "foo_w", "apple banana e1 e2"));
+  h.index(flatdoc("id", std::string("e"), "foo_w", "apple banana e1 e2", "prio_i", (int64_t)20));
   h.commit();
 
   auto* lreq = LocalReq::create(soluxNode->getSearchEngine());
@@ -221,7 +220,11 @@ TEST_F(FusionOpTest, rrfMultiSegment) {
   fusion.mutable_fields()->Add("id");
   fusion.mutable_rrf()->set_k(60);
   setTextSource((*fusion.mutable_sources())["apple"],  "foo_w", "apple",  10);
-  setTextSource((*fusion.mutable_sources())["banana"], "foo_w", "banana", 10);
+  auto& bananaSrc = (*fusion.mutable_sources())["banana"];
+  setTextSource(bananaSrc, "foo_w", "banana", 10);
+  auto* bananaSort = bananaSrc.add_sorts();
+  bananaSort->set_field("prio_i");
+  bananaSort->set_dir(proto::SortSpec::DESC);
 
   lreq->execute();
 
@@ -236,22 +239,22 @@ TEST_F(FusionOpTest, rrfMultiSegment) {
 
   // Expected fused scores (apple rank + banana rank, 1/(60+r) per contribution):
   //   a: apple=1                -> 1/61
-  //   b: apple=2, banana=1      -> 1/62 + 1/61
-  //   c: banana=4               -> 1/64
-  //   d: apple=3, banana=2      -> 1/63 + 1/62
+  //   b: apple=2, banana=4      -> 1/62 + 1/64
+  //   c: banana=2               -> 1/62
+  //   d: apple=3, banana=1      -> 1/63 + 1/61
   //   e: apple=4, banana=3      -> 1/64 + 1/63
-  // Sorted desc: b > d > e > a > c.
-  EXPECT_EQ(ids[0], "b");
-  EXPECT_EQ(ids[1], "d");
+  // Sorted desc: d > b > e > a > c.
+  EXPECT_EQ(ids[0], "d");
+  EXPECT_EQ(ids[1], "b");
   EXPECT_EQ(ids[2], "e");
   EXPECT_EQ(ids[3], "a");
   EXPECT_EQ(ids[4], "c");
 
-  EXPECT_NEAR(scores[0], 1.0f / 62.0f + 1.0f / 61.0f, 1e-6f);
-  EXPECT_NEAR(scores[1], 1.0f / 63.0f + 1.0f / 62.0f, 1e-6f);
+  EXPECT_NEAR(scores[0], 1.0f / 63.0f + 1.0f / 61.0f, 1e-6f);
+  EXPECT_NEAR(scores[1], 1.0f / 62.0f + 1.0f / 64.0f, 1e-6f);
   EXPECT_NEAR(scores[2], 1.0f / 64.0f + 1.0f / 63.0f, 1e-6f);
   EXPECT_NEAR(scores[3], 1.0f / 61.0f, 1e-6f);
-  EXPECT_NEAR(scores[4], 1.0f / 64.0f, 1e-6f);
+  EXPECT_NEAR(scores[4], 1.0f / 62.0f, 1e-6f);
 
   lreq->done();
 }

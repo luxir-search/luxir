@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstring>
+#include <functional>
 #include "SearchOp.h"
 #include "solux/query/AllQuery.h"
 #include "solux/query/Query.h"
@@ -10,6 +11,7 @@
 #include "solux/search/Collector.h"
 #include "solux/search/EmitDocs.h"
 #include "solux/search/FieldSortCollector.h"
+#include "solux/search/MergeableCollector.h"
 #include "solux/search/SortField.h"
 #include "solux/search/SearchRequest.h"
 #include "solux/util/AtomicMerger.h"
@@ -21,6 +23,8 @@ class TopDocsReq : public SearchOp {
 protected:
 
 public:
+  class Calc;
+
   const solux::proto::TopDocs& topDocsProto;  // the relevant part of the protobuf request
   Query::Context& qcontext;
   Query* query;
@@ -30,6 +34,13 @@ public:
   std::span<Query::Weight*> filterWeights;
   std::vector<SortField> sortFields;
   bool useFieldSort = false;
+
+  // Optional sink for the merged top-K collector.  If set, the Calc invokes
+  // it instead of self-emitting via fillQueryTopNResponse, letting another
+  // op (e.g. FusionOp) consume this TopDocsReq's ranking.  `mc` is null on
+  // the empty-index path (no segments, no collector ever obtained); sinks
+  // must handle that case.
+  std::function<void(Calc&, MergeableCollector*)> rankingSink;
 
 
   class Calc : public SearchOp::Calculator {
@@ -67,49 +78,6 @@ public:
     }
 
 
-
-    class MergeableCollector : public MergeableData {
-    public:
-      // QueryReq* queryReq;  // the query request that this collector is for
-      std::unique_ptr<TopDocsCollector> scoreCollector;
-      std::unique_ptr<FieldSortCollector> fieldCollector;
-      bool useFieldSort;
-
-      MergeableCollector(size_t topCount, bool useFieldSort, const std::vector<SortField>& sortFields, IndexReader* reader = nullptr) 
-        : useFieldSort(useFieldSort) {
-        if (!useFieldSort) {
-          scoreCollector = std::make_unique<TopDocsCollector>(topCount);
-        } else {
-          std::unique_ptr<FieldComparator> comparator;
-          if (sortFields.size() == 1) {
-            // For single field sort, create the comparator directly
-            comparator = sortFields[0].createComparator(topCount, reader);
-          } else {
-            // For multiple fields, use MultiFieldComparator
-            comparator = std::make_unique<MultiFieldComparator>(sortFields, topCount, reader);
-          }
-          fieldCollector = std::make_unique<FieldSortCollector>(topCount, std::move(comparator));
-        }
-      }
-
-      static MergeableCollector* merge(MergeableCollector* a, MergeableCollector* b) {
-        // merge the smaller collector into the larger collector, or if both the same size, merge
-        // the less competitive collector into the more competitive collector.
-        if (a->useFieldSort) {
-          if (a->fieldCollector->size() < b->fieldCollector->size()) {
-            std::swap(a, b);
-          }
-          a->fieldCollector->merge(*b->fieldCollector);
-        } else {
-          if (a->scoreCollector->size() < b->scoreCollector->size()
-            || a->scoreCollector->minCompetitiveVal < b->scoreCollector->minCompetitiveVal) {
-            std::swap(a, b);
-          }
-          a->scoreCollector->merge(*b->scoreCollector);
-        }
-        return a;
-      }
-    };
 
     AtomicMerger<MergeableCollector> collectorMerger;
 
@@ -227,7 +195,16 @@ public:
     }
 
     void doneCollecting() {
-      thisOp().fillQueryTopNResponse(*this);
+      auto& op = thisOp();
+      if (op.rankingSink) {
+        // The sink is responsible for everything downstream of "ranking is
+        // ready": emit, fuse, etc.  We pass the merged collector (possibly
+        // null on the empty-index path) so the sink can sort() and act on
+        // the ranked output.
+        op.rankingSink(*this, collectorMerger.getData());
+      } else {
+        op.fillQueryTopNResponse(*this);
+      }
       // TODO: figure out what state we can dump before and after this call.
     };
   };
