@@ -119,7 +119,6 @@ TEST_F(MemPoolTest, alloc) {
   }
   ASSERT_EQ(cons_calls, des_calls);
 
-  start_size = pool.size();
   start_cons_calls = cons_calls;
 
   {
@@ -130,7 +129,15 @@ TEST_F(MemPoolTest, alloc) {
     using pairtype = std::pair<const keytype, valtype>;
 
 #ifndef MEMPOOL_MALLOC
+    // Force the pool into a buffer with enough headroom for the upcoming allocations
+    // so they all land in a single buffer and the in-range pointer check is meaningful.
+    // Heap buffers from `new char[]` are not guaranteed to be at increasing addresses,
+    // so a page switch breaks pointer-range comparisons (UB across allocations).
+    pool.alloc(2048);
+    pool.shrink(2048);
+    start_size = pool.size();
     auto poolPtr = pool.ptr();
+    auto startBufferIdx = pool.bbAddress() >> MemPool::BYTE_BLOCK_SHIFT;
 #endif
 
     using Map = boost::unordered_node_map<keytype, valtype, PackedTermHash, PackedTermEqual, MemPool::allocator<pairtype>>;
@@ -157,6 +164,8 @@ TEST_F(MemPoolTest, alloc) {
 
     // Try to see that everything was actually pool allocated.  Only works if pool hasn't switched pages.
     auto endPoolPtr = pool.ptr();
+    auto endBufferIdx = pool.bbAddress() >> MemPool::BYTE_BLOCK_SHIFT;
+    ASSERT_EQ(startBufferIdx, endBufferIdx) << "pool switched pages during the test (start=" << startBufferIdx << ", end=" << endBufferIdx << ")";
     void* ptr;
     ptr = &*map.begin();
     ASSERT_TRUE(ptr >= poolPtr && ptr < endPoolPtr);
