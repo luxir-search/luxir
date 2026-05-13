@@ -207,6 +207,12 @@ TEST_F(IndexReaderAuxTest, retryEscalatesWhenAuxFilePersistentlyMissing) {
   EXPECT_THROW(
     { auto r = std::make_shared<IndexReader>(dir); },
     std::filesystem::filesystem_error);
+
+  // Clean up the deliberately-corrupted directory state. The shared "main"
+  // collection persists across tests/benchmarks, so leaving the IndexInfo
+  // referencing a deleted aux file would break any later code that opens
+  // an IndexReader on this collection.
+  h.clear();
 }
 
 // Carry-forward reuse: when the new commit's aux entry has the same name +
