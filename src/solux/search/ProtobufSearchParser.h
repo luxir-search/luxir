@@ -6,6 +6,7 @@
 #include "ops/FacetOp.h"
 #include "ops/StrFacetOp.h"
 #include "ops/StatsOp.h"
+#include "ops/FusionOp.h"
 #include "ops/TopDocsReq.h"
 #include "solux/query/ProtobufQueryParser.h"
 
@@ -56,6 +57,9 @@ public:
     switch (searchOp.kind_case()) {
       case solux::proto::SearchOp::kTopDocs: {
         return parseTopDocs(name, searchOp.top_docs());
+      }
+      case solux::proto::SearchOp::kFusion: {
+        return parseFusion(name, searchOp.fusion());
       }
       case solux::proto::SearchOp::kFieldFacet: {
         auto& facetReq = searchOp.field_facet();
@@ -108,18 +112,26 @@ public:
       minCount = facetReq.mincount();
     }
     auto missing = facetReq.missing();
-    //arena allocate FacetReq
-    FacetReq* facet = nullptr;
+
+    // Resolve everything that could throw before Arena::Create: the arena
+    // registers the cleanup entry pre-construction, so a throwing ctor
+    // leaves the cleanup list pointing at uninitialized memory which
+    // crashes at arena reset.
     auto& ftype = req.schema->getFieldTypeEx(facetField);
 
+    FacetReq* facet = nullptr;
     switch (ftype->type()) {
-      case FieldType::Type::INT:
-        facet = google::protobuf::Arena::Create<IntFacetReq>(&req.arena, req, facetReq, facetField, facetName, limit, minCount,  missing);
+      case FieldType::Type::INT: {
+        auto range = IntFacetReq::scanGlobalRange(*req.reader, facetField);
+        facet = google::protobuf::Arena::Create<IntFacetReq>(&req.arena, req, facetReq, facetField, facetName, limit, minCount, missing, range.min, range.max, range.useVector);
         break;
+      }
       case FieldType::Type::ID:
-      case FieldType::Type::STRING:
-        facet = google::protobuf::Arena::Create<StrFacetOp>(&req.arena, req, facetReq, facetField, facetName, limit, minCount, missing);
+      case FieldType::Type::STRING: {
+        auto ordMap = req.reader->getOrdMap(facetField);
+        facet = google::protobuf::Arena::Create<StrFacetOp>(&req.arena, req, facetReq, facetField, facetName, limit, minCount, missing, std::move(ordMap));
         break;
+      }
       case FieldType::Type::TEXT:
         facet = google::protobuf::Arena::Create<FullTextFacetReq>(&req.arena, req, facetReq, facetField, facetName, limit, minCount, missing);
         break;
@@ -129,6 +141,52 @@ public:
       throw std::runtime_error("Unknown facet field type: " + std::string(facetField));
     }
     return facet;
+  }
+
+  // Build SortField list from a proto::SortSpec repeated field.  Schema
+  // lookups may throw, so this must run before any Arena::Create that
+  // consumes the result.
+  struct ParsedSorts {
+    std::vector<SortField> sortFields;
+    bool useFieldSort = false;
+  };
+  ParsedSorts parseSorts(const google::protobuf::RepeatedPtrField<proto::SortSpec>& sorts) {
+    ParsedSorts out;
+    if (sorts.empty()) return out;
+    out.useFieldSort = true;
+    static ScoreFieldType scoreType;
+    static DocFieldType docType;
+    for (const auto& sortSpec : sorts) {
+      SortField::SortOrder order = sortSpec.dir() == proto::SortSpec::DESC ?
+        SortField::DESC : SortField::ASC;
+      FieldComparator::MissingValue missing = FieldComparator::MISSING_LAST;
+      if (sortSpec.field() == "_score_") {
+        out.sortFields.emplace_back(sortSpec.field(), scoreType, order, missing);
+      } else if (sortSpec.field() == "_docid_") {
+        out.sortFields.emplace_back(sortSpec.field(), docType, order, missing);
+      } else {
+        auto fieldTypePtr = req.schema->getFieldTypeEx(sortSpec.field());
+        if (!fieldTypePtr) {
+          throw std::runtime_error(std::string("Field not found in schema: ") + std::string(sortSpec.field()));
+        }
+        out.sortFields.emplace_back(sortSpec.field(), *fieldTypePtr, order, missing);
+      }
+    }
+    return out;
+  }
+
+  // Build Weights for a filter list.  Weight ctors may throw (e.g. KnnQuery
+  // dim validation), so this must run before any Arena::Create that takes
+  // the resulting span.
+  std::span<Query::Weight*> buildFilterWeights(
+      std::span<std::pair<std::string_view, Query*>> filters,
+      Query::Context& qcontext) {
+    if (filters.empty()) return {};
+    auto weights = req.requestPool.make_span<Query::Weight*>(filters.size());
+    for (size_t i = 0; i < filters.size(); i++) {
+      weights[i] = filters[i].second->createWeight(qcontext);
+    }
+    return weights;
   }
 
   SearchOp* parseTopDocs(std::string_view name, const solux::proto::TopDocs& topDocsReq) {
@@ -154,18 +212,19 @@ public:
     // limit to actual number of docs in the index (or all if limit == -1)
     int64_t limit = specifiedLimit < 0 ? req.reader->maxDoc() : std::min(specifiedLimit, req.reader->maxDoc());
 
-    std::span<std::pair<std::string_view, Query*>> filters;
-    if (topDocsReq.filter().size() > 0) {
-      filters = req.requestPool.make_span<std::pair<std::string_view, Query*>>(topDocsReq.filter().size());
-      for (int i = 0; i < topDocsReq.filter().size(); i++) {
-        auto& filter = topDocsReq.filter(i);
-        auto* filterQuery = parser.parse(filter.query());
-        filters[i] = {filter.name(), filterQuery};
-      }
-    }
+    auto filters = parseNamedFilters(parser, topDocsReq.filter());
 
-    auto* qcontext = google::protobuf::Arena::Create<Query::Context>(&req.arena, req.requestPool, *req.reader);
-    auto* qr = google::protobuf::Arena::Create<TopDocsReq>(&req.arena, req, name, topDocsReq, *qcontext, query, limit, filters);
+    // All work that may throw (sort field schema lookup, Weight ctors)
+    // must complete before Arena::Create<TopDocsReq>.
+    auto parsedSorts = parseSorts(topDocsReq.sorts());
+    auto* qcontext = Query::Context::create(&req.arena, req.requestPool, *req.reader);
+    auto* weight = query->createWeight(*qcontext);
+    auto filterWeights = buildFilterWeights(filters, *qcontext);
+
+    auto* qr = google::protobuf::Arena::Create<TopDocsReq>(
+      &req.arena, req, name, topDocsReq, *qcontext, query, weight, limit,
+      std::move(parsedSorts.sortFields), parsedSorts.useFieldSort,
+      filters, filterWeights);
 
     addSubs(*qr, topDocsReq.ops());
 
@@ -173,6 +232,75 @@ public:
       firstQuery = qr;
     }
     return qr;
+  }
+
+  std::span<std::pair<std::string_view, Query*>> parseNamedFilters(
+      ProtobufQueryParser& parser,
+      const google::protobuf::RepeatedPtrField<solux::proto::NamedQuery>& filtersProto) {
+    std::span<std::pair<std::string_view, Query*>> out;
+    if (filtersProto.size() > 0) {
+      out = req.requestPool.make_span<std::pair<std::string_view, Query*>>(filtersProto.size());
+      for (int i = 0; i < filtersProto.size(); i++) {
+        auto& f = filtersProto[i];
+        out[i] = {f.name(), parser.parse(f.query())};
+      }
+    }
+    return out;
+  }
+
+  SearchOp* parseFusion(std::string_view name, const solux::proto::Fusion& fusionProto) {
+    if (fusionProto.ops_size() > 0) {
+      throw std::runtime_error("Fusion sub-ops are not yet supported");
+    }
+    if (fusionProto.sources().empty()) {
+      throw std::runtime_error("Fusion requires at least one source");
+    }
+    if (!fusionProto.has_rrf()) {
+      throw std::runtime_error("Fusion requires a fusion method (only RRF is supported)");
+    }
+    if (fusionProto.rrf().k() < 0) {
+      throw std::runtime_error("RrfFusion.k must be >= 0 (0 selects the default)");
+    }
+    int32_t rrfK = fusionProto.rrf().k() > 0 ? fusionProto.rrf().k() : 60;
+
+    ProtobufQueryParser parser(req.requestPool, *req.schema);
+    auto* qcontext = Query::Context::create(&req.arena, req.requestPool, *req.reader);
+
+    // Fully populate each Source (sort fields, Weight, filter weights)
+    // before Arena::Create<FusionOp>.
+    std::vector<FusionOp::Source> sources;
+    sources.reserve(fusionProto.sources().size());
+    for (auto& [srcName, srcProto] : fusionProto.sources()) {
+      FusionOp::Source src;
+      src.name = srcName;
+      src.sourceProto = &srcProto;
+      src.query = parser.parse(srcProto.query());
+      int64_t srcSpecifiedLimit = srcProto.has_limit() ? srcProto.limit() : 10;
+      src.topCount = srcSpecifiedLimit < 0
+        ? req.reader->maxDoc()
+        : std::min(srcSpecifiedLimit, req.reader->maxDoc());
+      src.filters = parseNamedFilters(parser, srcProto.filter());
+
+      auto parsedSorts = parseSorts(srcProto.sorts());
+      src.sortFields = std::move(parsedSorts.sortFields);
+      src.useFieldSort = parsedSorts.useFieldSort;
+      src.weight = src.query->createWeight(*qcontext);
+      src.filterWeights = buildFilterWeights(src.filters, *qcontext);
+
+      sources.emplace_back(std::move(src));
+    }
+
+    auto sharedFilters = parseNamedFilters(parser, fusionProto.filter());
+    auto sharedFilterWeights = buildFilterWeights(sharedFilters, *qcontext);
+
+    int64_t specifiedLimit = fusionProto.has_limit() ? fusionProto.limit() : 10;
+    int64_t limit = specifiedLimit < 0 ? req.reader->maxDoc() : std::min(specifiedLimit, req.reader->maxDoc());
+
+    auto* fusion = google::protobuf::Arena::Create<FusionOp>(
+      &req.arena, req, name, fusionProto, *qcontext, std::move(sources), limit,
+      sharedFilters, sharedFilterWeights, rrfK);
+
+    return fusion;
   }
 
 };

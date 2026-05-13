@@ -26,11 +26,17 @@ public:
   int64_t minCount; // minimum count for a facet to be included in the result
   bool missing;
 
-  google::protobuf::RepeatedPtrField<proto::SortSpec> sorts;
+  // Reference into the request proto (always non-null, lifetime tied to the
+  // request).  Storing by value would copy a RepeatedPtrField and could
+  // throw during the copy, which mid-ctor would corrupt the arena cleanup
+  // list (see TopDocsReq's ctor comment for the hazard).
+  const google::protobuf::RepeatedPtrField<proto::SortSpec>& sorts;
   std::string_view facetName;
   std::vector<std::pair<const std::string_view, SearchOp*>> inlineSubOps;
 
-  FacetReq(SearchRequest& req, std::string_view fieldName, std::string_view facetName, int64_t limit, int64_t minCount, bool missing, google::protobuf::RepeatedPtrField<proto::SortSpec> sorts)
+  FacetReq(SearchRequest& req, std::string_view fieldName, std::string_view facetName,
+    int64_t limit, int64_t minCount, bool missing,
+    const google::protobuf::RepeatedPtrField<proto::SortSpec>& sorts)
     : SearchOp(req, facetName), reader(*req.reader), fieldName(fieldName), limit(limit), minCount(minCount), missing(missing),
       sorts(sorts), facetName(facetName) {
   }
@@ -301,38 +307,49 @@ public:
 private:
   AtomicMerger<MergeableIntFacet> countMerger;
 public:
-  IntFacetReq(SearchRequest& req, const proto::FieldFacet& fieldFacet, std::string_view fieldName, std::string_view facetName, int64_t limit, int64_t minCount, bool missing) :
-  FieldFacetReq(req, fieldFacet, fieldName, facetName, limit, minCount, missing){}
+  // Ctor must be nothrow (Arena::Create hazard).  ProtobufSearchParser
+  // computes globalMin/globalMax/useVector via scanGlobalRange before
+  // allocation and passes them in.
+  IntFacetReq(SearchRequest& req, const proto::FieldFacet& fieldFacet, std::string_view fieldName,
+    std::string_view facetName, int64_t limit, int64_t minCount, bool missing,
+    int64_t globalMin, int64_t globalMax, bool useVector) :
+  FieldFacetReq(req, fieldFacet, fieldName, facetName, limit, minCount, missing),
+  globalMin(globalMin), globalMax(globalMax), useVector(useVector) {}
 
-  void init() override {
-    FieldFacetReq::init();
-    
-    // Calculate global min/max across all segments
+  // Scan every segment for the column's min/max and decide vector vs map
+  // storage based on the resulting range.  Runs during parsing (before
+  // Arena::Create<IntFacetReq>) so any I/O exception propagates out
+  // cleanly.
+  struct GlobalRange {
+    int64_t min = std::numeric_limits<int64_t>::max();
+    int64_t max = std::numeric_limits<int64_t>::min();
+    bool useVector = false;
+  };
+  static GlobalRange scanGlobalRange(IndexReader& reader, std::string_view fieldName) {
+    GlobalRange r;
     for (size_t segnum = 0; segnum < reader.segments().size(); segnum++) {
       auto& postingsReader = reader.segments()[segnum].postingsReader();
       auto poolGuard = MemPool::threadLocalPoolGuard();
       FieldReader fieldReader(poolGuard.pool(), postingsReader);
       bool found = fieldReader.seek(fieldName);
       if (!found) continue;
-      
+
       SegFieldInfo segFieldInfo;
       fieldReader.readFieldInfo(segFieldInfo);
       if (segFieldInfo.numValues == 0) continue;
-      
+
       IntColReader intColReader(postingsReader, segFieldInfo);
-      globalMin = std::min(globalMin, intColReader.getMin());
-      globalMax = std::max(globalMax, intColReader.getMax());
+      r.min = std::min(r.min, intColReader.getMin());
+      r.max = std::max(r.max, intColReader.getMax());
     }
-    
-    // Decide whether to use vector based on global range
-    if (globalMin <= globalMax) {
-      int64_t range = globalMax - globalMin + 1;
-      // Use vector if range is reasonable
+    if (r.min <= r.max) {
+      int64_t range = r.max - r.min + 1;
       // TODO: also consider total number of docs
       if (range > 0 && range <= 100000) {
-        useVector = true;
+        r.useVector = true;
       }
     }
+    return r;
   }
 
   class Calc : public Calculator {
@@ -602,8 +619,13 @@ class IntFacetRangeReq : public FacetReq {
   int64_t end;
   int64_t gap;
 public:
-  IntFacetRangeReq(SearchRequest& req, proto::RangeFacet rangeFacet, std::string_view fieldName, std::string_view facetName, int64_t start, int64_t end, int64_t gap, int64_t minCount, bool missing)
-  : FacetReq(req, fieldName, facetName, -1, minCount, missing, rangeFacet.sorts()), start(start), end(end), gap(gap) {}
+  // rangeFacet must reference the request proto (not a temporary): FacetReq
+  // captures rangeFacet.sorts() by reference.
+  IntFacetRangeReq(SearchRequest& req, const proto::RangeFacet& rangeFacet,
+    std::string_view fieldName, std::string_view facetName,
+    int64_t start, int64_t end, int64_t gap, int64_t minCount, bool missing)
+  : FacetReq(req, fieldName, facetName, -1, minCount, missing, rangeFacet.sorts()),
+    start(start), end(end), gap(gap) {}
 
   virtual ~IntFacetRangeReq() = default;
 

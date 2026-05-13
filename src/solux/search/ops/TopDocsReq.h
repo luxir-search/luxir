@@ -233,61 +233,19 @@ public:
   };
 
 
-  //  req, *qcontext, query, limit
-  // NOTE: keep this constructor nothrow.  TopDocsReq is created via
-  // google::protobuf::Arena::Create<TopDocsReq>, which registers
-  // ~TopDocsReq() with the arena *before* the body runs.  A throw mid-ctor
-  // leaves a half-constructed object scheduled for cleanup, and
-  // ~TopDocsReq() crashes on uninitialized members during arena reset.
-  // All work that can throw (Weight construction, schema lookups for sort
-  // fields) goes in init(), which runs after the object is fully built.
-  TopDocsReq(SearchRequest& req, std::string_view name, const proto::TopDocs& topDocsProto, Query::Context& qcontext, Query* query, int64_t topCount,
-    std::span<std::pair<std::string_view, Query*>> filters)
+  // Arena::Create registers ~TopDocsReq with the arena *before* the ctor body
+  // runs.  Any throw mid-ctor leaves a half-constructed object scheduled for
+  // cleanup that crashes at arena reset.  Keep this ctor nothrow: all
+  // validation (sort field schema lookup, Weight construction, filter
+  // weights) is done by ProtobufSearchParser before Arena::Create.
+  TopDocsReq(SearchRequest& req, std::string_view name, const proto::TopDocs& topDocsProto,
+    Query::Context& qcontext, Query* query, Query::Weight* weight, int64_t topCount,
+    std::vector<SortField>&& sortFields, bool useFieldSort,
+    std::span<std::pair<std::string_view, Query*>> filters,
+    std::span<Query::Weight*> filterWeights)
     : SearchOp(req, name), topDocsProto(topDocsProto), qcontext(qcontext), query(query),
-      weight(nullptr), topCount(topCount), filters(filters) {
-  }
-
-  // Build sort fields, the main weight, and the filter weights here rather
-  // than in the ctor so that throwing paths (schema field-not-found, kNN
-  // dim mismatch, etc.) propagate cleanly out of submitBody.  See ctor
-  // comment for the arena-cleanup hazard.
-  void init() override {
-    SearchOp::init();
-
-    // Sort fields can throw if the schema doesn't have the field.
-    if (topDocsProto.sorts_size() > 0) {
-      useFieldSort = true;
-      // Static instances of special field types
-      static ScoreFieldType scoreType;
-      static DocFieldType docType;
-
-      for (const auto& sortSpec : topDocsProto.sorts()) {
-        SortField::SortOrder order = sortSpec.dir() == proto::SortSpec::DESC ?
-          SortField::DESC : SortField::ASC;
-        FieldComparator::MissingValue missing = FieldComparator::MISSING_LAST;
-
-        if (sortSpec.field() == "_score_") {
-          sortFields.emplace_back(sortSpec.field(), scoreType, order, missing);
-        } else if (sortSpec.field() == "_docid_") {
-          sortFields.emplace_back(sortSpec.field(), docType, order, missing);
-        } else {
-          auto fieldTypePtr = req.schema->getFieldTypeEx(sortSpec.field());
-          if (!fieldTypePtr) {
-            throw std::runtime_error(std::string("Field not found in schema: ") + std::string(sortSpec.field()));
-          }
-          sortFields.emplace_back(sortSpec.field(), *fieldTypePtr, order, missing);
-        }
-      }
-    }
-
-    // Weight ctors run validation that can throw (e.g. KnnQuery dim check).
-    weight = query->createWeight(qcontext);
-    if (filters.size() > 0) {
-      filterWeights = req.requestPool.make_span<Query::Weight*>(filters.size());
-      for (size_t i = 0; i < filters.size(); i++) {
-        filterWeights[i] = filters[i].second->createWeight(qcontext);
-      }
-    }
+      weight(weight), topCount(topCount), filters(filters), filterWeights(filterWeights),
+      sortFields(std::move(sortFields)), useFieldSort(useFieldSort) {
   }
 
   Calculator* createCalculator(Calculator* parent, int64_t slot = -1, int64_t numSlots = -1) override {

@@ -37,6 +37,7 @@ message SearchRequest {
 message SearchOp {
   oneof kind {
     TopDocs top_docs = 1;
+    Fusion fusion = 2;
     // future: function (or leave that as a query type?)
 
     // TODO: hmmm, should different facet types be be encapsulated by a single "Facet" message?
@@ -68,6 +69,54 @@ message TopDocs {
                                 // The solux server may choose a lower value to protect against large in-memory responses.
 
   map<string, SearchOp> ops = 15;  // sub-facets or search operations performed over docs that match this query.
+}
+
+// Hybrid-search fusion: run several source queries (each a full TopDocs spec)
+// and merge their results into a single ranked list.
+//
+// Per-source response-shape fields (`fields`, `batch_size`, `offset`,
+// `get_scores`, `get_number`) and per-source `ops` are ignored - Fusion
+// controls response shape at the top level.  Each source's `query`, `sorts`,
+// `limit`, and any per-source `filter` are used to produce that source's
+// ranked list.
+//
+// The fusion-level `filter` is applied to every source.  It is computed once
+// per segment and reused, so sharing common filters here avoids redundant
+// work.  If a source also specifies its own filter, the two are ANDed.
+message Fusion {
+  // Named source queries.  Names are used for debugging / explanation and
+  // (for future weighted-fusion methods) as the key for per-source weights.
+  map<string, TopDocs> sources = 1;
+
+  // Filter applied to every source.  Shared across sources so it's only
+  // computed once per segment.
+  repeated NamedQuery filter = 2;
+
+  // Maximum number of fused documents to return.
+  sint64 limit = 3;
+
+  // Fusion method (currently only RRF).
+  oneof method {
+    RrfFusion rrf = 10;
+  }
+
+  // Response shape (mirrors TopDocs).
+  int64 offset = 4;
+  bool get_number = 5;
+  bool get_scores = 6;
+  repeated string fields = 7;
+  int32 batch_size = 8;
+
+  // Sub-ops run over the union of source matches (intersected with the
+  // fusion-level filter), not just the fused top-N.
+  map<string, SearchOp> ops = 15;
+}
+
+// Reciprocal Rank Fusion: fused_score(d) = sum over sources s of
+// 1 / (k + rank_s(d)), where rank_s(d) is d's 1-based rank in source s
+// (or omitted if d does not appear in s).  k=60 is the standard default.
+message RrfFusion {
+  int32 k = 1;  // 0 means use default (60)
 }
 
 message SortSpec {

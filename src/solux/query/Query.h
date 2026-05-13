@@ -9,6 +9,7 @@
 #include "solux/reader/DocsEnum.h"
 #include "solux/search/Similarity.h"
 #include <boost/unordered/unordered_node_map.hpp>
+#include <google/protobuf/arena.h>
 
 namespace solux {
 
@@ -98,24 +99,48 @@ public:
   /// A Context is not generally thread-safe, so don't create weights from multiple threads with the same Context.
   class Context {
   public:
+    using FieldInfoMap = boost::unordered_node_map<std::string_view, CachedFieldInfo, PackedTermHash, PackedTermEqual, MemPool::allocator<std::pair<const std::string_view, CachedFieldInfo>>>;
+
     MemPool& pool;
     IndexReader& topReader;
     // Weight* top = nullptr;  // if we don't need a top-weight, we can reuse a Context for multiple queries in the same request.
 
     std::span<FieldReader> fieldReaders;
-    boost::unordered_node_map<std::string_view, CachedFieldInfo, PackedTermHash, PackedTermEqual, MemPool::allocator<std::pair<const std::string_view, CachedFieldInfo>>> fieldInfoMap;
+    FieldInfoMap fieldInfoMap;
 
+    // Nothrow ctor used by Context::create for arena allocation.
+    // Arena::Create registers ~Context before running the ctor body, so any
+    // throw mid-construction (pool allocation, FieldReader init, map bucket
+    // allocation) would leave a cleanup entry pointing at uninitialized
+    // memory.  This ctor only does noexcept member binds/moves; the
+    // throwing work is done by the factory before allocation.
+    Context(MemPool& pool, IndexReader& topReader,
+            std::span<FieldReader> fieldReaders, FieldInfoMap&& fieldInfoMap)
+      : pool(pool), topReader(topReader),
+        fieldReaders(fieldReaders), fieldInfoMap(std::move(fieldInfoMap)) {
+    }
+
+    // Convenience ctor for stack-allocated Contexts (tests, non-arena code).
+    // Safe to throw here since there's no arena cleanup entry that could be
+    // left dangling.
     Context(MemPool& pool, IndexReader& topReader)
-    : pool(pool), topReader(topReader), fieldInfoMap(4, pool.getAllocator()) {
-
-      auto numSegs = numSegments();
-
-      // allocate the raw space (then use operator placement new) since we don't have a default constructor
+      : pool(pool), topReader(topReader), fieldInfoMap(4, pool.getAllocator()) {
+      auto numSegs = topReader.segments().size();
       fieldReaders = {(FieldReader*)pool.alloc(sizeof(FieldReader)*numSegs, alignof(FieldReader)), numSegs};
-
-      for (auto i = 0; i < numSegs; i++) {
+      for (size_t i = 0; i < numSegs; i++) {
         new (&fieldReaders[i]) FieldReader(pool, topReader.segments()[i].postingsReader());
       }
+    }
+
+    static Context* create(google::protobuf::Arena* arena, MemPool& pool, IndexReader& topReader) {
+      auto numSegs = topReader.segments().size();
+      auto* readers = (FieldReader*)pool.alloc(sizeof(FieldReader)*numSegs, alignof(FieldReader));
+      for (size_t i = 0; i < numSegs; i++) {
+        new (&readers[i]) FieldReader(pool, topReader.segments()[i].postingsReader());
+      }
+      FieldInfoMap map(4, pool.getAllocator());
+      return google::protobuf::Arena::Create<Context>(
+        arena, pool, topReader, std::span<FieldReader>(readers, numSegs), std::move(map));
     }
 
     // return number of segments

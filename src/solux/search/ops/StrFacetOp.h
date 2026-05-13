@@ -182,14 +182,13 @@ class StrFacetOp : public FieldFacetReq {
 
 public:
 
+  // Ctor must be nothrow (Arena::Create hazard).  ProtobufSearchParser
+  // resolves the OrdMap before allocation and passes it in.
   StrFacetOp(SearchRequest& req, const proto::FieldFacet& fieldFacet, std::string_view fieldName,
-    std::string_view facetName, int64_t limit, int64_t minCount, bool missing) :
-  FieldFacetReq(req, fieldFacet, fieldName, facetName, limit, minCount, missing){}
-
-  void init() override {
-    FacetReq::init();
-    ordMap = req.reader->getOrdMap(fieldName);
-  }
+    std::string_view facetName, int64_t limit, int64_t minCount, bool missing,
+    std::shared_ptr<OrdMap> ordMap) :
+  FieldFacetReq(req, fieldFacet, fieldName, facetName, limit, minCount, missing),
+  ordMap(std::move(ordMap)) {}
 
   class Calc : public Calculator {
     std::vector<DocSet*> input;
