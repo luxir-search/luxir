@@ -7,6 +7,14 @@ add_executable(solux_test ${Test_SOURCES})
 target_include_directories(solux_test PRIVATE .)
 target_link_libraries(solux_test PRIVATE solux_lib benchmark::benchmark GTest::gtest)
 
+# gtest/benchmark are the dominant parse cost across the ~40 test TUs; add them
+# to the shared heavy-header set (SOLUX_PCH_COMMON comes from the root CMake).
+target_precompile_headers(solux_test PRIVATE
+  ${SOLUX_PCH_COMMON}
+  <gtest/gtest.h>
+  <benchmark/benchmark.h>
+)
+
 
 function(download fname url hash)
   if(NOT EXISTS ${fname})

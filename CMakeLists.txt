@@ -3,6 +3,39 @@ project(Solux VERSION 0.1)
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED True)
 
+# --- Build acceleration -----------------------------------------------------
+# ccache: transparent compiler cache. No-op if ccache is not installed.
+# pch_defines,time_macros sloppiness is required to get cache hits on TUs that
+# use a precompiled header (see target_precompile_headers below).
+find_program(CCACHE_PROGRAM ccache)
+if(CCACHE_PROGRAM)
+  set(CMAKE_C_COMPILER_LAUNCHER   "${CCACHE_PROGRAM}")
+  set(CMAKE_CXX_COMPILER_LAUNCHER "${CCACHE_PROGRAM}")
+  message(STATUS "Solux: ccache enabled (${CCACHE_PROGRAM})")
+endif()
+
+# Fast linker: prefer mold, then lld, then gold. Each candidate is verified with
+# a real test link, so a linker that cannot handle this toolchain (e.g. mold
+# 2.40 chokes on GCC 16's libatomic_asneeded.so AS_NEEDED script) is rejected
+# automatically and we fall back to the next option, ending at the system
+# default. NOTE: results are cached; after installing a new linker, reconfigure
+# from a clean cache (or unset the SOLUX_LD_WORKS_* cache vars) to re-detect.
+include(CheckLinkerFlag)
+set(SOLUX_LINKER "")
+foreach(_cand mold lld gold)
+  check_linker_flag(CXX "-fuse-ld=${_cand}" SOLUX_LD_WORKS_${_cand})
+  if(SOLUX_LD_WORKS_${_cand})
+    add_link_options("-fuse-ld=${_cand}")
+    set(SOLUX_LINKER "${_cand}")
+    break()
+  endif()
+endforeach()
+if(SOLUX_LINKER)
+  message(STATUS "Solux: using '${SOLUX_LINKER}' linker")
+else()
+  message(STATUS "Solux: using default system linker (no faster linker usable)")
+endif()
+
 # This keeps dlls and executables together, which makes windows happy.
 set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
@@ -91,8 +124,38 @@ add_library(solux_lib STATIC ${Proj_SOURCES})
 add_executable(solux src/solux/main.cpp)
 target_link_libraries(solux solux_lib)
 
+# --- Precompiled headers ----------------------------------------------------
+# Heavy, rarely-changing external/generated headers shared across translation
+# units. Project headers are intentionally excluded so editing them does not
+# invalidate the PCH; the one exception is util/log.h, which is stable and is
+# the only correct way to pull in spdlog (it sets SPDLOG_ACTIVE_LEVEL first).
+# SOLUX_PCH_COMMON is consumed by the test target too, so it is set before
+# add_subdirectory(test) and limited to headers on every target's include path.
+set(SOLUX_PCH_COMMON
+  <vector> <string> <string_view> <memory> <algorithm> <span>
+  <optional> <unordered_map> <cstdint> <charconv>
+  <boost/unordered/unordered_flat_map.hpp>
+  # Angle brackets (not quotes): a quoted entry is resolved relative to the
+  # source dir, but this header is generated into the build tree and found via -I.
+  <protos/solux_types.pb.h>
+)
+target_precompile_headers(solux_lib PRIVATE
+  ${SOLUX_PCH_COMMON}
+  <oneapi/tbb/flow_graph.h>
+  <oneapi/tbb/task_group.h>
+  # Angle brackets: src/ is on the include path; quotes would resolve to the
+  # wrong (src-less) source-relative path.
+  <solux/util/log.h>
+)
+
 add_subdirectory(protos)
 add_subdirectory(test)
+
+# The PCHs above include generated protobuf headers, so the .gch compile must be
+# ordered after myproto generates them (the link-time dependency does not order
+# per-object/PCH compilation).
+add_dependencies(solux_lib myproto)
+add_dependencies(solux_test myproto)
 
 if(ROBIN_HOOD_HASHING)
   find_path(ROBIN_HOOD_HASHING_INCLUDE_DIRS "robin_hood.h")
