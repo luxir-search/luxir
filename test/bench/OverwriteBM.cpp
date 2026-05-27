@@ -59,7 +59,7 @@ static void BM_Overwrite(benchmark::State& state, int nThreads, int64_t maxDoc, 
             }
           }
 
-          helper.index({docs.data(), (size_t)thisBatch}, UpdateMessage::NO_COMMIT, overwrite);
+          helper.indexAll({docs.data(), (size_t)thisBatch}, UpdateMessage::NO_COMMIT, overwrite);
           remaining -= thisBatch;
         }
 

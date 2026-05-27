@@ -1365,7 +1365,7 @@ TEST_F(IndexWriterTest, testCoreGen) {
   firstBatch.push_back(flatdoc("id", "doc1"));
   firstBatch.push_back(flatdoc("id", "doc2"));
   firstBatch.push_back(flatdoc("id", "doc3"));
-  helper.index(firstBatch, UpdateMessage::COMMIT, true);
+  helper.indexAll(firstBatch, UpdateMessage::COMMIT, true);
 
   auto reader2 = iw->getIndexReader();
   EXPECT_EQ(initialCoreGen + 1, reader2->coreGen()); // First segment added
@@ -1387,7 +1387,7 @@ TEST_F(IndexWriterTest, testCoreGen) {
   std::vector<Doc> secondBatch;
   secondBatch.push_back(flatdoc("id", "doc4"));
   secondBatch.push_back(flatdoc("id", "doc5"));
-  helper.index(secondBatch, UpdateMessage::COMMIT, true);
+  helper.indexAll(secondBatch, UpdateMessage::COMMIT, true);
 
   auto reader3 = iw->getIndexReader();
   EXPECT_EQ(initialCoreGen + 2, reader3->coreGen()); // Second segment added

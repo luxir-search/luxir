@@ -117,10 +117,14 @@ public:
   }
 
   IndexResult index(const Doc& doc, UpdateMessage::CommitType commitType = UpdateMessage::NO_COMMIT, bool overwrite = false) {
-    return index({&doc,1}, commitType, overwrite);
+    return indexAll({&doc,1}, commitType, overwrite);
   }
 
-  IndexResult index(std::span<const Doc> docs, UpdateMessage::CommitType commitType = UpdateMessage::NO_COMMIT, bool overwrite = false) {
+  // NOTE: distinct name (not an `index` overload) on purpose. As of C++26 std::span gained an
+  // initializer_list constructor (P2447R6), so a braced-init-list like index({{"id","1"}}) becomes
+  // ambiguous between the single-Doc overload and a span overload. Keeping the batch entry point
+  // under its own name removes that second candidate. Mirrors deleteById / deleteByIds below.
+  IndexResult indexAll(std::span<const Doc> docs, UpdateMessage::CommitType commitType = UpdateMessage::NO_COMMIT, bool overwrite = false) {
     auto writer = collection().getShard()->getIndexWriter();
 
     class BlockingProtoUpdateMessage : public ProtoUpdateMessage {

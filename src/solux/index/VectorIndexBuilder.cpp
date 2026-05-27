@@ -128,7 +128,6 @@ VectorIndexBuilder::buildField(std::string_view fieldName,
   // Defer FAISS index construction until we know dims (might come from a
   // later segment if the schema didn't pin it).
   std::unique_ptr<faiss::IndexFlat> index;
-  int64_t ntotal = 0;
 
   // Chunked working buffer for the COSINE renormalization path.  Allocated
   // lazily on first use, reused across segments.  Bounds working memory at
@@ -196,7 +195,6 @@ VectorIndexBuilder::buildField(std::string_view fieldName,
       // Either non-cosine, or user asserts vectors are already unit-norm.
       index->add(numVals, base);
     }
-    ntotal += numVals;
   }
 
   // No segment had any values - nothing to build.  Skip emitting an AuxIndexInfo.
@@ -242,7 +240,7 @@ VectorIndexBuilder::buildField(std::string_view fieldName,
   info.set_opaque_meta(std::move(meta));
 
   LOG_TRACE("VectorIndexBuilder: built {} ntotal={} dims={} metric={} file={}",
-           info.name(), ntotal, dims, (int)ft.metric_, faissFile);
+           info.name(), index->ntotal, dims, (int)ft.metric_, faissFile);
 
   return info;
 }
