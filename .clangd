@@ -1,0 +1,10 @@
+# CLion's code-model engine (and any editor using clangd) reads compile_commands.json,
+# where the build injects the GCC precompiled header via `-include .../cmake_pch.hxx`.
+# clangd cannot consume a GCC .gch and fails to parse the TU (the bits/version.h
+# "__glibcxx_want_*" preprocessor wall seen on CMake reload). The PCH is purely a
+# build-speed optimization; strip it from what clangd sees. The real gcc/ninja build
+# still uses the PCH normally -- this only affects code insight.
+CompileFlags:
+  Remove:
+    - -include
+    - -Winvalid-pch

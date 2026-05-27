@@ -43,6 +43,11 @@
     {
       "name": "base-clang",
       "hidden": true,
+      "condition": {
+        "type": "equals",
+        "lhs": "$env{SOLUX_ENABLE_CLANG}",
+        "rhs": "1"
+      },
       "cacheVariables": {
         "CMAKE_C_COMPILER": "clang",
         "CMAKE_CXX_COMPILER": "clang++"
@@ -99,7 +104,7 @@
       "name": "clang-debug",
       "inherits": ["base", "base-clang", "base-debug"],
       "displayName": "Clang Debug",
-      "description": "Clang variant. NOTE: FAISS is only installed in the gcc vcpkg repos; prefer the gcc presets unless specifically testing clang.",
+      "description": "Clang variant, DISABLED by default (set SOLUX_ENABLE_CLANG=1 to enable). FAISS + OpenMP are only set up in the gcc vcpkg repos, so configuring clang fails at find_package(OpenMP) / faiss here. Use the gcc presets.",
       "toolchainFile": "/opt/vcpkg_clang/scripts/buildsystems/vcpkg.cmake"
     },
     {
