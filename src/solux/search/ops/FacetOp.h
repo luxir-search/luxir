@@ -45,7 +45,6 @@ public:
 
   void init() override {
     SearchOp::init();
-    // TODO: add a test for faceting sorted by an inline sub-op (this branch); currently uncovered.
     if (!sorts.empty()) {
       for (auto& sort : sorts) {
         auto iter = subOps.find(sort.field());

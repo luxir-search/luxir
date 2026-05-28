@@ -279,6 +279,87 @@ TEST_F(FacetTest, vectorOptimization) {
   lreq->done();
 }
 
+// Facet sorted by an inline sub-op (avg) with a finite limit.  This exercises
+// FacetReq::init()'s "!sorts.empty()" branch, which moves the sort-field sub-op
+// into inlineSubOps.  The existing SearchEngineTest coverage uses limit==-1,
+// which inlines via a different branch and so masks regressions in this one.
+TEST_F(FacetTest, sortBySubOp) {
+  CollectionHelper helper;
+  helper.clear();
+  // 2 segments.  Per-category foo_i avg differs from per-category count so that
+  // an avg-ascending sort produces a different bucket order than count-desc.
+  //   a: count 3, avg 100
+  //   b: count 1, avg 1
+  //   c: count 2, avg 50
+  helper.index(flatdoc("cat_s", "a", "foo_i", 100), UpdateMessage::NO_COMMIT);
+  helper.index(flatdoc("cat_s", "b", "foo_i", 1), UpdateMessage::NO_COMMIT);
+  helper.index(flatdoc("cat_s", "c", "foo_i", 50), UpdateMessage::COMMIT);
+  helper.index(flatdoc("cat_s", "a", "foo_i", 100), UpdateMessage::NO_COMMIT);
+  helper.index(flatdoc("cat_s", "a", "foo_i", 100), UpdateMessage::NO_COMMIT);
+  helper.index(flatdoc("cat_s", "c", "foo_i", 50), UpdateMessage::COMMIT);
+
+  // Builds a facet on cat_s with an inline avg(foo_i) sub-op, sorted by that
+  // sub-op, and returns the response facet result.
+  auto runFacet = [&](int64_t limit, proto::SortSpec_SortDir dir) {
+    auto* lreq = LocalReq::create(soluxNode->getSearchEngine());
+    lreq->proto.mutable_collection()->add_name("main");
+    lreq->proto.set_request_id("test_sort_by_subop");
+
+    auto& ops = *lreq->proto.mutable_ops();
+    auto& topDocs = *ops["q"].mutable_top_docs();
+    topDocs.set_get_number(true);
+    topDocs.mutable_query()->set_all(true);
+
+    auto& facet = *ops["f"].mutable_field_facet();
+    facet.set_field("cat_s");
+    facet.set_limit(limit);
+    auto& subAvg = *(*facet.mutable_ops())["avgsub"].mutable_gen_op();
+    subAvg.set_name("avg");
+    subAvg.mutable_args()->Add()->set_s("foo_i");
+    auto& sort = *facet.mutable_sorts()->Add();
+    sort.set_field("avgsub");
+    sort.set_dir(dir);
+
+    lreq->engine.submit(*lreq, true);
+    return lreq;
+  };
+
+  // Ascending avg, all buckets.  Order is b(1), c(50), a(100) -- which differs
+  // from count-desc (a, c, b), so this confirms we sorted by the sub-op.
+  {
+    auto* lreq = runFacet(10, proto::SortSpec_SortDir_ASC);
+    const auto& facet = lreq->responses[0]->proto.ops().at("f").facet();
+    ASSERT_EQ(3, facet.bucket_ids().col_s().v_size());
+    EXPECT_EQ("b", facet.bucket_ids().col_s().v(0));
+    EXPECT_EQ("c", facet.bucket_ids().col_s().v(1));
+    EXPECT_EQ("a", facet.bucket_ids().col_s().v(2));
+    EXPECT_EQ(1, facet.counts(0));
+    EXPECT_EQ(2, facet.counts(1));
+    EXPECT_EQ(3, facet.counts(2));
+    const auto& avg = facet.ops().at("avgsub").arr_d();
+    ASSERT_EQ(3, avg.v_size());
+    EXPECT_EQ(1, avg.v(0));
+    EXPECT_EQ(50, avg.v(1));
+    EXPECT_EQ(100, avg.v(2));
+    lreq->done();
+  }
+
+  // Descending avg with a finite limit smaller than the bucket count: keep the
+  // top 2 by avg -> a(100), c(50).
+  {
+    auto* lreq = runFacet(2, proto::SortSpec_SortDir_DESC);
+    const auto& facet = lreq->responses[0]->proto.ops().at("f").facet();
+    ASSERT_EQ(2, facet.bucket_ids().col_s().v_size());
+    EXPECT_EQ("a", facet.bucket_ids().col_s().v(0));
+    EXPECT_EQ("c", facet.bucket_ids().col_s().v(1));
+    const auto& avg = facet.ops().at("avgsub").arr_d();
+    ASSERT_EQ(2, avg.v_size());
+    EXPECT_EQ(100, avg.v(0));
+    EXPECT_EQ(50, avg.v(1));
+    lreq->done();
+  }
+}
+
 //
 // Comprehensive random faceting test class
 //
