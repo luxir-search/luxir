@@ -26,6 +26,7 @@ private:
   const char* valuesData;                     // Pointer to concatenated string data
   std::optional<MonoReader> endValueRankReader;    // per-doc -> end value rank (multi-valued only)
   std::optional<MonoReader> endOffsetReader;  // per-value -> end byte offset (variable-size only)
+  std::optional<MonoReader> valDocReader;     // per-value rank -> owning docId (multi-valued reverse map; vectors only)
   int32_t docsWithField = 0;
   int64_t nvals = 0;
   int32_t fixedSize = -1;                     // -1 for variable size, >= 0 for fixed size
@@ -46,6 +47,10 @@ public:
       fixedSize = (int32_t)fieldInfo.mono2MetaOff;
     } else {
       endOffsetReader.emplace(postingsReader, fieldInfo.mono2Loc, fieldInfo.mono2MetaOff, fieldInfo.numValues);
+    }
+    // valDoc map is optional (only multi-valued vector columns write it).
+    if (!(fieldInfo.valDocLoc.offset() == 0 && fieldInfo.valDocLoc.filenum() == 0)) {
+      valDocReader.emplace(postingsReader, fieldInfo.valDocLoc, fieldInfo.valDocMetaOff, fieldInfo.numValues);
     }
   }
 
@@ -85,6 +90,14 @@ public:
   /// Valid as long as this StrColReader is valid.
   MonoReader* getEndOffsetReader() {
     return endOffsetReader ? &(*endOffsetReader) : nullptr;
+  }
+
+  /// Reverse map per-value rank -> owning segment-local docId.  Present only for
+  /// multi-valued columns that opted in at write time (vector fields).  nullptr for
+  /// single-valued fields (where valueRank == docRank) and non-vector columns.
+  /// Valid as long as this StrColReader is valid.
+  MonoReader* getValDocReader() {
+    return valDocReader ? &(*valDocReader) : nullptr;
   }
 
   /// Fixed value size for fixed-size fields; -1 for variable size.

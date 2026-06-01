@@ -81,6 +81,7 @@ public:
     fieldInfos.back().fieldname = fieldName;
     assert(fieldInfos.back().monoLoc.offset() == 0 && fieldInfos.back().monoMetaOff == 0 && fieldInfos.back().columnMetaOff == 0);
     assert(fieldInfos.back().mono2Loc.offset() == 0 && fieldInfos.back().mono2MetaOff == 0);
+    assert(fieldInfos.back().valDocLoc.offset() == 0 && fieldInfos.back().valDocMetaOff == 0);
     return fieldInfos.back();
   }
 
@@ -294,6 +295,8 @@ private:
       fieldOutput.writeVlong(finfo.monoMetaOff);
       fieldOutput.writeVal(finfo.mono2Loc);
       fieldOutput.writeVlong(finfo.mono2MetaOff);
+      fieldOutput.writeVal(finfo.valDocLoc);
+      fieldOutput.writeVlong(finfo.valDocMetaOff);
     }
 
     // Now write the start of each fieldInfo

@@ -117,6 +117,14 @@ public:
     valCountStream.addVal(inverter.pool, (int64_t)vals.size());
   }
 
+protected:
+  /// Whether to persist a per-value-rank -> owning-docId monotonic column (the
+  /// reverse of endValueRankReader).  Only written for multi-valued columns whose
+  /// consumers need vector-rank -> doc resolution; VectorHandler overrides this to
+  /// true so multi-valued kNN hits can be grouped back to their document.  For
+  /// single-valued fields valueRank == docRank, so no map is ever written.
+  virtual bool writesValueDocMap() const { return false; }
+
 private:
   void addValue(Inverter& inverter, std::string_view val) {
     int32_t valSize = (int32_t)val.size();
@@ -193,6 +201,30 @@ public:
       endValueRankWriter.finish();
       fieldInfo.monoLoc = endValueRankWriter.blockLoc;
       fieldInfo.monoMetaOff = endValueRankWriter.metaOff;
+    }
+
+    // Write the per-value-rank -> docId map (valDoc) when a multi-valued consumer
+    // needs the reverse lookup (vectors).  We emit each doc's id once per value it
+    // owns, in doc order, so the array is monotonic non-decreasing.  Single-valued
+    // fields never need it (valueRank == docRank) and string columns opt out.
+    if (multiValued && numValuesTotal > 0 && writesValueDocMap()) {
+      auto guard = tmpPool.rewindScopeGuard();
+      // doc ids of docs-with-value, in increasing order (one per valCountStream entry).
+      std::vector<int32_t> docids;
+      docids.reserve((size_t)numDocs);
+      docsWithVal.forEachDoc(inverter.pool, [&docids](int d) { docids.push_back(d); });
+
+      OutputStreamPtr out = postingsWriter.getOutputStream();
+      MonoWriter valDocWriter(tmpPool, *out);
+      size_t docIdx = 0;
+      valCountStream.visitValues(inverter.pool, [&](int32_t count) {
+        int32_t docid = docids[docIdx++];
+        for (int32_t v = 0; v < count; v++) valDocWriter.addInt64(docid);
+      });
+      assert(docIdx == docids.size());
+      valDocWriter.finish();
+      fieldInfo.valDocLoc = valDocWriter.blockLoc;
+      fieldInfo.valDocMetaOff = valDocWriter.metaOff;
     }
 
     // Write docs-with-value.

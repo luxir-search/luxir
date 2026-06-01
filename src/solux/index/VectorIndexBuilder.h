@@ -31,7 +31,9 @@ namespace solux {
 /// tracked via liveDocs separately), so those vectors land in FAISS too -
 /// the query layer is expected to filter against current liveDocs.
 ///
-/// V1: IndexFlatL2 / IndexFlatIP only, single-valued vectors only.
+/// IndexFlatL2 / IndexFlatIP only.  Single- and multi-valued vector fields are
+/// both supported: every value of every doc is added to FAISS, and the query layer
+/// maps each FAISS id back to its owning doc (valueRank -> docId).
 class VectorIndexBuilder {
 public:
   // Aux index name prefix (e.g. "vec.title_v").

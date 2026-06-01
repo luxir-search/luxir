@@ -34,6 +34,20 @@ protected:
     col.setSchema(Schema::fromProto(def, base.get()));
   }
 
+  // Install a schema where _vs is a multi-valued vector field with the given metric.
+  static void installMultiVecSchema(Collection& col, proto::VectorParams::Metric metric) {
+    proto::SchemaDef def;
+    auto* f = def.add_fields();
+    f->set_name("_vs");
+    f->set_field_class(proto::FieldDef::VECTOR);
+    f->set_abstract(true);
+    f->set_column_stored(true);
+    f->set_multi_valued(true);
+    f->mutable_vector()->set_metric(metric);
+    auto base = col.getSchema();
+    col.setSchema(Schema::fromProto(def, base.get()));
+  }
+
   // Build a TopDocs request with a KNN query for the given field + query
   // vector + k.  Always pulls back "id" so tests can assert ordering.
   static LocalReq* makeKnnReq(SoluxNode& node, std::string_view field,
@@ -165,6 +179,131 @@ TEST_F(KnnQueryTest, multiSegment) {
   EXPECT_TRUE(got.count("s0_b"));
   EXPECT_TRUE(got.count("s1_b"));
 
+  req->done();
+}
+
+// Multi-valued: a doc owns several vectors; FAISS hits must be grouped back to
+// the owning doc (one hit per doc, best score) via the valueRank->docId column.
+// An interleaved no-vector doc ("g") makes identity (valueRank==docId) resolve a
+// vector to the wrong doc, so its absence from the results proves the reverse map
+// is used.  A delete phase then exercises the multi-valued is_member resolve path.
+TEST_F(KnnQueryTest, multiValuedGrouping) {
+  CollectionHelper h("main");
+  h.clear();
+  installMultiVecSchema(h.collection(), proto::VectorParams::L2);
+
+  // docRank 0: "a" owns the two closest chunks to the query.
+  // docRank 1: "g" has no vector (forces real-docId resolution).
+  // docRank 2: "b" owns one far chunk.
+  // value ranks -> docId: 0->0(a), 1->0(a), 2->2(b).  Identity would mis-map
+  // value rank 1 to docId 1 ("g").
+  h.index(flatdoc("id", std::string("a"), "emb_vs",
+                  std::vector<std::vector<float>>{{1, 0, 0}, {0.99f, 0, 0}}));
+  h.index(flatdoc("id", std::string("g")));
+  h.index(flatdoc("id", std::string("b"), "emb_vs",
+                  std::vector<std::vector<float>>{{0, 1, 0}}));
+  h.commit({"*"});
+
+  // k=3 vectors requested; "a" owns the top two, so after grouping we get 2 docs.
+  auto* req = makeKnnReq(*soluxNode, "emb_vs", {1, 0, 0}, 3);
+  req->execute();
+  auto ids = resultIds(*req);
+  ASSERT_EQ(ids.size(), 2u) << "a's two top vectors must collapse to one hit";
+  EXPECT_EQ(ids[0], "a");  // best chunk is the exact match
+  EXPECT_EQ(ids[1], "b");
+  for (const auto& id : ids)
+    EXPECT_NE(id, "g") << "no-vector doc must not appear (reverse map mis-resolved?)";
+  req->done();
+
+  // Delete "a" (owns the top vectors): its vectors must be filtered inside FAISS
+  // via the map + liveDocs, leaving only "b".
+  std::vector<std::string> del{"a"};
+  h.deleteByIds(del, UpdateMessage::COMMIT);
+
+  auto* req2 = makeKnnReq(*soluxNode, "emb_vs", {1, 0, 0}, 3);
+  req2->execute();
+  auto ids2 = resultIds(*req2);
+  ASSERT_EQ(ids2.size(), 1u);
+  EXPECT_EQ(ids2[0], "b");
+  req2->done();
+}
+
+// Multi-valued across multiple segments: each segment resolves its own value
+// ranks via its own valueRank->docId map, combined with the per-segment FAISS-id
+// prefix, and hits are grouped across segments.  A no-vector doc in each segment
+// makes identity resolution land on the wrong doc, so correct ids prove the
+// per-segment maps are applied (not valueRank-as-docId).
+TEST_F(KnnQueryTest, multiValuedMultiSegment) {
+  CollectionHelper h("main");
+  h.clear();
+  installMultiVecSchema(h.collection(), proto::VectorParams::L2);
+
+  // Segment 0 (docRanks): s0_a[0] 2 vecs, s0_g[1] none, s0_b[2] 1 vec.
+  h.index(flatdoc("id", std::string("s0_a"), "emb_vs",
+                  std::vector<std::vector<float>>{{1, 0, 0}, {0, 1, 0}}));
+  h.index(flatdoc("id", std::string("s0_g")));
+  h.index(flatdoc("id", std::string("s0_b"), "emb_vs",
+                  std::vector<std::vector<float>>{{0.8f, 0, 0}}));
+  h.commit();
+
+  // Segment 1 (docRanks): s1_g[0] none, s1_a[1] 1 vec, s1_b[2] 2 vecs.
+  // s1_a's only vector is value rank 0 in seg1 -> must resolve to docId 1, not 0.
+  h.index(flatdoc("id", std::string("s1_g")));
+  h.index(flatdoc("id", std::string("s1_a"), "emb_vs",
+                  std::vector<std::vector<float>>{{0.9f, 0, 0}}));
+  h.index(flatdoc("id", std::string("s1_b"), "emb_vs",
+                  std::vector<std::vector<float>>{{0, 0, 1}, {0, 0, 0.9f}}));
+  h.commit({"*"});
+
+  auto* req = makeKnnReq(*soluxNode, "emb_vs", {1, 0, 0}, 3);
+  req->execute();
+  auto ids = resultIds(*req);
+  ASSERT_EQ(ids.size(), 3u);
+  // closest chunks: s0_a{1,0,0}=0, s1_a{0.9,0,0}=.01, s0_b{0.8,0,0}=.04
+  EXPECT_EQ(ids[0], "s0_a");
+  EXPECT_EQ(ids[1], "s1_a");
+  EXPECT_EQ(ids[2], "s0_b");
+  std::set<std::string> got(ids.begin(), ids.end());
+  EXPECT_FALSE(got.count("s0_g")) << "no-vector doc must not appear";
+  EXPECT_FALSE(got.count("s1_g")) << "no-vector doc must not appear";
+  req->done();
+}
+
+// kNN still works after a segment merge: mergeStrCol must have regenerated the
+// valueRank->docId map against the merged (remapped) doc ids, and the rebuilt
+// FAISS aux + query resolve hits to the correct merged docs.
+TEST_F(KnnQueryTest, multiValuedSurvivesMerge) {
+  CollectionHelper h("main");
+  h.clear();
+  installMultiVecSchema(h.collection(), proto::VectorParams::L2);
+
+  // Segment 0: a (2 vecs), b (1 vec).
+  h.index(flatdoc("id", std::string("a"), "emb_vs",
+                  std::vector<std::vector<float>>{{1, 0, 0}, {0, 1, 0}}));
+  h.index(flatdoc("id", std::string("b"), "emb_vs",
+                  std::vector<std::vector<float>>{{0.8f, 0, 0}}));
+  h.commit();
+
+  // Segment 1: c (1 vec), d (2 vecs).
+  h.index(flatdoc("id", std::string("c"), "emb_vs",
+                  std::vector<std::vector<float>>{{0.9f, 0, 0}}));
+  h.index(flatdoc("id", std::string("d"), "emb_vs",
+                  std::vector<std::vector<float>>{{0, 0, 1}, {0, 0, 0.5f}}));
+  h.commit();
+
+  // Force-merge, then rebuild the FAISS aux over the merged segment.  Merged
+  // docRanks: a=0, b=1, c=2, d=3; value ranks 0,1->a, 2->b, 3->c, 4,5->d.
+  // (Identity would mis-map value rank 2->doc 2 (c) and 3->doc 3 (d).)
+  h.getIndexWriter()->mergeSegments();
+  h.commit({"*"});
+
+  auto* req = makeKnnReq(*soluxNode, "emb_vs", {1, 0, 0}, 3);
+  req->execute();
+  auto ids = resultIds(*req);
+  ASSERT_EQ(ids.size(), 3u);
+  EXPECT_EQ(ids[0], "a");  // {1,0,0} exact
+  EXPECT_EQ(ids[1], "c");  // {0.9,0,0}
+  EXPECT_EQ(ids[2], "b");  // {0.8,0,0}
   req->done();
 }
 

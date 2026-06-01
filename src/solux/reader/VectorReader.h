@@ -52,6 +52,19 @@ public:
     return strCol_.getStartEndValueRank(docRank);
   }
 
+  /// Whether this segment carries the per-vector-rank -> docId reverse map.
+  /// True for multi-valued vector fields; false for single-valued (use identity /
+  /// the docs bitset) and for columns written before the map existed.
+  bool hasValDocMap() { return strCol_.getValDocReader() != nullptr; }
+
+  /// Multi-valued: map a global vector rank (0..numVectors()-1) to the segment-local
+  /// docId that owns it.  Requires hasValDocMap().
+  int32_t docForVectorRank(int64_t valueRank) {
+    MonoReader* r = strCol_.getValDocReader();
+    assert(r != nullptr);
+    return (int32_t)r->valueAt(valueRank);
+  }
+
   StrColReader& strColReader() { return strCol_; }
 
   using Iterator = StrColReader::DocIterator;

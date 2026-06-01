@@ -39,6 +39,14 @@ struct SegFieldInfo {
   // and the column is fixed-size, mono2MetaOff holds the fixed value size.
   seg_location mono2Loc;
   int64_t mono2MetaOff;
+
+  // Optional third mono column: per-value rank -> owning segment-local docId.
+  // Monotonic non-decreasing (values are written in doc order).  Written only for
+  // multi-valued columns whose consumers need the reverse vector-rank -> doc lookup
+  // (vector fields, for kNN hit grouping).  Unset (valDocLoc == {0,0}) otherwise; for
+  // single-valued fields valueRank == docRank so no map is needed.
+  seg_location valDocLoc;
+  int64_t valDocMetaOff;
 };
 
 
@@ -153,6 +161,8 @@ public:
       fieldInfo.monoMetaOff = fieldIS.readVlong();
       fieldInfo.mono2Loc = fieldIS.readVal<seg_location>();
       fieldInfo.mono2MetaOff = fieldIS.readVlong();
+      fieldInfo.valDocLoc = fieldIS.readVal<seg_location>();
+      fieldInfo.valDocMetaOff = fieldIS.readVlong();
     }
   }
 

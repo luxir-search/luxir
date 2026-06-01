@@ -365,8 +365,10 @@ private:
       // ordCollector.reset();
       // ordPool.reset();
 
-    } else if (type == FieldType::Type::STRING && !(allFlags & FieldType::INDEX_DOCS)) {
-      // Non-indexed string column (column-only storage)
+    } else if ((type == FieldType::Type::STRING || type == FieldType::Type::VECTOR)
+               && !(allFlags & FieldType::INDEX_DOCS)) {
+      // Non-indexed string/binary column (column-only storage).  Vector columns use
+      // the same fixed-size binary blob format (VectorHandler extends StrColHandler).
       mergeStrCol(sortedFields, postingsWriter, outputFieldInfo);
     } else {
       // int column that is not an ord column (assume all other field types have this (currently true)
@@ -509,7 +511,8 @@ private:
     auto poolGuard = MemPool::threadLocalPoolGuard();
     auto& pool = poolGuard.pool();
 
-    assert(outputFieldInfo.type == FieldType::Type::STRING);
+    assert(outputFieldInfo.type == FieldType::Type::STRING
+           || outputFieldInfo.type == FieldType::Type::VECTOR);
     assert(!(outputFieldInfo.flags & FieldType::INDEX_DOCS));
 
     bool multiValued = (outputFieldInfo.flags & FieldType::MULTI_VALUED) != 0;
@@ -532,6 +535,24 @@ private:
     if (multiValued) {
       endValueRankOut = postingsWriter.getOutputStream();
       endValueRankWriter = pool.make_unique_align<MonoWriter>(8, pool, *endValueRankOut);
+    }
+
+    // valDoc map (per-value rank -> merged docId): regenerated when any source segment
+    // carried one (multi-valued vector columns).  Like the source map it is monotonic
+    // non-decreasing, since merged doc ids are assigned in increasing order.
+    bool hasValDoc = false;
+    for (auto* f : sortedFields) {
+      if (f != nullptr && !(f->segFieldInfo.valDocLoc.offset() == 0 &&
+                            f->segFieldInfo.valDocLoc.filenum() == 0)) {
+        hasValDoc = true;
+        break;
+      }
+    }
+    u_ptr<MonoWriter> valDocWriter = nullptr;
+    OutputStreamPtr valDocOut;
+    if (multiValued && hasValDoc) {
+      valDocOut = postingsWriter.getOutputStream();
+      valDocWriter = pool.make_unique_align<MonoWriter>(8, pool, *valDocOut);
     }
 
     int32_t docsWithField = 0;
@@ -612,6 +633,7 @@ private:
           auto [startValueRank, endValueRank] = iter.valueRange();
           for (int64_t r = startValueRank; r < endValueRank; r++) {
             emitValue(reader.valueAt(r));
+            if (valDocWriter) valDocWriter->addInt64(mappedDoc);
           }
           endValueRankWriter->addInt64(totalValues);
         } else {
@@ -653,6 +675,13 @@ private:
       endValueRankWriter->finish();
       outputFieldInfo.monoLoc = endValueRankWriter->blockLoc;
       outputFieldInfo.monoMetaOff = endValueRankWriter->metaOff;
+    }
+
+    // valDoc map (valueRank -> docId)
+    if (valDocWriter) {
+      valDocWriter->finish();
+      outputFieldInfo.valDocLoc = valDocWriter->blockLoc;
+      outputFieldInfo.valDocMetaOff = valDocWriter->metaOff;
     }
 
     outputFieldInfo.docsWithField = docsWithField;

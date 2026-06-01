@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <format>
+#include <optional>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -37,8 +38,13 @@ namespace solux {
 /// always get exactly k live results back (or fewer if the index has fewer
 /// than k live vectors).  No over-fetch heuristic needed.
 ///
-/// V1 only supports single-valued vector fields (multi-valued vectors don't
-/// have a docId payload yet).
+/// Multi-valued vector fields are supported: every vector is its own FAISS id,
+/// mapped back to its owning doc via the segment's valueRank->docId column
+/// (VectorReader::docForVectorRank).  Several of a doc's vectors can land in the
+/// result; they are collapsed to one hit per doc keeping the best ("max-sim")
+/// score.  NOTE: we still request k *vectors* from FAISS, so a multi-valued query
+/// can return fewer than k *docs* when a doc owns several of the top vectors.
+/// Iterative over-fetch to guarantee k docs is a future enhancement.
 class KnnQuery final : public solux::Query {
   std::string_view field;
   std::span<const float> queryVec;
@@ -51,6 +57,24 @@ public:
   struct Hit {
     int32_t docId;
     float score;
+  };
+
+  /// Resolves a segment-local value rank to its owning docId.  Exactly one mode is
+  /// active per segment:
+  ///   - mono   : multi-valued reverse map (valueRank -> docId), read off the column.
+  ///   - flat   : sparse single-valued (some docs lack the field) materialized lookup.
+  ///   - neither: dense single-valued, valueRank == docId (identity).
+  /// The MonoReader / flat span must outlive every resolve() call (both live for the
+  /// duration of the FAISS search + result walk inside Weight's constructor).
+  class SegV2D {
+  public:
+    MonoReader* mono = nullptr;
+    std::span<const int32_t> flat;
+    int32_t resolve(int64_t valueRank) const {
+      if (mono) return (int32_t)mono->valueAt(valueRank);
+      if (!flat.empty()) return flat[(size_t)valueRank];
+      return (int32_t)valueRank;
+    }
   };
 
   KnnQuery(std::string_view field, std::span<const float> queryVec, int32_t k)
@@ -109,42 +133,55 @@ public:
       // the prefix sum lines up: zero-vector segments contribute a zero range.
       //
       // Within a segment, FAISS ids correspond to *value ranks* (0 ..
-      // numVectors), which equals docRank only when every doc has the field.
-      // For sparse fields (some docs without a vector), we need a
-      // valueRank -> docRank lookup; we materialize one per sparse segment
-      // by iterating the DocsReader bitmap.  Dense segments leave the inner
-      // span empty as a sentinel meaning "valueRank == docRank".
+      // numVectors).  Each segment gets a SegV2D resolver mapping valueRank ->
+      // docId: identity for dense single-valued, a materialized bitset lookup for
+      // sparse single-valued, and the column's reverse map for multi-valued.
       std::span<int64_t> prefix = context.pool.make_span<int64_t>(numSegs + 1);
       prefix[0] = 0;
-      std::span<std::span<const int32_t>> v2dPerSeg =
-        context.pool.make_span<std::span<const int32_t>>(numSegs);
-      for (auto& s : v2dPerSeg) s = {};
+      std::span<SegV2D> v2dPerSeg = context.pool.make_span<SegV2D>(numSegs);
+      for (auto& s : v2dPerSeg) s = SegV2D{};
+
+      // Holds the multi-valued segments' valueRank->docId readers alive through the
+      // FAISS search + result walk below (both in this constructor).  MonoReader is
+      // just pointers into the segment mmap (valid for the whole query) plus a size,
+      // so copying it out of the scratch VectorReader is safe and cheap.
+      std::vector<std::optional<MonoReader>> monoHolders(numSegs);
 
       auto segInfos = context.readSegInfos(query.getField());
       for (size_t i = 0; i < numSegs; i++) {
         int64_t segCount = 0;
         if (!segInfos.empty() && segInfos[i] != nullptr) {
-          // FIXED_SIZE single-valued vector column; numVectors == per-doc count
-          // when dense, or < maxDoc when some docs lack the field.
+          // FIXED_SIZE vector column.  numVectors == #docs-with-field for
+          // single-valued, or the total vector count for multi-valued.
           VectorReader vr(reader.segments()[i].postingsReader(), *segInfos[i]);
-          if (vr.isMultiValued()) {
-            throw std::runtime_error(std::format(
-              "KnnQuery: multi-valued vector field '{}' not supported in v1",
-              query.getField()));
-          }
           segCount = vr.numVectors();
-
-          // Build the sparse-field valueRank -> docRank lookup if needed.
-          auto& dr = vr.strColReader().docsReader();
-          if (dr.hasBitset() && segCount > 0) {
-            auto v2d = context.pool.make_span<int32_t>((size_t)segCount);
-            screaming::BitSet::Iterator it(dr.bitset());
-            for (int32_t r = 0; r < segCount; r++) {
-              int32_t docRank = it.next();
-              assert(docRank != screaming::BitSet::END);
-              v2d[r] = docRank;
+          if (segCount > 0) {
+            if (vr.isMultiValued()) {
+              // valueRank -> docId comes straight off the column's reverse map.
+              MonoReader* mr = vr.strColReader().getValDocReader();
+              if (mr == nullptr) {
+                throw std::runtime_error(std::format(
+                  "KnnQuery: multi-valued vector field '{}' is missing its valueRank->docId "
+                  "map (segment predates the map); reindex required", query.getField()));
+              }
+              monoHolders[i].emplace(*mr);
+              v2dPerSeg[i].mono = &*monoHolders[i];
+            } else {
+              // Single-valued: dense => identity (valueRank == docId).  Sparse (some
+              // docs lack the field) => materialize valueRank -> docRank from the
+              // has-field bitset; one int32 per vector, query-scoped.
+              auto& dr = vr.strColReader().docsReader();
+              if (dr.hasBitset()) {
+                auto v2d = context.pool.make_span<int32_t>((size_t)segCount);
+                screaming::BitSet::Iterator it(dr.bitset());
+                for (int32_t r = 0; r < segCount; r++) {
+                  int32_t docRank = it.next();
+                  assert(docRank != screaming::BitSet::END);
+                  v2d[r] = docRank;
+                }
+                v2dPerSeg[i].flat = v2d;
+              }
             }
-            v2dPerSeg[i] = v2d;
           }
         }
         prefix[i + 1] = prefix[i] + segCount;
@@ -195,17 +232,32 @@ public:
         if (fid < 0) continue;  // FAISS pad - no more live results
         int32_t ord = findSeg((int64_t)fid, prefix);
         if (ord < 0) continue;
-        int32_t valueRank = (int32_t)((int64_t)fid - prefix[ord]);
-        int32_t docRank = v2dPerSeg[ord].empty() ? valueRank : v2dPerSeg[ord][valueRank];
-        perSegBuf[ord].push_back({docRank, scoreFromDist(dists[i], vaux->getMetric())});
+        int64_t valueRank = (int64_t)fid - prefix[ord];
+        int32_t docId = v2dPerSeg[ord].resolve(valueRank);
+        perSegBuf[ord].push_back({docId, scoreFromDist(dists[i], vaux->getMetric())});
       }
 
-      // Materialize the per-segment hit arrays in the pool and sort each by docId.
+      // Materialize the per-segment hit arrays in the pool, sorted by docId.
       for (size_t ord = 0; ord < numSegs; ord++) {
         auto& bucket = perSegBuf[ord];
         if (bucket.empty()) continue;
         std::sort(bucket.begin(), bucket.end(),
                   [](const Hit& a, const Hit& b) { return a.docId < b.docId; });
+        // Collapse multiple hits from the same doc (multi-valued: several of a doc's
+        // vectors made the cut) into one, keeping the best score.  scoreFromDist is
+        // higher-is-better for every metric, so max == closest.  No-op when docIds
+        // are already unique (single-valued).
+        size_t w = 0;
+        for (size_t r = 0; r < bucket.size();) {
+          int32_t d = bucket[r].docId;
+          float best = bucket[r].score;
+          size_t j = r + 1;
+          for (; j < bucket.size() && bucket[j].docId == d; j++)
+            best = std::max(best, bucket[j].score);
+          bucket[w++] = {d, best};
+          r = j;
+        }
+        bucket.resize(w);
         auto out = context.pool.make_span<Hit>(bucket.size());
         std::copy(bucket.begin(), bucket.end(), out.begin());
         perSegHits[ord] = out;
@@ -285,14 +337,13 @@ private:
   /// selection.
   class LiveDocsSelector : public faiss::IDSelector {
     std::span<const int64_t> prefix;
-    // Per-segment valueRank -> docRank.  Empty inner span for dense segments
-    // (every doc has the field; valueRank == docRank).
-    std::span<const std::span<const int32_t>> v2dPerSeg;
+    // Per-segment valueRank -> docId resolver (mono / flat / identity).
+    std::span<const SegV2D> v2dPerSeg;
     std::span<IndexReader::Segment> segs;
 
   public:
     LiveDocsSelector(std::span<const int64_t> prefix,
-                     std::span<const std::span<const int32_t>> v2dPerSeg,
+                     std::span<const SegV2D> v2dPerSeg,
                      std::span<IndexReader::Segment> segs) noexcept
       : prefix(prefix), v2dPerSeg(v2dPerSeg), segs(segs) {}
 
@@ -301,9 +352,9 @@ private:
       if (ord < 0) return false;
       auto* live = segs[ord].liveDocs();
       if (live == nullptr) return true;  // no deletes in this segment
-      int32_t valueRank = (int32_t)((int64_t)id - prefix[ord]);
-      int32_t docRank = v2dPerSeg[ord].empty() ? valueRank : v2dPerSeg[ord][valueRank];
-      return live->bitset().get(docRank);
+      int64_t valueRank = (int64_t)id - prefix[ord];
+      int32_t docId = v2dPerSeg[ord].resolve(valueRank);
+      return live->bitset().get(docId);
     }
   };
 };

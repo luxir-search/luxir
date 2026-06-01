@@ -24,6 +24,19 @@ static proto::Val makeVec(std::initializer_list<float> floats) {
   return v;
 }
 
+// Index a multi-valued vector value (arr_vec) for the given doc.
+static void indexMultiVec(Inverter& inverter, Inverter::IndexHandler& handler,
+                          int32_t docid, std::vector<std::vector<float>> vecs) {
+  inverter.setDoc(docid);
+  proto::Val v;
+  auto* arr = v.mutable_arr_vec();
+  for (auto& vec : vecs) {
+    auto* f32 = arr->add_v()->mutable_f32();
+    for (float f : vec) f32->add_v(f);
+  }
+  handler.index(inverter, v);
+}
+
 // Low-level round-trip: index single-valued vectors, flush, read back via VectorReader.
 TEST_F(VectorColTest, singleValuedRoundTrip) {
   TestIndex testIndex;
@@ -56,6 +69,8 @@ TEST_F(VectorColTest, singleValuedRoundTrip) {
   ASSERT_EQ(4, vr.dims());
   ASSERT_EQ((int32_t)expected.size(), vr.docsWithValue());
   ASSERT_FALSE(vr.isMultiValued());
+  // Single-valued fields never get a valueRank->docId map (valueRank == docRank).
+  ASSERT_FALSE(vr.hasValDocMap());
 
   for (int32_t docRank = 0; docRank < (int32_t)expected.size(); docRank++) {
     auto span = vr.singleVectorAt(docRank);
@@ -118,6 +133,112 @@ TEST_F(VectorColTest, multiValuedRoundTrip) {
         EXPECT_FLOAT_EQ(exp[i], span[i]);
       }
     }
+  }
+}
+
+// valueRank -> docId reverse map for multi-valued vectors.  Uses sparse doc ids
+// (gaps) so the test fails if the map stored a dense rank-among-docs-with-field
+// instead of the real segment-local docId.
+TEST_F(VectorColTest, multiValuedValueRankToDoc) {
+  TestIndex testIndex;
+  auto& inverter = testIndex.getInverter();
+  auto& handler = inverter.getIndexHandler("emb_vs");
+
+  // doc 0: 2 vectors, doc 2: 1 vector, doc 5: 3 vectors.  Docs 1,3,4 have none.
+  struct DocVecs { int32_t docId; std::vector<std::vector<float>> vecs; };
+  std::vector<DocVecs> docs = {
+    {0, {{1, 2}, {3, 4}}},
+    {2, {{5, 6}}},
+    {5, {{7, 8}, {9, 10}, {11, 12}}},
+  };
+
+  for (auto& dv : docs) {
+    inverter.setDoc(dv.docId);
+    proto::Val v;
+    auto* arr = v.mutable_arr_vec();
+    for (auto& vec : dv.vecs) {
+      auto* f32 = arr->add_v()->mutable_f32();
+      for (float f : vec) f32->add_v(f);
+    }
+    handler.index(inverter, v);
+  }
+  testIndex.flush();
+
+  testIndex.initReader();
+  auto& seg = testIndex.reader->segments()[0];
+  FieldReader fieldReader(testIndex.pool, seg.postingsReader());
+  ASSERT_TRUE(fieldReader.seek("emb_vs"));
+  SegFieldInfo fi;
+  fieldReader.readFieldInfo(fi);
+
+  VectorReader vr(seg.postingsReader(), fi);
+  ASSERT_TRUE(vr.isMultiValued());
+  ASSERT_TRUE(vr.hasValDocMap());
+  ASSERT_EQ(6, vr.numVectors());
+
+  // Expected valueRank -> docId, in value-rank (doc) order.
+  std::vector<int32_t> expectedDoc;
+  for (auto& dv : docs)
+    for (size_t i = 0; i < dv.vecs.size(); i++) expectedDoc.push_back(dv.docId);
+  ASSERT_EQ(6u, expectedDoc.size());
+
+  for (int64_t r = 0; r < vr.numVectors(); r++) {
+    EXPECT_EQ(expectedDoc[(size_t)r], vr.docForVectorRank(r)) << "valueRank " << r;
+  }
+}
+
+// The valueRank -> docId map must survive a segment merge: mergeStrCol regenerates
+// it against the merged (remapped) doc ids.  Two multi-valued segments are merged
+// and every value rank is checked against its owning merged docId.
+TEST_F(VectorColTest, multiValuedValDocSurvivesMerge) {
+  TestIndex testIndex;
+
+  // Segment 1: doc 0 has 2 vectors, doc 1 has 1 vector.
+  {
+    auto& inverter = testIndex.getInverter();
+    auto& handler = inverter.getIndexHandler("emb_vs");
+    indexMultiVec(inverter, handler, 0, {{1, 2}, {3, 4}});
+    indexMultiVec(inverter, handler, 1, {{5, 6}});
+  }
+  testIndex.flush();
+
+  // Segment 2: doc 0 has 2 vectors.
+  {
+    auto& inverter = testIndex.getInverter();
+    auto& handler = inverter.getIndexHandler("emb_vs");
+    indexMultiVec(inverter, handler, 0, {{7, 8}, {9, 10}});
+  }
+  testIndex.flush();
+
+  testIndex.iw->mergeSegments();
+  testIndex.initReader();
+  ASSERT_EQ(1u, testIndex.reader->segments().size());
+  auto& seg = testIndex.reader->segments()[0];
+  FieldReader fieldReader(testIndex.pool, seg.postingsReader());
+  ASSERT_TRUE(fieldReader.seek("emb_vs"));
+  SegFieldInfo fi;
+  fieldReader.readFieldInfo(fi);
+
+  VectorReader vr(seg.postingsReader(), fi);
+  ASSERT_TRUE(vr.isMultiValued());
+  ASSERT_TRUE(vr.hasValDocMap());
+  ASSERT_EQ(5, vr.numVectors());
+
+  // merged docRanks: seg1 doc0->0, seg1 doc1->1, seg2 doc0->2.
+  // value ranks: 0,1 -> doc 0; 2 -> doc 1; 3,4 -> doc 2.  (Identity would wrongly
+  // map value rank 2 -> doc 2.)
+  std::vector<int32_t> expectedDoc = {0, 0, 1, 2, 2};
+  for (int64_t r = 0; r < vr.numVectors(); r++) {
+    EXPECT_EQ(expectedDoc[(size_t)r], vr.docForVectorRank(r)) << "valueRank " << r;
+  }
+
+  // Sanity: the vectors themselves survived the merge intact and in order.
+  std::vector<std::vector<float>> expectedVecs = {{1, 2}, {3, 4}, {5, 6}, {7, 8}, {9, 10}};
+  for (int64_t r = 0; r < vr.numVectors(); r++) {
+    auto span = vr.vectorAtRank(r);
+    ASSERT_EQ(2u, span.size());
+    EXPECT_FLOAT_EQ(expectedVecs[(size_t)r][0], span[0]);
+    EXPECT_FLOAT_EQ(expectedVecs[(size_t)r][1], span[1]);
   }
 }
 

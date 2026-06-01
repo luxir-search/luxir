@@ -81,7 +81,9 @@ VectorIndexBuilder::collectEligibleFields() {
     if (ft == nullptr || ft->type() != FieldType::VECTOR) continue;
     auto* vft = (const VectorFieldType*)ft;
     if (!vft->buildsAnnIndex()) continue;
-    if (vft->flags_ & FieldType::MULTI_VALUED) continue;  // v1: single-valued only
+    // Multi-valued vectors are indexed too: every value is added to FAISS, and the
+    // query layer maps each FAISS id back to its owning doc via the valueRank->docId
+    // column (StrColReader::getValDocReader).
     out.emplace_back(name, vft);
   }
   // Sort for stable AuxIndexInfo ordering across rebuilds (eases diffs/tests).
@@ -143,10 +145,10 @@ VectorIndexBuilder::buildField(std::string_view fieldName,
     SegFieldInfo fi;
     fr.readFieldInfo(fi);
     if (fi.type != FieldType::VECTOR) continue;
-    if (fi.flags & FieldType::MULTI_VALUED) {
-      throw std::runtime_error(std::string("VectorIndexBuilder: multi-valued vector field not supported in v1: ") + std::string(fieldName));
-    }
 
+    // Multi-valued is handled transparently: numVectors() counts all values across
+    // docs and the column stores them contiguously, so the add() calls below index
+    // every vector regardless of valued-ness.
     VectorReader vr(pr, fi);
     int32_t segDims = vr.dims();
     if (segDims <= 0) continue;

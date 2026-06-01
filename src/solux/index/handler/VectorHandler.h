@@ -30,6 +30,12 @@ public:
 
   int32_t dims() const { return dims_; }
 
+protected:
+  // Persist the valueRank -> docId map for multi-valued vector fields so the kNN
+  // engine can group per-vector hits back to their owning document.
+  bool writesValueDocMap() const override { return true; }
+
+public:
   void index(Inverter& inverter, const proto::Val& val) override {
     bool multi = (fieldType->flags_ & FieldType::MULTI_VALUED) != 0;
     if (val.has_vec()) {
