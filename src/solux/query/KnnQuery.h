@@ -21,6 +21,7 @@
 #include "solux/reader/PostingsReader.h"
 #include "solux/reader/VectorAuxReader.h"
 #include "solux/reader/VectorReader.h"
+#include "solux/util/BranchlessSearch.h"
 #include "solux/util/log.h"
 #include "solux/util/screaming.h"
 
@@ -227,10 +228,11 @@ public:
       // exist; bucket the rest per segment (sorted by docId for the
       // PostingsReader contract).
       std::vector<std::vector<Hit>> perSegBuf(numSegs);
+      BranchlessIndex<int64_t> segIndex(prefix.size());
       for (int64_t i = 0; i < kReq; i++) {
         faiss::idx_t fid = ids[i];
         if (fid < 0) continue;  // FAISS pad - no more live results
-        int32_t ord = findSeg((int64_t)fid, prefix);
+        int32_t ord = findSeg((int64_t)fid, prefix, segIndex);
         if (ord < 0) continue;
         int64_t valueRank = (int64_t)fid - prefix[ord];
         int32_t docId = v2dPerSeg[ord].resolve(valueRank);
@@ -319,10 +321,11 @@ private:
   // Locate the segment ord that "owns" the given FAISS id, given a
   // prefix-sum array of length numSegs+1 (prefix[0]=0, prefix[i] = sum of
   // vector counts in segments [0..i)).  Returns -1 if out of range.
-  static int32_t findSeg(int64_t faissId, std::span<const int64_t> prefix) {
+  static int32_t findSeg(int64_t faissId, std::span<const int64_t> prefix,
+                         const BranchlessIndex<int64_t>& index) {
     if (faissId < 0 || faissId >= prefix.back()) return -1;
-    auto it = std::upper_bound(prefix.begin(), prefix.end(), faissId);
-    return (int32_t)(it - prefix.begin() - 1);
+    auto it = index.upperBound(prefix.data(), faissId);
+    return (int32_t)(it - prefix.data() - 1);
   }
 
   /// faiss::IDSelector that maps a FAISS id to (segment ord, docRank) via
@@ -337,6 +340,9 @@ private:
   /// selection.
   class LiveDocsSelector : public faiss::IDSelector {
     std::span<const int64_t> prefix;
+    // Precomputed monobound layout for prefix; is_member() runs per candidate
+    // vector against this one array, so remembering it beats recomputing.
+    BranchlessIndex<int64_t> segIndex;
     // Per-segment valueRank -> docId resolver (mono / flat / identity).
     std::span<const SegV2D> v2dPerSeg;
     std::span<IndexReader::Segment> segs;
@@ -345,10 +351,10 @@ private:
     LiveDocsSelector(std::span<const int64_t> prefix,
                      std::span<const SegV2D> v2dPerSeg,
                      std::span<IndexReader::Segment> segs) noexcept
-      : prefix(prefix), v2dPerSeg(v2dPerSeg), segs(segs) {}
+      : prefix(prefix), segIndex(prefix.size()), v2dPerSeg(v2dPerSeg), segs(segs) {}
 
     bool is_member(faiss::idx_t id) const final {
-      int32_t ord = findSeg((int64_t)id, prefix);
+      int32_t ord = findSeg((int64_t)id, prefix, segIndex);
       if (ord < 0) return false;
       auto* live = segs[ord].liveDocs();
       if (live == nullptr) return true;  // no deletes in this segment
