@@ -22,6 +22,7 @@
 #include "solux/reader/VectorAuxReader.h"
 #include "solux/reader/VectorReader.h"
 #include "solux/util/log.h"
+#include "solux/util/screaming.h"
 
 namespace solux {
 
@@ -62,17 +63,20 @@ public:
   /// Resolves a segment-local value rank to its owning docId.  Exactly one mode is
   /// active per segment:
   ///   - mono   : multi-valued reverse map (valueRank -> docId), read off the column.
-  ///   - flat   : sparse single-valued (some docs lack the field) materialized lookup.
+  ///   - sel    : sparse single-valued (some docs lack the field) -> docId is the
+  ///              valueRank-th set bit of the has-field bitset (select()).  No
+  ///              per-vector array; the Selector caches only a small per-bucket
+  ///              prefix and reuses the column's existing bitset.
   ///   - neither: dense single-valued, valueRank == docId (identity).
-  /// The MonoReader / flat span must outlive every resolve() call (both live for the
+  /// The MonoReader / Selector must outlive every resolve() call (both live for the
   /// duration of the FAISS search + result walk inside Weight's constructor).
   class SegV2D {
   public:
     MonoReader* mono = nullptr;
-    std::span<const int32_t> flat;
+    const screaming::BitSet::Selector* sel = nullptr;
     int32_t resolve(int64_t valueRank) const {
       if (mono) return (int32_t)mono->valueAt(valueRank);
-      if (!flat.empty()) return flat[(size_t)valueRank];
+      if (sel) return sel->select((int32_t)valueRank);
       return (int32_t)valueRank;
     }
   };
@@ -141,10 +145,11 @@ public:
       std::span<SegV2D> v2dPerSeg = context.pool.make_span<SegV2D>(numSegs);
       for (auto& s : v2dPerSeg) s = SegV2D{};
 
-      // Holds the multi-valued segments' valueRank->docId readers alive through the
-      // FAISS search + result walk below (both in this constructor).  MonoReader is
-      // just pointers into the segment mmap (valid for the whole query) plus a size,
-      // so copying it out of the scratch VectorReader is safe and cheap.
+      // Holds the multi-valued segments' valueRank->docId MonoReaders alive through
+      // the FAISS search + result walk below (both in this constructor).  MonoReader is
+      // just pointers into the segment mmap (valid for the whole query), so copying it
+      // out of the scratch VectorReader is safe and cheap.  (The sparse single-valued
+      // Selector is pool-allocated via makeValueDocSelector, so it needs no holder.)
       std::vector<std::optional<MonoReader>> monoHolders(numSegs);
 
       auto segInfos = context.readSegInfos(query.getField());
@@ -168,18 +173,13 @@ public:
               v2dPerSeg[i].mono = &*monoHolders[i];
             } else {
               // Single-valued: dense => identity (valueRank == docId).  Sparse (some
-              // docs lack the field) => materialize valueRank -> docRank from the
-              // has-field bitset; one int32 per vector, query-scoped.
+              // docs lack the field) => resolve via select() on the has-field bitset:
+              // docId is the valueRank-th set bit.  No per-vector array; the Selector
+              // caches only a small per-bucket prefix (nBuckets+1 ints) and reuses the
+              // column's bitset.
               auto& dr = vr.strColReader().docsReader();
               if (dr.hasBitset()) {
-                auto v2d = context.pool.make_span<int32_t>((size_t)segCount);
-                screaming::BitSet::Iterator it(dr.bitset());
-                for (int32_t r = 0; r < segCount; r++) {
-                  int32_t docRank = it.next();
-                  assert(docRank != screaming::BitSet::END);
-                  v2d[r] = docRank;
-                }
-                v2dPerSeg[i].flat = v2d;
+                v2dPerSeg[i].sel = makeValueDocSelector(context.pool, dr.bitset());
               }
             }
           }

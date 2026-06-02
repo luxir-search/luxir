@@ -2,12 +2,17 @@
 
 #include <cstdint>
 #include <vector>
+#include <span>
 #include <bit>
 #include <cstring>
 #include <memory>
 #include <memory_resource>
 #include <sstream>
 #include <assert.h>
+
+#if defined(__BMI2__)
+#include <immintrin.h>
+#endif
 
 
 namespace screaming {
@@ -321,9 +326,22 @@ public:
   static constexpr int32_t END = std::numeric_limits<int32_t>::max();
 
   static constexpr uint32_t RANK_INDEX_SHIFT = 3; // for a dense (bitset) block, store a cumulative popcnt every 8 words
-  static constexpr uint32_t RANK_INDEX_SIZE = (Bits::fixedNumWords >> RANK_INDEX_SHIFT) * sizeof(uint16_t);
+  static constexpr uint32_t RANK_INDEX_ENTRIES = Bits::fixedNumWords >> RANK_INDEX_SHIFT; // uint16 entries in a dense block's rank index
+  static constexpr uint32_t RANK_INDEX_SIZE = RANK_INDEX_ENTRIES * sizeof(uint16_t);
   static constexpr uint32_t SPARSE_CONTAINER_SIZE = Bits::sizeInBytes;
   static constexpr uint32_t DENSE_CONTAINER_SIZE = Bits::sizeInBytes + RANK_INDEX_SIZE;
+
+  // A dense bucket stores its bitset words immediately followed by a
+  // cumulative-popcount rank index (RANK_INDEX_ENTRIES uint16s; see
+  // Builder::flushBucket).  This is the single source of where that index lives:
+  // Iterator::rank(), selectInBucket(), and the writer all locate it through here.
+  // A pure reinterpret_cast, so it inlines to nothing - no cost to the rank() hot path.
+  static const uint16_t* denseRankIndex(const Bits::word_type* words) {
+    return reinterpret_cast<const uint16_t*>(words + Bits::fixedNumWords);
+  }
+  static uint16_t* denseRankIndex(Bits::word_type* words) {
+    return reinterpret_cast<uint16_t*>(words + Bits::fixedNumWords);
+  }
 
 
   typedef struct {
@@ -512,7 +530,7 @@ public:
           // if bit buckets were 64 byte aligned, then every miniblock of 8 words would be exactly a cache line.
           auto localIndex = uint16_t(curr);
           auto rankIdx = localIndex >> (Bits::wordShift + RANK_INDEX_SHIFT);
-          uint16_t *rankIndexArr = reinterpret_cast<uint16_t *>(bucket.bits.obs.words + Bits::fixedNumWords);
+          uint16_t* rankIndexArr = denseRankIndex(bucket.bits.obs.words);
           auto rankBase = rankIndexArr[rankIdx];
           // Now find the rank of words before the current word in our mini-block
           auto wordIndex = localIndex >> Bits::wordShift;
@@ -592,14 +610,92 @@ public:
       }
     }
 
+  }; // end Iterator
 
+  // Total number of set bits in the whole set, by summing bucket cardinalities
+  // (O(nBuckets); there is no stored count or fast path).  Test-only: production
+  // never needs a set's cardinality because it is always redundant with other
+  // recorded index data (e.g. a field's docsWithField count), which is why we
+  // never persist it.
+  int32_t cardinality() const {
+    int32_t c = 0;
+    for (int32_t i = 0; i < nBuckets; i++) c += (int32_t)descriptors[i].size + 1;
+    return c;
+  }
 
-  };
+  // Value of the k-th set bit (0 <= k < cardinality()); the inverse of
+  // Iterator::rank().  Stateless: linear-scans the (small, contiguous) bucket
+  // descriptors to locate the owning bucket, then selects within it.  For many
+  // repeated lookups against one set, use Selector, which amortizes the bucket
+  // scan with a precomputed prefix + binary search.
+  int32_t select(int32_t k) const {
+    assert(k >= 0);
+    int32_t cum = 0;
+    for (int32_t bi = 0; bi < nBuckets; bi++) {
+      int32_t card = (int32_t)descriptors[bi].size + 1;
+      if (k < cum + card) return selectInBucket(bi, k - cum);
+      cum += card;
+    }
+    assert(false && "screaming::BitSet::select: k out of range");
+    return END;
+  }
 
-
-
+  // Amortized repeated select() over one set: owns a copy of the (lightweight)
+  // BitSet view and a precomputed per-bucket cumulative cardinality prefix, so
+  // each select() is a binary search over buckets plus an O(1)/few-word
+  // within-bucket select.  Defined out-of-line below (needs a complete BitSet to
+  // hold one by value).
+  class Selector;
 
 protected:
+
+  // Value of the localRank-th set bit (0-based) within bucket bi.  Implementation
+  // detail of select() / Selector::select().
+  int32_t selectInBucket(int32_t bi, int32_t localRank) const {
+    const BucketDescriptor& desc = descriptors[bi];
+    int32_t bucketBase = (int32_t)desc.upperBits << BUCKET_BITS;
+    int32_t card = (int32_t)desc.size + 1;
+    assert(localRank >= 0 && localRank < card);
+    if (card <= (int32_t)BUCKET_SPARSE_MAX) {
+      // Sparse bucket: a sorted uint16 array, so the localRank-th value is direct.
+      const uint16_t* vals = (const uint16_t*)(start + desc.offset);
+      return bucketBase + (int32_t)vals[localRank];
+    }
+    // Dense bucket: a bitset block followed by the cumulative-popcount rank index
+    // (one uint16 per 1<<RANK_INDEX_SHIFT words; entry m == popcount of the words
+    // before mini-block m, with the final mini-block intentionally uncounted).
+    // Binary-search the index to the owning mini-block, scan its words to the
+    // owning word, then select within that word.  Mirrors Iterator::rank().
+    const Bits::word_type* words = (const Bits::word_type*)(start + desc.offset);
+    const uint16_t* rankIndexArr = denseRankIndex(words);
+    // largest m with rankIndexArr[m] <= localRank
+    int32_t lo = 0, hi = (int32_t)RANK_INDEX_ENTRIES;
+    while (lo < hi) {
+      int32_t mid = (lo + hi) >> 1;
+      if ((int32_t)rankIndexArr[mid] <= localRank) lo = mid + 1; else hi = mid;
+    }
+    int32_t wordIdx = (lo - 1) << RANK_INDEX_SHIFT;
+    int32_t rankSoFar = (int32_t)rankIndexArr[lo - 1];
+    for (;; wordIdx++) {
+      int32_t pc = std::popcount(words[wordIdx]);
+      if (rankSoFar + pc > localRank) break;
+      rankSoFar += pc;
+    }
+    int32_t bitPos = selectInWord(words[wordIdx], localRank - rankSoFar);
+    return bucketBase + (wordIdx << Bits::wordShift) + bitPos;
+  }
+
+  // Position (0-based) of the r-th set bit within a 64-bit word.  Requires
+  // r < popcount(word).  PDEP deposits a single bit into the r-th set position;
+  // the scalar fallback clears the r lowest set bits.
+  static int32_t selectInWord(uint64_t word, int32_t r) {
+#if defined(__BMI2__)
+    return (int32_t)std::countr_zero(_pdep_u64((uint64_t)1 << (unsigned)r, word));
+#else
+    for (int32_t i = 0; i < r; i++) word &= word - 1;
+    return (int32_t)std::countr_zero(word);
+#endif
+  }
 
   // The number of bytes taken up by a block.
   // NOTE: this requires knowing if a rank index is being used for dense blocks!
@@ -612,6 +708,40 @@ protected:
     }
   }
 
+};
+
+
+// Out-of-line so the by-value BitSet member has a complete type.  Still a nested
+// class of BitSet, so it retains access to BitSet::selectInBucket.  The scratch
+// must hold at least s.nBuckets + 1 int32_t's, and the underlying bitset data
+// (not the BitSet object, which is copied) must outlive the Selector.
+class BitSet::Selector {
+  BitSet set;                          // a copy of the view (pointers into the bitset data)
+  // bucketStartRank[i] = rank of bucket i's first set bit = set bits in buckets [0, i);
+  // last entry is the total cardinality.  select() binary-searches it for the owning bucket.
+  std::span<int32_t> bucketStartRank;
+public:
+  Selector(const BitSet& s, std::span<int32_t> scratch)
+    : set(s), bucketStartRank(scratch.first((size_t)s.nBuckets + 1)) {
+    bucketStartRank[0] = 0;
+    for (int32_t i = 0; i < s.nBuckets; i++)
+      bucketStartRank[i + 1] = bucketStartRank[i] + (int32_t)s.descriptors[i].size + 1;
+  }
+
+  // Test-only (see BitSet::cardinality); O(1) here since the prefix is prebuilt.
+  int32_t cardinality() const { return bucketStartRank.back(); }
+
+  int32_t select(int32_t k) const {
+    assert(k >= 0 && k < bucketStartRank.back());
+    // largest bi with bucketStartRank[bi] <= k
+    int32_t lo = 0, hi = (int32_t)bucketStartRank.size();
+    while (lo < hi) {
+      int32_t mid = (lo + hi) >> 1;
+      if (bucketStartRank[mid] <= k) lo = mid + 1; else hi = mid;
+    }
+    int32_t bi = lo - 1;
+    return set.selectInBucket(bi, k - bucketStartRank[bi]);
+  }
 };
 
 
@@ -767,7 +897,7 @@ protected:
 
       if (rankIndex) {
         writeSize = BitSet::DENSE_CONTAINER_SIZE;
-        uint16_t* rankIndexArr = reinterpret_cast<uint16_t*>(bits.words + bits.fixedNumWords);
+        uint16_t* rankIndexArr = BitSet::denseRankIndex(bits.words);
         uint16_t cumulativeRank = 0;
         constexpr uint32_t wordsPerCount = (1<<BitSet::RANK_INDEX_SHIFT);
         // The count represents the cumulative popcnt of the *previous* block, i.e. the first is 0.

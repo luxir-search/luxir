@@ -174,6 +174,13 @@ public:
       for (int i=0; i<8; i++) {
         iters.emplace_back(*bitset);
       }
+      // select() is the inverse of rank(), so we verify it as we walk: after each
+      // rank() below, select(rank) must return the value we are sitting on.  This
+      // covers both the stateless select() and the amortized Selector without
+      // recording the values separately.  (Only used on modest bucket counts;
+      // stateless select()'s linear bucket scan would be quadratic otherwise.)
+      std::vector<int32_t> selScratch((size_t)bitset->nBuckets + 1);
+      screaming::BitSet::Selector selector(*bitset, selScratch);
       int last = it.val();
       for(;;) {
         int val = it.next();
@@ -209,10 +216,16 @@ public:
           EXPECT_EQ(rank, rankResult);
         }
 
+        // Inverse check: select(rank) must round-trip back to the current value.
+        EXPECT_EQ(val, bitset->select(rank));
+        EXPECT_EQ(val, selector.select(rank));
+
         itHash = itHash * 31 + val;
         card++;
       }
       EXPECT_EQ(card, nAdds);
+      EXPECT_EQ(bitset->cardinality(), nAdds);
+      EXPECT_EQ(selector.cardinality(), nAdds);
       // std::cout << "nAdds=" << nAdds << std::endl;
       EXPECT_EQ(addHash, itHash);
       return addHash == itHash;
@@ -438,8 +451,34 @@ TEST_F(ScreamingTest, randomSets) {
 
     set.finishBuild();
     // set.verifyIterator();
-    set.verifyIteratorSkips();
+    set.verifyIteratorSkips();  // also round-trips select() against rank()
   }
+}
+
+TEST_F(ScreamingTest, select) {
+  // Focused select() coverage: a sparse bucket, a dense (bitset) bucket, and a
+  // gap, across multiple bucket bases.  verifyIteratorSkips() round-trips both the
+  // stateless select() and the Selector against rank() for every value.
+  OutputStreamBuilder set;
+  set.addSmallBucket(1 + rng.rint(3));     // tiny sparse
+  set.addSmallBucket();                     // near-max sparse
+  set.nextBucket(3);                        // skip a few buckets (gap)
+  set.addMidBucket();                       // dense bitset bucket
+  set.addSmallBucket((int)(screaming::BitSet::BUCKET_SPARSE_MAX + 1 + rng.rint(3))); // just-dense
+  set.finishBuild();
+  ASSERT_TRUE(set.verifyIteratorSkips());
+}
+
+TEST_F(ScreamingTest, selectSingleValue) {
+  // Boundary: a one-element set.
+  std::ostringstream ss;
+  screaming::StringStreamBuilder builder(ss);
+  builder.add(0xabcdef);
+  builder.flush();
+  std::string result = ss.str();
+  screaming::BitSet bs((void*)(result.c_str() + result.size()));
+  ASSERT_EQ(bs.cardinality(), 1);
+  ASSERT_EQ(bs.select(0), 0xabcdef);
 }
 
 TEST_F(ScreamingTest, ramFixedBitSet) {

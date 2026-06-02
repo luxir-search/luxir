@@ -2,6 +2,8 @@
 
 #include <span>
 #include "StrColReader.h"
+#include "solux/util/MemPool.h"
+#include "solux/util/screaming.h"
 
 namespace solux {
 
@@ -69,5 +71,16 @@ public:
 
   using Iterator = StrColReader::DocIterator;
 };
+
+/// Build a pool-backed valueRank -> docId resolver for a sparse single-valued vector
+/// column: docId is the valueRank-th set bit of the column's has-field bitset
+/// (screaming::BitSet::Selector::select).  The Selector and its prefix are allocated in
+/// `pool`, so the result outlives the (scratch) VectorReader the bitset came from; the
+/// bitset's underlying data and `pool` must outlive the returned Selector.
+inline screaming::BitSet::Selector* makeValueDocSelector(MemPool& pool,
+                                                         const screaming::BitSet& bitset) {
+  return pool.make<screaming::BitSet::Selector>(
+      bitset, pool.make_span<int32_t>((size_t)bitset.nBuckets + 1));
+}
 
 } // namespace solux
