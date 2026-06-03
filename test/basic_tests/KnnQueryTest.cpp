@@ -4,6 +4,7 @@
 #include <vector>
 
 #include "protos/solux_types.pb.h"
+#include "solux/query/KnnQuery.h"
 #include "solux/schema/Schema.h"
 #include "solux/server/SoluxNode.h"
 #include "test/CollectionHelper.h"
@@ -16,6 +17,16 @@ using namespace solux::test;
 
 class KnnQueryTest : public SoluxTest {
 protected:
+  struct MaxKnnCandidatesGuard {
+    int64_t saved;
+    explicit MaxKnnCandidatesGuard(int64_t value) : saved(KnnQuery::maxKnnCandidates) {
+      KnnQuery::maxKnnCandidates = value;
+    }
+    ~MaxKnnCandidatesGuard() {
+      KnnQuery::maxKnnCandidates = saved;
+    }
+  };
+
   void SetUp() override {
     auto col = soluxNode->getCollection("main");
     col->setSchema(Schema::createDefaultSchema());
@@ -204,7 +215,8 @@ TEST_F(KnnQueryTest, multiValuedGrouping) {
                   std::vector<std::vector<float>>{{0, 1, 0}}));
   h.commit({"*"});
 
-  // k=3 vectors requested; "a" owns the top two, so after grouping we get 2 docs.
+  // Only two live docs have vectors, so k=3 returns both distinct docs after
+  // collapsing "a"'s two top chunks into one hit.
   auto* req = makeKnnReq(*soluxNode, "emb_vs", {1, 0, 0}, 3);
   req->execute();
   auto ids = resultIds(*req);
@@ -226,6 +238,126 @@ TEST_F(KnnQueryTest, multiValuedGrouping) {
   ASSERT_EQ(ids2.size(), 1u);
   EXPECT_EQ(ids2[0], "b");
   req2->done();
+}
+
+TEST_F(KnnQueryTest, multiValuedGuaranteesKDocs) {
+  CollectionHelper h("main");
+  h.clear();
+  installMultiVecSchema(h.collection(), proto::VectorParams::L2);
+
+  // "a" owns the top 3 vectors.  A k-vectors implementation returns only "a";
+  // over-requesting should continue far enough to fill k distinct docs.
+  h.index(flatdoc("id", std::string("a"), "emb_vs",
+                  std::vector<std::vector<float>>{{1, 0, 0}, {0.99f, 0, 0}, {0.98f, 0, 0}}));
+  h.index(flatdoc("id", std::string("b"), "emb_vs",
+                  std::vector<std::vector<float>>{{0.5f, 0, 0}}));
+  h.index(flatdoc("id", std::string("c"), "emb_vs",
+                  std::vector<std::vector<float>>{{0.4f, 0, 0}}));
+  h.index(flatdoc("id", std::string("d"), "emb_vs",
+                  std::vector<std::vector<float>>{{0.3f, 0, 0}}));
+  h.commit({"*"});
+
+  auto* req = makeKnnReq(*soluxNode, "emb_vs", {1, 0, 0}, 3);
+  req->execute();
+
+  EXPECT_EQ(req->getMatchCount(), 3);
+  auto ids = resultIds(*req);
+  ASSERT_EQ(ids.size(), 3u);
+  EXPECT_EQ(ids[0], "a");
+  EXPECT_EQ(ids[1], "b");
+  EXPECT_EQ(ids[2], "c");
+
+  req->done();
+}
+
+TEST_F(KnnQueryTest, multiValuedKExceedsDistinctDocs) {
+  CollectionHelper h("main");
+  h.clear();
+  installMultiVecSchema(h.collection(), proto::VectorParams::L2);
+
+  h.index(flatdoc("id", std::string("a"), "emb_vs",
+                  std::vector<std::vector<float>>{{1, 0, 0}, {0.99f, 0, 0}, {0.98f, 0, 0}}));
+  h.index(flatdoc("id", std::string("b"), "emb_vs",
+                  std::vector<std::vector<float>>{{0.5f, 0, 0}}));
+  h.index(flatdoc("id", std::string("c"), "emb_vs",
+                  std::vector<std::vector<float>>{{0.4f, 0, 0}}));
+  h.index(flatdoc("id", std::string("d"), "emb_vs",
+                  std::vector<std::vector<float>>{{0.3f, 0, 0}}));
+  h.commit({"*"});
+
+  auto* req = makeKnnReq(*soluxNode, "emb_vs", {1, 0, 0}, 10);
+  req->execute();
+
+  EXPECT_EQ(req->getMatchCount(), 4);
+  auto ids = resultIds(*req);
+  ASSERT_EQ(ids.size(), 4u);
+  EXPECT_EQ(ids[0], "a");
+  EXPECT_EQ(ids[1], "b");
+  EXPECT_EQ(ids[2], "c");
+  EXPECT_EQ(ids[3], "d");
+
+  req->done();
+}
+
+TEST_F(KnnQueryTest, multiValuedFillsAfterDeletingTopDoc) {
+  CollectionHelper h("main");
+  h.clear();
+  installMultiVecSchema(h.collection(), proto::VectorParams::L2);
+
+  h.index(flatdoc("id", std::string("a"), "emb_vs",
+                  std::vector<std::vector<float>>{{1, 0, 0}, {0.99f, 0, 0}, {0.98f, 0, 0}}));
+  h.index(flatdoc("id", std::string("b"), "emb_vs",
+                  std::vector<std::vector<float>>{{0.5f, 0, 0}}));
+  h.index(flatdoc("id", std::string("c"), "emb_vs",
+                  std::vector<std::vector<float>>{{0.4f, 0, 0}}));
+  h.index(flatdoc("id", std::string("d"), "emb_vs",
+                  std::vector<std::vector<float>>{{0.3f, 0, 0}}));
+  h.commit({"*"});
+
+  std::vector<std::string> del{"a"};
+  h.deleteByIds(del, UpdateMessage::COMMIT);
+
+  auto* req = makeKnnReq(*soluxNode, "emb_vs", {1, 0, 0}, 3);
+  req->execute();
+
+  EXPECT_EQ(req->getMatchCount(), 3);
+  auto ids = resultIds(*req);
+  ASSERT_EQ(ids.size(), 3u);
+  EXPECT_EQ(ids[0], "b");
+  EXPECT_EQ(ids[1], "c");
+  EXPECT_EQ(ids[2], "d");
+
+  req->done();
+}
+
+TEST_F(KnnQueryTest, multiValuedCandidateCapIsBestEffort) {
+  MaxKnnCandidatesGuard guard(3);
+  CollectionHelper h("main");
+  h.clear();
+  installMultiVecSchema(h.collection(), proto::VectorParams::L2);
+
+  h.index(flatdoc("id", std::string("a"), "emb_vs",
+                  std::vector<std::vector<float>>{{1, 0, 0}, {0.99f, 0, 0}, {0.98f, 0, 0}}));
+  h.index(flatdoc("id", std::string("b"), "emb_vs",
+                  std::vector<std::vector<float>>{{0.5f, 0, 0}}));
+  h.index(flatdoc("id", std::string("c"), "emb_vs",
+                  std::vector<std::vector<float>>{{0.4f, 0, 0}}));
+  h.index(flatdoc("id", std::string("d"), "emb_vs",
+                  std::vector<std::vector<float>>{{0.3f, 0, 0}}));
+  h.commit({"*"});
+
+  auto* req = makeKnnReq(*soluxNode, "emb_vs", {1, 0, 0}, 3);
+  {
+    LogLevelGuard quiet;  // expected: shortfall at the test candidate cap
+    req->execute();
+  }
+
+  EXPECT_EQ(req->getMatchCount(), 1);
+  auto ids = resultIds(*req);
+  ASSERT_EQ(ids.size(), 1u);
+  EXPECT_EQ(ids[0], "a");
+
+  req->done();
 }
 
 // Multi-valued across multiple segments: each segment resolves its own value
@@ -308,8 +440,7 @@ TEST_F(KnnQueryTest, multiValuedSurvivesMerge) {
 }
 
 // Deletes: deleted docs should not show up, even though FAISS still has
-// their vectors.  liveDocs filtering happens inside FAISS via IDSelector,
-// so we always get exactly k live results back.
+// their vectors.  liveDocs filtering happens inside FAISS via IDSelector.
 //
 // Mixes in a no-vector doc ("g") so the column is sparse.  Without the
 // valueRank -> docRank lookup, IDSelector::is_member would test the wrong
@@ -359,7 +490,7 @@ TEST_F(KnnQueryTest, filtersDeletedDocs) {
 }
 
 // Stress the IDSelector path: delete most of the docs and verify we still
-// get exactly k live hits back without any over-fetch logic.
+// get k live docs back.
 TEST_F(KnnQueryTest, manyDeletes) {
   CollectionHelper h("main");
   h.clear();
@@ -528,4 +659,3 @@ TEST_F(KnnQueryTest, l2Scores) {
 
   req->done();
 }
-

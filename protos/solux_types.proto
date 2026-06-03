@@ -159,18 +159,17 @@ message Query {
 // the index via UpdateRequest.CommitParams.build_aux_indexes (or "*").
 //
 // V1 limitations:
-//   - Single-valued vector fields only (multi-valued vectors aren't yet
-//     mapped to docs).
 //   - The query vector's dimensionality must match the index.
+//   - Results are best-effort if multi-valued collapse needs more than the
+//     bounded vector candidate budget.
 //
 // Deleted-doc vectors live in the FAISS index until the next rebuild;
 // liveDocs filtering happens *inside* the FAISS search via an IDSelector,
-// so callers always get exactly `k` live results (or fewer if the index has
-// fewer than k live vectors).
+// and multi-valued vector fields collapse to one hit per doc using max-sim.
 message KnnQuery {
   string field = 1;        // vector field name (e.g. "embedding_v")
   Vector query = 2;        // query vector - must match the field's dims
-  int32 k = 3;             // number of nearest neighbors to return
+  int32 k = 3;             // number of nearest-neighbor documents to return
 }
 
   // use NamedValue here instead? Repeat field so this can be used to query multiple fields at once? Add a field glob/regex?
@@ -682,4 +681,3 @@ message SchemaRequest {
 message SchemaResponse {
   SchemaDef schema = 1;         // the resulting schema after the operation
 }
-

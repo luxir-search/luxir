@@ -6,6 +6,7 @@
 #include <faiss/utils/distances.h>
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <format>
 #include <optional>
@@ -14,6 +15,7 @@
 #include <string>
 #include <string_view>
 #include <vector>
+#include <boost/unordered/unordered_flat_set.hpp>
 
 #include "Query.h"
 #include "protos/solux_types.pb.h"
@@ -37,16 +39,16 @@ namespace solux {
 ///
 /// LiveDocs filtering happens *inside* the FAISS search via a custom
 /// faiss::IDSelector, so deleted-doc vectors are skipped server-side and we
-/// always get exactly k live results back (or fewer if the index has fewer
-/// than k live vectors).  No over-fetch heuristic needed.
+/// over-request vectors only to fill k distinct docs after multi-vector
+/// collapse.
 ///
 /// Multi-valued vector fields are supported: every vector is its own FAISS id,
 /// mapped back to its owning doc via the segment's valueRank->docId column
 /// (VectorReader::docForVectorRank).  Several of a doc's vectors can land in the
 /// result; they are collapsed to one hit per doc keeping the best ("max-sim")
-/// score.  NOTE: we still request k *vectors* from FAISS, so a multi-valued query
-/// can return fewer than k *docs* when a doc owns several of the top vectors.
-/// Iterative over-fetch to guarantee k docs is a future enhancement.
+/// score.  The query adaptively over-requests vectors, bounded by
+/// maxKnnCandidates, so it normally emits k distinct docs (or fewer if fewer
+/// live docs have a vector).  Above that cap the result is best-effort.
 class KnnQuery final : public solux::Query {
   std::string_view field;
   std::span<const float> queryVec;
@@ -60,6 +62,10 @@ public:
     int32_t docId;
     float score;
   };
+
+  // Maximum vectors requested from FAISS while trying to fill k distinct docs.
+  // Mutable so tests can shrink it to exercise the best-effort cap path.
+  static inline int64_t maxKnnCandidates = 1000000;
 
   /// Resolves a segment-local value rank to its owning docId.  Exactly one mode is
   /// active per segment:
@@ -80,6 +86,12 @@ public:
       if (sel) return sel->select((int32_t)valueRank);
       return (int32_t)valueRank;
     }
+  };
+
+  struct DocHit {
+    int32_t segOrd;
+    int32_t docId;
+    float score;
   };
 
   KnnQuery(std::string_view field, std::span<const float> queryVec, int32_t k)
@@ -154,6 +166,8 @@ public:
       std::vector<std::optional<MonoReader>> monoHolders(numSegs);
 
       auto segInfos = context.readSegInfos(query.getField());
+      int64_t totalDocsWithValue = 0;
+      bool anyMultiValued = false;
       for (size_t i = 0; i < numSegs; i++) {
         int64_t segCount = 0;
         if (!segInfos.empty() && segInfos[i] != nullptr) {
@@ -162,7 +176,9 @@ public:
           VectorReader vr(reader.segments()[i].postingsReader(), *segInfos[i]);
           segCount = vr.numVectors();
           if (segCount > 0) {
+            totalDocsWithValue += vr.docsWithValue();
             if (vr.isMultiValued()) {
+              anyMultiValued = true;
               // valueRank -> docId comes straight off the column's reverse map.
               MonoReader* mr = vr.strColReader().getValDocReader();
               if (mr == nullptr) {
@@ -209,60 +225,84 @@ public:
       }
 
       // Use a faiss::IDSelector to filter deleted docs *inside* the search,
-      // so we ask for exactly k and never under-deliver due to liveDocs
-      // post-filtering.  The selector closes over `prefix`, `v2dPerSeg`, and
+      // so over-requesting is used only for multi-vector doc collapse, not for
+      // deleted vectors.  The selector closes over `prefix`, `v2dPerSeg`, and
       // segment liveDocs - all live for the duration of search() (pool /
       // IndexReader scoped).
       LiveDocsSelector selector(prefix, v2dPerSeg, reader.segments());
       faiss::SearchParameters params;
       params.sel = &selector;
 
-      int64_t kReq = std::min((int64_t)query.getK(), faissIdx->ntotal);
+      int64_t ntotal = faissIdx->ntotal;
+      int64_t kDocs = query.getK();
+      int64_t cap = std::min(ntotal, std::max((int64_t)1, maxKnnCandidates));
+      int64_t avgMult = (anyMultiValued && totalDocsWithValue > 0)
+        ? ceilDivClamped(ntotal, totalDocsWithValue, cap)
+        : 1;
+      int64_t kReq = mulClamped(kDocs, avgMult, cap);
       if (kReq <= 0) return;
 
-      std::vector<faiss::idx_t> ids((size_t)kReq);
-      std::vector<float> dists((size_t)kReq);
-      faissIdx->search(1, queryPtr, kReq, dists.data(), ids.data(), &params);
-
-      // Walk FAISS results.  IDs are -1 when fewer than kReq live vectors
-      // exist; bucket the rest per segment (sorted by docId for the
-      // PostingsReader contract).
-      std::vector<std::vector<Hit>> perSegBuf(numSegs);
       BranchlessIndex<int64_t> segIndex(prefix.size());
-      for (int64_t i = 0; i < kReq; i++) {
-        faiss::idx_t fid = ids[i];
-        if (fid < 0) continue;  // FAISS pad - no more live results
-        int32_t ord = findSeg((int64_t)fid, prefix, segIndex);
-        if (ord < 0) continue;
-        int64_t valueRank = (int64_t)fid - prefix[ord];
-        int32_t docId = v2dPerSeg[ord].resolve(valueRank);
-        perSegBuf[ord].push_back({docId, scoreFromDist(dists[i], vaux->getMetric())});
+      std::vector<faiss::idx_t> ids;
+      std::vector<float> dists;
+      std::vector<DocHit> docHits;
+      boost::unordered_flat_set<uint64_t> seenDocs;
+      size_t maxDocHits = (size_t)std::min(kDocs, cap);
+      docHits.reserve(maxDocHits);
+      seenDocs.reserve(maxDocHits);
+
+      for (;;) {
+        ids.assign((size_t)kReq, (faiss::idx_t)-1);
+        dists.assign((size_t)kReq, 0.0f);
+        faissIdx->search(1, queryPtr, kReq, dists.data(), ids.data(), &params);
+
+        docHits.clear();
+        seenDocs.clear();
+        int64_t liveHits = 0;
+        for (int64_t i = 0; i < kReq; i++) {
+          faiss::idx_t fid = ids[(size_t)i];
+          if (fid < 0) continue;  // FAISS pad - no more live results
+          liveHits++;
+          int32_t ord = findSeg((int64_t)fid, prefix, segIndex);
+          if (ord < 0) continue;
+          int64_t valueRank = (int64_t)fid - prefix[(size_t)ord];
+          int32_t docId = v2dPerSeg[(size_t)ord].resolve(valueRank);
+          uint64_t key = packSegDoc(ord, docId);
+          if (seenDocs.insert(key).second) {
+            // FAISS returns hits in score order, so the first vector seen for
+            // this doc is its best vector.
+            docHits.push_back({ord, docId, scoreFromDist(dists[(size_t)i], vaux->getMetric())});
+            if ((int64_t)docHits.size() == kDocs) break;
+          }
+        }
+
+        if ((int64_t)docHits.size() >= kDocs) break;
+        if (liveHits < kReq) break;
+        if (kReq >= cap) break;
+
+        int64_t want = projectedKReq(kReq, kDocs, (int64_t)docHits.size(), cap);
+        kReq = std::min(cap, std::max(kReq + 1, want));
+      }
+
+      if ((int64_t)docHits.size() < kDocs && cap < ntotal) {
+        LOG_DEBUG("KnnQuery: {} of k={} docs for field '{}' at candidate cap {}",
+                  docHits.size(), kDocs, query.getField(), cap);
       }
 
       // Materialize the per-segment hit arrays in the pool, sorted by docId.
-      for (size_t ord = 0; ord < numSegs; ord++) {
-        auto& bucket = perSegBuf[ord];
-        if (bucket.empty()) continue;
-        std::sort(bucket.begin(), bucket.end(),
-                  [](const Hit& a, const Hit& b) { return a.docId < b.docId; });
-        // Collapse multiple hits from the same doc (multi-valued: several of a doc's
-        // vectors made the cut) into one, keeping the best score.  scoreFromDist is
-        // higher-is-better for every metric, so max == closest.  No-op when docIds
-        // are already unique (single-valued).
-        size_t w = 0;
-        for (size_t r = 0; r < bucket.size();) {
-          int32_t d = bucket[r].docId;
-          float best = bucket[r].score;
-          size_t j = r + 1;
-          for (; j < bucket.size() && bucket[j].docId == d; j++)
-            best = std::max(best, bucket[j].score);
-          bucket[w++] = {d, best};
-          r = j;
+      std::sort(docHits.begin(), docHits.end(), [](const DocHit& a, const DocHit& b) {
+        return (a.segOrd == b.segOrd) ? (a.docId < b.docId) : (a.segOrd < b.segOrd);
+      });
+      for (size_t r = 0; r < docHits.size();) {
+        int32_t ord = docHits[r].segOrd;
+        size_t j = r + 1;
+        while (j < docHits.size() && docHits[j].segOrd == ord) j++;
+        auto out = context.pool.make_span<Hit>(j - r);
+        for (size_t i = r; i < j; i++) {
+          out[i - r] = {docHits[i].docId, docHits[i].score};
         }
-        bucket.resize(w);
-        auto out = context.pool.make_span<Hit>(bucket.size());
-        std::copy(bucket.begin(), bucket.end(), out.begin());
-        perSegHits[ord] = out;
+        perSegHits[(size_t)ord] = out;
+        r = j;
       }
     }
 
@@ -328,6 +368,32 @@ private:
     return (int32_t)(it - prefix.data() - 1);
   }
 
+  static uint64_t packSegDoc(int32_t segOrd, int32_t docId) {
+    return ((uint64_t)(uint32_t)segOrd << 32) | (uint32_t)docId;
+  }
+
+  static int64_t ceilDivClamped(int64_t num, int64_t den, int64_t cap) {
+    if (den <= 0) return cap;
+    if (num <= 0) return 0;
+    int64_t q = num / den;
+    if (num % den != 0) q++;
+    return std::min(q, cap);
+  }
+
+  static int64_t mulClamped(int64_t a, int64_t b, int64_t cap) {
+    if (a <= 0 || b <= 0) return 0;
+    if (a > cap / b) return cap;
+    return std::min(a * b, cap);
+  }
+
+  static int64_t projectedKReq(int64_t kReq, int64_t kDocs, int64_t docsSeen, int64_t cap) {
+    int64_t denom = std::max((int64_t)1, docsSeen);
+    // Heuristic projection: kReq * (target docs / observed docs) plus slack.
+    double want = std::ceil((double)kReq * (double)kDocs / (double)denom * 1.3);
+    if (want >= (double)cap) return cap;
+    return (int64_t)want;
+  }
+
   /// faiss::IDSelector that maps a FAISS id to (segment ord, docRank) via
   /// the precomputed prefix sums + per-segment valueRank->docRank lookup,
   /// then consults the segment's liveDocs.  FAISS calls is_member(id) for
@@ -335,7 +401,8 @@ private:
   /// deleted-doc vectors never make it into the result list.
   ///
   /// For IndexFlat this doesn't reduce the scan cost (we still touch every
-  /// vector for distance computation) but it cleanly avoids over-fetching.
+  /// vector for distance computation) but it keeps deleted vectors out of the
+  /// returned candidate list.
   /// For HNSW/IVF later, the selector can also prune graph traversal / list
   /// selection.
   class LiveDocsSelector : public faiss::IDSelector {
