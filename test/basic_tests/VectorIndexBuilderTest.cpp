@@ -300,10 +300,9 @@ TEST_F(VectorIndexBuilderTest, rebuildDeletesPreviousFiles) {
   EXPECT_EQ(idx->ntotal, 2);
 }
 
-// Cosine metric: by default we copy + renormalize each segment's vectors.
-// Verifies that kNN against a non-unit query still returns the correct order
-// (cosine on stored vectors == IP on normalized stored vectors).
-TEST_F(VectorIndexBuilderTest, cosineRenormalizesByDefault) {
+// Cosine metric normalizes on column write by default.  The FAISS builder can
+// add the already-normalized column bytes directly as inner-product vectors.
+TEST_F(VectorIndexBuilderTest, cosineNormalizeOnWriteBuildsInnerProductIndex) {
   CollectionHelper h("main");
   h.clear();
 
@@ -317,9 +316,8 @@ TEST_F(VectorIndexBuilderTest, cosineRenormalizesByDefault) {
   f->mutable_vector()->set_metric(proto::VectorParams::COSINE);
   h.collection().setSchema(Schema::fromProto(def, h.collection().getSchema().get()));
 
-  // Two doc vectors, NOT pre-normalized.  Direction-wise they're proportional
-  // (same direction), so renormalized they should land at the same point and
-  // both score IP=1 against a unit query in that direction.
+  // Two doc vectors, NOT pre-normalized.  The write path stores normalized
+  // vectors, so FAISS sees unit vectors.
   Doc d1 = flatdoc("id", std::string("a"), "v_v", std::vector<float>{2, 0, 0});
   Doc d2 = flatdoc("id", std::string("b"), "v_v", std::vector<float>{0, 5, 0});
   h.index(d1);
@@ -332,8 +330,8 @@ TEST_F(VectorIndexBuilderTest, cosineRenormalizesByDefault) {
   auto idx = readFaissIndex(h.getIndexWriter()->dir, info->aux_indexes(0).files(0));
   EXPECT_EQ(idx->metric_type, faiss::METRIC_INNER_PRODUCT);
 
-  // Unit-length query in doc-a's direction - IP against the (now-normalized)
-  // stored vectors should be 1.0 for doc-a, 0.0 for doc-b.
+  // Unit-length query in doc-a's direction - IP against normalized stored
+  // vectors should be 1.0 for doc-a, 0.0 for doc-b.
   std::vector<float> query{1, 0, 0};
   std::vector<faiss::idx_t> ids(2);
   std::vector<float> dists(2);
@@ -343,8 +341,8 @@ TEST_F(VectorIndexBuilderTest, cosineRenormalizesByDefault) {
   EXPECT_NEAR(dists[1], 0.0f, 1e-5);
 }
 
-// normalized=true: builder trusts vectors are already unit-length and skips
-// renormalization.  Pre-normalized inputs come out of FAISS unchanged.
+// normalized=true: writer and builder trust vectors are already unit-length and
+// skip renormalization.
 TEST_F(VectorIndexBuilderTest, normalizedFlagSkipsRenorm) {
   CollectionHelper h("main");
   h.clear();
@@ -359,14 +357,10 @@ TEST_F(VectorIndexBuilderTest, normalizedFlagSkipsRenorm) {
   f->mutable_vector()->set_normalized(true);
   h.collection().setSchema(Schema::fromProto(def, h.collection().getSchema().get()));
 
-  // Pre-normalized: each vector is unit-length.  We deliberately use
-  // vectors that would land elsewhere if the builder *did* renormalize a
-  // copy, but since they're already unit-length the result is the same -
-  // what we're really verifying is that no extra copy/normalize is
-  // performed (logically: the search returns identical results to passing
-  // these through faiss directly without normalization).
-  Doc d1 = flatdoc("id", std::string("a"), "v_v", std::vector<float>{1, 0, 0});
-  Doc d2 = flatdoc("id", std::string("b"), "v_v", std::vector<float>{0, 1, 0});
+  // Deliberately non-unit despite normalized=true: this verifies the flag is
+  // trust-only and prevents both write-time and build-time renormalization.
+  Doc d1 = flatdoc("id", std::string("a"), "v_v", std::vector<float>{2, 0, 0});
+  Doc d2 = flatdoc("id", std::string("b"), "v_v", std::vector<float>{0, 3, 0});
   h.index(d1);
   h.index(d2);
   h.commit({"*"});
@@ -382,7 +376,7 @@ TEST_F(VectorIndexBuilderTest, normalizedFlagSkipsRenorm) {
   std::vector<float> dists(2);
   idx->search(1, query.data(), 2, dists.data(), ids.data());
   EXPECT_EQ(ids[0], 0);
-  EXPECT_FLOAT_EQ(dists[0], 1.0f);
+  EXPECT_FLOAT_EQ(dists[0], 2.0f);
   EXPECT_FLOAT_EQ(dists[1], 0.0f);
 }
 
@@ -439,6 +433,7 @@ TEST_F(VectorIndexBuilderTest, cosineRenormChunkBoundaries) {
   f->set_abstract(true);
   f->set_column_stored(true);
   f->mutable_vector()->set_metric(proto::VectorParams::COSINE);
+  f->mutable_vector()->set_normalize_on_write(false);
   h.collection().setSchema(Schema::fromProto(def, h.collection().getSchema().get()));
 
   // 7 vectors, each non-unit and pointing in different cardinal directions.

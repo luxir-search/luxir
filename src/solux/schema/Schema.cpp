@@ -37,6 +37,8 @@ struct ResolvedField {
   VectorFieldType::Metric vectorMetric = VectorFieldType::METRIC_NONE;
   bool hasVectorNormalized = false;
   bool vectorNormalized = false;
+  bool hasVectorNormalizeOnWrite = false;
+  bool vectorNormalizeOnWrite = false;
 };
 
 using sv_flat_map = boost::unordered_flat_map<std::string_view, const proto::FieldDef*, PackedTermHash, PackedTermEqual>;
@@ -165,6 +167,15 @@ static void resolveField(std::string_view name,
     r.vectorNormalized = parentResolved.vectorNormalized;
   }
 
+  // vector normalize_on_write: explicit set on this field overrides; otherwise inherit.
+  if (def.has_vector() && def.vector().has_normalize_on_write()) {
+    r.hasVectorNormalizeOnWrite = true;
+    r.vectorNormalizeOnWrite = def.vector().normalize_on_write();
+  } else {
+    r.hasVectorNormalizeOnWrite = parentResolved.hasVectorNormalizeOnWrite;
+    r.vectorNormalizeOnWrite = parentResolved.vectorNormalizeOnWrite;
+  }
+
   visiting.erase(name);
   resolved[name] = std::move(r);
 }
@@ -263,6 +274,8 @@ std::shared_ptr<Schema> Schema::fromProto(const proto::SchemaDef& def, const Sch
         r.vectorMetric = vecFt->metric_;
         r.hasVectorNormalized = true;
         r.vectorNormalized = vecFt->normalized_;
+        r.hasVectorNormalizeOnWrite = true;
+        r.vectorNormalizeOnWrite = vecFt->normalizeOnWrite_;
       }
       resolved[name] = std::move(r);
     }
@@ -344,12 +357,17 @@ std::shared_ptr<Schema> Schema::fromProto(const proto::SchemaDef& def, const Sch
       case proto::FieldDef::INT:
         ft = std::make_shared<IntFieldType>(name, flags);
         break;
-      case proto::FieldDef::VECTOR:
+      case proto::FieldDef::VECTOR: {
         // VECTOR is always fixed-size (every value in a segment must share dims).
         // dims may be 0, meaning "infer from first indexed value".
+        bool normalizeOnWrite;
+        normalizeOnWrite = !r.vectorNormalized && (r.hasVectorNormalizeOnWrite
+          ? r.vectorNormalizeOnWrite
+          : (r.vectorMetric == VectorFieldType::METRIC_COSINE));
         ft = std::make_shared<VectorFieldType>(name, r.vectorDims, flags | FieldType::FIXED_SIZE,
-                                               r.vectorMetric, r.vectorNormalized);
+                                               r.vectorMetric, r.vectorNormalized, normalizeOnWrite);
         break;
+      }
       default:
         throw std::runtime_error("Unsupported field_class for field: " + std::string(name));
     }
@@ -448,6 +466,9 @@ void Schema::toProto(proto::SchemaDef* def) const {
       }
       if (vecFt->normalized_) {
         fieldDef->mutable_vector()->set_normalized(true);
+      }
+      if (vecFt->metric_ == VectorFieldType::METRIC_COSINE) {
+        fieldDef->mutable_vector()->set_normalize_on_write(vecFt->normalizeOnWrite_);
       }
     }
   }

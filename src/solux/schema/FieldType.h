@@ -177,18 +177,26 @@ public:
   // Caller asserts incoming vectors are unit-norm - the COSINE build path
   // skips its copy + renormalize step.  Ignored for non-COSINE metrics.
   bool normalized_;
+  // COSINE fields normalize vectors before column storage by default.  Ignored
+  // for non-COSINE metrics.
+  bool normalizeOnWrite_;
 
   VectorFieldType(std::string_view name, int32_t dims = 0,
                   int flags = COLUMN_STORED | FIXED_SIZE,
                   Metric metric = METRIC_NONE,
-                  bool normalized = false)
+                  bool normalized = false,
+                  bool normalizeOnWrite = true)
     : FieldType(name, FieldType::VECTOR, flags),
-      dims_(dims), metric_(metric), normalized_(normalized) {
+      dims_(dims),
+      metric_(metric),
+      normalized_(normalized),
+      normalizeOnWrite_((metric == METRIC_COSINE) && normalizeOnWrite && !normalized) {
   }
 
   int32_t dims() const { return dims_; }
   Metric metric() const { return metric_; }
   bool normalized() const { return normalized_; }
+  bool normalizeOnWrite() const { return normalizeOnWrite_; }
 
   // True iff a FAISS aux index should be built for this field when requested.
   bool buildsAnnIndex() const { return metric_ != METRIC_NONE; }

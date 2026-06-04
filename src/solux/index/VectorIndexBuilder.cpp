@@ -179,9 +179,10 @@ VectorIndexBuilder::buildField(std::string_view fieldName,
     // deleted-doc vectors stay in the index until the next rebuild - query
     // layer filters.
     const float* base = (const float*)vr.vectorAtRank(0).data();
-    if ((ft.metric_ == VectorFieldType::METRIC_COSINE) && !ft.normalized_) {
-      // Cosine via FAISS IP requires unit-norm vectors.  Copy in fixed-size
-      // chunks, normalize each chunk, then add.
+    if ((ft.metric_ == VectorFieldType::METRIC_COSINE) && !ft.normalized_ && !ft.normalizeOnWrite_) {
+      // Cosine via FAISS IP requires unit-norm vectors.  When the write path
+      // did not already normalize the column, copy in fixed-size chunks,
+      // normalize each chunk, then add.
       size_t bytesPerVec = (size_t)dims * sizeof(float);
       size_t chunkVecs = std::max((size_t)1, renormChunkBytes / bytesPerVec);
       size_t chunkFloats = chunkVecs * (size_t)dims;
@@ -194,7 +195,8 @@ VectorIndexBuilder::buildField(std::string_view fieldName,
         index->add(n, renormBuf.data());
       }
     } else {
-      // Either non-cosine, or user asserts vectors are already unit-norm.
+      // Either non-cosine, already normalized on write, or user asserts
+      // vectors are already unit-norm.
       index->add(numVals, base);
     }
   }

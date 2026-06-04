@@ -14,7 +14,14 @@
 using namespace solux;
 using namespace solux::test;
 
-class VectorColTest : public SoluxTest {};
+class VectorColTest : public SoluxTest {
+protected:
+  void SetUp() override {
+    SoluxTest::SetUp();
+    auto col = soluxNode->getCollection("main");
+    col->setSchema(Schema::createDefaultSchema());
+  }
+};
 
 // Build a proto::Val containing a single Vector{f32}.
 static proto::Val makeVec(std::initializer_list<float> floats) {
@@ -22,6 +29,20 @@ static proto::Val makeVec(std::initializer_list<float> floats) {
   auto* f32 = v.mutable_vec()->mutable_f32();
   for (float f : floats) f32->add_v(f);
   return v;
+}
+
+static void enableCosineOnVecSuffix(Collection& col, bool normalizeOnWrite = true) {
+  proto::SchemaDef def;
+  auto* f = def.add_fields();
+  f->set_name("_v");
+  f->set_field_class(proto::FieldDef::VECTOR);
+  f->set_abstract(true);
+  f->set_column_stored(true);
+  f->mutable_vector()->set_metric(proto::VectorParams::COSINE);
+  f->mutable_vector()->set_normalize_on_write(normalizeOnWrite);
+
+  auto base = col.getSchema();
+  col.setSchema(Schema::fromProto(def, base.get()));
 }
 
 // Index a multi-valued vector value (arr_vec) for the given doc.
@@ -368,6 +389,166 @@ TEST_F(VectorColTest, grpcMultiFieldsRoundTrip) {
   req->done();
 }
 
+TEST_F(VectorColTest, cosineDefaultsToNormalizedColumnStorage) {
+  CollectionHelper h("main");
+  h.clear();
+
+  proto::SchemaDef def;
+  auto* f = def.add_fields();
+  f->set_name("_v");
+  f->set_field_class(proto::FieldDef::VECTOR);
+  f->set_abstract(true);
+  f->set_column_stored(true);
+  f->mutable_vector()->set_metric(proto::VectorParams::COSINE);
+  h.collection().setSchema(Schema::fromProto(def, h.collection().getSchema().get()));
+
+  Doc doc = flatdoc("id", std::string("a"), "vec_v", std::vector<float>{3.0f, 4.0f});
+  h.index(doc, UpdateMessage::COMMIT);
+
+  auto* req = LocalReq::create(h.getSearchEngine());
+  req->collection("main")
+     .allQuery()
+     .fields({"id", "vec_v"})
+     .limit(10)
+     .execute();
+
+  auto docs = req->getDocs();
+  ASSERT_EQ(1u, docs.size());
+  auto* vecVal = find(docs[0], "vec_v");
+  ASSERT_NE(nullptr, vecVal);
+  const auto& vec = std::get<std::vector<float>>(*vecVal);
+  ASSERT_EQ(2u, vec.size());
+  EXPECT_FLOAT_EQ(0.6f, vec[0]);
+  EXPECT_FLOAT_EQ(0.8f, vec[1]);
+
+  req->done();
+}
+
+TEST_F(VectorColTest, cosineNormalizeOnWriteFalseKeepsRawColumnStorage) {
+  CollectionHelper h("main");
+  h.clear();
+  enableCosineOnVecSuffix(h.collection(), false);
+
+  Doc doc = flatdoc("id", std::string("a"), "vec_v", std::vector<float>{3.0f, 4.0f});
+  h.index(doc, UpdateMessage::COMMIT);
+
+  auto* req = LocalReq::create(h.getSearchEngine());
+  req->collection("main")
+     .allQuery()
+     .fields({"id", "vec_v"})
+     .limit(10)
+     .execute();
+
+  auto docs = req->getDocs();
+  ASSERT_EQ(1u, docs.size());
+  auto* vecVal = find(docs[0], "vec_v");
+  ASSERT_NE(nullptr, vecVal);
+  const auto& vec = std::get<std::vector<float>>(*vecVal);
+  ASSERT_EQ(2u, vec.size());
+  EXPECT_FLOAT_EQ(3.0f, vec[0]);
+  EXPECT_FLOAT_EQ(4.0f, vec[1]);
+
+  req->done();
+}
+
+TEST_F(VectorColTest, cosineNormalizedFlagKeepsRawColumnStorage) {
+  CollectionHelper h("main");
+  h.clear();
+
+  proto::SchemaDef def;
+  auto* f = def.add_fields();
+  f->set_name("_v");
+  f->set_field_class(proto::FieldDef::VECTOR);
+  f->set_abstract(true);
+  f->set_column_stored(true);
+  f->mutable_vector()->set_metric(proto::VectorParams::COSINE);
+  f->mutable_vector()->set_normalized(true);
+
+  auto schema = Schema::fromProto(def, h.collection().getSchema().get());
+  auto* ft = dynamic_cast<VectorFieldType*>(schema->getFieldTypePtr("vec_v"));
+  ASSERT_NE(nullptr, ft);
+  EXPECT_TRUE(ft->normalized());
+  EXPECT_FALSE(ft->normalizeOnWrite());
+  h.collection().setSchema(schema);
+
+  Doc doc = flatdoc("id", std::string("a"), "vec_v", std::vector<float>{3.0f, 4.0f});
+  h.index(doc, UpdateMessage::COMMIT);
+
+  auto* req = LocalReq::create(h.getSearchEngine());
+  req->collection("main")
+     .allQuery()
+     .fields({"id", "vec_v"})
+     .limit(10)
+     .execute();
+
+  auto docs = req->getDocs();
+  ASSERT_EQ(1u, docs.size());
+  auto* vecVal = find(docs[0], "vec_v");
+  ASSERT_NE(nullptr, vecVal);
+  const auto& vec = std::get<std::vector<float>>(*vecVal);
+  ASSERT_EQ(2u, vec.size());
+  EXPECT_FLOAT_EQ(3.0f, vec[0]);
+  EXPECT_FLOAT_EQ(4.0f, vec[1]);
+
+  req->done();
+}
+
+// A zero / near-zero cosine vector has no direction; rather than fail the whole
+// update we skip the value (the doc is indexed with no vector for that field).
+TEST_F(VectorColTest, cosineSkipsZeroVector) {
+  CollectionHelper h("main");
+  h.clear();
+
+  proto::SchemaDef def;
+  auto* f = def.add_fields();
+  f->set_name("_v");
+  f->set_field_class(proto::FieldDef::VECTOR);
+  f->set_abstract(true);
+  f->set_column_stored(true);
+  f->mutable_vector()->set_metric(proto::VectorParams::COSINE);
+  h.collection().setSchema(Schema::fromProto(def, h.collection().getSchema().get()));
+
+  // Doc "a" has a zero vector (skipped); doc "b" has a usable one (kept).
+  h.index(flatdoc("id", std::string("a"), "vec_v", std::vector<float>{0.0f, 0.0f}));
+  h.index(flatdoc("id", std::string("b"), "vec_v", std::vector<float>{3.0f, 4.0f}),
+          UpdateMessage::COMMIT);
+
+  auto* req = LocalReq::create(h.getSearchEngine());
+  req->collection("main").allQuery().fields({"id", "vec_v"}).limit(10).execute();
+
+  auto docs = req->getDocs();
+  ASSERT_EQ(2u, docs.size());
+  for (auto& doc : docs) {
+    auto* id = find(doc, "id");
+    ASSERT_NE(nullptr, id);
+    auto* vecVal = find(doc, "vec_v");
+    if (std::get<std::string>(*id) == "a") {
+      EXPECT_EQ(nullptr, vecVal);  // zero vector was skipped
+    } else {
+      ASSERT_NE(nullptr, vecVal);  // usable vector was stored (normalized)
+      const auto& vec = std::get<std::vector<float>>(*vecVal);
+      ASSERT_EQ(2u, vec.size());
+      EXPECT_FLOAT_EQ(0.6f, vec[0]);
+      EXPECT_FLOAT_EQ(0.8f, vec[1]);
+    }
+  }
+
+  req->done();
+}
+
+TEST_F(VectorColTest, cosineNormalizedFlagTrustsZeroVector) {
+  TestIndex testIndex;
+  auto& inverter = testIndex.getInverter();
+  auto cosineType = std::make_shared<VectorFieldType>(
+      "cos_v", /*dims=*/2, FieldType::COLUMN_STORED | FieldType::FIXED_SIZE,
+      VectorFieldType::METRIC_COSINE, /*normalized=*/true);
+  handler::VectorHandler vh(inverter, "cos_v", cosineType);
+
+  inverter.setDoc(0);
+  auto zero = makeVec({0.0f, 0.0f});
+  EXPECT_NO_THROW(vh.index(inverter, zero));
+}
+
 // Schema round-trip: toProto/fromProto preserves VECTOR field with dims.
 TEST_F(VectorColTest, schemaProtoRoundTrip) {
   proto::SchemaDef def;
@@ -376,6 +557,7 @@ TEST_F(VectorColTest, schemaProtoRoundTrip) {
   f->set_field_class(proto::FieldDef::VECTOR);
   f->set_column_stored(true);
   f->mutable_vector()->set_dims(384);
+  f->mutable_vector()->set_metric(proto::VectorParams::COSINE);
 
   auto schema = Schema::fromProto(def);
   auto it = schema->getFieldType("embedding");
@@ -383,6 +565,8 @@ TEST_F(VectorColTest, schemaProtoRoundTrip) {
   auto* vft = dynamic_cast<VectorFieldType*>(it->second.get());
   ASSERT_NE(nullptr, vft);
   EXPECT_EQ(384, vft->dims());
+  EXPECT_EQ(VectorFieldType::METRIC_COSINE, vft->metric());
+  EXPECT_TRUE(vft->normalizeOnWrite());
   EXPECT_TRUE(vft->hasColumn());
   EXPECT_TRUE(vft->isSet(FieldType::FIXED_SIZE));
 
@@ -393,6 +577,8 @@ TEST_F(VectorColTest, schemaProtoRoundTrip) {
     if (outDef.fields(i).name() == "embedding") {
       EXPECT_EQ(proto::FieldDef::VECTOR, outDef.fields(i).field_class());
       EXPECT_EQ(384, outDef.fields(i).vector().dims());
+      EXPECT_EQ(proto::VectorParams::COSINE, outDef.fields(i).vector().metric());
+      EXPECT_TRUE(outDef.fields(i).vector().normalize_on_write());
       found = true;
     }
   }

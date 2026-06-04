@@ -2,6 +2,11 @@
 
 #include "StrColHandler.h"
 #include "solux/schema/FieldType.h"
+#include "solux/util/log.h"
+
+#include <cassert>
+#include <cmath>
+#include <vector>
 
 namespace solux::handler {
 
@@ -17,6 +22,10 @@ namespace solux::handler {
 /// dims_ and subsequent values must match.
 class VectorHandler final : public StrColHandler {
   int32_t dims_ = 0;          // 0 until first value seen (or set from schema)
+  VectorFieldType::Metric metric = VectorFieldType::METRIC_NONE;
+  bool trustNormalized = false;
+  bool normalizeOnWrite = false;
+  std::vector<float> normalizedScratch;
 
 public:
   VectorHandler(Inverter& inverter, const std::string_view& fieldName,
@@ -26,6 +35,9 @@ public:
     // fields, which fromProto always builds as VectorFieldType.
     auto* vft = (VectorFieldType*)(fieldType.get());
     dims_ = vft->dims_;
+    metric = vft->metric_;
+    trustNormalized = vft->normalized_;
+    normalizeOnWrite = vft->normalizeOnWrite_;
   }
 
   int32_t dims() const { return dims_; }
@@ -58,9 +70,14 @@ public:
   }
 
 private:
+  static constexpr double MIN_COSINE_NORM_SQ = 1.0e-30;
+
   // Validate a Vector against current dims_, learning dims_ on first call.
-  // Returns the f32 floats; throws if the Vector uses an unsupported encoding.
-  const proto::ArrFloat& validate(const proto::Vector& vec) {
+  // Returns the f32 floats, or nullptr if the value should be skipped: a cosine
+  // field's zero / near-zero vector has no direction, so we drop it (and log)
+  // rather than fail the whole update.  Throws on hard errors (bad encoding,
+  // empty vector, dims mismatch).
+  const proto::ArrFloat* validate(const proto::Vector& vec, double* normSq = nullptr) {
     if (!vec.has_f32()) {
       throw std::runtime_error(fmt::format(
           "VectorHandler: field '{}' got Vector with unsupported / unset encoding",
@@ -79,7 +96,21 @@ private:
           "VectorHandler: field '{}' expects dims={}, got {}",
           std::string_view(fieldName), dims_, n));
     }
-    return f;
+    if (metric == VectorFieldType::METRIC_COSINE && !trustNormalized) {
+      double sum = 0.0;
+      for (float x : f.v()) {
+        double d = (double)x;
+        sum += d * d;
+      }
+      if (!std::isfinite(sum) || sum <= MIN_COSINE_NORM_SQ) {
+        // No cosine direction - skip this value rather than abort the update.
+        LOG_WARN("VectorHandler: cosine field '{}' skipping zero / near-zero vector",
+                 std::string_view(fieldName));
+        return nullptr;
+      }
+      if (normSq != nullptr) *normSq = sum;
+    }
+    return &f;
   }
 
   static std::string_view bytesOf(const proto::ArrFloat& vec) {
@@ -87,14 +118,40 @@ private:
                             (size_t)vec.v_size() * sizeof(float));
   }
 
+  static std::string_view bytesOf(const float* data, int32_t dims) {
+    return std::string_view((const char*)data, (size_t)dims * sizeof(float));
+  }
+
+  std::string_view storedBytes(const proto::ArrFloat& vec,
+                               double normSq,
+                               std::vector<float>& scratch) const {
+    if (!normalizeOnWrite) return bytesOf(vec);
+
+    size_t start = scratch.size();
+    scratch.resize(start + (size_t)vec.v_size());
+    float invNorm = (float)(1.0 / std::sqrt(normSq));
+    for (int32_t i = 0; i < vec.v_size(); i++) {
+      scratch[start + (size_t)i] = vec.v(i) * invNorm;
+    }
+    return bytesOf(scratch.data() + start, vec.v_size());
+  }
+
   void indexSingleVec(Inverter& inverter, const proto::Vector& vec) {
-    auto& f = validate(vec);
-    indexSingle(inverter, bytesOf(f));
+    double normSq = 0.0;
+    auto* f = validate(vec, &normSq);
+    if (f == nullptr) return;  // skipped: doc gets no value for this field
+    normalizedScratch.clear();
+    if (normalizeOnWrite) normalizedScratch.reserve((size_t)f->v_size());
+    indexSingle(inverter, storedBytes(*f, normSq, normalizedScratch));
   }
 
   void indexOne(Inverter& inverter, const proto::Vector& vec) {
-    auto& f = validate(vec);
-    std::string_view views[] = { bytesOf(f) };
+    double normSq = 0.0;
+    auto* f = validate(vec, &normSq);
+    if (f == nullptr) return;  // skipped: doc gets no value for this field
+    normalizedScratch.clear();
+    if (normalizeOnWrite) normalizedScratch.reserve((size_t)f->v_size());
+    std::string_view views[] = { storedBytes(*f, normSq, normalizedScratch) };
     indexMulti(inverter, std::span<std::string_view>(views));
   }
 
@@ -104,9 +161,32 @@ private:
     // unset); skip without recording the doc in docsWithValue.
     if (vecs.empty()) return;
     // Validate first so dims_ is locked before we capture byte views.
+    std::vector<const proto::ArrFloat*> floats;
+    std::vector<double> normSq;
+    floats.reserve(vecs.size());
+    normSq.reserve(vecs.size());
+    for (auto& v : vecs) {
+      double sq = 0.0;
+      auto* f = validate(v, &sq);
+      if (f == nullptr) continue;  // skip zero / near-zero cosine vector
+      floats.push_back(f);
+      normSq.push_back(sq);
+    }
+    // All values skipped => doc has no vector value (like an empty list).
+    if (floats.empty()) return;
+
     std::vector<std::string_view> views;
-    views.reserve(vecs.size());
-    for (auto& v : vecs) views.push_back(bytesOf(validate(v)));
+    views.reserve(floats.size());
+    normalizedScratch.clear();
+    if (normalizeOnWrite) {
+      // storedBytes returns views into normalizedScratch; reserve the full
+      // batch before appending so earlier views cannot be invalidated.
+      normalizedScratch.reserve((size_t)dims_ * floats.size());
+    }
+    for (size_t i = 0; i < floats.size(); i++) {
+      views.push_back(storedBytes(*floats[i], normSq[i], normalizedScratch));
+    }
+    assert(!normalizeOnWrite || normalizedScratch.size() == (size_t)dims_ * floats.size());
     indexMulti(inverter, std::span<std::string_view>(views));
   }
 };

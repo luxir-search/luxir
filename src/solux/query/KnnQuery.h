@@ -23,6 +23,7 @@
 #include "solux/reader/PostingsReader.h"
 #include "solux/reader/VectorAuxReader.h"
 #include "solux/reader/VectorReader.h"
+#include "solux/query/VectorEngine.h"
 #include "solux/search/DocSet.h"
 #include "solux/util/BranchlessSearch.h"
 #include "solux/util/log.h"
@@ -34,14 +35,15 @@ namespace solux {
 ///
 /// Execution model: the FAISS index is currently shard-level (one per
 /// IndexReader, not per segment), so search materializes once during the query
-/// preparation phase.  Hits are mapped back to (segment, docId) via the
-/// per-segment cumulative vector counts and bucketed per segment in docId order
-/// for the segment-parallel TopDocsReq pipeline.
+/// preparation phase.  Hits cross a small vector engine seam as
+/// (segment, valueRank, score), then are collapsed to docs and bucketed per
+/// segment in docId order for the segment-parallel TopDocsReq pipeline.
 ///
-/// LiveDocs filtering happens *inside* the FAISS search via a custom
-/// faiss::IDSelector, so deleted-doc vectors are skipped server-side and we
-/// over-request vectors only to fill k distinct docs after multi-vector
-/// collapse.
+/// The active query domain (liveDocs intersected with any enclosing filter
+/// clauses) is applied *inside* the FAISS search via a custom faiss::IDSelector
+/// (DomainSelector), so deleted-doc and out-of-domain vectors are skipped during
+/// the search and we over-request vectors only to fill k distinct docs after
+/// multi-vector collapse.
 ///
 /// Multi-valued vector fields are supported: every vector is its own FAISS id,
 /// mapped back to its owning doc via the segment's valueRank->docId column
@@ -253,8 +255,9 @@ public:
       }
 
       // Optionally normalize the query for COSINE - stored vectors were
-      // normalized at build, so we need a unit query for cosine = IP semantics
-      // to hold.  Done into a local copy; the caller's span is unmodified.
+      // normalized on write, or normalized by the builder for raw-column mode,
+      // so we need a unit query for cosine = IP semantics to hold.  Done into a
+      // local copy; the caller's span is unmodified.
       std::vector<float> queryBuf;
       const float* queryPtr = query.getQueryVec().data();
       if (vaux->getMetric() == proto::VectorParams::COSINE) {
@@ -282,41 +285,37 @@ public:
       if (kReq <= 0) return std::make_unique<KnnPreparedWeight>(std::move(perSegHits));
 
       BranchlessIndex<int64_t> segIndex(prefix.size());
-      std::vector<faiss::idx_t> ids;
-      std::vector<float> dists;
       std::vector<DocHit> docHits;
       boost::unordered_flat_set<uint64_t> seenDocs;
       size_t maxDocHits = (size_t)std::min(kDocs, cap);
       docHits.reserve(maxDocHits);
       seenDocs.reserve(maxDocHits);
+      FaissFlatVectorEngine engine(*faissIdx, params, prefixSpan, segIndex, vaux->getMetric());
 
       for (;;) {
-        ids.assign((size_t)kReq, (faiss::idx_t)-1);
-        dists.assign((size_t)kReq, 0.0f);
-        faissIdx->search(1, queryPtr, kReq, dists.data(), ids.data(), &params);
+        VectorSearchRequest request{
+          .query = queryPtr,
+          .dims = vaux->getDims(),
+          .candidates = kReq,
+        };
+        VectorSearchResult result = engine.search(request);
 
         docHits.clear();
         seenDocs.clear();
-        int64_t liveHits = 0;
-        for (int64_t i = 0; i < kReq; i++) {
-          faiss::idx_t fid = ids[(size_t)i];
-          if (fid < 0) continue;  // FAISS pad - no more live results
-          liveHits++;
-          int32_t ord = findSeg((int64_t)fid, prefixSpan, segIndex);
-          if (ord < 0) continue;
-          int64_t valueRank = (int64_t)fid - prefix[(size_t)ord];
-          int32_t docId = v2dPerSeg[(size_t)ord].resolve(valueRank);
-          uint64_t key = packSegDoc(ord, docId);
+        for (const auto& hit : result.hits) {
+          int32_t docId = v2dPerSeg[(size_t)hit.segOrd].resolve(hit.valueRank);
+          uint64_t key = packSegDoc(hit.segOrd, docId);
           if (seenDocs.insert(key).second) {
-            // FAISS returns hits in score order, so the first vector seen for
-            // this doc is its best vector.
-            docHits.push_back({ord, docId, scoreFromDist(dists[(size_t)i], vaux->getMetric())});
+            // Flat results are already exact and sorted in score order, so the
+            // first vector seen for this doc is its best vector.  Quantized
+            // engines will rescore and sort before this collapse step.
+            docHits.push_back({hit.segOrd, docId, hit.score});
             if ((int64_t)docHits.size() == kDocs) break;
           }
         }
 
         if ((int64_t)docHits.size() >= kDocs) break;
-        if (liveHits < kReq) break;
+        if (result.poolExhausted && result.breadthExhausted) break;
         if (kReq >= cap) break;
 
         int64_t want = projectedKReq(kReq, kDocs, (int64_t)docHits.size(), cap);
@@ -351,6 +350,59 @@ public:
       unused(target, segment);
       return nullptr;
     }
+
+  private:
+    class FaissFlatVectorEngine final : public VectorEngine {
+      faiss::Index& index;
+      faiss::SearchParameters& params;
+      std::span<const int64_t> prefix;
+      const BranchlessIndex<int64_t>& segIndex;
+      int32_t metric;
+      std::vector<faiss::idx_t> ids;
+      std::vector<float> dists;
+
+    public:
+      FaissFlatVectorEngine(faiss::Index& index,
+                            faiss::SearchParameters& params,
+                            std::span<const int64_t> prefix,
+                            const BranchlessIndex<int64_t>& segIndex,
+                            int32_t metric) noexcept
+        : index(index),
+          params(params),
+          prefix(prefix),
+          segIndex(segIndex),
+          metric(metric) {}
+
+      VectorSearchResult search(const VectorSearchRequest& request) override {
+        assert(request.query != nullptr);
+        assert(request.dims == index.d);
+
+        ids.assign((size_t)request.candidates, (faiss::idx_t)-1);
+        dists.assign((size_t)request.candidates, 0.0f);
+        index.search(1, request.query, request.candidates, dists.data(), ids.data(), &params);
+
+        VectorSearchResult result;
+        result.hits.reserve((size_t)request.candidates);
+        int64_t liveHits = 0;
+        for (int64_t i = 0; i < request.candidates; i++) {
+          faiss::idx_t fid = ids[(size_t)i];
+          if (fid < 0) continue;  // FAISS pad - no more live results.
+          liveHits++;
+          int32_t ord = findSeg((int64_t)fid, prefix, segIndex);
+          if (ord < 0) continue;
+          int64_t valueRank = (int64_t)fid - prefix[(size_t)ord];
+          result.hits.push_back({
+            .score = scoreFromDist(dists[(size_t)i], metric),
+            .segOrd = ord,
+            .valueRank = valueRank,
+          });
+        }
+
+        result.poolExhausted = liveHits < request.candidates || request.candidates >= index.ntotal;
+        result.breadthExhausted = true;
+        return result;
+      }
+    };
   };
 
   class Scorer final : public Query::Scorer {
@@ -393,8 +445,8 @@ private:
   // Convert FAISS's per-metric distance to a "higher is better" score.
   //   L2:    FAISS returns squared distance - invert to 1/(1+d).
   //   IP:    FAISS returns dot product - already higher-is-better.
-  //   COSINE: stored as IP over normalized vectors (builder normalized,
-  //           query is normalized at search time) - same as IP.
+  //   COSINE: stored as IP over normalized vectors (write path or builder),
+  //           query is normalized at search time - same as IP.
   static float scoreFromDist(float dist, int32_t metric) {
     switch (metric) {
       case proto::VectorParams::L2:

@@ -674,10 +674,16 @@ message VectorParams {
   Metric metric = 2;
 
   // Caller asserts that all values for this field are already L2-normalized
-  // (unit length).  Lets the COSINE build path skip the per-build copy +
-  // normalization and add vectors directly to FAISS via inner-product.
-  // No effect on non-COSINE metrics.  Trust-only: not validated at index time.
+  // (unit length).  For COSINE, this disables write-time and build-time
+  // normalization.  No effect on non-COSINE metrics.  Trust-only: not
+  // validated at index time.
   bool normalized = 3;
+
+  // For COSINE fields, normalize vectors before storing them in the column.
+  // If unset, COSINE defaults to true unless normalized is true; other metrics
+  // default to false.  A cosine field rejects zero / near-zero vectors when
+  // normalized is false.
+  bool normalize_on_write = 4;
 }
 
 message SchemaDef {

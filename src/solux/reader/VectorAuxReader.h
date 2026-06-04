@@ -27,8 +27,10 @@ namespace solux {
 /// dims and metric values cached out of AuxIndexInfo.opaque_meta.
 ///
 /// V1 contract (matches VectorIndexBuilder): one file per entry, IndexFlat
-/// {L2,IP}, single-valued vectors only.  The FAISS index is fully
-/// deserialized into process memory, so the source file does not need to
+/// {L2,IP,COSINE}.  Both single- and multi-valued vector fields are supported:
+/// every vector is its own FAISS id, and KnnQuery maps each id back to its
+/// owning doc via the segment's valueRank->docId column.  The FAISS index is
+/// fully deserialized into process memory, so the source file does not need to
 /// outlive the reader.
 class VectorAuxReader : public AuxReader {
   std::string name;
@@ -111,10 +113,15 @@ public:
     // same SIMD distance kernels.
     //
     // Stay-on-disk story for other index types when we add them:
-    //   - HNSW: graph (offsets/neighbors/levels) is in-memory C++ vectors by
-    //     design; random-access traversal would page-fault constantly against
-    //     mmap.  No avoiding the deserialize.  Vectors inside IndexHNSWFlat
-    //     are also in-memory; graph itself is ~10-30% on top of vectors.
+    //   - HNSW: FAISS 1.14.1's IO_FLAG_MMAP_IFC can mmap both the graph
+    //     adjacency (hnsw.neighbors) and the vectors (IndexFlat.codes), copying
+    //     only ~12 B/vector of per-node metadata (levels/offsets) into RAM, so
+    //     the deserialize-into-RAM copy IS avoidable.  The old "HNSW can't mmap"
+    //     belief came from the legacy IO_FLAG_MMAP, which only mapped IVF on-disk
+    //     lists.  Caveat: random-access graph traversal still churns its working
+    //     set under memory pressure (the durable cost is the access pattern, not
+    //     forced residency), so mmap helps HNSW less than it helps the sequential
+    //     IVF / IVF+PQ list scans.
     //   - IVF* (IVFFlat, IVFPQ, ...): FAISS supports OnDiskInvertedLists +
     //     IO_FLAG_MMAP, which keeps the bulk inverted-list data on disk and
     //     only loads centroids/metadata.  Two frictions vs our stack: (1) the
