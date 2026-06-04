@@ -27,6 +27,9 @@ static_assert(sizeof(VectorEngineHit) == 16);
 
 struct VectorSearchResult {
   std::vector<VectorEngineHit> hits;
+  // False means hit.score is only an engine approximation; the host must
+  // rescore from full-precision column vectors before sorting / doc collapse.
+  bool scoresAreExact = false;
   bool poolExhausted = false;
   bool breadthExhausted = true;
   int32_t nextBreadth = 0;

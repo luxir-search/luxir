@@ -1,12 +1,16 @@
 #include <gtest/gtest.h>
 
+#include <algorithm>
+#include <cmath>
 #include <map>
+#include <memory>
 #include <set>
 #include <string>
 #include <vector>
 
 #include "protos/solux_types.pb.h"
 #include "solux/query/KnnQuery.h"
+#include "solux/query/VectorEngine.h"
 #include "solux/schema/Schema.h"
 #include "solux/server/SoluxNode.h"
 #include "test/CollectionHelper.h"
@@ -17,6 +21,76 @@
 using namespace solux;
 using namespace solux::test;
 
+// Test engines wrapping the production flat engine via
+// KnnQuery::engineWrapperForTests.  Real VectorEngine implementations (scores
+// come from real searches over the real index), reshaped into result patterns
+// future engines will produce, so the host deepen loop's union / rescore /
+// sort / collapse logic is exercised without an IVF build.
+
+// IVF-flat shape: exact scores, breadth-limited search.  Splits the index into
+// two "lists" by valueRank (< split -> list 0); breadth 0 or 1 probes list 0
+// only, breadth >= 2 probes both.  A breadth round can therefore surface hits
+// that interleave in score with candidates absorbed earlier.  Single-segment
+// only (valueRank is used as the shard-global rank).
+class BreadthSplitEngine final : public VectorEngine {
+  VectorEngine& inner;
+  int64_t ntotal;
+  int64_t split;
+
+public:
+  BreadthSplitEngine(VectorEngine& inner, int64_t ntotal, int64_t split) noexcept
+    : inner(inner), ntotal(ntotal), split(split) {}
+
+  VectorSearchResult search(const VectorSearchRequest& request) override {
+    VectorSearchRequest full = request;
+    full.candidates = ntotal;
+    VectorSearchResult all = inner.search(full);  // exact, score-desc, domain-filtered
+
+    int32_t probedLists = request.breadth <= 1 ? 1 : 2;
+    VectorSearchResult result;
+    int64_t regionLive = 0;
+    for (const auto& hit : all.hits) {
+      if (probedLists < 2 && hit.valueRank >= split) continue;
+      regionLive++;
+      if ((int64_t)result.hits.size() < request.candidates) result.hits.push_back(hit);
+    }
+    result.scoresAreExact = true;
+    result.poolExhausted = (int64_t)result.hits.size() < request.candidates
+                           || request.candidates >= regionLive;
+    result.breadthExhausted = probedLists >= 2;
+    result.nextBreadth = 2;
+    return result;
+  }
+};
+
+// PQ shape: approximate scores.  Quantizes each exact score down to a coarse
+// half-unit bucket and inverts the order within each bucket (ascending true
+// score), then marks the result approximate.  Any host path that trusts the
+// engine order or skips the full-precision column rescore returns wrong
+// docs / scores.
+class QuantizingEngine final : public VectorEngine {
+  VectorEngine& inner;
+
+public:
+  explicit QuantizingEngine(VectorEngine& inner) noexcept : inner(inner) {}
+
+  VectorSearchResult search(const VectorSearchRequest& request) override {
+    VectorSearchResult result = inner.search(request);
+    for (auto& hit : result.hits) {
+      hit.score = std::floor(hit.score * 2.0f) / 2.0f;
+    }
+    // Reverse then stable-sort by bucket: still engine-score-desc as the
+    // contract requires, but ascending-by-exact-score within each bucket.
+    std::reverse(result.hits.begin(), result.hits.end());
+    std::stable_sort(result.hits.begin(), result.hits.end(),
+                     [](const VectorEngineHit& a, const VectorEngineHit& b) {
+                       return a.score > b.score;
+                     });
+    result.scoresAreExact = false;
+    return result;
+  }
+};
+
 class KnnQueryTest : public SoluxTest {
 protected:
   struct MaxKnnCandidatesGuard {
@@ -26,6 +100,16 @@ protected:
     }
     ~MaxKnnCandidatesGuard() {
       KnnQuery::maxKnnCandidates = saved;
+    }
+  };
+
+  struct EngineWrapperGuard {
+    explicit EngineWrapperGuard(
+        std::function<std::unique_ptr<VectorEngine>(VectorEngine&, int64_t)> f) {
+      KnnQuery::engineWrapperForTests = std::move(f);
+    }
+    ~EngineWrapperGuard() {
+      KnnQuery::engineWrapperForTests = nullptr;
     }
   };
 
@@ -43,6 +127,21 @@ protected:
     f->set_abstract(true);
     f->set_column_stored(true);
     f->mutable_vector()->set_metric(metric);
+    auto base = col.getSchema();
+    col.setSchema(Schema::fromProto(def, base.get()));
+  }
+
+  // Install a schema where _v is a COSINE vector field that stores RAW
+  // (unnormalized) vectors in the column - the normalize-on-rescore mode.
+  static void installVecSchemaCosineRaw(Collection& col) {
+    proto::SchemaDef def;
+    auto* f = def.add_fields();
+    f->set_name("_v");
+    f->set_field_class(proto::FieldDef::VECTOR);
+    f->set_abstract(true);
+    f->set_column_stored(true);
+    f->mutable_vector()->set_metric(proto::VectorParams::COSINE);
+    f->mutable_vector()->set_normalize_on_write(false);
     auto base = col.getSchema();
     col.setSchema(Schema::fromProto(def, base.get()));
   }
@@ -928,6 +1027,143 @@ TEST_F(KnnQueryTest, l2Scores) {
   EXPECT_NEAR(scores[1], 0.5f, 1e-5);
   EXPECT_EQ(ids[2], "two");
   EXPECT_NEAR(scores[2], 0.2f, 1e-5);
+
+  req->done();
+}
+
+// Drives the host deepen loop through breadth rounds with an exact-score
+// engine (the IVF-flat shape).  The candidate pool must stay sorted across a
+// breadth change INCLUDING a later depth round at the same breadth: doc x's
+// low vector (0.1, list 0) is absorbed in round 1, x's best vector (0.5,
+// list 1) only arrives in the final depth round, after the pool already mixed
+// breadths.  Collapsing an unsorted pool would score x at 0.1 and rank it
+// last instead of third.
+TEST_F(KnnQueryTest, breadthRoundsKeepCandidatePoolSorted) {
+  EngineWrapperGuard guard([](VectorEngine& flat, int64_t ntotal) {
+    return std::make_unique<BreadthSplitEngine>(flat, ntotal, 7);
+  });
+  CollectionHelper h("main");
+  h.clear();
+  installMultiVecSchema(h.collection(), proto::VectorParams::IP);
+
+  // valueRanks 0-5 (list 0): a's six vectors.  rank 6 (list 0): x's low
+  // vector.  rank 7 (list 1): x's high vector.  ranks 8-11: h's four.
+  // ranks 12-17: one filler vector per doc f1..f6.  18 vectors over 9 docs
+  // keeps avgMult=2, so k=4 starts at kReq=8 and the loop runs:
+  //   round 1 breadth 0: all 7 list-0 vectors (a's six + x@0.1), pool drained
+  //   round 2 breadth 2: top-8 = a+h vectors only -> 3 docs, deepen kReq to 14
+  //   round 3 breadth 2: appends x@0.5 + three fillers at the SAME breadth -
+  //     the mixed pool must still be sorted before collapse.
+  h.index(flatdoc("id", std::string("a"), "emb_vs",
+                  std::vector<std::vector<float>>{{0.95f, 0}, {0.9f, 0}, {0.85f, 0},
+                                                  {0.8f, 0}, {0.75f, 0}, {0.7f, 0}}));
+  h.index(flatdoc("id", std::string("x"), "emb_vs",
+                  std::vector<std::vector<float>>{{0.1f, 0}, {0.5f, 0}}));
+  h.index(flatdoc("id", std::string("h"), "emb_vs",
+                  std::vector<std::vector<float>>{{0.93f, 0}, {0.88f, 0},
+                                                  {0.83f, 0}, {0.78f, 0}}));
+  for (int i = 1; i <= 6; i++) {
+    h.index(flatdoc("id", "f" + std::to_string(i), "emb_vs",
+                    std::vector<std::vector<float>>{{0.46f - i * 0.01f, 0}}));
+  }
+  h.commit({"*"});
+
+  auto* req = makeKnnReq(*soluxNode, "emb_vs", {1, 0}, 4);
+  req->execute();
+
+  EXPECT_EQ(req->getMatchCount(), 4);
+  auto ids = resultIds(*req);
+  auto scores = resultScores(*req);
+  ASSERT_EQ(ids.size(), 4u);
+  EXPECT_EQ(ids[0], "a");
+  EXPECT_EQ(ids[1], "h");
+  EXPECT_EQ(ids[2], "x");  // its 0.5 vector, not the 0.1 straggler
+  EXPECT_EQ(ids[3], "f1");
+  ASSERT_EQ(scores.size(), 4u);
+  EXPECT_NEAR(scores[0], 0.95f, 1e-5);
+  EXPECT_NEAR(scores[1], 0.93f, 1e-5);
+  EXPECT_NEAR(scores[2], 0.5f, 1e-5);
+  EXPECT_NEAR(scores[3], 0.45f, 1e-5);
+
+  req->done();
+}
+
+// An approximate engine (the PQ shape: scores bucketed, order inverted within
+// each bucket) must be corrected by the host: rescore appended candidates
+// from the full-precision column, sort, then collapse.  Without the rescore
+// the inverted order collapses to the wrong docs (a, d, c) at bucket scores.
+TEST_F(KnnQueryTest, approximateScoresRescoredFromColumn) {
+  EngineWrapperGuard guard([](VectorEngine& flat, int64_t) {
+    return std::make_unique<QuantizingEngine>(flat);
+  });
+  CollectionHelper h("main");
+  h.clear();
+  installMultiVecSchema(h.collection(), proto::VectorParams::L2);
+
+  h.index(flatdoc("id", std::string("a"), "emb_vs",
+                  std::vector<std::vector<float>>{{1, 0, 0}, {0.99f, 0, 0}, {0.98f, 0, 0}}));
+  h.index(flatdoc("id", std::string("b"), "emb_vs",
+                  std::vector<std::vector<float>>{{0.5f, 0, 0}}));
+  h.index(flatdoc("id", std::string("c"), "emb_vs",
+                  std::vector<std::vector<float>>{{0.4f, 0, 0}}));
+  h.index(flatdoc("id", std::string("d"), "emb_vs",
+                  std::vector<std::vector<float>>{{0.3f, 0, 0}}));
+  h.commit({"*"});
+
+  auto* req = makeKnnReq(*soluxNode, "emb_vs", {1, 0, 0}, 3);
+  req->execute();
+
+  EXPECT_EQ(req->getMatchCount(), 3);
+  auto ids = resultIds(*req);
+  auto scores = resultScores(*req);
+  ASSERT_EQ(ids.size(), 3u);
+  EXPECT_EQ(ids[0], "a");
+  EXPECT_EQ(ids[1], "b");
+  EXPECT_EQ(ids[2], "c");
+  ASSERT_EQ(scores.size(), 3u);
+  EXPECT_NEAR(scores[0], 1.0f, 1e-5);          // d^2 = 0
+  EXPECT_NEAR(scores[1], 1.0f / 1.25f, 1e-5);  // d^2 = 0.25
+  EXPECT_NEAR(scores[2], 1.0f / 1.36f, 1e-5);  // d^2 = 0.36
+
+  req->done();
+}
+
+// COSINE with normalize_on_write=false stores RAW vectors in the column, so
+// the rescore path must renormalize each candidate on the fly (the persisted
+// cosineNormalizeColumnOnRescore policy).  The quantizing wrapper forces a
+// rescore; correct cosine order AND scores prove the raw-column normalization
+// ran (without it, rescore would return raw dot products like 5.0).
+TEST_F(KnnQueryTest, cosineRawColumnRescoreNormalizes) {
+  EngineWrapperGuard guard([](VectorEngine& flat, int64_t) {
+    return std::make_unique<QuantizingEngine>(flat);
+  });
+  CollectionHelper h("main");
+  h.clear();
+  installVecSchemaCosineRaw(h.collection());
+
+  // Raw (non-unit) vectors with distinct cosines vs the +x query direction:
+  //   east (5,0,0) -> 1.0,  c (4,3,0) -> 0.8,  b (3,4,0) -> 0.6
+  // 0.8 and 0.6 land in the same quantization bucket (0.5) and arrive
+  // inverted; only a normalize-on-rescore from the raw column restores c
+  // ahead of b.
+  h.index(flatdoc("id", std::string("east"), "embedding_v", std::vector<float>{5, 0, 0}));
+  h.index(flatdoc("id", std::string("b"), "embedding_v", std::vector<float>{3, 4, 0}));
+  h.index(flatdoc("id", std::string("c"), "embedding_v", std::vector<float>{4, 3, 0}));
+  h.commit({"*"});
+
+  auto* req = makeKnnReq(*soluxNode, "embedding_v", {7, 0, 0}, 3);
+  req->execute();
+
+  auto ids = resultIds(*req);
+  auto scores = resultScores(*req);
+  ASSERT_EQ(ids.size(), 3u);
+  EXPECT_EQ(ids[0], "east");
+  EXPECT_EQ(ids[1], "c");
+  EXPECT_EQ(ids[2], "b");
+  ASSERT_EQ(scores.size(), 3u);
+  EXPECT_NEAR(scores[0], 1.0f, 1e-5);
+  EXPECT_NEAR(scores[1], 0.8f, 1e-5);
+  EXPECT_NEAR(scores[2], 0.6f, 1e-5);
 
   req->done();
 }

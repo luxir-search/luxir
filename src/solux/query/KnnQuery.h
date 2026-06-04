@@ -9,6 +9,8 @@
 #include <cmath>
 #include <cstdint>
 #include <format>
+#include <functional>
+#include <memory>
 #include <optional>
 #include <span>
 #include <stdexcept>
@@ -70,6 +72,17 @@ public:
   // Mutable so tests can shrink it to exercise the best-effort cap path.
   static inline int64_t maxKnnCandidates = 1000000;
 
+  // Maximum recall breadth a non-flat engine can request while deepening.
+  // Flat ignores breadth; this is a host safety cap for future engines.
+  static inline int32_t maxKnnBreadth = 1000000;
+
+  // Test seam: when set, prepare() wraps the production flat engine and runs
+  // the host deepen loop against the wrapper instead.  Lets tests drive the
+  // loop with non-flat engine behaviors (breadth rounds, approximate scores)
+  // that no production engine exhibits yet.  Always null in production.
+  static inline std::function<std::unique_ptr<VectorEngine>(VectorEngine& flat, int64_t ntotal)>
+      engineWrapperForTests;
+
   /// Resolves a segment-local value rank to its owning docId.  Exactly one mode is
   /// active per segment:
   ///   - mono   : multi-valued reverse map (valueRank -> docId), read off the column.
@@ -95,6 +108,30 @@ public:
     int32_t segOrd;
     int32_t docId;
     float score;
+  };
+
+  struct VectorKey {
+    int32_t segOrd;
+    int64_t valueRank;
+  };
+
+  struct VectorKeyHash {
+    size_t operator()(const VectorKey& key) const noexcept {
+      uint64_t x = (uint64_t)(uint32_t)key.segOrd;
+      uint64_t y = (uint64_t)key.valueRank;
+      y ^= y >> 33;
+      y *= 0xff51afd7ed558ccdULL;
+      y ^= y >> 33;
+      y *= 0xc4ceb9fe1a85ec53ULL;
+      y ^= y >> 33;
+      return (size_t)(y ^ (x * 0x9e3779b97f4a7c15ULL));
+    }
+  };
+
+  struct VectorKeyEqual {
+    bool operator()(const VectorKey& a, const VectorKey& b) const noexcept {
+      return a.segOrd == b.segOrd && a.valueRank == b.valueRank;
+    }
   };
 
   KnnQuery(std::string_view field, std::span<const float> queryVec, int32_t k)
@@ -285,41 +322,97 @@ public:
       if (kReq <= 0) return std::make_unique<KnnPreparedWeight>(std::move(perSegHits));
 
       BranchlessIndex<int64_t> segIndex(prefix.size());
+      std::vector<VectorEngineHit> candidateHits;
+      boost::unordered_flat_set<VectorKey, VectorKeyHash, VectorKeyEqual> seenVectors;
       std::vector<DocHit> docHits;
       boost::unordered_flat_set<uint64_t> seenDocs;
       size_t maxDocHits = (size_t)std::min(kDocs, cap);
+      size_t maxVectorHits = (size_t)cap;
+      candidateHits.reserve((size_t)std::min(kReq, cap));
+      seenVectors.reserve((size_t)std::min(kReq, cap));
       docHits.reserve(maxDocHits);
       seenDocs.reserve(maxDocHits);
-      FaissFlatVectorEngine engine(*faissIdx, params, prefixSpan, segIndex, vaux->getMetric());
+      FaissFlatVectorEngine flatEngine(*faissIdx, params, prefixSpan, segIndex, vaux->getMetric());
+      VectorEngine* engine = &flatEngine;
+      std::unique_ptr<VectorEngine> wrapperEngine;
+      if (engineWrapperForTests) {
+        wrapperEngine = engineWrapperForTests(flatEngine, ntotal);
+        engine = wrapperEngine.get();
+      }
 
+      int32_t breadth = 0;
+      int32_t lastAbsorbedBreadth = -1;
+      int32_t maxBreadth = std::max(0, maxKnnBreadth);
+      bool poolMixedBreadth = false;
+      bool candidatePoolSorted = true;
       for (;;) {
         VectorSearchRequest request{
           .query = queryPtr,
           .dims = vaux->getDims(),
           .candidates = kReq,
+          .breadth = breadth,
         };
-        VectorSearchResult result = engine.search(request);
+        VectorSearchResult result = engine->search(request);
 
-        docHits.clear();
-        seenDocs.clear();
+        size_t appendStart = candidateHits.size();
         for (const auto& hit : result.hits) {
-          int32_t docId = v2dPerSeg[(size_t)hit.segOrd].resolve(hit.valueRank);
-          uint64_t key = packSegDoc(hit.segOrd, docId);
-          if (seenDocs.insert(key).second) {
-            // Flat results are already exact and sorted in score order, so the
-            // first vector seen for this doc is its best vector.  Quantized
-            // engines will rescore and sort before this collapse step.
-            docHits.push_back({hit.segOrd, docId, hit.score});
-            if ((int64_t)docHits.size() == kDocs) break;
+          if (candidateHits.size() >= maxVectorHits) break;
+          VectorKey key{hit.segOrd, hit.valueRank};
+          if (seenVectors.insert(key).second) {
+            candidateHits.push_back(hit);
           }
         }
+        bool appended = candidateHits.size() != appendStart;
+        if (appended) {
+          // Once the pool holds hits absorbed at two different breadths, the
+          // prefix-extension invariant is gone for good: a later same-breadth
+          // depth round appends hits bounded by the latest round's tail, but
+          // not by older low-score hits from a narrower breadth still sitting
+          // in the pool.  So mixed-breadth is sticky and every later append
+          // forces a sort.
+          if (lastAbsorbedBreadth >= 0 && request.breadth != lastAbsorbedBreadth) {
+            poolMixedBreadth = true;
+          }
+          if (poolMixedBreadth) candidatePoolSorted = false;
+          lastAbsorbedBreadth = request.breadth;
+        }
+
+        // Flat results are exact and each deeper flat request is a sorted
+        // prefix extension, so candidateHits stays score-sorted without work.
+        // Exact engines that broaden search (e.g. IVF-flat) can append hits
+        // that interleave with the existing pool, and approximate engines must
+        // rescore appended hits before sorting / doc collapse.
+        if (!result.scoresAreExact && appended) {
+          rescoreCandidates(std::span<VectorEngineHit>(candidateHits.data() + appendStart,
+                                                       candidateHits.size() - appendStart),
+                            reader,
+                            std::span<SegFieldInfo* const>(segInfos.data(), segInfos.size()),
+                            queryPtr, vaux->getDims(), vaux->getMetric(),
+                            vaux->shouldNormalizeColumnOnCosineRescore());
+          candidatePoolSorted = false;
+        }
+        if (!candidatePoolSorted) {
+          sortCandidatesByScore(candidateHits);
+          candidatePoolSorted = true;
+        }
+        collapseCandidates(candidateHits, v2dSpan, kDocs, docHits, seenDocs);
 
         if ((int64_t)docHits.size() >= kDocs) break;
-        if (result.poolExhausted && result.breadthExhausted) break;
-        if (kReq >= cap) break;
+        if (candidateHits.size() >= maxVectorHits) break;
 
-        int64_t want = projectedKReq(kReq, kDocs, (int64_t)docHits.size(), cap);
-        kReq = std::min(cap, std::max(kReq + 1, want));
+        if (!result.poolExhausted && kReq < cap) {
+          int64_t want = projectedKReq(kReq, kDocs, (int64_t)docHits.size(), cap);
+          kReq = std::min(cap, std::max(kReq + 1, want));
+          continue;
+        }
+
+        if (result.poolExhausted && !result.breadthExhausted && breadth < maxBreadth) {
+          int32_t nextBreadth = result.nextBreadth > breadth ? result.nextBreadth : breadth + 1;
+          breadth = std::min(nextBreadth, maxBreadth);
+          continue;
+        }
+
+        break;
       }
 
       if ((int64_t)docHits.size() < kDocs && cap < ntotal) {
@@ -398,6 +491,7 @@ public:
           });
         }
 
+        result.scoresAreExact = true;
         result.poolExhausted = liveHits < request.candidates || request.candidates >= index.ntotal;
         result.breadthExhausted = true;
         return result;
@@ -442,6 +536,100 @@ public:
   };
 
 private:
+  static constexpr double MIN_COSINE_NORM_SQ = 1.0e-30;
+
+  static void rescoreCandidates(std::span<VectorEngineHit> candidates,
+                                IndexReader& reader,
+                                std::span<SegFieldInfo* const> segInfos,
+                                const float* queryPtr,
+                                int32_t dims,
+                                int32_t metric,
+                                bool normalizeColumnOnCosineRescore) {
+    std::vector<std::optional<VectorReader>> vectorReaders(segInfos.size());
+    for (auto& candidate : candidates) {
+      if (candidate.segOrd < 0 || (size_t)candidate.segOrd >= segInfos.size()) {
+        throw std::runtime_error("KnnQuery: vector candidate segment ordinal out of range");
+      }
+      SegFieldInfo* info = segInfos[(size_t)candidate.segOrd];
+      if (info == nullptr) {
+        throw std::runtime_error("KnnQuery: vector candidate segment has no field info");
+      }
+      auto& vr = vectorReaders[(size_t)candidate.segOrd];
+      if (!vr) {
+        vr.emplace(reader.segments()[(size_t)candidate.segOrd].postingsReader(), *info);
+      }
+      candidate.score = exactScore(queryPtr, vr->vectorAtRank(candidate.valueRank),
+                                   dims, metric, normalizeColumnOnCosineRescore,
+                                   candidate.score);
+    }
+  }
+
+  // Keep L2/IP conversions in sync with scoreFromDist below.  COSINE has a
+  // separate stored-vector norm branch for raw-column rescore mode.
+  static float exactScore(const float* queryPtr,
+                          std::span<const float> vec,
+                          int32_t dims,
+                          int32_t metric,
+                          bool normalizeColumnOnCosineRescore,
+                          float fallbackScore) {
+    assert(queryPtr != nullptr);
+    assert((int32_t)vec.size() == dims);
+    double sum = 0.0;
+    switch (metric) {
+      case proto::VectorParams::L2:
+        for (int32_t i = 0; i < dims; i++) {
+          double d = (double)queryPtr[i] - (double)vec[(size_t)i];
+          sum += d * d;
+        }
+        return 1.0f / (1.0f + (float)sum);
+      case proto::VectorParams::IP:
+        for (int32_t i = 0; i < dims; i++) {
+          sum += (double)queryPtr[i] * (double)vec[(size_t)i];
+        }
+        return (float)sum;
+      case proto::VectorParams::COSINE: {
+        for (int32_t i = 0; i < dims; i++) {
+          sum += (double)queryPtr[i] * (double)vec[(size_t)i];
+        }
+        if (!normalizeColumnOnCosineRescore) return (float)sum;
+
+        double normSq = 0.0;
+        for (int32_t i = 0; i < dims; i++) {
+          double v = (double)vec[(size_t)i];
+          normSq += v * v;
+        }
+        if (!std::isfinite(normSq) || normSq <= MIN_COSINE_NORM_SQ) return 0.0f;
+        return (float)(sum / std::sqrt(normSq));
+      }
+      default:
+        return fallbackScore;
+    }
+  }
+
+  static void sortCandidatesByScore(std::vector<VectorEngineHit>& candidates) {
+    std::stable_sort(candidates.begin(), candidates.end(),
+        [](const VectorEngineHit& a, const VectorEngineHit& b) {
+          return a.score > b.score;
+        });
+  }
+
+  static void collapseCandidates(const std::vector<VectorEngineHit>& candidates,
+                                 std::span<const SegV2D> v2dPerSeg,
+                                 int64_t kDocs,
+                                 std::vector<DocHit>& docHits,
+                                 boost::unordered_flat_set<uint64_t>& seenDocs) {
+    docHits.clear();
+    seenDocs.clear();
+    for (const auto& hit : candidates) {
+      int32_t docId = v2dPerSeg[(size_t)hit.segOrd].resolve(hit.valueRank);
+      uint64_t key = packSegDoc(hit.segOrd, docId);
+      if (seenDocs.insert(key).second) {
+        docHits.push_back({hit.segOrd, docId, hit.score});
+        if ((int64_t)docHits.size() == kDocs) break;
+      }
+    }
+  }
+
   // Convert FAISS's per-metric distance to a "higher is better" score.
   //   L2:    FAISS returns squared distance - invert to 1/(1+d).
   //   IP:    FAISS returns dot product - already higher-is-better.

@@ -40,6 +40,7 @@ class VectorAuxReader : public AuxReader {
 
   // Raw int from proto::VectorParams::Metric (recorded in opaque_meta at build).
   int32_t metric;
+  bool cosineNormalizeColumnOnRescore;
 
 public:
   static constexpr std::string_view KIND = "vector_faiss";
@@ -47,16 +48,21 @@ public:
   VectorAuxReader(std::string name, std::string field,
                   uint64_t gen, uint64_t builtCoreGen,
                   std::unique_ptr<faiss::Index> idx,
-                  int32_t dims, int32_t metric) noexcept
+                  int32_t dims, int32_t metric,
+                  bool cosineNormalizeColumnOnRescore) noexcept
     : AuxReader(gen, builtCoreGen),
       name(std::move(name)), field(std::move(field)),
-      faissIndex(std::move(idx)), dims(dims), metric(metric) {}
+      faissIndex(std::move(idx)), dims(dims), metric(metric),
+      cosineNormalizeColumnOnRescore(cosineNormalizeColumnOnRescore) {}
 
   std::string_view getKind() const override { return KIND; }
   std::string_view getName() const override { return name; }
   std::string_view getField() const noexcept { return field; }
   int32_t getDims() const noexcept { return dims; }
   int32_t getMetric() const noexcept { return metric; }
+  bool shouldNormalizeColumnOnCosineRescore() const noexcept {
+    return cosineNormalizeColumnOnRescore;
+  }
 
   // Search-time entry point.  faiss::Index::search is thread-safe for
   // concurrent readers.
@@ -90,14 +96,20 @@ public:
         std::make_error_code(std::errc::no_such_file_or_directory));
     }
 
-    // Decode opaque_meta produced by VectorIndexBuilder: int32 dims, int32 metric.
+    // Decode opaque_meta produced by VectorIndexBuilder:
+    //   int32 dims, int32 metric, int32 cosineNormalizeColumnOnRescore.
     // Older entries without opaque_meta still work - we fall back to idx->d for
-    // dims and report metric=0 (unknown).
+    // dims, report metric=0 (unknown), and assume no cosine column rescore norm.
     int32_t dimsMeta = 0;
     int32_t metricMeta = 0;
+    int32_t cosineNormalizeColumnOnRescoreMeta = 0;
     if (info.opaque_meta().size() >= 2 * sizeof(int32_t)) {
       std::memcpy(&dimsMeta, info.opaque_meta().data(), sizeof(int32_t));
       std::memcpy(&metricMeta, info.opaque_meta().data() + sizeof(int32_t), sizeof(int32_t));
+    }
+    if (info.opaque_meta().size() >= 3 * sizeof(int32_t)) {
+      std::memcpy(&cosineNormalizeColumnOnRescoreMeta,
+                  info.opaque_meta().data() + 2 * sizeof(int32_t), sizeof(int32_t));
     }
 
     auto bytes = file->read();
@@ -151,7 +163,7 @@ public:
     return std::make_shared<VectorAuxReader>(
       std::string(info.name()), std::string(info.field()),
       info.gen(), info.built_core_gen(),
-      std::move(idx), dims, metricMeta);
+      std::move(idx), dims, metricMeta, cosineNormalizeColumnOnRescoreMeta != 0);
   }
 
 private:

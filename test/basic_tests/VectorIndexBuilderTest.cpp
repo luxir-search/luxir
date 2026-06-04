@@ -61,6 +61,24 @@ std::unique_ptr<faiss::Index> readFaissIndex(Directory& dir, std::string_view fn
   return std::unique_ptr<faiss::Index>(faiss::read_index(&r));
 }
 
+struct VectorAuxMeta {
+  int32_t dims;
+  int32_t metric;
+  int32_t cosineNormalizeColumnOnRescore;
+};
+
+VectorAuxMeta readVectorAuxMeta(const proto::AuxIndexInfo& aux) {
+  VectorAuxMeta meta{};
+  EXPECT_EQ(aux.opaque_meta().size(), sizeof(int32_t) * 3);
+  if (aux.opaque_meta().size() >= sizeof(int32_t) * 3) {
+    std::memcpy(&meta.dims, aux.opaque_meta().data(), sizeof(int32_t));
+    std::memcpy(&meta.metric, aux.opaque_meta().data() + sizeof(int32_t), sizeof(int32_t));
+    std::memcpy(&meta.cosineNormalizeColumnOnRescore,
+                aux.opaque_meta().data() + 2 * sizeof(int32_t), sizeof(int32_t));
+  }
+  return meta;
+}
+
 // Install a schema where _v has metric=L2.
 void enableL2OnVecSuffix(Collection& col) {
   proto::SchemaDef def;
@@ -170,13 +188,11 @@ TEST_F(VectorIndexBuilderTest, buildAcrossMultipleSegments) {
   EXPECT_EQ(idx->d, 3);
   EXPECT_EQ(idx->ntotal, 9);
 
-  // opaque_meta carries dims + metric (read-side fast check).
-  ASSERT_EQ(aux.opaque_meta().size(), 8u);
-  int32_t fileDims, fileMetric;
-  std::memcpy(&fileDims, aux.opaque_meta().data(), 4);
-  std::memcpy(&fileMetric, aux.opaque_meta().data() + 4, 4);
-  EXPECT_EQ(fileDims, 3);
-  EXPECT_EQ(fileMetric, (int32_t)proto::VectorParams::L2);
+  // opaque_meta carries dims + metric + cosine rescore policy.
+  auto meta = readVectorAuxMeta(aux);
+  EXPECT_EQ(meta.dims, 3);
+  EXPECT_EQ(meta.metric, (int32_t)proto::VectorParams::L2);
+  EXPECT_EQ(meta.cosineNormalizeColumnOnRescore, 0);
 }
 
 // Selector miss: name doesn't match any field -> no aux index built.
@@ -327,6 +343,8 @@ TEST_F(VectorIndexBuilderTest, cosineNormalizeOnWriteBuildsInnerProductIndex) {
   google::protobuf::Arena arena;
   auto* info = readIndexInfo(h.getIndexWriter()->dir, arena);
   ASSERT_EQ(1, info->aux_indexes_size());
+  auto meta = readVectorAuxMeta(info->aux_indexes(0));
+  EXPECT_EQ(meta.cosineNormalizeColumnOnRescore, 0);
   auto idx = readFaissIndex(h.getIndexWriter()->dir, info->aux_indexes(0).files(0));
   EXPECT_EQ(idx->metric_type, faiss::METRIC_INNER_PRODUCT);
 
@@ -368,6 +386,8 @@ TEST_F(VectorIndexBuilderTest, normalizedFlagSkipsRenorm) {
   google::protobuf::Arena arena;
   auto* info = readIndexInfo(h.getIndexWriter()->dir, arena);
   ASSERT_EQ(1, info->aux_indexes_size());
+  auto meta = readVectorAuxMeta(info->aux_indexes(0));
+  EXPECT_EQ(meta.cosineNormalizeColumnOnRescore, 0);
   auto idx = readFaissIndex(h.getIndexWriter()->dir, info->aux_indexes(0).files(0));
   EXPECT_EQ(idx->ntotal, 2);
 
@@ -451,6 +471,8 @@ TEST_F(VectorIndexBuilderTest, cosineRenormChunkBoundaries) {
   google::protobuf::Arena arena;
   auto* info = readIndexInfo(h.getIndexWriter()->dir, arena);
   ASSERT_EQ(1, info->aux_indexes_size());
+  auto meta = readVectorAuxMeta(info->aux_indexes(0));
+  EXPECT_EQ(meta.cosineNormalizeColumnOnRescore, 1);
   auto idx = readFaissIndex(h.getIndexWriter()->dir, info->aux_indexes(0).files(0));
   ASSERT_EQ(idx->ntotal, (faiss::idx_t)vecs.size());
 

@@ -234,13 +234,16 @@ VectorIndexBuilder::buildField(std::string_view fieldName,
   // future commits can invalidate this entry when segments merge/split.
   info.set_built_core_gen(coreGen_);
   info.add_files(faissFile);
-  // opaque_meta: pack {dims, metric} for cheap read-side checks.  ntotal is
-  // available from the FAISS index itself.  Layout: int32 dims, int32 metric.
+  // opaque_meta: pack {dims, metric, cosineNormalizeColumnOnRescore} for cheap
+  // read-side checks.  ntotal is available from the FAISS index itself.
   std::string meta;
-  meta.resize(sizeof(int32_t) * 2);
+  meta.resize(sizeof(int32_t) * 3);
   std::memcpy(meta.data(), &dims, sizeof(int32_t));
   int32_t metricInt = (int32_t)ft.metric_;
   std::memcpy(meta.data() + sizeof(int32_t), &metricInt, sizeof(int32_t));
+  int32_t cosineNormalizeColumnOnRescore =
+      (ft.metric_ == VectorFieldType::METRIC_COSINE && !ft.normalized_ && !ft.normalizeOnWrite_) ? 1 : 0;
+  std::memcpy(meta.data() + 2 * sizeof(int32_t), &cosineNormalizeColumnOnRescore, sizeof(int32_t));
   info.set_opaque_meta(std::move(meta));
 
   LOG_TRACE("VectorIndexBuilder: built {} ntotal={} dims={} metric={} file={}",

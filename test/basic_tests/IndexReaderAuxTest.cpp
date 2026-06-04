@@ -42,6 +42,19 @@ protected:
     auto base = col.getSchema();
     col.setSchema(Schema::fromProto(def, base.get()));
   }
+
+  static void enableCosineOnVecSuffix(Collection& col, bool normalizeOnWrite) {
+    proto::SchemaDef def;
+    auto* f = def.add_fields();
+    f->set_name("_v");
+    f->set_field_class(proto::FieldDef::VECTOR);
+    f->set_abstract(true);
+    f->set_column_stored(true);
+    f->mutable_vector()->set_metric(proto::VectorParams::COSINE);
+    f->mutable_vector()->set_normalize_on_write(normalizeOnWrite);
+    auto base = col.getSchema();
+    col.setSchema(Schema::fromProto(def, base.get()));
+  }
 };
 
 // Minimal happy path: build an aux index, open an IndexReader, and verify the
@@ -75,6 +88,7 @@ TEST_F(IndexReaderAuxTest, opensVectorAuxAfterBuild) {
   EXPECT_EQ(vaux->getField(), "embedding_v");
   EXPECT_EQ(vaux->getDims(), 4);
   EXPECT_EQ(vaux->getMetric(), (int32_t)proto::VectorParams::L2);
+  EXPECT_FALSE(vaux->shouldNormalizeColumnOnCosineRescore());
 
   auto* idx = vaux->getFaissIndex();
   ASSERT_NE(idx, nullptr);
@@ -88,6 +102,23 @@ TEST_F(IndexReaderAuxTest, opensVectorAuxAfterBuild) {
   idx->search(1, vecs[0].data(), 1, dists.data(), ids.data());
   EXPECT_EQ(ids[0], 0);
   EXPECT_FLOAT_EQ(dists[0], 0.0f);
+}
+
+TEST_F(IndexReaderAuxTest, cosineRawColumnSetsRescorePolicy) {
+  CollectionHelper h("main");
+  h.clear();
+  enableCosineOnVecSuffix(h.collection(), false);
+
+  h.index(flatdoc("id", std::string("a"), "embedding_v", std::vector<float>{2, 0, 0}));
+  h.commit({"*"});
+
+  auto reader = std::make_shared<IndexReader>(h.getIndexWriter()->dir);
+  auto aux = reader->getAuxReader("vec.embedding_v");
+  ASSERT_NE(aux, nullptr);
+  auto* vaux = dynamic_cast<VectorAuxReader*>(aux.get());
+  ASSERT_NE(vaux, nullptr);
+  EXPECT_EQ(vaux->getMetric(), (int32_t)proto::VectorParams::COSINE);
+  EXPECT_TRUE(vaux->shouldNormalizeColumnOnCosineRescore());
 }
 
 // No aux entries -> reader has no aux readers (default schema, no metric).

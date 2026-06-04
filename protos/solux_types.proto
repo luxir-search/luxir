@@ -681,8 +681,8 @@ message VectorParams {
 
   // For COSINE fields, normalize vectors before storing them in the column.
   // If unset, COSINE defaults to true unless normalized is true; other metrics
-  // default to false.  A cosine field rejects zero / near-zero vectors when
-  // normalized is false.
+  // default to false.  A cosine field skips and logs zero / near-zero vectors
+  // when normalized is false.
   bool normalize_on_write = 4;
 }
 
