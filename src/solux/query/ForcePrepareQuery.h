@@ -29,7 +29,7 @@ public:
       explicit Prepared(QueryPrep::PreparedSource&& child) : child(std::move(child)) {}
 
       Query::Scorer* createScorer(MemPool& targetPool, IndexReader::Segment& segment) override {
-        return child.scorerSource().createScorer(targetPool, segment);
+        return QueryPrep::createScorer(targetPool, segment, child.segmentSource());
       }
 
       bool outputIsSubsetOfDomain() const noexcept override {
@@ -56,7 +56,7 @@ public:
     }
 
     Query::Scorer* createScorer(MemPool& targetPool, IndexReader::Segment& segment) override {
-      return childWeight->createScorer(targetPool, segment);
+      return QueryPrep::createScorer(targetPool, segment, *childWeight);
     }
   };
 };

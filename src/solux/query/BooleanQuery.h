@@ -44,9 +44,9 @@ public:
     static Query::Scorer* assembleScorer(
         MemPool& targetPool,
         IndexReader::Segment& segment,
-        std::span<const QueryPrep::ScorerSource> mandatorySources,
-        std::span<const QueryPrep::ScorerSource> optionalSources,
-        std::span<const QueryPrep::ScorerSource> prohibitedSources,
+        std::span<Query::SegmentSource* const> mandatorySources,
+        std::span<Query::SegmentSource* const> optionalSources,
+        std::span<Query::SegmentSource* const> prohibitedSources,
         std::span<Query::Scorer*> filterScorers) {
       auto mandatoryScorers = QueryPrep::createScorers(targetPool, segment, mandatorySources);
       if (mandatoryScorers.size() < mandatorySources.size()) return nullptr;
@@ -128,9 +128,9 @@ public:
         return assembleScorer(
           targetPool,
           segment,
-          QueryPrep::scorerSources(targetPool, QueryPrep::preparedSpan(mandatorySources)),
-          QueryPrep::scorerSources(targetPool, QueryPrep::preparedSpan(optionalSources)),
-          QueryPrep::scorerSources(targetPool, QueryPrep::preparedSpan(prohibitedSources)),
+          QueryPrep::segmentSources(targetPool, QueryPrep::preparedSpan(mandatorySources)),
+          QueryPrep::segmentSources(targetPool, QueryPrep::preparedSpan(optionalSources)),
+          QueryPrep::segmentSources(targetPool, QueryPrep::preparedSpan(prohibitedSources)),
           filterScorers);
       }
     };

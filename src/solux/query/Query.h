@@ -26,8 +26,12 @@ class DocSet;
 //   Weight  : created by a Query for one IndexReader (carried by Query::Context)
 //             via createWeight(); holds index-level state (term stats, cached
 //             enums, and child Weights for compound queries like BooleanQuery).
-//   Scorer  : created by a Weight (or a PreparedWeight) for a single segment via
-//             createScorer(); iterates that segment's matching docs.
+//   SegmentSource
+//           : execution-facing source implemented by Weight and PreparedWeight.
+//   ScorerSupplier
+//           : temporary segment-local planning state that creates a Scorer.
+//   Scorer  : created by a ScorerSupplier for a single segment; iterates that
+//             segment's matching docs.
 //
 // Two phases, with different threading and allocation rules -- getting these
 // wrong can be a data race, so they are part of the contract:
@@ -49,21 +53,22 @@ class DocSet;
 //       and hand them the per-segment domains they need before they run.
 //       prepare() returns an
 //       immutable
-//       PreparedWeight holding the whole-index result; createScorer() then
+//       PreparedWeight holding the whole-index result; scorerSupplier() then
 //       reads from it per segment.  Compound queries propagate: needsPrepare()
 //       ORs over children, and prepare() recursively prepares children,
 //       threading per-segment domains down (e.g. Boolean materializes its
 //       filter clauses into a domain that narrows the scoring children's
 //       search).
-//    b. createScorer(targetPool, segment) -- called as needed for a segment,
-//       often from parallel tasks.
+//    b. scorerSupplier(targetPool, segment) -- called as needed for a segment,
+//       often from parallel tasks.  The supplier's get() creates the Scorer.
 //
 //    Because (a) and (b) can run on worker threads, they MUST NOT allocate from
 //    Context::pool or populate/mutate the Context caches (both are
 //    single-thread-only, populated in phase 1).  They may read immutable state
-//    built in phase 1.  createScorer() allocates from its per-call targetPool;
-//    prepare() uses stack/std containers, local or thread-local MemPools, or
-//    heap allocations for scratch, and returns state owned by the PreparedWeight.
+//    built in phase 1.  scorerSupplier() and Scorer creation allocate from the
+//    per-call targetPool; prepare() uses stack/std containers, local or
+//    thread-local MemPools, or heap allocations for scratch, and returns state
+//    owned by the PreparedWeight.
 //
 // Domain: the per-segment DocSet a query is restricted to (liveDocs from RootOp,
 // intersected with any filter clauses).  PrepareContext carries the per-segment
@@ -146,12 +151,47 @@ public:
   class Context;
   class Weight;
   class Scorer;
+  class ScorerSupplier;
+  class SegmentSource;
 
   /// Returns a non-owning pointer to the created weight.  The Query::Context
   /// is responsible for the lifecycle of the created Weight.
   /// A Context is not generally thread-safe, so don't create weights from multiple threads with the same Context.
   // TODO: pass down flags like NEED_SCORES, etc
   virtual Query::Weight* createWeight(Query::Context& context) = 0;
+
+  /// Per-segment planning state. Suppliers are allocated from the segment-local
+  /// targetPool and only need to live until their parent has called get().
+  // NOTE: no virtual destructor, so subclasses should not be owned or deleted through this type.
+  class ScorerSupplier {
+  public:
+    /// Estimated number of matching docs in this segment. This should be cheap
+    /// to compute; an upper bound is safe. Compound suppliers use it to choose
+    /// lead iterators before creating scorers.
+    virtual int64_t cost() = 0;
+
+    /// Create the scorer. leadCost is the estimated cost of the parent-selected
+    /// lead iterator that will drive this scorer, or INT64_MAX when there is no
+    /// lead constraint. Suppliers may use it to choose eager vs lazy setup.
+    virtual Query::Scorer* get(MemPool& targetPool, int64_t leadCost) = 0;
+  };
+
+  // NOTE: no virtual destructor, so subclasses should not be owned or deleted through this type.
+  class SegmentSource {
+  public:
+    /// Return temporary per-segment planning state allocated from targetPool.
+    /// A null supplier means this source cannot match the segment.
+    virtual Query::ScorerSupplier* scorerSupplier(MemPool& targetPool, IndexReader::Segment& segment);
+
+    /// Compatibility hook for existing scorer implementations. New call sites
+    /// should go through scorerSupplier(); the default supplier delegates here.
+    virtual Query::Scorer* createScorer(MemPool& targetPool, IndexReader::Segment& segment) = 0;
+
+    /// Advisory flag for callers that can optimize domain filtering. Return
+    /// true only when every emitted doc is already within the PrepareContext
+    /// domain used to build this SegmentSource; false is always safe.
+    virtual bool outputIsSubsetOfDomain() const noexcept { return false; }
+  };
 
   /// Gives context to a Query (i.e. what index it's being used on amongst other things) when creating weights
   /// A Context is not generally thread-safe, so don't create weights from multiple threads with the same Context.
@@ -303,7 +343,7 @@ public:
 
   // A weight is created by a query for execution over a specific index
   // It does not have a virtual destructor, so subclasses should be made trivially destructible.
-  class Weight {
+  class Weight : public Query::SegmentSource {
   protected:
     Query::Context& context;
   public:
@@ -318,7 +358,7 @@ public:
 
     /// Immutable result of prepare(), used to create segment scorers after
     /// whole-index work has completed.
-    class PreparedWeight {
+    class PreparedWeight : public Query::SegmentSource {
     public:
       /// Create a scorer from prepared state. Follows the same threading and
       /// allocation rules as Weight::createScorer().
@@ -327,7 +367,7 @@ public:
       /// Advisory flag for callers that can optimize domain filtering. Return
       /// true only when every emitted doc is already within the PrepareContext
       /// domain used to build this PreparedWeight; false is always safe.
-      virtual bool outputIsSubsetOfDomain() const noexcept { return false; }
+      bool outputIsSubsetOfDomain() const noexcept override { return false; }
       virtual ~PreparedWeight() = default;
     };
 
@@ -385,6 +425,37 @@ public:
     // NOTE: no virtual destructor, so subclasses should be made trivially destructible
   };
 };
+
+namespace query_detail {
+
+// Transitional supplier for SegmentSource implementations that still only
+// implement createScorer(). Specialized suppliers should override cost() with a
+// better estimate and may use leadCost in get().
+class DefaultScorerSupplier final : public Query::ScorerSupplier {
+  Query::SegmentSource& source;
+  IndexReader::Segment& segment;
+
+public:
+  DefaultScorerSupplier(Query::SegmentSource& source, IndexReader::Segment& segment)
+    : source(source), segment(segment) {}
+
+  // Conservative upper bound when the wrapped source has no cheaper estimate.
+  int64_t cost() override {
+    return segment.maxDoc();
+  }
+
+  Query::Scorer* get(MemPool& targetPool, int64_t leadCost) override {
+    unused(leadCost);
+    return source.createScorer(targetPool, segment);
+  }
+};
+
+} // namespace query_detail
+
+inline Query::ScorerSupplier* Query::SegmentSource::scorerSupplier(MemPool& targetPool,
+                                                                   IndexReader::Segment& segment) {
+  return targetPool.make<query_detail::DefaultScorerSupplier>(*this, segment);
+}
 
 
 } // end namespace

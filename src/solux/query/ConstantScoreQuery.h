@@ -66,7 +66,7 @@ public:
         : child(std::move(child)), constantScore(constantScore) {}
 
       Query::Scorer* createScorer(MemPool& targetPool, IndexReader::Segment& segment) override {
-        auto* childScorer = child.scorerSource().createScorer(targetPool, segment);
+        auto* childScorer = QueryPrep::createScorer(targetPool, segment, child.segmentSource());
         if (childScorer == nullptr) return nullptr;
         return targetPool.make<ConstantScoreQuery::Scorer>(childScorer, constantScore);
       }
@@ -96,7 +96,7 @@ public:
     }
 
     Query::Scorer* createScorer(MemPool& targetPool, IndexReader::Segment& segment) override {
-      auto* childScorer = childWeight->createScorer(targetPool, segment);
+      auto* childScorer = QueryPrep::createScorer(targetPool, segment, *childWeight);
       if (childScorer == nullptr) return nullptr;
       return targetPool.make<ConstantScoreQuery::Scorer>(childScorer, constantScore);
     }

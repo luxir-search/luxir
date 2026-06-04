@@ -1,6 +1,7 @@
 #pragma once
 
 #include <algorithm>
+#include <limits>
 #include <memory>
 #include <span>
 #include <vector>
@@ -10,26 +11,26 @@
 
 namespace solux::QueryPrep {
 
-// Non-owning adapter used by scorer assembly code. The source may be either
-// a normal Weight or a PreparedWeight produced after all segment domains were known.
-struct ScorerSource {
-  Query::Weight* weight = nullptr;
-  Query::Weight::PreparedWeight* prepared = nullptr;
-
-  Query::Scorer* createScorer(MemPool& targetPool, IndexReader::Segment& segment) const {
-    if (prepared) return prepared->createScorer(targetPool, segment);
-    return weight->createScorer(targetPool, segment);
-  }
-};
+// Convenience path for callers that just need a scorer and are not doing
+// parent-level planning. INT64_MAX means there is no external lead iterator
+// constraining scorer construction.
+inline Query::Scorer* createScorer(MemPool& targetPool,
+                                   IndexReader::Segment& segment,
+                                   Query::SegmentSource& source) {
+  auto* supplier = source.scorerSupplier(targetPool, segment);
+  if (supplier == nullptr) return nullptr;
+  return supplier->get(targetPool, std::numeric_limits<int64_t>::max());
+}
 
 // Owning prepare result for a child query. If prepared is null, the original
-// Weight remains usable through the same ScorerSource path.
+// Weight remains usable through the same SegmentSource path.
 struct PreparedSource {
   Query::Weight* weight = nullptr;
   std::unique_ptr<Query::Weight::PreparedWeight> prepared;
 
-  ScorerSource scorerSource() const {
-    return {weight, prepared.get()};
+  Query::SegmentSource& segmentSource() const {
+    if (prepared) return *prepared;
+    return *weight;
   }
 };
 
@@ -59,34 +60,34 @@ inline std::span<const PreparedSource> preparedSpan(const std::vector<PreparedSo
   return {sources.data(), sources.size()};
 }
 
-inline std::span<ScorerSource> liveSources(MemPool& targetPool,
-                                           std::span<Query::Weight*> weights) {
+inline std::span<Query::SegmentSource*> liveSources(MemPool& targetPool,
+                                                    std::span<Query::Weight*> weights) {
   if (weights.empty()) return {};
-  auto sources = targetPool.make_span<ScorerSource>(weights.size());
+  auto sources = targetPool.make_span<Query::SegmentSource*>(weights.size());
   for (size_t i = 0; i < weights.size(); i++) {
-    sources[i] = {weights[i], nullptr};
+    sources[i] = weights[i];
   }
   return sources;
 }
 
-inline std::span<ScorerSource> scorerSources(MemPool& targetPool,
-                                             std::span<const PreparedSource> preparedSources) {
+inline std::span<Query::SegmentSource*> segmentSources(MemPool& targetPool,
+                                                       std::span<const PreparedSource> preparedSources) {
   if (preparedSources.empty()) return {};
-  auto sources = targetPool.make_span<ScorerSource>(preparedSources.size());
+  auto sources = targetPool.make_span<Query::SegmentSource*>(preparedSources.size());
   for (size_t i = 0; i < preparedSources.size(); i++) {
-    sources[i] = preparedSources[i].scorerSource();
+    sources[i] = &preparedSources[i].segmentSource();
   }
   return sources;
 }
 
 inline std::span<Query::Scorer*> createScorers(MemPool& targetPool,
                                                IndexReader::Segment& segment,
-                                               std::span<const ScorerSource> sources) {
+                                               std::span<Query::SegmentSource* const> sources) {
   if (sources.empty()) return {};
   auto& scorers = *targetPool.make_vec<Query::Scorer*>();
   scorers.reserve(sources.size());
-  for (auto& source : sources) {
-    auto* scorer = source.createScorer(targetPool, segment);
+  for (auto* source : sources) {
+    auto* scorer = createScorer(targetPool, segment, *source);
     if (scorer != nullptr) scorers.push_back(scorer);
   }
   return scorers;
@@ -162,7 +163,7 @@ inline Query::Scorer* createDocSetScorer(MemPool& targetPool, DocSet* docs,
   return targetPool.make<DocSetScorer>(docs, segment.maxDoc());
 }
 
-inline std::unique_ptr<DocSet> materialize(const ScorerSource& source,
+inline std::unique_ptr<DocSet> materialize(Query::SegmentSource& source,
                                            IndexReader::Segment& segment,
                                            DocSet* domain) {
   // Used from prepare() paths, which can run deep in a work-stealing stack.
@@ -171,7 +172,7 @@ inline std::unique_ptr<DocSet> materialize(const ScorerSource& source,
   // temporaries out of Query::Context's shared request pool.
   auto guard = MemPool::threadLocalPoolGuard();
   MemPool& scratch = guard.pool();
-  auto* scorer = source.createScorer(scratch, segment);
+  auto* scorer = createScorer(scratch, segment, source);
   DocSetBuilder builder(segment.maxDoc());
   if (scorer != nullptr) {
     for (;;) {
@@ -188,7 +189,10 @@ inline std::unique_ptr<DocSet> materialize(Query::Weight& weight,
                                            Query::Weight::PreparedWeight* prepared,
                                            IndexReader::Segment& segment,
                                            DocSet* domain) {
-  return materialize({&weight, prepared}, segment, domain);
+  Query::SegmentSource& source = prepared != nullptr
+    ? static_cast<Query::SegmentSource&>(*prepared)
+    : static_cast<Query::SegmentSource&>(weight);
+  return materialize(source, segment, domain);
 }
 
 inline std::unique_ptr<DocSet> intersectOwned(std::vector<std::unique_ptr<DocSet>>& sets) {
@@ -209,7 +213,7 @@ inline std::unique_ptr<DocSet> materializeIntersection(std::span<const PreparedS
   std::vector<std::unique_ptr<DocSet>> sets;
   sets.reserve(sources.size());
   for (auto& source : sources) {
-    sets.push_back(materialize(source.scorerSource(), segment, domain));
+    sets.push_back(materialize(source.segmentSource(), segment, domain));
   }
   return intersectOwned(sets);
 }

@@ -136,8 +136,10 @@ public:
 
     Query::Scorer* createMainScorer(MemPool& pool, IndexReader::Segment& seg) {
       auto& op = thisOp();
-      if (preparedWeight) return preparedWeight->createScorer(pool, seg);
-      return op.weight->createScorer(pool, seg);
+      Query::SegmentSource& source = preparedWeight != nullptr
+        ? static_cast<Query::SegmentSource&>(*preparedWeight)
+        : static_cast<Query::SegmentSource&>(*op.weight);
+      return QueryPrep::createScorer(pool, seg, source);
     }
 
     std::unique_ptr<DocSet> buildEffectiveDomain(int32_t segnum) {
@@ -233,9 +235,7 @@ public:
       {
         auto poolGuard = MemPool::threadLocalPoolGuard();
         auto& seg = op.qcontext.topReader.segments()[segnum];
-        auto* scorer = preparedMode
-          ? createMainScorer(poolGuard.pool(), seg)
-          : op.weight->createScorer(poolGuard.pool(), seg);
+        auto* scorer = createMainScorer(poolGuard.pool(), seg);
 
         // Wait until last moment to obtain collector in hopes of reusing an existing one.
         data = collectorMerger.obtain();
