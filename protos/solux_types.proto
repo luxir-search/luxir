@@ -142,16 +142,33 @@ message Query {
     string field = 4;               // selects all documents with the given field name.  // TODO: what about field regex?
     PhraseQuery phrase = 5;         // selects all documents with a phrase
     KnnQuery knn = 6;               // approximate nearest-neighbor over a vector field
+    ConstantScoreQuery constant_score = 7; // wraps a query and replaces each hit's score
 
     // TODO: a looser string match that will auto-convert to correct type
     // TODO: a text query type (parsed by QueryParser)
     // TODO: wildcard query
     // TODO: function?
 
-
+    // Debug/test wrappers use high field numbers so ordinary query types keep
+    // the lower tag space.
+    ForcePrepareQuery force_prepare = 1000;
   }
 
 
+}
+
+// Debug/testing wrapper that forces its child through the prepared execution
+// path. Matching and scores should be identical to the wrapped query.
+message ForcePrepareQuery {
+  Query query = 1;
+}
+
+message ConstantScoreQuery {
+  Query query = 1;
+  // Presence matters: unset means 1.0, while an explicitly set 0.0 is a real
+  // constant score. Edition 2024 gives singular scalar fields explicit
+  // presence by default, so callers can distinguish those cases.
+  float score = 2;
 }
 
 // Approximate-nearest-neighbor query against a vector field's FAISS aux

@@ -1,5 +1,6 @@
 #pragma once
 
+#include <memory>
 #include <solux/util/heap.h>
 #include "solux/util/MemPool.h"
 #include "solux/util/StrRef.h"
@@ -13,10 +14,67 @@
 
 namespace solux {
 
-// Overview:
-// - Query represents a user query.
-// - Weight is created by a Query for a specific index
-// - Scorer is created by a Weight for a specific segment
+class DocSet;
+
+// Overview
+// ========
+// Execution follows Lucene's shape -- Query -> Weight -> Scorer -- plus one
+// addition, prepare(), for queries that need a whole-index pass before
+// per-segment scoring.
+//
+//   Query   : the user's query, independent of any index.
+//   Weight  : created by a Query for one IndexReader (carried by Query::Context)
+//             via createWeight(); holds index-level state (term stats, cached
+//             enums, and child Weights for compound queries like BooleanQuery).
+//   Scorer  : created by a Weight (or a PreparedWeight) for a single segment via
+//             createScorer(); iterates that segment's matching docs.
+//
+// Two phases, with different threading and allocation rules -- getting these
+// wrong can be a data race, so they are part of the contract:
+//
+// 1. Build -- single-threaded, before search tasks are dispatched.
+//    createWeight() walks the Query tree and builds the Weight tree.  Weight
+//    ctors may read/populate the shared Query::Context (field/term caches) and
+//    allocate from Context::pool (the per-request MemPool).  Safe ONLY because
+//    it runs before any task is dispatched.
+//
+// 2. Execute -- parallel, on the TBB task pool.
+//    a. prepare() -- optional.  A Weight whose needsPrepare() returns true is
+//       prepared before its segment scorers are created.  It is for any weight
+//       that must resolve state across the whole index before per-segment
+//       scorers exist: a leaf computing an index-level result (e.g. KnnQuery,
+//       whose FAISS index is index-level and whose search runs once,
+//       pre-filtered by the active per-segment domains), or a compound (a query
+//       with child queries, e.g. BooleanQuery) that must prepare its children
+//       and hand them the per-segment domains they need before they run.
+//       prepare() returns an
+//       immutable
+//       PreparedWeight holding the whole-index result; createScorer() then
+//       reads from it per segment.  Compound queries propagate: needsPrepare()
+//       ORs over children, and prepare() recursively prepares children,
+//       threading per-segment domains down (e.g. Boolean materializes its
+//       filter clauses into a domain that narrows the scoring children's
+//       search).
+//    b. createScorer(targetPool, segment) -- called as needed for a segment,
+//       often from parallel tasks.
+//
+//    Because (a) and (b) can run on worker threads, they MUST NOT allocate from
+//    Context::pool or populate/mutate the Context caches (both are
+//    single-thread-only, populated in phase 1).  They may read immutable state
+//    built in phase 1.  createScorer() allocates from its per-call targetPool;
+//    prepare() uses stack/std containers, local or thread-local MemPools, or
+//    heap allocations for scratch, and returns state owned by the PreparedWeight.
+//
+// Domain: the per-segment DocSet a query is restricted to (liveDocs from RootOp,
+// intersected with any filter clauses).  PrepareContext carries the per-segment
+// domains so a prepared weight can pre-filter its whole-index work; search ops
+// and materializers also intersect scorer output with the active domain.
+//
+// Scorer iteration: next()/advance(target) walk docs in increasing docId order,
+// returning PostingsReader::END when exhausted.  advance(target) returns the
+// first doc with docId >= target, and may return the current doc if it is
+// already >= target -- so a caller needing strict progress must pass
+// target > docId() (see ConjunctionScorer's leapfrog).
 //
 
 /// A map from KeyType to a vector of pointers to ValType.
@@ -251,13 +309,63 @@ public:
   public:
     Weight(Query::Context& context) : context(context) {}
 
-    /// Create a scorer for a specific segment in the specific MemPool.  Can return null if no docs match!
+    /// Per-segment domains available during prepare(). An empty domain span
+    /// means unrestricted aside from whatever the caller applies later.
+    struct PrepareContext {
+      IndexReader& reader;
+      std::span<DocSet* const> domainPerSeg;
+    };
+
+    /// Immutable result of prepare(), used to create segment scorers after
+    /// whole-index work has completed.
+    class PreparedWeight {
+    public:
+      /// Create a scorer from prepared state. Follows the same threading and
+      /// allocation rules as Weight::createScorer().
+      virtual Query::Scorer* createScorer(MemPool& target, IndexReader::Segment& segment) = 0;
+
+      /// Advisory flag for callers that can optimize domain filtering. Return
+      /// true only when every emitted doc is already within the PrepareContext
+      /// domain used to build this PreparedWeight; false is always safe.
+      virtual bool outputIsSubsetOfDomain() const noexcept { return false; }
+      virtual ~PreparedWeight() = default;
+    };
+
+    /// True if this Weight needs prepare() before segment scorer creation.
+    /// Compound queries should return true if any child needs preparation.
+    virtual bool needsPrepare() const noexcept { return false; }
+
+    /// Optional execution-time preparation for weights that need the domain for
+    /// all segments before they can create a scorer for any individual segment,
+    /// such as shard-level kNN over a filtered domain.
+    ///
+    /// Threading contract: prepare() may run on TBB worker tasks, concurrently
+    /// with prepare() for other weights from the same request. Implementations
+    /// must not mutate Query::Context state or allocate from context.pool here:
+    /// Context and its MemPool are request-scoped but not synchronized. Use
+    /// stack, std containers, a local MemPool, or thread-local MemPool guards
+    /// for prepare-only temporaries. Any state needed after prepare() returns
+    /// must be owned by the returned PreparedWeight or another synchronized
+    /// request object.
+    ///
+    /// The returned PreparedWeight may later be asked to create per-segment
+    /// scorers from segment tasks, so createScorer() should treat its stored
+    /// prepared state as read-only.
+    virtual std::unique_ptr<PreparedWeight> prepare(PrepareContext& ctx) {
+      unused(ctx);
+      return nullptr;
+    }
+
+    /// Create a scorer for a specific segment in the specific MemPool. Can
+    /// return null if no docs match. This may run concurrently on worker tasks:
+    /// allocate scorer state from target, and do not allocate from context.pool
+    /// or populate/mutate Query::Context caches.
     virtual Query::Scorer* createScorer(MemPool& target, IndexReader::Segment& segment) = 0;
 
     // NOTE: no virtual destructor, so subclasses should be made trivially destructible
   };
 
-  // NOTE: no virtual destructor, so subclasses of Query should be made trivially destructible
+  // NOTE: no virtual destructor, so subclasses of Scorer should be made trivially destructible
   class Scorer {
   public:
     virtual int32_t next() = 0;

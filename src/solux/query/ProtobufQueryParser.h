@@ -4,6 +4,9 @@
 #include "solux/query/Query.h"
 #include "solux/query/TermQuery.h"
 #include "solux/query/AllQuery.h"
+#include "solux/query/BooleanQuery.h"
+#include "solux/query/ConstantScoreQuery.h"
+#include "solux/query/ForcePrepareQuery.h"
 #include "solux/query/KnnQuery.h"
 #include "solux/schema/Schema.h"
 #include "protos/solux.grpc.pb.h"
@@ -115,6 +118,49 @@ public:
     return pool.make<solux::KnnQuery>(field, queryVec, k);
   }
 
+  std::span<Query*> parseQueryList(const google::protobuf::RepeatedPtrField<solux::proto::Query>& queries) {
+    if (queries.empty()) return {};
+    auto out = pool.make_span<Query*>(queries.size());
+    for (int i = 0; i < queries.size(); i++) {
+      out[i] = parse(queries[i]);
+    }
+    return out;
+  }
+
+  solux::Query* parseBoolean(const solux::proto::BooleanQuery& booleanQuery) {
+    if (booleanQuery.min_match() > 1) {
+      throw std::runtime_error(std::format(
+        "BooleanQuery min_match > 1 is not supported yet (got {})", booleanQuery.min_match()));
+    }
+    if (booleanQuery.min_match() == 1 &&
+        (booleanQuery.optional().empty() || !booleanQuery.required().empty() || !booleanQuery.filter().empty())) {
+      throw std::runtime_error(
+        "BooleanQuery min_match=1 is only supported for optional-only boolean queries");
+    }
+    auto required = parseQueryList(booleanQuery.required());
+    auto optional = parseQueryList(booleanQuery.optional());
+    auto prohibited = parseQueryList(booleanQuery.prohibited());
+    auto filter = parseQueryList(booleanQuery.filter());
+    return pool.make<solux::BooleanQuery>(required, optional, prohibited, filter);
+  }
+
+  solux::Query* parseForcePrepare(const solux::proto::ForcePrepareQuery& forcePrepareQuery) {
+    if (!forcePrepareQuery.has_query() ||
+        forcePrepareQuery.query().kind_case() == solux::proto::Query::KIND_NOT_SET) {
+      throw std::runtime_error("ForcePrepareQuery requires a child query");
+    }
+    return pool.make<solux::ForcePrepareQuery>(parse(forcePrepareQuery.query()));
+  }
+
+  solux::Query* parseConstantScore(const solux::proto::ConstantScoreQuery& constantScoreQuery) {
+    if (!constantScoreQuery.has_query() ||
+        constantScoreQuery.query().kind_case() == solux::proto::Query::KIND_NOT_SET) {
+      throw std::runtime_error("ConstantScoreQuery requires a child query");
+    }
+    float score = constantScoreQuery.has_score() ? constantScoreQuery.score() : 1.0f;
+    return pool.make<solux::ConstantScoreQuery>(parse(constantScoreQuery.query()), score);
+  }
+
   solux::Query* parse(const solux::proto::Query& pquery) {
     switch(pquery.kind_case()) {
       case solux::proto::Query::kMatch: {
@@ -129,6 +175,15 @@ public:
       case solux::proto::Query::kKnn: {
         return parseKnn(pquery.knn());
       }
+      case solux::proto::Query::kBoolean: {
+        return parseBoolean(pquery.boolean());
+      }
+      case solux::proto::Query::kConstantScore: {
+        return parseConstantScore(pquery.constant_score());
+      }
+      case solux::proto::Query::kForcePrepare: {
+        return parseForcePrepare(pquery.force_prepare());
+      }
       default:
         throw std::runtime_error(std::format("Unknown query type for proto field {} ({})", (int)pquery.kind_case(), pquery.GetDescriptor()->FindFieldByNumber(pquery.kind_case())->name()));
     }
@@ -138,4 +193,3 @@ public:
 };
 
 } // solux
-

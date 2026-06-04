@@ -1,5 +1,7 @@
 #include <gtest/gtest.h>
 
+#include <map>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -70,12 +72,17 @@ protected:
     topDocs.set_get_number(true);
     topDocs.mutable_fields()->Add("id");
 
-    auto& knn = *topDocs.mutable_query()->mutable_knn();
+    setKnnQuery(*topDocs.mutable_query(), field, queryVec, k);
+    return lreq;
+  }
+
+  static void setKnnQuery(proto::Query& query, std::string_view field,
+                          const std::vector<float>& queryVec, int32_t k) {
+    auto& knn = *query.mutable_knn();
     knn.set_field(field);
     knn.set_k(k);
     auto& f32 = *knn.mutable_query()->mutable_f32();
     for (float v : queryVec) f32.add_v(v);
-    return lreq;
   }
 
   // Pull "id" out of a search response in result order.
@@ -485,6 +492,271 @@ TEST_F(KnnQueryTest, filtersDeletedDocs) {
   // Top hit is "a" (exact match); second is "c" (next-closest live).
   EXPECT_EQ(resIds[0], "a");
   EXPECT_EQ(resIds[1], "c");
+
+  req->done();
+}
+
+TEST_F(KnnQueryTest, topDocsFilterConstrainsKnnSearch) {
+  CollectionHelper h("main");
+  h.clear();
+  installVecSchema(h.collection(), proto::VectorParams::L2);
+
+  h.index(flatdoc("id", std::string("blue_a"), "color_s", "blue",
+                  "embedding_v", std::vector<float>{1.0f, 0.0f}));
+  h.index(flatdoc("id", std::string("blue_b"), "color_s", "blue",
+                  "embedding_v", std::vector<float>{0.99f, 0.0f}));
+  h.index(flatdoc("id", std::string("red_a"), "color_s", "red",
+                  "embedding_v", std::vector<float>{0.8f, 0.0f}));
+  h.index(flatdoc("id", std::string("red_b"), "color_s", "red",
+                  "embedding_v", std::vector<float>{0.7f, 0.0f}));
+  h.commit({"*"});
+
+  auto* req = makeKnnReq(*soluxNode, "embedding_v", {1.0f, 0.0f}, 2);
+  auto& topDocs = *(*req->proto.mutable_ops())["q"].mutable_top_docs();
+  auto& nf = *topDocs.add_filter();
+  nf.set_name("red");
+  auto& m = *nf.mutable_query()->mutable_match();
+  m.set_field("color_s");
+  m.mutable_val()->set_s("red");
+
+  req->execute();
+
+  EXPECT_EQ(req->getMatchCount(), 2);
+  auto ids = resultIds(*req);
+  ASSERT_EQ(ids.size(), 2u);
+  EXPECT_EQ(ids[0], "red_a");
+  EXPECT_EQ(ids[1], "red_b");
+
+  req->done();
+}
+
+TEST_F(KnnQueryTest, booleanOptionalKnnsCanFacet) {
+  CollectionHelper h("main");
+  h.clear();
+  installVecSchema(h.collection(), proto::VectorParams::L2);
+
+  h.index(flatdoc("id", std::string("a"), "group_s", "left",
+                  "title_v", std::vector<float>{1.0f, 0.0f},
+                  "body_v", std::vector<float>{0.2f, 0.0f}));
+  h.index(flatdoc("id", std::string("b"), "group_s", "right",
+                  "title_v", std::vector<float>{0.0f, 0.2f},
+                  "body_v", std::vector<float>{0.0f, 1.0f}));
+  h.index(flatdoc("id", std::string("c"), "group_s", "other",
+                  "title_v", std::vector<float>{0.3f, 0.3f},
+                  "body_v", std::vector<float>{0.3f, 0.3f}));
+  h.commit({"*"});
+
+  auto* req = LocalReq::create(soluxNode->getSearchEngine());
+  req->proto.mutable_collection()->add_name("main");
+  auto& topDocs = *(*req->proto.mutable_ops())["q"].mutable_top_docs();
+  topDocs.set_limit(10);
+  topDocs.set_get_number(true);
+  topDocs.mutable_fields()->Add("id");
+
+  auto& boolean = *topDocs.mutable_query()->mutable_boolean();
+  setKnnQuery(*boolean.add_optional(), "title_v", {1.0f, 0.0f}, 1);
+  setKnnQuery(*boolean.add_optional(), "body_v", {0.0f, 1.0f}, 1);
+
+  auto& facet = *(*topDocs.mutable_ops())["groups"].mutable_field_facet();
+  facet.set_field("group_s");
+  facet.set_limit(-1);
+
+  req->execute();
+
+  EXPECT_EQ(req->getMatchCount(), 2);
+  auto ids = resultIds(*req);
+  std::set<std::string> got(ids.begin(), ids.end());
+  EXPECT_TRUE(got.count("a"));
+  EXPECT_TRUE(got.count("b"));
+  EXPECT_FALSE(got.count("c"));
+
+  const auto& docs = req->responses[0]->proto.ops().at("q").docs();
+  ASSERT_TRUE(docs.ops().contains("groups"));
+  const auto& facetResult = docs.ops().at("groups").facet();
+  std::map<std::string, int64_t> counts;
+  for (int i = 0; i < facetResult.counts_size(); i++) {
+    counts[std::string(facetResult.bucket_ids().col_s().v(i))] = facetResult.counts(i);
+  }
+  ASSERT_EQ(counts.size(), 2u);
+  EXPECT_EQ(counts["left"], 1);
+  EXPECT_EQ(counts["right"], 1);
+
+  req->done();
+}
+
+TEST_F(KnnQueryTest, booleanKnnFilterConstrainsRequiredKnn) {
+  CollectionHelper h("main");
+  h.clear();
+  installVecSchema(h.collection(), proto::VectorParams::L2);
+
+  h.index(flatdoc("id", std::string("a"),
+                  "title_v", std::vector<float>{1.0f, 0.0f},
+                  "body_v", std::vector<float>{1.0f, 0.0f}));
+  h.index(flatdoc("id", std::string("b"),
+                  "title_v", std::vector<float>{0.8f, 0.0f},
+                  "body_v", std::vector<float>{0.0f, 1.0f}));
+  h.index(flatdoc("id", std::string("c"),
+                  "title_v", std::vector<float>{0.0f, 1.0f},
+                  "body_v", std::vector<float>{0.5f, 0.5f}));
+  h.commit({"*"});
+
+  auto* req = LocalReq::create(soluxNode->getSearchEngine());
+  req->proto.mutable_collection()->add_name("main");
+  auto& topDocs = *(*req->proto.mutable_ops())["q"].mutable_top_docs();
+  topDocs.set_limit(10);
+  topDocs.set_get_number(true);
+  topDocs.mutable_fields()->Add("id");
+
+  auto& boolean = *topDocs.mutable_query()->mutable_boolean();
+  setKnnQuery(*boolean.add_required(), "title_v", {1.0f, 0.0f}, 1);
+  setKnnQuery(*boolean.add_filter(), "body_v", {0.0f, 1.0f}, 1);
+
+  req->execute();
+
+  EXPECT_EQ(req->getMatchCount(), 1);
+  auto ids = resultIds(*req);
+  ASSERT_EQ(ids.size(), 1u);
+  EXPECT_EQ(ids[0], "b");
+
+  req->done();
+}
+
+TEST_F(KnnQueryTest, booleanTermRequiredUsesKnnFilter) {
+  CollectionHelper h("main");
+  h.clear();
+  installVecSchema(h.collection(), proto::VectorParams::L2);
+
+  h.index(flatdoc("id", std::string("a"), "foo_w", "apple",
+                  "body_v", std::vector<float>{1.0f, 0.0f}));
+  h.index(flatdoc("id", std::string("b"), "foo_w", "apple",
+                  "body_v", std::vector<float>{0.0f, 1.0f}));
+  h.index(flatdoc("id", std::string("c"), "foo_w", "orange",
+                  "body_v", std::vector<float>{0.0f, 0.9f}));
+  h.commit({"*"});
+
+  auto* req = LocalReq::create(soluxNode->getSearchEngine());
+  req->proto.mutable_collection()->add_name("main");
+  auto& topDocs = *(*req->proto.mutable_ops())["q"].mutable_top_docs();
+  topDocs.set_limit(10);
+  topDocs.set_get_number(true);
+  topDocs.mutable_fields()->Add("id");
+
+  auto& boolean = *topDocs.mutable_query()->mutable_boolean();
+  auto& required = *boolean.add_required();
+  auto& match = *required.mutable_match();
+  match.set_field("foo_w");
+  match.mutable_val()->set_s("apple");
+  setKnnQuery(*boolean.add_filter(), "body_v", {0.0f, 1.0f}, 1);
+
+  req->execute();
+
+  EXPECT_EQ(req->getMatchCount(), 1);
+  auto ids = resultIds(*req);
+  ASSERT_EQ(ids.size(), 1u);
+  EXPECT_EQ(ids[0], "b");
+
+  req->done();
+}
+
+TEST_F(KnnQueryTest, booleanDisjointRequiredAndKnnFilterReturnsEmpty) {
+  CollectionHelper h("main");
+  h.clear();
+  installVecSchema(h.collection(), proto::VectorParams::L2);
+
+  h.index(flatdoc("id", std::string("a"), "foo_w", "apple",
+                  "body_v", std::vector<float>{1.0f, 0.0f}));
+  h.index(flatdoc("id", std::string("b"), "foo_w", "orange",
+                  "body_v", std::vector<float>{0.0f, 1.0f}));
+  h.commit({"*"});
+
+  auto* req = LocalReq::create(soluxNode->getSearchEngine());
+  req->proto.mutable_collection()->add_name("main");
+  auto& topDocs = *(*req->proto.mutable_ops())["q"].mutable_top_docs();
+  topDocs.set_limit(10);
+  topDocs.set_get_number(true);
+  topDocs.mutable_fields()->Add("id");
+
+  auto& boolean = *topDocs.mutable_query()->mutable_boolean();
+  auto& required = *boolean.add_required();
+  auto& match = *required.mutable_match();
+  match.set_field("foo_w");
+  match.mutable_val()->set_s("apple");
+  setKnnQuery(*boolean.add_filter(), "body_v", {0.0f, 1.0f}, 1);
+
+  req->execute();
+
+  EXPECT_EQ(req->getMatchCount(), 0);
+  EXPECT_TRUE(resultIds(*req).empty());
+
+  req->done();
+}
+
+TEST_F(KnnQueryTest, booleanFilterOnlyAppliesProhibited) {
+  CollectionHelper h("main");
+  h.clear();
+
+  h.index(flatdoc("id", std::string("a"), "foo_w", "apple", "state_s", "ok"));
+  h.index(flatdoc("id", std::string("b"), "foo_w", "apple", "state_s", "blocked"));
+  h.index(flatdoc("id", std::string("c"), "foo_w", "orange", "state_s", "ok"));
+  h.commit();
+
+  auto* req = LocalReq::create(soluxNode->getSearchEngine());
+  req->proto.mutable_collection()->add_name("main");
+  auto& topDocs = *(*req->proto.mutable_ops())["q"].mutable_top_docs();
+  topDocs.set_limit(10);
+  topDocs.set_get_number(true);
+  topDocs.set_get_scores(true);
+  topDocs.mutable_fields()->Add("id");
+
+  auto& boolean = *topDocs.mutable_query()->mutable_boolean();
+  auto& filter = *boolean.add_filter();
+  auto& filterMatch = *filter.mutable_match();
+  filterMatch.set_field("foo_w");
+  filterMatch.mutable_val()->set_s("apple");
+  auto& prohibited = *boolean.add_prohibited();
+  auto& prohibitedMatch = *prohibited.mutable_match();
+  prohibitedMatch.set_field("state_s");
+  prohibitedMatch.mutable_val()->set_s("blocked");
+
+  req->execute();
+
+  EXPECT_EQ(req->getMatchCount(), 1);
+  auto ids = resultIds(*req);
+  auto scores = resultScores(*req);
+  ASSERT_EQ(ids.size(), 1u);
+  ASSERT_EQ(scores.size(), 1u);
+  EXPECT_EQ(ids[0], "a");
+  EXPECT_EQ(scores[0], 0.0f);
+
+  req->done();
+}
+
+TEST_F(KnnQueryTest, booleanMinMatchWithRequiredIsRejected) {
+  CollectionHelper h("main");
+  h.clear();
+  h.index(flatdoc("id", std::string("a"), "foo_w", "apple"), UpdateMessage::COMMIT);
+
+  auto* req = LocalReq::create(soluxNode->getSearchEngine());
+  req->proto.mutable_collection()->add_name("main");
+  auto& topDocs = *(*req->proto.mutable_ops())["q"].mutable_top_docs();
+  auto& boolean = *topDocs.mutable_query()->mutable_boolean();
+  boolean.set_min_match(1);
+  auto& required = *boolean.add_required();
+  auto& requiredMatch = *required.mutable_match();
+  requiredMatch.set_field("foo_w");
+  requiredMatch.mutable_val()->set_s("apple");
+  auto& optional = *boolean.add_optional();
+  auto& optionalMatch = *optional.mutable_match();
+  optionalMatch.set_field("foo_w");
+  optionalMatch.mutable_val()->set_s("banana");
+
+  {
+    LogLevelGuard quiet;
+    req->execute();
+  }
+
+  ASSERT_EQ(req->responses.size(), 1u);
+  EXPECT_NE(req->responses[0]->proto.error().find("min_match=1"), std::string::npos);
 
   req->done();
 }

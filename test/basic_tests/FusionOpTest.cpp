@@ -44,14 +44,32 @@ protected:
     m.mutable_val()->set_s(term);
   }
 
-  static void setKnnSource(proto::TopDocs& src, std::string_view field,
-                           std::vector<float> query, int32_t k) {
-    src.set_limit(k);
-    auto& knn = *src.mutable_query()->mutable_knn();
+  static void setKnnQuery(proto::Query& query, std::string_view field,
+                          const std::vector<float>& queryVec, int32_t k) {
+    auto& knn = *query.mutable_knn();
     knn.set_field(field);
     knn.set_k(k);
     auto& f32 = *knn.mutable_query()->mutable_f32();
-    for (float v : query) f32.add_v(v);
+    for (float v : queryVec) f32.add_v(v);
+  }
+
+  static void setKnnSource(proto::TopDocs& src, std::string_view field,
+                           std::vector<float> query, int32_t k) {
+    src.set_limit(k);
+    setKnnQuery(*src.mutable_query(), field, query, k);
+  }
+
+  // Set a source's query to a BooleanQuery of several optional kNN clauses, so
+  // a single source's Context hosts multiple kNN weights (prepared serially),
+  // while many such sources prepare concurrently against the shared request pool.
+  static void setBoolKnnSource(proto::TopDocs& src, std::string_view field,
+                               const std::vector<std::vector<float>>& queryVecs,
+                               int32_t k, int64_t limit) {
+    src.set_limit(limit);
+    auto& boolean = *src.mutable_query()->mutable_boolean();
+    for (const auto& qv : queryVecs) {
+      setKnnQuery(*boolean.add_optional(), field, qv, k);
+    }
   }
 
   // Pull "id" out of a Fusion response in fused-rank order.
@@ -178,6 +196,42 @@ TEST_F(FusionOpTest, sharedFilter) {
   EXPECT_EQ(ids[1], "c");
   EXPECT_NEAR(scores[0], 1.0f / 61.0f, 1e-6f);
   EXPECT_NEAR(scores[1], 1.0f / 62.0f, 1e-6f);
+
+  lreq->done();
+}
+
+TEST_F(FusionOpTest, sharedKnnFilter) {
+  CollectionHelper h("main");
+  h.clear();
+  installVecSchema(h.collection(), proto::VectorParams::L2);
+
+  h.index(flatdoc("id", std::string("a"), "foo_w", "apple",
+                  "embedding_v", std::vector<float>{1.0f, 0.0f}));
+  h.index(flatdoc("id", std::string("b"), "foo_w", "apple",
+                  "embedding_v", std::vector<float>{0.0f, 1.0f}));
+  h.index(flatdoc("id", std::string("c"), "foo_w", "orange",
+                  "embedding_v", std::vector<float>{0.0f, 0.9f}));
+  h.commit({"*"});
+
+  auto* lreq = LocalReq::create(soluxNode->getSearchEngine());
+  lreq->proto.mutable_collection()->add_name("main");
+  auto& fusion = *(*lreq->proto.mutable_ops())["f"].mutable_fusion();
+  fusion.set_limit(10);
+  fusion.set_get_number(true);
+  fusion.mutable_fields()->Add("id");
+  fusion.mutable_rrf()->set_k(60);
+
+  setTextSource((*fusion.mutable_sources())["text"], "foo_w", "apple", 10);
+
+  auto& nf = *fusion.add_filter();
+  nf.set_name("near");
+  setKnnQuery(*nf.mutable_query(), "embedding_v", {0.0f, 1.0f}, 1);
+
+  lreq->execute();
+
+  auto ids = resultIds(*lreq);
+  ASSERT_EQ(ids.size(), 1u);
+  EXPECT_EQ(ids[0], "b");
 
   lreq->done();
 }
@@ -408,4 +462,80 @@ TEST_F(FusionOpTest, emptyIndex) {
   EXPECT_EQ(opVal.docs().matches(), 0);
 
   lreq->done();
+}
+
+
+// Concurrency coverage for the kNN prepare() path.
+//
+// prepare() runs during the parallel execution phase.  It used to allocate scratch
+// memory from the context pool, which is the same as the request pool and shared
+// across query contexts in the same request. MemPool is not thread-safe and
+// hence allocations should not be done concurrently.
+//
+TEST_F(FusionOpTest, concurrentKnnPrepareSharesRequestPool) {
+  CollectionHelper h("main");
+  h.clear();
+  installVecSchema(h.collection(), proto::VectorParams::L2);
+
+  // ~40 docs across 5 segments; ~1/3 lack the vector field so the sparse
+  // single-valued valueRank->docId selector path runs.  Distinct vectors keep
+  // kNN ordering unambiguous so the matched set is deterministic across runs.
+  constexpr int kSegments = 5;
+  constexpr int kPerSegment = 8;
+  int next = 0;
+  for (int seg = 0; seg < kSegments; seg++) {
+    for (int j = 0; j < kPerSegment; j++) {
+      if (next % 3 == 0) {
+        h.index(flatdoc("id", std::to_string(next)));  // no vector -> sparse
+      } else {
+        float x = (float)next / (float)(kSegments * kPerSegment);
+        h.index(flatdoc("id", std::to_string(next),
+                        "embedding_v", std::vector<float>{x, 1.0f - x}));
+      }
+      next++;
+    }
+    // Flush a segment per batch; build the shard kNN index on the last commit.
+    if (seg + 1 < kSegments) h.commit();
+    else h.commit({"*"});
+  }
+
+  auto buildReq = [&]() {
+    auto* lreq = LocalReq::create(soluxNode->getSearchEngine());
+    lreq->proto.mutable_collection()->add_name("main");
+    auto& fusion = *(*lreq->proto.mutable_ops())["f"].mutable_fusion();
+    fusion.set_limit(-1);
+    fusion.set_get_number(true);
+    fusion.mutable_fields()->Add("id");
+    fusion.mutable_rrf()->set_k(60);
+    // 10 sources, each a boolean of 2 optional kNN clauses => 20 kNN weights,
+    // 10 source prepares running concurrently on the shared request pool.
+    for (int s = 0; s < 10; s++) {
+      float a = (float)s / 10.0f;
+      setBoolKnnSource((*fusion.mutable_sources())["vec" + std::to_string(s)],
+                       "embedding_v", {{a, 1.0f - a}, {1.0f - a, a}}, 5, -1);
+    }
+    return lreq;
+  };
+
+  auto resultIdSet = [](LocalReq& req) {
+    auto ids = resultIds(req);
+    return std::set<std::string>(ids.begin(), ids.end());
+  };
+
+  std::set<std::string> baseline;
+  {
+    auto* lreq = buildReq();
+    lreq->execute();
+    baseline = resultIdSet(*lreq);
+    lreq->done();
+  }
+  ASSERT_FALSE(baseline.empty());
+
+  for (int iter = 0; iter < 50; iter++) {
+    auto* lreq = buildReq();
+    lreq->execute();
+    auto ids = resultIdSet(*lreq);
+    ASSERT_EQ(ids, baseline) << "divergent/garbage fused result set at iteration " << iter;
+    lreq->done();
+  }
 }

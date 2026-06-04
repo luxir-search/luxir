@@ -23,6 +23,7 @@
 #include "solux/reader/PostingsReader.h"
 #include "solux/reader/VectorAuxReader.h"
 #include "solux/reader/VectorReader.h"
+#include "solux/search/DocSet.h"
 #include "solux/util/BranchlessSearch.h"
 #include "solux/util/log.h"
 #include "solux/util/screaming.h"
@@ -31,11 +32,11 @@ namespace solux {
 
 /// kNN query against a vector field's FAISS aux index ("vec.<field>").
 ///
-/// Execution model: the FAISS index is shard-level (one per IndexReader, not
-/// per segment), so search runs once at Weight construction.  Hits are mapped
-/// back to (segment, docId) via the per-segment cumulative vector counts and
-/// bucketed per segment in docId order for the segment-parallel TopDocsReq
-/// pipeline.
+/// Execution model: the FAISS index is currently shard-level (one per
+/// IndexReader, not per segment), so search materializes once during the query
+/// preparation phase.  Hits are mapped back to (segment, docId) via the
+/// per-segment cumulative vector counts and bucketed per segment in docId order
+/// for the segment-parallel TopDocsReq pipeline.
 ///
 /// LiveDocs filtering happens *inside* the FAISS search via a custom
 /// faiss::IDSelector, so deleted-doc vectors are skipped server-side and we
@@ -76,7 +77,7 @@ public:
   ///              prefix and reuses the column's existing bitset.
   ///   - neither: dense single-valued, valueRank == docId (identity).
   /// The MonoReader / Selector must outlive every resolve() call (both live for the
-  /// duration of the FAISS search + result walk inside Weight's constructor).
+  /// duration of the FAISS search + result walk inside Weight::prepare).
   class SegV2D {
   public:
     MonoReader* mono = nullptr;
@@ -107,18 +108,12 @@ public:
 
   class Weight final : public Query::Weight {
     KnnQuery& query;
-    std::span<std::span<const Hit>> perSegHits;
+    VectorAuxReader* vaux = nullptr;
 
   public:
     Weight(Query::Context& context, KnnQuery& query)
       : Query::Weight(context), query(query) {
       IndexReader& reader = context.topReader;
-      size_t numSegs = reader.segments().size();
-
-      // Default: empty per-seg buckets; createScorer returns nullptr for
-      // every segment.  Reset only when we successfully run a search.
-      perSegHits = context.pool.make_span<std::span<const Hit>>(numSegs);
-      for (auto& s : perSegHits) s = {};
 
       // Find the aux reader for this field.  Missing (e.g. field never had
       // its FAISS index built) yields zero hits - graceful degradation.
@@ -129,7 +124,7 @@ public:
         LOG_DEBUG("KnnQuery: no aux index '{}' on this reader; returning empty result", auxName);
         return;
       }
-      auto* vaux = dynamic_cast<VectorAuxReader*>(aux.get());
+      vaux = dynamic_cast<VectorAuxReader*>(aux.get());
       if (!vaux) {
         throw std::runtime_error(std::format(
           "KnnQuery: aux '{}' is not a vector index (kind={})", auxName, aux->getKind()));
@@ -141,8 +136,46 @@ public:
           query.getQueryVec().size(), vaux->getDims(), query.getField()));
       }
 
+    }
+
+    bool needsPrepare() const noexcept override { return true; }
+
+    class KnnPreparedWeight final : public Query::Weight::PreparedWeight {
+      std::vector<std::vector<Hit>> perSegHits;
+
+    public:
+      explicit KnnPreparedWeight(std::vector<std::vector<Hit>>&& perSegHits)
+        : perSegHits(std::move(perSegHits)) {}
+
+      Query::Scorer* createScorer(MemPool& target, IndexReader::Segment& segment) override {
+        if ((size_t)segment.ord >= perSegHits.size()) return nullptr;
+        auto& hits = perSegHits[(size_t)segment.ord];
+        if (hits.empty()) return nullptr;
+        return target.make<KnnQuery::Scorer>(
+          std::span<const Hit>(hits.data(), hits.size()));
+      }
+
+      bool outputIsSubsetOfDomain() const noexcept override { return true; }
+    };
+
+    std::unique_ptr<Query::Weight::PreparedWeight> prepare(Query::Weight::PrepareContext& ctx) override {
+      IndexReader& reader = ctx.reader;
+      size_t numSegs = reader.segments().size();
+      std::vector<std::vector<Hit>> perSegHits(numSegs);
+      if (vaux == nullptr) return std::make_unique<KnnPreparedWeight>(std::move(perSegHits));
+
       faiss::Index* faissIdx = vaux->getFaissIndex();
-      if (!faissIdx || faissIdx->ntotal == 0) return;
+      if (!faissIdx || faissIdx->ntotal == 0) {
+        return std::make_unique<KnnPreparedWeight>(std::move(perSegHits));
+      }
+      // prepare() runs in the parallel phase, possibly deep in a work-stealing
+      // stack; use the thread-local pool (inline buffer in TLS, not on this
+      // frame) instead of a stack-resident MemPool.  Per-thread, so still off
+      // the shared request pool.  Everything allocated here (prefix is heap;
+      // the sparse selector / field-info live in this pool) is consumed within
+      // prepare(), before the guard rewinds.
+      auto poolGuard = MemPool::threadLocalPoolGuard();
+      MemPool& scratch = poolGuard.pool();
 
       // Per-segment vector counts -> cumulative prefix for FAISS-id -> segment
       // mapping.  Builder added segments in ord order skipping zero-vector
@@ -153,24 +186,30 @@ public:
       // numVectors).  Each segment gets a SegV2D resolver mapping valueRank ->
       // docId: identity for dense single-valued, a materialized bitset lookup for
       // sparse single-valued, and the column's reverse map for multi-valued.
-      std::span<int64_t> prefix = context.pool.make_span<int64_t>(numSegs + 1);
+      std::vector<int64_t> prefix(numSegs + 1);
       prefix[0] = 0;
-      std::span<SegV2D> v2dPerSeg = context.pool.make_span<SegV2D>(numSegs);
-      for (auto& s : v2dPerSeg) s = SegV2D{};
+      std::vector<SegV2D> v2dPerSeg(numSegs);
 
       // Holds the multi-valued segments' valueRank->docId MonoReaders alive through
-      // the FAISS search + result walk below (both in this constructor).  MonoReader is
+      // the FAISS search + result walk below.  MonoReader is
       // just pointers into the segment mmap (valid for the whole query), so copying it
-      // out of the scratch VectorReader is safe and cheap.  (The sparse single-valued
-      // Selector is pool-allocated via makeValueDocSelector, so it needs no holder.)
+      // out of the scratch VectorReader is safe and cheap.
       std::vector<std::optional<MonoReader>> monoHolders(numSegs);
+      std::vector<SegFieldInfo> segInfoStorage(numSegs);
+      std::vector<SegFieldInfo*> segInfos(numSegs, nullptr);
+      for (size_t i = 0; i < numSegs; i++) {
+        FieldReader fieldReader(scratch, reader.segments()[i].postingsReader());
+        if (fieldReader.seek(query.getField())) {
+          fieldReader.readFieldInfo(segInfoStorage[i]);
+          segInfos[i] = &segInfoStorage[i];
+        }
+      }
 
-      auto segInfos = context.readSegInfos(query.getField());
       int64_t totalDocsWithValue = 0;
       bool anyMultiValued = false;
       for (size_t i = 0; i < numSegs; i++) {
         int64_t segCount = 0;
-        if (!segInfos.empty() && segInfos[i] != nullptr) {
+        if (segInfos[i] != nullptr) {
           // FIXED_SIZE vector column.  numVectors == #docs-with-field for
           // single-valued, or the total vector count for multi-valued.
           VectorReader vr(reader.segments()[i].postingsReader(), *segInfos[i]);
@@ -196,7 +235,7 @@ public:
               // column's bitset.
               auto& dr = vr.strColReader().docsReader();
               if (dr.hasBitset()) {
-                v2dPerSeg[i].sel = makeValueDocSelector(context.pool, dr.bitset());
+                v2dPerSeg[i].sel = makeValueDocSelector(scratch, dr.bitset());
               }
             }
           }
@@ -224,12 +263,12 @@ public:
         queryPtr = queryBuf.data();
       }
 
-      // Use a faiss::IDSelector to filter deleted docs *inside* the search,
-      // so over-requesting is used only for multi-vector doc collapse, not for
-      // deleted vectors.  The selector closes over `prefix`, `v2dPerSeg`, and
-      // segment liveDocs - all live for the duration of search() (pool /
-      // IndexReader scoped).
-      LiveDocsSelector selector(prefix, v2dPerSeg, reader.segments());
+      // Use a faiss::IDSelector to filter deleted docs and the active query
+      // domain *inside* the search, so over-requesting is used only for
+      // multi-vector doc collapse.
+      std::span<const int64_t> prefixSpan(prefix.data(), prefix.size());
+      std::span<const SegV2D> v2dSpan(v2dPerSeg.data(), v2dPerSeg.size());
+      DomainSelector selector(prefixSpan, v2dSpan, reader.segments(), ctx.domainPerSeg);
       faiss::SearchParameters params;
       params.sel = &selector;
 
@@ -240,7 +279,7 @@ public:
         ? ceilDivClamped(ntotal, totalDocsWithValue, cap)
         : 1;
       int64_t kReq = mulClamped(kDocs, avgMult, cap);
-      if (kReq <= 0) return;
+      if (kReq <= 0) return std::make_unique<KnnPreparedWeight>(std::move(perSegHits));
 
       BranchlessIndex<int64_t> segIndex(prefix.size());
       std::vector<faiss::idx_t> ids;
@@ -263,7 +302,7 @@ public:
           faiss::idx_t fid = ids[(size_t)i];
           if (fid < 0) continue;  // FAISS pad - no more live results
           liveHits++;
-          int32_t ord = findSeg((int64_t)fid, prefix, segIndex);
+          int32_t ord = findSeg((int64_t)fid, prefixSpan, segIndex);
           if (ord < 0) continue;
           int64_t valueRank = (int64_t)fid - prefix[(size_t)ord];
           int32_t docId = v2dPerSeg[(size_t)ord].resolve(valueRank);
@@ -289,7 +328,7 @@ public:
                   docHits.size(), kDocs, query.getField(), cap);
       }
 
-      // Materialize the per-segment hit arrays in the pool, sorted by docId.
+      // Materialize the per-segment hit arrays, sorted by docId.
       std::sort(docHits.begin(), docHits.end(), [](const DocHit& a, const DocHit& b) {
         return (a.segOrd == b.segOrd) ? (a.docId < b.docId) : (a.segOrd < b.segOrd);
       });
@@ -297,24 +336,21 @@ public:
         int32_t ord = docHits[r].segOrd;
         size_t j = r + 1;
         while (j < docHits.size() && docHits[j].segOrd == ord) j++;
-        auto out = context.pool.make_span<Hit>(j - r);
+        auto& out = perSegHits[(size_t)ord];
+        out.reserve(j - r);
         for (size_t i = r; i < j; i++) {
-          out[i - r] = {docHits[i].docId, docHits[i].score};
+          out.push_back({docHits[i].docId, docHits[i].score});
         }
-        perSegHits[(size_t)ord] = out;
         r = j;
       }
+
+      return std::make_unique<KnnPreparedWeight>(std::move(perSegHits));
     }
 
     Query::Scorer* createScorer(MemPool& target, IndexReader::Segment& segment) override {
-      if ((size_t)segment.ord >= perSegHits.size()) return nullptr;
-      auto hits = perSegHits[segment.ord];
-      if (hits.empty()) return nullptr;
-      return target.make<KnnQuery::Scorer>(hits);
+      unused(target, segment);
+      return nullptr;
     }
-
-    // Exposed for testing.
-    std::span<std::span<const Hit>> getPerSegHits() const noexcept { return perSegHits; }
   };
 
   class Scorer final : public Query::Scorer {
@@ -329,11 +365,26 @@ public:
       return cur < (int32_t)hits.size() ? hits[cur].docId : PostingsReader::END;
     }
 
+    int32_t advance(int32_t docid) override {
+      if (cur >= 0 && cur < (int32_t)hits.size() && hits[cur].docId >= docid) {
+        return hits[cur].docId;
+      }
+      int32_t doc;
+      while ((doc = next()) < docid) {}
+      return doc;
+    }
+
+    bool advanceExact(int32_t docid) override {
+      return advance(docid) == docid;
+    }
+
     int32_t docId() override {
+      if (cur < 0) return -1;
       return cur < (int32_t)hits.size() ? hits[cur].docId : PostingsReader::END;
     }
 
     float score() override {
+      assert(cur >= 0 && cur < (int32_t)hits.size());
       return hits[cur].score;
     }
   };
@@ -396,16 +447,16 @@ private:
 
   /// faiss::IDSelector that maps a FAISS id to (segment ord, docRank) via
   /// the precomputed prefix sums + per-segment valueRank->docRank lookup,
-  /// then consults the segment's liveDocs.  FAISS calls is_member(id) for
-  /// every candidate during search and skips those that return false - so
-  /// deleted-doc vectors never make it into the result list.
+  /// then consults the segment's liveDocs and the active query domain.
+  /// FAISS calls is_member(id) for every candidate during search and skips
+  /// those that return false.
   ///
   /// For IndexFlat this doesn't reduce the scan cost (we still touch every
-  /// vector for distance computation) but it keeps deleted vectors out of the
-  /// returned candidate list.
+  /// vector for distance computation) but it keeps deleted and out-of-domain
+  /// vectors out of the returned candidate list.
   /// For HNSW/IVF later, the selector can also prune graph traversal / list
   /// selection.
-  class LiveDocsSelector : public faiss::IDSelector {
+  class DomainSelector : public faiss::IDSelector {
     std::span<const int64_t> prefix;
     // Precomputed monobound layout for prefix; is_member() runs per candidate
     // vector against this one array, so remembering it beats recomputing.
@@ -413,21 +464,28 @@ private:
     // Per-segment valueRank -> docId resolver (mono / flat / identity).
     std::span<const SegV2D> v2dPerSeg;
     std::span<IndexReader::Segment> segs;
+    std::span<DocSet* const> domainPerSeg;
 
   public:
-    LiveDocsSelector(std::span<const int64_t> prefix,
-                     std::span<const SegV2D> v2dPerSeg,
-                     std::span<IndexReader::Segment> segs) noexcept
-      : prefix(prefix), segIndex(prefix.size()), v2dPerSeg(v2dPerSeg), segs(segs) {}
+    DomainSelector(std::span<const int64_t> prefix,
+                   std::span<const SegV2D> v2dPerSeg,
+                   std::span<IndexReader::Segment> segs,
+                   std::span<DocSet* const> domainPerSeg) noexcept
+      : prefix(prefix), segIndex(prefix.size()), v2dPerSeg(v2dPerSeg),
+        segs(segs), domainPerSeg(domainPerSeg) {}
 
     bool is_member(faiss::idx_t id) const final {
       int32_t ord = findSeg((int64_t)id, prefix, segIndex);
       if (ord < 0) return false;
-      auto* live = segs[ord].liveDocs();
-      if (live == nullptr) return true;  // no deletes in this segment
       int64_t valueRank = (int64_t)id - prefix[ord];
       int32_t docId = v2dPerSeg[ord].resolve(valueRank);
-      return live->bitset().get(docId);
+      auto* live = segs[ord].liveDocs();
+      if (live != nullptr && !live->bitset().get(docId)) return false;
+      if (!domainPerSeg.empty()) {
+        auto* domain = domainPerSeg[(size_t)ord];
+        if (domain != nullptr && !domain->get(docId)) return false;
+      }
+      return true;
     }
   };
 };

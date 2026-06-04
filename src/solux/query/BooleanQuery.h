@@ -1,6 +1,7 @@
 #pragma once
 
 #include "Query.h"
+#include "QueryPrep.h"
 
 namespace solux {
 
@@ -21,13 +22,11 @@ public:
   }
 
   class Weight final : public Query::Weight {
-    BooleanQuery& query;
     std::span<Query::Weight*> mandatoryWeights;
     std::span<Query::Weight*> optionalWeights;
     std::span<Query::Weight*> prohibitedWeights;
     std::span<Query::Weight*> filterWeights;
 
-    // TODO: make these static (and refactor to query) so other queries can use them?
     // Returns a span of Weights, corresponding to the given span of Queries. Some weights can be null.
     std::span<Query::Weight*> createWeights(solux::MemPool& targetPool, Context& context, std::span<Query*> queries) {
       if (queries.size() == 0) {
@@ -40,77 +39,46 @@ public:
       return {weights, queries.size()};
     }
 
-    std::span<Scorer*> createScorers(solux::MemPool& targetPool, solux::IndexReader::Segment& segment,
-                                     std::span<Query::Weight*> weights) {
-      if (weights.size() == 0) {
-        return {};
-      }
-      // could optimize for 1 as well, but not a big deal.
-      auto& scorers = *targetPool.make_vec<Query::Scorer*>();
-      scorers.reserve(weights.size());
-      for (auto* weight: weights) {
-        auto* scorer = weight->createScorer(targetPool, segment);
-        if (scorer != nullptr) {
-          scorers.push_back(scorer);
-        }
-      }
-      return scorers;
-    }
-
-
-  public:
-    Weight(Context& context, BooleanQuery& query) : Query::Weight(context), query(query) {
-      mandatoryWeights = createWeights(context.pool, context, query.mandatory);
-      optionalWeights = createWeights(context.pool, context, query.optional);
-      prohibitedWeights = createWeights(context.pool, context, query.prohibited);
-      filterWeights = createWeights(context.pool, context, query.filter);
-    }
-
-
-    Scorer* createScorer(solux::MemPool& targetPool, solux::IndexReader::Segment& segment) override {
-      auto mandatoryScorers = createScorers(targetPool, segment, mandatoryWeights);
-      if (mandatoryScorers.size() < query.mandatory.size()) {
-        // if any mandatory scorers are missing for this segment, then it's impossible to match.
-        return nullptr;
-      }
-
-      auto filterScorers = createScorers(targetPool, segment, filterWeights);
-      if (filterScorers.size() < query.filter.size()) {
-        // if any filters are missing for this segment, then it's impossible to match
-        return nullptr;
-      }
+    // Keep clause wiring in one place so prepared and non-prepared execution
+    // cannot diverge on filter/prohibited semantics.
+    static Query::Scorer* assembleScorer(
+        MemPool& targetPool,
+        IndexReader::Segment& segment,
+        std::span<const QueryPrep::ScorerSource> mandatorySources,
+        std::span<const QueryPrep::ScorerSource> optionalSources,
+        std::span<const QueryPrep::ScorerSource> prohibitedSources,
+        std::span<Query::Scorer*> filterScorers) {
+      auto mandatoryScorers = QueryPrep::createScorers(targetPool, segment, mandatorySources);
+      if (mandatoryScorers.size() < mandatorySources.size()) return nullptr;
 
       Query::Scorer* mandScorer = nullptr;
-      if (mandatoryScorers.size() > 0) {
-        if (mandatoryScorers.size() == 1) {
-          mandScorer = mandatoryScorers[0];
-        } else {
-          mandScorer = targetPool.make<BooleanQuery::ConjunctionScorer>(targetPool, mandatoryScorers, filterScorers);
-        }
+      if (!mandatoryScorers.empty()) {
+        mandScorer = mandatoryScorers.size() == 1 && filterScorers.empty()
+          ? mandatoryScorers[0]
+          : targetPool.make<BooleanQuery::ConjunctionScorer>(targetPool, mandatoryScorers, filterScorers);
       }
 
-      auto optionalScorers = createScorers(targetPool, segment, optionalWeights);
+      auto optionalScorers = QueryPrep::createScorers(targetPool, segment, optionalSources);
       Query::Scorer* optScorer = nullptr;
-      if (optionalScorers.size() > 0) {
-        if (optionalScorers.size() == 1) {
-          optScorer = optionalScorers[0];
-        } else {
-          optScorer = targetPool.make<BooleanQuery::DisjunctionScorer>(targetPool, optionalScorers);
-        }
+      if (!optionalScorers.empty()) {
+        optScorer = optionalScorers.size() == 1
+          ? optionalScorers[0]
+          : targetPool.make<BooleanQuery::DisjunctionScorer>(targetPool, optionalScorers);
       }
 
-      // Find the current top scorer... mandatory, optional, or a combination.
       Query::Scorer* boolScorer = nullptr;
       if (mandScorer == nullptr) {
         if (optScorer == nullptr) {
-          return nullptr;
-        }
-        boolScorer = optScorer;
-        // if there were no mandatory clauses then we still need to handle any filter clauses.
-        if (filterScorers.size() > 0) {
-          std::span<Query::Scorer*> optSpan(targetPool.make_arr<Query::Scorer*>(1), 1);
-          optSpan[0] = optScorer;
-          boolScorer = targetPool.make<BooleanQuery::ConjunctionScorer>(targetPool, optSpan, filterScorers);
+          if (filterScorers.empty()) return nullptr;
+          boolScorer = targetPool.make<BooleanQuery::ConjunctionScorer>(
+            targetPool, std::span<Query::Scorer*>(), filterScorers);
+        } else {
+          boolScorer = optScorer;
+          if (!filterScorers.empty()) {
+            std::span<Query::Scorer*> optSpan(targetPool.make_arr<Query::Scorer*>(1), 1);
+            optSpan[0] = optScorer;
+            boolScorer = targetPool.make<BooleanQuery::ConjunctionScorer>(targetPool, optSpan, filterScorers);
+          }
         }
       } else if (optScorer == nullptr) {
         boolScorer = mandScorer;
@@ -118,19 +86,113 @@ public:
         boolScorer = targetPool.make<BooleanQuery::MandOptScorer>(targetPool, mandScorer, optScorer);
       }
 
-      // Now apply prohibited clauses
-      auto prohibitedScorers = createScorers(targetPool, segment, prohibitedWeights);
-      Query::Scorer* prohibitedScorer = nullptr;
-      if (prohibitedScorers.size() > 0) {
-        if (prohibitedScorers.size() == 1) {
-          prohibitedScorer = prohibitedScorers[0];
-        } else {
-          prohibitedScorer = targetPool.make<BooleanQuery::DisjunctionScorer>(targetPool, prohibitedScorers);
-        }
+      auto prohibitedScorers = QueryPrep::createScorers(targetPool, segment, prohibitedSources);
+      if (!prohibitedScorers.empty()) {
+        Query::Scorer* prohibitedScorer = prohibitedScorers.size() == 1
+          ? prohibitedScorers[0]
+          : targetPool.make<BooleanQuery::DisjunctionScorer>(targetPool, prohibitedScorers);
         boolScorer = targetPool.make<BooleanQuery::MandNotScorer>(targetPool, boolScorer, prohibitedScorer);
       }
-
       return boolScorer;
+    }
+
+    class BooleanPreparedWeight final : public Query::Weight::PreparedWeight {
+      std::vector<QueryPrep::PreparedSource> mandatorySources;
+      std::vector<QueryPrep::PreparedSource> optionalSources;
+      std::vector<QueryPrep::PreparedSource> prohibitedSources;
+      std::vector<std::unique_ptr<DocSet>> filterDomains;
+      bool hasFilters = false;
+
+    public:
+      BooleanPreparedWeight(std::vector<QueryPrep::PreparedSource>&& mandatorySources,
+                            std::vector<QueryPrep::PreparedSource>&& optionalSources,
+                            std::vector<QueryPrep::PreparedSource>&& prohibitedSources,
+                            std::vector<std::unique_ptr<DocSet>>&& filterDomains,
+                            bool hasFilters)
+        : mandatorySources(std::move(mandatorySources)),
+          optionalSources(std::move(optionalSources)),
+          prohibitedSources(std::move(prohibitedSources)),
+          filterDomains(std::move(filterDomains)),
+          hasFilters(hasFilters) {}
+
+      Query::Scorer* createScorer(MemPool& targetPool, IndexReader::Segment& segment) override {
+        std::span<Query::Scorer*> filterScorers;
+        if (hasFilters) {
+          auto* filterDomain = filterDomains[(size_t)segment.ord].get();
+          auto* filterScorer = QueryPrep::createDocSetScorer(targetPool, filterDomain, segment);
+          if (filterScorer == nullptr) return nullptr;
+          filterScorers = {targetPool.make_arr<Query::Scorer*>(1), 1};
+          filterScorers[0] = filterScorer;
+        }
+
+        return assembleScorer(
+          targetPool,
+          segment,
+          QueryPrep::scorerSources(targetPool, QueryPrep::preparedSpan(mandatorySources)),
+          QueryPrep::scorerSources(targetPool, QueryPrep::preparedSpan(optionalSources)),
+          QueryPrep::scorerSources(targetPool, QueryPrep::preparedSpan(prohibitedSources)),
+          filterScorers);
+      }
+    };
+
+
+  public:
+    Weight(Context& context, BooleanQuery& query) : Query::Weight(context) {
+      mandatoryWeights = createWeights(context.pool, context, query.mandatory);
+      optionalWeights = createWeights(context.pool, context, query.optional);
+      prohibitedWeights = createWeights(context.pool, context, query.prohibited);
+      filterWeights = createWeights(context.pool, context, query.filter);
+    }
+
+    bool needsPrepare() const noexcept override {
+      return QueryPrep::anyNeedsPrepare(mandatoryWeights) ||
+             QueryPrep::anyNeedsPrepare(optionalWeights) ||
+             QueryPrep::anyNeedsPrepare(prohibitedWeights) ||
+             QueryPrep::anyNeedsPrepare(filterWeights);
+    }
+
+    std::unique_ptr<Query::Weight::PreparedWeight> prepare(Query::Weight::PrepareContext& ctx) override {
+      auto filterSources = QueryPrep::prepareSources(filterWeights, ctx);
+      std::vector<std::unique_ptr<DocSet>> filterDomains(ctx.reader.segments().size());
+      std::vector<DocSet*> childDomainPtrs(ctx.reader.segments().size());
+
+      if (!filterSources.empty()) {
+        for (size_t segnum = 0; segnum < ctx.reader.segments().size(); segnum++) {
+          auto* outerDomain = ctx.domainPerSeg.empty() ? nullptr : ctx.domainPerSeg[segnum];
+          filterDomains[segnum] = QueryPrep::materializeIntersection(
+            QueryPrep::preparedSpan(filterSources), ctx.reader.segments()[segnum], outerDomain);
+          childDomainPtrs[segnum] = filterDomains[segnum].get();
+        }
+      } else {
+        for (size_t segnum = 0; segnum < ctx.reader.segments().size(); segnum++) {
+          childDomainPtrs[segnum] = ctx.domainPerSeg.empty() ? nullptr : ctx.domainPerSeg[segnum];
+        }
+      }
+
+      Query::Weight::PrepareContext childCtx{ctx.reader, std::span<DocSet* const>(childDomainPtrs.data(), childDomainPtrs.size())};
+      auto mandatorySources = QueryPrep::prepareSources(mandatoryWeights, childCtx);
+      auto optionalSources = QueryPrep::prepareSources(optionalWeights, childCtx);
+      auto prohibitedSources = QueryPrep::prepareSources(prohibitedWeights, ctx);
+
+      return std::make_unique<BooleanPreparedWeight>(
+        std::move(mandatorySources), std::move(optionalSources),
+        std::move(prohibitedSources), std::move(filterDomains),
+        !filterSources.empty());
+    }
+
+
+    Scorer* createScorer(solux::MemPool& targetPool, solux::IndexReader::Segment& segment) override {
+      auto mandatorySources = QueryPrep::liveSources(targetPool, mandatoryWeights);
+      auto optionalSources = QueryPrep::liveSources(targetPool, optionalWeights);
+      auto prohibitedSources = QueryPrep::liveSources(targetPool, prohibitedWeights);
+      auto filterSources = QueryPrep::liveSources(targetPool, filterWeights);
+      auto filterScorers = QueryPrep::createScorers(targetPool, segment, filterSources);
+
+      // If any filter scorer is missing for this segment, no document can match.
+      if (filterScorers.size() < filterSources.size()) return nullptr;
+
+      return assembleScorer(
+        targetPool, segment, mandatorySources, optionalSources, prohibitedSources, filterScorers);
     }
   };  // BooleanQuery::Weight
 
@@ -178,10 +240,9 @@ public:
     }
 
     bool advanceExact(int32_t docid) override {
-      if (mandScorer->advanceExact(docid)) {
-        id = docid;
-      }
-      return id;
+      if (!mandScorer->advanceExact(docid)) return false;
+      id = docid;
+      return true;
     }
 
     float score() override {
@@ -272,7 +333,7 @@ public:
           int32_t id = allScorers[j]->advance(target);
           assert(id >= target);
           if (id > target) {
-            target = firstScorer->advance(target);
+            target = firstScorer->advance(id);
             goto outer;  // could perhaps replace with "j=0; continue;" but that seems potentially worse?
           }
         }
@@ -376,7 +437,7 @@ public:
     }
 
     float score() override {
-      assert(docid = pq.top().docId());
+      assert(docid == pq.top().docId());
       float score = pq.top().score();
       int increments = 0;
       // If we ever had a huge disjunction, we don't really need to look at all of them for matches.  But equal

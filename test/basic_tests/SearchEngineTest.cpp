@@ -1,7 +1,8 @@
 
-#include <iostream>
 #include <gtest/gtest.h>
 #include <google/protobuf/text_format.h>
+#include <iostream>
+#include <map>
 #include "test/SoluxTest.h"
 #include "test/CollectionHelper.h"
 #include "test/LocalReq.h"
@@ -348,3 +349,141 @@ TEST_F(SearchEngineTest, basic) {
   }
 }
 
+TEST_F(SearchEngineTest, forcePrepareWrapperMatchesChild) {
+  CollectionHelper helper;
+  helper.clear();
+  helper.index(flatdoc("foo_w", "how now brown cow", "foo_i", 17, "color_s", "red"), UpdateMessage::COMMIT);
+  helper.index(flatdoc("foo_w", "charlie brown", "foo_i", 23, "color_s", "blue"), UpdateMessage::NO_COMMIT);
+  helper.index(flatdoc("foo_w", "brown", "foo_i", 5, "color_s", "brown"), UpdateMessage::COMMIT);
+
+  auto addBrownTopDocs = [](proto::TopDocs& topDocs) -> proto::Match& {
+    topDocs.set_get_number(true);
+    topDocs.set_get_scores(true);
+    topDocs.mutable_fields()->Add("foo_i");
+    topDocs.mutable_fields()->Add("color_s");
+    auto& match = *topDocs.mutable_query()->mutable_match();
+    match.set_field("foo_w");
+    match.mutable_val()->set_s("brown");
+    return match;
+  };
+
+  auto* lreq = LocalReq::create(soluxNode->getSearchEngine());
+  lreq->proto.mutable_collection()->add_name("main");
+  auto& ops = *lreq->proto.mutable_ops();
+  addBrownTopDocs(*ops["normal"].mutable_top_docs());
+
+  auto& forced = *ops["forced"].mutable_top_docs();
+  forced.set_get_number(true);
+  forced.set_get_scores(true);
+  forced.mutable_fields()->Add("foo_i");
+  forced.mutable_fields()->Add("color_s");
+  auto& forcedMatch = *forced.mutable_query()->mutable_force_prepare()->mutable_query()->mutable_match();
+  forcedMatch.set_field("foo_w");
+  forcedMatch.mutable_val()->set_s("brown");
+  auto& forcedFacet = *(*forced.mutable_ops())["colors"].mutable_field_facet();
+  forcedFacet.set_field("color_s");
+  forcedFacet.set_limit(-1);
+
+  lreq->engine.submit(*lreq, true);
+  ASSERT_EQ(1, lreq->responses.size()) << lreq->toString();
+  ASSERT_FALSE(lreq->responses[0]->proto.has_error()) << lreq->toString();
+
+  const auto& normalDocs = lreq->responses[0]->proto.ops().at("normal").docs();
+  const auto& forcedDocs = lreq->responses[0]->proto.ops().at("forced").docs();
+  ASSERT_EQ(normalDocs.matches(), forcedDocs.matches());
+
+  const auto& normalFoo = normalDocs.columns().at("foo_i").col_i().v();
+  const auto& forcedFoo = forcedDocs.columns().at("foo_i").col_i().v();
+  ASSERT_EQ(normalFoo.size(), forcedFoo.size());
+  for (int i = 0; i < normalFoo.size(); i++) {
+    EXPECT_EQ(normalFoo[i], forcedFoo[i]);
+  }
+
+  const auto& normalColor = normalDocs.columns().at("color_s").col_s().v();
+  const auto& forcedColor = forcedDocs.columns().at("color_s").col_s().v();
+  ASSERT_EQ(normalColor.size(), forcedColor.size());
+  for (int i = 0; i < normalColor.size(); i++) {
+    EXPECT_EQ(normalColor[i], forcedColor[i]);
+  }
+
+  const auto& normalScore = normalDocs.columns().at("_score_").col_f().v();
+  const auto& forcedScore = forcedDocs.columns().at("_score_").col_f().v();
+  ASSERT_EQ(normalScore.size(), forcedScore.size());
+  for (int i = 0; i < normalScore.size(); i++) {
+    EXPECT_FLOAT_EQ(normalScore[i], forcedScore[i]);
+  }
+
+  const auto& facet = forcedDocs.ops().at("colors").facet();
+  ASSERT_EQ(3, facet.bucket_ids().col_s().v_size());
+  std::map<std::string, int64_t> facetCounts;
+  for (int i = 0; i < facet.bucket_ids().col_s().v_size(); i++) {
+    facetCounts[std::string(facet.bucket_ids().col_s().v(i))] = facet.counts().at(i);
+  }
+  EXPECT_EQ(1, facetCounts["blue"]);
+  EXPECT_EQ(1, facetCounts["brown"]);
+  EXPECT_EQ(1, facetCounts["red"]);
+
+  lreq->done();
+}
+
+TEST_F(SearchEngineTest, constantScoreWrapperSetsScore) {
+  CollectionHelper helper;
+  helper.clear();
+  helper.index(flatdoc("foo_w", "how now brown cow", "foo_i", 17, "color_s", "red"), UpdateMessage::COMMIT);
+  helper.index(flatdoc("foo_w", "charlie brown", "foo_i", 23, "color_s", "blue"), UpdateMessage::NO_COMMIT);
+  helper.index(flatdoc("foo_w", "brown", "foo_i", 5, "color_s", "brown"), UpdateMessage::COMMIT);
+
+  auto* lreq = LocalReq::create(soluxNode->getSearchEngine());
+  lreq->proto.mutable_collection()->add_name("main");
+
+  auto& topDocs = *(*lreq->proto.mutable_ops())["constant"].mutable_top_docs();
+  topDocs.set_get_number(true);
+  topDocs.set_get_scores(true);
+  topDocs.mutable_fields()->Add("foo_i");
+  topDocs.mutable_fields()->Add("color_s");
+
+  auto& constant = *topDocs.mutable_query()->mutable_constant_score();
+  constant.set_score(7.5f);
+  auto& match = *constant.mutable_query()->mutable_force_prepare()->mutable_query()->mutable_match();
+  match.set_field("foo_w");
+  match.mutable_val()->set_s("brown");
+
+  auto& facet = *(*topDocs.mutable_ops())["colors"].mutable_field_facet();
+  facet.set_field("color_s");
+  facet.set_limit(-1);
+
+  lreq->engine.submit(*lreq, true);
+  ASSERT_EQ(1, lreq->responses.size()) << lreq->toString();
+  ASSERT_FALSE(lreq->responses[0]->proto.has_error()) << lreq->toString();
+
+  const auto& docs = lreq->responses[0]->proto.ops().at("constant").docs();
+  ASSERT_EQ(3, docs.matches());
+
+  const auto& foo = docs.columns().at("foo_i").col_i().v();
+  ASSERT_EQ(3, foo.size());
+  std::map<int64_t, bool> seenFoo;
+  for (int i = 0; i < foo.size(); i++) {
+    seenFoo[foo[i]] = true;
+  }
+  EXPECT_TRUE(seenFoo[5]);
+  EXPECT_TRUE(seenFoo[17]);
+  EXPECT_TRUE(seenFoo[23]);
+
+  const auto& scores = docs.columns().at("_score_").col_f().v();
+  ASSERT_EQ(3, scores.size());
+  for (int i = 0; i < scores.size(); i++) {
+    EXPECT_FLOAT_EQ(7.5f, scores[i]);
+  }
+
+  const auto& facetResult = docs.ops().at("colors").facet();
+  ASSERT_EQ(3, facetResult.bucket_ids().col_s().v_size());
+  std::map<std::string, int64_t> facetCounts;
+  for (int i = 0; i < facetResult.bucket_ids().col_s().v_size(); i++) {
+    facetCounts[std::string(facetResult.bucket_ids().col_s().v(i))] = facetResult.counts().at(i);
+  }
+  EXPECT_EQ(1, facetCounts["blue"]);
+  EXPECT_EQ(1, facetCounts["brown"]);
+  EXPECT_EQ(1, facetCounts["red"]);
+
+  lreq->done();
+}

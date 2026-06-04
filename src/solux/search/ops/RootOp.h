@@ -32,6 +32,10 @@ public:
       // Is it better in general to let the sub-calculators launch a new task for each calc() call,
       // or launch them all in parallel here?  If we let them launch their own tasks, then it
       // would be easier for them to use a different nested task group if they wanted to.
+      // Future prepared-weight queries that need domains from all segments before
+      // launching segment work could also use that child-owned scheduling shape:
+      // RootOp would call them synchronously for each segment, and the child would
+      // decide when and how to launch follow-up tasks.
       const auto& segs = op.req.reader->segments();
       for (auto& subCalc : subCalcs) {
         for (int32_t i = 0; i < (int32_t)segs.size(); i++) {
