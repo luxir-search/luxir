@@ -188,6 +188,11 @@ message KnnQuery {
   int32 nprobe = 4;        // exact IVF lists to probe (clamped to nlist); may return
                            // < k docs. 0 = index default, with host auto-deepening.
   int32 refine_factor = 5; // candidate overfetch for approximate ANN; 0 uses default
+  bool exact = 6;          // require exact (true top-k) results: the engine uses an
+                           // execution path that guarantees them (currently a full
+                           // scan of the stored vector column) and does not consult
+                           // approximate ANN indexes. nprobe / refine_factor are
+                           // ignored. Cost is linear in the number of stored vectors.
 }
 
   // use NamedValue here instead? Repeat field so this can be used to query multiple fields at once? Add a field glob/regex?

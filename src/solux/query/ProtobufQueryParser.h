@@ -129,7 +129,8 @@ public:
     }
 
     return pool.make<solux::KnnQuery>(
-      field, vectorType, queryVec, k, knnQuery.nprobe(), knnQuery.refine_factor());
+      field, vectorType, queryVec, k, knnQuery.nprobe(), knnQuery.refine_factor(),
+      knnQuery.exact());
   }
 
   std::span<Query*> parseQueryList(const google::protobuf::RepeatedPtrField<solux::proto::Query>& queries) {

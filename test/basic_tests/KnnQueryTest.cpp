@@ -216,7 +216,8 @@ protected:
   // vector + k.  Always pulls back "id" so tests can assert ordering.
   static LocalReq* makeKnnReq(SoluxNode& node, std::string_view field,
                               std::vector<float> queryVec, int32_t k,
-                              int32_t nprobe = 0, int32_t refineFactor = 0) {
+                              int32_t nprobe = 0, int32_t refineFactor = 0,
+                              bool exact = false) {
     auto* lreq = LocalReq::create(node.getSearchEngine());
     lreq->proto.mutable_collection()->add_name("main");
     auto& topDocs = *(*lreq->proto.mutable_ops())["q"].mutable_top_docs();
@@ -224,18 +225,21 @@ protected:
     topDocs.set_get_number(true);
     topDocs.mutable_fields()->Add("id");
 
-    setKnnQuery(*topDocs.mutable_query(), field, queryVec, k, nprobe, refineFactor);
+    setKnnQuery(*topDocs.mutable_query(), field, queryVec, k, nprobe, refineFactor,
+                exact);
     return lreq;
   }
 
   static void setKnnQuery(proto::Query& query, std::string_view field,
                           const std::vector<float>& queryVec, int32_t k,
-                          int32_t nprobe = 0, int32_t refineFactor = 0) {
+                          int32_t nprobe = 0, int32_t refineFactor = 0,
+                          bool exact = false) {
     auto& knn = *query.mutable_knn();
     knn.set_field(field);
     knn.set_k(k);
     if (nprobe > 0) knn.set_nprobe(nprobe);
     if (refineFactor > 0) knn.set_refine_factor(refineFactor);
+    if (exact) knn.set_exact(true);
     auto& f32 = *knn.mutable_query()->mutable_f32();
     for (float v : queryVec) f32.add_v(v);
   }
@@ -1035,6 +1039,97 @@ TEST_F(KnnQueryTest, ivfPqApproximateRecallAtOneProbe) {
   }
   EXPECT_GE(hits, 3) << "IVF+PQ one-probe recall should recover most exact top hits";
 
+  req->done();
+}
+
+// exact=true is a result contract: true top-k regardless of which ANN index
+// exists or what nprobe/refine say.  The data makes the ANN path miss by
+// construction: two tight blobs (nlist=2) plus one "outlier" vector at 600,
+// which k-means must assign to blob B's list (600 is closer to ~1000 than to
+// ~0).  The query at 400 is closer to blob A's centroid, so nprobe=1 probes
+// only A - the outlier, the true nearest doc by a 2x margin, is structurally
+// invisible to the approximate path.  exact must recover it.
+TEST_F(KnnQueryTest, exactBypassesApproximateIndex) {
+  IvfPqAuxGuard guard(/*nlist=*/2, /*m=*/2, /*bits=*/2,
+                      /*nprobe=*/1, /*minTraining=*/16, /*refineFactor=*/8);
+  CollectionHelper h("main");
+  h.clear();
+  installVecSchema(h.collection(), proto::VectorParams::L2);
+
+  for (int i = 0; i < 80; i++) {
+    float off = (float)i * 0.01f;
+    h.index(flatdoc("id", "a" + std::to_string(i),
+                    "embedding_v", std::vector<float>{off, 0.0f, 0.0f, 0.0f}));
+    h.index(flatdoc("id", "b" + std::to_string(i),
+                    "embedding_v", std::vector<float>{1000.0f + off, 0.0f, 0.0f, 0.0f}));
+  }
+  h.index(flatdoc("id", std::string("outlier"),
+                  "embedding_v", std::vector<float>{600.0f, 0.0f, 0.0f, 0.0f}));
+  h.commit({"*"});
+
+  // Approximate at nprobe=1: probes blob A's list only; the outlier (true #1,
+  // distance 200 vs blob A's best ~399) cannot appear.
+  auto* approx = makeKnnReq(*soluxNode, "embedding_v", {400, 0, 0, 0}, 5,
+                            /*nprobe=*/1, /*refineFactor=*/8);
+  approx->execute();
+  auto approxIds = resultIds(*approx);
+  ASSERT_EQ(approxIds.size(), 5u);
+  for (const auto& id : approxIds) {
+    EXPECT_NE(id, "outlier") << "nprobe=1 should be unable to reach the outlier's list";
+  }
+  approx->done();
+
+  // exact: identical request plus the contract flag; hostile nprobe/refine
+  // are ignored and the true top-5 comes back in order.
+  auto* req = makeKnnReq(*soluxNode, "embedding_v", {400, 0, 0, 0}, 5,
+                         /*nprobe=*/1, /*refineFactor=*/8, /*exact=*/true);
+  req->execute();
+
+  EXPECT_EQ(req->getMatchCount(), 5);
+  auto ids = resultIds(*req);
+  auto scores = resultScores(*req);
+  ASSERT_EQ(ids.size(), 5u);
+  EXPECT_EQ(ids[0], "outlier");
+  for (int i = 1; i < 5; i++) {
+    EXPECT_EQ(ids[(size_t)i], "a" + std::to_string(80 - i));  // a79, a78, a77, a76
+  }
+  ASSERT_EQ(scores.size(), 5u);
+  for (size_t i = 1; i < scores.size(); i++) {
+    EXPECT_GT(scores[i - 1], scores[i]);
+  }
+
+  req->done();
+}
+
+// The maxKnnCandidates host cap is a heuristic; exact is a contract and must
+// not be silently truncated by it.  Without exact, the same capped request
+// returns only cap docs.
+TEST_F(KnnQueryTest, exactIgnoresMaxKnnCandidatesCap) {
+  MaxKnnCandidatesGuard guard(2);
+
+  CollectionHelper h("main");
+  h.clear();
+  installVecSchema(h.collection(), proto::VectorParams::L2);
+  for (int i = 0; i < 10; i++) {
+    h.index(flatdoc("id", "doc" + std::to_string(i),
+                    "embedding_v", std::vector<float>{(float)i, 0.0f, 0.0f, 0.0f}));
+  }
+  h.commit({"*"});
+
+  auto* capped = makeKnnReq(*soluxNode, "embedding_v", {0, 0, 0, 0}, 5);
+  capped->execute();
+  EXPECT_EQ(capped->getMatchCount(), 2) << "non-exact respects the host cap";
+  capped->done();
+
+  auto* req = makeKnnReq(*soluxNode, "embedding_v", {0, 0, 0, 0}, 5,
+                         /*nprobe=*/0, /*refineFactor=*/0, /*exact=*/true);
+  req->execute();
+  EXPECT_EQ(req->getMatchCount(), 5) << "exact fulfills k despite the host cap";
+  auto ids = resultIds(*req);
+  ASSERT_EQ(ids.size(), 5u);
+  for (int i = 0; i < 5; i++) {
+    EXPECT_EQ(ids[(size_t)i], "doc" + std::to_string(i));
+  }
   req->done();
 }
 

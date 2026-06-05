@@ -43,6 +43,15 @@ engine for roughly `k * refine_factor` vector candidates, unions candidates
 across deepen rounds, rescans approximate hits from the full-precision column,
 sorts by exact score, and then collapses to one hit per document.
 
+`exact` requires exact (true top-k) results. It is a result contract, not an
+execution mode: the engine uses a path that guarantees exactness - currently
+an exhaustive scan over the stored vector column - and does not consult
+approximate ANN indexes. `nprobe` and `refine_factor` are ignored. Cost is
+linear in the number of stored vectors. Query semantics are otherwise
+identical to the default path (same filters, same multi-valued collapse, same
+score scale), which makes `exact` the ground truth for measuring ANN recall:
+run the same query twice, once with `exact`, and compare.
+
 ## Scoring
 
 L2 scores are reported as `1 / (1 + squared_distance)`. Inner product scores are

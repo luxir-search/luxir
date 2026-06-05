@@ -63,6 +63,7 @@ class KnnQuery final : public solux::Query {
   int32_t k;
   int32_t nprobe;
   int32_t refineFactor;
+  bool exact;
 
 public:
   /// One result hit within a segment.  docId is the local docRank within the
@@ -146,9 +147,9 @@ public:
 
   KnnQuery(std::string_view field, const VectorFieldType& fieldType,
            std::span<const float> queryVec, int32_t k,
-           int32_t nprobe = 0, int32_t refineFactor = 0)
+           int32_t nprobe = 0, int32_t refineFactor = 0, bool exact = false)
     : field(field), fieldType(fieldType), queryVec(queryVec), k(k),
-      nprobe(nprobe), refineFactor(refineFactor) {}
+      nprobe(nprobe), refineFactor(refineFactor), exact(exact) {}
 
   std::string_view getField() const noexcept { return field; }
   const VectorFieldType& getFieldType() const noexcept { return fieldType; }
@@ -156,6 +157,7 @@ public:
   int32_t getK() const noexcept { return k; }
   int32_t getNProbe() const noexcept { return nprobe; }
   int32_t getRefineFactor() const noexcept { return refineFactor; }
+  bool getExact() const noexcept { return exact; }
 
   Query::Weight* createWeight(Query::Context& context) override {
     return context.pool.make<KnnQuery::Weight>(context, *this);
@@ -179,6 +181,15 @@ public:
         throw std::runtime_error(std::format(
           "KnnQuery: query vector dims {} do not match schema dims {} for field '{}'",
           query.getQueryVec().size(), query.getFieldType().dims(), query.getField()));
+      }
+
+      // exact pins the result contract: true top-k, via an execution path
+      // that guarantees it.  Today that is the exhaustive flat-over-column
+      // scan in prepare(); approximate aux indexes are never consulted.
+      // Leaving vaux null selects that path, with identical query semantics
+      // (match-k, prepare, collapse) so exact/ANN results are comparable.
+      if (query.getExact()) {
+        return;
       }
 
       // Aux present wins (explicit FAISS-flat A-B path or IVF+PQ).
@@ -354,6 +365,11 @@ public:
 
       int64_t kDocs = query.getK();
       int64_t cap = std::min(ntotal, std::max((int64_t)1, maxKnnCandidates));
+      // exact is a contract: the maxKnnCandidates host heuristic must not
+      // silently truncate the requested k (the explicit knob wins).  ntotal
+      // still bounds it - fewer stored docs than k is not a violation, the
+      // true top-k is simply all of them.
+      if (query.getExact()) cap = std::min(ntotal, std::max(cap, kDocs));
       bool approximateEngine = vaux != nullptr && !vaux->scoresAreExact();
       int64_t avgMult = (faissIdx != nullptr && anyMultiValued && totalDocsWithValue > 0)
         ? ceilDivClamped(ntotal, totalDocsWithValue, cap)
