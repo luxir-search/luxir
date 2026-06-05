@@ -9,6 +9,7 @@
 
 #include "protos/solux_types.pb.h"
 #include "solux/index/IndexWriter.h"
+#include "solux/index/VectorIndexBuilder.h"
 #include "solux/reader/AuxReader.h"
 #include "solux/reader/Postings.h"
 #include "solux/reader/VectorAuxReader.h"
@@ -25,8 +26,13 @@ using namespace solux::test;
 class IndexReaderAuxTest : public SoluxTest {
 protected:
   void SetUp() override {
+    VectorIndexBuilder::buildFaissFlatAuxIndexes = true;
     auto col = soluxNode->getCollection("main");
     col->setSchema(Schema::createDefaultSchema());
+  }
+
+  void TearDown() override {
+    VectorIndexBuilder::buildFaissFlatAuxIndexes = false;
   }
 
   // Install a schema where _v has metric=L2 so the suffix-rule fields

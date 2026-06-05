@@ -48,6 +48,7 @@ faiss::MetricType toFaissMetric(VectorFieldType::Metric m) {
 
 // Default 1 MiB.  Tests can override via VectorIndexBuilder::renormChunkBytes.
 size_t VectorIndexBuilder::renormChunkBytes = 1 * 1024 * 1024;
+bool VectorIndexBuilder::buildFaissFlatAuxIndexes = false;
 
 bool VectorIndexBuilder::selectorMatches(const std::vector<std::string>& selectors,
                                          std::string_view name) {
@@ -80,7 +81,7 @@ VectorIndexBuilder::collectEligibleFields() {
     auto* ft = schema_.getFieldTypePtr(name);
     if (ft == nullptr || ft->type() != FieldType::VECTOR) continue;
     auto* vft = (const VectorFieldType*)ft;
-    if (!vft->buildsAnnIndex()) continue;
+    if (!vft->knnSearchable()) continue;
     // Multi-valued vectors are indexed too: every value is added to FAISS, and the
     // query layer maps each FAISS id back to its owning doc via the valueRank->docId
     // column (StrColReader::getValDocReader).
@@ -97,6 +98,10 @@ VectorIndexBuilder::build(const std::vector<std::string>& selectors,
                           std::vector<std::string>& outFilesToSync) {
   std::vector<proto::AuxIndexInfo> result;
   if (selectors.empty()) return result;
+  if (!buildFaissFlatAuxIndexes) {
+    LOG_TRACE("VectorIndexBuilder: FAISS-flat aux build disabled; flat kNN uses column scan");
+    return result;
+  }
 
   auto eligible = collectEligibleFields();
   for (const auto& [fieldName, vft] : eligible) {

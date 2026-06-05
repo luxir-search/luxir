@@ -160,9 +160,9 @@ public:
 // 0, in which case the first indexed value in a segment fixes the segment's
 // per-vector size; a positive dims_ enforces validation at index time.
 //
-// metric_ controls whether a FAISS ANN aux index is built.  NONE means
-// storage-only; L2 / IP / COSINE pick the metric used when the field is
-// targeted by UpdateRequest.build_aux_indexes.
+// metric_ controls whether the field is searchable by kNN / ANN.  NONE means
+// storage-only; L2 / IP / COSINE pick the similarity metric for exact column
+// scan and future aux-backed ANN engines.
 class VectorFieldType : public FieldType {
 public:
   enum Metric {
@@ -174,8 +174,8 @@ public:
 
   int32_t dims_;
   Metric metric_;
-  // Caller asserts incoming vectors are unit-norm - the COSINE build path
-  // skips its copy + renormalize step.  Ignored for non-COSINE metrics.
+  // Caller asserts incoming vectors are unit-norm.  COSINE write and aux-build
+  // paths trust the bytes as-is.  Ignored for non-COSINE metrics.
   bool normalized_;
   // COSINE fields normalize vectors before column storage by default.  Ignored
   // for non-COSINE metrics.
@@ -198,8 +198,9 @@ public:
   bool normalized() const { return normalized_; }
   bool normalizeOnWrite() const { return normalizeOnWrite_; }
 
-  // True iff a FAISS aux index should be built for this field when requested.
-  bool buildsAnnIndex() const { return metric_ != METRIC_NONE; }
+  // True iff this field supports kNN / ANN search.  Exact flat search can run
+  // directly over the column; real ANN engines may also build aux artifacts.
+  bool knnSearchable() const { return metric_ != METRIC_NONE; }
 };
 
 // Describes a stored-fields resource (a per-segment column of LZ4-compressed

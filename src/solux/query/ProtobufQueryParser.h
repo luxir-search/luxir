@@ -101,6 +101,10 @@ public:
     if (fieldType.type() != FieldType::Type::VECTOR) {
       throw std::runtime_error(std::format("KnnQuery on non-vector field: {}", field));
     }
+    auto& vectorType = (const VectorFieldType&)fieldType;
+    if (!vectorType.knnSearchable()) {
+      throw std::runtime_error(std::format("KnnQuery on vector field without metric: {}", field));
+    }
     if (!knnQuery.query().has_f32()) {
       throw std::runtime_error(std::format(
         "KnnQuery for field '{}' is missing query vector (only f32 supported in v1)", field));
@@ -109,13 +113,22 @@ public:
     // RepeatedField<float> is contiguous; the proto storage outlives the
     // pool-allocated query tree (request arena), so pointing into it is safe.
     std::span<const float> queryVec(f32.data(), (size_t)f32.size());
+    if (queryVec.empty()) {
+      throw std::runtime_error(std::format(
+        "KnnQuery for field '{}' must have a non-empty query vector", field));
+    }
+    if (vectorType.dims() > 0 && (int32_t)queryVec.size() != vectorType.dims()) {
+      throw std::runtime_error(std::format(
+        "KnnQuery: query vector dims {} do not match schema dims {} for field '{}'",
+        queryVec.size(), vectorType.dims(), field));
+    }
 
     int32_t k = knnQuery.k();
     if (k <= 0) {
       throw std::runtime_error(std::format("KnnQuery for field '{}' must have k > 0 (got {})", field, k));
     }
 
-    return pool.make<solux::KnnQuery>(field, queryVec, k);
+    return pool.make<solux::KnnQuery>(field, vectorType, queryVec, k);
   }
 
   std::span<Query*> parseQueryList(const google::protobuf::RepeatedPtrField<solux::proto::Query>& queries) {

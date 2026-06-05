@@ -12,6 +12,7 @@
 #include <functional>
 #include <memory>
 #include <optional>
+#include <queue>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -33,43 +34,45 @@
 
 namespace solux {
 
-/// kNN query against a vector field's FAISS aux index ("vec.<field>").
+/// kNN query against a vector field.
 ///
-/// Execution model: the FAISS index is currently shard-level (one per
-/// IndexReader, not per segment), so search materializes once during the query
-/// preparation phase.  Hits cross a small vector engine seam as
-/// (segment, valueRank, score), then are collapsed to docs and bucketed per
-/// segment in docId order for the segment-parallel TopDocsReq pipeline.
+/// Execution model: kNN is globally bounded, so search materializes once during
+/// the query preparation phase.  The default exact engine scans each segment's
+/// vector column directly; a temporary FAISS-flat aux engine remains for tests /
+/// benchmarks, and future ANN aux engines can dispatch through the same seam.
+/// Hits cross the seam as (segment, valueRank, score), then are collapsed to
+/// docs and bucketed per segment in docId order for the segment-parallel
+/// TopDocsReq pipeline.
 ///
 /// The active query domain (liveDocs intersected with any enclosing filter
-/// clauses) is applied *inside* the FAISS search via a custom faiss::IDSelector
-/// (DomainSelector), so deleted-doc and out-of-domain vectors are skipped during
-/// the search and we over-request vectors only to fill k distinct docs after
-/// multi-vector collapse.
+/// clauses) is pushed into the engine.  The column engine checks it directly
+/// while scanning docs; the temporary FAISS aux engine uses DomainSelector.
 ///
-/// Multi-valued vector fields are supported: every vector is its own FAISS id,
-/// mapped back to its owning doc via the segment's valueRank->docId column
-/// (VectorReader::docForVectorRank).  Several of a doc's vectors can land in the
-/// result; they are collapsed to one hit per doc keeping the best ("max-sim")
-/// score.  The query adaptively over-requests vectors, bounded by
-/// maxKnnCandidates, so it normally emits k distinct docs (or fewer if fewer
-/// live docs have a vector).  Above that cap the result is best-effort.
+/// Multi-valued vector fields are supported via the segment's persisted
+/// valueRank->docId column (VectorReader::docForVectorRank).  The exact column
+/// engine collapses a doc's vectors while scanning and returns one best vector
+/// per doc.  Approximate aux engines may return vector candidates instead; the
+/// host loop unions, rescans exact scores when needed, sorts, and collapses
+/// before publishing the global top-k docs.  Above maxKnnCandidates the result
+/// is best-effort.
 class KnnQuery final : public solux::Query {
   std::string_view field;
+  const VectorFieldType& fieldType;
   std::span<const float> queryVec;
   int32_t k;
 
 public:
   /// One result hit within a segment.  docId is the local docRank within the
-  /// segment; score is converted to "higher is better" regardless of FAISS
+  /// segment; score is converted to "higher is better" regardless of vector
   /// metric (see scoreFromDist).
   struct Hit {
     int32_t docId;
     float score;
   };
 
-  // Maximum vectors requested from FAISS while trying to fill k distinct docs.
-  // Mutable so tests can shrink it to exercise the best-effort cap path.
+  // Maximum engine candidates retained while trying to fill k distinct docs.
+  // Exact column flat returns doc-collapsed candidates; aux engines may return
+  // vector candidates.  Mutable so tests can shrink it for cap coverage.
   static inline int64_t maxKnnCandidates = 1000000;
 
   // Maximum recall breadth a non-flat engine can request while deepening.
@@ -92,7 +95,7 @@ public:
   ///              prefix and reuses the column's existing bitset.
   ///   - neither: dense single-valued, valueRank == docId (identity).
   /// The MonoReader / Selector must outlive every resolve() call (both live for the
-  /// duration of the FAISS search + result walk inside Weight::prepare).
+  /// duration of the engine search + result walk inside Weight::prepare).
   class SegV2D {
   public:
     MonoReader* mono = nullptr;
@@ -134,10 +137,12 @@ public:
     }
   };
 
-  KnnQuery(std::string_view field, std::span<const float> queryVec, int32_t k)
-    : field(field), queryVec(queryVec), k(k) {}
+  KnnQuery(std::string_view field, const VectorFieldType& fieldType,
+           std::span<const float> queryVec, int32_t k)
+    : field(field), fieldType(fieldType), queryVec(queryVec), k(k) {}
 
   std::string_view getField() const noexcept { return field; }
+  const VectorFieldType& getFieldType() const noexcept { return fieldType; }
   std::span<const float> getQueryVec() const noexcept { return queryVec; }
   int32_t getK() const noexcept { return k; }
 
@@ -154,13 +159,23 @@ public:
       : Query::Weight(context), query(query) {
       IndexReader& reader = context.topReader;
 
-      // Find the aux reader for this field.  Missing (e.g. field never had
-      // its FAISS index built) yields zero hits - graceful degradation.
+      if (!query.getFieldType().knnSearchable()) {
+        throw std::runtime_error(std::format(
+          "KnnQuery on vector field '{}' without a metric", query.getField()));
+      }
+      if (query.getFieldType().dims() > 0 &&
+          (int32_t)query.getQueryVec().size() != query.getFieldType().dims()) {
+        throw std::runtime_error(std::format(
+          "KnnQuery: query vector dims {} do not match schema dims {} for field '{}'",
+          query.getQueryVec().size(), query.getFieldType().dims(), query.getField()));
+      }
+
+      // Aux present wins (temporary FAISS-flat A-B path now, IVF+PQ later).
+      // Missing aux falls back to exact flat-over-column in prepare().
       std::string auxName("vec.");
       auxName.append(query.getField());
       auto aux = reader.getAuxReader(auxName);
       if (!aux) {
-        LOG_DEBUG("KnnQuery: no aux index '{}' on this reader; returning empty result", auxName);
         return;
       }
       vaux = dynamic_cast<VectorAuxReader*>(aux.get());
@@ -174,7 +189,6 @@ public:
           "KnnQuery: query vector dims {} do not match index dims {} for field '{}'",
           query.getQueryVec().size(), vaux->getDims(), query.getField()));
       }
-
     }
 
     bool needsPrepare() const noexcept override { return true; }
@@ -201,10 +215,9 @@ public:
       IndexReader& reader = ctx.reader;
       size_t numSegs = reader.segments().size();
       std::vector<std::vector<Hit>> perSegHits(numSegs);
-      if (vaux == nullptr) return std::make_unique<KnnPreparedWeight>(std::move(perSegHits));
 
-      faiss::Index* faissIdx = vaux->getFaissIndex();
-      if (!faissIdx || faissIdx->ntotal == 0) {
+      faiss::Index* faissIdx = vaux != nullptr ? vaux->getFaissIndex() : nullptr;
+      if (vaux != nullptr && (!faissIdx || faissIdx->ntotal == 0)) {
         return std::make_unique<KnnPreparedWeight>(std::move(perSegHits));
       }
       // prepare() runs in the parallel phase, possibly deep in a work-stealing
@@ -216,10 +229,10 @@ public:
       auto poolGuard = MemPool::threadLocalPoolGuard();
       MemPool& scratch = poolGuard.pool();
 
-      // Per-segment vector counts -> cumulative prefix for FAISS-id -> segment
-      // mapping.  Builder added segments in ord order skipping zero-vector
-      // ones, and our IndexInfo segments are in the same canonical order, so
-      // the prefix sum lines up: zero-vector segments contribute a zero range.
+      // Per-segment vector counts.  The cumulative prefix is still needed for
+      // aux-backed FAISS id -> segment mapping and also gives the total vector
+      // count for the column engine.  Zero-vector segments contribute a zero
+      // range.
       //
       // Within a segment, FAISS ids correspond to *value ranks* (0 ..
       // numVectors).  Each segment gets a SegV2D resolver mapping valueRank ->
@@ -230,7 +243,7 @@ public:
       std::vector<SegV2D> v2dPerSeg(numSegs);
 
       // Holds the multi-valued segments' valueRank->docId MonoReaders alive through
-      // the FAISS search + result walk below.  MonoReader is
+      // the engine search + result walk below.  MonoReader is
       // just pointers into the segment mmap (valid for the whole query), so copying it
       // out of the scratch VectorReader is safe and cheap.
       std::vector<std::optional<MonoReader>> monoHolders(numSegs);
@@ -246,6 +259,13 @@ public:
 
       int64_t totalDocsWithValue = 0;
       bool anyMultiValued = false;
+      int32_t dims = vaux != nullptr ? vaux->getDims()
+        : (query.getFieldType().dims() > 0 ? query.getFieldType().dims()
+                                           : (int32_t)query.getQueryVec().size());
+      if (dims <= 0) {
+        throw std::runtime_error(std::format(
+          "KnnQuery: query vector for field '{}' must have positive dims", query.getField()));
+      }
       for (size_t i = 0; i < numSegs; i++) {
         int64_t segCount = 0;
         if (segInfos[i] != nullptr) {
@@ -254,6 +274,11 @@ public:
           VectorReader vr(reader.segments()[i].postingsReader(), *segInfos[i]);
           segCount = vr.numVectors();
           if (segCount > 0) {
+            if (vr.dims() != dims) {
+              throw std::runtime_error(std::format(
+                "KnnQuery: query vector dims {} do not match segment dims {} for field '{}'",
+                dims, vr.dims(), query.getField()));
+            }
             totalDocsWithValue += vr.docsWithValue();
             if (vr.isMultiValued()) {
               anyMultiValued = true;
@@ -281,7 +306,11 @@ public:
         }
         prefix[i + 1] = prefix[i] + segCount;
       }
-      if (prefix[numSegs] != faissIdx->ntotal) {
+      int64_t ntotal = prefix[numSegs];
+      if (ntotal == 0) {
+        return std::make_unique<KnnPreparedWeight>(std::move(perSegHits));
+      }
+      if (faissIdx != nullptr && ntotal != faissIdx->ntotal) {
         // Drift between the FAISS index and the column data - implies the aux
         // entry was built against a different segment composition than what's
         // currently published.  Should be impossible because IndexWriter
@@ -297,25 +326,24 @@ public:
       // local copy; the caller's span is unmodified.
       std::vector<float> queryBuf;
       const float* queryPtr = query.getQueryVec().data();
-      if (vaux->getMetric() == proto::VectorParams::COSINE) {
+      int32_t metric = vaux != nullptr ? vaux->getMetric() : (int32_t)query.getFieldType().metric();
+      bool normalizeColumnOnCosineRescore = vaux != nullptr
+        ? vaux->shouldNormalizeColumnOnCosineRescore()
+        : (query.getFieldType().metric() == VectorFieldType::METRIC_COSINE
+           && !query.getFieldType().normalized()
+           && !query.getFieldType().normalizeOnWrite());
+      if (metric == proto::VectorParams::COSINE) {
         queryBuf.assign(query.getQueryVec().begin(), query.getQueryVec().end());
-        faiss::fvec_renorm_L2((size_t)vaux->getDims(), 1, queryBuf.data());
+        faiss::fvec_renorm_L2((size_t)dims, 1, queryBuf.data());
         queryPtr = queryBuf.data();
       }
 
-      // Use a faiss::IDSelector to filter deleted docs and the active query
-      // domain *inside* the search, so over-requesting is used only for
-      // multi-vector doc collapse.
       std::span<const int64_t> prefixSpan(prefix.data(), prefix.size());
       std::span<const SegV2D> v2dSpan(v2dPerSeg.data(), v2dPerSeg.size());
-      DomainSelector selector(prefixSpan, v2dSpan, reader.segments(), ctx.domainPerSeg);
-      faiss::SearchParameters params;
-      params.sel = &selector;
 
-      int64_t ntotal = faissIdx->ntotal;
       int64_t kDocs = query.getK();
       int64_t cap = std::min(ntotal, std::max((int64_t)1, maxKnnCandidates));
-      int64_t avgMult = (anyMultiValued && totalDocsWithValue > 0)
+      int64_t avgMult = (faissIdx != nullptr && anyMultiValued && totalDocsWithValue > 0)
         ? ceilDivClamped(ntotal, totalDocsWithValue, cap)
         : 1;
       int64_t kReq = mulClamped(kDocs, avgMult, cap);
@@ -332,11 +360,30 @@ public:
       seenVectors.reserve((size_t)std::min(kReq, cap));
       docHits.reserve(maxDocHits);
       seenDocs.reserve(maxDocHits);
-      FaissFlatVectorEngine flatEngine(*faissIdx, params, prefixSpan, segIndex, vaux->getMetric());
-      VectorEngine* engine = &flatEngine;
+
+      // Use a faiss::IDSelector only for the temporary FAISS-flat aux path.
+      // The column engine scans per segment and applies liveDocs/domain directly.
+      DomainSelector selector(prefixSpan, v2dSpan, reader.segments(), ctx.domainPerSeg);
+      faiss::SearchParameters params;
+      params.sel = &selector;
+      std::unique_ptr<VectorEngine> baseEngine;
+      if (faissIdx != nullptr) {
+        baseEngine = std::make_unique<FaissFlatVectorEngine>(
+          *faissIdx, params, prefixSpan, segIndex, metric);
+      } else {
+        baseEngine = std::make_unique<FlatColumnVectorEngine>(
+          reader.segments(),
+          std::span<SegFieldInfo* const>(segInfos.data(), segInfos.size()),
+          v2dSpan,
+          ctx.domainPerSeg,
+          dims,
+          metric,
+          normalizeColumnOnCosineRescore);
+      }
+      VectorEngine* engine = baseEngine.get();
       std::unique_ptr<VectorEngine> wrapperEngine;
       if (engineWrapperForTests) {
-        wrapperEngine = engineWrapperForTests(flatEngine, ntotal);
+        wrapperEngine = engineWrapperForTests(*baseEngine, ntotal);
         engine = wrapperEngine.get();
       }
 
@@ -348,7 +395,7 @@ public:
       for (;;) {
         VectorSearchRequest request{
           .query = queryPtr,
-          .dims = vaux->getDims(),
+          .dims = dims,
           .candidates = kReq,
           .breadth = breadth,
         };
@@ -387,8 +434,7 @@ public:
                                                        candidateHits.size() - appendStart),
                             reader,
                             std::span<SegFieldInfo* const>(segInfos.data(), segInfos.size()),
-                            queryPtr, vaux->getDims(), vaux->getMetric(),
-                            vaux->shouldNormalizeColumnOnCosineRescore());
+                            queryPtr, dims, metric, normalizeColumnOnCosineRescore);
           candidatePoolSorted = false;
         }
         if (!candidatePoolSorted) {
@@ -497,6 +543,134 @@ public:
         return result;
       }
     };
+
+    class FlatColumnVectorEngine final : public VectorEngine {
+      std::span<IndexReader::Segment> segs;
+      std::span<SegFieldInfo* const> segInfos;
+      std::span<const SegV2D> v2dPerSeg;
+      std::span<DocSet* const> domainPerSeg;
+      int32_t dims;
+      int32_t metric;
+      bool normalizeColumnOnCosineRescore;
+
+      static bool better(const VectorEngineHit& a, const VectorEngineHit& b) {
+        if (a.score != b.score) return a.score > b.score;
+        if (a.segOrd != b.segOrd) return a.segOrd < b.segOrd;
+        return a.valueRank < b.valueRank;
+      }
+
+      struct WorstFirst {
+        bool operator()(const VectorEngineHit& a, const VectorEngineHit& b) const {
+          return better(a, b);
+        }
+      };
+
+    public:
+      FlatColumnVectorEngine(std::span<IndexReader::Segment> segs,
+                             std::span<SegFieldInfo* const> segInfos,
+                             std::span<const SegV2D> v2dPerSeg,
+                             std::span<DocSet* const> domainPerSeg,
+                             int32_t dims,
+                             int32_t metric,
+                             bool normalizeColumnOnCosineRescore) noexcept
+        : segs(segs),
+          segInfos(segInfos),
+          v2dPerSeg(v2dPerSeg),
+          domainPerSeg(domainPerSeg),
+          dims(dims),
+          metric(metric),
+          normalizeColumnOnCosineRescore(normalizeColumnOnCosineRescore) {}
+
+      VectorSearchResult search(const VectorSearchRequest& request) override {
+        assert(request.query != nullptr);
+        assert(request.dims == dims);
+
+        VectorSearchResult result;
+        result.scoresAreExact = true;
+        result.breadthExhausted = true;
+        if (request.candidates <= 0) {
+          result.poolExhausted = true;
+          return result;
+        }
+
+        std::priority_queue<VectorEngineHit, std::vector<VectorEngineHit>, WorstFirst> heap;
+        int64_t eligibleDocs = 0;
+        for (size_t ord = 0; ord < segInfos.size(); ord++) {
+          SegFieldInfo* info = segInfos[ord];
+          if (info == nullptr) continue;
+          VectorReader vr(segs[ord].postingsReader(), *info);
+          int64_t numVals = vr.numVectors();
+          if (numVals == 0) continue;
+          if (vr.dims() != dims) {
+            throw std::runtime_error(std::format(
+              "KnnQuery: query vector dims {} do not match segment dims {}",
+              dims, vr.dims()));
+          }
+
+          int64_t rank = 0;
+          while (rank < numVals) {
+            int32_t docId = v2dPerSeg[ord].resolve(rank);
+            int64_t end = rank + 1;
+            while (end < numVals && v2dPerSeg[ord].resolve(end) == docId) end++;
+
+            if (docEligible((int32_t)ord, docId)) {
+              eligibleDocs++;
+              VectorEngineHit best{
+                .score = 0.0f,
+                .segOrd = (int32_t)ord,
+                .valueRank = rank,
+              };
+              bool haveScore = false;
+              for (int64_t r = rank; r < end; r++) {
+                float score = exactScore(request.query, vr.vectorAtRank(r), dims, metric,
+                                         normalizeColumnOnCosineRescore, 0.0f);
+                if (!haveScore || score > best.score) {
+                  best.score = score;
+                  best.valueRank = r;
+                  haveScore = true;
+                }
+              }
+              offer(heap, best, request.candidates);
+            }
+            rank = end;
+          }
+        }
+
+        result.hits.reserve(heap.size());
+        while (!heap.empty()) {
+          result.hits.push_back(heap.top());
+          heap.pop();
+        }
+        std::sort(result.hits.begin(), result.hits.end(), better);
+        result.poolExhausted = eligibleDocs <= request.candidates;
+        return result;
+      }
+
+    private:
+      bool docEligible(int32_t ord, int32_t docId) const {
+        auto* live = segs[(size_t)ord].liveDocs();
+        if (live != nullptr && !live->bitset().get(docId)) return false;
+        if (!domainPerSeg.empty()) {
+          auto* domain = domainPerSeg[(size_t)ord];
+          if (domain != nullptr && !domain->get(docId)) return false;
+        }
+        return true;
+      }
+
+      static void offer(
+          std::priority_queue<VectorEngineHit, std::vector<VectorEngineHit>, WorstFirst>& heap,
+          const VectorEngineHit& hit,
+          int64_t limit) {
+        if ((int64_t)heap.size() < limit) {
+          heap.push(hit);
+          return;
+        }
+        if (!heap.empty() && better(hit, heap.top())) {
+          heap.pop();
+          heap.push(hit);
+        }
+      }
+    };
   };
 
   class Scorer final : public Query::Scorer {
@@ -574,32 +748,23 @@ private:
                           float fallbackScore) {
     assert(queryPtr != nullptr);
     assert((int32_t)vec.size() == dims);
-    double sum = 0.0;
     switch (metric) {
-      case proto::VectorParams::L2:
-        for (int32_t i = 0; i < dims; i++) {
-          double d = (double)queryPtr[i] - (double)vec[(size_t)i];
-          sum += d * d;
-        }
-        return 1.0f / (1.0f + (float)sum);
+      case proto::VectorParams::L2: {
+        float dist = faiss::fvec_L2sqr(queryPtr, vec.data(), (size_t)dims);
+        return 1.0f / (1.0f + dist);
+      }
       case proto::VectorParams::IP:
-        for (int32_t i = 0; i < dims; i++) {
-          sum += (double)queryPtr[i] * (double)vec[(size_t)i];
-        }
-        return (float)sum;
+        return faiss::fvec_inner_product(queryPtr, vec.data(), (size_t)dims);
       case proto::VectorParams::COSINE: {
-        for (int32_t i = 0; i < dims; i++) {
-          sum += (double)queryPtr[i] * (double)vec[(size_t)i];
-        }
-        if (!normalizeColumnOnCosineRescore) return (float)sum;
+        float sum = faiss::fvec_inner_product(queryPtr, vec.data(), (size_t)dims);
+        if (!normalizeColumnOnCosineRescore) return sum;
 
-        double normSq = 0.0;
-        for (int32_t i = 0; i < dims; i++) {
-          double v = (double)vec[(size_t)i];
-          normSq += v * v;
-        }
+        // Raw-column cosine pays the vector norm at query time.  This is the
+        // explicit tradeoff for preserving the originally submitted bytes when
+        // normalize_on_write=false; the default cosine path stores unit vectors.
+        float normSq = faiss::fvec_norm_L2sqr(vec.data(), (size_t)dims);
         if (!std::isfinite(normSq) || normSq <= MIN_COSINE_NORM_SQ) return 0.0f;
-        return (float)(sum / std::sqrt(normSq));
+        return sum / std::sqrt(normSq);
       }
       default:
         return fallbackScore;

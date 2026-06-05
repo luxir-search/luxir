@@ -16,6 +16,10 @@ namespace solux {
 
 /// Builds FAISS aux indexes for vector fields across a snapshot of segments.
 ///
+/// Flat kNN is served directly from the vector column, so this builder is
+/// currently retained as a temporary FAISS-flat aux path for tests / A-B
+/// benchmarks until the first real ANN aux engine lands.
+///
 /// One index per (eligible) vector field, written under a single filename
 /// produced by Postings::getAuxIndexFileName.  The "name" used in filenames +
 /// AuxIndexInfo is "vec.<fieldName>" (e.g. "vec.title_v").
@@ -43,6 +47,11 @@ public:
   // Working-memory budget for the COSINE renormalization buffer.  Mutable so
   // tests can shrink it to exercise the multi-chunk loop on small inputs.
   static size_t renormChunkBytes;
+
+  // Temporary A-B hook: production flat search does not emit a vec.* aux
+  // artifact.  Tests / benches can enable this to keep the old FAISS-flat path
+  // available for comparison until IVF+PQ replaces it as the real aux engine.
+  static bool buildFaissFlatAuxIndexes;
 
   /// One segment's worth of input.  Segments must be passed in the same order
   /// they will appear in the IndexInfo file (sorted by segId), so query-time

@@ -22,6 +22,9 @@ public:
   solux::proto::SearchRequest& proto;
   google::protobuf::Arena& arena;
   std::shared_ptr<IndexReader> reader;
+  // Pins the collection schema snapshot for the request.  Schema instances are
+  // immutable after publication, so query objects may keep FieldType references
+  // derived from this schema for the request lifetime.
   std::shared_ptr<Schema> schema;
   MemPool requestPool;
   oneapi::tbb::task_group* tg = nullptr; // optional top-level task group for this request.

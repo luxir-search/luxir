@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "protos/solux_types.pb.h"
+#include "solux/index/VectorIndexBuilder.h"
 #include "solux/query/KnnQuery.h"
 #include "solux/query/VectorEngine.h"
 #include "solux/schema/Schema.h"
@@ -110,6 +111,15 @@ protected:
     }
     ~EngineWrapperGuard() {
       KnnQuery::engineWrapperForTests = nullptr;
+    }
+  };
+
+  struct FaissFlatAuxGuard {
+    explicit FaissFlatAuxGuard() {
+      VectorIndexBuilder::buildFaissFlatAuxIndexes = true;
+    }
+    ~FaissFlatAuxGuard() {
+      VectorIndexBuilder::buildFaissFlatAuxIndexes = false;
     }
   };
 
@@ -452,16 +462,18 @@ TEST_F(KnnQueryTest, multiValuedCandidateCapIsBestEffort) {
                   std::vector<std::vector<float>>{{0.3f, 0, 0}}));
   h.commit({"*"});
 
-  auto* req = makeKnnReq(*soluxNode, "emb_vs", {1, 0, 0}, 3);
+  auto* req = makeKnnReq(*soluxNode, "emb_vs", {1, 0, 0}, 4);
   {
     LogLevelGuard quiet;  // expected: shortfall at the test candidate cap
     req->execute();
   }
 
-  EXPECT_EQ(req->getMatchCount(), 1);
+  EXPECT_EQ(req->getMatchCount(), 3);
   auto ids = resultIds(*req);
-  ASSERT_EQ(ids.size(), 1u);
+  ASSERT_EQ(ids.size(), 3u);
   EXPECT_EQ(ids[0], "a");
+  EXPECT_EQ(ids[1], "b");
+  EXPECT_EQ(ids[2], "c");
 
   req->done();
 }
@@ -891,24 +903,23 @@ TEST_F(KnnQueryTest, manyDeletes) {
 }
 
 // Missing aux index: indexing without ever calling build -> the field has no
-// FAISS aux entry.  Query should return no hits, not throw.
-TEST_F(KnnQueryTest, missingAuxIndexReturnsEmpty) {
+// FAISS aux entry.  Query falls back to exact flat-over-column.
+TEST_F(KnnQueryTest, missingAuxIndexFallsBackToColumnScan) {
   CollectionHelper h("main");
   h.clear();
   installVecSchema(h.collection(), proto::VectorParams::L2);
 
-  // Index but DO NOT build the aux index (commit without selectors).
+  // Index but DO NOT build an aux index (commit without selectors).
   h.index(flatdoc("id", std::string("a"), "embedding_v", std::vector<float>{1, 0, 0}),
           UpdateMessage::COMMIT);
 
   auto* req = makeKnnReq(*soluxNode, "embedding_v", {1, 0, 0}, 5);
-  {
-    LogLevelGuard quiet;  // expected: KnnQuery debug-logs "no aux index"
-    req->execute();
-  }
+  req->execute();
 
-  EXPECT_EQ(req->getMatchCount(), 0);
-  EXPECT_EQ(resultIds(*req).size(), 0u);
+  EXPECT_EQ(req->getMatchCount(), 1);
+  auto ids = resultIds(*req);
+  ASSERT_EQ(ids.size(), 1u);
+  EXPECT_EQ(ids[0], "a");
 
   req->done();
 }
@@ -924,7 +935,7 @@ TEST_F(KnnQueryTest, missingAuxIndexReturnsEmpty) {
 // The fix moved createWeight to TopDocsReq::init(), which runs after the
 // object is fully constructed and registered, so a throw here unwinds
 // cleanly.
-TEST_F(KnnQueryTest, dimMismatchReturnsEmpty) {
+TEST_F(KnnQueryTest, dimMismatchReturnsErrorResponse) {
   CollectionHelper h("main");
   h.clear();
   installVecSchema(h.collection(), proto::VectorParams::L2);
@@ -943,7 +954,28 @@ TEST_F(KnnQueryTest, dimMismatchReturnsEmpty) {
 
   // A single response is returned with the error string populated.
   ASSERT_EQ(req->responses.size(), 1u);
-  EXPECT_NE(req->responses[0]->proto.error().find("dims 3 do not match index dims 4"), std::string::npos);
+  EXPECT_NE(req->responses[0]->proto.error().find("dims 3 do not match segment dims 4"), std::string::npos);
+
+  req->done();
+}
+
+TEST_F(KnnQueryTest, emptyQueryVectorReturnsErrorResponse) {
+  CollectionHelper h("main");
+  h.clear();
+  installVecSchema(h.collection(), proto::VectorParams::L2);
+
+  h.index(flatdoc("id", std::string("a"), "embedding_v", std::vector<float>{1, 0, 0}));
+  h.commit();
+
+  auto* req = makeKnnReq(*soluxNode, "embedding_v", {}, 1);
+  {
+    LogLevelGuard quiet;  // expected: empty query vector parse error
+    req->execute();
+  }
+  EXPECT_EQ(req->getMatchCount(), 0);
+  EXPECT_TRUE(resultIds(*req).empty());
+  ASSERT_EQ(req->responses.size(), 1u);
+  EXPECT_NE(req->responses[0]->proto.error().find("non-empty query vector"), std::string::npos);
 
   req->done();
 }
@@ -997,6 +1029,33 @@ TEST_F(KnnQueryTest, cosineMetric) {
   req->done();
 }
 
+TEST_F(KnnQueryTest, zeroOnlyCosineSegmentDoesNotPoisonColumnScan) {
+  CollectionHelper h("main");
+  h.clear();
+  installVecSchema(h.collection(), proto::VectorParams::COSINE);
+
+  {
+    LogLevelGuard quiet;  // expected: zero cosine vector is skipped on write
+    h.index(flatdoc("id", std::string("zero"), "embedding_v", std::vector<float>{0, 0, 0}));
+    h.commit();
+  }
+
+  h.index(flatdoc("id", std::string("east"), "embedding_v", std::vector<float>{2, 0, 0}));
+  h.index(flatdoc("id", std::string("north"), "embedding_v", std::vector<float>{0, 3, 0}));
+  h.commit();
+
+  auto* req = makeKnnReq(*soluxNode, "embedding_v", {7, 0, 0}, 2);
+  req->execute();
+
+  EXPECT_EQ(req->getMatchCount(), 2);
+  auto ids = resultIds(*req);
+  ASSERT_EQ(ids.size(), 2u);
+  EXPECT_EQ(ids[0], "east");
+  EXPECT_EQ(ids[1], "north");
+
+  req->done();
+}
+
 // L2 score conversion: KnnQuery returns 1/(1+d^2), where d^2 is FAISS's
 // squared L2.  Verify the formula end-to-end with concrete distances.
 TEST_F(KnnQueryTest, l2Scores) {
@@ -1039,6 +1098,7 @@ TEST_F(KnnQueryTest, l2Scores) {
 // breadths.  Collapsing an unsorted pool would score x at 0.1 and rank it
 // last instead of third.
 TEST_F(KnnQueryTest, breadthRoundsKeepCandidatePoolSorted) {
+  FaissFlatAuxGuard auxGuard;
   EngineWrapperGuard guard([](VectorEngine& flat, int64_t ntotal) {
     return std::make_unique<BreadthSplitEngine>(flat, ntotal, 7);
   });
@@ -1093,6 +1153,7 @@ TEST_F(KnnQueryTest, breadthRoundsKeepCandidatePoolSorted) {
 // from the full-precision column, sort, then collapse.  Without the rescore
 // the inverted order collapses to the wrong docs (a, d, c) at bucket scores.
 TEST_F(KnnQueryTest, approximateScoresRescoredFromColumn) {
+  FaissFlatAuxGuard auxGuard;
   EngineWrapperGuard guard([](VectorEngine& flat, int64_t) {
     return std::make_unique<QuantizingEngine>(flat);
   });
@@ -1134,6 +1195,7 @@ TEST_F(KnnQueryTest, approximateScoresRescoredFromColumn) {
 // rescore; correct cosine order AND scores prove the raw-column normalization
 // ran (without it, rescore would return raw dot products like 5.0).
 TEST_F(KnnQueryTest, cosineRawColumnRescoreNormalizes) {
+  FaissFlatAuxGuard auxGuard;
   EngineWrapperGuard guard([](VectorEngine& flat, int64_t) {
     return std::make_unique<QuantizingEngine>(flat);
   });

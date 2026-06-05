@@ -32,8 +32,13 @@ protected:
     // Reset to default schema; tests selectively install metric-bearing schemas
     // via enableL2OnVecSuffix.  Persisted schemas from prior tests would otherwise
     // leak in.
+    VectorIndexBuilder::buildFaissFlatAuxIndexes = true;
     auto col = soluxNode->getCollection("main");
     col->setSchema(Schema::createDefaultSchema());
+  }
+
+  void TearDown() override {
+    VectorIndexBuilder::buildFaissFlatAuxIndexes = false;
   }
 };
 

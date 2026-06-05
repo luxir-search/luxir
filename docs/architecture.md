@@ -32,9 +32,9 @@ High-level map of Solux internals. For exact file locations, browse `src/solux/<
    - `PostingsWriter`: used by an Inverter on flush to write a new segment.
 
 6. **Vector Search** (`src/solux/index/`, `src/solux/reader/`)
-   - `VectorIndexBuilder`: builds the per-segment vector index (FAISS-backed)
-   - `VectorReader` / `VectorAuxReader`: read vectors and associated payload at search time
-   - Reuses column storage; see `memory/project_faiss_integration.md` for design notes
+   - `VectorReader`: reads column-stored vectors for exact flat KNN
+   - `VectorIndexBuilder` / `VectorAuxReader`: temporary FAISS-flat aux path for tests and future ANN aux indexes
+   - Reuses column storage for exact search and full-precision rescoring
 
 7. **Storage** (`src/solux/store/`)
    - `Directory`: abstract storage interface. Implementations: `RAMDir` (in-memory, used by tests),
