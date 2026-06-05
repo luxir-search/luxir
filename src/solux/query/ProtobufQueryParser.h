@@ -128,7 +128,8 @@ public:
       throw std::runtime_error(std::format("KnnQuery for field '{}' must have k > 0 (got {})", field, k));
     }
 
-    return pool.make<solux::KnnQuery>(field, vectorType, queryVec, k);
+    return pool.make<solux::KnnQuery>(
+      field, vectorType, queryVec, k, knnQuery.nprobe(), knnQuery.refine_factor());
   }
 
   std::span<Query*> parseQueryList(const google::protobuf::RepeatedPtrField<solux::proto::Query>& queries) {

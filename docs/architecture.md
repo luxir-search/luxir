@@ -33,8 +33,9 @@ High-level map of Solux internals. For exact file locations, browse `src/solux/<
 
 6. **Vector Search** (`src/solux/index/`, `src/solux/reader/`)
    - `VectorReader`: reads column-stored vectors for exact flat KNN
-   - `VectorIndexBuilder` / `VectorAuxReader`: temporary FAISS-flat aux path for tests and future ANN aux indexes
-   - Reuses column storage for exact search and full-precision rescoring
+   - `VectorIndexBuilder` / `VectorAuxReader`: FAISS IVF+PQ aux indexes for ANN, with a FAISS-flat hook for tests and benchmarks
+   - Reuses column storage for exact search, cosine raw-column normalization, and full-precision rescoring
+   - See [vector-search.md](vector-search.md) for indexing, query knobs, and recall semantics
 
 7. **Storage** (`src/solux/store/`)
    - `Directory`: abstract storage interface. Implementations: `RAMDir` (in-memory, used by tests),

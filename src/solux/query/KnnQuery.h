@@ -1,6 +1,7 @@
 #pragma once
 
 #include <faiss/Index.h>
+#include <faiss/IndexIVF.h>
 #include <faiss/MetricType.h>
 #include <faiss/impl/IDSelector.h>
 #include <faiss/utils/distances.h>
@@ -38,15 +39,15 @@ namespace solux {
 ///
 /// Execution model: kNN is globally bounded, so search materializes once during
 /// the query preparation phase.  The default exact engine scans each segment's
-/// vector column directly; a temporary FAISS-flat aux engine remains for tests /
-/// benchmarks, and future ANN aux engines can dispatch through the same seam.
+/// vector column directly; a test / benchmark FAISS-flat aux engine remains,
+/// and IVF+PQ aux indexes dispatch through the same seam.
 /// Hits cross the seam as (segment, valueRank, score), then are collapsed to
 /// docs and bucketed per segment in docId order for the segment-parallel
 /// TopDocsReq pipeline.
 ///
 /// The active query domain (liveDocs intersected with any enclosing filter
 /// clauses) is pushed into the engine.  The column engine checks it directly
-/// while scanning docs; the temporary FAISS aux engine uses DomainSelector.
+/// while scanning docs; FAISS aux engines use DomainSelector.
 ///
 /// Multi-valued vector fields are supported via the segment's persisted
 /// valueRank->docId column (VectorReader::docForVectorRank).  The exact column
@@ -60,6 +61,8 @@ class KnnQuery final : public solux::Query {
   const VectorFieldType& fieldType;
   std::span<const float> queryVec;
   int32_t k;
+  int32_t nprobe;
+  int32_t refineFactor;
 
 public:
   /// One result hit within a segment.  docId is the local docRank within the
@@ -78,6 +81,10 @@ public:
   // Maximum recall breadth a non-flat engine can request while deepening.
   // Flat ignores breadth; this is a host safety cap for future engines.
   static inline int32_t maxKnnBreadth = 1000000;
+
+  // Approximate ANN engines over-fetch vector candidates before exact
+  // full-precision rescore.  Mutable so recall tests can force a known value.
+  static inline int32_t defaultAnnRefineFactor = 4;
 
   // Test seam: when set, prepare() wraps the production flat engine and runs
   // the host deepen loop against the wrapper instead.  Lets tests drive the
@@ -138,13 +145,17 @@ public:
   };
 
   KnnQuery(std::string_view field, const VectorFieldType& fieldType,
-           std::span<const float> queryVec, int32_t k)
-    : field(field), fieldType(fieldType), queryVec(queryVec), k(k) {}
+           std::span<const float> queryVec, int32_t k,
+           int32_t nprobe = 0, int32_t refineFactor = 0)
+    : field(field), fieldType(fieldType), queryVec(queryVec), k(k),
+      nprobe(nprobe), refineFactor(refineFactor) {}
 
   std::string_view getField() const noexcept { return field; }
   const VectorFieldType& getFieldType() const noexcept { return fieldType; }
   std::span<const float> getQueryVec() const noexcept { return queryVec; }
   int32_t getK() const noexcept { return k; }
+  int32_t getNProbe() const noexcept { return nprobe; }
+  int32_t getRefineFactor() const noexcept { return refineFactor; }
 
   Query::Weight* createWeight(Query::Context& context) override {
     return context.pool.make<KnnQuery::Weight>(context, *this);
@@ -170,7 +181,7 @@ public:
           query.getQueryVec().size(), query.getFieldType().dims(), query.getField()));
       }
 
-      // Aux present wins (temporary FAISS-flat A-B path now, IVF+PQ later).
+      // Aux present wins (explicit FAISS-flat A-B path or IVF+PQ).
       // Missing aux falls back to exact flat-over-column in prepare().
       std::string auxName("vec.");
       auxName.append(query.getField());
@@ -343,10 +354,16 @@ public:
 
       int64_t kDocs = query.getK();
       int64_t cap = std::min(ntotal, std::max((int64_t)1, maxKnnCandidates));
+      bool approximateEngine = vaux != nullptr && !vaux->scoresAreExact();
       int64_t avgMult = (faissIdx != nullptr && anyMultiValued && totalDocsWithValue > 0)
         ? ceilDivClamped(ntotal, totalDocsWithValue, cap)
         : 1;
-      int64_t kReq = mulClamped(kDocs, avgMult, cap);
+      int64_t refineFactor = approximateEngine
+        ? std::max<int64_t>(1, query.getRefineFactor() > 0
+                              ? query.getRefineFactor()
+                              : defaultAnnRefineFactor)
+        : 1;
+      int64_t kReq = mulClamped(mulClamped(kDocs, avgMult, cap), refineFactor, cap);
       if (kReq <= 0) return std::make_unique<KnnPreparedWeight>(std::move(perSegHits));
 
       BranchlessIndex<int64_t> segIndex(prefix.size());
@@ -361,15 +378,15 @@ public:
       docHits.reserve(maxDocHits);
       seenDocs.reserve(maxDocHits);
 
-      // Use a faiss::IDSelector only for the temporary FAISS-flat aux path.
-      // The column engine scans per segment and applies liveDocs/domain directly.
+      // Use a faiss::IDSelector for FAISS aux paths.  The column engine scans
+      // per segment and applies liveDocs/domain directly.
       DomainSelector selector(prefixSpan, v2dSpan, reader.segments(), ctx.domainPerSeg);
-      faiss::SearchParameters params;
-      params.sel = &selector;
       std::unique_ptr<VectorEngine> baseEngine;
       if (faissIdx != nullptr) {
-        baseEngine = std::make_unique<FaissFlatVectorEngine>(
-          *faissIdx, params, prefixSpan, segIndex, metric);
+        bool isIvf = vaux->getEngine() == VectorAuxMeta::ENGINE_IVFPQ;
+        baseEngine = std::make_unique<FaissVectorEngine>(
+          *faissIdx, &selector, prefixSpan, segIndex, metric,
+          vaux->scoresAreExact(), isIvf, vaux->getNList(), vaux->getDefaultBreadth());
       } else {
         baseEngine = std::make_unique<FlatColumnVectorEngine>(
           reader.segments(),
@@ -387,9 +404,11 @@ public:
         engine = wrapperEngine.get();
       }
 
-      int32_t breadth = 0;
+      int32_t breadth = query.getNProbe() > 0 ? query.getNProbe() : 0;
       int32_t lastAbsorbedBreadth = -1;
-      int32_t maxBreadth = std::max(0, maxKnnBreadth);
+      int32_t maxBreadth = query.getNProbe() > 0
+        ? query.getNProbe()
+        : std::max(0, maxKnnBreadth);
       bool poolMixedBreadth = false;
       bool candidatePoolSorted = true;
       for (;;) {
@@ -491,34 +510,75 @@ public:
     }
 
   private:
-    class FaissFlatVectorEngine final : public VectorEngine {
+    class FaissVectorEngine final : public VectorEngine {
       faiss::Index& index;
-      faiss::SearchParameters& params;
+      faiss::IDSelector* selector;
       std::span<const int64_t> prefix;
       const BranchlessIndex<int64_t>& segIndex;
       int32_t metric;
+      bool exactScores;
+      bool isIvf;
+      int32_t nlist;
+      int32_t defaultBreadth;
       std::vector<faiss::idx_t> ids;
       std::vector<float> dists;
 
     public:
-      FaissFlatVectorEngine(faiss::Index& index,
-                            faiss::SearchParameters& params,
-                            std::span<const int64_t> prefix,
-                            const BranchlessIndex<int64_t>& segIndex,
-                            int32_t metric) noexcept
+      FaissVectorEngine(faiss::Index& index,
+                        faiss::IDSelector* selector,
+                        std::span<const int64_t> prefix,
+                        const BranchlessIndex<int64_t>& segIndex,
+                        int32_t metric,
+                        bool exactScores,
+                        bool isIvf,
+                        int32_t nlist,
+                        int32_t defaultBreadth) noexcept
         : index(index),
-          params(params),
+          selector(selector),
           prefix(prefix),
           segIndex(segIndex),
-          metric(metric) {}
+          metric(metric),
+          exactScores(exactScores),
+          isIvf(isIvf),
+          nlist(nlist),
+          defaultBreadth(defaultBreadth) {}
 
       VectorSearchResult search(const VectorSearchRequest& request) override {
         assert(request.query != nullptr);
         assert(request.dims == index.d);
+        if (request.candidates <= 0) {
+          VectorSearchResult empty;
+          empty.scoresAreExact = exactScores;
+          empty.poolExhausted = true;
+          empty.breadthExhausted = true;
+          return empty;
+        }
 
         ids.assign((size_t)request.candidates, (faiss::idx_t)-1);
         dists.assign((size_t)request.candidates, 0.0f);
-        index.search(1, request.query, request.candidates, dists.data(), ids.data(), &params);
+
+        faiss::SearchParameters flatParams;
+        flatParams.sel = selector;
+        faiss::SearchParametersIVF ivfParams;
+        ivfParams.sel = selector;
+        // ivfParams.max_codes stays 0 (unlimited) by design: entries within an
+        // IVF list are insertion-ordered, not relevance-ordered, so any
+        // within-list truncation drops arbitrary candidates - possibly the
+        // best one.  Breadth (nprobe) is the only legitimate work limiter;
+        // probed lists are always scanned in full.
+
+        faiss::SearchParameters* params = &flatParams;
+        int32_t effectiveBreadth = 0;
+        if (isIvf) {
+          assert(nlist > 0);
+          int32_t fallback = defaultBreadth > 0 ? defaultBreadth : 1;
+          effectiveBreadth = request.breadth > 0 ? request.breadth : fallback;
+          effectiveBreadth = std::clamp(effectiveBreadth, 1, std::max(1, nlist));
+          ivfParams.nprobe = (size_t)effectiveBreadth;
+          params = &ivfParams;
+        }
+
+        index.search(1, request.query, request.candidates, dists.data(), ids.data(), params);
 
         VectorSearchResult result;
         result.hits.reserve((size_t)request.candidates);
@@ -537,9 +597,12 @@ public:
           });
         }
 
-        result.scoresAreExact = true;
+        result.scoresAreExact = exactScores;
         result.poolExhausted = liveHits < request.candidates || request.candidates >= index.ntotal;
-        result.breadthExhausted = true;
+        result.breadthExhausted = nlist <= 0 || effectiveBreadth >= nlist;
+        if (!result.breadthExhausted) {
+          result.nextBreadth = std::min(nlist, std::max(effectiveBreadth + 1, effectiveBreadth * 2));
+        }
         return result;
       }
     };
@@ -808,8 +871,6 @@ private:
       case proto::VectorParams::COSINE:
         return dist;
       default:
-        // Unknown metric (older builds without opaque_meta).  Return raw
-        // distance; caller can sort but absolute meaning is unspecified.
         return dist;
     }
   }
@@ -859,8 +920,8 @@ private:
   /// For IndexFlat this doesn't reduce the scan cost (we still touch every
   /// vector for distance computation) but it keeps deleted and out-of-domain
   /// vectors out of the returned candidate list.
-  /// For HNSW/IVF later, the selector can also prune graph traversal / list
-  /// selection.
+  /// For IVF, the selector can also prune list scanning by skipping candidates
+  /// outside the active domain.
   class DomainSelector : public faiss::IDSelector {
     std::span<const int64_t> prefix;
     // Precomputed monobound layout for prefix; is_member() runs per candidate

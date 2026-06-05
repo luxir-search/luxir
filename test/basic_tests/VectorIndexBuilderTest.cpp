@@ -4,6 +4,7 @@
 #include "test/LocalReq.h"
 #include "test/TestUtils.h"
 #include "solux/index/VectorIndexBuilder.h"
+#include "solux/reader/VectorAuxReader.h"
 #include "solux/schema/Schema.h"
 #include "solux/server/SoluxNode.h"
 #include "solux/store/Directory.h"
@@ -11,6 +12,7 @@
 #include "protos/solux_types.pb.h"
 
 #include <faiss/IndexFlat.h>
+#include <faiss/IndexIVFPQ.h>
 #include <faiss/MetricType.h>
 #include <faiss/index_io.h>
 #include <faiss/impl/io.h>
@@ -40,6 +42,44 @@ protected:
   void TearDown() override {
     VectorIndexBuilder::buildFaissFlatAuxIndexes = false;
   }
+
+  struct IvfPqGuard {
+    bool savedFlat;
+    bool savedIvfPq;
+    int32_t savedNList;
+    int32_t savedM;
+    int32_t savedBits;
+    int32_t savedNProbe;
+    int64_t savedMinTraining;
+
+    IvfPqGuard(int32_t nlist, int32_t m, int32_t bits,
+               int32_t nprobe, int64_t minTraining)
+      : savedFlat(VectorIndexBuilder::buildFaissFlatAuxIndexes),
+        savedIvfPq(VectorIndexBuilder::buildFaissIvfPqAuxIndexes),
+        savedNList(VectorIndexBuilder::ivfPqNList),
+        savedM(VectorIndexBuilder::ivfPqM),
+        savedBits(VectorIndexBuilder::ivfPqBits),
+        savedNProbe(VectorIndexBuilder::ivfPqDefaultNProbe),
+        savedMinTraining(VectorIndexBuilder::ivfPqMinTrainingVectors) {
+      VectorIndexBuilder::buildFaissFlatAuxIndexes = false;
+      VectorIndexBuilder::buildFaissIvfPqAuxIndexes = true;
+      VectorIndexBuilder::ivfPqNList = nlist;
+      VectorIndexBuilder::ivfPqM = m;
+      VectorIndexBuilder::ivfPqBits = bits;
+      VectorIndexBuilder::ivfPqDefaultNProbe = nprobe;
+      VectorIndexBuilder::ivfPqMinTrainingVectors = minTraining;
+    }
+
+    ~IvfPqGuard() {
+      VectorIndexBuilder::buildFaissFlatAuxIndexes = savedFlat;
+      VectorIndexBuilder::buildFaissIvfPqAuxIndexes = savedIvfPq;
+      VectorIndexBuilder::ivfPqNList = savedNList;
+      VectorIndexBuilder::ivfPqM = savedM;
+      VectorIndexBuilder::ivfPqBits = savedBits;
+      VectorIndexBuilder::ivfPqDefaultNProbe = savedNProbe;
+      VectorIndexBuilder::ivfPqMinTrainingVectors = savedMinTraining;
+    }
+  };
 };
 
 namespace {
@@ -66,22 +106,8 @@ std::unique_ptr<faiss::Index> readFaissIndex(Directory& dir, std::string_view fn
   return std::unique_ptr<faiss::Index>(faiss::read_index(&r));
 }
 
-struct VectorAuxMeta {
-  int32_t dims;
-  int32_t metric;
-  int32_t cosineNormalizeColumnOnRescore;
-};
-
 VectorAuxMeta readVectorAuxMeta(const proto::AuxIndexInfo& aux) {
-  VectorAuxMeta meta{};
-  EXPECT_EQ(aux.opaque_meta().size(), sizeof(int32_t) * 3);
-  if (aux.opaque_meta().size() >= sizeof(int32_t) * 3) {
-    std::memcpy(&meta.dims, aux.opaque_meta().data(), sizeof(int32_t));
-    std::memcpy(&meta.metric, aux.opaque_meta().data() + sizeof(int32_t), sizeof(int32_t));
-    std::memcpy(&meta.cosineNormalizeColumnOnRescore,
-                aux.opaque_meta().data() + 2 * sizeof(int32_t), sizeof(int32_t));
-  }
-  return meta;
+  return VectorAuxMeta::fromBytes(aux.opaque_meta(), aux.name());
 }
 
 // Install a schema where _v has metric=L2.
@@ -193,7 +219,7 @@ TEST_F(VectorIndexBuilderTest, buildAcrossMultipleSegments) {
   EXPECT_EQ(idx->d, 3);
   EXPECT_EQ(idx->ntotal, 9);
 
-  // opaque_meta carries dims + metric + cosine rescore policy.
+  // opaque_meta carries fixed-width vector engine metadata.
   auto meta = readVectorAuxMeta(aux);
   EXPECT_EQ(meta.dims, 3);
   EXPECT_EQ(meta.metric, (int32_t)proto::VectorParams::L2);
@@ -498,6 +524,63 @@ TEST_F(VectorIndexBuilderTest, cosineRenormChunkBoundaries) {
   }
 
   VectorIndexBuilder::renormChunkBytes = saved;
+}
+
+TEST_F(VectorIndexBuilderTest, buildsIvfPqAuxIndex) {
+  IvfPqGuard guard(/*nlist=*/4, /*m=*/2, /*bits=*/2, /*nprobe=*/4, /*minTraining=*/16);
+  CollectionHelper h("main");
+  h.clear();
+  enableL2OnVecSuffix(h.collection());
+
+  for (int i = 0; i < 160; i++) {
+    float x = (float)(i % 16);
+    float y = (float)(i / 16);
+    h.index(flatdoc("id", "doc" + std::to_string(i),
+                    "embedding_v", std::vector<float>{x, y, x * 0.5f, y * 0.5f}));
+  }
+  h.commit({"*"});
+
+  google::protobuf::Arena arena;
+  auto* info = readIndexInfo(h.getIndexWriter()->dir, arena);
+  ASSERT_EQ(1, info->aux_indexes_size());
+  const auto& aux = info->aux_indexes(0);
+  EXPECT_EQ(aux.kind(), "vector_faiss");
+  EXPECT_EQ(aux.name(), "vec.embedding_v");
+  ASSERT_EQ(aux.files_size(), 1);
+
+  auto idx = readFaissIndex(h.getIndexWriter()->dir, aux.files(0));
+  auto* ivfpq = dynamic_cast<faiss::IndexIVFPQ*>(idx.get());
+  ASSERT_NE(ivfpq, nullptr);
+  EXPECT_EQ(ivfpq->d, 4);
+  EXPECT_EQ(ivfpq->ntotal, 160);
+  EXPECT_EQ(ivfpq->nlist, 4u);
+  EXPECT_EQ(ivfpq->nprobe, 4u);
+  EXPECT_EQ(ivfpq->pq.M, 2u);
+  EXPECT_EQ(ivfpq->pq.nbits, 2u);
+
+  auto meta = readVectorAuxMeta(aux);
+  EXPECT_EQ(meta.engine, VectorAuxMeta::ENGINE_IVFPQ);
+  EXPECT_EQ(meta.nlist, 4);
+  EXPECT_EQ(meta.defaultBreadth, 4);
+  EXPECT_EQ(meta.pqM, 2);
+  EXPECT_EQ(meta.pqBits, 2);
+}
+
+TEST_F(VectorIndexBuilderTest, ivfPqFallsBackWhenTooSmallToTrain) {
+  IvfPqGuard guard(/*nlist=*/4, /*m=*/2, /*bits=*/4, /*nprobe=*/4, /*minTraining=*/128);
+  CollectionHelper h("main");
+  h.clear();
+  enableL2OnVecSuffix(h.collection());
+
+  for (int i = 0; i < 8; i++) {
+    h.index(flatdoc("id", "doc" + std::to_string(i),
+                    "embedding_v", std::vector<float>{(float)i, 0.0f, 1.0f, 0.0f}));
+  }
+  h.commit({"*"});
+
+  google::protobuf::Arena arena;
+  auto* info = readIndexInfo(h.getIndexWriter()->dir, arena);
+  EXPECT_EQ(0, info->aux_indexes_size());
 }
 
 // Field with metric=NONE (the default _v) is not eligible for build, even via "*".

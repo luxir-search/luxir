@@ -177,8 +177,7 @@ message ConstantScoreQuery {
 //
 // V1 limitations:
 //   - The query vector must be non-empty and match the schema / segment dims.
-//   - No production ANN engine has landed yet; the current production path is
-//     exact flat over column storage.
+//   - ANN indexes are best-effort above the candidate / breadth caps.
 //
 // liveDocs and any enclosing filter domain are applied inside the vector engine.
 // Multi-valued vector fields collapse to one hit per doc using max-sim.
@@ -186,6 +185,9 @@ message KnnQuery {
   string field = 1;        // vector field name (e.g. "embedding_v")
   Vector query = 2;        // query vector - must match the field's dims
   int32 k = 3;             // number of nearest-neighbor documents to return
+  int32 nprobe = 4;        // exact IVF lists to probe (clamped to nlist); may return
+                           // < k docs. 0 = index default, with host auto-deepening.
+  int32 refine_factor = 5; // candidate overfetch for approximate ANN; 0 uses default
 }
 
   // use NamedValue here instead? Repeat field so this can be used to query multiple fields at once? Add a field glob/regex?

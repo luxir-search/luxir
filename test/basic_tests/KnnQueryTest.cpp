@@ -123,6 +123,48 @@ protected:
     }
   };
 
+  struct IvfPqAuxGuard {
+    bool savedFlat;
+    bool savedIvfPq;
+    int32_t savedNList;
+    int32_t savedM;
+    int32_t savedBits;
+    int32_t savedNProbe;
+    int64_t savedMinTraining;
+    int32_t savedRefineFactor;
+
+    IvfPqAuxGuard(int32_t nlist, int32_t m, int32_t bits,
+                  int32_t nprobe, int64_t minTraining, int32_t refineFactor)
+      : savedFlat(VectorIndexBuilder::buildFaissFlatAuxIndexes),
+        savedIvfPq(VectorIndexBuilder::buildFaissIvfPqAuxIndexes),
+        savedNList(VectorIndexBuilder::ivfPqNList),
+        savedM(VectorIndexBuilder::ivfPqM),
+        savedBits(VectorIndexBuilder::ivfPqBits),
+        savedNProbe(VectorIndexBuilder::ivfPqDefaultNProbe),
+        savedMinTraining(VectorIndexBuilder::ivfPqMinTrainingVectors),
+        savedRefineFactor(KnnQuery::defaultAnnRefineFactor) {
+      VectorIndexBuilder::buildFaissFlatAuxIndexes = false;
+      VectorIndexBuilder::buildFaissIvfPqAuxIndexes = true;
+      VectorIndexBuilder::ivfPqNList = nlist;
+      VectorIndexBuilder::ivfPqM = m;
+      VectorIndexBuilder::ivfPqBits = bits;
+      VectorIndexBuilder::ivfPqDefaultNProbe = nprobe;
+      VectorIndexBuilder::ivfPqMinTrainingVectors = minTraining;
+      KnnQuery::defaultAnnRefineFactor = refineFactor;
+    }
+
+    ~IvfPqAuxGuard() {
+      VectorIndexBuilder::buildFaissFlatAuxIndexes = savedFlat;
+      VectorIndexBuilder::buildFaissIvfPqAuxIndexes = savedIvfPq;
+      VectorIndexBuilder::ivfPqNList = savedNList;
+      VectorIndexBuilder::ivfPqM = savedM;
+      VectorIndexBuilder::ivfPqBits = savedBits;
+      VectorIndexBuilder::ivfPqDefaultNProbe = savedNProbe;
+      VectorIndexBuilder::ivfPqMinTrainingVectors = savedMinTraining;
+      KnnQuery::defaultAnnRefineFactor = savedRefineFactor;
+    }
+  };
+
   void SetUp() override {
     auto col = soluxNode->getCollection("main");
     col->setSchema(Schema::createDefaultSchema());
@@ -173,7 +215,8 @@ protected:
   // Build a TopDocs request with a KNN query for the given field + query
   // vector + k.  Always pulls back "id" so tests can assert ordering.
   static LocalReq* makeKnnReq(SoluxNode& node, std::string_view field,
-                              std::vector<float> queryVec, int32_t k) {
+                              std::vector<float> queryVec, int32_t k,
+                              int32_t nprobe = 0, int32_t refineFactor = 0) {
     auto* lreq = LocalReq::create(node.getSearchEngine());
     lreq->proto.mutable_collection()->add_name("main");
     auto& topDocs = *(*lreq->proto.mutable_ops())["q"].mutable_top_docs();
@@ -181,15 +224,18 @@ protected:
     topDocs.set_get_number(true);
     topDocs.mutable_fields()->Add("id");
 
-    setKnnQuery(*topDocs.mutable_query(), field, queryVec, k);
+    setKnnQuery(*topDocs.mutable_query(), field, queryVec, k, nprobe, refineFactor);
     return lreq;
   }
 
   static void setKnnQuery(proto::Query& query, std::string_view field,
-                          const std::vector<float>& queryVec, int32_t k) {
+                          const std::vector<float>& queryVec, int32_t k,
+                          int32_t nprobe = 0, int32_t refineFactor = 0) {
     auto& knn = *query.mutable_knn();
     knn.set_field(field);
     knn.set_k(k);
+    if (nprobe > 0) knn.set_nprobe(nprobe);
+    if (refineFactor > 0) knn.set_refine_factor(refineFactor);
     auto& f32 = *knn.mutable_query()->mutable_f32();
     for (float v : queryVec) f32.add_v(v);
   }
@@ -922,6 +968,202 @@ TEST_F(KnnQueryTest, missingAuxIndexFallsBackToColumnScan) {
   EXPECT_EQ(ids[0], "a");
 
   req->done();
+}
+
+TEST_F(KnnQueryTest, ivfPqAuxUsesColumnRescore) {
+  IvfPqAuxGuard guard(/*nlist=*/4, /*m=*/2, /*bits=*/2,
+                      /*nprobe=*/4, /*minTraining=*/16, /*refineFactor=*/64);
+  CollectionHelper h("main");
+  h.clear();
+  installVecSchema(h.collection(), proto::VectorParams::L2);
+
+  for (int i = 0; i < 160; i++) {
+    float x = (float)i;
+    h.index(flatdoc("id", "doc" + std::to_string(i),
+                    "embedding_v", std::vector<float>{x, x * 0.01f, x * 0.02f, x * 0.03f}));
+  }
+  h.commit({"*"});
+
+  auto* req = makeKnnReq(*soluxNode, "embedding_v", {0, 0, 0, 0}, 5,
+                         /*nprobe=*/4, /*refineFactor=*/64);
+  req->execute();
+
+  EXPECT_EQ(req->getMatchCount(), 5);
+  auto ids = resultIds(*req);
+  auto scores = resultScores(*req);
+  ASSERT_EQ(ids.size(), 5u);
+  ASSERT_EQ(scores.size(), 5u);
+  for (int i = 0; i < 5; i++) {
+    EXPECT_EQ(ids[(size_t)i], "doc" + std::to_string(i));
+  }
+  EXPECT_NEAR(scores[0], 1.0f, 1e-5);
+  for (size_t i = 1; i < scores.size(); i++) {
+    EXPECT_GT(scores[i - 1], scores[i]);
+  }
+
+  req->done();
+}
+
+TEST_F(KnnQueryTest, ivfPqApproximateRecallAtOneProbe) {
+  IvfPqAuxGuard guard(/*nlist=*/4, /*m=*/2, /*bits=*/2,
+                      /*nprobe=*/1, /*minTraining=*/16, /*refineFactor=*/8);
+  CollectionHelper h("main");
+  h.clear();
+  installVecSchema(h.collection(), proto::VectorParams::L2);
+
+  for (int cluster = 0; cluster < 4; cluster++) {
+    for (int i = 0; i < 80; i++) {
+      float base = (float)(cluster * 1000);
+      float off = (float)i * 0.01f;
+      h.index(flatdoc("id", "c" + std::to_string(cluster) + "_" + std::to_string(i),
+                      "embedding_v", std::vector<float>{base + off, off, 0.0f, 0.0f}));
+    }
+  }
+  h.commit({"*"});
+
+  auto* req = makeKnnReq(*soluxNode, "embedding_v", {2000, 0, 0, 0}, 5,
+                         /*nprobe=*/1, /*refineFactor=*/8);
+  req->execute();
+
+  EXPECT_EQ(req->getMatchCount(), 5);
+  auto ids = resultIds(*req);
+  ASSERT_EQ(ids.size(), 5u);
+  std::set<std::string> exactTop{"c2_0", "c2_1", "c2_2", "c2_3", "c2_4"};
+  int hits = 0;
+  for (const auto& id : ids) {
+    if (exactTop.count(id)) hits++;
+  }
+  EXPECT_GE(hits, 3) << "IVF+PQ one-probe recall should recover most exact top hits";
+
+  req->done();
+}
+
+TEST_F(KnnQueryTest, ivfPqMultiValuedUsesReverseMapAndCollapse) {
+  IvfPqAuxGuard guard(/*nlist=*/4, /*m=*/2, /*bits=*/2,
+                      /*nprobe=*/4, /*minTraining=*/16, /*refineFactor=*/64);
+  CollectionHelper h("main");
+  h.clear();
+  installMultiVecSchema(h.collection(), proto::VectorParams::L2);
+
+  h.index(flatdoc("id", std::string("a"), "emb_vs",
+                  std::vector<std::vector<float>>{{0, 0, 0, 0}, {0.01f, 0, 0, 0}}));
+  h.index(flatdoc("id", std::string("g")));
+  h.index(flatdoc("id", std::string("b"), "emb_vs",
+                  std::vector<std::vector<float>>{{1, 0, 0, 0}}));
+  h.index(flatdoc("id", std::string("c"), "emb_vs",
+                  std::vector<std::vector<float>>{{2, 0, 0, 0}}));
+  h.index(flatdoc("id", std::string("d"), "emb_vs",
+                  std::vector<std::vector<float>>{{3, 0, 0, 0}}));
+  for (int i = 0; i < 155; i++) {
+    float x = 50.0f + (float)i;
+    h.index(flatdoc("id", "f" + std::to_string(i), "emb_vs",
+                    std::vector<std::vector<float>>{{
+                        x, (float)(i % 7) * 0.1f, (float)(i % 13) * 0.05f, 0.25f}}));
+  }
+  h.commit({"*"});
+
+  auto* req = makeKnnReq(*soluxNode, "emb_vs", {0, 0, 0, 0}, 3,
+                         /*nprobe=*/4, /*refineFactor=*/64);
+  req->execute();
+
+  EXPECT_EQ(req->getMatchCount(), 3);
+  auto ids = resultIds(*req);
+  ASSERT_EQ(ids.size(), 3u);
+  EXPECT_EQ(ids[0], "a");
+  EXPECT_EQ(ids[1], "b");
+  EXPECT_EQ(ids[2], "c");
+  for (const auto& id : ids) {
+    EXPECT_NE(id, "g");
+  }
+
+  req->done();
+}
+
+TEST_F(KnnQueryTest, ivfPqCosineRawColumnRescoreNormalizes) {
+  IvfPqAuxGuard guard(/*nlist=*/4, /*m=*/2, /*bits=*/2,
+                      /*nprobe=*/4, /*minTraining=*/16, /*refineFactor=*/64);
+  CollectionHelper h("main");
+  h.clear();
+  installVecSchemaCosineRaw(h.collection());
+
+  h.index(flatdoc("id", std::string("east"), "embedding_v", std::vector<float>{5, 0, 0, 0}));
+  h.index(flatdoc("id", std::string("b"), "embedding_v", std::vector<float>{3, 4, 0, 0}));
+  h.index(flatdoc("id", std::string("c"), "embedding_v", std::vector<float>{4, 3, 0, 0}));
+  for (int i = 0; i < 157; i++) {
+    h.index(flatdoc("id", "f" + std::to_string(i), "embedding_v",
+                    std::vector<float>{-1.0f - (float)i * 0.01f,
+                                       10.0f + (float)(i % 11),
+                                       (float)(i % 5) * 0.1f,
+                                       0.25f}));
+  }
+  h.commit({"*"});
+
+  auto* req = makeKnnReq(*soluxNode, "embedding_v", {7, 0, 0, 0}, 3,
+                         /*nprobe=*/4, /*refineFactor=*/64);
+  req->execute();
+
+  auto ids = resultIds(*req);
+  auto scores = resultScores(*req);
+  ASSERT_EQ(ids.size(), 3u);
+  EXPECT_EQ(ids[0], "east");
+  EXPECT_EQ(ids[1], "c");
+  EXPECT_EQ(ids[2], "b");
+  ASSERT_EQ(scores.size(), 3u);
+  EXPECT_NEAR(scores[0], 1.0f, 1e-5);
+  EXPECT_NEAR(scores[1], 0.8f, 1e-5);
+  EXPECT_NEAR(scores[2], 0.6f, 1e-5);
+
+  req->done();
+}
+
+TEST_F(KnnQueryTest, requestedNProbeCapsBreadthDeepening) {
+  IvfPqAuxGuard guard(/*nlist=*/2, /*m=*/2, /*bits=*/2,
+                      /*nprobe=*/1, /*minTraining=*/16, /*refineFactor=*/32);
+  CollectionHelper h("main");
+  h.clear();
+  installVecSchema(h.collection(), proto::VectorParams::L2);
+
+  for (int i = 0; i < 160; i++) {
+    float off = (float)i * 0.001f;
+    h.index(flatdoc("id", "red" + std::to_string(i), "color_s", "red",
+                    "embedding_v", std::vector<float>{off, off, 0.0f, 0.0f}));
+  }
+  for (int i = 0; i < 160; i++) {
+    float off = (float)i * 0.001f;
+    h.index(flatdoc("id", "blue" + std::to_string(i), "color_s", "blue",
+                    "embedding_v", std::vector<float>{1000.0f + off, off, 0.0f, 0.0f}));
+  }
+  h.commit({"*"});
+
+  auto addBlueFilter = [](LocalReq* req) {
+    auto& topDocs = *(*req->proto.mutable_ops())["q"].mutable_top_docs();
+    auto& nf = *topDocs.add_filter();
+    nf.set_name("blue");
+    auto& m = *nf.mutable_query()->mutable_match();
+    m.set_field("color_s");
+    m.mutable_val()->set_s("blue");
+  };
+
+  auto* capped = makeKnnReq(*soluxNode, "embedding_v", {0, 0, 0, 0}, 3,
+                            /*nprobe=*/1, /*refineFactor=*/32);
+  addBlueFilter(capped);
+  capped->execute();
+  EXPECT_EQ(capped->getMatchCount(), 0)
+      << "request nprobe=1 should cap breadth and not broaden into the blue list";
+  capped->done();
+
+  auto* broaden = makeKnnReq(*soluxNode, "embedding_v", {0, 0, 0, 0}, 3,
+                             /*nprobe=*/0, /*refineFactor=*/32);
+  addBlueFilter(broaden);
+  broaden->execute();
+  EXPECT_EQ(broaden->getMatchCount(), 3)
+      << "without request nprobe, the host may broaden from the index default";
+  auto ids = resultIds(*broaden);
+  ASSERT_EQ(ids.size(), 3u);
+  for (const auto& id : ids) {
+    EXPECT_TRUE(id.starts_with("blue"));
+  }
+  broaden->done();
 }
 
 // Dimension mismatch: query vector has different dims than the index.

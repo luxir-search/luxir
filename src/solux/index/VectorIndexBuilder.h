@@ -16,9 +16,9 @@ namespace solux {
 
 /// Builds FAISS aux indexes for vector fields across a snapshot of segments.
 ///
-/// Flat kNN is served directly from the vector column, so this builder is
-/// currently retained as a temporary FAISS-flat aux path for tests / A-B
-/// benchmarks until the first real ANN aux engine lands.
+/// Flat kNN is served directly from the vector column.  Normal aux builds now
+/// produce an IVF+PQ ANN index when enough vectors are present; the old
+/// FAISS-flat build remains as an explicit test / A-B benchmark hook.
 ///
 /// One index per (eligible) vector field, written under a single filename
 /// produced by Postings::getAuxIndexFileName.  The "name" used in filenames +
@@ -35,9 +35,11 @@ namespace solux {
 /// tracked via liveDocs separately), so those vectors land in FAISS too -
 /// the query layer is expected to filter against current liveDocs.
 ///
-/// IndexFlatL2 / IndexFlatIP only.  Single- and multi-valued vector fields are
-/// both supported: every value of every doc is added to FAISS, and the query layer
-/// maps each FAISS id back to its owning doc (valueRank -> docId).
+/// Single- and multi-valued vector fields are both supported: every value of
+/// every doc is added to FAISS, and the query layer maps each FAISS id back to
+/// its owning doc (valueRank -> docId).  IVF+PQ scores are approximate; the
+/// query layer rescans candidates from the full-precision vector column before
+/// ranking and doc collapse.
 class VectorIndexBuilder {
 public:
   // Aux index name prefix (e.g. "vec.title_v").
@@ -48,10 +50,23 @@ public:
   // tests can shrink it to exercise the multi-chunk loop on small inputs.
   static size_t renormChunkBytes;
 
-  // Temporary A-B hook: production flat search does not emit a vec.* aux
-  // artifact.  Tests / benches can enable this to keep the old FAISS-flat path
-  // available for comparison until IVF+PQ replaces it as the real aux engine.
+  // A-B hook: production flat search does not emit a vec.* aux artifact.
+  // Tests / benches can enable this to compare FAISS-flat against the normal
+  // IVF+PQ aux engine.
   static bool buildFaissFlatAuxIndexes;
+
+  // Normal aux builds attempt IVF+PQ.  Tests may disable this to verify the
+  // flat-over-column fallback without changing request selectors.
+  static bool buildFaissIvfPqAuxIndexes;
+
+  // IVF+PQ tuning defaults.  Zero means "derive from the field / collection".
+  static int32_t ivfPqNList;
+  static int32_t ivfPqM;
+  static int32_t ivfPqBits;
+  static int32_t ivfPqDefaultNProbe;
+  static int64_t ivfPqMinTrainingVectors;
+  static size_t ivfPqTrainingSampleBytes;
+  static size_t ivfPqAddChunkBytes;
 
   /// One segment's worth of input.  Segments must be passed in the same order
   /// they will appear in the IndexInfo file (sorted by segId), so query-time
@@ -101,11 +116,19 @@ private:
   // Output map: fieldName -> pinned schema dims (0 == infer from segment).
   std::vector<std::pair<std::string, const VectorFieldType*>> collectEligibleFields();
 
-  // Builds the FAISS index + mapping file for one field.  Returns nullopt when
+  // Builds the FAISS index file for one field.  Returns nullopt when
   // no segment has any vectors for the field (no files written, nothing to record).
   std::optional<proto::AuxIndexInfo> buildField(std::string_view fieldName,
                                                 const VectorFieldType& ft,
                                                 std::vector<std::string>& outFilesToSync);
+
+  std::optional<proto::AuxIndexInfo> buildFlatField(std::string_view fieldName,
+                                                    const VectorFieldType& ft,
+                                                    std::vector<std::string>& outFilesToSync);
+
+  std::optional<proto::AuxIndexInfo> buildIvfPqField(std::string_view fieldName,
+                                                     const VectorFieldType& ft,
+                                                     std::vector<std::string>& outFilesToSync);
 };
 
 } // namespace solux

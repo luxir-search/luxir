@@ -19,28 +19,70 @@
 #include "solux/store/Directory.h"
 #include "solux/store/InputStream.h"
 #include "solux/util/log.h"
+#include "solux/util/solux_util.h"
 
 namespace solux {
 
+/// Fixed-width metadata for one vector aux index entry.  VectorIndexBuilder
+/// packs this struct verbatim into AuxIndexInfo.opaque_meta; the reader copies
+/// it back out.  Packed so the byte layout is the struct declaration, with no
+/// implicit padding.  Native endianness: aux entries are rebuilt from the
+/// segments they describe, never shipped between hosts.
+SOLUX_PACKED_START
+struct VectorAuxMeta {
+  int32_t dims = 0;
+  int32_t metric = 0;       // raw proto::VectorParams::Metric value
+  int32_t cosineNormalizeColumnOnRescore = 0;  // bool: raw cosine column, renorm at rescore
+  int32_t engine = 0;       // ENGINE_FLAT / ENGINE_IVFPQ
+  int32_t nlist = 0;        // IVF only
+  int32_t defaultBreadth = 0;  // IVF only: build-time default nprobe
+  int32_t pqM = 0;          // IVF+PQ only
+  int32_t pqBits = 0;       // IVF+PQ only
+
+  static constexpr int32_t ENGINE_FLAT = 0;
+  static constexpr int32_t ENGINE_IVFPQ = 1;
+
+  std::string toBytes() const {
+    return std::string((const char*)this, sizeof(VectorAuxMeta));
+  }
+
+  /// Decode + validate.  Throws on size mismatch or unknown engine.
+  static VectorAuxMeta fromBytes(std::string_view bytes, std::string_view auxName) {
+    if (bytes.size() != sizeof(VectorAuxMeta)) {
+      throw std::runtime_error(std::format(
+        "VectorAuxMeta: aux '{}' has invalid opaque_meta size {} (expected {})",
+        auxName, bytes.size(), sizeof(VectorAuxMeta)));
+    }
+    VectorAuxMeta meta;
+    std::memcpy(&meta, bytes.data(), sizeof(VectorAuxMeta));
+    if (meta.engine != ENGINE_FLAT && meta.engine != ENGINE_IVFPQ) {
+      // (int32_t) copies: can't bind a reference to a packed field.
+      throw std::runtime_error(std::format(
+        "VectorAuxMeta: aux '{}' has unknown vector engine {}",
+        auxName, (int32_t)meta.engine));
+    }
+    return meta;
+  }
+} SOLUX_PACKED_END;
+
+static_assert(sizeof(VectorAuxMeta) == 8 * sizeof(int32_t),
+              "VectorAuxMeta layout is an on-disk contract");
+
 /// AuxReader for kind == "vector_faiss".  Holds a deserialized faiss::Index
 /// loaded from the single file referenced by AuxIndexInfo.files(0), plus the
-/// dims and metric values cached out of AuxIndexInfo.opaque_meta.
+/// VectorAuxMeta decoded out of AuxIndexInfo.opaque_meta.
 ///
-/// V1 contract (matches VectorIndexBuilder): one file per entry, IndexFlat
-/// {L2,IP,COSINE}.  Both single- and multi-valued vector fields are supported:
-/// every vector is its own FAISS id, and KnnQuery maps each id back to its
-/// owning doc via the segment's valueRank->docId column.  The FAISS index is
-/// fully deserialized into process memory, so the source file does not need to
-/// outlive the reader.
+/// Contract (matches VectorIndexBuilder): one file per entry, currently either
+/// explicit test-only IndexFlat or production IVF+PQ.  Both single- and
+/// multi-valued vector fields are supported: every vector is its own FAISS id,
+/// and KnnQuery maps each id back to its owning doc via the segment's
+/// valueRank->docId column.  The FAISS index is fully deserialized into process
+/// memory, so the source file does not need to outlive the reader.
 class VectorAuxReader : public AuxReader {
   std::string name;
   std::string field;
   std::unique_ptr<faiss::Index> faissIndex;
-  int32_t dims;
-
-  // Raw int from proto::VectorParams::Metric (recorded in opaque_meta at build).
-  int32_t metric;
-  bool cosineNormalizeColumnOnRescore;
+  VectorAuxMeta meta;
 
 public:
   static constexpr std::string_view KIND = "vector_faiss";
@@ -48,21 +90,25 @@ public:
   VectorAuxReader(std::string name, std::string field,
                   uint64_t gen, uint64_t builtCoreGen,
                   std::unique_ptr<faiss::Index> idx,
-                  int32_t dims, int32_t metric,
-                  bool cosineNormalizeColumnOnRescore) noexcept
+                  const VectorAuxMeta& meta) noexcept
     : AuxReader(gen, builtCoreGen),
       name(std::move(name)), field(std::move(field)),
-      faissIndex(std::move(idx)), dims(dims), metric(metric),
-      cosineNormalizeColumnOnRescore(cosineNormalizeColumnOnRescore) {}
+      faissIndex(std::move(idx)), meta(meta) {}
 
   std::string_view getKind() const override { return KIND; }
   std::string_view getName() const override { return name; }
   std::string_view getField() const noexcept { return field; }
-  int32_t getDims() const noexcept { return dims; }
-  int32_t getMetric() const noexcept { return metric; }
+  int32_t getDims() const noexcept { return meta.dims; }
+  int32_t getMetric() const noexcept { return meta.metric; }
   bool shouldNormalizeColumnOnCosineRescore() const noexcept {
-    return cosineNormalizeColumnOnRescore;
+    return meta.cosineNormalizeColumnOnRescore != 0;
   }
+  int32_t getEngine() const noexcept { return meta.engine; }
+  int32_t getNList() const noexcept { return meta.nlist; }
+  int32_t getDefaultBreadth() const noexcept { return meta.defaultBreadth; }
+  int32_t getPqM() const noexcept { return meta.pqM; }
+  int32_t getPqBits() const noexcept { return meta.pqBits; }
+  bool scoresAreExact() const noexcept { return meta.engine == VectorAuxMeta::ENGINE_FLAT; }
 
   // Search-time entry point.  faiss::Index::search is thread-safe for
   // concurrent readers.
@@ -96,21 +142,7 @@ public:
         std::make_error_code(std::errc::no_such_file_or_directory));
     }
 
-    // Decode opaque_meta produced by VectorIndexBuilder:
-    //   int32 dims, int32 metric, int32 cosineNormalizeColumnOnRescore.
-    // Older entries without opaque_meta still work - we fall back to idx->d for
-    // dims, report metric=0 (unknown), and assume no cosine column rescore norm.
-    int32_t dimsMeta = 0;
-    int32_t metricMeta = 0;
-    int32_t cosineNormalizeColumnOnRescoreMeta = 0;
-    if (info.opaque_meta().size() >= 2 * sizeof(int32_t)) {
-      std::memcpy(&dimsMeta, info.opaque_meta().data(), sizeof(int32_t));
-      std::memcpy(&metricMeta, info.opaque_meta().data() + sizeof(int32_t), sizeof(int32_t));
-    }
-    if (info.opaque_meta().size() >= 3 * sizeof(int32_t)) {
-      std::memcpy(&cosineNormalizeColumnOnRescoreMeta,
-                  info.opaque_meta().data() + 2 * sizeof(int32_t), sizeof(int32_t));
-    }
+    VectorAuxMeta meta = VectorAuxMeta::fromBytes(info.opaque_meta(), info.name());
 
     auto bytes = file->read();
     BufferIOReader io(bytes.data(), bytes.size());
@@ -153,17 +185,15 @@ public:
       throw std::runtime_error(std::format(
         "VectorAuxReader: read_index returned null for {}", fname));
     }
-    if (dimsMeta != 0 && idx->d != dimsMeta) {
+    if (idx->d != meta.dims) {
       throw std::runtime_error(std::format(
         "VectorAuxReader: dims mismatch for aux '{}': index has {}, opaque_meta says {}",
-        info.name(), (int)idx->d, dimsMeta));
+        info.name(), (int)idx->d, (int32_t)meta.dims));
     }
 
-    int32_t dims = dimsMeta != 0 ? dimsMeta : (int32_t)idx->d;
     return std::make_shared<VectorAuxReader>(
       std::string(info.name()), std::string(info.field()),
-      info.gen(), info.built_core_gen(),
-      std::move(idx), dims, metricMeta, cosineNormalizeColumnOnRescoreMeta != 0);
+      info.gen(), info.built_core_gen(), std::move(idx), meta);
   }
 
 private:
