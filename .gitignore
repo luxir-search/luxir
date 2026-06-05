@@ -58,3 +58,6 @@ protos/*.pb.h
 protos/*.grpc.pb.cc
 protos/*.grpc.pb.h
 
+# Local agent and dependency worktrees
+.claude/
+deps/simdcomp/
