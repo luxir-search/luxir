@@ -131,10 +131,15 @@ protected:
     int32_t savedBits;
     int32_t savedNProbe;
     int64_t savedMinTraining;
-    int32_t savedRefineFactor;
+    int32_t savedRefineCount;
+    int32_t savedRefineRatio;
 
+    // refineRatio configures the DEFAULT refine sizing as a pure multiple
+    // (count=0, ratio=refineRatio) so tests that rely on the default see
+    // multiplier behavior; most tests pass an explicit request
+    // refine_candidates (an absolute pool size) anyway.
     IvfPqAuxGuard(int32_t nlist, int32_t m, int32_t bits,
-                  int32_t nprobe, int64_t minTraining, int32_t refineFactor)
+                  int32_t nprobe, int64_t minTraining, int32_t refineRatio)
       : savedFlat(VectorIndexBuilder::buildFaissFlatAuxIndexes),
         savedIvfPq(VectorIndexBuilder::buildFaissIvfPqAuxIndexes),
         savedNList(VectorIndexBuilder::ivfPqNList),
@@ -142,7 +147,8 @@ protected:
         savedBits(VectorIndexBuilder::ivfPqBits),
         savedNProbe(VectorIndexBuilder::ivfPqDefaultNProbe),
         savedMinTraining(VectorIndexBuilder::ivfPqMinTrainingVectors),
-        savedRefineFactor(KnnQuery::defaultAnnRefineFactor) {
+        savedRefineCount(KnnQuery::defaultAnnRefineCount),
+        savedRefineRatio(KnnQuery::defaultAnnRefineRatio) {
       VectorIndexBuilder::buildFaissFlatAuxIndexes = false;
       VectorIndexBuilder::buildFaissIvfPqAuxIndexes = true;
       VectorIndexBuilder::ivfPqNList = nlist;
@@ -150,7 +156,8 @@ protected:
       VectorIndexBuilder::ivfPqBits = bits;
       VectorIndexBuilder::ivfPqDefaultNProbe = nprobe;
       VectorIndexBuilder::ivfPqMinTrainingVectors = minTraining;
-      KnnQuery::defaultAnnRefineFactor = refineFactor;
+      KnnQuery::defaultAnnRefineCount = 0;
+      KnnQuery::defaultAnnRefineRatio = refineRatio;
     }
 
     ~IvfPqAuxGuard() {
@@ -161,7 +168,8 @@ protected:
       VectorIndexBuilder::ivfPqBits = savedBits;
       VectorIndexBuilder::ivfPqDefaultNProbe = savedNProbe;
       VectorIndexBuilder::ivfPqMinTrainingVectors = savedMinTraining;
-      KnnQuery::defaultAnnRefineFactor = savedRefineFactor;
+      KnnQuery::defaultAnnRefineCount = savedRefineCount;
+      KnnQuery::defaultAnnRefineRatio = savedRefineRatio;
     }
   };
 
@@ -216,7 +224,7 @@ protected:
   // vector + k.  Always pulls back "id" so tests can assert ordering.
   static LocalReq* makeKnnReq(SoluxNode& node, std::string_view field,
                               std::vector<float> queryVec, int32_t k,
-                              int32_t nprobe = 0, int32_t refineFactor = 0,
+                              int32_t nprobe = 0, int32_t refineCandidates = 0,
                               bool exact = false) {
     auto* lreq = LocalReq::create(node.getSearchEngine());
     lreq->proto.mutable_collection()->add_name("main");
@@ -225,20 +233,20 @@ protected:
     topDocs.set_get_number(true);
     topDocs.mutable_fields()->Add("id");
 
-    setKnnQuery(*topDocs.mutable_query(), field, queryVec, k, nprobe, refineFactor,
-                exact);
+    setKnnQuery(*topDocs.mutable_query(), field, queryVec, k, nprobe,
+                refineCandidates, exact);
     return lreq;
   }
 
   static void setKnnQuery(proto::Query& query, std::string_view field,
                           const std::vector<float>& queryVec, int32_t k,
-                          int32_t nprobe = 0, int32_t refineFactor = 0,
+                          int32_t nprobe = 0, int32_t refineCandidates = 0,
                           bool exact = false) {
     auto& knn = *query.mutable_knn();
     knn.set_field(field);
     knn.set_k(k);
     if (nprobe > 0) knn.set_nprobe(nprobe);
-    if (refineFactor > 0) knn.set_refine_factor(refineFactor);
+    if (refineCandidates > 0) knn.set_refine_candidates(refineCandidates);
     if (exact) knn.set_exact(true);
     auto& f32 = *knn.mutable_query()->mutable_f32();
     for (float v : queryVec) f32.add_v(v);
@@ -976,7 +984,7 @@ TEST_F(KnnQueryTest, missingAuxIndexFallsBackToColumnScan) {
 
 TEST_F(KnnQueryTest, ivfPqAuxUsesColumnRescore) {
   IvfPqAuxGuard guard(/*nlist=*/4, /*m=*/2, /*bits=*/2,
-                      /*nprobe=*/4, /*minTraining=*/16, /*refineFactor=*/64);
+                      /*nprobe=*/4, /*minTraining=*/16, /*refineRatio=*/64);
   CollectionHelper h("main");
   h.clear();
   installVecSchema(h.collection(), proto::VectorParams::L2);
@@ -989,7 +997,7 @@ TEST_F(KnnQueryTest, ivfPqAuxUsesColumnRescore) {
   h.commit({"*"});
 
   auto* req = makeKnnReq(*soluxNode, "embedding_v", {0, 0, 0, 0}, 5,
-                         /*nprobe=*/4, /*refineFactor=*/64);
+                         /*nprobe=*/4, /*refineCandidates=*/320);
   req->execute();
 
   EXPECT_EQ(req->getMatchCount(), 5);
@@ -1010,7 +1018,7 @@ TEST_F(KnnQueryTest, ivfPqAuxUsesColumnRescore) {
 
 TEST_F(KnnQueryTest, ivfPqApproximateRecallAtOneProbe) {
   IvfPqAuxGuard guard(/*nlist=*/4, /*m=*/2, /*bits=*/2,
-                      /*nprobe=*/1, /*minTraining=*/16, /*refineFactor=*/8);
+                      /*nprobe=*/1, /*minTraining=*/16, /*refineRatio=*/8);
   CollectionHelper h("main");
   h.clear();
   installVecSchema(h.collection(), proto::VectorParams::L2);
@@ -1026,7 +1034,7 @@ TEST_F(KnnQueryTest, ivfPqApproximateRecallAtOneProbe) {
   h.commit({"*"});
 
   auto* req = makeKnnReq(*soluxNode, "embedding_v", {2000, 0, 0, 0}, 5,
-                         /*nprobe=*/1, /*refineFactor=*/8);
+                         /*nprobe=*/1, /*refineCandidates=*/40);
   req->execute();
 
   EXPECT_EQ(req->getMatchCount(), 5);
@@ -1051,7 +1059,7 @@ TEST_F(KnnQueryTest, ivfPqApproximateRecallAtOneProbe) {
 // invisible to the approximate path.  exact must recover it.
 TEST_F(KnnQueryTest, exactBypassesApproximateIndex) {
   IvfPqAuxGuard guard(/*nlist=*/2, /*m=*/2, /*bits=*/2,
-                      /*nprobe=*/1, /*minTraining=*/16, /*refineFactor=*/8);
+                      /*nprobe=*/1, /*minTraining=*/16, /*refineRatio=*/8);
   CollectionHelper h("main");
   h.clear();
   installVecSchema(h.collection(), proto::VectorParams::L2);
@@ -1070,7 +1078,7 @@ TEST_F(KnnQueryTest, exactBypassesApproximateIndex) {
   // Approximate at nprobe=1: probes blob A's list only; the outlier (true #1,
   // distance 200 vs blob A's best ~399) cannot appear.
   auto* approx = makeKnnReq(*soluxNode, "embedding_v", {400, 0, 0, 0}, 5,
-                            /*nprobe=*/1, /*refineFactor=*/8);
+                            /*nprobe=*/1, /*refineCandidates=*/40);
   approx->execute();
   auto approxIds = resultIds(*approx);
   ASSERT_EQ(approxIds.size(), 5u);
@@ -1082,7 +1090,7 @@ TEST_F(KnnQueryTest, exactBypassesApproximateIndex) {
   // exact: identical request plus the contract flag; hostile nprobe/refine
   // are ignored and the true top-5 comes back in order.
   auto* req = makeKnnReq(*soluxNode, "embedding_v", {400, 0, 0, 0}, 5,
-                         /*nprobe=*/1, /*refineFactor=*/8, /*exact=*/true);
+                         /*nprobe=*/1, /*refineCandidates=*/40, /*exact=*/true);
   req->execute();
 
   EXPECT_EQ(req->getMatchCount(), 5);
@@ -1122,7 +1130,7 @@ TEST_F(KnnQueryTest, exactIgnoresMaxKnnCandidatesCap) {
   capped->done();
 
   auto* req = makeKnnReq(*soluxNode, "embedding_v", {0, 0, 0, 0}, 5,
-                         /*nprobe=*/0, /*refineFactor=*/0, /*exact=*/true);
+                         /*nprobe=*/0, /*refineCandidates=*/0, /*exact=*/true);
   req->execute();
   EXPECT_EQ(req->getMatchCount(), 5) << "exact fulfills k despite the host cap";
   auto ids = resultIds(*req);
@@ -1135,7 +1143,7 @@ TEST_F(KnnQueryTest, exactIgnoresMaxKnnCandidatesCap) {
 
 TEST_F(KnnQueryTest, ivfPqMultiValuedUsesReverseMapAndCollapse) {
   IvfPqAuxGuard guard(/*nlist=*/4, /*m=*/2, /*bits=*/2,
-                      /*nprobe=*/4, /*minTraining=*/16, /*refineFactor=*/64);
+                      /*nprobe=*/4, /*minTraining=*/16, /*refineRatio=*/64);
   CollectionHelper h("main");
   h.clear();
   installMultiVecSchema(h.collection(), proto::VectorParams::L2);
@@ -1158,7 +1166,7 @@ TEST_F(KnnQueryTest, ivfPqMultiValuedUsesReverseMapAndCollapse) {
   h.commit({"*"});
 
   auto* req = makeKnnReq(*soluxNode, "emb_vs", {0, 0, 0, 0}, 3,
-                         /*nprobe=*/4, /*refineFactor=*/64);
+                         /*nprobe=*/4, /*refineCandidates=*/192);
   req->execute();
 
   EXPECT_EQ(req->getMatchCount(), 3);
@@ -1176,7 +1184,7 @@ TEST_F(KnnQueryTest, ivfPqMultiValuedUsesReverseMapAndCollapse) {
 
 TEST_F(KnnQueryTest, ivfPqCosineRawColumnRescoreNormalizes) {
   IvfPqAuxGuard guard(/*nlist=*/4, /*m=*/2, /*bits=*/2,
-                      /*nprobe=*/4, /*minTraining=*/16, /*refineFactor=*/64);
+                      /*nprobe=*/4, /*minTraining=*/16, /*refineRatio=*/64);
   CollectionHelper h("main");
   h.clear();
   installVecSchemaCosineRaw(h.collection());
@@ -1194,7 +1202,7 @@ TEST_F(KnnQueryTest, ivfPqCosineRawColumnRescoreNormalizes) {
   h.commit({"*"});
 
   auto* req = makeKnnReq(*soluxNode, "embedding_v", {7, 0, 0, 0}, 3,
-                         /*nprobe=*/4, /*refineFactor=*/64);
+                         /*nprobe=*/4, /*refineCandidates=*/192);
   req->execute();
 
   auto ids = resultIds(*req);
@@ -1213,7 +1221,7 @@ TEST_F(KnnQueryTest, ivfPqCosineRawColumnRescoreNormalizes) {
 
 TEST_F(KnnQueryTest, requestedNProbeCapsBreadthDeepening) {
   IvfPqAuxGuard guard(/*nlist=*/2, /*m=*/2, /*bits=*/2,
-                      /*nprobe=*/1, /*minTraining=*/16, /*refineFactor=*/32);
+                      /*nprobe=*/1, /*minTraining=*/16, /*refineRatio=*/32);
   CollectionHelper h("main");
   h.clear();
   installVecSchema(h.collection(), proto::VectorParams::L2);
@@ -1240,7 +1248,7 @@ TEST_F(KnnQueryTest, requestedNProbeCapsBreadthDeepening) {
   };
 
   auto* capped = makeKnnReq(*soluxNode, "embedding_v", {0, 0, 0, 0}, 3,
-                            /*nprobe=*/1, /*refineFactor=*/32);
+                            /*nprobe=*/1, /*refineCandidates=*/96);
   addBlueFilter(capped);
   capped->execute();
   EXPECT_EQ(capped->getMatchCount(), 0)
@@ -1248,7 +1256,7 @@ TEST_F(KnnQueryTest, requestedNProbeCapsBreadthDeepening) {
   capped->done();
 
   auto* broaden = makeKnnReq(*soluxNode, "embedding_v", {0, 0, 0, 0}, 3,
-                             /*nprobe=*/0, /*refineFactor=*/32);
+                             /*nprobe=*/0, /*refineCandidates=*/96);
   addBlueFilter(broaden);
   broaden->execute();
   EXPECT_EQ(broaden->getMatchCount(), 3)

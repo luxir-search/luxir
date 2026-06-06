@@ -38,15 +38,24 @@ in insertion order, not relevance order, so a partial list scan would drop
 arbitrary candidates; `nprobe` (which selects lists by relevance) is the only
 work limiter.
 
-`refine_factor` controls overfetch for approximate ANN. The query asks the aux
-engine for roughly `k * refine_factor` vector candidates, unions candidates
-across deepen rounds, rescans approximate hits from the full-precision column,
-sorts by exact score, and then collapses to one hit per document.
+`refine_candidates` controls overfetch for approximate ANN. An explicit
+value pins the candidate pool to exactly that many approximate candidates
+(clamped up to `k`) - an absolute count, like `nprobe`, so large-`k` callers
+are not forced to choose between coarse multiplier steps. When unset, the
+default pool is affine with a multiplier that shrinks as `k` grows - a fixed count plus
+`k` times a ratio that decays from ~10 at `k=1` to a small floor by
+`k=1000`. Quantization mis-ranking displaces a true neighbor by a roughly
+constant number of candidates regardless of `k`, so small `k` needs the
+fixed headroom; large `k` requests are recall-oriented retrieval whose
+near-tied tail does not benefit from extra overfetch, so the pool stays
+proportionate instead of exploding. Candidates are unioned across deepen
+rounds, rescanned from the full-precision column, sorted by exact score, and
+collapsed to one hit per document.
 
 `exact` requires exact (true top-k) results. It is a result contract, not an
 execution mode: the engine uses a path that guarantees exactness - currently
 an exhaustive scan over the stored vector column - and does not consult
-approximate ANN indexes. `nprobe` and `refine_factor` are ignored. Cost is
+approximate ANN indexes. `nprobe` and `refine_candidates` are ignored. Cost is
 linear in the number of stored vectors. Query semantics are otherwise
 identical to the default path (same filters, same multi-valued collapse, same
 score scale), which makes `exact` the ground truth for measuring ANN recall:

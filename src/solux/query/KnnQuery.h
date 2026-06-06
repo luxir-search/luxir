@@ -62,7 +62,7 @@ class KnnQuery final : public solux::Query {
   std::span<const float> queryVec;
   int32_t k;
   int32_t nprobe;
-  int32_t refineFactor;
+  int32_t refineCandidates;
   bool exact;
 
 public:
@@ -84,8 +84,24 @@ public:
   static inline int32_t maxKnnBreadth = 1000000;
 
   // Approximate ANN engines over-fetch vector candidates before exact
-  // full-precision rescore.  Mutable so recall tests can force a known value.
-  static inline int32_t defaultAnnRefineFactor = 4;
+  // full-precision rescore.  Default sizing is affine with a DECAYING ratio:
+  //   kReq = count + k * max(REFINE_MIN_RATIO, log2(REFINE_UNITY_K / k))
+  // (same shape as Solr's distributed-faceting overrequest, count +
+  // ratio*limit, with the ratio shrinking as k grows).  Rationale: PQ
+  // mis-ranking displaces a true neighbor by an absolute number of impostors
+  // that does not scale with k, so small k needs the fixed headroom - while
+  // large k is shotgun retrieval whose near-tied tail nobody can rank
+  // meaningfully (and no benchmark measures recall that deep), so the
+  // multiplier decays to REFINE_MIN_RATIO by k = REFINE_UNITY_K instead of
+  // inflating the rescore pool and the engine's result heap.  An explicit
+  // request refine_candidates pins the pool size directly (clamped up to k -
+  // an absolute count like nprobe, not a multiplier).  defaultAnnRefineRatio:
+  // 0 = the adaptive decay; > 0 pins a fixed default ratio (tests use this
+  // to emulate a pure multiplier).  Mutable for tests / benches.
+  static inline int32_t defaultAnnRefineCount = 128;
+  static inline int32_t defaultAnnRefineRatio = 0;
+  static constexpr double REFINE_UNITY_K = 1000.0;
+  static constexpr double REFINE_MIN_RATIO = 1.1;
 
   // Test seam: when set, prepare() wraps the production flat engine and runs
   // the host deepen loop against the wrapper instead.  Lets tests drive the
@@ -147,16 +163,16 @@ public:
 
   KnnQuery(std::string_view field, const VectorFieldType& fieldType,
            std::span<const float> queryVec, int32_t k,
-           int32_t nprobe = 0, int32_t refineFactor = 0, bool exact = false)
+           int32_t nprobe = 0, int32_t refineCandidates = 0, bool exact = false)
     : field(field), fieldType(fieldType), queryVec(queryVec), k(k),
-      nprobe(nprobe), refineFactor(refineFactor), exact(exact) {}
+      nprobe(nprobe), refineCandidates(refineCandidates), exact(exact) {}
 
   std::string_view getField() const noexcept { return field; }
   const VectorFieldType& getFieldType() const noexcept { return fieldType; }
   std::span<const float> getQueryVec() const noexcept { return queryVec; }
   int32_t getK() const noexcept { return k; }
   int32_t getNProbe() const noexcept { return nprobe; }
-  int32_t getRefineFactor() const noexcept { return refineFactor; }
+  int32_t getRefineCandidates() const noexcept { return refineCandidates; }
   bool getExact() const noexcept { return exact; }
 
   Query::Weight* createWeight(Query::Context& context) override {
@@ -374,12 +390,23 @@ public:
       int64_t avgMult = (faissIdx != nullptr && anyMultiValued && totalDocsWithValue > 0)
         ? ceilDivClamped(ntotal, totalDocsWithValue, cap)
         : 1;
-      int64_t refineFactor = approximateEngine
-        ? std::max<int64_t>(1, query.getRefineFactor() > 0
-                              ? query.getRefineFactor()
-                              : defaultAnnRefineFactor)
-        : 1;
-      int64_t kReq = mulClamped(mulClamped(kDocs, avgMult, cap), refineFactor, cap);
+      int64_t baseReq = kDocs;
+      if (approximateEngine) {
+        // Explicit refine_candidates pins the candidate pool size (an
+        // absolute count, clamped up to k); the absent-knob default is
+        // affine with a k-decaying ratio (see defaultAnnRefineCount above).
+        if (query.getRefineCandidates() > 0) {
+          baseReq = std::min(cap, std::max(kDocs, (int64_t)query.getRefineCandidates()));
+        } else {
+          double ratio = defaultAnnRefineRatio > 0
+            ? (double)defaultAnnRefineRatio
+            : std::max(REFINE_MIN_RATIO, std::log2(REFINE_UNITY_K / (double)kDocs));
+          baseReq = std::min(cap, (int64_t)defaultAnnRefineCount
+                                    + (int64_t)((double)kDocs * ratio));
+        }
+        baseReq = std::max(baseReq, kDocs);
+      }
+      int64_t kReq = mulClamped(baseReq, avgMult, cap);
       if (kReq <= 0) return std::make_unique<KnnPreparedWeight>(std::move(perSegHits));
 
       BranchlessIndex<int64_t> segIndex(prefix.size());
@@ -686,32 +713,70 @@ public:
               dims, vr.dims()));
           }
 
-          int64_t rank = 0;
-          while (rank < numVals) {
-            int32_t docId = v2dPerSeg[ord].resolve(rank);
-            int64_t end = rank + 1;
-            while (end < numVals && v2dPerSeg[ord].resolve(end) == docId) end++;
+          // Inline run-collapse: value ranks are doc-ordered (the valDoc map
+          // is monotonic; sparse select and dense identity likewise), so a
+          // doc's vectors form a contiguous run and max-sim collapse falls
+          // out of one pass.  liveDocs/domain are applied as a PER-RUN
+          // PREDICATE (one docEligible check per doc, ineligible docs skip
+          // all distance math) - but the scan still walks every value run
+          // regardless of filter selectivity.  A selective-filter fast path
+          // would invert this: iterate the domain and look up each doc's
+          // run (identity / bitset rank / binary search on the monotone
+          // valDoc column) - the exact arm of cost-based filter routing.
+          if (v2dPerSeg[ord].mono != nullptr) {
+            // Multi-valued: stream the valDoc map with BulkValues (SIMD
+            // 128-value sub-block decode) instead of per-value valueAt -
+            // a full walk is exactly the sequential access it amortizes.
+            MonoReader::BulkValues valDoc(*v2dPerSeg[ord].mono);
+            int64_t idx = valDoc.next();
+            int64_t rank = 0;
+            while (rank < numVals) {
+              int32_t docId = (int32_t)valDoc.value();
+              int64_t end = rank;
+              do {
+                end++;
+                idx = valDoc.next();
+              } while (end < numVals && (int32_t)valDoc.value() == docId);
+              unused(idx);
 
-            if (docEligible((int32_t)ord, docId)) {
-              eligibleDocs++;
-              VectorEngineHit best{
-                .score = 0.0f,
-                .segOrd = (int32_t)ord,
-                .valueRank = rank,
-              };
-              bool haveScore = false;
-              for (int64_t r = rank; r < end; r++) {
-                float score = exactScore(request.query, vr.vectorAtRank(r), dims, metric,
-                                         normalizeColumnOnCosineRescore, 0.0f);
-                if (!haveScore || score > best.score) {
-                  best.score = score;
-                  best.valueRank = r;
-                  haveScore = true;
+              if (docEligible((int32_t)ord, docId)) {
+                eligibleDocs++;
+                VectorEngineHit best{
+                  .score = 0.0f,
+                  .segOrd = (int32_t)ord,
+                  .valueRank = rank,
+                };
+                bool haveScore = false;
+                for (int64_t r = rank; r < end; r++) {
+                  float score = exactScore(request.query, vr.vectorAtRank(r), dims, metric,
+                                           normalizeColumnOnCosineRescore, 0.0f);
+                  if (!haveScore || score > best.score) {
+                    best.score = score;
+                    best.valueRank = r;
+                    haveScore = true;
+                  }
                 }
+                offer(heap, best, request.candidates);
               }
-              offer(heap, best, request.candidates);
+              rank = end;
             }
-            rank = end;
+          } else {
+            // Single-valued (dense identity or sparse select): runs are
+            // length 1 by construction, so no boundary detection - one
+            // resolve, one eligibility check, one score per value.
+            for (int64_t rank = 0; rank < numVals; rank++) {
+              int32_t docId = v2dPerSeg[ord].resolve(rank);
+              if (!docEligible((int32_t)ord, docId)) continue;
+              eligibleDocs++;
+              offer(heap,
+                    VectorEngineHit{
+                      .score = exactScore(request.query, vr.vectorAtRank(rank), dims, metric,
+                                          normalizeColumnOnCosineRescore, 0.0f),
+                      .segOrd = (int32_t)ord,
+                      .valueRank = rank,
+                    },
+                    request.candidates);
+            }
           }
         }
 

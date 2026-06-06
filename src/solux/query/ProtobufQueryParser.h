@@ -129,7 +129,7 @@ public:
     }
 
     return pool.make<solux::KnnQuery>(
-      field, vectorType, queryVec, k, knnQuery.nprobe(), knnQuery.refine_factor(),
+      field, vectorType, queryVec, k, knnQuery.nprobe(), knnQuery.refine_candidates(),
       knnQuery.exact());
   }
 
