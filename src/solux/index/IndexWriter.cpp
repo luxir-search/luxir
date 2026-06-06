@@ -924,8 +924,8 @@ void IndexWriter::buildSegmentOverlays(const UpdateMessage& msg,
       }
       if (exists) continue;
 
-      std::string fileName = Postings::getAuxIndexFileName(
-        TestOverlayAuxReader::NAME, msg.commitInfo->indexGen, (uint32_t)i);
+      std::string fileName = Postings::getSegmentOverlayFileName(
+        seg->segId, TestOverlayAuxReader::NAME, msg.commitInfo->indexGen, 0);
       {
         auto file = dir.createFile(fileName);
         OutputStream os;
@@ -957,7 +957,7 @@ void IndexWriter::buildSegmentOverlays(const UpdateMessage& msg,
     }
   }
 
-  if (vectorSelectors.empty()) {
+  if (vectorSelectors.empty() && msg.inferVectorSelectors) {
     for (const auto& overlay : currentSegmentOverlays_) {
       if (overlay.kind() != VectorIndexBuilder::KIND) continue;
       if (seenVectorSelectors.emplace(overlay.name()).second) {
@@ -994,8 +994,7 @@ void IndexWriter::buildSegmentOverlays(const UpdateMessage& msg,
     prHolders.push_back(pr);
 
     VectorIndexBuilder vb(dir, std::span<const VectorIndexBuilder::SegInput>(&input, 1),
-                          *schema, msg.commitInfo->indexGen, msg.commitInfo->coreGen,
-                          (uint32_t)i);
+                          *schema, msg.commitInfo->indexGen, msg.commitInfo->coreGen);
     auto newlyBuilt = vb.build(vectorSelectors, skipNames, outFilesToSync);
     for (auto& info : newlyBuilt) {
       seg->auxOverlays.push_back(std::move(info));
@@ -1408,6 +1407,7 @@ void IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
 
     CommitMessage* commitMessage = new CommitMessage();
     commitMessage->commit = UpdateMessage::COMMIT;
+    commitMessage->inferVectorSelectors = true;  // merged segment gets its overlay
     commitMessage->origMessage = &msg;
     INDEX_DEBUG("mergeSegmentsBody: requesting commit. msg={}", (void*)commitMessage);
     this->submitUpdate(commitMessage);

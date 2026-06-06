@@ -362,6 +362,40 @@ TEST_F(VectorIndexBuilderTest, segmentChangeCarriesExistingOverlay) {
   }
 }
 
+// Plain user commits do NOT infer vector selectors from existing overlays:
+// they build only what they ask for.  (Merge-triggered synthetic commits DO
+// infer, so a merged segment gets its index - covered by the merge lifecycle
+// test.)  Full auto-maintenance is the future background builder's job.
+TEST_F(VectorIndexBuilderTest, plainCommitDoesNotAutoBuild) {
+  IvfPqGuard guard(/*nlist=*/2, /*m=*/1, /*bits=*/1, /*nprobe=*/2, /*minTraining=*/2);
+  CollectionHelper h("main");
+  h.clear();
+  enableL2OnVecSuffix(h.collection());
+
+  for (int i = 0; i < 80; i++) {
+    h.index(flatdoc("id", "a" + std::to_string(i),
+                    "embedding_v", std::vector<float>{(float)i, 0.0f, 1.0f, 0.0f}));
+  }
+  h.commit({"*"});  // field is now "active" - one overlay exists
+
+  for (int i = 0; i < 80; i++) {
+    h.index(flatdoc("id", "b" + std::to_string(i),
+                    "embedding_v", std::vector<float>{100.0f + (float)i, 1.0f, 0.0f, 0.0f}));
+  }
+  VectorIndexBuilder::ivfPqBuildCountForTests = 0;
+  h.commit();  // plain: no selectors, no inference
+  EXPECT_EQ(VectorIndexBuilder::ivfPqBuildCountForTests, 0);
+
+  google::protobuf::Arena arena;
+  auto* info = readIndexInfo(h.getIndexWriter()->dir, arena);
+  EXPECT_EQ(vectorOverlays(info).size(), 1u) << "only the first segment's overlay exists";
+
+  // The explicit selector then builds the missing one.
+  VectorIndexBuilder::ivfPqBuildCountForTests = 0;
+  h.commit({"*"});
+  EXPECT_EQ(VectorIndexBuilder::ivfPqBuildCountForTests, 1);
+}
+
 TEST_F(VectorIndexBuilderTest, carryForwardBuildsOnlyNewAboveThresholdSegment) {
   IvfPqGuard guard(/*nlist=*/2, /*m=*/1, /*bits=*/1, /*nprobe=*/2, /*minTraining=*/2);
   CollectionHelper h("main");
@@ -381,13 +415,18 @@ TEST_F(VectorIndexBuilderTest, carryForwardBuildsOnlyNewAboveThresholdSegment) {
   auto overlays1 = vectorOverlays(info1);
   ASSERT_EQ(overlays1.size(), 1u);
   std::string firstFile{overlays1[0]->files(0)};
+  // Overlay filename convention: segment-prefixed like liveDocs -
+  // s<segId>__<name>_<gen>_<fnum> - so ls groups overlays with their segment.
+  EXPECT_TRUE(firstFile.starts_with(
+      Postings::getIndexFileNamePrefix(info1->segments(0).seg_id()) + "__vec.embedding_v_"))
+      << "unexpected overlay filename: " << firstFile;
 
   for (int i = 0; i < 80; i++) {
     h.index(flatdoc("id", "b" + std::to_string(i),
                     "embedding_v", std::vector<float>{100.0f + (float)i, 1.0f, 0.0f, 0.0f}));
   }
   VectorIndexBuilder::ivfPqBuildCountForTests = 0;
-  h.commit();
+  h.commit({"*"});
   EXPECT_EQ(VectorIndexBuilder::ivfPqBuildCountForTests, 1);
 
   google::protobuf::Arena arena2;

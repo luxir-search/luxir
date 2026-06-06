@@ -223,7 +223,6 @@ IndexReader::IndexReader(Directory& dir, IndexReader* previousReader) {
             IREADER_DEBUG("Reusing segment overlay '{}' for seg={} (gen={}) from previous IndexReader",
                           info.name(), segId, info.gen());
             segmentAuxReaders.push_back(prevIt->second);
-            auxReadersList.push_back(prevIt->second);
             continue;
           }
 
@@ -236,8 +235,7 @@ IndexReader::IndexReader(Directory& dir, IndexReader* previousReader) {
             break;
           }
           if (aux) {
-            segmentAuxReaders.push_back(aux);
-            auxReadersList.push_back(std::move(aux));
+            segmentAuxReaders.push_back(std::move(aux));
           }
         }
         if (retry) break;

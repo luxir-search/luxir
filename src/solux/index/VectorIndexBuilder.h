@@ -69,14 +69,14 @@ public:
   };
 
   /// indexGen is the gen the new commit will be published under (for filenames).
-  /// fileOrdinal makes filenames unique when several segment overlays for the
-  /// same field are built in one commit.  coreGen is accepted for the old
-  /// call-site shape but is intentionally not recorded on vector overlays.
+  /// Overlay filenames are segment-prefixed (getSegmentOverlayFileName), so
+  /// they are unique per (segment, name, gen) with no extra ordinal.  coreGen
+  /// is accepted for the old call-site shape but is intentionally not
+  /// recorded on vector overlays.
   VectorIndexBuilder(Directory& dir, std::span<const SegInput> segments,
-                     const Schema& schema, uint64_t indexGen, uint64_t coreGen,
-                     uint32_t fileOrdinal)
+                     const Schema& schema, uint64_t indexGen, uint64_t coreGen)
     : dir_(dir), segments_(segments), schema_(schema),
-      indexGen_(indexGen), coreGen_(coreGen), fileOrdinal_(fileOrdinal) {}
+      indexGen_(indexGen), coreGen_(coreGen) {}
 
   /// Build aux indexes for vector fields matching `selectors`.
   ///   selectors == ["*"]      - every eligible field
@@ -97,7 +97,6 @@ private:
   const Schema& schema_;
   uint64_t indexGen_;
   uint64_t coreGen_;
-  uint32_t fileOrdinal_;
 
   // Returns true if any selector matches name.
   static bool selectorMatches(const std::vector<std::string>& selectors, std::string_view name);

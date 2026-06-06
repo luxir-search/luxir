@@ -85,6 +85,31 @@ public:
     return s;
   }
 
+  /// Filename for a segment-local overlay file (see SegmentInfo.overlays).
+  /// Format: "s<segId>__<name>_<gen>_<fnum>" - the segment prefix groups a
+  /// segment's overlays with its data files and liveDocs in ls, and lets the
+  /// existing dead-segment deletePrefix sweep reclaim them automatically.
+  /// <name> conventionally contains a dot ("vec.title_v"), so it cannot
+  /// collide with the liveDocs "__L" marker.  Parsing, if ever needed, is
+  /// END-anchored (the last two underscore-separated fields are gen and
+  /// fnum) because field names may themselves contain underscores and
+  /// digits.  Filenames are opaque to the file layer; the IndexInfo manifest
+  /// binds file <-> entry.  gen is the indexGen at build time: a rebuild
+  /// (rebuild-without-reindex) writes a new gen while old readers still hold
+  /// the previous file.
+  static std::string getSegmentOverlayFileName(uint64_t segId, std::string_view name,
+                                               uint64_t gen, uint32_t fnum) {
+    std::string s(PREFIX_FNAME);
+    s.append(getSortableString(segId));
+    s += "__";
+    s.append(name);
+    s += '_';
+    s.append(getSortableString(gen));
+    s += '_';
+    s.append(getSortableString(fnum));
+    return s;
+  }
+
   /// A file that contains deletes for the segment.  deleteGen==0 implies no deletes.
   static std::string getLiveDocsFileName(const std::string_view gen, uint64_t liveGen) {
     std::string s = std::string(PREFIX_FNAME).append(gen);

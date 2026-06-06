@@ -392,7 +392,12 @@ VectorIndexBuilder::buildIvfPqField(std::string_view fieldName,
 
   std::string auxName(NAME_PREFIX);
   auxName.append(fieldName);
-  std::string faissFile = Postings::getAuxIndexFileName(auxName, indexGen_, fileOrdinal_);
+  // Per-segment overlay naming: production builds always run with exactly one
+  // segment (the milestone-1 minimum slice).  A future group-spanning index
+  // (n:m segment:index) would use index-level aux naming instead.
+  assert(segments_.size() == 1);
+  std::string faissFile = Postings::getSegmentOverlayFileName(
+      segments_.front().segId, auxName, indexGen_, 0);
 
   {
     auto file = dir_.createFile(faissFile);

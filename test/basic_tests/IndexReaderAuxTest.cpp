@@ -111,6 +111,16 @@ std::vector<const proto::AuxIndexInfo*> vectorOverlays(const proto::IndexInfo& i
   return out;
 }
 
+// Registry split: per-segment overlays are looked up via Segment::getAuxReader,
+// never via the index-level registry.  Returns the first segment's reader
+// holding the named overlay (nullptr if none).
+std::shared_ptr<AuxReader> firstSegmentAux(IndexReader& reader, std::string_view name) {
+  for (auto& seg : reader.segments()) {
+    if (auto aux = seg.getAuxReader(name)) return aux;
+  }
+  return nullptr;
+}
+
 const proto::AuxIndexInfo& onlyVectorOverlay(const proto::IndexInfo& info) {
   auto overlays = vectorOverlays(info);
   EXPECT_EQ(overlays.size(), 1u);
@@ -141,8 +151,11 @@ TEST_F(IndexReaderAuxTest, opensVectorAuxAfterBuild) {
   auto& dir = h.getIndexWriter()->dir;
   auto reader = std::make_shared<IndexReader>(dir);
 
-  ASSERT_EQ(reader->auxReaders().size(), 1u);
-  auto aux = reader->getAuxReader("vec.embedding_v");
+  // Registry split guard: segment overlays are NOT in the index-level
+  // registry (their names repeat per segment); index-level lookup says null.
+  EXPECT_EQ(reader->auxReaders().size(), 0u);
+  EXPECT_EQ(reader->getAuxReader("vec.embedding_v"), nullptr);
+  auto aux = firstSegmentAux(*reader, "vec.embedding_v");
   ASSERT_NE(aux, nullptr);
   EXPECT_EQ(aux->getKind(), VectorAuxReader::KIND);
 
@@ -173,7 +186,7 @@ TEST_F(IndexReaderAuxTest, cosineRawColumnSetsRescorePolicy) {
   h.commit({"*"});
 
   auto reader = std::make_shared<IndexReader>(h.getIndexWriter()->dir);
-  auto aux = reader->getAuxReader("vec.embedding_v");
+  auto aux = firstSegmentAux(*reader, "vec.embedding_v");
   ASSERT_NE(aux, nullptr);
   auto* vaux = dynamic_cast<VectorAuxReader*>(aux.get());
   ASSERT_NE(vaux, nullptr);
@@ -214,7 +227,7 @@ TEST_F(IndexReaderAuxTest, opensCleanlyAfterTinyCommitCarryForward) {
   // Sanity: aux file is referenced and present after the first commit.
   {
     auto reader = std::make_shared<IndexReader>(dir);
-    ASSERT_EQ(reader->auxReaders().size(), 1u);
+    ASSERT_NE(firstSegmentAux(*reader, "vec.embedding_v"), nullptr);
   }
 
   // Simulate the race: the IndexInfo we're about to parse references file F1,
@@ -225,7 +238,7 @@ TEST_F(IndexReaderAuxTest, opensCleanlyAfterTinyCommitCarryForward) {
   std::string oldFile;
   {
     auto reader1 = std::make_shared<IndexReader>(dir);
-    auto aux = reader1->getAuxReader("vec.embedding_v");
+    auto aux = firstSegmentAux(*reader1, "vec.embedding_v");
     ASSERT_NE(aux, nullptr);
     // Find the file referenced by this aux entry via the on-disk IndexInfo.
     auto infoFile = dir.openFile(Postings::INDEX_INFO_FILE);
@@ -246,8 +259,8 @@ TEST_F(IndexReaderAuxTest, opensCleanlyAfterTinyCommitCarryForward) {
   EXPECT_NE(dir.openFile(oldFile), nullptr) << "carried aux file should survive";
 
   auto reader2 = std::make_shared<IndexReader>(dir);
-  ASSERT_EQ(reader2->auxReaders().size(), 1u);
-  auto aux2 = reader2->getAuxReader("vec.embedding_v");
+  EXPECT_EQ(reader2->auxReaders().size(), 0u);  // index-level registry stays empty
+  auto aux2 = firstSegmentAux(*reader2, "vec.embedding_v");
   ASSERT_NE(aux2, nullptr);
   auto* vaux2 = dynamic_cast<VectorAuxReader*>(aux2.get());
   ASSERT_NE(vaux2, nullptr);
@@ -323,8 +336,7 @@ TEST_F(IndexReaderAuxTest, reusesAuxReaderOnCarryForward) {
 
   auto& dir = h.getIndexWriter()->dir;
   auto reader1 = std::make_shared<IndexReader>(dir);
-  ASSERT_EQ(reader1->auxReaders().size(), 1u);
-  auto aux1 = reader1->getAuxReader("vec.embedding_v");
+  auto aux1 = firstSegmentAux(*reader1, "vec.embedding_v");
   ASSERT_NE(aux1, nullptr);
 
   // Delete-only commit: the segment survives, so its overlay is carried by
@@ -333,8 +345,7 @@ TEST_F(IndexReaderAuxTest, reusesAuxReaderOnCarryForward) {
   h.deleteByIds(ids, UpdateMessage::COMMIT);
 
   auto reader2 = std::make_shared<IndexReader>(dir, reader1.get());
-  ASSERT_EQ(reader2->auxReaders().size(), 1u);
-  auto aux2 = reader2->getAuxReader("vec.embedding_v");
+  auto aux2 = firstSegmentAux(*reader2, "vec.embedding_v");
   ASSERT_NE(aux2, nullptr);
 
   // Same shared_ptr target - reused, not re-deserialized.

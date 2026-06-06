@@ -153,8 +153,10 @@ public:
     return auxReadersList;
   }
 
-  // Returns the aux reader with the given name, or nullptr if not present.
-  // Names are unique across an index (e.g. "vec.title_v").
+  // Returns the INDEX-LEVEL aux reader with the given name, or nullptr.
+  // Names are unique across an index for index-level entries.  Segment
+  // overlays (per-segment vector indexes etc.) are NOT in this registry -
+  // their names repeat across segments; use Segment::getAuxReader().
   // TODO: replace this O(n) scan with a name -> AuxReader hash map populated
   // at IndexReader construction.  Fine for v1 (<= a handful of aux entries
   // per shard); revisit if we add many cheap aux kinds (autocomplete,
