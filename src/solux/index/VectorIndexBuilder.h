@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <memory>
 #include <optional>
@@ -58,9 +59,19 @@ public:
   static int32_t ivfPqDefaultNProbe;
   static int64_t ivfPqMinTrainingVectors;
   static int64_t ivfPqBuildThresholdScanCost;
-  static int64_t ivfPqBuildCountForTests;
+  static std::atomic<int64_t> ivfPqBuildCountForTests;
+  static std::atomic<int64_t> ivfPqMergeBuildCountForTests;
   static size_t ivfPqTrainingSampleBytes;
   static size_t ivfPqAddChunkBytes;
+  // Test-only failure injection: builds for this field name throw.  Plain
+  // unsynchronized string - mutate ONLY while no merges or commits are in
+  // flight (current tests quiesce via blocking mergeSegments()/commit()).
+  static std::string failBuildForFieldNameForTests;
+
+  enum class BuildSite {
+    COMMIT,
+    MERGE
+  };
 
   /// One segment's worth of input.
   struct SegInput {
@@ -68,15 +79,19 @@ public:
     PostingsReader* postingsReader;
   };
 
-  /// indexGen is the gen the new commit will be published under (for filenames).
-  /// Overlay filenames are segment-prefixed (getSegmentOverlayFileName), so
-  /// they are unique per (segment, name, gen) with no extra ordinal.  coreGen
-  /// is accepted for the old call-site shape but is intentionally not
-  /// recorded on vector overlays.
+  /// overlayGen is the per-(segment, field) rebuild ordinal used in filenames
+  /// and AuxIndexInfo.gen.  Overlay filenames are segment-prefixed
+  /// (getSegmentOverlayFileName), so gen only has to distinguish rebuilds for
+  /// the same live segment and field.
   VectorIndexBuilder(Directory& dir, std::span<const SegInput> segments,
-                     const Schema& schema, uint64_t indexGen, uint64_t coreGen)
+                     const Schema& schema, uint64_t overlayGen)
     : dir_(dir), segments_(segments), schema_(schema),
-      indexGen_(indexGen), coreGen_(coreGen) {}
+      overlayGen_(overlayGen) {}
+
+  /// Expand selectors to concrete eligible overlay names present in this
+  /// builder's segment inputs.  This applies schema and field eligibility but
+  /// not the training floor or build threshold.
+  std::vector<std::string> matchingOverlayNames(const std::vector<std::string>& selectors);
 
   /// Build aux indexes for vector fields matching `selectors`.
   ///   selectors == ["*"]      - every eligible field
@@ -89,14 +104,14 @@ public:
   std::vector<proto::AuxIndexInfo> build(
       const std::vector<std::string>& selectors,
       const boost::unordered_flat_set<std::string>& skipNames,
-      std::vector<std::string>& outFilesToSync);
+      std::vector<std::string>& outFilesToSync,
+      BuildSite buildSite);
 
 private:
   Directory& dir_;
   std::span<const SegInput> segments_;
   const Schema& schema_;
-  uint64_t indexGen_;
-  uint64_t coreGen_;
+  uint64_t overlayGen_;
 
   // Returns true if any selector matches name.
   static bool selectorMatches(const std::vector<std::string>& selectors, std::string_view name);
@@ -110,11 +125,13 @@ private:
   // no segment has any vectors for the field (no files written, nothing to record).
   std::optional<proto::AuxIndexInfo> buildField(std::string_view fieldName,
                                                 const VectorFieldType& ft,
-                                                std::vector<std::string>& outFilesToSync);
+                                                std::vector<std::string>& outFilesToSync,
+                                                BuildSite buildSite);
 
   std::optional<proto::AuxIndexInfo> buildIvfPqField(std::string_view fieldName,
                                                      const VectorFieldType& ft,
-                                                     std::vector<std::string>& outFilesToSync);
+                                                     std::vector<std::string>& outFilesToSync,
+                                                     BuildSite buildSite);
 };
 
 } // namespace solux

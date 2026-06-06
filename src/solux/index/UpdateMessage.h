@@ -76,16 +76,6 @@ public:
   // can only waste a bounded build on a dying segment.
   bool waitForMerges = false;
 
-  // Internal: set only on merge-triggered synthetic commits.  When set and
-  // buildAuxIndexes carries no vector selectors, vector overlay maintenance
-  // derives selectors from existing overlays so a freshly merged segment
-  // gets its index without the merge commit naming fields.  Plain user
-  // commits never infer - they build only what they ask for (full
-  // auto-maintenance is the future background builder's job; see
-  // solux-private wait-for-merges notes).
-  bool inferVectorSelectors = false;
-
-
   /// Filled in by the IndexWriter when the message is received.  Do not change.
   uint64_t updateVersion;             // The version of this update, used to ensure updates are processed in order when needed
   uint64_t commitNum;                 // The 0-based commit number of this update, used to ensure commits are finished in order

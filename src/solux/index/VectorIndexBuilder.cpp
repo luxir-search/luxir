@@ -205,9 +205,11 @@ int32_t VectorIndexBuilder::ivfPqDefaultNProbe = 0;
 int64_t VectorIndexBuilder::ivfPqMinTrainingVectors =
     MIN_TRAINING_POINTS_PER_PQ_CENTROID * 256;
 int64_t VectorIndexBuilder::ivfPqBuildThresholdScanCost = 1'000'000;
-int64_t VectorIndexBuilder::ivfPqBuildCountForTests = 0;
+std::atomic<int64_t> VectorIndexBuilder::ivfPqBuildCountForTests{0};
+std::atomic<int64_t> VectorIndexBuilder::ivfPqMergeBuildCountForTests{0};
 size_t VectorIndexBuilder::ivfPqTrainingSampleBytes = 64 * 1024 * 1024;
 size_t VectorIndexBuilder::ivfPqAddChunkBytes = 16 * 1024 * 1024;
+std::string VectorIndexBuilder::failBuildForFieldNameForTests;
 
 bool VectorIndexBuilder::selectorMatches(const std::vector<std::string>& selectors,
                                          std::string_view name) {
@@ -254,7 +256,8 @@ VectorIndexBuilder::collectEligibleFields() {
 std::vector<proto::AuxIndexInfo>
 VectorIndexBuilder::build(const std::vector<std::string>& selectors,
                           const boost::unordered_flat_set<std::string>& skipNames,
-                          std::vector<std::string>& outFilesToSync) {
+                          std::vector<std::string>& outFilesToSync,
+                          BuildSite buildSite) {
   std::vector<proto::AuxIndexInfo> result;
   if (selectors.empty()) return result;
   if (!buildFaissIvfPqAuxIndexes) {
@@ -275,7 +278,7 @@ VectorIndexBuilder::build(const std::vector<std::string>& selectors,
 
     LOG_TRACE("VectorIndexBuilder: building {} (metric={}, dims_pinned={})",
              auxName, (int)vft->metric_, vft->dims_);
-    auto info = buildField(fieldName, *vft, outFilesToSync);
+    auto info = buildField(fieldName, *vft, outFilesToSync, buildSite);
     if (info) {
       result.emplace_back(std::move(*info));
     }
@@ -283,17 +286,42 @@ VectorIndexBuilder::build(const std::vector<std::string>& selectors,
   return result;
 }
 
+std::vector<std::string>
+VectorIndexBuilder::matchingOverlayNames(const std::vector<std::string>& selectors) {
+  std::vector<std::string> out;
+  if (selectors.empty()) return out;
+
+  auto eligible = collectEligibleFields();
+  out.reserve(eligible.size());
+  for (const auto& [fieldName, vft] : eligible) {
+    unused(vft);
+    std::string auxName(NAME_PREFIX);
+    auxName.append(fieldName);
+    if (selectorMatches(selectors, auxName)) {
+      out.push_back(std::move(auxName));
+    }
+  }
+  return out;
+}
+
 std::optional<proto::AuxIndexInfo>
 VectorIndexBuilder::buildField(std::string_view fieldName,
                                const VectorFieldType& ft,
-                               std::vector<std::string>& outFilesToSync) {
-  return buildIvfPqField(fieldName, ft, outFilesToSync);
+                               std::vector<std::string>& outFilesToSync,
+                               BuildSite buildSite) {
+  if (!failBuildForFieldNameForTests.empty()
+      && fieldName == std::string_view(failBuildForFieldNameForTests)) {
+    throw std::runtime_error(fmt::format(
+        "VectorIndexBuilder: test requested failure for field {}", fieldName));
+  }
+  return buildIvfPqField(fieldName, ft, outFilesToSync, buildSite);
 }
 
 std::optional<proto::AuxIndexInfo>
 VectorIndexBuilder::buildIvfPqField(std::string_view fieldName,
                                     const VectorFieldType& ft,
-                                    std::vector<std::string>& outFilesToSync) {
+                                    std::vector<std::string>& outFilesToSync,
+                                    BuildSite buildSite) {
   int32_t dims = ft.dims_;
   faiss::MetricType metric = toFaissMetric(ft.metric_);
   int64_t ntotal = 0;
@@ -369,7 +397,11 @@ VectorIndexBuilder::buildIvfPqField(std::string_view fieldName,
   LOG_TRACE("VectorIndexBuilder: training IVF+PQ {} ntotal={} ntrain={} dims={} "
             "nlist={} M={} bits={} nprobe={}",
             fieldName, ntotal, ntrain, dims, nlist, pqM, pqBits, nprobe);
-  ivfPqBuildCountForTests++;
+  if (buildSite == BuildSite::MERGE) {
+    ivfPqMergeBuildCountForTests.fetch_add(1, std::memory_order_relaxed);
+  } else {
+    ivfPqBuildCountForTests.fetch_add(1, std::memory_order_relaxed);
+  }
   index->train(ntrain, training.data());
   training.clear();
   training.shrink_to_fit();
@@ -397,7 +429,8 @@ VectorIndexBuilder::buildIvfPqField(std::string_view fieldName,
   // (n:m segment:index) would use index-level aux naming instead.
   assert(segments_.size() == 1);
   std::string faissFile = Postings::getSegmentOverlayFileName(
-      segments_.front().segId, auxName, indexGen_, 0);
+      segments_.front().segId, auxName, overlayGen_, 0);
+  outFilesToSync.push_back(faissFile);
 
   {
     auto file = dir_.createFile(faissFile);
@@ -409,13 +442,11 @@ VectorIndexBuilder::buildIvfPqField(std::string_view fieldName,
     dir_.finishFile(*file);
   }
 
-  outFilesToSync.push_back(faissFile);
-
   proto::AuxIndexInfo info;
   info.set_kind(std::string(KIND));
   info.set_field(std::string(fieldName));
   info.set_name(std::move(auxName));
-  info.set_gen(indexGen_);
+  info.set_gen(overlayGen_);
   info.add_files(faissFile);
   info.set_opaque_meta(makeVectorMeta(
       dims, ft, VectorAuxMeta::ENGINE_IVFPQ, nlist, nprobe, pqM, pqBits));

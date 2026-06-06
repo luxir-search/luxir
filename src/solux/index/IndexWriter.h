@@ -4,6 +4,7 @@
 #include <mutex>
 #include <span>
 #include <boost/unordered/unordered_flat_map.hpp>
+#include <boost/unordered/unordered_flat_set.hpp>
 #include <oneapi/tbb/flow_graph.h>
 #include "protos/solux_types.pb.h"
 #include "solux/store/Directory.h"
@@ -11,6 +12,7 @@
 #include "solux/server/SoluxError.h"
 #include "Inverter.h"
 #include "UpdateMessage.h"
+#include "VectorIndexBuilder.h"
 
 
 namespace solux {
@@ -297,10 +299,24 @@ public:
   // (files referenced by the previous list but not the new one are deleted).
   std::vector<proto::AuxIndexInfo> currentAuxIndexes_;
 
-  // Flat copy of all segment overlays referenced by the last published
-  // IndexInfo.  Used only for orphan-file cleanup after publishing a new
-  // IndexInfo; the authoritative per-segment copy lives on SegInfo.
-  std::vector<proto::AuxIndexInfo> currentSegmentOverlays_;
+  // One entry per segment overlay referenced by the last published IndexInfo,
+  // keyed by owning segment (the manifest nests overlays under SegmentInfo;
+  // this preserves that association in memory).  Consumers: orphan-file
+  // cleanup after publishing a new IndexInfo, gen-ordinal continuity for
+  // drop-then-rebuild (nextVectorOverlayGen), and activation seeding at
+  // startup.  The authoritative per-segment copy lives on SegInfo.
+  struct PublishedOverlay {
+    uint64_t segId;
+    proto::AuxIndexInfo info;
+  };
+  std::vector<PublishedOverlay> currentSegmentOverlays_;
+
+  // Concrete vector overlay names ("vec.<field>") that have been explicitly
+  // activated in this writer lifetime or were seeded from durable manifest
+  // overlays at startup.  Intent-only activation is process-local; startup
+  // seeds only from overlays that actually exist in s.olux.  Protected by
+  // indexMutex.
+  boost::unordered_flat_set<std::string> activeVectorOverlayNames;
 
   // commit info for the index, used to track deletes.
   // This is moved to the UpdateMessage when a commit is processed and a new one is created for the next commit.
@@ -462,9 +478,25 @@ private:
   void buildSegmentOverlays(const UpdateMessage& msg,
                             std::span<SegInfo*> segsToKeep,
                             std::vector<std::string>& outFilesToSync);
-  std::vector<proto::AuxIndexInfo> flattenSegmentOverlays(std::span<SegInfo*> segs) const;
+  std::shared_ptr<PostingsReader> getSegmentPostingsReader(SegInfo& seg);
+  void seedActiveVectorOverlayNamesFromManifestLocked();
+  void activateVectorOverlayNames(std::span<const std::string> names);
+  std::vector<std::string> snapshotActiveVectorOverlayNames();
+  uint64_t nextVectorOverlayGen(const SegInfo& seg, std::string_view name) const;
+  std::vector<proto::AuxIndexInfo> buildConcreteVectorOverlays(
+      SegInfo& seg,
+      PostingsReader& postingsReader,
+      std::span<const std::string> overlayNames,
+      const Schema& schema,
+      VectorIndexBuilder::BuildSite buildSite,
+      std::vector<std::string>& outFiles);
+  void deleteStagedOverlayFiles(std::span<const std::string> files,
+                                std::string_view context) noexcept;
+  std::vector<PublishedOverlay> flattenSegmentOverlays(std::span<SegInfo*> segs) const;
   // Delete files referenced by `oldList` that aren't referenced by `newList`.
   // Call only after the new IndexInfo file is durable.
+  void deleteOrphanedAuxFiles(const std::vector<PublishedOverlay>& oldList,
+                              const std::vector<PublishedOverlay>& newList);
   void deleteOrphanedAuxFiles(const std::vector<proto::AuxIndexInfo>& oldList,
                               const std::vector<proto::AuxIndexInfo>& newList);
   void tryDeleteSegments();
@@ -486,6 +518,11 @@ public:
   // Test hook for the rebuild-without-reindex path: remove an overlay entry
   // from one live segment, leaving the segment data untouched.
   bool testDropSegmentOverlay(std::string_view name, size_t segmentOrd);
+
+  // Test hook for process-local vector activation state.
+  bool testActiveVectorOverlayName(std::string_view name);
+  void testReseedActiveVectorOverlayNamesFromManifest();
+  bool testMergeRunning();
 
   // dump some useful info for tests
   void debugInfo();

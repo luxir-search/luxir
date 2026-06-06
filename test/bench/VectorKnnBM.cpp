@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <atomic>
 #include <charconv>
 #include <chrono>
 #include <cstdint>
@@ -620,10 +621,11 @@ void BM_VectorIvfPqIncrementalBuild(benchmark::State& state) {
       docs.clear();
     }
 
-    VectorIndexBuilder::ivfPqBuildCountForTests = 0;
+    VectorIndexBuilder::ivfPqBuildCountForTests.store(0, std::memory_order_relaxed);
+    VectorIndexBuilder::ivfPqMergeBuildCountForTests.store(0, std::memory_order_relaxed);
     BenchTimer timer(state);
     helper.commit({"vec.bench_v"});
-    annBuilds += VectorIndexBuilder::ivfPqBuildCountForTests;
+    annBuilds += VectorIndexBuilder::ivfPqBuildCountForTests.load(std::memory_order_relaxed);
   }
 
   state.counters["flushDocs"] = (double)flushDocs;

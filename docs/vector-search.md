@@ -13,12 +13,19 @@ whose vector kind is `vector_faiss` and whose opaque metadata is
 `VectorAuxMeta`.
 
 A vector aux build is introduced during commit when `build_aux_indexes`
-selects a vector field or `"*"`. After a segment has a vector overlay, that
-overlay follows the segment by liveness: later commits carry it forward without
-checking the shard core generation. New above-threshold segments that lack an
-overlay for an already-built vector field get their own overlay during the
-commit pipeline. Delete-only commits keep existing overlays; deleted-document
-vectors remain in FAISS and are filtered at query time.
+selects a vector field or `"*"`. Plain commits without vector selectors never
+build vector overlays. After a segment has a vector overlay, that overlay
+follows the segment by liveness: later commits carry it forward without
+checking the shard core generation. Delete-only commits keep existing overlays;
+deleted-document vectors remain in FAISS and are filtered at query time.
+
+Explicit vector selectors also activate those concrete overlay names in the
+writer. That activation is process-local unless it produced a durable overlay
+entry. A commit that fails mid-build has no side effects: staged overlay files
+are deleted, no overlay entries are published, and no names are activated -
+the caller sees the error and decides whether to retry. Startup seeds active names only from overlays already present in
+`s.olux`, so Solux never treats intent-only state as a boot-time "must build"
+queue.
 
 Build policy is per segment and size based. IVF+PQ is attempted only when the
 segment has enough vectors to satisfy the training floor and enough
@@ -32,10 +39,21 @@ inside a segment is time ordered. The builder normalizes vectors for FAISS when
 the field uses cosine and the stored column is raw.
 
 Merges drop overlays for merged-away segments. The merged segment is treated as
-a new segment and gets a fresh overlay during the merge's commit when it passes
-the same thresholds. Rebuilding with new options does not require reindexing
-documents: drop the segment overlay entry and run a selected commit to rebuild
-from the stored vector column.
+a new segment and gets fresh overlays inside the merge-private phase for active
+vector fields that pass the same thresholds. Whichever later commit publishes
+the merged segment publishes its overlay entries atomically with the segment.
+If a merge-time vector overlay build fails, Solux deletes the staged overlay
+files, publishes the merged segment without vector overlays, and serves that
+field through the exact flat column fallback until a later explicit build
+succeeds.
+Rebuilding with new options does not require reindexing documents: drop the
+segment overlay entry and run a selected commit to rebuild from the stored
+vector column.
+
+Explicit commit-time vector builds stage overlay files and entries across the
+whole selected commit. If any requested vector build fails, staged overlay files
+are deleted and no partial vector overlay entries are retained for a later plain
+commit to publish.
 
 ## Querying
 

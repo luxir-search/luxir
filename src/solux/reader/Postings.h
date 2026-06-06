@@ -94,9 +94,9 @@ public:
   /// END-anchored (the last two underscore-separated fields are gen and
   /// fnum) because field names may themselves contain underscores and
   /// digits.  Filenames are opaque to the file layer; the IndexInfo manifest
-  /// binds file <-> entry.  gen is the indexGen at build time: a rebuild
-  /// (rebuild-without-reindex) writes a new gen while old readers still hold
-  /// the previous file.
+  /// binds file <-> entry.  gen is an overlay-defined generation.  Vector
+  /// overlays use a per-(segment, field) rebuild ordinal, so rebuilds write a
+  /// new file while old readers still hold the previous file.
   static std::string getSegmentOverlayFileName(uint64_t segId, std::string_view name,
                                                uint64_t gen, uint32_t fnum) {
     std::string s(PREFIX_FNAME);

@@ -7,6 +7,7 @@
 #include "solux/index/VectorIndexBuilder.h"
 #include "solux/reader/VectorAuxReader.h"
 #include "solux/schema/Schema.h"
+#include "solux/server/ProtoUpdateMessage.h"
 #include "solux/server/SoluxNode.h"
 #include "solux/store/Directory.h"
 #include "solux/reader/Postings.h"
@@ -52,6 +53,7 @@ protected:
     int32_t savedNProbe;
     int64_t savedMinTraining;
     int64_t savedBuildThreshold;
+    std::string savedFailBuildForFieldName;
 
     IvfPqGuard(int32_t nlist, int32_t m, int32_t bits,
                int32_t nprobe, int64_t minTraining)
@@ -61,7 +63,8 @@ protected:
         savedBits(VectorIndexBuilder::ivfPqBits),
         savedNProbe(VectorIndexBuilder::ivfPqDefaultNProbe),
         savedMinTraining(VectorIndexBuilder::ivfPqMinTrainingVectors),
-        savedBuildThreshold(VectorIndexBuilder::ivfPqBuildThresholdScanCost) {
+        savedBuildThreshold(VectorIndexBuilder::ivfPqBuildThresholdScanCost),
+        savedFailBuildForFieldName(VectorIndexBuilder::failBuildForFieldNameForTests) {
       VectorIndexBuilder::buildFaissIvfPqAuxIndexes = true;
       VectorIndexBuilder::ivfPqNList = nlist;
       VectorIndexBuilder::ivfPqM = m;
@@ -69,6 +72,7 @@ protected:
       VectorIndexBuilder::ivfPqDefaultNProbe = nprobe;
       VectorIndexBuilder::ivfPqMinTrainingVectors = minTraining;
       VectorIndexBuilder::ivfPqBuildThresholdScanCost = 0;
+      VectorIndexBuilder::failBuildForFieldNameForTests.clear();
     }
 
     ~IvfPqGuard() {
@@ -79,11 +83,25 @@ protected:
       VectorIndexBuilder::ivfPqDefaultNProbe = savedNProbe;
       VectorIndexBuilder::ivfPqMinTrainingVectors = savedMinTraining;
       VectorIndexBuilder::ivfPqBuildThresholdScanCost = savedBuildThreshold;
+      VectorIndexBuilder::failBuildForFieldNameForTests = savedFailBuildForFieldName;
     }
   };
 };
 
 namespace {
+
+struct VectorBuildFailureGuard {
+  std::string savedFieldName;
+
+  explicit VectorBuildFailureGuard(std::string fieldName)
+      : savedFieldName(VectorIndexBuilder::failBuildForFieldNameForTests) {
+    VectorIndexBuilder::failBuildForFieldNameForTests = std::move(fieldName);
+  }
+
+  ~VectorBuildFailureGuard() {
+    VectorIndexBuilder::failBuildForFieldNameForTests = savedFieldName;
+  }
+};
 
 // Reads s.olux and returns the parsed IndexInfo.  Caller owns the storage in `arena`.
 proto::IndexInfo* readIndexInfo(Directory& dir, google::protobuf::Arena& arena) {
@@ -119,6 +137,60 @@ std::vector<const proto::AuxIndexInfo*> vectorOverlays(const proto::IndexInfo* i
     }
   }
   return out;
+}
+
+std::vector<std::string> vectorOverlayFiles(Directory& dir) {
+  std::vector<std::string> files;
+  dir.listFiles(files);
+  std::vector<std::string> out;
+  for (const auto& file : files) {
+    if (file.find("__vec.") != std::string::npos) out.push_back(file);
+  }
+  return out;
+}
+
+bool commitForTest(CollectionHelper& h,
+                   const std::vector<std::string>& buildAuxIndexes,
+                   bool waitForMerges = false) {
+  class BlockingProtoUpdateMessage : public ProtoUpdateMessage {
+  public:
+    Blocker blocker;
+    bool success = false;
+
+    explicit BlockingProtoUpdateMessage(proto::UpdateRequest* req) : ProtoUpdateMessage(req) {}
+
+    void done(IndexWriter& iw) override {
+      unused(iw);
+      success = !result.errored();
+      blocker.notify();
+    }
+  };
+
+  google::protobuf::Arena arena;
+  auto* request = google::protobuf::Arena::Create<proto::UpdateRequest>(&arena);
+  auto* params = request->mutable_commit();
+  for (const auto& name : buildAuxIndexes) params->add_build_aux_indexes(name);
+  params->set_wait_for_merges(waitForMerges);
+
+  BlockingProtoUpdateMessage msg(request);
+  bool submitted = h.getIndexWriter()->submitUpdate(&msg);
+  assert(submitted);
+  unused(submitted);
+  msg.blocker.wait();
+  return msg.success;
+}
+
+void resetVectorBuildCounters() {
+  VectorIndexBuilder::ivfPqBuildCountForTests.store(0, std::memory_order_relaxed);
+  VectorIndexBuilder::ivfPqMergeBuildCountForTests.store(0, std::memory_order_relaxed);
+}
+
+int64_t vectorCommitBuildCount() {
+  return VectorIndexBuilder::ivfPqBuildCountForTests.load(std::memory_order_relaxed);
+}
+
+int64_t vectorMergeBuildCount() {
+  return VectorIndexBuilder::ivfPqMergeBuildCountForTests.load(std::memory_order_relaxed);
 }
 
 const proto::AuxIndexInfo& onlyVectorOverlay(const proto::IndexInfo* info) {
@@ -363,9 +435,9 @@ TEST_F(VectorIndexBuilderTest, segmentChangeCarriesExistingOverlay) {
 }
 
 // Plain user commits do NOT infer vector selectors from existing overlays:
-// they build only what they ask for.  (Merge-triggered synthetic commits DO
-// infer, so a merged segment gets its index - covered by the merge lifecycle
-// test.)  Full auto-maintenance is the future background builder's job.
+// they build only what they ask for.  Merge-created segments get overlays in
+// the merge-private phase.  Full auto-maintenance is the future background
+// builder's job.
 TEST_F(VectorIndexBuilderTest, plainCommitDoesNotAutoBuild) {
   IvfPqGuard guard(/*nlist=*/2, /*m=*/1, /*bits=*/1, /*nprobe=*/2, /*minTraining=*/2);
   CollectionHelper h("main");
@@ -382,18 +454,18 @@ TEST_F(VectorIndexBuilderTest, plainCommitDoesNotAutoBuild) {
     h.index(flatdoc("id", "b" + std::to_string(i),
                     "embedding_v", std::vector<float>{100.0f + (float)i, 1.0f, 0.0f, 0.0f}));
   }
-  VectorIndexBuilder::ivfPqBuildCountForTests = 0;
+  resetVectorBuildCounters();
   h.commit();  // plain: no selectors, no inference
-  EXPECT_EQ(VectorIndexBuilder::ivfPqBuildCountForTests, 0);
+  EXPECT_EQ(vectorCommitBuildCount(), 0);
 
   google::protobuf::Arena arena;
   auto* info = readIndexInfo(h.getIndexWriter()->dir, arena);
   EXPECT_EQ(vectorOverlays(info).size(), 1u) << "only the first segment's overlay exists";
 
   // The explicit selector then builds the missing one.
-  VectorIndexBuilder::ivfPqBuildCountForTests = 0;
+  resetVectorBuildCounters();
   h.commit({"*"});
-  EXPECT_EQ(VectorIndexBuilder::ivfPqBuildCountForTests, 1);
+  EXPECT_EQ(vectorCommitBuildCount(), 1);
 }
 
 TEST_F(VectorIndexBuilderTest, carryForwardBuildsOnlyNewAboveThresholdSegment) {
@@ -406,9 +478,9 @@ TEST_F(VectorIndexBuilderTest, carryForwardBuildsOnlyNewAboveThresholdSegment) {
     h.index(flatdoc("id", "a" + std::to_string(i),
                     "embedding_v", std::vector<float>{(float)i, 0.0f, 1.0f, 0.0f}));
   }
-  VectorIndexBuilder::ivfPqBuildCountForTests = 0;
+  resetVectorBuildCounters();
   h.commit({"*"});
-  EXPECT_EQ(VectorIndexBuilder::ivfPqBuildCountForTests, 1);
+  EXPECT_EQ(vectorCommitBuildCount(), 1);
 
   google::protobuf::Arena arena1;
   auto* info1 = readIndexInfo(h.getIndexWriter()->dir, arena1);
@@ -425,9 +497,9 @@ TEST_F(VectorIndexBuilderTest, carryForwardBuildsOnlyNewAboveThresholdSegment) {
     h.index(flatdoc("id", "b" + std::to_string(i),
                     "embedding_v", std::vector<float>{100.0f + (float)i, 1.0f, 0.0f, 0.0f}));
   }
-  VectorIndexBuilder::ivfPqBuildCountForTests = 0;
+  resetVectorBuildCounters();
   h.commit({"*"});
-  EXPECT_EQ(VectorIndexBuilder::ivfPqBuildCountForTests, 1);
+  EXPECT_EQ(vectorCommitBuildCount(), 1);
 
   google::protobuf::Arena arena2;
   auto* info2 = readIndexInfo(h.getIndexWriter()->dir, arena2);
@@ -465,11 +537,11 @@ TEST_F(VectorIndexBuilderTest, littleCommitDoesNoAnnWorkAndMatchesExact) {
   std::string firstFile{onlyVectorOverlay(info1).files(0)};
 
   VectorIndexBuilder::ivfPqBuildThresholdScanCost = 1000;
-  VectorIndexBuilder::ivfPqBuildCountForTests = 0;
+  resetVectorBuildCounters();
   h.index(flatdoc("id", std::string("tiny"),
                   "embedding_v", std::vector<float>{100.0f, 0.0f, 0.0f, 0.0f}));
   h.commit();
-  EXPECT_EQ(VectorIndexBuilder::ivfPqBuildCountForTests, 0);
+  EXPECT_EQ(vectorCommitBuildCount(), 0);
 
   google::protobuf::Arena arena2;
   auto* info2 = readIndexInfo(h.getIndexWriter()->dir, arena2);
@@ -502,18 +574,24 @@ TEST_F(VectorIndexBuilderTest, rebuildWithoutReindex) {
 
   google::protobuf::Arena arena1;
   auto* info1 = readIndexInfo(h.getIndexWriter()->dir, arena1);
-  std::string firstFile{onlyVectorOverlay(info1).files(0)};
+  const auto& first = onlyVectorOverlay(info1);
+  std::string firstFile{first.files(0)};
+  EXPECT_EQ(first.gen(), 0u);
+  EXPECT_TRUE(firstFile.ends_with("_00_00")) << firstFile;
 
   ASSERT_TRUE(h.getIndexWriter()->testDropSegmentOverlay("vec.embedding_v", 0));
-  VectorIndexBuilder::ivfPqBuildCountForTests = 0;
+  resetVectorBuildCounters();
   h.commit({"vec.embedding_v"});
-  EXPECT_EQ(VectorIndexBuilder::ivfPqBuildCountForTests, 1);
+  EXPECT_EQ(vectorCommitBuildCount(), 1);
 
   google::protobuf::Arena arena2;
   auto* info2 = readIndexInfo(h.getIndexWriter()->dir, arena2);
   const auto& rebuilt = onlyVectorOverlay(info2);
   ASSERT_EQ(rebuilt.files_size(), 1);
+  EXPECT_EQ(rebuilt.gen(), 1u);
   EXPECT_NE(rebuilt.files(0), firstFile);
+  EXPECT_TRUE(std::string(rebuilt.files(0)).ends_with("_01_00")) << rebuilt.files(0);
+  EXPECT_EQ(h.getIndexWriter()->dir.openFile(firstFile), nullptr);
 
   auto ids = runKnnIds(h.getSearchEngine(), "embedding_v",
                        {0.0f, 0.0f, 1.0f, 0.0f}, 3,
@@ -546,6 +624,7 @@ TEST_F(VectorIndexBuilderTest, mergeDropsOldOverlayFiles) {
   for (const auto* overlay : oldOverlays) oldFiles.emplace_back(overlay->files(0));
 
   h.getIndexWriter()->mergeSegments();
+  h.commit();
 
   google::protobuf::Arena arena2;
   auto* info2 = readIndexInfo(h.getIndexWriter()->dir, arena2);
@@ -563,6 +642,363 @@ TEST_F(VectorIndexBuilderTest, mergeDropsOldOverlayFiles) {
   }
   auto idx = readFaissIndex(h.getIndexWriter()->dir, aux.files(0));
   EXPECT_EQ(idx->ntotal, 160);
+}
+
+TEST_F(VectorIndexBuilderTest, mergeBuildsOverlayBeforePlainPublishDuringActiveIndexing) {
+  IvfPqGuard guard(/*nlist=*/2, /*m=*/1, /*bits=*/1, /*nprobe=*/2, /*minTraining=*/2);
+  CollectionHelper h("main");
+  h.clear();
+  enableL2OnVecSuffix(h.collection());
+
+  for (int seg = 0; seg < 2; seg++) {
+    for (int i = 0; i < 80; i++) {
+      h.index(flatdoc("id", "s" + std::to_string(seg) + "_" + std::to_string(i),
+                      "embedding_v", std::vector<float>{(float)i, (float)seg, 1.0f, 0.0f}));
+    }
+    h.commit({"*"});
+  }
+
+  h.index(flatdoc("id", std::string("pending"),
+                  "embedding_v", std::vector<float>{1000.0f, 0.0f, 0.0f, 0.0f}));
+
+  resetVectorBuildCounters();
+  h.getIndexWriter()->mergeSegments();
+  EXPECT_EQ(vectorCommitBuildCount(), 0);
+  EXPECT_EQ(vectorMergeBuildCount(), 1);
+
+  auto beforeApprox = runKnnIds(h.getSearchEngine(), "embedding_v",
+                                {0.2f, 1.0f, 1.0f, 0.0f}, 3,
+                                /*nprobe=*/2, /*refineCandidates=*/200);
+  auto beforeExact = runKnnIds(h.getSearchEngine(), "embedding_v",
+                               {0.2f, 1.0f, 1.0f, 0.0f}, 3,
+                               /*nprobe=*/2, /*refineCandidates=*/200, /*exact=*/true);
+  EXPECT_EQ(beforeApprox, beforeExact);
+
+  h.commit();
+  EXPECT_EQ(vectorCommitBuildCount(), 0)
+      << "plain publication commit should not run ANN builds";
+  EXPECT_EQ(vectorMergeBuildCount(), 1);
+
+  google::protobuf::Arena arena;
+  auto* info = readIndexInfo(h.getIndexWriter()->dir, arena);
+  ASSERT_EQ(info->segments_size(), 2);
+  auto overlays = vectorOverlays(info);
+  ASSERT_EQ(overlays.size(), 1u);
+  auto idx = readFaissIndex(h.getIndexWriter()->dir, overlays[0]->files(0));
+  EXPECT_EQ(idx->ntotal, 160);
+
+  auto afterApprox = runKnnIds(h.getSearchEngine(), "embedding_v",
+                               {0.2f, 1.0f, 1.0f, 0.0f}, 3,
+                               /*nprobe=*/2, /*refineCandidates=*/200);
+  auto afterExact = runKnnIds(h.getSearchEngine(), "embedding_v",
+                              {0.2f, 1.0f, 1.0f, 0.0f}, 3,
+                              /*nprobe=*/2, /*refineCandidates=*/200, /*exact=*/true);
+  EXPECT_EQ(afterApprox, afterExact);
+}
+
+TEST_F(VectorIndexBuilderTest, mergePromotesBelowThresholdSegmentsForActiveField) {
+  IvfPqGuard guard(/*nlist=*/2, /*m=*/1, /*bits=*/1, /*nprobe=*/2, /*minTraining=*/2);
+  CollectionHelper h("main");
+  h.clear();
+  enableL2OnVecSuffix(h.collection());
+  auto iw = h.getIndexWriter();
+  iw->mergePolicy->setMergeFactor(2);
+
+  for (int i = 0; i < 400; i++) {
+    h.index(flatdoc("id", "active" + std::to_string(i),
+                    "embedding_v", std::vector<float>{(float)i, 0.0f, 1.0f, 0.0f}));
+  }
+  h.commit({"*"});
+
+  VectorIndexBuilder::ivfPqBuildThresholdScanCost = 400;
+  resetVectorBuildCounters();
+  for (int seg = 0; seg < 2; seg++) {
+    for (int i = 0; i < 79; i++) {
+      h.index(flatdoc("id", "small" + std::to_string(seg) + "_" + std::to_string(i),
+                      "embedding_v", std::vector<float>{200.0f + (float)i, (float)seg, 0.0f, 0.0f}));
+    }
+    h.commit();
+  }
+  iw->updateGraph.wait_for_all();
+  h.commit();
+
+  EXPECT_EQ(vectorCommitBuildCount(), 0);
+  EXPECT_EQ(vectorMergeBuildCount(), 1);
+
+  google::protobuf::Arena arena;
+  auto* info = readIndexInfo(iw->dir, arena);
+  auto overlays = vectorOverlays(info);
+  ASSERT_EQ(overlays.size(), 2u);
+  bool sawMergedSmall = false;
+  for (const auto* overlay : overlays) {
+    auto idx = readFaissIndex(iw->dir, overlay->files(0));
+    if (idx->ntotal == 158) {
+      sawMergedSmall = true;
+    }
+  }
+  EXPECT_TRUE(sawMergedSmall);
+}
+
+TEST_F(VectorIndexBuilderTest, belowThresholdMergedOutputBuildsNoOverlay) {
+  IvfPqGuard guard(/*nlist=*/2, /*m=*/1, /*bits=*/1, /*nprobe=*/2, /*minTraining=*/2);
+  VectorIndexBuilder::ivfPqBuildThresholdScanCost = 400;
+  CollectionHelper h("main");
+  h.clear();
+  enableL2OnVecSuffix(h.collection());
+  auto iw = h.getIndexWriter();
+
+  EXPECT_TRUE(commitForTest(h, {"vec.embedding_v"}));
+  EXPECT_TRUE(iw->testActiveVectorOverlayName("vec.embedding_v"));
+
+  for (int seg = 0; seg < 2; seg++) {
+    for (int i = 0; i < 39; i++) {
+      h.index(flatdoc("id", "small" + std::to_string(seg) + "_" + std::to_string(i),
+                      "embedding_v", std::vector<float>{(float)i, (float)seg, 1.0f, 0.0f}));
+    }
+    h.commit();
+  }
+
+  resetVectorBuildCounters();
+  iw->mergeSegments();
+  h.commit();
+  EXPECT_EQ(vectorCommitBuildCount(), 0);
+  EXPECT_EQ(vectorMergeBuildCount(), 0);
+
+  google::protobuf::Arena arena;
+  auto* info = readIndexInfo(iw->dir, arena);
+  ASSERT_EQ(info->segments_size(), 1);
+  EXPECT_EQ(vectorOverlays(info).size(), 0u);
+
+  auto approx = runKnnIds(h.getSearchEngine(), "embedding_v",
+                          {0.2f, 1.0f, 1.0f, 0.0f}, 3,
+                          /*nprobe=*/2, /*refineCandidates=*/200);
+  auto exact = runKnnIds(h.getSearchEngine(), "embedding_v",
+                         {0.2f, 1.0f, 1.0f, 0.0f}, 3,
+                         /*nprobe=*/2, /*refineCandidates=*/200, /*exact=*/true);
+  EXPECT_EQ(approx, exact);
+}
+
+TEST_F(VectorIndexBuilderTest, explicitActivationBelowThresholdPromotesInProcessMerge) {
+  IvfPqGuard guard(/*nlist=*/2, /*m=*/1, /*bits=*/1, /*nprobe=*/2, /*minTraining=*/2);
+  VectorIndexBuilder::ivfPqBuildThresholdScanCost = 400;
+  CollectionHelper h("main");
+  h.clear();
+  enableL2OnVecSuffix(h.collection());
+
+  for (int seg = 0; seg < 2; seg++) {
+    for (int i = 0; i < 79; i++) {
+      h.index(flatdoc("id", "small" + std::to_string(seg) + "_" + std::to_string(i),
+                      "embedding_v", std::vector<float>{(float)i, (float)seg, 1.0f, 0.0f}));
+    }
+    if (seg == 0) {
+      h.commit({"vec.embedding_v"});
+    } else {
+      h.commit();
+    }
+  }
+
+  google::protobuf::Arena arena1;
+  auto* info1 = readIndexInfo(h.getIndexWriter()->dir, arena1);
+  EXPECT_EQ(vectorOverlays(info1).size(), 0u);
+
+  resetVectorBuildCounters();
+  h.getIndexWriter()->mergeSegments();
+  h.commit();
+  EXPECT_EQ(vectorCommitBuildCount(), 0);
+  EXPECT_EQ(vectorMergeBuildCount(), 1);
+
+  google::protobuf::Arena arena2;
+  auto* info2 = readIndexInfo(h.getIndexWriter()->dir, arena2);
+  ASSERT_EQ(info2->segments_size(), 1);
+  const auto& aux = onlyVectorOverlay(info2);
+  auto idx = readFaissIndex(h.getIndexWriter()->dir, aux.files(0));
+  EXPECT_EQ(idx->ntotal, 158);
+}
+
+TEST_F(VectorIndexBuilderTest, explicitActivationOnEmptyIndexPromotesLaterMerge) {
+  IvfPqGuard guard(/*nlist=*/2, /*m=*/1, /*bits=*/1, /*nprobe=*/2, /*minTraining=*/2);
+  VectorIndexBuilder::ivfPqBuildThresholdScanCost = 400;
+  CollectionHelper h("main");
+  h.clear();
+  enableL2OnVecSuffix(h.collection());
+  auto iw = h.getIndexWriter();
+
+  EXPECT_TRUE(commitForTest(h, {"vec.embedding_v"}));
+  EXPECT_TRUE(iw->testActiveVectorOverlayName("vec.embedding_v"));
+
+  for (int seg = 0; seg < 2; seg++) {
+    for (int i = 0; i < 79; i++) {
+      h.index(flatdoc("id", "small" + std::to_string(seg) + "_" + std::to_string(i),
+                      "embedding_v", std::vector<float>{(float)i, (float)seg, 1.0f, 0.0f}));
+    }
+    h.commit();
+  }
+
+  resetVectorBuildCounters();
+  iw->mergeSegments();
+  h.commit();
+  EXPECT_EQ(vectorCommitBuildCount(), 0);
+  EXPECT_EQ(vectorMergeBuildCount(), 1);
+
+  google::protobuf::Arena arena;
+  auto* info = readIndexInfo(iw->dir, arena);
+  ASSERT_EQ(info->segments_size(), 1);
+  const auto& aux = onlyVectorOverlay(info);
+  auto idx = readFaissIndex(iw->dir, aux.files(0));
+  EXPECT_EQ(idx->ntotal, 158);
+}
+
+TEST_F(VectorIndexBuilderTest, invalidExactVectorSelectorDoesNotActivate) {
+  IvfPqGuard guard(/*nlist=*/2, /*m=*/1, /*bits=*/1, /*nprobe=*/2, /*minTraining=*/2);
+  CollectionHelper h("main");
+  h.clear();
+  enableL2OnVecSuffix(h.collection());
+  auto iw = h.getIndexWriter();
+
+  EXPECT_TRUE(commitForTest(h, {"vec.typo"}));
+  EXPECT_FALSE(iw->testActiveVectorOverlayName("vec.typo"));
+
+  for (int seg = 0; seg < 2; seg++) {
+    for (int i = 0; i < 80; i++) {
+      h.index(flatdoc("id", "doc" + std::to_string(seg) + "_" + std::to_string(i),
+                      "embedding_v", std::vector<float>{(float)i, (float)seg, 1.0f, 0.0f}));
+    }
+    h.commit();
+  }
+
+  resetVectorBuildCounters();
+  iw->mergeSegments();
+  h.commit();
+  EXPECT_EQ(vectorCommitBuildCount(), 0);
+  EXPECT_EQ(vectorMergeBuildCount(), 0);
+}
+
+TEST_F(VectorIndexBuilderTest, intentOnlyActivationIsNotSeededAfterRestart) {
+  IvfPqGuard guard(/*nlist=*/2, /*m=*/1, /*bits=*/1, /*nprobe=*/2, /*minTraining=*/2);
+  VectorIndexBuilder::ivfPqBuildThresholdScanCost = 400;
+  CollectionHelper h("main");
+  h.clear();
+  enableL2OnVecSuffix(h.collection());
+  auto iw = h.getIndexWriter();
+
+  for (int seg = 0; seg < 2; seg++) {
+    for (int i = 0; i < 79; i++) {
+      h.index(flatdoc("id", "small" + std::to_string(seg) + "_" + std::to_string(i),
+                      "embedding_v", std::vector<float>{(float)i, (float)seg, 1.0f, 0.0f}));
+    }
+    if (seg == 0) {
+      h.commit({"vec.embedding_v"});
+    } else {
+      h.commit();
+    }
+  }
+
+  google::protobuf::Arena arena;
+  auto* info = readIndexInfo(iw->dir, arena);
+  ASSERT_EQ(info->segments_size(), 2);
+  EXPECT_EQ(vectorOverlays(info).size(), 0u);
+  EXPECT_TRUE(iw->testActiveVectorOverlayName("vec.embedding_v"));
+
+  iw->testReseedActiveVectorOverlayNamesFromManifest();
+  EXPECT_FALSE(iw->testActiveVectorOverlayName("vec.embedding_v"));
+
+  resetVectorBuildCounters();
+  iw->mergeSegments();
+  h.commit();
+  EXPECT_EQ(vectorCommitBuildCount(), 0);
+  EXPECT_EQ(vectorMergeBuildCount(), 0);
+
+  google::protobuf::Arena arena2;
+  auto* info2 = readIndexInfo(iw->dir, arena2);
+  ASSERT_EQ(info2->segments_size(), 1);
+  EXPECT_EQ(vectorOverlays(info2).size(), 0u);
+
+  resetVectorBuildCounters();
+  h.commit({"vec.embedding_v"});
+  EXPECT_EQ(vectorCommitBuildCount(), 1);
+  EXPECT_EQ(vectorMergeBuildCount(), 0);
+  EXPECT_TRUE(iw->testActiveVectorOverlayName("vec.embedding_v"));
+}
+
+TEST_F(VectorIndexBuilderTest, failedMultiFieldCommitDoesNotPublishPartialOverlays) {
+  IvfPqGuard guard(/*nlist=*/2, /*m=*/1, /*bits=*/1, /*nprobe=*/2, /*minTraining=*/2);
+  CollectionHelper h("main");
+  h.clear();
+  enableL2OnVecSuffix(h.collection());
+  auto iw = h.getIndexWriter();
+
+  for (int i = 0; i < 80; i++) {
+    h.index(flatdoc("id", "doc" + std::to_string(i),
+                    "a_v", std::vector<float>{(float)i, 0.0f, 1.0f, 0.0f},
+                    "b_v", std::vector<float>{(float)i, 1.0f, 0.0f, 0.0f}));
+  }
+  h.commit();
+
+  resetVectorBuildCounters();
+  {
+    VectorBuildFailureGuard fail("b_v");
+    EXPECT_FALSE(commitForTest(h, {"*"}));
+  }
+  EXPECT_EQ(vectorCommitBuildCount(), 1);
+  EXPECT_EQ(vectorMergeBuildCount(), 0);
+  EXPECT_FALSE(iw->testActiveVectorOverlayName("vec.a_v"));
+  EXPECT_FALSE(iw->testActiveVectorOverlayName("vec.b_v"));
+  EXPECT_TRUE(vectorOverlayFiles(iw->dir).empty());
+
+  h.commit();
+
+  google::protobuf::Arena arena;
+  auto* info = readIndexInfo(iw->dir, arena);
+  EXPECT_EQ(vectorOverlays(info).size(), 0u);
+  EXPECT_FALSE(iw->testActiveVectorOverlayName("vec.a_v"));
+  EXPECT_FALSE(iw->testActiveVectorOverlayName("vec.b_v"));
+  EXPECT_TRUE(vectorOverlayFiles(iw->dir).empty());
+}
+
+TEST_F(VectorIndexBuilderTest, mergeOverlayFailurePublishesFlatAndClearsMergeGate) {
+  IvfPqGuard guard(/*nlist=*/2, /*m=*/1, /*bits=*/1, /*nprobe=*/2, /*minTraining=*/2);
+  CollectionHelper h("main");
+  h.clear();
+  enableL2OnVecSuffix(h.collection());
+  auto iw = h.getIndexWriter();
+
+  EXPECT_TRUE(commitForTest(h, {"vec.a_v", "vec.b_v"}));
+  EXPECT_TRUE(iw->testActiveVectorOverlayName("vec.a_v"));
+  EXPECT_TRUE(iw->testActiveVectorOverlayName("vec.b_v"));
+
+  for (int seg = 0; seg < 2; seg++) {
+    for (int i = 0; i < 80; i++) {
+      h.index(flatdoc("id", "s" + std::to_string(seg) + "_" + std::to_string(i),
+                      "a_v", std::vector<float>{(float)i, (float)seg, 1.0f, 0.0f},
+                      "b_v", std::vector<float>{(float)i, (float)seg, 0.0f, 1.0f}));
+    }
+    h.commit();
+  }
+
+  resetVectorBuildCounters();
+  {
+    VectorBuildFailureGuard fail("b_v");
+    iw->mergeSegments();
+  }
+  EXPECT_EQ(vectorCommitBuildCount(), 0);
+  EXPECT_EQ(vectorMergeBuildCount(), 1);
+  EXPECT_FALSE(iw->testMergeRunning());
+  EXPECT_TRUE(commitForTest(h, {}, /*waitForMerges=*/true));
+
+  google::protobuf::Arena arena1;
+  auto* info1 = readIndexInfo(iw->dir, arena1);
+  ASSERT_EQ(info1->segments_size(), 1);
+  EXPECT_EQ(vectorOverlays(info1).size(), 0u);
+  EXPECT_TRUE(vectorOverlayFiles(iw->dir).empty());
+
+  resetVectorBuildCounters();
+  EXPECT_TRUE(commitForTest(h, {"vec.a_v", "vec.b_v"}));
+  EXPECT_EQ(vectorCommitBuildCount(), 2);
+  EXPECT_EQ(vectorMergeBuildCount(), 0);
+
+  google::protobuf::Arena arena2;
+  auto* info2 = readIndexInfo(iw->dir, arena2);
+  EXPECT_EQ(vectorOverlays(info2).size(), 2u);
 }
 
 TEST_F(VectorIndexBuilderTest, vectorBuildCommitDoesNotWaitForInFlightMerge) {

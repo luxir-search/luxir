@@ -109,7 +109,7 @@ IndexWriter::IndexWriter(Directory& dir, std::function<std::shared_ptr<Schema>()
       seg.auxOverlays.reserve(segment.overlays_size());
       for (int j = 0; j < segment.overlays_size(); j++) {
         seg.auxOverlays.push_back(segment.overlays(j));
-        currentSegmentOverlays_.push_back(segment.overlays(j));
+        currentSegmentOverlays_.push_back({segId, segment.overlays(j)});
       }
       mergePolicy->_update(&seg);
       lastCommittedSegIds.push_back(segId);
@@ -123,6 +123,10 @@ IndexWriter::IndexWriter(Directory& dir, std::function<std::shared_ptr<Schema>()
     for (int i = 0; i < indexInfo.aux_indexes_size(); i++) {
       currentAuxIndexes_.push_back(indexInfo.aux_indexes(i));
     }
+  }
+  {
+    std::lock_guard<std::mutex> lock(indexMutex);
+    seedActiveVectorOverlayNamesFromManifestLocked();
   }
 
   // Create the updateGraph.  Start with a serial node that assigns an order to each update command
@@ -722,13 +726,16 @@ void IndexWriter::finishCommitBody(UpdateMessage& msg) {
   std::sort(segsToKeep.begin(), segsToKeep.end(),
             [](const SegInfo* a, const SegInfo* b) { return a->segId < b->segId; });
 
-  // Collect unsynced segment data files from segments being committed for the first time.
+  // Collect unsynced segment data and overlay files.  Keep them on the segment
+  // until sync succeeds so a failed commit can retry durability on a later
+  // commit attempt.  CAVEAT: liveDocs files from applyDeletes go into
+  // filesToSync directly and are NOT retry-covered - a failed sync loses them
+  // from the retry set while the in-memory liveGen has advanced (pre-existing
+  // gap, tracked).
   for (auto seg : segsToKeep) {
-    if (seg->firstCommitTime == 0 && !seg->unsyncedFiles.empty()) {
+    if (!seg->unsyncedFiles.empty()) {
       filesToSync.insert(filesToSync.end(),
-                         std::make_move_iterator(seg->unsyncedFiles.begin()),
-                         std::make_move_iterator(seg->unsyncedFiles.end()));
-      seg->unsyncedFiles.clear();
+                         seg->unsyncedFiles.begin(), seg->unsyncedFiles.end());
     }
   }
 
@@ -772,6 +779,9 @@ void IndexWriter::finishCommitBody(UpdateMessage& msg) {
   if (!filesToSync.empty()) {
     filesToSync.emplace_back(".");
     dir.sync(filesToSync);
+    for (auto seg : segsToKeep) {
+      seg->unsyncedFiles.clear();
+    }
   }
 
   // write the segments file with only the segments that have live documents
@@ -896,13 +906,198 @@ std::vector<proto::AuxIndexInfo> IndexWriter::buildAuxIndexes(
   return carried;
 }
 
+namespace {
+
+std::vector<std::string> collectVectorSelectors(const std::vector<std::string>& buildAuxIndexes) {
+  std::vector<std::string> selectors;
+  boost::unordered_flat_set<std::string> seen;
+  for (const auto& selector : buildAuxIndexes) {
+    if (selector == "*" || selector.starts_with(VectorIndexBuilder::NAME_PREFIX)) {
+      if (seen.emplace(selector).second) {
+        selectors.push_back(selector);
+      }
+    }
+  }
+  return selectors;
+}
+
+bool eligibleVectorOverlayName(const Schema& schema, std::string_view overlayName) {
+  if (!overlayName.starts_with(VectorIndexBuilder::NAME_PREFIX)) return false;
+  overlayName.remove_prefix(VectorIndexBuilder::NAME_PREFIX.size());
+  auto* ft = schema.getFieldTypePtr(overlayName);
+  if (ft == nullptr || ft->type() != FieldType::VECTOR) return false;
+  auto* vft = (const VectorFieldType*)ft;
+  return vft->knnSearchable();
+}
+
+std::vector<std::string> collectValidatedExactVectorOverlayNames(
+    const std::vector<std::string>& buildAuxIndexes,
+    const Schema& schema) {
+  std::vector<std::string> names;
+  boost::unordered_flat_set<std::string> seen;
+  for (const auto& selector : buildAuxIndexes) {
+    if (selector.starts_with(VectorIndexBuilder::NAME_PREFIX)) {
+      if (!seen.emplace(selector).second) continue;
+      if (eligibleVectorOverlayName(schema, selector)) {
+        names.push_back(selector);
+      } else {
+        LOG_WARN("Ignoring vector aux selector {} because it does not resolve to an eligible vector field",
+                 selector);
+      }
+    }
+  }
+  return names;
+}
+
+} // namespace
+
+// Benign load-then-store race: the commit thread and a merge thread can both
+// miss and each create a PostingsReader for a source segment - both are valid,
+// one is wasted, last store wins.  Deliberately NOT a lock or CAS; do not
+// "fix" this into synchronization.
+std::shared_ptr<PostingsReader> IndexWriter::getSegmentPostingsReader(SegInfo& seg) {
+  auto pr = seg.sharedPostingsReader.load();
+  if (!pr) {
+    pr = std::make_shared<PostingsReader>(dir, seg.segId);
+    seg.sharedPostingsReader.store(pr);
+  }
+  return pr;
+}
+
+void IndexWriter::seedActiveVectorOverlayNamesFromManifestLocked() {
+  activeVectorOverlayNames.clear();
+  for (const auto& published : currentSegmentOverlays_) {
+    if (published.info.kind() == VectorIndexBuilder::KIND) {
+      activeVectorOverlayNames.emplace(published.info.name());
+    }
+  }
+}
+
+// Exact vector names are activated only after schema validation.  That
+// validation gate is the "pass validation" part of the process-local intent
+// contract; "*" still activates only concrete names found on eligible segment
+// fields below.
+void IndexWriter::activateVectorOverlayNames(std::span<const std::string> names) {
+  if (names.empty()) return;
+  std::lock_guard<std::mutex> lock(indexMutex);
+  for (const auto& name : names) {
+    activeVectorOverlayNames.emplace(name);
+  }
+}
+
+std::vector<std::string> IndexWriter::snapshotActiveVectorOverlayNames() {
+  std::vector<std::string> names;
+  {
+    std::lock_guard<std::mutex> lock(indexMutex);
+    names.reserve(activeVectorOverlayNames.size());
+    for (const auto& name : activeVectorOverlayNames) {
+      names.push_back(name);
+    }
+  }
+  std::sort(names.begin(), names.end());
+  return names;
+}
+
+uint64_t IndexWriter::nextVectorOverlayGen(const SegInfo& seg, std::string_view name) const {
+  uint64_t nextGen = 0;
+  // Usually defense-in-depth: callers skip existing names before rebuilding, so
+  // seg.auxOverlays normally cannot raise the ordinal for a selected name.
+  for (const auto& overlay : seg.auxOverlays) {
+    if (overlay.kind() == VectorIndexBuilder::KIND && overlay.name() == name) {
+      nextGen = std::max(nextGen, overlay.gen() + 1);
+    }
+  }
+
+  // This scan is load-bearing for the current drop-then-rebuild test flow: the
+  // old manifest entry may be absent from seg.auxOverlays but still present in
+  // currentSegmentOverlays_ until the rebuilding commit publishes.  Future APIs
+  // that publish a drop separately must preserve this ordinal another way.
+  //
+  // firstCommitTime keeps private merge output out of currentSegmentOverlays_:
+  // merge-created segments are not published when their overlay build runs.
+  if (seg.firstCommitTime != 0) {
+    for (const auto& published : currentSegmentOverlays_) {
+      if (published.segId == seg.segId
+          && published.info.kind() == VectorIndexBuilder::KIND
+          && published.info.name() == name) {
+        nextGen = std::max(nextGen, published.info.gen() + 1);
+      }
+    }
+  }
+
+  return nextGen;
+}
+
+std::vector<proto::AuxIndexInfo> IndexWriter::buildConcreteVectorOverlays(
+    SegInfo& seg,
+    PostingsReader& postingsReader,
+    std::span<const std::string> overlayNames,
+    const Schema& schema,
+    VectorIndexBuilder::BuildSite buildSite,
+    std::vector<std::string>& outFiles) {
+  std::vector<proto::AuxIndexInfo> built;
+  if (overlayNames.empty()) return built;
+
+  boost::unordered_flat_set<std::string> existingNames;
+  for (const auto& overlay : seg.auxOverlays) {
+    if (overlay.kind() == VectorIndexBuilder::KIND) {
+      existingNames.emplace(overlay.name());
+    }
+  }
+
+  VectorIndexBuilder::SegInput input{seg.segId, &postingsReader};
+  for (const auto& overlayName : overlayNames) {
+    if (existingNames.contains(overlayName)) {
+      continue;
+    }
+
+    uint64_t overlayGen = nextVectorOverlayGen(seg, overlayName);
+    VectorIndexBuilder vb(dir, std::span<const VectorIndexBuilder::SegInput>(&input, 1),
+                          schema, overlayGen);
+    std::vector<std::string> oneSelector{overlayName};
+    auto newlyBuilt = vb.build(oneSelector, existingNames, outFiles, buildSite);
+    for (auto& info : newlyBuilt) {
+      existingNames.emplace(info.name());
+      built.push_back(std::move(info));
+    }
+  }
+  return built;
+}
+
+void IndexWriter::deleteStagedOverlayFiles(std::span<const std::string> files,
+                                           std::string_view context) noexcept {
+  for (const auto& file : files) {
+    try {
+      dir.deleteFile(file);
+    } catch (const std::exception& e) {
+      LOG_ERROR("Failed to delete staged vector overlay file {} after {}: {}",
+                file, context, e.what());
+    } catch (...) {
+      LOG_ERROR("Failed to delete staged vector overlay file {} after {}: unknown exception",
+                file, context);
+    }
+  }
+}
+
 void IndexWriter::buildSegmentOverlays(const UpdateMessage& msg,
                                        std::span<SegInfo*> segsToKeep,
                                        std::vector<std::string>& outFilesToSync) {
+  assert(msg.commitInfo && msg.commitInfo->indexGen > 0);
+
+  std::vector<std::string> vectorSelectors = collectVectorSelectors(msg.buildAuxIndexes);
+  std::shared_ptr<Schema> schema;
+  std::vector<std::string> stagedActiveOverlayNames;
+  if (!vectorSelectors.empty() && schemaProvider_) {
+    schema = schemaProvider_();
+    if (schema) {
+      stagedActiveOverlayNames = collectValidatedExactVectorOverlayNames(msg.buildAuxIndexes, *schema);
+    }
+  }
+
   if (segsToKeep.empty()) {
+    activateVectorOverlayNames(stagedActiveOverlayNames);
     return;
   }
-  assert(msg.commitInfo && msg.commitInfo->indexGen > 0);
 
   auto selectorMatches = [](const std::vector<std::string>& selectors, std::string_view name) {
     for (const auto& s : selectors) {
@@ -911,105 +1106,93 @@ void IndexWriter::buildSegmentOverlays(const UpdateMessage& msg,
     return false;
   };
 
-  if (selectorMatches(msg.buildAuxIndexes, TestOverlayAuxReader::NAME)) {
-    for (size_t i = 0; i < segsToKeep.size(); i++) {
-      auto* seg = segsToKeep[i];
-      bool exists = false;
-      for (const auto& overlay : seg->auxOverlays) {
-        if (overlay.kind() == TestOverlayAuxReader::KIND
-            && overlay.name() == TestOverlayAuxReader::NAME) {
-          exists = true;
-          break;
+  struct StagedOverlay {
+    SegInfo* seg;
+    proto::AuxIndexInfo info;
+  };
+  std::vector<StagedOverlay> stagedOverlays;
+  std::vector<std::string> stagedFiles;
+
+  try {
+    if (selectorMatches(msg.buildAuxIndexes, TestOverlayAuxReader::NAME)) {
+      for (size_t i = 0; i < segsToKeep.size(); i++) {
+        auto* seg = segsToKeep[i];
+        bool exists = false;
+        for (const auto& overlay : seg->auxOverlays) {
+          if (overlay.kind() == TestOverlayAuxReader::KIND
+              && overlay.name() == TestOverlayAuxReader::NAME) {
+            exists = true;
+            break;
+          }
+        }
+        if (exists) continue;
+
+        std::string fileName = Postings::getSegmentOverlayFileName(
+          seg->segId, TestOverlayAuxReader::NAME, msg.commitInfo->indexGen, 0);
+        {
+          auto file = dir.createFile(fileName);
+          OutputStream os;
+          os.setFile(&*file);
+          static constexpr std::string_view payload = "solux test overlay\n";
+          os.write(payload.data(), payload.size());
+          os.close();
+          dir.finishFile(*file);
+        }
+        stagedFiles.push_back(fileName);
+
+        proto::AuxIndexInfo info;
+        info.set_kind(std::string(TestOverlayAuxReader::KIND));
+        info.set_name(std::string(TestOverlayAuxReader::NAME));
+        info.set_gen(msg.commitInfo->indexGen);
+        info.add_files(fileName);
+        info.set_opaque_meta("test");
+        stagedOverlays.push_back({seg, std::move(info)});
+      }
+    }
+
+    if (!vectorSelectors.empty() && schema) {
+      for (size_t i = 0; i < segsToKeep.size(); i++) {
+        auto* seg = segsToKeep[i];
+        auto pr = getSegmentPostingsReader(*seg);
+        VectorIndexBuilder::SegInput input{seg->segId, pr.get()};
+        VectorIndexBuilder matcher(dir, std::span<const VectorIndexBuilder::SegInput>(&input, 1),
+                                   *schema, 0);
+        auto overlayNames = matcher.matchingOverlayNames(vectorSelectors);
+        stagedActiveOverlayNames.insert(stagedActiveOverlayNames.end(),
+                                        overlayNames.begin(), overlayNames.end());
+        auto built = buildConcreteVectorOverlays(*seg, *pr, overlayNames, *schema,
+                                                 VectorIndexBuilder::BuildSite::COMMIT, stagedFiles);
+        for (auto& info : built) {
+          stagedOverlays.push_back({seg, std::move(info)});
         }
       }
-      if (exists) continue;
-
-      std::string fileName = Postings::getSegmentOverlayFileName(
-        seg->segId, TestOverlayAuxReader::NAME, msg.commitInfo->indexGen, 0);
-      {
-        auto file = dir.createFile(fileName);
-        OutputStream os;
-        os.setFile(&*file);
-        static constexpr std::string_view payload = "solux test overlay\n";
-        os.write(payload.data(), payload.size());
-        os.close();
-        dir.finishFile(*file);
-      }
-      outFilesToSync.push_back(fileName);
-
-      proto::AuxIndexInfo info;
-      info.set_kind(std::string(TestOverlayAuxReader::KIND));
-      info.set_name(std::string(TestOverlayAuxReader::NAME));
-      info.set_gen(msg.commitInfo->indexGen);
-      info.add_files(fileName);
-      info.set_opaque_meta("test");
-      seg->auxOverlays.push_back(std::move(info));
     }
+  } catch (...) {
+    deleteStagedOverlayFiles(stagedFiles, "segment overlay build failure");
+    throw;
   }
 
-  std::vector<std::string> vectorSelectors;
-  boost::unordered_flat_set<std::string> seenVectorSelectors;
-  for (const auto& selector : msg.buildAuxIndexes) {
-    if (selector == "*" || selector.starts_with(VectorIndexBuilder::NAME_PREFIX)) {
-      if (seenVectorSelectors.emplace(selector).second) {
-        vectorSelectors.push_back(selector);
-      }
-    }
+  for (auto& file : stagedFiles) {
+    outFilesToSync.push_back(file);
   }
-
-  if (vectorSelectors.empty() && msg.inferVectorSelectors) {
-    for (const auto& overlay : currentSegmentOverlays_) {
-      if (overlay.kind() != VectorIndexBuilder::KIND) continue;
-      if (seenVectorSelectors.emplace(overlay.name()).second) {
-        vectorSelectors.emplace_back(overlay.name());
-      }
+  activateVectorOverlayNames(stagedActiveOverlayNames);
+  for (auto& staged : stagedOverlays) {
+    for (const auto& file : staged.info.files()) {
+      staged.seg->unsyncedFiles.push_back(file);
     }
-  }
-
-  if (vectorSelectors.empty() || !schemaProvider_) {
-    return;
-  }
-  auto schema = schemaProvider_();
-  if (!schema) {
-    return;
-  }
-
-  std::vector<std::shared_ptr<PostingsReader>> prHolders;
-  prHolders.reserve(segsToKeep.size());
-  for (size_t i = 0; i < segsToKeep.size(); i++) {
-    auto* seg = segsToKeep[i];
-    boost::unordered_flat_set<std::string> skipNames;
-    for (const auto& overlay : seg->auxOverlays) {
-      if (overlay.kind() == VectorIndexBuilder::KIND) {
-        skipNames.emplace(overlay.name());
-      }
-    }
-
-    auto pr = seg->sharedPostingsReader.load();
-    if (!pr) {
-      pr = std::make_shared<PostingsReader>(dir, seg->segId);
-      seg->sharedPostingsReader.store(pr);
-    }
-    VectorIndexBuilder::SegInput input{seg->segId, pr.get()};
-    prHolders.push_back(pr);
-
-    VectorIndexBuilder vb(dir, std::span<const VectorIndexBuilder::SegInput>(&input, 1),
-                          *schema, msg.commitInfo->indexGen, msg.commitInfo->coreGen);
-    auto newlyBuilt = vb.build(vectorSelectors, skipNames, outFilesToSync);
-    for (auto& info : newlyBuilt) {
-      seg->auxOverlays.push_back(std::move(info));
-    }
+    staged.seg->auxOverlays.push_back(std::move(staged.info));
   }
 }
 
-std::vector<proto::AuxIndexInfo> IndexWriter::flattenSegmentOverlays(std::span<SegInfo*> segs) const {
-  std::vector<proto::AuxIndexInfo> out;
+std::vector<IndexWriter::PublishedOverlay>
+IndexWriter::flattenSegmentOverlays(std::span<SegInfo*> segs) const {
+  std::vector<PublishedOverlay> out;
   size_t total = 0;
   for (auto* seg : segs) total += seg->auxOverlays.size();
   out.reserve(total);
   for (auto* seg : segs) {
     for (const auto& overlay : seg->auxOverlays) {
-      out.push_back(overlay);
+      out.push_back({seg->segId, overlay});
     }
   }
   return out;
@@ -1020,6 +1203,24 @@ std::vector<proto::AuxIndexInfo> IndexWriter::flattenSegmentOverlays(std::span<S
 // entries appear in both lists, so their files survive.  Files written by a
 // rebuild for a given name supersede files from the previous build of the same
 // name and the old ones get cleaned up here.
+// PublishedOverlay variant: same semantics, keyed file sets come from .info.
+void IndexWriter::deleteOrphanedAuxFiles(const std::vector<PublishedOverlay>& oldList,
+                                         const std::vector<PublishedOverlay>& newList) {
+  boost::unordered_flat_set<std::string> keep;
+  for (const auto& published : newList) {
+    for (const auto& f : published.info.files()) keep.emplace(f);
+  }
+  for (const auto& published : oldList) {
+    for (const auto& f : published.info.files()) {
+      std::string fname(f);
+      if (!keep.contains(fname)) {
+        INDEX_DEBUG("deleteOrphanedAuxFiles: deleting {}", fname);
+        dir.deleteFile(fname);
+      }
+    }
+  }
+}
+
 void IndexWriter::deleteOrphanedAuxFiles(const std::vector<proto::AuxIndexInfo>& oldList,
                                          const std::vector<proto::AuxIndexInfo>& newList) {
   boost::unordered_flat_set<std::string> keep;
@@ -1294,46 +1495,110 @@ void IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
       preaderPtrs.push_back(preader.get());
     }
 
-    PostingsWriter pwriter(dir, ++lastSegId);
+    uint64_t outputSegId = ++lastSegId;
+    bool outputPublished = false;
+    try {
+      PostingsWriter pwriter(dir, outputSegId);
 
-    // Do the actual merge.
-    // TODO: catch any errors and restore state / clean up.
-    SegmentMerger merger(preaderPtrs, liveDocsPtrs, pwriter);
-    merger.merge();
+      // Do the actual merge.
+      SegmentMerger merger(preaderPtrs, liveDocsPtrs, pwriter);
+      merger.merge();
 
-    // Create the new SegInfo for the output segment.
-    auto newSegInfo = std::make_unique<SegInfo>(pwriter.getSegId(), pwriter.getMaxDoc());
-    newSegInfo->schemaGen = currentSchemaGen();
-    pwriter.finish(&newSegInfo->unsyncedFiles);
+      // Create the new SegInfo for the output segment.
+      auto newSegInfo = std::make_unique<SegInfo>(pwriter.getSegId(), pwriter.getMaxDoc());
+      newSegInfo->schemaGen = currentSchemaGen();
+      pwriter.finish(&newSegInfo->unsyncedFiles);
 
-    // Move old segments to the delete list and add the new segment info.
-    std::vector<std::unique_ptr<SegInfo>> toDeleteSegs;
-    {
-      const std::lock_guard<std::mutex> lock(indexMutex);
-      for (auto segInfo : segs) {
-        segInfo->merging = false; // mark as no longer merging so it can be removed.
-        segInfo->mergedIntoSegId = newSegInfo->segId; // mark the segment as merged into the new segment
+      auto activeOverlayNames = snapshotActiveVectorOverlayNames();
+      if (!activeOverlayNames.empty() && schemaProvider_) {
+        auto schema = schemaProvider_();
+        if (schema) {
+          // The merged segment is private until the swap below.  Building here
+          // avoids reading live source overlays and publishes segment plus
+          // overlay entries atomically at the later commit.
+          auto pr = getSegmentPostingsReader(*newSegInfo);
+          #ifndef NDEBUG
+          {
+            std::lock_guard<std::mutex> lock(indexMutex);
+            assert(!segInfos.contains(newSegInfo->segId));
+          }
+          #endif
+          std::vector<std::string> stagedOverlayFiles;
+          try {
+            auto built = buildConcreteVectorOverlays(*newSegInfo, *pr, activeOverlayNames,
+                                                     *schema, VectorIndexBuilder::BuildSite::MERGE,
+                                                     stagedOverlayFiles);
+            for (auto& file : stagedOverlayFiles) {
+              newSegInfo->unsyncedFiles.push_back(file);
+            }
+            for (auto& info : built) {
+              newSegInfo->auxOverlays.push_back(std::move(info));
+            }
+          } catch (const std::exception& e) {
+            deleteStagedOverlayFiles(stagedOverlayFiles, "merge vector overlay build failure");
+            LOG_ERROR("Merge vector overlay build failed for seg={}; publishing flat fallback: {}",
+                      newSegInfo->segId, e.what());
+          } catch (...) {
+            deleteStagedOverlayFiles(stagedOverlayFiles, "merge vector overlay build failure");
+            LOG_ERROR("Merge vector overlay build failed for seg={}; publishing flat fallback: unknown exception",
+                      newSegInfo->segId);
+          }
+        }
+      }
 
-        // If the segment had personal deletes, we need to *copy* them to the new segment.
-        // The commit code could be in the process of applying deletes to this segment
-        // so we don't want to move them.
-        // The new segment isn't in the segInfos map yet, so this guarantees that
-        // The deletes will be applied before the new segment is used in a commit.
-        if (!segInfo->personalDeletes.empty()) {
-          INDEX_DEBUG("Will merge personal deletes from {} to {}", *segInfo, *newSegInfo);
-          newSegInfo->personalDeletes.append_range(segInfo->personalDeletes);
+      // Move old segments to the delete list and add the new segment info.
+      {
+        const std::lock_guard<std::mutex> lock(indexMutex);
+        for (auto segInfo : segs) {
+          segInfo->merging = false; // mark as no longer merging so it can be removed.
+          segInfo->mergedIntoSegId = newSegInfo->segId; // mark the segment as merged into the new segment
+
+          // If the segment had personal deletes, we need to *copy* them to the new segment.
+          // The commit code could be in the process of applying deletes to this segment
+          // so we don't want to move them.
+          // The new segment isn't in the segInfos map yet, so this guarantees that
+          // The deletes will be applied before the new segment is used in a commit.
+          if (!segInfo->personalDeletes.empty()) {
+            INDEX_DEBUG("Will merge personal deletes from {} to {}", *segInfo, *newSegInfo);
+            newSegInfo->personalDeletes.append_range(segInfo->personalDeletes);
+          }
+
+          // remove from the index: move from segInfos to segmentsToDelete
+          moveSegmentToDelete(segInfo->segId);
         }
 
-        // remove from the index: move from segInfos to segmentsToDelete
-        moveSegmentToDelete(segInfo->segId);
+        // add new segInfo to the index if it has any docs.  Mutations to the
+        // private auxOverlays and unsyncedFiles above happen before this
+        // mutex-protected transfer, so the commit thread observes them after
+        // taking indexMutex.
+        if (newSegInfo->liveDocs > 0) {
+          mergePolicy->_update(newSegInfo.get());
+          segInfos.emplace(pwriter.getSegId(), std::move(newSegInfo));
+          outputPublished = true;
+        }
+      } // end index lock
+    } catch (...) {
+      // TODO: merge state is NOT restored on failure - only file cleanup
+      // happens here.  mergeRunning stays true, waitingForMerges members keep
+      // their leftToFlush bump (wait_for_merges commits hang), and source
+      // segments stay merging=true.  The eventual fix is containment: run the
+      // normal teardown tail instead of rethrowing (the contained
+      // overlay-build catch and the segs.empty() path show the shape).
+      if (!outputPublished) {
+        try {
+          dir.deletePrefix(Postings::getIndexFileNamePrefix(outputSegId));
+        } catch (...) {
+          // Swallow: don't mask the original exception with a cleanup failure.
+          LOG_ERROR("Failed to delete merged segment files for segId={} after merge failure",
+                    outputSegId);
+        }
       }
+      throw;
+    }
 
-      // add new segInfo to the index if it has any docs.
-      if (newSegInfo->liveDocs > 0) {
-        mergePolicy->_update(newSegInfo.get());
-        segInfos.emplace(pwriter.getSegId(), std::move(newSegInfo));
-      }
-    } // end index lock
+    if (!outputPublished) {
+      dir.deletePrefix(Postings::getIndexFileNamePrefix(outputSegId));
+    }
 
     // This races with the commit code (see comments in finishCommitBody()).
     // tryDeleteSegments(); // try to delete segments that are now empty
@@ -1407,7 +1672,6 @@ void IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
 
     CommitMessage* commitMessage = new CommitMessage();
     commitMessage->commit = UpdateMessage::COMMIT;
-    commitMessage->inferVectorSelectors = true;  // merged segment gets its overlay
     commitMessage->origMessage = &msg;
     INDEX_DEBUG("mergeSegmentsBody: requesting commit. msg={}", (void*)commitMessage);
     this->submitUpdate(commitMessage);
@@ -1539,6 +1803,7 @@ void IndexWriter::testDeleteAllData() {
     lastCommittedSegIds.clear();
     currentAuxIndexes_.clear();
     currentSegmentOverlays_.clear();
+    activeVectorOverlayNames.clear();
     nextCommitInfo = std::make_unique<CommitInfo>();
 
     lastCommitTime = lastAdvertisedCommitTime = 0;
@@ -1574,8 +1839,22 @@ bool IndexWriter::testDropSegmentOverlay(std::string_view name, size_t segmentOr
     return info.name() == name;
   });
   if (overlays.size() == oldSize) return false;
-  currentSegmentOverlays_ = flattenSegmentOverlays(std::span<SegInfo*>(ordered.data(), ordered.size()));
   return true;
+}
+
+bool IndexWriter::testActiveVectorOverlayName(std::string_view name) {
+  std::lock_guard<std::mutex> lock(indexMutex);
+  return activeVectorOverlayNames.contains(std::string(name));
+}
+
+void IndexWriter::testReseedActiveVectorOverlayNamesFromManifest() {
+  std::lock_guard<std::mutex> lock(indexMutex);
+  seedActiveVectorOverlayNamesFromManifestLocked();
+}
+
+bool IndexWriter::testMergeRunning() {
+  std::lock_guard<std::mutex> lock(indexMutex);
+  return mergePolicy && mergePolicy->mergeRunning;
 }
 
 // TEST CODE
