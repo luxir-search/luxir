@@ -114,23 +114,14 @@ protected:
     }
   };
 
-  struct FaissFlatAuxGuard {
-    explicit FaissFlatAuxGuard() {
-      VectorIndexBuilder::buildFaissFlatAuxIndexes = true;
-    }
-    ~FaissFlatAuxGuard() {
-      VectorIndexBuilder::buildFaissFlatAuxIndexes = false;
-    }
-  };
-
   struct IvfPqAuxGuard {
-    bool savedFlat;
     bool savedIvfPq;
     int32_t savedNList;
     int32_t savedM;
     int32_t savedBits;
     int32_t savedNProbe;
     int64_t savedMinTraining;
+    int64_t savedBuildThreshold;
     int32_t savedRefineCount;
     int32_t savedRefineRatio;
 
@@ -140,34 +131,34 @@ protected:
     // refine_candidates (an absolute pool size) anyway.
     IvfPqAuxGuard(int32_t nlist, int32_t m, int32_t bits,
                   int32_t nprobe, int64_t minTraining, int32_t refineRatio)
-      : savedFlat(VectorIndexBuilder::buildFaissFlatAuxIndexes),
-        savedIvfPq(VectorIndexBuilder::buildFaissIvfPqAuxIndexes),
+      : savedIvfPq(VectorIndexBuilder::buildFaissIvfPqAuxIndexes),
         savedNList(VectorIndexBuilder::ivfPqNList),
         savedM(VectorIndexBuilder::ivfPqM),
         savedBits(VectorIndexBuilder::ivfPqBits),
         savedNProbe(VectorIndexBuilder::ivfPqDefaultNProbe),
         savedMinTraining(VectorIndexBuilder::ivfPqMinTrainingVectors),
+        savedBuildThreshold(VectorIndexBuilder::ivfPqBuildThresholdScanCost),
         savedRefineCount(KnnQuery::defaultAnnRefineCount),
         savedRefineRatio(KnnQuery::defaultAnnRefineRatio) {
-      VectorIndexBuilder::buildFaissFlatAuxIndexes = false;
       VectorIndexBuilder::buildFaissIvfPqAuxIndexes = true;
       VectorIndexBuilder::ivfPqNList = nlist;
       VectorIndexBuilder::ivfPqM = m;
       VectorIndexBuilder::ivfPqBits = bits;
       VectorIndexBuilder::ivfPqDefaultNProbe = nprobe;
       VectorIndexBuilder::ivfPqMinTrainingVectors = minTraining;
+      VectorIndexBuilder::ivfPqBuildThresholdScanCost = 0;
       KnnQuery::defaultAnnRefineCount = 0;
       KnnQuery::defaultAnnRefineRatio = refineRatio;
     }
 
     ~IvfPqAuxGuard() {
-      VectorIndexBuilder::buildFaissFlatAuxIndexes = savedFlat;
       VectorIndexBuilder::buildFaissIvfPqAuxIndexes = savedIvfPq;
       VectorIndexBuilder::ivfPqNList = savedNList;
       VectorIndexBuilder::ivfPqM = savedM;
       VectorIndexBuilder::ivfPqBits = savedBits;
       VectorIndexBuilder::ivfPqDefaultNProbe = savedNProbe;
       VectorIndexBuilder::ivfPqMinTrainingVectors = savedMinTraining;
+      VectorIndexBuilder::ivfPqBuildThresholdScanCost = savedBuildThreshold;
       KnnQuery::defaultAnnRefineCount = savedRefineCount;
       KnnQuery::defaultAnnRefineRatio = savedRefineRatio;
     }
@@ -1109,6 +1100,87 @@ TEST_F(KnnQueryTest, exactBypassesApproximateIndex) {
   req->done();
 }
 
+TEST_F(KnnQueryTest, mixedIndexedAndBelowThresholdCompositionMatchesExact) {
+  IvfPqAuxGuard guard(/*nlist=*/2, /*m=*/1, /*bits=*/1,
+                      /*nprobe=*/2, /*minTraining=*/2, /*refineRatio=*/64);
+  CollectionHelper h("main");
+  h.clear();
+  installVecSchema(h.collection(), proto::VectorParams::L2);
+
+  for (int i = 0; i < 80; i++) {
+    h.index(flatdoc("id", "big" + std::to_string(i),
+                    "embedding_v", std::vector<float>{(float)i, 0.0f, 0.0f, 0.0f}));
+  }
+  h.commit({"*"});
+
+  VectorIndexBuilder::ivfPqBuildThresholdScanCost = 1000;
+  h.index(flatdoc("id", std::string("tiny0"),
+                  "embedding_v", std::vector<float>{100.0f, 0.0f, 0.0f, 0.0f}));
+  h.index(flatdoc("id", std::string("tiny1"),
+                  "embedding_v", std::vector<float>{101.0f, 0.0f, 0.0f, 0.0f}));
+  h.commit();
+
+  auto* approx = makeKnnReq(*soluxNode, "embedding_v", {101, 0, 0, 0}, 5,
+                            /*nprobe=*/2, /*refineCandidates=*/200);
+  approx->execute();
+  auto approxIds = resultIds(*approx);
+  approx->done();
+
+  auto* exact = makeKnnReq(*soluxNode, "embedding_v", {101, 0, 0, 0}, 5,
+                           /*nprobe=*/2, /*refineCandidates=*/200, /*exact=*/true);
+  exact->execute();
+  auto exactIds = resultIds(*exact);
+  exact->done();
+
+  ASSERT_EQ(exactIds.size(), 5u);
+  EXPECT_EQ(exactIds[0], "tiny1");
+  EXPECT_EQ(exactIds[1], "tiny0");
+  EXPECT_EQ(approxIds, exactIds);
+}
+
+TEST_F(KnnQueryTest, perSegmentExactBypassesApproximateMiss) {
+  IvfPqAuxGuard guard(/*nlist=*/2, /*m=*/2, /*bits=*/2,
+                      /*nprobe=*/1, /*minTraining=*/16, /*refineRatio=*/8);
+  CollectionHelper h("main");
+  h.clear();
+  installVecSchema(h.collection(), proto::VectorParams::L2);
+
+  for (int i = 0; i < 80; i++) {
+    float off = (float)i * 0.01f;
+    h.index(flatdoc("id", "a" + std::to_string(i),
+                    "embedding_v", std::vector<float>{off, 0.0f, 0.0f, 0.0f}));
+    h.index(flatdoc("id", "b" + std::to_string(i),
+                    "embedding_v", std::vector<float>{1000.0f + off, 0.0f, 0.0f, 0.0f}));
+  }
+  h.index(flatdoc("id", std::string("outlier"),
+                  "embedding_v", std::vector<float>{600.0f, 0.0f, 0.0f, 0.0f}));
+  h.commit({"*"});
+
+  for (int i = 0; i < 160; i++) {
+    h.index(flatdoc("id", "far" + std::to_string(i),
+                    "embedding_v", std::vector<float>{2000.0f + (float)i, 0.0f, 0.0f, 0.0f}));
+  }
+  h.commit();
+
+  auto* approx = makeKnnReq(*soluxNode, "embedding_v", {400, 0, 0, 0}, 5,
+                            /*nprobe=*/1, /*refineCandidates=*/40);
+  approx->execute();
+  auto approxIds = resultIds(*approx);
+  approx->done();
+  ASSERT_EQ(approxIds.size(), 5u);
+  for (const auto& id : approxIds) {
+    EXPECT_NE(id, "outlier") << "segment-local nprobe=1 should miss the outlier list";
+  }
+
+  auto* exact = makeKnnReq(*soluxNode, "embedding_v", {400, 0, 0, 0}, 5,
+                           /*nprobe=*/1, /*refineCandidates=*/40, /*exact=*/true);
+  exact->execute();
+  auto exactIds = resultIds(*exact);
+  exact->done();
+  ASSERT_EQ(exactIds.size(), 5u);
+  EXPECT_EQ(exactIds[0], "outlier");
+}
+
 // The maxKnnCandidates host cap is a heuristic; exact is a contract and must
 // not be silently truncated by it.  Without exact, the same capped request
 // returns only cap docs.
@@ -1443,7 +1515,6 @@ TEST_F(KnnQueryTest, l2Scores) {
 // breadths.  Collapsing an unsorted pool would score x at 0.1 and rank it
 // last instead of third.
 TEST_F(KnnQueryTest, breadthRoundsKeepCandidatePoolSorted) {
-  FaissFlatAuxGuard auxGuard;
   EngineWrapperGuard guard([](VectorEngine& flat, int64_t ntotal) {
     return std::make_unique<BreadthSplitEngine>(flat, ntotal, 7);
   });
@@ -1498,7 +1569,6 @@ TEST_F(KnnQueryTest, breadthRoundsKeepCandidatePoolSorted) {
 // from the full-precision column, sort, then collapse.  Without the rescore
 // the inverted order collapses to the wrong docs (a, d, c) at bucket scores.
 TEST_F(KnnQueryTest, approximateScoresRescoredFromColumn) {
-  FaissFlatAuxGuard auxGuard;
   EngineWrapperGuard guard([](VectorEngine& flat, int64_t) {
     return std::make_unique<QuantizingEngine>(flat);
   });
@@ -1540,7 +1610,6 @@ TEST_F(KnnQueryTest, approximateScoresRescoredFromColumn) {
 // rescore; correct cosine order AND scores prove the raw-column normalization
 // ran (without it, rescore would return raw dot products like 5.0).
 TEST_F(KnnQueryTest, cosineRawColumnRescoreNormalizes) {
-  FaissFlatAuxGuard auxGuard;
   EngineWrapperGuard guard([](VectorEngine& flat, int64_t) {
     return std::make_unique<QuantizingEngine>(flat);
   });

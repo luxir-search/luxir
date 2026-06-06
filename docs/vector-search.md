@@ -1,37 +1,60 @@
 # Vector Search
 
-Solux stores vector fields in the normal column store and can also build one
-FAISS aux index per searchable vector field. The column is always the source of
-truth. It supports exact flat KNN, doc collapse for multi-valued vector fields,
-liveDocs filtering, and full-precision rescoring.
+Solux stores vector fields in the normal column store and can also build
+per-segment FAISS aux indexes for searchable vector fields. The column is
+always the source of truth. It supports exact flat KNN, doc collapse for
+multi-valued vector fields, liveDocs filtering, and full-precision rescoring.
 
 ## Indexing
 
-Vector aux indexes are built during commit when `build_aux_indexes` selects a
-vector field or `"*"`. A normal aux build attempts IVF+PQ when the field has
-enough vectors to train the coarse centroids and PQ codebooks. Small fields stay
-on the flat-over-column path because exact scan is cheap and low-sample PQ
-training is poor.
+Vector aux indexes are recorded as segment overlays in the index-level
+`s.olux` file. Each segment's `SegmentInfo` can carry `AuxIndexInfo` entries
+whose vector kind is `vector_faiss` and whose opaque metadata is
+`VectorAuxMeta`.
 
-The IVF+PQ training set is a strided sample across the shard's vector values,
-not a prefix sample. This avoids training only on the oldest segment data when
-the corpus is time ordered. The builder normalizes vectors for FAISS when the
-field uses cosine and the stored column is raw.
+A vector aux build is introduced during commit when `build_aux_indexes`
+selects a vector field or `"*"`. After a segment has a vector overlay, that
+overlay follows the segment by liveness: later commits carry it forward without
+checking the shard core generation. New above-threshold segments that lack an
+overlay for an already-built vector field get their own overlay during the
+commit pipeline. Delete-only commits keep existing overlays; deleted-document
+vectors remain in FAISS and are filtered at query time.
 
-Aux indexes are invalidated when the segment composition changes. The current
-MVP rebuilds the whole shard-level aux index on the next selected commit.
+Build policy is per segment and size based. IVF+PQ is attempted only when the
+segment has enough vectors to satisfy the training floor and enough
+`N * dims` scan cost to justify an ANN index. Segments below either threshold
+stay on the flat-over-column path. This mixed composition is normal: a query
+can use FAISS for large segments and exact column scan for small segments.
+
+The IVF+PQ training set is a strided sample across the segment's vector values,
+not a prefix sample. This avoids training only on the oldest values when data
+inside a segment is time ordered. The builder normalizes vectors for FAISS when
+the field uses cosine and the stored column is raw.
+
+Merges drop overlays for merged-away segments. The merged segment is treated as
+a new segment and gets a fresh overlay during the merge's commit when it passes
+the same thresholds. Rebuilding with new options does not require reindexing
+documents: drop the segment overlay entry and run a selected commit to rebuild
+from the stored vector column.
 
 ## Querying
 
-`KnnQuery` uses the aux engine when a matching `vec.<field>` aux reader is
-available. Otherwise it scans the vector column exactly.
+`KnnQuery` creates one vector engine per segment. A segment uses its
+`vec.<field>` FAISS overlay when present, or scans the vector column exactly
+when no overlay exists. FAISS ids are segment-local vector value ranks, so the
+query path maps each returned value rank back through that segment's vector
+column metadata before liveDocs, filters, scoring, and multi-valued collapse.
 
-`nprobe` sets the exact number of IVF lists probed (clamped to the index's
-list count) - every search round probes exactly that many, no more and no
-fewer. It is a latency control: an explicit `nprobe` combined with a
-selective filter can return fewer than `k` documents. Breadth auto-deepening
-applies only when `nprobe` is `0`: the search starts at the index default and
-the host widens it when filters or doc collapse leave too few live documents.
+IndexReader opens and pins overlay files eagerly when it opens an index
+version, so cleanup can unlink old files without breaking existing readers.
+The FAISS index bytes are decoded lazily on first kNN use and then cached on
+the segment reader.
+
+`nprobe` currently applies per segment and is clamped to each segment's list
+count. When `nprobe` is `0`, each segment starts from its own default breadth.
+Breadth auto-deepening can widen segments when filters or doc collapse leave
+too few live documents. This is an interim per-segment policy; a future total
+effort knob will allocate breadth globally.
 
 Probed lists are always scanned in full. Entries within an IVF list are stored
 in insertion order, not relevance order, so a partial list scan would drop
@@ -51,6 +74,11 @@ near-tied tail does not benefit from extra overfetch, so the pool stays
 proportionate instead of exploding. Candidates are unioned across deepen
 rounds, rescanned from the full-precision column, sorted by exact score, and
 collapsed to one hit per document.
+
+With per-segment indexes, candidate depth is distributed by segment size for
+now: each segment receives a proportional share of the requested candidate
+pool, floored at `min(k, segment_vector_count)`. A future allocator will own
+global candidate and breadth budgeting.
 
 `exact` requires exact (true top-k) results. It is a result contract, not an
 execution mode: the engine uses a path that guarantees exactness - currently
@@ -77,11 +105,11 @@ at query time instead.
 
 ## Recall Semantics
 
-IVF+PQ is approximate. Higher `nprobe` and higher `refine_factor` generally
+IVF+PQ is approximate. Higher `nprobe` and higher `refine_candidates` generally
 increase recall and latency. Setting `nprobe` to the full `nlist` and using a
-large enough `refine_factor` makes the aux search exhaustive over IVF lists, but
-PQ ordering still only decides which candidates are returned before column
-rescore. For exact results, rely on the flat-over-column path.
+large enough candidate pool makes the aux search exhaustive over IVF lists, but
+PQ ordering still decides which candidates are returned before column rescore.
+For exact results, use the `exact` flag.
 
 Similarity scores are model-relative: the score distribution depends on the
 embedding model and corpus, so thresholds and "good score" intuitions must be
@@ -89,16 +117,13 @@ calibrated per deployment, not carried between models.
 
 ## Current Limitations
 
-- The ANN index is shard-level and is fully rebuilt when segment composition
-  changes (a commit that adds or merges segments rebuilds the index).
-  Per-segment indexes with incremental reuse are planned.
 - IVF+PQ is the only ANN index type. No HNSW yet.
 - Filters are always applied inside the vector search. There is no cost-based
   choice yet between filtered ANN search and exact search over the filtered
   set, and no automatic exact fallback when a selective filter starves the
   ANN search.
-- The ANN index is loaded fully into memory at open. The vector column itself
+- FAISS indexes are decoded into memory on first use. The vector column itself
   is mmapped.
-- Default IVF tuning parameters (nlist, nprobe, refine) have not yet been
-  validated against recall benchmarks; treat them as reasonable starting
-  points, not tuned guarantees.
+- Per-segment `nprobe` and candidate distribution are interim policies. They
+  preserve the current API but do not pin total work across different segment
+  counts.

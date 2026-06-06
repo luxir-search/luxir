@@ -1,5 +1,7 @@
 #pragma once
+#include <memory>
 #include <span>
+#include <vector>
 
 #include "DocSet.h"
 #include "OrdMap.h"
@@ -62,6 +64,7 @@ public:
   class Segment {
     const std::shared_ptr<PostingsReader> sharedPostingsReader;
     const std::shared_ptr<LiveDocs> sharedLiveDocs;
+    const std::vector<std::shared_ptr<AuxReader>> sharedAuxReaders;
   public:
     friend class IndexReader;
 
@@ -80,8 +83,10 @@ public:
     const int32_t ord;            // index of this segment in the list of segments
 
     Segment(std::shared_ptr<PostingsReader>&& postingsReader, std::shared_ptr<LiveDocs>&& liveDocs,
+              std::vector<std::shared_ptr<AuxReader>>&& auxReaders,
               SegmentInfo segInfo, int64_t base, int ord)
             :  sharedPostingsReader(std::move(postingsReader)), sharedLiveDocs(std::move(liveDocs)),
+                sharedAuxReaders(std::move(auxReaders)),
                 segInfo(segInfo), base(base), ord(ord) {
     }
 
@@ -92,6 +97,17 @@ public:
     // returns null if all docs are live (no deletes)
     LiveDocs* liveDocs() const noexcept {
       return sharedLiveDocs.get();
+    }
+
+    std::span<const std::shared_ptr<AuxReader>> auxReaders() const noexcept {
+      return sharedAuxReaders;
+    }
+
+    std::shared_ptr<AuxReader> getAuxReader(std::string_view name) const {
+      for (const auto& r : sharedAuxReaders) {
+        if (r->getName() == name) return r;
+      }
+      return nullptr;
     }
 
     int32_t maxDoc() const noexcept {

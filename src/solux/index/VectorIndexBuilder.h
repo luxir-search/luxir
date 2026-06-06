@@ -14,26 +14,23 @@
 
 namespace solux {
 
-/// Builds FAISS aux indexes for vector fields across a snapshot of segments.
+/// Builds FAISS aux indexes for vector fields in one segment.
 ///
-/// Flat kNN is served directly from the vector column.  Normal aux builds now
-/// produce an IVF+PQ ANN index when enough vectors are present; the old
-/// FAISS-flat build remains as an explicit test / A-B benchmark hook.
+/// Flat kNN is served directly from the vector column.  Aux builds produce an
+/// IVF+PQ ANN index when enough vectors are present and the segment is large
+/// enough to be worth indexing.
 ///
-/// One index per (eligible) vector field, written under a single filename
-/// produced by Postings::getAuxIndexFileName.  The "name" used in filenames +
-/// AuxIndexInfo is "vec.<fieldName>" (e.g. "vec.title_v").
+/// One index per (eligible) vector field per segment, written under a single
+/// filename produced by Postings::getAuxIndexFileName.  The "name" recorded in
+/// the segment overlay is "vec.<fieldName>" (e.g. "vec.title_v").
 ///
 /// Eligibility: a field is eligible if the schema's resolved FieldType is a
 /// VectorFieldType with metric != METRIC_NONE.  Per-segment dims must agree
 /// (or be inferred consistently); a mismatch throws.
 ///
-/// FAISS-id -> (segment, valueRank) is *not* persisted: every value in the
-/// vector column of every segment in `segments` (in the order given) is added
-/// to FAISS, so at query time the mapping can be derived from each segment's
-/// numValues.  Vector columns include rows for deleted docs (deletes are
-/// tracked via liveDocs separately), so those vectors land in FAISS too -
-/// the query layer is expected to filter against current liveDocs.
+/// FAISS ids are segment-local value ranks.  Vector columns include rows for
+/// deleted docs (deletes are tracked via liveDocs separately), so those vectors
+/// land in FAISS too; the query layer filters current liveDocs.
 ///
 /// Single- and multi-valued vector fields are both supported: every value of
 /// every doc is added to FAISS, and the query layer maps each FAISS id back to
@@ -50,11 +47,6 @@ public:
   // tests can shrink it to exercise the multi-chunk loop on small inputs.
   static size_t renormChunkBytes;
 
-  // A-B hook: production flat search does not emit a vec.* aux artifact.
-  // Tests / benches can enable this to compare FAISS-flat against the normal
-  // IVF+PQ aux engine.
-  static bool buildFaissFlatAuxIndexes;
-
   // Normal aux builds attempt IVF+PQ.  Tests may disable this to verify the
   // flat-over-column fallback without changing request selectors.
   static bool buildFaissIvfPqAuxIndexes;
@@ -65,37 +57,35 @@ public:
   static int32_t ivfPqBits;
   static int32_t ivfPqDefaultNProbe;
   static int64_t ivfPqMinTrainingVectors;
+  static int64_t ivfPqBuildThresholdScanCost;
+  static int64_t ivfPqBuildCountForTests;
   static size_t ivfPqTrainingSampleBytes;
   static size_t ivfPqAddChunkBytes;
 
-  /// One segment's worth of input.  Segments must be passed in the same order
-  /// they will appear in the IndexInfo file (sorted by segId), so query-time
-  /// FAISS-id -> segment derivation lines up.
+  /// One segment's worth of input.
   struct SegInput {
     uint64_t segId;
     PostingsReader* postingsReader;
   };
 
   /// indexGen is the gen the new commit will be published under (for filenames).
-  /// coreGen is the segment-composition gen for the new commit; recorded as
-  /// AuxIndexInfo.built_core_gen so future commits can invalidate this entry
-  /// if segment composition changes.
+  /// fileOrdinal makes filenames unique when several segment overlays for the
+  /// same field are built in one commit.  coreGen is accepted for the old
+  /// call-site shape but is intentionally not recorded on vector overlays.
   VectorIndexBuilder(Directory& dir, std::span<const SegInput> segments,
-                     const Schema& schema, uint64_t indexGen, uint64_t coreGen)
+                     const Schema& schema, uint64_t indexGen, uint64_t coreGen,
+                     uint32_t fileOrdinal)
     : dir_(dir), segments_(segments), schema_(schema),
-      indexGen_(indexGen), coreGen_(coreGen) {}
+      indexGen_(indexGen), coreGen_(coreGen), fileOrdinal_(fileOrdinal) {}
 
   /// Build aux indexes for vector fields matching `selectors`.
   ///   selectors == ["*"]      - every eligible field
   ///   selectors == ["vec.X"]  - exact match on aux index name
-  /// `skipNames` contains aux names whose previously-built entry is still
-  /// valid for this commit (built_core_gen matches current coreGen).  These
-  /// are skipped - rebuilding would produce bit-identical output, so the
-  /// caller should keep the carried-forward entry instead.
-  /// Returned AuxIndexInfo entries should be appended to IndexInfo.aux_indexes
-  /// alongside any carried entries.  File names of every produced file are
-  /// appended to outFilesToSync so the caller can fsync them before
-  /// publishing the new IndexInfo.
+  /// `skipNames` contains overlay names already present on this live segment.
+  /// Segment liveness is the validity rule, so those entries are skipped.
+  /// Returned AuxIndexInfo entries should be appended to that segment's
+  /// SegmentInfo.overlays.  File names of every produced file are appended to
+  /// outFilesToSync so the caller can fsync them before publishing IndexInfo.
   std::vector<proto::AuxIndexInfo> build(
       const std::vector<std::string>& selectors,
       const boost::unordered_flat_set<std::string>& skipNames,
@@ -107,6 +97,7 @@ private:
   const Schema& schema_;
   uint64_t indexGen_;
   uint64_t coreGen_;
+  uint32_t fileOrdinal_;
 
   // Returns true if any selector matches name.
   static bool selectorMatches(const std::vector<std::string>& selectors, std::string_view name);
@@ -121,10 +112,6 @@ private:
   std::optional<proto::AuxIndexInfo> buildField(std::string_view fieldName,
                                                 const VectorFieldType& ft,
                                                 std::vector<std::string>& outFilesToSync);
-
-  std::optional<proto::AuxIndexInfo> buildFlatField(std::string_view fieldName,
-                                                    const VectorFieldType& ft,
-                                                    std::vector<std::string>& outFilesToSync);
 
   std::optional<proto::AuxIndexInfo> buildIvfPqField(std::string_view fieldName,
                                                      const VectorFieldType& ft,

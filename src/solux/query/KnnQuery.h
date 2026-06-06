@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <format>
 #include <functional>
+#include <iterator>
 #include <memory>
 #include <optional>
 #include <queue>
@@ -29,7 +30,6 @@
 #include "solux/reader/VectorReader.h"
 #include "solux/query/VectorEngine.h"
 #include "solux/search/DocSet.h"
-#include "solux/util/BranchlessSearch.h"
 #include "solux/util/log.h"
 #include "solux/util/screaming.h"
 
@@ -47,7 +47,7 @@ namespace solux {
 ///
 /// The active query domain (liveDocs intersected with any enclosing filter
 /// clauses) is pushed into the engine.  The column engine checks it directly
-/// while scanning docs; FAISS aux engines use DomainSelector.
+/// while scanning docs; FAISS aux engines use a segment-local IDSelector.
 ///
 /// Multi-valued vector fields are supported via the segment's persisted
 /// valueRank->docId column (VectorReader::docForVectorRank).  The exact column
@@ -181,13 +181,10 @@ public:
 
   class Weight final : public Query::Weight {
     KnnQuery& query;
-    VectorAuxReader* vaux = nullptr;
 
   public:
     Weight(Query::Context& context, KnnQuery& query)
       : Query::Weight(context), query(query) {
-      IndexReader& reader = context.topReader;
-
       if (!query.getFieldType().knnSearchable()) {
         throw std::runtime_error(std::format(
           "KnnQuery on vector field '{}' without a metric", query.getField()));
@@ -199,34 +196,6 @@ public:
           query.getQueryVec().size(), query.getFieldType().dims(), query.getField()));
       }
 
-      // exact pins the result contract: true top-k, via an execution path
-      // that guarantees it.  Today that is the exhaustive flat-over-column
-      // scan in prepare(); approximate aux indexes are never consulted.
-      // Leaving vaux null selects that path, with identical query semantics
-      // (match-k, prepare, collapse) so exact/ANN results are comparable.
-      if (query.getExact()) {
-        return;
-      }
-
-      // Aux present wins (explicit FAISS-flat A-B path or IVF+PQ).
-      // Missing aux falls back to exact flat-over-column in prepare().
-      std::string auxName("vec.");
-      auxName.append(query.getField());
-      auto aux = reader.getAuxReader(auxName);
-      if (!aux) {
-        return;
-      }
-      vaux = dynamic_cast<VectorAuxReader*>(aux.get());
-      if (!vaux) {
-        throw std::runtime_error(std::format(
-          "KnnQuery: aux '{}' is not a vector index (kind={})", auxName, aux->getKind()));
-      }
-
-      if ((int32_t)query.getQueryVec().size() != vaux->getDims()) {
-        throw std::runtime_error(std::format(
-          "KnnQuery: query vector dims {} do not match index dims {} for field '{}'",
-          query.getQueryVec().size(), vaux->getDims(), query.getField()));
-      }
     }
 
     bool needsPrepare() const noexcept override { return true; }
@@ -249,36 +218,46 @@ public:
       bool outputIsSubsetOfDomain() const noexcept override { return true; }
     };
 
+    struct EngineSlot {
+      std::unique_ptr<VectorEngine> engine;
+      int64_t vectorCount = 0;
+    };
+
     std::unique_ptr<Query::Weight::PreparedWeight> prepare(Query::Weight::PrepareContext& ctx) override {
       IndexReader& reader = ctx.reader;
       size_t numSegs = reader.segments().size();
       std::vector<std::vector<Hit>> perSegHits(numSegs);
 
-      faiss::Index* faissIdx = vaux != nullptr ? vaux->getFaissIndex() : nullptr;
-      if (vaux != nullptr && (!faissIdx || faissIdx->ntotal == 0)) {
-        return std::make_unique<KnnPreparedWeight>(std::move(perSegHits));
-      }
       // prepare() runs in the parallel phase, possibly deep in a work-stealing
       // stack; use the thread-local pool (inline buffer in TLS, not on this
       // frame) instead of a stack-resident MemPool.  Per-thread, so still off
-      // the shared request pool.  Everything allocated here (prefix is heap;
-      // the sparse selector / field-info live in this pool) is consumed within
-      // prepare(), before the guard rewinds.
+      // the shared request pool.  Sparse selectors / field-info live in this
+      // pool and are consumed within prepare(), before the guard rewinds.
       auto poolGuard = MemPool::threadLocalPoolGuard();
       MemPool& scratch = poolGuard.pool();
 
-      // Per-segment vector counts.  The cumulative prefix is still needed for
-      // aux-backed FAISS id -> segment mapping and also gives the total vector
-      // count for the column engine.  Zero-vector segments contribute a zero
-      // range.
-      //
-      // Within a segment, FAISS ids correspond to *value ranks* (0 ..
-      // numVectors).  Each segment gets a SegV2D resolver mapping valueRank ->
-      // docId: identity for dense single-valued, a materialized bitset lookup for
+      // Within a segment, FAISS ids are segment-local value ranks (0 ..
+      // numVectors).  Each segment gets a SegV2D resolver mapping valueRank to
+      // docId: identity for dense single-valued, a bitset select() lookup for
       // sparse single-valued, and the column's reverse map for multi-valued.
-      std::vector<int64_t> prefix(numSegs + 1);
-      prefix[0] = 0;
       std::vector<SegV2D> v2dPerSeg(numSegs);
+      std::vector<int64_t> segVectorCounts(numSegs, 0);
+      std::vector<VectorAuxReader*> vauxPerSeg(numSegs, nullptr);
+      std::string auxName("vec.");
+      auxName.append(query.getField());
+      if (!query.getExact()) {
+        for (size_t i = 0; i < numSegs; i++) {
+          auto aux = reader.segments()[i].getAuxReader(auxName);
+          if (!aux) continue;
+          auto* vaux = dynamic_cast<VectorAuxReader*>(aux.get());
+          if (!vaux) {
+            throw std::runtime_error(std::format(
+              "KnnQuery: segment overlay '{}' is not a vector index (kind={})",
+              auxName, aux->getKind()));
+          }
+          vauxPerSeg[i] = vaux;
+        }
+      }
 
       // Holds the multi-valued segments' valueRank->docId MonoReaders alive through
       // the engine search + result walk below.  MonoReader is
@@ -297,13 +276,18 @@ public:
 
       int64_t totalDocsWithValue = 0;
       bool anyMultiValued = false;
-      int32_t dims = vaux != nullptr ? vaux->getDims()
-        : (query.getFieldType().dims() > 0 ? query.getFieldType().dims()
-                                           : (int32_t)query.getQueryVec().size());
+      int32_t dims = query.getFieldType().dims() > 0
+        ? query.getFieldType().dims()
+        : (int32_t)query.getQueryVec().size();
       if (dims <= 0) {
         throw std::runtime_error(std::format(
           "KnnQuery: query vector for field '{}' must have positive dims", query.getField()));
       }
+      int32_t metric = (int32_t)query.getFieldType().metric();
+      bool normalizeColumnOnCosineRescore =
+        query.getFieldType().metric() == VectorFieldType::METRIC_COSINE
+        && !query.getFieldType().normalized()
+        && !query.getFieldType().normalizeOnWrite();
       for (size_t i = 0; i < numSegs; i++) {
         int64_t segCount = 0;
         if (segInfos[i] != nullptr) {
@@ -318,6 +302,7 @@ public:
                 dims, vr.dims(), query.getField()));
             }
             totalDocsWithValue += vr.docsWithValue();
+            segVectorCounts[i] = segCount;
             if (vr.isMultiValued()) {
               anyMultiValued = true;
               // valueRank -> docId comes straight off the column's reverse map.
@@ -342,20 +327,11 @@ public:
             }
           }
         }
-        prefix[i + 1] = prefix[i] + segCount;
       }
-      int64_t ntotal = prefix[numSegs];
+      int64_t ntotal = 0;
+      for (int64_t n : segVectorCounts) ntotal += n;
       if (ntotal == 0) {
         return std::make_unique<KnnPreparedWeight>(std::move(perSegHits));
-      }
-      if (faissIdx != nullptr && ntotal != faissIdx->ntotal) {
-        // Drift between the FAISS index and the column data - implies the aux
-        // entry was built against a different segment composition than what's
-        // currently published.  Should be impossible because IndexWriter
-        // invalidates aux entries on coreGen change.
-        throw std::runtime_error(std::format(
-          "KnnQuery: FAISS ntotal={} != sum of per-segment vector counts={} for field '{}'",
-          faissIdx->ntotal, prefix[numSegs], query.getField()));
       }
 
       // Optionally normalize the query for COSINE - stored vectors were
@@ -364,19 +340,12 @@ public:
       // local copy; the caller's span is unmodified.
       std::vector<float> queryBuf;
       const float* queryPtr = query.getQueryVec().data();
-      int32_t metric = vaux != nullptr ? vaux->getMetric() : (int32_t)query.getFieldType().metric();
-      bool normalizeColumnOnCosineRescore = vaux != nullptr
-        ? vaux->shouldNormalizeColumnOnCosineRescore()
-        : (query.getFieldType().metric() == VectorFieldType::METRIC_COSINE
-           && !query.getFieldType().normalized()
-           && !query.getFieldType().normalizeOnWrite());
       if (metric == proto::VectorParams::COSINE) {
         queryBuf.assign(query.getQueryVec().begin(), query.getQueryVec().end());
         faiss::fvec_renorm_L2((size_t)dims, 1, queryBuf.data());
         queryPtr = queryBuf.data();
       }
 
-      std::span<const int64_t> prefixSpan(prefix.data(), prefix.size());
       std::span<const SegV2D> v2dSpan(v2dPerSeg.data(), v2dPerSeg.size());
 
       int64_t kDocs = query.getK();
@@ -386,8 +355,58 @@ public:
       // still bounds it - fewer stored docs than k is not a violation, the
       // true top-k is simply all of them.
       if (query.getExact()) cap = std::min(ntotal, std::max(cap, kDocs));
-      bool approximateEngine = vaux != nullptr && !vaux->scoresAreExact();
-      int64_t avgMult = (faissIdx != nullptr && anyMultiValued && totalDocsWithValue > 0)
+      std::vector<EngineSlot> slots;
+      slots.reserve(numSegs);
+      bool approximateEngine = false;
+      for (size_t i = 0; i < numSegs; i++) {
+        int64_t segCount = segVectorCounts[i];
+        if (segCount <= 0 || segInfos[i] == nullptr) continue;
+        VectorAuxReader* vaux = vauxPerSeg[i];
+        if (vaux != nullptr) {
+          if (vaux->getDims() != dims) {
+            throw std::runtime_error(std::format(
+              "KnnQuery: query vector dims {} do not match segment index dims {} for field '{}'",
+              dims, vaux->getDims(), query.getField()));
+          }
+          if (vaux->getMetric() != metric) {
+            throw std::runtime_error(std::format(
+              "KnnQuery: segment index metric {} does not match field metric {} for field '{}'",
+              vaux->getMetric(), metric, query.getField()));
+          }
+          normalizeColumnOnCosineRescore =
+            normalizeColumnOnCosineRescore || vaux->shouldNormalizeColumnOnCosineRescore();
+          faiss::Index* idx = vaux->getFaissIndex();
+          if (idx == nullptr || idx->ntotal == 0) continue;
+          if (idx->ntotal != segCount) {
+            throw std::runtime_error(std::format(
+              "KnnQuery: segment FAISS ntotal={} != segment vector count={} for field '{}'",
+              idx->ntotal, segCount, query.getField()));
+          }
+          bool isIvf = vaux->getEngine() == VectorAuxMeta::ENGINE_IVFPQ;
+          approximateEngine = approximateEngine || !vaux->scoresAreExact();
+          slots.push_back({
+            .engine = std::make_unique<SegmentFaissVectorEngine>(
+              *idx, (int32_t)i, reader.segments()[i], v2dPerSeg[i],
+              ctx.domainPerSeg.empty() ? nullptr : ctx.domainPerSeg[i],
+              metric, vaux->scoresAreExact(), isIvf,
+              vaux->getNList(), vaux->getDefaultBreadth()),
+            .vectorCount = segCount,
+          });
+        } else {
+          slots.push_back({
+            .engine = std::make_unique<SegmentFlatColumnVectorEngine>(
+              (int32_t)i, reader.segments()[i], segInfos[i], v2dPerSeg[i],
+              ctx.domainPerSeg.empty() ? nullptr : ctx.domainPerSeg[i],
+              dims, metric, normalizeColumnOnCosineRescore),
+            .vectorCount = segCount,
+          });
+        }
+      }
+      if (slots.empty()) {
+        return std::make_unique<KnnPreparedWeight>(std::move(perSegHits));
+      }
+
+      int64_t avgMult = (approximateEngine && anyMultiValued && totalDocsWithValue > 0)
         ? ceilDivClamped(ntotal, totalDocsWithValue, cap)
         : 1;
       int64_t baseReq = kDocs;
@@ -409,7 +428,6 @@ public:
       int64_t kReq = mulClamped(baseReq, avgMult, cap);
       if (kReq <= 0) return std::make_unique<KnnPreparedWeight>(std::move(perSegHits));
 
-      BranchlessIndex<int64_t> segIndex(prefix.size());
       std::vector<VectorEngineHit> candidateHits;
       boost::unordered_flat_set<VectorKey, VectorKeyHash, VectorKeyEqual> seenVectors;
       std::vector<DocHit> docHits;
@@ -421,25 +439,8 @@ public:
       docHits.reserve(maxDocHits);
       seenDocs.reserve(maxDocHits);
 
-      // Use a faiss::IDSelector for FAISS aux paths.  The column engine scans
-      // per segment and applies liveDocs/domain directly.
-      DomainSelector selector(prefixSpan, v2dSpan, reader.segments(), ctx.domainPerSeg);
-      std::unique_ptr<VectorEngine> baseEngine;
-      if (faissIdx != nullptr) {
-        bool isIvf = vaux->getEngine() == VectorAuxMeta::ENGINE_IVFPQ;
-        baseEngine = std::make_unique<FaissVectorEngine>(
-          *faissIdx, &selector, prefixSpan, segIndex, metric,
-          vaux->scoresAreExact(), isIvf, vaux->getNList(), vaux->getDefaultBreadth());
-      } else {
-        baseEngine = std::make_unique<FlatColumnVectorEngine>(
-          reader.segments(),
-          std::span<SegFieldInfo* const>(segInfos.data(), segInfos.size()),
-          v2dSpan,
-          ctx.domainPerSeg,
-          dims,
-          metric,
-          normalizeColumnOnCosineRescore);
-      }
+      std::unique_ptr<VectorEngine> baseEngine =
+        std::make_unique<CompositeVectorEngine>(std::move(slots), ntotal, kDocs);
       VectorEngine* engine = baseEngine.get();
       std::unique_ptr<VectorEngine> wrapperEngine;
       if (engineWrapperForTests) {
@@ -448,11 +449,9 @@ public:
       }
 
       int32_t breadth = query.getNProbe() > 0 ? query.getNProbe() : 0;
-      int32_t lastAbsorbedBreadth = -1;
       int32_t maxBreadth = query.getNProbe() > 0
         ? query.getNProbe()
         : std::max(0, maxKnnBreadth);
-      bool poolMixedBreadth = false;
       bool candidatePoolSorted = true;
       for (;;) {
         VectorSearchRequest request{
@@ -473,24 +472,12 @@ public:
         }
         bool appended = candidateHits.size() != appendStart;
         if (appended) {
-          // Once the pool holds hits absorbed at two different breadths, the
-          // prefix-extension invariant is gone for good: a later same-breadth
-          // depth round appends hits bounded by the latest round's tail, but
-          // not by older low-score hits from a narrower breadth still sitting
-          // in the pool.  So mixed-breadth is sticky and every later append
-          // forces a sort.
-          if (lastAbsorbedBreadth >= 0 && request.breadth != lastAbsorbedBreadth) {
-            poolMixedBreadth = true;
-          }
-          if (poolMixedBreadth) candidatePoolSorted = false;
-          lastAbsorbedBreadth = request.breadth;
+          candidatePoolSorted = false;
         }
 
-        // Flat results are exact and each deeper flat request is a sorted
-        // prefix extension, so candidateHits stays score-sorted without work.
-        // Exact engines that broaden search (e.g. IVF-flat) can append hits
-        // that interleave with the existing pool, and approximate engines must
-        // rescore appended hits before sorting / doc collapse.
+        // Per-segment engines can append hits that interleave with the
+        // existing cross-segment pool.  Approximate engines must rescore
+        // appended hits before sorting / doc collapse.
         if (!result.scoresAreExact && appended) {
           rescoreCandidates(std::span<VectorEngineHit>(candidateHits.data() + appendStart,
                                                        candidateHits.size() - appendStart),
@@ -553,11 +540,32 @@ public:
     }
 
   private:
-    class FaissVectorEngine final : public VectorEngine {
+    class SegmentFaissVectorEngine final : public VectorEngine {
+      class LocalDomainSelector final : public faiss::IDSelector {
+        int32_t segOrd;
+        IndexReader::Segment& seg;
+        const SegV2D& v2d;
+        DocSet* domain;
+
+      public:
+        LocalDomainSelector(int32_t segOrd, IndexReader::Segment& seg,
+                            const SegV2D& v2d, DocSet* domain) noexcept
+          : segOrd(segOrd), seg(seg), v2d(v2d), domain(domain) {}
+
+        bool is_member(faiss::idx_t id) const final {
+          if (id < 0) return false;
+          int32_t docId = v2d.resolve((int64_t)id);
+          auto* live = seg.liveDocs();
+          if (live != nullptr && !live->bitset().get(docId)) return false;
+          if (domain != nullptr && !domain->get(docId)) return false;
+          unused(segOrd);
+          return true;
+        }
+      };
+
       faiss::Index& index;
-      faiss::IDSelector* selector;
-      std::span<const int64_t> prefix;
-      const BranchlessIndex<int64_t>& segIndex;
+      int32_t segOrd;
+      LocalDomainSelector selector;
       int32_t metric;
       bool exactScores;
       bool isIvf;
@@ -567,19 +575,19 @@ public:
       std::vector<float> dists;
 
     public:
-      FaissVectorEngine(faiss::Index& index,
-                        faiss::IDSelector* selector,
-                        std::span<const int64_t> prefix,
-                        const BranchlessIndex<int64_t>& segIndex,
-                        int32_t metric,
-                        bool exactScores,
-                        bool isIvf,
-                        int32_t nlist,
-                        int32_t defaultBreadth) noexcept
+      SegmentFaissVectorEngine(faiss::Index& index,
+                               int32_t segOrd,
+                               IndexReader::Segment& seg,
+                               const SegV2D& v2d,
+                               DocSet* domain,
+                               int32_t metric,
+                               bool exactScores,
+                               bool isIvf,
+                               int32_t nlist,
+                               int32_t defaultBreadth) noexcept
         : index(index),
-          selector(selector),
-          prefix(prefix),
-          segIndex(segIndex),
+          segOrd(segOrd),
+          selector(segOrd, seg, v2d, domain),
           metric(metric),
           exactScores(exactScores),
           isIvf(isIvf),
@@ -601,9 +609,9 @@ public:
         dists.assign((size_t)request.candidates, 0.0f);
 
         faiss::SearchParameters flatParams;
-        flatParams.sel = selector;
+        flatParams.sel = &selector;
         faiss::SearchParametersIVF ivfParams;
-        ivfParams.sel = selector;
+        ivfParams.sel = &selector;
         // ivfParams.max_codes stays 0 (unlimited) by design: entries within an
         // IVF list are insertion-ordered, not relevance-ordered, so any
         // within-list truncation drops arbitrary candidates - possibly the
@@ -614,7 +622,14 @@ public:
         int32_t effectiveBreadth = 0;
         if (isIvf) {
           assert(nlist > 0);
-          int32_t fallback = defaultBreadth > 0 ? defaultBreadth : 1;
+          // INTERIM breadth rule for Milestone 1: the request nprobe applies
+          // to every segment and is clamped to that segment's nlist.  With no
+          // explicit nprobe, use this segment's sqrt(nlist) build default.
+          // This is the known equal-work trap; Milestone 2 replaces it with a
+          // pinned total-effort budget and global list allocation.
+          int32_t fallback = defaultBreadth > 0
+            ? defaultBreadth
+            : std::max<int32_t>(1, (int32_t)std::sqrt((double)nlist));
           effectiveBreadth = request.breadth > 0 ? request.breadth : fallback;
           effectiveBreadth = std::clamp(effectiveBreadth, 1, std::max(1, nlist));
           ivfParams.nprobe = (size_t)effectiveBreadth;
@@ -630,13 +645,10 @@ public:
           faiss::idx_t fid = ids[(size_t)i];
           if (fid < 0) continue;  // FAISS pad - no more live results.
           liveHits++;
-          int32_t ord = findSeg((int64_t)fid, prefix, segIndex);
-          if (ord < 0) continue;
-          int64_t valueRank = (int64_t)fid - prefix[(size_t)ord];
           result.hits.push_back({
             .score = scoreFromDist(dists[(size_t)i], metric),
-            .segOrd = ord,
-            .valueRank = valueRank,
+            .segOrd = segOrd,
+            .valueRank = (int64_t)fid,
           });
         }
 
@@ -650,11 +662,12 @@ public:
       }
     };
 
-    class FlatColumnVectorEngine final : public VectorEngine {
-      std::span<IndexReader::Segment> segs;
-      std::span<SegFieldInfo* const> segInfos;
-      std::span<const SegV2D> v2dPerSeg;
-      std::span<DocSet* const> domainPerSeg;
+    class SegmentFlatColumnVectorEngine final : public VectorEngine {
+      int32_t segOrd;
+      IndexReader::Segment& seg;
+      SegFieldInfo* segInfo;
+      const SegV2D& v2d;
+      DocSet* domain;
       int32_t dims;
       int32_t metric;
       bool normalizeColumnOnCosineRescore;
@@ -672,17 +685,19 @@ public:
       };
 
     public:
-      FlatColumnVectorEngine(std::span<IndexReader::Segment> segs,
-                             std::span<SegFieldInfo* const> segInfos,
-                             std::span<const SegV2D> v2dPerSeg,
-                             std::span<DocSet* const> domainPerSeg,
-                             int32_t dims,
-                             int32_t metric,
-                             bool normalizeColumnOnCosineRescore) noexcept
-        : segs(segs),
-          segInfos(segInfos),
-          v2dPerSeg(v2dPerSeg),
-          domainPerSeg(domainPerSeg),
+      SegmentFlatColumnVectorEngine(int32_t segOrd,
+                                    IndexReader::Segment& seg,
+                                    SegFieldInfo* segInfo,
+                                    const SegV2D& v2d,
+                                    DocSet* domain,
+                                    int32_t dims,
+                                    int32_t metric,
+                                    bool normalizeColumnOnCosineRescore) noexcept
+        : segOrd(segOrd),
+          seg(seg),
+          segInfo(segInfo),
+          v2d(v2d),
+          domain(domain),
           dims(dims),
           metric(metric),
           normalizeColumnOnCosineRescore(normalizeColumnOnCosineRescore) {}
@@ -701,82 +716,75 @@ public:
 
         std::priority_queue<VectorEngineHit, std::vector<VectorEngineHit>, WorstFirst> heap;
         int64_t eligibleDocs = 0;
-        for (size_t ord = 0; ord < segInfos.size(); ord++) {
-          SegFieldInfo* info = segInfos[ord];
-          if (info == nullptr) continue;
-          VectorReader vr(segs[ord].postingsReader(), *info);
-          int64_t numVals = vr.numVectors();
-          if (numVals == 0) continue;
-          if (vr.dims() != dims) {
-            throw std::runtime_error(std::format(
-              "KnnQuery: query vector dims {} do not match segment dims {}",
-              dims, vr.dims()));
-          }
+        if (segInfo == nullptr) {
+          result.poolExhausted = true;
+          return result;
+        }
+        VectorReader vr(seg.postingsReader(), *segInfo);
+        int64_t numVals = vr.numVectors();
+        if (numVals == 0) {
+          result.poolExhausted = true;
+          return result;
+        }
+        if (vr.dims() != dims) {
+          throw std::runtime_error(std::format(
+            "KnnQuery: query vector dims {} do not match segment dims {}",
+            dims, vr.dims()));
+        }
 
-          // Inline run-collapse: value ranks are doc-ordered (the valDoc map
-          // is monotonic; sparse select and dense identity likewise), so a
-          // doc's vectors form a contiguous run and max-sim collapse falls
-          // out of one pass.  liveDocs/domain are applied as a PER-RUN
-          // PREDICATE (one docEligible check per doc, ineligible docs skip
-          // all distance math) - but the scan still walks every value run
-          // regardless of filter selectivity.  A selective-filter fast path
-          // would invert this: iterate the domain and look up each doc's
-          // run (identity / bitset rank / binary search on the monotone
-          // valDoc column) - the exact arm of cost-based filter routing.
-          if (v2dPerSeg[ord].mono != nullptr) {
-            // Multi-valued: stream the valDoc map with BulkValues (SIMD
-            // 128-value sub-block decode) instead of per-value valueAt -
-            // a full walk is exactly the sequential access it amortizes.
-            MonoReader::BulkValues valDoc(*v2dPerSeg[ord].mono);
-            int64_t idx = valDoc.next();
-            int64_t rank = 0;
-            while (rank < numVals) {
-              int32_t docId = (int32_t)valDoc.value();
-              int64_t end = rank;
-              do {
-                end++;
-                idx = valDoc.next();
-              } while (end < numVals && (int32_t)valDoc.value() == docId);
-              unused(idx);
+        // Inline run-collapse: value ranks are doc-ordered (the valDoc map is
+        // monotonic; sparse select and dense identity likewise), so a doc's
+        // vectors form a contiguous run and max-sim collapse falls out of one
+        // pass.  liveDocs/domain are applied as a per-run predicate.
+        if (v2d.mono != nullptr) {
+          MonoReader::BulkValues valDoc(*v2d.mono);
+          int64_t idx = valDoc.next();
+          int64_t rank = 0;
+          while (rank < numVals) {
+            int32_t docId = (int32_t)valDoc.value();
+            int64_t end = rank;
+            do {
+              end++;
+              idx = valDoc.next();
+            } while (end < numVals && (int32_t)valDoc.value() == docId);
+            unused(idx);
 
-              if (docEligible((int32_t)ord, docId)) {
-                eligibleDocs++;
-                VectorEngineHit best{
-                  .score = 0.0f,
-                  .segOrd = (int32_t)ord,
-                  .valueRank = rank,
-                };
-                bool haveScore = false;
-                for (int64_t r = rank; r < end; r++) {
-                  float score = exactScore(request.query, vr.vectorAtRank(r), dims, metric,
-                                           normalizeColumnOnCosineRescore, 0.0f);
-                  if (!haveScore || score > best.score) {
-                    best.score = score;
-                    best.valueRank = r;
-                    haveScore = true;
-                  }
-                }
-                offer(heap, best, request.candidates);
-              }
-              rank = end;
-            }
-          } else {
-            // Single-valued (dense identity or sparse select): runs are
-            // length 1 by construction, so no boundary detection - one
-            // resolve, one eligibility check, one score per value.
-            for (int64_t rank = 0; rank < numVals; rank++) {
-              int32_t docId = v2dPerSeg[ord].resolve(rank);
-              if (!docEligible((int32_t)ord, docId)) continue;
+            if (docEligible(docId)) {
               eligibleDocs++;
-              offer(heap,
-                    VectorEngineHit{
-                      .score = exactScore(request.query, vr.vectorAtRank(rank), dims, metric,
-                                          normalizeColumnOnCosineRescore, 0.0f),
-                      .segOrd = (int32_t)ord,
-                      .valueRank = rank,
-                    },
-                    request.candidates);
+              VectorEngineHit best{
+                .score = 0.0f,
+                .segOrd = segOrd,
+                .valueRank = rank,
+              };
+              bool haveScore = false;
+              for (int64_t r = rank; r < end; r++) {
+                float score = exactScore(request.query, vr.vectorAtRank(r), dims, metric,
+                                         normalizeColumnOnCosineRescore, 0.0f);
+                if (!haveScore || score > best.score) {
+                  best.score = score;
+                  best.valueRank = r;
+                  haveScore = true;
+                }
+              }
+              offer(heap, best, request.candidates);
             }
+            rank = end;
+          }
+        } else {
+          // Single-valued (dense identity or sparse select): runs are length
+          // 1 by construction.
+          for (int64_t rank = 0; rank < numVals; rank++) {
+            int32_t docId = v2d.resolve(rank);
+            if (!docEligible(docId)) continue;
+            eligibleDocs++;
+            offer(heap,
+                  VectorEngineHit{
+                    .score = exactScore(request.query, vr.vectorAtRank(rank), dims, metric,
+                                        normalizeColumnOnCosineRescore, 0.0f),
+                    .segOrd = segOrd,
+                    .valueRank = rank,
+                  },
+                  request.candidates);
           }
         }
 
@@ -791,13 +799,10 @@ public:
       }
 
     private:
-      bool docEligible(int32_t ord, int32_t docId) const {
-        auto* live = segs[(size_t)ord].liveDocs();
+      bool docEligible(int32_t docId) const {
+        auto* live = seg.liveDocs();
         if (live != nullptr && !live->bitset().get(docId)) return false;
-        if (!domainPerSeg.empty()) {
-          auto* domain = domainPerSeg[(size_t)ord];
-          if (domain != nullptr && !domain->get(docId)) return false;
-        }
+        if (domain != nullptr && !domain->get(docId)) return false;
         return true;
       }
 
@@ -813,6 +818,65 @@ public:
           heap.pop();
           heap.push(hit);
         }
+      }
+    };
+
+    class CompositeVectorEngine final : public VectorEngine {
+      std::vector<EngineSlot> slots;
+      int64_t totalVectors;
+      int64_t kDocs;
+
+      static bool better(const VectorEngineHit& a, const VectorEngineHit& b) {
+        if (a.score != b.score) return a.score > b.score;
+        if (a.segOrd != b.segOrd) return a.segOrd < b.segOrd;
+        return a.valueRank < b.valueRank;
+      }
+
+      int64_t candidatesForSlot(int64_t requested, int64_t n) const {
+        if (requested <= 0 || n <= 0) return 0;
+        // INTERIM depth rule for Milestone 1: distribute by segment size and
+        // floor each segment at min(k, N_i).  Milestone 2 owns global
+        // allocation and total-effort semantics.
+        long double proportional = ((long double)requested * (long double)n)
+          / (long double)std::max<int64_t>(1, totalVectors);
+        int64_t bySize = (int64_t)std::ceil(proportional);
+        int64_t floor = std::min(kDocs, n);
+        return std::min(n, std::max(bySize, floor));
+      }
+
+    public:
+      CompositeVectorEngine(std::vector<EngineSlot>&& slots, int64_t totalVectors, int64_t kDocs) noexcept
+        : slots(std::move(slots)), totalVectors(totalVectors), kDocs(kDocs) {}
+
+      VectorSearchResult search(const VectorSearchRequest& request) override {
+        VectorSearchResult merged;
+        merged.scoresAreExact = true;
+        merged.poolExhausted = true;
+        merged.breadthExhausted = true;
+        if (request.candidates <= 0) return merged;
+
+        for (auto& slot : slots) {
+          int64_t candidates = candidatesForSlot(request.candidates, slot.vectorCount);
+          if (candidates <= 0) continue;
+          VectorSearchRequest subReq = request;
+          subReq.candidates = candidates;
+          VectorSearchResult part = slot.engine->search(subReq);
+          merged.scoresAreExact = merged.scoresAreExact && part.scoresAreExact;
+          merged.poolExhausted = merged.poolExhausted && part.poolExhausted;
+          merged.breadthExhausted = merged.breadthExhausted && part.breadthExhausted;
+          if (!part.breadthExhausted && part.nextBreadth > request.breadth) {
+            if (merged.nextBreadth == 0) {
+              merged.nextBreadth = part.nextBreadth;
+            } else {
+              merged.nextBreadth = std::min(merged.nextBreadth, part.nextBreadth);
+            }
+          }
+          merged.hits.insert(merged.hits.end(),
+                             std::make_move_iterator(part.hits.begin()),
+                             std::make_move_iterator(part.hits.end()));
+        }
+        std::stable_sort(merged.hits.begin(), merged.hits.end(), better);
+        return merged;
       }
     };
   };
@@ -956,16 +1020,6 @@ private:
     }
   }
 
-  // Locate the segment ord that "owns" the given FAISS id, given a
-  // prefix-sum array of length numSegs+1 (prefix[0]=0, prefix[i] = sum of
-  // vector counts in segments [0..i)).  Returns -1 if out of range.
-  static int32_t findSeg(int64_t faissId, std::span<const int64_t> prefix,
-                         const BranchlessIndex<int64_t>& index) {
-    if (faissId < 0 || faissId >= prefix.back()) return -1;
-    auto it = index.upperBound(prefix.data(), faissId);
-    return (int32_t)(it - prefix.data() - 1);
-  }
-
   static uint64_t packSegDoc(int32_t segOrd, int32_t docId) {
     return ((uint64_t)(uint32_t)segOrd << 32) | (uint32_t)docId;
   }
@@ -992,49 +1046,6 @@ private:
     return (int64_t)want;
   }
 
-  /// faiss::IDSelector that maps a FAISS id to (segment ord, docRank) via
-  /// the precomputed prefix sums + per-segment valueRank->docRank lookup,
-  /// then consults the segment's liveDocs and the active query domain.
-  /// FAISS calls is_member(id) for every candidate during search and skips
-  /// those that return false.
-  ///
-  /// For IndexFlat this doesn't reduce the scan cost (we still touch every
-  /// vector for distance computation) but it keeps deleted and out-of-domain
-  /// vectors out of the returned candidate list.
-  /// For IVF, the selector can also prune list scanning by skipping candidates
-  /// outside the active domain.
-  class DomainSelector : public faiss::IDSelector {
-    std::span<const int64_t> prefix;
-    // Precomputed monobound layout for prefix; is_member() runs per candidate
-    // vector against this one array, so remembering it beats recomputing.
-    BranchlessIndex<int64_t> segIndex;
-    // Per-segment valueRank -> docId resolver (mono / flat / identity).
-    std::span<const SegV2D> v2dPerSeg;
-    std::span<IndexReader::Segment> segs;
-    std::span<DocSet* const> domainPerSeg;
-
-  public:
-    DomainSelector(std::span<const int64_t> prefix,
-                   std::span<const SegV2D> v2dPerSeg,
-                   std::span<IndexReader::Segment> segs,
-                   std::span<DocSet* const> domainPerSeg) noexcept
-      : prefix(prefix), segIndex(prefix.size()), v2dPerSeg(v2dPerSeg),
-        segs(segs), domainPerSeg(domainPerSeg) {}
-
-    bool is_member(faiss::idx_t id) const final {
-      int32_t ord = findSeg((int64_t)id, prefix, segIndex);
-      if (ord < 0) return false;
-      int64_t valueRank = (int64_t)id - prefix[ord];
-      int32_t docId = v2dPerSeg[ord].resolve(valueRank);
-      auto* live = segs[ord].liveDocs();
-      if (live != nullptr && !live->bitset().get(docId)) return false;
-      if (!domainPerSeg.empty()) {
-        auto* domain = domainPerSeg[(size_t)ord];
-        if (domain != nullptr && !domain->get(docId)) return false;
-      }
-      return true;
-    }
-  };
 };
 
 } // namespace solux

@@ -50,6 +50,7 @@ SoluxNode* SoluxTest::soluxNode;
 GRPCServer* GrpcSoluxTest::server = nullptr;
 std::thread GrpcSoluxTest::serverThread;
 std::shared_ptr<grpc::Channel> GrpcSoluxTest::channel = nullptr;
+bool GrpcSoluxTest::serverStartFailed = false;
 
 void SoluxTest::clearCollection(std::string_view collectionName) {
   auto collection = soluxNode->getCollection(collectionName);

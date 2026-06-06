@@ -1,5 +1,6 @@
 #include "IndexReader.h"
 #include "solux/reader/Postings.h"
+#include "solux/reader/TestOverlayAuxReader.h"
 #include "solux/reader/VectorAuxReader.h"
 
 #include "protos/solux_types.pb.h"
@@ -11,6 +12,30 @@
 #include "OrdMapImpl.h"
 
 namespace solux {
+
+namespace {
+
+std::string segmentAuxKey(uint64_t segId, std::string_view name) {
+  std::string key = std::to_string(segId);
+  key.push_back(':');
+  key.append(name);
+  return key;
+}
+
+std::shared_ptr<AuxReader> openKnownAux(Directory& dir,
+                                        const proto::AuxIndexInfo& info,
+                                        bool missingFileOK) {
+  if (info.kind() == VectorAuxReader::KIND) {
+    return VectorAuxReader::open(dir, info, missingFileOK);
+  }
+  if (info.kind() == TestOverlayAuxReader::KIND) {
+    return TestOverlayAuxReader::open(dir, info, missingFileOK);
+  }
+  IREADER_DEBUG("Skipping unknown aux kind '{}' for '{}'", info.kind(), info.name());
+  return nullptr;
+}
+
+} // namespace
 
 std::shared_ptr<LiveDocs> LiveDocs::create(Directory& dir, uint64_t segId, uint64_t liveGen, int32_t maxDoc, bool missingFileOK, bool expectSynced) {
   assert(liveGen > 0 && maxDoc > 0);
@@ -101,9 +126,15 @@ IndexReader::IndexReader(Directory& dir, IndexReader* previousReader) {
   // commit carried the entry forward (same gen + built_core_gen).  FAISS
   // deserialization is the expensive part; reuse keeps reopens cheap.
   boost::unordered_flat_map<std::string, std::shared_ptr<AuxReader>> prevAuxByName;
+  boost::unordered_flat_map<std::string, std::shared_ptr<AuxReader>> prevSegAuxByKey;
   if (previousReader) {
     for (const auto& r : previousReader->auxReadersList) {
       prevAuxByName.emplace(std::string(r->getName()), r);
+    }
+    for (const auto& seg : previousReader->segs) {
+      for (const auto& r : seg.auxReaders()) {
+        prevSegAuxByKey.emplace(segmentAuxKey(seg.segInfo.seg_id, r->getName()), r);
+      }
     }
   }
 
@@ -180,6 +211,37 @@ IndexReader::IndexReader(Directory& dir, IndexReader* previousReader) {
         }
         // If liveGen == 0, liveDocs remains nullptr (no deletes)
 
+        std::vector<std::shared_ptr<AuxReader>> segmentAuxReaders;
+        segmentAuxReaders.reserve(segment.overlays_size());
+        for (int j = 0; j < segment.overlays_size(); j++) {
+          const auto& info = segment.overlays(j);
+
+          auto prevIt = prevSegAuxByKey.find(segmentAuxKey(segId, info.name()));
+          if (prevIt != prevSegAuxByKey.end()
+              && prevIt->second->getGen() == info.gen()
+              && prevIt->second->getBuiltCoreGen() == info.built_core_gen()) {
+            IREADER_DEBUG("Reusing segment overlay '{}' for seg={} (gen={}) from previous IndexReader",
+                          info.name(), segId, info.gen());
+            segmentAuxReaders.push_back(prevIt->second);
+            auxReadersList.push_back(prevIt->second);
+            continue;
+          }
+
+          auto aux = openKnownAux(dir, info, missingFileOK);
+          if (!aux && (info.kind() == VectorAuxReader::KIND
+                       || info.kind() == TestOverlayAuxReader::KIND)) {
+            IREADER_DEBUG("Segment overlay file missing for '{}' seg={} - triggering retry",
+                          info.name(), segId);
+            retry = true;
+            break;
+          }
+          if (aux) {
+            segmentAuxReaders.push_back(aux);
+            auxReadersList.push_back(std::move(aux));
+          }
+        }
+        if (retry) break;
+
         Segment::SegmentInfo segmentInfo;
         segmentInfo.seg_id = segId;
         segmentInfo.live_gen = liveGen;
@@ -189,7 +251,8 @@ IndexReader::IndexReader(Directory& dir, IndexReader* previousReader) {
         segmentInfo.commit_time = segment.commit_time();
         segmentInfo.live_docs = segment.live_docs();
 
-        segs.emplace_back(std::move(postingsReader), std::move(liveDocs), segmentInfo, totalMaxDoc, i);
+        segs.emplace_back(std::move(postingsReader), std::move(liveDocs),
+                          std::move(segmentAuxReaders), segmentInfo, totalMaxDoc, i);
         totalMaxDoc += segs.back().postingsReader().maxDoc();
         livedocs += segs.back().numLive();
         assert(nDocs == segs.back().postingsReader().maxDoc());
@@ -218,11 +281,9 @@ IndexReader::IndexReader(Directory& dir, IndexReader* previousReader) {
 
           // Dispatch by kind.  Unknown kinds are silently skipped so older
           // binaries can read indexes that contain newer aux kinds.
-          std::shared_ptr<AuxReader> aux;
-          if (info.kind() == VectorAuxReader::KIND) {
-            aux = VectorAuxReader::open(dir, info, missingFileOK);
-          } else {
-            IREADER_DEBUG("Skipping unknown aux kind '{}' for '{}'", info.kind(), info.name());
+          std::shared_ptr<AuxReader> aux = openKnownAux(dir, info, missingFileOK);
+          if (!aux && info.kind() != VectorAuxReader::KIND
+                   && info.kind() != TestOverlayAuxReader::KIND) {
             continue;
           }
 

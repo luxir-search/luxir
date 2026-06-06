@@ -11,6 +11,7 @@ class GrpcSoluxTest : public SoluxTest {
   static GRPCServer *server;
   static std::thread serverThread;
   static std::shared_ptr<grpc::Channel> channel;
+  static bool serverStartFailed;
 public:
   // Not thread safe
   static GRPCServer* startServer(int nThreads = -1) {
@@ -24,7 +25,9 @@ public:
     server = new GRPCServer(*soluxNode, threads, config.server.grpc.port);
 
     serverThread = std::thread([](){server->run();});
-    server->waitForStart();
+    if (!server->waitForStart()) {
+      serverStartFailed = true;
+    }
     return server;
   }
 
@@ -39,6 +42,7 @@ public:
         delete server;
         server = nullptr;
         channel = nullptr;
+        serverStartFailed = false;
       }
     }
   }
@@ -52,6 +56,17 @@ public:
       channel = grpc::CreateChannel(serverAddress, grpc::InsecureChannelCredentials());
     }
     return channel;
+  }
+
+  static bool startFailed() {
+    return serverStartFailed;
+  }
+
+  void SetUp() override {
+    SoluxTest::SetUp();
+    if (serverStartFailed) {
+      GTEST_SKIP() << "gRPC test server failed to start in this environment";
+    }
   }
 
 };

@@ -71,12 +71,9 @@ public:
   std::vector<std::string> buildAuxIndexes;
 
   // Set to true to make this commit wait for any in-flight (or chained) merges
-  // before it runs finishCommitBody.  The merge code uses leftToFlush as the
-  // gate: every in-flight merge bumps the counter when it starts and
-  // decrements it when it finishes.  Auto-set to true by initiateCommit when
-  // buildAuxIndexes is non-empty so the aux build sees post-merge segments
-  // and the merge-triggered synthetic commit can't race in afterward and
-  // invalidate the aux on a coreGen bump.
+  // before it runs finishCommitBody.  Vector overlay builds deliberately do
+  // not set this: per-segment validity is segment liveness, so a racing merge
+  // can only waste a bounded build on a dying segment.
   bool waitForMerges = false;
 
 

@@ -320,11 +320,9 @@ message CommitParams {
   //   ["*"]              - rebuild every eligible aux index in the schema
   //   ["vec.title_v"]    - rebuild this one (matched against AuxIndexInfo.name)
   //   ["vec.*"]          - (future) glob-match by prefix
-  // When non-empty, wait_for_merges is implicitly enabled so the aux build sees post-merge segments.
   repeated string build_aux_indexes = 2;
 
   // If true, this commit will wait for any in-flight merges to finish before publishing.
-  // Implicitly true when build_aux_indexes is non-empty.
   bool wait_for_merges = 3;
 }
 
@@ -583,12 +581,13 @@ message IndexInfo {
   uint64 schema_gen = 6;              // Schema generation (incremented on each schema change)
   repeated SegmentInfo segments = 15; // List if segments in this index
 
-  // Auxiliary indexes built across (some or all) segments at a particular commit.
-  // Vector ANN indexes today; future: autocomplete, spell-correction, etc.
+  // Auxiliary indexes built at index scope.  Segment-local overlays live on
+  // SegmentInfo.overlays.
   repeated AuxIndexInfo aux_indexes = 16;
 }
 
-// An auxiliary (non-segment) index built at a particular commit.
+// An auxiliary index entry built at a particular commit.  Used for both
+// index-level aux indexes and segment-local overlays.
 // Files use the naming convention "s_<name>_<sortable_gen>_<sortable_fnum>".
 message AuxIndexInfo {
   string kind = 1;             // e.g. "vector_faiss"
@@ -599,13 +598,10 @@ message AuxIndexInfo {
   repeated string files = 6;   // segment-style filenames that comprise this aux index
   bytes opaque_meta = 7;       // kind-specific metadata blob
 
-  // Index core_gen this aux was built against.  On the next commit, an aux
-  // entry is carried forward only if its built_core_gen matches the new
-  // commit's core_gen - otherwise it's invalidated and its files deleted.
-  // Use this for aux kinds that embed segment-specific references (e.g. vector
-  // indexes mapping to (segId, localDoc)) and become incorrect after merges.
-  // Aux kinds robust to segment changes (future autocomplete, spell-check)
-  // should leave this at 0, which disables the check.
+  // Optional index-level core_gen stamp.  Segment overlays, including vector
+  // ANN overlays, leave this at 0; their validity is segment liveness.
+  // Future index-level aux kinds that embed segment composition may set it and
+  // have writer code invalidate them when core_gen changes.
   uint64 built_core_gen = 8;
 }
 
@@ -619,6 +615,10 @@ message SegmentInfo {
   int32  max_doc = 6;                   // Number of documents in this segment (ignoring deletes)
   int32  live_docs = 7;                 // Number of non-deleted documents in this segment
   uint64 schema_gen = 8;               // Schema generation this segment was indexed under
+
+  // Segment-local auxiliary overlays.  Vector ANN indexes are recorded here
+  // with kind "vector_faiss"; validity is segment liveness, not core_gen.
+  repeated AuxIndexInfo overlays = 9;
 }
 
 //

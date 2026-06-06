@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <charconv>
 #include <chrono>
 #include <cstdint>
@@ -20,18 +21,6 @@ using namespace solux;
 using namespace solux::test;
 
 namespace {
-
-struct FaissFlatBuildGuard {
-  bool saved;
-
-  explicit FaissFlatBuildGuard(bool enabled) : saved(VectorIndexBuilder::buildFaissFlatAuxIndexes) {
-    VectorIndexBuilder::buildFaissFlatAuxIndexes = enabled;
-  }
-
-  ~FaissFlatBuildGuard() {
-    VectorIndexBuilder::buildFaissFlatAuxIndexes = saved;
-  }
-};
 
 void installVectorBenchSchema(Collection& col, int32_t dims,
                               proto::VectorParams::Metric metric = proto::VectorParams::IP) {
@@ -61,6 +50,47 @@ void installVectorBenchSchema(Collection& col, int32_t dims,
 float nextFloat(SplitMix64& rng) {
   return ((float)((int32_t)rng.rint((int64_t)2001) - 1000)) / 1000.0f;
 }
+
+struct IvfPqBenchGuard {
+  bool savedIvfPq;
+  int32_t savedNList;
+  int32_t savedM;
+  int32_t savedBits;
+  int32_t savedNProbe;
+  int64_t savedMinTraining;
+  int64_t savedBuildThreshold;
+
+  IvfPqBenchGuard()
+    : savedIvfPq(VectorIndexBuilder::buildFaissIvfPqAuxIndexes),
+      savedNList(VectorIndexBuilder::ivfPqNList),
+      savedM(VectorIndexBuilder::ivfPqM),
+      savedBits(VectorIndexBuilder::ivfPqBits),
+      savedNProbe(VectorIndexBuilder::ivfPqDefaultNProbe),
+      savedMinTraining(VectorIndexBuilder::ivfPqMinTrainingVectors),
+      savedBuildThreshold(VectorIndexBuilder::ivfPqBuildThresholdScanCost) {
+    VectorIndexBuilder::buildFaissIvfPqAuxIndexes = true;
+    VectorIndexBuilder::ivfPqBuildThresholdScanCost = 0;
+    if (solux::unit_tests) {
+      // Tiny corpus in unit-test mode: shrink so IVF+PQ actually trains and
+      // the ANN path gets coverage. Real runs keep production IVF+PQ params
+      // but force eligibility so the benchmark measures the aux path.
+      VectorIndexBuilder::ivfPqNList = 4;
+      VectorIndexBuilder::ivfPqM = 2;
+      VectorIndexBuilder::ivfPqBits = 1;
+      VectorIndexBuilder::ivfPqMinTrainingVectors = 16;
+    }
+  }
+
+  ~IvfPqBenchGuard() {
+    VectorIndexBuilder::buildFaissIvfPqAuxIndexes = savedIvfPq;
+    VectorIndexBuilder::ivfPqNList = savedNList;
+    VectorIndexBuilder::ivfPqM = savedM;
+    VectorIndexBuilder::ivfPqBits = savedBits;
+    VectorIndexBuilder::ivfPqDefaultNProbe = savedNProbe;
+    VectorIndexBuilder::ivfPqMinTrainingVectors = savedMinTraining;
+    VectorIndexBuilder::ivfPqBuildThresholdScanCost = savedBuildThreshold;
+  }
+};
 
 std::vector<float> makeVector(int64_t docId, int32_t dims, int32_t valueOrd) {
   SplitMix64 rng((uint64_t)docId * 0x9e3779b97f4a7c15ULL + (uint64_t)(valueOrd + 1) * 0xbf58476d1ce4e5b9ULL);
@@ -114,7 +144,6 @@ void indexVectorBatch(CollectionHelper& helper, int64_t startDoc, int64_t count,
 
 void buildVectorBenchIndex(CollectionHelper& helper, int64_t nDocs, int32_t dims,
                            int32_t valuesPerDoc, bool buildFaissAux) {
-  FaissFlatBuildGuard guard(buildFaissAux);
   helper.clear();
   installVectorBenchSchema(helper.collection(), dims);
 
@@ -130,6 +159,7 @@ void buildVectorBenchIndex(CollectionHelper& helper, int64_t nDocs, int32_t dims
   }
 
   if (buildFaissAux) {
+    IvfPqBenchGuard guard;
     helper.commit({std::string("vec.") + (valuesPerDoc == 1 ? "bench_v" : "bench_vs")});
   }
 }
@@ -240,46 +270,6 @@ void BM_VectorKnn(benchmark::State& state, bool multiValued, bool faissAux) {
 // random vectors are IVF's pathological worst case - recall measured on noise
 // would slander any default.
 
-struct IvfPqBenchGuard {
-  bool savedFlat;
-  bool savedIvfPq;
-  int32_t savedNList;
-  int32_t savedM;
-  int32_t savedBits;
-  int32_t savedNProbe;
-  int64_t savedMinTraining;
-
-  IvfPqBenchGuard()
-    : savedFlat(VectorIndexBuilder::buildFaissFlatAuxIndexes),
-      savedIvfPq(VectorIndexBuilder::buildFaissIvfPqAuxIndexes),
-      savedNList(VectorIndexBuilder::ivfPqNList),
-      savedM(VectorIndexBuilder::ivfPqM),
-      savedBits(VectorIndexBuilder::ivfPqBits),
-      savedNProbe(VectorIndexBuilder::ivfPqDefaultNProbe),
-      savedMinTraining(VectorIndexBuilder::ivfPqMinTrainingVectors) {
-    VectorIndexBuilder::buildFaissFlatAuxIndexes = false;
-    VectorIndexBuilder::buildFaissIvfPqAuxIndexes = true;
-    if (solux::unit_tests) {
-      // Tiny corpus in unit-test mode: shrink so IVF+PQ actually trains and
-      // the ANN path gets coverage.  Real runs measure production defaults.
-      VectorIndexBuilder::ivfPqNList = 4;
-      VectorIndexBuilder::ivfPqM = 2;
-      VectorIndexBuilder::ivfPqBits = 2;
-      VectorIndexBuilder::ivfPqMinTrainingVectors = 16;
-    }
-  }
-
-  ~IvfPqBenchGuard() {
-    VectorIndexBuilder::buildFaissFlatAuxIndexes = savedFlat;
-    VectorIndexBuilder::buildFaissIvfPqAuxIndexes = savedIvfPq;
-    VectorIndexBuilder::ivfPqNList = savedNList;
-    VectorIndexBuilder::ivfPqM = savedM;
-    VectorIndexBuilder::ivfPqBits = savedBits;
-    VectorIndexBuilder::ivfPqDefaultNProbe = savedNProbe;
-    VectorIndexBuilder::ivfPqMinTrainingVectors = savedMinTraining;
-  }
-};
-
 // Cluster center for clusterId: deterministic, components in [-1, 1].
 std::vector<float> clusterCenter(int32_t clusterId, int32_t dims) {
   SplitMix64 rng((uint64_t)(clusterId + 1) * 0x2545f4914f6cdd1dULL);
@@ -328,12 +318,17 @@ std::vector<int32_t> clusteredDocsPerSeg(int64_t nDocs) {
 bool clusteredIndexReusable(CollectionHelper& helper, std::span<const int32_t> docsPerSeg) {
   if (!helper.indexMatchesShape(docsPerSeg)) return false;
   auto reader = helper.getIndexWriter()->getIndexReader();
-  auto aux = reader->getAuxReader("vec.bench_v");
-  if (!aux) return false;
-  auto* vaux = dynamic_cast<VectorAuxReader*>(aux.get());
-  return vaux != nullptr &&
-         vaux->getEngine() == VectorAuxMeta::ENGINE_IVFPQ &&
-         vaux->getMetric() == (int32_t)proto::VectorParams::L2;
+  for (const auto& seg : reader->segments()) {
+    auto aux = seg.getAuxReader("vec.bench_v");
+    if (!aux) return false;
+    auto* vaux = dynamic_cast<VectorAuxReader*>(aux.get());
+    if (vaux == nullptr ||
+        vaux->getEngine() != VectorAuxMeta::ENGINE_IVFPQ ||
+        vaux->getMetric() != (int32_t)proto::VectorParams::L2) {
+      return false;
+    }
+  }
+  return true;
 }
 
 void buildClusteredVectorIndex(CollectionHelper& helper, int32_t dims,
@@ -373,7 +368,18 @@ bool responseIds(LocalReq& req, std::vector<std::string>& out, std::string& erro
     error = response.error();
     return false;
   }
-  const auto& ids = response.ops().at("q").docs().columns().at("id").col_s();
+  auto opIt = response.ops().find("q");
+  if (opIt == response.ops().end()) {
+    error = "missing q response op";
+    return false;
+  }
+  const auto& docs = opIt->second.docs();
+  auto idIt = docs.columns().find("id");
+  if (idIt == docs.columns().end()) {
+    error = "missing id column";
+    return false;
+  }
+  const auto& ids = idIt->second.col_s();
   out.assign(ids.v().begin(), ids.v().end());
   return true;
 }
@@ -554,16 +560,92 @@ void BM_VectorIvfPqBuild(benchmark::State& state) {
       (double)nDocs * (double)state.iterations(), benchmark::Counter::kIsRate);
 }
 
+void BM_VectorIvfPqIncrementalBuild(benchmark::State& state) {
+  bool aboveThresholdFlush = state.range(0) != 0;
+  int32_t dims = solux::unit_tests ? 16 : 64;
+  int32_t nClusters = solux::unit_tests ? 8 : 100;
+  int64_t flushDocs = aboveThresholdFlush
+    ? (solux::unit_tests ? 120 : 25'000)
+    : (solux::unit_tests ? 4 : 128);
+  int64_t threshold = solux::unit_tests
+    ? (int64_t)dims * 64
+    : 1'000'000;
+
+  IvfPqBenchGuard guard;
+  VectorIndexBuilder::ivfPqBuildThresholdScanCost = threshold;
+  CollectionHelper helper("main");
+  std::vector<int32_t> docsPerSeg = solux::unit_tests
+    ? std::vector<int32_t>{120, 120}
+    : std::vector<int32_t>{25'000, 25'000};
+
+  double setupSecs = 0;
+  int64_t annBuilds = 0;
+  for (auto _ : state) {
+    auto setupStart = std::chrono::steady_clock::now();
+    helper.clear();
+    installVectorBenchSchema(helper.collection(), dims, proto::VectorParams::L2);
+    constexpr int64_t batchSize = 256;
+    std::vector<Doc> docs;
+    docs.reserve((size_t)batchSize);
+    int64_t docId = 0;
+    for (int32_t segDocs : docsPerSeg) {
+      for (int32_t i = 0; i < segDocs; i++, docId++) {
+        docs.push_back(flatdoc("id", "d" + std::to_string(docId),
+                               "bench_v", makeClusteredVector(docId, dims, nClusters)));
+        if ((int64_t)docs.size() == batchSize) {
+          helper.indexAll(docs);
+          docs.clear();
+        }
+      }
+      if (!docs.empty()) {
+        helper.indexAll(docs);
+        docs.clear();
+      }
+      helper.commit();
+    }
+    helper.commit({"vec.bench_v"});
+    setupSecs += std::chrono::duration<double>(
+        std::chrono::steady_clock::now() - setupStart).count();
+
+    for (int64_t i = 0; i < flushDocs; i++, docId++) {
+      docs.push_back(flatdoc("id", "d" + std::to_string(docId),
+                             "bench_v", makeClusteredVector(docId, dims, nClusters)));
+      if ((int64_t)docs.size() == batchSize) {
+        helper.indexAll(docs);
+        docs.clear();
+      }
+    }
+    if (!docs.empty()) {
+      helper.indexAll(docs);
+      docs.clear();
+    }
+
+    VectorIndexBuilder::ivfPqBuildCountForTests = 0;
+    BenchTimer timer(state);
+    helper.commit({"vec.bench_v"});
+    annBuilds += VectorIndexBuilder::ivfPqBuildCountForTests;
+  }
+
+  state.counters["flushDocs"] = (double)flushDocs;
+  state.counters["aboveThreshold"] = aboveThresholdFlush ? 1.0 : 0.0;
+  state.counters["annBuilds"] =
+      state.iterations() > 0 ? (double)annBuilds / (double)state.iterations() : 0.0;
+  state.counters["setupSecs"] =
+      state.iterations() > 0 ? setupSecs / (double)state.iterations() : 0.0;
+}
+
 }  // namespace
 
 // Plain BENCHMARK: manual time is incompatible with the UseRealTime() that
 // SOLUX_BENCHMARK appends.
 BENCHMARK(BM_VectorIvfPqBuild)->UseManualTime()->Iterations(3);
+BENCHMARK(BM_VectorIvfPqIncrementalBuild)->ArgName("aboveThresholdFlush")
+    ->Arg(0)->Arg(1)->UseManualTime()->Iterations(3);
 
 SOLUX_BENCHMARK_CAPTURE(BM_VectorKnn, single_column, false, false)->Arg(50'000);
-SOLUX_BENCHMARK_CAPTURE(BM_VectorKnn, single_faiss_flat, false, true)->Arg(50'000);
+SOLUX_BENCHMARK_CAPTURE(BM_VectorKnn, single_ivfpq, false, true)->Arg(50'000);
 SOLUX_BENCHMARK_CAPTURE(BM_VectorKnn, multi_column, true, false)->Arg(50'000);
-SOLUX_BENCHMARK_CAPTURE(BM_VectorKnn, multi_faiss_flat, true, true)->Arg(50'000);
+SOLUX_BENCHMARK_CAPTURE(BM_VectorKnn, multi_ivfpq, true, true)->Arg(50'000);
 
 // Two sweeps over (nprobe, refine); 0 = production default for either knob.
 // nprobe sweep at default refine: breadth axis, up to exhaustive-over-lists.

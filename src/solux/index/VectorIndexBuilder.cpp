@@ -197,7 +197,6 @@ bool forEachVectorSegment(std::span<const VectorIndexBuilder::SegInput> segments
 
 // Default 1 MiB.  Tests can override via VectorIndexBuilder::renormChunkBytes.
 size_t VectorIndexBuilder::renormChunkBytes = 1 * 1024 * 1024;
-bool VectorIndexBuilder::buildFaissFlatAuxIndexes = false;
 bool VectorIndexBuilder::buildFaissIvfPqAuxIndexes = true;
 int32_t VectorIndexBuilder::ivfPqNList = 0;
 int32_t VectorIndexBuilder::ivfPqM = 0;
@@ -205,6 +204,8 @@ int32_t VectorIndexBuilder::ivfPqBits = 8;
 int32_t VectorIndexBuilder::ivfPqDefaultNProbe = 0;
 int64_t VectorIndexBuilder::ivfPqMinTrainingVectors =
     MIN_TRAINING_POINTS_PER_PQ_CENTROID * 256;
+int64_t VectorIndexBuilder::ivfPqBuildThresholdScanCost = 1'000'000;
+int64_t VectorIndexBuilder::ivfPqBuildCountForTests = 0;
 size_t VectorIndexBuilder::ivfPqTrainingSampleBytes = 64 * 1024 * 1024;
 size_t VectorIndexBuilder::ivfPqAddChunkBytes = 16 * 1024 * 1024;
 
@@ -256,7 +257,7 @@ VectorIndexBuilder::build(const std::vector<std::string>& selectors,
                           std::vector<std::string>& outFilesToSync) {
   std::vector<proto::AuxIndexInfo> result;
   if (selectors.empty()) return result;
-  if (!buildFaissFlatAuxIndexes && !buildFaissIvfPqAuxIndexes) {
+  if (!buildFaissIvfPqAuxIndexes) {
     LOG_TRACE("VectorIndexBuilder: vector aux build disabled; flat kNN uses column scan");
     return result;
   }
@@ -286,135 +287,7 @@ std::optional<proto::AuxIndexInfo>
 VectorIndexBuilder::buildField(std::string_view fieldName,
                                const VectorFieldType& ft,
                                std::vector<std::string>& outFilesToSync) {
-  if (buildFaissFlatAuxIndexes) {
-    return buildFlatField(fieldName, ft, outFilesToSync);
-  }
   return buildIvfPqField(fieldName, ft, outFilesToSync);
-}
-
-std::optional<proto::AuxIndexInfo>
-VectorIndexBuilder::buildFlatField(std::string_view fieldName,
-                                   const VectorFieldType& ft,
-                                   std::vector<std::string>& outFilesToSync) {
-  // dims=0 means "infer from first segment with values".  All segments must
-  // agree on dims; mismatch throws.
-  int32_t dims = ft.dims_;
-  faiss::MetricType metric = toFaissMetric(ft.metric_);
-  // Defer FAISS index construction until we know dims (might come from a
-  // later segment if the schema didn't pin it).
-  std::unique_ptr<faiss::IndexFlat> index;
-
-  // Chunked working buffer for the COSINE renormalization path.  Allocated
-  // lazily on first use, reused across segments.  Bounds working memory at
-  // ~renormChunkBytes regardless of segment size.
-  std::vector<float> renormBuf;
-
-  for (auto& seg : segments_) {
-    auto& pr = *seg.postingsReader;
-    MemPool pool;
-    FieldReader fr(pool, pr);
-    if (!fr.seek(fieldName)) continue;
-
-    SegFieldInfo fi;
-    fr.readFieldInfo(fi);
-    if (fi.type != FieldType::VECTOR) continue;
-
-    // Multi-valued is handled transparently: numVectors() counts all values across
-    // docs and the column stores them contiguously, so the add() calls below index
-    // every vector regardless of valued-ness.
-    VectorReader vr(pr, fi);
-    int32_t segDims = vr.dims();
-    if (segDims <= 0) continue;
-    if (dims == 0) {
-      dims = segDims;
-    } else if (dims != segDims) {
-      throw std::runtime_error(fmt::format(
-        "VectorIndexBuilder: dims mismatch in field {} (expected {}, segment {} has {})",
-        fieldName, dims, seg.segId, segDims));
-    }
-
-    int64_t numVals = vr.numVectors();
-    if (numVals == 0) continue;
-
-    if (!index) {
-      // IndexFlat keeps the entire vector array in process memory
-      // (IndexFlatCodes::codes is just a std::vector<uint8_t>).  Peak RAM
-      // during build is roughly 2x the vector data: once in the source column
-      // (mmap or RAM), once in FAISS.  write_index streams its output, so the
-      // serialization step doesn't add a third copy.
-      // For collections that don't fit in RAM, switch to an IndexIVF* variant
-      // with OnDiskInvertedLists, or HNSW/PQ for compressed in-memory storage.
-      index = std::make_unique<faiss::IndexFlat>(dims, metric);
-    }
-
-    // Vector storage is contiguous (fixed-size column), so for the no-renorm
-    // path we can hand FAISS the whole block at once.  No live filtering:
-    // deleted-doc vectors stay in the index until the next rebuild - query
-    // layer filters.
-    const float* base = (const float*)vr.vectorAtRank(0).data();
-    if (shouldNormalizeForFaiss(ft)) {
-      // Cosine via FAISS IP requires unit-norm vectors.  When the write path
-      // did not already normalize the column, copy in fixed-size chunks,
-      // normalize each chunk, then add.
-      size_t bytesPerVec = (size_t)dims * sizeof(float);
-      size_t chunkVecs = std::max((size_t)1, renormChunkBytes / bytesPerVec);
-      size_t chunkFloats = chunkVecs * (size_t)dims;
-      if (renormBuf.size() < chunkFloats) renormBuf.resize(chunkFloats);
-      for (int64_t off = 0; off < numVals; off += (int64_t)chunkVecs) {
-        int64_t n = std::min((int64_t)chunkVecs, numVals - off);
-        std::memcpy(renormBuf.data(), base + off * dims,
-                    (size_t)n * bytesPerVec);
-        faiss::fvec_renorm_L2((size_t)dims, (size_t)n, renormBuf.data());
-        index->add(n, renormBuf.data());
-      }
-    } else {
-      // Either non-cosine, already normalized on write, or user asserts
-      // vectors are already unit-norm.
-      index->add(numVals, base);
-    }
-  }
-
-  // No segment had any values - nothing to build.  Skip emitting an AuxIndexInfo.
-  if (!index) {
-    LOG_INFO("VectorIndexBuilder: field {} has no vectors; skipping", fieldName);
-    return std::nullopt;
-  }
-
-  // Compose name and file.
-  std::string auxName(NAME_PREFIX);
-  auxName.append(fieldName);
-  std::string faissFile = Postings::getAuxIndexFileName(auxName, indexGen_, 0);
-
-  // Write FAISS bytes via our Directory.
-  {
-    auto file = dir_.createFile(faissFile);
-    OutputStream os;
-    os.setFile(&*file);
-    FaissOutAdapter adapter(os);
-    faiss::write_index(index.get(), &adapter);
-    os.close();
-    dir_.finishFile(*file);
-  }
-
-  outFilesToSync.push_back(faissFile);
-
-  proto::AuxIndexInfo info;
-  info.set_kind(std::string(KIND));
-  info.set_field(std::string(fieldName));
-  info.set_name(std::move(auxName));
-  info.set_gen(indexGen_);
-  // Record the segment composition we built against; carried in IndexInfo so
-  // future commits can invalidate this entry when segments merge/split.
-  info.set_built_core_gen(coreGen_);
-  info.add_files(faissFile);
-  // opaque_meta stores fixed-width engine metadata.  ntotal is available from
-  // the FAISS index itself.
-  info.set_opaque_meta(makeVectorMeta(dims, ft, VectorAuxMeta::ENGINE_FLAT));
-
-  LOG_TRACE("VectorIndexBuilder: built {} ntotal={} dims={} metric={} file={}",
-           info.name(), index->ntotal, dims, (int)ft.metric_, faissFile);
-
-  return info;
 }
 
 std::optional<proto::AuxIndexInfo>
@@ -447,6 +320,13 @@ VectorIndexBuilder::buildIvfPqField(std::string_view fieldName,
     LOG_TRACE("VectorIndexBuilder: field {} has {} vectors, below IVF+PQ training floor {}; "
               "using flat-over-column fallback",
               fieldName, ntotal, requiredTraining);
+    return std::nullopt;
+  }
+  int64_t scanCost = ntotal * (int64_t)dims;
+  if (scanCost < ivfPqBuildThresholdScanCost) {
+    LOG_TRACE("VectorIndexBuilder: field {} scan cost {} below IVF+PQ build threshold {}; "
+              "using flat-over-column fallback",
+              fieldName, scanCost, ivfPqBuildThresholdScanCost);
     return std::nullopt;
   }
 
@@ -489,6 +369,7 @@ VectorIndexBuilder::buildIvfPqField(std::string_view fieldName,
   LOG_TRACE("VectorIndexBuilder: training IVF+PQ {} ntotal={} ntrain={} dims={} "
             "nlist={} M={} bits={} nprobe={}",
             fieldName, ntotal, ntrain, dims, nlist, pqM, pqBits, nprobe);
+  ivfPqBuildCountForTests++;
   index->train(ntrain, training.data());
   training.clear();
   training.shrink_to_fit();
@@ -511,7 +392,7 @@ VectorIndexBuilder::buildIvfPqField(std::string_view fieldName,
 
   std::string auxName(NAME_PREFIX);
   auxName.append(fieldName);
-  std::string faissFile = Postings::getAuxIndexFileName(auxName, indexGen_, 0);
+  std::string faissFile = Postings::getAuxIndexFileName(auxName, indexGen_, fileOrdinal_);
 
   {
     auto file = dir_.createFile(faissFile);
@@ -530,7 +411,6 @@ VectorIndexBuilder::buildIvfPqField(std::string_view fieldName,
   info.set_field(std::string(fieldName));
   info.set_name(std::move(auxName));
   info.set_gen(indexGen_);
-  info.set_built_core_gen(coreGen_);
   info.add_files(faissFile);
   info.set_opaque_meta(makeVectorMeta(
       dims, ft, VectorAuxMeta::ENGINE_IVFPQ, nlist, nprobe, pqM, pqBits));

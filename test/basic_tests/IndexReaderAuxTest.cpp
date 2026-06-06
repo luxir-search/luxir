@@ -3,8 +3,11 @@
 #include <faiss/Index.h>
 #include <faiss/MetricType.h>
 
+#include <atomic>
+#include <chrono>
 #include <memory>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "protos/solux_types.pb.h"
@@ -12,6 +15,7 @@
 #include "solux/index/VectorIndexBuilder.h"
 #include "solux/reader/AuxReader.h"
 #include "solux/reader/Postings.h"
+#include "solux/reader/TestOverlayAuxReader.h"
 #include "solux/reader/VectorAuxReader.h"
 #include "solux/schema/Schema.h"
 #include "solux/search/IndexReader.h"
@@ -26,14 +30,46 @@ using namespace solux::test;
 class IndexReaderAuxTest : public SoluxTest {
 protected:
   void SetUp() override {
-    VectorIndexBuilder::buildFaissFlatAuxIndexes = true;
     auto col = soluxNode->getCollection("main");
     col->setSchema(Schema::createDefaultSchema());
   }
 
-  void TearDown() override {
-    VectorIndexBuilder::buildFaissFlatAuxIndexes = false;
-  }
+  struct IvfPqGuard {
+    bool savedIvfPq;
+    int32_t savedNList;
+    int32_t savedM;
+    int32_t savedBits;
+    int32_t savedNProbe;
+    int64_t savedMinTraining;
+    int64_t savedBuildThreshold;
+
+    IvfPqGuard()
+      : savedIvfPq(VectorIndexBuilder::buildFaissIvfPqAuxIndexes),
+        savedNList(VectorIndexBuilder::ivfPqNList),
+        savedM(VectorIndexBuilder::ivfPqM),
+        savedBits(VectorIndexBuilder::ivfPqBits),
+        savedNProbe(VectorIndexBuilder::ivfPqDefaultNProbe),
+        savedMinTraining(VectorIndexBuilder::ivfPqMinTrainingVectors),
+        savedBuildThreshold(VectorIndexBuilder::ivfPqBuildThresholdScanCost) {
+      VectorIndexBuilder::buildFaissIvfPqAuxIndexes = true;
+      VectorIndexBuilder::ivfPqNList = 2;
+      VectorIndexBuilder::ivfPqM = 1;
+      VectorIndexBuilder::ivfPqBits = 1;
+      VectorIndexBuilder::ivfPqDefaultNProbe = 2;
+      VectorIndexBuilder::ivfPqMinTrainingVectors = 2;
+      VectorIndexBuilder::ivfPqBuildThresholdScanCost = 0;
+    }
+
+    ~IvfPqGuard() {
+      VectorIndexBuilder::buildFaissIvfPqAuxIndexes = savedIvfPq;
+      VectorIndexBuilder::ivfPqNList = savedNList;
+      VectorIndexBuilder::ivfPqM = savedM;
+      VectorIndexBuilder::ivfPqBits = savedBits;
+      VectorIndexBuilder::ivfPqDefaultNProbe = savedNProbe;
+      VectorIndexBuilder::ivfPqMinTrainingVectors = savedMinTraining;
+      VectorIndexBuilder::ivfPqBuildThresholdScanCost = savedBuildThreshold;
+    }
+  };
 
   // Install a schema where _v has metric=L2 so the suffix-rule fields
   // (e.g. "embedding_v") become eligible for FAISS aux indexing.
@@ -63,19 +99,40 @@ protected:
   }
 };
 
+namespace {
+
+std::vector<const proto::AuxIndexInfo*> vectorOverlays(const proto::IndexInfo& info) {
+  std::vector<const proto::AuxIndexInfo*> out;
+  for (const auto& seg : info.segments()) {
+    for (const auto& overlay : seg.overlays()) {
+      if (overlay.kind() == VectorIndexBuilder::KIND) out.push_back(&overlay);
+    }
+  }
+  return out;
+}
+
+const proto::AuxIndexInfo& onlyVectorOverlay(const proto::IndexInfo& info) {
+  auto overlays = vectorOverlays(info);
+  EXPECT_EQ(overlays.size(), 1u);
+  return *overlays[0];
+}
+
+} // namespace
+
 // Minimal happy path: build an aux index, open an IndexReader, and verify the
 // AuxReader is present, dispatched to VectorAuxReader, and the FAISS index
 // round-trips through deserialize_index correctly.
 TEST_F(IndexReaderAuxTest, opensVectorAuxAfterBuild) {
+  IvfPqGuard guard;
   CollectionHelper h("main");
   h.clear();
   enableL2OnVecSuffix(h.collection());
 
-  std::vector<std::vector<float>> vecs = {
-    {1, 0, 0, 0},
-    {0, 1, 0, 0},
-    {0, 0, 1, 0},
-  };
+  std::vector<std::vector<float>> vecs;
+  vecs.reserve(80);
+  for (int i = 0; i < 80; i++) {
+    vecs.push_back({(float)i, 1.0f, 0.0f, 0.0f});
+  }
   for (size_t i = 0; i < vecs.size(); i++) {
     h.index(flatdoc("id", "doc" + std::to_string(i), "embedding_v", vecs[i]));
   }
@@ -101,21 +158,18 @@ TEST_F(IndexReaderAuxTest, opensVectorAuxAfterBuild) {
   EXPECT_EQ(idx->d, 4);
   EXPECT_EQ(idx->ntotal, (faiss::idx_t)vecs.size());
   EXPECT_EQ(idx->metric_type, faiss::METRIC_L2);
-
-  // Sanity: querying the first vector returns itself at distance 0.
-  std::vector<faiss::idx_t> ids(1);
-  std::vector<float> dists(1);
-  idx->search(1, vecs[0].data(), 1, dists.data(), ids.data());
-  EXPECT_EQ(ids[0], 0);
-  EXPECT_FLOAT_EQ(dists[0], 0.0f);
 }
 
 TEST_F(IndexReaderAuxTest, cosineRawColumnSetsRescorePolicy) {
+  IvfPqGuard guard;
   CollectionHelper h("main");
   h.clear();
   enableCosineOnVecSuffix(h.collection(), false);
 
-  h.index(flatdoc("id", std::string("a"), "embedding_v", std::vector<float>{2, 0, 0}));
+  for (int i = 0; i < 80; i++) {
+    h.index(flatdoc("id", "doc" + std::to_string(i),
+                    "embedding_v", std::vector<float>{2.0f, (float)(i + 1), 0.0f, 0.0f}));
+  }
   h.commit({"*"});
 
   auto reader = std::make_shared<IndexReader>(h.getIndexWriter()->dir);
@@ -140,19 +194,19 @@ TEST_F(IndexReaderAuxTest, noAuxEntriesIsEmpty) {
   EXPECT_EQ(reader->getAuxReader("vec.embedding_v"), nullptr);
 }
 
-// Verifies that an IndexReader opened after a rebuild commit (which deletes
-// the previous gen's aux file) finds the new file cleanly.  Does NOT actually
-// trigger the retry loop - by the time the reader parses IndexInfo, it
-// already references the new file, so the first open attempt succeeds.  See
-// retryEscalatesWhenAuxFilePersistentlyMissing for a test that actually
-// exercises the retry path.
-TEST_F(IndexReaderAuxTest, opensCleanlyAfterRebuild) {
+// Verifies that an IndexReader opened after a tiny commit still sees the
+// carried overlay for the surviving segment.
+TEST_F(IndexReaderAuxTest, opensCleanlyAfterTinyCommitCarryForward) {
+  IvfPqGuard guard;
   CollectionHelper h("main");
   h.clear();
   enableL2OnVecSuffix(h.collection());
 
   // First commit + build.
-  h.index(flatdoc("id", std::string("a"), "embedding_v", std::vector<float>{1, 0, 0}));
+  for (int i = 0; i < 80; i++) {
+    h.index(flatdoc("id", "doc" + std::to_string(i),
+                    "embedding_v", std::vector<float>{(float)i, 0.0f, 1.0f, 0.0f}));
+  }
   h.commit({"*"});
 
   auto& dir = h.getIndexWriter()->dir;
@@ -179,21 +233,17 @@ TEST_F(IndexReaderAuxTest, opensCleanlyAfterRebuild) {
     proto::IndexInfo info;
     auto is = infoFile->getInputStream();
     ASSERT_TRUE(info.ParseFromArray(is.ptr(), (int)is.left()));
-    ASSERT_EQ(info.aux_indexes_size(), 1);
-    ASSERT_EQ(info.aux_indexes(0).files_size(), 1);
-    oldFile = info.aux_indexes(0).files(0);
+    const auto& auxInfo = onlyVectorOverlay(info);
+    ASSERT_EQ(auxInfo.files_size(), 1);
+    oldFile = auxInfo.files(0);
   }
 
-  // Now publish a second commit that rebuilds (new file).  Both writes are
-  // synchronous via CollectionHelper, so by the time it returns the new
-  // IndexInfo + aux file are durable and the old aux file has been cleaned up
-  // by deleteOrphanedAuxFiles.
+  // Publish a tiny below-threshold segment.  It should not build a new ANN
+  // overlay and should not disturb the old segment's overlay.
   h.index(flatdoc("id", std::string("b"), "embedding_v", std::vector<float>{0, 1, 0}));
   h.commit({"*"});
 
-  // Old file should be gone; new IndexReader opens cleanly against the new
-  // commit's referenced file.
-  EXPECT_EQ(dir.openFile(oldFile), nullptr) << "old aux file should be deleted";
+  EXPECT_NE(dir.openFile(oldFile), nullptr) << "carried aux file should survive";
 
   auto reader2 = std::make_shared<IndexReader>(dir);
   ASSERT_EQ(reader2->auxReaders().size(), 1u);
@@ -201,8 +251,7 @@ TEST_F(IndexReaderAuxTest, opensCleanlyAfterRebuild) {
   ASSERT_NE(aux2, nullptr);
   auto* vaux2 = dynamic_cast<VectorAuxReader*>(aux2.get());
   ASSERT_NE(vaux2, nullptr);
-  // Two docs across two segments -> ntotal == 2.
-  EXPECT_EQ(vaux2->getFaissIndex()->ntotal, 2);
+  EXPECT_EQ(vaux2->getFaissIndex()->ntotal, 80);
 }
 
 // Real retry-trigger: physically delete the aux file referenced by the
@@ -216,11 +265,15 @@ TEST_F(IndexReaderAuxTest, opensCleanlyAfterRebuild) {
 // the retry window) need a Directory wrapper that can simulate the race -
 // not in scope for this test.
 TEST_F(IndexReaderAuxTest, retryEscalatesWhenAuxFilePersistentlyMissing) {
+  IvfPqGuard guard;
   CollectionHelper h("main");
   h.clear();
   enableL2OnVecSuffix(h.collection());
 
-  h.index(flatdoc("id", std::string("a"), "embedding_v", std::vector<float>{1, 0, 0}));
+  for (int i = 0; i < 80; i++) {
+    h.index(flatdoc("id", "doc" + std::to_string(i),
+                    "embedding_v", std::vector<float>{(float)i, 0.0f, 1.0f, 0.0f}));
+  }
   h.commit({"*"});
 
   auto& dir = h.getIndexWriter()->dir;
@@ -233,9 +286,9 @@ TEST_F(IndexReaderAuxTest, retryEscalatesWhenAuxFilePersistentlyMissing) {
     proto::IndexInfo info;
     auto is = infoFile->getInputStream();
     ASSERT_TRUE(info.ParseFromArray(is.ptr(), (int)is.left()));
-    ASSERT_EQ(info.aux_indexes_size(), 1);
-    ASSERT_EQ(info.aux_indexes(0).files_size(), 1);
-    auxFile = info.aux_indexes(0).files(0);
+    const auto& auxInfo = onlyVectorOverlay(info);
+    ASSERT_EQ(auxInfo.files_size(), 1);
+    auxFile = auxInfo.files(0);
   }
   ASSERT_TRUE(dir.deleteFile(auxFile));
 
@@ -252,18 +305,20 @@ TEST_F(IndexReaderAuxTest, retryEscalatesWhenAuxFilePersistentlyMissing) {
   h.clear();
 }
 
-// Carry-forward reuse: when the new commit's aux entry has the same name +
-// gen + built_core_gen as the previous reader's, IndexReader reuses the
-// previous AuxReader instance instead of re-deserializing.  We verify by
-// checking pointer identity.
+// Carry-forward reuse: when the new commit's segment overlay has the same
+// name + gen as the previous reader's, IndexReader reuses the previous
+// AuxReader instance instead of re-deserializing.  We verify by pointer identity.
 TEST_F(IndexReaderAuxTest, reusesAuxReaderOnCarryForward) {
+  IvfPqGuard guard;
   CollectionHelper h("main");
   h.clear();
   enableL2OnVecSuffix(h.collection());
 
   // Build aux index.
-  h.index(flatdoc("id", std::string("a"), "embedding_v", std::vector<float>{1, 0, 0}));
-  h.index(flatdoc("id", std::string("b"), "embedding_v", std::vector<float>{0, 1, 0}));
+  for (int i = 0; i < 80; i++) {
+    h.index(flatdoc("id", "doc" + std::to_string(i),
+                    "embedding_v", std::vector<float>{(float)i, 1.0f, 0.0f, 0.0f}));
+  }
   h.commit({"*"});
 
   auto& dir = h.getIndexWriter()->dir;
@@ -272,9 +327,9 @@ TEST_F(IndexReaderAuxTest, reusesAuxReaderOnCarryForward) {
   auto aux1 = reader1->getAuxReader("vec.embedding_v");
   ASSERT_NE(aux1, nullptr);
 
-  // Delete-only commit: segment composition unchanged -> coreGen unchanged ->
-  // aux entry carried forward with identical name/gen/built_core_gen.
-  std::vector<std::string> ids{"a"};
+  // Delete-only commit: the segment survives, so its overlay is carried by
+  // segment liveness with identical name/gen.
+  std::vector<std::string> ids{"doc0"};
   h.deleteByIds(ids, UpdateMessage::COMMIT);
 
   auto reader2 = std::make_shared<IndexReader>(dir, reader1.get());
@@ -287,34 +342,114 @@ TEST_F(IndexReaderAuxTest, reusesAuxReaderOnCarryForward) {
     << "aux reader should be reused across reopens when the entry is carried forward";
 }
 
-// New build (different gen / different built_core_gen) -> previous reader's
-// aux is NOT reused; a fresh AuxReader is constructed.
-TEST_F(IndexReaderAuxTest, rebuildsAuxReaderOnNewGen) {
+// Adding an above-threshold segment builds a second overlay.  The surviving
+// segment's reader is reused; the new segment gets a fresh reader.
+TEST_F(IndexReaderAuxTest, newSegmentGetsFreshAuxReader) {
+  IvfPqGuard guard;
   CollectionHelper h("main");
   h.clear();
   enableL2OnVecSuffix(h.collection());
 
-  h.index(flatdoc("id", std::string("a"), "embedding_v", std::vector<float>{1, 0, 0}));
+  for (int i = 0; i < 80; i++) {
+    h.index(flatdoc("id", "a" + std::to_string(i),
+                    "embedding_v", std::vector<float>{(float)i, 0.0f, 1.0f, 0.0f}));
+  }
   h.commit({"*"});
 
   auto& dir = h.getIndexWriter()->dir;
   auto reader1 = std::make_shared<IndexReader>(dir);
-  auto aux1 = reader1->getAuxReader("vec.embedding_v");
+  ASSERT_EQ(reader1->segments().size(), 1u);
+  auto aux1 = reader1->segments()[0].getAuxReader("vec.embedding_v");
   ASSERT_NE(aux1, nullptr);
 
-  // Add a doc + rebuild - produces a new gen of files; coreGen also bumps
-  // because segment composition changed.
-  h.index(flatdoc("id", std::string("b"), "embedding_v", std::vector<float>{0, 1, 0}));
+  // Add another above-threshold segment and build only its missing overlay.
+  for (int i = 0; i < 80; i++) {
+    h.index(flatdoc("id", "b" + std::to_string(i),
+                    "embedding_v", std::vector<float>{0.0f, (float)i, 1.0f, 0.0f}));
+  }
   h.commit({"*"});
 
   auto reader2 = std::make_shared<IndexReader>(dir, reader1.get());
-  auto aux2 = reader2->getAuxReader("vec.embedding_v");
-  ASSERT_NE(aux2, nullptr);
-  EXPECT_NE(aux1.get(), aux2.get())
-    << "aux reader should be re-deserialized when gen/built_core_gen change";
-  auto* vaux2 = dynamic_cast<VectorAuxReader*>(aux2.get());
+  ASSERT_EQ(reader2->segments().size(), 2u);
+  auto aux2a = reader2->segments()[0].getAuxReader("vec.embedding_v");
+  auto aux2b = reader2->segments()[1].getAuxReader("vec.embedding_v");
+  ASSERT_NE(aux2a, nullptr);
+  ASSERT_NE(aux2b, nullptr);
+  EXPECT_EQ(aux1.get(), aux2a.get());
+  EXPECT_NE(aux1.get(), aux2b.get());
+  auto* vaux2 = dynamic_cast<VectorAuxReader*>(aux2b.get());
   ASSERT_NE(vaux2, nullptr);
-  EXPECT_EQ(vaux2->getFaissIndex()->ntotal, 2);
+  EXPECT_EQ(vaux2->getFaissIndex()->ntotal, 80);
+}
+
+TEST_F(IndexReaderAuxTest, testOverlayConcurrentOpenHammer) {
+  CollectionHelper h("main");
+  h.clear();
+  auto iw = h.getIndexWriter();
+  iw->mergePolicy->setMergeFactor(100);
+
+  for (int seg = 0; seg < 2; seg++) {
+    h.index(flatdoc("id", "seed" + std::to_string(seg)));
+    h.commit({std::string(TestOverlayAuxReader::NAME)});
+  }
+
+  auto& dir = iw->dir;
+  auto oldReader = std::make_shared<IndexReader>(dir);
+  ASSERT_GT(oldReader->segments().size(), 0u);
+  for (const auto& seg : oldReader->segments()) {
+    auto aux = seg.getAuxReader(TestOverlayAuxReader::NAME);
+    ASSERT_NE(aux, nullptr);
+    auto* testAux = dynamic_cast<TestOverlayAuxReader*>(aux.get());
+    ASSERT_NE(testAux, nullptr);
+    EXPECT_GT(testAux->size(), 0u);
+  }
+
+  iw->mergePolicy->setMergeFactor(2);
+  iw->mergePolicy->refresh();
+
+  std::atomic_bool stop{false};
+  std::atomic_int failures{0};
+  std::vector<std::thread> readers;
+  for (int t = 0; t < 4; t++) {
+    readers.emplace_back([&]() {
+      while (!stop.load()) {
+        try {
+          auto reader = std::make_shared<IndexReader>(dir);
+          for (const auto& seg : reader->segments()) {
+            auto aux = seg.getAuxReader(TestOverlayAuxReader::NAME);
+            if (!aux) continue;
+            auto* testAux = dynamic_cast<TestOverlayAuxReader*>(aux.get());
+            if (testAux == nullptr || testAux->size() == 0) {
+              failures.fetch_add(1);
+            }
+          }
+        } catch (const std::exception&) {
+          failures.fetch_add(1);
+        }
+      }
+    });
+  }
+
+  for (int i = 0; i < 20; i++) {
+    h.index(flatdoc("id", "doc" + std::to_string(i)));
+    h.commit({std::string(TestOverlayAuxReader::NAME)});
+    if (i % 4 == 3) {
+      iw->mergeSegments();
+      h.commit({std::string(TestOverlayAuxReader::NAME)});
+    }
+  }
+
+  stop.store(true);
+  for (auto& thread : readers) thread.join();
+  EXPECT_EQ(failures.load(), 0);
+
+  for (const auto& seg : oldReader->segments()) {
+    auto aux = seg.getAuxReader(TestOverlayAuxReader::NAME);
+    ASSERT_NE(aux, nullptr);
+    auto* testAux = dynamic_cast<TestOverlayAuxReader*>(aux.get());
+    ASSERT_NE(testAux, nullptr);
+    EXPECT_GT(testAux->size(), 0u);
+  }
 }
 
 // Unknown aux kinds in IndexInfo are ignored, not treated as missing files.
@@ -323,10 +458,8 @@ TEST_F(IndexReaderAuxTest, rebuildsAuxReaderOnNewGen) {
 TEST_F(IndexReaderAuxTest, unknownAuxKindIsSkipped) {
   CollectionHelper h("main");
   h.clear();
-  enableL2OnVecSuffix(h.collection());
 
-  h.index(flatdoc("id", std::string("a"), "embedding_v", std::vector<float>{1, 0, 0}));
-  h.commit({"*"});
+  h.index(flatdoc("id", std::string("a")), UpdateMessage::COMMIT);
 
   auto& dir = h.getIndexWriter()->dir;
 
@@ -338,7 +471,6 @@ TEST_F(IndexReaderAuxTest, unknownAuxKindIsSkipped) {
     auto is = f->getInputStream();
     ASSERT_TRUE(info.ParseFromArray(is.ptr(), (int)is.left()));
   }
-  ASSERT_EQ(info.aux_indexes_size(), 1);
   auto* extra = info.add_aux_indexes();
   extra->set_kind("future_kind_abc");
   extra->set_name("future.foo");
@@ -355,9 +487,8 @@ TEST_F(IndexReaderAuxTest, unknownAuxKindIsSkipped) {
     dir.finishFile(*out);
   }
 
-  // Open should succeed: known entry present, unknown one skipped silently.
+  // Open should succeed: the unknown entry is skipped silently.
   auto reader = std::make_shared<IndexReader>(dir);
-  ASSERT_EQ(reader->auxReaders().size(), 1u);
-  EXPECT_NE(reader->getAuxReader("vec.embedding_v"), nullptr);
+  ASSERT_EQ(reader->auxReaders().size(), 0u);
   EXPECT_EQ(reader->getAuxReader("future.foo"), nullptr);
 }

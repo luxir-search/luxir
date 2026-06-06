@@ -5,6 +5,7 @@
 #include <span>
 #include <boost/unordered/unordered_flat_map.hpp>
 #include <oneapi/tbb/flow_graph.h>
+#include "protos/solux_types.pb.h"
 #include "solux/store/Directory.h"
 #include "solux/search/IndexReader.h"
 #include "solux/server/SoluxError.h"
@@ -59,6 +60,11 @@ namespace solux {
     // Filenames written for this segment that have not yet been fsynced.
     // Populated by PostingsWriter::finish() and drained at commit time.
     std::vector<std::string> unsyncedFiles;
+
+    // Segment-local aux overlays recorded in SegmentInfo.overlays.  Vector
+    // ANN entries are carried by segment liveness; coreGen does not
+    // participate.
+    std::vector<proto::AuxIndexInfo> auxOverlays;
 
     SegInfo(uint64_t segId, int nDocs) : segId(segId), maxDoc(nDocs), liveDocs(nDocs) {}
 
@@ -291,6 +297,11 @@ public:
   // (files referenced by the previous list but not the new one are deleted).
   std::vector<proto::AuxIndexInfo> currentAuxIndexes_;
 
+  // Flat copy of all segment overlays referenced by the last published
+  // IndexInfo.  Used only for orphan-file cleanup after publishing a new
+  // IndexInfo; the authoritative per-segment copy lives on SegInfo.
+  std::vector<proto::AuxIndexInfo> currentSegmentOverlays_;
+
   // commit info for the index, used to track deletes.
   // This is moved to the UpdateMessage when a commit is processed and a new one is created for the next commit.
   std::unique_ptr<CommitInfo> nextCommitInfo;
@@ -448,6 +459,10 @@ private:
   std::vector<proto::AuxIndexInfo> buildAuxIndexes(const UpdateMessage& msg,
                                                    std::span<SegInfo*> segsToKeep,
                                                    std::vector<std::string>& outFilesToSync);
+  void buildSegmentOverlays(const UpdateMessage& msg,
+                            std::span<SegInfo*> segsToKeep,
+                            std::vector<std::string>& outFilesToSync);
+  std::vector<proto::AuxIndexInfo> flattenSegmentOverlays(std::span<SegInfo*> segs) const;
   // Delete files referenced by `oldList` that aren't referenced by `newList`.
   // Call only after the new IndexInfo file is durable.
   void deleteOrphanedAuxFiles(const std::vector<proto::AuxIndexInfo>& oldList,
@@ -467,6 +482,10 @@ public:
   // This is difficult to get right though... we should really add the ability to empty the index through
   // the API and then use that (prob through the merge code since it's the only place segments are removed)
   void testDeleteAllData();
+
+  // Test hook for the rebuild-without-reindex path: remove an overlay entry
+  // from one live segment, leaving the segment data untouched.
+  bool testDropSegmentOverlay(std::string_view name, size_t segmentOrd);
 
   // dump some useful info for tests
   void debugInfo();

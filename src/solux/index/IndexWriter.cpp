@@ -1,5 +1,7 @@
 #include "IndexWriter.h"
 
+#include <algorithm>
+
 #include <boost/sort/spreadsort/string_sort.hpp>
 #include <boost/unordered/unordered_flat_set.hpp>
 #include <oneapi/tbb/task_group.h>
@@ -16,6 +18,7 @@
 #include "solux/util/thread.h"
 #include "SegmentMerger.h"
 #include "VectorIndexBuilder.h"
+#include "solux/reader/TestOverlayAuxReader.h"
 
 
 namespace solux {
@@ -103,6 +106,11 @@ IndexWriter::IndexWriter(Directory& dir, std::function<std::shared_ptr<Schema>()
       seg.schemaGen = segment.schema_gen();
       seg.firstCommitTime = segment.commit_time();  // firstCommitTime is stored in the segment meta.
       seg.lastCommitTime = indexInfo.commit_time(); // not stored in the segment meta, so use index meta.
+      seg.auxOverlays.reserve(segment.overlays_size());
+      for (int j = 0; j < segment.overlays_size(); j++) {
+        seg.auxOverlays.push_back(segment.overlays(j));
+        currentSegmentOverlays_.push_back(segment.overlays(j));
+      }
       mergePolicy->_update(&seg);
       lastCommittedSegIds.push_back(segId);
     }
@@ -333,14 +341,6 @@ void IndexWriter::commit(UpdateMessage::CommitType commitType) {
 
 void IndexWriter::initiateCommit(UpdateMessage& msg) {
   INDEX_DEBUG("initiateCommit: msg={} STARTING", (void*)&msg);
-
-  // A commit that requests aux index builds must run finishCommitBody after
-  // any in-flight merges have finished - otherwise the merge-triggered
-  // synthetic commit can race in behind us, bump coreGen, and invalidate the
-  // aux we just built.  Same gating mechanism as flushes (leftToFlush).
-  if (!msg.buildAuxIndexes.empty()) {
-    msg.waitForMerges = true;
-  }
 
   {
     const std::lock_guard<std::mutex> lock(indexMutex);
@@ -760,9 +760,12 @@ void IndexWriter::finishCommitBody(UpdateMessage& msg) {
     msg.commitInfo->coreGen = coreGen;
   }
 
-  // Build aux (vector) indexes if requested.  Done before the IndexInfo file is
-  // written so the file references the new aux artifacts atomically.
+  // Build aux indexes if requested.  Vector overlays are segment-local and are
+  // carried by segment liveness; index-level aux remains for future non-vector
+  // kinds only.
   auto auxIndexInfos = buildAuxIndexes(msg, segsToKeep, filesToSync);
+  buildSegmentOverlays(msg, segsToKeep, filesToSync);
+  auto segmentOverlayInfos = flattenSegmentOverlays(segsToKeep);
 
   // Fsync all segment data and liveDocs files before writing the commit point.
   // "." syncs the directory to make renames durable.
@@ -779,6 +782,8 @@ void IndexWriter::finishCommitBody(UpdateMessage& msg) {
   // Then publish the new list for the next commit's carry-forward.
   deleteOrphanedAuxFiles(currentAuxIndexes_, auxIndexInfos);
   currentAuxIndexes_ = std::move(auxIndexInfos);
+  deleteOrphanedAuxFiles(currentSegmentOverlays_, segmentOverlayInfos);
+  currentSegmentOverlays_ = std::move(segmentOverlayInfos);
 
   // Only move the segment to the delete list after the new IndexInfo file is written.
   // This way it should be safe for other threads to also try deletions.
@@ -859,26 +864,15 @@ void IndexWriter::moveSegmentToDelete(uint64_t segId) {
 }
 
 
-// Produce the aux index list to publish in this commit's IndexInfo.
-//
-// Semantics:
-//   - First, filter the previous list:
-//       * Entries with built_core_gen > 0 and != newCoreGen are dropped
-//         (segment composition changed -> segment-mapped indexes like FAISS
-//         are stale; their files will be cleaned up after the commit).
-//       * Entries with built_core_gen == 0 are always carried forward
-//         (aux kinds robust to segment changes - future autocomplete, etc).
-//   - Then, if the message requested rebuilds, build matching fields, drop
-//     any carried entries whose names get rebuilt, and append the new ones.
-//
-// Aux index files are appended to outFilesToSync so they share the pre-commit
-// fsync.  Called from finishCommitBody after deletes have been applied but
-// before writeIndexInfoFile.  finishCommitBody must have set
-// msg.commitInfo->indexGen to the gen this commit will be published under.
+// Produce the index-level aux list to publish in this commit's IndexInfo.
+// Vectors are not built here; they are segment overlays handled by
+// buildSegmentOverlays.  The old built_core_gen filter remains only for
+// future index-level aux kinds that choose to use it.
 std::vector<proto::AuxIndexInfo> IndexWriter::buildAuxIndexes(
     const UpdateMessage& msg,
     std::span<SegInfo*> segsToKeep,
     std::vector<std::string>& outFilesToSync) {
+  unused(segsToKeep, outFilesToSync);
   // finishCommitBody assigns indexGen + coreGen up front so all commit-stage
   // artifacts share these values.
   assert(msg.commitInfo && msg.commitInfo->indexGen > 0);
@@ -890,63 +884,137 @@ std::vector<proto::AuxIndexInfo> IndexWriter::buildAuxIndexes(
   // the builder to skip them.
   std::vector<proto::AuxIndexInfo> carried;
   carried.reserve(currentAuxIndexes_.size());
-  boost::unordered_flat_set<std::string> stillValid;
   for (const auto& prev : currentAuxIndexes_) {
+    if (prev.kind() == VectorIndexBuilder::KIND) {
+      continue;
+    }
     if (prev.built_core_gen() == 0 || prev.built_core_gen() == newCoreGen) {
       carried.push_back(prev);
-      if (prev.built_core_gen() == newCoreGen) {
-        stillValid.emplace(prev.name());
+    }
+  }
+
+  return carried;
+}
+
+void IndexWriter::buildSegmentOverlays(const UpdateMessage& msg,
+                                       std::span<SegInfo*> segsToKeep,
+                                       std::vector<std::string>& outFilesToSync) {
+  if (segsToKeep.empty()) {
+    return;
+  }
+  assert(msg.commitInfo && msg.commitInfo->indexGen > 0);
+
+  auto selectorMatches = [](const std::vector<std::string>& selectors, std::string_view name) {
+    for (const auto& s : selectors) {
+      if (s == name) return true;
+    }
+    return false;
+  };
+
+  if (selectorMatches(msg.buildAuxIndexes, TestOverlayAuxReader::NAME)) {
+    for (size_t i = 0; i < segsToKeep.size(); i++) {
+      auto* seg = segsToKeep[i];
+      bool exists = false;
+      for (const auto& overlay : seg->auxOverlays) {
+        if (overlay.kind() == TestOverlayAuxReader::KIND
+            && overlay.name() == TestOverlayAuxReader::NAME) {
+          exists = true;
+          break;
+        }
+      }
+      if (exists) continue;
+
+      std::string fileName = Postings::getAuxIndexFileName(
+        TestOverlayAuxReader::NAME, msg.commitInfo->indexGen, (uint32_t)i);
+      {
+        auto file = dir.createFile(fileName);
+        OutputStream os;
+        os.setFile(&*file);
+        static constexpr std::string_view payload = "solux test overlay\n";
+        os.write(payload.data(), payload.size());
+        os.close();
+        dir.finishFile(*file);
+      }
+      outFilesToSync.push_back(fileName);
+
+      proto::AuxIndexInfo info;
+      info.set_kind(std::string(TestOverlayAuxReader::KIND));
+      info.set_name(std::string(TestOverlayAuxReader::NAME));
+      info.set_gen(msg.commitInfo->indexGen);
+      info.add_files(fileName);
+      info.set_opaque_meta("test");
+      seg->auxOverlays.push_back(std::move(info));
+    }
+  }
+
+  std::vector<std::string> vectorSelectors;
+  boost::unordered_flat_set<std::string> seenVectorSelectors;
+  for (const auto& selector : msg.buildAuxIndexes) {
+    if (selector == "*" || selector.starts_with(VectorIndexBuilder::NAME_PREFIX)) {
+      if (seenVectorSelectors.emplace(selector).second) {
+        vectorSelectors.push_back(selector);
       }
     }
   }
 
-  // Step 2: if no rebuild requested, return carried list as-is.
-  if (msg.buildAuxIndexes.empty() || !schemaProvider_ || segsToKeep.empty()) {
-    return carried;
+  if (vectorSelectors.empty()) {
+    for (const auto& overlay : currentSegmentOverlays_) {
+      if (overlay.kind() != VectorIndexBuilder::KIND) continue;
+      if (seenVectorSelectors.emplace(overlay.name()).second) {
+        vectorSelectors.emplace_back(overlay.name());
+      }
+    }
+  }
+
+  if (vectorSelectors.empty() || !schemaProvider_) {
+    return;
   }
   auto schema = schemaProvider_();
-  if (!schema) return carried;
+  if (!schema) {
+    return;
+  }
 
-  // Step 3: build new entries for matching fields.
-  // Hold the PostingsReader shared_ptrs alive for the duration of the build,
-  // then point the builder's input struct at the raw pointers.  segsToKeep is
-  // already sorted by segId at finishCommitBody time.
   std::vector<std::shared_ptr<PostingsReader>> prHolders;
-  std::vector<VectorIndexBuilder::SegInput> inputs;
   prHolders.reserve(segsToKeep.size());
-  inputs.reserve(segsToKeep.size());
-  for (auto* seg : segsToKeep) {
+  for (size_t i = 0; i < segsToKeep.size(); i++) {
+    auto* seg = segsToKeep[i];
+    boost::unordered_flat_set<std::string> skipNames;
+    for (const auto& overlay : seg->auxOverlays) {
+      if (overlay.kind() == VectorIndexBuilder::KIND) {
+        skipNames.emplace(overlay.name());
+      }
+    }
+
     auto pr = seg->sharedPostingsReader.load();
     if (!pr) {
       pr = std::make_shared<PostingsReader>(dir, seg->segId);
       seg->sharedPostingsReader.store(pr);
     }
-    inputs.push_back({seg->segId, pr.get()});
-    prHolders.push_back(std::move(pr));
-  }
+    VectorIndexBuilder::SegInput input{seg->segId, pr.get()};
+    prHolders.push_back(pr);
 
-  VectorIndexBuilder vb(dir, std::span<const VectorIndexBuilder::SegInput>(inputs),
-                        *schema, msg.commitInfo->indexGen, newCoreGen);
-  auto newlyBuilt = vb.build(msg.buildAuxIndexes, stillValid, outFilesToSync);
-
-  // Step 4: merge - drop carried entries whose name was rebuilt, then append.
-  boost::unordered_flat_set<std::string> rebuiltNames;
-  rebuiltNames.reserve(newlyBuilt.size());
-  for (const auto& info : newlyBuilt) rebuiltNames.emplace(info.name());
-
-  std::vector<proto::AuxIndexInfo> merged;
-  merged.reserve(carried.size() + newlyBuilt.size());
-  for (const auto& prev : carried) {
-    if (!rebuiltNames.contains(std::string(prev.name()))) {
-      merged.push_back(prev);
+    VectorIndexBuilder vb(dir, std::span<const VectorIndexBuilder::SegInput>(&input, 1),
+                          *schema, msg.commitInfo->indexGen, msg.commitInfo->coreGen,
+                          (uint32_t)i);
+    auto newlyBuilt = vb.build(vectorSelectors, skipNames, outFilesToSync);
+    for (auto& info : newlyBuilt) {
+      seg->auxOverlays.push_back(std::move(info));
     }
   }
-  for (auto& info : newlyBuilt) {
-    merged.push_back(std::move(info));
-  }
-  return merged;
 }
 
+std::vector<proto::AuxIndexInfo> IndexWriter::flattenSegmentOverlays(std::span<SegInfo*> segs) const {
+  std::vector<proto::AuxIndexInfo> out;
+  size_t total = 0;
+  for (auto* seg : segs) total += seg->auxOverlays.size();
+  out.reserve(total);
+  for (auto* seg : segs) {
+    for (const auto& overlay : seg->auxOverlays) {
+      out.push_back(overlay);
+    }
+  }
+  return out;
+}
 
 // After a successful IndexInfo write, delete files referenced by the previous
 // aux index list that aren't referenced by the new one.  Carried-forward
@@ -1063,6 +1131,13 @@ void IndexWriter::writeIndexInfoFile(std::span<SegInfo*> segs, CommitInfo* commi
     segmentInfo->set_commit_time(seg->firstCommitTime);
     segmentInfo->set_live_docs(seg->liveDocs);
     segmentInfo->set_schema_gen(seg->schemaGen);
+    for (const auto& overlay : seg->auxOverlays) {
+      auto* dst = segmentInfo->add_overlays();
+      *dst = overlay;
+      if (dst->commit_time() == 0) {
+        dst->set_commit_time(now_us);
+      }
+    }
 
     numDocs += seg->maxDoc;
     INDEX_DEBUG("\t{}", *seg);
@@ -1463,6 +1538,7 @@ void IndexWriter::testDeleteAllData() {
     coreGen = 0;
     lastCommittedSegIds.clear();
     currentAuxIndexes_.clear();
+    currentSegmentOverlays_.clear();
     nextCommitInfo = std::make_unique<CommitInfo>();
 
     lastCommitTime = lastAdvertisedCommitTime = 0;
@@ -1473,6 +1549,33 @@ void IndexWriter::testDeleteAllData() {
 
 
   // don't touch commitNumber or updateNumber... the TBB graph relies on the exact sequence of numbers.
+}
+
+bool IndexWriter::testDropSegmentOverlay(std::string_view name, size_t segmentOrd) {
+  std::lock_guard<std::mutex> lock(indexMutex);
+  if (segmentOrd >= segInfos.size()) return false;
+
+  std::vector<SegInfo*> ordered;
+  ordered.reserve(segInfos.size());
+  for (auto& [segId, seg] : segInfos) {
+    unused(segId);
+    ordered.push_back(seg.get());
+  }
+  std::sort(ordered.begin(), ordered.end(), [](const SegInfo* a, const SegInfo* b) {
+    if (a->firstCommitTime != b->firstCommitTime) {
+      return a->firstCommitTime < b->firstCommitTime;
+    }
+    return a->segId < b->segId;
+  });
+
+  auto& overlays = ordered[segmentOrd]->auxOverlays;
+  auto oldSize = overlays.size();
+  std::erase_if(overlays, [&](const proto::AuxIndexInfo& info) {
+    return info.name() == name;
+  });
+  if (overlays.size() == oldSize) return false;
+  currentSegmentOverlays_ = flattenSegmentOverlays(std::span<SegInfo*>(ordered.data(), ordered.size()));
+  return true;
 }
 
 // TEST CODE

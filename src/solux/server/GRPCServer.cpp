@@ -36,8 +36,11 @@ GRPCServer::GRPCServer(SoluxNode& node, int nthreads, int port)
 void solux::GRPCServer::run() {
   pthread_setname_np(pthread_self(), "solux_grpc_main");
 
-  // Use requestedPort (default 0 for dynamic allocation, or a specific port like 50051)
-  std::string server_address = "0.0.0.0:" + std::to_string(requestedPort);
+  // Use requestedPort (default 0 for dynamic allocation, or a specific port
+  // like 50051).  Dynamic test ports bind localhost; configured ports keep the
+  // existing all-interfaces behavior.
+  std::string bindHost = requestedPort == 0 ? "127.0.0.1" : "0.0.0.0";
+  std::string server_address = bindHost + ":" + std::to_string(requestedPort);
 
   grpc::EnableDefaultHealthCheckService(true);
   grpc::reflection::InitProtoReflectionServerBuilderPlugin();
@@ -53,7 +56,6 @@ void solux::GRPCServer::run() {
   builder.RegisterService(&searcherService);
   builder.RegisterService(&adminService);
 
-  threads.reserve(nthreads);
   threadInfos.reserve(nthreads);
 
   // Give each thread a completion queue, but don't let them use it
@@ -62,11 +64,21 @@ void solux::GRPCServer::run() {
     threadInfos.emplace_back();
     threadInfos.back().threadno = i;
     threadInfos.back().cq = builder.AddCompletionQueue(); // each thread gets it's own completion queue
-    threads.emplace_back([this,i]{ this->runThread(threadInfos[i]); });
   }
 
   this->server = builder.BuildAndStart();
-  LOG_INFO("GRPCServer listening on 0.0.0.0:{}", serverPort);
+  if (!server) {
+    LOG_ERROR("GRPCServer failed to listen on {}", server_address);
+    startLatch.count_down();
+    startLatchThreads.count_down(nthreads);
+    return;
+  }
+  LOG_INFO("GRPCServer listening on {}:{}", bindHost, serverPort);
+
+  threads.reserve(nthreads);
+  for (int i=0; i<nthreads; i++) {
+    threads.emplace_back([this,i]{ this->runThread(threadInfos[i]); });
+  }
 
   // inform everyone that the server is up and running
   startLatch.count_down();
@@ -890,7 +902,7 @@ void GRPCServer::runThread(ThreadInfo& threadInfo) {
 
 bool GRPCServer::waitForStart() {
   startLatchThreads.wait();
-  return true;
+  return server != nullptr;
 }
 
 /*** NOTE: after upgrading from grpc1.41 (and dependencies) to grpc1.44 via vcpkg,
@@ -915,6 +927,9 @@ bool GRPCServer::waitForStart() {
  */
 void solux::GRPCServer::shutdown() {
   LOG_INFO("Shutting down solux grpc server.");
+  if (!server) {
+    return;
+  }
 
   // server should be shut down before completion queues
   server->Shutdown();

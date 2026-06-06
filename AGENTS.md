@@ -36,7 +36,10 @@ generated `*.pb.h` headers must exist). See [docs/build-setup.md](docs/build-set
 # Run specific test suite
 ./build/gcc-debug/bin/solux_test --gtest_filter="IndexWriterTest.*"
 
-# Run benchmarks
+# Run benchmarks (NOTE: builds production-scale corpora - slow setup, use
+# gcc-release and memory caps (ulimit -v 32000000) for real measurements.
+# For quick iteration/coverage use the small-corpus unit-test mode instead:
+#   ./build/gcc-debug/bin/solux_test --gtest_filter="Benchmarks.all"
 ./build/gcc-debug/bin/solux_test --bench
 
 # Run the same suite under ASan before committing

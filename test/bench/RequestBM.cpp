@@ -16,6 +16,10 @@ static void BM_Req(benchmark::State& state, int writers, int readers, bool async
   unused(writers,readers);
   
   auto channel = GrpcSoluxTest::getChannel();
+  if (GrpcSoluxTest::startFailed()) {
+    state.SkipWithError("gRPC test server failed to start in this environment");
+    return;
+  }
   std::unique_ptr<solux::Greeter::Stub> greeterStub = solux::Greeter::NewStub(channel);
 
   solux::HelloRequest req;
@@ -108,4 +112,3 @@ static void BM_Req(benchmark::State& state, int writers, int readers, bool async
 
 BENCHMARK_CAPTURE(BM_Req, helloSync, 1, 1, false)->UseRealTime();
 BENCHMARK_CAPTURE(BM_Req, helloAsync, 1, 1, true)->UseRealTime();
-

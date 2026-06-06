@@ -10,6 +10,7 @@
 #include <filesystem>
 #include <format>
 #include <memory>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -33,13 +34,12 @@ struct VectorAuxMeta {
   int32_t dims = 0;
   int32_t metric = 0;       // raw proto::VectorParams::Metric value
   int32_t cosineNormalizeColumnOnRescore = 0;  // bool: raw cosine column, renorm at rescore
-  int32_t engine = 0;       // ENGINE_FLAT / ENGINE_IVFPQ
+  int32_t engine = 0;       // ENGINE_IVFPQ
   int32_t nlist = 0;        // IVF only
   int32_t defaultBreadth = 0;  // IVF only: build-time default nprobe
   int32_t pqM = 0;          // IVF+PQ only
   int32_t pqBits = 0;       // IVF+PQ only
 
-  static constexpr int32_t ENGINE_FLAT = 0;
   static constexpr int32_t ENGINE_IVFPQ = 1;
 
   std::string toBytes() const {
@@ -55,10 +55,10 @@ struct VectorAuxMeta {
     }
     VectorAuxMeta meta;
     std::memcpy(&meta, bytes.data(), sizeof(VectorAuxMeta));
-    if (meta.engine != ENGINE_FLAT && meta.engine != ENGINE_IVFPQ) {
+    if (meta.engine != ENGINE_IVFPQ) {
       // (int32_t) copies: can't bind a reference to a packed field.
       throw std::runtime_error(std::format(
-        "VectorAuxMeta: aux '{}' has unknown vector engine {}",
+        "VectorAuxMeta: aux '{}' has unsupported vector engine {}",
         auxName, (int32_t)meta.engine));
     }
     return meta;
@@ -69,19 +69,22 @@ static_assert(sizeof(VectorAuxMeta) == 8 * sizeof(int32_t),
               "VectorAuxMeta layout is an on-disk contract");
 
 /// AuxReader for kind == "vector_faiss".  Holds a deserialized faiss::Index
-/// loaded from the single file referenced by AuxIndexInfo.files(0), plus the
-/// VectorAuxMeta decoded out of AuxIndexInfo.opaque_meta.
+/// lazily decoded from the single eagerly-opened file referenced by
+/// AuxIndexInfo.files(0), plus the VectorAuxMeta decoded out of
+/// AuxIndexInfo.opaque_meta.
 ///
-/// Contract (matches VectorIndexBuilder): one file per entry, currently either
-/// explicit test-only IndexFlat or production IVF+PQ.  Both single- and
-/// multi-valued vector fields are supported: every vector is its own FAISS id,
-/// and KnnQuery maps each id back to its owning doc via the segment's
-/// valueRank->docId column.  The FAISS index is fully deserialized into process
-/// memory, so the source file does not need to outlive the reader.
+/// Contract (matches VectorIndexBuilder): one IVF+PQ file per segment overlay.
+/// Both single- and multi-valued vector fields are supported: every vector is
+/// its own segment-local FAISS id, and KnnQuery maps each id back via the
+/// valueRank->docId column.  The file is opened at IndexReader open time so a
+/// reader can keep serving an unlinked overlay file; faiss::read_index runs on
+/// first kNN use and is cached.
 class VectorAuxReader : public AuxReader {
   std::string name;
   std::string field;
-  std::unique_ptr<faiss::Index> faissIndex;
+  std::shared_ptr<InputFile> file;
+  mutable std::once_flag loadOnce;
+  mutable std::unique_ptr<faiss::Index> faissIndex;
   VectorAuxMeta meta;
 
 public:
@@ -89,11 +92,11 @@ public:
 
   VectorAuxReader(std::string name, std::string field,
                   uint64_t gen, uint64_t builtCoreGen,
-                  std::unique_ptr<faiss::Index> idx,
+                  std::shared_ptr<InputFile> file,
                   const VectorAuxMeta& meta) noexcept
     : AuxReader(gen, builtCoreGen),
       name(std::move(name)), field(std::move(field)),
-      faissIndex(std::move(idx)), meta(meta) {}
+      file(std::move(file)), meta(meta) {}
 
   std::string_view getKind() const override { return KIND; }
   std::string_view getName() const override { return name; }
@@ -108,11 +111,28 @@ public:
   int32_t getDefaultBreadth() const noexcept { return meta.defaultBreadth; }
   int32_t getPqM() const noexcept { return meta.pqM; }
   int32_t getPqBits() const noexcept { return meta.pqBits; }
-  bool scoresAreExact() const noexcept { return meta.engine == VectorAuxMeta::ENGINE_FLAT; }
+  bool scoresAreExact() const noexcept { return false; }
 
-  // Search-time entry point.  faiss::Index::search is thread-safe for
-  // concurrent readers.
-  faiss::Index* getFaissIndex() const noexcept { return faissIndex.get(); }
+  // Search-time entry point.  Decode is lazy and once-only; faiss::Index::search
+  // is thread-safe for concurrent readers after construction.
+  faiss::Index* getFaissIndex() const {
+    std::call_once(loadOnce, [this]() {
+      InputStream is = file->getInputStream();
+      BufferIOReader io(is.ptr(), (size_t)is.left());
+      std::unique_ptr<faiss::Index> idx(faiss::read_index(&io));
+      if (!idx) {
+        throw std::runtime_error(std::format(
+          "VectorAuxReader: read_index returned null for {}", name));
+      }
+      if (idx->d != meta.dims) {
+        throw std::runtime_error(std::format(
+          "VectorAuxReader: dims mismatch for aux '{}': index has {}, opaque_meta says {}",
+          name, (int)idx->d, (int32_t)meta.dims));
+      }
+      faissIndex = std::move(idx);
+    });
+    return faissIndex.get();
+  }
 
   /// Open the FAISS index referenced by `info`.  Returns nullptr when the
   /// file is missing and missingFileOK is true (caller should re-parse
@@ -144,18 +164,6 @@ public:
 
     VectorAuxMeta meta = VectorAuxMeta::fromBytes(info.opaque_meta(), info.name());
 
-    auto bytes = file->read();
-    BufferIOReader io(bytes.data(), bytes.size());
-    // TODO: zero-copy IndexFlat path.  IndexFlat's on-disk bytes are the same
-    // float vectors we already store in the column; read_index unconditionally
-    // copies them into IndexFlatCodes::codes (its owned std::vector<uint8_t>),
-    // so we pay 1x extra RAM per flat aux index.  When/if we keep flat as a
-    // production path (e.g. small-segment optimization, where building HNSW
-    // doesn't pay off), skip writing the FAISS file in the builder and run
-    // brute-force kNN at search time directly over the mmap'd vector column
-    // via faiss::knn_L2sqr / knn_inner_product.  No deserialize, no copy,
-    // same SIMD distance kernels.
-    //
     // Stay-on-disk story for other index types when we add them:
     //   - HNSW: FAISS 1.14.1's IO_FLAG_MMAP_IFC can mmap both the graph
     //     adjacency (hnsw.neighbors) and the vectors (IndexFlat.codes), copying
@@ -180,20 +188,9 @@ public:
     //
     // Likely tiering once past v1: brute-force-over-column for small segments,
     // HNSW for RAM-fit mid-size, IVF + custom InvertedLists for large.
-    std::unique_ptr<faiss::Index> idx(faiss::read_index(&io));
-    if (!idx) {
-      throw std::runtime_error(std::format(
-        "VectorAuxReader: read_index returned null for {}", fname));
-    }
-    if (idx->d != meta.dims) {
-      throw std::runtime_error(std::format(
-        "VectorAuxReader: dims mismatch for aux '{}': index has {}, opaque_meta says {}",
-        info.name(), (int)idx->d, (int32_t)meta.dims));
-    }
-
     return std::make_shared<VectorAuxReader>(
       std::string(info.name()), std::string(info.field()),
-      info.gen(), info.built_core_gen(), std::move(idx), meta);
+      info.gen(), info.built_core_gen(), std::move(file), meta);
   }
 
 private:
