@@ -28,6 +28,9 @@ using namespace solux;
 using namespace solux::test;
 
 class IndexReaderAuxTest : public SoluxTest {
+public:
+  IndexReaderAuxTest() { TestOverlayAuxReader::enabledForTests = true; }
+
 protected:
   void SetUp() override {
     auto col = soluxNode->getCollection("main");

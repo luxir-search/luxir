@@ -606,7 +606,9 @@ TEST_F(VectorIndexBuilderTest, mergeDropsOldOverlayFiles) {
   CollectionHelper h("main");
   h.clear();
   enableL2OnVecSuffix(h.collection());
-  h.getIndexWriter()->mergePolicy->setMergeFactor(2);
+  // No setMergeFactor(2) here: an automatic merge during setup could publish
+  // the merged segment before the assertions below see the two source
+  // overlays.  mergeSegments() forces maxSegments=1 regardless of the factor.
 
   for (int seg = 0; seg < 2; seg++) {
     for (int i = 0; i < 80; i++) {

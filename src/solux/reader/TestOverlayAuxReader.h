@@ -26,6 +26,11 @@ public:
   static constexpr std::string_view KIND = "test_overlay";
   static constexpr std::string_view NAME = "test.overlay";
 
+  // Production gate: builds for this kind run only when a test enables them.
+  // Without this, any client commit naming "test.overlay" in
+  // build_aux_indexes would write test overlay files into a real index.
+  static inline bool enabledForTests = false;
+
   TestOverlayAuxReader(std::string name, uint64_t gen, uint64_t builtCoreGen,
                        std::shared_ptr<InputFile> file) noexcept
     : AuxReader(gen, builtCoreGen), name(std::move(name)), file(std::move(file)) {}

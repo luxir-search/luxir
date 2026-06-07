@@ -290,7 +290,11 @@ public:
   std::vector<uint64_t> lastCommittedSegIds;
 
   // Schema generation read from IndexInfo on startup, written on each commit.
-  uint64_t schemaGen_ = 0;
+  // Relaxed atomic: written from parallel flush tasks, the merge thread, and
+  // the commit body.  No ordering is needed - a segment stamped during a
+  // concurrent schema swap may legitimately get either gen - but the plain
+  // field was a formal data race (and TSan noise).
+  std::atomic<uint64_t> schemaGen_{0};
 
   // Aux indexes (vector ANN, future autocomplete, ...) currently published in
   // the IndexInfo file.  Read from s.olux at open, mutated only by the commit
@@ -354,13 +358,16 @@ public:
   uint64_t currentSchemaGen() {
     if (schemaProvider_) {
       auto schema = schemaProvider_();
-      if (schema) schemaGen_ = schema->gen_;
+      if (schema) {
+        schemaGen_.store(schema->gen_, std::memory_order_relaxed);
+        return schema->gen_;
+      }
     }
-    return schemaGen_;
+    return schemaGen_.load(std::memory_order_relaxed);
   }
 
   // Returns the schema generation read from IndexInfo (or 0 if none).
-  uint64_t getSchemaGen() const { return schemaGen_; }
+  uint64_t getSchemaGen() const { return schemaGen_.load(std::memory_order_relaxed); }
 
   explicit IndexWriter(Directory &dir, std::function<std::shared_ptr<Schema>()> schemaProvider = {});
   ~IndexWriter();
@@ -501,8 +508,8 @@ private:
                               const std::vector<proto::AuxIndexInfo>& newList);
   void tryDeleteSegments();
   void moveSegmentToDelete(uint64_t segId);
-  void applyDeletes(std::span<SegInfo*> segs, MultiDeletesData& multiDeletesData, std::vector<std::string>& filesToSync);
-  void applyDeletes(SegInfo& seg, SortedDeletes::EntrySpan commitDeletes, std::vector<std::string>& filesToSync);
+  void applyDeletes(std::span<SegInfo*> segs, MultiDeletesData& multiDeletesData);
+  void applyDeletes(SegInfo& seg, SortedDeletes::EntrySpan commitDeletes);
   void mergeSegmentsBody(MergeMessage& msg);
 
 public:

@@ -587,7 +587,7 @@ void IndexWriter::finishCommitBody(UpdateMessage& msg) {
     // Can personal deletes be mutated elsewhere?
     // mergeSegmentsBody can add personalDeletes to a *new* segment, but it does it under the indexMutex lock,
     // so we will either see the new segment with its personal deletes, or not see the segment at all.
-    applyDeletes(segsToApplyDeletes, commitInfo.multiDeletesData, filesToSync);
+    applyDeletes(segsToApplyDeletes, commitInfo.multiDeletesData);
   }
 
 
@@ -726,12 +726,11 @@ void IndexWriter::finishCommitBody(UpdateMessage& msg) {
   std::sort(segsToKeep.begin(), segsToKeep.end(),
             [](const SegInfo* a, const SegInfo* b) { return a->segId < b->segId; });
 
-  // Collect unsynced segment data and overlay files.  Keep them on the segment
-  // until sync succeeds so a failed commit can retry durability on a later
-  // commit attempt.  CAVEAT: liveDocs files from applyDeletes go into
-  // filesToSync directly and are NOT retry-covered - a failed sync loses them
-  // from the retry set while the in-memory liveGen has advanced (pre-existing
-  // gap, tracked).
+  // Collect unsynced segment data, liveDocs, and overlay files.  Keep them on
+  // the segment until sync succeeds so a failed commit (sync failure or a
+  // build exception later in this function) can retry durability on a later
+  // commit attempt.  applyDeletes above routes liveDocs filenames through
+  // seg->unsyncedFiles for exactly this reason.
   for (auto seg : segsToKeep) {
     if (!seg->unsyncedFiles.empty()) {
       filesToSync.insert(filesToSync.end(),
@@ -1114,7 +1113,8 @@ void IndexWriter::buildSegmentOverlays(const UpdateMessage& msg,
   std::vector<std::string> stagedFiles;
 
   try {
-    if (selectorMatches(msg.buildAuxIndexes, TestOverlayAuxReader::NAME)) {
+    if (TestOverlayAuxReader::enabledForTests
+        && selectorMatches(msg.buildAuxIndexes, TestOverlayAuxReader::NAME)) {
       for (size_t i = 0; i < segsToKeep.size(); i++) {
         auto* seg = segsToKeep[i];
         bool exists = false;
@@ -1143,6 +1143,8 @@ void IndexWriter::buildSegmentOverlays(const UpdateMessage& msg,
         proto::AuxIndexInfo info;
         info.set_kind(std::string(TestOverlayAuxReader::KIND));
         info.set_name(std::string(TestOverlayAuxReader::NAME));
+        // Intentionally indexGen, not the vector rebuild ordinal: this kind is
+        // existence-only (no rebuild flow), so gen only has to uniquify files.
         info.set_gen(msg.commitInfo->indexGen);
         info.add_files(fileName);
         info.set_opaque_meta("test");
@@ -1203,6 +1205,28 @@ IndexWriter::flattenSegmentOverlays(std::span<SegInfo*> segs) const {
 // entries appear in both lists, so their files survive.  Files written by a
 // rebuild for a given name supersede files from the previous build of the same
 // name and the old ones get cleaned up here.
+namespace {
+// Core of deleteOrphanedAuxFiles.  BEST-EFFORT BY CONTRACT: this runs after
+// writeIndexInfoFile has published the new commit, so a cleanup failure must
+// never propagate - the commit already succeeded and reporting an error now
+// would lie to the client.  A leaked file is reclaimed by a later rebuild's
+// diff or by the dead-segment prefix sweep.
+void deleteFilesNotKept(Directory& dir,
+                        const boost::unordered_flat_set<std::string>& keep,
+                        const std::string& fname) {
+  if (keep.contains(fname)) return;
+  try {
+    INDEX_DEBUG("deleteOrphanedAuxFiles: deleting {}", fname);
+    dir.deleteFile(fname);
+  } catch (const std::exception& e) {
+    LOG_ERROR("deleteOrphanedAuxFiles: failed to delete {} (will leak until reclaimed): {}",
+              fname, e.what());
+  } catch (...) {
+    LOG_ERROR("deleteOrphanedAuxFiles: failed to delete {} (will leak until reclaimed)", fname);
+  }
+}
+} // namespace
+
 // PublishedOverlay variant: same semantics, keyed file sets come from .info.
 void IndexWriter::deleteOrphanedAuxFiles(const std::vector<PublishedOverlay>& oldList,
                                          const std::vector<PublishedOverlay>& newList) {
@@ -1212,11 +1236,7 @@ void IndexWriter::deleteOrphanedAuxFiles(const std::vector<PublishedOverlay>& ol
   }
   for (const auto& published : oldList) {
     for (const auto& f : published.info.files()) {
-      std::string fname(f);
-      if (!keep.contains(fname)) {
-        INDEX_DEBUG("deleteOrphanedAuxFiles: deleting {}", fname);
-        dir.deleteFile(fname);
-      }
+      deleteFilesNotKept(dir, keep, f);
     }
   }
 }
@@ -1229,11 +1249,7 @@ void IndexWriter::deleteOrphanedAuxFiles(const std::vector<proto::AuxIndexInfo>&
   }
   for (const auto& info : oldList) {
     for (const auto& f : info.files()) {
-      std::string fname(f);
-      if (!keep.contains(fname)) {
-        INDEX_DEBUG("deleteOrphanedAuxFiles: deleting {}", fname);
-        dir.deleteFile(fname);
-      }
+      deleteFilesNotKept(dir, keep, f);
     }
   }
 }
@@ -1706,6 +1722,25 @@ void IndexWriter::mergeSegments() {
   BlockingMergeMessage mergeMessage;
   mergeMessage.maxSegments = 1;
 
+  // Follow the same gate protocol as policy-triggered merges
+  // (_maybeMergeSegments).  The invariant is bump-per-message symmetry: every
+  // merge message's tail performs exactly one decrement walk over
+  // waitingForMerges and one mergeRunning clear, so every submitted message
+  // must start-bump every waiter exactly once - otherwise a concurrent
+  // wait_for_merges commit is released early (publishing before its flushes)
+  // and the later flush decrement wraps the counter.  mergeRunning may
+  // already be true (the hammer test runs this concurrently with policy
+  // merges); setting it again under the lock is harmless - it is a throttle
+  // for policy chaining, not an exclusion gate.
+  {
+    const std::lock_guard<std::mutex> lock(indexMutex);
+    mergePolicy->mergeRunning = true;
+    for (auto* waitingMsg : waitingForMerges) {
+      assert(waitingMsg->commitInfo);
+      waitingMsg->commitInfo->leftToFlush++;
+    }
+  }
+
   mergeSegmentsNode->try_put(&mergeMessage);
 
   // If merge code decides to commit, this call back won't be done until the commit is finished.
@@ -1816,6 +1851,11 @@ void IndexWriter::testDeleteAllData() {
   // don't touch commitNumber or updateNumber... the TBB graph relies on the exact sequence of numbers.
 }
 
+// TEST HOOKS: safe only against a QUIESCED writer.  indexMutex here does not
+// exclude the commit body, which mutates seg->auxOverlays and
+// currentSegmentOverlays_ WITHOUT the lock (it is the single mutator by
+// design rule 1).  Do not "fix" a future race by adding locking on the
+// commit side; quiesce the writer in the test instead.
 bool IndexWriter::testDropSegmentOverlay(std::string_view name, size_t segmentOrd) {
   std::lock_guard<std::mutex> lock(indexMutex);
   if (segmentOrd >= segInfos.size()) return false;
@@ -1972,7 +2012,7 @@ SortedDeletes::EntrySpan mergeDeleteSpans(
 
 } // anonymous namespace
 
-void IndexWriter::applyDeletes(std::span<SegInfo*> segs, MultiDeletesData& multiDeletesData, std::vector<std::string>& filesToSync) {
+void IndexWriter::applyDeletes(std::span<SegInfo*> segs, MultiDeletesData& multiDeletesData) {
   // Collect commit-level spans
   boost::container::small_vector<SortedDeletes::EntrySpan, 4> commitSpans;
   for (const auto& sd : multiDeletesData.deletes) {
@@ -1985,27 +2025,22 @@ void IndexWriter::applyDeletes(std::span<SegInfo*> segs, MultiDeletesData& multi
   std::vector<SortedDeletes::Entry> mergedBuf;
   SortedDeletes::EntrySpan commitDeletes = mergeDeleteSpans(commitSpans, mergedBuf);
 
-  // Apply deletes to segments in parallel. Each task accumulates into its own
-  // local vector so the inner path doesn't need synchronization, then we splice
-  // results under a mutex once per segment.
-  std::mutex filesToSyncMutex;
+  // Apply deletes to segments in parallel.  Each task writes new liveDocs
+  // filenames into its own segment's unsyncedFiles (single owner per task, no
+  // synchronization needed); the commit body drains unsyncedFiles into the
+  // pre-manifest fsync set and clears them only after sync succeeds, so
+  // liveDocs files get the same retry-on-failed-commit durability as segment
+  // data and overlay files.
   oneapi::tbb::task_group tg;
   for (SegInfo* seg : segs) {
-    tg.run([this, seg, commitDeletes, &filesToSync, &filesToSyncMutex]() {
-      std::vector<std::string> localFiles;
-      applyDeletes(*seg, commitDeletes, localFiles);
-      if (!localFiles.empty()) {
-        const std::lock_guard<std::mutex> lock(filesToSyncMutex);
-        filesToSync.insert(filesToSync.end(),
-                           std::make_move_iterator(localFiles.begin()),
-                           std::make_move_iterator(localFiles.end()));
-      }
+    tg.run([this, seg, commitDeletes]() {
+      applyDeletes(*seg, commitDeletes);
     });
   }
   tg.wait();
 }
 
-void IndexWriter::applyDeletes(SegInfo& seg, SortedDeletes::EntrySpan commitDeletes, std::vector<std::string>& filesToSync) {
+void IndexWriter::applyDeletes(SegInfo& seg, SortedDeletes::EntrySpan commitDeletes) {
   if (commitDeletes.empty() && seg.personalDeletes.empty()) {
     return;
   }
@@ -2141,7 +2176,7 @@ void IndexWriter::applyDeletes(SegInfo& seg, SortedDeletes::EntrySpan commitDele
     auto newLiveGen = seg.liveGen + 1;
     numLiveDocs -= newDeletesCount;
 
-    bool success = LiveDocsWriter::writeLiveDocs(dir, seg.segId, newLiveGen, *liveBits, maxDocId, numLiveDocs, filesToSync);
+    bool success = LiveDocsWriter::writeLiveDocs(dir, seg.segId, newLiveGen, *liveBits, maxDocId, numLiveDocs, seg.unsyncedFiles);
     if (!success) {
       LOG_ERROR("Failed to write liveDocs file for segment {} with liveGen {}", seg.segId, newLiveGen);
       return;
