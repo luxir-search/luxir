@@ -1232,6 +1232,82 @@ TEST_F(IndexWriterTest, inverterDeletes) {
 }
 
 
+// A delete at version V can only affect a segment whose minVersion < V; a segment
+// whose minVersion is >= V holds only docs newer than the delete, so it must be
+// skipped. Under concurrent load this is routine: update/delete messages are
+// versioned in order at intake but execute in parallel into different inverters,
+// so a delete can be applied in the same commit that flushes a higher-versioned
+// segment. We reproduce that partition deterministically by seating inverters at
+// chosen versions via obtainInverter and flushing them in one commit whose delete
+// set sits between their minVersions. A Signal hook in applyDeletes reports each
+// segment the delete is actually applied to. The commit applies its delete to
+// three kinds of segment:
+//   - OLD:    committed in a prior commit (minVersion 1 < 2)              -> applied
+//   - INFLIGHT: flushed in this same commit (minVersion 1 < 2)           -> applied
+//   - NEW:    flushed in this same commit but newer (minVersion 3 >= 2)  -> skipped
+//
+// Before the minVersion fix this case could not be exercised: minVersion was pinned
+// to 0, so every segment passed 0 < V and was always a delete candidate.
+TEST_F(IndexWriterTest, deleteCandidacyGatedByMinVersion) {
+  RAMDir dir;
+  IndexWriter iw(dir);
+
+  std::set<int64_t> applied;  // segIds the delete was applied to this commit
+  std::mutex appliedMu;       // applyDeletes fires the hook from parallel per-segment tasks
+  solux::Signal::listen("deleteAppliedToSegment", [&](void* a, void*, void*) -> void* {
+    std::lock_guard<std::mutex> lk(appliedMu);
+    applied.insert((int64_t)a);
+    return nullptr;
+  });
+
+  // OLD segment at minVersion 1, holding id "dup", committed on its own first.
+  // (commit -> updateVersion 1, which flushes the minVersion-1 inverter.)
+  auto& oldInv = iw.obtainInverter(1);
+  int64_t oldSeg = oldInv.getSegId();
+  oldInv.startDoc();
+  oldInv.getIndexHandler("id").index(oldInv, "dup");
+  oldInv.finishDoc();
+  iw.releaseInverter(oldInv);
+  iw.commit();  // updateVersion 1
+
+  // Bump the update counter so the next commit's version clears the membership
+  // gate for the minVersion-3 inverter below (commit version must be >= 3).
+  iw.commit();  // updateVersion 2, nothing to flush
+
+  // Now flush, in a single commit, three inverters: a delete-bearing inverter at
+  // version 2, an in-flight low-version doc inverter at version 1, and a newer
+  // doc inverter at version 3. Obtain all before releasing any so the idle pool
+  // can't hand back the same object. The commit's maxDeleteVersion is 2 (from the
+  // delete), which sits between the low (1) and high (3) inverter minVersions.
+  auto& delInv = iw.obtainInverter(2);
+  delInv.deleteId("dup", 2);
+
+  auto& inflightInv = iw.obtainInverter(1);
+  int64_t inflightSeg = inflightInv.getSegId();
+  inflightInv.startDoc();
+  inflightInv.getIndexHandler("id").index(inflightInv, "live");
+  inflightInv.finishDoc();
+
+  auto& newInv = iw.obtainInverter(3);
+  int64_t newSeg = newInv.getSegId();
+  newInv.startDoc();
+  newInv.getIndexHandler("id").index(newInv, "newdoc");
+  newInv.finishDoc();
+
+  iw.releaseInverter(delInv);
+  iw.releaseInverter(inflightInv);
+  iw.releaseInverter(newInv);
+  iw.commit();  // updateVersion 3; flushes all three, maxDeleteVersion == 2
+
+  // The delete (version 2) is applied to both the pre-existing OLD segment and
+  // the just-flushed INFLIGHT segment (both minVersion 1 < 2), and skipped for
+  // NEW (minVersion 3 >= 2), whose docs are all newer than the delete.
+  EXPECT_TRUE(applied.contains(oldSeg));
+  EXPECT_TRUE(applied.contains(inflightSeg));
+  EXPECT_FALSE(applied.contains(newSeg));
+}
+
+
 // Test that fields are removed from the index after document deletion and merging
 TEST_F(IndexWriterTest, removeFields) {
   using namespace solux::test;

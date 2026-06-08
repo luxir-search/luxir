@@ -1,6 +1,7 @@
 #pragma once
 
 #include <algorithm>
+#include <limits>
 #include <boost/unordered/unordered_flat_map.hpp>
 #include "solux/util/MemPool.h"
 #include "solux/schema/Schema.h"
@@ -41,8 +42,14 @@ public:
 
   // The lowest and highest update numbers for this inverter, including deletes.
   // Should be updated by calls to updateVersions() after obtaining the inverter.
+  // minVersion starts at the max sentinel ("no updates seen yet") so the first
+  // updateVersions() call adopts the real minimum; obtainInverter() always calls
+  // it before the inverter is used or flushed, so the sentinel never reaches a
+  // consumer. A version of 0 (the obtainInverter default / unversioned) is the
+  // absorbing element of min and sticks, keeping the inverter an always-candidate
+  // for commits and deletes.
   uint64_t currVersion = 0;
-  uint64_t minVersion = 0;
+  uint64_t minVersion = std::numeric_limits<uint64_t>::max();
   uint64_t maxVersion = 0;
 
   // When true, indexing an id field will automatically queue a delete for previous
@@ -72,11 +79,7 @@ public:
   // for segmentVersions, adds, and deletes to be versioned correctly, this should be called after
   // obtaining the inverter
   void updateVersions(uint64_t version) {
-    if (minVersion != 0) {
-      minVersion = version;
-    } else {
-      minVersion = std::min(minVersion, version);
-    }
+    minVersion = std::min(minVersion, version);
     maxVersion = std::max(maxVersion, version);
     currVersion = version;
   }

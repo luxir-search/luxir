@@ -388,7 +388,7 @@ void IndexWriter::initiateCommit(UpdateMessage& msg) {
         }
         else {
           // this would be a bug since we should never have an idle inverter that is part of a commit.
-          LOG_ERROR("Idle inverter is part of a commit.");
+          LOG_ERROR("Idle inverter is part of another commit.");
         }
 
         // move the inverter to the flushing list
@@ -2033,6 +2033,7 @@ void IndexWriter::applyDeletes(std::span<SegInfo*> segs, MultiDeletesData& multi
   // data and overlay files.
   oneapi::tbb::task_group tg;
   for (SegInfo* seg : segs) {
+
     tg.run([this, seg, commitDeletes]() {
       applyDeletes(*seg, commitDeletes);
     });
@@ -2044,6 +2045,10 @@ void IndexWriter::applyDeletes(SegInfo& seg, SortedDeletes::EntrySpan commitDele
   if (commitDeletes.empty() && seg.personalDeletes.empty()) {
     return;
   }
+
+  // Test hook: reports each segment selected for delete application this commit.
+  // Called in parallel for different segments, so consumers should synchronize when applicable.
+  solux::Signal::emit("deleteAppliedToSegment", (void*)(int64_t)seg.segId);
 
   // If this segment has personal deletes (rare - only during concurrent merges),
   // merge them with commit deletes into a combined span.
