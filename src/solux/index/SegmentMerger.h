@@ -8,10 +8,14 @@
 #include "solux/reader/StrColReader.h"
 #include "solux/search/IndexReader.h"
 
+#include <atomic>
+
 // This file is only included in IndexWriter.cpp
 
 #define MERGER_DEBUG LOG_TRACE
 // #define MERGER_DEBUG LOG_DEBUG
+
+#include "solux/util/Signal.h"
 
 namespace solux {
 
@@ -60,6 +64,7 @@ class SegmentMerger {
   std::vector<FieldReader> fieldReaders;  // todo - pool allocate (& use smart ptr on MergeSeg if destructors needed)
   std::vector<Segment> segs;
 public:
+
 
 
   SegmentMerger(std::span<PostingsReader *> preaders, std::span<LiveDocs*> liveDocs, PostingsWriter& postingsWriter)
@@ -141,6 +146,10 @@ public:
       // TBB If this gets turned into a task, we would need to copy the mergeFieldInfos since
       // they will be reused.
       mergeField(mergeFieldInfos);
+
+      // Test hook: a listener may throw (or block) here to exercise
+      // merge-failure containment.  No-op in production (no listeners).
+      Signal::emit("segmentMergeBody");
     }
 
     // Caller is responsible for calling postingsWriter.finish()
@@ -863,4 +872,3 @@ private:
 
 
 }
-

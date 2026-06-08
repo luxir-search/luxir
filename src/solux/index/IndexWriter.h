@@ -1,5 +1,7 @@
 #pragma once
 
+#include <atomic>
+#include <optional>
 #include <string>
 #include <mutex>
 #include <span>
@@ -96,6 +98,15 @@ class IndexWriter {
 
 public:
 
+  struct MergeFailureInfo {
+    std::vector<uint64_t> sourceSegIds;
+    uint64_t outputSegId = 0;
+    std::string phase;
+    std::string exceptionType;
+    std::string message;
+    bool outputPublished = false;
+  };
+
   // TODO: if we don't need to expose MergePolicy, this could also be moved to the cpp file
   // if we add a method to IndexWriter to get/set the merge factor or other configurable things.
   class MergePolicy {
@@ -147,6 +158,22 @@ public:
       }
     }
 
+    int32_t _mergeLevelForMaxDoc(int32_t maxDoc) const {
+      if (maxDoc < mergeFactor) {
+        return 0;
+      }
+      return (int32_t)(log2(maxDoc) * inverseLogM);
+    }
+
+    // Reserve any merge-policy storage needed by _update(seg) before the
+    // caller mutates segment ownership.  Call with indexMutex locked.
+    void _prepareUpdate(SegInfo* seg) {
+      int32_t mergeLevel = _mergeLevelForMaxDoc(seg->maxDoc);
+      if (mergeLevel >= (int)levelCounts.size()) {
+        levelCounts.resize(mergeLevel + 1);
+      }
+    }
+
     // Update the merge level of a segment and return the segment level to merge, or -1 if no merge needed.
     // If seg is nullptr, then we check all segment levels for a merge.
     // Call with indexMutex locked.
@@ -158,11 +185,7 @@ public:
         segCount++;
 
         // For MERGE_FACTOR 10, docs 0-9 = level 0, 10-99 = level 1, etc.
-        if (seg->maxDoc < mergeFactor) {
-          seg->mergeLevel = 0;
-        } else {
-          seg->mergeLevel = (int32_t) (log2(seg->maxDoc) * inverseLogM);
-        }
+        seg->mergeLevel = _mergeLevelForMaxDoc(seg->maxDoc);
         if (seg->mergeLevel >= (int) levelCounts.size()) {
           levelCounts.resize(seg->mergeLevel + 1);
         }
@@ -314,6 +337,8 @@ public:
     proto::AuxIndexInfo info;
   };
   std::vector<PublishedOverlay> currentSegmentOverlays_;
+
+  std::optional<MergeFailureInfo> lastMergeFailure;
 
   // Concrete vector overlay names ("vec.<field>") that have been explicitly
   // activated in this writer lifetime or were seeded from durable manifest
@@ -510,10 +535,13 @@ private:
   void moveSegmentToDelete(uint64_t segId);
   void applyDeletes(std::span<SegInfo*> segs, MultiDeletesData& multiDeletesData);
   void applyDeletes(SegInfo& seg, SortedDeletes::EntrySpan commitDeletes);
+  bool finishMergeTail(bool allowSyntheticCommit, bool chainNextMerge = true);
   void mergeSegmentsBody(MergeMessage& msg);
 
 public:
   /// THIS SECTION ONLY FOR TEST CODE!
+
+
   /// Only for test code... there is no concurrency control, etc.
   void mergeSegments();
 
@@ -530,6 +558,7 @@ public:
   bool testActiveVectorOverlayName(std::string_view name);
   void testReseedActiveVectorOverlayNamesFromManifest();
   bool testMergeRunning();
+  std::optional<MergeFailureInfo> testLastMergeFailure();
 
   // dump some useful info for tests
   void debugInfo();

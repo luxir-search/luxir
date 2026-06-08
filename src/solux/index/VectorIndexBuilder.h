@@ -63,10 +63,7 @@ public:
   static std::atomic<int64_t> ivfPqMergeBuildCountForTests;
   static size_t ivfPqTrainingSampleBytes;
   static size_t ivfPqAddChunkBytes;
-  // Test-only failure injection: builds for this field name throw.  Plain
-  // unsynchronized string - mutate ONLY while no merges or commits are in
-  // flight (current tests quiesce via blocking mergeSegments()/commit()).
-  static std::string failBuildForFieldNameForTests;
+
 
   enum class BuildSite {
     COMMIT,

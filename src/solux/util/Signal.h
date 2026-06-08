@@ -12,6 +12,17 @@ namespace solux {
 // If you want the duration of a listener to be shorter, you can either unlisten or use
 // a scope_guard:
 //    auto cleaner = solux::scope_guard([](){ solux::Signal::unlisten("mergeStart");});
+//
+// LISTENER LIFETIME: emit() copies the matched listener and invokes it WITHOUT
+// holding the internal lock, so a blocking listener (e.g. one that waits on a
+// latch to reproduce a timing window) cannot deadlock other threads' emits.
+// The consequence is that unlisten()/clear()/replacing a listener does NOT
+// synchronize with an in-flight callback: a callback can still be running -
+// or even start, if an emit copied it just before removal - after it was
+// removed.  So do not remove or replace a listener, or destroy anything it
+// captures by reference (latches, locals), while an emit for that signal can
+// still be delivered.  The usual safe pattern is to join the threads that emit
+// before unlisten().
 class Signal {
   using callback_type = std::function<void*(void*, void*, void*)>;
   using map_type = boost::unordered_flat_map<std::string_view, callback_type>;

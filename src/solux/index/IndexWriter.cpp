@@ -1,6 +1,7 @@
 #include "IndexWriter.h"
 
 #include <algorithm>
+#include <typeinfo>
 
 #include <boost/sort/spreadsort/string_sort.hpp>
 #include <boost/unordered/unordered_flat_set.hpp>
@@ -1394,6 +1395,44 @@ void IndexWriter::writeIndexInfoFile(std::span<SegInfo*> segs, CommitInfo* commi
 }
 
 
+bool IndexWriter::finishMergeTail(bool allowSyntheticCommit, bool chainNextMerge) {
+  bool triggerCommit = false;
+  {
+    const std::lock_guard<std::mutex> lock(indexMutex);
+    mergePolicy->mergeRunning = false;
+    // On a contained merge FAILURE the caller passes chainNextMerge=false: the
+    // sources were restored unchanged, so _maybeMergeSegments would immediately
+    // re-select the same set and spin the single-concurrency merge node.  The
+    // next segment flush re-triggers _maybeMergeSegments naturally
+    // (event-paced), so a transient failure still self-heals without a busy
+    // loop.  A cause-aware retry/quarantine policy is future work (see
+    // solux-private merge-failure-containment.md).
+    bool anotherMerge = chainNextMerge && mergePolicy->_maybeMergeSegments(nullptr);
+
+    std::vector<UpdateMessage*> toRelease;
+    for (auto* waitingMsg : waitingForMerges) {
+      assert(waitingMsg->commitInfo);
+      assert(waitingMsg->commitInfo->leftToFlush > 0);
+      if (--waitingMsg->commitInfo->leftToFlush == 0) {
+        toRelease.push_back(waitingMsg);
+      }
+    }
+
+    if (allowSyntheticCommit && !anotherMerge && waitingForMerges.empty()) {
+      if (busyInverters.empty() && flushingInverters.empty() && idleInverters.empty()) {
+        // no indexing activity, so let's trigger a commit.
+        triggerCommit = true;
+      }
+    }
+
+    for (auto* releasedMsg : toRelease) {
+      _releaseToCommitSequencer(releasedMsg);
+    }
+  }
+  return triggerCommit;
+}
+
+
 // called from the mergeSegmentsNode which has concurrency==1 (single-threaded)
 // Only one merge will be running at a time.
 // We do run concurrently with everything else, including commits and segment deletions.
@@ -1434,41 +1473,45 @@ void IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
   if (segs.empty()) {
     // This is possible if a merge was correctly triggered, but all of the segments were deleted.
     INDEX_DEBUG("mergeSegmentsBody: no segments to merge for msg={}", (void*)&msg);
-    // Nothing merged, so no synthetic commit needed - but we still need to
-    // balance the gate: clear mergeRunning, chain a follow-up merge if some
-    // other level is now full, and decrement leftToFlush on every member of
-    // waitingForMerges to undo our start-bump.  Same ordering as the normal
-    // merge tail: chain check before decrement, so a chain re-bump can keep
-    // a commit waiting.
-    {
-      const std::lock_guard<std::mutex> lock(indexMutex);
-      mergePolicy->mergeRunning = false;
-      mergePolicy->_maybeMergeSegments(nullptr);
-      std::vector<UpdateMessage*> toRelease;
-      for (auto* waitingMsg : waitingForMerges) {
-        assert(waitingMsg->commitInfo);
-        if (--waitingMsg->commitInfo->leftToFlush == 0) {
-          toRelease.push_back(waitingMsg);
-        }
-      }
-      for (auto* releasedMsg : toRelease) {
-        _releaseToCommitSequencer(releasedMsg);
-      }
-    }
+    finishMergeTail(false);
     msg.done(*this);
     return; // nothing to merge
   }
 
-  solux::Signal::emit("mergeStart", (void*)(int64_t)msg.mergeLevel, (void*)segs.size());
+  std::vector<uint64_t> sourceSegIds;
+  sourceSegIds.reserve(segs.size());
+  for (auto* seg : segs) {
+    sourceSegIds.push_back(seg->segId);
+  }
 
-  // Sort the list of segments by the segId.
-  // Some tests rely on not reordering segments.
-  std::sort(segs.begin(), segs.end(), [](const SegInfo* a, const SegInfo* b) {
-    return a->segId < b->segId;
-  });
+  auto sourceSegIdsString = [&]() {
+    std::string out;
+    for (size_t i = 0; i < sourceSegIds.size(); i++) {
+      if (i > 0) out += ',';
+      out += std::to_string(sourceSegIds[i]);
+    }
+    return out;
+  };
 
+  uint64_t outputSegId = ++lastSegId;
+  bool outputPublished = false;
+  bool mergeFailed = false;
+  MergeFailureInfo failure;
+  failure.sourceSegIds = sourceSegIds;
+  failure.outputSegId = outputSegId;
+  const char* phase = "merge_start_signal";
 
-  {
+  try {
+    solux::Signal::emit("mergeStart", (void*)(int64_t)msg.mergeLevel, (void*)segs.size());
+
+    phase = "sort_sources";
+    // Sort the list of segments by the segId.
+    // Some tests rely on not reordering segments.
+    std::sort(segs.begin(), segs.end(), [](const SegInfo* a, const SegInfo* b) {
+      return a->segId < b->segId;
+    });
+
+    phase = "open_source_readers";
     // grab or open all the postings readers
     std::vector<std::shared_ptr<PostingsReader>> preaders;
     preaders.reserve(segs.size());
@@ -1480,12 +1523,13 @@ void IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
       }
     }
 
+    phase = "load_live_docs";
     // Load liveDocs (the version we got a snapshot for) each segment to be merged
     std::vector<std::shared_ptr<LiveDocs>> liveDocsVec;
     std::vector<LiveDocs*> liveDocsPtrs;
     liveDocsVec.reserve(segs.size());
     liveDocsPtrs.reserve(segs.size());
-    
+
     for (auto segInfo : segs) {
       if (segInfo->mergedLiveGen > 0) {
         // Load liveDocs for this segment
@@ -1493,7 +1537,6 @@ void IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
         if (!liveDocs) {
           throw std::runtime_error("Failed to load liveDocs for segment " + std::to_string(segInfo->segId) +
                                    " gen=" + std::to_string(segInfo->mergedLiveGen));
-          // TODO: need to retry... liveGen may have changed
         }
         liveDocsVec.push_back(liveDocs);
         liveDocsPtrs.push_back(liveDocs.get());
@@ -1503,7 +1546,8 @@ void IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
         liveDocsPtrs.push_back(nullptr);
       }
     }
-    
+
+    phase = "prepare_merge_inputs";
     // Copy the preaders to a vector of pointers for our underlying merge code.
     std::vector<PostingsReader*> preaderPtrs;
     preaderPtrs.reserve(preaders.size());
@@ -1511,27 +1555,35 @@ void IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
       preaderPtrs.push_back(preader.get());
     }
 
-    uint64_t outputSegId = ++lastSegId;
-    bool outputPublished = false;
-    try {
+    {
       PostingsWriter pwriter(dir, outputSegId);
 
+      phase = "segment_merge";
       // Do the actual merge.
       SegmentMerger merger(preaderPtrs, liveDocsPtrs, pwriter);
       merger.merge();
 
+      phase = "new_segment_info";
       // Create the new SegInfo for the output segment.
       auto newSegInfo = std::make_unique<SegInfo>(pwriter.getSegId(), pwriter.getMaxDoc());
+      phase = "schema_generation";
       newSegInfo->schemaGen = currentSchemaGen();
+      phase = "postings_finish";
       pwriter.finish(&newSegInfo->unsyncedFiles);
 
+      phase = "active_overlay_snapshot";
       auto activeOverlayNames = snapshotActiveVectorOverlayNames();
       if (!activeOverlayNames.empty() && schemaProvider_) {
+        phase = "schema_provider";
         auto schema = schemaProvider_();
         if (schema) {
           // The merged segment is private until the swap below.  Building here
           // avoids reading live source overlays and publishes segment plus
           // overlay entries atomically at the later commit.
+          phase = "merged_postings_reader";
+          // Test hook: a listener may throw to exercise containment of a
+          // post-merge, pre-swap failure.
+          Signal::emit("mergedPostingsReader", newSegInfo.get());
           auto pr = getSegmentPostingsReader(*newSegInfo);
           #ifndef NDEBUG
           {
@@ -1541,6 +1593,7 @@ void IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
           #endif
           std::vector<std::string> stagedOverlayFiles;
           try {
+            phase = "merge_vector_overlay";
             auto built = buildConcreteVectorOverlays(*newSegInfo, *pr, activeOverlayNames,
                                                      *schema, VectorIndexBuilder::BuildSite::MERGE,
                                                      stagedOverlayFiles);
@@ -1559,12 +1612,27 @@ void IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
             LOG_ERROR("Merge vector overlay build failed for seg={}; publishing flat fallback: unknown exception",
                       newSegInfo->segId);
           }
+          phase = "after_merge_vector_overlay";
         }
       }
 
+      phase = "publish_swap_prepare";
       // Move old segments to the delete list and add the new segment info.
       {
         const std::lock_guard<std::mutex> lock(indexMutex);
+        segmentsToDelete.reserve(segmentsToDelete.size() + segs.size());
+        if (newSegInfo->liveDocs > 0) {
+          segInfos.reserve(segInfos.size() + 1);
+          mergePolicy->_prepareUpdate(newSegInfo.get());
+        }
+
+        size_t personalDeleteCount = newSegInfo->personalDeletes.size();
+        for (auto segInfo : segs) {
+          personalDeleteCount += segInfo->personalDeletes.size();
+        }
+        newSegInfo->personalDeletes.reserve(personalDeleteCount);
+
+        phase = "publish_swap";
         for (auto segInfo : segs) {
           segInfo->merging = false; // mark as no longer merging so it can be removed.
           segInfo->mergedIntoSegId = newSegInfo->segId; // mark the segment as merged into the new segment
@@ -1588,87 +1656,98 @@ void IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
         // mutex-protected transfer, so the commit thread observes them after
         // taking indexMutex.
         if (newSegInfo->liveDocs > 0) {
-          mergePolicy->_update(newSegInfo.get());
-          segInfos.emplace(pwriter.getSegId(), std::move(newSegInfo));
+          auto* publishedSegInfo = newSegInfo.get();
+          auto [iter, success] = segInfos.emplace(pwriter.getSegId(), std::move(newSegInfo));
+          unused(iter);
+          assert(success);
           outputPublished = true;
+          mergePolicy->_update(publishedSegInfo);
         }
       } // end index lock
-    } catch (...) {
-      // TODO: merge state is NOT restored on failure - only file cleanup
-      // happens here.  mergeRunning stays true, waitingForMerges members keep
-      // their leftToFlush bump (wait_for_merges commits hang), and source
-      // segments stay merging=true.  The eventual fix is containment: run the
-      // normal teardown tail instead of rethrowing (the contained
-      // overlay-build catch and the segs.empty() path show the shape).
+    }
+  } catch (const std::exception& e) {
+    mergeFailed = true;
+    failure.phase = phase;
+    failure.exceptionType = typeid(e).name();
+    failure.message = e.what();
+    failure.outputPublished = outputPublished;
+  } catch (...) {
+    mergeFailed = true;
+    failure.phase = phase;
+    failure.exceptionType = "unknown";
+    failure.message = "unknown exception";
+    failure.outputPublished = outputPublished;
+  }
+
+  if (mergeFailed) {
+    {
+      const std::lock_guard<std::mutex> lock(indexMutex);
+      lastMergeFailure = failure;
+
       if (!outputPublished) {
-        try {
-          dir.deletePrefix(Postings::getIndexFileNamePrefix(outputSegId));
-        } catch (...) {
-          // Swallow: don't mask the original exception with a cleanup failure.
-          LOG_ERROR("Failed to delete merged segment files for segId={} after merge failure",
-                    outputSegId);
+        for (auto* segInfo : segs) {
+          segInfo->merging = false;
+          segInfo->mergedLiveGen = -1;
+          segInfo->mergedIntoSegId = 0;
+
+          if (!segInfos.contains(segInfo->segId)) {
+            // The source is not in the live set.  The publish swap is
+            // effectively noexcept (allocations reserved up front), so a
+            // pre-swap failure moved nothing to segmentsToDelete - a source
+            // found there was condemned by a CONCURRENT COMMIT that deleted all
+            // its docs (liveDocs==0).  Respect that: restore only a source that
+            // still has live docs (a genuine partial-swap victim), never
+            // resurrect one a commit already emptied - doing so reseeds the
+            // level with a zero-live segment that mergeSegmentsBody skips,
+            // scheduling endless no-op merges.
+            auto it = std::find_if(segmentsToDelete.begin(), segmentsToDelete.end(),
+                                   [&](const std::unique_ptr<SegInfo>& candidate) {
+                                     return candidate.get() == segInfo;
+                                   });
+            if (it != segmentsToDelete.end() && (*it)->liveDocs > 0) {
+              auto restored = std::move(*it);
+              segmentsToDelete.erase(it);
+              mergePolicy->_update(restored.get());
+              segInfos.emplace(restored->segId, std::move(restored));
+            }
+          }
         }
       }
-      throw;
     }
 
     if (!outputPublished) {
+      try {
+        dir.deletePrefix(Postings::getIndexFileNamePrefix(outputSegId));
+      } catch (const std::exception& e) {
+        LOG_ERROR("Failed to delete merged segment files for segId={} after merge failure: {}",
+                  outputSegId, e.what());
+      } catch (...) {
+        LOG_ERROR("Failed to delete merged segment files for segId={} after merge failure: unknown exception",
+                  outputSegId);
+      }
+    }
+
+    LOG_ERROR(
+      "Merge failed and was contained: sources=[{}] outputSegId={} outputPublished={} phase={} exceptionType={} message={}",
+      sourceSegIdsString(), outputSegId, outputPublished, failure.phase,
+      failure.exceptionType, failure.message);
+  } else if (!outputPublished) {
+    try {
       dir.deletePrefix(Postings::getIndexFileNamePrefix(outputSegId));
-    }
-
-    // This races with the commit code (see comments in finishCommitBody()).
-    // tryDeleteSegments(); // try to delete segments that are now empty
-  } // end of scope for preaders, pool, and pwriter
-
-
-  // TODO: if merge was kicked off and no more commits are in the pipeline, should we submit
-  // one ourselves so the new segment is visible?
-  // We could look to see if there are any busy inverters - if so, indexing is still happening.
-  // Also maybe only do if there are no more merges.
-
-
-
-  // Coordinate merge teardown with the commit-with-aux gate.  Order under
-  // indexMutex matters:
-  //   1. mergeRunning = false.
-  //   2. Possibly chain a follow-up merge.  This re-sets mergeRunning and
-  //      bumps leftToFlush on every member of waitingForMerges.
-  //   3. Decrement leftToFlush on every member of waitingForMerges to undo
-  //      our own bump, collecting any that hit zero.
-  // Doing (2) before (3) is the "wait for the merge wave" semantic: if a
-  // chain re-bumps before we decrement, net change is zero and the commit
-  // keeps waiting; if no chain, the decrement may release.
-  bool triggerCommit = false;
-  {
-    const std::lock_guard<std::mutex> lock(indexMutex);
-    mergePolicy->mergeRunning = false;
-    auto anotherMerge = mergePolicy->_maybeMergeSegments(nullptr);
-
-    std::vector<UpdateMessage*> toRelease;
-    for (auto* waitingMsg : waitingForMerges) {
-      assert(waitingMsg->commitInfo);
-      if (--waitingMsg->commitInfo->leftToFlush == 0) {
-        toRelease.push_back(waitingMsg);
-      }
-    }
-
-    // Synthetic commit only fires when nothing else will publish the
-    // merged segment.  Skip it if any commit-with-aux is in waitingForMerges
-    // (those commits will publish the merged segment via their own
-    // IndexInfo write and would otherwise race with a synthetic on a
-    // coreGen bump).  toRelease members are still in waitingForMerges at
-    // this point so the empty check covers them.
-    if (!anotherMerge && waitingForMerges.empty()) {
-      if (busyInverters.empty() && flushingInverters.empty() && idleInverters.empty()) {
-        // no indexing activity, so let's trigger a commit.
-        triggerCommit = true;
-      }
-    }
-
-    for (auto* releasedMsg : toRelease) {
-      _releaseToCommitSequencer(releasedMsg);
+    } catch (const std::exception& e) {
+      LOG_ERROR("Failed to delete unused merged segment files for segId={}: {}",
+                outputSegId, e.what());
+    } catch (...) {
+      LOG_ERROR("Failed to delete unused merged segment files for segId={}: unknown exception",
+                outputSegId);
     }
   }
+
+  // If a future throw site appears after outputPublished is set, the output is
+  // already live and the sources are already condemned.  In that case the
+  // failure path above skips source/file restoration and this tail may still
+  // request the synthetic publish commit.
+  bool triggerCommit = finishMergeTail(outputPublished, /*chainNextMerge=*/!mergeFailed);
 
   if (triggerCommit) {
     // send a commit message to force a commit.
@@ -1839,6 +1918,7 @@ void IndexWriter::testDeleteAllData() {
     currentAuxIndexes_.clear();
     currentSegmentOverlays_.clear();
     activeVectorOverlayNames.clear();
+    lastMergeFailure.reset();
     nextCommitInfo = std::make_unique<CommitInfo>();
 
     lastCommitTime = lastAdvertisedCommitTime = 0;
@@ -1895,6 +1975,11 @@ void IndexWriter::testReseedActiveVectorOverlayNamesFromManifest() {
 bool IndexWriter::testMergeRunning() {
   std::lock_guard<std::mutex> lock(indexMutex);
   return mergePolicy && mergePolicy->mergeRunning;
+}
+
+std::optional<IndexWriter::MergeFailureInfo> IndexWriter::testLastMergeFailure() {
+  std::lock_guard<std::mutex> lock(indexMutex);
+  return lastMergeFailure;
 }
 
 // TEST CODE

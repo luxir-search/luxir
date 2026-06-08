@@ -12,6 +12,7 @@
 #include <stdexcept>
 #include <unordered_set>
 
+#include "solux/util/Signal.h"
 #include "solux/reader/FieldReader.h"
 #include "solux/reader/VectorAuxReader.h"
 #include "solux/reader/VectorReader.h"
@@ -209,7 +210,6 @@ std::atomic<int64_t> VectorIndexBuilder::ivfPqBuildCountForTests{0};
 std::atomic<int64_t> VectorIndexBuilder::ivfPqMergeBuildCountForTests{0};
 size_t VectorIndexBuilder::ivfPqTrainingSampleBytes = 64 * 1024 * 1024;
 size_t VectorIndexBuilder::ivfPqAddChunkBytes = 16 * 1024 * 1024;
-std::string VectorIndexBuilder::failBuildForFieldNameForTests;
 
 bool VectorIndexBuilder::selectorMatches(const std::vector<std::string>& selectors,
                                          std::string_view name) {
@@ -309,11 +309,10 @@ VectorIndexBuilder::buildField(std::string_view fieldName,
                                const VectorFieldType& ft,
                                std::vector<std::string>& outFilesToSync,
                                BuildSite buildSite) {
-  if (!failBuildForFieldNameForTests.empty()
-      && fieldName == std::string_view(failBuildForFieldNameForTests)) {
-    throw std::runtime_error(fmt::format(
-        "VectorIndexBuilder: test requested failure for field {}", fieldName));
-  }
+  // Test hook: a listener may throw (or block) to exercise vector
+  // build-failure paths.  Args: the field name (std::string_view*) and the
+  // build site, so a listener can target a specific field and/or site.
+  Signal::emit("vectorBuildField", (void*)&fieldName, (void*)(intptr_t)buildSite);
   return buildIvfPqField(fieldName, ft, outFilesToSync, buildSite);
 }
 

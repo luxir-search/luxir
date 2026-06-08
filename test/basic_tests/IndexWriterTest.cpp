@@ -48,6 +48,70 @@ public:
   }
 };
 
+namespace {
+
+bool waitForMergesCommit(IndexWriter& iw) {
+  class BlockingWaitForMergesCommit final : public UpdateMessage {
+  public:
+    Blocker blocker;
+    bool success = false;
+
+    BlockingWaitForMergesCommit() {
+      commit = COMMIT;
+      waitForMerges = true;
+    }
+
+    void handle(IndexWriter& iw) override {
+      unused(iw);
+    }
+
+    void done(IndexWriter& iw) override {
+      unused(iw);
+      success = !result.errored();
+      blocker.notify();
+    }
+  };
+
+  BlockingWaitForMergesCommit msg;
+  bool submitted = iw.submitUpdate(&msg);
+  assert(submitted);
+  unused(submitted);
+  msg.blocker.wait();
+  return msg.success;
+}
+
+std::vector<std::string> allIds(solux::test::CollectionHelper& helper) {
+  auto* req = solux::test::LocalReq::create(helper.getSearchEngine());
+  auto docs = req->collection("main")
+               .allQuery()
+               .fields({"id"})
+               .limit(-1)
+               .execute()
+               .getDocs();
+  req->done();
+
+  std::vector<std::string> ids;
+  ids.reserve(docs.size());
+  for (const auto& doc : docs) {
+    auto* val = solux::test::find(doc, "id");
+    if (val) ids.push_back(std::get<std::string>(*val));
+  }
+  std::sort(ids.begin(), ids.end());
+  return ids;
+}
+
+bool segmentPrefixAbsent(Directory& dir, uint64_t segId) {
+  std::vector<std::string> files;
+  dir.listFiles(files);
+  auto prefix = Postings::getIndexFileNamePrefix(segId);
+  for (const auto& file : files) {
+    if (file.starts_with(prefix)) return false;
+  }
+  return true;
+}
+
+} // namespace
+
 
 TEST_F(IndexWriterTest, simple) {
   RAMDir dir;
@@ -209,6 +273,83 @@ TEST_F(IndexWriterTest, autoMerge) {
     ASSERT_EQ(reader->maxDoc(), MERGE_FACTOR);
     ASSERT_EQ(reader->segments().size(), 1);
   }
+}
+
+TEST_F(IndexWriterTest, mergeFailureContainmentRestoresSourcesAndGate) {
+  using namespace solux::test;
+
+  CollectionHelper helper("main");
+  helper.clear();
+  auto iw = helper.getIndexWriter();
+
+  std::vector<std::string> expectedIds;
+  for (int seg = 0; seg < 2; seg++) {
+    for (int i = 0; i < 4; i++) {
+      std::string id = "s" + std::to_string(seg) + "_" + std::to_string(i);
+      expectedIds.push_back(id);
+      helper.index(flatdoc("id", id, "text_w", "merge containment"));
+    }
+    helper.commit();
+  }
+  std::sort(expectedIds.begin(), expectedIds.end());
+
+  auto beforeReader = iw->getIndexReader();
+  ASSERT_EQ(beforeReader->segments().size(), 2u);
+  ASSERT_EQ(allIds(helper), expectedIds);
+
+  std::latch mergeStarted(1);
+  std::latch releaseMerge(1);
+  solux::Signal::listen("mergeStart", [&](void* a, void* b, void* c) -> void* {
+    unused(a, b, c);
+    mergeStarted.count_down();
+    releaseMerge.wait();
+    return nullptr;
+  });
+
+  solux::Signal::listen("segmentMergeBody", [](void*, void*, void*) -> void* {
+    throw std::runtime_error("injected segment merge failure");
+  });
+  std::thread mergeThread([&]() {
+    iw->mergeSegments();
+  });
+  mergeStarted.wait();
+
+  std::atomic_bool waitCommitDone = false;
+  std::atomic_bool waitCommitSuccess = false;
+  std::thread waitCommitThread([&]() {
+    waitCommitSuccess.store(waitForMergesCommit(*iw), std::memory_order_relaxed);
+    waitCommitDone.store(true, std::memory_order_relaxed);
+  });
+
+  releaseMerge.count_down();
+  mergeThread.join();
+  waitCommitThread.join();
+  solux::Signal::unlisten("mergeStart");
+  solux::Signal::unlisten("segmentMergeBody");
+
+  EXPECT_FALSE(iw->testMergeRunning());
+  EXPECT_TRUE(waitCommitDone.load(std::memory_order_relaxed));
+  // Benign ordering: the waitForMerges commit may register before or after the
+  // failure tail's decrement walk.  Both orderings succeed - a late joiner sees
+  // mergeRunning==false and does not wait - so this is not a flaky race, the
+  // success holds either way.  Do not "fix" it with added synchronization.
+  EXPECT_TRUE(waitCommitSuccess.load(std::memory_order_relaxed));
+  auto failure = iw->testLastMergeFailure();
+  ASSERT_TRUE(failure.has_value());
+  EXPECT_EQ(failure->phase, "segment_merge");
+  EXPECT_FALSE(failure->outputPublished);
+  EXPECT_EQ(failure->sourceSegIds.size(), 2u);
+  EXPECT_TRUE(segmentPrefixAbsent(iw->dir, failure->outputSegId));
+
+  EXPECT_TRUE(waitForMergesCommit(*iw));
+  auto afterFailureReader = iw->getIndexReader();
+  EXPECT_EQ(afterFailureReader->segments().size(), 2u);
+  EXPECT_EQ(allIds(helper), expectedIds);
+
+  iw->mergeSegments();
+  auto afterSuccessReader = iw->getIndexReader();
+  EXPECT_EQ(afterSuccessReader->segments().size(), 1u);
+  EXPECT_EQ(allIds(helper), expectedIds);
 }
 
 
@@ -1524,4 +1665,3 @@ TEST_F(IndexWriterTest, testCoreGen) {
   }
   EXPECT_EQ(mergedSegmentCount, 1);
 }
-

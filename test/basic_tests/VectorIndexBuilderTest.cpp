@@ -3,6 +3,7 @@
 #include "test/CollectionHelper.h"
 #include "test/LocalReq.h"
 #include "test/TestUtils.h"
+#include "solux/index/IndexWriter.h"
 #include "solux/index/UpdateMessage.h"
 #include "solux/index/VectorIndexBuilder.h"
 #include "solux/reader/VectorAuxReader.h"
@@ -53,7 +54,6 @@ protected:
     int32_t savedNProbe;
     int64_t savedMinTraining;
     int64_t savedBuildThreshold;
-    std::string savedFailBuildForFieldName;
 
     IvfPqGuard(int32_t nlist, int32_t m, int32_t bits,
                int32_t nprobe, int64_t minTraining)
@@ -63,8 +63,7 @@ protected:
         savedBits(VectorIndexBuilder::ivfPqBits),
         savedNProbe(VectorIndexBuilder::ivfPqDefaultNProbe),
         savedMinTraining(VectorIndexBuilder::ivfPqMinTrainingVectors),
-        savedBuildThreshold(VectorIndexBuilder::ivfPqBuildThresholdScanCost),
-        savedFailBuildForFieldName(VectorIndexBuilder::failBuildForFieldNameForTests) {
+        savedBuildThreshold(VectorIndexBuilder::ivfPqBuildThresholdScanCost) {
       VectorIndexBuilder::buildFaissIvfPqAuxIndexes = true;
       VectorIndexBuilder::ivfPqNList = nlist;
       VectorIndexBuilder::ivfPqM = m;
@@ -72,7 +71,6 @@ protected:
       VectorIndexBuilder::ivfPqDefaultNProbe = nprobe;
       VectorIndexBuilder::ivfPqMinTrainingVectors = minTraining;
       VectorIndexBuilder::ivfPqBuildThresholdScanCost = 0;
-      VectorIndexBuilder::failBuildForFieldNameForTests.clear();
     }
 
     ~IvfPqGuard() {
@@ -83,23 +81,28 @@ protected:
       VectorIndexBuilder::ivfPqDefaultNProbe = savedNProbe;
       VectorIndexBuilder::ivfPqMinTrainingVectors = savedMinTraining;
       VectorIndexBuilder::ivfPqBuildThresholdScanCost = savedBuildThreshold;
-      VectorIndexBuilder::failBuildForFieldNameForTests = savedFailBuildForFieldName;
     }
   };
 };
 
 namespace {
 
+// Listens on the "vectorBuildField" signal and throws when the build reaches
+// the named field, exercising vector build-failure paths.  A test could just
+// as easily block here (timing) or throw a different exception type.
 struct VectorBuildFailureGuard {
-  std::string savedFieldName;
-
-  explicit VectorBuildFailureGuard(std::string fieldName)
-      : savedFieldName(VectorIndexBuilder::failBuildForFieldNameForTests) {
-    VectorIndexBuilder::failBuildForFieldNameForTests = std::move(fieldName);
+  explicit VectorBuildFailureGuard(std::string fieldName) {
+    solux::Signal::listen("vectorBuildField",
+        [field = std::move(fieldName)](void* fnPtr, void*, void*) -> void* {
+          if (*(const std::string_view*)fnPtr == field) {
+            throw std::runtime_error("VectorBuildFailureGuard: injected failure for " + field);
+          }
+          return nullptr;
+        });
   }
 
   ~VectorBuildFailureGuard() {
-    VectorIndexBuilder::failBuildForFieldNameForTests = savedFieldName;
+    solux::Signal::unlisten("vectorBuildField");
   }
 };
 
@@ -147,6 +150,16 @@ std::vector<std::string> vectorOverlayFiles(Directory& dir) {
     if (file.find("__vec.") != std::string::npos) out.push_back(file);
   }
   return out;
+}
+
+bool segmentPrefixAbsent(Directory& dir, uint64_t segId) {
+  std::vector<std::string> files;
+  dir.listFiles(files);
+  auto prefix = Postings::getIndexFileNamePrefix(segId);
+  for (const auto& file : files) {
+    if (file.starts_with(prefix)) return false;
+  }
+  return true;
 }
 
 bool commitForTest(CollectionHelper& h,
@@ -1001,6 +1014,56 @@ TEST_F(VectorIndexBuilderTest, mergeOverlayFailurePublishesFlatAndClearsMergeGat
   google::protobuf::Arena arena2;
   auto* info2 = readIndexInfo(iw->dir, arena2);
   EXPECT_EQ(vectorOverlays(info2).size(), 2u);
+}
+
+TEST_F(VectorIndexBuilderTest, mergedPostingsReaderFailureRestoresSourcesAndCleansOutput) {
+  IvfPqGuard guard(/*nlist=*/2, /*m=*/1, /*bits=*/1, /*nprobe=*/2, /*minTraining=*/2);
+  CollectionHelper h("main");
+  h.clear();
+  enableL2OnVecSuffix(h.collection());
+  auto iw = h.getIndexWriter();
+
+  EXPECT_TRUE(commitForTest(h, {"vec.embedding_v"}));
+  EXPECT_TRUE(iw->testActiveVectorOverlayName("vec.embedding_v"));
+
+  for (int seg = 0; seg < 2; seg++) {
+    for (int i = 0; i < 80; i++) {
+      h.index(flatdoc("id", "s" + std::to_string(seg) + "_" + std::to_string(i),
+                      "embedding_v", std::vector<float>{(float)i, (float)seg, 1.0f, 0.0f}));
+    }
+    h.commit();
+  }
+
+  solux::Signal::listen("mergedPostingsReader", [](void*, void*, void*) -> void* {
+    throw std::runtime_error("injected merged postings reader failure");
+  });
+  iw->mergeSegments();
+  solux::Signal::unlisten("mergedPostingsReader");
+
+  EXPECT_FALSE(iw->testMergeRunning());
+  auto failure = iw->testLastMergeFailure();
+  ASSERT_TRUE(failure.has_value());
+  EXPECT_EQ(failure->phase, "merged_postings_reader");
+  EXPECT_FALSE(failure->outputPublished);
+  EXPECT_EQ(failure->sourceSegIds.size(), 2u);
+  EXPECT_TRUE(segmentPrefixAbsent(iw->dir, failure->outputSegId));
+  EXPECT_TRUE(commitForTest(h, {}, /*waitForMerges=*/true));
+
+  google::protobuf::Arena arena1;
+  auto* info1 = readIndexInfo(iw->dir, arena1);
+  ASSERT_EQ(info1->segments_size(), 2);
+  EXPECT_EQ(vectorOverlays(info1).size(), 0u);
+
+  resetVectorBuildCounters();
+  iw->mergeSegments();
+  h.commit();
+  EXPECT_EQ(vectorCommitBuildCount(), 0);
+  EXPECT_EQ(vectorMergeBuildCount(), 1);
+
+  google::protobuf::Arena arena2;
+  auto* info2 = readIndexInfo(iw->dir, arena2);
+  ASSERT_EQ(info2->segments_size(), 1);
+  EXPECT_EQ(vectorOverlays(info2).size(), 1u);
 }
 
 TEST_F(VectorIndexBuilderTest, vectorBuildCommitDoesNotWaitForInFlightMerge) {

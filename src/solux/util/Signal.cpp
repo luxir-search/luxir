@@ -7,15 +7,26 @@ std::unique_ptr<Signal::map_type> Signal::callbacks;
 std::mutex Signal_mutex;
 
 void* Signal::emit_(std::string_view name, void* a, void* b, void* c) {
-    std::lock_guard<std::mutex> lock(Signal_mutex);
-    if (!callbacks) {
-      return nullptr;
+    // Copy the callback out under the lock, then invoke it WITHOUT the lock
+    // held.  Holding Signal_mutex across the callback would let a blocking
+    // listener (e.g. a test that waits on a latch to reproduce a timing
+    // window) stall every other thread's emit on the global mutex - a
+    // deadlock when the blocked thread is the one expected to release it.
+    // The std::function copy keeps the callback valid even if another thread
+    // unlistens/clears while it runs.
+    callback_type cb;
+    {
+      std::lock_guard<std::mutex> lock(Signal_mutex);
+      if (!callbacks) {
+        return nullptr;
+      }
+      auto it = callbacks->find(name);
+      if (it == callbacks->end()) {
+        return nullptr;
+      }
+      cb = it->second;
     }
-    auto it = callbacks->find(name);
-    if (it == callbacks->end()) {
-      return nullptr;
-    }
-    return it->second(a, b, c);
+    return cb(a, b, c);
 }
 
 void Signal::listen(std::string_view name, callback_type&& callback) {
