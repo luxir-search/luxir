@@ -1,3 +1,4 @@
+#include <set>
 #include "solux/index/PostingsWriter.h"
 #include "solux/reader/DocsEnum.h"
 #include "gtest/gtest.h"
@@ -742,6 +743,90 @@ TEST_F(PostingsTest, seekForwardNumericIds) {
       ASSERT_EQ(tenum.term(), ids[i]);
       DocsEnum de(pool, reader, tenum);
       ASSERT_EQ(de.next(), i);
+    }
+  }
+}
+
+// Random fuzzer for seekForward, modeled on what applyDeletes actually does:
+// a per-segment RANDOM SUBSET of variable-width numeric ids (so block
+// boundaries land at random terms), sought via random-gap sorted forward
+// sequences from a FRESH enum (applyDeletes dropped the initial full seek).
+// The structured seekForward tests use fixed id sets and fixed strides and
+// miss this; this is the gap that let a seekForward bug ship in applyDeletes.
+TEST_F(PostingsTest, seekForwardRandom) {
+  for (int trial = 0; trial < 500; trial++) {
+    RAMDir dir;
+    MemPool pool;
+
+    // Random subset of numeric ids -> variable widths, random block boundaries.
+    int wanted = rng.rint(1, Postings::TERMS_BLOCK_SIZE * 3);
+    int range = rng.rint(wanted, wanted * 50 + 10);
+    std::set<std::string> idset;
+    while ((int)idset.size() < wanted) {
+      idset.insert(std::to_string(rng.rint(0, range)));
+    }
+    std::vector<std::string> ids(idset.begin(), idset.end());  // lexically sorted
+    int nTerms = (int)ids.size();
+
+    PostingsWriter postingsWriter(dir, 0, nTerms);
+    {
+      TextWriter writer(postingsWriter);
+      writer.startField("id");
+      for (int i = 0; i < nTerms; i++) {
+        TermRef term(pool, ids[i].data(), ids[i].size());
+        writer.startTerm(term);
+        writer.startDoc(i);
+        writer.addPositionDelta(1);
+        writer.endDoc(i);
+        writer.endTerm(term);
+      }
+      writer.endField();
+    }
+    postingsWriter.finish();
+
+    PostingsReader reader(dir, 0);
+    FieldReader fieldReader(pool, reader);
+    ASSERT_TRUE(fieldReader.readNextField());
+    SegFieldInfo fieldInfo;
+    fieldReader.readFieldInfo(fieldInfo);
+
+    int seqs = rng.rint(1, 20);
+    for (int s = 0; s < seqs; s++) {
+      TermsEnum tenum(pool, reader, fieldInfo);
+      // Build a SORTED query sequence mixing present ids and (mostly) absent
+      // values - exactly like applyDeletes seeking a sorted delete span whose
+      // ids may or may not exist in this segment.  Misses interleaved with hits
+      // are the untested case.
+      int nq = rng.rint(1, nTerms + 5);
+      std::vector<std::string> queries;
+      for (int q = 0; q < nq; q++) {
+        if (nTerms > 0 && rng.rint(2) == 0) {
+          queries.push_back(ids[rng.rint(0, nTerms)]);          // present (hit)
+        } else {
+          queries.push_back(std::to_string(rng.rint(0, range))); // maybe absent (miss)
+        }
+      }
+      std::sort(queries.begin(), queries.end());  // byte-lexical, same as term order
+
+      // Optionally start positioned with a full seek (mixed usage).
+      if (rng.rint(3) == 0 && nTerms > 0) {
+        ASSERT_TRUE(tenum.seek(ids[0]));
+      }
+      for (const auto& q : queries) {
+        bool found = tenum.seekForward(q);
+        auto it = std::lower_bound(ids.begin(), ids.end(), q);
+        bool present = (it != ids.end() && *it == q);
+        int idx = (int)(it - ids.begin());
+        ASSERT_EQ(found, present) << "trial=" << trial << " seq=" << s
+                           << " q='" << q << "' expectedOrd=" << (present ? idx : -1)
+                           << " nTerms=" << nTerms;
+        if (found) {
+          ASSERT_EQ(tenum.ord(), idx) << "trial=" << trial << " seq=" << s << " q='" << q << "'";
+          ASSERT_EQ(tenum.term(), q) << "trial=" << trial << " seq=" << s << " q='" << q << "'";
+          DocsEnum de(pool, reader, tenum);
+          ASSERT_EQ(de.next(), idx) << "trial=" << trial << " seq=" << s << " q='" << q << "'";
+        }
+      }
     }
   }
 }

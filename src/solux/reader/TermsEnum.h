@@ -192,22 +192,42 @@ public:
     }
 
     int32_t nextBlock = termBlockIndex + 1;
-    bool inCurrentBlock = (nextBlock >= numTermBlocks) ||
-        target < termsIS.readPackedTerm(fieldInfo.termsLoc.offset() + termBlockOffsets[nextBlock]);
+    bool beyondCurrentBlock = (nextBlock < numTermBlocks) &&
+        !(target < termsIS.readPackedTerm(fieldInfo.termsLoc.offset() + termBlockOffsets[nextBlock]));
 
-    if (inCurrentBlock) {
-      for (;;) {
-        auto cmp = term() <=> target;
-        if (cmp == 0) return true;
-        if (cmp > 0) return false;
-        if (ordInBlock >= maxOrdInBlock) return false;
-        readNextTermInBlock();
+    if (beyondCurrentBlock) {
+      // Binary-search for the block that may contain target (from nextBlock
+      // onward) and load it, positioning at ord 0.  We then fall into the same
+      // linear scan as the in-block case.  We deliberately do NOT use
+      // seekInBlock here: its hash skip stops at the first hash-colliding term
+      // past the target on a miss, leaving the enum beyond the true insertion
+      // point, which would break the next seekForward (the post-miss position
+      // must be the smallest term >= target for forward iteration to work).
+      // TODO: an exponential search from the current block could beat the
+      // binary search here.
+      auto blockStart = termBlockOffsets + nextBlock;
+      auto blockEnd = termBlockOffsets + numTermBlocks;
+      auto blockOffsetPtr = std::upper_bound(blockStart, blockEnd, target,
+          [&](std::string_view key, const int64_t& blockOffset) {
+            return key < termsIS.readPackedTerm(fieldInfo.termsLoc.offset() + blockOffset);
+          });
+      if (blockOffsetPtr > blockStart) {
+        blockOffsetPtr--;
       }
+      termBlockIndex = (int32_t)(blockOffsetPtr - termBlockOffsets);
+      readTermBlock();
     }
 
-    // TODO: an exponential search starting that the current block would be more
-    // appropriate than a binary search here.
-    return seek(target, nextBlock);
+    // Linear forward scan within the current block.  Stops at the first term
+    // >= target (the insertion point), so a subsequent seekForward starts from
+    // the correct position.
+    for (;;) {
+      auto cmp = term() <=> target;
+      if (cmp == 0) return true;
+      if (cmp > 0) return false;
+      if (ordInBlock >= maxOrdInBlock) return false;
+      readNextTermInBlock();
+    }
   }
 
   bool seekInBlock(std::string_view target) {

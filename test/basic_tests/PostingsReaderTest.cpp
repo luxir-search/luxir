@@ -30,6 +30,13 @@ public:
     std::string fname;
     std::string missing;
     std::string term;
+    // Track the current enum position so we can mix in seekForward (forward-only)
+    // when the next target is >= the current term.  curOrd == -1 means fresh enum;
+    // curOrd == nTerms means "position unknown after a miss" (disables seekForward
+    // until the next successful (re)positioning).  This exercises seekForward the
+    // same way applyDeletes does: a sorted run of forward seeks to present terms,
+    // interleaved with full seeks.
+    int curOrd = -1;
     for (int i=0; i < nTerms*nFields*2; i++) {
       if (rng.rint(0,10) == 0) { // 10% of the time, switch fields.
         st.getFieldName(fname, rng.rint(0, nFields));
@@ -46,11 +53,45 @@ public:
         bool found = st.fieldReader->seek(fname);
         ASSERT_TRUE(found);
         st.makeTermsEnum();  // refresh the terms enum st.tenum
+        curOrd = -1;
       }
 
       int tnum = rng.rint(0, nTerms);
-      st.makeTerm(tnum, term);
 
+      // Use seekForward when the target is at/ahead of the current position
+      // (the forward-only contract).  curOrd == -1 means a fresh enum.
+      bool canForward = (curOrd < 0) || (tnum >= curOrd);
+      if (canForward && rng.rint(100) < 50) {
+        if (rng.rbool()) {
+          // forward seek to a PRESENT term at ord tnum
+          st.makeTerm(tnum, term);
+          bool found = st.tenum->seekForward(term);
+          if (!found) {
+            found = st.tenum->seekForward(term);  // place breakpoint here to debug
+          }
+          ASSERT_TRUE(found) << " seekForward present tnum=" << tnum
+                             << " curOrd=" << curOrd << " term='" << term << "'";
+          ASSERT_EQ(st.tenum->ord(), tnum) << " seekForward present tnum=" << tnum;
+          curOrd = tnum;
+        } else {
+          // forward seek to an ABSENT term strictly between term[tnum] and
+          // term[tnum+1] - the applyDeletes case (a sorted delete id missing
+          // from this segment, sought via seekForward mid-iteration).
+          st.makeTerm(tnum, term);
+          term.push_back('!');  // sorts after term[tnum], before term[tnum+1]
+          bool found = st.tenum->seekForward(term);
+          if (found) {
+            found = st.tenum->seekForward(term);  // place breakpoint here to debug
+          }
+          ASSERT_FALSE(found) << " seekForward absent between " << tnum << " and "
+                              << (tnum+1) << " curOrd=" << curOrd << " term='" << term << "'";
+          curOrd = tnum + 1;  // enum advances past the missed target
+        }
+        continue;
+      }
+
+      // Full seek / seekOrd path (may move backward).
+      st.makeTerm(tnum, term);
       bool shouldFind = rng.rbool();
       if (!shouldFind) {
         term.push_back('!');
@@ -58,23 +99,23 @@ public:
           term[0] = (char) rng.rbyte();
         }
       }
-      // seek by ord or by term
       bool found;
-      if (shouldFind && rng.rint(100)<20) {  // look up by ord 20% of the time
+      if (shouldFind && rng.rint(100)<25) {  // look up by ord some of the time
         st.tenum->seekOrd(tnum);
         found = true;
-        ASSERT_EQ(shouldFind, found) << " tnum=" << tnum << " term='" << term << "'";
+        curOrd = tnum;
       } else {
         found = st.tenum->seek(term);
         if (found != shouldFind) {
           found = st.tenum->seek(term);  // place breakpoint here to debug
         }
         ASSERT_EQ(shouldFind, found) << " tnum=" << tnum << " term='" << term << "'";
+        curOrd = found ? tnum : nTerms;  // unknown position after a miss -> disable forward
       }
       if (found) {
 //        ASSERT_EQ(st.tenum->term(), term);
         auto ord = st.tenum->ord();
-        ASSERT_EQ(ord, tnum);
+        ASSERT_EQ(ord, tnum) << " tnum=" << tnum << " term='" << term << "'";
         // TODO: verify the postings for the term are correct
       }
     }
