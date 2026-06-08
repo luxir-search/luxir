@@ -1,38 +1,53 @@
 #pragma once
 
 #include <string>
-#include <assert.h>
-#include <climits>
+#include <string_view>
+#include <vector>
+#include <cstring>
 #include <memory>
 #include "solux/util/solux_util.h"
 
 namespace solux {
+
+// A Token is a borrowed view, not an owner. `text` points at bytes that live in
+// the source value, in a producing filter's private reusable buffer, or in a
+// static dictionary. The Token just points.
 //
-// TODO: investigate using string view?
-//
+// The contract every filter in a chain must obey:
+//   * read-only  - never write the bytes at `text`. To "change the text", a
+//                  rewriting filter copies into its own buffer and repoints
+//                  `text` at it. This protects both the caller's source value
+//                  and every upstream filter's output buffer (no aliasing).
+//   * transient  - `text` is valid only for the current token. It is invalidated
+//                  by the next incrementToken()/reset()/end() on the chain. A
+//                  buffering filter (shingles, CJK bigram) that needs to retain a
+//                  token past the current pull must copy the bytes out.
+// `text` (a string_view) is itself an attribute: the only way to change the
+// token's text is to reassign it. Positions/type/payload would join the same
+// mutable bag.
 class Token {
-private:
 public:
-  char *ptr;
-  char *end;
-  int positionIncrement; // position or increment?
-  // optional way to get pointer to Indexer (or make that a thread local?)... may be used in other contexts
+  std::string_view text;
+  int positionIncrement; // increment from the previous token's position
 
   void clear() {
     positionIncrement = 1;
   }
-
-  int numBytes() {
-    assert(end - ptr < INT_MAX);
-    return (int) (end - ptr);
-  }
-
 };
 
 
-// OPTION: we can either have the token ourselves, or have the caller pass it in
-// If the caller passes it in, everyone in the chain would need to set it (for a short field?)
-// If we return it, it's a virtual method call???
+// A pull-based stream of Tokens. The whole chain shares a single Token object
+// (held by the head Tokenizer); each stage repoints its `text`/attributes in
+// place. Lifecycle is reset() / incrementToken()* / end():
+//   * reset()           - prepare to emit tokens for a fresh value. The head's
+//                         input is supplied separately via Tokenizer::setValue.
+//                         Defaults to no-op (and non-forwarding); only stateful
+//                         (buffering) filters need to override it.
+//   * incrementToken()  - advance to the next token, returning false at the end.
+//   * end()             - reserved seam for reporting trailing stream state
+//                         (final offset, trailing position increment). Not needed
+//                         yet; will be added no-op-defaulted when the first
+//                         feature that produces trailing state lands.
 class TokenStream {
 protected:
   Token &token;
@@ -44,20 +59,28 @@ public:
 
   Token &getToken() { return token; }
 
-  virtual bool incrementToken(bool first) = 0;
+  // Prepare the stream to emit tokens for a fresh value. Default no-op: the
+  // common whitespace+lowercase chain holds no cross-token state, so there is
+  // nothing to reset (the head cursor is reset by setValue). Stateful filters
+  // override to clear their buffers; see TokenFilter::reset for forwarding.
+  virtual void reset() {}
+
+  virtual bool incrementToken() = 0;
 };
 
 class Tokenizer : public TokenStream {
 protected:
+  // Private scan cursors. These move forward through the source as we carve out
+  // tokens; each token is published as a string_view into [tokStart, start_).
   const char *start_ = nullptr;
   const char *end_ = nullptr;
   Token token;
 public:
   Tokenizer() : TokenStream(token) {}
 
-  /// The value this points to should exist for the duration of the analysis and may be changed in place!
+  // The value must outlive the analysis. It is treated as read-only: under the
+  // borrow contract no stage writes through these bytes.
   void setValue(std::string_view val) {
-    // do we have a max size?
     start_ = val.data();
     end_ = start_ + val.size();
   }
@@ -71,11 +94,18 @@ public:
   }
 
   TokenStream& source() { return *tokSource; }
+
+  // Forward reset() source-ward so a reset propagates to every stage. This is
+  // only invoked when the chain actually contains a stateful filter (see
+  // TokenChain::reset); the common stateless chain skips it entirely.
+  void reset() override { tokSource->reset(); }
 };
 
-// A version of WhitespaceTokenizer that makes a copy of the input
+// Splits the source on ASCII whitespace, viewing the source bytes directly (no
+// copy). Under the borrow contract the tokenizer never needs a writable buffer:
+// each token is a string_view into the source, and any rewriting happens later
+// in a filter's own buffer.
 class WhitespaceTokenizer : public Tokenizer {
-  std::vector<char> output;
 
   // increments over a single whitespace char.
   // assumes ptr is less than end
@@ -99,8 +129,7 @@ public:
   WhitespaceTokenizer() : Tokenizer() {
   }
 
-  virtual bool incrementToken(bool first) override {
-    unused(first);
+  virtual bool incrementToken() override {
     // first reset the token state
     token.clear();
 
@@ -110,7 +139,7 @@ public:
     } while (incrementOverWhitespace(start_, end_));
 
     // first non-whitespace, guaranteed to have start_ < end_
-    auto* mystart = start_;
+    const char* mystart = start_;
 
     // Going to the next character may place us on the second octet of a UTF8 sequence.
     // That's OK as long as our incrementOverWhitespace routine can handle that.
@@ -119,69 +148,10 @@ public:
     start_++;
 
     for (;;) {
-      auto* myend = start_;
+      const char* myend = start_;
       if (start_ >= end_ || incrementOverWhitespace(start_, end_)) {
         // If we hit whitespace, we will have already skipped over the first whitespace char for the next call
-        output.resize(myend - mystart);
-        memcpy(&output[0], mystart, output.size());  // std::copy doesn't know if ranges overlap and uses mmove
-        token.ptr = output.data();
-        token.end = token.ptr + output.size();
-        return true;
-      }
-      start_++;
-    }
-  }
-};
-
-class NoCopyWhitespaceTokenizer : public Tokenizer {
-
-  // increments over a single whitespace char.
-  // assumes ptr is less than end
-  // after returning ptr may be equal to end
-  static bool incrementOverWhitespace(const char *&ptr, const char *end) {
-    unused(end); // we don't check multiple bytes yet
-    char ch = *ptr;
-    // all whitespace chars are either less than ' ' or take up more than one UTF8 byte, so the first byte will be negative!
-    // this does rely on char being signed
-    if ((signed char) ch > (signed char) ' ') return false;
-    if (ch == ' ' || ch == '\n' || ch == '\t' || ch == '\r') {
-      ++ptr;
-      return true;
-    }  // use the shift-trick here?
-
-    // TODO: 0xA0 (non-breaking space) and the other unicode space chars (or java space chars)
-    return false;
-  }
-
-public:
-  NoCopyWhitespaceTokenizer() : Tokenizer() {}
-
-  // TODO: somehow add a method that could be used via templates
-  // or something that could be inlined (i.e. delegation via templates)
-
-  virtual bool incrementToken(bool first) override {
-    unused(first);
-    // first reset the token state
-    token.clear();
-
-    // first eat whitespace
-    do {
-      if (start_ >= end_) return false;
-    } while (incrementOverWhitespace(start_, end_));
-
-    // first non-whitespace, guaranteed to have start_ < end_
-    token.ptr = const_cast<char *>(start_);
-
-    // Going to the next character may place us on the second octet of a UTF8 sequence.
-    // That's OK as long as our incrementOverWhitespace routine can handle that.
-    // It's also guaranteed that this first character is not whitespace, so we don't need
-    // to correctly match higher code points for whitespace.
-    start_++;
-
-    for (;;) {
-      token.end = const_cast<char *>(start_);
-      if (start_ >= end_ || incrementOverWhitespace(start_, end_)) {
-        // If we hit whitespace, we will have already skipped over the first whitespace char for the next call
+        token.text = std::string_view(mystart, (size_t) (myend - mystart));
         return true;
       }
       start_++;
@@ -210,8 +180,6 @@ public:
       sink(start, (int) (val - start));
     }
   }
-
-
 };
 
 
@@ -220,32 +188,47 @@ class KeywordTokenizer : public Tokenizer {
 public:
   KeywordTokenizer() : Tokenizer() {}
 
-  virtual bool incrementToken(bool first) override {
-    if (!first) return false;  // only one token
-    token.clear();
+  virtual bool incrementToken() override {
+    // setValue repositions start_ at the value, so start_ >= end_ both signals
+    // an empty value and marks the single token as already consumed.
     if (start_ >= end_) return false;
-    token.ptr = const_cast<char*>(start_);
-    token.end = const_cast<char*>(end_);
+    token.clear();
+    token.text = std::string_view(start_, (size_t) (end_ - start_));
     start_ = end_;  // consumed
     return true;
   }
 };
 
 
+// ASCII lowercase. Rewriting filters obey the read-only contract: rather than
+// writing the source bytes in place, it copies the token into its own reusable
+// buffer and repoints. Pure-lowercase tokens pass through with zero copy.
 class LowercaseFilter : public TokenFilter {
+  std::vector<char> buf; // reusable output buffer; the borrowed bytes live here after a rewrite
 public:
   LowercaseFilter(std::unique_ptr<TokenStream> source) : TokenFilter(std::move(source)) {}
 
-  bool incrementToken(bool first) override {
-    if (source().incrementToken(first)) {
-      for (char* curr = token.ptr; curr < token.end; curr++) {
-        if (*curr <= 'Z' && *curr >= 'A') { // TODO: handle unicode!
-          *curr += 'a' - 'A';
-        }
-      }
-      return true;
+  bool incrementToken() override {
+    if (!source().incrementToken()) return false;
+
+    std::string_view in = token.text;
+    // Find the first uppercase byte. If there is none, leave the token pointing
+    // at the source bytes (no copy, no repoint).
+    size_t i = 0;
+    for (; i < in.size(); i++) {
+      char c = in[i];
+      if (c >= 'A' && c <= 'Z') break; // TODO: handle unicode!
     }
-    return false;
+    if (i == in.size()) return true;
+
+    // Copy into our own buffer and fold the rest. We never write `in`.
+    buf.assign(in.begin(), in.end());
+    for (; i < buf.size(); i++) {
+      char c = buf[i];
+      if (c >= 'A' && c <= 'Z') buf[i] = (char) (c + ('a' - 'A'));
+    }
+    token.text = std::string_view(buf.data(), buf.size());
+    return true;
   }
 };
 
@@ -271,11 +254,20 @@ class FieldAnalyzer {
 
 class TokenChain {
 public:
-  Tokenizer &head;
-  std::unique_ptr<TokenStream> tail;
+  Tokenizer &head;                   // owned via `tail` (the head is the bottom of the chain)
+  std::unique_ptr<TokenStream> tail; // the top of the chain; pull from here
+  bool stateful;                     // true iff any stage buffers state across tokens/values
 
-  TokenChain(Tokenizer &head, std::unique_ptr<TokenStream> tail)
-          : head(head), tail(std::move(tail)) {}
+  TokenChain(Tokenizer &head, std::unique_ptr<TokenStream> tail, bool stateful = false)
+          : head(head), tail(std::move(tail)), stateful(stateful) {}
+
+  // Begin analysis of a fresh value (the value itself is supplied via
+  // head.setValue). For the common stateless chain this is a single predictable
+  // branch with no virtual dispatch; only a chain that contains a stateful
+  // filter pays the source-ward reset() walk.
+  void reset() {
+    if (stateful) tail->reset();
+  }
 };
 
 

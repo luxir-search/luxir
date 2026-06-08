@@ -55,6 +55,7 @@ public:
   void indexSingle(Inverter& inverter, std::string_view val) {
     TokenChain& tc = *tokenChain;
     tc.head.setValue(val);
+    tc.reset();
 
     int numTokens = 0;
     int pos = -1;
@@ -62,12 +63,13 @@ public:
     TokenStream& tail = *tc.tail;
     int docid = inverter.getDoc();
     for (;;) {
-      bool hasNext = tail.incrementToken(numTokens == 0);
+      bool hasNext = tail.incrementToken();
       if (!hasNext) break;
       ++numTokens;
       pos += tok.positionIncrement;
-      auto term = std::string_view(tok.ptr, tok.end);
-      // int tokLen = tok.end - tok.ptr;
+      // The token bytes are transient (the chain may reuse the buffer on the
+      // next pull); try_emplace copies them into the MemPool below.
+      std::string_view term = tok.text;
 
       auto [entry, inserted] = termsHash.try_emplace(term, termsHash.getMemPool(), docid, pos);
       if (!inserted) {

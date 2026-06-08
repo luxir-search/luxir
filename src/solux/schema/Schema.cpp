@@ -515,7 +515,7 @@ std::shared_ptr<Schema> Schema::createDefaultSchema() {
   addField("_ssc", proto::FieldDef::STRING, true, false, true, true);
   addField("_i", proto::FieldDef::INT, true, false, true);
   addField("_is", proto::FieldDef::INT, true, false, true, true);
-  addField("_w", proto::FieldDef::TEXT, true, true, false, false, "nocopy_whitespace");
+  addField("_w", proto::FieldDef::TEXT, true, true, false, false, "whitespace");
   addField("_wl", proto::FieldDef::TEXT, true, true, false, false, "whitespace", {"lowercase"});
   addField("_t", proto::FieldDef::TEXT, true, true, false, false, "whitespace", {"lowercase"});
   // VECTOR suffixes: single-valued (_v) and multi-valued (_vs).  dims is left

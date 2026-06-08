@@ -98,7 +98,7 @@ public:
 
 class TextFieldType : public FieldType {
 public:
-  std::string tokenizer_;                // e.g., "whitespace", "nocopy_whitespace", "keyword"
+  std::string tokenizer_;                // e.g., "whitespace", "keyword"
   std::vector<std::string> filters_;     // e.g., {"lowercase"}
 
   TextFieldType(std::string_view name, int flags=INDEX_DOCS_FREQS_POSITIONS,
@@ -109,14 +109,15 @@ public:
   std::unique_ptr<TokenChain> createAnalyzer(std::string_view fieldName) {
     unused(fieldName);
 
-    // Create tokenizer by name
+    // Create tokenizer by name. The old "whitespace"/"nocopy_whitespace" split
+    // is gone: under the read-only borrow contract the tokenizer always views
+    // the source, so there is a single WhitespaceTokenizer. ("nocopy_whitespace"
+    // is still accepted as an alias until schemas are migrated.)
     std::unique_ptr<Tokenizer> tok;
-    if (tokenizer_ == "nocopy_whitespace") {
-      tok = std::make_unique<NoCopyWhitespaceTokenizer>();
-    } else if (tokenizer_ == "keyword") {
+    if (tokenizer_ == "keyword") {
       tok = std::make_unique<KeywordTokenizer>();
     } else {
-      // default: "whitespace"
+      // default: "whitespace" (and the "nocopy_whitespace" alias)
       tok = std::make_unique<WhitespaceTokenizer>();
     }
 
