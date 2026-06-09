@@ -401,6 +401,14 @@ VectorIndexBuilder::buildIvfPqField(std::string_view fieldName,
   } else {
     ivfPqBuildCountForTests.fetch_add(1, std::memory_order_relaxed);
   }
+  // Solux gates IVF/PQ building on its own training-size policy
+  // (ivfPqMinTrainingVectors), so FAISS's separate under-training heuristic is
+  // redundant.  It is the one message FAISS prints unconditionally to stderr
+  // during train(); min_points_per_centroid only controls that warning (not the
+  // clustering itself), so drop it to 1 on both the coarse quantizer and the PQ
+  // to keep that policy decision ours.
+  index->cp.min_points_per_centroid = 1;
+  index->pq.cp.min_points_per_centroid = 1;
   index->train(ntrain, training.data());
   training.clear();
   training.shrink_to_fit();
