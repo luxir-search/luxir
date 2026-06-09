@@ -1655,6 +1655,20 @@ void IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
         // private auxOverlays and unsyncedFiles above happen before this
         // mutex-protected transfer, so the commit thread observes them after
         // taking indexMutex.
+        //
+        // The empty-output case (liveDocs == 0) is not expected to occur: a
+        // segment whose docs are all deleted is dropped at commit time (see
+        // finishCommitBody, "if (seg->liveDocs == 0)"), so it is never selected
+        // for a merge, and a merge reads liveDocs at its mergedLiveGen snapshot
+        // - the gen at which the selected segments still had live docs - so the
+        // output reflects those live docs.  Measured: zero empty merges across
+        // heavy-churn multithreaded stress.  If that ever changes and empty
+        // merges become possible, note that this path leaves outputPublished
+        // false, so finishMergeTail(outputPublished, ...) below would NOT fire
+        // the synthetic commit that persists the source removal / reclaims the
+        // dropped source files - it should then allow the commit for any
+        // successful merge (outputPublished || !mergeFailed), matching the
+        // non-empty case.
         if (newSegInfo->liveDocs > 0) {
           auto* publishedSegInfo = newSegInfo.get();
           auto [iter, success] = segInfos.emplace(pwriter.getSegId(), std::move(newSegInfo));
