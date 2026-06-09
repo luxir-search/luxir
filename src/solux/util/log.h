@@ -7,8 +7,10 @@
 #include "spdlog/spdlog.h"
 #include "spdlog/sinks/sink.h"
 
+#include <algorithm>
 #include <atomic>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -63,24 +65,52 @@ public:
 
 namespace log_detail {
 
-// A sink that drops any message whose payload contains one of `drop`'s
-// substrings and forwards everything else to the wrapped sinks unchanged.
-class FilterSink : public spdlog::sinks::sink {
-  std::vector<spdlog::sink_ptr> inner;
+// One active suppression rule: a set of payload substrings to drop and a
+// counter of how many messages this rule has dropped.  Owned by an ExpectLog;
+// the FilterSink only holds a raw pointer to it, valid for the ExpectLog's
+// lifetime (it deregisters in its destructor under the same mutex).
+struct Expectation {
   std::vector<std::string> drop;
   std::atomic<size_t> dropped{0};
-public:
-  FilterSink(std::vector<spdlog::sink_ptr> inner, std::vector<std::string> drop)
-    : inner(std::move(inner)), drop(std::move(drop)) {}
+};
 
-  size_t droppedCount() const { return dropped.load(std::memory_order_relaxed); }
+// A sink wrapping the logger's real sinks.  It drops any message whose payload
+// contains a substring named by one of the currently-registered expectations
+// (forwarding everything else unchanged) and bumps that expectation's counter.
+//
+// Installed exactly once per process (see ExpectLog) and never swapped back out,
+// so the logger's sink list is mutated only at that first install - not on every
+// guard scope.  That matters because background threads (e.g. merge workers) log
+// concurrently: registering/deregistering an expectation only touches the
+// mutex-guarded `active` list, never the logger's sink vector, so there is no
+// data race between a guard's construction/destruction and a concurrent log().
+class FilterSink : public spdlog::sinks::sink {
+  std::vector<spdlog::sink_ptr> inner;
+  std::mutex mtx;
+  std::vector<Expectation*> active;  // guarded by mtx
+public:
+  explicit FilterSink(std::vector<spdlog::sink_ptr> inner) : inner(std::move(inner)) {}
+
+  void add(Expectation* e) {
+    std::lock_guard<std::mutex> lock(mtx);
+    active.push_back(e);
+  }
+  void remove(Expectation* e) {
+    std::lock_guard<std::mutex> lock(mtx);
+    active.erase(std::remove(active.begin(), active.end(), e), active.end());
+  }
 
   void log(const spdlog::details::log_msg& msg) override {
     std::string_view payload(msg.payload.data(), msg.payload.size());
-    for (const auto& d : drop) {
-      if (payload.find(d) != std::string_view::npos) {
-        dropped.fetch_add(1, std::memory_order_relaxed);
-        return;
+    {
+      std::lock_guard<std::mutex> lock(mtx);
+      for (auto* e : active) {
+        for (const auto& d : e->drop) {
+          if (payload.find(d) != std::string_view::npos) {
+            e->dropped.fetch_add(1, std::memory_order_relaxed);
+            return;
+          }
+        }
       }
     }
     for (const auto& s : inner) {
@@ -98,6 +128,21 @@ public:
   }
 };
 
+// The process-wide FilterSink, installed on first use into the default logger.
+// Only ever installed by a test constructing an ExpectLog, so the server binary
+// (which never constructs one) keeps its plain sink chain untouched.  The swap
+// happens once, under call_once, at a quiescent point before any test launches
+// its threads, so it does not race with concurrent logging.
+inline FilterSink& filterSink() {
+  static std::shared_ptr<FilterSink> instance = [] {
+    auto logger = spdlog::default_logger();
+    auto sink = std::make_shared<FilterSink>(logger->sinks());
+    logger->sinks() = {sink};
+    return sink;
+  }();
+  return *instance;
+}
+
 } // namespace log_detail
 
 // RAII guard that suppresses *only* the expected log lines naming a known
@@ -108,32 +153,29 @@ public:
 // message is emitted from background threads at unpredictable times and there
 // is no tight window to wrap.
 //
-// Install/restore mutate the logger's sink list, so they must not race with a
-// concurrent log call: construct the guard before launching threads and destroy
-// it after joining them.
+// Constructing the guard registers its substrings on the process-wide filter
+// sink (installed lazily on first use); destroying it deregisters them.  Both
+// are mutex-guarded against concurrent log() calls, so - unlike a sink-list
+// swap - the guard may be created and destroyed while background threads log.
 //
 //   ExpectLog quiet("injected merge failure (hammer)");
 //   ... run the whole hammer ...
 //   EXPECT_GT(quiet.suppressed(), 0u);  // optional: the failures really fired
 class ExpectLog {
-  std::shared_ptr<spdlog::logger> logger;
-  std::vector<spdlog::sink_ptr> saved;
-  std::shared_ptr<log_detail::FilterSink> filter;
+  log_detail::Expectation expectation;
 
   void install(std::vector<std::string> substrings) {
-    logger = spdlog::default_logger();
-    saved = logger->sinks();
-    filter = std::make_shared<log_detail::FilterSink>(saved, std::move(substrings));
-    logger->sinks() = {filter};
+    expectation.drop = std::move(substrings);
+    log_detail::filterSink().add(&expectation);
   }
 public:
   explicit ExpectLog(std::string substring) { install({std::move(substring)}); }
   ExpectLog(std::initializer_list<std::string> substrings) { install(substrings); }
-  ~ExpectLog() { logger->sinks() = saved; }
+  ~ExpectLog() { log_detail::filterSink().remove(&expectation); }
 
   // Number of messages dropped so far - lets a test assert the expected log
   // actually fired (catches the message text drifting out from under the filter).
-  size_t suppressed() const { return filter->droppedCount(); }
+  size_t suppressed() const { return expectation.dropped.load(std::memory_order_relaxed); }
 
   ExpectLog(const ExpectLog&) = delete;
   ExpectLog& operator=(const ExpectLog&) = delete;
