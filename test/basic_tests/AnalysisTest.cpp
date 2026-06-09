@@ -355,6 +355,45 @@ TEST_F(AnalysisTest, chainUnicodeWordNfkcCf) {
   EXPECT_EQ((std::vector<int>{0, 1, 2, 3, 4, 5}), out.positions);
 }
 
+// The default _t chain: unicode_word + nfkc_cf + fold. Accents are removed so an
+// accented word matches its bare form; CJK and case still handled.
+TEST_F(AnalysisTest, chainUnicodeWordFold) {
+  TextFieldType ft("t", FieldType::INDEX_DOCS_FREQS_POSITIONS, "unicode_word", {"nfkc_cf", "fold"});
+  auto chain = ft.createAnalyzer("t");
+  auto out = analyze(*chain, "Café NAÏVE señor Straße 中文");
+  EXPECT_EQ((std::vector<std::string>{"cafe", "naive", "senor", "strasse", "中", "文"}), out.terms);
+}
+
+// fold (_t) vs no-fold (_wl): the accent is dropped with fold, preserved without.
+TEST_F(AnalysisTest, foldVsPreserveAccents) {
+  TextFieldType folding("t", FieldType::INDEX_DOCS_FREQS_POSITIONS, "unicode_word", {"nfkc_cf", "fold"});
+  TextFieldType preserving("wl", FieldType::INDEX_DOCS_FREQS_POSITIONS, "unicode_word", {"nfkc_cf"});
+  EXPECT_EQ((std::vector<std::string>{"cafe"}), analyze(*folding.createAnalyzer("t"), "Café").terms);
+  EXPECT_EQ((std::vector<std::string>{"café"}), analyze(*preserving.createAnalyzer("wl"), "Café").terms);
+}
+
+// The fused StandardTokenizer (swapped in for unicode_word + nfkc_cf) must produce
+// byte-identical tokens to the explicit two-stage chain - the optimization is
+// behavior-preserving.
+TEST_F(AnalysisTest, standardFusionMatchesComposedChain) {
+  for (std::string_view v : {"The QUICK brown FOX 42",
+                             "Café 中文 Straße señor naïve",
+                             "  ...!?  mixed-CASE  ",
+                             "ﬃ ligature ＡＢＣ fullwidth"}) {
+    auto t1 = makeUnicodeWordTokenizer();
+    Tokenizer& h1 = *t1;
+    auto composedTail = makeNfkcCasefoldFilter(std::move(t1));
+    TokenChain composed(h1, std::move(composedTail), true);
+
+    auto t2 = makeStandardTokenizer();
+    Tokenizer& h2 = *t2;
+    std::unique_ptr<TokenStream> fusedTail = std::move(t2);
+    TokenChain fused(h2, std::move(fusedTail), true);
+
+    EXPECT_EQ(analyze(composed, v).terms, analyze(fused, v).terms) << "mismatch on: " << v;
+  }
+}
+
 // unicode_word without a fold filter: segmentation only, original bytes preserved.
 TEST_F(AnalysisTest, chainUnicodeWordNoFilter) {
   TextFieldType ft("w", FieldType::INDEX_DOCS_FREQS_POSITIONS, "unicode_word");

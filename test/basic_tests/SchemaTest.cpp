@@ -209,9 +209,9 @@ TEST_F(SchemaTest, mergeWithParentFromBase) {
   EXPECT_FALSE(title->isAbstract());
 
   auto* textFt = (TextFieldType*)(title);
-  EXPECT_EQ("whitespace", textFt->tokenizer_);
+  EXPECT_EQ("unicode_word", textFt->tokenizer_);  // inherited from _wl
   ASSERT_EQ(1, textFt->filters_.size());
-  EXPECT_EQ("lowercase", textFt->filters_[0]);
+  EXPECT_EQ("nfkc_cf", textFt->filters_[0]);
 
   // Base fields should still be present
   ASSERT_NE(nullptr, merged->getFieldTypePtr("id"));

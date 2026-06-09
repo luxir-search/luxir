@@ -115,12 +115,21 @@ public:
     // is still accepted as an alias until schemas are migrated.)
     std::unique_ptr<Tokenizer> tok;
     bool stateful = false;
+    size_t firstFilter = 0;  // index of the first filter still to apply (some get fused into the tokenizer)
     if (tokenizer_ == "keyword") {
       tok = std::make_unique<KeywordTokenizer>();
     } else if (tokenizer_ == "unicode_word") {
       // UAX#29 word segmentation; carries a cursor, so the chain is stateful.
-      tok = makeUnicodeWordTokenizer();
       stateful = true;
+      // Optimization: unicode_word + nfkc_cf (the common default) fuses into one
+      // StandardTokenizer - segmentation and NFKC_CF in a single stage. Any
+      // remaining filters (e.g. fold) still apply on top.
+      if (!filters_.empty() && filters_[0] == "nfkc_cf") {
+        tok = makeStandardTokenizer();
+        firstFilter = 1;
+      } else {
+        tok = makeUnicodeWordTokenizer();
+      }
     } else {
       // default: "whitespace" (and the "nocopy_whitespace" alias)
       tok = std::make_unique<WhitespaceTokenizer>();
@@ -129,12 +138,15 @@ public:
     auto& headRef = *tok;
     std::unique_ptr<TokenStream> tail = std::move(tok);
 
-    // Apply filters in order
-    for (const auto& filter : filters_) {
+    // Apply remaining filters in order
+    for (size_t i = firstFilter; i < filters_.size(); i++) {
+      const auto& filter = filters_[i];
       if (filter == "lowercase") {
         tail = std::make_unique<LowercaseFilter>(std::move(tail));
       } else if (filter == "nfkc_cf") {
         tail = makeNfkcCasefoldFilter(std::move(tail));
+      } else if (filter == "fold") {
+        tail = makeAccentFoldFilter(std::move(tail));
       }
       // easy to add more filters here
     }

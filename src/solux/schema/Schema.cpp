@@ -515,9 +515,15 @@ std::shared_ptr<Schema> Schema::createDefaultSchema() {
   addField("_ssc", proto::FieldDef::STRING, true, false, true, true);
   addField("_i", proto::FieldDef::INT, true, false, true);
   addField("_is", proto::FieldDef::INT, true, false, true, true);
+  // Text suffixes, from raw to fully folded:
+  //   _w  raw whitespace tokens (case- and accent-sensitive)
+  //   _wl Unicode word segmentation + NFKC case folding, accents PRESERVED
+  //       (the opt-out for accent-sensitive languages: Swedish a-ring, Spanish n-tilde, ...)
+  //   _t  the general default: also folds accents, so cafe matches cafe-with-accent
+  //       (US/adoption-centric; lossy for some languages - use _wl there)
   addField("_w", proto::FieldDef::TEXT, true, true, false, false, "whitespace");
-  addField("_wl", proto::FieldDef::TEXT, true, true, false, false, "whitespace", {"lowercase"});
-  addField("_t", proto::FieldDef::TEXT, true, true, false, false, "whitespace", {"lowercase"});
+  addField("_wl", proto::FieldDef::TEXT, true, true, false, false, "unicode_word", {"nfkc_cf"});
+  addField("_t", proto::FieldDef::TEXT, true, true, false, false, "unicode_word", {"nfkc_cf", "fold"});
   // VECTOR suffixes: single-valued (_v) and multi-valued (_vs).  dims is left
   // unset on the abstract suffix; concrete fields may pin it via VectorParams.
   addField("_v", proto::FieldDef::VECTOR, true, false, true);

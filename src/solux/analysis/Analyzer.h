@@ -239,6 +239,13 @@ public:
 // must be constructed with stateful=true.
 std::unique_ptr<Tokenizer> makeUnicodeWordTokenizer();
 std::unique_ptr<TokenStream> makeNfkcCasefoldFilter(std::unique_ptr<TokenStream> source);
+// Fused unicode_word + nfkc_cf: UAX#29 segmentation with per-token NFKC_CF in one
+// stage. createAnalyzer swaps this in when it sees that canonical pair, so the
+// common default avoids the extra filter hop. Equivalent output (see AnalysisTest).
+std::unique_ptr<Tokenizer> makeStandardTokenizer();
+// Accent/diacritic folding (cafe == cafe-with-accent). Lossy and language-
+// dependent, so it is a separate opt-in filter applied after nfkc_cf.
+std::unique_ptr<TokenStream> makeAccentFoldFilter(std::unique_ptr<TokenStream> source);
 
 class TokenStreamFactory {
 
