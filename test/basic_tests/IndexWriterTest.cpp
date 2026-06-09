@@ -911,7 +911,11 @@ TEST_F(IndexWriterTest, testMissingFiles) {
 // merges.  If changes are made to the IndexWriter, pump up opsPerThread to really stress
 // test the system.
 //
-TEST_F(IndexWriterTest, testMultithreadedUpdates) {
+// Shared body for the multithreaded update/delete/read stress test.  When
+// mergeFailPercent > 0, a fraction of merges throw mid-flight to exercise the
+// merge-failure containment teardown under concurrency.  Contained failures
+// are invisible to queries, so the version oracle below must still hold.
+static void runMultithreadedUpdates(uint64_t seed, int mergeFailPercent) {
   using namespace solux::test;
 
   CollectionHelper helper("main");
@@ -925,8 +929,22 @@ TEST_F(IndexWriterTest, testMultithreadedUpdates) {
   auto docsPerThread = 4;  // number of unique documents per thread.. keep this low to generate high contention.
 
 
+  // Merge-failure injection.  Driven by an Rng (not a fixed stride) so failure
+  // runs - back-to-back, bursts, gaps - occur naturally; future IW failure
+  // handling (backoff/quarantine) will branch on consecutiveness.  The merge
+  // node is concurrency==1, so one Rng on this listener is single-threaded.
+  Rng mergeRng(seed ^ 0x9e3779b97f4a7c15ULL);
+  if (mergeFailPercent > 0) {
+    solux::Signal::listen("segmentMergeBody",
+        [&mergeRng, mergeFailPercent](void*, void*, void*) -> void* {
+          if (mergeRng.rint(100) < mergeFailPercent) {
+            throw std::runtime_error("injected merge failure (hammer)");
+          }
+          return nullptr;
+        });
+  }
+
   std::vector<std::thread> threads;
-  auto seed = rng();
 
 #ifdef TBB_TEST_VERSION
   std::atomic<bool> done(false);
@@ -1077,8 +1095,26 @@ TEST_F(IndexWriterTest, testMultithreadedUpdates) {
     thread.join();
   }
 
-  // make sure we don't leave any tasks in the updateGraph
+  // make sure we don't leave any tasks in the updateGraph (drains in-flight
+  // merges, including injected-failure ones, before we drop the listener).
   indexWriter->updateGraph.wait_for_all();
+
+  if (mergeFailPercent > 0) {
+    solux::Signal::unlisten("segmentMergeBody");
+  }
+}
+
+TEST_F(IndexWriterTest, testMultithreadedUpdates) {
+  runMultithreadedUpdates(rng(), /*mergeFailPercent=*/0);
+}
+
+// Same hammer, but a fraction of merges fail mid-flight.  Verifies merge
+// failure containment under real contention: contained failures must not
+// corrupt visible state (the version oracle holds), wedge the writer
+// (wait_for_merges commits still complete - no hang), or crash the
+// concurrent source-restoration path.
+TEST_F(IndexWriterTest, testMultithreadedUpdatesWithMergeFailures) {
+  runMultithreadedUpdates(rng(), /*mergeFailPercent=*/25);
 }
 
 // Test segment merging with deleted documents
