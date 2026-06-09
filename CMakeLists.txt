@@ -67,6 +67,17 @@ find_package(faiss CONFIG REQUIRED)
 include_directories(deps)
 link_directories(deps/simdcomp)
 
+# uni-algo (vendored under deps/uni-algo, Unicode 15.1.0): full Unicode case
+# folding, NFC/NFKC, UAX#29 word/grapheme/sentence segmentation. The header API
+# lives in deps/uni-algo/include; the Unicode tables compile once from
+# src/data.cpp into this small static lib. Pinned + vendored on purpose - the
+# analyzer's Unicode version is part of the index format (see the analysis
+# design note). Conformance is gated by AnalysisTest before the real
+# tokenizer/filter classes are built on top of it.
+add_library(uni_algo STATIC deps/uni-algo/src/data.cpp)
+target_include_directories(uni_algo PUBLIC deps/uni-algo/include)
+set_target_properties(uni_algo PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
 #Print out all env vars... useful while build system is in development
 get_cmake_property(_variableNames VARIABLES)
 list (SORT _variableNames)

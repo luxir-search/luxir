@@ -1,5 +1,9 @@
 #include <filesystem>
 #include <thread>
+#include <cstddef>
+#include <cstdlib>
+#include <cstring>
+#include <new>
 #include "SoluxTest.h"
 #include "GrpcSoluxTest.h"
 #include "solux/solux_main.h"
@@ -253,21 +257,44 @@ TEST(Benchmarks, all) {
 }
 
 
+// Global operator new/delete overrides for the test+benchmark binary. Every
+// allocation bumps a per-thread counter (see SoluxTest.h / AllocScope), which
+// lets tests assert "this code path performs N allocations" - notably the
+// allocation-free Unicode segmentation check. Cost is one thread-local increment
+// per allocation; BM_AllocSmall_std measures it. Under MEM_SCRIBBLE we also
+// scribble freshly-allocated bytes (heap use-before-init aid).
+namespace solux::memtrack {
+thread_local long allocCount = 0;
+thread_local long allocBytes = 0;
+}
+
+static inline void* soluxTrackAlloc(std::size_t n, std::size_t align) {
+  ++solux::memtrack::allocCount;
+  solux::memtrack::allocBytes += (long) n;
+  void* p;
+  if (align <= alignof(std::max_align_t)) {
+    p = std::malloc(n ? n : 1);
+  } else {
+    std::size_t sz = (n + align - 1) & ~(align - 1);  // aligned_alloc needs size % align == 0
+    p = std::aligned_alloc(align, sz ? sz : align);
+  }
+  if (!p) throw std::bad_alloc();
 #ifdef MEM_SCRIBBLE
-void* operator new (std::size_t count ) {
-  // std::cout << "new(" << count << ")" << std::endl;
-  auto p = malloc(count);
-  memset(p, 'z', count);
+  std::memset(p, 'z', n);
+#endif
   return p;
 }
 
-void operator delete  (void* ptr) {
-  // std::cout << "delete(" << ptr << ")" << std::endl;
-  free(ptr);
-}
-void operator delete  (void* ptr, std::size_t sz) {
-  // std::cout << "delete2(" << ptr << "," << sz << ")" << std::endl;
-  memset(ptr, 'z', sz);
-  free(ptr);
-}
-#endif
+void* operator new(std::size_t n) { return soluxTrackAlloc(n, alignof(std::max_align_t)); }
+void* operator new[](std::size_t n) { return soluxTrackAlloc(n, alignof(std::max_align_t)); }
+void* operator new(std::size_t n, std::align_val_t a) { return soluxTrackAlloc(n, (std::size_t) a); }
+void* operator new[](std::size_t n, std::align_val_t a) { return soluxTrackAlloc(n, (std::size_t) a); }
+
+void operator delete(void* p) noexcept { std::free(p); }
+void operator delete[](void* p) noexcept { std::free(p); }
+void operator delete(void* p, std::size_t) noexcept { std::free(p); }
+void operator delete[](void* p, std::size_t) noexcept { std::free(p); }
+void operator delete(void* p, std::align_val_t) noexcept { std::free(p); }
+void operator delete[](void* p, std::align_val_t) noexcept { std::free(p); }
+void operator delete(void* p, std::size_t, std::align_val_t) noexcept { std::free(p); }
+void operator delete[](void* p, std::size_t, std::align_val_t) noexcept { std::free(p); }

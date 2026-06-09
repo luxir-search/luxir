@@ -1,0 +1,1 @@
+v1.2.0 (Unicode 15.1.0), vendored from https://github.com/uni-algo/uni-algo tag v1.2.0

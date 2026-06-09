@@ -47,12 +47,14 @@ public:
 };
 
 
-// test allocation of objects
+// Object-lifecycle / functional test for MemPool with allocator-aware containers:
+// objects construct and destruct correctly and each container operates against
+// the pool allocator. Heap-avoidance (that none of this touches the heap) is
+// proved directly in MemPoolTest.poolAllocatorsAvoidHeap below.
 TEST_F(MemPoolTest, alloc) {
   MemPool pool;
   int cons_calls = 0;
   int des_calls = 0;
-  auto start_size = pool.size();
   {
     auto x = pool.make_unique<X>(cons_calls, des_calls);
     auto y = pool.make_unique<X>(cons_calls, des_calls);
@@ -61,18 +63,13 @@ TEST_F(MemPoolTest, alloc) {
     ASSERT_TRUE(z == nullptr);
     ASSERT_EQ(cons_calls, 3);
     ASSERT_EQ(des_calls, 0);
-
-#ifndef MEMPOOL_MALLOC
-    ASSERT_EQ(pool.size()-start_size, 3*sizeof(X));
-#endif
   }
   ASSERT_EQ(cons_calls, 3);
   ASSERT_EQ(des_calls, 3);
 
-  start_size = pool.size();
   int start_cons_calls = cons_calls;
 
-  // now try custom allocator
+  // std::map with MemPool::allocator
   {
     std::map<int, X, std::less<>, MemPool::allocator<std::pair<const int, X>>> map(pool.getAllocator());
     map.try_emplace(1, cons_calls, des_calls);
@@ -81,17 +78,12 @@ TEST_F(MemPoolTest, alloc) {
     ASSERT_EQ(cons_calls, start_cons_calls+2);
     map.try_emplace(3, cons_calls, des_calls);
     ASSERT_EQ(cons_calls, start_cons_calls+3);
-
-#ifndef MEMPOOL_MALLOC
-    ASSERT_TRUE(size_t(pool.size() - start_size) > sizeof(*map.begin())*map.size());
-#endif
   }
   ASSERT_EQ(cons_calls, des_calls);
 
-  start_size = pool.size();
   start_cons_calls = cons_calls;
 
-  // now try MemPool with polymorphic allocator with standard vector
+  // MemPool via std::pmr::polymorphic_allocator with std::vector
   {
     pmr::polymorphic_allocator<X> pmr_alloc(&pool);
     std::vector<X, std::pmr::polymorphic_allocator<X>> myvec(pmr_alloc);
@@ -100,14 +92,12 @@ TEST_F(MemPoolTest, alloc) {
     ASSERT_EQ(cons_calls, start_cons_calls+1);
     myvec.emplace_back(cons_calls, des_calls);
     ASSERT_EQ(cons_calls, start_cons_calls+2);
-    ASSERT_TRUE(size_t(pool.size() - start_size) > sizeof(X)*myvec.size());
   }
   ASSERT_EQ(cons_calls, des_calls);
 
-  start_size = pool.size();
   start_cons_calls = cons_calls;
 
-  // now try mempool as a memory_resource with std::pmr::vector
+  // MemPool as a std::pmr::memory_resource with std::pmr::vector
   {
     std::pmr::vector<X> myvec(&pool);
     myvec.reserve(4);
@@ -115,31 +105,18 @@ TEST_F(MemPoolTest, alloc) {
     ASSERT_EQ(cons_calls, start_cons_calls+1);
     myvec.emplace_back(cons_calls, des_calls);
     ASSERT_EQ(cons_calls, start_cons_calls+2);
-    ASSERT_TRUE(size_t(pool.size() - start_size) > sizeof(X)*myvec.size());
   }
   ASSERT_EQ(cons_calls, des_calls);
 
   start_cons_calls = cons_calls;
 
   {
-    // create unordered map with nested vectors of unique pointers, all in the mempool
+    // unordered map with nested vectors of unique pointers, all pool-allocated;
+    // exercises the re-emplace-existing-key path and balanced construct/destruct.
     using keytype = std::string_view;
     using elemtype = u_ptr<X>;
     using valtype = std::vector<elemtype, MemPool::allocator<elemtype>>;
     using pairtype = std::pair<const keytype, valtype>;
-
-#ifndef MEMPOOL_MALLOC
-    // Force the pool into a buffer with enough headroom for the upcoming allocations
-    // so they all land in a single buffer and the in-range pointer check is meaningful.
-    // Heap buffers from `new char[]` are not guaranteed to be at increasing addresses,
-    // so a page switch breaks pointer-range comparisons (UB across allocations).
-    pool.alloc(2048);
-    pool.shrink(2048);
-    start_size = pool.size();
-    auto poolPtr = pool.ptr();
-    auto startBufferIdx = pool.bbAddress() >> MemPool::BYTE_BLOCK_SHIFT;
-#endif
-
     using Map = boost::unordered_node_map<keytype, valtype, PackedTermHash, PackedTermEqual, MemPool::allocator<pairtype>>;
     Map map(pool.getAllocator());
     {
@@ -158,32 +135,86 @@ TEST_F(MemPoolTest, alloc) {
       }
       vec[5] = pool.make_unique<X>(cons_calls, des_calls);
     }
-
-#ifndef MEMPOOL_MALLOC
-    ASSERT_TRUE(size_t(pool.size() - start_size) > sizeof(pairtype)*map.size() + sizeof(elemtype)*10 + sizeof(X)*2);
-
-    // Try to see that everything was actually pool allocated.  Only works if pool hasn't switched pages.
-    auto endPoolPtr = pool.ptr();
-    auto endBufferIdx = pool.bbAddress() >> MemPool::BYTE_BLOCK_SHIFT;
-    ASSERT_EQ(startBufferIdx, endBufferIdx) << "pool switched pages during the test (start=" << startBufferIdx << ", end=" << endBufferIdx << ")";
-    void* ptr;
-    ptr = &*map.begin();
-    ASSERT_TRUE(ptr >= poolPtr && ptr < endPoolPtr);
-    pairtype& pair = *map.find("hi");
-    ptr = &pair;
-    ASSERT_TRUE(ptr >= poolPtr && ptr < endPoolPtr);
-    ptr = &pair.second[0];  // the array the vector points to
-    ASSERT_TRUE(ptr >= poolPtr && ptr < endPoolPtr);
-    ptr = pair.second[3].get();  // one of the X objects we previously created
-    ASSERT_TRUE(ptr >= poolPtr && ptr < endPoolPtr);
-#endif
-
     ASSERT_EQ(cons_calls, start_cons_calls+2);
     ASSERT_EQ(des_calls, start_cons_calls);
   }
   ASSERT_EQ(cons_calls, des_calls);
-
 }
+
+#ifndef MEMPOOL_MALLOC
+// Directly prove MemPool-backed allocators send every allocation into the pool
+// and none to the heap, via the allocation counter (memtrack::AllocScope) - the
+// strong version of the address-range heuristic in MemPoolTest.alloc above, and
+// of the malloc-override-in-a-throwaway-program approach. (Skipped under
+// MEMPOOL_MALLOC, where the pool deliberately uses a separate allocation per
+// request, so "zero heap" does not apply.)
+//
+// Subtlety: the pool's backing buffers come from `new char[]`, so growing the
+// pool is itself a heap allocation. Each case reserves headroom first (alloc then
+// shrink leaves a large current buffer), OUTSIDE the measured scope, so the
+// counter sees only the container's own allocations - which must be zero.
+TEST_F(MemPoolTest, poolAllocatorsAvoidHeap) {
+  int cc = 0, dc = 0;
+  auto reserve = [](MemPool& pool, size_t n) { pool.alloc(n); pool.shrink(n); };
+
+  // 1. std::map: red-black-tree nodes route to the pool.
+  {
+    MemPool pool;
+    reserve(pool, 16384);
+    memtrack::AllocScope s;
+    std::map<int, X, std::less<>, MemPool::allocator<std::pair<const int, X>>> m(pool.getAllocator());
+    m.try_emplace(1, cc, dc);
+    m.try_emplace(2, cc, dc);
+    m.try_emplace(3, cc, dc);
+    long heap = s.count();  // capture before EXPECT (gtest allocates) and before ~m
+    EXPECT_EQ(0, heap) << "std::map<MemPool::allocator> made " << heap << " heap allocations";
+  }
+
+  // 2. std::pmr::vector with the pool as a memory_resource.
+  {
+    MemPool pool;
+    reserve(pool, 16384);
+    memtrack::AllocScope s;
+    std::pmr::vector<X> v(&pool);
+    v.reserve(8);
+    v.emplace_back(cc, dc);
+    v.emplace_back(cc, dc);
+    long heap = s.count();
+    EXPECT_EQ(0, heap) << "std::pmr::vector<MemPool> made " << heap << " heap allocations";
+  }
+
+  // 3. boost::unordered_node_map of nested pool-vectors of pool unique_ptrs - the
+  //    real PackedTermHash shape. Buckets, nodes, inner vectors and the X objects
+  //    must all land in the pool.
+  {
+    MemPool pool;
+    reserve(pool, 16384);
+    using valtype = std::vector<u_ptr<X>, MemPool::allocator<u_ptr<X>>>;
+    using pairtype = std::pair<const std::string_view, valtype>;
+    using Map = boost::unordered_node_map<std::string_view, valtype, PackedTermHash, PackedTermEqual,
+                                          MemPool::allocator<pairtype>>;
+    memtrack::AllocScope s;
+    Map map(pool.getAllocator());
+    valtype v1(pool.getAllocator());
+    valtype& vec = map.try_emplace("hi", std::move(v1)).first->second;
+    vec.resize(10);
+    vec[3] = pool.make_unique<X>(cc, dc);
+    long heap = s.count();
+    EXPECT_EQ(0, heap) << "boost::unordered_node_map<MemPool::allocator> made " << heap << " heap allocations";
+  }
+
+  // Contrast: the same map with the default allocator DOES hit the heap, so the
+  // zeros above are a real result and not a broken-counter false pass.
+  {
+    memtrack::AllocScope s;
+    std::map<int, X, std::less<>> m;
+    m.try_emplace(1, cc, dc);
+    m.try_emplace(2, cc, dc);
+    long heap = s.count();
+    EXPECT_GT(heap, 0) << "default-allocator map made no heap allocations (counter broken?)";
+  }
+}
+#endif  // !MEMPOOL_MALLOC
 
 TEST_F(MemPoolTest, sizes) {
 #ifndef MEMPOOL_MALLOC

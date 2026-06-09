@@ -5,6 +5,24 @@
 
 namespace solux {
 
+namespace memtrack {
+// Per-thread allocation counters, updated by the global operator new/new[]
+// overrides in SoluxTest.cpp. Always on (one thread-local increment per
+// allocation). Lets a test assert how many heap allocations a code path makes.
+// (Named memtrack, not testing, so it does not shadow gtest's ::testing.)
+extern thread_local long allocCount;
+extern thread_local long allocBytes;
+
+// RAII window: AllocScope s; ...code...; EXPECT_EQ(0, s.count());
+// Capture the delta into a local BEFORE any EXPECT (gtest macros allocate).
+struct AllocScope {
+  long startCount = allocCount;
+  long startBytes = allocBytes;
+  long count() const { return allocCount - startCount; }
+  long bytes() const { return allocBytes - startBytes; }
+};
+}  // namespace memtrack
+
 //
 // Basic recommended test case writing:
 //   class MyTest : public SoluxTest {
