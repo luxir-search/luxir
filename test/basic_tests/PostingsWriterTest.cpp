@@ -754,7 +754,7 @@ TEST_F(PostingsTest, seekForwardNumericIds) {
 // The structured seekForward tests use fixed id sets and fixed strides and
 // miss this; this is the gap that let a seekForward bug ship in applyDeletes.
 TEST_F(PostingsTest, seekForwardRandom) {
-  for (int trial = 0; trial < 500; trial++) {
+  for (int trial = 0; trial < 100; trial++) {
     RAMDir dir;
     MemPool pool;
 

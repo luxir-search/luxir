@@ -6,7 +6,10 @@
 
 using namespace solux;
 
-static void BM_IndexBook(benchmark::State& state, std::string field, bool writePostings, bool docPerPara) {
+// Indexes the book and reports the invert and flush phases separately. A single
+// invert+flush run yields both phase numbers, so there is no need for distinct
+// invert-only and invert+flush benchmarks per corpus.
+static void BM_IndexBook(benchmark::State& state, std::string field, bool docPerPara) {
 
   Book& book = TestData::data->getBook();
   if (skipBenchIfDataMissing(state, !book.text().empty(), "book.txt")) return;
@@ -15,11 +18,13 @@ static void BM_IndexBook(benchmark::State& state, std::string field, bool writeP
   int sz = docPerPara ? book.sumParaSizes : book.text().size();
 
   RAMDir dir;
+  double invertSecs = 0, flushSecs = 0;
   for (auto _ : state) {
     dir = RAMDir(); // clear files
     Inverter inverter(dir, 0);
     Inverter::IndexHandler& fieldHandler = inverter.getIndexHandler(field);
 
+    auto t0 = std::chrono::steady_clock::now();
     if (!docPerPara) {
       // index whole book as a single document
       inverter.startDoc();
@@ -33,22 +38,27 @@ static void BM_IndexBook(benchmark::State& state, std::string field, bool writeP
         inverter.finishDoc();
       }
     }
-
+    auto t1 = std::chrono::steady_clock::now();
     inverterSz = inverter.memSize();
+    inverter.flush();
+    auto t2 = std::chrono::steady_clock::now();
 
-    if (writePostings) {
-      inverter.flush();
-    }
+    double iSecs = std::chrono::duration<double>(t1 - t0).count();
+    double fSecs = std::chrono::duration<double>(t2 - t1).count();
+    invertSecs += iSecs;
+    flushSecs += fSecs;
+    state.SetIterationTime(iSecs + fSecs);
   }
 
-  state.counters["rate"] = benchmark::Counter(sz, benchmark::Counter::kIsIterationInvariantRate);
+  double iters = (double)state.iterations();
+  state.counters["invert_rate"] = sz * iters / invertSecs;   // bytes/sec
+  state.counters["flush_rate"] = sz * iters / flushSecs;
+  state.counters["total_rate"] = sz * iters / (invertSecs + flushSecs);
   state.counters["inverterSz"] = inverterSz;
   state.counters["indexSz"] = dir.totalFileSize();
 }
 
 
 
-BENCHMARK_CAPTURE(BM_IndexBook, ws, "text_w", false, false)->UseRealTime();             // index whole book as single doc, invert only
-BENCHMARK_CAPTURE(BM_IndexBook, ws_postings, "text_w", true, false)->UseRealTime();     // index whole book as single doc
-BENCHMARK_CAPTURE(BM_IndexBook, para_ws, "text_w", false, true)->UseRealTime();         // index paragraph-per-doc, invert only
-BENCHMARK_CAPTURE(BM_IndexBook, para_ws_postings, "text_w", true, true)->UseRealTime(); // index paragraph-per-ddoc
+BENCHMARK_CAPTURE(BM_IndexBook, ws, "text_w", false)->UseManualTime();       // index whole book as single doc
+BENCHMARK_CAPTURE(BM_IndexBook, para_ws, "text_w", true)->UseManualTime();   // index paragraph-per-doc
