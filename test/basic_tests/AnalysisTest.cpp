@@ -333,6 +333,7 @@ TEST_F(AnalysisTest, caseFoldingConformance) {
 // assertion below cannot pass by a no-op/broken counter. The fold path returns a
 // std::string and must allocate for a long non-ASCII token.
 TEST_F(AnalysisTest, allocCounterObservesFoldAllocation) {
+  if (!memtrack::counting_enabled) GTEST_SKIP() << "allocation counter disabled under ASan";
   std::string longUni;
   for (int i = 0; i < 500; i++) longUni += "Ä";  // long, non-SSO, non-ASCII
   memtrack::AllocScope s;
@@ -342,10 +343,42 @@ TEST_F(AnalysisTest, allocCounterObservesFoldAllocation) {
   EXPECT_FALSE(folded.empty());
 }
 
+// The real analysis chain: unicode_word tokenizer + nfkc_cf filter, via the
+// schema factory. UAX#29 word segmentation, NFKC_CF folding, punctuation dropped.
+TEST_F(AnalysisTest, chainUnicodeWordNfkcCf) {
+  TextFieldType ft("body", FieldType::INDEX_DOCS_FREQS_POSITIONS, "unicode_word", {"nfkc_cf"});
+  auto chain = ft.createAnalyzer("body");
+  ASSERT_NE(nullptr, chain);
+  EXPECT_TRUE(chain->stateful);  // unicode_word carries a segmentation cursor
+  auto out = analyze(*chain, "The QUICK 中文 Straße café!");
+  EXPECT_EQ((std::vector<std::string>{"the", "quick", "中", "文", "strasse", "café"}), out.terms);
+  EXPECT_EQ((std::vector<int>{0, 1, 2, 3, 4, 5}), out.positions);
+}
+
+// unicode_word without a fold filter: segmentation only, original bytes preserved.
+TEST_F(AnalysisTest, chainUnicodeWordNoFilter) {
+  TextFieldType ft("w", FieldType::INDEX_DOCS_FREQS_POSITIONS, "unicode_word");
+  auto chain = ft.createAnalyzer("w");
+  auto out = analyze(*chain, "Hello 中文 World");
+  EXPECT_EQ((std::vector<std::string>{"Hello", "中", "文", "World"}), out.terms);
+}
+
+// Reusing one stateful chain across values: reset() rebuilds the segmentation
+// cursor each time, including empty/punctuation-only values.
+TEST_F(AnalysisTest, unicodeWordReuseAcrossValues) {
+  TextFieldType ft("b", FieldType::INDEX_DOCS_FREQS_POSITIONS, "unicode_word", {"nfkc_cf"});
+  auto chain = ft.createAnalyzer("b");
+  EXPECT_EQ((std::vector<std::string>{"one", "two"}), analyze(*chain, "One TWO").terms);
+  EXPECT_EQ((std::vector<std::string>{"中", "文"}), analyze(*chain, "中文").terms);
+  EXPECT_TRUE(analyze(*chain, "  ...  ").terms.empty());
+  EXPECT_EQ((std::vector<std::string>{"café"}), analyze(*chain, "CAFÉ").terms);
+}
+
 // UAX#29 word segmentation yields string_views into the source, so iterating it
 // must not allocate - the hot-path property the real tokenizer relies on. Checked
 // for both ASCII and multibyte input.
 TEST_F(AnalysisTest, wordSegmentationIsAllocationFree) {
+  if (!memtrack::counting_enabled) GTEST_SKIP() << "allocation counter disabled under ASan";
   static volatile size_t sink = 0;
   auto segAllocs = [](std::string_view in) {
     size_t local = 0;

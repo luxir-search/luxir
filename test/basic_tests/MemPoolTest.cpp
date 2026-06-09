@@ -154,6 +154,7 @@ TEST_F(MemPoolTest, alloc) {
 // shrink leaves a large current buffer), OUTSIDE the measured scope, so the
 // counter sees only the container's own allocations - which must be zero.
 TEST_F(MemPoolTest, poolAllocatorsAvoidHeap) {
+  if (!memtrack::counting_enabled) GTEST_SKIP() << "allocation counter disabled under ASan";
   int cc = 0, dc = 0;
   auto reserve = [](MemPool& pool, size_t n) { pool.alloc(n); pool.shrink(n); };
 

@@ -186,3 +186,6 @@ target_link_libraries(solux_lib PRIVATE spdlog::spdlog spdlog::spdlog_header_onl
 target_link_libraries(solux_lib PRIVATE CLI11::CLI11)
 target_link_libraries(solux_lib PRIVATE lz4::lz4)
 target_link_libraries(solux_lib PRIVATE faiss)
+# uni-algo (vendored): Unicode case folding / NFKC / UAX#29 segmentation, used by
+# the analysis chain (src/solux/analysis/Analyzer.cpp).
+target_link_libraries(solux_lib PRIVATE uni_algo)

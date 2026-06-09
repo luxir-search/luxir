@@ -268,6 +268,7 @@ thread_local long allocCount = 0;
 thread_local long allocBytes = 0;
 }
 
+#ifndef SOLUX_ASAN  // under ASan, ASan owns operator new/delete (see SoluxTest.h)
 static inline void* soluxTrackAlloc(std::size_t n, std::size_t align) {
   ++solux::memtrack::allocCount;
   solux::memtrack::allocBytes += (long) n;
@@ -298,3 +299,4 @@ void operator delete(void* p, std::align_val_t) noexcept { std::free(p); }
 void operator delete[](void* p, std::align_val_t) noexcept { std::free(p); }
 void operator delete(void* p, std::size_t, std::align_val_t) noexcept { std::free(p); }
 void operator delete[](void* p, std::size_t, std::align_val_t) noexcept { std::free(p); }
+#endif  // !SOLUX_ASAN

@@ -114,8 +114,13 @@ public:
     // the source, so there is a single WhitespaceTokenizer. ("nocopy_whitespace"
     // is still accepted as an alias until schemas are migrated.)
     std::unique_ptr<Tokenizer> tok;
+    bool stateful = false;
     if (tokenizer_ == "keyword") {
       tok = std::make_unique<KeywordTokenizer>();
+    } else if (tokenizer_ == "unicode_word") {
+      // UAX#29 word segmentation; carries a cursor, so the chain is stateful.
+      tok = makeUnicodeWordTokenizer();
+      stateful = true;
     } else {
       // default: "whitespace" (and the "nocopy_whitespace" alias)
       tok = std::make_unique<WhitespaceTokenizer>();
@@ -128,11 +133,13 @@ public:
     for (const auto& filter : filters_) {
       if (filter == "lowercase") {
         tail = std::make_unique<LowercaseFilter>(std::move(tail));
+      } else if (filter == "nfkc_cf") {
+        tail = makeNfkcCasefoldFilter(std::move(tail));
       }
       // easy to add more filters here
     }
 
-    return std::make_unique<TokenChain>(headRef, std::move(tail));
+    return std::make_unique<TokenChain>(headRef, std::move(tail), stateful);
   }
 
 };

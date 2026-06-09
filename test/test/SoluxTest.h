@@ -5,13 +5,32 @@
 
 namespace solux {
 
+// AddressSanitizer ships its own operator new/delete; our counting override in
+// SoluxTest.cpp would clash with it (alloc-dealloc-mismatch), so the override is
+// compiled out under ASan and allocation counting is disabled there.
+#if defined(__SANITIZE_ADDRESS__)
+#  define SOLUX_ASAN 1
+#elif defined(__has_feature)
+#  if __has_feature(address_sanitizer)
+#    define SOLUX_ASAN 1
+#  endif
+#endif
+
 namespace memtrack {
 // Per-thread allocation counters, updated by the global operator new/new[]
-// overrides in SoluxTest.cpp. Always on (one thread-local increment per
-// allocation). Lets a test assert how many heap allocations a code path makes.
+// overrides in SoluxTest.cpp. One thread-local increment per allocation. Lets a
+// test assert how many heap allocations a code path makes.
 // (Named memtrack, not testing, so it does not shadow gtest's ::testing.)
 extern thread_local long allocCount;
 extern thread_local long allocBytes;
+
+// False under ASan (counting override disabled). Counting-based tests should
+// GTEST_SKIP when this is false.
+#ifdef SOLUX_ASAN
+inline constexpr bool counting_enabled = false;
+#else
+inline constexpr bool counting_enabled = true;
+#endif
 
 // RAII window: AllocScope s; ...code...; EXPECT_EQ(0, s.count());
 // Capture the delta into a local BEFORE any EXPECT (gtest macros allocate).
