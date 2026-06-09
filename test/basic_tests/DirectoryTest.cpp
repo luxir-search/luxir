@@ -305,7 +305,7 @@ TEST_F(DirectoryTest, checkedDirWarnMode) {
 
   // WARN mode should not throw even with expectSynced on unsynced file
   {
-    LogLevelGuard quiet;  // expected: unsynced-read warn
+    ExpectLog quiet("expectSynced openFile on unsynced file");
     ASSERT_NO_THROW(dir.openFile("bar", true));
   }
 }

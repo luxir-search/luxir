@@ -391,7 +391,7 @@ TEST_F(FusionOpTest, validation) {
     auto* lreq = buildBase();
     auto& fusion = *(*lreq->proto.mutable_ops())["f"].mutable_fusion();
     fusion.mutable_rrf()->set_k(60);
-    LogLevelGuard quiet;
+    ExpectLog quiet("Search request failed:");
     lreq->execute();
     ASSERT_FALSE(lreq->responses.empty());
     EXPECT_NE(lreq->responses[0]->proto.error().find("source"), std::string::npos);
@@ -403,7 +403,7 @@ TEST_F(FusionOpTest, validation) {
     auto* lreq = buildBase();
     auto& fusion = *(*lreq->proto.mutable_ops())["f"].mutable_fusion();
     setTextSource((*fusion.mutable_sources())["text"], "foo_w", "apple", 5);
-    LogLevelGuard quiet;
+    ExpectLog quiet("Search request failed:");
     lreq->execute();
     ASSERT_FALSE(lreq->responses.empty());
     EXPECT_NE(lreq->responses[0]->proto.error().find("method"), std::string::npos);
@@ -416,7 +416,7 @@ TEST_F(FusionOpTest, validation) {
     auto& fusion = *(*lreq->proto.mutable_ops())["f"].mutable_fusion();
     fusion.mutable_rrf()->set_k(-1);
     setTextSource((*fusion.mutable_sources())["text"], "foo_w", "apple", 5);
-    LogLevelGuard quiet;
+    ExpectLog quiet("Search request failed:");
     lreq->execute();
     ASSERT_FALSE(lreq->responses.empty());
     EXPECT_NE(lreq->responses[0]->proto.error().find("k"), std::string::npos);
@@ -431,7 +431,7 @@ TEST_F(FusionOpTest, validation) {
     setTextSource((*fusion.mutable_sources())["text"], "foo_w", "apple", 5);
     auto& sub = (*fusion.mutable_ops())["facet"];
     sub.mutable_field_facet()->set_field("color_s");
-    LogLevelGuard quiet;
+    ExpectLog quiet("Search request failed:");
     lreq->execute();
     ASSERT_FALSE(lreq->responses.empty());
     EXPECT_NE(lreq->responses[0]->proto.error().find("sub-ops"), std::string::npos);

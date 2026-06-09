@@ -9,6 +9,7 @@
 #include "solux/reader/FieldReader.h"
 #include "solux/schema/FieldType.h"
 #include "solux/schema/Schema.h"
+#include "solux/util/log.h"
 #include "protos/solux_types.pb.h"
 
 using namespace solux;
@@ -509,9 +510,12 @@ TEST_F(VectorColTest, cosineSkipsZeroVector) {
   h.collection().setSchema(Schema::fromProto(def, h.collection().getSchema().get()));
 
   // Doc "a" has a zero vector (skipped); doc "b" has a usable one (kept).
-  h.index(flatdoc("id", std::string("a"), "vec_v", std::vector<float>{0.0f, 0.0f}));
-  h.index(flatdoc("id", std::string("b"), "vec_v", std::vector<float>{3.0f, 4.0f}),
-          UpdateMessage::COMMIT);
+  {
+    ExpectLog quiet("skipping zero / near-zero vector");
+    h.index(flatdoc("id", std::string("a"), "vec_v", std::vector<float>{0.0f, 0.0f}));
+    h.index(flatdoc("id", std::string("b"), "vec_v", std::vector<float>{3.0f, 4.0f}),
+            UpdateMessage::COMMIT);
+  }
 
   auto* req = LocalReq::create(h.getSearchEngine());
   req->collection("main").allQuery().fields({"id", "vec_v"}).limit(10).execute();

@@ -309,21 +309,28 @@ TEST_F(IndexWriterTest, mergeFailureContainmentRestoresSourcesAndGate) {
   solux::Signal::listen("segmentMergeBody", [](void*, void*, void*) -> void* {
     throw std::runtime_error("injected segment merge failure");
   });
-  std::thread mergeThread([&]() {
-    iw->mergeSegments();
-  });
-  mergeStarted.wait();
-
   std::atomic_bool waitCommitDone = false;
   std::atomic_bool waitCommitSuccess = false;
-  std::thread waitCommitThread([&]() {
-    waitCommitSuccess.store(waitForMergesCommit(*iw), std::memory_order_relaxed);
-    waitCommitDone.store(true, std::memory_order_relaxed);
-  });
+  {
+    // The injected merge failure is contained and logged at error level; drop
+    // that one expected line so real failures stand out.  Installed before the
+    // threads start and torn down after they join, so the sink swap cannot race
+    // a concurrent log.
+    ExpectLog quiet("injected segment merge failure");
+    std::thread mergeThread([&]() {
+      iw->mergeSegments();
+    });
+    mergeStarted.wait();
 
-  releaseMerge.count_down();
-  mergeThread.join();
-  waitCommitThread.join();
+    std::thread waitCommitThread([&]() {
+      waitCommitSuccess.store(waitForMergesCommit(*iw), std::memory_order_relaxed);
+      waitCommitDone.store(true, std::memory_order_relaxed);
+    });
+
+    releaseMerge.count_down();
+    mergeThread.join();
+    waitCommitThread.join();
+  }
   solux::Signal::unlisten("mergeStart");
   solux::Signal::unlisten("segmentMergeBody");
 
@@ -944,6 +951,12 @@ static void runMultithreadedUpdates(uint64_t seed, int mergeFailPercent) {
         });
   }
 
+  // Injected merge failures are contained and logged at error level.  Suppress
+  // exactly those expected lines (matched by message) for the whole run so they
+  // do not bury real problems; a genuine unexpected error still surfaces.  When
+  // no failures are injected nothing matches, so this is a harmless pass-through.
+  ExpectLog quietFailures("injected merge failure (hammer)");
+
   std::vector<std::thread> threads;
 
 #ifdef TBB_TEST_VERSION
@@ -1100,6 +1113,9 @@ static void runMultithreadedUpdates(uint64_t seed, int mergeFailPercent) {
   indexWriter->updateGraph.wait_for_all();
 
   if (mergeFailPercent > 0) {
+    // The run is meaningless if no merge actually failed; the version oracle
+    // above would still pass.  Assert at least one injected failure landed.
+    EXPECT_GT(quietFailures.suppressed(), 0u);
     solux::Signal::unlisten("segmentMergeBody");
   }
 }

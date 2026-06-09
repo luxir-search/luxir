@@ -513,7 +513,7 @@ TEST_F(KnnQueryTest, multiValuedCandidateCapIsBestEffort) {
 
   auto* req = makeKnnReq(*soluxNode, "emb_vs", {1, 0, 0}, 4);
   {
-    LogLevelGuard quiet;  // expected: shortfall at the test candidate cap
+    ExpectLog quiet("at candidate cap");
     req->execute();
   }
 
@@ -911,7 +911,7 @@ TEST_F(KnnQueryTest, booleanMinMatchWithRequiredIsRejected) {
   optionalMatch.mutable_val()->set_s("banana");
 
   {
-    LogLevelGuard quiet;
+    ExpectLog quiet("Search request failed:");
     req->execute();
   }
 
@@ -1197,7 +1197,10 @@ TEST_F(KnnQueryTest, exactIgnoresMaxKnnCandidatesCap) {
   h.commit({"*"});
 
   auto* capped = makeKnnReq(*soluxNode, "embedding_v", {0, 0, 0, 0}, 5);
-  capped->execute();
+  {
+    ExpectLog quiet("at candidate cap");  // non-exact falls short of k at the cap
+    capped->execute();
+  }
   EXPECT_EQ(capped->getMatchCount(), 2) << "non-exact respects the host cap";
   capped->done();
 
@@ -1363,7 +1366,7 @@ TEST_F(KnnQueryTest, dimMismatchReturnsErrorResponse) {
   // Query is 3-d but index is 4-d.
   auto* req = makeKnnReq(*soluxNode, "embedding_v", {1, 0, 0}, 1);
   {
-    LogLevelGuard quiet;  // expected: dim-mismatch warns
+    ExpectLog quiet("Search request failed:");
     req->execute();
   }
   EXPECT_EQ(req->getMatchCount(), 0);
@@ -1386,7 +1389,7 @@ TEST_F(KnnQueryTest, emptyQueryVectorReturnsErrorResponse) {
 
   auto* req = makeKnnReq(*soluxNode, "embedding_v", {}, 1);
   {
-    LogLevelGuard quiet;  // expected: empty query vector parse error
+    ExpectLog quiet("Search request failed:");
     req->execute();
   }
   EXPECT_EQ(req->getMatchCount(), 0);
@@ -1452,7 +1455,7 @@ TEST_F(KnnQueryTest, zeroOnlyCosineSegmentDoesNotPoisonColumnScan) {
   installVecSchema(h.collection(), proto::VectorParams::COSINE);
 
   {
-    LogLevelGuard quiet;  // expected: zero cosine vector is skipped on write
+    ExpectLog quiet("skipping zero / near-zero vector");
     h.index(flatdoc("id", std::string("zero"), "embedding_v", std::vector<float>{0, 0, 0}));
     h.commit();
   }

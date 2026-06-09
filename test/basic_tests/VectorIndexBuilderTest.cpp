@@ -13,6 +13,7 @@
 #include "solux/store/Directory.h"
 #include "solux/reader/Postings.h"
 #include "solux/util/Signal.h"
+#include "solux/util/log.h"
 #include "protos/solux_types.pb.h"
 
 #include <faiss/IndexFlat.h>
@@ -91,7 +92,12 @@ namespace {
 // the named field, exercising vector build-failure paths.  A test could just
 // as easily block here (timing) or throw a different exception type.
 struct VectorBuildFailureGuard {
-  explicit VectorBuildFailureGuard(std::string fieldName) {
+  // Suppress the log line the injected failure produces - the guard already
+  // knows the field, so it knows exactly what to hush.  Reverts with the guard.
+  ExpectLog quiet;
+
+  explicit VectorBuildFailureGuard(std::string fieldName)
+      : quiet("injected failure for " + fieldName) {
     solux::Signal::listen("vectorBuildField",
         [field = std::move(fieldName)](void* fnPtr, void*, void*) -> void* {
           if (*(const std::string_view*)fnPtr == field) {
@@ -870,7 +876,10 @@ TEST_F(VectorIndexBuilderTest, invalidExactVectorSelectorDoesNotActivate) {
   enableL2OnVecSuffix(h.collection());
   auto iw = h.getIndexWriter();
 
-  EXPECT_TRUE(commitForTest(h, {"vec.typo"}));
+  {
+    ExpectLog quiet("Ignoring vector aux selector vec.typo");
+    EXPECT_TRUE(commitForTest(h, {"vec.typo"}));
+  }
   EXPECT_FALSE(iw->testActiveVectorOverlayName("vec.typo"));
 
   for (int seg = 0; seg < 2; seg++) {
@@ -1037,7 +1046,10 @@ TEST_F(VectorIndexBuilderTest, mergedPostingsReaderFailureRestoresSourcesAndClea
   solux::Signal::listen("mergedPostingsReader", [](void*, void*, void*) -> void* {
     throw std::runtime_error("injected merged postings reader failure");
   });
-  iw->mergeSegments();
+  {
+    ExpectLog quiet("injected merged postings reader failure");
+    iw->mergeSegments();
+  }
   solux::Signal::unlisten("mergedPostingsReader");
 
   EXPECT_FALSE(iw->testMergeRunning());
