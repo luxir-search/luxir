@@ -182,7 +182,9 @@ target_link_libraries(solux_lib PRIVATE ${Boost_LIBRARIES})
 target_link_libraries(solux_lib PRIVATE debug simdcomp_ad)
 target_link_libraries(solux_lib PRIVATE optimized simdcomp_a)
 target_link_libraries(solux_lib PRIVATE myproto)
-target_link_libraries(solux_lib PRIVATE spdlog::spdlog spdlog::spdlog_header_only)
+# log.h is included by tests and other dependents; propagate spdlog's compiled
+# mode so every TU shares the same default-logger registry.
+target_link_libraries(solux_lib PUBLIC spdlog::spdlog)
 target_link_libraries(solux_lib PRIVATE CLI11::CLI11)
 target_link_libraries(solux_lib PRIVATE lz4::lz4)
 target_link_libraries(solux_lib PRIVATE faiss)
