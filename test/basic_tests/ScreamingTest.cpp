@@ -627,3 +627,35 @@ TEST_F(ScreamingTest, ramFixedBitSetRandom) {
     }
   }
 }
+
+// visitZeroes/visitOnes word-walkers: edge bits 0 and 63, all-zero and
+// all-one words, and exact complementarity over a multi-word array.
+TEST_F(ScreamingTest, visitZeroesAndOnes) {
+  std::vector<uint64_t> words(4, ~0ULL);
+  words[0] &= ~((1ULL << 0) | (1ULL << 3) | (1ULL << 5) | (1ULL << 63));
+  words[1] = 0;
+  words[3] = rng.rlong();
+  int32_t nbits = (int32_t)(words.size() * 64);
+  std::vector<bool> reference(nbits);
+  for (int32_t b = 0; b < nbits; b++) {
+    reference[b] = (words[b >> 6] >> (b & 63)) & 1;
+  }
+
+  std::vector<int32_t> got;
+  screaming::FixedBitSet::visitZeroes(words.data(), (int32_t)words.size(),
+                                      [&](int32_t b) { got.push_back(b); });
+  std::vector<int32_t> expected;
+  for (int32_t b = 0; b < nbits; b++) {
+    if (!reference[b]) expected.push_back(b);
+  }
+  EXPECT_EQ(got, expected);
+
+  got.clear();
+  expected.clear();
+  screaming::FixedBitSet::visitOnes(words.data(), (int32_t)words.size(),
+                                    [&](int32_t b) { got.push_back(b); });
+  for (int32_t b = 0; b < nbits; b++) {
+    if (reference[b]) expected.push_back(b);
+  }
+  EXPECT_EQ(got, expected);
+}

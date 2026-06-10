@@ -99,6 +99,11 @@ public:
       return sharedLiveDocs.get();
     }
 
+    // shared form of liveDocs(), for callers that cache views into its mapped bits
+    std::shared_ptr<LiveDocs> liveDocsShared() const noexcept {
+      return sharedLiveDocs;
+    }
+
     std::span<const std::shared_ptr<AuxReader>> auxReaders() const noexcept {
       return sharedAuxReaders;
     }

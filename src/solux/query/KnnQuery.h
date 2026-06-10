@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <bit>
 #include <cmath>
 #include <cstdint>
 #include <format>
@@ -384,6 +385,7 @@ public:
       // just pointers into the segment mmap (valid for the whole query), so copying it
       // out of the scratch VectorReader is safe and cheap.
       std::vector<std::optional<MonoReader>> monoHolders(numSegs);
+      std::vector<std::shared_ptr<const RankLiveBitmap>> rankLivePerSeg(numSegs);
       std::vector<SegFieldInfo> segInfoStorage(numSegs);
       std::vector<SegFieldInfo*> segInfos(numSegs, nullptr);
       for (size_t i = 0; i < numSegs; i++) {
@@ -445,7 +447,23 @@ public:
                 v2dPerSeg[i].sel = makeValueDocSelector(scratch, dr.bitset());
               }
             }
-            segLiveVectorCounts[i] = liveVectorUpperBound(reader.segments()[i], vr);
+            IndexReader::Segment& seg = reader.segments()[i];
+            if (vauxPerSeg[i] != nullptr && seg.liveDocs() != nullptr) {
+              // Rank-space liveness bitmap, cached on the aux reader per
+              // liveDocs generation; fetched here so a (rare) rebuild runs
+              // while the scratch column readers it walks are alive.
+              // liveListSize accounting always reads it, for an unfiltered
+              // query (domain == the liveDocs docset) it doubles as the
+              // whole FAISS eligibility selector, and it carries this
+              // segment's EXACT live vector count.
+              rankLivePerSeg[i] = vauxPerSeg[i]->rankLiveBitmap(
+                seg.segInfo.live_gen, [&]() {
+                  return buildRankLiveBitmap(seg, vr, segCount);
+                });
+              segLiveVectorCounts[i] = rankLivePerSeg[i]->liveVectors;
+            } else {
+              segLiveVectorCounts[i] = liveVectorUpperBound(seg, vr);
+            }
           }
         }
       }
@@ -517,18 +535,9 @@ public:
           }
           bool isIvf = vaux->getEngine() == VectorAuxMeta::ENGINE_IVFPQ;
           approximateEngine = approximateEngine || !vaux->scoresAreExact();
-          // Rank-space liveness bitmap, cached on the aux reader per
-          // liveDocs generation: liveListSize accounting always reads it,
-          // and for an unfiltered query (domain == the liveDocs docset) it
-          // doubles as the whole FAISS eligibility selector.
-          std::shared_ptr<const std::vector<uint8_t>> rankLive;
-          if (seg.liveDocs() != nullptr) {
-            rankLive = vaux->rankLiveBitmap(seg.segInfo.live_gen, [&]() {
-              return buildRankLiveBitmap(v2dPerSeg[i], *seg.liveDocs(), segCount);
-            });
-          }
           auto faissEngine = std::make_unique<SegmentFaissVectorEngine>(
-            *idx, (int32_t)i, seg, v2dPerSeg[i], domain, std::move(rankLive),
+            *idx, (int32_t)i, seg, v2dPerSeg[i], domain,
+            std::move(rankLivePerSeg[i]),
             metric, vaux->scoresAreExact(), isIvf,
             vaux->getNList());
           SegmentFaissVectorEngine* ivfEngine = isIvf ? faissEngine.get() : nullptr;
@@ -781,7 +790,7 @@ public:
       // (shared from the VectorAuxReader's per-liveGen cache).  liveListSize
       // always reads it; it doubles as the FAISS selector when the domain is
       // exactly liveDocs (unfiltered query).
-      std::shared_ptr<const std::vector<uint8_t>> rankLiveBits;
+      std::shared_ptr<const RankLiveBitmap> rankLive;
       std::optional<faiss::IDSelectorBitmap> bitmapSelector;
       std::optional<LocalDomainSelector> domainSelector;
       // Selector handed to FAISS scans: &bitmapSelector when the domain is
@@ -799,7 +808,7 @@ public:
                                IndexReader::Segment& seg,
                                const SegV2D& v2d,
                                DocSet* domain,
-                               std::shared_ptr<const std::vector<uint8_t>>&& rankLive,
+                               std::shared_ptr<const RankLiveBitmap>&& rankLive,
                                int32_t metric,
                                bool exactScores,
                                bool isIvf,
@@ -809,7 +818,7 @@ public:
           segOrd(segOrd),
           v2d(v2d),
           liveDocs(seg.liveDocs()),
-          rankLiveBits(std::move(rankLive)),
+          rankLive(std::move(rankLive)),
           metric(metric),
           exactScores(exactScores),
           isIvf(isIvf),
@@ -817,10 +826,10 @@ public:
         if (isIvf && ivf == nullptr) {
           throw std::runtime_error("KnnQuery: vector aux marked IVF but FAISS index is not IndexIVF");
         }
-        assert((liveDocs != nullptr) == (rankLiveBits != nullptr));
+        assert((liveDocs != nullptr) == (this->rankLive != nullptr));
         if (domain != nullptr) {
           if (liveDocs != nullptr && domain == &liveDocs->docset()) {
-            bitmapSelector.emplace(rankLiveBits->size(), rankLiveBits->data());
+            bitmapSelector.emplace(this->rankLive->numBytes, this->rankLive->bits);
             sel = &*bitmapSelector;
           } else {
             domainSelector.emplace(v2d, domain);
@@ -857,7 +866,7 @@ public:
         if (rawSize == 0) return 0;
         if (liveDocs == nullptr) return (int64_t)rawSize;
 
-        const uint8_t* bits = rankLiveBits->data();
+        const uint8_t* bits = rankLive->bits;
         int64_t liveSize = 0;
         const faiss::idx_t* listIds = ivf->invlists->get_ids((size_t)listId);
         for (size_t i = 0; i < rawSize; i++) {
@@ -1653,58 +1662,93 @@ public:
 private:
   static constexpr double MIN_COSINE_NORM_SQ = 1.0e-30;
 
-  /// Build the rank-space liveness bitmap for one segment's vector field:
-  /// bit r is set iff the doc owning vector rank r is live.  LSB-first
-  /// bytes, the faiss::IDSelectorBitmap layout.  O(numVectors), run once per
-  /// liveDocs generation (cached on the VectorAuxReader); multi-valued walks
-  /// the valDoc map sequentially and checks each doc run once.
-  static std::vector<uint8_t> buildRankLiveBitmap(const SegV2D& v2d,
-                                                  LiveDocs& live,
-                                                  int64_t numVectors) {
+  /// Build the RankLiveBitmap (rank-space liveness + exact live vector
+  /// count) for one segment's vector field.  Run once per liveDocs
+  /// generation (cached on the VectorAuxReader), and sized by the segment's
+  /// DELETED docs rather than its vectors: start all-live, walk the zero
+  /// bits of liveDocs, and clear each deleted doc's rank(s), resolving
+  /// doc -> rank through the has-field bitset (advance + rank) and, for
+  /// multi-valued, the forward start/end-rank map - the engines' reverse
+  /// (valueRank -> docId) map is never consulted.  Dense single-valued
+  /// needs no walk at all: valueRank == docId, so the liveDocs words
+  /// themselves are the bitmap (borrowed and pinned via backing) and the
+  /// segment's cached live count is the cardinality.
+  static RankLiveBitmap buildRankLiveBitmap(IndexReader::Segment& seg,
+                                            VectorReader& vr,
+                                            int64_t numVectors) {
     rankLiveBitmapBuildsForTests.fetch_add(1, std::memory_order_relaxed);
-    std::vector<uint8_t> bits(((size_t)numVectors + 7) / 8, 0);
-    const auto& liveBits = live.bitset();
-    if (v2d.mono != nullptr) {
-      MonoReader::BulkValues valDoc(*v2d.mono);
-      int64_t idx = valDoc.next();
-      int64_t rank = 0;
-      while (rank < numVectors) {
-        int32_t docId = (int32_t)valDoc.value();
-        int64_t end = rank;
-        do {
-          end++;
-          idx = valDoc.next();
-        } while (end < numVectors && (int32_t)valDoc.value() == docId);
-        unused(idx);
-        if (liveBits.get(docId)) {
-          for (int64_t r = rank; r < end; r++) {
-            bits[(size_t)(r >> 3)] |= (uint8_t)(1u << (r & 7));
-          }
-        }
-        rank = end;
-      }
-    } else {
-      for (int64_t r = 0; r < numVectors; r++) {
-        if (liveBits.get(v2d.resolve(r))) {
-          bits[(size_t)(r >> 3)] |= (uint8_t)(1u << (r & 7));
-        }
-      }
+    LiveDocs& live = *seg.liveDocs();
+    const screaming::FixedBitSet& liveBits = live.bitset();
+    size_t numBytes = ((size_t)numVectors + 7) / 8;
+    StrColReader& col = vr.strColReader();
+    const bool multi = vr.isMultiValued();
+    auto& dr = col.docsReader();
+    if (!multi && !dr.hasBitset()) {
+      static_assert(std::endian::native == std::endian::little,
+                    "liveDocs words double as the LSB-first byte bitmap");
+      assert((int64_t)live.size() == numVectors);
+      return {(const uint8_t*)liveBits.words, numBytes, (int64_t)live.numLive(),
+              seg.liveDocsShared()};
     }
-    return bits;
+
+    auto owned = std::make_shared<std::vector<uint8_t>>(numBytes, (uint8_t)0xFF);
+    std::vector<uint8_t>& bits = *owned;
+    if (numVectors & 7) {
+      bits.back() = (uint8_t)(0xFFu >> (8 - (numVectors & 7)));
+    }
+    int64_t cleared = 0;
+    auto clearRanks = [&bits, &cleared](int64_t begin, int64_t end) {
+      for (int64_t r = begin; r < end; r++) {
+        bits[(size_t)(r >> 3)] &= (uint8_t)~(1u << (r & 7));
+      }
+      cleared += end - begin;
+    };
+
+    const int32_t maxDoc = live.size();
+    const int32_t numWords = (int32_t)screaming::FixedBitSet::sizeInWords(maxDoc);
+    if (dr.hasBitset()) {
+      screaming::BitSet::Iterator fieldDocs(dr.bitset());
+      int32_t fieldDoc = -1;  // last doc-with-field landed on (END once drained)
+      screaming::FixedBitSet::visitZeroes(liveBits.words, numWords, [&](int32_t d) {
+        if (d >= maxDoc) return;  // zero tail bits of the last word are not docs
+        if (fieldDoc < d) fieldDoc = fieldDocs.advance(d);
+        if (fieldDoc != d) return;  // deleted doc holds no vectors
+        int32_t docRank = fieldDocs.rank();
+        if (multi) {
+          auto [begin, end] = col.getStartEndValueRank(docRank);
+          clearRanks(begin, end);
+        } else {
+          clearRanks(docRank, docRank + 1);
+        }
+      });
+    } else {
+      // Every doc has the field, so docRank == docId.  Multi-valued only:
+      // the dense single-valued case borrowed liveDocs above.
+      screaming::FixedBitSet::visitZeroes(liveBits.words, numWords, [&](int32_t d) {
+        if (d >= maxDoc) return;
+        auto [begin, end] = col.getStartEndValueRank(d);
+        clearRanks(begin, end);
+      });
+    }
+    const uint8_t* data = bits.data();
+    return {data, numBytes, numVectors - cleared, std::move(owned)};
   }
 
   /// O(1) UPPER BOUND on a segment's live vector count, used as the budget
   /// denominator (referenceBreadth, list-cost normalization) and the
-  /// targetDocReq cap.  An exact count under deletes required walking the
-  /// field (every rank for sparse single-valued, the whole column iterator
-  /// for multi-valued) on EVERY query - O(N_seg) bookkeeping to budget a
-  /// search that examines ~N^0.75 vectors at the default.  An upper bound is
-  /// the safe direction to relax: overestimating only makes the scan
-  /// fraction leaner and targetDocReq higher, and host deepening compensates
-  /// (the same stance as cost accounting ignoring the domain filter).
-  /// UNDERestimating is not safe: targetDocReq = min(liveTotal, ...) would
-  /// stop the widen loop before K achievable docs.  Exact for no-deletes and
-  /// for dense single-valued (identity mapping => live count == numLive).
+  /// targetDocReq cap for segments with no cached exact count: flat
+  /// (aux-less) segments under deletes.  FAISS segments under deletes use
+  /// the exact cardinality the cached RankLiveBitmap carries instead - the
+  /// count is amortized into the per-liveGen bitmap build, where computing
+  /// it here would re-walk the field on EVERY query, O(N_seg) bookkeeping
+  /// to budget a search that examines ~N^0.75 vectors at the default.  An
+  /// upper bound is the safe direction to relax: overestimating only makes
+  /// the scan fraction leaner and targetDocReq higher, and host deepening
+  /// compensates (the same stance as cost accounting ignoring the domain
+  /// filter).  UNDERestimating is not safe: targetDocReq = min(liveTotal,
+  /// ...) would stop the widen loop before K achievable docs.  Exact for
+  /// no-deletes and for dense single-valued (identity mapping => live count
+  /// == numLive).
   static int64_t liveVectorUpperBound(IndexReader::Segment& segment,
                                       VectorReader& vr) {
     LiveDocs* live = segment.liveDocs();

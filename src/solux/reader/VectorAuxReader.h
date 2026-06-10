@@ -190,6 +190,22 @@ public:
   }
 };
 
+/// Rank-space liveness for one segment's vector field, cached per liveDocs
+/// generation: bit r is set iff the doc owning vector rank r is live, in the
+/// LSB-first byte layout faiss::IDSelectorBitmap consumes, plus the exact
+/// live vector cardinality so consumers never recount it.  Bits past
+/// numVectors in the final byte are zero, so popcount(bits) == liveVectors.
+/// `bits` points either into bytes owned by `backing` or directly at the
+/// segment's liveDocs words (dense single-valued fields: valueRank == docId,
+/// and the little-endian byte view of the words IS this layout); either way
+/// `backing` pins the storage for as long as a query holds the bitmap.
+struct RankLiveBitmap {
+  const uint8_t* bits;
+  size_t numBytes;
+  int64_t liveVectors;
+  std::shared_ptr<const void> backing;
+};
+
 /// AuxReader for kind == "vector_faiss".  Holds a deserialized faiss::Index
 /// lazily decoded from the single eagerly-opened file referenced by
 /// AuxIndexInfo.files(0), plus the VectorAuxMeta decoded out of
@@ -211,16 +227,17 @@ class VectorAuxReader : public AuxReader {
   mutable std::unique_ptr<MmapInvertedLists> mmapLists;
   mutable std::unique_ptr<faiss::Index> faissIndex;
   VectorAuxMeta meta;
-  // Cached rank-space liveness bitmap (see KnnQuery): bit r is set iff the
-  // doc owning vector rank r is live.  Built once per liveDocs generation
-  // and shared by every query against this (segment, field) - the FAISS
-  // eligibility selector for unfiltered queries and the allocator's
-  // live-list accounting both read it instead of resolving rank -> doc ->
-  // liveDocs per scanned vector.  Keyed by liveGen, so a reader version
-  // with newer deletes rebuilds.
+  // Cached RankLiveBitmap (built by KnnQuery).  Built once per liveDocs
+  // generation - in time proportional to the segment's DELETED docs, not its
+  // vectors - and shared by every query against this (segment, field): the
+  // FAISS eligibility selector for unfiltered queries and the allocator's
+  // live-list accounting both read the bits instead of resolving rank ->
+  // doc -> liveDocs per scanned vector, and its cardinality is the
+  // segment's exact live vector count.  Keyed by liveGen, so a reader
+  // version with newer deletes rebuilds.
   mutable std::mutex rankLiveMutex;
   mutable uint64_t rankLiveGen = 0;
-  mutable std::shared_ptr<const std::vector<uint8_t>> rankLiveBits;
+  mutable std::shared_ptr<const RankLiveBitmap> rankLive;
 
 public:
   static constexpr std::string_view KIND = "vector_faiss";
@@ -308,20 +325,20 @@ public:
     return faissIndex.get();
   }
 
-  /// Get-or-build the rank-space liveness bitmap for the given liveDocs
-  /// generation.  build() runs at most once per generation (under the lock;
-  /// concurrent first callers wait rather than duplicate the O(numVectors)
-  /// walk) and must return ceil(numVectors / 8) LSB-first bytes, the layout
-  /// faiss::IDSelectorBitmap consumes.
+  /// Get-or-build the RankLiveBitmap for the given liveDocs generation.
+  /// build() runs at most once per generation (under the lock; concurrent
+  /// first callers wait rather than duplicate the walk) and returns a
+  /// RankLiveBitmap whose backing keeps the bits valid for as long as any
+  /// query holds the shared_ptr.
   template <typename Build>
-  std::shared_ptr<const std::vector<uint8_t>> rankLiveBitmap(uint64_t liveGen,
-                                                             Build&& build) const {
+  std::shared_ptr<const RankLiveBitmap> rankLiveBitmap(uint64_t liveGen,
+                                                       Build&& build) const {
     std::lock_guard<std::mutex> lock(rankLiveMutex);
-    if (rankLiveBits == nullptr || rankLiveGen != liveGen) {
-      rankLiveBits = std::make_shared<const std::vector<uint8_t>>(build());
+    if (rankLive == nullptr || rankLiveGen != liveGen) {
+      rankLive = std::make_shared<const RankLiveBitmap>(build());
       rankLiveGen = liveGen;
     }
-    return rankLiveBits;
+    return rankLive;
   }
 
   /// Open the FAISS index referenced by `info`.  Returns nullptr when the

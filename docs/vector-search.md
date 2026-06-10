@@ -90,10 +90,13 @@ For per-segment IVF, Solux ranks all segments' IVF lists by query-to-centroid
 distance, then probes the globally best lists until the requested scan fraction
 is reached. List cost is based on that list's live vector count divided by the
 field's live vector count. This handles uneven list sizes and avoids applying
-equal work to every segment. The field-wide live count in these formulas is a
-cheap upper bound when a segment has deletions (exact counting would scan the
-field per query); the bound only errs toward slightly leaner initial effort,
-which auto-deepening recovers.
+equal work to every segment. For an IVF segment with deletions the live count
+is exact: it rides along with the segment's cached rank-liveness bitmap, which
+is rebuilt per delete generation in time proportional to the deleted docs (for
+a dense single-valued field the bitmap simply borrows the liveDocs bits).
+Flat-scanned segments with deletions use a cheap upper bound instead (exact
+counting there would scan the field per query); the bound only errs toward
+slightly leaner initial effort, which auto-deepening recovers.
 
 `min_scan_fraction` optionally sets a direct floor on the internal scan
 fraction. It is a float in `[0,1]`; values like `0.001` mean 0.1% of the live

@@ -148,39 +148,35 @@ public:
     }
   }
 
-  // TODO: untested
   // These are static so they can be used more easily in other contexts, with different offsets, etc.
+  // Clearing the lowest set bit compiles to BLSR (x86) and avoids shift-count
+  // bookkeeping (a >>= 64 on a full word would be UB).
   template <class Callable>
   static void visitZeroes(const word_type* words, index_type numWords, Callable callable) {
     for (index_type i=0; i<numWords; i++) {
       word_type word = ~words[i];  // flip bits and find the ones
-      uint8_t bitIdx = 0;
+      index_type base = i * (index_type)(sizeof(word_type) * 8);
       while (word != 0) {
         auto foundIdx = std::countr_zero(word);
-        bitIdx += foundIdx;
-        word >>= (bitIdx + 1);
-        callable(i * sizeof(word_type) * 8 + bitIdx);
+        word &= word - 1;  // clear the lowest set bit
+        callable(base + (index_type)foundIdx);
       }
     }
   }
 
-  // TODO: untested
   template <class Callable>
   static void visitOnes(const word_type* words, index_type numWords, Callable callable) {
     for (index_type i=0; i<numWords; i++) {
       word_type word = words[i];
-      uint8_t bitIdx = 0;
+      index_type base = i * (index_type)(sizeof(word_type) * 8);
       while (word != 0) {
         auto foundIdx = std::countr_zero(word);
-        bitIdx += foundIdx;
-        word >>= (bitIdx + 1);
-        callable(i * sizeof(word_type) * 8 + bitIdx);
+        word &= word - 1;  // clear the lowest set bit
+        callable(base + (index_type)foundIdx);
       }
     }
   }
 
-  // TODO: untested.  This should be a faster way than shifting the word.  Compiler explorer shows that the
-  // clearing-the-lowest-bit code is translated to BLSR (x86), which also eliminates a separate test for 0
   template <class Callable>
   static void visitOnes(uint64_t word, Callable callable) {
     while (word != 0) {

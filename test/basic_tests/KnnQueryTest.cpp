@@ -1783,6 +1783,66 @@ TEST_F(KnnQueryTest, ivfPqMultiValuedUsesReverseMapAndCollapse) {
   req->done();
 }
 
+// Multi-valued IVF segment under deletes: the cached rank-live bitmap is
+// built by walking DELETED docs and must clear every rank a deleted doc
+// owns (via the forward start/end-rank map).  Deleting the top doc "a"
+// (two vectors - both ranks must drop) and the no-vector doc "g" (the
+// deleted-doc-without-field skip) must leave the survivors matching exact.
+TEST_F(KnnQueryTest, ivfPqMultiValuedDeletesClearAllRanks) {
+  IvfPqAuxGuard guard(/*nlist=*/4, /*m=*/2, /*bits=*/2,
+                      /*nprobe=*/4, /*minTraining=*/16, /*refineRatio=*/64);
+  CollectionHelper h("main");
+  h.clear();
+  installMultiVecSchema(h.collection(), proto::VectorParams::L2);
+
+  h.index(flatdoc("id", std::string("a"), "emb_vs",
+                  std::vector<std::vector<float>>{{0, 0, 0, 0}, {0.01f, 0, 0, 0}}));
+  h.index(flatdoc("id", std::string("g")));
+  h.index(flatdoc("id", std::string("b"), "emb_vs",
+                  std::vector<std::vector<float>>{{1, 0, 0, 0}}));
+  h.index(flatdoc("id", std::string("c"), "emb_vs",
+                  std::vector<std::vector<float>>{{2, 0, 0, 0}}));
+  h.index(flatdoc("id", std::string("d"), "emb_vs",
+                  std::vector<std::vector<float>>{{3, 0, 0, 0}}));
+  for (int i = 0; i < 155; i++) {
+    float x = 50.0f + (float)i;
+    h.index(flatdoc("id", "f" + std::to_string(i), "emb_vs",
+                    std::vector<std::vector<float>>{{
+                        x, (float)(i % 7) * 0.1f, (float)(i % 13) * 0.05f, 0.25f}}));
+  }
+  h.commit({"*"});
+  {
+    auto reader = h.getIndexWriter()->getIndexReader();
+    ASSERT_EQ(reader->segments().size(), 1u);
+    ASSERT_NE(reader->segments()[0].getAuxReader("vec.emb_vs"), nullptr)
+        << "segment fell back to flat (below IVF training floor)";
+  }
+
+  std::vector<std::string> dels{"a", "g"};
+  h.deleteByIds(dels, UpdateMessage::COMMIT);
+
+  int64_t builds0 = KnnQuery::rankLiveBitmapBuildsForTests.load(std::memory_order_relaxed);
+  auto* req = makeKnnReq(*soluxNode, "emb_vs", {0, 0, 0, 0}, 3,
+                         /*nprobe=*/0, /*refineCandidates=*/200,
+                         /*exact=*/false, /*minScanFraction=*/1.0f);
+  req->execute();
+  auto ids = resultIds(*req);
+  req->done();
+  auto* exact = makeKnnReq(*soluxNode, "emb_vs", {0, 0, 0, 0}, 3,
+                           /*nprobe=*/0, /*refineCandidates=*/200, /*exact=*/true);
+  exact->execute();
+  auto exactIds = resultIds(*exact);
+  exact->done();
+  int64_t builds1 = KnnQuery::rankLiveBitmapBuildsForTests.load(std::memory_order_relaxed);
+  EXPECT_EQ(builds1, builds0 + 1) << "one bitmap build for the IVF query";
+
+  ASSERT_EQ(ids.size(), 3u);
+  EXPECT_EQ(ids, exactIds);
+  EXPECT_EQ(ids[0], "b");
+  EXPECT_EQ(ids[1], "c");
+  EXPECT_EQ(ids[2], "d");
+}
+
 TEST_F(KnnQueryTest, ivfPqCosineRawColumnRescoreNormalizes) {
   IvfPqAuxGuard guard(/*nlist=*/4, /*m=*/2, /*bits=*/2,
                       /*nprobe=*/4, /*minTraining=*/16, /*refineRatio=*/64);
