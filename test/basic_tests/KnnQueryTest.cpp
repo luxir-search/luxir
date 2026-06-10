@@ -92,6 +92,40 @@ public:
   }
 };
 
+// Mixed-exactness merge shape (the flat+IVF composition the composite engine
+// produces): hits from exactSeg keep deliberately shifted scores and are
+// claimed exact via exactSegOrds; all other segments' scores are quantized to
+// coarse buckets and arrive approximate.  The shift is a tracer: a host that
+// re-rescores exact-claimed hits erases it, while a host honoring
+// exactSegOrds must surface it in the response scores.
+class PartiallyExactEngine final : public VectorEngine {
+  VectorEngine& inner;
+  int32_t exactSeg;
+  float shift;
+
+public:
+  PartiallyExactEngine(VectorEngine& inner, int32_t exactSeg, float shift) noexcept
+    : inner(inner), exactSeg(exactSeg), shift(shift) {}
+
+  VectorSearchResult search(const VectorSearchRequest& request) override {
+    VectorSearchResult result = inner.search(request);
+    for (auto& hit : result.hits) {
+      if (hit.segOrd == exactSeg) {
+        hit.score += shift;
+      } else {
+        hit.score = std::floor(hit.score * 2.0f) / 2.0f;
+      }
+    }
+    std::stable_sort(result.hits.begin(), result.hits.end(),
+                     [](const VectorEngineHit& a, const VectorEngineHit& b) {
+                       return a.score > b.score;
+                     });
+    result.scoresAreExact = false;
+    result.exactSegOrds.assign(1, exactSeg);
+    return result;
+  }
+};
+
 class KnnQueryTest : public SoluxTest {
 protected:
   struct MaxKnnCandidatesGuard {
@@ -1701,6 +1735,50 @@ TEST_F(KnnQueryTest, approximateScoresRescoredFromColumn) {
   EXPECT_NEAR(scores[0], 1.0f, 1e-5);          // d^2 = 0
   EXPECT_NEAR(scores[1], 1.0f / 1.25f, 1e-5);  // d^2 = 0.25
   EXPECT_NEAR(scores[2], 1.0f / 1.36f, 1e-5);  // d^2 = 0.36
+
+  req->done();
+}
+
+// A mixed merge (some segments exact, some approximate - the flat+IVF
+// composition shape) must rescore ONLY the approximate segments' hits.  The
+// wrapper shifts the exact-claimed segment's scores by +0.25: those scores
+// surviving to the response proves their column re-read was skipped, while
+// the quantized segment's hits coming back at full precision proves the
+// rescore still ran where needed.
+TEST_F(KnnQueryTest, mixedExactSegmentsSkipColumnRescore) {
+  EngineWrapperGuard guard([](VectorEngine& flat, int64_t) {
+    return std::make_unique<PartiallyExactEngine>(flat, 0, 0.25f);
+  });
+  CollectionHelper h("main");
+  h.clear();
+  installVecSchema(h.collection(), proto::VectorParams::L2);
+
+  // Segment 0: the exact-claimed segment.
+  h.index(flatdoc("id", std::string("a1"), "embedding_v", std::vector<float>{1.0f, 0, 0}));
+  h.index(flatdoc("id", std::string("a2"), "embedding_v", std::vector<float>{0.9f, 0, 0}));
+  h.commit();
+  // Segment 1: the approximate segment.  Both scores quantize into the same
+  // 0.5 bucket, so only a column rescore restores their order and values.
+  h.index(flatdoc("id", std::string("b1"), "embedding_v", std::vector<float>{0.95f, 0, 0}));
+  h.index(flatdoc("id", std::string("b2"), "embedding_v", std::vector<float>{0.5f, 0, 0}));
+  h.commit({"*"});
+
+  auto* req = makeKnnReq(*soluxNode, "embedding_v", {1, 0, 0}, 4);
+  req->execute();
+
+  EXPECT_EQ(req->getMatchCount(), 4);
+  auto ids = resultIds(*req);
+  auto scores = resultScores(*req);
+  ASSERT_EQ(ids.size(), 4u);
+  EXPECT_EQ(ids[0], "a1");
+  EXPECT_EQ(ids[1], "a2");
+  EXPECT_EQ(ids[2], "b1");
+  EXPECT_EQ(ids[3], "b2");
+  ASSERT_EQ(scores.size(), 4u);
+  EXPECT_NEAR(scores[0], 1.25f, 1e-5);                 // 1.0 + shift: not re-read
+  EXPECT_NEAR(scores[1], 1.0f / 1.01f + 0.25f, 1e-5);  // shifted: not re-read
+  EXPECT_NEAR(scores[2], 1.0f / 1.0025f, 1e-5);        // rescored from column
+  EXPECT_NEAR(scores[3], 1.0f / 1.25f, 1e-5);          // rescored from column
 
   req->done();
 }

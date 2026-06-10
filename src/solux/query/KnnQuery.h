@@ -479,6 +479,10 @@ public:
       boost::unordered_flat_set<VectorKey, VectorKeyHash, VectorKeyEqual> seenVectors;
       std::vector<DocHit> docHits;
       boost::unordered_flat_set<uint64_t> seenDocs;
+      // Per-segment exactness of the pooled candidates: a segment is marked
+      // once any round contributes a possibly-approximate hit from it; the
+      // terminal rescore re-reads the column only for marked segments.
+      std::vector<char> segApproxInPool(numSegs, 0);
       size_t maxDocHits = (size_t)std::min<int64_t>(targetDocReq, cap);
       size_t maxVectorHits = (size_t)cap;
       candidateHits.reserve((size_t)std::min(kReq, cap));
@@ -532,11 +536,22 @@ public:
         VectorSearchResult result = engine->search(request);
 
         size_t appendStart = candidateHits.size();
+        std::vector<char> roundExactSeg;
+        if (!result.scoresAreExact && !result.exactSegOrds.empty()) {
+          roundExactSeg.assign(numSegs, 0);
+          for (int32_t s : result.exactSegOrds) {
+            if (s >= 0 && (size_t)s < numSegs) roundExactSeg[(size_t)s] = 1;
+          }
+        }
         for (const auto& hit : result.hits) {
           if (candidateHits.size() >= maxVectorHits) break;
           VectorKey key{hit.segOrd, hit.valueRank};
           if (seenVectors.insert(key).second) {
             candidateHits.push_back(hit);
+            if (!result.scoresAreExact
+                && (roundExactSeg.empty() || !roundExactSeg[(size_t)hit.segOrd])) {
+              segApproxInPool[(size_t)hit.segOrd] = 1;
+            }
           }
         }
         bool appended = candidateHits.size() != appendStart;
@@ -581,6 +596,7 @@ public:
                                      reader,
                                      std::span<SegFieldInfo* const>(segInfos.data(), segInfos.size()),
                                      v2dSpan,
+                                     std::span<const char>(segApproxInPool.data(), segApproxInPool.size()),
                                      queryPtr, dims, metric, normalizeColumnOnCosineRescore,
                                      kDocs, docHits);
       } else if ((int64_t)docHits.size() > kDocs) {
@@ -918,22 +934,17 @@ public:
 
             if (docEligible(docId)) {
               eligibleDocs++;
-              VectorEngineHit best{
-                .score = 0.0f,
-                .segOrd = segOrd,
-                .valueRank = rank,
-              };
-              bool haveScore = false;
-              for (int64_t r = rank; r < end; r++) {
-                float score = exactScore(request.query, vr.vectorAtRank(r), dims, metric,
-                                         normalizeColumnOnCosineRescore, 0.0f);
-                if (!haveScore || score > best.score) {
-                  best.score = score;
-                  best.valueRank = r;
-                  haveScore = true;
-                }
-              }
-              offer(heap, best, request.candidates);
+              auto [bestRank, bestScore] = bestInRun(rank, end, [&](int64_t r) {
+                return exactScore(request.query, vr.vectorAtRank(r), dims, metric,
+                                  normalizeColumnOnCosineRescore, 0.0f);
+              });
+              offer(heap,
+                    VectorEngineHit{
+                      .score = bestScore,
+                      .segOrd = segOrd,
+                      .valueRank = bestRank,
+                    },
+                    request.candidates);
             }
             rank = end;
           }
@@ -1276,6 +1287,11 @@ public:
         bool depthGrew = request.candidates != lastScannedCandidates;
         lastScannedCandidates = request.candidates;
 
+        // Sub-results are per-segment, so exactness IS segment-attributable
+        // here: remember the exact parts so the host's terminal rescore (run
+        // when this merge is approximate overall) can keep their scores
+        // instead of re-reading their columns.
+        std::vector<int32_t> exactPartSegs;
         for (size_t i = 0; i < slots.size(); i++) {
           auto& slot = slots[i];
           VectorSearchResult part;
@@ -1308,11 +1324,17 @@ public:
             subReq.candidates = candidates;
             part = slot.engine->search(subReq);
           }
+          if (part.scoresAreExact && !part.hits.empty()) {
+            exactPartSegs.push_back(part.hits.front().segOrd);
+          }
           merged.scoresAreExact = merged.scoresAreExact && part.scoresAreExact;
           merged.poolExhausted = merged.poolExhausted && part.poolExhausted;
           merged.hits.insert(merged.hits.end(),
                              std::make_move_iterator(part.hits.begin()),
                              std::make_move_iterator(part.hits.end()));
+        }
+        if (!merged.scoresAreExact) {
+          merged.exactSegOrds = std::move(exactPartSegs);
         }
         if (hasIvfSlots) {
           merged.breadthExhausted = heapSize <= 0;
@@ -1388,20 +1410,44 @@ private:
     return vr.numVectors();
   }
 
-  /// Terminal refine: exact-rescore the pooled candidates from the column and
-  /// collapse to the top kDocs docs.  Candidates are sorted by (segOrd,
-  /// valueRank) first so the column is read in ONE ordered sparse pass per
-  /// segment (sequential mmap access instead of score-order random access),
-  /// and because valueRank order groups a doc's vectors contiguously, the
-  /// multi-valued max-sim collapse happens inline during that same pass.
-  /// Collapsing before the score sort is legal precisely because these scores
-  /// are exact - the engine's approximate ranking no longer matters.  (Same
-  /// ordered-rank-walk + run-collapse shape as the flat column engine's scan;
-  /// candidate-driven here, full-scan there.)
+  /// Max-sim collapse of one doc's run of doc-ordered vector positions: scores
+  /// each position in [begin, end) via scoreAt and returns (bestPos, bestScore).
+  /// Ties keep the lowest position, so the dense engine scan (positions are
+  /// valueRanks) and the sparse host rescore (positions are candidate indexes)
+  /// rank a doc's equal-scoring vectors identically.
+  template <typename ScoreAt>
+  static std::pair<int64_t, float> bestInRun(int64_t begin, int64_t end, ScoreAt&& scoreAt) {
+    assert(begin < end);
+    int64_t bestPos = begin;
+    float bestScore = scoreAt(begin);
+    for (int64_t pos = begin + 1; pos < end; pos++) {
+      float score = scoreAt(pos);
+      if (score > bestScore) {
+        bestScore = score;
+        bestPos = pos;
+      }
+    }
+    return {bestPos, bestScore};
+  }
+
+  /// Terminal refine: collapse the pooled candidates to the top kDocs docs,
+  /// exact-rescoring approximate segments' vectors from the column.
+  /// Candidates are sorted by (segOrd, valueRank) first so the column is read
+  /// in ONE ordered sparse pass per segment (sequential mmap access instead
+  /// of score-order random access), and because valueRank order groups a
+  /// doc's vectors contiguously, the multi-valued max-sim collapse (bestInRun,
+  /// shared with the flat column engine's full scan) happens inline during
+  /// that same pass.  Collapsing before the score sort is legal precisely
+  /// because the surviving scores are exact - the engine's approximate
+  /// ranking no longer matters.  Candidates from segments NOT marked in
+  /// segApprox already carry exact scores: they keep them (no column read)
+  /// but still run-collapse, since a flat FAISS aux returns per-vector hits.
+  /// An empty segApprox rescores everything.
   static void rescoreAndCollapseCandidates(std::vector<VectorEngineHit>& candidates,
                                            IndexReader& reader,
                                            std::span<SegFieldInfo* const> segInfos,
                                            std::span<const SegV2D> v2dPerSeg,
+                                           std::span<const char> segApprox,
                                            const float* queryPtr,
                                            int32_t dims,
                                            int32_t metric,
@@ -1428,24 +1474,34 @@ private:
       if (info == nullptr) {
         throw std::runtime_error("KnnQuery: vector candidate segment has no field info");
       }
-      auto& vr = vectorReaders[(size_t)segOrd];
-      if (!vr) {
-        vr.emplace(reader.segments()[(size_t)segOrd].postingsReader(), *info);
+      const SegV2D& v2d = v2dPerSeg[(size_t)segOrd];
+
+      int32_t docId = v2d.resolve(candidates[i].valueRank);
+      size_t runEnd = i + 1;
+      while (runEnd < candidates.size()
+             && candidates[runEnd].segOrd == segOrd
+             && v2d.resolve(candidates[runEnd].valueRank) == docId) {
+        runEnd++;
       }
 
-      int32_t docId = v2dPerSeg[(size_t)segOrd].resolve(candidates[i].valueRank);
-      float bestScore = std::numeric_limits<float>::lowest();
-      do {
-        float score = exactScore(queryPtr, vr->vectorAtRank(candidates[i].valueRank),
-                                 dims, metric, normalizeColumnOnCosineRescore,
-                                 candidates[i].score);
-        bestScore = std::max(bestScore, score);
-        i++;
-      } while (i < candidates.size()
-               && candidates[i].segOrd == segOrd
-               && v2dPerSeg[(size_t)segOrd].resolve(candidates[i].valueRank) == docId);
-
+      float bestScore;
+      if (!segApprox.empty() && !segApprox[(size_t)segOrd]) {
+        bestScore = bestInRun((int64_t)i, (int64_t)runEnd, [&](int64_t c) {
+          return candidates[(size_t)c].score;
+        }).second;
+      } else {
+        auto& vr = vectorReaders[(size_t)segOrd];
+        if (!vr) {
+          vr.emplace(reader.segments()[(size_t)segOrd].postingsReader(), *info);
+        }
+        bestScore = bestInRun((int64_t)i, (int64_t)runEnd, [&](int64_t c) {
+          return exactScore(queryPtr, vr->vectorAtRank(candidates[(size_t)c].valueRank),
+                            dims, metric, normalizeColumnOnCosineRescore,
+                            candidates[(size_t)c].score);
+        }).second;
+      }
       docHits.push_back({segOrd, docId, bestScore});
+      i = runEnd;
     }
 
     std::sort(docHits.begin(), docHits.end(), [](const DocHit& a, const DocHit& b) {

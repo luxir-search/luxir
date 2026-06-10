@@ -51,6 +51,13 @@ struct VectorSearchResult {
   // False means hit.score is only an engine approximation; the host must
   // rescore from full-precision column vectors before sorting / doc collapse.
   bool scoresAreExact = false;
+  // Refinement when scoresAreExact is false: segments whose hits in this
+  // result carry exact scores anyway (a multi-engine merge where only some
+  // segments are approximate).  The host's terminal rescore keeps those
+  // hits' scores instead of re-reading their column vectors.  An engine that
+  // cannot attribute exactness per segment leaves this empty - every hit is
+  // then treated as approximate, which is always safe.
+  std::vector<int32_t> exactSegOrds;
   bool poolExhausted = false;
   bool breadthExhausted = true;
   // Engine's hint for the next useful breadth value (the smallest one that
