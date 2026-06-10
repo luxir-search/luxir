@@ -427,20 +427,24 @@ TEST_F(AnalysisTest, unicodeWordReuseAcrossValues) {
 // for both ASCII and multibyte input.
 TEST_F(AnalysisTest, wordSegmentationIsAllocationFree) {
   if (!memtrack::counting_enabled) GTEST_SKIP() << "allocation counter disabled under ASan";
-  static volatile size_t sink = 0;
+  // Returns {heap allocations, total segment bytes}; the byte count keeps the
+  // loop observable and lets us assert it actually produced segments.
   auto segAllocs = [](std::string_view in) {
-    size_t local = 0;
+    size_t bytes = 0;
     memtrack::AllocScope s;
-    for (std::string_view w : una::views::word_only::utf8(in)) local += w.size();
+    for (std::string_view w : una::views::word_only::utf8(in)) bytes += w.size();
     long allocs = s.count();
-    sink = local;  // observable store: forces the loop to actually run
-    return allocs;
+    return std::pair<long, size_t>(allocs, bytes);
   };
   std::string ascii = "the quick brown fox jumps over the lazy dog";
   std::string uni = "café 中文 naïve Ärger test";
 
   segAllocs(ascii);  // warm up (settle any one-time init)
   segAllocs(uni);
-  EXPECT_EQ(0, segAllocs(ascii));
-  EXPECT_EQ(0, segAllocs(uni));
+  auto [asciiAllocs, asciiBytes] = segAllocs(ascii);
+  auto [uniAllocs, uniBytes] = segAllocs(uni);
+  EXPECT_EQ(0, asciiAllocs);
+  EXPECT_EQ(0, uniAllocs);
+  EXPECT_GT(asciiBytes, 0u);  // the loops really produced segments
+  EXPECT_GT(uniBytes, 0u);
 }
