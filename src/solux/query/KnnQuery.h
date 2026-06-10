@@ -74,9 +74,16 @@ namespace solux {
 /// optional floor on the internal scan fraction; refine_candidates = pinned
 /// approximate pool size; exact = bypass ANN entirely (column scan contract).
 ///
-/// The active query domain (liveDocs intersected with any enclosing filter
-/// clauses) is pushed into the engine.  The column engine checks it directly
-/// while scanning docs; FAISS aux engines use a segment-local IDSelector.
+/// The active query domain is pushed into the engine as the COMPLETE
+/// eligibility predicate: per the PrepareContext contract it is already
+/// live-filtered (liveDocs intersected with any enclosing filter clauses),
+/// and a null domain means no deletes and no filters.  The column engine
+/// checks it directly while scanning docs.  FAISS aux engines pick the
+/// cheapest selector per segment: none at all when the domain is null (the
+/// scanner's per-vector check compiles out), a cached rank-space liveness
+/// bitmap when the domain is exactly liveDocs (built once per liveDocs
+/// generation, shared across queries), or a resolve-based IDSelector for
+/// per-query filtered domains.
 ///
 /// Multi-valued vector fields are supported via the segment's persisted
 /// valueRank->docId column (VectorReader::docForVectorRank).  The exact column
@@ -159,6 +166,11 @@ public:
   // query positions (e.g. kNN inside a boolean clause), which is otherwise
   // invisible because results are identical either way.
   static inline std::atomic<int64_t> parallelScanRoundsForTests{0};
+
+  // Test observability: rank-space liveness bitmap builds (cache misses).
+  // Lets tests assert the per-liveGen cache reuses across queries and
+  // rebuilds when new deletes commit.
+  static inline std::atomic<int64_t> rankLiveBitmapBuildsForTests{0};
 
   /// Resolves a segment-local value rank to its owning docId.  Exactly one mode is
   /// active per segment:
@@ -475,6 +487,13 @@ public:
       for (size_t i = 0; i < numSegs; i++) {
         int64_t segCount = segVectorCounts[i];
         if (segCount <= 0 || segInfos[i] == nullptr) continue;
+        IndexReader::Segment& seg = reader.segments()[i];
+        DocSet* domain = ctx.domainPerSeg.empty() ? nullptr : ctx.domainPerSeg[i];
+        // Domain contract (Query.h): a present domain is live-filtered and
+        // is the complete eligibility predicate; null means no deletes and
+        // no filters.  The engines rely on it - they never re-check
+        // liveDocs.
+        assert(domain != nullptr || seg.liveDocs() == nullptr);
         VectorAuxReader* vaux = vauxPerSeg[i];
         if (vaux != nullptr) {
           if (vaux->getDims() != dims) {
@@ -498,9 +517,18 @@ public:
           }
           bool isIvf = vaux->getEngine() == VectorAuxMeta::ENGINE_IVFPQ;
           approximateEngine = approximateEngine || !vaux->scoresAreExact();
+          // Rank-space liveness bitmap, cached on the aux reader per
+          // liveDocs generation: liveListSize accounting always reads it,
+          // and for an unfiltered query (domain == the liveDocs docset) it
+          // doubles as the whole FAISS eligibility selector.
+          std::shared_ptr<const std::vector<uint8_t>> rankLive;
+          if (seg.liveDocs() != nullptr) {
+            rankLive = vaux->rankLiveBitmap(seg.segInfo.live_gen, [&]() {
+              return buildRankLiveBitmap(v2dPerSeg[i], *seg.liveDocs(), segCount);
+            });
+          }
           auto faissEngine = std::make_unique<SegmentFaissVectorEngine>(
-            *idx, (int32_t)i, reader.segments()[i], v2dPerSeg[i],
-            ctx.domainPerSeg.empty() ? nullptr : ctx.domainPerSeg[i],
+            *idx, (int32_t)i, seg, v2dPerSeg[i], domain, std::move(rankLive),
             metric, vaux->scoresAreExact(), isIvf,
             vaux->getNList());
           SegmentFaissVectorEngine* ivfEngine = isIvf ? faissEngine.get() : nullptr;
@@ -513,8 +541,7 @@ public:
         } else {
           slots.push_back({
             .engine = std::make_unique<SegmentFlatColumnVectorEngine>(
-              (int32_t)i, reader.segments()[i], segInfos[i], v2dPerSeg[i],
-              ctx.domainPerSeg.empty() ? nullptr : ctx.domainPerSeg[i],
+              (int32_t)i, seg, segInfos[i], v2dPerSeg[i], domain,
               dims, metric, normalizeColumnOnCosineRescore),
             .vectorCount = segCount,
             .liveVectorCount = segLiveVectorCounts[i],
@@ -722,43 +749,45 @@ public:
     /// exists today (ENGINE_IVFPQ is the only one), so it is reserved seam
     /// surface, not a live code path.
     class SegmentFaissVectorEngine final : public VectorEngine {
+      /// Resolve-based eligibility selector over the live-filtered query
+      /// domain (the PrepareContext contract: a present domain already
+      /// includes liveDocs, so there is no separate liveness check).  FAISS
+      /// consults the selector per scanned vector, before the distance, so
+      /// this is the slow path - it is only used for per-query (filtered)
+      /// domains; the unfiltered-with-deletes case uses the cached
+      /// rank-space bitmap via faiss::IDSelectorBitmap instead, and the
+      /// no-deletes no-filter case passes no selector at all (the scanner's
+      /// per-vector check compiles out).
       class LocalDomainSelector final : public faiss::IDSelector {
-        int32_t segOrd;
-        IndexReader::Segment& seg;
         const SegV2D& v2d;
         DocSet* domain;
 
       public:
-        LocalDomainSelector(int32_t segOrd, IndexReader::Segment& seg,
-                            const SegV2D& v2d, DocSet* domain) noexcept
-          : segOrd(segOrd), seg(seg), v2d(v2d), domain(domain) {}
+        LocalDomainSelector(const SegV2D& v2d, DocSet* domain) noexcept
+          : v2d(v2d), domain(domain) {}
 
         bool is_member(faiss::idx_t id) const final {
           if (id < 0) return false;
-          int32_t docId = v2d.resolve((int64_t)id);
-          auto* live = seg.liveDocs();
-          if (live != nullptr && !live->bitset().get(docId)) return false;
-          if (domain != nullptr && !domain->get(docId)) return false;
-          unused(segOrd);
-          return true;
-        }
-
-        bool live_member(faiss::idx_t id) const {
-          if (id < 0) return false;
-          int32_t docId = v2d.resolve((int64_t)id);
-          auto* live = seg.liveDocs();
-          return live == nullptr || live->bitset().get(docId);
-        }
-
-        bool hasDeletes() const noexcept {
-          return seg.liveDocs() != nullptr;
+          return domain->get(v2d.resolve((int64_t)id));
         }
       };
 
       faiss::Index& index;
       faiss::IndexIVF* ivf;
       int32_t segOrd;
-      LocalDomainSelector selector;
+      const SegV2D& v2d;
+      LiveDocs* liveDocs;
+      // Rank-space liveness bitmap, present iff the segment has deletes
+      // (shared from the VectorAuxReader's per-liveGen cache).  liveListSize
+      // always reads it; it doubles as the FAISS selector when the domain is
+      // exactly liveDocs (unfiltered query).
+      std::shared_ptr<const std::vector<uint8_t>> rankLiveBits;
+      std::optional<faiss::IDSelectorBitmap> bitmapSelector;
+      std::optional<LocalDomainSelector> domainSelector;
+      // Selector handed to FAISS scans: &bitmapSelector when the domain is
+      // liveDocs itself, &domainSelector for filtered domains, null when the
+      // segment needs no filtering.
+      const faiss::IDSelector* sel = nullptr;
       int32_t metric;
       bool exactScores;
       bool isIvf;
@@ -770,6 +799,7 @@ public:
                                IndexReader::Segment& seg,
                                const SegV2D& v2d,
                                DocSet* domain,
+                               std::shared_ptr<const std::vector<uint8_t>>&& rankLive,
                                int32_t metric,
                                bool exactScores,
                                bool isIvf,
@@ -777,13 +807,25 @@ public:
         : index(index),
           ivf(isIvf ? dynamic_cast<faiss::IndexIVF*>(&index) : nullptr),
           segOrd(segOrd),
-          selector(segOrd, seg, v2d, domain),
+          v2d(v2d),
+          liveDocs(seg.liveDocs()),
+          rankLiveBits(std::move(rankLive)),
           metric(metric),
           exactScores(exactScores),
           isIvf(isIvf),
           nlist(nlist) {
         if (isIvf && ivf == nullptr) {
           throw std::runtime_error("KnnQuery: vector aux marked IVF but FAISS index is not IndexIVF");
+        }
+        assert((liveDocs != nullptr) == (rankLiveBits != nullptr));
+        if (domain != nullptr) {
+          if (liveDocs != nullptr && domain == &liveDocs->docset()) {
+            bitmapSelector.emplace(rankLiveBits->size(), rankLiveBits->data());
+            sel = &*bitmapSelector;
+          } else {
+            domainSelector.emplace(v2d, domain);
+            sel = &*domainSelector;
+          }
         }
       }
 
@@ -804,22 +846,23 @@ public:
       /// Live vector count of one IVF list - the unit the global allocator
       /// charges against the scan-fraction budget (cost = liveListSize / N).
       /// Uses the ACTUAL invlist length so list imbalance prices correctly
-      /// (full selection always sums to ~N).  Under deletes this walks the
-      /// list's ids once to count live members - acceptable because it is
-      /// only called for lists the allocator actually selects (or peeks for
-      /// nextBreadth), never all of them; liveness only (not the query
-      /// domain), matching the live-N denominator.
+      /// (full selection always sums to ~N).  Under deletes this reads the
+      /// cached rank-space liveness bitmap per id (no rank -> doc resolve);
+      /// liveness only (not the query domain), matching the live-N
+      /// denominator.
       int64_t liveListSize(faiss::idx_t listId) const {
         assert(ivf != nullptr);
         if (listId < 0 || listId >= nlist) return 0;
         size_t rawSize = ivf->invlists->list_size((size_t)listId);
         if (rawSize == 0) return 0;
-        if (!selector.hasDeletes()) return (int64_t)rawSize;
+        if (liveDocs == nullptr) return (int64_t)rawSize;
 
+        const uint8_t* bits = rankLiveBits->data();
         int64_t liveSize = 0;
         const faiss::idx_t* listIds = ivf->invlists->get_ids((size_t)listId);
         for (size_t i = 0; i < rawSize; i++) {
-          if (selector.live_member(listIds[i])) liveSize++;
+          uint64_t r = (uint64_t)listIds[i];
+          liveSize += (bits[r >> 3] >> (r & 7)) & 1;
         }
         ivf->invlists->release_ids((size_t)listId, listIds);
         return liveSize;
@@ -851,8 +894,9 @@ public:
 
         faiss::SearchParametersIVF ivfParams;
         // FAISS declares sel as a mutable pointer but only calls const
-        // members on it during search.
-        ivfParams.sel = const_cast<LocalDomainSelector*>(&selector);
+        // members on it during search.  null when the segment needs no
+        // filtering - the scanner then compiles the per-vector check out.
+        ivfParams.sel = const_cast<faiss::IDSelector*>(sel);
         // max_codes remains 0: selected IVF lists are scanned in full.
         ivfParams.nprobe = listIds.size();
         // Local stats sink, discarded: with a null stats argument FAISS does
@@ -908,7 +952,7 @@ public:
         std::vector<float> dists((size_t)request.candidates, 0.0f);
 
         faiss::SearchParameters flatParams;
-        flatParams.sel = &selector;
+        flatParams.sel = const_cast<faiss::IDSelector*>(sel);
         index.search(1, request.query, request.candidates, dists.data(), ids.data(), &flatParams);
 
         VectorSearchResult result;
@@ -1048,11 +1092,11 @@ public:
       }
 
     private:
+      // The domain, when present, is live-filtered and is the complete
+      // eligibility predicate (PrepareContext contract); null means the
+      // segment has no deletes and no filters.
       bool docEligible(int32_t docId) const {
-        auto* live = seg.liveDocs();
-        if (live != nullptr && !live->bitset().get(docId)) return false;
-        if (domain != nullptr && !domain->get(docId)) return false;
-        return true;
+        return domain == nullptr || domain->get(docId);
       }
     };
 
@@ -1608,6 +1652,46 @@ public:
 
 private:
   static constexpr double MIN_COSINE_NORM_SQ = 1.0e-30;
+
+  /// Build the rank-space liveness bitmap for one segment's vector field:
+  /// bit r is set iff the doc owning vector rank r is live.  LSB-first
+  /// bytes, the faiss::IDSelectorBitmap layout.  O(numVectors), run once per
+  /// liveDocs generation (cached on the VectorAuxReader); multi-valued walks
+  /// the valDoc map sequentially and checks each doc run once.
+  static std::vector<uint8_t> buildRankLiveBitmap(const SegV2D& v2d,
+                                                  LiveDocs& live,
+                                                  int64_t numVectors) {
+    rankLiveBitmapBuildsForTests.fetch_add(1, std::memory_order_relaxed);
+    std::vector<uint8_t> bits(((size_t)numVectors + 7) / 8, 0);
+    const auto& liveBits = live.bitset();
+    if (v2d.mono != nullptr) {
+      MonoReader::BulkValues valDoc(*v2d.mono);
+      int64_t idx = valDoc.next();
+      int64_t rank = 0;
+      while (rank < numVectors) {
+        int32_t docId = (int32_t)valDoc.value();
+        int64_t end = rank;
+        do {
+          end++;
+          idx = valDoc.next();
+        } while (end < numVectors && (int32_t)valDoc.value() == docId);
+        unused(idx);
+        if (liveBits.get(docId)) {
+          for (int64_t r = rank; r < end; r++) {
+            bits[(size_t)(r >> 3)] |= (uint8_t)(1u << (r & 7));
+          }
+        }
+        rank = end;
+      }
+    } else {
+      for (int64_t r = 0; r < numVectors; r++) {
+        if (liveBits.get(v2d.resolve(r))) {
+          bits[(size_t)(r >> 3)] |= (uint8_t)(1u << (r & 7));
+        }
+      }
+    }
+    return bits;
+  }
 
   /// O(1) UPPER BOUND on a segment's live vector count, used as the budget
   /// denominator (referenceBreadth, list-cost normalization) and the

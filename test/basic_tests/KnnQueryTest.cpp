@@ -1352,18 +1352,30 @@ TEST_F(KnnQueryTest, parallelChunkedScanMatchesSerialAndExact) {
   h.clear();
   installVecSchema(h.collection(), proto::VectorParams::L2);
 
-  for (int i = 0; i < 80; i++) {
+  // 160 vectors per segment: above the PQ training floor (39 * 2^bits =
+  // 156 at bits=2) so these segments genuinely build IVF - below it the
+  // builder silently falls back to flat and this test would pass without
+  // exercising IVF chunking at all (asserted below).
+  for (int i = 0; i < 160; i++) {
     h.index(flatdoc("id", "a" + std::to_string(i),
                     "embedding_v", std::vector<float>{(float)i, 0.0f, 0.0f, 0.0f}));
     if (i % 7 == 0) h.index(flatdoc("id", "ga" + std::to_string(i)));
   }
   h.commit({"*"});
 
-  for (int i = 0; i < 80; i++) {
+  for (int i = 0; i < 160; i++) {
     h.index(flatdoc("id", "b" + std::to_string(i),
                     "embedding_v", std::vector<float>{(float)i + 0.5f, 0.0f, 0.0f, 0.0f}));
   }
   h.commit({"*"});
+  {
+    auto reader = h.getIndexWriter()->getIndexReader();
+    ASSERT_EQ(reader->segments().size(), 2u);
+    ASSERT_NE(reader->segments()[0].getAuxReader("vec.embedding_v"), nullptr)
+        << "segment 0 fell back to flat (below IVF training floor)";
+    ASSERT_NE(reader->segments()[1].getAuxReader("vec.embedding_v"), nullptr)
+        << "segment 1 fell back to flat (below IVF training floor)";
+  }
 
   // Plain commit: no aux build for this segment, so it scans flat.
   h.index(flatdoc("id", std::string("tiny0"),
@@ -1374,8 +1386,10 @@ TEST_F(KnnQueryTest, parallelChunkedScanMatchesSerialAndExact) {
   h.deleteByIds(dels, UpdateMessage::COMMIT);
 
   std::vector<float> queryVec{40.3f, 0.0f, 0.0f, 0.0f};
+  // refine_candidates covers every live vector, so the terminal rescore is
+  // exhaustive and exact parity is guaranteed, not k-means-placement luck.
   auto* par = makeKnnReq(*soluxNode, "embedding_v", queryVec, 10,
-                         /*nprobe=*/0, /*refineCandidates=*/200,
+                         /*nprobe=*/0, /*refineCandidates=*/400,
                          /*exact=*/false, /*minScanFraction=*/1.0f);
   par->execute(/*parallel=*/true);
   auto parIds = resultIds(*par);
@@ -1383,7 +1397,7 @@ TEST_F(KnnQueryTest, parallelChunkedScanMatchesSerialAndExact) {
   par->done();
 
   auto* ser = makeKnnReq(*soluxNode, "embedding_v", queryVec, 10,
-                         /*nprobe=*/0, /*refineCandidates=*/200,
+                         /*nprobe=*/0, /*refineCandidates=*/400,
                          /*exact=*/false, /*minScanFraction=*/1.0f);
   ser->execute(/*parallel=*/false);
   auto serIds = resultIds(*ser);
@@ -1391,7 +1405,7 @@ TEST_F(KnnQueryTest, parallelChunkedScanMatchesSerialAndExact) {
   ser->done();
 
   auto* exact = makeKnnReq(*soluxNode, "embedding_v", queryVec, 10,
-                           /*nprobe=*/0, /*refineCandidates=*/200, /*exact=*/true);
+                           /*nprobe=*/0, /*refineCandidates=*/400, /*exact=*/true);
   exact->execute();
   auto exactIds = resultIds(*exact);
   exact->done();
@@ -1419,7 +1433,8 @@ TEST_F(KnnQueryTest, parallelMultiValuedIvfMatchesSerial) {
   h.clear();
   installMultiVecSchema(h.collection(), proto::VectorParams::L2);
 
-  for (int i = 0; i < 40; i++) {
+  // Vector counts (180 and 160) sit above the PQ training floor of 156.
+  for (int i = 0; i < 60; i++) {
     float base = (float)i;
     h.index(flatdoc("id", "a" + std::to_string(i), "emb_vs",
                     std::vector<std::vector<float>>{
@@ -1428,7 +1443,7 @@ TEST_F(KnnQueryTest, parallelMultiValuedIvfMatchesSerial) {
                       {base, 2.0f, 0.0f, 0.0f}}));
   }
   h.commit({"*"});
-  for (int i = 0; i < 40; i++) {
+  for (int i = 0; i < 80; i++) {
     float base = (float)i + 0.5f;
     h.index(flatdoc("id", "b" + std::to_string(i), "emb_vs",
                     std::vector<std::vector<float>>{
@@ -1436,6 +1451,14 @@ TEST_F(KnnQueryTest, parallelMultiValuedIvfMatchesSerial) {
                       {base, 1.0f, 0.0f, 0.0f}}));
   }
   h.commit({"*"});
+  {
+    auto reader = h.getIndexWriter()->getIndexReader();
+    ASSERT_EQ(reader->segments().size(), 2u);
+    ASSERT_NE(reader->segments()[0].getAuxReader("vec.emb_vs"), nullptr)
+        << "segment 0 fell back to flat (below IVF training floor)";
+    ASSERT_NE(reader->segments()[1].getAuxReader("vec.emb_vs"), nullptr)
+        << "segment 1 fell back to flat (below IVF training floor)";
+  }
 
   std::vector<float> queryVec{20.2f, 0.0f, 0.0f, 0.0f};
   auto* par = makeKnnReq(*soluxNode, "emb_vs", queryVec, 10,
@@ -1470,16 +1493,21 @@ TEST_F(KnnQueryTest, booleanNestedKnnPropagatesParallelism) {
   h.clear();
   installVecSchema(h.collection(), proto::VectorParams::L2);
 
-  for (int i = 0; i < 80; i++) {
+  for (int i = 0; i < 160; i++) {
     h.index(flatdoc("id", "a" + std::to_string(i), "foo_w", "apple",
                     "embedding_v", std::vector<float>{(float)i, 0.0f, 0.0f, 0.0f}));
   }
   h.commit({"*"});
-  for (int i = 0; i < 80; i++) {
+  for (int i = 0; i < 160; i++) {
     h.index(flatdoc("id", "b" + std::to_string(i), "foo_w", "apple",
                     "embedding_v", std::vector<float>{(float)i + 0.5f, 0.0f, 0.0f, 0.0f}));
   }
   h.commit({"*"});
+  {
+    auto reader = h.getIndexWriter()->getIndexReader();
+    ASSERT_NE(reader->segments()[0].getAuxReader("vec.embedding_v"), nullptr)
+        << "segment 0 fell back to flat (below IVF training floor)";
+  }
 
   auto* req = LocalReq::create(soluxNode->getSearchEngine());
   req->proto.mutable_collection()->add_name("main");
@@ -1502,6 +1530,133 @@ TEST_F(KnnQueryTest, booleanNestedKnnPropagatesParallelism) {
       << "nested kNN never spawned parallel scan tasks";
   EXPECT_EQ(req->getMatchCount(), 5);
   req->done();
+}
+
+// Unfiltered queries on a segment with deletes use the rank-space liveness
+// bitmap as the whole FAISS selector, built ONCE per liveDocs generation and
+// cached on the aux reader: a second query must not rebuild it, and a commit
+// with new deletes must.  Results stay correct against the exact contract in
+// both generations (the bitmap IS the eligibility filtering here - a stale
+// or mis-keyed cache would surface deleted docs).
+TEST_F(KnnQueryTest, ivfDeletesUseCachedRankLiveBitmap) {
+  IvfPqAuxGuard guard(/*nlist=*/4, /*m=*/2, /*bits=*/2,
+                      /*nprobe=*/4, /*minTraining=*/16, /*refineRatio=*/8);
+  CollectionHelper h("main");
+  h.clear();
+  installVecSchema(h.collection(), proto::VectorParams::L2);
+
+  for (int i = 0; i < 160; i++) {
+    h.index(flatdoc("id", "d" + std::to_string(i),
+                    "embedding_v", std::vector<float>{(float)i, 0.0f, 0.0f, 0.0f}));
+  }
+  h.commit({"*"});
+  {
+    auto reader = h.getIndexWriter()->getIndexReader();
+    ASSERT_EQ(reader->segments().size(), 1u);
+    ASSERT_NE(reader->segments()[0].getAuxReader("vec.embedding_v"), nullptr)
+        << "segment fell back to flat (below IVF training floor)";
+  }
+  std::vector<std::string> dels{"d40"};
+  h.deleteByIds(dels, UpdateMessage::COMMIT);
+
+  {
+    auto reader = h.getIndexWriter()->getIndexReader();
+    ASSERT_EQ(reader->segments().size(), 1u);
+    ASSERT_NE(reader->segments()[0].liveDocs(), nullptr) << "delete did not produce liveDocs";
+    ASSERT_NE(reader->segments()[0].getAuxReader("vec.embedding_v"), nullptr)
+        << "IVF overlay missing after delete commit";
+  }
+
+  auto runAndCheck = [&](const std::string& deletedId) {
+    auto* req = makeKnnReq(*soluxNode, "embedding_v", {40.3f, 0.0f, 0.0f, 0.0f}, 5,
+                           /*nprobe=*/0, /*refineCandidates=*/200,
+                           /*exact=*/false, /*minScanFraction=*/1.0f);
+    req->execute();
+    auto ids = resultIds(*req);
+    req->done();
+    auto* exact = makeKnnReq(*soluxNode, "embedding_v", {40.3f, 0.0f, 0.0f, 0.0f}, 5,
+                             /*nprobe=*/0, /*refineCandidates=*/200, /*exact=*/true);
+    exact->execute();
+    auto exactIds = resultIds(*exact);
+    exact->done();
+    EXPECT_EQ(ids, exactIds);
+    for (const auto& id : ids) EXPECT_NE(id, deletedId);
+  };
+
+  int64_t builds0 = KnnQuery::rankLiveBitmapBuildsForTests.load(std::memory_order_relaxed);
+  runAndCheck("d40");
+  int64_t builds1 = KnnQuery::rankLiveBitmapBuildsForTests.load(std::memory_order_relaxed);
+  EXPECT_EQ(builds1, builds0 + 1) << "first query builds the bitmap";
+  runAndCheck("d40");
+  int64_t builds2 = KnnQuery::rankLiveBitmapBuildsForTests.load(std::memory_order_relaxed);
+  EXPECT_EQ(builds2, builds1) << "second query must reuse the cached bitmap";
+
+  std::vector<std::string> dels2{"d41"};
+  h.deleteByIds(dels2, UpdateMessage::COMMIT);
+  runAndCheck("d41");
+  int64_t builds3 = KnnQuery::rankLiveBitmapBuildsForTests.load(std::memory_order_relaxed);
+  EXPECT_EQ(builds3, builds2 + 1) << "new liveGen must rebuild the bitmap";
+}
+
+// Filtered query on an IVF segment with deletes: the domain is filter
+// intersect liveDocs (NOT the liveDocs docset itself), so eligibility goes
+// through the resolve-based selector while the allocator's live accounting
+// reads the cached bitmap.  Per the live-filtered domain contract the
+// engines never re-check liveDocs - a violation would surface the deleted
+// doc here.
+TEST_F(KnnQueryTest, ivfFilteredQueryWithDeletesMatchesExact) {
+  IvfPqAuxGuard guard(/*nlist=*/4, /*m=*/2, /*bits=*/2,
+                      /*nprobe=*/4, /*minTraining=*/16, /*refineRatio=*/8);
+  CollectionHelper h("main");
+  h.clear();
+  installVecSchema(h.collection(), proto::VectorParams::L2);
+
+  for (int i = 0; i < 160; i++) {
+    h.index(flatdoc("id", "d" + std::to_string(i),
+                    "color_s", (i % 2 == 0) ? "red" : "blue",
+                    "embedding_v", std::vector<float>{(float)i, 0.0f, 0.0f, 0.0f}));
+  }
+  h.commit({"*"});
+  {
+    auto reader = h.getIndexWriter()->getIndexReader();
+    ASSERT_NE(reader->segments()[0].getAuxReader("vec.embedding_v"), nullptr)
+        << "segment fell back to flat (below IVF training floor)";
+  }
+  // d40 is red and nearest the query; deleting it must remove it even
+  // though it passes the filter.
+  std::vector<std::string> dels{"d40"};
+  h.deleteByIds(dels, UpdateMessage::COMMIT);
+
+  auto makeFiltered = [&](bool exact) {
+    auto* req = makeKnnReq(*soluxNode, "embedding_v", {40.3f, 0.0f, 0.0f, 0.0f}, 5,
+                           /*nprobe=*/0, /*refineCandidates=*/200,
+                           exact, exact ? 0.0f : 1.0f);
+    auto& topDocs = *(*req->proto.mutable_ops())["q"].mutable_top_docs();
+    auto& nf = *topDocs.add_filter();
+    nf.set_name("red");
+    auto& m = *nf.mutable_query()->mutable_match();
+    m.set_field("color_s");
+    m.mutable_val()->set_s("red");
+    return req;
+  };
+
+  auto* req = makeFiltered(false);
+  req->execute();
+  auto ids = resultIds(*req);
+  req->done();
+
+  auto* exact = makeFiltered(true);
+  exact->execute();
+  auto exactIds = resultIds(*exact);
+  exact->done();
+
+  ASSERT_EQ(ids.size(), 5u);
+  EXPECT_EQ(ids, exactIds);
+  EXPECT_EQ(ids[0], "d42");  // nearest red after d40's deletion
+  for (const auto& id : ids) {
+    EXPECT_NE(id, "d40") << "deleted doc must not appear despite passing the filter";
+    EXPECT_NE(id, "d41") << "blue doc must not pass the red filter";
+  }
 }
 
 // A NaN/Inf query vector is rejected loudly: NaN scores would break the

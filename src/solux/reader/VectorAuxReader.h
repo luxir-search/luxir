@@ -211,6 +211,16 @@ class VectorAuxReader : public AuxReader {
   mutable std::unique_ptr<MmapInvertedLists> mmapLists;
   mutable std::unique_ptr<faiss::Index> faissIndex;
   VectorAuxMeta meta;
+  // Cached rank-space liveness bitmap (see KnnQuery): bit r is set iff the
+  // doc owning vector rank r is live.  Built once per liveDocs generation
+  // and shared by every query against this (segment, field) - the FAISS
+  // eligibility selector for unfiltered queries and the allocator's
+  // live-list accounting both read it instead of resolving rank -> doc ->
+  // liveDocs per scanned vector.  Keyed by liveGen, so a reader version
+  // with newer deletes rebuilds.
+  mutable std::mutex rankLiveMutex;
+  mutable uint64_t rankLiveGen = 0;
+  mutable std::shared_ptr<const std::vector<uint8_t>> rankLiveBits;
 
 public:
   static constexpr std::string_view KIND = "vector_faiss";
@@ -296,6 +306,22 @@ public:
       faissIndex = std::move(idx);
     });
     return faissIndex.get();
+  }
+
+  /// Get-or-build the rank-space liveness bitmap for the given liveDocs
+  /// generation.  build() runs at most once per generation (under the lock;
+  /// concurrent first callers wait rather than duplicate the O(numVectors)
+  /// walk) and must return ceil(numVectors / 8) LSB-first bytes, the layout
+  /// faiss::IDSelectorBitmap consumes.
+  template <typename Build>
+  std::shared_ptr<const std::vector<uint8_t>> rankLiveBitmap(uint64_t liveGen,
+                                                             Build&& build) const {
+    std::lock_guard<std::mutex> lock(rankLiveMutex);
+    if (rankLiveBits == nullptr || rankLiveGen != liveGen) {
+      rankLiveBits = std::make_shared<const std::vector<uint8_t>>(build());
+      rankLiveGen = liveGen;
+    }
+    return rankLiveBits;
   }
 
   /// Open the FAISS index referenced by `info`.  Returns nullptr when the

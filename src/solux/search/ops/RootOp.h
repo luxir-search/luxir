@@ -42,7 +42,10 @@ public:
           // int32_t segnum = (int32_t)segs.size() - 1 - i; // launch in reverse order to get the first segments done first.
           int32_t segnum = i; // launch in order for later (smaller) segments to start in this thread first.
           auto& seg = segs[segnum];
-          // For the domains, start with live docs.
+          // For the domains, start with live docs.  This establishes the
+          // PrepareContext domain contract (Query.h): a segment's domain,
+          // when present, is live-filtered and is the complete eligibility
+          // predicate; null means no deletes and no filters.
           DocSet* domainPtr = seg.liveDocs() ? &seg.liveDocs()->docset() : nullptr;
           task_group_run(tg, [this, segnum, domainPtr, tg,  &subCalc]() {
             // call the calc method on each sub-calculator

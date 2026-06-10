@@ -351,6 +351,15 @@ public:
 
     /// Per-segment domains available during prepare(). An empty domain span
     /// means unrestricted aside from whatever the caller applies later.
+    ///
+    /// Domain contract: a segment's domain, when present, is LIVE-FILTERED -
+    /// it is liveDocs intersected with any enclosing filter clauses, and is
+    /// the complete eligibility predicate (consumers must not re-check
+    /// liveDocs).  A null domain means the segment has no deletes and no
+    /// enclosing filters.  RootOp establishes this by seeding every
+    /// segment's base domain with liveDocs; every domain-deriving seam
+    /// (filter materialization, boolean child contexts) preserves it.
+    ///
     /// parallel is true when the request runs under a TBB task group; a
     /// prepare() implementation may then spawn internal worker tasks, provided
     /// they are joined before prepare() returns.  false means the request is
