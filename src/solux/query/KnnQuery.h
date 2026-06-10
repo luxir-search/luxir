@@ -40,12 +40,32 @@ namespace solux {
 /// kNN query against a vector field.
 ///
 /// Execution model: kNN is globally bounded, so search materializes once during
-/// the query preparation phase.  The default exact engine scans each segment's
-/// vector column directly; a test / benchmark FAISS-flat aux engine remains,
-/// and IVF+PQ aux indexes dispatch through the same seam.
-/// Hits cross the seam as (segment, valueRank, score), then are collapsed to
-/// docs and bucketed per segment in docId order for the segment-parallel
-/// TopDocsReq pipeline.
+/// the query preparation phase (Weight::prepare), then scores replay from
+/// per-segment hit arrays.  prepare() runs four stages:
+///
+///   1. Resolve per segment: field info, valueRank->docId resolver (SegV2D),
+///      vector counts, and the "vec.<field>" overlay aux reader if present.
+///   2. Build one engine slot per segment behind the VectorEngine seam:
+///      SegmentFlatColumnVectorEngine (exact brute-force over the mmapped
+///      column - the default and the below-IVF-threshold fallback) or
+///      SegmentFaissVectorEngine (IVF+PQ aux, approximate).  All slots are
+///      wrapped in one CompositeVectorEngine, which owns global IVF list
+///      allocation across segments (see its class comment).
+///   3. WIDEN: the host loop below re-enters engine->search() until enough
+///      distinct live docs are pooled, deepening along two axes (candidate
+///      depth, then IVF breadth).  All widening runs on engine scores; exact
+///      rescore never influences the loop.
+///   4. REFINE once: a single terminal pass rescores the pooled candidates
+///      from the full-precision column, collapses multi-valued hits to docs,
+///      and cuts the global top-k.  Hits are then bucketed per segment in
+///      docId order for the segment-parallel TopDocsReq pipeline.
+///
+/// Request knobs (see KnnQuery message in solux_types.proto for the wire
+/// contract): k = docs to return; nprobe = merge-stable IVF effort (lists to
+/// probe as if the field were ONE IVF index with nlist=sqrt(live vectors) -
+/// explicit pins the effort, 0 adapts and auto-deepens); min_scan_fraction =
+/// optional floor on the internal scan fraction; refine_candidates = pinned
+/// approximate pool size; exact = bypass ANN entirely (column scan contract).
 ///
 /// The active query domain (liveDocs intersected with any enclosing filter
 /// clauses) is pushed into the engine.  The column engine checks it directly
@@ -54,10 +74,9 @@ namespace solux {
 /// Multi-valued vector fields are supported via the segment's persisted
 /// valueRank->docId column (VectorReader::docForVectorRank).  The exact column
 /// engine collapses a doc's vectors while scanning and returns one best vector
-/// per doc.  Approximate aux engines may return vector candidates instead; the
-/// host loop unions, rescans exact scores when needed, sorts, and collapses
-/// before publishing the global top-k docs.  Above maxKnnCandidates the result
-/// is best-effort.
+/// per doc.  Approximate aux engines return vector candidates instead; the
+/// host pools them and the terminal refine collapses.  Above maxKnnCandidates
+/// the result is best-effort.
 class KnnQuery final : public solux::Query {
   std::string_view field;
   const VectorFieldType& fieldType;
@@ -476,12 +495,32 @@ public:
         engine = wrapperEngine.get();
       }
 
+      // breadth carries the request nprobe in REFERENCE-index units (lists of
+      // a hypothetical single nlist=sqrt(N) IVF index; the composite engine
+      // converts it to a scan fraction).  Explicit nprobe pins the effort cap
+      // (breadth == maxBreadth, no deepening past it); 0 starts at the
+      // engine's adaptive default and may deepen up to maxKnnBreadth.
       int32_t breadth = query.getNProbe() > 0 ? query.getNProbe() : 0;
       int32_t maxBreadth = query.getNProbe() > 0
         ? query.getNProbe()
         : std::max(0, maxKnnBreadth);
       bool candidatePoolSorted = true;
       bool candidateScoresExact = true;
+      // WIDEN loop: pool candidates until targetDocReq distinct live docs (or
+      // a pool/breadth/cap limit).  Two deepen axes, tried in order:
+      //   DEPTH   - the engine pool was not exhausted at this candidate count:
+      //             grow kReq (more candidates from the same lists / scan).
+      //   BREADTH - pool exhausted but more IVF lists remain: grow breadth
+      //             (the engine allocates the next globally-best lists).
+      // The whole loop runs on ENGINE scores (exact for column slots,
+      // approximate for IVF+PQ): the stopping condition is a distinct-doc
+      // COUNT, which approximate scores answer just as well, so exact rescore
+      // is deferred to one terminal pass after the loop.  Deliberately not
+      // overlapped with rescore: interleaving would re-read column vectors
+      // for segments that later rounds add candidates to, trading throughput
+      // under load for latency.  seenVectors dedups across rounds because
+      // depth rounds re-return prior hits (FAISS has no resumable cursor) and
+      // flat slots re-run on breadth rounds.
       for (;;) {
         VectorSearchRequest request{
           .query = queryPtr,
@@ -530,6 +569,13 @@ public:
         break;
       }
 
+      // REFINE: one terminal exact pass over the whole pooled candidate set.
+      // Running it once (instead of per widen round) means each segment's
+      // sorted sparse column read happens exactly once, and no incremental
+      // "already rescored" bookkeeping is needed.  The full pool (not just
+      // targetDocReq docs) feeds the rescore, so exact scores can promote any
+      // pooled vector into the final top-k.  All-exact pools skip it; their
+      // loop-time collapse used targetDocReq, so re-cut to kDocs if larger.
       if (!candidateScoresExact && !candidateHits.empty()) {
         rescoreAndCollapseCandidates(candidateHits,
                                      reader,
@@ -571,6 +617,17 @@ public:
     }
 
   private:
+    /// Per-segment adapter over a deserialized FAISS aux index.  FAISS ids are
+    /// segment-local valueRanks, mapped to docIds through SegV2D by the
+    /// selector and by the host after collapse.
+    ///
+    /// IVF indexes do not drive themselves: the CompositeVectorEngine's global
+    /// allocator calls coarseRun() (full sorted centroid ranking) and
+    /// liveListSize() to pick lists across ALL segments, then hands the chosen
+    /// lists back through searchSelectedLists().  The plain search() override
+    /// is the whole-index path for non-IVF FAISS kinds; no such aux kind
+    /// exists today (ENGINE_IVFPQ is the only one), so it is reserved seam
+    /// surface, not a live code path.
     class SegmentFaissVectorEngine final : public VectorEngine {
       class LocalDomainSelector final : public faiss::IDSelector {
         int32_t segOrd;
@@ -653,6 +710,14 @@ public:
         ivf->quantizer->search(1, query, nlist, centroidDists.data(), listIds.data());
       }
 
+      /// Live vector count of one IVF list - the unit the global allocator
+      /// charges against the scan-fraction budget (cost = liveListSize / N).
+      /// Uses the ACTUAL invlist length so list imbalance prices correctly
+      /// (full selection always sums to ~N).  Under deletes this walks the
+      /// list's ids once to count live members - acceptable because it is
+      /// only called for lists the allocator actually selects (or peeks for
+      /// nextBreadth), never all of them; liveness only (not the query
+      /// domain), matching the live-N denominator.
       int64_t liveListSize(faiss::idx_t listId) const {
         assert(ivf != nullptr);
         if (listId < 0 || listId >= nlist) return 0;
@@ -709,6 +774,11 @@ public:
           });
         }
 
+        // Drained if FAISS could not fill the heap (fewer selector-passing
+        // members than requested) or if every live vector in the scanned
+        // lists already fit (selectedLiveVectors is tail-only on a breadth
+        // round - prior lists were drained at this depth before the host
+        // grew breadth, so the tail decides alone).
         result.poolExhausted = liveHits < request.candidates
           || selectedLiveVectors <= request.candidates;
         return result;
@@ -918,6 +988,27 @@ public:
       }
     };
 
+    /// One VectorEngine over all per-segment slots.  Owns the cross-segment
+    /// policy so individual segments never self-allocate effort:
+    ///
+    ///   - Budget: request.breadth (nprobe in reference-index units) becomes
+    ///     a scan fraction P = breadth / defaultIvfNList(liveN), floored by
+    ///     min_scan_fraction.  Denominating effort in fraction-of-index makes
+    ///     it MERGE-STABLE: a raw per-segment list count would scan ~sqrt(2)x
+    ///     more before a merge than after, so a tuned query would degrade on
+    ///     the next merge through no data change.
+    ///   - Allocation: every IVF segment contributes its full centroid-sorted
+    ///     list ranking; a lazy k-way merge pops the globally best list and
+    ///     charges its live size / liveN until P is spent.  Small segments
+    ///     thus get small (or zero) shares instead of equal work.
+    ///   - Deepening: the merge heap and per-slot cursors persist across
+    ///     search() calls; a breadth round just keeps popping where the last
+    ///     round stopped.  Flat (column / non-IVF) slots ignore breadth.
+    ///
+    /// SINGLE-SHOT lifecycle: coarseReady, cursors, watermarks and
+    /// lastScannedCandidates mutate monotonically across search() rounds of
+    /// ONE query.  prepare() builds a fresh instance per query; reusing one
+    /// across queries would silently serve the old query's coarse ranking.
     class CompositeVectorEngine final : public VectorEngine {
       std::vector<EngineSlot> slots;
       int64_t totalVectors;
@@ -944,6 +1035,15 @@ public:
         }
       };
 
+      // Coarse-selection state, persisted across deepen rounds (this IS the
+      // resumable breadth state).  Per slot: runs holds the full sorted
+      // (listId, centroidDist) ranking from coarseRun(); cursors[i] is the
+      // k-way-merge position into it.  heads/heapIndexes/heapSize back the
+      // IndexedPQ of each slot's current head, keyed by centroid score -
+      // updateTop() (replace-top) advances a slot in one sift, the same heap
+      // discipline the doc collectors use.  selected* accumulate the
+      // allocation in global pop order; selectedCentroidDists stays 1:1 with
+      // selectedListIds because search_preassigned consumes them paired.
       std::vector<CoarseRun> runs;
       std::vector<size_t> cursors;
       std::vector<CoarseHead> heads;
@@ -971,6 +1071,12 @@ public:
         return a.valueRank < b.valueRank;
       }
 
+      // Candidate count for a FLAT (exact) slot: its proportional share of the
+      // request, floored at kDocs so a small segment can still supply all k
+      // docs by itself.  Deliberately smaller than the IVF slots' full kReq:
+      // the over-fetch headroom in kReq exists so approximate scores can be
+      // reordered by the exact rescore, and flat scores are already exact -
+      // a flat slot's top-kDocs are final, no reorder headroom needed.
       int64_t candidatesForSlot(int64_t requested, int64_t n) const {
         if (requested <= 0 || n <= 0) return 0;
         long double proportional = ((long double)requested * (long double)n)
@@ -1056,6 +1162,13 @@ public:
         return std::max(1, (int32_t)breadth);
       }
 
+      // Extend the global allocation until the requested scan fraction is
+      // covered.  Lazy k-way merge over all slots' centroid-sorted runs: pop
+      // the globally closest list, charge its live size / liveN, advance that
+      // slot's cursor (replace-top, one sift), repeat.  Resumable: cursors
+      // and allocatedCost persist, so a deepen round allocates only the
+      // increment.  The epsilon absorbs float accumulation when a fraction
+      // boundary lands exactly on a list edge.
       void allocateToBudget(const VectorSearchRequest& request) {
         ensureCoarseReady(request);
         if (!hasIvfSlots || heapSize <= 0) return;
@@ -1096,6 +1209,11 @@ public:
         heapSize = (int32_t)pq.size();
       }
 
+      // Hint for the host's next breadth round: the breadth value (in
+      // reference-index units) whose budget covers the allocation so far PLUS
+      // the next globally-best unallocated list.  Peeked off the persisted
+      // heap without popping; minStep and the +1 floor guarantee the hint
+      // makes progress even for tiny or empty lists.
       int32_t nextBreadth(const VectorSearchRequest& request) {
         if (!hasIvfSlots || heapSize <= 0) return 0;
         IndexedPQ<CoarseHead, CoarseHeadLess, int32_t> pq(
@@ -1146,6 +1264,15 @@ public:
         // unchanged hits via seenVectors, and re-running keeps search() a pure
         // function of its arguments for the flat-only path (test oracles rely on
         // that; the IVF tail-scan is incremental only because the host unions).
+        //
+        // RECALL SAFETY: IVF lists are disjoint, and for disjoint sets A, B
+        // the global top-k of (A union B) is contained in top-k(A) union
+        // top-k(B).  So the host's union of per-round top-k subsets is a
+        // SUPERSET of what one global pass over all selected lists would
+        // return - PROVIDED every list was scanned at the final candidate
+        // count, which is exactly what the depthGrew full re-scan maintains.
+        // Making the DEPTH axis incremental would break that invariant and
+        // silently lose recall, beyond merely fighting the cursorless API.
         bool depthGrew = request.candidates != lastScannedCandidates;
         lastScannedCandidates = request.candidates;
 
@@ -1261,6 +1388,16 @@ private:
     return vr.numVectors();
   }
 
+  /// Terminal refine: exact-rescore the pooled candidates from the column and
+  /// collapse to the top kDocs docs.  Candidates are sorted by (segOrd,
+  /// valueRank) first so the column is read in ONE ordered sparse pass per
+  /// segment (sequential mmap access instead of score-order random access),
+  /// and because valueRank order groups a doc's vectors contiguously, the
+  /// multi-valued max-sim collapse happens inline during that same pass.
+  /// Collapsing before the score sort is legal precisely because these scores
+  /// are exact - the engine's approximate ranking no longer matters.  (Same
+  /// ordered-rank-walk + run-collapse shape as the flat column engine's scan;
+  /// candidate-driven here, full-scan there.)
   static void rescoreAndCollapseCandidates(std::vector<VectorEngineHit>& candidates,
                                            IndexReader& reader,
                                            std::span<SegFieldInfo* const> segInfos,
