@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 
 #include <faiss/Index.h>
+#include <faiss/IndexIVFPQ.h>
 #include <faiss/MetricType.h>
 
 #include <atomic>
@@ -174,6 +175,111 @@ TEST_F(IndexReaderAuxTest, opensVectorAuxAfterBuild) {
   EXPECT_EQ(idx->d, 4);
   EXPECT_EQ(idx->ntotal, (faiss::idx_t)vecs.size());
   EXPECT_EQ(idx->metric_type, faiss::METRIC_L2);
+}
+
+// mmap residency: only the IVF header (coarse quantizer + PQ codebooks) is
+// deserialized into RAM; the list payloads are served zero-copy from the aux
+// file's memory view through MmapInvertedLists.  Guards against silently
+// falling back to a RAM-resident ArrayInvertedLists, and verifies the list
+// payloads written in Solux's own layout round-trip (every segment-local
+// valueRank appears exactly once across the lists).
+TEST_F(IndexReaderAuxTest, ivfListsAreServedFromFileView) {
+  IvfPqGuard guard;
+  CollectionHelper h("main");
+  h.clear();
+  enableL2OnVecSuffix(h.collection());
+
+  constexpr int N = 80;
+  for (int i = 0; i < N; i++) {
+    h.index(flatdoc("id", "doc" + std::to_string(i), "embedding_v",
+                    std::vector<float>{(float)(i % 10), (float)(i / 10), 1.0f, 0.5f}));
+  }
+  h.commit({"*"});
+
+  auto reader = std::make_shared<IndexReader>(h.getIndexWriter()->dir);
+  auto aux = firstSegmentAux(*reader, "vec.embedding_v");
+  ASSERT_NE(aux, nullptr);
+  auto* vaux = dynamic_cast<VectorAuxReader*>(aux.get());
+  ASSERT_NE(vaux, nullptr);
+
+  auto* ivf = dynamic_cast<faiss::IndexIVF*>(vaux->getFaissIndex());
+  ASSERT_NE(ivf, nullptr);
+  auto* lists = dynamic_cast<MmapInvertedLists*>(ivf->invlists);
+  ASSERT_NE(lists, nullptr);  // ArrayInvertedLists here = deserialized copy
+  EXPECT_EQ((int64_t)lists->compute_ntotal(), (int64_t)N);
+
+  std::vector<int> seen(N, 0);
+  for (size_t l = 0; l < lists->nlist; l++) {
+    size_t sz = lists->list_size(l);
+    const faiss::idx_t* ids = lists->get_ids(l);
+    for (size_t j = 0; j < sz; j++) {
+      ASSERT_GE(ids[j], 0);
+      ASSERT_LT(ids[j], N);
+      seen[(size_t)ids[j]]++;
+    }
+  }
+  for (int i = 0; i < N; i++) {
+    EXPECT_EQ(seen[i], 1) << "valueRank " << i;
+  }
+}
+
+// Pins the per-index RAM contract the memory story relies on: faiss::read_index
+// RECOMPUTES the IVFPQ precomputed distance table at open for METRIC_L2 +
+// by_residual (nlist * M * 256 floats - the largest resident piece for L2
+// fields), and allocates NOTHING for inner-product metrics.  Cosine maps to
+// METRIC_INNER_PRODUCT over unit vectors, so cosine fields must stay
+// table-free.  If a FAISS upgrade changes either side, this fails and the
+// residency accounting (and docs) need a fresh look.
+TEST_F(IndexReaderAuxTest, cosineSkipsL2PrecomputedTable) {
+  IvfPqGuard guard;
+
+  // Keeps the reader + aux alive alongside the borrowed index pointer (the
+  // VectorAuxReader owns the faiss::Index and the mmap lists behind it).
+  struct OpenedIvfPq {
+    std::shared_ptr<IndexReader> reader;
+    std::shared_ptr<AuxReader> aux;
+    faiss::IndexIVFPQ* ivfpq = nullptr;
+  };
+  auto openIvfPq = [](CollectionHelper& h) {
+    OpenedIvfPq out;
+    out.reader = std::make_shared<IndexReader>(h.getIndexWriter()->dir);
+    out.aux = firstSegmentAux(*out.reader, "vec.embedding_v");
+    EXPECT_NE(out.aux, nullptr);
+    auto* vaux = dynamic_cast<VectorAuxReader*>(out.aux.get());
+    EXPECT_NE(vaux, nullptr);
+    if (vaux != nullptr) {
+      out.ivfpq = dynamic_cast<faiss::IndexIVFPQ*>(vaux->getFaissIndex());
+    }
+    return out;
+  };
+  auto indexDocs = [](CollectionHelper& h) {
+    for (int i = 0; i < 80; i++) {
+      h.index(flatdoc("id", "doc" + std::to_string(i), "embedding_v",
+                      std::vector<float>{(float)(i % 10), (float)(i / 10), 1.0f, 0.5f}));
+    }
+    h.commit({"*"});
+  };
+
+  {
+    CollectionHelper h("main");
+    h.clear();
+    enableCosineOnVecSuffix(h.collection(), true);
+    indexDocs(h);
+    auto opened = openIvfPq(h);
+    ASSERT_NE(opened.ivfpq, nullptr);
+    EXPECT_EQ(opened.ivfpq->metric_type, faiss::METRIC_INNER_PRODUCT);
+    EXPECT_EQ(opened.ivfpq->precomputed_table.size(), 0u);
+  }
+  {
+    CollectionHelper h("main");
+    h.clear();
+    enableL2OnVecSuffix(h.collection());
+    indexDocs(h);
+    auto opened = openIvfPq(h);
+    ASSERT_NE(opened.ivfpq, nullptr);
+    EXPECT_EQ(opened.ivfpq->metric_type, faiss::METRIC_L2);
+    EXPECT_GT(opened.ivfpq->precomputed_table.size(), 0u);
+  }
 }
 
 TEST_F(IndexReaderAuxTest, cosineRawColumnSetsRescorePolicy) {

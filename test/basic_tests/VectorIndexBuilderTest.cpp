@@ -11,6 +11,7 @@
 #include "solux/server/ProtoUpdateMessage.h"
 #include "solux/server/SoluxNode.h"
 #include "solux/store/Directory.h"
+#include "solux/store/FSDirectory.h"
 #include "solux/reader/Postings.h"
 #include "solux/util/Signal.h"
 #include "solux/util/log.h"
@@ -29,6 +30,7 @@
 #include <cstring>
 #include <atomic>
 #include <chrono>
+#include <filesystem>
 #include <latch>
 #include <memory>
 #include <thread>
@@ -310,6 +312,69 @@ TEST_F(VectorIndexBuilderTest, basicBuildSingleSegment) {
   EXPECT_EQ(idx->d, 4);
   EXPECT_EQ(idx->ntotal, (faiss::idx_t)vecs.size());
   EXPECT_EQ(idx->metric_type, faiss::METRIC_L2);
+}
+
+// The mmap-lists layout must serve identically whether the aux file's memory
+// view is RAMDir's owned buffer or FSDirectory's real mmap: copy the built
+// aux file into a temp FSDirectory, open it through VectorAuxReader there,
+// and require bit-identical FAISS search results against the RAMDir-backed
+// open.  This is the FSDirectory leg of the zero-copy list path (the rest of
+// the suite runs on RAMDir).
+TEST_F(VectorIndexBuilderTest, ivfListsServeIdenticallyFromFsDirectoryMmap) {
+  IvfPqGuard guard(/*nlist=*/2, /*m=*/1, /*bits=*/1, /*nprobe=*/2, /*minTraining=*/2);
+  CollectionHelper h("main");
+  h.clear();
+  enableL2OnVecSuffix(h.collection());
+
+  for (int i = 0; i < 80; i++) {
+    h.index(flatdoc("id", "doc" + std::to_string(i), "embedding_v",
+                    std::vector<float>{(float)(i % 10), (float)(i / 10), 1.0f, 0.5f}));
+  }
+  h.commit({"*"});
+
+  auto& shardDir = h.getIndexWriter()->dir;
+  google::protobuf::Arena arena;
+  auto* info = readIndexInfo(shardDir, arena);
+  const auto& aux = onlyVectorOverlay(info);
+  ASSERT_EQ(aux.files_size(), 1);
+
+  auto ramAux = VectorAuxReader::open(shardDir, aux, /*missingFileOK=*/false);
+  ASSERT_NE(ramAux, nullptr);
+  faiss::Index* ramIdx = ramAux->getFaissIndex();
+  ASSERT_NE(ramIdx, nullptr);
+
+  std::string tmpl = (std::filesystem::temp_directory_path() / "solux_vec_aux_XXXXXX").string();
+  ASSERT_NE(mkdtemp(tmpl.data()), nullptr);
+  std::filesystem::path tmp(tmpl);
+  {
+    FSDirectory fsDir(tmp);
+    auto src = shardDir.openFile(aux.files(0));
+    ASSERT_NE(src, nullptr);
+    auto bytes = src->read();
+    auto dst = fsDir.createFile(aux.files(0));
+    OutputStream os;
+    os.setFile(&*dst);
+    os.write(bytes.data(), bytes.size());
+    os.close();
+    fsDir.finishFile(*dst);
+
+    auto fsAux = VectorAuxReader::open(fsDir, aux, /*missingFileOK=*/false);
+    ASSERT_NE(fsAux, nullptr);
+    auto* fsIvf = dynamic_cast<faiss::IndexIVF*>(fsAux->getFaissIndex());
+    ASSERT_NE(fsIvf, nullptr);
+    ASSERT_NE(dynamic_cast<MmapInvertedLists*>(fsIvf->invlists), nullptr);
+
+    constexpr int K = 10;
+    std::vector<float> query{3.0f, 4.0f, 1.0f, 0.5f};
+    std::vector<float> ramDist(K), fsDist(K);
+    std::vector<faiss::idx_t> ramIds(K), fsIds(K);
+    ramIdx->search(1, query.data(), K, ramDist.data(), ramIds.data());
+    fsIvf->search(1, query.data(), K, fsDist.data(), fsIds.data());
+    EXPECT_EQ(ramIds, fsIds);
+    EXPECT_EQ(ramDist, fsDist);
+    EXPECT_NE(ramIds[0], -1);
+  }
+  std::filesystem::remove_all(tmp);
 }
 
 // Empty selectors -> no aux index is built even on a populated index.

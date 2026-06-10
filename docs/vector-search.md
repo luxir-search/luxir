@@ -38,6 +38,14 @@ not a prefix sample. This avoids training only on the oldest values when data
 inside a segment is time ordered. The builder normalizes vectors for FAISS when
 the field uses cosine and the stored column is raw.
 
+Index data stays memory-mapped at query time. The aux file holds a small FAISS
+header (index parameters, IVF centroids, PQ codebooks) followed by the
+inverted-list payloads (PQ codes and vector ids) in Solux's own layout; the
+reader decodes only the header into memory and serves list scans directly from
+the mmapped file. Residency of the bulk index data is therefore managed by the
+OS page cache, like the vector column itself, rather than forced into process
+RAM.
+
 Merges drop overlays for merged-away segments. The merged segment is treated as
 a new segment and gets fresh overlays inside the merge-private phase for active
 vector fields that pass the same thresholds. Whichever later commit publishes
@@ -154,5 +162,3 @@ calibrated per deployment, not carried between models.
   choice yet between filtered ANN search and exact search over the filtered
   set, and no automatic exact fallback when a selective filter starves the
   ANN search.
-- FAISS indexes are decoded into memory on first use. The vector column itself
-  is mmapped.

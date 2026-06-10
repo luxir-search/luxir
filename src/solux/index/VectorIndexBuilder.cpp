@@ -38,6 +38,25 @@ public:
   }
 };
 
+// Swaps an empty set of inverted lists into an IVF index for the duration of
+// faiss::write_index, so the serialized blob carries only the index "header"
+// (params + coarse quantizer + PQ codebooks); the list payloads are written
+// separately in Solux's own layout (VectorAuxListsFooter) and served
+// zero-copy from the mmapped file by MmapInvertedLists at read time.  RAII:
+// the real lists pointer is restored even if write_index throws (the index
+// must never own the stack-resident empty lists).
+struct EmptyInvlistsSwap {
+  faiss::IndexIVF& ivf;
+  faiss::InvertedLists* saved;
+  faiss::ArrayInvertedLists empty;
+
+  explicit EmptyInvlistsSwap(faiss::IndexIVF& ivf)
+    : ivf(ivf), saved(ivf.invlists), empty(ivf.nlist, ivf.code_size) {
+    ivf.invlists = &empty;
+  }
+  ~EmptyInvlistsSwap() { ivf.invlists = saved; }
+};
+
 faiss::MetricType toFaissMetric(VectorFieldType::Metric m) {
   switch (m) {
     case VectorFieldType::METRIC_L2: return faiss::METRIC_L2;
@@ -442,7 +461,42 @@ VectorIndexBuilder::buildIvfPqField(std::string_view fieldName,
     OutputStream os;
     os.setFile(&*file);
     FaissOutAdapter adapter(os);
-    faiss::write_index(index.get(), &adapter);
+    int64_t faissHeaderBytes;
+    {
+      EmptyInvlistsSwap swap(*index);
+      faiss::write_index(index.get(), &adapter);
+      faissHeaderBytes = (int64_t)os.size();
+    }
+
+    // List payloads in the layout VectorAuxListsFooter documents: sizes, ids,
+    // codes, footer.  The ids section must land 8-aligned in the file so the
+    // reader's in-memory view can be indexed as idx_t directly.
+    os.align(8);
+    const faiss::InvertedLists& lists = *index->invlists;
+    for (size_t i = 0; i < lists.nlist; i++) {
+      os.writeLong((int64_t)lists.list_size(i));
+    }
+    for (size_t i = 0; i < lists.nlist; i++) {
+      size_t sz = lists.list_size(i);
+      if (sz == 0) continue;
+      faiss::InvertedLists::ScopedIds ids(&lists, i);
+      os.write(ids.get(), sz * sizeof(faiss::idx_t));
+    }
+    for (size_t i = 0; i < lists.nlist; i++) {
+      size_t sz = lists.list_size(i);
+      if (sz == 0) continue;
+      faiss::InvertedLists::ScopedCodes codes(&lists, i);
+      os.write(codes.get(), sz * lists.code_size);
+    }
+    os.align(8);
+    VectorAuxListsFooter footer;
+    footer.faissHeaderBytes = faissHeaderBytes;
+    footer.nlist = (int64_t)lists.nlist;
+    footer.codeSize = (int64_t)lists.code_size;
+    footer.ntotal = ntotal;
+    footer.version = VectorAuxListsFooter::VERSION;
+    footer.magic = VectorAuxListsFooter::MAGIC;
+    os.write(&footer, sizeof(footer));
     os.close();
     dir_.finishFile(*file);
   }
