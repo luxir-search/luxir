@@ -104,6 +104,17 @@ in insertion order, not relevance order, so a partial list scan would drop
 arbitrary candidates; `nprobe` (which selects lists by relevance) is the only
 work limiter.
 
+A single query's scan and rescore run in parallel when the request executes in
+parallel mode. The selected IVF lists are split into contiguous per-segment
+chunks sized by their actual vector counts, and each chunk (plus each
+column-scanned segment) is scanned as an independent task; the terminal
+full-precision rescore runs one task per segment whose candidate bucket
+exceeds a small grain (smaller buckets, including the common small-`k`
+single-segment pool, fold inline on the calling thread). Task boundaries do
+not depend on the execution mode, and every bounded candidate cut uses a total
+order, so a parallel run returns bit-identical results to a serial run of the
+same query.
+
 `refine_candidates` controls overfetch for approximate ANN. An explicit
 value pins the candidate pool to exactly that many approximate candidates
 (clamped up to `k`) - an absolute count, so large-`k` callers are not forced to

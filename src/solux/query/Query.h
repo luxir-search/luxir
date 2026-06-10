@@ -351,9 +351,24 @@ public:
 
     /// Per-segment domains available during prepare(). An empty domain span
     /// means unrestricted aside from whatever the caller applies later.
+    /// parallel is true when the request runs under a TBB task group; a
+    /// prepare() implementation may then spawn internal worker tasks, provided
+    /// they are joined before prepare() returns.  false means the request is
+    /// serial and prepare() must not spawn tasks.
+    ///
+    /// The constructor deliberately has no default for parallel: a derived
+    /// context built from a parent ctx must forward ctx.parallel, and a
+    /// defaulted field would let a new construction site silently strand
+    /// nested queries in serial mode (an aggregate would value-initialize the
+    /// missing field just as silently).
     struct PrepareContext {
       IndexReader& reader;
       std::span<DocSet* const> domainPerSeg;
+      bool parallel;
+
+      PrepareContext(IndexReader& reader, std::span<DocSet* const> domainPerSeg,
+                     bool parallel) noexcept
+        : reader(reader), domainPerSeg(domainPerSeg), parallel(parallel) {}
     };
 
     /// Immutable result of prepare(), used to create segment scorers after

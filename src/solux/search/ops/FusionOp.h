@@ -172,7 +172,8 @@ public:
 
       Query::Weight::PrepareContext baseCtx{
         *op.req.reader,
-        std::span<DocSet* const>(baseDomains.data(), baseDomains.size())
+        std::span<DocSet* const>(baseDomains.data(), baseDomains.size()),
+        tg != nullptr
       };
       for (size_t i = 0; i < op.filterWeights.size(); i++) {
         if (op.filterWeights[i]->needsPrepare()) {

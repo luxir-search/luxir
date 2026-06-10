@@ -148,6 +148,26 @@ protected:
     }
   };
 
+  // Shrinks the parallel-task grains so small test corpora still exercise
+  // multi-chunk scans and per-segment rescore tasks.  Grain changes
+  // scheduling only, never results (chunk boundaries are mode-independent).
+  struct ScanGrainGuard {
+    int64_t savedScanGrain;
+    int64_t savedRescoreGrain;
+
+    ScanGrainGuard(int64_t scanGrainVectors, int64_t rescoreGrainCandidates)
+      : savedScanGrain(KnnQuery::scanTaskGrainVectors),
+        savedRescoreGrain(KnnQuery::rescoreTaskGrainCandidates) {
+      KnnQuery::scanTaskGrainVectors = scanGrainVectors;
+      KnnQuery::rescoreTaskGrainCandidates = rescoreGrainCandidates;
+    }
+
+    ~ScanGrainGuard() {
+      KnnQuery::scanTaskGrainVectors = savedScanGrain;
+      KnnQuery::rescoreTaskGrainCandidates = savedRescoreGrain;
+    }
+  };
+
   struct IvfPqAuxGuard {
     bool savedIvfPq;
     int32_t savedNList;
@@ -1311,6 +1331,225 @@ TEST_F(KnnQueryTest, perSegmentExactBypassesApproximateMiss) {
   exact->done();
   ASSERT_EQ(exactIds.size(), 5u);
   EXPECT_EQ(exactIds[0], "outlier");
+}
+
+// Milestone-3 scan parallelism: with the scan grain forced to 1, every
+// selected IVF list becomes its own (segment, list-range) task and every
+// segment's rescore bucket its own task.  Chunk boundaries and the
+// top-candidates cut are total-order deterministic, so a parallel run must
+// be BIT-IDENTICAL to a serial run of the same query - ids and scores - and
+// with min_scan_fraction=1 (a genuine full-breadth pin: every list of every
+// segment is selected, independent of k-means placement) plus a rescore pool
+// covering the corpus, identical to the exact contract too.  Mixed
+// composition (TWO IVF segments, both committed with a build selector, plus
+// one aux-less flat segment), sparse no-vector docs, and post-build deletes
+// all ride along.
+TEST_F(KnnQueryTest, parallelChunkedScanMatchesSerialAndExact) {
+  IvfPqAuxGuard guard(/*nlist=*/4, /*m=*/2, /*bits=*/2,
+                      /*nprobe=*/4, /*minTraining=*/16, /*refineRatio=*/8);
+  ScanGrainGuard grains(/*scanGrainVectors=*/1, /*rescoreGrainCandidates=*/1);
+  CollectionHelper h("main");
+  h.clear();
+  installVecSchema(h.collection(), proto::VectorParams::L2);
+
+  for (int i = 0; i < 80; i++) {
+    h.index(flatdoc("id", "a" + std::to_string(i),
+                    "embedding_v", std::vector<float>{(float)i, 0.0f, 0.0f, 0.0f}));
+    if (i % 7 == 0) h.index(flatdoc("id", "ga" + std::to_string(i)));
+  }
+  h.commit({"*"});
+
+  for (int i = 0; i < 80; i++) {
+    h.index(flatdoc("id", "b" + std::to_string(i),
+                    "embedding_v", std::vector<float>{(float)i + 0.5f, 0.0f, 0.0f, 0.0f}));
+  }
+  h.commit({"*"});
+
+  // Plain commit: no aux build for this segment, so it scans flat.
+  h.index(flatdoc("id", std::string("tiny0"),
+                  "embedding_v", std::vector<float>{40.25f, 0.0f, 0.0f, 0.0f}));
+  h.commit();
+
+  std::vector<std::string> dels{"a40", "b40"};
+  h.deleteByIds(dels, UpdateMessage::COMMIT);
+
+  std::vector<float> queryVec{40.3f, 0.0f, 0.0f, 0.0f};
+  auto* par = makeKnnReq(*soluxNode, "embedding_v", queryVec, 10,
+                         /*nprobe=*/0, /*refineCandidates=*/200,
+                         /*exact=*/false, /*minScanFraction=*/1.0f);
+  par->execute(/*parallel=*/true);
+  auto parIds = resultIds(*par);
+  auto parScores = resultScores(*par);
+  par->done();
+
+  auto* ser = makeKnnReq(*soluxNode, "embedding_v", queryVec, 10,
+                         /*nprobe=*/0, /*refineCandidates=*/200,
+                         /*exact=*/false, /*minScanFraction=*/1.0f);
+  ser->execute(/*parallel=*/false);
+  auto serIds = resultIds(*ser);
+  auto serScores = resultScores(*ser);
+  ser->done();
+
+  auto* exact = makeKnnReq(*soluxNode, "embedding_v", queryVec, 10,
+                           /*nprobe=*/0, /*refineCandidates=*/200, /*exact=*/true);
+  exact->execute();
+  auto exactIds = resultIds(*exact);
+  exact->done();
+
+  ASSERT_EQ(parIds.size(), 10u);
+  EXPECT_EQ(parIds, serIds);
+  EXPECT_EQ(parScores, serScores);
+  EXPECT_EQ(parIds, exactIds);
+  EXPECT_EQ(parIds[0], "tiny0");  // 0.05 away, served by the flat segment
+  for (const auto& id : parIds) {
+    EXPECT_NE(id, "a40") << "deleted doc must not appear";
+    EXPECT_NE(id, "b40") << "deleted doc must not appear";
+  }
+}
+
+// Same parallel == serial identity for multi-valued fields, where the
+// candidate cut, cross-segment merge, doc collapse, and per-segment rescore
+// buckets all interact.  A small refine_candidates pin makes the bounded
+// approximate cut actually bite (kReq well below the pooled vector count).
+TEST_F(KnnQueryTest, parallelMultiValuedIvfMatchesSerial) {
+  IvfPqAuxGuard guard(/*nlist=*/4, /*m=*/2, /*bits=*/2,
+                      /*nprobe=*/4, /*minTraining=*/16, /*refineRatio=*/8);
+  ScanGrainGuard grains(/*scanGrainVectors=*/1, /*rescoreGrainCandidates=*/1);
+  CollectionHelper h("main");
+  h.clear();
+  installMultiVecSchema(h.collection(), proto::VectorParams::L2);
+
+  for (int i = 0; i < 40; i++) {
+    float base = (float)i;
+    h.index(flatdoc("id", "a" + std::to_string(i), "emb_vs",
+                    std::vector<std::vector<float>>{
+                      {base, 0.0f, 0.0f, 0.0f},
+                      {base, 1.0f, 0.0f, 0.0f},
+                      {base, 2.0f, 0.0f, 0.0f}}));
+  }
+  h.commit({"*"});
+  for (int i = 0; i < 40; i++) {
+    float base = (float)i + 0.5f;
+    h.index(flatdoc("id", "b" + std::to_string(i), "emb_vs",
+                    std::vector<std::vector<float>>{
+                      {base, 0.0f, 0.0f, 0.0f},
+                      {base, 1.0f, 0.0f, 0.0f}}));
+  }
+  h.commit({"*"});
+
+  std::vector<float> queryVec{20.2f, 0.0f, 0.0f, 0.0f};
+  auto* par = makeKnnReq(*soluxNode, "emb_vs", queryVec, 10,
+                         /*nprobe=*/4, /*refineCandidates=*/20);
+  par->execute(/*parallel=*/true);
+  auto parIds = resultIds(*par);
+  auto parScores = resultScores(*par);
+  par->done();
+
+  auto* ser = makeKnnReq(*soluxNode, "emb_vs", queryVec, 10,
+                         /*nprobe=*/4, /*refineCandidates=*/20);
+  ser->execute(/*parallel=*/false);
+  auto serIds = resultIds(*ser);
+  auto serScores = resultScores(*ser);
+  ser->done();
+
+  ASSERT_EQ(parIds.size(), 10u) << "k docs guaranteed despite the candidate cut";
+  EXPECT_EQ(parIds, serIds);
+  EXPECT_EQ(parScores, serScores);
+}
+
+// Parallel mode must reach a kNN nested inside a boolean clause:
+// BooleanQuery::prepare rebuilds the child PrepareContext, and dropping
+// ctx.parallel there would leave hybrid boolean+kNN queries silently
+// single-threaded (results are identical either way, so the spawn counter is
+// the only observable).
+TEST_F(KnnQueryTest, booleanNestedKnnPropagatesParallelism) {
+  IvfPqAuxGuard guard(/*nlist=*/4, /*m=*/2, /*bits=*/2,
+                      /*nprobe=*/4, /*minTraining=*/16, /*refineRatio=*/8);
+  ScanGrainGuard grains(/*scanGrainVectors=*/1, /*rescoreGrainCandidates=*/1);
+  CollectionHelper h("main");
+  h.clear();
+  installVecSchema(h.collection(), proto::VectorParams::L2);
+
+  for (int i = 0; i < 80; i++) {
+    h.index(flatdoc("id", "a" + std::to_string(i), "foo_w", "apple",
+                    "embedding_v", std::vector<float>{(float)i, 0.0f, 0.0f, 0.0f}));
+  }
+  h.commit({"*"});
+  for (int i = 0; i < 80; i++) {
+    h.index(flatdoc("id", "b" + std::to_string(i), "foo_w", "apple",
+                    "embedding_v", std::vector<float>{(float)i + 0.5f, 0.0f, 0.0f, 0.0f}));
+  }
+  h.commit({"*"});
+
+  auto* req = LocalReq::create(soluxNode->getSearchEngine());
+  req->proto.mutable_collection()->add_name("main");
+  auto& topDocs = *(*req->proto.mutable_ops())["q"].mutable_top_docs();
+  topDocs.set_limit(10);
+  topDocs.set_get_number(true);
+  topDocs.mutable_fields()->Add("id");
+  auto& boolean = *topDocs.mutable_query()->mutable_boolean();
+  auto& required = *boolean.add_required();
+  auto& match = *required.mutable_match();
+  match.set_field("foo_w");
+  match.mutable_val()->set_s("apple");
+  setKnnQuery(*boolean.add_required(), "embedding_v", {40.3f, 0.0f, 0.0f, 0.0f}, 5,
+              /*nprobe=*/0, /*refineCandidates=*/0, /*exact=*/false,
+              /*minScanFraction=*/1.0f);
+
+  int64_t before = KnnQuery::parallelScanRoundsForTests.load(std::memory_order_relaxed);
+  req->execute(/*parallel=*/true);
+  EXPECT_GT(KnnQuery::parallelScanRoundsForTests.load(std::memory_order_relaxed), before)
+      << "nested kNN never spawned parallel scan tasks";
+  EXPECT_EQ(req->getMatchCount(), 5);
+  req->done();
+}
+
+// A NaN/Inf query vector is rejected loudly: NaN scores would break the
+// strict-total-order contract the bounded candidate cuts and result sorts
+// rely on.
+TEST_F(KnnQueryTest, nanQueryVectorReturnsErrorResponse) {
+  CollectionHelper h("main");
+  h.clear();
+  installVecSchema(h.collection(), proto::VectorParams::L2);
+  h.index(flatdoc("id", std::string("a"), "embedding_v", std::vector<float>{1, 0, 0}));
+  h.commit({"*"});
+
+  auto* req = makeKnnReq(*soluxNode, "embedding_v",
+                         {std::numeric_limits<float>::quiet_NaN(), 0.0f, 0.0f}, 1);
+  {
+    ExpectLog quiet("Search request failed:");
+    req->execute();
+  }
+  EXPECT_EQ(req->getMatchCount(), 0);
+  ASSERT_EQ(req->responses.size(), 1u);
+  EXPECT_NE(req->responses[0]->proto.error().find("finite"), std::string::npos);
+  req->done();
+}
+
+// A NaN stored vector must not poison the comparators (a non-total order
+// makes the sorts UB and the bounded cuts fold-order dependent); finiteScore
+// maps its score to the worst finite float so it deterministically ranks
+// last (still collected - unlike -infinity, which the score collectors'
+// sentinel would silently drop).
+TEST_F(KnnQueryTest, nanStoredVectorRanksLast) {
+  CollectionHelper h("main");
+  h.clear();
+  installVecSchema(h.collection(), proto::VectorParams::IP);
+
+  h.index(flatdoc("id", std::string("good1"), "embedding_v", std::vector<float>{3, 0, 0}));
+  h.index(flatdoc("id", std::string("bad"), "embedding_v",
+                  std::vector<float>{std::numeric_limits<float>::quiet_NaN(), 0.0f, 0.0f}));
+  h.index(flatdoc("id", std::string("good2"), "embedding_v", std::vector<float>{2, 0, 0}));
+  h.commit({"*"});
+
+  auto* req = makeKnnReq(*soluxNode, "embedding_v", {1, 0, 0}, 3);
+  req->execute();
+  auto ids = resultIds(*req);
+  ASSERT_EQ(ids.size(), 3u);
+  EXPECT_EQ(ids[0], "good1");
+  EXPECT_EQ(ids[1], "good2");
+  EXPECT_EQ(ids[2], "bad");
+  req->done();
 }
 
 // The maxKnnCandidates host cap is a heuristic; exact is a contract and must

@@ -174,7 +174,8 @@ public:
 
       Query::Weight::PrepareContext baseCtx{
         *op.req.reader,
-        std::span<DocSet* const>(baseDomains.data(), baseDomains.size())
+        std::span<DocSet* const>(baseDomains.data(), baseDomains.size()),
+        tg != nullptr
       };
       for (size_t i = 0; i < op.filterWeights.size(); i++) {
         if (op.filterWeights[i]->needsPrepare()) {
@@ -193,7 +194,8 @@ public:
 
       Query::Weight::PrepareContext queryCtx{
         *op.req.reader,
-        std::span<DocSet* const>(effectiveDomains.data(), effectiveDomains.size())
+        std::span<DocSet* const>(effectiveDomains.data(), effectiveDomains.size()),
+        tg != nullptr
       };
       if (op.weight->needsPrepare()) {
         preparedWeight = op.weight->prepare(queryCtx);

@@ -385,7 +385,7 @@ bool responseIds(LocalReq& req, std::vector<std::string>& out, std::string& erro
   return true;
 }
 
-void BM_VectorKnnRecall(benchmark::State& state) {
+void BM_VectorKnnRecallBody(benchmark::State& state, bool parallelExec) {
   int64_t nDocs = solux::unit_tests ? 240 : 50'000;
   int32_t dims = solux::unit_tests ? 16 : 64;
   int32_t nClusters = solux::unit_tests ? 8 : 100;
@@ -465,11 +465,13 @@ void BM_VectorKnnRecall(benchmark::State& state) {
   }
 
   // Timed loop measures latency only, cycling queries for realistic variety.
+  // parallelExec runs each request on the TBB task group (intra-query scan /
+  // rescore tasks); results are identical either way, only latency moves.
   int32_t queryOrd = 0;
   for (auto _ : state) {
     auto* req = makeKnnBenchReq(helper.getSearchEngine(), "bench_v",
                                 queries[(size_t)queryOrd], k, nprobe, cand);
-    req->execute(false);
+    req->execute(parallelExec);
     std::vector<std::string> ids;
     std::string error;
     bool ok = responseIds(*req, ids, error);
@@ -496,12 +498,32 @@ void BM_VectorKnnRecall(benchmark::State& state) {
   state.counters["rate"] = Counter(state.iterations(), Counter::kIsRate);
 }
 
+void BM_VectorKnnRecall(benchmark::State& state) {
+  BM_VectorKnnRecallBody(state, /*parallelExec=*/false);
+}
+
+// Single-client latency with intra-query parallelism: the (segment,
+// list-range) scan tasks and per-segment rescore fan out across idle cores.
+// Compare against BM_VectorKnnRecall (serial execution of the same work) for
+// the latency win; recall is identical by construction.
+void BM_VectorKnnRecallParallel(benchmark::State& state) {
+  BM_VectorKnnRecallBody(state, /*parallelExec=*/true);
+}
+
 // Throughput wrapper: same benchmark at the production defaults, run on
 // 1..32 concurrent closed-loop threads.  rate = aggregate QPS.  Registered
 // as a separate function so the thread sweep does not multiply the full
 // (nprobe, refine, k) grid.
 void BM_VectorKnnRecallThreads(benchmark::State& state) {
-  BM_VectorKnnRecall(state);
+  BM_VectorKnnRecallBody(state, /*parallelExec=*/false);
+}
+
+// Saturated-throughput check for intra-query parallelism: under closed-loop
+// load every core is already busy, so task fan-out cannot ADD throughput -
+// this run exists to confirm the scheduling overhead does not SUBTRACT
+// from it relative to BM_VectorKnnRecallThreads.
+void BM_VectorKnnRecallThreadsParallel(benchmark::State& state) {
+  BM_VectorKnnRecallBody(state, /*parallelExec=*/true);
 }
 
 // Build-phase cost of the IVF+PQ aux index.  Manual timing covers ONLY the
@@ -665,5 +687,14 @@ SOLUX_BENCHMARK(BM_VectorKnnRecall)->ArgNames({"nprobe", "cand", "k"})
     // Note recall granularity is 1/(16*k): coarse at k=1.
     ->Args({0, 0, 1})->Args({0, 0, 100})->Args({0, 0, 1000});
 
+// Parallel-execution latency points: default knobs, a wide-breadth probe
+// (more selected lists = more scan tasks), and a deep-k pool (bigger
+// rescore buckets).
+SOLUX_BENCHMARK(BM_VectorKnnRecallParallel)->ArgNames({"nprobe", "cand", "k"})
+    ->Args({0, 0, 10})->Args({16, 0, 10})->Args({1 << 20, 0, 10})
+    ->Args({0, 0, 1000});
+
 SOLUX_BENCHMARK(BM_VectorKnnRecallThreads)->ArgNames({"nprobe", "cand", "k"})
+    ->Args({0, 0, 10})->ThreadRange(1, 32);
+SOLUX_BENCHMARK(BM_VectorKnnRecallThreadsParallel)->ArgNames({"nprobe", "cand", "k"})
     ->Args({0, 0, 10})->ThreadRange(1, 32);

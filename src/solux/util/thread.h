@@ -1,5 +1,7 @@
 #pragma once
+#include <optional>
 #include <oneapi/tbb/flow_graph.h>
+#include <oneapi/tbb/task_group.h>
 
 namespace solux {
 
@@ -13,6 +15,42 @@ void task_group_run(oneapi::tbb::task_group* tg, F&& f) {
     std::forward<F>(f)();
   }
 }
+
+
+/// Scope guard for a maybe-parallel fan-out over one task_group.
+/// run(spawn, f) either spawns f on the (lazily created) group or runs it
+/// inline on the calling thread.  Call join() on the success path: it waits
+/// and propagates the first task exception.  If the scope unwinds before
+/// join() - an inline body or run() itself threw - the destructor cancels
+/// the group and waits while swallowing any parked task exception, so the
+/// unwind never double-throws (a bare ~task_group rethrowing a captured task
+/// exception during active unwinding would std::terminate).
+class TaskGroupRunner {
+  std::optional<oneapi::tbb::task_group> tg;
+  bool joined = false;
+
+public:
+  template <typename F>
+  void run(bool spawn, F&& f) {
+    if (spawn) {
+      if (!tg) tg.emplace();
+      tg->run(std::forward<F>(f));
+    } else {
+      std::forward<F>(f)();
+    }
+  }
+
+  void join() {
+    joined = true;
+    if (tg) tg->wait();
+  }
+
+  ~TaskGroupRunner() {
+    if (joined || !tg) return;
+    tg->cancel();
+    try { tg->wait(); } catch (...) {}
+  }
+};
 
 
 // A simple (but heavyweight) class like a latch so that one can block waiting on an async action to complete.
