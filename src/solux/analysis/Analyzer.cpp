@@ -61,6 +61,15 @@ std::string_view applyNfkcCf(std::string_view in, std::string& buf) {
   }
   if (hasNonAscii) {
     buf = una::norm::to_nfkc_utf8(una::cases::to_casefold_utf8(in));
+    // NFKC can surface fresh uppercase (e.g. U+03D3 -> U+038E), so one pass is
+    // not the NFKC_CF fixpoint; re-fold until stable (typically zero iterations:
+    // casefold of already-folded text is the identity, so the loop is one
+    // compare in the common case).
+    for (;;) {
+      std::string refolded = una::cases::to_casefold_utf8(buf);
+      if (refolded == buf) break;
+      buf = una::norm::to_nfkc_utf8(refolded);
+    }
     return buf;
   }
   if (hasUpper) {

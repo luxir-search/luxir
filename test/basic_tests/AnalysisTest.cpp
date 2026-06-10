@@ -372,6 +372,15 @@ TEST_F(AnalysisTest, foldVsPreserveAccents) {
   EXPECT_EQ((std::vector<std::string>{"café"}), analyze(*preserving.createAnalyzer("wl"), "Café").terms);
 }
 
+// NFKC_CF must reach the fold/normalize fixpoint: NFKC of U+03D3 (ϓ) is U+038E,
+// an UPPERCASE Ύ, so a single casefold-then-NFKC pass would leave uppercase in
+// the "casefolded" index and canonically-equivalent query forms would miss.
+TEST_F(AnalysisTest, nfkcCfReachesFixpoint) {
+  TextFieldType ft("t", FieldType::INDEX_DOCS_FREQS_POSITIONS, "unicode_word", {"nfkc_cf"});
+  auto out = analyze(*ft.createAnalyzer("t"), "ϓ Ύ ύ");  // U+03D3, U+038E, U+03CD
+  EXPECT_EQ((std::vector<std::string>{"ύ", "ύ", "ύ"}), out.terms);  // all fold to U+03CD
+}
+
 // The fused StandardTokenizer (swapped in for unicode_word + nfkc_cf) must produce
 // byte-identical tokens to the explicit two-stage chain - the optimization is
 // behavior-preserving.
