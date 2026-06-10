@@ -1,0 +1,21 @@
+diff --git a/triplets/x64-linux.cmake b/triplets/x64-linux.cmake
+index 8822134560..1e69731a76 100644
+--- a/triplets/x64-linux.cmake
++++ b/triplets/x64-linux.cmake
+@@ -4,3 +4,16 @@ set(VCPKG_LIBRARY_LINKAGE static)
+ 
+ set(VCPKG_CMAKE_SYSTEM_NAME Linux)
+ 
++#YCS
++#set(VCPKG_CXX_FLAGS_DEBUG -fsanitize=address)
++#set(VCPKG_C_FLAGS_DEBUG -fsanitize=address)
++#set(VCPKG_LINKER_FLAGS_DEBUG -fsanitize=address)
++
++# Set address sanitizer for both debug and release.
++# I don't know if vcpkg default is to add debugging info to release builds, so
++# add -g just in case.
++
++set(VCPKG_CXX_FLAGS "-g -fno-omit-frame-pointer -fsanitize=address -mavx -mssse3 -march=native -mtune=native")
++set(VCPKG_C_FLAGS "-g -fno-omit-frame-pointer -fsanitize=address -mavx -mssse3 -march=native -mtune=native")
++set(VCPKG_LINKER_FLAGS "-g -fno-omit-frame-pointer -fsanitize=address")
++
