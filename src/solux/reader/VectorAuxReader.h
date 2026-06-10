@@ -5,6 +5,7 @@
 #include <faiss/index_io.h>
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <filesystem>
@@ -64,6 +65,20 @@ struct VectorAuxMeta {
     return meta;
   }
 } SOLUX_PACKED_END;
+
+/// Default IVF coarse-list count for n vectors: the sqrt(n) rule clamped to
+/// [1, 4096].  Single source of truth for both the builder's per-segment
+/// build-time nlist default (VectorIndexBuilder::chooseIvfNList) and the query
+/// side's merge-stable REFERENCE list count, which defines the nprobe scan
+/// fraction "as if one IVF index of nlist=sqrt(N)".  Keeping them on one rule
+/// (and one 4096 cap) means the search-side reference cannot silently drift
+/// from how segments are actually partitioned.
+inline int32_t defaultIvfNList(int64_t n) {
+  if (n <= 0) return 1;
+  int64_t derived = (int64_t)std::sqrt((double)n);
+  derived = std::clamp<int64_t>(derived, 1, 4096);
+  return (int32_t)std::min<int64_t>(derived, n);
+}
 
 static_assert(sizeof(VectorAuxMeta) == 8 * sizeof(int32_t),
               "VectorAuxMeta layout is an on-disk contract");

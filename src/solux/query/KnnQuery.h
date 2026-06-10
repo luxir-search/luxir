@@ -12,6 +12,7 @@
 #include <format>
 #include <functional>
 #include <iterator>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <queue>
@@ -30,6 +31,7 @@
 #include "solux/reader/VectorReader.h"
 #include "solux/query/VectorEngine.h"
 #include "solux/search/DocSet.h"
+#include "solux/util/heap.h"
 #include "solux/util/log.h"
 #include "solux/util/screaming.h"
 
@@ -63,6 +65,7 @@ class KnnQuery final : public solux::Query {
   int32_t k;
   int32_t nprobe;
   int32_t refineCandidates;
+  float minScanFraction;
   bool exact;
 
 public:
@@ -163,9 +166,11 @@ public:
 
   KnnQuery(std::string_view field, const VectorFieldType& fieldType,
            std::span<const float> queryVec, int32_t k,
-           int32_t nprobe = 0, int32_t refineCandidates = 0, bool exact = false)
+           int32_t nprobe = 0, int32_t refineCandidates = 0,
+           float minScanFraction = 0.0f, bool exact = false)
     : field(field), fieldType(fieldType), queryVec(queryVec), k(k),
-      nprobe(nprobe), refineCandidates(refineCandidates), exact(exact) {}
+      nprobe(nprobe), refineCandidates(refineCandidates),
+      minScanFraction(minScanFraction), exact(exact) {}
 
   std::string_view getField() const noexcept { return field; }
   const VectorFieldType& getFieldType() const noexcept { return fieldType; }
@@ -173,6 +178,7 @@ public:
   int32_t getK() const noexcept { return k; }
   int32_t getNProbe() const noexcept { return nprobe; }
   int32_t getRefineCandidates() const noexcept { return refineCandidates; }
+  float getMinScanFraction() const noexcept { return minScanFraction; }
   bool getExact() const noexcept { return exact; }
 
   Query::Weight* createWeight(Query::Context& context) override {
@@ -218,11 +224,17 @@ public:
       bool outputIsSubsetOfDomain() const noexcept override { return true; }
     };
 
+  private:
+    class SegmentFaissVectorEngine;
+
     struct EngineSlot {
       std::unique_ptr<VectorEngine> engine;
       int64_t vectorCount = 0;
+      int64_t liveVectorCount = 0;
+      SegmentFaissVectorEngine* ivfEngine = nullptr;
     };
 
+  public:
     std::unique_ptr<Query::Weight::PreparedWeight> prepare(Query::Weight::PrepareContext& ctx) override {
       IndexReader& reader = ctx.reader;
       size_t numSegs = reader.segments().size();
@@ -242,6 +254,7 @@ public:
       // sparse single-valued, and the column's reverse map for multi-valued.
       std::vector<SegV2D> v2dPerSeg(numSegs);
       std::vector<int64_t> segVectorCounts(numSegs, 0);
+      std::vector<int64_t> segLiveVectorCounts(numSegs, 0);
       std::vector<VectorAuxReader*> vauxPerSeg(numSegs, nullptr);
       std::string auxName("vec.");
       auxName.append(query.getField());
@@ -325,12 +338,18 @@ public:
                 v2dPerSeg[i].sel = makeValueDocSelector(scratch, dr.bitset());
               }
             }
+            segLiveVectorCounts[i] = liveVectorUpperBound(reader.segments()[i], vr);
           }
         }
       }
       int64_t ntotal = 0;
       for (int64_t n : segVectorCounts) ntotal += n;
       if (ntotal == 0) {
+        return std::make_unique<KnnPreparedWeight>(std::move(perSegHits));
+      }
+      int64_t liveNTotal = 0;
+      for (int64_t n : segLiveVectorCounts) liveNTotal += n;
+      if (liveNTotal == 0) {
         return std::make_unique<KnnPreparedWeight>(std::move(perSegHits));
       }
 
@@ -384,13 +403,17 @@ public:
           }
           bool isIvf = vaux->getEngine() == VectorAuxMeta::ENGINE_IVFPQ;
           approximateEngine = approximateEngine || !vaux->scoresAreExact();
+          auto faissEngine = std::make_unique<SegmentFaissVectorEngine>(
+            *idx, (int32_t)i, reader.segments()[i], v2dPerSeg[i],
+            ctx.domainPerSeg.empty() ? nullptr : ctx.domainPerSeg[i],
+            metric, vaux->scoresAreExact(), isIvf,
+            vaux->getNList());
+          SegmentFaissVectorEngine* ivfEngine = isIvf ? faissEngine.get() : nullptr;
           slots.push_back({
-            .engine = std::make_unique<SegmentFaissVectorEngine>(
-              *idx, (int32_t)i, reader.segments()[i], v2dPerSeg[i],
-              ctx.domainPerSeg.empty() ? nullptr : ctx.domainPerSeg[i],
-              metric, vaux->scoresAreExact(), isIvf,
-              vaux->getNList(), vaux->getDefaultBreadth()),
+            .engine = std::move(faissEngine),
             .vectorCount = segCount,
+            .liveVectorCount = segLiveVectorCounts[i],
+            .ivfEngine = ivfEngine,
           });
         } else {
           slots.push_back({
@@ -399,6 +422,8 @@ public:
               ctx.domainPerSeg.empty() ? nullptr : ctx.domainPerSeg[i],
               dims, metric, normalizeColumnOnCosineRescore),
             .vectorCount = segCount,
+            .liveVectorCount = segLiveVectorCounts[i],
+            .ivfEngine = nullptr,
           });
         }
       }
@@ -427,12 +452,15 @@ public:
       }
       int64_t kReq = mulClamped(baseReq, avgMult, cap);
       if (kReq <= 0) return std::make_unique<KnnPreparedWeight>(std::move(perSegHits));
+      int64_t targetDocReq = approximateEngine
+        ? std::min<int64_t>(liveNTotal, std::max(kDocs, baseReq))
+        : kDocs;
 
       std::vector<VectorEngineHit> candidateHits;
       boost::unordered_flat_set<VectorKey, VectorKeyHash, VectorKeyEqual> seenVectors;
       std::vector<DocHit> docHits;
       boost::unordered_flat_set<uint64_t> seenDocs;
-      size_t maxDocHits = (size_t)std::min(kDocs, cap);
+      size_t maxDocHits = (size_t)std::min<int64_t>(targetDocReq, cap);
       size_t maxVectorHits = (size_t)cap;
       candidateHits.reserve((size_t)std::min(kReq, cap));
       seenVectors.reserve((size_t)std::min(kReq, cap));
@@ -440,7 +468,7 @@ public:
       seenDocs.reserve(maxDocHits);
 
       std::unique_ptr<VectorEngine> baseEngine =
-        std::make_unique<CompositeVectorEngine>(std::move(slots), ntotal, kDocs);
+        std::make_unique<CompositeVectorEngine>(std::move(slots), ntotal, liveNTotal, kDocs, metric);
       VectorEngine* engine = baseEngine.get();
       std::unique_ptr<VectorEngine> wrapperEngine;
       if (engineWrapperForTests) {
@@ -453,12 +481,14 @@ public:
         ? query.getNProbe()
         : std::max(0, maxKnnBreadth);
       bool candidatePoolSorted = true;
+      bool candidateScoresExact = true;
       for (;;) {
         VectorSearchRequest request{
           .query = queryPtr,
           .dims = dims,
           .candidates = kReq,
           .breadth = breadth,
+          .minScanFraction = query.getMinScanFraction(),
         };
         VectorSearchResult result = engine->search(request);
 
@@ -473,30 +503,20 @@ public:
         bool appended = candidateHits.size() != appendStart;
         if (appended) {
           candidatePoolSorted = false;
+          if (!result.scoresAreExact) candidateScoresExact = false;
         }
 
-        // Per-segment engines can append hits that interleave with the
-        // existing cross-segment pool.  Approximate engines must rescore
-        // appended hits before sorting / doc collapse.
-        if (!result.scoresAreExact && appended) {
-          rescoreCandidates(std::span<VectorEngineHit>(candidateHits.data() + appendStart,
-                                                       candidateHits.size() - appendStart),
-                            reader,
-                            std::span<SegFieldInfo* const>(segInfos.data(), segInfos.size()),
-                            queryPtr, dims, metric, normalizeColumnOnCosineRescore);
-          candidatePoolSorted = false;
-        }
         if (!candidatePoolSorted) {
           sortCandidatesByScore(candidateHits);
           candidatePoolSorted = true;
         }
-        collapseCandidates(candidateHits, v2dSpan, kDocs, docHits, seenDocs);
+        collapseCandidates(candidateHits, v2dSpan, targetDocReq, docHits, seenDocs);
 
-        if ((int64_t)docHits.size() >= kDocs) break;
+        if ((int64_t)docHits.size() >= targetDocReq) break;
         if (candidateHits.size() >= maxVectorHits) break;
 
         if (!result.poolExhausted && kReq < cap) {
-          int64_t want = projectedKReq(kReq, kDocs, (int64_t)docHits.size(), cap);
+          int64_t want = projectedKReq(kReq, targetDocReq, (int64_t)docHits.size(), cap);
           kReq = std::min(cap, std::max(kReq + 1, want));
           continue;
         }
@@ -508,6 +528,17 @@ public:
         }
 
         break;
+      }
+
+      if (!candidateScoresExact && !candidateHits.empty()) {
+        rescoreAndCollapseCandidates(candidateHits,
+                                     reader,
+                                     std::span<SegFieldInfo* const>(segInfos.data(), segInfos.size()),
+                                     v2dSpan,
+                                     queryPtr, dims, metric, normalizeColumnOnCosineRescore,
+                                     kDocs, docHits);
+      } else if ((int64_t)docHits.size() > kDocs) {
+        collapseCandidates(candidateHits, v2dSpan, kDocs, docHits, seenDocs);
       }
 
       if ((int64_t)docHits.size() < kDocs && cap < ntotal) {
@@ -561,16 +592,27 @@ public:
           unused(segOrd);
           return true;
         }
+
+        bool live_member(faiss::idx_t id) const {
+          if (id < 0) return false;
+          int32_t docId = v2d.resolve((int64_t)id);
+          auto* live = seg.liveDocs();
+          return live == nullptr || live->bitset().get(docId);
+        }
+
+        bool hasDeletes() const noexcept {
+          return seg.liveDocs() != nullptr;
+        }
       };
 
       faiss::Index& index;
+      faiss::IndexIVF* ivf;
       int32_t segOrd;
       LocalDomainSelector selector;
       int32_t metric;
       bool exactScores;
       bool isIvf;
       int32_t nlist;
-      int32_t defaultBreadth;
       std::vector<faiss::idx_t> ids;
       std::vector<float> dists;
 
@@ -583,18 +625,102 @@ public:
                                int32_t metric,
                                bool exactScores,
                                bool isIvf,
-                               int32_t nlist,
-                               int32_t defaultBreadth) noexcept
+                               int32_t nlist)
         : index(index),
+          ivf(isIvf ? dynamic_cast<faiss::IndexIVF*>(&index) : nullptr),
           segOrd(segOrd),
           selector(segOrd, seg, v2d, domain),
           metric(metric),
           exactScores(exactScores),
           isIvf(isIvf),
-          nlist(nlist),
-          defaultBreadth(defaultBreadth) {}
+          nlist(nlist) {
+        if (isIvf && ivf == nullptr) {
+          throw std::runtime_error("KnnQuery: vector aux marked IVF but FAISS index is not IndexIVF");
+        }
+      }
+
+      int32_t getNList() const noexcept { return nlist; }
+
+      void coarseRun(const float* query, int32_t dims,
+                     std::vector<faiss::idx_t>& listIds,
+                     std::vector<float>& centroidDists) const {
+        assert(ivf != nullptr);
+        assert(query != nullptr);
+        assert(dims == index.d);
+        unused(dims);
+        listIds.assign((size_t)nlist, (faiss::idx_t)-1);
+        centroidDists.assign((size_t)nlist, 0.0f);
+        ivf->quantizer->search(1, query, nlist, centroidDists.data(), listIds.data());
+      }
+
+      int64_t liveListSize(faiss::idx_t listId) const {
+        assert(ivf != nullptr);
+        if (listId < 0 || listId >= nlist) return 0;
+        size_t rawSize = ivf->invlists->list_size((size_t)listId);
+        if (rawSize == 0) return 0;
+        if (!selector.hasDeletes()) return (int64_t)rawSize;
+
+        int64_t liveSize = 0;
+        const faiss::idx_t* listIds = ivf->invlists->get_ids((size_t)listId);
+        for (size_t i = 0; i < rawSize; i++) {
+          if (selector.live_member(listIds[i])) liveSize++;
+        }
+        ivf->invlists->release_ids((size_t)listId, listIds);
+        return liveSize;
+      }
+
+      VectorSearchResult searchSelectedLists(const VectorSearchRequest& request,
+                                             std::span<const faiss::idx_t> listIds,
+                                             std::span<const float> centroidDists,
+                                             int64_t selectedLiveVectors) {
+        assert(ivf != nullptr);
+        assert(request.query != nullptr);
+        assert(request.dims == index.d);
+
+        VectorSearchResult result;
+        result.scoresAreExact = exactScores;
+        result.breadthExhausted = true;
+        if (request.candidates <= 0 || listIds.empty()) {
+          result.poolExhausted = true;
+          return result;
+        }
+
+        ids.assign((size_t)request.candidates, (faiss::idx_t)-1);
+        dists.assign((size_t)request.candidates, 0.0f);
+
+        faiss::SearchParametersIVF ivfParams;
+        ivfParams.sel = &selector;
+        // max_codes remains 0: selected IVF lists are scanned in full.
+        ivfParams.nprobe = listIds.size();
+        ivf->search_preassigned(1, request.query, request.candidates,
+                                listIds.data(), centroidDists.data(),
+                                dists.data(), ids.data(), false, &ivfParams);
+
+        result.hits.reserve((size_t)request.candidates);
+        int64_t liveHits = 0;
+        for (int64_t i = 0; i < request.candidates; i++) {
+          faiss::idx_t fid = ids[(size_t)i];
+          if (fid < 0) continue;
+          liveHits++;
+          result.hits.push_back({
+            .score = scoreFromDist(dists[(size_t)i], metric),
+            .segOrd = segOrd,
+            .valueRank = (int64_t)fid,
+          });
+        }
+
+        result.poolExhausted = liveHits < request.candidates
+          || selectedLiveVectors <= request.candidates;
+        return result;
+      }
 
       VectorSearchResult search(const VectorSearchRequest& request) override {
+        // Flat (non-IVF) FAISS path only.  IVF aux indexes are always routed
+        // through CompositeVectorEngine::searchSelectedLists() after global list
+        // allocation, so they never reach this method - there is no per-segment
+        // IVF breadth fallback here (that would be a second, divergent deepen
+        // policy competing with the host allocator).
+        assert(!isIvf);
         assert(request.query != nullptr);
         assert(request.dims == index.d);
         if (request.candidates <= 0) {
@@ -610,33 +736,7 @@ public:
 
         faiss::SearchParameters flatParams;
         flatParams.sel = &selector;
-        faiss::SearchParametersIVF ivfParams;
-        ivfParams.sel = &selector;
-        // ivfParams.max_codes stays 0 (unlimited) by design: entries within an
-        // IVF list are insertion-ordered, not relevance-ordered, so any
-        // within-list truncation drops arbitrary candidates - possibly the
-        // best one.  Breadth (nprobe) is the only legitimate work limiter;
-        // probed lists are always scanned in full.
-
-        faiss::SearchParameters* params = &flatParams;
-        int32_t effectiveBreadth = 0;
-        if (isIvf) {
-          assert(nlist > 0);
-          // INTERIM breadth rule for Milestone 1: the request nprobe applies
-          // to every segment and is clamped to that segment's nlist.  With no
-          // explicit nprobe, use this segment's sqrt(nlist) build default.
-          // This is the known equal-work trap; Milestone 2 replaces it with a
-          // pinned total-effort budget and global list allocation.
-          int32_t fallback = defaultBreadth > 0
-            ? defaultBreadth
-            : std::max<int32_t>(1, (int32_t)std::sqrt((double)nlist));
-          effectiveBreadth = request.breadth > 0 ? request.breadth : fallback;
-          effectiveBreadth = std::clamp(effectiveBreadth, 1, std::max(1, nlist));
-          ivfParams.nprobe = (size_t)effectiveBreadth;
-          params = &ivfParams;
-        }
-
-        index.search(1, request.query, request.candidates, dists.data(), ids.data(), params);
+        index.search(1, request.query, request.candidates, dists.data(), ids.data(), &flatParams);
 
         VectorSearchResult result;
         result.hits.reserve((size_t)request.candidates);
@@ -654,10 +754,7 @@ public:
 
         result.scoresAreExact = exactScores;
         result.poolExhausted = liveHits < request.candidates || request.candidates >= index.ntotal;
-        result.breadthExhausted = nlist <= 0 || effectiveBreadth >= nlist;
-        if (!result.breadthExhausted) {
-          result.nextBreadth = std::min(nlist, std::max(effectiveBreadth + 1, effectiveBreadth * 2));
-        }
+        result.breadthExhausted = true;
         return result;
       }
     };
@@ -824,7 +921,49 @@ public:
     class CompositeVectorEngine final : public VectorEngine {
       std::vector<EngineSlot> slots;
       int64_t totalVectors;
+      int64_t liveTotalVectors;
       int64_t kDocs;
+      int32_t metric;
+
+      struct CoarseRun {
+        std::vector<faiss::idx_t> listIds;
+        std::vector<float> centroidDists;
+      };
+
+      struct CoarseHead {
+        float score = 0.0f;
+        int32_t slotOrd = -1;
+        faiss::idx_t listId = -1;
+      };
+
+      struct CoarseHeadLess {
+        bool operator()(const CoarseHead& a, const CoarseHead& b) const noexcept {
+          if (a.score != b.score) return a.score < b.score;
+          if (a.slotOrd != b.slotOrd) return a.slotOrd > b.slotOrd;
+          return a.listId > b.listId;
+        }
+      };
+
+      std::vector<CoarseRun> runs;
+      std::vector<size_t> cursors;
+      std::vector<CoarseHead> heads;
+      std::vector<int32_t> heapIndexes;
+      int32_t heapSize = 0;
+      std::vector<std::vector<faiss::idx_t>> selectedListIds;
+      std::vector<std::vector<float>> selectedCentroidDists;
+      std::vector<int64_t> selectedLiveVectors;
+      // Per-slot watermarks: how many selected lists (and their live vectors)
+      // have already been scanned into the host pool, so a pure-breadth deepen
+      // round scans only the freshly allocated tail instead of re-scanning every
+      // list.  lastScannedCandidates detects a depth (candidate-count) change,
+      // which DOES force a full re-scan (FAISS has no resumable list cursor).
+      std::vector<size_t> scannedListCount;
+      std::vector<int64_t> liveVectorsScanned;
+      int64_t lastScannedCandidates = -1;
+      double allocatedCost = 0.0;
+      int32_t referenceBreadth = 1;
+      bool coarseReady = false;
+      bool hasIvfSlots = false;
 
       static bool better(const VectorEngineHit& a, const VectorEngineHit& b) {
         if (a.score != b.score) return a.score > b.score;
@@ -834,9 +973,6 @@ public:
 
       int64_t candidatesForSlot(int64_t requested, int64_t n) const {
         if (requested <= 0 || n <= 0) return 0;
-        // INTERIM depth rule for Milestone 1: distribute by segment size and
-        // floor each segment at min(k, N_i).  Milestone 2 owns global
-        // allocation and total-effort semantics.
         long double proportional = ((long double)requested * (long double)n)
           / (long double)std::max<int64_t>(1, totalVectors);
         int64_t bySize = (int64_t)std::ceil(proportional);
@@ -844,9 +980,146 @@ public:
         return std::min(n, std::max(bySize, floor));
       }
 
+      CoarseHead makeHead(int32_t slotOrd) const {
+        const auto& run = runs[(size_t)slotOrd];
+        size_t cursor = cursors[(size_t)slotOrd];
+        faiss::idx_t listId = run.listIds[cursor];
+        float dist = run.centroidDists[cursor];
+        return {
+          .score = scoreFromDist(dist, metric),
+          .slotOrd = slotOrd,
+          .listId = listId,
+        };
+      }
+
+      void ensureCoarseReady(const VectorSearchRequest& request) {
+        if (coarseReady) return;
+        coarseReady = true;
+        referenceBreadth = defaultIvfNList(liveTotalVectors);
+        runs.resize(slots.size());
+        cursors.assign(slots.size(), 0);
+        heads.resize(slots.size());
+        selectedListIds.resize(slots.size());
+        selectedCentroidDists.resize(slots.size());
+        selectedLiveVectors.assign(slots.size(), 0);
+        scannedListCount.assign(slots.size(), 0);
+        liveVectorsScanned.assign(slots.size(), 0);
+        heapIndexes.clear();
+        heapIndexes.reserve(slots.size());
+
+        for (size_t i = 0; i < slots.size(); i++) {
+          auto* ivf = slots[i].ivfEngine;
+          if (ivf == nullptr || slots[i].liveVectorCount <= 0 || ivf->getNList() <= 0) continue;
+          ivf->coarseRun(request.query, request.dims, runs[i].listIds, runs[i].centroidDists);
+          while (cursors[i] < runs[i].listIds.size() && runs[i].listIds[cursors[i]] < 0) {
+            cursors[i]++;
+          }
+          if (cursors[i] >= runs[i].listIds.size()) continue;
+          heads[i] = makeHead((int32_t)i);
+          heapIndexes.push_back((int32_t)i);
+          hasIvfSlots = true;
+        }
+        heapSize = (int32_t)heapIndexes.size();
+      }
+
+      double defaultBudget() const {
+        // nprobe=0 default: probe as many lists as a SINGLE IVF index of
+        // nlist=referenceBreadth would by its own default, i.e. sqrt(nlist).  As
+        // a scan fraction that is sqrt(referenceBreadth) / referenceBreadth =
+        // 1 / sqrt(referenceBreadth) (= N^-0.25 for referenceBreadth=sqrt(N)).
+        // This depends only on the total live vector count, so it is
+        // MERGE-STABLE: repartitioning the same vectors into more or fewer
+        // segments does not move it.  Host auto-deepening grows breadth from
+        // this lean start when too few distinct live docs come back.
+        //
+        // A per-segment sum was rejected: sum_s sqrt(N_s) / sqrt(N) =
+        // sqrt(numSegments) >= 1, which clamps to a full scan; and even summing
+        // per-segment defaults (sum_s sqrt(nlist_s) / sqrt(N) = S^0.75 * N^-0.25)
+        // keeps an S-dependent term that drifts on merges.
+        return 1.0 / std::sqrt((double)std::max(1, referenceBreadth));
+      }
+
+      double budgetForRequest(const VectorSearchRequest& request) const {
+        double p = request.breadth > 0
+          ? (double)request.breadth / (double)std::max(1, referenceBreadth)
+          : defaultBudget();
+        p = std::max(p, (double)request.minScanFraction);
+        return std::clamp(p, 0.0, 1.0);
+      }
+
+      int32_t breadthForBudget(double p) const {
+        if (p <= 0.0) return 1;
+        double breadth = std::ceil(p * (double)std::max(1, referenceBreadth));
+        if (breadth >= (double)std::numeric_limits<int32_t>::max()) {
+          return std::numeric_limits<int32_t>::max();
+        }
+        return std::max(1, (int32_t)breadth);
+      }
+
+      void allocateToBudget(const VectorSearchRequest& request) {
+        ensureCoarseReady(request);
+        if (!hasIvfSlots || heapSize <= 0) return;
+
+        double target = budgetForRequest(request);
+        if (allocatedCost + 1.0e-15 >= target) return;
+
+        IndexedPQ<CoarseHead, CoarseHeadLess, int32_t> pq(
+          std::span<CoarseHead>(heads.data(), heads.size()),
+          std::span<int32_t>(heapIndexes.data(), heapIndexes.size()),
+          heapSize);
+        while (pq.size() > 0 && allocatedCost + 1.0e-15 < target) {
+          int32_t slotOrd = pq.indexOfTop();
+          auto& head = pq.top();
+          faiss::idx_t listId = head.listId;
+          int64_t liveSize = slots[(size_t)slotOrd].ivfEngine->liveListSize(listId);
+
+          selectedListIds[(size_t)slotOrd].push_back(listId);
+          selectedCentroidDists[(size_t)slotOrd].push_back(
+            runs[(size_t)slotOrd].centroidDists[cursors[(size_t)slotOrd]]);
+          selectedLiveVectors[(size_t)slotOrd] += liveSize;
+          if (liveTotalVectors > 0) {
+            allocatedCost += (double)liveSize / (double)liveTotalVectors;
+          }
+
+          cursors[(size_t)slotOrd]++;
+          while (cursors[(size_t)slotOrd] < runs[(size_t)slotOrd].listIds.size()
+                 && runs[(size_t)slotOrd].listIds[cursors[(size_t)slotOrd]] < 0) {
+            cursors[(size_t)slotOrd]++;
+          }
+          if (cursors[(size_t)slotOrd] < runs[(size_t)slotOrd].listIds.size()) {
+            head = makeHead(slotOrd);
+            pq.updateTop();
+          } else {
+            pq.removeTopIndex();
+          }
+        }
+        heapSize = (int32_t)pq.size();
+      }
+
+      int32_t nextBreadth(const VectorSearchRequest& request) {
+        if (!hasIvfSlots || heapSize <= 0) return 0;
+        IndexedPQ<CoarseHead, CoarseHeadLess, int32_t> pq(
+          std::span<CoarseHead>(heads.data(), heads.size()),
+          std::span<int32_t>(heapIndexes.data(), heapIndexes.size()),
+          heapSize);
+        int32_t slotOrd = pq.indexOfTop();
+        int64_t liveSize = slots[(size_t)slotOrd].ivfEngine->liveListSize(pq.top().listId);
+        double nextCost = liveTotalVectors > 0
+          ? (double)liveSize / (double)liveTotalVectors
+          : 0.0;
+        double minStep = 1.0 / (double)std::max(1, referenceBreadth);
+        int32_t next = breadthForBudget(std::min(1.0, allocatedCost + std::max(nextCost, minStep)));
+        return std::max(next, request.breadth + 1);
+      }
+
     public:
-      CompositeVectorEngine(std::vector<EngineSlot>&& slots, int64_t totalVectors, int64_t kDocs) noexcept
-        : slots(std::move(slots)), totalVectors(totalVectors), kDocs(kDocs) {}
+      CompositeVectorEngine(std::vector<EngineSlot>&& slots, int64_t totalVectors,
+                            int64_t liveTotalVectors, int64_t kDocs, int32_t metric) noexcept
+        : slots(std::move(slots)),
+          totalVectors(totalVectors),
+          liveTotalVectors(liveTotalVectors),
+          kDocs(kDocs),
+          metric(metric) {}
 
       VectorSearchResult search(const VectorSearchRequest& request) override {
         VectorSearchResult merged;
@@ -855,25 +1128,70 @@ public:
         merged.breadthExhausted = true;
         if (request.candidates <= 0) return merged;
 
-        for (auto& slot : slots) {
-          int64_t candidates = candidatesForSlot(request.candidates, slot.vectorCount);
-          if (candidates <= 0) continue;
-          VectorSearchRequest subReq = request;
-          subReq.candidates = candidates;
-          VectorSearchResult part = slot.engine->search(subReq);
+        allocateToBudget(request);
+
+        // The host re-enters search() to deepen along one of two axes per round:
+        //   DEPTH  - request.candidates grew: need more candidates from the SAME
+        //            lists.  FAISS has no resumable list cursor, so re-scan all
+        //            selected lists at the new depth.
+        //   BREADTH - allocateToBudget appended new lists at the same candidate
+        //            depth: only the freshly allocated tail needs scanning, since
+        //            prior lists' hits are already unioned into the host pool.
+        // Scanning only the new tail on a breadth round turns the old O(rounds x
+        // lists) IVF re-scan into O(lists) total.  A breadth round is only entered
+        // after a poolExhausted=true round (host loop), so every prior list is
+        // already drained at this candidate depth - their omission from the AND
+        // below is correct.  Flat (below-threshold) engines are breadth-
+        // independent and small, so they are simply re-run; the host dedups their
+        // unchanged hits via seenVectors, and re-running keeps search() a pure
+        // function of its arguments for the flat-only path (test oracles rely on
+        // that; the IVF tail-scan is incremental only because the host unions).
+        bool depthGrew = request.candidates != lastScannedCandidates;
+        lastScannedCandidates = request.candidates;
+
+        for (size_t i = 0; i < slots.size(); i++) {
+          auto& slot = slots[i];
+          VectorSearchResult part;
+          if (slot.ivfEngine != nullptr) {
+            size_t total = selectedListIds[i].size();
+            size_t start = depthGrew ? 0 : scannedListCount[i];
+            int64_t rangeLive = depthGrew
+              ? selectedLiveVectors[i]
+              : selectedLiveVectors[i] - liveVectorsScanned[i];
+            scannedListCount[i] = total;
+            liveVectorsScanned[i] = selectedLiveVectors[i];
+            if (start >= total) continue;
+            int64_t candidates = std::min(request.candidates, slot.vectorCount);
+            if (candidates <= 0) continue;
+            VectorSearchRequest subReq = request;
+            subReq.candidates = candidates;
+            // search_preassigned requires centroid distances aligned 1:1 with
+            // list ids; the two arrays are only coupled by adjacent push_backs
+            // in allocateToBudget.
+            assert(selectedListIds[i].size() == selectedCentroidDists[i].size());
+            part = slot.ivfEngine->searchSelectedLists(
+              subReq,
+              std::span<const faiss::idx_t>(selectedListIds[i].data() + start, total - start),
+              std::span<const float>(selectedCentroidDists[i].data() + start, total - start),
+              rangeLive);
+          } else {
+            int64_t candidates = candidatesForSlot(request.candidates, slot.vectorCount);
+            if (candidates <= 0) continue;
+            VectorSearchRequest subReq = request;
+            subReq.candidates = candidates;
+            part = slot.engine->search(subReq);
+          }
           merged.scoresAreExact = merged.scoresAreExact && part.scoresAreExact;
           merged.poolExhausted = merged.poolExhausted && part.poolExhausted;
-          merged.breadthExhausted = merged.breadthExhausted && part.breadthExhausted;
-          if (!part.breadthExhausted && part.nextBreadth > request.breadth) {
-            if (merged.nextBreadth == 0) {
-              merged.nextBreadth = part.nextBreadth;
-            } else {
-              merged.nextBreadth = std::min(merged.nextBreadth, part.nextBreadth);
-            }
-          }
           merged.hits.insert(merged.hits.end(),
                              std::make_move_iterator(part.hits.begin()),
                              std::make_move_iterator(part.hits.end()));
+        }
+        if (hasIvfSlots) {
+          merged.breadthExhausted = heapSize <= 0;
+          if (!merged.breadthExhausted) {
+            merged.nextBreadth = nextBreadth(request);
+          }
         }
         std::stable_sort(merged.hits.begin(), merged.hits.end(), better);
         return merged;
@@ -920,29 +1238,86 @@ public:
 private:
   static constexpr double MIN_COSINE_NORM_SQ = 1.0e-30;
 
-  static void rescoreCandidates(std::span<VectorEngineHit> candidates,
-                                IndexReader& reader,
-                                std::span<SegFieldInfo* const> segInfos,
-                                const float* queryPtr,
-                                int32_t dims,
-                                int32_t metric,
-                                bool normalizeColumnOnCosineRescore) {
+  /// O(1) UPPER BOUND on a segment's live vector count, used as the budget
+  /// denominator (referenceBreadth, list-cost normalization) and the
+  /// targetDocReq cap.  An exact count under deletes required walking the
+  /// field (every rank for sparse single-valued, the whole column iterator
+  /// for multi-valued) on EVERY query - O(N_seg) bookkeeping to budget a
+  /// search that examines ~N^0.75 vectors at the default.  An upper bound is
+  /// the safe direction to relax: overestimating only makes the scan
+  /// fraction leaner and targetDocReq higher, and host deepening compensates
+  /// (the same stance as cost accounting ignoring the domain filter).
+  /// UNDERestimating is not safe: targetDocReq = min(liveTotal, ...) would
+  /// stop the widen loop before K achievable docs.  Exact for no-deletes and
+  /// for dense single-valued (identity mapping => live count == numLive).
+  static int64_t liveVectorUpperBound(IndexReader::Segment& segment,
+                                      VectorReader& vr) {
+    LiveDocs* live = segment.liveDocs();
+    if (live == nullptr) return vr.numVectors();
+    if (!vr.isMultiValued()) {
+      // Each live doc holds at most one vector.
+      return std::min<int64_t>(vr.numVectors(), live->numLive());
+    }
+    return vr.numVectors();
+  }
+
+  static void rescoreAndCollapseCandidates(std::vector<VectorEngineHit>& candidates,
+                                           IndexReader& reader,
+                                           std::span<SegFieldInfo* const> segInfos,
+                                           std::span<const SegV2D> v2dPerSeg,
+                                           const float* queryPtr,
+                                           int32_t dims,
+                                           int32_t metric,
+                                           bool normalizeColumnOnCosineRescore,
+                                           int64_t kDocs,
+                                           std::vector<DocHit>& docHits) {
+    docHits.clear();
+    if (candidates.empty() || kDocs <= 0) return;
+
+    std::sort(candidates.begin(), candidates.end(),
+        [](const VectorEngineHit& a, const VectorEngineHit& b) {
+          if (a.segOrd != b.segOrd) return a.segOrd < b.segOrd;
+          return a.valueRank < b.valueRank;
+        });
+
     std::vector<std::optional<VectorReader>> vectorReaders(segInfos.size());
-    for (auto& candidate : candidates) {
-      if (candidate.segOrd < 0 || (size_t)candidate.segOrd >= segInfos.size()) {
+    docHits.reserve(std::min<int64_t>((int64_t)candidates.size(), kDocs));
+    for (size_t i = 0; i < candidates.size();) {
+      int32_t segOrd = candidates[i].segOrd;
+      if (segOrd < 0 || (size_t)segOrd >= segInfos.size()) {
         throw std::runtime_error("KnnQuery: vector candidate segment ordinal out of range");
       }
-      SegFieldInfo* info = segInfos[(size_t)candidate.segOrd];
+      SegFieldInfo* info = segInfos[(size_t)segOrd];
       if (info == nullptr) {
         throw std::runtime_error("KnnQuery: vector candidate segment has no field info");
       }
-      auto& vr = vectorReaders[(size_t)candidate.segOrd];
+      auto& vr = vectorReaders[(size_t)segOrd];
       if (!vr) {
-        vr.emplace(reader.segments()[(size_t)candidate.segOrd].postingsReader(), *info);
+        vr.emplace(reader.segments()[(size_t)segOrd].postingsReader(), *info);
       }
-      candidate.score = exactScore(queryPtr, vr->vectorAtRank(candidate.valueRank),
-                                   dims, metric, normalizeColumnOnCosineRescore,
-                                   candidate.score);
+
+      int32_t docId = v2dPerSeg[(size_t)segOrd].resolve(candidates[i].valueRank);
+      float bestScore = std::numeric_limits<float>::lowest();
+      do {
+        float score = exactScore(queryPtr, vr->vectorAtRank(candidates[i].valueRank),
+                                 dims, metric, normalizeColumnOnCosineRescore,
+                                 candidates[i].score);
+        bestScore = std::max(bestScore, score);
+        i++;
+      } while (i < candidates.size()
+               && candidates[i].segOrd == segOrd
+               && v2dPerSeg[(size_t)segOrd].resolve(candidates[i].valueRank) == docId);
+
+      docHits.push_back({segOrd, docId, bestScore});
+    }
+
+    std::sort(docHits.begin(), docHits.end(), [](const DocHit& a, const DocHit& b) {
+      if (a.score != b.score) return a.score > b.score;
+      if (a.segOrd != b.segOrd) return a.segOrd < b.segOrd;
+      return a.docId < b.docId;
+    });
+    if ((int64_t)docHits.size() > kDocs) {
+      docHits.resize((size_t)kDocs);
     }
   }
 

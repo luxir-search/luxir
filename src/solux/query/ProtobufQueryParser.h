@@ -127,10 +127,16 @@ public:
     if (k <= 0) {
       throw std::runtime_error(std::format("KnnQuery for field '{}' must have k > 0 (got {})", field, k));
     }
+    float minScanFraction = knnQuery.min_scan_fraction();
+    if (minScanFraction < 0.0f || minScanFraction > 1.0f) {
+      throw std::runtime_error(std::format(
+        "KnnQuery for field '{}' has min_scan_fraction {} outside [0,1]",
+        field, minScanFraction));
+    }
 
     return pool.make<solux::KnnQuery>(
       field, vectorType, queryVec, k, knnQuery.nprobe(), knnQuery.refine_candidates(),
-      knnQuery.exact());
+      minScanFraction, knnQuery.exact());
   }
 
   std::span<Query*> parseQueryList(const google::protobuf::RepeatedPtrField<solux::proto::Query>& queries) {

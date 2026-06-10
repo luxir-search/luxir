@@ -68,11 +68,28 @@ version, so cleanup can unlink old files without breaking existing readers.
 The FAISS index bytes are decoded lazily on first kNN use and then cached on
 the segment reader.
 
-`nprobe` currently applies per segment and is clamped to each segment's list
-count. When `nprobe` is `0`, each segment starts from its own default breadth.
-Breadth auto-deepening can widen segments when filters or doc collapse leave
-too few live documents. This is an interim per-segment policy; a future total
-effort knob will allocate breadth globally.
+`nprobe` is a merge-stable IVF effort knob. The wire name stays familiar, but
+the value is interpreted as the number of lists Solux would probe if the field
+were a single IVF index built with `nlist = sqrt(live_vector_count)`, capped the
+same way as the builder's `nlist`. Internally this becomes a scan fraction
+`nprobe / sqrt(live_vector_count)`. That fraction is applied across the current
+per-segment indexes, so pure merges do not change the requested total effort.
+When `nprobe` is `0`, Solux chooses an adaptive default and may auto-deepen
+breadth when filters or doc collapse leave too few live documents. Explicit
+`nprobe` pins the total effort cap.
+
+For per-segment IVF, Solux ranks all segments' IVF lists by query-to-centroid
+distance, then probes the globally best lists until the requested scan fraction
+is reached. List cost is based on that list's live vector count divided by the
+field's live vector count. This handles uneven list sizes and avoids applying
+equal work to every segment. The field-wide live count in these formulas is a
+cheap upper bound when a segment has deletions (exact counting would scan the
+field per query); the bound only errs toward slightly leaner initial effort,
+which auto-deepening recovers.
+
+`min_scan_fraction` optionally sets a direct floor on the internal scan
+fraction. It is a float in `[0,1]`; values like `0.001` mean 0.1% of the live
+vector values, not 0.001%.
 
 Probed lists are always scanned in full. Entries within an IVF list are stored
 in insertion order, not relevance order, so a partial list scan would drop
@@ -81,8 +98,8 @@ work limiter.
 
 `refine_candidates` controls overfetch for approximate ANN. An explicit
 value pins the candidate pool to exactly that many approximate candidates
-(clamped up to `k`) - an absolute count, like `nprobe`, so large-`k` callers
-are not forced to choose between coarse multiplier steps. When unset, the
+(clamped up to `k`) - an absolute count, so large-`k` callers are not forced to
+choose between coarse multiplier steps. When unset, the
 default pool is affine with a multiplier that shrinks as `k` grows - a fixed count plus
 `k` times a ratio that decays from ~10 at `k=1` to a small floor by
 `k=1000`. Quantization mis-ranking displaces a true neighbor by a roughly
@@ -90,13 +107,9 @@ constant number of candidates regardless of `k`, so small `k` needs the
 fixed headroom; large `k` requests are recall-oriented retrieval whose
 near-tied tail does not benefit from extra overfetch, so the pool stays
 proportionate instead of exploding. Candidates are unioned across deepen
-rounds, rescanned from the full-precision column, sorted by exact score, and
-collapsed to one hit per document.
-
-With per-segment indexes, candidate depth is distributed by segment size for
-now: each segment receives a proportional share of the requested candidate
-pool, floored at `min(k, segment_vector_count)`. A future allocator will own
-global candidate and breadth budgeting.
+rounds using approximate scores for the widen decision. Once widening finishes,
+the final candidate pool is rescanned from the full-precision column, sorted by
+exact score, and collapsed to one hit per document.
 
 `exact` requires exact (true top-k) results. It is a result contract, not an
 execution mode: the engine uses a path that guarantees exactness - currently
@@ -124,9 +137,10 @@ at query time instead.
 ## Recall Semantics
 
 IVF+PQ is approximate. Higher `nprobe` and higher `refine_candidates` generally
-increase recall and latency. Setting `nprobe` to the full `nlist` and using a
-large enough candidate pool makes the aux search exhaustive over IVF lists, but
-PQ ordering still decides which candidates are returned before column rescore.
+increase recall and latency. Setting `nprobe` to at least the reference
+`sqrt(live_vector_count)` list count, or setting `min_scan_fraction=1`, makes
+the aux search exhaustive over IVF lists, but PQ ordering still decides which
+candidates are returned before column rescore.
 For exact results, use the `exact` flag.
 
 Similarity scores are model-relative: the score distribution depends on the
@@ -142,6 +156,3 @@ calibrated per deployment, not carried between models.
   ANN search.
 - FAISS indexes are decoded into memory on first use. The vector column itself
   is mmapped.
-- Per-segment `nprobe` and candidate distribution are interim policies. They
-  preserve the current API but do not pin total work across different segment
-  counts.

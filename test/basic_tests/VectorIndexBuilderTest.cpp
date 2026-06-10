@@ -687,12 +687,13 @@ TEST_F(VectorIndexBuilderTest, mergeBuildsOverlayBeforePlainPublishDuringActiveI
   EXPECT_EQ(vectorCommitBuildCount(), 0);
   EXPECT_EQ(vectorMergeBuildCount(), 1);
 
+  constexpr int32_t fullEffortNProbe = 20;  // > sqrt(160), exhaustive under total-effort semantics.
   auto beforeApprox = runKnnIds(h.getSearchEngine(), "embedding_v",
                                 {0.2f, 1.0f, 1.0f, 0.0f}, 3,
-                                /*nprobe=*/2, /*refineCandidates=*/200);
+                                /*nprobe=*/fullEffortNProbe, /*refineCandidates=*/200);
   auto beforeExact = runKnnIds(h.getSearchEngine(), "embedding_v",
                                {0.2f, 1.0f, 1.0f, 0.0f}, 3,
-                               /*nprobe=*/2, /*refineCandidates=*/200, /*exact=*/true);
+                               /*nprobe=*/fullEffortNProbe, /*refineCandidates=*/200, /*exact=*/true);
   EXPECT_EQ(beforeApprox, beforeExact);
 
   h.commit();
@@ -710,10 +711,10 @@ TEST_F(VectorIndexBuilderTest, mergeBuildsOverlayBeforePlainPublishDuringActiveI
 
   auto afterApprox = runKnnIds(h.getSearchEngine(), "embedding_v",
                                {0.2f, 1.0f, 1.0f, 0.0f}, 3,
-                               /*nprobe=*/2, /*refineCandidates=*/200);
+                               /*nprobe=*/fullEffortNProbe, /*refineCandidates=*/200);
   auto afterExact = runKnnIds(h.getSearchEngine(), "embedding_v",
                               {0.2f, 1.0f, 1.0f, 0.0f}, 3,
-                              /*nprobe=*/2, /*refineCandidates=*/200, /*exact=*/true);
+                              /*nprobe=*/fullEffortNProbe, /*refineCandidates=*/200, /*exact=*/true);
   EXPECT_EQ(afterApprox, afterExact);
 }
 

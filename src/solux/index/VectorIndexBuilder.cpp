@@ -54,9 +54,7 @@ int32_t chooseIvfNList(int64_t ntotal) {
   if (VectorIndexBuilder::ivfPqNList > 0) {
     return (int32_t)std::min<int64_t>(VectorIndexBuilder::ivfPqNList, ntotal);
   }
-  int64_t derived = (int64_t)std::sqrt((double)ntotal);
-  derived = std::clamp<int64_t>(derived, 1, 4096);
-  return (int32_t)std::min<int64_t>(derived, ntotal);
+  return defaultIvfNList(ntotal);
 }
 
 int32_t choosePqM(int32_t dims) {

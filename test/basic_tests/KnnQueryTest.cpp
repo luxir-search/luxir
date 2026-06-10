@@ -216,7 +216,7 @@ protected:
   static LocalReq* makeKnnReq(SoluxNode& node, std::string_view field,
                               std::vector<float> queryVec, int32_t k,
                               int32_t nprobe = 0, int32_t refineCandidates = 0,
-                              bool exact = false) {
+                              bool exact = false, float minScanFraction = 0.0f) {
     auto* lreq = LocalReq::create(node.getSearchEngine());
     lreq->proto.mutable_collection()->add_name("main");
     auto& topDocs = *(*lreq->proto.mutable_ops())["q"].mutable_top_docs();
@@ -225,19 +225,20 @@ protected:
     topDocs.mutable_fields()->Add("id");
 
     setKnnQuery(*topDocs.mutable_query(), field, queryVec, k, nprobe,
-                refineCandidates, exact);
+                refineCandidates, exact, minScanFraction);
     return lreq;
   }
 
   static void setKnnQuery(proto::Query& query, std::string_view field,
                           const std::vector<float>& queryVec, int32_t k,
                           int32_t nprobe = 0, int32_t refineCandidates = 0,
-                          bool exact = false) {
+                          bool exact = false, float minScanFraction = 0.0f) {
     auto& knn = *query.mutable_knn();
     knn.set_field(field);
     knn.set_k(k);
     if (nprobe > 0) knn.set_nprobe(nprobe);
     if (refineCandidates > 0) knn.set_refine_candidates(refineCandidates);
+    if (minScanFraction > 0.0f) knn.set_min_scan_fraction(minScanFraction);
     if (exact) knn.set_exact(true);
     auto& f32 = *knn.mutable_query()->mutable_f32();
     for (float v : queryVec) f32.add_v(v);
@@ -1098,6 +1099,103 @@ TEST_F(KnnQueryTest, exactBypassesApproximateIndex) {
   }
 
   req->done();
+}
+
+TEST_F(KnnQueryTest, minScanFractionFloorsExplicitNProbe) {
+  IvfPqAuxGuard guard(/*nlist=*/2, /*m=*/2, /*bits=*/2,
+                      /*nprobe=*/1, /*minTraining=*/16, /*refineRatio=*/8);
+  CollectionHelper h("main");
+  h.clear();
+  installVecSchema(h.collection(), proto::VectorParams::L2);
+
+  for (int i = 0; i < 80; i++) {
+    float off = (float)i * 0.01f;
+    h.index(flatdoc("id", "a" + std::to_string(i),
+                    "embedding_v", std::vector<float>{off, 0.0f, 0.0f, 0.0f}));
+    h.index(flatdoc("id", "b" + std::to_string(i),
+                    "embedding_v", std::vector<float>{1000.0f + off, 0.0f, 0.0f, 0.0f}));
+  }
+  h.index(flatdoc("id", std::string("outlier"),
+                  "embedding_v", std::vector<float>{600.0f, 0.0f, 0.0f, 0.0f}));
+  h.commit({"*"});
+
+  auto* narrow = makeKnnReq(*soluxNode, "embedding_v", {400, 0, 0, 0}, 5,
+                            /*nprobe=*/1, /*refineCandidates=*/40);
+  narrow->execute();
+  auto narrowIds = resultIds(*narrow);
+  narrow->done();
+  ASSERT_EQ(narrowIds.size(), 5u);
+  for (const auto& id : narrowIds) {
+    EXPECT_NE(id, "outlier");
+  }
+
+  auto* floor = makeKnnReq(*soluxNode, "embedding_v", {400, 0, 0, 0}, 5,
+                           /*nprobe=*/1, /*refineCandidates=*/200,
+                           /*exact=*/false, /*minScanFraction=*/1.0f);
+  floor->execute();
+  auto floorIds = resultIds(*floor);
+  floor->done();
+
+  auto* exact = makeKnnReq(*soluxNode, "embedding_v", {400, 0, 0, 0}, 5,
+                           /*nprobe=*/1, /*refineCandidates=*/200, /*exact=*/true);
+  exact->execute();
+  auto exactIds = resultIds(*exact);
+  exact->done();
+
+  ASSERT_EQ(floorIds.size(), 5u);
+  EXPECT_EQ(floorIds[0], "outlier");
+  EXPECT_EQ(floorIds, exactIds);
+}
+
+// Regression: nprobe=0 (the default) must NOT silently probe every IVF list.
+// The default scan fraction is anchored on the reference index's own default
+// (1/sqrt(referenceBreadth) = N^-0.25), a lean start, not a full scan.  Same
+// hostile geometry as exactBypassesApproximateIndex: two tight blobs (nlist=2)
+// plus an outlier at 600 that k-means assigns to blob B's list; the query at
+// 400 sits in blob A's list.  refine_candidates is held below blob A's doc
+// count so the host fills its candidate target from blob A alone and does not
+// auto-deepen into blob B - a default that full-scanned would surface the
+// outlier (its true #1), so its absence proves the default stayed lean.
+// min_scan_fraction=1 over the same request recovers it, confirming the corpus
+// would reveal a full scan if one happened.
+TEST_F(KnnQueryTest, defaultNProbeStaysLeanNotFullScan) {
+  IvfPqAuxGuard guard(/*nlist=*/2, /*m=*/2, /*bits=*/2,
+                      /*nprobe=*/1, /*minTraining=*/16, /*refineRatio=*/8);
+  CollectionHelper h("main");
+  h.clear();
+  installVecSchema(h.collection(), proto::VectorParams::L2);
+
+  for (int i = 0; i < 80; i++) {
+    float off = (float)i * 0.01f;
+    h.index(flatdoc("id", "a" + std::to_string(i),
+                    "embedding_v", std::vector<float>{off, 0.0f, 0.0f, 0.0f}));
+    h.index(flatdoc("id", "b" + std::to_string(i),
+                    "embedding_v", std::vector<float>{1000.0f + off, 0.0f, 0.0f, 0.0f}));
+  }
+  h.index(flatdoc("id", std::string("outlier"),
+                  "embedding_v", std::vector<float>{600.0f, 0.0f, 0.0f, 0.0f}));
+  h.commit({"*"});
+
+  auto* dflt = makeKnnReq(*soluxNode, "embedding_v", {400, 0, 0, 0}, 5,
+                          /*nprobe=*/0, /*refineCandidates=*/40);
+  dflt->execute();
+  auto dfltIds = resultIds(*dflt);
+  dflt->done();
+  ASSERT_EQ(dfltIds.size(), 5u);
+  for (const auto& id : dfltIds) {
+    EXPECT_NE(id, "outlier")
+        << "nprobe=0 must stay at the lean index default, not probe every list";
+  }
+
+  auto* full = makeKnnReq(*soluxNode, "embedding_v", {400, 0, 0, 0}, 5,
+                          /*nprobe=*/0, /*refineCandidates=*/200,
+                          /*exact=*/false, /*minScanFraction=*/1.0f);
+  full->execute();
+  auto fullIds = resultIds(*full);
+  full->done();
+  ASSERT_EQ(fullIds.size(), 5u);
+  EXPECT_EQ(fullIds[0], "outlier")
+      << "min_scan_fraction=1 forces the exhaustive scan the default must avoid";
 }
 
 TEST_F(KnnQueryTest, mixedIndexedAndBelowThresholdCompositionMatchesExact) {

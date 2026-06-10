@@ -185,17 +185,20 @@ message KnnQuery {
   string field = 1;        // vector field name (e.g. "embedding_v")
   Vector query = 2;        // query vector - must match the field's dims
   int32 k = 3;             // number of nearest-neighbor documents to return
-  int32 nprobe = 4;        // exact IVF lists to probe (clamped to nlist); may return
-                           // < k docs. 0 = index default, with host auto-deepening.
+  int32 nprobe = 4;        // merge-stable IVF effort: lists to probe if this field
+                           // were one IVF index with nlist=sqrt(live vectors).
+                           // 0 = adaptive default, with host auto-deepening.
   int32 refine_candidates = 5; // exact number of approximate candidates fetched for
                            // full-precision rescore (clamped up to k). 0 = adaptive
                            // default (fixed headroom plus a k-decaying multiple).
   bool exact = 6;          // require exact (true top-k) results: the engine uses an
                            // execution path that guarantees them (currently a full
                            // scan of the stored vector column) and does not consult
-                           // approximate ANN indexes. nprobe / refine_candidates
-                           // are ignored. Cost is linear in the number of stored
-                           // vectors.
+                           // approximate ANN indexes. nprobe / min_scan_fraction /
+                           // refine_candidates are ignored. Cost is linear in the
+                           // number of stored vectors.
+  float min_scan_fraction = 7; // optional floor for the internal scan fraction,
+                           // in [0,1]. 0 = no floor.
 }
 
   // use NamedValue here instead? Repeat field so this can be used to query multiple fields at once? Add a field glob/regex?

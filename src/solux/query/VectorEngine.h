@@ -12,6 +12,7 @@ struct VectorSearchRequest {
   // Domain filtering is supplied by engine construction today.  Flat FAISS
   // receives it through SearchParameters::sel instead of per request state.
   int32_t breadth = 0;
+  float minScanFraction = 0.0f;
 };
 
 /// Candidate from the vector engine seam.  score is exact for flat engines;
