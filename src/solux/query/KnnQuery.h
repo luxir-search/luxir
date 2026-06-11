@@ -172,6 +172,11 @@ public:
   // Lets tests assert the per-liveGen cache reuses across queries and
   // rebuilds when new deletes commit.
   static inline std::atomic<int64_t> rankLiveBitmapBuildsForTests{0};
+  static inline std::atomic<int64_t> seenFoldsForTests{0};
+  // Post-fold hits that were already pooled.  The eligible contract makes
+  // this impossible for conforming engines; nonzero means selector wiring
+  // broke and deepen rounds silently regressed to re-returning the pool.
+  static inline std::atomic<int64_t> staleHitsForTests{0};
 
   /// Resolves a segment-local value rank to its owning docId.  Exactly one mode is
   /// active per segment:
@@ -200,29 +205,17 @@ public:
     float score;
   };
 
-  struct VectorKey {
-    int64_t valueRank;
-    int32_t segOrd;
-  };
-
-  struct VectorKeyHash {
-    size_t operator()(const VectorKey& key) const noexcept {
-      uint64_t x = (uint64_t)(uint32_t)key.segOrd;
-      uint64_t y = (uint64_t)key.valueRank;
-      y ^= y >> 33;
-      y *= 0xff51afd7ed558ccdULL;
-      y ^= y >> 33;
-      y *= 0xc4ceb9fe1a85ec53ULL;
-      y ^= y >> 33;
-      return (size_t)(y ^ (x * 0x9e3779b97f4a7c15ULL));
-    }
-  };
-
-  struct VectorKeyEqual {
-    bool operator()(const VectorKey& a, const VectorKey& b) const noexcept {
-      return a.segOrd == b.segOrd && a.valueRank == b.valueRank;
-    }
-  };
+  /// Dedup key for a (segOrd, valueRank) hit: segOrd in the top 20 bits,
+  /// valueRank in the low 44 (1M segments, 17.6T vectors per segment).
+  /// Debug-assert ONLY - no other code enforces these bounds, they are
+  /// physics-scale (2^44 ranks implies a tens-of-TB segment file).  A wrap
+  /// would silently alias keys and drop distinct hits from the pool.
+  static constexpr int PACK_RANK_BITS = 44;
+  static uint64_t packSegRank(int32_t segOrd, int64_t valueRank) {
+    assert(segOrd >= 0 && segOrd < (1 << (64 - PACK_RANK_BITS)));
+    assert(valueRank >= 0 && valueRank < ((int64_t)1 << PACK_RANK_BITS));
+    return ((uint64_t)(uint32_t)segOrd << PACK_RANK_BITS) | (uint64_t)valueRank;
+  }
 
   /// Strict total order on engine hits: score desc, then (segOrd, valueRank)
   /// asc.  Being total makes every bounded top-N cut deterministic regardless
@@ -535,9 +528,11 @@ public:
           }
           bool isIvf = vaux->getEngine() == VectorAuxMeta::ENGINE_IVFPQ;
           approximateEngine = approximateEngine || !vaux->scoresAreExact();
+          // rankLivePerSeg[i] is shared with the engine, NOT moved: the widen
+          // loop's foldSeen() seeds the eligible bitmaps from it.
           auto faissEngine = std::make_unique<SegmentFaissVectorEngine>(
             *idx, (int32_t)i, seg, v2dPerSeg[i], domain,
-            std::move(rankLivePerSeg[i]),
+            rankLivePerSeg[i],
             metric, vaux->scoresAreExact(), isIvf,
             vaux->getNList());
           SegmentFaissVectorEngine* ivfEngine = isIvf ? faissEngine.get() : nullptr;
@@ -588,7 +583,7 @@ public:
         : kDocs;
 
       std::vector<VectorEngineHit> candidateHits;
-      boost::unordered_flat_set<VectorKey, VectorKeyHash, VectorKeyEqual> seenVectors;
+      boost::unordered_flat_set<uint64_t> seenVectors;
       std::vector<DocHit> docHits;
       boost::unordered_flat_set<uint64_t> seenDocs;
       // Per-segment exactness of the pooled candidates: a segment is marked
@@ -623,6 +618,88 @@ public:
         : std::max(0, maxKnnBreadth);
       bool candidatePoolSorted = true;
       bool candidateScoresExact = true;
+
+      // Cross-round dedup runs in two phases.  Round 1 (the overwhelmingly
+      // common only round) uses the small seenVectors hash set and passes no
+      // eligible bitmaps.  The FIRST deepen of either axis folds the seen set
+      // into per-segment rank-space "eligible" bitmaps (init: the segment's
+      // cached rank-live bitmap when it has one, else all-ones; pooled ranks
+      // cleared), which then serve double duty: the host's dedup structure
+      // (O(1) bit test instead of a hash probe, and bounded at numVectors/8
+      // bytes where the hash set would grow toward the candidate cap), and
+      // the engines' NOT-pooled exclusion filter via request.eligible - so
+      // every post-fold round spends its whole result heap on fresh hits
+      // (the resumable cursor FAISS does not provide), and kReq switches
+      // from cumulative pool depth to a per-round fresh budget.  A segment
+      // with no liveness seed gets its span only once something of its is
+      // pooled (markSeen activates it), so untouched no-delete segments
+      // keep FAISS's compiled-out no-selector fast path.  Fold cost is
+      // O(ntotal/8 + seen), paid only by queries that deepen.
+      std::vector<std::vector<uint8_t>> eligibleStore;
+      std::vector<std::span<const uint8_t>> eligibleSpans;
+      bool seenFolded = false;
+      auto foldSeen = [&]() {
+        if (seenFolded) return;
+        seenFolded = true;
+        seenFoldsForTests.fetch_add(1, std::memory_order_relaxed);
+        eligibleStore.resize(numSegs);
+        eligibleSpans.assign(numSegs, {});
+        std::vector<char> cleared(numSegs, 0);
+        for (size_t i = 0; i < numSegs; i++) {
+          int64_t n = segVectorCounts[i];
+          if (n <= 0) continue;
+          auto& bits = eligibleStore[i];
+          if (rankLivePerSeg[i] != nullptr) {
+            size_t numBytes = ((size_t)n + 7) / 8;
+            assert(rankLivePerSeg[i]->numBytes == numBytes);
+            bits.assign(rankLivePerSeg[i]->bits, rankLivePerSeg[i]->bits + numBytes);
+          } else {
+            // No cached liveness (no deletes, or a flat slot): not-pooled
+            // only.  Flat engines filter the domain themselves, so for them
+            // the bit means just "not pooled yet" - same dedup semantics.
+            fillAllRanksSet(bits, n);
+          }
+        }
+        for (uint64_t key : seenVectors) {
+          size_t seg = (size_t)(key >> PACK_RANK_BITS);
+          uint64_t r = key & (((uint64_t)1 << PACK_RANK_BITS) - 1);
+          eligibleStore[seg][(size_t)(r >> 3)] &= (uint8_t)~(1u << (r & 7));
+          cleared[seg] = 1;
+        }
+        // Hand engines a span only where it can exclude something: a
+        // liveness seed or at least one pooled rank.  An all-ones span
+        // would only demote a previously selector-less scan to a per-vector
+        // always-true probe.
+        for (size_t i = 0; i < numSegs; i++) {
+          if (!eligibleStore[i].empty()
+              && (rankLivePerSeg[i] != nullptr || cleared[i])) {
+            eligibleSpans[i] = eligibleStore[i];
+          }
+        }
+        seenVectors = boost::unordered_flat_set<uint64_t>{};
+      };
+      // Mark a hit seen; true if it was fresh.  Post-fold every engine
+      // returns only fresh hits (eligible is binding), so a stale hit here
+      // means a broken engine/selector wiring - counted for tests.  The
+      // first pooled rank of a span-less segment activates its span for the
+      // next round.
+      auto markSeen = [&](int32_t segOrd, int64_t valueRank) -> bool {
+        if (!seenFolded) {
+          return seenVectors.insert(packSegRank(segOrd, valueRank)).second;
+        }
+        auto& bits = eligibleStore[(size_t)segOrd];
+        size_t byteIdx = (size_t)(valueRank >> 3);
+        uint8_t mask = (uint8_t)(1u << (valueRank & 7));
+        bool fresh = (bits[byteIdx] & mask) != 0;
+        bits[byteIdx] &= (uint8_t)~mask;
+        if (!fresh) {
+          staleHitsForTests.fetch_add(1, std::memory_order_relaxed);
+        } else if (eligibleSpans[(size_t)segOrd].empty()) {
+          eligibleSpans[(size_t)segOrd] = bits;
+        }
+        return fresh;
+      };
+
       // WIDEN loop: pool candidates until targetDocReq distinct live docs (or
       // a pool/breadth/cap limit).  Two deepen axes, tried in order:
       //   DEPTH   - the engine pool was not exhausted at this candidate count:
@@ -635,9 +712,7 @@ public:
       // is deferred to one terminal pass after the loop.  Deliberately not
       // overlapped with rescore: interleaving would re-read column vectors
       // for segments that later rounds add candidates to, trading throughput
-      // under load for latency.  seenVectors dedups across rounds because
-      // depth rounds re-return prior hits (FAISS has no resumable cursor) and
-      // flat slots re-run on breadth rounds.
+      // under load for latency.
       for (;;) {
         VectorSearchRequest request{
           .query = queryPtr,
@@ -645,6 +720,7 @@ public:
           .candidates = kReq,
           .breadth = breadth,
           .minScanFraction = query.getMinScanFraction(),
+          .eligible = std::span<const std::span<const uint8_t>>(eligibleSpans),
         };
         VectorSearchResult result = engine->search(request);
 
@@ -658,8 +734,7 @@ public:
         }
         for (const auto& hit : result.hits) {
           if (candidateHits.size() >= maxVectorHits) break;
-          VectorKey key{hit.segOrd, hit.valueRank};
-          if (seenVectors.insert(key).second) {
+          if (markSeen(hit.segOrd, hit.valueRank)) {
             candidateHits.push_back(hit);
             if (!result.scoresAreExact
                 && (roundExactSeg.empty() || !roundExactSeg[(size_t)hit.segOrd])) {
@@ -682,15 +757,31 @@ public:
         if ((int64_t)docHits.size() >= targetDocReq) break;
         if (candidateHits.size() >= maxVectorHits) break;
 
-        if (!result.poolExhausted && kReq < cap) {
-          int64_t want = projectedKReq(kReq, targetDocReq, (int64_t)docHits.size(), cap);
-          kReq = std::min(cap, std::max(kReq + 1, want));
+        // DEPTH: project the POOL size that should collapse to targetDocReq
+        // docs from the observed docs-per-candidate yield, then request only
+        // the INCREMENT over the banked pool: post-fold every engine returns
+        // fresh hits on top of it (eligible exclusion), so re-requesting the
+        // cumulative depth would overshoot the projection by the pool size,
+        // compounding across rounds.  Floored at the doc deficit so a
+        // degenerate projection still progresses.  `appended` is the
+        // termination backstop: a round that added nothing fresh and still
+        // claims an unexhausted pool (a conforming engine cannot - fresh
+        // hits or poolExhausted) must not loop at the same shape.
+        if (!result.poolExhausted && appended
+            && (int64_t)candidateHits.size() < cap) {
+          int64_t pool = (int64_t)candidateHits.size();
+          int64_t want = projectedKReq(pool, targetDocReq, (int64_t)docHits.size(), cap);
+          kReq = std::min(cap - pool,
+                          std::max(targetDocReq - (int64_t)docHits.size(),
+                                   want - pool));
+          foldSeen();
           continue;
         }
 
         if (result.poolExhausted && !result.breadthExhausted && breadth < maxBreadth) {
           int32_t nextBreadth = result.nextBreadth > breadth ? result.nextBreadth : breadth + 1;
           breadth = std::min(nextBreadth, maxBreadth);
+          foldSeen();
           continue;
         }
 
@@ -770,13 +861,26 @@ public:
       class LocalDomainSelector final : public faiss::IDSelector {
         const SegV2D& v2d;
         DocSet* domain;
+        // Optional rank-space eligibility bits (request.eligible): tested
+        // before the resolve so already-pooled ranks cost one bit probe, no
+        // doc resolution.  Out-of-range ids are rejected, mirroring
+        // faiss::IDSelectorBitmap's byte-bound guard, so a corrupt id from
+        // the zero-copy mmapped lists cannot read past the bitmap.  Empty
+        // when the host has not folded yet.
+        std::span<const uint8_t> eligible;
 
       public:
-        LocalDomainSelector(const SegV2D& v2d, DocSet* domain) noexcept
-          : v2d(v2d), domain(domain) {}
+        LocalDomainSelector(const SegV2D& v2d, DocSet* domain,
+                            std::span<const uint8_t> eligible = {}) noexcept
+          : v2d(v2d), domain(domain), eligible(eligible) {}
 
         bool is_member(faiss::idx_t id) const final {
           if (id < 0) return false;
+          uint64_t r = (uint64_t)id;
+          if (!eligible.empty()) {
+            if ((r >> 3) >= eligible.size()) return false;
+            if (((eligible[r >> 3] >> (r & 7)) & 1) == 0) return false;
+          }
           return domain->get(v2d.resolve((int64_t)id));
         }
       };
@@ -788,19 +892,67 @@ public:
       LiveDocs* liveDocs;
       // Rank-space liveness bitmap, present iff the segment has deletes
       // (shared from the VectorAuxReader's per-liveGen cache).  liveListSize
-      // always reads it; it doubles as the FAISS selector when the domain is
-      // exactly liveDocs (unfiltered query).
+      // always reads it; RoundSelector hands it to FAISS as the eligibility
+      // bitmap when the domain is exactly liveDocs (unfiltered query).
       std::shared_ptr<const RankLiveBitmap> rankLive;
-      std::optional<faiss::IDSelectorBitmap> bitmapSelector;
-      std::optional<LocalDomainSelector> domainSelector;
-      // Selector handed to FAISS scans: &bitmapSelector when the domain is
-      // liveDocs itself, &domainSelector for filtered domains, null when the
-      // segment needs no filtering.
-      const faiss::IDSelector* sel = nullptr;
+      // The query domain per the live-filtered contract; domainIsLive marks
+      // the unfiltered case (domain == the liveDocs docset) where rank-space
+      // bitmaps can stand in for the resolve-based check.
+      DocSet* domain;
+      bool domainIsLive;
       int32_t metric;
       bool exactScores;
       bool isIvf;
       int32_t nlist;
+
+      /// The ONLY selector policy: built per scan call from (domain,
+      /// domainIsLive, rankLive, request.eligible), so round 1 and deepen
+      /// rounds cannot drift apart.  Cheapest selector wins:
+      ///   no domain, no eligible      -> null (FAISS compiles the per-vector
+      ///                                  check out)
+      ///   domain == liveDocs          -> IDSelectorBitmap over rankLive, or
+      ///                                  over eligible once present (it is
+      ///                                  seeded from rankLive, so liveness
+      ///                                  rides along - one bit probe)
+      ///   filtered domain             -> LocalDomainSelector, composing the
+      ///                                  eligible bit test (when present)
+      ///                                  with the resolve-based check
+      /// Per-call construction is two stores; owns the selector storage, so
+      /// keep it alive across the FAISS call (copy/move deleted to enforce
+      /// that selPtr never outlives the optionals it points into).
+      class RoundSelector {
+        std::optional<faiss::IDSelectorBitmap> bitmap;
+        std::optional<LocalDomainSelector> domainSel;
+        const faiss::IDSelector* selPtr = nullptr;
+
+      public:
+        RoundSelector(const SegmentFaissVectorEngine& eng,
+                      const VectorSearchRequest& request) {
+          std::span<const uint8_t> elig =
+            (size_t)eng.segOrd < request.eligible.size()
+              ? request.eligible[(size_t)eng.segOrd]
+              : std::span<const uint8_t>{};
+          if (eng.domain != nullptr && !eng.domainIsLive) {
+            domainSel.emplace(eng.v2d, eng.domain, elig);
+            selPtr = &*domainSel;
+          } else if (!elig.empty()) {
+            bitmap.emplace(elig.size(), elig.data());
+            selPtr = &*bitmap;
+          } else if (eng.domainIsLive) {
+            bitmap.emplace(eng.rankLive->numBytes, eng.rankLive->bits);
+            selPtr = &*bitmap;
+          }
+        }
+
+        RoundSelector(const RoundSelector&) = delete;
+        RoundSelector& operator=(const RoundSelector&) = delete;
+
+        // FAISS declares sel as a mutable pointer but only calls const
+        // members on it during search.
+        faiss::IDSelector* get() const {
+          return const_cast<faiss::IDSelector*>(selPtr);
+        }
+      };
 
     public:
       SegmentFaissVectorEngine(faiss::Index& index,
@@ -808,7 +960,7 @@ public:
                                IndexReader::Segment& seg,
                                const SegV2D& v2d,
                                DocSet* domain,
-                               std::shared_ptr<const RankLiveBitmap>&& rankLive,
+                               std::shared_ptr<const RankLiveBitmap> rankLive,
                                int32_t metric,
                                bool exactScores,
                                bool isIvf,
@@ -819,6 +971,9 @@ public:
           v2d(v2d),
           liveDocs(seg.liveDocs()),
           rankLive(std::move(rankLive)),
+          domain(domain),
+          domainIsLive(domain != nullptr && liveDocs != nullptr
+                       && domain == &liveDocs->docset()),
           metric(metric),
           exactScores(exactScores),
           isIvf(isIvf),
@@ -827,15 +982,6 @@ public:
           throw std::runtime_error("KnnQuery: vector aux marked IVF but FAISS index is not IndexIVF");
         }
         assert((liveDocs != nullptr) == (this->rankLive != nullptr));
-        if (domain != nullptr) {
-          if (liveDocs != nullptr && domain == &liveDocs->docset()) {
-            bitmapSelector.emplace(this->rankLive->numBytes, this->rankLive->bits);
-            sel = &*bitmapSelector;
-          } else {
-            domainSelector.emplace(v2d, domain);
-            sel = &*domainSelector;
-          }
-        }
       }
 
       int32_t getNList() const noexcept { return nlist; }
@@ -901,11 +1047,12 @@ public:
         std::vector<faiss::idx_t> ids((size_t)request.candidates, (faiss::idx_t)-1);
         std::vector<float> dists((size_t)request.candidates, 0.0f);
 
+        // Single per-round selector policy (see RoundSelector); null when
+        // the segment needs no filtering this round, so the scanner
+        // compiles the per-vector check out.
+        RoundSelector roundSel(*this, request);
         faiss::SearchParametersIVF ivfParams;
-        // FAISS declares sel as a mutable pointer but only calls const
-        // members on it during search.  null when the segment needs no
-        // filtering - the scanner then compiles the per-vector check out.
-        ivfParams.sel = const_cast<faiss::IDSelector*>(sel);
+        ivfParams.sel = roundSel.get();
         // max_codes remains 0: selected IVF lists are scanned in full.
         ivfParams.nprobe = listIds.size();
         // Local stats sink, discarded: with a null stats argument FAISS does
@@ -960,8 +1107,9 @@ public:
         std::vector<faiss::idx_t> ids((size_t)request.candidates, (faiss::idx_t)-1);
         std::vector<float> dists((size_t)request.candidates, 0.0f);
 
+        RoundSelector roundSel(*this, request);
         faiss::SearchParameters flatParams;
-        flatParams.sel = const_cast<faiss::IDSelector*>(sel);
+        flatParams.sel = roundSel.get();
         index.search(1, request.query, request.candidates, dists.data(), ids.data(), &flatParams);
 
         VectorSearchResult result;
@@ -1043,6 +1191,27 @@ public:
             dims, vr.dims()));
         }
 
+        // Pooled-rank exclusion (request.eligible), honored at DOC level:
+        // this engine's scores are exact and it emits each doc's max-sim
+        // vector, so a cleared bit anywhere in a doc's run means the doc's
+        // best vector is already in the host pool and nothing else in the
+        // run can ever improve the doc - skip it whole.  (A segment is
+        // served by exactly one slot, so cleared ranks here are exactly
+        // this engine's prior emissions.)  Skipped docs do not count toward
+        // eligibleDocs: poolExhausted means "a deeper request adds nothing",
+        // and pooled docs never will.
+        std::span<const uint8_t> elig =
+          (size_t)segOrd < request.eligible.size()
+            ? request.eligible[(size_t)segOrd]
+            : std::span<const uint8_t>{};
+        auto pooledInRun = [&elig](int64_t begin, int64_t end) {
+          if (elig.empty()) return false;
+          for (int64_t r = begin; r < end; r++) {
+            if (((elig[(size_t)(r >> 3)] >> (r & 7)) & 1) == 0) return true;
+          }
+          return false;
+        };
+
         // Inline run-collapse: value ranks are doc-ordered (the valDoc map is
         // monotonic; sparse select and dense identity likewise), so a doc's
         // vectors form a contiguous run and max-sim collapse falls out of one
@@ -1060,7 +1229,7 @@ public:
             } while (end < numVals && (int32_t)valDoc.value() == docId);
             unused(idx);
 
-            if (docEligible(docId)) {
+            if (docEligible(docId) && !pooledInRun(rank, end)) {
               eligibleDocs++;
               auto [bestRank, bestScore] = bestInRun(rank, end, [&](int64_t r) {
                 return exactScore(request.query, vr.vectorAtRank(r), dims, metric,
@@ -1080,6 +1249,7 @@ public:
           // Single-valued (dense identity or sparse select): runs are length
           // 1 by construction.
           for (int64_t rank = 0; rank < numVals; rank++) {
+            if (pooledInRun(rank, rank + 1)) continue;
             int32_t docId = v2d.resolve(rank);
             if (!docEligible(docId)) continue;
             eligibleDocs++;
@@ -1136,7 +1306,7 @@ public:
     ///     parallel mode, so results are bit-identical either way.
     ///
     /// SINGLE-SHOT lifecycle: coarseReady, cursors, watermarks and
-    /// lastScannedCandidates mutate monotonically across search() rounds of
+    /// lastScannedBreadth mutate across search() rounds of
     /// ONE query.  prepare() builds a fresh instance per query; reusing one
     /// across queries would silently serve the old query's coarse ranking.
     class CompositeVectorEngine final : public VectorEngine {
@@ -1188,10 +1358,13 @@ public:
       // Per-slot watermarks: how many selected lists have already been
       // scanned into the host pool, so a pure-breadth deepen round scans only
       // the freshly allocated tail instead of re-scanning every list.
-      // lastScannedCandidates detects a depth (candidate-count) change, which
-      // DOES force a full re-scan (FAISS has no resumable list cursor).
+      // lastScannedBreadth detects a depth round (the host grows exactly one
+      // axis per round, so an UNCHANGED breadth means depth), which DOES
+      // force a full re-scan - candidate counts cannot stand in for this
+      // since post-fold they are per-round fresh budgets and may repeat or
+      // shrink between rounds.
       std::vector<size_t> scannedListCount;
-      int64_t lastScannedCandidates = -1;
+      int32_t lastScannedBreadth = -1;
       double allocatedCost = 0.0;
       int32_t referenceBreadth = 1;
       bool coarseReady = false;
@@ -1470,35 +1643,47 @@ public:
         allocateToBudget(request);
 
         // The host re-enters search() to deepen along one of two axes per round:
-        //   DEPTH  - request.candidates grew: need more candidates from the SAME
+        //   DEPTH  - breadth unchanged: need more candidates from the SAME
         //            lists.  FAISS has no resumable list cursor, so re-scan all
-        //            selected lists at the new depth.
-        //   BREADTH - allocateToBudget appended new lists at the same candidate
-        //            depth: only the freshly allocated tail needs scanning, since
-        //            prior lists' hits are already unioned into the host pool.
+        //            selected lists; request.eligible excludes everything the
+        //            host already pooled, so the re-scan returns only fresh
+        //            hits and the round's candidate count is a FRESH budget,
+        //            not a cumulative depth (it may repeat or shrink, which is
+        //            why breadth - the host grows exactly one axis per round -
+        //            is the depth-round signal, not the candidate count).
+        //   BREADTH - allocateToBudget appended new lists: only the freshly
+        //            allocated tail needs scanning, since prior lists' hits
+        //            are already unioned into the host pool.
         // Scanning only the new tail on a breadth round turns the old O(rounds x
         // lists) IVF re-scan into O(lists) total.  A breadth round is only entered
         // after a poolExhausted=true round (host loop), so every prior list is
-        // already drained at this candidate depth - omitting them from this
-        // round's exhaustion accounting is correct.  Flat (below-threshold)
-        // engines are breadth-independent and small, so they are simply re-run;
-        // the host dedups their unchanged hits via seenVectors, and re-running
-        // keeps search() a pure function of its arguments for the flat-only
-        // path (test oracles rely on that; the IVF tail-scan is incremental
-        // only because the host unions).
+        // already drained at this depth - omitting them from this round's
+        // exhaustion accounting is correct.  Flat (below-threshold) engines are
+        // breadth-independent and small, so they are simply re-run; they honor
+        // request.eligible like every engine (a doc whose pooled best vector is
+        // excluded can never improve an exact score, so the whole doc is
+        // skipped), which keeps search() a pure function of its arguments (the
+        // bitmaps are arguments; test oracles rely on the purity).
         //
         // RECALL SAFETY: IVF lists are disjoint, and for disjoint sets A, B
         // the global top-k of (A union B) is contained in top-k(A) union
         // top-k(B).  So the host's union of per-round top-k subsets is a
         // SUPERSET of what one global pass over all selected lists would
         // return - PROVIDED every list was scanned at the final candidate
-        // count, which is exactly what the depthGrew full re-scan maintains.
-        // Making the DEPTH axis incremental would break that invariant and
-        // silently lose recall, beyond merely fighting the cursorless API.
-        // The same lemma is why per-chunk scanning below loses nothing: every
-        // chunk scans at the full round candidate count.
-        bool depthGrew = request.candidates != lastScannedCandidates;
-        lastScannedCandidates = request.candidates;
+        // count, which is exactly what the depth-round full re-scan maintains.
+        // What must NOT happen on the depth axis is skipping previously
+        // scanned lists - that silently loses recall.  EXCLUDING the host's
+        // already-POOLED ranks (request.eligible) is safe, and is also what
+        // makes the smaller fresh-budget heaps sound: if x is in
+        // top-(pooled+k)(P) and x is not pooled, fewer than k members of
+        // (P minus pooled) beat x, so x is in top-k(P minus pooled) - the
+        // banked pool plus a k-deep fresh scan covers a (pooled+k)-deep
+        // cumulative scan exactly.  (Pooled is what the host KEPT -
+        // merge-cut hits were never pooled, stay eligible, and come back on
+        // the next round.)  The same lemma is why per-chunk scanning below
+        // loses nothing: every chunk scans at the full round candidate count.
+        bool depthGrew = request.breadth == lastScannedBreadth;
+        lastScannedBreadth = request.breadth;
 
         // Build the round's flat worklist: IVF tails chunked by live-vector
         // cost (the allocator already priced every selected list), whole
@@ -1662,6 +1847,17 @@ public:
 private:
   static constexpr double MIN_COSINE_NORM_SQ = 1.0e-30;
 
+  /// Fill `bits` with the all-set pattern for n ranks: ceil(n/8) 0xFF bytes
+  /// with the tail bits past n cleared.  Every rank bitmap in this file
+  /// keeps that tail invariant, so popcount(bits) == set ranks (see
+  /// RankLiveBitmap); build them through here so the mask lives once.
+  static void fillAllRanksSet(std::vector<uint8_t>& bits, int64_t n) {
+    bits.assign(((size_t)n + 7) / 8, (uint8_t)0xFF);
+    if (n & 7) {
+      bits.back() = (uint8_t)(0xFFu >> (8 - (n & 7)));
+    }
+  }
+
   /// Build the RankLiveBitmap (rank-space liveness + exact live vector
   /// count) for one segment's vector field.  Run once per liveDocs
   /// generation (cached on the VectorAuxReader), and sized by the segment's
@@ -1691,11 +1887,9 @@ private:
               seg.liveDocsShared()};
     }
 
-    auto owned = std::make_shared<std::vector<uint8_t>>(numBytes, (uint8_t)0xFF);
+    auto owned = std::make_shared<std::vector<uint8_t>>();
     std::vector<uint8_t>& bits = *owned;
-    if (numVectors & 7) {
-      bits.back() = (uint8_t)(0xFFu >> (8 - (numVectors & 7)));
-    }
+    fillAllRanksSet(bits, numVectors);
     int64_t cleared = 0;
     auto clearRanks = [&bits, &cleared](int64_t begin, int64_t end) {
       for (int64_t r = begin; r < end; r++) {

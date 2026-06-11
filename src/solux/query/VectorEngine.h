@@ -1,15 +1,23 @@
 #pragma once
 
 #include <cstdint>
+#include <span>
 #include <vector>
 
 namespace solux {
 
-/// One round of the host's widen loop.  The host re-enters search() with a
-/// monotonically growing request along two axes:
-///   - candidates (DEPTH): more results from the same recall effort.  Engines
-///     without resumable iteration re-return prior hits at the larger count;
-///     the host dedups, so that is correct (just not free).
+/// One round of the host's widen loop.  The host re-enters search() along two
+/// axes, growing exactly one per round:
+///   - candidates (DEPTH): more results from the same recall effort.  On
+///     round 1 (no `eligible` bitmaps) this is a plain pool-depth request.
+///     From the first deepen round on, the request carries per-segment
+///     `eligible` bitmaps with already-pooled ranks cleared and candidates
+///     becomes a PER-ROUND FRESH BUDGET - it may repeat or shrink across
+///     rounds - because every engine must exclude cleared ranks and so
+///     spends the whole result heap on fresh hits (a poor-man's resumable
+///     cursor).  The host plans round sizes and termination around that
+///     fresh-only property; an engine that re-returned pooled hits would
+///     stall the widen loop, not just waste work.
 ///   - breadth: more recall effort (for IVF, more lists; engine-defined for
 ///     other index kinds).  Units are merge-stable "reference index" lists:
 ///     the lists a single IVF index with nlist=sqrt(live vectors) would
@@ -25,6 +33,27 @@ struct VectorSearchRequest {
   // raises the effective breadth when breadth maps below it.  1.0 forces a
   // full scan.  Exact engines satisfy it trivially.
   float minScanFraction = 0.0f;
+  // Per-segment exclusion bitmaps (LSB-first bytes, bit r = vector rank r),
+  // indexed by segOrd; empty (or an empty per-segment span) until the host's
+  // first deepen round, when the host folds its pooled-hit set into them.
+  // Contract:
+  //   - A CLEARED bit means the rank is already in the host pool and MUST
+  //     NOT be returned.  This is a return filter only: whether cleared
+  //     ranks are visited or scored during traversal is engine business.
+  //     An engine that cannot push the filter down may drop cleared ranks
+  //     from its returned hits ONLY if the result heap is then refilled
+  //     with non-cleared ranks (scan past the pooled prefix) or the drops
+  //     are folded into its exhaustion answer - post-filtering a
+  //     fixed-depth scan under-returns fresh hits while still reporting an
+  //     unexhausted pool, which starves the host's depth axis (and never
+  //     trips the stale-hit counter, because the pooled hits never arrive).
+  //   - A SET bit promises NOTHING: not liveness, not domain membership.
+  //     The host seeds these bitmaps from per-query copies of the liveness
+  //     bitmap only where one exists; an engine's own domain/liveness
+  //     filtering still applies in full.
+  //   - The spans are valid only for the duration of this search() call.
+  //     The host mutates the backing bytes between rounds; never cache them.
+  std::span<const std::span<const uint8_t>> eligible;
 };
 
 /// Candidate from the vector engine seam.  score is exact for flat engines;

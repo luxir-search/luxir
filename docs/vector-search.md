@@ -129,7 +129,14 @@ constant number of candidates regardless of `k`, so small `k` needs the
 fixed headroom; large `k` requests are recall-oriented retrieval whose
 near-tied tail does not benefit from extra overfetch, so the pool stays
 proportionate instead of exploding. Candidates are unioned across deepen
-rounds using approximate scores for the widen decision. Once widening finishes,
+rounds using approximate scores for the widen decision; from the first deepen
+round on, already-pooled vectors are excluded from every engine's scan (the
+pooled set is folded into per-query copies of the segments' liveness bitmaps -
+all-ones where a segment has no deletions - and handed to the scanners as an
+eligibility filter), so each round's result heap is spent entirely on new
+candidates and each round requests only the projected shortfall rather than
+re-requesting the whole pool. The shared per-segment liveness cache itself is
+never modified by queries. Once widening finishes,
 the final candidate pool is rescanned from the full-precision column, sorted by
 exact score, and collapsed to one hit per document.
 

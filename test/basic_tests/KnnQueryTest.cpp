@@ -1843,6 +1843,81 @@ TEST_F(KnnQueryTest, ivfPqMultiValuedDeletesClearAllRanks) {
   EXPECT_EQ(ids[2], "d");
 }
 
+// Forces the widen loop past round 1 on an IVF segment so the seen-fold
+// fires: the pooled-hit set becomes per-segment eligible bitmaps (seeded
+// from the rank-live bitmap, so the deleted near-doc must STAY excluded on
+// deepen rounds) handed to FAISS as the NOT-pooled selector - depth rounds
+// then return only fresh hits.  A 40-vector doc hogs the small first-round
+// pool (refine_candidates=8 -> targetDocReq=8 docs, round 1 yields ~1);
+// the loop must still surface the runner-up docs and match exact.
+TEST_F(KnnQueryTest, ivfDeepenExcludesPooledAndDeleted) {
+  IvfPqAuxGuard guard(/*nlist=*/4, /*m=*/2, /*bits=*/2,
+                      /*nprobe=*/4, /*minTraining=*/16, /*refineRatio=*/8);
+  CollectionHelper h("main");
+  h.clear();
+  installMultiVecSchema(h.collection(), proto::VectorParams::L2);
+
+  std::vector<std::vector<float>> zvecs;
+  for (int i = 0; i < 40; i++) {
+    zvecs.push_back({(float)i * 0.001f, 0, 0, 0});
+  }
+  h.index(flatdoc("id", std::string("z"), "emb_vs", zvecs));
+  h.index(flatdoc("id", std::string("b"), "emb_vs",
+                  std::vector<std::vector<float>>{{1, 0, 0, 0}}));
+  h.index(flatdoc("id", std::string("c"), "emb_vs",
+                  std::vector<std::vector<float>>{{2, 0, 0, 0}}));
+  h.index(flatdoc("id", std::string("d"), "emb_vs",
+                  std::vector<std::vector<float>>{{3, 0, 0, 0}}));
+  h.index(flatdoc("id", std::string("del"), "emb_vs",
+                  std::vector<std::vector<float>>{{0.5f, 0, 0, 0}, {0.6f, 0, 0, 0}}));
+  for (int i = 0; i < 155; i++) {
+    float x = 50.0f + (float)i;
+    h.index(flatdoc("id", "f" + std::to_string(i), "emb_vs",
+                    std::vector<std::vector<float>>{{
+                        x, (float)(i % 7) * 0.1f, (float)(i % 13) * 0.05f, 0.25f}}));
+  }
+  h.commit({"*"});
+  {
+    auto reader = h.getIndexWriter()->getIndexReader();
+    ASSERT_EQ(reader->segments().size(), 1u);
+    ASSERT_NE(reader->segments()[0].getAuxReader("vec.emb_vs"), nullptr)
+        << "segment fell back to flat (below IVF training floor)";
+  }
+  std::vector<std::string> dels{"del"};
+  h.deleteByIds(dels, UpdateMessage::COMMIT);
+
+  int64_t folds0 = KnnQuery::seenFoldsForTests.load(std::memory_order_relaxed);
+  int64_t stale0 = KnnQuery::staleHitsForTests.load(std::memory_order_relaxed);
+  auto* req = makeKnnReq(*soluxNode, "emb_vs", {0, 0, 0, 0}, 4,
+                         /*nprobe=*/0, /*refineCandidates=*/8,
+                         /*exact=*/false, /*minScanFraction=*/1.0f);
+  req->execute();
+  auto ids = resultIds(*req);
+  req->done();
+  int64_t folds1 = KnnQuery::seenFoldsForTests.load(std::memory_order_relaxed);
+  EXPECT_GT(folds1, folds0) << "query never deepened; fold path unexercised";
+  // The eligible contract is binding: post-fold rounds must return only
+  // fresh hits.  A stale hit means the selector wiring quietly disconnected
+  // (deepen rounds would re-return the pool and the results would STILL
+  // look right, because markSeen dedups - this counter is the tripwire).
+  int64_t stale1 = KnnQuery::staleHitsForTests.load(std::memory_order_relaxed);
+  EXPECT_EQ(stale1, stale0) << "an engine returned an already-pooled rank post-fold";
+
+  auto* exact = makeKnnReq(*soluxNode, "emb_vs", {0, 0, 0, 0}, 4,
+                           /*nprobe=*/0, /*refineCandidates=*/8, /*exact=*/true);
+  exact->execute();
+  auto exactIds = resultIds(*exact);
+  exact->done();
+
+  ASSERT_EQ(ids.size(), 4u);
+  EXPECT_EQ(ids, exactIds);
+  EXPECT_EQ(ids[0], "z");
+  EXPECT_EQ(ids[1], "b");
+  EXPECT_EQ(ids[2], "c");
+  EXPECT_EQ(ids[3], "d");
+  for (const auto& id : ids) EXPECT_NE(id, "del");
+}
+
 TEST_F(KnnQueryTest, ivfPqCosineRawColumnRescoreNormalizes) {
   IvfPqAuxGuard guard(/*nlist=*/4, /*m=*/2, /*bits=*/2,
                       /*nprobe=*/4, /*minTraining=*/16, /*refineRatio=*/64);
