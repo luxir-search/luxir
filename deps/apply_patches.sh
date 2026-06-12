@@ -26,6 +26,18 @@
 #     patches/simdcomp.diff: drop _GLIBCXX_DEBUG from the debug flags (its
 #     ABI is incompatible with code built without it) and un-static a few
 #     functions Solux links directly.
+#
+#   deps/uni-algo (vendored in-repo, normally already patched in git)
+#     patches/uni-algo-word-only-newline-leak.patch: upstream v1.2.0 bug -
+#     the per-segment word property accumulator is reset only on a WB999
+#     break, not on WB3a/WB3b newline breaks, so a CR/LF/Newline run right
+#     after a word inherits its property and word_only emits it as a "word"
+#     ("sep\r\nlines" -> "sep", "\r\n", "lines"; newline runs became index
+#     terms). The fix resets the accumulator in WB3a/WB3b exactly like WB999
+#     (all four variants: utf8/utf16 x forward/reverse). Word BOUNDARIES are
+#     untouched - UAX#29 conformance is unaffected (gated in AnalysisTest,
+#     which also equivalence-checks word_only against the ASCII fast path).
+#     This entry only matters if uni-algo is ever re-fetched from upstream.
 set -euo pipefail
 cd "$(dirname "$0")"
 PATCH_DIR="$(pwd)/patches"  # absolute: git -C <repo> resolves relative paths in <repo>
@@ -61,6 +73,9 @@ apply "$VCPKG_ROOT" "$PATCH_DIR"/vcpkg-faiss-opt-level-dd.patch
 echo "vcpkg (asan): $VCPKG_ASAN_ROOT"
 apply "$VCPKG_ASAN_ROOT" "$PATCH_DIR"/vcpkg-asan-triplet-x64-linux.patch
 apply "$VCPKG_ASAN_ROOT" "$PATCH_DIR"/vcpkg-faiss-opt-level-dd.patch
+
+echo "uni-algo (vendored): $(pwd)/uni-algo"
+apply .. "$PATCH_DIR"/uni-algo-word-only-newline-leak.patch
 
 echo "simdcomp: $(pwd)/simdcomp"
 if [ -d simdcomp/.git ]; then

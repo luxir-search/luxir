@@ -61,6 +61,9 @@ uni-algo
 Vendored in-repo (v1.2.0, Unicode 15.1.0; see uni-algo/VENDORED.txt) and
 compiled by the main CMakeLists.txt (uni_algo target from src/data.cpp), so
 nothing to do here. make_deps.sh can re-fetch the identical subset from the
-upstream tag if the directory is ever removed.
+upstream tag if the directory is ever removed; apply_patches.sh then re-applies
+the local fix in patches/uni-algo-word-only-newline-leak.patch (the vendored
+copy in git already has it applied - see the apply_patches.sh header for what
+it fixes and why).
 
 TODO: automate / integrate simdcomp into the build system if we keep it.

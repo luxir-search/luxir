@@ -1,0 +1,76 @@
+diff --git a/deps/uni-algo/include/uni_algo/impl/impl_segment_word.h b/deps/uni-algo/include/uni_algo/impl/impl_segment_word.h
+index b1bc21a..23d58ff 100644
+--- a/deps/uni-algo/include/uni_algo/impl/impl_segment_word.h
++++ b/deps/uni-algo/include/uni_algo/impl/impl_segment_word.h
+@@ -248,9 +248,15 @@ uaix_static bool segment_word_utf8(struct impl_segment_word_state* const state,
+     else if (p_prop == prop_WB_CR && c_prop == prop_WB_LF) // WB3
+         result = false; // NOLINT
+     else if (p_prop == prop_WB_Newline || p_prop == prop_WB_CR || p_prop == prop_WB_LF) // WB3a
+-        result = true; // NOLINT
++    {
++        result = true;
++        *word_prop = 0; // Solux fix: reset segment prop like WB999 (word_only newline leak; see deps/patches/)
++    }
+     else if (c_prop == prop_WB_Newline || c_prop == prop_WB_CR || c_prop == prop_WB_LF) // WB3b
+-        result = true; // NOLINT
++    {
++        result = true;
++        *word_prop = 0; // Solux fix: reset segment prop like WB999 (word_only newline leak; see deps/patches/)
++    }
+     else if (p_prop == prop_WB_ZWJ && segment_word_prop_ext_pic(raw_prop)) // WB3c
+         result = false; // NOLINT
+     else if (p_prop == prop_WB_WSegSpace && c_prop == prop_WB_WSegSpace) // WB3d
+@@ -468,9 +474,15 @@ uaix_static bool segment_word_rev_utf8(struct impl_segment_word_state* const sta
+     else if (c_prop == prop_WB_CR && p_prop == prop_WB_LF) // WB3
+         result = false; // NOLINT
+     else if (c_prop == prop_WB_Newline || c_prop == prop_WB_CR || c_prop == prop_WB_LF) // WB3a
+-        result = true; // NOLINT
++    {
++        result = true;
++        *word_prop = 0; // Solux fix: reset segment prop like WB999 (word_only newline leak; see deps/patches/)
++    }
+     else if (p_prop == prop_WB_Newline || p_prop == prop_WB_CR || p_prop == prop_WB_LF) // WB3b
+-        result = true; // NOLINT
++    {
++        result = true;
++        *word_prop = 0; // Solux fix: reset segment prop like WB999 (word_only newline leak; see deps/patches/)
++    }
+     else if (c_prop == prop_WB_ZWJ && segment_word_prop_ext_pic(state->prev_cp_prop)) // WB3c
+         result = false; // NOLINT
+     else if (c_prop == prop_WB_WSegSpace && p_prop == prop_WB_WSegSpace) // WB3d
+@@ -635,9 +647,15 @@ uaix_static bool segment_word_utf16(struct impl_segment_word_state* const state,
+     else if (p_prop == prop_WB_CR && c_prop == prop_WB_LF) // WB3
+         result = false; // NOLINT
+     else if (p_prop == prop_WB_Newline || p_prop == prop_WB_CR || p_prop == prop_WB_LF) // WB3a
+-        result = true; // NOLINT
++    {
++        result = true;
++        *word_prop = 0; // Solux fix: reset segment prop like WB999 (word_only newline leak; see deps/patches/)
++    }
+     else if (c_prop == prop_WB_Newline || c_prop == prop_WB_CR || c_prop == prop_WB_LF) // WB3b
+-        result = true; // NOLINT
++    {
++        result = true;
++        *word_prop = 0; // Solux fix: reset segment prop like WB999 (word_only newline leak; see deps/patches/)
++    }
+     else if (p_prop == prop_WB_ZWJ && segment_word_prop_ext_pic(raw_prop)) // WB3c
+         result = false; // NOLINT
+     else if (p_prop == prop_WB_WSegSpace && c_prop == prop_WB_WSegSpace) // WB3d
+@@ -851,9 +869,15 @@ uaix_static bool segment_word_rev_utf16(struct impl_segment_word_state* const st
+     else if (c_prop == prop_WB_CR && p_prop == prop_WB_LF) // WB3
+         result = false; // NOLINT
+     else if (c_prop == prop_WB_Newline || c_prop == prop_WB_CR || c_prop == prop_WB_LF) // WB3a
+-        result = true; // NOLINT
++    {
++        result = true;
++        *word_prop = 0; // Solux fix: reset segment prop like WB999 (word_only newline leak; see deps/patches/)
++    }
+     else if (p_prop == prop_WB_Newline || p_prop == prop_WB_CR || p_prop == prop_WB_LF) // WB3b
+-        result = true; // NOLINT
++    {
++        result = true;
++        *word_prop = 0; // Solux fix: reset segment prop like WB999 (word_only newline leak; see deps/patches/)
++    }
+     else if (c_prop == prop_WB_ZWJ && segment_word_prop_ext_pic(state->prev_cp_prop)) // WB3c
+         result = false; // NOLINT
+     else if (c_prop == prop_WB_WSegSpace && p_prop == prop_WB_WSegSpace) // WB3d
