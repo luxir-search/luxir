@@ -5,7 +5,7 @@
 // FusionOp (after RRF merge); both share the same segment-grouped column
 // loader, batched protobuf assembly, and streaming reply path.
 //
-// The per-field load helpers (loadIntCol/loadStrCol/loadVectorCol/
+// The per-field load helpers (loadNumCol/loadStrCol/loadVectorCol/
 // loadStoredFields) are pure functions of (req, field, segDocs, sortedIdx,
 // segRunLength, columnsProto, tg) - they were lifted out of TopDocsReq
 // unchanged.
@@ -28,6 +28,7 @@
 #include "solux/search/Collector.h"
 #include "solux/search/SearchRequest.h"
 #include "solux/util/MemPool.h"
+#include "solux/util/NumericUtils.h"
 #include "solux/util/StrRef.h"
 #include "solux/util/solux_util.h"
 #include "solux/util/thread.h"
@@ -167,16 +168,48 @@ inline void loadStrCol(SearchRequest& req, std::string_view field, FieldType& fi
   loadStrColWithTargets(req, field, fieldType, starget, mtarget, segDocs, sortedIdx, segRunLength, tg);
 }
 
+// Per-type policies for emitting numeric columns.  INT columns hold the
+// value directly; FLOAT/DOUBLE columns hold sortable bits (see
+// util/NumericUtils.h) that decode() turns back into the client-facing
+// floating point value.
+struct IntColEmit {
+  using value_type = int64_t;
+  using arr_type = solux::proto::ArrInt;
+  static constexpr int64_t missingVal = std::numeric_limits<int64_t>::min();
+  static auto& singleCol(solux::proto::Column& col) { return *col.mutable_col_i(); }
+  static auto& multiCol(solux::proto::Column& col) { return *col.mutable_multi_i(); }
+  static int64_t decode(int64_t raw) { return raw; }
+};
+
+struct FloatColEmit {
+  using value_type = float;
+  using arr_type = solux::proto::ArrFloat;
+  static constexpr float missingVal = std::numeric_limits<float>::lowest();
+  static auto& singleCol(solux::proto::Column& col) { return *col.mutable_col_f(); }
+  static auto& multiCol(solux::proto::Column& col) { return *col.mutable_multi_f(); }
+  static float decode(int64_t raw) { return sortableInt32ToFloat((int32_t)raw); }
+};
+
+struct DoubleColEmit {
+  using value_type = double;
+  using arr_type = solux::proto::ArrDouble;
+  static constexpr double missingVal = std::numeric_limits<double>::lowest();
+  static auto& singleCol(solux::proto::Column& col) { return *col.mutable_col_d(); }
+  static auto& multiCol(solux::proto::Column& col) { return *col.mutable_multi_d(); }
+  static double decode(int64_t raw) { return sortableInt64ToDouble(raw); }
+};
+
 // We are guaranteed that the resources passed here will remain valid for any subtasks added to "tg" (i.e. the
 // caller waits on "tg" before releasing the resources).
-inline void loadIntCol(SearchRequest& req, std::string_view field, FieldType& fieldType,
+template <typename Emit>
+inline void loadNumCol(SearchRequest& req, std::string_view field, FieldType& fieldType,
                        std::span<const segdoc> segDocs, std::span<uint8_t> sortedIdx,
                        const std::span<uint8_t> segRunLength,
                        SearchResponse::ColumnsType& columnsProto, oneapi::tbb::task_group* tg)
 {
   auto& fieldCol = columnsProto[field];  // output Column in the protobuf
-  std::span<int64_t> starget; // single valued target
-  std::span<solux::proto::ArrInt*> mtarget;  // multi-valued target
+  std::span<typename Emit::value_type> starget; // single valued target
+  std::span<typename Emit::arr_type*> mtarget;  // multi-valued target
   auto columnSize = segDocs.size();
 
   if (columnSize == 0) {
@@ -184,20 +217,20 @@ inline void loadIntCol(SearchRequest& req, std::string_view field, FieldType& fi
   }
 
   if (!fieldType.multiValued()) {
-    auto& intCol = *fieldCol.mutable_col_i();
-    auto& intsProto = *intCol.mutable_v();
-    auto missingVal = std::numeric_limits<int64_t>::min();
-    intsProto.Resize(columnSize, missingVal);
-    starget = {intsProto.mutable_data(), (size_t)columnSize};
-    assert(&intsProto[columnSize - 1] >= starget.data() && &intsProto[columnSize - 1] < starget.data() + columnSize);
+    auto& numCol = Emit::singleCol(fieldCol);
+    numCol.set_missing_val(Emit::missingVal);
+    auto& valsProto = *numCol.mutable_v();
+    valsProto.Resize(columnSize, Emit::missingVal);
+    starget = {valsProto.mutable_data(), (size_t)columnSize};
+    assert(&valsProto[columnSize - 1] >= starget.data() && &valsProto[columnSize - 1] < starget.data() + columnSize);
   } else {
-    auto& intCol = *fieldCol.mutable_multi_i();
-    auto& arrArrProto = *intCol.mutable_v();
+    auto& numCol = Emit::multiCol(fieldCol);
+    auto& arrArrProto = *numCol.mutable_v();
     arrArrProto.Reserve(columnSize);
     for (auto i = 0u; i < columnSize; i++) {
       arrArrProto.Add();
     }
-    solux::proto::ArrInt** arrstart = arrArrProto.mutable_data();
+    typename Emit::arr_type** arrstart = arrArrProto.mutable_data();
     assert(&arrArrProto.Get(columnSize - 1) == arrstart[columnSize - 1]);
     mtarget = {arrstart, columnSize};
   }
@@ -222,17 +255,17 @@ inline void loadIntCol(SearchRequest& req, std::string_view field, FieldType& fi
       if (!fieldType.multiValued()) {
         auto valHandler = [&](size_t idx, int32_t doc, int64_t val) {
           assert(segDocs[idxSpan[idx]].docId() == doc);
-          starget[idxSpan[idx]] = val;
+          starget[idxSpan[idx]] = Emit::decode(val);
         };
         IntColReader::getSingleValues(poolGuard.pool(), postingsReader, segFieldInfo, sortedDocs, valHandler);
       } else {
         auto valHandler = [&](size_t idx, int32_t doc, int64_t val, int64_t valIdx, int64_t numVals) {
-          assert(segDocs[idxSpan[idx]].docId() == doc && val > 0);
-          solux::proto::ArrInt& target = *mtarget[idxSpan[idx]];
+          assert(segDocs[idxSpan[idx]].docId() == doc);
+          typename Emit::arr_type& target = *mtarget[idxSpan[idx]];
           if (valIdx == 0) {
             target.mutable_v()->Reserve(numVals);
           }
-          target.mutable_v()->Add(val);
+          target.mutable_v()->Add(Emit::decode(val));
         };
         IntColReader::getValues(poolGuard.pool(), postingsReader, segFieldInfo, sortedDocs, valHandler);
       }
@@ -571,7 +604,15 @@ void emitDocsResponse(SearchRequest& req,
 
       switch (fieldType.type()) {
         case FieldType::Type::INT: {
-          loadIntCol(req, field, fieldType, segDocs, sortedIdx, segRunLength, columnsProto, tg);
+          loadNumCol<IntColEmit>(req, field, fieldType, segDocs, sortedIdx, segRunLength, columnsProto, tg);
+          break;
+        }
+        case FieldType::Type::FLOAT: {
+          loadNumCol<FloatColEmit>(req, field, fieldType, segDocs, sortedIdx, segRunLength, columnsProto, tg);
+          break;
+        }
+        case FieldType::Type::DOUBLE: {
+          loadNumCol<DoubleColEmit>(req, field, fieldType, segDocs, sortedIdx, segRunLength, columnsProto, tg);
           break;
         }
         case FieldType::Type::ID:

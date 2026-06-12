@@ -3,21 +3,43 @@
 #include "solux/reader/FieldReader.h"
 #include "solux/reader/IntColReader.h"
 #include "solux/util/AtomicMerger.h"
+#include "solux/util/NumericUtils.h"
 
 namespace solux {
 class AvgOp : public SearchOp {
 public:
   const std::string_view fieldName; // the name of the field to calculate the average for
-  AvgOp(SearchRequest& req, const std::string_view& name, const std::string_view& fieldName)
-    : SearchOp(req, name), fieldName(fieldName) {
+  // INT, FLOAT, or DOUBLE - FLOAT/DOUBLE columns hold sortable bits that
+  // must be decoded before any arithmetic (their sum as raw bits is
+  // meaningless even though their order is correct).
+  const FieldType::Type valType;
+
+  AvgOp(SearchRequest& req, const std::string_view& name, const std::string_view& fieldName,
+        FieldType::Type valType = FieldType::INT)
+    : SearchOp(req, name), fieldName(fieldName), valType(valType) {
   }
+
+  bool isFloating() const {
+    return valType == FieldType::FLOAT || valType == FieldType::DOUBLE;
+  }
+
+  double decodeDouble(int64_t raw) const {
+    switch (valType) {
+      case FieldType::FLOAT: return (double)sortableInt32ToFloat((int32_t)raw);
+      case FieldType::DOUBLE: return sortableInt64ToDouble(raw);
+      default: return (double)raw;
+    }
+  }
+
   class MergeableSum : public MergeableData {
   public:
-    int64_t sum = 0; // sum of all values in this segment
+    int64_t sum = 0;   // sum of int values in this segment (kept integral for exactness)
+    double dsum = 0;   // sum of decoded float/double values in this segment
     int64_t count = 0; // number of values summed in this segment
 
     static MergeableSum* merge(MergeableSum* a, MergeableSum* b) {
       a->sum += b->sum;
+      a->dsum += b->dsum;
       a->count += b->count;
       return a;
     }
@@ -38,7 +60,9 @@ public:
       std::unique_ptr<MergeableSum> mergeableData(sumMerger.obtain());
       SegFieldInfo segFieldInfo;
       int64_t sum = 0;
+      double dsum = 0;
       int64_t count = 0;
+      bool floating = thisOp().isFloating();
       BitDocSet* bitDocs = (BitDocSet*) domain;
 
       auto& postingsReader = thisOp().req.reader->segments()[segnum].postingsReader();
@@ -66,20 +90,29 @@ public:
         if (intColIter.docId() == docid) {
           if (!intColReader.multiValued()) {
             auto val = intColIter.value();
-            sum += val;
+            if (floating) {
+              dsum += thisOp().decodeDouble(val);
+            } else {
+              sum += val;
+            }
             count++;
           } else {
             auto [start, end] = intColReader.getStartEndValueRank(intColIter.rank());
             auto n = end - start;
             for (int64_t vrank = 0; vrank < n; vrank++) {
               auto val = intColIter.values().valueAt(start + vrank);
-              sum += val;
+              if (floating) {
+                dsum += thisOp().decodeDouble(val);
+              } else {
+                sum += val;
+              }
               count++;
             }
           }
         }
       }
       mergeableData->sum += sum;
+      mergeableData->dsum += dsum;
       mergeableData->count += count;
       auto merged = sumMerger.release(mergeableData.release());
       checkCompletion(merged);
@@ -100,8 +133,10 @@ public:
 
         std::unique_ptr<MergeableSum> mergeableData(sumMerger.obtain());
         auto sum = mergeableData->sum;
+        auto dsum = mergeableData->dsum;
         auto count = mergeableData->count;
-        double avg = (double) sum / (double) count;
+        // one of sum/dsum is always 0 (a field is either int or floating)
+        double avg = ((double) sum + dsum) / (double) count;
         if (slot == -1) {
           myVal->set_d(avg);
         } else {
@@ -125,8 +160,15 @@ public:
   }
 
   class InlineCalc final : public InlineCalculator {
-    struct entry {
+    // Named Entry (not entry): the InlineCalculator methods take a parameter
+    // named "entry" that would shadow the type, silently turning
+    // sizeof(Entry) into sizeof(void*).
+    struct Entry {
       double val;
+      // number of field values summed into val.  The average divides by this
+      // (matching the non-inline Calc), not by the bucket's doc count: docs
+      // can be missing the field or carry multiple values.
+      int64_t count;
     };
 
     std::optional<IntColReader> intColReader;
@@ -146,65 +188,74 @@ public:
     }
 
     int insert(void* entry, int32_t docid, int space) override {
-      if (space < (int)sizeof(entry)) {
-        return -(int)sizeof(entry); // not enough space to insert
+      if (space < (int)sizeof(Entry)) {
+        return -(int)sizeof(Entry); // not enough space to insert
       }
-      auto* e = (struct entry*)entry;
+      auto* e = (Entry*)entry;
       e->val = 0.0;
+      e->count = 0;
       return update(entry, docid);
     }
 
     int update(void* entry, int32_t docid) override {
-      auto* e = (struct entry*)entry;
+      auto* e = (Entry*)entry;
       if (intColIter) {
         if (intColIter->docId() < docid) {
           intColIter->advance(docid);
         }
         if (intColIter->docId() == docid) {
-          //if (!intColReader->multiValued()) {
-          e->val += intColIter->value();
-          //} else {
-          //auto [start, end] = intColReader->getStartEndValueRank(intColIter->rank());
-          //auto n = end - start;
-          //for (int64_t vrank = 0; vrank < n; vrank++) {
-          //e->tot += intColIter->values().valueAt(start + vrank);
-          //}
-          //}
+          if (!intColReader->multiValued()) {
+            e->val += thisOp().decodeDouble(intColIter->value());
+            e->count++;
+          } else {
+            auto [start, end] = intColReader->getStartEndValueRank(intColIter->rank());
+            for (int64_t vrank = start; vrank < end; vrank++) {
+              e->val += thisOp().decodeDouble(intColIter->values().valueAt(vrank));
+            }
+            e->count += end - start;
+          }
         }
       }
-      return sizeof(entry);
+      return sizeof(Entry);
     }
 
     std::pair<int, int> merge(void* target, void* from) override {
-      auto* e = (struct entry*)target;
-      auto* o = (struct entry*)from;
+      auto* e = (Entry*)target;
+      auto* o = (Entry*)from;
       e->val += o->val;
-      return {sizeof(entry), sizeof(entry)};
+      e->count += o->count;
+      return {sizeof(Entry), sizeof(Entry)};
     }
 
     std::pair<int, int> mergeNew(void* target, void* from, int space) override {
-      if (space < (int)sizeof(entry)) {
-        return {-(int)sizeof(entry), (int)sizeof(entry)}; // not enough space to insert
+      if (space < (int)sizeof(Entry)) {
+        return {-(int)sizeof(Entry), (int)sizeof(Entry)}; // not enough space to insert
       }
-      auto* e = (struct entry*)target;
+      auto* e = (Entry*)target;
       e->val = 0.0;
+      e->count = 0;
       return merge(target, from);
     }
 
+    // count is the bucket's doc count and is unused: the average divides by
+    // the number of field values seen (e->count).  A bucket with no values
+    // reports 0.0.  Always return the entry size - the FacetMap entry walk
+    // packs calc entries back to back, so a 0 return would desync any calcs
+    // that follow.
     int finalize(void* entry, int64_t count) override {
-      auto* e = (struct entry*)entry;
-      if (count == 0) {
-        return 0; // no values, nothing to do
+      unused(count);
+      auto* e = (Entry*)entry;
+      if (e->count > 0) {
+        e->val /= e->count; // calculate the average
       }
-      e->val /= count; // calculate the average
-      return sizeof(entry);
+      return sizeof(Entry);
     }
 
     int compare(void* a, void* b, int& asize, int& bsize) override {
-      auto* aentry = (struct entry*)a;
-      auto* bentry = (struct entry*)b;
-      asize = sizeof(entry);
-      bsize = sizeof(entry);
+      auto* aentry = (Entry*)a;
+      auto* bentry = (Entry*)b;
+      asize = sizeof(Entry);
+      bsize = sizeof(Entry);
       if (aentry->val < bentry->val) {
         return -1;
       } else if (aentry->val > bentry->val) {
@@ -248,9 +299,9 @@ public:
          });
       auto& arr = *myVal->mutable_arr_d();
       for (auto i = 0u; i < entries.size(); i++) {
-        auto e = *(entry*)entries[i];
+        auto e = *(Entry*)entries[i];
         arr.set_v(i, e.val);
-        entries[i] += sizeof(entry); // move to the next entry part
+        entries[i] += sizeof(Entry); // move to the next entry part
       }
     }
   };

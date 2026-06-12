@@ -659,8 +659,9 @@ TEST_F(IndexWriterTest, versionFieldOverwrite) {
   ASSERT_EQ(3, docs.size());
   
   // text_w is STORED by default, so the raw value comes back with the doc.
-  Doc expectedDoc1 = flatdoc("id", "doc1", "text_w", std::string("hello world"),
-                             "_version_", std::numeric_limits<int64_t>::min());
+  // doc1 was indexed without overwrite, so it has no _version_ value and the
+  // field is absent from the returned doc.
+  Doc expectedDoc1 = flatdoc("id", "doc1", "text_w", std::string("hello world"));
   Doc expectedDoc2 = flatdoc("id", "doc2", "text_w", std::string("hello version world"),
                              "_version_", (int64_t)(result2.updateVersion));
   Doc expectedDoc3 = flatdoc("id", "doc3", "text_w", std::string("hello third world"),

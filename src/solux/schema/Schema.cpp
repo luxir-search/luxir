@@ -357,6 +357,12 @@ std::shared_ptr<Schema> Schema::fromProto(const proto::SchemaDef& def, const Sch
       case proto::FieldDef::INT:
         ft = std::make_shared<IntFieldType>(name, flags);
         break;
+      case proto::FieldDef::FLOAT:
+        ft = std::make_shared<FloatFieldType>(name, flags);
+        break;
+      case proto::FieldDef::DOUBLE:
+        ft = std::make_shared<DoubleFieldType>(name, flags);
+        break;
       case proto::FieldDef::VECTOR: {
         // VECTOR is always fixed-size (every value in a segment must share dims).
         // dims may be 0, meaning "infer from first indexed value".
@@ -515,6 +521,10 @@ std::shared_ptr<Schema> Schema::createDefaultSchema() {
   addField("_ssc", proto::FieldDef::STRING, true, false, true, true);
   addField("_i", proto::FieldDef::INT, true, false, true);
   addField("_is", proto::FieldDef::INT, true, false, true, true);
+  addField("_f", proto::FieldDef::FLOAT, true, false, true);
+  addField("_fs", proto::FieldDef::FLOAT, true, false, true, true);
+  addField("_d", proto::FieldDef::DOUBLE, true, false, true);
+  addField("_ds", proto::FieldDef::DOUBLE, true, false, true, true);
   // Text suffixes, from raw to fully folded:
   //   _w  raw whitespace tokens (case- and accent-sensitive)
   //   _wl Unicode word segmentation + NFKC case folding, accents PRESERVED

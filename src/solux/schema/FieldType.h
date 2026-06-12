@@ -168,6 +168,22 @@ public:
   }
 };
 
+// FLOAT and DOUBLE fields store Lucene-style sortable bits in the standard
+// int column (see util/NumericUtils.h): the encoded int64 orders the same as
+// the floating point value, so sorting and min/max work on the column
+// directly; consumers that need the numeric value decode at the edges.
+class FloatFieldType : public FieldType {
+public:
+  FloatFieldType(std::string_view name, int flags=COLUMN_STORED) : FieldType(name, FieldType::FLOAT, flags) {
+  }
+};
+
+class DoubleFieldType : public FieldType {
+public:
+  DoubleFieldType(std::string_view name, int flags=COLUMN_STORED) : FieldType(name, FieldType::DOUBLE, flags) {
+  }
+};
+
 // Unique id field
 class IdFieldType : public FieldType {
 public:

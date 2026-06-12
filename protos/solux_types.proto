@@ -575,18 +575,26 @@ message MultiVector {
 }
 
 message ColInt {
-  sint64 missing_val = 1;
+  // Sentinel held in v slots for docs without a value.  The writer uses the
+  // type's minimum, so a real stored value equal to the sentinel is
+  // indistinguishable from a missing field.  Multi-valued columns don't have
+  // this ambiguity (missing = empty array).
   // we could also use a bitset for missing values, but that might be slightly harder to use for some people?
   // bytes missing_bits = 3;
+  sint64 missing_val = 1;
   repeated sint64 v = 2;
 }
 
 message ColFloat {
+  // numeric_limits<float>::lowest(); see the ColInt.missing_val sentinel note.
+  // NaN can't be the sentinel: it compares unequal to itself, breaking the
+  // natural v != missing_val check.
   float missing_val = 1;
   repeated float v = 2;
 }
 
 message ColDouble {
+  // numeric_limits<double>::lowest(); see the ColInt.missing_val sentinel note.
   double missing_val = 1;
   repeated double v = 2;
 }

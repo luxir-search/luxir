@@ -84,6 +84,14 @@ public:
           minCount = facetReq.mincount();
         }
         auto missing = facetReq.missing();
+        // IntFacetRangeReq does integer bucket arithmetic on raw column
+        // values; FLOAT/DOUBLE columns hold sortable bits, which would
+        // produce silently wrong buckets.  Refuse until range faceting
+        // learns to decode them.
+        auto& rangeFtype = req.schema->getFieldTypeEx(facetField);
+        if (rangeFtype->type() == FieldType::FLOAT || rangeFtype->type() == FieldType::DOUBLE) {
+          throw std::runtime_error("Range facet over float/double field not yet supported: " + std::string(facetField));
+        }
         FacetReq* facet = google::protobuf::Arena::Create<IntFacetRangeReq>(&req.arena, req, facetReq, facetField, name, start, end, gap, minCount, missing);
         addSubs(*facet, searchOp.range_facet().ops());
         return facet;
@@ -92,7 +100,9 @@ public:
         case solux::proto::SearchOp::kGenOp: {
           if (searchOp.gen_op().name() == "avg" || searchOp.gen_op().name() == "average") {
             auto& avgOp = searchOp.gen_op();
-            auto* avg = google::protobuf::Arena::Create<AvgOp>(&req.arena, req, name, avgOp.args(0).s());
+            // Resolve the field type before Arena::Create (schema lookup may throw).
+            auto& avgFtype = req.schema->getFieldTypeEx(avgOp.args(0).s());
+            auto* avg = google::protobuf::Arena::Create<AvgOp>(&req.arena, req, name, avgOp.args(0).s(), avgFtype->type());
             return avg;
           } else {
             throw std::runtime_error("Unknown generic operation: " + std::string(searchOp.gen_op().name()));

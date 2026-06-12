@@ -3,6 +3,9 @@
 #include "solux/index/DocStream.h"
 #include "solux/index/Inverter.h"
 #include "solux/index/IntColWriter.h"
+#include "solux/util/NumericUtils.h"
+
+#include <ranges>
 
 using namespace solux;
 namespace solux::handler {
@@ -10,7 +13,7 @@ namespace solux::handler {
 //
 // Info for one single valued column
 //
-class IntColHandler final : public Inverter::IndexHandler {
+class IntColHandler : public Inverter::IndexHandler {
   friend class Inverter;
   LongStream longStream;
   DocStream docsWithVal;
@@ -125,31 +128,34 @@ public:
   ~MultiIntColHandler() override = default;
 
   void index(Inverter& inverter, const proto::Val& val) override {
-    if (val.has_i()) {
-      index(inverter, val.i());
-    }
-    else if (val.has_arr_i()) {
+    // expected kinds first: array form, then a single value
+    if (val.has_arr_i()) {
       auto& arr = val.arr_i().v();
       std::span<const int64_t> values(arr.data(), arr.size());
       index(inverter, values);
     }
+    else if (val.has_i()) {
+      index(inverter, val.i());
+    }
   }
 
   void index(Inverter& inverter, int64_t int64) override {
-    indexMulti(inverter, {&int64, 1});
+    indexMulti(inverter, std::span<const int64_t>(&int64, 1));
   }
 
   void index(Inverter& inverter, std::span<const int64_t> vals) override {
     indexMulti(inverter, vals);
   }
 
-  void indexMulti(Inverter& inverter, std::span<const int64_t> values) {
-    for (auto& val : values) {
+  void indexMulti(Inverter& inverter, std::ranges::input_range auto&& values) {
+    int64_t n = 0;
+    for (auto val : values) {
       longStream.addVal(inverter.pool, val);
-      numVals++;
+      n++;
     }
+    numVals += n;
     docsWithVal.addDoc(inverter.pool, inverter.getDoc());
-    lengthStream.addVal(inverter.pool, values.size());
+    lengthStream.addVal(inverter.pool, n);
     numDocs++;
   }
 
@@ -216,6 +222,122 @@ public:
       fieldInfo.monoMetaOff = endValueRankWriter.metaOff;
     }
 
+  }
+};
+
+
+//
+// FLOAT and DOUBLE columns reuse the int column machinery by storing
+// Lucene/Solr-style sortable bits (see util/NumericUtils.h): doubles as the full
+// 64-bit encoding, floats as the 32-bit encoding sign-extended to int64.
+// Incoming values are coerced from any numeric proto kind (i, f, d and the
+// array forms) to the field's own type before encoding, so clients don't
+// have to match the wire type exactly.
+//
+
+class DoubleColHandler final : public IntColHandler {
+public:
+  using IntColHandler::IntColHandler;
+
+  void index(Inverter& inverter, const proto::Val& val) override {
+    if (val.has_d()) {
+      indexSingle(inverter, doubleToSortableInt64(val.d()));
+    } else if (val.has_f()) {
+      indexSingle(inverter, doubleToSortableInt64((double)val.f()));
+    } else if (val.has_i()) {
+      indexSingle(inverter, doubleToSortableInt64((double)val.i()));
+    }
+  }
+
+  void index(Inverter& inverter, int64_t int64) override {
+    indexSingle(inverter, doubleToSortableInt64((double)int64));
+  }
+};
+
+class FloatColHandler final : public IntColHandler {
+public:
+  using IntColHandler::IntColHandler;
+
+  void index(Inverter& inverter, const proto::Val& val) override {
+    if (val.has_f()) {
+      indexSingle(inverter, (int64_t)floatToSortableInt32(val.f()));
+    } else if (val.has_d()) {
+      indexSingle(inverter, (int64_t)floatToSortableInt32((float)val.d()));
+    } else if (val.has_i()) {
+      indexSingle(inverter, (int64_t)floatToSortableInt32((float)val.i()));
+    }
+  }
+
+  void index(Inverter& inverter, int64_t int64) override {
+    indexSingle(inverter, (int64_t)floatToSortableInt32((float)int64));
+  }
+};
+
+class MultiDoubleColHandler final : public MultiIntColHandler {
+public:
+  using MultiIntColHandler::MultiIntColHandler;
+
+  void index(Inverter& inverter, const proto::Val& val) override {
+    auto encode = [](double d) { return doubleToSortableInt64(d); };
+    // expected kinds first (array form, then a single value), coercions after
+    if (val.has_arr_d()) {
+      indexMulti(inverter, val.arr_d().v() | std::views::transform(encode));
+    } else if (val.has_d()) {
+      indexMulti(inverter, std::views::single(encode(val.d())));
+    } else if (val.has_arr_f()) {
+      indexMulti(inverter, val.arr_f().v()
+                 | std::views::transform([&](float f) { return encode((double)f); }));
+    } else if (val.has_f()) {
+      indexMulti(inverter, std::views::single(encode((double)val.f())));
+    } else if (val.has_arr_i()) {
+      indexMulti(inverter, val.arr_i().v()
+                 | std::views::transform([&](int64_t i) { return encode((double)i); }));
+    } else if (val.has_i()) {
+      indexMulti(inverter, std::views::single(encode((double)val.i())));
+    }
+  }
+
+  void index(Inverter& inverter, int64_t int64) override {
+    indexMulti(inverter, std::views::single(doubleToSortableInt64((double)int64)));
+  }
+
+  void index(Inverter& inverter, std::span<const int64_t> vals) override {
+    indexMulti(inverter, vals
+               | std::views::transform([](int64_t i) { return doubleToSortableInt64((double)i); }));
+  }
+};
+
+class MultiFloatColHandler final : public MultiIntColHandler {
+public:
+  using MultiIntColHandler::MultiIntColHandler;
+
+  void index(Inverter& inverter, const proto::Val& val) override {
+    auto encode = [](float f) { return (int64_t)floatToSortableInt32(f); };
+    // expected kinds first (array form, then a single value), coercions after
+    if (val.has_arr_f()) {
+      indexMulti(inverter, val.arr_f().v() | std::views::transform(encode));
+    } else if (val.has_f()) {
+      indexMulti(inverter, std::views::single(encode(val.f())));
+    } else if (val.has_arr_d()) {
+      indexMulti(inverter, val.arr_d().v()
+                 | std::views::transform([&](double d) { return encode((float)d); }));
+    } else if (val.has_d()) {
+      indexMulti(inverter, std::views::single(encode((float)val.d())));
+    } else if (val.has_arr_i()) {
+      indexMulti(inverter, val.arr_i().v()
+                 | std::views::transform([&](int64_t i) { return encode((float)i); }));
+    } else if (val.has_i()) {
+      indexMulti(inverter, std::views::single(encode((float)val.i())));
+    }
+  }
+
+  void index(Inverter& inverter, int64_t int64) override {
+    indexMulti(inverter, std::views::single((int64_t)floatToSortableInt32((float)int64)));
+  }
+
+  void index(Inverter& inverter, std::span<const int64_t> vals) override {
+    indexMulti(inverter, vals
+               | std::views::transform([](int64_t i) { return (int64_t)floatToSortableInt32((float)i); }));
   }
 };
 
