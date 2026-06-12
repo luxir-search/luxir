@@ -697,7 +697,40 @@ TEST_F(IndexWriterTest, versionFieldOverwrite) {
   */
 }
 
-// Test deletion functionality - verify delete infrastructure works  
+// _version_ columns can be sparse within a segment: docs indexed without an id
+// field get no version value.  applyDeletes must read versions by rank, not
+// docid - it used to index the dense decoder by docid, reading the wrong doc's
+// version past a gap (and asserting past the end of the column).
+TEST_F(IndexWriterTest, sparseVersionColumnDeletes) {
+  using namespace solux::test;
+
+  CollectionHelper helper("main");
+  helper.clear();
+
+  // One batch -> one segment: doc 0 has no id (no _version_ value), doc 1 has
+  // an id and an overwrite version.  The column holds 1 value but maxDoc is 2,
+  // so reading doc 1's version by docid lands past the end.
+  std::vector<Doc> docs = {
+    flatdoc("text_w", "anonymous filler"),
+    flatdoc("id", "sv1", "text_w", "versioned target"),
+  };
+  helper.indexAll(docs, UpdateMessage::COMMIT, true);
+
+  // Deleting the versioned doc reads its version during applyDeletes.
+  helper.deleteById("sv1", UpdateMessage::COMMIT);
+
+  auto* req = LocalReq::create(helper.getSearchEngine());
+  auto docs1 = req->collection("main").matchQuery("text_w", "versioned").fields({"text_w"}).limit(-1).execute().getDocs();
+  req->done();
+  EXPECT_EQ(0u, docs1.size());
+
+  req = LocalReq::create(helper.getSearchEngine());
+  auto docs2 = req->collection("main").matchQuery("text_w", "anonymous").fields({"text_w"}).limit(-1).execute().getDocs();
+  req->done();
+  EXPECT_EQ(1u, docs2.size());
+}
+
+// Test deletion functionality - verify delete infrastructure works
 TEST_F(IndexWriterTest, deletionInfrastructure) {
   using namespace solux::test;
   

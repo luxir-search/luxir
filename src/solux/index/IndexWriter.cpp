@@ -2209,22 +2209,25 @@ void IndexWriter::applyDeletes(SegInfo& seg, SortedDeletes::EntrySpan commitDele
   // Also get the "_version_" field for version comparison
   FieldReader versionFieldReader(pool, reader);
   SegFieldInfo versionFieldInfo;
-  bool hasVersionField = false;
   std::optional<IntColReader> versionColReader;
-  std::optional<IntColReader::DenseValues> versionValues;
   if (versionFieldReader.seek("_version_")) {
     versionFieldReader.readFieldInfo(versionFieldInfo);
-    hasVersionField = true;
     versionColReader.emplace(reader, versionFieldInfo);
     assert(!versionColReader->multiValued());
-    versionValues.emplace(*versionColReader);
   }
 
-  // Apply the merged delete span to this segment.
+  // Phase 1: walk the merged delete span and collect the live candidate doc
+  // for each delete entry.
   // The span is sorted by id, so we use seekForward() to scan the segment's terms
   // in order, avoiding redundant binary searches across blocks.
   // version==0 entries (non-overwrite adds) are filtered during merge, but can still
   // appear in the single-span fast path which skips the merge.
+  struct DeleteCandidate {
+    int32_t docId;
+    uint64_t deleteVersion;
+  };
+  std::vector<DeleteCandidate> candidates;
+
   for (auto& entry : deleteSpan) {
     uint64_t deleteVersion = entry.val().version;
     if (deleteVersion == 0) continue;
@@ -2241,38 +2244,58 @@ void IndexWriter::applyDeletes(SegInfo& seg, SortedDeletes::EntrySpan commitDele
         if (currLiveBits && !currLiveBits->get(docId)) {
           continue;
         }
-
-        bool shouldDelete = true;
-
-        if (hasVersionField) {
-          uint64_t docVersion = (uint64_t)versionValues->valueAt(docId);
-
-          INDEX_TRACE("applyDeletes: found version {} for docId {} in segment {}",
-                   docId, docVersion, seg.segId);
-
-          shouldDelete = (docVersion < deleteVersion);
-        }
-
-        if (shouldDelete) {
-          if (!liveBits) {
-            liveBits = std::make_unique<screaming::RAMFixedBitSet>(maxDocId, true);
-
-            if (existingLiveDocs) {
-              const auto& existingBitset = existingLiveDocs->bitset();
-              size_t wordsSize = screaming::FixedBitSet::sizeInWords(maxDocId) * sizeof(uint64_t);
-              std::memcpy(liveBits->words, existingBitset.words, wordsSize);
-            }
-
-            currLiveBits = liveBits.get();
-          }
-
-          INDEX_TRACE("applyDeletes: marking docId {} as deleted in segment {}",
-                   docId, seg.segId);
-          liveBits->clear(docId);
-          newDeletesCount++;
-        }
+        candidates.push_back({docId, deleteVersion});
       }
     } // end if termsEnum.seek()
+  }
+
+  // Phase 2: version-gate the candidates in docId order so the _version_
+  // column can be read with a single forward iterator.  The column can be
+  // sparse - docs indexed with overwrite=false, or docs with no id field,
+  // have no version value - so values must be read by rank, not docId.
+  // A doc with no version value gates as version 0 and is always deleted.
+  std::sort(candidates.begin(), candidates.end(),
+            [](const DeleteCandidate& a, const DeleteCandidate& b) { return a.docId < b.docId; });
+
+  std::optional<IntColReader::SparseIterator> versionIter;
+  if (versionColReader) {
+    versionIter.emplace(*versionColReader);
+  }
+
+  int32_t foundDoc = -1;
+  for (const auto& candidate : candidates) {
+    uint64_t docVersion = 0;
+    if (versionIter) {
+      if (foundDoc < candidate.docId) {
+        foundDoc = versionIter->advance(candidate.docId);
+      }
+      if (foundDoc == candidate.docId) {
+        docVersion = (uint64_t)versionIter->value();
+      }
+      INDEX_TRACE("applyDeletes: found version {} for docId {} in segment {}",
+               docVersion, candidate.docId, seg.segId);
+    }
+
+    if (docVersion < candidate.deleteVersion) {
+      if (!liveBits) {
+        liveBits = std::make_unique<screaming::RAMFixedBitSet>(maxDocId, true);
+
+        if (existingLiveDocs) {
+          const auto& existingBitset = existingLiveDocs->bitset();
+          size_t wordsSize = screaming::FixedBitSet::sizeInWords(maxDocId) * sizeof(uint64_t);
+          std::memcpy(liveBits->words, existingBitset.words, wordsSize);
+        }
+      }
+
+      // a doc could appear under two delete entries if it indexed multiple id
+      // values; guard the count against clearing the same bit twice.
+      if (liveBits->get(candidate.docId)) {
+        INDEX_TRACE("applyDeletes: marking docId {} as deleted in segment {}",
+                 candidate.docId, seg.segId);
+        liveBits->clear(candidate.docId);
+        newDeletesCount++;
+      }
+    }
   }
 
   // If we found any new documents to delete, write a new delete generation
