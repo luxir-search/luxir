@@ -92,6 +92,9 @@ public:
         if (rangeFtype->type() == FieldType::FLOAT || rangeFtype->type() == FieldType::DOUBLE) {
           throw std::runtime_error("Range facet over float/double field not yet supported: " + std::string(facetField));
         }
+        if (facetReq.ops_size() > 0 || facetReq.sorts_size() > 0) {
+          throw std::runtime_error("facet '" + std::string(name) + "': sub-ops/sorts are not yet supported for range facets");
+        }
         FacetReq* facet = google::protobuf::Arena::Create<IntFacetRangeReq>(&req.arena, req, facetReq, facetField, name, start, end, gap, minCount, missing);
         addSubs(*facet, searchOp.range_facet().ops());
         return facet;
@@ -134,6 +137,9 @@ public:
     FacetReq* facet = nullptr;
     switch (ftype->type()) {
       case FieldType::Type::INT: {
+        if (facetReq.ops_size() > 0 || facetReq.sorts_size() > 0) {
+          throw std::runtime_error("facet '" + std::string(facetName) + "': sub-ops/sorts are not yet supported for int field facets");
+        }
         auto range = IntFacetReq::scanGlobalRange(*req.reader, facetField);
         facet = google::protobuf::Arena::Create<IntFacetReq>(&req.arena, req, facetReq, facetField, facetName, limit, minCount, missing, range.min, range.max, range.useVector);
         break;
@@ -145,6 +151,9 @@ public:
         break;
       }
       case FieldType::Type::TEXT:
+        if (facetReq.ops_size() > 0 || facetReq.sorts_size() > 0) {
+          throw std::runtime_error("facet '" + std::string(facetName) + "': sub-ops/sorts are not yet supported for text field facets");
+        }
         facet = google::protobuf::Arena::Create<FullTextFacetReq>(&req.arena, req, facetReq, facetField, facetName, limit, minCount, missing);
         break;
       default: ;

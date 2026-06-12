@@ -46,15 +46,19 @@ public:
   void init() override {
     SearchOp::init();
     if (!sorts.empty()) {
+      if (sorts.size() > 1) {
+        throw std::runtime_error("facet '" + std::string(facetName) + "': multiple sort fields are not yet supported");
+      }
       for (auto& sort : sorts) {
         auto iter = subOps.find(sort.field());
-        if (iter != subOps.end()) {
-          if (iter->second->canInline()) {
-            inlineSubOps.push_back(*iter);
-            subOps.erase(iter);
-          } else {
-            throw std::runtime_error("Cannot sort by a subop without inline support: " + std::string(iter->second->name));
-          }
+        if (iter == subOps.end()) {
+          throw std::runtime_error("facet '" + std::string(facetName) + "': unknown sort field '" + sort.field() + "'");
+        }
+        if (iter->second->canInline()) {
+          inlineSubOps.push_back(*iter);
+          subOps.erase(iter);
+        } else {
+          throw std::runtime_error("facet '" + std::string(facetName) + "': cannot sort by a subop without inline support: " + std::string(iter->second->name));
         }
       }
     }
@@ -513,7 +517,9 @@ public:
           count++;
         }
         // use heterogeneous lookup in the future to avoid creating string when not needed
-        counts[(std::string) (std::string_view) tenum.term()] += count;
+        if (count > 0) {
+          counts[(std::string) (std::string_view) tenum.term()] += count;
+        }
       }
       auto merged = countMerger.release(mergeableData.release());
       if ((size_t)merged == thisOp().reader.segments().size()) {

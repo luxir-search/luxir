@@ -3,6 +3,7 @@
 #include <thread>
 #include <atomic>
 #include <set>
+#include <functional>
 #include <tbb/task_group.h>
 #include <boost/unordered/unordered_flat_map.hpp>
 #include "test/SoluxTest.h"
@@ -405,7 +406,6 @@ TEST_F(FacetTest, fullTextFacetNestedSparseArrayDomain) {
   auto& facet = *(*topDocs.mutable_ops())["f"].mutable_field_facet();
   facet.set_field("body_w");
   facet.set_limit(-1);
-  facet.set_mincount(1);
 
   lreq->engine.submit(*lreq, true);
 
@@ -617,6 +617,83 @@ TEST_F(FacetTest, limitMinusOneInlinesMultipleAvgSubOps) {
   }
 
   lreq->done();
+}
+
+TEST_F(FacetTest, unsupportedFacetOptionsRejected) {
+  CollectionHelper helper;
+  helper.clear();
+  helper.index(flatdoc("cat_s", "a", "foo_i", 1, "body_w", "alpha"), UpdateMessage::NO_COMMIT);
+  helper.index(flatdoc("cat_s", "b", "foo_i", 2, "body_w", "beta"), UpdateMessage::COMMIT);
+
+  struct Case {
+    std::string name;
+    std::function<void(proto::SearchRequest&)> configure;
+  };
+
+  std::vector<Case> cases = {
+    {"int_subop", [](proto::SearchRequest& req) {
+      auto& facet = *(*req.mutable_ops())["f"].mutable_field_facet();
+      facet.set_field("foo_i");
+      auto& avg = *(*facet.mutable_ops())["avg"].mutable_gen_op();
+      avg.set_name("avg");
+      avg.mutable_args()->Add()->set_s("foo_i");
+    }},
+    {"int_sort", [](proto::SearchRequest& req) {
+      auto& facet = *(*req.mutable_ops())["f"].mutable_field_facet();
+      facet.set_field("foo_i");
+      auto& sort = *facet.mutable_sorts()->Add();
+      sort.set_field("avg");
+      sort.set_dir(proto::SortSpec_SortDir_ASC);
+    }},
+    {"text_subop", [](proto::SearchRequest& req) {
+      auto& facet = *(*req.mutable_ops())["f"].mutable_field_facet();
+      facet.set_field("body_w");
+      auto& avg = *(*facet.mutable_ops())["avg"].mutable_gen_op();
+      avg.set_name("avg");
+      avg.mutable_args()->Add()->set_s("foo_i");
+    }},
+    {"range_sort", [](proto::SearchRequest& req) {
+      auto& facet = *(*req.mutable_ops())["f"].mutable_range_facet();
+      facet.set_field("foo_i");
+      facet.set_start(0);
+      facet.set_end(10);
+      facet.set_gap(1);
+      auto& sort = *facet.mutable_sorts()->Add();
+      sort.set_field("avg");
+      sort.set_dir(proto::SortSpec_SortDir_ASC);
+    }},
+    {"string_unknown_sort", [](proto::SearchRequest& req) {
+      auto& facet = *(*req.mutable_ops())["f"].mutable_field_facet();
+      facet.set_field("cat_s");
+      auto& sort = *facet.mutable_sorts()->Add();
+      sort.set_field("not_a_subop");
+      sort.set_dir(proto::SortSpec_SortDir_ASC);
+    }},
+    {"string_two_sorts", [](proto::SearchRequest& req) {
+      auto& facet = *(*req.mutable_ops())["f"].mutable_field_facet();
+      facet.set_field("cat_s");
+      auto& sort1 = *facet.mutable_sorts()->Add();
+      sort1.set_field("first");
+      sort1.set_dir(proto::SortSpec_SortDir_ASC);
+      auto& sort2 = *facet.mutable_sorts()->Add();
+      sort2.set_field("second");
+      sort2.set_dir(proto::SortSpec_SortDir_DESC);
+    }}
+  };
+
+  for (const auto& testCase : cases) {
+    auto* lreq = LocalReq::create(soluxNode->getSearchEngine());
+    lreq->proto.mutable_collection()->add_name("main");
+    lreq->proto.set_request_id("test_unsupported_facet_options_" + testCase.name);
+    testCase.configure(lreq->proto);
+
+    lreq->engine.submit(*lreq, true);
+
+    ASSERT_EQ(1, lreq->responses.size()) << testCase.name;
+    EXPECT_TRUE(lreq->responses[0]->proto.has_error()) << testCase.name << "\n" << lreq->toString();
+    EXPECT_FALSE(lreq->responses[0]->proto.error().empty()) << testCase.name;
+    lreq->done();
+  }
 }
 
 //

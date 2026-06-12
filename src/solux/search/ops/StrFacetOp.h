@@ -556,8 +556,14 @@ public:
       } else {
         // Count and bucket-value sorts are future work; sub-op sort is supported.
         std::string_view field = thisOp().fieldFacet.sorts(0).field();
-        auto calc = mergedData->inlineCalcs.front();
-        assert(field == calc->getOp().name);
+        SearchOp::InlineCalculator* calc = nullptr;
+        for (auto* candidate : mergedData->inlineCalcs) {
+          if (candidate->getOp().name == field) {
+            calc = candidate;
+            break;
+          }
+        }
+        assert(calc != nullptr);
         bool reversed = thisOp().fieldFacet.sorts(0).dir() == proto::SortSpec_SortDir_DESC;
         std::sort(valVec.begin(), valVec.end(), [&calc, reversed](auto& a, auto& b) {
           int asize, bsize;
