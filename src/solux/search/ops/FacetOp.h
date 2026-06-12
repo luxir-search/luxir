@@ -6,6 +6,7 @@
 #include "protos/solux_types.pb.h"
 #include "solux/search/DocSet.h"
 #include "solux/search/IndexReader.h"
+#include "FacetEmit.h"
 #include "SearchOp.h"
 #include "solux/reader/DocsEnum.h"
 #include "solux/reader/IntColReader.h"
@@ -395,26 +396,8 @@ solux::proto::Val* getTargetForSub(solux::proto::SearchResponse* searchResponse,
       
       auto missing_count = mergedData->missing_num;
       delete mergedData;
-      std::sort(countVec.begin(), countVec.end(), [](const auto& a, const auto& b) {
-        if (a.second != b.second ) {
-          return a.second > b.second;
-        }
-        return a.first < b.first;
-      });
-      if (limit >= 0 && limit < (int64_t)countVec.size()) {
-        countVec.resize(limit);
-      }
-
-      // fill in the facet result proto
-      auto& bucketIds = *facetResultProto.mutable_bucket_ids()->mutable_col_i();
-      auto& bucketIdsArr = *bucketIds.mutable_v();
-      auto& countsArr = *facetResultProto.mutable_counts();
-      bucketIdsArr.Reserve(countVec.size());
-      countsArr.Reserve(countVec.size());
-      for (auto [val, count] : countVec) {
-        bucketIdsArr.Add(val);
-        countsArr.Add(count);
-      }
+      sortByCountDescAndLimit(countVec, limit);
+      emitBuckets(facetResultProto, countVec);
       if (missing) {
         facetResultProto.set_missing(missing_count);
       }
@@ -545,27 +528,8 @@ public:
       }
       auto missing_count = mergedData->missing_num;
       delete mergedData;
-      std::sort(countVec.begin(), countVec.end(), [](auto& a, auto& b) {
-        if (a.second != b.second ) {
-          return a.second > b.second;
-        }
-        return a.first < b.first;
-      });
-      if (limit >= 0 && limit < (int64_t)countVec.size()) {
-        countVec.resize(limit);
-      }
-
-      // fill in the facet result proto
-      auto& bucketIds = *facetResultProto.mutable_bucket_ids()->mutable_col_s();
-      auto& bucketIdsArr = *bucketIds.mutable_v();
-      auto& countsArr = *facetResultProto.mutable_counts();
-      bucketIdsArr.Reserve(countVec.size());
-      countsArr.Reserve(countVec.size());
-      for (auto [val, count] : countVec) {
-        auto* strptr = bucketIdsArr.Add();
-        *strptr = val; // copy the string
-        countsArr.Add(count);
-      }
+      sortByCountDescAndLimit(countVec, limit);
+      emitBuckets(facetResultProto, countVec);
       if (missing) {
         facetResultProto.set_missing(missing_count);
       }

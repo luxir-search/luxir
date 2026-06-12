@@ -2,6 +2,7 @@
 
 #include <variant>
 #include <boost/unordered/unordered_flat_map.hpp>
+#include "FacetEmit.h"
 #include "FacetOp.h"
 #include "SkinnyCounter.h"
 
@@ -488,16 +489,7 @@ public:
 
         missing_count = mergedData->missing_num;
 
-        // TODO: use a heap if we are only keeping a small number of results.
-        std::sort(ordCounts.begin(), ordCounts.end(), [](auto& a, auto& b) {
-          if (a.second != b.second ) {
-            return a.second > b.second;
-          }
-          return a.first < b.first;
-        });
-        if (limit >= 0 && limit < (int64_t)ordCounts.size()) {
-          ordCounts.resize(limit);
-        }
+        sortByCountDescAndLimit(ordCounts, limit);
         countVec.reserve(ordCounts.size());
         auto poolGuard = MemPool::threadLocalPoolGuard();
         OrdMapStr ordMapStr(poolGuard.pool(), thisOp().ordMap.get(), *thisOp().req.reader, thisOp().fieldName);
@@ -510,17 +502,7 @@ public:
       mergedData.reset();  // free up memory from the merged data, everything should be in countVec now.
 
 
-      // fill in the facet result proto
-      auto& bucketIds = *facetResultProto.mutable_bucket_ids()->mutable_col_s();
-      auto& bucketIdsArr = *bucketIds.mutable_v();
-      auto& countsArr = *facetResultProto.mutable_counts();
-      bucketIdsArr.Reserve(countVec.size());
-      countsArr.Reserve(countVec.size());
-      for (auto [val, count] : countVec) {
-        auto* strptr = bucketIdsArr.Add();
-        *strptr = val; // copy the string
-        countsArr.Add(count);
-      }
+      emitBuckets(facetResultProto, countVec);
       if (missing) {
         facetResultProto.set_missing(missing_count);
       }
