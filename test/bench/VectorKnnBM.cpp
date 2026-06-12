@@ -12,6 +12,7 @@
 #include "bench/solux_bench.h"
 #include "protos/solux_types.pb.h"
 #include "solux/index/VectorIndexBuilder.h"
+#include "solux/query/KnnQuery.h"
 #include "solux/reader/VectorAuxReader.h"
 #include "solux/schema/Schema.h"
 #include "solux/util/random.h"
@@ -111,28 +112,63 @@ std::vector<float> makeQueryVector(int32_t dims) {
   return vec;
 }
 
-Doc makeVectorDoc(int64_t docId, int32_t dims, int32_t valuesPerDoc) {
+// The deepen-forcing corpus shape (skew=true): one doc in a thousand is a
+// "hog" holding 32 vectors clustered tightly right next to the fixed bench
+// query; the rest hold 2 independent random vectors.  Every vector the
+// engine ranks near the query then belongs to one of ~50 hog docs, so the
+// round-1 pool collapses to far fewer docs than targetDocReq and the widen
+// loop must take depth rounds.  (The realistic analog: long chunked
+// documents that match the query own all the best chunks.)  The shape is
+// deliberately extreme because two softer skews DON'T deepen, which is
+// worth remembering: uniform corpora never underfill (avgMult is exact for
+// them), and "many mildly-near hogs" doesn't either under IVF+PQ -
+// quantization error smears the per-doc clusters across the approximate
+// ranking, spreading the top pool over plenty of distinct docs.  Underfill
+// requires the near-query vector population itself to be owned by few docs.
+// The flat column engine never deepens on multiplicity at all (it
+// doc-collapses during its scan), so the skew point is IVF-only.
+bool skewHog(int64_t docId) { return docId % 1000 == 0; }
+
+Doc makeVectorDoc(int64_t docId, int32_t dims, int32_t valuesPerDoc, bool skew) {
   std::string id = "d" + std::to_string(docId);
-  if (valuesPerDoc == 1) {
+  if (valuesPerDoc == 1 && !skew) {
     return flatdoc("id", id, "bench_v", makeVector(docId, dims, 0));
   }
 
   std::vector<std::vector<float>> values;
-  values.reserve((size_t)valuesPerDoc);
-  for (int32_t i = 0; i < valuesPerDoc; i++) {
-    values.push_back(makeVector(docId, dims, i));
+  if (skew && skewHog(docId)) {
+    std::vector<float> query = makeQueryVector(dims);
+    std::vector<float> center = makeVector(docId, dims, 0);
+    for (int32_t i = 0; i < dims; i++) {
+      center[(size_t)i] = query[(size_t)i] + 0.02f * center[(size_t)i];
+    }
+    constexpr int32_t hogValues = 32;
+    values.reserve((size_t)hogValues);
+    for (int32_t v = 0; v < hogValues; v++) {
+      std::vector<float> jitter = makeVector(docId, dims, v + 1);
+      for (int32_t i = 0; i < dims; i++) {
+        jitter[(size_t)i] = center[(size_t)i] + 0.01f * jitter[(size_t)i];
+      }
+      values.push_back(std::move(jitter));
+    }
+  } else {
+    int32_t numValues = skew ? 2 : valuesPerDoc;
+    values.reserve((size_t)numValues);
+    for (int32_t i = 0; i < numValues; i++) {
+      values.push_back(makeVector(docId, dims, i));
+    }
   }
   return flatdoc("id", id, "bench_vs", values);
 }
 
 void indexVectorBatch(CollectionHelper& helper, int64_t startDoc, int64_t count,
-                      int32_t dims, int32_t valuesPerDoc) {
+                      int32_t dims, int32_t valuesPerDoc, bool skew) {
   constexpr int64_t batchSize = 256;
   std::vector<Doc> docs;
   docs.reserve((size_t)batchSize);
 
   for (int64_t i = 0; i < count; i++) {
-    docs.push_back(makeVectorDoc(startDoc + i, dims, valuesPerDoc));
+    docs.push_back(makeVectorDoc(startDoc + i, dims, valuesPerDoc, skew));
     if ((int64_t)docs.size() == batchSize) {
       helper.indexAll(docs);
       docs.clear();
@@ -144,7 +180,7 @@ void indexVectorBatch(CollectionHelper& helper, int64_t startDoc, int64_t count,
 }
 
 void buildVectorBenchIndex(CollectionHelper& helper, int64_t nDocs, int32_t dims,
-                           int32_t valuesPerDoc, bool buildFaissAux) {
+                           int32_t valuesPerDoc, bool buildFaissAux, bool skew = false) {
   helper.clear();
   installVectorBenchSchema(helper.collection(), dims);
 
@@ -154,14 +190,15 @@ void buildVectorBenchIndex(CollectionHelper& helper, int64_t nDocs, int32_t dims
   int64_t docId = 0;
   for (int64_t seg = 0; seg < nSegs; seg++) {
     int64_t segDocs = baseSegDocs + (seg < remainder ? 1 : 0);
-    indexVectorBatch(helper, docId, segDocs, dims, valuesPerDoc);
+    indexVectorBatch(helper, docId, segDocs, dims, valuesPerDoc, skew);
     helper.commit();
     docId += segDocs;
   }
 
   if (buildFaissAux) {
     IvfPqBenchGuard guard;
-    helper.commit({std::string("vec.") + (valuesPerDoc == 1 ? "bench_v" : "bench_vs")});
+    helper.commit({std::string("vec.")
+                   + (valuesPerDoc == 1 && !skew ? "bench_v" : "bench_vs")});
   }
 }
 
@@ -211,19 +248,21 @@ bool fingerprint(LocalReq& req, uint64_t& fp, std::string& error) {
   return true;
 }
 
-void BM_VectorKnn(benchmark::State& state, bool multiValued, bool faissAux) {
+void BM_VectorKnn(benchmark::State& state, bool multiValued, bool faissAux,
+                  bool skew = false) {
   int64_t nDocs = solux::unit_tests ? 240 : state.range(0);
   int32_t dims = solux::unit_tests ? 16 : 64;
   int32_t valuesPerDoc = multiValued ? 4 : 1;
   int32_t k = 10;
 
   CollectionHelper helper("main");
-  buildVectorBenchIndex(helper, nDocs, dims, valuesPerDoc, faissAux);
+  buildVectorBenchIndex(helper, nDocs, dims, valuesPerDoc, faissAux, skew);
   std::vector<float> query = makeQueryVector(dims);
   std::string field = multiValued ? "bench_vs" : "bench_v";
 
   uint64_t expectedFp = 0;
   bool haveExpectedFp = false;
+  int64_t folds0 = KnnQuery::seenFoldsForTests.load(std::memory_order_relaxed);
   RSSWatcher watcher;
   for (auto _ : state) {
     auto* req = makeKnnBenchReq(helper.getSearchEngine(), field, query, k);
@@ -255,6 +294,11 @@ void BM_VectorKnn(benchmark::State& state, bool multiValued, bool faissAux) {
   state.counters["rate"] = benchmark::Counter(state.iterations(), benchmark::Counter::kIsRate);
   state.counters["RSS_delta"] = mem.first / 1024;
   state.counters["RSS_max"] = mem.second / 1024;
+  // ~1.0 when every query deepened (the skew points exist to pin this at 1;
+  // the uniform points pin it at 0 - their collapse never underfills).
+  state.counters["folds"] =
+    (double)(KnnQuery::seenFoldsForTests.load(std::memory_order_relaxed) - folds0)
+    / (double)state.iterations();
 }
 
 // ---------------------------------------------------------------------------
@@ -670,6 +714,11 @@ SOLUX_BENCHMARK_CAPTURE(BM_VectorKnn, single_column, false, false)->Arg(50'000);
 SOLUX_BENCHMARK_CAPTURE(BM_VectorKnn, single_ivfpq, false, true)->Arg(50'000);
 SOLUX_BENCHMARK_CAPTURE(BM_VectorKnn, multi_column, true, false)->Arg(50'000);
 SOLUX_BENCHMARK_CAPTURE(BM_VectorKnn, multi_ivfpq, true, true)->Arg(50'000);
+// Deepen-latency point: the skew corpus (see makeVectorDoc) makes round-1
+// collapse underfill the doc target, forcing depth rounds (folds counter
+// == 1).  IVF-only: the flat column engine doc-collapses during its scan
+// and so never deepens on multiplicity.
+SOLUX_BENCHMARK_CAPTURE(BM_VectorKnn, multi_ivfpq_skew, true, true, true)->Arg(50'000);
 
 // Two sweeps over (nprobe, refine); 0 = production default for either knob.
 // nprobe sweep at default refine: breadth axis, up to exhaustive-over-lists.
