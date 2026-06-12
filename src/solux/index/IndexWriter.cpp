@@ -461,17 +461,31 @@ void IndexWriter::segmentFlushBody(Inverter& inverter) {
     segInfo->liveGen = inverter.liveGen;
     segInfo->liveDocs = inverter.liveDocs;
     assert(segInfo->liveDocs <= segInfo->maxDoc);
-    // liveDocs == 0 (empty segment) should be dropped later during commit.
-    // We still need to carry over deletes-by-string-id
+    // We still need to carry over deletes-by-string-id even if liveDocs == 0.
   } else {
     segInfo->liveDocs = segInfo->maxDoc;
+  }
+
+  // A segment born with no live docs (every doc failed and was marked deleted)
+  // never becomes visible: don't register it as a live segment.  Registering it
+  // would feed the merge policy a level count that merge selection can never
+  // reduce (mergeSegmentsBody skips liveDocs==0 sources), which sustains an
+  // endless self-chaining merge loop.  Route it straight to segmentsToDelete so
+  // its files get removed after the commit.
+  if (success && segInfo->liveDocs == 0) {
+    INDEX_DEBUG("segmentFlushBody: inverter {} produced empty segment {}; dropping",
+                (void*)&inverter, *segInfo);
+    success = false;
+    const std::lock_guard<std::mutex> lock(indexMutex);
+    segmentsToDelete.push_back(std::move(segInfo));
   }
 
   std::unique_ptr<Inverter> inverterPtr;
 
   {
     const std::lock_guard<std::mutex> lock(indexMutex);
-    INDEX_DEBUG("segmentFlushBody: inverter {} flushed. Adding {}", (void*)&inverter, *segInfo);
+    INDEX_DEBUG("segmentFlushBody: inverter {} flushed. Adding {}", (void*)&inverter,
+                segInfo ? format_as(*segInfo) : std::string("(empty segment, dropped)"));
 
     // segments are flushed in parallel, so the segids are not in order... (or in the completed order.) should be fine.
     std::pair<SegMap::iterator, bool> iter;
@@ -1471,11 +1485,33 @@ void IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
     mergePolicy->_sanityCheck();
   }
   if (segs.empty()) {
-    // This is possible if a merge was correctly triggered, but all of the segments were deleted.
+    // This is possible if a merge was correctly triggered, but all of the segments were
+    // deleted (or emptied by deletes and awaiting their commit-time drop).  Don't chain
+    // the next merge: no progress was made, so chaining would re-select the same nothing
+    // and spin the single-concurrency merge node, starving the commit whose segment drop
+    // would correct the level counts.  The next segment flush re-triggers merging
+    // naturally (event-paced), same as the contained-merge-failure path.
     INDEX_DEBUG("mergeSegmentsBody: no segments to merge for msg={}", (void*)&msg);
-    finishMergeTail(false);
+    finishMergeTail(false, /*chainNextMerge=*/false);
     msg.done(*this);
     return; // nothing to merge
+  }
+
+  if (segs.size() == 1 && msg.maxSegments != 1) {
+    // A single-segment gather means the level counts are out of sync with the
+    // mergeable segments at this level (e.g. liveDocs==0 segments awaiting their
+    // commit-time drop still hold counts).  Merging one segment into an
+    // equivalent same-level output makes no progress; chaining on it spins the
+    // merge node forever.  Bail out and let the next flush re-trigger merging.
+    {
+      const std::lock_guard<std::mutex> lock(indexMutex);
+      segs[0]->merging = false;
+      segs[0]->mergedLiveGen = -1;
+    }
+    INDEX_DEBUG("mergeSegmentsBody: only one mergeable segment at level {}; skipping", msg.mergeLevel);
+    finishMergeTail(false, /*chainNextMerge=*/false);
+    msg.done(*this);
+    return;
   }
 
   std::vector<uint64_t> sourceSegIds;
