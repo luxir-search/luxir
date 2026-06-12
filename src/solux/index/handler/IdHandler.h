@@ -80,6 +80,12 @@ private:
 
     auto [entry, inserted] = termsHash.try_emplace(id, inverter.getDoc(), version);
     if (!inserted) {
+      if (version > 0 && entry->val().docId != inverter.getDoc()) {
+        // Overwrite of an id already indexed in this inverter: the previous doc is
+        // superseded and must be marked deleted here.  applyDeletes can never reach
+        // it - the id postings written at flush only list the latest doc per id.
+        inverter.deleteDoc(entry->val().docId);
+      }
       // Same id indexed again. update to latest doc and version.
       entry->val().docId = inverter.getDoc();
       // Keep the overwrite version if we had one, otherwise update
