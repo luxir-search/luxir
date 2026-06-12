@@ -49,6 +49,41 @@ TEST_F(SchemaTest, defaultSchema) {
 }
 
 
+TEST_F(SchemaTest, collectionHelperClearRestoresDefaultSchema) {
+  CollectionHelper ch;
+  ch.clear();
+
+  proto::SchemaDef def;
+  auto* f = def.add_fields();
+  f->set_name("custom_text");
+  f->set_field_class(proto::FieldDef::TEXT);
+  auto schema = Schema::fromProto(def, ch.collection().getSchema().get());
+  ch.collection().setSchema(schema);
+  ASSERT_NE(nullptr, ch.collection().getSchema()->getFieldTypePtr("custom_text"));
+
+  ch.clear();
+
+  auto resetSchema = ch.collection().getSchema();
+  EXPECT_EQ(nullptr, resetSchema->getFieldTypePtr("custom_text"));
+  EXPECT_NE(nullptr, resetSchema->getFieldTypePtr("id"));
+  EXPECT_NE(nullptr, resetSchema->getFieldTypePtr("body_w"));
+}
+
+
+TEST_F(SchemaTest, collectionHelperClearSkipsDefaultSchemaReset) {
+  CollectionHelper ch;
+  ch.clear();
+
+  auto schema = ch.collection().getSchema();
+  uint64_t nextGen = ch.collection().schemaGen();
+
+  ch.clear();
+
+  EXPECT_EQ(nextGen, ch.collection().schemaGen());
+  EXPECT_EQ(schema.get(), ch.collection().getSchema().get());
+}
+
+
 TEST_F(SchemaTest, fromProtoBasic) {
   proto::SchemaDef def;
 
