@@ -47,34 +47,42 @@ public:
   }
 
   void addBlock(std::span<int64_t> arr) {
-    // since gcd(a,b) = gcd(a, b-a), it doesn't matter if we subtract min first (except maybe it could be faster?)
-    // we also do the gcd calculation in signed integers, because gcd(-10,10) on unsigned bit patterns yields 2.
-    int64_t gcd = arr[0];
     int64_t min = arr[0];
     int64_t max = arr[0];
     for (size_t i=1; i<arr.size(); i++) {
       min = std::min(min, arr[i]);
       max = std::max(max, arr[i]);
-      // If gcd hits 1 it can't change from that.  If it's 0, it could still go up.
-      if (gcd != 1) {
-        gcd = std::gcd(gcd, arr[i]);
-      }
     }
-    
+
     // Track overall min/max across all blocks
     overallMin = std::min(overallMin, min);
     overallMax = std::max(overallMax, max);
 
-    // get number of bits needed to represent values if we divide everything by the gcd
+    // gcd of the deltas from min, computed in uint64: the deltas are exact
+    // for any int64 pair (a block's range can exceed int64, e.g. sortable
+    // double bit patterns near both extremes), std::gcd on signed values is
+    // UB for INT64_MIN, and gcd-of-deltas >= gcd-of-values so compression
+    // only improves.  The decode formula (delta * gcd + min) only needs the
+    // gcd to divide the deltas.
+    uint64_t gcd = 0;
+    for (auto v : arr) {
+      // If gcd hits 1 it can't change from that.  If it's 0, it could still go up.
+      if (gcd == 1) {
+        break;
+      }
+      gcd = std::gcd(gcd, uint64_t(v) - uint64_t(min));
+    }
     if (gcd == 0) {
-      gcd = 1;  // all values 0... we can't divide by 0 though.
+      gcd = 1;  // all values equal... we can't divide by 0 though.
     }
 
-    uint32_t bits = std::bit_width((uint64_t)((max - min) / gcd));
+    // number of bits needed to represent the deltas after dividing by the gcd
+    uint64_t range = (uint64_t(max) - uint64_t(min)) / gcd;
+    uint32_t bits = std::bit_width(range);
     colOutput.align(4); // just a guess for now... we should really test.
     // the original SIMD code wrote length, min, max (which is 12 bytes, only 4 byte aligned when the SIMD magic starts happening)
     int64_t off = colOutput.size() - colStart;
-    blockInfo.push_back({gcd, min, max, bits, off});
+    blockInfo.push_back({(int64_t)gcd, min, max, bits, off});
 
     if (bits > 32) {
       // we can't handle this case yet
@@ -89,8 +97,12 @@ public:
     ivalues.reserve(arr.size());
     ivalues.resize(0);
     for (auto v : arr) {
-      ivalues.push_back(int32_t((v - min) / gcd));  // guaranteed to fit since bits <=32
-      assert(int64_t(ivalues.back()) * gcd + min == v);
+      // The delta is an unsigned 32-bit quantity (bits <= 32 covers the full
+      // uint32 range); the codec and readers consume it as uint32 and
+      // zero-extend before applying gcd/min, so keep the unsigned bit pattern.
+      uint32_t delta = (uint32_t)((uint64_t(v) - uint64_t(min)) / gcd);
+      ivalues.push_back((int32_t)delta);
+      assert(int64_t(uint64_t(delta) * gcd + uint64_t(min)) == v);
     }
 
     if (false && bits > 28) {  // future... need to manage our own metadata (bits,min) for this to work on reading side.

@@ -354,7 +354,9 @@ public:
       auto valuesInBlock = (blockNum == uint64_t(max) / Postings::NUMERIC_BLOCK_SIZE) ? uint32_t(max) % Postings::NUMERIC_BLOCK_SIZE : Postings::NUMERIC_BLOCK_SIZE;
       if (block.format <= 32) {
         auto unscaled = IndexCodec::numericCodec.selectWithMeta(blockStart, valuesInBlock, rankInBlock, 0, block.format);
-        return unscaled * block.gcd + block.min;
+        // unsigned math: delta * gcd can exceed int64 for blocks whose range
+        // spans most of the int64 space (see IntColWriter::addBlock)
+        return int64_t(uint64_t(unscaled) * uint64_t(block.gcd) + uint64_t(block.min));
       } else {
         // 64-bit, temp impl uncompressed
         return reinterpret_cast<const int64_t*>(blockStart)[rankInBlock];
@@ -424,7 +426,9 @@ public:
         IndexCodec::numericCodec.decodeWithMeta(subBlockStart, littleBlockSize,
                                               ints, num, 0, block.format);
         for (uint32_t i = 0; i < num; i++) {
-          decoded[i] = ints[i] * block.gcd + block.min;
+          // unsigned math: delta * gcd can exceed int64 for blocks whose range
+          // spans most of the int64 space (see IntColWriter::addBlock)
+          decoded[i] = int64_t(uint64_t(ints[i]) * uint64_t(block.gcd) + uint64_t(block.min));
         }
       } else {
         // 64-bit, temp impl uncompressed

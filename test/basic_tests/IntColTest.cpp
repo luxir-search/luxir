@@ -168,6 +168,66 @@ TEST_F(IntColTest, minMaxSingleValue) {
   ASSERT_EQ(42, f.colReader->getMax());
 }
 
+// Blocks whose value range crosses 2^31 (or the full int64 span) used to
+// overflow the writer's signed 32-bit delta math; deltas are unsigned and
+// both writer and readers must zero-extend them (see IntColWriter::addBlock).
+TEST_F(IntColTest, wideRangeBlock) {
+  // range just over 2^31, gcd 1: compressed 32-bit-delta path
+  {
+    TestIndex testIndex;
+    TestField f(testIndex, "foo_i");
+    f.startIndexing();
+    f.add(0, 2000000000);
+    f.add(1, -2000000000);
+    f.add(2, 1500000001);  // odd value forces gcd=1
+    testIndex.flush();
+    f.startReading();
+    ASSERT_EQ(0, f.nextDoc());
+    ASSERT_EQ(2000000000, f.val());
+    ASSERT_EQ(1, f.nextDoc());
+    ASSERT_EQ(-2000000000, f.val());
+    ASSERT_EQ(2, f.nextDoc());
+    ASSERT_EQ(1500000001, f.val());
+    ASSERT_EQ(-1, f.nextDoc());
+  }
+
+  // range exceeding int64: uncompressed 64-bit path
+  {
+    TestIndex testIndex;
+    TestField f(testIndex, "foo_i");
+    f.startIndexing();
+    f.add(0, std::numeric_limits<int64_t>::max());
+    f.add(1, std::numeric_limits<int64_t>::min());
+    f.add(2, 7);
+    testIndex.flush();
+    f.startReading();
+    ASSERT_EQ(0, f.nextDoc());
+    ASSERT_EQ(std::numeric_limits<int64_t>::max(), f.val());
+    ASSERT_EQ(1, f.nextDoc());
+    ASSERT_EQ(std::numeric_limits<int64_t>::min(), f.val());
+    ASSERT_EQ(2, f.nextDoc());
+    ASSERT_EQ(7, f.val());
+    ASSERT_EQ(-1, f.nextDoc());
+  }
+
+  // range exceeding int64 but compressible thanks to a large gcd (2^62):
+  // delta * gcd exceeds int64 on decode and must be done in unsigned math
+  {
+    TestIndex testIndex;
+    TestField f(testIndex, "foo_i");
+    f.startIndexing();
+    f.add(0, int64_t(1) << 62);
+    f.add(1, -(int64_t(1) << 62));
+    testIndex.flush();
+    f.startReading();
+    ASSERT_EQ(0, f.nextDoc());
+    ASSERT_EQ(int64_t(1) << 62, f.val());
+    ASSERT_EQ(1, f.nextDoc());
+    ASSERT_EQ(-(int64_t(1) << 62), f.val());
+    ASSERT_EQ(-1, f.nextDoc());
+  }
+}
+
 TEST_F(IntColTest, basic2) {
   TestIndex testIndex;
   std::vector<FieldAndValues> fvs;
