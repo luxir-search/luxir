@@ -8,6 +8,7 @@
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 #include <uni_algo/case.h>
@@ -401,6 +402,144 @@ TEST_F(AnalysisTest, standardFusionMatchesComposedChain) {
 
     EXPECT_EQ(analyze(composed, v).terms, analyze(fused, v).terms) << "mismatch on: " << v;
   }
+}
+
+namespace {
+// Build the composed reference chain (unicode_word + nfkc_cf, pure uni-algo)
+// and the fused StandardTokenizer (region dispatch + ASCII DFA + bulk
+// lowercase), and return both term lists for `v`. The fast paths are correct
+// iff these are always identical.
+std::pair<std::vector<std::string>, std::vector<std::string>> composedVsFused(std::string_view v) {
+  auto t1 = makeUnicodeWordTokenizer();
+  Tokenizer& h1 = *t1;
+  std::unique_ptr<TokenStream> composedTail = makeNfkcCasefoldFilter(std::move(t1));
+  TokenChain composed(h1, std::move(composedTail), true);
+
+  auto t2 = makeStandardTokenizer();
+  Tokenizer& h2 = *t2;
+  std::unique_ptr<TokenStream> fusedTail = std::move(t2);
+  TokenChain fused(h2, std::move(fusedTail), true);
+
+  return {analyze(composed, v).terms, analyze(fused, v).terms};
+}
+}  // namespace
+
+// Adversarial equivalence for the StandardTokenizer fast paths: the safe-split
+// region dispatch, the ASCII word-break DFA, and the bulk ASCII lowercase must
+// be invisible next to the composed chain. Curly apostrophes/quotes and accents
+// exercise mixed ASCII/non-ASCII region routing; mids and underscores the DFA
+// join rules; format/combining/emoji codepoints the region boundary logic.
+TEST_F(AnalysisTest, standardFusionAdversarialEquivalence) {
+  const char* cases[] = {
+      "don’t can’t won’t",                  // curly apostrophe is MidNumLet
+      "“Quoted” and—dashed",                // curly quotes, em dash
+      "Pávlovna said don't go before 3.14 or 1,000",
+      "a:b 1:2 a,b b;c 1;2 a.b.c x..y can't. 'tis 'quoted'",
+      "_ __ _x x_ a_1 x_:y 1_.2 _'_",
+      "tab\tsep\r\nlines\vvtab\fformfeed  double  space",
+      "x\u00ady soft\u00adhyphen",             // U+00AD soft hyphen: Format, glued by WB4
+      "combining a\u0301 mark \u0301orphan-after-space",  // U+0301 combining acute
+      "nb\u00a0sp word\u00a0joined",            // NBSP suppresses the safe split
+      "ＡＢＣ １２ fullwidth",         // NFKC maps to ASCII
+      "ﬃ ligature ﬁnal",
+      "中文mixed汉字words",                // CJK adjacent to ASCII
+      "Большой ТЕАТР",
+      "ΣΟΦΟΣ ὈΔΥΣΣΕΎΣ",
+      "\U0001f1fa\U0001f1f8\U0001f1eb\U0001f1f7 flags \U0001f44d\U0001f3fb emoji",
+      " \t leading and trailing \r\n ",
+      "...  !!!  ---  ()[]{}",
+      "ALLCAPS MixedCase lowercase 0123456789",
+      "",
+  };
+  for (std::string_view v : cases) {
+    auto [composed, fused] = composedVsFused(v);
+    EXPECT_EQ(composed, fused) << "mismatch on: " << v;
+  }
+}
+
+// Every WordBreakTest input sequence through both chains. The corpus is dense
+// in exotic boundary machinery (ZWJ, regional indicators, Extend/Format runs,
+// CR LF, WSegSpace) and stress-tests the safe-split region scanner against
+// codepoints it must route to the conformant path.
+TEST_F(AnalysisTest, standardFusionMatchesComposedOnWordBreakCorpus) {
+  fs::path path = unicodeDataPath("WordBreakTest-15.1.0.txt");
+  std::ifstream in(path, std::ios::binary);
+  if (!in) GTEST_SKIP() << "missing " << path << " (reconfigure cmake to download)";
+
+  int total = 0;
+  for (std::string l; std::getline(in, l);) {
+    if (auto h = l.find('#'); h != std::string::npos) l.resize(h);
+    std::string input;
+    std::istringstream ts(l);
+    for (std::string tok; ts >> tok;) {
+      if (tok != "\xC3\xB7" && tok != "\xC3\x97")  // skip break/no-break marks
+        utf8Append(input, (uint32_t) std::stoul(tok, nullptr, 16));
+    }
+    if (input.empty()) continue;
+    ++total;
+    auto [composed, fused] = composedVsFused(input);
+    ASSERT_EQ(composed, fused) << "WordBreakTest input: " << l;
+  }
+  RecordProperty("wordbreak_equivalence_lines", total);
+}
+
+// Randomized equivalence: values assembled from atoms chosen to stress the
+// region splitter (every ASCII whitespace byte, mids, curly punctuation,
+// accents, CJK, combining marks, format chars, emoji/RI, fullwidth forms).
+TEST_F(AnalysisTest, standardFusionRandomizedEquivalence) {
+  const char* atoms[] = {
+      "the", "Quick", "BROWN", "fox42", "3.14", "1,000", "a:b", "1:2", "x_y", "_",
+      "can't", "x..y", ".", ",", ":", ";", "'", "\"", "-", "(", ")",
+      " ", "  ", "\t", "\n", "\r\n", "\v", "\f",
+      "don’t", "“", "”", "—", "café", "Pávlovna",
+      "straße", "中文", "\u0301", "\u00ad", "\u200d", "\u00a0",
+      "ＡＢ", "\U0001f1fa\U0001f1f8", "\U0001f44d",
+  };
+  int natoms = (int) (sizeof(atoms) / sizeof(atoms[0]));
+  for (int round = 0; round < 300; round++) {
+    std::string v;
+    int n = (int) rng.rint(40);
+    for (int i = 0; i < n; i++) v += atoms[rng.rint(natoms)];
+    auto [composed, fused] = composedVsFused(v);
+    ASSERT_EQ(composed, fused) << "value: " << v;
+  }
+}
+
+// Pin the ASCII fast-path word-break semantics directly (all pure-ASCII, so
+// these stay on the byte-class DFA): '.'/'\'' join same-kind pairs, ':' joins
+// letters only, ',' joins digits only, '_' joins but is not a word by itself,
+// and a trailing mid char never joins.
+TEST_F(AnalysisTest, standardAsciiWordBreakSemantics) {
+  TextFieldType ft("wl", FieldType::INDEX_DOCS_FREQS_POSITIONS, "unicode_word", {"nfkc_cf"});
+  auto chain = ft.createAnalyzer("wl");
+  EXPECT_EQ((std::vector<std::string>{"can't", "stop", "won't", "3.14", "1,000", "a:b", "1", "2",
+                                      "a", "b", "_tag", "x_1", "a.b.c", "x", "y"}),
+            analyze(*chain, "Can't STOP won't 3.14 1,000 a:b 1:2 a,b _tag x_1 a.b.c x..y").terms);
+  EXPECT_EQ((std::vector<std::string>{"x"}), analyze(*chain, "_ x").terms);
+  EXPECT_EQ((std::vector<std::string>{"end"}), analyze(*chain, "end.").terms);
+}
+
+// The ASCII path must be allocation-free per value once buffers are warm: the
+// bulk lowercase reuses `lowered`, DFA tokens are views into it, and no
+// uni-algo view or NFKC scratch is touched for pure-ASCII regions.
+TEST_F(AnalysisTest, standardAsciiPathAllocationFree) {
+  if (!memtrack::counting_enabled) GTEST_SKIP() << "allocation counter disabled under ASan";
+  auto t = makeStandardTokenizer();
+  Tokenizer& head = *t;
+  std::unique_ptr<TokenStream> tail = std::move(t);
+  std::string_view v = "The Quick brown FOX jumps over 42 lazy dogs don't stop a:b 3.14";
+  size_t bytes = 0;
+  auto run = [&] {
+    head.setValue(v);
+    tail->reset();
+    while (tail->incrementToken()) bytes += head.getToken().text.size();
+  };
+  run();  // warm the lowered-value buffer
+  memtrack::AllocScope s;
+  run();
+  long allocs = s.count();  // capture before any EXPECT (gtest macros allocate)
+  EXPECT_EQ(0, allocs);
+  EXPECT_GT(bytes, 0u);
 }
 
 // unicode_word without a fold filter: segmentation only, original bytes preserved.

@@ -60,5 +60,7 @@ static void BM_IndexBook(benchmark::State& state, std::string field, bool docPer
 
 
 
-BENCHMARK_CAPTURE(BM_IndexBook, ws, "text_w", false)->UseManualTime();       // index whole book as single doc
-BENCHMARK_CAPTURE(BM_IndexBook, para_ws, "text_w", true)->UseManualTime();   // index paragraph-per-doc
+// BENCHMARK_CAPTURE(BM_IndexBook, whitespace, "text_w", false)->UseManualTime();    // index whole book as single doc
+BENCHMARK_CAPTURE(BM_IndexBook, standard, "text_wl", false)->UseManualTime();        // index whole book as single doc
+BENCHMARK_CAPTURE(BM_IndexBook, para_whitespace, "text_w", true)->UseManualTime();   // index paragraph-per-doc
+BENCHMARK_CAPTURE(BM_IndexBook, para_standard, "text_wl", true)->UseManualTime();    // index paragraph-per-doc
