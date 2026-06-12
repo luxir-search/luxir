@@ -237,59 +237,9 @@ public:
         }
       } else if (auto* avec = std::get_if<CountVector>(&a->counts)) {
         if (auto* bvec = std::get_if<CountVector>(&b->counts)) {
-          // Both are vectors - need to handle potentially different ranges
-          if (a->minValue == b->minValue && avec->size() == bvec->size()) {
-            // Same range - simple addition
-            for (size_t i = 0; i < bvec->size(); i++) {
-              (*avec)[i] += (*bvec)[i];
-            }
-          } else {
-            // Different ranges - calculate combined range
-            int64_t aMax = a->minValue + (int64_t)avec->size() - 1;
-            int64_t bMax = b->minValue + (int64_t)bvec->size() - 1;
-            int64_t newMin = std::min(a->minValue, b->minValue);
-            int64_t newMax = std::max(aMax, bMax);
-            int64_t newRange = newMax - newMin + 1;
-            
-            if (newRange <= 100000) {
-              // Reuse avec - resize if needed (no-op if already large enough)
-              int64_t oldSize = (int64_t)avec->size();
-              avec->resize(newRange);
-              
-              // If the new min is lower, shift existing values to the right
-              if (newMin < a->minValue) {
-                int64_t shift = a->minValue - newMin;
-                // Fill new cells with 0 first (resize may not zero them if growing)
-                for (int64_t i = oldSize; i < newRange; i++) {
-                  (*avec)[i] = 0;
-                }
-                // Move existing values to the right
-                for (int64_t i = oldSize - 1; i >= 0; i--) {
-                  (*avec)[i + shift] = (*avec)[i];
-                  (*avec)[i] = 0;
-                }
-                a->minValue = newMin;
-              }
-              
-              // Add b's values at their correct positions
-              for (size_t i = 0; i < bvec->size(); i++) {
-                (*avec)[b->minValue - a->minValue + i] += (*bvec)[i];
-              }
-            } else {
-              // Range too large - convert to map
-              IntHash newMap;
-              for (size_t i = 0; i < avec->size(); i++) {
-                if ((*avec)[i] > 0) {
-                  newMap[a->minValue + i] = (*avec)[i];
-                }
-              }
-              for (size_t i = 0; i < bvec->size(); i++) {
-                if ((*bvec)[i] > 0) {
-                  newMap[b->minValue + i] += (*bvec)[i];
-                }
-              }
-              a->counts = std::move(newMap);
-            }
+          assert(a->minValue == b->minValue && avec->size() == bvec->size());
+          for (size_t i = 0; i < bvec->size(); i++) {
+            (*avec)[i] += (*bvec)[i];
           }
         } else {
           // a is vector, b is map
@@ -306,8 +256,6 @@ public:
       return a;
     }
   };
-private:
-  AtomicMerger<MergeableIntFacet> countMerger;
 public:
   // Ctor must be nothrow (Arena::Create hazard).  ProtobufSearchParser
   // computes globalMin/globalMax/useVector via scanGlobalRange before

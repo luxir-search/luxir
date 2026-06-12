@@ -13,6 +13,7 @@
 #include "solux/util/proto.h"
 #include "solux/index/Inverter.h"
 #include "solux/index/IndexWriter.h"
+#include "solux/search/ops/StrFacetOp.h"
 
 using namespace solux;
 using namespace solux::test;
@@ -20,6 +21,70 @@ using namespace solux::test;
 class FacetTest : public SoluxTest {
 protected:
 };
+
+TEST_F(FacetTest, mergeableStrDataMergeVariants) {
+  using Data = StrFacetOp::MergeableStrData;
+  using CountVector = Data::CountVector;
+  using OrdHash = Data::OrdHash;
+
+  auto makeOrd = [](std::initializer_list<std::pair<const int64_t, int64_t>> vals, int64_t missing) {
+    Data data;
+    data.counts = OrdHash(vals);
+    data.missing_num = missing;
+    return data;
+  };
+  auto makeVec = [](std::initializer_list<int64_t> vals, int64_t missing) {
+    Data data;
+    data.counts = CountVector(vals);
+    data.missing_num = missing;
+    return data;
+  };
+  auto makeSkinny = [](std::initializer_list<std::pair<int64_t, int64_t>> vals, int64_t missing) {
+    Data data;
+    data.counts.emplace<SkinnyCounter8>(8);
+    auto& skinny = std::get<SkinnyCounter8>(data.counts);
+    for (auto [ord, count] : vals) {
+      skinny.increment(ord, count);
+    }
+    data.missing_num = missing;
+    return data;
+  };
+  auto asVec = [](const Data& data) {
+    std::vector<int64_t> out(8);
+    if (auto* ords = std::get_if<OrdHash>(&data.counts)) {
+      for (auto [ord, count] : *ords) out[ord] = count;
+    } else if (auto* vec = std::get_if<CountVector>(&data.counts)) {
+      for (size_t i = 0; i < vec->size(); i++) out[i] = (*vec)[i];
+    } else if (auto* skinny = std::get_if<SkinnyCounter8>(&data.counts)) {
+      for (size_t i = 0; i < skinny->counts.size(); i++) out[i] = skinny->counts[i];
+      for (auto [ord, count] : skinny->overflow) out[ord] += count;
+    }
+    return out;
+  };
+  auto expectMerge = [&](Data a, Data b, std::vector<int64_t> expected) {
+    auto missing = a.missing_num + b.missing_num;
+    auto* result = Data::merge(&a, &b);
+    EXPECT_EQ(expected, asVec(*result));
+    EXPECT_EQ(missing, result->missing_num);
+  };
+
+  {
+    Data empty;
+    empty.missing_num = 1;
+    expectMerge(empty, makeOrd({{2, 3}}, 2), {0, 0, 3, 0, 0, 0, 0, 0});
+  }
+  {
+    Data empty;
+    empty.missing_num = 4;
+    expectMerge(makeOrd({{1, 5}}, 3), empty, {0, 5, 0, 0, 0, 0, 0, 0});
+  }
+  expectMerge(makeOrd({{2, 1}}, 5), makeOrd({{2, 4}, {3, 6}}, 6), {0, 0, 5, 6, 0, 0, 0, 0});
+  expectMerge(makeOrd({{1, 7}, {2, 1}}, 7), makeOrd({{1, 3}}, 8), {0, 10, 1, 0, 0, 0, 0, 0});
+  expectMerge(makeSkinny({{2, 3}}, 9), makeOrd({{2, 4}, {4, 5}}, 10), {0, 0, 7, 0, 5, 0, 0, 0});
+  expectMerge(makeVec({1, 0, 2, 0, 0, 0, 0, 0}, 11), makeOrd({{2, 5}, {5, 6}}, 12), {1, 0, 7, 0, 0, 6, 0, 0});
+  expectMerge(makeVec({0, 2, 0, 0, 0, 0, 0, 0}, 13), makeSkinny({{1, 5}, {6, 300}}, 14), {0, 7, 0, 0, 0, 0, 300, 0});
+  expectMerge(makeVec({1, 2, 0, 0, 0, 0, 0, 0}, 15), makeVec({3, 0, 4, 0, 0, 0, 0, 0}, 16), {4, 2, 4, 0, 0, 0, 0, 0});
+}
 
 TEST_F(FacetTest, emptyIndex) {
   CollectionHelper helper;
