@@ -28,6 +28,19 @@ class IdHandler final : public Inverter::IndexHandler {
   std::unique_ptr<TermValHash<IdEntry>> deleteHash;  // explicit delete-by-id: docId = -1
   bool hadOverwrites_ = false;  // true if any indexId() call had overwrite=true
 
+  // Undo log so a failed document (or a failed all_or_none request) can roll back
+  // its termsHash / deleteHash mutations.  A failed update must not delete the
+  // previous version of the doc, nor displace an earlier in-inverter entry for
+  // the same id.  TermValRef copies stay valid across rehash: the blobs live in
+  // idPool and rehash only moves the refs.  Scope of an undo is a single update
+  // message; IndexWriter::releaseInverter clears the log.
+  struct UndoEntry {
+    TermValRef<IdEntry> entry;
+    IdEntry oldVal;
+    bool inserted;
+  };
+  std::vector<UndoEntry> undoLog_;
+
   Inverter::IndexHandler* versionHandler = nullptr; // lazily resolved on first overwrite
 
 public:
@@ -60,11 +73,40 @@ public:
     }
     auto [entry, inserted] = deleteHash->try_emplace(id, -1, version);
     if (!inserted) {
+      undoLog_.push_back({*entry, entry->val(), false});
       // Same id deleted again - keep the highest version.
       if (version > entry->val().version) {
         entry->val().version = version;
       }
+    } else {
+      undoLog_.push_back({*entry, IdEntry(-1, 0), true});
     }
+  }
+
+  size_t undoSize() const {
+    return undoLog_.size();
+  }
+
+  /// Roll back all termsHash / deleteHash mutations made after the given mark
+  /// (a previous undoSize() value).  Callers must separately mark the docs of
+  /// the rolled-back scope as deleted; see Inverter::rollbackTo.
+  void rollbackTo(size_t mark) {
+    while (undoLog_.size() > mark) {
+      UndoEntry& u = undoLog_.back();
+      if (u.inserted) {
+        // TermValHash has no erase; neutralize instead.  version==0 entries are
+        // inert (applyDeletes skips them, merges filter them) and the doc this
+        // entry points at is marked deleted by the caller.
+        u.entry.val().version = 0;
+      } else {
+        u.entry.val() = u.oldVal;
+      }
+      undoLog_.pop_back();
+    }
+  }
+
+  void clearUndoLog() {
+    undoLog_.clear();
   }
 
 private:
@@ -80,6 +122,7 @@ private:
 
     auto [entry, inserted] = termsHash.try_emplace(id, inverter.getDoc(), version);
     if (!inserted) {
+      undoLog_.push_back({*entry, entry->val(), false});
       if (version > 0 && entry->val().docId != inverter.getDoc()) {
         // Overwrite of an id already indexed in this inverter: the previous doc is
         // superseded and must be marked deleted here.  applyDeletes can never reach
@@ -92,6 +135,8 @@ private:
       if (version > 0 || entry->val().version == 0) {
         entry->val().version = version;
       }
+    } else {
+      undoLog_.push_back({*entry, IdEntry(0, 0), true});
     }
   }
 

@@ -628,6 +628,7 @@ public:
     assert(success);
 
     updateMessage.blocker.wait();
+    updateMessage.finishResponse();
 
     return grpc::Status::OK;
   }
@@ -705,7 +706,7 @@ public:
         // By the time this response is done, *this* object will already be deleted, so don't
         // reference anything in this Update instance.
         auto* p = parent;
-        parent->respond(this->getResponse(),
+        parent->respond(this->finishResponse(),
                       [p](auto* response) { unused(p); releaseArena(response->GetArena()); },
                       1);
         delete this; // TODO arena allocate this

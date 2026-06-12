@@ -18,10 +18,14 @@ namespace solux::handler {
 ///
 /// dims_ tracks the vector size observed so far in this segment.  If the
 /// owning VectorFieldType declares a non-zero dims, it seeds dims_ and any
-/// mismatched input is rejected.  Otherwise the first indexed value sets
-/// dims_ and subsequent values must match.
+/// mismatched input is rejected.  Otherwise dims are learned from input, but
+/// only committed to dims_ once a value is actually appended to the column:
+/// a doc that fails during validation (and is rolled back / marked deleted)
+/// must not constrain later docs, while an appended value makes the
+/// per-segment fixed-size constraint real even if its doc is later deleted.
 class VectorHandler final : public StrColHandler {
-  int32_t dims_ = 0;          // 0 until first value seen (or set from schema)
+  int32_t dims_ = 0;          // 0 until first value appended (or set from schema)
+  int32_t pendingDims_ = 0;   // dims learned from the current value, not yet appended
   VectorFieldType::Metric metric = VectorFieldType::METRIC_NONE;
   bool trustNormalized = false;
   bool normalizeOnWrite = false;
@@ -49,6 +53,7 @@ protected:
 
 public:
   void index(Inverter& inverter, const proto::Val& val) override {
+    pendingDims_ = 0;  // dims learned by a previous (possibly failed) value don't carry over
     bool multi = (fieldType->flags_ & FieldType::MULTI_VALUED) != 0;
     if (val.has_vec()) {
       if (multi) {
@@ -72,11 +77,24 @@ public:
 private:
   static constexpr double MIN_COSINE_NORM_SQ = 1.0e-30;
 
-  // Validate a Vector against current dims_, learning dims_ on first call.
-  // Returns the f32 floats, or nullptr if the value should be skipped: a cosine
-  // field's zero / near-zero vector has no direction, so we drop it (and log)
-  // rather than fail the whole update.  Throws on hard errors (bad encoding,
-  // empty vector, dims mismatch).
+  // The dims constraint to validate against: committed segment dims if any,
+  // else dims learned earlier in the current value.
+  int32_t effectiveDims() const {
+    return dims_ != 0 ? dims_ : pendingDims_;
+  }
+
+  // Commit tentatively learned dims; called right before a value is appended.
+  void commitDims() {
+    if (dims_ == 0) {
+      dims_ = pendingDims_;
+    }
+  }
+
+  // Validate a Vector against the effective dims, learning pendingDims_ on the
+  // first vector of a value.  Returns the f32 floats, or nullptr if the value
+  // should be skipped: a cosine field's zero / near-zero vector has no
+  // direction, so we drop it (and log) rather than fail the whole update.
+  // Throws on hard errors (bad encoding, empty vector, dims mismatch).
   const proto::ArrFloat* validate(const proto::Vector& vec, double* normSq = nullptr) {
     if (!vec.has_f32()) {
       throw std::runtime_error(fmt::format(
@@ -89,12 +107,13 @@ private:
       throw std::runtime_error(fmt::format(
           "VectorHandler: empty vector in field '{}'", std::string_view(fieldName)));
     }
-    if (dims_ == 0) {
-      dims_ = n;
-    } else if (n != dims_) {
+    int32_t expected = effectiveDims();
+    if (expected == 0) {
+      pendingDims_ = n;
+    } else if (n != expected) {
       throw std::runtime_error(fmt::format(
           "VectorHandler: field '{}' expects dims={}, got {}",
-          std::string_view(fieldName), dims_, n));
+          std::string_view(fieldName), expected, n));
     }
     if (metric == VectorFieldType::METRIC_COSINE && !trustNormalized) {
       double sum = 0.0;
@@ -140,6 +159,7 @@ private:
     double normSq = 0.0;
     auto* f = validate(vec, &normSq);
     if (f == nullptr) return;  // skipped: doc gets no value for this field
+    commitDims();
     normalizedScratch.clear();
     if (normalizeOnWrite) normalizedScratch.reserve((size_t)f->v_size());
     indexSingle(inverter, storedBytes(*f, normSq, normalizedScratch));
@@ -149,6 +169,7 @@ private:
     double normSq = 0.0;
     auto* f = validate(vec, &normSq);
     if (f == nullptr) return;  // skipped: doc gets no value for this field
+    commitDims();
     normalizedScratch.clear();
     if (normalizeOnWrite) normalizedScratch.reserve((size_t)f->v_size());
     std::string_view views[] = { storedBytes(*f, normSq, normalizedScratch) };
@@ -174,6 +195,7 @@ private:
     }
     // All values skipped => doc has no vector value (like an empty list).
     if (floats.empty()) return;
+    commitDims();
 
     std::vector<std::string_view> views;
     views.reserve(floats.size());

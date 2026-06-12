@@ -351,13 +351,18 @@ message UpdateRequest {
   // effectively enable a mix of column oriented and row oriented.
   Columns columns = 5;
 
-  // Document IDs to delete.
+  // Document IDs to delete.  Deletes never fail per-id; deleting a nonexistent id
+  // is a no-op.
   repeated string delete_ids = 6;
 
   // If true, existing documents with the same ID will be overwritten by documents in this request.
   bool overwrite = 7;
 
   // If true, all documents in this request must be successfully indexed or none will be.
+  // Processing stops at the first failing document: documents already indexed by this
+  // request are rolled back, queued delete_ids from this request are rolled back, and
+  // later documents are not attempted (and not listed in errors).
+  // Atomicity is per-request; it does not span multiple requests in a stream.
   bool all_or_none = 8;
 
   // If true, return the ids of indexed documents in the response.
@@ -367,7 +372,8 @@ message UpdateRequest {
   CommitParams commit = 10;
 }
 
-// The response to an update request, or one or more update requests in streaming mode.
+// The response to an update request.  In streaming mode the server sends exactly one
+// response per request.
 message UpdateResponse {
   // This is the request_id from the UpdateRequest, if it was set.
   bytes request_id = 1;
@@ -378,21 +384,39 @@ message UpdateResponse {
   enum Status {
     UNKNOWN = 0;          // the default
     OK = 1;               // the update was successful
-    PARTIAL = 2;          // some documents were updated, but some failed
-    ERROR = 3;            // the update failed completely
+    PARTIAL = 2;          // part of the request took effect, part failed (see errors)
+    ERROR = 3;            // the request failed.  If error_message is empty, the failure was
+                          // per-document (see errors) and the request had no visible effect
+                          // on the index.  If error_message is set, the failure was
+                          // request-level (e.g. commit pipeline) and the effect of
+                          // individual documents is indeterminate beyond what errors lists.
   }
 
   Status status = 3;
 
-  // ids of documents that were successfully indexed, if return_ids was set to true in the request.
+  // ids of documents that were successfully indexed, if return_ids was set to true in the
+  // request.  In request order; failed documents are omitted (align against docs by
+  // skipping errors[].index).  A successfully indexed doc without a string/bytes id
+  // contributes an empty string.  Only meaningful when status is OK or PARTIAL; on a
+  // request-level ERROR the listed documents may have been rolled back.
   repeated string ids = 4;
 
   message Error {
-    string id = 1;  // the id of the document that failed to update
+    // the id of the failed document as given in the request (empty if absent or not a
+    // string/bytes value)
+    string id = 1;
     string error_message = 2;
+    // position of the failed document within the request's document list
+    int32 index = 3;
     // for an invalid value for a field, we could actually give that field/value in a more structured way
   }
+  // Per-document failures.  A failed document has no effect on search results; the
+  // previous version of the document, if any, is untouched.
   repeated Error errors = 5;
+
+  // Request-level error (not tied to a single document), e.g. a failure in the commit
+  // pipeline.  Set when status == ERROR for a non-document failure.
+  string error_message = 6;
 }
 
 

@@ -27,6 +27,30 @@ void Inverter::deleteId(std::string_view id, uint64_t version) {
 }
 
 
+Inverter::UndoMark Inverter::undoMark() const {
+  UndoMark mark;
+  if (idHandler_ != nullptr) {
+    mark.idUndoSize = static_cast<handler::IdHandler&>(*idHandler_).undoSize();
+  }
+  mark.numDeleted = deleted.size();
+  return mark;
+}
+
+void Inverter::rollbackTo(const UndoMark& mark) {
+  if (idHandler_ != nullptr) {
+    static_cast<handler::IdHandler&>(*idHandler_).rollbackTo(mark.idUndoSize);
+  }
+  assert(deleted.size() >= mark.numDeleted);
+  deleted.resize(mark.numDeleted);
+}
+
+void Inverter::clearUndoLog() {
+  if (idHandler_ != nullptr) {
+    static_cast<handler::IdHandler&>(*idHandler_).clearUndoLog();
+  }
+}
+
+
 Inverter::IndexHandler& Inverter::createIndexHandler(const std::string_view name) {
   // perhaps this part should be moved to Schema?
   auto currSchema = schema.get();

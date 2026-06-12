@@ -10,10 +10,20 @@ private:
   // response is created on-demand.
   proto::UpdateResponse* response;  // The response object is created in the same arena as the request.
 
+  void initResponse(proto::UpdateResponse* rsp) {
+    rsp->set_request_id(req->request_id());
+    rsp->set_status(proto::UpdateResponse::OK);  // default status
+  }
+
 public:
   proto::UpdateRequest* req;  // The request object may become unavailable after the callback is called
 
   ProtoUpdateMessage(proto::UpdateRequest* req, proto::UpdateResponse* rsp=nullptr) : response(rsp), req(req) {
+    if (response != nullptr) {
+      // A caller-supplied response (unary path) gets the same initialization an
+      // on-demand one gets in getResponse().
+      initResponse(response);
+    }
     if (req->has_commit()) {
       commit = COMMIT;
       const auto& params = req->commit();
@@ -32,10 +42,23 @@ public:
     if (response == nullptr) {
       assert(req->GetArena() != nullptr);
       response = google::protobuf::Arena::Create<proto::UpdateResponse>(req->GetArena());
-      response->set_request_id(req->request_id());
-      response->set_status(proto::UpdateResponse::OK);  // default status
+      initResponse(response);
     }
     return response;
+  }
+
+  // Folds the update version and any message-level error (commit pipeline failures,
+  // unexpected exceptions caught by the update graph) into the response.  Doc-level
+  // errors are already recorded during handle().  Call once processing is complete,
+  // typically from done().
+  proto::UpdateResponse* finishResponse() {
+    auto* rsp = getResponse();
+    rsp->set_update_version(updateVersion);
+    if (result.errored()) {
+      rsp->set_status(proto::UpdateResponse::ERROR);
+      rsp->set_error_message(std::string(result.what()));
+    }
+    return rsp;
   }
 
   // For now, we will allow the handler to obtain/release an inverter.  We could also optionally pass it

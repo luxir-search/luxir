@@ -953,16 +953,21 @@ TEST_F(IndexWriterTest, testMissingFiles) {
 //
 // Shared body for the multithreaded update/delete/read stress test.  When
 // mergeFailPercent > 0, a fraction of merges throw mid-flight to exercise the
-// merge-failure containment teardown under concurrency.  Contained failures
-// are invisible to queries, so the version oracle below must still hold.
-static void runMultithreadedUpdates(uint64_t seed, int mergeFailPercent) {
+// merge-failure containment teardown under concurrency.  When
+// updateFailPercent > 0, a fraction of updates contain a doc that fails to
+// index (unknown field), either as a single-doc update or an all_or_none
+// batch.  All injected failures are invisible to queries, so the version
+// oracle below must hold exactly as if they were never submitted.
+static void runMultithreadedUpdates(uint64_t seed, int mergeFailPercent, int updateFailPercent = 0) {
   using namespace solux::test;
 
   CollectionHelper helper("main");
   helper.clear();
-  
+
   auto indexWriter = helper.getIndexWriter();
   indexWriter->mergePolicy->setMergeFactor(3);  // low merge factor to stress merge concurrency with other operations
+
+  std::atomic<int> injectedDocFailures{0};
 
   auto numThreads = 16;
   auto opsPerThread = 50;  // total operations per thread
@@ -989,6 +994,18 @@ static void runMultithreadedUpdates(uint64_t seed, int mergeFailPercent) {
   // do not bury real problems; a genuine unexpected error still surfaces.  When
   // no failures are injected nothing matches, so this is a harmless pass-through.
   ExpectLog quietFailures("injected merge failure (hammer)");
+
+  // True while an enabled injection kind has not fired yet.  Threads run their
+  // planned ops and then keep going (bounded) until every enabled kind has fired
+  // at least once, so the EXPECT_GT guards at the end can't trip on an unlucky
+  // run while every injection stays probabilistic (a deterministic forced
+  // failure could mask a bug that killed all the random ones).  The cap turns
+  // structurally broken injection into a guard failure instead of an endless
+  // loop.
+  auto injectionsPending = [&]() {
+    return (updateFailPercent > 0 && injectedDocFailures.load() == 0)
+        || (mergeFailPercent > 0 && quietFailures.suppressed() == 0);
+  };
 
   std::vector<std::thread> threads;
 
@@ -1085,7 +1102,7 @@ static void runMultithreadedUpdates(uint64_t seed, int mergeFailPercent) {
       Rng r(seed + tid);
       std::vector<int64_t> docVersions(docsPerThread, 0);
 
-      for (int op = 0; op < opsPerThread; op++) {
+      for (int op = 0; op < opsPerThread || (op < opsPerThread * 10 && injectionsPending()); op++) {
         // Use numeric IDs: thread 0 uses 1000-1007, thread 1 uses 2000-2007, etc
         // One thread never modifies another threads documents.
         int localDoc = r.rint(docsPerThread);
@@ -1094,6 +1111,42 @@ static void runMultithreadedUpdates(uint64_t seed, int mergeFailPercent) {
         int operation = r.rint(3);  // 0 == update, 1 == delete, 2 = read
 
         if (operation == 0) { // Index
+          // Inject a failing update: the doc must keep its previous state, so
+          // docVersions is deliberately NOT updated and the version oracle in
+          // the read path verifies the rollback was invisible.
+          if (updateFailPercent > 0 && r.rint(100) < updateFailPercent) {
+            injectedDocFailures++;
+            if (r.rint(2) == 0) {
+              // Single doc that fails on an unknown field.
+              Doc doc = flatdoc("id", docId, "no_such_field", "boom");
+              auto result = helper.index(doc, UpdateMessage::COMMIT, true);
+              ASSERT_FALSE(result.success);
+              ASSERT_EQ(proto::UpdateResponse::ERROR, result.response.status());
+              ASSERT_EQ(1, result.response.errors_size());
+              EXPECT_EQ(docId, result.response.errors(0).id());
+            } else {
+              // all_or_none batch: a good update of another owned doc gets
+              // indexed, then the bad doc voids the batch; both docs must be
+              // left exactly as they were.
+              std::string otherId = std::to_string(r.rint(docsPerThread) + tid * 1000);
+              google::protobuf::Arena arena;
+              auto* request = google::protobuf::Arena::Create<proto::UpdateRequest>(&arena);
+              CollectionHelper::convertDocToProto(flatdoc("id", otherId), *request->add_docs());
+              CollectionHelper::convertDocToProto(flatdoc("id", docId, "no_such_field", "boom"),
+                                                  *request->add_docs());
+              request->set_overwrite(true);
+              request->set_all_or_none(true);
+              request->mutable_commit();
+              auto result = helper.submit(request);
+              ASSERT_FALSE(result.success);
+              ASSERT_EQ(proto::UpdateResponse::ERROR, result.response.status());
+              ASSERT_EQ(1, result.response.errors_size());
+              EXPECT_EQ(docId, result.response.errors(0).id());
+              EXPECT_EQ(1, result.response.errors(0).index());
+            }
+            continue;
+          }
+
           Doc doc = flatdoc("id", docId);
           auto result = helper.index(doc, UpdateMessage::COMMIT, true);
           ASSERT_TRUE(result.success);
@@ -1151,6 +1204,10 @@ static void runMultithreadedUpdates(uint64_t seed, int mergeFailPercent) {
     EXPECT_GT(quietFailures.suppressed(), 0u);
     solux::Signal::unlisten("segmentMergeBody");
   }
+
+  if (updateFailPercent > 0) {
+    EXPECT_GT(injectedDocFailures.load(), 0);
+  }
 }
 
 TEST_F(IndexWriterTest, testMultithreadedUpdates) {
@@ -1164,6 +1221,20 @@ TEST_F(IndexWriterTest, testMultithreadedUpdates) {
 // concurrent source-restoration path.
 TEST_F(IndexWriterTest, testMultithreadedUpdatesWithMergeFailures) {
   runMultithreadedUpdates(rng(), /*mergeFailPercent=*/25);
+}
+
+// Same hammer, but a fraction of updates contain a failing doc (single-doc and
+// all_or_none batch variants).  Verifies per-doc failure recovery under real
+// contention: id-map rollback, tombstoning, and inverter reuse racing with
+// deletes, commits, and merges.  The version oracle must hold exactly as if
+// the failed updates were never submitted.
+TEST_F(IndexWriterTest, testMultithreadedUpdatesWithDocFailures) {
+  runMultithreadedUpdates(rng(), /*mergeFailPercent=*/0, /*updateFailPercent=*/25);
+}
+
+// Doc failures and merge failures together.
+TEST_F(IndexWriterTest, testMultithreadedUpdatesWithDocAndMergeFailures) {
+  runMultithreadedUpdates(rng(), /*mergeFailPercent=*/25, /*updateFailPercent=*/25);
 }
 
 // Test segment merging with deleted documents

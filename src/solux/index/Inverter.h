@@ -127,6 +127,13 @@ public:
       return this->fieldName == fname;
     }
 
+    // index() implementations should validate a value before mutating any stream
+    // state: a throw is recovered by marking the doc deleted, so streams must stay
+    // appendable for subsequent docs.  Data already appended for the failed doc is
+    // fine (the doc is dead); a throw mid-append of a single value is not.
+    // Cross-doc constraints learned from values (e.g. vector dims) must only be
+    // committed once a value is actually appended, so a failed doc does not
+    // constrain later docs; see VectorHandler.
     virtual void index(Inverter& inverter, std::string_view val) {
       unused(inverter, val);
     }
@@ -209,9 +216,27 @@ public:
   }
 
   /// mark the doc as deleted if something went wrong indexing it.
+  /// A partially indexed doc cannot be backed out of the append-only postings and
+  /// column streams; deleting it via liveDocs is the recovery mechanism.
   void deleteDoc(int docid) {
     deleted.push_back(docid);
   }
+
+  // Rollback support for failed documents / failed all_or_none requests.
+  // A mark captures the undo state at a point in time; rollbackTo restores the
+  // id map (termsHash / deleteHash mutations are undone) and un-marks docs
+  // deleted after the mark (in-inverter overwrites mark superseded docs deleted;
+  // a rolled-back update must resurrect them).  Postings and column data of
+  // rolled-back docs stay in the segment; callers mark those docs deleted.
+  // The undo scope is a single update message: IndexWriter::releaseInverter
+  // clears the log, so marks must not be held across obtain/release.
+  struct UndoMark {
+    size_t idUndoSize = 0;
+    size_t numDeleted = 0;
+  };
+  UndoMark undoMark() const;
+  void rollbackTo(const UndoMark& mark);
+  void clearUndoLog();
 
   size_t memSize() {
     // TODO: take into account more than just the pool

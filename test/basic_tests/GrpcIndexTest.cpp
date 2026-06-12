@@ -127,6 +127,7 @@ public:
     solux::proto::UpdateResponse response;
     grpc::ClientContext context;
 
+    ureq.set_request_id(std::to_string(docnum));
     ureq.mutable_collection()->add_name("main");
     if (commit) {
       auto* params = ureq.mutable_commit();
@@ -138,6 +139,11 @@ public:
     grpc::Status status = indexerStub->Update(&context, ureq , &response);
 
     ASSERT_TRUE(status.ok());
+    // The unary path fills a caller-supplied response: it must get the same
+    // initialization (status, request_id) as an arena-created one.
+    ASSERT_EQ(solux::proto::UpdateResponse::OK, response.status());
+    ASSERT_EQ(std::to_string(docnum), response.request_id());
+    ASSERT_GT(response.update_version(), 0u);
   }
 
   int64_t getDocCount() {

@@ -261,6 +261,10 @@ Inverter& IndexWriter::obtainInverter(uint64_t updateVersion) {
 
 
 void IndexWriter::releaseInverter(Inverter& inverter, bool flush) {
+  // The undo scope is the update message that held this inverter; marks must
+  // not outlive the release.
+  inverter.clearUndoLog();
+
   const std::lock_guard<std::mutex> lock(indexMutex);
   auto it = busyInverters.find(&inverter);
   if (it == busyInverters.end()) {
@@ -2287,9 +2291,10 @@ void IndexWriter::applyDeletes(SegInfo& seg, SortedDeletes::EntrySpan commitDele
 
   // Phase 2: version-gate the candidates in docId order so the _version_
   // column can be read with a single forward iterator.  The column can be
-  // sparse - docs indexed with overwrite=false, or docs with no id field,
-  // have no version value - so values must be read by rank, not docId.
-  // A doc with no version value gates as version 0 and is always deleted.
+  // sparse - docs indexed with overwrite=false, or failed docs that never
+  // reached their id field, have no version value - so values must be read by
+  // rank, not docId.  A doc with no version value gates as version 0 and is
+  // always deleted.
   std::sort(candidates.begin(), candidates.end(),
             [](const DeleteCandidate& a, const DeleteCandidate& b) { return a.docId < b.docId; });
 

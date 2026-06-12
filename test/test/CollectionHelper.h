@@ -13,7 +13,8 @@ namespace solux::test {
 
 struct IndexResult {
   uint64_t updateVersion;
-  bool success;
+  bool success;  // false if the message errored or the response status is ERROR
+  proto::UpdateResponse response;  // copy of the final response (status, errors, ids)
 };
 
 class CollectionHelper {
@@ -21,7 +22,7 @@ private:
   std::shared_ptr<Collection> collection_;
   std::counting_semaphore<1'000'000> indexSemaphore; // semaphore to limit concurrent indexing operations
 
-
+public:
   // Helper function to convert Doc to protobuf Map
   static void convertDocToProto(const Doc& doc, proto::Map& map) {
 
@@ -120,106 +121,78 @@ public:
     return indexAll({&doc,1}, commitType, overwrite);
   }
 
+  // Submit a fully-formed UpdateRequest (must be arena-allocated) and wait for it.
+  // For requests the convenience methods don't cover (all_or_none, return_ids,
+  // mixed adds + deletes); build docs with convertDocToProto.
+  IndexResult submit(proto::UpdateRequest* request) {
+    auto writer = collection().getShard()->getIndexWriter();
+
+    class BlockingProtoUpdateMessage : public ProtoUpdateMessage {
+    public:
+      Blocker blocker;
+      IndexResult* result;
+
+      explicit BlockingProtoUpdateMessage(proto::UpdateRequest* req, IndexResult* result)
+        : ProtoUpdateMessage(req), result(result) {
+      }
+
+      void done(IndexWriter& iw) override {
+        unused(iw);
+        result->response = *finishResponse();
+        result->updateVersion = updateVersion;
+        result->success = !ProtoUpdateMessage::result.errored()
+                          && result->response.status() != proto::UpdateResponse::ERROR;
+        INDEX_TRACE("SYNC_UPDATE_NOTIFY: msg={}", (void*)this);
+        blocker.notify();
+      }
+    };
+
+    IndexResult result;
+    BlockingProtoUpdateMessage updateMessage(request, &result);
+
+    INDEX_TRACE("SYNC_UPDATE_START: msg={}", (void*)&updateMessage);
+    bool success = writer->submitUpdate(&updateMessage);
+    assert(success);
+    unused(success);
+
+    updateMessage.blocker.wait();
+    INDEX_TRACE("SYNC_UPDATE_END: msg={}", (void*)&updateMessage);
+    return result;
+  }
+
   // NOTE: distinct name (not an `index` overload) on purpose. As of C++26 std::span gained an
   // initializer_list constructor (P2447R6), so a braced-init-list like index({{"id","1"}}) becomes
   // ambiguous between the single-Doc overload and a span overload. Keeping the batch entry point
   // under its own name removes that second candidate. Mirrors deleteById / deleteByIds below.
   IndexResult indexAll(std::span<const Doc> docs, UpdateMessage::CommitType commitType = UpdateMessage::NO_COMMIT, bool overwrite = false) {
-    auto writer = collection().getShard()->getIndexWriter();
-
-    class BlockingProtoUpdateMessage : public ProtoUpdateMessage {
-    public:
-      Blocker blocker;
-      IndexResult* result;
-      
-      explicit BlockingProtoUpdateMessage(proto::UpdateRequest* req, IndexResult* result = nullptr) 
-        : ProtoUpdateMessage(req), result(result) {
-      }
-
-      void done(IndexWriter& iw) override {
-        unused(iw);
-        if (result) {
-          result->updateVersion = updateVersion;
-          result->success = !ProtoUpdateMessage::result.errored();
-        }
-        INDEX_TRACE("SYNC_INDEX_NOTIFY: msg={}", (void*)this);
-        blocker.notify();
-      }
-    };
-
     google::protobuf::Arena arena;
     auto* request = google::protobuf::Arena::Create<proto::UpdateRequest>(&arena);
-    
+
     // Convert docs to protobuf format
     for (const auto& doc : docs) {
       convertDocToProto(doc, *request->add_docs());
     }
-    
+
     // Set commit type and overwrite flag
     if (commitType != UpdateMessage::NO_COMMIT) request->mutable_commit();
     request->set_overwrite(overwrite);
 
-    // Create and submit the update message
-    IndexResult result;
-    BlockingProtoUpdateMessage updateMessage(request, &result);
-
-    INDEX_TRACE("SYNC_INDEX_START: msg={}", (void*)&updateMessage);
-    bool success = writer->submitUpdate(&updateMessage);
-    assert(success);
-    unused(success);
-
-    updateMessage.blocker.wait();
-    INDEX_TRACE("SYNC_INDEX_END: msg={}", (void*)&updateMessage);
-    return result;
+    return submit(request);
   }
 
   IndexResult deleteByIds(std::span<const std::string> ids, UpdateMessage::CommitType commitType = UpdateMessage::NO_COMMIT) {
-    auto writer = collection().getShard()->getIndexWriter();
-
-    class BlockingProtoUpdateMessage : public ProtoUpdateMessage {
-    public:
-      Blocker blocker;
-      IndexResult* result;
-      
-      explicit BlockingProtoUpdateMessage(proto::UpdateRequest* req, IndexResult* result = nullptr) 
-        : ProtoUpdateMessage(req), result(result) {
-      }
-
-      void done(IndexWriter& iw) override {
-        unused(iw);
-        if (result) {
-          result->updateVersion = updateVersion;
-          result->success = !ProtoUpdateMessage::result.errored();
-        }
-        INDEX_TRACE("SYNC_DELETEBYID_NOTIFY: msg={}", (void*)this);
-        blocker.notify();
-      }
-    };
-
     google::protobuf::Arena arena;
     auto* request = google::protobuf::Arena::Create<proto::UpdateRequest>(&arena);
-    
+
     // Add delete IDs
     for (const auto& id : ids) {
       request->add_delete_ids(id);
     }
-    
+
     // Set commit type
     if (commitType != UpdateMessage::NO_COMMIT) request->mutable_commit();
 
-    // Create and submit the update message
-    IndexResult result;
-    BlockingProtoUpdateMessage updateMessage(request, &result);
-
-    INDEX_TRACE("SYNC_DELETEBYID_START: msg={}", (void*)&updateMessage);
-
-    bool success = writer->submitUpdate(&updateMessage);
-    assert(success);
-    unused(success);
-
-    updateMessage.blocker.wait();
-    INDEX_TRACE("SYNC_DELETEBYID_END: msg={}", (void*)&updateMessage);
-    return result;
+    return submit(request);
   }
 
   IndexResult deleteById(const std::string& id, UpdateMessage::CommitType commitType = UpdateMessage::NO_COMMIT) {
@@ -251,8 +224,10 @@ public:
       void done(IndexWriter& iw) override {
         unused(iw);
         IndexResult result;
+        result.response = *finishResponse();
         result.updateVersion = updateVersion;
-        result.success = !ProtoUpdateMessage::result.errored();
+        result.success = !ProtoUpdateMessage::result.errored()
+                         && result.response.status() != proto::UpdateResponse::ERROR;
         callback(result);
         delete this;
       }
