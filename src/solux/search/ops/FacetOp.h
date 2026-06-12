@@ -63,8 +63,10 @@ public:
       for (auto& subOp : subOps) {
         if (subOp.second->canInline()) {
           inlineSubOps.push_back(subOp);
-          subOps.erase(subOps.find(subOp.first));
         }
+      }
+      for (auto& subOp : inlineSubOps) {
+        subOps.erase(subOp.first);
       }
     }
   }
@@ -521,8 +523,10 @@ public:
       }
       
       SegFieldInfo segFieldInfo;
-      BitDocSet* bitDocs = (BitDocSet*) domain;
-      auto* domainBits = bitDocs ? &bitDocs->bits() : nullptr;
+      const FixedBitSet* domainBits = nullptr;
+      if (domain && domain->type == DocSet::Type::BITSET) {
+        domainBits = &static_cast<BitDocSet*>(domain)->bits();
+      }
       std::unique_ptr<MergeableStrFacet> mergeableData(countMerger.obtain());
       boost::unordered_flat_map<std::string, int64_t>& counts = mergeableData->counts;
 
@@ -532,10 +536,14 @@ public:
       FieldReader fieldReader(poolGuard.pool(), postingsReader);
       bool found = fieldReader.seek(thisOp().fieldName);
       if (!found) {
-        if (bitDocs) {
-          mergeableData->missing_num += bitDocs->card();
+        if (domain) {
+          mergeableData->missing_num += domain->card();
         } else {
           mergeableData->missing_num += maxDoc;
+        }
+        auto merged = countMerger.release(mergeableData.release());
+        if ((size_t)merged == thisOp().reader.segments().size()) {
+          facetResult();
         }
         return;
       }
@@ -549,8 +557,10 @@ public:
           if (doc == DocsEnum::END) {
             break; // no more docs for this term
           }
-          if (domainBits && !domainBits->get(doc)) {
-            continue; // this doc is not in the domain
+          if (domainBits) {
+            if (!domainBits->get(doc)) continue;
+          } else if (domain && !domain->get(doc)) {
+            continue;
           }
           count++;
         }

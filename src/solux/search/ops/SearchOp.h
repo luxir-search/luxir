@@ -131,11 +131,14 @@ public:
       for (auto* calc : calcs) {
         auto calcSpace = calc->insert(ptr, docid, space);
         if (calcSpace < 0) {
-          auto newptr = pool.reserve(space + (-calcSpace));
-          memcpy(newptr, start, ptr - start);
+          int used = (int)(ptr - start);
+          auto newptr = pool.reserve(used + (-calcSpace));
+          memcpy(newptr, start, used);
           start = newptr;
-          ptr = newptr + (ptr - start);
+          ptr = newptr + used;
+          space = (int)pool.spaceLeft() - used;
           calcSpace = calc->insert(ptr, docid, space);
+          assert(calcSpace >= 0);
         }
         space -= calcSpace;
         ptr += calcSpace;
@@ -170,11 +173,14 @@ public:
         for (auto* calc : calcs) {
           auto [calcSpace, otherCalcSpace] = calc->mergeNew(ptr, otherPtr, space);
           if (calcSpace < 0) {
-            auto newptr = pool.reserve(space + (-calcSpace));
-            memcpy(newptr, start, ptr - start);
+            int used = (int)(ptr - start);
+            auto newptr = pool.reserve(used + (-calcSpace));
+            memcpy(newptr, start, used);
             start = newptr;
-            ptr = newptr + (ptr - start);
+            ptr = newptr + used;
+            space = (int)pool.spaceLeft() - used;
             std::tie(calcSpace, otherCalcSpace) = calc->mergeNew(ptr, otherPtr, space);
+            assert(calcSpace >= 0);
           }
           space -= calcSpace;
           ptr += calcSpace;

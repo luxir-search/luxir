@@ -1,4 +1,6 @@
 #pragma once
+#include <limits>
+
 #include "SearchOp.h"
 #include "solux/reader/FieldReader.h"
 #include "solux/reader/IntColReader.h"
@@ -46,6 +48,25 @@ public:
   };
   class Calc : public Calculator {
     AtomicMerger<MergeableSum> sumMerger;
+
+    void emitResult(double avg) {
+      auto* myVal = getTarget(nullptr, [&](solux::proto::Val& val) {
+        if (slot >= 0) {
+          // do array creation with mutex held since different buckets could be calculated in parallel
+          auto& arr = *val.mutable_arr_d();
+          if (arr.v_size() == 0) {
+            arr.mutable_v()->Resize(numSlots, 0.0);
+          }
+        }
+      });
+      if (slot == -1) {
+        myVal->set_d(avg);
+      } else {
+        auto& arr = *myVal->mutable_arr_d();
+        arr.set_v(slot, avg);
+      }
+    }
+
   public:
     Calc(SearchOp& op, Calculator* parent, int64_t slot, int64_t numSlots)
       : Calculator(op, parent, slot, numSlots) {
@@ -57,6 +78,12 @@ public:
     solux::proto::Val* getTargetForSub(solux::proto::SearchResponse* searchResponse, Calculator* sub) override {return nullptr;};
     void calc(oneapi::tbb::task_group* tg, int32_t segnum, DocSet* domain) override {
       //LOG_DEBUG("calc AvgOp: this={} segnum={}, domain={} slot={}", (void*)this, segnum, (void*)domain, slot);
+      if (segnum == -1) {
+        double kNaN = std::numeric_limits<double>::quiet_NaN();
+        emitResult(kNaN);
+        return;
+      }
+
       std::unique_ptr<MergeableSum> mergeableData(sumMerger.obtain());
       SegFieldInfo segFieldInfo;
       int64_t sum = 0;
@@ -120,29 +147,13 @@ public:
 
     void checkCompletion(int64_t merged) {
       if ((size_t)merged == thisOp().req.reader->segments().size()) {
-        auto* myVal = getTarget(nullptr, [&](solux::proto::Val& val) {
-          if (slot >= 0) {
-            // do array creation with mutex held since different buckets could be calculated in parallel
-            auto& arr = *val.mutable_arr_d();
-            if (arr.v_size() == 0) {
-              arr.mutable_v()->Resize(numSlots, 0.0);
-            }
-          }
-        });
-
-
         std::unique_ptr<MergeableSum> mergeableData(sumMerger.obtain());
         auto sum = mergeableData->sum;
         auto dsum = mergeableData->dsum;
         auto count = mergeableData->count;
         // one of sum/dsum is always 0 (a field is either int or floating)
         double avg = ((double) sum + dsum) / (double) count;
-        if (slot == -1) {
-          myVal->set_d(avg);
-        } else {
-          auto& arr = *myVal->mutable_arr_d();
-          arr.set_v(slot, avg);
-        }
+        emitResult(avg);
       }
     }
   };

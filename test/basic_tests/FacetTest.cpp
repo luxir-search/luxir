@@ -105,6 +105,38 @@ TEST_F(FacetTest, emptyIndex) {
   }
 }
 
+TEST_F(FacetTest, emptyIndexNestedFacet) {
+  CollectionHelper helper;
+  helper.clear();
+
+  auto* lreq = LocalReq::create(soluxNode->getSearchEngine());
+  lreq->proto.mutable_collection()->add_name("main");
+  lreq->proto.set_request_id("test_empty_index_nested_facet");
+
+  auto& topDocs = *(*lreq->proto.mutable_ops())["q"].mutable_top_docs();
+  topDocs.set_get_number(true);
+  topDocs.mutable_query()->set_all(true);
+
+  auto& facet = *(*topDocs.mutable_ops())["f"].mutable_field_facet();
+  facet.set_field("category_s");
+  facet.set_limit(10);
+  facet.set_missing(true);
+
+  lreq->engine.submit(*lreq, true);
+
+  ASSERT_EQ(1, lreq->responses.size()) << lreq->toString();
+  ASSERT_FALSE(lreq->responses[0]->proto.has_error()) << lreq->toString();
+  const auto& docs = lreq->responses[0]->proto.ops().at("q").docs();
+  ASSERT_EQ(0, docs.matches());
+  ASSERT_TRUE(docs.ops().contains("f")) << lreq->toString();
+  const auto& facetResult = docs.ops().at("f").facet();
+  EXPECT_EQ(0, facetResult.bucket_ids().col_s().v_size());
+  EXPECT_EQ(0, facetResult.counts_size());
+  EXPECT_EQ(0, facetResult.missing());
+
+  lreq->done();
+}
+
 TEST_F(FacetTest, singleSegment) {
   CollectionHelper helper;
   helper.clear();
@@ -237,6 +269,101 @@ TEST_F(FacetTest, multipleSegments) {
   lreq->done();
 }
 
+TEST_F(FacetTest, fullTextFacetSegmentMissingField) {
+  CollectionHelper helper;
+  helper.clear();
+
+  helper.index(flatdoc("id", "a", "body_w", "alpha beta"), UpdateMessage::NO_COMMIT);
+  helper.index(flatdoc("id", "b", "body_w", "alpha"), UpdateMessage::COMMIT);
+  helper.index(flatdoc("id", "c", "other_s", "x"), UpdateMessage::NO_COMMIT);
+  helper.index(flatdoc("id", "d", "other_s", "y"), UpdateMessage::COMMIT);
+
+  auto* lreq = LocalReq::create(soluxNode->getSearchEngine());
+  lreq->proto.mutable_collection()->add_name("main");
+  lreq->proto.set_request_id("test_full_text_facet_segment_missing_field");
+
+  auto& ops = *lreq->proto.mutable_ops();
+  auto& topDocs = *ops["q"].mutable_top_docs();
+  topDocs.set_get_number(true);
+  topDocs.mutable_query()->set_all(true);
+
+  auto& facet = *ops["f"].mutable_field_facet();
+  facet.set_field("body_w");
+  facet.set_limit(-1);
+  facet.set_missing(true);
+
+  lreq->engine.submit(*lreq, true);
+
+  ASSERT_EQ(1, lreq->responses.size()) << lreq->toString();
+  ASSERT_FALSE(lreq->responses[0]->proto.has_error()) << lreq->toString();
+  ASSERT_TRUE(lreq->responses[0]->proto.ops().contains("f")) << lreq->toString();
+  const auto& facetResult = lreq->responses[0]->proto.ops().at("f").facet();
+  ASSERT_EQ(2, facetResult.bucket_ids().col_s().v_size());
+  ASSERT_EQ(2, facetResult.counts_size());
+  EXPECT_EQ("alpha", facetResult.bucket_ids().col_s().v(0));
+  EXPECT_EQ(2, facetResult.counts(0));
+  EXPECT_EQ("beta", facetResult.bucket_ids().col_s().v(1));
+  EXPECT_EQ(1, facetResult.counts(1));
+  EXPECT_EQ(2, facetResult.missing());
+
+  lreq->done();
+}
+
+TEST_F(FacetTest, fullTextFacetNestedSparseArrayDomain) {
+  CollectionHelper helper;
+  helper.clear();
+
+  for (int i = 0; i < 100; i++) {
+    std::string id = std::to_string(i);
+    if (i == 3) {
+      helper.index(flatdoc("id", id, "pick_w", "yes", "body_w", "apple red"), UpdateMessage::NO_COMMIT);
+    } else if (i == 17) {
+      helper.index(flatdoc("id", id, "pick_w", "yes", "body_w", "red cherry"), UpdateMessage::NO_COMMIT);
+    } else if (i == 88) {
+      helper.index(flatdoc("id", id, "pick_w", "yes", "body_w", "blue apple"), UpdateMessage::NO_COMMIT);
+    } else {
+      helper.index(flatdoc("id", id, "body_w", "noise filler"), UpdateMessage::NO_COMMIT);
+    }
+  }
+  helper.commit();
+
+  auto* lreq = LocalReq::create(soluxNode->getSearchEngine());
+  lreq->proto.mutable_collection()->add_name("main");
+  lreq->proto.set_request_id("test_full_text_facet_nested_sparse_array_domain");
+
+  auto& topDocs = *(*lreq->proto.mutable_ops())["q"].mutable_top_docs();
+  topDocs.set_get_number(true);
+  auto& match = *topDocs.mutable_query()->mutable_match();
+  match.set_field("pick_w");
+  match.mutable_val()->set_s("yes");
+
+  auto& facet = *(*topDocs.mutable_ops())["f"].mutable_field_facet();
+  facet.set_field("body_w");
+  facet.set_limit(-1);
+  facet.set_mincount(1);
+
+  lreq->engine.submit(*lreq, true);
+
+  ASSERT_EQ(1, lreq->responses.size()) << lreq->toString();
+  ASSERT_FALSE(lreq->responses[0]->proto.has_error()) << lreq->toString();
+  const auto& docs = lreq->responses[0]->proto.ops().at("q").docs();
+  ASSERT_EQ(3, docs.matches());
+  ASSERT_TRUE(docs.ops().contains("f")) << lreq->toString();
+  const auto& facetResult = docs.ops().at("f").facet();
+  ASSERT_EQ(4, facetResult.bucket_ids().col_s().v_size());
+  ASSERT_EQ(4, facetResult.counts_size());
+  EXPECT_EQ("apple", facetResult.bucket_ids().col_s().v(0));
+  EXPECT_EQ(2, facetResult.counts(0));
+  EXPECT_EQ("red", facetResult.bucket_ids().col_s().v(1));
+  EXPECT_EQ(2, facetResult.counts(1));
+  EXPECT_EQ("blue", facetResult.bucket_ids().col_s().v(2));
+  EXPECT_EQ(1, facetResult.counts(2));
+  EXPECT_EQ("cherry", facetResult.bucket_ids().col_s().v(3));
+  EXPECT_EQ(1, facetResult.counts(3));
+
+  lreq->done();
+}
+
 TEST_F(FacetTest, vectorOptimization) {
   CollectionHelper helper;
   helper.clear();
@@ -358,6 +485,73 @@ TEST_F(FacetTest, sortBySubOp) {
     EXPECT_EQ(50, avg.v(1));
     lreq->done();
   }
+}
+
+TEST_F(FacetTest, limitMinusOneInlinesMultipleAvgSubOps) {
+  CollectionHelper helper;
+  helper.clear();
+
+  const int totalDocs = 6000;
+  auto categoryName = [](int i) {
+    return "cat" + std::to_string(100000 + i);
+  };
+
+  std::vector<Doc> firstSegment;
+  std::vector<Doc> secondSegment;
+  firstSegment.reserve(totalDocs / 2);
+  secondSegment.reserve(totalDocs / 2);
+  for (int i = 0; i < totalDocs; i++) {
+    auto doc = flatdoc("cat_s", categoryName(i),
+                       "score_i", (int64_t)i,
+                       "bonus_i", (int64_t)(totalDocs - i));
+    if (i < totalDocs / 2) {
+      firstSegment.push_back(std::move(doc));
+    } else {
+      secondSegment.push_back(std::move(doc));
+    }
+  }
+  helper.indexAll(firstSegment, UpdateMessage::COMMIT);
+  helper.indexAll(secondSegment, UpdateMessage::COMMIT);
+
+  auto* lreq = LocalReq::create(soluxNode->getSearchEngine());
+  lreq->proto.mutable_collection()->add_name("main");
+  lreq->proto.set_request_id("test_limit_minus_one_inlines_multiple_avg_subops");
+
+  auto& topDocs = *(*lreq->proto.mutable_ops())["q"].mutable_top_docs();
+  topDocs.set_get_number(true);
+  topDocs.mutable_query()->set_all(true);
+
+  auto& facet = *(*lreq->proto.mutable_ops())["f"].mutable_field_facet();
+  facet.set_field("cat_s");
+  facet.set_limit(-1);
+  auto& avgScore = *(*facet.mutable_ops())["avg_score"].mutable_gen_op();
+  avgScore.set_name("avg");
+  avgScore.mutable_args()->Add()->set_s("score_i");
+  auto& avgBonus = *(*facet.mutable_ops())["avg_bonus"].mutable_gen_op();
+  avgBonus.set_name("avg");
+  avgBonus.mutable_args()->Add()->set_s("bonus_i");
+
+  lreq->engine.submit(*lreq, true);
+
+  ASSERT_EQ(1, lreq->responses.size()) << lreq->toString();
+  ASSERT_FALSE(lreq->responses[0]->proto.has_error()) << lreq->toString();
+  const auto& facetResult = lreq->responses[0]->proto.ops().at("f").facet();
+  ASSERT_EQ(totalDocs, facetResult.bucket_ids().col_s().v_size());
+  ASSERT_EQ(totalDocs, facetResult.counts_size());
+  const auto& avgScoreResult = facetResult.ops().at("avg_score").arr_d();
+  const auto& avgBonusResult = facetResult.ops().at("avg_bonus").arr_d();
+  ASSERT_EQ(totalDocs, avgScoreResult.v_size());
+  ASSERT_EQ(totalDocs, avgBonusResult.v_size());
+
+  std::vector<int> checkIndexes = {0, 10, 11, 2999, 3000, totalDocs - 1};
+  for (int idx : checkIndexes) {
+    EXPECT_EQ(categoryName(idx), facetResult.bucket_ids().col_s().v(idx));
+    EXPECT_EQ(1, facetResult.counts(idx));
+    EXPECT_DOUBLE_EQ((double)idx, avgScoreResult.v(idx));
+    EXPECT_DOUBLE_EQ((double)(totalDocs - idx), avgBonusResult.v(idx));
+  }
+
+  lreq->done();
 }
 
 //

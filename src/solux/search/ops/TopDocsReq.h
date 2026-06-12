@@ -222,7 +222,9 @@ public:
 
       if (segnum < 0) {
         // special case for empty index reader, we are done.
-        // TODO: pass along to sub-calculators?
+        for (auto& subCalc : subCalcs) {
+          subCalc->calc(tg, -1, nullptr);
+        }
         doneCollecting();
         return;
       }

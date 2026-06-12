@@ -1,6 +1,7 @@
 
 #include <gtest/gtest.h>
 #include <google/protobuf/text_format.h>
+#include <cmath>
 #include <iostream>
 #include <map>
 #include "test/SoluxTest.h"
@@ -14,6 +15,43 @@ using namespace solux::test;
 class SearchEngineTest : public SoluxTest {
 public:
 };
+
+TEST_F(SearchEngineTest, avgOpsEmptyIndexEmitNan) {
+  CollectionHelper helper;
+  helper.clear();
+
+  auto* lreq = LocalReq::create(soluxNode->getSearchEngine());
+  lreq->proto.mutable_collection()->add_name("main");
+  lreq->proto.set_request_id("test_avg_ops_empty_index_emit_nan");
+
+  auto& ops = *lreq->proto.mutable_ops();
+  auto& topDocs = *ops["q"].mutable_top_docs();
+  topDocs.set_get_number(true);
+  topDocs.mutable_query()->set_all(true);
+
+  auto& rootAvg = *ops["root_avg"].mutable_gen_op();
+  rootAvg.set_name("avg");
+  rootAvg.mutable_args()->Add()->set_s("foo_i");
+
+  auto& nestedAvg = *(*topDocs.mutable_ops())["nested_avg"].mutable_gen_op();
+  nestedAvg.set_name("avg");
+  nestedAvg.mutable_args()->Add()->set_s("foo_i");
+
+  lreq->engine.submit(*lreq, true);
+
+  ASSERT_EQ(1, lreq->responses.size()) << lreq->toString();
+  const auto& response = lreq->responses[0]->proto;
+  ASSERT_FALSE(response.has_error()) << lreq->toString();
+  ASSERT_TRUE(response.ops().contains("root_avg")) << lreq->toString();
+  EXPECT_TRUE(std::isnan(response.ops().at("root_avg").d()));
+
+  const auto& docs = response.ops().at("q").docs();
+  ASSERT_EQ(0, docs.matches());
+  ASSERT_TRUE(docs.ops().contains("nested_avg")) << lreq->toString();
+  EXPECT_TRUE(std::isnan(docs.ops().at("nested_avg").d()));
+
+  lreq->done();
+}
 
 TEST_F(SearchEngineTest, basic) {
   bool para = true;
