@@ -536,6 +536,9 @@ message ArrInt32 {
 message ColStr {
   // this will cause an additional tag (byte) per string value, but strings are normally somewhat larger anyway
   // repeated google.protobuf.StringValue v = 1;
+  // "" unless a real empty string occurs in the batch, in which case a
+  // string greater than every batch value is used (see the
+  // ColInt.missing_val sentinel note; the check is exact).
   string missing_val = 1;
   repeated string v = 2;
 }
@@ -575,26 +578,28 @@ message MultiVector {
 }
 
 message ColInt {
-  // Sentinel held in v slots for docs without a value.  The writer uses the
-  // type's minimum, so a real stored value equal to the sentinel is
-  // indistinguishable from a missing field.  Multi-valued columns don't have
-  // this ambiguity (missing = empty array).
-  // we could also use a bitset for missing values, but that might be slightly harder to use for some people?
-  // bytes missing_bits = 3;
+  // Sentinel held in v slots for docs without a value.  The server chooses
+  // it per column per batch to be a value that does NOT otherwise occur in
+  // v, so the v[i] != missing_val check is exact: 0 when absent from the
+  // batch (cheapest varint), else an extreme, else any unused value.
+  // Presence bitmaps / missing-index lists were considered and rejected in
+  // favor of keeping this single mechanism.  Multi-valued columns signal
+  // missing structurally: empty array.  JSON responses are hand-rendered
+  // and represent missing slots as null.
   sint64 missing_val = 1;
   repeated sint64 v = 2;
 }
 
 message ColFloat {
-  // numeric_limits<float>::lowest(); see the ColInt.missing_val sentinel note.
-  // NaN can't be the sentinel: it compares unequal to itself, breaking the
-  // natural v != missing_val check.
+  // Chosen per batch like ColInt.missing_val (the check is exact).  Never
+  // NaN (it compares unequal to itself); +0.0/-0.0 are treated as one value
+  // when choosing.
   float missing_val = 1;
   repeated float v = 2;
 }
 
 message ColDouble {
-  // numeric_limits<double>::lowest(); see the ColInt.missing_val sentinel note.
+  // See ColFloat.missing_val.
   double missing_val = 1;
   repeated double v = 2;
 }

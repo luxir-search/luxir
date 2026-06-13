@@ -83,8 +83,8 @@ public:
       if (has_i256_50_i) {
         ASSERT_EQ(r() & 0xff, i256_50_i.col_i().v(col));
       } else {
-        auto missingVal = std::numeric_limits<int64_t>::min();
-        ASSERT_EQ(missingVal, i256_50_i.col_i().v(col));
+        // missing slots hold the column's batch-chosen filler
+        ASSERT_EQ(i256_50_i.col_i().missing_val(), i256_50_i.col_i().v(col));
       }
     } else {
       assert(!has_i256_50_i);

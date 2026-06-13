@@ -739,10 +739,11 @@ TEST_F(SortCollectorTest, SortWithMissingValues) {
   ASSERT_EQ("doc1", idCol.v(2));
   ASSERT_EQ(100, priceCol.v(2));
   
-  // Documents with missing values come last
-  // They should have the missing value substitute (min int64)
-  ASSERT_EQ(std::numeric_limits<int64_t>::min(), priceCol.v(3));
-  ASSERT_EQ(std::numeric_limits<int64_t>::min(), priceCol.v(4));
+  // Documents with missing values come last.  Their slots hold the column's
+  // batch-chosen filler (0 here, since no real price is 0).
+  ASSERT_EQ(0, priceCol.missing_val());
+  ASSERT_EQ(priceCol.missing_val(), priceCol.v(3));
+  ASSERT_EQ(priceCol.missing_val(), priceCol.v(4));
   
   lreq->done();
 }

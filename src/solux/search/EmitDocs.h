@@ -12,6 +12,8 @@
 
 #include <algorithm>
 #include <cstring>
+#include <deque>
+#include <functional>
 #include <numeric>
 #include <ranges>
 #include <span>
@@ -35,6 +37,77 @@
 
 namespace solux {
 
+// Exact missing_val support for single-valued columns.  The sentinel
+// contract (v[i] != missing_val) is only 100% if the filler provably does
+// not occur as a real value in the batch, so the filler is chosen per
+// column per batch: per-segment load tasks mark the slots they fill, and
+// after the batch's task-group wait a finish pass picks a filler absent
+// from the loaded values, writes it into the unfilled slots, and sets
+// missing_val.  Multi-valued columns signal missing structurally (empty
+// array) and are not tracked.
+// Tasks write distinct bytes of present, so no synchronization is needed
+// beyond the task-group wait; the deque keeps element addresses stable
+// while tasks hold present.data().
+struct PendingCol {
+  std::vector<uint8_t> present;
+  std::function<void(std::span<const uint8_t>)> finish;
+};
+using PendingCols = std::deque<PendingCol>;
+
+// Run the finish passes.  Call after the batch's load tasks complete.
+inline void finishPendingCols(PendingCols& pendingCols) {
+  for (auto& p : pendingCols) {
+    p.finish(p.present);
+  }
+}
+
+// Pick a filler value that does not occur among the present slot values,
+// working in the Emit's encoded (order-preserving int64) space.  Preference
+// order: 0 (cheapest varint for ints), then the low and high extremes, then
+// any unused value.  Emits with foldZeros (floats/doubles) treat +0.0 and
+// -0.0 as one value, since clients compare with ==; NaN is never chosen (it
+// lies outside [encLo, encHi]).  No sorting: the common path is a single
+// scan testing three candidates, and the rare fallback uses pigeonhole.
+template <typename Emit>
+typename Emit::value_type pickMissingVal(std::span<const typename Emit::value_type> vals,
+                                         std::span<const uint8_t> present) {
+  using V = typename Emit::value_type;
+  const int64_t encLo = Emit::encLo();
+  const int64_t encHi = Emit::encHi();
+
+  // One scan testing only the three preferred fillers.  encodeVal((V)0) is 0
+  // for every type, so the zero test is e == 0; for floats a present -0.0
+  // (which encodes to -1) also blocks the +0.0 filler since they compare ==.
+  bool zeroTaken = false, loTaken = false, hiTaken = false;
+  for (size_t i = 0; i < vals.size(); i++) {
+    if (!present[i]) continue;
+    int64_t e = Emit::encodeVal(vals[i]);
+    if (e == 0 || (Emit::foldZeros && e == -1)) zeroTaken = true;
+    if (e == encLo) loTaken = true;
+    if (e == encHi) hiTaken = true;
+  }
+  if (!zeroTaken) return (V)0;
+  if (!loTaken) return Emit::decodeEnc(encLo);
+  if (!hiTaken) return Emit::decodeEnc(encHi);
+
+  // Degenerate batch: it holds 0 and both extremes.  Among the n+1
+  // consecutive encodings [encLo, encLo+n] (n = present count) at most n can
+  // be present, so one is free.  Mark the in-window values and return the
+  // first hole - O(n), no sort.
+  int64_t n = 0;
+  for (size_t i = 0; i < present.size(); i++) n += present[i] ? 1 : 0;
+  std::vector<char> taken(n + 1, 0);
+  for (size_t i = 0; i < vals.size(); i++) {
+    if (!present[i]) continue;
+    int64_t off = Emit::encodeVal(vals[i]) - encLo;
+    if (off >= 0 && off <= n) taken[off] = 1;
+  }
+  for (int64_t j = 0; j <= n; j++) {
+    if (!taken[j]) return Emit::decodeEnc(encLo + j);
+  }
+  return Emit::decodeEnc(encLo);  // unreachable by pigeonhole
+}
+
 // One stored-field retrieval request.  Collected per-field during dispatch
 // then grouped by resource so each (resource, segment) pair is served by a
 // single StoredFieldsReader - one chunk decompression covers all fields
@@ -46,29 +119,61 @@ struct StoredReq {
   bool multi;
   std::span<std::string*> starget;
   std::span<solux::proto::ArrStr*> mtarget;
+  uint8_t* present = nullptr;  // presence slots when single-valued (see PendingCol)
 };
 
 // Allocate the output Column (col_s or multi_s) for a TEXT/STRING field
 // and return spans into its internal storage.  Used by both column
 // retrieval (loadStrCol) and stored retrieval - the output proto shape is
 // identical in both cases.  Leaves spans empty when columnSize is 0.
-inline void allocStringColumn(solux::proto::Column& fieldCol, size_t columnSize, bool multi,
-                              std::span<std::string*>& starget,
-                              std::span<solux::proto::ArrStr*>& mtarget)
+// Returns the presence slots for a single-valued column (null for multi,
+// which signals missing structurally).
+inline uint8_t* allocStringColumn(solux::proto::Column& fieldCol, size_t columnSize, bool multi,
+                                  std::span<std::string*>& starget,
+                                  std::span<solux::proto::ArrStr*>& mtarget,
+                                  PendingCols& pendingCols)
 {
-  if (columnSize == 0) return;
+  if (columnSize == 0) return nullptr;
   if (!multi) {
     auto& strCol = *fieldCol.mutable_col_s();
     auto& stringsProto = *strCol.mutable_v();
     stringsProto.Reserve(columnSize);
     for (auto i = 0u; i < columnSize; i++) stringsProto.Add("");
     starget = {stringsProto.mutable_data(), (size_t)columnSize};
+
+    auto& pending = pendingCols.emplace_back();
+    pending.present.assign(columnSize, 0);
+    pending.finish = [&strCol](std::span<const uint8_t> present) {
+      auto& v = *strCol.mutable_v();
+      // "" is the default filler; only when a real empty string occurs must
+      // a different filler be used: one byte past the largest present value
+      // is greater than every present value, so it cannot collide.
+      bool emptyPresent = false;
+      for (size_t i = 0; i < present.size(); i++) {
+        if (present[i] && v[(int)i].empty()) {
+          emptyPresent = true;
+          break;
+        }
+      }
+      if (!emptyPresent) return;
+      std::string_view maxStr;
+      for (size_t i = 0; i < present.size(); i++) {
+        if (present[i] && std::string_view(v[(int)i]) > maxStr) maxStr = v[(int)i];
+      }
+      std::string filler = std::string(maxStr) + '\0';
+      strCol.set_missing_val(filler);
+      for (size_t i = 0; i < present.size(); i++) {
+        if (!present[i]) *v.Mutable((int)i) = filler;
+      }
+    };
+    return pending.present.data();
   } else {
     auto& strCol = *fieldCol.mutable_multi_s();
     auto& arrArrProto = *strCol.mutable_v();
     arrArrProto.Reserve(columnSize);
     for (auto i = 0u; i < columnSize; i++) arrArrProto.Add();
     mtarget = {arrArrProto.mutable_data(), columnSize};
+    return nullptr;
   }
 }
 
@@ -78,7 +183,8 @@ inline void allocStringColumn(solux::proto::Column& fieldCol, size_t columnSize,
 // path can fall back here when a segment predates the STORED flag.
 inline void loadStrColForSegment(SearchRequest& req, std::string_view field, FieldType& fieldType,
                                  std::span<uint8_t> idxSpan, std::span<const segdoc> segDocs,
-                                 std::span<std::string*> starget, std::span<solux::proto::ArrStr*> mtarget)
+                                 std::span<std::string*> starget, std::span<solux::proto::ArrStr*> mtarget,
+                                 uint8_t* present)
 {
   auto sortedSegDocs = idxSpan | std::views::transform([&segDocs](auto idx) { return segDocs[idx]; });
   auto segNum = sortedSegDocs[0].segment();
@@ -103,12 +209,14 @@ inline void loadStrColForSegment(SearchRequest& req, std::string_view field, Fie
         assert(segDocs[idxSpan[idx]].docId() == doc && val > 0);
         tenum.seekOrd((int32_t) val - 1);
         *starget[idxSpan[idx]] = (std::string_view) tenum.term();
+        if (present) present[idxSpan[idx]] = 1;
       };
       IntColReader::getSingleValues(poolGuard.pool(), postingsReader, segFieldInfo, sortedDocs, valHandler);
     } else {
       auto valHandler = [&](size_t idx, int32_t doc, std::string_view val) {
         assert(segDocs[idxSpan[idx]].docId() == doc);
         *starget[idxSpan[idx]] = std::string(val);
+        if (present) present[idxSpan[idx]] = 1;
       };
       StrColReader::getValues(poolGuard.pool(), postingsReader, segFieldInfo, sortedDocs, valHandler);
     }
@@ -142,14 +250,15 @@ inline void loadStrColForSegment(SearchRequest& req, std::string_view field, Fie
 // earlier allocStringColumn).  Dispatches one per-segment task per run.
 inline void loadStrColWithTargets(SearchRequest& req, std::string_view field, FieldType& fieldType,
                                   std::span<std::string*> starget, std::span<solux::proto::ArrStr*> mtarget,
+                                  uint8_t* present,
                                   std::span<const segdoc> segDocs, std::span<uint8_t> sortedIdx,
                                   const std::span<uint8_t> segRunLength, oneapi::tbb::task_group* tg)
 {
   int32_t start = 0;
   for (auto runlen : segRunLength) {
     auto idxSpan = sortedIdx.subspan(start, runlen);
-    task_group_run(tg, [idxSpan, &req, field, &fieldType, segDocs, starget, mtarget]() {
-      loadStrColForSegment(req, field, fieldType, idxSpan, segDocs, starget, mtarget);
+    task_group_run(tg, [idxSpan, &req, field, &fieldType, segDocs, starget, mtarget, present]() {
+      loadStrColForSegment(req, field, fieldType, idxSpan, segDocs, starget, mtarget, present);
     });
     start += runlen;
   }
@@ -158,45 +267,61 @@ inline void loadStrColWithTargets(SearchRequest& req, std::string_view field, Fi
 inline void loadStrCol(SearchRequest& req, std::string_view field, FieldType& fieldType,
                        std::span<const segdoc> segDocs, std::span<uint8_t> sortedIdx,
                        const std::span<uint8_t> segRunLength,
-                       SearchResponse::ColumnsType& columnsProto, oneapi::tbb::task_group* tg)
+                       SearchResponse::ColumnsType& columnsProto, oneapi::tbb::task_group* tg,
+                       PendingCols& pendingCols)
 {
   auto columnSize = segDocs.size();
   if (columnSize == 0) return;
   std::span<std::string*> starget;
   std::span<solux::proto::ArrStr*> mtarget;
-  allocStringColumn(columnsProto[field], columnSize, fieldType.multiValued(), starget, mtarget);
-  loadStrColWithTargets(req, field, fieldType, starget, mtarget, segDocs, sortedIdx, segRunLength, tg);
+  uint8_t* present = allocStringColumn(columnsProto[field], columnSize, fieldType.multiValued(),
+                                       starget, mtarget, pendingCols);
+  loadStrColWithTargets(req, field, fieldType, starget, mtarget, present, segDocs, sortedIdx, segRunLength, tg);
 }
 
 // Per-type policies for emitting numeric columns.  INT columns hold the
 // value directly; FLOAT/DOUBLE columns hold sortable bits (see
 // util/NumericUtils.h) that decode() turns back into the client-facing
-// floating point value.
+// floating point value.  encodeVal/decodeEnc map client-facing values to
+// the order-preserving int64 space pickMissingVal searches in (identity
+// for ints, sortable bits for floats/doubles).
 struct IntColEmit {
   using value_type = int64_t;
   using arr_type = solux::proto::ArrInt;
-  static constexpr int64_t missingVal = std::numeric_limits<int64_t>::min();
+  static constexpr bool foldZeros = false;
   static auto& singleCol(solux::proto::Column& col) { return *col.mutable_col_i(); }
   static auto& multiCol(solux::proto::Column& col) { return *col.mutable_multi_i(); }
   static int64_t decode(int64_t raw) { return raw; }
+  static int64_t encodeVal(int64_t v) { return v; }
+  static int64_t decodeEnc(int64_t e) { return e; }
+  static int64_t encLo() { return std::numeric_limits<int64_t>::min(); }
+  static int64_t encHi() { return std::numeric_limits<int64_t>::max(); }
 };
 
 struct FloatColEmit {
   using value_type = float;
   using arr_type = solux::proto::ArrFloat;
-  static constexpr float missingVal = std::numeric_limits<float>::lowest();
+  static constexpr bool foldZeros = true;
   static auto& singleCol(solux::proto::Column& col) { return *col.mutable_col_f(); }
   static auto& multiCol(solux::proto::Column& col) { return *col.mutable_multi_f(); }
   static float decode(int64_t raw) { return sortableInt32ToFloat((int32_t)raw); }
+  static int64_t encodeVal(float v) { return (int64_t)floatToSortableInt32(v); }
+  static float decodeEnc(int64_t e) { return sortableInt32ToFloat((int32_t)e); }
+  static int64_t encLo() { return (int64_t)floatToSortableInt32(-std::numeric_limits<float>::infinity()); }
+  static int64_t encHi() { return (int64_t)floatToSortableInt32(std::numeric_limits<float>::infinity()); }
 };
 
 struct DoubleColEmit {
   using value_type = double;
   using arr_type = solux::proto::ArrDouble;
-  static constexpr double missingVal = std::numeric_limits<double>::lowest();
+  static constexpr bool foldZeros = true;
   static auto& singleCol(solux::proto::Column& col) { return *col.mutable_col_d(); }
   static auto& multiCol(solux::proto::Column& col) { return *col.mutable_multi_d(); }
   static double decode(int64_t raw) { return sortableInt64ToDouble(raw); }
+  static int64_t encodeVal(double v) { return doubleToSortableInt64(v); }
+  static double decodeEnc(int64_t e) { return sortableInt64ToDouble(e); }
+  static int64_t encLo() { return doubleToSortableInt64(-std::numeric_limits<double>::infinity()); }
+  static int64_t encHi() { return doubleToSortableInt64(std::numeric_limits<double>::infinity()); }
 };
 
 // We are guaranteed that the resources passed here will remain valid for any subtasks added to "tg" (i.e. the
@@ -205,11 +330,13 @@ template <typename Emit>
 inline void loadNumCol(SearchRequest& req, std::string_view field, FieldType& fieldType,
                        std::span<const segdoc> segDocs, std::span<uint8_t> sortedIdx,
                        const std::span<uint8_t> segRunLength,
-                       SearchResponse::ColumnsType& columnsProto, oneapi::tbb::task_group* tg)
+                       SearchResponse::ColumnsType& columnsProto, oneapi::tbb::task_group* tg,
+                       PendingCols& pendingCols)
 {
   auto& fieldCol = columnsProto[field];  // output Column in the protobuf
   std::span<typename Emit::value_type> starget; // single valued target
   std::span<typename Emit::arr_type*> mtarget;  // multi-valued target
+  uint8_t* present = nullptr;
   auto columnSize = segDocs.size();
 
   if (columnSize == 0) {
@@ -218,11 +345,23 @@ inline void loadNumCol(SearchRequest& req, std::string_view field, FieldType& fi
 
   if (!fieldType.multiValued()) {
     auto& numCol = Emit::singleCol(fieldCol);
-    numCol.set_missing_val(Emit::missingVal);
     auto& valsProto = *numCol.mutable_v();
-    valsProto.Resize(columnSize, Emit::missingVal);
+    valsProto.Resize(columnSize, (typename Emit::value_type)0);
     starget = {valsProto.mutable_data(), (size_t)columnSize};
     assert(&valsProto[columnSize - 1] >= starget.data() && &valsProto[columnSize - 1] < starget.data() + columnSize);
+
+    auto& pending = pendingCols.emplace_back();
+    pending.present.assign(columnSize, 0);
+    present = pending.present.data();
+    pending.finish = [&numCol](std::span<const uint8_t> present) {
+      auto* data = numCol.mutable_v()->mutable_data();
+      size_t n = present.size();
+      auto filler = pickMissingVal<Emit>({data, n}, present);
+      numCol.set_missing_val(filler);
+      for (size_t i = 0; i < n; i++) {
+        if (!present[i]) data[i] = filler;
+      }
+    };
   } else {
     auto& numCol = Emit::multiCol(fieldCol);
     auto& arrArrProto = *numCol.mutable_v();
@@ -237,7 +376,7 @@ inline void loadNumCol(SearchRequest& req, std::string_view field, FieldType& fi
   int32_t start = 0;
   for (auto runlen : segRunLength) {
     auto idxSpan = sortedIdx.subspan(start, runlen);
-    task_group_run(tg, [idxSpan, &req, field, &fieldType, segDocs, starget, mtarget]() {
+    task_group_run(tg, [idxSpan, &req, field, &fieldType, segDocs, starget, mtarget, present]() {
       auto sortedSegDocs = idxSpan | std::views::transform([&segDocs](auto idx) { return segDocs[idx]; });
       auto segNum = sortedSegDocs[0].segment();
       auto sortedDocs = sortedSegDocs | std::views::transform([](const auto& sd) { return sd.docId(); });
@@ -256,6 +395,7 @@ inline void loadNumCol(SearchRequest& req, std::string_view field, FieldType& fi
         auto valHandler = [&](size_t idx, int32_t doc, int64_t val) {
           assert(segDocs[idxSpan[idx]].docId() == doc);
           starget[idxSpan[idx]] = Emit::decode(val);
+          present[idxSpan[idx]] = 1;
         };
         IntColReader::getSingleValues(poolGuard.pool(), postingsReader, segFieldInfo, sortedDocs, valHandler);
       } else {
@@ -387,6 +527,7 @@ inline void storeValuesInReq(const StoredReq& r, size_t slot, std::span<const st
   if (values.empty()) return;
   if (!r.multi) {
     *r.starget[slot] = std::string(values[0]);
+    if (r.present) r.present[slot] = 1;
   } else {
     solux::proto::ArrStr& target = *r.mtarget[slot];
     target.mutable_v()->Reserve((int)values.size());
@@ -447,7 +588,8 @@ inline void loadStoredFields(SearchRequest& req, std::string_view resourceName,
       }
 
       for (auto* r : colReqs) {
-        loadStrColForSegment(req, r->fieldName, *r->fieldType, idxSpan, segDocs, r->starget, r->mtarget);
+        loadStrColForSegment(req, r->fieldName, *r->fieldType, idxSpan, segDocs, r->starget, r->mtarget,
+                             r->present);
       }
 
       if (sfrReqs.empty()) return;
@@ -575,6 +717,10 @@ void emitDocsResponse(SearchRequest& req,
 
     auto& columnsProto = *docListProto.mutable_columns();
 
+    // Single-valued columns register here so the post-wait finish pass can
+    // pick each column's exact missing_val and fill the missing slots.
+    PendingCols pendingCols;
+
     // Stored-field retrieval is grouped by resource so that multiple stored
     // fields sharing one resource decompress each chunk only once.
     boost::unordered_flat_map<std::string_view, std::vector<StoredReq>,
@@ -597,22 +743,23 @@ void emitDocsResponse(SearchRequest& req,
       auto recordStoredReq = [&](std::string_view resourceName) {
         std::span<std::string*> starget;
         std::span<solux::proto::ArrStr*> mtarget;
-        allocStringColumn(columnsProto[field], columnSize, fieldType.multiValued(), starget, mtarget);
+        uint8_t* present = allocStringColumn(columnsProto[field], columnSize, fieldType.multiValued(),
+                                             starget, mtarget, pendingCols);
         storedByResource[resourceName].push_back(
-            {field, &fieldType, fieldType.multiValued(), starget, mtarget});
+            {field, &fieldType, fieldType.multiValued(), starget, mtarget, present});
       };
 
       switch (fieldType.type()) {
         case FieldType::Type::INT: {
-          loadNumCol<IntColEmit>(req, field, fieldType, segDocs, sortedIdx, segRunLength, columnsProto, tg);
+          loadNumCol<IntColEmit>(req, field, fieldType, segDocs, sortedIdx, segRunLength, columnsProto, tg, pendingCols);
           break;
         }
         case FieldType::Type::FLOAT: {
-          loadNumCol<FloatColEmit>(req, field, fieldType, segDocs, sortedIdx, segRunLength, columnsProto, tg);
+          loadNumCol<FloatColEmit>(req, field, fieldType, segDocs, sortedIdx, segRunLength, columnsProto, tg, pendingCols);
           break;
         }
         case FieldType::Type::DOUBLE: {
-          loadNumCol<DoubleColEmit>(req, field, fieldType, segDocs, sortedIdx, segRunLength, columnsProto, tg);
+          loadNumCol<DoubleColEmit>(req, field, fieldType, segDocs, sortedIdx, segRunLength, columnsProto, tg, pendingCols);
           break;
         }
         case FieldType::Type::ID:
@@ -620,7 +767,7 @@ void emitDocsResponse(SearchRequest& req,
           if (fieldType.isStored()) {
             recordStoredReq(fieldType.storedResource_);
           } else if (fieldType.hasColumn()) {
-            loadStrCol(req, field, fieldType, segDocs, sortedIdx, segRunLength, columnsProto, tg);
+            loadStrCol(req, field, fieldType, segDocs, sortedIdx, segRunLength, columnsProto, tg, pendingCols);
           }
           break;
         }
@@ -654,7 +801,7 @@ void emitDocsResponse(SearchRequest& req,
                          segDocs, sortedIdx, segRunLength, tg);
       } else {
         for (auto& r : reqs) {
-          loadStrColWithTargets(req, r.fieldName, *r.fieldType, r.starget, r.mtarget,
+          loadStrColWithTargets(req, r.fieldName, *r.fieldType, r.starget, r.mtarget, r.present,
                                 segDocs, sortedIdx, segRunLength, tg);
         }
       }
@@ -673,6 +820,10 @@ void emitDocsResponse(SearchRequest& req,
     if (tg != nullptr) {
       tg->wait();
     }
+
+    // All slots are loaded; pick each single-valued column's exact
+    // missing_val and fill its missing slots.
+    finishPendingCols(pendingCols);
 
     if (!lastResponse) {
       auto numBuffered = req.reply(response);
