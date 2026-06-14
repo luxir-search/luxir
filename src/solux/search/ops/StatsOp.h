@@ -90,7 +90,6 @@ public:
       double dsum = 0;
       int64_t count = 0;
       bool floating = thisOp().isFloating();
-      BitDocSet* bitDocs = (BitDocSet*) domain;
 
       auto& postingsReader = thisOp().req.reader->segments()[segnum].postingsReader();
       int32_t maxDoc = postingsReader.maxDoc();
@@ -108,7 +107,7 @@ public:
       IntColReader intColReader(postingsReader, segFieldInfo);
       IntColReader::Iterator intColIter(intColReader);
       for (int32_t docid = 0; docid < maxDoc; docid++) {
-        if (bitDocs && !bitDocs->get(docid)) {
+        if (domain && !domain->get(docid)) {
           continue;
         }
         if (intColIter.docId() < docid ) {

@@ -165,6 +165,13 @@ public:
     void doPrepareDomain(oneapi::tbb::task_group* tg, int32_t segnum, solux::DocSet* domain) {
       auto& op = thisOp();
       if (segnum < 0) {
+        // Empty index: forward to sub-calculators so nested ops still emit a
+        // result, mirroring the empty-index path in doCollect.  Without this,
+        // a prepare-requiring query (force_prepare, KNN) silently drops nested
+        // facet/avg ops on an empty index.
+        for (auto& subCalc : subCalcs) {
+          subCalc->calc(tg, -1, nullptr);
+        }
         doneCollecting();
         return;
       }

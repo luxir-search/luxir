@@ -446,7 +446,12 @@ public:
         auto* skinnyCounts = std::get_if<SkinnyCounter8>(&mergedData->counts);
         auto* vecCounts   = std::get_if<MergeableStrData::CountVector>(&mergedData->counts);
         std::vector<std::pair<int64_t, int64_t>> ordCounts;
-        auto min = thisOp().minCount == -1 ? 1 : thisOp().minCount;
+        // Floor at 1: count facets never emit zero-count buckets.  This also
+        // makes the result independent of the storage representation - a dense
+        // CountVector/SkinnyCounter has a slot per global ord, so mincount==0
+        // would otherwise leak zero-count buckets (and duplicate the zeroed
+        // skinny overflow ords) that the sparse OrdHash never produces.
+        auto min = std::max<int64_t>(thisOp().minCount, 1);
 
         if (mapCounts) {
           for (auto& [val, count] : *mapCounts) {

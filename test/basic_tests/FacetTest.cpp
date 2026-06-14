@@ -2,6 +2,7 @@
 #include <mutex>
 #include <thread>
 #include <atomic>
+#include <cmath>
 #include <set>
 #include <functional>
 #include <tbb/task_group.h>
@@ -628,6 +629,7 @@ TEST_F(FacetTest, unsupportedFacetOptionsRejected) {
   struct Case {
     std::string name;
     std::function<void(proto::SearchRequest&)> configure;
+    std::string expectSubstr; // a phrase the clear error message must contain
   };
 
   std::vector<Case> cases = {
@@ -637,21 +639,21 @@ TEST_F(FacetTest, unsupportedFacetOptionsRejected) {
       auto& avg = *(*facet.mutable_ops())["avg"].mutable_gen_op();
       avg.set_name("avg");
       avg.mutable_args()->Add()->set_s("foo_i");
-    }},
+    }, "not yet supported for int field facets"},
     {"int_sort", [](proto::SearchRequest& req) {
       auto& facet = *(*req.mutable_ops())["f"].mutable_field_facet();
       facet.set_field("foo_i");
       auto& sort = *facet.mutable_sorts()->Add();
       sort.set_field("avg");
       sort.set_dir(proto::SortSpec_SortDir_ASC);
-    }},
+    }, "not yet supported for int field facets"},
     {"text_subop", [](proto::SearchRequest& req) {
       auto& facet = *(*req.mutable_ops())["f"].mutable_field_facet();
       facet.set_field("body_w");
       auto& avg = *(*facet.mutable_ops())["avg"].mutable_gen_op();
       avg.set_name("avg");
       avg.mutable_args()->Add()->set_s("foo_i");
-    }},
+    }, "not yet supported for text field facets"},
     {"range_sort", [](proto::SearchRequest& req) {
       auto& facet = *(*req.mutable_ops())["f"].mutable_range_facet();
       facet.set_field("foo_i");
@@ -661,14 +663,14 @@ TEST_F(FacetTest, unsupportedFacetOptionsRejected) {
       auto& sort = *facet.mutable_sorts()->Add();
       sort.set_field("avg");
       sort.set_dir(proto::SortSpec_SortDir_ASC);
-    }},
+    }, "not yet supported for range facets"},
     {"string_unknown_sort", [](proto::SearchRequest& req) {
       auto& facet = *(*req.mutable_ops())["f"].mutable_field_facet();
       facet.set_field("cat_s");
       auto& sort = *facet.mutable_sorts()->Add();
       sort.set_field("not_a_subop");
       sort.set_dir(proto::SortSpec_SortDir_ASC);
-    }},
+    }, "unknown sort field"},
     {"string_two_sorts", [](proto::SearchRequest& req) {
       auto& facet = *(*req.mutable_ops())["f"].mutable_field_facet();
       facet.set_field("cat_s");
@@ -678,7 +680,7 @@ TEST_F(FacetTest, unsupportedFacetOptionsRejected) {
       auto& sort2 = *facet.mutable_sorts()->Add();
       sort2.set_field("second");
       sort2.set_dir(proto::SortSpec_SortDir_DESC);
-    }}
+    }, "multiple sort fields"}
   };
 
   for (const auto& testCase : cases) {
@@ -690,10 +692,250 @@ TEST_F(FacetTest, unsupportedFacetOptionsRejected) {
     lreq->engine.submit(*lreq, true);
 
     ASSERT_EQ(1, lreq->responses.size()) << testCase.name;
+    const auto& error = lreq->responses[0]->proto.error();
     EXPECT_TRUE(lreq->responses[0]->proto.has_error()) << testCase.name << "\n" << lreq->toString();
-    EXPECT_FALSE(lreq->responses[0]->proto.error().empty()) << testCase.name;
+    // Lock in the clear-message contract: the facet name and the specific
+    // unsupported-option phrase must both appear.
+    EXPECT_NE(error.find("'f'"), std::string::npos) << testCase.name << ": '" << error << "'";
+    EXPECT_NE(error.find(testCase.expectSubstr), std::string::npos) << testCase.name << ": '" << error << "'";
     lreq->done();
   }
+}
+
+// Finding 1: a prepare-requiring query (force_prepare) on an empty index must
+// still emit its nested ops. Pre-fix, doPrepareDomain's segnum<0 branch only
+// called doneCollecting() and dropped the nested facet/avg.
+TEST_F(FacetTest, emptyIndexForcePrepareNestedOps) {
+  CollectionHelper helper;
+  helper.clear();
+
+  auto* lreq = LocalReq::create(soluxNode->getSearchEngine());
+  lreq->proto.mutable_collection()->add_name("main");
+  lreq->proto.set_request_id("test_empty_index_force_prepare_nested_ops");
+
+  auto& topDocs = *(*lreq->proto.mutable_ops())["q"].mutable_top_docs();
+  topDocs.set_get_number(true);
+  topDocs.mutable_query()->mutable_force_prepare()->mutable_query()->set_all(true);
+
+  auto& facet = *(*topDocs.mutable_ops())["f"].mutable_field_facet();
+  facet.set_field("category_s");
+  facet.set_limit(10);
+
+  auto& avg = *(*topDocs.mutable_ops())["a"].mutable_gen_op();
+  avg.set_name("avg");
+  avg.mutable_args()->Add()->set_s("price_i");
+
+  lreq->engine.submit(*lreq, true);
+
+  ASSERT_EQ(1, lreq->responses.size()) << lreq->toString();
+  ASSERT_FALSE(lreq->responses[0]->proto.has_error()) << lreq->toString();
+  const auto& docs = lreq->responses[0]->proto.ops().at("q").docs();
+  ASSERT_EQ(0, docs.matches());
+  // Both nested calculator families must still emit on an empty prepared index.
+  ASSERT_TRUE(docs.ops().contains("f")) << lreq->toString();
+  EXPECT_EQ(0, docs.ops().at("f").facet().bucket_ids().col_s().v_size());
+  ASSERT_TRUE(docs.ops().contains("a")) << lreq->toString();
+  EXPECT_TRUE(std::isnan(docs.ops().at("a").d()));
+
+  lreq->done();
+}
+
+// Finding 2: string facet with explicit mincount=0 must not emit zero-count
+// buckets, even under dense (CountVector) storage where every global ord has a
+// slot. Pre-fix the floor was 0, so ords absent from the domain leaked through.
+TEST_F(FacetTest, stringFacetMincountZeroNoZeroCountBuckets) {
+  CollectionHelper helper;
+  helper.clear();
+  // Enough "a" docs in the sel=yes domain to push string facet storage to a
+  // dense CountVector (domainSize>>8 >= uniqueVals), where the "b" ord (absent
+  // from the domain) is a zero slot.
+  const int aDocs = 700;
+  std::vector<Doc> docs;
+  for (int i = 0; i < aDocs; i++) {
+    docs.push_back(flatdoc("id", std::to_string(i), "cat_s", "a", "sel_s", "yes"));
+  }
+  for (int i = 0; i < 5; i++) {
+    docs.push_back(flatdoc("id", std::to_string(1000 + i), "cat_s", "b", "sel_s", "no"));
+  }
+  helper.indexAll(docs, UpdateMessage::COMMIT);
+
+  auto* lreq = LocalReq::create(soluxNode->getSearchEngine());
+  lreq->proto.mutable_collection()->add_name("main");
+  lreq->proto.set_request_id("test_string_facet_mincount_zero");
+
+  auto& topDocs = *(*lreq->proto.mutable_ops())["q"].mutable_top_docs();
+  topDocs.set_get_number(true);
+  auto& match = *topDocs.mutable_query()->mutable_match();
+  match.set_field("sel_s");
+  match.mutable_val()->set_s("yes");
+
+  auto& facet = *(*topDocs.mutable_ops())["f"].mutable_field_facet();
+  facet.set_field("cat_s");
+  facet.set_limit(-1);
+  facet.set_mincount(0);
+
+  lreq->engine.submit(*lreq, true);
+
+  ASSERT_EQ(1, lreq->responses.size()) << lreq->toString();
+  ASSERT_FALSE(lreq->responses[0]->proto.has_error()) << lreq->toString();
+  const auto& facetResult = lreq->responses[0]->proto.ops().at("q").docs().ops().at("f").facet();
+  // Only "a" is in the sel=yes domain; the zero-count "b" ord must not appear.
+  ASSERT_EQ(1, facetResult.bucket_ids().col_s().v_size()) << lreq->toString();
+  EXPECT_EQ("a", facetResult.bucket_ids().col_s().v(0));
+  EXPECT_EQ(aDocs, facetResult.counts(0));
+  // No bucket may have count 0, and no bucket may be duplicated.
+  std::set<std::string> seen;
+  for (int i = 0; i < facetResult.counts_size(); i++) {
+    EXPECT_GT(facetResult.counts(i), 0);
+    EXPECT_TRUE(seen.insert(std::string(facetResult.bucket_ids().col_s().v(i))).second);
+  }
+
+  lreq->done();
+}
+
+// Finding 3: avg op nested under a selective query (sparse ArrDocSet domain).
+// Locks in correct sparse-domain handling after dropping the BitDocSet C-cast.
+TEST_F(FacetTest, avgNestedSparseArrayDomain) {
+  CollectionHelper helper;
+  helper.clear();
+  for (int i = 0; i < 100; i++) {
+    std::string id = std::to_string(i);
+    if (i == 5) {
+      helper.index(flatdoc("id", id, "pick_s", "yes", "val_i", 10), UpdateMessage::NO_COMMIT);
+    } else if (i == 50) {
+      helper.index(flatdoc("id", id, "pick_s", "yes", "val_i", 20), UpdateMessage::NO_COMMIT);
+    } else if (i == 95) {
+      helper.index(flatdoc("id", id, "pick_s", "yes", "val_i", 30), UpdateMessage::NO_COMMIT);
+    } else {
+      helper.index(flatdoc("id", id, "val_i", 999), UpdateMessage::NO_COMMIT);
+    }
+  }
+  helper.commit();
+
+  auto* lreq = LocalReq::create(soluxNode->getSearchEngine());
+  lreq->proto.mutable_collection()->add_name("main");
+  lreq->proto.set_request_id("test_avg_nested_sparse_array_domain");
+
+  auto& topDocs = *(*lreq->proto.mutable_ops())["q"].mutable_top_docs();
+  topDocs.set_get_number(true);
+  auto& match = *topDocs.mutable_query()->mutable_match();
+  match.set_field("pick_s");
+  match.mutable_val()->set_s("yes");
+
+  auto& avg = *(*topDocs.mutable_ops())["a"].mutable_gen_op();
+  avg.set_name("avg");
+  avg.mutable_args()->Add()->set_s("val_i");
+
+  lreq->engine.submit(*lreq, true);
+
+  ASSERT_EQ(1, lreq->responses.size()) << lreq->toString();
+  ASSERT_FALSE(lreq->responses[0]->proto.has_error()) << lreq->toString();
+  const auto& docs = lreq->responses[0]->proto.ops().at("q").docs();
+  ASSERT_EQ(3, docs.matches());
+  // avg over the 3 in-domain docs: (10+20+30)/3 = 20
+  EXPECT_DOUBLE_EQ(20.0, docs.ops().at("a").d());
+
+  lreq->done();
+}
+
+// Finding 4: full-text facet per-doc missing. A segment that has the field but
+// where some in-domain docs lack any token must count those as missing.
+// Pre-fix, missing was only counted when the whole segment lacked the field.
+TEST_F(FacetTest, fullTextFacetMixedPresenceMissing) {
+  CollectionHelper helper;
+  helper.clear();
+  // single segment, mixed presence: 2 docs with body_w, 2 without.
+  helper.index(flatdoc("id", "1", "body_w", "alpha beta"), UpdateMessage::NO_COMMIT);
+  helper.index(flatdoc("id", "2", "body_w", "alpha"), UpdateMessage::NO_COMMIT);
+  helper.index(flatdoc("id", "3", "other_s", "x"), UpdateMessage::NO_COMMIT);
+  helper.index(flatdoc("id", "4", "other_s", "y"), UpdateMessage::COMMIT);
+
+  auto* lreq = LocalReq::create(soluxNode->getSearchEngine());
+  lreq->proto.mutable_collection()->add_name("main");
+  lreq->proto.set_request_id("test_full_text_facet_mixed_presence_missing");
+
+  auto& topDocs = *(*lreq->proto.mutable_ops())["q"].mutable_top_docs();
+  topDocs.set_get_number(true);
+  topDocs.mutable_query()->set_all(true);
+
+  auto& facet = *(*topDocs.mutable_ops())["f"].mutable_field_facet();
+  facet.set_field("body_w");
+  facet.set_limit(-1);
+  facet.set_missing(true);
+
+  lreq->engine.submit(*lreq, true);
+
+  ASSERT_EQ(1, lreq->responses.size()) << lreq->toString();
+  ASSERT_FALSE(lreq->responses[0]->proto.has_error()) << lreq->toString();
+  const auto& facetResult = lreq->responses[0]->proto.ops().at("q").docs().ops().at("f").facet();
+  ASSERT_EQ(2, facetResult.bucket_ids().col_s().v_size());
+  EXPECT_EQ("alpha", facetResult.bucket_ids().col_s().v(0));
+  EXPECT_EQ(2, facetResult.counts(0));
+  EXPECT_EQ("beta", facetResult.bucket_ids().col_s().v(1));
+  EXPECT_EQ(1, facetResult.counts(1));
+  // docs 3 and 4 have no body_w token -> missing = 2 (pre-fix counted 0).
+  EXPECT_EQ(2, facetResult.missing());
+
+  lreq->done();
+}
+
+// Full-text facet missing under a selective query: the domain is a sparse
+// ArrDocSet, so missing is computed by intersecting the indexed docs-with-value
+// set with the domain. Verifies out-of-domain docs that have the field are
+// excluded from both the buckets and the have-field count.
+TEST_F(FacetTest, fullTextFacetSparseDomainMissing) {
+  CollectionHelper helper;
+  helper.clear();
+  for (int i = 0; i < 100; i++) {
+    std::string id = std::to_string(i);
+    if (i == 5) {
+      helper.index(flatdoc("id", id, "pick_s", "yes", "body_w", "alpha"), UpdateMessage::NO_COMMIT);
+    } else if (i == 50) {
+      helper.index(flatdoc("id", id, "pick_s", "yes", "body_w", "beta"), UpdateMessage::NO_COMMIT);
+    } else if (i == 95) {
+      helper.index(flatdoc("id", id, "pick_s", "yes"), UpdateMessage::NO_COMMIT); // in domain, no body_w
+    } else if (i == 10 || i == 20 || i == 30) {
+      helper.index(flatdoc("id", id, "body_w", "gamma"), UpdateMessage::NO_COMMIT); // has body_w, not in domain
+    } else {
+      helper.index(flatdoc("id", id, "other_s", "z"), UpdateMessage::NO_COMMIT);
+    }
+  }
+  helper.commit();
+
+  auto* lreq = LocalReq::create(soluxNode->getSearchEngine());
+  lreq->proto.mutable_collection()->add_name("main");
+  lreq->proto.set_request_id("test_full_text_facet_sparse_domain_missing");
+
+  auto& topDocs = *(*lreq->proto.mutable_ops())["q"].mutable_top_docs();
+  topDocs.set_get_number(true);
+  auto& match = *topDocs.mutable_query()->mutable_match();
+  match.set_field("pick_s");
+  match.mutable_val()->set_s("yes");
+
+  auto& facet = *(*topDocs.mutable_ops())["f"].mutable_field_facet();
+  facet.set_field("body_w");
+  facet.set_limit(-1);
+  facet.set_missing(true);
+
+  lreq->engine.submit(*lreq, true);
+
+  ASSERT_EQ(1, lreq->responses.size()) << lreq->toString();
+  ASSERT_FALSE(lreq->responses[0]->proto.has_error()) << lreq->toString();
+  const auto& docs = lreq->responses[0]->proto.ops().at("q").docs();
+  ASSERT_EQ(3, docs.matches());
+  const auto& facetResult = docs.ops().at("f").facet();
+  // Only in-domain docs contribute: alpha (doc 5) and beta (doc 50). The gamma
+  // docs have body_w but are out of domain, so they appear in neither the
+  // buckets nor the have-field count.
+  ASSERT_EQ(2, facetResult.bucket_ids().col_s().v_size());
+  EXPECT_EQ("alpha", facetResult.bucket_ids().col_s().v(0));
+  EXPECT_EQ("beta", facetResult.bucket_ids().col_s().v(1));
+  EXPECT_EQ(1, facetResult.counts(0));
+  EXPECT_EQ(1, facetResult.counts(1));
+  // domain = {5, 50, 95}; doc 95 has no body_w -> missing = 1.
+  EXPECT_EQ(1, facetResult.missing());
+
+  lreq->done();
 }
 
 //

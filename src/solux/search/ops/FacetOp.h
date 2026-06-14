@@ -9,6 +9,7 @@
 #include "FacetEmit.h"
 #include "SearchOp.h"
 #include "solux/reader/DocsEnum.h"
+#include "solux/reader/DocsReader.h"
 #include "solux/reader/IntColReader.h"
 #include "solux/reader/TermsEnum.h"
 #include "solux/schema/Schema.h"
@@ -503,6 +504,31 @@ public:
         if (count > 0) {
           counts[(std::string) (std::string_view) tenum.term()] += count;
         }
+      }
+      if (thisOp().missing) {
+        // missing = in-domain docs that have no value for this field.  The
+        // docs-with-value set is already indexed (the field-length/norms
+        // column), so intersect it with the domain rather than rebuilding a
+        // per-doc set during the term scan.
+        DocsReader docsReader(postingsReader, segFieldInfo);
+        int64_t domainCard = domain ? domain->card() : maxDoc;
+        int64_t haveField;
+        if (!docsReader.hasBitset()) {
+          // dense: every doc has the field, so none in the domain are missing.
+          haveField = domainCard;
+        } else if (!domain) {
+          // null domain == all docs, so the intersection is exactly docsWithField.
+          haveField = docsReader.numDocs();
+        } else {
+          haveField = 0;
+          screaming::BitSet::Iterator it(docsReader.bitset());
+          for (int32_t doc = it.next(); doc != screaming::BitSet::END; doc = it.next()) {
+            if (domain->get(doc)) {
+              haveField++;
+            }
+          }
+        }
+        mergeableData->missing_num += domainCard - haveField;
       }
       auto merged = countMerger.release(mergeableData.release());
       if ((size_t)merged == thisOp().reader.segments().size()) {
