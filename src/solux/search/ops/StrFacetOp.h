@@ -633,7 +633,6 @@ public:
           FieldReader fieldReader(poolGuard.pool(), postingsReader);
           bool found = fieldReader.seek(thisOp().fieldName);
           DocSetBuilder builder(maxDoc);
-          std::unique_ptr<DocSet> bucketDomain;
           if (found) {
             fieldReader.readFieldInfo(segFieldInfo);
             TermsEnum tenum(poolGuard.pool(), postingsReader, segFieldInfo);
@@ -649,9 +648,13 @@ public:
                 }
                 builder.add(doc);
               }
-              bucketDomain = builder.build();
             }
           }
+          // Always pass a (possibly empty) bucket domain.  A null domain means
+          // "all docs" to a sub-op (e.g. AvgOp), so when the field or value is
+          // absent in this segment the bucket would wrongly absorb every doc in
+          // the segment.  The bucket has no docs here, so the domain is empty.
+          std::unique_ptr<DocSet> bucketDomain = builder.build();
           for (auto& subCalc : calculators) {
             //subCalc->calc(tg, segnum, &output);
             // no support for subcalcs launching tasks yet
