@@ -212,7 +212,7 @@ public:
       MonoWriter endValueRankWriter(pool, *out);
       int64_t endValueRank = 0;
 
-      lengthStream.visitValues(pool, [&endValueRank, &endValueRankWriter](auto val) {
+      lengthStream.visitValues(inverter.pool, [&endValueRank, &endValueRankWriter](auto val) {
         endValueRank += val;
         endValueRankWriter.addInt64(endValueRank);
       });
