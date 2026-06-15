@@ -1066,6 +1066,93 @@ TEST_F(FacetTest, fullTextFacetSparseDomainMissing) {
   lreq->done();
 }
 
+// Diagnostic: facet avg() sub-op must average only over the query domain, not
+// all docs with the bucket value. Two segments; out-of-domain docs carry wildly
+// different avgval so a domain leak is obvious.
+TEST_F(FacetTest, facetAvgRespectsSelectiveDomain) {
+  CollectionHelper helper;
+  helper.clear();
+  helper.index(flatdoc("id", "A", "cat_s", "x", "sel_s", "yes", "avgval_i", 10), UpdateMessage::NO_COMMIT);
+  helper.index(flatdoc("id", "B", "cat_s", "x", "sel_s", "no",  "avgval_i", 1000), UpdateMessage::NO_COMMIT);
+  helper.index(flatdoc("id", "C", "cat_s", "y", "sel_s", "yes", "avgval_i", 20), UpdateMessage::NO_COMMIT);
+  helper.index(flatdoc("id", "G", "cat_s", "z", "sel_s", "yes", "avgval_i", 100), UpdateMessage::COMMIT);
+  helper.index(flatdoc("id", "D", "cat_s", "x", "sel_s", "yes", "avgval_i", 30), UpdateMessage::NO_COMMIT);
+  helper.index(flatdoc("id", "E", "cat_s", "y", "sel_s", "no",  "avgval_i", 2000), UpdateMessage::NO_COMMIT);
+  helper.index(flatdoc("id", "F", "cat_s", "y", "sel_s", "yes", "avgval_i", 40), UpdateMessage::NO_COMMIT);
+  // z also appears in out-of-domain docs across this segment -> z's in-domain
+  // bucket is just {G}; the avg must be 100, not polluted by H/I.
+  helper.index(flatdoc("id", "H", "cat_s", "z", "sel_s", "no",  "avgval_i", 200), UpdateMessage::NO_COMMIT);
+  helper.index(flatdoc("id", "I", "cat_s", "z", "sel_s", "no",  "avgval_i", 300), UpdateMessage::COMMIT);
+
+  // domain = {A,C,D,F,G}; x={A,D} avg 20; y={C,F} avg 30; z={G} avg 100 (count 1).
+  for (int64_t limit : {(int64_t)10, (int64_t)-1}) {
+    auto* lreq = LocalReq::create(soluxNode->getSearchEngine());
+    lreq->proto.mutable_collection()->add_name("main");
+    lreq->proto.set_request_id("test_facet_avg_domain");
+    auto& topDocs = *(*lreq->proto.mutable_ops())["q"].mutable_top_docs();
+    topDocs.set_get_number(true);
+    auto& match = *topDocs.mutable_query()->mutable_match();
+    match.set_field("sel_s");
+    match.mutable_val()->set_s("yes");
+    auto& facet = *(*topDocs.mutable_ops())["f"].mutable_field_facet();
+    facet.set_field("cat_s");
+    facet.set_limit(limit);
+    auto& avg = *(*facet.mutable_ops())["av"].mutable_gen_op();
+    avg.set_name("avg");
+    avg.mutable_args()->Add()->set_s("avgval_i");
+    lreq->engine.submit(*lreq, true);
+
+    ASSERT_FALSE(lreq->responses[0]->proto.has_error()) << lreq->toString();
+    const auto& f = lreq->responses[0]->proto.ops().at("q").docs().ops().at("f").facet();
+    ASSERT_EQ(3, f.bucket_ids().col_s().v_size()) << "limit=" << limit << "\n" << lreq->toString();
+    std::map<std::string, double> got;
+    for (int i = 0; i < f.bucket_ids().col_s().v_size(); i++)
+      got[std::string(f.bucket_ids().col_s().v(i))] = f.ops().at("av").arr_d().v(i);
+    EXPECT_DOUBLE_EQ(20.0, got["x"]) << "limit=" << limit << "\n" << lreq->toString();
+    EXPECT_DOUBLE_EQ(30.0, got["y"]) << "limit=" << limit << "\n" << lreq->toString();
+    EXPECT_DOUBLE_EQ(100.0, got["z"]) << "limit=" << limit << "\n" << lreq->toString();
+    lreq->done();
+  }
+}
+
+// A facet sub-op (avg) must not be polluted by a segment that lacks the facet
+// field: the bucket has no docs there. Regression for doSubops passing a null
+// (== all-docs) domain when the field/value is absent in a segment.
+TEST_F(FacetTest, facetAvgFieldAbsentInSegment) {
+  CollectionHelper helper;
+  helper.clear();
+  // seg1 has cat_s; seg2 has NO cat_s at all (only avgval).
+  helper.index(flatdoc("id", "A", "cat_s", "x", "sel_s", "yes", "avgval_i", 10), UpdateMessage::NO_COMMIT);
+  helper.index(flatdoc("id", "B", "cat_s", "x", "sel_s", "yes", "avgval_i", 20), UpdateMessage::COMMIT);
+  helper.index(flatdoc("id", "C", "sel_s", "yes", "avgval_i", 1000), UpdateMessage::NO_COMMIT);
+  helper.index(flatdoc("id", "D", "sel_s", "yes", "avgval_i", 2000), UpdateMessage::COMMIT);
+
+  auto* lreq = LocalReq::create(soluxNode->getSearchEngine());
+  lreq->proto.mutable_collection()->add_name("main");
+  lreq->proto.set_request_id("test_facet_avg_field_absent_in_segment");
+  auto& topDocs = *(*lreq->proto.mutable_ops())["q"].mutable_top_docs();
+  topDocs.set_get_number(true);
+  auto& match = *topDocs.mutable_query()->mutable_match();
+  match.set_field("sel_s");
+  match.mutable_val()->set_s("yes");
+  auto& facet = *(*topDocs.mutable_ops())["f"].mutable_field_facet();
+  facet.set_field("cat_s");
+  facet.set_limit(10);  // finite -> post-hoc sub-op path
+  auto& avg = *(*facet.mutable_ops())["av"].mutable_gen_op();
+  avg.set_name("avg");
+  avg.mutable_args()->Add()->set_s("avgval_i");
+  lreq->engine.submit(*lreq, true);
+
+  ASSERT_FALSE(lreq->responses[0]->proto.has_error()) << lreq->toString();
+  const auto& f = lreq->responses[0]->proto.ops().at("q").docs().ops().at("f").facet();
+  ASSERT_EQ(1, f.bucket_ids().col_s().v_size()) << lreq->toString();
+  EXPECT_EQ("x", f.bucket_ids().col_s().v(0));
+  EXPECT_EQ(2, f.counts(0));
+  // bucket x = {A,B}; avg = (10+20)/2 = 15. C,D lack cat_s and must NOT leak in.
+  EXPECT_DOUBLE_EQ(15.0, f.ops().at("av").arr_d().v(0)) << lreq->toString();
+  lreq->done();
+}
+
 //
 // Comprehensive random faceting test class
 //
@@ -1333,10 +1420,25 @@ protected:
       // Determine field type from field name convention
       bool isIntField = fieldName.ends_with("_i") || fieldName.ends_with("_is");
       bool showZeros = !isIntField && hasMin && facetOp.mincount() == 0;
-      
+
+      // avg() sub-op detection (string/id facets only; the parser rejects it on
+      // int/range/text). The buckets may also be sorted by it.
+      std::string avgOpName, avgField;
+      for (const auto& [opName, sub] : facetOp.ops()) {
+        if (sub.has_gen_op() && (sub.gen_op().name() == "avg" || sub.gen_op().name() == "average")) {
+          avgOpName = opName;
+          avgField = sub.gen_op().args(0).s();
+          break;
+        }
+      }
+      bool hasAvg = !avgOpName.empty();
+      bool sortByAvg = hasAvg && facetOp.sorts_size() > 0 && facetOp.sorts(0).field() == avgOpName;
+      bool avgDesc = sortByAvg && facetOp.sorts(0).dir() == proto::SortSpec_SortDir_DESC;
+
       // Count values for documents matching the domain query
       boost::unordered_flat_map<int64_t, int64_t> intCounts;
       boost::unordered_flat_map<std::string, int64_t> strCounts;
+      boost::unordered_flat_map<std::string, int64_t> strAvgSum; // per-bucket sum of avgField (hasAvg)
       int64_t missingCount = 0;
       
       std::vector<const FieldVal*> vals;
@@ -1353,6 +1455,12 @@ protected:
       
       for (auto docIdx : domainDocs) {
         const auto& doc = docs[docIdx];
+        int64_t av = 0;
+        if (hasAvg) {
+          if (auto* p = find(doc, avgField)) {
+            if (auto* iv = std::get_if<int64_t>(p)) av = *iv;
+          }
+        }
         findAll(doc, fieldName, vals);
         bool hasField = false;
         for (auto* val : vals) {
@@ -1364,6 +1472,7 @@ protected:
           } else {
             if (auto* strVal = std::get_if<std::string>(val)) {
               strCounts[*strVal]++;
+              if (hasAvg) strAvgSum[*strVal] += av;
               hasField = true;
             }
           }
@@ -1380,6 +1489,38 @@ protected:
         for (const auto& [val, count] : sorted) {
           bucketIds->add_v(val);
           facetResult->add_counts(count);
+        }
+      } else if (hasAvg) {
+        // avgval_i is always present, so every bucket has count avg values and
+        // avg = avgSum/count (no empty bucket -> no 0.0-vs-NaN ambiguity).
+        struct B { std::string val; int64_t count; int64_t avgSum; };
+        std::vector<B> buckets;
+        for (const auto& [val, count] : strCounts) {
+          if (count >= mincount) buckets.push_back({val, count, strAvgSum.at(val)});
+        }
+        if (sortByAvg) {
+          std::sort(buckets.begin(), buckets.end(), [avgDesc](const B& a, const B& b) {
+            double aa = (double)a.avgSum / (double)a.count;
+            double ba = (double)b.avgSum / (double)b.count;
+            if (aa != ba) return avgDesc ? aa > ba : aa < ba;
+            return a.val < b.val; // tie-break by bucket value asc (matches facetResult2)
+          });
+        } else {
+          std::sort(buckets.begin(), buckets.end(), [](const B& a, const B& b) {
+            if (a.count != b.count) return a.count > b.count;
+            return a.val < b.val;
+          });
+        }
+        if (limit >= 0 && (int64_t)buckets.size() > limit) buckets.resize(limit);
+        auto* bucketIds = facetResult->mutable_bucket_ids()->mutable_col_s();
+        // Only emit the sub-op result when there are buckets: the engine's
+        // post-hoc path creates no ops entry for an empty facet.
+        auto* avgArr = buckets.empty() ? nullptr
+                       : (*facetResult->mutable_ops())[avgOpName].mutable_arr_d();
+        for (const auto& b : buckets) {
+          bucketIds->add_v(b.val);
+          facetResult->add_counts(b.count);
+          avgArr->add_v((double)b.avgSum / (double)b.count);
         }
       } else {
         auto sorted = sortAndLimitFacets(strCounts, limit, showZeros ? 0 : mincount);
@@ -1454,6 +1595,11 @@ protected:
         
         // get IndexHandlers for the fields that exist in this segment
         auto* idHandler = &inverter.getIndexHandler("id");
+        // Dedicated avg-target: single-valued int, indexed for EVERY doc in
+        // every segment so an avg() sub-op never sees an empty bucket (which
+        // would make the inline path report 0.0 but the post-hoc path NaN, and
+        // make sort-by-avg ill-defined).
+        auto* avgHandler = &inverter.getIndexHandler("avgval_i");
         boost::container::small_vector<Inverter::IndexHandler*,8> handlers(fields.size());
         for (size_t i = 0; i < fields.size(); i++) {
           if (fieldExists[i] < 5) {
@@ -1469,7 +1615,12 @@ protected:
           
           inverter.startDoc();
           idHandler->index(inverter, std::to_string(docId));
-          
+
+          // Always-present avg target (see avgHandler above).
+          int64_t avgv = segRng.rint(1000);
+          avgHandler->index(inverter, avgv);
+          doc.push_back({"avgval_i", avgv});
+
           // Add random field values
           for (size_t fieldIdx = 0; fieldIdx < fields.size(); fieldIdx++) {
             const auto& field = fields[fieldIdx];
@@ -1617,8 +1768,24 @@ protected:
     
     // Random missing
     facet->set_missing(rng.rbool());
-    
-    // TODO: Add sub-facets (ops) generation
+
+    // avg() sub-op on the always-present avgval_i. Only on string/id facets -
+    // the parser rejects sub-ops/sorts on int/range/text facets. Optionally
+    // sort the buckets by it.
+    if (!field.isInt && rng.rint(100) < 40) {
+      // avg + mincount=0 (all-values) is an untested combination; avoid it.
+      if (facet->has_mincount() && facet->mincount() == 0) {
+        facet->set_mincount(1);
+      }
+      auto& avg = *(*facet->mutable_ops())["av"].mutable_gen_op();
+      avg.set_name("avg");
+      avg.mutable_args()->Add()->set_s("avgval_i");
+      if (rng.rint(100) < 50) {
+        auto& sort = *facet->mutable_sorts()->Add();
+        sort.set_field("av");
+        sort.set_dir(rng.rbool() ? proto::SortSpec_SortDir_DESC : proto::SortSpec_SortDir_ASC);
+      }
+    }
   }
 
 public:
@@ -1752,6 +1919,19 @@ public:
               for (int i = 0; i < expected.counts_size(); i++)
                 EXPECT_EQ(actual.counts(i), expected.counts(i)) << "count " << i << ": " << ctx;
               if (ff.missing()) { EXPECT_EQ(actual.missing(), expected.missing()) << "missing: " << ctx; }
+              // avg() sub-op result: arr_d with one entry per returned bucket.
+              for (const auto& [opName, sub] : ff.ops()) {
+                if (sub.has_gen_op() && (sub.gen_op().name() == "avg" || sub.gen_op().name() == "average")) {
+                  // Empty facets emit no sub-op result (model omits it too).
+                  if (!expected.ops().contains(opName)) continue;
+                  ASSERT_TRUE(actual.ops().contains(opName)) << "actual avg missing: " << ctx << "\n" << lreq->toString();
+                  const auto& aArr = actual.ops().at(opName).arr_d();
+                  const auto& eArr = expected.ops().at(opName).arr_d();
+                  ASSERT_EQ(aArr.v_size(), eArr.v_size()) << "avg arr size: " << ctx << "\n" << lreq->toString();
+                  for (int i = 0; i < eArr.v_size(); i++)
+                    EXPECT_DOUBLE_EQ(aArr.v(i), eArr.v(i)) << "avg[" << i << "]: " << ctx;
+                }
+              }
             };
 
             // Walk the request ops and verify every facet at its path: root facets,
