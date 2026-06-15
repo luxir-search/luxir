@@ -38,7 +38,9 @@ public:
   bool incrementToken() override {
     token.clear();
     if (!view || it == view->end()) return false;
-    token.text = *it;
+    std::string_view w = *it;  // word_only yields a view into the source value
+    token.text = w;
+    token.setOffset((int) (w.data() - base_), (int) (w.data() + w.size() - base_));
     ++it;
     return true;
   }
@@ -158,6 +160,7 @@ class StandardTokenizer : public Tokenizer {
   using View = decltype(una::views::word_only::utf8(std::declval<std::string_view>()));
   using Iter = decltype(std::declval<View&>().begin());
   std::string lowered;           // ASCII-lowercased copy of the current value
+  const char* loweredBase = nullptr;  // = lowered.data(), cached so offset math avoids reloading it
   const char* cur = nullptr;     // region scan cursor into `lowered`
   const char* valEnd = nullptr;
   const char* dfaCur = nullptr;  // active pure-ASCII region: [dfaCur, dfaEnd)
@@ -172,7 +175,8 @@ public:
     for (char& ch : lowered) {
       if ((unsigned char) (ch - 'A') < 26) ch = (char) (ch + ('a' - 'A'));
     }
-    cur = lowered.data();
+    loweredBase = lowered.data();
+    cur = loweredBase;
     valEnd = cur + lowered.size();
     dfaCur = dfaEnd = nullptr;
     view.reset();
@@ -186,7 +190,13 @@ public:
         if (asciiNext()) return true;
       } else if (view) {
         if (it != view->end()) {
-          token.text = applyNfkcCf(*it, buf);
+          // Capture the source span before NFKC_CF repoints token.text at `buf`.
+          // `lowered` is a length-preserving ASCII-lowercased copy, so byte
+          // offsets into it equal byte offsets into the original value.
+          std::string_view w = *it;
+          token.setOffset((int) (w.data() - loweredBase),
+                          (int) (w.data() + w.size() - loweredBase));
+          token.text = applyNfkcCf(w, buf);
           ++it;
           return true;
         }
@@ -257,6 +267,7 @@ private:
       }
       if (sawLetNum) {
         token.text = std::string_view(w, (size_t) (s - w));
+        token.setOffset((int) (w - loweredBase), (int) (s - loweredBase));
         dfaCur = s;
         return true;
       }

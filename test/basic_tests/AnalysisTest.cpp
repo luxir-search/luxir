@@ -29,6 +29,8 @@ namespace {
 struct Analysis {
   std::vector<std::string> terms;
   std::vector<int> positions;
+  std::vector<int> starts;  // startOffset per token (parallel to terms)
+  std::vector<int> ends;    // endOffset per token
 };
 
 // Drive a raw stream (caller already wired the chain). `head` supplies the input.
@@ -41,6 +43,8 @@ Analysis analyze(Tokenizer& head, TokenStream& tail, std::string_view val) {
     pos += tok.positionIncrement;
     out.terms.emplace_back(tok.text);
     out.positions.push_back(pos);
+    out.starts.push_back(tok.startOffset);
+    out.ends.push_back(tok.endOffset);
   }
   return out;
 }
@@ -85,6 +89,47 @@ TEST_F(AnalysisTest, keywordWholeInput) {
 TEST_F(AnalysisTest, keywordEmptyEmitsNothing) {
   KeywordTokenizer tok;
   EXPECT_TRUE(analyze(tok, tok, "").terms.empty());
+}
+
+// --- Token offsets ----------------------------------------------------------
+
+TEST_F(AnalysisTest, whitespaceOffsets) {
+  WhitespaceTokenizer tok;
+  //                              0123456789012345678
+  auto out = analyze(tok, tok, "the quick brown fox");
+  EXPECT_EQ((std::vector<int>{0, 4, 10, 16}), out.starts);
+  EXPECT_EQ((std::vector<int>{3, 9, 15, 19}), out.ends);
+}
+
+// Leading/internal/trailing whitespace runs do not perturb offsets: each token's
+// span is the byte range it actually occupies in the source.
+TEST_F(AnalysisTest, whitespaceOffsetsAcrossRuns) {
+  WhitespaceTokenizer tok;
+  //                              0 1 23 4 5 6 7 89 0 1
+  auto out = analyze(tok, tok, "  a\t\tb \n c  ");
+  EXPECT_EQ((std::vector<std::string>{"a", "b", "c"}), out.terms);
+  EXPECT_EQ((std::vector<int>{2, 5, 9}), out.starts);
+  EXPECT_EQ((std::vector<int>{3, 6, 10}), out.ends);
+}
+
+TEST_F(AnalysisTest, keywordOffsetsSpanWholeInput) {
+  KeywordTokenizer tok;
+  auto out = analyze(tok, tok, "Hello World  ");
+  EXPECT_EQ((std::vector<int>{0}), out.starts);
+  EXPECT_EQ((std::vector<int>{13}), out.ends);  // includes trailing spaces
+}
+
+// The key contract: a rewriting filter repoints `text` at its own buffer but
+// must leave the offset pointing back at the original source span.
+TEST_F(AnalysisTest, offsetSurvivesRewritingFilter) {
+  auto src = std::make_unique<WhitespaceTokenizer>();
+  WhitespaceTokenizer& head = *src;
+  LowercaseFilter filter(std::move(src));
+  //                                  0123456789
+  auto out = analyze(head, filter, "The QUICK");
+  EXPECT_EQ((std::vector<std::string>{"the", "quick"}), out.terms);  // text rewritten
+  EXPECT_EQ((std::vector<int>{0, 4}), out.starts);                   // offsets unchanged
+  EXPECT_EQ((std::vector<int>{3, 9}), out.ends);
 }
 
 TEST_F(AnalysisTest, lowercaseFolds) {
@@ -517,6 +562,38 @@ TEST_F(AnalysisTest, standardAsciiWordBreakSemantics) {
             analyze(*chain, "Can't STOP won't 3.14 1,000 a:b 1:2 a,b _tag x_1 a.b.c x..y").terms);
   EXPECT_EQ((std::vector<std::string>{"x"}), analyze(*chain, "_ x").terms);
   EXPECT_EQ((std::vector<std::string>{"end"}), analyze(*chain, "end.").terms);
+}
+
+// Offsets through the fused StandardTokenizer, both the ASCII DFA fast path and
+// the uni-algo path. They are byte spans into the original value, surviving the
+// lowercasing/NFKC_CF rewrite of `text`.
+TEST_F(AnalysisTest, standardOffsets) {
+  TextFieldType ft("wl", FieldType::INDEX_DOCS_FREQS_POSITIONS, "unicode_word", {"nfkc_cf"});
+  auto chain = ft.createAnalyzer("wl");
+
+  //                                  0123456789012345678
+  auto ascii = analyze(*chain, "The Quick BROWN fox");
+  EXPECT_EQ((std::vector<std::string>{"the", "quick", "brown", "fox"}), ascii.terms);
+  EXPECT_EQ((std::vector<int>{0, 4, 10, 16}), ascii.starts);
+  EXPECT_EQ((std::vector<int>{3, 9, 15, 19}), ascii.ends);
+
+  // Non-ASCII region routed to uni-algo. "café" is 5 bytes (é is 2); the offset
+  // is the source span even though NFKC_CF repoints text at its scratch buffer.
+  auto wide = analyze(*chain, "café World");
+  EXPECT_EQ((std::vector<std::string>{"café", "world"}), wide.terms);
+  EXPECT_EQ((std::vector<int>{0, 6}), wide.starts);
+  EXPECT_EQ((std::vector<int>{5, 11}), wide.ends);
+}
+
+// Offsets through the standalone unicode_word tokenizer (no nfkc fusion). Each
+// CJK ideograph is its own 3-byte segment.
+TEST_F(AnalysisTest, unicodeWordOffsets) {
+  TextFieldType ft("w", FieldType::INDEX_DOCS_FREQS_POSITIONS, "unicode_word");
+  auto chain = ft.createAnalyzer("w");
+  auto out = analyze(*chain, "Hello 中文 World");
+  EXPECT_EQ((std::vector<std::string>{"Hello", "中", "文", "World"}), out.terms);
+  EXPECT_EQ((std::vector<int>{0, 6, 9, 13}), out.starts);
+  EXPECT_EQ((std::vector<int>{5, 9, 12, 18}), out.ends);
 }
 
 // The ASCII path must be allocation-free per value once buffers are warm: the

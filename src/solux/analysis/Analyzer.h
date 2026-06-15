@@ -3,6 +3,7 @@
 #include <string>
 #include <string_view>
 #include <vector>
+#include <cstdint>
 #include <cstring>
 #include <memory>
 #include "solux/util/solux_util.h"
@@ -29,9 +30,21 @@ class Token {
 public:
   std::string_view text;
   int positionIncrement; // increment from the previous token's position
+  int startOffset; // byte offset into original text buffer of current token
+  int endOffset;   // end offset (exclusive) into the original text buffer
 
   void clear() {
+    // Offsets are deliberately not reset here: every emit path sets them, so
+    // zeroing first would just be a dead store on the hot path.
     positionIncrement = 1;
+  }
+
+  // Record the [start, end) source byte span. Only the head Tokenizer (which
+  // still sees the source) sets this; downstream filters generally leave it alone so it
+  // keeps pointing at the origin span even after they rewrite `text`.
+  void setOffset(int start, int end) {
+    startOffset = start;
+    endOffset = end;
   }
 };
 
@@ -74,6 +87,9 @@ protected:
   // tokens; each token is published as a string_view into [tokStart, start_).
   const char *start_ = nullptr;
   const char *end_ = nullptr;
+  // Start of the current value. start_ advances as we scan, so token offsets are
+  // measured against this fixed origin rather than the moving cursor.
+  const char *base_ = nullptr;
   Token token;
 public:
   Tokenizer() : TokenStream(token) {}
@@ -83,6 +99,7 @@ public:
   void setValue(std::string_view val) {
     start_ = val.data();
     end_ = start_ + val.size();
+    base_ = start_;
   }
 };
 
@@ -152,6 +169,7 @@ public:
       if (start_ >= end_ || incrementOverWhitespace(start_, end_)) {
         // If we hit whitespace, we will have already skipped over the first whitespace char for the next call
         token.text = std::string_view(mystart, (size_t) (myend - mystart));
+        token.setOffset((int) (mystart - base_), (int) (myend - base_));
         return true;
       }
       start_++;
@@ -194,6 +212,7 @@ public:
     if (start_ >= end_) return false;
     token.clear();
     token.text = std::string_view(start_, (size_t) (end_ - start_));
+    token.setOffset((int) (start_ - base_), (int) (end_ - base_));
     start_ = end_;  // consumed
     return true;
   }
