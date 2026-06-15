@@ -647,6 +647,11 @@ TEST_F(FacetTest, unsupportedFacetOptionsRejected) {
       sort.set_field("avg");
       sort.set_dir(proto::SortSpec_SortDir_ASC);
     }, "not yet supported for int field facets"},
+    {"int_mincount_zero", [](proto::SearchRequest& req) {
+      auto& facet = *(*req.mutable_ops())["f"].mutable_field_facet();
+      facet.set_field("foo_i");
+      facet.set_mincount(0);
+    }, "not supported for int field facets"},
     {"text_subop", [](proto::SearchRequest& req) {
       auto& facet = *(*req.mutable_ops())["f"].mutable_field_facet();
       facet.set_field("body_w");
@@ -664,6 +669,14 @@ TEST_F(FacetTest, unsupportedFacetOptionsRejected) {
       sort.set_field("avg");
       sort.set_dir(proto::SortSpec_SortDir_ASC);
     }, "not yet supported for range facets"},
+    {"range_mincount_zero", [](proto::SearchRequest& req) {
+      auto& facet = *(*req.mutable_ops())["f"].mutable_range_facet();
+      facet.set_field("foo_i");
+      facet.set_start(0);
+      facet.set_end(10);
+      facet.set_gap(1);
+      facet.set_mincount(0);
+    }, "not supported for range facets"},
     {"string_unknown_sort", [](proto::SearchRequest& req) {
       auto& facet = *(*req.mutable_ops())["f"].mutable_field_facet();
       facet.set_field("cat_s");
@@ -740,15 +753,9 @@ TEST_F(FacetTest, emptyIndexForcePrepareNestedOps) {
   lreq->done();
 }
 
-// Finding 2: string facet with explicit mincount=0 must not emit zero-count
-// buckets, even under dense (CountVector) storage where every global ord has a
-// slot. Pre-fix the floor was 0, so ords absent from the domain leaked through.
-TEST_F(FacetTest, stringFacetMincountZeroNoZeroCountBuckets) {
+TEST_F(FacetTest, stringFacetMincountZeroShowsAllValues) {
   CollectionHelper helper;
   helper.clear();
-  // Enough "a" docs in the sel=yes domain to push string facet storage to a
-  // dense CountVector (domainSize>>8 >= uniqueVals), where the "b" ord (absent
-  // from the domain) is a zero slot.
   const int aDocs = 700;
   std::vector<Doc> docs;
   for (int i = 0; i < aDocs; i++) {
@@ -779,16 +786,138 @@ TEST_F(FacetTest, stringFacetMincountZeroNoZeroCountBuckets) {
   ASSERT_EQ(1, lreq->responses.size()) << lreq->toString();
   ASSERT_FALSE(lreq->responses[0]->proto.has_error()) << lreq->toString();
   const auto& facetResult = lreq->responses[0]->proto.ops().at("q").docs().ops().at("f").facet();
-  // Only "a" is in the sel=yes domain; the zero-count "b" ord must not appear.
-  ASSERT_EQ(1, facetResult.bucket_ids().col_s().v_size()) << lreq->toString();
+  ASSERT_EQ(2, facetResult.bucket_ids().col_s().v_size()) << lreq->toString();
+  ASSERT_EQ(2, facetResult.counts_size());
   EXPECT_EQ("a", facetResult.bucket_ids().col_s().v(0));
   EXPECT_EQ(aDocs, facetResult.counts(0));
-  // No bucket may have count 0, and no bucket may be duplicated.
-  std::set<std::string> seen;
-  for (int i = 0; i < facetResult.counts_size(); i++) {
-    EXPECT_GT(facetResult.counts(i), 0);
-    EXPECT_TRUE(seen.insert(std::string(facetResult.bucket_ids().col_s().v(i))).second);
-  }
+  EXPECT_EQ("b", facetResult.bucket_ids().col_s().v(1));
+  EXPECT_EQ(0, facetResult.counts(1));
+
+  lreq->done();
+}
+
+TEST_F(FacetTest, stringFacetMincountZeroPadsZerosByValue) {
+  CollectionHelper helper;
+  helper.clear();
+  helper.index(flatdoc("id", "1", "cat_s", "x", "sel_s", "yes"), UpdateMessage::NO_COMMIT);
+  helper.index(flatdoc("id", "2", "cat_s", "x", "sel_s", "yes"), UpdateMessage::NO_COMMIT);
+  helper.index(flatdoc("id", "3", "cat_s", "y", "sel_s", "no"), UpdateMessage::NO_COMMIT);
+  helper.index(flatdoc("id", "4", "cat_s", "z", "sel_s", "no"), UpdateMessage::COMMIT);
+
+  auto* lreq = LocalReq::create(soluxNode->getSearchEngine());
+  lreq->proto.mutable_collection()->add_name("main");
+  lreq->proto.set_request_id("test_string_facet_mincount_zero_small_cardinality");
+
+  auto& topDocs = *(*lreq->proto.mutable_ops())["q"].mutable_top_docs();
+  topDocs.set_get_number(true);
+  auto& match = *topDocs.mutable_query()->mutable_match();
+  match.set_field("sel_s");
+  match.mutable_val()->set_s("yes");
+
+  auto& facet = *(*topDocs.mutable_ops())["f"].mutable_field_facet();
+  facet.set_field("cat_s");
+  facet.set_limit(-1);
+  facet.set_mincount(0);
+
+  lreq->engine.submit(*lreq, true);
+
+  ASSERT_EQ(1, lreq->responses.size()) << lreq->toString();
+  ASSERT_FALSE(lreq->responses[0]->proto.has_error()) << lreq->toString();
+  const auto& facetResult = lreq->responses[0]->proto.ops().at("q").docs().ops().at("f").facet();
+  ASSERT_EQ(3, facetResult.bucket_ids().col_s().v_size()) << lreq->toString();
+  ASSERT_EQ(3, facetResult.counts_size());
+  EXPECT_EQ("x", facetResult.bucket_ids().col_s().v(0));
+  EXPECT_EQ(2, facetResult.counts(0));
+  EXPECT_EQ("y", facetResult.bucket_ids().col_s().v(1));
+  EXPECT_EQ(0, facetResult.counts(1));
+  EXPECT_EQ("z", facetResult.bucket_ids().col_s().v(2));
+  EXPECT_EQ(0, facetResult.counts(2));
+
+  lreq->done();
+}
+
+TEST_F(FacetTest, stringFacetMincountZeroPadsToFiniteLimit) {
+  CollectionHelper helper;
+  helper.clear();
+  helper.index(flatdoc("id", "1", "cat_s", "a", "sel_s", "yes"), UpdateMessage::NO_COMMIT);
+  helper.index(flatdoc("id", "2", "cat_s", "a", "sel_s", "yes"), UpdateMessage::NO_COMMIT);
+  helper.index(flatdoc("id", "3", "cat_s", "b", "sel_s", "yes"), UpdateMessage::NO_COMMIT);
+  helper.index(flatdoc("id", "4", "cat_s", "c", "sel_s", "no"), UpdateMessage::NO_COMMIT);
+  helper.index(flatdoc("id", "5", "cat_s", "d", "sel_s", "no"), UpdateMessage::NO_COMMIT);
+  helper.index(flatdoc("id", "6", "cat_s", "e", "sel_s", "no"), UpdateMessage::COMMIT);
+
+  auto* lreq = LocalReq::create(soluxNode->getSearchEngine());
+  lreq->proto.mutable_collection()->add_name("main");
+  lreq->proto.set_request_id("test_string_facet_mincount_zero_finite_limit");
+
+  auto& topDocs = *(*lreq->proto.mutable_ops())["q"].mutable_top_docs();
+  topDocs.set_get_number(true);
+  auto& match = *topDocs.mutable_query()->mutable_match();
+  match.set_field("sel_s");
+  match.mutable_val()->set_s("yes");
+
+  auto& facet = *(*topDocs.mutable_ops())["f"].mutable_field_facet();
+  facet.set_field("cat_s");
+  facet.set_limit(4);
+  facet.set_mincount(0);
+
+  lreq->engine.submit(*lreq, true);
+
+  ASSERT_EQ(1, lreq->responses.size()) << lreq->toString();
+  ASSERT_FALSE(lreq->responses[0]->proto.has_error()) << lreq->toString();
+  const auto& facetResult = lreq->responses[0]->proto.ops().at("q").docs().ops().at("f").facet();
+  ASSERT_EQ(4, facetResult.bucket_ids().col_s().v_size()) << lreq->toString();
+  ASSERT_EQ(4, facetResult.counts_size());
+  EXPECT_EQ("a", facetResult.bucket_ids().col_s().v(0));
+  EXPECT_EQ(2, facetResult.counts(0));
+  EXPECT_EQ("b", facetResult.bucket_ids().col_s().v(1));
+  EXPECT_EQ(1, facetResult.counts(1));
+  EXPECT_EQ("c", facetResult.bucket_ids().col_s().v(2));
+  EXPECT_EQ(0, facetResult.counts(2));
+  EXPECT_EQ("d", facetResult.bucket_ids().col_s().v(3));
+  EXPECT_EQ(0, facetResult.counts(3));
+
+  lreq->done();
+}
+
+TEST_F(FacetTest, fullTextFacetMincountZeroShowsOutOfDomainTerms) {
+  CollectionHelper helper;
+  helper.clear();
+  helper.index(flatdoc("id", "1", "sel_s", "yes", "body_w", "alpha beta"), UpdateMessage::NO_COMMIT);
+  helper.index(flatdoc("id", "2", "sel_s", "yes", "body_w", "alpha"), UpdateMessage::NO_COMMIT);
+  helper.index(flatdoc("id", "3", "sel_s", "no", "body_w", "gamma"), UpdateMessage::NO_COMMIT);
+  helper.index(flatdoc("id", "4", "sel_s", "no", "body_w", "delta"), UpdateMessage::COMMIT);
+
+  auto* lreq = LocalReq::create(soluxNode->getSearchEngine());
+  lreq->proto.mutable_collection()->add_name("main");
+  lreq->proto.set_request_id("test_full_text_facet_mincount_zero");
+
+  auto& topDocs = *(*lreq->proto.mutable_ops())["q"].mutable_top_docs();
+  topDocs.set_get_number(true);
+  auto& match = *topDocs.mutable_query()->mutable_match();
+  match.set_field("sel_s");
+  match.mutable_val()->set_s("yes");
+
+  auto& facet = *(*topDocs.mutable_ops())["f"].mutable_field_facet();
+  facet.set_field("body_w");
+  facet.set_limit(-1);
+  facet.set_mincount(0);
+
+  lreq->engine.submit(*lreq, true);
+
+  ASSERT_EQ(1, lreq->responses.size()) << lreq->toString();
+  ASSERT_FALSE(lreq->responses[0]->proto.has_error()) << lreq->toString();
+  const auto& facetResult = lreq->responses[0]->proto.ops().at("q").docs().ops().at("f").facet();
+  ASSERT_EQ(4, facetResult.bucket_ids().col_s().v_size()) << lreq->toString();
+  ASSERT_EQ(4, facetResult.counts_size());
+  EXPECT_EQ("alpha", facetResult.bucket_ids().col_s().v(0));
+  EXPECT_EQ(2, facetResult.counts(0));
+  EXPECT_EQ("beta", facetResult.bucket_ids().col_s().v(1));
+  EXPECT_EQ(1, facetResult.counts(1));
+  EXPECT_EQ("delta", facetResult.bucket_ids().col_s().v(2));
+  EXPECT_EQ(0, facetResult.counts(2));
+  EXPECT_EQ("gamma", facetResult.bucket_ids().col_s().v(3));
+  EXPECT_EQ(0, facetResult.counts(3));
 
   lreq->done();
 }

@@ -2,6 +2,7 @@
 
 #include <variant>
 #include <boost/unordered/unordered_flat_map.hpp>
+#include <boost/unordered/unordered_flat_set.hpp>
 #include "FacetEmit.h"
 #include "FacetOp.h"
 #include "SkinnyCounter.h"
@@ -446,11 +447,8 @@ public:
         auto* skinnyCounts = std::get_if<SkinnyCounter8>(&mergedData->counts);
         auto* vecCounts   = std::get_if<MergeableStrData::CountVector>(&mergedData->counts);
         std::vector<std::pair<int64_t, int64_t>> ordCounts;
-        // Floor at 1: count facets never emit zero-count buckets.  This also
-        // makes the result independent of the storage representation - a dense
-        // CountVector/SkinnyCounter has a slot per global ord, so mincount==0
-        // would otherwise leak zero-count buckets (and duplicate the zeroed
-        // skinny overflow ords) that the sparse OrdHash never produces.
+        // Collect nonzero counts first. Explicit mincount=0 pads zero-count
+        // buckets after sorting/truncating the competitive nonzero buckets.
         auto min = std::max<int64_t>(thisOp().minCount, 1);
 
         if (mapCounts) {
@@ -495,6 +493,24 @@ public:
         missing_count = mergedData->missing_num;
 
         sortByCountDescAndLimit(ordCounts, limit);
+        bool showZeros = (thisOp().minCount == 0);
+        if (showZeros) {
+          int64_t numOrds = thisOp().ordMap ? thisOp().ordMap->numOrds() : 0;
+          int64_t target = (limit < 0) ? numOrds : limit;
+          if ((int64_t)ordCounts.size() < target) {
+            boost::unordered_flat_set<int64_t> present;
+            present.reserve(ordCounts.size());
+            for (auto& [ord, count] : ordCounts) {
+              unused(count);
+              present.insert(ord);
+            }
+            for (int64_t ord = 0; ord < numOrds && (int64_t)ordCounts.size() < target; ord++) {
+              if (!present.contains(ord)) {
+                ordCounts.emplace_back(ord, 0);
+              }
+            }
+          }
+        }
         countVec.reserve(ordCounts.size());
         auto poolGuard = MemPool::threadLocalPoolGuard();
         OrdMapStr ordMapStr(poolGuard.pool(), thisOp().ordMap.get(), *thisOp().req.reader, thisOp().fieldName);

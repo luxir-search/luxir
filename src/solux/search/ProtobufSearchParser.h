@@ -92,6 +92,9 @@ public:
         if (rangeFtype->type() == FieldType::FLOAT || rangeFtype->type() == FieldType::DOUBLE) {
           throw std::runtime_error("Range facet over float/double field not yet supported: " + std::string(facetField));
         }
+        if (facetReq.has_mincount() && facetReq.mincount() < 1) {
+          throw std::runtime_error("facet '" + std::string(name) + "': mincount < 1 (zero-count buckets) is not supported for range facets");
+        }
         if (facetReq.ops_size() > 0 || facetReq.sorts_size() > 0) {
           throw std::runtime_error("facet '" + std::string(name) + "': sub-ops/sorts are not yet supported for range facets");
         }
@@ -137,6 +140,9 @@ public:
     FacetReq* facet = nullptr;
     switch (ftype->type()) {
       case FieldType::Type::INT: {
+        if (facetReq.has_mincount() && facetReq.mincount() < 1) {
+          throw std::runtime_error("facet '" + std::string(facetName) + "': mincount < 1 (zero-count buckets) is not supported for int field facets");
+        }
         if (facetReq.ops_size() > 0 || facetReq.sorts_size() > 0) {
           throw std::runtime_error("facet '" + std::string(facetName) + "': sub-ops/sorts are not yet supported for int field facets");
         }

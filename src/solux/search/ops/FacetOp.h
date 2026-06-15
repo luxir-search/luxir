@@ -501,7 +501,7 @@ public:
           count++;
         }
         // use heterogeneous lookup in the future to avoid creating string when not needed
-        if (count > 0) {
+        if (count > 0 || thisOp().minCount == 0) {
           counts[(std::string) (std::string_view) tenum.term()] += count;
         }
       }
