@@ -1562,6 +1562,28 @@ protected:
     return vals;
   }
 
+  // Fill a query: 80% a match on a present-enough string field, else match-all.
+  // Multi-valued string fields are fine - matchesQuery matches if ANY value
+  // equals, mirroring the engine.
+  static void makeRandomQuery(Rng& rng, proto::Query* query, const std::vector<FieldDef>& fields) {
+    if (rng.rint(100) < 80 && !fields.empty()) {
+      std::vector<int> candidateFields;
+      for (int idx = 0; idx < (int)fields.size(); idx++) {
+        if (!fields[idx].isInt && fields[idx].sparsityPercent >= 50) {
+          candidateFields.push_back(idx);
+        }
+      }
+      if (!candidateFields.empty()) {
+        const auto& qf = fields[candidateFields[rng.rint((int)candidateFields.size())]];
+        auto& matchQuery = *query->mutable_match();
+        matchQuery.set_field(qf.name);
+        matchQuery.mutable_val()->set_s("v" + std::to_string(rng.rint(qf.numUniqueValues)));
+        return;
+      }
+    }
+    query->set_all(true);
+  }
+
   // Generate a random facet configuration directly on the protobuf
   static void generateRandomFacet(Rng& rng, proto::FieldFacet* facet, const FieldDef& field) {
     facet->set_field(field.name);
@@ -1666,50 +1688,32 @@ public:
             lreq->proto.set_request_id("random_test_" + std::to_string(iteration) + "_" + std::to_string(testNum));
         
             auto& ops = *lreq->proto.mutable_ops();
-            
-            // Create a query operation
-            auto& topDocs = *ops["q"].mutable_top_docs();
-            topDocs.set_get_number(true);
-            
-            // Generate query directly: 80% match query, 20% all query
-            proto::Query* query = topDocs.mutable_query();
-            if (localRng.rint(100) < 80 && !fields.empty()) {
-              // Only use string fields for match queries
-              std::vector<int> candidateFields;
-              for (int idx = 0; idx < (int)fields.size(); idx++) {
-                if (!fields[idx].isInt && fields[idx].sparsityPercent >= 50) {
-                  candidateFields.push_back(idx);
+
+            // Issue several top_docs queries (each its own domain) per request and
+            // facet a random subset of fields under each, so the SAME field is often
+            // faceted under several different domains in one request.  This amortizes
+            // the expensive index build over many cheap facet computations and
+            // stresses the concurrent merge/completion paths.
+            int numQueries = 1 + localRng.rint(3);  // 1..3
+            for (int qi = 0; qi < numQueries; qi++) {
+              auto& topDocs = *ops["q" + std::to_string(qi)].mutable_top_docs();
+              topDocs.set_get_number(true);
+              makeRandomQuery(localRng, topDocs.mutable_query(), fields);
+              for (size_t f = 0; f < fields.size(); f++) {
+                if (localRng.rint(100) < 70) {
+                  auto& facet = *(*topDocs.mutable_ops())["f" + std::to_string(f)].mutable_field_facet();
+                  generateRandomFacet(localRng, &facet, fields[f]);
                 }
               }
-              
-              if (!candidateFields.empty()) {
-                int queryFieldIdx = candidateFields[localRng.rint((int)candidateFields.size())];
-                const auto& queryField = fields[queryFieldIdx];
-                auto& matchQuery = *query->mutable_match();
-                matchQuery.set_field(queryField.name);
-                int valueIdx = localRng.rint(queryField.numUniqueValues);
-                matchQuery.mutable_val()->set_s("v" + std::to_string(valueIdx));
-              } else {
-                query->set_all(true);
-              }
-            } else {
-              query->set_all(true);
             }
-
-            // Decide on root vs nested facets
-            bool useRootFacets = localRng.rint(100) < 10;
-            
-            // Get reference to the correct ops map (root level or under query)
-            auto* opsMap = useRootFacets ? &ops : topDocs.mutable_ops();
-            
-            LOG_TRACE("Creating {} facets, root={}", fields.size(), useRootFacets);
-            for (size_t f = 0; f < fields.size(); f++) {
-              const auto& field = fields[f];
-              std::string facetName = "f" + std::to_string(f);
-            
-              // Generate facet directly in the ops map
-              auto& facet = *(*opsMap)[facetName].mutable_field_facet();
-              generateRandomFacet(localRng, &facet, field);
+            // Occasionally also facet at the root (whole-index / livedocs domain).
+            if (localRng.rint(100) < 20) {
+              for (size_t f = 0; f < fields.size(); f++) {
+                if (localRng.rint(100) < 50) {
+                  auto& facet = *ops["rf" + std::to_string(f)].mutable_field_facet();
+                  generateRandomFacet(localRng, &facet, fields[f]);
+                }
+              }
             }
         
             // Execute the request
@@ -1728,103 +1732,50 @@ public:
             // Process all operations to calculate expected results
             model.processOps(lreq->proto.ops(), expectedResponse->mutable_ops());
             
-            // Now verify each facet result against expected values
-            // Iterate over the ops map we populated with facets
-            for (const auto& [facetName, searchOp] : *opsMap) {
-              // Skip non-facet operations (like the query itself if at root level)
-              if (!searchOp.has_field_facet()) {
-                continue;
-              }
-              
-              // Get expected result from our calculated response
-              const proto::Val* expectedVal = nullptr;
-              if (useRootFacets) {
-                // Root-level facet
-                if (expectedResponse->ops().contains(facetName)) {
-                  expectedVal = &expectedResponse->ops().at(facetName);
-                }
+            // Compare one facet result (buckets + counts + missing) against the model.
+            auto verifyOneFacet = [&](const std::string& ctx, const proto::FieldFacet& ff,
+                                      const proto::FacetResult& actual, const proto::FacetResult& expected) {
+              if (expected.bucket_ids().has_col_i()) {
+                ASSERT_TRUE(actual.bucket_ids().has_col_i()) << "expected int buckets: " << ctx << "\n" << lreq->toString();
+                const auto& a = actual.bucket_ids().col_i();
+                const auto& e = expected.bucket_ids().col_i();
+                ASSERT_EQ(a.v_size(), e.v_size()) << "bucket count: " << ctx << "\n" << lreq->toString();
+                for (int i = 0; i < a.v_size(); i++) EXPECT_EQ(a.v(i), e.v(i)) << "bucket " << i << " value: " << ctx;
               } else {
-                // Nested facet under query
-                if (expectedResponse->ops().contains("q") && 
-                    expectedResponse->ops().at("q").has_docs() &&
-                    expectedResponse->ops().at("q").docs().ops().contains(facetName)) {
-                  expectedVal = &expectedResponse->ops().at("q").docs().ops().at(facetName);
-                }
+                ASSERT_TRUE(actual.bucket_ids().has_col_s()) << "expected string buckets: " << ctx << "\n" << lreq->toString();
+                const auto& a = actual.bucket_ids().col_s();
+                const auto& e = expected.bucket_ids().col_s();
+                ASSERT_EQ(a.v_size(), e.v_size()) << "bucket count: " << ctx << "\n" << lreq->toString();
+                for (int i = 0; i < a.v_size(); i++) EXPECT_EQ(a.v(i), e.v(i)) << "bucket " << i << " value: " << ctx;
               }
-              
-              ASSERT_TRUE(expectedVal != nullptr && expectedVal->has_facet())
-                << "Expected facet result not found for " << facetName;
-              const auto& expectedFacet = expectedVal->facet();
-              
-              // Extract actual facet result
-              const proto::FacetResult* actualFacet = nullptr;
-              
-              if (useRootFacets) {
-                // Check root-level operations
-                if (response.ops().contains(facetName)) {
-                  actualFacet = &response.ops().at(facetName).facet();
-                }
-              } else {
-                // Check nested operations under query - access through docs().ops()
-                if (response.ops().contains("q") && 
-                    response.ops().at("q").has_docs() &&
-                    response.ops().at("q").docs().ops().contains(facetName)) {
-                  actualFacet = &response.ops().at("q").docs().ops().at(facetName).facet();
-                }
-              }
-              
-              ASSERT_TRUE(actualFacet != nullptr) 
-                << "Iteration " << iteration << ", test " << testNum 
-                << ", facet " << facetName << " - Facet not found in response"
-                << " (useRootFacets=" << useRootFacets << ")";
-              
-              // Verify bucket IDs and counts
-              if (expectedFacet.bucket_ids().has_col_i()) {
-                ASSERT_TRUE(actualFacet->bucket_ids().has_col_i())
-                  << "Expected integer buckets for field " << std::string(searchOp.field_facet().field());
-                
-                const auto& actualBuckets = actualFacet->bucket_ids().col_i();
-                const auto& expectedBuckets = expectedFacet.bucket_ids().col_i();
-                ASSERT_EQ(actualBuckets.v_size(), expectedBuckets.v_size())
-                  << "Mismatch in number of buckets for facet " << facetName;
-                
-                for (int i = 0; i < actualBuckets.v_size(); i++) {
-                  if (actualBuckets.v(i) != expectedBuckets.v(i)) {
-                    EXPECT_EQ(actualBuckets.v(i), expectedBuckets.v(i))  // place breakpoint here
-                    << "Bucket " << i << " value mismatch for facet " << facetName;
+              ASSERT_EQ(actual.counts_size(), expected.counts_size()) << "counts size: " << ctx;
+              for (int i = 0; i < expected.counts_size(); i++)
+                EXPECT_EQ(actual.counts(i), expected.counts(i)) << "count " << i << ": " << ctx;
+              if (ff.missing()) { EXPECT_EQ(actual.missing(), expected.missing()) << "missing: " << ctx; }
+            };
+
+            // Walk the request ops and verify every facet at its path: root facets,
+            // facets under each top_docs query, and (recursively) deeper nesting.
+            using OpMap = google::protobuf::Map<std::string, proto::SearchOp>;
+            using ValMap = google::protobuf::Map<std::string, proto::Val>;
+            std::function<void(const OpMap&, const ValMap&, const ValMap&, const std::string&)> verifyOps =
+              [&](const OpMap& reqOps, const ValMap& actualOps, const ValMap& expectedOps, const std::string& path) {
+                for (const auto& [name, op] : reqOps) {
+                  if (op.has_field_facet()) {
+                    std::string ctx = path + name + " (field " + std::string(op.field_facet().field()) + ")";
+                    ASSERT_TRUE(expectedOps.contains(name) && expectedOps.at(name).has_facet()) << "expected facet missing: " << ctx;
+                    ASSERT_TRUE(actualOps.contains(name) && actualOps.at(name).has_facet())
+                      << "actual facet missing: " << ctx << "\n" << lreq->toString();
+                    verifyOneFacet(ctx, op.field_facet(), actualOps.at(name).facet(), expectedOps.at(name).facet());
+                  } else if (op.has_top_docs() && op.top_docs().ops_size() > 0) {
+                    ASSERT_TRUE(actualOps.contains(name) && actualOps.at(name).has_docs()) << "actual docs missing: " << path + name << "\n" << lreq->toString();
+                    ASSERT_TRUE(expectedOps.contains(name) && expectedOps.at(name).has_docs()) << "expected docs missing: " << path + name;
+                    verifyOps(op.top_docs().ops(), actualOps.at(name).docs().ops(), expectedOps.at(name).docs().ops(), path + name + "/");
                   }
                 }
-              } else {
-                ASSERT_TRUE(actualFacet->bucket_ids().has_col_s())
-                  << "Expected string buckets for field " << std::string(searchOp.field_facet().field());
-                
-                const auto& actualBuckets = actualFacet->bucket_ids().col_s();
-                const auto& expectedBuckets = expectedFacet.bucket_ids().col_s();
-                ASSERT_EQ(actualBuckets.v_size(), expectedBuckets.v_size())
-                  << "Mismatch in number of buckets for facet " << facetName;
-                
-                for (int i = 0; i < actualBuckets.v_size(); i++) {
-                  EXPECT_EQ(actualBuckets.v(i), expectedBuckets.v(i))
-                    << "Bucket " << i << " value mismatch for facet " << facetName;
-                }
-              }
-              
-              // Verify counts
-              ASSERT_EQ(actualFacet->counts_size(), expectedFacet.counts_size())
-                << "Mismatch in number of counts for facet " << facetName;
-              
-              for (int i = 0; i < expectedFacet.counts_size(); i++) {
-                EXPECT_EQ(actualFacet->counts(i), expectedFacet.counts(i))
-                  << "Count mismatch for bucket " << i << " in facet " << facetName;
-              }
-              
-              // Verify missing count if requested
-              if (searchOp.field_facet().missing()) {
-                EXPECT_EQ(actualFacet->missing(), expectedFacet.missing())
-                  << "Missing count mismatch for facet " << facetName;
-              }
-            }
-            
+              };
+            verifyOps(lreq->proto.ops(), response.ops(), expectedResponse->ops(), "");
+
             // Clean up the arena
             releaseArena(arena);
             
@@ -1838,5 +1789,8 @@ public:
 
 
 TEST_F(RandomFacetTest, randomFaceting) {
-  runRandomTest(12, 120);  // 12 indexes, 120 requests per index = 1440 requests, one facet per field
+  // Index build dominates cost, so amortize it: fewer indexes, many more
+  // requests, each issuing several queries x a facet per field (many facet
+  // computations, the same field faceted under multiple domains).
+  runRandomTest(8, 400);
 }
