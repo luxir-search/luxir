@@ -1208,6 +1208,7 @@ protected:
   struct FieldDef {
     std::string name;
     bool isInt;
+    bool isText = false;  // _w text field (single token; modeled like _s)
     bool multiValued;
     int numUniqueValues;
     int maxValuesPerDoc;
@@ -1796,8 +1797,8 @@ protected:
     if (rng.rint(100) < 80 && !fields.empty()) {
       std::vector<int> candidateFields;
       for (int idx = 0; idx < (int)fields.size(); idx++) {
-        if (!fields[idx].isInt && fields[idx].sparsityPercent >= 50) {
-          candidateFields.push_back(idx);
+        if (!fields[idx].isInt && !fields[idx].isText && fields[idx].sparsityPercent >= 50) {
+          candidateFields.push_back(idx);  // match on plain string fields only
         }
       }
       if (!candidateFields.empty()) {
@@ -1850,7 +1851,7 @@ protected:
     // Sub-ops only on string/id facets (parser rejects them on int/range/text)
     // and only at the top level (bounds nesting). May attach several at once:
     // 1-2 avgs (distinct always-present int fields) and/or a sub-facet.
-    if (depth == 0 && !field.isInt) {
+    if (depth == 0 && !field.isInt && !field.isText) {
       bool wantAvg = rng.rint(100) < 45;
       bool wantSubFacet = rng.rint(100) < 25;
       if ((wantAvg || wantSubFacet) && facet->has_mincount() && facet->mincount() == 0) {
@@ -1871,7 +1872,7 @@ protected:
       if (wantSubFacet) {
         std::vector<int> strFields;
         for (int i = 0; i < (int)allFields.size(); i++)
-          if (!allFields[i].isInt) strFields.push_back(i);
+          if (!allFields[i].isInt && !allFields[i].isText) strFields.push_back(i);  // string sub-facets only
         if (!strFields.empty()) {
           const auto& sf = allFields[strFields[rng.rint((int)strFields.size())]];
           generateRandomFacet(rng, (*facet->mutable_ops())["sf"].mutable_field_facet(), sf, allFields, depth + 1);
@@ -1892,7 +1893,7 @@ public:
       std::vector<FieldDef> fields;
       for (int i = 0; i < NUM_FIELDS; i++) {
         FieldDef field;
-        int kind = i % 4;
+        int kind = i % 5;
         if (kind == 0) {
           field.name = "field" + std::to_string(i) + "_i";
           field.isInt = true;
@@ -1905,10 +1906,16 @@ public:
           field.name = "field" + std::to_string(i) + "_is";
           field.isInt = true;
           field.multiValued = true;
-        } else {
+        } else if (kind == 3) {
           field.name = "field" + std::to_string(i) + "_ss";
           field.isInt = false;
           field.multiValued = true;
+        } else {
+          // text field, single token per doc (modeled like a single-valued _s).
+          field.name = "field" + std::to_string(i) + "_w";
+          field.isInt = false;
+          field.isText = true;
+          field.multiValued = false;
         }
         field.maxValuesPerDoc = field.multiValued ? 2 + rng.rint(3) : 1;
         int cardClass = i % 3;
