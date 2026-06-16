@@ -1221,16 +1221,21 @@ protected:
   class Model {
   public:
     std::vector<Doc> docs;
-    
+    std::vector<char> deleted;  // parallel to docs; deleted docs are not live
+
     void addDoc(const Doc& doc) {
       docs.push_back(doc);
+      deleted.push_back(0);
     }
-    
+
+    void markDeleted(size_t i) { deleted[i] = 1; }
+    bool isDeleted(size_t i) const { return i < deleted.size() && deleted[i]; }
+
     std::vector<size_t> allDocIndexes() const {
       std::vector<size_t> out;
       out.reserve(docs.size());
       for (size_t i = 0; i < docs.size(); i++) {
-        out.push_back(i);
+        if (!isDeleted(i)) out.push_back(i);  // root domain = live docs
       }
       return out;
     }
@@ -1239,7 +1244,7 @@ protected:
       std::vector<size_t> out;
       out.reserve(docs.size());
       for (size_t i = 0; i < docs.size(); i++) {
-        if (matchesQuery(docs[i], query)) {
+        if (!isDeleted(i) && matchesQuery(docs[i], query)) {  // query domain is live-filtered
           out.push_back(i);
         }
       }
@@ -2011,7 +2016,23 @@ public:
       
       // Build index with parallel segment construction
       buildRandomIndex(helper, model, rng, fields, maxSegments, maxDocsPerSegment);
-      
+
+      // On ~half the indexes, delete a random subset of docs so facet domains
+      // are live-filtered (non-null liveDocs at root, intersected under queries).
+      if (rng.rint(100) < 50) {
+        std::vector<std::string> toDelete;
+        for (size_t d = 0; d < model.docs.size(); d++) {
+          if (rng.rint(100) < 15) {
+            if (auto* id = find(model.docs[d], "id"))
+              if (auto* s = std::get_if<std::string>(id)) {
+                toDelete.push_back(*s);
+                model.markDeleted(d);
+              }
+          }
+        }
+        if (!toDelete.empty()) helper.deleteByIds(toDelete, UpdateMessage::COMMIT);
+      }
+
       // Run multiple random facet tests on this index in parallel
       int numParallelTests = requestsPerIndex;
       
