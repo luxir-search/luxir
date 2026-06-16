@@ -6,6 +6,7 @@
 #include "FacetEmit.h"
 #include "FacetOp.h"
 #include "SkinnyCounter.h"
+#include "solux/util/SegmentMergeDriver.h"
 
 namespace solux {
 
@@ -173,27 +174,31 @@ public:
 
   class Calc : public Calculator {
     std::vector<DocSet*> input;
-    AtomicMerger<MergeableStrData> countMerger;
-    AtomicMerger<MergeableStrFacetInline> inlineMerger;
+    // The request-wide task group (RootOp passes req.tg to every segment's
+    // calc()), stashed so the driver completion handlers -- which need a tg to
+    // launch per-bucket sub-op work but run from inside the driver, not calc()
+    // -- can reach it.  All segments share one pointer; atomic only to keep
+    // the concurrent same-value writes data-race-free under TSan.
+    std::atomic<oneapi::tbb::task_group*> requestTg{nullptr};
+    SegmentMergeDriver<MergeableStrData> driver;
+    SegmentMergeDriver<MergeableStrFacetInline> inlineDriver;
   public:
-    Calc(SearchOp& op, Calculator* parent, int64_t slot, int64_t numSlots) : Calculator(op, parent, slot, numSlots) {
+    Calc(SearchOp& op, Calculator* parent, int64_t slot, int64_t numSlots)
+      : Calculator(op, parent, slot, numSlots),
+        driver(op.req.reader->segments().size(),
+               [this](std::unique_ptr<MergeableStrData> m){ facetResult(requestTg.load(), std::move(m)); }),
+        inlineDriver(op.req.reader->segments().size(),
+                     [this](std::unique_ptr<MergeableStrFacetInline> m){ facetResult2(requestTg.load(), std::move(m)); }) {
       input.resize(op.req.reader->segments().size());
-
-
-
-
-      inlineMerger.creator = [this]() {
+      inlineDriver.setCreator([this]() {
         auto* p = new MergeableStrFacetInline;
-
         for (auto& [key, subop] : thisOp().inlineSubOps) {
           auto* calc = subop->createInlineCalculator(this, -1, -1);
           p->inlineCalcs.push_back(calc);
-
         }
-
         p->counts.calcs = p->inlineCalcs;
         return p;
-      };
+      });
     }
 
     StrFacetOp& thisOp() {
@@ -211,11 +216,10 @@ public:
       //TODO: need to account for slot somehow,  or will subop do that?
     };
     void calc(oneapi::tbb::task_group* tg, int32_t segnum, DocSet* domain) override {
-      // Handle empty index case
+      requestTg.store(tg, std::memory_order_relaxed);
       if (segnum == -1) {
-        // Empty index - just generate empty result
-        std::unique_ptr<MergeableStrData> mergeableData(countMerger.obtain());
-        facetResult(tg, std::move(mergeableData));
+        // Empty index - emit an empty (non-inline) result, matching prior behavior.
+        driver.completeEmpty();
         return;
       }
 
@@ -229,188 +233,148 @@ public:
     };
 
     void calc2(oneapi::tbb::task_group* tg, int32_t segnum, DocSet* domain) {
-      std::unique_ptr<MergeableStrFacetInline> mergeableData(inlineMerger.obtain());
-      for (auto* calc : mergeableData->inlineCalcs) {
-        calc->startSeg(segnum);
-      }
-      input[segnum] = domain;
-      SegFieldInfo segFieldInfo;
-      PostingsReader& postingsReader = thisOp().reader.segments()[segnum].postingsReader();
-      auto poolGuard = MemPool::threadLocalPoolGuard();
+      unused(tg);  // completion uses requestTg via the driver
+      inlineDriver.contribute([&](MergeableStrFacetInline& data) {
+        for (auto* calc : data.inlineCalcs) {
+          calc->startSeg(segnum);
+        }
+        input[segnum] = domain;
+        SegFieldInfo segFieldInfo;
+        PostingsReader& postingsReader = thisOp().reader.segments()[segnum].postingsReader();
+        auto poolGuard = MemPool::threadLocalPoolGuard();
 
-      FieldReader fieldReader(poolGuard.pool(), postingsReader);
-      std::optional<TermsEnum> tenum;
-      bool found = fieldReader.seek(thisOp().fieldName);
-      if (found) {
-        fieldReader.readFieldInfo(segFieldInfo);
-        tenum.emplace(poolGuard.pool(), postingsReader, segFieldInfo);
-      }
-      int64_t missing_num = 0;
-      auto& facetReq = (FacetReq&)getOp();
-      facetReq.facetSegIntCol(domain, segnum, missing_num, segFieldInfo,
-        [&](int32_t docid, int64_t val)SOLUX_INLINE {
-          tenum->seekOrd(val - 1);
-        std::string_view termView = (std::string_view) tenum->term();
-          mergeableData->counts.add((std::string) termView, docid);
-        });
+        FieldReader fieldReader(poolGuard.pool(), postingsReader);
+        std::optional<TermsEnum> tenum;
+        bool found = fieldReader.seek(thisOp().fieldName);
+        if (found) {
+          fieldReader.readFieldInfo(segFieldInfo);
+          tenum.emplace(poolGuard.pool(), postingsReader, segFieldInfo);
+        }
+        int64_t missing_num = 0;
+        auto& facetReq = (FacetReq&)getOp();
+        facetReq.facetSegIntCol(domain, segnum, missing_num, segFieldInfo,
+          [&](int32_t docid, int64_t val)SOLUX_INLINE {
+            tenum->seekOrd(val - 1);
+            std::string_view termView = (std::string_view) tenum->term();
+            data.counts.add((std::string) termView, docid);
+          });
 
-      mergeableData->missing_num += missing_num;
-
-      auto merged = inlineMerger.release(mergeableData.release());
-      if ((size_t)merged == thisOp().reader.segments().size()) {
-        facetResult2(tg, std::unique_ptr<MergeableStrFacetInline>(inlineMerger.obtain()));
-      }
+        data.missing_num += missing_num;
+      });
     }
 
     void calcOrdMap(oneapi::tbb::task_group* tg, int32_t segnum, DocSet* domain) {
-      //write only to different slots, so no need to synchronize
-      input[segnum] = domain;
-      SegFieldInfo segFieldInfo;
-      auto& postingsReader = thisOp().reader.segments()[segnum].postingsReader();
-      int32_t maxDoc = postingsReader.maxDoc();
-      auto poolGuard = MemPool::threadLocalPoolGuard();
-      FieldReader fieldReader(poolGuard.pool(), postingsReader);
-      bool found = fieldReader.seek(thisOp().fieldName);
-      std::unique_ptr<MergeableStrData> mergeableData(countMerger.obtain());
-      if (!found) {
-        if (domain) {
-          mergeableData->missing_num += domain->card();
-        } else {
-          mergeableData->missing_num += maxDoc;
+      unused(tg);  // completion uses requestTg via the driver
+      driver.contribute([&](MergeableStrData& data) {
+        //write only to different slots, so no need to synchronize
+        input[segnum] = domain;
+        SegFieldInfo segFieldInfo;
+        auto& postingsReader = thisOp().reader.segments()[segnum].postingsReader();
+        int32_t maxDoc = postingsReader.maxDoc();
+        auto poolGuard = MemPool::threadLocalPoolGuard();
+        FieldReader fieldReader(poolGuard.pool(), postingsReader);
+        bool found = fieldReader.seek(thisOp().fieldName);
+        if (!found) {
+          data.missing_num += domain ? domain->card() : maxDoc;
+          return; // field not found, but still a contribution (driver releases)
         }
-        auto merged = countMerger.release(mergeableData.release());
-        if ((size_t)merged == thisOp().reader.segments().size()) {
-          facetResult(tg, std::unique_ptr<MergeableStrData>(countMerger.obtain()));
+        fieldReader.readFieldInfo(segFieldInfo);
+
+        auto* countVec = std::get_if<MergeableStrData::CountVector>(&data.counts);
+        auto* countMap = std::get_if<MergeableStrData::OrdHash>(&data.counts);
+        auto* countSkinny = std::get_if<SkinnyCounter8>(&data.counts);
+
+        int32_t domainSize = domain ? domain->card() : maxDoc;
+        int64_t globVals = thisOp().ordMap ? thisOp().ordMap->numOrds() : segFieldInfo.nTerms;
+
+        // want a vector of global ords if the domain size is much larger than the number of unique values
+        // such that a skinny counter would have many overflows.
+        bool wantVec = (domainSize >> 8) >= globVals;
+
+        // if the number of unique values is large compared to the domain size, we want to use a hashmap
+        bool wantHash = (globVals >> 6) >= domainSize;
+
+        // skinny is the default in the middle.
+        bool wantSkinny = !wantVec && !wantHash;
+
+        // A segment that finished before us may have chosen a smaller storage
+        // type (hashmap or skinny).  If we want a larger one we upgrade IN
+        // PLACE: snapshot the existing counts, rebuild data.counts as the new
+        // representation, then fold the old counts back in.  The driver owns
+        // the object across the merge, so (unlike the old swap-a-fresh-object
+        // code) there is no releaseCount to carry by hand; missing_num stays in
+        // data because we move only the counts variant out.
+        std::optional<MergeableStrData> oldData;
+        if ((wantVec && (countMap || countSkinny))
+          || (wantSkinny && countMap)) {
+          oldData.emplace();
+          oldData->counts = std::move(data.counts);
+          data.counts.emplace<std::monostate>();
+          countMap = nullptr;
+          countSkinny = nullptr;
         }
-        return; // field not found, nothing to do
-      }
-      fieldReader.readFieldInfo(segFieldInfo);
 
-      auto* countVec = std::get_if<MergeableStrData::CountVector>(&mergeableData->counts);
-      auto* countMap = std::get_if<MergeableStrData::OrdHash>(&mergeableData->counts);
-      auto* countSkinny = std::get_if<SkinnyCounter8>(&mergeableData->counts);
-
-      int32_t domainSize = domain ? domain->card() : maxDoc;
-      int64_t globVals = thisOp().ordMap ? thisOp().ordMap->numOrds() : segFieldInfo.nTerms;
-
-      // want a vector of global ords if the domain size is much larger than the number of unique values
-      // such that a skinny counter would have many overflows.
-      bool wantVec = (domainSize >> 8) >= globVals;
-
-      // if the number of unique values is large compared to the domain size, we want to use a hashmap
-      bool wantHash = (globVals >> 6) >= domainSize;
-
-      // skinny is the default in the middle.
-      bool wantSkinny = !wantVec && !wantHash;
-
-      // A segment that finished before us may have chosen a different storage type.
-      // If they chose a larger storage type (vector or skinny), then we should stick
-      // with that.  If they chose a smaller storage type (hashmap or skinny), then we
-      // can upgrade.  We do the upgrade by pretending we don't have any storage yet
-      // and then merging the old storage into the new storage we create.
-      std::unique_ptr<MergeableStrData> oldMergeableData;
-      if ((wantVec && (countMap || countSkinny))
-        || (wantSkinny && countMap)) {
-        std::swap(mergeableData, oldMergeableData);
-        mergeableData.reset(countMerger.creator()); // create new empty storage
-        mergeableData->releaseCount = oldMergeableData->releaseCount;  // carry over the release count.
-        countMap = nullptr;
-        countSkinny = nullptr;
-      }
-
-      if (!countVec && !countMap && !countSkinny) {
-        if (wantVec) {
-          mergeableData->counts.emplace<MergeableStrData::CountVector>();
-          countVec = &std::get<MergeableStrData::CountVector>(mergeableData->counts);
-          if (countVec->empty()) {
-            countVec->resize(globVals);
-          }
-        } else if (wantHash) {
-          mergeableData->counts.emplace<MergeableStrData::OrdHash>();
-          countMap = &std::get<MergeableStrData::OrdHash>(mergeableData->counts);
-        } else if (wantSkinny) {
-          mergeableData->counts.emplace<SkinnyCounter8>(globVals);
-          countSkinny = &std::get<SkinnyCounter8>(mergeableData->counts);
-        }
-      }
-
-      if (oldMergeableData) {
-        auto* result = MergeableStrData::merge(mergeableData.get(), oldMergeableData.get());
-        // result should always be the new one we created.
-        assert(result == mergeableData.get());
-        oldMergeableData.reset();  // free up memory from the original one.
-      }
-
-
-      int64_t missing_num = 0;
-      auto& facetReq = (FacetReq&)getOp();
-      MonoReader* deltas = nullptr;
-      if (thisOp().ordMap) {
-        auto segtoGlobal = thisOp().ordMap->getSegToGlobal(segnum);
-        deltas = segtoGlobal.deltas;
-      }
-
-      // if we want a vector, then there are enough repeats that we should collect
-      // local counts first and then only convert to global ords once.
-      if (countVec) {
-        // TODO: we have a countVec, but if we wanted a map, that means we should
-        // probably not do 2 pass.  Unclear how often this will happen.
-        // NOTE: skip 2 phase if the ords for this segment are the same as global ords!
-
-        // for single-valued, we could get away with int32_t
-        std::vector<int64_t> localCounts(segFieldInfo.nTerms);
-        facetReq.facetSegIntCol(domain, segnum, missing_num, segFieldInfo,
-          [&](int32_t docid, int64_t ord) SOLUX_INLINE {
-            unused(docid);
-            ord--; // ordMap is zero-based, int columns are one-based
-            localCounts[ord]++;
-          });
-
-        for (size_t i = 0; i < localCounts.size(); i++) {
-          auto count = localCounts[i];
-          auto ord = i;
-          if (count > 0) {
-            if (deltas) {
-              ord += deltas->valueAt(ord);
+        if (!countVec && !countMap && !countSkinny) {
+          if (wantVec) {
+            data.counts.emplace<MergeableStrData::CountVector>();
+            countVec = &std::get<MergeableStrData::CountVector>(data.counts);
+            if (countVec->empty()) {
+              countVec->resize(globVals);
             }
-            (*countVec)[ord] += count;
+          } else if (wantHash) {
+            data.counts.emplace<MergeableStrData::OrdHash>();
+            countMap = &std::get<MergeableStrData::OrdHash>(data.counts);
+          } else if (wantSkinny) {
+            data.counts.emplace<SkinnyCounter8>(globVals);
+            countSkinny = &std::get<SkinnyCounter8>(data.counts);
           }
         }
 
-      } else if (countMap) {
-        facetReq.facetSegIntCol(domain, segnum, missing_num, segFieldInfo,
-          [&](int32_t docid, int64_t ord) SOLUX_INLINE {
-            unused(docid);
-            ord--; // ordMap is zero-based, int columns are one-based
-            if (deltas) {
-              ord += deltas->valueAt(ord);
-            }
-            (*countMap)[ord]++;
-          });
-      } else {
-        assert(countSkinny);
-        // If localords != globalOrds and expected number of repeats per value is > 2, use a local skinny counter first
-        // and convert to global ords on overflow.
-        if (deltas && domainSize >= (segFieldInfo.nTerms >> 1)) {
-          std::vector<uint8_t> localCounts(segFieldInfo.nTerms);
+        if (oldData) {
+          // Fold the old (smaller) representation into data's new (larger) one.
+          // The upgrade-to-larger invariant guarantees merge returns data.
+          auto* result = MergeableStrData::merge(&data, &*oldData);
+          assert(result == &data);
+          unused(result);
+        }
+
+
+        int64_t missing_num = 0;
+        auto& facetReq = (FacetReq&)getOp();
+        MonoReader* deltas = nullptr;
+        if (thisOp().ordMap) {
+          auto segtoGlobal = thisOp().ordMap->getSegToGlobal(segnum);
+          deltas = segtoGlobal.deltas;
+        }
+
+        // if we want a vector, then there are enough repeats that we should collect
+        // local counts first and then only convert to global ords once.
+        if (countVec) {
+          // TODO: we have a countVec, but if we wanted a map, that means we should
+          // probably not do 2 pass.  Unclear how often this will happen.
+          // NOTE: skip 2 phase if the ords for this segment are the same as global ords!
+
+          // for single-valued, we could get away with int32_t
+          std::vector<int64_t> localCounts(segFieldInfo.nTerms);
           facetReq.facetSegIntCol(domain, segnum, missing_num, segFieldInfo,
             [&](int32_t docid, int64_t ord) SOLUX_INLINE {
               unused(docid);
               ord--; // ordMap is zero-based, int columns are one-based
-              if (++localCounts[ord] == 0) {
-                ord += deltas->valueAt(ord);  // convert to global ord
-                countSkinny->increment(ord, std::numeric_limits<uint8_t>::max() + 1);
-              }
+              localCounts[ord]++;
             });
+
           for (size_t i = 0; i < localCounts.size(); i++) {
             auto count = localCounts[i];
+            auto ord = i;
             if (count > 0) {
-              int64_t ord = i + deltas->valueAt(i);  // convert to global ord
-              countSkinny->increment(ord, count);
+              if (deltas) {
+                ord += deltas->valueAt(ord);
+              }
+              (*countVec)[ord] += count;
             }
           }
-        } else {
-          // Not many repeats expected, so just collect global ords directly.
+
+        } else if (countMap) {
           facetReq.facetSegIntCol(domain, segnum, missing_num, segFieldInfo,
             [&](int32_t docid, int64_t ord) SOLUX_INLINE {
               unused(docid);
@@ -418,16 +382,45 @@ public:
               if (deltas) {
                 ord += deltas->valueAt(ord);
               }
-              countSkinny->increment(ord);
+              (*countMap)[ord]++;
             });
+        } else {
+          assert(countSkinny);
+          // If localords != globalOrds and expected number of repeats per value is > 2, use a local skinny counter first
+          // and convert to global ords on overflow.
+          if (deltas && domainSize >= (segFieldInfo.nTerms >> 1)) {
+            std::vector<uint8_t> localCounts(segFieldInfo.nTerms);
+            facetReq.facetSegIntCol(domain, segnum, missing_num, segFieldInfo,
+              [&](int32_t docid, int64_t ord) SOLUX_INLINE {
+                unused(docid);
+                ord--; // ordMap is zero-based, int columns are one-based
+                if (++localCounts[ord] == 0) {
+                  ord += deltas->valueAt(ord);  // convert to global ord
+                  countSkinny->increment(ord, std::numeric_limits<uint8_t>::max() + 1);
+                }
+              });
+            for (size_t i = 0; i < localCounts.size(); i++) {
+              auto count = localCounts[i];
+              if (count > 0) {
+                int64_t ord = i + deltas->valueAt(i);  // convert to global ord
+                countSkinny->increment(ord, count);
+              }
+            }
+          } else {
+            // Not many repeats expected, so just collect global ords directly.
+            facetReq.facetSegIntCol(domain, segnum, missing_num, segFieldInfo,
+              [&](int32_t docid, int64_t ord) SOLUX_INLINE {
+                unused(docid);
+                ord--; // ordMap is zero-based, int columns are one-based
+                if (deltas) {
+                  ord += deltas->valueAt(ord);
+                }
+                countSkinny->increment(ord);
+              });
+          }
         }
-      }
-      mergeableData->missing_num += missing_num;
-
-      auto merged = countMerger.release(mergeableData.release());
-      if ((size_t)merged == thisOp().reader.segments().size()) {
-        facetResult(tg, std::unique_ptr<MergeableStrData>(countMerger.obtain()));
-      }
+        data.missing_num += missing_num;
+      });
     }
 
     void facetResult(oneapi::tbb::task_group* tg, std::unique_ptr<MergeableStrData> mergedData) {
