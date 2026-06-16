@@ -1,10 +1,9 @@
 #pragma once
-#include <limits>
-
 #include "SearchOp.h"
 #include "solux/reader/FieldReader.h"
 #include "solux/reader/IntColReader.h"
 #include "solux/util/AtomicMerger.h"
+#include "solux/util/SegmentMergeDriver.h"
 #include "solux/util/NumericUtils.h"
 
 namespace solux {
@@ -47,7 +46,7 @@ public:
     }
   };
   class Calc : public Calculator {
-    AtomicMerger<MergeableSum> sumMerger;
+    SegmentMergeDriver<MergeableSum> driver;
 
     void emitResult(double avg) {
       auto* myVal = getTarget(nullptr, [&](solux::proto::Val& val) {
@@ -69,7 +68,13 @@ public:
 
   public:
     Calc(SearchOp& op, Calculator* parent, int64_t slot, int64_t numSlots)
-      : Calculator(op, parent, slot, numSlots) {
+      : Calculator(op, parent, slot, numSlots),
+        driver(op.req.reader->segments().size(), [this](std::unique_ptr<MergeableSum> m) {
+          // one of sum/dsum is always 0 (a field is either int or floating); an
+          // empty index / no-value field gives 0/0 == NaN, matching the prior
+          // empty-index behavior.
+          emitResult(((double) m->sum + m->dsum) / (double) m->count);
+        }) {
     }
     AvgOp& thisOp() {
       return (AvgOp&)getOp();
@@ -79,81 +84,60 @@ public:
     void calc(oneapi::tbb::task_group* tg, int32_t segnum, DocSet* domain) override {
       //LOG_DEBUG("calc AvgOp: this={} segnum={}, domain={} slot={}", (void*)this, segnum, (void*)domain, slot);
       if (segnum == -1) {
-        double kNaN = std::numeric_limits<double>::quiet_NaN();
-        emitResult(kNaN);
+        driver.completeEmpty();
         return;
       }
-
-      std::unique_ptr<MergeableSum> mergeableData(sumMerger.obtain());
-      SegFieldInfo segFieldInfo;
-      int64_t sum = 0;
-      double dsum = 0;
-      int64_t count = 0;
-      bool floating = thisOp().isFloating();
-
-      auto& postingsReader = thisOp().req.reader->segments()[segnum].postingsReader();
-      int32_t maxDoc = postingsReader.maxDoc();
-      auto poolGuard = MemPool::threadLocalPoolGuard();
-      FieldReader fieldReader(poolGuard.pool(), postingsReader);
-      bool found = fieldReader.seek(thisOp().fieldName);
-      if (!found) {
-        auto merged = sumMerger.release(mergeableData.release());
-        checkCompletion(merged);
-        return;
-      }
-      fieldReader.readFieldInfo(segFieldInfo);
-      // this is a int field for now, so we need to read the value for each doc
-      // and accumulate counts per value.
-      IntColReader intColReader(postingsReader, segFieldInfo);
-      IntColReader::Iterator intColIter(intColReader);
-      for (int32_t docid = 0; docid < maxDoc; docid++) {
-        if (domain && !domain->get(docid)) {
-          continue;
+      driver.contribute([&](MergeableSum& data) {
+        SegFieldInfo segFieldInfo;
+        bool floating = thisOp().isFloating();
+        auto& postingsReader = thisOp().req.reader->segments()[segnum].postingsReader();
+        int32_t maxDoc = postingsReader.maxDoc();
+        auto poolGuard = MemPool::threadLocalPoolGuard();
+        FieldReader fieldReader(poolGuard.pool(), postingsReader);
+        if (!fieldReader.seek(thisOp().fieldName)) {
+          return; // no value for this field in this segment; still a contribution
         }
-        if (intColIter.docId() < docid ) {
-          intColIter.advance(docid);
-        }
-        if (intColIter.docId() == docid) {
-          if (!intColReader.multiValued()) {
-            auto val = intColIter.value();
-            if (floating) {
-              dsum += thisOp().decodeDouble(val);
-            } else {
-              sum += val;
-            }
-            count++;
-          } else {
-            auto [start, end] = intColReader.getStartEndValueRank(intColIter.rank());
-            auto n = end - start;
-            for (int64_t vrank = 0; vrank < n; vrank++) {
-              auto val = intColIter.values().valueAt(start + vrank);
+        fieldReader.readFieldInfo(segFieldInfo);
+        IntColReader intColReader(postingsReader, segFieldInfo);
+        IntColReader::Iterator intColIter(intColReader);
+        int64_t sum = 0;
+        double dsum = 0;
+        int64_t count = 0;
+        for (int32_t docid = 0; docid < maxDoc; docid++) {
+          if (domain && !domain->get(docid)) {
+            continue;
+          }
+          if (intColIter.docId() < docid ) {
+            intColIter.advance(docid);
+          }
+          if (intColIter.docId() == docid) {
+            if (!intColReader.multiValued()) {
+              auto val = intColIter.value();
               if (floating) {
                 dsum += thisOp().decodeDouble(val);
               } else {
                 sum += val;
               }
               count++;
+            } else {
+              auto [start, end] = intColReader.getStartEndValueRank(intColIter.rank());
+              auto n = end - start;
+              for (int64_t vrank = 0; vrank < n; vrank++) {
+                auto val = intColIter.values().valueAt(start + vrank);
+                if (floating) {
+                  dsum += thisOp().decodeDouble(val);
+                } else {
+                  sum += val;
+                }
+                count++;
+              }
             }
           }
         }
-      }
-      mergeableData->sum += sum;
-      mergeableData->dsum += dsum;
-      mergeableData->count += count;
-      auto merged = sumMerger.release(mergeableData.release());
-      checkCompletion(merged);
-    }
-
-    void checkCompletion(int64_t merged) {
-      if ((size_t)merged == thisOp().req.reader->segments().size()) {
-        std::unique_ptr<MergeableSum> mergeableData(sumMerger.obtain());
-        auto sum = mergeableData->sum;
-        auto dsum = mergeableData->dsum;
-        auto count = mergeableData->count;
-        // one of sum/dsum is always 0 (a field is either int or floating)
-        double avg = ((double) sum + dsum) / (double) count;
-        emitResult(avg);
-      }
+        data.sum += sum;
+        data.dsum += dsum;
+        data.count += count;
+      });
     }
   };
 
