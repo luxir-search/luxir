@@ -1387,6 +1387,8 @@ protected:
         if (searchOp.has_field_facet()) {
           // Process field facet - facets at root level operate on all documents
           (*responseOps)[opName] = calculateFieldFacet(searchOp.field_facet(), allDocs);
+        } else if (searchOp.has_range_facet()) {
+          (*responseOps)[opName] = calculateRangeFacet(searchOp.range_facet(), allDocs);
         } else if (searchOp.has_top_docs()) {
           // Process top docs query (which may have nested ops)
           const auto& topDocs = searchOp.top_docs();
@@ -1422,6 +1424,8 @@ protected:
         if (searchOp.has_field_facet()) {
           // Nested facet uses the domain query from its parent
           (*responseOps)[opName] = calculateFieldFacet(searchOp.field_facet(), domainDocs);
+        } else if (searchOp.has_range_facet()) {
+          (*responseOps)[opName] = calculateRangeFacet(searchOp.range_facet(), domainDocs);
         } else if (searchOp.has_top_docs()) {
           // Nested top_docs would combine its query with the domain query
           // This is more complex and would need proper query combination logic
@@ -1618,8 +1622,50 @@ protected:
 
       return result;
     }
+
+    // Expected result for an int range facet. Buckets are nonzero only, in
+    // bucket-index order; out-of-range values are dropped (not missing);
+    // missing = domain docs with no int value for the field.
+    proto::Val calculateRangeFacet(const proto::RangeFacet& rf,
+                                   const std::vector<size_t>& domainDocs) const {
+      proto::Val result;
+      auto* fr = result.mutable_facet();
+      std::string fieldName(rf.field());
+      int64_t start = rf.start();
+      int64_t end = rf.end();
+      int64_t gap = rf.has_gap() ? rf.gap() : 1;
+      if (gap <= 0) gap = 1;
+      int64_t minCount = rf.has_mincount() ? rf.mincount() : -1;  // engine: unset == -1
+
+      std::map<int64_t, int64_t> bucketCounts;  // bucket index -> count (ascending)
+      int64_t missingCount = 0;
+      std::vector<const FieldVal*> vals;
+      for (auto docIdx : domainDocs) {
+        findAll(docs[docIdx], fieldName, vals);
+        bool hasField = false;
+        for (auto* p : vals) {
+          if (auto* iv = std::get_if<int64_t>(p)) {
+            hasField = true;
+            int64_t v = *iv;
+            if (v < start || v >= end) continue;  // out of range -> dropped
+            bucketCounts[(v - start) / gap]++;
+          }
+        }
+        if (!hasField) missingCount++;
+      }
+      auto* multiI = fr->mutable_bucket_ids()->mutable_multi_i();
+      for (auto [k, count] : bucketCounts) {
+        if (minCount != -1 && count < minCount) continue;
+        auto* pair = multiI->add_v();
+        pair->add_v(start + k * gap);
+        pair->add_v(std::min(start + (k + 1) * gap, end));
+        fr->add_counts(count);
+      }
+      if (rf.missing()) fr->set_missing(missingCount);
+      return result;
+    }
   };
-  
+
   // Build index with random data using parallel segment construction
   void buildRandomIndex(CollectionHelper& helper, Model& model, Rng& rng,
                        const std::vector<FieldDef>& fields,
@@ -1812,6 +1858,36 @@ protected:
     query->set_all(true);
   }
 
+  // Random int range facet (start may be negative, end may exceed the value
+  // range, gap may not divide evenly -> exercises out-of-range and partial
+  // buckets). Range rejects mincount<1 and float/double, so unset or >=1.
+  static void generateRandomRangeFacet(Rng& rng, proto::RangeFacet* rf, const FieldDef& field) {
+    rf->set_field(field.name);
+    int n = field.numUniqueValues;
+    int64_t start = (int64_t)rng.rint(std::max(3, n / 2 + 3)) - 2;  // [-2, ...)
+    int64_t end = start + 1 + rng.rint(n + 4);                      // > start
+    int64_t gap = 1 + rng.rint(std::max(1, n / 3));                 // >= 1
+    rf->set_start(start);
+    rf->set_end(end);
+    rf->set_gap(gap);
+    int mc = rng.rint(3);
+    if (mc == 1) rf->set_mincount(1);
+    else if (mc == 2) rf->set_mincount(2);
+    rf->set_missing(rng.rbool());
+  }
+
+  // Add a facet op for `field` under `ops` as `name`: an int field becomes a
+  // range facet ~40% of the time, else a field facet.
+  static void addFacetOp(Rng& rng, google::protobuf::Map<std::string, proto::SearchOp>* ops,
+                         const std::string& name, const FieldDef& field,
+                         const std::vector<FieldDef>& allFields) {
+    if (field.isInt && rng.rint(100) < 40) {
+      generateRandomRangeFacet(rng, (*ops)[name].mutable_range_facet(), field);
+    } else {
+      generateRandomFacet(rng, (*ops)[name].mutable_field_facet(), field, allFields);
+    }
+  }
+
   // Generate a random facet configuration directly on the protobuf. depth>0 is
   // a sub-facet (no further sub-ops, and no mincount=0, to bound the space).
   static void generateRandomFacet(Rng& rng, proto::FieldFacet* facet, const FieldDef& field,
@@ -1967,8 +2043,7 @@ public:
               makeRandomQuery(localRng, topDocs.mutable_query(), fields);
               for (size_t f = 0; f < fields.size(); f++) {
                 if (localRng.rint(100) < 70) {
-                  auto& facet = *(*topDocs.mutable_ops())["f" + std::to_string(f)].mutable_field_facet();
-                  generateRandomFacet(localRng, &facet, fields[f], fields);
+                  addFacetOp(localRng, topDocs.mutable_ops(), "f" + std::to_string(f), fields[f], fields);
                 }
               }
             }
@@ -1976,8 +2051,7 @@ public:
             if (localRng.rint(100) < 20) {
               for (size_t f = 0; f < fields.size(); f++) {
                 if (localRng.rint(100) < 50) {
-                  auto& facet = *ops["rf" + std::to_string(f)].mutable_field_facet();
-                  generateRandomFacet(localRng, &facet, fields[f], fields);
+                  addFacetOp(localRng, &ops, "rf" + std::to_string(f), fields[f], fields);
                 }
               }
             }
@@ -2060,6 +2134,25 @@ public:
                     ASSERT_TRUE(actualOps.contains(name) && actualOps.at(name).has_facet())
                       << "actual facet missing: " << ctx << "\n" << lreq->toString();
                     verifyOneFacet(ctx, op.field_facet(), actualOps.at(name).facet(), expectedOps.at(name).facet());
+                  } else if (op.has_range_facet()) {
+                    std::string ctx = path + name + " (range " + std::string(op.range_facet().field()) + ")";
+                    ASSERT_TRUE(expectedOps.contains(name) && expectedOps.at(name).has_facet()) << "expected range missing: " << ctx;
+                    ASSERT_TRUE(actualOps.contains(name) && actualOps.at(name).has_facet())
+                      << "actual range missing: " << ctx << "\n" << lreq->toString();
+                    const auto& af = actualOps.at(name).facet();
+                    const auto& ef = expectedOps.at(name).facet();
+                    const auto& ab = af.bucket_ids().multi_i();
+                    const auto& eb = ef.bucket_ids().multi_i();
+                    ASSERT_EQ(ab.v_size(), eb.v_size()) << "range bucket count: " << ctx << "\n" << lreq->toString();
+                    for (int i = 0; i < eb.v_size(); i++) {
+                      ASSERT_EQ(2, ab.v(i).v_size()) << ctx;
+                      EXPECT_EQ(eb.v(i).v(0), ab.v(i).v(0)) << "range[" << i << "] lo: " << ctx;
+                      EXPECT_EQ(eb.v(i).v(1), ab.v(i).v(1)) << "range[" << i << "] hi: " << ctx;
+                    }
+                    ASSERT_EQ(af.counts_size(), ef.counts_size()) << "range counts size: " << ctx;
+                    for (int i = 0; i < ef.counts_size(); i++)
+                      EXPECT_EQ(af.counts(i), ef.counts(i)) << "range count " << i << ": " << ctx;
+                    if (op.range_facet().missing()) { EXPECT_EQ(af.missing(), ef.missing()) << "range missing: " << ctx; }
                   } else if (op.has_top_docs() && op.top_docs().ops_size() > 0) {
                     ASSERT_TRUE(actualOps.contains(name) && actualOps.at(name).has_docs()) << "actual docs missing: " << path + name << "\n" << lreq->toString();
                     ASSERT_TRUE(expectedOps.contains(name) && expectedOps.at(name).has_docs()) << "expected docs missing: " << path + name;
