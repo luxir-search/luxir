@@ -431,8 +431,18 @@ public:
     }
 
     void facetResult(oneapi::tbb::task_group* tg, std::unique_ptr<MergeableStrData> mergedData) {
-      auto* myVal = getTarget(nullptr);
-      solux::proto::FacetResult& facetResultProto = *myVal->mutable_facet();
+      auto* myVal = getTarget(nullptr, [&](solux::proto::Val& val) {
+        if (slot >= 0) {
+          // sub-facet: this Val is shared by all parent buckets, so index by
+          // slot into a per-bucket array (parallel to the parent bucket_ids),
+          // sized once under the mutex like AvgOp's arr_d.
+          auto& arr = *val.mutable_arr();
+          while (arr.v_size() < (int)numSlots) arr.add_v();
+        }
+      });
+      solux::proto::FacetResult& facetResultProto = slot >= 0
+        ? *(*myVal->mutable_arr()->mutable_v())[slot].mutable_facet()
+        : *myVal->mutable_facet();
       auto limit = thisOp().limit;
       auto missing = thisOp().missing;
 
@@ -533,8 +543,15 @@ public:
 
 
     void facetResult2(oneapi::tbb::task_group* tg, std::unique_ptr<MergeableStrFacetInline> mergedData) {
-      auto* myVal = getTarget(nullptr);
-      solux::proto::FacetResult& facetResultProto = *myVal->mutable_facet();
+      auto* myVal = getTarget(nullptr, [&](solux::proto::Val& val) {
+        if (slot >= 0) {
+          auto& arr = *val.mutable_arr();
+          while (arr.v_size() < (int)numSlots) arr.add_v();
+        }
+      });
+      solux::proto::FacetResult& facetResultProto = slot >= 0
+        ? *(*myVal->mutable_arr()->mutable_v())[slot].mutable_facet()
+        : *myVal->mutable_facet();
       auto minCount = thisOp().minCount;
       auto limit = thisOp().limit;
       auto missing = thisOp().missing;

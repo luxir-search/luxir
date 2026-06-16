@@ -1153,6 +1153,48 @@ TEST_F(FacetTest, facetAvgFieldAbsentInSegment) {
   lreq->done();
 }
 
+// Nested facet: a string facet under a string facet, returning a per-parent-
+// bucket sub-facet (ops[name].arr.v[i].facet parallel to bucket_ids).
+TEST_F(FacetTest, nestedStringFacet) {
+  CollectionHelper helper; helper.clear();
+  helper.index(flatdoc("id", "1", "cat_s", "x", "sub_s", "p"), UpdateMessage::NO_COMMIT);
+  helper.index(flatdoc("id", "2", "cat_s", "x", "sub_s", "q"), UpdateMessage::NO_COMMIT);
+  helper.index(flatdoc("id", "3", "cat_s", "y", "sub_s", "p"), UpdateMessage::COMMIT);
+
+  auto* lreq = LocalReq::create(soluxNode->getSearchEngine());
+  lreq->proto.mutable_collection()->add_name("main");
+  auto& topDocs = *(*lreq->proto.mutable_ops())["q"].mutable_top_docs();
+  topDocs.mutable_query()->set_all(true);
+  auto& facet = *(*topDocs.mutable_ops())["f"].mutable_field_facet();
+  facet.set_field("cat_s");
+  facet.set_limit(-1);
+  auto& sub = *(*facet.mutable_ops())["sf"].mutable_field_facet();
+  sub.set_field("sub_s");
+  sub.set_limit(-1);
+  lreq->engine.submit(*lreq, true);
+
+  ASSERT_FALSE(lreq->responses[0]->proto.has_error()) << lreq->toString();
+  const auto& f = lreq->responses[0]->proto.ops().at("q").docs().ops().at("f").facet();
+  ASSERT_EQ(2, f.bucket_ids().col_s().v_size()) << lreq->toString();
+  EXPECT_EQ("x", f.bucket_ids().col_s().v(0));  // x(2), y(1): count desc
+  EXPECT_EQ("y", f.bucket_ids().col_s().v(1));
+  const auto& sfArr = f.ops().at("sf").arr();
+  ASSERT_EQ(2, sfArr.v_size()) << lreq->toString();  // one sub-facet per parent bucket
+  // bucket x = docs {1,2} -> sub_s {p:1, q:1}
+  const auto& sfx = sfArr.v(0).facet();
+  ASSERT_EQ(2, sfx.bucket_ids().col_s().v_size()) << lreq->toString();
+  EXPECT_EQ("p", sfx.bucket_ids().col_s().v(0));
+  EXPECT_EQ("q", sfx.bucket_ids().col_s().v(1));
+  EXPECT_EQ(1, sfx.counts(0));
+  EXPECT_EQ(1, sfx.counts(1));
+  // bucket y = doc {3} -> sub_s {p:1}
+  const auto& sfy = sfArr.v(1).facet();
+  ASSERT_EQ(1, sfy.bucket_ids().col_s().v_size()) << lreq->toString();
+  EXPECT_EQ("p", sfy.bucket_ids().col_s().v(0));
+  EXPECT_EQ(1, sfy.counts(0));
+  lreq->done();
+}
+
 //
 // Comprehensive random faceting test class
 //
