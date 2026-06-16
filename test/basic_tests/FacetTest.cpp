@@ -1463,24 +1463,27 @@ protected:
       bool isIntField = fieldName.ends_with("_i") || fieldName.ends_with("_is");
       bool showZeros = !isIntField && hasMin && facetOp.mincount() == 0;
 
-      // avg() sub-op detection (string/id facets only; the parser rejects it on
-      // int/range/text). The buckets may also be sorted by it.
-      std::string avgOpName, avgField;
+      // avg() sub-ops (string/id parent only; the parser rejects sub-ops on
+      // int/range/text). There can be several; at most one is the sort key.
+      struct AvgOpDef { std::string name, field; };
+      std::vector<AvgOpDef> avgOps;
       for (const auto& [opName, sub] : facetOp.ops()) {
         if (sub.has_gen_op() && (sub.gen_op().name() == "avg" || sub.gen_op().name() == "average")) {
-          avgOpName = opName;
-          avgField = sub.gen_op().args(0).s();
-          break;
+          avgOps.push_back({opName, std::string(sub.gen_op().args(0).s())});
         }
       }
-      bool hasAvg = !avgOpName.empty();
-      bool sortByAvg = hasAvg && facetOp.sorts_size() > 0 && facetOp.sorts(0).field() == avgOpName;
-      bool avgDesc = sortByAvg && facetOp.sorts(0).dir() == proto::SortSpec_SortDir_DESC;
+      bool hasAvg = !avgOps.empty();
+      int sortAvgIdx = -1;  // index into avgOps of the sort key, or -1
+      if (facetOp.sorts_size() > 0) {
+        for (size_t k = 0; k < avgOps.size(); k++)
+          if (avgOps[k].name == facetOp.sorts(0).field()) { sortAvgIdx = (int)k; break; }
+      }
+      bool avgDesc = sortAvgIdx >= 0 && facetOp.sorts(0).dir() == proto::SortSpec_SortDir_DESC;
 
       // Count values for documents matching the domain query
       boost::unordered_flat_map<int64_t, int64_t> intCounts;
       boost::unordered_flat_map<std::string, int64_t> strCounts;
-      boost::unordered_flat_map<std::string, int64_t> strAvgSum; // per-bucket sum of avgField (hasAvg)
+      boost::unordered_flat_map<std::string, std::vector<int64_t>> strAvgSums; // bucket -> sum per avgOp
       int64_t missingCount = 0;
       
       std::vector<const FieldVal*> vals;
@@ -1497,12 +1500,10 @@ protected:
       
       for (auto docIdx : domainDocs) {
         const auto& doc = docs[docIdx];
-        int64_t av = 0;
-        if (hasAvg) {
-          if (auto* p = find(doc, avgField)) {
-            if (auto* iv = std::get_if<int64_t>(p)) av = *iv;
-          }
-        }
+        std::vector<int64_t> avs(avgOps.size(), 0);  // this doc's value per avgOp field
+        for (size_t k = 0; k < avgOps.size(); k++)
+          if (auto* p = find(doc, avgOps[k].field))
+            if (auto* iv = std::get_if<int64_t>(p)) avs[k] = *iv;
         findAll(doc, fieldName, vals);
         bool hasField = false;
         for (auto* val : vals) {
@@ -1514,7 +1515,11 @@ protected:
           } else {
             if (auto* strVal = std::get_if<std::string>(val)) {
               strCounts[*strVal]++;
-              if (hasAvg) strAvgSum[*strVal] += av;
+              if (hasAvg) {
+                auto& sums = strAvgSums[*strVal];
+                if (sums.empty()) sums.resize(avgOps.size(), 0);
+                for (size_t k = 0; k < avgOps.size(); k++) sums[k] += avs[k];
+              }
               hasField = true;
             }
           }
@@ -1533,17 +1538,18 @@ protected:
           facetResult->add_counts(count);
         }
       } else if (hasAvg) {
-        // avgval_i is always present, so every bucket has count avg values and
-        // avg = avgSum/count (no empty bucket -> no 0.0-vs-NaN ambiguity).
-        struct B { std::string val; int64_t count; int64_t avgSum; };
+        // avg fields (avgval_i / avgval2_i) are always present, so every bucket
+        // has count values per avgOp and avg = sum/count (no empty-bucket
+        // 0.0-vs-NaN). One avgOp may be the sort key; the rest are annotations.
+        struct B { std::string val; int64_t count; std::vector<int64_t> sums; };
         std::vector<B> buckets;
         for (const auto& [val, count] : strCounts) {
-          if (count >= mincount) buckets.push_back({val, count, strAvgSum.at(val)});
+          if (count >= mincount) buckets.push_back({val, count, strAvgSums.at(val)});
         }
-        if (sortByAvg) {
-          std::sort(buckets.begin(), buckets.end(), [avgDesc](const B& a, const B& b) {
-            double aa = (double)a.avgSum / (double)a.count;
-            double ba = (double)b.avgSum / (double)b.count;
+        if (sortAvgIdx >= 0) {
+          std::sort(buckets.begin(), buckets.end(), [&](const B& a, const B& b) {
+            double aa = (double)a.sums[sortAvgIdx] / (double)a.count;
+            double ba = (double)b.sums[sortAvgIdx] / (double)b.count;
             if (aa != ba) return avgDesc ? aa > ba : aa < ba;
             return a.val < b.val; // tie-break by bucket value asc (matches facetResult2)
           });
@@ -1555,14 +1561,17 @@ protected:
         }
         if (limit >= 0 && (int64_t)buckets.size() > limit) buckets.resize(limit);
         auto* bucketIds = facetResult->mutable_bucket_ids()->mutable_col_s();
-        // Only emit the sub-op result when there are buckets: the engine's
-        // post-hoc path creates no ops entry for an empty facet.
-        auto* avgArr = buckets.empty() ? nullptr
-                       : (*facetResult->mutable_ops())[avgOpName].mutable_arr_d();
+        // Only emit sub-op results when there are buckets (the engine's post-hoc
+        // path creates no ops entry for an empty facet). One arr_d per avgOp.
+        std::vector<proto::ArrDouble*> avgArrs;
+        if (!buckets.empty())
+          for (const auto& ao : avgOps)
+            avgArrs.push_back((*facetResult->mutable_ops())[ao.name].mutable_arr_d());
         for (const auto& b : buckets) {
           bucketIds->add_v(b.val);
           facetResult->add_counts(b.count);
-          avgArr->add_v((double)b.avgSum / (double)b.count);
+          for (size_t k = 0; k < avgOps.size(); k++)
+            avgArrs[k]->add_v((double)b.sums[k] / (double)b.count);
         }
       } else {
         auto sorted = sortAndLimitFacets(strCounts, limit, showZeros ? 0 : mincount);
@@ -1657,11 +1666,13 @@ protected:
         
         // get IndexHandlers for the fields that exist in this segment
         auto* idHandler = &inverter.getIndexHandler("id");
-        // Dedicated avg-target: single-valued int, indexed for EVERY doc in
+        // Dedicated avg-targets: single-valued ints, indexed for EVERY doc in
         // every segment so an avg() sub-op never sees an empty bucket (which
         // would make the inline path report 0.0 but the post-hoc path NaN, and
-        // make sort-by-avg ill-defined).
+        // make sort-by-avg ill-defined). Two of them, to test multiple
+        // simultaneous avg sub-ops on different fields.
         auto* avgHandler = &inverter.getIndexHandler("avgval_i");
+        auto* avgHandler2 = &inverter.getIndexHandler("avgval2_i");
         boost::container::small_vector<Inverter::IndexHandler*,8> handlers(fields.size());
         for (size_t i = 0; i < fields.size(); i++) {
           if (fieldExists[i] < 5) {
@@ -1678,10 +1689,13 @@ protected:
           inverter.startDoc();
           idHandler->index(inverter, std::to_string(docId));
 
-          // Always-present avg target (see avgHandler above).
+          // Always-present avg targets (see avgHandler above).
           int64_t avgv = segRng.rint(1000);
           avgHandler->index(inverter, avgv);
           doc.push_back({"avgval_i", avgv});
+          int64_t avgv2 = segRng.rint(1000);
+          avgHandler2->index(inverter, avgv2);
+          doc.push_back({"avgval2_i", avgv2});
 
           // Add random field values
           for (size_t fieldIdx = 0; fieldIdx < fields.size(); fieldIdx++) {
@@ -1834,23 +1848,27 @@ protected:
     facet->set_missing(rng.rbool());
 
     // Sub-ops only on string/id facets (parser rejects them on int/range/text)
-    // and only at the top level (bounds nesting). Pick at most one of {avg,
-    // sub-facet}.
+    // and only at the top level (bounds nesting). May attach several at once:
+    // 1-2 avgs (distinct always-present int fields) and/or a sub-facet.
     if (depth == 0 && !field.isInt) {
-      int subChoice = rng.rint(100);
-      if (subChoice < 35) {
-        // avg() on the always-present avgval_i; avoid avg + mincount=0.
-        if (facet->has_mincount() && facet->mincount() == 0) facet->set_mincount(1);
-        auto& avg = *(*facet->mutable_ops())["av"].mutable_gen_op();
-        avg.set_name("avg");
-        avg.mutable_args()->Add()->set_s("avgval_i");
-        if (rng.rint(100) < 50) {
+      bool wantAvg = rng.rint(100) < 45;
+      bool wantSubFacet = rng.rint(100) < 25;
+      if ((wantAvg || wantSubFacet) && facet->has_mincount() && facet->mincount() == 0) {
+        facet->set_mincount(1);  // sub-ops + mincount=0 is an untested combo; avoid it
+      }
+      if (wantAvg) {
+        { auto& a = *(*facet->mutable_ops())["av"].mutable_gen_op();
+          a.set_name("avg"); a.mutable_args()->Add()->set_s("avgval_i"); }
+        bool twoAvgs = rng.rbool();
+        if (twoAvgs) { auto& a = *(*facet->mutable_ops())["av2"].mutable_gen_op();
+          a.set_name("avg"); a.mutable_args()->Add()->set_s("avgval2_i"); }
+        if (rng.rint(100) < 50) {  // sort by one of the avgs (at most one sort field)
           auto& sort = *facet->mutable_sorts()->Add();
-          sort.set_field("av");
+          sort.set_field((twoAvgs && rng.rbool()) ? "av2" : "av");
           sort.set_dir(rng.rbool() ? proto::SortSpec_SortDir_DESC : proto::SortSpec_SortDir_ASC);
         }
-      } else if (subChoice < 60) {
-        // Nested sub-facet on a random string field (no further nesting).
+      }
+      if (wantSubFacet) {
         std::vector<int> strFields;
         for (int i = 0; i < (int)allFields.size(); i++)
           if (!allFields[i].isInt) strFields.push_back(i);
