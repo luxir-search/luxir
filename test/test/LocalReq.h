@@ -85,12 +85,30 @@ public:
     return *this;
   }
 
-  // Add a phrase query to a top_docs operation
+  // Add a phrase query (un-analyzed word list) to a top_docs operation
   LocalReq& phraseQuery(std::string_view field, std::initializer_list<std::string> words, std::string_view opName = "q") {
     auto& query = *topDocs(opName).mutable_query()->mutable_phrase();
     query.set_field(field);
     for (const auto& word : words) {
       *query.mutable_words()->Add() = word;
+    }
+    return *this;
+  }
+
+  // Add a phrase query from a single un-analyzed text string (analyzed at query time)
+  LocalReq& phraseText(std::string_view field, std::string_view text, std::string_view opName = "q") {
+    auto& query = *topDocs(opName).mutable_query()->mutable_phrase();
+    query.set_field(field);
+    query.set_text(text);
+    return *this;
+  }
+
+  // Add a phrase query from a list of already-analyzed terms (used verbatim)
+  LocalReq& phraseTerms(std::string_view field, std::initializer_list<std::string> terms, std::string_view opName = "q") {
+    auto& query = *topDocs(opName).mutable_query()->mutable_phrase();
+    query.set_field(field);
+    for (const auto& term : terms) {
+      *query.mutable_terms()->Add() = term;
     }
     return *this;
   }

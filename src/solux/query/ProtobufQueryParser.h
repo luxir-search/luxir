@@ -1,6 +1,7 @@
 #pragma once
 
 #include "PhraseQuery.h"
+#include "QueryBuilder.h"
 #include "solux/query/Query.h"
 #include "solux/query/TermQuery.h"
 #include "solux/query/AllQuery.h"
@@ -63,35 +64,50 @@ public:
 
   solux::Query* parsePhrase(const solux::proto::PhraseQuery& phraseQuery) {
     std::string_view field = phraseQuery.field();
-    FieldType& fieldType = *schema.getFieldTypeEx(field);
-    if (fieldType.type() != FieldType::Type::TEXT) {
-      throw std::runtime_error(std::format("Phrase query on non-text field: {}", field));
-    }
+    QueryBuilder builder(pool, schema);
 
-    // PhraseQuery(std::string_view field, std::span<std::string_view> terms, std::span<int32_t> positions) : field(field),
+    std::span<const int32_t> positions(phraseQuery.positions().begin(),
+                                       (size_t)phraseQuery.positions().size());
 
-    auto sz = phraseQuery.words().size();
-
-    auto terms = pool.make_span<std::string_view>(sz);
-    std::span<const int32_t> positions(phraseQuery.positions().begin(), (size_t)phraseQuery.positions().size());
-
-    for (int i=0; i < sz; i++) {
-      terms[i] = phraseQuery.words(i);
-    }
-
-    if (positions.size() > 0 && positions.size() != sz) {
-      throw std::runtime_error(std::format("Phrase query positions size {} does not match words size {}", positions.size(), sz));
-    }
-
-    if (positions.empty()) {
-      auto pos = pool.make_span<int32_t>(sz);
-      for (int i=0; i<sz; i++) {
-        pos[i] = i;  // positions are just the index in the phrase
+    // Exactly one of text / words / terms / terms_bin is expected. text and
+    // words are un-analyzed (run through the field's analyzer here, at query
+    // time); terms and terms_bin are already analyzed and used verbatim. We
+    // only translate proto into primitives -- the builder owns the analysis and
+    // query-shape decisions so JSON / string parsers can share it.
+    if (!phraseQuery.text().empty()) {
+      if (!positions.empty()) {
+        throw std::runtime_error(
+          "Phrase query 'positions' cannot be combined with 'text' (positions come from analysis)");
       }
-      positions = pos;  // use the default positions
+      std::string_view text = phraseQuery.text();
+      return builder.createPhraseQuery(field, std::span<const std::string_view>(&text, 1));
+    }
+    if (!phraseQuery.words().empty()) {
+      // positions (when given) are one per word; the builder shifts them to
+      // absorb words that analyze to multiple tokens.
+      auto words = pool.make_span<std::string_view>(phraseQuery.words().size());
+      for (int i = 0; i < phraseQuery.words().size(); i++) {
+        words[i] = phraseQuery.words(i);
+      }
+      return builder.createPhraseQuery(field, words, positions);
+    }
+    if (!phraseQuery.terms().empty()) {
+      auto terms = pool.make_span<std::string_view>(phraseQuery.terms().size());
+      for (int i = 0; i < phraseQuery.terms().size(); i++) {
+        terms[i] = phraseQuery.terms(i);
+      }
+      return builder.createPhraseFromTerms(field, terms, positions);
+    }
+    if (!phraseQuery.terms_bin().empty()) {
+      auto terms = pool.make_span<std::string_view>(phraseQuery.terms_bin().size());
+      for (int i = 0; i < phraseQuery.terms_bin().size(); i++) {
+        terms[i] = phraseQuery.terms_bin(i);
+      }
+      return builder.createPhraseFromTerms(field, terms, positions);
     }
 
-    return pool.make<solux::PhraseQuery>(field, terms, positions);
+    // Nothing to match on.
+    return builder.matchNoDocs();
   }
 
 
