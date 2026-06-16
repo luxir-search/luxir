@@ -1578,14 +1578,34 @@ protected:
         facetResult->set_missing(missingCount);
       }
       
-      // Process any nested operations (sub-facets) if present
-      if (facetOp.ops_size() > 0) {
-        // For each bucket, calculate sub-operations with documents filtered to that bucket
-        // This would require creating a filtered domain for each bucket
-        // For now, leaving as TODO since it requires more complex domain filtering
-        // processOps(facetOp.ops(), facetResult->mutable_ops(), bucketSpecificQuery);
+      // Nested sub-facets (string/id parent only; the engine supports facet
+      // sub-ops there). One sub-facet per RETURNED bucket, parallel to
+      // bucket_ids: ops[name].arr.v[i].facet over that bucket's sub-domain.
+      if (!isIntField) {
+        std::vector<std::string> parentVals;
+        for (int i = 0; i < facetResult->bucket_ids().col_s().v_size(); i++)
+          parentVals.push_back(std::string(facetResult->bucket_ids().col_s().v(i)));
+        if (parentVals.empty()) return result;  // engine emits no sub-op for an empty parent
+        for (const auto& [opName, sub] : facetOp.ops()) {
+          if (!sub.has_field_facet()) continue;
+          auto* arr = (*facetResult->mutable_ops())[opName].mutable_arr();
+          for (const auto& bval : parentVals) {
+            std::vector<size_t> bucketDocs;
+            std::vector<const FieldVal*> bvals;
+            for (auto docIdx : domainDocs) {
+              findAll(docs[docIdx], fieldName, bvals);
+              for (auto* p : bvals) {
+                if (auto* s = std::get_if<std::string>(p); s && *s == bval) {
+                  bucketDocs.push_back(docIdx);
+                  break;
+                }
+              }
+            }
+            *arr->add_v() = calculateFieldFacet(sub.field_facet(), bucketDocs);
+          }
+        }
       }
-      
+
       return result;
     }
   };
@@ -1777,8 +1797,10 @@ protected:
     query->set_all(true);
   }
 
-  // Generate a random facet configuration directly on the protobuf
-  static void generateRandomFacet(Rng& rng, proto::FieldFacet* facet, const FieldDef& field) {
+  // Generate a random facet configuration directly on the protobuf. depth>0 is
+  // a sub-facet (no further sub-ops, and no mincount=0, to bound the space).
+  static void generateRandomFacet(Rng& rng, proto::FieldFacet* facet, const FieldDef& field,
+                                  const std::vector<FieldDef>& allFields, int depth = 0) {
     facet->set_field(field.name);
     
     // Random limit - avoid problematic edge cases for now
@@ -1798,8 +1820,8 @@ protected:
     int mincountChoice = rng.rint(field.isInt ? 4 : 5);
     if (mincountChoice == 0) {
       // unset: parser maps this to minCount=-1, effective min 1
-    } else if (!field.isInt && mincountChoice == 1) {
-      facet->set_mincount(0);  // string/id facets support zero-count buckets
+    } else if (!field.isInt && depth == 0 && mincountChoice == 1) {
+      facet->set_mincount(0);  // string/id facets support zero-count buckets (top-level only)
     } else if (mincountChoice == 2) {
       facet->set_mincount(2);
     } else if (mincountChoice == 3) {
@@ -1811,21 +1833,31 @@ protected:
     // Random missing
     facet->set_missing(rng.rbool());
 
-    // avg() sub-op on the always-present avgval_i. Only on string/id facets -
-    // the parser rejects sub-ops/sorts on int/range/text facets. Optionally
-    // sort the buckets by it.
-    if (!field.isInt && rng.rint(100) < 40) {
-      // avg + mincount=0 (all-values) is an untested combination; avoid it.
-      if (facet->has_mincount() && facet->mincount() == 0) {
-        facet->set_mincount(1);
-      }
-      auto& avg = *(*facet->mutable_ops())["av"].mutable_gen_op();
-      avg.set_name("avg");
-      avg.mutable_args()->Add()->set_s("avgval_i");
-      if (rng.rint(100) < 50) {
-        auto& sort = *facet->mutable_sorts()->Add();
-        sort.set_field("av");
-        sort.set_dir(rng.rbool() ? proto::SortSpec_SortDir_DESC : proto::SortSpec_SortDir_ASC);
+    // Sub-ops only on string/id facets (parser rejects them on int/range/text)
+    // and only at the top level (bounds nesting). Pick at most one of {avg,
+    // sub-facet}.
+    if (depth == 0 && !field.isInt) {
+      int subChoice = rng.rint(100);
+      if (subChoice < 35) {
+        // avg() on the always-present avgval_i; avoid avg + mincount=0.
+        if (facet->has_mincount() && facet->mincount() == 0) facet->set_mincount(1);
+        auto& avg = *(*facet->mutable_ops())["av"].mutable_gen_op();
+        avg.set_name("avg");
+        avg.mutable_args()->Add()->set_s("avgval_i");
+        if (rng.rint(100) < 50) {
+          auto& sort = *facet->mutable_sorts()->Add();
+          sort.set_field("av");
+          sort.set_dir(rng.rbool() ? proto::SortSpec_SortDir_DESC : proto::SortSpec_SortDir_ASC);
+        }
+      } else if (subChoice < 60) {
+        // Nested sub-facet on a random string field (no further nesting).
+        std::vector<int> strFields;
+        for (int i = 0; i < (int)allFields.size(); i++)
+          if (!allFields[i].isInt) strFields.push_back(i);
+        if (!strFields.empty()) {
+          const auto& sf = allFields[strFields[rng.rint((int)strFields.size())]];
+          generateRandomFacet(rng, (*facet->mutable_ops())["sf"].mutable_field_facet(), sf, allFields, depth + 1);
+        }
       }
     }
   }
@@ -1911,7 +1943,7 @@ public:
               for (size_t f = 0; f < fields.size(); f++) {
                 if (localRng.rint(100) < 70) {
                   auto& facet = *(*topDocs.mutable_ops())["f" + std::to_string(f)].mutable_field_facet();
-                  generateRandomFacet(localRng, &facet, fields[f]);
+                  generateRandomFacet(localRng, &facet, fields[f], fields);
                 }
               }
             }
@@ -1920,7 +1952,7 @@ public:
               for (size_t f = 0; f < fields.size(); f++) {
                 if (localRng.rint(100) < 50) {
                   auto& facet = *ops["rf" + std::to_string(f)].mutable_field_facet();
-                  generateRandomFacet(localRng, &facet, fields[f]);
+                  generateRandomFacet(localRng, &facet, fields[f], fields);
                 }
               }
             }
@@ -1942,8 +1974,10 @@ public:
             model.processOps(lreq->proto.ops(), expectedResponse->mutable_ops());
             
             // Compare one facet result (buckets + counts + missing) against the model.
-            auto verifyOneFacet = [&](const std::string& ctx, const proto::FieldFacet& ff,
-                                      const proto::FacetResult& actual, const proto::FacetResult& expected) {
+            std::function<void(const std::string&, const proto::FieldFacet&,
+                               const proto::FacetResult&, const proto::FacetResult&)> verifyOneFacet =
+              [&](const std::string& ctx, const proto::FieldFacet& ff,
+                  const proto::FacetResult& actual, const proto::FacetResult& expected) {
               if (expected.bucket_ids().has_col_i()) {
                 ASSERT_TRUE(actual.bucket_ids().has_col_i()) << "expected int buckets: " << ctx << "\n" << lreq->toString();
                 const auto& a = actual.bucket_ids().col_i();
@@ -1973,6 +2007,18 @@ public:
                   for (int i = 0; i < eArr.v_size(); i++)
                     EXPECT_DOUBLE_EQ(aArr.v(i), eArr.v(i)) << "avg[" << i << "]: " << ctx;
                 }
+              }
+              // Nested sub-facet results: ops[name].arr.v[i].facet, one per bucket.
+              for (const auto& [opName, sub] : ff.ops()) {
+                if (!sub.has_field_facet()) continue;
+                if (!expected.ops().contains(opName)) continue;  // empty parent -> no sub-op
+                ASSERT_TRUE(actual.ops().contains(opName)) << "actual sub-facet missing: " << ctx << "\n" << lreq->toString();
+                const auto& aArr = actual.ops().at(opName).arr();
+                const auto& eArr = expected.ops().at(opName).arr();
+                ASSERT_EQ(aArr.v_size(), eArr.v_size()) << "sub-facet arr size: " << ctx << "\n" << lreq->toString();
+                for (int i = 0; i < eArr.v_size(); i++)
+                  verifyOneFacet(ctx + "/" + opName + "[" + std::to_string(i) + "]",
+                                 sub.field_facet(), aArr.v(i).facet(), eArr.v(i).facet());
               }
             };
 
