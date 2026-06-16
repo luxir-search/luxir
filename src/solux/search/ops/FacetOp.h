@@ -15,6 +15,7 @@
 #include "solux/schema/Schema.h"
 #include "solux/search/OrdMapStr.h"
 #include "solux/util/AtomicMerger.h"
+#include "solux/util/SegmentMergeDriver.h"
 
 namespace solux {
 
@@ -309,101 +310,82 @@ public:
   }
 
   class Calc : public Calculator {
-    AtomicMerger<MergeableIntFacet> countMerger;
+    SegmentMergeDriver<MergeableIntFacet> driver;
   public:
-    Calc(SearchOp& op, Calculator* parent, int64_t slot, int64_t numSlots) : Calculator(op, parent, slot, numSlots){}
+    Calc(SearchOp& op, Calculator* parent, int64_t slot, int64_t numSlots)
+      : Calculator(op, parent, slot, numSlots),
+        driver(op.req.reader->segments().size(),
+               [this](std::unique_ptr<MergeableIntFacet> m){ facetResult(*m); }) {}
     IntFacetReq& thisOp() {
       return (IntFacetReq&)getOp();
     }
 
-solux::proto::Val* getTargetForSub(solux::proto::SearchResponse* searchResponse, Calculator* sub) override {
-  return nullptr;
-};
+    solux::proto::Val* getTargetForSub(solux::proto::SearchResponse* searchResponse, Calculator* sub) override {
+      return nullptr;
+    };
     void calc(oneapi::tbb::task_group* tg, int32_t segnum, DocSet* domain) override {
-      // Handle empty index case
       if (segnum == -1) {
-        // Empty index - just generate empty result
-        facetResult();
+        driver.completeEmpty();  // empty index -> empty result
         return;
       }
-      
-      std::unique_ptr<MergeableIntFacet> mergeableData(countMerger.obtain());
-      SegFieldInfo segFieldInfo;
-      auto& facetReq = (FacetReq&)getOp();
-      
-      // Initialize storage based on pre-determined type
-      if (std::holds_alternative<std::monostate>(mergeableData->counts)) {
-        // First time initialization - use pre-determined storage type
-        if (thisOp().useVector) {
-          int64_t range = thisOp().globalMax - thisOp().globalMin + 1;
-          mergeableData->counts = MergeableIntFacet::CountVector(range, 0);
-          mergeableData->minValue = thisOp().globalMin;
-        } else {
-          mergeableData->counts = MergeableIntFacet::IntHash();
+      driver.contribute([&](MergeableIntFacet& data) {
+        SegFieldInfo segFieldInfo;
+        auto& facetReq = (FacetReq&)getOp();
+        // Initialize storage based on the pre-determined type (first segment).
+        if (std::holds_alternative<std::monostate>(data.counts)) {
+          if (thisOp().useVector) {
+            int64_t range = thisOp().globalMax - thisOp().globalMin + 1;
+            data.counts = MergeableIntFacet::CountVector(range, 0);
+            data.minValue = thisOp().globalMin;
+          } else {
+            data.counts = MergeableIntFacet::IntHash();
+          }
         }
-      }
-      
-      // Now do the actual faceting with simple lambdas
-      if (auto* countVec = std::get_if<MergeableIntFacet::CountVector>(&mergeableData->counts)) {
-        // Vector storage - simple array indexing
-        int64_t minVal = mergeableData->minValue;
-        facetReq.facetSegIntCol(domain, segnum, mergeableData->missing_num, segFieldInfo, 
-          [countVec, minVal](int32_t docid, int64_t val) SOLUX_INLINE {
-            unused(docid);
-            (*countVec)[val - minVal]++;
-          });
-      } else {
-        // Map storage - direct value mapping
-        auto* countMap = &std::get<MergeableIntFacet::IntHash>(mergeableData->counts);
-        facetReq.facetSegIntCol(domain, segnum, mergeableData->missing_num, segFieldInfo, 
-          [countMap](int32_t docid, int64_t val) SOLUX_INLINE {
-            unused(docid);
-            (*countMap)[val]++;
-          });
-      }
-      
-      auto merged = countMerger.release(mergeableData.release());
-      if ((size_t)merged == thisOp().reader.segments().size()) {
-        facetResult();
-      }
+        if (auto* countVec = std::get_if<MergeableIntFacet::CountVector>(&data.counts)) {
+          int64_t minVal = data.minValue;
+          facetReq.facetSegIntCol(domain, segnum, data.missing_num, segFieldInfo,
+            [countVec, minVal](int32_t docid, int64_t val) SOLUX_INLINE {
+              unused(docid);
+              (*countVec)[val - minVal]++;
+            });
+        } else {
+          auto* countMap = &std::get<MergeableIntFacet::IntHash>(data.counts);
+          facetReq.facetSegIntCol(domain, segnum, data.missing_num, segFieldInfo,
+            [countMap](int32_t docid, int64_t val) SOLUX_INLINE {
+              unused(docid);
+              (*countMap)[val]++;
+            });
+        }
+      });
     };
 
-    void facetResult() {
+    void facetResult(MergeableIntFacet& merged) {
       auto* myVal = getTarget(nullptr);
       solux::proto::FacetResult& facetResultProto = *myVal->mutable_facet();
       auto minCount = thisOp().minCount;
       auto limit = thisOp().limit;
       auto missing = thisOp().missing;
 
-      auto* mergedData = countMerger.obtain();
       std::vector<std::pair<int64_t, int64_t>> countVec;
-      
-      // Handle both storage types
-      if (auto* countMap = std::get_if<MergeableIntFacet::IntHash>(&mergedData->counts)) {
-        // Map storage
+      // Both storage types (monostate -> neither -> empty result, e.g. empty index).
+      if (auto* countMap = std::get_if<MergeableIntFacet::IntHash>(&merged.counts)) {
         for (auto [val, count] : *countMap) {
           if (count >= minCount) {
             countVec.emplace_back(val, count);
           }
         }
-      } else if (auto* countVector = std::get_if<MergeableIntFacet::CountVector>(&mergedData->counts)) {
-        // Vector storage - convert indices back to values
+      } else if (auto* countVector = std::get_if<MergeableIntFacet::CountVector>(&merged.counts)) {
         for (size_t i = 0; i < countVector->size(); i++) {
           if ((*countVector)[i] > 0 && (*countVector)[i] >= minCount) {
-            countVec.emplace_back(mergedData->minValue + i, (*countVector)[i]);
+            countVec.emplace_back(merged.minValue + i, (*countVector)[i]);
           }
         }
       }
-      
-      auto missing_count = mergedData->missing_num;
-      delete mergedData;
       sortByCountDescAndLimit(countVec, limit);
       emitBuckets(facetResultProto, countVec);
       if (missing) {
-        facetResultProto.set_missing(missing_count);
+        facetResultProto.set_missing(merged.missing_num);
       }
-
-
     }
   };
 
@@ -440,9 +422,12 @@ public:
   FieldFacetReq(req, fieldFacet, fieldName, facetName, limit, minCount, missing){}
 
   class Calc : public Calculator {
-    AtomicMerger<MergeableStrFacet> countMerger;
+    SegmentMergeDriver<MergeableStrFacet> driver;
   public:
-    Calc(SearchOp& op, Calculator* parent, int64_t slot, int64_t numSlots) : Calculator(op, parent, slot, numSlots){}
+    Calc(SearchOp& op, Calculator* parent, int64_t slot, int64_t numSlots)
+      : Calculator(op, parent, slot, numSlots),
+        driver(op.req.reader->segments().size(),
+               [this](std::unique_ptr<MergeableStrFacet> m){ facetResult(*m); }) {}
     FullTextFacetReq& thisOp() {
       return (FullTextFacetReq&)getOp();
     }
@@ -451,113 +436,93 @@ public:
       return nullptr;
     };
     void calc(oneapi::tbb::task_group* tg, int32_t segnum, DocSet* domain) override {
-      // Handle empty index case
       if (segnum == -1) {
-        // Empty index - just generate empty result
-        facetResult();
+        driver.completeEmpty();  // empty index -> empty result
         return;
       }
-      
-      SegFieldInfo segFieldInfo;
-      const FixedBitSet* domainBits = nullptr;
-      if (domain && domain->type == DocSet::Type::BITSET) {
-        domainBits = &static_cast<BitDocSet*>(domain)->bits();
-      }
-      std::unique_ptr<MergeableStrFacet> mergeableData(countMerger.obtain());
-      boost::unordered_flat_map<std::string, int64_t>& counts = mergeableData->counts;
-
-      auto& postingsReader = thisOp().reader.segments()[segnum].postingsReader();
-      int32_t maxDoc = postingsReader.maxDoc();
-      auto poolGuard = MemPool::threadLocalPoolGuard();
-      FieldReader fieldReader(poolGuard.pool(), postingsReader);
-      bool found = fieldReader.seek(thisOp().fieldName);
-      if (!found) {
-        if (domain) {
-          mergeableData->missing_num += domain->card();
-        } else {
-          mergeableData->missing_num += maxDoc;
+      driver.contribute([&](MergeableStrFacet& data) {
+        boost::unordered_flat_map<std::string, int64_t>& counts = data.counts;
+        const FixedBitSet* domainBits = nullptr;
+        if (domain && domain->type == DocSet::Type::BITSET) {
+          domainBits = &static_cast<BitDocSet*>(domain)->bits();
         }
-        auto merged = countMerger.release(mergeableData.release());
-        if ((size_t)merged == thisOp().reader.segments().size()) {
-          facetResult();
+        SegFieldInfo segFieldInfo;
+        auto& postingsReader = thisOp().reader.segments()[segnum].postingsReader();
+        int32_t maxDoc = postingsReader.maxDoc();
+        auto poolGuard = MemPool::threadLocalPoolGuard();
+        FieldReader fieldReader(poolGuard.pool(), postingsReader);
+        if (!fieldReader.seek(thisOp().fieldName)) {
+          // field absent in this segment: all in-domain docs are missing
+          data.missing_num += domain ? domain->card() : maxDoc;
+          return;
         }
-        return;
-      }
-      fieldReader.readFieldInfo(segFieldInfo);
-      TermsEnum tenum(poolGuard.pool(), postingsReader, segFieldInfo);
-      while (tenum.nextTerm()) {
-        int64_t count = 0;
-        DocsEnum denum(poolGuard.pool(), postingsReader, tenum);
-        while (true) {
-          auto doc = denum.nextDoc();
-          if (doc == DocsEnum::END) {
-            break; // no more docs for this term
+        fieldReader.readFieldInfo(segFieldInfo);
+        TermsEnum tenum(poolGuard.pool(), postingsReader, segFieldInfo);
+        while (tenum.nextTerm()) {
+          int64_t count = 0;
+          DocsEnum denum(poolGuard.pool(), postingsReader, tenum);
+          while (true) {
+            auto doc = denum.nextDoc();
+            if (doc == DocsEnum::END) {
+              break; // no more docs for this term
+            }
+            if (domainBits) {
+              if (!domainBits->get(doc)) continue;
+            } else if (domain && !domain->get(doc)) {
+              continue;
+            }
+            count++;
           }
-          if (domainBits) {
-            if (!domainBits->get(doc)) continue;
-          } else if (domain && !domain->get(doc)) {
-            continue;
+          // use heterogeneous lookup in the future to avoid creating string when not needed
+          if (count > 0 || thisOp().minCount == 0) {
+            counts[(std::string) (std::string_view) tenum.term()] += count;
           }
-          count++;
         }
-        // use heterogeneous lookup in the future to avoid creating string when not needed
-        if (count > 0 || thisOp().minCount == 0) {
-          counts[(std::string) (std::string_view) tenum.term()] += count;
-        }
-      }
-      if (thisOp().missing) {
-        // missing = in-domain docs that have no value for this field.  The
-        // docs-with-value set is already indexed (the field-length/norms
-        // column), so intersect it with the domain rather than rebuilding a
-        // per-doc set during the term scan.
-        DocsReader docsReader(postingsReader, segFieldInfo);
-        int64_t domainCard = domain ? domain->card() : maxDoc;
-        int64_t haveField;
-        if (!docsReader.hasBitset()) {
-          // dense: every doc has the field, so none in the domain are missing.
-          haveField = domainCard;
-        } else if (!domain) {
-          // null domain == all docs, so the intersection is exactly docsWithField.
-          haveField = docsReader.numDocs();
-        } else {
-          haveField = 0;
-          screaming::BitSet::Iterator it(docsReader.bitset());
-          for (int32_t doc = it.next(); doc != screaming::BitSet::END; doc = it.next()) {
-            if (domain->get(doc)) {
-              haveField++;
+        if (thisOp().missing) {
+          // missing = in-domain docs that have no value for this field.  The
+          // docs-with-value set is already indexed (the field-length/norms
+          // column), so intersect it with the domain rather than rebuilding a
+          // per-doc set during the term scan.
+          DocsReader docsReader(postingsReader, segFieldInfo);
+          int64_t domainCard = domain ? domain->card() : maxDoc;
+          int64_t haveField;
+          if (!docsReader.hasBitset()) {
+            // dense: every doc has the field, so none in the domain are missing.
+            haveField = domainCard;
+          } else if (!domain) {
+            // null domain == all docs, so the intersection is exactly docsWithField.
+            haveField = docsReader.numDocs();
+          } else {
+            haveField = 0;
+            screaming::BitSet::Iterator it(docsReader.bitset());
+            for (int32_t doc = it.next(); doc != screaming::BitSet::END; doc = it.next()) {
+              if (domain->get(doc)) {
+                haveField++;
+              }
             }
           }
+          data.missing_num += domainCard - haveField;
         }
-        mergeableData->missing_num += domainCard - haveField;
-      }
-      auto merged = countMerger.release(mergeableData.release());
-      if ((size_t)merged == thisOp().reader.segments().size()) {
-        facetResult();
-      }
+      });
     }
 
-    void facetResult() {
+    void facetResult(MergeableStrFacet& merged) {
       auto* myVal = getTarget(nullptr);
       solux::proto::FacetResult& facetResultProto = *myVal->mutable_facet();
       auto minCount = thisOp().minCount;
       auto limit = thisOp().limit;
       auto missing = thisOp().missing;
 
-      auto* mergedData = countMerger.obtain();
-      auto& counts = mergedData->counts;
-
       std::vector<std::pair<std::string, int64_t>> countVec;
-      for (auto [val, count] : counts) {
+      for (auto [val, count] : merged.counts) {
         if (minCount == -1 || count >= minCount) {
           countVec.emplace_back(val, count);
         }
       }
-      auto missing_count = mergedData->missing_num;
-      delete mergedData;
       sortByCountDescAndLimit(countVec, limit);
       emitBuckets(facetResultProto, countVec);
       if (missing) {
-        facetResultProto.set_missing(missing_count);
+        facetResultProto.set_missing(merged.missing_num);
       }
     }
 
@@ -584,9 +549,12 @@ public:
   virtual ~IntFacetRangeReq() = default;
 
   class Calc : public Calculator {
-    AtomicMerger<IntFacetReq::MergeableIntFacet> countMerger;
+    SegmentMergeDriver<IntFacetReq::MergeableIntFacet> driver;
   public:
-    Calc(SearchOp& op, Calculator* parent, int64_t slot, int64_t numSlots) : Calculator(op, parent, slot, numSlots){}
+    Calc(SearchOp& op, Calculator* parent, int64_t slot, int64_t numSlots)
+      : Calculator(op, parent, slot, numSlots),
+        driver(op.req.reader->segments().size(),
+               [this](std::unique_ptr<IntFacetReq::MergeableIntFacet> m){ facetResult(*m); }) {}
     IntFacetRangeReq& thisOp() {
       return (IntFacetRangeReq&)getOp();
     }
@@ -595,43 +563,32 @@ public:
       return nullptr;
     };
     void calc(oneapi::tbb::task_group* tg, int32_t segnum, DocSet* domain) override {
-      // Handle empty index case
       if (segnum == -1) {
-        // Empty index - need to initialize merger with empty data
-        std::unique_ptr<IntFacetReq::MergeableIntFacet> mergeableData(countMerger.obtain());
-        mergeableData->counts = IntFacetReq::MergeableIntFacet::IntHash();
-        countMerger.release(mergeableData.release());
-        facetResult();
+        driver.completeEmpty();  // empty index -> empty result (facetResult handles monostate)
         return;
       }
-      
-      std::unique_ptr<IntFacetReq::MergeableIntFacet> mergeableData(countMerger.obtain());
-      SegFieldInfo segFieldInfo;
-      
-      // IntFacetRangeReq always uses map storage since ranges can be arbitrary
-      if (std::holds_alternative<std::monostate>(mergeableData->counts)) {
-        mergeableData->counts = IntFacetReq::MergeableIntFacet::IntHash();
-      }
-      auto& count = std::get<IntFacetReq::MergeableIntFacet::IntHash>(mergeableData->counts);
-      
-      auto start = thisOp().start;
-      auto end = thisOp().end;
-      auto gap = thisOp().gap;
-      auto& facetReq = (FacetReq&)getOp();
-      facetReq.facetSegIntCol(domain, segnum, mergeableData->missing_num, segFieldInfo, [&](int32_t docid, int64_t val) SOLUX_INLINE {
-        unused(docid);
-        if (val < start || val >= end) {
-          return; // value is out of range
+      driver.contribute([&](IntFacetReq::MergeableIntFacet& data) {
+        SegFieldInfo segFieldInfo;
+        // IntFacetRangeReq always uses map storage since ranges can be arbitrary.
+        if (std::holds_alternative<std::monostate>(data.counts)) {
+          data.counts = IntFacetReq::MergeableIntFacet::IntHash();
         }
-        count[(val-start)/gap]++;
+        auto& count = std::get<IntFacetReq::MergeableIntFacet::IntHash>(data.counts);
+        auto start = thisOp().start;
+        auto end = thisOp().end;
+        auto gap = thisOp().gap;
+        auto& facetReq = (FacetReq&)getOp();
+        facetReq.facetSegIntCol(domain, segnum, data.missing_num, segFieldInfo, [&](int32_t docid, int64_t val) SOLUX_INLINE {
+          unused(docid);
+          if (val < start || val >= end) {
+            return; // value is out of range
+          }
+          count[(val-start)/gap]++;
+        });
       });
-      auto merged = countMerger.release(mergeableData.release());
-      if ((size_t)merged == thisOp().reader.segments().size()) {
-        facetResult();
-      }
     };
 
-    void facetResult() {
+    void facetResult(IntFacetReq::MergeableIntFacet& merged) {
       auto* myVal = getTarget(nullptr);
       solux::proto::FacetResult& facetResultProto = *myVal->mutable_facet();
       auto minCount = thisOp().minCount;
@@ -641,17 +598,15 @@ public:
       auto end = thisOp().end;
       auto gap = thisOp().gap;
 
-      auto* mergedData = countMerger.obtain();
-      // IntFacetRangeReq always uses map storage
-      auto& counts = std::get<IntFacetReq::MergeableIntFacet::IntHash>(mergedData->counts);
       std::vector<std::pair<int64_t, int64_t>> countVec;
-      for (auto [val, count] : counts) {
-        if (minCount == -1 || count >= minCount) {
-          countVec.emplace_back(val, count);
+      // IntFacetRangeReq always uses map storage; monostate only for an empty index.
+      if (auto* counts = std::get_if<IntFacetReq::MergeableIntFacet::IntHash>(&merged.counts)) {
+        for (auto [val, count] : *counts) {
+          if (minCount == -1 || count >= minCount) {
+            countVec.emplace_back(val, count);
+          }
         }
       }
-      auto missing_count = mergedData->missing_num;
-      delete mergedData;
       std::sort(countVec.begin(), countVec.end(), [](auto& a, auto& b) {
         return a.first < b.first;
       });
@@ -673,10 +628,8 @@ public:
         countsArr.Add(count);
       }
       if (missing) {
-        facetResultProto.set_missing(missing_count);
+        facetResultProto.set_missing(merged.missing_num);
       }
-
-
     }
   };
   Calculator* createCalculator(Calculator* parent, int64_t slot, int64_t numSlots = -1) override {
