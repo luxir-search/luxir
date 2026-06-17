@@ -134,6 +134,65 @@ public:
 
       return a;
     }
+
+    enum class Rep { Vector, Hash, Skinny };
+
+    // Make `data.counts` the requested representation, sized for globVals,
+    // folding any existing (smaller) counts in.  This is the storage-upgrade a
+    // later segment performs when it wants a larger counter than the
+    // merged-so-far it obtained.  Rules (matching the original calcOrdMap inline
+    // logic): upgrade map/skinny -> vector and map -> skinny by snapshotting the
+    // old counts, rebuilding as the larger rep, and folding the old back in via
+    // merge; otherwise keep whatever data already holds (never downgrade), and
+    // build fresh from monostate.  The driver owns `data` across the merge, so
+    // releaseCount is never touched; merge equalizes missing_num so data's is
+    // already correct.  Exposed for direct unit testing of the upgrade.
+    static void ensureRep(MergeableStrData& data, Rep rep, int64_t globVals) {
+      bool isMap = std::holds_alternative<OrdHash>(data.counts);
+      bool isSkinny = std::holds_alternative<SkinnyCounter8>(data.counts);
+      bool needUpgrade = (rep == Rep::Vector && (isMap || isSkinny))
+                      || (rep == Rep::Skinny && isMap);
+
+      std::optional<MergeableStrData> oldData;
+      if (needUpgrade) {
+        oldData.emplace();
+        oldData->counts = std::move(data.counts);
+        data.counts.emplace<std::monostate>();
+      }
+
+      // Only (re)build when there is no usable storage yet (fresh, or just
+      // cleared for an upgrade); an existing equal/larger rep is kept as-is.
+      if (std::holds_alternative<std::monostate>(data.counts)) {
+        switch (rep) {
+          case Rep::Vector: {
+            data.counts.emplace<CountVector>();
+            auto& vec = std::get<CountVector>(data.counts);
+            if (vec.empty()) {
+              vec.resize(globVals);
+            }
+            break;
+          }
+          case Rep::Hash:
+            data.counts.emplace<OrdHash>();
+            break;
+          case Rep::Skinny:
+            data.counts.emplace<SkinnyCounter8>(globVals);
+            break;
+        }
+      }
+
+      if (oldData) {
+        // Fold the old (smaller) rep into data's new (larger) one.  The
+        // upgrade-to-larger invariant means merge returns data; defend against
+        // a future variant breaking that so we never silently drop counts in a
+        // release build (assert off).
+        auto* result = MergeableStrData::merge(&data, &*oldData);
+        assert(result == &data);
+        if (result != &data) {
+          data.counts = std::move(result->counts);
+        }
+      }
+    }
   };
 
 private:
@@ -174,21 +233,15 @@ public:
 
   class Calc : public Calculator {
     std::vector<DocSet*> input;
-    // The request-wide task group (RootOp passes req.tg to every segment's
-    // calc()), stashed so the driver completion handlers -- which need a tg to
-    // launch per-bucket sub-op work but run from inside the driver, not calc()
-    // -- can reach it.  All segments share one pointer; atomic only to keep
-    // the concurrent same-value writes data-race-free under TSan.
-    std::atomic<oneapi::tbb::task_group*> requestTg{nullptr};
     SegmentMergeDriver<MergeableStrData> driver;
     SegmentMergeDriver<MergeableStrFacetInline> inlineDriver;
   public:
     Calc(SearchOp& op, Calculator* parent, int64_t slot, int64_t numSlots)
       : Calculator(op, parent, slot, numSlots),
         driver(op.req.reader->segments().size(),
-               [this](std::unique_ptr<MergeableStrData> m){ facetResult(requestTg.load(), std::move(m)); }),
+               [this](std::unique_ptr<MergeableStrData> m){ facetResult(std::move(m)); }),
         inlineDriver(op.req.reader->segments().size(),
-                     [this](std::unique_ptr<MergeableStrFacetInline> m){ facetResult2(requestTg.load(), std::move(m)); }) {
+                     [this](std::unique_ptr<MergeableStrFacetInline> m){ facetResult2(std::move(m)); }) {
       input.resize(op.req.reader->segments().size());
       inlineDriver.setCreator([this]() {
         auto* p = new MergeableStrFacetInline;
@@ -216,7 +269,9 @@ public:
       //TODO: need to account for slot somehow,  or will subop do that?
     };
     void calc(oneapi::tbb::task_group* tg, int32_t segnum, DocSet* domain) override {
-      requestTg.store(tg, std::memory_order_relaxed);
+      // Sub-op task launching is not wired up yet (doSubops runs sub-calcs
+      // inline with a null tg), so the per-segment work needs no task group.
+      unused(tg);
       if (segnum == -1) {
         // Empty index - emit an empty (non-inline) result, matching prior behavior.
         driver.completeEmpty();
@@ -224,16 +279,15 @@ public:
       }
 
       if (!thisOp().inlineSubOps.empty()) {
-        calc2(tg, segnum, domain);
+        calc2(segnum, domain);
         return;
       } else {
-        calcOrdMap(tg, segnum, domain);
+        calcOrdMap(segnum, domain);
         return;
       }
     };
 
-    void calc2(oneapi::tbb::task_group* tg, int32_t segnum, DocSet* domain) {
-      unused(tg);  // completion uses requestTg via the driver
+    void calc2(int32_t segnum, DocSet* domain) {
       inlineDriver.contribute([&](MergeableStrFacetInline& data) {
         for (auto* calc : data.inlineCalcs) {
           calc->startSeg(segnum);
@@ -263,8 +317,7 @@ public:
       });
     }
 
-    void calcOrdMap(oneapi::tbb::task_group* tg, int32_t segnum, DocSet* domain) {
-      unused(tg);  // completion uses requestTg via the driver
+    void calcOrdMap(int32_t segnum, DocSet* domain) {
       driver.contribute([&](MergeableStrData& data) {
         //write only to different slots, so no need to synchronize
         input[segnum] = domain;
@@ -280,10 +333,6 @@ public:
         }
         fieldReader.readFieldInfo(segFieldInfo);
 
-        auto* countVec = std::get_if<MergeableStrData::CountVector>(&data.counts);
-        auto* countMap = std::get_if<MergeableStrData::OrdHash>(&data.counts);
-        auto* countSkinny = std::get_if<SkinnyCounter8>(&data.counts);
-
         int32_t domainSize = domain ? domain->card() : maxDoc;
         int64_t globVals = thisOp().ordMap ? thisOp().ordMap->numOrds() : segFieldInfo.nTerms;
 
@@ -294,50 +343,17 @@ public:
         // if the number of unique values is large compared to the domain size, we want to use a hashmap
         bool wantHash = (globVals >> 6) >= domainSize;
 
-        // skinny is the default in the middle.
-        bool wantSkinny = !wantVec && !wantHash;
-
         // A segment that finished before us may have chosen a smaller storage
-        // type (hashmap or skinny).  If we want a larger one we upgrade IN
-        // PLACE: snapshot the existing counts, rebuild data.counts as the new
-        // representation, then fold the old counts back in.  The driver owns
-        // the object across the merge, so (unlike the old swap-a-fresh-object
-        // code) there is no releaseCount to carry by hand; missing_num stays in
-        // data because we move only the counts variant out.
-        std::optional<MergeableStrData> oldData;
-        if ((wantVec && (countMap || countSkinny))
-          || (wantSkinny && countMap)) {
-          oldData.emplace();
-          oldData->counts = std::move(data.counts);
-          data.counts.emplace<std::monostate>();
-          countMap = nullptr;
-          countSkinny = nullptr;
-        }
-
-        if (!countVec && !countMap && !countSkinny) {
-          if (wantVec) {
-            data.counts.emplace<MergeableStrData::CountVector>();
-            countVec = &std::get<MergeableStrData::CountVector>(data.counts);
-            if (countVec->empty()) {
-              countVec->resize(globVals);
-            }
-          } else if (wantHash) {
-            data.counts.emplace<MergeableStrData::OrdHash>();
-            countMap = &std::get<MergeableStrData::OrdHash>(data.counts);
-          } else if (wantSkinny) {
-            data.counts.emplace<SkinnyCounter8>(globVals);
-            countSkinny = &std::get<SkinnyCounter8>(data.counts);
-          }
-        }
-
-        if (oldData) {
-          // Fold the old (smaller) representation into data's new (larger) one.
-          // The upgrade-to-larger invariant guarantees merge returns data.
-          auto* result = MergeableStrData::merge(&data, &*oldData);
-          assert(result == &data);
-          unused(result);
-        }
-
+        // type; ensureRep upgrades data.counts in place to the larger rep we
+        // want (folding the old counts in), or keeps/creates it as needed.  Then
+        // re-read the active alternative for the scan below.
+        MergeableStrData::Rep rep = wantVec ? MergeableStrData::Rep::Vector
+                                  : wantHash ? MergeableStrData::Rep::Hash
+                                             : MergeableStrData::Rep::Skinny;
+        MergeableStrData::ensureRep(data, rep, globVals);
+        auto* countVec = std::get_if<MergeableStrData::CountVector>(&data.counts);
+        auto* countMap = std::get_if<MergeableStrData::OrdHash>(&data.counts);
+        auto* countSkinny = std::get_if<SkinnyCounter8>(&data.counts);
 
         int64_t missing_num = 0;
         auto& facetReq = (FacetReq&)getOp();
@@ -423,7 +439,7 @@ public:
       });
     }
 
-    void facetResult(oneapi::tbb::task_group* tg, std::unique_ptr<MergeableStrData> mergedData) {
+    void facetResult(std::unique_ptr<MergeableStrData> mergedData) {
       auto* myVal = getTarget(nullptr, [&](solux::proto::Val& val) {
         if (slot >= 0) {
           // sub-facet: this Val is shared by all parent buckets, so index by
@@ -535,7 +551,7 @@ public:
     }
 
 
-    void facetResult2(oneapi::tbb::task_group* tg, std::unique_ptr<MergeableStrFacetInline> mergedData) {
+    void facetResult2(std::unique_ptr<MergeableStrFacetInline> mergedData) {
       auto* myVal = getTarget(nullptr, [&](solux::proto::Val& val) {
         if (slot >= 0) {
           auto& arr = *val.mutable_arr();

@@ -87,6 +87,92 @@ TEST_F(FacetTest, mergeableStrDataMergeVariants) {
   expectMerge(makeVec({1, 2, 0, 0, 0, 0, 0, 0}, 15), makeVec({3, 0, 4, 0, 0, 0, 0, 0}, 16), {4, 2, 4, 0, 0, 0, 0, 0});
 }
 
+// ensureRep is the storage-upgrade step calcOrdMap runs when a later segment
+// wants a larger counter than the merged-so-far it obtained (move the old
+// counts out, rebuild as the larger rep, fold the old back in).  It is the
+// trickiest part of the SegmentMergeDriver conversion, and the engine only
+// exercises the upgrade under a specific multi-segment completion order (so it
+// is covered by RandomFacetTest but not deterministically there).  Test it
+// directly.
+TEST_F(FacetTest, ensureRepUpgradesAndPreservesCounts) {
+  using Data = StrFacetOp::MergeableStrData;
+  using Rep = Data::Rep;
+  using CountVector = Data::CountVector;
+  using OrdHash = Data::OrdHash;
+
+  auto asVec = [](const Data& data) {
+    std::vector<int64_t> out(8, 0);
+    if (auto* ords = std::get_if<OrdHash>(&data.counts)) {
+      for (auto [ord, count] : *ords) out[ord] = count;
+    } else if (auto* vec = std::get_if<CountVector>(&data.counts)) {
+      for (size_t i = 0; i < vec->size(); i++) out[i] = (*vec)[i];
+    } else if (auto* skinny = std::get_if<SkinnyCounter8>(&data.counts)) {
+      for (size_t i = 0; i < skinny->counts.size(); i++) out[i] = skinny->counts[i];
+      for (auto [ord, count] : skinny->overflow) out[ord] += count;
+    }
+    return out;
+  };
+  auto makeMap = [](std::initializer_list<std::pair<const int64_t, int64_t>> vals, int64_t missing) {
+    Data data; data.counts = OrdHash(vals); data.missing_num = missing; return data;
+  };
+  auto makeSkinny = [](std::initializer_list<std::pair<int64_t, int64_t>> vals, int64_t missing) {
+    Data data;
+    data.counts.emplace<SkinnyCounter8>(8);
+    auto& s = std::get<SkinnyCounter8>(data.counts);
+    for (auto [ord, count] : vals) s.increment(ord, count);
+    data.missing_num = missing;
+    return data;
+  };
+
+  // Fresh (monostate) builds the requested rep; a fresh vector is sized to globVals.
+  { Data d; Data::ensureRep(d, Rep::Vector, 8);
+    EXPECT_TRUE(std::holds_alternative<CountVector>(d.counts));
+    EXPECT_EQ((size_t)8, std::get<CountVector>(d.counts).size()); }
+  { Data d; Data::ensureRep(d, Rep::Hash, 8);
+    EXPECT_TRUE(std::holds_alternative<OrdHash>(d.counts)); }
+  { Data d; Data::ensureRep(d, Rep::Skinny, 8);
+    EXPECT_TRUE(std::holds_alternative<SkinnyCounter8>(d.counts)); }
+
+  // UPGRADE skinny -> vector (incl. an overflowed count): rep changes, counts
+  // and missing_num are preserved.
+  { Data d = makeSkinny({{2, 3}, {5, 300}}, 7);
+    Data::ensureRep(d, Rep::Vector, 8);
+    EXPECT_TRUE(std::holds_alternative<CountVector>(d.counts));
+    EXPECT_EQ((std::vector<int64_t>{0, 0, 3, 0, 0, 300, 0, 0}), asVec(d));
+    EXPECT_EQ(7, d.missing_num); }
+
+  // UPGRADE map -> vector.
+  { Data d = makeMap({{1, 5}, {3, 6}}, 4);
+    Data::ensureRep(d, Rep::Vector, 8);
+    EXPECT_TRUE(std::holds_alternative<CountVector>(d.counts));
+    EXPECT_EQ((std::vector<int64_t>{0, 5, 0, 6, 0, 0, 0, 0}), asVec(d));
+    EXPECT_EQ(4, d.missing_num); }
+
+  // UPGRADE map -> skinny.
+  { Data d = makeMap({{2, 9}, {6, 1}}, 2);
+    Data::ensureRep(d, Rep::Skinny, 8);
+    EXPECT_TRUE(std::holds_alternative<SkinnyCounter8>(d.counts));
+    EXPECT_EQ((std::vector<int64_t>{0, 0, 9, 0, 0, 0, 1, 0}), asVec(d));
+    EXPECT_EQ(2, d.missing_num); }
+
+  // NEVER DOWNGRADE: an existing larger rep is kept, counts intact.
+  { Data d = makeSkinny({{1, 4}}, 0);  // skinny, ask hash -> keep skinny
+    Data::ensureRep(d, Rep::Hash, 8);
+    EXPECT_TRUE(std::holds_alternative<SkinnyCounter8>(d.counts));
+    EXPECT_EQ((std::vector<int64_t>{0, 4, 0, 0, 0, 0, 0, 0}), asVec(d)); }
+  { Data d; d.counts = CountVector({1, 2, 0, 0, 0, 0, 0, 0}); d.missing_num = 3;  // vec, ask skinny -> keep vec
+    Data::ensureRep(d, Rep::Skinny, 8);
+    EXPECT_TRUE(std::holds_alternative<CountVector>(d.counts));
+    EXPECT_EQ((std::vector<int64_t>{1, 2, 0, 0, 0, 0, 0, 0}), asVec(d));
+    EXPECT_EQ(3, d.missing_num); }
+
+  // SAME REP: existing storage and its accumulated counts are kept (not cleared).
+  { Data d; d.counts = CountVector({5, 0, 7, 0, 0, 0, 0, 0});
+    Data::ensureRep(d, Rep::Vector, 8);
+    EXPECT_TRUE(std::holds_alternative<CountVector>(d.counts));
+    EXPECT_EQ((std::vector<int64_t>{5, 0, 7, 0, 0, 0, 0, 0}), asVec(d)); }
+}
+
 TEST_F(FacetTest, emptyIndex) {
   CollectionHelper helper;
   helper.clear();
