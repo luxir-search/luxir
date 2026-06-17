@@ -65,7 +65,11 @@ public:
           : targetPool.make<BooleanQuery::ConjunctionScorer>(targetPool, mandatoryScorers, filterScorers);
       }
 
-      auto optionalScorers = QueryPrep::createScorers(targetPool, segment, optionalSources);
+      // For min-should-match (> 1) order the optional scorers by cost so the
+      // pigeonhole lead/tail split leads with the cheapest (sparsest) iterators.
+      auto optionalScorers = minShouldMatch > 1
+        ? QueryPrep::createScorersByCost(targetPool, segment, optionalSources)
+        : QueryPrep::createScorers(targetPool, segment, optionalSources);
       Query::Scorer* optScorer = nullptr;
       if (!optionalScorers.empty()) {
         if (minShouldMatch <= 1) {
@@ -476,54 +480,75 @@ public:
 
 
   // Matches docs where at least `minMatch` of the sub-scorers match (the
-  // OR..AND middle ground). 1 < minMatch < scorers.size(); the disjunction and
-  // conjunction cases are handled by their own scorers. Simple linear merge:
-  // each sub-scorer advances monotonically, so the total work is bounded by the
-  // postings scanned. TODO: OPT a WAND / block-max variant for large clause
-  // counts (the disjunction/conjunction scorers have the same standing TODO).
+  // OR..AND middle ground). 1 < minMatch <= scorers.size(); the pure
+  // disjunction and conjunction cases are handled by their own scorers.
+  //
+  // Pigeonhole lead/tail split (after Lucene's WANDScorer matching core): of the
+  // N scorers, the cheapest `N - minMatch + 1` are "leads" and the densest
+  // `minMatch - 1` are the "tail". Any doc with >= minMatch matches must carry at
+  // least one lead (at most minMatch-1 can be in the tail), so the leads alone
+  // generate every candidate; the tail is never walked, only advanced onto a
+  // candidate to confirm. The input span must be ordered by ascending cost
+  // (see QueryPrep::createScorersByCost).
+  //
+  // TODO: OPT lead with a doc-ordered priority queue (like DisjunctionScorer)
+  // and dynamically rebalance head/tail rather than the fixed cost partition;
+  // and a WAND / block-max variant once impacts + min-competitive-score
+  // feedback exist.
   class MinShouldMatchScorer final : public Query::Scorer {
-    std::span<Scorer*> scorers;
+    std::span<Scorer*> scorers;  // ascending cost: leads first, then tail
     int32_t minMatch;
+    int32_t leadCount;           // scorers[0, leadCount) lead; [leadCount, N) tail
     int32_t docid = -1;
 
-    // Advance to the first doc >= target carrying at least minMatch sub-scorers.
+    std::span<Scorer*> leads() { return scorers.subspan(0, (size_t)leadCount); }
+    std::span<Scorer*> tail() { return scorers.subspan((size_t)leadCount); }
+
+    // First doc >= target carrying at least minMatch matching sub-scorers.
     int32_t findNext(int32_t target) {
       for (;;) {
-        // Bring every lagging sub-scorer up to >= target, tracking the global
-        // minimum doc reached (the next candidate).
+        // Leads drive candidate generation: advance lagging leads to >= target
+        // and take the minimum as the candidate.
         int32_t candidate = PostingsReader::END;
-        for (auto* s : scorers) {
+        for (auto* s : leads()) {
           int32_t d = s->docId();
-          if (d < target) {
-            d = s->advance(target);
-          }
-          if (d < candidate) {
-            candidate = d;
-          }
+          if (d < target) d = s->advance(target);
+          if (d < candidate) candidate = d;
         }
         if (candidate == PostingsReader::END) {
-          docid = PostingsReader::END;
-          return docid;
+          return docid = PostingsReader::END;
         }
-        // How many sub-scorers sit on the candidate?
-        int32_t count = 0;
-        for (auto* s : scorers) {
-          if (s->docId() == candidate) count++;
+
+        int32_t freq = 0;
+        for (auto* s : leads()) {
+          if (s->docId() == candidate) freq++;
         }
-        if (count >= minMatch) {
-          docid = candidate;
-          return docid;
+
+        // Top up from the tail, advancing onto the candidate only as needed.
+        auto t = tail();
+        for (size_t i = 0; i < t.size(); i++) {
+          if (freq >= minMatch) break;                            // confirmed match
+          if (freq + (int32_t)(t.size() - i) < minMatch) break;   // can't reach it
+          int32_t d = t[i]->docId();
+          if (d < candidate) d = t[i]->advance(candidate);
+          if (d == candidate) freq++;
+        }
+
+        if (freq >= minMatch) {
+          return docid = candidate;
         }
         target = candidate + 1;  // candidate fell short; look past it
       }
     }
 
   public:
-    MinShouldMatchScorer(solux::MemPool& pool, std::span<Scorer*> scorers, int32_t minMatch)
-            : scorers(scorers), minMatch(minMatch) {
+    MinShouldMatchScorer(solux::MemPool& pool, std::span<Scorer*> costAscendingScorers, int32_t minMatch)
+            : scorers(costAscendingScorers), minMatch(minMatch),
+              leadCount((int32_t)costAscendingScorers.size() - minMatch + 1) {
       unused(pool);
       assert(minMatch >= 2);
       assert((int32_t)scorers.size() >= minMatch);
+      assert(leadCount >= 1);
     }
 
     int32_t next() override {
@@ -539,9 +564,17 @@ public:
     }
 
     float score() override {
+      // findNext stops once minMatch scorers are confirmed, so some matching
+      // tail scorers may not be on docid yet. Complete the tail before summing
+      // so the score includes every matching optional term.
       float score = 0.0f;
-      for (auto* s : scorers) {
+      for (auto* s : leads()) {
         if (s->docId() == docid) score += s->score();
+      }
+      for (auto* s : tail()) {
+        int32_t d = s->docId();
+        if (d < docid) d = s->advance(docid);
+        if (d == docid) score += s->score();
       }
       return score;
     }

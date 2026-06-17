@@ -252,3 +252,41 @@ TEST_F(QueryAnalysisTest, booleanMinMatchWithRequiredRejected) {
   EXPECT_TRUE(req->responses[0]->proto.has_error());
   req->done();
 }
+
+TEST_F(QueryAnalysisTest, matchMinShouldMatchManyTerms) {
+  // Terms with distinct doc frequencies (a:4, b:3, c:2, d:1) exercise the
+  // cost-ordered lead/tail split across several thresholds.
+  helper.clear();
+  helper.index(flatdoc("id", "d1", "body_wl", "a b c d"), UpdateMessage::NO_COMMIT);
+  helper.index(flatdoc("id", "d2", "body_wl", "a b c"), UpdateMessage::NO_COMMIT);
+  helper.index(flatdoc("id", "d3", "body_wl", "a b"), UpdateMessage::NO_COMMIT);
+  helper.index(flatdoc("id", "d4", "body_wl", "a"), UpdateMessage::COMMIT);
+
+  EXPECT_EQ(4, matchMinMatchCount("body_wl", "a b c d", 1));  // OR -> all have 'a'
+  EXPECT_EQ(3, matchMinMatchCount("body_wl", "a b c d", 2));  // d1,d2,d3
+  EXPECT_EQ(2, matchMinMatchCount("body_wl", "a b c d", 3));  // d1,d2
+  EXPECT_EQ(1, matchMinMatchCount("body_wl", "a b c d", 4));  // d1 (conjunction)
+}
+
+TEST_F(QueryAnalysisTest, matchMinShouldMatchScoreIncludesAllMatches) {
+  // A doc that matches all three terms must score identically under OR and
+  // under min_match=2: the scorer stops iterating at minMatch but score() has
+  // to complete the tail so the BM25 sum covers every matching term.
+  helper.clear();
+  helper.index(flatdoc("id", "x", "body_wl", "alpha beta gamma"), UpdateMessage::COMMIT);
+
+  auto score = [&](int minMatch) {
+    auto* req = LocalReq::create(helper.getSearchEngine());
+    auto& m = *req->topDocs("q").mutable_query()->mutable_match();
+    m.set_field("body_wl");
+    m.mutable_val()->set_s("alpha beta gamma");
+    if (minMatch > 0) m.set_min_match(minMatch);
+    req->collection("main").withStats().execute();
+    EXPECT_EQ(1, req->getMatchCount());
+    float s = req->responses[0]->proto.ops().at("q").docs().columns().at("_score_").col_f().v(0);
+    req->done();
+    return s;
+  };
+
+  EXPECT_FLOAT_EQ(score(0), score(2));  // OR vs min-should-match, same matched set
+}

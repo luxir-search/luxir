@@ -5,6 +5,7 @@
 #include <memory>
 #include <span>
 #include <vector>
+#include <boost/container/small_vector.hpp>
 
 #include "Query.h"
 #include "solux/search/DocSet.h"
@@ -91,6 +92,43 @@ inline std::span<Query::Scorer*> createScorers(MemPool& targetPool,
     if (scorer != nullptr) scorers.push_back(scorer);
   }
   return scorers;
+}
+
+
+
+// Like createScorers, but returns the surviving scorers ordered by ascending
+// supplier cost(). The cost is read from the ScorerSupplier (its planning role)
+// before the scorer is built, which lets a compound scorer pick lead iterators
+// by cost - e.g. the min-should-match lead/tail split, where the cheapest
+// (sparsest) iterators drive candidates and the densest are skipped onto them.
+inline std::span<Query::Scorer*> createScorersByCost(MemPool& targetPool,
+                                                     IndexReader::Segment& segment,
+                                                     std::span<Query::SegmentSource* const> sources) {
+  if (sources.empty()) return {};
+
+  struct CostedSupplier {
+    int64_t cost;
+    Query::ScorerSupplier* supplier;
+  };
+
+  // The (cost, supplier) scratch is only needed to sort before building scorers;
+  // it does not outlive this call. A small_vector keeps it on the stack for the
+  // usual handful of clauses.
+  boost::container::small_vector<CostedSupplier, 16> costed;
+  for (auto* source : sources) {
+    auto* supplier = source->scorerSupplier(targetPool, segment);
+    if (supplier != nullptr) costed.push_back({supplier->cost(), supplier});
+  }
+  std::sort(costed.begin(), costed.end(),
+            [](const CostedSupplier& a, const CostedSupplier& b) { return a.cost < b.cost; });
+
+  auto* scorers = targetPool.make_arr<Query::Scorer*>(sources.size());
+  size_t count = 0;
+  for (auto& c : costed) {
+    auto* scorer = c.supplier->get(targetPool, std::numeric_limits<int64_t>::max());
+    if (scorer != nullptr) scorers[count++] = scorer;
+  }
+  return {scorers, count};
 }
 
 class DocSetScorer final : public Query::Scorer {

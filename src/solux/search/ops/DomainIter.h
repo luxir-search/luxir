@@ -7,11 +7,7 @@ namespace solux {
 
 // The single place that knows how to walk a facet/stats domain over an int
 // column: domain type (array / bitset / null=all-docs) x single-vs-multi-valued
-// x dense-vs-sparse column iterator.  Centralizing it kills the hand-rolled
-// (BitDocSet*)/(ArrDocSet*) downcasts that previously lived at every consumer
-// (the P0-2 mis-cast bug came from exactly such a bypass), and gives AvgOp a
-// domain-driven scan instead of a full 0..maxDoc loop with a virtual
-// DocSet::get() per doc (a binary search for array domains).
+// x dense-vs-sparse column iterator.
 //
 // callback(int32_t docid, int64_t value) is invoked once per value of each
 // in-domain doc that has the field.  In-domain docs with no value bump

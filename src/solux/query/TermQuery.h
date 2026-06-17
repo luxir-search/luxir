@@ -76,6 +76,34 @@ public:
       return targetPool.make<TermQuery::Scorer>(*docsEnum, *normsReader, *cachedTermInfo->simScorer);
     }
 
+    // Per-segment supplier that exposes the term's real cost (its number of docs
+    // in this segment) so compound scorers can order leaders by cost. The
+    // default supplier reports maxDoc for every clause, which is useless for
+    // e.g. the min-should-match lead/tail split.
+    class Supplier final : public Query::ScorerSupplier {
+      TermQuery::Weight& weight;
+      solux::IndexReader::Segment& segment;
+    public:
+      Supplier(TermQuery::Weight& weight, solux::IndexReader::Segment& segment)
+        : weight(weight), segment(segment) {}
+
+      int64_t cost() override {
+        if (weight.cachedTermInfo == nullptr) return 0;
+        auto* docsEnum = weight.cachedTermInfo->docsEnums[segment.ord];
+        return docsEnum == nullptr ? 0 : docsEnum->numDocs();
+      }
+
+      Query::Scorer* get(solux::MemPool& targetPool, int64_t leadCost) override {
+        unused(leadCost);
+        return weight.createScorer(targetPool, segment);
+      }
+    };
+
+    Query::ScorerSupplier* scorerSupplier(solux::MemPool& targetPool,
+                                          solux::IndexReader::Segment& segment) override {
+      return targetPool.make<Supplier>(*this, segment);
+    }
+
   };  // TermQuery::Weight
 
   class Scorer final : public Query::Scorer {
