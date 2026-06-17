@@ -971,7 +971,7 @@ TEST_F(KnnQueryTest, booleanMinMatchWithRequiredIsRejected) {
   }
 
   ASSERT_EQ(req->responses.size(), 1u);
-  EXPECT_NE(req->responses[0]->proto.error().find("min_match=1"), std::string::npos);
+  EXPECT_NE(req->responses[0]->proto.error().find("min_match"), std::string::npos);
 
   req->done();
 }

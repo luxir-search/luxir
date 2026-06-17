@@ -211,10 +211,9 @@ message Match {
   // Unset = OR.  Named after the Elasticsearch / OpenSearch match "operator".
   Operator operator = 3;
 
-  // RESERVED / NOT YET IMPLEMENTED: minimum number of the analyzed terms that
-  // must match (the OR..AND middle ground).  Needs a min-should-match scorer
-  // that counts per-doc matches; until that lands, setting it raises an error
-  // rather than silently returning OR results.  Mirrors BooleanQuery.min_match.
+  // Minimum number of the analyzed terms that must match (the OR..AND middle
+  // ground).  When set it overrides `operator`; clamped to the term count.
+  // Mirrors BooleanQuery.min_match.
   int32 min_match = 4;
 
   enum Operator {

@@ -42,11 +42,8 @@ public:
   solux::Query* parseMatch(const solux::proto::Match& matchQuery) {
     std::string_view field = matchQuery.field();
 
-    // min_match has wire presence but no scorer yet; reject rather than silently
-    // returning OR results (see the proto field comment).
-    if (matchQuery.min_match() != 0) {
-      throw std::runtime_error(
-        "Match 'min_match' is not yet implemented (needs a min-should-match scorer); use 'operator' AND/OR for now");
+    if (matchQuery.min_match() < 0) {
+      throw std::runtime_error("Match 'min_match' must not be negative");
     }
 
     auto op = matchQuery.operator_() == solux::proto::Match::AND
@@ -54,7 +51,7 @@ public:
                 : QueryBuilder::Operator::OR;
 
     QueryBuilder builder(pool, schema);
-    return builder.createMatchQuery(field, getString(matchQuery.val()), op);
+    return builder.createMatchQuery(field, getString(matchQuery.val()), op, matchQuery.min_match());
   }
 
   // Copy a protobuf repeated string/bytes field into a pool-allocated span of
@@ -171,20 +168,27 @@ public:
   }
 
   solux::Query* parseBoolean(const solux::proto::BooleanQuery& booleanQuery) {
-    if (booleanQuery.min_match() > 1) {
-      throw std::runtime_error(std::format(
-        "BooleanQuery min_match > 1 is not supported yet (got {})", booleanQuery.min_match()));
+    int minMatch = booleanQuery.min_match();
+    if (minMatch < 0) {
+      throw std::runtime_error(std::format("BooleanQuery min_match must not be negative (got {})", minMatch));
     }
-    if (booleanQuery.min_match() == 1 &&
-        (booleanQuery.optional().empty() || !booleanQuery.required().empty() || !booleanQuery.filter().empty())) {
-      throw std::runtime_error(
-        "BooleanQuery min_match=1 is only supported for optional-only boolean queries");
+    if (minMatch >= 1) {
+      // The min-should-match scorer only constrains the optional group; its
+      // interaction with required/filter clauses is not wired yet.
+      if (booleanQuery.optional().empty() || !booleanQuery.required().empty() || !booleanQuery.filter().empty()) {
+        throw std::runtime_error(
+          "BooleanQuery min_match is only supported for optional-only boolean queries (no required/filter)");
+      }
+      // Asking for more matches than there are clauses just means "all of them".
+      if (minMatch > booleanQuery.optional().size()) {
+        minMatch = booleanQuery.optional().size();
+      }
     }
     auto required = parseQueryList(booleanQuery.required());
     auto optional = parseQueryList(booleanQuery.optional());
     auto prohibited = parseQueryList(booleanQuery.prohibited());
     auto filter = parseQueryList(booleanQuery.filter());
-    return pool.make<solux::BooleanQuery>(required, optional, prohibited, filter);
+    return pool.make<solux::BooleanQuery>(required, optional, prohibited, filter, minMatch);
   }
 
   solux::Query* parseForcePrepare(const solux::proto::ForcePrepareQuery& forcePrepareQuery) {

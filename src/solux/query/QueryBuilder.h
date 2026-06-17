@@ -78,14 +78,20 @@ public:
   }
 
   // Build a match query for `field` against raw value `value`.
-  //   * TEXT field: run the field's analyzer and combine the resulting terms by
-  //     `op` (OR -> any term, a disjunction; AND -> every term, a conjunction).
+  //   * TEXT field: run the field's analyzer and combine the resulting terms.
   //     Term bytes are copied into the pool (analyzer buffers are transient).
-  //   * STRING / ID field: matched verbatim as a single term, no analysis (op is
-  //     irrelevant). The value must outlive the query tree (caller's storage).
+  //   * STRING / ID field: matched verbatim as a single term, no analysis. The
+  //     value must outlive the query tree (caller's storage).
   // The 0/1/N collapse applies: 0 terms -> match nothing, 1 -> TermQuery,
   // N -> BooleanQuery.
-  Query* createMatchQuery(std::string_view field, std::string_view value, Operator op = Operator::OR) {
+  //
+  // How the N terms combine is resolved to a "must match at least k of N":
+  //   * minMatch > 0 wins (the OR..AND middle ground), clamped into [1, N].
+  //   * else `op`: OR -> k = 1 (disjunction), AND -> k = N (conjunction).
+  // k <= 1 builds a disjunction, k >= N a conjunction, and the middle a
+  // min-should-match boolean.
+  Query* createMatchQuery(std::string_view field, std::string_view value,
+                          Operator op = Operator::OR, int minMatch = 0) {
     FieldType& fieldType = *schema.getFieldTypeEx(field);
     switch (fieldType.type()) {
       case FieldType::Type::TEXT: {
@@ -112,10 +118,16 @@ public:
         for (size_t i = 0; i < terms.size(); i++) {
           clauses[i] = pool.make<TermQuery>(field, terms[i]);
         }
+        int n = (int)terms.size();
+        int k = minMatch > 0 ? minMatch : (op == Operator::AND ? n : 1);
         std::span<Query*> none{};
-        // AND -> all required (conjunction); OR -> all optional (disjunction).
-        return op == Operator::AND ? pool.make<BooleanQuery>(clauses, none, none, none)
-                                   : pool.make<BooleanQuery>(none, clauses, none, none);
+        if (k >= n) {
+          return pool.make<BooleanQuery>(clauses, none, none, none);  // conjunction (all)
+        }
+        if (k <= 1) {
+          return pool.make<BooleanQuery>(none, clauses, none, none);  // disjunction (any)
+        }
+        return pool.make<BooleanQuery>(none, clauses, none, none, k);  // min-should-match
       }
       case FieldType::Type::ID:
       case FieldType::Type::STRING:

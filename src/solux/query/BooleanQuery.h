@@ -10,11 +10,16 @@ class BooleanQuery final : public solux::Query {
   std::span<Query*> optional;
   std::span<Query*> prohibited;
   std::span<Query*> filter;
+  // Minimum number of `optional` clauses a doc must match. 0 (or 1) is the
+  // plain disjunction (any optional). > 1 selects the min-should-match scorer.
+  // Only supported for optional-only queries (no mandatory/filter) for now.
+  int minShouldMatch;
 
 public:
   BooleanQuery(std::span<Query*> mandatory, std::span<Query*> optional, std::span<Query*> prohibited,
-               std::span<Query*> filter)
-          : mandatory(mandatory), optional(optional), prohibited(prohibited), filter(filter) {
+               std::span<Query*> filter, int minShouldMatch = 0)
+          : mandatory(mandatory), optional(optional), prohibited(prohibited), filter(filter),
+            minShouldMatch(minShouldMatch) {
   }
 
   Weight* createWeight(Context& context) override {
@@ -26,6 +31,7 @@ public:
     std::span<Query::Weight*> optionalWeights;
     std::span<Query::Weight*> prohibitedWeights;
     std::span<Query::Weight*> filterWeights;
+    int minShouldMatch = 0;
 
     // Returns a span of Weights, corresponding to the given span of Queries. Some weights can be null.
     std::span<Query::Weight*> createWeights(solux::MemPool& targetPool, Context& context, std::span<Query*> queries) {
@@ -47,7 +53,8 @@ public:
         std::span<Query::SegmentSource* const> mandatorySources,
         std::span<Query::SegmentSource* const> optionalSources,
         std::span<Query::SegmentSource* const> prohibitedSources,
-        std::span<Query::Scorer*> filterScorers) {
+        std::span<Query::Scorer*> filterScorers,
+        int minShouldMatch) {
       auto mandatoryScorers = QueryPrep::createScorers(targetPool, segment, mandatorySources);
       if (mandatoryScorers.size() < mandatorySources.size()) return nullptr;
 
@@ -61,9 +68,17 @@ public:
       auto optionalScorers = QueryPrep::createScorers(targetPool, segment, optionalSources);
       Query::Scorer* optScorer = nullptr;
       if (!optionalScorers.empty()) {
-        optScorer = optionalScorers.size() == 1
-          ? optionalScorers[0]
-          : targetPool.make<BooleanQuery::DisjunctionScorer>(targetPool, optionalScorers);
+        if (minShouldMatch <= 1) {
+          optScorer = optionalScorers.size() == 1
+            ? optionalScorers[0]
+            : targetPool.make<BooleanQuery::DisjunctionScorer>(targetPool, optionalScorers);
+        } else if ((int)optionalScorers.size() >= minShouldMatch) {
+          // Threshold counts surviving scorers: a clause whose term is missing
+          // in this segment can never match, so fewer survivors than the
+          // threshold is unsatisfiable (optScorer stays null below).
+          optScorer = targetPool.make<BooleanQuery::MinShouldMatchScorer>(
+            targetPool, optionalScorers, minShouldMatch);
+        }
       }
 
       Query::Scorer* boolScorer = nullptr;
@@ -102,18 +117,19 @@ public:
       std::vector<QueryPrep::PreparedSource> prohibitedSources;
       std::vector<std::unique_ptr<DocSet>> filterDomains;
       bool hasFilters = false;
+      int minShouldMatch = 0;
 
     public:
       BooleanPreparedWeight(std::vector<QueryPrep::PreparedSource>&& mandatorySources,
                             std::vector<QueryPrep::PreparedSource>&& optionalSources,
                             std::vector<QueryPrep::PreparedSource>&& prohibitedSources,
                             std::vector<std::unique_ptr<DocSet>>&& filterDomains,
-                            bool hasFilters)
+                            bool hasFilters, int minShouldMatch)
         : mandatorySources(std::move(mandatorySources)),
           optionalSources(std::move(optionalSources)),
           prohibitedSources(std::move(prohibitedSources)),
           filterDomains(std::move(filterDomains)),
-          hasFilters(hasFilters) {}
+          hasFilters(hasFilters), minShouldMatch(minShouldMatch) {}
 
       Query::Scorer* createScorer(MemPool& targetPool, IndexReader::Segment& segment) override {
         std::span<Query::Scorer*> filterScorers;
@@ -131,7 +147,7 @@ public:
           QueryPrep::segmentSources(targetPool, QueryPrep::preparedSpan(mandatorySources)),
           QueryPrep::segmentSources(targetPool, QueryPrep::preparedSpan(optionalSources)),
           QueryPrep::segmentSources(targetPool, QueryPrep::preparedSpan(prohibitedSources)),
-          filterScorers);
+          filterScorers, minShouldMatch);
       }
     };
 
@@ -142,6 +158,7 @@ public:
       optionalWeights = createWeights(context.pool, context, query.optional);
       prohibitedWeights = createWeights(context.pool, context, query.prohibited);
       filterWeights = createWeights(context.pool, context, query.filter);
+      minShouldMatch = query.minShouldMatch;
     }
 
     bool needsPrepare() const noexcept override {
@@ -180,7 +197,7 @@ public:
       return std::make_unique<BooleanPreparedWeight>(
         std::move(mandatorySources), std::move(optionalSources),
         std::move(prohibitedSources), std::move(filterDomains),
-        !filterSources.empty());
+        !filterSources.empty(), minShouldMatch);
     }
 
 
@@ -195,7 +212,8 @@ public:
       if (filterScorers.size() < filterSources.size()) return nullptr;
 
       return assembleScorer(
-        targetPool, segment, mandatorySources, optionalSources, prohibitedSources, filterScorers);
+        targetPool, segment, mandatorySources, optionalSources, prohibitedSources, filterScorers,
+        minShouldMatch);
     }
   };  // BooleanQuery::Weight
 
@@ -455,6 +473,79 @@ public:
       return score;
     }
   }; // DisjunctionScorer
+
+
+  // Matches docs where at least `minMatch` of the sub-scorers match (the
+  // OR..AND middle ground). 1 < minMatch < scorers.size(); the disjunction and
+  // conjunction cases are handled by their own scorers. Simple linear merge:
+  // each sub-scorer advances monotonically, so the total work is bounded by the
+  // postings scanned. TODO: OPT a WAND / block-max variant for large clause
+  // counts (the disjunction/conjunction scorers have the same standing TODO).
+  class MinShouldMatchScorer final : public Query::Scorer {
+    std::span<Scorer*> scorers;
+    int32_t minMatch;
+    int32_t docid = -1;
+
+    // Advance to the first doc >= target carrying at least minMatch sub-scorers.
+    int32_t findNext(int32_t target) {
+      for (;;) {
+        // Bring every lagging sub-scorer up to >= target, tracking the global
+        // minimum doc reached (the next candidate).
+        int32_t candidate = PostingsReader::END;
+        for (auto* s : scorers) {
+          int32_t d = s->docId();
+          if (d < target) {
+            d = s->advance(target);
+          }
+          if (d < candidate) {
+            candidate = d;
+          }
+        }
+        if (candidate == PostingsReader::END) {
+          docid = PostingsReader::END;
+          return docid;
+        }
+        // How many sub-scorers sit on the candidate?
+        int32_t count = 0;
+        for (auto* s : scorers) {
+          if (s->docId() == candidate) count++;
+        }
+        if (count >= minMatch) {
+          docid = candidate;
+          return docid;
+        }
+        target = candidate + 1;  // candidate fell short; look past it
+      }
+    }
+
+  public:
+    MinShouldMatchScorer(solux::MemPool& pool, std::span<Scorer*> scorers, int32_t minMatch)
+            : scorers(scorers), minMatch(minMatch) {
+      unused(pool);
+      assert(minMatch >= 2);
+      assert((int32_t)scorers.size() >= minMatch);
+    }
+
+    int32_t next() override {
+      return findNext(docid + 1);
+    }
+
+    int32_t advance(int32_t target) override {
+      return findNext(target);
+    }
+
+    int32_t docId() override {
+      return docid;
+    }
+
+    float score() override {
+      float score = 0.0f;
+      for (auto* s : scorers) {
+        if (s->docId() == docid) score += s->score();
+      }
+      return score;
+    }
+  }; // MinShouldMatchScorer
 
 
 };

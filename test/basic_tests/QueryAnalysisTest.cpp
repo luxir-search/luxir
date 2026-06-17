@@ -41,6 +41,19 @@ public:
     req->done();
     return n;
   }
+
+  // Run a match query with min_match set, return the total match count.
+  int64_t matchMinMatchCount(std::string_view field, std::string_view value, int minMatch) {
+    auto* req = LocalReq::create(helper.getSearchEngine());
+    auto& m = *req->topDocs("q").mutable_query()->mutable_match();
+    m.set_field(field);
+    m.mutable_val()->set_s(value);
+    m.set_min_match(minMatch);
+    req->collection("main").withStats().execute();
+    int64_t n = req->getMatchCount();
+    req->done();
+    return n;
+  }
 };
 
 TEST_F(QueryAnalysisTest, textPhraseAnalyzedAndCaseFolded) {
@@ -193,13 +206,47 @@ TEST_F(QueryAnalysisTest, matchOnNonTextFieldIsVerbatim) {
   EXPECT_EQ(0, matchCount("id", "D1"));
 }
 
-TEST_F(QueryAnalysisTest, matchMinMatchRejected) {
-  // min_match has wire presence but no scorer yet -> error, not silent OR.
+TEST_F(QueryAnalysisTest, matchMinShouldMatch) {
+  // d1: "welcome thomas anderson here"; d2: "anderson met thomas".
+  // "welcome here met" -> d1 has {welcome,here}=2, d2 has {met}=1.
+  EXPECT_EQ(2, matchCount("body_wl", "welcome here met"));             // OR baseline
+  EXPECT_EQ(1, matchMinMatchCount("body_wl", "welcome here met", 2));  // >=2 -> only d1
+  EXPECT_EQ(0, matchMinMatchCount("body_wl", "welcome here met", 3));  // all three -> none
+  EXPECT_EQ(0, matchMinMatchCount("body_wl", "welcome here met", 10)); // clamped to 3 -> none
+}
+
+TEST_F(QueryAnalysisTest, matchMinShouldMatchMissingTermLowersCeiling) {
+  // "zzz" exists nowhere, so only 2 of the 3 terms can ever match.
+  EXPECT_EQ(2, matchMinMatchCount("body_wl", "thomas anderson zzz", 2));  // both real terms present
+  EXPECT_EQ(0, matchMinMatchCount("body_wl", "thomas anderson zzz", 3));  // can't reach 3 -> none
+}
+
+TEST_F(QueryAnalysisTest, booleanMinMatchOptionalClauses) {
+  // The same min-should-match scorer, reached through parseBoolean.
   auto* req = LocalReq::create(helper.getSearchEngine());
-  auto& m = *req->topDocs("q").mutable_query()->mutable_match();
-  m.set_field("body_wl");
-  m.mutable_val()->set_s("Thomas Anderson");
-  m.set_min_match(2);
+  auto& b = *req->topDocs("q").mutable_query()->mutable_boolean();
+  for (const auto* term : {"welcome", "here", "met"}) {
+    auto& m = *b.add_optional()->mutable_match();
+    m.set_field("body_wl");
+    m.mutable_val()->set_s(term);
+  }
+  b.set_min_match(2);
+  req->collection("main").withStats().execute();
+  EXPECT_EQ(1, req->getMatchCount());  // only d1 has >= 2 of welcome/here/met
+  req->done();
+}
+
+TEST_F(QueryAnalysisTest, booleanMinMatchWithRequiredRejected) {
+  // min_match alongside required/filter clauses is not wired yet.
+  auto* req = LocalReq::create(helper.getSearchEngine());
+  auto& b = *req->topDocs("q").mutable_query()->mutable_boolean();
+  auto& opt = *b.add_optional()->mutable_match();
+  opt.set_field("body_wl");
+  opt.mutable_val()->set_s("thomas");
+  auto& reqd = *b.add_required()->mutable_match();
+  reqd.set_field("body_wl");
+  reqd.mutable_val()->set_s("anderson");
+  b.set_min_match(2);
   req->collection("main").withStats().execute();
   ASSERT_FALSE(req->responses.empty());
   EXPECT_TRUE(req->responses[0]->proto.has_error());
