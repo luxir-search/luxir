@@ -16,6 +16,7 @@
 #include "solux/search/OrdMapStr.h"
 #include "solux/util/AtomicMerger.h"
 #include "solux/util/SegmentMergeDriver.h"
+#include "solux/search/ops/DomainIter.h"
 
 namespace solux {
 
@@ -84,107 +85,22 @@ public:
   // segFieldInfo is passed in uninitializsed and filled in if the field exists in the segment.
   // The value returned is if the field exists in the segment.
   bool facetSegIntCol(DocSet* domain, int32_t segnum, int64_t& missing_num, SegFieldInfo& segFieldInfo, auto&& callback) {
-    const FixedBitSet* bits = nullptr;
-    ArrDocSet* arrDocs = nullptr;
-    if (domain) {
-      if (domain->type == DocSet::Type::BITSET) {
-        BitDocSet* bitDocs = (BitDocSet*) domain;
-        bits = &bitDocs->bits();
-      } else if (domain->type == DocSet::Type::ARRAY) {
-        arrDocs = (ArrDocSet*) domain;
-      }
-    }
-
     auto& postingsReader = reader.segments()[segnum].postingsReader();
     int32_t maxDoc = postingsReader.maxDoc();
     auto poolGuard = MemPool::threadLocalPoolGuard();
     FieldReader fieldReader(poolGuard.pool(), postingsReader);
     bool found = fieldReader.seek(fieldName);
     if (!found) {
-      if (domain) {
-        missing_num += domain->card();
-      } else {
-        missing_num += maxDoc;
-      }
+      // field absent in this segment: every in-domain doc is missing.
+      missing_num += domain ? domain->card() : maxDoc;
       return false;
     }
     fieldReader.readFieldInfo(segFieldInfo);
-    // this is a int field for now, so we need to read the value for each doc
-    // and accumulate counts per value.
+    // Walk the domain over the int column.  forEachIntColValue owns the
+    // domain-type x single/multi x dense/sparse dispatch (and the one
+    // (BitDocSet*)/(ArrDocSet*) cast); callback is per value.
     IntColReader intColReader(postingsReader, segFieldInfo);
-    IntColReader::Iterator intColIter(intColReader); // TODO: OPT: use sparse iterator if the domain is sparse.
-
-    auto collect = [&](int32_t docid) SOLUX_INLINE {
-      if (intColIter.docId() < docid ) {
-        intColIter.advance(docid);
-      }
-      if (intColIter.docId() == docid) {
-        if (!intColReader.multiValued()) {
-          auto val = intColIter.value();
-          callback(docid, val);
-        } else {
-          // TODO: use bulk iter for dense domain?
-          auto [start, end] = intColReader.getStartEndValueRank(intColIter.rank());
-          auto n = end - start;
-          for (int64_t vrank = 0; vrank < n; vrank++) {
-            auto val = intColIter.values().valueAt(start + vrank);
-            callback(docid, val);
-          }
-        }
-      } else {
-        missing_num++;
-      }
-    };
-
-    if (arrDocs) {
-      IntColReader::SparseIterator iter(intColReader);
-      // single valued case
-      if (!intColReader.multiValued()) {
-        for (auto docid : arrDocs->docs()) {
-          if (iter.docId() < docid ) {
-            iter.advance(docid);
-          }
-          if (iter.docId() == docid) {
-            auto val = iter.value();
-            callback(docid, val);
-          } else {
-            missing_num++;
-          }
-        }
-      } else {
-        // multi-valued case
-        for (auto docid : arrDocs->docs()) {
-          if (iter.docId() < docid ) {
-            iter.advance(docid);
-          }
-          if (iter.docId() == docid) {
-            // TODO: use bulk iter for dense domain?
-            auto [start, end] = intColReader.getStartEndValueRank(iter.rank());
-            auto n = end - start;
-            for (int64_t vrank = 0; vrank < n; vrank++) {
-              auto val = iter.values().valueAt(start + vrank);
-              callback(docid, val);
-            }
-          } else {
-            missing_num++;
-          }
-        }
-      }
-    } else {
-      // bit doc set domain
-      int32_t docid = -1;
-      while (docid + 1 < maxDoc) {
-        if (bits) {
-          docid = bits->nextSetBit(docid + 1);
-          if (docid >= maxDoc) {
-            break;
-          }
-        } else {
-          docid++;
-        }
-        collect(docid);
-      }
-    }
+    forEachIntColValue(domain, intColReader, maxDoc, missing_num, callback);
     return true;
   }
 };

@@ -5,6 +5,7 @@
 #include "solux/util/AtomicMerger.h"
 #include "solux/util/SegmentMergeDriver.h"
 #include "solux/util/NumericUtils.h"
+#include "solux/search/ops/DomainIter.h"
 
 namespace solux {
 class AvgOp : public SearchOp {
@@ -99,41 +100,23 @@ public:
         }
         fieldReader.readFieldInfo(segFieldInfo);
         IntColReader intColReader(postingsReader, segFieldInfo);
-        IntColReader::Iterator intColIter(intColReader);
         int64_t sum = 0;
         double dsum = 0;
         int64_t count = 0;
-        for (int32_t docid = 0; docid < maxDoc; docid++) {
-          if (domain && !domain->get(docid)) {
-            continue;
-          }
-          if (intColIter.docId() < docid ) {
-            intColIter.advance(docid);
-          }
-          if (intColIter.docId() == docid) {
-            if (!intColReader.multiValued()) {
-              auto val = intColIter.value();
-              if (floating) {
-                dsum += thisOp().decodeDouble(val);
-              } else {
-                sum += val;
-              }
-              count++;
+        int64_t missing = 0; // avg ignores docs with no value; not tracked here
+        // Domain-driven walk: forEachIntColValue picks the sparse/dense iterator
+        // by domain type instead of the previous full 0..maxDoc scan with a
+        // virtual DocSet::get() (a binary search for array domains) per doc.
+        forEachIntColValue(domain, intColReader, maxDoc, missing,
+          [&](int32_t docid, int64_t val) SOLUX_INLINE {
+            unused(docid);
+            if (floating) {
+              dsum += thisOp().decodeDouble(val);
             } else {
-              auto [start, end] = intColReader.getStartEndValueRank(intColIter.rank());
-              auto n = end - start;
-              for (int64_t vrank = 0; vrank < n; vrank++) {
-                auto val = intColIter.values().valueAt(start + vrank);
-                if (floating) {
-                  dsum += thisOp().decodeDouble(val);
-                } else {
-                  sum += val;
-                }
-                count++;
-              }
+              sum += val;
             }
-          }
-        }
+            count++;
+          });
         data.sum += sum;
         data.dsum += dsum;
         data.count += count;
