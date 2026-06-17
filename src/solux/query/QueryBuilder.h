@@ -8,6 +8,7 @@
 #include <vector>
 
 #include "solux/analysis/Analyzer.h"
+#include "solux/query/BooleanQuery.h"
 #include "solux/query/MatchNoDocsQuery.h"
 #include "solux/query/PhraseQuery.h"
 #include "solux/query/Query.h"
@@ -66,10 +67,62 @@ class QueryBuilder {
   }
 
 public:
+  // How the multiple terms an analyzed text field produces are combined.
+  // Mirrors the Elasticsearch / OpenSearch match "operator".
+  enum class Operator { OR, AND };
+
   QueryBuilder(MemPool& pool, Schema& schema) : pool(pool), schema(schema) {}
 
   Query* matchNoDocs() {
     return pool.make<MatchNoDocsQuery>();
+  }
+
+  // Build a match query for `field` against raw value `value`.
+  //   * TEXT field: run the field's analyzer and combine the resulting terms by
+  //     `op` (OR -> any term, a disjunction; AND -> every term, a conjunction).
+  //     Term bytes are copied into the pool (analyzer buffers are transient).
+  //   * STRING / ID field: matched verbatim as a single term, no analysis (op is
+  //     irrelevant). The value must outlive the query tree (caller's storage).
+  // The 0/1/N collapse applies: 0 terms -> match nothing, 1 -> TermQuery,
+  // N -> BooleanQuery.
+  Query* createMatchQuery(std::string_view field, std::string_view value, Operator op = Operator::OR) {
+    FieldType& fieldType = *schema.getFieldTypeEx(field);
+    switch (fieldType.type()) {
+      case FieldType::Type::TEXT: {
+        auto& textType = (TextFieldType&)fieldType;
+        auto chain = textType.createAnalyzer(field);
+        TokenChain& tc = *chain;
+        Token& tok = tc.head.getToken();
+        TokenStream& tail = *tc.tail;
+
+        std::vector<std::string_view> terms;
+        tc.head.setValue(value);
+        tc.reset();
+        while (tail.incrementToken()) {
+          terms.push_back(copyTerm(tok.text));
+        }
+
+        if (terms.empty()) {
+          return matchNoDocs();
+        }
+        if (terms.size() == 1) {
+          return pool.make<TermQuery>(field, terms[0]);
+        }
+        auto clauses = pool.make_span<Query*>(terms.size());
+        for (size_t i = 0; i < terms.size(); i++) {
+          clauses[i] = pool.make<TermQuery>(field, terms[i]);
+        }
+        std::span<Query*> none{};
+        // AND -> all required (conjunction); OR -> all optional (disjunction).
+        return op == Operator::AND ? pool.make<BooleanQuery>(clauses, none, none, none)
+                                   : pool.make<BooleanQuery>(none, clauses, none, none);
+      }
+      case FieldType::Type::ID:
+      case FieldType::Type::STRING:
+        return pool.make<TermQuery>(field, value);
+      default:
+        throw std::runtime_error(std::format("Match query on unsupported field type: {}", field));
+    }
   }
 
   // Build a phrase query from un-analyzed input by running the field's analyzer.

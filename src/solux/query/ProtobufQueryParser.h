@@ -41,25 +41,20 @@ public:
 
   solux::Query* parseMatch(const solux::proto::Match& matchQuery) {
     std::string_view field = matchQuery.field();
-    FieldType& fieldType = *schema.getFieldTypeEx(field);
-    // float boost = 1.0f;
 
-    switch(fieldType.type()) {
-      case FieldType::Type::TEXT: {
-        // TODO: for a text field, we need to tokenize the string and handle multiple terms
-        std::string_view val = getString(matchQuery.val());
-        return pool.make<solux::TermQuery>(field, val);
-      }
-      case FieldType::Type::ID:
-      case FieldType::Type::STRING: {
-        std::string_view term = getString(matchQuery.val());
-        return pool.make<solux::TermQuery>(field, term);
-      }
-      case FieldType::Type::INT:
-      default:
-        throw std::runtime_error("Unknown field type");
+    // min_match has wire presence but no scorer yet; reject rather than silently
+    // returning OR results (see the proto field comment).
+    if (matchQuery.min_match() != 0) {
+      throw std::runtime_error(
+        "Match 'min_match' is not yet implemented (needs a min-should-match scorer); use 'operator' AND/OR for now");
     }
-    std::unreachable();
+
+    auto op = matchQuery.operator_() == solux::proto::Match::AND
+                ? QueryBuilder::Operator::AND
+                : QueryBuilder::Operator::OR;
+
+    QueryBuilder builder(pool, schema);
+    return builder.createMatchQuery(field, getString(matchQuery.val()), op);
   }
 
   // Copy a protobuf repeated string/bytes field into a pool-allocated span of

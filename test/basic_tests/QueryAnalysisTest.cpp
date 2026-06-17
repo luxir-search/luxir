@@ -32,6 +32,15 @@ public:
     req->done();
     return n;
   }
+
+  // Run a match query (default OR) and return the total match count.
+  int64_t matchCount(std::string_view field, std::string_view value) {
+    auto* req = LocalReq::create(helper.getSearchEngine());
+    req->collection("main").matchQuery(field, value).withStats().execute();
+    int64_t n = req->getMatchCount();
+    req->done();
+    return n;
+  }
 };
 
 TEST_F(QueryAnalysisTest, textPhraseAnalyzedAndCaseFolded) {
@@ -149,4 +158,50 @@ TEST_F(QueryAnalysisTest, caseSensitiveFieldRespectsCase) {
   // body_w is whitespace-only, case-sensitive: query analysis leaves bytes alone.
   EXPECT_EQ(1, phraseTextCount("body_w", "Thomas Anderson"));   // exact case matches
   EXPECT_EQ(0, phraseTextCount("body_w", "thomas anderson"));   // wrong case misses
+}
+
+// --- match (parseMatch) query-time analysis -----------------------------------
+
+TEST_F(QueryAnalysisTest, matchSingleTermCaseFolded) {
+  // Uppercase match query against a case-folded field matches (the parity fix);
+  // one analyzed term collapses to a TermQuery. d1 and d2 both contain anderson.
+  EXPECT_EQ(2, matchCount("body_wl", "ANDERSON"));
+}
+
+TEST_F(QueryAnalysisTest, matchMultiTermDefaultsToOr) {
+  // "Thomas here" -> [thomas, here]; default operator OR. d1 has both, d2 has
+  // thomas only -> both match.
+  EXPECT_EQ(2, matchCount("body_wl", "Thomas here"));
+}
+
+TEST_F(QueryAnalysisTest, matchAndRequiresAllTerms) {
+  // Same terms with operator AND: only d1 contains both thomas and here.
+  auto* req = LocalReq::create(helper.getSearchEngine());
+  req->collection("main").matchQuery("body_wl", "Thomas here", proto::Match::AND).withStats().execute();
+  EXPECT_EQ(1, req->getMatchCount());
+  req->done();
+}
+
+TEST_F(QueryAnalysisTest, matchEmptyAnalyzesToNothing) {
+  // Non-empty input that analyzes to zero tokens -> MatchNoDocsQuery.
+  EXPECT_EQ(0, matchCount("body_wl", " ... "));
+}
+
+TEST_F(QueryAnalysisTest, matchOnNonTextFieldIsVerbatim) {
+  // ID / STRING fields are matched verbatim (no analysis), so case matters.
+  EXPECT_EQ(1, matchCount("id", "d1"));
+  EXPECT_EQ(0, matchCount("id", "D1"));
+}
+
+TEST_F(QueryAnalysisTest, matchMinMatchRejected) {
+  // min_match has wire presence but no scorer yet -> error, not silent OR.
+  auto* req = LocalReq::create(helper.getSearchEngine());
+  auto& m = *req->topDocs("q").mutable_query()->mutable_match();
+  m.set_field("body_wl");
+  m.mutable_val()->set_s("Thomas Anderson");
+  m.set_min_match(2);
+  req->collection("main").withStats().execute();
+  ASSERT_FALSE(req->responses.empty());
+  EXPECT_TRUE(req->responses[0]->proto.has_error());
+  req->done();
 }

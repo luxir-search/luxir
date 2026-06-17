@@ -79,6 +79,16 @@ public:
     return *this;
   }
 
+  // Add a match query with an explicit AND/OR operator (combines analyzed terms)
+  LocalReq& matchQuery(std::string_view field, std::string_view value,
+                       proto::Match::Operator op, std::string_view opName = "q") {
+    auto& query = *topDocs(opName).mutable_query()->mutable_match();
+    query.set_field(field);
+    query.mutable_val()->set_s(value);
+    query.set_operator_(op);
+    return *this;
+  }
+
   // Add an "all documents" query
   LocalReq& allQuery(std::string_view opName = "q") {
     topDocs(opName).mutable_query()->set_all(true);

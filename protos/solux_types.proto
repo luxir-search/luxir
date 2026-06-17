@@ -206,6 +206,22 @@ message KnnQuery {
 message Match {
   string field = 1;
   Val val = 2;   // if val is an Array, this could be used for TermsQuery as well...  how to tell if scoring or not though?
+
+  // How to combine the multiple terms an analyzed text field can produce.
+  // Unset = OR.  Named after the Elasticsearch / OpenSearch match "operator".
+  Operator operator = 3;
+
+  // RESERVED / NOT YET IMPLEMENTED: minimum number of the analyzed terms that
+  // must match (the OR..AND middle ground).  Needs a min-should-match scorer
+  // that counts per-doc matches; until that lands, setting it raises an error
+  // rather than silently returning OR results.  Mirrors BooleanQuery.min_match.
+  int32 min_match = 4;
+
+  enum Operator {
+    OPERATOR_UNSPECIFIED = 0;  // treated as OR
+    OR = 1;                    // a doc matches if any analyzed term matches
+    AND = 2;                   // a doc must match every analyzed term
+  }
 }
 
 // Attach a name to a query so it can be referenced by other queries or facets.
