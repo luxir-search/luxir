@@ -62,6 +62,17 @@ public:
     std::unreachable();
   }
 
+  // Copy a protobuf repeated string/bytes field into a pool-allocated span of
+  // string_views. The views point at the proto storage, which outlives the
+  // query tree, so no byte copies are made here.
+  std::span<std::string_view> toSpan(const google::protobuf::RepeatedPtrField<std::string>& vals) {
+    auto out = pool.make_span<std::string_view>(vals.size());
+    for (int i = 0; i < vals.size(); i++) {
+      out[i] = vals.Get(i);
+    }
+    return out;
+  }
+
   solux::Query* parsePhrase(const solux::proto::PhraseQuery& phraseQuery) {
     std::string_view field = phraseQuery.field();
     QueryBuilder builder(pool, schema);
@@ -69,44 +80,44 @@ public:
     std::span<const int32_t> positions(phraseQuery.positions().begin(),
                                        (size_t)phraseQuery.positions().size());
 
-    // Exactly one of text / words / terms / terms_bin is expected. text and
-    // words are un-analyzed (run through the field's analyzer here, at query
-    // time); terms and terms_bin are already analyzed and used verbatim. We
-    // only translate proto into primitives -- the builder owns the analysis and
-    // query-shape decisions so JSON / string parsers can share it.
-    if (!phraseQuery.text().empty()) {
+    // Exactly one of text / words / terms / terms_bin selects the phrase input.
+    // text and words are un-analyzed (run through the field's analyzer here, at
+    // query time); terms and terms_bin are already analyzed and used verbatim.
+    // We only translate proto into primitives -- the builder owns the analysis
+    // and query-shape decisions so JSON / string parsers can share it.
+    bool hasText = !phraseQuery.text().empty();
+    bool hasWords = !phraseQuery.words().empty();
+    bool hasTerms = !phraseQuery.terms().empty();
+    bool hasTermsBin = !phraseQuery.terms_bin().empty();
+    if (hasText + hasWords + hasTerms + hasTermsBin > 1) {
+      throw std::runtime_error(
+        "Phrase query must set exactly one of text / words / terms / terms_bin");
+    }
+
+    if (hasText) {
       if (!positions.empty()) {
         throw std::runtime_error(
-          "Phrase query 'positions' cannot be combined with 'text' (positions come from analysis)");
+          "Phrase query 'positions' cannot be combined with 'text' (text has no word boundaries to position)");
       }
       std::string_view text = phraseQuery.text();
       return builder.createPhraseQuery(field, std::span<const std::string_view>(&text, 1));
     }
-    if (!phraseQuery.words().empty()) {
+    if (hasWords) {
       // positions (when given) are one per word; the builder shifts them to
       // absorb words that analyze to multiple tokens.
-      auto words = pool.make_span<std::string_view>(phraseQuery.words().size());
-      for (int i = 0; i < phraseQuery.words().size(); i++) {
-        words[i] = phraseQuery.words(i);
-      }
-      return builder.createPhraseQuery(field, words, positions);
+      return builder.createPhraseQuery(field, toSpan(phraseQuery.words()), positions);
     }
-    if (!phraseQuery.terms().empty()) {
-      auto terms = pool.make_span<std::string_view>(phraseQuery.terms().size());
-      for (int i = 0; i < phraseQuery.terms().size(); i++) {
-        terms[i] = phraseQuery.terms(i);
-      }
-      return builder.createPhraseFromTerms(field, terms, positions);
+    if (hasTerms) {
+      return builder.createPhraseFromTerms(field, toSpan(phraseQuery.terms()), positions);
     }
-    if (!phraseQuery.terms_bin().empty()) {
-      auto terms = pool.make_span<std::string_view>(phraseQuery.terms_bin().size());
-      for (int i = 0; i < phraseQuery.terms_bin().size(); i++) {
-        terms[i] = phraseQuery.terms_bin(i);
-      }
-      return builder.createPhraseFromTerms(field, terms, positions);
+    if (hasTermsBin) {
+      return builder.createPhraseFromTerms(field, toSpan(phraseQuery.terms_bin()), positions);
     }
 
-    // Nothing to match on.
+    // No phrase terms at all.
+    if (!positions.empty()) {
+      throw std::runtime_error("Phrase query has 'positions' but no terms");
+    }
     return builder.matchNoDocs();
   }
 

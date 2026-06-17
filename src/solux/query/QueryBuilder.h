@@ -18,8 +18,7 @@ namespace solux {
 
 // Builds Query objects from primitives. Independent of JSON / Protobuf so both
 // can use it.
-// This is the single place where query-time text
-// analysis is applied.
+// This is the single place where query-time text analysis is applied.
 //
 // Query nodes and any analyzed term bytes are allocated in the pool, which
 // (with the caller's source bytes for pass-through terms) must outlive the
@@ -76,9 +75,7 @@ public:
   // Build a phrase query from un-analyzed input by running the field's analyzer.
   // `values` is the raw text to analyze: a single element for a whole text
   // string ("Thomas Anderson"), or one element per word for a word list
-  // (["Yonik","Seeley"]). Each value is analyzed independently (one reset() per
-  // value -- the "analyze per value, never concatenate" invariant). The
-  // resulting term count then drives buildPhrase().
+  // (["Yonik","Seeley"]). Each value is analyzed independently.
   //
   // `valuePositions` is optional and, when set, parallel to `values` (the proto
   // words + positions form): it gives the intended phrase position of each
@@ -151,8 +148,9 @@ public:
 
   // Build a phrase query from already-analyzed terms; the terms are used
   // verbatim, with no analysis. `positions` may be empty (defaults to
-  // 0,1,2,...) or must match the term count. Terms and any provided positions
-  // must outlive the query tree (callers point them at the request storage).
+  // 0,1,2,...) or must match the term count.
+  //
+  // The provided span contents are not copied and thus should outlive the returned query.
   Query* createPhraseFromTerms(std::string_view field, std::span<std::string_view> terms,
                                std::span<const int32_t> positions) {
     textFieldType(field);  // validate it is a text field

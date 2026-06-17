@@ -107,6 +107,44 @@ TEST_F(QueryAnalysisTest, preAnalyzedTermsUsedVerbatim) {
   }
 }
 
+TEST_F(QueryAnalysisTest, preAnalyzedTermsBinUsedVerbatim) {
+  // terms_bin is the binary equivalent of terms: already analyzed, verbatim.
+  auto* req = LocalReq::create(helper.getSearchEngine());
+  auto& ph = *req->topDocs("q").mutable_query()->mutable_phrase();
+  ph.set_field("body_wl");
+  *ph.mutable_terms_bin()->Add() = "thomas";
+  *ph.mutable_terms_bin()->Add() = "anderson";
+  req->collection("main").withStats().execute();
+  EXPECT_EQ(1, req->getMatchCount());
+  req->done();
+}
+
+TEST_F(QueryAnalysisTest, multiplePhraseInputsRejected) {
+  // Only one of text / words / terms / terms_bin may be set.
+  auto* req = LocalReq::create(helper.getSearchEngine());
+  auto& ph = *req->topDocs("q").mutable_query()->mutable_phrase();
+  ph.set_field("body_wl");
+  ph.set_text("Thomas Anderson");
+  *ph.mutable_words()->Add() = "here";
+  req->collection("main").withStats().execute();
+  ASSERT_FALSE(req->responses.empty());
+  EXPECT_TRUE(req->responses[0]->proto.has_error());
+  req->done();
+}
+
+TEST_F(QueryAnalysisTest, positionsWithoutTermsRejected) {
+  // positions with no phrase input is a malformed request.
+  auto* req = LocalReq::create(helper.getSearchEngine());
+  auto& ph = *req->topDocs("q").mutable_query()->mutable_phrase();
+  ph.set_field("body_wl");
+  ph.add_positions(0);
+  ph.add_positions(1);
+  req->collection("main").withStats().execute();
+  ASSERT_FALSE(req->responses.empty());
+  EXPECT_TRUE(req->responses[0]->proto.has_error());
+  req->done();
+}
+
 TEST_F(QueryAnalysisTest, caseSensitiveFieldRespectsCase) {
   // body_w is whitespace-only, case-sensitive: query analysis leaves bytes alone.
   EXPECT_EQ(1, phraseTextCount("body_w", "Thomas Anderson"));   // exact case matches
