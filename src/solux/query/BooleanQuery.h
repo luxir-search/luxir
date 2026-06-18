@@ -185,6 +185,90 @@ public:
       return boolScorer;
     }
 
+    // Composite cardinality cost for a boolean, from its child supplier costs -
+    // an upper bound, mirroring how assembleScorer combines them. So a nested
+    // boolean clause reports a real cost to a parent's cost ordering instead of
+    // the default maxDoc. Estimate only: it uses query-level clause counts (not
+    // per-segment survival) and ignores prohibited (which can only remove docs).
+    static int64_t compositeCost(
+        MemPool& targetPool,
+        IndexReader::Segment& segment,
+        std::span<Query::SegmentSource* const> mandatorySources,
+        std::span<Query::SegmentSource* const> optionalSources,
+        std::span<Query::ScorerSupplier* const> filterSuppliers,
+        int minShouldMatch) {
+      int64_t maxDoc = segment.maxDoc();
+      // Required (mandatory + filter) drives matching when present: the
+      // conjunction matches at most the rarest required clause.
+      if (!mandatorySources.empty() || !filterSuppliers.empty()) {
+        int64_t minReq = maxDoc;
+        for (auto* source : mandatorySources) {
+          auto* supplier = source->scorerSupplier(targetPool, segment);
+          if (supplier == nullptr) return 0;  // required clause absent -> no match here
+          minReq = std::min(minReq, supplier->cost());
+        }
+        for (auto* supplier : filterSuppliers) {
+          if (supplier == nullptr) return 0;
+          minReq = std::min(minReq, supplier->cost());
+        }
+        return minReq;
+      }
+      if (optionalSources.empty()) return 0;
+      boost::container::small_vector<int64_t, 16> costs;
+      for (auto* source : optionalSources) {
+        auto* supplier = source->scorerSupplier(targetPool, segment);
+        costs.push_back(supplier == nullptr ? 0 : supplier->cost());
+      }
+      int n = (int)costs.size();
+      if (minShouldMatch >= n) {  // all optional required -> rarest
+        int64_t m = maxDoc;
+        for (auto c : costs) m = std::min(m, c);
+        return m;
+      }
+      // Disjunction (mm <= 1) is the sum; min-should-match needs at least
+      // n - mm + 1 of them, so its cost is the sum of that many cheapest
+      // (Lucene's ScorerUtil.costWithMinShouldMatch). Both capped at maxDoc.
+      int take = minShouldMatch <= 1 ? n : n - minShouldMatch + 1;
+      if (take < n) std::sort(costs.begin(), costs.end());
+      int64_t sum = 0;
+      for (int i = 0; i < take; i++) sum += costs[i];
+      return std::min(sum, maxDoc);
+    }
+
+    // Supplier over a boolean's per-segment child sources: cost() composes child
+    // costs; get() runs assembleScorer. Stores the source spans (cheap) and
+    // builds child scorers lazily in get(). TODO: OPT cost() re-collects child
+    // suppliers each call; collect once and share with get() if it shows up.
+    class Supplier final : public Query::ScorerSupplier {
+      MemPool& pool;
+      IndexReader::Segment& segment;
+      std::span<Query::SegmentSource* const> mandatorySources;
+      std::span<Query::SegmentSource* const> optionalSources;
+      std::span<Query::SegmentSource* const> prohibitedSources;
+      std::span<Query::ScorerSupplier* const> filterSuppliers;
+      int minShouldMatch;
+    public:
+      Supplier(MemPool& pool, IndexReader::Segment& segment,
+               std::span<Query::SegmentSource* const> mandatorySources,
+               std::span<Query::SegmentSource* const> optionalSources,
+               std::span<Query::SegmentSource* const> prohibitedSources,
+               std::span<Query::ScorerSupplier* const> filterSuppliers,
+               int minShouldMatch)
+        : pool(pool), segment(segment), mandatorySources(mandatorySources),
+          optionalSources(optionalSources), prohibitedSources(prohibitedSources),
+          filterSuppliers(filterSuppliers), minShouldMatch(minShouldMatch) {}
+
+      int64_t cost() override {
+        return compositeCost(pool, segment, mandatorySources, optionalSources, filterSuppliers, minShouldMatch);
+      }
+
+      Query::Scorer* get(MemPool& targetPool, int64_t leadCost) override {
+        unused(leadCost);
+        return assembleScorer(targetPool, segment, mandatorySources, optionalSources,
+                              prohibitedSources, filterSuppliers, minShouldMatch);
+      }
+    };
+
     class BooleanPreparedWeight final : public Query::Weight::PreparedWeight {
       std::vector<QueryPrep::PreparedSource> mandatorySources;
       std::vector<QueryPrep::PreparedSource> optionalSources;
@@ -205,7 +289,7 @@ public:
           filterDomains(std::move(filterDomains)),
           hasFilters(hasFilters), minShouldMatch(minShouldMatch) {}
 
-      Query::Scorer* createScorer(MemPool& targetPool, IndexReader::Segment& segment) override {
+      Query::ScorerSupplier* scorerSupplier(MemPool& targetPool, IndexReader::Segment& segment) override {
         // Expose the per-segment filter domain as a supplier (cost = its exact
         // cardinality) so it joins the required cost ordering. An empty domain
         // surfaces as a null scorer in assembleRequired -> the boolean cannot
@@ -216,14 +300,16 @@ public:
           filterSuppliers = {targetPool.make_arr<Query::ScorerSupplier*>(1), 1};
           filterSuppliers[0] = targetPool.make<QueryPrep::DocSetSupplier>(filterDomain, segment);
         }
-
-        return assembleScorer(
-          targetPool,
-          segment,
+        return targetPool.make<BooleanQuery::Weight::Supplier>(
+          targetPool, segment,
           QueryPrep::segmentSources(targetPool, QueryPrep::preparedSpan(mandatorySources)),
           QueryPrep::segmentSources(targetPool, QueryPrep::preparedSpan(optionalSources)),
           QueryPrep::segmentSources(targetPool, QueryPrep::preparedSpan(prohibitedSources)),
           filterSuppliers, minShouldMatch);
+      }
+
+      Query::Scorer* createScorer(MemPool& targetPool, IndexReader::Segment& segment) override {
+        return scorerSupplier(targetPool, segment)->get(targetPool, std::numeric_limits<int64_t>::max());
       }
     };
 
@@ -277,7 +363,7 @@ public:
     }
 
 
-    Scorer* createScorer(solux::MemPool& targetPool, solux::IndexReader::Segment& segment) override {
+    Query::ScorerSupplier* scorerSupplier(solux::MemPool& targetPool, solux::IndexReader::Segment& segment) override {
       auto mandatorySources = QueryPrep::liveSources(targetPool, mandatoryWeights);
       auto optionalSources = QueryPrep::liveSources(targetPool, optionalWeights);
       auto prohibitedSources = QueryPrep::liveSources(targetPool, prohibitedWeights);
@@ -286,10 +372,12 @@ public:
       // cannot match this segment surfaces in assembleRequired (null supplier or
       // null scorer), making the whole boolean unsatisfiable here.
       auto filterSuppliers = QueryPrep::collectSuppliers(targetPool, segment, filterSources);
+      return targetPool.make<Supplier>(targetPool, segment, mandatorySources, optionalSources,
+                                       prohibitedSources, filterSuppliers, minShouldMatch);
+    }
 
-      return assembleScorer(
-        targetPool, segment, mandatorySources, optionalSources, prohibitedSources, filterSuppliers,
-        minShouldMatch);
+    Scorer* createScorer(solux::MemPool& targetPool, solux::IndexReader::Segment& segment) override {
+      return scorerSupplier(targetPool, segment)->get(targetPool, std::numeric_limits<int64_t>::max());
     }
   };  // BooleanQuery::Weight
 
