@@ -76,10 +76,9 @@ class DocSet;
 // and materializers also intersect scorer output with the active domain.
 //
 // Scorer iteration: next()/advance(target) walk docs in increasing docId order,
-// returning PostingsReader::END when exhausted.  advance(target) returns the
-// first doc with docId >= target, and may return the current doc if it is
-// already >= target -- so a caller needing strict progress must pass
-// target > docId() (see ConjunctionScorer's leapfrog).
+// returning PostingsReader::END when exhausted. advance(target) is strict: target
+// must be greater than docId(), and the scorer advances to the first doc >=
+// target. Use advanceExact() or guard sub-scorers that may already be on target.
 //
 
 /// A map from KeyType to a vector of pointers to ValType.
@@ -433,13 +432,20 @@ public:
   class Scorer {
   public:
     virtual int32_t next() = 0;
-    virtual int32_t advance(int32_t docid) {
+    virtual int32_t advance(int32_t target) {
+      // Strict advance: callers must pass a target beyond the current doc.
+      assert(docId() < target);
       int32_t doc;
-      while ((doc = next()) < docid) {}
+      while ((doc = next()) < target) {}
       return doc;
     }
-    virtual bool advanceExact (int32_t docid) {
-      return advance(docid) == docid;
+    // Lenient exact probe: stay put when already at or past target.
+    virtual bool advanceExact(int32_t target) {
+      int32_t doc = docId();
+      if (doc < target) {
+        doc = advance(target);
+      }
+      return doc == target;
     }
     /// doc we are positioned on
     virtual int32_t docId() = 0;

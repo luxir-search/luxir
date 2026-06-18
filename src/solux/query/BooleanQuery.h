@@ -72,14 +72,17 @@ public:
         : QueryPrep::createScorers(targetPool, segment, optionalSources);
       Query::Scorer* optScorer = nullptr;
       if (!optionalScorers.empty()) {
+        int optCount = (int)optionalScorers.size();
+        // minShouldMatch applies to optional scorers that exist in this segment.
         if (minShouldMatch <= 1) {
-          optScorer = optionalScorers.size() == 1
+          optScorer = optCount == 1
             ? optionalScorers[0]
             : targetPool.make<BooleanQuery::DisjunctionScorer>(targetPool, optionalScorers);
-        } else if ((int)optionalScorers.size() >= minShouldMatch) {
-          // Threshold counts surviving scorers: a clause whose term is missing
-          // in this segment can never match, so fewer survivors than the
-          // threshold is unsatisfiable (optScorer stays null below).
+        } else if (optCount == minShouldMatch) {
+          // Every surviving optional clause is required.
+          optScorer = targetPool.make<BooleanQuery::ConjunctionScorer>(
+            targetPool, optionalScorers, std::span<Query::Scorer*>());
+        } else if (optCount > minShouldMatch) {
           optScorer = targetPool.make<BooleanQuery::MinShouldMatchScorer>(
             targetPool, optionalScorers, minShouldMatch);
         }
@@ -309,8 +312,11 @@ public:
       return doNext();
     }
 
-    bool advanceExact(int32_t docid) override {
-      return advance(docid) == docid;
+    bool advanceExact(int32_t target) override {
+      if (id < target) {
+        advance(target);
+      }
+      return id == target;
     }
 
     float score() override {
@@ -355,11 +361,14 @@ public:
       outer:
       for (;;) {
         for (int j = 1; j < allScorers.size(); j++) {
-          int32_t id = allScorers[j]->advance(target);
-          assert(id >= target);
-          if (id > target) {
-            target = firstScorer->advance(id);
-            goto outer;  // could perhaps replace with "j=0; continue;" but that seems potentially worse?
+          // advance() is strict; skip sub-scorers already on target.
+          if (allScorers[j]->docId() < target) {
+            int32_t id = allScorers[j]->advance(target);
+            assert(id >= target);
+            if (id > target) {
+              target = firstScorer->advance(id);
+              goto outer;  // could perhaps replace with "j=0; continue;" but that seems potentially worse?
+            }
           }
         }
         // if we made it through the loop, all scorers matched (maybe at END)
@@ -425,10 +434,11 @@ public:
     }
 
     int32_t next() override {
+      // Parent advanceExact() paths can call next() after exhaustion.
+      if (pq.size() == 0) {
+        return docid = solux::PostingsReader::END;
+      }
       int currid = docid;
-
-      // if pq.size()==0, then should have previously returned END and so next() should not be called after that.
-      assert(pq.size() > 0);
       assert(pq.top().docId() == docid);
 
       docid = pq.top().next();
@@ -480,21 +490,14 @@ public:
 
 
   // Matches docs where at least `minMatch` of the sub-scorers match (the
-  // OR..AND middle ground). 1 < minMatch <= scorers.size(); the pure
-  // disjunction and conjunction cases are handled by their own scorers.
+  // OR..AND middle ground). Called only for 1 < minMatch < scorers.size().
   //
-  // Pigeonhole lead/tail split (after Lucene's WANDScorer matching core): of the
-  // N scorers, the cheapest `N - minMatch + 1` are "leads" and the densest
-  // `minMatch - 1` are the "tail". Any doc with >= minMatch matches must carry at
-  // least one lead (at most minMatch-1 can be in the tail), so the leads alone
-  // generate every candidate; the tail is never walked, only advanced onto a
-  // candidate to confirm. The input span must be ordered by ascending cost
-  // (see QueryPrep::createScorersByCost).
+  // With scorers sorted by ascending cost, the first N - minMatch + 1 are leads.
+  // Any match must hit at least one lead, so leads generate candidates and the
+  // tail only confirms them.
   //
   // TODO: OPT lead with a doc-ordered priority queue (like DisjunctionScorer)
-  // and dynamically rebalance head/tail rather than the fixed cost partition;
-  // and a WAND / block-max variant once impacts + min-competitive-score
-  // feedback exist.
+  // and rebalance lead/tail once block-max scoring exists.
   class MinShouldMatchScorer final : public Query::Scorer {
     std::span<Scorer*> scorers;  // ascending cost: leads first, then tail
     int32_t minMatch;
@@ -507,13 +510,11 @@ public:
     // First doc >= target carrying at least minMatch matching sub-scorers.
     int32_t findNext(int32_t target) {
       for (;;) {
-        // Leads drive candidate generation: advance lagging leads to >= target
-        // and take the minimum as the candidate.
+        // Advance lagging leads and use their minimum as the candidate.
         int32_t candidate = PostingsReader::END;
         for (auto* s : leads()) {
-          int32_t d = s->docId();
-          if (d < target) d = s->advance(target);
-          if (d < candidate) candidate = d;
+          if (s->docId() < target) s->advance(target);
+          if (s->docId() < candidate) candidate = s->docId();
         }
         if (candidate == PostingsReader::END) {
           return docid = PostingsReader::END;
@@ -529,9 +530,8 @@ public:
         for (size_t i = 0; i < t.size(); i++) {
           if (freq >= minMatch) break;                            // confirmed match
           if (freq + (int32_t)(t.size() - i) < minMatch) break;   // can't reach it
-          int32_t d = t[i]->docId();
-          if (d < candidate) d = t[i]->advance(candidate);
-          if (d == candidate) freq++;
+          if (t[i]->docId() < candidate) t[i]->advance(candidate);
+          if (t[i]->docId() == candidate) freq++;
         }
 
         if (freq >= minMatch) {
@@ -564,17 +564,14 @@ public:
     }
 
     float score() override {
-      // findNext stops once minMatch scorers are confirmed, so some matching
-      // tail scorers may not be on docid yet. Complete the tail before summing
-      // so the score includes every matching optional term.
+      // findNext may stop before every matching tail scorer has advanced.
       float score = 0.0f;
       for (auto* s : leads()) {
         if (s->docId() == docid) score += s->score();
       }
       for (auto* s : tail()) {
-        int32_t d = s->docId();
-        if (d < docid) d = s->advance(docid);
-        if (d == docid) score += s->score();
+        if (s->docId() < docid) s->advance(docid);
+        if (s->docId() == docid) score += s->score();
       }
       return score;
     }

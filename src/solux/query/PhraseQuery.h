@@ -65,12 +65,11 @@ public:
       if (cachedFieldInfo == nullptr) {
         return nullptr;
       }
-      CachedTermInfo* termInfo = cachedTermInfos[segment.ord];
-      if (termInfo == nullptr) {
+      // segInfos is per-segment; cachedTermInfos is per-term.
+      auto* segFieldInfo = cachedFieldInfo->segInfos[segment.ord];
+      if (segFieldInfo == nullptr) {
         return nullptr;
       }
-
-      auto* segFieldInfo = cachedFieldInfo->segInfos[segment.ord]; // this segFieldInfo can't be null at this point
       auto* normsReader = targetPool.make<IntColReader>(segment.postingsReader(), *segFieldInfo);
       auto docsEnums = targetPool.make_span<DocsEnum*>(cachedTermInfos.size());
       for (int i = 0; i < cachedTermInfos.size(); i++) {
@@ -199,8 +198,11 @@ public:
       return PostingsReader::END;
     }
 
-    int32_t advance(int32_t docid) override {
-      advanceApprox(docid);
+    int32_t advance(int32_t target) override {
+      // confirmMatch() consumes positions, so strict advance must not recheck the
+      // current doc.
+      assert(docid < target);
+      advanceApprox(target);
       for (;;) {
         if (docid == PostingsReader::END) {
           return PostingsReader::END;
@@ -209,7 +211,7 @@ public:
           return docid;
         }
         nextApprox();
-      };
+      }
     }
 
     /// doc we are positioned on
