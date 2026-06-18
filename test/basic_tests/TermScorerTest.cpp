@@ -103,7 +103,7 @@ TEST_F(TermScorerTest, singleSeg) {
     // lucene scores the docs as follows:
     // doc=5 score=0.36330473
     // doc=7 score=0.37098017
-    TermQuery::Scorer termScorer(denum, normsCol, simScorer);
+    TermQuery::Scorer termScorer(denum, &normsCol, &simScorer);
     ASSERT_EQ(termScorer.next(), 5);
     ASSERT_EQ(termScorer.docId(), 5);
     ASSERT_EQ(termScorer.termFreq(), 2);
@@ -120,7 +120,7 @@ TEST_F(TermScorerTest, singleSeg) {
       TermQuery tq("foo_w", "to");
       Query::Context qContext(testIndex.pool, *testIndex.reader);
 
-      auto* weight = tq.createWeight(qContext);
+      auto* weight = tq.createWeight(qContext, Query::NEED_SCORES);
       TermQuery::Scorer* scorer = dynamic_cast<TermQuery::Scorer*>( weight->createScorer(testIndex.pool,
                                                                                          qContext.topReader.segments()[0]));
       testScores(scorer, {5, 7}, {0.36330473f, 0.37098017f});
@@ -148,7 +148,7 @@ TEST_F(TermScorerTest, multiSeg) {
       TermQuery tq("foo_w", "to");
       Query::Context qContext(testIndex.pool, *testIndex.reader);
 
-      auto* weight = tq.createWeight(qContext);
+      auto* weight = tq.createWeight(qContext, Query::NEED_SCORES);
       // put the scorer creation in a separate scope to test that it's OK to rewind the pool after we are done with a single scorer.
       {
         auto g1 = testIndex.pool.rewindScopeGuard();
@@ -184,7 +184,7 @@ TEST_F(TermScorerTest, multiSeg) {
       TermQuery tq("foo_w", "to");
       Query::Context qContext(testIndex.pool, *testIndex.reader);
 
-      auto* weight = tq.createWeight(qContext);
+      auto* weight = tq.createWeight(qContext, Query::NEED_SCORES);
       // put the scorer creation in a separate scope to test that it's OK to rewind the pool after we are done with a single scorer.
       {
         auto g1 = testIndex.pool.rewindScopeGuard();
@@ -207,7 +207,7 @@ TEST_F(TermScorerTest, multiSeg) {
       float score = 0.0f; // current expected score for an all-scorer is 0.0f
       AllQuery allQuery;
       Query::Context qContext(testIndex.pool, *testIndex.reader);
-      auto* weight = allQuery.createWeight(qContext);
+      auto* weight = allQuery.createWeight(qContext, Query::NEED_SCORES);
       // put the scorer creation in a separate scope to test that it's OK to rewind the pool after we are done with a single scorer.
       {
         auto g1 = testIndex.pool.rewindScopeGuard();
@@ -251,7 +251,7 @@ TEST_F(TermScorerTest, boolScore) {
 
       auto poolFree = testIndex.pool.rewindScopeGuard();
       Query::Context qContext(testIndex.pool, *testIndex.reader);
-      auto* weight = q.createWeight(qContext);
+      auto* weight = q.createWeight(qContext, Query::NEED_SCORES);
       // put the scorer creation in a separate scope to test that it's OK to rewind the pool after we are done with a single scorer.
       {
         auto g = testIndex.pool.rewindScopeGuard();
@@ -275,7 +275,7 @@ TEST_F(TermScorerTest, boolScore) {
 
       auto poolFree = testIndex.pool.rewindScopeGuard();
       Query::Context qContext(testIndex.pool, *testIndex.reader);
-      auto* weight = q.createWeight(qContext);
+      auto* weight = q.createWeight(qContext, Query::NEED_SCORES);
       // put the scorer creation in a separate scope to test that it's OK to rewind the pool after we are done with a single scorer.
       {
         auto g = testIndex.pool.rewindScopeGuard();
@@ -299,7 +299,7 @@ TEST_F(TermScorerTest, boolScore) {
 
       auto poolFree = testIndex.pool.rewindScopeGuard();
       Query::Context qContext(testIndex.pool, *testIndex.reader);
-      auto* weight = q.createWeight(qContext);
+      auto* weight = q.createWeight(qContext, Query::NEED_SCORES);
       // put the scorer creation in a separate scope to test that it's OK to rewind the pool after we are done with a single scorer.
       {
         auto g = testIndex.pool.rewindScopeGuard();
@@ -323,7 +323,7 @@ TEST_F(TermScorerTest, boolScore) {
 
       auto poolFree = testIndex.pool.rewindScopeGuard();
       Query::Context qContext(testIndex.pool, *testIndex.reader);
-      auto* weight = q.createWeight(qContext);
+      auto* weight = q.createWeight(qContext, Query::NEED_SCORES);
       // put the scorer creation in a separate scope to test that it's OK to rewind the pool after we are done with a single scorer.
       {
         auto g = testIndex.pool.rewindScopeGuard();
@@ -350,7 +350,7 @@ TEST_F(TermScorerTest, boolScore) {
 
       auto poolFree = testIndex.pool.rewindScopeGuard();
       Query::Context qContext(testIndex.pool, *testIndex.reader);
-      auto* weight = q.createWeight(qContext);
+      auto* weight = q.createWeight(qContext, Query::NEED_SCORES);
       // put the scorer creation in a separate scope to test that it's OK to rewind the pool after we are done with a single scorer.
       {
         auto g = testIndex.pool.rewindScopeGuard();
@@ -380,7 +380,7 @@ TEST_F(TermScorerTest, boolScore) {
 
       auto poolFree = testIndex.pool.rewindScopeGuard();
       Query::Context qContext(testIndex.pool, *testIndex.reader);
-      auto* weight = q.createWeight(qContext);
+      auto* weight = q.createWeight(qContext, Query::NEED_SCORES);
       // put the scorer creation in a separate scope to test that it's OK to rewind the pool after we are done with a single scorer.
       {
         auto g = testIndex.pool.rewindScopeGuard();
@@ -407,7 +407,7 @@ TEST_F(TermScorerTest, boolScore) {
 
       auto poolFree = testIndex.pool.rewindScopeGuard();
       Query::Context qContext(testIndex.pool, *testIndex.reader);
-      auto* weight = q.createWeight(qContext);
+      auto* weight = q.createWeight(qContext, Query::NEED_SCORES);
       // put the scorer creation in a separate scope to test that it's OK to rewind the pool after we are done with a single scorer.
       {
         auto g = testIndex.pool.rewindScopeGuard();
@@ -434,7 +434,7 @@ TEST_F(TermScorerTest, boolScore) {
 
       auto poolFree = testIndex.pool.rewindScopeGuard();
       Query::Context qContext(testIndex.pool, *testIndex.reader);
-      auto* weight = q.createWeight(qContext);
+      auto* weight = q.createWeight(qContext, Query::NEED_SCORES);
       // put the scorer creation in a separate scope to test that it's OK to rewind the pool after we are done with a single scorer.
       {
         auto g = testIndex.pool.rewindScopeGuard();
@@ -461,7 +461,7 @@ TEST_F(TermScorerTest, boolScore) {
 
       auto poolFree = testIndex.pool.rewindScopeGuard();
       Query::Context qContext(testIndex.pool, *testIndex.reader);
-      auto* weight = phrase.createWeight(qContext);
+      auto* weight = phrase.createWeight(qContext, Query::NEED_SCORES);
       // put the scorer creation in a separate scope to test that it's OK to rewind the pool after we are done with a single scorer.
       {
         auto g = testIndex.pool.rewindScopeGuard();
@@ -486,7 +486,7 @@ TEST_F(TermScorerTest, boolScore) {
 
       auto poolFree = testIndex.pool.rewindScopeGuard();
       Query::Context qContext(testIndex.pool, *testIndex.reader);
-      auto* weight = q.createWeight(qContext);
+      auto* weight = q.createWeight(qContext, Query::NEED_SCORES);
       // put the scorer creation in a separate scope to test that it's OK to rewind the pool after we are done with a single scorer.
       {
         auto g = testIndex.pool.rewindScopeGuard();
@@ -513,7 +513,7 @@ TEST_F(TermScorerTest, boolScore) {
 
       auto poolFree = testIndex.pool.rewindScopeGuard();
       Query::Context qContext(testIndex.pool, *testIndex.reader);
-      auto* weight = q.createWeight(qContext);
+      auto* weight = q.createWeight(qContext, Query::NEED_SCORES);
       // put the scorer creation in a separate scope to test that it's OK to rewind the pool after we are done with a single scorer.
       {
         auto g = testIndex.pool.rewindScopeGuard();

@@ -273,16 +273,17 @@ public:
   float getMinScanFraction() const noexcept { return minScanFraction; }
   bool getExact() const noexcept { return exact; }
 
-  Query::Weight* createWeight(Query::Context& context) override {
-    return context.pool.make<KnnQuery::Weight>(context, *this);
+  Query::Weight* createWeight(Query::Context& context, int32_t flags) override {
+    return context.pool.make<KnnQuery::Weight>(context, *this, flags);
   }
 
   class Weight final : public Query::Weight {
     KnnQuery& query;
 
   public:
-    Weight(Query::Context& context, KnnQuery& query)
-      : Query::Weight(context), query(query) {
+    Weight(Query::Context& context, KnnQuery& query, int32_t flags)
+      : Query::Weight(context, flags), query(query) {
+      traits |= NEEDS_PREPARE;  // index-level ANN pass
       if (!query.getFieldType().knnSearchable()) {
         throw std::runtime_error(std::format(
           "KnnQuery on vector field '{}' without a metric", query.getField()));
@@ -304,8 +305,6 @@ public:
         }
       }
     }
-
-    bool needsPrepare() const noexcept override { return true; }
 
     class KnnPreparedWeight final : public Query::Weight::PreparedWeight {
       std::vector<std::vector<Hit>> perSegHits;

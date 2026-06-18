@@ -15,8 +15,8 @@ class ForcePrepareQuery final : public solux::Query {
 public:
   explicit ForcePrepareQuery(Query* child) : child(child) {}
 
-  Weight* createWeight(Context& context) override {
-    return context.pool.make<ForcePrepareQuery::Weight>(context, *this);
+  Weight* createWeight(Context& context, int32_t flags) override {
+    return context.pool.make<ForcePrepareQuery::Weight>(context, *this, flags);
   }
 
   class Weight final : public Query::Weight {
@@ -44,12 +44,10 @@ public:
     };
 
   public:
-    Weight(Context& context, ForcePrepareQuery& query) : Query::Weight(context) {
-      childWeight = query.child->createWeight(context);
-    }
-
-    bool needsPrepare() const noexcept override {
-      return true;
+    Weight(Context& context, ForcePrepareQuery& query, int32_t flags) : Query::Weight(context, flags) {
+      childWeight = query.child->createWeight(context, flags);
+      // Forces prepare; scoring behavior is otherwise the child's.
+      traits |= NEEDS_PREPARE | (childWeight->getFlags() & IS_CONSTANT_SCORING);
     }
 
     std::unique_ptr<Query::Weight::PreparedWeight> prepare(Query::Weight::PrepareContext& ctx) override {

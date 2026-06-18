@@ -4,23 +4,22 @@
 
 namespace solux {
 
-// A query that matches no documents. The query builder returns this when
-// query-time analysis yields zero terms (an all-punctuation phrase, empty
-// input, etc.): there is nothing to match, but we still need a valid Query to
-// hand back. It mirrors the "no match" path TermQuery already takes for a
-// missing term/field -- the weight simply yields a null scorer for every
-// segment, which every caller already treats as "this source can't match here".
+// A query that matches no documents. Query builders use this when analysis
+// yields zero terms but the caller still needs a valid Query object. The weight
+// yields a null scorer for every segment.
 class MatchNoDocsQuery final : public solux::Query {
 public:
   MatchNoDocsQuery() {}
 
-  MatchNoDocsQuery::Weight* createWeight(Context& context) override {
-    return context.pool.make<MatchNoDocsQuery::Weight>(context);
+  MatchNoDocsQuery::Weight* createWeight(Context& context, int32_t flags) override {
+    return context.pool.make<MatchNoDocsQuery::Weight>(context, flags);
   }
 
   class Weight final : public Query::Weight {
   public:
-    explicit Weight(Context& context) : Query::Weight(context) {}
+    Weight(Context& context, int32_t flags) : Query::Weight(context, flags) {
+      traits |= IS_CONSTANT_SCORING;  // vacuously constant
+    }
 
     Query::Scorer* createScorer(solux::MemPool& targetPool, solux::IndexReader::Segment& segment) override {
       unused(targetPool);

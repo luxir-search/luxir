@@ -6,11 +6,10 @@ namespace solux {
 
 class AllQuery final : public solux::Query {
 public:
-  // TermQuery constructor
   AllQuery() {}
 
-  AllQuery::Weight* createWeight(Context& context) override {
-    AllQuery::Weight* weight = context.pool.make<AllQuery::Weight>(context, *this);
+  AllQuery::Weight* createWeight(Context& context, int32_t flags) override {
+    AllQuery::Weight* weight = context.pool.make<AllQuery::Weight>(context, *this, flags);
     return weight;
   }
 
@@ -18,14 +17,15 @@ public:
   protected:
     AllQuery& query;
   public:
-    Weight(Context& context, AllQuery& query) : Query::Weight(context), query(query) {
+    Weight(Context& context, AllQuery& query, int32_t flags) : Query::Weight(context, flags), query(query) {
+      traits |= IS_CONSTANT_SCORING;  // every match scores 0
     }
 
     AllQuery::Scorer* createScorer(solux::MemPool& targetPool, solux::IndexReader::Segment& segment) override {
       return targetPool.make<AllQuery::Scorer>(segment);
     }
 
-  };  // TermQuery::Weight
+  };
 
   class Scorer final : public Query::Scorer {
   public:
@@ -54,7 +54,7 @@ public:
       return 0.0f;
     }
 
-  }; // TermQuery::Scorer
+  };
 
 };
 

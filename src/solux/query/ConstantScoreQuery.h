@@ -62,15 +62,13 @@ class ConstantScoreQuery final : public solux::Query {
 public:
   ConstantScoreQuery(Query* child, float constantScore = 1.0f) : child(child), constantScore(constantScore) {}
 
-  Weight* createWeight(Context& context) override {
-    return context.pool.make<ConstantScoreQuery::Weight>(context, *this);
+  Weight* createWeight(Context& context, int32_t flags) override {
+    return context.pool.make<ConstantScoreQuery::Weight>(context, *this, flags);
   }
 
   class Weight final : public Query::Weight {
     Query::Weight* childWeight = nullptr;
     float constantScore;
-    // TODO: once Weight creation gets a NEED_SCORES flag, create the child
-    // scorer without scores so filters like TermQuery can skip sim/norm setup.
 
     class Prepared final : public Query::Weight::PreparedWeight {
       QueryPrep::PreparedSource child;
@@ -98,13 +96,12 @@ public:
     };
 
   public:
-    Weight(Context& context, ConstantScoreQuery& query)
-      : Query::Weight(context), constantScore(query.constantScore) {
-      childWeight = query.child->createWeight(context);
-    }
-
-    bool needsPrepare() const noexcept override {
-      return childWeight->needsPrepare();
+    Weight(Context& context, ConstantScoreQuery& query, int32_t flags)
+      : Query::Weight(context, flags), constantScore(query.constantScore) {
+      // The child constrains matches; this wrapper replaces its score.
+      childWeight = query.child->createWeight(context, flags & ~NEED_SCORES);
+      // The wrapper is constant-scoring; prepare still follows the child.
+      traits |= IS_CONSTANT_SCORING | (childWeight->getFlags() & NEEDS_PREPARE);
     }
 
     std::unique_ptr<Query::Weight::PreparedWeight> prepare(Query::Weight::PrepareContext& ctx) override {

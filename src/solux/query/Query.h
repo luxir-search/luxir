@@ -18,7 +18,7 @@ class DocSet;
 
 // Overview
 // ========
-// Execution follows Lucene's shape -- Query -> Weight -> Scorer -- plus one
+// Execution follows Lucene's shape: Query -> Weight -> Scorer, plus one
 // addition, prepare(), for queries that need a whole-index pass before
 // per-segment scoring.
 //
@@ -33,33 +33,27 @@ class DocSet;
 //   Scorer  : created by a ScorerSupplier for a single segment; iterates that
 //             segment's matching docs.
 //
-// Two phases, with different threading and allocation rules -- getting these
+// Two phases, with different threading and allocation rules. Getting these
 // wrong can be a data race, so they are part of the contract:
 //
-// 1. Build -- single-threaded, before search tasks are dispatched.
+// 1. Build: single-threaded, before search tasks are dispatched.
 //    createWeight() walks the Query tree and builds the Weight tree.  Weight
 //    ctors may read/populate the shared Query::Context (field/term caches) and
 //    allocate from Context::pool (the per-request MemPool).  Safe ONLY because
 //    it runs before any task is dispatched.
 //
-// 2. Execute -- parallel, on the TBB task pool.
-//    a. prepare() -- optional.  A Weight whose needsPrepare() returns true is
-//       prepared before its segment scorers are created.  It is for any weight
-//       that must resolve state across the whole index before per-segment
-//       scorers exist: a leaf computing an index-level result (e.g. KnnQuery,
-//       whose FAISS index is index-level and whose search runs once,
-//       pre-filtered by the active per-segment domains), or a compound (a query
-//       with child queries, e.g. BooleanQuery) that must prepare its children
-//       and hand them the per-segment domains they need before they run.
-//       prepare() returns an
-//       immutable
-//       PreparedWeight holding the whole-index result; scorerSupplier() then
-//       reads from it per segment.  Compound queries propagate: needsPrepare()
-//       ORs over children, and prepare() recursively prepares children,
-//       threading per-segment domains down (e.g. Boolean materializes its
-//       filter clauses into a domain that narrows the scoring children's
-//       search).
-//    b. scorerSupplier(targetPool, segment) -- called as needed for a segment,
+// 2. Execute: parallel, on the TBB task pool.
+//    a. prepare(): optional.  A Weight with the NEEDS_PREPARE trait is prepared
+//       before its segment scorers are created.  This is for any weight that
+//       must resolve state across the whole index before per-segment scorers
+//       exist: a leaf computing an index-level result (e.g. KnnQuery), or a
+//       compound query (e.g. BooleanQuery) that must prepare children after
+//       deriving their per-segment domains.
+//       prepare() returns an immutable PreparedWeight holding the whole-index
+//       result; scorerSupplier() then reads from it per segment.  Compound
+//       weights set NEEDS_PREPARE from child traits and recursively prepare
+//       children, threading per-segment domains down.
+//    b. scorerSupplier(targetPool, segment): called as needed for a segment,
 //       often from parallel tasks.  The supplier's get() creates the Scorer.
 //
 //    Because (a) and (b) can run on worker threads, they MUST NOT allocate from
@@ -155,11 +149,14 @@ public:
   class ScorerSupplier;
   class SegmentSource;
 
+  /// Input flags for createWeight(). NEED_SCORES is propagated down the query
+  /// tree and cleared for clauses whose score the parent never reads.
+  static constexpr int32_t NEED_SCORES = 1;
+
   /// Returns a non-owning pointer to the created weight.  The Query::Context
   /// is responsible for the lifecycle of the created Weight.
   /// A Context is not generally thread-safe, so don't create weights from multiple threads with the same Context.
-  // TODO: pass down flags like NEED_SCORES, etc
-  virtual Query::Weight* createWeight(Query::Context& context) = 0;
+  virtual Query::Weight* createWeight(Query::Context& context, int32_t flags) = 0;
 
   /// Per-segment planning state. Suppliers are allocated from the segment-local
   /// targetPool and only need to live until their parent has called get().
@@ -347,8 +344,15 @@ public:
   class Weight : public Query::SegmentSource {
   protected:
     Query::Context& context;
+    // Input flags passed to createWeight(), such as NEED_SCORES. These are
+    // construction directives; public callers should use traits for properties
+    // computed by the weight.
+    int32_t inputFlags;
+    // Execution traits computed at construction. Default 0 is conservative:
+    // no prepare pass and no constant-scoring fast path.
+    int32_t traits = 0;
   public:
-    Weight(Query::Context& context) : context(context) {}
+    Weight(Query::Context& context, int32_t inputFlags) : context(context), inputFlags(inputFlags) {}
 
     /// Per-segment domains available during prepare(). An empty domain span
     /// means unrestricted aside from whatever the caller applies later.
@@ -357,20 +361,13 @@ public:
     /// it is liveDocs intersected with any enclosing filter clauses, and is
     /// the complete eligibility predicate (consumers must not re-check
     /// liveDocs).  A null domain means the segment has no deletes and no
-    /// enclosing filters.  RootOp establishes this by seeding every
-    /// segment's base domain with liveDocs; every domain-deriving seam
-    /// (filter materialization, boolean child contexts) preserves it.
+    /// enclosing filters; all docs in the segment are eligible.  RootOp
+    /// establishes this, and every domain-deriving path preserves it.
     ///
     /// parallel is true when the request runs under a TBB task group; a
     /// prepare() implementation may then spawn internal worker tasks, provided
     /// they are joined before prepare() returns.  false means the request is
     /// serial and prepare() must not spawn tasks.
-    ///
-    /// The constructor deliberately has no default for parallel: a derived
-    /// context built from a parent ctx must forward ctx.parallel, and a
-    /// defaulted field would let a new construction site silently strand
-    /// nested queries in serial mode (an aggregate would value-initialize the
-    /// missing field just as silently).
     struct PrepareContext {
       IndexReader& reader;
       std::span<DocSet* const> domainPerSeg;
@@ -396,9 +393,22 @@ public:
       virtual ~PreparedWeight() = default;
     };
 
+    /// Execution traits computed once at construction. These are a distinct
+    /// bit-space from createWeight() input flags: input flags say what the
+    /// parent requested, traits say what is true of the built weight.
+    static constexpr int32_t NEEDS_PREPARE = 1 << 0;        // needs a whole-index prepare() pass
+    static constexpr int32_t IS_CONSTANT_SCORING = 1 << 1;  // every matching doc scores the same
+
+    /// Raw execution trait bitmask.
+    int32_t getFlags() const noexcept { return traits; }
+
     /// True if this Weight needs prepare() before segment scorer creation.
-    /// Compound queries should return true if any child needs preparation.
-    virtual bool needsPrepare() const noexcept { return false; }
+    bool needsPrepare() const noexcept { return (traits & NEEDS_PREPARE) != 0; }
+
+    /// True if every matching doc receives the same score. Leaf terms/phrases
+    /// set this when built without NEED_SCORES; wrappers and compounds set it
+    /// from their scoring semantics. Advisory: false is always safe.
+    bool isConstantScoring() const noexcept { return (traits & IS_CONSTANT_SCORING) != 0; }
 
     /// Optional execution-time preparation for weights that need the domain for
     /// all segments before they can create a scorer for any individual segment,

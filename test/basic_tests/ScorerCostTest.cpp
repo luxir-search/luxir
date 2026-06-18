@@ -7,6 +7,7 @@
 #include "solux/query/BooleanQuery.h"
 #include "solux/query/ConstantScoreQuery.h"
 #include "solux/query/ForcePrepareQuery.h"
+#include "solux/query/AllQuery.h"
 
 using namespace solux;
 using namespace solux::test;
@@ -31,7 +32,7 @@ public:
 
   int64_t cost(Query* q) {
     Query::Context ctx(pool, *reader);
-    auto* weight = q->createWeight(ctx);
+    auto* weight = q->createWeight(ctx, Query::NEED_SCORES);
     auto& seg = reader->segments()[0];
     // Mirror execution: queries that need a whole-index pass (ForcePrepare, or a
     // boolean that contains one) are scored through their PreparedWeight, so read
@@ -61,6 +62,12 @@ public:
   BooleanQuery* filterBoolq(std::span<Query*> filter, std::span<Query*> optional) {
     std::span<Query*> none{};
     return pool.make<BooleanQuery>(none, optional, none, filter, 0);
+  }
+
+  // Build a weight with the given input flags and inspect its computed traits.
+  bool isConstant(Query* q, int32_t flags = Query::NEED_SCORES) {
+    Query::Context ctx(pool, *reader);
+    return q->createWeight(ctx, flags)->isConstantScoring();
   }
 };
 
@@ -121,4 +128,56 @@ TEST_F(ScorerCostTest, preparedBooleanFilterUsesDocSetCardinality) {
   // cardinality, not maxDoc (which would give 6).
   auto* opt = pool.make<ForcePrepareQuery>(term("a"));
   EXPECT_EQ(1, cost(filterBoolq(clauses({term("c")}), clauses({opt}))));
+}
+
+TEST_F(ScorerCostTest, needScoresFlagControlsScoring) {
+  Query::Context ctx(pool, *reader);
+  auto& seg = reader->segments()[0];
+  TermQuery tq("body_w", "a");
+
+  auto* scoredSup = tq.createWeight(ctx, Query::NEED_SCORES)->scorerSupplier(pool, seg);
+  auto* unscoredSup = tq.createWeight(ctx, 0)->scorerSupplier(pool, seg);
+
+  // cost() comes from the term's doc count (gathered regardless of scoring
+  // setup), not the sim scorer - so skipping scores must not change it.
+  EXPECT_EQ(6, scoredSup->cost());
+  EXPECT_EQ(scoredSup->cost(), unscoredSup->cost());
+
+  // With NEED_SCORES the term scorer produces a real BM25 score.
+  auto* scored = scoredSup->get(pool, std::numeric_limits<int64_t>::max());
+  ASSERT_NE(scored, nullptr);
+  scored->next();
+  EXPECT_GT(scored->score(), 0.0f);
+
+  // Without it (a filter-style clause) scoring setup is skipped; score() is 0.
+  auto* unscored = unscoredSup->get(pool, std::numeric_limits<int64_t>::max());
+  ASSERT_NE(unscored, nullptr);
+  unscored->next();
+  EXPECT_EQ(0.0f, unscored->score());
+}
+
+TEST_F(ScorerCostTest, constantScoringTrait) {
+  // A scored term varies (BM25); AllQuery and constant_score are constant.
+  EXPECT_FALSE(isConstant(term("a")));
+  EXPECT_TRUE(isConstant(pool.make<ConstantScoreQuery>(term("a"), 1.0f)));
+  EXPECT_TRUE(isConstant(pool.make<AllQuery>()));
+
+  // The same term built without scoring always returns score 0.
+  EXPECT_TRUE(isConstant(term("a"), 0));
+
+  // Pure-filter booleans score 0; constant mandatory clauses add to a fixed sum.
+  std::span<Query*> none{};
+  EXPECT_TRUE(isConstant(filterBoolq(clauses({term("a")}), none)));
+  EXPECT_TRUE(isConstant(boolq(clauses({pool.make<ConstantScoreQuery>(term("a"), 1.0f),
+                                        pool.make<ConstantScoreQuery>(term("b"), 1.0f)}), {})));
+
+  // Optional clauses make the sum depend on which clauses match. A scored
+  // mandatory term is also non-constant.
+  EXPECT_FALSE(isConstant(boolq({}, clauses({term("a"), term("b")}))));
+  EXPECT_FALSE(isConstant(boolq(clauses({term("a")}), {})));
+
+  // Regression: clearing NEED_SCORES on a boolean does not by itself make the
+  // boolean constant; children may still produce non-zero scores.
+  EXPECT_FALSE(isConstant(boolq({}, clauses({pool.make<ConstantScoreQuery>(term("a"), 1.0f),
+                                             pool.make<ConstantScoreQuery>(term("b"), 1.0f)})), 0));
 }

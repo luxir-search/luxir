@@ -207,11 +207,14 @@ public:
   // the resulting span.
   std::span<Query::Weight*> buildFilterWeights(
       std::span<std::pair<std::string_view, Query*>> filters,
-      Query::Context& qcontext) {
+      Query::Context& qcontext, int32_t requestFlags) {
     if (filters.empty()) return {};
+    // Filters constrain matches but never contribute to score. Preserve any
+    // future request flags, but clear NEED_SCORES.
+    int32_t filterFlags = requestFlags & ~Query::NEED_SCORES;
     auto weights = req.requestPool.make_span<Query::Weight*>(filters.size());
     for (size_t i = 0; i < filters.size(); i++) {
-      weights[i] = filters[i].second->createWeight(qcontext);
+      weights[i] = filters[i].second->createWeight(qcontext, filterFlags);
     }
     return weights;
   }
@@ -248,8 +251,13 @@ public:
     // must complete before Arena::Create<TopDocsReq>.
     auto parsedSorts = parseSorts(topDocsReq.sorts());
     auto* qcontext = Query::Context::create(&req.arena, req.requestPool, *req.reader);
-    auto* weight = query->createWeight(*qcontext);
-    auto filterWeights = buildFilterWeights(filters, *qcontext);
+    // Flags for this request's main query. Filters inherit these after
+    // buildFilterWeights clears NEED_SCORES.
+    // TODO: drop NEED_SCORES for count-only / pure field-sort requests once the
+    // collector is confirmed not to read score() in those modes.
+    int32_t requestFlags = Query::NEED_SCORES;
+    auto* weight = query->createWeight(*qcontext, requestFlags);
+    auto filterWeights = buildFilterWeights(filters, *qcontext, requestFlags);
 
     auto* qr = google::protobuf::Arena::Create<TopDocsReq>(
       &req.arena, req, name, topDocsReq, *qcontext, query, weight, limit,
@@ -313,7 +321,8 @@ public:
     // Reuse the first source's qcontext to build the shared filter
     // weights.  All sources share the same reader/pool, so any qcontext
     // works; reusing one avoids an otherwise-unneeded allocation.
-    auto sharedFilterWeights = buildFilterWeights(sharedFilters, sources.front()->qcontext);
+    // Shared filters use the same request flag path as TopDocs filters.
+    auto sharedFilterWeights = buildFilterWeights(sharedFilters, sources.front()->qcontext, Query::NEED_SCORES);
 
     int64_t specifiedLimit = fusionProto.has_limit() ? fusionProto.limit() : 10;
     int64_t limit = specifiedLimit < 0 ? req.reader->maxDoc() : std::min(specifiedLimit, req.reader->maxDoc());

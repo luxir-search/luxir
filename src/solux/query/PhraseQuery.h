@@ -1,5 +1,7 @@
 #pragma once
 
+#include <optional>
+
 #include "Query.h"
 #include "solux/reader/IntColReader.h"
 
@@ -30,8 +32,8 @@ public:
     return positions;
   }
 
-  Weight* createWeight(Context& context) override {
-    return context.pool.make<PhraseQuery::Weight>(context, *this);
+  Weight* createWeight(Context& context, int32_t flags) override {
+    return context.pool.make<PhraseQuery::Weight>(context, *this, flags);
   }
 
 
@@ -39,25 +41,33 @@ public:
     PhraseQuery& query;
     CachedFieldInfo* cachedFieldInfo;
     std::span<CachedTermInfo*> cachedTermInfos;
-    Similarity::BM25Scorer* simScorer;
+    Similarity::BM25Scorer* simScorer = nullptr;
   public:
-    explicit Weight(Query::Context& context, PhraseQuery& query) : Query::Weight(context), query(query) {
+    Weight(Query::Context& context, PhraseQuery& query, int32_t flags)
+            : Query::Weight(context, flags), query(query) {
+      bool needScores = (flags & NEED_SCORES) != 0;
+      // Filter-style phrases match normally but always score 0.
+      if (!needScores) traits |= IS_CONSTANT_SCORING;
       cachedFieldInfo = context.getCachedFieldInfo(query.getField());
-      if (cachedFieldInfo != nullptr) {
-        cachedTermInfos = context.pool.make_span<CachedTermInfo*>(query.getTerms().size());
-        Similarity similarity;
-        double idf = 0.0;
-        for (int i = 0; i < cachedTermInfos.size(); i++) {
-          cachedTermInfos[i] = context.getCachedTerminfo(*cachedFieldInfo, query.getTerms()[i]);
-          if (cachedTermInfos[i] == nullptr) {
-            // can't match if a term doesn't exist
-            cachedFieldInfo = nullptr;
-            return;
-          }
-          idf += similarity.idf(cachedFieldInfo->fieldStats, cachedTermInfos[i]->termStats);
-          simScorer = context.pool.make<Similarity::BM25Scorer>(
-                  similarity.getScorer(1.0f, cachedFieldInfo->fieldStats, (float) idf));
+      if (cachedFieldInfo == nullptr) {
+        return;
+      }
+      cachedTermInfos = context.pool.make_span<CachedTermInfo*>(query.getTerms().size());
+      Similarity similarity;
+      double idf = 0.0;
+      for (int i = 0; i < cachedTermInfos.size(); i++) {
+        cachedTermInfos[i] = context.getCachedTerminfo(*cachedFieldInfo, query.getTerms()[i]);
+        if (cachedTermInfos[i] == nullptr) {
+          // can't match if a term doesn't exist
+          cachedFieldInfo = nullptr;
+          return;
         }
+        idf += similarity.idf(cachedFieldInfo->fieldStats, cachedTermInfos[i]->termStats);
+      }
+      // Position matching does not need BM25; build it only for scoring clauses.
+      if (needScores) {
+        simScorer = context.pool.make<Similarity::BM25Scorer>(
+                similarity.getScorer(1.0f, cachedFieldInfo->fieldStats, (float) idf));
       }
     }
 
@@ -70,7 +80,6 @@ public:
       if (segFieldInfo == nullptr) {
         return nullptr;
       }
-      auto* normsReader = targetPool.make<IntColReader>(segment.postingsReader(), *segFieldInfo);
       auto docsEnums = targetPool.make_span<DocsEnum*>(cachedTermInfos.size());
       for (int i = 0; i < cachedTermInfos.size(); i++) {
         docsEnums[i] = cachedTermInfos[i]->useDocsEnum(targetPool, segment);
@@ -80,10 +89,15 @@ public:
         }
       }
 
+      // Position matching does not need norms when score() is never read.
+      IntColReader* normsReader = (inputFlags & NEED_SCORES) != 0
+              ? targetPool.make<IntColReader>(segment.postingsReader(), *segFieldInfo)
+              : nullptr;
+
       // no need to make copy, the query will outlive the scorers.
       // auto pos = targetPool.copy_span<const int32_t>(query.getPositions());
 
-      return targetPool.make<PhraseQuery::Scorer>(targetPool, docsEnums, query.getPositions(), *normsReader, *simScorer);
+      return targetPool.make<PhraseQuery::Scorer>(targetPool, docsEnums, query.getPositions(), normsReader, simScorer);
     }
 
     // A phrase matches a subset of the docs containing its rarest term, so its
@@ -125,9 +139,9 @@ public:
   class Scorer final : public Query::Scorer {
     std::span<DocsEnum*> docsEnums;
     std::span<const int32_t> positions;
-    // IntColReader normsReader; // prob not necessary?
-    IntColReader::Iterator normsIter;
-    Similarity::BM25Scorer& simScorer;
+    // Both absent when scores are not needed; score() is 0.
+    std::optional<IntColReader::Iterator> normsIter;
+    Similarity::BM25Scorer* simScorer;
 
     int32_t docid = -1;
     int32_t pos = -1;    // position of last match, or END if no more matches.
@@ -201,9 +215,12 @@ public:
 
 
   public:
-    Scorer(MemPool& targetPool, std::span<DocsEnum*> docsEnums, std::span<const int32_t> positions, IntColReader& normsReader,
-           Similarity::BM25Scorer& simScorer)
-            : docsEnums(docsEnums), positions(positions), normsIter(normsReader), simScorer(simScorer) {
+    Scorer(MemPool& targetPool, std::span<DocsEnum*> docsEnums, std::span<const int32_t> positions, IntColReader* normsReader,
+           Similarity::BM25Scorer* simScorer)
+            : docsEnums(docsEnums), positions(positions), simScorer(simScorer) {
+      // Scoring needs both BM25 and norms, or neither.
+      assert((simScorer == nullptr) == (normsReader == nullptr));
+      if (normsReader != nullptr) normsIter.emplace(*normsReader);
       int32_t maxOff = 0;
       for (auto pos: positions) {
         maxOff = std::max(maxOff, pos);
@@ -266,10 +283,11 @@ public:
     }
 
     float score() override {
-      int32_t normDoc = normsIter.advance(docid);
+      if (simScorer == nullptr) return 0.0f;
+      int32_t normDoc = normsIter->advance(docid);
       assert(normDoc == docid);
-      auto encodedNorm = normsIter.value();
-      return simScorer.score((float) freq, encodedNorm);
+      auto encodedNorm = normsIter->value();
+      return simScorer->score((float) freq, encodedNorm);
     }
   };
 

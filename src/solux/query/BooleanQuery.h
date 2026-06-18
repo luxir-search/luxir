@@ -22,8 +22,8 @@ public:
             minShouldMatch(minShouldMatch) {
   }
 
-  Weight* createWeight(Context& context) override {
-    return context.pool.make<BooleanQuery::Weight>(context, *this);
+  Weight* createWeight(Context& context, int32_t flags) override {
+    return context.pool.make<BooleanQuery::Weight>(context, *this, flags);
   }
 
   class Weight final : public Query::Weight {
@@ -34,13 +34,14 @@ public:
     int minShouldMatch = 0;
 
     // Returns a span of Weights, corresponding to the given span of Queries. Some weights can be null.
-    std::span<Query::Weight*> createWeights(solux::MemPool& targetPool, Context& context, std::span<Query*> queries) {
+    std::span<Query::Weight*> createWeights(solux::MemPool& targetPool, Context& context,
+                                            std::span<Query*> queries, int32_t flags) {
       if (queries.size() == 0) {
         return {};
       }
       auto weights = targetPool.make_arr<Query::Weight*>(queries.size());
       for (int i = 0; i < queries.size(); ++i) {
-        weights[i] = queries[i]->createWeight(context);
+        weights[i] = queries[i]->createWeight(context, flags);
       }
       return {weights, queries.size()};
     }
@@ -325,19 +326,29 @@ public:
 
 
   public:
-    Weight(Context& context, BooleanQuery& query) : Query::Weight(context) {
-      mandatoryWeights = createWeights(context.pool, context, query.mandatory);
-      optionalWeights = createWeights(context.pool, context, query.optional);
-      prohibitedWeights = createWeights(context.pool, context, query.prohibited);
-      filterWeights = createWeights(context.pool, context, query.filter);
+    Weight(Context& context, BooleanQuery& query, int32_t flags) : Query::Weight(context, flags) {
+      // Only mandatory and optional clauses can contribute to score.
+      int32_t noScore = flags & ~NEED_SCORES;
+      mandatoryWeights = createWeights(context.pool, context, query.mandatory, flags);
+      optionalWeights = createWeights(context.pool, context, query.optional, flags);
+      prohibitedWeights = createWeights(context.pool, context, query.prohibited, noScore);
+      filterWeights = createWeights(context.pool, context, query.filter, noScore);
       minShouldMatch = query.minShouldMatch;
-    }
 
-    bool needsPrepare() const noexcept override {
-      return QueryPrep::anyNeedsPrepare(mandatoryWeights) ||
-             QueryPrep::anyNeedsPrepare(optionalWeights) ||
-             QueryPrep::anyNeedsPrepare(prohibitedWeights) ||
-             QueryPrep::anyNeedsPrepare(filterWeights);
+      if (QueryPrep::anyNeedsPrepare(mandatoryWeights) ||
+          QueryPrep::anyNeedsPrepare(optionalWeights) ||
+          QueryPrep::anyNeedsPrepare(prohibitedWeights) ||
+          QueryPrep::anyNeedsPrepare(filterWeights)) {
+        traits |= NEEDS_PREPARE;
+      }
+      // Boolean scoring is constant only when every match gets the same sum.
+      // Optional clauses make the sum data-dependent; mandatory clauses are
+      // safe only if each mandatory child is constant.
+      bool constant = optionalWeights.empty();
+      for (auto* w : mandatoryWeights) {
+        if (!w->isConstantScoring()) constant = false;
+      }
+      if (constant) traits |= IS_CONSTANT_SCORING;
     }
 
     std::unique_ptr<Query::Weight::PreparedWeight> prepare(Query::Weight::PrepareContext& ctx) override {
