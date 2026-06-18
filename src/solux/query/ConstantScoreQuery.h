@@ -40,6 +40,25 @@ class ConstantScoreQuery final : public solux::Query {
     }
   };
 
+  // Delegates cost to the child supplier and wraps its scorer with the constant
+  // score, so a constant_score(...) clause reports the child's real cost to a
+  // parent's cost-based planning instead of the default maxDoc.
+  class Supplier final : public Query::ScorerSupplier {
+    Query::ScorerSupplier* childSupplier;
+    float constantScore;
+  public:
+    Supplier(Query::ScorerSupplier* childSupplier, float constantScore)
+      : childSupplier(childSupplier), constantScore(constantScore) {}
+
+    int64_t cost() override { return childSupplier->cost(); }
+
+    Query::Scorer* get(MemPool& targetPool, int64_t leadCost) override {
+      auto* childScorer = childSupplier->get(targetPool, leadCost);
+      if (childScorer == nullptr) return nullptr;
+      return targetPool.make<ConstantScoreQuery::Scorer>(childScorer, constantScore);
+    }
+  };
+
 public:
   ConstantScoreQuery(Query* child, float constantScore = 1.0f) : child(child), constantScore(constantScore) {}
 
@@ -65,6 +84,12 @@ public:
         auto* childScorer = QueryPrep::createScorer(targetPool, segment, child.segmentSource());
         if (childScorer == nullptr) return nullptr;
         return targetPool.make<ConstantScoreQuery::Scorer>(childScorer, constantScore);
+      }
+
+      Query::ScorerSupplier* scorerSupplier(MemPool& targetPool, IndexReader::Segment& segment) override {
+        auto* childSupplier = child.segmentSource().scorerSupplier(targetPool, segment);
+        if (childSupplier == nullptr) return nullptr;
+        return targetPool.make<ConstantScoreQuery::Supplier>(childSupplier, constantScore);
       }
 
       bool outputIsSubsetOfDomain() const noexcept override {
@@ -95,6 +120,12 @@ public:
       auto* childScorer = QueryPrep::createScorer(targetPool, segment, *childWeight);
       if (childScorer == nullptr) return nullptr;
       return targetPool.make<ConstantScoreQuery::Scorer>(childScorer, constantScore);
+    }
+
+    Query::ScorerSupplier* scorerSupplier(MemPool& targetPool, IndexReader::Segment& segment) override {
+      auto* childSupplier = childWeight->scorerSupplier(targetPool, segment);
+      if (childSupplier == nullptr) return nullptr;
+      return targetPool.make<ConstantScoreQuery::Supplier>(childSupplier, constantScore);
     }
   };
 };

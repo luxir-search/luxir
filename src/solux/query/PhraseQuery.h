@@ -85,6 +85,40 @@ public:
 
       return targetPool.make<PhraseQuery::Scorer>(targetPool, docsEnums, query.getPositions(), *normsReader, *simScorer);
     }
+
+    // A phrase matches a subset of the docs containing its rarest term, so its
+    // cardinality cost is the min over the terms' per-segment doc counts (an
+    // upper bound, like Lucene's phrase weight). This is only the cardinality
+    // axis: confirming a phrase is far more work per candidate than a term (the
+    // position walk), which two-phase iteration / match cost would model.
+    class Supplier final : public Query::ScorerSupplier {
+      PhraseQuery::Weight& weight;
+      IndexReader::Segment& segment;
+    public:
+      Supplier(PhraseQuery::Weight& weight, IndexReader::Segment& segment)
+        : weight(weight), segment(segment) {}
+
+      int64_t cost() override {
+        if (weight.cachedFieldInfo == nullptr) return 0;
+        int64_t minCost = -1;
+        for (auto* termInfo : weight.cachedTermInfos) {
+          auto* docsEnum = termInfo->docsEnums[segment.ord];
+          if (docsEnum == nullptr) return 0;  // a term absent here -> phrase matches nothing
+          int64_t c = docsEnum->numDocs();
+          if (minCost < 0 || c < minCost) minCost = c;
+        }
+        return minCost < 0 ? 0 : minCost;
+      }
+
+      Query::Scorer* get(MemPool& targetPool, int64_t leadCost) override {
+        unused(leadCost);
+        return weight.createScorer(targetPool, segment);
+      }
+    };
+
+    Query::ScorerSupplier* scorerSupplier(MemPool& targetPool, IndexReader::Segment& segment) override {
+      return targetPool.make<Supplier>(*this, segment);
+    }
   };
 
 
