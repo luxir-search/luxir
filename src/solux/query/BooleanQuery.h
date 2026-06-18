@@ -161,6 +161,13 @@ public:
         if (optScorer == nullptr) return nullptr;
         boolScorer = optScorer;
       } else if (optScorer == nullptr) {
+        // reqScorer present, but no optional scorer survived this segment (the
+        // optional terms are absent, or fewer survive than minShouldMatch). With
+        // no mandatory clause the optionals are required (conjoined with the
+        // filters), so that is no match here - returning reqScorer would wrongly
+        // emit filter-only docs. With no optional clauses at all, the filters
+        // stand alone, which is correct.
+        if (!hasMandatory && !optionalSources.empty()) return nullptr;
         boolScorer = reqScorer;
       } else if (hasMandatory) {
         boolScorer = targetPool.make<BooleanQuery::MandOptScorer>(targetPool, reqScorer, optScorer);

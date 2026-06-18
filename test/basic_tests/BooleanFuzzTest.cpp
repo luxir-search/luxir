@@ -16,8 +16,13 @@ using namespace solux::test;
 class BooleanFuzzTest : public SoluxTest {
 public:
   CollectionHelper helper;
-  static constexpr const char* VOCAB[] = {"a", "b", "c", "d", "e", "f", "g", "h"};
-  static constexpr int VOCAB_SIZE = 8;
+  // A wide vocabulary over short docs keeps terms sparse, so a clause is often
+  // absent from a whole segment - which is what exercises the per-segment
+  // "scorer is null this segment" paths (e.g. filter + absent optional).
+  static constexpr const char* VOCAB[] = {
+    "a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m",
+    "n", "o", "p", "q", "r", "s", "t", "u", "v", "w", "x", "y", "z"};
+  static constexpr int VOCAB_SIZE = 26;
 
   std::string randTerm() { return VOCAB[rng.rint(VOCAB_SIZE)]; }
 
@@ -46,15 +51,17 @@ public:
 
   void genBool(proto::Query* q, int depth) {
     auto& b = *q->mutable_boolean();
-    int nreq = (int)rng.rint(3);   // 0..2
-    int nopt = (int)rng.rint(4);   // 0..3
-    int nproh = (int)rng.rint(3);  // 0..2
-    if (nreq + nopt == 0) nopt = 1;  // guarantee a positive clause
+    int nreq = (int)rng.rint(3);     // 0..2
+    int nopt = (int)rng.rint(4);     // 0..3
+    int nproh = (int)rng.rint(3);    // 0..2
+    int nfilter = (int)rng.rint(3);  // 0..2
+    if (nreq + nopt + nfilter == 0) nopt = 1;  // guarantee a positive clause
     for (int i = 0; i < nreq; i++) genClause(b.add_required(), depth);
     for (int i = 0; i < nopt; i++) genClause(b.add_optional(), depth);
     for (int i = 0; i < nproh; i++) genClause(b.add_prohibited(), depth);
-    // min_match is only valid for optional-only clauses (parser restriction).
-    if (nopt > 0 && nreq == 0) {
+    for (int i = 0; i < nfilter; i++) genClause(b.add_filter(), depth);
+    // min_match is only valid for optional-only clauses (no required/filter).
+    if (nopt > 0 && nreq == 0 && nfilter == 0) {
       b.set_min_match((int)rng.rint(nopt + 1));  // 0..nopt
     }
   }
@@ -102,13 +109,17 @@ public:
     for (const auto& r : b.required()) {
       if (!clauseMatches(r, toks)) return false;
     }
+    for (const auto& f : b.filter()) {  // filters constrain like required (no score)
+      if (!clauseMatches(f, toks)) return false;
+    }
     for (const auto& p : b.prohibited()) {
       if (clauseMatches(p, toks)) return false;
     }
-    bool hasPositive = b.required_size() > 0 || b.optional_size() > 0;
+    bool hasPositive = b.required_size() > 0 || b.optional_size() > 0 || b.filter_size() > 0;
     if (!hasPositive) return false;
-    // Optional drives matching only when there are no required clauses; with a
-    // required clause present, optional is scoring-only (MandOpt).
+    // Optional must match unless there is a mandatory (required) clause, which
+    // makes the optional side scoring-only (MandOpt). A filter does NOT relax
+    // that - filter + optional conjoins them, so the optional is still required.
     if (b.optional_size() > 0 && b.required_size() == 0) {
       int matched = 0;
       for (const auto& o : b.optional()) {
@@ -121,6 +132,37 @@ public:
     return true;
   }
 };
+
+TEST_F(BooleanFuzzTest, filterRequiresOptionalToMatch) {
+  helper.clear();
+  helper.index(flatdoc("id", "x1", "body_w", "f a"), UpdateMessage::NO_COMMIT);  // f + a
+  helper.index(flatdoc("id", "x2", "body_w", "f"), UpdateMessage::COMMIT);        // f, no a; z nowhere
+
+  auto run = [&](const char* filterTerm, const char* optTerm) {
+    auto* req = LocalReq::create(helper.getSearchEngine());
+    req->collection("main");
+    auto& td = req->topDocs("q");
+    td.set_limit(100);
+    *td.mutable_fields()->Add() = "id";
+    auto& b = *td.mutable_query()->mutable_boolean();
+    auto& f = *b.add_filter()->mutable_match();
+    f.set_field("body_w");
+    f.mutable_val()->set_s(filterTerm);
+    auto& o = *b.add_optional()->mutable_match();
+    o.set_field("body_w");
+    o.mutable_val()->set_s(optTerm);
+    req->execute();
+    std::set<std::string> got;
+    for (const auto& d : req->getDocs()) got.insert(std::get<std::string>(*find(d, "id")));
+    req->done();
+    return got;
+  };
+
+  // No mandatory clause, so the optional is required (conjoined with the filter).
+  EXPECT_EQ((std::set<std::string>{"x1"}), run("f", "a"));  // x2 has f but not a
+  // Optional term absent everywhere -> filter must NOT match on its own.
+  EXPECT_EQ((std::set<std::string>{}), run("f", "z"));
+}
 
 TEST_F(BooleanFuzzTest, twoTermConjunctionAcrossSegments) {
   helper.clear();
@@ -198,7 +240,7 @@ TEST_F(BooleanFuzzTest, randomBooleanMatchesOracle) {
   const int numDocs = 48;
   std::vector<std::pair<std::string, std::vector<std::string>>> docs;
   for (int i = 0; i < numDocs; i++) {
-    int len = (int)rng.rint(2, 7);  // 2..6 tokens
+    int len = (int)rng.rint(1, 5);  // 1..4 tokens (short, so terms stay sparse)
     std::vector<std::string> toks;
     std::string text;
     for (int j = 0; j < len; j++) {
