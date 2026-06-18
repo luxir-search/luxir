@@ -45,6 +45,74 @@ public:
       return {weights, queries.size()};
     }
 
+    // Outcome of building the required (mandatory + filter) conjunction for a
+    // segment. `scorer` is null when there are no required clauses at all;
+    // `unsatisfiable` is true when a required clause cannot match this segment,
+    // so the whole boolean cannot match it.
+    struct Required {
+      Query::Scorer* scorer;
+      bool unsatisfiable;
+    };
+
+    // Build the required-clause conjunction. Mandatory clauses score; filter
+    // clauses only constrain iteration. Required clauses are ordered by ascending
+    // supplier cost so the sparsest leads the conjunction (the highest-leverage
+    // win for a "+rare +common" or "+term filter:x" query), and the sparsest cost
+    // is passed as leadCost to every child get() per the supplier planning
+    // contract. Because a Solux Scorer exposes no cost(), this ordering has to
+    // happen here at the supplier layer, before any scorer is constructed.
+    static Required assembleRequired(
+        MemPool& targetPool,
+        IndexReader::Segment& segment,
+        std::span<Query::SegmentSource* const> mandatorySources,
+        std::span<Query::ScorerSupplier* const> filterSuppliers) {
+      struct Entry {
+        int64_t cost;
+        Query::ScorerSupplier* supplier;
+        bool scoring;
+      };
+      boost::container::small_vector<Entry, 16> entries;
+      for (auto* source : mandatorySources) {
+        auto* supplier = source->scorerSupplier(targetPool, segment);
+        if (supplier == nullptr) return {nullptr, true};
+        entries.push_back({supplier->cost(), supplier, true});
+      }
+      for (auto* supplier : filterSuppliers) {
+        if (supplier == nullptr) return {nullptr, true};
+        entries.push_back({supplier->cost(), supplier, false});
+      }
+      if (entries.empty()) return {nullptr, false};
+
+      // leadCost is the cost of the sparsest required clause: it bounds how often
+      // the others get driven, so each may plan eager vs lazy setup off it.
+      int64_t leadCost = std::numeric_limits<int64_t>::max();
+      for (auto& e : entries) leadCost = std::min(leadCost, e.cost);
+
+      // Sparsest first so allScorers[0] leads the conjunction.
+      std::sort(entries.begin(), entries.end(),
+                [](const Entry& a, const Entry& b) { return a.cost < b.cost; });
+
+      auto* all = targetPool.make_arr<Query::Scorer*>(entries.size());
+      Query::Scorer** scoring = mandatorySources.empty()
+        ? nullptr
+        : targetPool.make_arr<Query::Scorer*>(mandatorySources.size());
+      size_t allCount = 0;
+      size_t scoringCount = 0;
+      for (auto& e : entries) {
+        auto* scorer = e.supplier->get(targetPool, leadCost);
+        if (scorer == nullptr) return {nullptr, true};
+        all[allCount++] = scorer;
+        if (e.scoring) scoring[scoringCount++] = scorer;
+      }
+
+      // A lone scoring clause (one mandatory, no filters) needs no wrapper.
+      if (allCount == 1 && scoringCount == 1) return {all[0], false};
+      return {targetPool.make<BooleanQuery::ConjunctionScorer>(
+                targetPool, std::span<Query::Scorer*>(all, allCount),
+                std::span<Query::Scorer*>(scoring, scoringCount)),
+              false};
+    }
+
     // Keep clause wiring in one place so prepared and non-prepared execution
     // cannot diverge on filter/prohibited semantics.
     static Query::Scorer* assembleScorer(
@@ -53,17 +121,16 @@ public:
         std::span<Query::SegmentSource* const> mandatorySources,
         std::span<Query::SegmentSource* const> optionalSources,
         std::span<Query::SegmentSource* const> prohibitedSources,
-        std::span<Query::Scorer*> filterScorers,
+        std::span<Query::ScorerSupplier* const> filterSuppliers,
         int minShouldMatch) {
-      auto mandatoryScorers = QueryPrep::createScorers(targetPool, segment, mandatorySources);
-      if (mandatoryScorers.size() < mandatorySources.size()) return nullptr;
-
-      Query::Scorer* mandScorer = nullptr;
-      if (!mandatoryScorers.empty()) {
-        mandScorer = mandatoryScorers.size() == 1 && filterScorers.empty()
-          ? mandatoryScorers[0]
-          : targetPool.make<BooleanQuery::ConjunctionScorer>(targetPool, mandatoryScorers, filterScorers);
-      }
+      Required req = assembleRequired(targetPool, segment, mandatorySources, filterSuppliers);
+      if (req.unsatisfiable) return nullptr;
+      Query::Scorer* reqScorer = req.scorer;
+      // Whether a scoring-required (mandatory) clause exists decides how optionals
+      // combine: with a mandatory clause they are a pure score add (ReqOpt); with
+      // only filters they must match (conjunction). This mirrors the prior
+      // mandScorer-vs-filter discriminator.
+      bool hasMandatory = !mandatorySources.empty();
 
       // For min-should-match (> 1) order the optional scorers by cost so the
       // pigeonhole lead/tail split leads with the cheapest (sparsest) iterators.
@@ -79,9 +146,9 @@ public:
             ? optionalScorers[0]
             : targetPool.make<BooleanQuery::DisjunctionScorer>(targetPool, optionalScorers);
         } else if (optCount == minShouldMatch) {
-          // Every surviving optional clause is required.
+          // Every surviving optional clause is required and scores.
           optScorer = targetPool.make<BooleanQuery::ConjunctionScorer>(
-            targetPool, optionalScorers, std::span<Query::Scorer*>());
+            targetPool, optionalScorers, optionalScorers);
         } else if (optCount > minShouldMatch) {
           optScorer = targetPool.make<BooleanQuery::MinShouldMatchScorer>(
             targetPool, optionalScorers, minShouldMatch);
@@ -89,23 +156,23 @@ public:
       }
 
       Query::Scorer* boolScorer = nullptr;
-      if (mandScorer == nullptr) {
-        if (optScorer == nullptr) {
-          if (filterScorers.empty()) return nullptr;
-          boolScorer = targetPool.make<BooleanQuery::ConjunctionScorer>(
-            targetPool, std::span<Query::Scorer*>(), filterScorers);
-        } else {
-          boolScorer = optScorer;
-          if (!filterScorers.empty()) {
-            std::span<Query::Scorer*> optSpan(targetPool.make_arr<Query::Scorer*>(1), 1);
-            optSpan[0] = optScorer;
-            boolScorer = targetPool.make<BooleanQuery::ConjunctionScorer>(targetPool, optSpan, filterScorers);
-          }
-        }
+      if (reqScorer == nullptr) {
+        // No required clauses: the optional side stands alone.
+        if (optScorer == nullptr) return nullptr;
+        boolScorer = optScorer;
       } else if (optScorer == nullptr) {
-        boolScorer = mandScorer;
+        boolScorer = reqScorer;
+      } else if (hasMandatory) {
+        boolScorer = targetPool.make<BooleanQuery::MandOptScorer>(targetPool, reqScorer, optScorer);
       } else {
-        boolScorer = targetPool.make<BooleanQuery::MandOptScorer>(targetPool, mandScorer, optScorer);
+        // Filters + optionals, no mandatory: the optional side must match, so
+        // conjoin it with the required filters; only the optional side scores.
+        std::span<Query::Scorer*> allSpan(targetPool.make_arr<Query::Scorer*>(2), 2);
+        allSpan[0] = reqScorer;
+        allSpan[1] = optScorer;
+        std::span<Query::Scorer*> scoringSpan(targetPool.make_arr<Query::Scorer*>(1), 1);
+        scoringSpan[0] = optScorer;
+        boolScorer = targetPool.make<BooleanQuery::ConjunctionScorer>(targetPool, allSpan, scoringSpan);
       }
 
       auto prohibitedScorers = QueryPrep::createScorers(targetPool, segment, prohibitedSources);
@@ -139,13 +206,15 @@ public:
           hasFilters(hasFilters), minShouldMatch(minShouldMatch) {}
 
       Query::Scorer* createScorer(MemPool& targetPool, IndexReader::Segment& segment) override {
-        std::span<Query::Scorer*> filterScorers;
+        // Expose the per-segment filter domain as a supplier (cost = its exact
+        // cardinality) so it joins the required cost ordering. An empty domain
+        // surfaces as a null scorer in assembleRequired -> the boolean cannot
+        // match this segment.
+        std::span<Query::ScorerSupplier*> filterSuppliers;
         if (hasFilters) {
           auto* filterDomain = filterDomains[(size_t)segment.ord].get();
-          auto* filterScorer = QueryPrep::createDocSetScorer(targetPool, filterDomain, segment);
-          if (filterScorer == nullptr) return nullptr;
-          filterScorers = {targetPool.make_arr<Query::Scorer*>(1), 1};
-          filterScorers[0] = filterScorer;
+          filterSuppliers = {targetPool.make_arr<Query::ScorerSupplier*>(1), 1};
+          filterSuppliers[0] = targetPool.make<QueryPrep::DocSetSupplier>(filterDomain, segment);
         }
 
         return assembleScorer(
@@ -154,7 +223,7 @@ public:
           QueryPrep::segmentSources(targetPool, QueryPrep::preparedSpan(mandatorySources)),
           QueryPrep::segmentSources(targetPool, QueryPrep::preparedSpan(optionalSources)),
           QueryPrep::segmentSources(targetPool, QueryPrep::preparedSpan(prohibitedSources)),
-          filterScorers, minShouldMatch);
+          filterSuppliers, minShouldMatch);
       }
     };
 
@@ -213,13 +282,13 @@ public:
       auto optionalSources = QueryPrep::liveSources(targetPool, optionalWeights);
       auto prohibitedSources = QueryPrep::liveSources(targetPool, prohibitedWeights);
       auto filterSources = QueryPrep::liveSources(targetPool, filterWeights);
-      auto filterScorers = QueryPrep::createScorers(targetPool, segment, filterSources);
-
-      // If any filter scorer is missing for this segment, no document can match.
-      if (filterScorers.size() < filterSources.size()) return nullptr;
+      // Filters join the required cost ordering as suppliers; a filter that
+      // cannot match this segment surfaces in assembleRequired (null supplier or
+      // null scorer), making the whole boolean unsatisfiable here.
+      auto filterSuppliers = QueryPrep::collectSuppliers(targetPool, segment, filterSources);
 
       return assembleScorer(
-        targetPool, segment, mandatorySources, optionalSources, prohibitedSources, filterScorers,
+        targetPool, segment, mandatorySources, optionalSources, prohibitedSources, filterSuppliers,
         minShouldMatch);
     }
   };  // BooleanQuery::Weight
@@ -329,8 +398,8 @@ public:
 
 
   class ConjunctionScorer final : public Query::Scorer {
-    std::span<Scorer*> scorers;    // just the mandatory scorers
-    std::span<Scorer*> allScorers; // mandatory scorers combined with filter scorers
+    std::span<Scorer*> scorers;    // subset of allScorers that contributes to score()
+    std::span<Scorer*> allScorers; // every required iterator, ascending cost (lead first)
 
     // TODO: OPT: heapifying with virtual methods prob isn't a good idea... pull out and save the docid.
     constexpr static auto idComparator = [](Query::Scorer& a, Query::Scorer& b) { return b.docId() < a.docId(); };
@@ -365,19 +434,15 @@ public:
     }
 
   public:
-    // The passed in span of scorers will be modified (rearranged).
-    ConjunctionScorer(solux::MemPool& pool, std::span<Scorer*> scorers, std::span<Scorer*> filterScorers)
-            : scorers(scorers) {
-      // combine the filterScorers with the mandatory scorers
-      if (filterScorers.size() != 0) {
-        allScorers = {pool.make_arr<Scorer*>(scorers.size() + filterScorers.size()),
-                      scorers.size() + filterScorers.size()};
-        std::ranges::copy(filterScorers, allScorers.begin());
-        std::ranges::copy(scorers, allScorers.begin() + filterScorers.size());
-        // TODO: if any mandatory scorers are boosted to 0, we could remove them from scorers (keeping them in allScorers) for when score() is called.
-      } else {
-        allScorers = scorers;
-      }
+    // allScorers: every required iterator, ordered by ascending cost so
+    // allScorers[0] is the sparsest and leads the matching. scoringScorers: the
+    // subset whose score() contributes to the conjunction score (filter clauses
+    // iterate but do not score); every entry must also appear in allScorers.
+    // TODO: if any scoring scorer is boosted to 0 it could be dropped from the
+    // scoring subset while staying in allScorers.
+    ConjunctionScorer(solux::MemPool& pool, std::span<Scorer*> allScorers, std::span<Scorer*> scoringScorers)
+            : scorers(scoringScorers), allScorers(allScorers) {
+      unused(pool);
     }
 
     int32_t next() override {

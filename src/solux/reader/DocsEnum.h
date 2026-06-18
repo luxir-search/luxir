@@ -267,7 +267,10 @@ public:
   }
 
 
+  // Strict (like the Scorer / Lucene PostingsEnum contract): target must be
+  // beyond the current doc. The only caller, PhraseQuery::doNext, guards.
   int32_t advance(int32_t target) {
+    assert(docid < target);
     while (docid < target) {
       nextDoc();
     }

@@ -1821,9 +1821,7 @@ public:
     }
 
     int32_t advance(int32_t docid) override {
-      if (cur >= 0 && cur < (int32_t)hits.size() && hits[cur].docId >= docid) {
-        return hits[cur].docId;
-      }
+      assert(docId() < docid);  // strict Scorer contract; callers guard
       int32_t doc;
       while ((doc = next()) < docid) {}
       return doc;

@@ -131,6 +131,20 @@ inline std::span<Query::Scorer*> createScorersByCost(MemPool& targetPool,
   return {scorers, count};
 }
 
+// Collect a ScorerSupplier for each source, keeping a 1:1 mapping with the input
+// (a null entry means that source cannot match this segment). Lets a parent plan
+// over child costs - and pick lead iterators - before any scorer is built.
+inline std::span<Query::ScorerSupplier*> collectSuppliers(MemPool& targetPool,
+                                                          IndexReader::Segment& segment,
+                                                          std::span<Query::SegmentSource* const> sources) {
+  if (sources.empty()) return {};
+  auto* suppliers = targetPool.make_arr<Query::ScorerSupplier*>(sources.size());
+  for (size_t i = 0; i < sources.size(); i++) {
+    suppliers[i] = sources[i]->scorerSupplier(targetPool, segment);
+  }
+  return {suppliers, sources.size()};
+}
+
 class DocSetScorer final : public Query::Scorer {
   DocSet* docs;
   int32_t maxDoc;
@@ -159,7 +173,7 @@ public:
   }
 
   int32_t advance(int32_t docid) override {
-    if (doc >= docid) return doc;
+    assert(doc < docid);  // strict Scorer contract; callers guard
     if (docs->type == DocSet::ARRAY) {
       auto it = std::lower_bound(arrDocs.begin(), arrDocs.end(), docid);
       if (it == arrDocs.end()) {
@@ -190,6 +204,25 @@ inline Query::Scorer* createDocSetScorer(MemPool& targetPool, DocSet* docs,
   if (docs == nullptr || docs->card() == 0) return nullptr;
   return targetPool.make<DocSetScorer>(docs, segment.maxDoc());
 }
+
+// Supplier over a pre-materialized filter domain (a prepared boolean's per-segment
+// filter result). cost() is the exact domain cardinality, so a parent conjunction
+// can order it against the other required clauses - a selective filter should lead
+// the iteration rather than always being walked first by clause position.
+class DocSetSupplier final : public Query::ScorerSupplier {
+  DocSet* docs;
+  IndexReader::Segment& segment;
+
+public:
+  DocSetSupplier(DocSet* docs, IndexReader::Segment& segment) : docs(docs), segment(segment) {}
+
+  int64_t cost() override { return docs == nullptr ? 0 : (int64_t)docs->card(); }
+
+  Query::Scorer* get(MemPool& targetPool, int64_t leadCost) override {
+    unused(leadCost);
+    return createDocSetScorer(targetPool, docs, segment);
+  }
+};
 
 inline std::unique_ptr<DocSet> materialize(Query::SegmentSource& source,
                                            IndexReader::Segment& segment,

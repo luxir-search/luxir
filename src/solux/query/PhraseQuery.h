@@ -108,12 +108,17 @@ public:
       outer:
       for (;;) {
         for (int j = 1; j < docsEnums.size(); j++) {
-          int32_t id = docsEnums[j]->advance(target);
-          assert(id >= target);
-          if (id > target) {
-            // TODO: explicitly handle END here for faster termination?
-            target = firstEnum->advance(id);
-            goto outer;  // could perhaps replace with "j=0; continue;" but that seems potentially worse?
+          // docsEnums[j] may already sit on target (firstEnum landed exactly on a
+          // doc it was already at); advance() is strict, so only advance the ones
+          // that are behind (same guard as ConjunctionScorer).
+          if (docsEnums[j]->docId() < target) {
+            int32_t id = docsEnums[j]->advance(target);
+            assert(id >= target);
+            if (id > target) {
+              // TODO: explicitly handle END here for faster termination?
+              target = firstEnum->advance(id);
+              goto outer;  // could perhaps replace with "j=0; continue;" but that seems potentially worse?
+            }
           }
         }
         // if we made it through the loop, all docsenum matched (maybe at END)
