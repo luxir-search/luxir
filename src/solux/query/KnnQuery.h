@@ -1829,10 +1829,6 @@ public:
       return doc;
     }
 
-    bool advanceExact(int32_t docid) override {
-      return advance(docid) == docid;
-    }
-
     int32_t docId() override {
       if (cur < 0) return -1;
       return cur < (int32_t)hits.size() ? hits[cur].docId : PostingsReader::END;

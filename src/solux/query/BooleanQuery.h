@@ -246,7 +246,6 @@ public:
     Scorer* mandScorer;
     Scorer* optScorer;
     int32_t id = -1;
-    int32_t optId = -1;
   public:
     MandOptScorer(solux::MemPool& targetPool, Scorer* mandScorer, Scorer* optScorer) : mandScorer(mandScorer),
                                                                                        optScorer(optScorer) {
@@ -267,20 +266,14 @@ public:
       return id;
     }
 
-    bool advanceExact(int32_t docid) override {
-      if (!mandScorer->advanceExact(docid)) return false;
-      id = docid;
-      return true;
-    }
-
     float score() override {
       float score = mandScorer->score();
-      if (optId < id) {
-        if (optScorer->advanceExact(id)) {
-          optId = id;
-        }
+      // Consult the optional scorer for this exact doc (Lucene's ReqOptSumScorer
+      // style): advance it only if behind, then add its score on an exact hit.
+      if (optScorer->docId() < id) {
+        optScorer->advance(id);
       }
-      if (optId == id) {
+      if (optScorer->docId() == id) {
         score += optScorer->score();
       }
       return score;
@@ -310,13 +303,6 @@ public:
     int32_t advance(int32_t docid) override {
       id = mandScorer->advance(docid);
       return doNext();
-    }
-
-    bool advanceExact(int32_t target) override {
-      if (id < target) {
-        advance(target);
-      }
-      return id == target;
     }
 
     float score() override {
@@ -434,7 +420,9 @@ public:
     }
 
     int32_t next() override {
-      // Parent advanceExact() paths can call next() after exhaustion.
+      // A parent's advance() (which loops on next()) can call us again after we
+      // returned END - e.g. MandOptScorer scoring a required doc past the last
+      // optional match. Stay idempotent at END.
       if (pq.size() == 0) {
         return docid = solux::PostingsReader::END;
       }

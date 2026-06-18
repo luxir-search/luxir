@@ -180,16 +180,6 @@ public:
     return doc;
   }
 
-  bool advanceExact(int32_t docid) override {
-    if (!docs->get(docid)) return false;
-    doc = docid;
-    if (docs->type == DocSet::ARRAY) {
-      auto it = std::lower_bound(arrDocs.begin(), arrDocs.end(), docid);
-      arrIdx = (int32_t)(it - arrDocs.begin());
-    }
-    return true;
-  }
-
   int32_t docId() override { return doc; }
 
   float score() override { return 0.0f; }

@@ -31,10 +31,6 @@ class ConstantScoreQuery final : public solux::Query {
       return child->advance(docid);
     }
 
-    bool advanceExact(int32_t docid) override {
-      return child->advanceExact(docid);
-    }
-
     int32_t docId() override {
       return child->docId();
     }
