@@ -185,11 +185,34 @@ public:
       return boolScorer;
     }
 
-    // Composite cardinality cost for a boolean, from its child supplier costs -
-    // an upper bound, mirroring how assembleScorer combines them. So a nested
-    // boolean clause reports a real cost to a parent's cost ordering instead of
-    // the default maxDoc. Estimate only: it uses query-level clause counts (not
-    // per-segment survival) and ignores prohibited (which can only remove docs).
+    // Estimates the optional group's match cost: disjunction is the sum (capped),
+    // min-should-match the sum of the cheapest n - mm + 1, all-required the rarest.
+    static int64_t optionalCost(
+        MemPool& targetPool,
+        IndexReader::Segment& segment,
+        std::span<Query::SegmentSource* const> optionalSources,
+        int minShouldMatch,
+        int64_t maxDoc) {
+      boost::container::small_vector<int64_t, 16> costs;
+      for (auto* source : optionalSources) {
+        auto* supplier = source->scorerSupplier(targetPool, segment);
+        costs.push_back(supplier == nullptr ? 0 : supplier->cost());
+      }
+      int n = (int)costs.size();
+      if (n == 0) return 0;
+      if (minShouldMatch >= n) {  // every optional clause required -> rarest
+        int64_t m = maxDoc;
+        for (auto c : costs) m = std::min(m, c);
+        return m;
+      }
+      int take = minShouldMatch <= 1 ? n : n - minShouldMatch + 1;
+      if (take < n) std::sort(costs.begin(), costs.end());
+      int64_t sum = 0;
+      for (int i = 0; i < take; i++) sum += costs[i];
+      return std::min(sum, maxDoc);
+    }
+
+    // Estimates the boolean match cost from child supplier costs.
     static int64_t compositeCost(
         MemPool& targetPool,
         IndexReader::Segment& segment,
@@ -198,47 +221,31 @@ public:
         std::span<Query::ScorerSupplier* const> filterSuppliers,
         int minShouldMatch) {
       int64_t maxDoc = segment.maxDoc();
-      // Required (mandatory + filter) drives matching when present: the
-      // conjunction matches at most the rarest required clause.
-      if (!mandatorySources.empty() || !filterSuppliers.empty()) {
+      bool hasMandatory = !mandatorySources.empty();
+      if (hasMandatory || !filterSuppliers.empty()) {
+        // Required = mandatory + filter, conjoined: at most the rarest clause.
         int64_t minReq = maxDoc;
         for (auto* source : mandatorySources) {
           auto* supplier = source->scorerSupplier(targetPool, segment);
-          if (supplier == nullptr) return 0;  // required clause absent -> no match here
+          if (supplier == nullptr) return 0;
           minReq = std::min(minReq, supplier->cost());
         }
         for (auto* supplier : filterSuppliers) {
           if (supplier == nullptr) return 0;
           minReq = std::min(minReq, supplier->cost());
         }
+        // A mandatory clause makes the optional side score-only (MandOpt), so it
+        // doesn't constrain. With only filters, the optional side is conjoined
+        // (it must match) and can tighten the estimate.
+        if (!hasMandatory && !optionalSources.empty()) {
+          return std::min(minReq, optionalCost(targetPool, segment, optionalSources, minShouldMatch, maxDoc));
+        }
         return minReq;
       }
-      if (optionalSources.empty()) return 0;
-      boost::container::small_vector<int64_t, 16> costs;
-      for (auto* source : optionalSources) {
-        auto* supplier = source->scorerSupplier(targetPool, segment);
-        costs.push_back(supplier == nullptr ? 0 : supplier->cost());
-      }
-      int n = (int)costs.size();
-      if (minShouldMatch >= n) {  // all optional required -> rarest
-        int64_t m = maxDoc;
-        for (auto c : costs) m = std::min(m, c);
-        return m;
-      }
-      // Disjunction (mm <= 1) is the sum; min-should-match needs at least
-      // n - mm + 1 of them, so its cost is the sum of that many cheapest
-      // (Lucene's ScorerUtil.costWithMinShouldMatch). Both capped at maxDoc.
-      int take = minShouldMatch <= 1 ? n : n - minShouldMatch + 1;
-      if (take < n) std::sort(costs.begin(), costs.end());
-      int64_t sum = 0;
-      for (int i = 0; i < take; i++) sum += costs[i];
-      return std::min(sum, maxDoc);
+      return optionalCost(targetPool, segment, optionalSources, minShouldMatch, maxDoc);
     }
 
-    // Supplier over a boolean's per-segment child sources: cost() composes child
-    // costs; get() runs assembleScorer. Stores the source spans (cheap) and
-    // builds child scorers lazily in get(). TODO: OPT cost() re-collects child
-    // suppliers each call; collect once and share with get() if it shows up.
+    // TODO: OPT share child suppliers between cost() and get().
     class Supplier final : public Query::ScorerSupplier {
       MemPool& pool;
       IndexReader::Segment& segment;
@@ -290,10 +297,6 @@ public:
           hasFilters(hasFilters), minShouldMatch(minShouldMatch) {}
 
       Query::ScorerSupplier* scorerSupplier(MemPool& targetPool, IndexReader::Segment& segment) override {
-        // Expose the per-segment filter domain as a supplier (cost = its exact
-        // cardinality) so it joins the required cost ordering. An empty domain
-        // surfaces as a null scorer in assembleRequired -> the boolean cannot
-        // match this segment.
         std::span<Query::ScorerSupplier*> filterSuppliers;
         if (hasFilters) {
           auto* filterDomain = filterDomains[(size_t)segment.ord].get();
@@ -368,9 +371,6 @@ public:
       auto optionalSources = QueryPrep::liveSources(targetPool, optionalWeights);
       auto prohibitedSources = QueryPrep::liveSources(targetPool, prohibitedWeights);
       auto filterSources = QueryPrep::liveSources(targetPool, filterWeights);
-      // Filters join the required cost ordering as suppliers; a filter that
-      // cannot match this segment surfaces in assembleRequired (null supplier or
-      // null scorer), making the whole boolean unsatisfiable here.
       auto filterSuppliers = QueryPrep::collectSuppliers(targetPool, segment, filterSources);
       return targetPool.make<Supplier>(targetPool, segment, mandatorySources, optionalSources,
                                        prohibitedSources, filterSuppliers, minShouldMatch);

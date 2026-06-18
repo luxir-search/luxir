@@ -6,17 +6,12 @@
 #include "solux/query/PhraseQuery.h"
 #include "solux/query/BooleanQuery.h"
 #include "solux/query/ConstantScoreQuery.h"
+#include "solux/query/ForcePrepareQuery.h"
 
 using namespace solux;
 using namespace solux::test;
 
-// Locks the cardinality cost() contract across query types. cost() only drives
-// planning (lead selection), so a value regression - e.g. a phrase or nested
-// boolean silently reverting to the DefaultScorerSupplier's maxDoc - would not
-// change results and the other suites would not catch it.
-//
-// One segment of 6 docs over body_w (whitespace, case-sensitive). Per-term doc
-// counts: a=6, b=3, c=1; maxDoc=6.
+// Single-segment corpus: df(a)=6, df(b)=3, df(c)=1, maxDoc=6.
 class ScorerCostTest : public SoluxTest {
 public:
   CollectionHelper helper;
@@ -34,12 +29,19 @@ public:
     reader = helper.getIndexWriter()->getIndexReader();
   }
 
-  // Cost of a query's supplier on the single segment.
   int64_t cost(Query* q) {
     Query::Context ctx(pool, *reader);
     auto* weight = q->createWeight(ctx);
-    auto* supplier = weight->scorerSupplier(pool, reader->segments()[0]);
-    return supplier->cost();
+    auto& seg = reader->segments()[0];
+    // Mirror execution: queries that need a whole-index pass (ForcePrepare, or a
+    // boolean that contains one) are scored through their PreparedWeight, so read
+    // cost off the prepared supplier - that is the path materialized filters take.
+    if (weight->needsPrepare()) {
+      Query::Weight::PrepareContext pctx{*reader, std::span<DocSet* const>{}, false};
+      auto prepared = weight->prepare(pctx);
+      return prepared->scorerSupplier(pool, seg)->cost();
+    }
+    return weight->scorerSupplier(pool, seg)->cost();
   }
 
   TermQuery* term(std::string_view t) { return pool.make<TermQuery>("body_w", t); }
@@ -54,6 +56,11 @@ public:
   BooleanQuery* boolq(std::span<Query*> mandatory, std::span<Query*> optional, int minShouldMatch = 0) {
     std::span<Query*> none{};
     return pool.make<BooleanQuery>(mandatory, optional, none, none, minShouldMatch);
+  }
+
+  BooleanQuery* filterBoolq(std::span<Query*> filter, std::span<Query*> optional) {
+    std::span<Query*> none{};
+    return pool.make<BooleanQuery>(none, optional, none, filter, 0);
   }
 };
 
@@ -70,21 +77,19 @@ TEST_F(ScorerCostTest, phraseCostIsRarestTerm) {
   auto pos = pool.make_span<int32_t>(2);
   pos[0] = 0;
   pos[1] = 1;
-  // min(a=6, b=3); an upper bound, not the 2 docs the phrase actually matches.
   EXPECT_EQ(3, cost(pool.make<PhraseQuery>("body_w", terms, pos)));
 }
 
 TEST_F(ScorerCostTest, disjunctionCostIsSumCapped) {
-  EXPECT_EQ(4, cost(boolq({}, clauses({term("b"), term("c")}))));   // 3 + 1
-  EXPECT_EQ(6, cost(boolq({}, clauses({term("a"), term("b")}))));   // 6 + 3 capped at maxDoc 6
+  EXPECT_EQ(4, cost(boolq({}, clauses({term("b"), term("c")}))));
+  EXPECT_EQ(6, cost(boolq({}, clauses({term("a"), term("b")}))));
 }
 
 TEST_F(ScorerCostTest, conjunctionCostIsRarest) {
-  EXPECT_EQ(3, cost(boolq(clauses({term("a"), term("b")}), {})));   // min(6, 3)
+  EXPECT_EQ(3, cost(boolq(clauses({term("a"), term("b")}), {})));
 }
 
 TEST_F(ScorerCostTest, minShouldMatchCostIsCheapestSubset) {
-  // optional a(6) b(3) c(1), mm=2 -> sum of the n-mm+1 = 2 cheapest: 1 + 3.
   EXPECT_EQ(4, cost(boolq({}, clauses({term("a"), term("b"), term("c")}), 2)));
 }
 
@@ -93,7 +98,27 @@ TEST_F(ScorerCostTest, constantScoreCostDelegatesToChild) {
 }
 
 TEST_F(ScorerCostTest, nestedBooleanCompositeCost) {
-  // Required a(6) AND (b OR c) [disjunction cost 3+1=4] -> conjunction min(6, 4) = 4.
   auto* inner = boolq({}, clauses({term("b"), term("c")}));
   EXPECT_EQ(4, cost(boolq(clauses({term("a"), inner}), {})));
+}
+
+TEST_F(ScorerCostTest, filterPlusOptionalCapsByOptional) {
+  // No mandatory: filter and optional are conjoined, so the rare optional caps
+  // the estimate. filter a(6) AND optional c(1) -> 1, not the filter's 6.
+  EXPECT_EQ(1, cost(filterBoolq(clauses({term("a")}), clauses({term("c")}))));
+}
+
+TEST_F(ScorerCostTest, forcePrepareCostDelegatesToChild) {
+  // Exercises the prepared path: ForcePrepare always prepares, and its prepared
+  // supplier is the child's.
+  EXPECT_EQ(1, cost(pool.make<ForcePrepareQuery>(term("c"))));
+}
+
+TEST_F(ScorerCostTest, preparedBooleanFilterUsesDocSetCardinality) {
+  // A ForcePrepare optional clause forces the boolean through prepare(), so the
+  // filter c materializes into a DocSet (card 1) exposed via DocSetSupplier.
+  // filter c(1) AND optional a(6) -> 1, proving the filter cost is its
+  // cardinality, not maxDoc (which would give 6).
+  auto* opt = pool.make<ForcePrepareQuery>(term("a"));
+  EXPECT_EQ(1, cost(filterBoolq(clauses({term("c")}), clauses({opt}))));
 }
