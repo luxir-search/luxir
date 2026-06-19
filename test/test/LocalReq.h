@@ -95,6 +95,14 @@ public:
     return *this;
   }
 
+  // Add a prefix query.
+  LocalReq& prefixQuery(std::string_view field, std::string_view prefix, std::string_view opName = "q") {
+    auto& query = *topDocs(opName).mutable_query()->mutable_prefix();
+    query.set_field(field);
+    query.set_prefix(prefix);
+    return *this;
+  }
+
   // Add a phrase query (un-analyzed word list) to a top_docs operation
   LocalReq& phraseQuery(std::string_view field, std::initializer_list<std::string> words, std::string_view opName = "q") {
     auto& query = *topDocs(opName).mutable_query()->mutable_phrase();

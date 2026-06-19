@@ -114,6 +114,11 @@ public:
   }
 
 
+  solux::Query* parsePrefix(const solux::proto::PrefixQuery& prefixQuery) {
+    QueryBuilder builder(pool, schema);
+    return builder.createPrefixQuery(prefixQuery.field(), prefixQuery.prefix());
+  }
+
   solux::Query* parseKnn(const solux::proto::KnnQuery& knnQuery) {
     std::string_view field = knnQuery.field();
     FieldType& fieldType = *schema.getFieldTypeEx(field);
@@ -215,6 +220,9 @@ public:
       }
       case solux::proto::Query::kPhrase: {
         return parsePhrase(pquery.phrase());
+      }
+      case solux::proto::Query::kPrefix: {
+        return parsePrefix(pquery.prefix());
       }
       case solux::proto::Query::kAll: {
         return pool.make<solux::AllQuery>();

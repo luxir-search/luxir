@@ -11,6 +11,7 @@
 #include "solux/query/BooleanQuery.h"
 #include "solux/query/MatchNoDocsQuery.h"
 #include "solux/query/PhraseQuery.h"
+#include "solux/query/PrefixQuery.h"
 #include "solux/query/Query.h"
 #include "solux/query/TermQuery.h"
 #include "solux/schema/Schema.h"
@@ -75,6 +76,20 @@ public:
 
   Query* matchNoDocs() {
     return pool.make<MatchNoDocsQuery>();
+  }
+
+  // Build a prefix query over term-backed fields. The prefix is not analyzed,
+  // and the field and prefix views must outlive the returned query.
+  Query* createPrefixQuery(std::string_view field, std::string_view prefix) {
+    FieldType& fieldType = *schema.getFieldTypeEx(field);
+    switch (fieldType.type()) {
+      case FieldType::Type::TEXT:
+      case FieldType::Type::ID:
+      case FieldType::Type::STRING:
+        return pool.make<PrefixQuery>(field, prefix);
+      default:
+        throw std::runtime_error(std::format("Prefix query on unsupported field type: {}", field));
+    }
   }
 
   // Build a match query for `field` against raw value `value`.

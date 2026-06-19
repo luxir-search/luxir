@@ -143,6 +143,7 @@ message Query {
     PhraseQuery phrase = 5;         // selects all documents with a phrase
     KnnQuery knn = 6;               // approximate nearest-neighbor over a vector field
     ConstantScoreQuery constant_score = 7; // wraps a query and replaces each hit's score
+    PrefixQuery prefix = 8;         // selects documents by term prefix
 
     // TODO: a looser string match that will auto-convert to correct type
     // TODO: a text query type (parsed by QueryParser)
@@ -235,6 +236,14 @@ message BooleanQuery {
   repeated Query optional = 3;     // optional clauses that add to the score
   repeated Query prohibited = 4;   // prohibited clauses that must not match
   int32 min_match = 5;             // minimum number of optional clauses that must match
+}
+
+// Matches documents where `field` has a term starting with `prefix`.
+// The prefix is used exactly as provided.  An empty prefix matches documents
+// that have the field.
+message PrefixQuery {
+  string field = 1;
+  string prefix = 2;
 }
 
 message PhraseQuery {
