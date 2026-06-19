@@ -404,7 +404,7 @@ public:
           assert(countSkinny);
           // If localords != globalOrds and expected number of repeats per value is > 2, use a local skinny counter first
           // and convert to global ords on overflow.
-          if (deltas && domainSize >= (segFieldInfo.nTerms >> 1)) {
+          if (deltas && (domainSize >> 1) >= segFieldInfo.nTerms) {
             std::vector<uint8_t> localCounts(segFieldInfo.nTerms);
             facetReq.facetSegIntCol(domain, segnum, missing_num, segFieldInfo,
               [&](int32_t docid, int64_t ord) SOLUX_INLINE {
