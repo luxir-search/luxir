@@ -26,6 +26,18 @@ public:
     bool found = st.tenum->seek("\0\0\0\0before beginning");
     ASSERT_EQ(false, found);
 
+    // seekCeil of a target after every term has no ceil and reports exhausted.
+    {
+      std::string pastEnd;
+      st.makeTerm(nTerms - 1, pastEnd);
+      pastEnd.push_back('!');  // sorts after the last term
+      ASSERT_FALSE(st.tenum->seekCeil(pastEnd));
+    }
+    // seekCeil of a target before every term positions on the first term.  Run
+    // this last so the enum is left at ord 0 for the loop below.
+    ASSERT_TRUE(st.tenum->seekCeil(""));
+    ASSERT_EQ(st.tenum->ord(), 0);
+
     // random term lookups
     std::string fname;
     std::string missing;
@@ -86,6 +98,34 @@ public:
           ASSERT_FALSE(found) << " seekForward absent between " << tnum << " and "
                               << (tnum+1) << " curOrd=" << curOrd << " term='" << term << "'";
           curOrd = tnum + 1;  // enum advances past the missed target
+        }
+        continue;
+      }
+
+      // seekCeil path: positions on the smallest term >= target.  Unlike
+      // seekForward it may move backward, so it runs from any current position.
+      if (rng.rint(100) < 40) {
+        if (rng.rbool()) {
+          // The ceil of a present term is that term itself.
+          st.makeTerm(tnum, term);
+          bool found = st.tenum->seekCeil(term);
+          ASSERT_TRUE(found) << " seekCeil present tnum=" << tnum << " term='" << term << "'";
+          ASSERT_EQ(st.tenum->ord(), tnum) << " seekCeil present tnum=" << tnum;
+          curOrd = tnum;
+        } else {
+          // The ceil of a term strictly between term[tnum] and term[tnum+1] is
+          // term[tnum+1] - or exhausted when tnum is the last term.
+          st.makeTerm(tnum, term);
+          term.push_back('!');  // sorts after term[tnum], before term[tnum+1]
+          bool found = st.tenum->seekCeil(term);
+          if (tnum + 1 < nTerms) {
+            ASSERT_TRUE(found) << " seekCeil between tnum=" << tnum << " term='" << term << "'";
+            ASSERT_EQ(st.tenum->ord(), tnum + 1) << " seekCeil ceil tnum=" << tnum;
+            curOrd = tnum + 1;
+          } else {
+            ASSERT_FALSE(found) << " seekCeil past end tnum=" << tnum << " term='" << term << "'";
+            curOrd = nTerms;  // exhausted -> position unknown, disable forward
+          }
         }
         continue;
       }

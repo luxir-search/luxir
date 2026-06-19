@@ -80,6 +80,7 @@ public:
     return currTerm;
   }
 
+protected:
   // read the data that comes after each term
   void readTermMetadata() {
     // see PostingsWriter.flushTerms
@@ -113,6 +114,7 @@ public:
     readTermMetadata();
   }
 
+public:
   /// If there is a next term, this advances to it and returns true.
   /// Otherwise, no advance is done (i.e. ord() is not changed.)
   bool nextTerm() {
@@ -130,6 +132,7 @@ public:
   }
 
 
+protected:
   // reads the next term in the block with no checking if one runs off the end of the block.
   void readNextTermInBlock() {
     assert(ordInBlock < maxOrdInBlock);
@@ -161,7 +164,11 @@ public:
     readTermMetadata();
   }
 
-  bool seek(std::string_view target, int32_t firstBlock = 0) {
+  // Binary-search the block index for the block whose starting term is the
+  // greatest one that is <= target (considering only blocks at firstBlock or
+  // later), then seek to and load that block, leaving the enum at ord 0 of it.
+  // Shared by seek(), seekForward(), and seekCeil().
+  void seekBlock(std::string_view target, int32_t firstBlock) {
     auto blockStart = termBlockOffsets + firstBlock;
     auto blockEnd = termBlockOffsets + numTermBlocks;
 
@@ -177,6 +184,11 @@ public:
 
     termBlockIndex = (int32_t)(blockOffsetPtr - termBlockOffsets);
     readTermBlock();
+  }
+
+public:
+  bool seek(std::string_view target) {
+    seekBlock(target, 0);
     return seekInBlock(target);
   }
 
@@ -205,17 +217,7 @@ public:
       // must be the smallest term >= target for forward iteration to work).
       // TODO: an exponential search from the current block could beat the
       // binary search here.
-      auto blockStart = termBlockOffsets + nextBlock;
-      auto blockEnd = termBlockOffsets + numTermBlocks;
-      auto blockOffsetPtr = std::upper_bound(blockStart, blockEnd, target,
-          [&](std::string_view key, const int64_t& blockOffset) {
-            return key < termsIS.readPackedTerm(fieldInfo.termsLoc.offset() + blockOffset);
-          });
-      if (blockOffsetPtr > blockStart) {
-        blockOffsetPtr--;
-      }
-      termBlockIndex = (int32_t)(blockOffsetPtr - termBlockOffsets);
-      readTermBlock();
+      seekBlock(target, nextBlock);
     }
 
     // Linear forward scan within the current block.  Stops at the first term
@@ -230,6 +232,24 @@ public:
     }
   }
 
+  /// Positions on the smallest term that is >= target.
+  /// May move backward, so it can be called from any current position.
+  /// Returns true with term() and ord() valid if such a term exists, or false
+  /// if target sorts after every term.  To detect an exact match, compare
+  /// term() to target after a true return.
+  bool seekCeil(std::string_view target) {
+    // Start from the block whose first term is the greatest one <= target.
+    seekBlock(target, 0);
+    // nextTerm() can cross block boundaries, so this also handles a target
+    // between the last term of one block and the first term of the next.
+    for (;;) {
+      auto cmp = term() <=> target;
+      if (cmp >= 0) return true;        // first term >= target
+      if (!nextTerm()) return false;    // target is past the last term
+    }
+  }
+
+protected:
   bool seekInBlock(std::string_view target) {
     // TODO: rather than hashing every call, have an option to pass it in?
     char hash = (char)XXH3_64bits(target.data(), target.size());
@@ -263,6 +283,7 @@ public:
     }
   }
 
+public:
   // 0-based ords
   void seekOrd(int32_t targetOrd) {
     assert(targetOrd >= 0 && targetOrd < fieldInfo.nTerms);
@@ -279,6 +300,7 @@ public:
   }
 
 
+protected:
   bool seekCeilInBlock(std::string_view target) {
     auto cmp = term() <=> target;
     // std::cout << " comparing with first " << term() << ": eq=" << (cmp==0) << " gt=" <<  (cmp>0) << std::endl;
