@@ -3,7 +3,6 @@
 #include <iostream>
 
 #include "solux/index/Stream.h"
-#include "simdcomp/include/for.h"
 #include "solux/index/DocStream.h"
 #include "test/SoluxTest.h"
 

@@ -5,12 +5,13 @@ Building
 
 $ ./make_deps.sh        # defaults: /opt/vcpkg /opt/vcpkg_asan
 
-   This fetches pinned simdcomp sources if absent (and restores the
-   normally-vendored uni-algo if it is ever missing), applies Solux's local
-   patches to the vcpkg roots and the simdcomp checkout, and builds the
-   simdcomp static libs if missing. Run it BEFORE installing vcpkg packages,
-   or reinstall any already-built package afterwards so it picks up the
-   patched triplet/port (e.g. ./vcpkg remove faiss && ./vcpkg install faiss).
+   This fetches pinned FastPFOR sources if absent (and restores the
+   normally-vendored uni-algo if it is ever missing) and applies Solux's local
+   patches to the vcpkg roots (and FastPFOR, if any patches exist). FastPFOR
+   itself is compiled by the main CMakeLists.txt, so there is no static-lib
+   build step. Run it BEFORE installing vcpkg packages, or reinstall any
+   already-built package afterwards so it picks up the patched triplet/port
+   (e.g. ./vcpkg remove faiss && ./vcpkg install faiss).
 
    apply_patches.sh is the patch-application piece on its own; patches/ holds
    one file per change, and the script headers document what each one does.
@@ -34,27 +35,20 @@ Ubuntu:
 sudo apt install libtbb-dev    #TODO - try the tbb in vcpkg now.
 ```
 
-SIMDCompressionAndIntersection (simdcomp)
------------------------------------------
-make_deps.sh handles all of this; details for reference:
+FastPFOR
+--------
+make_deps.sh clones this; details for reference:
 
-- Pinned to upstream commit b666a60c8fca18227d6532fb2d3b4d4dbc466cc9
-  (lemire/SIMDCompressionAndIntersection master, 2020-12-11).
-- patches/simdcomp.diff removes -D_GLIBCXX_DEBUG from the debug build (its
-  debug-container ABI is incompatible with code built without the flag -
-  things crash; the alternative of adding _GLIBCXX_DEBUG to every vcpkg
-  debug library was considered and rejected) and un-statics a few functions
-  Solux links directly.
-- The libs CMake links live INSIDE the checkout (link_directories points at
-  deps/simdcomp): libsimdcomp_a.a (release) and libsimdcomp_ad.a (DEBUG=1).
-  Manual rebuild, should you need it:
-
-  $ cd simdcomp
-  $ make clean && make CXX=g++ CC=gcc DEBUG=1 libSIMDCompressionAndIntersection.a
-  $ mv libSIMDCompressionAndIntersection.a libsimdcomp_ad.a
-  $ make clean && make CXX=g++ CC=gcc libSIMDCompressionAndIntersection.a
-  $ mv libSIMDCompressionAndIntersection.a libsimdcomp_a.a
-  $ make clean
+- Pinned to tag v0.5.0 (fast-pack/FastPFOR), the release with ARM NEON
+  support. Cloned into deps/FastPFOR (gitignored).
+- Compiled by the main CMakeLists.txt: the `fastpfor` static-lib target builds
+  just the bit-packing sources we use (bitpacking.cpp, simdbitpacking.cpp,
+  simdunalignedbitpacking.cpp) with headers from deps/FastPFOR/headers. We do
+  NOT compile streamvbyte.c / varintdecode.c / codecfactory.cpp (their C
+  symbols are unused and were the only real clash risk). So there is no manual
+  lib-build step.
+- No local patches are needed at present. If one becomes necessary, drop it in
+  patches/ as fastpfor*.diff and apply_patches.sh will apply it on the next run.
 
 uni-algo
 --------
@@ -65,5 +59,3 @@ upstream tag if the directory is ever removed; apply_patches.sh then re-applies
 the local fix in patches/uni-algo-word-only-newline-leak.patch (the vendored
 copy in git already has it applied - see the apply_patches.sh header for what
 it fixes and why).
-
-TODO: automate / integrate simdcomp into the build system if we keep it.

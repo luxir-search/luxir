@@ -1,6 +1,7 @@
 #include <vector>
 #include "solux/util/random.h"
 #include "solux/util/solux_util.h"
+#include "solux/reader/Postings.h"
 #include "test/CodecTest.h"
 #include "bench/solux_bench.h"
 #include <gtest/gtest.h>
@@ -54,7 +55,7 @@ static void BM_blockDecode(benchmark::State& state, std::string codecName, uint3
   for (auto i = 0u; i<maxValues.size(); i++) {
     values[i].resize(nvalues);
     decoded[i].resize(nvalues);
-    encoded[i].resize(nvalues*sizeof(uint32_t) * 2);  // may result in SIMDCompressionLib::NotEnoughStorage if not big enough
+    encoded[i].resize(nvalues*sizeof(uint32_t) * 2);  // must be large enough for the codec's worst-case output
     fillBlock(rng, maxValues[i], &values[i][0], nvalues, sorted);
     // some codecs modify the input array (calculating deltas in place), so make a copy.
     std::vector<uint32_t> orig(values[i]);
@@ -71,10 +72,6 @@ static void BM_blockDecode(benchmark::State& state, std::string codecName, uint3
         for (auto j=0u; j<10; j++) {
           // single value decode
           size_t which = rng.rint(blockSize);
-          // dynamic cast to IntegerCODECTypeWrapper<SIMDCompressionLib::SIMDFrameOfReference>>
-
-          // auto* pfor = (IntegerCODECTypeWrapper<SIMDCompressionLib::SIMDFrameOfReference>*) codec.get();
-          // auto val = pfor->getCodec().select((uint32_t*) &encoded[i][0], which);
           auto val = codec->select(&encoded[i][0], values[i].size(), which);
 
           ASSERT_EQ(values[i][which], val);
@@ -109,17 +106,10 @@ static void BM_blockDecode(benchmark::State& state, std::string codecName, uint3
 
 // TODO: is there a way to get test name and avoid the duplication with codec here?
 BENCHMARK_CAPTURE(BM_blockDecode, SimpleCodec, "SimpleCodec", INT_BLOCK_SIZE, false);
-BENCHMARK_CAPTURE(BM_blockDecode, FastPFor, "FastPFor", INT_BLOCK_SIZE, false); // ->Range(8, 8<<10);
-BENCHMARK_CAPTURE(BM_blockDecode, SIMDFastPFor, "SIMDFastPFor", INT_BLOCK_SIZE, false);
-BENCHMARK_CAPTURE(BM_blockDecode, SIMDFastPForDelta1, "SIMDFastPForDelta1", INT_BLOCK_SIZE, true);
 BENCHMARK_CAPTURE(BM_blockDecode, SoluxPFOR128, "SoluxPFOR", 128, false);  // these two codecs only do 128
 BENCHMARK_CAPTURE(BM_blockDecode, SoluxPFORd128, "SoluxPFORd", 128, true);
-BENCHMARK_CAPTURE(BM_blockDecode, SIMDFor, "SIMDFor", INT_BLOCK_SIZE, false);
-BENCHMARK_CAPTURE(BM_blockDecode, SIMDFor_select, "SIMDFor", INT_BLOCK_SIZE, false, true);
 BENCHMARK_CAPTURE(BM_blockDecode, SoluxSIMDFor, "SoluxSIMDFor", INT_BLOCK_SIZE, false);
 BENCHMARK_CAPTURE(BM_blockDecode, SoluxSIMDFor_select, "SoluxSIMDFor", INT_BLOCK_SIZE, false, true);
-BENCHMARK_CAPTURE(BM_blockDecode, ForCODEC, "ForCODEC", INT_BLOCK_SIZE, false);
-BENCHMARK_CAPTURE(BM_blockDecode, ForCODEC_select, "ForCODEC", INT_BLOCK_SIZE, false, true);
 
 
 } // end solux

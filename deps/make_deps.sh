@@ -1,34 +1,36 @@
 #!/usr/bin/env bash
 # Bootstrap deps/ for a fresh checkout:
 #   1. fetch pinned third-party sources that are not checked into the repo
-#      (simdcomp; also restores the normally-vendored uni-algo if absent)
+#      (FastPFOR; also restores the normally-vendored uni-algo if absent)
 #   2. apply Solux's local patches (delegates to apply_patches.sh, which
 #      also patches the vcpkg roots - see its header for what and why)
-#   3. build the simdcomp static libs if they are missing
 # Safe to re-run: every step skips work that is already done.
+#
+# FastPFOR is compiled by the main CMakeLists.txt (the fastpfor target builds a
+# subset of its src/), so unlike the old simdcomp setup there is NO separate
+# static-lib build step here - the cloned source + headers just need to exist.
 #
 # Usage: ./make_deps.sh [VCPKG_ROOT [VCPKG_ASAN_ROOT]]
 #   (passed through to apply_patches.sh; defaults /opt/vcpkg /opt/vcpkg_asan)
 #
 # Env overrides, for mirrors / offline use:
-#   SIMDCOMP_REPO  (default: https://github.com/lemire/SIMDCompressionAndIntersection.git)
+#   FASTPFOR_REPO  (default: https://github.com/fast-pack/FastPFOR.git)
 #   UNI_ALGO_URL   (default: the github archive tarball for the pinned tag)
 set -euo pipefail
 cd "$(dirname "$0")"
 
-SIMDCOMP_REPO="${SIMDCOMP_REPO:-https://github.com/lemire/SIMDCompressionAndIntersection.git}"
-SIMDCOMP_COMMIT=b666a60c8fca18227d6532fb2d3b4d4dbc466cc9  # upstream master, 2020-12-11
+FASTPFOR_REPO="${FASTPFOR_REPO:-https://github.com/fast-pack/FastPFOR.git}"
+FASTPFOR_TAG=v0.5.0  # FastPFOR release with ARM NEON support
 
 UNI_ALGO_TAG=v1.2.0  # Unicode 15.1.0; keep in sync with uni-algo/VENDORED.txt and CMakeLists.txt
 UNI_ALGO_URL="${UNI_ALGO_URL:-https://github.com/uni-algo/uni-algo/archive/refs/tags/${UNI_ALGO_TAG}.tar.gz}"
 
-# ---- simdcomp: clone at the pinned commit if absent ----
-if [ -d simdcomp/.git ]; then
-  echo "simdcomp: source present (skipping fetch)"
+# ---- FastPFOR: clone at the pinned tag if absent ----
+if [ -d FastPFOR/.git ]; then
+  echo "FastPFOR: source present (skipping fetch)"
 else
-  echo "simdcomp: cloning ${SIMDCOMP_REPO} @ ${SIMDCOMP_COMMIT}"
-  git clone "${SIMDCOMP_REPO}" simdcomp
-  git -C simdcomp checkout --quiet "${SIMDCOMP_COMMIT}"
+  echo "FastPFOR: cloning ${FASTPFOR_REPO} @ ${FASTPFOR_TAG}"
+  git clone --branch "${FASTPFOR_TAG}" --depth 1 "${FASTPFOR_REPO}" FastPFOR
 fi
 
 # ---- uni-algo: vendored in-repo; this only restores it if somehow absent ----
@@ -50,27 +52,8 @@ else
   # apply_patches.sh (next step) re-applies the local uni-algo fix to this fresh copy
 fi
 
-# ---- local patches: vcpkg roots + the simdcomp checkout ----
+# ---- local patches: vcpkg roots, uni-algo, and any FastPFOR patches ----
 ./apply_patches.sh "$@"
-
-# ---- simdcomp libs: build only if missing ----
-# CMake links these from INSIDE the checkout (link_directories(deps/simdcomp)):
-# libsimdcomp_a.a (release) for optimized builds, libsimdcomp_ad.a (DEBUG=1,
-# minus _GLIBCXX_DEBUG via patches/simdcomp.diff) for debug builds.
-# CXX/CC passed explicitly: the upstream Makefile defaults to g++-4.7.
-if [ -f simdcomp/libsimdcomp_a.a ] && [ -f simdcomp/libsimdcomp_ad.a ]; then
-  echo "simdcomp: libs present (skipping build)"
-else
-  echo "simdcomp: building libsimdcomp_ad.a (debug)"
-  make -C simdcomp -s clean
-  make -C simdcomp -s CXX=g++ CC=gcc DEBUG=1 -j"$(nproc)" libSIMDCompressionAndIntersection.a
-  mv simdcomp/libSIMDCompressionAndIntersection.a simdcomp/libsimdcomp_ad.a
-  echo "simdcomp: building libsimdcomp_a.a (release)"
-  make -C simdcomp -s clean
-  make -C simdcomp -s CXX=g++ CC=gcc -j"$(nproc)" libSIMDCompressionAndIntersection.a
-  mv simdcomp/libSIMDCompressionAndIntersection.a simdcomp/libsimdcomp_a.a
-  make -C simdcomp -s clean
-fi
 
 echo
 echo "deps ready. Next: install packages into the vcpkg roots (see README.txt),"

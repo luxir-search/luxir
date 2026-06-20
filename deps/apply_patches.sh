@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Apply Solux's local patches to the vcpkg roots and the simdcomp checkout.
+# Apply Solux's local patches to the vcpkg roots and the FastPFOR checkout.
 # Safe to re-run: patches that are already applied are detected and skipped.
 #
 # Usage: ./apply_patches.sh [VCPKG_ROOT [VCPKG_ASAN_ROOT]]
@@ -22,10 +22,9 @@
 #     PQ code distance) are never compiled and FAISS distance kernels run
 #     SSE-only. Takes effect on the next faiss build (see reminder below).
 #
-#   deps/simdcomp (if cloned; see README.txt)
-#     patches/simdcomp.diff: drop _GLIBCXX_DEBUG from the debug flags (its
-#     ABI is incompatible with code built without it) and un-static a few
-#     functions Solux links directly.
+#   deps/FastPFOR (cloned by make_deps.sh; gitignored)
+#     patches/fastpfor*.diff (if any): local fixes to the vendored FastPFOR.
+#     None are needed at present; the hook below applies them if/when added.
 #
 #   deps/uni-algo (vendored in-repo, normally already patched in git)
 #     patches/uni-algo-word-only-newline-leak.patch: upstream v1.2.0 bug -
@@ -77,13 +76,18 @@ apply "$VCPKG_ASAN_ROOT" "$PATCH_DIR"/vcpkg-faiss-opt-level-dd.patch
 echo "uni-algo (vendored): $(pwd)/uni-algo"
 apply .. "$PATCH_DIR"/uni-algo-word-only-newline-leak.patch
 
-echo "simdcomp: $(pwd)/simdcomp"
-if [ -d simdcomp/.git ]; then
-  apply simdcomp "$PATCH_DIR"/simdcomp.diff
+echo "FastPFOR: $(pwd)/FastPFOR"
+if [ -d FastPFOR/.git ]; then
+  shopt -s nullglob
+  fastpfor_patches=("$PATCH_DIR"/fastpfor*.diff "$PATCH_DIR"/fastpfor*.patch)
+  shopt -u nullglob
+  if [ ${#fastpfor_patches[@]} -eq 0 ]; then
+    echo "  ok      no FastPFOR patches yet"
+  else
+    for p in "${fastpfor_patches[@]}"; do apply FastPFOR "$p"; done
+  fi
 else
-  echo "  skip    not cloned; to set up:"
-  echo "            git clone https://github.com/lemire/SIMDCompressionAndIntersection.git simdcomp"
-  echo "          then re-run this script and build per README.txt"
+  echo "  skip    not cloned; run make_deps.sh first"
 fi
 
 echo

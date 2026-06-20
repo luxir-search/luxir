@@ -709,7 +709,7 @@ TEST_F(GrpcIndexTest, threadsafeIndex) {
 
   doThreadSafeSearch(nThreads, nDocs, nDocs, requestCreator, responseChecker);
 
-  // Now let's do a test designed to uncover non-thread-safety of the codecs in SIMDCompressionLib
+  // Now let's do a test designed to uncover codec thread-safety bugs -
   // unpacking blocks of docids, frequencies, or positions concurrently should do it.
 
   RequestCreator reqc2 = [&](int64_t docid, solux::proto::SearchRequest& req) {
@@ -744,9 +744,9 @@ TEST_F(GrpcIndexTest, threadsafeIndex) {
     ASSERT_EQ(hits[docid % 10], docList.matches());
   };
 
-  // With 10K docs and 32 threads, this reliably fails when using the non-thread-safe SIMDCompressionLib codecs.
-  // 1000 docs is enough to get it to fail sometimes, often with ASAN detecting a double-free in SIMDCompressionLib.
-  // Failures were fixed by using thread_locals for those specific codecs.
+  // With 10K docs and 32 threads, this reliably failed with the old non-thread-safe
+  // SIMDCompressionLib codecs (ASan often caught a double-free). The FastPFOR codecs
+  // we use now are thread-safe by construction (stack-resident bit packers); this guards it.
   doThreadSafeSearch(nThreads, nDocs, nDocs, reqc2, respc2verify);
 
   //

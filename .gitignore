@@ -60,4 +60,4 @@ protos/*.grpc.pb.h
 
 # Local agent and dependency worktrees
 .claude/
-deps/simdcomp/
+deps/FastPFOR/

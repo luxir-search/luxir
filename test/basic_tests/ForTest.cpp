@@ -1,6 +1,7 @@
 #include "solux/index/Inverter.h"
 #include "solux/index/PostingsWriter.h"
 #include "solux/reader/PostingsReader.h"
+#include "solux/codec/Codec.h"
 #include "gtest/gtest.h"
 #include "test/SoluxTest.h"
 #include "test/TestIndex.h"
@@ -9,11 +10,12 @@
 using namespace solux;
 using namespace solux::test;
 
+// Runs the FOR-codec battery (round-trip + random access) across every length
+// and value-range boundary. Parameterized by codec type for easy extension.
+template <typename Codec>
 class ForTest : public SoluxTest {
 protected:
-  // SoluxFor codec;
-  SoluxSIMDFor codec;
-  // IntegerCODECTypeWrapper<SIMDCompressionLib::SIMDFrameOfReference> codec;
+  Codec codec;
 
   std::vector<int32_t> values;
   std::vector<char> encoded;
@@ -62,13 +64,6 @@ protected:
     for (uint32_t i = 0u; i < values.size(); i++) {
       auto val = codec.select(buffer.get(), values.size(), i);
 
-      /* for directly testing SIMDFrameOfReference:
-      SIMDCompressionLib::SIMDFrameOfReference& c = ((IntegerCODECTypeWrapper<SIMDCompressionLib::SIMDFrameOfReference>*)&codec)->getCodec();
-      char* buf = buffer.get();
-      // make it easier to step into
-      auto val = c.select((uint32_t*)buf, i);
-      */
-
       if ((int32_t)val != values[i]) {
         LOG_ERROR("i={} val={} values[i]={} arr_size={}", i, val, values[i], values.size());
         // put debugger here:
@@ -77,55 +72,29 @@ protected:
       ASSERT_EQ((int32_t)val, values[i]);
     }
   }
-
-  template <typename T>  // int64_t vs uint64_t
-  int bitWidth(T* vals, int nvalues) {
-    // test gcd
-    auto g = vals[0];
-    auto min = vals[0];
-    auto max = vals[0];
-    for (int i = 0; i < nvalues; i++) {
-      LOG_INFO("\t\tvalues[{}]={:x}", i, vals[i]);
-      g = std::gcd(g, vals[i]);
-      min = std::min(min, vals[i]);
-      max = std::max(max, vals[i]);
-    }
-    auto bits = std::bit_width(uint64_t((max - min)/g));
-    LOG_INFO("\tgcd={:x} min={:x} max={:x} max-min={:x} max/gcd={:x} min/gcd={:x} (max-min)/gcd={:x} bits={}",
-             g, min, max, max-min, max/g, min/g, (max-min)/g, bits);
-    return bits;
-  }
-
 };
 
+using ForCodecs = ::testing::Types<SoluxSIMDFor>;
+TYPED_TEST_SUITE(ForTest, ForCodecs);
 
-TEST_F(ForTest, basic) {
-  // std::vector<double> v{1.0, -2.0, 3.0, 4.0, -5.0, 1.3};
-  // LOG_INFO("bits<uint64_t>={} bits<int64_t>={}", bitWidth((uint64_t*)v.data(), v.size()), bitWidth((int64_t*)v.data(), v.size()));
-  // for positive and negative whole numbers (as doubles), we want to calculate in unsigned space (or convert the doubles)
-  // But a simple 1.3 blows us out to full 64 bit space.
-
-  // test({255+100,100,101,101,101});
-  test({7});
-  test({3,5});
-  test({-100, 0, 100});  // I won't pass any negative numbers since I subtract the min myself.
+TYPED_TEST(ForTest, basic) {
+  this->test({7});
+  this->test({3,5});
+  this->test({-100, 0, 100});  // I won't pass any negative numbers since I subtract the min myself.
 
   // do every length variation to ensure there are no boundary conditions (For does 32 values internally)
   for (int i=1; i<261; i++) {
-    values.resize(0);
+    this->values.resize(0);
     for (int j=0; j<i; j++) {  // try always making a multiple of 128
-      values.push_back(j+100);  // make min something other than 0
-      // values.push_back((j&255) + 100);  // make everything into a single byte and make it increase by 1 to see what memory layout is like.
+      this->values.push_back(j+100);  // make min something other than 0
     }
-    test();
+    this->test();
   }
 
   // test all equal values
-  values.resize(0);
+  this->values.resize(0);
   for (int i=0; i<50; i++) {
-    values.push_back(123456789);
+    this->values.push_back(123456789);
   }
-  test();
-
+  this->test();
 }
-

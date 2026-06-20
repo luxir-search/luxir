@@ -12,7 +12,6 @@
 #include "solux/store/Directory.h"
 #include "solux/reader/PostingsReader.h"
 #include "solux/reader/FieldReader.h"
-#include "simdcomp/include/codecfactory.h"
 #include "ScreamingBuilder.h"
 #include "solux/codec/Codec.h"
 #include "solux/schema/FieldType.h"
@@ -449,10 +448,9 @@ public:
 
     assert(docs.back() < postingsWriter.getMaxDoc()); // sanity check to ensure we didn't go over provided numDocs
 
-    // NOTE: some codecs (like s4-fastpfor-d1) modify the input array to calculate deltas!
-    // given that we (could) already have deltas, is there an easy way to bypass that part?
-    // NOTE: SIMDCompressionAndIntersection puts 32 bit size at start!  Look at C version and see if it's easier to modify?
-    // The simdcomp C library does have lower level interfaces that just handle a single 128 value block
+    // NOTE: SoluxPFORd (docCodec) applies the adjacent delta itself, in place,
+    // so we pass the raw (monotonic) doc ids. encodeBlock handles exactly one
+    // DOCS_BLOCK_SIZE block.
 
     compressed_output.resize(Postings::DOCS_BLOCK_SIZE * sizeof(int32_t) + 1024);
     uint32_t compressedSize = compressed_output.size(); // this gets changed to the actual size

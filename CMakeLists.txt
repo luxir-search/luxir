@@ -65,7 +65,6 @@ find_package(OpenMP REQUIRED)
 find_package(faiss CONFIG REQUIRED)
 
 include_directories(deps)
-link_directories(deps/simdcomp)
 
 # uni-algo (vendored under deps/uni-algo, Unicode 15.1.0): full Unicode case
 # folding, NFC/NFKC, UAX#29 word/grapheme/sentence segmentation. The header API
@@ -77,6 +76,17 @@ link_directories(deps/simdcomp)
 add_library(uni_algo STATIC deps/uni-algo/src/data.cpp)
 target_include_directories(uni_algo PUBLIC deps/uni-algo/include)
 set_target_properties(uni_algo PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
+# FastPFOR (vendored under deps/FastPFOR, v0.5.0): SIMD bit-packing kernels with
+# native ARM NEON support (headers/fastpfor_neon.h). We compile only the
+# bit-packing sources the codecs use (CodecFP.cpp) -- not streamvbyte.c /
+# varintdecode.c / codecfactory.cpp, which we don't reference.
+add_library(fastpfor STATIC
+  deps/FastPFOR/src/bitpacking.cpp
+  deps/FastPFOR/src/simdbitpacking.cpp
+  deps/FastPFOR/src/simdunalignedbitpacking.cpp)
+target_include_directories(fastpfor PUBLIC deps/FastPFOR/headers)
+set_target_properties(fastpfor PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 #Print out all env vars... useful while build system is in development
 get_cmake_property(_variableNames VARIABLES)
@@ -107,8 +117,6 @@ if (CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
   )
   # -Wno-unused-parameter: many virtual overrides must keep base-class signature; renaming params would just be noise.
   add_compile_options(-Wall -Wextra -Wno-unused-parameter)
-  # NOTE: simdcomp lib is compiled with -D_GLIBCXX_DEBUG for debugging lib by default... and if our files aren't, it causes a segv
-  # so make sure they match.  For now, we remove that flag from simdcomp.
 elseif (CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -mavx -mssse3 -march=native -mtune=native")   # native just for dev... lock down more later?
   add_compile_options(
@@ -179,8 +187,7 @@ target_include_directories(solux_lib PRIVATE ${GTL_INCLUDE_DIRS})
 target_link_libraries(solux_lib PRIVATE TBB::tbb)
 target_link_libraries(solux_lib PRIVATE xxHash::xxhash)
 target_link_libraries(solux_lib PRIVATE ${Boost_LIBRARIES})
-target_link_libraries(solux_lib PRIVATE debug simdcomp_ad)
-target_link_libraries(solux_lib PRIVATE optimized simdcomp_a)
+target_link_libraries(solux_lib PRIVATE fastpfor)
 target_link_libraries(solux_lib PRIVATE myproto)
 # log.h is included by tests and other dependents; propagate spdlog's compiled
 # mode so every TU shares the same default-logger registry.
