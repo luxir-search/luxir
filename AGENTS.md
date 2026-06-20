@@ -52,6 +52,8 @@ generated `*.pb.h` headers must exist). See [docs/build-setup.md](docs/build-set
 - members at top of C++ classes, no prefix / suffix
 - do not use em dashes or other non-ascii (in source or prose)
 - This is unreleased code, so NEVER worry about back compat.
+- Arena::Create<T> constructors must not throw. Protobuf registers the
+  destructor cleanup node before placement-new, and doesn't remove after exception.
 
 ## Writing Tests
 

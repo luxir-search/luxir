@@ -12,14 +12,14 @@ public:
   IndexReader& index;
   std::string_view fieldName;
   std::span<TermsEnum*> enums;
-  IntColReader::DenseValues* deltas = nullptr;
-  IntColReader::DenseValues* firstSegs = nullptr;
+  IntColReader::SparseValues* deltas = nullptr;
+  IntColReader::SparseValues* firstSegs = nullptr;
 
   OrdMapStr(MemPool& pool, OrdMap* ordMap, IndexReader& index, std::string_view fieldName) : pool(pool), ordMap(ordMap), index(index), fieldName(fieldName) {
     enums = pool.make_span<TermsEnum*>(index.segments().size());
     if (ordMap && ordMap->getGlobDeltas()) {
-      deltas = pool.make<IntColReader::DenseValues>(*ordMap->getGlobDeltas());
-      firstSegs = pool.make<IntColReader::DenseValues>(*ordMap->getFirstSegs());
+      deltas = pool.make<IntColReader::SparseValues>(*ordMap->getGlobDeltas());
+      firstSegs = pool.make<IntColReader::SparseValues>(*ordMap->getFirstSegs());
     }
   }
 

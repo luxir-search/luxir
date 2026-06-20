@@ -316,16 +316,18 @@ public:
     // Make a merging benchmark first though!
   }
 
-  // An iterator over dense int values.  It needs to support more than int32 indexes because
-  // of multi-valued fields (i.e. even if you only have 2B docs, a column could have > 4B values).
-  class DenseValues {
+  // Decodes one value per call; tuned for scattered / big-skip (sparse) access.
+  // Its sibling BulkValues decodes a sub-block at a time for dense iteration.
+  // It needs to support more than int32 indexes because of multi-valued fields
+  // (i.e. even if you only have 2B docs, a column could have > 4B values).
+  class SparseValues {
     const NumericBlockInfo* blockMeta;  // array of block metadata
     const char* blocks;                 // start of the compressed blocks of data
     int64_t index_ = -1;
     int64_t max;
   public:
 
-    DenseValues(const IntColReader& col) : blockMeta(col.blockMeta), blocks(col.blocks), max(col.numValues()) {
+    SparseValues(const IntColReader& col) : blockMeta(col.blockMeta), blocks(col.blocks), max(col.numValues()) {
     }
 
     int64_t index() {
@@ -454,12 +456,12 @@ public:
 
 
   // This is an iterator over documents, so indexes will always be 32 bit.
-  template <class DenseValueImpl>
+  template <class ValuesImpl>
   class DocIterator {
   protected:
     const IntColReader& col;
     screaming::BitSet::Iterator docsIter;
-    DenseValueImpl valueIter;
+    ValuesImpl valueIter;
     int32_t docRank = -1;
     int32_t doc = -1;
     int32_t maxRank;
@@ -471,7 +473,7 @@ public:
       dense = !col.docs.hasBitset();
     }
 
-    DenseValueImpl& values() {
+    ValuesImpl& values() {
       return valueIter;
     }
 
@@ -523,7 +525,7 @@ public:
     }
   };
 
-  using SparseIterator = DocIterator<DenseValues>;  // decodes individual values (good for big skipping)
+  using SparseIterator = DocIterator<SparseValues>;  // decodes individual values (good for big skipping)
   using BulkIterator = DocIterator<BulkValues>;  // decodes blocks of values (good for iterating or small skipping)
   using Iterator = BulkIterator;
 

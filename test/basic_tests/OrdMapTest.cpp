@@ -426,8 +426,8 @@ TEST_F(OrdMapTest, GlobalToSegmentReverseMapping) {
   
   // Expected global order: apple=0, banana=1, cherry=2, date=3, elderberry=4, fig=5
   // Create dense value accessors for the global columns
-  IntColReader::DenseValues firstSegsValues(*ordMap->getFirstSegs());
-  IntColReader::DenseValues globDeltasValues(*ordMap->getGlobDeltas());
+  IntColReader::SparseValues firstSegsValues(*ordMap->getFirstSegs());
+  IntColReader::SparseValues globDeltasValues(*ordMap->getGlobDeltas());
 
   // Test reverse mapping for each global ordinal
   for (int globalOrd = 0; globalOrd < ordMap->numOrds(); globalOrd++) {

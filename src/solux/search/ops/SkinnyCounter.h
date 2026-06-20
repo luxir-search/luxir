@@ -29,6 +29,9 @@ public:
     assert(key >=0 && (size_t)key < max && val >= 0);
     size_t tot = (size_t)counts[key] + val;
     if (tot > std::numeric_limits<SkinnyType>::max()) {
+      // We could alternatively overflow such that overflow
+      // just contains the high bits. This would exmand
+      // the max val we could store.
       counts[key] = 0;
       overflow[key] += tot;
     } else {
@@ -51,6 +54,14 @@ public:
 
 };
 
+// FUTURE: when applicable, also use a uint32 key/value instantiation
+// (SkinnyCounter<uint8_t, uint32_t, uint32_t>) to halve the overflow-map
+// footprint.
+// The key MUST be narrowed too: a uint32 value alone saves nothing because
+// std::pair<const int64_t, uint32_t> pads back up to 16 bytes.
+// Extendable to ~2^40 counts (32 + 8) if
+// overflow stores only the high bits (count >> 8) instead of the full value
+// on overflow with increment.
 using SkinnyCounter8 = SkinnyCounter<uint8_t, int64_t, int64_t>;
 
 }
