@@ -432,6 +432,7 @@ public:
     }
 
     int32_t next() override {
+      assert(id != solux::PostingsReader::END);
       id = mandScorer->next();
       return id;
     }
@@ -471,6 +472,7 @@ public:
     }
 
     int32_t next() override {
+      assert(id != solux::PostingsReader::END);
       id = mandScorer->next();
       return doNext();
     }
@@ -552,6 +554,7 @@ public:
     }
 
     int32_t next() override {
+      assert(docid != solux::PostingsReader::END);
       return doNext(allScorers[0]->next());
     }
 
@@ -591,12 +594,8 @@ public:
     }
 
     int32_t next() override {
-      // A parent's advance() (which loops on next()) can call us again after we
-      // returned END - e.g. MandOptScorer scoring a required doc past the last
-      // optional match. Stay idempotent at END.
-      if (pq.size() == 0) {
-        return docid = solux::PostingsReader::END;
-      }
+      // Contract: callers must not re-poll after END (see Query::Scorer).
+      assert(pq.size() > 0);
       int currid = docid;
       assert(pq.top().docId() == docid);
 
@@ -711,10 +710,12 @@ public:
     }
 
     int32_t next() override {
+      assert(docid != solux::PostingsReader::END);
       return findNext(docid + 1);
     }
 
     int32_t advance(int32_t target) override {
+      assert(docid < target);  // strict, and (END < target) is never true: also latches END
       return findNext(target);
     }
 

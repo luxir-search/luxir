@@ -193,6 +193,8 @@ public:
   }
 
   int32_t nextDoc() {
+    // Contract: callers must not re-poll after END (see Query::Scorer).
+    assert(docid != PostingsReader::END);
     if (docBufIdx >= docBufEnd) {
       auto leftToRead = docfreq - docOrd;
       // Boundary analysis: if docfreq==1 and docOrd==1 (meaning we already read ord 0, but not 1), we are done.

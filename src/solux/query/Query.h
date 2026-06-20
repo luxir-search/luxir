@@ -76,6 +76,12 @@ class DocSet;
 // `if (sub.docId() < target) sub.advance(target)` (see ConjunctionScorer,
 // MandOptScorer).
 //
+// Once a scorer returns END, calling next() or advance() on it again is undefined
+// behavior (Lucene's DocIdSetIterator contract): callers latch on END and stop.
+// Because END == INT_MAX the strict-advance guard above doubles as that latch for
+// advance() (END is never < target, so an exhausted sub is simply never re-advanced);
+// next() asserts it has not been re-polled where the exhausted state is cheap to test.
+//
 
 /// A map from KeyType to a vector of pointers to ValType.
 /// The map internals, the vector, and the instances of ValType are all pool allocated.
