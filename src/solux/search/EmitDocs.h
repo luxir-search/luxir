@@ -99,8 +99,13 @@ typename Emit::value_type pickMissingVal(std::span<const typename Emit::value_ty
   std::vector<char> taken(n + 1, 0);
   for (size_t i = 0; i < vals.size(); i++) {
     if (!present[i]) continue;
-    int64_t off = Emit::encodeVal(vals[i]) - encLo;
-    if (off >= 0 && off <= n) taken[off] = 1;
+    // Unsigned: for the int column encLo is INT64_MIN, so encodeVal - encLo
+    // overflows signed int64 (UB, miscompiled at -O2) for any value above
+    // encLo.  In unsigned arithmetic the window [encLo, encLo+n] maps to
+    // off in [0, n]; everything outside wraps to a large value that the
+    // single off <= n test rejects.
+    uint64_t off = (uint64_t)Emit::encodeVal(vals[i]) - (uint64_t)encLo;
+    if (off <= (uint64_t)n) taken[off] = 1;
   }
   for (int64_t j = 0; j <= n; j++) {
     if (!taken[j]) return Emit::decodeEnc(encLo + j);
