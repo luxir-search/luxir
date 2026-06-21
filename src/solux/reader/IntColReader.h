@@ -133,8 +133,12 @@ public:
       uint32_t num = decodedMax - decodedStart;
       if (block.bits <= 32) {
         uint32_t ints[BULK_DECODE];  // the deltas from the expected value
-        IndexCodec::numericCodec.decodeWithMeta(subBlockStart, littleBlockSize,
-                                              ints, num, 0, block.bits);
+
+        if constexpr (BULK_DECODE == 128) {
+          IndexCodec::numericCodec.decodeSingleBlock(subBlockStart, ints, num, block.bits);
+        } else {
+          IndexCodec::numericCodec.decodeWithMeta(subBlockStart, ints, num, block.bits);
+        }
 
         /* decoding a single value looks like this:
         auto valuesInBlock = (blockNum == uint64_t(nValues) / BLOCK_SIZE) ? uint64_t(nValues) % BLOCK_SIZE : BLOCK_SIZE;
@@ -200,7 +204,7 @@ public:
     int64_t gcd;
     int64_t min;
     int64_t max;
-    int64_t format; // currently number of bits if <= 32.
+    uint64_t format; // currently number of bits if <= 32.
     int64_t blockOffset;  // byte offset of compressed block from the start of the column
   };
 
@@ -352,7 +356,7 @@ public:
       auto rankInBlock = (uint64_t)index % Postings::NUMERIC_BLOCK_SIZE;
       auto& block = blockMeta[blockNum];
       const char* blockStart = blocks + block.blockOffset;
-      // depending ont the exact format, valuesInBlock may not be needed.
+      // depending on the exact format, valuesInBlock may not be needed.
       auto valuesInBlock = (blockNum == uint64_t(max) / Postings::NUMERIC_BLOCK_SIZE) ? uint32_t(max) % Postings::NUMERIC_BLOCK_SIZE : Postings::NUMERIC_BLOCK_SIZE;
       if (block.format <= 32) {
         auto unscaled = IndexCodec::numericCodec.selectWithMeta(blockStart, valuesInBlock, rankInBlock, 0, block.format);
@@ -425,8 +429,13 @@ public:
       uint32_t num = decodedMax - decodedStart;
       if (block.format <= 32) {
         uint32_t ints[BULK_DECODE];
-        IndexCodec::numericCodec.decodeWithMeta(subBlockStart, littleBlockSize,
-                                              ints, num, 0, block.format);
+
+        if constexpr (BULK_DECODE == 128) {
+          IndexCodec::numericCodec.decodeSingleBlock(subBlockStart, ints, num, block.format);
+        } else {
+          IndexCodec::numericCodec.decodeWithMeta(subBlockStart, ints, num, block.format);
+        }
+
         for (uint32_t i = 0; i < num; i++) {
           // unsigned math: delta * gcd can exceed int64 for blocks whose range
           // spans most of the int64 space (see IntColWriter::addBlock)

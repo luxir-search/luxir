@@ -5,13 +5,21 @@
 #include <cassert>
 #include <stdexcept>
 #include <bit>
+#include <emmintrin.h>  // __m128i, for the inline numeric decode loop
 #include "solux/util/solux_util.h"
 
 // Integer codecs, backed by FastPFOR's SIMD bit-packing kernels (which have
 // native ARM NEON support; the engine migrated off SIMDCompressionAndIntersection
 // to FastPFOR for that). The heavy FastPFOR headers are pulled in only by
-// Codec.cpp, so this widely-included header stays light -- the one inline method,
-// SoluxSIMDFor::selectWithMeta, is pure integer bit-math.
+// Codec.cpp, so this widely-included header stays light. The inline hot paths
+// (SoluxSIMDFor::selectWithMeta, decodeWithMeta) need only __m128i plus the one
+// forward-declared unpack kernel below, not FastPFOR's headers.
+
+namespace FastPForLib {
+// FastPFOR's unaligned SIMD bit-unpack (defined in the fastpfor static lib). Forward-
+// declared so the inline decodeWithMeta can call it without pulling in common.h.
+void usimdunpack(const __m128i* __restrict__ in, uint32_t* __restrict__ out, uint32_t bit);
+}
 
 namespace solux {
 
@@ -92,9 +100,34 @@ class SoluxSIMDFor : public U32Codec {
 public:
   ~SoluxSIMDFor() override = default;
 
-  // Caller supplies minval + bits (from block metadata); stores no header.
+  // encodeWithMeta: caller supplies minval + bits (from block metadata); stores no header.
   void encodeWithMeta(uint32_t* in, uint32_t inSz, char* target, uint32_t& outSz, uint32_t minval, uint8_t bits);
-  uint32_t decodeWithMeta(const char* encoded, uint32_t inSz, uint32_t* out, uint32_t& outSz, uint32_t minval, uint8_t bits);
+
+  // decodeWithMeta: inline so the column readers' decode loops fold it in and DCE around it.
+  // Production frame-of-reference min is always 0, so a value IS its unpacked delta -- no minval,
+  // no unused size arg. The 0/32-bit edge formats and a partial tail are cold (out-of-line).
+  inline uint32_t decodeWithMeta(const char* encoded, uint32_t* out, uint32_t outSz, uint8_t bits) {
+    const uint32_t* in = (const uint32_t*) encoded;
+    uint32_t k = 0;
+    for (; k + 128 <= outSz; k += 128) {
+      FastPForLib::usimdunpack((const __m128i*) in, out + k, bits);  // bits 0 and 32 handled by the kernel
+      in += 4 * bits;
+    }
+    if (k < outSz) in += decodeTailMeta(in, outSz - k, out + k, bits);
+    return (uint32_t) ((const char*) in - encoded);
+  }
+
+  // decode a single block (128) or less.
+  inline void decodeSingleBlock(const char* encoded, uint32_t* out, uint32_t outSz, uint8_t bits) {
+    assert(outSz <= 128);
+    if (outSz < 128) [[unlikely]] {
+      decodeTailMeta((const uint32_t*)encoded, outSz, out, bits);
+    } else {
+      FastPForLib::usimdunpack((const __m128i*) encoded, out, bits);
+    }
+  }
+
+  static uint32_t decodeTailMeta(const uint32_t* in, uint32_t rem, uint32_t* out, uint8_t bits);  // partial tail (<128)
 
   // U32Codec interface: self-describing variants that store min/max up front
   // (used by codec tests/benchmarks).
@@ -107,10 +140,8 @@ public:
   inline uint32_t selectWithMeta(const char* compressed, uint32_t blockSize, uint32_t index, uint32_t minval, uint8_t bits) {
     unused(blockSize);
     const uint32_t* in = (const uint32_t*) compressed;
-    if (bits == 32) {
-      return in[index];
-    } else if (bits == 0) {
-      return minval;  // all values equal minval, nothing encoded.
+    if (bits == 0) {
+      return minval;  // all values equal minval, nothing encoded (hand-rolled, so guard the read).
     }
     in += index / 128 * 4 * bits;
     const uint32_t slot = index % 128;
@@ -119,7 +150,7 @@ public:
     const uint32_t firstwordinlane = bitsinlane / 32;
     const uint32_t secondwordinlane = (bitsinlane + bits - 1) / 32;
     const uint32_t firstpart = in[4 * firstwordinlane + lane] >> (bitsinlane % 32);
-    const uint32_t mask = (1 << bits) - 1;
+    const uint32_t mask = (uint32_t)((1ull << bits) - 1);  /* 64-bit shift avoids UB at bits==32 */
     if (firstwordinlane == secondwordinlane) {
       /* easy common case */
       return minval + (firstpart & mask);

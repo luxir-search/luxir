@@ -97,4 +97,14 @@ TYPED_TEST(ForTest, basic) {
     this->values.push_back(123456789);
   }
   this->test();
+
+  // full-width residuals (bits==32): the uint32 range needs all 32 bits (M-m >= 2^31).
+  // Exercises the dropped 32-bit special case across encode / decode / select.
+  this->test({0, (int32_t)0x80000000u});                        // M-m == 2^31 -> bits 32
+  this->test({(int32_t)0xFFFFFFFFu, 0, (int32_t)0x7fffffff});   // full 32-bit span
+  this->values.resize(0);                                        // full SIMD block + 2-value tail at bits 32
+  this->values.push_back(0);
+  this->values.push_back((int32_t)0x80000000u);
+  for (int i = 2; i < 130; i++) this->values.push_back(i);
+  this->test();
 }

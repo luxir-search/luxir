@@ -242,7 +242,7 @@ uint32_t packTail(const uint32_t* residuals, uint32_t len, uint8_t bits, uint32_
 }
 
 void unpackTail(const uint32_t* in, uint32_t len, uint8_t bits, uint32_t* out) {
-  const uint32_t mask = (1u << bits) - 1;
+  const uint32_t mask = (uint32_t)((1ull << bits) - 1);  // 64-bit shift avoids UB at bits==32
   for (uint32_t i = 0; i < len; ++i) {
     const uint32_t lane = i % 4;
     const uint32_t bitsinlane = (i / 4) * bits;
@@ -269,11 +269,8 @@ void SoluxSIMDFor::encodeWithMeta(uint32_t* in, uint32_t inSz, char* target, uin
     outSz = 0;
     return;
   }
-  if (bits == 32) {  // raw passthrough -- selectWithMeta returns the raw word.
-    memcpy(out, in, inSz * sizeof(uint32_t));
-    outSz = inSz * sizeof(uint32_t);
-    return;
-  }
+  // bits 1..32 all go through the SIMD packer (bit==32 is a straight copy in the kernel), storing
+  // residuals (value - minval). For production minval==0 this is byte-identical to a raw copy.
 
   uint32_t tmp[128];
   uint32_t k = 0;
@@ -296,33 +293,17 @@ void SoluxSIMDFor::encodeWithMeta(uint32_t* in, uint32_t inSz, char* target, uin
   outSz = (char*) out - target;
 }
 
-uint32_t SoluxSIMDFor::decodeWithMeta(const char* encoded, uint32_t inSz, uint32_t* out, uint32_t& outSz,
-                                      uint32_t minval, uint8_t bits) {
-  unused(inSz);
-  const uint32_t* in = (const uint32_t*) encoded;
+// Cold partial-tail decode (min==0): unpack the <128 remainder straight into the output buffer
+// (no scratch copy, since there's no minval to add). bits==0 (constant block, nothing stored) ->
+// zeros, handled here so the hot path needs no branch for it; unpackTail would otherwise read
+// past the (empty) block.
+uint32_t SoluxSIMDFor::decodeTailMeta(const uint32_t* in, uint32_t rem, uint32_t* out, uint8_t bits) {
   if (bits == 0) {
-    for (uint32_t i = 0; i < outSz; ++i) out[i] = minval;
+    memset(out, 0, rem * sizeof(uint32_t));
     return 0;
   }
-  if (bits == 32) {
-    memcpy(out, in, outSz * sizeof(uint32_t));
-    return outSz * sizeof(uint32_t);
-  }
-
-  uint32_t tmp[128];
-  uint32_t k = 0;
-  for (; k + 128 <= outSz; k += 128) {
-    FastPForLib::usimdunpack((const __m128i*) in, out + k, bits);
-    if (minval) for (uint32_t i = 0; i < 128; ++i) out[k + i] += minval;
-    in += 4 * bits;
-  }
-  if (k < outSz) {  // compact partial tail (matches packTail)
-    const uint32_t rem = outSz - k;
-    unpackTail(in, rem, bits, tmp);
-    for (uint32_t i = 0; i < rem; ++i) out[k + i] = tmp[i] + minval;
-    in += tailWords(rem, bits);
-  }
-  return (char*) in - encoded;
+  unpackTail(in, rem, bits, out);
+  return tailWords(rem, bits);
 }
 
 void SoluxSIMDFor::encodeBlock(uint32_t* in, uint32_t inSz, char* target, uint32_t& outSz) {
@@ -345,12 +326,16 @@ void SoluxSIMDFor::encodeBlock(uint32_t* in, uint32_t inSz, char* target, uint32
 }
 
 uint32_t SoluxSIMDFor::decodeBlock(const char* compressed, uint32_t inSz, uint32_t* out, uint32_t& outSz) {
+  unused(inSz);
   if (outSz == 0) return 0;
   const uint32_t* in = (const uint32_t*) compressed;
   const uint32_t m = in[0];
   const uint32_t M = in[1];
   const int b = std::bit_width((uint32_t) (M - m));
-  const auto readSize = decodeWithMeta((const char*) (in + 2), inSz - 2 * sizeof(uint32_t), out, outSz, m, (uint8_t) b);
+  const auto readSize = decodeWithMeta((const char*) (in + 2), out, outSz, (uint8_t) b);
+  // decodeWithMeta assumes min==0; the self-describing path restores the stored min here
+  // (all widths now store residuals). Test/bench only -- not perf sensitive.
+  if (m) for (uint32_t i = 0; i < outSz; ++i) out[i] += m;
   return readSize + 2 * sizeof(uint32_t);
 }
 
