@@ -176,13 +176,28 @@ public:
 };
 
 /// Delta-coded PForDelta -- the documents codec. Applies an adjacent delta over
-/// the block before PFor encoding and a prefix sum after decoding.
+/// the block before PFor encoding and a prefix sum after decoding. The block's
+/// first id is coded as a delta from `base` (the last doc of the previous block,
+/// 0 for the first / a standalone block), so cross-block ids stay small instead
+/// of every block's first id being a large absolute outlier.
 /// NOTE: encodeBlock mutates `in` in place (the delta).
 class SoluxPFORd : public U32Codec {
 public:
   ~SoluxPFORd() override = default;
-  void encodeBlock(uint32_t* in, uint32_t inSz, char* out, uint32_t& outSz) override;
-  uint32_t decodeBlock(const char* in, uint32_t inSz, uint32_t* out, uint32_t& outSz) override;
+
+  // Base-aware production path: base = last doc id of the previous block (0 for
+  // the first block of a term).  encodeBlock mutates `in`.
+  void encodeBlock(uint32_t* in, uint32_t inSz, char* out, uint32_t& outSz, uint32_t base);
+  uint32_t decodeBlock(const char* in, uint32_t inSz, uint32_t* out, uint32_t& outSz, uint32_t base);
+
+  // U32Codec interface (base == 0): standalone, self-contained blocks, used by
+  // the codec round-trip tests / benchmarks.
+  void encodeBlock(uint32_t* in, uint32_t inSz, char* out, uint32_t& outSz) override {
+    encodeBlock(in, inSz, out, outSz, 0);
+  }
+  uint32_t decodeBlock(const char* in, uint32_t inSz, uint32_t* out, uint32_t& outSz) override {
+    return decodeBlock(in, inSz, out, outSz, 0);
+  }
 };
 
 

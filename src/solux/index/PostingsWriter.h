@@ -374,6 +374,7 @@ class TextWriter {
   int32_t docsFlushed;  /// number of documents flushed for the current term so far
   int32_t curTf = 0;    /// occurrences (term freq) seen so far for the current doc
   int64_t ttfAcc = 0;   /// total term freq (sum of tf over docs) accumulated for the current term
+  uint32_t prevDocBlockLast = 0;  /// last doc id of the previous flushed doc block (cross-block delta base); reset per term
 
   // Index level for this field, decoded from the field flags in startField().  These gate
   // whether the freq stream and position stream are written at all.
@@ -466,12 +467,16 @@ public:
 
     // NOTE: SoluxPFORd (docCodec) applies the adjacent delta itself, in place,
     // so we pass the raw (monotonic) doc ids. encodeBlock handles exactly one
-    // DOCS_BLOCK_SIZE block.
+    // DOCS_BLOCK_SIZE block.  The block's first id is coded as a delta from the
+    // previous block's last id (cross-block base); capture this block's last id
+    // first, since encodeBlock deltas `docs` in place.
+    const uint32_t base = prevDocBlockLast;
+    prevDocBlockLast = (uint32_t) docs.back();
 
     compressed_output.resize(Postings::DOCS_BLOCK_SIZE * sizeof(int32_t) + 1024);
     uint32_t compressedSize = compressed_output.size(); // this gets changed to the actual size
     IndexCodec::docCodec.encodeBlock(reinterpret_cast<uint32_t *>(docs.data()), docs.size(), compressed_output.data(),
-                                  compressedSize);
+                                  compressedSize, base);
     docOutput.write(compressed_output.data(), compressedSize);
 
     //
@@ -628,6 +633,7 @@ public:
   int32_t startTerm(TermRef term) {
     docsFlushed = 0;
     ttfAcc = 0;
+    prevDocBlockLast = 0;  // each term's first doc block starts from base 0
     locOfPositionsForTerm = posOutput.size();
     locOfDocsForTerm = docOutput.size();
     termList.push_back(term);  // we don't really need the term name at this point (could add in endTerm), but it might be nice for debugging / exceptions?
@@ -689,7 +695,9 @@ public:
       const uint32_t kb = svbKeyBytes(n);
       uint8_t dkeys[Postings::DOCS_BLOCK_SIZE / 4 + 1];
       uint8_t ddata[Postings::DOCS_BLOCK_SIZE * 4];
-      uint8_t* ddEnd = svb_encode_scalar_d1_init((const uint32_t*) docs.data(), dkeys, ddata, n, 0);
+      // d1 base: continue the cross-block delta from the last full block (0 when
+      // the term is a single partial block), matching the docs codec convention.
+      uint8_t* ddEnd = svb_encode_scalar_d1_init((const uint32_t*) docs.data(), dkeys, ddata, n, prevDocBlockLast);
       docOutput.write(dkeys, kb);
       docOutput.write(ddata, (size_t)(ddEnd - ddata));
       if (hasFreqs) {

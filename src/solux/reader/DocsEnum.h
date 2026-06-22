@@ -205,12 +205,19 @@ public:
         return docid;
       }
 
+      // Cross-block delta base: the previous block's last id (still in docBuf,
+      // not yet overwritten), or 0 for the first block.  Mirrors PostingsWriter
+      // (full blocks via the docs codec, the partial tail via StreamVByte d1).
+      // Once skip data exists, a seek-to-block reads this base from the skip entry
+      // instead of the previous block.
+      const uint32_t base = (docOrd == 0) ? 0 : (uint32_t) docBuf[Postings::DOCS_BLOCK_SIZE - 1];
+
       // Since we only read whole blocks, simply comparing with number of docs left to read is sufficient.
       // If we start partial decoding of blocks (say because of skipping), then we would want something
       // like lastBlockEncodedPosOrd, but for docs.
       if (leftToRead >= Postings::DOCS_BLOCK_SIZE) {
         uint32_t outSz = Postings::DOCS_BLOCK_SIZE;
-        auto bytesRead = IndexCodec::docCodec.decodeBlock(docIS.ptr(), docIS.left(), (uint32_t*)docBuf, outSz);
+        auto bytesRead = IndexCodec::docCodec.decodeBlock(docIS.ptr(), docIS.left(), (uint32_t*)docBuf, outSz, base);
         docIS.skip(bytesRead);
         assert(outSz == Postings::DOCS_BLOCK_SIZE);
         docBufIdx = 0;
@@ -237,7 +244,7 @@ public:
         const uint32_t n = (uint32_t) leftToRead;
         const uint32_t kb = svbKeyBytes(n);
         uint8_t* p = (uint8_t*) docIS.ptr();
-        uint8_t* dataEnd = svb_decode_avx_d1_init((uint32_t*) docBuf, p, p + kb, n, 0);
+        uint8_t* dataEnd = svb_decode_avx_d1_init((uint32_t*) docBuf, p, p + kb, n, base);
         if (hasFreqs) {
           dataEnd = svb_decode_avx_simple((uint32_t*) tfreqBuf, dataEnd, dataEnd + kb, n);
           tfreqBufIdx = 0;

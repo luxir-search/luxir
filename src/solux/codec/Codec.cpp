@@ -369,18 +369,20 @@ uint32_t SoluxPFOR::decodeBlock(const char* in, uint32_t inSz, uint32_t* out, ui
 
 // --- SoluxPFORd (documents, delta) ---
 
-void SoluxPFORd::encodeBlock(uint32_t* in, uint32_t inSz, char* out, uint32_t& outSz) {
+void SoluxPFORd::encodeBlock(uint32_t* in, uint32_t inSz, char* out, uint32_t& outSz, uint32_t base) {
   unused(inSz);
   assert(inSz == BLOCK_SIZE);
-  FastPForLib::Delta::fastDelta(in, BLOCK_SIZE);  // adjacent delta, in place
+  FastPForLib::Delta::fastDelta(in, BLOCK_SIZE);  // adjacent delta, in place; in[0] left absolute
+  in[0] -= base;  // code the first id as a delta from the carried base (base==0 for the first block)
   encodeBlockPFor(in, out, outSz);
 }
 
-uint32_t SoluxPFORd::decodeBlock(const char* in, uint32_t inSz, uint32_t* out, uint32_t& outSz) {
+uint32_t SoluxPFORd::decodeBlock(const char* in, uint32_t inSz, uint32_t* out, uint32_t& outSz, uint32_t base) {
   unused(inSz);
   assert(outSz == BLOCK_SIZE);
   unused(outSz);
   auto ret = decodeBlockPFor(in, out);
+  out[0] += base;  // undo the base before the prefix sum (mirrors encode)
   FastPForLib::Delta::fastinverseDelta2(out, BLOCK_SIZE);
   return ret;
 }

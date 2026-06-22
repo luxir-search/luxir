@@ -6,6 +6,8 @@
 #include <algorithm>
 #include "solux/util/BranchlessSearch.h"
 #include "solux/util/screaming.h"
+#include "solux/util/random.h"
+#include "test/SoluxTest.h"
 
 using namespace solux;
 using screaming::gallopLowerBound;
@@ -28,7 +30,7 @@ namespace solux { extern bool unit_tests; }
 // Always-on: cheap fuzz check that the production gallop and branchless searches
 // match std::lower_bound across edge-case lengths and every key position.
 TEST(BranchlessSearchBM, gallopAndBranchlessMatchStd) {
-  std::mt19937 rng(123);
+  auto& rng = SoluxTest::rng;  // gtest-seeded (per-test) fast RNG
   for (size_t len : std::initializer_list<size_t>{0, 1, 2, 3, 7, 16, 100, 4096}) {
     std::uniform_int_distribution<int> v(0, (int)len + 5);
     std::vector<uint16_t> arr(len);
@@ -51,7 +53,7 @@ constexpr int NUM_KEYS = 1024;
 
 template <typename T>
 std::vector<T> sortedArray(size_t len, uint64_t span) {
-  std::mt19937_64 rng(0x5eed ^ len);
+  Rng rng(0x5eed ^ len);  // local, per-len seed: same data for std/branchless A/B
   std::uniform_int_distribution<uint64_t> dist(0, span);
   std::vector<T> v;
   v.reserve(len);
@@ -62,7 +64,7 @@ std::vector<T> sortedArray(size_t len, uint64_t span) {
 
 template <typename T>
 std::vector<T> randomKeys(uint64_t span) {
-  std::mt19937_64 rng(0xc0ffee);
+  Rng rng(0xc0ffee);  // local, fixed seed: identical keys across A/B variants
   std::uniform_int_distribution<uint64_t> dist(0, span);
   std::vector<T> keys(NUM_KEYS);
   for (auto& k : keys) k = (T)dist(rng);
@@ -148,7 +150,7 @@ struct SparseArena {
   a.data.resize(numBuckets * bucketSize);
   a.offsets.resize(numBuckets + 1);
   a.order.resize(numBuckets);
-  std::mt19937 rng(0x5af3 ^ bucketSize);
+  Rng rng(0x5af3 ^ bucketSize);  // local, per-bucketSize seed for reproducible arena
   std::uniform_int_distribution<uint32_t> v(0, 60000);
   for (size_t b = 0; b < numBuckets; b++) {
     a.offsets[b] = (uint32_t)(b * bucketSize);

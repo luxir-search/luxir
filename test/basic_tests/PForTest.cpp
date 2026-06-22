@@ -1,8 +1,8 @@
 #include "solux/codec/Codec.h"  // SoluxPFOR, SoluxPFORd, SoluxSIMDFor
 #include "gtest/gtest.h"
 #include "test/SoluxTest.h"
+#include <algorithm>
 #include <cstring>
-#include <random>
 #include <vector>
 
 using namespace solux;
@@ -35,7 +35,6 @@ class PForTest : public SoluxTest {};
 // Non-delta PForDelta: round-trips across value distributions that exercise the
 // exception path, all-zero (bestb==0), and full 32-bit values.
 TEST_F(PForTest, pforRoundTrip) {
-  std::mt19937 rng(12345);
   SoluxPFOR fp;
 
   for (int trial = 0; trial < 300; ++trial) {
@@ -69,7 +68,6 @@ TEST_F(PForTest, pforRoundTrip) {
 
 // Delta-coded PForDelta (docs codec): monotonic inputs, like document ids.
 TEST_F(PForTest, pfordRoundTrip) {
-  std::mt19937 rng(67890);
   SoluxPFORd fp;
 
   for (int trial = 0; trial < 300; ++trial) {
@@ -83,5 +81,33 @@ TEST_F(PForTest, pfordRoundTrip) {
     }
 
     ASSERT_EQ(roundtrip(fp, data), data) << "trial " << trial;
+  }
+}
+
+// Delta-coded docs with a cross-block base: a block whose first id is coded as a
+// delta from the previous block's last id must round-trip when decoded with the
+// same base.  Mirrors how PostingsWriter/DocsEnum carry the base across blocks.
+TEST_F(PForTest, pfordBaseCarry) {
+  SoluxPFORd fp;
+
+  for (int trial = 0; trial < 200; ++trial) {
+    uint32_t base = rng() % 1000000;            // previous block's last id
+    uint32_t maxGap = (trial % 4) + 1;          // dense .. sparse gaps
+    if (trial % 7 == 0) maxGap = 100000;        // occasional big jumps
+    std::vector<uint32_t> data(BLK);
+    uint32_t acc = base;
+    for (auto& v : data) { acc += 1 + rng() % maxGap; v = acc; }  // strictly increasing, all > base
+
+    std::vector<uint32_t> in = data;            // encodeBlock mutates in place
+    std::vector<char> enc(BLK * sizeof(uint32_t) * 2 + 1024);
+    uint32_t encSz = enc.size();
+    fp.encodeBlock(in.data(), in.size(), enc.data(), encSz, base);
+
+    std::vector<char> buf(encSz + 64, 0);       // exact-sized (+slack) so over-reads are caught
+    memcpy(buf.data(), enc.data(), encSz);
+    std::vector<uint32_t> out(BLK, 0xdeadbeef);
+    uint32_t outSz = BLK;
+    fp.decodeBlock(buf.data(), encSz, out.data(), outSz, base);
+    ASSERT_EQ(out, data) << "trial " << trial << " base " << base;
   }
 }

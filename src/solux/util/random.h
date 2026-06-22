@@ -89,12 +89,17 @@ public:
 };
 
 
-// TODO: implement interfaces expected of std random engines so we can use these in conjunction with
-// other standard lib random code (like distribution generation)
 template<class Engine>
 class SoluxRand {
   Engine engine;
 public:
+  // C++ UniformRandomBitGenerator interface, so SoluxRand drives std::shuffle,
+  // std::sample, std::uniform_int_distribution, etc.  Both engines emit
+  // full-range 64-bit values.
+  using result_type = uint64_t;
+  static constexpr result_type min() { return 0; }
+  static constexpr result_type max() { return UINT64_MAX; }
+
   SoluxRand() {
   }
 
