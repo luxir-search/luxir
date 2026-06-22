@@ -42,6 +42,10 @@ generated `*.pb.h` headers must exist). See [docs/build-setup.md](docs/build-set
 #   ./build/gcc-debug/bin/solux_test --gtest_filter="Benchmarks.all"
 ./build/gcc-debug/bin/solux_test --bench
 
+# Run all benchmarks except the slow vector ones (HNSW/IVFPQ builds dominate
+# wall-clock). Negative google-benchmark filter excludes the BM_Vector* family:
+./build/gcc-release/bin/solux_test --bench --benchmark_filter='-BM_Vector'
+
 # Run the same suite under ASan before committing
 ./build/gcc-debug-asan/bin/solux_test
 ```
