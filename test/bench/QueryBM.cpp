@@ -292,6 +292,66 @@ static void BM_Query(benchmark::State& state, int64_t nDocs, std::string_view sh
 
 
 
+// Conjunction (AND of two terms) -- the canonical advance()/leapfrog workload:
+// the smaller posting list leads and advance()s the larger across doc blocks,
+// which is exactly what postings skip data accelerates.  Kept deliberately lean
+// (count all matches, no sort, no scores) so the conjunction iteration -- not
+// the collector -- dominates, making the skip-data before/after visible.
+static void BM_QueryConj(benchmark::State& state, int64_t nDocs, std::string_view shape,
+                         std::string_view field1, std::string_view field2, bool para) {
+  int mergeFactor = 10;  // TODO: actually get from IW?
+
+  if (solux::unit_tests) {
+    nDocs = 200;
+  }
+
+  std::vector<int32_t> docsPerSeg;
+  CollectionHelper::calcSegSizes(nDocs, mergeFactor, shape, docsPerSeg);
+
+  CollectionHelper helper;
+  bool reuseIndex = helper.indexMatchesShape(docsPerSeg);
+  if (!reuseIndex) {
+    buildBenchIndex(helper, nDocs, docsPerSeg);
+  }
+
+  int64_t fp = -1;
+  for (auto _ : state) {
+    auto* lreq = LocalReq::create(SoluxTest::soluxNode->getSearchEngine());
+    lreq->proto.mutable_collection()->add_name("main");
+    lreq->proto.set_request_id("myrequestid");
+    auto& ops = *lreq->proto.mutable_ops();
+    auto& topDocs = *ops["q"].mutable_top_docs();
+
+    // field1:0 AND field2:0 (both required/scoring).  Clause order is irrelevant;
+    // BooleanQuery leads with the lower-docfreq clause and advance()s the other.
+    auto& boolean = *topDocs.mutable_query()->mutable_boolean();
+    for (std::string_view f : {field1, field2}) {
+      auto& m = *boolean.add_required()->mutable_match();
+      m.set_field(f);
+      m.mutable_val()->set_s("0");
+    }
+    topDocs.set_limit(10);
+    topDocs.set_get_number(true);   // count all matches -> iterate the full conjunction
+    topDocs.set_get_scores(false);
+
+    lreq->engine.submit(*lreq, para);
+
+    int64_t ret = lreq->responses[0]->proto.ops().at("q").docs().matches();
+    lreq->done();
+    benchmark::DoNotOptimize(ret);
+
+    if (fp != -1) {
+      ASSERT_EQ(fp, ret);  // same match count every iteration
+    }
+    fp = ret;
+  }
+
+  state.counters["matches"] = fp;
+  state.counters["reused"] = reuseIndex;
+  state.counters["rate"] = benchmark::Counter(state.iterations(), benchmark::Counter::kIsRate);
+}
+
+
 // When we test sparse sets for performance, the most interesting case is when it's still a bitset in the block.
 // Search code will spend much less time in very sparse sets.
 constexpr int32_t nDocs = 10'000'000; // nocommit
@@ -317,4 +377,10 @@ SOLUX_BENCHMARK_CAPTURE(BM_Query, short_u100k_s,      nDocs, shape, "all", "shor
 SOLUX_BENCHMARK_CAPTURE(BM_Query, short_u100k_s_para, nDocs, shape, "all", "short_u100k_s", true);
 SOLUX_BENCHMARK_CAPTURE(BM_Query, short_u1m_s,      nDocs, shape, "all", "short_u1m_s", false);
 SOLUX_BENCHMARK_CAPTURE(BM_Query, short_u1m_s_para, nDocs, shape, "all", "short_u1m_s", true);
+
+// Conjunction shapes (rare term leads, advance()s the common one across blocks).
+SOLUX_BENCHMARK_CAPTURE(BM_QueryConj, conj_dense_sparse,      nDocs, shape, "short_u10_s",  "short_u100k_s", false);  // ~1M AND ~100
+SOLUX_BENCHMARK_CAPTURE(BM_QueryConj, conj_dense_sparse_para, nDocs, shape, "short_u10_s",  "short_u100k_s", true);
+SOLUX_BENCHMARK_CAPTURE(BM_QueryConj, conj_dense_mid,         nDocs, shape, "short_u10_s",  "short_u10k_s",  false);  // ~1M AND ~1k
+SOLUX_BENCHMARK_CAPTURE(BM_QueryConj, conj_mid_sparse,        nDocs, shape, "short_u10k_s", "short_u100k_s", false);  // ~1k AND ~100
 // #endif

@@ -361,13 +361,21 @@ public:
       }
       driver.contribute([&](MergeableStrFacet& data) {
         boost::unordered_flat_map<std::string, int64_t>& counts = data.counts;
+        // Domain shape, resolved once; per term we pick the intersection strategy
+        // from the domain size vs the term docfreq (see the loop below).
         const FixedBitSet* domainBits = nullptr;
-        if (domain && domain->type == DocSet::Type::BITSET) {
-          domainBits = &static_cast<BitDocSet*>(domain)->bits();
+        ArrDocSet* domainArr = nullptr;
+        if (domain) {
+          if (domain->type == DocSet::Type::BITSET) {
+            domainBits = &static_cast<BitDocSet*>(domain)->bits();
+          } else {
+            domainArr = static_cast<ArrDocSet*>(domain);
+          }
         }
         SegFieldInfo segFieldInfo;
         auto& postingsReader = thisOp().reader.segments()[segnum].postingsReader();
         int32_t maxDoc = postingsReader.maxDoc();
+        const int64_t domainCard = domain ? domain->card() : maxDoc;  // null domain == all docs
         auto poolGuard = MemPool::threadLocalPoolGuard();
         FieldReader fieldReader(poolGuard.pool(), postingsReader);
         if (!fieldReader.seek(thisOp().fieldName)) {
@@ -378,19 +386,41 @@ public:
         fieldReader.readFieldInfo(segFieldInfo);
         TermsEnum tenum(poolGuard.pool(), postingsReader, segFieldInfo);
         while (tenum.nextTerm()) {
-          int64_t count = 0;
           DocsEnum denum(poolGuard.pool(), postingsReader, tenum);
-          while (true) {
-            auto doc = denum.nextDoc();
-            if (doc == DocsEnum::END) {
-              break; // no more docs for this term
+          int64_t count = 0;
+          if (domain && domainCard < denum.numDocs()) {
+            // Domain smaller than this term's postings: drive from the domain and
+            // advance() the DocsEnum, so it can skip whole doc blocks (a big win
+            // for a common term vs a narrow domain once postings skip data lands;
+            // already a win for an array domain by avoiding a get() per term doc,
+            // and neutral for a bitset domain, before skip data).  advance() is
+            // forward-only, so only call it when the enum is behind the target.
+            if (domainArr) {
+              for (int32_t dd : domainArr->docs()) {
+                if (denum.docId() < dd && denum.advance(dd) == DocsEnum::END) break;
+                if (denum.docId() == dd) count++;
+              }
+            } else {
+              // nextSetBit asserts its arg < maxDoc, so guard dd+1 (DomainIter idiom).
+              int32_t dd = -1;
+              while (dd + 1 < maxDoc) {
+                dd = domainBits->nextSetBit(dd + 1);
+                if (dd >= maxDoc) break;
+                if (denum.docId() < dd && denum.advance(dd) == DocsEnum::END) break;
+                if (denum.docId() == dd) count++;
+              }
             }
-            if (domainBits) {
-              if (!domainBits->get(doc)) continue;
-            } else if (domain && !domain->get(doc)) {
-              continue;
+          } else {
+            // Dense or null domain: walk the term's postings and probe the domain
+            // (O(1) bitset get, binary search for an array domain, all docs if null).
+            for (int32_t doc = denum.nextDoc(); doc != DocsEnum::END; doc = denum.nextDoc()) {
+              if (domainBits) {
+                if (!domainBits->get(doc)) continue;
+              } else if (domainArr && !domainArr->get(doc)) {
+                continue;
+              }
+              count++;
             }
-            count++;
           }
           // use heterogeneous lookup in the future to avoid creating string when not needed
           if (count > 0 || thisOp().minCount == 0) {
