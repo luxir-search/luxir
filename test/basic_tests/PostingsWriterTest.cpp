@@ -332,6 +332,199 @@ TEST_F(PostingsTest, basic) {
 
 }
 
+// Exercise the index-options ladder: DOCS (no freqs/positions),
+// DOCS_AND_FREQS (freqs, no positions), and full positions.  Each level must
+// round-trip through the pulsed path (single doc), the StreamVByte tail, and a
+// full doc block.  tf is only stored when freqs are indexed; otherwise the
+// reader must report 1.  Positions are only present at the top level.
+TEST_F(PostingsTest, levelLadder) {
+  struct Doc { int id; int tf; };
+  struct Term { std::string name; std::vector<Doc> docs; };
+
+  for (int level = 0; level < 3; level++) {
+    FieldType::flag_type flags =
+        level == 0 ? FieldType::INDEX_DOCS :
+        level == 1 ? FieldType::INDEX_DOCS_FREQS :
+                     FieldType::INDEX_DOCS_FREQS_POSITIONS;
+    bool hasFreqs = FieldType::hasFreqs(flags);
+    bool hasPositions = FieldType::hasPositions(flags);
+
+    // terms must be written in sorted order: block < pulse < tail.
+    std::vector<Term> terms;
+    Term blk{"block", {}};
+    int nBlockDocs = Postings::DOCS_BLOCK_SIZE + 5;  // forces a block + tail
+    for (int d = 0; d < nBlockDocs; d++) blk.docs.push_back({d, (d % 3) + 1});
+    terms.push_back(std::move(blk));
+    terms.push_back({"pulse", {{3, 1}}});  // single doc, single occurrence -> pulsed
+    Term tail{"tail", {}};
+    for (int d = 0; d < 5; d++) tail.docs.push_back({d * 7 + 1, d + 1});
+    terms.push_back(std::move(tail));
+
+    RAMDir dir;
+    MemPool pool;
+    PostingsWriter postingsWriter(dir, 0, Postings::DOCS_BLOCK_SIZE + 20);
+    {
+      TextWriter writer(postingsWriter);
+      auto& finfo = postingsWriter.addField("f");
+      finfo.type = FieldType::TEXT;
+      finfo.flags = flags;
+      writer.startField(&finfo);
+      for (auto& t : terms) {
+        TermRef tref(pool, t.name.data(), t.name.size());
+        writer.startTerm(tref);
+        for (auto& d : t.docs) {
+          // Positions stream in via startDoc/addPositionDelta/endDoc; positionless
+          // fields state the freq directly via addDoc.  Writing the actual occurrence
+          // count at every level (including DOCS-only, where freqs are not stored)
+          // verifies that a non-freq field with multiple occurrences in one doc still
+          // reports ttf==docfreq, and that field-level sumTotalTermFreq matches the
+          // per-term ttf the reader sees.
+          if (hasPositions) {
+            writer.startDoc(d.id);
+            for (int o = 0; o < d.tf; o++) writer.addPositionDelta(o == 0 ? 1 : 2);
+            writer.endDoc(d.id);
+          } else {
+            writer.addDoc(d.id, d.tf);
+          }
+        }
+        writer.endTerm(tref);
+      }
+      writer.endField();
+    }
+    postingsWriter.finish();
+
+    PostingsReader reader(dir, 0);
+    FieldReader fieldReader(pool, reader);
+    ASSERT_TRUE(fieldReader.readNextField());
+    SegFieldInfo fieldInfo;
+    fieldReader.readFieldInfo(fieldInfo);
+    ASSERT_EQ(FieldType::hasFreqs(fieldInfo.flags), hasFreqs) << "level " << level;
+    ASSERT_EQ(FieldType::hasPositions(fieldInfo.flags), hasPositions) << "level " << level;
+
+    // Field-level stats must agree with the per-term ttf the reader reports: ttf is
+    // sum-of-freqs when freqs are indexed, else docfreq (each doc counts once).
+    int64_t expectedSumDf = 0, expectedSumTtf = 0;
+    for (auto& t : terms) {
+      expectedSumDf += (int64_t) t.docs.size();
+      for (auto& d : t.docs) expectedSumTtf += hasFreqs ? d.tf : 1;
+    }
+    ASSERT_EQ(fieldInfo.sumDocFreq, expectedSumDf) << "level " << level;
+    ASSERT_EQ(fieldInfo.sumTotalTermFreq, expectedSumTtf) << "level " << level;
+
+    TermsEnum tenum(pool, reader, fieldInfo);
+    for (auto& t : terms) {
+      ASSERT_TRUE(tenum.nextTerm()) << "level " << level << " term " << t.name;
+      ASSERT_EQ(tenum.term(), t.name);
+      DocsEnum de(pool, reader, tenum);
+      ASSERT_EQ(de.numDocs(), (int)t.docs.size()) << "level " << level << " term " << t.name;
+
+      int64_t expectedTtf = 0;
+      for (auto& d : t.docs) expectedTtf += hasFreqs ? d.tf : 1;
+      ASSERT_EQ(de.totalTermFreq(), expectedTtf) << "level " << level << " term " << t.name;
+
+      for (auto& d : t.docs) {
+        ASSERT_EQ(de.nextDoc(), d.id) << "level " << level << " term " << t.name;
+        int expectedTf = hasFreqs ? d.tf : 1;
+        ASSERT_EQ(de.termFreq(), expectedTf)
+            << "level " << level << " term " << t.name << " doc " << d.id;
+        if (hasPositions) {
+          // The written deltas are 1, then 2,2,...; because positions reset per
+          // doc, occurrence o lands at 2*o. Reading past tf positions is outside
+          // the codec contract.
+          de.startPositions();
+          for (int o = 0; o < expectedTf; o++) {
+            ASSERT_EQ(de.nextPosition(), 2 * o)
+                << "level " << level << " term " << t.name << " doc " << d.id << " occ " << o;
+          }
+        }
+      }
+      ASSERT_EQ(de.nextDoc(), INT_MAX) << "level " << level << " term " << t.name;
+    }
+    ASSERT_FALSE(tenum.nextTerm());
+  }
+}
+
+// Verify the file over-read padding contract used by PostingsWriter::finish().
+// Any codec's output can be the last bytes of a data file, so a decoder that reads
+// past the encoded bytes can run past the exact-sized store buffer or mmap. Decode
+// each codec from a heap allocation sized to exactly encodedSize plus its documented
+// over-read; under ASan the redzone immediately after the allocation catches reads
+// beyond that bound. Numeric and PFOR decode from the exact byte range and need no
+// slack. The old IntColWriter "31 bytes" note referred to the removed
+// SIMDCompressionAndIntersection codec. The StreamVByte AVX tail must stay within
+// SVB_OVERREAD_PAD.
+TEST_F(PostingsTest, codecFileOverreadBounds) {
+  // SoluxSIMDFor numeric column codec: claim exact (decode from a 0-slack buffer).
+  for (uint8_t bits : {(uint8_t)1, (uint8_t)7, (uint8_t)17, (uint8_t)31, (uint8_t)32}) {
+    uint32_t mask = bits == 32 ? ~0u : ((1u << bits) - 1);
+    for (uint32_t n : {1u, 5u, 31u, 100u, 128u, 200u, 333u}) {
+      std::vector<uint32_t> vals(n);
+      for (auto& v : vals) v = (uint32_t) rng() & mask;
+      std::vector<char> work(n * sizeof(uint32_t) + 64);
+      uint32_t encSz = work.size();
+      IndexCodec::numericCodec.encodeWithMeta(vals.data(), n, work.data(), encSz, 0, bits);
+      char* exact = new char[encSz];  // ASan redzone right after -> over-read faults
+      memcpy(exact, work.data(), encSz);
+      std::vector<uint32_t> out(n);
+      IndexCodec::numericCodec.decodeWithMeta(exact, out.data(), n, bits);
+      delete[] exact;
+      ASSERT_EQ(out, vals) << "numeric bits=" << (int)bits << " n=" << n;
+    }
+  }
+
+  // SoluxPFORd docs + SoluxPFOR positions codecs: full-block decodeBlock, claim exact.
+  auto checkBlockCodec = [&](U32Codec& codec, uint32_t blockSize, const char* name) {
+    std::vector<uint32_t> vals(blockSize);
+    uint32_t d = 0;
+    for (auto& v : vals) { d += rng.rint(1, 1000); v = d; }  // monotonic (delta-coded)
+    std::vector<uint32_t> expected = vals;  // SoluxPFORd delta-codes its input in place
+    std::vector<char> work(blockSize * sizeof(uint32_t) + 1024);
+    uint32_t encSz = work.size();
+    codec.encodeBlock(vals.data(), blockSize, work.data(), encSz);
+    char* exact = new char[encSz];
+    memcpy(exact, work.data(), encSz);
+    std::vector<uint32_t> out(blockSize);
+    uint32_t outSz = blockSize;
+    codec.decodeBlock(exact, encSz, out.data(), outSz);
+    delete[] exact;
+    ASSERT_EQ(outSz, blockSize) << name;
+    ASSERT_EQ(out, expected) << name;
+  };
+  checkBlockCodec(IndexCodec::docCodec, Postings::DOCS_BLOCK_SIZE, "docCodec");
+  checkBlockCodec(IndexCodec::posCodec, Postings::POSITIONS_BLOCK_SIZE, "posCodec");
+
+  // StreamVByte AVX tail (docs d1 + freqs plain): claim over-read <= SVB_OVERREAD_PAD.
+  // Buffer is sized to exactly the encoded length + SVB_OVERREAD_PAD; a larger over-read
+  // would fault.  n covers the scalar path (<32) and the AVX path (>=32, multiples and not).
+  for (uint32_t n : {1u, 5u, 32u, 33u, 64u, 96u, 127u}) {
+    std::vector<uint32_t> docs(n), freqs(n);
+    uint32_t d = 0;
+    for (auto& v : docs) { d += rng.rint(1, 100000); v = d; }
+    for (auto& f : freqs) f = rng.rint(1, 1000);
+    uint32_t kb = svbKeyBytes(n);
+    std::vector<uint8_t> dkeys(kb), ddata(n * 4 + 32), tkeys(kb), tdata(n * 4 + 32);
+    uint8_t* ddEnd = svb_encode_scalar_d1_init(docs.data(), dkeys.data(), ddata.data(), n, 0);
+    uint8_t* tdEnd = svb_encode_scalar(freqs.data(), tkeys.data(), tdata.data(), n);
+    uint32_t dDataSz = (uint32_t)(ddEnd - ddata.data());
+    uint32_t tDataSz = (uint32_t)(tdEnd - tdata.data());
+    uint32_t encSz = kb + dDataSz + kb + tDataSz;  // [dkeys][ddata][tkeys][tdata]
+    char* buf = new char[encSz + SVB_OVERREAD_PAD];
+    uint8_t* p = (uint8_t*) buf;
+    memcpy(p, dkeys.data(), kb);
+    memcpy(p + kb, ddata.data(), dDataSz);
+    memcpy(p + kb + dDataSz, tkeys.data(), kb);
+    memcpy(p + kb + dDataSz + kb, tdata.data(), tDataSz);
+    std::vector<uint32_t> outDocs(n + 8), outFreqs(n + 8);
+    uint8_t* de = svb_decode_avx_d1_init(outDocs.data(), p, p + kb, n, 0);
+    svb_decode_avx_simple(outFreqs.data(), de, de + kb, n);
+    delete[] buf;
+    for (uint32_t i = 0; i < n; i++) {
+      ASSERT_EQ(outDocs[i], docs[i]) << "svb docs n=" << n << " i=" << i;
+      ASSERT_EQ(outFreqs[i], freqs[i]) << "svb freqs n=" << n << " i=" << i;
+    }
+  }
+}
+
 TEST_F(PostingsTest, blockPositions) {
   RAMDir dir;
   MemPool pool;

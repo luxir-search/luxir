@@ -2,6 +2,7 @@
 
 #include "TermsEnum.h"
 #include "solux/codec/Codec.h"
+#include "solux/codec/StreamVByte.h"
 
 namespace solux {
 // TODO: templatize to be able to instrument, implement checkindex, etc...
@@ -45,6 +46,8 @@ class DocsEnum {
   PostingsReader& postingsReader;
   const SegFieldInfo& fieldInfo;
   MemPool* pool;
+  bool hasFreqs;      // field indexes term freqs (else tfreq is implicitly 1)
+  bool hasPositions;  // field indexes positions (else there is no position stream)
   int32_t docfreq; // number of docs containing this term
   int64_t ttf;    // totalTermFreq (sum of term freq across all docs for this term)
 
@@ -82,6 +85,8 @@ public:
     docBuf=db;
     posBuf=pb;
     tfreqBuf=tb;
+    hasFreqs = FieldType::hasFreqs(fieldInfo.flags);
+    hasPositions = FieldType::hasPositions(fieldInfo.flags);
 
     // Since the same terms enum will often be used for multiple docs enum, we should copy everything we need
     // from the terms enum that we need (that may change.)
@@ -96,14 +101,18 @@ public:
       docfreq = 1;
       tfreq = 1;
       ttf = 1;
-      // fill buffers with single pulsed doc+position
+      // fill buffers with the single pulsed doc (+ position, if the field indexes them)
       docBuf[0] = tenum.pulsedDoc;
       docBufEnd = 1;
       tfreqBuf[0] = 1;
       tfreqBufEnd = 1;
-      posBuf[0] = tenum.pulsedPos;
       posBufIdx = 0;
-      posBufEndDoc = posBufEnd = 1;
+      if (hasPositions) {
+        posBuf[0] = tenum.pulsedPos;
+        posBufEndDoc = posBufEnd = 1;
+      } else {
+        posBufEndDoc = posBufEnd = 0;
+      }
       cumulativeTermFreq = 0;  // this will be incremented in nextDoc()
       // std::cout << "Pulsed posting: id=" << docid << "pos=" << posBuf[0] << std::endl;
 
@@ -120,18 +129,22 @@ public:
       docIS.seek(locOfDocsForTermBlock + cumulativeDocsSize - 1);
       uint8_t metaSize = docIS.readByte();
       docIS.relativeSeek(-metaSize - 1); // move to start of metadata
+      // Per-term metadata is level-dependent (see PostingsWriter::endTerm): docfreq always,
+      // then ttfCode only when freqs are indexed, then posOffset only when positions are.
       docfreq = docIS.readVint();
-      ttf = docfreq + docIS.readVlong();
+      ttf = hasFreqs ? (docfreq + docIS.readVlong()) : docfreq;
       docBufEnd = 0;
 
-      auto posOffset = docIS.readVlong();
+      if (hasPositions) {
+        auto posOffset = docIS.readVlong();
+        posIS = postingsReader.getInputStream(fieldInfo.posLoc.filenum());
+        posIS.seek(locOfPositionsForTermBlock + posOffset);
+      }
 
       // start of the actual docs is end of block - size
       startOfDocs = locOfDocsForTermBlock + cumulativeDocsSize - docsSize;
       docIS.seek(startOfDocs);
 
-      posIS = postingsReader.getInputStream(fieldInfo.posLoc.filenum());
-      posIS.seek(locOfPositionsForTermBlock + posOffset);
       posBufEndDoc = posBufEnd = 0; // no positions read yet
       cumulativeTermFreq = 0;
       // std::cout << "Normal posting" << std::endl;
@@ -148,6 +161,11 @@ public:
     posBuf = pb;
     tfreqBuf = tb;
     // If buffers cease to be immediate, we need to copy in the pulsed docs/positions/freqs (first element)
+  }
+
+  /// whether this field indexes positions (false for DOCS / DOCS_AND_FREQS fields)
+  bool indexHasPositions() const {
+    return hasPositions;
   }
 
   /// number of documents containing the term
@@ -168,23 +186,6 @@ public:
   /// number of times the term appears in the current document
   int32_t termFreq() {
     return tfreq;
-  }
-
-  int32_t nextDocOld() {
-    if (docsSize != 0) {
-      // see PostingsWriter.endTerm() for format of non-block encoded docs/freqs
-      uint32_t doccode = docIS.readVint();
-      if ((doccode & 0x01)==1) {
-        tfreq = 1;
-      } else {
-        tfreq = docIS.readVint();
-      }
-      posOrdStart = cumulativeTermFreq;
-      cumulativeTermFreq += tfreq;
-      auto docDelta = doccode >> 1;
-      docid += docDelta;
-    }
-    return docid;
   }
 
   // we also have a next() to align with scorers
@@ -216,52 +217,55 @@ public:
         docBufEnd = Postings::DOCS_BLOCK_SIZE;
         // std::cout << "read doc block: " << std::endl;
 
+        // Term freqs are omitted entirely for DOCS-only fields; tfreq is then implicitly 1.
         // TODO: we should really decode term freqs lazily in case they aren't needed... but this is far simpler for now.
-        outSz = Postings::DOCS_BLOCK_SIZE;  // currently parallel to docs, so must be same block size
-        bytesRead = IndexCodec::tfreqCodec.decodeBlock(docIS.ptr(), docIS.left(), (uint32_t*)tfreqBuf, outSz);
-        docIS.skip(bytesRead);
-        assert(outSz == Postings::DOCS_BLOCK_SIZE);
-        tfreqBufIdx = 0;
-        tfreqBufEnd = Postings::DOCS_BLOCK_SIZE;
+        if (hasFreqs) {
+          outSz = Postings::DOCS_BLOCK_SIZE;  // currently parallel to docs, so must be same block size
+          bytesRead = IndexCodec::tfreqCodec.decodeBlock(docIS.ptr(), docIS.left(), (uint32_t*)tfreqBuf, outSz);
+          docIS.skip(bytesRead);
+          assert(outSz == Postings::DOCS_BLOCK_SIZE);
+          tfreqBufIdx = 0;
+          tfreqBufEnd = Postings::DOCS_BLOCK_SIZE;
+        }
         // std::cout << "read tfreq block: " << std::endl;
       } else {
-        // decode whole tail?
-        // int32_t id = docid;  // PostingsWriter currently uses -1 for tail base, not lastDoc
-        int32_t id = -1;
-        for (int i=0; i<leftToRead; i++) {
-          // see PostingsWriter.endTerm() for format of non-block encoded docs/freqs
-          uint32_t doccode = docIS.readVint();
-          int32_t tf;
-          if ((doccode & 0x01) == 1) {
-            tf = 1;
-          } else {
-            tf = docIS.readVint();
-          }
-          auto docDelta = ((uint32_t)doccode) >> 1;
-          id += docDelta;
-          docBuf[i] = id;
-          tfreqBuf[i] = tf;
+        // StreamVByte tail layout written by PostingsWriter::endTerm:
+        //   [docKeys][docData] followed, for fields with freqs, by [tfreqKeys][tfreqData].
+        // Docs are d1 decoded; freqs are plain StreamVByte values. The AVX decoders
+        // may read up to SVB_OVERREAD_PAD bytes past the encoded data, covered by
+        // the trailing padding PostingsWriter::finish() reserves on the docs file.
+        const uint32_t n = (uint32_t) leftToRead;
+        const uint32_t kb = svbKeyBytes(n);
+        uint8_t* p = (uint8_t*) docIS.ptr();
+        uint8_t* dataEnd = svb_decode_avx_d1_init((uint32_t*) docBuf, p, p + kb, n, 0);
+        if (hasFreqs) {
+          dataEnd = svb_decode_avx_simple((uint32_t*) tfreqBuf, dataEnd, dataEnd + kb, n);
+          tfreqBufIdx = 0;
+          tfreqBufEnd = leftToRead;
         }
+        docIS.skip(dataEnd - p);
 
         docBufIdx = 0;
         docBufEnd = leftToRead;
-        tfreqBufIdx = 0;
-        tfreqBufEnd = leftToRead;
-        // std::cout << "read doc/tfreq tail: " << leftToRead << std::endl;
 
       } // end decode tail
     }
 
-    // NOTE: because tfreq and cumulativeTermFreq are currently directly read used when reading positions,
-    // keep these up-to-date for now instead of lazily calculating.
-    assert(docBufIdx == tfreqBufIdx);
-    assert(docOrd == tfreqOrd);
+    // Keep tfreq and cumulativeTermFreq current because position decoding still
+    // reads them eagerly; they can be made lazy once positions are decoded lazily too.
+    assert(!hasFreqs || docBufIdx == tfreqBufIdx);
+    assert(!hasFreqs || docOrd == tfreqOrd);
 
     docid = docBuf[docBufIdx++];
     docOrd++;
 
-    tfreq = tfreqBuf[tfreqBufIdx++];
-    tfreqOrd++;
+    // DOCS-only fields have no freq stream; tfreq is implicitly 1.
+    if (hasFreqs) {
+      tfreq = tfreqBuf[tfreqBufIdx++];
+      tfreqOrd++;
+    } else {
+      tfreq = 1;
+    }
     posOrdStart = cumulativeTermFreq;
     cumulativeTermFreq += tfreq;
 
@@ -280,6 +284,7 @@ public:
   }
 
   void startPositions() {
+    assert(hasPositions);  // positions are only queried on fields that index them
     pos = -1;
     while (posOrd < posOrdStart) {
       // need to skip some positions.

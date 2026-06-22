@@ -263,9 +263,14 @@ public:
     // Postings::numericCodec.encodeBlock((uint32_t*)ivalues.data(), ivalues.size(), compressed_output.data(), compressedSize);
     IndexCodec::numericCodec.encodeWithMeta((uint32_t*)ivalues.data(), ivalues.size(), compressed_output.data(), compressedSize, 0, bits);
     out.write(compressed_output.data(), compressedSize);
-    // SIMDFor implementation can read up to 31 extra bytes after the end of compressedSize.  See SoluxSIMDFor comment.
-    // TODO: FIXME just a single MonoReader::BlockInfo that come after the blocks may not be enough!
-    // We could always pad the end of a file rather than pad each field.
+    // The +32 on compressed_output above is encode-output headroom for tails that
+    // pack up to a word boundary. SoluxSIMDFor decodes exactly the encoded byte
+    // range, so this block needs no reader-side slack. The old
+    // SIMDCompressionAndIntersection codec did read ~31 bytes past the data; that
+    // was removed in the FastPFOR migration and is covered by
+    // PostingsTest.codecFileOverreadBounds. The only postings decoder that
+    // over-reads now is the StreamVByte tail, for which PostingsWriter::finish()
+    // reserves SVB_OVERREAD_PAD trailing bytes per data file.
   }
 
   // returns number of values written and sets metadata to be read.

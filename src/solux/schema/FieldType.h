@@ -75,11 +75,17 @@ public:
   bool isAbstract() { return (bool) (flags_ & ABSTRACT); }
 
   // TODO: check standard on cast of int to bool (check generated code too)
-  bool indexed() { return (bool) (flags_ & INDEX_DOCS_FREQS_POSITIONS); }
+  bool indexed() { return (bool) (flags_ & INDEX_DOCS); }
 
-  bool hasFreqs() { return (bool) (flags_ & INDEX_DOCS_FREQS); }
+  // The index level is cumulative: DOCS < DOCS_FREQS < DOCS_FREQS_POSITIONS.
+  // A level is present only when all of that level's bits are set; a plain
+  // bit-and would report a DOCS-only field as having freqs/positions.
+  static bool hasFreqs(flag_type flags) { return (flags & INDEX_DOCS_FREQS) == INDEX_DOCS_FREQS; }
+  static bool hasPositions(flag_type flags) { return (flags & INDEX_DOCS_FREQS_POSITIONS) == INDEX_DOCS_FREQS_POSITIONS; }
 
-  bool hasPositions() { return (bool) (flags_ & INDEX_DOCS_FREQS_POSITIONS); }
+  bool hasFreqs() { return hasFreqs(flags_); }
+
+  bool hasPositions() { return hasPositions(flags_); }
 
   bool hasNumTokens() { return (bool) (flags_ & (NUM_TOKENS_APPROX | NUM_TOKENS_EXACT)); }
 

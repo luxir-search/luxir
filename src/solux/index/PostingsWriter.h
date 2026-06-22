@@ -10,6 +10,7 @@
 #include "solux/util/StrRef.h"
 #include "solux/store/OutputStream.h"
 #include "solux/store/Directory.h"
+#include "solux/codec/StreamVByte.h"
 #include "solux/reader/PostingsReader.h"
 #include "solux/reader/FieldReader.h"
 #include "ScreamingBuilder.h"
@@ -184,6 +185,19 @@ public:
     writeSegmentInfo();
     // TODO: implement compound files for small files
 
+    // The StreamVByte AVX tail decoder used by DocsEnum may read up to
+    // SVB_OVERREAD_PAD bytes past the encoded data. Reserve that slack at the end of
+    // every pure-data file so the read stays in bounds. File 0 ends with the field
+    // index and segment info just written above, which already provide far more
+    // trailing slack, so it is skipped. Padding past its segment-info size marker
+    // would also break the end-relative read in PostingsReader.
+    if (files.size() > 1) {
+      static const char svbPad[SVB_OVERREAD_PAD] = {};
+      for (size_t i = 1; i < files.size(); i++) {
+        files[i].out.write(svbPad, SVB_OVERREAD_PAD);
+      }
+    }
+
     if (filenames) {
       filenames->reserve(filenames->size() + files.size());
     }
@@ -357,9 +371,14 @@ class TextWriter {
   int64_t locOfPositionsForTerm;
   int64_t locOfDocsForTerm;
 
-  int64_t positionsHandled;  /// number of positions handled for the current term so far (everything except posdeltas)
   int32_t docsFlushed;  /// number of documents flushed for the current term so far
-  int64_t totalTermFreqPrevDoc = 0; // total term freq up through the previous doc
+  int32_t curTf = 0;    /// occurrences (term freq) seen so far for the current doc
+  int64_t ttfAcc = 0;   /// total term freq (sum of tf over docs) accumulated for the current term
+
+  // Index level for this field, decoded from the field flags in startField().  These gate
+  // whether the freq stream and position stream are written at all.
+  bool hasFreqs = false;
+  bool hasPositions = false;
 
   std::vector<uint64_t> termBlockOffsets;  // offset from termsOffset (for this field) for each term block
   int64_t sumTotalTermFreq = 0; // updated in endTerm
@@ -375,14 +394,10 @@ private:  // some internal utility methods... not for use by indexers
     return docsFlushed + docs.size();
   }
 
-  // total number of positions for the current term
+  // total term freq (sum of tf over all docs) for the current term.  Equals the
+  // total position count for fields that index positions.
   int64_t getTotalTermFreq() const {
-    return positionsHandled + posdeltas.size();
-  }
-
-  // total number of positions for the current doc
-  int32_t getTermFreq() const {
-    return getTotalTermFreq() - totalTermFreqPrevDoc;
+    return ttfAcc;
   }
 
   // the size the docfile takes
@@ -411,6 +426,8 @@ public:
       throw std::runtime_error("startField called twice!");
     }
     fieldInfo = finfo;
+    hasFreqs = FieldType::hasFreqs(finfo->flags);
+    hasPositions = FieldType::hasPositions(finfo->flags);
     termsLoc = termOutput.size();
     docsLoc = docOutput.size();
     posLoc = posOutput.size();
@@ -434,7 +451,6 @@ public:
                                   compressedSize);
     posOutput.write(compressed_output.data(), compressedSize);
 
-    positionsHandled += posdeltas.size();
     posdeltas.resize(0);
   }
 
@@ -459,13 +475,15 @@ public:
     docOutput.write(compressed_output.data(), compressedSize);
 
     //
-    // now the term freqs
+    // now the term freqs (omitted entirely for DOCS-only fields)
     //
-    compressed_output.resize(Postings::TERMS_BLOCK_SIZE + 1024);
-    compressedSize = compressed_output.size(); // this gets changed to the actual size
-    IndexCodec::tfreqCodec.encodeBlock(reinterpret_cast<uint32_t *>(tfreqs.data()), tfreqs.size(), compressed_output.data(),
-                                    compressedSize);
-    docOutput.write(compressed_output.data(), compressedSize);
+    if (hasFreqs) {
+      compressed_output.resize(Postings::TERMS_BLOCK_SIZE + 1024);
+      compressedSize = compressed_output.size(); // this gets changed to the actual size
+      IndexCodec::tfreqCodec.encodeBlock(reinterpret_cast<uint32_t *>(tfreqs.data()), tfreqs.size(), compressed_output.data(),
+                                      compressedSize);
+      docOutput.write(compressed_output.data(), compressedSize);
+    }
 
     docsFlushed += docs.size();
     docs.resize(0);
@@ -576,7 +594,6 @@ public:
       auto docsSize = docFileSize[i];
       if (docsSize == 0) {
         auto doc = pulsed[pulsedIdx++];
-        auto pos = pulsed[pulsedIdx++];
         // TODO: optimize this wasteful encoding.
         // We could add enough to the minimum size of a docs block so that we could use the low 4 bits as a group
         // varint encoding.  This would also speed up skipping over a pulsed term.  We could also put pulsed terms
@@ -585,7 +602,10 @@ public:
         // We could make the term freq or doc even if it's real or odd if it's a pulsed position.
         termOutput.write(0);
         termOutput.writeVint(doc);  // for now, just write vints (slower to skip though)
-        termOutput.writeVint(pos);
+        if (hasPositions) {
+          auto pos = pulsed[pulsedIdx++];
+          termOutput.writeVint(pos);
+        }
       } else {
         termOutput.writeVint(docsSize);
       }
@@ -607,7 +627,7 @@ public:
   // returns 1-based ordinal of term in this field
   int32_t startTerm(TermRef term) {
     docsFlushed = 0;
-    positionsHandled = 0;
+    ttfAcc = 0;
     locOfPositionsForTerm = posOutput.size();
     locOfDocsForTerm = docOutput.size();
     termList.push_back(term);  // we don't really need the term name at this point (could add in endTerm), but it might be nice for debugging / exceptions?
@@ -616,7 +636,11 @@ public:
 
   void endTerm(TermRef term) {
     unused(term);
-    auto totalTermFreq = getTotalTermFreq();
+    auto docfreq = getDocFreq();
+    // For fields that don't index freqs, ttf is *defined* as docfreq (each doc counts
+    // once); the real occurrence count isn't stored and the reader reports docfreq, so
+    // term-level and field-level (sumTotalTermFreq) stats must use the same definition.
+    auto totalTermFreq = hasFreqs ? ttfAcc : (int64_t) docfreq;
     sumTotalTermFreq += totalTermFreq;
     if (docs.size() > 0) {
       assert(docs.back() < postingsWriter.getMaxDoc()); // sanity check to ensure we didn't go over provided numDocs
@@ -627,54 +651,53 @@ public:
       return;
     }
     if (totalTermFreq == 1) {
-      assert(getDocFileSize()==0 && docs.size()==1 && posdeltas.size() == 1);
+      assert(getDocFileSize()==0 && docs.size()==1 && tfreqs.size()==1);
+      assert(posdeltas.size() == (hasPositions ? 1u : 0u));
       sumDocFreq += 1;
       docFileSize.push_back(0);
-      // the doc+position will be remembered to be included directly in the term dictionary (i.e. pulsing)
+      // the doc (+ position, if indexed) will be remembered to be included directly in the term dictionary (i.e. pulsing)
       pulsed.push_back(docs[0]);
-      pulsed.push_back(posdeltas.back());
-      posdeltas.pop_back();
-      positionsHandled++;
+      if (hasPositions) {
+        pulsed.push_back(posdeltas.back());
+        posdeltas.pop_back();
+      }
 
       docsFlushed += docs.size();
       docs.resize(0);
       tfreqs.resize(0);
 
     } else {
-      // Finish positions that were not block encoded
+      // Finish positions that were not block encoded (only when positions are indexed)
       // TODO: possibly block encode positions across terms?  For that we would want ttf encoded in the terms dict (or could also store sum of all prev in docs file)
       //       Downside to this is that it could hurt block compression to mix terms (small + big deltas mixed)
-      for (auto posDelta : posdeltas) {
-        // TODO: try group varint
-        posOutput.writeVint(posDelta);
+      if (hasPositions) {
+        for (auto posDelta : posdeltas) {
+          // TODO: try group varint
+          posOutput.writeVint(posDelta);
+        }
       }
-      positionsHandled += posdeltas.size();
       posdeltas.resize(0);
 
-      // Finish docs that were not block encoded.  In this case, we simply interleave docs and termfreqs
-      // for more efficient incremental decode.
-      // TODO: try some sort of group varint encoding once we have a good benchmark framework.
-      // TODO: pull this out into codec?
-      // TODO: for a list above a certain size, bisect with a skip?  Wait for good benchmarks to implement this.  It seems like
-      //   it would only speed up rare/rare term conjunctions.  Might help common terms in small segments too though.
-      // TODO: make first delta an actual delta from the last block... not from -1.  Not too important though given that that this is only sub-optimal
-      //   when the docfreq is larger than the doc block size.
-      int32_t lastdoc = -1;
+      // Finish docs (and, for fields that index them, term freqs) that were not block encoded.
+      // StreamVByte tail layout (see DocsEnum::nextDoc):
+      //   [docKeys][docData] followed, for fields with freqs, by [tfreqKeys][tfreqData].
+      // Docs are d1 encoded; freqs are plain StreamVByte values.
+      // TODO: when ttf==docfreq (all tf==1) the freq stream is constant 1 and can be dropped for
+      //   scoring fields too (plan A); needs the freq blocks deferred/separated since flushDocs is eager.
       assert(docs.size() == tfreqs.size());
-      for (int i=0; i<(int)docs.size(); i++) {
-        assert(docs[i] > lastdoc || i==0);
-        int docdelta = docs[i] - lastdoc;
-        lastdoc = docs[i];
-
-        auto tfreq = tfreqs[i];
-        int doccode = docdelta << 1;  // the low bit will be used to signal a termfreq of 1 or not.
-        if (tfreq == 1) {
-          doccode |= 1u;  // low bit==1 means tfreq==1.
-        }
-        docOutput.writeVint(doccode);
-        if (tfreq != 1) {
-          docOutput.writeVint(tfreq);
-        }
+      const uint32_t n = (uint32_t) docs.size();
+      const uint32_t kb = svbKeyBytes(n);
+      uint8_t dkeys[Postings::DOCS_BLOCK_SIZE / 4 + 1];
+      uint8_t ddata[Postings::DOCS_BLOCK_SIZE * 4];
+      uint8_t* ddEnd = svb_encode_scalar_d1_init((const uint32_t*) docs.data(), dkeys, ddata, n, 0);
+      docOutput.write(dkeys, kb);
+      docOutput.write(ddata, (size_t)(ddEnd - ddata));
+      if (hasFreqs) {
+        uint8_t tkeys[Postings::DOCS_BLOCK_SIZE / 4 + 1];
+        uint8_t tdata[Postings::DOCS_BLOCK_SIZE * 4];
+        uint8_t* tdEnd = svb_encode_scalar((const uint32_t*) tfreqs.data(), tkeys, tdata, n);
+        docOutput.write(tkeys, kb);
+        docOutput.write(tdata, (size_t)(tdEnd - tdata));
       }
       docsFlushed += docs.size();
       docs.resize(0);
@@ -686,16 +709,22 @@ public:
       // length at the end to enable backing up.)
       auto metadataStart = docOutput.size();
 
-      auto docfreq = getDocFreq();
-      sumDocFreq += docfreq;
-      auto ttfCode = totalTermFreq - docfreq;
-      // offset from start of positions in term dict block
-      auto posOffset = locOfPositionsForTerm - locOfPositionsForTermBlock;
+      sumDocFreq += docfreq;  // docfreq computed at the top of endTerm
 
+      // Per-term metadata is level-dependent: docfreq always; ttfCode (ttf-docfreq) only when freqs
+      // are indexed; posOffset only when positions are indexed.  The reader knows the level from the
+      // field flags and reads exactly these.
       // TODO: encode as group, and can replace the metadataSize byte with the control byte.
       docOutput.writeVint(docfreq);
-      docOutput.writeVlong(ttfCode);
-      docOutput.writeVlong(posOffset);
+      if (hasFreqs) {
+        auto ttfCode = totalTermFreq - docfreq;
+        docOutput.writeVlong(ttfCode);
+      }
+      if (hasPositions) {
+        // offset from start of positions in term dict block
+        auto posOffset = locOfPositionsForTerm - locOfPositionsForTermBlock;
+        docOutput.writeVlong(posOffset);
+      }
 
       auto metadataSize = docOutput.size() - metadataStart;
       docOutput.write((char)metadataSize);
@@ -735,7 +764,7 @@ public:
 
   void startDoc(int32_t doc) {
     unused(doc);
-    totalTermFreqPrevDoc = getTotalTermFreq();
+    curTf = 0;
 
     // Do we need to know the current doc?
 
@@ -743,23 +772,39 @@ public:
     // locationOfPositionsForDoc = posOutput->size();
   }
 
-  void endDoc(int32_t doc) {
-    auto tf = getTermFreq();
+  // Record a doc with a known term freq and no positions.  Positionless fields (string/id,
+  // freq-only, and the positionless merge path) call this directly, since they already know
+  // the freq and don't need the per-occurrence startDoc/addPositionDelta/endDoc dance.
+  // endDoc() routes the position-streaming path here with its accumulated occurrence count.
+  // tf is stored only when the field indexes freqs; for DOCS-only fields any tf>0 just
+  // records the doc (its ttf is defined as docfreq).
+  void addDoc(int32_t docid, int32_t tf) {
     if (tf == 0) {
       // TODO: revisit if this can happen... it depends on where deleted docs are checked.
       return;
     }
-    docs.push_back(doc);
-    tfreqs.push_back(tf);
+    docs.push_back(docid);
+    tfreqs.push_back(tf);  // kept parallel to docs; only written when hasFreqs
+    ttfAcc += tf;
     if (docs.size() == Postings::DOCS_BLOCK_SIZE) {
       flushDocs();
     }
   }
 
+  void endDoc(int32_t doc) {
+    addDoc(doc, curTf);
+  }
+
+  // Register one occurrence of the term in the current doc that carries a position.
+  // The position is only stored when the field indexes positions; either way it
+  // contributes to the term freq.
   void addPositionDelta(int32_t posDelta) {
-    posdeltas.push_back(posDelta);
-    if (posdeltas.size() == Postings::POSITIONS_BLOCK_SIZE) {
-      flushPositions();
+    curTf++;
+    if (hasPositions) {
+      posdeltas.push_back(posDelta);
+      if (posdeltas.size() == Postings::POSITIONS_BLOCK_SIZE) {
+        flushPositions();
+      }
     }
   }
 

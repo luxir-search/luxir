@@ -183,7 +183,7 @@ public:
       return;
     }
 
-    // --- Write segment postings/ords from overwrite hash only ---
+    // Write segment postings/ords from overwrite hash only.
     if (uniqueVals > 0) {
       PostingsWriter& postingsWriter = inverter.getPostingsWriter();
 
@@ -209,9 +209,7 @@ public:
         auto term = terms[tnum];
         textWriter.startTerm(term);
         // id is unique: exactly one doc per term, docFreq=1, always pulsed
-        textWriter.startDoc(term.val().docId);
-        textWriter.addPositionDelta(1); // dummy position for TextWriter compatibility
-        textWriter.endDoc(term.val().docId);
+        textWriter.addDoc(term.val().docId, 1);  // DOCS-only field: record the doc, no freq/position stored
         ords.add(term.val().docId, tnum + 1); // +1 because 0 means "missing"
         textWriter.endTerm(term);
       }
@@ -221,7 +219,7 @@ public:
       ordsWriter.finish();
     }
 
-    // --- Produce SortedDeletes from overwrite hash and/or delete hash ---
+    // Produce SortedDeletes from overwrite hash and/or delete hash.
     bool hasOverwrites = uniqueVals > 0 && hadOverwrites_;
 
     if (!hasOverwrites && !hasDeletes) {

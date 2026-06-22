@@ -181,8 +181,9 @@ private:
     assert(newDocId == seg.numLive); // Make sure we got the right number of live documents
   }
 
-  // add docs and positions from the provided DocsEnum
+  // add docs (with positions, or just freqs for positionless fields) from the provided DocsEnum
   void addDocsPos(TextWriter& textWriter, DocsEnum& docsEnum, const Segment& seg) {
+    bool hasPositions = docsEnum.indexHasPositions();
     for (;;) {
       int32_t docid = docsEnum.nextDoc();
       if (docid == INT_MAX) break;
@@ -194,16 +195,22 @@ private:
       }
       int32_t newDocid = seg.base + mappedDoc;
 
-      textWriter.startDoc(newDocid);
-      docsEnum.startPositions();
-      int32_t lastPos = -1;
-      for (;;) {
-        auto pos = docsEnum.nextPosition();
-        if (pos == INT_MAX) break;
-        textWriter.addPositionDelta(pos - lastPos);
-        lastPos = pos;
+      if (hasPositions) {
+        textWriter.startDoc(newDocid);
+        docsEnum.startPositions();
+        int32_t lastPos = -1;
+        for (;;) {
+          auto pos = docsEnum.nextPosition();
+          if (pos == INT_MAX) break;
+          textWriter.addPositionDelta(pos - lastPos);
+          lastPos = pos;
+        }
+        textWriter.endDoc(newDocid);
+      } else {
+        // No positions to copy; record the doc with the source term freq directly.
+        // termFreq() is 1 for DOCS-only fields, the real freq for DOCS_AND_FREQS.
+        textWriter.addDoc(newDocid, docsEnum.termFreq());
       }
-      textWriter.endDoc(newDocid);
     }
 
   }
@@ -222,16 +229,7 @@ private:
       int32_t newDocid = seg.base + mappedDoc;
 
       docToOrd.add(newDocid, ord);
-      textWriter.startDoc(newDocid);
-      docsEnum.startPositions();
-      int32_t lastPos = -1;
-      for(;;) {
-        auto pos = docsEnum.nextPosition();
-        if (pos == INT_MAX) break;
-        textWriter.addPositionDelta(pos - lastPos);
-        lastPos = pos;
-      }
-      textWriter.endDoc(newDocid);
+      textWriter.addDoc(newDocid, 1);  // DOCS-only string column: no positions to copy
     }
   }
 

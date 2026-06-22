@@ -88,7 +88,10 @@ protected:
     cumulativeDocsSize += docsSize;
     if (docsSize == 0) {
       pulsedDoc = termsIS.readVint();
-      pulsedPos = termsIS.readVint();
+      // the pulsed position is only present when the field indexes positions
+      if (FieldType::hasPositions(fieldInfo.flags)) {
+        pulsedPos = termsIS.readVint();
+      }
     }
   }
 

@@ -110,10 +110,7 @@ public:
       // push all the docs for this term to the TextWriter, as well as record the ordinal for each doc
       term.val().forEachDoc(inverter.pool, [&](int docid) {
         // LOG_INFO("WRITE docid={}, tnum={}", docid, tnum);
-        textWriter.startDoc(docid);
-        textWriter.addPositionDelta(1);
-        // add a dummy position for now since we are using TextWriter, which expects them.
-        textWriter.endDoc(docid);
+        textWriter.addDoc(docid, 1);  // DOCS-only field: record the doc, no freq/position stored
 
         // single-valued version.
         // docToOrd[docid] = tnum + 1;  // +1 because 0 means "missing"

@@ -3,7 +3,7 @@ project(Solux VERSION 0.1)
 set(CMAKE_CXX_STANDARD 26)
 set(CMAKE_CXX_STANDARD_REQUIRED True)
 
-# --- Build acceleration -----------------------------------------------------
+# Build acceleration
 # ccache: transparent compiler cache. No-op if ccache is not installed.
 # pch_defines,time_macros sloppiness is required to get cache hits on TUs that
 # use a precompiled header (see target_precompile_headers below).
@@ -78,15 +78,20 @@ target_include_directories(uni_algo PUBLIC deps/uni-algo/include)
 set_target_properties(uni_algo PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
 # FastPFOR (vendored under deps/FastPFOR, v0.5.0): SIMD bit-packing kernels with
-# native ARM NEON support (headers/fastpfor_neon.h). We compile only the
-# bit-packing sources the codecs use (CodecFP.cpp) -- not streamvbyte.c /
-# varintdecode.c / codecfactory.cpp, which we don't reference.
+# native ARM NEON support (headers/fastpfor_neon.h). We compile the bit-packing
+# sources the codecs use, plus streamvbyte.c for the experimental postings-tail
+# SIMD varint path. We skip varintdecode.c and codecfactory.cpp because Solux
+# does not reference them.
 add_library(fastpfor STATIC
   deps/FastPFOR/src/bitpacking.cpp
   deps/FastPFOR/src/simdbitpacking.cpp
-  deps/FastPFOR/src/simdunalignedbitpacking.cpp)
+  deps/FastPFOR/src/simdunalignedbitpacking.cpp
+  deps/FastPFOR/src/streamvbyte.c)
 target_include_directories(fastpfor PUBLIC deps/FastPFOR/headers)
 set_target_properties(fastpfor PROPERTIES POSITION_INDEPENDENT_CODE ON)
+# streamvbyte.c is C, so CMAKE_CXX_FLAGS does not reach it. Set the arch flags
+# on the target so its SSSE3/SSE4.1 intrinsics are enabled for both C and C++.
+target_compile_options(fastpfor PRIVATE -march=native -mtune=native)
 
 #Print out all env vars... useful while build system is in development
 get_cmake_property(_variableNames VARIABLES)
@@ -143,7 +148,7 @@ add_library(solux_lib STATIC ${Proj_SOURCES})
 add_executable(solux src/solux/main.cpp)
 target_link_libraries(solux solux_lib)
 
-# --- Precompiled headers ----------------------------------------------------
+# Precompiled headers
 # Heavy, rarely-changing external/generated headers shared across translation
 # units. Project headers are intentionally excluded so editing them does not
 # invalidate the PCH; the one exception is util/log.h, which is stable and is
