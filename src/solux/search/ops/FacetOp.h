@@ -216,9 +216,12 @@ public:
       r.max = std::max(r.max, intColReader.getMax());
     }
     if (r.min <= r.max) {
-      int64_t range = r.max - r.min + 1;
+      // width = (#distinct values) - 1, computed unsigned: max-min can exceed
+      // int64 for a column spanning near the full range (signed-overflow UB).
+      // range <= 100000 is equivalent to width < 100000.
+      uint64_t width = (uint64_t)r.max - (uint64_t)r.min;
       // TODO: also consider total number of docs
-      if (range > 0 && range <= 100000) {
+      if (width < 100000) {
         r.useVector = true;
       }
     }
@@ -499,7 +502,11 @@ public:
           if (val < start || val >= end) {
             return; // value is out of range
           }
-          count[(val-start)/gap]++;
+          // Unsigned distance: val-start can exceed int64 (e.g. start near
+          // INT64_MIN and val near INT64_MAX), which is signed-overflow UB.
+          // The guard above ensures start <= val < end, so the distance is a
+          // valid nonnegative bucket offset.
+          count[(int64_t)(((uint64_t)val - (uint64_t)start) / (uint64_t)gap)]++;
         });
       });
     };
@@ -523,8 +530,11 @@ public:
           }
         }
       }
+      // Bucket keys are unsigned bucket indices stored in int64; for a range
+      // spanning > INT64_MAX buckets a key exceeds INT64_MAX and reads back
+      // negative, so order them unsigned to keep ascending bucket order.
       std::sort(countVec.begin(), countVec.end(), [](auto& a, auto& b) {
-        return a.first < b.first;
+        return (uint64_t)a.first < (uint64_t)b.first;
       });
       if (limit >= 0 && limit < (int64_t)countVec.size()) {
         countVec.resize(limit);
@@ -536,11 +546,19 @@ public:
       auto& countsArr = *facetResultProto.mutable_counts();
       bucketIdsArr.Reserve(countVec.size());
       countsArr.Reserve(countVec.size());
+      // Bucket bounds via unsigned offsets from start.  k*gap and (k+1)*gap can
+      // exceed int64 for a large user gap/range; clamping the end offset before
+      // converting back keeps both bounds in [start, end] with no signed
+      // overflow and no wrap-to-negative (std::min on the converted value would
+      // pick the wrapped-negative bound instead of clamping to end).
+      uint64_t endOffset = (uint64_t)end - (uint64_t)start;
       for (auto [val, count] : countVec) {
+        uint64_t k = (uint64_t)val;
+        uint64_t loOff = k * (uint64_t)gap;  // < endOffset (key came from a real value)
+        uint64_t hiOff = endOffset - loOff > (uint64_t)gap ? loOff + (uint64_t)gap : endOffset;
         auto& pair = *bucketIdsArr.Add();
-        pair.mutable_v()->Add(start + val * gap);
-        int64_t bucketEnd = start + (val + 1) * gap;
-        pair.mutable_v()->Add(std::min(bucketEnd, end));
+        pair.mutable_v()->Add((int64_t)((uint64_t)start + loOff));
+        pair.mutable_v()->Add((int64_t)((uint64_t)start + hiOff));
         countsArr.Add(count);
       }
       if (missing) {

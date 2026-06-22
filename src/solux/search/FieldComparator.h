@@ -75,10 +75,10 @@ public:
                                : std::numeric_limits<int64_t>::max();
 
     if (reversed) {
-      missingValueSubstitute = -(missingValueSubstitute + 1);
-      // +1 handles inability to negate INT64_MIN:
-      //   MAX + 1 overflows to MIN, which stays min when negated
-      //   MIN + 1 when negated becomes MAX
+      // ~x == -(x+1) but without the signed-overflow UB: -(INT64_MAX+1) and
+      // negating INT64_MIN both overflow.  ~x is an order-reversing bijection
+      // over the whole int64 range, exactly the descending transform we want.
+      missingValueSubstitute = ~missingValueSubstitute;
     }
   }
   
@@ -117,8 +117,10 @@ public:
     // if we wanted to make this branchless, we could have a an adder and multiplier
     // but this will be a predictable branch anyway.
     if (sortMultiplier < 0) {
-      // This will shift the space to correctly negate both INT64_MIN to INT64_MAX
-      value = -(value + 1);
+      // Descending: ~value == -(value+1) but with no signed-overflow UB.
+      // -(value+1) overflows when value==INT64_MAX (and negating INT64_MIN is
+      // UB too); ~value is the same order-reversing map over the full range.
+      value = ~value;
     }
     return value;
   }

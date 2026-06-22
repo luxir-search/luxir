@@ -35,7 +35,8 @@ public:
 
   class MergeableSum : public MergeableData {
   public:
-    int64_t sum = 0;   // sum of int values in this segment (kept integral for exactness)
+    __int128 sum = 0;  // sum of int values; 128-bit keeps it exact and avoids
+                       // the signed int64 overflow UB a full-range sum would hit
     double dsum = 0;   // sum of decoded float/double values in this segment
     int64_t count = 0; // number of values summed in this segment
 
@@ -100,7 +101,7 @@ public:
         }
         fieldReader.readFieldInfo(segFieldInfo);
         IntColReader intColReader(postingsReader, segFieldInfo);
-        int64_t sum = 0;
+        __int128 sum = 0;  // 128-bit: exact and overflow-free over full-range int64 values
         double dsum = 0;
         int64_t count = 0;
         int64_t missing = 0; // avg ignores docs with no value; not tracked here

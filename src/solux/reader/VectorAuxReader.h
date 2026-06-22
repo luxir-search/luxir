@@ -120,7 +120,10 @@ struct VectorAuxListsFooter {
   size_t idsOffset() const noexcept { return sizesOffset() + (size_t)nlist * 8; }
   size_t codesOffset() const noexcept { return idsOffset() + (size_t)ntotal * 8; }
   size_t expectedFileBytes() const noexcept {
-    return align8(codesOffset() + (size_t)(ntotal * codeSize)) + sizeof(VectorAuxListsFooter);
+    // Unsigned multiply: ntotal/codeSize are file-controlled (read from the
+    // footer before validation), so a corrupt footer could overflow a signed
+    // int64 product (UB) inside the very check meant to reject it.
+    return align8(codesOffset() + (uint64_t)ntotal * (uint64_t)codeSize) + sizeof(VectorAuxListsFooter);
   }
 
   /// Decode + validate the footer at the tail of a fileBytes-long file.
@@ -142,7 +145,17 @@ struct VectorAuxListsFooter {
         "VectorAuxReader: aux '{}' has unsupported lists layout version {}",
         auxName, (int32_t)f.version));
     }
+    // Bound each section against the actual file size *before* the offset math
+    // so a crafted footer cannot wrap the unsigned sums in expectedFileBytes()
+    // to coincidentally equal fileBytes.  Every section must fit within the
+    // file; the ntotal*codeSize bound is phrased as a division to avoid
+    // overflowing the product itself.  codeSize > 0 is checked first so the
+    // division is safe via short-circuit.
     if (f.faissHeaderBytes <= 0 || f.nlist <= 0 || f.codeSize <= 0 || f.ntotal < 0
+        || (uint64_t)f.faissHeaderBytes > fileBytes
+        || (uint64_t)f.nlist > fileBytes / 8
+        || (uint64_t)f.ntotal > fileBytes / 8
+        || (uint64_t)f.ntotal > fileBytes / (uint64_t)f.codeSize
         || f.expectedFileBytes() != fileBytes) {
       throw std::runtime_error(std::format(
         "VectorAuxReader: aux '{}' lists footer does not match file size {}",
