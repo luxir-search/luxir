@@ -52,67 +52,66 @@ public:
     for (uint32_t i = 0; i < 32; ++i) sizes[i] = 0;
   }
 
-  uint32_t* write(uint32_t* out) {
-    uint32_t bitmap = 0;
-    for (uint32_t k = 1; k < 32; ++k)
-      if (sizes[k] != 0) bitmap |= (1U << k);
-    *(out++) = bitmap;
-
-    for (uint32_t k = 1; k < 32; ++k) {
-      if (sizes[k] != 0) {
-        *out = sizes[k];
-        out++;
-        uint32_t j = 0;
-        for (; j + 128 <= sizes[k]; j += 128) {
-          FastPForLib::usimdpackwithoutmask(&data[k][j], reinterpret_cast<__m128i*>(out), k + 1);
-          out += 4 * (k + 1);
-        }
-        // scalar fallback for the remainder
-        for (; j < sizes[k]; j += 32) {
-          FastPForLib::fastpackwithoutmask(&data[k][j], out, k + 1);
-          out += k + 1;
-        }
-        out -= (j - sizes[k]) * (k + 1) / 32;
-      }
+  // Serialize a single lane's values. Unlike the multi-block FastPFOR original,
+  // single-block PFor uses exactly one lane, and its identity (maxb-bestb-1) and
+  // count (cexcept) are already in the block header -- so this writes NO bitmap
+  // word and NO per-lane size word, just the packed residuals.
+  uint32_t* writeLane(uint32_t* out, uint32_t lane) {
+    const uint32_t k = lane;
+    uint32_t j = 0;
+    for (; j + 128 <= sizes[k]; j += 128) {
+      FastPForLib::usimdpackwithoutmask(&data[k][j], reinterpret_cast<__m128i*>(out), k + 1);
+      out += 4 * (k + 1);
     }
+    // scalar fallback for the remainder (final partial group reads padding from
+    // data[k], harmless; the over-counted words are backed out below)
+    for (; j < sizes[k]; j += 32) {
+      FastPForLib::fastpackwithoutmask(&data[k][j], out, k + 1);
+      out += k + 1;
+    }
+    out -= (j - sizes[k]) * (k + 1) / 32;
     return out;
   }
 
-  const uint32_t* read(const uint32_t* in) {
-    clear();
-    const uint32_t bitmap = *(in++);
-
-    for (uint32_t k = 1; k < 32; ++k) {
-      if ((bitmap & (1U << k)) != 0) {
-        sizes[k] = *in++;
-        assert(sizes[k] <= SIZE);
-        uint32_t j = 0;
-        for (; j + 128 <= sizes[k]; j += 128) {
-          FastPForLib::usimdunpack(reinterpret_cast<const __m128i*>(in), &data[k][j], k + 1);
-          in += 4 * (k + 1);
-        }
-        for (; j + 31 < sizes[k]; j += 32) {
-          FastPForLib::fastunpack(in, &data[k][j], k + 1);
-          in += k + 1;
-        }
-        uint32_t remaining = sizes[k] - j;
-        memcpy(buffer, in, (remaining * (k + 1) + 31) / 32 * sizeof(uint32_t));
-        uint32_t* bpointer = buffer;
-        in += ((sizes[k] + 31) / 32 * 32 - j) / 32 * (k + 1);
-        for (; j < sizes[k]; j += 32) {
-          FastPForLib::fastunpack(bpointer, &data[k][j], k + 1);
-          bpointer += k + 1;
-        }
-        in -= (j - sizes[k]) * (k + 1) / 32;
-      }
+  // Inverse of writeLane: unpack `count` values into `lane`. The caller supplies
+  // lane + count from the block header (not read from the stream).
+  const uint32_t* readLane(const uint32_t* in, uint32_t lane, uint32_t count) {
+    const uint32_t k = lane;
+    assert(count <= SIZE);
+    sizes[k] = count;
+    uint32_t j = 0;
+    for (; j + 128 <= count; j += 128) {
+      FastPForLib::usimdunpack(reinterpret_cast<const __m128i*>(in), &data[k][j], k + 1);
+      in += 4 * (k + 1);
     }
+    for (; j + 31 < count; j += 32) {
+      FastPForLib::fastunpack(in, &data[k][j], k + 1);
+      in += k + 1;
+    }
+    // final partial group: copy just its words into a scratch buffer so the
+    // scalar unpack (which consumes 32 values worth of input) can't over-read.
+    uint32_t remaining = count - j;
+    memcpy(buffer, in, (remaining * (k + 1) + 31) / 32 * sizeof(uint32_t));
+    uint32_t* bpointer = buffer;
+    in += ((count + 31) / 32 * 32 - j) / 32 * (k + 1);
+    for (; j < count; j += 32) {
+      FastPForLib::fastunpack(bpointer, &data[k][j], k + 1);
+      bpointer += k + 1;
+    }
+    in -= (j - count) * (k + 1) / 32;
     return in;
   }
 };
 
-// Port of SIMDFastPFor::getBestBFromData: choose the base bit width (bestb),
-// the exception count (bestcexcept) and the max bit width (maxb) that minimize
-// the encoded size for this block.
+// Choose the base bit width (bestb), exception count (bestcexcept) and max bit
+// width (maxb) that minimize the encoded size for this block. The cost model is
+// in bits and matches the lean single-block layout: a b-bit base over all 128
+// values, plus per exception one position byte (overheadofeachexcept) and a
+// (maxb-b)-bit residual; the +8 is the single maxb byte, present only when there
+// are exceptions (so it is excluded from the cexcept==0 bestcost init). A
+// residual of width 1 stores nothing (high bit implicitly 1, reconstructed on
+// decode), so its residual term is dropped -- and that keys off the residual
+// width maxb-b, NOT bestb (which mutates as the search finds a better base).
 void getBestBFromData(const uint32_t* in, uint8_t& bestb, uint8_t& bestcexcept, uint8_t& maxb) {
   constexpr uint32_t overheadofeachexcept = 8;
   uint32_t freqs[33];
@@ -127,7 +126,7 @@ void getBestBFromData(const uint32_t* in, uint8_t& bestb, uint8_t& bestcexcept, 
   for (uint32_t b = bestb - 1; b < 32; --b) {
     cexcept += freqs[b + 1];
     uint32_t thiscost = cexcept * overheadofeachexcept + cexcept * (maxb - b) + b * BLOCK_SIZE + 8;
-    if (bestb - b == 1) thiscost -= cexcept;
+    if (maxb - b == 1) thiscost -= cexcept;
     if (thiscost < bestcost) {
       bestcost = thiscost;
       bestb = (uint8_t) b;
@@ -136,24 +135,27 @@ void getBestBFromData(const uint32_t* in, uint8_t& bestb, uint8_t& bestcexcept, 
   }
 }
 
-// Single-block PForDelta encode (NoDelta). Writes the header word, the
-// SIMD-packed base, the exception byte-container and the bit-packed exception
-// residuals. outSz is set to the encoded size in bytes.
+// Single-block PForDelta encode (NoDelta). Lean layout, no multi-block
+// scaffolding:
+//   [bestb:1][cexcept:1]  [maxb:1, positions:cexcept B  -- only if cexcept>0]
+//   (padded to a word) [SIMD-packed base: 4*bestb words]
+//   [residuals: cexcept values @ (maxb-bestb) bits  -- only if cexcept>1 over base]
+// Every section's size is derivable from the 2-3 header bytes, so no offset,
+// byte-container-size, or bitpacker bitmap/lane-size words are stored. outSz is
+// the encoded size in bytes.
 void encodeBlockPFor(uint32_t* in, char* outc, uint32_t& outSz) {
-  SoluxBitPacker bpacker;
-  uint32_t* out = (uint32_t*) outc;
-  uint32_t* const initout = out;
-  uint32_t* const headerout = out++;
-  bpacker.clear();
-  uint8_t bytescontainer[3 + BLOCK_SIZE];
-  uint8_t* bc = bytescontainer;
-
-  uint8_t bestb, bestcexcept, maxb;
+  uint8_t bestb, bestcexcept, maxb = 0;
   getBestBFromData(in, bestb, bestcexcept, maxb);
+
+  // Header, written straight into the output.
+  uint8_t* bc = reinterpret_cast<uint8_t*>(outc);
   *bc++ = bestb;
   *bc++ = bestcexcept;
+
+  SoluxBitPacker bpacker;
   if (bestcexcept > 0) {
     *bc++ = maxb;
+    bpacker.clear();
     bpacker.ensureCapacity(maxb - bestb - 1, bestcexcept);
     const uint32_t maxval = 1U << bestb;
     for (uint32_t k = 0; k < BLOCK_SIZE; ++k) {
@@ -163,56 +165,59 @@ void encodeBlockPFor(uint32_t* in, char* outc, uint32_t& outSz) {
       }
     }
   }
-  for (uint32_t k = 0; k < BLOCK_SIZE; k += 128) {
-    FastPForLib::simdpack(in + k, reinterpret_cast<__m128i*>(out), bestb);
-    out += 4 * bestb;
+  // Word-align the base so the SIMD/scalar bit-packing kernels stay word-granular
+  // (zero the pad bytes for a deterministic encoding).
+  while ((reinterpret_cast<char*>(bc) - outc) % sizeof(uint32_t) != 0) *bc++ = 0;
+  uint32_t* out = reinterpret_cast<uint32_t*>(bc);
+
+  // SIMD-packed base (masked: exception values keep only their low bestb bits
+  // here). bestb==0 packs nothing.
+  FastPForLib::simdpack(in, reinterpret_cast<__m128i*>(out), bestb);
+  out += 4 * bestb;
+
+  // Exception residuals: one lane of (maxb-bestb)-bit values. Width 1 stores
+  // nothing (the high bit is implicitly 1, reconstructed on decode).
+  if (bestcexcept > 0 && (uint32_t) (maxb - bestb) > 1) {
+    out = bpacker.writeLane(out, maxb - bestb - 1);
   }
-  headerout[0] = (uint32_t) (out - headerout);
-  const uint32_t bytescontainersize = (uint32_t) (bc - bytescontainer);
-  *(out++) = bytescontainersize;
-  memcpy(out, bytescontainer, bytescontainersize);
-  out += (bytescontainersize + sizeof(uint32_t) - 1) / sizeof(uint32_t);
-  uint32_t* const lastout = bpacker.write(out);
-  outSz = (uint32_t) ((lastout - initout) * sizeof(uint32_t));
+  outSz = (uint32_t) (reinterpret_cast<char*>(out) - outc);
 }
 
 // Single-block PForDelta decode (hand-rolled, stack bit packer). Returns bytes read.
 uint32_t decodeBlockPFor(const char* inc, uint32_t* out) {
-  SoluxBitPacker bpacker;
-  uint32_t* in = (uint32_t*) inc;
-  const uint32_t* const initin = in;
-  const uint32_t* const headerin = in++;
-  const uint32_t wheremeta = headerin[0];
-  const uint32_t* inexcept = headerin + wheremeta;
-  const uint32_t bytesize = *inexcept++;
-  const uint8_t* bytep = reinterpret_cast<const uint8_t*>(inexcept);
-
-  inexcept += (bytesize + sizeof(uint32_t) - 1) / sizeof(uint32_t);
-  inexcept = bpacker.read(inexcept);
-  const uint32_t lengthWords = (uint32_t) (inexcept - initin);
-
-  const uint8_t b = *bytep++;
-  const uint8_t cexcept = *bytep++;
-  for (uint32_t k = 0; k < BLOCK_SIZE; k += 128) {
-    FastPForLib::simdunpack(reinterpret_cast<const __m128i*>(in), out + k, b);
-    in += 4 * b;
-  }
+  const uint8_t* h = reinterpret_cast<const uint8_t*>(inc);
+  const uint8_t bestb = h[0];
+  const uint8_t cexcept = h[1];
+  uint32_t headerBytes = 2;
+  uint8_t maxb = 0;
+  const uint8_t* positions = nullptr;
   if (cexcept > 0) {
-    const uint8_t maxbits = *bytep++;
-    if (maxbits - b == 1) {
+    maxb = h[2];
+    positions = h + 3;
+    headerBytes = 3 + cexcept;
+  }
+  const uint32_t headerWords = (headerBytes + sizeof(uint32_t) - 1) / sizeof(uint32_t);
+  const uint32_t* in = reinterpret_cast<const uint32_t*>(inc) + headerWords;
+
+  FastPForLib::simdunpack(reinterpret_cast<const __m128i*>(in), out, bestb);
+  in += 4 * bestb;
+
+  if (cexcept > 0) {
+    const uint32_t width = (uint32_t) maxb - bestb;
+    if (width == 1) {
       for (uint32_t k = 0; k < cexcept; ++k) {
-        const uint8_t pos = *(bytep++);
-        out[pos] |= (uint32_t) 1 << b;
+        out[positions[k]] |= (uint32_t) 1 << bestb;
       }
     } else {
-      const uint32_t* vals = bpacker.get(maxbits - b - 1);
+      SoluxBitPacker bpacker;
+      in = bpacker.readLane(in, maxb - bestb - 1, cexcept);
+      const uint32_t* vals = bpacker.get(maxb - bestb - 1);
       for (uint32_t k = 0; k < cexcept; ++k) {
-        const uint8_t pos = *(bytep++);
-        out[pos] |= vals[k] << b;
+        out[positions[k]] |= vals[k] << bestb;
       }
     }
   }
-  return lengthWords * sizeof(uint32_t);
+  return (uint32_t) (reinterpret_cast<const char*>(in) - inc);
 }
 
 // Compact 4-lane bit layout for partial (tail) blocks, matching the addressing
