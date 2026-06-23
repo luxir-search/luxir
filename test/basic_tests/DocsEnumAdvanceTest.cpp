@@ -1,6 +1,5 @@
 #include <algorithm>
 #include <iterator>
-#include <set>
 #include <string>
 #include <vector>
 
@@ -13,122 +12,156 @@
 using namespace solux;
 using namespace solux::test;
 
-namespace {
+// Fuzz for DocsEnum advance() and friends.
+// Builds randomized indexes and replays random nextDoc()/advance()/position-read sequences against an
+// independent model, checking doc id, term freq, and positions every step.
+class DocsEnumAdvanceTest : public SoluxTest {
+protected:
+  struct Posting { int32_t docid; int32_t firstPos; int32_t tf; };
 
-// First element of the sorted set that is >= target, else DocsEnum::END.
-int32_t firstGE(const std::vector<int32_t>& sorted, int32_t target) {
-  auto it = std::lower_bound(sorted.begin(), sorted.end(), target);
-  return it == sorted.end() ? DocsEnum::END : *it;
+  static constexpr int VOCAB_SIZE = 40;       // t%9 sets density 1, 1/2, ... 1/256
+  static constexpr int INDEX_ITERATIONS = 5;  // increase with WALKS_PER_TERM when changing DocsEnum
+  static constexpr int WALKS_PER_TERM = 6;
+
+  void checkAdvanceWalk(TestIndex& testIndex, PostingsReader& reader, TermsEnum& tenum,
+                        const std::vector<Posting>& model, const std::string& term,
+                        int maxDoc, int indexIter, int walk) {
+    SCOPED_TRACE(::testing::Message() << "indexIter=" << indexIter << " term=" << term << " walk=" << walk);
+
+    DocsEnum denum(testIndex.pool, reader, tenum);
+    ASSERT_EQ(denum.numDocs(), (int) model.size()) << term;
+
+    auto byDoc = [](const Posting& p, int32_t v) { return p.docid < v; };
+    size_t i = 0;       // model index of the next doc the enum will return
+    int32_t cur = -1;
+    for (;;) {
+      size_t j;         // model index this op must land on
+      if (rng.rbool()) {
+        cur = denum.nextDoc();
+        j = i;
+      } else {
+        int32_t span = rng.rbool() ? 200 : maxDoc;  // small step or far jump
+        int32_t target = cur + 1 + (int32_t) rng.rint(0, span + 1);
+        cur = denum.advance(target);
+        j = (size_t) (std::lower_bound(model.begin(), model.end(), target, byDoc) - model.begin());
+      }
+      int32_t expected = j < model.size() ? model[j].docid : DocsEnum::END;
+      ASSERT_EQ(cur, expected) << term;
+      if (cur == DocsEnum::END) break;
+      ASSERT_EQ(denum.termFreq(), model[j].tf) << term << " tf at doc " << cur;
+
+      if (rng.rbool()) {
+        denum.startPositions();
+        int toRead = (int) rng.rint(0, model[j].tf + 1);
+        for (int k = 0; k < toRead; k++) {
+          ASSERT_EQ(denum.nextPosition(), model[j].firstPos + k) << term << " pos " << k << " doc " << cur;
+        }
+        if (toRead == model[j].tf) {
+          ASSERT_EQ(denum.nextPosition(), DocsEnum::END) << term << " pos end doc " << cur;
+        }
+      }
+      i = j + 1;
+    }
+  }
+
+  void runAdvanceFuzzIndex(int indexIter, int walksPerTerm) {
+    // indexIter 0 ends exactly on a block boundary; later indexes use arbitrary sizes.
+    const int N = indexIter == 0 ? 16 * Postings::DOCS_BLOCK_SIZE : 500 + (int) rng.rint(0, 2000);
+
+    std::vector<std::vector<Posting>> model(VOCAB_SIZE);
+    TestIndex testIndex;
+    TestField f(testIndex, "body_w");
+    f.startIndexing();
+    std::string text;
+    for (int d = 0; d < N; d++) {
+      text.clear();
+      int32_t posn = 0;
+      for (int t = 0; t < VOCAB_SIZE; t++) {
+        if (rng.rint(0, 1 << (t % 9)) != 0) continue;
+        int tf = 1 + (int) rng.rint(0, 3);
+        model[t].push_back({d, posn, tf});
+        for (int k = 0; k < tf; k++) { text += 't'; text += std::to_string(t); text += ' '; }
+        posn += tf;
+      }
+      f.add(d, text);  // t0 is present in every doc, so maxDoc == N
+    }
+    testIndex.flush();
+    f.startReading();
+
+    auto& reader = f.currentSegment()->postingsReader();
+    for (int t = 0; t < VOCAB_SIZE; t++) {
+      const auto& m = model[t];
+      if (m.empty()) continue;
+      std::string term = "t" + std::to_string(t);
+      TermsEnum tenum = f.createTermsEnum();
+      ASSERT_TRUE(tenum.seek(term)) << term;
+
+      for (int walk = 0; walk < walksPerTerm; walk++) {
+        checkAdvanceWalk(testIndex, reader, tenum, m, term, N, indexIter, walk);
+      }
+    }
+  }
+};
+
+
+TEST_F(DocsEnumAdvanceTest, advanceFuzz) {
+  for (int iter = 0; iter < INDEX_ITERATIONS; iter++) {
+    runAdvanceFuzzIndex(iter, WALKS_PER_TERM);
+  }
 }
 
-}  // namespace
+// DOCS-only fields use the shorter skip payload (no cumTf) and an implicit term
+// frequency of 1 -- a layout the positions-field fuzz above never exercises.
+TEST_F(DocsEnumAdvanceTest, advanceDocsOnly) {
+  const int N = 400;  // dense ids 0..399 => 3 full blocks + tail
+  TestIndex testIndex;
+  TestField f(testIndex, "tag_s");
+  f.startIndexing();
+  for (int d = 0; d < N; d++) f.add(d, std::string_view("x"));  // term "x" in every doc
+  testIndex.flush();
+  f.startReading();
 
-class DocsEnumAdvanceTest : public SoluxTest {};
+  TermsEnum tenum = f.createTermsEnum();
+  ASSERT_TRUE(tenum.seek("x"));
+  ASSERT_EQ(DocsEnum(testIndex.pool, f.currentSegment()->postingsReader(), tenum).numDocs(), N);
 
-// DocsEnum::advance(target) must return the first doc >= target, correctly
-// crossing the 128-doc PFor block boundaries (and the StreamVByte tail).  That
-// is exactly the path the postings skip-data work will rewrite, and today it is
-// only a nextDoc() loop with no test that exceeds a single block (BooleanFuzz
-// uses 48 docs).  This pins the advance() contract -- at the DocsEnum level and
-// through a conjunction scorer -- so the skip-data version can be checked
-// against the same expectations.
-TEST_F(DocsEnumAdvanceTest, advanceAcrossBlocks) {
-  // One text field, two terms of very different selectivity:
-  //   "hot"  -> dense list spanning several full 128-doc blocks plus a tail
-  //   "rare" -> sparse list (drives the conjunction leapfrog over "hot")
-  // Docs are added at sparse, increasing ids, so a term's postings have gaps
-  // and advance targets can land on present docs, in gaps, and on boundaries.
-  std::vector<int32_t> hot;
-  std::vector<int32_t> rare;  // subset of hot
-  int32_t d = 0;
-  for (int i = 0; i < 600; i++) {                 // 600 = 4 full blocks + 88 tail
-    hot.push_back(d);
-    if (rng.rint(0, 8) == 0) rare.push_back(d);   // ~1/8 of hot docs also rare
-    d += rng.rint(1, 4);                           // gaps of 1..3
+  // Random forward walk on one enum (resumes the skip cursor, never restarts at 0).
+  DocsEnum denum(testIndex.pool, f.currentSegment()->postingsReader(), tenum);
+  int32_t cur = -1;
+  while (cur != DocsEnum::END) {
+    int32_t target = cur + 1 + (int32_t) rng.rint(0, rng.rbool() ? 5 : N);
+    cur = denum.advance(target);
+    ASSERT_EQ(cur, target < N ? target : DocsEnum::END) << "advance(" << target << ")";  // dense -> exact
+    if (cur != DocsEnum::END) { ASSERT_EQ(denum.termFreq(), 1); }
   }
-  ASSERT_GT((int)hot.size(), 4 * Postings::DOCS_BLOCK_SIZE) << "want several full blocks";
-  ASSERT_GT((int)rare.size(), 0);
+}
 
-  // Add some "rare" docs that are NOT hot, so the conjunction lead (rare) also
-  // overshoots non-matching ids -- exercising advance-overshoot/re-advance.
-  std::set<int32_t> rareSet(rare.begin(), rare.end());
-  for (int i = 0; i < 30; i++) {
-    int32_t id = (int32_t)rng.rint(0, hot.back() + 50);
-    if (!std::binary_search(hot.begin(), hot.end(), id)) rareSet.insert(id);
-  }
-
-  std::set<int32_t> hotSet(hot.begin(), hot.end());
-  std::set<int32_t> all(hotSet);
-  all.insert(rareSet.begin(), rareSet.end());
-
+// A conjunction's advance() must route through the skip list (TermQuery::Scorer
+// forwards advance() to DocsEnum::advance()).  The sparse term leads and advance()s
+// the dense one across many blocks; some sparse docs are not dense, exercising the
+// advance-overshoot/re-advance path.  The result must equal the true intersection.
+TEST_F(DocsEnumAdvanceTest, conjunctionLeapfrog) {
+  const int N = 1500;
+  std::vector<int32_t> dense, sparse;
   TestIndex testIndex;
   TestField f(testIndex, "body_w");
   f.startIndexing();
-  for (int32_t id : all) {  // std::set iterates ascending: ids are strictly increasing
+  for (int d = 0; d < N; d++) {
     std::string text;
-    if (hotSet.count(id)) text += "hot ";
-    if (rareSet.count(id)) text += "rare";
-    f.add(id, text);
+    if (rng.rint(0, 3) != 0) { text += "dense "; dense.push_back(d); }    // ~2/3 of docs, spans many blocks
+    if (rng.rint(0, 20) == 0) { text += "sparse"; sparse.push_back(d); }  // ~1/20, some not in dense
+    if (!text.empty()) f.add(d, text);                                    // skip docs with neither term
   }
   testIndex.flush();
   f.startReading();
 
-  // ---- Part 1: exhaustive advance() semantics on the dense "hot" list ----
-  TermsEnum tenum = f.createTermsEnum();
-  ASSERT_TRUE(tenum.seek("hot"));
-  ASSERT_EQ(DocsEnum(testIndex.pool, f.currentSegment()->postingsReader(), tenum).numDocs(),
-            (int)hot.size());
-
-  // Targets: 0; each present doc and its neighbors (gap landings); every block
-  // boundary; and past-the-end (-> END).
-  std::vector<int32_t> targets{0, hot.back() + 1, hot.back() + 100000};
-  for (int32_t h : hot) {
-    targets.push_back(h);
-    targets.push_back(h + 1);
-    if (h > 0) targets.push_back(h - 1);
-  }
-  for (int ord = 0; ord < (int)hot.size(); ord += Postings::DOCS_BLOCK_SIZE) {
-    targets.push_back(hot[ord]);
-  }
-  std::sort(targets.begin(), targets.end());
-  targets.erase(std::unique(targets.begin(), targets.end()), targets.end());
-
-  // Fresh enum per target (advance is forward-only): advance-from-start landing
-  // in any block.
-  for (int32_t t : targets) {
-    DocsEnum denum(testIndex.pool, f.currentSegment()->postingsReader(), tenum);
-    ASSERT_EQ(denum.advance(t), firstGE(hot, t)) << "advance(" << t << ")";
-  }
-
-  // Real scorer usage: one enum, a monotonically increasing mix of nextDoc() and
-  // advance() to random forward targets, checked against the reference list.
-  {
-    DocsEnum denum(testIndex.pool, f.currentSegment()->postingsReader(), tenum);
-    int32_t cur = denum.nextDoc();
-    ASSERT_EQ(cur, hot[0]);
-    size_t idx = 0;
-    while (cur != DocsEnum::END) {
-      if (rng.rbool()) {
-        cur = denum.nextDoc();
-        idx++;
-      } else {
-        int32_t t = cur + 1 + (int32_t)rng.rint(0, 200);  // strictly forward
-        cur = denum.advance(t);
-        idx = (size_t)(std::lower_bound(hot.begin(), hot.end(), t) - hot.begin());
-      }
-      ASSERT_EQ(cur, idx < hot.size() ? hot[idx] : DocsEnum::END);
-    }
-  }
-
-  // ---- Part 2: advance() through a conjunction scorer (hot AND rare) ----
-  std::vector<int32_t> rareAll(rareSet.begin(), rareSet.end());
-  std::vector<int32_t> expected;  // hot INTERSECT rare
-  std::set_intersection(hot.begin(), hot.end(), rareAll.begin(), rareAll.end(),
+  std::vector<int32_t> expected;  // dense INTERSECT sparse
+  std::set_intersection(dense.begin(), dense.end(), sparse.begin(), sparse.end(),
                         std::back_inserter(expected));
 
-  TermQuery hotQ("body_w", "hot");
-  TermQuery rareQ("body_w", "rare");
-  std::vector<Query*> mand = {&hotQ, &rareQ};
+  TermQuery denseQ("body_w", "dense");
+  TermQuery sparseQ("body_w", "sparse");
+  std::vector<Query*> mand = {&denseQ, &sparseQ};
   BooleanQuery q(mand, {}, {}, {});  // pure conjunction
 
   auto poolFree = testIndex.pool.rewindScopeGuard();

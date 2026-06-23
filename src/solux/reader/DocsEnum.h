@@ -58,6 +58,13 @@ class DocsEnum {
   int64_t locOfDocsForTermBlock;
   int64_t locOfPositionsForTermBlock;
 
+  // Inline skip data from PostingsWriter::endTerm.  The key array is searched
+  // first; payload is read only after the target block is known.
+  const int32_t* docSkipLastDoc = nullptr;
+  const char* docSkipPayload = nullptr;
+  int32_t numSkipBlocks = 0;
+  uint32_t skipPayloadSize = 0;  // 4 (byteEnd) or 12 (byteEnd + cumTf)
+
 
   int32_t db[Postings::DOCS_BLOCK_SIZE];  // temporary...
   int32_t pb[Postings::POSITIONS_BLOCK_SIZE];
@@ -126,9 +133,11 @@ public:
       // see the end of PostingsWriter.endTerm() for the term-specific metadata written there (docfreq, ttf, etc)
 
       // read last byte of docs to get the metadata size
-      docIS.seek(locOfDocsForTermBlock + cumulativeDocsSize - 1);
+      int64_t metaEnd = locOfDocsForTermBlock + cumulativeDocsSize - 1;  // the metaSize byte
+      docIS.seek(metaEnd);
       uint8_t metaSize = docIS.readByte();
-      docIS.relativeSeek(-metaSize - 1); // move to start of metadata
+      int64_t metadataStart = metaEnd - metaSize;
+      docIS.seek(metadataStart); // move to start of metadata
       // Per-term metadata is level-dependent (see PostingsWriter::endTerm): docfreq always,
       // then ttfCode only when freqs are indexed, then posOffset only when positions are.
       docfreq = docIS.readVint();
@@ -139,6 +148,17 @@ public:
         auto posOffset = docIS.readVlong();
         posIS = postingsReader.getInputStream(fieldInfo.posLoc.filenum());
         posIS.seek(locOfPositionsForTermBlock + posOffset);
+      }
+
+      // Skip data sits immediately before metadata and has derived size:
+      // numSkipBlocks keys plus numSkipBlocks payloads.
+      if (docfreq >= Postings::DOCS_BLOCK_SIZE) {
+        numSkipBlocks = docfreq / Postings::DOCS_BLOCK_SIZE;
+        skipPayloadSize = hasPositions ? 12 : 4;  // byteEnd [+ cumTf]
+        uint32_t skipBytes = numSkipBlocks * (uint32_t) (sizeof(int32_t) + skipPayloadSize);
+        docIS.seek(metadataStart - skipBytes);
+        docSkipLastDoc = (const int32_t*) docIS.ptr();
+        docSkipPayload = docIS.ptr() + (size_t) numSkipBlocks * sizeof(int32_t);
       }
 
       // start of the actual docs is end of block - size
@@ -280,10 +300,57 @@ public:
   }
 
 
-  // Strict (like the Scorer / Lucene PostingsEnum contract): target must be
-  // beyond the current doc. The only caller, PhraseQuery::doNext, guards.
+  // Reset the doc decoder to the block that may contain target.  Position state is
+  // repaired by cumulativeTermFreq; the position stream itself stays lazy.
+  void skipToBlock(int32_t target) {
+    const int32_t* keys = docSkipLastDoc;
+    const int32_t n = numSkipBlocks;
+    // DocsEnum is forward-only, so search from the current block instead of from 0.
+    int32_t startBlk = (docOrd - 1) / Postings::DOCS_BLOCK_SIZE;
+    if (startBlk < 0) startBlk = 0;
+    if (startBlk > n) startBlk = n;
+    int32_t bound = 1;
+    while (startBlk + bound < n && keys[startBlk + bound] < target) bound <<= 1;
+    int32_t loIdx = startBlk + (bound >> 1);
+    int32_t hiIdx = (startBlk + bound < n) ? startBlk + bound + 1 : n;
+    while (loIdx < hiIdx) {
+      int32_t mid = loIdx + ((hiIdx - loIdx) >> 1);
+      if (keys[mid] < target) loIdx = mid + 1; else hiIdx = mid;
+    }
+    int32_t lo = loIdx;
+    // lo == numSkipBlocks => target is past every full block: jump to the tail.
+    // Otherwise the state at the end of block lo-1 is the start of block lo.
+    int32_t base = 0;
+    uint32_t byteStart = 0;
+    int64_t cumTf = 0;
+    if (lo > 0) {
+      base = keys[lo - 1];
+      const char* p = docSkipPayload + (size_t) (lo - 1) * skipPayloadSize;
+      byteStart = *(const uint32_t*) p;
+      cumTf = hasPositions ? *(const int64_t*) (p + sizeof(int32_t)) : 0;
+    }
+    docIS.seek(startOfDocs + byteStart);
+    docOrd = lo * Postings::DOCS_BLOCK_SIZE;
+    tfreqOrd = docOrd;
+    cumulativeTermFreq = cumTf;  // restores position alignment; unused when !hasPositions
+    docBuf[Postings::DOCS_BLOCK_SIZE - 1] = base;        // delta base read by nextDoc's decode
+    docBufIdx = docBufEnd = Postings::DOCS_BLOCK_SIZE;   // force a decode on the next nextDoc()
+  }
+
+  // Strict (like the Scorer / Lucene PostingsEnum contract): target must be beyond
+  // the current doc.  Callers: ConjunctionScorer / MandOpt / MandNot, PhraseQuery,
+  // ConstantScoreQuery, the column-join iterators.
   int32_t advance(int32_t target) {
     assert(docid < target);
+    // Once the tail has been entered there are no later skip entries; scanning
+    // avoids seeking back to the tail start and decoding it again.
+    if (docSkipLastDoc != nullptr && docOrd <= numSkipBlocks * Postings::DOCS_BLOCK_SIZE
+        && (docBufEnd == 0 || target > docBuf[docBufEnd - 1])) {
+      skipToBlock(target);
+    }
+    // TODO: try galloping or branchless binary search here?
+    // requires ability to fix up cumulative metadata maintained in nextDoc(), revisit
+    // if/when we defer "tf" decoding.
     while (docid < target) {
       nextDoc();
     }
@@ -391,7 +458,8 @@ public:
           assert(outSz == Postings::POSITIONS_BLOCK_SIZE);
           posBufIdx = 0;
           posBufEnd = outSz;
-          posBufEndDoc = std::min(posBufEnd, tfreq);
+          // This doc may have started in the previous positions block.
+          posBufEndDoc = std::min(posBufEnd, leftToRead);
         } else {
           // we are in the tail
           // we could read position-by-position at the tail if we wanted...

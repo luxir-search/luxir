@@ -361,6 +361,15 @@ class TextWriter {
   std::vector<int32_t> tfreqs; // term freqs - number of times the term appears in each document (parallel vector to "docs")
   std::vector<int32_t> posdeltas; // list of position deltas for the current term (for all documents... per-document positions are not delimited)
 
+  // One skip entry per full docs block, emitted as key and payload arrays after
+  // the docs tail.  The entry count is derived from docfreq.
+  struct DocSkip {
+    int32_t lastDoc;   // last doc in the block; also the next block's delta base
+    uint32_t byteEnd;  // offset from this term's docs start to the end of the block
+    int64_t cumTf;     // cumulative term freq through this block; used for positions
+  };
+  std::vector<DocSkip> docSkip;
+
   // base (starting) values int the associated output streams to calculate offsets from
   int64_t termsLoc=0;
   int64_t docsLoc;
@@ -490,11 +499,13 @@ public:
       docOutput.write(compressed_output.data(), compressedSize);
     }
 
+    docSkip.push_back({(int32_t) prevDocBlockLast,
+                       (uint32_t) (docOutput.size() - locOfDocsForTerm),
+                       ttfAcc});
+
     docsFlushed += docs.size();
     docs.resize(0);
     tfreqs.resize(0);
-
-    // TODO: add data (or keep track of blocks) for docs skip list
   }
 
 
@@ -634,6 +645,7 @@ public:
     docsFlushed = 0;
     ttfAcc = 0;
     prevDocBlockLast = 0;  // each term's first doc block starts from base 0
+    docSkip.resize(0);
     locOfPositionsForTerm = posOutput.size();
     locOfDocsForTerm = docOutput.size();
     termList.push_back(term);  // we don't really need the term name at this point (could add in endTerm), but it might be nice for debugging / exceptions?
@@ -712,6 +724,21 @@ public:
       tfreqs.resize(0);
 
 
+      // Skip data layout:
+      //   int32 lastDoc[numFullBlocks]
+      //   payload[numFullBlocks] = uint32 byteEnd [, int64 cumTf]
+      // The reader derives numFullBlocks from docfreq, so the metadata does not
+      // store a skip length.  A variable-width payload would need a control field.
+      for (auto& e : docSkip) {
+        docOutput.writeInt(e.lastDoc);            // lastDoc[]
+      }
+      for (auto& e : docSkip) {
+        docOutput.writeInt((int32_t) e.byteEnd);  // payload[]
+        if (hasPositions) {
+          docOutput.writeLong(e.cumTf);
+        }
+      }
+
       // The reader can find the start or end of a doc block from the terms dictionary (since blocks are all adjacent)
       // So we can store info at the end of the block as well (but need to encode backwards, or have a single byte metadata
       // length at the end to enable backing up.)
@@ -719,9 +746,9 @@ public:
 
       sumDocFreq += docfreq;  // docfreq computed at the top of endTerm
 
-      // Per-term metadata is level-dependent: docfreq always; ttfCode (ttf-docfreq) only when freqs
-      // are indexed; posOffset only when positions are indexed.  The reader knows the level from the
-      // field flags and reads exactly these.
+      // Per-term metadata is level-dependent: docfreq always; ttfCode (ttf-docfreq)
+      // only when freqs are indexed; posOffset only when positions are indexed.
+      // Skip list size is derived from docfreq.
       // TODO: encode as group, and can replace the metadataSize byte with the control byte.
       docOutput.writeVint(docfreq);
       if (hasFreqs) {
@@ -736,7 +763,6 @@ public:
 
       auto metadataSize = docOutput.size() - metadataStart;
       docOutput.write((char)metadataSize);
-      // TODO: generate/store skip index
 
       docFileSize.push_back(getDocFileSize());
     }

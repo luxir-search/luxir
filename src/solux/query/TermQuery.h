@@ -123,6 +123,10 @@ public:
       return docsEnum.nextDoc();
     }
 
+    int32_t advance(int32_t target) override {
+      return docsEnum.advance(target);
+    }
+
     /// doc we are positioned on
     int32_t docId() override {
       return docsEnum.docId();
