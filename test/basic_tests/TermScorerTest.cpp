@@ -531,3 +531,57 @@ TEST_F(TermScorerTest, boolScore) {
 
   }
 }
+
+
+// Regression for the norm-encoding fix (impact-scoring.md "Step 0"): the field-length
+// column stores the SmallFloat-encoded norm byte, not the raw token count. Before the
+// fix a doc over 40 tokens was mis-scored, and a doc over 255 tokens wrapped mod 256
+// (e.g. 256 -> byte 0 -> "length 0", the shortest-doc bonus), so a very long doc could
+// outscore a short one. With the same tf, the BM25 score must be monotone non-increasing
+// in length, with no wrap across the 40- and 255-token boundaries.
+TEST_F(TermScorerTest, normEncodingMonotone) {
+  TestIndex testIndex;
+  TestField f(testIndex, "foo_w");
+  f.startIndexing();
+
+  // Each doc has "needle" exactly once (tf=1) plus filler to hit a target token
+  // count straddling the encoding boundaries. docids ascend with length, so the
+  // scorer (docid order) yields scores that must descend.
+  std::vector<int> lengths = {5, 40, 41, 100, 255, 256, 300, 600};
+  std::vector<std::string> docs;
+  for (int len : lengths) {
+    std::string s = "needle";
+    for (int i = 1; i < len; i++) s += " fill";
+    docs.push_back(std::move(s));
+  }
+  for (size_t i = 0; i < docs.size(); i++) {
+    f.add((int32_t)i, docs[i]);
+  }
+  testIndex.flush();
+  f.startReading();
+
+  TermQuery tq("foo_w", "needle");
+  auto poolFree = testIndex.pool.rewindScopeGuard();
+  Query::Context qContext(testIndex.pool, *testIndex.reader);
+  auto* weight = tq.createWeight(qContext, Query::NEED_SCORES);
+  auto* scorer = dynamic_cast<TermQuery::Scorer*>(
+      weight->createScorer(testIndex.pool, qContext.topReader.segments()[0]));
+  ASSERT_NE(scorer, nullptr);
+
+  std::vector<float> scores;
+  for (int32_t doc = scorer->next(); doc != PostingsReader::END; doc = scorer->next()) {
+    ASSERT_EQ(scorer->termFreq(), 1);
+    scores.push_back(scorer->score());
+  }
+  ASSERT_EQ(scores.size(), lengths.size());
+
+  // Monotone non-increasing across every boundary, including 40/41 and 255/256.
+  // (Adjacent lengths in the same quantization bucket score equal, hence <=.)
+  for (size_t i = 1; i < scores.size(); i++) {
+    EXPECT_LE(scores[i], scores[i - 1])
+        << "length " << lengths[i] << " outscored length " << lengths[i - 1];
+  }
+  // The length effect is real (quantization didn't collapse it): the longest doc
+  // scores strictly below the shortest. The pre-fix 256-token wrap inverted this.
+  EXPECT_LT(scores.back(), scores.front());
+}

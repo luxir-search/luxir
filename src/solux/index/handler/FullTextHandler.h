@@ -3,6 +3,7 @@
 #include "solux/index/DocStream.h"
 #include "solux/index/Inverter.h"
 #include "solux/index/IntColWriter.h"
+#include "solux/search/Similarity.h"
 
 
 using namespace solux;
@@ -79,7 +80,11 @@ public:
 
     // We index the length even if all tokens were removed somehow, because we still want
     // to record that there was a doc for this field.
-    fieldLengthCol.indexSingle(inverter, numTokens);
+    // Store the SmallFloat-encoded norm byte, not the raw token count: the scorers index
+    // invNorm[(uint8_t)encodedNorm], so the column must already hold the encoded byte
+    // (identity for lengths 0..40, quantized above). Storing raw numTokens silently
+    // mis-scores docs over 40 tokens and wraps mod 256 above 255.
+    fieldLengthCol.indexSingle(inverter, SmallFloat::intToByte4(numTokens));
   }
 
   void flush(Inverter& inverter) override {
