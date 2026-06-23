@@ -3,6 +3,7 @@
 #include "TermsEnum.h"
 #include "solux/codec/Codec.h"
 #include "solux/codec/StreamVByte.h"
+#include <vector>
 
 namespace solux {
 // TODO: templatize to be able to instrument, implement checkindex, etc...
@@ -391,6 +392,10 @@ public:
         if (hasPositions) {
           blockTfSum += InputStream::readVint(p, headerEnd);
         }
+        if (hasFreqs) {
+          auto maxTf = InputStream::readVint(p, headerEnd);
+          unused(maxTf);
+        }
         assert(p == headerEnd);
 
         const char* body = headerEnd;
@@ -449,6 +454,10 @@ public:
       if (hasPositions) {
         groupTfSum += InputStream::readVint(p, groupHeaderEnd);
       }
+      if (hasFreqs) {
+        auto spanImpact = InputStream::readVint(p, groupHeaderEnd);
+        unused(spanImpact);
+      }
       assert(p == groupHeaderEnd);
 
       const char* groupBody = groupHeaderEnd;
@@ -502,6 +511,86 @@ public:
       nextDoc();
     }
     return docid;
+  }
+
+  // Read stored T0 impact data without decoding postings bodies.  DOCS-only fields
+  // do not store impact fields, so their per-block maxTf and group span impacts are
+  // synthesized as 1.
+  void readBlockMaxTf(std::vector<int32_t>& blockMaxTf,
+                      std::vector<int32_t>* groupSpanImpacts = nullptr) const {
+    blockMaxTf.resize(0);
+    if (groupSpanImpacts != nullptr) {
+      groupSpanImpacts->resize(0);
+    }
+    if (docsSize == 0) {
+      return;
+    }
+
+    blockMaxTf.reserve(numDocBlocks);
+    if (groupSpanImpacts != nullptr) {
+      groupSpanImpacts->reserve(numDocGroups);
+    }
+
+    const char* const end = docIS.ptr(metadataStart);
+    const char* p = docIS.ptr(startOfDocs);
+    uint32_t prevGroupLastDoc = 0;
+    uint32_t prevBlockLastDoc = 0;
+
+    for (int32_t group = 0; group < numDocGroups; group++) {
+      int32_t groupStartBlock = group * L1_PERIOD;
+      int32_t groupBlockCount = std::min(L1_PERIOD, numDocBlocks - groupStartBlock);
+
+      uint32_t groupHeaderLen = InputStream::readVint(p, end);
+      const char* groupHeaderEnd = p + groupHeaderLen;
+      assert(groupHeaderEnd <= end);
+      uint32_t groupLastDoc = prevGroupLastDoc + readVint15(p, groupHeaderEnd);
+      uint64_t groupByteLen = readVlong15(p, groupHeaderEnd);
+      if (hasPositions) {
+        auto groupCumTfDelta = InputStream::readVint(p, groupHeaderEnd);
+        unused(groupCumTfDelta);
+      }
+      int32_t spanImpact = 1;
+      if (hasFreqs) {
+        spanImpact = (int32_t) InputStream::readVint(p, groupHeaderEnd);
+      }
+      assert(p == groupHeaderEnd);
+      if (groupSpanImpacts != nullptr) {
+        groupSpanImpacts->push_back(spanImpact);
+      }
+
+      const char* const groupBody = groupHeaderEnd;
+      const char* const groupEnd = groupBody + (int64_t) groupByteLen;
+      assert(groupEnd <= end);
+      p = groupBody;
+
+      for (int32_t i = 0; i < groupBlockCount; i++) {
+        uint32_t headerLen = InputStream::readVint(p, groupEnd);
+        const char* headerEnd = p + headerLen;
+        assert(headerEnd <= groupEnd);
+        uint32_t blockLastDoc = prevBlockLastDoc + readVint15(p, headerEnd);
+        uint64_t blockByteLen = readVlong15(p, headerEnd);
+        if (hasPositions) {
+          auto blockCumTfDelta = InputStream::readVint(p, headerEnd);
+          unused(blockCumTfDelta);
+        }
+        int32_t maxTf = 1;
+        if (hasFreqs) {
+          maxTf = (int32_t) InputStream::readVint(p, headerEnd);
+        }
+        assert(p == headerEnd);
+        blockMaxTf.push_back(maxTf);
+        p = headerEnd + (int64_t) blockByteLen;
+        assert(p <= groupEnd);
+        prevBlockLastDoc = blockLastDoc;
+      }
+
+      assert(p == groupEnd);
+      prevGroupLastDoc = groupLastDoc;
+      assert(prevBlockLastDoc == prevGroupLastDoc);
+    }
+
+    assert((int32_t) blockMaxTf.size() == numDocBlocks);
+    assert(p == end);
   }
 
   void startPositions() {

@@ -382,6 +382,7 @@ class TextWriter {
   int32_t l1GroupBlockCount = 0;
   int32_t l1GroupDocCount = 0;
   uint64_t l1GroupTfSum = 0;
+  uint32_t l1GroupMaxTf = 0;
 
   // Index level for this field, decoded from the field flags in startField().  These gate
   // whether the freq stream and position stream are written at all.
@@ -439,7 +440,8 @@ private:  // some internal utility methods... not for use by indexers
   }
 
   void appendL0Header(std::vector<char>& out, uint32_t lastDoc, uint32_t base,
-                      uint64_t blockByteLen, uint32_t docCount, uint64_t tfSum) {
+                      uint64_t blockByteLen, uint32_t docCount, uint64_t tfSum,
+                      uint32_t maxTf) {
     header_output.resize(0);
     assert(lastDoc >= base);
     appendVint15(header_output, lastDoc - base);
@@ -447,6 +449,10 @@ private:  // some internal utility methods... not for use by indexers
     if (hasPositions) {
       assert(tfSum >= docCount);
       appendVint(header_output, (uint32_t) (tfSum - docCount));
+    }
+    if (hasFreqs) {
+      assert(maxTf > 0);
+      appendVint(header_output, maxTf);
     }
     appendVint(out, (uint32_t) header_output.size());
     appendBytes(out, header_output.data(), header_output.size());
@@ -458,14 +464,17 @@ private:  // some internal utility methods... not for use by indexers
   }
 
   void appendL0Block(uint32_t lastDoc, uint32_t base, uint64_t blockByteLen,
-                     uint32_t docCount, uint64_t tfSum) {
-    appendL0Header(group_output, lastDoc, base, blockByteLen, docCount, tfSum);
+                     uint32_t docCount, uint64_t tfSum, uint32_t maxTf) {
+    appendL0Header(group_output, lastDoc, base, blockByteLen, docCount, tfSum, maxTf);
     appendBytes(group_output, compressed_output.data(), blockByteLen);
     l1GroupLastDoc = lastDoc;
     l1GroupBlockCount++;
     l1GroupDocCount += (int32_t) docCount;
     if (hasPositions) {
       l1GroupTfSum += tfSum;
+    }
+    if (hasFreqs) {
+      l1GroupMaxTf = std::max(l1GroupMaxTf, maxTf);
     }
     if (l1GroupBlockCount == L1_PERIOD) {
       flushL1Group();
@@ -484,6 +493,10 @@ private:  // some internal utility methods... not for use by indexers
       assert(l1GroupTfSum >= (uint64_t) l1GroupDocCount);
       appendVint(header_output, (uint32_t) (l1GroupTfSum - (uint64_t) l1GroupDocCount));
     }
+    if (hasFreqs) {
+      assert(l1GroupMaxTf > 0);
+      appendVint(header_output, l1GroupMaxTf);
+    }
     docOutput.writeVint((uint32_t) header_output.size());
     docOutput.write(header_output.data(), header_output.size());
     docOutput.write(group_output.data(), group_output.size());
@@ -493,6 +506,7 @@ private:  // some internal utility methods... not for use by indexers
     l1GroupBlockCount = 0;
     l1GroupDocCount = 0;
     l1GroupTfSum = 0;
+    l1GroupMaxTf = 0;
   }
 
   // number of docs for the current term
@@ -579,9 +593,13 @@ public:
     const uint32_t base = prevDocBlockLast;
     const uint32_t lastDoc = (uint32_t) docs.back();
     uint64_t tfSum = 0;
-    if (hasPositions) {
+    uint32_t maxTf = 0;
+    if (hasFreqs) {
       for (auto tf : tfreqs) {
-        tfSum += (uint32_t) tf;
+        if (hasPositions) {
+          tfSum += (uint32_t) tf;
+        }
+        maxTf = std::max(maxTf, (uint32_t) tf);
       }
     }
 
@@ -601,7 +619,7 @@ public:
       blockByteLen += compressedSize;
     }
 
-    appendL0Block(lastDoc, base, blockByteLen, Postings::DOCS_BLOCK_SIZE, tfSum);
+    appendL0Block(lastDoc, base, blockByteLen, Postings::DOCS_BLOCK_SIZE, tfSum, maxTf);
     prevDocBlockLast = lastDoc;
 
     docsFlushed += docs.size();
@@ -751,6 +769,7 @@ public:
     l1GroupBlockCount = 0;
     l1GroupDocCount = 0;
     l1GroupTfSum = 0;
+    l1GroupMaxTf = 0;
     group_output.resize(0);
     locOfPositionsForTerm = posOutput.size();
     locOfDocsForTerm = docOutput.size();
@@ -819,9 +838,13 @@ public:
         const uint32_t base = prevDocBlockLast;
         const uint32_t lastDoc = (uint32_t) docs.back();
         uint64_t tfSum = 0;
-        if (hasPositions) {
+        uint32_t maxTf = 0;
+        if (hasFreqs) {
           for (auto tf : tfreqs) {
-            tfSum += (uint32_t) tf;
+            if (hasPositions) {
+              tfSum += (uint32_t) tf;
+            }
+            maxTf = std::max(maxTf, (uint32_t) tf);
           }
         }
         uint8_t* ddEnd = svb_encode_scalar_d1_init((const uint32_t*) docs.data(), dkeys, ddata, n, base);
@@ -835,7 +858,7 @@ public:
           appendBytes(compressed_output, tkeys, kb);
           appendBytes(compressed_output, tdata, (size_t)(tdEnd - tdata));
         }
-        appendL0Block(lastDoc, base, compressed_output.size(), n, tfSum);
+        appendL0Block(lastDoc, base, compressed_output.size(), n, tfSum, maxTf);
         prevDocBlockLast = lastDoc;
       }
       docsFlushed += docs.size();

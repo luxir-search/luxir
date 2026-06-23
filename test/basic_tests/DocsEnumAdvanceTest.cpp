@@ -23,6 +23,82 @@ protected:
   static constexpr int INDEX_ITERATIONS = 5;  // increase with WALKS_PER_TERM when changing DocsEnum
   static constexpr int WALKS_PER_TERM = 6;
 
+  static int32_t impactTfForDoc(int32_t docid) {
+    int32_t block = docid / Postings::DOCS_BLOCK_SIZE;
+    return 1 + ((block * 7 + (docid % 3)) % 23);
+  }
+
+  static std::vector<int32_t> expectedBlockMaxTf(int32_t numDocs, bool hasFreqs) {
+    int32_t numBlocks = (numDocs + Postings::DOCS_BLOCK_SIZE - 1) / Postings::DOCS_BLOCK_SIZE;
+    std::vector<int32_t> expected(numBlocks, hasFreqs ? 0 : 1);
+    if (!hasFreqs) {
+      return expected;
+    }
+    for (int32_t doc = 0; doc < numDocs; doc++) {
+      int32_t block = doc / Postings::DOCS_BLOCK_SIZE;
+      expected[block] = std::max(expected[block], impactTfForDoc(doc));
+    }
+    return expected;
+  }
+
+  static std::vector<int32_t> expectedGroupSpanImpacts(const std::vector<int32_t>& blockMaxTf) {
+    int32_t numGroups = ((int32_t) blockMaxTf.size() + 31) / 32;
+    std::vector<int32_t> expected;
+    expected.reserve(numGroups);
+    for (int32_t group = 0; group < numGroups; group++) {
+      int32_t start = group * 32;
+      int32_t end = std::min(start + 32, (int32_t) blockMaxTf.size());
+      int32_t spanImpact = 0;
+      for (int32_t block = start; block < end; block++) {
+        spanImpact = std::max(spanImpact, blockMaxTf[block]);
+      }
+      expected.push_back(spanImpact);
+    }
+    return expected;
+  }
+
+  void assertImpactHeaders(DocsEnum& denum, const std::vector<int32_t>& expectedBlockMaxTf,
+                           std::string_view label) {
+    std::vector<int32_t> blockMaxTf;
+    std::vector<int32_t> groupSpanImpacts;
+    denum.readBlockMaxTf(blockMaxTf, &groupSpanImpacts);
+    ASSERT_EQ(blockMaxTf, expectedBlockMaxTf) << label;
+    ASSERT_EQ(groupSpanImpacts, expectedGroupSpanImpacts(expectedBlockMaxTf)) << label;
+  }
+
+  void checkRawImpactHeaders(FieldType::flag_type flags, const std::vector<int32_t>& expectedBlockMaxTf,
+                             int32_t numDocs, std::string_view label) {
+    RAMDir dir;
+    MemPool pool;
+    PostingsWriter postingsWriter(dir, 0, numDocs);
+    {
+      TextWriter writer(postingsWriter);
+      auto& finfo = postingsWriter.addField("f");
+      finfo.type = FieldType::TEXT;
+      finfo.flags = flags;
+      writer.startField(&finfo);
+
+      TermRef term(pool, "hot", 3);
+      writer.startTerm(term);
+      for (int32_t doc = 0; doc < numDocs; doc++) {
+        writer.addDoc(doc, impactTfForDoc(doc));
+      }
+      writer.endTerm(term);
+      writer.endField();
+    }
+    postingsWriter.finish();
+
+    PostingsReader reader(dir, 0);
+    FieldReader fieldReader(pool, reader);
+    ASSERT_TRUE(fieldReader.readNextField()) << label;
+    SegFieldInfo fieldInfo;
+    fieldReader.readFieldInfo(fieldInfo);
+    TermsEnum tenum(pool, reader, fieldInfo);
+    ASSERT_TRUE(tenum.seek("hot")) << label;
+    DocsEnum denum(pool, reader, tenum);
+    assertImpactHeaders(denum, expectedBlockMaxTf, label);
+  }
+
   void checkAdvanceWalk(TestIndex& testIndex, PostingsReader& reader, TermsEnum& tenum,
                         const std::vector<Posting>& model, const std::string& term,
                         int maxDoc, int indexIter, int walk) {
@@ -137,6 +213,37 @@ TEST_F(DocsEnumAdvanceTest, advanceDocsOnly) {
     ASSERT_EQ(cur, target < N ? target : DocsEnum::END) << "advance(" << target << ")";  // dense -> exact
     if (cur != DocsEnum::END) { ASSERT_EQ(denum.termFreq(), 1); }
   }
+}
+
+TEST_F(DocsEnumAdvanceTest, blockImpactHeadersRoundTrip) {
+  const int32_t N = 72 * Postings::DOCS_BLOCK_SIZE + 17;
+  std::vector<int32_t> expectedFreqImpacts = expectedBlockMaxTf(N, true);
+  std::vector<int32_t> expectedDocsOnlyImpacts = expectedBlockMaxTf(N, false);
+
+  {
+    TestIndex testIndex;
+    TestField f(testIndex, "body_w");
+    f.startIndexing();
+    std::string text;
+    for (int32_t doc = 0; doc < N; doc++) {
+      text.clear();
+      int32_t tf = impactTfForDoc(doc);
+      for (int32_t i = 0; i < tf; i++) {
+        text += "hot ";
+      }
+      f.add(doc, text);
+    }
+    testIndex.flush();
+    f.startReading();
+
+    TermsEnum tenum = f.createTermsEnum();
+    ASSERT_TRUE(tenum.seek("hot"));
+    DocsEnum denum(testIndex.pool, f.currentSegment()->postingsReader(), tenum);
+    assertImpactHeaders(denum, expectedFreqImpacts, "positions");
+  }
+
+  checkRawImpactHeaders(FieldType::INDEX_DOCS_FREQS, expectedFreqImpacts, N, "docs+freqs");
+  checkRawImpactHeaders(FieldType::INDEX_DOCS, expectedDocsOnlyImpacts, N, "docs-only");
 }
 
 // A conjunction's advance() must route through the skip list (TermQuery::Scorer
