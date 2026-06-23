@@ -65,8 +65,11 @@ protected:
   }
 
   void runAdvanceFuzzIndex(int indexIter, int walksPerTerm) {
-    // indexIter 0 ends exactly on a block boundary; later indexes use arbitrary sizes.
-    const int N = indexIter == 0 ? 16 * Postings::DOCS_BLOCK_SIZE : 500 + (int) rng.rint(0, 2000);
+    // indexIter 0 ends exactly on a block boundary and is sized to span multiple L1
+    // skip groups (L1 period is 32 blocks): 72 blocks => t0 (every doc) covers 2 full
+    // groups + a partial third, so far advances exercise the L1 group step-over and
+    // mid-density terms land their tails in later groups.  Later indexes use arbitrary sizes.
+    const int N = indexIter == 0 ? 72 * Postings::DOCS_BLOCK_SIZE : 500 + (int) rng.rint(0, 2000);
 
     std::vector<std::vector<Posting>> model(VOCAB_SIZE);
     TestIndex testIndex;

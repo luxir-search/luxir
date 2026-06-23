@@ -361,14 +361,7 @@ class TextWriter {
   std::vector<int32_t> tfreqs; // term freqs - number of times the term appears in each document (parallel vector to "docs")
   std::vector<int32_t> posdeltas; // list of position deltas for the current term (for all documents... per-document positions are not delimited)
 
-  // One skip entry per full docs block, emitted as key and payload arrays after
-  // the docs tail.  The entry count is derived from docfreq.
-  struct DocSkip {
-    int32_t lastDoc;   // last doc in the block; also the next block's delta base
-    uint32_t byteEnd;  // offset from this term's docs start to the end of the block
-    int64_t cumTf;     // cumulative term freq through this block; used for positions
-  };
-  std::vector<DocSkip> docSkip;
+  static constexpr int32_t L1_PERIOD = 32;
 
   // base (starting) values int the associated output streams to calculate offsets from
   int64_t termsLoc=0;
@@ -384,6 +377,11 @@ class TextWriter {
   int32_t curTf = 0;    /// occurrences (term freq) seen so far for the current doc
   int64_t ttfAcc = 0;   /// total term freq (sum of tf over docs) accumulated for the current term
   uint32_t prevDocBlockLast = 0;  /// last doc id of the previous flushed doc block (cross-block delta base); reset per term
+  uint32_t prevL1GroupLast = 0;   /// last doc id of the previous flushed L1 group; reset per term
+  uint32_t l1GroupLastDoc = 0;    /// last doc id in the buffered L1 group
+  int32_t l1GroupBlockCount = 0;
+  int32_t l1GroupDocCount = 0;
+  uint64_t l1GroupTfSum = 0;
 
   // Index level for this field, decoded from the field flags in startField().  These gate
   // whether the freq stream and position stream are written at all.
@@ -397,8 +395,106 @@ class TextWriter {
 
   // TODO: pool allocate this
   std::vector<char> compressed_output;
+  std::vector<char> header_output;
+  std::vector<char> group_output;
 
 private:  // some internal utility methods... not for use by indexers
+  static void appendVint(std::vector<char>& out, uint32_t val) {
+    while (val > 0x7f) {
+      out.push_back((char) (val | 0x80));
+      val >>= 7;
+    }
+    out.push_back((char) val);
+  }
+
+  static void appendVlong(std::vector<char>& out, uint64_t val) {
+    while (val > 0x7f) {
+      out.push_back((char) (val | 0x80));
+      val >>= 7;
+    }
+    out.push_back((char) val);
+  }
+
+  static void appendShortLE(std::vector<char>& out, uint16_t val) {
+    out.push_back((char) val);
+    out.push_back((char) (val >> 8));
+  }
+
+  static void appendVint15(std::vector<char>& out, uint32_t val) {
+    if ((val & ~0x7fffu) == 0) {
+      appendShortLE(out, (uint16_t) val);
+    } else {
+      appendShortLE(out, (uint16_t) (0x8000u | (val & 0x7fffu)));
+      appendVint(out, val >> 15);
+    }
+  }
+
+  static void appendVlong15(std::vector<char>& out, uint64_t val) {
+    if ((val & ~0x7fffull) == 0) {
+      appendShortLE(out, (uint16_t) val);
+    } else {
+      appendShortLE(out, (uint16_t) (0x8000u | (val & 0x7fffull)));
+      appendVlong(out, val >> 15);
+    }
+  }
+
+  void appendL0Header(std::vector<char>& out, uint32_t lastDoc, uint32_t base,
+                      uint64_t blockByteLen, uint32_t docCount, uint64_t tfSum) {
+    header_output.resize(0);
+    assert(lastDoc >= base);
+    appendVint15(header_output, lastDoc - base);
+    appendVlong15(header_output, blockByteLen);
+    if (hasPositions) {
+      assert(tfSum >= docCount);
+      appendVint(header_output, (uint32_t) (tfSum - docCount));
+    }
+    appendVint(out, (uint32_t) header_output.size());
+    appendBytes(out, header_output.data(), header_output.size());
+  }
+
+  void appendBytes(std::vector<char>& out, const void* data, size_t len) {
+    const char* src = (const char*) data;
+    out.insert(out.end(), src, src + len);
+  }
+
+  void appendL0Block(uint32_t lastDoc, uint32_t base, uint64_t blockByteLen,
+                     uint32_t docCount, uint64_t tfSum) {
+    appendL0Header(group_output, lastDoc, base, blockByteLen, docCount, tfSum);
+    appendBytes(group_output, compressed_output.data(), blockByteLen);
+    l1GroupLastDoc = lastDoc;
+    l1GroupBlockCount++;
+    l1GroupDocCount += (int32_t) docCount;
+    if (hasPositions) {
+      l1GroupTfSum += tfSum;
+    }
+    if (l1GroupBlockCount == L1_PERIOD) {
+      flushL1Group();
+    }
+  }
+
+  void flushL1Group() {
+    if (l1GroupBlockCount == 0) {
+      return;
+    }
+    header_output.resize(0);
+    assert(l1GroupLastDoc >= prevL1GroupLast);
+    appendVint15(header_output, l1GroupLastDoc - prevL1GroupLast);
+    appendVlong15(header_output, group_output.size());
+    if (hasPositions) {
+      assert(l1GroupTfSum >= (uint64_t) l1GroupDocCount);
+      appendVint(header_output, (uint32_t) (l1GroupTfSum - (uint64_t) l1GroupDocCount));
+    }
+    docOutput.writeVint((uint32_t) header_output.size());
+    docOutput.write(header_output.data(), header_output.size());
+    docOutput.write(group_output.data(), group_output.size());
+
+    prevL1GroupLast = l1GroupLastDoc;
+    group_output.resize(0);
+    l1GroupBlockCount = 0;
+    l1GroupDocCount = 0;
+    l1GroupTfSum = 0;
+  }
+
   // number of docs for the current term
   int32_t getDocFreq() const {
     return docsFlushed + docs.size();
@@ -473,6 +569,7 @@ public:
     }
 
     assert(docs.back() < postingsWriter.getMaxDoc()); // sanity check to ensure we didn't go over provided numDocs
+    assert(docs.size() == Postings::DOCS_BLOCK_SIZE);
 
     // NOTE: SoluxPFORd (docCodec) applies the adjacent delta itself, in place,
     // so we pass the raw (monotonic) doc ids. encodeBlock handles exactly one
@@ -480,28 +577,32 @@ public:
     // previous block's last id (cross-block base); capture this block's last id
     // first, since encodeBlock deltas `docs` in place.
     const uint32_t base = prevDocBlockLast;
-    prevDocBlockLast = (uint32_t) docs.back();
+    const uint32_t lastDoc = (uint32_t) docs.back();
+    uint64_t tfSum = 0;
+    if (hasPositions) {
+      for (auto tf : tfreqs) {
+        tfSum += (uint32_t) tf;
+      }
+    }
 
-    compressed_output.resize(Postings::DOCS_BLOCK_SIZE * sizeof(int32_t) + 1024);
-    uint32_t compressedSize = compressed_output.size(); // this gets changed to the actual size
+    compressed_output.resize(2 * (Postings::DOCS_BLOCK_SIZE * sizeof(int32_t) + 1024));
+    uint32_t compressedSize = (uint32_t) compressed_output.size(); // this gets changed to the actual size
     IndexCodec::docCodec.encodeBlock(reinterpret_cast<uint32_t *>(docs.data()), docs.size(), compressed_output.data(),
                                   compressedSize, base);
-    docOutput.write(compressed_output.data(), compressedSize);
+    uint32_t blockByteLen = compressedSize;
 
     //
     // now the term freqs (omitted entirely for DOCS-only fields)
     //
     if (hasFreqs) {
-      compressed_output.resize(Postings::TERMS_BLOCK_SIZE + 1024);
-      compressedSize = compressed_output.size(); // this gets changed to the actual size
-      IndexCodec::tfreqCodec.encodeBlock(reinterpret_cast<uint32_t *>(tfreqs.data()), tfreqs.size(), compressed_output.data(),
+      compressedSize = (uint32_t) compressed_output.size() - blockByteLen; // this gets changed to the actual size
+      IndexCodec::tfreqCodec.encodeBlock(reinterpret_cast<uint32_t *>(tfreqs.data()), tfreqs.size(), compressed_output.data() + blockByteLen,
                                       compressedSize);
-      docOutput.write(compressed_output.data(), compressedSize);
+      blockByteLen += compressedSize;
     }
 
-    docSkip.push_back({(int32_t) prevDocBlockLast,
-                       (uint32_t) (docOutput.size() - locOfDocsForTerm),
-                       ttfAcc});
+    appendL0Block(lastDoc, base, blockByteLen, Postings::DOCS_BLOCK_SIZE, tfSum);
+    prevDocBlockLast = lastDoc;
 
     docsFlushed += docs.size();
     docs.resize(0);
@@ -645,7 +746,12 @@ public:
     docsFlushed = 0;
     ttfAcc = 0;
     prevDocBlockLast = 0;  // each term's first doc block starts from base 0
-    docSkip.resize(0);
+    prevL1GroupLast = 0;
+    l1GroupLastDoc = 0;
+    l1GroupBlockCount = 0;
+    l1GroupDocCount = 0;
+    l1GroupTfSum = 0;
+    group_output.resize(0);
     locOfPositionsForTerm = posOutput.size();
     locOfDocsForTerm = docOutput.size();
     termList.push_back(term);  // we don't really need the term name at this point (could add in endTerm), but it might be nice for debugging / exceptions?
@@ -704,40 +810,39 @@ public:
       //   scoring fields too (plan A); needs the freq blocks deferred/separated since flushDocs is eager.
       assert(docs.size() == tfreqs.size());
       const uint32_t n = (uint32_t) docs.size();
-      const uint32_t kb = svbKeyBytes(n);
-      uint8_t dkeys[Postings::DOCS_BLOCK_SIZE / 4 + 1];
-      uint8_t ddata[Postings::DOCS_BLOCK_SIZE * 4];
-      // d1 base: continue the cross-block delta from the last full block (0 when
-      // the term is a single partial block), matching the docs codec convention.
-      uint8_t* ddEnd = svb_encode_scalar_d1_init((const uint32_t*) docs.data(), dkeys, ddata, n, prevDocBlockLast);
-      docOutput.write(dkeys, kb);
-      docOutput.write(ddata, (size_t)(ddEnd - ddata));
-      if (hasFreqs) {
-        uint8_t tkeys[Postings::DOCS_BLOCK_SIZE / 4 + 1];
-        uint8_t tdata[Postings::DOCS_BLOCK_SIZE * 4];
-        uint8_t* tdEnd = svb_encode_scalar((const uint32_t*) tfreqs.data(), tkeys, tdata, n);
-        docOutput.write(tkeys, kb);
-        docOutput.write(tdata, (size_t)(tdEnd - tdata));
+      if (n > 0) {
+        const uint32_t kb = svbKeyBytes(n);
+        uint8_t dkeys[Postings::DOCS_BLOCK_SIZE / 4 + 1];
+        uint8_t ddata[Postings::DOCS_BLOCK_SIZE * 4];
+        // d1 base: continue the cross-block delta from the last full block (0 when
+        // the term is a single partial block), matching the docs codec convention.
+        const uint32_t base = prevDocBlockLast;
+        const uint32_t lastDoc = (uint32_t) docs.back();
+        uint64_t tfSum = 0;
+        if (hasPositions) {
+          for (auto tf : tfreqs) {
+            tfSum += (uint32_t) tf;
+          }
+        }
+        uint8_t* ddEnd = svb_encode_scalar_d1_init((const uint32_t*) docs.data(), dkeys, ddata, n, base);
+        compressed_output.resize(0);
+        appendBytes(compressed_output, dkeys, kb);
+        appendBytes(compressed_output, ddata, (size_t)(ddEnd - ddata));
+        if (hasFreqs) {
+          uint8_t tkeys[Postings::DOCS_BLOCK_SIZE / 4 + 1];
+          uint8_t tdata[Postings::DOCS_BLOCK_SIZE * 4];
+          uint8_t* tdEnd = svb_encode_scalar((const uint32_t*) tfreqs.data(), tkeys, tdata, n);
+          appendBytes(compressed_output, tkeys, kb);
+          appendBytes(compressed_output, tdata, (size_t)(tdEnd - tdata));
+        }
+        appendL0Block(lastDoc, base, compressed_output.size(), n, tfSum);
+        prevDocBlockLast = lastDoc;
       }
       docsFlushed += docs.size();
       docs.resize(0);
       tfreqs.resize(0);
+      flushL1Group();
 
-
-      // Skip data layout:
-      //   int32 lastDoc[numFullBlocks]
-      //   payload[numFullBlocks] = uint32 byteEnd [, int64 cumTf]
-      // The reader derives numFullBlocks from docfreq, so the metadata does not
-      // store a skip length.  A variable-width payload would need a control field.
-      for (auto& e : docSkip) {
-        docOutput.writeInt(e.lastDoc);            // lastDoc[]
-      }
-      for (auto& e : docSkip) {
-        docOutput.writeInt((int32_t) e.byteEnd);  // payload[]
-        if (hasPositions) {
-          docOutput.writeLong(e.cumTf);
-        }
-      }
 
       // The reader can find the start or end of a doc block from the terms dictionary (since blocks are all adjacent)
       // So we can store info at the end of the block as well (but need to encode backwards, or have a single byte metadata
@@ -748,7 +853,6 @@ public:
 
       // Per-term metadata is level-dependent: docfreq always; ttfCode (ttf-docfreq)
       // only when freqs are indexed; posOffset only when positions are indexed.
-      // Skip list size is derived from docfreq.
       // TODO: encode as group, and can replace the metadataSize byte with the control byte.
       docOutput.writeVint(docfreq);
       if (hasFreqs) {

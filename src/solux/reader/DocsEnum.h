@@ -53,18 +53,24 @@ class DocsEnum {
 
   int32_t docsSize;  // size of the postings in the doc file for the given term
   int64_t startOfDocs;
+  int64_t metadataStart;
 
   int64_t cumulativeDocsSize;
   int64_t locOfDocsForTermBlock;
   int64_t locOfPositionsForTermBlock;
 
-  // Inline skip data from PostingsWriter::endTerm.  The key array is searched
-  // first; payload is read only after the target block is known.
-  const int32_t* docSkipLastDoc = nullptr;
-  const char* docSkipPayload = nullptr;
-  int32_t numSkipBlocks = 0;
-  uint32_t skipPayloadSize = 0;  // 4 (byteEnd) or 12 (byteEnd + cumTf)
+  static constexpr int32_t L1_PERIOD = 32;
+  static constexpr int32_t L1_DOCS = L1_PERIOD * Postings::DOCS_BLOCK_SIZE;
 
+  int32_t numDocBlocks = 0;
+  int32_t numDocGroups = 0;
+  int32_t nextL0Block = 0;     // block whose header is at docIS, unless bodyReady is true
+  uint32_t nextL0Base = 0;     // last doc before nextL0Block
+  int64_t nextL0CumTf = 0;     // cumulative tf before nextL0Block
+  int32_t nextL1Group = 0;     // group whose header is next when nextL0Block is on a group boundary
+  uint32_t nextL1Base = 0;     // last doc before nextL1Group
+  int64_t nextL1CumTf = 0;     // cumulative tf before nextL1Group
+  bool bodyReady = false;      // docIS already points at the current block body after an L0 walk
 
   int32_t db[Postings::DOCS_BLOCK_SIZE];  // temporary...
   int32_t pb[Postings::POSITIONS_BLOCK_SIZE];
@@ -76,6 +82,30 @@ class DocsEnum {
     // A ttf of 127 means we don't have a full block... so return -1.
     // A ttf of 128 through (128+127) means ords 0-127 are in first block and we would want to return 127.
     return (ttf & ~(Postings::POSITIONS_BLOCK_SIZE-1)) - 1;
+  }
+
+  static uint32_t readVint15(const char*& pos, const char* end) {
+    assert(pos + 2 <= end);
+    uint16_t s = (uint16_t) (uint8_t) pos[0] | (uint16_t) ((uint16_t) (uint8_t) pos[1] << 8);
+    pos += 2;
+    if ((s & 0x8000u) == 0) {
+      return s;
+    }
+    return (s & 0x7fffu) | (InputStream::readVint(pos, end) << 15);
+  }
+
+  static uint64_t readVlong15(const char*& pos, const char* end) {
+    assert(pos + 2 <= end);
+    uint16_t s = (uint16_t) (uint8_t) pos[0] | (uint16_t) ((uint16_t) (uint8_t) pos[1] << 8);
+    pos += 2;
+    if ((s & 0x8000u) == 0) {
+      return s;
+    }
+    return (s & 0x7fffull) | (InputStream::readVlong(pos, end) << 15);
+  }
+
+  static bool isL1Boundary(int32_t block) {
+    return (block % L1_PERIOD) == 0;
   }
 
 public:
@@ -136,29 +166,20 @@ public:
       int64_t metaEnd = locOfDocsForTermBlock + cumulativeDocsSize - 1;  // the metaSize byte
       docIS.seek(metaEnd);
       uint8_t metaSize = docIS.readByte();
-      int64_t metadataStart = metaEnd - metaSize;
+      metadataStart = metaEnd - metaSize;
       docIS.seek(metadataStart); // move to start of metadata
       // Per-term metadata is level-dependent (see PostingsWriter::endTerm): docfreq always,
       // then ttfCode only when freqs are indexed, then posOffset only when positions are.
       docfreq = docIS.readVint();
       ttf = hasFreqs ? (docfreq + docIS.readVlong()) : docfreq;
       docBufEnd = 0;
+      numDocBlocks = (docfreq + Postings::DOCS_BLOCK_SIZE - 1) / Postings::DOCS_BLOCK_SIZE;
+      numDocGroups = (numDocBlocks + L1_PERIOD - 1) / L1_PERIOD;
 
       if (hasPositions) {
         auto posOffset = docIS.readVlong();
         posIS = postingsReader.getInputStream(fieldInfo.posLoc.filenum());
         posIS.seek(locOfPositionsForTermBlock + posOffset);
-      }
-
-      // Skip data sits immediately before metadata and has derived size:
-      // numSkipBlocks keys plus numSkipBlocks payloads.
-      if (docfreq >= Postings::DOCS_BLOCK_SIZE) {
-        numSkipBlocks = docfreq / Postings::DOCS_BLOCK_SIZE;
-        skipPayloadSize = hasPositions ? 12 : 4;  // byteEnd [+ cumTf]
-        uint32_t skipBytes = numSkipBlocks * (uint32_t) (sizeof(int32_t) + skipPayloadSize);
-        docIS.seek(metadataStart - skipBytes);
-        docSkipLastDoc = (const int32_t*) docIS.ptr();
-        docSkipPayload = docIS.ptr() + (size_t) numSkipBlocks * sizeof(int32_t);
       }
 
       // start of the actual docs is end of block - size
@@ -167,6 +188,13 @@ public:
 
       posBufEndDoc = posBufEnd = 0; // no positions read yet
       cumulativeTermFreq = 0;
+      nextL0Block = 0;
+      nextL0Base = 0;
+      nextL0CumTf = 0;
+      nextL1Group = 0;
+      nextL1Base = 0;
+      nextL1CumTf = 0;
+      bodyReady = false;
       // std::cout << "Normal posting" << std::endl;
     }
   }
@@ -228,9 +256,20 @@ public:
       // Cross-block delta base: the previous block's last id (still in docBuf,
       // not yet overwritten), or 0 for the first block.  Mirrors PostingsWriter
       // (full blocks via the docs codec, the partial tail via StreamVByte d1).
-      // Once skip data exists, a seek-to-block reads this base from the skip entry
-      // instead of the previous block.
       const uint32_t base = (docOrd == 0) ? 0 : (uint32_t) docBuf[Postings::DOCS_BLOCK_SIZE - 1];
+      const int32_t blockStartOrd = docOrd;
+      const int64_t blockStartCumTf = cumulativeTermFreq;
+
+      if (!bodyReady) {
+        if (isL1Boundary(nextL0Block)) {
+          auto groupHeaderLen = docIS.readVint();
+          docIS.skip(groupHeaderLen);
+        }
+        auto headerLen = docIS.readVint();
+        docIS.skip(headerLen);
+      } else {
+        bodyReady = false;
+      }
 
       // Since we only read whole blocks, simply comparing with number of docs left to read is sufficient.
       // If we start partial decoding of blocks (say because of skipping), then we would want something
@@ -255,6 +294,20 @@ public:
           tfreqBufEnd = Postings::DOCS_BLOCK_SIZE;
         }
         // std::cout << "read tfreq block: " << std::endl;
+        if (hasPositions) {
+          int64_t blockTfSum = 0;
+          for (int i = 0; i < Postings::DOCS_BLOCK_SIZE; i++) {
+            blockTfSum += tfreqBuf[i];
+          }
+          nextL0CumTf = blockStartCumTf + blockTfSum;
+        }
+        nextL0Base = (uint32_t) docBuf[Postings::DOCS_BLOCK_SIZE - 1];
+        nextL0Block = blockStartOrd / Postings::DOCS_BLOCK_SIZE + 1;
+        if (isL1Boundary(nextL0Block)) {
+          nextL1Group = nextL0Block / L1_PERIOD;
+          nextL1Base = nextL0Base;
+          nextL1CumTf = nextL0CumTf;
+        }
       } else {
         // StreamVByte tail layout written by PostingsWriter::endTerm:
         //   [docKeys][docData] followed, for fields with freqs, by [tfreqKeys][tfreqData].
@@ -274,6 +327,20 @@ public:
 
         docBufIdx = 0;
         docBufEnd = leftToRead;
+        if (hasPositions) {
+          int64_t blockTfSum = 0;
+          for (int i = 0; i < leftToRead; i++) {
+            blockTfSum += tfreqBuf[i];
+          }
+          nextL0CumTf = blockStartCumTf + blockTfSum;
+        }
+        nextL0Base = (uint32_t) docBuf[leftToRead - 1];
+        nextL0Block = blockStartOrd / Postings::DOCS_BLOCK_SIZE + 1;
+        if (isL1Boundary(nextL0Block)) {
+          nextL1Group = nextL0Block / L1_PERIOD;
+          nextL1Base = nextL0Base;
+          nextL1CumTf = nextL0CumTf;
+        }
 
       } // end decode tail
     }
@@ -303,38 +370,120 @@ public:
   // Reset the doc decoder to the block that may contain target.  Position state is
   // repaired by cumulativeTermFreq; the position stream itself stays lazy.
   void skipToBlock(int32_t target) {
-    const int32_t* keys = docSkipLastDoc;
-    const int32_t n = numSkipBlocks;
-    // DocsEnum is forward-only, so search from the current block instead of from 0.
-    int32_t startBlk = (docOrd - 1) / Postings::DOCS_BLOCK_SIZE;
-    if (startBlk < 0) startBlk = 0;
-    if (startBlk > n) startBlk = n;
-    int32_t bound = 1;
-    while (startBlk + bound < n && keys[startBlk + bound] < target) bound <<= 1;
-    int32_t loIdx = startBlk + (bound >> 1);
-    int32_t hiIdx = (startBlk + bound < n) ? startBlk + bound + 1 : n;
-    while (loIdx < hiIdx) {
-      int32_t mid = loIdx + ((hiIdx - loIdx) >> 1);
-      if (keys[mid] < target) loIdx = mid + 1; else hiIdx = mid;
+    const char* const streamStart = docIS.ptr(0);
+    const char* const end = docIS.ptr(metadataStart);
+    const char* p = docIS.ptr();
+    int32_t block = nextL0Block;
+    uint32_t prevLastDoc = nextL0Base;
+    int64_t cumTf = nextL0CumTf;
+
+    auto walkL0To = [&](int32_t maxBlock) -> bool {
+      while (block < maxBlock && block < numDocBlocks) {
+        uint32_t headerLen = InputStream::readVint(p, end);
+        const char* headerEnd = p + headerLen;
+        assert(headerEnd <= end);
+        uint32_t lastDocDelta = readVint15(p, headerEnd);
+        uint32_t blockLastDoc = prevLastDoc + lastDocDelta;
+        uint64_t blockByteLen = readVlong15(p, headerEnd);
+        int32_t blockDocCount = std::min(Postings::DOCS_BLOCK_SIZE,
+                                         docfreq - block * Postings::DOCS_BLOCK_SIZE);
+        int64_t blockTfSum = blockDocCount;
+        if (hasPositions) {
+          blockTfSum += InputStream::readVint(p, headerEnd);
+        }
+        assert(p == headerEnd);
+
+        const char* body = headerEnd;
+        if (target <= (int32_t) blockLastDoc) {
+          docIS.seek(body - streamStart);
+          docOrd = block * Postings::DOCS_BLOCK_SIZE;
+          tfreqOrd = docOrd;
+          cumulativeTermFreq = cumTf;  // restores position alignment; unused when !hasPositions
+          docBuf[Postings::DOCS_BLOCK_SIZE - 1] = (int32_t) prevLastDoc;
+          docBufIdx = docBufEnd = Postings::DOCS_BLOCK_SIZE;   // force a decode on the next nextDoc()
+          tfreqBufIdx = tfreqBufEnd = 0;
+          nextL0Block = block;
+          nextL0Base = prevLastDoc;
+          nextL0CumTf = cumTf;
+          if (isL1Boundary(block)) {
+            nextL1Group = block / L1_PERIOD;
+            nextL1Base = prevLastDoc;
+            nextL1CumTf = cumTf;
+          }
+          bodyReady = true;
+          return true;
+        }
+
+        p = body + (int64_t) blockByteLen;
+        assert(p <= end);
+        prevLastDoc = blockLastDoc;
+        cumTf += blockTfSum;
+        block++;
+      }
+      return false;
+    };
+
+    if (!isL1Boundary(block)) {
+      int32_t nextGroupBlock = ((block / L1_PERIOD) + 1) * L1_PERIOD;
+      if (walkL0To(nextGroupBlock)) {
+        return;
+      }
     }
-    int32_t lo = loIdx;
-    // lo == numSkipBlocks => target is past every full block: jump to the tail.
-    // Otherwise the state at the end of block lo-1 is the start of block lo.
-    int32_t base = 0;
-    uint32_t byteStart = 0;
-    int64_t cumTf = 0;
-    if (lo > 0) {
-      base = keys[lo - 1];
-      const char* p = docSkipPayload + (size_t) (lo - 1) * skipPayloadSize;
-      byteStart = *(const uint32_t*) p;
-      cumTf = hasPositions ? *(const int64_t*) (p + sizeof(int32_t)) : 0;
+
+    while (block < numDocBlocks) {
+      assert(isL1Boundary(block));
+      int32_t group = block / L1_PERIOD;
+      nextL1Group = group;
+      nextL1Base = prevLastDoc;
+      nextL1CumTf = cumTf;
+
+      uint32_t groupHeaderLen = InputStream::readVint(p, end);
+      const char* groupHeaderEnd = p + groupHeaderLen;
+      assert(groupHeaderEnd <= end);
+      uint32_t groupLastDocDelta = readVint15(p, groupHeaderEnd);
+      uint32_t groupLastDoc = prevLastDoc + groupLastDocDelta;
+      uint64_t groupByteLen = readVlong15(p, groupHeaderEnd);
+      int32_t groupBlockCount = std::min(L1_PERIOD, numDocBlocks - block);
+      int32_t groupDocCount = std::min(L1_DOCS, docfreq - group * L1_DOCS);
+      int64_t groupTfSum = groupDocCount;
+      if (hasPositions) {
+        groupTfSum += InputStream::readVint(p, groupHeaderEnd);
+      }
+      assert(p == groupHeaderEnd);
+
+      const char* groupBody = groupHeaderEnd;
+      if (target <= (int32_t) groupLastDoc) {
+        p = groupBody;
+        if (walkL0To(block + groupBlockCount)) {
+          return;
+        }
+        assert(false);
+        return;
+      }
+
+      p = groupBody + (int64_t) groupByteLen;
+      assert(p <= end);
+      prevLastDoc = groupLastDoc;
+      cumTf += groupTfSum;
+      block += groupBlockCount;
+      nextL1Group = block / L1_PERIOD;
+      nextL1Base = prevLastDoc;
+      nextL1CumTf = cumTf;
     }
-    docIS.seek(startOfDocs + byteStart);
-    docOrd = lo * Postings::DOCS_BLOCK_SIZE;
-    tfreqOrd = docOrd;
-    cumulativeTermFreq = cumTf;  // restores position alignment; unused when !hasPositions
-    docBuf[Postings::DOCS_BLOCK_SIZE - 1] = base;        // delta base read by nextDoc's decode
-    docBufIdx = docBufEnd = Postings::DOCS_BLOCK_SIZE;   // force a decode on the next nextDoc()
+
+    docIS.seek(p - streamStart);
+    docOrd = docfreq;
+    tfreqOrd = docfreq;
+    cumulativeTermFreq = cumTf;
+    docBufIdx = docBufEnd = 0;
+    tfreqBufIdx = tfreqBufEnd = 0;
+    nextL0Block = numDocBlocks;
+    nextL0Base = prevLastDoc;
+    nextL0CumTf = cumTf;
+    nextL1Group = numDocGroups;
+    nextL1Base = prevLastDoc;
+    nextL1CumTf = cumTf;
+    bodyReady = false;
   }
 
   // Strict (like the Scorer / Lucene PostingsEnum contract): target must be beyond
@@ -342,9 +491,7 @@ public:
   // ConstantScoreQuery, the column-join iterators.
   int32_t advance(int32_t target) {
     assert(docid < target);
-    // Once the tail has been entered there are no later skip entries; scanning
-    // avoids seeking back to the tail start and decoding it again.
-    if (docSkipLastDoc != nullptr && docOrd <= numSkipBlocks * Postings::DOCS_BLOCK_SIZE
+    if (nextL0Block < numDocBlocks
         && (docBufEnd == 0 || target > docBuf[docBufEnd - 1])) {
       skipToBlock(target);
     }
