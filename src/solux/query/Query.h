@@ -1,5 +1,6 @@
 #pragma once
 
+#include <limits>
 #include <memory>
 #include <solux/util/heap.h>
 #include "solux/util/MemPool.h"
@@ -461,6 +462,17 @@ public:
     virtual int32_t docId() = 0;
     /// term frequency for current doc
     virtual float score() = 0;
+    virtual void setMinCompetitiveScore(float minScore) {
+      unused(minScore);
+    }
+    virtual float getMaxScore(int32_t upTo) {
+      unused(upTo);
+      return std::numeric_limits<float>::infinity();
+    }
+    virtual int32_t advanceShallow(int32_t target) {
+      unused(target);
+      return PostingsReader::END;
+    }
 
     // NOTE: no virtual destructor, so subclasses should be made trivially destructible
   };

@@ -1,4 +1,5 @@
 #include <solux/query/AllQuery.h>
+#include <cmath>
 #include "gtest/gtest.h"
 #include "test/SoluxTest.h"
 #include "test/TestIndex.h"
@@ -584,4 +585,110 @@ TEST_F(TermScorerTest, normEncodingMonotone) {
   // The length effect is real (quantization didn't collapse it): the longest doc
   // scores strictly below the shortest. The pre-fix 256-token wrap inverted this.
   EXPECT_LT(scores.back(), scores.front());
+}
+
+TEST_F(TermScorerTest, termImpactMaxScoreBounds) {
+  const int32_t N = 5 * Postings::DOCS_BLOCK_SIZE + 17;
+  TestIndex testIndex;
+  TestField f(testIndex, "body_w");
+  f.startIndexing();
+
+  for (int32_t doc = 0; doc < N; doc++) {
+    int32_t tf = 1 + ((doc / Postings::DOCS_BLOCK_SIZE) * 3 + (doc % 5)) % 17;
+    int32_t len = 4 + ((doc * 11) % 90);
+    if (len < tf) {
+      len = tf;
+    }
+    std::string text;
+    for (int32_t i = 0; i < tf; i++) {
+      text += "impact ";
+    }
+    for (int32_t i = tf; i < len; i++) {
+      text += "filler ";
+    }
+    if (doc == 7) {
+      text += "rare ";
+    }
+    f.add(doc, text);
+  }
+  testIndex.flush();
+  f.startReading();
+
+  auto poolFree = testIndex.pool.rewindScopeGuard();
+  Query::Context qContext(testIndex.pool, *testIndex.reader);
+  TermQuery impactForBounds("body_w", "impact");
+  TermQuery impactForActuals("body_w", "impact");
+  auto* boundWeight = impactForBounds.createWeight(qContext, Query::NEED_SCORES);
+  auto* actualWeight = impactForActuals.createWeight(qContext, Query::NEED_SCORES);
+  auto& segment = qContext.topReader.segments()[0];
+
+  auto* actualScorer = dynamic_cast<TermQuery::Scorer*>(
+      actualWeight->createScorer(testIndex.pool, segment));
+  ASSERT_NE(actualScorer, nullptr);
+  std::vector<std::pair<int32_t, float>> actualScores;
+  for (int32_t doc = actualScorer->next(); doc != PostingsReader::END; doc = actualScorer->next()) {
+    actualScores.push_back({doc, actualScorer->score()});
+  }
+  ASSERT_EQ((int32_t) actualScores.size(), N);
+
+  auto actualMax = [&](int32_t current, int32_t upTo) {
+    float maxScore = 0.0f;
+    for (auto [doc, score] : actualScores) {
+      if (doc >= current && doc <= upTo) {
+        maxScore = std::max(maxScore, score);
+      }
+    }
+    return maxScore;
+  };
+
+  auto* scorer = dynamic_cast<TermQuery::Scorer*>(
+      boundWeight->createScorer(testIndex.pool, segment));
+  ASSERT_NE(scorer, nullptr);
+
+  auto assertBound = [&](int32_t upTo) {
+    float bound = scorer->getMaxScore(upTo);
+    ASSERT_TRUE(std::isfinite(bound)) << "upTo=" << upTo << " doc=" << scorer->docId();
+    EXPECT_GE(bound + 1e-6f, actualMax(scorer->docId(), upTo))
+        << "upTo=" << upTo << " doc=" << scorer->docId();
+  };
+
+  for (int32_t upTo : {0, 17, 127, 128, 255, 400, N - 1, PostingsReader::END}) {
+    assertBound(upTo);
+  }
+
+  ASSERT_EQ(scorer->advance(200), 200);
+  for (int32_t upTo : {200, 255, 511, N - 1, PostingsReader::END}) {
+    assertBound(upTo);
+  }
+
+  ASSERT_EQ(scorer->advance(600), 600);
+  for (int32_t upTo : {600, N - 1, PostingsReader::END}) {
+    assertBound(upTo);
+  }
+
+  auto* shallowScorer = dynamic_cast<TermQuery::Scorer*>(
+      boundWeight->createScorer(testIndex.pool, segment));
+  ASSERT_NE(shallowScorer, nullptr);
+  ASSERT_EQ(shallowScorer->docId(), -1);
+  auto expectedBlockLastDoc = [&](int32_t target) {
+    if (target >= N) {
+      return PostingsReader::END;
+    }
+    int32_t block = target / Postings::DOCS_BLOCK_SIZE;
+    return std::min(N - 1, (block + 1) * Postings::DOCS_BLOCK_SIZE - 1);
+  };
+  for (int32_t target : {0, 1, 127, 128, 129, 3 * Postings::DOCS_BLOCK_SIZE + 5, N - 1}) {
+    EXPECT_EQ(shallowScorer->advanceShallow(target), expectedBlockLastDoc(target)) << target;
+    EXPECT_EQ(shallowScorer->docId(), -1);
+  }
+  EXPECT_EQ(shallowScorer->advanceShallow(N + 10), PostingsReader::END);
+  EXPECT_EQ(shallowScorer->docId(), -1);
+
+  TermQuery rareQuery("body_w", "rare");
+  auto* rareWeight = rareQuery.createWeight(qContext, Query::NEED_SCORES);
+  auto* rareScorer = dynamic_cast<TermQuery::Scorer*>(
+      rareWeight->createScorer(testIndex.pool, segment));
+  ASSERT_NE(rareScorer, nullptr);
+  EXPECT_TRUE(std::isinf(rareScorer->getMaxScore(PostingsReader::END)));
+  EXPECT_EQ(rareScorer->advanceShallow(0), PostingsReader::END);
 }

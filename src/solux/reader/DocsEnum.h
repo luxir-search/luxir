@@ -517,10 +517,14 @@ public:
   // do not store impact fields, so their per-block maxTf and group span impacts are
   // synthesized as 1.
   void readBlockMaxTf(std::vector<int32_t>& blockMaxTf,
-                      std::vector<int32_t>* groupSpanImpacts = nullptr) const {
+                      std::vector<int32_t>* groupSpanImpacts = nullptr,
+                      std::vector<int32_t>* blockLastDocs = nullptr) const {
     blockMaxTf.resize(0);
     if (groupSpanImpacts != nullptr) {
       groupSpanImpacts->resize(0);
+    }
+    if (blockLastDocs != nullptr) {
+      blockLastDocs->resize(0);
     }
     if (docsSize == 0) {
       return;
@@ -529,6 +533,9 @@ public:
     blockMaxTf.reserve(numDocBlocks);
     if (groupSpanImpacts != nullptr) {
       groupSpanImpacts->reserve(numDocGroups);
+    }
+    if (blockLastDocs != nullptr) {
+      blockLastDocs->reserve(numDocBlocks);
     }
 
     const char* const end = docIS.ptr(metadataStart);
@@ -567,7 +574,7 @@ public:
         uint32_t headerLen = InputStream::readVint(p, groupEnd);
         const char* headerEnd = p + headerLen;
         assert(headerEnd <= groupEnd);
-        uint32_t blockLastDoc = prevBlockLastDoc + readVint15(p, headerEnd);
+        uint32_t blockLastDocValue = prevBlockLastDoc + readVint15(p, headerEnd);
         uint64_t blockByteLen = readVlong15(p, headerEnd);
         if (hasPositions) {
           auto blockCumTfDelta = InputStream::readVint(p, headerEnd);
@@ -579,9 +586,12 @@ public:
         }
         assert(p == headerEnd);
         blockMaxTf.push_back(maxTf);
+        if (blockLastDocs != nullptr) {
+          blockLastDocs->push_back((int32_t) blockLastDocValue);
+        }
         p = headerEnd + (int64_t) blockByteLen;
         assert(p <= groupEnd);
-        prevBlockLastDoc = blockLastDoc;
+        prevBlockLastDoc = blockLastDocValue;
       }
 
       assert(p == groupEnd);

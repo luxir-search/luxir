@@ -1,6 +1,9 @@
 #pragma once
 
+#include <algorithm>
+#include <limits>
 #include <optional>
+#include <vector>
 
 #include "Query.h"
 #include "solux/reader/IntColReader.h"
@@ -72,7 +75,7 @@ public:
       auto* segFieldInfo = cachedFieldInfo->segInfos[segment.ord]; // this segFieldInfo can't be null at this point
       solux::IntColReader* normsReader = targetPool.make<solux::IntColReader>(segment.postingsReader(),
                                                                               *segFieldInfo);
-      return targetPool.make<TermQuery::Scorer>(*docsEnum, normsReader, cachedTermInfo->simScorer);
+      return targetPool.make<TermQuery::Scorer>(targetPool, *docsEnum, normsReader, cachedTermInfo->simScorer);
     }
 
     // Per-segment supplier that exposes the term's real cost (its number of docs
@@ -111,12 +114,71 @@ public:
     // Both absent when scores are not needed; score() is 0.
     std::optional<solux::IntColReader::Iterator> normsIter;
     solux::Similarity::BM25Scorer* simScorer;
+    int32_t impactBlockCount = 0;
+    int32_t* impactLastDoc = nullptr;
+    float* blockImpact = nullptr;
+    float* maxImpactFrom = nullptr;
+    float minCompetitiveScore = 0.0f;
+    int32_t shallowBlock = -1;
 
     Scorer(solux::DocsEnum& docsEnum, solux::IntColReader* normsReader, solux::Similarity::BM25Scorer* simScorer)
             : docsEnum(docsEnum), simScorer(simScorer) {
       // Scoring needs both BM25 and norms, or neither.
       assert((simScorer == nullptr) == (normsReader == nullptr));
       if (normsReader != nullptr) normsIter.emplace(*normsReader);
+    }
+
+    Scorer(solux::MemPool& pool, solux::DocsEnum& docsEnum, solux::IntColReader* normsReader,
+           solux::Similarity::BM25Scorer* simScorer)
+            : Scorer(docsEnum, normsReader, simScorer) {
+      buildImpacts(pool, normsReader);
+    }
+
+    bool hasImpacts() const {
+      return impactBlockCount > 0;
+    }
+
+    void buildImpacts(solux::MemPool& pool, solux::IntColReader* normsReader) {
+      if (simScorer == nullptr || normsReader == nullptr) {
+        return;
+      }
+      int64_t minNorm = normsReader->getMin();
+      if (minNorm < 0 || minNorm > 255) {
+        return;
+      }
+
+      std::vector<int32_t> blockMaxTf;
+      std::vector<int32_t> blockLastDoc;
+      docsEnum.readBlockMaxTf(blockMaxTf, nullptr, &blockLastDoc);
+      if (blockMaxTf.empty()) {
+        return;
+      }
+      assert(blockMaxTf.size() == blockLastDoc.size());
+
+      impactBlockCount = (int32_t) blockMaxTf.size();
+      impactLastDoc = pool.make_arr<int32_t>((size_t) impactBlockCount);
+      blockImpact = pool.make_arr<float>((size_t) impactBlockCount);
+      maxImpactFrom = pool.make_arr<float>((size_t) impactBlockCount);
+
+      for (int32_t i = 0; i < impactBlockCount; i++) {
+        impactLastDoc[i] = blockLastDoc[i];
+        blockImpact[i] = simScorer->score((float) blockMaxTf[i], minNorm);
+      }
+      float suffixMax = 0.0f;
+      for (int32_t i = impactBlockCount - 1; i >= 0; i--) {
+        suffixMax = std::max(suffixMax, blockImpact[i]);
+        maxImpactFrom[i] = suffixMax;
+      }
+    }
+
+    int32_t blockContaining(int32_t target) const {
+      if (!hasImpacts()) {
+        return impactBlockCount;
+      }
+      int32_t* begin = impactLastDoc;
+      int32_t* end = impactLastDoc + impactBlockCount;
+      int32_t* it = std::lower_bound(begin, end, target);
+      return (int32_t) (it - begin);
     }
 
     int32_t next() override {
@@ -140,6 +202,49 @@ public:
       assert(normDoc == docid);
       auto encodedNorm = normsIter->value();
       return simScorer->score((float) tf, encodedNorm);
+    }
+
+    void setMinCompetitiveScore(float minScore) override {
+      minCompetitiveScore = minScore;
+    }
+
+    float getMaxScore(int32_t upTo) override {
+      if (!hasImpacts()) {
+        return std::numeric_limits<float>::infinity();
+      }
+
+      int32_t curBlock = blockContaining(docsEnum.docId());
+      if (curBlock >= impactBlockCount) {
+        return std::numeric_limits<float>::infinity();
+      }
+
+      int32_t upBlock = blockContaining(upTo);
+      if (upBlock >= impactBlockCount) {
+        upBlock = impactBlockCount - 1;
+      }
+      if (upBlock < curBlock) {
+        return std::numeric_limits<float>::infinity();
+      }
+      if (upBlock == impactBlockCount - 1) {
+        return maxImpactFrom[curBlock];
+      }
+
+      float maxScore = 0.0f;
+      for (int32_t i = curBlock; i <= upBlock; i++) {
+        maxScore = std::max(maxScore, blockImpact[i]);
+      }
+      return maxScore;
+    }
+
+    int32_t advanceShallow(int32_t target) override {
+      if (!hasImpacts()) {
+        return PostingsReader::END;
+      }
+      shallowBlock = blockContaining(target);
+      if (shallowBlock >= impactBlockCount) {
+        return PostingsReader::END;
+      }
+      return impactLastDoc[shallowBlock];
     }
 
     /// term frequency for current doc
