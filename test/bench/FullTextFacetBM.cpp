@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <bit>
 #include <charconv>
 #include <cmath>
 #include <string>
@@ -9,6 +10,8 @@
 #include "bench/solux_bench.h"
 #include "test/CollectionHelper.h"
 #include "test/LocalReq.h"
+#include "solux/query/TermQuery.h"
+#include "solux/search/Collector.h"
 
 using namespace solux;
 using namespace solux::test;
@@ -67,6 +70,75 @@ struct ZipfTable {
 
 constexpr int kBodyVocab = 50000;  // body_w vocabulary size
 constexpr double kZipfS = 1.0;     // ~natural-language exponent
+
+using ScoreDoc = TopDocsCollector::ScoreDoc;
+
+struct ScoreTopKResult {
+  int64_t visited = 0;
+  int64_t fp = 0;
+  std::vector<ScoreDoc> topDocs;
+};
+
+void sortScoreDocs(std::vector<ScoreDoc>& docs) {
+  std::sort(docs.begin(), docs.end(), [](const ScoreDoc& a, const ScoreDoc& b) {
+    if (a.score != b.score) {
+      return a.score > b.score;
+    }
+    return a.doc < b.doc;
+  });
+}
+
+int64_t scoreTopKFingerprint(std::span<const ScoreDoc> docs) {
+  int64_t ret = (int64_t) docs.size();
+  for (const auto& doc : docs) {
+    uint32_t scoreBits = std::bit_cast<uint32_t>(doc.score);
+    ret = ret * 31 + doc.doc.segment();
+    ret = ret * 31 + doc.doc.docId();
+    ret = ret * 31 + (int64_t) scoreBits;
+  }
+  return ret;
+}
+
+ScoreTopKResult runFullTextScoreTopK(IndexReader& reader, std::string_view qterm,
+                                     int32_t topK, bool skip) {
+  MemPool pool;
+  Query::Context qContext(pool, reader);
+  TermQuery query("body_w", qterm);
+  auto* weight = query.createWeight(qContext, Query::NEED_SCORES);
+  TopDocsCollector collector(topK);
+
+  auto segments = qContext.topReader.segments();
+  for (int32_t segnum = 0; segnum < (int32_t) segments.size(); segnum++) {
+    auto* scorer = weight->createScorer(pool, segments[segnum]);
+    if (scorer == nullptr) {
+      continue;
+    }
+    if (skip) {
+      scorer->setMinCompetitiveScore(collector.minCompetitiveVal);
+      collectTopK(segnum, scorer, nullptr, nullptr, collector);
+    } else {
+      for (int32_t doc = scorer->next(); doc != PostingsReader::END; doc = scorer->next()) {
+        collector.collect(segnum, doc, scorer->score());
+      }
+    }
+  }
+
+  ScoreTopKResult result;
+  result.visited = collector.totalHits();
+  auto topDocs = collector.sort();
+  result.topDocs.assign(topDocs.begin(), topDocs.end());
+  sortScoreDocs(result.topDocs);
+  result.fp = scoreTopKFingerprint(result.topDocs);
+  return result;
+}
+
+void assertSameTopK(const ScoreTopKResult& expected, const ScoreTopKResult& actual) {
+  ASSERT_EQ(actual.topDocs.size(), expected.topDocs.size());
+  for (size_t i = 0; i < expected.topDocs.size(); i++) {
+    ASSERT_EQ(actual.topDocs[i].doc, expected.topDocs[i].doc) << "i=" << i;
+    ASSERT_FLOAT_EQ(actual.topDocs[i].score, expected.topDocs[i].score) << "i=" << i;
+  }
+}
 
 }  // namespace
 
@@ -231,6 +303,62 @@ static void BM_FullTextFacet(benchmark::State& state, int64_t nDocs, std::string
   state.counters["RSS_max"] = mem.second / 1024;
 }
 
+//
+// Single-term relevance top-k over the same body_w full-text corpus.  skip=true
+// drives TermQuery through collectTopK so the collector threshold feeds the
+// scorer and enables Step 1 block skipping; skip=false exhaustively scores every
+// matching doc and never pushes a threshold.
+//
+static void BM_FullTextScoreTopK(benchmark::State& state, int64_t nDocs, std::string_view shape,
+                                 std::string_view qterm, bool skip) {
+  int mergeFactor = 10;  // TODO: actually get from IW?
+  constexpr int32_t topK = 100;
+
+  if (solux::unit_tests) {
+    nDocs = 200;
+  }
+
+  std::vector<int32_t> docsPerSeg;
+  CollectionHelper::calcSegSizes(nDocs, mergeFactor, shape, docsPerSeg);
+
+  CollectionHelper helper;
+  bool reuseIndex = helper.indexMatchesShape(docsPerSeg);
+  if (!reuseIndex) {
+    buildFullTextBenchIndex(helper, nDocs, docsPerSeg);
+  }
+
+  auto reader = helper.getIndexWriter()->getIndexReader();
+
+  ScoreTopKResult exhaustive = runFullTextScoreTopK(*reader, qterm, topK, false);
+  ScoreTopKResult pruned = runFullTextScoreTopK(*reader, qterm, topK, true);
+  assertSameTopK(exhaustive, pruned);
+
+  RSSWatcher watcher;
+
+  int64_t fp = -1;
+  int64_t visited = 0;
+  for (auto _ : state) {
+    ScoreTopKResult result = runFullTextScoreTopK(*reader, qterm, topK, skip);
+    benchmark::DoNotOptimize(result.fp);
+    benchmark::DoNotOptimize(result.visited);
+
+    if (fp != -1) {
+      ASSERT_EQ(fp, result.fp);
+    }
+    fp = result.fp;
+    visited = result.visited;
+  }
+
+  state.counters["fp"] = fp;
+  state.counters["visited"] = visited;
+  state.counters["skip"] = skip ? 1 : 0;
+  state.counters["reused"] = reuseIndex;
+  state.counters["rate"] = benchmark::Counter(state.iterations(), benchmark::Counter::kIsRate);
+  auto mem = watcher.getDeltaKB();
+  state.counters["RSS_delta"] = mem.first / 1024;
+  state.counters["RSS_max"] = mem.second / 1024;
+}
+
 
 constexpr int32_t nDocs = 1'000'000;
 constexpr const char* shape = "5555";  // ~5 segs of ~181K docs down to tiny sparse segs
@@ -246,3 +374,10 @@ SOLUX_BENCHMARK_CAPTURE(BM_FullTextFacet, mid_body,       nDocs, shape, "t100", 
 SOLUX_BENCHMARK_CAPTURE(BM_FullTextFacet, mid_body_para,  nDocs, shape, "t100",   true);
 SOLUX_BENCHMARK_CAPTURE(BM_FullTextFacet, tail_body,      nDocs, shape, "t10000", false);
 SOLUX_BENCHMARK_CAPTURE(BM_FullTextFacet, tail_body_para, nDocs, shape, "t10000", true);
+
+// Single-term relevance top-k A/B over the same full-text corpus, measuring the
+// Step 1 impact-skipping win on dense and mid-frequency terms.
+SOLUX_BENCHMARK_CAPTURE(BM_FullTextScoreTopK, head_skip,   nDocs, shape, "t0",   true);
+SOLUX_BENCHMARK_CAPTURE(BM_FullTextScoreTopK, head_noskip, nDocs, shape, "t0",   false);
+SOLUX_BENCHMARK_CAPTURE(BM_FullTextScoreTopK, mid_skip,    nDocs, shape, "t100", true);
+SOLUX_BENCHMARK_CAPTURE(BM_FullTextScoreTopK, mid_noskip,  nDocs, shape, "t100", false);
