@@ -144,6 +144,7 @@ message Query {
     KnnQuery knn = 6;               // approximate nearest-neighbor over a vector field
     ConstantScoreQuery constant_score = 7; // wraps a query and replaces each hit's score
     PrefixQuery prefix = 8;         // selects documents by term prefix
+    FuzzyQuery fuzzy = 9;           // selects documents by fuzzy (edit-distance) term match
 
     // TODO: a looser string match that will auto-convert to correct type
     // TODO: a text query type (parsed by QueryParser)
@@ -209,7 +210,7 @@ message Match {
   Val val = 2;   // if val is an Array, this could be used for TermsQuery as well...  how to tell if scoring or not though?
 
   // How to combine the multiple terms an analyzed text field can produce.
-  // Unset = OR.  Named after the Elasticsearch / OpenSearch match "operator".
+  // Unset = OR.  Named after the OpenSearch match "operator".
   Operator operator = 3;
 
   // Minimum number of the analyzed terms that must match (the OR..AND middle
@@ -244,6 +245,22 @@ message BooleanQuery {
 message PrefixQuery {
   string field = 1;
   string prefix = 2;
+}
+
+// Matches indexed terms within byte-wise Levenshtein distance of `term`.
+// The term is used verbatim. Scoring queries sum boosted BM25 term scores;
+// filter queries use constant scores.
+message FuzzyQuery {
+  string field = 1;
+  string term = 2;
+  // Maximum edit distance, 0..2. Unset = AUTO by term length:
+  // 0 for <=2 bytes, 1 for <=5, else 2.
+  int32 max_edits = 3;
+  // Leading bytes that must match exactly. Unset = 1; 0 = no required prefix.
+  int32 prefix_length = 4;
+  // Max scored term expansions, closest terms first. Unset = 50.
+  // Non-scoring filters are uncapped.
+  int32 max_expansions = 5;
 }
 
 message PhraseQuery {

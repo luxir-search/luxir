@@ -27,6 +27,10 @@ public:
     return term;
   }
 
+  float getBoost() const {
+    return boost;
+  }
+
   TermQuery::Weight* createWeight(Context& context, int32_t flags) override {
     return context.pool.make<TermQuery::Weight>(context, *this, flags);
   }
@@ -69,13 +73,14 @@ public:
 
       if ((inputFlags & NEED_SCORES) == 0) {
         // Matching does not need norms or BM25 when score() is never read.
-        return targetPool.make<TermQuery::Scorer>(*docsEnum, nullptr, nullptr);
+        return targetPool.make<TermQuery::Scorer>(*docsEnum, nullptr, nullptr, query.getBoost());
       }
 
       auto* segFieldInfo = cachedFieldInfo->segInfos[segment.ord]; // this segFieldInfo can't be null at this point
       solux::IntColReader* normsReader = targetPool.make<solux::IntColReader>(segment.postingsReader(),
                                                                               *segFieldInfo);
-      return targetPool.make<TermQuery::Scorer>(targetPool, *docsEnum, normsReader, cachedTermInfo->simScorer);
+      return targetPool.make<TermQuery::Scorer>(targetPool, *docsEnum, normsReader,
+                                                cachedTermInfo->simScorer, query.getBoost());
     }
 
     // Per-segment supplier that exposes the term's real cost (its number of docs
@@ -120,17 +125,20 @@ public:
     float* maxImpactFrom = nullptr;
     float minCompetitiveScore = 0.0f;
     int32_t shallowBlock = -1;
+    // Query-time multiplier for boosted term clauses, e.g. fuzzy rewrites.
+    float boost;
 
-    Scorer(solux::DocsEnum& docsEnum, solux::IntColReader* normsReader, solux::Similarity::BM25Scorer* simScorer)
-            : docsEnum(docsEnum), simScorer(simScorer) {
+    Scorer(solux::DocsEnum& docsEnum, solux::IntColReader* normsReader,
+           solux::Similarity::BM25Scorer* simScorer, float boost = 1.0f)
+            : docsEnum(docsEnum), simScorer(simScorer), boost(boost) {
       // Scoring needs both BM25 and norms, or neither.
       assert((simScorer == nullptr) == (normsReader == nullptr));
       if (normsReader != nullptr) normsIter.emplace(*normsReader);
     }
 
     Scorer(solux::MemPool& pool, solux::DocsEnum& docsEnum, solux::IntColReader* normsReader,
-           solux::Similarity::BM25Scorer* simScorer)
-            : Scorer(docsEnum, normsReader, simScorer) {
+           solux::Similarity::BM25Scorer* simScorer, float boost = 1.0f)
+            : Scorer(docsEnum, normsReader, simScorer, boost) {
       buildImpacts(pool, normsReader);
     }
 
@@ -162,7 +170,7 @@ public:
 
       for (int32_t i = 0; i < impactBlockCount; i++) {
         impactLastDoc[i] = blockLastDoc[i];
-        blockImpact[i] = simScorer->score((float) blockMaxTf[i], minNorm);
+        blockImpact[i] = boost * simScorer->score((float) blockMaxTf[i], minNorm);
       }
       float suffixMax = 0.0f;
       for (int32_t i = impactBlockCount - 1; i >= 0; i--) {
@@ -201,7 +209,7 @@ public:
       int32_t normDoc = normsIter->advance(docid);
       assert(normDoc == docid);
       auto encodedNorm = normsIter->value();
-      return simScorer->score((float) tf, encodedNorm);
+      return boost * simScorer->score((float) tf, encodedNorm);
     }
 
     void setMinCompetitiveScore(float minScore) override {

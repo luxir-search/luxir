@@ -103,6 +103,18 @@ public:
     return *this;
   }
 
+  // Add a fuzzy query. Negative maxEdits/prefixLength leaves that field unset.
+  LocalReq& fuzzyQuery(std::string_view field, std::string_view term, int maxEdits = -1,
+                       int prefixLength = -1, int maxExpansions = 0, std::string_view opName = "q") {
+    auto& query = *topDocs(opName).mutable_query()->mutable_fuzzy();
+    query.set_field(field);
+    query.set_term(term);
+    if (maxEdits >= 0) query.set_max_edits(maxEdits);
+    if (prefixLength >= 0) query.set_prefix_length(prefixLength);
+    if (maxExpansions > 0) query.set_max_expansions(maxExpansions);
+    return *this;
+  }
+
   // Add a phrase query (un-analyzed word list) to a top_docs operation
   LocalReq& phraseQuery(std::string_view field, std::initializer_list<std::string> words, std::string_view opName = "q") {
     auto& query = *topDocs(opName).mutable_query()->mutable_phrase();

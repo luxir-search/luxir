@@ -2,6 +2,7 @@
 
 #include <cstring>
 #include <format>
+#include <optional>
 #include <span>
 #include <stdexcept>
 #include <string_view>
@@ -9,6 +10,7 @@
 
 #include "solux/analysis/Analyzer.h"
 #include "solux/query/BooleanQuery.h"
+#include "solux/query/FuzzyQuery.h"
 #include "solux/query/MatchNoDocsQuery.h"
 #include "solux/query/PhraseQuery.h"
 #include "solux/query/PrefixQuery.h"
@@ -69,7 +71,7 @@ class QueryBuilder {
 
 public:
   // How the multiple terms an analyzed text field produces are combined.
-  // Mirrors the Elasticsearch / OpenSearch match "operator".
+  // Mirrors the OpenSearch match "operator".
   enum class Operator { OR, AND };
 
   QueryBuilder(MemPool& pool, Schema& schema) : pool(pool), schema(schema) {}
@@ -90,6 +92,49 @@ public:
       default:
         throw std::runtime_error(std::format("Prefix query on unsupported field type: {}", field));
     }
+  }
+
+  // OpenSearch-style AUTO fuzziness by byte length.
+  static int autoMaxEdits(size_t termLen) {
+    if (termLen <= 2) return 0;
+    if (termLen <= 5) return 1;
+    return 2;
+  }
+
+  // Build a fuzzy query over term-backed fields. The term is not analyzed.
+  // Defaults: maxEdits = AUTO, prefixLength = 1, maxExpansions = 50.
+  Query* createFuzzyQuery(std::string_view field, std::string_view term,
+                          std::optional<int> maxEdits = std::nullopt,
+                          std::optional<int> prefixLength = std::nullopt,
+                          int maxExpansions = 0) {
+    FieldType& fieldType = *schema.getFieldTypeEx(field);
+    switch (fieldType.type()) {
+      case FieldType::Type::TEXT:
+      case FieldType::Type::ID:
+      case FieldType::Type::STRING:
+        break;
+      default:
+        throw std::runtime_error(std::format("Fuzzy query on unsupported field type: {}", field));
+    }
+    int resolvedEdits;
+    if (!maxEdits) {
+      resolvedEdits = autoMaxEdits(term.size());
+    } else if (*maxEdits < 0 || *maxEdits > 2) {
+      // Keep fuzzy within the common 0..2 range; wider scans get expensive fast.
+      throw std::runtime_error(std::format("Fuzzy query max_edits must be 0..2 (got {})", *maxEdits));
+    } else {
+      resolvedEdits = *maxEdits;
+    }
+    // The default prefix limits scans; explicit 0 allows a full-field scan.
+    int resolvedPrefix = prefixLength.value_or(1);
+    if (resolvedPrefix < 0) {
+      throw std::runtime_error(
+        std::format("Fuzzy query prefix_length must not be negative (got {})", resolvedPrefix));
+    }
+    if (maxExpansions <= 0) {
+      maxExpansions = 50;  // Lucene's default fuzzy expansion cap
+    }
+    return pool.make<FuzzyQuery>(field, term, resolvedEdits, resolvedPrefix, maxExpansions);
   }
 
   // Build a match query for `field` against raw value `value`.

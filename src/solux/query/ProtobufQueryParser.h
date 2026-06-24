@@ -119,6 +119,16 @@ public:
     return builder.createPrefixQuery(prefixQuery.field(), prefixQuery.prefix());
   }
 
+  solux::Query* parseFuzzy(const solux::proto::FuzzyQuery& fuzzyQuery) {
+    QueryBuilder builder(pool, schema);
+    std::optional<int> maxEdits = fuzzyQuery.has_max_edits()
+        ? std::optional<int>(fuzzyQuery.max_edits()) : std::nullopt;
+    std::optional<int> prefixLength = fuzzyQuery.has_prefix_length()
+        ? std::optional<int>(fuzzyQuery.prefix_length()) : std::nullopt;
+    return builder.createFuzzyQuery(fuzzyQuery.field(), fuzzyQuery.term(),
+                                    maxEdits, prefixLength, fuzzyQuery.max_expansions());
+  }
+
   solux::Query* parseKnn(const solux::proto::KnnQuery& knnQuery) {
     std::string_view field = knnQuery.field();
     FieldType& fieldType = *schema.getFieldTypeEx(field);
@@ -223,6 +233,9 @@ public:
       }
       case solux::proto::Query::kPrefix: {
         return parsePrefix(pquery.prefix());
+      }
+      case solux::proto::Query::kFuzzy: {
+        return parseFuzzy(pquery.fuzzy());
       }
       case solux::proto::Query::kAll: {
         return pool.make<solux::AllQuery>();
