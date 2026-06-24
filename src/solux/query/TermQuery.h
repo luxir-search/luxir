@@ -189,8 +189,35 @@ public:
       return (int32_t) (it - begin);
     }
 
+    int32_t skipNonCompetitiveBlocks(int32_t doc) {
+      if (!hasImpacts() || !(minCompetitiveScore > 0.0f)) {
+        return doc;
+      }
+      while (doc != PostingsReader::END) {
+        int32_t block = blockContaining(doc);
+        if (block >= impactBlockCount) {
+          return doc;
+        }
+        if (maxImpactFrom[block] < minCompetitiveScore) {
+          return PostingsReader::END;
+        }
+        if (blockImpact[block] >= minCompetitiveScore) {
+          return doc;
+        }
+        if (impactLastDoc[block] >= PostingsReader::END - 1) {
+          return PostingsReader::END;
+        }
+        int32_t target = impactLastDoc[block] + 1;
+        if (target <= doc) {
+          return doc;
+        }
+        doc = docsEnum.advance(target);
+      }
+      return doc;
+    }
+
     int32_t next() override {
-      return docsEnum.nextDoc();
+      return skipNonCompetitiveBlocks(docsEnum.nextDoc());
     }
 
     int32_t advance(int32_t target) override {

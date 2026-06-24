@@ -6,6 +6,7 @@
 #include "solux/query/TermQuery.h"
 #include "solux/query/PhraseQuery.h"
 #include "solux/query/BooleanQuery.h"
+#include "solux/search/Collector.h"
 
 
 using namespace solux;
@@ -691,4 +692,68 @@ TEST_F(TermScorerTest, termImpactMaxScoreBounds) {
   ASSERT_NE(rareScorer, nullptr);
   EXPECT_TRUE(std::isinf(rareScorer->getMaxScore(PostingsReader::END)));
   EXPECT_EQ(rareScorer->advanceShallow(0), PostingsReader::END);
+}
+
+TEST_F(TermScorerTest, termImpactTopKSkippingMatchesExhaustive) {
+  const int32_t N = 6 * Postings::DOCS_BLOCK_SIZE + 17;
+  TestIndex testIndex;
+  TestField f(testIndex, "body_w");
+  f.startIndexing();
+
+  for (int32_t doc = 0; doc < N; doc++) {
+    int32_t tf;
+    int32_t len;
+    if (doc < Postings::DOCS_BLOCK_SIZE) {
+      tf = 24 + (doc % 29);
+      len = tf + (doc % 11);
+    } else {
+      tf = 1;
+      len = 180 + (doc % 37);
+    }
+    std::string text;
+    for (int32_t i = 0; i < tf; i++) {
+      text += "impactskip ";
+    }
+    for (int32_t i = tf; i < len; i++) {
+      text += "filler ";
+    }
+    f.add(doc, text);
+  }
+  testIndex.flush();
+  f.startReading();
+
+  auto poolFree = testIndex.pool.rewindScopeGuard();
+  Query::Context qContext(testIndex.pool, *testIndex.reader);
+  auto& segment = qContext.topReader.segments()[0];
+
+  for (int32_t k : {1, 5, 50}) {
+    TermQuery exhaustiveQuery("body_w", "impactskip");
+    TermQuery prunedQuery("body_w", "impactskip");
+    auto* exhaustiveWeight = exhaustiveQuery.createWeight(qContext, Query::NEED_SCORES);
+    auto* prunedWeight = prunedQuery.createWeight(qContext, Query::NEED_SCORES);
+
+    auto* exhaustiveScorer = dynamic_cast<TermQuery::Scorer*>(
+        exhaustiveWeight->createScorer(testIndex.pool, segment));
+    ASSERT_NE(exhaustiveScorer, nullptr);
+    TopDocsCollector exhaustiveCollector(k);
+    for (int32_t doc = exhaustiveScorer->next(); doc != PostingsReader::END; doc = exhaustiveScorer->next()) {
+      exhaustiveCollector.collect(0, doc, exhaustiveScorer->score());
+    }
+    ASSERT_EQ(exhaustiveCollector.totalHits(), N);
+
+    auto* prunedScorer = dynamic_cast<TermQuery::Scorer*>(
+        prunedWeight->createScorer(testIndex.pool, segment));
+    ASSERT_NE(prunedScorer, nullptr);
+    TopDocsCollector prunedCollector(k);
+    collectTopK(0, prunedScorer, nullptr, nullptr, prunedCollector);
+
+    auto expected = exhaustiveCollector.sort();
+    auto actual = prunedCollector.sort();
+    ASSERT_EQ(actual.size(), expected.size()) << "k=" << k;
+    for (size_t i = 0; i < expected.size(); i++) {
+      EXPECT_EQ(actual[i].doc, expected[i].doc) << "k=" << k << " i=" << i;
+      EXPECT_FLOAT_EQ(actual[i].score, expected[i].score) << "k=" << k << " i=" << i;
+    }
+    EXPECT_LT(prunedCollector.totalHits(), exhaustiveCollector.totalHits()) << "k=" << k;
+  }
 }

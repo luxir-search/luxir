@@ -290,6 +290,18 @@ public:
 template <typename Collector>
 void collectTopK(int32_t segnum, Query::Scorer* scorer, DocSet* filter,
                  DocSetBuilder* builder, Collector& collector) {
+  float lastPushedMinCompetitiveScore = std::numeric_limits<float>::lowest();
+  auto pushMinCompetitiveScore = [&]() {
+    if constexpr (requires { collector.minCompetitiveVal; }) {
+      if (builder == nullptr && collector.minCompetitiveVal > lastPushedMinCompetitiveScore) {
+        scorer->setMinCompetitiveScore(collector.minCompetitiveVal);
+        lastPushedMinCompetitiveScore = collector.minCompetitiveVal;
+      }
+    } else {
+      unused(lastPushedMinCompetitiveScore);
+    }
+  };
+
   if (filter == nullptr || filter->type == DocSet::BITSET) {
     BitDocSet* bitDocs = (BitDocSet*)filter;
     auto* domainBits = bitDocs ? &bitDocs->bits() : nullptr;
@@ -306,6 +318,7 @@ void collectTopK(int32_t segnum, Query::Scorer* scorer, DocSet* filter,
       }
       auto score = scorer->score();
       collector.collect(segnum, doc, score);
+      pushMinCompetitiveScore();
     }
   } else {
     assert(filter->type == DocSet::ARRAY);
@@ -322,6 +335,7 @@ void collectTopK(int32_t segnum, Query::Scorer* scorer, DocSet* filter,
       }
       auto score = scorer->score();
       collector.collect(segnum, doc, score);
+      pushMinCompetitiveScore();
     }
   }
 }
