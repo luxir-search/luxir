@@ -150,18 +150,20 @@ public:
       if (simScorer == nullptr || normsReader == nullptr) {
         return;
       }
-      int64_t minNorm = normsReader->getMin();
-      if (minNorm < 0 || minNorm > 255) {
-        return;
-      }
 
+      // T1 corner bound: evaluate each block's impact at its own (maxTf, minNorm) corner.
+      // minNorm is the block's minimum encoded norm byte (shortest doc, score-maximizing),
+      // tighter than the field-global IntColReader::getMin() used for T0.  normsReader != null
+      // implies a TEXT field, which stores per-block minNorm (2a), so blockMinNorm is real here.
       std::vector<int32_t> blockMaxTf;
       std::vector<int32_t> blockLastDoc;
-      docsEnum.readBlockMaxTf(blockMaxTf, nullptr, &blockLastDoc);
+      std::vector<int32_t> blockMinNorm;
+      docsEnum.readBlockMaxTf(blockMaxTf, nullptr, &blockLastDoc, &blockMinNorm);
       if (blockMaxTf.empty()) {
         return;
       }
       assert(blockMaxTf.size() == blockLastDoc.size());
+      assert(blockMaxTf.size() == blockMinNorm.size());
 
       impactBlockCount = (int32_t) blockMaxTf.size();
       impactLastDoc = pool.make_arr<int32_t>((size_t) impactBlockCount);
@@ -170,7 +172,7 @@ public:
 
       for (int32_t i = 0; i < impactBlockCount; i++) {
         impactLastDoc[i] = blockLastDoc[i];
-        blockImpact[i] = boost * simScorer->score((float) blockMaxTf[i], minNorm);
+        blockImpact[i] = boost * simScorer->score((float) blockMaxTf[i], (int64_t) blockMinNorm[i]);
       }
       float suffixMax = 0.0f;
       for (int32_t i = impactBlockCount - 1; i >= 0; i--) {
