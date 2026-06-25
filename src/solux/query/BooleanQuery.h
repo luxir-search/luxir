@@ -1,5 +1,7 @@
 #pragma once
 
+#include <cmath>
+
 #include "Query.h"
 #include "QueryPrep.h"
 
@@ -32,6 +34,7 @@ public:
     std::span<Query::Weight*> prohibitedWeights;
     std::span<Query::Weight*> filterWeights;
     int minShouldMatch = 0;
+    bool needsScores = false;
 
     // Returns a span of Weights, corresponding to the given span of Queries. Some weights can be null.
     std::span<Query::Weight*> createWeights(solux::MemPool& targetPool, Context& context,
@@ -123,7 +126,8 @@ public:
         std::span<Query::SegmentSource* const> optionalSources,
         std::span<Query::SegmentSource* const> prohibitedSources,
         std::span<Query::ScorerSupplier* const> filterSuppliers,
-        int minShouldMatch) {
+        int minShouldMatch,
+        bool needsScores) {
       Required req = assembleRequired(targetPool, segment, mandatorySources, filterSuppliers);
       if (req.unsatisfiable) return nullptr;
       Query::Scorer* reqScorer = req.scorer;
@@ -141,11 +145,17 @@ public:
       Query::Scorer* optScorer = nullptr;
       if (!optionalScorers.empty()) {
         int optCount = (int)optionalScorers.size();
+        bool useMaxScoreDisjunction = needsScores && reqScorer == nullptr
+          && prohibitedSources.empty() && minShouldMatch <= 1 && optCount >= 2;
         // minShouldMatch applies to optional scorers that exist in this segment.
         if (minShouldMatch <= 1) {
-          optScorer = optCount == 1
-            ? optionalScorers[0]
-            : targetPool.make<BooleanQuery::DisjunctionScorer>(targetPool, optionalScorers);
+          if (optCount == 1) {
+            optScorer = optionalScorers[0];
+          } else if (useMaxScoreDisjunction) {
+            optScorer = targetPool.make<BooleanQuery::MaxScoreDisjunctionScorer>(targetPool, optionalScorers);
+          } else {
+            optScorer = targetPool.make<BooleanQuery::DisjunctionScorer>(targetPool, optionalScorers);
+          }
         } else if (optCount == minShouldMatch) {
           // Every surviving optional clause is required and scores.
           optScorer = targetPool.make<BooleanQuery::ConjunctionScorer>(
@@ -262,16 +272,19 @@ public:
       std::span<Query::SegmentSource* const> prohibitedSources;
       std::span<Query::ScorerSupplier* const> filterSuppliers;
       int minShouldMatch;
+      bool needsScores;
     public:
       Supplier(MemPool& pool, IndexReader::Segment& segment,
                std::span<Query::SegmentSource* const> mandatorySources,
                std::span<Query::SegmentSource* const> optionalSources,
                std::span<Query::SegmentSource* const> prohibitedSources,
                std::span<Query::ScorerSupplier* const> filterSuppliers,
-               int minShouldMatch)
+               int minShouldMatch,
+               bool needsScores)
         : pool(pool), segment(segment), mandatorySources(mandatorySources),
           optionalSources(optionalSources), prohibitedSources(prohibitedSources),
-          filterSuppliers(filterSuppliers), minShouldMatch(minShouldMatch) {}
+          filterSuppliers(filterSuppliers), minShouldMatch(minShouldMatch),
+          needsScores(needsScores) {}
 
       int64_t cost() override {
         return compositeCost(pool, segment, mandatorySources, optionalSources, filterSuppliers, minShouldMatch);
@@ -280,7 +293,7 @@ public:
       Query::Scorer* get(MemPool& targetPool, int64_t leadCost) override {
         unused(leadCost);
         return assembleScorer(targetPool, segment, mandatorySources, optionalSources,
-                              prohibitedSources, filterSuppliers, minShouldMatch);
+                              prohibitedSources, filterSuppliers, minShouldMatch, needsScores);
       }
     };
 
@@ -291,18 +304,20 @@ public:
       std::vector<std::unique_ptr<DocSet>> filterDomains;
       bool hasFilters = false;
       int minShouldMatch = 0;
+      bool needsScores = false;
 
     public:
       BooleanPreparedWeight(std::vector<QueryPrep::PreparedSource>&& mandatorySources,
                             std::vector<QueryPrep::PreparedSource>&& optionalSources,
                             std::vector<QueryPrep::PreparedSource>&& prohibitedSources,
                             std::vector<std::unique_ptr<DocSet>>&& filterDomains,
-                            bool hasFilters, int minShouldMatch)
+                            bool hasFilters, int minShouldMatch, bool needsScores)
         : mandatorySources(std::move(mandatorySources)),
           optionalSources(std::move(optionalSources)),
           prohibitedSources(std::move(prohibitedSources)),
           filterDomains(std::move(filterDomains)),
-          hasFilters(hasFilters), minShouldMatch(minShouldMatch) {}
+          hasFilters(hasFilters), minShouldMatch(minShouldMatch),
+          needsScores(needsScores) {}
 
       Query::ScorerSupplier* scorerSupplier(MemPool& targetPool, IndexReader::Segment& segment) override {
         std::span<Query::ScorerSupplier*> filterSuppliers;
@@ -316,7 +331,7 @@ public:
           QueryPrep::segmentSources(targetPool, QueryPrep::preparedSpan(mandatorySources)),
           QueryPrep::segmentSources(targetPool, QueryPrep::preparedSpan(optionalSources)),
           QueryPrep::segmentSources(targetPool, QueryPrep::preparedSpan(prohibitedSources)),
-          filterSuppliers, minShouldMatch);
+          filterSuppliers, minShouldMatch, needsScores);
       }
 
       Query::Scorer* createScorer(MemPool& targetPool, IndexReader::Segment& segment) override {
@@ -327,6 +342,7 @@ public:
 
   public:
     Weight(Context& context, BooleanQuery& query, int32_t flags) : Query::Weight(context, flags) {
+      needsScores = (flags & Query::NEED_SCORES) != 0;
       // Only mandatory and optional clauses can contribute to score.
       int32_t noScore = flags & ~NEED_SCORES;
       mandatoryWeights = createWeights(context.pool, context, query.mandatory, flags);
@@ -380,7 +396,7 @@ public:
       return std::make_unique<BooleanPreparedWeight>(
         std::move(mandatorySources), std::move(optionalSources),
         std::move(prohibitedSources), std::move(filterDomains),
-        !filterSources.empty(), minShouldMatch);
+        !filterSources.empty(), minShouldMatch, needsScores);
     }
 
 
@@ -391,7 +407,7 @@ public:
       auto filterSources = QueryPrep::liveSources(targetPool, filterWeights);
       auto filterSuppliers = QueryPrep::collectSuppliers(targetPool, segment, filterSources);
       return targetPool.make<Supplier>(targetPool, segment, mandatorySources, optionalSources,
-                                       prohibitedSources, filterSuppliers, minShouldMatch);
+                                       prohibitedSources, filterSuppliers, minShouldMatch, needsScores);
     }
 
     Scorer* createScorer(solux::MemPool& targetPool, solux::IndexReader::Segment& segment) override {
@@ -645,6 +661,180 @@ public:
       return score;
     }
   }; // DisjunctionScorer
+
+
+  class MaxScoreDisjunctionScorer final : public Query::Scorer {
+    MemPool& pool;
+    std::span<Scorer*> scorers;
+    std::span<float> clauseMax;
+    std::span<Scorer*> essentialPointers;
+
+    // TODO: OPT: heapifying with virtual methods prob isn't a good idea... pull out and save the docid.
+    constexpr static auto idComparator = [](Query::Scorer& a, Query::Scorer& b) { return b.docId() < a.docId(); };
+
+    solux::IndirectPQ<Scorer, decltype(idComparator)>* pq = nullptr;
+
+    size_t splitIndex = 0;
+    float minCompetitiveScore = std::numeric_limits<float>::lowest();
+    int32_t docid = -1;
+    float currentScore = 0.0f;
+    int64_t visitedCandidates = 0;
+    int64_t nonEssentialLookups = 0;
+
+    static bool lessMaxScore(float a, float b) {
+      bool finiteA = std::isfinite(a);
+      bool finiteB = std::isfinite(b);
+      if (finiteA != finiteB) return finiteA;
+      return a < b;
+    }
+
+    void sortByClauseMax() {
+      for (size_t i = 1; i < scorers.size(); i++) {
+        Scorer* scorer = scorers[i];
+        float maxScore = clauseMax[i];
+        size_t j = i;
+        while (j > 0 && lessMaxScore(maxScore, clauseMax[j - 1])) {
+          scorers[j] = scorers[j - 1];
+          clauseMax[j] = clauseMax[j - 1];
+          j--;
+        }
+        scorers[j] = scorer;
+        clauseMax[j] = maxScore;
+      }
+    }
+
+    void rebuildEssentialHeap() {
+      size_t essentialCount = scorers.size() - splitIndex;
+      for (size_t i = 0; i < essentialCount; i++) {
+        essentialPointers[i] = scorers[splitIndex + i];
+      }
+      pq = pool.make<solux::IndirectPQ<Scorer, decltype(idComparator)>>(essentialPointers, essentialCount);
+    }
+
+    void updateSplit() {
+      // Accumulate the non-essential bound in double so the partition is conservatively
+      // sound: a float running sum could round down below the threshold and demote a clause
+      // whose exact max-sum still reaches it.  Summing the float clauseMax values in double
+      // is exact for any realistic clause count, so a clause is demoted only when the true
+      // sum of clause maxima is strictly below the competitive threshold.
+      double sum = 0.0;
+      size_t newSplit = 0;
+      for (; newSplit < scorers.size(); newSplit++) {
+        if (!std::isfinite(clauseMax[newSplit])) break;
+        double nextSum = sum + (double) clauseMax[newSplit];
+        if (!(nextSum < (double) minCompetitiveScore)) break;
+        sum = nextSum;
+      }
+      if (newSplit > splitIndex) {
+        splitIndex = newSplit;
+        rebuildEssentialHeap();
+      }
+    }
+
+    void scoreCurrentDoc() {
+      // Sum every matching clause in a single fixed pass over the (clauseMax-sorted) array,
+      // independent of splitIndex.  This keeps a doc's score a deterministic function of the
+      // doc (not of when the threshold happened to advance), so the pruned and exhaustive
+      // runs of this scorer produce bit-identical scores regardless of clause count.
+      float sum = 0.0f;
+      for (size_t i = 0; i < scorers.size(); i++) {
+        if (i < splitIndex) {
+          // Non-essential: not driven by the essential union, so seek it to docid.
+          nonEssentialLookups++;
+          if (scorers[i]->docId() < docid) {
+            scorers[i]->advance(docid);
+          }
+        }
+        if (scorers[i]->docId() == docid) {
+          sum += scorers[i]->score();
+        }
+      }
+      currentScore = sum;
+      visitedCandidates++;
+    }
+
+  public:
+    // The passed in span of scorers will be modified (rearranged).
+    MaxScoreDisjunctionScorer(solux::MemPool& pool, std::span<Scorer*> scorers)
+            : pool(pool),
+              scorers(scorers),
+              clauseMax(pool.make_arr<float>(scorers.size()), scorers.size()),
+              essentialPointers(pool.make_arr<Scorer*>(scorers.size()), scorers.size()) {
+      for (size_t i = 0; i < scorers.size(); i++) {
+        clauseMax[i] = scorers[i]->getMaxScore(PostingsReader::END);
+      }
+      sortByClauseMax();
+      rebuildEssentialHeap();
+    }
+
+    int32_t next() override {
+      assert(docid != solux::PostingsReader::END);
+      int32_t currid = docid;
+      for (;;) {
+        if (pq->size() == 0) {
+          docid = solux::PostingsReader::END;
+          currentScore = 0.0f;
+          return docid;
+        }
+        int32_t topDoc = pq->top().docId();
+        if (topDoc == solux::PostingsReader::END) {
+          pq->removeTop();
+          continue;
+        }
+        if (topDoc <= currid) {
+          int32_t nextDoc = pq->top().next();
+          if (nextDoc == solux::PostingsReader::END) {
+            pq->removeTop();
+          } else {
+            pq->updateTop();
+          }
+          continue;
+        }
+        docid = pq->top().docId();
+        scoreCurrentDoc();
+        return docid;
+      }
+    }
+
+    int32_t docId() override {
+      return docid;
+    }
+
+    float score() override {
+      return currentScore;
+    }
+
+    void setMinCompetitiveScore(float minScore) override {
+      if (minScore > minCompetitiveScore) {
+        minCompetitiveScore = minScore;
+        updateSplit();
+      }
+    }
+
+    float getMaxScore(int32_t upTo) override {
+      float sum = 0.0f;
+      for (auto* scorer : scorers) {
+        float maxScore = scorer->getMaxScore(upTo);
+        if (!std::isfinite(maxScore)) {
+          return std::numeric_limits<float>::infinity();
+        }
+        sum += maxScore;
+      }
+      return sum;
+    }
+
+    int64_t visited() const {
+      return visitedCandidates;
+    }
+
+    int64_t nonEssentialLookupCount() const {
+      return nonEssentialLookups;
+    }
+
+    int32_t currentSplitIndex() const {
+      return (int32_t) splitIndex;
+    }
+  }; // MaxScoreDisjunctionScorer
 
 
   // Matches docs where at least `minMatch` of the sub-scorers match (the

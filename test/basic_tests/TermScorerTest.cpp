@@ -3,6 +3,8 @@
 #include "gtest/gtest.h"
 #include "test/SoluxTest.h"
 #include "test/TestIndex.h"
+#include "test/CollectionHelper.h"
+#include "test/LocalReq.h"
 #include "solux/query/TermQuery.h"
 #include "solux/query/PhraseQuery.h"
 #include "solux/query/BooleanQuery.h"
@@ -48,6 +50,121 @@ protected:
 
 
 };
+
+struct DisjunctionTopKRun {
+  int64_t visited = 0;
+  int64_t nonEssentialLookups = 0;
+  std::vector<TopDocsCollector::ScoreDoc> topDocs;
+};
+
+std::vector<TopDocsCollector::ScoreDoc> sortedCollectorDocs(TopDocsCollector& collector) {
+  auto docs = collector.sort();
+  std::vector<TopDocsCollector::ScoreDoc> out(docs.begin(), docs.end());
+  std::sort(out.begin(), out.end(), TopDocsCollector::scoreAndDocComp);
+  return out;
+}
+
+void addMaxScoreDisjunctionDocs(CollectionHelper& helper) {
+  const int32_t segDocs = Postings::DOCS_BLOCK_SIZE + 40;
+  const int32_t segCount = 3;
+  helper.clear();
+
+  for (int32_t seg = 0; seg < segCount; seg++) {
+    std::vector<Doc> docs;
+    docs.reserve(segDocs);
+    for (int32_t local = 0; local < segDocs; local++) {
+      int32_t doc = seg * segDocs + local;
+      std::string body = "common";
+      if (doc < 6) {
+        // Strictly decreasing rare tf (doc 0 has the most) with constant length:
+        // doc 0 alone maximizes the rare clause, so the top-k threshold stays
+        // strictly below the sum of clause maxima.  That keeps the rare clause
+        // essential while the near-zero-idf common clause is demoted, so the
+        // non-essential lookup path is actually exercised (partial demotion).
+        int32_t rareTf = 8 - doc;
+        for (int32_t i = 0; i < rareTf; i++) body += " rare";
+        for (int32_t i = rareTf; i < 8; i++) body += " pad";
+        body += " medium";
+      } else {
+        if ((doc % 9) == 0) body += " medium";
+        for (int32_t i = 0; i < 60; i++) body += " filler";
+      }
+      docs.push_back(flatdoc("id", "d" + std::to_string(doc), "body_w", body));
+    }
+    helper.indexAll(docs, UpdateMessage::COMMIT);
+  }
+}
+
+DisjunctionTopKRun runMaxScoreDisjunctionTopK(IndexReader& reader, int32_t topK) {
+  MemPool pool;
+  Query::Context qContext(pool, reader);
+  TermQuery common("body_w", "common");
+  TermQuery medium("body_w", "medium");
+  TermQuery rare("body_w", "rare");
+  std::vector<Query*> optional = {&common, &medium, &rare};
+  BooleanQuery query({}, optional, {}, {});
+  auto* weight = query.createWeight(qContext, Query::NEED_SCORES);
+  TopDocsCollector collector(topK);
+  DisjunctionTopKRun result;
+
+  auto segments = qContext.topReader.segments();
+  for (int32_t segnum = 0; segnum < (int32_t) segments.size(); segnum++) {
+    auto* scorer = weight->createScorer(pool, segments[segnum]);
+    if (scorer == nullptr) continue;
+    scorer->setMinCompetitiveScore(collector.minCompetitiveVal);
+    collectTopK(segnum, scorer, nullptr, nullptr, collector);
+    if (auto* maxScore = dynamic_cast<BooleanQuery::MaxScoreDisjunctionScorer*>(scorer)) {
+      result.nonEssentialLookups += maxScore->nonEssentialLookupCount();
+    }
+  }
+
+  result.visited = collector.totalHits();
+  result.topDocs = sortedCollectorDocs(collector);
+  return result;
+}
+
+DisjunctionTopKRun runExhaustiveDisjunctionTopK(IndexReader& reader, int32_t topK) {
+  MemPool pool;
+  Query::Context qContext(pool, reader);
+  TermQuery common("body_w", "common");
+  TermQuery medium("body_w", "medium");
+  TermQuery rare("body_w", "rare");
+  std::array<Query::Weight*, 3> weights = {
+    common.createWeight(qContext, Query::NEED_SCORES),
+    medium.createWeight(qContext, Query::NEED_SCORES),
+    rare.createWeight(qContext, Query::NEED_SCORES)
+  };
+  TopDocsCollector collector(topK);
+
+  auto segments = qContext.topReader.segments();
+  for (int32_t segnum = 0; segnum < (int32_t) segments.size(); segnum++) {
+    auto* arr = pool.make_arr<Query::Scorer*>(weights.size());
+    int32_t count = 0;
+    for (auto* weight : weights) {
+      auto* scorer = weight->createScorer(pool, segments[segnum]);
+      if (scorer != nullptr) arr[count++] = scorer;
+    }
+    if (count == 0) continue;
+    Query::Scorer* scorer = count == 1
+      ? arr[0]
+      : pool.make<BooleanQuery::DisjunctionScorer>(
+          pool, std::span<Query::Scorer*>(arr, (size_t) count));
+    collectTopK(segnum, scorer, nullptr, nullptr, collector, false);
+  }
+
+  DisjunctionTopKRun result;
+  result.visited = collector.totalHits();
+  result.topDocs = sortedCollectorDocs(collector);
+  return result;
+}
+
+void assertSameTopKDocs(const DisjunctionTopKRun& expected, const DisjunctionTopKRun& actual, int32_t topK) {
+  ASSERT_EQ(actual.topDocs.size(), expected.topDocs.size()) << "k=" << topK;
+  for (size_t i = 0; i < expected.topDocs.size(); i++) {
+    EXPECT_EQ(actual.topDocs[i].doc, expected.topDocs[i].doc) << "k=" << topK << " i=" << i;
+    EXPECT_FLOAT_EQ(actual.topDocs[i].score, expected.topDocs[i].score) << "k=" << topK << " i=" << i;
+  }
+}
 
 
 TEST_F(TermScorerTest, singleSeg) {
@@ -756,6 +873,27 @@ TEST_F(TermScorerTest, termImpactTopKSkippingMatchesExhaustive) {
     }
     EXPECT_LT(prunedCollector.totalHits(), exhaustiveCollector.totalHits()) << "k=" << k;
   }
+}
+
+TEST_F(TermScorerTest, maxScoreDisjunctionTopKMatchesExhaustive) {
+  CollectionHelper helper("main");
+  addMaxScoreDisjunctionDocs(helper);
+  auto reader = helper.getIndexWriter()->getIndexReader();
+  const int32_t totalDocs = 3 * (Postings::DOCS_BLOCK_SIZE + 40);
+
+  for (int32_t k : {3, totalDocs + 10}) {
+    auto expected = runExhaustiveDisjunctionTopK(*reader, k);
+    auto actual = runMaxScoreDisjunctionTopK(*reader, k);
+    assertSameTopKDocs(expected, actual, k);
+    if (k == 3) {
+      EXPECT_LT(actual.visited, expected.visited);
+      EXPECT_GT(actual.nonEssentialLookups, 0);
+    } else {
+      EXPECT_EQ(actual.visited, expected.visited);
+      EXPECT_EQ(actual.nonEssentialLookups, 0);
+    }
+  }
+  helper.clear();
 }
 
 // Regression for the 1f bug: impact block skipping under-counts the total hit count

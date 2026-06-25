@@ -10,6 +10,7 @@
 #include "bench/solux_bench.h"
 #include "test/CollectionHelper.h"
 #include "test/LocalReq.h"
+#include "solux/query/BooleanQuery.h"
 #include "solux/query/TermQuery.h"
 #include "solux/search/Collector.h"
 
@@ -75,6 +76,7 @@ using ScoreDoc = TopDocsCollector::ScoreDoc;
 
 struct ScoreTopKResult {
   int64_t visited = 0;
+  int64_t nonEssentialLookups = 0;
   int64_t fp = 0;
   std::vector<ScoreDoc> topDocs;
 };
@@ -125,6 +127,50 @@ ScoreTopKResult runFullTextScoreTopK(IndexReader& reader, std::string_view qterm
 
   ScoreTopKResult result;
   result.visited = collector.totalHits();
+  auto topDocs = collector.sort();
+  result.topDocs.assign(topDocs.begin(), topDocs.end());
+  sortScoreDocs(result.topDocs);
+  result.fp = scoreTopKFingerprint(result.topDocs);
+  return result;
+}
+
+ScoreTopKResult runFullTextScoreTopKDisjunction(IndexReader& reader,
+                                                std::string_view commonTerm,
+                                                std::string_view rareTerm,
+                                                int32_t topK,
+                                                bool skip) {
+  MemPool pool;
+  Query::Context qContext(pool, reader);
+  TermQuery common("body_w", commonTerm);
+  TermQuery rare("body_w", rareTerm);
+  std::vector<Query*> optional = {&common, &rare};
+  BooleanQuery query({}, optional, {}, {});
+  auto* weight = query.createWeight(qContext, Query::NEED_SCORES);
+  TopDocsCollector collector(topK);
+
+  int64_t nonEssentialLookups = 0;
+  auto segments = qContext.topReader.segments();
+  for (int32_t segnum = 0; segnum < (int32_t) segments.size(); segnum++) {
+    auto* scorer = weight->createScorer(pool, segments[segnum]);
+    if (scorer == nullptr) {
+      continue;
+    }
+    if (skip) {
+      scorer->setMinCompetitiveScore(collector.minCompetitiveVal);
+      collectTopK(segnum, scorer, nullptr, nullptr, collector);
+    } else {
+      for (int32_t doc = scorer->next(); doc != PostingsReader::END; doc = scorer->next()) {
+        collector.collect(segnum, doc, scorer->score());
+      }
+    }
+    if (auto* maxScore = dynamic_cast<BooleanQuery::MaxScoreDisjunctionScorer*>(scorer)) {
+      nonEssentialLookups += maxScore->nonEssentialLookupCount();
+    }
+  }
+
+  ScoreTopKResult result;
+  result.visited = collector.totalHits();
+  result.nonEssentialLookups = nonEssentialLookups;
   auto topDocs = collector.sort();
   result.topDocs.assign(topDocs.begin(), topDocs.end());
   sortScoreDocs(result.topDocs);
@@ -385,6 +431,69 @@ static void BM_FullTextScoreTopK(benchmark::State& state, int64_t nDocs, std::st
 }
 
 //
+// Pure disjunction relevance top-k over the same Zipfian body_w corpus.
+// skip=true lets MaxScore drop the frequent term from the essential union after
+// the collector threshold exceeds that term's global max score. skip=false is
+// the exhaustive OR baseline.
+//
+static void BM_FullTextScoreTopKDisjunction(benchmark::State& state, int64_t nDocs,
+                                            std::string_view shape,
+                                            std::string_view commonTerm,
+                                            std::string_view rareTerm,
+                                            bool skip) {
+  int mergeFactor = 10;  // TODO: actually get from IW?
+  constexpr int32_t topK = 100;
+
+  if (solux::unit_tests) {
+    nDocs = 200;
+  }
+
+  std::vector<int32_t> docsPerSeg;
+  CollectionHelper::calcSegSizes(nDocs, mergeFactor, shape, docsPerSeg);
+
+  CollectionHelper helper;
+  bool reuseIndex = helper.indexMatchesShape(docsPerSeg);
+  if (!reuseIndex) {
+    buildFullTextBenchIndex(helper, nDocs, docsPerSeg);
+  }
+
+  auto reader = helper.getIndexWriter()->getIndexReader();
+
+  ScoreTopKResult exhaustive = runFullTextScoreTopKDisjunction(*reader, commonTerm, rareTerm, topK, false);
+  ScoreTopKResult pruned = runFullTextScoreTopKDisjunction(*reader, commonTerm, rareTerm, topK, true);
+  assertSameTopK(exhaustive, pruned);
+
+  RSSWatcher watcher;
+
+  int64_t fp = -1;
+  int64_t visited = 0;
+  int64_t nonEssentialLookups = 0;
+  for (auto _ : state) {
+    ScoreTopKResult result = runFullTextScoreTopKDisjunction(*reader, commonTerm, rareTerm, topK, skip);
+    benchmark::DoNotOptimize(result.fp);
+    benchmark::DoNotOptimize(result.visited);
+    benchmark::DoNotOptimize(result.nonEssentialLookups);
+
+    if (fp != -1) {
+      ASSERT_EQ(fp, result.fp);
+    }
+    fp = result.fp;
+    visited = result.visited;
+    nonEssentialLookups = result.nonEssentialLookups;
+  }
+
+  state.counters["fp"] = fp;
+  state.counters["visited"] = visited;
+  state.counters["nonessential_lookups"] = nonEssentialLookups;
+  state.counters["skip"] = skip ? 1 : 0;
+  state.counters["reused"] = reuseIndex;
+  state.counters["rate"] = benchmark::Counter(state.iterations(), benchmark::Counter::kIsRate);
+  auto mem = watcher.getDeltaKB();
+  state.counters["RSS_delta"] = mem.first / 1024;
+  state.counters["RSS_max"] = mem.second / 1024;
+}
+
+//
 // Length-clustered single-term relevance top-k.  The term "hot" appears once in
 // every doc, while doc length rises monotonically with docid.  Adjacent blocks
 // have similar norms, so per-block minNorm should be a useful pruning bound.
@@ -450,6 +559,11 @@ SOLUX_BENCHMARK_CAPTURE(BM_FullTextScoreTopK, head_skip,   nDocs, shape, "t0",  
 SOLUX_BENCHMARK_CAPTURE(BM_FullTextScoreTopK, head_noskip, nDocs, shape, "t0",   false);
 SOLUX_BENCHMARK_CAPTURE(BM_FullTextScoreTopK, mid_skip,    nDocs, shape, "t100", true);
 SOLUX_BENCHMARK_CAPTURE(BM_FullTextScoreTopK, mid_noskip,  nDocs, shape, "t100", false);
+
+// Disjunction MaxScore A/B. t0 is the frequent low-idf clause; t1000 is rare
+// enough to lift the top-k threshold but common enough to supply k winners.
+SOLUX_BENCHMARK_CAPTURE(BM_FullTextScoreTopKDisjunction, disj_skip,   nDocs, shape, "t0", "t1000", true);
+SOLUX_BENCHMARK_CAPTURE(BM_FullTextScoreTopKDisjunction, disj_noskip, nDocs, shape, "t0", "t1000", false);
 
 // Length-clustered relevance top-k A/B for the T1 minNorm pruning workload.
 SOLUX_BENCHMARK_CAPTURE(BM_FullTextScoreTopKClustered, clustered_skip,   true);
