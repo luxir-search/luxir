@@ -287,18 +287,23 @@ public:
 // Precondition: caller is responsible for any per-segment setup on `collector`.  In
 // particular, FieldSortCollector requires `setSegment(segnum, &postingsReader)` to be
 // called before this; TopDocsCollector has no per-segment setup.
+// allowPruning: when false (e.g. the request asks for an exact total hit count via
+// get_number), the rising threshold is NOT pushed to the scorer, so impact block
+// skipping stays off and every matching doc is visited.  Dynamic pruning and an exact
+// total count are mutually exclusive - skipping does not visit (cannot count) the docs
+// it skips - so a query that needs the count must forgo pruning.
 template <typename Collector>
 void collectTopK(int32_t segnum, Query::Scorer* scorer, DocSet* filter,
-                 DocSetBuilder* builder, Collector& collector) {
+                 DocSetBuilder* builder, Collector& collector, bool allowPruning = true) {
   float lastPushedMinCompetitiveScore = std::numeric_limits<float>::lowest();
   auto pushMinCompetitiveScore = [&]() {
     if constexpr (requires { collector.minCompetitiveVal; }) {
-      if (builder == nullptr && collector.minCompetitiveVal > lastPushedMinCompetitiveScore) {
+      if (allowPruning && builder == nullptr && collector.minCompetitiveVal > lastPushedMinCompetitiveScore) {
         scorer->setMinCompetitiveScore(collector.minCompetitiveVal);
         lastPushedMinCompetitiveScore = collector.minCompetitiveVal;
       }
     } else {
-      unused(lastPushedMinCompetitiveScore);
+      unused(lastPushedMinCompetitiveScore, allowPruning);
     }
   };
 

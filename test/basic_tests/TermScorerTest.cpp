@@ -757,3 +757,42 @@ TEST_F(TermScorerTest, termImpactTopKSkippingMatchesExhaustive) {
     EXPECT_LT(prunedCollector.totalHits(), exhaustiveCollector.totalHits()) << "k=" << k;
   }
 }
+
+// Regression for the 1f bug: impact block skipping under-counts the total hit count
+// (matches / get_number), since skipped docs are never visited.  collectTopK must keep
+// pruning OFF (allowPruning=false) when an exact count is needed, so every match is
+// visited; only then does totalHits() equal the true docfreq.
+TEST_F(TermScorerTest, getNumberDisablesImpactSkipping) {
+  const int32_t N = 6 * Postings::DOCS_BLOCK_SIZE + 17;  // multi-block common term
+  TestIndex testIndex;
+  TestField f(testIndex, "body_w");
+  f.startIndexing();
+  for (int32_t doc = 0; doc < N; doc++) {
+    int32_t tf = 1 + ((doc / Postings::DOCS_BLOCK_SIZE) * 3 + (doc % 5)) % 17;
+    int32_t len = 4 + ((doc * 11) % 90);
+    if (len < tf) len = tf;
+    std::string text;
+    for (int32_t i = 0; i < tf; i++) text += "needle ";
+    for (int32_t i = tf; i < len; i++) text += "filler ";
+    f.add(doc, text);
+  }
+  testIndex.flush();
+  f.startReading();
+
+  auto poolFree = testIndex.pool.rewindScopeGuard();
+  Query::Context qContext(testIndex.pool, *testIndex.reader);
+  auto& segment = qContext.topReader.segments()[0];
+  const int32_t k = 5;  // small k: with pruning ON the threshold would rise and skip blocks.
+
+  // allowPruning=false (the get_number path): pruning is disabled, so every match is
+  // visited and totalHits() is the exact docfreq (== N).  "needle" is in every doc.
+  // This is a valid guard: skipping DOES fire on this corpus when allowed, so a broken
+  // gate (pruning despite allowPruning=false) would drop the count below N and fail here.
+  TermQuery exactQuery("body_w", "needle");
+  auto* exactWeight = exactQuery.createWeight(qContext, Query::NEED_SCORES);
+  auto* exactScorer = dynamic_cast<TermQuery::Scorer*>(exactWeight->createScorer(testIndex.pool, segment));
+  ASSERT_NE(exactScorer, nullptr);
+  TopDocsCollector exactCollector(k);
+  collectTopK(0, exactScorer, nullptr, nullptr, exactCollector, /*allowPruning=*/false);
+  EXPECT_EQ(exactCollector.totalHits(), (int64_t) N);
+}

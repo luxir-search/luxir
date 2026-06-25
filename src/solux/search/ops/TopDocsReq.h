@@ -286,7 +286,10 @@ public:
             data->fieldCollector->setSegment(segnum, &seg.postingsReader());
             collectTopK(segnum, scorer, filter, builderPtr, *data->fieldCollector);
           } else {
-            collectTopK(segnum, scorer, filter, builderPtr, *data->scoreCollector);
+            // get_number requests an exact total hit count, which is incompatible with
+            // impact block skipping (skipped docs are not visited, so not counted).
+            bool allowPruning = !op.topDocsProto.get_number();
+            collectTopK(segnum, scorer, filter, builderPtr, *data->scoreCollector, allowPruning);
           }
         }
         if (builder.has_value()) {
