@@ -246,6 +246,7 @@ std::shared_ptr<Schema> Schema::fromProto(const proto::SchemaDef& def, const Sch
         case FieldType::INT:    r.fieldClass = proto::FieldDef::INT; break;
         case FieldType::FLOAT:  r.fieldClass = proto::FieldDef::FLOAT; break;
         case FieldType::DOUBLE: r.fieldClass = proto::FieldDef::DOUBLE; break;
+        case FieldType::DATE:   r.fieldClass = proto::FieldDef::DATE; break;
         case FieldType::VECTOR: r.fieldClass = proto::FieldDef::VECTOR; break;
         default:                r.fieldClass = proto::FieldDef::BIN; break;
       }
@@ -363,6 +364,9 @@ std::shared_ptr<Schema> Schema::fromProto(const proto::SchemaDef& def, const Sch
       case proto::FieldDef::DOUBLE:
         ft = std::make_shared<DoubleFieldType>(name, flags);
         break;
+      case proto::FieldDef::DATE:
+        ft = std::make_shared<DateFieldType>(name, flags);
+        break;
       case proto::FieldDef::VECTOR: {
         // VECTOR is always fixed-size (every value in a segment must share dims).
         // dims may be 0, meaning "infer from first indexed value".
@@ -428,6 +432,9 @@ void Schema::toProto(proto::SchemaDef* def) const {
         break;
       case FieldType::DOUBLE:
         fieldDef->set_field_class(proto::FieldDef::DOUBLE);
+        break;
+      case FieldType::DATE:
+        fieldDef->set_field_class(proto::FieldDef::DATE);
         break;
       case FieldType::BIN:
         fieldDef->set_field_class(proto::FieldDef::BIN);
@@ -525,6 +532,8 @@ std::shared_ptr<Schema> Schema::createDefaultSchema() {
   addField("_fs", proto::FieldDef::FLOAT, true, false, true, true);
   addField("_d", proto::FieldDef::DOUBLE, true, false, true);
   addField("_ds", proto::FieldDef::DOUBLE, true, false, true, true);
+  addField("_dt", proto::FieldDef::DATE, true, false, true);
+  addField("_dts", proto::FieldDef::DATE, true, false, true, true);
   // Text suffixes, from raw to fully folded:
   //   _w  raw whitespace tokens (case- and accent-sensitive)
   //   _wl Unicode word segmentation + NFKC case folding, accents PRESERVED

@@ -16,6 +16,9 @@ namespace solux {
 // before indexing any data.
 class FieldType {
 public:
+  // NOTE: these ordinals are persisted as-is in the segment (PostingsWriter
+  // writes IndexFieldInfo::type, FieldReader reads it back via static_cast).
+  // Append new types at the end; reordering silently misreads existing segments.
   enum Type {
     NONE=0,
     STRING,   // unanalyzed string field
@@ -25,7 +28,8 @@ public:
     FLOAT,
     DOUBLE,
     ID,       // unique id field
-    VECTOR    // dense float vector; column-stored as fixed-size bytes
+    VECTOR,   // dense float vector; column-stored as fixed-size bytes
+    DATE      // timestamp; column-stored as int64 milliseconds since the Unix epoch
   };
 
   using flag_type = int32_t;
@@ -187,6 +191,17 @@ public:
 class DoubleFieldType : public FieldType {
 public:
   DoubleFieldType(std::string_view name, int flags=COLUMN_STORED) : FieldType(name, FieldType::DOUBLE, flags) {
+  }
+};
+
+// DATE stores int64 milliseconds since the Unix epoch directly in the standard
+// int column.  Signed millis already sorts in chronological order, so sort,
+// range-facet, and min/max stats run on the raw column with no per-value
+// transform (unlike FLOAT/DOUBLE, which store sortable bits).  The DATE tag
+// drives string<->millis parsing on input and date-aware rendering on output.
+class DateFieldType : public FieldType {
+public:
+  DateFieldType(std::string_view name, int flags=COLUMN_STORED) : FieldType(name, FieldType::DATE, flags) {
   }
 };
 

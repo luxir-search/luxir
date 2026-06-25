@@ -139,6 +139,10 @@ public:
 
     FacetReq* facet = nullptr;
     switch (ftype->type()) {
+      // DATE is epoch millis in the int column; it terms-facets exactly like
+      // INT (distinct millis values).  Date-histogram bucketing is a range
+      // facet, not a terms facet.
+      case FieldType::Type::DATE:
       case FieldType::Type::INT: {
         if (facetReq.has_mincount() && facetReq.mincount() < 1) {
           throw std::runtime_error("facet '" + std::string(facetName) + "': mincount < 1 (zero-count buckets) is not supported for int field facets");

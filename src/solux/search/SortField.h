@@ -54,11 +54,13 @@ public:
         // Handle regular field types based on FieldType
         switch (const_cast<FieldType&>(fieldType_).type()) {
             case FieldType::Type::INT:
+            case FieldType::Type::DATE:
             case FieldType::Type::FLOAT:
             case FieldType::Type::DOUBLE:
+                // INT and DATE (epoch millis) sort on the raw column values.
                 // FLOAT/DOUBLE columns store sortable bits whose int64 order
                 // matches the floating point order, so the int comparator
-                // works on the encoded values as-is.
+                // works on the encoded values as-is for all four.
                 return std::make_unique<SimpleNumericFieldComparator>(
                     fieldName, numHits, isReversed(), missingValue
                 );

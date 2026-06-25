@@ -119,6 +119,13 @@ Inverter::IndexHandler& Inverter::createIndexHandler(const std::string_view name
         fieldHandler = pool.make_unique<handler::DoubleColHandler>(*this, name, fieldType);
       }
       break;
+    case FieldType::Type::DATE:
+      if (fieldType->multiValued()) {
+        fieldHandler = pool.make_unique<handler::MultiDateColHandler>(*this, name, fieldType);
+      } else {
+        fieldHandler = pool.make_unique<handler::DateColHandler>(*this, name, fieldType);
+      }
+      break;
     case FieldType::Type::VECTOR:
       fieldHandler = pool.make_unique<handler::VectorHandler>(*this, name, fieldType);
       break;

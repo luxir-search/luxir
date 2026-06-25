@@ -767,6 +767,13 @@ void emitDocsResponse(SearchRequest& req,
           loadNumCol<DoubleColEmit>(req, field, fieldType, segDocs, sortedIdx, segRunLength, columnsProto, tg, pendingCols);
           break;
         }
+        case FieldType::Type::DATE: {
+          // DATE is epoch millis in the int column; emit the raw millis as
+          // col_i.  ISO-8601 string rendering is an input-side / JSON-layer
+          // concern, not the typed gRPC column.
+          loadNumCol<IntColEmit>(req, field, fieldType, segDocs, sortedIdx, segRunLength, columnsProto, tg, pendingCols);
+          break;
+        }
         case FieldType::Type::ID:
         case FieldType::Type::STRING: {
           if (fieldType.isStored()) {

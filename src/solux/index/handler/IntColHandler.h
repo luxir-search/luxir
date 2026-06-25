@@ -3,7 +3,10 @@
 #include "solux/index/DocStream.h"
 #include "solux/index/Inverter.h"
 #include "solux/index/IntColWriter.h"
+#include "solux/util/DateTime.h"
 #include "solux/util/NumericUtils.h"
+
+#include <fmt/format.h>
 
 #include <ranges>
 
@@ -338,6 +341,77 @@ public:
   void index(Inverter& inverter, std::span<const int64_t> vals) override {
     indexMulti(inverter, vals
                | std::views::transform([](int64_t i) { return (int64_t)floatToSortableInt32((float)i); }));
+  }
+};
+
+
+//
+// DATE columns store int64 milliseconds since the Unix epoch directly in the
+// int column (no sortable-bits transform - signed millis already sorts in
+// chronological order).  Incoming values are either an int (epoch millis,
+// passthrough) or an ISO-8601 string parsed via parseDateToEpochMillis.  A
+// string that does not parse throws, so the per-doc update path marks the doc
+// failed (same contract as VectorHandler).
+//
+
+// Parse an ISO-8601 / epoch-millis date string or throw a per-doc failure.
+inline int64_t parseDateOrThrow(std::string_view fieldName, std::string_view text) {
+  if (auto ms = parseDateToEpochMillis(text)) return *ms;
+  throw std::runtime_error(fmt::format(
+      "DATE field '{}': cannot parse '{}' as a date (expected ISO-8601 or epoch millis)",
+      fieldName, text));
+}
+
+class DateColHandler final : public IntColHandler {
+public:
+  using IntColHandler::IntColHandler;
+
+  void index(Inverter& inverter, const proto::Val& val) override {
+    if (val.has_i()) {
+      indexSingle(inverter, val.i());
+    } else if (val.has_s()) {
+      indexSingle(inverter, parseDateOrThrow(std::string_view(fieldName), val.s()));
+    }
+  }
+
+  void index(Inverter& inverter, int64_t int64) override {
+    indexSingle(inverter, int64);
+  }
+};
+
+class MultiDateColHandler final : public MultiIntColHandler {
+public:
+  using MultiIntColHandler::MultiIntColHandler;
+
+  void index(Inverter& inverter, const proto::Val& val) override {
+    auto parse = [&](std::string_view s) { return parseDateOrThrow(std::string_view(fieldName), s); };
+    // expected kinds first (array form, then a single value)
+    if (val.has_arr_i()) {
+      index(inverter, std::span<const int64_t>(val.arr_i().v().data(), val.arr_i().v().size()));
+    } else if (val.has_i()) {
+      indexMulti(inverter, std::views::single(val.i()));
+    } else if (val.has_arr_s()) {
+      // Parse every element up front: indexMulti appends to the value stream
+      // as it iterates, so a throw partway through a lazy transform would
+      // leave already-parsed values orphaned (the column reconstructs
+      // positionally, corrupting later docs).  Materialize first so a parse
+      // failure throws before any stream mutation.
+      auto& arr = val.arr_s().v();
+      std::vector<int64_t> millis;
+      millis.reserve(arr.size());
+      for (const auto& s : arr) millis.push_back(parse(s));
+      index(inverter, std::span<const int64_t>(millis.data(), millis.size()));
+    } else if (val.has_s()) {
+      indexMulti(inverter, std::views::single(parse(val.s())));
+    }
+  }
+
+  void index(Inverter& inverter, int64_t int64) override {
+    indexMulti(inverter, std::views::single(int64));
+  }
+
+  void index(Inverter& inverter, std::span<const int64_t> vals) override {
+    indexMulti(inverter, vals);
   }
 };
 

@@ -725,6 +725,7 @@ message FieldDef {
     BIN = 5;
     ID = 6;        // unique id field with co-located version
     VECTOR = 7;    // dense float vector, stored as a fixed-size binary column
+    DATE = 8;      // timestamp, stored as int64 milliseconds since the Unix epoch
   }
   FieldClass field_class = 4;  // if unset (default), inherited from parent
 
