@@ -75,8 +75,13 @@ class TopDocsCollector {
     hitCount++;
 
     if (score > minCompetitiveVal) {
-      bool overflow = pq.insertWithOverflow({score, segdoc(segment, docid)});
-      if (overflow) {
+      pq.insertWithOverflow({score, segdoc(segment, docid)});
+      // Once the heap holds topCount docs, its root (a min-heap on score) is the k-th best
+      // so far - the competitive threshold a later doc must beat to enter.  Publish it as
+      // soon as the heap fills, not only when a doc evicts one: best-docs-first / index-
+      // sorted / clustered input never evicts, so the old "update on overflow only" left the
+      // threshold at lowest() forever and defeated impact pruning exactly when it helps most.
+      if (pq.size() >= topCount) {
         minCompetitiveVal = pq.top().score;
       }
     }
