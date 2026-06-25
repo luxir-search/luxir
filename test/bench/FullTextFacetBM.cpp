@@ -140,6 +140,31 @@ void assertSameTopK(const ScoreTopKResult& expected, const ScoreTopKResult& actu
   }
 }
 
+void buildClusteredScoreTopKIndex(IndexWriter& iw, int64_t nDocs) {
+  Inverter& inverter = iw.obtainInverter();
+  Inverter::IndexHandler& hBody = inverter.getIndexHandler("body_w");
+
+  std::string body;
+  for (int64_t doc = 0; doc < nDocs; doc++) {
+    int tokenCount = 8 + (int) ((int64_t) doc * 192 / nDocs);
+    // "hot" in every other doc so docFreq < docsWithField and idf > 0.  A term in
+    // EVERY doc has idf ~= 0, which zeroes the BM25 scores and removes the score
+    // variance that makes the per-block norm bound matter - defeating the measurement.
+    bool hasHot = (doc % 2) == 0;
+    body.assign(hasHot ? "hot" : "pad");
+    for (int token = 1; token < tokenCount; token++) {
+      body.append(" pad");
+    }
+
+    inverter.startDoc();
+    hBody.index(inverter, body);
+    inverter.finishDoc();
+  }
+
+  iw.releaseInverter(inverter, true);
+  iw.commit();
+}
+
 }  // namespace
 
 namespace solux {
@@ -359,6 +384,50 @@ static void BM_FullTextScoreTopK(benchmark::State& state, int64_t nDocs, std::st
   state.counters["RSS_max"] = mem.second / 1024;
 }
 
+//
+// Length-clustered single-term relevance top-k.  The term "hot" appears once in
+// every doc, while doc length rises monotonically with docid.  Adjacent blocks
+// have similar norms, so per-block minNorm should be a useful pruning bound.
+//
+static void BM_FullTextScoreTopKClustered(benchmark::State& state, bool skip) {
+  int64_t clusteredDocs = solux::unit_tests ? 2000 : 1'000'000;
+  constexpr int32_t topK = 100;
+
+  RAMDir dir;
+  IndexWriter iw(dir);
+  buildClusteredScoreTopKIndex(iw, clusteredDocs);
+  auto reader = iw.getIndexReader();
+
+  ScoreTopKResult exhaustive = runFullTextScoreTopK(*reader, "hot", topK, false);
+  ScoreTopKResult pruned = runFullTextScoreTopK(*reader, "hot", topK, true);
+  assertSameTopK(exhaustive, pruned);
+
+  RSSWatcher watcher;
+
+  int64_t fp = -1;
+  int64_t visited = 0;
+  for (auto _ : state) {
+    ScoreTopKResult result = runFullTextScoreTopK(*reader, "hot", topK, skip);
+    benchmark::DoNotOptimize(result.fp);
+    benchmark::DoNotOptimize(result.visited);
+
+    if (fp != -1) {
+      ASSERT_EQ(fp, result.fp);
+    }
+    fp = result.fp;
+    visited = result.visited;
+  }
+
+  state.counters["fp"] = fp;
+  state.counters["visited"] = visited;
+  state.counters["skip"] = skip ? 1 : 0;
+  state.counters["nDocs"] = clusteredDocs;
+  state.counters["rate"] = benchmark::Counter(state.iterations(), benchmark::Counter::kIsRate);
+  auto mem = watcher.getDeltaKB();
+  state.counters["RSS_delta"] = mem.first / 1024;
+  state.counters["RSS_max"] = mem.second / 1024;
+}
+
 
 constexpr int32_t nDocs = 1'000'000;
 constexpr const char* shape = "5555";  // ~5 segs of ~181K docs down to tiny sparse segs
@@ -381,3 +450,7 @@ SOLUX_BENCHMARK_CAPTURE(BM_FullTextScoreTopK, head_skip,   nDocs, shape, "t0",  
 SOLUX_BENCHMARK_CAPTURE(BM_FullTextScoreTopK, head_noskip, nDocs, shape, "t0",   false);
 SOLUX_BENCHMARK_CAPTURE(BM_FullTextScoreTopK, mid_skip,    nDocs, shape, "t100", true);
 SOLUX_BENCHMARK_CAPTURE(BM_FullTextScoreTopK, mid_noskip,  nDocs, shape, "t100", false);
+
+// Length-clustered relevance top-k A/B for the T1 minNorm pruning workload.
+SOLUX_BENCHMARK_CAPTURE(BM_FullTextScoreTopKClustered, clustered_skip,   true);
+SOLUX_BENCHMARK_CAPTURE(BM_FullTextScoreTopKClustered, clustered_noskip, false);
