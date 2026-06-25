@@ -121,17 +121,19 @@ struct CachedTermInfo {
   Similarity::BM25Scorer* simScorer = nullptr;  // This may be null even if other elements are fille in (phrase query would have different one)
   std::span<DocsEnum*> docsEnums = {}; // TODO: cache align if they will be used in multiple threads
 
-  /// Get a possibly-cached DocsEnum for use. This means cloning it if the cached one is shared.
+  /// Get an independent DocsEnum to iterate.  Always cloned: a scorer mutates the enum
+  /// it gets, and the clone is a cheap pool-free copy (DocsEnum buffers are immediate).
+  /// The old sharedCount fast path (hand out the cached enum un-cloned when only one
+  /// weight referenced the term) was fragile: the clone-or-not decision is made at
+  /// scorer-creation time, but sharedCount can rise afterwards, so a createWeight for
+  /// this term that ran after a scorer had already advanced the cached enum would later
+  /// clone the mutated state.  Cloning unconditionally removes that ordering hazard.
   DocsEnum* useDocsEnum(MemPool& targetPool, IndexReader::Segment& segment) {
     auto* docsEnum = docsEnums[segment.ord];
     if (docsEnum == nullptr) {
       return nullptr;
     }
-    if (sharedCount > 0) {
-      // This cachedTerm is shared, so we need to make a copy of the DocsEnum
-      docsEnum = targetPool.make<DocsEnum>(targetPool, *docsEnum);
-    }
-    return docsEnum;
+    return targetPool.make<DocsEnum>(targetPool, *docsEnum);
   }
 
 

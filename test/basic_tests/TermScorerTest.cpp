@@ -796,3 +796,42 @@ TEST_F(TermScorerTest, getNumberDisablesImpactSkipping) {
   collectTopK(0, exactScorer, nullptr, nullptr, exactCollector, /*allowPruning=*/false);
   EXPECT_EQ(exactCollector.totalHits(), (int64_t) N);
 }
+
+// Regression: CachedTermInfo::useDocsEnum used to hand out the cached DocsEnum un-cloned
+// when only one weight referenced the term (sharedCount==0).  Creating a SECOND weight
+// for the same term (sharedCount->1) and a scorer AFTER the first scorer had already run
+// then cloned the exhausted cached enum.  useDocsEnum now always clones, so interleaved
+// createWeight / run / createWeight is safe.
+TEST_F(TermScorerTest, interleavedScorersForSameTermAreIndependent) {
+  const int32_t N = 3 * Postings::DOCS_BLOCK_SIZE + 7;  // multi-block, "needle" in every doc
+  TestIndex testIndex;
+  TestField f(testIndex, "body_w");
+  f.startIndexing();
+  for (int32_t doc = 0; doc < N; doc++) {
+    f.add(doc, "needle filler filler");
+  }
+  testIndex.flush();
+  f.startReading();
+
+  auto poolFree = testIndex.pool.rewindScopeGuard();
+  Query::Context qContext(testIndex.pool, *testIndex.reader);
+  auto& segment = qContext.topReader.segments()[0];
+
+  auto countAll = [&](const char* term) {
+    TermQuery q("body_w", term);
+    auto* w = q.createWeight(qContext, Query::NEED_SCORES);
+    auto* s = dynamic_cast<TermQuery::Scorer*>(w->createScorer(testIndex.pool, segment));
+    EXPECT_NE(s, nullptr);
+    int64_t n = 0;
+    for (int32_t doc = s->next(); doc != PostingsReader::END; doc = s->next()) {
+      n++;
+    }
+    return n;
+  };
+
+  // First weight+scorer for "needle", fully consumed (its createWeight set sharedCount=0).
+  EXPECT_EQ(countAll("needle"), (int64_t) N);
+  // Second weight+scorer for the SAME term, created and run AFTER the first finished.
+  // Pre-fix this cloned the exhausted cached enum and counted far fewer than N.
+  EXPECT_EQ(countAll("needle"), (int64_t) N);
+}
