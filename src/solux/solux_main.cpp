@@ -1,9 +1,11 @@
 #include <filesystem>
+#include <optional>
 #include <sstream>
 #include <thread>
 #include "solux/solux_main.h"
 #include "solux/util/solux_util.h"
 #include "solux/server/GRPCServer.h"
+#include "solux/server/HttpServer.h"
 #include "solux/SoluxConfig.h"
 
 namespace fs = std::filesystem;
@@ -33,8 +35,19 @@ int solux_main(int argc, char** argv) {
            spdlog::level::to_string_view(spdlog::get_level()));
 
   SoluxNode node{config};
+
+  // The HTTP/JSON server runs on its own io threads; start it (non-blocking)
+  // before the blocking gRPC run().
+  std::optional<HttpServer> httpServer;
+  if (config.server.http.enabled) {
+    httpServer.emplace(node, config.server.http.resolveThreads(), config.server.http.port);
+    httpServer->start();
+  }
+
   GRPCServer server(node, config.server.grpc.resolveThreads(), config.server.grpc.port);
   server.run();
+
+  if (httpServer) httpServer->shutdown();
   return 0;
 }
 

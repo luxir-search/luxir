@@ -25,6 +25,13 @@ void SoluxConfig::addOptions(CLI::App& app) {
   app.add_option("--server.grpc.threads,-t", server.grpc.threads, "Number of server threads (0 = auto)")
       ->default_val(server.grpc.threads);
 
+  app.add_flag("--server.http.enabled,!--no-http", server.http.enabled, "Enable the HTTP/JSON server")
+      ->default_val(server.http.enabled);
+  app.add_option("--server.http.port", server.http.port, "HTTP/JSON listen port")
+      ->default_val(server.http.port);
+  app.add_option("--server.http.threads", server.http.threads, "Number of HTTP server threads (0 = auto)")
+      ->default_val(server.http.threads);
+
   app.add_option("--store.backend", store.backend, "Storage backend (ram, fs)")
       ->default_val(store.backend)
       ->check(CLI::IsMember({"ram", "fs"}));
