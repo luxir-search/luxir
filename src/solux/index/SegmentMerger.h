@@ -233,6 +233,24 @@ private:
     }
   }
 
+  void buildMergedNorms(std::span<MergeFieldInfo*> compactFields, std::vector<uint8_t>& normByDoc) {
+    normByDoc.assign((size_t) postingsWriter.getMaxDoc(), 0);
+    for (auto* field : compactFields) {
+      auto& seg = *field->seg;
+      IntColReader reader(*seg.postingsReader, field->segFieldInfo);
+      IntColReader::Iterator iter(reader);
+      for (int32_t localId = iter.next(); localId != IntColReader::ENDDOC; localId = iter.next()) {
+        auto [mappedDoc, isDeleted] = seg.remapDocId(localId);
+        if (isDeleted) {
+          continue;
+        }
+        int64_t norm = iter.value();
+        assert(norm >= 0 && norm <= 255);
+        normByDoc[(size_t) mappedDoc] = (uint8_t) norm;
+      }
+    }
+  }
+
   void mergeField(std::vector<MergeFieldInfo>& mergeFieldInfos) {
     int32_t nDocs = postingsWriter.getMaxDoc();
     auto poolGuard = MemPool::threadLocalPoolGuard();
@@ -279,6 +297,11 @@ private:
       }
       allFlags |= field->segFieldInfo.flags;
     }
+    bool hasNorms = type == FieldType::Type::TEXT && FieldType::hasPositions(allFlags);
+    std::vector<uint8_t> normByDoc;
+    if (hasNorms) {
+      buildMergedNorms(compactFields, normByDoc);
+    }
 
     // get/reserve a new fieldInfo from the postingsReader
     PostingsWriter::IndexFieldInfo& outputFieldInfo = postingsWriter.addField(compactFields[0]->segFieldInfo.fieldname);
@@ -300,6 +323,9 @@ private:
       // nocommit outputFieldInfo.flags |= 0x01;
       TextWriter textWriter(postingsWriter);
       textWriter.startField(&outputFieldInfo);
+      if (hasNorms) {
+        textWriter.setNorms(normByDoc);
+      }
 
       // Collect TermsEnum for each segment.  Keep track of the index so we can visit in ascending order one at a time.
       struct TermsEnumIdx {

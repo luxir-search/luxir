@@ -383,11 +383,14 @@ class TextWriter {
   int32_t l1GroupDocCount = 0;
   uint64_t l1GroupTfSum = 0;
   uint32_t l1GroupMaxTf = 0;
+  uint32_t l1GroupMinNorm = 0;
 
   // Index level for this field, decoded from the field flags in startField().  These gate
   // whether the freq stream and position stream are written at all.
   bool hasFreqs = false;
   bool hasPositions = false;
+  bool hasNorms = false;
+  std::span<const uint8_t> normByDoc;
 
   std::vector<uint64_t> termBlockOffsets;  // offset from termsOffset (for this field) for each term block
   int64_t sumTotalTermFreq = 0; // updated in endTerm
@@ -441,7 +444,7 @@ private:  // some internal utility methods... not for use by indexers
 
   void appendL0Header(std::vector<char>& out, uint32_t lastDoc, uint32_t base,
                       uint64_t blockByteLen, uint32_t docCount, uint64_t tfSum,
-                      uint32_t maxTf) {
+                      uint32_t maxTf, uint32_t minNorm) {
     header_output.resize(0);
     assert(lastDoc >= base);
     appendVint15(header_output, lastDoc - base);
@@ -454,6 +457,10 @@ private:  // some internal utility methods... not for use by indexers
       assert(maxTf > 0);
       appendVint(header_output, maxTf);
     }
+    if (hasNorms) {
+      assert(minNorm <= 255);
+      appendVint(header_output, minNorm);
+    }
     appendVint(out, (uint32_t) header_output.size());
     appendBytes(out, header_output.data(), header_output.size());
   }
@@ -464,8 +471,8 @@ private:  // some internal utility methods... not for use by indexers
   }
 
   void appendL0Block(uint32_t lastDoc, uint32_t base, uint64_t blockByteLen,
-                     uint32_t docCount, uint64_t tfSum, uint32_t maxTf) {
-    appendL0Header(group_output, lastDoc, base, blockByteLen, docCount, tfSum, maxTf);
+                     uint32_t docCount, uint64_t tfSum, uint32_t maxTf, uint32_t minNorm) {
+    appendL0Header(group_output, lastDoc, base, blockByteLen, docCount, tfSum, maxTf, minNorm);
     appendBytes(group_output, compressed_output.data(), blockByteLen);
     l1GroupLastDoc = lastDoc;
     l1GroupBlockCount++;
@@ -476,9 +483,29 @@ private:  // some internal utility methods... not for use by indexers
     if (hasFreqs) {
       l1GroupMaxTf = std::max(l1GroupMaxTf, maxTf);
     }
+    if (hasNorms) {
+      assert(minNorm <= 255);
+      l1GroupMinNorm = l1GroupBlockCount == 1 ? minNorm : std::min(l1GroupMinNorm, minNorm);
+    }
     if (l1GroupBlockCount == L1_PERIOD) {
       flushL1Group();
     }
+  }
+
+  uint32_t blockMinNorm(uint32_t docCount) const {
+    if (!hasNorms) {
+      return 0;
+    }
+    if (normByDoc.empty()) {
+      return 0;
+    }
+    uint32_t minNorm = 255;
+    for (uint32_t i = 0; i < docCount; i++) {
+      int32_t docid = docs[i];
+      assert(docid >= 0 && (size_t) docid < normByDoc.size());
+      minNorm = std::min(minNorm, (uint32_t) normByDoc[(size_t) docid]);
+    }
+    return minNorm;
   }
 
   void flushL1Group() {
@@ -497,6 +524,10 @@ private:  // some internal utility methods... not for use by indexers
       assert(l1GroupMaxTf > 0);
       appendVint(header_output, l1GroupMaxTf);
     }
+    if (hasNorms) {
+      assert(l1GroupMinNorm <= 255);
+      appendVint(header_output, l1GroupMinNorm);
+    }
     docOutput.writeVint((uint32_t) header_output.size());
     docOutput.write(header_output.data(), header_output.size());
     docOutput.write(group_output.data(), group_output.size());
@@ -507,6 +538,7 @@ private:  // some internal utility methods... not for use by indexers
     l1GroupDocCount = 0;
     l1GroupTfSum = 0;
     l1GroupMaxTf = 0;
+    l1GroupMinNorm = 0;
   }
 
   // number of docs for the current term
@@ -548,6 +580,7 @@ public:
     fieldInfo = finfo;
     hasFreqs = FieldType::hasFreqs(finfo->flags);
     hasPositions = FieldType::hasPositions(finfo->flags);
+    hasNorms = hasPositions;
     termsLoc = termOutput.size();
     docsLoc = docOutput.size();
     posLoc = posOutput.size();
@@ -594,6 +627,7 @@ public:
     const uint32_t lastDoc = (uint32_t) docs.back();
     uint64_t tfSum = 0;
     uint32_t maxTf = 0;
+    uint32_t minNorm = blockMinNorm(Postings::DOCS_BLOCK_SIZE);
     if (hasFreqs) {
       for (auto tf : tfreqs) {
         if (hasPositions) {
@@ -619,7 +653,7 @@ public:
       blockByteLen += compressedSize;
     }
 
-    appendL0Block(lastDoc, base, blockByteLen, Postings::DOCS_BLOCK_SIZE, tfSum, maxTf);
+    appendL0Block(lastDoc, base, blockByteLen, Postings::DOCS_BLOCK_SIZE, tfSum, maxTf, minNorm);
     prevDocBlockLast = lastDoc;
 
     docsFlushed += docs.size();
@@ -770,6 +804,7 @@ public:
     l1GroupDocCount = 0;
     l1GroupTfSum = 0;
     l1GroupMaxTf = 0;
+    l1GroupMinNorm = 0;
     group_output.resize(0);
     locOfPositionsForTerm = posOutput.size();
     locOfDocsForTerm = docOutput.size();
@@ -839,6 +874,7 @@ public:
         const uint32_t lastDoc = (uint32_t) docs.back();
         uint64_t tfSum = 0;
         uint32_t maxTf = 0;
+        uint32_t minNorm = blockMinNorm(n);
         if (hasFreqs) {
           for (auto tf : tfreqs) {
             if (hasPositions) {
@@ -858,7 +894,7 @@ public:
           appendBytes(compressed_output, tkeys, kb);
           appendBytes(compressed_output, tdata, (size_t)(tdEnd - tdata));
         }
-        appendL0Block(lastDoc, base, compressed_output.size(), n, tfSum, maxTf);
+        appendL0Block(lastDoc, base, compressed_output.size(), n, tfSum, maxTf, minNorm);
         prevDocBlockLast = lastDoc;
       }
       docsFlushed += docs.size();
@@ -967,6 +1003,10 @@ public:
         flushPositions();
       }
     }
+  }
+
+  void setNorms(std::span<const uint8_t> norms) {
+    normByDoc = norms;
   }
 
 };

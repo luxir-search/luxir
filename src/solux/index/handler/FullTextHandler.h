@@ -5,6 +5,8 @@
 #include "solux/index/IntColWriter.h"
 #include "solux/search/Similarity.h"
 
+#include <vector>
+
 
 using namespace solux;
 namespace solux::handler {
@@ -15,6 +17,7 @@ class FullTextHandler : public Inverter::IndexHandler {
 
   TermValHash<DocFreqPosStream> termsHash; // the set of terms contained in this field
   std::unique_ptr<TokenChain> tokenChain;
+  std::vector<uint8_t> normByDoc;
 
   IntColHandler fieldLengthCol; // to store the field length needed for scoring among other things.
 public:
@@ -84,7 +87,12 @@ public:
     // invNorm[(uint8_t)encodedNorm], so the column must already hold the encoded byte
     // (identity for lengths 0..40, quantized above). Storing raw numTokens silently
     // mis-scores docs over 40 tokens and wraps mod 256 above 255.
-    fieldLengthCol.indexSingle(inverter, SmallFloat::intToByte4(numTokens));
+    uint8_t encodedNorm = SmallFloat::intToByte4(numTokens);
+    if ((size_t) docid >= normByDoc.size()) {
+      normByDoc.resize((size_t) docid + 1);
+    }
+    normByDoc[(size_t) docid] = encodedNorm;
+    fieldLengthCol.indexSingle(inverter, encodedNorm);
   }
 
   void flush(Inverter& inverter) override {
@@ -125,6 +133,7 @@ public:
     fieldInfo.flags = fieldType->flags_ & ~FieldType::ABSTRACT;
 
     textWriter.startField(&fieldInfo);
+    textWriter.setNorms(normByDoc);
     for (size_t tnum = 0; tnum < sz; tnum++) {
       auto term = terms[tnum];
       textWriter.startTerm(term);
@@ -137,6 +146,7 @@ public:
 
     // now flush the field length column
     fieldLengthCol.flushIntCol(inverter, fieldInfo);
+    normByDoc.clear();
   }
 
 };

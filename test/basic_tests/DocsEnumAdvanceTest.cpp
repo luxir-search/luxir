@@ -8,6 +8,7 @@
 #include "test/TestIndex.h"
 #include "solux/query/TermQuery.h"
 #include "solux/query/BooleanQuery.h"
+#include "solux/search/Similarity.h"
 
 using namespace solux;
 using namespace solux::test;
@@ -28,6 +29,10 @@ protected:
     return 1 + ((block * 7 + (docid % 3)) % 23);
   }
 
+  static int32_t impactTokenCountForDoc(int32_t docid) {
+    return impactTfForDoc(docid) + 3 + ((docid * 11) % 67);
+  }
+
   static std::vector<int32_t> expectedBlockMaxTf(int32_t numDocs, bool hasFreqs) {
     int32_t numBlocks = (numDocs + Postings::DOCS_BLOCK_SIZE - 1) / Postings::DOCS_BLOCK_SIZE;
     std::vector<int32_t> expected(numBlocks, hasFreqs ? 0 : 1);
@@ -37,6 +42,20 @@ protected:
     for (int32_t doc = 0; doc < numDocs; doc++) {
       int32_t block = doc / Postings::DOCS_BLOCK_SIZE;
       expected[block] = std::max(expected[block], impactTfForDoc(doc));
+    }
+    return expected;
+  }
+
+  static std::vector<int32_t> expectedBlockMinNorm(int32_t numDocs, bool hasNorms) {
+    int32_t numBlocks = (numDocs + Postings::DOCS_BLOCK_SIZE - 1) / Postings::DOCS_BLOCK_SIZE;
+    std::vector<int32_t> expected(numBlocks, hasNorms ? 255 : 0);
+    if (!hasNorms) {
+      return expected;
+    }
+    for (int32_t doc = 0; doc < numDocs; doc++) {
+      int32_t block = doc / Postings::DOCS_BLOCK_SIZE;
+      int32_t norm = SmallFloat::intToByte4(impactTokenCountForDoc(doc));
+      expected[block] = std::min(expected[block], norm);
     }
     return expected;
   }
@@ -57,17 +76,39 @@ protected:
     return expected;
   }
 
+  static std::vector<int32_t> expectedGroupSpanMinNorms(const std::vector<int32_t>& blockMinNorm) {
+    int32_t numGroups = ((int32_t) blockMinNorm.size() + 31) / 32;
+    std::vector<int32_t> expected;
+    expected.reserve(numGroups);
+    for (int32_t group = 0; group < numGroups; group++) {
+      int32_t start = group * 32;
+      int32_t end = std::min(start + 32, (int32_t) blockMinNorm.size());
+      int32_t spanMinNorm = 255;
+      for (int32_t block = start; block < end; block++) {
+        spanMinNorm = std::min(spanMinNorm, blockMinNorm[block]);
+      }
+      expected.push_back(blockMinNorm.empty() ? 0 : spanMinNorm);
+    }
+    return expected;
+  }
+
   void assertImpactHeaders(DocsEnum& denum, const std::vector<int32_t>& expectedBlockMaxTf,
+                           const std::vector<int32_t>& expectedBlockMinNorm,
                            std::string_view label) {
     std::vector<int32_t> blockMaxTf;
     std::vector<int32_t> groupSpanImpacts;
-    denum.readBlockMaxTf(blockMaxTf, &groupSpanImpacts);
+    std::vector<int32_t> blockMinNorm;
+    std::vector<int32_t> groupSpanMinNorms;
+    denum.readBlockMaxTf(blockMaxTf, &groupSpanImpacts, nullptr, &blockMinNorm, &groupSpanMinNorms);
     ASSERT_EQ(blockMaxTf, expectedBlockMaxTf) << label;
     ASSERT_EQ(groupSpanImpacts, expectedGroupSpanImpacts(expectedBlockMaxTf)) << label;
+    ASSERT_EQ(blockMinNorm, expectedBlockMinNorm) << label;
+    ASSERT_EQ(groupSpanMinNorms, expectedGroupSpanMinNorms(expectedBlockMinNorm)) << label;
   }
 
   void checkRawImpactHeaders(FieldType::flag_type flags, const std::vector<int32_t>& expectedBlockMaxTf,
-                             int32_t numDocs, std::string_view label) {
+                             const std::vector<int32_t>& expectedBlockMinNorm, int32_t numDocs,
+                             std::string_view label) {
     RAMDir dir;
     MemPool pool;
     PostingsWriter postingsWriter(dir, 0, numDocs);
@@ -96,7 +137,33 @@ protected:
     TermsEnum tenum(pool, reader, fieldInfo);
     ASSERT_TRUE(tenum.seek("hot")) << label;
     DocsEnum denum(pool, reader, tenum);
-    assertImpactHeaders(denum, expectedBlockMaxTf, label);
+    assertImpactHeaders(denum, expectedBlockMaxTf, expectedBlockMinNorm, label);
+  }
+
+  void addImpactDocs(TestField& f, int32_t firstDoc, int32_t numDocs, int32_t globalBase) {
+    std::string text;
+    for (int32_t i = 0; i < numDocs; i++) {
+      int32_t globalDoc = globalBase + i;
+      int32_t tf = impactTfForDoc(globalDoc);
+      int32_t tokenCount = impactTokenCountForDoc(globalDoc);
+      text.clear();
+      for (int32_t j = 0; j < tf; j++) {
+        text += "hot ";
+      }
+      for (int32_t j = tf; j < tokenCount; j++) {
+        text += "pad ";
+      }
+      f.add(firstDoc + i, text);
+    }
+  }
+
+  void assertImpactHeadersForField(TestField& f, const std::vector<int32_t>& expectedBlockMaxTf,
+                                   const std::vector<int32_t>& expectedBlockMinNorm,
+                                   std::string_view label) {
+    TermsEnum tenum = f.createTermsEnum();
+    ASSERT_TRUE(tenum.seek("hot")) << label;
+    DocsEnum denum(f.testIndex.pool, f.currentSegment()->postingsReader(), tenum);
+    assertImpactHeaders(denum, expectedBlockMaxTf, expectedBlockMinNorm, label);
   }
 
   void checkAdvanceWalk(TestIndex& testIndex, PostingsReader& reader, TermsEnum& tenum,
@@ -219,31 +286,40 @@ TEST_F(DocsEnumAdvanceTest, blockImpactHeadersRoundTrip) {
   const int32_t N = 72 * Postings::DOCS_BLOCK_SIZE + 17;
   std::vector<int32_t> expectedFreqImpacts = expectedBlockMaxTf(N, true);
   std::vector<int32_t> expectedDocsOnlyImpacts = expectedBlockMaxTf(N, false);
+  std::vector<int32_t> expectedNorms = expectedBlockMinNorm(N, true);
+  std::vector<int32_t> expectedNoNorms = expectedBlockMinNorm(N, false);
 
   {
     TestIndex testIndex;
     TestField f(testIndex, "body_w");
     f.startIndexing();
-    std::string text;
-    for (int32_t doc = 0; doc < N; doc++) {
-      text.clear();
-      int32_t tf = impactTfForDoc(doc);
-      for (int32_t i = 0; i < tf; i++) {
-        text += "hot ";
-      }
-      f.add(doc, text);
-    }
+    addImpactDocs(f, 0, N, 0);
     testIndex.flush();
     f.startReading();
 
-    TermsEnum tenum = f.createTermsEnum();
-    ASSERT_TRUE(tenum.seek("hot"));
-    DocsEnum denum(testIndex.pool, f.currentSegment()->postingsReader(), tenum);
-    assertImpactHeaders(denum, expectedFreqImpacts, "positions");
+    assertImpactHeadersForField(f, expectedFreqImpacts, expectedNorms, "positions");
   }
 
-  checkRawImpactHeaders(FieldType::INDEX_DOCS_FREQS, expectedFreqImpacts, N, "docs+freqs");
-  checkRawImpactHeaders(FieldType::INDEX_DOCS, expectedDocsOnlyImpacts, N, "docs-only");
+  {
+    const int32_t split = 40 * Postings::DOCS_BLOCK_SIZE + 9;
+    TestIndex testIndex;
+    TestField f(testIndex, "body_w");
+    f.startIndexing();
+    addImpactDocs(f, 0, split, 0);
+    testIndex.flush();
+    f.startIndexing();
+    addImpactDocs(f, 0, N - split, split);
+    testIndex.flush();
+
+    testIndex.iw->mergeSegments();
+    f.startReading();
+    ASSERT_EQ(testIndex.reader->segments().size(), 1u);
+
+    assertImpactHeadersForField(f, expectedFreqImpacts, expectedNorms, "merged positions");
+  }
+
+  checkRawImpactHeaders(FieldType::INDEX_DOCS_FREQS, expectedFreqImpacts, expectedNoNorms, N, "docs+freqs");
+  checkRawImpactHeaders(FieldType::INDEX_DOCS, expectedDocsOnlyImpacts, expectedNoNorms, N, "docs-only");
 }
 
 // A conjunction's advance() must route through the skip list (TermQuery::Scorer

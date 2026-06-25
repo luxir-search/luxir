@@ -49,6 +49,7 @@ class DocsEnum {
   MemPool* pool;
   bool hasFreqs;      // field indexes term freqs (else tfreq is implicitly 1)
   bool hasPositions;  // field indexes positions (else there is no position stream)
+  bool hasNorms;      // text fields with positions carry encoded length norms
   int32_t docfreq; // number of docs containing this term
   int64_t ttf;    // totalTermFreq (sum of term freq across all docs for this term)
 
@@ -125,6 +126,7 @@ public:
     tfreqBuf=tb;
     hasFreqs = FieldType::hasFreqs(fieldInfo.flags);
     hasPositions = FieldType::hasPositions(fieldInfo.flags);
+    hasNorms = hasPositions;
 
     // Since the same terms enum will often be used for multiple docs enum, we should copy everything we need
     // from the terms enum that we need (that may change.)
@@ -396,6 +398,10 @@ public:
           auto maxTf = InputStream::readVint(p, headerEnd);
           unused(maxTf);
         }
+        if (hasNorms) {
+          auto minNorm = InputStream::readVint(p, headerEnd);
+          unused(minNorm);
+        }
         assert(p == headerEnd);
 
         const char* body = headerEnd;
@@ -458,6 +464,10 @@ public:
         auto spanImpact = InputStream::readVint(p, groupHeaderEnd);
         unused(spanImpact);
       }
+      if (hasNorms) {
+        auto spanMinNorm = InputStream::readVint(p, groupHeaderEnd);
+        unused(spanMinNorm);
+      }
       assert(p == groupHeaderEnd);
 
       const char* groupBody = groupHeaderEnd;
@@ -513,18 +523,26 @@ public:
     return docid;
   }
 
-  // Read stored T0 impact data without decoding postings bodies.  DOCS-only fields
+  // Read stored impact data without decoding postings bodies.  DOCS-only fields
   // do not store impact fields, so their per-block maxTf and group span impacts are
-  // synthesized as 1.
+  // synthesized as 1; fields without norms synthesize minNorm/spanMinNorm as 0.
   void readBlockMaxTf(std::vector<int32_t>& blockMaxTf,
                       std::vector<int32_t>* groupSpanImpacts = nullptr,
-                      std::vector<int32_t>* blockLastDocs = nullptr) const {
+                      std::vector<int32_t>* blockLastDocs = nullptr,
+                      std::vector<int32_t>* blockMinNorms = nullptr,
+                      std::vector<int32_t>* groupSpanMinNorms = nullptr) const {
     blockMaxTf.resize(0);
     if (groupSpanImpacts != nullptr) {
       groupSpanImpacts->resize(0);
     }
     if (blockLastDocs != nullptr) {
       blockLastDocs->resize(0);
+    }
+    if (blockMinNorms != nullptr) {
+      blockMinNorms->resize(0);
+    }
+    if (groupSpanMinNorms != nullptr) {
+      groupSpanMinNorms->resize(0);
     }
     if (docsSize == 0) {
       return;
@@ -536,6 +554,12 @@ public:
     }
     if (blockLastDocs != nullptr) {
       blockLastDocs->reserve(numDocBlocks);
+    }
+    if (blockMinNorms != nullptr) {
+      blockMinNorms->reserve(numDocBlocks);
+    }
+    if (groupSpanMinNorms != nullptr) {
+      groupSpanMinNorms->reserve(numDocGroups);
     }
 
     const char* const end = docIS.ptr(metadataStart);
@@ -560,9 +584,16 @@ public:
       if (hasFreqs) {
         spanImpact = (int32_t) InputStream::readVint(p, groupHeaderEnd);
       }
+      int32_t spanMinNorm = 0;
+      if (hasNorms) {
+        spanMinNorm = (int32_t) InputStream::readVint(p, groupHeaderEnd);
+      }
       assert(p == groupHeaderEnd);
       if (groupSpanImpacts != nullptr) {
         groupSpanImpacts->push_back(spanImpact);
+      }
+      if (groupSpanMinNorms != nullptr) {
+        groupSpanMinNorms->push_back(spanMinNorm);
       }
 
       const char* const groupBody = groupHeaderEnd;
@@ -584,10 +615,17 @@ public:
         if (hasFreqs) {
           maxTf = (int32_t) InputStream::readVint(p, headerEnd);
         }
+        int32_t minNorm = 0;
+        if (hasNorms) {
+          minNorm = (int32_t) InputStream::readVint(p, headerEnd);
+        }
         assert(p == headerEnd);
         blockMaxTf.push_back(maxTf);
         if (blockLastDocs != nullptr) {
           blockLastDocs->push_back((int32_t) blockLastDocValue);
+        }
+        if (blockMinNorms != nullptr) {
+          blockMinNorms->push_back(minNorm);
         }
         p = headerEnd + (int64_t) blockByteLen;
         assert(p <= groupEnd);
@@ -600,6 +638,7 @@ public:
     }
 
     assert((int32_t) blockMaxTf.size() == numDocBlocks);
+    assert(blockMinNorms == nullptr || (int32_t) blockMinNorms->size() == numDocBlocks);
     assert(p == end);
   }
 
