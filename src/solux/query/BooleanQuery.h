@@ -696,6 +696,12 @@ public:
     int32_t docid = -1;
     float currentScore = 0.0f;
     int64_t visitedCandidates = 0;
+    // Inflates the double split bound to cover score()'s float-summation rounding:
+    // score() can round above the exact double sum of demoted-clause maxima by up to
+    // ~(m-1) ULP for m clauses, so demoting purely on the exact sum could skip a doc
+    // whose score() rounds > theta.  No-op at theta == lowest().  (scoreCurrentDoc and
+    // getMaxScore accumulate in float, which is already monotonically >= score().)
+    double scoreBoundFactor = 1.0;
     int64_t nonEssentialLookups = 0;
 
     static bool lessMaxScore(float a, float b) {
@@ -767,7 +773,7 @@ public:
       for (; newSplit < scorers.size(); newSplit++) {
         if (!std::isfinite(clauseMax[newSplit])) break;
         double nextSum = sum + (double) clauseMax[newSplit];
-        if (!(nextSum < (double) minCompetitiveScore)) break;
+        if (!(nextSum * scoreBoundFactor < (double) minCompetitiveScore)) break;
         sum = nextSum;
       }
       if (newSplit > splitIndex) {
@@ -785,7 +791,7 @@ public:
         float maxScore = windowMax[(size_t) windowOrder[s]];
         if (!std::isfinite(maxScore)) break;
         double nextSum = sum + (double) maxScore;
-        if (!(nextSum < (double) minCompetitiveScore)) break;
+        if (!(nextSum * scoreBoundFactor < (double) minCompetitiveScore)) break;
         sum = nextSum;
       }
       return s;
@@ -952,6 +958,8 @@ public:
               maxDoc(maxDoc),
               windowSize(normalizeWindowSize(windowSize)),
               globalMode(normalizeWindowSize(windowSize) >= maxDoc) {
+      // Float-summation error headroom for the double split bound (see member).
+      scoreBoundFactor = 1.0 + (double) scorers.size() * 0x1p-24;
       for (size_t i = 0; i < scorers.size(); i++) {
         clauseMax[i] = scorers[i]->getMaxScore(PostingsReader::END);
       }
