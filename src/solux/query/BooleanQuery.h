@@ -162,8 +162,14 @@ public:
           optScorer = targetPool.make<BooleanQuery::ConjunctionScorer>(
             targetPool, optionalScorers, optionalScorers);
         } else if (optCount > minShouldMatch) {
-          optScorer = targetPool.make<BooleanQuery::MinShouldMatchScorer>(
-            targetPool, optionalScorers, minShouldMatch);
+          bool useWand = needsScores && reqScorer == nullptr && prohibitedSources.empty();
+          if (useWand) {
+            optScorer = targetPool.make<BooleanQuery::MinShouldMatchWandScorer>(
+              targetPool, optionalScorers, minShouldMatch);
+          } else {
+            optScorer = targetPool.make<BooleanQuery::MinShouldMatchScorer>(
+              targetPool, optionalScorers, minShouldMatch);
+          }
         }
       }
 
@@ -1004,6 +1010,316 @@ public:
       return (int32_t) splitIndex;
     }
   }; // MaxScoreDisjunctionScorer
+
+
+  class MinShouldMatchWandScorer final : public Query::Scorer {
+    std::span<Scorer*> scorers;
+    std::span<float> clauseMax;
+    std::span<int32_t> head;
+    std::span<int32_t> tail;
+    std::span<int32_t> lead;
+    int32_t minMatch;
+    int32_t headSize = 0;
+    int32_t tailSize = 0;
+    int32_t leadSize = 0;
+    double tailMaxScore = 0.0;
+    double leadMaxScore = 0.0;
+    float minCompetitiveScore = std::numeric_limits<float>::lowest();
+    int32_t docid = -1;
+    float currentScore = 0.0f;
+    bool scoreReady = false;
+    int64_t visitedCandidates = 0;
+    // Inflates the pivot's double max-sum so it is a true UPPER bound on the float
+    // score() returned for a candidate.  score() is a sequential float accumulation
+    // of matching clause scores, which can round above the exact double sum of the
+    // per-clause maxima by up to ~(m-1) ULP for m clauses; comparing the exact sum
+    // against theta could otherwise skip a doc whose score() rounds > theta.
+    double scoreBoundFactor = 1.0;
+
+    // True when no doc the (lead+tail) maxima could produce can be competitive,
+    // accounting for score()'s float-summation rounding.  +inf maxima (non-impact
+    // clauses) and theta == lowest() both make this false, so pruning never engages
+    // there - the scorer degrades to exhaustive.
+    bool maxScoreBelowThreshold(double maxSum) const {
+      return maxSum * scoreBoundFactor < (double) minCompetitiveScore;
+    }
+
+    bool headLess(int32_t a, int32_t b) const {
+      int32_t docA = scorers[(size_t) a]->docId();
+      int32_t docB = scorers[(size_t) b]->docId();
+      if (docA != docB) return docA > docB;
+      return a > b;
+    }
+
+    bool tailLess(int32_t a, int32_t b) const {
+      float maxA = clauseMax[(size_t) a];
+      float maxB = clauseMax[(size_t) b];
+      if (maxA != maxB) return maxA < maxB;
+      return a > b;
+    }
+
+    bool tailGreater(int32_t a, int32_t b) const {
+      float maxA = clauseMax[(size_t) a];
+      float maxB = clauseMax[(size_t) b];
+      if (maxA != maxB) return maxA > maxB;
+      return a < b;
+    }
+
+    void heapifyTail() {
+      auto comp = [this](int32_t a, int32_t b) { return tailLess(a, b); };
+      std::make_heap(tail.begin(), tail.begin() + tailSize, comp);
+    }
+
+    void recomputeTailMaxScore() {
+      double sum = 0.0;
+      for (int32_t i = 0; i < tailSize; i++) {
+        sum += (double) clauseMax[(size_t) tail[(size_t) i]];
+      }
+      tailMaxScore = sum;
+    }
+
+    void addHead(int32_t idx) {
+      if (scorers[(size_t) idx]->docId() == PostingsReader::END) return;
+      auto comp = [this](int32_t a, int32_t b) { return headLess(a, b); };
+      head[(size_t) headSize++] = idx;
+      std::push_heap(head.begin(), head.begin() + headSize, comp);
+    }
+
+    int32_t popHead() {
+      auto comp = [this](int32_t a, int32_t b) { return headLess(a, b); };
+      std::pop_heap(head.begin(), head.begin() + headSize, comp);
+      return head[(size_t) --headSize];
+    }
+
+    void addTail(int32_t idx) {
+      auto comp = [this](int32_t a, int32_t b) { return tailLess(a, b); };
+      tail[(size_t) tailSize++] = idx;
+      std::push_heap(tail.begin(), tail.begin() + tailSize, comp);
+      tailMaxScore += (double) clauseMax[(size_t) idx];
+    }
+
+    int32_t popTail() {
+      auto comp = [this](int32_t a, int32_t b) { return tailLess(a, b); };
+      std::pop_heap(tail.begin(), tail.begin() + tailSize, comp);
+      int32_t idx = tail[(size_t) --tailSize];
+      recomputeTailMaxScore();
+      return idx;
+    }
+
+    // Keep the tail unable to produce a competitive min-should-match hit by
+    // itself. If adding idx would break that invariant, evict the highest-max
+    // tail clause so it can be advanced into the head.
+    int32_t insertTailWithOverflow(int32_t idx) {
+      if (maxScoreBelowThreshold(tailMaxScore + (double) clauseMax[(size_t) idx])
+          || tailSize + 1 < minMatch) {
+        addTail(idx);
+        return -1;
+      }
+      if (tailSize == 0) {
+        return idx;
+      }
+
+      int32_t top = tail[0];
+      if (!tailGreater(top, idx)) {
+        return idx;
+      }
+      tail[0] = idx;
+      heapifyTail();
+      recomputeTailMaxScore();
+      return top;
+    }
+
+    void advanceToHead(int32_t idx, int32_t target) {
+      auto* scorer = scorers[(size_t) idx];
+      if (scorer->docId() < target) {
+        scorer->advance(target);
+      }
+      addHead(idx);
+    }
+
+    void clearLead() {
+      leadSize = 0;
+      leadMaxScore = 0.0;
+    }
+
+    void addLead(int32_t idx) {
+      lead[(size_t) leadSize++] = idx;
+      leadMaxScore += (double) clauseMax[(size_t) idx];
+    }
+
+    void pushBackLeads(int32_t target) {
+      for (int32_t i = 0; i < leadSize; i++) {
+        int32_t evicted = insertTailWithOverflow(lead[(size_t) i]);
+        if (evicted >= 0) {
+          advanceToHead(evicted, target);
+        }
+      }
+      clearLead();
+    }
+
+    void advanceHead(int32_t target) {
+      while (headSize > 0 && scorers[(size_t) head[0]]->docId() < target) {
+        int32_t idx = popHead();
+        int32_t evicted = insertTailWithOverflow(idx);
+        if (evicted >= 0) {
+          advanceToHead(evicted, target);
+        }
+      }
+    }
+
+    void resetForTarget(int32_t target) {
+      headSize = 0;
+      tailSize = 0;
+      clearLead();
+      tailMaxScore = 0.0;
+      scoreReady = false;
+      for (size_t i = 0; i < scorers.size(); i++) {
+        if (scorers[i]->docId() == PostingsReader::END) {
+          continue;
+        }
+        if (scorers[i]->docId() < target) {
+          int32_t evicted = insertTailWithOverflow((int32_t) i);
+          if (evicted >= 0) {
+            advanceToHead(evicted, target);
+          }
+        } else {
+          addHead((int32_t) i);
+        }
+      }
+    }
+
+    void moveHeadToLead() {
+      clearLead();
+      if (headSize == 0) return;
+      docid = scorers[(size_t) head[0]]->docId();
+      while (headSize > 0 && scorers[(size_t) head[0]]->docId() == docid) {
+        addLead(popHead());
+      }
+    }
+
+    bool candidateMatchesPivot() {
+      while (leadMaxScore < (double) minCompetitiveScore || leadSize < minMatch) {
+        if (maxScoreBelowThreshold(leadMaxScore + tailMaxScore)
+            || leadSize + tailSize < minMatch) {
+          return false;
+        }
+        int32_t idx = popTail();
+        auto* scorer = scorers[(size_t) idx];
+        if (scorer->docId() < docid) {
+          scorer->advance(docid);
+        }
+        if (scorer->docId() == docid) {
+          addLead(idx);
+        } else {
+          addHead(idx);
+        }
+      }
+      return true;
+    }
+
+    int32_t doAdvance(int32_t target) {
+      resetForTarget(target);
+      for (;;) {
+        if (headSize == 0) {
+          docid = PostingsReader::END;
+          currentScore = 0.0f;
+          scoreReady = true;
+          return docid;
+        }
+        moveHeadToLead();
+        if (candidateMatchesPivot()) {
+          visitedCandidates++;
+          currentScore = 0.0f;
+          scoreReady = false;
+          return docid;
+        }
+        target = docid + 1;
+        pushBackLeads(target);
+        advanceHead(target);
+      }
+    }
+
+  public:
+    MinShouldMatchWandScorer(solux::MemPool& pool, std::span<Scorer*> scorers, int32_t minMatch)
+            : scorers(scorers),
+              clauseMax(pool.make_arr<float>(scorers.size()), scorers.size()),
+              head(pool.make_arr<int32_t>(scorers.size()), scorers.size()),
+              tail(pool.make_arr<int32_t>(scorers.size()), scorers.size()),
+              lead(pool.make_arr<int32_t>(scorers.size()), scorers.size()),
+              minMatch(minMatch) {
+      assert(minMatch >= 2);
+      assert((int32_t)scorers.size() > minMatch);
+      // Worst-case relative error of summing scorers.size() non-negative floats in
+      // float arithmetic is bounded by (m-1)*u, u = 2^-24; round the double max-sum
+      // up by that so it bounds score()'s float accumulation from above.
+      scoreBoundFactor = 1.0 + (double) scorers.size() * 0x1p-24;
+      for (size_t i = 0; i < scorers.size(); i++) {
+        clauseMax[i] = scorers[i]->getMaxScore(PostingsReader::END);
+      }
+    }
+
+    int32_t next() override {
+      assert(docid != solux::PostingsReader::END);
+      return doAdvance(docid + 1);
+    }
+
+    int32_t advance(int32_t target) override {
+      assert(docid < target);
+      return doAdvance(target);
+    }
+
+    int32_t docId() override {
+      return docid;
+    }
+
+    float score() override {
+      if (scoreReady) return currentScore;
+      float sum = 0.0f;
+      for (size_t i = 0; i < scorers.size(); i++) {
+        if (scorers[i]->docId() < docid) {
+          scorers[i]->advance(docid);
+        }
+        if (scorers[i]->docId() == docid) {
+          sum += scorers[i]->score();
+        }
+      }
+      currentScore = sum;
+      scoreReady = true;
+      return currentScore;
+    }
+
+    void setMinCompetitiveScore(float minScore) override {
+      if (minScore > minCompetitiveScore) {
+        minCompetitiveScore = minScore;
+      }
+    }
+
+    float getMaxScore(int32_t upTo) override {
+      double sum = 0.0;
+      for (auto* scorer : scorers) {
+        float maxScore = scorer->getMaxScore(upTo);
+        if (!std::isfinite(maxScore)) {
+          return std::numeric_limits<float>::infinity();
+        }
+        sum += (double) maxScore;
+      }
+      // Same float-accumulation headroom as the pivot bound, so this is a true upper
+      // bound on score() when the scorer nests under another impact scorer.
+      sum *= scoreBoundFactor;
+      if (!std::isfinite(sum) || sum > (double) std::numeric_limits<float>::max()) {
+        return std::numeric_limits<float>::infinity();
+      }
+      float ret = (float) sum;
+      if ((double) ret < sum) {
+        ret = std::nextafter(ret, std::numeric_limits<float>::infinity());
+      }
+      return ret;
+    }
+
+    int64_t visited() const {
+      return visitedCandidates;
+    }
+  }; // MinShouldMatchWandScorer
 
 
   // Matches docs where at least `minMatch` of the sub-scorers match (the

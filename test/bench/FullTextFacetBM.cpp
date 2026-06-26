@@ -94,6 +94,11 @@ enum class CrossSegmentAccumulatorMode {
   Shared
 };
 
+enum class MsmWandMode {
+  Exhaustive,
+  Wand
+};
+
 void sortScoreDocs(std::vector<ScoreDoc>& docs) {
   std::sort(docs.begin(), docs.end(), [](const ScoreDoc& a, const ScoreDoc& b) {
     if (a.score != b.score) {
@@ -216,6 +221,58 @@ ScoreTopKResult runCrossSegmentAccumulatorTopK(IndexReader& reader, int32_t topK
   ScoreTopKResult result;
   result.visited = visited;
   auto topDocs = merged.sort();
+  result.topDocs.assign(topDocs.begin(), topDocs.end());
+  sortScoreDocs(result.topDocs);
+  result.fp = scoreTopKFingerprint(result.topDocs);
+  return result;
+}
+
+ScoreTopKResult runMsmWandTopK(IndexReader& reader, int32_t topK, MsmWandMode mode) {
+  MemPool pool;
+  Query::Context qContext(pool, reader);
+  TermQuery a("body_w", "wand_a");
+  TermQuery b("body_w", "wand_b");
+  TermQuery c("body_w", "wand_c");
+  TermQuery d("body_w", "wand_d");
+  TermQuery e("body_w", "wand_e");
+  std::array<Query::Weight*, 5> weights = {
+    a.createWeight(qContext, Query::NEED_SCORES),
+    b.createWeight(qContext, Query::NEED_SCORES),
+    c.createWeight(qContext, Query::NEED_SCORES),
+    d.createWeight(qContext, Query::NEED_SCORES),
+    e.createWeight(qContext, Query::NEED_SCORES)
+  };
+  constexpr int32_t minMatch = 2;
+  TopDocsCollector collector(topK);
+
+  auto segments = qContext.topReader.segments();
+  for (int32_t segnum = 0; segnum < (int32_t) segments.size(); segnum++) {
+    auto* arr = pool.make_arr<Query::Scorer*>(weights.size());
+    int32_t count = 0;
+    for (auto* weight : weights) {
+      auto* scorer = weight->createScorer(pool, segments[segnum]);
+      if (scorer != nullptr) arr[count++] = scorer;
+    }
+    if (count < minMatch) {
+      continue;
+    }
+
+    std::span<Query::Scorer*> span(arr, (size_t) count);
+    Query::Scorer* scorer = nullptr;
+    if (count == minMatch) {
+      scorer = pool.make<BooleanQuery::ConjunctionScorer>(pool, span, span);
+    } else if (mode == MsmWandMode::Wand) {
+      scorer = pool.make<BooleanQuery::MinShouldMatchWandScorer>(pool, span, minMatch);
+    } else {
+      scorer = pool.make<BooleanQuery::MinShouldMatchScorer>(pool, span, minMatch);
+    }
+
+    collectTopK(segnum, scorer, nullptr, nullptr, collector, mode == MsmWandMode::Wand);
+  }
+
+  ScoreTopKResult result;
+  result.visited = collector.totalHits();
+  auto topDocs = collector.sort();
   result.topDocs.assign(topDocs.begin(), topDocs.end());
   sortScoreDocs(result.topDocs);
   result.fp = scoreTopKFingerprint(result.topDocs);
@@ -346,6 +403,53 @@ void makeCrossSegmentAccumulatorBody(std::string& body, int32_t seg, int32_t loc
   body.clear();
   appendTerm(body, "needle", tf);
   appendTerm(body, "filler", len - tf);
+}
+
+void makeMsmWandBenchBody(std::string& body, int64_t doc, int32_t hotLimit) {
+  int32_t used = 0;
+  auto add = [&](std::string_view term, int32_t count) {
+    appendTerm(body, term, count);
+    used += count;
+  };
+
+  body.clear();
+  bool hot = doc < hotLimit;
+  add("wand_a", 1);
+  if (hot || (doc % 2) == 0) add("wand_b", 1);
+  if (hot || (doc % 3) == 0) add("wand_c", 1);
+  if (hot) {
+    add("wand_d", hotLimit + 40 - (int32_t) (doc / 2));
+    add("wand_e", hotLimit + 20 - (int32_t) (doc / 3));
+  } else {
+    if ((doc % 31) == 0) add("wand_d", 1);
+    if ((doc % 47) == 0) add("wand_e", 1);
+  }
+
+  int32_t len = hot ? 2 * hotLimit + 220 : 140 + (int32_t) (doc % 113);
+  if (len < used) len = used;
+  add("filler", len - used);
+}
+
+void buildMsmWandBenchIndex(CollectionHelper& helper, int64_t nDocs) {
+  helper.clear();
+  auto iw = helper.getIndexWriter();
+  Inverter& inverter = iw->obtainInverter();
+  Inverter::IndexHandler& hId = inverter.getIndexHandler("id");
+  Inverter::IndexHandler& hBody = inverter.getIndexHandler("body_w");
+  int32_t hotLimit = solux::unit_tests ? 128 : 512;
+
+  std::string body;
+  for (int64_t doc = 0; doc < nDocs; doc++) {
+    makeMsmWandBenchBody(body, doc, hotLimit);
+
+    inverter.startDoc();
+    hId.index(inverter, std::to_string(doc));
+    hBody.index(inverter, body);
+    inverter.finishDoc();
+  }
+
+  iw->releaseInverter(inverter, true);
+  helper.commit();
 }
 
 void buildCrossSegmentAccumulatorBenchIndex(CollectionHelper& helper,
@@ -834,6 +938,60 @@ static void BM_FullTextScoreTopKCrossSegmentAccumulator(benchmark::State& state,
 }
 
 //
+// Min-should-match relevance top-k A/B for global-max WAND.  The first docs
+// match the high-idf clauses with large, strictly decreasing term frequencies;
+// the long tail matches mostly frequent low-idf combinations that WAND can stop
+// driving once the top-k threshold rises.
+//
+static void BM_FullTextScoreTopKMsmWand(benchmark::State& state, MsmWandMode mode) {
+  int64_t msmDocs = solux::unit_tests ? 10'000 : 1'000'003;
+  constexpr int32_t topK = 100;
+  std::vector<int32_t> docsPerSeg = {(int32_t) msmDocs};
+
+  CollectionHelper helper;
+  static int64_t builtMsmDocs = 0;
+  bool reuseIndex = builtMsmDocs == msmDocs && helper.indexMatchesShape(docsPerSeg);
+  if (!reuseIndex) {
+    buildMsmWandBenchIndex(helper, msmDocs);
+    builtMsmDocs = msmDocs;
+  }
+
+  auto reader = helper.getIndexWriter()->getIndexReader();
+
+  ScoreTopKResult exhaustive = runMsmWandTopK(*reader, topK, MsmWandMode::Exhaustive);
+  ScoreTopKResult wand = runMsmWandTopK(*reader, topK, MsmWandMode::Wand);
+  assertSameTopK(exhaustive, wand);
+
+  RSSWatcher watcher;
+
+  int64_t fp = -1;
+  int64_t visited = 0;
+  for (auto _ : state) {
+    ScoreTopKResult result = runMsmWandTopK(*reader, topK, mode);
+    benchmark::DoNotOptimize(result.fp);
+    benchmark::DoNotOptimize(result.visited);
+
+    if (fp != -1) {
+      ASSERT_EQ(fp, result.fp);
+    }
+    fp = result.fp;
+    visited = result.visited;
+  }
+
+  state.counters["fp"] = fp;
+  state.counters["visited"] = visited;
+  state.counters["mode"] = (int32_t) mode;
+  state.counters["wand"] = mode == MsmWandMode::Wand ? 1 : 0;
+  state.counters["guard_exhaustive_visited"] = exhaustive.visited;
+  state.counters["guard_wand_visited"] = wand.visited;
+  state.counters["reused"] = reuseIndex;
+  state.counters["rate"] = benchmark::Counter(state.iterations(), benchmark::Counter::kIsRate);
+  auto mem = watcher.getDeltaKB();
+  state.counters["RSS_delta"] = mem.first / 1024;
+  state.counters["RSS_max"] = mem.second / 1024;
+}
+
+//
 // Length-clustered single-term relevance top-k.  The term "hot" appears once in
 // every doc, while doc length rises monotonically with docid.  Adjacent blocks
 // have similar norms, so per-block minNorm should be a useful pruning bound.
@@ -918,6 +1076,10 @@ SOLUX_BENCHMARK_CAPTURE(BM_FullTextScoreTopKCrossSegmentAccumulator, shared,
                         CrossSegmentAccumulatorMode::Shared);
 SOLUX_BENCHMARK_CAPTURE(BM_FullTextScoreTopKCrossSegmentAccumulator, local,
                         CrossSegmentAccumulatorMode::Local);
+
+// Min-should-match WAND A/B.
+SOLUX_BENCHMARK_CAPTURE(BM_FullTextScoreTopKMsmWand, wand, MsmWandMode::Wand);
+SOLUX_BENCHMARK_CAPTURE(BM_FullTextScoreTopKMsmWand, exhaustive, MsmWandMode::Exhaustive);
 
 // Length-clustered relevance top-k A/B for the T1 minNorm pruning workload.
 SOLUX_BENCHMARK_CAPTURE(BM_FullTextScoreTopKClustered, clustered_skip,   true);

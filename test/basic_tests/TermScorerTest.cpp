@@ -3,6 +3,7 @@
 #include <array>
 #include <cmath>
 #include <limits>
+#include <span>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -63,6 +64,12 @@ protected:
 struct DisjunctionTopKRun {
   int64_t visited = 0;
   int64_t nonEssentialLookups = 0;
+  std::vector<TopDocsCollector::ScoreDoc> topDocs;
+};
+
+struct MsmTopKRun {
+  int64_t visited = 0;
+  int64_t wandVisited = 0;
   std::vector<TopDocsCollector::ScoreDoc> topDocs;
 };
 
@@ -299,6 +306,202 @@ std::vector<float> localResultScores(LocalReq& req, std::string_view opName = "q
   if (scoreIt == cols.end()) return scores;
   for (float score : scoreIt->second.col_f().v()) scores.push_back(score);
   return scores;
+}
+
+void addWandMsmDocs(CollectionHelper& helper) {
+  const int32_t nDocs = 8 * Postings::DOCS_BLOCK_SIZE + 73;
+  helper.clear();
+  std::vector<Doc> docs;
+  docs.reserve((size_t) nDocs);
+
+  for (int32_t doc = 0; doc < nDocs; doc++) {
+    std::string body;
+    int32_t used = 0;
+    auto add = [&](std::string_view term, int32_t count) {
+      appendRepeatedToken(body, term, count);
+      used += count;
+    };
+
+    bool hot = doc < 48;
+    add("msm_a", 1);
+    if (hot || (doc % 2) == 0) add("msm_b", 1);
+    if (hot || (doc % 3) == 0) add("msm_c", 1);
+    if (hot) {
+      add("msm_d", 120 - doc);
+      add("msm_e", 90 - doc / 2);
+    } else {
+      if ((doc % 29) == 0) add("msm_d", 1);
+      if ((doc % 43) == 0) add("msm_e", 1);
+    }
+
+    int32_t len = hot ? 240 : 90 + (doc % 53);
+    if (len < used) len = used;
+    add("filler", len - used);
+    docs.push_back(flatdoc("id", "w" + std::to_string(doc), "body_w", body));
+  }
+
+  helper.indexAll(docs, UpdateMessage::COMMIT);
+}
+
+std::array<Query::Weight*, 5> createWandMsmWeights(Query::Context& qContext,
+                                                   TermQuery& a, TermQuery& b,
+                                                   TermQuery& c, TermQuery& d,
+                                                   TermQuery& e) {
+  return {
+    a.createWeight(qContext, Query::NEED_SCORES),
+    b.createWeight(qContext, Query::NEED_SCORES),
+    c.createWeight(qContext, Query::NEED_SCORES),
+    d.createWeight(qContext, Query::NEED_SCORES),
+    e.createWeight(qContext, Query::NEED_SCORES)
+  };
+}
+
+Query::Scorer* createMsmScorer(MemPool& pool, std::span<Query::Weight*> weights,
+                               IndexReader::Segment& segment, int32_t minMatch,
+                               bool wand) {
+  auto* arr = pool.make_arr<Query::Scorer*>(weights.size());
+  int32_t count = 0;
+  for (auto* weight : weights) {
+    auto* scorer = weight->createScorer(pool, segment);
+    if (scorer != nullptr) arr[count++] = scorer;
+  }
+  if (count < minMatch) return nullptr;
+  std::span<Query::Scorer*> span(arr, (size_t) count);
+  if (count == minMatch) {
+    return pool.make<BooleanQuery::ConjunctionScorer>(pool, span, span);
+  }
+  if (wand) {
+    return pool.make<BooleanQuery::MinShouldMatchWandScorer>(pool, span, minMatch);
+  }
+  return pool.make<BooleanQuery::MinShouldMatchScorer>(pool, span, minMatch);
+}
+
+MsmTopKRun runMsmTopK(IndexReader& reader, int32_t minMatch, int32_t topK, bool wand) {
+  MemPool pool;
+  Query::Context qContext(pool, reader);
+  TermQuery a("body_w", "msm_a");
+  TermQuery b("body_w", "msm_b");
+  TermQuery c("body_w", "msm_c");
+  TermQuery d("body_w", "msm_d");
+  TermQuery e("body_w", "msm_e");
+  auto weights = createWandMsmWeights(qContext, a, b, c, d, e);
+  TopDocsCollector collector(topK);
+  MsmTopKRun result;
+
+  auto segments = qContext.topReader.segments();
+  for (int32_t segnum = 0; segnum < (int32_t) segments.size(); segnum++) {
+    auto* scorer = createMsmScorer(pool, weights, segments[segnum], minMatch, wand);
+    if (scorer == nullptr) continue;
+    collectTopK(segnum, scorer, nullptr, nullptr, collector, wand);
+    if (auto* wandScorer = dynamic_cast<BooleanQuery::MinShouldMatchWandScorer*>(scorer)) {
+      result.wandVisited += wandScorer->visited();
+    }
+  }
+
+  result.visited = collector.totalHits();
+  result.topDocs = sortedCollectorDocs(collector);
+  return result;
+}
+
+std::vector<TopDocsCollector::ScoreDoc> runMsmMatches(IndexReader& reader, int32_t minMatch, bool wand) {
+  MemPool pool;
+  Query::Context qContext(pool, reader);
+  TermQuery a("body_w", "msm_a");
+  TermQuery b("body_w", "msm_b");
+  TermQuery c("body_w", "msm_c");
+  TermQuery d("body_w", "msm_d");
+  TermQuery e("body_w", "msm_e");
+  auto weights = createWandMsmWeights(qContext, a, b, c, d, e);
+  std::vector<TopDocsCollector::ScoreDoc> docs;
+
+  auto segments = qContext.topReader.segments();
+  for (int32_t segnum = 0; segnum < (int32_t) segments.size(); segnum++) {
+    auto* scorer = createMsmScorer(pool, weights, segments[segnum], minMatch, wand);
+    if (scorer == nullptr) continue;
+    for (int32_t doc = scorer->next(); doc != PostingsReader::END; doc = scorer->next()) {
+      docs.push_back({scorer->score(), segdoc(segnum, doc)});
+    }
+  }
+  return docs;
+}
+
+void assertSameMsmTopK(const MsmTopKRun& expected, const MsmTopKRun& actual, int32_t minMatch, int32_t topK) {
+  ASSERT_EQ(actual.topDocs.size(), expected.topDocs.size()) << "minMatch=" << minMatch << " k=" << topK;
+  for (size_t i = 0; i < expected.topDocs.size(); i++) {
+    EXPECT_EQ(actual.topDocs[i].doc, expected.topDocs[i].doc)
+      << "minMatch=" << minMatch << " k=" << topK << " i=" << i;
+    EXPECT_FLOAT_EQ(actual.topDocs[i].score, expected.topDocs[i].score)
+      << "minMatch=" << minMatch << " k=" << topK << " i=" << i;
+  }
+}
+
+void assertSameMsmMatches(std::span<const TopDocsCollector::ScoreDoc> expected,
+                          std::span<const TopDocsCollector::ScoreDoc> actual,
+                          int32_t minMatch) {
+  ASSERT_EQ(actual.size(), expected.size()) << "minMatch=" << minMatch;
+  for (size_t i = 0; i < expected.size(); i++) {
+    EXPECT_EQ(actual[i].doc, expected[i].doc) << "minMatch=" << minMatch << " i=" << i;
+    EXPECT_FLOAT_EQ(actual[i].score, expected[i].score) << "minMatch=" << minMatch << " i=" << i;
+  }
+}
+
+// Many-clause corpus: hot docs (early) match every term with a distinct decreasing
+// `mt0` tf so the top-k scores are distinct (tie-free); later docs match sparse
+// low-score subsets.  Exercises the WAND pivot's float-summation bound across many
+// clauses (the failure mode the 5-clause tests do not reach).
+void addManyTermMsmDocs(CollectionHelper& helper, int32_t numTerms) {
+  const int32_t nDocs = 6 * Postings::DOCS_BLOCK_SIZE + 51;
+  helper.clear();
+  std::vector<Doc> docs;
+  docs.reserve((size_t) nDocs);
+  for (int32_t doc = 0; doc < nDocs; doc++) {
+    std::string body;
+    int32_t used = 0;
+    auto add = [&](const std::string& term, int32_t count) {
+      appendRepeatedToken(body, term, count);
+      used += count;
+    };
+    bool hot = doc < 40;
+    if (hot) add("mt0", 200 - doc);
+    else if ((doc % 2) == 0) add("mt0", 1);
+    for (int32_t t = 1; t < numTerms; t++) {
+      if (hot || (doc % (t + 2)) == 0) add("mt" + std::to_string(t), 1);
+    }
+    int32_t len = hot ? 260 : 100 + (doc % 41);
+    if (len < used) len = used;
+    add("filler", len - used);
+    docs.push_back(flatdoc("id", "m" + std::to_string(doc), "body_w", body));
+  }
+  helper.indexAll(docs, UpdateMessage::COMMIT);
+}
+
+MsmTopKRun runManyTermMsmTopK(IndexReader& reader, int32_t numTerms, int32_t minMatch,
+                              int32_t topK, bool wand) {
+  MemPool pool;
+  Query::Context qContext(pool, reader);
+  // TermQuery holds a string_view of the term, so the backing strings must outlive
+  // the queries/scorers (literals work elsewhere; these are built names).
+  std::vector<std::string> termStrs;
+  termStrs.reserve((size_t) numTerms);
+  for (int32_t t = 0; t < numTerms; t++) termStrs.push_back("mt" + std::to_string(t));
+  std::vector<TermQuery> queries;
+  queries.reserve((size_t) numTerms);
+  for (int32_t t = 0; t < numTerms; t++) queries.emplace_back("body_w", termStrs[(size_t) t]);
+  auto* warr = pool.make_arr<Query::Weight*>((size_t) numTerms);
+  for (int32_t t = 0; t < numTerms; t++) warr[(size_t) t] = queries[(size_t) t].createWeight(qContext, Query::NEED_SCORES);
+  std::span<Query::Weight*> weights(warr, (size_t) numTerms);
+  TopDocsCollector collector(topK);
+  MsmTopKRun result;
+  auto segments = qContext.topReader.segments();
+  for (int32_t segnum = 0; segnum < (int32_t) segments.size(); segnum++) {
+    auto* scorer = createMsmScorer(pool, weights, segments[segnum], minMatch, wand);
+    if (scorer == nullptr) continue;
+    collectTopK(segnum, scorer, nullptr, nullptr, collector, wand);
+    if (auto* w = dynamic_cast<BooleanQuery::MinShouldMatchWandScorer*>(scorer)) result.wandVisited += w->visited();
+  }
+  result.visited = collector.totalHits();
+  result.topDocs = sortedCollectorDocs(collector);
+  return result;
 }
 
 
@@ -1105,6 +1308,52 @@ TEST_F(TermScorerTest, windowedMaxScoreDisjunctionTopKMatchesExhaustiveAndGlobal
     } else {
       EXPECT_EQ(windowed.visited, expected.visited);
       EXPECT_EQ(windowed.nonEssentialLookups, 0);
+    }
+  }
+  helper.clear();
+}
+
+TEST_F(TermScorerTest, WandMinShouldMatchTopKMatchesExhaustive) {
+  CollectionHelper helper("main");
+  addWandMsmDocs(helper);
+  auto reader = helper.getIndexWriter()->getIndexReader();
+  const int32_t totalDocs = 8 * Postings::DOCS_BLOCK_SIZE + 73;
+
+  for (int32_t minMatch : {2, 3}) {
+    auto expectedMatches = runMsmMatches(*reader, minMatch, false);
+    auto actualMatches = runMsmMatches(*reader, minMatch, true);
+    assertSameMsmMatches(expectedMatches, actualMatches, minMatch);
+
+    for (int32_t k : {5, totalDocs + 10}) {
+      auto expected = runMsmTopK(*reader, minMatch, k, false);
+      auto actual = runMsmTopK(*reader, minMatch, k, true);
+      assertSameMsmTopK(expected, actual, minMatch, k);
+      if (k == 5) {
+        EXPECT_LT(actual.visited, expected.visited) << "minMatch=" << minMatch;
+        EXPECT_GT(actual.wandVisited, 0) << "minMatch=" << minMatch;
+      } else {
+        EXPECT_EQ(actual.visited, expected.visited) << "minMatch=" << minMatch;
+      }
+    }
+  }
+  helper.clear();
+}
+
+TEST_F(TermScorerTest, WandManyClauseMsmMatchesExhaustive) {
+  CollectionHelper helper("main");
+  const int32_t numTerms = 12;
+  addManyTermMsmDocs(helper, numTerms);
+  auto reader = helper.getIndexWriter()->getIndexReader();
+
+  for (int32_t minMatch : {3, 6}) {
+    for (int32_t k : {5, 200}) {
+      auto expected = runManyTermMsmTopK(*reader, numTerms, minMatch, k, false);
+      auto actual = runManyTermMsmTopK(*reader, numTerms, minMatch, k, true);
+      assertSameMsmTopK(expected, actual, minMatch, k);
+      if (k == 5) {
+        EXPECT_LT(actual.visited, expected.visited) << "minMatch=" << minMatch;
+        EXPECT_GT(actual.wandVisited, 0) << "minMatch=" << minMatch;
+      }
     }
   }
   helper.clear();
