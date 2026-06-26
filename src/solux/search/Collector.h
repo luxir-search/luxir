@@ -1,5 +1,8 @@
 #pragma once
 
+#include <atomic>
+#include <limits>
+
 #include "solux/query/Query.h"
 #include "solux/search/DocSet.h"
 
@@ -283,6 +286,26 @@ public:
 
 };
 
+class MaxScoreAccumulator {
+public:
+  std::atomic<float> maxScore;
+
+  MaxScoreAccumulator() : maxScore(std::numeric_limits<float>::lowest()) {
+  }
+
+  void accumulate(float score) {
+    float cur = maxScore.load(std::memory_order_acquire);
+    while (score > cur
+           && !maxScore.compare_exchange_weak(
+             cur, score, std::memory_order_acq_rel, std::memory_order_acquire)) {
+    }
+  }
+
+  float get() const {
+    return maxScore.load(std::memory_order_acquire);
+  }
+};
+
 // Drive a per-segment Scorer through the optional `filter` domain, feeding (doc, score)
 // into `collector`.  If `builder` is non-null, also records every matched doc for use as
 // a sub-op domain (see TopDocsReq's per-segment subCalc dispatch).  Templated on Collector
@@ -299,16 +322,54 @@ public:
 // it skips - so a query that needs the count must forgo pruning.
 template <typename Collector>
 void collectTopK(int32_t segnum, Query::Scorer* scorer, DocSet* filter,
-                 DocSetBuilder* builder, Collector& collector, bool allowPruning = true) {
+                 DocSetBuilder* builder, Collector& collector, bool allowPruning = true,
+                 MaxScoreAccumulator* accumulator = nullptr) {
+  constexpr int32_t kAccumulatorPollPeriod = 1024;
   float lastPushedMinCompetitiveScore = std::numeric_limits<float>::lowest();
-  auto pushMinCompetitiveScore = [&]() {
+  int32_t accumulatorPollCount = 0;
+  auto pushMinCompetitiveScore = [&](bool localRise, bool periodicPoll) {
     if constexpr (requires { collector.minCompetitiveVal; }) {
-      if (allowPruning && builder == nullptr && collector.minCompetitiveVal > lastPushedMinCompetitiveScore) {
-        scorer->setMinCompetitiveScore(collector.minCompetitiveVal);
-        lastPushedMinCompetitiveScore = collector.minCompetitiveVal;
+      if (!allowPruning || builder != nullptr) {
+        return;
+      }
+      if (accumulator != nullptr) {
+        if (localRise) {
+          accumulator->accumulate(collector.minCompetitiveVal);
+        } else if (!periodicPoll) {
+          return;
+        }
+      } else if (!localRise) {
+        return;
+      }
+
+      float minCompetitiveScore = accumulator != nullptr
+        ? accumulator->get()
+        : collector.minCompetitiveVal;
+      if (minCompetitiveScore > lastPushedMinCompetitiveScore) {
+        scorer->setMinCompetitiveScore(minCompetitiveScore);
+        lastPushedMinCompetitiveScore = minCompetitiveScore;
       }
     } else {
-      unused(lastPushedMinCompetitiveScore, allowPruning);
+      unused(localRise, periodicPoll, lastPushedMinCompetitiveScore, allowPruning, accumulator);
+    }
+  };
+  auto collectOne = [&](int32_t doc, float score) {
+    if constexpr (requires { collector.minCompetitiveVal; }) {
+      float oldMinCompetitiveVal = collector.minCompetitiveVal;
+      collector.collect(segnum, doc, score);
+      bool localRise = collector.minCompetitiveVal > oldMinCompetitiveVal;
+      bool periodicPoll = false;
+      if (allowPruning && builder == nullptr && accumulator != nullptr) {
+        accumulatorPollCount++;
+        if (accumulatorPollCount >= kAccumulatorPollPeriod) {
+          accumulatorPollCount = 0;
+          periodicPoll = true;
+        }
+      }
+      pushMinCompetitiveScore(localRise, periodicPoll);
+    } else {
+      unused(lastPushedMinCompetitiveScore, accumulatorPollCount, accumulator, allowPruning);
+      collector.collect(segnum, doc, score);
     }
   };
 
@@ -327,8 +388,7 @@ void collectTopK(int32_t segnum, Query::Scorer* scorer, DocSet* filter,
         builder->add(doc);
       }
       auto score = scorer->score();
-      collector.collect(segnum, doc, score);
-      pushMinCompetitiveScore();
+      collectOne(doc, score);
     }
   } else {
     assert(filter->type == DocSet::ARRAY);
@@ -344,8 +404,7 @@ void collectTopK(int32_t segnum, Query::Scorer* scorer, DocSet* filter,
         builder->add(doc);
       }
       auto score = scorer->score();
-      collector.collect(segnum, doc, score);
-      pushMinCompetitiveScore();
+      collectOne(doc, score);
     }
   }
 }

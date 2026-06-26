@@ -96,6 +96,7 @@ public:
 
 
     AtomicMerger<MergeableCollector> collectorMerger;
+    MaxScoreAccumulator scoreAccumulator;
 
 
     // produced domains for subOps.
@@ -289,7 +290,8 @@ public:
             // get_number requests an exact total hit count, which is incompatible with
             // impact block skipping (skipped docs are not visited, so not counted).
             bool allowPruning = !op.topDocsProto.get_number();
-            collectTopK(segnum, scorer, filter, builderPtr, *data->scoreCollector, allowPruning);
+            collectTopK(segnum, scorer, filter, builderPtr, *data->scoreCollector,
+                        allowPruning, &scoreAccumulator);
           }
         }
         if (builder.has_value()) {

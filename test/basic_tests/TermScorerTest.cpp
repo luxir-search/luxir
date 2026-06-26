@@ -1,7 +1,12 @@
 #include <solux/query/AllQuery.h>
+#include <algorithm>
 #include <array>
 #include <cmath>
 #include <limits>
+#include <string>
+#include <string_view>
+#include <thread>
+#include <vector>
 #include "gtest/gtest.h"
 #include "test/SoluxTest.h"
 #include "test/TestIndex.h"
@@ -181,6 +186,119 @@ void assertSameTopKDocs(const DisjunctionTopKRun& expected, const DisjunctionTop
     EXPECT_EQ(actual.topDocs[i].doc, expected.topDocs[i].doc) << "k=" << topK << " i=" << i;
     EXPECT_FLOAT_EQ(actual.topDocs[i].score, expected.topDocs[i].score) << "k=" << topK << " i=" << i;
   }
+}
+
+void appendRepeatedToken(std::string& body, std::string_view token, int32_t count) {
+  for (int32_t i = 0; i < count; i++) {
+    if (!body.empty()) body.push_back(' ');
+    body.append(token);
+  }
+}
+
+std::string makeCrossSegmentBody(int32_t tf, int32_t len) {
+  std::string body;
+  appendRepeatedToken(body, "needle", tf);
+  appendRepeatedToken(body, "filler", len - tf);
+  return body;
+}
+
+void addCrossSegmentAccumulatorDocs(CollectionHelper& helper, std::vector<std::vector<std::string>>& idsBySeg,
+                                    int32_t segCount = 3) {
+  const std::array<int32_t, 3> segDocs = {
+    2 * Postings::DOCS_BLOCK_SIZE + 17,
+    6 * Postings::DOCS_BLOCK_SIZE + 31,
+    4 * Postings::DOCS_BLOCK_SIZE + 19
+  };
+  helper.clear();
+  idsBySeg.clear();
+  idsBySeg.resize((size_t) segCount);
+
+  for (int32_t seg = 0; seg < segCount; seg++) {
+    std::vector<Doc> docs;
+    docs.reserve((size_t) segDocs[(size_t) seg]);
+    idsBySeg[(size_t) seg].reserve((size_t) segDocs[(size_t) seg]);
+    for (int32_t local = 0; local < segDocs[(size_t) seg]; local++) {
+      int32_t tf;
+      int32_t len;
+      if (seg == 0 && local < 16) {
+        tf = 96 - local * 3;
+        len = 128;
+      } else if (seg == 0) {
+        tf = 2;
+        len = 220 + (local % 37);
+      } else {
+        tf = 1;
+        int32_t docsInSeg = segDocs[(size_t) seg];
+        int32_t lenRange = 140;
+        len = 260 - (local * lenRange / std::max(1, docsInSeg - 1));
+        if (seg == 2) len += 20;
+      }
+      std::string id = "s" + std::to_string(seg) + "_" + std::to_string(local);
+      idsBySeg[(size_t) seg].push_back(id);
+      docs.push_back(flatdoc("id", id, "body_w", makeCrossSegmentBody(tf, len)));
+    }
+    helper.indexAll(docs, UpdateMessage::COMMIT);
+  }
+}
+
+DisjunctionTopKRun runCrossSegmentTermTopK(IndexReader& reader, int32_t topK,
+                                           bool allowPruning,
+                                           MaxScoreAccumulator* accumulator = nullptr) {
+  MemPool pool;
+  Query::Context qContext(pool, reader);
+  TermQuery query("body_w", "needle");
+  auto* weight = query.createWeight(qContext, Query::NEED_SCORES);
+  TopDocsCollector collector(topK);
+
+  auto segments = qContext.topReader.segments();
+  for (int32_t segnum = 0; segnum < (int32_t) segments.size(); segnum++) {
+    auto* scorer = weight->createScorer(pool, segments[segnum]);
+    if (scorer == nullptr) continue;
+    collectTopK(segnum, scorer, nullptr, nullptr, collector, allowPruning, accumulator);
+  }
+
+  DisjunctionTopKRun result;
+  result.visited = collector.totalHits();
+  result.topDocs = sortedCollectorDocs(collector);
+  return result;
+}
+
+void collectCrossSegmentTermSegment(IndexReader& reader, int32_t segnum, int32_t topK,
+                                    bool allowPruning, MaxScoreAccumulator* accumulator,
+                                    TopDocsCollector& collector) {
+  MemPool pool;
+  Query::Context qContext(pool, reader);
+  TermQuery query("body_w", "needle");
+  auto* weight = query.createWeight(qContext, Query::NEED_SCORES);
+  auto segments = qContext.topReader.segments();
+  ASSERT_LT(segnum, (int32_t) segments.size());
+  auto* scorer = weight->createScorer(pool, segments[segnum]);
+  ASSERT_NE(scorer, nullptr);
+  collectTopK(segnum, scorer, nullptr, nullptr, collector, allowPruning, accumulator);
+}
+
+std::vector<std::string> localResultIds(LocalReq& req, std::string_view opName = "q") {
+  std::vector<std::string> ids;
+  if (req.responses.empty()) return ids;
+  auto it = req.responses[0]->proto.ops().find(std::string(opName));
+  if (it == req.responses[0]->proto.ops().end() || !it->second.has_docs()) return ids;
+  const auto& cols = it->second.docs().columns();
+  auto idIt = cols.find("id");
+  if (idIt == cols.end()) return ids;
+  for (const auto& id : idIt->second.col_s().v()) ids.emplace_back(id);
+  return ids;
+}
+
+std::vector<float> localResultScores(LocalReq& req, std::string_view opName = "q") {
+  std::vector<float> scores;
+  if (req.responses.empty()) return scores;
+  auto it = req.responses[0]->proto.ops().find(std::string(opName));
+  if (it == req.responses[0]->proto.ops().end() || !it->second.has_docs()) return scores;
+  const auto& cols = it->second.docs().columns();
+  auto scoreIt = cols.find("_score_");
+  if (scoreIt == cols.end()) return scores;
+  for (float score : scoreIt->second.col_f().v()) scores.push_back(score);
+  return scores;
 }
 
 
@@ -989,6 +1107,103 @@ TEST_F(TermScorerTest, windowedMaxScoreDisjunctionTopKMatchesExhaustiveAndGlobal
       EXPECT_EQ(windowed.nonEssentialLookups, 0);
     }
   }
+  helper.clear();
+}
+
+TEST_F(TermScorerTest, MaxScoreAccumulatorConcurrentMax) {
+  MaxScoreAccumulator accumulator;
+  float prev = accumulator.get();
+  for (float score : {0.5f, 0.25f, 3.0f, 2.0f, 7.5f, 6.0f}) {
+    accumulator.accumulate(score);
+    float cur = accumulator.get();
+    EXPECT_GE(cur, prev);
+    prev = cur;
+  }
+  EXPECT_FLOAT_EQ(accumulator.get(), 7.5f);
+
+  MaxScoreAccumulator concurrent;
+  std::array<std::vector<float>, 4> values = {
+    std::vector<float>{1.0f, 4.0f, 12.0f, 8.0f},
+    std::vector<float>{2.0f, 18.0f, 3.0f},
+    std::vector<float>{5.0f, 99.5f, 11.0f},
+    std::vector<float>{0.5f, 42.0f, 77.0f}
+  };
+  std::vector<std::thread> threads;
+  threads.reserve(values.size());
+  for (size_t i = 0; i < values.size(); i++) {
+    threads.emplace_back([&concurrent, &values, i]() {
+      for (float score : values[i]) {
+        concurrent.accumulate(score);
+      }
+    });
+  }
+  for (auto& thread : threads) {
+    thread.join();
+  }
+  EXPECT_FLOAT_EQ(concurrent.get(), 99.5f);
+}
+
+TEST_F(TermScorerTest, CrossSegmentAccumulatorRealOpMatchesExhaustive) {
+  CollectionHelper helper("main");
+  std::vector<std::vector<std::string>> idsBySeg;
+  addCrossSegmentAccumulatorDocs(helper, idsBySeg, 3);
+  auto reader = helper.getIndexWriter()->getIndexReader();
+  const int32_t k = 5;
+
+  auto expected = runCrossSegmentTermTopK(*reader, k, false);
+
+  auto* req = LocalReq::create(SoluxTest::soluxNode->getSearchEngine());
+  req->collection("main").matchQuery("body_w", "needle").fields({"id"}).limit(k);
+  req->topDocs("q").set_get_scores(true);
+  req->execute(true);
+  ASSERT_EQ(req->responses.size(), 1u) << req->toString();
+  ASSERT_FALSE(req->responses[0]->proto.has_error()) << req->toString();
+
+  auto ids = localResultIds(*req);
+  auto scores = localResultScores(*req);
+  ASSERT_EQ(ids.size(), expected.topDocs.size());
+  ASSERT_EQ(scores.size(), expected.topDocs.size());
+  for (size_t i = 0; i < expected.topDocs.size(); i++) {
+    auto seg = (size_t) expected.topDocs[i].doc.segment();
+    auto doc = (size_t) expected.topDocs[i].doc.docId();
+    ASSERT_LT(seg, idsBySeg.size());
+    ASSERT_LT(doc, idsBySeg[seg].size());
+    EXPECT_EQ(ids[i], idsBySeg[seg][doc]) << "i=" << i;
+    EXPECT_FLOAT_EQ(scores[i], expected.topDocs[i].score) << "i=" << i;
+  }
+  req->done();
+  helper.clear();
+}
+
+TEST_F(TermScorerTest, CrossSegmentAccumulatorPropagatesThresholdSequential) {
+  CollectionHelper helper("main");
+  std::vector<std::vector<std::string>> idsBySeg;
+  addCrossSegmentAccumulatorDocs(helper, idsBySeg, 2);
+  auto reader = helper.getIndexWriter()->getIndexReader();
+  const int32_t k = 5;
+
+  MaxScoreAccumulator accumulator;
+  TopDocsCollector seg0Collector(k);
+  collectCrossSegmentTermSegment(*reader, 0, k, true, &accumulator, seg0Collector);
+  ASSERT_GT(accumulator.get(), std::numeric_limits<float>::lowest());
+
+  TopDocsCollector seg1SharedCollector(k);
+  collectCrossSegmentTermSegment(*reader, 1, k, true, &accumulator, seg1SharedCollector);
+
+  TopDocsCollector seg1LocalCollector(k);
+  collectCrossSegmentTermSegment(*reader, 1, k, true, nullptr, seg1LocalCollector);
+
+  EXPECT_LT(seg1SharedCollector.totalHits(), seg1LocalCollector.totalHits());
+
+  TopDocsCollector merged(k);
+  merged.merge(seg0Collector);
+  merged.merge(seg1SharedCollector);
+
+  DisjunctionTopKRun actual;
+  actual.visited = seg0Collector.totalHits() + seg1SharedCollector.totalHits();
+  actual.topDocs = sortedCollectorDocs(merged);
+  auto expected = runCrossSegmentTermTopK(*reader, k, false);
+  assertSameTopKDocs(expected, actual, k);
   helper.clear();
 }
 

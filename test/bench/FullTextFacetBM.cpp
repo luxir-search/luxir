@@ -89,6 +89,11 @@ enum class DisjunctionMaxScoreMode {
   Windowed
 };
 
+enum class CrossSegmentAccumulatorMode {
+  Local,
+  Shared
+};
+
 void sortScoreDocs(std::vector<ScoreDoc>& docs) {
   std::sort(docs.begin(), docs.end(), [](const ScoreDoc& a, const ScoreDoc& b) {
     if (a.score != b.score) {
@@ -180,6 +185,37 @@ ScoreTopKResult runFullTextScoreTopKDisjunction(IndexReader& reader,
   result.visited = collector.totalHits();
   result.nonEssentialLookups = nonEssentialLookups;
   auto topDocs = collector.sort();
+  result.topDocs.assign(topDocs.begin(), topDocs.end());
+  sortScoreDocs(result.topDocs);
+  result.fp = scoreTopKFingerprint(result.topDocs);
+  return result;
+}
+
+ScoreTopKResult runCrossSegmentAccumulatorTopK(IndexReader& reader, int32_t topK,
+                                               bool allowPruning,
+                                               MaxScoreAccumulator* accumulator) {
+  MemPool pool;
+  Query::Context qContext(pool, reader);
+  TermQuery query("body_w", "needle");
+  auto* weight = query.createWeight(qContext, Query::NEED_SCORES);
+  TopDocsCollector merged(topK);
+  int64_t visited = 0;
+
+  auto segments = qContext.topReader.segments();
+  for (int32_t segnum = 0; segnum < (int32_t) segments.size(); segnum++) {
+    auto* scorer = weight->createScorer(pool, segments[segnum]);
+    if (scorer == nullptr) {
+      continue;
+    }
+    TopDocsCollector segmentCollector(topK);
+    collectTopK(segnum, scorer, nullptr, nullptr, segmentCollector, allowPruning, accumulator);
+    visited += segmentCollector.totalHits();
+    merged.merge(segmentCollector);
+  }
+
+  ScoreTopKResult result;
+  result.visited = visited;
+  auto topDocs = merged.sort();
   result.topDocs.assign(topDocs.begin(), topDocs.end());
   sortScoreDocs(result.topDocs);
   result.fp = scoreTopKFingerprint(result.topDocs);
@@ -289,6 +325,54 @@ void appendTerm(std::string& body, std::string_view term, int32_t count) {
     if (!body.empty()) body.push_back(' ');
     body.append(term);
   }
+}
+
+void makeCrossSegmentAccumulatorBody(std::string& body, int32_t seg, int32_t local,
+                                     int32_t docsInSeg) {
+  int32_t tf;
+  int32_t len;
+  if (seg == 0 && local < 160) {
+    tf = 220 - local;
+    if (tf < 30) tf = 30;
+    len = 240;
+  } else if (seg == 0) {
+    tf = 2;
+    len = 260;
+  } else {
+    tf = 1;
+    len = 300 - (local * 180 / std::max(1, docsInSeg - 1)) + seg * 8;
+  }
+
+  body.clear();
+  appendTerm(body, "needle", tf);
+  appendTerm(body, "filler", len - tf);
+}
+
+void buildCrossSegmentAccumulatorBenchIndex(CollectionHelper& helper,
+                                            std::span<const int32_t> docsPerSeg) {
+  helper.clear();
+  auto iw = helper.getIndexWriter();
+  int64_t id = 0;
+
+  for (size_t segnum = 0; segnum < docsPerSeg.size(); segnum++) {
+    Inverter& inverter = iw->obtainInverter();
+    Inverter::IndexHandler& hId = inverter.getIndexHandler("id");
+    Inverter::IndexHandler& hBody = inverter.getIndexHandler("body_w");
+    int32_t docsInSeg = docsPerSeg[segnum];
+
+    std::string body;
+    for (int32_t local = 0; local < docsInSeg; local++) {
+      makeCrossSegmentAccumulatorBody(body, (int32_t) segnum, local, docsInSeg);
+
+      inverter.startDoc();
+      hId.index(inverter, std::to_string(id++));
+      hBody.index(inverter, body);
+      inverter.finishDoc();
+    }
+    iw->releaseInverter(inverter, true);
+  }
+
+  helper.commit();
 }
 
 void buildClusteredDisjunctionBenchIndex(CollectionHelper& helper, int64_t nDocs) {
@@ -685,6 +769,71 @@ static void BM_FullTextScoreTopKDisjunctionClustered(benchmark::State& state,
 }
 
 //
+// Multi-segment relevance top-k for cross-segment competitive threshold sharing.
+// Segment 0 owns the global winners, so its filled top-k threshold can prune the
+// lower-scoring later segments when a shared MaxScoreAccumulator is enabled.
+//
+static void BM_FullTextScoreTopKCrossSegmentAccumulator(benchmark::State& state,
+                                                        CrossSegmentAccumulatorMode mode) {
+  constexpr int32_t topK = 100;
+  std::vector<int32_t> docsPerSeg;
+  if (solux::unit_tests) {
+    docsPerSeg = {2048, 2048, 2048, 2048};
+  } else {
+    docsPerSeg.assign(8, 125000);
+  }
+
+  CollectionHelper helper;
+  static std::vector<int32_t> builtShape;
+  bool reuseIndex = builtShape == docsPerSeg && helper.indexMatchesShape(docsPerSeg);
+  if (!reuseIndex) {
+    buildCrossSegmentAccumulatorBenchIndex(helper, docsPerSeg);
+    builtShape = docsPerSeg;
+  }
+
+  auto reader = helper.getIndexWriter()->getIndexReader();
+
+  ScoreTopKResult exhaustive = runCrossSegmentAccumulatorTopK(*reader, topK, false, nullptr);
+  ScoreTopKResult local = runCrossSegmentAccumulatorTopK(*reader, topK, true, nullptr);
+  MaxScoreAccumulator guardAccumulator;
+  ScoreTopKResult shared = runCrossSegmentAccumulatorTopK(*reader, topK, true, &guardAccumulator);
+  assertSameTopK(exhaustive, local);
+  assertSameTopK(exhaustive, shared);
+
+  RSSWatcher watcher;
+
+  int64_t fp = -1;
+  int64_t visited = 0;
+  for (auto _ : state) {
+    MaxScoreAccumulator accumulator;
+    ScoreTopKResult result = mode == CrossSegmentAccumulatorMode::Shared
+      ? runCrossSegmentAccumulatorTopK(*reader, topK, true, &accumulator)
+      : runCrossSegmentAccumulatorTopK(*reader, topK, true, nullptr);
+    benchmark::DoNotOptimize(result.fp);
+    benchmark::DoNotOptimize(result.visited);
+
+    if (fp != -1) {
+      ASSERT_EQ(fp, result.fp);
+    }
+    fp = result.fp;
+    visited = result.visited;
+  }
+
+  state.counters["fp"] = fp;
+  state.counters["visited"] = visited;
+  state.counters["mode"] = (int32_t) mode;
+  state.counters["shared"] = mode == CrossSegmentAccumulatorMode::Shared ? 1 : 0;
+  state.counters["guard_exhaustive_visited"] = exhaustive.visited;
+  state.counters["guard_local_visited"] = local.visited;
+  state.counters["guard_shared_visited"] = shared.visited;
+  state.counters["reused"] = reuseIndex;
+  state.counters["rate"] = benchmark::Counter(state.iterations(), benchmark::Counter::kIsRate);
+  auto mem = watcher.getDeltaKB();
+  state.counters["RSS_delta"] = mem.first / 1024;
+  state.counters["RSS_max"] = mem.second / 1024;
+}
+
+//
 // Length-clustered single-term relevance top-k.  The term "hot" appears once in
 // every doc, while doc length rises monotonically with docid.  Adjacent blocks
 // have similar norms, so per-block minNorm should be a useful pruning bound.
@@ -763,6 +912,12 @@ SOLUX_BENCHMARK_CAPTURE(BM_FullTextScoreTopKDisjunctionClustered, clustered_glob
                         DisjunctionMaxScoreMode::Global);
 SOLUX_BENCHMARK_CAPTURE(BM_FullTextScoreTopKDisjunctionClustered, clustered_exhaustive,
                         DisjunctionMaxScoreMode::Exhaustive);
+
+// Cross-segment competitive threshold A/B.
+SOLUX_BENCHMARK_CAPTURE(BM_FullTextScoreTopKCrossSegmentAccumulator, shared,
+                        CrossSegmentAccumulatorMode::Shared);
+SOLUX_BENCHMARK_CAPTURE(BM_FullTextScoreTopKCrossSegmentAccumulator, local,
+                        CrossSegmentAccumulatorMode::Local);
 
 // Length-clustered relevance top-k A/B for the T1 minNorm pruning workload.
 SOLUX_BENCHMARK_CAPTURE(BM_FullTextScoreTopKClustered, clustered_skip,   true);
