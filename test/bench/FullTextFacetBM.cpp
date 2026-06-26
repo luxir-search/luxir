@@ -259,19 +259,6 @@ void assertSameTopK(const ScoreTopKResult& expected, const ScoreTopKResult& actu
   }
 }
 
-// Tie-tolerant top-k equivalence: compares the sorted score sequence only.  When
-// many docs share the boundary score the SET of top-k docids is genuinely
-// ambiguous (exhaustive collects in docid order, MaxScore in essential-union
-// order, so they keep different tied docs), but any correct top-k has the same
-// unique score multiset.  Exact-docid equivalence on a tie-free corpus is covered
-// by TermScorerTest.
-void assertSameTopKScores(const ScoreTopKResult& expected, const ScoreTopKResult& actual) {
-  ASSERT_EQ(actual.topDocs.size(), expected.topDocs.size());
-  for (size_t i = 0; i < expected.topDocs.size(); i++) {
-    ASSERT_FLOAT_EQ(actual.topDocs[i].score, expected.topDocs[i].score) << "i=" << i;
-  }
-}
-
 void buildClusteredScoreTopKIndex(IndexWriter& iw, int64_t nDocs) {
   Inverter& inverter = iw.obtainInverter();
   Inverter::IndexHandler& hBody = inverter.getIndexHandler("body_w");
@@ -313,25 +300,35 @@ void buildClusteredDisjunctionBenchIndex(CollectionHelper& helper, int64_t nDocs
 
   std::string body;
   for (int64_t doc = 0; doc < nDocs; doc++) {
-    int64_t window = doc / DocsEnum::L1_DOCS;
-    bool alphaHot = window == 0 && (doc % 2) == 0;
-    bool betaHot = window == 1 && (doc % 2) == 0;
+    // alpha's high-impact docs are clustered in window 0 with STRICTLY DECREASING
+    // tf, each padded to a constant length, so every top-k score is distinct with
+    // a clear gap (no ties, and no sub-ULP boundary flip between the heap-order
+    // exhaustive sum and the stable-order MaxScore sum) - which keeps the exact
+    // doc-id bench guard valid.  alpha also appears at tf 1 scattered through every
+    // later window, so its GLOBAL max stays high (the window-0 cluster) and global
+    // MaxScore must keep it essential everywhere; windowed MaxScore demotes it in
+    // the later windows where its per-window max is just tf 1.  One clustered clause
+    // is enough to separate windowed from global; common/beta are demoted disjuncts.
+    int32_t alphaHotTf = 0;
+    if (doc < DocsEnum::L1_DOCS && (doc % 2) == 0) {
+      alphaHotTf = (int32_t) std::max<int64_t>(2, 132 - doc / 2);
+    }
 
     body.clear();
     appendTerm(body, "common", 1);
-    if (alphaHot) {
-      appendTerm(body, "alpha", 24);
-    } else if ((doc % 3) == 0) {
-      appendTerm(body, "alpha", 1);
+    if (alphaHotTf > 0) {
+      appendTerm(body, "alpha", alphaHotTf);
+      appendTerm(body, "filler", 134 - alphaHotTf);  // constant length: only tf drives the score
+    } else {
+      // Scattered alpha keeps alpha's global max high (so global MaxScore drives
+      // it through every later window); beta is a frequent, low-idf disjunct that
+      // both global and windowed demote once the threshold rises.  windowed also
+      // demotes alpha in these later windows (per-window max is just tf 1), so it
+      // skips the bulk that global must scan.
+      if ((doc % 3) == 0) appendTerm(body, "alpha", 1);
+      if ((doc % 2) == 1) appendTerm(body, "beta", 1);
+      appendTerm(body, "filler", 80);
     }
-    if (betaHot) {
-      appendTerm(body, "beta", 24);
-    } else if ((doc % 5) == 0) {
-      appendTerm(body, "beta", 1);
-    }
-
-    int32_t filler = alphaHot || betaHot ? 2 : 80;
-    appendTerm(body, "filler", filler);
 
     inverter.startDoc();
     hId.index(inverter, std::to_string(doc));
@@ -653,8 +650,8 @@ static void BM_FullTextScoreTopKDisjunctionClustered(benchmark::State& state,
     *reader, topK, DisjunctionMaxScoreMode::Global);
   ScoreTopKResult windowed = runClusteredDisjunctionTopK(
     *reader, topK, DisjunctionMaxScoreMode::Windowed);
-  assertSameTopKScores(exhaustive, global);
-  assertSameTopKScores(exhaustive, windowed);
+  assertSameTopK(exhaustive, global);
+  assertSameTopK(exhaustive, windowed);
 
   RSSWatcher watcher;
 
