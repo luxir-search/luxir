@@ -373,6 +373,21 @@ void collectTopK(int32_t segnum, Query::Scorer* scorer, DocSet* filter,
     }
   };
 
+  // Seed the scorer with the shared threshold a sibling segment may have already
+  // raised, so this segment prunes from the FIRST doc instead of waiting for its
+  // own heap to fill (k docs) or the periodic poll.  This is what lets a segment
+  // that matches few docs but does heavy per-match work still benefit from the
+  // cross-segment threshold.
+  if constexpr (requires { collector.minCompetitiveVal; }) {
+    if (allowPruning && builder == nullptr && accumulator != nullptr) {
+      float seed = accumulator->get();
+      if (seed > lastPushedMinCompetitiveScore) {
+        scorer->setMinCompetitiveScore(seed);
+        lastPushedMinCompetitiveScore = seed;
+      }
+    }
+  }
+
   if (filter == nullptr || filter->type == DocSet::BITSET) {
     BitDocSet* bitDocs = (BitDocSet*)filter;
     auto* domainBits = bitDocs ? &bitDocs->bits() : nullptr;
