@@ -152,7 +152,8 @@ public:
           if (optCount == 1) {
             optScorer = optionalScorers[0];
           } else if (useMaxScoreDisjunction) {
-            optScorer = targetPool.make<BooleanQuery::MaxScoreDisjunctionScorer>(targetPool, optionalScorers);
+            optScorer = targetPool.make<BooleanQuery::MaxScoreDisjunctionScorer>(
+              targetPool, optionalScorers, segment.maxDoc());
           } else {
             optScorer = targetPool.make<BooleanQuery::DisjunctionScorer>(targetPool, optionalScorers);
           }
@@ -665,8 +666,11 @@ public:
 
   class MaxScoreDisjunctionScorer final : public Query::Scorer {
     MemPool& pool;
-    std::span<Scorer*> scorers;
+    std::span<Scorer*> scorers;  // stable global-max order, used for deterministic scoring
     std::span<float> clauseMax;
+    std::span<float> windowMax;
+    std::span<int32_t> windowOrder;
+    std::span<bool> isEssential;
     std::span<Scorer*> essentialPointers;
 
     // TODO: OPT: heapifying with virtual methods prob isn't a good idea... pull out and save the docid.
@@ -674,6 +678,13 @@ public:
 
     solux::IndirectPQ<Scorer, decltype(idComparator)>* pq = nullptr;
 
+    int32_t maxDoc;
+    int32_t windowSize;
+    bool globalMode;
+    bool windowReady = false;
+    int32_t nextWindowStart = 0;
+    int32_t windowStart = 0;
+    int32_t windowEnd = 0;
     size_t splitIndex = 0;
     float minCompetitiveScore = std::numeric_limits<float>::lowest();
     int32_t docid = -1;
@@ -686,6 +697,10 @@ public:
       bool finiteB = std::isfinite(b);
       if (finiteA != finiteB) return finiteA;
       return a < b;
+    }
+
+    static int32_t normalizeWindowSize(int32_t requestedWindowSize) {
+      return requestedWindowSize > 0 ? requestedWindowSize : DocsEnum::L1_DOCS;
     }
 
     void sortByClauseMax() {
@@ -703,15 +718,39 @@ public:
       }
     }
 
-    void rebuildEssentialHeap() {
+    bool lessWindowOrder(int32_t a, int32_t b) const {
+      return lessMaxScore(windowMax[(size_t) a], windowMax[(size_t) b]);
+    }
+
+    void sortWindowOrder() {
+      for (size_t i = 1; i < windowOrder.size(); i++) {
+        int32_t idx = windowOrder[i];
+        size_t j = i;
+        while (j > 0 && lessWindowOrder(idx, windowOrder[j - 1])) {
+          windowOrder[j] = windowOrder[j - 1];
+          j--;
+        }
+        windowOrder[j] = idx;
+      }
+    }
+
+    void clearEssentialFlags() {
+      for (size_t i = 0; i < isEssential.size(); i++) {
+        isEssential[i] = false;
+      }
+    }
+
+    void rebuildGlobalHeap() {
+      clearEssentialFlags();
       size_t essentialCount = scorers.size() - splitIndex;
       for (size_t i = 0; i < essentialCount; i++) {
+        isEssential[splitIndex + i] = true;
         essentialPointers[i] = scorers[splitIndex + i];
       }
       pq = pool.make<solux::IndirectPQ<Scorer, decltype(idComparator)>>(essentialPointers, essentialCount);
     }
 
-    void updateSplit() {
+    void updateGlobalSplit() {
       // Accumulate the non-essential bound in double so the partition is conservatively
       // sound: a float running sum could round down below the threshold and demote a clause
       // whose exact max-sum still reaches it.  Summing the float clauseMax values in double
@@ -727,7 +766,67 @@ public:
       }
       if (newSplit > splitIndex) {
         splitIndex = newSplit;
-        rebuildEssentialHeap();
+        rebuildGlobalHeap();
+      }
+    }
+
+    // Largest non-essential prefix whose cumulative window-max stays under the
+    // threshold, accumulated in double (conservative, as in updateGlobalSplit).
+    size_t computeWindowSplit() const {
+      double sum = 0.0;
+      size_t s = 0;
+      for (; s < scorers.size(); s++) {
+        float maxScore = windowMax[(size_t) windowOrder[s]];
+        if (!std::isfinite(maxScore)) break;
+        double nextSum = sum + (double) maxScore;
+        if (!(nextSum < (double) minCompetitiveScore)) break;
+        sum = nextSum;
+      }
+      return s;
+    }
+
+    // Rebuild the essential heap from the window-essential clauses (windowOrder
+    // suffix from splitIndex) at their CURRENT positions.
+    void rebuildWindowEssentialHeap() {
+      clearEssentialFlags();
+      size_t essentialCount = 0;
+      for (size_t i = splitIndex; i < scorers.size(); i++) {
+        int32_t idx = windowOrder[i];
+        isEssential[(size_t) idx] = true;
+        essentialPointers[essentialCount++] = scorers[(size_t) idx];
+      }
+      pq = pool.make<solux::IndirectPQ<Scorer, decltype(idComparator)>>(essentialPointers, essentialCount);
+    }
+
+    void setupWindow(int32_t start) {
+      windowStart = start;
+      int32_t remaining = maxDoc - windowStart;
+      windowEnd = remaining > windowSize ? windowStart + windowSize : maxDoc;
+
+      for (size_t i = 0; i < scorers.size(); i++) {
+        if (scorers[i]->docId() < windowStart) {
+          scorers[i]->advance(windowStart);
+        }
+        scorers[i]->advanceShallow(windowStart);
+        windowMax[i] = scorers[i]->getMaxScore(windowEnd - 1);
+        windowOrder[i] = (int32_t) i;
+      }
+      sortWindowOrder();
+
+      splitIndex = computeWindowSplit();
+      rebuildWindowEssentialHeap();
+      windowReady = true;
+    }
+
+    // The threshold rose mid-window: re-partition against the SAME window maxes so
+    // a window does not keep driving clauses the now-higher threshold has demoted.
+    // splitIndex only advances within a window (theta is monotonic); the next
+    // window boundary recomputes it from scratch via setupWindow.
+    void updateWindowSplit() {
+      size_t newSplit = computeWindowSplit();
+      if (newSplit > splitIndex) {
+        splitIndex = newSplit;
+        rebuildWindowEssentialHeap();
       }
     }
 
@@ -738,7 +837,7 @@ public:
       // runs of this scorer produce bit-identical scores regardless of clause count.
       float sum = 0.0f;
       for (size_t i = 0; i < scorers.size(); i++) {
-        if (i < splitIndex) {
+        if (!isEssential[i]) {
           // Non-essential: not driven by the essential union, so seek it to docid.
           nonEssentialLookups++;
           if (scorers[i]->docId() < docid) {
@@ -753,22 +852,7 @@ public:
       visitedCandidates++;
     }
 
-  public:
-    // The passed in span of scorers will be modified (rearranged).
-    MaxScoreDisjunctionScorer(solux::MemPool& pool, std::span<Scorer*> scorers)
-            : pool(pool),
-              scorers(scorers),
-              clauseMax(pool.make_arr<float>(scorers.size()), scorers.size()),
-              essentialPointers(pool.make_arr<Scorer*>(scorers.size()), scorers.size()) {
-      for (size_t i = 0; i < scorers.size(); i++) {
-        clauseMax[i] = scorers[i]->getMaxScore(PostingsReader::END);
-      }
-      sortByClauseMax();
-      rebuildEssentialHeap();
-    }
-
-    int32_t next() override {
-      assert(docid != solux::PostingsReader::END);
+    int32_t nextGlobal() {
       int32_t currid = docid;
       for (;;) {
         if (pq->size() == 0) {
@@ -796,6 +880,87 @@ public:
       }
     }
 
+    int32_t nextWindowed() {
+      for (;;) {
+        if (!windowReady) {
+          if (nextWindowStart >= maxDoc) {
+            docid = solux::PostingsReader::END;
+            currentScore = 0.0f;
+            return docid;
+          }
+          setupWindow(nextWindowStart);
+        }
+
+        for (;;) {
+          if (pq->size() == 0) {
+            nextWindowStart = windowEnd;
+            windowReady = false;
+            break;
+          }
+          int32_t topDoc = pq->top().docId();
+          if (topDoc == solux::PostingsReader::END) {
+            pq->removeTop();
+            continue;
+          }
+          if (topDoc < windowStart) {
+            topDoc = pq->top().advance(windowStart);
+            if (topDoc == solux::PostingsReader::END) {
+              pq->removeTop();
+            } else {
+              pq->updateTop();
+            }
+            continue;
+          }
+          if (topDoc >= windowEnd) {
+            nextWindowStart = windowEnd;
+            windowReady = false;
+            break;
+          }
+          if (topDoc <= docid) {
+            int32_t nextDoc = pq->top().next();
+            if (nextDoc == solux::PostingsReader::END) {
+              pq->removeTop();
+            } else {
+              pq->updateTop();
+            }
+            continue;
+          }
+          docid = topDoc;
+          scoreCurrentDoc();
+          return docid;
+        }
+      }
+    }
+
+  public:
+    // The passed in span of scorers will be modified (rearranged).
+    MaxScoreDisjunctionScorer(solux::MemPool& pool, std::span<Scorer*> scorers,
+                              int32_t maxDoc, int32_t windowSize = DocsEnum::L1_DOCS)
+            : pool(pool),
+              scorers(scorers),
+              clauseMax(pool.make_arr<float>(scorers.size()), scorers.size()),
+              windowMax(pool.make_arr<float>(scorers.size()), scorers.size()),
+              windowOrder(pool.make_arr<int32_t>(scorers.size()), scorers.size()),
+              isEssential(pool.make_arr<bool>(scorers.size()), scorers.size()),
+              essentialPointers(pool.make_arr<Scorer*>(scorers.size()), scorers.size()),
+              maxDoc(maxDoc),
+              windowSize(normalizeWindowSize(windowSize)),
+              globalMode(normalizeWindowSize(windowSize) >= maxDoc) {
+      for (size_t i = 0; i < scorers.size(); i++) {
+        clauseMax[i] = scorers[i]->getMaxScore(PostingsReader::END);
+      }
+      sortByClauseMax();
+      for (size_t i = 0; i < scorers.size(); i++) {
+        windowOrder[i] = (int32_t) i;
+      }
+      rebuildGlobalHeap();
+    }
+
+    int32_t next() override {
+      assert(docid != solux::PostingsReader::END);
+      return globalMode ? nextGlobal() : nextWindowed();
+    }
+
     int32_t docId() override {
       return docid;
     }
@@ -807,7 +972,11 @@ public:
     void setMinCompetitiveScore(float minScore) override {
       if (minScore > minCompetitiveScore) {
         minCompetitiveScore = minScore;
-        updateSplit();
+        if (globalMode) {
+          updateGlobalSplit();
+        } else if (windowReady) {
+          updateWindowSplit();
+        }
       }
     }
 

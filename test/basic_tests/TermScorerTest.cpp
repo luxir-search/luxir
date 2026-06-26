@@ -1,5 +1,7 @@
 #include <solux/query/AllQuery.h>
+#include <array>
 #include <cmath>
+#include <limits>
 #include "gtest/gtest.h"
 #include "test/SoluxTest.h"
 #include "test/TestIndex.h"
@@ -13,6 +15,8 @@
 
 using namespace solux;
 using namespace solux::test;
+
+constexpr int32_t kMaxScoreDisjunctionSegDocs = 3 * Postings::DOCS_BLOCK_SIZE + 40;
 
 class TermScorerTest : public SoluxTest {
 protected:
@@ -65,7 +69,7 @@ std::vector<TopDocsCollector::ScoreDoc> sortedCollectorDocs(TopDocsCollector& co
 }
 
 void addMaxScoreDisjunctionDocs(CollectionHelper& helper) {
-  const int32_t segDocs = Postings::DOCS_BLOCK_SIZE + 40;
+  const int32_t segDocs = kMaxScoreDisjunctionSegDocs;
   const int32_t segCount = 3;
   helper.clear();
 
@@ -95,22 +99,35 @@ void addMaxScoreDisjunctionDocs(CollectionHelper& helper) {
   }
 }
 
-DisjunctionTopKRun runMaxScoreDisjunctionTopK(IndexReader& reader, int32_t topK) {
+DisjunctionTopKRun runMaxScoreDisjunctionTopK(IndexReader& reader, int32_t topK,
+                                              int32_t windowSize = DocsEnum::L1_DOCS) {
   MemPool pool;
   Query::Context qContext(pool, reader);
   TermQuery common("body_w", "common");
   TermQuery medium("body_w", "medium");
   TermQuery rare("body_w", "rare");
-  std::vector<Query*> optional = {&common, &medium, &rare};
-  BooleanQuery query({}, optional, {}, {});
-  auto* weight = query.createWeight(qContext, Query::NEED_SCORES);
+  std::array<Query::Weight*, 3> weights = {
+    common.createWeight(qContext, Query::NEED_SCORES),
+    medium.createWeight(qContext, Query::NEED_SCORES),
+    rare.createWeight(qContext, Query::NEED_SCORES)
+  };
   TopDocsCollector collector(topK);
   DisjunctionTopKRun result;
 
   auto segments = qContext.topReader.segments();
   for (int32_t segnum = 0; segnum < (int32_t) segments.size(); segnum++) {
-    auto* scorer = weight->createScorer(pool, segments[segnum]);
-    if (scorer == nullptr) continue;
+    auto* arr = pool.make_arr<Query::Scorer*>(weights.size());
+    int32_t count = 0;
+    for (auto* weight : weights) {
+      auto* scorer = weight->createScorer(pool, segments[segnum]);
+      if (scorer != nullptr) arr[count++] = scorer;
+    }
+    if (count == 0) continue;
+    Query::Scorer* scorer = count == 1
+      ? arr[0]
+      : pool.make<BooleanQuery::MaxScoreDisjunctionScorer>(
+          pool, std::span<Query::Scorer*>(arr, (size_t) count),
+          segments[segnum].maxDoc(), windowSize);
     scorer->setMinCompetitiveScore(collector.minCompetitiveVal);
     collectTopK(segnum, scorer, nullptr, nullptr, collector);
     if (auto* maxScore = dynamic_cast<BooleanQuery::MaxScoreDisjunctionScorer*>(scorer)) {
@@ -811,6 +828,61 @@ TEST_F(TermScorerTest, termImpactMaxScoreBounds) {
   EXPECT_EQ(rareScorer->advanceShallow(0), PostingsReader::END);
 }
 
+TEST_F(TermScorerTest, termImpactShallowMaxScoreUsesWindowBlocks) {
+  const int32_t N = 5 * Postings::DOCS_BLOCK_SIZE;
+  TestIndex testIndex;
+  TestField f(testIndex, "body_w");
+  f.startIndexing();
+
+  for (int32_t doc = 0; doc < N; doc++) {
+    int32_t block = doc / Postings::DOCS_BLOCK_SIZE;
+    int32_t tf = block == 0 ? 40 : block == 2 ? 3 : 2;
+    int32_t len = block == 0 ? tf : 120;
+    std::string text;
+    for (int32_t i = 0; i < tf; i++) text += "shallowimpact ";
+    for (int32_t i = tf; i < len; i++) text += "filler ";
+    f.add(doc, text);
+  }
+  testIndex.flush();
+  f.startReading();
+
+  auto poolFree = testIndex.pool.rewindScopeGuard();
+  Query::Context qContext(testIndex.pool, *testIndex.reader);
+  auto& segment = qContext.topReader.segments()[0];
+
+  TermQuery globalQuery("body_w", "shallowimpact");
+  auto* globalWeight = globalQuery.createWeight(qContext, Query::NEED_SCORES);
+  auto* globalScorer = dynamic_cast<TermQuery::Scorer*>(
+      globalWeight->createScorer(testIndex.pool, segment));
+  ASSERT_NE(globalScorer, nullptr);
+  float globalMax = globalScorer->getMaxScore(PostingsReader::END);
+  ASSERT_TRUE(std::isfinite(globalMax));
+
+  TermQuery windowQuery("body_w", "shallowimpact");
+  auto* windowWeight = windowQuery.createWeight(qContext, Query::NEED_SCORES);
+  auto* windowScorer = dynamic_cast<TermQuery::Scorer*>(
+      windowWeight->createScorer(testIndex.pool, segment));
+  ASSERT_NE(windowScorer, nullptr);
+
+  int32_t ws = 2 * Postings::DOCS_BLOCK_SIZE;
+  int32_t we = 3 * Postings::DOCS_BLOCK_SIZE - 1;
+  ASSERT_EQ(windowScorer->advance(ws), ws);
+  ASSERT_EQ(windowScorer->advanceShallow(ws), we);
+
+  int32_t startBlock = windowScorer->blockContaining(ws);
+  int32_t endBlock = windowScorer->blockContaining(we);
+  ASSERT_LT(endBlock, windowScorer->impactBlockCount);
+  float bruteMax = 0.0f;
+  for (int32_t block = startBlock; block <= endBlock; block++) {
+    bruteMax = std::max(bruteMax, windowScorer->blockImpact[block]);
+  }
+
+  float windowMax = windowScorer->getMaxScore(we);
+  EXPECT_FLOAT_EQ(windowMax, bruteMax);
+  EXPECT_LE(windowMax, globalMax);
+  EXPECT_LT(windowMax, globalMax);
+}
+
 TEST_F(TermScorerTest, termImpactTopKSkippingMatchesExhaustive) {
   const int32_t N = 6 * Postings::DOCS_BLOCK_SIZE + 17;
   TestIndex testIndex;
@@ -879,7 +951,7 @@ TEST_F(TermScorerTest, maxScoreDisjunctionTopKMatchesExhaustive) {
   CollectionHelper helper("main");
   addMaxScoreDisjunctionDocs(helper);
   auto reader = helper.getIndexWriter()->getIndexReader();
-  const int32_t totalDocs = 3 * (Postings::DOCS_BLOCK_SIZE + 40);
+  const int32_t totalDocs = 3 * kMaxScoreDisjunctionSegDocs;
 
   for (int32_t k : {3, totalDocs + 10}) {
     auto expected = runExhaustiveDisjunctionTopK(*reader, k);
@@ -891,6 +963,30 @@ TEST_F(TermScorerTest, maxScoreDisjunctionTopKMatchesExhaustive) {
     } else {
       EXPECT_EQ(actual.visited, expected.visited);
       EXPECT_EQ(actual.nonEssentialLookups, 0);
+    }
+  }
+  helper.clear();
+}
+
+TEST_F(TermScorerTest, windowedMaxScoreDisjunctionTopKMatchesExhaustiveAndGlobal) {
+  CollectionHelper helper("main");
+  addMaxScoreDisjunctionDocs(helper);
+  auto reader = helper.getIndexWriter()->getIndexReader();
+  const int32_t totalDocs = 3 * kMaxScoreDisjunctionSegDocs;
+
+  for (int32_t k : {3, totalDocs + 10}) {
+    auto expected = runExhaustiveDisjunctionTopK(*reader, k);
+    auto global = runMaxScoreDisjunctionTopK(*reader, k, std::numeric_limits<int32_t>::max());
+    auto windowed = runMaxScoreDisjunctionTopK(*reader, k, 256);
+    assertSameTopKDocs(expected, global, k);
+    assertSameTopKDocs(expected, windowed, k);
+    assertSameTopKDocs(global, windowed, k);
+    if (k == 3) {
+      EXPECT_LT(windowed.visited, expected.visited);
+      EXPECT_LE(windowed.visited, global.visited);
+    } else {
+      EXPECT_EQ(windowed.visited, expected.visited);
+      EXPECT_EQ(windowed.nonEssentialLookups, 0);
     }
   }
   helper.clear();

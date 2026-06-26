@@ -61,8 +61,11 @@ class DocsEnum {
   int64_t locOfDocsForTermBlock;
   int64_t locOfPositionsForTermBlock;
 
+public:
   static constexpr int32_t L1_PERIOD = 32;
   static constexpr int32_t L1_DOCS = L1_PERIOD * Postings::DOCS_BLOCK_SIZE;
+
+private:
 
   int32_t numDocBlocks = 0;
   int32_t numDocGroups = 0;

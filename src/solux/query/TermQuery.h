@@ -250,8 +250,9 @@ public:
         return std::numeric_limits<float>::infinity();
       }
 
-      int32_t curBlock = blockContaining(docsEnum.docId());
-      if (curBlock >= impactBlockCount) {
+      int32_t docBlock = blockContaining(docsEnum.docId());
+      int32_t startBlock = shallowBlock >= 0 ? std::min(docBlock, shallowBlock) : docBlock;
+      if (startBlock >= impactBlockCount) {
         return std::numeric_limits<float>::infinity();
       }
 
@@ -259,15 +260,15 @@ public:
       if (upBlock >= impactBlockCount) {
         upBlock = impactBlockCount - 1;
       }
-      if (upBlock < curBlock) {
+      if (upBlock < startBlock) {
         return std::numeric_limits<float>::infinity();
       }
       if (upBlock == impactBlockCount - 1) {
-        return maxImpactFrom[curBlock];
+        return maxImpactFrom[startBlock];
       }
 
       float maxScore = 0.0f;
-      for (int32_t i = curBlock; i <= upBlock; i++) {
+      for (int32_t i = startBlock; i <= upBlock; i++) {
         maxScore = std::max(maxScore, blockImpact[i]);
       }
       return maxScore;

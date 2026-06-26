@@ -1,7 +1,9 @@
 #include <algorithm>
+#include <array>
 #include <bit>
 #include <charconv>
 #include <cmath>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -79,6 +81,12 @@ struct ScoreTopKResult {
   int64_t nonEssentialLookups = 0;
   int64_t fp = 0;
   std::vector<ScoreDoc> topDocs;
+};
+
+enum class DisjunctionMaxScoreMode {
+  Exhaustive,
+  Global,
+  Windowed
 };
 
 void sortScoreDocs(std::vector<ScoreDoc>& docs) {
@@ -178,10 +186,88 @@ ScoreTopKResult runFullTextScoreTopKDisjunction(IndexReader& reader,
   return result;
 }
 
+ScoreTopKResult runClusteredDisjunctionTopK(IndexReader& reader, int32_t topK,
+                                            DisjunctionMaxScoreMode mode) {
+  MemPool pool;
+  Query::Context qContext(pool, reader);
+  TermQuery common("body_w", "common");
+  TermQuery alpha("body_w", "alpha");
+  TermQuery beta("body_w", "beta");
+  std::array<Query::Weight*, 3> weights = {
+    common.createWeight(qContext, Query::NEED_SCORES),
+    alpha.createWeight(qContext, Query::NEED_SCORES),
+    beta.createWeight(qContext, Query::NEED_SCORES)
+  };
+  TopDocsCollector collector(topK);
+  int64_t nonEssentialLookups = 0;
+
+  auto segments = qContext.topReader.segments();
+  for (int32_t segnum = 0; segnum < (int32_t) segments.size(); segnum++) {
+    auto* arr = pool.make_arr<Query::Scorer*>(weights.size());
+    int32_t count = 0;
+    for (auto* weight : weights) {
+      auto* scorer = weight->createScorer(pool, segments[segnum]);
+      if (scorer != nullptr) arr[count++] = scorer;
+    }
+    if (count == 0) {
+      continue;
+    }
+
+    Query::Scorer* scorer = nullptr;
+    if (count == 1) {
+      scorer = arr[0];
+    } else if (mode == DisjunctionMaxScoreMode::Exhaustive) {
+      scorer = pool.make<BooleanQuery::DisjunctionScorer>(
+        pool, std::span<Query::Scorer*>(arr, (size_t) count));
+    } else {
+      int32_t windowSize = mode == DisjunctionMaxScoreMode::Global
+        ? std::numeric_limits<int32_t>::max()
+        : DocsEnum::L1_DOCS;
+      scorer = pool.make<BooleanQuery::MaxScoreDisjunctionScorer>(
+        pool, std::span<Query::Scorer*>(arr, (size_t) count),
+        segments[segnum].maxDoc(), windowSize);
+    }
+
+    if (mode == DisjunctionMaxScoreMode::Exhaustive) {
+      for (int32_t doc = scorer->next(); doc != PostingsReader::END; doc = scorer->next()) {
+        collector.collect(segnum, doc, scorer->score());
+      }
+    } else {
+      scorer->setMinCompetitiveScore(collector.minCompetitiveVal);
+      collectTopK(segnum, scorer, nullptr, nullptr, collector);
+      if (auto* maxScore = dynamic_cast<BooleanQuery::MaxScoreDisjunctionScorer*>(scorer)) {
+        nonEssentialLookups += maxScore->nonEssentialLookupCount();
+      }
+    }
+  }
+
+  ScoreTopKResult result;
+  result.visited = collector.totalHits();
+  result.nonEssentialLookups = nonEssentialLookups;
+  auto topDocs = collector.sort();
+  result.topDocs.assign(topDocs.begin(), topDocs.end());
+  sortScoreDocs(result.topDocs);
+  result.fp = scoreTopKFingerprint(result.topDocs);
+  return result;
+}
+
 void assertSameTopK(const ScoreTopKResult& expected, const ScoreTopKResult& actual) {
   ASSERT_EQ(actual.topDocs.size(), expected.topDocs.size());
   for (size_t i = 0; i < expected.topDocs.size(); i++) {
     ASSERT_EQ(actual.topDocs[i].doc, expected.topDocs[i].doc) << "i=" << i;
+    ASSERT_FLOAT_EQ(actual.topDocs[i].score, expected.topDocs[i].score) << "i=" << i;
+  }
+}
+
+// Tie-tolerant top-k equivalence: compares the sorted score sequence only.  When
+// many docs share the boundary score the SET of top-k docids is genuinely
+// ambiguous (exhaustive collects in docid order, MaxScore in essential-union
+// order, so they keep different tied docs), but any correct top-k has the same
+// unique score multiset.  Exact-docid equivalence on a tie-free corpus is covered
+// by TermScorerTest.
+void assertSameTopKScores(const ScoreTopKResult& expected, const ScoreTopKResult& actual) {
+  ASSERT_EQ(actual.topDocs.size(), expected.topDocs.size());
+  for (size_t i = 0; i < expected.topDocs.size(); i++) {
     ASSERT_FLOAT_EQ(actual.topDocs[i].score, expected.topDocs[i].score) << "i=" << i;
   }
 }
@@ -209,6 +295,52 @@ void buildClusteredScoreTopKIndex(IndexWriter& iw, int64_t nDocs) {
 
   iw.releaseInverter(inverter, true);
   iw.commit();
+}
+
+void appendTerm(std::string& body, std::string_view term, int32_t count) {
+  for (int32_t i = 0; i < count; i++) {
+    if (!body.empty()) body.push_back(' ');
+    body.append(term);
+  }
+}
+
+void buildClusteredDisjunctionBenchIndex(CollectionHelper& helper, int64_t nDocs) {
+  helper.clear();
+  auto iw = helper.getIndexWriter();
+  Inverter& inverter = iw->obtainInverter();
+  Inverter::IndexHandler& hId = inverter.getIndexHandler("id");
+  Inverter::IndexHandler& hBody = inverter.getIndexHandler("body_w");
+
+  std::string body;
+  for (int64_t doc = 0; doc < nDocs; doc++) {
+    int64_t window = doc / DocsEnum::L1_DOCS;
+    bool alphaHot = window == 0 && (doc % 2) == 0;
+    bool betaHot = window == 1 && (doc % 2) == 0;
+
+    body.clear();
+    appendTerm(body, "common", 1);
+    if (alphaHot) {
+      appendTerm(body, "alpha", 24);
+    } else if ((doc % 3) == 0) {
+      appendTerm(body, "alpha", 1);
+    }
+    if (betaHot) {
+      appendTerm(body, "beta", 24);
+    } else if ((doc % 5) == 0) {
+      appendTerm(body, "beta", 1);
+    }
+
+    int32_t filler = alphaHot || betaHot ? 2 : 80;
+    appendTerm(body, "filler", filler);
+
+    inverter.startDoc();
+    hId.index(inverter, std::to_string(doc));
+    hBody.index(inverter, body);
+    inverter.finishDoc();
+  }
+
+  iw->releaseInverter(inverter, true);
+  helper.commit();
 }
 
 }  // namespace
@@ -494,6 +626,68 @@ static void BM_FullTextScoreTopKDisjunction(benchmark::State& state, int64_t nDo
 }
 
 //
+// Clustered disjunction workload for block-max windowed MaxScore.  The high-tf
+// alpha and beta docs are clustered in early L1 windows; low-tf occurrences are
+// spread through later windows.  Windowed MaxScore can demote those clauses in
+// the later windows, while global MaxScore must keep them essential everywhere.
+//
+static void BM_FullTextScoreTopKDisjunctionClustered(benchmark::State& state,
+                                                     DisjunctionMaxScoreMode mode) {
+  int64_t clusteredDocs = solux::unit_tests ? 12'000 : 1'000'000;
+  constexpr int32_t topK = 100;
+  std::vector<int32_t> docsPerSeg = {(int32_t) clusteredDocs};
+
+  CollectionHelper helper;
+  static std::vector<int32_t> builtShape;
+  bool reuseIndex = builtShape == docsPerSeg && helper.indexMatchesShape(docsPerSeg);
+  if (!reuseIndex) {
+    buildClusteredDisjunctionBenchIndex(helper, clusteredDocs);
+    builtShape = docsPerSeg;
+  }
+
+  auto reader = helper.getIndexWriter()->getIndexReader();
+
+  ScoreTopKResult exhaustive = runClusteredDisjunctionTopK(
+    *reader, topK, DisjunctionMaxScoreMode::Exhaustive);
+  ScoreTopKResult global = runClusteredDisjunctionTopK(
+    *reader, topK, DisjunctionMaxScoreMode::Global);
+  ScoreTopKResult windowed = runClusteredDisjunctionTopK(
+    *reader, topK, DisjunctionMaxScoreMode::Windowed);
+  assertSameTopKScores(exhaustive, global);
+  assertSameTopKScores(exhaustive, windowed);
+
+  RSSWatcher watcher;
+
+  int64_t fp = -1;
+  int64_t visited = 0;
+  int64_t nonEssentialLookups = 0;
+  for (auto _ : state) {
+    ScoreTopKResult result = runClusteredDisjunctionTopK(*reader, topK, mode);
+    benchmark::DoNotOptimize(result.fp);
+    benchmark::DoNotOptimize(result.visited);
+    benchmark::DoNotOptimize(result.nonEssentialLookups);
+
+    if (fp != -1) {
+      ASSERT_EQ(fp, result.fp);
+    }
+    fp = result.fp;
+    visited = result.visited;
+    nonEssentialLookups = result.nonEssentialLookups;
+  }
+
+  state.counters["fp"] = fp;
+  state.counters["visited"] = visited;
+  state.counters["nonessential_lookups"] = nonEssentialLookups;
+  state.counters["mode"] = (int32_t) mode;
+  state.counters["window"] = mode == DisjunctionMaxScoreMode::Windowed ? DocsEnum::L1_DOCS : 0;
+  state.counters["reused"] = reuseIndex;
+  state.counters["rate"] = benchmark::Counter(state.iterations(), benchmark::Counter::kIsRate);
+  auto mem = watcher.getDeltaKB();
+  state.counters["RSS_delta"] = mem.first / 1024;
+  state.counters["RSS_max"] = mem.second / 1024;
+}
+
+//
 // Length-clustered single-term relevance top-k.  The term "hot" appears once in
 // every doc, while doc length rises monotonically with docid.  Adjacent blocks
 // have similar norms, so per-block minNorm should be a useful pruning bound.
@@ -564,6 +758,14 @@ SOLUX_BENCHMARK_CAPTURE(BM_FullTextScoreTopK, mid_noskip,  nDocs, shape, "t100",
 // enough to lift the top-k threshold but common enough to supply k winners.
 SOLUX_BENCHMARK_CAPTURE(BM_FullTextScoreTopKDisjunction, disj_skip,   nDocs, shape, "t0", "t1000", true);
 SOLUX_BENCHMARK_CAPTURE(BM_FullTextScoreTopKDisjunction, disj_noskip, nDocs, shape, "t0", "t1000", false);
+
+// Clustered-disjunction A/B/C for block-max windowed MaxScore.
+SOLUX_BENCHMARK_CAPTURE(BM_FullTextScoreTopKDisjunctionClustered, clustered_windowed,
+                        DisjunctionMaxScoreMode::Windowed);
+SOLUX_BENCHMARK_CAPTURE(BM_FullTextScoreTopKDisjunctionClustered, clustered_global,
+                        DisjunctionMaxScoreMode::Global);
+SOLUX_BENCHMARK_CAPTURE(BM_FullTextScoreTopKDisjunctionClustered, clustered_exhaustive,
+                        DisjunctionMaxScoreMode::Exhaustive);
 
 // Length-clustered relevance top-k A/B for the T1 minNorm pruning workload.
 SOLUX_BENCHMARK_CAPTURE(BM_FullTextScoreTopKClustered, clustered_skip,   true);
