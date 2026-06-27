@@ -1,5 +1,7 @@
 #pragma once
 
+#include <algorithm>
+#include <array>
 #include <cstdint>
 #include <assert.h>
 #include <iostream>
@@ -401,6 +403,9 @@ class TextWriter {
   std::vector<char> compressed_output;
   std::vector<char> header_output;
   std::vector<char> group_output;
+  std::array<uint32_t, 256> maxTfPerNorm;
+  std::vector<uint32_t> frontierNorms;
+  std::vector<uint32_t> frontierTfs;
 
 private:  // some internal utility methods... not for use by indexers
   static void appendVint(std::vector<char>& out, uint32_t val) {
@@ -442,6 +447,40 @@ private:  // some internal utility methods... not for use by indexers
     }
   }
 
+  uint32_t normForDoc(int32_t docid) const {
+    if (normByDoc.empty()) {
+      return 0;
+    }
+    assert(docid >= 0 && (size_t) docid < normByDoc.size());
+    return (uint32_t) normByDoc[(size_t) docid];
+  }
+
+  void buildImpactFrontier(uint32_t docCount) {
+    frontierNorms.resize(0);
+    frontierTfs.resize(0);
+    if (!(hasFreqs && hasNorms)) {
+      return;
+    }
+
+    maxTfPerNorm.fill(0);
+    for (uint32_t i = 0; i < docCount; i++) {
+      uint32_t norm = normForDoc(docs[i]);
+      assert(norm <= 255);
+      uint32_t tf = (uint32_t) tfreqs[i];
+      maxTfPerNorm[norm] = std::max(maxTfPerNorm[norm], tf);
+    }
+
+    uint32_t runningMaxTf = 0;
+    for (uint32_t norm = 0; norm < maxTfPerNorm.size(); norm++) {
+      uint32_t tf = maxTfPerNorm[norm];
+      if (tf > runningMaxTf) {
+        frontierNorms.push_back(norm);
+        frontierTfs.push_back(tf);
+        runningMaxTf = tf;
+      }
+    }
+  }
+
   void appendL0Header(std::vector<char>& out, uint32_t lastDoc, uint32_t base,
                       uint64_t blockByteLen, uint32_t docCount, uint64_t tfSum,
                       uint32_t maxTf, uint32_t minNorm) {
@@ -453,11 +492,27 @@ private:  // some internal utility methods... not for use by indexers
       assert(tfSum >= docCount);
       appendVint(header_output, (uint32_t) (tfSum - docCount));
     }
-    if (hasFreqs) {
+    if (hasFreqs && hasNorms) {
+      assert(!frontierTfs.empty());
+      assert(frontierTfs.size() == frontierNorms.size());
+      appendVint(header_output, (uint32_t) frontierTfs.size());
+      uint32_t prevTf = 0;
+      for (size_t i = 0; i < frontierTfs.size(); i++) {
+        uint32_t norm = frontierNorms[i];
+        uint32_t tf = frontierTfs[i];
+        assert(norm <= 255);
+        assert(i == 0 || norm > frontierNorms[i - 1]);
+        assert(tf > prevTf);
+        // norm is a SmallFloat byte (0-255): store it raw, not vint-encoded.  tf is
+        // unbounded, so keep its delta (the staircase is tf-ascending) vint-encoded.
+        header_output.push_back((char) (uint8_t) norm);
+        appendVint(header_output, tf - prevTf);
+        prevTf = tf;
+      }
+    } else if (hasFreqs) {
       assert(maxTf > 0);
       appendVint(header_output, maxTf);
-    }
-    if (hasNorms) {
+    } else if (hasNorms) {
       assert(minNorm <= 255);
       appendVint(header_output, minNorm);
     }
@@ -501,9 +556,7 @@ private:  // some internal utility methods... not for use by indexers
     }
     uint32_t minNorm = 255;
     for (uint32_t i = 0; i < docCount; i++) {
-      int32_t docid = docs[i];
-      assert(docid >= 0 && (size_t) docid < normByDoc.size());
-      minNorm = std::min(minNorm, (uint32_t) normByDoc[(size_t) docid]);
+      minNorm = std::min(minNorm, normForDoc(docs[i]));
     }
     return minNorm;
   }
@@ -636,6 +689,7 @@ public:
         maxTf = std::max(maxTf, (uint32_t) tf);
       }
     }
+    buildImpactFrontier(Postings::DOCS_BLOCK_SIZE);
 
     compressed_output.resize(2 * (Postings::DOCS_BLOCK_SIZE * sizeof(int32_t) + 1024));
     uint32_t compressedSize = (uint32_t) compressed_output.size(); // this gets changed to the actual size
@@ -883,6 +937,7 @@ public:
             maxTf = std::max(maxTf, (uint32_t) tf);
           }
         }
+        buildImpactFrontier(n);
         uint8_t* ddEnd = svb_encode_scalar_d1_init((const uint32_t*) docs.data(), dkeys, ddata, n, base);
         compressed_output.resize(0);
         appendBytes(compressed_output, dkeys, kb);

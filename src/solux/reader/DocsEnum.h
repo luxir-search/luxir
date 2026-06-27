@@ -65,6 +65,24 @@ public:
   static constexpr int32_t L1_PERIOD = 32;
   static constexpr int32_t L1_DOCS = L1_PERIOD * Postings::DOCS_BLOCK_SIZE;
 
+  struct ImpactFrontiers {
+    std::vector<int32_t> offsets;
+    std::vector<int32_t> tfs;
+    std::vector<int32_t> norms;
+
+    void clear() {
+      offsets.resize(0);
+      tfs.resize(0);
+      norms.resize(0);
+    }
+
+    int32_t count(int32_t block) const {
+      assert(block >= 0);
+      assert(block + 1 < (int32_t) offsets.size());
+      return offsets[(size_t) block + 1] - offsets[(size_t) block];
+    }
+  };
+
 private:
 
   int32_t numDocBlocks = 0;
@@ -397,11 +415,18 @@ public:
         if (hasPositions) {
           blockTfSum += InputStream::readVint(p, headerEnd);
         }
-        if (hasFreqs) {
+        if (hasFreqs && hasNorms) {
+          uint32_t frontierCount = InputStream::readVint(p, headerEnd);
+          for (uint32_t i = 0; i < frontierCount; i++) {
+            assert(p < headerEnd);
+            p++;  // norm: one raw byte
+            auto tfDelta = InputStream::readVint(p, headerEnd);
+            unused(tfDelta);
+          }
+        } else if (hasFreqs) {
           auto maxTf = InputStream::readVint(p, headerEnd);
           unused(maxTf);
-        }
-        if (hasNorms) {
+        } else if (hasNorms) {
           auto minNorm = InputStream::readVint(p, headerEnd);
           unused(minNorm);
         }
@@ -533,7 +558,8 @@ public:
                       std::vector<int32_t>* groupSpanImpacts = nullptr,
                       std::vector<int32_t>* blockLastDocs = nullptr,
                       std::vector<int32_t>* blockMinNorms = nullptr,
-                      std::vector<int32_t>* groupSpanMinNorms = nullptr) const {
+                      std::vector<int32_t>* groupSpanMinNorms = nullptr,
+                      ImpactFrontiers* impactFrontiers = nullptr) const {
     blockMaxTf.resize(0);
     if (groupSpanImpacts != nullptr) {
       groupSpanImpacts->resize(0);
@@ -546,6 +572,9 @@ public:
     }
     if (groupSpanMinNorms != nullptr) {
       groupSpanMinNorms->resize(0);
+    }
+    if (impactFrontiers != nullptr) {
+      impactFrontiers->clear();
     }
     if (docsSize == 0) {
       return;
@@ -563,6 +592,9 @@ public:
     }
     if (groupSpanMinNorms != nullptr) {
       groupSpanMinNorms->reserve(numDocGroups);
+    }
+    if (impactFrontiers != nullptr) {
+      impactFrontiers->offsets.reserve((size_t) numDocBlocks + 1);
     }
 
     const char* const end = docIS.ptr(metadataStart);
@@ -615,11 +647,33 @@ public:
           unused(blockCumTfDelta);
         }
         int32_t maxTf = 1;
-        if (hasFreqs) {
-          maxTf = (int32_t) InputStream::readVint(p, headerEnd);
-        }
         int32_t minNorm = 0;
-        if (hasNorms) {
+        if (impactFrontiers != nullptr) {
+          impactFrontiers->offsets.push_back((int32_t) impactFrontiers->tfs.size());
+        }
+        if (hasFreqs && hasNorms) {
+          uint32_t frontierCount = InputStream::readVint(p, headerEnd);
+          assert(frontierCount > 0);
+          int32_t tf = 0;
+          for (uint32_t j = 0; j < frontierCount; j++) {
+            assert(p < headerEnd);
+            int32_t norm = (int32_t) (uint8_t) *p;  // raw byte (absolute)
+            p++;
+            tf += (int32_t) InputStream::readVint(p, headerEnd);  // tf delta
+            assert(norm >= 0 && norm <= 255);
+            assert(tf > 0);
+            if (j == 0) {
+              minNorm = norm;
+            }
+            maxTf = tf;
+            if (impactFrontiers != nullptr) {
+              impactFrontiers->norms.push_back(norm);
+              impactFrontiers->tfs.push_back(tf);
+            }
+          }
+        } else if (hasFreqs) {
+          maxTf = (int32_t) InputStream::readVint(p, headerEnd);
+        } else if (hasNorms) {
           minNorm = (int32_t) InputStream::readVint(p, headerEnd);
         }
         assert(p == headerEnd);
@@ -642,6 +696,11 @@ public:
 
     assert((int32_t) blockMaxTf.size() == numDocBlocks);
     assert(blockMinNorms == nullptr || (int32_t) blockMinNorms->size() == numDocBlocks);
+    if (impactFrontiers != nullptr) {
+      impactFrontiers->offsets.push_back((int32_t) impactFrontiers->tfs.size());
+      assert((int32_t) impactFrontiers->offsets.size() == numDocBlocks + 1);
+      assert(impactFrontiers->tfs.size() == impactFrontiers->norms.size());
+    }
     assert(p == end);
   }
 

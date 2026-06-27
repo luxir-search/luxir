@@ -73,11 +73,94 @@ struct MsmTopKRun {
   std::vector<TopDocsCollector::ScoreDoc> topDocs;
 };
 
+struct TermImpactTopKRun {
+  int64_t visited = 0;
+  int64_t skippedBlocks = 0;
+  std::vector<TopDocsCollector::ScoreDoc> topDocs;
+};
+
 std::vector<TopDocsCollector::ScoreDoc> sortedCollectorDocs(TopDocsCollector& collector) {
   auto docs = collector.sort();
   std::vector<TopDocsCollector::ScoreDoc> out(docs.begin(), docs.end());
   std::sort(out.begin(), out.end(), TopDocsCollector::scoreAndDocComp);
   return out;
+}
+
+void appendRepeatedTerm(std::string& body, std::string_view term, int32_t count) {
+  for (int32_t i = 0; i < count; i++) {
+    if (!body.empty()) body.push_back(' ');
+    body.append(term);
+  }
+}
+
+void antiCorrelatedTfLen(int32_t postingOrd, int32_t& tf, int32_t& len) {
+  int32_t block = postingOrd / Postings::DOCS_BLOCK_SIZE;
+  int32_t local = postingOrd % Postings::DOCS_BLOCK_SIZE;
+  if (block == 0) {
+    tf = 180 - (local % 37);
+    len = tf + 2 + (local % 3);
+  } else if (local == 0) {
+    tf = 170 - std::min(block, 40);
+    len = 900 + block * 17;
+  } else if (local == 1) {
+    tf = 1;
+    len = 2;
+  } else {
+    tf = 1 + (local % 3 == 0 ? 1 : 0);
+    len = 260 + (local % 41);
+  }
+  if (len < tf) {
+    len = tf;
+  }
+}
+
+void addAntiCorrelatedFrontierDocs(TestField& f, int32_t postingCount) {
+  std::string body;
+  for (int32_t doc = 0; doc < postingCount * 2; doc++) {
+    body.clear();
+    if ((doc % 2) == 0) {
+      int32_t tf = 0;
+      int32_t len = 0;
+      antiCorrelatedTfLen(doc / 2, tf, len);
+      appendRepeatedTerm(body, "frontier", tf);
+      appendRepeatedTerm(body, "filler", len - tf);
+    } else {
+      appendRepeatedTerm(body, "filler", 20 + (doc % 11));
+    }
+    f.add(doc, body);
+  }
+}
+
+TermImpactTopKRun runSingleTermFrontierTopK(IndexReader& reader, int32_t topK,
+                                            bool useFrontierBound,
+                                            bool allowPruning) {
+  MemPool pool;
+  Query::Context qContext(pool, reader);
+  TermQuery query("body_w", "frontier", 1.0f, useFrontierBound);
+  auto* weight = query.createWeight(qContext, Query::NEED_SCORES);
+  TopDocsCollector collector(topK);
+  TermImpactTopKRun result;
+
+  auto segments = qContext.topReader.segments();
+  for (int32_t segnum = 0; segnum < (int32_t) segments.size(); segnum++) {
+    auto* scorer = dynamic_cast<TermQuery::Scorer*>(
+        weight->createScorer(pool, segments[segnum]));
+    if (scorer == nullptr) {
+      continue;
+    }
+    if (allowPruning) {
+      collectTopK(segnum, scorer, nullptr, nullptr, collector);
+    } else {
+      for (int32_t doc = scorer->next(); doc != PostingsReader::END; doc = scorer->next()) {
+        collector.collect(segnum, doc, scorer->score());
+      }
+    }
+    result.skippedBlocks += scorer->skippedBlocks();
+  }
+
+  result.visited = collector.totalHits();
+  result.topDocs = sortedCollectorDocs(collector);
+  return result;
 }
 
 void addMaxScoreDisjunctionDocs(CollectionHelper& helper) {
@@ -1202,6 +1285,89 @@ TEST_F(TermScorerTest, termImpactShallowMaxScoreUsesWindowBlocks) {
   EXPECT_FLOAT_EQ(windowMax, bruteMax);
   EXPECT_LE(windowMax, globalMax);
   EXPECT_LT(windowMax, globalMax);
+}
+
+TEST_F(TermScorerTest, termImpactFrontierIsExactBlockMax) {
+  const int32_t postingCount = 7 * Postings::DOCS_BLOCK_SIZE + 19;
+  TestIndex testIndex;
+  TestField f(testIndex, "body_w");
+  f.startIndexing();
+  addAntiCorrelatedFrontierDocs(f, postingCount);
+  testIndex.flush();
+  f.startReading();
+
+  auto poolFree = testIndex.pool.rewindScopeGuard();
+  Query::Context qContext(testIndex.pool, *testIndex.reader);
+  auto& segment = qContext.topReader.segments()[0];
+
+  TermQuery frontierQuery("body_w", "frontier", 1.0f, true);
+  TermQuery cornerQuery("body_w", "frontier", 1.0f, false);
+  TermQuery actualQuery("body_w", "frontier", 1.0f, true);
+  auto* frontierWeight = frontierQuery.createWeight(qContext, Query::NEED_SCORES);
+  auto* cornerWeight = cornerQuery.createWeight(qContext, Query::NEED_SCORES);
+  auto* actualWeight = actualQuery.createWeight(qContext, Query::NEED_SCORES);
+
+  auto* frontierScorer = dynamic_cast<TermQuery::Scorer*>(
+      frontierWeight->createScorer(testIndex.pool, segment));
+  auto* cornerScorer = dynamic_cast<TermQuery::Scorer*>(
+      cornerWeight->createScorer(testIndex.pool, segment));
+  auto* actualScorer = dynamic_cast<TermQuery::Scorer*>(
+      actualWeight->createScorer(testIndex.pool, segment));
+  ASSERT_NE(frontierScorer, nullptr);
+  ASSERT_NE(cornerScorer, nullptr);
+  ASSERT_NE(actualScorer, nullptr);
+  ASSERT_EQ(frontierScorer->impactBlockCount, cornerScorer->impactBlockCount);
+
+  std::vector<float> brute((size_t) frontierScorer->impactBlockCount, 0.0f);
+  int32_t block = 0;
+  for (int32_t doc = actualScorer->next(); doc != PostingsReader::END; doc = actualScorer->next()) {
+    while (block + 1 < frontierScorer->impactBlockCount
+           && doc > frontierScorer->impactLastDoc[block]) {
+      block++;
+    }
+    ASSERT_LE(doc, frontierScorer->impactLastDoc[block]);
+    brute[(size_t) block] = std::max(brute[(size_t) block], actualScorer->score());
+  }
+
+  bool sawTighterBlock = false;
+  for (int32_t i = 0; i < frontierScorer->impactBlockCount; i++) {
+    EXPECT_FLOAT_EQ(frontierScorer->blockImpact[i], brute[(size_t) i]) << "block=" << i;
+    EXPECT_LE(frontierScorer->blockImpact[i], cornerScorer->blockImpact[i] + 1e-6f)
+        << "block=" << i;
+    sawTighterBlock |= frontierScorer->blockImpact[i] + 1e-6f < cornerScorer->blockImpact[i];
+  }
+  EXPECT_TRUE(sawTighterBlock);
+}
+
+TEST_F(TermScorerTest, termImpactFrontierTopKMatchesCornerAndExhaustive) {
+  const int32_t postingCount = 14 * Postings::DOCS_BLOCK_SIZE;
+  TestIndex testIndex;
+  TestField f(testIndex, "body_w");
+  f.startIndexing();
+  addAntiCorrelatedFrontierDocs(f, postingCount);
+  testIndex.flush();
+  f.startReading();
+
+  for (int32_t k : {3, 25}) {
+    TermImpactTopKRun exhaustive = runSingleTermFrontierTopK(*testIndex.reader, k, true, false);
+    TermImpactTopKRun corner = runSingleTermFrontierTopK(*testIndex.reader, k, false, true);
+    TermImpactTopKRun frontier = runSingleTermFrontierTopK(*testIndex.reader, k, true, true);
+
+    ASSERT_EQ(corner.topDocs.size(), exhaustive.topDocs.size()) << "k=" << k;
+    ASSERT_EQ(frontier.topDocs.size(), exhaustive.topDocs.size()) << "k=" << k;
+    for (size_t i = 0; i < exhaustive.topDocs.size(); i++) {
+      EXPECT_EQ(corner.topDocs[i].doc, exhaustive.topDocs[i].doc) << "k=" << k << " i=" << i;
+      EXPECT_FLOAT_EQ(corner.topDocs[i].score, exhaustive.topDocs[i].score) << "k=" << k << " i=" << i;
+      EXPECT_EQ(frontier.topDocs[i].doc, exhaustive.topDocs[i].doc) << "k=" << k << " i=" << i;
+      EXPECT_FLOAT_EQ(frontier.topDocs[i].score, exhaustive.topDocs[i].score) << "k=" << k << " i=" << i;
+    }
+    EXPECT_LE(frontier.visited, corner.visited) << "k=" << k;
+    EXPECT_GE(frontier.skippedBlocks, corner.skippedBlocks) << "k=" << k;
+    if (k == 3) {
+      EXPECT_LT(frontier.visited, corner.visited) << "k=" << k;
+      EXPECT_GT(frontier.skippedBlocks, corner.skippedBlocks) << "k=" << k;
+    }
+  }
 }
 
 TEST_F(TermScorerTest, termImpactTopKSkippingMatchesExhaustive) {

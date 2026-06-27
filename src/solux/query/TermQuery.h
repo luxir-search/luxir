@@ -15,9 +15,11 @@ protected:
   std::string_view field;
   std::string_view term;
   float boost;
+  bool useFrontierBound;
 public:
-  TermQuery(std::string_view field, std::string_view term, float boost = 1.0f) : field(field), term(term),
-                                                                                 boost(boost) {}
+  TermQuery(std::string_view field, std::string_view term, float boost = 1.0f,
+            bool useFrontierBound = true)
+      : field(field), term(term), boost(boost), useFrontierBound(useFrontierBound) {}
 
   std::string_view getField() const {
     return field;
@@ -29,6 +31,10 @@ public:
 
   float getBoost() const {
     return boost;
+  }
+
+  bool shouldUseFrontierBound() const {
+    return useFrontierBound;
   }
 
   TermQuery::Weight* createWeight(Context& context, int32_t flags) override {
@@ -80,7 +86,8 @@ public:
       solux::IntColReader* normsReader = targetPool.make<solux::IntColReader>(segment.postingsReader(),
                                                                               *segFieldInfo);
       return targetPool.make<TermQuery::Scorer>(targetPool, *docsEnum, normsReader,
-                                                cachedTermInfo->simScorer, query.getBoost());
+                                                cachedTermInfo->simScorer, query.getBoost(),
+                                                query.shouldUseFrontierBound());
     }
 
     // Per-segment supplier that exposes the term's real cost (its number of docs
@@ -127,43 +134,50 @@ public:
     int32_t shallowBlock = -1;
     // Query-time multiplier for boosted term clauses, e.g. fuzzy rewrites.
     float boost;
+    int64_t skippedImpactBlocks = 0;
 
     Scorer(solux::DocsEnum& docsEnum, solux::IntColReader* normsReader,
-           solux::Similarity::BM25Scorer* simScorer, float boost = 1.0f)
+           solux::Similarity::BM25Scorer* simScorer, float boost = 1.0f,
+           bool useFrontierBound = true)
             : docsEnum(docsEnum), simScorer(simScorer), boost(boost) {
+      unused(useFrontierBound);
       // Scoring needs both BM25 and norms, or neither.
       assert((simScorer == nullptr) == (normsReader == nullptr));
       if (normsReader != nullptr) normsIter.emplace(*normsReader);
     }
 
     Scorer(solux::MemPool& pool, solux::DocsEnum& docsEnum, solux::IntColReader* normsReader,
-           solux::Similarity::BM25Scorer* simScorer, float boost = 1.0f)
-            : Scorer(docsEnum, normsReader, simScorer, boost) {
-      buildImpacts(pool, normsReader);
+           solux::Similarity::BM25Scorer* simScorer, float boost = 1.0f,
+           bool useFrontierBound = true)
+            : Scorer(docsEnum, normsReader, simScorer, boost, useFrontierBound) {
+      buildImpacts(pool, normsReader, useFrontierBound);
     }
 
     bool hasImpacts() const {
       return impactBlockCount > 0;
     }
 
-    void buildImpacts(solux::MemPool& pool, solux::IntColReader* normsReader) {
+    void buildImpacts(solux::MemPool& pool, solux::IntColReader* normsReader,
+                      bool useFrontierBound = true) {
       if (simScorer == nullptr || normsReader == nullptr) {
         return;
       }
 
-      // T1 corner bound: evaluate each block's impact at its own (maxTf, minNorm) corner.
-      // minNorm is the block's minimum encoded norm byte (shortest doc, score-maximizing),
-      // tighter than the field-global IntColReader::getMin() used for T0.  normsReader != null
-      // implies a TEXT field, which stores per-block minNorm (2a), so blockMinNorm is real here.
+      // T2 frontier bound: evaluate each block's impact at all real Pareto frontier
+      // points.  The old T1 corner bound remains available for A/B measurement.
       std::vector<int32_t> blockMaxTf;
       std::vector<int32_t> blockLastDoc;
       std::vector<int32_t> blockMinNorm;
-      docsEnum.readBlockMaxTf(blockMaxTf, nullptr, &blockLastDoc, &blockMinNorm);
+      DocsEnum::ImpactFrontiers impactFrontiers;
+      docsEnum.readBlockMaxTf(blockMaxTf, nullptr, &blockLastDoc, &blockMinNorm,
+                              nullptr, useFrontierBound ? &impactFrontiers : nullptr);
       if (blockMaxTf.empty()) {
         return;
       }
       assert(blockMaxTf.size() == blockLastDoc.size());
       assert(blockMaxTf.size() == blockMinNorm.size());
+      assert(!useFrontierBound
+             || impactFrontiers.offsets.size() == blockMaxTf.size() + 1);
 
       impactBlockCount = (int32_t) blockMaxTf.size();
       impactLastDoc = pool.make_arr<int32_t>((size_t) impactBlockCount);
@@ -172,7 +186,24 @@ public:
 
       for (int32_t i = 0; i < impactBlockCount; i++) {
         impactLastDoc[i] = blockLastDoc[i];
-        blockImpact[i] = boost * simScorer->score((float) blockMaxTf[i], (int64_t) blockMinNorm[i]);
+        if (useFrontierBound) {
+          int32_t start = impactFrontiers.offsets[(size_t) i];
+          int32_t end = impactFrontiers.offsets[(size_t) i + 1];
+          if (start < end) {
+            float maxImpact = 0.0f;
+            for (int32_t j = start; j < end; j++) {
+              maxImpact = std::max(
+                  maxImpact,
+                  boost * simScorer->score((float) impactFrontiers.tfs[(size_t) j],
+                                            (int64_t) impactFrontiers.norms[(size_t) j]));
+            }
+            blockImpact[i] = maxImpact;
+          } else {
+            blockImpact[i] = boost * simScorer->score((float) blockMaxTf[i], (int64_t) blockMinNorm[i]);
+          }
+        } else {
+          blockImpact[i] = boost * simScorer->score((float) blockMaxTf[i], (int64_t) blockMinNorm[i]);
+        }
       }
       float suffixMax = 0.0f;
       for (int32_t i = impactBlockCount - 1; i >= 0; i--) {
@@ -201,6 +232,7 @@ public:
           return doc;
         }
         if (maxImpactFrom[block] < minCompetitiveScore) {
+          skippedImpactBlocks += impactBlockCount - block;
           return PostingsReader::END;
         }
         if (blockImpact[block] >= minCompetitiveScore) {
@@ -213,6 +245,7 @@ public:
         if (target <= doc) {
           return doc;
         }
+        skippedImpactBlocks++;
         doc = docsEnum.advance(target);
       }
       return doc;
@@ -283,6 +316,10 @@ public:
         return PostingsReader::END;
       }
       return impactLastDoc[shallowBlock];
+    }
+
+    int64_t skippedBlocks() const {
+      return skippedImpactBlocks;
     }
 
     /// term frequency for current doc

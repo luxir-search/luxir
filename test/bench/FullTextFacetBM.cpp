@@ -78,6 +78,7 @@ using ScoreDoc = TopDocsCollector::ScoreDoc;
 
 struct ScoreTopKResult {
   int64_t visited = 0;
+  int64_t skippedBlocks = 0;
   int64_t nonEssentialLookups = 0;
   int64_t fp = 0;
   std::vector<ScoreDoc> topDocs;
@@ -97,6 +98,17 @@ enum class CrossSegmentAccumulatorMode {
 enum class MsmWandMode {
   Exhaustive,
   Wand
+};
+
+enum class FrontierBoundMode {
+  Corner,
+  Frontier
+};
+
+enum class FrontierCorpus {
+  AntiCorrelated,
+  Clustered,
+  Zipf
 };
 
 void sortScoreDocs(std::vector<ScoreDoc>& docs) {
@@ -120,12 +132,14 @@ int64_t scoreTopKFingerprint(std::span<const ScoreDoc> docs) {
 }
 
 ScoreTopKResult runFullTextScoreTopK(IndexReader& reader, std::string_view qterm,
-                                     int32_t topK, bool skip) {
+                                     int32_t topK, bool skip,
+                                     bool useFrontierBound = true) {
   MemPool pool;
   Query::Context qContext(pool, reader);
-  TermQuery query("body_w", qterm);
+  TermQuery query("body_w", qterm, 1.0f, useFrontierBound);
   auto* weight = query.createWeight(qContext, Query::NEED_SCORES);
   TopDocsCollector collector(topK);
+  int64_t skippedBlocks = 0;
 
   auto segments = qContext.topReader.segments();
   for (int32_t segnum = 0; segnum < (int32_t) segments.size(); segnum++) {
@@ -141,10 +155,14 @@ ScoreTopKResult runFullTextScoreTopK(IndexReader& reader, std::string_view qterm
         collector.collect(segnum, doc, scorer->score());
       }
     }
+    if (auto* termScorer = dynamic_cast<TermQuery::Scorer*>(scorer)) {
+      skippedBlocks += termScorer->skippedBlocks();
+    }
   }
 
   ScoreTopKResult result;
   result.visited = collector.totalHits();
+  result.skippedBlocks = skippedBlocks;
   auto topDocs = collector.sort();
   result.topDocs.assign(topDocs.begin(), topDocs.end());
   sortScoreDocs(result.topDocs);
@@ -384,6 +402,58 @@ void appendTerm(std::string& body, std::string_view term, int32_t count) {
   }
 }
 
+void frontierBenchTfLen(int64_t postingOrd, int32_t& tf, int32_t& len) {
+  int32_t block = (int32_t) (postingOrd / Postings::DOCS_BLOCK_SIZE);
+  int32_t local = (int32_t) (postingOrd % Postings::DOCS_BLOCK_SIZE);
+  if (block == 0) {
+    tf = 260 - local;
+    len = tf + 2;
+  } else if (local == 0) {
+    tf = 240 - std::min(block, 120);
+    len = 1100 + block * 3;
+  } else if (local == 1) {
+    tf = 1;
+    len = 2;
+  } else {
+    tf = 1 + (local % 5 == 0 ? 1 : 0);
+    len = 260 + (local % 53);
+  }
+  if (len < tf) {
+    len = tf;
+  }
+}
+
+void buildAntiCorrelatedFrontierBenchIndex(CollectionHelper& helper, int64_t nDocs) {
+  helper.clear();
+  auto iw = helper.getIndexWriter();
+  Inverter& inverter = iw->obtainInverter();
+  Inverter::IndexHandler& hId = inverter.getIndexHandler("id");
+  Inverter::IndexHandler& hBody = inverter.getIndexHandler("body_w");
+
+  std::string body;
+  int64_t postingOrd = 0;
+  for (int64_t doc = 0; doc < nDocs; doc++) {
+    body.clear();
+    if ((doc % 2) == 0) {
+      int32_t tf = 0;
+      int32_t len = 0;
+      frontierBenchTfLen(postingOrd++, tf, len);
+      appendTerm(body, "frontier", tf);
+      appendTerm(body, "filler", len - tf);
+    } else {
+      appendTerm(body, "filler", 32 + (int32_t) (doc % 17));
+    }
+
+    inverter.startDoc();
+    hId.index(inverter, std::to_string(doc));
+    hBody.index(inverter, body);
+    inverter.finishDoc();
+  }
+
+  iw->releaseInverter(inverter, true);
+  helper.commit();
+}
+
 void makeCrossSegmentAccumulatorBody(std::string& body, int32_t seg, int32_t local,
                                      int32_t docsInSeg) {
   int32_t tf;
@@ -526,6 +596,73 @@ void buildClusteredDisjunctionBenchIndex(CollectionHelper& helper, int64_t nDocs
 
   iw->releaseInverter(inverter, true);
   helper.commit();
+}
+
+// Multi-term version of the anti-correlated frontier corpus: numTerms terms,
+// each round-robin over docids so each gets its own anti-correlated block
+// structure (loose corner, tight frontier).  Used to measure whether the T2
+// frontier bound tightens the MULTI-term windowed-MaxScore window bound, not
+// just the single-term block skip.
+void buildMultiTermAntiCorrelatedIndex(CollectionHelper& helper, int64_t nDocs, int32_t numTerms) {
+  helper.clear();
+  auto iw = helper.getIndexWriter();
+  Inverter& inverter = iw->obtainInverter();
+  Inverter::IndexHandler& hId = inverter.getIndexHandler("id");
+  Inverter::IndexHandler& hBody = inverter.getIndexHandler("body_w");
+
+  std::vector<int64_t> postingOrd((size_t) numTerms, 0);
+  std::string body;
+  for (int64_t doc = 0; doc < nDocs; doc++) {
+    int32_t term = (int32_t) (doc % numTerms);
+    int32_t tf = 0;
+    int32_t len = 0;
+    frontierBenchTfLen(postingOrd[(size_t) term]++, tf, len);
+    body.clear();
+    appendTerm(body, "mt" + std::to_string(term), tf);
+    appendTerm(body, "filler", len - tf);
+    inverter.startDoc();
+    hId.index(inverter, std::to_string(doc));
+    hBody.index(inverter, body);
+    inverter.finishDoc();
+  }
+  iw->releaseInverter(inverter, true);
+  helper.commit();
+}
+
+ScoreTopKResult runMultiTermDisjunctionTopK(IndexReader& reader,
+                                            const std::vector<std::string>& terms,
+                                            int32_t topK, bool useFrontier) {
+  MemPool pool;
+  Query::Context qContext(pool, reader);
+  std::vector<TermQuery> queries;
+  queries.reserve(terms.size());
+  for (const auto& t : terms) {
+    queries.emplace_back("body_w", t, 1.0f, useFrontier);
+  }
+  std::vector<Query*> optional;
+  optional.reserve(terms.size());
+  for (auto& q : queries) optional.push_back(&q);
+  BooleanQuery query({}, optional, {}, {});
+  auto* weight = query.createWeight(qContext, Query::NEED_SCORES);
+  TopDocsCollector collector(topK);
+
+  auto segments = qContext.topReader.segments();
+  for (int32_t segnum = 0; segnum < (int32_t) segments.size(); segnum++) {
+    auto* scorer = weight->createScorer(pool, segments[segnum]);
+    if (scorer == nullptr) {
+      continue;
+    }
+    scorer->setMinCompetitiveScore(collector.minCompetitiveVal);
+    collectTopK(segnum, scorer, nullptr, nullptr, collector);
+  }
+
+  ScoreTopKResult result;
+  result.visited = collector.totalHits();
+  auto topDocs = collector.sort();
+  result.topDocs.assign(topDocs.begin(), topDocs.end());
+  sortScoreDocs(result.topDocs);
+  result.fp = scoreTopKFingerprint(result.topDocs);
+  return result;
 }
 
 }  // namespace
@@ -1035,6 +1172,140 @@ static void BM_FullTextScoreTopKClustered(benchmark::State& state, bool skip) {
   state.counters["RSS_max"] = mem.second / 1024;
 }
 
+//
+// Multi-term windowed-MaxScore disjunction over the anti-correlated frontier
+// corpus, T2 vs T1 sub-clause bounds.  Tests whether the tighter T2 per-block
+// bound flows into the multi-term window partition (each clause's
+// getMaxScore(windowEnd)) and prunes more than the loose T1 corner.
+//
+static void BM_FullTextScoreTopKMultiTermFrontier(benchmark::State& state,
+                                                  FrontierBoundMode mode, bool zipf) {
+  constexpr int32_t topK = 100;
+  int64_t nDocs = solux::unit_tests ? 16000 : 1'000'000;
+  std::vector<int32_t> docsPerSeg = {(int32_t) nDocs};
+  // anti-correlated mt0..mt3 (loose corner), vs realistic Zipfian mid-freq terms.
+  std::vector<std::string> terms = zipf
+    ? std::vector<std::string>{"t5", "t20", "t100", "t500"}
+    : std::vector<std::string>{"mt0", "mt1", "mt2", "mt3"};
+
+  CollectionHelper helper;
+  static std::vector<int32_t> builtShape;
+  static bool builtZipf = false;
+  bool reuseIndex = builtShape == docsPerSeg && builtZipf == zipf && helper.indexMatchesShape(docsPerSeg);
+  if (!reuseIndex) {
+    if (zipf) {
+      buildFullTextBenchIndex(helper, nDocs, docsPerSeg);
+    } else {
+      buildMultiTermAntiCorrelatedIndex(helper, nDocs, (int32_t) terms.size());
+    }
+    builtShape = docsPerSeg;
+    builtZipf = zipf;
+  }
+
+  auto reader = helper.getIndexWriter()->getIndexReader();
+  ScoreTopKResult t2 = runMultiTermDisjunctionTopK(*reader, terms, topK, true);
+  ScoreTopKResult t1 = runMultiTermDisjunctionTopK(*reader, terms, topK, false);
+  assertSameTopK(t2, t1);
+
+  RSSWatcher watcher;
+  int64_t fp = -1;
+  int64_t visited = 0;
+  for (auto _ : state) {
+    ScoreTopKResult result = runMultiTermDisjunctionTopK(*reader, terms, topK,
+                                                         mode == FrontierBoundMode::Frontier);
+    benchmark::DoNotOptimize(result.fp);
+    benchmark::DoNotOptimize(result.visited);
+    if (fp != -1) {
+      ASSERT_EQ(fp, result.fp);
+    }
+    fp = result.fp;
+    visited = result.visited;
+  }
+  state.counters["fp"] = fp;
+  state.counters["visited"] = visited;
+  state.counters["frontier"] = mode == FrontierBoundMode::Frontier ? 1 : 0;
+  state.counters["guard_t1_visited"] = t1.visited;
+  state.counters["guard_t2_visited"] = t2.visited;
+  state.counters["reused"] = reuseIndex;
+  state.counters["rate"] = benchmark::Counter(state.iterations(), benchmark::Counter::kIsRate);
+  auto mem = watcher.getDeltaKB();
+  state.counters["RSS_delta"] = mem.first / 1024;
+  state.counters["RSS_max"] = mem.second / 1024;
+}
+
+static void BM_FullTextScoreTopKFrontierBounds(benchmark::State& state,
+                                               FrontierCorpus corpus,
+                                               FrontierBoundMode mode) {
+  int64_t corpusDocs = solux::unit_tests ? 6000 : 1'000'000;
+  constexpr int32_t topK = 100;
+  std::string_view qterm = "frontier";
+
+  CollectionHelper helper;
+  bool reuseIndex = false;
+  if (corpus == FrontierCorpus::AntiCorrelated) {
+    buildAntiCorrelatedFrontierBenchIndex(helper, corpusDocs);
+  } else if (corpus == FrontierCorpus::Clustered) {
+    helper.clear();
+    buildClusteredScoreTopKIndex(*helper.getIndexWriter(), corpusDocs);
+    qterm = "hot";
+  } else {
+    int mergeFactor = 10;
+    constexpr const char* zipfShape = "5555";
+    std::vector<int32_t> docsPerSeg;
+    CollectionHelper::calcSegSizes(corpusDocs, mergeFactor, zipfShape, docsPerSeg);
+    reuseIndex = helper.indexMatchesShape(docsPerSeg);
+    if (!reuseIndex) {
+      buildFullTextBenchIndex(helper, corpusDocs, docsPerSeg);
+    }
+    qterm = "t100";
+  }
+
+  auto reader = helper.getIndexWriter()->getIndexReader();
+  ScoreTopKResult exhaustive = runFullTextScoreTopK(*reader, qterm, topK, false, true);
+  ScoreTopKResult corner = runFullTextScoreTopK(*reader, qterm, topK, true, false);
+  ScoreTopKResult frontier = runFullTextScoreTopK(*reader, qterm, topK, true, true);
+  assertSameTopK(exhaustive, corner);
+  assertSameTopK(exhaustive, frontier);
+
+  RSSWatcher watcher;
+
+  bool useFrontierBound = mode == FrontierBoundMode::Frontier;
+  int64_t fp = -1;
+  int64_t visited = 0;
+  int64_t skippedBlocks = 0;
+  for (auto _ : state) {
+    ScoreTopKResult result = runFullTextScoreTopK(*reader, qterm, topK, true, useFrontierBound);
+    benchmark::DoNotOptimize(result.fp);
+    benchmark::DoNotOptimize(result.visited);
+    benchmark::DoNotOptimize(result.skippedBlocks);
+
+    if (fp != -1) {
+      ASSERT_EQ(fp, result.fp);
+    }
+    fp = result.fp;
+    visited = result.visited;
+    skippedBlocks = result.skippedBlocks;
+  }
+
+  state.counters["fp"] = fp;
+  state.counters["visited"] = visited;
+  state.counters["skipped_blocks"] = skippedBlocks;
+  state.counters["frontier"] = useFrontierBound ? 1 : 0;
+  state.counters["corpus"] = corpus == FrontierCorpus::AntiCorrelated ? 0
+                            : corpus == FrontierCorpus::Clustered ? 1
+                            : 2;
+  state.counters["nDocs"] = corpusDocs;
+  state.counters["reused"] = reuseIndex;
+  state.counters["guard_t1_visited"] = corner.visited;
+  state.counters["guard_t2_visited"] = frontier.visited;
+  state.counters["guard_t1_skipped_blocks"] = corner.skippedBlocks;
+  state.counters["guard_t2_skipped_blocks"] = frontier.skippedBlocks;
+  state.counters["rate"] = benchmark::Counter(state.iterations(), benchmark::Counter::kIsRate);
+  auto mem = watcher.getDeltaKB();
+  state.counters["RSS_delta"] = mem.first / 1024;
+  state.counters["RSS_max"] = mem.second / 1024;
+}
+
 
 constexpr int32_t nDocs = 1'000'000;
 constexpr const char* shape = "5555";  // ~5 segs of ~181K docs down to tiny sparse segs
@@ -1084,3 +1355,29 @@ SOLUX_BENCHMARK_CAPTURE(BM_FullTextScoreTopKMsmWand, exhaustive, MsmWandMode::Ex
 // Length-clustered relevance top-k A/B for the T1 minNorm pruning workload.
 SOLUX_BENCHMARK_CAPTURE(BM_FullTextScoreTopKClustered, clustered_skip,   true);
 SOLUX_BENCHMARK_CAPTURE(BM_FullTextScoreTopKClustered, clustered_noskip, false);
+
+// T2 frontier impact bound A/B. Corpus 0 is anti-correlated by construction;
+// corpora 1 and 2 reuse the existing clustered and Zipfian workloads.
+SOLUX_BENCHMARK_CAPTURE(BM_FullTextScoreTopKFrontierBounds, anti_t2,
+                        FrontierCorpus::AntiCorrelated, FrontierBoundMode::Frontier);
+SOLUX_BENCHMARK_CAPTURE(BM_FullTextScoreTopKFrontierBounds, anti_t1,
+                        FrontierCorpus::AntiCorrelated, FrontierBoundMode::Corner);
+SOLUX_BENCHMARK_CAPTURE(BM_FullTextScoreTopKFrontierBounds, clustered_t2,
+                        FrontierCorpus::Clustered, FrontierBoundMode::Frontier);
+SOLUX_BENCHMARK_CAPTURE(BM_FullTextScoreTopKFrontierBounds, clustered_t1,
+                        FrontierCorpus::Clustered, FrontierBoundMode::Corner);
+SOLUX_BENCHMARK_CAPTURE(BM_FullTextScoreTopKFrontierBounds, zipf_t2,
+                        FrontierCorpus::Zipf, FrontierBoundMode::Frontier);
+SOLUX_BENCHMARK_CAPTURE(BM_FullTextScoreTopKFrontierBounds, zipf_t1,
+                        FrontierCorpus::Zipf, FrontierBoundMode::Corner);
+
+// Multi-term windowed-MaxScore disjunction, T2 frontier vs T1 corner sub-clauses,
+// on the anti-correlated corpus (where the corner is loose) and a realistic Zipfian one.
+SOLUX_BENCHMARK_CAPTURE(BM_FullTextScoreTopKMultiTermFrontier, multiterm_anti_t2,
+                        FrontierBoundMode::Frontier, false);
+SOLUX_BENCHMARK_CAPTURE(BM_FullTextScoreTopKMultiTermFrontier, multiterm_anti_t1,
+                        FrontierBoundMode::Corner, false);
+SOLUX_BENCHMARK_CAPTURE(BM_FullTextScoreTopKMultiTermFrontier, multiterm_zipf_t2,
+                        FrontierBoundMode::Frontier, true);
+SOLUX_BENCHMARK_CAPTURE(BM_FullTextScoreTopKMultiTermFrontier, multiterm_zipf_t1,
+                        FrontierBoundMode::Corner, true);
