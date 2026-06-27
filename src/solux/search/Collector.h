@@ -68,7 +68,10 @@ class TopDocsCollector {
 
   int64_t topCount;
   std::vector<ScoreDoc> topDocs;  // TODO: create an expanding PQ backed by a vector so we don't have to allocate a vector of size topCount
-  DirectPQ<ScoreDoc, decltype(scoreComp)> pq;
+  // Heap orders by (score, then doc) so ties at the k-th score are broken by (seg, docid):
+  // the kept top-K is a deterministic total order, independent of collection/merge order
+  // (and, once it exists, slicing).  Required for sliced==unsliced to hold at exact ties.
+  DirectPQ<ScoreDoc, decltype(scoreAndDocComp)> pq;
 
   TopDocsCollector(int64_t topCount) : topCount(topCount), topDocs(topCount), pq(topDocs) {
     assert(topCount > 0);
@@ -77,7 +80,12 @@ class TopDocsCollector {
   void collect(int32_t segment, int32_t docid, float score) {
     hitCount++;
 
-    if (score > minCompetitiveVal) {
+    // Admit anything that can match OR beat the k-th best score (>=, not >): a doc whose
+    // score ties the k-th score is still competitive if its (seg, docid) sorts ahead of the
+    // current worst tied doc.  insertWithOverflow resolves that via the (score, then doc)
+    // heap comparator, so a losing tie is a cheap no-op insert and a winning tie evicts the
+    // worst.  This is what makes the kept top-K order-independent (collection, merge, slice).
+    if (score >= minCompetitiveVal) {
       pq.insertWithOverflow({score, segdoc(segment, docid)});
       // Once the heap holds topCount docs, its root (a min-heap on score) is the k-th best
       // so far - the competitive threshold a later doc must beat to enter.  Publish it as
@@ -115,7 +123,9 @@ class TopDocsCollector {
   // Since we use min-heap comparators in our priority queues, the list will be reverse-sorted (smallest last)
   // Repeated calls to pop() on the priority queue will also return the docs in order.
   std::span<ScoreDoc> sort() {
-    std::sort_heap(topDocs.begin(), topDocs.begin() + pq.size(), scoreComp);
+    // sort_heap must use the same comparator the heap was built with (scoreAndDocComp),
+    // which also gives the stable response order: score desc, then (seg, docid) asc at ties.
+    std::sort_heap(topDocs.begin(), topDocs.begin() + pq.size(), scoreAndDocComp);
     return {topDocs.data(), pq.size()};
   }
 

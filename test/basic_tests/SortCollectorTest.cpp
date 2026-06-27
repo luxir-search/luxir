@@ -60,6 +60,114 @@ TEST_F(SortCollectorTest, testPQ) {
   ASSERT_EQ(sortDocs[0].sortValue, 100);
 }
 
+// Score ties must break by (seg, docid) ascending so the kept top-K is a deterministic
+// total order - independent of collection order, merge order, and (eventually) slicing.
+// This is the prerequisite that lets a sliced run be a valid oracle vs the unsliced run.
+// Pre-fix (strict `>` admit + score-only heap) any permutation where the smallest-(seg,docid)
+// tie member arrives after the heap fills produced a different / wrong top-K.
+TEST_F(SortCollectorTest, scoreTieBreakDeterministic) {
+  struct In { int32_t seg; int32_t doc; float score; };
+  // Three docs share the boundary score 10; at k=2 the tie-break must keep the two with the
+  // smallest (seg, docid): (0,2) then (0,5).  (1,0) loses (higher segment), 7 and 3 lose on score.
+  std::vector<In> docs = {
+    {0, 5, 10.0f},
+    {0, 2, 10.0f},
+    {1, 0, 10.0f},
+    {1, 9, 7.0f},
+    {0, 8, 3.0f},
+  };
+  std::vector<segdoc> expected = { segdoc(0, 2), segdoc(0, 5) };
+
+  auto topKOf = [](TopDocsCollector& c) {
+    auto out = c.sort();
+    std::vector<segdoc> got;
+    for (auto& sd : out) got.push_back(sd.doc);
+    return got;
+  };
+
+  // Same multiset collected in several permutations - including ones where the tie-winner
+  // (0,2) arrives after the heap is already full of other score-10 docs - must all match.
+  std::vector<std::vector<int>> orders = {
+    {0, 1, 2, 3, 4}, {4, 3, 2, 1, 0}, {2, 0, 1, 3, 4}, {0, 2, 1, 4, 3}, {3, 2, 0, 4, 1},
+  };
+  for (auto& order : orders) {
+    TopDocsCollector c(2);
+    for (int i : order) c.collect(docs[i].seg, docs[i].doc, docs[i].score);
+    ASSERT_EQ(topKOf(c), expected) << "collection order dependence";
+    ASSERT_EQ(c.totalHits(), (int64_t)docs.size());
+  }
+
+  // Merge must be order-independent too (parallel/sliced collection merges partials).
+  auto runMerge = [&](std::vector<int> a, std::vector<int> b, bool reverse) {
+    TopDocsCollector ca(2), cb(2);
+    for (int i : a) ca.collect(docs[i].seg, docs[i].doc, docs[i].score);
+    for (int i : b) cb.collect(docs[i].seg, docs[i].doc, docs[i].score);
+    TopDocsCollector* lhs = reverse ? &cb : &ca;
+    TopDocsCollector* rhs = reverse ? &ca : &cb;
+    lhs->merge(*rhs);
+    return std::make_pair(topKOf(*lhs), lhs->totalHits());
+  };
+  for (bool reverse : {false, true}) {
+    auto [got1, hits1] = runMerge({0, 1}, {2, 3, 4}, reverse);
+    ASSERT_EQ(got1, expected) << "merge order dependence";
+    ASSERT_EQ(hits1, (int64_t)docs.size());
+    auto [got2, hits2] = runMerge({2, 4}, {0, 1, 3}, reverse);
+    ASSERT_EQ(got2, expected) << "merge order dependence";
+    ASSERT_EQ(hits2, (int64_t)docs.size());
+  }
+}
+
+// Tie-break edge cases: k==1 and an all-equal-score corpus (the flat-score path where
+// every doc ties).  Both must keep the smallest (seg, docid) members deterministically
+// regardless of collection or merge order.
+TEST_F(SortCollectorTest, scoreTieBreakEdgeCases) {
+  struct In { int32_t seg; int32_t doc; float score; };
+  auto topKOf = [](TopDocsCollector& c) {
+    auto out = c.sort();
+    std::vector<segdoc> got;
+    for (auto& sd : out) got.push_back(sd.doc);
+    return got;
+  };
+
+  // k == 1: the single kept doc is the smallest (seg, docid) among the max-score docs.
+  {
+    std::vector<In> docs = { {1, 0, 10.0f}, {0, 7, 10.0f}, {0, 3, 10.0f}, {1, 5, 2.0f} };
+    std::vector<segdoc> expected = { segdoc(0, 3) };
+    std::vector<std::vector<int>> orders = { {0, 1, 2, 3}, {3, 2, 1, 0}, {1, 0, 3, 2} };
+    for (auto& order : orders) {
+      TopDocsCollector c(1);
+      for (int i : order) c.collect(docs[i].seg, docs[i].doc, docs[i].score);
+      ASSERT_EQ(topKOf(c), expected) << "k==1 tie-break order dependence";
+    }
+  }
+
+  // All-equal-score corpus, k == 3: top-3 is the three smallest (seg, docid), and it must
+  // be identical across collection permutations and a merge split.
+  {
+    std::vector<In> docs = {
+      {0, 0, 5.0f}, {0, 4, 5.0f}, {0, 9, 5.0f}, {1, 1, 5.0f}, {1, 2, 5.0f}, {1, 8, 5.0f},
+    };
+    std::vector<segdoc> expected = { segdoc(0, 0), segdoc(0, 4), segdoc(0, 9) };
+    std::vector<std::vector<int>> orders = { {0, 1, 2, 3, 4, 5}, {5, 4, 3, 2, 1, 0}, {3, 0, 5, 1, 4, 2} };
+    for (auto& order : orders) {
+      TopDocsCollector c(3);
+      for (int i : order) c.collect(docs[i].seg, docs[i].doc, docs[i].score);
+      ASSERT_EQ(topKOf(c), expected) << "flat-score order dependence";
+      ASSERT_EQ(c.totalHits(), (int64_t)docs.size());
+    }
+    // merge split, both directions
+    for (bool reverse : {false, true}) {
+      TopDocsCollector ca(3), cb(3);
+      for (int i : {3, 5, 1}) ca.collect(docs[i].seg, docs[i].doc, docs[i].score);
+      for (int i : {2, 0, 4}) cb.collect(docs[i].seg, docs[i].doc, docs[i].score);
+      TopDocsCollector* lhs = reverse ? &cb : &ca;
+      lhs->merge(reverse ? ca : cb);
+      ASSERT_EQ(topKOf(*lhs), expected) << "flat-score merge order dependence";
+      ASSERT_EQ(lhs->totalHits(), (int64_t)docs.size());
+    }
+  }
+}
+
 // Test collecting in different segment orders with both merging and non-merging
 // since this can happen with parallel searches.
 TEST_F(SortCollectorTest, smallEdge) {
