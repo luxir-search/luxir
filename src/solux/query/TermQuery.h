@@ -8,6 +8,7 @@
 
 #include "Query.h"
 #include "solux/reader/IntColReader.h"
+#include "solux/reader/NormsReader.h"
 #include "solux/util/solux_util.h"
 
 namespace solux {
@@ -85,9 +86,14 @@ public:
       }
 
       auto* segFieldInfo = cachedFieldInfo->segInfos[segment.ord]; // this segFieldInfo can't be null at this point
-      solux::IntColReader* normsReader = targetPool.make<solux::IntColReader>(segment.postingsReader(),
-                                                                              *segFieldInfo);
-      return targetPool.make<TermQuery::Scorer>(targetPool, *docsEnum, normsReader,
+      solux::NormsReader* normsReader = nullptr;
+      solux::IntColReader* valueReader = nullptr;
+      if (segFieldInfo->type == FieldType::TEXT) {
+        normsReader = targetPool.make<solux::NormsReader>(segment.postingsReader(), *segFieldInfo);
+      } else if (segFieldInfo->columnLoc.offset() > 0) {
+        valueReader = targetPool.make<solux::IntColReader>(segment.postingsReader(), *segFieldInfo);
+      }
+      return targetPool.make<TermQuery::Scorer>(targetPool, *docsEnum, normsReader, valueReader,
                                                 cachedTermInfo->simScorer, query.getBoost(),
                                                 query.shouldUseFrontierBound());
     }
@@ -125,8 +131,10 @@ public:
   class Scorer final : public Query::Scorer {
   public:
     solux::DocsEnum& docsEnum;
-    // Both absent when scores are not needed; score() is 0.
-    std::optional<solux::IntColReader::Iterator> normsIter;
+    // Both absent when scores are not needed; score() is 0. Text fields use
+    // normsIter; non-text term queries keep the existing column-backed lookup.
+    std::optional<solux::NormsReader::Iterator> normsIter;
+    std::optional<solux::IntColReader::Iterator> valueIter;
     solux::Similarity::BM25Scorer* simScorer;
     int32_t impactBlockCount = 0;
     int32_t* impactLastDoc = nullptr;
@@ -138,30 +146,45 @@ public:
     float boost;
     int64_t skippedImpactBlocks = 0;
 
-    Scorer(solux::DocsEnum& docsEnum, solux::IntColReader* normsReader,
+    Scorer(solux::DocsEnum& docsEnum, solux::NormsReader* normsReader,
            solux::Similarity::BM25Scorer* simScorer, float boost = 1.0f,
            bool useFrontierBound = true)
-            : docsEnum(docsEnum), simScorer(simScorer), boost(boost) {
-      unused(useFrontierBound);
-      // Scoring needs both BM25 and norms, or neither.
-      assert((simScorer == nullptr) == (normsReader == nullptr));
-      if (normsReader != nullptr) normsIter.emplace(*normsReader);
+            : Scorer(docsEnum, normsReader, nullptr, simScorer, boost, useFrontierBound) {
     }
 
-    Scorer(solux::MemPool& pool, solux::DocsEnum& docsEnum, solux::IntColReader* normsReader,
+    Scorer(solux::DocsEnum& docsEnum, solux::NormsReader* normsReader,
+           solux::IntColReader* valueReader, solux::Similarity::BM25Scorer* simScorer,
+           float boost = 1.0f, bool useFrontierBound = true)
+            : docsEnum(docsEnum), simScorer(simScorer), boost(boost) {
+      unused(useFrontierBound);
+      // Scoring needs both BM25 and an encoded norm/value lookup, or neither.
+      assert((simScorer == nullptr) == (normsReader == nullptr && valueReader == nullptr));
+      assert(normsReader == nullptr || valueReader == nullptr);
+      if (normsReader != nullptr) normsIter.emplace(*normsReader);
+      if (valueReader != nullptr) valueIter.emplace(*valueReader);
+    }
+
+    Scorer(solux::MemPool& pool, solux::DocsEnum& docsEnum, solux::NormsReader* normsReader,
            solux::Similarity::BM25Scorer* simScorer, float boost = 1.0f,
            bool useFrontierBound = true)
             : Scorer(docsEnum, normsReader, simScorer, boost, useFrontierBound) {
-      buildImpacts(pool, normsReader, useFrontierBound);
+      buildImpacts(pool, normsReader != nullptr, useFrontierBound);
+    }
+
+    Scorer(solux::MemPool& pool, solux::DocsEnum& docsEnum, solux::NormsReader* normsReader,
+           solux::IntColReader* valueReader, solux::Similarity::BM25Scorer* simScorer,
+           float boost = 1.0f, bool useFrontierBound = true)
+            : Scorer(docsEnum, normsReader, valueReader, simScorer, boost, useFrontierBound) {
+      buildImpacts(pool, normsReader != nullptr || valueReader != nullptr, useFrontierBound);
     }
 
     bool hasImpacts() const {
       return impactBlockCount > 0;
     }
 
-    void buildImpacts(solux::MemPool& pool, solux::IntColReader* normsReader,
+    void buildImpacts(solux::MemPool& pool, bool hasNormLookup,
                       bool useFrontierBound = true) {
-      if (simScorer == nullptr || normsReader == nullptr) {
+      if (simScorer == nullptr || !hasNormLookup) {
         return;
       }
 
@@ -269,11 +292,9 @@ public:
     // Keep the norms advance out-of-line at the per-doc score() call site.
     //
     // score() is the vtable target the per-doc disjunction path calls once per
-    // matching doc. If the norms advance is inlined here it pulls in the
-    // IntColReader dense-bucket walk and balloons this hot function ~10x
-    // (objdump: score() 0xc8 -> 0x7b1), thrashing i-cache; with this barrier it
-    // is 0x6d. Block scoring (fillScoresFromSpans) deliberately does NOT use
-    // this helper, so the block/throughput path still inlines the advance.
+    // matching doc. Keep norm lookup out-of-line here so scorer code size stays
+    // stable. Block scoring (fillScoresFromSpans) deliberately does NOT use this
+    // helper, so the block/throughput path still inlines the lookup.
     //
     // Without this NOINLINE, BM_FullTextScoreTopKBulkDisjunction/bulk_few
     // regressed +43.5% in a gcc-release A/B - and bulk_few does not even execute
@@ -282,10 +303,19 @@ public:
     // REVISIT with a future compiler: re-run that benchmark with and without
     // SOLUX_NOINLINE and drop it if the inliner no longer over-pulls.
     // Observed on: g++ (Ubuntu) 16.0.1 20260322 experimental (trunk r16-8246).
-    int64_t SOLUX_NOINLINE advanceNorm(int32_t doc) {
-      int32_t normDoc = normsIter->advance(doc);
+    int64_t lookupNorm(int32_t doc) {
+      if (normsIter) {
+        int32_t normDoc = normsIter->advance(doc);
+        assert(normDoc == doc);
+        return normsIter->value();
+      }
+      int32_t normDoc = valueIter->advance(doc);
       assert(normDoc == doc);
-      return normsIter->value();
+      return valueIter->value();
+    }
+
+    int64_t SOLUX_NOINLINE advanceNorm(int32_t doc) {
+      return lookupNorm(doc);
     }
 
     float score() override {
@@ -315,9 +345,7 @@ public:
           scores[filled] = 0.0f;
         } else {
           int32_t tf = docsEnum.termFreq();
-          int32_t normDoc = normsIter->advance(doc);
-          assert(normDoc == doc);
-          auto encodedNorm = normsIter->value();
+          auto encodedNorm = lookupNorm(doc);
           scores[filled] = boost * simScorer->score((float) tf, encodedNorm);
         }
         filled++;
@@ -337,9 +365,7 @@ public:
       }
       for (int32_t i = 0; i < count; i++) {
         int32_t doc = blockDocs[(size_t) i];
-        int32_t normDoc = normsIter->advance(doc);
-        assert(normDoc == doc);
-        auto encodedNorm = normsIter->value();
+        auto encodedNorm = lookupNorm(doc);
         scores[i] = boost * simScorer->score((float) blockFreqs[(size_t) i], encodedNorm);
       }
     }

@@ -3,7 +3,7 @@
 #include <optional>
 
 #include "Query.h"
-#include "solux/reader/IntColReader.h"
+#include "solux/reader/NormsReader.h"
 
 namespace solux {
 
@@ -90,8 +90,8 @@ public:
       }
 
       // Position matching does not need norms when score() is never read.
-      IntColReader* normsReader = (inputFlags & NEED_SCORES) != 0
-              ? targetPool.make<IntColReader>(segment.postingsReader(), *segFieldInfo)
+      NormsReader* normsReader = (inputFlags & NEED_SCORES) != 0
+              ? targetPool.make<NormsReader>(segment.postingsReader(), *segFieldInfo)
               : nullptr;
 
       // no need to make copy, the query will outlive the scorers.
@@ -140,7 +140,7 @@ public:
     std::span<DocsEnum*> docsEnums;
     std::span<const int32_t> positions;
     // Both absent when scores are not needed; score() is 0.
-    std::optional<IntColReader::Iterator> normsIter;
+    std::optional<NormsReader::Iterator> normsIter;
     Similarity::BM25Scorer* simScorer;
 
     int32_t docid = -1;
@@ -215,7 +215,7 @@ public:
 
 
   public:
-    Scorer(MemPool& targetPool, std::span<DocsEnum*> docsEnums, std::span<const int32_t> positions, IntColReader* normsReader,
+    Scorer(MemPool& targetPool, std::span<DocsEnum*> docsEnums, std::span<const int32_t> positions, NormsReader* normsReader,
            Similarity::BM25Scorer* simScorer)
             : docsEnums(docsEnums), positions(positions), simScorer(simScorer) {
       // Scoring needs both BM25 and norms, or neither.

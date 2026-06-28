@@ -2,8 +2,10 @@
 #include "IndexWriter.h"
 #include "OrdCollector.h"
 #include "OrdColWriter.h"
+#include "NormsWriter.h"
 #include "StoredFieldsWriter.h"
 #include "solux/reader/DocsEnum.h"
+#include "solux/reader/NormsReader.h"
 #include "solux/reader/StoredFieldsReader.h"
 #include "solux/reader/StrColReader.h"
 #include "solux/search/IndexReader.h"
@@ -233,20 +235,21 @@ private:
     }
   }
 
-  void buildMergedNorms(std::span<MergeFieldInfo*> compactFields, std::vector<uint8_t>& normByDoc) {
-    normByDoc.assign((size_t) postingsWriter.getMaxDoc(), 0);
+  void buildMergedNorms(std::span<MergeFieldInfo*> compactFields, Stream& normBytes,
+                        DocStream& normDocsWithField, int32_t& numDocsWithField, MemPool& pool) {
+    numDocsWithField = 0;
     for (auto* field : compactFields) {
       auto& seg = *field->seg;
-      IntColReader reader(*seg.postingsReader, field->segFieldInfo);
-      IntColReader::Iterator iter(reader);
-      for (int32_t localId = iter.next(); localId != IntColReader::ENDDOC; localId = iter.next()) {
+      NormsReader reader(*seg.postingsReader, field->segFieldInfo);
+      NormsReader::Iterator iter(reader);
+      for (int32_t localId = iter.next(); localId != NormsReader::ENDDOC; localId = iter.next()) {
         auto [mappedDoc, isDeleted] = seg.remapDocId(localId);
         if (isDeleted) {
           continue;
         }
-        int64_t norm = iter.value();
-        assert(norm >= 0 && norm <= 255);
-        normByDoc[(size_t) mappedDoc] = (uint8_t) norm;
+        normBytes.writeByte(pool, iter.value());
+        normDocsWithField.addDoc(pool, mappedDoc);
+        numDocsWithField++;
       }
     }
   }
@@ -297,16 +300,24 @@ private:
       }
       allFlags |= field->segFieldInfo.flags;
     }
-    bool hasNorms = type == FieldType::Type::TEXT && FieldType::hasPositions(allFlags);
-    std::vector<uint8_t> normByDoc;
-    if (hasNorms) {
-      buildMergedNorms(compactFields, normByDoc);
+    bool isText = type == FieldType::Type::TEXT;
+    bool hasImpactNorms = isText && FieldType::hasPositions(allFlags);
+    Stream normBytes;
+    DocStream normDocsWithField(pool);
+    int32_t numNormDocsWithField = 0;
+    if (isText) {
+      buildMergedNorms(compactFields, normBytes, normDocsWithField, numNormDocsWithField, pool);
     }
 
     // get/reserve a new fieldInfo from the postingsReader
     PostingsWriter::IndexFieldInfo& outputFieldInfo = postingsWriter.addField(compactFields[0]->segFieldInfo.fieldname);
     outputFieldInfo.type = type;
     outputFieldInfo.flags = allFlags;
+    NormsWriter::PreparedNorms preparedNorms;
+    if (isText) {
+      preparedNorms = NormsWriter::prepare(pool, postingsWriter, outputFieldInfo, normBytes,
+                                           normDocsWithField, numNormDocsWithField);
+    }
 
     // if this is an indexed string column, we need to collect the ordinals for each doc
     bool isOrdCol = (type == FieldType::Type::STRING) && (allFlags & FieldType::INDEX_DOCS);
@@ -323,8 +334,8 @@ private:
       // nocommit outputFieldInfo.flags |= 0x01;
       TextWriter textWriter(postingsWriter);
       textWriter.startField(&outputFieldInfo);
-      if (hasNorms) {
-        textWriter.setNorms(normByDoc);
+      if (hasImpactNorms) {
+        textWriter.setNorms(preparedNorms.textView());
       }
 
       // Collect TermsEnum for each segment.  Keep track of the index so we can visit in ascending order one at a time.
@@ -398,6 +409,9 @@ private:
       // ordCollector.reset();
       // ordPool.reset();
 
+    } else if (isText) {
+      NormsWriter::writeValues(pool, postingsWriter, outputFieldInfo, preparedNorms,
+                               normDocsWithField);
     } else if ((type == FieldType::Type::STRING || type == FieldType::Type::VECTOR)
                && !(allFlags & FieldType::INDEX_DOCS)) {
       // Non-indexed string/binary column (column-only storage).  Vector columns use

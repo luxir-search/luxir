@@ -2,10 +2,8 @@
 
 #include "solux/index/DocStream.h"
 #include "solux/index/Inverter.h"
-#include "solux/index/IntColWriter.h"
+#include "solux/index/NormsWriter.h"
 #include "solux/search/Similarity.h"
-
-#include <vector>
 
 
 using namespace solux;
@@ -17,14 +15,14 @@ class FullTextHandler : public Inverter::IndexHandler {
 
   TermValHash<DocFreqPosStream> termsHash; // the set of terms contained in this field
   std::unique_ptr<TokenChain> tokenChain;
-  std::vector<uint8_t> normByDoc;
-
-  IntColHandler fieldLengthCol; // to store the field length needed for scoring among other things.
+  Stream normBytes;
+  DocStream normDocsWithField;
+  int32_t numDocsWithField = 0;
 public:
   FullTextHandler(Inverter& inverter, const std::string_view& fieldName, const std::shared_ptr<FieldType>& fieldType)
     : IndexHandler(PackedTerm(inverter.pool, fieldName), fieldType),
       termsHash(inverter.pool, 4),
-      fieldLengthCol(inverter, this->fieldName, this->fieldType, *this) {
+      normDocsWithField(inverter.pool) {
 
     // Future optimization: cache the analyzer for the type if it isn't field-specific
     // This can help with memory consumption when the same analyzer can be used for many fields.
@@ -88,11 +86,9 @@ public:
     // (identity for lengths 0..40, quantized above). Storing raw numTokens silently
     // mis-scores docs over 40 tokens and wraps mod 256 above 255.
     uint8_t encodedNorm = SmallFloat::intToByte4(numTokens);
-    if ((size_t) docid >= normByDoc.size()) {
-      normByDoc.resize((size_t) docid + 1);
-    }
-    normByDoc[(size_t) docid] = encodedNorm;
-    fieldLengthCol.indexSingle(inverter, encodedNorm);
+    normBytes.writeByte(inverter.pool, encodedNorm);
+    normDocsWithField.addDoc(inverter.pool, docid);
+    numDocsWithField++;
   }
 
   void flush(Inverter& inverter) override {
@@ -132,8 +128,11 @@ public:
     fieldInfo.type = fieldType->type();
     fieldInfo.flags = fieldType->flags_ & ~FieldType::ABSTRACT;
 
+    auto preparedNorms = NormsWriter::prepare(inverter.pool, inverter.getPostingsWriter(),
+                                              fieldInfo, normBytes, normDocsWithField,
+                                              numDocsWithField);
     textWriter.startField(&fieldInfo);
-    textWriter.setNorms(normByDoc);
+    textWriter.setNorms(preparedNorms.textView());
     for (size_t tnum = 0; tnum < sz; tnum++) {
       auto term = terms[tnum];
       textWriter.startTerm(term);
@@ -144,9 +143,8 @@ public:
     textWriter.endField();
     termsHash.free();  // free up memory early.
 
-    // now flush the field length column
-    fieldLengthCol.flushIntCol(inverter, fieldInfo);
-    normByDoc.clear();
+    NormsWriter::writeValues(inverter.pool, inverter.getPostingsWriter(), fieldInfo,
+                             preparedNorms, normDocsWithField);
   }
 
 };

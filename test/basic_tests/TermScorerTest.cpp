@@ -885,7 +885,7 @@ TEST_F(TermScorerTest, singleSeg) {
     Similarity sim;
     auto simScorer = sim.getScorer(1.0, fieldStats, termStats);
 
-    IntColReader& normsCol = *f.colReader;
+    NormsReader& normsCol = *f.normsReader;
 
     // lucene scores the docs as follows:
     // doc=5 score=0.36330473

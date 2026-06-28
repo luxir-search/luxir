@@ -8,6 +8,7 @@
 #include "solux/reader/TermsEnum.h"
 #include "solux/reader/DocsEnum.h"
 #include "solux/reader/IntColReader.h"
+#include "solux/reader/NormsReader.h"
 #include "test/SoluxTest.h"
 #include <vector>
 
@@ -207,6 +208,8 @@ namespace solux::test {
     SegFieldInfo fieldInfo;
     std::unique_ptr<IntColReader> colReader;
     std::unique_ptr<IntColReader::Iterator> iter;
+    std::unique_ptr<NormsReader> normsReader;
+    std::unique_ptr<NormsReader::Iterator> normsIter;
     std::unique_ptr<TermsEnum> tenum;
 
 
@@ -257,15 +260,16 @@ namespace solux::test {
       testIndex.initReader();  // TODO: don't do this for each field, it will invalidate previous pointers!
       currSeg = -1;
       iter.reset();
+      normsIter.reset();
     }
 
     int64_t nextDoc() {
-      if (iter == nullptr) {
+      if (iter == nullptr && normsIter == nullptr) {
         auto found = nextSegment();
         if (!found) return -1; // OR BIG_END. 0x7ffffffff?
       }
       for(;;) {
-        doc = iter->next();
+        doc = iter ? iter->next() : normsIter->next();
         if (doc != IntColReader::ENDDOC) {
           auto* liveDocs = testIndex.reader->segments()[currSeg].liveDocs();
           if (liveDocs && !liveDocs->bitset().get(doc)) {
@@ -279,7 +283,7 @@ namespace solux::test {
     }
 
     int64_t val() {
-      return v = iter->value();
+      return v = iter ? iter->value() : normsIter->value();
     }
 
     int64_t ord() {
@@ -319,9 +323,18 @@ namespace solux::test {
         if (!found) continue;
 
         fieldReader.readFieldInfo(fieldInfo);
-        colReader = std::make_unique<IntColReader>(seg.postingsReader(), fieldInfo); // todo nocommit, when will pool rollback be done?
-        // EXPECT_EQ(colReader->docsWithField(), nAdds); // TODO: sum up and only do after final segment has been reached
-        iter = std::make_unique<IntColReader::Iterator>(*colReader);
+        if (fieldInfo.type == FieldType::TEXT) {
+          normsReader = std::make_unique<NormsReader>(seg.postingsReader(), fieldInfo);
+          normsIter = std::make_unique<NormsReader::Iterator>(*normsReader);
+          colReader.reset();
+          iter.reset();
+        } else {
+          colReader = std::make_unique<IntColReader>(seg.postingsReader(), fieldInfo); // todo nocommit, when will pool rollback be done?
+          // EXPECT_EQ(colReader->docsWithField(), nAdds); // TODO: sum up and only do after final segment has been reached
+          iter = std::make_unique<IntColReader::Iterator>(*colReader);
+          normsReader.reset();
+          normsIter.reset();
+        }
         return true;
       }
     }

@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <assert.h>
 #include <iostream>
+#include <optional>
 #include <sstream>
 #include <unordered_map>
 #include <vector>
@@ -304,6 +305,9 @@ private:
       fieldOutput.writeVal(finfo.columnLoc);
       fieldOutput.writeVlong(finfo.columnMetaOff);
       fieldOutput.writeVlong(finfo.numValues);
+      fieldOutput.writeVint((uint32_t)finfo.normsFormat);
+      fieldOutput.writeVal(finfo.normsLoc);
+      fieldOutput.writeVlong(finfo.normsLen);
 
       // for now, always write mono col info.  If we want to make it optional, we need a flag for it.
       fieldOutput.writeVal(finfo.monoLoc);
@@ -334,6 +338,45 @@ private:
 
 
 using OutputStreamPtr = PostingsWriter::OutputStreamPtr;  // for convenience
+
+
+class TextNormsView {
+  std::span<const uint8_t> ordinalNorms;
+  const screaming::BitSet* docsBitset = nullptr;
+  mutable std::optional<screaming::BitSet::Iterator> docsIter;
+  mutable int32_t lastDoc = -1;
+
+public:
+  TextNormsView() = default;
+
+  TextNormsView(std::span<const uint8_t> ordinalNorms, const screaming::BitSet* docsBitset)
+      : ordinalNorms(ordinalNorms), docsBitset(docsBitset) {
+  }
+
+  bool empty() const {
+    return ordinalNorms.empty();
+  }
+
+  uint32_t normForDoc(int32_t docid) const {
+    if (ordinalNorms.empty()) {
+      return 0;
+    }
+    if (docsBitset == nullptr) {
+      assert(docid >= 0 && (size_t)docid < ordinalNorms.size());
+      return (uint32_t) ordinalNorms[(size_t)docid];
+    }
+
+    if (!docsIter.has_value() || docid <= lastDoc) {
+      docsIter.emplace(*docsBitset);
+    }
+    int32_t found = docsIter->advance(docid);
+    assert(found == docid);
+    lastDoc = docid;
+    int32_t ord = docsIter->rank();
+    assert(ord >= 0 && (size_t)ord < ordinalNorms.size());
+    return (uint32_t) ordinalNorms[(size_t)ord];
+  }
+};
 
 
 // TODO: we need a specialization of this for when positions are not required (indexed string fields)
@@ -392,7 +435,7 @@ class TextWriter {
   bool hasFreqs = false;
   bool hasPositions = false;
   bool hasNorms = false;
-  std::span<const uint8_t> normByDoc;
+  TextNormsView norms;
 
   std::vector<uint64_t> termBlockOffsets;  // offset from termsOffset (for this field) for each term block
   int64_t sumTotalTermFreq = 0; // updated in endTerm
@@ -448,11 +491,7 @@ private:  // some internal utility methods... not for use by indexers
   }
 
   uint32_t normForDoc(int32_t docid) const {
-    if (normByDoc.empty()) {
-      return 0;
-    }
-    assert(docid >= 0 && (size_t) docid < normByDoc.size());
-    return (uint32_t) normByDoc[(size_t) docid];
+    return norms.normForDoc(docid);
   }
 
   void buildImpactFrontier(uint32_t docCount) {
@@ -551,7 +590,7 @@ private:  // some internal utility methods... not for use by indexers
     if (!hasNorms) {
       return 0;
     }
-    if (normByDoc.empty()) {
+    if (norms.empty()) {
       return 0;
     }
     uint32_t minNorm = 255;
@@ -1060,8 +1099,8 @@ public:
     }
   }
 
-  void setNorms(std::span<const uint8_t> norms) {
-    normByDoc = norms;
+  void setNorms(TextNormsView norms) {
+    this->norms = norms;
   }
 
 };

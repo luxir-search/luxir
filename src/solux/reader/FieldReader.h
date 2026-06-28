@@ -4,6 +4,12 @@
 
 namespace solux {
 struct SegFieldInfo {
+  enum NormsFormat : uint8_t {
+    NORMS_NONE = 0,
+    NORMS_FLAT = 1,
+    NORMS_SPARSE = 2
+  };
+
   PackedTerm fieldname;
   FieldType::Type type;
   int32_t flags;  // from FieldType
@@ -29,6 +35,12 @@ struct SegFieldInfo {
   int64_t columnMetaOff;     // offset from the start of the column to the metadata
   int64_t numValues;         // total number of values in the column across all docs.
                              // For single-valued fields numValues == docsWithField; for multi-valued it is >=.
+
+  // Dedicated text norms column.  The docs-with-field bitset remains in
+  // docsWithFieldEndLoc/docsWithField; this region stores only the raw norm bytes.
+  int32_t normsFormat;
+  seg_location normsLoc;
+  int64_t normsLen;
 
   seg_location monoLoc;   // location of the monotonic column
   int64_t monoMetaOff;    // offset from the start of the mono column to the metadata
@@ -156,6 +168,9 @@ public:
       fieldInfo.columnLoc = fieldIS.readVal<seg_location>();
       fieldInfo.columnMetaOff = fieldIS.readVlong();
       fieldInfo.numValues = fieldIS.readVlong();
+      fieldInfo.normsFormat = fieldIS.readVint();
+      fieldInfo.normsLoc = fieldIS.readVal<seg_location>();
+      fieldInfo.normsLen = fieldIS.readVlong();
 
       fieldInfo.monoLoc = fieldIS.readVal<seg_location>();
       fieldInfo.monoMetaOff = fieldIS.readVlong();
