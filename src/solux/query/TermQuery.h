@@ -3,10 +3,12 @@
 #include <algorithm>
 #include <limits>
 #include <optional>
+#include <span>
 #include <vector>
 
 #include "Query.h"
 #include "solux/reader/IntColReader.h"
+#include "solux/util/solux_util.h"
 
 namespace solux {
 
@@ -264,13 +266,33 @@ public:
       return docsEnum.docId();
     }
 
+    // Keep the norms advance out-of-line at the per-doc score() call site.
+    //
+    // score() is the vtable target the per-doc disjunction path calls once per
+    // matching doc. If the norms advance is inlined here it pulls in the
+    // IntColReader dense-bucket walk and balloons this hot function ~10x
+    // (objdump: score() 0xc8 -> 0x7b1), thrashing i-cache; with this barrier it
+    // is 0x6d. Block scoring (fillScoresFromSpans) deliberately does NOT use
+    // this helper, so the block/throughput path still inlines the advance.
+    //
+    // Without this NOINLINE, BM_FullTextScoreTopKBulkDisjunction/bulk_few
+    // regressed +43.5% in a gcc-release A/B - and bulk_few does not even execute
+    // the edit that triggered it; the inliner just re-evaluated the whole TU.
+    // This is a fragile codegen workaround, not a fundamental constraint.
+    // REVISIT with a future compiler: re-run that benchmark with and without
+    // SOLUX_NOINLINE and drop it if the inliner no longer over-pulls.
+    // Observed on: g++ (Ubuntu) 16.0.1 20260322 experimental (trunk r16-8246).
+    int64_t SOLUX_NOINLINE advanceNorm(int32_t doc) {
+      int32_t normDoc = normsIter->advance(doc);
+      assert(normDoc == doc);
+      return normsIter->value();
+    }
+
     float score() override {
       if (simScorer == nullptr) return 0.0f;
       auto docid = docsEnum.docId();
       int32_t tf = docsEnum.termFreq();
-      int32_t normDoc = normsIter->advance(docid);
-      assert(normDoc == docid);
-      auto encodedNorm = normsIter->value();
+      int64_t encodedNorm = advanceNorm(docid);
       return boost * simScorer->score((float) tf, encodedNorm);
     }
 
@@ -304,6 +326,24 @@ public:
       return filled;
     }
 
+    void fillScoresFromSpans(int32_t* docs, float* scores, std::span<const int32_t> blockDocs,
+                             std::span<const int32_t> blockFreqs, int32_t count) {
+      for (int32_t i = 0; i < count; i++) {
+        docs[i] = blockDocs[(size_t) i];
+      }
+      if (simScorer == nullptr) {
+        std::fill(scores, scores + count, 0.0f);
+        return;
+      }
+      for (int32_t i = 0; i < count; i++) {
+        int32_t doc = blockDocs[(size_t) i];
+        int32_t normDoc = normsIter->advance(doc);
+        assert(normDoc == doc);
+        auto encodedNorm = normsIter->value();
+        scores[i] = boost * simScorer->score((float) blockFreqs[(size_t) i], encodedNorm);
+      }
+    }
+
     int32_t fillScoreBlock(int32_t* docs, float* scores, int32_t count, int32_t upTo) override {
       assert(count >= 0);
       if (count <= 0) {
@@ -312,34 +352,38 @@ public:
 
       // The scalar path owns exact impact-threshold skipping. The block span
       // path is used by BS1, which does not push child term thresholds.
-      if (count != Postings::DOCS_BLOCK_SIZE || (hasImpacts() && minCompetitiveScore > 0.0f)) {
+      if (hasImpacts() && minCompetitiveScore > 0.0f) {
         return fillScoreBlockScalar(docs, scores, count, upTo, true);
       }
 
-      auto [blockDocs, blockFreqs] = docsEnum.nextDocFreqBlock(upTo);
-      int32_t filled = (int32_t) blockDocs.size();
-      if (filled == 0) {
-        return 0;
-      }
-      assert(filled <= count);
-
-      for (int32_t i = 0; i < filled; i++) {
-        docs[i] = blockDocs[(size_t) i];
-      }
-      if (simScorer == nullptr) {
-        std::fill(scores, scores + filled, 0.0f);
-      } else {
-        for (int32_t i = 0; i < filled; i++) {
-          int32_t doc = blockDocs[(size_t) i];
-          int32_t normDoc = normsIter->advance(doc);
-          assert(normDoc == doc);
-          auto encodedNorm = normsIter->value();
-          scores[i] = boost * simScorer->score((float) blockFreqs[(size_t) i], encodedNorm);
+      int32_t filled = 0;
+      while (filled < count) {
+        auto [blockDocs, blockFreqs] = docsEnum.peekDocFreqBlock();
+        int32_t available = (int32_t) blockDocs.size();
+        if (available == 0) {
+          break;
         }
-      }
 
-      if (filled < count) {
-        filled += fillScoreBlockScalar(docs + filled, scores + filled, count - filled, upTo, false);
+        int32_t limit = std::min(available, count - filled);
+        int32_t used = 0;
+        if (blockDocs[(size_t) limit - 1] < upTo) {
+          used = limit;
+        } else {
+          while (used < limit && blockDocs[(size_t) used] < upTo) {
+            used++;
+          }
+        }
+
+        if (used == 0) {
+          break;
+        }
+        fillScoresFromSpans(docs + filled, scores + filled, blockDocs, blockFreqs, used);
+        docsEnum.consumeDocFreqBlock(used);
+        filled += used;
+
+        if (used < available) {
+          break;
+        }
       }
       return filled;
     }
