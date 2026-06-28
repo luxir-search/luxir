@@ -80,6 +80,8 @@ struct ScoreTopKResult {
   int64_t visited = 0;
   int64_t skippedBlocks = 0;
   int64_t nonEssentialLookups = 0;
+  int64_t bulkSegments = 0;
+  int64_t bulkFallbackSegments = 0;
   int64_t fp = 0;
   std::vector<ScoreDoc> topDocs;
 };
@@ -109,6 +111,11 @@ enum class FrontierCorpus {
   AntiCorrelated,
   Clustered,
   Zipf
+};
+
+enum class BulkDisjunctionCorpus {
+  Few,
+  Dense
 };
 
 void sortScoreDocs(std::vector<ScoreDoc>& docs) {
@@ -603,6 +610,15 @@ void buildClusteredDisjunctionBenchIndex(CollectionHelper& helper, int64_t nDocs
 // structure (loose corner, tight frontier).  Used to measure whether the T2
 // frontier bound tightens the MULTI-term windowed-MaxScore window bound, not
 // just the single-term block skip.
+std::vector<std::string> makeMtTerms(int32_t numTerms) {
+  std::vector<std::string> terms;
+  terms.reserve((size_t) numTerms);
+  for (int32_t term = 0; term < numTerms; term++) {
+    terms.push_back("mt" + std::to_string(term));
+  }
+  return terms;
+}
+
 void buildMultiTermAntiCorrelatedIndex(CollectionHelper& helper, int64_t nDocs, int32_t numTerms) {
   helper.clear();
   auto iw = helper.getIndexWriter();
@@ -625,6 +641,39 @@ void buildMultiTermAntiCorrelatedIndex(CollectionHelper& helper, int64_t nDocs, 
     hBody.index(inverter, body);
     inverter.finishDoc();
   }
+  iw->releaseInverter(inverter, true);
+  helper.commit();
+}
+
+void buildDenseManyClauseIndex(CollectionHelper& helper, int64_t nDocs, int32_t numTerms) {
+  helper.clear();
+  auto iw = helper.getIndexWriter();
+  Inverter& inverter = iw->obtainInverter();
+  Inverter::IndexHandler& hId = inverter.getIndexHandler("id");
+  Inverter::IndexHandler& hBody = inverter.getIndexHandler("body_w");
+  std::vector<std::string> terms = makeMtTerms(numTerms);
+
+  std::string body;
+  for (int64_t doc = 0; doc < nDocs; doc++) {
+    body.clear();
+    int32_t used = 0;
+    for (int32_t term = 0; term < numTerms; term++) {
+      if (((doc + term) & 1) != 0) {
+        continue;
+      }
+      int32_t tf = 1 + (int32_t) ((doc * 31 + term * 17) % 4);
+      appendTerm(body, terms[(size_t) term], tf);
+      used += tf;
+    }
+    int32_t len = used + 24 + (int32_t) (doc % 37);
+    appendTerm(body, "filler", len - used);
+
+    inverter.startDoc();
+    hId.index(inverter, std::to_string(doc));
+    hBody.index(inverter, body);
+    inverter.finishDoc();
+  }
+
   iw->releaseInverter(inverter, true);
   helper.commit();
 }
@@ -657,6 +706,64 @@ ScoreTopKResult runMultiTermDisjunctionTopK(IndexReader& reader,
   }
 
   ScoreTopKResult result;
+  result.visited = collector.totalHits();
+  auto topDocs = collector.sort();
+  result.topDocs.assign(topDocs.begin(), topDocs.end());
+  sortScoreDocs(result.topDocs);
+  result.fp = scoreTopKFingerprint(result.topDocs);
+  return result;
+}
+
+ScoreTopKResult runBulkOrPullDisjunctionTopK(IndexReader& reader,
+                                             const std::vector<std::string>& terms,
+                                             int32_t topK, bool useBulk) {
+  MemPool pool;
+  Query::Context qContext(pool, reader);
+  std::vector<TermQuery> queries;
+  queries.reserve(terms.size());
+  for (const auto& t : terms) {
+    queries.emplace_back("body_w", t);
+  }
+  std::vector<Query*> optional;
+  optional.reserve(terms.size());
+  for (auto& q : queries) optional.push_back(&q);
+  BooleanQuery query({}, optional, {}, {});
+  auto* weight = query.createWeight(qContext, Query::NEED_SCORES);
+  TopDocsCollector collector(topK);
+  ScoreTopKResult result;
+
+  auto segments = qContext.topReader.segments();
+  for (int32_t segnum = 0; segnum < (int32_t) segments.size(); segnum++) {
+    auto& seg = segments[segnum];
+    if (useBulk) {
+      auto* supplier = weight->scorerSupplier(pool, seg);
+      if (supplier == nullptr) {
+        continue;
+      }
+      auto* bulk = supplier->bulkScorer(pool);
+      if (bulk != nullptr) {
+        result.bulkSegments++;
+        collectTopKWindowed(segnum, bulk, nullptr, collector, nullptr, seg.maxDoc());
+        continue;
+      }
+      result.bulkFallbackSegments++;
+      LOG_ERROR("MaxScore bulk scorer unexpectedly null for segment {}", segnum);
+      auto* scorer = supplier->get(pool, std::numeric_limits<int64_t>::max());
+      if (scorer == nullptr) {
+        continue;
+      }
+      scorer->setMinCompetitiveScore(collector.minCompetitiveVal);
+      collectTopK(segnum, scorer, nullptr, nullptr, collector);
+    } else {
+      auto* scorer = weight->createScorer(pool, seg);
+      if (scorer == nullptr) {
+        continue;
+      }
+      scorer->setMinCompetitiveScore(collector.minCompetitiveVal);
+      collectTopK(segnum, scorer, nullptr, nullptr, collector);
+    }
+  }
+
   result.visited = collector.totalHits();
   auto topDocs = collector.sort();
   result.topDocs.assign(topDocs.begin(), topDocs.end());
@@ -1233,6 +1340,80 @@ static void BM_FullTextScoreTopKMultiTermFrontier(benchmark::State& state,
   state.counters["RSS_max"] = mem.second / 1024;
 }
 
+static void BM_FullTextScoreTopKBulkDisjunction(benchmark::State& state,
+                                                BulkDisjunctionCorpus corpus, bool useBulk) {
+  constexpr int32_t topK = 100;
+  int64_t nDocs = solux::unit_tests ? 2000 : 1'000'000;
+  int32_t numTerms = corpus == BulkDisjunctionCorpus::Dense ? 32 : 5;
+  std::vector<int32_t> docsPerSeg = {(int32_t) nDocs};
+  std::vector<std::string> terms = makeMtTerms(numTerms);
+
+  CollectionHelper helper;
+  static BulkDisjunctionCorpus builtCorpus = BulkDisjunctionCorpus::Few;
+  static int64_t builtDocs = 0;
+  static int32_t builtTerms = 0;
+  bool reuseIndex = builtCorpus == corpus && builtDocs == nDocs && builtTerms == numTerms
+    && helper.indexMatchesShape(docsPerSeg);
+  if (!reuseIndex) {
+    if (corpus == BulkDisjunctionCorpus::Dense) {
+      buildDenseManyClauseIndex(helper, nDocs, numTerms);
+    } else {
+      buildMultiTermAntiCorrelatedIndex(helper, nDocs, numTerms);
+    }
+    builtCorpus = corpus;
+    builtDocs = nDocs;
+    builtTerms = numTerms;
+  }
+
+  auto reader = helper.getIndexWriter()->getIndexReader();
+  ScoreTopKResult pull = runBulkOrPullDisjunctionTopK(*reader, terms, topK, false);
+  ScoreTopKResult bulk = runBulkOrPullDisjunctionTopK(*reader, terms, topK, true);
+  ASSERT_EQ(0, bulk.bulkFallbackSegments);
+  ASSERT_GT(bulk.bulkSegments, 0);
+  ASSERT_EQ(pull.fp, bulk.fp);
+  assertSameTopK(pull, bulk);
+
+  RSSWatcher watcher;
+  int64_t fp = -1;
+  int64_t visited = 0;
+  int64_t bulkSegments = 0;
+  int64_t bulkFallbackSegments = 0;
+  for (auto _ : state) {
+    ScoreTopKResult result = runBulkOrPullDisjunctionTopK(*reader, terms, topK, useBulk);
+    benchmark::DoNotOptimize(result.fp);
+    benchmark::DoNotOptimize(result.visited);
+    benchmark::DoNotOptimize(result.bulkSegments);
+    benchmark::DoNotOptimize(result.bulkFallbackSegments);
+    if (useBulk) {
+      ASSERT_EQ(0, result.bulkFallbackSegments);
+      ASSERT_GT(result.bulkSegments, 0);
+    }
+
+    if (fp != -1) {
+      ASSERT_EQ(fp, result.fp);
+    }
+    fp = result.fp;
+    visited = result.visited;
+    bulkSegments = result.bulkSegments;
+    bulkFallbackSegments = result.bulkFallbackSegments;
+  }
+
+  state.counters["fp"] = fp;
+  state.counters["visited"] = visited;
+  state.counters["bulk"] = useBulk ? 1 : 0;
+  state.counters["dense"] = corpus == BulkDisjunctionCorpus::Dense ? 1 : 0;
+  state.counters["terms"] = numTerms;
+  state.counters["bulk_segments"] = bulkSegments;
+  state.counters["bulk_fallback_segments"] = bulkFallbackSegments;
+  state.counters["guard_pull_visited"] = pull.visited;
+  state.counters["guard_bulk_visited"] = bulk.visited;
+  state.counters["reused"] = reuseIndex;
+  state.counters["rate"] = benchmark::Counter(state.iterations(), benchmark::Counter::kIsRate);
+  auto mem = watcher.getDeltaKB();
+  state.counters["RSS_delta"] = mem.first / 1024;
+  state.counters["RSS_max"] = mem.second / 1024;
+}
+
 static void BM_FullTextScoreTopKFrontierBounds(benchmark::State& state,
                                                FrontierCorpus corpus,
                                                FrontierBoundMode mode) {
@@ -1381,3 +1562,14 @@ SOLUX_BENCHMARK_CAPTURE(BM_FullTextScoreTopKMultiTermFrontier, multiterm_zipf_t2
                         FrontierBoundMode::Frontier, true);
 SOLUX_BENCHMARK_CAPTURE(BM_FullTextScoreTopKMultiTermFrontier, multiterm_zipf_t1,
                         FrontierBoundMode::Corner, true);
+
+// Pull MaxScoreDisjunctionScorer vs the wired MaxScoreBulkScorer path. The dense
+// many-clause corpus is the pre-BS1 case where most clauses stay essential.
+SOLUX_BENCHMARK_CAPTURE(BM_FullTextScoreTopKBulkDisjunction, bulk_few,
+                        BulkDisjunctionCorpus::Few, true);
+SOLUX_BENCHMARK_CAPTURE(BM_FullTextScoreTopKBulkDisjunction, pull_few,
+                        BulkDisjunctionCorpus::Few, false);
+SOLUX_BENCHMARK_CAPTURE(BM_FullTextScoreTopKBulkDisjunction, bulk_dense,
+                        BulkDisjunctionCorpus::Dense, true);
+SOLUX_BENCHMARK_CAPTURE(BM_FullTextScoreTopKBulkDisjunction, pull_dense,
+                        BulkDisjunctionCorpus::Dense, false);
