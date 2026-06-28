@@ -1,6 +1,7 @@
 #include <solux/query/AllQuery.h>
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cmath>
 #include <limits>
 #include <span>
@@ -275,6 +276,130 @@ void assertSameTopKDocs(const DisjunctionTopKRun& expected, const DisjunctionTop
   for (size_t i = 0; i < expected.topDocs.size(); i++) {
     EXPECT_EQ(actual.topDocs[i].doc, expected.topDocs[i].doc) << "k=" << topK << " i=" << i;
     EXPECT_FLOAT_EQ(actual.topDocs[i].score, expected.topDocs[i].score) << "k=" << topK << " i=" << i;
+  }
+}
+
+void assertSameTopKDocsExact(const DisjunctionTopKRun& expected, const DisjunctionTopKRun& actual, int32_t topK) {
+  ASSERT_EQ(actual.topDocs.size(), expected.topDocs.size()) << "k=" << topK;
+  for (size_t i = 0; i < expected.topDocs.size(); i++) {
+    EXPECT_EQ(actual.topDocs[i].doc, expected.topDocs[i].doc) << "k=" << topK << " i=" << i;
+    EXPECT_EQ(std::bit_cast<uint32_t>(actual.topDocs[i].score),
+              std::bit_cast<uint32_t>(expected.topDocs[i].score))
+      << "k=" << topK << " i=" << i;
+  }
+}
+
+std::vector<TermQuery> makeTermQueries(std::span<const std::string_view> terms) {
+  std::vector<TermQuery> queries;
+  queries.reserve(terms.size());
+  for (auto term : terms) {
+    queries.emplace_back("body_w", term);
+  }
+  return queries;
+}
+
+std::vector<Query*> queryPointers(std::span<TermQuery> queries) {
+  std::vector<Query*> pointers;
+  pointers.reserve(queries.size());
+  for (auto& query : queries) {
+    pointers.push_back(&query);
+  }
+  return pointers;
+}
+
+DisjunctionTopKRun runExhaustiveTermDisjunctionTopK(IndexReader& reader,
+                                                    std::span<const std::string_view> terms,
+                                                    int32_t topK) {
+  MemPool pool;
+  Query::Context qContext(pool, reader);
+  auto queries = makeTermQueries(terms);
+  std::vector<Query::Weight*> weights;
+  weights.reserve(queries.size());
+  for (auto& query : queries) {
+    weights.push_back(query.createWeight(qContext, Query::NEED_SCORES));
+  }
+
+  TopDocsCollector collector(topK);
+  auto segments = qContext.topReader.segments();
+  for (int32_t segnum = 0; segnum < (int32_t) segments.size(); segnum++) {
+    auto* arr = pool.make_arr<Query::Scorer*>(weights.size());
+    int32_t count = 0;
+    for (auto* weight : weights) {
+      auto* scorer = weight->createScorer(pool, segments[segnum]);
+      if (scorer != nullptr) arr[count++] = scorer;
+    }
+    if (count == 0) continue;
+    Query::Scorer* scorer = count == 1
+      ? arr[0]
+      : pool.make<BooleanQuery::DisjunctionScorer>(
+          pool, std::span<Query::Scorer*>(arr, (size_t) count));
+    collectTopK(segnum, scorer, nullptr, nullptr, collector, false);
+  }
+
+  DisjunctionTopKRun result;
+  result.visited = collector.totalHits();
+  result.topDocs = sortedCollectorDocs(collector);
+  return result;
+}
+
+DisjunctionTopKRun runBulkTermDisjunctionTopK(IndexReader& reader,
+                                              std::span<const std::string_view> terms,
+                                              int32_t topK,
+                                              bool segmentCollectors,
+                                              MaxScoreAccumulator* accumulator) {
+  MemPool pool;
+  Query::Context qContext(pool, reader);
+  auto queries = makeTermQueries(terms);
+  auto optional = queryPointers(queries);
+  std::span<Query*> empty;
+  BooleanQuery query(empty, std::span<Query*>(optional.data(), optional.size()), empty, empty);
+  auto* weight = query.createWeight(qContext, Query::NEED_SCORES);
+
+  TopDocsCollector merged(topK);
+  TopDocsCollector single(topK);
+  int64_t visited = 0;
+  auto segments = qContext.topReader.segments();
+  for (int32_t segnum = 0; segnum < (int32_t) segments.size(); segnum++) {
+    auto* supplier = weight->scorerSupplier(pool, segments[segnum]);
+    if (supplier == nullptr) continue;
+    auto* bulk = supplier->bulkScorer(pool);
+    if (bulk == nullptr) {
+      ADD_FAILURE() << "bulkScorer returned null for segment " << segnum;
+      continue;
+    }
+    if (segmentCollectors) {
+      TopDocsCollector segmentCollector(topK);
+      collectTopKWindowed(segnum, bulk, nullptr, segmentCollector, accumulator, segments[segnum].maxDoc());
+      visited += segmentCollector.totalHits();
+      merged.merge(segmentCollector);
+    } else {
+      collectTopKWindowed(segnum, bulk, nullptr, single, accumulator, segments[segnum].maxDoc());
+    }
+  }
+
+  DisjunctionTopKRun result;
+  if (segmentCollectors) {
+    result.visited = visited;
+    result.topDocs = sortedCollectorDocs(merged);
+  } else {
+    result.visited = single.totalHits();
+    result.topDocs = sortedCollectorDocs(single);
+  }
+  return result;
+}
+
+void addBulkTieDisjunctionDocs(CollectionHelper& helper) {
+  helper.clear();
+  for (int32_t seg = 0; seg < 2; seg++) {
+    std::vector<Doc> docs;
+    docs.reserve(32);
+    for (int32_t local = 0; local < 32; local++) {
+      std::string term = (local % 2) == 0 ? "tie_a" : "tie_b";
+      std::string body = term + " filler filler filler";
+      docs.push_back(flatdoc("id", "t" + std::to_string(seg) + "_" + std::to_string(local),
+                             "body_w", body));
+    }
+    helper.indexAll(docs, UpdateMessage::COMMIT);
   }
 }
 
@@ -1476,6 +1601,53 @@ TEST_F(TermScorerTest, windowedMaxScoreDisjunctionTopKMatchesExhaustiveAndGlobal
       EXPECT_EQ(windowed.nonEssentialLookups, 0);
     }
   }
+  helper.clear();
+}
+
+TEST_F(TermScorerTest, MaxScoreBulkScorerWindowedTopKMatchesBaseline) {
+  CollectionHelper helper("main");
+  addMaxScoreDisjunctionDocs(helper);
+  auto reader = helper.getIndexWriter()->getIndexReader();
+  const int32_t totalDocs = 3 * kMaxScoreDisjunctionSegDocs;
+  std::array<std::string_view, 3> terms = {"common", "medium", "rare"};
+
+  for (int32_t k : {3, totalDocs + 10}) {
+    auto exhaustive = runExhaustiveDisjunctionTopK(*reader, k);
+    auto baseline = runMaxScoreDisjunctionTopK(*reader, k);
+    auto bulk = runBulkTermDisjunctionTopK(*reader, terms, k, false, nullptr);
+    assertSameTopKDocs(exhaustive, bulk, k);
+    assertSameTopKDocsExact(baseline, bulk, k);
+  }
+  helper.clear();
+}
+
+TEST_F(TermScorerTest, MaxScoreBulkScorerSharedAccumulatorMatchesBaseline) {
+  CollectionHelper helper("main");
+  addMaxScoreDisjunctionDocs(helper);
+  auto reader = helper.getIndexWriter()->getIndexReader();
+  const int32_t k = 3;
+  std::array<std::string_view, 3> terms = {"common", "medium", "rare"};
+
+  MaxScoreAccumulator accumulator;
+  auto exhaustive = runExhaustiveDisjunctionTopK(*reader, k);
+  auto baseline = runMaxScoreDisjunctionTopK(*reader, k);
+  auto bulk = runBulkTermDisjunctionTopK(*reader, terms, k, true, &accumulator);
+  assertSameTopKDocs(exhaustive, bulk, k);
+  assertSameTopKDocsExact(baseline, bulk, k);
+  ASSERT_GT(accumulator.get(), std::numeric_limits<float>::lowest());
+  helper.clear();
+}
+
+TEST_F(TermScorerTest, MaxScoreBulkScorerTiesMatchExhaustive) {
+  CollectionHelper helper("main");
+  addBulkTieDisjunctionDocs(helper);
+  auto reader = helper.getIndexWriter()->getIndexReader();
+  const int32_t k = 9;
+  std::array<std::string_view, 2> terms = {"tie_a", "tie_b"};
+
+  auto expected = runExhaustiveTermDisjunctionTopK(*reader, terms, k);
+  auto bulk = runBulkTermDisjunctionTopK(*reader, terms, k, false, nullptr);
+  assertSameTopKDocsExact(expected, bulk, k);
   helper.clear();
 }
 

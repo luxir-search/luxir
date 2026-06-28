@@ -1,5 +1,6 @@
 #pragma once
 
+#include <bit>
 #include <cmath>
 
 #include "Query.h"
@@ -301,6 +302,19 @@ public:
         unused(leadCost);
         return assembleScorer(targetPool, segment, mandatorySources, optionalSources,
                               prohibitedSources, filterSuppliers, minShouldMatch, needsScores);
+      }
+
+      BulkScorer* bulkScorer(MemPool& targetPool) override {
+        if (!needsScores || !mandatorySources.empty() || !prohibitedSources.empty()
+            || !filterSuppliers.empty() || minShouldMatch > 1 || optionalSources.size() < 2) {
+          return nullptr;
+        }
+        auto optionalScorers = QueryPrep::createScorers(targetPool, segment, optionalSources);
+        if (optionalScorers.size() < 2) {
+          return nullptr;
+        }
+        return targetPool.make<BooleanQuery::MaxScoreBulkScorer>(
+          targetPool, optionalScorers, segment.maxDoc());
       }
     };
 
@@ -1018,6 +1032,274 @@ public:
       return (int32_t) splitIndex;
     }
   }; // MaxScoreDisjunctionScorer
+
+
+  class MaxScoreBulkScorer final : public BulkScorer {
+    constexpr static int32_t kWindowSize = DocsEnum::L1_DOCS;
+    constexpr static int32_t kWindowWords = kWindowSize / 64;
+    static_assert((kWindowSize % 64) == 0);
+
+    std::span<Query::Scorer*> scorers;  // stable global-max order, used for deterministic scoring
+    std::span<float> clauseMax;
+    std::span<float> windowMax;
+    std::span<int32_t> windowOrder;
+    std::span<bool> isEssential;
+    std::span<uint64_t> windowBits;
+    std::span<float> essentialScores;
+    std::span<int32_t> outDocs;
+    std::span<float> outScores;
+
+    int32_t maxDoc;
+    int32_t windowStart = 0;
+    int32_t windowEnd = 0;
+    size_t splitIndex = 0;
+    float minCompetitiveScore = std::numeric_limits<float>::lowest();
+    double scoreBoundFactor = 1.0;
+
+    static bool lessMaxScore(float a, float b) {
+      bool finiteA = std::isfinite(a);
+      bool finiteB = std::isfinite(b);
+      if (finiteA != finiteB) return finiteA;
+      return a < b;
+    }
+
+    void sortByClauseMax() {
+      for (size_t i = 1; i < scorers.size(); i++) {
+        Query::Scorer* scorer = scorers[i];
+        float maxScore = clauseMax[i];
+        size_t j = i;
+        while (j > 0 && lessMaxScore(maxScore, clauseMax[j - 1])) {
+          scorers[j] = scorers[j - 1];
+          clauseMax[j] = clauseMax[j - 1];
+          j--;
+        }
+        scorers[j] = scorer;
+        clauseMax[j] = maxScore;
+      }
+    }
+
+    bool lessWindowOrder(int32_t a, int32_t b) const {
+      return lessMaxScore(windowMax[(size_t) a], windowMax[(size_t) b]);
+    }
+
+    void sortWindowOrder() {
+      for (size_t i = 1; i < windowOrder.size(); i++) {
+        int32_t idx = windowOrder[i];
+        size_t j = i;
+        while (j > 0 && lessWindowOrder(idx, windowOrder[j - 1])) {
+          windowOrder[j] = windowOrder[j - 1];
+          j--;
+        }
+        windowOrder[j] = idx;
+      }
+    }
+
+    void clearEssentialFlags() {
+      for (size_t i = 0; i < isEssential.size(); i++) {
+        isEssential[i] = false;
+      }
+    }
+
+    size_t computeWindowSplit() const {
+      double sum = 0.0;
+      size_t s = 0;
+      for (; s < scorers.size(); s++) {
+        float maxScore = windowMax[(size_t) windowOrder[s]];
+        if (!std::isfinite(maxScore)) break;
+        double nextSum = sum + (double) maxScore;
+        if (!(nextSum * scoreBoundFactor < (double) minCompetitiveScore)) break;
+        sum = nextSum;
+      }
+      return s;
+    }
+
+    void markEssentialScorers() {
+      clearEssentialFlags();
+      for (size_t i = splitIndex; i < scorers.size(); i++) {
+        isEssential[(size_t) windowOrder[i]] = true;
+      }
+    }
+
+    void setupWindow(int32_t start, int32_t max) {
+      windowStart = start;
+      int32_t requestedEnd = windowStart + kWindowSize;
+      if (requestedEnd < windowStart) {
+        requestedEnd = max;
+      }
+      windowEnd = std::min(std::min(requestedEnd, max), maxDoc);
+
+      for (size_t i = 0; i < scorers.size(); i++) {
+        if (scorers[i]->docId() < windowStart) {
+          scorers[i]->advance(windowStart);
+        }
+        scorers[i]->advanceShallow(windowStart);
+        windowMax[i] = scorers[i]->getMaxScore(windowEnd - 1);
+        windowOrder[i] = (int32_t) i;
+      }
+      sortWindowOrder();
+      splitIndex = computeWindowSplit();
+      markEssentialScorers();
+    }
+
+    float* essentialScoreRow(size_t scorerIndex) {
+      return essentialScores.data() + scorerIndex * (size_t) kWindowSize;
+    }
+
+    void clearWindowBits() {
+      std::fill(windowBits.begin(), windowBits.end(), 0);
+    }
+
+    void setWindowBit(int32_t index) {
+      windowBits[(size_t) (index >> 6)] |= 1ULL << (index & 63);
+    }
+
+    bool acceptsDoc(DocSet* filter, const FixedBitSet* domainBits, int32_t doc) const {
+      if (filter == nullptr) {
+        return true;
+      }
+      if (domainBits != nullptr) {
+        return domainBits->get(doc);
+      }
+      // Correctness fallback for ARRAY filters. Step 3 wiring keeps the hot path on
+      // null/BITSET filters until this is measured.
+      return filter->get(doc);
+    }
+
+    bool verifyMatch(Query::Scorer* scorer, int32_t doc) const {
+      unused(scorer, doc);
+      // Reserved for two-phase: approximation hits will call matches() here.
+      return true;
+    }
+
+    void fillEssentialCandidates(DocSet* filter, const FixedBitSet* domainBits) {
+      clearWindowBits();
+      for (size_t i = 0; i < scorers.size(); i++) {
+        if (!isEssential[i]) {
+          continue;
+        }
+        float* row = essentialScoreRow(i);
+        std::fill(row, row + kWindowSize, 0.0f);
+        auto* scorer = scorers[i];
+        int32_t doc = scorer->docId();
+        if (doc < windowStart) {
+          doc = scorer->advance(windowStart);
+        }
+        while (doc < windowEnd) {
+          if (acceptsDoc(filter, domainBits, doc)) {
+            int32_t index = doc - windowStart;
+            setWindowBit(index);
+            row[(size_t) index] = scorer->score();
+          }
+          doc = scorer->next();
+        }
+      }
+    }
+
+    float scoreCandidate(int32_t doc, int32_t index) {
+      float sum = 0.0f;
+      for (size_t i = 0; i < scorers.size(); i++) {
+        if (isEssential[i]) {
+          sum += essentialScoreRow(i)[(size_t) index];
+          continue;
+        }
+        auto* scorer = scorers[i];
+        if (scorer->docId() < doc) {
+          scorer->advance(doc);
+        }
+        if (scorer->docId() == doc && verifyMatch(scorer, doc)) {
+          sum += scorer->score();
+        }
+      }
+      return sum;
+    }
+
+    void finalizeCandidates(ScoreWindow& out) {
+      out.min = windowStart;
+      out.max = windowEnd;
+      out.size = 0;
+      out.docs = outDocs;
+      out.scores = outScores;
+
+      int32_t innerSize = windowEnd - windowStart;
+      for (int32_t word = 0; word < kWindowWords; word++) {
+        uint64_t bits = windowBits[(size_t) word];
+        while (bits != 0) {
+          int32_t bit = (int32_t) std::countr_zero(bits);
+          int32_t index = (word << 6) + bit;
+          if (index >= innerSize) {
+            break;
+          }
+          int32_t doc = windowStart + index;
+          float score = scoreCandidate(doc, index);
+          if (score >= minCompetitiveScore) {
+            out.docs[(size_t) out.size] = doc;
+            out.scores[(size_t) out.size] = score;
+            out.size++;
+          }
+          bits &= bits - 1;
+        }
+      }
+    }
+
+  public:
+    // The passed in span of scorers will be modified (rearranged).
+    MaxScoreBulkScorer(solux::MemPool& pool, std::span<Query::Scorer*> scorers,
+                       int32_t maxDoc)
+            : scorers(scorers),
+              clauseMax(pool.make_arr<float>(scorers.size()), scorers.size()),
+              windowMax(pool.make_arr<float>(scorers.size()), scorers.size()),
+              windowOrder(pool.make_arr<int32_t>(scorers.size()), scorers.size()),
+              isEssential(pool.make_arr<bool>(scorers.size()), scorers.size()),
+              windowBits(pool.make_arr<uint64_t>((size_t) kWindowWords), (size_t) kWindowWords),
+              essentialScores(pool.make_arr<float>(scorers.size() * (size_t) kWindowSize),
+                              scorers.size() * (size_t) kWindowSize),
+              outDocs(pool.make_arr<int32_t>((size_t) kWindowSize), (size_t) kWindowSize),
+              outScores(pool.make_arr<float>((size_t) kWindowSize), (size_t) kWindowSize),
+              maxDoc(maxDoc) {
+      scoreBoundFactor = 1.0 + (double) scorers.size() * 0x1p-24;
+      for (size_t i = 0; i < scorers.size(); i++) {
+        clauseMax[i] = scorers[i]->getMaxScore(PostingsReader::END);
+      }
+      sortByClauseMax();
+      for (size_t i = 0; i < scorers.size(); i++) {
+        windowOrder[i] = (int32_t) i;
+      }
+    }
+
+    int32_t scoreNextWindow(ScoreWindow& out, DocSet* filter, int32_t min, int32_t max,
+                            float minCompetitiveScore) override {
+      out.min = min;
+      out.max = min;
+      out.size = 0;
+      out.docs = outDocs;
+      out.scores = outScores;
+
+      max = std::min(max, maxDoc);
+      if (min >= max) {
+        return PostingsReader::END;
+      }
+      if (minCompetitiveScore > this->minCompetitiveScore) {
+        this->minCompetitiveScore = minCompetitiveScore;
+      }
+
+      const FixedBitSet* domainBits = nullptr;
+      if (filter != nullptr && filter->type == DocSet::BITSET) {
+        domainBits = &((BitDocSet*) filter)->bits();
+      }
+
+      setupWindow(min, max);
+      if (splitIndex < scorers.size()) {
+        fillEssentialCandidates(filter, domainBits);
+        finalizeCandidates(out);
+      } else {
+        clearWindowBits();
+        out.min = windowStart;
+        out.max = windowEnd;
+      }
+
+      return windowEnd >= max ? PostingsReader::END : windowEnd;
+    }
+  }; // MaxScoreBulkScorer
 
 
   class MinShouldMatchWandScorer final : public Query::Scorer {

@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <cstring>
+#include <limits>
 #include <functional>
 #include "SearchOp.h"
 #include "solux/query/AllQuery.h"
@@ -135,12 +136,18 @@ public:
       }
     }
 
-    Query::Scorer* createMainScorer(MemPool& pool, IndexReader::Segment& seg) {
+    Query::ScorerSupplier* mainScorerSupplier(MemPool& pool, IndexReader::Segment& seg) {
       auto& op = thisOp();
       Query::SegmentSource& source = preparedWeight != nullptr
         ? static_cast<Query::SegmentSource&>(*preparedWeight)
         : static_cast<Query::SegmentSource&>(*op.weight);
-      return QueryPrep::createScorer(pool, seg, source);
+      return source.scorerSupplier(pool, seg);
+    }
+
+    Query::Scorer* createMainScorer(MemPool& pool, IndexReader::Segment& seg) {
+      auto* supplier = mainScorerSupplier(pool, seg);
+      if (supplier == nullptr) return nullptr;
+      return supplier->get(pool, std::numeric_limits<int64_t>::max());
     }
 
     std::unique_ptr<DocSet> buildEffectiveDomain(int32_t segnum) {
@@ -247,7 +254,7 @@ public:
       {
         auto poolGuard = MemPool::threadLocalPoolGuard();
         auto& seg = op.qcontext.topReader.segments()[segnum];
-        auto* scorer = createMainScorer(poolGuard.pool(), seg);
+        auto* supplier = mainScorerSupplier(poolGuard.pool(), seg);
 
         // Wait until last moment to obtain collector in hopes of reusing an existing one.
         data = collectorMerger.obtain();
@@ -262,7 +269,7 @@ public:
         }
 
 
-        if (scorer != nullptr) {
+        if (supplier != nullptr) {
           DocSet* filter = domain;
           std::unique_ptr<DocSet> newDomain;
           if (!preparedMode && !thisOp().filterWeights.empty()) {
@@ -284,14 +291,29 @@ public:
           }
           DocSetBuilder* builderPtr = builder.has_value() ? &*builder : nullptr;
           if (data->useFieldSort) {
-            data->fieldCollector->setSegment(segnum, &seg.postingsReader());
-            collectTopK(segnum, scorer, filter, builderPtr, *data->fieldCollector);
+            auto* scorer = supplier->get(poolGuard.pool(), std::numeric_limits<int64_t>::max());
+            if (scorer != nullptr) {
+              data->fieldCollector->setSegment(segnum, &seg.postingsReader());
+              collectTopK(segnum, scorer, filter, builderPtr, *data->fieldCollector);
+            }
           } else {
             // get_number requests an exact total hit count, which is incompatible with
             // impact block skipping (skipped docs are not visited, so not counted).
             bool allowPruning = !op.topDocsProto.get_number();
-            collectTopK(segnum, scorer, filter, builderPtr, *data->scoreCollector,
-                        allowPruning, &scoreAccumulator);
+            BulkScorer* bulk = nullptr;
+            if (allowPruning && builderPtr == nullptr) {
+              bulk = supplier->bulkScorer(poolGuard.pool());
+            }
+            if (bulk != nullptr) {
+              collectTopKWindowed(segnum, bulk, filter, *data->scoreCollector,
+                                  &scoreAccumulator, seg.maxDoc());
+            } else {
+              auto* scorer = supplier->get(poolGuard.pool(), std::numeric_limits<int64_t>::max());
+              if (scorer != nullptr) {
+                collectTopK(segnum, scorer, filter, builderPtr, *data->scoreCollector,
+                            allowPruning, &scoreAccumulator);
+              }
+            }
           }
         }
         if (builder.has_value()) {

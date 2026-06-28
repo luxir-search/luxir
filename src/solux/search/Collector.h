@@ -1,5 +1,6 @@
 #pragma once
 
+#include <algorithm>
 #include <atomic>
 #include <limits>
 
@@ -431,6 +432,38 @@ void collectTopK(int32_t segnum, Query::Scorer* scorer, DocSet* filter,
       auto score = scorer->score();
       collectOne(doc, score);
     }
+  }
+}
+
+template <typename Collector>
+void collectTopKWindowed(int32_t segnum, BulkScorer* bulk, DocSet* filter,
+                         Collector& collector, MaxScoreAccumulator* accumulator,
+                         int32_t maxDoc) {
+  static_assert(requires(Collector& c) { c.minCompetitiveVal; },
+                "collectTopKWindowed is only for score top-k collectors");
+
+  assert(bulk != nullptr);
+  int32_t cursor = 0;
+  ScoreWindow window;
+  while (cursor != PostingsReader::END && cursor < maxDoc) {
+    float theta = accumulator != nullptr
+      ? std::max(collector.minCompetitiveVal, accumulator->get())
+      : collector.minCompetitiveVal;
+    int32_t next = bulk->scoreNextWindow(window, filter, cursor, maxDoc, theta);
+
+    for (int32_t i = 0; i < window.size; i++) {
+      float oldMinCompetitiveVal = collector.minCompetitiveVal;
+      collector.collect(segnum, window.docs[(size_t) i], window.scores[(size_t) i]);
+      if (accumulator != nullptr && collector.minCompetitiveVal > oldMinCompetitiveVal) {
+        accumulator->accumulate(collector.minCompetitiveVal);
+      }
+    }
+
+    if (next == PostingsReader::END) {
+      break;
+    }
+    assert(next > cursor);
+    cursor = next;
   }
 }
 

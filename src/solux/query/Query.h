@@ -2,6 +2,7 @@
 
 #include <limits>
 #include <memory>
+#include <span>
 #include <solux/util/heap.h>
 #include "solux/util/MemPool.h"
 #include "solux/util/StrRef.h"
@@ -16,6 +17,25 @@
 namespace solux {
 
 class DocSet;
+
+struct ScoreWindow {
+  int32_t min = 0;
+  int32_t max = 0;
+  int32_t size = 0;
+  std::span<int32_t> docs;
+  std::span<float> scores;
+};
+
+// NOTE: no virtual destructor, so subclasses should not be owned or deleted through this type.
+class BulkScorer {
+public:
+  // Produce the next window of verified competitive candidates in [min, max),
+  // intersected with filter (null = all), filtered by minCompetitiveScore.
+  // Returns the docid to resume from (first window not produced), or PostingsReader::END.
+  // The spans in out are valid until the next call.
+  virtual int32_t scoreNextWindow(ScoreWindow& out, DocSet* filter, int32_t min, int32_t max,
+                                  float minCompetitiveScore) = 0;
+};
 
 // Overview
 // ========
@@ -181,6 +201,11 @@ public:
     /// lead iterator that will drive this scorer, or INT64_MAX when there is no
     /// lead constraint. Suppliers may use it to choose eager vs lazy setup.
     virtual Query::Scorer* get(MemPool& targetPool, int64_t leadCost) = 0;
+
+    virtual BulkScorer* bulkScorer(MemPool& targetPool) {
+      unused(targetPool);
+      return nullptr;
+    }
   };
 
   // NOTE: no virtual destructor, so subclasses should not be owned or deleted through this type.
