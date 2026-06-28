@@ -1037,6 +1037,7 @@ public:
   class MaxScoreBulkScorer final : public BulkScorer {
     constexpr static int32_t kWindowSize = DocsEnum::L1_DOCS;
     constexpr static int32_t kWindowWords = kWindowSize / 64;
+    constexpr static size_t kBs1MinClauses = 16;
     static_assert((kWindowSize % 64) == 0);
 
     std::span<Query::Scorer*> scorers;  // stable global-max order, used for deterministic scoring
@@ -1046,6 +1047,7 @@ public:
     std::span<bool> isEssential;
     std::span<uint64_t> windowBits;
     std::span<float> essentialScores;
+    std::span<float> bs1Scores;
     std::span<int32_t> outDocs;
     std::span<float> outScores;
 
@@ -1053,6 +1055,7 @@ public:
     int32_t windowStart = 0;
     int32_t windowEnd = 0;
     size_t splitIndex = 0;
+    int64_t bs1Windows = 0;
     float minCompetitiveScore = std::numeric_limits<float>::lowest();
     double scoreBoundFactor = 1.0;
 
@@ -1118,6 +1121,10 @@ public:
       for (size_t i = splitIndex; i < scorers.size(); i++) {
         isEssential[(size_t) windowOrder[i]] = true;
       }
+    }
+
+    bool useBs1ForWindow() const {
+      return scorers.size() >= kBs1MinClauses && splitIndex * 2 <= scorers.size();
     }
 
     void setupWindow(int32_t start, int32_t max) {
@@ -1195,6 +1202,29 @@ public:
       }
     }
 
+    void fillBs1Candidates() {
+      clearWindowBits();
+      std::fill(bs1Scores.begin(), bs1Scores.end(), 0.0f);
+      int32_t blockDocs[Postings::DOCS_BLOCK_SIZE];
+      float blockScores[Postings::DOCS_BLOCK_SIZE];
+      for (size_t i = 0; i < scorers.size(); i++) {
+        auto* scorer = scorers[i];
+        int32_t doc = scorer->docId();
+        if (doc < windowStart) {
+          scorer->advance(windowStart);
+        }
+        int32_t count = 0;
+        while ((count = scorer->fillScoreBlock(
+                    blockDocs, blockScores, Postings::DOCS_BLOCK_SIZE, windowEnd)) > 0) {
+          for (int32_t j = 0; j < count; j++) {
+            int32_t index = blockDocs[j] - windowStart;
+            setWindowBit(index);
+            bs1Scores[(size_t) index] += blockScores[j];
+          }
+        }
+      }
+    }
+
     float scoreCandidate(int32_t doc, int32_t index) {
       float sum = 0.0f;
       for (size_t i = 0; i < scorers.size(); i++) {
@@ -1213,12 +1243,16 @@ public:
       return sum;
     }
 
-    void finalizeCandidates(ScoreWindow& out) {
+    void prepareOutputWindow(ScoreWindow& out) {
       out.min = windowStart;
       out.max = windowEnd;
       out.size = 0;
       out.docs = outDocs;
       out.scores = outScores;
+    }
+
+    void finalizeCandidates(ScoreWindow& out) {
+      prepareOutputWindow(out);
 
       int32_t innerSize = windowEnd - windowStart;
       for (int32_t word = 0; word < kWindowWords; word++) {
@@ -1241,6 +1275,35 @@ public:
       }
     }
 
+    void finalizeBs1Candidates(ScoreWindow& out, DocSet* filter, const FixedBitSet* domainBits) {
+      prepareOutputWindow(out);
+
+      int32_t innerSize = windowEnd - windowStart;
+      for (int32_t word = 0; word < kWindowWords; word++) {
+        uint64_t bits = windowBits[(size_t) word];
+        while (bits != 0) {
+          int32_t bit = (int32_t) std::countr_zero(bits);
+          int32_t index = (word << 6) + bit;
+          if (index >= innerSize) {
+            break;
+          }
+          int32_t doc = windowStart + index;
+          // BS1 intentionally defers filter membership to one check per candidate.
+          // Selective filters may accumulate rejected docs, but dense windows are the
+          // path this mode is for.
+          if (acceptsDoc(filter, domainBits, doc)) {
+            float score = bs1Scores[(size_t) index];
+            if (score >= minCompetitiveScore) {
+              out.docs[(size_t) out.size] = doc;
+              out.scores[(size_t) out.size] = score;
+              out.size++;
+            }
+          }
+          bits &= bits - 1;
+        }
+      }
+    }
+
   public:
     // The passed in span of scorers will be modified (rearranged).
     MaxScoreBulkScorer(solux::MemPool& pool, std::span<Query::Scorer*> scorers,
@@ -1253,6 +1316,7 @@ public:
               windowBits(pool.make_arr<uint64_t>((size_t) kWindowWords), (size_t) kWindowWords),
               essentialScores(pool.make_arr<float>(scorers.size() * (size_t) kWindowSize),
                               scorers.size() * (size_t) kWindowSize),
+              bs1Scores(pool.make_arr<float>((size_t) kWindowSize), (size_t) kWindowSize),
               outDocs(pool.make_arr<int32_t>((size_t) kWindowSize), (size_t) kWindowSize),
               outScores(pool.make_arr<float>((size_t) kWindowSize), (size_t) kWindowSize),
               maxDoc(maxDoc) {
@@ -1289,8 +1353,14 @@ public:
 
       setupWindow(min, max);
       if (splitIndex < scorers.size()) {
-        fillEssentialCandidates(filter, domainBits);
-        finalizeCandidates(out);
+        if (useBs1ForWindow()) {
+          bs1Windows++;
+          fillBs1Candidates();
+          finalizeBs1Candidates(out, filter, domainBits);
+        } else {
+          fillEssentialCandidates(filter, domainBits);
+          finalizeCandidates(out);
+        }
       } else {
         clearWindowBits();
         out.min = windowStart;
@@ -1298,6 +1368,10 @@ public:
       }
 
       return windowEnd >= max ? PostingsReader::END : windowEnd;
+    }
+
+    int64_t bs1WindowCount() const {
+      return bs1Windows;
     }
   }; // MaxScoreBulkScorer
 

@@ -274,6 +274,30 @@ public:
       return boost * simScorer->score((float) tf, encodedNorm);
     }
 
+    int32_t fillScoreBlock(int32_t* docs, float* scores, int32_t count, int32_t upTo) override {
+      assert(count >= 0);
+      int32_t filled = 0;
+      int32_t doc = docsEnum.docId();
+      if (doc < 0) {
+        doc = skipNonCompetitiveBlocks(docsEnum.nextDoc());
+      }
+      while (filled < count && doc < upTo) {
+        docs[filled] = doc;
+        if (simScorer == nullptr) {
+          scores[filled] = 0.0f;
+        } else {
+          int32_t tf = docsEnum.termFreq();
+          int32_t normDoc = normsIter->advance(doc);
+          assert(normDoc == doc);
+          auto encodedNorm = normsIter->value();
+          scores[filled] = boost * simScorer->score((float) tf, encodedNorm);
+        }
+        filled++;
+        doc = skipNonCompetitiveBlocks(docsEnum.nextDoc());
+      }
+      return filled;
+    }
+
     void setMinCompetitiveScore(float minScore) override {
       minCompetitiveScore = minScore;
     }

@@ -489,6 +489,24 @@ public:
     virtual int32_t docId() = 0;
     /// term frequency for current doc
     virtual float score() = 0;
+    /// Fill docs/scores from the current positioned doc while docid < upTo.
+    /// The scorer is advanced after each emitted doc, so repeated calls continue
+    /// at the first unfilled doc.
+    virtual int32_t fillScoreBlock(int32_t* docs, float* scores, int32_t count, int32_t upTo) {
+      assert(count >= 0);
+      int32_t filled = 0;
+      int32_t doc = docId();
+      if (doc < 0) {
+        doc = next();
+      }
+      while (filled < count && doc < upTo) {
+        docs[filled] = doc;
+        scores[filled] = score();
+        filled++;
+        doc = next();
+      }
+      return filled;
+    }
     virtual void setMinCompetitiveScore(float minScore) {
       unused(minScore);
     }

@@ -65,6 +65,7 @@ protected:
 struct DisjunctionTopKRun {
   int64_t visited = 0;
   int64_t nonEssentialLookups = 0;
+  int64_t bs1Windows = 0;
   std::vector<TopDocsCollector::ScoreDoc> topDocs;
 };
 
@@ -307,6 +308,67 @@ std::vector<Query*> queryPointers(std::span<TermQuery> queries) {
   return pointers;
 }
 
+std::vector<std::string> makeMtTermStrings(int32_t numTerms) {
+  std::vector<std::string> terms;
+  terms.reserve((size_t) numTerms);
+  for (int32_t term = 0; term < numTerms; term++) {
+    terms.push_back("mt" + std::to_string(term));
+  }
+  return terms;
+}
+
+void addDenseManyClauseDisjunctionDocs(CollectionHelper& helper, int32_t nDocs, int32_t numTerms) {
+  helper.clear();
+  std::vector<std::string> terms = makeMtTermStrings(numTerms);
+  std::vector<Doc> docs;
+  docs.reserve((size_t) nDocs);
+
+  for (int32_t doc = 0; doc < nDocs; doc++) {
+    std::string body;
+    int32_t used = 0;
+    for (int32_t term = 0; term < numTerms; term++) {
+      if (((doc + term) & 1) != 0) {
+        continue;
+      }
+      int32_t tf = 1 + (int32_t) ((doc * 31 + term * 17) % 4);
+      appendRepeatedTerm(body, terms[(size_t) term], tf);
+      used += tf;
+    }
+    int32_t len = used + 24 + (doc % 37);
+    appendRepeatedTerm(body, "filler", len - used);
+    docs.push_back(flatdoc("id", "bs1_" + std::to_string(doc), "body_w", body));
+  }
+
+  helper.indexAll(docs, UpdateMessage::COMMIT);
+}
+
+void setEveryOtherDoc(RAMBitDocSet& filter, int32_t maxDoc) {
+  for (int32_t doc = 0; doc < maxDoc; doc++) {
+    if ((doc & 1) == 0) {
+      filter.mutableBits().set(doc);
+    }
+  }
+}
+
+Query::Weight* createDenseDisjunctionWeight(Query::Context& qContext, int32_t numTerms,
+                                            std::vector<std::string>& terms,
+                                            std::vector<TermQuery>& queries,
+                                            std::vector<Query*>& optional) {
+  terms = makeMtTermStrings(numTerms);
+  queries.clear();
+  queries.reserve((size_t) numTerms);
+  for (const auto& term : terms) {
+    queries.emplace_back("body_w", term);
+  }
+  optional.clear();
+  optional.reserve((size_t) numTerms);
+  for (auto& query : queries) {
+    optional.push_back(&query);
+  }
+  BooleanQuery query({}, optional, {}, {});
+  return query.createWeight(qContext, Query::NEED_SCORES);
+}
+
 DisjunctionTopKRun runExhaustiveTermDisjunctionTopK(IndexReader& reader,
                                                     std::span<const std::string_view> terms,
                                                     int32_t topK) {
@@ -337,6 +399,66 @@ DisjunctionTopKRun runExhaustiveTermDisjunctionTopK(IndexReader& reader,
   }
 
   DisjunctionTopKRun result;
+  result.visited = collector.totalHits();
+  result.topDocs = sortedCollectorDocs(collector);
+  return result;
+}
+
+DisjunctionTopKRun runDenseFilteredPullTopK(IndexReader& reader, int32_t numTerms, int32_t topK) {
+  MemPool pool;
+  Query::Context qContext(pool, reader);
+  std::vector<std::string> terms;
+  std::vector<TermQuery> queries;
+  std::vector<Query*> optional;
+  auto* weight = createDenseDisjunctionWeight(qContext, numTerms, terms, queries, optional);
+  TopDocsCollector collector(topK);
+
+  auto segments = qContext.topReader.segments();
+  for (int32_t segnum = 0; segnum < (int32_t) segments.size(); segnum++) {
+    RAMBitDocSet filter(segments[segnum].maxDoc());
+    setEveryOtherDoc(filter, segments[segnum].maxDoc());
+    auto* scorer = weight->createScorer(pool, segments[segnum]);
+    if (scorer == nullptr) continue;
+    collectTopK(segnum, scorer, &filter, nullptr, collector);
+  }
+
+  DisjunctionTopKRun result;
+  result.visited = collector.totalHits();
+  result.topDocs = sortedCollectorDocs(collector);
+  return result;
+}
+
+DisjunctionTopKRun runDenseFilteredBulkTopK(IndexReader& reader, int32_t numTerms, int32_t topK) {
+  MemPool pool;
+  Query::Context qContext(pool, reader);
+  std::vector<std::string> terms;
+  std::vector<TermQuery> queries;
+  std::vector<Query*> optional;
+  auto* weight = createDenseDisjunctionWeight(qContext, numTerms, terms, queries, optional);
+  TopDocsCollector collector(topK);
+  DisjunctionTopKRun result;
+
+  auto segments = qContext.topReader.segments();
+  for (int32_t segnum = 0; segnum < (int32_t) segments.size(); segnum++) {
+    RAMBitDocSet filter(segments[segnum].maxDoc());
+    setEveryOtherDoc(filter, segments[segnum].maxDoc());
+    auto* supplier = weight->scorerSupplier(pool, segments[segnum]);
+    if (supplier == nullptr) continue;
+    auto* bulk = supplier->bulkScorer(pool);
+    if (bulk == nullptr) {
+      ADD_FAILURE() << "bulkScorer returned null for dense segment " << segnum;
+      continue;
+    }
+    auto* maxScoreBulk = dynamic_cast<BooleanQuery::MaxScoreBulkScorer*>(bulk);
+    if (maxScoreBulk == nullptr) {
+      ADD_FAILURE() << "bulkScorer returned unexpected type for dense segment " << segnum;
+      continue;
+    }
+    int64_t beforeBs1Windows = maxScoreBulk->bs1WindowCount();
+    collectTopKWindowed(segnum, bulk, &filter, collector, nullptr, segments[segnum].maxDoc());
+    result.bs1Windows += maxScoreBulk->bs1WindowCount() - beforeBs1Windows;
+  }
+
   result.visited = collector.totalHits();
   result.topDocs = sortedCollectorDocs(collector);
   return result;
@@ -1635,6 +1757,21 @@ TEST_F(TermScorerTest, MaxScoreBulkScorerSharedAccumulatorMatchesBaseline) {
   assertSameTopKDocs(exhaustive, bulk, k);
   assertSameTopKDocsExact(baseline, bulk, k);
   ASSERT_GT(accumulator.get(), std::numeric_limits<float>::lowest());
+  helper.clear();
+}
+
+TEST_F(TermScorerTest, MaxScoreBulkScorerBs1BitsetFilterMatchesPull) {
+  CollectionHelper helper("main");
+  const int32_t numTerms = 32;
+  const int32_t nDocs = 12 * Postings::DOCS_BLOCK_SIZE + 37;
+  const int32_t topK = 100;
+  addDenseManyClauseDisjunctionDocs(helper, nDocs, numTerms);
+  auto reader = helper.getIndexWriter()->getIndexReader();
+
+  auto pull = runDenseFilteredPullTopK(*reader, numTerms, topK);
+  auto bulk = runDenseFilteredBulkTopK(*reader, numTerms, topK);
+  ASSERT_GT(bulk.bs1Windows, 0);
+  assertSameTopKDocsExact(pull, bulk, topK);
   helper.clear();
 }
 
