@@ -3,6 +3,9 @@
 #include "TermsEnum.h"
 #include "solux/codec/Codec.h"
 #include "solux/codec/StreamVByte.h"
+#include <algorithm>
+#include <span>
+#include <utility>
 #include <vector>
 
 namespace solux {
@@ -32,6 +35,7 @@ class DocsEnum {
   int32_t docBufIdx = 0; // index of the next value to read in the docs buffer
   int32_t docBufEnd;     // index of one-past the last valid element
   int32_t docid;         // current docid
+  bool blockMode = false;
 
   // For term freqs, since they are parallel to docs, we don't actually need
   // all of these variables.  But it sets the stage for separating the two
@@ -268,6 +272,7 @@ public:
   int32_t nextDoc() {
     // Contract: callers must not re-poll after END (see Query::Scorer).
     assert(docid != PostingsReader::END);
+    blockMode = false;
     if (docBufIdx >= docBufEnd) {
       auto leftToRead = docfreq - docOrd;
       // Boundary analysis: if docfreq==1 and docOrd==1 (meaning we already read ord 0, but not 1), we are done.
@@ -390,10 +395,88 @@ public:
     return docid;
   }
 
+  // Return decoded docs/freqs from the current decoded block, clamped to docs
+  // below upTo. This is a consuming block-mode API: it advances docBufIdx past
+  // returned docs and may leave docId()/termFreq() useful only as a lower-bound
+  // position for a later advance(). It does not keep position/cumulative-tf
+  // metadata synchronized because score-only block consumers do not need it.
+  // Spans are valid until the next DocsEnum call. Impact threshold ownership
+  // remains with TermQuery::Scorer; this exposes raw decoded postings and does
+  // not know minCompetitiveScore.
+  std::pair<std::span<const int32_t>, std::span<const int32_t>> nextDocFreqBlock(int32_t upTo) {
+    if (docid == PostingsReader::END) {
+      return {};
+    }
+
+    int32_t start = 0;
+    bool countedCurrent = false;
+    if (!blockMode) {
+      if (docid < 0) {
+        int32_t doc = nextDoc();
+        if (doc >= upTo) {
+          return {};
+        }
+      } else if (docid >= upTo) {
+        return {};
+      }
+      start = docBufIdx - 1;
+      countedCurrent = true;
+    } else {
+      if (docBufIdx >= docBufEnd) {
+        int32_t doc = nextDoc();
+        if (doc >= upTo) {
+          return {};
+        }
+        start = docBufIdx - 1;
+        countedCurrent = true;
+      } else {
+        if (docBuf[docBufIdx] >= upTo) {
+          return {};
+        }
+        start = docBufIdx;
+      }
+    }
+
+    int32_t limit = (int32_t) (std::lower_bound(docBuf + start, docBuf + docBufEnd, upTo) - docBuf);
+    if (limit <= start) {
+      return {};
+    }
+
+    if (!hasFreqs) {
+      std::fill(tfreqBuf + start, tfreqBuf + limit, 1);
+    }
+
+    int32_t emitted = limit - start;
+    int32_t newlyCounted = emitted - (countedCurrent ? 1 : 0);
+    docOrd += newlyCounted;
+    if (hasFreqs) {
+      tfreqOrd += newlyCounted;
+    }
+    docBufIdx = limit;
+    if (hasFreqs) {
+      tfreqBufIdx = limit;
+      tfreq = tfreqBuf[limit - 1];
+    } else {
+      tfreq = 1;
+    }
+    docid = docBuf[limit - 1];
+    blockMode = true;
+
+    return {
+      std::span<const int32_t>(docBuf + start, (size_t) emitted),
+      std::span<const int32_t>(tfreqBuf + start, (size_t) emitted)
+    };
+  }
+
+  std::span<const int32_t> nextDocBlock(int32_t upTo) {
+    return nextDocFreqBlock(upTo).first;
+  }
+
 
   // Reset the doc decoder to the block that may contain target.  Position state is
   // repaired by cumulativeTermFreq; the position stream itself stays lazy.
   void skipToBlock(int32_t target) {
+    blockMode = false;
     const char* const streamStart = docIS.ptr(0);
     const char* const end = docIS.ptr(metadataStart);
     const char* p = docIS.ptr();

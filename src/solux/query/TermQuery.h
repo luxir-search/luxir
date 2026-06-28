@@ -274,12 +274,18 @@ public:
       return boost * simScorer->score((float) tf, encodedNorm);
     }
 
-    int32_t fillScoreBlock(int32_t* docs, float* scores, int32_t count, int32_t upTo) override {
+    int32_t fillScoreBlockScalar(int32_t* docs, float* scores, int32_t count, int32_t upTo,
+                                 bool includeCurrent) {
       assert(count >= 0);
       int32_t filled = 0;
       int32_t doc = docsEnum.docId();
       if (doc < 0) {
         doc = skipNonCompetitiveBlocks(docsEnum.nextDoc());
+      } else if (!includeCurrent) {
+        if (doc >= PostingsReader::END - 1) {
+          return 0;
+        }
+        doc = skipNonCompetitiveBlocks(docsEnum.advance(doc + 1));
       }
       while (filled < count && doc < upTo) {
         docs[filled] = doc;
@@ -294,6 +300,46 @@ public:
         }
         filled++;
         doc = skipNonCompetitiveBlocks(docsEnum.nextDoc());
+      }
+      return filled;
+    }
+
+    int32_t fillScoreBlock(int32_t* docs, float* scores, int32_t count, int32_t upTo) override {
+      assert(count >= 0);
+      if (count <= 0) {
+        return 0;
+      }
+
+      // The scalar path owns exact impact-threshold skipping. The block span
+      // path is used by BS1, which does not push child term thresholds.
+      if (count != Postings::DOCS_BLOCK_SIZE || (hasImpacts() && minCompetitiveScore > 0.0f)) {
+        return fillScoreBlockScalar(docs, scores, count, upTo, true);
+      }
+
+      auto [blockDocs, blockFreqs] = docsEnum.nextDocFreqBlock(upTo);
+      int32_t filled = (int32_t) blockDocs.size();
+      if (filled == 0) {
+        return 0;
+      }
+      assert(filled <= count);
+
+      for (int32_t i = 0; i < filled; i++) {
+        docs[i] = blockDocs[(size_t) i];
+      }
+      if (simScorer == nullptr) {
+        std::fill(scores, scores + filled, 0.0f);
+      } else {
+        for (int32_t i = 0; i < filled; i++) {
+          int32_t doc = blockDocs[(size_t) i];
+          int32_t normDoc = normsIter->advance(doc);
+          assert(normDoc == doc);
+          auto encodedNorm = normsIter->value();
+          scores[i] = boost * simScorer->score((float) blockFreqs[(size_t) i], encodedNorm);
+        }
+      }
+
+      if (filled < count) {
+        filled += fillScoreBlockScalar(docs + filled, scores + filled, count - filled, upTo, false);
       }
       return filled;
     }
