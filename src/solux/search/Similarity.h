@@ -6,6 +6,7 @@
 #include <cassert>
 #include <bit>
 #include <span>
+#include "solux/reader/Postings.h"
 #include "solux/util/solux_util.h"
 
 namespace solux {
@@ -155,6 +156,32 @@ public:
       // Adapted from lucene, see BM25Similarity.java for more details.
       auto normInverse = invNorm[ (uint8_t)encodedNorm ];
       return weight - weight / (1.0f + termFreq * normInverse);
+    }
+
+    // PERF-CRITICAL, RELIES ON AUTO-VECTORIZATION. Block BM25 for the dense
+    // disjunction hot path (bulk_dense, via fillScoresFromSpans). It is split on
+    // purpose: a scalar invNorm[] LUT-gather loop, then a math-ONLY loop that gcc
+    // auto-vectorizes to AVX (vdivps / vfmadd132ps / vmulps / vsubps over ymm,
+    // 8-wide). Two rules if you touch this:
+    //   1. Do NOT merge the two loops - the gather (invNorm[norms[i]]) inside the
+    //      math loop blocks vectorization.
+    //   2. Do NOT algebraically rewrite loop 2 (no precomputing boost*weight, no
+    //      reassociation). Scores must stay BIT-IDENTICAL to score() above, and the
+    //      vector FMA only matches the scalar path because the expression is verbatim.
+    // After any change, objdump TermQuery::Scorer::fillScoresFromSpans (this inlines
+    // there) and confirm vdivps/ymm survive, then re-run the byte-identical score
+    // guards + the bulk_dense gcc-release A/B. Auto-vec confirmed on g++ (Ubuntu)
+    // 16.0.1 20260322 (trunk r16-8246); a future compiler may need a re-check.
+    void scoreBlock(const int32_t* tf, const uint8_t* norms, float boost, float* out,
+                    int32_t count) {
+      assert(count >= 0 && count <= Postings::DOCS_BLOCK_SIZE);
+      float factor[Postings::DOCS_BLOCK_SIZE];
+      for (int32_t i = 0; i < count; i++) {
+        factor[i] = invNorm[norms[i]];
+      }
+      for (int32_t i = 0; i < count; i++) {
+        out[i] = boost * (weight - weight / (1.0f + (float)tf[i] * factor[i]));
+      }
     }
   };
 

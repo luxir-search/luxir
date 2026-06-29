@@ -135,6 +135,7 @@ public:
     // normsIter; non-text term queries keep the existing column-backed lookup.
     std::optional<solux::NormsReader::Iterator> normsIter;
     std::optional<solux::IntColReader::Iterator> valueIter;
+    const uint8_t* flatNormsBase = nullptr;
     solux::Similarity::BM25Scorer* simScorer;
     int32_t impactBlockCount = 0;
     int32_t* impactLastDoc = nullptr;
@@ -160,7 +161,10 @@ public:
       // Scoring needs both BM25 and an encoded norm/value lookup, or neither.
       assert((simScorer == nullptr) == (normsReader == nullptr && valueReader == nullptr));
       assert(normsReader == nullptr || valueReader == nullptr);
-      if (normsReader != nullptr) normsIter.emplace(*normsReader);
+      if (normsReader != nullptr) {
+        normsIter.emplace(*normsReader);
+        flatNormsBase = normsReader->flatBase();
+      }
       if (valueReader != nullptr) valueIter.emplace(*valueReader);
     }
 
@@ -361,6 +365,16 @@ public:
       }
       if (simScorer == nullptr) {
         std::fill(scores, scores + count, 0.0f);
+        return;
+      }
+      if (flatNormsBase != nullptr) {
+        assert(count <= Postings::DOCS_BLOCK_SIZE);
+        uint8_t normBuf[Postings::DOCS_BLOCK_SIZE];
+        for (int32_t i = 0; i < count; i++) {
+          int32_t doc = blockDocs[(size_t) i];
+          normBuf[i] = flatNormsBase[doc];
+        }
+        simScorer->scoreBlock(blockFreqs.data(), normBuf, boost, scores, count);
         return;
       }
       for (int32_t i = 0; i < count; i++) {

@@ -51,8 +51,16 @@ public:
     return nbytes;
   }
 
+  int32_t maxDoc() const noexcept {
+    return maxdoc;
+  }
+
   bool isFlat() const noexcept {
     return format == SegFieldInfo::NORMS_FLAT;
+  }
+
+  const uint8_t* flatBase() const noexcept {
+    return isFlat() ? normsBytes : nullptr;
   }
 
   bool isSparse() const noexcept {
