@@ -1,11 +1,16 @@
 #include "HttpServer.h"
 
 #include <cassert>
+#include <cstddef>
 #include <deque>
 #include <functional>
 #include <list>
+#include <memory_resource>
 #include <memory>
 #include <mutex>
+#include <optional>
+#include <span>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
@@ -20,6 +25,7 @@
 #include "solux/search/SearchEngine.h"
 #include "solux/search/SearchRequest.h"
 #include "JsonRequest.h"
+#include "solux/api/build.h"
 #include "JsonResponse.h"
 
 namespace solux {
@@ -31,6 +37,13 @@ using tcp = net::ip::tcp;
 
 class HttpSession;
 
+using HttpSearchReqProto = solux::api::SearchRequest;
+
+struct HttpSearchRequestState {
+  std::pmr::monotonic_buffer_resource resource;
+  HttpSearchReqProto proto;  // non-owning; backed by `resource`
+};
+
 // One SearchRequest per HTTP query.  Engine workers call reply() from a task
 // arena thread; it renders one NDJSON line and hands it to the session strand.
 // Holds a shared_ptr to the session so the connection outlives in-flight work,
@@ -38,12 +51,15 @@ class HttpSession;
 // completes (used by graceful shutdown).
 class HttpSearchRequest : public SearchRequest {
 public:
+  std::unique_ptr<HttpSearchRequestState> requestState;
   std::shared_ptr<HttpSession> session;
   std::optional<net::executor_work_guard<net::any_io_executor>> workGuard;
 
-  HttpSearchRequest(SearchEngine& engine, proto::SearchRequest& proto,
-                    std::shared_ptr<HttpSession> s)
-    : SearchRequest(engine, proto), session(std::move(s)) {}
+  HttpSearchRequest(SearchEngine& engine, std::unique_ptr<HttpSearchRequestState> requestState,
+                    std::shared_ptr<HttpSession> s, google::protobuf::Arena& arena)
+    : SearchRequest(engine, requestState->proto, arena),
+      requestState(std::move(requestState)),
+      session(std::move(s)) {}
 
   int reply(SearchResponse& response) override;  // defined after HttpSession
   // done() is inherited: releaseArena(&arena) frees this request (and its work
@@ -154,10 +170,14 @@ private:
 
   void handleQuery(const std::string& body, const std::string& coll) {
     auto* arena = createArena();
-    auto* protoReq = google::protobuf::Arena::Create<proto::SearchRequest>(arena);
-    protoReq->mutable_collection()->add_name(coll);
+    auto requestState = std::make_unique<HttpSearchRequestState>();
     try {
-      parseQueryRequest(body, *protoReq);
+      // Build the NON-OWNING request directly into the request state's arena.
+      parseQueryRequest(body, requestState->proto, requestState->resource);
+      // Collection target: one-element name span, arena-backed (coll is transient).
+      auto& tgt = requestState->proto.collection.emplace();
+      std::string_view* nm = solux::api::build::allocArray(tgt.name, 1, requestState->resource);
+      nm[0] = solux::api::build::arenaStr(requestState->resource, coll);
     } catch (const std::exception& e) {
       releaseArena(arena);
       respondSimple(http::status::bad_request, "application/json",
@@ -167,7 +187,7 @@ private:
 
     auto& engine = node_.getSearchEngine();
     auto* sreq = google::protobuf::Arena::Create<HttpSearchRequest>(
-        arena, engine, *protoReq, shared_from_this());
+        arena, engine, std::move(requestState), shared_from_this(), *arena);
     // Keep the io_context busy until this query finishes so shutdown drains it.
     sreq->workGuard.emplace(stream_.get_executor());
 
@@ -318,6 +338,7 @@ int HttpSearchRequest::reply(SearchResponse& response) {
   // throwing render/post still releases the arena and lets shutdown drain.
   bool last = response.last;
   try {
+    response.proto.more = !last;
     session->enqueueLine(renderSearchResponseLine(response.proto), last);
   } catch (...) {
     // fall through to cleanup

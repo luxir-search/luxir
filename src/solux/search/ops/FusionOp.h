@@ -41,7 +41,7 @@ namespace solux {
 // matches) are not yet wired; the parser rejects them.
 class FusionOp : public SearchOp {
 public:
-  const proto::Fusion& fusionProto;
+  const ReqFusion& fusionProto;
   // Each source is a full TopDocsReq parented to this FusionOp.  Their
   // rankingSinks are set by the parser to deliver to FusionOp::Calc.
   std::vector<TopDocsReq*> sources;
@@ -53,7 +53,7 @@ public:
   // Nothrow ctor (Arena::Create hazard - see TopDocsReq's ctor comment).
   // ProtobufSearchParser builds each source TopDocsReq (with rankingSink
   // wired) and the filter weights before allocation.
-  FusionOp(SearchRequest& req, std::string_view name, const proto::Fusion& fusionProto,
+  FusionOp(SearchRequest& req, std::string_view name, const ReqFusion& fusionProto,
            std::vector<TopDocsReq*>&& sources, int64_t topCount,
            std::span<std::pair<std::string_view, Query*>> filters,
            std::span<Query::Weight*> filterWeights, int32_t rrfK)
@@ -121,11 +121,12 @@ public:
       return static_cast<FusionOp&>(op);
     }
 
-    solux::proto::Val* getTargetForSub(solux::proto::SearchResponse* searchResponse, Calculator* sub) override {
-      auto* ourVal = parent->getTargetForSub(searchResponse, this);
-      assert(ourVal != nullptr && (ourVal->kind_case() == solux::proto::Val::kDocs
-        || ourVal->kind_case() == solux::proto::Val::KIND_NOT_SET));
-      return &(*ourVal->mutable_docs()->mutable_ops())[sub->getOp().name];
+    solux::api::Val* getTargetForSub(SearchResponse* resp, Calculator* sub) override {
+      auto* ourVal = parent->getTargetForSub(resp, this);
+      assert(ourVal != nullptr && (std::holds_alternative<solux::api::DocList>(ourVal->kind)
+        || std::holds_alternative<std::monostate>(ourVal->kind)));
+      auto& dl = oneofMut<solux::api::DocList>(*ourVal);
+      return build::opsSlot(dl.ops, op.subOps.size(), sub->getOp().name, resp->mr);
     }
 
     void calc(oneapi::tbb::task_group* tg, int32_t segnum, solux::DocSet* domain) override {
@@ -294,9 +295,9 @@ public:
       int64_t numCollected = std::min((int64_t)fusedList.size(), op.topCount);
       int64_t totalHits = (int64_t)fused.size();
 
-      auto getDocList = [this](solux::proto::SearchResponse* resp) -> solux::proto::DocList& {
+      auto getDocList = [this](SearchResponse* resp) -> solux::api::DocList& {
         auto& val = *getTarget(resp);
-        return *val.mutable_docs();
+        return oneofMut<solux::api::DocList>(val);
       };
 
       emitDocsResponse(op.req, getDocList,
@@ -304,11 +305,11 @@ public:
         [&fusedList](int64_t i) { return fusedList[i].first; },
         [&fusedList](int64_t i) { return fusedList[i].second; },
         totalHits,
-        op.fusionProto.fields(),
-        op.fusionProto.batch_size(),
-        op.fusionProto.offset(),
-        op.fusionProto.get_number(),
-        op.fusionProto.get_scores());
+        op.fusionProto.fields,
+        op.fusionProto.batch_size,
+        op.fusionProto.offset,
+        op.fusionProto.get_number,
+        op.fusionProto.get_scores);
     }
   };
 

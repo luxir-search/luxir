@@ -16,9 +16,9 @@ public:
   public:
     Calc(RootOp& op, SearchOp::Calculator* parent, int64_t slot, int64_t numSlots) : SearchOp::Calculator(op, parent, slot, numSlots) {}
 
-    solux::proto::Val* getTargetForSub(solux::proto::SearchResponse* searchResponse, Calculator* sub) override {
-      searchResponse = searchResponse ? searchResponse : &op.req.lastResponse->proto;
-      return &(*searchResponse->mutable_ops())[sub->getOp().name];
+    solux::api::Val* getTargetForSub(SearchResponse* resp, Calculator* sub) override {
+      // Top-level ops map: slot array sized to the root op's subOps; one Val per sub.
+      return build::opsSlot(resp->proto.ops, op.subOps.size(), sub->getOp().name, resp->mr);
     }
 
     void calc(oneapi::tbb::task_group* tg, int32_t segnum, solux::DocSet* domain) override {

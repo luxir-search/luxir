@@ -34,14 +34,15 @@ public:
 
   ~FullTextHandler() override = default;
 
-  void index(Inverter& inverter, const proto::Val& val) override {
+  void index(Inverter& inverter, const IndexVal& val) override {
     // TODO: handle bytes
     std::string_view sv;
-    if (val.has_s()) {
-      sv = val.s();
+    if (std::holds_alternative<std::string_view>(val.kind)) {
+      sv = std::get<std::string_view>(val.kind);
     }
-    else if (val.has_bin()) {
-      sv = val.bin();
+    else if (std::holds_alternative<hpp_proto::non_owning_traits::bytes_t>(val.kind)) {
+      const auto& b = std::get<hpp_proto::non_owning_traits::bytes_t>(val.kind);
+      sv = std::string_view((const char*)b.data(), b.size());
     }
 
     // TODO: handle arrays as well.  Hard to do in virtual methods where you can't use templates though.

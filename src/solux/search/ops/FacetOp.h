@@ -3,7 +3,7 @@
 #include <vector>
 #include <boost/unordered/unordered_flat_map.hpp>
 
-#include "protos/solux_types.pb.h"
+#include "solux/api/solux_types.hpp"
 #include "solux/search/DocSet.h"
 #include "solux/search/IndexReader.h"
 #include "FacetEmit.h"
@@ -30,17 +30,18 @@ public:
   int64_t minCount; // minimum count for a facet to be included in the result
   bool missing;
 
-  // Reference into the request proto (always non-null, lifetime tied to the
-  // request).  Storing by value would copy a RepeatedPtrField and could
-  // throw during the copy, which mid-ctor would corrupt the arena cleanup
-  // list (see TopDocsReq's ctor comment for the hazard).
-  const google::protobuf::RepeatedPtrField<proto::SortSpec>& sorts;
+  // Non-owning view of the request proto's repeated sorts (a trivially
+  // copyable span into the kept-alive request bytes, valid for the request
+  // lifetime).  Held by value: unlike the old RepeatedPtrField the span copy
+  // is nothrow, so it no longer risks the mid-ctor arena cleanup hazard (see
+  // TopDocsReq's ctor comment).
+  ReqSortList sorts;
   std::string_view facetName;
   std::vector<std::pair<const std::string_view, SearchOp*>> inlineSubOps;
 
   FacetReq(SearchRequest& req, std::string_view fieldName, std::string_view facetName,
     int64_t limit, int64_t minCount, bool missing,
-    const google::protobuf::RepeatedPtrField<proto::SortSpec>& sorts)
+    ReqSortList sorts)
     : SearchOp(req, facetName), reader(*req.reader), fieldName(fieldName), limit(limit), minCount(minCount), missing(missing),
       sorts(sorts), facetName(facetName) {
   }
@@ -54,9 +55,9 @@ public:
         throw std::runtime_error("facet '" + std::string(facetName) + "': multiple sort fields are not yet supported");
       }
       for (auto& sort : sorts) {
-        auto iter = subOps.find(sort.field());
+        auto iter = subOps.find(sort.field);
         if (iter == subOps.end()) {
-          throw std::runtime_error("facet '" + std::string(facetName) + "': unknown sort field '" + sort.field() + "'");
+          throw std::runtime_error("facet '" + std::string(facetName) + "': unknown sort field '" + std::string(sort.field) + "'");
         }
         if (iter->second->canInline()) {
           inlineSubOps.push_back(*iter);
@@ -107,9 +108,9 @@ public:
 
 class FieldFacetReq : public FacetReq {
 public:
-  const proto::FieldFacet& fieldFacet;
-  FieldFacetReq(SearchRequest& req, const proto::FieldFacet& fieldFacet, std::string_view fieldName, std::string_view facetName, int64_t limit, int64_t minCount, bool missing) :
-  FacetReq(req, fieldName, facetName, limit, minCount, missing, fieldFacet.sorts()), fieldFacet(fieldFacet){}
+  const ReqFieldFacet& fieldFacet;
+  FieldFacetReq(SearchRequest& req, const ReqFieldFacet& fieldFacet, std::string_view fieldName, std::string_view facetName, int64_t limit, int64_t minCount, bool missing) :
+  FacetReq(req, fieldName, facetName, limit, minCount, missing, fieldFacet.sorts), fieldFacet(fieldFacet){}
 
   virtual ~FieldFacetReq() = default;
 
@@ -183,7 +184,7 @@ public:
   // Ctor must be nothrow (Arena::Create hazard).  ProtobufSearchParser
   // computes globalMin/globalMax/useVector via scanGlobalRange before
   // allocation and passes them in.
-  IntFacetReq(SearchRequest& req, const proto::FieldFacet& fieldFacet, std::string_view fieldName,
+  IntFacetReq(SearchRequest& req, const ReqFieldFacet& fieldFacet, std::string_view fieldName,
     std::string_view facetName, int64_t limit, int64_t minCount, bool missing,
     int64_t globalMin, int64_t globalMax, bool useVector) :
   FieldFacetReq(req, fieldFacet, fieldName, facetName, limit, minCount, missing),
@@ -239,7 +240,7 @@ public:
       return (IntFacetReq&)getOp();
     }
 
-    solux::proto::Val* getTargetForSub(solux::proto::SearchResponse* searchResponse, Calculator* sub) override {
+    solux::api::Val* getTargetForSub(SearchResponse* resp, Calculator* sub) override {
       return nullptr;
     };
     void calc(oneapi::tbb::task_group* tg, int32_t segnum, DocSet* domain) override {
@@ -279,8 +280,9 @@ public:
     };
 
     void facetResult(MergeableIntFacet& merged) {
+      auto& mr = op.req.lastResponse->mr;  // arena for this leaf result (getTarget(nullptr) builds here)
       auto* myVal = getTarget(nullptr);
-      solux::proto::FacetResult& facetResultProto = *myVal->mutable_facet();
+      solux::api::FacetResult& facetResultProto = oneofMut<solux::api::FacetResult>(*myVal);
       auto minCount = thisOp().minCount;
       auto limit = thisOp().limit;
       auto missing = thisOp().missing;
@@ -301,9 +303,9 @@ public:
         }
       }
       sortByCountDescAndLimit(countVec, limit);
-      emitBuckets(facetResultProto, countVec);
+      emitBuckets(facetResultProto, countVec, mr);
       if (missing) {
-        facetResultProto.set_missing(merged.missing_num);
+        facetResultProto.missing = merged.missing_num;
       }
     }
   };
@@ -337,7 +339,7 @@ class FullTextFacetReq : public FieldFacetReq {
   };
 
 public:
-  FullTextFacetReq(SearchRequest& req, const proto::FieldFacet& fieldFacet, std::string_view fieldName, std::string_view facetName, int64_t limit, int64_t minCount, bool missing) :
+  FullTextFacetReq(SearchRequest& req, const ReqFieldFacet& fieldFacet, std::string_view fieldName, std::string_view facetName, int64_t limit, int64_t minCount, bool missing) :
   FieldFacetReq(req, fieldFacet, fieldName, facetName, limit, minCount, missing){}
 
   class Calc : public Calculator {
@@ -351,7 +353,7 @@ public:
       return (FullTextFacetReq&)getOp();
     }
 
-    solux::proto::Val* getTargetForSub(solux::proto::SearchResponse* searchResponse, Calculator* sub) override {
+    solux::api::Val* getTargetForSub(SearchResponse* resp, Calculator* sub) override {
       return nullptr;
     };
     void calc(oneapi::tbb::task_group* tg, int32_t segnum, DocSet* domain) override {
@@ -456,8 +458,9 @@ public:
     }
 
     void facetResult(MergeableStrFacet& merged) {
+      auto& mr = op.req.lastResponse->mr;  // arena for this leaf result (getTarget(nullptr) builds here)
       auto* myVal = getTarget(nullptr);
-      solux::proto::FacetResult& facetResultProto = *myVal->mutable_facet();
+      solux::api::FacetResult& facetResultProto = oneofMut<solux::api::FacetResult>(*myVal);
       auto minCount = thisOp().minCount;
       auto limit = thisOp().limit;
       auto missing = thisOp().missing;
@@ -469,9 +472,9 @@ public:
         }
       }
       sortByCountDescAndLimit(countVec, limit);
-      emitBuckets(facetResultProto, countVec);
+      emitBuckets(facetResultProto, countVec, mr);
       if (missing) {
-        facetResultProto.set_missing(merged.missing_num);
+        facetResultProto.missing = merged.missing_num;
       }
     }
 
@@ -488,11 +491,11 @@ class IntFacetRangeReq : public FacetReq {
   int64_t gap;
 public:
   // rangeFacet must reference the request proto (not a temporary): FacetReq
-  // captures rangeFacet.sorts() by reference.
-  IntFacetRangeReq(SearchRequest& req, const proto::RangeFacet& rangeFacet,
+  // captures a span over rangeFacet.sorts that points into the request bytes.
+  IntFacetRangeReq(SearchRequest& req, const ReqRangeFacet& rangeFacet,
     std::string_view fieldName, std::string_view facetName,
     int64_t start, int64_t end, int64_t gap, int64_t minCount, bool missing)
-  : FacetReq(req, fieldName, facetName, -1, minCount, missing, rangeFacet.sorts()),
+  : FacetReq(req, fieldName, facetName, -1, minCount, missing, rangeFacet.sorts),
     start(start), end(end), gap(gap) {}
 
   virtual ~IntFacetRangeReq() = default;
@@ -508,7 +511,7 @@ public:
       return (IntFacetRangeReq&)getOp();
     }
 
-    solux::proto::Val* getTargetForSub(solux::proto::SearchResponse* searchResponse, Calculator* sub) override {
+    solux::api::Val* getTargetForSub(SearchResponse* resp, Calculator* sub) override {
       return nullptr;
     };
     void calc(oneapi::tbb::task_group* tg, int32_t segnum, DocSet* domain) override {
@@ -542,8 +545,9 @@ public:
     };
 
     void facetResult(IntFacetReq::MergeableIntFacet& merged) {
+      auto& mr = op.req.lastResponse->mr;  // arena for this leaf result (getTarget(nullptr) builds here)
       auto* myVal = getTarget(nullptr);
-      solux::proto::FacetResult& facetResultProto = *myVal->mutable_facet();
+      solux::api::FacetResult& facetResultProto = oneofMut<solux::api::FacetResult>(*myVal);
       auto minCount = thisOp().minCount;
       auto limit = thisOp().limit;
       auto missing = thisOp().missing;
@@ -570,29 +574,29 @@ public:
         countVec.resize(limit);
       }
 
-      // fill in the facet result proto
-      auto& bucketIds = *facetResultProto.mutable_bucket_ids()->mutable_multi_i();
-      auto& bucketIdsArr = *bucketIds.mutable_v();
-      auto& countsArr = *facetResultProto.mutable_counts();
-      bucketIdsArr.Reserve(countVec.size());
-      countsArr.Reserve(countVec.size());
+      // fill in the facet result proto (non-owning: sizes known from countVec)
+      auto& bucketIds = facetResultProto.bucket_ids.emplace().kind.emplace<solux::api::ArrArrInt>();
+      size_t n = countVec.size();
+      solux::api::ArrInt* pairs = build::allocArray(bucketIds.v, n, mr);
+      int64_t* counts = build::allocArray(facetResultProto.counts, n, mr);
       // Bucket bounds via unsigned offsets from start.  k*gap and (k+1)*gap can
       // exceed int64 for a large user gap/range; clamping the end offset before
       // converting back keeps both bounds in [start, end] with no signed
       // overflow and no wrap-to-negative (std::min on the converted value would
       // pick the wrapped-negative bound instead of clamping to end).
       uint64_t endOffset = (uint64_t)end - (uint64_t)start;
-      for (auto [val, count] : countVec) {
+      for (size_t i = 0; i < n; i++) {
+        auto [val, count] = countVec[i];
         uint64_t k = (uint64_t)val;
         uint64_t loOff = k * (uint64_t)gap;  // < endOffset (key came from a real value)
         uint64_t hiOff = endOffset - loOff > (uint64_t)gap ? loOff + (uint64_t)gap : endOffset;
-        auto& pair = *bucketIdsArr.Add();
-        pair.mutable_v()->Add((int64_t)((uint64_t)start + loOff));
-        pair.mutable_v()->Add((int64_t)((uint64_t)start + hiOff));
-        countsArr.Add(count);
+        int64_t* bounds = build::allocArray(pairs[i].v, 2, mr);
+        bounds[0] = (int64_t)((uint64_t)start + loOff);
+        bounds[1] = (int64_t)((uint64_t)start + hiOff);
+        counts[i] = count;
       }
       if (missing) {
-        facetResultProto.set_missing(merged.missing_num);
+        facetResultProto.missing = merged.missing_num;
       }
     }
   };

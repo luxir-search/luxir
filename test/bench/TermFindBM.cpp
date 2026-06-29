@@ -1,4 +1,7 @@
+#include <algorithm>
 #include <charconv>
+#include <numeric>
+#include <unordered_set>
 
 #include "bench/solux_bench.h"
 #include "test/SegmentTest.h"

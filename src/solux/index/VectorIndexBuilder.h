@@ -8,7 +8,7 @@
 #include <string>
 #include <vector>
 #include <boost/unordered/unordered_flat_set.hpp>
-#include "protos/solux_types.pb.h"
+#include "solux/index/AuxInfo.h"
 #include "solux/store/Directory.h"
 #include "solux/schema/Schema.h"
 #include "solux/reader/PostingsReader.h"
@@ -98,7 +98,7 @@ public:
   /// Returned AuxIndexInfo entries should be appended to that segment's
   /// SegmentInfo.overlays.  File names of every produced file are appended to
   /// outFilesToSync so the caller can fsync them before publishing IndexInfo.
-  std::vector<proto::AuxIndexInfo> build(
+  std::vector<AuxInfo> build(
       const std::vector<std::string>& selectors,
       const boost::unordered_flat_set<std::string>& skipNames,
       std::vector<std::string>& outFilesToSync,
@@ -120,12 +120,12 @@ private:
 
   // Builds the FAISS index file for one field.  Returns nullopt when
   // no segment has any vectors for the field (no files written, nothing to record).
-  std::optional<proto::AuxIndexInfo> buildField(std::string_view fieldName,
+  std::optional<AuxInfo> buildField(std::string_view fieldName,
                                                 const VectorFieldType& ft,
                                                 std::vector<std::string>& outFilesToSync,
                                                 BuildSite buildSite);
 
-  std::optional<proto::AuxIndexInfo> buildIvfPqField(std::string_view fieldName,
+  std::optional<AuxInfo> buildIvfPqField(std::string_view fieldName,
                                                      const VectorFieldType& ft,
                                                      std::vector<std::string>& outFilesToSync,
                                                      BuildSite buildSite);

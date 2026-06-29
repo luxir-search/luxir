@@ -1,11 +1,15 @@
 
 #include <iostream>
+#include <memory>
+#include <variant>
 #include <gtest/gtest.h>
-#include <google/protobuf/text_format.h>
+#include "test/GrpcClient.h"
 #include "test/GrpcSoluxTest.h"
+#include "test/LocalReq.h"
 #include "solux/server/GRPCServer.h"
 
 using namespace solux;
+using namespace solux::test;  // HppClientReaderWriter, Reply, rpc::
 
 // TODO - use a different logger for RPC stuff some point
 // redefine DEBUG to TRACE level which shouldn't currently be logged!
@@ -13,50 +17,40 @@ using namespace solux;
 
 class GrpcSearchTest : public GrpcSoluxTest {
 public:
-  std::unique_ptr<solux::Searcher::Stub> searchStub;
+  std::shared_ptr<grpc::Channel> channel;
 
   GrpcSearchTest() {
-    auto channel = getChannel();
-    searchStub = solux::Searcher::NewStub(channel);
+    channel = getChannel();
   }
 };
 
 
 
 TEST_F(GrpcSearchTest, basic) {
-  // Setup request
-  solux::proto::SearchRequest req;
-  solux::proto::SearchResponse response;
   grpc::ClientContext context;  // need a new one for each RPC
 
-  req.mutable_collection()->add_name("main");
-  auto& ops = *req.mutable_ops();
-  // invalid utf8 looks to be validated by both libprotobuf on both serialization and deserialization! Is there a way to stop this?
-  // It actually still works and passes the test, but it generates ERROR output to stderr.
-  // std::string key = "q\xc3\x01";
-  std::string key = "q";
-  ops[key].mutable_top_docs()->mutable_query()->set_all(true);
+  // Build a concrete SearchRequest with the OpCursor builder (used only as a builder here;
+  // we serialize its `view`, we do not execute locally).
+  auto lreq = localReq(soluxNode->getSearchEngine());
+  lreq->collection("main").topDocs("q").allQuery();
 
-  std::string reqStr;
-  google::protobuf::TextFormat::PrintToString(req, &reqStr);
-  GRPC_DEBUG("CLIENT REQ:( {} )", reqStr);
+  GRPC_DEBUG("CLIENT REQ: key=q");
 
-  std::unique_ptr<grpc::ClientReaderWriter<solux::proto::SearchRequest, solux::proto::SearchResponse>> stream = searchStub->Search(&context);
-  bool wrote = stream->Write(req);
+  HppClientReaderWriter<solux::api::SearchRequest, solux::api::SearchResponse> stream(
+    channel.get(), rpc::Search, &context);
+  bool wrote = stream.Write(lreq->proto);  // lreq->proto is the built (non-owning) SearchRequest view
   ASSERT_TRUE(wrote);
-  bool ok = stream->WritesDone();  // can replace with WriteLast? is it more efficient?
+  bool ok = stream.WritesDone();  // can replace with WriteLast? is it more efficient?
   ASSERT_TRUE(ok);
 
-  while (stream->Read(&response)) {
-    std::string resStr;
-    google::protobuf::TextFormat::PrintToString(response, &resStr);
-    GRPC_DEBUG("CLIENT RESULT:( {} )", resStr);
-    auto& rsp = response.ops().at(key);  // make sure the key was unadulterated
-    ASSERT_TRUE(rsp.has_docs());
+  Reply<solux::api::SearchResponse> response;
+  while (stream.Read(&response)) {
+    GRPC_DEBUG("CLIENT RESULT: ops={}", response.msg.ops.size());
+    auto& rsp = *response.msg.ops.at("q");  // make sure the key was unadulterated
+    ASSERT_TRUE(std::holds_alternative<solux::api::DocList>(rsp.kind));
   }
 
-  grpc::Status status = stream->Finish();
+  grpc::Status status = stream.Finish();
   GRPC_DEBUG("STREAMING SEARCH CLIENT FINISHED");
   ASSERT_TRUE(status.ok());
 }
-

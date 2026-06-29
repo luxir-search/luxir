@@ -1,12 +1,14 @@
 #pragma once
 
+#include <memory_resource>
 #include <string_view>
-#include "protos/solux_types.pb.h"
+#include "solux/api/solux_types.hpp"
 
 namespace solux {
 
-// Parse a bespoke JSON query body into `out` (whose collection target the caller
-// has already set).  Fills a single top_docs op named "q".
+// Parse a bespoke JSON query body into NON-OWNING `out`, whose message data is
+// allocated from `arena` (which must outlive `out`).  Fills a single top_docs op
+// named "q".  The caller sets `out`'s collection target separately.
 //
 // Phase 0 grammar:
 //   {
@@ -17,6 +19,7 @@ namespace solux {
 //   }
 //
 // Throws std::runtime_error with a client-facing message on malformed input.
-void parseQueryRequest(std::string_view body, proto::SearchRequest& out);
+void parseQueryRequest(std::string_view body, solux::api::SearchRequest& out,
+                       std::pmr::memory_resource& arena);
 
 } // namespace solux

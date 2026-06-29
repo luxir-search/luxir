@@ -4,6 +4,7 @@
 #include "test/SoluxTest.h"
 #include "test/CollectionHelper.h"
 #include "test/LocalReq.h"
+#include "test/QueryBuild.h"
 #include "solux/util/DateTime.h"
 
 using namespace solux;
@@ -124,25 +125,22 @@ TEST_F(DateFieldTest, mergeAcrossSegments) {
   helper.getIndexWriter()->mergeSegments();
   helper.commit();
 
-  auto* lreq = LocalReq::create(soluxNode->getSearchEngine());
-  lreq->collection("main").allQuery().fields({"id_s", "when_dt"}).limit(10).execute();
+  auto lreq = localReq(soluxNode->getSearchEngine());
+  lreq->collection("main").topDocs("q").allQuery().fields({"id_s", "when_dt"}).limit(10);
+  lreq->execute();
   auto docs = lreq->getDocs();
   ASSERT_EQ(3u, docs.size());
   EXPECT_TRUE(containsDoc(docs, flatdoc("id_s", "a", "when_dt", a)));
   EXPECT_TRUE(containsDoc(docs, flatdoc("id_s", "b", "when_dt", b)));
   EXPECT_TRUE(containsDoc(docs, flatdoc("id_s", "c", "when_dt", c)));
-  lreq->done();
 
-  auto* s = LocalReq::create(soluxNode->getSearchEngine());
-  s->collection("main").allQuery().fields({"id_s"}).limit(10);
-  auto* sort = s->topDocs().mutable_sorts()->Add();
-  sort->set_field("when_dt");
-  sort->set_dir(proto::SortSpec_SortDir_ASC);
+  auto s = localReq(soluxNode->getSearchEngine());
+  auto& scur = s->collection("main").topDocs("q").allQuery().fields({"id_s"}).limit(10);
+  qb::sort(scur, "when_dt", qb::ASC);
   s->execute();
   std::vector<std::string> ids;
   for (auto& d : s->getDocs()) ids.push_back(std::get<std::string>(*find(d, "id_s")));
   EXPECT_EQ((std::vector<std::string>{"c", "a", "b"}), ids);
-  s->done();
 }
 
 // ---- format: canonical UTC ISO-8601, '.fff' only when non-zero ----
@@ -182,12 +180,12 @@ TEST_F(DateFieldTest, roundTrip) {
                        "stamps_dts", vec_i(a, b)),
                UpdateMessage::COMMIT);
 
-  auto* lreq = LocalReq::create(soluxNode->getSearchEngine());
-  lreq->collection("main")
+  auto lreq = localReq(soluxNode->getSearchEngine());
+  lreq->collection("main").topDocs("q")
       .allQuery()
       .fields({"id_s", "when_dt", "stamps_dts"})
-      .limit(10)
-      .execute();
+      .limit(10);
+  lreq->execute();
 
   auto docs = lreq->getDocs();
   ASSERT_EQ(2u, docs.size());
@@ -196,7 +194,6 @@ TEST_F(DateFieldTest, roundTrip) {
                                         "stamps_dts", vec_i(a, b))));
   EXPECT_TRUE(containsDoc(docs, flatdoc("id_s", "d2", "when_dt", ms2,
                                         "stamps_dts", vec_i(a, b))));
-  lreq->done();
 }
 
 // Sorting runs on the raw millis column (chronological order, no decode).
@@ -209,17 +206,14 @@ TEST_F(DateFieldTest, sort) {
   helper.index(flatdoc("id_s", "c", "when_dt", "1969-06-01T00:00:00Z"), UpdateMessage::NO_COMMIT);  // pre-epoch
   helper.index(flatdoc("id_s", "d"), UpdateMessage::COMMIT);  // missing, sorts last asc
 
-  auto* lreq = LocalReq::create(soluxNode->getSearchEngine());
-  lreq->collection("main").allQuery().fields({"id_s"}).limit(10);
-  auto* sort = lreq->topDocs().mutable_sorts()->Add();
-  sort->set_field("when_dt");
-  sort->set_dir(proto::SortSpec_SortDir_ASC);
+  auto lreq = localReq(soluxNode->getSearchEngine());
+  auto& cur = lreq->collection("main").topDocs("q").allQuery().fields({"id_s"}).limit(10);
+  qb::sort(cur, "when_dt", qb::ASC);
   lreq->execute();
 
   std::vector<std::string> ids;
   for (auto& doc : lreq->getDocs()) ids.push_back(std::get<std::string>(*find(doc, "id_s")));
   EXPECT_EQ((std::vector<std::string>{"c", "b", "a", "d"}), ids);
-  lreq->done();
 }
 
 // A multi-valued cell whose Nth string fails to parse must fail the whole
@@ -243,17 +237,17 @@ TEST_F(DateFieldTest, multiStringPartialFailureNoCorruption) {
     flatdoc("id", "g2", "stamps_dts", std::vector<std::string>{"2003-03-03", "2004-04-04"}),
   };
   auto result = helper.indexAll(docs, UpdateMessage::COMMIT);
-  ASSERT_EQ(proto::UpdateResponse::PARTIAL, result.response.status());
-  ASSERT_EQ(1, result.response.errors_size());
-  EXPECT_EQ("b1", result.response.errors(0).id());
+  ASSERT_EQ(solux::api::UpdateResponse_::Status::PARTIAL, result.status);
+  ASSERT_EQ(1, result.errors.size());
+  EXPECT_EQ("b1", result.errors[0].id);
 
-  auto* lreq = LocalReq::create(soluxNode->getSearchEngine());
-  lreq->collection("main").allQuery().fields({"id", "stamps_dts"}).limit(10).execute();
+  auto lreq = localReq(soluxNode->getSearchEngine());
+  lreq->collection("main").topDocs("q").allQuery().fields({"id", "stamps_dts"}).limit(10);
+  lreq->execute();
   auto retrieved = lreq->getDocs();
   // The good docs must read back exactly their own values (no shift from b1).
   EXPECT_TRUE(containsDoc(retrieved, flatdoc("id", "g1", "stamps_dts", vec_i(y2001))));
   EXPECT_TRUE(containsDoc(retrieved, flatdoc("id", "g2", "stamps_dts", vec_i(y2003, y2004))));
-  lreq->done();
 }
 
 // An unparseable date string fails just that doc (same contract as a bad
@@ -269,16 +263,16 @@ TEST_F(DateFieldTest, badDateMarksDocFailed) {
   };
   auto result = helper.indexAll(docs, UpdateMessage::COMMIT);
 
-  ASSERT_EQ(proto::UpdateResponse::PARTIAL, result.response.status());
-  ASSERT_EQ(1, result.response.errors_size());
-  EXPECT_EQ("b1", result.response.errors(0).id());
-  EXPECT_NE(std::string::npos, result.response.errors(0).error_message().find("when_dt"));
+  ASSERT_EQ(solux::api::UpdateResponse_::Status::PARTIAL, result.status);
+  ASSERT_EQ(1, result.errors.size());
+  EXPECT_EQ("b1", result.errors[0].id);
+  EXPECT_NE(std::string::npos, result.errors[0].error_message.find("when_dt"));
 
-  auto* lreq = LocalReq::create(soluxNode->getSearchEngine());
-  lreq->collection("main").allQuery().fields({"id"}).limit(10).execute();
+  auto lreq = localReq(soluxNode->getSearchEngine());
+  lreq->collection("main").topDocs("q").allQuery().fields({"id"}).limit(10);
+  lreq->execute();
   std::vector<std::string> ids;
   for (auto& doc : lreq->getDocs()) ids.push_back(std::get<std::string>(*find(doc, "id")));
   std::sort(ids.begin(), ids.end());
   EXPECT_EQ((std::vector<std::string>{"g1", "g2"}), ids);
-  lreq->done();
 }

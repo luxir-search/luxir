@@ -3,8 +3,12 @@
 #include <thread>
 #include <latch>
 #include <grpcpp/grpcpp.h>
-#include "protos/solux.grpc.pb.h"
+#include <grpcpp/generic/async_generic_service.h>
 #include "SoluxNode.h"
+// The server itself serves everything through the generic service in the .cpp.
+// This hpp-proto metadata include is kept for callers that still pick it up
+// transitively while the client side migration catches up.
+#include "solux/api/solux.hpp"
 
 namespace solux {
 
@@ -48,11 +52,12 @@ public:
     }
   };
 private:
-
-  solux::Greeter::AsyncService greeterService;
-  solux::Indexer::AsyncService indexerService;
-  solux::Searcher::AsyncService searcherService;
-  solux::Admin::AsyncService adminService;
+  // All RPCs are served raw (grpc::ByteBuffer in/out) through a single generic
+  // service; method dispatch is by RPC path (see GenericCallData in the .cpp).
+  // This replaces the per-service typed AsyncService stubs so the server no longer
+  // depends on generated service classes for transport; handlers own hpp-proto
+  // read_binpb/write_binpb.
+  grpc::AsyncGenericService genericService;
 
   SoluxNode& soluxNode;
   std::latch startLatch; // triggered when the gRPC server has started (but not the serving threads yet)
@@ -69,6 +74,7 @@ private:
   void runThread(ThreadInfo& threadInfo);
 
   friend class CallData;
+  friend class GenericCallData;
 };
 
 }

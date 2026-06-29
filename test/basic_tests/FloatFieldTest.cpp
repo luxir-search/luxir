@@ -3,6 +3,7 @@
 #include "test/SoluxTest.h"
 #include "test/CollectionHelper.h"
 #include "test/LocalReq.h"
+#include "test/QueryBuild.h"
 #include "solux/util/NumericUtils.h"
 
 using namespace solux;
@@ -87,21 +88,20 @@ TEST_F(FloatFieldTest, roundTrip) {
   helper.index(flatdoc("id_s", "d3", "weight_d", std::numeric_limits<double>::infinity()),
                UpdateMessage::COMMIT);
 
-  auto* lreq = LocalReq::create(soluxNode->getSearchEngine());
-  lreq->collection("main")
+  auto req = localReq(soluxNode->getSearchEngine());
+  req->collection("main").topDocs("q")
       .allQuery()
       .fields({"id_s", "price_f", "weight_d", "vals_fs", "vals_ds"})
-      .limit(10)
-      .execute();
+      .limit(10);
+  req->execute();
 
-  auto docs = lreq->getDocs();
+  auto docs = req->getDocs();
   ASSERT_EQ(3u, docs.size());
-  ASSERT_TRUE(containsDoc(docs, flatdoc("id_s", "d1", "price_f", -1.5f, "weight_d", -2.5,
-                                        "vals_fs", vec(7.5f, -0.25f), "vals_ds", vec(0.5, -2.75))));
-  ASSERT_TRUE(containsDoc(docs, flatdoc("id_s", "d2", "price_f", 0.25f, "weight_d", 1e100,
-                                        "vals_ds", vec(42.0))));
-  ASSERT_TRUE(containsDoc(docs, flatdoc("id_s", "d3", "weight_d", std::numeric_limits<double>::infinity())));
-  lreq->done();
+  EXPECT_CONTAINS_DOC(docs, flatdoc("id_s", "d1", "price_f", -1.5f, "weight_d", -2.5,
+                                    "vals_fs", vec(7.5f, -0.25f), "vals_ds", vec(0.5, -2.75)));
+  EXPECT_CONTAINS_DOC(docs, flatdoc("id_s", "d2", "price_f", 0.25f, "weight_d", 1e100,
+                                    "vals_ds", vec(42.0)));
+  EXPECT_CONTAINS_DOC(docs, flatdoc("id_s", "d3", "weight_d", std::numeric_limits<double>::infinity()));
 }
 
 // Sorting compares the encoded column values directly; negative values are
@@ -116,27 +116,25 @@ TEST_F(FloatFieldTest, sortFloat) {
   helper.index(flatdoc("id_s", "d", "price_f", 0.25f), UpdateMessage::NO_COMMIT);
   helper.index(flatdoc("id_s", "e"), UpdateMessage::COMMIT);  // missing value, sorts last
 
-  auto sortBy = [&](proto::SortSpec_SortDir dir) {
-    auto* lreq = LocalReq::create(soluxNode->getSearchEngine());
-    lreq->collection("main").allQuery().fields({"id_s"}).limit(10);
-    auto* sort = lreq->topDocs().mutable_sorts()->Add();
-    sort->set_field("price_f");
-    sort->set_dir(dir);
-    lreq->execute();
+  auto sortBy = [&](qb::SortDir dir) {
+    auto req = localReq(soluxNode->getSearchEngine());
+    req->collection("main");
+    auto& cur = req->topDocs("q").allQuery().fields({"id_s"}).limit(10);
+    qb::sort(cur, "price_f", dir);
+    req->execute();
     std::vector<std::string> ids;
-    for (auto& doc : lreq->getDocs()) {
+    for (auto& doc : req->getDocs()) {
       ids.push_back(std::get<std::string>(*find(doc, "id_s")));
     }
-    lreq->done();
     return ids;
   };
 
-  auto asc = sortBy(proto::SortSpec_SortDir_ASC);
+  auto asc = sortBy(qb::ASC);
   ASSERT_EQ((std::vector<std::string>{"b", "c", "d", "a", "e"}), asc);
 
   // missing values sort as if +infinity (same contract as int fields):
   // last under ASC, first under DESC
-  auto desc = sortBy(proto::SortSpec_SortDir_DESC);
+  auto desc = sortBy(qb::DESC);
   ASSERT_EQ((std::vector<std::string>{"e", "a", "d", "c", "b"}), desc);
 }
 
@@ -148,19 +146,17 @@ TEST_F(FloatFieldTest, sortDouble) {
   helper.index(flatdoc("id_s", "b", "weight_d", 1e-300), UpdateMessage::COMMIT);
   helper.index(flatdoc("id_s", "c", "weight_d", -2.5), UpdateMessage::COMMIT);
 
-  auto* lreq = LocalReq::create(soluxNode->getSearchEngine());
-  lreq->collection("main").allQuery().fields({"id_s"}).limit(10);
-  auto* sort = lreq->topDocs().mutable_sorts()->Add();
-  sort->set_field("weight_d");
-  sort->set_dir(proto::SortSpec_SortDir_ASC);
-  lreq->execute();
+  auto req = localReq(soluxNode->getSearchEngine());
+  req->collection("main");
+  auto& cur = req->topDocs("q").allQuery().fields({"id_s"}).limit(10);
+  qb::sort(cur, "weight_d", qb::ASC);
+  req->execute();
 
   std::vector<std::string> ids;
-  for (auto& doc : lreq->getDocs()) {
+  for (auto& doc : req->getDocs()) {
     ids.push_back(std::get<std::string>(*find(doc, "id_s")));
   }
   ASSERT_EQ((std::vector<std::string>{"a", "c", "b"}), ids);
-  lreq->done();
 }
 
 // Facet-inline avg (the per-bucket InlineCalc path) must iterate every value
@@ -177,39 +173,32 @@ TEST_F(FloatFieldTest, avgFacetInline) {
   helper.index(flatdoc("id_s", "c", "color_s", "blue", "vals_ds", vec(6.0)), UpdateMessage::NO_COMMIT);
   helper.index(flatdoc("id_s", "d", "color_s", "blue"), UpdateMessage::COMMIT);  // no values
 
-  auto* lreq = LocalReq::create(soluxNode->getSearchEngine());
-  lreq->collection("main").allQuery().limit(10);
-  auto& ops = *lreq->proto.mutable_ops();
-  auto& facet = *ops["f"].mutable_field_facet();
-  facet.set_field("color_s");
-  facet.set_limit(-1);
-  auto& subOps = *facet.mutable_ops();
-  auto& avgD = *subOps["avgd"].mutable_gen_op();
-  avgD.set_name("avg");
-  avgD.mutable_args()->Add()->set_s("vals_ds");
-  auto& avgI = *subOps["avgi"].mutable_gen_op();
-  avgI.set_name("avg");
-  avgI.mutable_args()->Add()->set_s("nums_is");
-  facet.mutable_sorts()->Add();
-  facet.mutable_sorts(0)->set_field("avgd");
-  facet.mutable_sorts(0)->set_dir(proto::SortSpec_SortDir_ASC);
-  lreq->execute();
+  auto req = localReq(soluxNode->getSearchEngine());
+  req->collection("main").topDocs("q").allQuery().limit(10);
+  auto& facet = req->facet("f", "color_s");
+  facet.limit(-1);
+  facet.avg("avgd", "vals_ds");
+  facet.avg("avgi", "nums_is");
+  qb::sort(facet, "avgd", qb::ASC);
+  req->execute();
+  ASSERT_OK(req);
 
-  auto& facetResult = lreq->responses[0]->proto.ops().at("f").facet();
-  ASSERT_EQ(2, facetResult.bucket_ids().col_s().v_size());
-  ASSERT_EQ("red", facetResult.bucket_ids().col_s().v(0));
-  ASSERT_EQ("blue", facetResult.bucket_ids().col_s().v(1));
+  const auto* fr = req->responses[0]->proto.ops.at("f")->facetResult();
+  ASSERT_NE(fr, nullptr);
+  auto& bids = std::get<solux::api::ColStr>(fr->bucket_ids->kind);
+  ASSERT_EQ(2u, bids.v.size());
+  ASSERT_EQ("red", bids.v[0]);
+  ASSERT_EQ("blue", bids.v[1]);
 
   // red: (1+3+5)/3 values = 3.0 (dividing by its 2 docs would give 4.5)
   // blue: 6/1 value = 6.0 (dividing by its 2 docs would give 3.0)
-  ASSERT_DOUBLE_EQ(3.0, facetResult.ops().at("avgd").arr_d().v(0));
-  ASSERT_DOUBLE_EQ(6.0, facetResult.ops().at("avgd").arr_d().v(1));
+  ASSERT_DOUBLE_EQ(3.0, std::get<solux::api::ArrDouble>(fr->ops.at("avgd")->kind).v[0]);
+  ASSERT_DOUBLE_EQ(6.0, std::get<solux::api::ArrDouble>(fr->ops.at("avgd")->kind).v[1]);
 
   // multi-valued int through the same inline path
   // red: (10+20+30)/3 = 20.0 ; blue has no values -> 0.0
-  ASSERT_DOUBLE_EQ(20.0, facetResult.ops().at("avgi").arr_d().v(0));
-  ASSERT_DOUBLE_EQ(0.0, facetResult.ops().at("avgi").arr_d().v(1));
-  lreq->done();
+  ASSERT_DOUBLE_EQ(20.0, std::get<solux::api::ArrDouble>(fr->ops.at("avgi")->kind).v[0]);
+  ASSERT_DOUBLE_EQ(0.0, std::get<solux::api::ArrDouble>(fr->ops.at("avgi")->kind).v[1]);
 }
 
 // avg must decode the sortable bits before summing - the sum of raw encoded
@@ -222,18 +211,13 @@ TEST_F(FloatFieldTest, avg) {
   helper.index(flatdoc("id_s", "b", "price_f", 2.0f, "weight_d", 2.5), UpdateMessage::COMMIT);
   helper.index(flatdoc("id_s", "c", "price_f", 6.0f, "weight_d", 5.0), UpdateMessage::COMMIT);
 
-  auto* lreq = LocalReq::create(soluxNode->getSearchEngine());
-  lreq->collection("main").allQuery().limit(10);
-  auto& ops = *lreq->proto.mutable_ops();
-  auto& avgF = *ops["avgf"].mutable_gen_op();
-  avgF.set_name("avg");
-  avgF.mutable_args()->Add()->set_s("price_f");
-  auto& avgD = *ops["avgd"].mutable_gen_op();
-  avgD.set_name("avg");
-  avgD.mutable_args()->Add()->set_s("weight_d");
-  lreq->execute();
+  auto req = localReq(soluxNode->getSearchEngine());
+  req->collection("main").topDocs("q").allQuery().limit(10);
+  req->avg("avgf", "price_f");
+  req->avg("avgd", "weight_d");
+  req->execute();
+  ASSERT_OK(req);
 
-  ASSERT_DOUBLE_EQ(3.0, lreq->responses[0]->proto.ops().at("avgf").d());
-  ASSERT_DOUBLE_EQ(2.0, lreq->responses[0]->proto.ops().at("avgd").d());
-  lreq->done();
+  ASSERT_DOUBLE_EQ(3.0, req->scalar<double>("avgf"));
+  ASSERT_DOUBLE_EQ(2.0, req->scalar<double>("avgd"));
 }

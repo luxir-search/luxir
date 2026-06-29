@@ -1,4 +1,5 @@
 #pragma once
+#include <numeric>
 
 #include "PostingsWriter.h"
 #include "solux/reader/IntColReader.h"

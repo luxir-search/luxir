@@ -51,20 +51,20 @@ public:
     SegmentMergeDriver<MergeableSum> driver;
 
     void emitResult(double avg) {
-      auto* myVal = getTarget(nullptr, [&](solux::proto::Val& val) {
+      auto* myVal = getTarget(nullptr, [&](solux::api::Val& val) {
         if (slot >= 0) {
           // do array creation with mutex held since different buckets could be calculated in parallel
-          auto& arr = *val.mutable_arr_d();
-          if (arr.v_size() == 0) {
-            arr.mutable_v()->Resize(numSlots, 0.0);
+          auto& arr = oneofMut<solux::api::ArrDouble>(val);
+          if (arr.v.empty()) {
+            build::allocArray(arr.v, numSlots, op.req.lastResponse->mr);
           }
         }
       });
       if (slot == -1) {
-        myVal->set_d(avg);
+        myVal->kind.emplace<double>(avg);
       } else {
-        auto& arr = *myVal->mutable_arr_d();
-        arr.set_v(slot, avg);
+        auto& arr = oneofMut<solux::api::ArrDouble>(*myVal);
+        const_cast<double*>(arr.v.data())[slot] = avg;
       }
     }
 
@@ -82,7 +82,7 @@ public:
       return (AvgOp&)getOp();
     }
 
-    solux::proto::Val* getTargetForSub(solux::proto::SearchResponse* searchResponse, Calculator* sub) override {return nullptr;};
+    solux::api::Val* getTargetForSub(SearchResponse* resp, Calculator* sub) override {return nullptr;};
     void calc(oneapi::tbb::task_group* tg, int32_t segnum, DocSet* domain) override {
       //LOG_DEBUG("calc AvgOp: this={} segnum={}, domain={} slot={}", (void*)this, segnum, (void*)domain, slot);
       if (segnum == -1) {
@@ -158,7 +158,7 @@ public:
     }
 
     ~InlineCalc() override = default;
-    solux::proto::Val* getTargetForSub(solux::proto::SearchResponse* searchResponse, Calculator* sub) override {return nullptr;};
+    solux::api::Val* getTargetForSub(SearchResponse* resp, Calculator* sub) override {return nullptr;};
     void calc(oneapi::tbb::task_group* tg, int32_t segnum, DocSet* domain) override {};
 
     AvgOp& thisOp() {
@@ -268,17 +268,18 @@ public:
     }
 
     void fillResult(std::span<char*> entries) override {
-      auto* myVal = getTarget(nullptr, [&](solux::proto::Val& val) {
+      auto* myVal = getTarget(nullptr, [&](solux::api::Val& val) {
              // do array creation with mutex held since different buckets could be calculated in parallel
-             auto& arr = *val.mutable_arr_d();
-             if (arr.v_size() == 0) {
-               arr.mutable_v()->Resize(entries.size(), 0.0);
+             auto& arr = oneofMut<solux::api::ArrDouble>(val);
+             if (arr.v.empty()) {
+               build::allocArray(arr.v, entries.size(), op.req.lastResponse->mr);
              }
          });
-      auto& arr = *myVal->mutable_arr_d();
+      auto& arr = oneofMut<solux::api::ArrDouble>(*myVal);
+      auto* data = const_cast<double*>(arr.v.data());
       for (auto i = 0u; i < entries.size(); i++) {
         auto e = *(Entry*)entries[i];
-        arr.set_v(i, e.val);
+        data[i] = e.val;
         entries[i] += sizeof(Entry); // move to the next entry part
       }
     }

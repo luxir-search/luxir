@@ -15,7 +15,8 @@
 #include "solux/reader/Postings.h"
 #include "solux/util/Signal.h"
 #include "solux/util/log.h"
-#include "protos/solux_types.pb.h"
+#include "solux/api/solux_types.hpp"
+#include "test/QueryBuild.h"
 
 #include <faiss/IndexFlat.h>
 #include <faiss/IndexIVFPQ.h>
@@ -23,16 +24,14 @@
 #include <faiss/index_io.h>
 #include <faiss/impl/io.h>
 
-#include <google/protobuf/arena.h>
-#include <google/protobuf/io/coded_stream.h>
-#include <google/protobuf/io/zero_copy_stream_impl_lite.h>
-
 #include <cstring>
 #include <atomic>
 #include <chrono>
 #include <filesystem>
 #include <latch>
 #include <memory>
+#include <memory_resource>
+#include <span>
 #include <thread>
 #include <vector>
 
@@ -114,16 +113,25 @@ struct VectorBuildFailureGuard {
   }
 };
 
-// Reads s.olux and returns the parsed IndexInfo.  Caller owns the storage in `arena`.
-proto::IndexInfo* readIndexInfo(Directory& dir, google::protobuf::Arena& arena) {
+// Owns the decode arena and the non-owning IndexInfo view it backs.  The arena lives on the
+// heap so the view stays valid after the holder is moved out of readIndexInfo().
+struct IndexInfoHolder {
+  std::unique_ptr<std::pmr::monotonic_buffer_resource> arena =
+      std::make_unique<std::pmr::monotonic_buffer_resource>();
+  solux::api::IndexInfo info;
+  const solux::api::IndexInfo* operator->() const { return &info; }
+  const solux::api::IndexInfo& operator*() const { return info; }
+};
+
+// Reads s.olux and returns the parsed IndexInfo (and its backing arena).
+IndexInfoHolder readIndexInfo(Directory& dir) {
   auto file = dir.openFile(Postings::INDEX_INFO_FILE);
   EXPECT_NE(file, nullptr);
-  auto* info = google::protobuf::Arena::Create<proto::IndexInfo>(&arena);
+  IndexInfoHolder holder;
   auto is = file->getInputStream();
-  google::protobuf::io::ArrayInputStream as(is.ptr(), (int)is.left());
-  google::protobuf::io::CodedInputStream cs(&as);
-  EXPECT_TRUE(info->ParseFromCodedStream(&cs));
-  return info;
+  std::span<const std::byte> bytes((const std::byte*)is.ptr(), (size_t)is.left());
+  EXPECT_TRUE(solux::api::decode(holder.info, bytes, *holder.arena));
+  return holder;
 }
 
 // Reads a faiss::IndexFlat from a directory file.
@@ -136,18 +144,23 @@ std::unique_ptr<faiss::Index> readFaissIndex(Directory& dir, std::string_view fn
   return std::unique_ptr<faiss::Index>(faiss::read_index(&r));
 }
 
-VectorAuxMeta readVectorAuxMeta(const proto::AuxIndexInfo& aux) {
-  return VectorAuxMeta::fromBytes(aux.opaque_meta(), aux.name());
+VectorAuxMeta readVectorAuxMeta(const solux::api::AuxIndexInfo& aux) {
+  return VectorAuxMeta::fromBytes(
+      std::string_view((const char*)aux.opaque_meta.data(), aux.opaque_meta.size()), aux.name);
 }
 
-std::vector<const proto::AuxIndexInfo*> vectorOverlays(const proto::IndexInfo* info) {
-  std::vector<const proto::AuxIndexInfo*> out;
-  for (const auto& seg : info->segments()) {
-    for (const auto& overlay : seg.overlays()) {
-      if (overlay.kind() == VectorIndexBuilder::KIND) out.push_back(&overlay);
+std::vector<const solux::api::AuxIndexInfo*> vectorOverlays(const solux::api::IndexInfo* info) {
+  std::vector<const solux::api::AuxIndexInfo*> out;
+  for (const auto& seg : info->segments) {
+    for (const auto& overlay : seg.overlays) {
+      if (overlay.kind == VectorIndexBuilder::KIND) out.push_back(&overlay);
     }
   }
   return out;
+}
+
+std::vector<const solux::api::AuxIndexInfo*> vectorOverlays(const IndexInfoHolder& info) {
+  return vectorOverlays(&info.info);
 }
 
 std::vector<std::string> vectorOverlayFiles(Directory& dir) {
@@ -178,7 +191,7 @@ bool commitForTest(CollectionHelper& h,
     Blocker blocker;
     bool success = false;
 
-    explicit BlockingProtoUpdateMessage(proto::UpdateRequest* req) : ProtoUpdateMessage(req) {}
+    explicit BlockingProtoUpdateMessage(const ProtoUpdateMessage::RequestProto* req) : ProtoUpdateMessage(req) {}
 
     void done(IndexWriter& iw) override {
       unused(iw);
@@ -187,13 +200,18 @@ bool commitForTest(CollectionHelper& h,
     }
   };
 
-  google::protobuf::Arena arena;
-  auto* request = google::protobuf::Arena::Create<proto::UpdateRequest>(&arena);
-  auto* params = request->mutable_commit();
-  for (const auto& name : buildAuxIndexes) params->add_build_aux_indexes(name);
-  params->set_wait_for_merges(waitForMerges);
+  // Build the non-owning commit request directly into a local arena (lives across the
+  // blocking submit + wait below).
+  std::pmr::monotonic_buffer_resource mr;
+  solux::api::UpdateRequest request;
+  auto& params = request.commit.emplace();
+  if (!buildAuxIndexes.empty()) {
+    std::string_view* a = solux::api::build::allocArray(params.build_aux_indexes, buildAuxIndexes.size(), mr);
+    for (size_t i = 0; i < buildAuxIndexes.size(); i++) a[i] = solux::api::build::arenaStr(mr, buildAuxIndexes[i]);
+  }
+  params.wait_for_merges = waitForMerges;
 
-  BlockingProtoUpdateMessage msg(request);
+  BlockingProtoUpdateMessage msg(&request);
   bool submitted = h.getIndexWriter()->submitUpdate(&msg);
   assert(submitted);
   unused(submitted);
@@ -214,21 +232,26 @@ int64_t vectorMergeBuildCount() {
   return VectorIndexBuilder::ivfPqMergeBuildCountForTests.load(std::memory_order_relaxed);
 }
 
-const proto::AuxIndexInfo& onlyVectorOverlay(const proto::IndexInfo* info) {
+const solux::api::AuxIndexInfo& onlyVectorOverlay(const solux::api::IndexInfo* info) {
   auto overlays = vectorOverlays(info);
   EXPECT_EQ(overlays.size(), 1u);
   return *overlays[0];
 }
 
+const solux::api::AuxIndexInfo& onlyVectorOverlay(const IndexInfoHolder& info) {
+  return onlyVectorOverlay(&info.info);
+}
+
 // Install a schema where _v has metric=L2.
 void enableL2OnVecSuffix(Collection& col) {
-  proto::SchemaDef def;
-  auto* f = def.add_fields();
-  f->set_name("_v");
-  f->set_field_class(proto::FieldDef::VECTOR);
-  f->set_abstract(true);
-  f->set_column_stored(true);
-  f->mutable_vector()->set_metric(proto::VectorParams::L2);
+  std::pmr::monotonic_buffer_resource mr;
+  solux::api::SchemaDef def;
+  auto* f = solux::api::build::allocArray(def.fields, 1, mr);
+  f->name = "_v";
+  f->field_class = solux::api::FieldDef_::FieldClass::VECTOR;
+  f->abstract = true;
+  f->column_stored = true;
+  f->vector.emplace().metric = solux::api::VectorParams_::Metric::L2;
 
   // fromProto with the existing schema as base preserves all built-in fields and
   // overrides _v with the metric-bearing definition.
@@ -240,34 +263,20 @@ std::vector<std::string> runKnnIds(SearchEngine& engine, std::string_view field,
                                   const std::vector<float>& queryVec, int32_t k,
                                   int32_t nprobe = 0, int32_t refineCandidates = 0,
                                   bool exact = false) {
-  auto* req = LocalReq::create(engine);
-  req->proto.mutable_collection()->add_name("main");
-  auto& topDocs = *(*req->proto.mutable_ops())["q"].mutable_top_docs();
-  topDocs.set_get_number(true);
-  topDocs.mutable_fields()->Add("id");
-  auto& knn = *topDocs.mutable_query()->mutable_knn();
-  knn.set_field(field);
-  knn.set_k(k);
-  if (nprobe > 0) knn.set_nprobe(nprobe);
-  if (refineCandidates > 0) knn.set_refine_candidates(refineCandidates);
-  if (exact) knn.set_exact(true);
-  auto& f32 = *knn.mutable_query()->mutable_f32();
-  for (float v : queryVec) f32.add_v(v);
+  auto req = localReq(engine);
+  auto& cur = req->collection("main").topDocs("q").getNumber().fields({"id"});
+  cur.rawQuery() = qb::knn(cur.mr(), field, queryVec, k, nprobe, exact, refineCandidates);
 
   req->execute();
+  EXPECT_OK(req);
   std::vector<std::string> ids;
-  if (!req->responses.empty()) {
-    const auto& response = req->responses[0]->proto;
-    EXPECT_TRUE(response.error().empty()) << response.error();
-    auto opIt = response.ops().find("q");
-    if (opIt != response.ops().end()) {
-      auto idIt = opIt->second.docs().columns().find("id");
-      if (idIt != opIt->second.docs().columns().end()) {
-        for (const auto& id : idIt->second.col_s().v()) ids.push_back(id);
+  if (const auto* dl = req->docList("q")) {
+    if (const auto* p = dl->columns.find("id")) {
+      if (const auto* col = std::get_if<solux::api::ColStr>(&p->kind)) {
+        for (auto id : col->v) ids.emplace_back(id);
       }
     }
   }
-  req->done();
   return ids;
 }
 
@@ -296,18 +305,17 @@ TEST_F(VectorIndexBuilderTest, basicBuildSingleSegment) {
 
   auto& shardDir = h.getIndexWriter()->dir;
 
-  google::protobuf::Arena arena;
-  auto* info = readIndexInfo(shardDir, arena);
-  EXPECT_EQ(0, info->aux_indexes_size());
+  auto info = readIndexInfo(shardDir);
+  EXPECT_EQ(0, info->aux_indexes.size());
   const auto& aux = onlyVectorOverlay(info);
-  EXPECT_EQ(aux.kind(), "vector_faiss");
-  EXPECT_EQ(aux.field(), "embedding_v");
-  EXPECT_EQ(aux.name(), "vec.embedding_v");
-  EXPECT_EQ(aux.built_core_gen(), 0u);
-  ASSERT_EQ(aux.files_size(), 1);
+  EXPECT_EQ(aux.kind, "vector_faiss");
+  EXPECT_EQ(aux.field, "embedding_v");
+  EXPECT_EQ(aux.name, "vec.embedding_v");
+  EXPECT_EQ(aux.built_core_gen, 0u);
+  ASSERT_EQ(aux.files.size(), 1);
 
   // Read and verify the FAISS index.
-  auto idx = readFaissIndex(shardDir, aux.files(0));
+  auto idx = readFaissIndex(shardDir, aux.files[0]);
   ASSERT_NE(idx, nullptr);
   EXPECT_EQ(idx->d, 4);
   EXPECT_EQ(idx->ntotal, (faiss::idx_t)vecs.size());
@@ -333,10 +341,9 @@ TEST_F(VectorIndexBuilderTest, ivfListsServeIdenticallyFromFsDirectoryMmap) {
   h.commit({"*"});
 
   auto& shardDir = h.getIndexWriter()->dir;
-  google::protobuf::Arena arena;
-  auto* info = readIndexInfo(shardDir, arena);
+  auto info = readIndexInfo(shardDir);
   const auto& aux = onlyVectorOverlay(info);
-  ASSERT_EQ(aux.files_size(), 1);
+  ASSERT_EQ(aux.files.size(), 1);
 
   auto ramAux = VectorAuxReader::open(shardDir, aux, /*missingFileOK=*/false);
   ASSERT_NE(ramAux, nullptr);
@@ -348,10 +355,10 @@ TEST_F(VectorIndexBuilderTest, ivfListsServeIdenticallyFromFsDirectoryMmap) {
   std::filesystem::path tmp(tmpl);
   {
     FSDirectory fsDir(tmp);
-    auto src = shardDir.openFile(aux.files(0));
+    auto src = shardDir.openFile(aux.files[0]);
     ASSERT_NE(src, nullptr);
     auto bytes = src->read();
-    auto dst = fsDir.createFile(aux.files(0));
+    auto dst = fsDir.createFile(aux.files[0]);
     OutputStream os;
     os.setFile(&*dst);
     os.write(bytes.data(), bytes.size());
@@ -386,9 +393,8 @@ TEST_F(VectorIndexBuilderTest, noBuildWhenSelectorsEmpty) {
   Doc d = flatdoc("id", std::string("a"), "embedding_v", std::vector<float>{1, 0, 0});
   h.index(d, UpdateMessage::COMMIT);
 
-  google::protobuf::Arena arena;
-  auto* info = readIndexInfo(h.getIndexWriter()->dir, arena);
-  EXPECT_EQ(0, info->aux_indexes_size());
+  auto info = readIndexInfo(h.getIndexWriter()->dir);
+  EXPECT_EQ(0, info->aux_indexes.size());
   EXPECT_EQ(vectorOverlays(info).size(), 0u);
 }
 
@@ -413,21 +419,20 @@ TEST_F(VectorIndexBuilderTest, buildAcrossMultipleSegments) {
   // Final commit triggers the build over all three segments.
   h.commit({"vec.embedding_v"});
 
-  google::protobuf::Arena arena;
-  auto* info = readIndexInfo(h.getIndexWriter()->dir, arena);
-  EXPECT_EQ(0, info->aux_indexes_size());
+  auto info = readIndexInfo(h.getIndexWriter()->dir);
+  EXPECT_EQ(0, info->aux_indexes.size());
   auto overlays = vectorOverlays(info);
   ASSERT_EQ(overlays.size(), 3u);
 
   for (const auto* aux : overlays) {
-    ASSERT_EQ(aux->files_size(), 1);
-    auto idx = readFaissIndex(h.getIndexWriter()->dir, aux->files(0));
+    ASSERT_EQ(aux->files.size(), 1);
+    auto idx = readFaissIndex(h.getIndexWriter()->dir, aux->files[0]);
     EXPECT_EQ(idx->d, 3);
     EXPECT_EQ(idx->ntotal, 80);
 
     auto meta = readVectorAuxMeta(*aux);
     EXPECT_EQ(meta.dims, 3);
-    EXPECT_EQ(meta.metric, (int32_t)proto::VectorParams::L2);
+    EXPECT_EQ(meta.metric, (int32_t)solux::api::VectorParams_::Metric::L2);
     EXPECT_EQ(meta.cosineNormalizeColumnOnRescore, 0);
   }
 }
@@ -442,9 +447,8 @@ TEST_F(VectorIndexBuilderTest, selectorMiss) {
   h.index(d);
   h.commit({"vec.does_not_exist_v"});
 
-  google::protobuf::Arena arena;
-  auto* info = readIndexInfo(h.getIndexWriter()->dir, arena);
-  EXPECT_EQ(0, info->aux_indexes_size());
+  auto info = readIndexInfo(h.getIndexWriter()->dir);
+  EXPECT_EQ(0, info->aux_indexes.size());
   EXPECT_EQ(vectorOverlays(info).size(), 0u);
 }
 
@@ -463,21 +467,19 @@ TEST_F(VectorIndexBuilderTest, carryForwardOnDeleteOnlyCommit) {
   }
   h.commit({"*"});
 
-  google::protobuf::Arena arena1;
-  auto* info1 = readIndexInfo(h.getIndexWriter()->dir, arena1);
+  auto info1 = readIndexInfo(h.getIndexWriter()->dir);
   const auto& orig = onlyVectorOverlay(info1);
-  std::vector<std::string> origFiles(orig.files().begin(), orig.files().end());
+  std::vector<std::string> origFiles(orig.files.begin(), orig.files.end());
 
   // Delete one doc and commit - segment composition unchanged.
   std::vector<std::string> ids{"doc0"};
   h.deleteByIds(ids, UpdateMessage::COMMIT);
 
-  google::protobuf::Arena arena2;
-  auto* info2 = readIndexInfo(h.getIndexWriter()->dir, arena2);
+  auto info2 = readIndexInfo(h.getIndexWriter()->dir);
   const auto& carried = onlyVectorOverlay(info2);
-  EXPECT_EQ(carried.name(), "vec.embedding_v");
-  EXPECT_EQ(carried.built_core_gen(), 0u);
-  EXPECT_EQ(std::vector<std::string>(carried.files().begin(), carried.files().end()), origFiles);
+  EXPECT_EQ(carried.name, "vec.embedding_v");
+  EXPECT_EQ(carried.built_core_gen, 0u);
+  EXPECT_EQ(std::vector<std::string>(carried.files.begin(), carried.files.end()), origFiles);
   // Files survive on disk.
   for (const auto& f : origFiles) {
     EXPECT_NE(h.getIndexWriter()->dir.openFile(f), nullptr) << "carried file: " << f;
@@ -499,20 +501,18 @@ TEST_F(VectorIndexBuilderTest, segmentChangeCarriesExistingOverlay) {
   }
   h.commit({"*"});
 
-  google::protobuf::Arena arena1;
-  auto* info1 = readIndexInfo(h.getIndexWriter()->dir, arena1);
+  auto info1 = readIndexInfo(h.getIndexWriter()->dir);
   const auto& orig = onlyVectorOverlay(info1);
-  std::vector<std::string> origFiles(orig.files().begin(), orig.files().end());
+  std::vector<std::string> origFiles(orig.files.begin(), orig.files.end());
 
   // Index one tiny segment and commit without rebuild.
   Doc d2 = flatdoc("id", std::string("b"), "embedding_v", std::vector<float>{0, 1, 0});
   h.index(d2, UpdateMessage::COMMIT);
 
-  google::protobuf::Arena arena2;
-  auto* info2 = readIndexInfo(h.getIndexWriter()->dir, arena2);
+  auto info2 = readIndexInfo(h.getIndexWriter()->dir);
   auto overlays = vectorOverlays(info2);
   ASSERT_EQ(overlays.size(), 1u);
-  EXPECT_EQ(std::vector<std::string>(overlays[0]->files().begin(), overlays[0]->files().end()), origFiles);
+  EXPECT_EQ(std::vector<std::string>(overlays[0]->files.begin(), overlays[0]->files.end()), origFiles);
   for (const auto& f : origFiles) {
     EXPECT_NE(h.getIndexWriter()->dir.openFile(f), nullptr) << "carried file: " << f;
   }
@@ -542,8 +542,7 @@ TEST_F(VectorIndexBuilderTest, plainCommitDoesNotAutoBuild) {
   h.commit();  // plain: no selectors, no inference
   EXPECT_EQ(vectorCommitBuildCount(), 0);
 
-  google::protobuf::Arena arena;
-  auto* info = readIndexInfo(h.getIndexWriter()->dir, arena);
+  auto info = readIndexInfo(h.getIndexWriter()->dir);
   EXPECT_EQ(vectorOverlays(info).size(), 1u) << "only the first segment's overlay exists";
 
   // The explicit selector then builds the missing one.
@@ -566,15 +565,14 @@ TEST_F(VectorIndexBuilderTest, carryForwardBuildsOnlyNewAboveThresholdSegment) {
   h.commit({"*"});
   EXPECT_EQ(vectorCommitBuildCount(), 1);
 
-  google::protobuf::Arena arena1;
-  auto* info1 = readIndexInfo(h.getIndexWriter()->dir, arena1);
+  auto info1 = readIndexInfo(h.getIndexWriter()->dir);
   auto overlays1 = vectorOverlays(info1);
   ASSERT_EQ(overlays1.size(), 1u);
-  std::string firstFile{overlays1[0]->files(0)};
+  std::string firstFile{overlays1[0]->files[0]};
   // Overlay filename convention: segment-prefixed like liveDocs -
   // s<segId>__<name>_<gen>_<fnum> - so ls groups overlays with their segment.
   EXPECT_TRUE(firstFile.starts_with(
-      Postings::getIndexFileNamePrefix(info1->segments(0).seg_id()) + "__vec.embedding_v_"))
+      Postings::getIndexFileNamePrefix(info1->segments[0].seg_id) + "__vec.embedding_v_"))
       << "unexpected overlay filename: " << firstFile;
 
   for (int i = 0; i < 80; i++) {
@@ -585,15 +583,14 @@ TEST_F(VectorIndexBuilderTest, carryForwardBuildsOnlyNewAboveThresholdSegment) {
   h.commit({"*"});
   EXPECT_EQ(vectorCommitBuildCount(), 1);
 
-  google::protobuf::Arena arena2;
-  auto* info2 = readIndexInfo(h.getIndexWriter()->dir, arena2);
+  auto info2 = readIndexInfo(h.getIndexWriter()->dir);
   auto overlays2 = vectorOverlays(info2);
   ASSERT_EQ(overlays2.size(), 2u);
   int carried = 0;
   int fresh = 0;
   for (const auto* overlay : overlays2) {
-    ASSERT_EQ(overlay->files_size(), 1);
-    if (overlay->files(0) == firstFile) {
+    ASSERT_EQ(overlay->files.size(), 1);
+    if (overlay->files[0] == firstFile) {
       carried++;
     } else {
       fresh++;
@@ -616,9 +613,8 @@ TEST_F(VectorIndexBuilderTest, littleCommitDoesNoAnnWorkAndMatchesExact) {
   }
   h.commit({"*"});
 
-  google::protobuf::Arena arena1;
-  auto* info1 = readIndexInfo(h.getIndexWriter()->dir, arena1);
-  std::string firstFile{onlyVectorOverlay(info1).files(0)};
+  auto info1 = readIndexInfo(h.getIndexWriter()->dir);
+  std::string firstFile{onlyVectorOverlay(info1).files[0]};
 
   VectorIndexBuilder::ivfPqBuildThresholdScanCost = 1000;
   resetVectorBuildCounters();
@@ -627,11 +623,10 @@ TEST_F(VectorIndexBuilderTest, littleCommitDoesNoAnnWorkAndMatchesExact) {
   h.commit();
   EXPECT_EQ(vectorCommitBuildCount(), 0);
 
-  google::protobuf::Arena arena2;
-  auto* info2 = readIndexInfo(h.getIndexWriter()->dir, arena2);
+  auto info2 = readIndexInfo(h.getIndexWriter()->dir);
   auto overlays = vectorOverlays(info2);
   ASSERT_EQ(overlays.size(), 1u);
-  EXPECT_EQ(overlays[0]->files(0), firstFile);
+  EXPECT_EQ(overlays[0]->files[0], firstFile);
 
   auto approx = runKnnIds(h.getSearchEngine(), "embedding_v",
                           {100.0f, 0.0f, 0.0f, 0.0f}, 3,
@@ -656,11 +651,10 @@ TEST_F(VectorIndexBuilderTest, rebuildWithoutReindex) {
   }
   h.commit({"*"});
 
-  google::protobuf::Arena arena1;
-  auto* info1 = readIndexInfo(h.getIndexWriter()->dir, arena1);
+  auto info1 = readIndexInfo(h.getIndexWriter()->dir);
   const auto& first = onlyVectorOverlay(info1);
-  std::string firstFile{first.files(0)};
-  EXPECT_EQ(first.gen(), 0u);
+  std::string firstFile{first.files[0]};
+  EXPECT_EQ(first.gen, 0u);
   EXPECT_TRUE(firstFile.ends_with("_00_00")) << firstFile;
 
   ASSERT_TRUE(h.getIndexWriter()->testDropSegmentOverlay("vec.embedding_v", 0));
@@ -668,13 +662,12 @@ TEST_F(VectorIndexBuilderTest, rebuildWithoutReindex) {
   h.commit({"vec.embedding_v"});
   EXPECT_EQ(vectorCommitBuildCount(), 1);
 
-  google::protobuf::Arena arena2;
-  auto* info2 = readIndexInfo(h.getIndexWriter()->dir, arena2);
+  auto info2 = readIndexInfo(h.getIndexWriter()->dir);
   const auto& rebuilt = onlyVectorOverlay(info2);
-  ASSERT_EQ(rebuilt.files_size(), 1);
-  EXPECT_EQ(rebuilt.gen(), 1u);
-  EXPECT_NE(rebuilt.files(0), firstFile);
-  EXPECT_TRUE(std::string(rebuilt.files(0)).ends_with("_01_00")) << rebuilt.files(0);
+  ASSERT_EQ(rebuilt.files.size(), 1);
+  EXPECT_EQ(rebuilt.gen, 1u);
+  EXPECT_NE(rebuilt.files[0], firstFile);
+  EXPECT_TRUE(std::string(rebuilt.files[0]).ends_with("_01_00")) << rebuilt.files[0];
   EXPECT_EQ(h.getIndexWriter()->dir.openFile(firstFile), nullptr);
 
   auto ids = runKnnIds(h.getSearchEngine(), "embedding_v",
@@ -702,21 +695,19 @@ TEST_F(VectorIndexBuilderTest, mergeDropsOldOverlayFiles) {
     h.commit({"*"});
   }
 
-  google::protobuf::Arena arena1;
-  auto* info1 = readIndexInfo(h.getIndexWriter()->dir, arena1);
+  auto info1 = readIndexInfo(h.getIndexWriter()->dir);
   auto oldOverlays = vectorOverlays(info1);
   ASSERT_EQ(oldOverlays.size(), 2u);
   std::vector<std::string> oldFiles;
-  for (const auto* overlay : oldOverlays) oldFiles.emplace_back(overlay->files(0));
+  for (const auto* overlay : oldOverlays) oldFiles.emplace_back(overlay->files[0]);
 
   h.getIndexWriter()->mergeSegments();
   h.commit();
 
-  google::protobuf::Arena arena2;
-  auto* info2 = readIndexInfo(h.getIndexWriter()->dir, arena2);
-  ASSERT_EQ(info2->segments_size(), 1);
+  auto info2 = readIndexInfo(h.getIndexWriter()->dir);
+  ASSERT_EQ(info2->segments.size(), 1);
   const auto& aux = onlyVectorOverlay(info2);
-  std::vector<std::string> newFiles(aux.files().begin(), aux.files().end());
+  std::vector<std::string> newFiles(aux.files.begin(), aux.files.end());
 
   // Old files should be gone.
   for (const auto& f : oldFiles) {
@@ -726,7 +717,7 @@ TEST_F(VectorIndexBuilderTest, mergeDropsOldOverlayFiles) {
   for (const auto& f : newFiles) {
     EXPECT_NE(h.getIndexWriter()->dir.openFile(f), nullptr) << "new file should exist: " << f;
   }
-  auto idx = readFaissIndex(h.getIndexWriter()->dir, aux.files(0));
+  auto idx = readFaissIndex(h.getIndexWriter()->dir, aux.files[0]);
   EXPECT_EQ(idx->ntotal, 160);
 }
 
@@ -766,12 +757,11 @@ TEST_F(VectorIndexBuilderTest, mergeBuildsOverlayBeforePlainPublishDuringActiveI
       << "plain publication commit should not run ANN builds";
   EXPECT_EQ(vectorMergeBuildCount(), 1);
 
-  google::protobuf::Arena arena;
-  auto* info = readIndexInfo(h.getIndexWriter()->dir, arena);
-  ASSERT_EQ(info->segments_size(), 2);
+  auto info = readIndexInfo(h.getIndexWriter()->dir);
+  ASSERT_EQ(info->segments.size(), 2);
   auto overlays = vectorOverlays(info);
   ASSERT_EQ(overlays.size(), 1u);
-  auto idx = readFaissIndex(h.getIndexWriter()->dir, overlays[0]->files(0));
+  auto idx = readFaissIndex(h.getIndexWriter()->dir, overlays[0]->files[0]);
   EXPECT_EQ(idx->ntotal, 160);
 
   auto afterApprox = runKnnIds(h.getSearchEngine(), "embedding_v",
@@ -812,13 +802,12 @@ TEST_F(VectorIndexBuilderTest, mergePromotesBelowThresholdSegmentsForActiveField
   EXPECT_EQ(vectorCommitBuildCount(), 0);
   EXPECT_EQ(vectorMergeBuildCount(), 1);
 
-  google::protobuf::Arena arena;
-  auto* info = readIndexInfo(iw->dir, arena);
+  auto info = readIndexInfo(iw->dir);
   auto overlays = vectorOverlays(info);
   ASSERT_EQ(overlays.size(), 2u);
   bool sawMergedSmall = false;
   for (const auto* overlay : overlays) {
-    auto idx = readFaissIndex(iw->dir, overlay->files(0));
+    auto idx = readFaissIndex(iw->dir, overlay->files[0]);
     if (idx->ntotal == 158) {
       sawMergedSmall = true;
     }
@@ -851,9 +840,8 @@ TEST_F(VectorIndexBuilderTest, belowThresholdMergedOutputBuildsNoOverlay) {
   EXPECT_EQ(vectorCommitBuildCount(), 0);
   EXPECT_EQ(vectorMergeBuildCount(), 0);
 
-  google::protobuf::Arena arena;
-  auto* info = readIndexInfo(iw->dir, arena);
-  ASSERT_EQ(info->segments_size(), 1);
+  auto info = readIndexInfo(iw->dir);
+  ASSERT_EQ(info->segments.size(), 1);
   EXPECT_EQ(vectorOverlays(info).size(), 0u);
 
   auto approx = runKnnIds(h.getSearchEngine(), "embedding_v",
@@ -884,8 +872,7 @@ TEST_F(VectorIndexBuilderTest, explicitActivationBelowThresholdPromotesInProcess
     }
   }
 
-  google::protobuf::Arena arena1;
-  auto* info1 = readIndexInfo(h.getIndexWriter()->dir, arena1);
+  auto info1 = readIndexInfo(h.getIndexWriter()->dir);
   EXPECT_EQ(vectorOverlays(info1).size(), 0u);
 
   resetVectorBuildCounters();
@@ -894,11 +881,10 @@ TEST_F(VectorIndexBuilderTest, explicitActivationBelowThresholdPromotesInProcess
   EXPECT_EQ(vectorCommitBuildCount(), 0);
   EXPECT_EQ(vectorMergeBuildCount(), 1);
 
-  google::protobuf::Arena arena2;
-  auto* info2 = readIndexInfo(h.getIndexWriter()->dir, arena2);
-  ASSERT_EQ(info2->segments_size(), 1);
+  auto info2 = readIndexInfo(h.getIndexWriter()->dir);
+  ASSERT_EQ(info2->segments.size(), 1);
   const auto& aux = onlyVectorOverlay(info2);
-  auto idx = readFaissIndex(h.getIndexWriter()->dir, aux.files(0));
+  auto idx = readFaissIndex(h.getIndexWriter()->dir, aux.files[0]);
   EXPECT_EQ(idx->ntotal, 158);
 }
 
@@ -927,11 +913,10 @@ TEST_F(VectorIndexBuilderTest, explicitActivationOnEmptyIndexPromotesLaterMerge)
   EXPECT_EQ(vectorCommitBuildCount(), 0);
   EXPECT_EQ(vectorMergeBuildCount(), 1);
 
-  google::protobuf::Arena arena;
-  auto* info = readIndexInfo(iw->dir, arena);
-  ASSERT_EQ(info->segments_size(), 1);
+  auto info = readIndexInfo(iw->dir);
+  ASSERT_EQ(info->segments.size(), 1);
   const auto& aux = onlyVectorOverlay(info);
-  auto idx = readFaissIndex(iw->dir, aux.files(0));
+  auto idx = readFaissIndex(iw->dir, aux.files[0]);
   EXPECT_EQ(idx->ntotal, 158);
 }
 
@@ -983,9 +968,8 @@ TEST_F(VectorIndexBuilderTest, intentOnlyActivationIsNotSeededAfterRestart) {
     }
   }
 
-  google::protobuf::Arena arena;
-  auto* info = readIndexInfo(iw->dir, arena);
-  ASSERT_EQ(info->segments_size(), 2);
+  auto info = readIndexInfo(iw->dir);
+  ASSERT_EQ(info->segments.size(), 2);
   EXPECT_EQ(vectorOverlays(info).size(), 0u);
   EXPECT_TRUE(iw->testActiveVectorOverlayName("vec.embedding_v"));
 
@@ -998,9 +982,8 @@ TEST_F(VectorIndexBuilderTest, intentOnlyActivationIsNotSeededAfterRestart) {
   EXPECT_EQ(vectorCommitBuildCount(), 0);
   EXPECT_EQ(vectorMergeBuildCount(), 0);
 
-  google::protobuf::Arena arena2;
-  auto* info2 = readIndexInfo(iw->dir, arena2);
-  ASSERT_EQ(info2->segments_size(), 1);
+  auto info2 = readIndexInfo(iw->dir);
+  ASSERT_EQ(info2->segments.size(), 1);
   EXPECT_EQ(vectorOverlays(info2).size(), 0u);
 
   resetVectorBuildCounters();
@@ -1037,8 +1020,7 @@ TEST_F(VectorIndexBuilderTest, failedMultiFieldCommitDoesNotPublishPartialOverla
 
   h.commit();
 
-  google::protobuf::Arena arena;
-  auto* info = readIndexInfo(iw->dir, arena);
+  auto info = readIndexInfo(iw->dir);
   EXPECT_EQ(vectorOverlays(info).size(), 0u);
   EXPECT_FALSE(iw->testActiveVectorOverlayName("vec.a_v"));
   EXPECT_FALSE(iw->testActiveVectorOverlayName("vec.b_v"));
@@ -1075,9 +1057,8 @@ TEST_F(VectorIndexBuilderTest, mergeOverlayFailurePublishesFlatAndClearsMergeGat
   EXPECT_FALSE(iw->testMergeRunning());
   EXPECT_TRUE(commitForTest(h, {}, /*waitForMerges=*/true));
 
-  google::protobuf::Arena arena1;
-  auto* info1 = readIndexInfo(iw->dir, arena1);
-  ASSERT_EQ(info1->segments_size(), 1);
+  auto info1 = readIndexInfo(iw->dir);
+  ASSERT_EQ(info1->segments.size(), 1);
   EXPECT_EQ(vectorOverlays(info1).size(), 0u);
   EXPECT_TRUE(vectorOverlayFiles(iw->dir).empty());
 
@@ -1086,8 +1067,7 @@ TEST_F(VectorIndexBuilderTest, mergeOverlayFailurePublishesFlatAndClearsMergeGat
   EXPECT_EQ(vectorCommitBuildCount(), 2);
   EXPECT_EQ(vectorMergeBuildCount(), 0);
 
-  google::protobuf::Arena arena2;
-  auto* info2 = readIndexInfo(iw->dir, arena2);
+  auto info2 = readIndexInfo(iw->dir);
   EXPECT_EQ(vectorOverlays(info2).size(), 2u);
 }
 
@@ -1127,9 +1107,8 @@ TEST_F(VectorIndexBuilderTest, mergedPostingsReaderFailureRestoresSourcesAndClea
   EXPECT_TRUE(segmentPrefixAbsent(iw->dir, failure->outputSegId));
   EXPECT_TRUE(commitForTest(h, {}, /*waitForMerges=*/true));
 
-  google::protobuf::Arena arena1;
-  auto* info1 = readIndexInfo(iw->dir, arena1);
-  ASSERT_EQ(info1->segments_size(), 2);
+  auto info1 = readIndexInfo(iw->dir);
+  ASSERT_EQ(info1->segments.size(), 2);
   EXPECT_EQ(vectorOverlays(info1).size(), 0u);
 
   resetVectorBuildCounters();
@@ -1138,9 +1117,8 @@ TEST_F(VectorIndexBuilderTest, mergedPostingsReaderFailureRestoresSourcesAndClea
   EXPECT_EQ(vectorCommitBuildCount(), 0);
   EXPECT_EQ(vectorMergeBuildCount(), 1);
 
-  google::protobuf::Arena arena2;
-  auto* info2 = readIndexInfo(iw->dir, arena2);
-  ASSERT_EQ(info2->segments_size(), 1);
+  auto info2 = readIndexInfo(iw->dir);
+  ASSERT_EQ(info2->segments.size(), 1);
   EXPECT_EQ(vectorOverlays(info2).size(), 1u);
 }
 
@@ -1240,13 +1218,14 @@ TEST_F(VectorIndexBuilderTest, cosineNormalizeOnWriteBuildsInnerProductIndex) {
   h.clear();
 
   // Schema: _v with metric=COSINE.
-  proto::SchemaDef def;
-  auto* f = def.add_fields();
-  f->set_name("_v");
-  f->set_field_class(proto::FieldDef::VECTOR);
-  f->set_abstract(true);
-  f->set_column_stored(true);
-  f->mutable_vector()->set_metric(proto::VectorParams::COSINE);
+  std::pmr::monotonic_buffer_resource mr;
+  solux::api::SchemaDef def;
+  auto* f = solux::api::build::allocArray(def.fields, 1, mr);
+  f->name = "_v";
+  f->field_class = solux::api::FieldDef_::FieldClass::VECTOR;
+  f->abstract = true;
+  f->column_stored = true;
+  f->vector.emplace().metric = solux::api::VectorParams_::Metric::COSINE;
   h.collection().setSchema(Schema::fromProto(def, h.collection().getSchema().get()));
 
   for (int i = 0; i < 80; i++) {
@@ -1255,12 +1234,11 @@ TEST_F(VectorIndexBuilderTest, cosineNormalizeOnWriteBuildsInnerProductIndex) {
   }
   h.commit({"*"});
 
-  google::protobuf::Arena arena;
-  auto* info = readIndexInfo(h.getIndexWriter()->dir, arena);
+  auto info = readIndexInfo(h.getIndexWriter()->dir);
   auto& aux = onlyVectorOverlay(info);
   auto meta = readVectorAuxMeta(aux);
   EXPECT_EQ(meta.cosineNormalizeColumnOnRescore, 0);
-  auto idx = readFaissIndex(h.getIndexWriter()->dir, aux.files(0));
+  auto idx = readFaissIndex(h.getIndexWriter()->dir, aux.files[0]);
   EXPECT_EQ(idx->metric_type, faiss::METRIC_INNER_PRODUCT);
   EXPECT_EQ(idx->ntotal, 80);
 }
@@ -1272,14 +1250,16 @@ TEST_F(VectorIndexBuilderTest, normalizedFlagSkipsRenorm) {
   CollectionHelper h("main");
   h.clear();
 
-  proto::SchemaDef def;
-  auto* f = def.add_fields();
-  f->set_name("_v");
-  f->set_field_class(proto::FieldDef::VECTOR);
-  f->set_abstract(true);
-  f->set_column_stored(true);
-  f->mutable_vector()->set_metric(proto::VectorParams::COSINE);
-  f->mutable_vector()->set_normalized(true);
+  std::pmr::monotonic_buffer_resource mr;
+  solux::api::SchemaDef def;
+  auto* f = solux::api::build::allocArray(def.fields, 1, mr);
+  f->name = "_v";
+  f->field_class = solux::api::FieldDef_::FieldClass::VECTOR;
+  f->abstract = true;
+  f->column_stored = true;
+  auto& vector = f->vector.emplace();
+  vector.metric = solux::api::VectorParams_::Metric::COSINE;
+  vector.normalized = true;
   h.collection().setSchema(Schema::fromProto(def, h.collection().getSchema().get()));
 
   for (int i = 0; i < 80; i++) {
@@ -1288,12 +1268,11 @@ TEST_F(VectorIndexBuilderTest, normalizedFlagSkipsRenorm) {
   }
   h.commit({"*"});
 
-  google::protobuf::Arena arena;
-  auto* info = readIndexInfo(h.getIndexWriter()->dir, arena);
+  auto info = readIndexInfo(h.getIndexWriter()->dir);
   auto& aux = onlyVectorOverlay(info);
   auto meta = readVectorAuxMeta(aux);
   EXPECT_EQ(meta.cosineNormalizeColumnOnRescore, 0);
-  auto idx = readFaissIndex(h.getIndexWriter()->dir, aux.files(0));
+  auto idx = readFaissIndex(h.getIndexWriter()->dir, aux.files[0]);
   EXPECT_EQ(idx->ntotal, 80);
 }
 
@@ -1312,9 +1291,8 @@ TEST_F(VectorIndexBuilderTest, rebuildSkippedWhenStillValid) {
   }
   h.commit({"*"});
 
-  google::protobuf::Arena arena1;
-  auto* info1 = readIndexInfo(h.getIndexWriter()->dir, arena1);
-  std::string origFile{onlyVectorOverlay(info1).files(0)};
+  auto info1 = readIndexInfo(h.getIndexWriter()->dir);
+  std::string origFile{onlyVectorOverlay(info1).files[0]};
 
   // Delete-only commit (coreGen unchanged) that *also* requests a rebuild via
   // "*".  The rebuild should be a no-op because the carried entry is still
@@ -1323,9 +1301,8 @@ TEST_F(VectorIndexBuilderTest, rebuildSkippedWhenStillValid) {
   h.deleteByIds(ids);
   h.commit({"*"});
 
-  google::protobuf::Arena arena2;
-  auto* info2 = readIndexInfo(h.getIndexWriter()->dir, arena2);
-  EXPECT_EQ(onlyVectorOverlay(info2).files(0), origFile)
+  auto info2 = readIndexInfo(h.getIndexWriter()->dir);
+  EXPECT_EQ(onlyVectorOverlay(info2).files[0], origFile)
       << "filename should be unchanged (no rebuild)";
   EXPECT_NE(h.getIndexWriter()->dir.openFile(origFile), nullptr);
 }
@@ -1343,14 +1320,16 @@ TEST_F(VectorIndexBuilderTest, cosineRenormChunkBoundaries) {
   CollectionHelper h("main");
   h.clear();
 
-  proto::SchemaDef def;
-  auto* f = def.add_fields();
-  f->set_name("_v");
-  f->set_field_class(proto::FieldDef::VECTOR);
-  f->set_abstract(true);
-  f->set_column_stored(true);
-  f->mutable_vector()->set_metric(proto::VectorParams::COSINE);
-  f->mutable_vector()->set_normalize_on_write(false);
+  std::pmr::monotonic_buffer_resource mr;
+  solux::api::SchemaDef def;
+  auto* f = solux::api::build::allocArray(def.fields, 1, mr);
+  f->name = "_v";
+  f->field_class = solux::api::FieldDef_::FieldClass::VECTOR;
+  f->abstract = true;
+  f->column_stored = true;
+  auto& vector = f->vector.emplace();
+  vector.metric = solux::api::VectorParams_::Metric::COSINE;
+  vector.normalize_on_write = false;
   h.collection().setSchema(Schema::fromProto(def, h.collection().getSchema().get()));
 
   std::vector<std::vector<float>> vecs = {
@@ -1363,12 +1342,11 @@ TEST_F(VectorIndexBuilderTest, cosineRenormChunkBoundaries) {
   }
   h.commit({"*"});
 
-  google::protobuf::Arena arena;
-  auto* info = readIndexInfo(h.getIndexWriter()->dir, arena);
+  auto info = readIndexInfo(h.getIndexWriter()->dir);
   auto& aux = onlyVectorOverlay(info);
   auto meta = readVectorAuxMeta(aux);
   EXPECT_EQ(meta.cosineNormalizeColumnOnRescore, 1);
-  auto idx = readFaissIndex(h.getIndexWriter()->dir, aux.files(0));
+  auto idx = readFaissIndex(h.getIndexWriter()->dir, aux.files[0]);
   ASSERT_EQ(idx->ntotal, 80);
 
   VectorIndexBuilder::renormChunkBytes = saved;
@@ -1388,16 +1366,15 @@ TEST_F(VectorIndexBuilderTest, buildsIvfPqAuxIndex) {
   }
   h.commit({"*"});
 
-  google::protobuf::Arena arena;
-  auto* info = readIndexInfo(h.getIndexWriter()->dir, arena);
-  EXPECT_EQ(0, info->aux_indexes_size());
+  auto info = readIndexInfo(h.getIndexWriter()->dir);
+  EXPECT_EQ(0, info->aux_indexes.size());
   const auto& aux = onlyVectorOverlay(info);
-  EXPECT_EQ(aux.kind(), "vector_faiss");
-  EXPECT_EQ(aux.name(), "vec.embedding_v");
-  EXPECT_EQ(aux.built_core_gen(), 0u);
-  ASSERT_EQ(aux.files_size(), 1);
+  EXPECT_EQ(aux.kind, "vector_faiss");
+  EXPECT_EQ(aux.name, "vec.embedding_v");
+  EXPECT_EQ(aux.built_core_gen, 0u);
+  ASSERT_EQ(aux.files.size(), 1);
 
-  auto idx = readFaissIndex(h.getIndexWriter()->dir, aux.files(0));
+  auto idx = readFaissIndex(h.getIndexWriter()->dir, aux.files[0]);
   auto* ivfpq = dynamic_cast<faiss::IndexIVFPQ*>(idx.get());
   ASSERT_NE(ivfpq, nullptr);
   EXPECT_EQ(ivfpq->d, 4);
@@ -1427,9 +1404,8 @@ TEST_F(VectorIndexBuilderTest, ivfPqFallsBackWhenTooSmallToTrain) {
   }
   h.commit({"*"});
 
-  google::protobuf::Arena arena;
-  auto* info = readIndexInfo(h.getIndexWriter()->dir, arena);
-  EXPECT_EQ(0, info->aux_indexes_size());
+  auto info = readIndexInfo(h.getIndexWriter()->dir);
+  EXPECT_EQ(0, info->aux_indexes.size());
   EXPECT_EQ(vectorOverlays(info).size(), 0u);
 }
 
@@ -1443,8 +1419,7 @@ TEST_F(VectorIndexBuilderTest, metricNoneIsIneligible) {
   h.index(d);
   h.commit({"*"});
 
-  google::protobuf::Arena arena;
-  auto* info = readIndexInfo(h.getIndexWriter()->dir, arena);
-  EXPECT_EQ(0, info->aux_indexes_size());
+  auto info = readIndexInfo(h.getIndexWriter()->dir);
+  EXPECT_EQ(0, info->aux_indexes.size());
   EXPECT_EQ(vectorOverlays(info).size(), 0u);
 }

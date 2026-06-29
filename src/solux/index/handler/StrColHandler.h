@@ -47,32 +47,31 @@ public:
 
   ~StrColHandler() override = default;
 
-  void index(Inverter& inverter, const proto::Val& val) override {
-    if (val.has_s()) {
-      indexSingle(inverter, val.s());
+  void index(Inverter& inverter, const IndexVal& val) override {
+    if (std::holds_alternative<std::string_view>(val.kind)) {
+      indexSingle(inverter, std::get<std::string_view>(val.kind));
     }
-    else if (val.has_bin()) {
+    else if (std::holds_alternative<::hpp_proto::bytes_view>(val.kind)) {
       // TODO: only OK if this is a binary type, otherwise we could accept non-unicode and then attempt
       // to return that as a string later and cause gRPC or someone else up the line to choke.
-      indexSingle(inverter, val.bin());
+      const auto& b = std::get<::hpp_proto::bytes_view>(val.kind);
+      indexSingle(inverter, std::string_view((const char*)b.data(), b.size()));
     }
-    else if (val.has_arr_s()) {
-      auto& arr = val.arr_s().v();
-      std::span<const std::string* const> values(arr.data(), arr.size());
-      indexMulti(inverter, values);
+    else if (std::holds_alternative<solux::api::ArrStr>(val.kind)) {
+      const auto& arr = std::get<solux::api::ArrStr>(val.kind).v;
+      indexMulti(inverter, std::span<const std::string_view>(arr.data(), arr.size()));
     }
-    else if (val.has_arr_bin()) {
-      auto& arr = val.arr_bin().v();
+    else if (std::holds_alternative<solux::api::ArrBin>(val.kind)) {
+      const auto& arr = std::get<solux::api::ArrBin>(val.kind).v;
       std::vector<std::string_view> views;
       views.reserve(arr.size());
       for (const auto& bin : arr) {
-        views.push_back(bin);
+        views.push_back(std::string_view((const char*)bin.data(), bin.size()));
       }
-      std::span<std::string_view> values(views);
-      indexMulti(inverter, values);
+      indexMulti(inverter, std::span<const std::string_view>(views.data(), views.size()));
     }
     else {
-      throw std::runtime_error("StrColHandler: expected string or binary value, got " + val.DebugString());
+      throw std::runtime_error("StrColHandler: expected string or binary value");
     }
   }
 
@@ -89,21 +88,7 @@ public:
     }
   }
 
-  void indexMulti(Inverter& inverter, std::span<const std::string* const> vals) {
-    if (!(fieldType->flags_ & FieldType::MULTI_VALUED)) {
-      throw std::runtime_error(fmt::format("Field '{}' is single-valued but received multiple values",
-                                          std::string_view(fieldName)));
-    }
-
-    numDocs++;
-    docsWithVal.addDoc(inverter.pool, inverter.getDoc());
-    for (const auto* val : vals) {
-      addValue(inverter, std::string_view(*val));
-    }
-    valCountStream.addVal(inverter.pool, (int64_t)vals.size());
-  }
-
-  void indexMulti(Inverter& inverter, std::span<std::string_view> vals) {
+  void indexMulti(Inverter& inverter, std::span<const std::string_view> vals) {
     if (!(fieldType->flags_ & FieldType::MULTI_VALUED)) {
       throw std::runtime_error(fmt::format("Field '{}' is single-valued but received multiple values",
                                           std::string_view(fieldName)));

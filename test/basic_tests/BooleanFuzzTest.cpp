@@ -7,9 +7,13 @@
 #include "test/SoluxTest.h"
 #include "test/CollectionHelper.h"
 #include "test/LocalReq.h"
+#include "test/QueryBuild.h"
 
 using namespace solux;
 using namespace solux::test;
+
+namespace api = solux::api;
+namespace build = solux::api::build;
 
 // Randomized differential test for boolean matching. body_w uses identity
 // analysis for this vocabulary, so the oracle can evaluate raw tokens.
@@ -26,43 +30,90 @@ public:
 
   std::string randTerm() { return VOCAB[rng.rint(VOCAB_SIZE)]; }
 
-  // Random query generation.
+  // Random query generation. Each builder returns a Query by value with its nested
+  // data allocated into `mr` (the request build arena), so the tree is assembled
+  // bottom-up and the root is assigned to the op via cur.rawQuery().
 
-  void genLeaf(proto::Query* q) {
+  api::Query genLeaf(std::pmr::memory_resource& mr) {
     if (rng.rint(10) < 3) {  // ~30% phrase
-      auto& ph = *q->mutable_phrase();
-      ph.set_field("body_w");
       int len = (int)rng.rint(2, 4);  // 2 or 3 words
-      for (int i = 0; i < len; i++) *ph.mutable_words()->Add() = randTerm();
-    } else {
-      auto& m = *q->mutable_match();
-      m.set_field("body_w");
-      m.mutable_val()->set_s(randTerm());
+      api::Query q;
+      auto& ph = q.kind.emplace<api::PhraseQuery>();
+      ph.field = build::arenaStr(mr, "body_w");
+      std::string_view* a = build::allocArray(ph.words, (size_t)len, mr);
+      for (int i = 0; i < len; i++) a[i] = build::arenaStr(mr, randTerm());
+      return q;
     }
+    return qb::match(mr, "body_w", randTerm());
   }
 
-  void genClause(proto::Query* q, int depth) {
+  api::Query genClause(std::pmr::memory_resource& mr, int depth) {
     if (depth > 0 && rng.rint(6) == 0) {
-      genBool(q, depth - 1);
-    } else {
-      genLeaf(q);
+      return genBool(mr, depth - 1);
     }
+    return genLeaf(mr);
   }
 
-  void genBool(proto::Query* q, int depth) {
-    auto& b = *q->mutable_boolean();
+  api::Query genBool(std::pmr::memory_resource& mr, int depth) {
     int nreq = (int)rng.rint(3);     // 0..2
     int nopt = (int)rng.rint(4);     // 0..3
     int nproh = (int)rng.rint(3);    // 0..2
     int nfilter = (int)rng.rint(3);  // 0..2
     if (nreq + nopt + nfilter == 0) nopt = 1;  // guarantee a positive clause
-    for (int i = 0; i < nreq; i++) genClause(b.add_required(), depth);
-    for (int i = 0; i < nopt; i++) genClause(b.add_optional(), depth);
-    for (int i = 0; i < nproh; i++) genClause(b.add_prohibited(), depth);
-    for (int i = 0; i < nfilter; i++) genClause(b.add_filter(), depth);
+    std::vector<api::Query> required, optional, prohibited, filter;
+    for (int i = 0; i < nreq; i++) required.push_back(genClause(mr, depth));
+    for (int i = 0; i < nopt; i++) optional.push_back(genClause(mr, depth));
+    for (int i = 0; i < nproh; i++) prohibited.push_back(genClause(mr, depth));
+    for (int i = 0; i < nfilter; i++) filter.push_back(genClause(mr, depth));
+    int minMatch = 0;
     // min_match is only valid for optional-only clauses (no required/filter).
     if (nopt > 0 && nreq == 0 && nfilter == 0) {
-      b.set_min_match((int)rng.rint(nopt + 1));  // 0..nopt
+      minMatch = (int)rng.rint(nopt + 1);  // 0..nopt
+    }
+    return qb::boolean(mr, required, optional, prohibited, filter, minMatch);
+  }
+
+  static std::string querySummary(const api::Query& q) {
+    std::string out;
+    appendQuerySummary(q, out);
+    return out;
+  }
+
+  static void appendQuerySummary(const api::Query& q, std::string& out) {
+    if (const auto* m = std::get_if<api::Match>(&q.kind)) {
+      out += "match(" + std::string(m->field) + ":";
+      if (m->val.has_value() && std::holds_alternative<std::string_view>(m->val->kind)) {
+        out += std::get<std::string_view>(m->val->kind);
+      }
+      out += ")";
+    } else if (const auto* ph = std::get_if<api::PhraseQuery>(&q.kind)) {
+      out += "phrase(" + std::string(ph->field) + ":";
+      for (size_t i = 0; i < ph->words.size(); i++) {
+        if (i != 0) out += " ";
+        out += ph->words[i];
+      }
+      out += ")";
+    } else if (const auto* b = std::get_if<api::BooleanQuery>(&q.kind)) {
+      out += "bool(required=[";
+      appendQueriesSummary(b->required, out);
+      out += "], optional=[";
+      appendQueriesSummary(b->optional, out);
+      out += "], prohibited=[";
+      appendQueriesSummary(b->prohibited, out);
+      out += "], filter=[";
+      appendQueriesSummary(b->filter, out);
+      out += "], min_match=" + std::to_string(b->min_match) + ")";
+    } else if (std::holds_alternative<bool>(q.kind)) {
+      out += "all";
+    } else {
+      out += "unknown";
+    }
+  }
+
+  static void appendQueriesSummary(std::span<const api::Query> qs, std::string& out) {
+    for (size_t i = 0; i < qs.size(); i++) {
+      if (i != 0) out += ", ";
+      appendQuerySummary(qs[i], out);
     }
   }
 
@@ -88,45 +139,43 @@ public:
     return false;
   }
 
-  static bool clauseMatches(const proto::Query& q, const std::vector<std::string>& toks) {
-    switch (q.kind_case()) {
-      case proto::Query::kMatch:
-        return tokensContain(toks, q.match().val().s());
-      case proto::Query::kPhrase: {
-        std::vector<std::string> phrase(q.phrase().words().begin(), q.phrase().words().end());
-        return tokensContainPhrase(toks, phrase);
-      }
-      case proto::Query::kBoolean:
-        return boolMatches(q.boolean(), toks);
-      case proto::Query::kAll:
-        return true;
-      default:
-        return false;
+  static bool clauseMatches(const api::Query& q, const std::vector<std::string>& toks) {
+    if (const auto* m = std::get_if<api::Match>(&q.kind)) {
+      if (!m->val.has_value() || !std::holds_alternative<std::string_view>(m->val->kind)) return false;
+      return tokensContain(toks, std::get<std::string_view>(m->val->kind));
     }
+    if (const auto* ph = std::get_if<api::PhraseQuery>(&q.kind)) {
+      std::vector<std::string> phrase(ph->words.begin(), ph->words.end());
+      return tokensContainPhrase(toks, phrase);
+    }
+    if (const auto* b = std::get_if<api::BooleanQuery>(&q.kind)) {
+      return boolMatches(*b, toks);
+    }
+    return std::holds_alternative<bool>(q.kind);
   }
 
-  static bool boolMatches(const proto::BooleanQuery& b, const std::vector<std::string>& toks) {
-    for (const auto& r : b.required()) {
+  static bool boolMatches(const api::BooleanQuery& b, const std::vector<std::string>& toks) {
+    for (const auto& r : b.required) {
       if (!clauseMatches(r, toks)) return false;
     }
-    for (const auto& f : b.filter()) {  // filters constrain like required (no score)
+    for (const auto& f : b.filter) {  // filters constrain like required (no score)
       if (!clauseMatches(f, toks)) return false;
     }
-    for (const auto& p : b.prohibited()) {
+    for (const auto& p : b.prohibited) {
       if (clauseMatches(p, toks)) return false;
     }
-    bool hasPositive = b.required_size() > 0 || b.optional_size() > 0 || b.filter_size() > 0;
+    bool hasPositive = b.required.size() > 0 || b.optional.size() > 0 || b.filter.size() > 0;
     if (!hasPositive) return false;
     // Optional must match unless there is a mandatory (required) clause, which
     // makes the optional side scoring-only (MandOpt). A filter does NOT relax
     // that - filter + optional conjoins them, so the optional is still required.
-    if (b.optional_size() > 0 && b.required_size() == 0) {
+    if (!b.optional.empty() && b.required.empty()) {
       int matched = 0;
-      for (const auto& o : b.optional()) {
+      for (const auto& o : b.optional) {
         if (clauseMatches(o, toks)) matched++;
       }
-      int mm = b.min_match();
-      int eff = mm >= 1 ? std::min(mm, b.optional_size()) : 1;  // unset/0 -> any (>=1)
+      int mm = b.min_match;
+      int eff = mm >= 1 ? std::min(mm, (int)b.optional.size()) : 1;  // unset/0 -> any (>=1)
       if (matched < eff) return false;
     }
     return true;
@@ -139,22 +188,18 @@ TEST_F(BooleanFuzzTest, filterRequiresOptionalToMatch) {
   helper.index(flatdoc("id", "x2", "body_w", "f"), UpdateMessage::COMMIT);        // f, no a; z nowhere
 
   auto run = [&](const char* filterTerm, const char* optTerm) {
-    auto* req = LocalReq::create(helper.getSearchEngine());
+    auto req = localReq(helper.getSearchEngine());
     req->collection("main");
-    auto& td = req->topDocs("q");
-    td.set_limit(100);
-    *td.mutable_fields()->Add() = "id";
-    auto& b = *td.mutable_query()->mutable_boolean();
-    auto& f = *b.add_filter()->mutable_match();
-    f.set_field("body_w");
-    f.mutable_val()->set_s(filterTerm);
-    auto& o = *b.add_optional()->mutable_match();
-    o.set_field("body_w");
-    o.mutable_val()->set_s(optTerm);
+    auto& cur = req->topDocs("q");
+    cur.limit(100).fields({"id"});
+    cur.rawQuery() = qb::boolean(cur.mr(),
+        /*required=*/{},
+        /*optional=*/{qb::match(cur.mr(), "body_w", optTerm)},
+        /*prohibited=*/{},
+        /*filter=*/{qb::match(cur.mr(), "body_w", filterTerm)});
     req->execute();
     std::set<std::string> got;
     for (const auto& d : req->getDocs()) got.insert(std::get<std::string>(*find(d, "id")));
-    req->done();
     return got;
   };
 
@@ -171,20 +216,16 @@ TEST_F(BooleanFuzzTest, twoTermConjunctionAcrossSegments) {
   helper.index(flatdoc("id", "x3", "body_w", "b d b f"), UpdateMessage::COMMIT);    // seg2
   helper.index(flatdoc("id", "x4", "body_w", "b c"), UpdateMessage::COMMIT);        // only b
 
-  auto* req = LocalReq::create(helper.getSearchEngine());
+  auto req = localReq(helper.getSearchEngine());
   req->collection("main");
-  auto& td = req->topDocs("q");
-  td.set_get_number(true);
-  td.set_limit(100);
-  *td.mutable_fields()->Add() = "id";
-  auto& b = *td.mutable_query()->mutable_boolean();
-  { auto& m = *b.add_required()->mutable_match(); m.set_field("body_w"); m.mutable_val()->set_s("b"); }
-  { auto& m = *b.add_required()->mutable_match(); m.set_field("body_w"); m.mutable_val()->set_s("d"); }
+  auto& cur = req->topDocs("q");
+  cur.getNumber().limit(100).fields({"id"});
+  cur.rawQuery() = qb::boolean(cur.mr(),
+      /*required=*/{qb::match(cur.mr(), "body_w", "b"), qb::match(cur.mr(), "body_w", "d")});
   req->execute(false);
   std::set<std::string> got;
   for (const auto& d : req->getDocs()) got.insert(std::get<std::string>(*find(d, "id")));
   int64_t count = req->getMatchCount();
-  req->done();
 
   EXPECT_EQ((std::set<std::string>{"x1", "x2", "x3"}), got);
   EXPECT_EQ(3, count);
@@ -199,37 +240,26 @@ TEST_F(BooleanFuzzTest, phraseMultiDoc) {
 
   // standalone phrase "a e"
   {
-    auto* req = LocalReq::create(helper.getSearchEngine());
-    req->collection("main");
-    auto& td = req->topDocs("q");
-    td.set_limit(100);
-    *td.mutable_fields()->Add() = "id";
-    auto& ph = *td.mutable_query()->mutable_phrase();
-    ph.set_field("body_w");
-    *ph.mutable_words()->Add() = "a";
-    *ph.mutable_words()->Add() = "e";
+    auto req = localReq(helper.getSearchEngine());
+    req->collection("main").topDocs("q").phraseQuery("body_w", {"a", "e"}).limit(100).fields({"id"});
     req->execute(false);
     std::set<std::string> got;
     for (const auto& d : req->getDocs()) got.insert(std::get<std::string>(*find(d, "id")));
-    req->done();
     EXPECT_EQ((std::set<std::string>{"p1", "p3"}), got) << "standalone phrase";
   }
 
   // required e AND phrase "a e"
   {
-    auto* req = LocalReq::create(helper.getSearchEngine());
+    auto req = localReq(helper.getSearchEngine());
     req->collection("main");
-    auto& td = req->topDocs("q");
-    td.set_limit(100);
-    *td.mutable_fields()->Add() = "id";
-    auto& b = *td.mutable_query()->mutable_boolean();
-    { auto& m = *b.add_required()->mutable_match(); m.set_field("body_w"); m.mutable_val()->set_s("e"); }
-    { auto& ph = *b.add_required()->mutable_phrase(); ph.set_field("body_w");
-      *ph.mutable_words()->Add() = "a"; *ph.mutable_words()->Add() = "e"; }
+    auto& cur = req->topDocs("q");
+    cur.limit(100).fields({"id"});
+    cur.rawQuery() = qb::boolean(cur.mr(),
+        /*required=*/{qb::match(cur.mr(), "body_w", "e"),
+                      qb::phraseWords(cur.mr(), "body_w", {"a", "e"})});
     req->execute(false);
     std::set<std::string> got;
     for (const auto& d : req->getDocs()) got.insert(std::get<std::string>(*find(d, "id")));
-    req->done();
     EXPECT_EQ((std::set<std::string>{"p1", "p3"}), got) << "required e + phrase a e";
   }
 }
@@ -257,18 +287,19 @@ TEST_F(BooleanFuzzTest, randomBooleanMatchesOracle) {
   }
 
   for (int iter = 0; iter < 300; iter++) {
-    auto* req = LocalReq::create(helper.getSearchEngine());
+    auto req = localReq(helper.getSearchEngine());
     req->collection("main");
-    auto& td = req->topDocs("q");
-    td.set_get_number(true);
-    td.set_limit(numDocs);          // return every match, not just a top page
-    td.set_batch_size(numDocs + 1);  // in one response batch (we only read responses[0])
-    *td.mutable_fields()->Add() = "id";
-    genBool(td.mutable_query(), 2);
+    auto& cur = req->topDocs("q");
+    cur.getNumber()
+       .limit(numDocs)          // return every match, not just a top page
+       .batchSize(numDocs + 1)  // in one response batch (we only read responses[0])
+       .fields({"id"});
+    api::Query rootQuery = genBool(cur.mr(), 2);
+    cur.rawQuery() = rootQuery;
 
     std::set<std::string> expected;
     for (const auto& [id, toks] : docs) {
-      if (boolMatches(td.query().boolean(), toks)) expected.insert(id);
+      if (boolMatches(std::get<api::BooleanQuery>(rootQuery.kind), toks)) expected.insert(id);
     }
 
     req->execute();
@@ -291,10 +322,8 @@ TEST_F(BooleanFuzzTest, randomBooleanMatchesOracle) {
       }
       ADD_FAILURE() << "iter=" << iter << " oracleCount=" << expected.size()
                     << " engineCount=" << engineCount << " gotDocs=" << got.size()
-                    << "\ndiff docs:\n" << diff << "query=\n" << td.query().DebugString();
-      req->done();
+                    << "\ndiff docs:\n" << diff << "query=\n" << querySummary(rootQuery);
       break;
     }
-    req->done();
   }
 }

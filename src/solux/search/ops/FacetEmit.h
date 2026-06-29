@@ -5,7 +5,8 @@
 #include <string>
 #include <vector>
 
-#include "protos/solux_types.pb.h"
+#include "solux/api/solux_types.hpp"
+#include "SearchOp.h"  // build:: alias + solux::api types (via SearchRequest.h)
 
 namespace solux {
 
@@ -26,28 +27,33 @@ void sortByCountDescAndLimit(std::vector<std::pair<K, int64_t>>& buckets, int64_
   }
 }
 
-inline void emitBuckets(proto::FacetResult& facetResultProto, const std::vector<std::pair<int64_t, int64_t>>& buckets) {
-  auto& bucketIds = *facetResultProto.mutable_bucket_ids()->mutable_col_i();
-  auto& bucketIdsArr = *bucketIds.mutable_v();
-  auto& countsArr = *facetResultProto.mutable_counts();
-  bucketIdsArr.Reserve(buckets.size());
-  countsArr.Reserve(buckets.size());
-  for (auto [val, count] : buckets) {
-    bucketIdsArr.Add(val);
-    countsArr.Add(count);
+// Build bucket_ids (a Column) + counts (an int64 span) into the NON-OWNING
+// FacetResult.  The bucket count is known up front (buckets.size()), so each
+// span is allocArray'd once into the response arena `mr` and index-filled.
+inline void emitBuckets(solux::api::FacetResult& facetResultProto,
+                        const std::vector<std::pair<int64_t, int64_t>>& buckets,
+                        std::pmr::memory_resource& mr) {
+  auto& bucketIds = facetResultProto.bucket_ids.emplace().kind.emplace<solux::api::ColInt>();
+  size_t n = buckets.size();
+  int64_t* ids = build::allocArray(bucketIds.v, n, mr);
+  int64_t* counts = build::allocArray(facetResultProto.counts, n, mr);
+  for (size_t i = 0; i < n; i++) {
+    ids[i] = buckets[i].first;
+    counts[i] = buckets[i].second;
   }
 }
 
-inline void emitBuckets(proto::FacetResult& facetResultProto, const std::vector<std::pair<std::string, int64_t>>& buckets) {
-  auto& bucketIds = *facetResultProto.mutable_bucket_ids()->mutable_col_s();
-  auto& bucketIdsArr = *bucketIds.mutable_v();
-  auto& countsArr = *facetResultProto.mutable_counts();
-  bucketIdsArr.Reserve(buckets.size());
-  countsArr.Reserve(buckets.size());
-  for (auto [val, count] : buckets) {
-    auto* strptr = bucketIdsArr.Add();
-    *strptr = val;
-    countsArr.Add(count);
+inline void emitBuckets(solux::api::FacetResult& facetResultProto,
+                        const std::vector<std::pair<std::string, int64_t>>& buckets,
+                        std::pmr::memory_resource& mr) {
+  auto& bucketIds = facetResultProto.bucket_ids.emplace().kind.emplace<solux::api::ColStr>();
+  size_t n = buckets.size();
+  std::string_view* ids = build::allocArray(bucketIds.v, n, mr);
+  int64_t* counts = build::allocArray(facetResultProto.counts, n, mr);
+  for (size_t i = 0; i < n; i++) {
+    // bucket strings live in the transient countVec; copy into the arena.
+    ids[i] = build::arenaStr(mr, buckets[i].first);
+    counts[i] = buckets[i].second;
   }
 }
 

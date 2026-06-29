@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <deque>
 #include <assert.h>
 #include <iostream>
 #include <optional>

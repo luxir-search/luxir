@@ -3,6 +3,7 @@
 #include <charconv>
 #include <cmath>
 #include <cstdio>
+#include <variant>
 
 namespace solux {
 
@@ -49,17 +50,17 @@ void appendFloating(std::string& out, F v) {
 }
 
 // Number of doc rows a column represents (the active oneof's repeated length).
-size_t columnSize(const proto::Column& col) {
-  if (col.has_col_s())    return col.col_s().v_size();
-  if (col.has_col_i())    return col.col_i().v_size();
-  if (col.has_col_f())    return col.col_f().v_size();
-  if (col.has_col_d())    return col.col_d().v_size();
-  if (col.has_multi_s())  return col.multi_s().v_size();
-  if (col.has_multi_i())  return col.multi_i().v_size();
-  if (col.has_multi_f())  return col.multi_f().v_size();
-  if (col.has_multi_d())  return col.multi_d().v_size();
-  if (col.has_col_vec())  return col.col_vec().v_size();
-  if (col.has_multi_vec()) return col.multi_vec().v_size();
+size_t columnSize(const solux::api::Column& col) {
+  if (auto* c = std::get_if<solux::api::ColStr>(&col.kind)) return c->v.size();
+  if (auto* c = std::get_if<solux::api::ColInt>(&col.kind)) return c->v.size();
+  if (auto* c = std::get_if<solux::api::ColFloat>(&col.kind)) return c->v.size();
+  if (auto* c = std::get_if<solux::api::ColDouble>(&col.kind)) return c->v.size();
+  if (auto* c = std::get_if<solux::api::ArrArrStr>(&col.kind)) return c->v.size();
+  if (auto* c = std::get_if<solux::api::ArrArrInt>(&col.kind)) return c->v.size();
+  if (auto* c = std::get_if<solux::api::ArrArrFloat>(&col.kind)) return c->v.size();
+  if (auto* c = std::get_if<solux::api::ArrArrDouble>(&col.kind)) return c->v.size();
+  if (auto* c = std::get_if<solux::api::ColVector>(&col.kind)) return c->v.size();
+  if (auto* c = std::get_if<solux::api::MultiVector>(&col.kind)) return c->v.size();
   return 0;
 }
 
@@ -76,58 +77,47 @@ void appendArray(std::string& out, const Repeated& v, Emit&& emit) {
 }
 
 // Emit doc i's value for this column, or null if the slot is missing.
-void appendCell(std::string& out, const proto::Column& col, size_t i) {
-  int idx = (int)i;
-  if (col.has_col_s()) {
-    const auto& c = col.col_s();
-    if (idx < c.v_size() && c.v(idx) != c.missing_val()) appendJsonString(out, c.v(idx));
+void appendCell(std::string& out, const solux::api::Column& col, size_t i) {
+  if (auto* c = std::get_if<solux::api::ColStr>(&col.kind)) {
+    if (i < c->v.size() && c->v[i] != c->missing_val) appendJsonString(out, c->v[i]);
     else out += "null";
-  } else if (col.has_col_i()) {
-    const auto& c = col.col_i();
-    if (idx < c.v_size() && c.v(idx) != c.missing_val()) appendInt(out, c.v(idx));
+  } else if (auto* c = std::get_if<solux::api::ColInt>(&col.kind)) {
+    if (i < c->v.size() && c->v[i] != c->missing_val) appendInt(out, c->v[i]);
     else out += "null";
-  } else if (col.has_col_f()) {
-    const auto& c = col.col_f();
-    if (idx < c.v_size() && c.v(idx) != c.missing_val()) appendFloating(out, c.v(idx));
+  } else if (auto* c = std::get_if<solux::api::ColFloat>(&col.kind)) {
+    if (i < c->v.size() && c->v[i] != c->missing_val) appendFloating(out, c->v[i]);
     else out += "null";
-  } else if (col.has_col_d()) {
-    const auto& c = col.col_d();
-    if (idx < c.v_size() && c.v(idx) != c.missing_val()) appendFloating(out, c.v(idx));
+  } else if (auto* c = std::get_if<solux::api::ColDouble>(&col.kind)) {
+    if (i < c->v.size() && c->v[i] != c->missing_val) appendFloating(out, c->v[i]);
     else out += "null";
-  } else if (col.has_multi_s()) {
+  } else if (auto* c = std::get_if<solux::api::ArrArrStr>(&col.kind)) {
     // Multi-valued columns signal "missing" structurally as an empty list; render
     // that (and an out-of-range slot) as null, matching the scalar missing_val
     // contract.  A present but genuinely empty list is indistinguishable from
     // missing for these columns, so both map to null.
-    const auto& c = col.multi_s();
-    if (idx < c.v_size() && c.v(idx).v_size() > 0)
-      appendArray(out, c.v(idx).v(), [&](const auto& s){ appendJsonString(out, s); });
+    if (i < c->v.size() && !c->v[i].v.empty())
+      appendArray(out, c->v[i].v, [&](const auto& s){ appendJsonString(out, s); });
     else out += "null";
-  } else if (col.has_multi_i()) {
-    const auto& c = col.multi_i();
-    if (idx < c.v_size() && c.v(idx).v_size() > 0)
-      appendArray(out, c.v(idx).v(), [&](int64_t x){ appendInt(out, x); });
+  } else if (auto* c = std::get_if<solux::api::ArrArrInt>(&col.kind)) {
+    if (i < c->v.size() && !c->v[i].v.empty())
+      appendArray(out, c->v[i].v, [&](int64_t x){ appendInt(out, x); });
     else out += "null";
-  } else if (col.has_multi_f()) {
-    const auto& c = col.multi_f();
-    if (idx < c.v_size() && c.v(idx).v_size() > 0)
-      appendArray(out, c.v(idx).v(), [&](float x){ appendFloating(out, x); });
+  } else if (auto* c = std::get_if<solux::api::ArrArrFloat>(&col.kind)) {
+    if (i < c->v.size() && !c->v[i].v.empty())
+      appendArray(out, c->v[i].v, [&](float x){ appendFloating(out, x); });
     else out += "null";
-  } else if (col.has_multi_d()) {
-    const auto& c = col.multi_d();
-    if (idx < c.v_size() && c.v(idx).v_size() > 0)
-      appendArray(out, c.v(idx).v(), [&](double x){ appendFloating(out, x); });
+  } else if (auto* c = std::get_if<solux::api::ArrArrDouble>(&col.kind)) {
+    if (i < c->v.size() && !c->v[i].v.empty())
+      appendArray(out, c->v[i].v, [&](double x){ appendFloating(out, x); });
     else out += "null";
-  } else if (col.has_col_vec()) {
-    const auto& c = col.col_vec();
-    if (idx < c.v_size() && c.v(idx).has_f32())
-      appendArray(out, c.v(idx).f32().v(), [&](float x){ appendFloating(out, x); });
+  } else if (auto* c = std::get_if<solux::api::ColVector>(&col.kind)) {
+    if (i < c->v.size() && c->v[i].f32.has_value())
+      appendArray(out, c->v[i].f32->v, [&](float x){ appendFloating(out, x); });
     else out += "null";
-  } else if (col.has_multi_vec()) {
-    const auto& c = col.multi_vec();
-    if (idx < c.v_size() && c.v(idx).v_size() > 0) {
-      appendArray(out, c.v(idx).v(), [&](const proto::Vector& vec){
-        if (vec.has_f32()) appendArray(out, vec.f32().v(), [&](float x){ appendFloating(out, x); });
+  } else if (auto* c = std::get_if<solux::api::MultiVector>(&col.kind)) {
+    if (i < c->v.size() && !c->v[i].v.empty()) {
+      appendArray(out, c->v[i].v, [&](const solux::api::Vector& vec){
+        if (vec.f32.has_value()) appendArray(out, vec.f32->v, [&](float x){ appendFloating(out, x); });
         else out += "null";
       });
     } else out += "null";
@@ -136,9 +126,9 @@ void appendCell(std::string& out, const proto::Column& col, size_t i) {
   }
 }
 
-void appendDocs(std::string& out, const proto::DocList& docs) {
+void appendDocs(std::string& out, const solux::api::DocList& docs) {
   size_t numDocs = 0;
-  for (const auto& [name, col] : docs.columns()) {
+  for (const auto& [name, col] : docs.columns) {
     numDocs = columnSize(col);
     break;
   }
@@ -147,7 +137,7 @@ void appendDocs(std::string& out, const proto::DocList& docs) {
     if (i) out += ',';
     out += '{';
     bool first = true;
-    for (const auto& [name, col] : docs.columns()) {
+    for (const auto& [name, col] : docs.columns) {
       if (!first) out += ',';
       first = false;
       appendJsonString(out, name);
@@ -161,29 +151,32 @@ void appendDocs(std::string& out, const proto::DocList& docs) {
 
 } // namespace
 
-std::string renderSearchResponseLine(const proto::SearchResponse& resp) {
+std::string renderSearchResponseLine(const solux::api::SearchResponse& resp) {
   std::string out;
   out += '{';
-  if (!resp.error().empty()) {
+  if (!resp.error.empty()) {
     out += R"("error":)";
-    appendJsonString(out, resp.error());
+    appendJsonString(out, resp.error);
     out += "}\n";
     return out;
   }
 
-  const proto::DocList* docs = nullptr;
-  for (const auto& [name, val] : resp.ops()) {
-    if (val.has_docs()) { docs = &val.docs(); break; }
+  const solux::api::DocList* docs = nullptr;
+  for (const auto& [name, val] : resp.ops) {
+    if (auto* docList = std::get_if<solux::api::DocList>(&val->kind)) {
+      docs = docList;
+      break;
+    }
   }
   if (docs) {
     out += R"("found":)";
-    appendInt(out, docs->matches());
+    appendInt(out, docs->matches.value_or(0));
     out += R"(,"docs":)";
     appendDocs(out, *docs);
   } else {
     out += R"("docs":[])";
   }
-  if (resp.more()) out += R"(,"more":true)";
+  if (resp.more) out += R"(,"more":true)";
   out += "}\n";
   return out;
 }

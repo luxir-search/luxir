@@ -644,25 +644,25 @@ void collectCrossSegmentTermSegment(IndexReader& reader, int32_t segnum, int32_t
 
 std::vector<std::string> localResultIds(LocalReq& req, std::string_view opName = "q") {
   std::vector<std::string> ids;
-  if (req.responses.empty()) return ids;
-  auto it = req.responses[0]->proto.ops().find(std::string(opName));
-  if (it == req.responses[0]->proto.ops().end() || !it->second.has_docs()) return ids;
-  const auto& cols = it->second.docs().columns();
-  auto idIt = cols.find("id");
-  if (idIt == cols.end()) return ids;
-  for (const auto& id : idIt->second.col_s().v()) ids.emplace_back(id);
+  const auto* docs = req.docList(opName);
+  if (docs == nullptr) return ids;
+  const auto* idColumn = docs->columns.find("id");
+  if (idColumn == nullptr) return ids;
+  const auto* idCol = std::get_if<solux::api::ColStr>(&idColumn->kind);
+  if (idCol == nullptr) return ids;
+  for (const auto& id : idCol->v) ids.emplace_back(id);
   return ids;
 }
 
 std::vector<float> localResultScores(LocalReq& req, std::string_view opName = "q") {
   std::vector<float> scores;
-  if (req.responses.empty()) return scores;
-  auto it = req.responses[0]->proto.ops().find(std::string(opName));
-  if (it == req.responses[0]->proto.ops().end() || !it->second.has_docs()) return scores;
-  const auto& cols = it->second.docs().columns();
-  auto scoreIt = cols.find("_score_");
-  if (scoreIt == cols.end()) return scores;
-  for (float score : scoreIt->second.col_f().v()) scores.push_back(score);
+  const auto* docs = req.docList(opName);
+  if (docs == nullptr) return scores;
+  const auto* scoreColumn = docs->columns.find("_score_");
+  if (scoreColumn == nullptr) return scores;
+  const auto* scoreCol = std::get_if<solux::api::ColFloat>(&scoreColumn->kind);
+  if (scoreCol == nullptr) return scores;
+  for (float score : scoreCol->v) scores.push_back(score);
   return scores;
 }
 
@@ -1930,12 +1930,11 @@ TEST_F(TermScorerTest, CrossSegmentAccumulatorRealOpMatchesExhaustive) {
 
   auto expected = runCrossSegmentTermTopK(*reader, k, false);
 
-  auto* req = LocalReq::create(SoluxTest::soluxNode->getSearchEngine());
-  req->collection("main").matchQuery("body_w", "needle").fields({"id"}).limit(k);
-  req->topDocs("q").set_get_scores(true);
+  auto req = localReq(SoluxTest::soluxNode->getSearchEngine());
+  req->collection("main").topDocs("q").matchQuery("body_w", "needle").fields({"id"}).limit(k).getScores();
   req->execute(true);
   ASSERT_EQ(req->responses.size(), 1u) << req->toString();
-  ASSERT_FALSE(req->responses[0]->proto.has_error()) << req->toString();
+  ASSERT_FALSE(hasError(req->responses[0]->proto)) << req->toString();
 
   auto ids = localResultIds(*req);
   auto scores = localResultScores(*req);
@@ -1949,7 +1948,6 @@ TEST_F(TermScorerTest, CrossSegmentAccumulatorRealOpMatchesExhaustive) {
     EXPECT_EQ(ids[i], idsBySeg[seg][doc]) << "i=" << i;
     EXPECT_FLOAT_EQ(scores[i], expected.topDocs[i].score) << "i=" << i;
   }
-  req->done();
   helper.clear();
 }
 

@@ -1,0 +1,4 @@
+[submodule "deps/hpp-proto"]
+	path = deps/hpp-proto
+	url = https://github.com/yonik/hpp-proto.git
+	branch = integration

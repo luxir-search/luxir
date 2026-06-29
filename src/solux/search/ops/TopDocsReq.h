@@ -28,7 +28,7 @@ protected:
 public:
   class Calc;
 
-  const solux::proto::TopDocs& topDocsProto;  // the relevant part of the protobuf request
+  const ReqTopDocs& topDocsProto;  // the relevant part of the protobuf request
   Query::Context& qcontext;
   Query* query;
   Query::Weight* weight;
@@ -48,13 +48,14 @@ public:
 
   class Calc : public SearchOp::Calculator {
   public:
-    solux::proto::Val* getTargetForSub(solux::proto::SearchResponse* searchResponse, Calculator* sub) override {
-      auto* ourVal = parent->getTargetForSub(searchResponse, this);
+    solux::api::Val* getTargetForSub(SearchResponse* resp, Calculator* sub) override {
+      auto* ourVal = parent->getTargetForSub(resp, this);
       // the Val should either be unset, or have a DocList
       assert(
-        ourVal != nullptr && (ourVal->kind_case() == solux::proto::Val::kDocs
-          || ourVal->kind_case() == solux::proto::Val::KIND_NOT_SET));
-      return &(*ourVal->mutable_docs()->mutable_ops())[sub->getOp().name];
+        ourVal != nullptr && (std::holds_alternative<solux::api::DocList>(ourVal->kind)
+          || std::holds_alternative<std::monostate>(ourVal->kind)));
+      auto& dl = oneofMut<solux::api::DocList>(*ourVal);
+      return build::opsSlot(dl.ops, op.subOps.size(), sub->getOp().name, resp->mr);
     }
 
     Calc(TopDocsReq& op, Calculator* parent) : SearchOp::Calculator(op, parent, -1, -1), collectorMerger(nullptr, nullptr) {
@@ -305,7 +306,9 @@ public:
           } else {
             // get_number requests an exact total hit count, which is incompatible with
             // impact block skipping (skipped docs are not visited, so not counted).
-            bool allowPruning = !op.topDocsProto.get_number();
+            // keep origin/main's bulk-scorer pruning path; concrete TopDocs has get_number
+            // as a bare field (was the protobuf get_number() accessor).
+            bool allowPruning = !op.topDocsProto.get_number;
             BulkScorer* bulk = nullptr;
             if (allowPruning && builderPtr == nullptr) {
               bulk = supplier->bulkScorer(poolGuard.pool());
@@ -382,7 +385,7 @@ public:
   // cleanup that crashes at arena reset.  Keep this ctor nothrow: all
   // validation (sort field schema lookup, Weight construction, filter
   // weights) is done by ProtobufSearchParser before Arena::Create.
-  TopDocsReq(SearchRequest& req, std::string_view name, const proto::TopDocs& topDocsProto,
+  TopDocsReq(SearchRequest& req, std::string_view name, const ReqTopDocs& topDocsProto,
     Query::Context& qcontext, Query* query, Query::Weight* weight, int64_t topCount,
     std::vector<SortField>&& sortFields, bool useFieldSort,
     std::span<std::pair<std::string_view, Query*>> filters,
@@ -410,14 +413,14 @@ public:
 
     if (mergeableCollector == nullptr) {
       auto& searchResultProto = *calc.getTarget(nullptr);
-      auto& docListProto = *searchResultProto.mutable_docs();
-      docListProto.set_matches(0);
+      auto& docListProto = oneofMut<solux::api::DocList>(searchResultProto);
+      docListProto.matches = 0;
       return;
     }
 
-    auto getDocList = [&calc](solux::proto::SearchResponse* resp) -> solux::proto::DocList& {
+    auto getDocList = [&calc](SearchResponse* resp) -> solux::api::DocList& {
       auto& val = *calc.getTarget(resp);
-      return *val.mutable_docs();
+      return oneofMut<solux::api::DocList>(val);
     };
 
     if (mergeableCollector->useFieldSort) {
@@ -428,11 +431,11 @@ public:
         [sortDocs](int64_t i) { return sortDocs[i].doc; },
         [sortDocs](int64_t i) { return sortDocs[i].score; },
         collector.totalHits(),
-        qr.topDocsProto.fields(),
-        qr.topDocsProto.batch_size(),
-        qr.topDocsProto.offset(),
-        qr.topDocsProto.get_number(),
-        qr.topDocsProto.get_scores());
+        qr.topDocsProto.fields,
+        qr.topDocsProto.batch_size,
+        qr.topDocsProto.offset,
+        qr.topDocsProto.get_number,
+        qr.topDocsProto.get_scores);
     } else {
       auto& collector = *mergeableCollector->scoreCollector;
       auto scoreDocs = collector.sort();
@@ -441,11 +444,11 @@ public:
         [scoreDocs](int64_t i) { return scoreDocs[i].doc; },
         [scoreDocs](int64_t i) { return scoreDocs[i].score; },
         collector.totalHits(),
-        qr.topDocsProto.fields(),
-        qr.topDocsProto.batch_size(),
-        qr.topDocsProto.offset(),
-        qr.topDocsProto.get_number(),
-        qr.topDocsProto.get_scores());
+        qr.topDocsProto.fields,
+        qr.topDocsProto.batch_size,
+        qr.topDocsProto.offset,
+        qr.topDocsProto.get_number,
+        qr.topDocsProto.get_scores);
     }
   }
 

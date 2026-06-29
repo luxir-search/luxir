@@ -1,7 +1,13 @@
+#include "solux/util/proto.h"
 #include "ProtoUpdateMessage.h"
 #include "solux/index/IndexWriter.h"
 
+#include <variant>
+
 namespace solux {
+
+using IndexVal = solux::api::Val;
+using BytesView = ::hpp_proto::bytes_view;
 
 
 // Message for the in-flight exception, including non-std exceptions.
@@ -18,26 +24,29 @@ static std::string currentExceptionMessage() {
 
 // The value of the doc's unique id field, or empty if not present.
 // "id" is the schema-defined name for the unique id field.
-static std::string_view docId(const proto::Map& doc) {
-  auto it = doc.fields().find("id");
-  if (it == doc.fields().end()) {
-    return {};
+static std::string_view docId(const solux::api::Map& doc) {
+  std::string_view result;
+  for (const auto& [name, valView] : doc.fields) {
+    if (name != "id") {
+      continue;
+    }
+    const IndexVal& val = *valView;
+    if (const auto* s = std::get_if<std::string_view>(&val.kind)) {
+      result = *s;
+    } else if (const auto* bin = std::get_if<BytesView>(&val.kind)) {
+      result = std::string_view((const char*)bin->data(), bin->size());
+    } else {
+      result = {};
+    }
   }
-  const proto::Val& val = it->second;
-  if (val.has_s()) {
-    return val.s();
-  }
-  if (val.has_bin()) {
-    return val.bin();
-  }
-  return {};
+  return result;  // last "id" wins (protobuf map dedup semantics)
 }
 
 
 static void update(ProtoUpdateMessage& msg, Inverter& inverter, const Inverter::UndoMark& requestMark) {
   auto& request = *msg.req;
-  const bool allOrNone = request.all_or_none();
-  const bool returnIds = request.return_ids();
+  const bool allOrNone = request.all_or_none;
+  const bool returnIds = request.return_ids;
   std::vector<Inverter::IndexHandler*> handlers;
 
   // first docid this request's adds will use; needed for all_or_none rollback.
@@ -45,9 +54,9 @@ static void update(ProtoUpdateMessage& msg, Inverter& inverter, const Inverter::
 
   int32_t failed = 0;
   int32_t docIndex = -1;
-  for (const auto &doc : request.docs()) {
+  for (const auto &doc : request.docs) {
     docIndex++;
-    size_t nFields = doc.fields_size();
+    size_t nFields = doc.fields.size();
     if (handlers.size() < nFields) {
       handlers.resize(nFields);
     }
@@ -57,13 +66,13 @@ static void update(ProtoUpdateMessage& msg, Inverter& inverter, const Inverter::
 
     try {
       int idx = 0;
-      for (const auto&[fname, fval] : doc.fields()) {
+      for (const auto& [fname, fval] : lastWins(doc.fields)) {  // dedup duplicate field keys, last-wins
         auto handler = handlers[idx];
         if (handler == nullptr || *handler != fname) {
           handlers[idx] = handler = &inverter.getIndexHandler(fname);
         }
 
-        handler->index(inverter, fval);
+        handler->index(inverter, **fval);
         idx++;
       }
 
@@ -71,10 +80,10 @@ static void update(ProtoUpdateMessage& msg, Inverter& inverter, const Inverter::
     } catch (...) {
       failed++;
       auto* response = msg.getResponse();
-      auto* err = response->add_errors();
-      err->set_id(std::string(docId(doc)));
-      err->set_index(docIndex);
-      err->set_error_message(currentExceptionMessage());
+      auto& err = msg.addError();
+      err.id = solux::api::build::arenaStr(msg.responseArena(), docId(doc));
+      err.index = docIndex;
+      err.error_message = solux::api::build::arenaStr(msg.responseArena(), currentExceptionMessage());
 
       if (allOrNone) {
         // Undo the id map mutations of the whole request (including queued
@@ -84,8 +93,8 @@ static void update(ProtoUpdateMessage& msg, Inverter& inverter, const Inverter::
         for (int32_t docid = firstDoc; docid <= inverter.getDoc(); docid++) {
           inverter.deleteDoc(docid);
         }
-        response->clear_ids();
-        response->set_status(proto::UpdateResponse::ERROR);
+        msg.clearIds();
+        response->status = ProtoUpdateMessage::ResponseStatus::ERROR;
         return;
       }
 
@@ -97,35 +106,35 @@ static void update(ProtoUpdateMessage& msg, Inverter& inverter, const Inverter::
     }
 
     if (returnIds) {
-      msg.getResponse()->add_ids(std::string(docId(doc)));
+      msg.addId(docId(doc));
     }
   }
 
   if (failed > 0) {
     // ERROR only if nothing in the request had any effect.
-    bool anySuccess = failed < request.docs_size() || request.delete_ids_size() > 0;
-    msg.getResponse()->set_status(anySuccess ? proto::UpdateResponse::PARTIAL
-                                             : proto::UpdateResponse::ERROR);
+    bool anySuccess = failed < (int32_t)request.docs.size() || !request.delete_ids.empty();
+    msg.getResponse()->status = anySuccess ? ProtoUpdateMessage::ResponseStatus::PARTIAL
+                                           : ProtoUpdateMessage::ResponseStatus::ERROR;
   }
 }
 
 
 void ProtoUpdateMessage::handle(IndexWriter& iw) {
   // Check if we have columns (not yet implemented)
-  if (req->has_columns()) {
-    std::cout << "\tindexer got columns (not yet implemented!): " << req->columns().columns_size() << std::endl;
+  if (req->columns.has_value()) {
+    std::cout << "\tindexer got columns (not yet implemented!): " << req->columns->columns.size() << std::endl;
     return;
   }
 
   // Check if we need an inverter for either deletes or adds
-  bool needInverter = req->delete_ids_size() > 0 || req->docs_size() > 0;
+  bool needInverter = !req->delete_ids.empty() || !req->docs.empty();
 
   if (!needInverter) {
     return;
   }
 
   Inverter& inverter = iw.obtainInverter(this->updateVersion);
-  inverter.overwrite = req->overwrite();
+  inverter.overwrite = !req->allow_dups;
 
   // Captured before deletes are queued so an all_or_none failure rolls them back too.
   auto requestMark = inverter.undoMark();
@@ -159,14 +168,14 @@ void ProtoUpdateMessage::handle(IndexWriter& iw) {
   } releaseGuard{iw, inverter, requestMark, inverter.getMaxDoc()};
 
   // Process deletes before adds (shouldn't matter since we just queue deletes)
-  if (req->delete_ids_size() > 0) {
-    for (const auto& id : req->delete_ids()) {
+  if (!req->delete_ids.empty()) {
+    for (const auto& id : req->delete_ids) {
       inverter.deleteId(id, this->updateVersion);
     }
   }
 
   // Process document additions
-  if (req->docs_size() > 0) {
+  if (!req->docs.empty()) {
     update(*this, inverter, requestMark);
   }
 }

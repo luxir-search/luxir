@@ -1,335 +1,470 @@
 #pragma once
 
 #include "TestUtils.h"
+#include "solux/search/SearchRequest.h"
+
+#include <cassert>
+#include <deque>
+#include <span>
+#include <variant>
 
 namespace solux::test {
 
+// SearchResponse.error is a bare string (empty == success); restores the has_error predicate.
+inline bool hasError(const RespProto& r) { return !r.error.empty(); }
 
-class LocalReq : public SearchRequest {
+// Base-from-member: holds the NON-OWNING request view so it exists before the SearchRequest
+// base ctor (which borrows it) runs.
+struct LocalReqViewHolder {
+  ReqProto view;
+};
+
+using OpsMap = solux::api::map_view<std::string_view, ::hpp_proto::indirect_view<solux::api::SearchOp>>;
+
+class LocalReq;
+
+// Fluent cursor over one op (or the request root). Cursors are owned by LocalReq in a
+// std::deque, so a reference stays valid as later chain calls add more cursors. The configure
+// methods assert the op kind. Descend with topDocs()/facet()/avg()/...; climb back with end().
+//
+// The concrete solux::api classes are the public API: reads go through their named accessors
+// (val.docList()/asDouble(), map_view.find). This cursor only hides the ARENA/build-by-backing
+// mechanics on the write side. For rare wrapper queries (ConstantScore/ForcePrepare) use
+// rawQuery() and build the wrapper chain on the concrete classes directly.
+class OpCursor {
+  friend class LocalReq;
+  LocalReq* req_;
+  OpCursor* parent_;            // null at the root cursor
+  solux::api::SearchOp* op_;    // the op this cursor configures; null at root
+  OpsMap* subOps_;              // ops map this cursor's children go into; null if op has none
+  OpCursor(LocalReq* req, OpCursor* parent, solux::api::SearchOp* op, OpsMap* subOps)
+    : req_(req), parent_(parent), op_(op), subOps_(subOps) {}
+
 public:
-  std::vector<SearchResponse*> responses;
+  // --- descend: add a sub-op into this cursor's ops map, return its cursor ---
+  OpCursor& topDocs(std::string_view name);
+  OpCursor& facet(std::string_view name, std::string_view field);       // FieldFacet
+  OpCursor& rangeFacet(std::string_view name, std::string_view field);  // RangeFacet
+  OpCursor& avg(std::string_view name, std::string_view field);         // GenOp "avg"
+  OpCursor& stats(std::string_view name, std::string_view field);       // GenOp "stats"
 
-  /// Heap allocate an Arena (if null) and use it to create a LocalReq object and proto::SearchRequest
+  // --- configure a TopDocs/Fusion op (assert kind) ---
+  OpCursor& allQuery();
+  OpCursor& matchQuery(std::string_view field, std::string_view value);
+  OpCursor& matchQuery(std::string_view field, std::string_view value, solux::api::Match_::Operator op);
+  OpCursor& prefixQuery(std::string_view field, std::string_view prefix);
+  OpCursor& fuzzyQuery(std::string_view field, std::string_view term,
+                       int maxEdits = -1, int prefixLength = -1, int maxExpansions = 0);
+  OpCursor& phraseQuery(std::string_view field, std::initializer_list<std::string> words);
+  OpCursor& phraseText(std::string_view field, std::string_view text);
+  OpCursor& phraseTerms(std::string_view field, std::initializer_list<std::string> terms);
+  OpCursor& fields(std::initializer_list<std::string> fieldNames);
+  OpCursor& batchSize(int32_t n);
+  OpCursor& getNumber(bool v = true);
+  OpCursor& getScores(bool v = true);
+  OpCursor& withStats() { return getNumber().getScores(); }
+
+  // --- configure a facet op ---
+  OpCursor& limit(int64_t n);     // TopDocs.limit or FieldFacet.limit, by op kind
+  OpCursor& mincount(int64_t n);  // FieldFacet / RangeFacet
+  OpCursor& range(int64_t start, int64_t end, int64_t gap);  // RangeFacet bounds
+
+  // --- escape hatch: the mutable arena Query& of this TopDocs op, for wrapper queries
+  //     (ConstantScore/ForcePrepare) the fluent helpers don't cover. ---
+  solux::api::Query& rawQuery();
+
+  // --- escape hatches for op fields the fluent helpers don't cover (sorts, knn, fusion
+  //     sources, ...): the raw op this cursor configures, and the request build arena.
+  //     Build directly on the concrete classes (see QueryBuild.h for arena helpers). ---
+  solux::api::SearchOp& rawOp() { return *op_; }
+  std::pmr::memory_resource& mr();
+
+  OpCursor& end() { return parent_ ? *parent_ : *this; }
+
+private:
+  solux::api::TopDocs& asTopDocs();          // assert + return the TopDocs arm
+  solux::api::Query& getOrCreateQuery();      // get-or-create the TopDocs query
+  OpCursor& genOpHelper(std::string_view name, std::string_view fn, std::string_view field);
+};
+
+// In-process search-request harness. Builds a CONCRETE solux::api::SearchRequest (`view`)
+// directly into the request arena via the OpCursor builder (no owning builder, no wire
+// bridge). Responses are NON-OWNING views backed by per-response arenas, so reply() RETAINS
+// each response (and its arena) until done() - it does not copy or free eagerly. Use the
+// RAII handle (localReq()) so done() runs automatically.
+class LocalReq : private LocalReqViewHolder, public SearchRequest {
+  friend class OpCursor;
+
+public:
+  solux::ArenaResource mr;                  // pmr view over the base arena for build helpers
+  std::vector<SearchResponse*> responses;   // retained (arenas kept alive until done())
+
   static LocalReq* create(SearchEngine& engine, google::protobuf::Arena* arena = nullptr) {
     arena = arena ? arena : createArena();
-    auto* SearchRequestProto = google::protobuf::Arena::Create<solux::proto::SearchRequest>(arena);
-    auto* localReq = google::protobuf::Arena::Create<LocalReq>(arena, engine, *SearchRequestProto);
-    return localReq;
+    return google::protobuf::Arena::Create<LocalReq>(arena, engine, *arena);
   }
 
-  LocalReq(SearchEngine& engine, solux::proto::SearchRequest& proto) : SearchRequest(engine, proto) {
-  }
-
-  virtual ~LocalReq() {
-    for (auto* response : responses) {
-      if (&response->arena != &arena) {
-        LOG_TRACE("releasing response arena!");
-        releaseArena(&response->arena);
-      }
-    }
+  LocalReq(SearchEngine& engine, google::protobuf::Arena& arena)
+    : SearchRequest(engine, this->view, arena), mr(&arena), rootCursor_(this, nullptr, nullptr, &view.ops) {
   }
 
   int reply(SearchResponse& response) override {
-    responses.push_back(&response);
-    /*
-    std::string reqStr;
-    google::protobuf::TextFormat::PrintToString(response.proto, &reqStr);
-    LOG_DEBUG("\tresponse:{}", reqStr);
-     */
+    responses.push_back(&response);  // retain; the response's arena stays alive until done()
     return 0;
   }
+  void replyCallback(SearchResponse& response) override { unused(response); }
 
-  // will never be called
-  void replyCallback(SearchResponse& response) override {
-    unused(response);
-  }
-
-  // should be called by user
+  // Release each retained response's non-shared arena, then the request arena. Invoked by the
+  // RAII handle (or directly); the engine does not auto-call done() for LocalReq.
   void done() override {
-    releaseArena(&arena);
-  }
-
-  std::string toString() {
-    std::string ret;
-    ret += "Request:" + proto.DebugString() + "\n";
-    for (auto* response : responses) {
-      ret += "\tResponse:" + response->proto.DebugString() + "\n";
+    for (auto* r : responses) {
+      if (&r->arena != &this->SearchRequest::arena) releaseArena(&r->arena);
     }
-    return ret;
+    releaseArena(&this->SearchRequest::arena);
   }
 
-  // Convenience methods to make common operations easier
-
-  // Set collection name easily
+  // --- request-level setters ---
   LocalReq& collection(std::string_view name) {
-    proto.mutable_collection()->add_name(name);
+    if (!view.collection) view.collection.emplace();
+    appendStr(view.collection->name, name);
+    return *this;
+  }
+  LocalReq& requestId(std::string_view id) {
+    view.request_id = build::arenaBytes(mr, std::as_bytes(std::span<const char>(id.data(), id.size())));
     return *this;
   }
 
-  // Get or create a top_docs operation with the given name
-  proto::TopDocs& topDocs(std::string_view opName = "q") {
-    return *proto.mutable_ops()->operator[](opName).mutable_top_docs();
-  }
+  // --- top-level op builders (descend from the root) ---
+  OpCursor& topDocs(std::string_view name = "q") { return rootCursor_.topDocs(name); }
+  OpCursor& facet(std::string_view name, std::string_view field) { return rootCursor_.facet(name, field); }
+  OpCursor& rangeFacet(std::string_view name, std::string_view field) { return rootCursor_.rangeFacet(name, field); }
+  OpCursor& avg(std::string_view name, std::string_view field) { return rootCursor_.avg(name, field); }
+  OpCursor& stats(std::string_view name, std::string_view field) { return rootCursor_.stats(name, field); }
 
-  // Add a match query to a top_docs operation
-  LocalReq& matchQuery(std::string_view field, std::string_view value, std::string_view opName = "q") {
-    auto& query = *topDocs(opName).mutable_query()->mutable_match();
-    query.set_field(field);
-    query.mutable_val()->set_s(value);
-    return *this;
-  }
-
-  // Add a match query with an explicit AND/OR operator (combines analyzed terms)
-  LocalReq& matchQuery(std::string_view field, std::string_view value,
-                       proto::Match::Operator op, std::string_view opName = "q") {
-    auto& query = *topDocs(opName).mutable_query()->mutable_match();
-    query.set_field(field);
-    query.mutable_val()->set_s(value);
-    query.set_operator_(op);
-    return *this;
-  }
-
-  // Add an "all documents" query
-  LocalReq& allQuery(std::string_view opName = "q") {
-    topDocs(opName).mutable_query()->set_all(true);
-    return *this;
-  }
-
-  // Add a prefix query.
-  LocalReq& prefixQuery(std::string_view field, std::string_view prefix, std::string_view opName = "q") {
-    auto& query = *topDocs(opName).mutable_query()->mutable_prefix();
-    query.set_field(field);
-    query.set_prefix(prefix);
-    return *this;
-  }
-
-  // Add a fuzzy query. Negative maxEdits/prefixLength leaves that field unset.
-  LocalReq& fuzzyQuery(std::string_view field, std::string_view term, int maxEdits = -1,
-                       int prefixLength = -1, int maxExpansions = 0, std::string_view opName = "q") {
-    auto& query = *topDocs(opName).mutable_query()->mutable_fuzzy();
-    query.set_field(field);
-    query.set_term(term);
-    if (maxEdits >= 0) query.set_max_edits(maxEdits);
-    if (prefixLength >= 0) query.set_prefix_length(prefixLength);
-    if (maxExpansions > 0) query.set_max_expansions(maxExpansions);
-    return *this;
-  }
-
-  // Add a phrase query (un-analyzed word list) to a top_docs operation
-  LocalReq& phraseQuery(std::string_view field, std::initializer_list<std::string> words, std::string_view opName = "q") {
-    auto& query = *topDocs(opName).mutable_query()->mutable_phrase();
-    query.set_field(field);
-    for (const auto& word : words) {
-      *query.mutable_words()->Add() = word;
-    }
-    return *this;
-  }
-
-  // Add a phrase query from a single un-analyzed text string (analyzed at query time)
-  LocalReq& phraseText(std::string_view field, std::string_view text, std::string_view opName = "q") {
-    auto& query = *topDocs(opName).mutable_query()->mutable_phrase();
-    query.set_field(field);
-    query.set_text(text);
-    return *this;
-  }
-
-  // Add a phrase query from a list of already-analyzed terms (used verbatim)
-  LocalReq& phraseTerms(std::string_view field, std::initializer_list<std::string> terms, std::string_view opName = "q") {
-    auto& query = *topDocs(opName).mutable_query()->mutable_phrase();
-    query.set_field(field);
-    for (const auto& term : terms) {
-      *query.mutable_terms()->Add() = term;
-    }
-    return *this;
-  }
-
-  // Add fields to return in search results
-  LocalReq& fields(std::initializer_list<std::string> fieldNames, std::string_view opName = "q") {
-    auto& td = topDocs(opName);
-    for (const auto& field : fieldNames) {
-      *td.mutable_fields()->Add() = field;
-    }
-    return *this;
-  }
-
-  // Set limit for number of results
-  LocalReq& limit(int64_t maxResults, std::string_view opName = "q") {
-    topDocs(opName).set_limit(maxResults);
-    return *this;
-  }
-
-  // Set batch size for streaming responses
-  LocalReq& batchSize(int32_t batchSize, std::string_view opName = "q") {
-    topDocs(opName).set_batch_size(batchSize);
-    return *this;
-  }
-
-  // Enable match count and scores
-  LocalReq& withStats(std::string_view opName = "q") {
-    auto& td = topDocs(opName);
-    td.set_get_number(true);
-    td.set_get_scores(true);
-    return *this;
-  }
-
-  // Execute the search
   LocalReq& execute(bool parallel = true) {
     engine.submit(*this, parallel);
     return *this;
   }
 
-  // Get the search results as Doc objects for easy comparison
-  std::vector<Doc> getDocs(std::string_view opName = "q") {
-    if (responses.empty()) {
-      return {};
-    }
-    
-    auto it = responses[0]->proto.ops().find(opName);
-    if (it == responses[0]->proto.ops().end() || !it->second.has_docs()) {
-      return {};
-    }
-    
-    return convertResultsToDocs(it->second.docs());
+  // --- result inspection (reads go through the concrete classes' accessors) ---
+  bool ok() const { return !responses.empty() && !hasError(responses[0]->proto); }
+  std::string errorMsg() const { return responses.empty() ? "(no response)" : std::string(responses[0]->proto.error); }
+
+  // The DocList for op `opName` in the first response, or null.
+  const solux::api::DocList* docList(std::string_view opName = "q") const {
+    const solux::api::Val* v = opVal(opName);
+    return v ? v->docList() : nullptr;
+  }
+  // A scalar (e.g. avg/stats) op result. T is one of int64_t/double/float/bool/string_view.
+  template <class T>
+  T scalar(std::string_view opName) const {
+    const solux::api::Val* v = opVal(opName);
+    assert(v != nullptr);
+    return std::get<T>(v->kind);
+  }
+  std::vector<Doc> getDocs(std::string_view opName = "q") const {
+    const auto* dl = docList(opName);
+    return dl ? convertResultsToDocs(*dl) : std::vector<Doc>{};
+  }
+  int64_t getMatchCount(std::string_view opName = "q") const {
+    const auto* dl = docList(opName);
+    return (dl && dl->matches) ? *dl->matches : 0;
   }
 
-  // Get number of matches
-  int64_t getMatchCount(std::string_view opName = "q") {
-    if (responses.empty()) return 0;
-    auto it = responses[0]->proto.ops().find(opName);
-    if (it == responses[0]->proto.ops().end() || !it->second.has_docs()) {
-      return 0;
+  // Compact textual dump for test-failure diagnostics.
+  std::string toString() const {
+    std::string ret = "Request id=" + bytesToStr(view.request_id) + " ops=[";
+    bool first = true;
+    for (const auto& [name, op] : view.ops) { ret += (first ? "" : ","); ret += std::string(name); first = false; }
+    ret += "]\n";
+    for (size_t r = 0; r < responses.size(); r++) {
+      const auto& resp = responses[r]->proto;
+      ret += "  Response[" + std::to_string(r) + "]";
+      if (!resp.error.empty()) ret += " error=\"" + std::string(resp.error) + "\"";
+      ret += std::string(" more=") + (resp.more ? "true" : "false") + "\n";
+      for (const auto& [name, valPtr] : resp.ops) {
+        ret += "    " + std::string(name) + " -> ";
+        if (const auto* dl = valPtr->docList()) {
+          ret += "DocList(matches=" + (dl->matches ? std::to_string(*dl->matches) : std::string("unset"))
+               + ", offset=" + std::to_string(dl->offset) + ", cols=[";
+          bool fc = true;
+          for (const auto& [cn, col] : dl->columns) { ret += (fc ? "" : ","); ret += std::string(cn); fc = false; }
+          ret += "])\n";
+        } else {
+          ret += "kind#" + std::to_string(valPtr->kind.index()) + "\n";
+        }
+      }
     }
-    return it->second.docs().matches();
+    return ret;
   }
 
 private:
-  // Convert protobuf search results back to Doc format
-  static std::vector<Doc> convertResultsToDocs(const proto::DocList& docs) {
+  static constexpr std::size_t OPS_CAP = 32;  // unused by realloc-grow path; kept for clarity
+  std::deque<OpCursor> cursors_;              // stable storage for cursor refs
+  OpCursor rootCursor_;                        // root (op-less) cursor; children go into view.ops
+
+  // Arena-allocate (placement-new) a default T. All solux::api types are trivially
+  // destructible, so the arena is dropped without running dtors.
+  template <class T>
+  T* arenaNew() { return new (mr.allocate(sizeof(T), alignof(T))) T(); }
+
+  // Append a SearchOp* into an ops map (realloc-grow: the builder doesn't know the count up
+  // front, so grow the backing pair[] by one and copy the prior entries).
+  void appendOp(OpsMap& m, std::string_view name, solux::api::SearchOp* sub) {
+    using Pair = std::pair<std::string_view, ::hpp_proto::indirect_view<solux::api::SearchOp>>;
+    auto old = m;
+    Pair* a = build::allocArray(m, old.size() + 1, mr);
+    for (std::size_t i = 0; i < old.size(); i++) a[i] = old[i];
+    a[old.size()] = Pair{build::arenaStr(mr, name), {sub}};
+  }
+  OpCursor& pushCursor(OpCursor* parent, solux::api::SearchOp* op, OpsMap* subOps) {
+    return cursors_.emplace_back(OpCursor(this, parent, op, subOps));
+  }
+
+  // Append one arena-copied string to a span member (realloc-copy preserves prior entries).
+  void appendStr(std::span<const std::string_view>& member, std::string_view s) {
+    auto old = member;
+    std::string_view* a = build::allocArray(member, old.size() + 1, mr);
+    for (std::size_t i = 0; i < old.size(); i++) a[i] = old[i];
+    a[old.size()] = build::arenaStr(mr, s);
+  }
+  void setStrs(std::span<const std::string_view>& member, std::initializer_list<std::string> strs) {
+    std::string_view* a = build::allocArray(member, strs.size(), mr);
+    std::size_t i = 0;
+    for (const auto& s : strs) a[i++] = build::arenaStr(mr, s);
+  }
+
+  static std::string bytesToStr(::hpp_proto::bytes_view b) {
+    return std::string(reinterpret_cast<const char*>(b.data()), b.size());
+  }
+
+  const solux::api::Val* opVal(std::string_view opName) const {
+    if (responses.empty()) return nullptr;
+    const auto* p = responses[0]->proto.ops.find(opName);  // const indirect_view<Val>* or null
+    return p ? &**p : nullptr;
+  }
+
+  // Convert a columnar DocList result back to Doc rows (skipping per-column missing slots).
+  static std::vector<Doc> convertResultsToDocs(const solux::api::DocList& docs) {
     std::vector<Doc> results;
-    
-    if (docs.columns().empty()) {
-      return results;
-    }
-    
-    // Determine number of documents from any column
+    if (docs.columns.empty()) return results;
+
+    // Row count comes from the field (non-_score_) columns, which must all agree in height.
     size_t numDocs = 0;
-    for (const auto& [fieldName, column] : docs.columns()) {
-      if (fieldName == "_score_") continue; // Skip score field for document count
-      
-      if (column.has_col_s()) {
-        numDocs = column.col_s().v_size();
-      } else if (column.has_col_i()) {
-        numDocs = column.col_i().v_size();
-      } else if (column.has_col_f()) {
-        numDocs = column.col_f().v_size();
-      } else if (column.has_col_d()) {
-        numDocs = column.col_d().v_size();
-      } else if (column.has_multi_s()) {
-        numDocs = column.multi_s().v_size();
-      } else if (column.has_multi_i()) {
-        numDocs = column.multi_i().v_size();
-      } else if (column.has_multi_f()) {
-        numDocs = column.multi_f().v_size();
-      } else if (column.has_multi_d()) {
-        numDocs = column.multi_d().v_size();
-      } else if (column.has_col_vec()) {
-        numDocs = column.col_vec().v_size();
-      } else if (column.has_multi_vec()) {
-        numDocs = column.multi_vec().v_size();
-      }
-      break;
+    bool haveCount = false;
+    for (const auto& [fieldName, column] : docs.columns) {
+      if (fieldName == "_score_") continue;
+      std::visit([&](const auto& col) {
+        using C = std::decay_t<decltype(col)>;
+        if constexpr (!std::is_same_v<C, std::monostate>) {
+          if (!haveCount) { numDocs = col.v.size(); haveCount = true; }
+          else { assert(col.v.size() == numDocs && "DocList field columns have mismatched row counts"); }
+        }
+      }, column.kind);
     }
-    
+    if (!haveCount) return results;
     results.resize(numDocs);
-    
-    // Convert each field's column data back to Doc format
-    for (const auto& [fieldName, column] : docs.columns()) {
-      if (fieldName == "_score_") continue; // Skip score field
-      
-      for (size_t docIdx = 0; docIdx < numDocs; docIdx++) {
-        if (column.has_col_s()) {
-          const auto& colData = column.col_s();
-          if (docIdx < (size_t)(colData.v_size()) && colData.v(docIdx) != colData.missing_val()) {
-            results[docIdx].push_back({fieldName, std::string(colData.v(docIdx))});
+
+    for (const auto& [fieldName, column] : docs.columns) {
+      if (fieldName == "_score_") continue;
+      for (size_t i = 0; i < numDocs; i++) {
+        if (const auto* c = std::get_if<solux::api::ColStr>(&column.kind)) {
+          if (i < c->v.size() && c->v[i] != c->missing_val) results[i].push_back({std::string(fieldName), std::string(c->v[i])});
+        } else if (const auto* c = std::get_if<solux::api::ColInt>(&column.kind)) {
+          if (i < c->v.size() && c->v[i] != c->missing_val) results[i].push_back({std::string(fieldName), (int64_t)c->v[i]});
+        } else if (const auto* c = std::get_if<solux::api::ColFloat>(&column.kind)) {
+          if (i < c->v.size() && c->v[i] != c->missing_val) results[i].push_back({std::string(fieldName), c->v[i]});
+        } else if (const auto* c = std::get_if<solux::api::ColDouble>(&column.kind)) {
+          if (i < c->v.size() && c->v[i] != c->missing_val) results[i].push_back({std::string(fieldName), c->v[i]});
+        } else if (const auto* c = std::get_if<solux::api::ArrArrStr>(&column.kind)) {
+          if (i < c->v.size() && !c->v[i].v.empty()) {
+            std::vector<std::string> vals;
+            for (const auto& s : c->v[i].v) vals.emplace_back(s);
+            results[i].push_back({std::string(fieldName), std::move(vals)});
           }
-        } else if (column.has_col_i()) {
-          const auto& colData = column.col_i();
-          if (docIdx < (size_t)(colData.v_size()) && colData.v(docIdx) != colData.missing_val()) {
-            results[docIdx].push_back({fieldName, (int64_t)(colData.v(docIdx))});
+        } else if (const auto* c = std::get_if<solux::api::ArrArrInt>(&column.kind)) {
+          if (i < c->v.size() && !c->v[i].v.empty()) {
+            std::vector<int64_t> vals(c->v[i].v.begin(), c->v[i].v.end());
+            results[i].push_back({std::string(fieldName), std::move(vals)});
           }
-        } else if (column.has_col_f()) {
-          const auto& colData = column.col_f();
-          if (docIdx < (size_t)(colData.v_size()) && colData.v(docIdx) != colData.missing_val()) {
-            results[docIdx].push_back({fieldName, colData.v(docIdx)});
+        } else if (const auto* c = std::get_if<solux::api::ArrArrFloat>(&column.kind)) {
+          if (i < c->v.size() && !c->v[i].v.empty()) {
+            std::vector<float> vals(c->v[i].v.begin(), c->v[i].v.end());
+            results[i].push_back({std::string(fieldName), std::move(vals)});
           }
-        } else if (column.has_col_d()) {
-          const auto& colData = column.col_d();
-          if (docIdx < (size_t)(colData.v_size()) && colData.v(docIdx) != colData.missing_val()) {
-            results[docIdx].push_back({fieldName, colData.v(docIdx)});
+        } else if (const auto* c = std::get_if<solux::api::ArrArrDouble>(&column.kind)) {
+          if (i < c->v.size() && !c->v[i].v.empty()) {
+            std::vector<double> vals(c->v[i].v.begin(), c->v[i].v.end());
+            results[i].push_back({std::string(fieldName), std::move(vals)});
           }
-        } else if (column.has_multi_s()) {
-          const auto& colData = column.multi_s();
-          if (docIdx < (size_t)(colData.v_size()) && colData.v(docIdx).v_size() > 0) {
-            std::vector<std::string> values;
-            for (const auto& val : colData.v(docIdx).v()) {
-              values.push_back(std::string(val));
+        } else if (const auto* c = std::get_if<solux::api::ColVector>(&column.kind)) {
+          if (i < c->v.size() && c->v[i].f32) {
+            std::vector<float> vals(c->v[i].f32->v.begin(), c->v[i].f32->v.end());
+            results[i].push_back({std::string(fieldName), std::move(vals)});
+          }
+        } else if (const auto* c = std::get_if<solux::api::MultiVector>(&column.kind)) {
+          if (i < c->v.size() && !c->v[i].v.empty()) {
+            std::vector<std::vector<float>> vals;
+            for (const auto& vec : c->v[i].v) {
+              if (vec.f32) vals.emplace_back(vec.f32->v.begin(), vec.f32->v.end());
             }
-            results[docIdx].push_back({fieldName, std::move(values)});
-          }
-        } else if (column.has_multi_i()) {
-          const auto& colData = column.multi_i();
-          if (docIdx < (size_t)(colData.v_size()) && colData.v(docIdx).v_size() > 0) {
-            std::vector<int64_t> values;
-            for (const auto& val : colData.v(docIdx).v()) {
-              values.push_back((int64_t)(val));
-            }
-            results[docIdx].push_back({fieldName, std::move(values)});
-          }
-        } else if (column.has_multi_f()) {
-          const auto& colData = column.multi_f();
-          if (docIdx < (size_t)(colData.v_size()) && colData.v(docIdx).v_size() > 0) {
-            std::vector<float> values;
-            for (const auto& val : colData.v(docIdx).v()) {
-              values.push_back(val);
-            }
-            results[docIdx].push_back({fieldName, std::move(values)});
-          }
-        } else if (column.has_multi_d()) {
-          const auto& colData = column.multi_d();
-          if (docIdx < (size_t)(colData.v_size()) && colData.v(docIdx).v_size() > 0) {
-            std::vector<double> values;
-            for (const auto& val : colData.v(docIdx).v()) {
-              values.push_back(val);
-            }
-            results[docIdx].push_back({fieldName, std::move(values)});
-          }
-        } else if (column.has_col_vec()) {
-          // Single-valued vector column: missing if the slot's kind oneof is unset.
-          const auto& colData = column.col_vec();
-          if (docIdx < (size_t)(colData.v_size()) && colData.v(docIdx).has_f32()) {
-            const auto& f32 = colData.v(docIdx).f32();
-            std::vector<float> values(f32.v().begin(), f32.v().end());
-            results[docIdx].push_back({fieldName, std::move(values)});
-          }
-        } else if (column.has_multi_vec()) {
-          // Multi-valued vector column: empty ArrVector means "no values".
-          const auto& colData = column.multi_vec();
-          if (docIdx < (size_t)(colData.v_size()) && colData.v(docIdx).v_size() > 0) {
-            std::vector<std::vector<float>> values;
-            for (const auto& vec : colData.v(docIdx).v()) {
-              if (vec.has_f32()) {
-                values.emplace_back(vec.f32().v().begin(), vec.f32().v().end());
-              }
-            }
-            results[docIdx].push_back({fieldName, std::move(values)});
+            results[i].push_back({std::string(fieldName), std::move(vals)});
           }
         }
       }
     }
-
     return results;
   }
 };
 
+// ---- OpCursor method definitions (LocalReq is now complete) ----
 
-} // solux::test
+inline solux::api::TopDocs& OpCursor::asTopDocs() {
+  assert(op_ != nullptr && std::holds_alternative<solux::api::TopDocs>(op_->kind));
+  return std::get<solux::api::TopDocs>(op_->kind);
+}
+inline solux::api::Query& OpCursor::getOrCreateQuery() {
+  auto& td = asTopDocs();
+  if (!td.query.has_value()) td.query = req_->arenaNew<solux::api::Query>();
+  return *const_cast<solux::api::Query*>(&*td.query);
+}
+inline solux::api::Query& OpCursor::rawQuery() { return getOrCreateQuery(); }
+inline std::pmr::memory_resource& OpCursor::mr() { return req_->mr; }
+
+inline OpCursor& OpCursor::topDocs(std::string_view name) {
+  auto* sub = req_->arenaNew<solux::api::SearchOp>();
+  req_->appendOp(*subOps_, name, sub);
+  auto& td = sub->kind.emplace<solux::api::TopDocs>();
+  return req_->pushCursor(this, sub, &td.ops);
+}
+inline OpCursor& OpCursor::facet(std::string_view name, std::string_view field) {
+  auto* sub = req_->arenaNew<solux::api::SearchOp>();
+  req_->appendOp(*subOps_, name, sub);
+  auto& f = sub->kind.emplace<solux::api::FieldFacet>();
+  f.field = build::arenaStr(req_->mr, field);
+  return req_->pushCursor(this, sub, &f.ops);
+}
+inline OpCursor& OpCursor::rangeFacet(std::string_view name, std::string_view field) {
+  auto* sub = req_->arenaNew<solux::api::SearchOp>();
+  req_->appendOp(*subOps_, name, sub);
+  auto& f = sub->kind.emplace<solux::api::RangeFacet>();
+  f.field = build::arenaStr(req_->mr, field);
+  return req_->pushCursor(this, sub, &f.ops);
+}
+inline OpCursor& OpCursor::avg(std::string_view name, std::string_view field) {
+  return genOpHelper(name, "avg", field);
+}
+inline OpCursor& OpCursor::stats(std::string_view name, std::string_view field) {
+  return genOpHelper(name, "stats", field);
+}
+inline OpCursor& OpCursor::genOpHelper(std::string_view name, std::string_view fn, std::string_view field) {
+  auto* sub = req_->arenaNew<solux::api::SearchOp>();
+  req_->appendOp(*subOps_, name, sub);
+  auto& g = sub->kind.emplace<solux::api::GenOp>();
+  g.name = build::arenaStr(req_->mr, fn);
+  solux::api::Val* args = build::allocArray(g.args, 1, req_->mr);
+  args[0].kind = build::arenaStr(req_->mr, field);
+  return req_->pushCursor(this, sub, nullptr);  // GenOp has no sub-ops
+}
+
+inline OpCursor& OpCursor::allQuery() { getOrCreateQuery().kind = true; return *this; }  // the `all` arm
+inline OpCursor& OpCursor::matchQuery(std::string_view field, std::string_view value) {
+  auto& q = getOrCreateQuery();
+  auto& m = std::holds_alternative<solux::api::Match>(q.kind)
+            ? std::get<solux::api::Match>(q.kind)
+            : q.kind.emplace<solux::api::Match>();
+  m.field = build::arenaStr(req_->mr, field);
+  auto* v = req_->arenaNew<solux::api::Val>();
+  v->kind = build::arenaStr(req_->mr, value);
+  m.val = v;
+  return *this;
+}
+inline OpCursor& OpCursor::matchQuery(std::string_view field, std::string_view value, solux::api::Match_::Operator op) {
+  matchQuery(field, value);
+  std::get<solux::api::Match>(getOrCreateQuery().kind).operator_ = op;
+  return *this;
+}
+inline OpCursor& OpCursor::prefixQuery(std::string_view field, std::string_view prefix) {
+  auto& p = getOrCreateQuery().kind.emplace<solux::api::PrefixQuery>();
+  p.field = build::arenaStr(req_->mr, field);
+  p.prefix = build::arenaStr(req_->mr, prefix);
+  return *this;
+}
+inline OpCursor& OpCursor::fuzzyQuery(std::string_view field, std::string_view term,
+                                      int maxEdits, int prefixLength, int maxExpansions) {
+  auto& f = getOrCreateQuery().kind.emplace<solux::api::FuzzyQuery>();
+  f.field = build::arenaStr(req_->mr, field);
+  f.term = build::arenaStr(req_->mr, term);
+  if (maxEdits >= 0) f.max_edits = maxEdits;
+  if (prefixLength >= 0) f.prefix_length = prefixLength;
+  if (maxExpansions > 0) f.max_expansions = maxExpansions;
+  return *this;
+}
+inline OpCursor& OpCursor::phraseQuery(std::string_view field, std::initializer_list<std::string> words) {
+  auto& p = getOrCreateQuery().kind.emplace<solux::api::PhraseQuery>();
+  p.field = build::arenaStr(req_->mr, field);
+  req_->setStrs(p.words, words);
+  return *this;
+}
+inline OpCursor& OpCursor::phraseText(std::string_view field, std::string_view text) {
+  auto& p = getOrCreateQuery().kind.emplace<solux::api::PhraseQuery>();
+  p.field = build::arenaStr(req_->mr, field);
+  p.text = build::arenaStr(req_->mr, text);
+  return *this;
+}
+inline OpCursor& OpCursor::phraseTerms(std::string_view field, std::initializer_list<std::string> terms) {
+  auto& p = getOrCreateQuery().kind.emplace<solux::api::PhraseQuery>();
+  p.field = build::arenaStr(req_->mr, field);
+  req_->setStrs(p.terms, terms);
+  return *this;
+}
+inline OpCursor& OpCursor::fields(std::initializer_list<std::string> fieldNames) {
+  auto& td = asTopDocs();
+  for (const auto& f : fieldNames) req_->appendStr(td.fields, f);
+  return *this;
+}
+inline OpCursor& OpCursor::batchSize(int32_t n) { asTopDocs().batch_size = n; return *this; }
+inline OpCursor& OpCursor::getNumber(bool v) { asTopDocs().get_number = v; return *this; }
+inline OpCursor& OpCursor::getScores(bool v) { asTopDocs().get_scores = v; return *this; }
+
+inline OpCursor& OpCursor::limit(int64_t n) {
+  if (auto* td = std::get_if<solux::api::TopDocs>(&op_->kind)) td->limit = n;
+  else if (auto* f = std::get_if<solux::api::FieldFacet>(&op_->kind)) f->limit = n;
+  else assert(false && "limit() on an op without a limit field");
+  return *this;
+}
+inline OpCursor& OpCursor::mincount(int64_t n) {
+  if (auto* f = std::get_if<solux::api::FieldFacet>(&op_->kind)) f->mincount = n;
+  else if (auto* r = std::get_if<solux::api::RangeFacet>(&op_->kind)) r->mincount = n;
+  else assert(false && "mincount() on a non-facet op");
+  return *this;
+}
+inline OpCursor& OpCursor::range(int64_t start, int64_t end, int64_t gap) {
+  auto& r = std::get<solux::api::RangeFacet>(op_->kind);
+  r.start = start; r.end = end; r.gap = gap;
+  return *this;
+}
+
+// RAII owner: destruction calls done(), releasing the request arena and every retained
+// response arena. Use: `auto req = localReq(engine); req->topDocs(...)...; req->execute();`
+class LocalReqHandle {
+  LocalReq* p_;
+public:
+  explicit LocalReqHandle(LocalReq* p) : p_(p) {}
+  LocalReqHandle(LocalReqHandle&& o) noexcept : p_(o.p_) { o.p_ = nullptr; }
+  LocalReqHandle(const LocalReqHandle&) = delete;
+  LocalReqHandle& operator=(const LocalReqHandle&) = delete;
+  ~LocalReqHandle() { if (p_) p_->done(); }
+  LocalReq* operator->() const { return p_; }
+  LocalReq& operator*() const { return *p_; }
+  LocalReq* get() const { return p_; }
+};
+
+inline LocalReqHandle localReq(SearchEngine& engine) { return LocalReqHandle(LocalReq::create(engine)); }
+
+} // namespace solux::test
+
+// Assert/expect the request succeeded (first response present + no error), dumping the
+// request/response on failure. Works for a LocalReqHandle or a LocalReq*.
+#define ASSERT_OK(req) ASSERT_TRUE((req)->ok()) << (req)->toString()
+#define EXPECT_OK(req) EXPECT_TRUE((req)->ok()) << (req)->toString()

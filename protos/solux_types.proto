@@ -1,4 +1,4 @@
-edition = "2024";
+syntax = "proto3";
 
 import "google/protobuf/struct.proto";
 
@@ -59,7 +59,7 @@ message TopDocs {
   // A set of named filters on the main query.
   repeated NamedQuery filter = 2;
   int64 offset = 3;
-  sint64 limit = 4;
+  optional sint64 limit = 4;
   bool get_number = 5;          // return the number of matching documents
   bool get_scores = 6;          // return the relevancy score for each document returned
   repeated string fields = 7;   // fields to return for each document
@@ -93,7 +93,7 @@ message Fusion {
   repeated NamedQuery filter = 2;
 
   // Maximum number of fused documents to return.
-  sint64 limit = 3;
+  optional sint64 limit = 3;
 
   // Fusion method (currently only RRF).
   oneof method {
@@ -168,9 +168,9 @@ message ForcePrepareQuery {
 message ConstantScoreQuery {
   Query query = 1;
   // Presence matters: unset means 1.0, while an explicitly set 0.0 is a real
-  // constant score. Edition 2024 gives singular scalar fields explicit
-  // presence by default, so callers can distinguish those cases.
-  float score = 2;
+  // constant score. The `optional` keyword gives this field explicit presence
+  // so callers can distinguish those cases.
+  optional float score = 2;
 }
 
 // Nearest-neighbor query against a searchable vector field.  Exact flat search
@@ -255,9 +255,9 @@ message FuzzyQuery {
   string term = 2;
   // Maximum edit distance, 0..2. Unset = AUTO by term length:
   // 0 for <=2 bytes, 1 for <=5, else 2.
-  int32 max_edits = 3;
+  optional int32 max_edits = 3;
   // Leading bytes that must match exactly. Unset = 1; 0 = no required prefix.
-  int32 prefix_length = 4;
+  optional int32 prefix_length = 4;
   // Max scored term expansions, closest terms first. Unset = 50.
   // Non-scoring filters are uncapped.
   int32 max_expansions = 5;
@@ -279,8 +279,8 @@ message PhraseQuery {
 
 message FieldFacet {
   string field = 1;
-  sint64 limit = 2;         // maximum number of buckets to return
-  int64 mincount = 3; // the minimum count of a bucket to be included in the response
+  optional sint64 limit = 2;         // maximum number of buckets to return
+  optional int64 mincount = 3; // the minimum count of a bucket to be included in the response
   bool missing = 4;
   repeated SortSpec sorts = 5; // how to sort the buckets, if not specified, the default is by count descending
   map<string, SearchOp> ops = 6;  // sub-facets or search operations performed per bucket
@@ -288,10 +288,10 @@ message FieldFacet {
 
 message RangeFacet {
   string field = 1;
-  sint64 start = 2; // inclusive start of the range
-  sint64 end = 3;   // exclusive end of the range
+  optional sint64 start = 2; // inclusive start of the range
+  optional sint64 end = 3;   // exclusive end of the range
   int64 gap = 4; // the size of each bucket in the range
-  int64 mincount = 5; // the minimum count of a bucket to be included in the response
+  optional int64 mincount = 5; // the minimum count of a bucket to be included in the response
   bool missing = 6;
   repeated SortSpec sorts = 7; // how to sort the buckets, if not specified, the default is by bucket id ascending
   map<string, SearchOp> ops = 8;  // sub-facets or search operations performed per bucket
@@ -318,8 +318,8 @@ message SearchResponse {
 
 
 message DocList {
-  sint64 matches = 1;
-  float max_score = 2;
+  optional sint64 matches = 1;
+  optional float max_score = 2;
   map<string, Column> columns = 3;
   int64 offset = 4;
   map<string, Val> ops = 14; // sub-operation results performed on the TopDocs query.
@@ -328,10 +328,10 @@ message DocList {
 
 
 message FacetResult {
-  sint64 total_buckets =  1; // The total number of buckets *if* it was requested.  This can be expensive to calculate.
+  optional sint64 total_buckets =  1; // The total number of buckets *if* it was requested.  This can be expensive to calculate.
   Column bucket_ids = 2;
   repeated int64 counts = 3;
-  int64 missing = 4; // the number of documents that do not have this field
+  optional int64 missing = 4; // the number of documents that do not have this field
   map<string, Val> ops = 22;  // sub-operation results performed per bucket, like a sub-facet or statistics.
   int64 offset = 6;
 }
@@ -396,8 +396,9 @@ message UpdateRequest {
   // is a no-op.
   repeated string delete_ids = 6;
 
-  // If true, existing documents with the same ID will be overwritten by documents in this request.
-  bool overwrite = 7;
+  // If true, allow documents with duplicate IDs (skip overwrite/dedupe).
+  // Default (false) overwrites any existing document with the same ID.
+  bool allow_dups = 7;
 
   // If true, all documents in this request must be successfully indexed or none will be.
   // Processing stops at the first failing document: documents already indexed by this
@@ -727,15 +728,15 @@ message FieldDef {
     VECTOR = 7;    // dense float vector, stored as a fixed-size binary column
     DATE = 8;      // timestamp, stored as int64 milliseconds since the Unix epoch
   }
-  FieldClass field_class = 4;  // if unset (default), inherited from parent
+  optional FieldClass field_class = 4;  // if unset (default), inherited from parent
 
-  bool indexed = 5;
-  bool column_stored = 6;
-  bool multi_valued = 7;
+  optional bool indexed = 5;
+  optional bool column_stored = 6;
+  optional bool multi_valued = 7;
 
   AnalyzerDef analyzer = 8;            // for TEXT fields; if unset, inherited from parent
 
-  bool stored = 9;              // if true, raw values are kept in the segment's stored-fields resource
+  optional bool stored = 9;              // if true, raw values are kept in the segment's stored-fields resource
 
   // When stored=true, names the target stored-fields resource (StoredFieldType
   // entry in the schema).  Empty / unset means the default "_stored_" resource.
@@ -768,13 +769,13 @@ message VectorParams {
   // (unit length).  For COSINE, this disables write-time and aux-build
   // normalization.  No effect on non-COSINE metrics.  Trust-only: not
   // validated at index time.
-  bool normalized = 3;
+  optional bool normalized = 3;
 
   // For COSINE fields, normalize vectors before storing them in the column.
   // If unset, COSINE defaults to true unless normalized is true; other metrics
   // default to false.  A cosine field skips and logs zero / near-zero vectors
   // when normalized is false.
-  bool normalize_on_write = 4;
+  optional bool normalize_on_write = 4;
 }
 
 message SchemaDef {

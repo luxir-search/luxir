@@ -14,6 +14,8 @@ using namespace std;
 using namespace solux;
 using namespace solux::test;
 
+using ResponseStatus = solux::api::UpdateResponse_::Status;
+
 // No schema entry and no default suffix match, so getIndexHandler throws.
 static constexpr const char* BAD_FIELD = "no_such_field";
 
@@ -32,35 +34,34 @@ public:
 
   static IndexResult submitDocs(CollectionHelper& helper, std::span<const Doc> docs,
                                 const SubmitOpts& opts) {
-    google::protobuf::Arena arena;
-    auto* request = google::protobuf::Arena::Create<proto::UpdateRequest>(&arena);
+    CollectionHelper::UpdateBuilder b;
     for (const auto& doc : docs) {
-      CollectionHelper::convertDocToProto(doc, *request->add_docs());
+      b.add(doc);
     }
     for (const auto& id : opts.deleteIds) {
-      request->add_delete_ids(id);
+      b.remove(id);
     }
-    request->set_overwrite(opts.overwrite);
-    request->set_all_or_none(opts.allOrNone);
-    request->set_return_ids(opts.returnIds);
-    request->mutable_commit();
-    return helper.submit(request);
+    b.overwrite(opts.overwrite);
+    b.allOrNone(opts.allOrNone);
+    b.returnIds(opts.returnIds);
+    b.commit();
+    return helper.submit(b);
   }
 
   // ids of all docs in the index
   static std::vector<Doc> allDocs(CollectionHelper& helper) {
-    auto* req = LocalReq::create(helper.getSearchEngine());
-    auto docs = req->collection("main").allQuery().fields({"id"}).limit(-1).execute().getDocs();
-    req->done();
-    return docs;
+    auto req = localReq(helper.getSearchEngine());
+    req->collection("main").topDocs("q").allQuery().fields({"id"}).limit(-1);
+    req->execute();
+    return req->getDocs();
   }
 
   // ids of docs whose text_w contains the (lowercase, single-token) word
   static std::vector<Doc> matchDocs(CollectionHelper& helper, std::string_view word) {
-    auto* req = LocalReq::create(helper.getSearchEngine());
-    auto docs = req->collection("main").matchQuery("text_w", word).fields({"id"}).limit(-1).execute().getDocs();
-    req->done();
-    return docs;
+    auto req = localReq(helper.getSearchEngine());
+    req->collection("main").topDocs("q").matchQuery("text_w", word).fields({"id"}).limit(-1);
+    req->execute();
+    return req->getDocs();
   }
 };
 
@@ -77,11 +78,11 @@ TEST_F(UpdateErrorTest, partialFailureMarksDocDeleted) {
 
   auto result = submitDocs(helper, docs);
   EXPECT_TRUE(result.success);  // partial success
-  ASSERT_EQ(proto::UpdateResponse::PARTIAL, result.response.status());
-  ASSERT_EQ(1, result.response.errors_size());
-  EXPECT_EQ("b1", result.response.errors(0).id());
-  EXPECT_EQ(1, result.response.errors(0).index());
-  EXPECT_NE(std::string::npos, result.response.errors(0).error_message().find(BAD_FIELD));
+  ASSERT_EQ(ResponseStatus::PARTIAL, result.status);
+  ASSERT_EQ(1u, result.errors.size());
+  EXPECT_EQ("b1", result.errors[0].id);
+  EXPECT_EQ(1, result.errors[0].index);
+  EXPECT_NE(std::string::npos, result.errors[0].error_message.find(BAD_FIELD));
 
   auto all = allDocs(helper);
   ASSERT_EQ(2u, all.size());
@@ -102,9 +103,9 @@ TEST_F(UpdateErrorTest, failedOverwriteKeepsOldVersion) {
   Doc badUpdate = flatdoc("id", "x1", "text_w", "updated content", BAD_FIELD, "boom");
   auto result = submitDocs(helper, {&badUpdate, 1});
   EXPECT_FALSE(result.success);
-  ASSERT_EQ(proto::UpdateResponse::ERROR, result.response.status());  // everything failed
-  ASSERT_EQ(1, result.response.errors_size());
-  EXPECT_EQ("x1", result.response.errors(0).id());
+  ASSERT_EQ(ResponseStatus::ERROR, result.status);  // everything failed
+  ASSERT_EQ(1u, result.errors.size());
+  EXPECT_EQ("x1", result.errors[0].id);
 
   // The failed update must not have deleted (or replaced) the old version.
   EXPECT_EQ(1u, allDocs(helper).size());
@@ -130,10 +131,10 @@ TEST_F(UpdateErrorTest, allOrNoneRollsBackBatch) {
   opts.allOrNone = true;
   auto result = submitDocs(helper, docs, opts);
   EXPECT_FALSE(result.success);
-  ASSERT_EQ(proto::UpdateResponse::ERROR, result.response.status());
-  ASSERT_EQ(1, result.response.errors_size());  // docs after the failure are not listed
-  EXPECT_EQ("z", result.response.errors(0).id());
-  EXPECT_EQ(1, result.response.errors(0).index());
+  ASSERT_EQ(ResponseStatus::ERROR, result.status);
+  ASSERT_EQ(1u, result.errors.size());  // docs after the failure are not listed
+  EXPECT_EQ("z", result.errors[0].id);
+  EXPECT_EQ(1, result.errors[0].index);
 
   // The index is unchanged: a still has its old content, c never made it in.
   auto all = allDocs(helper);
@@ -159,13 +160,13 @@ TEST_F(UpdateErrorTest, allOrNoneRollsBackDeletes) {
   opts.allOrNone = true;
   opts.deleteIds = {"y1"};
   auto result = submitDocs(helper, {&bad, 1}, opts);
-  ASSERT_EQ(proto::UpdateResponse::ERROR, result.response.status());
+  ASSERT_EQ(ResponseStatus::ERROR, result.status);
   EXPECT_EQ(1u, matchDocs(helper, "keep").size());
 
   // Without all_or_none the delete applies even though the doc failed.
   opts.allOrNone = false;
   result = submitDocs(helper, {&bad, 1}, opts);
-  ASSERT_EQ(proto::UpdateResponse::PARTIAL, result.response.status());
+  ASSERT_EQ(ResponseStatus::PARTIAL, result.status);
   EXPECT_EQ(0u, matchDocs(helper, "keep").size());
 }
 
@@ -181,10 +182,10 @@ TEST_F(UpdateErrorTest, allFailedIsError) {
 
   auto result = submitDocs(helper, docs);
   EXPECT_FALSE(result.success);
-  ASSERT_EQ(proto::UpdateResponse::ERROR, result.response.status());
-  ASSERT_EQ(2, result.response.errors_size());
-  EXPECT_EQ(0, result.response.errors(0).index());
-  EXPECT_EQ(1, result.response.errors(1).index());
+  ASSERT_EQ(ResponseStatus::ERROR, result.status);
+  ASSERT_EQ(2u, result.errors.size());
+  EXPECT_EQ(0, result.errors[0].index);
+  EXPECT_EQ(1, result.errors[1].index);
   EXPECT_EQ(0u, allDocs(helper).size());
 }
 
@@ -202,11 +203,11 @@ TEST_F(UpdateErrorTest, returnIdsListsOnlySuccesses) {
   SubmitOpts opts;
   opts.returnIds = true;
   auto result = submitDocs(helper, docs, opts);
-  ASSERT_EQ(proto::UpdateResponse::PARTIAL, result.response.status());
-  ASSERT_EQ(2, result.response.ids_size());
-  EXPECT_EQ("g1", result.response.ids(0));
-  EXPECT_EQ("g2", result.response.ids(1));
-  EXPECT_GT(result.response.update_version(), 0u);
+  ASSERT_EQ(ResponseStatus::PARTIAL, result.status);
+  ASSERT_EQ(2u, result.ids.size());
+  EXPECT_EQ("g1", result.ids[0]);
+  EXPECT_EQ("g2", result.ids[1]);
+  EXPECT_GT(result.updateVersion, 0u);
 }
 
 
@@ -220,7 +221,7 @@ TEST_F(UpdateErrorTest, failedDocThenSameIdSucceeds) {
   };
 
   auto result = submitDocs(helper, docs);
-  ASSERT_EQ(proto::UpdateResponse::PARTIAL, result.response.status());
+  ASSERT_EQ(ResponseStatus::PARTIAL, result.status);
 
   EXPECT_EQ(1u, allDocs(helper).size());
   EXPECT_EQ(1u, matchDocs(helper, "good").size());
@@ -243,7 +244,7 @@ TEST_F(UpdateErrorTest, inSegmentDuplicateOverwrite) {
 
   auto result = helper.indexAll(docs, UpdateMessage::COMMIT, true);
   EXPECT_TRUE(result.success);
-  EXPECT_EQ(proto::UpdateResponse::OK, result.response.status());
+  EXPECT_EQ(ResponseStatus::OK, result.status);
 
   EXPECT_EQ(1u, allDocs(helper).size());
   EXPECT_EQ(1u, matchDocs(helper, "second").size());
@@ -267,12 +268,12 @@ TEST_F(UpdateErrorTest, failedDocDoesNotLockVectorDims) {
   };
 
   auto result = submitDocs(helper, docs);
-  ASSERT_EQ(proto::UpdateResponse::PARTIAL, result.response.status());
-  ASSERT_EQ(2, result.response.errors_size());
-  EXPECT_EQ("v1", result.response.errors(0).id());
-  EXPECT_NE(std::string::npos, result.response.errors(0).error_message().find("dims"));
-  EXPECT_EQ("v3", result.response.errors(1).id());
-  EXPECT_NE(std::string::npos, result.response.errors(1).error_message().find("dims=2"));
+  ASSERT_EQ(ResponseStatus::PARTIAL, result.status);
+  ASSERT_EQ(2u, result.errors.size());
+  EXPECT_EQ("v1", result.errors[0].id);
+  EXPECT_NE(std::string::npos, result.errors[0].error_message.find("dims"));
+  EXPECT_EQ("v3", result.errors[1].id);
+  EXPECT_NE(std::string::npos, result.errors[1].error_message.find("dims=2"));
 
   auto all = allDocs(helper);
   ASSERT_EQ(1u, all.size());

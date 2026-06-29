@@ -6,6 +6,7 @@
 #include <limits>
 #include <memory>
 #include <string>
+#include <variant>
 #include <vector>
 
 #include <tbb/task_group.h>
@@ -905,45 +906,37 @@ static void BM_FullTextFacet(benchmark::State& state, int64_t nDocs, std::string
   for (auto _ : state) {
     int64_t ret = 0;
 
-    auto* lreq = LocalReq::create(SoluxTest::soluxNode->getSearchEngine());
-    lreq->proto.mutable_collection()->add_name("main");
-    lreq->proto.set_request_id("myrequestid");
-    auto& ops = *lreq->proto.mutable_ops();
-    auto& topDocs = *ops["q"].mutable_top_docs();
+    auto req = localReq(SoluxTest::soluxNode->getSearchEngine());
+    req->collection("main");
+    auto& topDocs = req->topDocs("q");
 
     if (qterm == "all") {
-      topDocs.mutable_query()->set_all(true);
+      topDocs.allQuery();
     } else {
-      auto& matchQuery = *topDocs.mutable_query()->mutable_match();
-      matchQuery.set_field("body_w");
-      matchQuery.mutable_val()->set_s(std::string(qterm));
+      topDocs.matchQuery("body_w", qterm);
     }
-    topDocs.set_get_number(true);
-    topDocs.set_get_scores(false);
+    topDocs.getNumber(true).getScores(false);
 
     // facet on the full-text field itself
-    auto& topDocsOps = *topDocs.mutable_ops();
-    auto& facet = *topDocsOps["f"].mutable_field_facet();
-    facet.set_field("body_w");
-    facet.set_limit(5);
+    auto& facet = topDocs.facet("f", "body_w");
+    facet.limit(5);
 
-    lreq->engine.submit(*lreq, para);
+    req->execute(para);
 
-    const auto& qDocs = lreq->responses[0]->proto.ops().at("q").docs();
-    matches = qDocs.matches();
-    auto& facetResult = qDocs.ops().at("f").facet();
-    auto& counts = facetResult.counts();
+    const auto* qDocs = req->responses[0]->proto.ops.at("q")->docList();
+    matches = qDocs->matches.value_or(0);
+    const auto* facetResult = qDocs->ops.at("f")->facetResult();
+    const auto& counts = facetResult->counts;
     // Text faceting buckets are terms (col_s).
-    if (facetResult.bucket_ids().has_col_s()) {
-      auto& bucketIds = facetResult.bucket_ids().col_s();
-      for (int i = 0; i < counts.size(); i++) {
-        ret = ret * 31 + java_string_hashcode(bucketIds.v(i)) + counts[i];
+    if (std::holds_alternative<solux::api::ColStr>(facetResult->bucket_ids->kind)) {
+      const auto& bucketIds = std::get<solux::api::ColStr>(facetResult->bucket_ids->kind);
+      for (int i = 0; i < (int)counts.size(); i++) {
+        ret = ret * 31 + java_string_hashcode(bucketIds.v[i]) + counts[i];
       }
     } else {
-      LOG_ERROR("Unexpected bucket ids type in text facet result: {}", facetResult.bucket_ids().DebugString());
+      LOG_ERROR("Unexpected bucket ids type in text facet result: {}", "<unknown>");
     }
 
-    lreq->done();
     benchmark::DoNotOptimize(ret);
 
     if (fp != -1) {

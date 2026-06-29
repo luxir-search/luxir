@@ -1,17 +1,24 @@
 #include "Schema.h"
-#include "protos/solux_types.pb.h"
+#include <memory_resource>
+#include "solux/api/build.h"
+#include "solux/api/solux_types.hpp"
 
 #include <boost/unordered/unordered_flat_set.hpp>
+#include <cstddef>
+#include <span>
 #include <stdexcept>
 #include <vector>
 
 namespace solux {
 
+using FieldClass = solux::api::FieldDef_::FieldClass;
+using VectorMetric = solux::api::VectorParams_::Metric;
+
 // Resolved state for a single FieldDef during fromProto processing
 struct ResolvedField {
   bool abstract = false;
   bool hasFieldClass = false;
-  proto::FieldDef::FieldClass fieldClass = proto::FieldDef::STRING;
+  FieldClass fieldClass = FieldClass::STRING;
   bool hasIndexed = false;
   bool indexed = false;
   bool hasColumnStored = false;
@@ -41,9 +48,27 @@ struct ResolvedField {
   bool vectorNormalizeOnWrite = false;
 };
 
-using sv_flat_map = boost::unordered_flat_map<std::string_view, const proto::FieldDef*, PackedTermHash, PackedTermEqual>;
+using sv_flat_map =
+  boost::unordered_flat_map<std::string_view, const solux::api::FieldDef*, PackedTermHash, PackedTermEqual>;
 using sv_resolved_map = boost::unordered_flat_map<std::string_view, ResolvedField, PackedTermHash, PackedTermEqual>;
 using sv_flat_set = boost::unordered_flat_set<std::string_view, PackedTermHash, PackedTermEqual>;
+
+static std::string serializeSchemaDef(const solux::api::SchemaDef& def) {
+  std::vector<std::byte> serialized;
+  if (!solux::api::encode(def, serialized)) {
+    throw std::runtime_error("Failed to serialize SchemaDef protobuf");
+  }
+  return std::string((const char*)serialized.data(), serialized.size());
+}
+
+// Decode into `def`, whose non-owning views are backed by `arena` (+ the `bytes` buffer);
+// both must outlive any use of `def`.
+static void parseSchemaDef(std::string_view bytes, solux::api::SchemaDef& def,
+                           std::pmr::memory_resource& arena) {
+  if (!solux::api::decode(def, std::as_bytes(std::span<const char>(bytes.data(), bytes.size())), arena)) {
+    throw std::runtime_error("Failed to parse SchemaDef protobuf");
+  }
+}
 
 // Walk the parent chain and resolve all properties for a field.
 static void resolveField(std::string_view name,
@@ -61,79 +86,79 @@ static void resolveField(std::string_view name,
   if (defIt == defMap.end()) {
     throw std::runtime_error("Parent field not found in schema: " + std::string(name));
   }
-  const proto::FieldDef& def = *defIt->second;
+  const solux::api::FieldDef& def = *defIt->second;
 
   // Resolve parent first if exists
   ResolvedField parentResolved{};
-  if (!def.parent().empty()) {
-    std::string_view parentName = def.parent();
+  if (!def.parent.empty()) {
+    std::string_view parentName = def.parent;
     resolveField(parentName, defMap, resolved, visiting);
     parentResolved = resolved.find(parentName)->second;
   }
 
   ResolvedField r;
-  r.abstract = def.abstract();  // NOT inherited
+  r.abstract = def.abstract;  // NOT inherited
 
   // field_class: use this field's if set, else parent's
-  if (def.has_field_class()) {
+  if (def.field_class.has_value()) {
     r.hasFieldClass = true;
-    r.fieldClass = def.field_class();
+    r.fieldClass = *def.field_class;
   } else {
     r.hasFieldClass = parentResolved.hasFieldClass;
     r.fieldClass = parentResolved.fieldClass;
   }
 
   // indexed
-  if (def.has_indexed()) {
+  if (def.indexed.has_value()) {
     r.hasIndexed = true;
-    r.indexed = def.indexed();
+    r.indexed = *def.indexed;
   } else {
     r.hasIndexed = parentResolved.hasIndexed;
     r.indexed = parentResolved.indexed;
   }
 
   // column_stored
-  if (def.has_column_stored()) {
+  if (def.column_stored.has_value()) {
     r.hasColumnStored = true;
-    r.columnStored = def.column_stored();
+    r.columnStored = *def.column_stored;
   } else {
     r.hasColumnStored = parentResolved.hasColumnStored;
     r.columnStored = parentResolved.columnStored;
   }
 
   // multi_valued
-  if (def.has_multi_valued()) {
+  if (def.multi_valued.has_value()) {
     r.hasMultiValued = true;
-    r.multiValued = def.multi_valued();
+    r.multiValued = *def.multi_valued;
   } else {
     r.hasMultiValued = parentResolved.hasMultiValued;
     r.multiValued = parentResolved.multiValued;
   }
 
   // stored
-  if (def.has_stored()) {
+  if (def.stored.has_value()) {
     r.hasStored = true;
-    r.stored = def.stored();
+    r.stored = *def.stored;
   } else {
     r.hasStored = parentResolved.hasStored;
     r.stored = parentResolved.stored;
   }
 
   // stored_resource
-  if (def.has_stored_resource() && !def.stored_resource().empty()) {
+  if (!def.stored_resource.empty()) {
     r.hasStoredResource = true;
-    r.storedResource = def.stored_resource();
+    r.storedResource = def.stored_resource;
   } else {
     r.hasStoredResource = parentResolved.hasStoredResource;
     r.storedResource = parentResolved.storedResource;
   }
 
   // analyzer: atomic - first non-empty AnalyzerDef in chain wins
-  if (def.has_analyzer() && (!def.analyzer().tokenizer().empty() || def.analyzer().filters_size() > 0)) {
+  if (def.analyzer.has_value() && (!def.analyzer->tokenizer.empty() || !def.analyzer->filters.empty())) {
     r.hasAnalyzer = true;
-    r.tokenizer = std::string(def.analyzer().tokenizer());
-    for (int i = 0; i < def.analyzer().filters_size(); i++) {
-      r.filters.push_back(std::string(def.analyzer().filters(i)));
+    r.tokenizer = std::string(def.analyzer->tokenizer);
+    for (const auto& filter : def.analyzer->filters) {
+      r.filters.push_back(std::string(filter));
     }
   } else {
     r.hasAnalyzer = parentResolved.hasAnalyzer;
@@ -143,34 +168,34 @@ static void resolveField(std::string_view name,
 
   // vector: VectorParams.dims > 0 overrides; otherwise inherit from parent
   // (0 = not set / infer from first value).
-  r.vectorDims = (def.has_vector() && def.vector().dims() > 0)
-    ? def.vector().dims()
+  r.vectorDims = (def.vector.has_value() && def.vector->dims > 0)
+    ? def.vector->dims
     : parentResolved.vectorDims;
 
   // vector metric: explicit set on this field overrides; otherwise inherit.
   // proto NONE (0) is treated as "not set" so default-initialized VectorParams
   // doesn't clobber an inherited metric.
-  if (def.has_vector() && def.vector().metric() != proto::VectorParams::NONE) {
+  if (def.vector.has_value() && def.vector->metric != VectorMetric::NONE) {
     r.hasVectorMetric = true;
-    r.vectorMetric = (VectorFieldType::Metric)def.vector().metric();
+    r.vectorMetric = (VectorFieldType::Metric)def.vector->metric;
   } else {
     r.hasVectorMetric = parentResolved.hasVectorMetric;
     r.vectorMetric = parentResolved.vectorMetric;
   }
 
   // vector normalized: explicit set on this field overrides; otherwise inherit.
-  if (def.has_vector() && def.vector().has_normalized()) {
+  if (def.vector.has_value() && def.vector->normalized.has_value()) {
     r.hasVectorNormalized = true;
-    r.vectorNormalized = def.vector().normalized();
+    r.vectorNormalized = *def.vector->normalized;
   } else {
     r.hasVectorNormalized = parentResolved.hasVectorNormalized;
     r.vectorNormalized = parentResolved.vectorNormalized;
   }
 
   // vector normalize_on_write: explicit set on this field overrides; otherwise inherit.
-  if (def.has_vector() && def.vector().has_normalize_on_write()) {
+  if (def.vector.has_value() && def.vector->normalize_on_write.has_value()) {
     r.hasVectorNormalizeOnWrite = true;
-    r.vectorNormalizeOnWrite = def.vector().normalize_on_write();
+    r.vectorNormalizeOnWrite = *def.vector->normalize_on_write;
   } else {
     r.hasVectorNormalizeOnWrite = parentResolved.hasVectorNormalizeOnWrite;
     r.vectorNormalizeOnWrite = parentResolved.vectorNormalizeOnWrite;
@@ -181,35 +206,39 @@ static void resolveField(std::string_view name,
 }
 
 
-std::shared_ptr<Schema> Schema::fromProto(const proto::SchemaDef& def, const Schema* base) {
+std::shared_ptr<Schema> Schema::fromProto(const solux::api::SchemaDef& def, const Schema* base) {
   auto schema = std::make_shared<Schema>();
 
   // Build the source def to persist. For MERGE mode, merge new fields into the base's source def.
   if (base && !base->sourceDef_.empty()) {
-    // Parse the base's source def
-    proto::SchemaDef baseSrc;
-    baseSrc.ParseFromString(base->sourceDef_);
+    // Decode the base's source def into an arena that lives through the merge + serialize.
+    std::pmr::monotonic_buffer_resource baseArena;
+    solux::api::SchemaDef baseSrc;
+    parseSchemaDef(base->sourceDef_, baseSrc, baseArena);
 
     // Build a set of field names from the new def for quick lookup
     sv_flat_set newFieldNames;
-    for (int i = 0; i < def.fields_size(); i++) {
-      newFieldNames.insert(def.fields(i).name());
+    for (const auto& field : def.fields) {
+      newFieldNames.insert(field.name);
     }
 
-    // Start with base fields that are NOT being overridden
-    proto::SchemaDef mergedSrc;
-    for (int i = 0; i < baseSrc.fields_size(); i++) {
-      if (!newFieldNames.contains(baseSrc.fields(i).name())) {
-        *mergedSrc.add_fields() = baseSrc.fields(i);
+    // Merge: base fields NOT being overridden, then all new fields. Collect the FieldDef
+    // views into a local vector (backed by baseSrc's arena + def's source) and point the
+    // merged SchemaDef's span at it, then serialize.
+    std::vector<solux::api::FieldDef> mergedFields;
+    for (const auto& field : baseSrc.fields) {
+      if (!newFieldNames.contains(field.name)) {
+        mergedFields.push_back(field);
       }
     }
-    // Add all new fields (including overrides)
-    for (int i = 0; i < def.fields_size(); i++) {
-      *mergedSrc.add_fields() = def.fields(i);
+    for (const auto& field : def.fields) {
+      mergedFields.push_back(field);
     }
-    schema->sourceDef_ = mergedSrc.SerializeAsString();
+    solux::api::SchemaDef mergedSrc;
+    mergedSrc.fields = std::span<const solux::api::FieldDef>(mergedFields.data(), mergedFields.size());
+    schema->sourceDef_ = serializeSchemaDef(mergedSrc);
   } else {
-    schema->sourceDef_ = def.SerializeAsString();
+    schema->sourceDef_ = serializeSchemaDef(def);
   }
 
   // If MERGE mode, copy base schema's fields
@@ -219,8 +248,8 @@ std::shared_ptr<Schema> Schema::fromProto(const proto::SchemaDef& def, const Sch
 
   // Build a name->FieldDef map
   sv_flat_map defMap;
-  for (int i = 0; i < def.fields_size(); i++) {
-    defMap[def.fields(i).name()] = &def.fields(i);
+  for (const auto& field : def.fields) {
+    defMap[field.name] = &field;
   }
 
   // Resolve all fields
@@ -240,15 +269,15 @@ std::shared_ptr<Schema> Schema::fromProto(const proto::SchemaDef& def, const Sch
       r.abstract = ft->isAbstract();
       r.hasFieldClass = true;
       switch (ft->type()) {
-        case FieldType::ID:     r.fieldClass = proto::FieldDef::ID; break;
-        case FieldType::STRING: r.fieldClass = proto::FieldDef::STRING; break;
-        case FieldType::TEXT:   r.fieldClass = proto::FieldDef::TEXT; break;
-        case FieldType::INT:    r.fieldClass = proto::FieldDef::INT; break;
-        case FieldType::FLOAT:  r.fieldClass = proto::FieldDef::FLOAT; break;
-        case FieldType::DOUBLE: r.fieldClass = proto::FieldDef::DOUBLE; break;
-        case FieldType::DATE:   r.fieldClass = proto::FieldDef::DATE; break;
-        case FieldType::VECTOR: r.fieldClass = proto::FieldDef::VECTOR; break;
-        default:                r.fieldClass = proto::FieldDef::BIN; break;
+        case FieldType::ID:     r.fieldClass = FieldClass::ID; break;
+        case FieldType::STRING: r.fieldClass = FieldClass::STRING; break;
+        case FieldType::TEXT:   r.fieldClass = FieldClass::TEXT; break;
+        case FieldType::INT:    r.fieldClass = FieldClass::INT; break;
+        case FieldType::FLOAT:  r.fieldClass = FieldClass::FLOAT; break;
+        case FieldType::DOUBLE: r.fieldClass = FieldClass::DOUBLE; break;
+        case FieldType::DATE:   r.fieldClass = FieldClass::DATE; break;
+        case FieldType::VECTOR: r.fieldClass = FieldClass::VECTOR; break;
+        default:                r.fieldClass = FieldClass::BIN; break;
       }
       r.hasIndexed = true;
       r.indexed = ft->indexed();
@@ -301,19 +330,19 @@ std::shared_ptr<Schema> Schema::fromProto(const proto::SchemaDef& def, const Sch
     if (!r.hasIndexed) {
       // defaults by field_class
       switch (r.fieldClass) {
-        case proto::FieldDef::ID:     indexed = true; break;
-        case proto::FieldDef::STRING: indexed = true; break;
-        case proto::FieldDef::TEXT:   indexed = true; break;
-        case proto::FieldDef::INT:    indexed = false; break;
+        case FieldClass::ID:     indexed = true; break;
+        case FieldClass::STRING: indexed = true; break;
+        case FieldClass::TEXT:   indexed = true; break;
+        case FieldClass::INT:    indexed = false; break;
         default: indexed = false; break;
       }
     }
     if (!r.hasColumnStored) {
       switch (r.fieldClass) {
-        case proto::FieldDef::ID:     columnStored = true; break;
-        case proto::FieldDef::STRING: columnStored = true; break;
-        case proto::FieldDef::TEXT:   columnStored = false; break;
-        case proto::FieldDef::INT:    columnStored = true; break;
+        case FieldClass::ID:     columnStored = true; break;
+        case FieldClass::STRING: columnStored = true; break;
+        case FieldClass::TEXT:   columnStored = false; break;
+        case FieldClass::INT:    columnStored = true; break;
         default: columnStored = true; break;
       }
     }
@@ -324,13 +353,13 @@ std::shared_ptr<Schema> Schema::fromProto(const proto::SchemaDef& def, const Sch
       // TEXT fields are stored by default so the raw (pre-analysis) value can
       // be returned in search results.  Other field classes default to false;
       // STRING/ID already expose their value via the column store.
-      stored = (r.fieldClass == proto::FieldDef::TEXT);
+      stored = (r.fieldClass == FieldClass::TEXT);
     }
 
     // Build flags
     FieldType::flag_type flags = 0;
     if (indexed) {
-      if (r.fieldClass == proto::FieldDef::TEXT) {
+      if (r.fieldClass == FieldClass::TEXT) {
         flags |= FieldType::INDEX_DOCS_FREQS_POSITIONS;
       } else {
         flags |= FieldType::INDEX_DOCS;
@@ -343,31 +372,31 @@ std::shared_ptr<Schema> Schema::fromProto(const proto::SchemaDef& def, const Sch
     std::shared_ptr<FieldType> ft;
 
     switch (r.fieldClass) {
-      case proto::FieldDef::ID:
+      case FieldClass::ID:
         ft = std::make_shared<IdFieldType>(name, flags);
         break;
-      case proto::FieldDef::STRING:
+      case FieldClass::STRING:
         ft = std::make_shared<StrFieldType>(name, flags);
         break;
-      case proto::FieldDef::TEXT: {
+      case FieldClass::TEXT: {
         std::string tokenizer = r.hasAnalyzer ? r.tokenizer : "whitespace";
         if (tokenizer.empty()) tokenizer = "whitespace";
         ft = std::make_shared<TextFieldType>(name, flags, tokenizer, r.filters);
         break;
       }
-      case proto::FieldDef::INT:
+      case FieldClass::INT:
         ft = std::make_shared<IntFieldType>(name, flags);
         break;
-      case proto::FieldDef::FLOAT:
+      case FieldClass::FLOAT:
         ft = std::make_shared<FloatFieldType>(name, flags);
         break;
-      case proto::FieldDef::DOUBLE:
+      case FieldClass::DOUBLE:
         ft = std::make_shared<DoubleFieldType>(name, flags);
         break;
-      case proto::FieldDef::DATE:
+      case FieldClass::DATE:
         ft = std::make_shared<DateFieldType>(name, flags);
         break;
-      case proto::FieldDef::VECTOR: {
+      case FieldClass::VECTOR: {
         // VECTOR is always fixed-size (every value in a segment must share dims).
         // dims may be 0, meaning "infer from first indexed value".
         bool normalizeOnWrite;
@@ -401,7 +430,10 @@ std::shared_ptr<Schema> Schema::fromProto(const proto::SchemaDef& def, const Sch
 }
 
 
-void Schema::toProto(proto::SchemaDef* def) const {
+void Schema::toProto(solux::api::SchemaDef* def, std::pmr::memory_resource& arena) const {
+  // Non-owning build: collect FieldDef views (over this schema's owned strings + `arena`
+  // for the filters spans) then point def->fields at an arena-allocated copy.
+  std::vector<solux::api::FieldDef> fields;
   for (const auto& [name, ft] : fieldTypeMap) {
     // StoredFieldType entries describe per-segment stored-fields resources.
     // They're managed in-memory (fromProto re-adds the default "_stored_");
@@ -409,150 +441,166 @@ void Schema::toProto(proto::SchemaDef* def) const {
     if (dynamic_cast<const StoredFieldType*>(ft.get()) != nullptr) {
       continue;
     }
-    auto* fieldDef = def->add_fields();
-    fieldDef->set_name(name);
-    fieldDef->set_abstract(ft->isAbstract());
+    solux::api::FieldDef fieldDef;
+    fieldDef.name = name;
+    fieldDef.abstract = ft->isAbstract();
 
     // Map FieldType::Type to FieldDef::FieldClass
     switch (ft->type()) {
       case FieldType::ID:
-        fieldDef->set_field_class(proto::FieldDef::ID);
+        fieldDef.field_class = FieldClass::ID;
         break;
       case FieldType::STRING:
-        fieldDef->set_field_class(proto::FieldDef::STRING);
+        fieldDef.field_class = FieldClass::STRING;
         break;
       case FieldType::TEXT:
-        fieldDef->set_field_class(proto::FieldDef::TEXT);
+        fieldDef.field_class = FieldClass::TEXT;
         break;
       case FieldType::INT:
-        fieldDef->set_field_class(proto::FieldDef::INT);
+        fieldDef.field_class = FieldClass::INT;
         break;
       case FieldType::FLOAT:
-        fieldDef->set_field_class(proto::FieldDef::FLOAT);
+        fieldDef.field_class = FieldClass::FLOAT;
         break;
       case FieldType::DOUBLE:
-        fieldDef->set_field_class(proto::FieldDef::DOUBLE);
+        fieldDef.field_class = FieldClass::DOUBLE;
         break;
       case FieldType::DATE:
-        fieldDef->set_field_class(proto::FieldDef::DATE);
+        fieldDef.field_class = FieldClass::DATE;
         break;
       case FieldType::BIN:
-        fieldDef->set_field_class(proto::FieldDef::BIN);
+        fieldDef.field_class = FieldClass::BIN;
         break;
       case FieldType::VECTOR:
-        fieldDef->set_field_class(proto::FieldDef::VECTOR);
+        fieldDef.field_class = FieldClass::VECTOR;
         break;
       default:
         break;
     }
 
     // Set flags
-    if (ft->indexed()) {
-      fieldDef->set_indexed(true);
-    } else {
-      fieldDef->set_indexed(false);
-    }
-    fieldDef->set_column_stored(ft->hasColumn());
-    fieldDef->set_multi_valued(ft->multiValued());
-    fieldDef->set_stored(ft->isStored());
+    fieldDef.indexed = ft->indexed();
+    fieldDef.column_stored = ft->hasColumn();
+    fieldDef.multi_valued = ft->multiValued();
+    fieldDef.stored = ft->isStored();
     // Only emit stored_resource when it deviates from the default - keeps
     // the serialized schema clean for fields that use "_stored_".
     if (ft->storedResource_ != Postings::STORED_DEFAULT_RESOURCE) {
-      fieldDef->set_stored_resource(ft->storedResource_);
+      fieldDef.stored_resource = ft->storedResource_;
     }
 
     // Serialize analyzer for TEXT fields
     if (ft->type() == FieldType::TEXT) {
       auto* textFt = (TextFieldType*)(ft.get());
-      auto* analyzer = fieldDef->mutable_analyzer();
-      analyzer->set_tokenizer(textFt->tokenizer_);
-      for (const auto& filter : textFt->filters_) {
-        analyzer->add_filters(filter);
+      auto& analyzer = fieldDef.analyzer.emplace();
+      analyzer.tokenizer = textFt->tokenizer_;
+      std::string_view* fl = solux::api::build::allocArray(analyzer.filters, textFt->filters_.size(), arena);
+      for (size_t i = 0; i < textFt->filters_.size(); i++) {
+        fl[i] = textFt->filters_[i];
       }
     } else if (ft->type() == FieldType::VECTOR) {
       auto* vecFt = (VectorFieldType*)(ft.get());
+      auto ensureVector = [&]() -> solux::api::VectorParams& {
+        if (!fieldDef.vector.has_value()) {
+          fieldDef.vector.emplace();
+        }
+        return *fieldDef.vector;
+      };
       if (vecFt->dims_ > 0) {
-        fieldDef->mutable_vector()->set_dims(vecFt->dims_);
+        ensureVector().dims = vecFt->dims_;
       }
       if (vecFt->metric_ != VectorFieldType::METRIC_NONE) {
-        fieldDef->mutable_vector()->set_metric((proto::VectorParams::Metric)vecFt->metric_);
+        ensureVector().metric = (VectorMetric)vecFt->metric_;
       }
       if (vecFt->normalized_) {
-        fieldDef->mutable_vector()->set_normalized(true);
+        ensureVector().normalized = true;
       }
       if (vecFt->metric_ == VectorFieldType::METRIC_COSINE) {
-        fieldDef->mutable_vector()->set_normalize_on_write(vecFt->normalizeOnWrite_);
+        ensureVector().normalize_on_write = vecFt->normalizeOnWrite_;
       }
     }
+    fields.push_back(fieldDef);
+  }
+  solux::api::FieldDef* arr = solux::api::build::allocArray(def->fields, fields.size(), arena);
+  for (size_t i = 0; i < fields.size(); i++) {
+    arr[i] = fields[i];
   }
 }
 
 
 std::shared_ptr<Schema> Schema::createDefaultSchema() {
-  proto::SchemaDef def;
+  // Non-owning build: all strings here are string literals (stable); per-field filter
+  // spans are allocated in `arena`. `fields` + `arena` outlive the fromProto() call.
+  std::pmr::monotonic_buffer_resource arena;
+  std::vector<solux::api::FieldDef> fields;
 
   // Helper lambda to add a field.  `stored` is tri-state: -1 means "leave
   // unset so the field_class default applies", 0/1 set it explicitly.
-  auto addField = [&](const char* name, proto::FieldDef::FieldClass fc,
+  auto addField = [&](const char* name, FieldClass fc,
                       bool abstract, bool indexed, bool columnStored,
                       bool multiValued = false,
                       const char* tokenizer = nullptr,
-                      std::vector<std::string> filters = {},
+                      std::vector<std::string_view> filters = {},
                       int stored = -1) {
-    auto* f = def.add_fields();
-    f->set_name(name);
-    f->set_abstract(abstract);
-    f->set_field_class(fc);
-    f->set_indexed(indexed);
-    f->set_column_stored(columnStored);
-    f->set_multi_valued(multiValued);
-    if (stored >= 0) f->set_stored(stored != 0);
+    solux::api::FieldDef f;
+    f.name = name;
+    f.abstract = abstract;
+    f.field_class = fc;
+    f.indexed = indexed;
+    f.column_stored = columnStored;
+    f.multi_valued = multiValued;
+    if (stored >= 0) f.stored = stored != 0;
     if (tokenizer) {
-      auto* a = f->mutable_analyzer();
-      a->set_tokenizer(tokenizer);
-      for (auto& filter : filters) {
-        a->add_filters(filter);
+      auto& a = f.analyzer.emplace();
+      a.tokenizer = tokenizer;
+      std::string_view* fl = solux::api::build::allocArray(a.filters, filters.size(), arena);
+      for (size_t i = 0; i < filters.size(); i++) {
+        fl[i] = filters[i];
       }
     }
+    fields.push_back(f);
   };
 
   // Concrete fields
-  addField("id", proto::FieldDef::ID, false, true, true);
-  addField("_version_", proto::FieldDef::INT, false, false, true);
+  addField("id", FieldClass::ID, false, true, true);
+  addField("_version_", FieldClass::INT, false, false, true);
 
   // Abstract dynamic suffix fields.  TEXT suffixes inherit the field_class
   // default (stored=true) so the raw value can be returned in search results.
-  addField("_s", proto::FieldDef::STRING, true, true, true);
-  addField("_sc", proto::FieldDef::STRING, true, false, true);
-  addField("_ss", proto::FieldDef::STRING, true, true, true, true);
-  addField("_ssc", proto::FieldDef::STRING, true, false, true, true);
-  addField("_i", proto::FieldDef::INT, true, false, true);
-  addField("_is", proto::FieldDef::INT, true, false, true, true);
-  addField("_f", proto::FieldDef::FLOAT, true, false, true);
-  addField("_fs", proto::FieldDef::FLOAT, true, false, true, true);
-  addField("_d", proto::FieldDef::DOUBLE, true, false, true);
-  addField("_ds", proto::FieldDef::DOUBLE, true, false, true, true);
-  addField("_dt", proto::FieldDef::DATE, true, false, true);
-  addField("_dts", proto::FieldDef::DATE, true, false, true, true);
+  addField("_s", FieldClass::STRING, true, true, true);
+  addField("_sc", FieldClass::STRING, true, false, true);
+  addField("_ss", FieldClass::STRING, true, true, true, true);
+  addField("_ssc", FieldClass::STRING, true, false, true, true);
+  addField("_i", FieldClass::INT, true, false, true);
+  addField("_is", FieldClass::INT, true, false, true, true);
+  addField("_f", FieldClass::FLOAT, true, false, true);
+  addField("_fs", FieldClass::FLOAT, true, false, true, true);
+  addField("_d", FieldClass::DOUBLE, true, false, true);
+  addField("_ds", FieldClass::DOUBLE, true, false, true, true);
+  addField("_dt", FieldClass::DATE, true, false, true);
+  addField("_dts", FieldClass::DATE, true, false, true, true);
   // Text suffixes, from raw to fully folded:
   //   _w  raw whitespace tokens (case- and accent-sensitive)
   //   _wl Unicode word segmentation + NFKC case folding, accents PRESERVED
   //       (the opt-out for accent-sensitive languages: Swedish a-ring, Spanish n-tilde, ...)
   //   _t  the general default: also folds accents, so cafe matches cafe-with-accent
   //       (US/adoption-centric; lossy for some languages - use _wl there)
-  addField("_w", proto::FieldDef::TEXT, true, true, false, false, "whitespace");
-  addField("_wl", proto::FieldDef::TEXT, true, true, false, false, "unicode_word", {"nfkc_cf"});
-  addField("_t", proto::FieldDef::TEXT, true, true, false, false, "unicode_word", {"nfkc_cf", "fold"});
+  addField("_w", FieldClass::TEXT, true, true, false, false, "whitespace");
+  addField("_wl", FieldClass::TEXT, true, true, false, false, "unicode_word", {"nfkc_cf"});
+  addField("_t", FieldClass::TEXT, true, true, false, false, "unicode_word", {"nfkc_cf", "fold"});
   // VECTOR suffixes: single-valued (_v) and multi-valued (_vs).  dims is left
   // unset on the abstract suffix; concrete fields may pin it via VectorParams.
-  addField("_v", proto::FieldDef::VECTOR, true, false, true);
-  addField("_vs", proto::FieldDef::VECTOR, true, false, true, true);
+  addField("_v", FieldClass::VECTOR, true, false, true);
+  addField("_vs", FieldClass::VECTOR, true, false, true, true);
 
   // fromProto ensures the default "_stored_" resource is present.  Users can
   // override or add additional named resources (e.g. "_stored_paragraphs_")
   // by inserting entries in fieldTypeMap before using the schema.
+  solux::api::SchemaDef def;
+  def.fields = std::span<const solux::api::FieldDef>(fields.data(), fields.size());
   return fromProto(def);
 }
+
 
 
 } // namespace solux

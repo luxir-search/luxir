@@ -3,11 +3,10 @@
 #include "solux/reader/TestOverlayAuxReader.h"
 #include "solux/reader/VectorAuxReader.h"
 
-#include "protos/solux_types.pb.h"
+#include "solux/api/solux_types.hpp"
 #include <boost/unordered/unordered_flat_map.hpp>
-#include <google/protobuf/arena.h>
-#include <google/protobuf/io/coded_stream.h>
-#include <google/protobuf/io/zero_copy_stream_impl_lite.h>
+#include <memory_resource>
+#include <span>
 
 #include "OrdMapImpl.h"
 
@@ -23,15 +22,15 @@ std::string segmentAuxKey(uint64_t segId, std::string_view name) {
 }
 
 std::shared_ptr<AuxReader> openKnownAux(Directory& dir,
-                                        const proto::AuxIndexInfo& info,
+                                        const solux::api::AuxIndexInfo& info,
                                         bool missingFileOK) {
-  if (info.kind() == VectorAuxReader::KIND) {
+  if (info.kind == VectorAuxReader::KIND) {
     return VectorAuxReader::open(dir, info, missingFileOK);
   }
-  if (info.kind() == TestOverlayAuxReader::KIND) {
+  if (info.kind == TestOverlayAuxReader::KIND) {
     return TestOverlayAuxReader::open(dir, info, missingFileOK);
   }
-  IREADER_DEBUG("Skipping unknown aux kind '{}' for '{}'", info.kind(), info.name());
+  IREADER_DEBUG("Skipping unknown aux kind '{}' for '{}'", info.kind, info.name);
   return nullptr;
 }
 
@@ -119,8 +118,6 @@ IndexReader::IndexReader(Directory& dir, IndexReader* previousReader) {
   // But we should really have a postings getter abstraction that can provide already opened readers and livedocs
   uint64_t lastCommitTime = 0;
   bool retry = false;
-  
-  google::protobuf::Arena arena;
 
   // Index previous reader's aux readers by name for cheap reuse when the new
   // commit carried the entry forward (same gen + built_core_gen).  FAISS
@@ -146,12 +143,13 @@ IndexReader::IndexReader(Directory& dir, IndexReader* previousReader) {
       totalMaxDoc = 0;
       livedocs = 0;
       retry = false;
-      // Clear arena to prevent unbounded growth
-      arena.Reset();
     }
-    
-    auto* indexInfo = google::protobuf::Arena::Create<solux::proto::IndexInfo>(&arena);
-    
+
+    // Non-owning IndexInfo view; its repeated messages live in indexInfoArena and its
+    // strings view the inputFile bytes (segmentsIs below), both alive through the loop.
+    std::pmr::monotonic_buffer_resource indexInfoArena;
+    solux::api::IndexInfo indexInfo;
+
     // Don't use expectSynced here - IndexReader can race with a concurrent
     // commit that has finished s.olux but not yet synced it.
     std::shared_ptr<InputFile> inputFile = dir.openFile(Postings::INDEX_INFO_FILE);
@@ -162,19 +160,16 @@ IndexReader::IndexReader(Directory& dir, IndexReader* previousReader) {
       IREADER_DEBUG("Opening IndexReader");
       InputStream segmentsIs = inputFile->getInputStream();
 
-      google::protobuf::io::ArrayInputStream arrayStream(segmentsIs.ptr(), (int)segmentsIs.left());
-      google::protobuf::io::CodedInputStream codedStream(&arrayStream);
-
-      if (!indexInfo->ParseFromCodedStream(&codedStream)) {
+      std::span<const char> indexInfoBytes(segmentsIs.ptr(), (size_t)segmentsIs.left());
+      if (!solux::api::decode(indexInfo, std::as_bytes(indexInfoBytes), indexInfoArena)) {
         throw std::runtime_error("Failed to parse IndexInfo protobuf");
       }
-      assert(codedStream.ConsumedEntireMessage());
 
-      commitTimeUs = indexInfo->commit_time();
-      this->coreGeneration = indexInfo->core_gen();
+      commitTimeUs = indexInfo.commit_time;
+      this->coreGeneration = indexInfo.core_gen;
       bool missingFileOK = true; // Allow missing files on first attempt
-      IREADER_DEBUG("\tOpening IndexReader, commitTime={} nSegs={} gen={}", indexInfo->commit_time(),
-                    indexInfo->segments_size(), indexInfo->index_gen());
+      IREADER_DEBUG("\tOpening IndexReader, commitTime={} nSegs={} gen={}", indexInfo.commit_time,
+                    indexInfo.segments.size(), indexInfo.index_gen);
       if (commitTimeUs == lastCommitTime) {
         // No new commit, continue with missingFileOK=false so we get proper exceptions
         IREADER_DEBUG("Retry index open did not get new IndexInfo file, will try with missingFileOK=false.");
@@ -182,12 +177,12 @@ IndexReader::IndexReader(Directory& dir, IndexReader* previousReader) {
       }
       lastCommitTime = commitTimeUs;
 
-      segs.reserve(indexInfo->segments_size());
-      for (int i = 0; i < indexInfo->segments_size(); i++) {
-        const auto& segment = indexInfo->segments(i);
-        uint64_t segId = segment.seg_id();
-        uint64_t liveGen = segment.live_gen();
-        int32_t nDocs = segment.max_doc();
+      segs.reserve(indexInfo.segments.size());
+      for (int i = 0; i < (int)indexInfo.segments.size(); i++) {
+        const auto& segment = indexInfo.segments[i];
+        uint64_t segId = segment.seg_id;
+        uint64_t liveGen = segment.live_gen;
+        int32_t nDocs = segment.max_doc;
         unused(nDocs);
 
         // TODO: instead of creating a new PostingsReader, we could check if the previousReader has it already opened.
@@ -212,25 +207,25 @@ IndexReader::IndexReader(Directory& dir, IndexReader* previousReader) {
         // If liveGen == 0, liveDocs remains nullptr (no deletes)
 
         std::vector<std::shared_ptr<AuxReader>> segmentAuxReaders;
-        segmentAuxReaders.reserve(segment.overlays_size());
-        for (int j = 0; j < segment.overlays_size(); j++) {
-          const auto& info = segment.overlays(j);
+        segmentAuxReaders.reserve(segment.overlays.size());
+        for (int j = 0; j < (int)segment.overlays.size(); j++) {
+          const auto& info = segment.overlays[j];
 
-          auto prevIt = prevSegAuxByKey.find(segmentAuxKey(segId, info.name()));
+          auto prevIt = prevSegAuxByKey.find(segmentAuxKey(segId, info.name));
           if (prevIt != prevSegAuxByKey.end()
-              && prevIt->second->getGen() == info.gen()
-              && prevIt->second->getBuiltCoreGen() == info.built_core_gen()) {
+              && prevIt->second->getGen() == info.gen
+              && prevIt->second->getBuiltCoreGen() == info.built_core_gen) {
             IREADER_DEBUG("Reusing segment overlay '{}' for seg={} (gen={}) from previous IndexReader",
-                          info.name(), segId, info.gen());
+                          info.name, segId, info.gen);
             segmentAuxReaders.push_back(prevIt->second);
             continue;
           }
 
           auto aux = openKnownAux(dir, info, missingFileOK);
-          if (!aux && (info.kind() == VectorAuxReader::KIND
-                       || info.kind() == TestOverlayAuxReader::KIND)) {
+          if (!aux && (info.kind == VectorAuxReader::KIND
+                       || info.kind == TestOverlayAuxReader::KIND)) {
             IREADER_DEBUG("Segment overlay file missing for '{}' seg={} - triggering retry",
-                          info.name(), segId);
+                          info.name, segId);
             retry = true;
             break;
           }
@@ -243,11 +238,11 @@ IndexReader::IndexReader(Directory& dir, IndexReader* previousReader) {
         Segment::SegmentInfo segmentInfo;
         segmentInfo.seg_id = segId;
         segmentInfo.live_gen = liveGen;
-        segmentInfo.min_version = segment.min_version();
-        segmentInfo.max_version = segment.max_version();
+        segmentInfo.min_version = segment.min_version;
+        segmentInfo.max_version = segment.max_version;
         segmentInfo.max_doc = nDocs;
-        segmentInfo.commit_time = segment.commit_time();
-        segmentInfo.live_docs = segment.live_docs();
+        segmentInfo.commit_time = segment.commit_time;
+        segmentInfo.live_docs = segment.live_docs;
 
         segs.emplace_back(std::move(postingsReader), std::move(liveDocs),
                           std::move(segmentAuxReaders), segmentInfo, totalMaxDoc, i);
@@ -261,18 +256,18 @@ IndexReader::IndexReader(Directory& dir, IndexReader* previousReader) {
       // only after publishing the new IndexInfo, so the retry will see a
       // referenceable list).  Unknown-kind entries are skipped silently.
       if (!retry) {
-        for (int i = 0; i < indexInfo->aux_indexes_size(); i++) {
-          const auto& info = indexInfo->aux_indexes(i);
+        for (int i = 0; i < (int)indexInfo.aux_indexes.size(); i++) {
+          const auto& info = indexInfo.aux_indexes[i];
 
           // Reuse from the previous reader when name + gen + built_core_gen
           // all match - the writer carry-forward logic guarantees the files
           // are byte-identical in that case.
-          auto prevIt = prevAuxByName.find(std::string(info.name()));
+          auto prevIt = prevAuxByName.find(std::string(info.name));
           if (prevIt != prevAuxByName.end()
-              && prevIt->second->getGen() == info.gen()
-              && prevIt->second->getBuiltCoreGen() == info.built_core_gen()) {
+              && prevIt->second->getGen() == info.gen
+              && prevIt->second->getBuiltCoreGen() == info.built_core_gen) {
             IREADER_DEBUG("Reusing aux reader '{}' (gen={}) from previous IndexReader",
-                          info.name(), info.gen());
+                          info.name, info.gen);
             auxReadersList.push_back(prevIt->second);
             continue;
           }
@@ -280,13 +275,13 @@ IndexReader::IndexReader(Directory& dir, IndexReader* previousReader) {
           // Dispatch by kind.  Unknown kinds are silently skipped so older
           // binaries can read indexes that contain newer aux kinds.
           std::shared_ptr<AuxReader> aux = openKnownAux(dir, info, missingFileOK);
-          if (!aux && info.kind() != VectorAuxReader::KIND
-                   && info.kind() != TestOverlayAuxReader::KIND) {
+          if (!aux && info.kind != VectorAuxReader::KIND
+                   && info.kind != TestOverlayAuxReader::KIND) {
             continue;
           }
 
           if (!aux) {
-            IREADER_DEBUG("Aux file missing for '{}' - triggering retry", info.name());
+            IREADER_DEBUG("Aux file missing for '{}' - triggering retry", info.name);
             retry = true;
             break;
           }

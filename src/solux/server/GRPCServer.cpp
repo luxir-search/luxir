@@ -1,23 +1,34 @@
 
 #include <string>
 #include <algorithm>
+#include <cstddef>
+#include <deque>
+#include <memory_resource>
+#include <mutex>
+#include <optional>
+#include <span>
+#include <unordered_map>
+#include <vector>
 #include <grpcpp/grpcpp.h>
+#include <grpcpp/generic/async_generic_service.h>
 #include <absl/strings/str_cat.h>
-#include <google/protobuf/text_format.h>
 #include <grpcpp/health_check_service_interface.h>
 #include <grpcpp/ext/proto_server_reflection_plugin.h>
+#include <grpcpp/support/byte_buffer.h>
+#include <hpp_proto/grpc/serialization.hpp>
 #include <oneapi/tbb/task_group.h>
 
 #include "GRPCServer.h"
 #include "SoluxNode.h"
+#include "solux/api/solux.hpp"
 #include "solux/util/random.h"
 #include "solux/util/solux_util.h"
 #include "solux/util/TaggedPtr.h"
-#include "solux/query/ProtobufQueryParser.h"
 #include "solux/util/thread.h"
 #include "solux/util/proto.h"
 #include "ProtoUpdateMessage.h"
 #include "solux/schema/Schema.h"
+#include "solux_descriptors.h"
 
 
 namespace solux {
@@ -42,19 +53,21 @@ void solux::GRPCServer::run() {
   std::string bindHost = requestedPort == 0 ? "127.0.0.1" : "0.0.0.0";
   std::string server_address = bindHost + ":" + std::to_string(requestedPort);
 
+  registerSoluxDescriptors();
   grpc::EnableDefaultHealthCheckService(true);
   grpc::reflection::InitProtoReflectionServerBuilderPlugin();
   grpc::ServerBuilder builder;
   // Listen on the given address without any authentication mechanism.
   // The actual port will be stored in serverPort
   builder.AddListeningPort(server_address, grpc::InsecureServerCredentials(), &serverPort);
-  // Register "service" as the instance through which we'll communicate with
-  // clients. In this case it corresponds to a *synchronous* service.
 
-  builder.RegisterService(&greeterService);
-  builder.RegisterService(&indexerService);
-  builder.RegisterService(&searcherService);
-  builder.RegisterService(&adminService);
+  // One generic service handles every method as raw bytes; dispatch is by RPC
+  // path inside GenericCallData.  registerSoluxDescriptors() makes describe and
+  // FileContainingSymbol work through the generated descriptor pool.  TODO:
+  // add a descriptor-backed reflection service for ListServices, since the
+  // stock plugin lists registered typed services and generic service leaves it
+  // empty.
+  builder.RegisterAsyncGenericService(&genericService);
 
   threadInfos.reserve(nthreads);
 
@@ -116,685 +129,233 @@ public:
 
   GRPCServer& server;
   GRPCServer::ThreadInfo& threadInfo;
-
-  grpc::ServerContext ctx;
-  // TODO: ServerContext objects should not be used across different RPC calls (but does this apply to multiple messages in a streaming RPC???)
 };
 
 
-// TODO: make a template class for request/response
-template <class RequestT, class ResponseT, class AsyncServiceT>
-class UnaryCallData : public CallData {
-public:
-  RequestT request;
-  ResponseT response;
-  AsyncServiceT& service;
-  grpc::ServerAsyncResponseWriter<ResponseT> responder;
-  enum CallStatus { CREATE, PROCESS, FINISH };
-  CallStatus state;
+class GenericCallData;
 
-  UnaryCallData(GRPCServer& server, AsyncServiceT& service, GRPCServer::ThreadInfo& threadInfo) : CallData(server, threadInfo), service(service), responder(&ctx) {
-    // TODO: how to do this in a generic way?  I would need to get the index of the method and then call
-    // ::grpc::Service::RequestAsyncUnary(0, context, request, response, new_call_cq, notification_cq, tag);
-    // service.RequestSayHello(&ctx, &request, &responder, &cq, &cq, (void*)this);
-    state = PROCESS;
-  }
-
-  virtual void proceed(bool ok, uint32_t tag) override {
-    unused(tag);
-    // std::cout << "UnaryCallData.proceed(" << ok << ") this=" << (void*)this << std::endl;
-    if (!ok) {
-      // canceled/errored... nothing else to do.
-      // std::cout << "deleting " << (void*)this << std::endl;
-      delete this;
-      return;
-    }
-
-    if (state == PROCESS) {
-      threadInfo.requests++;
-
-      // create a new instance of this to handle additional calls.
-      createNew();
-
-      // The actual processing.
-      state = FINISH;
-      try {
-        fillResponse();
-        responder.Finish(response, grpc::Status::OK, make_tag());
-      } catch (const std::exception& e) {
-        responder.Finish(response, grpc::Status(grpc::StatusCode::INTERNAL, e.what()), make_tag());
-      }
-      //std::cout << "finish called," << counter++ << std::endl;
-    } else {
-      // nothing left to do but delete ourselves
-      // std::cout << "deleting " << (void*)this << std::endl;
-      delete this;
-    }
-
-  }
-
-  virtual void createNew() = 0;
-  virtual void fillResponse() = 0;
+// A routed method: how it parses the request bytes, runs the engine, and produces
+// response bytes.  handle() is invoked once per inbound message (once for unary,
+// repeatedly for client streams); it must arrange for call.respondRaw(...) to be
+// called for each response and account for the responsesExpected++ the read loop
+// did before calling it (respondRaw's finishCount, or decrementOutstanding()).
+struct MethodEntry {
+  void (*handle)(GenericCallData& call, grpc::ByteBuffer& readBuf);
 };
 
-template <class RequestT, class ResponseT, class AsyncServiceT>
-class BiStreamingRequest : public CallData {
+static const MethodEntry* lookupMethod(const std::string& method);
+
+using SearchReqProto = solux::api::SearchRequest;
+using UpdateReqProto = solux::api::UpdateRequest;
+using UpdateRespProto = solux::api::UpdateResponse;
+using SchemaReqProto = solux::api::SchemaRequest;
+using SchemaRespProto = solux::api::SchemaResponse;
+using HelloReqProto = solux::api::HelloRequest;
+using HelloRespProto = solux::api::HelloReply;
+
+template <typename Message>
+struct HppRequestState {
+  std::vector<std::byte> wire;
+  std::pmr::monotonic_buffer_resource resource;
+  Message proto;
+};
+
+static grpc::Status dumpByteBuffer(grpc::ByteBuffer& buf, std::vector<std::byte>& wire) {
+  std::vector<grpc::Slice> slices;
+  auto status = buf.Dump(&slices);
+  if (!status.ok()) {
+    return status;
+  }
+  wire.clear();
+  size_t size = 0;
+  for (const auto& slice : slices) {
+    size += slice.size();
+  }
+  wire.reserve(size + 1);
+  for (const auto& slice : slices) {
+    const auto* data = (const std::byte*)slice.begin();
+    wire.insert(wire.end(), data, data + slice.size());
+  }
+  wire.push_back(std::byte{0});
+  return grpc::Status::OK;
+}
+
+template <typename Message>
+static bool parseRequest(grpc::ByteBuffer& buf, HppRequestState<Message>& state, std::string_view method) {
+  auto grpcStatus = dumpByteBuffer(buf, state.wire);
+  if (!grpcStatus.ok()) {
+    LOG_ERROR("{}: failed to read request ByteBuffer: {}", method, grpcStatus.error_message());
+    return false;
+  }
+
+  std::span<const std::byte> payload(state.wire.data(), state.wire.size() - 1);
+  if (!solux::api::decode(state.proto, payload, state.resource)) {
+    LOG_ERROR("{}: failed to parse request", method);
+    return false;
+  }
+  return true;
+}
+
+// Serialize a concrete message into an OWNED ByteBuffer (decoupled from any arena).
+// grpc::Slice copies the bytes, so the temporary vector can go away.
+template <typename Message>
+static grpc::ByteBuffer serializeToByteBuffer(const Message& msg) {
+  std::vector<std::byte> v;
+  if (!solux::api::encode(msg, v)) {
+    LOG_ERROR("gRPC: failed to serialize response");
+  }
+  grpc::Slice slice((const void*)v.data(), v.size());
+  return grpc::ByteBuffer(&slice, 1);
+}
+
+
+// Generic raw call: one state machine for every method, routed by RPC path.
+//
+// Generalizes the Track-1 RawSearcherSearchStreamingCall onto grpc::AsyncGenericService
+// (solux-private/hpp-proto-glaze.md). Every RPC - unary or streaming - is handled as a
+// raw ByteBuffer stream: outgoing bytes are OWNED here (writeBuffer + pending), fully
+// decoupled from any request/response arena, so handlers do eager cleanup with no
+// post-write callback. A unary RPC is just a stream with one read + one write.
+class GenericCallData : public CallData {
 public:
+  grpc::AsyncGenericService& genericService;
+  grpc::GenericServerContext genericCtx;
+  grpc::GenericServerAsyncReaderWriter readerWriter;  // ServerAsyncReaderWriter<ByteBuffer,ByteBuffer>
+  grpc::ByteBuffer readBuf;  // incoming raw request bytes
 
-  // We want to support two streaming use-cases:
-  // 1) common case of a single response for a single request
-  //    ideally use a single arena for both
-  // 2) multiple responses for a single request
-  //    each response should be in a separate arena so they can be freed separately
-  // We also need to buffer responses since only one write can be outstanding at once.
-
-  using callback_type = std::function<void(google::protobuf::Message*)>;
-  using MessageAndCallback = std::pair<google::protobuf::Message*, callback_type>;
-  constexpr static size_t ARENA_BUF_SIZE = 1024;  // size of first buffer to give to the arena (includes space for arena itself!)
+  const MethodEntry* methodEntry = nullptr;  // resolved on CONNECT from the RPC path
 
   std::mutex mutex;
-  AsyncServiceT& service;
-  grpc::ServerAsyncReaderWriter<ResponseT,RequestT> readerWriter;
+  // protected by mutex:
+  std::deque<grpc::ByteBuffer> pending;  // buffered outgoing responses (owned bytes)
+  grpc::ByteBuffer writeBuffer;          // bytes of the in-flight write; kept alive until WRITE completes
+  bool errored = false;
+  bool readsDone = false;
+  bool writeOutstanding = false;
+  bool finishSent = false;
+  int32_t responsesExpected = 0;
 
-  // The current request object (req->request) that is being read into.
-  RequestT* req = nullptr;
+  enum CallTags { READ = 1, WRITE = 2, FINISH = 3, CONNECT = 4 };
 
-  // these are protected by the mutex
-  std::deque<MessageAndCallback> pending;  // pending writes
-  bool errored = false;    // if true, something happened and additional reads/writes should fail.
-  bool readsDone = false;  // true when client ends the stream and we can't read any more messages
-  bool writeOutstanding = false;  // if true, a write was requested but not yet completed.  Only one write can be outstanding at a time in a streaming RPC.
-  bool finishSent = false;  // if true, we sent a finish.
-  int32_t responsesExpected = 0;  // number of future responses to requests we are expecting.
-
-  // these are the tags we use in the completion queue to know what event/operation finished in the completion queue.
-  enum CallTags { READ = 1, WRITE = 2, FINISH = 3, CONNECT = 4, ASYNC_NOTIFY_WHEN_DONE = 5 };
-
-  int numCalls = 0; // TODO: testing only... remove after stable.
-
-
-
-  BiStreamingRequest(GRPCServer& server, AsyncServiceT& service, GRPCServer::ThreadInfo& threadInfo) : CallData(server, threadInfo), service(service), readerWriter(&ctx) {
-    GRPC_DEBUG("CREATE StreamingCallData this={}", (void*)this);
-
-    // see https://stackoverflow.com/questions/60856240/grpc-c-async-server-how-differentiate-between-writesdone-and-broken-connection
-    // TODO: not sure the right way to use this event yet.
-
-    // NOTE: ASYNC_NOTIFY_WHEN_DONE can come in *after* the FINISH event (i.e. AFTER this object has been deleted!)
-    // Hence we must not use it like this.
-    // If we ever need to check for cancellation, then we will need ASYNC_NOTIFY_WHEN_DONE.  Perhaps delete only
-    // after both Finish and ASYNC_NOTIFY_WHEN_DONE have been received?
-    // ctx.AsyncNotifyWhenDone(make_tag(CallTags::ASYNC_NOTIFY_WHEN_DONE));
+  GenericCallData(GRPCServer& server, grpc::AsyncGenericService& genericService, GRPCServer::ThreadInfo& threadInfo)
+      : CallData(server, threadInfo), genericService(genericService), readerWriter(&genericCtx) {
+    genericService.RequestCall(&genericCtx, &readerWriter, threadInfo.cq.get(), threadInfo.cq.get(), make_tag(CONNECT));
   }
 
-  virtual ~BiStreamingRequest() {
-    // release arena of req
-    if (req) {
-      releaseArena(req->GetArena());
-      req = nullptr;
-    }
+  void createNew() {
+    new GenericCallData(server, genericService, threadInfo);
   }
 
-
-  // mutex is held when calling this method
-  void doWrite(ResponseT* response, const callback_type& callback) {
+  // mutex held
+  void doWrite(grpc::ByteBuffer&& buf) {
     assert(!writeOutstanding);
     writeOutstanding = true;
-    readerWriter.Write(*response, make_tag(WRITE));
-    callback(response);
+    writeBuffer = std::move(buf);  // retain bytes for the duration of the async write
+    readerWriter.Write(writeBuffer, make_tag(WRITE));
   }
 
-  // mutex is held when calling this method
+  // mutex held
   void maybeSendFinish() {
-    // TODO: what if errored state?
     if (!finishSent && readsDone && pending.empty() && !writeOutstanding && responsesExpected <= 0) {
-      // There are no other outstanding requests, so we can finish now.
       readerWriter.Finish(grpc::Status::OK, make_tag(FINISH));
       finishSent = true;
-      GRPC_DEBUG("After calling Finish. this={} numCalls={} cancelled={}", (void*)this, numCalls, ctx.IsCancelled());
     }
+  }
+
+  /// Enqueue an owned response (one outstanding write at a time).
+  /// Returns the number of buffered (not-yet-written) responses.
+  /// NOTE: with finishCount>0 this may eventually delete "this" on another thread,
+  /// so make it the last use of "this" in the caller.
+  size_t respondRaw(grpc::ByteBuffer&& buf, int32_t finishCount = 1) {
+    const std::lock_guard<std::mutex> lock(mutex);
+    responsesExpected -= finishCount;
+    if (writeOutstanding) {
+      pending.emplace_back(std::move(buf));
+    } else {
+      doWrite(std::move(buf));
+    }
+    return pending.size();
+  }
+
+  void decrementOutstanding(int32_t finishCount = 1) {
+    const std::lock_guard<std::mutex> lock(mutex);
+    responsesExpected -= finishCount;
+    maybeSendFinish();
   }
 
   void writeFinished(bool ok) {
-    {
-      const std::lock_guard<std::mutex> lock(mutex);
-
-      if (!ok) {
-        errored = true;
-        readsDone = true;  // is this needed? Our Read() call should also be returned with !ok and do the same thing?
-      }
-      assert(writeOutstanding);
-      writeOutstanding = false;
-      if (!pending.empty()) {
-        auto& pendingResponse = pending.front();
-        doWrite((ResponseT*)pendingResponse.first, pendingResponse.second);
-        pending.pop_front();
-      } else {
-        maybeSendFinish();
-      }
-    }
-  }
-
-
-  // request a read
-  void readRequest() {
-    if (req == nullptr) {
-      req = createRequestMessage();
-    }
-    readerWriter.Read(req, make_tag(READ));
-  }
-
-
-  /// response is the message to send back to the client.
-  /// callback will be called with the response message after Write has been called and it is safe to free it.
-  /// The callback object itself may be copied and called later, so it must be safe to do so.
-  /// finishCount is the number of outstanding requests that this write will complete (i.e. responsesExpected is decremented).
-  /// 0 if further writes will happen for the same request.
-  /// 1 if the request is done and this is the last write.
-  /// 2 or more if this write effectively coalesces responses to multiple requests.
-  /// @returns the number of currently buffered write requests
-  /// NOTE: calling with finishCount>0 may eventually cause "this" to be deleted in another thread,
-  /// so make it the last thing you do with "this" in the calling code.
-  size_t respond(ResponseT* response, const callback_type& callback, int32_t finishCount=1) {
-    {
-      const std::lock_guard<std::mutex> lock(mutex);
-
-      responsesExpected -= finishCount;
-      if (writeOutstanding) {
-        // we can't write until the previous write is done.
-        pending.emplace_back(MessageAndCallback{response, callback});
-      } else {
-        doWrite(response, callback);
-      }
-
-      return pending.size();
-    }
-  }
-
-  /// Decrement the count of the number of outstanding responses expected.
-  /// This can be used when something bad happened with a request and we don't want to send a response.
-  /// This can also be used when multiple responses are sent for a request, but one doesn't know the order the
-  /// responses will be completed.
-  /// NOTE: this may eventually cause "this" to be deleted in another thread, so make it the last thing you do with "this" in the calling code.
-  void decrementOutstanding(int32_t finishCount=1) {
-    {
-      const std::lock_guard<std::mutex> lock(mutex);
-      responsesExpected -= finishCount;
-      // Maybe we didn't send finish earlier because there were outstanding responses for requests.  Check again.
+    const std::lock_guard<std::mutex> lock(mutex);
+    if (!ok) { errored = true; readsDone = true; }
+    assert(writeOutstanding);
+    writeOutstanding = false;
+    writeBuffer.Clear();  // release the bytes we just wrote
+    if (!pending.empty()) {
+      grpc::ByteBuffer next = std::move(pending.front());
+      pending.pop_front();
+      doWrite(std::move(next));
+    } else {
       maybeSendFinish();
     }
   }
 
+  void readRequest() {
+    readBuf.Clear();
+    readerWriter.Read(&readBuf, make_tag(READ));
+  }
 
   virtual void proceed(bool ok, uint32_t tag) override {
-    // If we have a single thread per completion queue, then this can only be called from that thread.
-    // Multiple threads is a little more unclear... There can only be one Read being completed at once (since only one can be outstanding)
-    // and the same for writes.  But one thread could be notifying of a read and one of a write?
-    // It's also unclear when ASYNC_NOTIFY_WHEN_DONE can be returned.
-
-    // Ending the stream: currently outstanding requests will always cause a Write request to be done, hence we can just
-    // check in writeFinished() if we are done and call Finish() if so.
-
-    // NOTE: isCancelled can only be safely called after ASYNC_NOTIFY_WHEN_DONE has been returned.
-    GRPC_DEBUG("PROCEED this={} ok={} numCalls={} tag={} cancelled={} responsesExpected={} readsDone={} writeOutstanding={} pwrites={}",
-               (void*)this, ok, ++numCalls, tag, ctx.IsCancelled(), responsesExpected, readsDone, writeOutstanding, pending.size());
-
-    switch(tag) {
-      case READ:
-        if (!ok) {
-          // Client ended the stream.
-          // TODO: ok==false when we are shutting down as well.... how to tell the difference?  I guess Write / Finish will
-          // error out if we're shutting down???
-          GRPC_DEBUG("End of stream!");
+    switch (tag) {
+      case CONNECT:
+        if (!ok) { delete this; break; }
+        // re-arm a fresh acceptor before doing any work
+        createNew();
+        methodEntry = lookupMethod(genericCtx.method());
+        if (methodEntry == nullptr) {
+          LOG_ERROR("gRPC: no handler for method '{}'", genericCtx.method());
           readsDone = true;
-          {
-            const std::lock_guard<std::mutex> lock(mutex);
-            maybeSendFinish();
-          }
+          finishSent = true;
+          readerWriter.Finish(grpc::Status(grpc::StatusCode::UNIMPLEMENTED, "unknown method"), make_tag(FINISH));
           break;
         }
-
-        // respond() can be called before handleRequest returns, so we need to increment the number of
-        // outstanding requests before that.
-        {
-          const std::lock_guard<std::mutex> lock(mutex);
-          responsesExpected++;  // expect this request will eventually cause a response
+        readRequest();
+        break;
+      case READ:
+        if (!ok) {
+          readsDone = true;
+          { const std::lock_guard<std::mutex> lock(mutex); maybeSendFinish(); }
+          break;
         }
-
-        // call handleRequest before requesting the next read. This allows for the handler to directly call respond()
-        // or to copy what is needed from the request object.  When this is the case, it can be reused.
-        //
-        // This also allows for a flow control mechanism
-        // where at some point handleRequest can block / help perform tasks if heavily loaded.
-        {
-          bool ownershipPassed = handleRequest(req);
-          if (ownershipPassed) {
-            req = nullptr;
-          }
-        }
-
+        // respondRaw() can be called (possibly from another thread) before handle()
+        // returns, so account for the expected response before dispatching.
+        { const std::lock_guard<std::mutex> lock(mutex); responsesExpected++; }
+        methodEntry->handle(*this, readBuf);
         readRequest();
         break;
       case WRITE:
-        // Last write succeeded.  Now check if we have any more pending.
         writeFinished(ok);
         break;
       case FINISH:
-        // deleting self... be careful there are no destructors or scope guards that depend on
-        // this object (like the mutex) that fire off after this!
         delete this;
         break;
-      case CONNECT:
-        if (!ok) {
-          assert(responsesExpected == 0 && writeOutstanding == 0);  // first event... should be no requests outstanding.
-          delete this;
-          break;
-        }
-
-        // create a new instance of this to handle additional streaming calls.
-        createNew();
-        readRequest();
-        break;
-      case ASYNC_NOTIFY_WHEN_DONE:
-        // In a simple test where the client sends two requests, calls finish, then reads the responses,
-        // the last 3 events in the queue are Read(ok=false), ASYNC_NOTIFY_WHEN_DONE(ok=true), and FINISH(ok=true).
-        // It doesn't seem like we currently need this event.
-        // NOTE: this event has been removed (see comments in the constructor)
-        break;
       default:
-        // we tag everything going into the queue, so this shouldn't happen.
-        LOG_ERROR("Unknown tag {} on {}", tag, (void*)this);
+        LOG_ERROR("Unknown tag {} on generic call {}", tag, (void*)this);
         break;
     }
   }
-
-  /// This creates a request message with an Arena.  The arena may be used for other purposes as well.
-  /// Use releaseArena() to destroy both the Arena and the message.  The pointer to the arena
-  /// may be obtained from the message.
-  RequestT* createRequestMessage() {
-    auto arena = createArena();
-    return google::protobuf::Arena::Create<RequestT>(arena);
-  }
-
-  virtual void createNew() = 0;
-
-  /// Return true if you have taken ownership of the request message.
-  /// If so, a new one will be created for the next request. If false,
-  /// the request will be reused for the next request.
-  virtual bool handleRequest(RequestT* request) = 0;
 };
 
-
-
-class SayHelloStreamingCall : public BiStreamingRequest<HelloRequest, HelloReply, Greeter::AsyncService> {
-public:
-  SayHelloStreamingCall(GRPCServer& server, Greeter::AsyncService& service, GRPCServer::ThreadInfo& threadInfo) : BiStreamingRequest(server, service, threadInfo) {
-    //     void RequestSayHelloStreaming(::grpc::ServerContext* context, ::grpc::ServerAsyncReaderWriter< ::solux::HelloReply, ::solux::HelloRequest>* stream, ::grpc::CompletionQueue* new_call_cq, ::grpc::ServerCompletionQueue* notification_cq, void *tag) {
-    service.RequestSayHelloStreaming(&ctx, &readerWriter, threadInfo.cq.get(), threadInfo.cq.get(), make_tag(CONNECT));
-  }
-
-  virtual void createNew() override {
-    new SayHelloStreamingCall(server, service, threadInfo);
-  }
-
-  void fillResponse(HelloReply* response, HelloRequest* request, int responseNum) {
-    response->set_message(absl::StrCat("Hello ", request->name()));
-    response->set_response_number(responseNum);
-
-    // sleep a random amount of time between the given min and max microseconds
-    if (request->max_sleep_us() > 0) {
-      auto now = std::chrono::high_resolution_clock::now();
-      solux::Rng rng(now.time_since_epoch().count());
-      auto sleepUs = rng.rint(request->min_sleep_us(), request->max_sleep_us());
-      std::this_thread::sleep_for(std::chrono::microseconds(sleepUs));
-    }
-  }
-
-  void doMultipleResponse(HelloRequest* request) {
-    oneapi::tbb::task_group tg;
-
-    for (int i = 0; i < request->response_count(); i++) {
-      tg.run([this, request, i] {
-        auto arena = createArena();
-        HelloReply* response = google::protobuf::Arena::Create<HelloReply>(arena);
-        fillResponse(response, request, i+1);
-        respond(response,
-                [](auto* response) { releaseArena(response->GetArena()); },
-                0);  // never call with >0 here since we don't know the order of execution and that could end things prematurely.
-      });
-    }
-    tg.wait();
-  }
-
-  bool handleRequest(HelloRequest* request) override {
-
-    // single sync response, do the simplest way.
-    if (request->response_count() <= 1) {
-      // if sync, respond
-      if (!request->async()) {
-        // NOTE: we still can't use a single cached response object here because this call could be interleaved with
-        // other calls that cause buffering of the responses and hence we don't know when the response will actually
-        // be sent.  We would need to implement caching of responses.
-        auto arena = createArena();
-        HelloReply* response = google::protobuf::Arena::Create<HelloReply>(arena);
-        fillResponse(response, request, 1);
-        respond(response,
-                [](auto* response) { releaseArena(response->GetArena()); },
-                1);
-
-        return false; // don't take ownership of request object
-      }
-
-      // if async, but single response (this will be most common in solux probably), then we can just use the
-      // arena of the request object.
-      auto arena = request->GetArena();
-      // Create the response object immediately so it's in the same arena buffer as the request object.
-      // If it's created in a different thread, a different arena buffer will be used.
-      // In reality, this would probably only help responses that don't need to further allocate.
-      HelloReply* response = google::protobuf::Arena::Create<HelloReply>(arena);
-      auto& taskArena = server.getSoluxNode().getTaskArena();
-
-      taskArena.enqueue([this,request,response]() {
-        this->fillResponse(response, request, 1);
-        this->respond(response,
-                      [](auto* response) { releaseArena(response->GetArena()); },
-                      1);
-        // since the arena of the response will be freed, that will take care of the
-        // request as well.
-      });
-      return true; // take ownership of request object
-    }
-
-    if (!request->async()) {
-      doMultipleResponse(request);
-      decrementOutstanding();
-      return false; // don't take ownership of request object.. we don't need it anymore.
-    }
-
-    // if async, take ownership of request object so we can refer to it later.
-    auto& taskArena = server.getSoluxNode().getTaskArena();
-    taskArena.enqueue([this,request]() {
-      this->doMultipleResponse(request);
-      releaseArena(request->GetArena());
-      this->decrementOutstanding();
-    });
-    return true; // take ownership of request object
-  }
-};
-
-class SayHelloCall : public UnaryCallData<HelloRequest, HelloReply, Greeter::AsyncService> {
-public:
-  SayHelloCall(GRPCServer& server, Greeter::AsyncService& service, GRPCServer::ThreadInfo& threadInfo) : UnaryCallData(server, service, threadInfo) {
-    // std::cout << "hello inserting " << (void*)this << std::endl;
-    // TODO: how to do this in a generic way?  I would need to get the index of the method and then call
-    // ::grpc::Service::RequestAsyncUnary(0, context, request, response, new_call_cq, notification_cq, tag);
-    service.RequestSayHello(&ctx, &request, &responder, threadInfo.cq.get(), threadInfo.cq.get(), make_tag());
-  }
-
-  virtual void createNew() override {
-    new SayHelloCall(server, service, threadInfo);
-  }
-  virtual void fillResponse() override {
-    response.set_message(absl::StrCat("Hello ", request.name()));
-    // std::cout << "req name:" << request.name() << std::endl;
-  }
-};
-
-class SayHelloCall2 : public UnaryCallData<HelloRequest, HelloReply, Greeter::AsyncService> {
-public:
-  SayHelloCall2(GRPCServer& server, Greeter::AsyncService& service, GRPCServer::ThreadInfo& threadInfo) : UnaryCallData(server, service, threadInfo) {
-    // std::cout << "hello2 inserting " << (void*)this << std::endl;
-    service.RequestSayHello2(&ctx, &request, &responder, threadInfo.cq.get(), threadInfo.cq.get(), make_tag());
-  }
-
-  virtual void createNew() override {
-    new SayHelloCall2(server, service, threadInfo);
-  }
-  virtual void fillResponse() override {
-    response.set_message(absl::StrCat("Hello2 ", request.name()));
-    // std::cout << "req name:" << request.name() << std::endl;
-  }
-};
-
-class IndexerUpdateCall : public UnaryCallData<solux::proto::UpdateRequest, solux::proto::UpdateResponse, Indexer::AsyncService> {
-public:
-  IndexerUpdateCall(GRPCServer& server, Indexer::AsyncService& service, GRPCServer::ThreadInfo& threadInfo) : UnaryCallData(server, service, threadInfo) {
-    GRPC_DEBUG("Indexer.Update inserting this={}", (void*)this);
-    service.RequestUpdate(&ctx, &request, &responder, threadInfo.cq.get(), threadInfo.cq.get(), make_tag());
-  }
-
-  virtual void createNew() override {
-    new IndexerUpdateCall(server, service, threadInfo);
-  }
-  virtual void fillResponse() override {
-    GRPC_DEBUG("Update GRPCServer peer={}", ctx.peer());
-
-    auto code = handleUpdate(server, request, response);
-    unused(code); // TOOD: pass back?
-  }
-
-  // static methods meant to be usable by streaming server as well
-  static grpc::Status handleUpdate(GRPCServer& server, solux::proto::UpdateRequest& request, solux::proto::UpdateResponse& response) {
-    std::shared_ptr<Collection> collection;
-
-    if (request.collection().name_size() == 0) {
-      // TODO: do we support default collections (implicitly defined by something like an api-key?)
-    }
-
-    std::shared_ptr<Library> library = server.getSoluxNode().getLibrary(nullptr, "");
-    for (int i=0; i<request.collection().name_size(); i++) {
-      // TODO: walk from our implicit root to find the correct collection.
-      if (i == request.collection().name_size()-1) {
-        GRPC_DEBUG("Looking up collection name '{}'", request.collection().name(i));
-
-        // last element in path, so get collection.
-        collection = server.getSoluxNode().getCollection(library.get(), request.collection().name(i));
-        // TODO: handle lookup failure
-      } else {
-        // not last element... get sub-library
-        library = server.getSoluxNode().getLibrary(library.get(), request.collection().name(i));
-        // TODO: handle lookup failure
-      }
-    }
-
-    GRPC_DEBUG("\tindexer got docs, num={}", request.docs_size());
-    auto shard = collection->getShard();
-    auto iw = shard->getIndexWriter();
-
-    /** first test iteration before TBB update graph
-    if (request.docs_size() != 0) {
-      iw->update(request);
-      iw->commit(); // TODO: remove this at some point...
-    } else {
-      // thread safety testing... only happened when we had actual docs.  try to simulate with a sleep.
-      std::this_thread::sleep_for(std::chrono::microseconds (100));
-    }
-    */
-
-
-    class BlockingUpdateMessage : public ProtoUpdateMessage {
-    public:
-      Blocker blocker;
-      BlockingUpdateMessage(solux::proto::UpdateRequest* req, solux::proto::UpdateResponse* response) : ProtoUpdateMessage(req, response) {
-      }
-      virtual void done(IndexWriter& iw) override {
-        unused(iw);
-        blocker.notify();
-      }
-    };
-
-    BlockingUpdateMessage updateMessage(&request, &response);
-    bool success = iw->submitUpdate(&updateMessage);
-    assert(success);
-
-    updateMessage.blocker.wait();
-    updateMessage.finishResponse();
-
-    return grpc::Status::OK;
-  }
-};
-
-
-
-// client-server interaction scenarios:
-//   single streaming client to single index
-//   single streaming client to multiple indexes
-//   multiple streaming clients to single index
-//   multiple streaming clients to multiple indexes
-//
-// Server partition:
-//   For updates, the solux server enables indexing one or more update requests in parallel by partitioning by
-//   document id and ensuring that updates to the same document are in-order.
-//
-// A) Single large index, all unique docs:
-//   1) N streaming clients connected to N server threads, all updates processed in receiving thread on cached Inverter.
-//       # more complicated client, but potentially fastest due to fewer context switches?
-//   2) 1 streaming client connected to 1 streaming server, handing out messages to N indexing threads, each with their own cached Inverter.
-//
-// B) Single large index, non-unique docs:
-//   1) N streaming clients connected to N server threads, handing out messages to M indexing threads partitioned by docid
-//
-
-class IndexerUpdateStreamingCall : public BiStreamingRequest<solux::proto::UpdateRequest, solux::proto::UpdateResponse, Indexer::AsyncService> {
-public:
-  IndexerUpdateStreamingCall(GRPCServer& server, Indexer::AsyncService& service, GRPCServer::ThreadInfo& threadInfo) : BiStreamingRequest(server, service, threadInfo) {
-    service.RequestUpdateStream(&ctx, &readerWriter, threadInfo.cq.get(), threadInfo.cq.get(), make_tag(CONNECT));
-  }
-
-  virtual void createNew() override {
-    new IndexerUpdateStreamingCall(server, service, threadInfo);
-  }
-
-  bool handleRequest(proto::UpdateRequest* request) override {
-    // auto* arena = request->GetArena();
-
-    std::shared_ptr<Collection> collection;
-
-    if (request->collection().name_size() == 0) {
-      // TODO: do we support default collections (implicitly defined by something like an api-key?)
-    }
-
-    std::shared_ptr<Library> library = server.getSoluxNode().getLibrary(nullptr, "");
-    for (int i=0; i<request->collection().name_size(); i++) {
-      // TODO: walk from our implicit root to find the correct collection.
-      if (i == request->collection().name_size()-1) {
-        GRPC_DEBUG("Looking up collection name '{}'", request->collection().name(i));
-
-        // last element in path, so get collection.
-        collection = server.getSoluxNode().getCollection(library.get(), request->collection().name(i));
-        // TODO: handle lookup failure
-      } else {
-        // not last element... get sub-library
-        library = server.getSoluxNode().getLibrary(library.get(), request->collection().name(i));
-        // TODO: handle lookup failure
-      }
-    }
-
-    GRPC_DEBUG("\tindexer got docs, num={}", request->docs_size());
-    auto shard = collection->getShard();
-    auto iw = shard->getIndexWriter();
-
-
-    class Update : public ProtoUpdateMessage {
-    public:
-      IndexerUpdateStreamingCall* parent;
-      Update(proto::UpdateRequest* req, IndexerUpdateStreamingCall* parent) : ProtoUpdateMessage(req), parent(parent) {}
-      virtual void done(IndexWriter& iw) override {
-        unused(iw);
-        // LOG_DEBUG("done msg={}", (void*)this);
-
-        // By the time this response is done, *this* object will already be deleted, so don't
-        // reference anything in this Update instance.
-        auto* p = parent;
-        parent->respond(this->finishResponse(),
-                      [p](auto* response) { unused(p); releaseArena(response->GetArena()); },
-                      1);
-        delete this; // TODO arena allocate this
-      }
-    };
-
-    Update* updateMessage = new Update(req, this); // TODO arena allocate this.
-
-    // TODO: test if submitting a task to an arena that does this would cause the updateMessage to start
-    // faster.  A standalone test would be easist to see this.
-    iw->submitUpdate(updateMessage);
-
-    return true; // take ownership of request object since we used its arena (and we are handling async)
-  }
-};
-
-//   rpc search(stream solux.proto.SearchRequest) returns (stream solux.proto.SearchResponse) {}
-class SearcherSearchStreamingCall : public BiStreamingRequest<solux::proto::SearchRequest, solux::proto::SearchResponse, Searcher::AsyncService> {
-public:
-  SearcherSearchStreamingCall(GRPCServer& server, Searcher::AsyncService& service, GRPCServer::ThreadInfo& threadInfo) : BiStreamingRequest(server, service, threadInfo) {
-    service.RequestSearch(&ctx, &readerWriter, threadInfo.cq.get(), threadInfo.cq.get(), make_tag(CONNECT));
-  }
-
-  virtual void createNew() override {
-    new SearcherSearchStreamingCall(server, service, threadInfo);
-  }
-
-
-  bool handleRequest(solux::proto::SearchRequest* request) override {
-    auto& engine = server.getSoluxNode().getSearchEngine();
-    auto arena = request->GetArena();
-
-    // Two ways to do synchronous:
-    //   1) pass thread_group as null
-    //   2) make a local thread_group, use that and wait() for it.
-    // In both cases, there may be issues with multiple-responses? The first response will be written,
-    // but since only one write can be outstanding at the same time, we won't have the chance
-    // to get "write complete" from the completion queue, and any further writes will be buffered.
-    // If we implement flow control, we could deadlock.  Hence, if operating synchronously, we can't do
-    // flow control and multiple responses after the first will all be buffered.
-    // One solution is to only allow single-response requests in synchronous mode.  It could be disastrous
-    // for a large streaming response.
-    //
-    // Deadlock: if we synchronously handle a response here, it should not do work-stealing, as I believe
-    // this could lead to deadlock (anything waiting for a response callback would be vulnerable).
-    // TBB isolation should be able to prevent this, as could avoiding TBB (pass thread_group==null)
-
-    class GRPCSearchRequest : public SearchRequest {
-    public:
-      SearcherSearchStreamingCall* parent;
-      GRPCSearchRequest(SearchEngine& engine, solux::proto::SearchRequest& proto) : SearchRequest(engine, proto) {
-      }
-
-      int reply(SearchResponse& response) override {
-        auto buffered = parent->respond(&response.proto,
-                        // cause replyCallback() to be called after the write is done.
-                        [&response](auto* responseProto) {
-          unused(responseProto);
-          assert(responseProto == &response.proto);
-          response.req.replyCallback(response);
-        });
-        return (int)buffered;
-      }
-    };
-
-    auto& req = *google::protobuf::Arena::Create<GRPCSearchRequest>(arena, engine, *request);
-    req.parent = this;
-    engine.submit(req, true);
-
-    // Always return true (i.e. we have taken control of the request object thus it can't be reused)
-    // The issue is that even for a single simple synchronous request, there may be other responses
-    // that are concurrently being written to this connection.  Hence, our write may be buffered
-    // and since it's connected to the request object via Arena, we can't reuse that request object.
-    return true;
-  }
-
-
-};
 
 // Helper to resolve a Collection from a Target proto
-static std::shared_ptr<Collection> resolveCollection(GRPCServer& server, const proto::Target& target) {
+static std::shared_ptr<Collection> resolveCollection(GRPCServer& server, const solux::api::Target* target) {
   std::shared_ptr<Library> library = server.getSoluxNode().getLibrary(nullptr, "");
   std::shared_ptr<Collection> collection;
-  for (int i = 0; i < target.name_size(); i++) {
-    if (i == target.name_size() - 1) {
-      collection = server.getSoluxNode().getCollection(library.get(), target.name(i));
-    } else {
-      library = server.getSoluxNode().getLibrary(library.get(), target.name(i));
+  if (target != nullptr) {
+    for (int i = 0; i < (int)target->name.size(); i++) {
+      if (i == (int)target->name.size() - 1) {
+        collection = server.getSoluxNode().getCollection(library.get(), target->name[i]);
+      } else {
+        library = server.getSoluxNode().getLibrary(library.get(), target->name[i]);
+      }
     }
   }
   if (!collection) {
@@ -803,51 +364,280 @@ static std::shared_ptr<Collection> resolveCollection(GRPCServer& server, const p
   return collection;
 }
 
-class AdminSetSchemaCall : public UnaryCallData<proto::SchemaRequest, proto::SchemaResponse, Admin::AsyncService> {
-public:
-  AdminSetSchemaCall(GRPCServer& server, Admin::AsyncService& service, GRPCServer::ThreadInfo& threadInfo)
-    : UnaryCallData(server, service, threadInfo) {
-    service.RequestSetSchema(&ctx, &request, &responder, threadInfo.cq.get(), threadInfo.cq.get(), make_tag());
-  }
+static std::shared_ptr<Collection> resolveCollection(GRPCServer& server,
+                                                     const std::optional<solux::api::Target>& target) {
+  return resolveCollection(server, target.has_value() ? &*target : nullptr);
+}
 
-  void createNew() override {
-    new AdminSetSchemaCall(server, service, threadInfo);
-  }
-
-  void fillResponse() override {
-    auto collection = resolveCollection(server, request.collection());
-    std::shared_ptr<Schema> newSchema;
-
-    if (request.mode() == proto::SchemaRequest::MERGE) {
-      auto currentSchema = collection->getSchema();
-      newSchema = Schema::fromProto(request.schema(), currentSchema.get());
-    } else {
-      // REPLACE
-      newSchema = Schema::fromProto(request.schema());
+template <typename Request>
+static std::shared_ptr<Collection> resolveUpdateCollection(GRPCServer& server, const Request& request) {
+  std::shared_ptr<Library> library = server.getSoluxNode().getLibrary(nullptr, "");
+  std::shared_ptr<Collection> collection;
+  if (request.collection.has_value()) {
+    const auto& target = *request.collection;
+    for (int i = 0; i < (int)target.name.size(); i++) {
+      if (i == (int)target.name.size() - 1) {
+        collection = server.getSoluxNode().getCollection(library.get(), target.name[i]);
+      } else {
+        library = server.getSoluxNode().getLibrary(library.get(), target.name[i]);
+      }
     }
-
-    collection->setSchema(newSchema);
-    newSchema->toProto(response.mutable_schema());
   }
-};
+  if (!collection) {
+    collection = server.getSoluxNode().getCollection("");
+  }
+  return collection;
+}
 
-class AdminGetSchemaCall : public UnaryCallData<proto::SchemaRequest, proto::SchemaResponse, Admin::AsyncService> {
-public:
-  AdminGetSchemaCall(GRPCServer& server, Admin::AsyncService& service, GRPCServer::ThreadInfo& threadInfo)
-    : UnaryCallData(server, service, threadInfo) {
-    service.RequestGetSchema(&ctx, &request, &responder, threadInfo.cq.get(), threadInfo.cq.get(), make_tag());
+
+// ---- per-method handlers -------------------------------------------------
+
+//   rpc Search(stream SearchRequest) returns (stream SearchResponse)
+static void handleSearch(GenericCallData& call, grpc::ByteBuffer& readBuf) {
+  // SearchRequest subclass whose reply() serializes to ByteBuffer and drops eagerly.
+  class GRPCSearchRequest : public SearchRequest {
+  public:
+    GenericCallData* parent = nullptr;
+    GRPCSearchRequest(SearchEngine& engine, const SearchReqProto& proto, google::protobuf::Arena& arena)
+      : SearchRequest(engine, proto, arena) {}
+
+    int reply(SearchResponse& response) override {
+      // Serialize eagerly into an OWNED ByteBuffer, then drop arenas (no post-write callback).
+      response.proto.more = !response.last;
+      grpc::ByteBuffer buf = serializeToByteBuffer(response.proto);
+      size_t buffered = parent->respondRaw(std::move(buf), 1);
+      // replyCallback() may delete "this" on the last response, so it must be the
+      // last use of "this"/"response".
+      response.req.replyCallback(response);
+      return (int)buffered;
+    }
+  };
+
+  auto* arena = createArena();
+  HppRequestState<SearchReqProto> request;
+  if (!parseRequest(readBuf, request, "Search")) {
+    releaseArena(arena);
+    call.decrementOutstanding();  // balance the responsesExpected++ done before handle()
+    return;
+  }
+  auto& engine = call.server.getSoluxNode().getSearchEngine();
+  auto& req = *google::protobuf::Arena::Create<GRPCSearchRequest>(arena, engine, request.proto, *arena);
+  req.parent = &call;
+  // submit() is synchronous (waits on its task group), so the padded request
+  // bytes and parse resource stay valid until all borrowed views are done.
+  engine.submit(req, true);
+}
+
+
+// Shared blocking update used by the unary Update handler. Returns the serialized
+// response: the response is NON-OWNING and its spans are backed by updateMessage's arena,
+// so it must be serialized here (while updateMessage is alive), not by the caller.
+static grpc::ByteBuffer doBlockingUpdate(GRPCServer& server, const UpdateReqProto& request) {
+  std::shared_ptr<Collection> collection = resolveUpdateCollection(server, request);
+
+  auto shard = collection->getShard();
+  auto iw = shard->getIndexWriter();
+
+  class BlockingUpdateMessage : public ProtoUpdateMessage {
+  public:
+    Blocker blocker;
+    BlockingUpdateMessage(const UpdateReqProto* req, UpdateRespProto* response)
+        : ProtoUpdateMessage(req, response) {}
+    virtual void done(IndexWriter& iw) override {
+      unused(iw);
+      blocker.notify();
+    }
+  };
+
+  UpdateRespProto response;
+  BlockingUpdateMessage updateMessage(&request, &response);
+  bool success = iw->submitUpdate(&updateMessage);
+  assert(success);
+  unused(success);
+  updateMessage.blocker.wait();
+  updateMessage.finishResponse();
+  return serializeToByteBuffer(response);
+}
+
+//   rpc Update(UpdateRequest) returns (UpdateResponse)  [unary]
+static void handleUpdate(GenericCallData& call, grpc::ByteBuffer& readBuf) {
+  HppRequestState<UpdateReqProto> request;
+  if (!parseRequest(readBuf, request, "Update")) {
+    call.decrementOutstanding();
+    return;
+  }
+  grpc::ByteBuffer buf = doBlockingUpdate(call.server, request.proto);
+  call.respondRaw(std::move(buf), 1);
+}
+
+//   rpc UpdateStream(stream UpdateRequest) returns (stream UpdateResponse)
+static void handleUpdateStream(GenericCallData& call, grpc::ByteBuffer& readBuf) {
+  auto request = std::make_unique<HppRequestState<UpdateReqProto>>();
+  if (!parseRequest(readBuf, *request, "UpdateStream")) {
+    call.decrementOutstanding();
+    return;
   }
 
-  void createNew() override {
-    new AdminGetSchemaCall(server, service, threadInfo);
-  }
+  std::shared_ptr<Collection> collection = resolveUpdateCollection(call.server, request->proto);
+  auto shard = collection->getShard();
+  auto iw = shard->getIndexWriter();
 
-  void fillResponse() override {
-    auto collection = resolveCollection(server, request.collection());
-    auto schema = collection->getSchema();
-    schema->toProto(response.mutable_schema());
+  // The update is async; its done() serializes the response into owned bytes, hands
+  // them to the call, then deletes this message, freeing the borrowed request bytes
+  // and response state.
+  class Update : public ProtoUpdateMessage {
+  public:
+    std::unique_ptr<HppRequestState<UpdateReqProto>> request;
+    GenericCallData* parent;
+    Update(std::unique_ptr<HppRequestState<UpdateReqProto>> requestState, GenericCallData* parent)
+      : ProtoUpdateMessage(&requestState->proto), request(std::move(requestState)), parent(parent) {}
+    virtual void done(IndexWriter& iw) override {
+      unused(iw);
+      auto* response = finishResponse();
+      grpc::ByteBuffer buf = serializeToByteBuffer(*response);
+      parent->respondRaw(std::move(buf), 1);       // may delete parent on another thread
+      delete this;                                 // frees request bytes, parse resource, and response
+    }
+  };
+
+  Update* updateMessage = new Update(std::move(request), &call);
+  iw->submitUpdate(updateMessage);
+}
+
+//   rpc SetSchema(SchemaRequest) returns (SchemaResponse)  [unary]
+static void handleSetSchema(GenericCallData& call, grpc::ByteBuffer& readBuf) {
+  HppRequestState<SchemaReqProto> request;
+  if (!parseRequest(readBuf, request, "SetSchema")) {
+    call.decrementOutstanding();
+    return;
   }
-};
+  if (!request.proto.schema.has_value()) {
+    LOG_ERROR("SetSchema: missing schema");
+    call.decrementOutstanding();
+    return;
+  }
+  SchemaRespProto response;
+  std::pmr::monotonic_buffer_resource respArena;  // backs the non-owning response SchemaDef
+
+  auto collection = resolveCollection(call.server, request.proto.collection);
+  std::shared_ptr<Schema> newSchema;
+  if (request.proto.mode == solux::api::SchemaRequest_::Mode::MERGE) {
+    auto currentSchema = collection->getSchema();
+    newSchema = Schema::fromProto(*request.proto.schema, currentSchema.get());
+  } else {
+    newSchema = Schema::fromProto(*request.proto.schema);
+  }
+  collection->setSchema(newSchema);
+  newSchema->toProto(&response.schema.emplace(), respArena);
+
+  grpc::ByteBuffer buf = serializeToByteBuffer(response);
+  call.respondRaw(std::move(buf), 1);
+}
+
+//   rpc GetSchema(SchemaRequest) returns (SchemaResponse)  [unary]
+static void handleGetSchema(GenericCallData& call, grpc::ByteBuffer& readBuf) {
+  HppRequestState<SchemaReqProto> request;
+  if (!parseRequest(readBuf, request, "GetSchema")) {
+    call.decrementOutstanding();
+    return;
+  }
+  SchemaRespProto response;
+  std::pmr::monotonic_buffer_resource respArena;  // backs the non-owning response SchemaDef
+
+  auto collection = resolveCollection(call.server, request.proto.collection);
+  auto schema = collection->getSchema();
+  schema->toProto(&response.schema.emplace(), respArena);
+
+  grpc::ByteBuffer buf = serializeToByteBuffer(response);
+  call.respondRaw(std::move(buf), 1);
+}
+
+//   rpc SayHello(HelloRequest) returns (HelloReply)  [unary] - demo
+static void handleSayHello(GenericCallData& call, grpc::ByteBuffer& readBuf) {
+  HppRequestState<HelloReqProto> request;
+  if (!parseRequest(readBuf, request, "SayHello")) {
+    call.decrementOutstanding();
+    return;
+  }
+  HelloRespProto response;
+  // response.message is a non-owning string_view; keep the backing string alive until
+  // after serialize (StrCat returns a temporary that would otherwise dangle).
+  std::string message = absl::StrCat("Hello ", request.proto.name);
+  response.message = message;
+  call.respondRaw(serializeToByteBuffer(response), 1);
+}
+
+//   rpc SayHello2(HelloRequest) returns (HelloReply)  [unary] - demo
+static void handleSayHello2(GenericCallData& call, grpc::ByteBuffer& readBuf) {
+  HppRequestState<HelloReqProto> request;
+  if (!parseRequest(readBuf, request, "SayHello2")) {
+    call.decrementOutstanding();
+    return;
+  }
+  HelloRespProto response;
+  std::string message = absl::StrCat("Hello2 ", request.proto.name);
+  response.message = message;
+  call.respondRaw(serializeToByteBuffer(response), 1);
+}
+
+//   rpc SayHelloStreaming(stream HelloRequest) returns (stream HelloReply) - demo
+// Each request produces response_count replies (>=1), optionally async, optionally
+// sleeping between min/max us.  Response bytes are owned, so we copy the few fields we
+// need and decouple from the request entirely.
+static void handleSayHelloStreaming(GenericCallData& call, grpc::ByteBuffer& readBuf) {
+  HppRequestState<HelloReqProto> request;
+  if (!parseRequest(readBuf, request, "SayHelloStreaming")) {
+    call.decrementOutstanding();
+    return;
+  }
+  std::string name = std::string(request.proto.name);
+  int count = std::max(1, request.proto.response_count);
+  int minSleepUs = request.proto.min_sleep_us;
+  int maxSleepUs = request.proto.max_sleep_us;
+  bool async = request.proto.async;
+
+  auto produce = [&call, name, count, minSleepUs, maxSleepUs]() {
+    for (int i = 0; i < count; i++) {
+      if (maxSleepUs > 0) {
+        auto now = std::chrono::high_resolution_clock::now();
+        solux::Rng rng(now.time_since_epoch().count());
+        auto sleepUs = rng.rint(minSleepUs, maxSleepUs);
+        std::this_thread::sleep_for(std::chrono::microseconds(sleepUs));
+      }
+      HelloRespProto reply;
+      std::string message = absl::StrCat("Hello ", name);  // keep alive past serialize (non-owning view)
+      reply.message = message;
+      reply.response_number = i + 1;
+      call.respondRaw(serializeToByteBuffer(reply), 0);  // intermediate; balance with decrementOutstanding below
+    }
+    call.decrementOutstanding(1);  // this request is now fully answered
+  };
+
+  if (async) {
+    call.server.getSoluxNode().getTaskArena().enqueue(produce);
+  } else {
+    produce();
+  }
+}
+
+
+// ---- method routing ------------------------------------------------------
+
+static const MethodEntry* lookupMethod(const std::string& method) {
+  static const std::unordered_map<std::string, MethodEntry> table = {
+    {"/solux.Searcher/Search",          {handleSearch}},
+    {"/solux.Indexer/Update",           {handleUpdate}},
+    {"/solux.Indexer/UpdateStream",     {handleUpdateStream}},
+    {"/solux.Admin/SetSchema",          {handleSetSchema}},
+    {"/solux.Admin/GetSchema",          {handleGetSchema}},
+    {"/solux.Greeter/SayHello",         {handleSayHello}},
+    {"/solux.Greeter/SayHello2",        {handleSayHello2}},
+    {"/solux.Greeter/SayHelloStreaming",{handleSayHelloStreaming}},
+  };
+  auto it = table.find(method);
+  return it == table.end() ? nullptr : &it->second;
+}
+
 
 void GRPCServer::runThread(ThreadInfo& threadInfo) {
   // linux-only: give threads a nice name for debugging.
@@ -860,15 +650,13 @@ void GRPCServer::runThread(ThreadInfo& threadInfo) {
   // Used to test that a client request will still be handled correctly if it comes in before we've registered the calls
   // std::this_thread::sleep_for (std::chrono::seconds(10));
 
-  // Create one of each type of call.  They insert themselves into the completion queue.
-  new SayHelloCall(*this, greeterService, threadInfo);
-  new SayHelloCall2(*this, greeterService, threadInfo);
-  new SayHelloStreamingCall(*this, greeterService, threadInfo);
-  new IndexerUpdateCall(*this, indexerService, threadInfo);
-  new IndexerUpdateStreamingCall(*this, indexerService, threadInfo);
-  new SearcherSearchStreamingCall(*this, searcherService, threadInfo);
-  new AdminSetSchemaCall(*this, adminService, threadInfo);
-  new AdminGetSchemaCall(*this, adminService, threadInfo);
+  // Pre-arm several generic acceptors per CQ (each re-arms on accept, so the
+  // accept backlog stays at this depth).  Matches the previous depth of 8
+  // per-method acceptors.
+  constexpr int kGenericAcceptors = 8;
+  for (int i = 0; i < kGenericAcceptors; i++) {
+    new GenericCallData(*this, genericService, threadInfo);
+  }
 
   /*
    * This startLatchThreads was added because shutting down the server very quickly would generate this failed assertion:

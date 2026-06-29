@@ -8,7 +8,7 @@
 #include <boost/unordered/unordered_flat_map.hpp>
 #include <boost/unordered/unordered_flat_set.hpp>
 #include <oneapi/tbb/flow_graph.h>
-#include "protos/solux_types.pb.h"
+#include "solux/index/AuxInfo.h"
 #include "solux/store/Directory.h"
 #include "solux/search/IndexReader.h"
 #include "solux/server/SoluxError.h"
@@ -68,7 +68,7 @@ namespace solux {
     // Segment-local aux overlays recorded in SegmentInfo.overlays.  Vector
     // ANN entries are carried by segment liveness; coreGen does not
     // participate.
-    std::vector<proto::AuxIndexInfo> auxOverlays;
+    std::vector<AuxInfo> auxOverlays;
 
     SegInfo(uint64_t segId, int nDocs) : segId(segId), maxDoc(nDocs), liveDocs(nDocs) {}
 
@@ -324,7 +324,7 @@ public:
   // pipeline (single-threaded via the commitFinishNode).  Used for carry-forward
   // (entries not rebuilt by this commit are preserved) and orphan-file cleanup
   // (files referenced by the previous list but not the new one are deleted).
-  std::vector<proto::AuxIndexInfo> currentAuxIndexes_;
+  std::vector<AuxInfo> currentAuxIndexes_;
 
   // One entry per segment overlay referenced by the last published IndexInfo,
   // keyed by owning segment (the manifest nests overlays under SegmentInfo;
@@ -334,7 +334,7 @@ public:
   // startup.  The authoritative per-segment copy lives on SegInfo.
   struct PublishedOverlay {
     uint64_t segId;
-    proto::AuxIndexInfo info;
+    AuxInfo info;
   };
   std::vector<PublishedOverlay> currentSegmentOverlays_;
 
@@ -503,8 +503,8 @@ private:
   void segmentFlushBody(Inverter& inverter);
   void finishCommitBody(UpdateMessage& msg);
   void writeIndexInfoFile(std::span<SegInfo*> segs, CommitInfo* commitInfo = nullptr,
-                          std::span<const proto::AuxIndexInfo> auxIndexes = {});
-  std::vector<proto::AuxIndexInfo> buildAuxIndexes(const UpdateMessage& msg,
+                          std::span<const AuxInfo> auxIndexes = {});
+  std::vector<AuxInfo> buildAuxIndexes(const UpdateMessage& msg,
                                                    std::span<SegInfo*> segsToKeep,
                                                    std::vector<std::string>& outFilesToSync);
   void buildSegmentOverlays(const UpdateMessage& msg,
@@ -515,7 +515,7 @@ private:
   void activateVectorOverlayNames(std::span<const std::string> names);
   std::vector<std::string> snapshotActiveVectorOverlayNames();
   uint64_t nextVectorOverlayGen(const SegInfo& seg, std::string_view name) const;
-  std::vector<proto::AuxIndexInfo> buildConcreteVectorOverlays(
+  std::vector<AuxInfo> buildConcreteVectorOverlays(
       SegInfo& seg,
       PostingsReader& postingsReader,
       std::span<const std::string> overlayNames,
@@ -529,8 +529,8 @@ private:
   // Call only after the new IndexInfo file is durable.
   void deleteOrphanedAuxFiles(const std::vector<PublishedOverlay>& oldList,
                               const std::vector<PublishedOverlay>& newList);
-  void deleteOrphanedAuxFiles(const std::vector<proto::AuxIndexInfo>& oldList,
-                              const std::vector<proto::AuxIndexInfo>& newList);
+  void deleteOrphanedAuxFiles(const std::vector<AuxInfo>& oldList,
+                              const std::vector<AuxInfo>& newList);
   void tryDeleteSegments();
   void moveSegmentToDelete(uint64_t segId);
   void applyDeletes(std::span<SegInfo*> segs, MultiDeletesData& multiDeletesData);

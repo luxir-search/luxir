@@ -1,11 +1,11 @@
 #include "oneapi/tbb/task_group.h"
 #include "bench/solux_bench.h"
-#include "test/SegmentTest.h"
-#include "solux/server/GRPCServer.h"
 #include "test/GrpcSoluxTest.h"
+#include "test/GrpcClient.h"
 
 
 using namespace solux;
+using namespace solux::test;  // HppClientReaderWriter, Reply, rpc::*
 
 // about 1.2% slower when not ommitting frame pointer
 // adding term hashes (without using them) resulted in a slowdown of ~1%
@@ -20,18 +20,18 @@ static void BM_Req(benchmark::State& state, int writers, int readers, bool async
     state.SkipWithError("gRPC test server failed to start in this environment");
     return;
   }
-  std::unique_ptr<solux::Greeter::Stub> greeterStub = solux::Greeter::NewStub(channel);
 
-  solux::HelloRequest req;
-  solux::HelloReply result;
+  solux::api::HelloRequest req;
+  Reply<solux::api::HelloReply> result;
   grpc::ClientContext context;  // need a new one for each RPC
-  std::unique_ptr<grpc::ClientReaderWriter<HelloRequest,HelloReply>> stream = greeterStub->SayHelloStreaming(&context);
+  HppClientReaderWriter<solux::api::HelloRequest, solux::api::HelloReply> stream(
+    channel.get(), rpc::SayHelloStreaming, &context);
 
   oneapi::tbb::task_group tasks;
 
   const int32_t requestsPerLoop = 200;
-  req.set_name("A");
-  req.set_async(async);
+  req.name = "A";
+  req.async = async;
 
 
   int64_t totalReads = 0;
@@ -50,7 +50,7 @@ static void BM_Req(benchmark::State& state, int writers, int readers, bool async
     tasks.run(
             [&] {
               int32_t numResponses = 0;
-              while (stream->Read(&result)) {
+              while (stream.Read(&result)) {
                 numResponses++;
                 if (writesDone && numResponses >= expectedResponses) {
                   break;
@@ -65,7 +65,7 @@ static void BM_Req(benchmark::State& state, int writers, int readers, bool async
 
     for (int i=0; i<requestsPerLoop; i++) {
       int responseCount = 1;
-      req.set_response_count(responseCount);
+      req.response_count = responseCount;
       expectedResponses += responseCount;
 
       // set writesDone *before* we actually write to avoid a race condition where
@@ -74,7 +74,7 @@ static void BM_Req(benchmark::State& state, int writers, int readers, bool async
         writesDone = true;
       }
 
-      bool wrote = stream->Write(req);
+      bool wrote = stream.Write(req);
       ASSERT_TRUE(wrote);
     }
 
@@ -93,10 +93,10 @@ static void BM_Req(benchmark::State& state, int writers, int readers, bool async
   auto end = std::chrono::high_resolution_clock::now();
   auto duration = std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count();
 
-  bool ok = stream->WritesDone();
+  bool ok = stream.WritesDone();
   ASSERT_TRUE(ok);
 
-  grpc::Status status = stream->Finish();
+  grpc::Status status = stream.Finish();
   ASSERT_TRUE(status.ok());
 
   state.counters["writeRate"] = benchmark::Counter((double)totalWrites/(double)loops, benchmark::Counter::kIsIterationInvariantRate);

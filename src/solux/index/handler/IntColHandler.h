@@ -36,9 +36,9 @@ public:
 
   ~IntColHandler() override = default;
 
-  void index(Inverter& inverter, const proto::Val& val) override {
-    if (val.has_i()) {
-      int64_t ival = val.i();
+  void index(Inverter& inverter, const IndexVal& val) override {
+    if (std::holds_alternative<int64_t>(val.kind)) {
+      int64_t ival = std::get<int64_t>(val.kind);
       indexSingle(inverter, ival);
     }
   }
@@ -130,15 +130,15 @@ public:
 
   ~MultiIntColHandler() override = default;
 
-  void index(Inverter& inverter, const proto::Val& val) override {
+  void index(Inverter& inverter, const IndexVal& val) override {
     // expected kinds first: array form, then a single value
-    if (val.has_arr_i()) {
-      auto& arr = val.arr_i().v();
+    if (std::holds_alternative<solux::api::ArrInt>(val.kind)) {
+      auto& arr = std::get<solux::api::ArrInt>(val.kind).v;
       std::span<const int64_t> values(arr.data(), arr.size());
       index(inverter, values);
     }
-    else if (val.has_i()) {
-      index(inverter, val.i());
+    else if (std::holds_alternative<int64_t>(val.kind)) {
+      index(inverter, std::get<int64_t>(val.kind));
     }
   }
 
@@ -242,13 +242,13 @@ class DoubleColHandler final : public IntColHandler {
 public:
   using IntColHandler::IntColHandler;
 
-  void index(Inverter& inverter, const proto::Val& val) override {
-    if (val.has_d()) {
-      indexSingle(inverter, doubleToSortableInt64(val.d()));
-    } else if (val.has_f()) {
-      indexSingle(inverter, doubleToSortableInt64((double)val.f()));
-    } else if (val.has_i()) {
-      indexSingle(inverter, doubleToSortableInt64((double)val.i()));
+  void index(Inverter& inverter, const IndexVal& val) override {
+    if (std::holds_alternative<double>(val.kind)) {
+      indexSingle(inverter, doubleToSortableInt64(std::get<double>(val.kind)));
+    } else if (std::holds_alternative<float>(val.kind)) {
+      indexSingle(inverter, doubleToSortableInt64((double)std::get<float>(val.kind)));
+    } else if (std::holds_alternative<int64_t>(val.kind)) {
+      indexSingle(inverter, doubleToSortableInt64((double)std::get<int64_t>(val.kind)));
     }
   }
 
@@ -261,13 +261,13 @@ class FloatColHandler final : public IntColHandler {
 public:
   using IntColHandler::IntColHandler;
 
-  void index(Inverter& inverter, const proto::Val& val) override {
-    if (val.has_f()) {
-      indexSingle(inverter, (int64_t)floatToSortableInt32(val.f()));
-    } else if (val.has_d()) {
-      indexSingle(inverter, (int64_t)floatToSortableInt32((float)val.d()));
-    } else if (val.has_i()) {
-      indexSingle(inverter, (int64_t)floatToSortableInt32((float)val.i()));
+  void index(Inverter& inverter, const IndexVal& val) override {
+    if (std::holds_alternative<float>(val.kind)) {
+      indexSingle(inverter, (int64_t)floatToSortableInt32(std::get<float>(val.kind)));
+    } else if (std::holds_alternative<double>(val.kind)) {
+      indexSingle(inverter, (int64_t)floatToSortableInt32((float)std::get<double>(val.kind)));
+    } else if (std::holds_alternative<int64_t>(val.kind)) {
+      indexSingle(inverter, (int64_t)floatToSortableInt32((float)std::get<int64_t>(val.kind)));
     }
   }
 
@@ -280,23 +280,23 @@ class MultiDoubleColHandler final : public MultiIntColHandler {
 public:
   using MultiIntColHandler::MultiIntColHandler;
 
-  void index(Inverter& inverter, const proto::Val& val) override {
+  void index(Inverter& inverter, const IndexVal& val) override {
     auto encode = [](double d) { return doubleToSortableInt64(d); };
     // expected kinds first (array form, then a single value), coercions after
-    if (val.has_arr_d()) {
-      indexMulti(inverter, val.arr_d().v() | std::views::transform(encode));
-    } else if (val.has_d()) {
-      indexMulti(inverter, std::views::single(encode(val.d())));
-    } else if (val.has_arr_f()) {
-      indexMulti(inverter, val.arr_f().v()
+    if (std::holds_alternative<solux::api::ArrDouble>(val.kind)) {
+      indexMulti(inverter, std::get<solux::api::ArrDouble>(val.kind).v | std::views::transform(encode));
+    } else if (std::holds_alternative<double>(val.kind)) {
+      indexMulti(inverter, std::views::single(encode(std::get<double>(val.kind))));
+    } else if (std::holds_alternative<solux::api::ArrFloat>(val.kind)) {
+      indexMulti(inverter, std::get<solux::api::ArrFloat>(val.kind).v
                  | std::views::transform([&](float f) { return encode((double)f); }));
-    } else if (val.has_f()) {
-      indexMulti(inverter, std::views::single(encode((double)val.f())));
-    } else if (val.has_arr_i()) {
-      indexMulti(inverter, val.arr_i().v()
+    } else if (std::holds_alternative<float>(val.kind)) {
+      indexMulti(inverter, std::views::single(encode((double)std::get<float>(val.kind))));
+    } else if (std::holds_alternative<solux::api::ArrInt>(val.kind)) {
+      indexMulti(inverter, std::get<solux::api::ArrInt>(val.kind).v
                  | std::views::transform([&](int64_t i) { return encode((double)i); }));
-    } else if (val.has_i()) {
-      indexMulti(inverter, std::views::single(encode((double)val.i())));
+    } else if (std::holds_alternative<int64_t>(val.kind)) {
+      indexMulti(inverter, std::views::single(encode((double)std::get<int64_t>(val.kind))));
     }
   }
 
@@ -314,23 +314,23 @@ class MultiFloatColHandler final : public MultiIntColHandler {
 public:
   using MultiIntColHandler::MultiIntColHandler;
 
-  void index(Inverter& inverter, const proto::Val& val) override {
+  void index(Inverter& inverter, const IndexVal& val) override {
     auto encode = [](float f) { return (int64_t)floatToSortableInt32(f); };
     // expected kinds first (array form, then a single value), coercions after
-    if (val.has_arr_f()) {
-      indexMulti(inverter, val.arr_f().v() | std::views::transform(encode));
-    } else if (val.has_f()) {
-      indexMulti(inverter, std::views::single(encode(val.f())));
-    } else if (val.has_arr_d()) {
-      indexMulti(inverter, val.arr_d().v()
+    if (std::holds_alternative<solux::api::ArrFloat>(val.kind)) {
+      indexMulti(inverter, std::get<solux::api::ArrFloat>(val.kind).v | std::views::transform(encode));
+    } else if (std::holds_alternative<float>(val.kind)) {
+      indexMulti(inverter, std::views::single(encode(std::get<float>(val.kind))));
+    } else if (std::holds_alternative<solux::api::ArrDouble>(val.kind)) {
+      indexMulti(inverter, std::get<solux::api::ArrDouble>(val.kind).v
                  | std::views::transform([&](double d) { return encode((float)d); }));
-    } else if (val.has_d()) {
-      indexMulti(inverter, std::views::single(encode((float)val.d())));
-    } else if (val.has_arr_i()) {
-      indexMulti(inverter, val.arr_i().v()
+    } else if (std::holds_alternative<double>(val.kind)) {
+      indexMulti(inverter, std::views::single(encode((float)std::get<double>(val.kind))));
+    } else if (std::holds_alternative<solux::api::ArrInt>(val.kind)) {
+      indexMulti(inverter, std::get<solux::api::ArrInt>(val.kind).v
                  | std::views::transform([&](int64_t i) { return encode((float)i); }));
-    } else if (val.has_i()) {
-      indexMulti(inverter, std::views::single(encode((float)val.i())));
+    } else if (std::holds_alternative<int64_t>(val.kind)) {
+      indexMulti(inverter, std::views::single(encode((float)std::get<int64_t>(val.kind))));
     }
   }
 
@@ -366,11 +366,11 @@ class DateColHandler final : public IntColHandler {
 public:
   using IntColHandler::IntColHandler;
 
-  void index(Inverter& inverter, const proto::Val& val) override {
-    if (val.has_i()) {
-      indexSingle(inverter, val.i());
-    } else if (val.has_s()) {
-      indexSingle(inverter, parseDateOrThrow(std::string_view(fieldName), val.s()));
+  void index(Inverter& inverter, const IndexVal& val) override {
+    if (std::holds_alternative<int64_t>(val.kind)) {
+      indexSingle(inverter, std::get<int64_t>(val.kind));
+    } else if (std::holds_alternative<std::string_view>(val.kind)) {
+      indexSingle(inverter, parseDateOrThrow(std::string_view(fieldName), std::get<std::string_view>(val.kind)));
     }
   }
 
@@ -383,26 +383,26 @@ class MultiDateColHandler final : public MultiIntColHandler {
 public:
   using MultiIntColHandler::MultiIntColHandler;
 
-  void index(Inverter& inverter, const proto::Val& val) override {
+  void index(Inverter& inverter, const IndexVal& val) override {
     auto parse = [&](std::string_view s) { return parseDateOrThrow(std::string_view(fieldName), s); };
     // expected kinds first (array form, then a single value)
-    if (val.has_arr_i()) {
-      index(inverter, std::span<const int64_t>(val.arr_i().v().data(), val.arr_i().v().size()));
-    } else if (val.has_i()) {
-      indexMulti(inverter, std::views::single(val.i()));
-    } else if (val.has_arr_s()) {
+    if (std::holds_alternative<solux::api::ArrInt>(val.kind)) {
+      index(inverter, std::span<const int64_t>(std::get<solux::api::ArrInt>(val.kind).v.data(), std::get<solux::api::ArrInt>(val.kind).v.size()));
+    } else if (std::holds_alternative<int64_t>(val.kind)) {
+      indexMulti(inverter, std::views::single(std::get<int64_t>(val.kind)));
+    } else if (std::holds_alternative<solux::api::ArrStr>(val.kind)) {
       // Parse every element up front: indexMulti appends to the value stream
       // as it iterates, so a throw partway through a lazy transform would
       // leave already-parsed values orphaned (the column reconstructs
       // positionally, corrupting later docs).  Materialize first so a parse
       // failure throws before any stream mutation.
-      auto& arr = val.arr_s().v();
+      auto& arr = std::get<solux::api::ArrStr>(val.kind).v;
       std::vector<int64_t> millis;
       millis.reserve(arr.size());
       for (const auto& s : arr) millis.push_back(parse(s));
       index(inverter, std::span<const int64_t>(millis.data(), millis.size()));
-    } else if (val.has_s()) {
-      indexMulti(inverter, std::views::single(parse(val.s())));
+    } else if (std::holds_alternative<std::string_view>(val.kind)) {
+      indexMulti(inverter, std::views::single(parse(std::get<std::string_view>(val.kind))));
     }
   }
 

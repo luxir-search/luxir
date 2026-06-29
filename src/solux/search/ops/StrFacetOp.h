@@ -225,7 +225,7 @@ public:
 
   // Ctor must be nothrow (Arena::Create hazard).  ProtobufSearchParser
   // resolves the OrdMap before allocation and passes it in.
-  StrFacetOp(SearchRequest& req, const proto::FieldFacet& fieldFacet, std::string_view fieldName,
+  StrFacetOp(SearchRequest& req, const ReqFieldFacet& fieldFacet, std::string_view fieldName,
     std::string_view facetName, int64_t limit, int64_t minCount, bool missing,
     std::shared_ptr<OrdMap> ordMap) :
   FieldFacetReq(req, fieldFacet, fieldName, facetName, limit, minCount, missing),
@@ -259,13 +259,20 @@ public:
     }
 
 
-    solux::proto::Val* getTargetForSub(solux::proto::SearchResponse* searchResponse, Calculator* sub) override {
-      auto* ourVal = parent->getTargetForSub(searchResponse, this);
-      // the Val should either be unset, or have a DocList
+    solux::api::Val* getTargetForSub(SearchResponse* resp, Calculator* sub) override {
+      auto* ourVal = parent->getTargetForSub(resp, this);
+      // the Val should either be unset, or have a FacetResult
       assert(
-        ourVal != nullptr && (ourVal->kind_case() == solux::proto::Val::kFacet
-          || ourVal->kind_case() == solux::proto::Val::KIND_NOT_SET));
-      return &(*ourVal->mutable_facet()->mutable_ops())[sub->getOp().name];
+        ourVal != nullptr && (std::holds_alternative<solux::api::FacetResult>(ourVal->kind)
+          || std::holds_alternative<std::monostate>(ourVal->kind)));
+      auto& fr = oneofMut<solux::api::FacetResult>(*ourVal);
+      // Cap = max distinct sub-op Vals written into this FacetResult's ops map.
+      // Both post sub-ops (doSubops, from subOps) and inline calculators
+      // (fillResult, from inlineSubOps) bubble through here, and the two sets are
+      // disjoint (init() moves inline ops out of subOps), so the backing array
+      // must be sized for their sum or opsSlot's pre-sized array overflows.
+      std::size_t cap = thisOp().subOps.size() + thisOp().inlineSubOps.size();
+      return build::opsSlot(fr.ops, cap, sub->getOp().name, resp->mr);
       //TODO: need to account for slot somehow,  or will subop do that?
     };
     void calc(oneapi::tbb::task_group* tg, int32_t segnum, DocSet* domain) override {
@@ -440,18 +447,24 @@ public:
     }
 
     void facetResult(std::unique_ptr<MergeableStrData> mergedData) {
-      auto* myVal = getTarget(nullptr, [&](solux::proto::Val& val) {
+      auto& mr = op.req.lastResponse->mr;  // arena for this leaf result (getTarget(nullptr) builds here)
+      auto* myVal = getTarget(nullptr, [&](solux::api::Val& val) {
         if (slot >= 0) {
           // sub-facet: this Val is shared by all parent buckets, so index by
           // slot into a per-bucket array (parallel to the parent bucket_ids),
-          // sized once under the mutex like AvgOp's arr_d.
-          auto& arr = *val.mutable_arr();
-          while (arr.v_size() < (int)numSlots) arr.add_v();
+          // allocated once at numSlots under the mutex like AvgOp's arr_d.
+          auto& arr = oneofMut<solux::api::ArrVal>(val);
+          if (arr.v.empty()) build::allocArray(arr.v, numSlots, mr);
         }
       });
-      solux::proto::FacetResult& facetResultProto = slot >= 0
-        ? *(*myVal->mutable_arr()->mutable_v())[slot].mutable_facet()
-        : *myVal->mutable_facet();
+      // For a sub-facet, our FacetResult goes into the slot-th element of the
+      // shared ArrVal (each slot is a distinct, stably-addressed Val).
+      solux::api::Val* targetVal = myVal;
+      if (slot >= 0) {
+        auto& arr = oneofMut<solux::api::ArrVal>(*myVal);
+        targetVal = &const_cast<solux::api::Val*>(arr.v.data())[slot];
+      }
+      solux::api::FacetResult& facetResultProto = oneofMut<solux::api::FacetResult>(*targetVal);
       auto limit = thisOp().limit;
       auto missing = thisOp().missing;
 
@@ -542,9 +555,9 @@ public:
       mergedData.reset();  // free up memory from the merged data, everything should be in countVec now.
 
 
-      emitBuckets(facetResultProto, countVec);
+      emitBuckets(facetResultProto, countVec, mr);
       if (missing) {
-        facetResultProto.set_missing(missing_count);
+        facetResultProto.missing = missing_count;
       }
 
       doSubops(thisOp().subOps, countVec);
@@ -552,15 +565,19 @@ public:
 
 
     void facetResult2(std::unique_ptr<MergeableStrFacetInline> mergedData) {
-      auto* myVal = getTarget(nullptr, [&](solux::proto::Val& val) {
+      auto& mr = op.req.lastResponse->mr;  // arena for this leaf result (getTarget(nullptr) builds here)
+      auto* myVal = getTarget(nullptr, [&](solux::api::Val& val) {
         if (slot >= 0) {
-          auto& arr = *val.mutable_arr();
-          while (arr.v_size() < (int)numSlots) arr.add_v();
+          auto& arr = oneofMut<solux::api::ArrVal>(val);
+          if (arr.v.empty()) build::allocArray(arr.v, numSlots, mr);
         }
       });
-      solux::proto::FacetResult& facetResultProto = slot >= 0
-        ? *(*myVal->mutable_arr()->mutable_v())[slot].mutable_facet()
-        : *myVal->mutable_facet();
+      solux::api::Val* targetVal = myVal;
+      if (slot >= 0) {
+        auto& arr = oneofMut<solux::api::ArrVal>(*myVal);
+        targetVal = &const_cast<solux::api::Val*>(arr.v.data())[slot];
+      }
+      solux::api::FacetResult& facetResultProto = oneofMut<solux::api::FacetResult>(*targetVal);
       auto minCount = thisOp().minCount;
       auto limit = thisOp().limit;
       auto missing = thisOp().missing;
@@ -575,7 +592,7 @@ public:
         }
       }
       auto missing_count = mergedData->missing_num;
-      if (thisOp().fieldFacet.sorts().empty()) {
+      if (thisOp().fieldFacet.sorts.empty()) {
         std::sort(valVec.begin(), valVec.end(), [](auto& a, auto& b) {
           if (*(int64_t*)a.second != *(int64_t*)b.second ) {
             return *(int64_t*)a.second > *(int64_t*)b.second;
@@ -584,7 +601,7 @@ public:
         });
       } else {
         // Count and bucket-value sorts are future work; sub-op sort is supported.
-        std::string_view field = thisOp().fieldFacet.sorts(0).field();
+        std::string_view field = thisOp().fieldFacet.sorts[0].field;
         SearchOp::InlineCalculator* calc = nullptr;
         for (auto* candidate : mergedData->inlineCalcs) {
           if (candidate->getOp().name == field) {
@@ -593,7 +610,7 @@ public:
           }
         }
         assert(calc != nullptr);
-        bool reversed = thisOp().fieldFacet.sorts(0).dir() == proto::SortSpec_SortDir_DESC;
+        bool reversed = thisOp().fieldFacet.sorts[0].dir == solux::api::SortSpec_::SortDir::DESC;
         std::sort(valVec.begin(), valVec.end(), [&calc, reversed](auto& a, auto& b) {
           int asize, bsize;
           int  cmp = calc->compare(a.second + sizeof(int64_t), b.second + sizeof(int64_t), asize, bsize);
@@ -607,19 +624,17 @@ public:
         valVec.resize(limit);
       }
 
-      // fill in the facet result proto
-      auto& bucketIds = *facetResultProto.mutable_bucket_ids()->mutable_col_s();
-      auto& bucketIdsArr = *bucketIds.mutable_v();
-      auto& countsArr = *facetResultProto.mutable_counts();
-      bucketIdsArr.Reserve(valVec.size());
-      countsArr.Reserve(valVec.size());
-      for (auto [key, val] : valVec) {
-        auto* strptr = bucketIdsArr.Add();
-        *strptr = key; // copy the string
-        countsArr.Add(*(int64_t*)val);
+      // fill in the facet result proto (non-owning: size known from valVec)
+      auto& bucketIds = facetResultProto.bucket_ids.emplace().kind.emplace<solux::api::ColStr>();
+      size_t n = valVec.size();
+      std::string_view* ids = build::allocArray(bucketIds.v, n, mr);
+      int64_t* countArr = build::allocArray(facetResultProto.counts, n, mr);
+      for (size_t i = 0; i < n; i++) {
+        ids[i] = build::arenaStr(mr, valVec[i].first);  // copy the (transient) string into the arena
+        countArr[i] = *(int64_t*)valVec[i].second;
       }
       if (missing) {
-        facetResultProto.set_missing(missing_count);
+        facetResultProto.missing = missing_count;
       }
 
       // fill in results from inline calculators

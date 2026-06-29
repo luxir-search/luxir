@@ -10,8 +10,8 @@
 
 namespace solux::handler {
 
-/// Dense-float-vector field handler.  Values arrive as proto::Vector
-/// (single) or proto::ArrVector (multi-valued); we reinterpret each f32
+/// Dense-float-vector field handler.  Values arrive as solux::api::Vector
+/// (single) or solux::api::ArrVector (multi-valued); we reinterpret each f32
 /// vector as a fixed-size byte blob and delegate to the binary-column path
 /// inherited from StrColHandler.  The column's existing fixed-size fast path
 /// captures per-segment dims automatically (mono2MetaOff = dims*4).
@@ -52,25 +52,25 @@ protected:
   bool writesValueDocMap() const override { return true; }
 
 public:
-  void index(Inverter& inverter, const proto::Val& val) override {
+  void index(Inverter& inverter, const IndexVal& val) override {
     pendingDims_ = 0;  // dims learned by a previous (possibly failed) value don't carry over
     bool multi = (fieldType->flags_ & FieldType::MULTI_VALUED) != 0;
-    if (val.has_vec()) {
+    if (std::holds_alternative<solux::api::Vector>(val.kind)) {
       if (multi) {
         // A single Vector on a multi-valued field is treated as a one-element list.
-        indexOne(inverter, val.vec());
+        indexOne(inverter, std::get<solux::api::Vector>(val.kind));
       } else {
-        indexSingleVec(inverter, val.vec());
+        indexSingleVec(inverter, std::get<solux::api::Vector>(val.kind));
       }
-    } else if (val.has_arr_vec()) {
+    } else if (std::holds_alternative<solux::api::ArrVector>(val.kind)) {
       if (!multi) {
         throw std::runtime_error(fmt::format(
             "VectorHandler: field '{}' is single-valued but received arr_vec",
             std::string_view(fieldName)));
       }
-      indexMultiVec(inverter, val.arr_vec());
+      indexMultiVec(inverter, std::get<solux::api::ArrVector>(val.kind));
     } else {
-      throw std::runtime_error("VectorHandler: expected vec or arr_vec, got " + val.DebugString());
+      throw std::runtime_error("VectorHandler: expected vec or arr_vec");
     }
   }
 
@@ -95,14 +95,14 @@ private:
   // should be skipped: a cosine field's zero / near-zero vector has no
   // direction, so we drop it (and log) rather than fail the whole update.
   // Throws on hard errors (bad encoding, empty vector, dims mismatch).
-  const proto::ArrFloat* validate(const proto::Vector& vec, double* normSq = nullptr) {
-    if (!vec.has_f32()) {
+  const solux::api::ArrFloat* validate(const solux::api::Vector& vec, double* normSq = nullptr) {
+    if (!vec.f32.has_value()) {
       throw std::runtime_error(fmt::format(
           "VectorHandler: field '{}' got Vector with unsupported / unset encoding",
           std::string_view(fieldName)));
     }
-    auto& f = vec.f32();
-    int32_t n = f.v_size();
+    auto& f = (*vec.f32);
+    int32_t n = f.v.size();
     if (n == 0) {
       throw std::runtime_error(fmt::format(
           "VectorHandler: empty vector in field '{}'", std::string_view(fieldName)));
@@ -117,7 +117,7 @@ private:
     }
     if (metric == VectorFieldType::METRIC_COSINE && !trustNormalized) {
       double sum = 0.0;
-      for (float x : f.v()) {
+      for (float x : f.v) {
         double d = (double)x;
         sum += d * d;
       }
@@ -132,57 +132,57 @@ private:
     return &f;
   }
 
-  static std::string_view bytesOf(const proto::ArrFloat& vec) {
-    return std::string_view((const char*)vec.v().data(),
-                            (size_t)vec.v_size() * sizeof(float));
+  static std::string_view bytesOf(const solux::api::ArrFloat& vec) {
+    return std::string_view((const char*)vec.v.data(),
+                            (size_t)vec.v.size() * sizeof(float));
   }
 
   static std::string_view bytesOf(const float* data, int32_t dims) {
     return std::string_view((const char*)data, (size_t)dims * sizeof(float));
   }
 
-  std::string_view storedBytes(const proto::ArrFloat& vec,
+  std::string_view storedBytes(const solux::api::ArrFloat& vec,
                                double normSq,
                                std::vector<float>& scratch) const {
     if (!normalizeOnWrite) return bytesOf(vec);
 
     size_t start = scratch.size();
-    scratch.resize(start + (size_t)vec.v_size());
+    scratch.resize(start + (size_t)vec.v.size());
     float invNorm = (float)(1.0 / std::sqrt(normSq));
-    for (int32_t i = 0; i < vec.v_size(); i++) {
-      scratch[start + (size_t)i] = vec.v(i) * invNorm;
+    for (int32_t i = 0; i < vec.v.size(); i++) {
+      scratch[start + (size_t)i] = vec.v[i] * invNorm;
     }
-    return bytesOf(scratch.data() + start, vec.v_size());
+    return bytesOf(scratch.data() + start, vec.v.size());
   }
 
-  void indexSingleVec(Inverter& inverter, const proto::Vector& vec) {
+  void indexSingleVec(Inverter& inverter, const solux::api::Vector& vec) {
     double normSq = 0.0;
     auto* f = validate(vec, &normSq);
     if (f == nullptr) return;  // skipped: doc gets no value for this field
     commitDims();
     normalizedScratch.clear();
-    if (normalizeOnWrite) normalizedScratch.reserve((size_t)f->v_size());
+    if (normalizeOnWrite) normalizedScratch.reserve((size_t)f->v.size());
     indexSingle(inverter, storedBytes(*f, normSq, normalizedScratch));
   }
 
-  void indexOne(Inverter& inverter, const proto::Vector& vec) {
+  void indexOne(Inverter& inverter, const solux::api::Vector& vec) {
     double normSq = 0.0;
     auto* f = validate(vec, &normSq);
     if (f == nullptr) return;  // skipped: doc gets no value for this field
     commitDims();
     normalizedScratch.clear();
-    if (normalizeOnWrite) normalizedScratch.reserve((size_t)f->v_size());
+    if (normalizeOnWrite) normalizedScratch.reserve((size_t)f->v.size());
     std::string_view views[] = { storedBytes(*f, normSq, normalizedScratch) };
-    indexMulti(inverter, std::span<std::string_view>(views));
+    indexMulti(inverter, std::span<const std::string_view>(views));
   }
 
-  void indexMultiVec(Inverter& inverter, const proto::ArrVector& arr) {
-    auto& vecs = arr.v();
+  void indexMultiVec(Inverter& inverter, const solux::api::ArrVector& arr) {
+    auto& vecs = arr.v;
     // Empty list = "no value for this doc" (indistinguishable from field
     // unset); skip without recording the doc in docsWithValue.
     if (vecs.empty()) return;
     // Validate first so dims_ is locked before we capture byte views.
-    std::vector<const proto::ArrFloat*> floats;
+    std::vector<const solux::api::ArrFloat*> floats;
     std::vector<double> normSq;
     floats.reserve(vecs.size());
     normSq.reserve(vecs.size());
@@ -209,7 +209,7 @@ private:
       views.push_back(storedBytes(*floats[i], normSq[i], normalizedScratch));
     }
     assert(!normalizeOnWrite || normalizedScratch.size() == (size_t)dims_ * floats.size());
-    indexMulti(inverter, std::span<std::string_view>(views));
+    indexMulti(inverter, std::span<const std::string_view>(views));
   }
 };
 

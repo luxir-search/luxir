@@ -2,6 +2,7 @@
 #include "test/SoluxTest.h"
 #include "test/CollectionHelper.h"
 #include "test/LocalReq.h"
+#include "test/QueryBuild.h"
 #include "solux/search/FieldSortCollector.h"
 // #include "solux/search/FieldSortCollector2.h"
 #include "solux/search/SortField.h"
@@ -398,99 +399,66 @@ TEST_F(SortCollectorTest, SortByStringField) {
   helper.index(flatdoc("id_s", "doc5", "name_s", "alice"), UpdateMessage::COMMIT); // duplicate value
   
   // Create a search request that sorts by name ascending
-  auto* lreq = LocalReq::create(soluxNode->getSearchEngine());
-  lreq->proto.mutable_collection()->add_name("main");
-  
-  auto& ops = *lreq->proto.mutable_ops();
-  auto& topDocs = *ops["q"].mutable_top_docs();
-  topDocs.set_get_number(true);
-  topDocs.set_limit(10);
-  
-  // Match all documents
-  topDocs.mutable_query()->set_all(true);
-  
-  // Sort by name ascending
-  auto* sortSpec = topDocs.add_sorts();
-  sortSpec->set_field("name_s");
-  sortSpec->set_dir(proto::SortSpec::ASC);
-  
-  // Request fields to return
-  topDocs.mutable_fields()->Add("id_s");
-  topDocs.mutable_fields()->Add("name_s");
-  
-  lreq->engine.submit(*lreq, true);
-  
-  ASSERT_GT(lreq->responses.size(), 0) << "No responses received";
-  auto& docs = lreq->responses[0]->proto.ops().at("q").docs();
-  
-  ASSERT_EQ(5, docs.matches());
-  
+  auto req = localReq(soluxNode->getSearchEngine());
+  req->collection("main");
+  auto& cur = req->topDocs("q").getNumber().limit(10).allQuery().fields({"id_s", "name_s"});
+  qb::sort(cur, "name_s", qb::ASC);
+  req->execute(true);
+  ASSERT_OK(req);
+
+  const auto* docs = req->docList("q");
+  ASSERT_EQ(5, docs->matches.value_or(0));
+
   // Verify sort order: alice (doc2), alice (doc5), bob, charlie, david
-  auto& idCol = docs.columns().at("id_s").col_s();
-  auto& nameCol = docs.columns().at("name_s").col_s();
-  
-  ASSERT_EQ(5, idCol.v_size());
-  ASSERT_EQ(5, nameCol.v_size());
-  
+  auto& idCol = std::get<solux::api::ColStr>(docs->columns.at("id_s").kind);
+  auto& nameCol = std::get<solux::api::ColStr>(docs->columns.at("name_s").kind);
+
+  ASSERT_EQ(5, (int)idCol.v.size());
+  ASSERT_EQ(5, (int)nameCol.v.size());
+
   // First two should be alice (ordered by docid as tiebreaker)
-  ASSERT_EQ("alice", nameCol.v(0));
-  ASSERT_EQ("doc2", idCol.v(0));
-  
-  ASSERT_EQ("alice", nameCol.v(1));
-  ASSERT_EQ("doc5", idCol.v(1));
-  
-  ASSERT_EQ("bob", nameCol.v(2));
-  ASSERT_EQ("doc3", idCol.v(2));
-  
-  ASSERT_EQ("charlie", nameCol.v(3));
-  ASSERT_EQ("doc1", idCol.v(3));
-  
-  ASSERT_EQ("david", nameCol.v(4));
-  ASSERT_EQ("doc4", idCol.v(4));
-  
-  lreq->done();
-  
+  ASSERT_EQ("alice", nameCol.v[0]);
+  ASSERT_EQ("doc2", idCol.v[0]);
+
+  ASSERT_EQ("alice", nameCol.v[1]);
+  ASSERT_EQ("doc5", idCol.v[1]);
+
+  ASSERT_EQ("bob", nameCol.v[2]);
+  ASSERT_EQ("doc3", idCol.v[2]);
+
+  ASSERT_EQ("charlie", nameCol.v[3]);
+  ASSERT_EQ("doc1", idCol.v[3]);
+
+  ASSERT_EQ("david", nameCol.v[4]);
+  ASSERT_EQ("doc4", idCol.v[4]);
+
   // Test descending sort as well
-  auto* lreq3 = LocalReq::create(soluxNode->getSearchEngine());
-  lreq3->proto.mutable_collection()->add_name("main");
-  
-  auto& ops3 = *lreq3->proto.mutable_ops();
-  auto& topDocs3 = *ops3["q"].mutable_top_docs();
-  topDocs3.set_get_number(true);
-  topDocs3.set_limit(10);
-  topDocs3.mutable_query()->set_all(true);
-  
-  // Sort by name descending
-  auto* sortSpec3 = topDocs3.add_sorts();
-  sortSpec3->set_field("name_s");
-  sortSpec3->set_dir(proto::SortSpec::DESC);
-  
-  topDocs3.mutable_fields()->Add("id_s");
-  topDocs3.mutable_fields()->Add("name_s");
-  
-  lreq3->engine.submit(*lreq3, true);
-  
-  auto& docs3 = lreq3->responses[0]->proto.ops().at("q").docs();
-  ASSERT_EQ(5, docs3.matches());
-  
+  auto req3 = localReq(soluxNode->getSearchEngine());
+  req3->collection("main");
+  auto& cur3 = req3->topDocs("q").getNumber().limit(10).allQuery().fields({"id_s", "name_s"});
+  qb::sort(cur3, "name_s", qb::DESC);
+  req3->execute(true);
+  ASSERT_OK(req3);
+
+  const auto* docs3 = req3->docList("q");
+  ASSERT_EQ(5, docs3->matches.value_or(0));
+
   // Verify descending sort order: david, charlie, bob, alice (doc2), alice (doc5)
-  auto& idCol3 = docs3.columns().at("id_s").col_s();
-  auto& nameCol3 = docs3.columns().at("name_s").col_s();
-  
-  ASSERT_EQ("david", nameCol3.v(0));
-  ASSERT_EQ("doc4", idCol3.v(0));
-  
-  ASSERT_EQ("charlie", nameCol3.v(1));
-  ASSERT_EQ("doc1", idCol3.v(1));
-  
-  ASSERT_EQ("bob", nameCol3.v(2));
-  ASSERT_EQ("doc3", idCol3.v(2));
-  
+  auto& idCol3 = std::get<solux::api::ColStr>(docs3->columns.at("id_s").kind);
+  auto& nameCol3 = std::get<solux::api::ColStr>(docs3->columns.at("name_s").kind);
+
+  ASSERT_EQ("david", nameCol3.v[0]);
+  ASSERT_EQ("doc4", idCol3.v[0]);
+
+  ASSERT_EQ("charlie", nameCol3.v[1]);
+  ASSERT_EQ("doc1", idCol3.v[1]);
+
+  ASSERT_EQ("bob", nameCol3.v[2]);
+  ASSERT_EQ("doc3", idCol3.v[2]);
+
   // alice docs should be in docid order (reverse of ascending)
-  ASSERT_EQ("alice", nameCol3.v(3));
-  ASSERT_EQ("alice", nameCol3.v(4));
-  
-  lreq3->done();
+  ASSERT_EQ("alice", nameCol3.v[3]);
+  ASSERT_EQ("alice", nameCol3.v[4]);
 }
 
 TEST_F(SortCollectorTest, SortByPriceAscending) {
@@ -505,100 +473,67 @@ TEST_F(SortCollectorTest, SortByPriceAscending) {
   helper.index(flatdoc("id_s", "doc5", "price_i", 100, "price_s", "00100", "rating_i", 4), UpdateMessage::COMMIT);
 
   // Create a search request that sorts by price ascending
-  auto* lreq = LocalReq::create(soluxNode->getSearchEngine());
-  lreq->proto.mutable_collection()->add_name("main");
+  auto req = localReq(soluxNode->getSearchEngine());
+  req->collection("main");
+  auto& cur = req->topDocs("q").getNumber().limit(10).allQuery().fields({"id_s", "price_i"});
+  qb::sort(cur, "price_i", qb::ASC);
+  req->execute(true);
+  ASSERT_OK(req);
 
-  auto& ops = *lreq->proto.mutable_ops();
-  auto& topDocs = *ops["q"].mutable_top_docs();
-  topDocs.set_get_number(true);
-  topDocs.set_limit(10);
-
-  // Match all documents
-  topDocs.mutable_query()->set_all(true);
-
-  // Sort by price ascending
-  auto* sortSpec = topDocs.add_sorts();
-  sortSpec->set_field("price_i");
-  sortSpec->set_dir(proto::SortSpec::ASC);
-
-  // Request fields to return
-  topDocs.mutable_fields()->Add("id_s");
-  topDocs.mutable_fields()->Add("price_i");
-
-  lreq->engine.submit(*lreq, true);
-
-  ASSERT_GT(lreq->responses.size(), 0) << "No responses received";
-  auto& docs = lreq->responses[0]->proto.ops().at("q").docs();
-
-  ASSERT_EQ(5, docs.matches());
+  const auto* docs = req->docList("q");
+  ASSERT_EQ(5, docs->matches.value_or(0));
 
   // Check if we have columns
-  ASSERT_GT(docs.columns_size(), 0) << "No columns returned";
+  ASSERT_GT((int)docs->columns.size(), 0) << "No columns returned";
 
   // Check if values were actually loaded
-  auto& idCol = docs.columns().at("id_s").col_s();
-  auto& priceCol = docs.columns().at("price_i").col_i();
+  auto& idCol = std::get<solux::api::ColStr>(docs->columns.at("id_s").kind);
+  auto& priceCol = std::get<solux::api::ColInt>(docs->columns.at("price_i").kind);
 
-  ASSERT_GT(idCol.v_size(), 0) << "No id values loaded";
-  ASSERT_GT(priceCol.v_size(), 0) << "No price values loaded";
+  ASSERT_GT((int)idCol.v.size(), 0) << "No id values loaded";
+  ASSERT_GT((int)priceCol.v.size(), 0) << "No price values loaded";
 
   // Verify sort order by price: doc2(50), doc4(75), doc1(100), doc5(100), doc3(150)
-  ASSERT_EQ("doc2", idCol.v(0));
-  ASSERT_EQ(50, priceCol.v(0));
+  ASSERT_EQ("doc2", idCol.v[0]);
+  ASSERT_EQ(50, priceCol.v[0]);
 
-  ASSERT_EQ("doc4", docs.columns().at("id_s").col_s().v(1));
-  ASSERT_EQ(75, docs.columns().at("price_i").col_i().v(1));
+  ASSERT_EQ("doc4", idCol.v[1]);
+  ASSERT_EQ(75, priceCol.v[1]);
 
   // doc1 and doc5 have same price, so they should be ordered by docid
-  ASSERT_EQ(100, docs.columns().at("price_i").col_i().v(2));
-  ASSERT_EQ(100, docs.columns().at("price_i").col_i().v(3));
+  ASSERT_EQ(100, priceCol.v[2]);
+  ASSERT_EQ(100, priceCol.v[3]);
 
-  ASSERT_EQ("doc3", docs.columns().at("id_s").col_s().v(4));
-  ASSERT_EQ(150, docs.columns().at("price_i").col_i().v(4));
+  ASSERT_EQ("doc3", idCol.v[4]);
+  ASSERT_EQ(150, priceCol.v[4]);
 
-  lreq->done();
-  
   // Now test string sorting with the same data - should give identical results
-  auto* lreq2 = LocalReq::create(soluxNode->getSearchEngine());
-  lreq2->proto.mutable_collection()->add_name("main");
-  
-  auto& ops2 = *lreq2->proto.mutable_ops();
-  auto& topDocs2 = *ops2["q"].mutable_top_docs();
-  topDocs2.set_get_number(true);
-  topDocs2.set_limit(10);
-  topDocs2.mutable_query()->set_all(true);
-  
-  // Sort by price_s (string) ascending
-  auto* sortSpec2 = topDocs2.add_sorts();
-  sortSpec2->set_field("price_s");
-  sortSpec2->set_dir(proto::SortSpec::ASC);
-  
-  topDocs2.mutable_fields()->Add("id_s");
-  topDocs2.mutable_fields()->Add("price_s");
-  
-  lreq2->engine.submit(*lreq2, true);
-  
-  auto& docs2 = lreq2->responses[0]->proto.ops().at("q").docs();
-  ASSERT_EQ(5, docs2.matches());
-  
+  auto req2 = localReq(soluxNode->getSearchEngine());
+  req2->collection("main");
+  auto& cur2 = req2->topDocs("q").getNumber().limit(10).allQuery().fields({"id_s", "price_s"});
+  qb::sort(cur2, "price_s", qb::ASC);
+  req2->execute(true);
+  ASSERT_OK(req2);
+
+  const auto* docs2 = req2->docList("q");
+  ASSERT_EQ(5, docs2->matches.value_or(0));
+
   // Verify same sort order as integer sort
-  auto& idCol2 = docs2.columns().at("id_s").col_s();
-  auto& priceStrCol = docs2.columns().at("price_s").col_s();
-  
-  ASSERT_EQ("doc2", idCol2.v(0));
-  ASSERT_EQ("00050", priceStrCol.v(0));
-  
-  ASSERT_EQ("doc4", idCol2.v(1));
-  ASSERT_EQ("00075", priceStrCol.v(1));
-  
+  auto& idCol2 = std::get<solux::api::ColStr>(docs2->columns.at("id_s").kind);
+  auto& priceStrCol = std::get<solux::api::ColStr>(docs2->columns.at("price_s").kind);
+
+  ASSERT_EQ("doc2", idCol2.v[0]);
+  ASSERT_EQ("00050", priceStrCol.v[0]);
+
+  ASSERT_EQ("doc4", idCol2.v[1]);
+  ASSERT_EQ("00075", priceStrCol.v[1]);
+
   // doc1 and doc5 have same price string, ordered by docid
-  ASSERT_EQ("00100", priceStrCol.v(2));
-  ASSERT_EQ("00100", priceStrCol.v(3));
-  
-  ASSERT_EQ("doc3", idCol2.v(4));
-  ASSERT_EQ("00150", priceStrCol.v(4));
-  
-  lreq2->done();
+  ASSERT_EQ("00100", priceStrCol.v[2]);
+  ASSERT_EQ("00100", priceStrCol.v[3]);
+
+  ASSERT_EQ("doc3", idCol2.v[4]);
+  ASSERT_EQ("00150", priceStrCol.v[4]);
 }
 
 TEST_F(SortCollectorTest, SortByMultipleFields) {
@@ -613,58 +548,43 @@ TEST_F(SortCollectorTest, SortByMultipleFields) {
   helper.index(flatdoc("id_s", "doc5", "price_i", 100, "rating_i", 4), UpdateMessage::COMMIT);
 
   // Create a search request that sorts by rating desc, then price asc
-  auto* lreq = LocalReq::create(soluxNode->getSearchEngine());
-  lreq->proto.mutable_collection()->add_name("main");
-
-  auto& ops = *lreq->proto.mutable_ops();
-  auto& topDocs = *ops["q"].mutable_top_docs();
-  topDocs.set_get_number(true);
-  topDocs.set_limit(10);
-
-  // Match all documents
-  topDocs.mutable_query()->set_all(true);
+  auto req = localReq(soluxNode->getSearchEngine());
+  req->collection("main");
+  auto& cur = req->topDocs("q").getNumber().limit(10).allQuery()
+      .fields({"id_s", "price_i", "rating_i"});
 
   // Sort by rating descending, then price ascending
-  auto* sortSpec1 = topDocs.add_sorts();
-  sortSpec1->set_field("rating_i");
-  sortSpec1->set_dir(proto::SortSpec::DESC);
+  qb::sort(cur, "rating_i", qb::DESC);
+  qb::sort(cur, "price_i", qb::ASC);
 
-  auto* sortSpec2 = topDocs.add_sorts();
-  sortSpec2->set_field("price_i");
-  sortSpec2->set_dir(proto::SortSpec::ASC);
+  req->execute(true);
+  ASSERT_OK(req);
 
-  // Request fields to return
-  topDocs.mutable_fields()->Add("id_s");
-  topDocs.mutable_fields()->Add("price_i");
-  topDocs.mutable_fields()->Add("rating_i");
-
-  lreq->engine.submit(*lreq, true);
-
-  auto& docs = lreq->responses[0]->proto.ops().at("q").docs();
-  ASSERT_EQ(5, docs.matches());
+  const auto* docs = req->docList("q");
+  ASSERT_EQ(5, docs->matches.value_or(0));
 
   // Expected order:
   // rating 5: doc4(75), doc1(100)
   // rating 4: doc2(50), doc5(100)
   // rating 3: doc3(150)
-  
+
   // Note: FieldSortCollector currently has a limitation with multi-field sorts
   // where secondary sort fields are not preserved during heap operations.
   // This causes tie-breaking to fall back to document ID order.
   // We'll verify that primary sort (rating DESC) works correctly.
-  
-  // First two docs should have rating=5
-  ASSERT_EQ(5, docs.columns().at("rating_i").col_i().v(0));
-  ASSERT_EQ(5, docs.columns().at("rating_i").col_i().v(1));
-  
-  // Next two docs should have rating=4
-  ASSERT_EQ(4, docs.columns().at("rating_i").col_i().v(2));
-  ASSERT_EQ(4, docs.columns().at("rating_i").col_i().v(3));
-  
-  // Last doc should have rating=3
-  ASSERT_EQ(3, docs.columns().at("rating_i").col_i().v(4));
 
-  lreq->done();
+  auto& ratingCol = std::get<solux::api::ColInt>(docs->columns.at("rating_i").kind);
+
+  // First two docs should have rating=5
+  ASSERT_EQ(5, ratingCol.v[0]);
+  ASSERT_EQ(5, ratingCol.v[1]);
+
+  // Next two docs should have rating=4
+  ASSERT_EQ(4, ratingCol.v[2]);
+  ASSERT_EQ(4, ratingCol.v[3]);
+
+  // Last doc should have rating=3
+  ASSERT_EQ(3, ratingCol.v[4]);
 }
 
 TEST_F(SortCollectorTest, SortByPriceDescending) {
@@ -677,40 +597,26 @@ TEST_F(SortCollectorTest, SortByPriceDescending) {
   helper.index(flatdoc("id_s", "doc3", "price_i", 150), UpdateMessage::COMMIT);
 
   // Create a search request that sorts by price descending
-  auto* lreq = LocalReq::create(soluxNode->getSearchEngine());
-  lreq->proto.mutable_collection()->add_name("main");
+  auto req = localReq(soluxNode->getSearchEngine());
+  req->collection("main");
+  auto& cur = req->topDocs("q").limit(10).allQuery().fields({"id_s", "price_i"});
+  qb::sort(cur, "price_i", qb::DESC);
+  req->execute(true);
+  ASSERT_OK(req);
 
-  auto& ops = *lreq->proto.mutable_ops();
-  auto& topDocs = *ops["q"].mutable_top_docs();
-  topDocs.set_limit(10);
-
-  // Match all documents
-  topDocs.mutable_query()->set_all(true);
-
-  // Sort by price descending
-  auto* sortSpec = topDocs.add_sorts();
-  sortSpec->set_field("price_i");
-  sortSpec->set_dir(proto::SortSpec::DESC);
-
-  // Request fields to return
-  topDocs.mutable_fields()->Add("id_s");
-  topDocs.mutable_fields()->Add("price_i");
-
-  lreq->engine.submit(*lreq, true);
-
-  auto& docs = lreq->responses[0]->proto.ops().at("q").docs();
+  const auto* docs = req->docList("q");
+  auto& idCol = std::get<solux::api::ColStr>(docs->columns.at("id_s").kind);
+  auto& priceCol = std::get<solux::api::ColInt>(docs->columns.at("price_i").kind);
 
   // Verify sort order by price descending: doc3(150), doc1(100), doc2(50)
-  ASSERT_EQ("doc3", docs.columns().at("id_s").col_s().v(0));
-  ASSERT_EQ(150, docs.columns().at("price_i").col_i().v(0));
+  ASSERT_EQ("doc3", idCol.v[0]);
+  ASSERT_EQ(150, priceCol.v[0]);
 
-  ASSERT_EQ("doc1", docs.columns().at("id_s").col_s().v(1));
-  ASSERT_EQ(100, docs.columns().at("price_i").col_i().v(1));
+  ASSERT_EQ("doc1", idCol.v[1]);
+  ASSERT_EQ(100, priceCol.v[1]);
 
-  ASSERT_EQ("doc2", docs.columns().at("id_s").col_s().v(2));
-  ASSERT_EQ(50, docs.columns().at("price_i").col_i().v(2));
-
-  lreq->done();
+  ASSERT_EQ("doc2", idCol.v[2]);
+  ASSERT_EQ(50, priceCol.v[2]);
 }
 
 TEST_F(SortCollectorTest, SortWithBatchedResponses) {
@@ -724,73 +630,57 @@ TEST_F(SortCollectorTest, SortWithBatchedResponses) {
   }
 
   // Create a search request with small batch size to trigger multiple responses
-  auto* lreq = LocalReq::create(soluxNode->getSearchEngine());
-  lreq->proto.mutable_collection()->add_name("main");
-
-  auto& ops = *lreq->proto.mutable_ops();
-  auto& topDocs = *ops["q"].mutable_top_docs();
-  topDocs.set_limit(10);
-  topDocs.set_batch_size(3); // Small batch size to get multiple responses
-  topDocs.set_get_number(true);
-
-  // Match all documents
-  topDocs.mutable_query()->set_all(true);
-
-  // Sort by price ascending
-  auto* sortSpec = topDocs.add_sorts();
-  sortSpec->set_field("price_i");
-  sortSpec->set_dir(proto::SortSpec::ASC);
-
-  // Request fields to return
-  topDocs.mutable_fields()->Add("id_s");
-  topDocs.mutable_fields()->Add("price_i");
-
-  lreq->engine.submit(*lreq, true);
+  auto req = localReq(soluxNode->getSearchEngine());
+  req->collection("main");
+  auto& cur = req->topDocs("q").limit(10)
+      .batchSize(3)  // Small batch size to get multiple responses
+      .getNumber().allQuery().fields({"id_s", "price_i"});
+  qb::sort(cur, "price_i", qb::ASC);
+  req->execute(true);
+  ASSERT_OK(req);
 
   // Should have multiple responses due to batch size
-  ASSERT_GT(lreq->responses.size(), 1) << "Expected multiple batched responses";
+  ASSERT_GT(req->responses.size(), 1) << "Expected multiple batched responses";
 
   // Verify we got all documents across all responses
   int totalDocs = 0;
   std::vector<int> allPrices;
 
-  for (size_t i = 0; i < lreq->responses.size(); i++) {
-    auto& response = *lreq->responses[i];
-    auto& docs = response.proto.ops().at("q").docs();
+  for (size_t i = 0; i < req->responses.size(); i++) {
+    auto& response = req->responses[i]->proto;
+    const auto* docs = response.ops.at("q")->docList();
 
     // Check offset is correct for each batch
-    EXPECT_EQ(docs.offset(), totalDocs) << "Incorrect offset for batch " << i;
+    EXPECT_EQ(docs->offset, totalDocs) << "Incorrect offset for batch " << i;
 
     // All but last response should have more flag
-    if (i < lreq->responses.size() - 1) {
-      EXPECT_TRUE(response.proto.more()) << "Expected more flag on response " << i;
-      EXPECT_TRUE(docs.more()) << "Expected more flag on docs " << i;
+    if (i < req->responses.size() - 1) {
+      EXPECT_TRUE(response.more) << "Expected more flag on response " << i;
+      EXPECT_TRUE(docs->more) << "Expected more flag on docs " << i;
     }
     else {
-      EXPECT_FALSE(response.proto.more()) << "Unexpected more flag on last response";
-      EXPECT_FALSE(docs.more()) << "Unexpected more flag on last docs";
+      EXPECT_FALSE(response.more) << "Unexpected more flag on last response";
+      EXPECT_FALSE(docs->more) << "Unexpected more flag on last docs";
     }
 
     // Collect all prices to verify complete sort order
-    auto& priceCol = docs.columns().at("price_i").col_i();
-    for (int j = 0; j < priceCol.v_size(); j++) {
-      allPrices.push_back(priceCol.v(j));
+    auto& priceCol = std::get<solux::api::ColInt>(docs->columns.at("price_i").kind);
+    for (int j = 0; j < (int)priceCol.v.size(); j++) {
+      allPrices.push_back(priceCol.v[j]);
     }
 
-    totalDocs += priceCol.v_size();
+    totalDocs += (int)priceCol.v.size();
   }
 
   // Verify we got all 10 documents
   ASSERT_EQ(totalDocs, 10);
-  ASSERT_EQ(lreq->responses.back()->proto.ops().at("q").docs().matches(), 10);
+  ASSERT_EQ(req->responses.back()->proto.ops.at("q")->docList()->matches.value_or(0), 10);
 
   // Verify complete sort order: 10, 20, 30, ..., 100
   ASSERT_EQ(allPrices.size(), 10);
   for (int i = 0; i < 10; i++) {
     EXPECT_EQ(allPrices[i], (i + 1) * 10) << "Incorrect price at position " << i;
   }
-
-  lreq->done();
 }
 
 TEST_F(SortCollectorTest, SortWithMissingValues) {
@@ -805,55 +695,39 @@ TEST_F(SortCollectorTest, SortWithMissingValues) {
   helper.index(flatdoc("id_s", "doc5", "price_i", 75), UpdateMessage::COMMIT);
   
   // Create a search request that sorts by price ascending
-  auto* lreq = LocalReq::create(soluxNode->getSearchEngine());
-  lreq->proto.mutable_collection()->add_name("main");
-  
-  auto& ops = *lreq->proto.mutable_ops();
-  auto& topDocs = *ops["q"].mutable_top_docs();
-  topDocs.set_get_number(true);
-  topDocs.set_limit(10);
-  
-  // Match all documents
-  topDocs.mutable_query()->set_all(true);
-  
+  auto req = localReq(soluxNode->getSearchEngine());
+  req->collection("main");
   // Sort by price ascending (missing values should be last by default)
-  auto* sortSpec = topDocs.add_sorts();
-  sortSpec->set_field("price_i");
-  sortSpec->set_dir(proto::SortSpec::ASC);
-  
-  // Request fields to return
-  topDocs.mutable_fields()->Add("id_s");
-  topDocs.mutable_fields()->Add("price_i");
-  
-  lreq->engine.submit(*lreq, true);
-  
-  auto& docs = lreq->responses[0]->proto.ops().at("q").docs();
-  ASSERT_EQ(5, docs.matches());
-  
+  auto& cur = req->topDocs("q").getNumber().limit(10).allQuery().fields({"id_s", "price_i"});
+  qb::sort(cur, "price_i", qb::ASC);
+  req->execute(true);
+  ASSERT_OK(req);
+
+  const auto* docs = req->docList("q");
+  ASSERT_EQ(5, docs->matches.value_or(0));
+
   // Check order: documents with values first (50, 75, 100), then missing values
-  auto& idCol = docs.columns().at("id_s").col_s();
-  auto& priceCol = docs.columns().at("price_i").col_i();
-  
-  ASSERT_EQ(5, idCol.v_size());
-  ASSERT_EQ(5, priceCol.v_size());
-  
+  auto& idCol = std::get<solux::api::ColStr>(docs->columns.at("id_s").kind);
+  auto& priceCol = std::get<solux::api::ColInt>(docs->columns.at("price_i").kind);
+
+  ASSERT_EQ(5, (int)idCol.v.size());
+  ASSERT_EQ(5, (int)priceCol.v.size());
+
   // Documents with values come first in ascending order
-  ASSERT_EQ("doc3", idCol.v(0));
-  ASSERT_EQ(50, priceCol.v(0));
-  
-  ASSERT_EQ("doc5", idCol.v(1));
-  ASSERT_EQ(75, priceCol.v(1));
-  
-  ASSERT_EQ("doc1", idCol.v(2));
-  ASSERT_EQ(100, priceCol.v(2));
-  
+  ASSERT_EQ("doc3", idCol.v[0]);
+  ASSERT_EQ(50, priceCol.v[0]);
+
+  ASSERT_EQ("doc5", idCol.v[1]);
+  ASSERT_EQ(75, priceCol.v[1]);
+
+  ASSERT_EQ("doc1", idCol.v[2]);
+  ASSERT_EQ(100, priceCol.v[2]);
+
   // Documents with missing values come last.  Their slots hold the column's
   // batch-chosen filler (0 here, since no real price is 0).
-  ASSERT_EQ(0, priceCol.missing_val());
-  ASSERT_EQ(priceCol.missing_val(), priceCol.v(3));
-  ASSERT_EQ(priceCol.missing_val(), priceCol.v(4));
-  
-  lreq->done();
+  ASSERT_EQ(0, priceCol.missing_val);
+  ASSERT_EQ(priceCol.missing_val, priceCol.v[3]);
+  ASSERT_EQ(priceCol.missing_val, priceCol.v[4]);
 }
 
 TEST_F(SortCollectorTest, EmptyResults) {
@@ -865,33 +739,20 @@ TEST_F(SortCollectorTest, EmptyResults) {
   helper.index(flatdoc("id_s", "doc2", "price_i", 50), UpdateMessage::COMMIT);
   
   // Create a search request that matches no documents
-  auto* lreq = LocalReq::create(soluxNode->getSearchEngine());
-  lreq->proto.mutable_collection()->add_name("main");
-  
-  auto& ops = *lreq->proto.mutable_ops();
-  auto& topDocs = *ops["q"].mutable_top_docs();
-  topDocs.set_get_number(true);
-  topDocs.set_limit(10);
-  
+  auto req = localReq(soluxNode->getSearchEngine());
+  req->collection("main");
   // Search for a field value that doesn't exist
-  topDocs.mutable_query()->mutable_match()->set_field("id_s");
-  topDocs.mutable_query()->mutable_match()->mutable_val()->set_s("nonexistent");
-  
+  auto& cur = req->topDocs("q").getNumber().limit(10).matchQuery("id_s", "nonexistent");
   // Sort by price
-  auto* sortSpec = topDocs.add_sorts();
-  sortSpec->set_field("price_i");
-  sortSpec->set_dir(proto::SortSpec::ASC);
-  
-  lreq->engine.submit(*lreq, true);
-  
-  ASSERT_GT(lreq->responses.size(), 0) << "Should receive empty response";
-  auto& docs = lreq->responses[0]->proto.ops().at("q").docs();
-  
+  qb::sort(cur, "price_i", qb::ASC);
+  req->execute(true);
+  ASSERT_OK(req);
+
+  const auto* docs = req->docList("q");
+
   // Should have 0 matches but still have a valid response
-  ASSERT_EQ(0, docs.matches());
-  ASSERT_EQ(0, docs.columns_size()) << "Should have no columns for empty results";
-  
-  lreq->done();
+  ASSERT_EQ(0, docs->matches.value_or(0));
+  ASSERT_EQ(0, (int)docs->columns.size()) << "Should have no columns for empty results";
 }
 
 TEST_F(SortCollectorTest, SingleDocument) {
@@ -902,35 +763,19 @@ TEST_F(SortCollectorTest, SingleDocument) {
   helper.index(flatdoc("id_s", "doc1", "price_i", 100), UpdateMessage::COMMIT);
   
   // Create a search request
-  auto* lreq = LocalReq::create(soluxNode->getSearchEngine());
-  lreq->proto.mutable_collection()->add_name("main");
-  
-  auto& ops = *lreq->proto.mutable_ops();
-  auto& topDocs = *ops["q"].mutable_top_docs();
-  topDocs.set_get_number(true);
-  topDocs.set_limit(10);
-  
-  // Match all documents
-  topDocs.mutable_query()->set_all(true);
-  
+  auto req = localReq(soluxNode->getSearchEngine());
+  req->collection("main");
+  auto& cur = req->topDocs("q").getNumber().limit(10).allQuery().fields({"id_s", "price_i"});
   // Sort by price
-  auto* sortSpec = topDocs.add_sorts();
-  sortSpec->set_field("price_i");
-  sortSpec->set_dir(proto::SortSpec::ASC);
-  
-  // Request fields to return
-  topDocs.mutable_fields()->Add("id_s");
-  topDocs.mutable_fields()->Add("price_i");
-  
-  lreq->engine.submit(*lreq, true);
-  
-  auto& docs = lreq->responses[0]->proto.ops().at("q").docs();
-  
-  ASSERT_EQ(1, docs.matches());
-  ASSERT_EQ("doc1", docs.columns().at("id_s").col_s().v(0));
-  ASSERT_EQ(100, docs.columns().at("price_i").col_i().v(0));
-  
-  lreq->done();
+  qb::sort(cur, "price_i", qb::ASC);
+  req->execute(true);
+  ASSERT_OK(req);
+
+  const auto* docs = req->docList("q");
+
+  ASSERT_EQ(1, docs->matches.value_or(0));
+  ASSERT_EQ("doc1", std::get<solux::api::ColStr>(docs->columns.at("id_s").kind).v[0]);
+  ASSERT_EQ(100, std::get<solux::api::ColInt>(docs->columns.at("price_i").kind).v[0]);
 }
 
 TEST_F(SortCollectorTest, ResultsExceedingTopCount) {
@@ -944,42 +789,26 @@ TEST_F(SortCollectorTest, ResultsExceedingTopCount) {
   }
   
   // Create a search request with limit of 5
-  auto* lreq = LocalReq::create(soluxNode->getSearchEngine());
-  lreq->proto.mutable_collection()->add_name("main");
-  
-  auto& ops = *lreq->proto.mutable_ops();
-  auto& topDocs = *ops["q"].mutable_top_docs();
-  topDocs.set_get_number(true);
-  topDocs.set_limit(5);  // Only get top 5
-  
-  // Match all documents
-  topDocs.mutable_query()->set_all(true);
-  
+  auto req = localReq(soluxNode->getSearchEngine());
+  req->collection("main");
+  auto& cur = req->topDocs("q").getNumber().limit(5).allQuery().fields({"id_s", "price_i"});  // Only get top 5
   // Sort by price ascending
-  auto* sortSpec = topDocs.add_sorts();
-  sortSpec->set_field("price_i");
-  sortSpec->set_dir(proto::SortSpec::ASC);
-  
-  // Request fields to return
-  topDocs.mutable_fields()->Add("id_s");
-  topDocs.mutable_fields()->Add("price_i");
-  
-  lreq->engine.submit(*lreq, true);
-  
-  auto& docs = lreq->responses[0]->proto.ops().at("q").docs();
-  
+  qb::sort(cur, "price_i", qb::ASC);
+  req->execute(true);
+  ASSERT_OK(req);
+
+  const auto* docs = req->docList("q");
+
   // Should report total of 20 matches but only return 5
-  ASSERT_EQ(20, docs.matches());
-  
-  auto& priceCol = docs.columns().at("price_i").col_i();
-  ASSERT_EQ(5, priceCol.v_size()) << "Should only return top 5 documents";
-  
+  ASSERT_EQ(20, docs->matches.value_or(0));
+
+  auto& priceCol = std::get<solux::api::ColInt>(docs->columns.at("price_i").kind);
+  ASSERT_EQ(5, (int)priceCol.v.size()) << "Should only return top 5 documents";
+
   // Verify we got the 5 lowest prices: 10, 20, 30, 40, 50
   for (int i = 0; i < 5; i++) {
-    EXPECT_EQ((i + 1) * 10, priceCol.v(i)) << "Wrong price at position " << i;
+    EXPECT_EQ((i + 1) * 10, priceCol.v[i]) << "Wrong price at position " << i;
   }
-  
-  lreq->done();
 }
 
 TEST_F(SortCollectorTest, LimitOne) {
@@ -992,44 +821,28 @@ TEST_F(SortCollectorTest, LimitOne) {
   helper.index(flatdoc("id_s", "doc3", "price_i", 150), UpdateMessage::COMMIT);
   
   // Create a search request with limit=1
-  auto* lreq = LocalReq::create(soluxNode->getSearchEngine());
-  lreq->proto.mutable_collection()->add_name("main");
-  
-  auto& ops = *lreq->proto.mutable_ops();
-  auto& topDocs = *ops["q"].mutable_top_docs();
-  topDocs.set_get_number(true);
-  topDocs.set_limit(1);  // Only get the top 1
-  
-  // Match all documents
-  topDocs.mutable_query()->set_all(true);
-  
+  auto req = localReq(soluxNode->getSearchEngine());
+  req->collection("main");
+  auto& cur = req->topDocs("q").getNumber().limit(1).allQuery().fields({"id_s", "price_i"});  // Only get the top 1
   // Sort by price ascending
-  auto* sortSpec = topDocs.add_sorts();
-  sortSpec->set_field("price_i");
-  sortSpec->set_dir(proto::SortSpec::ASC);
-  
-  // Request fields to return
-  topDocs.mutable_fields()->Add("id_s");
-  topDocs.mutable_fields()->Add("price_i");
-  
-  lreq->engine.submit(*lreq, true);
-  
-  auto& docs = lreq->responses[0]->proto.ops().at("q").docs();
-  
+  qb::sort(cur, "price_i", qb::ASC);
+  req->execute(true);
+  ASSERT_OK(req);
+
+  const auto* docs = req->docList("q");
+
   // Should report 3 matches but only return 1
-  ASSERT_EQ(3, docs.matches());
-  
-  auto& idCol = docs.columns().at("id_s").col_s();
-  auto& priceCol = docs.columns().at("price_i").col_i();
-  
-  ASSERT_EQ(1, idCol.v_size());
-  ASSERT_EQ(1, priceCol.v_size());
-  
+  ASSERT_EQ(3, docs->matches.value_or(0));
+
+  auto& idCol = std::get<solux::api::ColStr>(docs->columns.at("id_s").kind);
+  auto& priceCol = std::get<solux::api::ColInt>(docs->columns.at("price_i").kind);
+
+  ASSERT_EQ(1, (int)idCol.v.size());
+  ASSERT_EQ(1, (int)priceCol.v.size());
+
   // Should get the document with lowest price
-  ASSERT_EQ("doc2", idCol.v(0));
-  ASSERT_EQ(50, priceCol.v(0));
-  
-  lreq->done();
+  ASSERT_EQ("doc2", idCol.v[0]);
+  ASSERT_EQ(50, priceCol.v[0]);
 }
 
 
@@ -1060,44 +873,29 @@ TEST_F(SortCollectorTest, DeterministicParallelSort) {
   std::vector<int64_t> fingerprints;
   
   for (int run = 0; run < 2; run++) {  // Just 2 runs for debugging
-    auto* lreq = LocalReq::create(soluxNode->getSearchEngine());
-    lreq->proto.mutable_collection()->add_name("main");
-    
-    auto& ops = *lreq->proto.mutable_ops();
-    auto& topDocs = *ops["q"].mutable_top_docs();
-    topDocs.set_get_number(true);
-    topDocs.set_limit(50);
-    
-    // Match all documents
-    topDocs.mutable_query()->set_all(true);
-    
-    // Sort by price ascending  
-    auto* sortSpec = topDocs.add_sorts();
-    sortSpec->set_field("price_i");
-    sortSpec->set_dir(proto::SortSpec::ASC);
-    
-    // Request fields to return
-    topDocs.mutable_fields()->Add("id_s");
-    topDocs.mutable_fields()->Add("price_i");
-    
+    auto req = localReq(soluxNode->getSearchEngine());
+    req->collection("main");
+    auto& cur = req->topDocs("q").getNumber().limit(50).allQuery().fields({"id_s", "price_i"});
+    // Sort by price ascending
+    qb::sort(cur, "price_i", qb::ASC);
     // Run in parallel mode
-    lreq->engine.submit(*lreq, false);
-    
-    auto& docs = lreq->responses[0]->proto.ops().at("q").docs();
-    ASSERT_EQ(300, docs.matches());
-    
+    req->execute(false);
+    ASSERT_OK(req);
+
+    const auto* docs = req->docList("q");
+    ASSERT_EQ(300, docs->matches.value_or(0));
+
     // Calculate fingerprint of results
-    int64_t fp = docs.matches();
-    const auto& idCol = docs.columns().at("id_s").col_s();
-    
-    for (int i = 0; i < idCol.v_size(); i++) {
+    int64_t fp = docs->matches.value_or(0);
+    const auto& idCol = std::get<solux::api::ColStr>(docs->columns.at("id_s").kind);
+
+    for (int i = 0; i < (int)idCol.v.size(); i++) {
       int64_t id = 0;
-      std::from_chars(idCol.v(i).data() + 3, idCol.v(i).data() + idCol.v(i).size(), id);
+      std::from_chars(idCol.v[i].data() + 3, idCol.v[i].data() + idCol.v[i].size(), id);
       fp = fp * 31 + id;
     }
-    
+
     fingerprints.push_back(fp);
-    lreq->done();
   }
   
   // Verify all runs produced the same fingerprint
@@ -1122,130 +920,91 @@ TEST_F(SortCollectorTest, SortByNonIndexedStringColumn) {
   
   // Test sorting by indexed string field (name_s)
   {
-    auto* lreq = LocalReq::create(soluxNode->getSearchEngine());
-    lreq->proto.mutable_collection()->add_name("main");
-    
-    auto& ops = *lreq->proto.mutable_ops();
-    auto& topDocs = *ops["q"].mutable_top_docs();
-    topDocs.set_get_number(true);
-    topDocs.set_limit(10);
-    topDocs.mutable_query()->set_all(true);
-    
+    auto req = localReq(soluxNode->getSearchEngine());
+    req->collection("main");
     // Sort by indexed string field
-    auto* sortSpec = topDocs.add_sorts();
-    sortSpec->set_field("name_s");
-    sortSpec->set_dir(proto::SortSpec::ASC);
-    
-    topDocs.mutable_fields()->Add("id_s");
-    topDocs.mutable_fields()->Add("name_s");
-    
-    lreq->engine.submit(*lreq, true);
-    
-    auto& docs = lreq->responses[0]->proto.ops().at("q").docs();
-    ASSERT_EQ(5, docs.matches());
-    
-    auto& nameCol = docs.columns().at("name_s").col_s();
+    auto& cur = req->topDocs("q").getNumber().limit(10).allQuery().fields({"id_s", "name_s"});
+    qb::sort(cur, "name_s", qb::ASC);
+    req->execute(true);
+    ASSERT_OK(req);
+
+    const auto* docs = req->docList("q");
+    ASSERT_EQ(5, docs->matches.value_or(0));
+
+    auto& nameCol = std::get<solux::api::ColStr>(docs->columns.at("name_s").kind);
 
     // Verify sort order: alice, alice, bob, charlie, david
-    ASSERT_EQ("alice", nameCol.v(0));
-    ASSERT_EQ("alice", nameCol.v(1));
-    ASSERT_EQ("bob", nameCol.v(2));
-    ASSERT_EQ("charlie", nameCol.v(3));
-    ASSERT_EQ("david", nameCol.v(4));
-    
-    lreq->done();
+    ASSERT_EQ("alice", nameCol.v[0]);
+    ASSERT_EQ("alice", nameCol.v[1]);
+    ASSERT_EQ("bob", nameCol.v[2]);
+    ASSERT_EQ("charlie", nameCol.v[3]);
+    ASSERT_EQ("david", nameCol.v[4]);
   }
   
   // Test sorting by non-indexed string column (description_sc)
   {
-    auto* lreq = LocalReq::create(soluxNode->getSearchEngine());
-    lreq->proto.mutable_collection()->add_name("main");
-    
-    auto& ops = *lreq->proto.mutable_ops();
-    auto& topDocs = *ops["q"].mutable_top_docs();
-    topDocs.set_get_number(true);
-    topDocs.set_limit(10);
-    topDocs.mutable_query()->set_all(true);
-    
+    auto req = localReq(soluxNode->getSearchEngine());
+    req->collection("main");
     // Sort by non-indexed string column
-    auto* sortSpec = topDocs.add_sorts();
-    sortSpec->set_field("description_sc");
-    sortSpec->set_dir(proto::SortSpec::ASC);
-    
-    topDocs.mutable_fields()->Add("id_s");
-    topDocs.mutable_fields()->Add("description_sc");
-    
-    lreq->engine.submit(*lreq, true);
-    
-    auto& docs = lreq->responses[0]->proto.ops().at("q").docs();
-    ASSERT_EQ(5, docs.matches());
-    
-    auto& idCol = docs.columns().at("id_s").col_s();
-    auto& descCol = docs.columns().at("description_sc").col_s();
-    
+    auto& cur = req->topDocs("q").getNumber().limit(10).allQuery().fields({"id_s", "description_sc"});
+    qb::sort(cur, "description_sc", qb::ASC);
+    req->execute(true);
+    ASSERT_OK(req);
+
+    const auto* docs = req->docList("q");
+    ASSERT_EQ(5, docs->matches.value_or(0));
+
+    auto& idCol = std::get<solux::api::ColStr>(docs->columns.at("id_s").kind);
+    auto& descCol = std::get<solux::api::ColStr>(docs->columns.at("description_sc").kind);
+
     // Verify sort order by description: "first duplicate", "first person", "fourth person", "second person", "third person"
-    ASSERT_EQ("first duplicate", descCol.v(0));
-    ASSERT_EQ("doc5", idCol.v(0));
-    
-    ASSERT_EQ("first person", descCol.v(1));
-    ASSERT_EQ("doc2", idCol.v(1));
-    
-    ASSERT_EQ("fourth person", descCol.v(2));
-    ASSERT_EQ("doc4", idCol.v(2));
-    
-    ASSERT_EQ("second person", descCol.v(3));
-    ASSERT_EQ("doc3", idCol.v(3));
-    
-    ASSERT_EQ("third person", descCol.v(4));
-    ASSERT_EQ("doc1", idCol.v(4));
-    
-    lreq->done();
+    ASSERT_EQ("first duplicate", descCol.v[0]);
+    ASSERT_EQ("doc5", idCol.v[0]);
+
+    ASSERT_EQ("first person", descCol.v[1]);
+    ASSERT_EQ("doc2", idCol.v[1]);
+
+    ASSERT_EQ("fourth person", descCol.v[2]);
+    ASSERT_EQ("doc4", idCol.v[2]);
+
+    ASSERT_EQ("second person", descCol.v[3]);
+    ASSERT_EQ("doc3", idCol.v[3]);
+
+    ASSERT_EQ("third person", descCol.v[4]);
+    ASSERT_EQ("doc1", idCol.v[4]);
   }
   
   // Test descending sort on non-indexed string column
   {
-    auto* lreq = LocalReq::create(soluxNode->getSearchEngine());
-    lreq->proto.mutable_collection()->add_name("main");
-    
-    auto& ops = *lreq->proto.mutable_ops();
-    auto& topDocs = *ops["q"].mutable_top_docs();
-    topDocs.set_get_number(true);
-    topDocs.set_limit(10);
-    topDocs.mutable_query()->set_all(true);
-    
+    auto req = localReq(soluxNode->getSearchEngine());
+    req->collection("main");
     // Sort by non-indexed string column descending
-    auto* sortSpec = topDocs.add_sorts();
-    sortSpec->set_field("description_sc");
-    sortSpec->set_dir(proto::SortSpec::DESC);
-    
-    topDocs.mutable_fields()->Add("id_s");
-    topDocs.mutable_fields()->Add("description_sc");
-    
-    lreq->engine.submit(*lreq, true);
-    
-    auto& docs = lreq->responses[0]->proto.ops().at("q").docs();
-    ASSERT_EQ(5, docs.matches());
-    
-    auto& idCol = docs.columns().at("id_s").col_s();
-    auto& descCol = docs.columns().at("description_sc").col_s();
-    
+    auto& cur = req->topDocs("q").getNumber().limit(10).allQuery().fields({"id_s", "description_sc"});
+    qb::sort(cur, "description_sc", qb::DESC);
+    req->execute(true);
+    ASSERT_OK(req);
+
+    const auto* docs = req->docList("q");
+    ASSERT_EQ(5, docs->matches.value_or(0));
+
+    auto& idCol = std::get<solux::api::ColStr>(docs->columns.at("id_s").kind);
+    auto& descCol = std::get<solux::api::ColStr>(docs->columns.at("description_sc").kind);
+
     // Verify descending sort order
-    ASSERT_EQ("third person", descCol.v(0));
-    ASSERT_EQ("doc1", idCol.v(0));
-    
-    ASSERT_EQ("second person", descCol.v(1));
-    ASSERT_EQ("doc3", idCol.v(1));
-    
-    ASSERT_EQ("fourth person", descCol.v(2));
-    ASSERT_EQ("doc4", idCol.v(2));
-    
-    ASSERT_EQ("first person", descCol.v(3));
-    ASSERT_EQ("doc2", idCol.v(3));
-    
-    ASSERT_EQ("first duplicate", descCol.v(4));
-    ASSERT_EQ("doc5", idCol.v(4));
-    
-    lreq->done();
+    ASSERT_EQ("third person", descCol.v[0]);
+    ASSERT_EQ("doc1", idCol.v[0]);
+
+    ASSERT_EQ("second person", descCol.v[1]);
+    ASSERT_EQ("doc3", idCol.v[1]);
+
+    ASSERT_EQ("fourth person", descCol.v[2]);
+    ASSERT_EQ("doc4", idCol.v[2]);
+
+    ASSERT_EQ("first person", descCol.v[3]);
+    ASSERT_EQ("doc2", idCol.v[3]);
+
+    ASSERT_EQ("first duplicate", descCol.v[4]);
+    ASSERT_EQ("doc5", idCol.v[4]);
   }
 }
 
@@ -1321,48 +1080,36 @@ TEST_F(SortCollectorTest, RandomValuesWithTieBreaking) {
         });
 
       // Search with sorting
-      auto* lreq = LocalReq::create(soluxNode->getSearchEngine());
-      lreq->proto.mutable_collection()->add_name("main");
+      auto req = localReq(soluxNode->getSearchEngine());
+      req->collection("main");
 
-      auto& ops = *lreq->proto.mutable_ops();
-      auto& topDocs = *ops["q"].mutable_top_docs();
-      topDocs.set_get_number(true);
+      int limit = rng.rint(1, docsPerSeg*3/2);  // Get all results
 
-      int limit = rng.rint(1, docsPerSeg*3/2);
-      topDocs.set_limit(limit); // Get all results
+      // Sort by value (direction varies per iteration)
+      auto& cur = req->topDocs("q").getNumber().limit(limit).allQuery().fields({"id_s", "value_i"});
+      qb::sort(cur, sortField, direction ? qb::DESC : qb::ASC);
 
-      // Match all documents
-      topDocs.mutable_query()->set_all(true);
+      req->execute(true); // Run multi-threaded
+      ASSERT_OK(req);
 
-      // Sort by value descending
-      auto* sortSpec = topDocs.add_sorts();
-      sortSpec->set_field(sortField);
-      sortSpec->set_dir(direction ? proto::SortSpec::DESC : proto::SortSpec::ASC);
+      const auto* docs = req->docList("q");
 
-      // Request fields
-      topDocs.mutable_fields()->Add("id_s");
-      topDocs.mutable_fields()->Add("value_i");
-
-      lreq->engine.submit(*lreq, true); // Run multi-threaded
-
-      auto& docs = lreq->responses[0]->proto.ops().at("q").docs();
-
-      ASSERT_EQ(docs.matches(), docId) << "Should match all documents";
+      ASSERT_EQ(docs->matches.value_or(0), docId) << "Should match all documents";
 
       // Debug: print how many segments we have
       auto reader = helper.getIndexWriter()->getIndexReader();
 
       // Verify results are in expected order
-      const auto& idCol = docs.columns().at("id_s").col_s();
-      const auto& valueCol = docs.columns().at("value_i").col_i();
+      const auto& idCol = std::get<solux::api::ColStr>(docs->columns.at("id_s").kind);
+      const auto& valueCol = std::get<solux::api::ColInt>(docs->columns.at("value_i").kind);
 
       // verify that the number of results match either the limit or the number of docs indexed (whichever is smaller)
-      ASSERT_EQ(idCol.v().size(), std::min(limit, totalDocs));
+      ASSERT_EQ(idCol.v.size(), std::min(limit, totalDocs));
 
-      for (int i = 0; i < std::min(idCol.v_size(), (int)expectedOrder.size()); i++) {
+      for (int i = 0; i < std::min((int)idCol.v.size(), (int)expectedOrder.size()); i++) {
         int64_t actualId = 0;
-        std::from_chars(idCol.v(i).data(), idCol.v(i).data() + idCol.v(i).size(), actualId);
-        int64_t actualValue = valueCol.v(i);
+        std::from_chars(idCol.v[i].data(), idCol.v[i].data() + idCol.v[i].size(), actualId);
+        int64_t actualValue = valueCol.v[i];
 
         if (actualId != expectedOrder[i].docId) {
           // Debug: print nearby entries
@@ -1383,8 +1130,6 @@ TEST_F(SortCollectorTest, RandomValuesWithTieBreaking) {
           << "Position " << i << ": Expected value=" << expectedOrder[i].value
           << " but got value=" << actualValue;
       }
-
-      lreq->done();
     }
   }
 }

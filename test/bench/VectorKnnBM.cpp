@@ -10,7 +10,6 @@
 #include <vector>
 
 #include "bench/solux_bench.h"
-#include "protos/solux_types.pb.h"
 #include "solux/index/VectorIndexBuilder.h"
 #include "solux/query/KnnQuery.h"
 #include "solux/reader/VectorAuxReader.h"
@@ -18,32 +17,44 @@
 #include "solux/util/random.h"
 #include "test/CollectionHelper.h"
 #include "test/LocalReq.h"
+#include "test/QueryBuild.h"
 
 using namespace solux;
 using namespace solux::test;
 
+namespace api = solux::api;
+
 namespace {
 
 void installVectorBenchSchema(Collection& col, int32_t dims,
-                              proto::VectorParams::Metric metric = proto::VectorParams::IP) {
-  proto::SchemaDef def;
+                              api::VectorParams_::Metric metric = api::VectorParams_::Metric::IP) {
+  // Non-owning build: field names are string literals (stable); the FieldDef
+  // structs live in `fields`, which outlives the fromProto() call below.
+  std::vector<api::FieldDef> fields;
 
-  auto* single = def.add_fields();
-  single->set_name("_v");
-  single->set_field_class(proto::FieldDef::VECTOR);
-  single->set_abstract(true);
-  single->set_column_stored(true);
-  single->mutable_vector()->set_dims(dims);
-  single->mutable_vector()->set_metric(metric);
+  api::FieldDef single;
+  single.name = "_v";
+  single.field_class = api::FieldDef_::FieldClass::VECTOR;
+  single.abstract = true;
+  single.column_stored = true;
+  auto& singleVector = single.vector.emplace();
+  singleVector.dims = dims;
+  singleVector.metric = metric;
+  fields.push_back(single);
 
-  auto* multi = def.add_fields();
-  multi->set_name("_vs");
-  multi->set_field_class(proto::FieldDef::VECTOR);
-  multi->set_abstract(true);
-  multi->set_column_stored(true);
-  multi->set_multi_valued(true);
-  multi->mutable_vector()->set_dims(dims);
-  multi->mutable_vector()->set_metric(metric);
+  api::FieldDef multi;
+  multi.name = "_vs";
+  multi.field_class = api::FieldDef_::FieldClass::VECTOR;
+  multi.abstract = true;
+  multi.column_stored = true;
+  multi.multi_valued = true;
+  auto& multiVector = multi.vector.emplace();
+  multiVector.dims = dims;
+  multiVector.metric = metric;
+  fields.push_back(multi);
+
+  api::SchemaDef def;
+  def.fields = std::span<const api::FieldDef>(fields.data(), fields.size());
 
   auto base = Schema::createDefaultSchema();
   col.setSchema(Schema::fromProto(def, base.get()));
@@ -207,24 +218,11 @@ LocalReq* makeKnnBenchReq(SearchEngine& engine, std::string_view field,
                           int32_t nprobe = 0, int32_t refineCandidates = 0,
                           bool exact = false) {
   auto* req = LocalReq::create(engine);
-  req->proto.mutable_collection()->add_name("main");
-  req->proto.set_request_id("vector-bench");
+  req->collection("main").requestId("vector-bench");
 
-  auto& topDocs = *(*req->proto.mutable_ops())["q"].mutable_top_docs();
-  topDocs.set_limit(k);
-  topDocs.set_get_number(true);
-  topDocs.mutable_fields()->Add("id");
-
-  auto& knn = *topDocs.mutable_query()->mutable_knn();
-  knn.set_field(field);
-  knn.set_k(k);
-  if (nprobe > 0) knn.set_nprobe(nprobe);
-  if (refineCandidates > 0) knn.set_refine_candidates(refineCandidates);
-  if (exact) knn.set_exact(true);
-  auto& f32 = *knn.mutable_query()->mutable_f32();
-  for (float v : queryVec) {
-    f32.add_v(v);
-  }
+  auto& cur = req->topDocs();
+  cur.limit(k).getNumber().fields({"id"});
+  cur.rawQuery() = qb::knn(cur.mr(), field, queryVec, k, nprobe, exact, refineCandidates);
 
   return req;
 }
@@ -235,14 +233,24 @@ bool fingerprint(LocalReq& req, uint64_t& fp, std::string& error) {
     return false;
   }
   const auto& response = req.responses[0]->proto;
-  if (!response.error().empty()) {
-    error = response.error();
+  if (!response.error.empty()) {
+    error = std::string(response.error);
     return false;
   }
-  const auto& docs = response.ops().at("q").docs();
-  fp = (uint64_t)docs.matches();
-  const auto& ids = docs.columns().at("id").col_s();
-  for (const auto& id : ids.v()) {
+  const auto* opPtr = response.ops.find("q");
+  if (!opPtr || !std::holds_alternative<api::DocList>((*opPtr)->kind)) {
+    error = "missing q doc list";
+    return false;
+  }
+  const auto& docs = std::get<api::DocList>((*opPtr)->kind);
+  fp = (uint64_t)(docs.matches ? *docs.matches : 0);
+  const auto* idCol = docs.columns.find("id");
+  if (!idCol || !std::holds_alternative<api::ColStr>(idCol->kind)) {
+    error = "missing id column";
+    return false;
+  }
+  const auto& ids = std::get<api::ColStr>(idCol->kind);
+  for (const auto& id : ids.v) {
     fp = fp * 131 + (uint32_t)java_string_hashcode(id);
   }
   return true;
@@ -369,7 +377,7 @@ bool clusteredIndexReusable(CollectionHelper& helper, std::span<const int32_t> d
     auto* vaux = dynamic_cast<VectorAuxReader*>(aux.get());
     if (vaux == nullptr ||
         vaux->getEngine() != VectorAuxMeta::ENGINE_IVFPQ ||
-        vaux->getMetric() != (int32_t)proto::VectorParams::L2) {
+        vaux->getMetric() != (int32_t)api::VectorParams_::Metric::L2) {
       return false;
     }
   }
@@ -379,7 +387,7 @@ bool clusteredIndexReusable(CollectionHelper& helper, std::span<const int32_t> d
 void buildClusteredVectorIndex(CollectionHelper& helper, int32_t dims,
                                int32_t nClusters, std::span<const int32_t> docsPerSeg) {
   helper.clear();
-  installVectorBenchSchema(helper.collection(), dims, proto::VectorParams::L2);
+  installVectorBenchSchema(helper.collection(), dims, api::VectorParams_::Metric::L2);
 
   constexpr int64_t batchSize = 256;
   std::vector<Doc> docs;
@@ -409,23 +417,31 @@ bool responseIds(LocalReq& req, std::vector<std::string>& out, std::string& erro
     return false;
   }
   const auto& response = req.responses[0]->proto;
-  if (!response.error().empty()) {
-    error = response.error();
+  if (!response.error.empty()) {
+    error = std::string(response.error);
     return false;
   }
-  auto opIt = response.ops().find("q");
-  if (opIt == response.ops().end()) {
+  const auto* opPtr = response.ops.find("q");
+  if (!opPtr) {
     error = "missing q response op";
     return false;
   }
-  const auto& docs = opIt->second.docs();
-  auto idIt = docs.columns().find("id");
-  if (idIt == docs.columns().end()) {
+  if (!std::holds_alternative<api::DocList>((*opPtr)->kind)) {
+    error = "q response op is not a doc list";
+    return false;
+  }
+  const auto& docs = std::get<api::DocList>((*opPtr)->kind);
+  const auto* idCol = docs.columns.find("id");
+  if (!idCol) {
     error = "missing id column";
     return false;
   }
-  const auto& ids = idIt->second.col_s();
-  out.assign(ids.v().begin(), ids.v().end());
+  if (!std::holds_alternative<api::ColStr>(idCol->kind)) {
+    error = "id column is not string";
+    return false;
+  }
+  const auto& ids = std::get<api::ColStr>(idCol->kind);
+  out.assign(ids.v.begin(), ids.v.end());
   return true;
 }
 
@@ -591,7 +607,7 @@ void BM_VectorIvfPqBuild(benchmark::State& state) {
     // want isolated, so inline its steps here.
     auto wallStart = std::chrono::steady_clock::now();
     helper.clear();
-    installVectorBenchSchema(helper.collection(), dims, proto::VectorParams::L2);
+    installVectorBenchSchema(helper.collection(), dims, api::VectorParams_::Metric::L2);
     constexpr int64_t batchSize = 256;
     std::vector<Doc> docs;
     docs.reserve((size_t)batchSize);
@@ -650,7 +666,7 @@ void BM_VectorIvfPqIncrementalBuild(benchmark::State& state) {
   for (auto _ : state) {
     auto setupStart = std::chrono::steady_clock::now();
     helper.clear();
-    installVectorBenchSchema(helper.collection(), dims, proto::VectorParams::L2);
+    installVectorBenchSchema(helper.collection(), dims, api::VectorParams_::Metric::L2);
     constexpr int64_t batchSize = 256;
     std::vector<Doc> docs;
     docs.reserve((size_t)batchSize);

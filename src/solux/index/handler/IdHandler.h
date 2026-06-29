@@ -52,11 +52,12 @@ public:
 
   ~IdHandler() override = default;
 
-  void index(Inverter& inverter, const proto::Val& val) override {
-    if (val.has_s()) {
-      indexId(inverter, val.s());
-    } else if (val.has_bin()) {
-      indexId(inverter, val.bin());
+  void index(Inverter& inverter, const IndexVal& val) override {
+    if (std::holds_alternative<std::string_view>(val.kind)) {
+      indexId(inverter, std::get<std::string_view>(val.kind));
+    } else if (std::holds_alternative<hpp_proto::non_owning_traits::bytes_t>(val.kind)) {
+      const auto& b = std::get<hpp_proto::non_owning_traits::bytes_t>(val.kind);
+      indexId(inverter, std::string_view((const char*)b.data(), b.size()));
     }
     // TODO: Missing id value is silently ignored - same as other string fields.
     // Validation should happen at a higher level?

@@ -1,12 +1,10 @@
 #pragma once
 
 #include <boost/unordered/unordered_flat_map.hpp>
+#include <memory_resource>
+#include "solux/api/solux_types.hpp"
 #include "solux/util/StrRef.h"
 #include "FieldType.h"
-
-namespace solux::proto {
-class SchemaDef;
-}
 
 namespace solux {
 
@@ -81,10 +79,10 @@ public:
 
   // Build a Schema from a SchemaDef proto.
   // If base is provided (MERGE mode), start from the base schema's fields.
-  static std::shared_ptr<Schema> fromProto(const proto::SchemaDef& def, const Schema* base = nullptr);
+  static std::shared_ptr<Schema> fromProto(const solux::api::SchemaDef& def, const Schema* base = nullptr);
 
   // Serialize this schema to a SchemaDef proto (all fields, including dynamic suffix fields).
-  void toProto(proto::SchemaDef* def) const;
+  void toProto(solux::api::SchemaDef* def, std::pmr::memory_resource& arena) const;
 
   // Create the default schema with built-in fields.
   static std::shared_ptr<Schema> createDefaultSchema();

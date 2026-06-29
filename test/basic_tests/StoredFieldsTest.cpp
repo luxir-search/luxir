@@ -574,14 +574,14 @@ TEST_F(StoredFieldsSearchTest, returnsStoredTextInSearch) {
                    "tags", vecs("solo")),
            UpdateMessage::COMMIT);
 
-  auto* req = LocalReq::create(ch.getSearchEngine());
-  auto docs = req->collection("main")
-                 .allQuery()
-                 .fields({"id", "body", "tags"})
-                 .limit(-1)
-                 .execute()
-                 .getDocs();
-  req->done();
+  auto req = localReq(ch.getSearchEngine());
+  req->collection("main").topDocs("q")
+      .allQuery()
+      .fields({"id", "body", "tags"})
+      .limit(-1);
+  req->execute();
+  ASSERT_OK(req);
+  auto docs = req->getDocs();
 
   ASSERT_EQ(3, docs.size());
   EXPECT_TRUE(containsDoc(docs, flatdoc("id", std::string("d1"),
@@ -615,35 +615,39 @@ TEST_F(StoredFieldsSearchTest, defaultTSuffixIsStored) {
                    "body_t", std::string("Lazy Dog")),
            UpdateMessage::COMMIT);
 
-  auto* req = LocalReq::create(ch.getSearchEngine());
-  auto docs = req->collection("main")
-                 .allQuery()
-                 .fields({"id", "body_t"})
-                 .limit(-1)
-                 .execute()
-                 .getDocs();
-  req->done();
+  {
+    auto req = localReq(ch.getSearchEngine());
+    req->collection("main").topDocs("q")
+        .allQuery()
+        .fields({"id", "body_t"})
+        .limit(-1);
+    req->execute();
+    ASSERT_OK(req);
+    auto docs = req->getDocs();
 
-  ASSERT_EQ(2, docs.size());
-  // Raw (not lowercased) values come back - the _t analyzer lowercases for
-  // indexing/search, but stored fields preserve the original bytes.
-  EXPECT_TRUE(containsDoc(docs, flatdoc("id", std::string("a"),
-                                        "body_t", std::string("The Quick Brown Fox"))));
-  EXPECT_TRUE(containsDoc(docs, flatdoc("id", std::string("b"),
-                                        "body_t", std::string("Lazy Dog"))));
+    ASSERT_EQ(2, docs.size());
+    // Raw (not lowercased) values come back - the _t analyzer lowercases for
+    // indexing/search, but stored fields preserve the original bytes.
+    EXPECT_TRUE(containsDoc(docs, flatdoc("id", std::string("a"),
+                                          "body_t", std::string("The Quick Brown Fox"))));
+    EXPECT_TRUE(containsDoc(docs, flatdoc("id", std::string("b"),
+                                          "body_t", std::string("Lazy Dog"))));
+  }
 
   // And search against the tokenized (lowercased) form still works.
-  req = LocalReq::create(ch.getSearchEngine());
-  auto matches = req->collection("main")
-                    .matchQuery("body_t", "quick")
-                    .fields({"id", "body_t"})
-                    .limit(-1)
-                    .execute()
-                    .getDocs();
-  req->done();
-  ASSERT_EQ(1, matches.size());
-  EXPECT_TRUE(containsDoc(matches, flatdoc("id", std::string("a"),
-                                           "body_t", std::string("The Quick Brown Fox"))));
+  {
+    auto req = localReq(ch.getSearchEngine());
+    req->collection("main").topDocs("q")
+        .matchQuery("body_t", "quick")
+        .fields({"id", "body_t"})
+        .limit(-1);
+    req->execute();
+    ASSERT_OK(req);
+    auto matches = req->getDocs();
+    ASSERT_EQ(1, matches.size());
+    EXPECT_TRUE(containsDoc(matches, flatdoc("id", std::string("a"),
+                                             "body_t", std::string("The Quick Brown Fox"))));
+  }
 
   ch.clear();
 }
@@ -661,20 +665,23 @@ TEST_F(StoredFieldsSearchTest, storedStringField) {
   // Indexed STRING fields (no column) with STORED set so retrieval goes
   // through the stored-fields resource rather than the ord column.
   {
-    proto::SchemaDef def;
-    auto* f = def.add_fields();
-    f->set_name("label");
-    f->set_field_class(proto::FieldDef::STRING);
-    f->set_indexed(true);
-    f->set_column_stored(false);
-    f->set_stored(true);
-    auto* f2 = def.add_fields();
-    f2->set_name("aliases");
-    f2->set_field_class(proto::FieldDef::STRING);
-    f2->set_indexed(true);
-    f2->set_column_stored(false);
-    f2->set_multi_valued(true);
-    f2->set_stored(true);
+    solux::api::SchemaDef def;
+    std::vector<solux::api::FieldDef> fields;
+    fields.reserve(2);
+    auto& f = fields.emplace_back();
+    f.name = "label";
+    f.field_class = solux::api::FieldDef::FieldClass::STRING;
+    f.indexed = true;
+    f.column_stored = false;
+    f.stored = true;
+    auto& f2 = fields.emplace_back();
+    f2.name = "aliases";
+    f2.field_class = solux::api::FieldDef::FieldClass::STRING;
+    f2.indexed = true;
+    f2.column_stored = false;
+    f2.multi_valued = true;
+    f2.stored = true;
+    def.fields = fields;
     schema = Schema::fromProto(def, schema.get());
   }
   ch.collection().setSchema(schema);
@@ -687,14 +694,14 @@ TEST_F(StoredFieldsSearchTest, storedStringField) {
                    "label", std::string("Second")),
            UpdateMessage::COMMIT);
 
-  auto* req = LocalReq::create(ch.getSearchEngine());
-  auto docs = req->collection("main")
-                 .allQuery()
-                 .fields({"id", "label", "aliases"})
-                 .limit(-1)
-                 .execute()
-                 .getDocs();
-  req->done();
+  auto req = localReq(ch.getSearchEngine());
+  req->collection("main").topDocs("q")
+      .allQuery()
+      .fields({"id", "label", "aliases"})
+      .limit(-1);
+  req->execute();
+  ASSERT_OK(req);
+  auto docs = req->getDocs();
 
   ASSERT_EQ(2, docs.size());
   EXPECT_TRUE(containsDoc(docs, flatdoc("id", std::string("s1"),
@@ -718,13 +725,15 @@ TEST_F(StoredFieldsSearchTest, columnPreferredOverStored) {
 
   auto schema = Schema::createDefaultSchema();
   // Column-only (not indexed) STRING that is also STORED.
-  proto::SchemaDef def;
-  auto* f = def.add_fields();
-  f->set_name("tag");
-  f->set_field_class(proto::FieldDef::STRING);
-  f->set_indexed(false);
-  f->set_column_stored(true);
-  f->set_stored(true);
+  solux::api::SchemaDef def;
+  std::vector<solux::api::FieldDef> fields;
+  auto& f = fields.emplace_back();
+  f.name = "tag";
+  f.field_class = solux::api::FieldDef::FieldClass::STRING;
+  f.indexed = false;
+  f.column_stored = true;
+  f.stored = true;
+  def.fields = fields;
   schema = Schema::fromProto(def, schema.get());
   ch.collection().setSchema(schema);
 
@@ -733,14 +742,14 @@ TEST_F(StoredFieldsSearchTest, columnPreferredOverStored) {
   ch.index(flatdoc("id", std::string("d2"), "tag", std::string("blue")),
            UpdateMessage::COMMIT);
 
-  auto* req = LocalReq::create(ch.getSearchEngine());
-  auto docs = req->collection("main")
-                 .allQuery()
-                 .fields({"id", "tag"})
-                 .limit(-1)
-                 .execute()
-                 .getDocs();
-  req->done();
+  auto req = localReq(ch.getSearchEngine());
+  req->collection("main").topDocs("q")
+      .allQuery()
+      .fields({"id", "tag"})
+      .limit(-1);
+  req->execute();
+  ASSERT_OK(req);
+  auto docs = req->getDocs();
 
   ASSERT_EQ(2, docs.size());
   EXPECT_TRUE(containsDoc(docs, flatdoc("id", std::string("d1"), "tag", std::string("red"))));
@@ -766,18 +775,21 @@ TEST_F(StoredFieldsSearchTest, customStoredResourceFromProto) {
   auto schema = Schema::createDefaultSchema();
   schema->fieldTypeMap["_stored_embeddings_"] =
       std::make_shared<StoredFieldType>("_stored_embeddings_");
-  proto::SchemaDef def;
-  auto* body = def.add_fields();
-  body->set_name("body");
-  body->set_field_class(proto::FieldDef::TEXT);
-  body->set_indexed(true);
-  body->set_stored(true);
-  auto* para = def.add_fields();
-  para->set_name("paragraphs");
-  para->set_field_class(proto::FieldDef::TEXT);
-  para->set_indexed(true);
-  para->set_stored(true);
-  para->set_stored_resource("_stored_embeddings_");
+  solux::api::SchemaDef def;
+  std::vector<solux::api::FieldDef> fields;
+  fields.reserve(2);
+  auto& body = fields.emplace_back();
+  body.name = "body";
+  body.field_class = solux::api::FieldDef::FieldClass::TEXT;
+  body.indexed = true;
+  body.stored = true;
+  auto& para = fields.emplace_back();
+  para.name = "paragraphs";
+  para.field_class = solux::api::FieldDef::FieldClass::TEXT;
+  para.indexed = true;
+  para.stored = true;
+  para.stored_resource = "_stored_embeddings_";
+  def.fields = fields;
   schema = Schema::fromProto(def, schema.get());
   ASSERT_EQ("_stored_embeddings_", schema->getFieldTypePtr("paragraphs")->storedResource_);
   ch.collection().setSchema(schema);
@@ -787,14 +799,14 @@ TEST_F(StoredFieldsSearchTest, customStoredResourceFromProto) {
                    "paragraphs", std::string("custom resource")),
            UpdateMessage::COMMIT);
 
-  auto* req = LocalReq::create(ch.getSearchEngine());
-  auto docs = req->collection("main")
-                 .allQuery()
-                 .fields({"id", "body", "paragraphs"})
-                 .limit(-1)
-                 .execute()
-                 .getDocs();
-  req->done();
+  auto req = localReq(ch.getSearchEngine());
+  req->collection("main").topDocs("q")
+      .allQuery()
+      .fields({"id", "body", "paragraphs"})
+      .limit(-1);
+  req->execute();
+  ASSERT_OK(req);
+  auto docs = req->getDocs();
 
   ASSERT_EQ(1, docs.size());
   EXPECT_TRUE(containsDoc(docs, flatdoc("id", std::string("d1"),
@@ -823,14 +835,14 @@ TEST_F(StoredFieldsSearchTest, storedIdField) {
   ch.index(flatdoc("id", std::string("xyz")), UpdateMessage::NO_COMMIT);
   ch.index(flatdoc("id", std::string("abc")), UpdateMessage::COMMIT);
 
-  auto* req = LocalReq::create(ch.getSearchEngine());
-  auto docs = req->collection("main")
-                 .allQuery()
-                 .fields({"id"})
-                 .limit(-1)
-                 .execute()
-                 .getDocs();
-  req->done();
+  auto req = localReq(ch.getSearchEngine());
+  req->collection("main").topDocs("q")
+      .allQuery()
+      .fields({"id"})
+      .limit(-1);
+  req->execute();
+  ASSERT_OK(req);
+  auto docs = req->getDocs();
 
   ASSERT_EQ(2, docs.size());
   EXPECT_TRUE(containsDoc(docs, flatdoc("id", std::string("xyz"))));
@@ -853,13 +865,15 @@ TEST_F(StoredFieldsSearchTest, preStoredSegmentFallbackToColumn) {
   // Segment 1: schema has the STRING field WITHOUT stored - only column.
   {
     auto schema = Schema::createDefaultSchema();
-    proto::SchemaDef def;
-    auto* f = def.add_fields();
-    f->set_name("name");
-    f->set_field_class(proto::FieldDef::STRING);
-    f->set_indexed(true);
-    f->set_column_stored(true);
-    f->set_stored(false);
+    solux::api::SchemaDef def;
+    std::vector<solux::api::FieldDef> fields;
+    auto& f = fields.emplace_back();
+    f.name = "name";
+    f.field_class = solux::api::FieldDef::FieldClass::STRING;
+    f.indexed = true;
+    f.column_stored = true;
+    f.stored = false;
+    def.fields = fields;
     schema = Schema::fromProto(def, schema.get());
     ch.collection().setSchema(schema);
 
@@ -871,13 +885,15 @@ TEST_F(StoredFieldsSearchTest, preStoredSegmentFallbackToColumn) {
   // Segment 2: schema now marks "name" as STORED (and drops the column).
   {
     auto schema = Schema::createDefaultSchema();
-    proto::SchemaDef def;
-    auto* f = def.add_fields();
-    f->set_name("name");
-    f->set_field_class(proto::FieldDef::STRING);
-    f->set_indexed(true);
-    f->set_column_stored(false);
-    f->set_stored(true);
+    solux::api::SchemaDef def;
+    std::vector<solux::api::FieldDef> fields;
+    auto& f = fields.emplace_back();
+    f.name = "name";
+    f.field_class = solux::api::FieldDef::FieldClass::STRING;
+    f.indexed = true;
+    f.column_stored = false;
+    f.stored = true;
+    def.fields = fields;
     schema = Schema::fromProto(def, schema.get());
     ch.collection().setSchema(schema);
 
@@ -886,14 +902,14 @@ TEST_F(StoredFieldsSearchTest, preStoredSegmentFallbackToColumn) {
              UpdateMessage::COMMIT);
   }
 
-  auto* req = LocalReq::create(ch.getSearchEngine());
-  auto docs = req->collection("main")
-                 .allQuery()
-                 .fields({"id", "name"})
-                 .limit(-1)
-                 .execute()
-                 .getDocs();
-  req->done();
+  auto req = localReq(ch.getSearchEngine());
+  req->collection("main").topDocs("q")
+      .allQuery()
+      .fields({"id", "name"})
+      .limit(-1);
+  req->execute();
+  ASSERT_OK(req);
+  auto docs = req->getDocs();
 
   ASSERT_EQ(2, docs.size());
   // Old segment's "alpha" falls back to the ord column; new segment's "beta"
@@ -923,13 +939,15 @@ TEST_F(StoredFieldsSearchTest, opportunisticStoredPullsColumnPeerFromChunk) {
   // body_t is already stored-only via the default _t suffix (TEXT, no column).
   // Add a STRING field that is BOTH column-stored and STORED.
   {
-    proto::SchemaDef def;
-    auto* f = def.add_fields();
-    f->set_name("author");
-    f->set_field_class(proto::FieldDef::STRING);
-    f->set_indexed(false);
-    f->set_column_stored(true);
-    f->set_stored(true);
+    solux::api::SchemaDef def;
+    std::vector<solux::api::FieldDef> fields;
+    auto& f = fields.emplace_back();
+    f.name = "author";
+    f.field_class = solux::api::FieldDef::FieldClass::STRING;
+    f.indexed = false;
+    f.column_stored = true;
+    f.stored = true;
+    def.fields = fields;
     schema = Schema::fromProto(def, schema.get());
   }
   ch.collection().setSchema(schema);
@@ -943,14 +961,14 @@ TEST_F(StoredFieldsSearchTest, opportunisticStoredPullsColumnPeerFromChunk) {
                    "author", std::string("bob")),
            UpdateMessage::COMMIT);
 
-  auto* req = LocalReq::create(ch.getSearchEngine());
-  auto docs = req->collection("main")
-                 .allQuery()
-                 .fields({"id", "body_t", "author"})
-                 .limit(-1)
-                 .execute()
-                 .getDocs();
-  req->done();
+  auto req = localReq(ch.getSearchEngine());
+  req->collection("main").topDocs("q")
+      .allQuery()
+      .fields({"id", "body_t", "author"})
+      .limit(-1);
+  req->execute();
+  ASSERT_OK(req);
+  auto docs = req->getDocs();
 
   ASSERT_EQ(2, docs.size());
   EXPECT_TRUE(containsDoc(docs, flatdoc("id", std::string("d1"),
@@ -986,14 +1004,14 @@ TEST_F(StoredFieldsSearchTest, multipleFieldsShareResource) {
                    "c_t", std::string("gamma two")),
            UpdateMessage::COMMIT);
 
-  auto* req = LocalReq::create(ch.getSearchEngine());
-  auto docs = req->collection("main")
-                 .allQuery()
-                 .fields({"id", "a_t", "b_t", "c_t"})
-                 .limit(-1)
-                 .execute()
-                 .getDocs();
-  req->done();
+  auto req = localReq(ch.getSearchEngine());
+  req->collection("main").topDocs("q")
+      .allQuery()
+      .fields({"id", "a_t", "b_t", "c_t"})
+      .limit(-1);
+  req->execute();
+  ASSERT_OK(req);
+  auto docs = req->getDocs();
 
   ASSERT_EQ(2, docs.size());
   EXPECT_TRUE(containsDoc(docs, flatdoc("id", std::string("d1"),

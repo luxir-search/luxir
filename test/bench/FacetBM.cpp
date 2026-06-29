@@ -1,5 +1,6 @@
 #include <charconv>
 #include <latch>
+#include <variant>
 
 #include "bench/solux_bench.h"
 #include "test/CollectionHelper.h"
@@ -40,56 +41,48 @@ static void BM_Facet(benchmark::State& state, int64_t nDocs, std::string_view sh
   for (auto _ : state) {
     int64_t ret = 0;
 
-    auto* lreq = LocalReq::create(SoluxTest::soluxNode->getSearchEngine());
-    lreq->proto.mutable_collection()->add_name("main");
-    lreq->proto.set_request_id("myrequestid");
+    auto req = localReq(SoluxTest::soluxNode->getSearchEngine());
+    req->collection("main");
     // match all docs query
-    auto& ops = *lreq->proto.mutable_ops();
-    auto& topDocs = *ops["q"].mutable_top_docs();
+    auto& topDocs = req->topDocs("q");
 
     if (qfield == "all") {
-      topDocs.mutable_query()->set_all(true);
+      topDocs.allQuery();
     } else {
-      auto& matchQuery = *topDocs.mutable_query()->mutable_match();
-      matchQuery.set_field(qfield);
-      matchQuery.mutable_val()->set_s("0");
+      topDocs.matchQuery(qfield, "0");
     }
-    topDocs.set_get_number(true);
-    topDocs.set_get_scores(false);
+    topDocs.getNumber(true).getScores(false);
 
     // add the field we want to facet
-    auto& topDocsOps = *topDocs.mutable_ops();
-    auto& facet = *topDocsOps["f"].mutable_field_facet();
-    facet.set_field(ffield);
-    facet.set_limit(5);
+    auto& facet = topDocs.facet("f", ffield);
+    facet.limit(5);
 
-    lreq->engine.submit(*lreq, para);
-    // LOG_DEBUG("ENGINE REQ: {}", lreq->toString());
+    req->execute(para);
+    // LOG_DEBUG("ENGINE REQ: {}", req->toString());
     // add all the facet counts into the fingerprint "ret"
-    // auto& facetResult = lreq->responses[0]->proto.ops().at("f").facet();  // top level facets
-    auto& facetResult = lreq->responses[0]->proto.ops().at("q").docs().ops().at("f").facet();
-    auto& counts = facetResult.counts();
-    if (facetResult.bucket_ids().has_col_i()) {
-      auto& bucketIds = facetResult.bucket_ids().col_i();
-      for (int i = 0; i < facetResult.counts().size(); i++) {
-        ret = ret * 31 + bucketIds.v(i) + counts[i];
+    const auto* qDocs = req->responses[0]->proto.ops.at("q")->docList();
+    const auto* facetResult = qDocs->ops.at("f")->facetResult();
+    const auto& counts = facetResult->counts;
+    if (std::holds_alternative<solux::api::ColInt>(facetResult->bucket_ids->kind)) {
+      const auto& bucketIds = std::get<solux::api::ColInt>(facetResult->bucket_ids->kind);
+      for (int i = 0; i < (int)counts.size(); i++) {
+        ret = ret * 31 + bucketIds.v[i] + counts[i];
       }
-    } else if (facetResult.bucket_ids().has_col_s()) {
-      auto& bucketIds = facetResult.bucket_ids().col_s();
-      for (int i = 0; i < facetResult.counts().size(); i++) {
-        ret = ret * 31 + java_string_hashcode(bucketIds.v(i)) + counts[i];
+    } else if (std::holds_alternative<solux::api::ColStr>(facetResult->bucket_ids->kind)) {
+      const auto& bucketIds = std::get<solux::api::ColStr>(facetResult->bucket_ids->kind);
+      for (int i = 0; i < (int)counts.size(); i++) {
+        ret = ret * 31 + java_string_hashcode(bucketIds.v[i]) + counts[i];
       }
-    } else if (facetResult.bucket_ids().has_multi_i()) {
-      auto& bucketIds = facetResult.bucket_ids().multi_i();
-      for (int i = 0; i < facetResult.counts().size(); i++) {
-        ret = ret * 31 + bucketIds.v(i).v(0) + counts[i];
+    } else if (std::holds_alternative<solux::api::ArrArrInt>(facetResult->bucket_ids->kind)) {
+      const auto& bucketIds = std::get<solux::api::ArrArrInt>(facetResult->bucket_ids->kind);
+      for (int i = 0; i < (int)counts.size(); i++) {
+        ret = ret * 31 + bucketIds.v[i].v[0] + counts[i];
       }
     } else {
-      LOG_ERROR("Unknown bucket ids type in facet result: {}", facetResult.bucket_ids().DebugString());
+      LOG_ERROR("Unknown bucket ids type in facet result: {}", "<unknown>");
     }
 
 
-    lreq->done();
     benchmark::DoNotOptimize(ret);
 
     if (fp != -1) {

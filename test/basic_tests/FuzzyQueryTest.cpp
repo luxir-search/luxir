@@ -281,14 +281,14 @@ public:
 
   std::vector<std::string> fuzzyIds(std::string_view field, std::string_view term,
                                     int maxEdits = -1, int prefixLength = -1) {
-    auto* req = LocalReq::create(helper.getSearchEngine());
-    req->collection("main").fuzzyQuery(field, term, maxEdits, prefixLength)
-        .fields({"id"}).limit(100).execute();
+    auto req = localReq(helper.getSearchEngine());
+    req->collection("main").topDocs("q").fuzzyQuery(field, term, maxEdits, prefixLength)
+        .fields({"id"}).limit(100);
+    req->execute();
     std::vector<std::string> ids;
     for (auto& doc : req->getDocs()) {
       if (auto* v = find(doc, "id")) ids.push_back(std::get<std::string>(*v));
     }
-    req->done();
     std::sort(ids.begin(), ids.end());
     return ids;
   }

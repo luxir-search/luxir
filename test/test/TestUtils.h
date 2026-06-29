@@ -5,6 +5,7 @@
 #include <string>
 #include "SoluxTest.h"
 #include "solux/index/IndexWriter.h"
+#include "solux/util/Overloaded.h"
 
 namespace solux::test {
 
@@ -81,10 +82,7 @@ Doc flatdoc(T1 arg1, T2 arg2, Args... args) {
 };
 
 
-template<class... Ts>
-struct overloaded : Ts... { using Ts::operator()...; };
-template<class... Ts>
-overloaded(Ts...) -> overloaded<Ts...>;
+using solux::overloaded;  // the shared std::visit visitor (solux/util/Overloaded.h)
 
 // Utility function to compare Doc objects for testing
 inline bool docEquals(const Doc& doc1, const Doc& doc2) {
@@ -211,4 +209,20 @@ inline std::string docToString(const Doc& doc) {
   return result;
 }
 
+// Print a list of Docs (one per line) for debugging / assertion messages.
+inline std::string docsToString(const std::vector<Doc>& docs) {
+  std::string result;
+  for (const auto& d : docs) {
+    result += "  " + docToString(d) + "\n";
+  }
+  return result;
+}
+
 } // solux::test
+
+// Expect that `docs` contains a doc matching `doc`; on failure prints the expected doc and
+// the full actual doc list via docToString().
+#define EXPECT_CONTAINS_DOC(docs, doc)                                                      \
+  EXPECT_TRUE(::solux::test::containsDoc((docs), (doc)))                                    \
+      << "expected doc: " << ::solux::test::docToString(doc) << "\nactual docs:\n"          \
+      << ::solux::test::docsToString(docs)

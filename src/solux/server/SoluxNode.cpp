@@ -3,7 +3,10 @@
 #include "solux/store/InputStream.h"
 #include "solux/store/CheckedDirFactory.h"
 #include "solux/reader/Postings.h"
-#include "protos/solux_types.pb.h"
+#include "solux/api/solux_types.hpp"
+
+#include <memory_resource>
+#include <span>
 
 namespace solux {
 
@@ -61,8 +64,10 @@ bool Collection::loadSchema() {
     auto file = shard->dir->openFile(lastSchemaFile, true);
     if (file) {
       InputStream is = file->getInputStream();
-      proto::SchemaDef def;
-      if (!def.ParseFromArray(is.ptr(), (int)is.left())) {
+      std::pmr::monotonic_buffer_resource schemaArena;  // backs the non-owning SchemaDef
+      solux::api::SchemaDef def;
+      std::span<const char> bytes((const char*)is.ptr(), is.left());
+      if (!solux::api::decode(def, std::as_bytes(bytes), schemaArena)) {
         throw std::runtime_error("Failed to parse schema file: " + lastSchemaFile);
       }
 

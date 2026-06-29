@@ -6,6 +6,37 @@
 namespace solux {
 class DocSet;
 
+// --- Request-side (non-owning) proto message views ---
+// Sub-messages of the request proto (ReqProto = SearchRequest<non_owning_traits>),
+// borrowed from the kept-alive request bytes.  Ops hold const refs/views to these;
+// the parser hands them in.  Spelled once here so the ops don't repeat the traits.
+using ReqTopDocs = solux::api::TopDocs;
+using ReqFusion = solux::api::Fusion;
+using ReqFieldFacet = solux::api::FieldFacet;
+using ReqRangeFacet = solux::api::RangeFacet;
+using ReqSortList = std::span<const solux::api::SortSpec>;
+
+// --- Response-side (owning) oneof / optional mutators ---
+// hpp-proto translation of protobuf's mutable_<oneof_arm>() / mutable_<message>():
+// "return the active arm/value, creating a default one if not already present"
+// (get-or-create).  Unlike a bare kind.emplace<Arm>(), this never clobbers an arm
+// a sibling op/bucket already set - the response tree is assembled concurrently
+// under req.mutex and multiple sub-ops share a parent Val's docs/facet arm.
+template <typename Arm, typename Msg>
+Arm& oneofMut(Msg& msg) {
+  if (auto* p = std::get_if<Arm>(&msg.kind)) {
+    return *p;
+  }
+  return msg.kind.template emplace<Arm>();
+}
+template <typename T>
+T& optMut(std::optional<T>& opt) {
+  if (!opt.has_value()) {
+    opt.emplace();
+  }
+  return *opt;
+}
+
 class SearchOp {
 public:
   SearchRequest& req;
@@ -48,21 +79,41 @@ public:
   public:
     Calculator(SearchOp& op, Calculator* parent, int64_t slot, int64_t numSlots) : op(op), parent(parent), slot(slot), numSlots(numSlots) {}
 
-    // Return the target Val for this calculator.
-    // If searchResponse is not null, then the subOp wants the path created in the given searchResponse.
-    solux::proto::Val* getTarget(solux::proto::SearchResponse* searchResponse, auto&& visitor) {
+    // --- Result assembly: getTarget() / getTargetForSub() ---
+    // (1) BUBBLE-TO-ROOT slot resolution. A sub-op asks its PARENT for its spot
+    //     (getTargetForSub bubbles up the Calculator chain to the root op, which owns the
+    //     response). Each level builds its piece of the nesting path in the NON-OWNING
+    //     response - sets the enclosing Val's variant arm and gets-or-creates the sub's
+    //     entry in the ops map - and returns a stable Val* slot for this op to fill. The
+    //     `resp` (SearchResponse, carrying both proto + arena `mr`) selects WHICH response
+    //     object to build into (see (3)); when null, getTarget resolves it to the request's
+    //     current/accumulating response (req.lastResponse) so getTargetForSub is non-null.
+    // (2) POINTER STABILITY. The returned Val* must stay valid while the op fills it and
+    //     while sibling ops add other slots concurrently. It holds because build::opsSlot
+    //     pre-allocates the ops backing array once (sized to the parent op's subOps) and
+    //     allocates each Val separately in `resp->mr` - so a Val's address never moves as
+    //     siblings fill other slots - and ALL assembly happens under op.req.mutex.
+    // (3) INCREMENTAL / STREAMING EMISSION. To emit an intermediate partial result, an op
+    //     creates a FRESH SearchResponse, getTarget()s into IT (the same bubble builds the
+    //     path into that object, backed by its own mr), fills the slot, the handler
+    //     encode's it and respondRaw(..., more=true), then it is dropped (per-emit
+    //     eager-drop). The accumulating/final response is untouched; multiple intermediates
+    //     may precede the final, which goes out more=false.
+    solux::api::Val* getTarget(SearchResponse* resp, auto&& visitor) {
       std::lock_guard<std::mutex> lock(op.req.mutex);
-      auto* val = parent->getTargetForSub(searchResponse, this);
+      resp = resp ? resp : op.req.lastResponse;
+      auto* val = parent->getTargetForSub(resp, this);
       visitor(*val); // call the visitor with the target Val with mutex held.
       return val;
     }
-    solux::proto::Val* getTarget(solux::proto::SearchResponse* searchResponse) {
-      return getTarget(searchResponse, [](solux::proto::Val& val){});
+    solux::api::Val* getTarget(SearchResponse* resp) {
+      return getTarget(resp, [](solux::api::Val&){});
     }
 
     // Called by a subCalculator on us to get the target for the subCalculator to set.
-    // Do not call this without a lock held to protect the response from concurrent modifications.
-    virtual solux::proto::Val* getTargetForSub(solux::proto::SearchResponse* searchResponse, Calculator* sub) = 0;
+    // `resp` is non-null (getTarget resolves it). Do not call this without op.req.mutex
+    // held to protect the response from concurrent modifications.
+    virtual solux::api::Val* getTargetForSub(SearchResponse* resp, Calculator* sub) = 0;
 
     SearchOp& getOp() {
       return op;
@@ -91,7 +142,7 @@ public:
       : Calculator(op, parent, slot, numSlots) {
     }
 
-    solux::proto::Val* getTargetForSub(solux::proto::SearchResponse* searchResponse, Calculator* sub) override { return nullptr; }
+    solux::api::Val* getTargetForSub(SearchResponse* resp, Calculator* sub) override { return nullptr; }
     void calc(oneapi::tbb::task_group* tg, int32_t segnum, DocSet* domain) override {};
     virtual void startSeg(int32_t segnum) {};
     virtual void endSeg(int32_t segnum) {};

@@ -7,11 +7,14 @@
 #include <atomic>
 #include <chrono>
 #include <memory>
+#include <memory_resource>
+#include <span>
 #include <string>
 #include <thread>
 #include <vector>
 
-#include "protos/solux_types.pb.h"
+#include "solux/api/build.h"
+#include "solux/api/solux_types.hpp"
 #include "solux/index/IndexWriter.h"
 #include "solux/index/VectorIndexBuilder.h"
 #include "solux/reader/AuxReader.h"
@@ -78,26 +81,31 @@ protected:
   // Install a schema where _v has metric=L2 so the suffix-rule fields
   // (e.g. "embedding_v") become eligible for FAISS aux indexing.
   static void enableL2OnVecSuffix(Collection& col) {
-    proto::SchemaDef def;
-    auto* f = def.add_fields();
-    f->set_name("_v");
-    f->set_field_class(proto::FieldDef::VECTOR);
-    f->set_abstract(true);
-    f->set_column_stored(true);
-    f->mutable_vector()->set_metric(proto::VectorParams::L2);
+    // The concrete SchemaDef is non-owning (fields is a span); build a single FieldDef on
+    // the stack and view it, valid for the duration of the fromProto call.
+    solux::api::FieldDef f;
+    f.name = "_v";
+    f.field_class = solux::api::FieldDef_::FieldClass::VECTOR;
+    f.abstract = true;
+    f.column_stored = true;
+    f.vector.emplace().metric = solux::api::VectorParams_::Metric::L2;
+    solux::api::SchemaDef def;
+    def.fields = std::span<const solux::api::FieldDef>(&f, 1);
     auto base = col.getSchema();
     col.setSchema(Schema::fromProto(def, base.get()));
   }
 
   static void enableCosineOnVecSuffix(Collection& col, bool normalizeOnWrite) {
-    proto::SchemaDef def;
-    auto* f = def.add_fields();
-    f->set_name("_v");
-    f->set_field_class(proto::FieldDef::VECTOR);
-    f->set_abstract(true);
-    f->set_column_stored(true);
-    f->mutable_vector()->set_metric(proto::VectorParams::COSINE);
-    f->mutable_vector()->set_normalize_on_write(normalizeOnWrite);
+    solux::api::FieldDef f;
+    f.name = "_v";
+    f.field_class = solux::api::FieldDef_::FieldClass::VECTOR;
+    f.abstract = true;
+    f.column_stored = true;
+    auto& vector = f.vector.emplace();
+    vector.metric = solux::api::VectorParams_::Metric::COSINE;
+    vector.normalize_on_write = normalizeOnWrite;
+    solux::api::SchemaDef def;
+    def.fields = std::span<const solux::api::FieldDef>(&f, 1);
     auto base = col.getSchema();
     col.setSchema(Schema::fromProto(def, base.get()));
   }
@@ -105,14 +113,34 @@ protected:
 
 namespace {
 
-std::vector<const proto::AuxIndexInfo*> vectorOverlays(const proto::IndexInfo& info) {
-  std::vector<const proto::AuxIndexInfo*> out;
-  for (const auto& seg : info.segments()) {
-    for (const auto& overlay : seg.overlays()) {
-      if (overlay.kind() == VectorIndexBuilder::KIND) out.push_back(&overlay);
+std::vector<const solux::api::AuxIndexInfo*> vectorOverlays(const solux::api::IndexInfo& info) {
+  std::vector<const solux::api::AuxIndexInfo*> out;
+  for (const auto& seg : info.segments) {
+    for (const auto& overlay : seg.overlays) {
+      if (overlay.kind == VectorIndexBuilder::KIND) out.push_back(&overlay);
     }
   }
   return out;
+}
+
+// solux::api::IndexInfo is NON-OWNING: its repeated messages live in the arena and its
+// strings (including aux file names) view the InputFile bytes.  Keep both alive next to
+// the decoded view so callers can read it after readIndexInfo returns.
+struct LoadedIndexInfo {
+  std::shared_ptr<InputFile> file;
+  std::unique_ptr<std::pmr::monotonic_buffer_resource> arena;
+  solux::api::IndexInfo info;
+};
+
+LoadedIndexInfo readIndexInfo(Directory& dir) {
+  LoadedIndexInfo loaded;
+  loaded.file = dir.openFile(Postings::INDEX_INFO_FILE);
+  EXPECT_NE(loaded.file, nullptr);
+  loaded.arena = std::make_unique<std::pmr::monotonic_buffer_resource>();
+  auto is = loaded.file->getInputStream();
+  std::span<const char> bytes(is.ptr(), (size_t)is.left());
+  EXPECT_TRUE(solux::api::decode(loaded.info, std::as_bytes(bytes), *loaded.arena));
+  return loaded;
 }
 
 // Registry split: per-segment overlays are looked up via Segment::getAuxReader,
@@ -125,7 +153,7 @@ std::shared_ptr<AuxReader> firstSegmentAux(IndexReader& reader, std::string_view
   return nullptr;
 }
 
-const proto::AuxIndexInfo& onlyVectorOverlay(const proto::IndexInfo& info) {
+const solux::api::AuxIndexInfo& onlyVectorOverlay(const solux::api::IndexInfo& info) {
   auto overlays = vectorOverlays(info);
   EXPECT_EQ(overlays.size(), 1u);
   return *overlays[0];
@@ -167,7 +195,7 @@ TEST_F(IndexReaderAuxTest, opensVectorAuxAfterBuild) {
   ASSERT_NE(vaux, nullptr);
   EXPECT_EQ(vaux->getField(), "embedding_v");
   EXPECT_EQ(vaux->getDims(), 4);
-  EXPECT_EQ(vaux->getMetric(), (int32_t)proto::VectorParams::L2);
+  EXPECT_EQ(vaux->getMetric(), (int32_t)solux::api::VectorParams_::Metric::L2);
   EXPECT_FALSE(vaux->shouldNormalizeColumnOnCosineRescore());
 
   auto* idx = vaux->getFaissIndex();
@@ -299,7 +327,7 @@ TEST_F(IndexReaderAuxTest, cosineRawColumnSetsRescorePolicy) {
   ASSERT_NE(aux, nullptr);
   auto* vaux = dynamic_cast<VectorAuxReader*>(aux.get());
   ASSERT_NE(vaux, nullptr);
-  EXPECT_EQ(vaux->getMetric(), (int32_t)proto::VectorParams::COSINE);
+  EXPECT_EQ(vaux->getMetric(), (int32_t)solux::api::VectorParams_::Metric::COSINE);
   EXPECT_TRUE(vaux->shouldNormalizeColumnOnCosineRescore());
 }
 
@@ -350,14 +378,10 @@ TEST_F(IndexReaderAuxTest, opensCleanlyAfterTinyCommitCarryForward) {
     auto aux = firstSegmentAux(*reader1, "vec.embedding_v");
     ASSERT_NE(aux, nullptr);
     // Find the file referenced by this aux entry via the on-disk IndexInfo.
-    auto infoFile = dir.openFile(Postings::INDEX_INFO_FILE);
-    ASSERT_NE(infoFile, nullptr);
-    proto::IndexInfo info;
-    auto is = infoFile->getInputStream();
-    ASSERT_TRUE(info.ParseFromArray(is.ptr(), (int)is.left()));
-    const auto& auxInfo = onlyVectorOverlay(info);
-    ASSERT_EQ(auxInfo.files_size(), 1);
-    oldFile = auxInfo.files(0);
+    auto loaded = readIndexInfo(dir);
+    const auto& auxInfo = onlyVectorOverlay(loaded.info);
+    ASSERT_EQ(auxInfo.files.size(), 1u);
+    oldFile = std::string(auxInfo.files[0]);
   }
 
   // Publish a tiny below-threshold segment.  It should not build a new ANN
@@ -403,14 +427,10 @@ TEST_F(IndexReaderAuxTest, retryEscalatesWhenAuxFilePersistentlyMissing) {
   // Find the aux file referenced by the current IndexInfo and delete it.
   std::string auxFile;
   {
-    auto infoFile = dir.openFile(Postings::INDEX_INFO_FILE);
-    ASSERT_NE(infoFile, nullptr);
-    proto::IndexInfo info;
-    auto is = infoFile->getInputStream();
-    ASSERT_TRUE(info.ParseFromArray(is.ptr(), (int)is.left()));
-    const auto& auxInfo = onlyVectorOverlay(info);
-    ASSERT_EQ(auxInfo.files_size(), 1);
-    auxFile = auxInfo.files(0);
+    auto loaded = readIndexInfo(dir);
+    const auto& auxInfo = onlyVectorOverlay(loaded.info);
+    ASSERT_EQ(auxInfo.files.size(), 1u);
+    auxFile = std::string(auxInfo.files[0]);
   }
   ASSERT_TRUE(dir.deleteFile(auxFile));
 
@@ -583,26 +603,28 @@ TEST_F(IndexReaderAuxTest, unknownAuxKindIsSkipped) {
 
   auto& dir = h.getIndexWriter()->dir;
 
-  // Read existing IndexInfo, append an unknown aux entry, write it back.
-  proto::IndexInfo info;
-  {
-    auto f = dir.openFile(Postings::INDEX_INFO_FILE);
-    ASSERT_NE(f, nullptr);
-    auto is = f->getInputStream();
-    ASSERT_TRUE(info.ParseFromArray(is.ptr(), (int)is.left()));
-  }
-  auto* extra = info.add_aux_indexes();
-  extra->set_kind("future_kind_abc");
-  extra->set_name("future.foo");
-  extra->set_gen(1);
-  extra->add_files("nonexistent_file_should_not_be_opened");
+  // Read existing IndexInfo, append an unknown aux entry, write it back.  The concrete
+  // IndexInfo is non-owning (aux_indexes / files are spans), so grow the arrays into the
+  // loaded arena instead of emplace_back, then re-encode while the loaded view is alive.
+  auto loaded = readIndexInfo(dir);
+  auto oldAux = loaded.info.aux_indexes;
+  solux::api::AuxIndexInfo* aux =
+      solux::api::build::allocArray(loaded.info.aux_indexes, oldAux.size() + 1, *loaded.arena);
+  for (size_t i = 0; i < oldAux.size(); i++) aux[i] = oldAux[i];
+  auto& extra = aux[oldAux.size()];
+  extra.kind = "future_kind_abc";
+  extra.name = "future.foo";
+  extra.gen = 1;
+  solux::api::build::allocArray(extra.files, 1, *loaded.arena)[0] =
+      "nonexistent_file_should_not_be_opened";
 
   {
+    std::vector<std::byte> serialized;
+    ASSERT_TRUE(solux::api::encode(loaded.info, serialized));
     auto out = dir.createFile(Postings::INDEX_INFO_FILE);
-    std::string serialized = info.SerializeAsString();
     OutputStream os;
     os.setFile(&*out);
-    os.write(serialized.data(), serialized.size());
+    os.write((const char*)serialized.data(), serialized.size());
     os.close();
     dir.finishFile(*out);
   }

@@ -25,7 +25,7 @@
 #include <boost/unordered/unordered_flat_set.hpp>
 
 #include "Query.h"
-#include "protos/solux_types.pb.h"
+#include "solux/api/solux_types.hpp"
 #include "solux/reader/AuxReader.h"
 #include "solux/reader/PostingsReader.h"
 #include "solux/reader/VectorAuxReader.h"
@@ -476,7 +476,7 @@ public:
       // local copy; the caller's span is unmodified.
       std::vector<float> queryBuf;
       const float* queryPtr = query.getQueryVec().data();
-      if (metric == proto::VectorParams::COSINE) {
+      if (metric == (int32_t)solux::api::VectorParams_::Metric::COSINE) {
         queryBuf.assign(query.getQueryVec().begin(), query.getQueryVec().end());
         faiss::fvec_renorm_L2((size_t)dims, 1, queryBuf.data());
         queryPtr = queryBuf.data();
@@ -2122,13 +2122,13 @@ private:
     assert(queryPtr != nullptr);
     assert((int32_t)vec.size() == dims);
     switch (metric) {
-      case proto::VectorParams::L2: {
+      case (int32_t)solux::api::VectorParams_::Metric::L2: {
         float dist = faiss::fvec_L2sqr(queryPtr, vec.data(), (size_t)dims);
         return finiteScore(1.0f / (1.0f + dist));
       }
-      case proto::VectorParams::IP:
+      case (int32_t)solux::api::VectorParams_::Metric::IP:
         return finiteScore(faiss::fvec_inner_product(queryPtr, vec.data(), (size_t)dims));
-      case proto::VectorParams::COSINE: {
+      case (int32_t)solux::api::VectorParams_::Metric::COSINE: {
         float sum = faiss::fvec_inner_product(queryPtr, vec.data(), (size_t)dims);
         if (!normalizeColumnOnCosineRescore) return finiteScore(sum);
 
@@ -2176,10 +2176,10 @@ private:
   // NaN distances map to the worst score (see finiteScore).
   static float scoreFromDist(float dist, int32_t metric) {
     switch (metric) {
-      case proto::VectorParams::L2:
+      case (int32_t)solux::api::VectorParams_::Metric::L2:
         return finiteScore(1.0f / (1.0f + dist));
-      case proto::VectorParams::IP:
-      case proto::VectorParams::COSINE:
+      case (int32_t)solux::api::VectorParams_::Metric::IP:
+      case (int32_t)solux::api::VectorParams_::Metric::COSINE:
       default:
         return finiteScore(dist);
     }

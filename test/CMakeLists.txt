@@ -1,7 +1,9 @@
 find_package(GTest CONFIG REQUIRED)
 find_package(benchmark REQUIRED)
 
-file(GLOB_RECURSE Test_SOURCES *.cpp *.h)
+# CONFIGURE_DEPENDS: re-glob on build so a newly added test/helper .cpp is picked up
+# without a manual reconfigure (otherwise new files link as undefined symbols).
+file(GLOB_RECURSE Test_SOURCES CONFIGURE_DEPENDS *.cpp *.h)
 
 add_executable(solux_test ${Test_SOURCES})
 target_include_directories(solux_test PRIVATE .)
@@ -20,6 +22,11 @@ target_precompile_headers(solux_test PRIVATE
   <gtest/gtest.h>
   <benchmark/benchmark.h>
 )
+
+
+# (solux_smoke removed: it was migration scaffolding to run SmokeTest while solux_test was
+# still on the protobuf API. solux_test now compiles SmokeTest.cpp on the concrete solux::api,
+# so the standalone target is redundant.)
 
 
 function(download fname url hash)

@@ -6,6 +6,7 @@
 #include "bench/solux_bench.h"
 #include "test/CollectionHelper.h"
 #include "test/LocalReq.h"
+#include "test/QueryBuild.h"
 
 using namespace solux;
 using namespace solux::test;
@@ -232,44 +233,37 @@ static void BM_Query(benchmark::State& state, int64_t nDocs, std::string_view sh
       continue;
     }
 
-    auto* lreq = LocalReq::create(SoluxTest::soluxNode->getSearchEngine());
-    lreq->proto.mutable_collection()->add_name("main");
-    lreq->proto.set_request_id("myrequestid");
+    auto req = localReq(SoluxTest::soluxNode->getSearchEngine());
+    req->collection("main");
     // match all docs query
-    auto& ops = *lreq->proto.mutable_ops();
-    auto& topDocs = *ops["q"].mutable_top_docs();
+    auto& topDocs = req->topDocs("q");
 
     if (qfield == "all") {
-      topDocs.mutable_query()->set_all(true);
+      topDocs.allQuery();
     } else {
-      auto& matchQuery = *topDocs.mutable_query()->mutable_match();
-      matchQuery.set_field(qfield);
-      matchQuery.mutable_val()->set_s("0");
+      topDocs.matchQuery(qfield, "0");
     }
-    topDocs.set_limit(100); // higher limit to exercise the priority queues more
-    topDocs.set_get_number(true);
-    topDocs.set_get_scores(false);
-    topDocs.add_fields("id");
+    topDocs.limit(100)        // higher limit to exercise the priority queues more
+           .getNumber(true)
+           .getScores(false)
+           .fields({"id"});
     // sort by some of the string fields
-    auto* sortSpec = topDocs.add_sorts();
-    sortSpec->set_field(sfield);
-    sortSpec->set_dir(proto::SortSpec::DESC);
+    qb::sort(topDocs, sfield, qb::DESC);
 
-    lreq->engine.submit(*lreq, para);
+    req->execute(para);
 
     // Now lets fingerprint the results to make sure we get the same every time.
-    const auto& docs = lreq->responses[0]->proto.ops().at("q").docs();
+    const auto* docs = req->responses[0]->proto.ops.at("q")->docList();
     // convert the ids back to integers and add them up.
-    const auto& idCol = docs.columns().at("id").col_s();
+    const auto& idCol = std::get<solux::api::ColStr>(docs->columns.at("id").kind);
     // start with the number of matches
-    ret += docs.matches();
-    for (int i = 0; i < idCol.v_size(); i++) {
+    ret += docs->matches.value_or(0);
+    for (int i = 0; i < (int)idCol.v.size(); i++) {
       int64_t id = 0;
-      std::from_chars(idCol.v(i).data(), idCol.v(i).data() + idCol.v(i).size(), id);
+      std::from_chars(idCol.v[i].data(), idCol.v[i].data() + idCol.v[i].size(), id);
       ret = ret * 31 + id;
     }
 
-    lreq->done();
     benchmark::DoNotOptimize(ret);
 
     if (fp != -1) {
@@ -316,28 +310,23 @@ static void BM_QueryConj(benchmark::State& state, int64_t nDocs, std::string_vie
 
   int64_t fp = -1;
   for (auto _ : state) {
-    auto* lreq = LocalReq::create(SoluxTest::soluxNode->getSearchEngine());
-    lreq->proto.mutable_collection()->add_name("main");
-    lreq->proto.set_request_id("myrequestid");
-    auto& ops = *lreq->proto.mutable_ops();
-    auto& topDocs = *ops["q"].mutable_top_docs();
+    auto req = localReq(SoluxTest::soluxNode->getSearchEngine());
+    req->collection("main");
+    auto& topDocs = req->topDocs("q");
 
     // field1:0 AND field2:0 (both required/scoring).  Clause order is irrelevant;
     // BooleanQuery leads with the lower-docfreq clause and advance()s the other.
-    auto& boolean = *topDocs.mutable_query()->mutable_boolean();
-    for (std::string_view f : {field1, field2}) {
-      auto& m = *boolean.add_required()->mutable_match();
-      m.set_field(f);
-      m.mutable_val()->set_s("0");
-    }
-    topDocs.set_limit(10);
-    topDocs.set_get_number(true);   // count all matches -> iterate the full conjunction
-    topDocs.set_get_scores(false);
+    topDocs.rawQuery() = qb::boolean(topDocs.mr(),
+        /*required=*/{qb::match(topDocs.mr(), field1, "0"),
+                      qb::match(topDocs.mr(), field2, "0")});
+    topDocs.limit(10)
+           .getNumber(true)    // count all matches -> iterate the full conjunction
+           .getScores(false);
 
-    lreq->engine.submit(*lreq, para);
+    req->execute(para);
 
-    int64_t ret = lreq->responses[0]->proto.ops().at("q").docs().matches();
-    lreq->done();
+    const auto* docs = req->responses[0]->proto.ops.at("q")->docList();
+    int64_t ret = docs->matches.value_or(0);
     benchmark::DoNotOptimize(ret);
 
     if (fp != -1) {

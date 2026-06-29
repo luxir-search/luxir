@@ -66,6 +66,10 @@ find_package(simdjson CONFIG REQUIRED)
 # locate OpenMP before find_package(faiss).
 find_package(OpenMP REQUIRED)
 find_package(faiss CONFIG REQUIRED)
+# protobuf (DescriptorPool + google::protobuf::Arena) and gRPC are linked directly into
+# solux_lib now that myproto is gone; they used to arrive transitively via myproto.
+find_package(Protobuf CONFIG REQUIRED)
+find_package(gRPC CONFIG REQUIRED)
 
 include_directories(deps)
 
@@ -120,7 +124,7 @@ message(STATUS "CMAKE_CXX_COMPILER_ID=${CMAKE_CXX_COMPILER_ID}")
 if (CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -mavx -mssse3 -march=native -mtune=native")
   add_compile_options(
-          "$<$<CONFIG:RELEASE>:-g>"
+          "$<$<CONFIG:RELEASE>:-g1>"
 #          "$<$<CONFIG:DEBUG>:-D_GLIBCXX_DEBUG>"
   )
   # -Wno-unused-parameter: many virtual overrides must keep base-class signature; renaming params would just be noise.
@@ -128,7 +132,7 @@ if (CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
 elseif (CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -mavx -mssse3 -march=native -mtune=native")   # native just for dev... lock down more later?
   add_compile_options(
-          "$<$<CONFIG:RELEASE>:-g>"
+          "$<$<CONFIG:RELEASE>:-g1>"
 #          "$<$<CONFIG:DEBUG>:-D_GLIBCXX_DEBUG>"
   )
   add_compile_options(-Wall -Wextra -Wno-unused-parameter)
@@ -139,6 +143,33 @@ elseif (CMAKE_CXX_COMPILER_ID STREQUAL "MSVC")
   #if debugging?
   #add_link_options("/nodefaultlib:msvcrt")
 endif()
+
+# ---- Adaptive compile-parallelism CAP (memory-aware, Ninja job pool) ----
+# hpp-proto template instantiation makes each heavy TU cost ~1.5-2.5G RAM to compile, so
+# the build tool's default -j (logical cores: 32 on a hyperthreaded 16-core box) OOMs.
+# This caps CONCURRENT COMPILES via a Ninja pool sized from THIS machine's physical cores
+# and RAM, never above 16 (hyperthreads add no compile throughput past real cores). It is a
+# cap, not a forced -j: a smaller -j still wins, and it adapts DOWN automatically on a
+# smaller laptop. Override explicitly with -DSOLUX_COMPILE_JOBS=N. Tune _ram_jobs divisor
+# (GB/job) down once the serializer is moved out-of-line and per-TU memory drops.
+if(NOT DEFINED SOLUX_COMPILE_JOBS)
+  cmake_host_system_information(RESULT _ncores QUERY NUMBER_OF_PHYSICAL_CORES)
+  cmake_host_system_information(RESULT _rammb  QUERY TOTAL_PHYSICAL_MEMORY)
+  math(EXPR _ram_jobs "${_rammb} / 2000")   # ~2.0G per concurrent heavy compile (post serializer-isolation ceiling)
+  set(SOLUX_COMPILE_JOBS ${_ncores})
+  if(_ram_jobs LESS SOLUX_COMPILE_JOBS)
+    set(SOLUX_COMPILE_JOBS ${_ram_jobs})
+  endif()
+  if(SOLUX_COMPILE_JOBS GREATER 16)
+    set(SOLUX_COMPILE_JOBS 16)
+  endif()
+  if(SOLUX_COMPILE_JOBS LESS 1)
+    set(SOLUX_COMPILE_JOBS 1)
+  endif()
+endif()
+message(STATUS "Solux compile-job cap: ${SOLUX_COMPILE_JOBS} (physical cores=${_ncores}, RAM=${_rammb}MB)")
+set_property(GLOBAL PROPERTY JOB_POOLS solux_compile=${SOLUX_COMPILE_JOBS})
+set(CMAKE_JOB_POOL_COMPILE solux_compile)
 
 # Include protobuf/grpc generated *.pb.h files
 include_directories("${CMAKE_CURRENT_BINARY_DIR}")
@@ -162,9 +193,10 @@ set(SOLUX_PCH_COMMON
   <vector> <string> <string_view> <memory> <algorithm> <span>
   <optional> <unordered_map> <cstdint> <charconv>
   <boost/unordered/unordered_flat_map.hpp>
-  # Angle brackets (not quotes): a quoted entry is resolved relative to the
-  # source dir, but this header is generated into the build tree and found via -I.
-  <protos/solux_types.pb.h>
+  # NOTE: the proto message header is intentionally NOT in the PCH during the
+  # solux::api cutover. A TU that includes the concrete header must not also pull
+  # the trait-templated header (unqualified-count ADL clash), and converted TUs
+  # use this PCH, so the proto header is included per-TU instead.
 )
 target_precompile_headers(solux_lib PRIVATE
   ${SOLUX_PCH_COMMON}
@@ -175,14 +207,26 @@ target_precompile_headers(solux_lib PRIVATE
   <solux/util/log.h>
 )
 
+# hpp-proto codegen toolchain (is_utf8, protoc-gen-hpp, hpp_proto::runtime,
+# hpp_proto_generate()). Included unconditionally now that the engine migration to
+# hpp solux::proto is underway (big-bang). protos/ uses hpp_proto_generate().
+include(cmake/hpp_proto.cmake)
+
 add_subdirectory(protos)
 add_subdirectory(test)
 
-# The PCHs above include generated protobuf headers, so the .gch compile must be
-# ordered after myproto generates them (the link-time dependency does not order
-# per-object/PCH compilation).
-add_dependencies(solux_lib myproto)
-add_dependencies(solux_test myproto)
+# Concrete solux::api round-trip tests (binary + JSON sweep + build-by-backing proof).
+# EXCLUDE_FROM_ALL: built on demand (--target solux_concrete_sweep / solux_concrete_build_test).
+add_subdirectory(test_concrete_proto)
+
+# solux_descriptors.cpp #include "solux_fds_data.h" (generated descriptor set); order its
+# compile after generation. The PCH no longer force-includes any generated proto header.
+add_dependencies(solux_lib solux_fds_gen)
+# build/protos holds the generated solux_fds_data.h (was provided via solux_proto_hpp).
+target_include_directories(solux_lib PRIVATE "${CMAKE_BINARY_DIR}/protos")
+# solux_descriptors.cpp pulls protobuf descriptor headers; keep the hpp serializer
+# PCH out of its TU (avoids the unqualified-count ADL clash, per the sweep split).
+set_source_files_properties(src/solux/server/solux_descriptors.cpp PROPERTIES SKIP_PRECOMPILE_HEADERS ON)
 
 if(ROBIN_HOOD_HASHING)
   find_path(ROBIN_HOOD_HASHING_INCLUDE_DIRS "robin_hood.h")
@@ -196,7 +240,15 @@ target_link_libraries(solux_lib PRIVATE TBB::tbb)
 target_link_libraries(solux_lib PRIVATE xxHash::xxhash)
 target_link_libraries(solux_lib PRIVATE ${Boost_LIBRARIES})
 target_link_libraries(solux_lib PRIVATE fastpfor)
-target_link_libraries(solux_lib PRIVATE myproto)
+# Concrete solux::api wire model (post-cutover): hand-written concrete structs + out-of-line
+# pb_meta/glz::meta (solux_proto_concrete) carrying hpp_proto::runtime (is_utf8) + glaze.
+# libprotobuf for google::protobuf::Arena (kept as the allocator) and the DescriptorPool used
+# by descriptor-only reflection; grpc++ for the server. The trait-templated solux_proto_hpp
+# was dropped - no TU includes "protos/solux*.pb.hpp" anymore. myproto (the protobuf message
+# classes + typed stubs) is also intentionally gone.
+target_link_libraries(solux_lib PUBLIC solux_proto_concrete)
+target_link_libraries(solux_lib PUBLIC protobuf::libprotobuf)
+target_link_libraries(solux_lib PUBLIC gRPC::grpc++ gRPC::grpc++_reflection)
 # log.h is included by tests and other dependents; propagate spdlog's compiled
 # mode so every TU shares the same default-logger registry.
 target_link_libraries(solux_lib PUBLIC spdlog::spdlog)

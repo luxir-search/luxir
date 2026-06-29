@@ -1,8 +1,11 @@
 #include <gtest/gtest.h>
 
+#include <cstddef>
+
 #include "test/SoluxTest.h"
 #include "test/CollectionHelper.h"
 #include "test/LocalReq.h"
+#include "test/QueryBuild.h"
 
 using namespace solux;
 using namespace solux::test;
@@ -16,6 +19,11 @@ class QueryAnalysisTest : public SoluxTest {
 public:
   CollectionHelper helper;
 
+  static std::vector<std::byte> bytes(std::string_view text) {
+    return std::vector<std::byte>((const std::byte*)text.data(),
+                                  (const std::byte*)text.data() + text.size());
+  }
+
   QueryAnalysisTest() {
     helper.clear();
     helper.index(flatdoc("id", "d1", "body_wl", "Welcome Thomas Anderson here",
@@ -26,33 +34,28 @@ public:
 
   // Run a phrase-over-text query and return the total match count.
   int64_t phraseTextCount(std::string_view field, std::string_view text) {
-    auto* req = LocalReq::create(helper.getSearchEngine());
-    req->collection("main").phraseText(field, text).withStats().execute();
-    int64_t n = req->getMatchCount();
-    req->done();
-    return n;
+    auto req = localReq(helper.getSearchEngine());
+    req->collection("main").topDocs("q").phraseText(field, text).withStats();
+    req->execute();
+    return req->getMatchCount();
   }
 
   // Run a match query (default OR) and return the total match count.
   int64_t matchCount(std::string_view field, std::string_view value) {
-    auto* req = LocalReq::create(helper.getSearchEngine());
-    req->collection("main").matchQuery(field, value).withStats().execute();
-    int64_t n = req->getMatchCount();
-    req->done();
-    return n;
+    auto req = localReq(helper.getSearchEngine());
+    req->collection("main").topDocs("q").matchQuery(field, value).withStats();
+    req->execute();
+    return req->getMatchCount();
   }
 
   // Run a match query with min_match set, return the total match count.
   int64_t matchMinMatchCount(std::string_view field, std::string_view value, int minMatch) {
-    auto* req = LocalReq::create(helper.getSearchEngine());
-    auto& m = *req->topDocs("q").mutable_query()->mutable_match();
-    m.set_field(field);
-    m.mutable_val()->set_s(value);
-    m.set_min_match(minMatch);
-    req->collection("main").withStats().execute();
-    int64_t n = req->getMatchCount();
-    req->done();
-    return n;
+    auto req = localReq(helper.getSearchEngine());
+    auto& cur = req->collection("main").topDocs("q").matchQuery(field, value);
+    std::get<solux::api::Match>(cur.rawQuery().kind).min_match = minMatch;
+    cur.withStats();
+    req->execute();
+    return req->getMatchCount();
   }
 };
 
@@ -79,20 +82,20 @@ TEST_F(QueryAnalysisTest, emptyAnalysisMatchesNothing) {
 }
 
 TEST_F(QueryAnalysisTest, wordListAnalyzed) {
-  auto* req = LocalReq::create(helper.getSearchEngine());
-  req->collection("main").phraseQuery("body_wl", {"THOMAS", "ANDERSON"}).withStats().execute();
+  auto req = localReq(helper.getSearchEngine());
+  req->collection("main").topDocs("q").phraseQuery("body_wl", {"THOMAS", "ANDERSON"}).withStats();
+  req->execute();
   EXPECT_EQ(1, req->getMatchCount());
-  req->done();
 }
 
 TEST_F(QueryAnalysisTest, wordListEntryFlattensToMultiplePositions) {
   // A single words[] entry that the analyzer splits into several tokens expands
   // to several phrase positions (flatten, like text). "Thomas Anderson" as one
   // entry -> [thomas, anderson].
-  auto* req = LocalReq::create(helper.getSearchEngine());
-  req->collection("main").phraseQuery("body_wl", {"Thomas Anderson"}).withStats().execute();
+  auto req = localReq(helper.getSearchEngine());
+  req->collection("main").topDocs("q").phraseQuery("body_wl", {"Thomas Anderson"}).withStats();
+  req->execute();
   EXPECT_EQ(1, req->getMatchCount());
-  req->done();
 }
 
 TEST_F(QueryAnalysisTest, wordListWithPositionsAdjustsForExpansion) {
@@ -101,70 +104,83 @@ TEST_F(QueryAnalysisTest, wordListWithPositionsAdjustsForExpansion) {
   // following word ("here", given position 1) is shifted to 2. The phrase then
   // matches d1's "... Thomas Anderson here" (relative deltas 0,1,2). Without
   // the shift, "here" would collide with "anderson" and never match.
-  auto* req = LocalReq::create(helper.getSearchEngine());
-  auto& ph = *req->topDocs("q").mutable_query()->mutable_phrase();
-  ph.set_field("body_wl");
-  ph.add_words("Thomas Anderson");
-  ph.add_words("here");
-  ph.add_positions(0);
-  ph.add_positions(1);
-  req->collection("main").withStats().execute();
+  auto req = localReq(helper.getSearchEngine());
+  auto& cur = req->collection("main").topDocs("q");
+  auto& ph = cur.rawQuery().kind.emplace<solux::api::PhraseQuery>();
+  ph.field = "body_wl";
+  auto& mr = cur.mr();
+  std::string_view* w = build::allocArray(ph.words, 2, mr);
+  w[0] = build::arenaStr(mr, "Thomas Anderson");
+  w[1] = build::arenaStr(mr, "here");
+  std::int32_t* pos = build::allocArray(ph.positions, 2, mr);
+  pos[0] = 0;
+  pos[1] = 1;
+  cur.withStats();
+  req->execute();
   EXPECT_EQ(1, req->getMatchCount());
-  req->done();
 }
 
 TEST_F(QueryAnalysisTest, preAnalyzedTermsUsedVerbatim) {
   // terms[] are already analyzed: they must match the index bytes exactly.
   {
-    auto* req = LocalReq::create(helper.getSearchEngine());
-    req->collection("main").phraseTerms("body_wl", {"thomas", "anderson"}).withStats().execute();
+    auto req = localReq(helper.getSearchEngine());
+    req->collection("main").topDocs("q").phraseTerms("body_wl", {"thomas", "anderson"}).withStats();
+    req->execute();
     EXPECT_EQ(1, req->getMatchCount());  // already folded -> matches
-    req->done();
   }
   {
-    auto* req = LocalReq::create(helper.getSearchEngine());
-    req->collection("main").phraseTerms("body_wl", {"Thomas", "Anderson"}).withStats().execute();
+    auto req = localReq(helper.getSearchEngine());
+    req->collection("main").topDocs("q").phraseTerms("body_wl", {"Thomas", "Anderson"}).withStats();
+    req->execute();
     EXPECT_EQ(0, req->getMatchCount());  // NOT analyzed; uppercase misses folded index
-    req->done();
   }
 }
 
 TEST_F(QueryAnalysisTest, preAnalyzedTermsBinUsedVerbatim) {
   // terms_bin is the binary equivalent of terms: already analyzed, verbatim.
-  auto* req = LocalReq::create(helper.getSearchEngine());
-  auto& ph = *req->topDocs("q").mutable_query()->mutable_phrase();
-  ph.set_field("body_wl");
-  *ph.mutable_terms_bin()->Add() = "thomas";
-  *ph.mutable_terms_bin()->Add() = "anderson";
-  req->collection("main").withStats().execute();
+  auto req = localReq(helper.getSearchEngine());
+  auto& cur = req->collection("main").topDocs("q");
+  auto& ph = cur.rawQuery().kind.emplace<solux::api::PhraseQuery>();
+  ph.field = "body_wl";
+  auto& mr = cur.mr();
+  auto* tb = build::allocArray(ph.terms_bin, 2, mr);
+  tb[0] = build::arenaBytes(mr, bytes("thomas"));
+  tb[1] = build::arenaBytes(mr, bytes("anderson"));
+  cur.withStats();
+  req->execute();
   EXPECT_EQ(1, req->getMatchCount());
-  req->done();
 }
 
 TEST_F(QueryAnalysisTest, multiplePhraseInputsRejected) {
   // Only one of text / words / terms / terms_bin may be set.
-  auto* req = LocalReq::create(helper.getSearchEngine());
-  auto& ph = *req->topDocs("q").mutable_query()->mutable_phrase();
-  ph.set_field("body_wl");
-  ph.set_text("Thomas Anderson");
-  *ph.mutable_words()->Add() = "here";
-  req->collection("main").withStats().execute();
+  auto req = localReq(helper.getSearchEngine());
+  auto& cur = req->collection("main").topDocs("q");
+  auto& ph = cur.rawQuery().kind.emplace<solux::api::PhraseQuery>();
+  ph.field = "body_wl";
+  ph.text = "Thomas Anderson";
+  auto& mr = cur.mr();
+  std::string_view* w = build::allocArray(ph.words, 1, mr);
+  w[0] = build::arenaStr(mr, "here");
+  cur.withStats();
+  req->execute();
   ASSERT_FALSE(req->responses.empty());
-  EXPECT_TRUE(req->responses[0]->proto.has_error());
-  req->done();
+  EXPECT_TRUE(hasError(req->responses[0]->proto));
 }
 
 TEST_F(QueryAnalysisTest, positionsWithoutTermsRejected) {
   // positions with no phrase input is a malformed request.
-  auto* req = LocalReq::create(helper.getSearchEngine());
-  auto& ph = *req->topDocs("q").mutable_query()->mutable_phrase();
-  ph.set_field("body_wl");
-  ph.add_positions(0);
-  ph.add_positions(1);
-  req->collection("main").withStats().execute();
+  auto req = localReq(helper.getSearchEngine());
+  auto& cur = req->collection("main").topDocs("q");
+  auto& ph = cur.rawQuery().kind.emplace<solux::api::PhraseQuery>();
+  ph.field = "body_wl";
+  auto& mr = cur.mr();
+  std::int32_t* pos = build::allocArray(ph.positions, 2, mr);
+  pos[0] = 0;
+  pos[1] = 1;
+  cur.withStats();
+  req->execute();
   ASSERT_FALSE(req->responses.empty());
-  EXPECT_TRUE(req->responses[0]->proto.has_error());
-  req->done();
+  EXPECT_TRUE(hasError(req->responses[0]->proto));
 }
 
 TEST_F(QueryAnalysisTest, caseSensitiveFieldRespectsCase) {
@@ -189,10 +205,11 @@ TEST_F(QueryAnalysisTest, matchMultiTermDefaultsToOr) {
 
 TEST_F(QueryAnalysisTest, matchAndRequiresAllTerms) {
   // Same terms with operator AND: only d1 contains both thomas and here.
-  auto* req = LocalReq::create(helper.getSearchEngine());
-  req->collection("main").matchQuery("body_wl", "Thomas here", proto::Match::AND).withStats().execute();
+  auto req = localReq(helper.getSearchEngine());
+  req->collection("main").topDocs("q").matchQuery("body_wl", "Thomas here",
+                                     solux::api::Match_::Operator::AND).withStats();
+  req->execute();
   EXPECT_EQ(1, req->getMatchCount());
-  req->done();
 }
 
 TEST_F(QueryAnalysisTest, matchEmptyAnalyzesToNothing) {
@@ -223,34 +240,31 @@ TEST_F(QueryAnalysisTest, matchMinShouldMatchMissingTermLowersCeiling) {
 
 TEST_F(QueryAnalysisTest, booleanMinMatchOptionalClauses) {
   // The same min-should-match scorer, reached through parseBoolean.
-  auto* req = LocalReq::create(helper.getSearchEngine());
-  auto& b = *req->topDocs("q").mutable_query()->mutable_boolean();
-  for (const auto* term : {"welcome", "here", "met"}) {
-    auto& m = *b.add_optional()->mutable_match();
-    m.set_field("body_wl");
-    m.mutable_val()->set_s(term);
-  }
-  b.set_min_match(2);
-  req->collection("main").withStats().execute();
+  auto req = localReq(helper.getSearchEngine());
+  auto& cur = req->collection("main").topDocs("q");
+  auto& mr = cur.mr();
+  cur.rawQuery() = qb::boolean(mr, /*required=*/{},
+      /*optional=*/{qb::match(mr, "body_wl", "welcome"),
+                    qb::match(mr, "body_wl", "here"),
+                    qb::match(mr, "body_wl", "met")},
+      /*prohibited=*/{}, /*filter=*/{}, /*minMatch=*/2);
+  cur.withStats();
+  req->execute();
   EXPECT_EQ(1, req->getMatchCount());  // only d1 has >= 2 of welcome/here/met
-  req->done();
 }
 
 TEST_F(QueryAnalysisTest, booleanMinMatchWithRequiredRejected) {
   // min_match alongside required/filter clauses is not wired yet.
-  auto* req = LocalReq::create(helper.getSearchEngine());
-  auto& b = *req->topDocs("q").mutable_query()->mutable_boolean();
-  auto& opt = *b.add_optional()->mutable_match();
-  opt.set_field("body_wl");
-  opt.mutable_val()->set_s("thomas");
-  auto& reqd = *b.add_required()->mutable_match();
-  reqd.set_field("body_wl");
-  reqd.mutable_val()->set_s("anderson");
-  b.set_min_match(2);
-  req->collection("main").withStats().execute();
+  auto req = localReq(helper.getSearchEngine());
+  auto& cur = req->collection("main").topDocs("q");
+  auto& mr = cur.mr();
+  cur.rawQuery() = qb::boolean(mr, /*required=*/{qb::match(mr, "body_wl", "anderson")},
+      /*optional=*/{qb::match(mr, "body_wl", "thomas")},
+      /*prohibited=*/{}, /*filter=*/{}, /*minMatch=*/2);
+  cur.withStats();
+  req->execute();
   ASSERT_FALSE(req->responses.empty());
-  EXPECT_TRUE(req->responses[0]->proto.has_error());
-  req->done();
+  EXPECT_TRUE(hasError(req->responses[0]->proto));
 }
 
 TEST_F(QueryAnalysisTest, matchMinShouldMatchManyTerms) {
@@ -276,15 +290,15 @@ TEST_F(QueryAnalysisTest, matchMinShouldMatchScoreIncludesAllMatches) {
   helper.index(flatdoc("id", "x", "body_wl", "alpha beta gamma"), UpdateMessage::COMMIT);
 
   auto score = [&](int minMatch) {
-    auto* req = LocalReq::create(helper.getSearchEngine());
-    auto& m = *req->topDocs("q").mutable_query()->mutable_match();
-    m.set_field("body_wl");
-    m.mutable_val()->set_s("alpha beta gamma");
-    if (minMatch > 0) m.set_min_match(minMatch);
-    req->collection("main").withStats().execute();
+    auto req = localReq(helper.getSearchEngine());
+    auto& cur = req->collection("main").topDocs("q").matchQuery("body_wl", "alpha beta gamma");
+    if (minMatch > 0) std::get<solux::api::Match>(cur.rawQuery().kind).min_match = minMatch;
+    cur.withStats();
+    req->execute();
     EXPECT_EQ(1, req->getMatchCount());
-    float s = req->responses[0]->proto.ops().at("q").docs().columns().at("_score_").col_f().v(0);
-    req->done();
+    const auto* dl = req->docList("q");
+    const auto& scores = std::get<solux::api::ColFloat>(dl->columns.at("_score_").kind).v;
+    float s = scores[0];
     return s;
   };
 

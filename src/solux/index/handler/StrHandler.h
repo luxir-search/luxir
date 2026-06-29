@@ -27,19 +27,19 @@ public:
 
   ~StrHandler() override = default;
 
-  void index(Inverter& inverter, const proto::Val& val) override {
+  void index(Inverter& inverter, const IndexVal& val) override {
     std::string_view v;
 
-    if (val.has_s()) {
-      v = val.s();
+    if (std::holds_alternative<std::string_view>(val.kind)) {
+      v = std::get<std::string_view>(val.kind);
     }
-    else if (val.has_bin()) {
-      v = val.bin();
+    else if (std::holds_alternative<::hpp_proto::bytes_view>(val.kind)) {
+      const auto& b = std::get<::hpp_proto::bytes_view>(val.kind);
+      v = std::string_view((const char*)b.data(), b.size());
     }
-    else if (val.has_arr_s()) {
-      auto& arr = val.arr_s().v();
-      std::span<const std::string* const> values(arr.data(), arr.size());
-      index(inverter, values);
+    else if (std::holds_alternative<solux::api::ArrStr>(val.kind)) {
+      const auto& arr = std::get<solux::api::ArrStr>(val.kind).v;
+      index(inverter, std::span<const std::string_view>(arr.data(), arr.size()));
       return;
     }
     // TODO: handle arrays of binary as well
@@ -61,15 +61,7 @@ public:
     }
   }
 
-  void index(Inverter& inverter, std::span<const std::string* const> vals) override {
-    for (auto val : vals) {
-      indexSingle(inverter, *val);
-    }
-    maxValues = std::max(maxValues, vals.size());
-    // TODO: check if fieldType allows multiple values?
-  }
-
-  void index(Inverter& inverter, std::span<std::string_view> vals) override {
+  void index(Inverter& inverter, std::span<const std::string_view> vals) override {
     for (auto val : vals) {
       indexSingle(inverter, val);
     }

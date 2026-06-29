@@ -52,7 +52,7 @@ public:
   virtual void done(IndexWriter& iw) = 0;
 
   // Internal commit-kind enum.  The proto API exposes commit-or-not via presence of
-  // proto::CommitParams; SILENT_COMMIT and CONSISTENT_COMMIT are placeholders for future
+  // solux::api::CommitParams; SILENT_COMMIT and CONSISTENT_COMMIT are placeholders for future
   // wiring (no internal branches act on them yet).
   enum CommitType {
     NO_COMMIT = 0,         // the default

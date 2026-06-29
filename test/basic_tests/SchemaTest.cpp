@@ -5,17 +5,39 @@
 #include "solux/schema/FieldType.h"
 #include "solux/store/InputStream.h"
 #include "solux/reader/Postings.h"
-#include "protos/solux_types.pb.h"
+#include "solux/api/solux_types.hpp"
+#include "solux/api/build.h"
 #include "test/SoluxTest.h"
 #include "test/CollectionHelper.h"
 #include "test/LocalReq.h"
 #include "test/TestUtils.h"
 
+#include <memory_resource>
+#include <span>
+
 using namespace solux;
 using namespace solux::test;
 
+namespace api = solux::api;
+namespace build = solux::api::build;
+using FieldClass = solux::api::FieldDef::FieldClass;
+
 static std::string schemaFileName(uint64_t gen) {
   return "_schema_" + Postings::getSortableString(gen);
+}
+
+// Build a field's analyzer (tokenizer + optional filters) into `arena`. The concrete
+// FieldDef is non-owning, so the filters span needs arena-backed storage.
+static void setAnalyzer(api::FieldDef& f, std::string_view tokenizer,
+                        std::initializer_list<std::string_view> filters,
+                        std::pmr::memory_resource& arena) {
+  auto& a = f.analyzer.emplace();
+  a.tokenizer = tokenizer;
+  if (filters.size() > 0) {
+    std::string_view* fl = build::allocArray(a.filters, filters.size(), arena);
+    std::size_t i = 0;
+    for (auto x : filters) fl[i++] = x;
+  }
 }
 
 class SchemaTest : public SoluxTest {};
@@ -53,10 +75,12 @@ TEST_F(SchemaTest, collectionHelperClearRestoresDefaultSchema) {
   CollectionHelper ch;
   ch.clear();
 
-  proto::SchemaDef def;
-  auto* f = def.add_fields();
-  f->set_name("custom_text");
-  f->set_field_class(proto::FieldDef::TEXT);
+  std::pmr::monotonic_buffer_resource arena;
+  api::SchemaDef def;
+  api::FieldDef* fields = build::allocArray(def.fields, 1, arena);
+  auto& f = fields[0];
+  f.name = "custom_text";
+  f.field_class = FieldClass::TEXT;
   auto schema = Schema::fromProto(def, ch.collection().getSchema().get());
   ch.collection().setSchema(schema);
   ASSERT_NE(nullptr, ch.collection().getSchema()->getFieldTypePtr("custom_text"));
@@ -85,19 +109,20 @@ TEST_F(SchemaTest, collectionHelperClearSkipsDefaultSchemaReset) {
 
 
 TEST_F(SchemaTest, fromProtoBasic) {
-  proto::SchemaDef def;
+  std::pmr::monotonic_buffer_resource arena;
+  api::SchemaDef def;
+  api::FieldDef* fields = build::allocArray(def.fields, 2, arena);
 
-  auto* f = def.add_fields();
-  f->set_name("title");
-  f->set_field_class(proto::FieldDef::TEXT);
-  f->set_indexed(true);
-  f->mutable_analyzer()->set_tokenizer("whitespace");
-  f->mutable_analyzer()->add_filters("lowercase");
+  auto& f = fields[0];
+  f.name = "title";
+  f.field_class = FieldClass::TEXT;
+  f.indexed = true;
+  setAnalyzer(f, "whitespace", {"lowercase"}, arena);
 
-  auto* f2 = def.add_fields();
-  f2->set_name("price");
-  f2->set_field_class(proto::FieldDef::INT);
-  f2->set_column_stored(true);
+  auto& f2 = fields[1];
+  f2.name = "price";
+  f2.field_class = FieldClass::INT;
+  f2.column_stored = true;
 
   auto schema = Schema::fromProto(def);
 
@@ -115,21 +140,22 @@ TEST_F(SchemaTest, fromProtoBasic) {
 
 
 TEST_F(SchemaTest, inheritance) {
-  proto::SchemaDef def;
+  std::pmr::monotonic_buffer_resource arena;
+  api::SchemaDef def;
+  api::FieldDef* fields = build::allocArray(def.fields, 2, arena);
 
   // Parent: analyzed text with whitespace+lowercase
-  auto* parent = def.add_fields();
-  parent->set_name("_wl");
-  parent->set_field_class(proto::FieldDef::TEXT);
-  parent->set_indexed(true);
-  parent->set_abstract(true);
-  parent->mutable_analyzer()->set_tokenizer("whitespace");
-  parent->mutable_analyzer()->add_filters("lowercase");
+  auto& parent = fields[0];
+  parent.name = "_wl";
+  parent.field_class = FieldClass::TEXT;
+  parent.indexed = true;
+  parent.abstract = true;
+  setAnalyzer(parent, "whitespace", {"lowercase"}, arena);
 
   // Child inherits from _wl
-  auto* child = def.add_fields();
-  child->set_name("title");
-  child->set_parent("_wl");
+  auto& child = fields[1];
+  child.name = "title";
+  child.parent = "_wl";
 
   auto schema = Schema::fromProto(def);
 
@@ -148,21 +174,22 @@ TEST_F(SchemaTest, inheritance) {
 
 
 TEST_F(SchemaTest, inheritanceOverride) {
-  proto::SchemaDef def;
+  std::pmr::monotonic_buffer_resource arena;
+  api::SchemaDef def;
+  api::FieldDef* fields = build::allocArray(def.fields, 2, arena);
 
-  auto* parent = def.add_fields();
-  parent->set_name("_wl");
-  parent->set_field_class(proto::FieldDef::TEXT);
-  parent->set_indexed(true);
-  parent->set_abstract(true);
-  parent->mutable_analyzer()->set_tokenizer("whitespace");
-  parent->mutable_analyzer()->add_filters("lowercase");
+  auto& parent = fields[0];
+  parent.name = "_wl";
+  parent.field_class = FieldClass::TEXT;
+  parent.indexed = true;
+  parent.abstract = true;
+  setAnalyzer(parent, "whitespace", {"lowercase"}, arena);
 
   // Child overrides the analyzer
-  auto* child = def.add_fields();
-  child->set_name("title");
-  child->set_parent("_wl");
-  child->mutable_analyzer()->set_tokenizer("keyword");
+  auto& child = fields[1];
+  child.name = "title";
+  child.parent = "_wl";
+  setAnalyzer(child, "keyword", {}, arena);
 
   auto schema = Schema::fromProto(def);
 
@@ -178,17 +205,19 @@ TEST_F(SchemaTest, inheritanceOverride) {
 
 
 TEST_F(SchemaTest, circularInheritance) {
-  proto::SchemaDef def;
+  std::pmr::monotonic_buffer_resource arena;
+  api::SchemaDef def;
+  api::FieldDef* fields = build::allocArray(def.fields, 2, arena);
 
-  auto* a = def.add_fields();
-  a->set_name("a");
-  a->set_parent("b");
-  a->set_field_class(proto::FieldDef::STRING);
+  auto& a = fields[0];
+  a.name = "a";
+  a.parent = "b";
+  a.field_class = FieldClass::STRING;
 
-  auto* b = def.add_fields();
-  b->set_name("b");
-  b->set_parent("a");
-  b->set_field_class(proto::FieldDef::STRING);
+  auto& b = fields[1];
+  b.name = "b";
+  b.parent = "a";
+  b.field_class = FieldClass::STRING;
 
   EXPECT_THROW(Schema::fromProto(def), std::runtime_error);
 }
@@ -196,25 +225,28 @@ TEST_F(SchemaTest, circularInheritance) {
 
 TEST_F(SchemaTest, mergeMode) {
   // Start with a base schema
-  proto::SchemaDef baseDef;
-  auto* f1 = baseDef.add_fields();
-  f1->set_name("title");
-  f1->set_field_class(proto::FieldDef::TEXT);
-  f1->set_indexed(true);
-  f1->mutable_analyzer()->set_tokenizer("whitespace");
+  std::pmr::monotonic_buffer_resource arena;
+  api::SchemaDef baseDef;
+  api::FieldDef* baseFields = build::allocArray(baseDef.fields, 2, arena);
+  auto& f1 = baseFields[0];
+  f1.name = "title";
+  f1.field_class = FieldClass::TEXT;
+  f1.indexed = true;
+  setAnalyzer(f1, "whitespace", {}, arena);
 
-  auto* f2 = baseDef.add_fields();
-  f2->set_name("author");
-  f2->set_field_class(proto::FieldDef::STRING);
+  auto& f2 = baseFields[1];
+  f2.name = "author";
+  f2.field_class = FieldClass::STRING;
 
   auto baseSchema = Schema::fromProto(baseDef);
 
   // Merge: add a new field, existing "author" should survive
-  proto::SchemaDef mergeDef;
-  auto* f3 = mergeDef.add_fields();
-  f3->set_name("price");
-  f3->set_field_class(proto::FieldDef::INT);
-  f3->set_column_stored(true);
+  api::SchemaDef mergeDef;
+  api::FieldDef* mergeFields = build::allocArray(mergeDef.fields, 1, arena);
+  auto& f3 = mergeFields[0];
+  f3.name = "price";
+  f3.field_class = FieldClass::INT;
+  f3.column_stored = true;
 
   auto mergedSchema = Schema::fromProto(mergeDef, baseSchema.get());
 
@@ -229,10 +261,12 @@ TEST_F(SchemaTest, mergeWithParentFromBase) {
   auto baseSchema = Schema::createDefaultSchema();
 
   // Merge: add "title" that inherits from "_wl" in the base schema
-  proto::SchemaDef mergeDef;
-  auto* f = mergeDef.add_fields();
-  f->set_name("title");
-  f->set_parent("_wl");
+  std::pmr::monotonic_buffer_resource arena;
+  api::SchemaDef mergeDef;
+  api::FieldDef* fields = build::allocArray(mergeDef.fields, 1, arena);
+  auto& f = fields[0];
+  f.name = "title";
+  f.parent = "_wl";
 
   auto merged = Schema::fromProto(mergeDef, baseSchema.get());
 
@@ -256,25 +290,28 @@ TEST_F(SchemaTest, mergeWithParentFromBase) {
 
 TEST_F(SchemaTest, replaceMode) {
   // Base schema with "title" and "author"
-  proto::SchemaDef baseDef;
-  auto* f1 = baseDef.add_fields();
-  f1->set_name("title");
-  f1->set_field_class(proto::FieldDef::TEXT);
-  f1->set_indexed(true);
-  f1->mutable_analyzer()->set_tokenizer("whitespace");
+  std::pmr::monotonic_buffer_resource arena;
+  api::SchemaDef baseDef;
+  api::FieldDef* baseFields = build::allocArray(baseDef.fields, 2, arena);
+  auto& f1 = baseFields[0];
+  f1.name = "title";
+  f1.field_class = FieldClass::TEXT;
+  f1.indexed = true;
+  setAnalyzer(f1, "whitespace", {}, arena);
 
-  auto* f2 = baseDef.add_fields();
-  f2->set_name("author");
-  f2->set_field_class(proto::FieldDef::STRING);
+  auto& f2 = baseFields[1];
+  f2.name = "author";
+  f2.field_class = FieldClass::STRING;
 
   auto baseSchema = Schema::fromProto(baseDef);
 
   // Replace: only "price" remains
-  proto::SchemaDef replaceDef;
-  auto* f3 = replaceDef.add_fields();
-  f3->set_name("price");
-  f3->set_field_class(proto::FieldDef::INT);
-  f3->set_column_stored(true);
+  api::SchemaDef replaceDef;
+  api::FieldDef* replaceFields = build::allocArray(replaceDef.fields, 1, arena);
+  auto& f3 = replaceFields[0];
+  f3.name = "price";
+  f3.field_class = FieldClass::INT;
+  f3.column_stored = true;
 
   auto replacedSchema = Schema::fromProto(replaceDef);  // no base = replace
 
@@ -287,26 +324,28 @@ TEST_F(SchemaTest, replaceMode) {
 TEST_F(SchemaTest, inheritStoredFromParent) {
   // A child field that inherits from a STORED parent picks up the STORED
   // flag, and the resulting FieldType has STORED set.
-  proto::SchemaDef def;
+  std::pmr::monotonic_buffer_resource arena;
+  api::SchemaDef def;
+  api::FieldDef* fields = build::allocArray(def.fields, 3, arena);
 
-  auto* parent = def.add_fields();
-  parent->set_name("_body_");
-  parent->set_field_class(proto::FieldDef::TEXT);
-  parent->set_indexed(true);
-  parent->set_abstract(true);
-  parent->set_stored(true);
-  parent->mutable_analyzer()->set_tokenizer("whitespace");
+  auto& parent = fields[0];
+  parent.name = "_body_";
+  parent.field_class = FieldClass::TEXT;
+  parent.indexed = true;
+  parent.abstract = true;
+  parent.stored = true;
+  setAnalyzer(parent, "whitespace", {}, arena);
 
   // Child: no explicit stored flag; should inherit true.
-  auto* child = def.add_fields();
-  child->set_name("title");
-  child->set_parent("_body_");
+  auto& child = fields[1];
+  child.name = "title";
+  child.parent = "_body_";
 
   // Child that explicitly disables stored (override wins).
-  auto* child2 = def.add_fields();
-  child2->set_name("summary");
-  child2->set_parent("_body_");
-  child2->set_stored(false);
+  auto& child2 = fields[2];
+  child2.name = "summary";
+  child2.parent = "_body_";
+  child2.stored = false;
 
   auto schema = Schema::fromProto(def);
 
@@ -332,32 +371,34 @@ TEST_F(SchemaTest, defaultTSuffixIsStored) {
 TEST_F(SchemaTest, storedRoundtripsThroughProto) {
   // Build a schema with STORED on TEXT and STRING, serialize, deserialize,
   // and verify STORED survives.
-  proto::SchemaDef def;
-  auto* t = def.add_fields();
-  t->set_name("body");
-  t->set_field_class(proto::FieldDef::TEXT);
-  t->set_indexed(true);
-  t->set_stored(true);
-  auto* s = def.add_fields();
-  s->set_name("tag");
-  s->set_field_class(proto::FieldDef::STRING);
-  s->set_indexed(true);
-  s->set_column_stored(false);
-  s->set_stored(true);
+  std::pmr::monotonic_buffer_resource arena;
+  api::SchemaDef def;
+  api::FieldDef* fields = build::allocArray(def.fields, 3, arena);
+  auto& t = fields[0];
+  t.name = "body";
+  t.field_class = FieldClass::TEXT;
+  t.indexed = true;
+  t.stored = true;
+  auto& s = fields[1];
+  s.name = "tag";
+  s.field_class = FieldClass::STRING;
+  s.indexed = true;
+  s.column_stored = false;
+  s.stored = true;
   // A non-stored field for contrast.
-  auto* p = def.add_fields();
-  p->set_name("plain");
-  p->set_field_class(proto::FieldDef::TEXT);
-  p->set_indexed(true);
-  p->set_stored(false);
+  auto& p = fields[2];
+  p.name = "plain";
+  p.field_class = FieldClass::TEXT;
+  p.indexed = true;
+  p.stored = false;
 
   auto original = Schema::fromProto(def);
   EXPECT_TRUE(original->getFieldTypePtr("body")->isStored());
   EXPECT_TRUE(original->getFieldTypePtr("tag")->isStored());
   EXPECT_FALSE(original->getFieldTypePtr("plain")->isStored());
 
-  proto::SchemaDef round;
-  original->toProto(&round);
+  api::SchemaDef round;
+  original->toProto(&round, arena);
   auto loaded = Schema::fromProto(round);
   EXPECT_TRUE(loaded->getFieldTypePtr("body")->isStored());
   EXPECT_TRUE(loaded->getFieldTypePtr("tag")->isStored());
@@ -367,26 +408,28 @@ TEST_F(SchemaTest, storedRoundtripsThroughProto) {
 TEST_F(SchemaTest, storedResourceRoundtripsThroughProto) {
   // A custom stored_resource survives toProto -> fromProto; unset fields
   // keep the default "_stored_".
-  proto::SchemaDef def;
-  auto* custom = def.add_fields();
-  custom->set_name("paragraphs");
-  custom->set_field_class(proto::FieldDef::TEXT);
-  custom->set_indexed(true);
-  custom->set_stored(true);
-  custom->set_stored_resource("_stored_embeddings_");
+  std::pmr::monotonic_buffer_resource arena;
+  api::SchemaDef def;
+  api::FieldDef* fields = build::allocArray(def.fields, 2, arena);
+  auto& custom = fields[0];
+  custom.name = "paragraphs";
+  custom.field_class = FieldClass::TEXT;
+  custom.indexed = true;
+  custom.stored = true;
+  custom.stored_resource = "_stored_embeddings_";
 
-  auto* defaulted = def.add_fields();
-  defaulted->set_name("body");
-  defaulted->set_field_class(proto::FieldDef::TEXT);
-  defaulted->set_indexed(true);
-  defaulted->set_stored(true);
+  auto& defaulted = fields[1];
+  defaulted.name = "body";
+  defaulted.field_class = FieldClass::TEXT;
+  defaulted.indexed = true;
+  defaulted.stored = true;
 
   auto s1 = Schema::fromProto(def);
   EXPECT_EQ("_stored_embeddings_", s1->getFieldTypePtr("paragraphs")->storedResource_);
   EXPECT_EQ("_stored_", s1->getFieldTypePtr("body")->storedResource_);
 
-  proto::SchemaDef round;
-  s1->toProto(&round);
+  api::SchemaDef round;
+  s1->toProto(&round, arena);
   auto s2 = Schema::fromProto(round);
   EXPECT_EQ("_stored_embeddings_", s2->getFieldTypePtr("paragraphs")->storedResource_);
   EXPECT_EQ("_stored_", s2->getFieldTypePtr("body")->storedResource_);
@@ -395,24 +438,26 @@ TEST_F(SchemaTest, storedResourceRoundtripsThroughProto) {
 TEST_F(SchemaTest, storedResourceInheritedFromParent) {
   // A child inheriting from a parent with a non-default stored_resource
   // picks up the parent's choice.  Explicit override on the child wins.
-  proto::SchemaDef def;
+  std::pmr::monotonic_buffer_resource arena;
+  api::SchemaDef def;
+  api::FieldDef* fields = build::allocArray(def.fields, 3, arena);
 
-  auto* parent = def.add_fields();
-  parent->set_name("_emb_");
-  parent->set_field_class(proto::FieldDef::TEXT);
-  parent->set_indexed(true);
-  parent->set_abstract(true);
-  parent->set_stored(true);
-  parent->set_stored_resource("_stored_embeddings_");
+  auto& parent = fields[0];
+  parent.name = "_emb_";
+  parent.field_class = FieldClass::TEXT;
+  parent.indexed = true;
+  parent.abstract = true;
+  parent.stored = true;
+  parent.stored_resource = "_stored_embeddings_";
 
-  auto* inherit = def.add_fields();
-  inherit->set_name("paragraphs");
-  inherit->set_parent("_emb_");
+  auto& inherit = fields[1];
+  inherit.name = "paragraphs";
+  inherit.parent = "_emb_";
 
-  auto* override_ = def.add_fields();
-  override_->set_name("captions");
-  override_->set_parent("_emb_");
-  override_->set_stored_resource("_stored_captions_");
+  auto& override_ = fields[2];
+  override_.name = "captions";
+  override_.parent = "_emb_";
+  override_.stored_resource = "_stored_captions_";
 
   auto s = Schema::fromProto(def);
   EXPECT_EQ("_stored_embeddings_", s->getFieldTypePtr("paragraphs")->storedResource_);
@@ -423,13 +468,15 @@ TEST_F(SchemaTest, mergePreservesStoredResource) {
   // MERGE-mode fromProto rebuilds every FieldType from resolved data.  That
   // rebuild must carry the base schema's stored_resource forward; otherwise
   // base fields silently lose their custom column-family assignment.
-  proto::SchemaDef baseDef;
-  auto* b = baseDef.add_fields();
-  b->set_name("body");
-  b->set_field_class(proto::FieldDef::TEXT);
-  b->set_indexed(true);
-  b->set_stored(true);
-  b->set_stored_resource("_stored_embeddings_");
+  std::pmr::monotonic_buffer_resource arena;
+  api::SchemaDef baseDef;
+  api::FieldDef* baseFields = build::allocArray(baseDef.fields, 1, arena);
+  auto& b = baseFields[0];
+  b.name = "body";
+  b.field_class = FieldClass::TEXT;
+  b.indexed = true;
+  b.stored = true;
+  b.stored_resource = "_stored_embeddings_";
   auto base = Schema::fromProto(baseDef);
   ASSERT_EQ("_stored_embeddings_", base->getFieldTypePtr("body")->storedResource_);
 
@@ -437,10 +484,11 @@ TEST_F(SchemaTest, mergePreservesStoredResource) {
   // survive a merge that doesn't mention the field.
   base->getFieldTypePtr("body")->storedResource_ = "_stored_programmatic_";
 
-  proto::SchemaDef mergeDef;
-  auto* f = mergeDef.add_fields();
-  f->set_name("price");
-  f->set_field_class(proto::FieldDef::INT);
+  api::SchemaDef mergeDef;
+  api::FieldDef* mergeFields = build::allocArray(mergeDef.fields, 1, arena);
+  auto& f = mergeFields[0];
+  f.name = "price";
+  f.field_class = FieldClass::INT;
 
   auto merged = Schema::fromProto(mergeDef, base.get());
   EXPECT_EQ("_stored_programmatic_", merged->getFieldTypePtr("body")->storedResource_);
@@ -452,8 +500,9 @@ TEST_F(SchemaTest, roundtrip) {
   auto original = Schema::createDefaultSchema();
 
   // Serialize to proto
-  proto::SchemaDef def;
-  original->toProto(&def);
+  std::pmr::monotonic_buffer_resource arena;
+  api::SchemaDef def;
+  original->toProto(&def, arena);
 
   // Deserialize back
   auto roundtripped = Schema::fromProto(def);
@@ -479,16 +528,20 @@ TEST_F(SchemaTest, indexAndSearchWithExplicitField) {
   // Set a custom schema on the collection: "title" as TEXT with whitespace+lowercase
   auto defaultSchema = Schema::createDefaultSchema();
 
-  proto::SchemaDef customDef;
-  defaultSchema->toProto(&customDef);
+  std::pmr::monotonic_buffer_resource arena;
+  api::SchemaDef defaults;
+  defaultSchema->toProto(&defaults, arena);
 
   // Add an explicit "title" field as TEXT with whitespace+lowercase
-  auto* titleField = customDef.add_fields();
-  titleField->set_name("title");
-  titleField->set_field_class(proto::FieldDef::TEXT);
-  titleField->set_indexed(true);
-  titleField->mutable_analyzer()->set_tokenizer("whitespace");
-  titleField->mutable_analyzer()->add_filters("lowercase");
+  std::size_t n = defaults.fields.size();
+  api::SchemaDef customDef;
+  api::FieldDef* fields = build::allocArray(customDef.fields, n + 1, arena);
+  for (std::size_t i = 0; i < n; i++) fields[i] = defaults.fields[i];
+  auto& titleField = fields[n];
+  titleField.name = "title";
+  titleField.field_class = FieldClass::TEXT;
+  titleField.indexed = true;
+  setAnalyzer(titleField, "whitespace", {"lowercase"}, arena);
 
   auto newSchema = Schema::fromProto(customDef);
 
@@ -509,15 +562,16 @@ TEST_F(SchemaTest, indexAndSearchWithExplicitField) {
 
   // Search for "hello" should match
   auto& engine = ch.getSearchEngine();
-  auto* req = LocalReq::create(engine);
+  auto req = localReq(engine);
   req->collection("main")
+     .topDocs("q")
      .matchQuery("title", "hello")
      .limit(10)
-     .withStats()
-     .execute();
+     .withStats();
+  req->execute();
 
+  ASSERT_OK(req);
   EXPECT_EQ(1, req->getMatchCount());
-  req->done();
 
   // Clean up
   ch.clear();
@@ -526,22 +580,24 @@ TEST_F(SchemaTest, indexAndSearchWithExplicitField) {
 
 
 TEST_F(SchemaTest, fieldClassDefaults) {
-  proto::SchemaDef def;
+  std::pmr::monotonic_buffer_resource arena;
+  api::SchemaDef def;
+  api::FieldDef* fields = build::allocArray(def.fields, 3, arena);
 
   // STRING field with no explicit flags - should get default indexed=true, column_stored=true
-  auto* f1 = def.add_fields();
-  f1->set_name("str_field");
-  f1->set_field_class(proto::FieldDef::STRING);
+  auto& f1 = fields[0];
+  f1.name = "str_field";
+  f1.field_class = FieldClass::STRING;
 
   // INT field with no explicit flags - should get default indexed=false, column_stored=true
-  auto* f2 = def.add_fields();
-  f2->set_name("int_field");
-  f2->set_field_class(proto::FieldDef::INT);
+  auto& f2 = fields[1];
+  f2.name = "int_field";
+  f2.field_class = FieldClass::INT;
 
   // TEXT field with no explicit flags - should get default indexed=true, column_stored=false
-  auto* f3 = def.add_fields();
-  f3->set_name("text_field");
-  f3->set_field_class(proto::FieldDef::TEXT);
+  auto& f3 = fields[2];
+  f3.name = "text_field";
+  f3.field_class = FieldClass::TEXT;
 
   auto schema = Schema::fromProto(def);
 
@@ -563,11 +619,13 @@ TEST_F(SchemaTest, fieldClassDefaults) {
 
 
 TEST_F(SchemaTest, missingFieldClass) {
-  proto::SchemaDef def;
+  std::pmr::monotonic_buffer_resource arena;
+  api::SchemaDef def;
+  api::FieldDef* fields = build::allocArray(def.fields, 1, arena);
 
   // Field with no field_class and no parent - should error
-  auto* f = def.add_fields();
-  f->set_name("broken");
+  auto& f = fields[0];
+  f.name = "broken";
 
   EXPECT_THROW(Schema::fromProto(def), std::runtime_error);
 }
@@ -579,13 +637,14 @@ TEST_F(SchemaTest, schemaPersistence) {
 
   // Set a custom schema with an explicit "title" field
   auto defaultSchema = Schema::createDefaultSchema();
-  proto::SchemaDef customDef;
-  auto* titleField = customDef.add_fields();
-  titleField->set_name("title");
-  titleField->set_field_class(proto::FieldDef::TEXT);
-  titleField->set_indexed(true);
-  titleField->mutable_analyzer()->set_tokenizer("whitespace");
-  titleField->mutable_analyzer()->add_filters("lowercase");
+  std::pmr::monotonic_buffer_resource arena;
+  api::SchemaDef customDef;
+  api::FieldDef* fields = build::allocArray(customDef.fields, 1, arena);
+  auto& titleField = fields[0];
+  titleField.name = "title";
+  titleField.field_class = FieldClass::TEXT;
+  titleField.indexed = true;
+  setAnalyzer(titleField, "whitespace", {"lowercase"}, arena);
 
   auto newSchema = Schema::fromProto(customDef, defaultSchema.get());
   ch.collection().setSchema(newSchema);
@@ -603,15 +662,16 @@ TEST_F(SchemaTest, schemaPersistence) {
 
   // Verify we can parse the persisted schema
   InputStream is = file->getInputStream();
-  proto::SchemaDef persistedDef;
-  ASSERT_TRUE(persistedDef.ParseFromArray(is.ptr(), (int)is.left()));
+  api::SchemaDef persistedDef;
+  std::span<const char> persistedBytes(is.ptr(), (size_t)is.left());
+  ASSERT_TRUE(api::decode(persistedDef, std::as_bytes(persistedBytes), arena));
 
   // The persisted def should contain "title" field
   bool foundTitle = false;
-  for (int i = 0; i < persistedDef.fields_size(); i++) {
-    if (persistedDef.fields(i).name() == "title") {
+  for (size_t i = 0; i < persistedDef.fields.size(); i++) {
+    if (persistedDef.fields[i].name == "title") {
       foundTitle = true;
-      EXPECT_EQ(proto::FieldDef::TEXT, persistedDef.fields(i).field_class());
+      EXPECT_EQ(FieldClass::TEXT, *persistedDef.fields[i].field_class);
       break;
     }
   }
@@ -627,21 +687,24 @@ TEST_F(SchemaTest, schemaGenIncrements) {
   ch.clear();
 
   auto defaultSchema = Schema::createDefaultSchema();
+  std::pmr::monotonic_buffer_resource arena;
 
   // Set schema first time
-  proto::SchemaDef def1;
-  auto* f1 = def1.add_fields();
-  f1->set_name("field1");
-  f1->set_field_class(proto::FieldDef::STRING);
+  api::SchemaDef def1;
+  api::FieldDef* f1arr = build::allocArray(def1.fields, 1, arena);
+  auto& f1 = f1arr[0];
+  f1.name = "field1";
+  f1.field_class = FieldClass::STRING;
   auto schema1 = Schema::fromProto(def1, defaultSchema.get());
   ch.collection().setSchema(schema1);
   uint64_t gen1 = ch.collection().getSchema()->gen_;
 
   // Set schema second time
-  proto::SchemaDef def2;
-  auto* f2 = def2.add_fields();
-  f2->set_name("field2");
-  f2->set_field_class(proto::FieldDef::INT);
+  api::SchemaDef def2;
+  api::FieldDef* f2arr = build::allocArray(def2.fields, 1, arena);
+  auto& f2 = f2arr[0];
+  f2.name = "field2";
+  f2.field_class = FieldClass::INT;
   auto schema2 = Schema::fromProto(def2, ch.collection().getSchema().get());
   ch.collection().setSchema(schema2);
   uint64_t gen2 = ch.collection().getSchema()->gen_;
@@ -667,12 +730,14 @@ TEST_F(SchemaTest, schemaGenWrittenToIndexInfo) {
 
   // Set a custom schema
   auto defaultSchema = Schema::createDefaultSchema();
-  proto::SchemaDef customDef;
-  auto* f = customDef.add_fields();
-  f->set_name("title");
-  f->set_field_class(proto::FieldDef::TEXT);
-  f->set_indexed(true);
-  f->mutable_analyzer()->set_tokenizer("whitespace");
+  std::pmr::monotonic_buffer_resource arena;
+  api::SchemaDef customDef;
+  api::FieldDef* fields = build::allocArray(customDef.fields, 1, arena);
+  auto& f = fields[0];
+  f.name = "title";
+  f.field_class = FieldClass::TEXT;
+  f.indexed = true;
+  setAnalyzer(f, "whitespace", {}, arena);
 
   auto newSchema = Schema::fromProto(customDef, defaultSchema.get());
   ch.collection().setSchema(newSchema);
@@ -689,13 +754,14 @@ TEST_F(SchemaTest, schemaGenWrittenToIndexInfo) {
   ASSERT_NE(nullptr, indexInfoFile.get());
 
   InputStream is = indexInfoFile->getInputStream();
-  proto::IndexInfo indexInfo;
-  ASSERT_TRUE(indexInfo.ParseFromArray(is.ptr(), (int)is.left()));
-  EXPECT_EQ(expectedGen, indexInfo.schema_gen()) << "IndexInfo should contain the current schema_gen";
+  api::IndexInfo indexInfo;
+  std::span<const char> indexInfoBytes(is.ptr(), (size_t)is.left());
+  ASSERT_TRUE(api::decode(indexInfo, std::as_bytes(indexInfoBytes), arena));
+  EXPECT_EQ(expectedGen, indexInfo.schema_gen) << "IndexInfo should contain the current schema_gen";
 
   // Check that SegmentInfo also has schema_gen
-  ASSERT_GT(indexInfo.segments_size(), 0);
-  EXPECT_EQ(expectedGen, indexInfo.segments(0).schema_gen()) << "SegmentInfo should have schema_gen";
+  ASSERT_GT(indexInfo.segments.size(), 0u);
+  EXPECT_EQ(expectedGen, indexInfo.segments[0].schema_gen) << "SegmentInfo should have schema_gen";
 
   ch.clear();
   ch.collection().setSchema(Schema::createDefaultSchema());
@@ -708,13 +774,14 @@ TEST_F(SchemaTest, schemaLoadOnRestart) {
 
   // Set a custom schema with "title" field
   auto defaultSchema = Schema::createDefaultSchema();
-  proto::SchemaDef customDef;
-  auto* f = customDef.add_fields();
-  f->set_name("title");
-  f->set_field_class(proto::FieldDef::TEXT);
-  f->set_indexed(true);
-  f->mutable_analyzer()->set_tokenizer("whitespace");
-  f->mutable_analyzer()->add_filters("lowercase");
+  std::pmr::monotonic_buffer_resource arena;
+  api::SchemaDef customDef;
+  api::FieldDef* fields = build::allocArray(customDef.fields, 1, arena);
+  auto& f = fields[0];
+  f.name = "title";
+  f.field_class = FieldClass::TEXT;
+  f.indexed = true;
+  setAnalyzer(f, "whitespace", {"lowercase"}, arena);
 
   auto newSchema = Schema::fromProto(customDef, defaultSchema.get());
   ch.collection().setSchema(newSchema);
@@ -748,32 +815,34 @@ TEST_F(SchemaTest, schemaLoadOnRestart) {
 
 TEST_F(SchemaTest, sourceDef) {
   // Verify that sourceDef_ preserves the original SchemaDef (including parent references)
-  proto::SchemaDef def;
+  std::pmr::monotonic_buffer_resource arena;
+  api::SchemaDef def;
+  api::FieldDef* fields = build::allocArray(def.fields, 2, arena);
 
-  auto* parent = def.add_fields();
-  parent->set_name("_wl");
-  parent->set_field_class(proto::FieldDef::TEXT);
-  parent->set_indexed(true);
-  parent->set_abstract(true);
-  parent->mutable_analyzer()->set_tokenizer("whitespace");
-  parent->mutable_analyzer()->add_filters("lowercase");
+  auto& parent = fields[0];
+  parent.name = "_wl";
+  parent.field_class = FieldClass::TEXT;
+  parent.indexed = true;
+  parent.abstract = true;
+  setAnalyzer(parent, "whitespace", {"lowercase"}, arena);
 
-  auto* child = def.add_fields();
-  child->set_name("title");
-  child->set_parent("_wl");
+  auto& child = fields[1];
+  child.name = "title";
+  child.parent = "_wl";
 
   auto schema = Schema::fromProto(def);
   ASSERT_FALSE(schema->sourceDef_.empty());
 
   // Parse back the sourceDef and verify it has parent references
-  proto::SchemaDef roundtripped;
-  ASSERT_TRUE(roundtripped.ParseFromString(schema->sourceDef_));
+  api::SchemaDef roundtripped;
+  std::span<const char> sourceBytes(schema->sourceDef_.data(), schema->sourceDef_.size());
+  ASSERT_TRUE(api::decode(roundtripped, std::as_bytes(sourceBytes), arena));
 
   bool foundChild = false;
-  for (int i = 0; i < roundtripped.fields_size(); i++) {
-    if (roundtripped.fields(i).name() == "title") {
+  for (size_t i = 0; i < roundtripped.fields.size(); i++) {
+    if (roundtripped.fields[i].name == "title") {
       foundChild = true;
-      EXPECT_EQ("_wl", roundtripped.fields(i).parent())
+      EXPECT_EQ("_wl", roundtripped.fields[i].parent)
         << "sourceDef should preserve parent references";
       break;
     }
@@ -791,12 +860,14 @@ TEST_F(SchemaTest, loadSchemaAfterOldFileDeleted) {
   ch.clear();
 
   auto baseSchema = Schema::createDefaultSchema();
+  std::pmr::monotonic_buffer_resource arena;
 
   // setSchema - writes _schema.<gen1>
-  proto::SchemaDef def1;
-  auto* f1 = def1.add_fields();
-  f1->set_name("field1");
-  f1->set_field_class(proto::FieldDef::STRING);
+  api::SchemaDef def1;
+  api::FieldDef* f1arr = build::allocArray(def1.fields, 1, arena);
+  auto& f1 = f1arr[0];
+  f1.name = "field1";
+  f1.field_class = FieldClass::STRING;
   ch.collection().setSchema(Schema::fromProto(def1, baseSchema.get()));
   uint64_t gen1 = ch.collection().getSchema()->gen_;
 
@@ -808,17 +879,19 @@ TEST_F(SchemaTest, loadSchemaAfterOldFileDeleted) {
   EXPECT_FALSE(ch.collection().loadSchema()) << "Should fail with no schema files";
 
   // Now do two setSchema calls so the first gen's file gets cleaned up naturally
-  proto::SchemaDef def2;
-  auto* f2 = def2.add_fields();
-  f2->set_name("field2");
-  f2->set_field_class(proto::FieldDef::INT);
+  api::SchemaDef def2;
+  api::FieldDef* f2arr = build::allocArray(def2.fields, 1, arena);
+  auto& f2 = f2arr[0];
+  f2.name = "field2";
+  f2.field_class = FieldClass::INT;
   ch.collection().setSchema(Schema::fromProto(def2, baseSchema.get()));
 
-  proto::SchemaDef def3;
-  auto* f3 = def3.add_fields();
-  f3->set_name("field3");
-  f3->set_field_class(proto::FieldDef::INT);
-  f3->set_column_stored(true);
+  api::SchemaDef def3;
+  api::FieldDef* f3arr = build::allocArray(def3.fields, 1, arena);
+  auto& f3 = f3arr[0];
+  f3.name = "field3";
+  f3.field_class = FieldClass::INT;
+  f3.column_stored = true;
   ch.collection().setSchema(Schema::fromProto(def3, ch.collection().getSchema().get()));
   uint64_t gen3 = ch.collection().getSchema()->gen_;
 

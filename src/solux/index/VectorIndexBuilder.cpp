@@ -270,12 +270,12 @@ VectorIndexBuilder::collectEligibleFields() {
   return out;
 }
 
-std::vector<proto::AuxIndexInfo>
+std::vector<AuxInfo>
 VectorIndexBuilder::build(const std::vector<std::string>& selectors,
                           const boost::unordered_flat_set<std::string>& skipNames,
                           std::vector<std::string>& outFilesToSync,
                           BuildSite buildSite) {
-  std::vector<proto::AuxIndexInfo> result;
+  std::vector<AuxInfo> result;
   if (selectors.empty()) return result;
   if (!buildFaissIvfPqAuxIndexes) {
     LOG_TRACE("VectorIndexBuilder: vector aux build disabled; flat kNN uses column scan");
@@ -321,7 +321,7 @@ VectorIndexBuilder::matchingOverlayNames(const std::vector<std::string>& selecto
   return out;
 }
 
-std::optional<proto::AuxIndexInfo>
+std::optional<AuxInfo>
 VectorIndexBuilder::buildField(std::string_view fieldName,
                                const VectorFieldType& ft,
                                std::vector<std::string>& outFilesToSync,
@@ -333,7 +333,7 @@ VectorIndexBuilder::buildField(std::string_view fieldName,
   return buildIvfPqField(fieldName, ft, outFilesToSync, buildSite);
 }
 
-std::optional<proto::AuxIndexInfo>
+std::optional<AuxInfo>
 VectorIndexBuilder::buildIvfPqField(std::string_view fieldName,
                                     const VectorFieldType& ft,
                                     std::vector<std::string>& outFilesToSync,
@@ -501,18 +501,22 @@ VectorIndexBuilder::buildIvfPqField(std::string_view fieldName,
     dir_.finishFile(*file);
   }
 
-  proto::AuxIndexInfo info;
-  info.set_kind(std::string(KIND));
-  info.set_field(std::string(fieldName));
-  info.set_name(std::move(auxName));
-  info.set_gen(overlayGen_);
-  info.add_files(faissFile);
-  info.set_opaque_meta(makeVectorMeta(
-      dims, ft, VectorAuxMeta::ENGINE_IVFPQ, nlist, nprobe, pqM, pqBits));
+  AuxInfo info;
+  info.kind = std::string(KIND);
+  info.field = std::string(fieldName);
+  info.name = std::move(auxName);
+  info.gen = overlayGen_;
+  info.files.push_back(faissFile);
+  {
+    std::string meta = makeVectorMeta(
+        dims, ft, VectorAuxMeta::ENGINE_IVFPQ, nlist, nprobe, pqM, pqBits);
+    info.opaque_meta.assign((const std::byte*)meta.data(),
+                            (const std::byte*)meta.data() + meta.size());
+  }
 
   LOG_TRACE("VectorIndexBuilder: built IVF+PQ {} ntotal={} dims={} metric={} "
             "nlist={} M={} bits={} file={}",
-            info.name(), index->ntotal, dims, (int)ft.metric_,
+            info.name, index->ntotal, dims, (int)ft.metric_,
             nlist, pqM, pqBits, faissFile);
 
   return info;

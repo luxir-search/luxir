@@ -20,7 +20,7 @@
 #include <vector>
 
 #include "AuxReader.h"
-#include "protos/solux_types.pb.h"
+#include "solux/api/solux_types.hpp"
 #include "solux/store/Directory.h"
 #include "solux/store/InputStream.h"
 #include "solux/util/log.h"
@@ -36,7 +36,7 @@ namespace solux {
 SOLUX_PACKED_START
 struct VectorAuxMeta {
   int32_t dims = 0;
-  int32_t metric = 0;       // raw proto::VectorParams::Metric value
+  int32_t metric = 0;       // raw solux::api::VectorParams::Metric value
   int32_t cosineNormalizeColumnOnRescore = 0;  // bool: raw cosine column, renorm at rescore
   int32_t engine = 0;       // ENGINE_IVFPQ
   int32_t nlist = 0;        // IVF only
@@ -358,15 +358,15 @@ public:
   /// file is missing and missingFileOK is true (caller should re-parse
   /// IndexInfo and retry).
   static std::shared_ptr<VectorAuxReader> open(Directory& dir,
-                                               const proto::AuxIndexInfo& info,
+                                               const solux::api::AuxIndexInfo& info,
                                                bool missingFileOK) {
     // V1 layout: exactly one file per vector aux entry.
-    if (info.files_size() != 1) {
+    if (info.files.size() != 1) {
       throw std::runtime_error(std::format(
         "VectorAuxReader: expected 1 file, got {} for aux '{}'",
-        info.files_size(), info.name()));
+        info.files.size(), info.name));
     }
-    std::string_view fname = info.files(0);
+    std::string_view fname = info.files[0];
 
     // expectSynced=true: aux files were fsynced before the IndexInfo that
     // references them was published, same contract as segment files.
@@ -374,15 +374,15 @@ public:
     if (file == nullptr) {
       if (missingFileOK) {
         LOG_TRACE("VectorAuxReader::open: file {} missing for aux '{}', will retry",
-                  fname, info.name());
+                  fname, info.name);
         return nullptr;
       }
       throw std::filesystem::filesystem_error(
-        std::format("Missing aux index file '{}' for aux '{}'", fname, info.name()),
+        std::format("Missing aux index file '{}' for aux '{}'", fname, info.name),
         std::make_error_code(std::errc::no_such_file_or_directory));
     }
 
-    VectorAuxMeta meta = VectorAuxMeta::fromBytes(info.opaque_meta(), info.name());
+    VectorAuxMeta meta = VectorAuxMeta::fromBytes(std::string_view((const char*)info.opaque_meta.data(), info.opaque_meta.size()), info.name);
 
     // Residency rule: index data must NOT be force-resident.  IVF/IVF+PQ list
     // payloads are served zero-copy from the file's memory view via
@@ -403,8 +403,8 @@ public:
     // Likely tiering once past v1: brute-force-over-column for small segments,
     // HNSW for RAM-fit mid-size, IVF + mmap lists for large.
     return std::make_shared<VectorAuxReader>(
-      std::string(info.name()), std::string(info.field()),
-      info.gen(), info.built_core_gen(), std::move(file), meta);
+      std::string(info.name), std::string(info.field),
+      info.gen, info.built_core_gen, std::move(file), meta);
   }
 
 private:

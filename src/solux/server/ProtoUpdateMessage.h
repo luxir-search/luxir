@@ -1,36 +1,61 @@
 #pragma once
 
+#include <memory>
+#include <memory_resource>
+#include <string>
+
 #include "solux/index/UpdateMessage.h"
-#include "protos/solux.grpc.pb.h"
+#include "solux/api/build.h"
 
 namespace solux {
 
 class ProtoUpdateMessage : public UpdateMessage {
+public:
+  using RequestProto = solux::api::UpdateRequest;
+  using ResponseProto = solux::api::UpdateResponse;
+  using ResponseStatus = solux::api::UpdateResponse_::Status;
+  using Error = solux::api::UpdateResponse_::Error;
+
 private:
   // response is created on-demand.
-  proto::UpdateResponse* response;  // The response object is created in the same arena as the request.
+  std::unique_ptr<ResponseProto> ownedResponse;
+  ResponseProto* response;
+  // The response is NON-OWNING; its message data (request_id, error strings, ids) and the
+  // variable-count errors/ids arrays are backed by this monotonic arena. Update processing
+  // for one message is single-threaded, so a plain monotonic resource suffices.
+  std::pmr::monotonic_buffer_resource mr_;
+  solux::api::build::SpanBuilder<Error> errors_{mr_};
+  solux::api::build::SpanBuilder<std::string_view> ids_{mr_};
 
-  void initResponse(proto::UpdateResponse* rsp) {
-    rsp->set_request_id(req->request_id());
-    rsp->set_status(proto::UpdateResponse::OK);  // default status
+  void initResponse(ResponseProto* rsp) {
+    rsp->request_id = solux::api::build::arenaBytes(
+        mr_, std::span<const std::byte>(req->request_id.data(), req->request_id.size()));
+    rsp->status = ResponseStatus::OK;  // default status
   }
 
 public:
-  proto::UpdateRequest* req;  // The request object may become unavailable after the callback is called
+  // Build-side helpers: errors/ids accumulate at unknown count; finishResponse() seals them
+  // into the response spans. Transient strings are copied into the response arena.
+  std::pmr::memory_resource& responseArena() { return mr_; }
+  Error& addError() { return errors_.emplace_back(); }
+  void addId(std::string_view id) { ids_.push_back(solux::api::build::arenaStr(mr_, id)); }
+  void clearIds() { ids_.clear(); }
 
-  ProtoUpdateMessage(proto::UpdateRequest* req, proto::UpdateResponse* rsp=nullptr) : response(rsp), req(req) {
+  const RequestProto* req;  // The request object may become unavailable after the callback is called
+
+  ProtoUpdateMessage(const RequestProto* req, ResponseProto* rsp=nullptr) : response(rsp), req(req) {
     if (response != nullptr) {
       // A caller-supplied response (unary path) gets the same initialization an
       // on-demand one gets in getResponse().
       initResponse(response);
     }
-    if (req->has_commit()) {
+    if (req->commit.has_value()) {
       commit = COMMIT;
-      const auto& params = req->commit();
-      commit_within = params.commit_within_us();
-      waitForMerges = params.wait_for_merges();
-      buildAuxIndexes.reserve(params.build_aux_indexes_size());
-      for (const auto& name : params.build_aux_indexes()) {
+      const auto& params = *req->commit;
+      commit_within = params.commit_within_us;
+      waitForMerges = params.wait_for_merges;
+      buildAuxIndexes.reserve(params.build_aux_indexes.size());
+      for (const auto& name : params.build_aux_indexes) {
         buildAuxIndexes.emplace_back(name);
       }
     } else {
@@ -38,10 +63,10 @@ public:
     }
   }
 
-  proto::UpdateResponse* getResponse() {
+  ResponseProto* getResponse() {
     if (response == nullptr) {
-      assert(req->GetArena() != nullptr);
-      response = google::protobuf::Arena::Create<proto::UpdateResponse>(req->GetArena());
+      ownedResponse = std::make_unique<ResponseProto>();
+      response = ownedResponse.get();
       initResponse(response);
     }
     return response;
@@ -51,13 +76,16 @@ public:
   // unexpected exceptions caught by the update graph) into the response.  Doc-level
   // errors are already recorded during handle().  Call once processing is complete,
   // typically from done().
-  proto::UpdateResponse* finishResponse() {
+  ResponseProto* finishResponse() {
     auto* rsp = getResponse();
-    rsp->set_update_version(updateVersion);
+    rsp->update_version = updateVersion;
     if (result.errored()) {
-      rsp->set_status(proto::UpdateResponse::ERROR);
-      rsp->set_error_message(std::string(result.what()));
+      rsp->status = ResponseStatus::ERROR;
+      rsp->error_message = solux::api::build::arenaStr(mr_, result.what());
     }
+    // Seal the accumulated errors/ids into the non-owning response spans.
+    rsp->errors = errors_.finish();
+    rsp->ids = ids_.finish();
     return rsp;
   }
 

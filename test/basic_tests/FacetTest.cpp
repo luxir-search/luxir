@@ -4,11 +4,16 @@
 #include <atomic>
 #include <cmath>
 #include <functional>
+#include <map>
+#include <optional>
+#include <variant>
+#include <unordered_map>
 #include <tbb/task_group.h>
 #include <boost/unordered/unordered_flat_map.hpp>
 #include "test/SoluxTest.h"
 #include "test/CollectionHelper.h"
 #include "test/LocalReq.h"
+#include "test/QueryBuild.h"
 #include "test/TestUtils.h"
 #include "solux/util/random.h"
 #include "solux/util/proto.h"
@@ -196,64 +201,56 @@ TEST_F(FacetTest, emptyIndex) {
   
   for (const auto& fieldType : fieldTypes) {
     // Create a search request with faceting on the field type
-    auto* lreq = LocalReq::create(soluxNode->getSearchEngine());
-    lreq->proto.mutable_collection()->add_name("main");
-    lreq->proto.set_request_id("test_empty_index_" + fieldType.fieldName);
-    
-    auto& ops = *lreq->proto.mutable_ops();
-    auto& topDocs = *ops["q"].mutable_top_docs();
-    topDocs.set_get_number(true);
-    topDocs.mutable_query()->set_all(true);
-    
+    auto req = localReq(soluxNode->getSearchEngine());
+    req->collection("main");
+
+    req->topDocs().getNumber(true).allQuery();
+
     // Add facet based on field type
     if (fieldType.isRangeFacet) {
       // Range facet for integer
-      auto& facet = *ops["f_range"].mutable_range_facet();
-      facet.set_field(fieldType.fieldName);
-      facet.set_start(0);
-      facet.set_end(100);
-      facet.set_gap(10);
+      req->rangeFacet("f_range", fieldType.fieldName).range(0, 100, 10);
     } else {
       // Regular field facet
-      auto& facet = *ops["f"].mutable_field_facet();
-      facet.set_field(fieldType.fieldName);
-      facet.set_limit(10);
-      facet.set_missing(true); // Also test missing value handling
+      auto& facet = req->facet("f", fieldType.fieldName);
+      facet.limit(10);
+      std::get<solux::api::FieldFacet>(facet.rawOp().kind).missing = true; // Also test missing value handling
     }
-    
+
     // Execute search on empty index
-    lreq->engine.submit(*lreq, true);
-    
+    req->execute(true);
+
     // Verify we get a response without crashing
-    ASSERT_EQ(1, lreq->responses.size()) << "Failed for " << fieldType.description;
-    
+    ASSERT_EQ(1u, req->responses.size()) << "Failed for " << fieldType.description;
+    const auto& ops = req->responses[0]->proto.ops;
+
     // Check the appropriate facet result based on type
     if (fieldType.isRangeFacet) {
-      ASSERT_TRUE(lreq->responses[0]->proto.ops().contains("f_range")) << "Failed for " << fieldType.description;
-      const auto& facetResult = lreq->responses[0]->proto.ops().at("f_range").facet();
-      
+      ASSERT_TRUE(ops.contains("f_range")) << "Failed for " << fieldType.description;
+      const auto* facetResult = ops.at("f_range")->facetResult();
+      ASSERT_NE(facetResult, nullptr) << "Failed for " << fieldType.description;
+
       // Range facets should have empty buckets
-      ASSERT_EQ(0, facetResult.bucket_ids().multi_i().v_size()) << "Failed for " << fieldType.description;
-      ASSERT_EQ(0, facetResult.counts_size()) << "Failed for " << fieldType.description;
+      ASSERT_EQ(0, (int)std::get<solux::api::ArrArrInt>(facetResult->bucket_ids->kind).v.size()) << "Failed for " << fieldType.description;
+      ASSERT_EQ(0, (int)facetResult->counts.size()) << "Failed for " << fieldType.description;
     } else {
-      ASSERT_TRUE(lreq->responses[0]->proto.ops().contains("f")) << "Failed for " << fieldType.description;
-      const auto& facetResult = lreq->responses[0]->proto.ops().at("f").facet();
-      
+      ASSERT_TRUE(ops.contains("f")) << "Failed for " << fieldType.description;
+      const auto* facetResult = ops.at("f")->facetResult();
+      ASSERT_NE(facetResult, nullptr) << "Failed for " << fieldType.description;
+
       // Check appropriate bucket type based on field type
       if (fieldType.fieldName.contains("_i")) {
         // Integer field
-        ASSERT_EQ(0, facetResult.bucket_ids().col_i().v_size()) << "Failed for " << fieldType.description;
+        ASSERT_EQ(0, (int)std::get<solux::api::ColInt>(facetResult->bucket_ids->kind).v.size()) << "Failed for " << fieldType.description;
       } else if (fieldType.fieldName.contains("_s") || fieldType.fieldName.contains("_w")) {
         // String or text field
-        ASSERT_EQ(0, facetResult.bucket_ids().col_s().v_size()) << "Failed for " << fieldType.description;
+        ASSERT_EQ(0, (int)std::get<solux::api::ColStr>(facetResult->bucket_ids->kind).v.size()) << "Failed for " << fieldType.description;
       }
-      ASSERT_EQ(0, facetResult.counts_size()) << "Failed for " << fieldType.description;
-      
+      ASSERT_EQ(0, (int)facetResult->counts.size()) << "Failed for " << fieldType.description;
+
       // Since we requested missing=true, missing count should be 0 for empty index
-      ASSERT_EQ(0, facetResult.missing()) << "Failed for " << fieldType.description;
+      ASSERT_EQ(0, facetResult->missing.value_or(0)) << "Failed for " << fieldType.description;
     }
-    
-    lreq->done();
   }
 }
 
@@ -261,32 +258,28 @@ TEST_F(FacetTest, emptyIndexNestedFacet) {
   CollectionHelper helper;
   helper.clear();
 
-  auto* lreq = LocalReq::create(soluxNode->getSearchEngine());
-  lreq->proto.mutable_collection()->add_name("main");
-  lreq->proto.set_request_id("test_empty_index_nested_facet");
+  auto req = localReq(soluxNode->getSearchEngine());
+  req->collection("main");
 
-  auto& topDocs = *(*lreq->proto.mutable_ops())["q"].mutable_top_docs();
-  topDocs.set_get_number(true);
-  topDocs.mutable_query()->set_all(true);
+  auto& topDocs = req->topDocs();
+  topDocs.getNumber(true).allQuery();
 
-  auto& facet = *(*topDocs.mutable_ops())["f"].mutable_field_facet();
-  facet.set_field("category_s");
-  facet.set_limit(10);
-  facet.set_missing(true);
+  auto& facet = topDocs.facet("f", "category_s");
+  facet.limit(10);
+  std::get<solux::api::FieldFacet>(facet.rawOp().kind).missing = true;
 
-  lreq->engine.submit(*lreq, true);
+  req->execute(true);
 
-  ASSERT_EQ(1, lreq->responses.size()) << lreq->toString();
-  ASSERT_FALSE(lreq->responses[0]->proto.has_error()) << lreq->toString();
-  const auto& docs = lreq->responses[0]->proto.ops().at("q").docs();
-  ASSERT_EQ(0, docs.matches());
-  ASSERT_TRUE(docs.ops().contains("f")) << lreq->toString();
-  const auto& facetResult = docs.ops().at("f").facet();
-  EXPECT_EQ(0, facetResult.bucket_ids().col_s().v_size());
-  EXPECT_EQ(0, facetResult.counts_size());
-  EXPECT_EQ(0, facetResult.missing());
-
-  lreq->done();
+  ASSERT_OK(req);
+  const auto* docs = req->docList("q");
+  ASSERT_NE(docs, nullptr) << req->toString();
+  ASSERT_EQ(0, docs->matches.value_or(0));
+  ASSERT_TRUE(docs->ops.contains("f")) << req->toString();
+  const auto* facetResult = docs->ops.at("f")->facetResult();
+  ASSERT_NE(facetResult, nullptr) << req->toString();
+  EXPECT_EQ(0, (int)std::get<solux::api::ColStr>(facetResult->bucket_ids->kind).v.size());
+  EXPECT_EQ(0, (int)facetResult->counts.size());
+  EXPECT_EQ(0, facetResult->missing.value_or(0));
 }
 
 TEST_F(FacetTest, singleSegment) {
@@ -304,77 +297,63 @@ TEST_F(FacetTest, singleSegment) {
   
   // Test integer faceting
   {
-    auto* lreq = LocalReq::create(soluxNode->getSearchEngine());
-    lreq->proto.mutable_collection()->add_name("main");
-    lreq->proto.set_request_id("test_single_segment_int");
-    
-    auto& ops = *lreq->proto.mutable_ops();
-    auto& topDocs = *ops["q"].mutable_top_docs();
-    topDocs.set_get_number(true);
-    topDocs.mutable_query()->set_all(true);
-    
-    auto& facet = *ops["f"].mutable_field_facet();
-    facet.set_field("price_i");
-    facet.set_limit(10);
-    
-    lreq->engine.submit(*lreq, true);
-    
-    ASSERT_EQ(1, lreq->responses.size());
-    const auto& facetResult = lreq->responses[0]->proto.ops().at("f").facet();
-    
+    auto req = localReq(soluxNode->getSearchEngine());
+    req->collection("main");
+
+    req->topDocs().getNumber(true).allQuery();
+    req->facet("f", "price_i").limit(10);
+
+    req->execute(true);
+
+    ASSERT_EQ(1u, req->responses.size());
+    const auto* facetResult = req->responses[0]->proto.ops.at("f")->facetResult();
+    ASSERT_NE(facetResult, nullptr);
+    const auto& bucketIds = std::get<solux::api::ColInt>(facetResult->bucket_ids->kind);
+
     // Should have 5 buckets (0, 10, 20, 30, 40)
-    ASSERT_EQ(5, facetResult.bucket_ids().col_i().v_size());
-    ASSERT_EQ(5, facetResult.counts_size());
-    
+    ASSERT_EQ(5, (int)bucketIds.v.size());
+    ASSERT_EQ(5, (int)facetResult->counts.size());
+
     // Each bucket should have count of 1
     for (int i = 0; i < 5; i++) {
-      EXPECT_EQ(i * 10, facetResult.bucket_ids().col_i().v(i));
-      EXPECT_EQ(1, facetResult.counts(i));
+      EXPECT_EQ(i * 10, bucketIds.v[i]);
+      EXPECT_EQ(1, facetResult->counts[i]);
     }
-    
-    lreq->done();
   }
-  
+
   // Test string faceting
   {
-    auto* lreq = LocalReq::create(soluxNode->getSearchEngine());
-    lreq->proto.mutable_collection()->add_name("main");
-    lreq->proto.set_request_id("test_single_segment_string");
-    
-    auto& ops = *lreq->proto.mutable_ops();
-    auto& topDocs = *ops["q"].mutable_top_docs();
-    topDocs.set_get_number(true);
-    topDocs.mutable_query()->set_all(true);
-    
-    auto& facet = *ops["f_str"].mutable_field_facet();
-    facet.set_field("color_s");
-    facet.set_limit(10);
-    
-    lreq->engine.submit(*lreq, true);
-    
-    ASSERT_EQ(1, lreq->responses.size());
-    const auto& facetResult = lreq->responses[0]->proto.ops().at("f_str").facet();
-    
+    auto req = localReq(soluxNode->getSearchEngine());
+    req->collection("main");
+
+    req->topDocs().getNumber(true).allQuery();
+    req->facet("f_str", "color_s").limit(10);
+
+    req->execute(true);
+
+    ASSERT_EQ(1u, req->responses.size());
+    const auto* facetResult = req->responses[0]->proto.ops.at("f_str")->facetResult();
+    ASSERT_NE(facetResult, nullptr);
+    const auto& bucketIds = std::get<solux::api::ColStr>(facetResult->bucket_ids->kind);
+
     // Should have 3 unique colors
-    ASSERT_EQ(3, facetResult.bucket_ids().col_s().v_size());
-    ASSERT_EQ(3, facetResult.counts_size());
-    
+    ASSERT_EQ(3, (int)bucketIds.v.size());
+    ASSERT_EQ(3, (int)facetResult->counts.size());
+
     // Check the counts for each color
     // Note: facets are typically sorted by count desc, then by value
     // We expect: red(2), blue(2), green(1)
     boost::unordered_flat_map<std::string, int> expectedCounts = {
       {"red", 2},
-      {"blue", 2}, 
+      {"blue", 2},
       {"green", 1}
     };
-    
-    for (int i = 0; i < facetResult.bucket_ids().col_s().v_size(); i++) {
-      std::string color = std::string(facetResult.bucket_ids().col_s().v(i));
+
+    for (int i = 0; i < (int)bucketIds.v.size(); i++) {
+      std::string color = std::string(bucketIds.v[i]);
       EXPECT_TRUE(expectedCounts.count(color) > 0) << "Unexpected color: " << color;
-      EXPECT_EQ(expectedCounts[color], facetResult.counts(i)) << "Wrong count for color: " << color;
+      EXPECT_EQ(expectedCounts[color], facetResult->counts[i]) << "Wrong count for color: " << color;
     }
-    
-    lreq->done();
   }
 }
 
@@ -391,34 +370,26 @@ TEST_F(FacetTest, multipleSegments) {
   }
   
   // Create search request with faceting
-  auto* lreq = LocalReq::create(soluxNode->getSearchEngine());
-  lreq->proto.mutable_collection()->add_name("main");
-  lreq->proto.set_request_id("test_multiple_segments");
-  
-  auto& ops = *lreq->proto.mutable_ops();
-  auto& topDocs = *ops["q"].mutable_top_docs();
-  topDocs.set_get_number(true);
-  topDocs.mutable_query()->set_all(true);
-  
-  auto& facet = *ops["f"].mutable_field_facet();
-  facet.set_field("price_i");
-  facet.set_limit(20);
-  
-  lreq->engine.submit(*lreq, true);
-  
-  ASSERT_EQ(1, lreq->responses.size());
-  const auto& facetResult = lreq->responses[0]->proto.ops().at("f").facet();
-  
+  auto req = localReq(soluxNode->getSearchEngine());
+  req->collection("main");
+
+  req->topDocs().getNumber(true).allQuery();
+  req->facet("f", "price_i").limit(20);
+
+  req->execute(true);
+
+  ASSERT_EQ(1u, req->responses.size());
+  const auto* facetResult = req->responses[0]->proto.ops.at("f")->facetResult();
+  ASSERT_NE(facetResult, nullptr);
+
   // Should have 9 unique values: 0,1,2,10,11,12,20,21,22
-  ASSERT_EQ(9, facetResult.bucket_ids().col_i().v_size());
-  ASSERT_EQ(9, facetResult.counts_size());
-  
+  ASSERT_EQ(9, (int)std::get<solux::api::ColInt>(facetResult->bucket_ids->kind).v.size());
+  ASSERT_EQ(9, (int)facetResult->counts.size());
+
   // Each value should have count of 1
   for (int i = 0; i < 9; i++) {
-    EXPECT_EQ(1, facetResult.counts(i));
+    EXPECT_EQ(1, facetResult->counts[i]);
   }
-  
-  lreq->done();
 }
 
 TEST_F(FacetTest, fullTextFacetSegmentMissingField) {
@@ -430,35 +401,29 @@ TEST_F(FacetTest, fullTextFacetSegmentMissingField) {
   helper.index(flatdoc("id", "c", "other_s", "x"), UpdateMessage::NO_COMMIT);
   helper.index(flatdoc("id", "d", "other_s", "y"), UpdateMessage::COMMIT);
 
-  auto* lreq = LocalReq::create(soluxNode->getSearchEngine());
-  lreq->proto.mutable_collection()->add_name("main");
-  lreq->proto.set_request_id("test_full_text_facet_segment_missing_field");
+  auto req = localReq(soluxNode->getSearchEngine());
+  req->collection("main");
 
-  auto& ops = *lreq->proto.mutable_ops();
-  auto& topDocs = *ops["q"].mutable_top_docs();
-  topDocs.set_get_number(true);
-  topDocs.mutable_query()->set_all(true);
+  req->topDocs().getNumber(true).allQuery();
 
-  auto& facet = *ops["f"].mutable_field_facet();
-  facet.set_field("body_w");
-  facet.set_limit(-1);
-  facet.set_missing(true);
+  auto& facet = req->facet("f", "body_w");
+  facet.limit(-1);
+  std::get<solux::api::FieldFacet>(facet.rawOp().kind).missing = true;
 
-  lreq->engine.submit(*lreq, true);
+  req->execute(true);
 
-  ASSERT_EQ(1, lreq->responses.size()) << lreq->toString();
-  ASSERT_FALSE(lreq->responses[0]->proto.has_error()) << lreq->toString();
-  ASSERT_TRUE(lreq->responses[0]->proto.ops().contains("f")) << lreq->toString();
-  const auto& facetResult = lreq->responses[0]->proto.ops().at("f").facet();
-  ASSERT_EQ(2, facetResult.bucket_ids().col_s().v_size());
-  ASSERT_EQ(2, facetResult.counts_size());
-  EXPECT_EQ("alpha", facetResult.bucket_ids().col_s().v(0));
-  EXPECT_EQ(2, facetResult.counts(0));
-  EXPECT_EQ("beta", facetResult.bucket_ids().col_s().v(1));
-  EXPECT_EQ(1, facetResult.counts(1));
-  EXPECT_EQ(2, facetResult.missing());
-
-  lreq->done();
+  ASSERT_OK(req);
+  ASSERT_TRUE(req->responses[0]->proto.ops.contains("f")) << req->toString();
+  const auto* facetResult = req->responses[0]->proto.ops.at("f")->facetResult();
+  ASSERT_NE(facetResult, nullptr) << req->toString();
+  const auto& bucketIds = std::get<solux::api::ColStr>(facetResult->bucket_ids->kind);
+  ASSERT_EQ(2, (int)bucketIds.v.size());
+  ASSERT_EQ(2, (int)facetResult->counts.size());
+  EXPECT_EQ("alpha", bucketIds.v[0]);
+  EXPECT_EQ(2, facetResult->counts[0]);
+  EXPECT_EQ("beta", bucketIds.v[1]);
+  EXPECT_EQ(1, facetResult->counts[1]);
+  EXPECT_EQ(2, facetResult->missing.value_or(0));
 }
 
 TEST_F(FacetTest, fullTextFacetNestedSparseArrayDomain) {
@@ -479,40 +444,34 @@ TEST_F(FacetTest, fullTextFacetNestedSparseArrayDomain) {
   }
   helper.commit();
 
-  auto* lreq = LocalReq::create(soluxNode->getSearchEngine());
-  lreq->proto.mutable_collection()->add_name("main");
-  lreq->proto.set_request_id("test_full_text_facet_nested_sparse_array_domain");
+  auto req = localReq(soluxNode->getSearchEngine());
+  req->collection("main");
 
-  auto& topDocs = *(*lreq->proto.mutable_ops())["q"].mutable_top_docs();
-  topDocs.set_get_number(true);
-  auto& match = *topDocs.mutable_query()->mutable_match();
-  match.set_field("pick_w");
-  match.mutable_val()->set_s("yes");
+  auto& topDocs = req->topDocs();
+  topDocs.getNumber(true).matchQuery("pick_w", "yes");
 
-  auto& facet = *(*topDocs.mutable_ops())["f"].mutable_field_facet();
-  facet.set_field("body_w");
-  facet.set_limit(-1);
+  topDocs.facet("f", "body_w").limit(-1);
 
-  lreq->engine.submit(*lreq, true);
+  req->execute(true);
 
-  ASSERT_EQ(1, lreq->responses.size()) << lreq->toString();
-  ASSERT_FALSE(lreq->responses[0]->proto.has_error()) << lreq->toString();
-  const auto& docs = lreq->responses[0]->proto.ops().at("q").docs();
-  ASSERT_EQ(3, docs.matches());
-  ASSERT_TRUE(docs.ops().contains("f")) << lreq->toString();
-  const auto& facetResult = docs.ops().at("f").facet();
-  ASSERT_EQ(4, facetResult.bucket_ids().col_s().v_size());
-  ASSERT_EQ(4, facetResult.counts_size());
-  EXPECT_EQ("apple", facetResult.bucket_ids().col_s().v(0));
-  EXPECT_EQ(2, facetResult.counts(0));
-  EXPECT_EQ("red", facetResult.bucket_ids().col_s().v(1));
-  EXPECT_EQ(2, facetResult.counts(1));
-  EXPECT_EQ("blue", facetResult.bucket_ids().col_s().v(2));
-  EXPECT_EQ(1, facetResult.counts(2));
-  EXPECT_EQ("cherry", facetResult.bucket_ids().col_s().v(3));
-  EXPECT_EQ(1, facetResult.counts(3));
-
-  lreq->done();
+  ASSERT_OK(req);
+  const auto* docs = req->docList("q");
+  ASSERT_NE(docs, nullptr) << req->toString();
+  ASSERT_EQ(3, docs->matches.value_or(0));
+  ASSERT_TRUE(docs->ops.contains("f")) << req->toString();
+  const auto* facetResult = docs->ops.at("f")->facetResult();
+  ASSERT_NE(facetResult, nullptr) << req->toString();
+  const auto& bucketIds = std::get<solux::api::ColStr>(facetResult->bucket_ids->kind);
+  ASSERT_EQ(4, (int)bucketIds.v.size());
+  ASSERT_EQ(4, (int)facetResult->counts.size());
+  EXPECT_EQ("apple", bucketIds.v[0]);
+  EXPECT_EQ(2, facetResult->counts[0]);
+  EXPECT_EQ("red", bucketIds.v[1]);
+  EXPECT_EQ(2, facetResult->counts[1]);
+  EXPECT_EQ("blue", bucketIds.v[2]);
+  EXPECT_EQ(1, facetResult->counts[2]);
+  EXPECT_EQ("cherry", bucketIds.v[3]);
+  EXPECT_EQ(1, facetResult->counts[3]);
 }
 
 TEST_F(FacetTest, vectorOptimization) {
@@ -526,35 +485,28 @@ TEST_F(FacetTest, vectorOptimization) {
   helper.commit();
   
   // Create search request with faceting
-  auto* lreq = LocalReq::create(soluxNode->getSearchEngine());
-  lreq->proto.mutable_collection()->add_name("main");
-  lreq->proto.set_request_id("test_vector_optimization");
-  
-  auto& ops = *lreq->proto.mutable_ops();
-  auto& topDocs = *ops["q"].mutable_top_docs();
-  topDocs.set_get_number(true);
-  topDocs.mutable_query()->set_all(true);
-  
-  auto& facet = *ops["f"].mutable_field_facet();
-  facet.set_field("score_i");
-  facet.set_limit(30);
-  
-  lreq->engine.submit(*lreq, true);
-  
-  ASSERT_EQ(1, lreq->responses.size());
-  const auto& facetResult = lreq->responses[0]->proto.ops().at("f").facet();
-  
+  auto req = localReq(soluxNode->getSearchEngine());
+  req->collection("main");
+
+  req->topDocs().getNumber(true).allQuery();
+  req->facet("f", "score_i").limit(30);
+
+  req->execute(true);
+
+  ASSERT_EQ(1u, req->responses.size());
+  const auto* facetResult = req->responses[0]->proto.ops.at("f")->facetResult();
+  ASSERT_NE(facetResult, nullptr);
+  const auto& bucketIds = std::get<solux::api::ColInt>(facetResult->bucket_ids->kind);
+
   // Should have 20 unique values (0-19)
-  ASSERT_EQ(20, facetResult.bucket_ids().col_i().v_size());
-  ASSERT_EQ(20, facetResult.counts_size());
-  
+  ASSERT_EQ(20, (int)bucketIds.v.size());
+  ASSERT_EQ(20, (int)facetResult->counts.size());
+
   // Each value should have count of 5 (100 docs / 20 values)
   for (int i = 0; i < 20; i++) {
-    EXPECT_EQ(i, facetResult.bucket_ids().col_i().v(i));
-    EXPECT_EQ(5, facetResult.counts(i));
+    EXPECT_EQ(i, bucketIds.v[i]);
+    EXPECT_EQ(5, facetResult->counts[i]);
   }
-  
-  lreq->done();
 }
 
 // Facet sorted by an inline sub-op (avg) with a finite limit.  This exercises
@@ -577,64 +529,57 @@ TEST_F(FacetTest, sortBySubOp) {
   helper.index(flatdoc("cat_s", "c", "foo_i", 50), UpdateMessage::COMMIT);
 
   // Builds a facet on cat_s with an inline avg(foo_i) sub-op, sorted by that
-  // sub-op, and returns the response facet result.
-  auto runFacet = [&](int64_t limit, proto::SortSpec_SortDir dir) {
-    auto* lreq = LocalReq::create(soluxNode->getSearchEngine());
-    lreq->proto.mutable_collection()->add_name("main");
-    lreq->proto.set_request_id("test_sort_by_subop");
+  // sub-op, and returns the request handle (kept alive by the caller).
+  auto runFacet = [&](int64_t limit, qb::SortDir dir) {
+    auto req = localReq(soluxNode->getSearchEngine());
+    req->collection("main");
 
-    auto& ops = *lreq->proto.mutable_ops();
-    auto& topDocs = *ops["q"].mutable_top_docs();
-    topDocs.set_get_number(true);
-    topDocs.mutable_query()->set_all(true);
+    req->topDocs().getNumber(true).allQuery();
 
-    auto& facet = *ops["f"].mutable_field_facet();
-    facet.set_field("cat_s");
-    facet.set_limit(limit);
-    auto& subAvg = *(*facet.mutable_ops())["avgsub"].mutable_gen_op();
-    subAvg.set_name("avg");
-    subAvg.mutable_args()->Add()->set_s("foo_i");
-    auto& sort = *facet.mutable_sorts()->Add();
-    sort.set_field("avgsub");
-    sort.set_dir(dir);
+    auto& facet = req->facet("f", "cat_s");
+    facet.limit(limit);
+    facet.avg("avgsub", "foo_i");
+    qb::sort(facet, "avgsub", dir);
 
-    lreq->engine.submit(*lreq, true);
-    return lreq;
+    req->execute(true);
+    return req;
   };
 
   // Ascending avg, all buckets.  Order is b(1), c(50), a(100) -- which differs
   // from count-desc (a, c, b), so this confirms we sorted by the sub-op.
   {
-    auto* lreq = runFacet(10, proto::SortSpec_SortDir_ASC);
-    const auto& facet = lreq->responses[0]->proto.ops().at("f").facet();
-    ASSERT_EQ(3, facet.bucket_ids().col_s().v_size());
-    EXPECT_EQ("b", facet.bucket_ids().col_s().v(0));
-    EXPECT_EQ("c", facet.bucket_ids().col_s().v(1));
-    EXPECT_EQ("a", facet.bucket_ids().col_s().v(2));
-    EXPECT_EQ(1, facet.counts(0));
-    EXPECT_EQ(2, facet.counts(1));
-    EXPECT_EQ(3, facet.counts(2));
-    const auto& avg = facet.ops().at("avgsub").arr_d();
-    ASSERT_EQ(3, avg.v_size());
-    EXPECT_EQ(1, avg.v(0));
-    EXPECT_EQ(50, avg.v(1));
-    EXPECT_EQ(100, avg.v(2));
-    lreq->done();
+    auto req = runFacet(10, qb::ASC);
+    const auto* facet = req->responses[0]->proto.ops.at("f")->facetResult();
+    ASSERT_NE(facet, nullptr);
+    const auto& bucketIds = std::get<solux::api::ColStr>(facet->bucket_ids->kind);
+    ASSERT_EQ(3, (int)bucketIds.v.size());
+    EXPECT_EQ("b", bucketIds.v[0]);
+    EXPECT_EQ("c", bucketIds.v[1]);
+    EXPECT_EQ("a", bucketIds.v[2]);
+    EXPECT_EQ(1, facet->counts[0]);
+    EXPECT_EQ(2, facet->counts[1]);
+    EXPECT_EQ(3, facet->counts[2]);
+    const auto& avg = std::get<solux::api::ArrDouble>(facet->ops.at("avgsub")->kind);
+    ASSERT_EQ(3, (int)avg.v.size());
+    EXPECT_EQ(1, avg.v[0]);
+    EXPECT_EQ(50, avg.v[1]);
+    EXPECT_EQ(100, avg.v[2]);
   }
 
   // Descending avg with a finite limit smaller than the bucket count: keep the
   // top 2 by avg -> a(100), c(50).
   {
-    auto* lreq = runFacet(2, proto::SortSpec_SortDir_DESC);
-    const auto& facet = lreq->responses[0]->proto.ops().at("f").facet();
-    ASSERT_EQ(2, facet.bucket_ids().col_s().v_size());
-    EXPECT_EQ("a", facet.bucket_ids().col_s().v(0));
-    EXPECT_EQ("c", facet.bucket_ids().col_s().v(1));
-    const auto& avg = facet.ops().at("avgsub").arr_d();
-    ASSERT_EQ(2, avg.v_size());
-    EXPECT_EQ(100, avg.v(0));
-    EXPECT_EQ(50, avg.v(1));
-    lreq->done();
+    auto req = runFacet(2, qb::DESC);
+    const auto* facet = req->responses[0]->proto.ops.at("f")->facetResult();
+    ASSERT_NE(facet, nullptr);
+    const auto& bucketIds = std::get<solux::api::ColStr>(facet->bucket_ids->kind);
+    ASSERT_EQ(2, (int)bucketIds.v.size());
+    EXPECT_EQ("a", bucketIds.v[0]);
+    EXPECT_EQ("c", bucketIds.v[1]);
+    const auto& avg = std::get<solux::api::ArrDouble>(facet->ops.at("avgsub")->kind);
+    ASSERT_EQ(2, (int)avg.v.size());
+    EXPECT_EQ(100, avg.v[0]);
+    EXPECT_EQ(50, avg.v[1]);
   }
 }
 
@@ -664,45 +609,36 @@ TEST_F(FacetTest, limitMinusOneInlinesMultipleAvgSubOps) {
   helper.indexAll(firstSegment, UpdateMessage::COMMIT);
   helper.indexAll(secondSegment, UpdateMessage::COMMIT);
 
-  auto* lreq = LocalReq::create(soluxNode->getSearchEngine());
-  lreq->proto.mutable_collection()->add_name("main");
-  lreq->proto.set_request_id("test_limit_minus_one_inlines_multiple_avg_subops");
+  auto req = localReq(soluxNode->getSearchEngine());
+  req->collection("main");
 
-  auto& topDocs = *(*lreq->proto.mutable_ops())["q"].mutable_top_docs();
-  topDocs.set_get_number(true);
-  topDocs.mutable_query()->set_all(true);
+  req->topDocs().getNumber(true).allQuery();
 
-  auto& facet = *(*lreq->proto.mutable_ops())["f"].mutable_field_facet();
-  facet.set_field("cat_s");
-  facet.set_limit(-1);
-  auto& avgScore = *(*facet.mutable_ops())["avg_score"].mutable_gen_op();
-  avgScore.set_name("avg");
-  avgScore.mutable_args()->Add()->set_s("score_i");
-  auto& avgBonus = *(*facet.mutable_ops())["avg_bonus"].mutable_gen_op();
-  avgBonus.set_name("avg");
-  avgBonus.mutable_args()->Add()->set_s("bonus_i");
+  auto& facet = req->facet("f", "cat_s");
+  facet.limit(-1);
+  facet.avg("avg_score", "score_i");
+  facet.avg("avg_bonus", "bonus_i");
 
-  lreq->engine.submit(*lreq, true);
+  req->execute(true);
 
-  ASSERT_EQ(1, lreq->responses.size()) << lreq->toString();
-  ASSERT_FALSE(lreq->responses[0]->proto.has_error()) << lreq->toString();
-  const auto& facetResult = lreq->responses[0]->proto.ops().at("f").facet();
-  ASSERT_EQ(totalDocs, facetResult.bucket_ids().col_s().v_size());
-  ASSERT_EQ(totalDocs, facetResult.counts_size());
-  const auto& avgScoreResult = facetResult.ops().at("avg_score").arr_d();
-  const auto& avgBonusResult = facetResult.ops().at("avg_bonus").arr_d();
-  ASSERT_EQ(totalDocs, avgScoreResult.v_size());
-  ASSERT_EQ(totalDocs, avgBonusResult.v_size());
+  ASSERT_OK(req);
+  const auto* facetResult = req->responses[0]->proto.ops.at("f")->facetResult();
+  ASSERT_NE(facetResult, nullptr) << req->toString();
+  const auto& bucketIds = std::get<solux::api::ColStr>(facetResult->bucket_ids->kind);
+  ASSERT_EQ(totalDocs, (int)bucketIds.v.size());
+  ASSERT_EQ(totalDocs, (int)facetResult->counts.size());
+  const auto& avgScoreResult = std::get<solux::api::ArrDouble>(facetResult->ops.at("avg_score")->kind);
+  const auto& avgBonusResult = std::get<solux::api::ArrDouble>(facetResult->ops.at("avg_bonus")->kind);
+  ASSERT_EQ(totalDocs, (int)avgScoreResult.v.size());
+  ASSERT_EQ(totalDocs, (int)avgBonusResult.v.size());
 
   std::vector<int> checkIndexes = {0, 10, 11, 2999, 3000, totalDocs - 1};
   for (int idx : checkIndexes) {
-    EXPECT_EQ(categoryName(idx), facetResult.bucket_ids().col_s().v(idx));
-    EXPECT_EQ(1, facetResult.counts(idx));
-    EXPECT_DOUBLE_EQ((double)idx, avgScoreResult.v(idx));
-    EXPECT_DOUBLE_EQ((double)(totalDocs - idx), avgBonusResult.v(idx));
+    EXPECT_EQ(categoryName(idx), bucketIds.v[idx]);
+    EXPECT_EQ(1, facetResult->counts[idx]);
+    EXPECT_DOUBLE_EQ((double)idx, avgScoreResult.v[idx]);
+    EXPECT_DOUBLE_EQ((double)(totalDocs - idx), avgBonusResult.v[idx]);
   }
-
-  lreq->done();
 }
 
 TEST_F(FacetTest, unsupportedFacetOptionsRejected) {
@@ -713,90 +649,57 @@ TEST_F(FacetTest, unsupportedFacetOptionsRejected) {
 
   struct Case {
     std::string name;
-    std::function<void(proto::SearchRequest&)> configure;
+    std::function<void(LocalReq&)> configure;
     std::string expectSubstr; // a phrase the clear error message must contain
   };
 
   std::vector<Case> cases = {
-    {"int_subop", [](proto::SearchRequest& req) {
-      auto& facet = *(*req.mutable_ops())["f"].mutable_field_facet();
-      facet.set_field("foo_i");
-      auto& avg = *(*facet.mutable_ops())["avg"].mutable_gen_op();
-      avg.set_name("avg");
-      avg.mutable_args()->Add()->set_s("foo_i");
+    {"int_subop", [](LocalReq& req) {
+      req.facet("f", "foo_i").avg("avg", "foo_i");
     }, "not yet supported for int field facets"},
-    {"int_sort", [](proto::SearchRequest& req) {
-      auto& facet = *(*req.mutable_ops())["f"].mutable_field_facet();
-      facet.set_field("foo_i");
-      auto& sort = *facet.mutable_sorts()->Add();
-      sort.set_field("avg");
-      sort.set_dir(proto::SortSpec_SortDir_ASC);
+    {"int_sort", [](LocalReq& req) {
+      auto& facet = req.facet("f", "foo_i");
+      qb::sort(facet, "avg", qb::ASC);
     }, "not yet supported for int field facets"},
-    {"int_mincount_zero", [](proto::SearchRequest& req) {
-      auto& facet = *(*req.mutable_ops())["f"].mutable_field_facet();
-      facet.set_field("foo_i");
-      facet.set_mincount(0);
+    {"int_mincount_zero", [](LocalReq& req) {
+      req.facet("f", "foo_i").mincount(0);
     }, "not supported for int field facets"},
-    {"text_subop", [](proto::SearchRequest& req) {
-      auto& facet = *(*req.mutable_ops())["f"].mutable_field_facet();
-      facet.set_field("body_w");
-      auto& avg = *(*facet.mutable_ops())["avg"].mutable_gen_op();
-      avg.set_name("avg");
-      avg.mutable_args()->Add()->set_s("foo_i");
+    {"text_subop", [](LocalReq& req) {
+      req.facet("f", "body_w").avg("avg", "foo_i");
     }, "not yet supported for text field facets"},
-    {"range_sort", [](proto::SearchRequest& req) {
-      auto& facet = *(*req.mutable_ops())["f"].mutable_range_facet();
-      facet.set_field("foo_i");
-      facet.set_start(0);
-      facet.set_end(10);
-      facet.set_gap(1);
-      auto& sort = *facet.mutable_sorts()->Add();
-      sort.set_field("avg");
-      sort.set_dir(proto::SortSpec_SortDir_ASC);
+    {"range_sort", [](LocalReq& req) {
+      auto& facet = req.rangeFacet("f", "foo_i");
+      facet.range(0, 10, 1);
+      qb::sort(facet, "avg", qb::ASC);
     }, "not yet supported for range facets"},
-    {"range_mincount_zero", [](proto::SearchRequest& req) {
-      auto& facet = *(*req.mutable_ops())["f"].mutable_range_facet();
-      facet.set_field("foo_i");
-      facet.set_start(0);
-      facet.set_end(10);
-      facet.set_gap(1);
-      facet.set_mincount(0);
+    {"range_mincount_zero", [](LocalReq& req) {
+      req.rangeFacet("f", "foo_i").range(0, 10, 1).mincount(0);
     }, "not supported for range facets"},
-    {"string_unknown_sort", [](proto::SearchRequest& req) {
-      auto& facet = *(*req.mutable_ops())["f"].mutable_field_facet();
-      facet.set_field("cat_s");
-      auto& sort = *facet.mutable_sorts()->Add();
-      sort.set_field("not_a_subop");
-      sort.set_dir(proto::SortSpec_SortDir_ASC);
+    {"string_unknown_sort", [](LocalReq& req) {
+      auto& facet = req.facet("f", "cat_s");
+      qb::sort(facet, "not_a_subop", qb::ASC);
     }, "unknown sort field"},
-    {"string_two_sorts", [](proto::SearchRequest& req) {
-      auto& facet = *(*req.mutable_ops())["f"].mutable_field_facet();
-      facet.set_field("cat_s");
-      auto& sort1 = *facet.mutable_sorts()->Add();
-      sort1.set_field("first");
-      sort1.set_dir(proto::SortSpec_SortDir_ASC);
-      auto& sort2 = *facet.mutable_sorts()->Add();
-      sort2.set_field("second");
-      sort2.set_dir(proto::SortSpec_SortDir_DESC);
+    {"string_two_sorts", [](LocalReq& req) {
+      auto& facet = req.facet("f", "cat_s");
+      qb::sort(facet, "first", qb::ASC);
+      qb::sort(facet, "second", qb::DESC);
     }, "multiple sort fields"}
   };
 
   for (const auto& testCase : cases) {
-    auto* lreq = LocalReq::create(soluxNode->getSearchEngine());
-    lreq->proto.mutable_collection()->add_name("main");
-    lreq->proto.set_request_id("test_unsupported_facet_options_" + testCase.name);
-    testCase.configure(lreq->proto);
+    auto req = localReq(soluxNode->getSearchEngine());
+    req->collection("main");
+    testCase.configure(*req);
 
-    lreq->engine.submit(*lreq, true);
+    req->execute(true);
 
-    ASSERT_EQ(1, lreq->responses.size()) << testCase.name;
-    const auto& error = lreq->responses[0]->proto.error();
-    EXPECT_TRUE(lreq->responses[0]->proto.has_error()) << testCase.name << "\n" << lreq->toString();
+    ASSERT_EQ(1u, req->responses.size()) << testCase.name;
+    const std::string error(req->responses[0]->proto.error);
+    EXPECT_TRUE(hasError(req->responses[0]->proto)) << testCase.name << "\n" << req->toString();
     // Lock in the clear-message contract: the facet name and the specific
     // unsupported-option phrase must both appear.
     EXPECT_NE(error.find("'f'"), std::string::npos) << testCase.name << ": '" << error << "'";
     EXPECT_NE(error.find(testCase.expectSubstr), std::string::npos) << testCase.name << ": '" << error << "'";
-    lreq->done();
   }
 }
 
@@ -807,35 +710,30 @@ TEST_F(FacetTest, emptyIndexForcePrepareNestedOps) {
   CollectionHelper helper;
   helper.clear();
 
-  auto* lreq = LocalReq::create(soluxNode->getSearchEngine());
-  lreq->proto.mutable_collection()->add_name("main");
-  lreq->proto.set_request_id("test_empty_index_force_prepare_nested_ops");
+  auto req = localReq(soluxNode->getSearchEngine());
+  req->collection("main");
 
-  auto& topDocs = *(*lreq->proto.mutable_ops())["q"].mutable_top_docs();
-  topDocs.set_get_number(true);
-  topDocs.mutable_query()->mutable_force_prepare()->mutable_query()->set_all(true);
+  auto& topDocs = req->topDocs();
+  topDocs.getNumber(true);
+  topDocs.rawQuery() = qb::forcePrepare(topDocs.mr(), qb::all());
 
-  auto& facet = *(*topDocs.mutable_ops())["f"].mutable_field_facet();
-  facet.set_field("category_s");
-  facet.set_limit(10);
+  topDocs.facet("f", "category_s").limit(10);
 
-  auto& avg = *(*topDocs.mutable_ops())["a"].mutable_gen_op();
-  avg.set_name("avg");
-  avg.mutable_args()->Add()->set_s("price_i");
+  topDocs.avg("a", "price_i");
 
-  lreq->engine.submit(*lreq, true);
+  req->execute(true);
 
-  ASSERT_EQ(1, lreq->responses.size()) << lreq->toString();
-  ASSERT_FALSE(lreq->responses[0]->proto.has_error()) << lreq->toString();
-  const auto& docs = lreq->responses[0]->proto.ops().at("q").docs();
-  ASSERT_EQ(0, docs.matches());
+  ASSERT_OK(req);
+  const auto* docs = req->docList("q");
+  ASSERT_NE(docs, nullptr) << req->toString();
+  ASSERT_EQ(0, docs->matches.value_or(0));
   // Both nested calculator families must still emit on an empty prepared index.
-  ASSERT_TRUE(docs.ops().contains("f")) << lreq->toString();
-  EXPECT_EQ(0, docs.ops().at("f").facet().bucket_ids().col_s().v_size());
-  ASSERT_TRUE(docs.ops().contains("a")) << lreq->toString();
-  EXPECT_TRUE(std::isnan(docs.ops().at("a").d()));
-
-  lreq->done();
+  ASSERT_TRUE(docs->ops.contains("f")) << req->toString();
+  const auto* fFacet = docs->ops.at("f")->facetResult();
+  ASSERT_NE(fFacet, nullptr) << req->toString();
+  EXPECT_EQ(0, (int)std::get<solux::api::ColStr>(fFacet->bucket_ids->kind).v.size());
+  ASSERT_TRUE(docs->ops.contains("a")) << req->toString();
+  EXPECT_TRUE(std::isnan(std::get<double>(docs->ops.at("a")->kind)));
 }
 
 TEST_F(FacetTest, stringFacetMincountZeroShowsAllValues) {
@@ -851,34 +749,28 @@ TEST_F(FacetTest, stringFacetMincountZeroShowsAllValues) {
   }
   helper.indexAll(docs, UpdateMessage::COMMIT);
 
-  auto* lreq = LocalReq::create(soluxNode->getSearchEngine());
-  lreq->proto.mutable_collection()->add_name("main");
-  lreq->proto.set_request_id("test_string_facet_mincount_zero");
+  auto req = localReq(soluxNode->getSearchEngine());
+  req->collection("main");
 
-  auto& topDocs = *(*lreq->proto.mutable_ops())["q"].mutable_top_docs();
-  topDocs.set_get_number(true);
-  auto& match = *topDocs.mutable_query()->mutable_match();
-  match.set_field("sel_s");
-  match.mutable_val()->set_s("yes");
+  auto& topDocs = req->topDocs();
+  topDocs.getNumber(true).matchQuery("sel_s", "yes");
 
-  auto& facet = *(*topDocs.mutable_ops())["f"].mutable_field_facet();
-  facet.set_field("cat_s");
-  facet.set_limit(-1);
-  facet.set_mincount(0);
+  topDocs.facet("f", "cat_s").limit(-1).mincount(0);
 
-  lreq->engine.submit(*lreq, true);
+  req->execute(true);
 
-  ASSERT_EQ(1, lreq->responses.size()) << lreq->toString();
-  ASSERT_FALSE(lreq->responses[0]->proto.has_error()) << lreq->toString();
-  const auto& facetResult = lreq->responses[0]->proto.ops().at("q").docs().ops().at("f").facet();
-  ASSERT_EQ(2, facetResult.bucket_ids().col_s().v_size()) << lreq->toString();
-  ASSERT_EQ(2, facetResult.counts_size());
-  EXPECT_EQ("a", facetResult.bucket_ids().col_s().v(0));
-  EXPECT_EQ(aDocs, facetResult.counts(0));
-  EXPECT_EQ("b", facetResult.bucket_ids().col_s().v(1));
-  EXPECT_EQ(0, facetResult.counts(1));
-
-  lreq->done();
+  ASSERT_OK(req);
+  const auto* qDocs = req->docList("q");
+  ASSERT_NE(qDocs, nullptr) << req->toString();
+  const auto* facetResult = qDocs->ops.at("f")->facetResult();
+  ASSERT_NE(facetResult, nullptr) << req->toString();
+  const auto& bucketIds = std::get<solux::api::ColStr>(facetResult->bucket_ids->kind);
+  ASSERT_EQ(2, (int)bucketIds.v.size()) << req->toString();
+  ASSERT_EQ(2, (int)facetResult->counts.size());
+  EXPECT_EQ("a", bucketIds.v[0]);
+  EXPECT_EQ(aDocs, facetResult->counts[0]);
+  EXPECT_EQ("b", bucketIds.v[1]);
+  EXPECT_EQ(0, facetResult->counts[1]);
 }
 
 TEST_F(FacetTest, stringFacetMincountZeroPadsZerosByValue) {
@@ -889,36 +781,30 @@ TEST_F(FacetTest, stringFacetMincountZeroPadsZerosByValue) {
   helper.index(flatdoc("id", "3", "cat_s", "y", "sel_s", "no"), UpdateMessage::NO_COMMIT);
   helper.index(flatdoc("id", "4", "cat_s", "z", "sel_s", "no"), UpdateMessage::COMMIT);
 
-  auto* lreq = LocalReq::create(soluxNode->getSearchEngine());
-  lreq->proto.mutable_collection()->add_name("main");
-  lreq->proto.set_request_id("test_string_facet_mincount_zero_small_cardinality");
+  auto req = localReq(soluxNode->getSearchEngine());
+  req->collection("main");
 
-  auto& topDocs = *(*lreq->proto.mutable_ops())["q"].mutable_top_docs();
-  topDocs.set_get_number(true);
-  auto& match = *topDocs.mutable_query()->mutable_match();
-  match.set_field("sel_s");
-  match.mutable_val()->set_s("yes");
+  auto& topDocs = req->topDocs();
+  topDocs.getNumber(true).matchQuery("sel_s", "yes");
 
-  auto& facet = *(*topDocs.mutable_ops())["f"].mutable_field_facet();
-  facet.set_field("cat_s");
-  facet.set_limit(-1);
-  facet.set_mincount(0);
+  topDocs.facet("f", "cat_s").limit(-1).mincount(0);
 
-  lreq->engine.submit(*lreq, true);
+  req->execute(true);
 
-  ASSERT_EQ(1, lreq->responses.size()) << lreq->toString();
-  ASSERT_FALSE(lreq->responses[0]->proto.has_error()) << lreq->toString();
-  const auto& facetResult = lreq->responses[0]->proto.ops().at("q").docs().ops().at("f").facet();
-  ASSERT_EQ(3, facetResult.bucket_ids().col_s().v_size()) << lreq->toString();
-  ASSERT_EQ(3, facetResult.counts_size());
-  EXPECT_EQ("x", facetResult.bucket_ids().col_s().v(0));
-  EXPECT_EQ(2, facetResult.counts(0));
-  EXPECT_EQ("y", facetResult.bucket_ids().col_s().v(1));
-  EXPECT_EQ(0, facetResult.counts(1));
-  EXPECT_EQ("z", facetResult.bucket_ids().col_s().v(2));
-  EXPECT_EQ(0, facetResult.counts(2));
-
-  lreq->done();
+  ASSERT_OK(req);
+  const auto* docs = req->docList("q");
+  ASSERT_NE(docs, nullptr) << req->toString();
+  const auto* facetResult = docs->ops.at("f")->facetResult();
+  ASSERT_NE(facetResult, nullptr) << req->toString();
+  const auto& bucketIds = std::get<solux::api::ColStr>(facetResult->bucket_ids->kind);
+  ASSERT_EQ(3, (int)bucketIds.v.size()) << req->toString();
+  ASSERT_EQ(3, (int)facetResult->counts.size());
+  EXPECT_EQ("x", bucketIds.v[0]);
+  EXPECT_EQ(2, facetResult->counts[0]);
+  EXPECT_EQ("y", bucketIds.v[1]);
+  EXPECT_EQ(0, facetResult->counts[1]);
+  EXPECT_EQ("z", bucketIds.v[2]);
+  EXPECT_EQ(0, facetResult->counts[2]);
 }
 
 TEST_F(FacetTest, stringFacetMincountZeroPadsToFiniteLimit) {
@@ -931,38 +817,32 @@ TEST_F(FacetTest, stringFacetMincountZeroPadsToFiniteLimit) {
   helper.index(flatdoc("id", "5", "cat_s", "d", "sel_s", "no"), UpdateMessage::NO_COMMIT);
   helper.index(flatdoc("id", "6", "cat_s", "e", "sel_s", "no"), UpdateMessage::COMMIT);
 
-  auto* lreq = LocalReq::create(soluxNode->getSearchEngine());
-  lreq->proto.mutable_collection()->add_name("main");
-  lreq->proto.set_request_id("test_string_facet_mincount_zero_finite_limit");
+  auto req = localReq(soluxNode->getSearchEngine());
+  req->collection("main");
 
-  auto& topDocs = *(*lreq->proto.mutable_ops())["q"].mutable_top_docs();
-  topDocs.set_get_number(true);
-  auto& match = *topDocs.mutable_query()->mutable_match();
-  match.set_field("sel_s");
-  match.mutable_val()->set_s("yes");
+  auto& topDocs = req->topDocs();
+  topDocs.getNumber(true).matchQuery("sel_s", "yes");
 
-  auto& facet = *(*topDocs.mutable_ops())["f"].mutable_field_facet();
-  facet.set_field("cat_s");
-  facet.set_limit(4);
-  facet.set_mincount(0);
+  topDocs.facet("f", "cat_s").limit(4).mincount(0);
 
-  lreq->engine.submit(*lreq, true);
+  req->execute(true);
 
-  ASSERT_EQ(1, lreq->responses.size()) << lreq->toString();
-  ASSERT_FALSE(lreq->responses[0]->proto.has_error()) << lreq->toString();
-  const auto& facetResult = lreq->responses[0]->proto.ops().at("q").docs().ops().at("f").facet();
-  ASSERT_EQ(4, facetResult.bucket_ids().col_s().v_size()) << lreq->toString();
-  ASSERT_EQ(4, facetResult.counts_size());
-  EXPECT_EQ("a", facetResult.bucket_ids().col_s().v(0));
-  EXPECT_EQ(2, facetResult.counts(0));
-  EXPECT_EQ("b", facetResult.bucket_ids().col_s().v(1));
-  EXPECT_EQ(1, facetResult.counts(1));
-  EXPECT_EQ("c", facetResult.bucket_ids().col_s().v(2));
-  EXPECT_EQ(0, facetResult.counts(2));
-  EXPECT_EQ("d", facetResult.bucket_ids().col_s().v(3));
-  EXPECT_EQ(0, facetResult.counts(3));
-
-  lreq->done();
+  ASSERT_OK(req);
+  const auto* docs = req->docList("q");
+  ASSERT_NE(docs, nullptr) << req->toString();
+  const auto* facetResult = docs->ops.at("f")->facetResult();
+  ASSERT_NE(facetResult, nullptr) << req->toString();
+  const auto& bucketIds = std::get<solux::api::ColStr>(facetResult->bucket_ids->kind);
+  ASSERT_EQ(4, (int)bucketIds.v.size()) << req->toString();
+  ASSERT_EQ(4, (int)facetResult->counts.size());
+  EXPECT_EQ("a", bucketIds.v[0]);
+  EXPECT_EQ(2, facetResult->counts[0]);
+  EXPECT_EQ("b", bucketIds.v[1]);
+  EXPECT_EQ(1, facetResult->counts[1]);
+  EXPECT_EQ("c", bucketIds.v[2]);
+  EXPECT_EQ(0, facetResult->counts[2]);
+  EXPECT_EQ("d", bucketIds.v[3]);
+  EXPECT_EQ(0, facetResult->counts[3]);
 }
 
 TEST_F(FacetTest, fullTextFacetMincountZeroShowsOutOfDomainTerms) {
@@ -973,38 +853,32 @@ TEST_F(FacetTest, fullTextFacetMincountZeroShowsOutOfDomainTerms) {
   helper.index(flatdoc("id", "3", "sel_s", "no", "body_w", "gamma"), UpdateMessage::NO_COMMIT);
   helper.index(flatdoc("id", "4", "sel_s", "no", "body_w", "delta"), UpdateMessage::COMMIT);
 
-  auto* lreq = LocalReq::create(soluxNode->getSearchEngine());
-  lreq->proto.mutable_collection()->add_name("main");
-  lreq->proto.set_request_id("test_full_text_facet_mincount_zero");
+  auto req = localReq(soluxNode->getSearchEngine());
+  req->collection("main");
 
-  auto& topDocs = *(*lreq->proto.mutable_ops())["q"].mutable_top_docs();
-  topDocs.set_get_number(true);
-  auto& match = *topDocs.mutable_query()->mutable_match();
-  match.set_field("sel_s");
-  match.mutable_val()->set_s("yes");
+  auto& topDocs = req->topDocs();
+  topDocs.getNumber(true).matchQuery("sel_s", "yes");
 
-  auto& facet = *(*topDocs.mutable_ops())["f"].mutable_field_facet();
-  facet.set_field("body_w");
-  facet.set_limit(-1);
-  facet.set_mincount(0);
+  topDocs.facet("f", "body_w").limit(-1).mincount(0);
 
-  lreq->engine.submit(*lreq, true);
+  req->execute(true);
 
-  ASSERT_EQ(1, lreq->responses.size()) << lreq->toString();
-  ASSERT_FALSE(lreq->responses[0]->proto.has_error()) << lreq->toString();
-  const auto& facetResult = lreq->responses[0]->proto.ops().at("q").docs().ops().at("f").facet();
-  ASSERT_EQ(4, facetResult.bucket_ids().col_s().v_size()) << lreq->toString();
-  ASSERT_EQ(4, facetResult.counts_size());
-  EXPECT_EQ("alpha", facetResult.bucket_ids().col_s().v(0));
-  EXPECT_EQ(2, facetResult.counts(0));
-  EXPECT_EQ("beta", facetResult.bucket_ids().col_s().v(1));
-  EXPECT_EQ(1, facetResult.counts(1));
-  EXPECT_EQ("delta", facetResult.bucket_ids().col_s().v(2));
-  EXPECT_EQ(0, facetResult.counts(2));
-  EXPECT_EQ("gamma", facetResult.bucket_ids().col_s().v(3));
-  EXPECT_EQ(0, facetResult.counts(3));
-
-  lreq->done();
+  ASSERT_OK(req);
+  const auto* docs = req->docList("q");
+  ASSERT_NE(docs, nullptr) << req->toString();
+  const auto* facetResult = docs->ops.at("f")->facetResult();
+  ASSERT_NE(facetResult, nullptr) << req->toString();
+  const auto& bucketIds = std::get<solux::api::ColStr>(facetResult->bucket_ids->kind);
+  ASSERT_EQ(4, (int)bucketIds.v.size()) << req->toString();
+  ASSERT_EQ(4, (int)facetResult->counts.size());
+  EXPECT_EQ("alpha", bucketIds.v[0]);
+  EXPECT_EQ(2, facetResult->counts[0]);
+  EXPECT_EQ("beta", bucketIds.v[1]);
+  EXPECT_EQ(1, facetResult->counts[1]);
+  EXPECT_EQ("delta", bucketIds.v[2]);
+  EXPECT_EQ(0, facetResult->counts[2]);
+  EXPECT_EQ("gamma", bucketIds.v[3]);
+  EXPECT_EQ(0, facetResult->counts[3]);
 }
 
 // Finding 3: avg op nested under a selective query (sparse ArrDocSet domain).
@@ -1026,30 +900,22 @@ TEST_F(FacetTest, avgNestedSparseArrayDomain) {
   }
   helper.commit();
 
-  auto* lreq = LocalReq::create(soluxNode->getSearchEngine());
-  lreq->proto.mutable_collection()->add_name("main");
-  lreq->proto.set_request_id("test_avg_nested_sparse_array_domain");
+  auto req = localReq(soluxNode->getSearchEngine());
+  req->collection("main");
 
-  auto& topDocs = *(*lreq->proto.mutable_ops())["q"].mutable_top_docs();
-  topDocs.set_get_number(true);
-  auto& match = *topDocs.mutable_query()->mutable_match();
-  match.set_field("pick_s");
-  match.mutable_val()->set_s("yes");
+  auto& topDocs = req->topDocs();
+  topDocs.getNumber(true).matchQuery("pick_s", "yes");
 
-  auto& avg = *(*topDocs.mutable_ops())["a"].mutable_gen_op();
-  avg.set_name("avg");
-  avg.mutable_args()->Add()->set_s("val_i");
+  topDocs.avg("a", "val_i");
 
-  lreq->engine.submit(*lreq, true);
+  req->execute(true);
 
-  ASSERT_EQ(1, lreq->responses.size()) << lreq->toString();
-  ASSERT_FALSE(lreq->responses[0]->proto.has_error()) << lreq->toString();
-  const auto& docs = lreq->responses[0]->proto.ops().at("q").docs();
-  ASSERT_EQ(3, docs.matches());
+  ASSERT_OK(req);
+  const auto* docs = req->docList("q");
+  ASSERT_NE(docs, nullptr) << req->toString();
+  ASSERT_EQ(3, docs->matches.value_or(0));
   // avg over the 3 in-domain docs: (10+20+30)/3 = 20
-  EXPECT_DOUBLE_EQ(20.0, docs.ops().at("a").d());
-
-  lreq->done();
+  EXPECT_DOUBLE_EQ(20.0, std::get<double>(docs->ops.at("a")->kind));
 }
 
 // Finding 4: full-text facet per-doc missing. A segment that has the field but
@@ -1064,33 +930,31 @@ TEST_F(FacetTest, fullTextFacetMixedPresenceMissing) {
   helper.index(flatdoc("id", "3", "other_s", "x"), UpdateMessage::NO_COMMIT);
   helper.index(flatdoc("id", "4", "other_s", "y"), UpdateMessage::COMMIT);
 
-  auto* lreq = LocalReq::create(soluxNode->getSearchEngine());
-  lreq->proto.mutable_collection()->add_name("main");
-  lreq->proto.set_request_id("test_full_text_facet_mixed_presence_missing");
+  auto req = localReq(soluxNode->getSearchEngine());
+  req->collection("main");
 
-  auto& topDocs = *(*lreq->proto.mutable_ops())["q"].mutable_top_docs();
-  topDocs.set_get_number(true);
-  topDocs.mutable_query()->set_all(true);
+  auto& topDocs = req->topDocs();
+  topDocs.getNumber(true).allQuery();
 
-  auto& facet = *(*topDocs.mutable_ops())["f"].mutable_field_facet();
-  facet.set_field("body_w");
-  facet.set_limit(-1);
-  facet.set_missing(true);
+  auto& facet = topDocs.facet("f", "body_w");
+  facet.limit(-1);
+  std::get<solux::api::FieldFacet>(facet.rawOp().kind).missing = true;
 
-  lreq->engine.submit(*lreq, true);
+  req->execute(true);
 
-  ASSERT_EQ(1, lreq->responses.size()) << lreq->toString();
-  ASSERT_FALSE(lreq->responses[0]->proto.has_error()) << lreq->toString();
-  const auto& facetResult = lreq->responses[0]->proto.ops().at("q").docs().ops().at("f").facet();
-  ASSERT_EQ(2, facetResult.bucket_ids().col_s().v_size());
-  EXPECT_EQ("alpha", facetResult.bucket_ids().col_s().v(0));
-  EXPECT_EQ(2, facetResult.counts(0));
-  EXPECT_EQ("beta", facetResult.bucket_ids().col_s().v(1));
-  EXPECT_EQ(1, facetResult.counts(1));
+  ASSERT_OK(req);
+  const auto* docs = req->docList("q");
+  ASSERT_NE(docs, nullptr) << req->toString();
+  const auto* facetResult = docs->ops.at("f")->facetResult();
+  ASSERT_NE(facetResult, nullptr) << req->toString();
+  const auto& bucketIds = std::get<solux::api::ColStr>(facetResult->bucket_ids->kind);
+  ASSERT_EQ(2, (int)bucketIds.v.size());
+  EXPECT_EQ("alpha", bucketIds.v[0]);
+  EXPECT_EQ(2, facetResult->counts[0]);
+  EXPECT_EQ("beta", bucketIds.v[1]);
+  EXPECT_EQ(1, facetResult->counts[1]);
   // docs 3 and 4 have no body_w token -> missing = 2 (pre-fix counted 0).
-  EXPECT_EQ(2, facetResult.missing());
-
-  lreq->done();
+  EXPECT_EQ(2, facetResult->missing.value_or(0));
 }
 
 // Full-text facet missing under a selective query: the domain is a sparse
@@ -1116,40 +980,35 @@ TEST_F(FacetTest, fullTextFacetSparseDomainMissing) {
   }
   helper.commit();
 
-  auto* lreq = LocalReq::create(soluxNode->getSearchEngine());
-  lreq->proto.mutable_collection()->add_name("main");
-  lreq->proto.set_request_id("test_full_text_facet_sparse_domain_missing");
+  auto req = localReq(soluxNode->getSearchEngine());
+  req->collection("main");
 
-  auto& topDocs = *(*lreq->proto.mutable_ops())["q"].mutable_top_docs();
-  topDocs.set_get_number(true);
-  auto& match = *topDocs.mutable_query()->mutable_match();
-  match.set_field("pick_s");
-  match.mutable_val()->set_s("yes");
+  auto& topDocs = req->topDocs();
+  topDocs.getNumber(true).matchQuery("pick_s", "yes");
 
-  auto& facet = *(*topDocs.mutable_ops())["f"].mutable_field_facet();
-  facet.set_field("body_w");
-  facet.set_limit(-1);
-  facet.set_missing(true);
+  auto& facet = topDocs.facet("f", "body_w");
+  facet.limit(-1);
+  std::get<solux::api::FieldFacet>(facet.rawOp().kind).missing = true;
 
-  lreq->engine.submit(*lreq, true);
+  req->execute(true);
 
-  ASSERT_EQ(1, lreq->responses.size()) << lreq->toString();
-  ASSERT_FALSE(lreq->responses[0]->proto.has_error()) << lreq->toString();
-  const auto& docs = lreq->responses[0]->proto.ops().at("q").docs();
-  ASSERT_EQ(3, docs.matches());
-  const auto& facetResult = docs.ops().at("f").facet();
+  ASSERT_OK(req);
+  const auto* docs = req->docList("q");
+  ASSERT_NE(docs, nullptr) << req->toString();
+  ASSERT_EQ(3, docs->matches.value_or(0));
+  const auto* facetResult = docs->ops.at("f")->facetResult();
+  ASSERT_NE(facetResult, nullptr) << req->toString();
+  const auto& bucketIds = std::get<solux::api::ColStr>(facetResult->bucket_ids->kind);
   // Only in-domain docs contribute: alpha (doc 5) and beta (doc 50). The gamma
   // docs have body_w but are out of domain, so they appear in neither the
   // buckets nor the have-field count.
-  ASSERT_EQ(2, facetResult.bucket_ids().col_s().v_size());
-  EXPECT_EQ("alpha", facetResult.bucket_ids().col_s().v(0));
-  EXPECT_EQ("beta", facetResult.bucket_ids().col_s().v(1));
-  EXPECT_EQ(1, facetResult.counts(0));
-  EXPECT_EQ(1, facetResult.counts(1));
+  ASSERT_EQ(2, (int)bucketIds.v.size());
+  EXPECT_EQ("alpha", bucketIds.v[0]);
+  EXPECT_EQ("beta", bucketIds.v[1]);
+  EXPECT_EQ(1, facetResult->counts[0]);
+  EXPECT_EQ(1, facetResult->counts[1]);
   // domain = {5, 50, 95}; doc 95 has no body_w -> missing = 1.
-  EXPECT_EQ(1, facetResult.missing());
-
-  lreq->done();
+  EXPECT_EQ(1, facetResult->missing.value_or(0));
 }
 
 // Diagnostic: facet avg() sub-op must average only over the query domain, not
@@ -1172,32 +1031,29 @@ TEST_F(FacetTest, facetAvgRespectsSelectiveDomain) {
 
   // domain = {A,C,D,F,G}; x={A,D} avg 20; y={C,F} avg 30; z={G} avg 100 (count 1).
   for (int64_t limit : {(int64_t)10, (int64_t)-1}) {
-    auto* lreq = LocalReq::create(soluxNode->getSearchEngine());
-    lreq->proto.mutable_collection()->add_name("main");
-    lreq->proto.set_request_id("test_facet_avg_domain");
-    auto& topDocs = *(*lreq->proto.mutable_ops())["q"].mutable_top_docs();
-    topDocs.set_get_number(true);
-    auto& match = *topDocs.mutable_query()->mutable_match();
-    match.set_field("sel_s");
-    match.mutable_val()->set_s("yes");
-    auto& facet = *(*topDocs.mutable_ops())["f"].mutable_field_facet();
-    facet.set_field("cat_s");
-    facet.set_limit(limit);
-    auto& avg = *(*facet.mutable_ops())["av"].mutable_gen_op();
-    avg.set_name("avg");
-    avg.mutable_args()->Add()->set_s("avgval_i");
-    lreq->engine.submit(*lreq, true);
+    auto req = localReq(soluxNode->getSearchEngine());
+    req->collection("main");
+    auto& topDocs = req->topDocs();
+    topDocs.getNumber(true).matchQuery("sel_s", "yes");
+    auto& facet = topDocs.facet("f", "cat_s");
+    facet.limit(limit);
+    facet.avg("av", "avgval_i");
+    req->execute(true);
 
-    ASSERT_FALSE(lreq->responses[0]->proto.has_error()) << lreq->toString();
-    const auto& f = lreq->responses[0]->proto.ops().at("q").docs().ops().at("f").facet();
-    ASSERT_EQ(3, f.bucket_ids().col_s().v_size()) << "limit=" << limit << "\n" << lreq->toString();
+    ASSERT_FALSE(hasError(req->responses[0]->proto)) << req->toString();
+    const auto* docs = req->docList("q");
+    ASSERT_NE(docs, nullptr) << req->toString();
+    const auto* f = docs->ops.at("f")->facetResult();
+    ASSERT_NE(f, nullptr) << req->toString();
+    const auto& bucketIds = std::get<solux::api::ColStr>(f->bucket_ids->kind);
+    const auto& avgArr = std::get<solux::api::ArrDouble>(f->ops.at("av")->kind);
+    ASSERT_EQ(3, (int)bucketIds.v.size()) << "limit=" << limit << "\n" << req->toString();
     std::map<std::string, double> got;
-    for (int i = 0; i < f.bucket_ids().col_s().v_size(); i++)
-      got[std::string(f.bucket_ids().col_s().v(i))] = f.ops().at("av").arr_d().v(i);
-    EXPECT_DOUBLE_EQ(20.0, got["x"]) << "limit=" << limit << "\n" << lreq->toString();
-    EXPECT_DOUBLE_EQ(30.0, got["y"]) << "limit=" << limit << "\n" << lreq->toString();
-    EXPECT_DOUBLE_EQ(100.0, got["z"]) << "limit=" << limit << "\n" << lreq->toString();
-    lreq->done();
+    for (int i = 0; i < (int)bucketIds.v.size(); i++)
+      got[std::string(bucketIds.v[i])] = avgArr.v[i];
+    EXPECT_DOUBLE_EQ(20.0, got["x"]) << "limit=" << limit << "\n" << req->toString();
+    EXPECT_DOUBLE_EQ(30.0, got["y"]) << "limit=" << limit << "\n" << req->toString();
+    EXPECT_DOUBLE_EQ(100.0, got["z"]) << "limit=" << limit << "\n" << req->toString();
   }
 }
 
@@ -1213,30 +1069,26 @@ TEST_F(FacetTest, facetAvgFieldAbsentInSegment) {
   helper.index(flatdoc("id", "C", "sel_s", "yes", "avgval_i", 1000), UpdateMessage::NO_COMMIT);
   helper.index(flatdoc("id", "D", "sel_s", "yes", "avgval_i", 2000), UpdateMessage::COMMIT);
 
-  auto* lreq = LocalReq::create(soluxNode->getSearchEngine());
-  lreq->proto.mutable_collection()->add_name("main");
-  lreq->proto.set_request_id("test_facet_avg_field_absent_in_segment");
-  auto& topDocs = *(*lreq->proto.mutable_ops())["q"].mutable_top_docs();
-  topDocs.set_get_number(true);
-  auto& match = *topDocs.mutable_query()->mutable_match();
-  match.set_field("sel_s");
-  match.mutable_val()->set_s("yes");
-  auto& facet = *(*topDocs.mutable_ops())["f"].mutable_field_facet();
-  facet.set_field("cat_s");
-  facet.set_limit(10);  // finite -> post-hoc sub-op path
-  auto& avg = *(*facet.mutable_ops())["av"].mutable_gen_op();
-  avg.set_name("avg");
-  avg.mutable_args()->Add()->set_s("avgval_i");
-  lreq->engine.submit(*lreq, true);
+  auto req = localReq(soluxNode->getSearchEngine());
+  req->collection("main");
+  auto& topDocs = req->topDocs();
+  topDocs.getNumber(true).matchQuery("sel_s", "yes");
+  auto& facet = topDocs.facet("f", "cat_s");
+  facet.limit(10);  // finite -> post-hoc sub-op path
+  facet.avg("av", "avgval_i");
+  req->execute(true);
 
-  ASSERT_FALSE(lreq->responses[0]->proto.has_error()) << lreq->toString();
-  const auto& f = lreq->responses[0]->proto.ops().at("q").docs().ops().at("f").facet();
-  ASSERT_EQ(1, f.bucket_ids().col_s().v_size()) << lreq->toString();
-  EXPECT_EQ("x", f.bucket_ids().col_s().v(0));
-  EXPECT_EQ(2, f.counts(0));
+  ASSERT_FALSE(hasError(req->responses[0]->proto)) << req->toString();
+  const auto* docs = req->docList("q");
+  ASSERT_NE(docs, nullptr) << req->toString();
+  const auto* f = docs->ops.at("f")->facetResult();
+  ASSERT_NE(f, nullptr) << req->toString();
+  const auto& bucketIds = std::get<solux::api::ColStr>(f->bucket_ids->kind);
+  ASSERT_EQ(1, (int)bucketIds.v.size()) << req->toString();
+  EXPECT_EQ("x", bucketIds.v[0]);
+  EXPECT_EQ(2, f->counts[0]);
   // bucket x = {A,B}; avg = (10+20)/2 = 15. C,D lack cat_s and must NOT leak in.
-  EXPECT_DOUBLE_EQ(15.0, f.ops().at("av").arr_d().v(0)) << lreq->toString();
-  lreq->done();
+  EXPECT_DOUBLE_EQ(15.0, std::get<solux::api::ArrDouble>(f->ops.at("av")->kind).v[0]) << req->toString();
 }
 
 // Nested facet: a string facet under a string facet, returning a per-parent-
@@ -1247,38 +1099,40 @@ TEST_F(FacetTest, nestedStringFacet) {
   helper.index(flatdoc("id", "2", "cat_s", "x", "sub_s", "q"), UpdateMessage::NO_COMMIT);
   helper.index(flatdoc("id", "3", "cat_s", "y", "sub_s", "p"), UpdateMessage::COMMIT);
 
-  auto* lreq = LocalReq::create(soluxNode->getSearchEngine());
-  lreq->proto.mutable_collection()->add_name("main");
-  auto& topDocs = *(*lreq->proto.mutable_ops())["q"].mutable_top_docs();
-  topDocs.mutable_query()->set_all(true);
-  auto& facet = *(*topDocs.mutable_ops())["f"].mutable_field_facet();
-  facet.set_field("cat_s");
-  facet.set_limit(-1);
-  auto& sub = *(*facet.mutable_ops())["sf"].mutable_field_facet();
-  sub.set_field("sub_s");
-  sub.set_limit(-1);
-  lreq->engine.submit(*lreq, true);
+  auto req = localReq(soluxNode->getSearchEngine());
+  req->collection("main");
+  auto& topDocs = req->topDocs();
+  topDocs.allQuery();
+  auto& facet = topDocs.facet("f", "cat_s");
+  facet.limit(-1);
+  facet.facet("sf", "sub_s").limit(-1);
+  req->execute(true);
 
-  ASSERT_FALSE(lreq->responses[0]->proto.has_error()) << lreq->toString();
-  const auto& f = lreq->responses[0]->proto.ops().at("q").docs().ops().at("f").facet();
-  ASSERT_EQ(2, f.bucket_ids().col_s().v_size()) << lreq->toString();
-  EXPECT_EQ("x", f.bucket_ids().col_s().v(0));  // x(2), y(1): count desc
-  EXPECT_EQ("y", f.bucket_ids().col_s().v(1));
-  const auto& sfArr = f.ops().at("sf").arr();
-  ASSERT_EQ(2, sfArr.v_size()) << lreq->toString();  // one sub-facet per parent bucket
+  ASSERT_FALSE(hasError(req->responses[0]->proto)) << req->toString();
+  const auto* docs = req->docList("q");
+  ASSERT_NE(docs, nullptr) << req->toString();
+  const auto* f = docs->ops.at("f")->facetResult();
+  ASSERT_NE(f, nullptr) << req->toString();
+  const auto& fIds = std::get<solux::api::ColStr>(f->bucket_ids->kind);
+  ASSERT_EQ(2, (int)fIds.v.size()) << req->toString();
+  EXPECT_EQ("x", fIds.v[0]);  // x(2), y(1): count desc
+  EXPECT_EQ("y", fIds.v[1]);
+  const auto& sfArr = std::get<solux::api::ArrVal>(f->ops.at("sf")->kind);
+  ASSERT_EQ(2, (int)sfArr.v.size()) << req->toString();  // one sub-facet per parent bucket
   // bucket x = docs {1,2} -> sub_s {p:1, q:1}
-  const auto& sfx = sfArr.v(0).facet();
-  ASSERT_EQ(2, sfx.bucket_ids().col_s().v_size()) << lreq->toString();
-  EXPECT_EQ("p", sfx.bucket_ids().col_s().v(0));
-  EXPECT_EQ("q", sfx.bucket_ids().col_s().v(1));
-  EXPECT_EQ(1, sfx.counts(0));
-  EXPECT_EQ(1, sfx.counts(1));
+  const auto& sfx = std::get<solux::api::FacetResult>(sfArr.v[0].kind);
+  const auto& sfxIds = std::get<solux::api::ColStr>(sfx.bucket_ids->kind);
+  ASSERT_EQ(2, (int)sfxIds.v.size()) << req->toString();
+  EXPECT_EQ("p", sfxIds.v[0]);
+  EXPECT_EQ("q", sfxIds.v[1]);
+  EXPECT_EQ(1, sfx.counts[0]);
+  EXPECT_EQ(1, sfx.counts[1]);
   // bucket y = doc {3} -> sub_s {p:1}
-  const auto& sfy = sfArr.v(1).facet();
-  ASSERT_EQ(1, sfy.bucket_ids().col_s().v_size()) << lreq->toString();
-  EXPECT_EQ("p", sfy.bucket_ids().col_s().v(0));
-  EXPECT_EQ(1, sfy.counts(0));
-  lreq->done();
+  const auto& sfy = std::get<solux::api::FacetResult>(sfArr.v[1].kind);
+  const auto& sfyIds = std::get<solux::api::ColStr>(sfy.bucket_ids->kind);
+  ASSERT_EQ(1, (int)sfyIds.v.size()) << req->toString();
+  EXPECT_EQ("p", sfyIds.v[0]);
+  EXPECT_EQ(1, sfy.counts[0]);
 }
 
 //
@@ -1301,8 +1155,35 @@ protected:
     int sparsityPercent;  // 0 = always missing, 100 = always present
   };
   
-  // No need for FacetRequest struct anymore - we'll just use the protobuf directly
-  
+  // No need for FacetRequest struct anymore - we read the built request directly.
+
+  // The request is built via the OpCursor fluent API; the model reads it back through the
+  // non-owning concrete request view (LocalReq::proto, a solux::api::SearchRequest).
+  using ReqOps = solux::test::OpsMap;  // map_view<string_view, indirect_view<SearchOp>>
+  using RespOps = solux::api::map_view<std::string_view, ::hpp_proto::indirect_view<solux::api::Val>>;
+
+  // Plain expected-result mirror of the engine's solux::api facet/doclist output. The model
+  // computes these from the built request; verify compares the (non-owning, arena-backed)
+  // engine output against them. (The api result types are spans into an arena, so a plain
+  // owning mirror is simpler than rebuilding owning api structs.)
+  struct ExpFacet {
+    bool isRange = false;
+    bool intBuckets = false;                              // field facet: int vs string buckets
+    std::vector<int64_t> intIds;                          // field facet int buckets
+    std::vector<std::string> strIds;                      // field facet string buckets
+    std::vector<std::pair<int64_t, int64_t>> rangePairs;  // range facet [lo, hi]
+    std::vector<int64_t> counts;
+    std::optional<int64_t> missing;
+    std::map<std::string, std::vector<double>> avgOps;        // avg op name -> per-bucket avg
+    std::map<std::string, std::vector<ExpFacet>> subFacetOps; // sub-facet op name -> per-bucket
+  };
+  struct ExpVal {
+    bool isDocList = false;
+    ExpFacet facet;                     // when !isDocList
+    int64_t matches = 0;                // when isDocList
+    std::map<std::string, ExpVal> ops;  // when isDocList (nested ops)
+  };
+
   // Model to track documents and calculate facets dynamically
   class Model {
   public:
@@ -1326,7 +1207,7 @@ protected:
       return out;
     }
 
-    std::vector<size_t> matchingDocIndexes(const proto::Query& query) const {
+    std::vector<size_t> matchingDocIndexes(const solux::api::Query& query) const {
       std::vector<size_t> out;
       out.reserve(docs.size());
       for (size_t i = 0; i < docs.size(); i++) {
@@ -1347,7 +1228,7 @@ protected:
     }
 
     // Dump model state for debugging
-    void dumpModel(const std::string& field, const proto::Query& query) const {
+    void dumpModel(const std::string& field, const solux::api::Query& query) const {
       LOG_ERROR("=== Model Dump for field '{}' ===", field);
       LOG_ERROR("Total docs: {}", docs.size());
       
@@ -1379,10 +1260,12 @@ protected:
       }
       
       std::string queryStr;
-      if (query.has_match()) {
-        queryStr = "match(" + std::string(query.match().field()) + "=" + 
-          (query.match().val().has_s() ? std::string(query.match().val().s()) : 
-           std::to_string(query.match().val().i())) + ")";
+      if (std::holds_alternative<solux::api::Match>(query.kind)) {
+        const auto& qm = std::get<solux::api::Match>(query.kind);
+        const auto& qv = *qm.val;
+        queryStr = "match(" + std::string(qm.field) + "=" +
+          (std::holds_alternative<std::string_view>(qv.kind) ? std::string(std::get<std::string_view>(qv.kind)) :
+           std::to_string(std::get<int64_t>(qv.kind))) + ")";
       } else {
         queryStr = "all";
       }
@@ -1413,32 +1296,33 @@ protected:
     }
     
     // Check if a document matches a query
-    bool matchesQuery(const Doc& doc, const proto::Query& query) const {
-      if (query.has_all() && query.all()) {
+    bool matchesQuery(const Doc& doc, const solux::api::Query& query) const {
+      if (std::holds_alternative<bool>(query.kind) && std::get<bool>(query.kind)) {
         return true;
       }
-      
-      if (query.has_match()) {
-        const auto& match = query.match();
+
+      if (std::holds_alternative<solux::api::Match>(query.kind)) {
+        const auto& match = std::get<solux::api::Match>(query.kind);
+        const auto& matchVal = *match.val;
         std::vector<const FieldVal*> vals;
-        findAll(doc, match.field(), vals);
+        findAll(doc, match.field, vals);
         if (vals.empty()) return false;
-        if (match.val().has_s()) {
+        if (std::holds_alternative<std::string_view>(matchVal.kind)) {
           for (auto* val : vals) {
             if (auto* strVal = std::get_if<std::string>(val)) {
-              if (*strVal == match.val().s()) return true;
+              if (*strVal == std::get<std::string_view>(matchVal.kind)) return true;
             }
           }
-        } else if (match.val().has_i()) {
+        } else if (std::holds_alternative<int64_t>(matchVal.kind)) {
           for (auto* val : vals) {
             if (auto* intVal = std::get_if<int64_t>(val)) {
-              if (*intVal == match.val().i()) return true;
+              if (*intVal == std::get<int64_t>(matchVal.kind)) return true;
             }
           }
         }
         return false;
       }
-      
+
       // TODO: Add support for range, boolean queries
       return true;  // Default to matching for unsupported query types
     }
@@ -1470,118 +1354,123 @@ protected:
     }
     
     // Process all operations in an ops map recursively
-    void processOps(const google::protobuf::Map<std::string, proto::SearchOp>& requestOps,
-                    google::protobuf::Map<std::string, proto::Val>* responseOps) const {
-      
+    void processOps(const ReqOps& requestOps, std::map<std::string, ExpVal>& responseOps) const {
+
       auto allDocs = allDocIndexes();
-      for (const auto& [opName, searchOp] : requestOps) {
-        if (searchOp.has_field_facet()) {
+      for (const auto& [opName, searchOpPtr] : requestOps) {
+        const auto& searchOp = *searchOpPtr;
+        if (std::holds_alternative<solux::api::FieldFacet>(searchOp.kind)) {
           // Process field facet - facets at root level operate on all documents
-          (*responseOps)[opName] = calculateFieldFacet(searchOp.field_facet(), allDocs);
-        } else if (searchOp.has_range_facet()) {
-          (*responseOps)[opName] = calculateRangeFacet(searchOp.range_facet(), allDocs);
-        } else if (searchOp.has_top_docs()) {
+          ExpVal v; v.facet = calculateFieldFacet(std::get<solux::api::FieldFacet>(searchOp.kind), allDocs);
+          responseOps[std::string(opName)] = std::move(v);
+        } else if (std::holds_alternative<solux::api::RangeFacet>(searchOp.kind)) {
+          ExpVal v; v.facet = calculateRangeFacet(std::get<solux::api::RangeFacet>(searchOp.kind), allDocs);
+          responseOps[std::string(opName)] = std::move(v);
+        } else if (std::holds_alternative<solux::api::TopDocs>(searchOp.kind)) {
           // Process top docs query (which may have nested ops)
-          const auto& topDocs = searchOp.top_docs();
-          proto::Val result;
-          auto* docList = result.mutable_docs();
-          
+          const auto& topDocs = std::get<solux::api::TopDocs>(searchOp.kind);
+
           // The query in top_docs defines the domain for nested ops
-          proto::Query effectiveQuery = topDocs.has_query() ? topDocs.query() : proto::Query();
-          if (!effectiveQuery.kind_case()) {
-            effectiveQuery.set_all(true);  // Default to all if no query specified
+          solux::api::Query effectiveQuery;
+          if (topDocs.query.has_value()) effectiveQuery = *topDocs.query;
+          if (effectiveQuery.kind.index() == 0) {
+            effectiveQuery.kind = true;  // Default to all if no query specified
           }
-          
+
           auto matchingDocs = matchingDocIndexes(effectiveQuery);
-          docList->set_matches(matchingDocs.size());
-          
+          ExpVal v; v.isDocList = true; v.matches = (int64_t)matchingDocs.size();
+
           // Process any nested operations under this query with the query as their domain
-          if (topDocs.ops_size() > 0) {
-            processOpsWithDomain(topDocs.ops(), docList->mutable_ops(), matchingDocs);
+          if (!topDocs.ops.empty()) {
+            processOpsWithDomain(topDocs.ops, v.ops, matchingDocs);
           }
-          
-          (*responseOps)[opName] = result;
+
+          responseOps[std::string(opName)] = std::move(v);
         }
         // Add other operation types as needed
       }
     }
-    
+
     // Process operations with a specific domain query (for nested ops)
-    void processOpsWithDomain(const google::protobuf::Map<std::string, proto::SearchOp>& requestOps,
-                               google::protobuf::Map<std::string, proto::Val>* responseOps,
+    void processOpsWithDomain(const ReqOps& requestOps, std::map<std::string, ExpVal>& responseOps,
                                const std::vector<size_t>& domainDocs) const {
-      
-      for (const auto& [opName, searchOp] : requestOps) {
-        if (searchOp.has_field_facet()) {
+
+      for (const auto& [opName, searchOpPtr] : requestOps) {
+        const auto& searchOp = *searchOpPtr;
+        if (std::holds_alternative<solux::api::FieldFacet>(searchOp.kind)) {
           // Nested facet uses the domain query from its parent
-          (*responseOps)[opName] = calculateFieldFacet(searchOp.field_facet(), domainDocs);
-        } else if (searchOp.has_range_facet()) {
-          (*responseOps)[opName] = calculateRangeFacet(searchOp.range_facet(), domainDocs);
-        } else if (searchOp.has_top_docs()) {
+          ExpVal v; v.facet = calculateFieldFacet(std::get<solux::api::FieldFacet>(searchOp.kind), domainDocs);
+          responseOps[std::string(opName)] = std::move(v);
+        } else if (std::holds_alternative<solux::api::RangeFacet>(searchOp.kind)) {
+          ExpVal v; v.facet = calculateRangeFacet(std::get<solux::api::RangeFacet>(searchOp.kind), domainDocs);
+          responseOps[std::string(opName)] = std::move(v);
+        } else if (std::holds_alternative<solux::api::TopDocs>(searchOp.kind)) {
           // Nested top_docs would combine its query with the domain query
           // This is more complex and would need proper query combination logic
           // For now, just using the nested query
-          const auto& topDocs = searchOp.top_docs();
-          proto::Val result;
-          auto* docList = result.mutable_docs();
-          
-          if (topDocs.has_query()) {
-            auto matchingDocs = matchingDocIndexes(topDocs.query());
-            docList->set_matches(matchingDocs.size());
-            if (topDocs.ops_size() > 0) {
-              processOpsWithDomain(topDocs.ops(), docList->mutable_ops(), matchingDocs);
+          const auto& topDocs = std::get<solux::api::TopDocs>(searchOp.kind);
+          ExpVal v; v.isDocList = true;
+
+          if (topDocs.query.has_value()) {
+            auto matchingDocs = matchingDocIndexes(*topDocs.query);
+            v.matches = (int64_t)matchingDocs.size();
+            if (!topDocs.ops.empty()) {
+              processOpsWithDomain(topDocs.ops, v.ops, matchingDocs);
             }
           } else {
-            docList->set_matches(domainDocs.size());
-            if (topDocs.ops_size() > 0) {
-              processOpsWithDomain(topDocs.ops(), docList->mutable_ops(), domainDocs);
+            v.matches = (int64_t)domainDocs.size();
+            if (!topDocs.ops.empty()) {
+              processOpsWithDomain(topDocs.ops, v.ops, domainDocs);
             }
           }
-          
-          (*responseOps)[opName] = result;
+
+          responseOps[std::string(opName)] = std::move(v);
         }
       }
     }
           
     // Calculate expected facet results for a single field facet
-    proto::Val calculateFieldFacet(const proto::FieldFacet& facetOp,
-                                   const std::vector<size_t>& domainDocs) const {
-      proto::Val result;
-      auto* facetResult = result.mutable_facet();
-          
-      std::string fieldName(facetOp.field());
-      int64_t limit = facetOp.limit();
-      bool hasMin = facetOp.has_mincount();
-      int64_t mincount = hasMin ? std::max<int64_t>(facetOp.mincount(), 1) : 1;
-      bool includeMissing = facetOp.missing();
-    
+    ExpFacet calculateFieldFacet(const solux::api::FieldFacet& facetOp,
+                                 const std::vector<size_t>& domainDocs) const {
+      ExpFacet out;
+
+      std::string fieldName(facetOp.field);
+      int64_t limit = facetOp.limit.value_or(0);
+      bool hasMin = facetOp.mincount.has_value();
+      int64_t mincount = hasMin ? std::max<int64_t>(*facetOp.mincount, 1) : 1;
+      bool includeMissing = facetOp.missing;
+
       // Determine field type from field name convention
       bool isIntField = fieldName.ends_with("_i") || fieldName.ends_with("_is");
-      bool showZeros = !isIntField && hasMin && facetOp.mincount() == 0;
+      bool showZeros = !isIntField && hasMin && *facetOp.mincount == 0;
 
       // avg() sub-ops (string/id parent only; the parser rejects sub-ops on
       // int/range/text). There can be several; at most one is the sort key.
       struct AvgOpDef { std::string name, field; };
       std::vector<AvgOpDef> avgOps;
-      for (const auto& [opName, sub] : facetOp.ops()) {
-        if (sub.has_gen_op() && (sub.gen_op().name() == "avg" || sub.gen_op().name() == "average")) {
-          avgOps.push_back({opName, std::string(sub.gen_op().args(0).s())});
+      for (const auto& [opName, subPtr] : facetOp.ops) {
+        const auto& sub = *subPtr;
+        if (std::holds_alternative<solux::api::GenOp>(sub.kind)) {
+          const auto& genOp = std::get<solux::api::GenOp>(sub.kind);
+          if (genOp.name == "avg" || genOp.name == "average") {
+            avgOps.push_back({std::string(opName), std::string(std::get<std::string_view>(genOp.args[0].kind))});
+          }
         }
       }
       bool hasAvg = !avgOps.empty();
       int sortAvgIdx = -1;  // index into avgOps of the sort key, or -1
-      if (facetOp.sorts_size() > 0) {
+      if (!facetOp.sorts.empty()) {
         for (size_t k = 0; k < avgOps.size(); k++)
-          if (avgOps[k].name == facetOp.sorts(0).field()) { sortAvgIdx = (int)k; break; }
+          if (avgOps[k].name == facetOp.sorts[0].field) { sortAvgIdx = (int)k; break; }
       }
-      bool avgDesc = sortAvgIdx >= 0 && facetOp.sorts(0).dir() == proto::SortSpec_SortDir_DESC;
+      bool avgDesc = sortAvgIdx >= 0 && facetOp.sorts[0].dir == solux::api::SortSpec_::SortDir::DESC;
 
       // Count values for documents matching the domain query
       boost::unordered_flat_map<int64_t, int64_t> intCounts;
       boost::unordered_flat_map<std::string, int64_t> strCounts;
       boost::unordered_flat_map<std::string, std::vector<int64_t>> strAvgSums; // bucket -> sum per avgOp
       int64_t missingCount = 0;
-      
+
       std::vector<const FieldVal*> vals;
       if (showZeros) {
         for (const auto& doc : docs) {
@@ -1593,7 +1482,7 @@ protected:
           }
         }
       }
-      
+
       for (auto docIdx : domainDocs) {
         const auto& doc = docs[docIdx];
         std::vector<int64_t> avs(avgOps.size(), 0);  // this doc's value per avgOp field
@@ -1624,14 +1513,14 @@ protected:
           missingCount++;
         }
       }
-      
-      // Apply mincount, sort, and limit, then populate protobuf result
+
+      // Apply mincount, sort, and limit, then populate the expected result
       if (isIntField) {
+        out.intBuckets = true;
         auto sorted = sortAndLimitFacets(intCounts, limit, mincount);
-        auto* bucketIds = facetResult->mutable_bucket_ids()->mutable_col_i();
         for (const auto& [val, count] : sorted) {
-          bucketIds->add_v(val);
-          facetResult->add_counts(count);
+          out.intIds.push_back(val);
+          out.counts.push_back(count);
         }
       } else if (hasAvg) {
         // avg fields (avgval_i / avgval2_i) are always present, so every bucket
@@ -1656,44 +1545,38 @@ protected:
           });
         }
         if (limit >= 0 && (int64_t)buckets.size() > limit) buckets.resize(limit);
-        auto* bucketIds = facetResult->mutable_bucket_ids()->mutable_col_s();
         // Only emit sub-op results when there are buckets (the engine's post-hoc
-        // path creates no ops entry for an empty facet). One arr_d per avgOp.
-        std::vector<proto::ArrDouble*> avgArrs;
-        if (!buckets.empty())
-          for (const auto& ao : avgOps)
-            avgArrs.push_back((*facetResult->mutable_ops())[ao.name].mutable_arr_d());
+        // path creates no ops entry for an empty facet). One vector per avgOp;
+        // the push_back below creates each entry on the first bucket.
         for (const auto& b : buckets) {
-          bucketIds->add_v(b.val);
-          facetResult->add_counts(b.count);
+          out.strIds.push_back(b.val);
+          out.counts.push_back(b.count);
           for (size_t k = 0; k < avgOps.size(); k++)
-            avgArrs[k]->add_v((double)b.sums[k] / (double)b.count);
+            out.avgOps[avgOps[k].name].push_back((double)b.sums[k] / (double)b.count);
         }
       } else {
         auto sorted = sortAndLimitFacets(strCounts, limit, showZeros ? 0 : mincount);
-        auto* bucketIds = facetResult->mutable_bucket_ids()->mutable_col_s();
         for (const auto& [val, count] : sorted) {
-          bucketIds->add_v(val);
-          facetResult->add_counts(count);
+          out.strIds.push_back(val);
+          out.counts.push_back(count);
         }
       }
-      
+
       // Set missing count if requested
       if (includeMissing) {
-        facetResult->set_missing(missingCount);
+        out.missing = missingCount;
       }
-      
+
       // Nested sub-facets (string/id parent only; the engine supports facet
       // sub-ops there). One sub-facet per RETURNED bucket, parallel to
       // bucket_ids: ops[name].arr.v[i].facet over that bucket's sub-domain.
       if (!isIntField) {
-        std::vector<std::string> parentVals;
-        for (int i = 0; i < facetResult->bucket_ids().col_s().v_size(); i++)
-          parentVals.push_back(std::string(facetResult->bucket_ids().col_s().v(i)));
-        if (parentVals.empty()) return result;  // engine emits no sub-op for an empty parent
-        for (const auto& [opName, sub] : facetOp.ops()) {
-          if (!sub.has_field_facet()) continue;
-          auto* arr = (*facetResult->mutable_ops())[opName].mutable_arr();
+        const std::vector<std::string>& parentVals = out.strIds;
+        if (parentVals.empty()) return out;  // engine emits no sub-op for an empty parent
+        for (const auto& [opName, subPtr] : facetOp.ops) {
+          const auto& sub = *subPtr;
+          if (!std::holds_alternative<solux::api::FieldFacet>(sub.kind)) continue;
+          auto& arr = out.subFacetOps[std::string(opName)];
           for (const auto& bval : parentVals) {
             std::vector<size_t> bucketDocs;
             std::vector<const FieldVal*> bvals;
@@ -1706,27 +1589,27 @@ protected:
                 }
               }
             }
-            *arr->add_v() = calculateFieldFacet(sub.field_facet(), bucketDocs);
+            arr.push_back(calculateFieldFacet(std::get<solux::api::FieldFacet>(sub.kind), bucketDocs));
           }
         }
       }
 
-      return result;
+      return out;
     }
 
     // Expected result for an int range facet. Buckets are nonzero only, in
     // bucket-index order; out-of-range values are dropped (not missing);
     // missing = domain docs with no int value for the field.
-    proto::Val calculateRangeFacet(const proto::RangeFacet& rf,
-                                   const std::vector<size_t>& domainDocs) const {
-      proto::Val result;
-      auto* fr = result.mutable_facet();
-      std::string fieldName(rf.field());
-      int64_t start = rf.start();
-      int64_t end = rf.end();
-      int64_t gap = rf.has_gap() ? rf.gap() : 1;
+    ExpFacet calculateRangeFacet(const solux::api::RangeFacet& rf,
+                                 const std::vector<size_t>& domainDocs) const {
+      ExpFacet out;
+      out.isRange = true;
+      std::string fieldName(rf.field);
+      int64_t start = rf.start.value_or(0);
+      int64_t end = rf.end.value_or(0);
+      int64_t gap = rf.gap;  // bare: unset (0) -> 1 via the clamp below
       if (gap <= 0) gap = 1;
-      int64_t minCount = rf.has_mincount() ? rf.mincount() : -1;  // engine: unset == -1
+      int64_t minCount = rf.mincount.has_value() ? *rf.mincount : -1;  // engine: unset == -1
 
       std::map<int64_t, int64_t> bucketCounts;  // bucket index -> count (ascending)
       int64_t missingCount = 0;
@@ -1744,16 +1627,13 @@ protected:
         }
         if (!hasField) missingCount++;
       }
-      auto* multiI = fr->mutable_bucket_ids()->mutable_multi_i();
       for (auto [k, count] : bucketCounts) {
         if (minCount != -1 && count < minCount) continue;
-        auto* pair = multiI->add_v();
-        pair->add_v(start + k * gap);
-        pair->add_v(std::min(start + (k + 1) * gap, end));
-        fr->add_counts(count);
+        out.rangePairs.push_back({start + k * gap, std::min(start + (k + 1) * gap, end)});
+        out.counts.push_back(count);
       }
-      if (rf.missing()) fr->set_missing(missingCount);
-      return result;
+      if (rf.missing) out.missing = missingCount;
+      return out;
     }
   };
 
@@ -1930,7 +1810,7 @@ protected:
   // Fill a query: 80% a match on a present-enough string field, else match-all.
   // Multi-valued string fields are fine - matchesQuery matches if ANY value
   // equals, mirroring the engine.
-  static void makeRandomQuery(Rng& rng, proto::Query* query, const std::vector<FieldDef>& fields) {
+  static void makeRandomQuery(Rng& rng, OpCursor& cur, const std::vector<FieldDef>& fields) {
     if (rng.rint(100) < 80 && !fields.empty()) {
       std::vector<int> candidateFields;
       for (int idx = 0; idx < (int)fields.size(); idx++) {
@@ -1940,80 +1820,78 @@ protected:
       }
       if (!candidateFields.empty()) {
         const auto& qf = fields[candidateFields[rng.rint((int)candidateFields.size())]];
-        auto& matchQuery = *query->mutable_match();
-        matchQuery.set_field(qf.name);
-        matchQuery.mutable_val()->set_s("v" + std::to_string(rng.rint(qf.numUniqueValues)));
+        cur.matchQuery(qf.name, "v" + std::to_string(rng.rint(qf.numUniqueValues)));
         return;
       }
     }
-    query->set_all(true);
+    cur.allQuery();
   }
 
   // Random int range facet (start may be negative, end may exceed the value
   // range, gap may not divide evenly -> exercises out-of-range and partial
   // buckets). Range rejects mincount<1 and float/double, so unset or >=1.
-  static void generateRandomRangeFacet(Rng& rng, proto::RangeFacet* rf, const FieldDef& field) {
-    rf->set_field(field.name);
+  // `cur` is the RangeFacet cursor (its field is already set).
+  static void generateRandomRangeFacet(Rng& rng, OpCursor& cur, const FieldDef& field) {
     int n = field.numUniqueValues;
     int64_t start = (int64_t)rng.rint(std::max(3, n / 2 + 3)) - 2;  // [-2, ...)
     int64_t end = start + 1 + rng.rint(n + 4);                      // > start
     int64_t gap = 1 + rng.rint(std::max(1, n / 3));                 // >= 1
-    rf->set_start(start);
-    rf->set_end(end);
-    rf->set_gap(gap);
+    cur.range(start, end, gap);
     int mc = rng.rint(3);
-    if (mc == 1) rf->set_mincount(1);
-    else if (mc == 2) rf->set_mincount(2);
-    rf->set_missing(rng.rbool());
+    if (mc == 1) cur.mincount(1);
+    else if (mc == 2) cur.mincount(2);
+    std::get<solux::api::RangeFacet>(cur.rawOp().kind).missing = rng.rbool();
   }
 
-  // Add a facet op for `field` under `ops` as `name`: an int field becomes a
-  // range facet ~40% of the time, else a field facet.
-  static void addFacetOp(Rng& rng, google::protobuf::Map<std::string, proto::SearchOp>* ops,
+  // Add a facet op for `field` under `parent` as `name`: an int field becomes a
+  // range facet ~40% of the time, else a field facet. `parent` is a LocalReq
+  // (root) or an OpCursor (a top_docs query); both expose facet()/rangeFacet().
+  template <class Parent>
+  static void addFacetOp(Rng& rng, Parent& parent,
                          const std::string& name, const FieldDef& field,
                          const std::vector<FieldDef>& allFields) {
     if (field.isInt && rng.rint(100) < 40) {
-      generateRandomRangeFacet(rng, (*ops)[name].mutable_range_facet(), field);
+      generateRandomRangeFacet(rng, parent.rangeFacet(name, field.name), field);
     } else {
-      generateRandomFacet(rng, (*ops)[name].mutable_field_facet(), field, allFields);
+      generateRandomFacet(rng, parent.facet(name, field.name), field, allFields);
     }
   }
 
-  // Generate a random facet configuration directly on the protobuf. depth>0 is
-  // a sub-facet (no further sub-ops, and no mincount=0, to bound the space).
-  static void generateRandomFacet(Rng& rng, proto::FieldFacet* facet, const FieldDef& field,
+  // Generate a random facet configuration onto the FieldFacet cursor (its field
+  // is already set). depth>0 is a sub-facet (no further sub-ops, and no
+  // mincount=0, to bound the space).
+  static void generateRandomFacet(Rng& rng, OpCursor& cur, const FieldDef& field,
                                   const std::vector<FieldDef>& allFields, int depth = 0) {
-    facet->set_field(field.name);
-    
     // Random limit - avoid problematic edge cases for now
     int limitChoice = rng.rint(5);
     if (limitChoice == 0) {
-      facet->set_limit(-1);  // No limit
+      cur.limit(-1);  // No limit
     } else if (limitChoice == 1) {
-      facet->set_limit(1);  // Exactly 1 result
+      cur.limit(1);  // Exactly 1 result
     } else if (limitChoice == 2) {
-      facet->set_limit(5);  // Small limit
+      cur.limit(5);  // Small limit
     } else if (limitChoice == 3) {
-      facet->set_limit(20);  // Medium limit
+      cur.limit(20);  // Medium limit
     } else {
-      facet->set_limit(rng.rint(1, 50));  // Random limit
+      cur.limit(rng.rint(1, 50));  // Random limit
     }
+    auto& ff = std::get<solux::api::FieldFacet>(cur.rawOp().kind);
     // Random mincount. Leaving it unset is distinct from explicit 0.
     int mincountChoice = rng.rint(field.isInt ? 4 : 5);
     if (mincountChoice == 0) {
       // unset: parser maps this to minCount=-1, effective min 1
     } else if (!field.isInt && depth == 0 && mincountChoice == 1) {
-      facet->set_mincount(0);  // string/id facets support zero-count buckets (top-level only)
+      cur.mincount(0);  // string/id facets support zero-count buckets (top-level only)
     } else if (mincountChoice == 2) {
-      facet->set_mincount(2);
+      cur.mincount(2);
     } else if (mincountChoice == 3) {
-      facet->set_mincount(5);
+      cur.mincount(5);
     } else {
-      facet->set_mincount(1 + rng.rint(3));
+      cur.mincount(1 + rng.rint(3));
     }
-    
+
     // Random missing
-    facet->set_missing(rng.rbool());
+    ff.missing = rng.rbool();
 
     // Sub-ops only on string/id facets (parser rejects them on int/range/text)
     // and only at the top level (bounds nesting). May attach several at once:
@@ -2021,19 +1899,16 @@ protected:
     if (depth == 0 && !field.isInt && !field.isText) {
       bool wantAvg = rng.rint(100) < 45;
       bool wantSubFacet = rng.rint(100) < 25;
-      if ((wantAvg || wantSubFacet) && facet->has_mincount() && facet->mincount() == 0) {
-        facet->set_mincount(1);  // sub-ops + mincount=0 is an untested combo; avoid it
+      if ((wantAvg || wantSubFacet) && ff.mincount.has_value() && *ff.mincount == 0) {
+        cur.mincount(1);  // sub-ops + mincount=0 is an untested combo; avoid it
       }
       if (wantAvg) {
-        { auto& a = *(*facet->mutable_ops())["av"].mutable_gen_op();
-          a.set_name("avg"); a.mutable_args()->Add()->set_s("avgval_i"); }
+        cur.avg("av", "avgval_i");
         bool twoAvgs = rng.rbool();
-        if (twoAvgs) { auto& a = *(*facet->mutable_ops())["av2"].mutable_gen_op();
-          a.set_name("avg"); a.mutable_args()->Add()->set_s("avgval2_i"); }
+        if (twoAvgs) cur.avg("av2", "avgval2_i");
         if (rng.rint(100) < 50) {  // sort by one of the avgs (at most one sort field)
-          auto& sort = *facet->mutable_sorts()->Add();
-          sort.set_field((twoAvgs && rng.rbool()) ? "av2" : "av");
-          sort.set_dir(rng.rbool() ? proto::SortSpec_SortDir_DESC : proto::SortSpec_SortDir_ASC);
+          std::string_view sortField = (twoAvgs && rng.rbool()) ? "av2" : "av";
+          qb::sort(cur, sortField, rng.rbool() ? qb::DESC : qb::ASC);
         }
       }
       if (wantSubFacet) {
@@ -2042,7 +1917,7 @@ protected:
           if (!allFields[i].isInt && !allFields[i].isText) strFields.push_back(i);  // string sub-facets only
         if (!strFields.empty()) {
           const auto& sf = allFields[strFields[rng.rint((int)strFields.size())]];
-          generateRandomFacet(rng, (*facet->mutable_ops())["sf"].mutable_field_facet(), sf, allFields, depth + 1);
+          generateRandomFacet(rng, cur.facet("sf", sf.name), sf, allFields, depth + 1);
         }
       }
     }
@@ -2132,11 +2007,8 @@ public:
             // Advance RNG to ensure different seed for each test
             localRng(); 
             
-            auto* lreq = LocalReq::create(soluxNode->getSearchEngine());
-            lreq->proto.mutable_collection()->add_name("main");
-            lreq->proto.set_request_id("random_test_" + std::to_string(iteration) + "_" + std::to_string(testNum));
-        
-            auto& ops = *lreq->proto.mutable_ops();
+            auto req = localReq(soluxNode->getSearchEngine());
+            req->collection("main");
 
             // Issue several top_docs queries (each its own domain) per request and
             // facet a random subset of fields under each, so the SAME field is often
@@ -2145,12 +2017,12 @@ public:
             // stresses the concurrent merge/completion paths.
             int numQueries = 1 + localRng.rint(3);  // 1..3
             for (int qi = 0; qi < numQueries; qi++) {
-              auto& topDocs = *ops["q" + std::to_string(qi)].mutable_top_docs();
-              topDocs.set_get_number(true);
-              makeRandomQuery(localRng, topDocs.mutable_query(), fields);
+              auto& topDocs = req->topDocs("q" + std::to_string(qi));
+              topDocs.getNumber(true);
+              makeRandomQuery(localRng, topDocs, fields);
               for (size_t f = 0; f < fields.size(); f++) {
                 if (localRng.rint(100) < 70) {
-                  addFacetOp(localRng, topDocs.mutable_ops(), "f" + std::to_string(f), fields[f], fields);
+                  addFacetOp(localRng, topDocs, "f" + std::to_string(f), fields[f], fields);
                 }
               }
             }
@@ -2158,121 +2030,121 @@ public:
             if (localRng.rint(100) < 20) {
               for (size_t f = 0; f < fields.size(); f++) {
                 if (localRng.rint(100) < 50) {
-                  addFacetOp(localRng, &ops, "rf" + std::to_string(f), fields[f], fields);
+                  addFacetOp(localRng, *req, "rf" + std::to_string(f), fields[f], fields);
                 }
               }
             }
-        
+
             // Execute the request
             bool para = (localRng.rint(100) < PERCENT_PARA);
-            lreq->engine.submit(*lreq, para);
-            
-            ASSERT_EQ(1, lreq->responses.size());
+            req->execute(para);
+
+            ASSERT_EQ(1u, req->responses.size());
 
             // Verify facet results
-            const auto& response = lreq->responses[0]->proto;
-            
-            // Calculate expected results for all operations using an arena
-            auto* arena = createArena(4096);  // 4KB initial arena size
-            auto* expectedResponse = google::protobuf::Arena::Create<proto::SearchResponse>(arena);
-            
-            // Process all operations to calculate expected results
-            model.processOps(lreq->proto.ops(), expectedResponse->mutable_ops());
-            
+            const auto& response = req->responses[0]->proto;
+
+            // Calculate expected results for all operations (read back from the
+            // built request view) into a plain expected-result map.
+            std::map<std::string, ExpVal> expected;
+            model.processOps(req->proto.ops, expected);
+
             // Compare one facet result (buckets + counts + missing) against the model.
-            std::function<void(const std::string&, const proto::FieldFacet&,
-                               const proto::FacetResult&, const proto::FacetResult&)> verifyOneFacet =
-              [&](const std::string& ctx, const proto::FieldFacet& ff,
-                  const proto::FacetResult& actual, const proto::FacetResult& expected) {
-              if (expected.bucket_ids().has_col_i()) {
-                ASSERT_TRUE(actual.bucket_ids().has_col_i()) << "expected int buckets: " << ctx << "\n" << lreq->toString();
-                const auto& a = actual.bucket_ids().col_i();
-                const auto& e = expected.bucket_ids().col_i();
-                ASSERT_EQ(a.v_size(), e.v_size()) << "bucket count: " << ctx << "\n" << lreq->toString();
-                for (int i = 0; i < a.v_size(); i++) EXPECT_EQ(a.v(i), e.v(i)) << "bucket " << i << " value: " << ctx;
+            std::function<void(const std::string&, const solux::api::FieldFacet&,
+                               const solux::api::FacetResult&, const ExpFacet&)> verifyOneFacet =
+              [&](const std::string& ctx, const solux::api::FieldFacet& ff,
+                  const solux::api::FacetResult& actual, const ExpFacet& expected) {
+              if (expected.intBuckets) {
+                ASSERT_TRUE(actual.bucket_ids && std::holds_alternative<solux::api::ColInt>(actual.bucket_ids->kind)) << "expected int buckets: " << ctx << "\n" << req->toString();
+                const auto& a = std::get<solux::api::ColInt>(actual.bucket_ids->kind);
+                ASSERT_EQ(a.v.size(), expected.intIds.size()) << "bucket count: " << ctx << "\n" << req->toString();
+                for (int i = 0; i < (int)a.v.size(); i++) EXPECT_EQ(a.v[i], expected.intIds[i]) << "bucket " << i << " value: " << ctx;
               } else {
-                ASSERT_TRUE(actual.bucket_ids().has_col_s()) << "expected string buckets: " << ctx << "\n" << lreq->toString();
-                const auto& a = actual.bucket_ids().col_s();
-                const auto& e = expected.bucket_ids().col_s();
-                ASSERT_EQ(a.v_size(), e.v_size()) << "bucket count: " << ctx << "\n" << lreq->toString();
-                for (int i = 0; i < a.v_size(); i++) EXPECT_EQ(a.v(i), e.v(i)) << "bucket " << i << " value: " << ctx;
+                ASSERT_TRUE(actual.bucket_ids && std::holds_alternative<solux::api::ColStr>(actual.bucket_ids->kind)) << "expected string buckets: " << ctx << "\n" << req->toString();
+                const auto& a = std::get<solux::api::ColStr>(actual.bucket_ids->kind);
+                ASSERT_EQ(a.v.size(), expected.strIds.size()) << "bucket count: " << ctx << "\n" << req->toString();
+                for (int i = 0; i < (int)a.v.size(); i++) EXPECT_EQ(a.v[i], expected.strIds[i]) << "bucket " << i << " value: " << ctx;
               }
-              ASSERT_EQ(actual.counts_size(), expected.counts_size()) << "counts size: " << ctx;
-              for (int i = 0; i < expected.counts_size(); i++)
-                EXPECT_EQ(actual.counts(i), expected.counts(i)) << "count " << i << ": " << ctx;
-              if (ff.missing()) { EXPECT_EQ(actual.missing(), expected.missing()) << "missing: " << ctx; }
+              ASSERT_EQ(actual.counts.size(), expected.counts.size()) << "counts size: " << ctx;
+              for (int i = 0; i < (int)expected.counts.size(); i++)
+                EXPECT_EQ(actual.counts[i], expected.counts[i]) << "count " << i << ": " << ctx;
+              if (ff.missing) { EXPECT_EQ(actual.missing.value_or(0), expected.missing.value_or(0)) << "missing: " << ctx; }
               // avg() sub-op result: arr_d with one entry per returned bucket.
-              for (const auto& [opName, sub] : ff.ops()) {
-                if (sub.has_gen_op() && (sub.gen_op().name() == "avg" || sub.gen_op().name() == "average")) {
+              for (const auto& [opName, subPtr] : ff.ops) {
+                const auto& sub = *subPtr;
+                if (std::holds_alternative<solux::api::GenOp>(sub.kind)) {
+                  const auto& genOp = std::get<solux::api::GenOp>(sub.kind);
+                  if (genOp.name != "avg" && genOp.name != "average") continue;
                   // Empty facets emit no sub-op result (model omits it too).
-                  if (!expected.ops().contains(opName)) continue;
-                  ASSERT_TRUE(actual.ops().contains(opName)) << "actual avg missing: " << ctx << "\n" << lreq->toString();
-                  const auto& aArr = actual.ops().at(opName).arr_d();
-                  const auto& eArr = expected.ops().at(opName).arr_d();
-                  ASSERT_EQ(aArr.v_size(), eArr.v_size()) << "avg arr size: " << ctx << "\n" << lreq->toString();
-                  for (int i = 0; i < eArr.v_size(); i++)
-                    EXPECT_DOUBLE_EQ(aArr.v(i), eArr.v(i)) << "avg[" << i << "]: " << ctx;
+                  if (!expected.avgOps.contains(std::string(opName))) continue;
+                  ASSERT_TRUE(actual.ops.contains(opName)) << "actual avg missing: " << ctx << "\n" << req->toString();
+                  const auto& aArr = std::get<solux::api::ArrDouble>(actual.ops.at(opName)->kind);
+                  const auto& eArr = expected.avgOps.at(std::string(opName));
+                  ASSERT_EQ(aArr.v.size(), eArr.size()) << "avg arr size: " << ctx << "\n" << req->toString();
+                  for (int i = 0; i < (int)eArr.size(); i++)
+                    EXPECT_DOUBLE_EQ(aArr.v[i], eArr[i]) << "avg[" << i << "]: " << ctx;
                 }
               }
               // Nested sub-facet results: ops[name].arr.v[i].facet, one per bucket.
-              for (const auto& [opName, sub] : ff.ops()) {
-                if (!sub.has_field_facet()) continue;
-                if (!expected.ops().contains(opName)) continue;  // empty parent -> no sub-op
-                ASSERT_TRUE(actual.ops().contains(opName)) << "actual sub-facet missing: " << ctx << "\n" << lreq->toString();
-                const auto& aArr = actual.ops().at(opName).arr();
-                const auto& eArr = expected.ops().at(opName).arr();
-                ASSERT_EQ(aArr.v_size(), eArr.v_size()) << "sub-facet arr size: " << ctx << "\n" << lreq->toString();
-                for (int i = 0; i < eArr.v_size(); i++)
-                  verifyOneFacet(ctx + "/" + opName + "[" + std::to_string(i) + "]",
-                                 sub.field_facet(), aArr.v(i).facet(), eArr.v(i).facet());
+              for (const auto& [opName, subPtr] : ff.ops) {
+                const auto& sub = *subPtr;
+                if (!std::holds_alternative<solux::api::FieldFacet>(sub.kind)) continue;
+                if (!expected.subFacetOps.contains(std::string(opName))) continue;  // empty parent -> no sub-op
+                ASSERT_TRUE(actual.ops.contains(opName)) << "actual sub-facet missing: " << ctx << "\n" << req->toString();
+                const auto& aArr = std::get<solux::api::ArrVal>(actual.ops.at(opName)->kind);
+                const auto& eArr = expected.subFacetOps.at(std::string(opName));
+                ASSERT_EQ(aArr.v.size(), eArr.size()) << "sub-facet arr size: " << ctx << "\n" << req->toString();
+                for (int i = 0; i < (int)eArr.size(); i++)
+                  verifyOneFacet(ctx + "/" + std::string(opName) + "[" + std::to_string(i) + "]",
+                                 std::get<solux::api::FieldFacet>(sub.kind),
+                                 std::get<solux::api::FacetResult>(aArr.v[i].kind),
+                                 eArr[i]);
               }
             };
 
             // Walk the request ops and verify every facet at its path: root facets,
             // facets under each top_docs query, and (recursively) deeper nesting.
-            using OpMap = google::protobuf::Map<std::string, proto::SearchOp>;
-            using ValMap = google::protobuf::Map<std::string, proto::Val>;
-            std::function<void(const OpMap&, const ValMap&, const ValMap&, const std::string&)> verifyOps =
-              [&](const OpMap& reqOps, const ValMap& actualOps, const ValMap& expectedOps, const std::string& path) {
-                for (const auto& [name, op] : reqOps) {
-                  if (op.has_field_facet()) {
-                    std::string ctx = path + name + " (field " + std::string(op.field_facet().field()) + ")";
-                    ASSERT_TRUE(expectedOps.contains(name) && expectedOps.at(name).has_facet()) << "expected facet missing: " << ctx;
-                    ASSERT_TRUE(actualOps.contains(name) && actualOps.at(name).has_facet())
-                      << "actual facet missing: " << ctx << "\n" << lreq->toString();
-                    verifyOneFacet(ctx, op.field_facet(), actualOps.at(name).facet(), expectedOps.at(name).facet());
-                  } else if (op.has_range_facet()) {
-                    std::string ctx = path + name + " (range " + std::string(op.range_facet().field()) + ")";
-                    ASSERT_TRUE(expectedOps.contains(name) && expectedOps.at(name).has_facet()) << "expected range missing: " << ctx;
-                    ASSERT_TRUE(actualOps.contains(name) && actualOps.at(name).has_facet())
-                      << "actual range missing: " << ctx << "\n" << lreq->toString();
-                    const auto& af = actualOps.at(name).facet();
-                    const auto& ef = expectedOps.at(name).facet();
-                    const auto& ab = af.bucket_ids().multi_i();
-                    const auto& eb = ef.bucket_ids().multi_i();
-                    ASSERT_EQ(ab.v_size(), eb.v_size()) << "range bucket count: " << ctx << "\n" << lreq->toString();
-                    for (int i = 0; i < eb.v_size(); i++) {
-                      ASSERT_EQ(2, ab.v(i).v_size()) << ctx;
-                      EXPECT_EQ(eb.v(i).v(0), ab.v(i).v(0)) << "range[" << i << "] lo: " << ctx;
-                      EXPECT_EQ(eb.v(i).v(1), ab.v(i).v(1)) << "range[" << i << "] hi: " << ctx;
+            std::function<void(const ReqOps&, const RespOps&, const std::map<std::string, ExpVal>&, const std::string&)> verifyOps =
+              [&](const ReqOps& reqOps, const RespOps& actualOps, const std::map<std::string, ExpVal>& expectedOps, const std::string& path) {
+                for (const auto& [name, opPtr] : reqOps) {
+                  const auto& op = *opPtr;
+                  std::string nameStr(name);
+                  if (std::holds_alternative<solux::api::FieldFacet>(op.kind)) {
+                    std::string ctx = path + nameStr + " (field " + std::string(std::get<solux::api::FieldFacet>(op.kind).field) + ")";
+                    ASSERT_TRUE(expectedOps.contains(nameStr) && !expectedOps.at(nameStr).isDocList) << "expected facet missing: " << ctx;
+                    ASSERT_TRUE(actualOps.contains(name) && actualOps.at(name)->facetResult())
+                      << "actual facet missing: " << ctx << "\n" << req->toString();
+                    verifyOneFacet(ctx, std::get<solux::api::FieldFacet>(op.kind),
+                                   *actualOps.at(name)->facetResult(),
+                                   expectedOps.at(nameStr).facet);
+                  } else if (std::holds_alternative<solux::api::RangeFacet>(op.kind)) {
+                    std::string ctx = path + nameStr + " (range " + std::string(std::get<solux::api::RangeFacet>(op.kind).field) + ")";
+                    ASSERT_TRUE(expectedOps.contains(nameStr) && !expectedOps.at(nameStr).isDocList) << "expected range missing: " << ctx;
+                    ASSERT_TRUE(actualOps.contains(name) && actualOps.at(name)->facetResult())
+                      << "actual range missing: " << ctx << "\n" << req->toString();
+                    const auto& af = *actualOps.at(name)->facetResult();
+                    const auto& ef = expectedOps.at(nameStr).facet;
+                    const auto& ab = std::get<solux::api::ArrArrInt>(af.bucket_ids->kind);
+                    ASSERT_EQ(ab.v.size(), ef.rangePairs.size()) << "range bucket count: " << ctx << "\n" << req->toString();
+                    for (int i = 0; i < (int)ef.rangePairs.size(); i++) {
+                      ASSERT_EQ(2, (int)ab.v[i].v.size()) << ctx;
+                      EXPECT_EQ(ef.rangePairs[i].first, ab.v[i].v[0]) << "range[" << i << "] lo: " << ctx;
+                      EXPECT_EQ(ef.rangePairs[i].second, ab.v[i].v[1]) << "range[" << i << "] hi: " << ctx;
                     }
-                    ASSERT_EQ(af.counts_size(), ef.counts_size()) << "range counts size: " << ctx;
-                    for (int i = 0; i < ef.counts_size(); i++)
-                      EXPECT_EQ(af.counts(i), ef.counts(i)) << "range count " << i << ": " << ctx;
-                    if (op.range_facet().missing()) { EXPECT_EQ(af.missing(), ef.missing()) << "range missing: " << ctx; }
-                  } else if (op.has_top_docs() && op.top_docs().ops_size() > 0) {
-                    ASSERT_TRUE(actualOps.contains(name) && actualOps.at(name).has_docs()) << "actual docs missing: " << path + name << "\n" << lreq->toString();
-                    ASSERT_TRUE(expectedOps.contains(name) && expectedOps.at(name).has_docs()) << "expected docs missing: " << path + name;
-                    verifyOps(op.top_docs().ops(), actualOps.at(name).docs().ops(), expectedOps.at(name).docs().ops(), path + name + "/");
+                    ASSERT_EQ(af.counts.size(), ef.counts.size()) << "range counts size: " << ctx;
+                    for (int i = 0; i < (int)ef.counts.size(); i++)
+                      EXPECT_EQ(af.counts[i], ef.counts[i]) << "range count " << i << ": " << ctx;
+                    if (std::get<solux::api::RangeFacet>(op.kind).missing) { EXPECT_EQ(af.missing.value_or(0), ef.missing.value_or(0)) << "range missing: " << ctx; }
+                  } else if (std::holds_alternative<solux::api::TopDocs>(op.kind) && !std::get<solux::api::TopDocs>(op.kind).ops.empty()) {
+                    ASSERT_TRUE(actualOps.contains(name) && actualOps.at(name)->docList()) << "actual docs missing: " << path + nameStr << "\n" << req->toString();
+                    ASSERT_TRUE(expectedOps.contains(nameStr) && expectedOps.at(nameStr).isDocList) << "expected docs missing: " << path + nameStr;
+                    verifyOps(std::get<solux::api::TopDocs>(op.kind).ops,
+                              actualOps.at(name)->docList()->ops,
+                              expectedOps.at(nameStr).ops, path + nameStr + "/");
                   }
                 }
               };
-            verifyOps(lreq->proto.ops(), response.ops(), expectedResponse->ops(), "");
-
-            // Clean up the arena
-            releaseArena(arena);
-            
-            lreq->done();
+            verifyOps(req->proto.ops, response.ops, expected, "");
           }  // end of for loop in lambda
         });  // end of parallel_for
 

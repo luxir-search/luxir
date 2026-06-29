@@ -4,6 +4,7 @@
 #include "test/TestIndex.h"
 #include "test/CollectionHelper.h"
 #include "test/LocalReq.h"
+#include "test/QueryBuild.h"
 #include "solux/query/PrefixQuery.h"
 #include "solux/query/QueryBuilder.h"
 #include "solux/schema/Schema.h"
@@ -151,21 +152,20 @@ public:
   }
 
   int64_t prefixCount(std::string_view field, std::string_view prefix) {
-    auto* req = LocalReq::create(helper.getSearchEngine());
-    req->collection("main").prefixQuery(field, prefix).withStats().execute();
-    int64_t n = req->getMatchCount();
-    req->done();
-    return n;
+    auto req = localReq(helper.getSearchEngine());
+    req->collection("main").topDocs("q").prefixQuery(field, prefix).withStats();
+    req->execute();
+    return req->getMatchCount();
   }
 
   std::vector<std::string> prefixIds(std::string_view field, std::string_view prefix) {
-    auto* req = LocalReq::create(helper.getSearchEngine());
-    req->collection("main").prefixQuery(field, prefix).fields({"id"}).limit(100).execute();
+    auto req = localReq(helper.getSearchEngine());
+    req->collection("main").topDocs("q").prefixQuery(field, prefix).fields({"id"}).limit(100);
+    req->execute();
     std::vector<std::string> ids;
     for (auto& doc : req->getDocs()) {
       if (auto* v = find(doc, "id")) ids.push_back(std::get<std::string>(*v));
     }
-    req->done();
     std::sort(ids.begin(), ids.end());
     return ids;
   }
@@ -181,21 +181,20 @@ TEST_F(PrefixQueryE2ETest, textField) {
 
 TEST_F(PrefixQueryE2ETest, asBooleanFilter) {
   // Exercises prefix as a filter clause under conjunction planning.
-  auto* req = LocalReq::create(helper.getSearchEngine());
-  auto* boolq = req->topDocs("q").mutable_query()->mutable_boolean();
-  auto* filter = boolq->add_filter();
-  filter->mutable_prefix()->set_field("color_s");
-  filter->mutable_prefix()->set_prefix("re");
-  auto* required = boolq->add_required();
-  required->mutable_match()->set_field("body_w");
-  required->mutable_match()->mutable_val()->set_s("apple");
-  req->collection("main").fields({"id"}).limit(100).execute();
+  auto req = localReq(helper.getSearchEngine());
+  req->collection("main");
+  auto& cur = req->topDocs("q");
+  cur.rawQuery() = qb::boolean(cur.mr(),
+      /*required=*/{qb::match(cur.mr(), "body_w", "apple")},
+      /*optional=*/{}, /*prohibited=*/{},
+      /*filter=*/{qb::prefix(cur.mr(), "color_s", "re")});
+  cur.fields({"id"}).limit(100);
+  req->execute();
 
   std::vector<std::string> ids;
   for (auto& doc : req->getDocs()) {
     if (auto* v = find(doc, "id")) ids.push_back(std::get<std::string>(*v));
   }
-  req->done();
   std::sort(ids.begin(), ids.end());
   EXPECT_EQ(ids, (std::vector<std::string>{"d1", "d4"}));
 }

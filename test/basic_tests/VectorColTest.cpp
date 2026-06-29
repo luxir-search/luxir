@@ -1,4 +1,7 @@
 #include "gtest/gtest.h"
+
+#include <deque>
+
 #include "test/SoluxTest.h"
 #include "test/TestIndex.h"
 #include "test/TestUtils.h"
@@ -10,7 +13,9 @@
 #include "solux/schema/FieldType.h"
 #include "solux/schema/Schema.h"
 #include "solux/util/log.h"
-#include "protos/solux_types.pb.h"
+#include "solux/api/build.h"
+
+#include <memory_resource>
 
 using namespace solux;
 using namespace solux::test;
@@ -24,23 +29,31 @@ protected:
   }
 };
 
-// Build a proto::Val containing a single Vector{f32}.
-static proto::Val makeVec(std::initializer_list<float> floats) {
-  proto::Val v;
-  auto* f32 = v.mutable_vec()->mutable_f32();
-  for (float f : floats) f32->add_v(f);
+// Build a Val containing a single Vector{f32}, backed by `mr` (must outlive the Val).
+static solux::api::Val makeVec(std::pmr::memory_resource& mr, std::initializer_list<float> floats) {
+  solux::api::Val v;
+  auto& f32 = v.kind.emplace<solux::api::Vector>().f32.emplace();
+  float* a = solux::api::build::allocArray(f32.v, floats.size(), mr);
+  std::size_t i = 0;
+  for (float f : floats) a[i++] = f;
   return v;
 }
 
+static void indexVal(Inverter& inverter, Inverter::IndexHandler& handler, const solux::api::Val& val) {
+  handler.index(inverter, val);
+}
+
 static void enableCosineOnVecSuffix(Collection& col, bool normalizeOnWrite = true) {
-  proto::SchemaDef def;
-  auto* f = def.add_fields();
-  f->set_name("_v");
-  f->set_field_class(proto::FieldDef::VECTOR);
-  f->set_abstract(true);
-  f->set_column_stored(true);
-  f->mutable_vector()->set_metric(proto::VectorParams::COSINE);
-  f->mutable_vector()->set_normalize_on_write(normalizeOnWrite);
+  std::pmr::monotonic_buffer_resource mr;
+  solux::api::SchemaDef def;
+  auto* f = solux::api::build::allocArray(def.fields, 1, mr);
+  f->name = "_v";
+  f->field_class = solux::api::FieldDef_::FieldClass::VECTOR;
+  f->abstract = true;
+  f->column_stored = true;
+  auto& vector = f->vector.emplace();
+  vector.metric = solux::api::VectorParams_::Metric::COSINE;
+  vector.normalize_on_write = normalizeOnWrite;
 
   auto base = col.getSchema();
   col.setSchema(Schema::fromProto(def, base.get()));
@@ -49,14 +62,17 @@ static void enableCosineOnVecSuffix(Collection& col, bool normalizeOnWrite = tru
 // Index a multi-valued vector value (arr_vec) for the given doc.
 static void indexMultiVec(Inverter& inverter, Inverter::IndexHandler& handler,
                           int32_t docid, std::vector<std::vector<float>> vecs) {
+  std::pmr::monotonic_buffer_resource mr;
   inverter.setDoc(docid);
-  proto::Val v;
-  auto* arr = v.mutable_arr_vec();
-  for (auto& vec : vecs) {
-    auto* f32 = arr->add_v()->mutable_f32();
-    for (float f : vec) f32->add_v(f);
+  solux::api::Val v;
+  auto& arr = v.kind.emplace<solux::api::ArrVector>();
+  auto* a = solux::api::build::allocArray(arr.v, vecs.size(), mr);
+  for (std::size_t i = 0; i < vecs.size(); i++) {
+    auto& f32 = a[i].f32.emplace();
+    float* fa = solux::api::build::allocArray(f32.v, vecs[i].size(), mr);
+    for (std::size_t j = 0; j < vecs[i].size(); j++) fa[j] = vecs[i][j];
   }
-  handler.index(inverter, v);
+  indexVal(inverter, handler, v);
 }
 
 // Low-level round-trip: index single-valued vectors, flush, read back via VectorReader.
@@ -71,10 +87,11 @@ TEST_F(VectorColTest, singleValuedRoundTrip) {
     {0.0f, 0.0f, 0.0f, 0.0f},
   };
 
+  std::pmr::monotonic_buffer_resource mr;
   for (size_t doc = 0; doc < expected.size(); doc++) {
     inverter.setDoc((int32_t)doc);
-    auto val = makeVec({expected[doc][0], expected[doc][1], expected[doc][2], expected[doc][3]});
-    handler.index(inverter, val);
+    auto val = makeVec(mr, {expected[doc][0], expected[doc][1], expected[doc][2], expected[doc][3]});
+    indexVal(inverter, handler, val);
   }
   testIndex.flush();
 
@@ -117,14 +134,7 @@ TEST_F(VectorColTest, multiValuedRoundTrip) {
   };
 
   for (size_t doc = 0; doc < expected.size(); doc++) {
-    inverter.setDoc((int32_t)doc);
-    proto::Val v;
-    auto* arr = v.mutable_arr_vec();
-    for (auto& vec : expected[doc]) {
-      auto* f32 = arr->add_v()->mutable_f32();
-      for (float f : vec) f32->add_v(f);
-    }
-    handler.index(inverter, v);
+    indexMultiVec(inverter, handler, (int32_t)doc, expected[doc]);
   }
   testIndex.flush();
 
@@ -175,14 +185,7 @@ TEST_F(VectorColTest, multiValuedValueRankToDoc) {
   };
 
   for (auto& dv : docs) {
-    inverter.setDoc(dv.docId);
-    proto::Val v;
-    auto* arr = v.mutable_arr_vec();
-    for (auto& vec : dv.vecs) {
-      auto* f32 = arr->add_v()->mutable_f32();
-      for (float f : vec) f32->add_v(f);
-    }
-    handler.index(inverter, v);
+    indexMultiVec(inverter, handler, dv.docId, dv.vecs);
   }
   testIndex.flush();
 
@@ -270,13 +273,14 @@ TEST_F(VectorColTest, dimsInferredFromFirstValue) {
   auto& inverter = testIndex.getInverter();
   auto& handler = inverter.getIndexHandler("vec_v");
 
+  std::pmr::monotonic_buffer_resource mr;
   inverter.setDoc(0);
-  auto v0 = makeVec({1, 2, 3, 4, 5, 6});
-  handler.index(inverter, v0);
+  auto v0 = makeVec(mr, {1, 2, 3, 4, 5, 6});
+  indexVal(inverter, handler, v0);
 
   inverter.setDoc(1);
-  auto v1 = makeVec({7, 8, 9, 10, 11});  // wrong dims
-  EXPECT_THROW(handler.index(inverter, v1), std::runtime_error);
+  auto v1 = makeVec(mr, {7, 8, 9, 10, 11});  // wrong dims
+  EXPECT_THROW(indexVal(inverter, handler, v1), std::runtime_error);
 
   auto* vh = dynamic_cast<handler::VectorHandler*>(&handler);
   ASSERT_NE(nullptr, vh);
@@ -292,13 +296,14 @@ TEST_F(VectorColTest, strictDimsRejectsMismatch) {
   auto strictType = std::make_shared<VectorFieldType>("strict_v", /*dims=*/4);
   handler::VectorHandler vh(inverter, "strict_v", strictType);
 
+  std::pmr::monotonic_buffer_resource mr;
   inverter.setDoc(0);
-  auto wrong = makeVec({1, 2, 3});  // 3 dims vs declared 4
-  EXPECT_THROW(vh.index(inverter, wrong), std::runtime_error);
+  auto wrong = makeVec(mr, {1, 2, 3});  // 3 dims vs declared 4
+  EXPECT_THROW(indexVal(inverter, vh, wrong), std::runtime_error);
 
   inverter.setDoc(1);
-  auto right = makeVec({1, 2, 3, 4});
-  EXPECT_NO_THROW(vh.index(inverter, right));
+  auto right = makeVec(mr, {1, 2, 3, 4});
+  EXPECT_NO_THROW(indexVal(inverter, vh, right));
 }
 
 // gRPC round trip (single-valued): index via CollectionHelper, retrieve via LocalReq.
@@ -311,12 +316,10 @@ TEST_F(VectorColTest, grpcSingleFieldsRoundTrip) {
   h.index(doc1);
   h.index(doc2, UpdateMessage::COMMIT);
 
-  auto* req = LocalReq::create(h.getSearchEngine());
-  req->collection("main")
-     .allQuery()
-     .fields({"id", "vec_v"})
-     .limit(10)
-     .execute();
+  auto req = localReq(h.getSearchEngine());
+  req->collection("main").topDocs("q").allQuery().fields({"id", "vec_v"}).limit(10);
+  req->execute();
+  ASSERT_OK(req);
 
   auto docs = req->getDocs();
   ASSERT_EQ(2u, docs.size());
@@ -345,7 +348,6 @@ TEST_F(VectorColTest, grpcSingleFieldsRoundTrip) {
   EXPECT_TRUE(sawA);
   EXPECT_TRUE(sawB);
 
-  req->done();
 }
 
 // gRPC round trip (multi-valued): exercises the loadVectorColForSegmentMulti path.
@@ -360,12 +362,10 @@ TEST_F(VectorColTest, grpcMultiFieldsRoundTrip) {
   h.index(doc1);
   h.index(doc2, UpdateMessage::COMMIT);
 
-  auto* req = LocalReq::create(h.getSearchEngine());
-  req->collection("main")
-     .allQuery()
-     .fields({"id", "emb_vs"})
-     .limit(10)
-     .execute();
+  auto req = localReq(h.getSearchEngine());
+  req->collection("main").topDocs("q").allQuery().fields({"id", "emb_vs"}).limit(10);
+  req->execute();
+  ASSERT_OK(req);
 
   auto docs = req->getDocs();
   ASSERT_EQ(2u, docs.size());
@@ -387,31 +387,29 @@ TEST_F(VectorColTest, grpcMultiFieldsRoundTrip) {
   EXPECT_TRUE(sawA);
   EXPECT_TRUE(sawB);
 
-  req->done();
 }
 
 TEST_F(VectorColTest, cosineDefaultsToNormalizedColumnStorage) {
   CollectionHelper h("main");
   h.clear();
 
-  proto::SchemaDef def;
-  auto* f = def.add_fields();
-  f->set_name("_v");
-  f->set_field_class(proto::FieldDef::VECTOR);
-  f->set_abstract(true);
-  f->set_column_stored(true);
-  f->mutable_vector()->set_metric(proto::VectorParams::COSINE);
+  std::pmr::monotonic_buffer_resource mr;
+  solux::api::SchemaDef def;
+  auto* f = solux::api::build::allocArray(def.fields, 1, mr);
+  f->name = "_v";
+  f->field_class = solux::api::FieldDef_::FieldClass::VECTOR;
+  f->abstract = true;
+  f->column_stored = true;
+  f->vector.emplace().metric = solux::api::VectorParams_::Metric::COSINE;
   h.collection().setSchema(Schema::fromProto(def, h.collection().getSchema().get()));
 
   Doc doc = flatdoc("id", std::string("a"), "vec_v", std::vector<float>{3.0f, 4.0f});
   h.index(doc, UpdateMessage::COMMIT);
 
-  auto* req = LocalReq::create(h.getSearchEngine());
-  req->collection("main")
-     .allQuery()
-     .fields({"id", "vec_v"})
-     .limit(10)
-     .execute();
+  auto req = localReq(h.getSearchEngine());
+  req->collection("main").topDocs("q").allQuery().fields({"id", "vec_v"}).limit(10);
+  req->execute();
+  ASSERT_OK(req);
 
   auto docs = req->getDocs();
   ASSERT_EQ(1u, docs.size());
@@ -422,7 +420,6 @@ TEST_F(VectorColTest, cosineDefaultsToNormalizedColumnStorage) {
   EXPECT_FLOAT_EQ(0.6f, vec[0]);
   EXPECT_FLOAT_EQ(0.8f, vec[1]);
 
-  req->done();
 }
 
 TEST_F(VectorColTest, cosineNormalizeOnWriteFalseKeepsRawColumnStorage) {
@@ -433,12 +430,10 @@ TEST_F(VectorColTest, cosineNormalizeOnWriteFalseKeepsRawColumnStorage) {
   Doc doc = flatdoc("id", std::string("a"), "vec_v", std::vector<float>{3.0f, 4.0f});
   h.index(doc, UpdateMessage::COMMIT);
 
-  auto* req = LocalReq::create(h.getSearchEngine());
-  req->collection("main")
-     .allQuery()
-     .fields({"id", "vec_v"})
-     .limit(10)
-     .execute();
+  auto req = localReq(h.getSearchEngine());
+  req->collection("main").topDocs("q").allQuery().fields({"id", "vec_v"}).limit(10);
+  req->execute();
+  ASSERT_OK(req);
 
   auto docs = req->getDocs();
   ASSERT_EQ(1u, docs.size());
@@ -449,21 +444,22 @@ TEST_F(VectorColTest, cosineNormalizeOnWriteFalseKeepsRawColumnStorage) {
   EXPECT_FLOAT_EQ(3.0f, vec[0]);
   EXPECT_FLOAT_EQ(4.0f, vec[1]);
 
-  req->done();
 }
 
 TEST_F(VectorColTest, cosineNormalizedFlagKeepsRawColumnStorage) {
   CollectionHelper h("main");
   h.clear();
 
-  proto::SchemaDef def;
-  auto* f = def.add_fields();
-  f->set_name("_v");
-  f->set_field_class(proto::FieldDef::VECTOR);
-  f->set_abstract(true);
-  f->set_column_stored(true);
-  f->mutable_vector()->set_metric(proto::VectorParams::COSINE);
-  f->mutable_vector()->set_normalized(true);
+  std::pmr::monotonic_buffer_resource mr;
+  solux::api::SchemaDef def;
+  auto* f = solux::api::build::allocArray(def.fields, 1, mr);
+  f->name = "_v";
+  f->field_class = solux::api::FieldDef_::FieldClass::VECTOR;
+  f->abstract = true;
+  f->column_stored = true;
+  auto& vector = f->vector.emplace();
+  vector.metric = solux::api::VectorParams_::Metric::COSINE;
+  vector.normalized = true;
 
   auto schema = Schema::fromProto(def, h.collection().getSchema().get());
   auto* ft = dynamic_cast<VectorFieldType*>(schema->getFieldTypePtr("vec_v"));
@@ -475,12 +471,10 @@ TEST_F(VectorColTest, cosineNormalizedFlagKeepsRawColumnStorage) {
   Doc doc = flatdoc("id", std::string("a"), "vec_v", std::vector<float>{3.0f, 4.0f});
   h.index(doc, UpdateMessage::COMMIT);
 
-  auto* req = LocalReq::create(h.getSearchEngine());
-  req->collection("main")
-     .allQuery()
-     .fields({"id", "vec_v"})
-     .limit(10)
-     .execute();
+  auto req = localReq(h.getSearchEngine());
+  req->collection("main").topDocs("q").allQuery().fields({"id", "vec_v"}).limit(10);
+  req->execute();
+  ASSERT_OK(req);
 
   auto docs = req->getDocs();
   ASSERT_EQ(1u, docs.size());
@@ -491,7 +485,6 @@ TEST_F(VectorColTest, cosineNormalizedFlagKeepsRawColumnStorage) {
   EXPECT_FLOAT_EQ(3.0f, vec[0]);
   EXPECT_FLOAT_EQ(4.0f, vec[1]);
 
-  req->done();
 }
 
 // A zero / near-zero cosine vector has no direction; rather than fail the whole
@@ -500,13 +493,14 @@ TEST_F(VectorColTest, cosineSkipsZeroVector) {
   CollectionHelper h("main");
   h.clear();
 
-  proto::SchemaDef def;
-  auto* f = def.add_fields();
-  f->set_name("_v");
-  f->set_field_class(proto::FieldDef::VECTOR);
-  f->set_abstract(true);
-  f->set_column_stored(true);
-  f->mutable_vector()->set_metric(proto::VectorParams::COSINE);
+  std::pmr::monotonic_buffer_resource mr;
+  solux::api::SchemaDef def;
+  auto* f = solux::api::build::allocArray(def.fields, 1, mr);
+  f->name = "_v";
+  f->field_class = solux::api::FieldDef_::FieldClass::VECTOR;
+  f->abstract = true;
+  f->column_stored = true;
+  f->vector.emplace().metric = solux::api::VectorParams_::Metric::COSINE;
   h.collection().setSchema(Schema::fromProto(def, h.collection().getSchema().get()));
 
   // Doc "a" has a zero vector (skipped); doc "b" has a usable one (kept).
@@ -517,8 +511,10 @@ TEST_F(VectorColTest, cosineSkipsZeroVector) {
             UpdateMessage::COMMIT);
   }
 
-  auto* req = LocalReq::create(h.getSearchEngine());
-  req->collection("main").allQuery().fields({"id", "vec_v"}).limit(10).execute();
+  auto req = localReq(h.getSearchEngine());
+  req->collection("main").topDocs("q").allQuery().fields({"id", "vec_v"}).limit(10);
+  req->execute();
+  ASSERT_OK(req);
 
   auto docs = req->getDocs();
   ASSERT_EQ(2u, docs.size());
@@ -537,7 +533,6 @@ TEST_F(VectorColTest, cosineSkipsZeroVector) {
     }
   }
 
-  req->done();
 }
 
 TEST_F(VectorColTest, cosineNormalizedFlagTrustsZeroVector) {
@@ -548,20 +543,23 @@ TEST_F(VectorColTest, cosineNormalizedFlagTrustsZeroVector) {
       VectorFieldType::METRIC_COSINE, /*normalized=*/true);
   handler::VectorHandler vh(inverter, "cos_v", cosineType);
 
+  std::pmr::monotonic_buffer_resource mr;
   inverter.setDoc(0);
-  auto zero = makeVec({0.0f, 0.0f});
-  EXPECT_NO_THROW(vh.index(inverter, zero));
+  auto zero = makeVec(mr, {0.0f, 0.0f});
+  EXPECT_NO_THROW(indexVal(inverter, vh, zero));
 }
 
 // Schema round-trip: toProto/fromProto preserves VECTOR field with dims.
 TEST_F(VectorColTest, schemaProtoRoundTrip) {
-  proto::SchemaDef def;
-  auto* f = def.add_fields();
-  f->set_name("embedding");
-  f->set_field_class(proto::FieldDef::VECTOR);
-  f->set_column_stored(true);
-  f->mutable_vector()->set_dims(384);
-  f->mutable_vector()->set_metric(proto::VectorParams::COSINE);
+  std::pmr::monotonic_buffer_resource mr;
+  solux::api::SchemaDef def;
+  auto* f = solux::api::build::allocArray(def.fields, 1, mr);
+  f->name = "embedding";
+  f->field_class = solux::api::FieldDef_::FieldClass::VECTOR;
+  f->column_stored = true;
+  auto& vector = f->vector.emplace();
+  vector.dims = 384;
+  vector.metric = solux::api::VectorParams_::Metric::COSINE;
 
   auto schema = Schema::fromProto(def);
   auto it = schema->getFieldType("embedding");
@@ -574,15 +572,19 @@ TEST_F(VectorColTest, schemaProtoRoundTrip) {
   EXPECT_TRUE(vft->hasColumn());
   EXPECT_TRUE(vft->isSet(FieldType::FIXED_SIZE));
 
-  proto::SchemaDef outDef;
-  schema->toProto(&outDef);
+  solux::api::SchemaDef outDef;
+  std::pmr::monotonic_buffer_resource outMr;
+  schema->toProto(&outDef, outMr);
   bool found = false;
-  for (int i = 0; i < outDef.fields_size(); i++) {
-    if (outDef.fields(i).name() == "embedding") {
-      EXPECT_EQ(proto::FieldDef::VECTOR, outDef.fields(i).field_class());
-      EXPECT_EQ(384, outDef.fields(i).vector().dims());
-      EXPECT_EQ(proto::VectorParams::COSINE, outDef.fields(i).vector().metric());
-      EXPECT_TRUE(outDef.fields(i).vector().normalize_on_write());
+  for (const auto& field : outDef.fields) {
+    if (field.name == "embedding") {
+      ASSERT_TRUE(field.field_class.has_value());
+      ASSERT_TRUE(field.vector.has_value());
+      EXPECT_EQ(solux::api::FieldDef_::FieldClass::VECTOR, *field.field_class);
+      EXPECT_EQ(384, field.vector->dims);
+      EXPECT_EQ(solux::api::VectorParams_::Metric::COSINE, field.vector->metric);
+      ASSERT_TRUE(field.vector->normalize_on_write.has_value());
+      EXPECT_TRUE(*field.vector->normalize_on_write);
       found = true;
     }
   }

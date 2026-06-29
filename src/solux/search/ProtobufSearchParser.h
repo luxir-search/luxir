@@ -1,5 +1,8 @@
 #pragma once
 
+#include "solux/util/proto.h"
+#include <variant>
+
 #include "SearchRequest.h"
 #include "ops/RootOp.h"
 #include "ops/SearchOp.h"
@@ -9,6 +12,7 @@
 #include "ops/FusionOp.h"
 #include "ops/TopDocsReq.h"
 #include "solux/query/ProtobufQueryParser.h"
+#include "solux/util/Overloaded.h"
 
 namespace solux {
 
@@ -16,7 +20,10 @@ class ProtobufSearchParser {
   SearchRequest& req;
   TopDocsReq* firstQuery = nullptr;
 
-
+  // The request's named-op maps (SearchRequest.ops, TopDocs.ops, FieldFacet.ops,
+  // RangeFacet.ops) all share this non-owning type: a span of (name, SearchOp
+  // view) pairs over the request bytes (solux::api::map_view<sv, indirect_view<SearchOp>>).
+  using OpsMap = decltype(ReqProto::ops);
 
 
 
@@ -34,7 +41,7 @@ public:
 
     RootOp& rootOp = *google::protobuf::Arena::Create<RootOp>(&req.arena, req);
     rootOp.parent = nullptr;
-    addSubs(rootOp, req.proto.ops());
+    addSubs(rootOp, req.proto.ops);
 
     // figure out if any facets are using the first query as their input.
     // If so, add those facets under the first query with a signal that they should add their
@@ -42,9 +49,11 @@ public:
     return &rootOp;
   }
 
-  void addSubs(SearchOp& currOp, const google::protobuf::Map<std::string, solux::proto::SearchOp>& ops) {
-    for (auto& [name, searchOp] : ops) {
-      auto* sub = parseOp(name, searchOp);
+  void addSubs(SearchOp& currOp, OpsMap ops) {
+    for (auto& [name, searchOp] : lastWins(ops)) {
+      // map values are indirect views over the request bytes; deref to the SearchOp.
+      // lastWins() collapses duplicate op names (protobuf map dedup semantics).
+      auto* sub = parseOp(name, **searchOp);
       if (sub == nullptr) {
         continue; // skip this op
       }
@@ -53,37 +62,33 @@ public:
     }
   }
 
-  SearchOp* parseOp(std::string_view name, const solux::proto::SearchOp& searchOp) {
-    switch (searchOp.kind_case()) {
-      case solux::proto::SearchOp::kTopDocs: {
-        auto* qr = parseTopDocs(name, searchOp.top_docs());
-        addSubs(*qr, searchOp.top_docs().ops());
+  SearchOp* parseOp(std::string_view name, const solux::api::SearchOp& searchOp) {
+    // Exhaustive dispatch over the SearchOp oneof: a new arm is a compile error until handled.
+    return std::visit(solux::overloaded{
+      [&](const solux::api::TopDocs& topDocs) -> SearchOp* {
+        auto* qr = parseTopDocs(name, topDocs);
+        addSubs(*qr, topDocs.ops);
         return qr;
-      }
-      case solux::proto::SearchOp::kFusion: {
-        return parseFusion(name, searchOp.fusion());
-      }
-      case solux::proto::SearchOp::kFieldFacet: {
-        auto& facetReq = searchOp.field_facet();
+      },
+      [&](const solux::api::Fusion& fusion) -> SearchOp* { return parseFusion(name, fusion); },
+      [&](const solux::api::FieldFacet& facetReq) -> SearchOp* {
         auto* facet = createFieldFacetReq(name, facetReq);
-        addSubs(*facet, searchOp.field_facet().ops());
+        addSubs(*facet, facetReq.ops);
         return facet;
-      } // end case
-        break;
-      case solux::proto::SearchOp::kRangeFacet: {
-        auto& facetReq = searchOp.range_facet();
-        auto facetField = facetReq.field();
-        auto start = facetReq.start();
-        auto end = facetReq.end();
-        auto gap = facetReq.has_gap() ? facetReq.gap() : 1; // default gap is 1
+      },
+      [&](const solux::api::RangeFacet& facetReq) -> SearchOp* {
+        std::string_view facetField = facetReq.field;
+        int64_t start = facetReq.start.value_or(0);
+        int64_t end = facetReq.end.value_or(0);
+        int64_t gap = facetReq.gap; // bare: unset (0) -> 1 via the clamp below
         if (gap <= 0) {
           gap = 1; // ensure gap is positive
         }
         int64_t minCount = -1;
-        if (facetReq.has_mincount()) {
-          minCount = facetReq.mincount();
+        if (facetReq.mincount.has_value()) {
+          minCount = *facetReq.mincount;
         }
-        auto missing = facetReq.missing();
+        bool missing = facetReq.missing;
         // IntFacetRangeReq does integer bucket arithmetic on raw column
         // values; FLOAT/DOUBLE columns hold sortable bits, which would
         // produce silently wrong buckets.  Refuse until range faceting
@@ -92,44 +97,43 @@ public:
         if (rangeFtype->type() == FieldType::FLOAT || rangeFtype->type() == FieldType::DOUBLE) {
           throw std::runtime_error("Range facet over float/double field not yet supported: " + std::string(facetField));
         }
-        if (facetReq.has_mincount() && facetReq.mincount() < 1) {
+        if (facetReq.mincount.has_value() && *facetReq.mincount < 1) {
           throw std::runtime_error("facet '" + std::string(name) + "': mincount < 1 (zero-count buckets) is not supported for range facets");
         }
-        if (facetReq.ops_size() > 0 || facetReq.sorts_size() > 0) {
+        if (!facetReq.ops.empty() || !facetReq.sorts.empty()) {
           throw std::runtime_error("facet '" + std::string(name) + "': sub-ops/sorts are not yet supported for range facets");
         }
         FacetReq* facet = google::protobuf::Arena::Create<IntFacetRangeReq>(&req.arena, req, facetReq, facetField, name, start, end, gap, minCount, missing);
-        addSubs(*facet, searchOp.range_facet().ops());
+        addSubs(*facet, facetReq.ops);
         return facet;
-      }
-        break;
-        case solux::proto::SearchOp::kGenOp: {
-          if (searchOp.gen_op().name() == "avg" || searchOp.gen_op().name() == "average") {
-            auto& avgOp = searchOp.gen_op();
-            // Resolve the field type before Arena::Create (schema lookup may throw).
-            auto& avgFtype = req.schema->getFieldTypeEx(avgOp.args(0).s());
-            auto* avg = google::protobuf::Arena::Create<AvgOp>(&req.arena, req, name, avgOp.args(0).s(), avgFtype->type());
-            return avg;
-          } else {
-            throw std::runtime_error("Unknown generic operation: " + std::string(searchOp.gen_op().name()));
+      },
+      [&](const solux::api::GenOp& avgOp) -> SearchOp* {
+        if (avgOp.name == "avg" || avgOp.name == "average") {
+          if (avgOp.args.empty()) {
+            throw std::runtime_error("Generic operation 'avg' requires a field argument");
           }
+          // Resolve the field type before Arena::Create (schema lookup may throw).
+          std::string_view avgField = ProtobufQueryParser::getString(avgOp.args[0]);
+          auto& avgFtype = req.schema->getFieldTypeEx(avgField);
+          return google::protobuf::Arena::Create<AvgOp>(&req.arena, req, name, avgField, avgFtype->type());
         }
-      default:
-        throw std::runtime_error("Unknown search operation");
-    }
+        throw std::runtime_error("Unknown generic operation: " + std::string(avgOp.name));
+      },
+      [&](std::monostate) -> SearchOp* { throw std::runtime_error("search op oneof not set"); },
+    }, searchOp.kind);
   }
 
-  FacetReq* createFieldFacetReq(std::string_view facetName, const proto::FieldFacet& facetReq) {
-    auto facetField = facetReq.field();
+  FacetReq* createFieldFacetReq(std::string_view facetName, const solux::api::FieldFacet& facetReq) {
+    std::string_view facetField = facetReq.field;
     int64_t limit = 5; // default limit
-    if (facetReq.has_limit()) {
-      limit = facetReq.limit();
+    if (facetReq.limit.has_value()) {
+      limit = *facetReq.limit;
     }
     int64_t minCount = -1;
-    if (facetReq.has_mincount()) {
-      minCount = facetReq.mincount();
+    if (facetReq.mincount.has_value()) {
+      minCount = *facetReq.mincount;
     }
-    auto missing = facetReq.missing();
+    bool missing = facetReq.missing;
 
     // Resolve everything that could throw before Arena::Create: the arena
     // registers the cleanup entry pre-construction, so a throwing ctor
@@ -144,10 +148,10 @@ public:
       // facet, not a terms facet.
       case FieldType::Type::DATE:
       case FieldType::Type::INT: {
-        if (facetReq.has_mincount() && facetReq.mincount() < 1) {
+        if (facetReq.mincount.has_value() && *facetReq.mincount < 1) {
           throw std::runtime_error("facet '" + std::string(facetName) + "': mincount < 1 (zero-count buckets) is not supported for int field facets");
         }
-        if (facetReq.ops_size() > 0 || facetReq.sorts_size() > 0) {
+        if (!facetReq.ops.empty() || !facetReq.sorts.empty()) {
           throw std::runtime_error("facet '" + std::string(facetName) + "': sub-ops/sorts are not yet supported for int field facets");
         }
         auto range = IntFacetReq::scanGlobalRange(*req.reader, facetField);
@@ -161,7 +165,7 @@ public:
         break;
       }
       case FieldType::Type::TEXT:
-        if (facetReq.ops_size() > 0 || facetReq.sorts_size() > 0) {
+        if (!facetReq.ops.empty() || !facetReq.sorts.empty()) {
           throw std::runtime_error("facet '" + std::string(facetName) + "': sub-ops/sorts are not yet supported for text field facets");
         }
         facet = google::protobuf::Arena::Create<FullTextFacetReq>(&req.arena, req, facetReq, facetField, facetName, limit, minCount, missing);
@@ -174,33 +178,33 @@ public:
     return facet;
   }
 
-  // Build SortField list from a proto::SortSpec repeated field.  Schema
+  // Build SortField list from a proto SortSpec repeated field.  Schema
   // lookups may throw, so this must run before any Arena::Create that
   // consumes the result.
   struct ParsedSorts {
     std::vector<SortField> sortFields;
     bool useFieldSort = false;
   };
-  ParsedSorts parseSorts(const google::protobuf::RepeatedPtrField<proto::SortSpec>& sorts) {
+  ParsedSorts parseSorts(std::span<const solux::api::SortSpec> sorts) {
     ParsedSorts out;
     if (sorts.empty()) return out;
     out.useFieldSort = true;
     static ScoreFieldType scoreType;
     static DocFieldType docType;
     for (const auto& sortSpec : sorts) {
-      SortField::SortOrder order = sortSpec.dir() == proto::SortSpec::DESC ?
+      SortField::SortOrder order = sortSpec.dir == solux::api::SortSpec_::SortDir::DESC ?
         SortField::DESC : SortField::ASC;
       FieldComparator::MissingValue missing = FieldComparator::MISSING_LAST;
-      if (sortSpec.field() == "_score_") {
-        out.sortFields.emplace_back(sortSpec.field(), scoreType, order, missing);
-      } else if (sortSpec.field() == "_docid_") {
-        out.sortFields.emplace_back(sortSpec.field(), docType, order, missing);
+      if (sortSpec.field == "_score_") {
+        out.sortFields.emplace_back(sortSpec.field, scoreType, order, missing);
+      } else if (sortSpec.field == "_docid_") {
+        out.sortFields.emplace_back(sortSpec.field, docType, order, missing);
       } else {
-        auto fieldTypePtr = req.schema->getFieldTypeEx(sortSpec.field());
+        auto fieldTypePtr = req.schema->getFieldTypeEx(sortSpec.field);
         if (!fieldTypePtr) {
-          throw std::runtime_error(std::string("Field not found in schema: ") + std::string(sortSpec.field()));
+          throw std::runtime_error(std::string("Field not found in schema: ") + std::string(sortSpec.field));
         }
-        out.sortFields.emplace_back(sortSpec.field(), *fieldTypePtr, order, missing);
+        out.sortFields.emplace_back(sortSpec.field, *fieldTypePtr, order, missing);
       }
     }
     return out;
@@ -226,7 +230,7 @@ public:
   // Build a TopDocsReq from a TopDocs proto.  Caller decides whether to
   // attach sub-ops (the kTopDocs path in parseOp does; parseFusion does
   // not, since per-source ops are ignored by spec).
-  TopDocsReq* parseTopDocs(std::string_view name, const solux::proto::TopDocs& topDocsReq) {
+  TopDocsReq* parseTopDocs(std::string_view name, const solux::api::TopDocs& topDocsReq) {
     /*
     message TopDocs {
             Query query = 1;
@@ -242,18 +246,21 @@ public:
     // Place the Query in the requestPool since it uses things like string_view that directly reference
     // the request.
     ProtobufQueryParser parser(req.requestPool, *req.schema);
-    Query* query = parser.parse(topDocsReq.query());
-    int64_t offset = topDocsReq.offset();
+    if (!topDocsReq.query.has_value()) {
+      throw std::runtime_error("TopDocs requires a query");
+    }
+    Query* query = parser.parse(*topDocsReq.query);
+    int64_t offset = topDocsReq.offset;
     unused(offset); // TODO
-    int64_t specifiedLimit = topDocsReq.has_limit() ? topDocsReq.limit() : 10;
+    int64_t specifiedLimit = topDocsReq.limit.has_value() ? *topDocsReq.limit : 10;
     // limit to actual number of docs in the index (or all if limit == -1)
     int64_t limit = specifiedLimit < 0 ? req.reader->maxDoc() : std::min(specifiedLimit, req.reader->maxDoc());
 
-    auto filters = parseNamedFilters(parser, topDocsReq.filter());
+    auto filters = parseNamedFilters(parser, topDocsReq.filter);
 
     // All work that may throw (sort field schema lookup, Weight ctors)
     // must complete before Arena::Create<TopDocsReq>.
-    auto parsedSorts = parseSorts(topDocsReq.sorts());
+    auto parsedSorts = parseSorts(topDocsReq.sorts);
     auto* qcontext = Query::Context::create(&req.arena, req.requestPool, *req.reader);
     // Flags for this request's main query. Filters inherit these after
     // buildFilterWeights clears NEED_SCORES.
@@ -276,44 +283,48 @@ public:
 
   std::span<std::pair<std::string_view, Query*>> parseNamedFilters(
       ProtobufQueryParser& parser,
-      const google::protobuf::RepeatedPtrField<solux::proto::NamedQuery>& filtersProto) {
+      std::span<const solux::api::NamedQuery> filtersProto) {
     std::span<std::pair<std::string_view, Query*>> out;
-    if (filtersProto.size() > 0) {
+    if (!filtersProto.empty()) {
       out = req.requestPool.make_span<std::pair<std::string_view, Query*>>(filtersProto.size());
-      for (int i = 0; i < filtersProto.size(); i++) {
+      for (size_t i = 0; i < filtersProto.size(); i++) {
         auto& f = filtersProto[i];
-        out[i] = {f.name(), parser.parse(f.query())};
+        if (!f.query.has_value()) {
+          throw std::runtime_error("filter '" + std::string(f.name) + "' requires a query");
+        }
+        out[i] = {f.name, parser.parse(*f.query)};
       }
     }
     return out;
   }
 
-  SearchOp* parseFusion(std::string_view name, const solux::proto::Fusion& fusionProto) {
-    if (fusionProto.ops_size() > 0) {
+  SearchOp* parseFusion(std::string_view name, const solux::api::Fusion& fusionProto) {
+    if (!fusionProto.ops.empty()) {
       throw std::runtime_error("Fusion sub-ops are not yet supported");
     }
-    if (fusionProto.sources().empty()) {
+    if (fusionProto.sources.empty()) {
       throw std::runtime_error("Fusion requires at least one source");
     }
-    if (!fusionProto.has_rrf()) {
+    if (!fusionProto.rrf.has_value()) {
       throw std::runtime_error("Fusion requires a fusion method (only RRF is supported)");
     }
-    if (fusionProto.rrf().k() < 0) {
+    if (fusionProto.rrf->k < 0) {
       throw std::runtime_error("RrfFusion.k must be >= 0 (0 selects the default)");
     }
-    int32_t rrfK = fusionProto.rrf().k() > 0 ? fusionProto.rrf().k() : 60;
+    int32_t rrfK = fusionProto.rrf->k > 0 ? fusionProto.rrf->k : 60;
 
     // Build each source as a full TopDocsReq, wired to deliver its merged
     // collector back to the FusionOp::Calc instead of self-emitting.  The
     // sink closure captures nothing at parse time; it resolves the parent
     // FusionOp::Calc at runtime via the source Calc's parent pointer.
     // Per-source `ops` are intentionally not attached (Fusion spec ignores
-    // them).
+    // them).  Fusion.sources is a map whose values are TopDocs directly (not
+    // indirect), so srcProto is the message itself.
     std::vector<TopDocsReq*> sources;
-    sources.reserve(fusionProto.sources().size());
-    for (auto& [srcName, srcProto] : fusionProto.sources()) {
+    sources.reserve(fusionProto.sources.size());
+    for (auto& [srcName, srcProto] : lastWins(fusionProto.sources)) {  // dedup duplicate source names, last-wins
       size_t idx = sources.size();
-      auto* src = parseTopDocs(srcName, srcProto);
+      auto* src = parseTopDocs(srcName, *srcProto);
       src->rankingSink = [idx](TopDocsReq::Calc& calc, MergeableCollector* mc) {
         static_cast<FusionOp::Calc*>(calc.getParent())->acceptSourceRanking(idx, mc);
       };
@@ -321,14 +332,14 @@ public:
     }
 
     ProtobufQueryParser parser(req.requestPool, *req.schema);
-    auto sharedFilters = parseNamedFilters(parser, fusionProto.filter());
+    auto sharedFilters = parseNamedFilters(parser, fusionProto.filter);
     // Reuse the first source's qcontext to build the shared filter
     // weights.  All sources share the same reader/pool, so any qcontext
     // works; reusing one avoids an otherwise-unneeded allocation.
     // Shared filters use the same request flag path as TopDocs filters.
     auto sharedFilterWeights = buildFilterWeights(sharedFilters, sources.front()->qcontext, Query::NEED_SCORES);
 
-    int64_t specifiedLimit = fusionProto.has_limit() ? fusionProto.limit() : 10;
+    int64_t specifiedLimit = fusionProto.limit.has_value() ? *fusionProto.limit : 10;
     int64_t limit = specifiedLimit < 0 ? req.reader->maxDoc() : std::min(specifiedLimit, req.reader->maxDoc());
 
     auto* fusion = google::protobuf::Arena::Create<FusionOp>(

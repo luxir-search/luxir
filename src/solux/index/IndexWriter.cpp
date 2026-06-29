@@ -11,7 +11,8 @@
 #include "LiveDocsWriter.h"
 #include "solux/schema/Schema.h"
 
-#include "protos/solux_types.pb.h"
+#include "solux/index/AuxInfo.h"
+#include <memory_resource>
 #include <google/protobuf/io/coded_stream.h>
 #include <google/protobuf/io/zero_copy_stream_impl_lite.h>
 #include "solux/util/heap.h"
@@ -72,45 +73,42 @@ IndexWriter::IndexWriter(Directory& dir, std::function<std::shared_ptr<Schema>()
   else {
     InputStream segmentsIs = segFile->getInputStream();
 
-    google::protobuf::Arena arena;
-    proto::IndexInfo& indexInfo = *google::protobuf::Arena::Create<proto::IndexInfo>(&arena);
-    google::protobuf::io::ArrayInputStream arrayStream(segmentsIs.ptr(), segmentsIs.left());
-    google::protobuf::io::CodedInputStream codedStream(&arrayStream);
-
-    if (!indexInfo.ParseFromCodedStream(&codedStream)) {
+    std::pmr::monotonic_buffer_resource iiArena;  // backs the non-owning IndexInfo view
+    solux::api::IndexInfo indexInfo;
+    std::span<const std::byte> indexInfoBytes((const std::byte*)segmentsIs.ptr(), segmentsIs.left());
+    if (!solux::api::decode(indexInfo, indexInfoBytes, iiArena)) {
       throw std::runtime_error("Failed to parse IndexInfo protobuf");
     }
 
-    lastCommitTime = lastAdvertisedCommitTime = indexInfo.commit_time();
-    indexGen = indexInfo.index_gen();
-    coreGen = indexInfo.core_gen();
-    schemaGen_ = indexInfo.schema_gen();
-    updateBase = indexInfo.update_version() + 1;
-    segInfos.reserve(indexInfo.segments_size());
-    lastCommittedSegIds.reserve(indexInfo.segments_size());
+    lastCommitTime = lastAdvertisedCommitTime = indexInfo.commit_time;
+    indexGen = indexInfo.index_gen;
+    coreGen = indexInfo.core_gen;
+    schemaGen_ = indexInfo.schema_gen;
+    updateBase = indexInfo.update_version + 1;
+    segInfos.reserve(indexInfo.segments.size());
+    lastCommittedSegIds.reserve(indexInfo.segments.size());
 
     // TODO: maybe maintain segment order by recording ord in segments file.
-    for (int i = 0; i < indexInfo.segments_size(); i++) {
-      const auto& segment = indexInfo.segments(i);
-      auto segId = segment.seg_id();
+    for (const auto& segment : indexInfo.segments) {
+      auto segId = segment.seg_id;
       lastSegId = std::max(lastSegId.load(std::memory_order::relaxed), segId);
-      int32_t nDocs = segment.max_doc();
+      int32_t nDocs = segment.max_doc;
       // having ndocs in the list of segments is redundant with info in the segment itself and may be removed later.
       // for now it makes it easy to populate nDocs for merge decisions.
       auto [iter, success] = segInfos.emplace(segId, std::make_unique<SegInfo>(segId, nDocs));
       assert(success); // should be no repeated segments
       auto& seg = *iter->second;
-      seg.liveGen = segment.live_gen();
-      seg.minVersion = segment.min_version();
-      seg.maxVersion = segment.max_version();
-      seg.liveDocs = segment.live_docs();
-      seg.schemaGen = segment.schema_gen();
-      seg.firstCommitTime = segment.commit_time();  // firstCommitTime is stored in the segment meta.
-      seg.lastCommitTime = indexInfo.commit_time(); // not stored in the segment meta, so use index meta.
-      seg.auxOverlays.reserve(segment.overlays_size());
-      for (int j = 0; j < segment.overlays_size(); j++) {
-        seg.auxOverlays.push_back(segment.overlays(j));
-        currentSegmentOverlays_.push_back({segId, segment.overlays(j)});
+      seg.liveGen = segment.live_gen;
+      seg.minVersion = segment.min_version;
+      seg.maxVersion = segment.max_version;
+      seg.liveDocs = segment.live_docs;
+      seg.schemaGen = segment.schema_gen;
+      seg.firstCommitTime = segment.commit_time;  // firstCommitTime is stored in the segment meta.
+      seg.lastCommitTime = indexInfo.commit_time; // not stored in the segment meta, so use index meta.
+      seg.auxOverlays.reserve(segment.overlays.size());
+      for (const auto& overlay : segment.overlays) {
+        seg.auxOverlays.push_back(fromWire(overlay));
+        currentSegmentOverlays_.push_back({segId, fromWire(overlay)});
       }
       mergePolicy->_update(&seg);
       lastCommittedSegIds.push_back(segId);
@@ -120,9 +118,9 @@ IndexWriter::IndexWriter(Directory& dir, std::function<std::shared_ptr<Schema>()
 
     // Pull aux indexes forward so the next commit can carry them and so we
     // know which files the previous commit referenced (for orphan cleanup).
-    currentAuxIndexes_.reserve(indexInfo.aux_indexes_size());
-    for (int i = 0; i < indexInfo.aux_indexes_size(); i++) {
-      currentAuxIndexes_.push_back(indexInfo.aux_indexes(i));
+    currentAuxIndexes_.reserve(indexInfo.aux_indexes.size());
+    for (const auto& aux : indexInfo.aux_indexes) {
+      currentAuxIndexes_.push_back(fromWire(aux));
     }
   }
   {
@@ -896,7 +894,7 @@ void IndexWriter::moveSegmentToDelete(uint64_t segId) {
 // Vectors are not built here; they are segment overlays handled by
 // buildSegmentOverlays.  The old built_core_gen filter remains only for
 // future index-level aux kinds that choose to use it.
-std::vector<proto::AuxIndexInfo> IndexWriter::buildAuxIndexes(
+std::vector<AuxInfo> IndexWriter::buildAuxIndexes(
     const UpdateMessage& msg,
     std::span<SegInfo*> segsToKeep,
     std::vector<std::string>& outFilesToSync) {
@@ -910,13 +908,13 @@ std::vector<proto::AuxIndexInfo> IndexWriter::buildAuxIndexes(
   // names (segment-dependent entries whose built_core_gen matches the new
   // core gen) - rebuilding those would produce identical output, so we tell
   // the builder to skip them.
-  std::vector<proto::AuxIndexInfo> carried;
+  std::vector<AuxInfo> carried;
   carried.reserve(currentAuxIndexes_.size());
   for (const auto& prev : currentAuxIndexes_) {
-    if (prev.kind() == VectorIndexBuilder::KIND) {
+    if (prev.kind == VectorIndexBuilder::KIND) {
       continue;
     }
-    if (prev.built_core_gen() == 0 || prev.built_core_gen() == newCoreGen) {
+    if (prev.built_core_gen == 0 || prev.built_core_gen == newCoreGen) {
       carried.push_back(prev);
     }
   }
@@ -985,8 +983,8 @@ std::shared_ptr<PostingsReader> IndexWriter::getSegmentPostingsReader(SegInfo& s
 void IndexWriter::seedActiveVectorOverlayNamesFromManifestLocked() {
   activeVectorOverlayNames.clear();
   for (const auto& published : currentSegmentOverlays_) {
-    if (published.info.kind() == VectorIndexBuilder::KIND) {
-      activeVectorOverlayNames.emplace(published.info.name());
+    if (published.info.kind == VectorIndexBuilder::KIND) {
+      activeVectorOverlayNames.emplace(published.info.name);
     }
   }
 }
@@ -1021,8 +1019,8 @@ uint64_t IndexWriter::nextVectorOverlayGen(const SegInfo& seg, std::string_view 
   // Usually defense-in-depth: callers skip existing names before rebuilding, so
   // seg.auxOverlays normally cannot raise the ordinal for a selected name.
   for (const auto& overlay : seg.auxOverlays) {
-    if (overlay.kind() == VectorIndexBuilder::KIND && overlay.name() == name) {
-      nextGen = std::max(nextGen, overlay.gen() + 1);
+    if (overlay.kind == VectorIndexBuilder::KIND && overlay.name == name) {
+      nextGen = std::max(nextGen, overlay.gen + 1);
     }
   }
 
@@ -1036,9 +1034,9 @@ uint64_t IndexWriter::nextVectorOverlayGen(const SegInfo& seg, std::string_view 
   if (seg.firstCommitTime != 0) {
     for (const auto& published : currentSegmentOverlays_) {
       if (published.segId == seg.segId
-          && published.info.kind() == VectorIndexBuilder::KIND
-          && published.info.name() == name) {
-        nextGen = std::max(nextGen, published.info.gen() + 1);
+          && published.info.kind == VectorIndexBuilder::KIND
+          && published.info.name == name) {
+        nextGen = std::max(nextGen, published.info.gen + 1);
       }
     }
   }
@@ -1046,20 +1044,20 @@ uint64_t IndexWriter::nextVectorOverlayGen(const SegInfo& seg, std::string_view 
   return nextGen;
 }
 
-std::vector<proto::AuxIndexInfo> IndexWriter::buildConcreteVectorOverlays(
+std::vector<AuxInfo> IndexWriter::buildConcreteVectorOverlays(
     SegInfo& seg,
     PostingsReader& postingsReader,
     std::span<const std::string> overlayNames,
     const Schema& schema,
     VectorIndexBuilder::BuildSite buildSite,
     std::vector<std::string>& outFiles) {
-  std::vector<proto::AuxIndexInfo> built;
+  std::vector<AuxInfo> built;
   if (overlayNames.empty()) return built;
 
   boost::unordered_flat_set<std::string> existingNames;
   for (const auto& overlay : seg.auxOverlays) {
-    if (overlay.kind() == VectorIndexBuilder::KIND) {
-      existingNames.emplace(overlay.name());
+    if (overlay.kind == VectorIndexBuilder::KIND) {
+      existingNames.emplace(overlay.name);
     }
   }
 
@@ -1075,7 +1073,7 @@ std::vector<proto::AuxIndexInfo> IndexWriter::buildConcreteVectorOverlays(
     std::vector<std::string> oneSelector{overlayName};
     auto newlyBuilt = vb.build(oneSelector, existingNames, outFiles, buildSite);
     for (auto& info : newlyBuilt) {
-      existingNames.emplace(info.name());
+      existingNames.emplace(info.name);
       built.push_back(std::move(info));
     }
   }
@@ -1126,7 +1124,7 @@ void IndexWriter::buildSegmentOverlays(const UpdateMessage& msg,
 
   struct StagedOverlay {
     SegInfo* seg;
-    proto::AuxIndexInfo info;
+    AuxInfo info;
   };
   std::vector<StagedOverlay> stagedOverlays;
   std::vector<std::string> stagedFiles;
@@ -1138,8 +1136,8 @@ void IndexWriter::buildSegmentOverlays(const UpdateMessage& msg,
         auto* seg = segsToKeep[i];
         bool exists = false;
         for (const auto& overlay : seg->auxOverlays) {
-          if (overlay.kind() == TestOverlayAuxReader::KIND
-              && overlay.name() == TestOverlayAuxReader::NAME) {
+          if (overlay.kind == TestOverlayAuxReader::KIND
+              && overlay.name == TestOverlayAuxReader::NAME) {
             exists = true;
             break;
           }
@@ -1159,14 +1157,16 @@ void IndexWriter::buildSegmentOverlays(const UpdateMessage& msg,
         }
         stagedFiles.push_back(fileName);
 
-        proto::AuxIndexInfo info;
-        info.set_kind(std::string(TestOverlayAuxReader::KIND));
-        info.set_name(std::string(TestOverlayAuxReader::NAME));
+        AuxInfo info;
+        info.kind = std::string(TestOverlayAuxReader::KIND);
+        info.name = std::string(TestOverlayAuxReader::NAME);
         // Intentionally indexGen, not the vector rebuild ordinal: this kind is
         // existence-only (no rebuild flow), so gen only has to uniquify files.
-        info.set_gen(msg.commitInfo->indexGen);
-        info.add_files(fileName);
-        info.set_opaque_meta("test");
+        info.gen = msg.commitInfo->indexGen;
+        info.files.push_back(fileName);
+        static constexpr std::string_view testMeta = "test";
+        info.opaque_meta.assign((const std::byte*)testMeta.data(),
+                                (const std::byte*)testMeta.data() + testMeta.size());
         stagedOverlays.push_back({seg, std::move(info)});
       }
     }
@@ -1198,7 +1198,7 @@ void IndexWriter::buildSegmentOverlays(const UpdateMessage& msg,
   }
   activateVectorOverlayNames(stagedActiveOverlayNames);
   for (auto& staged : stagedOverlays) {
-    for (const auto& file : staged.info.files()) {
+    for (const auto& file : staged.info.files) {
       staged.seg->unsyncedFiles.push_back(file);
     }
     staged.seg->auxOverlays.push_back(std::move(staged.info));
@@ -1251,23 +1251,23 @@ void IndexWriter::deleteOrphanedAuxFiles(const std::vector<PublishedOverlay>& ol
                                          const std::vector<PublishedOverlay>& newList) {
   boost::unordered_flat_set<std::string> keep;
   for (const auto& published : newList) {
-    for (const auto& f : published.info.files()) keep.emplace(f);
+    for (const auto& f : published.info.files) keep.emplace(f);
   }
   for (const auto& published : oldList) {
-    for (const auto& f : published.info.files()) {
+    for (const auto& f : published.info.files) {
       deleteFilesNotKept(dir, keep, f);
     }
   }
 }
 
-void IndexWriter::deleteOrphanedAuxFiles(const std::vector<proto::AuxIndexInfo>& oldList,
-                                         const std::vector<proto::AuxIndexInfo>& newList) {
+void IndexWriter::deleteOrphanedAuxFiles(const std::vector<AuxInfo>& oldList,
+                                         const std::vector<AuxInfo>& newList) {
   boost::unordered_flat_set<std::string> keep;
   for (const auto& info : newList) {
-    for (const auto& f : info.files()) keep.emplace(f);
+    for (const auto& f : info.files) keep.emplace(f);
   }
   for (const auto& info : oldList) {
-    for (const auto& f : info.files()) {
+    for (const auto& f : info.files) {
       deleteFilesNotKept(dir, keep, f);
     }
   }
@@ -1278,7 +1278,7 @@ void IndexWriter::deleteOrphanedAuxFiles(const std::vector<proto::AuxIndexInfo>&
 // hence we only need to protect against changes in the segInfos map, not multiple invocations of this method.
 // The passed span of segments may be reordered after this is finished.
 void IndexWriter::writeIndexInfoFile(std::span<SegInfo*> segs, CommitInfo* commitInfo,
-                                     std::span<const proto::AuxIndexInfo> auxIndexes) {
+                                     std::span<const AuxInfo> auxIndexes) {
   // We should be able to write the segments file without holding the indexMutex,
   // as long as we access only fields that should not change on SegInfo.
   // liveDocs + liveGen won't change because we only apply deletes in finishCommitBody().
@@ -1337,17 +1337,20 @@ void IndexWriter::writeIndexInfoFile(std::span<SegInfo*> segs, CommitInfo* commi
     updateVersion = updateBase + 1;
   }
 
-  // Build the protobuf message
-  google::protobuf::Arena arena;
-  proto::IndexInfo& indexInfo = *google::protobuf::Arena::Create<proto::IndexInfo>(&arena);
-  indexInfo.set_commit_time(now_us);
-  indexInfo.set_version(1);
-  indexInfo.set_index_gen(thisIndexGen);
-  indexInfo.set_update_version(updateVersion);
-  indexInfo.set_core_gen(coreGen);
-  indexInfo.set_schema_gen(currentSchemaGen());
-  indexInfo.mutable_segments()->Reserve(segs.size());
+  // Build the IndexInfo message NON-OWNING into a scratch arena, then encode. Segment +
+  // overlay + aux arrays are arena-allocated; AuxIndexInfo views point at the owning
+  // AuxInfo state (toWire) with file-name spans also in the arena.
+  std::pmr::monotonic_buffer_resource iiArena;
+  solux::api::IndexInfo indexInfo;
+  indexInfo.commit_time = now_us;
+  indexInfo.version = 1;
+  indexInfo.index_gen = thisIndexGen;
+  indexInfo.update_version = updateVersion;
+  indexInfo.core_gen = coreGen;
+  indexInfo.schema_gen = currentSchemaGen();
 
+  solux::api::SegmentInfo* segArr = solux::api::build::allocArray(indexInfo.segments, segs.size(), iiArena);
+  size_t segIdx = 0;
   for (auto seg : segs) {
     // Update the commit time for the seg. Important to know if this seg is part of the last commit.
     // This does mean that this may be visible before the commit is done and before lastCommitTime is updated.
@@ -1357,20 +1360,21 @@ void IndexWriter::writeIndexInfoFile(std::span<SegInfo*> segs, CommitInfo* commi
       seg->firstCommitTime = now_us;
     }
 
-    auto* segmentInfo = indexInfo.add_segments();
-    segmentInfo->set_seg_id(seg->segId);
-    segmentInfo->set_max_doc(seg->maxDoc);
-    segmentInfo->set_live_gen(seg->liveGen);
-    segmentInfo->set_min_version(seg->minVersion);
-    segmentInfo->set_max_version(seg->maxVersion);
-    segmentInfo->set_commit_time(seg->firstCommitTime);
-    segmentInfo->set_live_docs(seg->liveDocs);
-    segmentInfo->set_schema_gen(seg->schemaGen);
-    for (const auto& overlay : seg->auxOverlays) {
-      auto* dst = segmentInfo->add_overlays();
-      *dst = overlay;
-      if (dst->commit_time() == 0) {
-        dst->set_commit_time(now_us);
+    auto& segmentInfo = segArr[segIdx++];
+    segmentInfo.seg_id = seg->segId;
+    segmentInfo.max_doc = seg->maxDoc;
+    segmentInfo.live_gen = seg->liveGen;
+    segmentInfo.min_version = seg->minVersion;
+    segmentInfo.max_version = seg->maxVersion;
+    segmentInfo.commit_time = seg->firstCommitTime;
+    segmentInfo.live_docs = seg->liveDocs;
+    segmentInfo.schema_gen = seg->schemaGen;
+    solux::api::AuxIndexInfo* ovArr =
+        solux::api::build::allocArray(segmentInfo.overlays, seg->auxOverlays.size(), iiArena);
+    for (size_t oi = 0; oi < seg->auxOverlays.size(); oi++) {
+      ovArr[oi] = toWire(seg->auxOverlays[oi], iiArena);
+      if (ovArr[oi].commit_time == 0) {
+        ovArr[oi].commit_time = now_us;
       }
     }
 
@@ -1379,22 +1383,23 @@ void IndexWriter::writeIndexInfoFile(std::span<SegInfo*> segs, CommitInfo* commi
   }
 
   // Carry over aux indexes built during this commit.
-  for (const auto& aux : auxIndexes) {
-    auto* dst = indexInfo.add_aux_indexes();
-    *dst = aux;
-    if (dst->commit_time() == 0) {
-      dst->set_commit_time(now_us);
+  solux::api::AuxIndexInfo* auxArr =
+      solux::api::build::allocArray(indexInfo.aux_indexes, auxIndexes.size(), iiArena);
+  for (size_t ai = 0; ai < auxIndexes.size(); ai++) {
+    auxArr[ai] = toWire(auxIndexes[ai], iiArena);
+    if (auxArr[ai].commit_time == 0) {
+      auxArr[ai].commit_time = now_us;
     }
   }
 
-  // Serialize the protobuf message - TODO: hook into other serialization methods to avoid string
-  std::string serialized;
+  // Serialize the IndexInfo (changes the on-disk commit-point format).
+  std::vector<std::byte> serialized;
   serialized.reserve(200 + segs.size() * 24);
-  if (!indexInfo.SerializeToString(&serialized)) {
+  if (!solux::api::encode(indexInfo, serialized)) {
     throw std::runtime_error("Failed to serialize IndexInfo protobuf");
   }
 
-  indexOut.write(serialized.data(), serialized.size());
+  indexOut.write((const char*)serialized.data(), serialized.size());
   indexOut.close();
   dir.finishFile(*indexFile);
 
@@ -2009,8 +2014,8 @@ bool IndexWriter::testDropSegmentOverlay(std::string_view name, size_t segmentOr
 
   auto& overlays = ordered[segmentOrd]->auxOverlays;
   auto oldSize = overlays.size();
-  std::erase_if(overlays, [&](const proto::AuxIndexInfo& info) {
-    return info.name() == name;
+  std::erase_if(overlays, [&](const AuxInfo& info) {
+    return info.name == name;
   });
   if (overlays.size() == oldSize) return false;
   return true;

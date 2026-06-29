@@ -33,7 +33,9 @@ void SearchEngine::submitBody(SearchRequest& req) {
     if (req.lastResponse == nullptr) {
       req.lastResponse = SearchResponse::create(req, true);
     }
-    req.lastResponse->proto.set_error(e.what());
+    // proto.error is a non-owning string_view; e.what() points into the exception object,
+    // which is destroyed when this catch block exits. Copy it into the response arena.
+    req.lastResponse->proto.error = solux::api::build::arenaStr(req.lastResponse->mr, e.what());
   }
 
   // Send back the final response.  Do not access req after this point as it
@@ -56,29 +58,33 @@ void SearchEngine::getResources(SearchRequest& req) {
   auto& request = req.proto;
   auto& node = req.engine.node;
 
-  if (request.collection().name_size() == 0) {
+  // collection is an optional Target; an absent or empty name path means no
+  // explicit collection was specified.
+  int nameCount = request.collection ? (int)request.collection->name.size() : 0;
+  if (nameCount == 0) {
     // TODO: do we support default collections (implicitly defined by something like an api-key?)
   }
 
   std::shared_ptr<Library> library = node.getLibrary(nullptr, "");
-  for (int i = 0; i < request.collection().name_size(); i++) {
+  for (int i = 0; i < nameCount; i++) {
+    std::string_view name = request.collection->name[i];
     // TODO: walk from our implicit root to find the correct collection.
-    if (i == request.collection().name_size() - 1) {
-      // LOG_DEBUG("Looking up collection name '{}'", request.collection().name(i));
+    if (i == nameCount - 1) {
+      // LOG_DEBUG("Looking up collection name '{}'", name);
 
       // last element in path, so get collection.
-      collection = node.getCollection(library.get(), request.collection().name(i));
+      collection = node.getCollection(library.get(), name);
       // TODO: handle lookup failure
     } else {
       // not last element... get sub-library
-      library = node.getLibrary(library.get(), request.collection().name(i));
+      library = node.getLibrary(library.get(), name);
       // TODO: handle lookup failure
     }
   }
 
   // get the index reader
   req.schema = collection->getSchema();
-  req.reader = collection->getShard()->getIndexWriter()->getIndexReader(request.freshness_us());
+  req.reader = collection->getShard()->getIndexWriter()->getIndexReader(request.freshness_us);
 }
 
 

@@ -1,14 +1,18 @@
 #include <gtest/gtest.h>
 
+#include <memory>
+#include <memory_resource>
 #include <set>
+#include <span>
 #include <string>
+#include <utility>
 #include <vector>
 
-#include "protos/solux_types.pb.h"
 #include "solux/schema/Schema.h"
 #include "solux/server/SoluxNode.h"
 #include "test/CollectionHelper.h"
 #include "test/LocalReq.h"
+#include "test/QueryBuild.h"
 #include "test/SoluxTest.h"
 #include "test/TestUtils.h"
 
@@ -24,76 +28,124 @@ protected:
 
   // Override _v with a vector field so the same docs can carry both an
   // analyzed text field (_w) and a dense vector for fusion across both.
-  static void installVecSchema(Collection& col, proto::VectorParams::Metric metric) {
-    proto::SchemaDef def;
-    auto* f = def.add_fields();
-    f->set_name("_v");
-    f->set_field_class(proto::FieldDef::VECTOR);
-    f->set_abstract(true);
-    f->set_column_stored(true);
-    f->mutable_vector()->set_metric(metric);
+  static void installVecSchema(Collection& col, solux::api::VectorParams::Metric metric) {
+    std::pmr::monotonic_buffer_resource pool;
+    solux::api::SchemaDef def;
+    solux::api::FieldDef* f = build::allocArray(def.fields, 1, pool);
+    f->name = build::arenaStr(pool, "_v");
+    f->field_class = solux::api::FieldDef_::FieldClass::VECTOR;
+    f->abstract = true;
+    f->column_stored = true;
+    f->vector.emplace().metric = metric;
     auto base = col.getSchema();
     col.setSchema(Schema::fromProto(def, base.get()));
   }
 
-  static void setTextSource(proto::TopDocs& src, std::string_view field,
-                            std::string_view term, int64_t limit) {
-    src.set_limit(limit);
-    auto& m = *src.mutable_query()->mutable_match();
-    m.set_field(field);
-    m.mutable_val()->set_s(term);
+  // --- arena builders for the Fusion op the OpCursor fluent API doesn't cover ---
+
+  // Copy a by-value Query into the build arena and return a stable pointer for an
+  // optional_indirect_view<Query> member to point at.
+  static solux::api::Query* arenaQuery(std::pmr::memory_resource& mr, const solux::api::Query& q) {
+    auto* p = (solux::api::Query*)mr.allocate(sizeof(solux::api::Query), alignof(solux::api::Query));
+    return new (p) solux::api::Query(q);
   }
 
-  static void setKnnQuery(proto::Query& query, std::string_view field,
-                          const std::vector<float>& queryVec, int32_t k) {
-    auto& knn = *query.mutable_knn();
-    knn.set_field(field);
-    knn.set_k(k);
-    auto& f32 = *knn.mutable_query()->mutable_f32();
-    for (float v : queryVec) f32.add_v(v);
+  // Grow Fusion.sources (map_view<string_view, TopDocs>, TopDocs by value) by one entry and
+  // return the fresh slot to fill. Realloc-grow (mirrors LocalReq::appendOp): the prior
+  // entries are trivially copyable with their nested data in the arena. The returned
+  // reference stays valid until the next addSource() call reallocates the backing array.
+  static solux::api::TopDocs& addSource(solux::api::Fusion& fusion, std::string_view name,
+                                        std::pmr::memory_resource& mr) {
+    using Map = solux::api::map_view<std::string_view, solux::api::TopDocs>;
+    using Pair = std::pair<std::string_view, solux::api::TopDocs>;
+    auto old = fusion.sources;
+    Pair* a = (Pair*)mr.allocate(sizeof(Pair) * (old.size() + 1), alignof(Pair));
+    std::uninitialized_value_construct_n(a, old.size() + 1);
+    for (std::size_t i = 0; i < old.size(); i++) a[i] = old[i];
+    a[old.size()].first = build::arenaStr(mr, name);
+    fusion.sources = Map(std::span<const Pair>(a, old.size() + 1));
+    return a[old.size()].second;
   }
 
-  static void setKnnSource(proto::TopDocs& src, std::string_view field,
-                           std::vector<float> query, int32_t k) {
-    src.set_limit(k);
-    setKnnQuery(*src.mutable_query(), field, query, k);
+  // Append one field name to a Fusion.fields span (realloc-grow preserves prior entries).
+  static void addField(solux::api::Fusion& fusion, std::string_view field,
+                       std::pmr::memory_resource& mr) {
+    auto old = fusion.fields;
+    std::string_view* a = build::allocArray(fusion.fields, old.size() + 1, mr);
+    for (std::size_t i = 0; i < old.size(); i++) a[i] = old[i];
+    a[old.size()] = build::arenaStr(mr, field);
+  }
+
+  // Append a named filter (a NamedQuery) to a span<const NamedQuery> (Fusion.filter or
+  // TopDocs.filter), pointing the entry at an arena copy of the pre-built query.
+  static void addNamedFilter(std::span<const solux::api::NamedQuery>& filter,
+                             std::string_view name, const solux::api::Query& q,
+                             std::pmr::memory_resource& mr) {
+    auto old = filter;
+    solux::api::NamedQuery* a = build::allocArray(filter, old.size() + 1, mr);
+    for (std::size_t i = 0; i < old.size(); i++) a[i] = old[i];
+    a[old.size()].name = build::arenaStr(mr, name);
+    a[old.size()].query = arenaQuery(mr, q);
+  }
+
+  // Append a sort spec to a TopDocs source (realloc-grow preserves prior entries).
+  static void addSort(solux::api::TopDocs& src, std::string_view field,
+                      solux::api::SortSpec::SortDir dir, std::pmr::memory_resource& mr) {
+    auto old = src.sorts;
+    solux::api::SortSpec* a = build::allocArray(src.sorts, old.size() + 1, mr);
+    for (std::size_t i = 0; i < old.size(); i++) a[i] = old[i];
+    a[old.size()].field = build::arenaStr(mr, field);
+    a[old.size()].dir = dir;
+  }
+
+  static void setTextSource(solux::api::TopDocs& src, std::pmr::memory_resource& mr,
+                            std::string_view field, std::string_view term, int64_t limit) {
+    src.limit = limit;
+    src.query = arenaQuery(mr, qb::match(mr, field, term));
+  }
+
+  static void setKnnSource(solux::api::TopDocs& src, std::pmr::memory_resource& mr,
+                           std::string_view field, std::vector<float> query, int32_t k) {
+    src.limit = k;
+    src.query = arenaQuery(mr, qb::knn(mr, field, query, k));
   }
 
   // Set a source's query to a BooleanQuery of several optional kNN clauses, so
   // a single source's Context hosts multiple kNN weights (prepared serially),
   // while many such sources prepare concurrently against the shared request pool.
-  static void setBoolKnnSource(proto::TopDocs& src, std::string_view field,
+  static void setBoolKnnSource(solux::api::TopDocs& src, std::pmr::memory_resource& mr,
+                               std::string_view field,
                                const std::vector<std::vector<float>>& queryVecs,
                                int32_t k, int64_t limit) {
-    src.set_limit(limit);
-    auto& boolean = *src.mutable_query()->mutable_boolean();
-    for (const auto& qv : queryVecs) {
-      setKnnQuery(*boolean.add_optional(), field, qv, k);
-    }
+    src.limit = limit;
+    std::vector<solux::api::Query> optional;
+    for (const auto& qv : queryVecs) optional.push_back(qb::knn(mr, field, qv, k));
+    src.query = arenaQuery(mr, qb::boolean(mr, std::span<const solux::api::Query>{},
+                                           std::span<const solux::api::Query>(optional)));
   }
 
   // Pull "id" out of a Fusion response in fused-rank order.
   static std::vector<std::string> resultIds(LocalReq& req, std::string_view opName = "f") {
     std::vector<std::string> ids;
-    if (req.responses.empty()) return ids;
-    auto it = req.responses[0]->proto.ops().find(std::string(opName));
-    if (it == req.responses[0]->proto.ops().end() || !it->second.has_docs()) return ids;
-    const auto& cols = it->second.docs().columns();
-    auto idIt = cols.find("id");
-    if (idIt == cols.end()) return ids;
-    for (const auto& s : idIt->second.col_s().v()) ids.emplace_back(s);
+    const auto* dl = req.docList(opName);
+    if (dl == nullptr) return ids;
+    const auto* colp = dl->columns.find("id");
+    if (colp == nullptr) return ids;
+    const auto* col = std::get_if<solux::api::ColStr>(&colp->kind);
+    if (col == nullptr) return ids;
+    for (const auto& s : col->v) ids.emplace_back(s);
     return ids;
   }
 
   static std::vector<float> resultScores(LocalReq& req, std::string_view opName = "f") {
     std::vector<float> scores;
-    if (req.responses.empty()) return scores;
-    auto it = req.responses[0]->proto.ops().find(std::string(opName));
-    if (it == req.responses[0]->proto.ops().end() || !it->second.has_docs()) return scores;
-    const auto& cols = it->second.docs().columns();
-    auto sIt = cols.find("_score_");
-    if (sIt == cols.end()) return scores;
-    for (float v : sIt->second.col_f().v()) scores.push_back(v);
+    const auto* dl = req.docList(opName);
+    if (dl == nullptr) return scores;
+    const auto* colp = dl->columns.find("_score_");
+    if (colp == nullptr) return scores;
+    const auto* col = std::get_if<solux::api::ColFloat>(&colp->kind);
+    if (col == nullptr) return scores;
+    for (float v : col->v) scores.push_back(v);
     return scores;
   }
 };
@@ -107,7 +159,7 @@ protected:
 TEST_F(FusionOpTest, rrfTextAndKnn) {
   CollectionHelper h("main");
   h.clear();
-  installVecSchema(h.collection(), proto::VectorParams::L2);
+  installVecSchema(h.collection(), solux::api::VectorParams::Metric::L2);
 
   h.index(flatdoc("id", std::string("a"), "foo_w", "apple",  "embedding_v", std::vector<float>{1.0f, 0,    0   }));
   h.index(flatdoc("id", std::string("b"), "foo_w", "orange", "embedding_v", std::vector<float>{0.9f, 0.1f, 0   }));
@@ -116,20 +168,22 @@ TEST_F(FusionOpTest, rrfTextAndKnn) {
   h.commit({"*"});
 
   auto* lreq = LocalReq::create(soluxNode->getSearchEngine());
-  lreq->proto.mutable_collection()->add_name("main");
-  auto& fusion = *(*lreq->proto.mutable_ops())["f"].mutable_fusion();
-  fusion.set_limit(10);
-  fusion.set_get_number(true);
-  fusion.set_get_scores(true);
-  fusion.mutable_fields()->Add("id");
-  fusion.mutable_rrf()->set_k(60);
-  setTextSource((*fusion.mutable_sources())["text"], "foo_w", "apple", 5);
-  setKnnSource((*fusion.mutable_sources())["vec"], "embedding_v", {1, 0, 0}, 3);
+  lreq->collection("main");
+  auto& fusion = lreq->topDocs("f").rawOp().kind.emplace<solux::api::Fusion>();
+  auto& mr = lreq->mr;
+  fusion.limit = 10;
+  fusion.get_number = true;
+  fusion.get_scores = true;
+  addField(fusion, "id", mr);
+  fusion.rrf.emplace().k = 60;
+  setTextSource(addSource(fusion, "text", mr), mr, "foo_w", "apple", 5);
+  setKnnSource(addSource(fusion, "vec", mr), mr, "embedding_v", {1, 0, 0}, 3);
 
   lreq->execute();
+  ASSERT_OK(lreq);
 
   // Union: a (text+knn), b (knn), c (knn).  d is excluded by k=3.
-  auto matches = lreq->responses[0]->proto.ops().at("f").docs().matches();
+  auto matches = lreq->getMatchCount("f");
   EXPECT_EQ(matches, 3);
 
   auto ids = resultIds(*lreq);
@@ -168,23 +222,21 @@ TEST_F(FusionOpTest, sharedFilter) {
   h.commit();
 
   auto* lreq = LocalReq::create(soluxNode->getSearchEngine());
-  lreq->proto.mutable_collection()->add_name("main");
-  auto& fusion = *(*lreq->proto.mutable_ops())["f"].mutable_fusion();
-  fusion.set_limit(10);
-  fusion.set_get_number(true);
-  fusion.set_get_scores(true);
-  fusion.mutable_fields()->Add("id");
-  fusion.mutable_rrf()->set_k(60);
+  lreq->collection("main");
+  auto& fusion = lreq->topDocs("f").rawOp().kind.emplace<solux::api::Fusion>();
+  auto& mr = lreq->mr;
+  fusion.limit = 10;
+  fusion.get_number = true;
+  fusion.get_scores = true;
+  addField(fusion, "id", mr);
+  fusion.rrf.emplace().k = 60;
 
-  setTextSource((*fusion.mutable_sources())["text"], "foo_w", "apple", 10);
+  setTextSource(addSource(fusion, "text", mr), mr, "foo_w", "apple", 10);
 
-  auto& nf = *fusion.add_filter();
-  nf.set_name("colorRed");
-  auto& m = *nf.mutable_query()->mutable_match();
-  m.set_field("color_s");
-  m.mutable_val()->set_s("red");
+  addNamedFilter(fusion.filter, "colorRed", qb::match(mr, "color_s", "red"), mr);
 
   lreq->execute();
+  ASSERT_OK(lreq);
 
   auto ids = resultIds(*lreq);
   auto scores = resultScores(*lreq);
@@ -203,7 +255,7 @@ TEST_F(FusionOpTest, sharedFilter) {
 TEST_F(FusionOpTest, sharedKnnFilter) {
   CollectionHelper h("main");
   h.clear();
-  installVecSchema(h.collection(), proto::VectorParams::L2);
+  installVecSchema(h.collection(), solux::api::VectorParams::Metric::L2);
 
   h.index(flatdoc("id", std::string("a"), "foo_w", "apple",
                   "embedding_v", std::vector<float>{1.0f, 0.0f}));
@@ -214,20 +266,20 @@ TEST_F(FusionOpTest, sharedKnnFilter) {
   h.commit({"*"});
 
   auto* lreq = LocalReq::create(soluxNode->getSearchEngine());
-  lreq->proto.mutable_collection()->add_name("main");
-  auto& fusion = *(*lreq->proto.mutable_ops())["f"].mutable_fusion();
-  fusion.set_limit(10);
-  fusion.set_get_number(true);
-  fusion.mutable_fields()->Add("id");
-  fusion.mutable_rrf()->set_k(60);
+  lreq->collection("main");
+  auto& fusion = lreq->topDocs("f").rawOp().kind.emplace<solux::api::Fusion>();
+  auto& mr = lreq->mr;
+  fusion.limit = 10;
+  fusion.get_number = true;
+  addField(fusion, "id", mr);
+  fusion.rrf.emplace().k = 60;
 
-  setTextSource((*fusion.mutable_sources())["text"], "foo_w", "apple", 10);
+  setTextSource(addSource(fusion, "text", mr), mr, "foo_w", "apple", 10);
 
-  auto& nf = *fusion.add_filter();
-  nf.set_name("near");
-  setKnnQuery(*nf.mutable_query(), "embedding_v", {0.0f, 1.0f}, 1);
+  addNamedFilter(fusion.filter, "near", qb::knn(mr, "embedding_v", {0.0f, 1.0f}, 1), mr);
 
   lreq->execute();
+  ASSERT_OK(lreq);
 
   auto ids = resultIds(*lreq);
   ASSERT_EQ(ids.size(), 1u);
@@ -266,24 +318,24 @@ TEST_F(FusionOpTest, rrfMultiSegment) {
   h.commit();
 
   auto* lreq = LocalReq::create(soluxNode->getSearchEngine());
-  lreq->proto.mutable_collection()->add_name("main");
-  auto& fusion = *(*lreq->proto.mutable_ops())["f"].mutable_fusion();
-  fusion.set_limit(10);
-  fusion.set_get_number(true);
-  fusion.set_get_scores(true);
-  fusion.mutable_fields()->Add("id");
-  fusion.mutable_rrf()->set_k(60);
-  setTextSource((*fusion.mutable_sources())["apple"],  "foo_w", "apple",  10);
-  auto& bananaSrc = (*fusion.mutable_sources())["banana"];
-  setTextSource(bananaSrc, "foo_w", "banana", 10);
-  auto* bananaSort = bananaSrc.add_sorts();
-  bananaSort->set_field("prio_i");
-  bananaSort->set_dir(proto::SortSpec::DESC);
+  lreq->collection("main");
+  auto& fusion = lreq->topDocs("f").rawOp().kind.emplace<solux::api::Fusion>();
+  auto& mr = lreq->mr;
+  fusion.limit = 10;
+  fusion.get_number = true;
+  fusion.get_scores = true;
+  addField(fusion, "id", mr);
+  fusion.rrf.emplace().k = 60;
+  setTextSource(addSource(fusion, "apple", mr), mr, "foo_w", "apple", 10);
+  auto& bananaSrc = addSource(fusion, "banana", mr);
+  setTextSource(bananaSrc, mr, "foo_w", "banana", 10);
+  addSort(bananaSrc, "prio_i", solux::api::SortSpec::SortDir::DESC, mr);
 
   lreq->execute();
+  ASSERT_OK(lreq);
 
   // Union: a, b, c, d, e.
-  auto matches = lreq->responses[0]->proto.ops().at("f").docs().matches();
+  auto matches = lreq->getMatchCount("f");
   EXPECT_EQ(matches, 5);
 
   auto ids = resultIds(*lreq);
@@ -332,34 +384,24 @@ TEST_F(FusionOpTest, sharedAndPerSourceFilter) {
   h.commit();
 
   auto* lreq = LocalReq::create(soluxNode->getSearchEngine());
-  lreq->proto.mutable_collection()->add_name("main");
-  auto& fusion = *(*lreq->proto.mutable_ops())["f"].mutable_fusion();
-  fusion.set_limit(10);
-  fusion.set_get_number(true);
-  fusion.mutable_fields()->Add("id");
-  fusion.mutable_rrf()->set_k(60);
+  lreq->collection("main");
+  auto& fusion = lreq->topDocs("f").rawOp().kind.emplace<solux::api::Fusion>();
+  auto& mr = lreq->mr;
+  fusion.limit = 10;
+  fusion.get_number = true;
+  addField(fusion, "id", mr);
+  fusion.rrf.emplace().k = 60;
 
   // Shared filter: color_s = red.
-  {
-    auto& nf = *fusion.add_filter();
-    nf.set_name("colorRed");
-    auto& m = *nf.mutable_query()->mutable_match();
-    m.set_field("color_s");
-    m.mutable_val()->set_s("red");
-  }
+  addNamedFilter(fusion.filter, "colorRed", qb::match(mr, "color_s", "red"), mr);
 
   // Per-source filter: owner_s = alice (applied to the text source only).
-  auto& textSrc = (*fusion.mutable_sources())["text"];
-  setTextSource(textSrc, "foo_w", "apple", 10);
-  {
-    auto& nf = *textSrc.add_filter();
-    nf.set_name("ownerAlice");
-    auto& m = *nf.mutable_query()->mutable_match();
-    m.set_field("owner_s");
-    m.mutable_val()->set_s("alice");
-  }
+  auto& textSrc = addSource(fusion, "text", mr);
+  setTextSource(textSrc, mr, "foo_w", "apple", 10);
+  addNamedFilter(textSrc.filter, "ownerAlice", qb::match(mr, "owner_s", "alice"), mr);
 
   lreq->execute();
+  ASSERT_OK(lreq);
 
   std::set<std::string> got;
   for (auto& id : resultIds(*lreq)) got.insert(id);
@@ -382,59 +424,62 @@ TEST_F(FusionOpTest, validation) {
 
   auto buildBase = [&]() {
     auto* lreq = LocalReq::create(soluxNode->getSearchEngine());
-    lreq->proto.mutable_collection()->add_name("main");
+    lreq->collection("main");
     return lreq;
   };
 
   // No sources.
   {
     auto* lreq = buildBase();
-    auto& fusion = *(*lreq->proto.mutable_ops())["f"].mutable_fusion();
-    fusion.mutable_rrf()->set_k(60);
+    auto& fusion = lreq->topDocs("f").rawOp().kind.emplace<solux::api::Fusion>();
+    fusion.rrf.emplace().k = 60;
     ExpectLog quiet("Search request failed:");
     lreq->execute();
     ASSERT_FALSE(lreq->responses.empty());
-    EXPECT_NE(lreq->responses[0]->proto.error().find("source"), std::string::npos);
+    EXPECT_NE(lreq->errorMsg().find("source"), std::string::npos);
     lreq->done();
   }
 
   // No method.
   {
     auto* lreq = buildBase();
-    auto& fusion = *(*lreq->proto.mutable_ops())["f"].mutable_fusion();
-    setTextSource((*fusion.mutable_sources())["text"], "foo_w", "apple", 5);
+    auto& fusion = lreq->topDocs("f").rawOp().kind.emplace<solux::api::Fusion>();
+    auto& mr = lreq->mr;
+    setTextSource(addSource(fusion, "text", mr), mr, "foo_w", "apple", 5);
     ExpectLog quiet("Search request failed:");
     lreq->execute();
     ASSERT_FALSE(lreq->responses.empty());
-    EXPECT_NE(lreq->responses[0]->proto.error().find("method"), std::string::npos);
+    EXPECT_NE(lreq->errorMsg().find("method"), std::string::npos);
     lreq->done();
   }
 
   // Negative k.
   {
     auto* lreq = buildBase();
-    auto& fusion = *(*lreq->proto.mutable_ops())["f"].mutable_fusion();
-    fusion.mutable_rrf()->set_k(-1);
-    setTextSource((*fusion.mutable_sources())["text"], "foo_w", "apple", 5);
+    auto& fusion = lreq->topDocs("f").rawOp().kind.emplace<solux::api::Fusion>();
+    auto& mr = lreq->mr;
+    fusion.rrf.emplace().k = -1;
+    setTextSource(addSource(fusion, "text", mr), mr, "foo_w", "apple", 5);
     ExpectLog quiet("Search request failed:");
     lreq->execute();
     ASSERT_FALSE(lreq->responses.empty());
-    EXPECT_NE(lreq->responses[0]->proto.error().find("k"), std::string::npos);
+    EXPECT_NE(lreq->errorMsg().find("k"), std::string::npos);
     lreq->done();
   }
 
   // Sub-ops not supported.
   {
     auto* lreq = buildBase();
-    auto& fusion = *(*lreq->proto.mutable_ops())["f"].mutable_fusion();
-    fusion.mutable_rrf()->set_k(60);
-    setTextSource((*fusion.mutable_sources())["text"], "foo_w", "apple", 5);
-    auto& sub = (*fusion.mutable_ops())["facet"];
-    sub.mutable_field_facet()->set_field("color_s");
+    auto& fusion = lreq->topDocs("f").rawOp().kind.emplace<solux::api::Fusion>();
+    auto& mr = lreq->mr;
+    fusion.rrf.emplace().k = 60;
+    setTextSource(addSource(fusion, "text", mr), mr, "foo_w", "apple", 5);
+    auto* sub = build::mapSlot<solux::api::SearchOp>(fusion.ops, 1, "facet", mr);
+    sub->kind.emplace<solux::api::FieldFacet>().field = build::arenaStr(mr, "color_s");
     ExpectLog quiet("Search request failed:");
     lreq->execute();
     ASSERT_FALSE(lreq->responses.empty());
-    EXPECT_NE(lreq->responses[0]->proto.error().find("sub-ops"), std::string::npos);
+    EXPECT_NE(lreq->errorMsg().find("sub-ops"), std::string::npos);
     lreq->done();
   }
 }
@@ -447,19 +492,20 @@ TEST_F(FusionOpTest, emptyIndex) {
   h.clear();
 
   auto* lreq = LocalReq::create(soluxNode->getSearchEngine());
-  lreq->proto.mutable_collection()->add_name("main");
-  auto& fusion = *(*lreq->proto.mutable_ops())["f"].mutable_fusion();
-  fusion.set_limit(5);
-  fusion.set_get_number(true);
-  fusion.mutable_rrf()->set_k(60);
-  setTextSource((*fusion.mutable_sources())["text"], "foo_w", "apple", 5);
+  lreq->collection("main");
+  auto& fusion = lreq->topDocs("f").rawOp().kind.emplace<solux::api::Fusion>();
+  auto& mr = lreq->mr;
+  fusion.limit = 5;
+  fusion.get_number = true;
+  fusion.rrf.emplace().k = 60;
+  setTextSource(addSource(fusion, "text", mr), mr, "foo_w", "apple", 5);
 
   lreq->execute();
+  ASSERT_OK(lreq);
 
-  ASSERT_FALSE(lreq->responses.empty());
-  auto& opVal = lreq->responses[0]->proto.ops().at("f");
-  ASSERT_TRUE(opVal.has_docs());
-  EXPECT_EQ(opVal.docs().matches(), 0);
+  const auto* dl = lreq->docList("f");
+  ASSERT_TRUE(dl != nullptr);
+  EXPECT_EQ(dl->matches.value_or(0), 0);
 
   lreq->done();
 }
@@ -475,7 +521,7 @@ TEST_F(FusionOpTest, emptyIndex) {
 TEST_F(FusionOpTest, concurrentKnnPrepareSharesRequestPool) {
   CollectionHelper h("main");
   h.clear();
-  installVecSchema(h.collection(), proto::VectorParams::L2);
+  installVecSchema(h.collection(), solux::api::VectorParams::Metric::L2);
 
   // ~40 docs across 5 segments; ~1/3 lack the vector field so the sparse
   // single-valued valueRank->docId selector path runs.  Distinct vectors keep
@@ -501,18 +547,19 @@ TEST_F(FusionOpTest, concurrentKnnPrepareSharesRequestPool) {
 
   auto buildReq = [&]() {
     auto* lreq = LocalReq::create(soluxNode->getSearchEngine());
-    lreq->proto.mutable_collection()->add_name("main");
-    auto& fusion = *(*lreq->proto.mutable_ops())["f"].mutable_fusion();
-    fusion.set_limit(-1);
-    fusion.set_get_number(true);
-    fusion.mutable_fields()->Add("id");
-    fusion.mutable_rrf()->set_k(60);
+    lreq->collection("main");
+    auto& fusion = lreq->topDocs("f").rawOp().kind.emplace<solux::api::Fusion>();
+    auto& mr = lreq->mr;
+    fusion.limit = -1;
+    fusion.get_number = true;
+    addField(fusion, "id", mr);
+    fusion.rrf.emplace().k = 60;
     // 10 sources, each a boolean of 2 optional kNN clauses => 20 kNN weights,
     // 10 source prepares running concurrently on the shared request pool.
     for (int s = 0; s < 10; s++) {
       float a = (float)s / 10.0f;
-      setBoolKnnSource((*fusion.mutable_sources())["vec" + std::to_string(s)],
-                       "embedding_v", {{a, 1.0f - a}, {1.0f - a, a}}, 5, -1);
+      setBoolKnnSource(addSource(fusion, "vec" + std::to_string(s), mr),
+                       mr, "embedding_v", {{a, 1.0f - a}, {1.0f - a, a}}, 5, -1);
     }
     return lreq;
   };
@@ -526,6 +573,7 @@ TEST_F(FusionOpTest, concurrentKnnPrepareSharesRequestPool) {
   {
     auto* lreq = buildReq();
     lreq->execute();
+    ASSERT_OK(lreq);
     baseline = resultIdSet(*lreq);
     lreq->done();
   }
@@ -534,6 +582,7 @@ TEST_F(FusionOpTest, concurrentKnnPrepareSharesRequestPool) {
   for (int iter = 0; iter < 50; iter++) {
     auto* lreq = buildReq();
     lreq->execute();
+    ASSERT_OK(lreq);
     auto ids = resultIdSet(*lreq);
     ASSERT_EQ(ids, baseline) << "divergent/garbage fused result set at iteration " << iter;
     lreq->done();

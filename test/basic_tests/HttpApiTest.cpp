@@ -74,8 +74,9 @@ TEST_F(HttpApiTest, matchQueryParityAndNull) {
 
   // Authoritative result from the in-process engine.
   auto* lreq = LocalReq::create(helper.getSearchEngine());
-  lreq->collection("main").matchQuery("title_w", "dune")
-      .fields({"id", "title_s", "year_i"}).withStats().execute();
+  lreq->collection("main").topDocs("q").matchQuery("title_w", "dune")
+      .fields({"id", "title_s", "year_i"}).withStats();
+  lreq->execute();
   auto localIds = idsOf(lreq->getDocs());
   lreq->done();
 

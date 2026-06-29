@@ -10,9 +10,15 @@
 
 // so IndexHandler can consume protobuf types
 #include "SortedDeletes.h"
-#include "protos/solux_types.pb.h"
+#include "solux/api/solux_types.hpp"
 
 namespace solux {
+
+// The indexing path reads field values straight out of the inbound UpdateRequest
+// bytes, which are kept alive for the duration of (synchronous) indexing, so the
+// indexing Val is a non-owning view (string_t = std::string_view, arrays = spans).
+// Handlers take a `const IndexVal&` and dispatch on its `kind` std::variant.
+using IndexVal = solux::api::Val;
 
 using std::iter_swap; // for boost string_sort
 
@@ -137,12 +143,9 @@ public:
     virtual void index(Inverter& inverter, std::string_view val) {
       unused(inverter, val);
     }
-    // yuck.  this is to handle an array of strings in protobuf (without creating a new list)
-    virtual void index(Inverter& inverter, std::span<std::string_view> vals) {
-      unused(inverter,vals);
-    }
-    // yuck.  this is to handle an array of strings in protobuf (without creating a new list)
-    virtual void index(Inverter& inverter, std::span<const std::string* const> vals) {
+    // handles an array of strings without creating a new list. non_owning hpp arrays
+    // are span<const string_view>, so this takes a const span.
+    virtual void index(Inverter& inverter, std::span<const std::string_view> vals) {
       unused(inverter,vals);
     }
     virtual void index(Inverter& inverter, int64_t val) {
@@ -152,13 +155,12 @@ public:
       unused(inverter, vals);
     }
 
-    virtual void index(Inverter& inverter, const proto::Val& val) {
-      if (val.has_s()) {
-        index(inverter, val.s());
-      } else if (val.has_arr_s()) {
-        auto& arr = val.arr_s().v();
-        std::span<const std::string* const> values(arr.data(), arr.size());
-        index(inverter, values);
+    virtual void index(Inverter& inverter, const IndexVal& val) {
+      if (std::holds_alternative<std::string_view>(val.kind)) {
+        index(inverter, std::get<std::string_view>(val.kind));
+      } else if (std::holds_alternative<solux::api::ArrStr>(val.kind)) {
+        const auto& arr = std::get<solux::api::ArrStr>(val.kind).v;
+        index(inverter, std::span<const std::string_view>(arr.data(), arr.size()));
       }
     }
 

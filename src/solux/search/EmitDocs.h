@@ -3,17 +3,23 @@
 // Field loading + streaming response emission for an already-ranked list of
 // (segdoc, score) pairs.  Used by TopDocsReq (after collector sort) and by
 // FusionOp (after RRF merge); both share the same segment-grouped column
-// loader, batched protobuf assembly, and streaming reply path.
+// loader, batched assembly, and streaming reply path.
 //
-// The per-field load helpers (loadNumCol/loadStrCol/loadVectorCol/
-// loadStoredFields) are pure functions of (req, field, segDocs, sortedIdx,
-// segRunLength, columnsProto, tg) - they were lifted out of TopDocsReq
-// unchanged.
+// Response columns are built NON-OWNING via build-by-backing: every column's
+// storage is allocated from the response's arena (SearchResponse::mr, a
+// thread-safe pmr view over the request arena), and the concrete column's span
+// members point at it.  Single-valued columns are pre-sized in the dispatching
+// thread (allocArray(columnSize)) and the parallel per-segment tasks fill
+// distinct slots by index.  Multi-valued sub-arrays and copied string values
+// are allocated inside the tasks (concurrently) - safe because the arena is
+// thread-safe.  String values are copied into the arena (arenaStr) since their
+// source views (TermsEnum / column / stored-field readers) are transient.
 
 #include <algorithm>
 #include <cstring>
 #include <deque>
 #include <functional>
+#include <memory_resource>
 #include <numeric>
 #include <ranges>
 #include <span>
@@ -21,7 +27,6 @@
 
 #include <boost/unordered/unordered_flat_map.hpp>
 
-#include "protos/solux_types.pb.h"
 #include "solux/reader/FieldReader.h"
 #include "solux/reader/IntColReader.h"
 #include "solux/reader/StoredFieldsReader.h"
@@ -122,40 +127,38 @@ struct StoredReq {
   FieldType* fieldType;
   // Exactly one of starget / mtarget is populated (selected by multi flag).
   bool multi;
-  std::span<std::string*> starget;
-  std::span<solux::proto::ArrStr*> mtarget;
+  // Mutable views over the arena-allocated column slots (single: one
+  // string_view per doc; multi: one ArrStr per doc).  Filled by the loaders.
+  std::span<std::string_view> starget;
+  std::span<solux::api::ArrStr> mtarget;
   uint8_t* present = nullptr;  // presence slots when single-valued (see PendingCol)
 };
 
-// Allocate the output Column (col_s or multi_s) for a TEXT/STRING field
-// and return spans into its internal storage.  Used by both column
-// retrieval (loadStrCol) and stored retrieval - the output proto shape is
-// identical in both cases.  Leaves spans empty when columnSize is 0.
-// Returns the presence slots for a single-valued column (null for multi,
-// which signals missing structurally).
-inline uint8_t* allocStringColumn(solux::proto::Column& fieldCol, size_t columnSize, bool multi,
-                                  std::span<std::string*>& starget,
-                                  std::span<solux::proto::ArrStr*>& mtarget,
-                                  PendingCols& pendingCols)
+// Allocate the output Column (col_s or multi_s) for a TEXT/STRING field and
+// return mutable spans into its arena storage.  Used by both column retrieval
+// (loadStrCol) and stored retrieval - the output shape is identical.  Leaves
+// spans empty when columnSize is 0.  Returns the presence slots for a
+// single-valued column (null for multi, which signals missing structurally).
+inline uint8_t* allocStringColumn(solux::api::Column& fieldCol, size_t columnSize, bool multi,
+                                  std::span<std::string_view>& starget,
+                                  std::span<solux::api::ArrStr>& mtarget,
+                                  PendingCols& pendingCols, std::pmr::memory_resource& mr)
 {
   if (columnSize == 0) return nullptr;
   if (!multi) {
-    auto& strCol = *fieldCol.mutable_col_s();
-    auto& stringsProto = *strCol.mutable_v();
-    stringsProto.Reserve(columnSize);
-    for (auto i = 0u; i < columnSize; i++) stringsProto.Add("");
-    starget = {stringsProto.mutable_data(), (size_t)columnSize};
+    auto& strCol = fieldCol.kind.emplace<solux::api::ColStr>();
+    starget = std::span<std::string_view>(build::allocArray(strCol.v, columnSize, mr), columnSize);
 
     auto& pending = pendingCols.emplace_back();
     pending.present.assign(columnSize, 0);
-    pending.finish = [&strCol](std::span<const uint8_t> present) {
-      auto& v = *strCol.mutable_v();
+    pending.finish = [&strCol, &mr](std::span<const uint8_t> present) {
+      auto v = std::span<std::string_view>(const_cast<std::string_view*>(strCol.v.data()), strCol.v.size());
       // "" is the default filler; only when a real empty string occurs must
       // a different filler be used: one byte past the largest present value
       // is greater than every present value, so it cannot collide.
       bool emptyPresent = false;
       for (size_t i = 0; i < present.size(); i++) {
-        if (present[i] && v[(int)i].empty()) {
+        if (present[i] && v[i].empty()) {
           emptyPresent = true;
           break;
         }
@@ -163,21 +166,18 @@ inline uint8_t* allocStringColumn(solux::proto::Column& fieldCol, size_t columnS
       if (!emptyPresent) return;
       std::string_view maxStr;
       for (size_t i = 0; i < present.size(); i++) {
-        if (present[i] && std::string_view(v[(int)i]) > maxStr) maxStr = v[(int)i];
+        if (present[i] && v[i] > maxStr) maxStr = v[i];
       }
       std::string filler = std::string(maxStr) + '\0';
-      strCol.set_missing_val(filler);
+      strCol.missing_val = build::arenaStr(mr, filler);  // copy filler into the arena
       for (size_t i = 0; i < present.size(); i++) {
-        if (!present[i]) *v.Mutable((int)i) = filler;
+        if (!present[i]) v[i] = strCol.missing_val;
       }
     };
     return pending.present.data();
   } else {
-    auto& strCol = *fieldCol.mutable_multi_s();
-    auto& arrArrProto = *strCol.mutable_v();
-    arrArrProto.Reserve(columnSize);
-    for (auto i = 0u; i < columnSize; i++) arrArrProto.Add();
-    mtarget = {arrArrProto.mutable_data(), columnSize};
+    auto& strCol = fieldCol.kind.emplace<solux::api::ArrArrStr>();
+    mtarget = std::span<solux::api::ArrStr>(build::allocArray(strCol.v, columnSize, mr), columnSize);
     return nullptr;
   }
 }
@@ -188,8 +188,8 @@ inline uint8_t* allocStringColumn(solux::proto::Column& fieldCol, size_t columnS
 // path can fall back here when a segment predates the STORED flag.
 inline void loadStrColForSegment(SearchRequest& req, std::string_view field, FieldType& fieldType,
                                  std::span<uint8_t> idxSpan, std::span<const segdoc> segDocs,
-                                 std::span<std::string*> starget, std::span<solux::proto::ArrStr*> mtarget,
-                                 uint8_t* present)
+                                 std::span<std::string_view> starget, std::span<solux::api::ArrStr> mtarget,
+                                 uint8_t* present, std::pmr::memory_resource& mr)
 {
   auto sortedSegDocs = idxSpan | std::views::transform([&segDocs](auto idx) { return segDocs[idx]; });
   auto segNum = sortedSegDocs[0].segment();
@@ -213,14 +213,14 @@ inline void loadStrColForSegment(SearchRequest& req, std::string_view field, Fie
       auto valHandler = [&](size_t idx, int32_t doc, int64_t val) {
         assert(segDocs[idxSpan[idx]].docId() == doc && val > 0);
         tenum.seekOrd((int32_t) val - 1);
-        *starget[idxSpan[idx]] = (std::string_view) tenum.term();
+        starget[idxSpan[idx]] = build::arenaStr(mr, (std::string_view) tenum.term());
         if (present) present[idxSpan[idx]] = 1;
       };
       IntColReader::getSingleValues(poolGuard.pool(), postingsReader, segFieldInfo, sortedDocs, valHandler);
     } else {
       auto valHandler = [&](size_t idx, int32_t doc, std::string_view val) {
         assert(segDocs[idxSpan[idx]].docId() == doc);
-        *starget[idxSpan[idx]] = std::string(val);
+        starget[idxSpan[idx]] = build::arenaStr(mr, val);
         if (present) present[idxSpan[idx]] = 1;
       };
       StrColReader::getValues(poolGuard.pool(), postingsReader, segFieldInfo, sortedDocs, valHandler);
@@ -230,21 +230,18 @@ inline void loadStrColForSegment(SearchRequest& req, std::string_view field, Fie
       TermsEnum tenum(poolGuard.pool(), postingsReader, segFieldInfo);
       auto valHandler = [&](size_t idx, int32_t doc, int64_t val, int64_t valIdx, int64_t numVals) {
         assert(segDocs[idxSpan[idx]].docId() == doc && val > 0);
-        solux::proto::ArrStr& target = *mtarget[idxSpan[idx]];
-        if (valIdx == 0) target.mutable_v()->Reserve(numVals);
+        solux::api::ArrStr& target = mtarget[idxSpan[idx]];
+        if (valIdx == 0) build::allocArray(target.v, numVals, mr);
         tenum.seekOrd((int32_t) val - 1);
-        auto v = (std::string_view) tenum.term();
-        auto* strProto = target.mutable_v()->Add();
-        *strProto = v;
+        const_cast<std::string_view*>(target.v.data())[valIdx] = build::arenaStr(mr, (std::string_view) tenum.term());
       };
       IntColReader::getValues(poolGuard.pool(), postingsReader, segFieldInfo, sortedDocs, valHandler);
     } else {
       auto valHandler = [&](size_t idx, int32_t doc, std::string_view val, int64_t valIdx, int64_t numVals) {
         assert(segDocs[idxSpan[idx]].docId() == doc);
-        solux::proto::ArrStr& target = *mtarget[idxSpan[idx]];
-        if (valIdx == 0) target.mutable_v()->Reserve(numVals);
-        auto* strProto = target.mutable_v()->Add();
-        *strProto = std::string(val);
+        solux::api::ArrStr& target = mtarget[idxSpan[idx]];
+        if (valIdx == 0) build::allocArray(target.v, numVals, mr);
+        const_cast<std::string_view*>(target.v.data())[valIdx] = build::arenaStr(mr, val);
       };
       StrColReader::getMultiValues(poolGuard.pool(), postingsReader, segFieldInfo, sortedDocs, valHandler);
     }
@@ -254,16 +251,17 @@ inline void loadStrColForSegment(SearchRequest& req, std::string_view field, Fie
 // loadStrCol when the output spans are already allocated (by the caller's
 // earlier allocStringColumn).  Dispatches one per-segment task per run.
 inline void loadStrColWithTargets(SearchRequest& req, std::string_view field, FieldType& fieldType,
-                                  std::span<std::string*> starget, std::span<solux::proto::ArrStr*> mtarget,
+                                  std::span<std::string_view> starget, std::span<solux::api::ArrStr> mtarget,
                                   uint8_t* present,
                                   std::span<const segdoc> segDocs, std::span<uint8_t> sortedIdx,
-                                  const std::span<uint8_t> segRunLength, oneapi::tbb::task_group* tg)
+                                  const std::span<uint8_t> segRunLength, oneapi::tbb::task_group* tg,
+                                  std::pmr::memory_resource& mr)
 {
   int32_t start = 0;
   for (auto runlen : segRunLength) {
     auto idxSpan = sortedIdx.subspan(start, runlen);
-    task_group_run(tg, [idxSpan, &req, field, &fieldType, segDocs, starget, mtarget, present]() {
-      loadStrColForSegment(req, field, fieldType, idxSpan, segDocs, starget, mtarget, present);
+    task_group_run(tg, [idxSpan, &req, field, &fieldType, segDocs, starget, mtarget, present, &mr]() {
+      loadStrColForSegment(req, field, fieldType, idxSpan, segDocs, starget, mtarget, present, mr);
     });
     start += runlen;
   }
@@ -272,16 +270,17 @@ inline void loadStrColWithTargets(SearchRequest& req, std::string_view field, Fi
 inline void loadStrCol(SearchRequest& req, std::string_view field, FieldType& fieldType,
                        std::span<const segdoc> segDocs, std::span<uint8_t> sortedIdx,
                        const std::span<uint8_t> segRunLength,
-                       SearchResponse::ColumnsType& columnsProto, oneapi::tbb::task_group* tg,
-                       PendingCols& pendingCols)
+                       SearchResponse::ColumnsType& columnsProto, size_t colCap,
+                       oneapi::tbb::task_group* tg, PendingCols& pendingCols, std::pmr::memory_resource& mr)
 {
   auto columnSize = segDocs.size();
   if (columnSize == 0) return;
-  std::span<std::string*> starget;
-  std::span<solux::proto::ArrStr*> mtarget;
-  uint8_t* present = allocStringColumn(columnsProto[field], columnSize, fieldType.multiValued(),
-                                       starget, mtarget, pendingCols);
-  loadStrColWithTargets(req, field, fieldType, starget, mtarget, present, segDocs, sortedIdx, segRunLength, tg);
+  std::span<std::string_view> starget;
+  std::span<solux::api::ArrStr> mtarget;
+  auto& fieldCol = build::columnSlot(columnsProto, colCap, field, mr);
+  uint8_t* present = allocStringColumn(fieldCol, columnSize, fieldType.multiValued(),
+                                       starget, mtarget, pendingCols, mr);
+  loadStrColWithTargets(req, field, fieldType, starget, mtarget, present, segDocs, sortedIdx, segRunLength, tg, mr);
 }
 
 // Per-type policies for emitting numeric columns.  INT columns hold the
@@ -292,10 +291,10 @@ inline void loadStrCol(SearchRequest& req, std::string_view field, FieldType& fi
 // for ints, sortable bits for floats/doubles).
 struct IntColEmit {
   using value_type = int64_t;
-  using arr_type = solux::proto::ArrInt;
+  using arr_type = solux::api::ArrInt;
   static constexpr bool foldZeros = false;
-  static auto& singleCol(solux::proto::Column& col) { return *col.mutable_col_i(); }
-  static auto& multiCol(solux::proto::Column& col) { return *col.mutable_multi_i(); }
+  static auto& singleCol(solux::api::Column& col) { return col.kind.emplace<solux::api::ColInt>(); }
+  static auto& multiCol(solux::api::Column& col) { return col.kind.emplace<solux::api::ArrArrInt>(); }
   static int64_t decode(int64_t raw) { return raw; }
   static int64_t encodeVal(int64_t v) { return v; }
   static int64_t decodeEnc(int64_t e) { return e; }
@@ -305,10 +304,10 @@ struct IntColEmit {
 
 struct FloatColEmit {
   using value_type = float;
-  using arr_type = solux::proto::ArrFloat;
+  using arr_type = solux::api::ArrFloat;
   static constexpr bool foldZeros = true;
-  static auto& singleCol(solux::proto::Column& col) { return *col.mutable_col_f(); }
-  static auto& multiCol(solux::proto::Column& col) { return *col.mutable_multi_f(); }
+  static auto& singleCol(solux::api::Column& col) { return col.kind.emplace<solux::api::ColFloat>(); }
+  static auto& multiCol(solux::api::Column& col) { return col.kind.emplace<solux::api::ArrArrFloat>(); }
   static float decode(int64_t raw) { return sortableInt32ToFloat((int32_t)raw); }
   static int64_t encodeVal(float v) { return (int64_t)floatToSortableInt32(v); }
   static float decodeEnc(int64_t e) { return sortableInt32ToFloat((int32_t)e); }
@@ -318,10 +317,10 @@ struct FloatColEmit {
 
 struct DoubleColEmit {
   using value_type = double;
-  using arr_type = solux::proto::ArrDouble;
+  using arr_type = solux::api::ArrDouble;
   static constexpr bool foldZeros = true;
-  static auto& singleCol(solux::proto::Column& col) { return *col.mutable_col_d(); }
-  static auto& multiCol(solux::proto::Column& col) { return *col.mutable_multi_d(); }
+  static auto& singleCol(solux::api::Column& col) { return col.kind.emplace<solux::api::ColDouble>(); }
+  static auto& multiCol(solux::api::Column& col) { return col.kind.emplace<solux::api::ArrArrDouble>(); }
   static double decode(int64_t raw) { return sortableInt64ToDouble(raw); }
   static int64_t encodeVal(double v) { return doubleToSortableInt64(v); }
   static double decodeEnc(int64_t e) { return sortableInt64ToDouble(e); }
@@ -335,12 +334,12 @@ template <typename Emit>
 inline void loadNumCol(SearchRequest& req, std::string_view field, FieldType& fieldType,
                        std::span<const segdoc> segDocs, std::span<uint8_t> sortedIdx,
                        const std::span<uint8_t> segRunLength,
-                       SearchResponse::ColumnsType& columnsProto, oneapi::tbb::task_group* tg,
-                       PendingCols& pendingCols)
+                       SearchResponse::ColumnsType& columnsProto, size_t colCap,
+                       oneapi::tbb::task_group* tg, PendingCols& pendingCols, std::pmr::memory_resource& mr)
 {
-  auto& fieldCol = columnsProto[field];  // output Column in the protobuf
+  auto& fieldCol = build::columnSlot(columnsProto, colCap, field, mr);  // output Column slot
   std::span<typename Emit::value_type> starget; // single valued target
-  std::span<typename Emit::arr_type*> mtarget;  // multi-valued target
+  std::span<typename Emit::arr_type> mtarget;   // multi-valued target
   uint8_t* present = nullptr;
   auto columnSize = segDocs.size();
 
@@ -350,38 +349,28 @@ inline void loadNumCol(SearchRequest& req, std::string_view field, FieldType& fi
 
   if (!fieldType.multiValued()) {
     auto& numCol = Emit::singleCol(fieldCol);
-    auto& valsProto = *numCol.mutable_v();
-    valsProto.Resize(columnSize, (typename Emit::value_type)0);
-    starget = {valsProto.mutable_data(), (size_t)columnSize};
-    assert(&valsProto[columnSize - 1] >= starget.data() && &valsProto[columnSize - 1] < starget.data() + columnSize);
+    starget = std::span<typename Emit::value_type>(build::allocArray(numCol.v, columnSize, mr), columnSize);
 
     auto& pending = pendingCols.emplace_back();
     pending.present.assign(columnSize, 0);
     present = pending.present.data();
     pending.finish = [&numCol](std::span<const uint8_t> present) {
-      auto* data = numCol.mutable_v()->mutable_data();
+      auto* data = const_cast<typename Emit::value_type*>(numCol.v.data());
       size_t n = present.size();
       auto filler = pickMissingVal<Emit>({data, n}, present);
-      numCol.set_missing_val(filler);
+      numCol.missing_val = filler;
       for (size_t i = 0; i < n; i++) {
         if (!present[i]) data[i] = filler;
       }
     };
   } else {
     auto& numCol = Emit::multiCol(fieldCol);
-    auto& arrArrProto = *numCol.mutable_v();
-    arrArrProto.Reserve(columnSize);
-    for (auto i = 0u; i < columnSize; i++) {
-      arrArrProto.Add();
-    }
-    typename Emit::arr_type** arrstart = arrArrProto.mutable_data();
-    assert(&arrArrProto.Get(columnSize - 1) == arrstart[columnSize - 1]);
-    mtarget = {arrstart, columnSize};
+    mtarget = std::span<typename Emit::arr_type>(build::allocArray(numCol.v, columnSize, mr), columnSize);
   }
   int32_t start = 0;
   for (auto runlen : segRunLength) {
     auto idxSpan = sortedIdx.subspan(start, runlen);
-    task_group_run(tg, [idxSpan, &req, field, &fieldType, segDocs, starget, mtarget, present]() {
+    task_group_run(tg, [idxSpan, &req, field, &fieldType, segDocs, starget, mtarget, present, &mr]() {
       auto sortedSegDocs = idxSpan | std::views::transform([&segDocs](auto idx) { return segDocs[idx]; });
       auto segNum = sortedSegDocs[0].segment();
       auto sortedDocs = sortedSegDocs | std::views::transform([](const auto& sd) { return sd.docId(); });
@@ -406,11 +395,11 @@ inline void loadNumCol(SearchRequest& req, std::string_view field, FieldType& fi
       } else {
         auto valHandler = [&](size_t idx, int32_t doc, int64_t val, int64_t valIdx, int64_t numVals) {
           assert(segDocs[idxSpan[idx]].docId() == doc);
-          typename Emit::arr_type& target = *mtarget[idxSpan[idx]];
+          typename Emit::arr_type& target = mtarget[idxSpan[idx]];
           if (valIdx == 0) {
-            target.mutable_v()->Reserve(numVals);
+            build::allocArray(target.v, numVals, mr);
           }
-          target.mutable_v()->Add(Emit::decode(val));
+          const_cast<typename Emit::value_type*>(target.v.data())[valIdx] = Emit::decode(val);
         };
         IntColReader::getValues(poolGuard.pool(), postingsReader, segFieldInfo, sortedDocs, valHandler);
       }
@@ -420,21 +409,21 @@ inline void loadNumCol(SearchRequest& req, std::string_view field, FieldType& fi
   }
 }
 
-// Copy raw column bytes into a Vector.f32's repeated float buffer.  memcpy
+// Copy raw column bytes into a Vector.f32's arena float buffer.  memcpy
 // sidesteps alignment of the source bytes (column storage is byte-packed
 // and not guaranteed 4-byte aligned).
-inline void fillVectorF32(solux::proto::Vector& vec, std::string_view bytes) {
+inline void fillVectorF32(solux::api::Vector& vec, std::string_view bytes, std::pmr::memory_resource& mr) {
   assert(bytes.size() % sizeof(float) == 0);
   int32_t nFloats = (int32_t)(bytes.size() / sizeof(float));
-  auto& fs = *vec.mutable_f32()->mutable_v();
-  fs.Resize(nFloats, 0.0f);
-  std::memcpy(fs.mutable_data(), bytes.data(), bytes.size());
+  vec.f32.emplace();
+  float* fs = build::allocArray(vec.f32->v, nFloats, mr);
+  std::memcpy(fs, bytes.data(), bytes.size());
 }
 
 inline void loadVectorColForSegmentSingle(SearchRequest& req, std::string_view field,
                                           std::span<uint8_t> idxSpan,
                                           std::span<const segdoc> segDocs,
-                                          std::span<solux::proto::Vector*> target)
+                                          std::span<solux::api::Vector> target, std::pmr::memory_resource& mr)
 {
   auto sortedSegDocs = idxSpan | std::views::transform([&segDocs](auto idx) { return segDocs[idx]; });
   auto segNum = sortedSegDocs[0].segment();
@@ -450,7 +439,7 @@ inline void loadVectorColForSegmentSingle(SearchRequest& req, std::string_view f
   auto valHandler = [&](size_t idx, int32_t doc, std::string_view bytes) {
     assert(segDocs[idxSpan[idx]].docId() == doc);
     unused(doc);
-    fillVectorF32(*target[idxSpan[idx]], bytes);
+    fillVectorF32(target[idxSpan[idx]], bytes, mr);
   };
   StrColReader::getValues(poolGuard.pool(), postingsReader, segFieldInfo, sortedDocs, valHandler);
 }
@@ -458,7 +447,7 @@ inline void loadVectorColForSegmentSingle(SearchRequest& req, std::string_view f
 inline void loadVectorColForSegmentMulti(SearchRequest& req, std::string_view field,
                                          std::span<uint8_t> idxSpan,
                                          std::span<const segdoc> segDocs,
-                                         std::span<solux::proto::ArrVector*> target)
+                                         std::span<solux::api::ArrVector> target, std::pmr::memory_resource& mr)
 {
   auto sortedSegDocs = idxSpan | std::views::transform([&segDocs](auto idx) { return segDocs[idx]; });
   auto segNum = sortedSegDocs[0].segment();
@@ -471,12 +460,15 @@ inline void loadVectorColForSegmentMulti(SearchRequest& req, std::string_view fi
   SegFieldInfo segFieldInfo;
   fieldReader.readFieldInfo(segFieldInfo);
 
+  // Multi-valued vectors: each doc's ArrVector holds numVals Vectors. numVals
+  // is known at valIdx==0, so the inner Vector span is allocArray'd then filled
+  // by index (recovered via the span's data() across valHandler calls).
   auto valHandler = [&](size_t idx, int32_t doc, std::string_view bytes, int64_t valIdx, int64_t numVals) {
     assert(segDocs[idxSpan[idx]].docId() == doc);
     unused(doc);
-    auto* outer = target[idxSpan[idx]]->mutable_v();
-    if (valIdx == 0) outer->Reserve(numVals);
-    fillVectorF32(*outer->Add(), bytes);
+    solux::api::ArrVector& outer = target[idxSpan[idx]];
+    if (valIdx == 0) build::allocArray(outer.v, numVals, mr);
+    fillVectorF32(const_cast<solux::api::Vector*>(outer.v.data())[valIdx], bytes, mr);
   };
   StrColReader::getMultiValues(poolGuard.pool(), postingsReader, segFieldInfo, sortedDocs, valHandler);
 }
@@ -490,37 +482,34 @@ inline void loadVectorColForSegmentMulti(SearchRequest& req, std::string_view fi
 inline void loadVectorCol(SearchRequest& req, std::string_view field, FieldType& fieldType,
                           std::span<const segdoc> segDocs, std::span<uint8_t> sortedIdx,
                           const std::span<uint8_t> segRunLength,
-                          SearchResponse::ColumnsType& columnsProto, oneapi::tbb::task_group* tg)
+                          SearchResponse::ColumnsType& columnsProto, size_t colCap,
+                          oneapi::tbb::task_group* tg, std::pmr::memory_resource& mr)
 {
   auto columnSize = segDocs.size();
   if (columnSize == 0) return;
-  auto& fieldCol = columnsProto[field];
+  auto& fieldCol = build::columnSlot(columnsProto, colCap, field, mr);
 
   if (!fieldType.multiValued()) {
-    auto& vecsProto = *fieldCol.mutable_col_vec()->mutable_v();
-    vecsProto.Reserve(columnSize);
-    for (auto i = 0u; i < columnSize; i++) vecsProto.Add();
-    std::span<solux::proto::Vector*> target{vecsProto.mutable_data(), columnSize};
+    auto& vecCol = fieldCol.kind.emplace<solux::api::ColVector>();
+    std::span<solux::api::Vector> target(build::allocArray(vecCol.v, columnSize, mr), columnSize);
 
     int32_t start = 0;
     for (auto runlen : segRunLength) {
       auto idxSpan = sortedIdx.subspan(start, runlen);
-      task_group_run(tg, [idxSpan, &req, field, segDocs, target]() {
-        loadVectorColForSegmentSingle(req, field, idxSpan, segDocs, target);
+      task_group_run(tg, [idxSpan, &req, field, segDocs, target, &mr]() {
+        loadVectorColForSegmentSingle(req, field, idxSpan, segDocs, target, mr);
       });
       start += runlen;
     }
   } else {
-    auto& arrVecsProto = *fieldCol.mutable_multi_vec()->mutable_v();
-    arrVecsProto.Reserve(columnSize);
-    for (auto i = 0u; i < columnSize; i++) arrVecsProto.Add();
-    std::span<solux::proto::ArrVector*> target{arrVecsProto.mutable_data(), columnSize};
+    auto& arrVecCol = fieldCol.kind.emplace<solux::api::MultiVector>();
+    std::span<solux::api::ArrVector> target(build::allocArray(arrVecCol.v, columnSize, mr), columnSize);
 
     int32_t start = 0;
     for (auto runlen : segRunLength) {
       auto idxSpan = sortedIdx.subspan(start, runlen);
-      task_group_run(tg, [idxSpan, &req, field, segDocs, target]() {
-        loadVectorColForSegmentMulti(req, field, idxSpan, segDocs, target);
+      task_group_run(tg, [idxSpan, &req, field, segDocs, target, &mr]() {
+        loadVectorColForSegmentMulti(req, field, idxSpan, segDocs, target, mr);
       });
       start += runlen;
     }
@@ -528,17 +517,17 @@ inline void loadVectorCol(SearchRequest& req, std::string_view field, FieldType&
 }
 
 // Copy stored values for one doc into a request's output slot.
-inline void storeValuesInReq(const StoredReq& r, size_t slot, std::span<const std::string_view> values) {
+inline void storeValuesInReq(const StoredReq& r, size_t slot, std::span<const std::string_view> values,
+                             std::pmr::memory_resource& mr) {
   if (values.empty()) return;
   if (!r.multi) {
-    *r.starget[slot] = std::string(values[0]);
+    r.starget[slot] = build::arenaStr(mr, values[0]);
     if (r.present) r.present[slot] = 1;
   } else {
-    solux::proto::ArrStr& target = *r.mtarget[slot];
-    target.mutable_v()->Reserve((int)values.size());
-    for (auto v : values) {
-      auto* strProto = target.mutable_v()->Add();
-      *strProto = std::string(v);
+    solux::api::ArrStr& target = r.mtarget[slot];
+    std::string_view* dst = build::allocArray(target.v, values.size(), mr);
+    for (size_t i = 0; i < values.size(); i++) {
+      dst[i] = build::arenaStr(mr, values[i]);
     }
   }
 }
@@ -557,7 +546,8 @@ inline void storeValuesInReq(const StoredReq& r, size_t slot, std::span<const st
 inline void loadStoredFields(SearchRequest& req, std::string_view resourceName,
                              std::vector<StoredReq> reqsOwned,
                              std::span<const segdoc> segDocs, std::span<uint8_t> sortedIdx,
-                             const std::span<uint8_t> segRunLength, oneapi::tbb::task_group* tg)
+                             const std::span<uint8_t> segRunLength, oneapi::tbb::task_group* tg,
+                             std::pmr::memory_resource& mr)
 {
   // Move into a shared_ptr so every segment task can safely reference the
   // same vector even after this function returns.
@@ -566,7 +556,7 @@ inline void loadStoredFields(SearchRequest& req, std::string_view resourceName,
   int32_t start = 0;
   for (auto runlen : segRunLength) {
     auto idxSpan = sortedIdx.subspan(start, runlen);
-    task_group_run(tg, [idxSpan, &req, resourceName, reqs, segDocs]() {
+    task_group_run(tg, [idxSpan, &req, resourceName, reqs, segDocs, &mr]() {
       auto segNum = segDocs[idxSpan[0]].segment();
       auto& postingsReader = req.reader->segments()[segNum].postingsReader();
       auto sfr = StoredFieldsReader::open(postingsReader, resourceName);
@@ -594,7 +584,7 @@ inline void loadStoredFields(SearchRequest& req, std::string_view resourceName,
 
       for (auto* r : colReqs) {
         loadStrColForSegment(req, r->fieldName, *r->fieldType, idxSpan, segDocs, r->starget, r->mtarget,
-                             r->present);
+                             r->present, mr);
       }
 
       if (sfrReqs.empty()) return;
@@ -609,7 +599,7 @@ inline void loadStoredFields(SearchRequest& req, std::string_view resourceName,
         for (int32_t i = 0; i < (int32_t)idxSpan.size(); i++) {
           int32_t doc = segDocs[idxSpan[i]].docId();
           sfr->readFieldById(doc, fid, [&](std::span<const std::string_view> values) {
-            storeValuesInReq(*r, idxSpan[i], values);
+            storeValuesInReq(*r, idxSpan[i], values, mr);
           });
         }
       } else {
@@ -621,7 +611,7 @@ inline void loadStoredFields(SearchRequest& req, std::string_view resourceName,
           sfr->readDoc(doc, [&](std::string_view name, std::span<const std::string_view> values) {
             for (auto* r : sfrReqs) {
               if (r->fieldName == name) {
-                storeValuesInReq(*r, idxSpan[i], values);
+                storeValuesInReq(*r, idxSpan[i], values, mr);
                 break;
               }
             }
@@ -636,8 +626,7 @@ inline void loadStoredFields(SearchRequest& req, std::string_view resourceName,
 // Stream a final ranked list of (segdoc, score) pairs back to the client as one
 // or more SearchResponses.  Both TopDocsReq and FusionOp call this after their
 // own ranking is complete.  The caller's `getDocList(response)` lambda returns
-// the DocList proto in `response` to populate - for TopDocsReq it walks
-// calc.getTarget(...)->mutable_docs() (mutex-protected).
+// the DocList in `response` (a SearchResponse*) to populate.
 //
 // `getDoc(i)` and `getScore(i)` are invoked lazily, only for indices in the
 // current batch - no upfront materialization of a parallel array, so callers
@@ -656,7 +645,7 @@ void emitDocsResponse(SearchRequest& req,
                       GetDoc&& getDoc,
                       GetScore&& getScore,
                       int64_t totalHits,
-                      const google::protobuf::RepeatedPtrField<std::string>& fields,
+                      std::span<const std::string_view> fields,
                       int32_t batchSize,
                       int64_t offset,
                       bool getNumber,
@@ -669,6 +658,10 @@ void emitDocsResponse(SearchRequest& req,
     maxBatchSize = 256;
   }
 
+  // Upper bound on distinct response columns: one per requested field plus the
+  // synthetic _score_ column. Used to pre-size the columns map's slot array.
+  size_t colCap = fields.size() + 1;
+
   // If no documents were collected, we still need to send an empty response
   int64_t totalBatches = numCollected > 0 ? numCollected : 1;
   for (int64_t batchStart = 0; batchStart < totalBatches; batchStart += maxBatchSize) {
@@ -677,15 +670,16 @@ void emitDocsResponse(SearchRequest& req,
 
     bool lastResponse = batchEnd >= numCollected;
     auto& response = lastResponse ? *req.lastResponse : *SearchResponse::create(req, lastResponse);
-    auto& docListProto = getDocList(&response.proto);
-    docListProto.set_offset(offset + batchStart);
+    auto& docListProto = getDocList(&response);
+    auto& mr = response.mr;  // arena backing this response's column data
+    docListProto.offset = offset + batchStart;
     if (!lastResponse) {
-      docListProto.set_more(true);
-      response.proto.set_more(true);  // also set at the response level for easier client handling.
+      docListProto.more = true;
+      response.proto.more = true;  // also set at the response level for easier client handling.
     }
 
     if (getNumber) {
-      docListProto.set_matches(totalHits);
+      docListProto.matches = totalHits;
     }
 
     // Materialize just this batch's docs from getDoc.  Field loaders need a
@@ -720,7 +714,7 @@ void emitDocsResponse(SearchRequest& req,
     std::vector<uint8_t> segRunLength;
     std::ranges::copy(bySeg, std::back_inserter(segRunLength));
 
-    auto& columnsProto = *docListProto.mutable_columns();
+    auto& columnsProto = docListProto.columns;
 
     // Single-valued columns register here so the post-wait finish pass can
     // pick each column's exact missing_val and fill the missing slots.
@@ -746,32 +740,33 @@ void emitDocsResponse(SearchRequest& req,
       // chunk anyway, in which case pulling column-backed peer fields out
       // of the same chunk is cheaper than doing separate column lookups.
       auto recordStoredReq = [&](std::string_view resourceName) {
-        std::span<std::string*> starget;
-        std::span<solux::proto::ArrStr*> mtarget;
-        uint8_t* present = allocStringColumn(columnsProto[field], columnSize, fieldType.multiValued(),
-                                             starget, mtarget, pendingCols);
+        std::span<std::string_view> starget;
+        std::span<solux::api::ArrStr> mtarget;
+        auto& fieldCol = build::columnSlot(columnsProto, colCap, field, mr);
+        uint8_t* present = allocStringColumn(fieldCol, columnSize, fieldType.multiValued(),
+                                             starget, mtarget, pendingCols, mr);
         storedByResource[resourceName].push_back(
             {field, &fieldType, fieldType.multiValued(), starget, mtarget, present});
       };
 
       switch (fieldType.type()) {
         case FieldType::Type::INT: {
-          loadNumCol<IntColEmit>(req, field, fieldType, segDocs, sortedIdx, segRunLength, columnsProto, tg, pendingCols);
+          loadNumCol<IntColEmit>(req, field, fieldType, segDocs, sortedIdx, segRunLength, columnsProto, colCap, tg, pendingCols, mr);
           break;
         }
         case FieldType::Type::FLOAT: {
-          loadNumCol<FloatColEmit>(req, field, fieldType, segDocs, sortedIdx, segRunLength, columnsProto, tg, pendingCols);
+          loadNumCol<FloatColEmit>(req, field, fieldType, segDocs, sortedIdx, segRunLength, columnsProto, colCap, tg, pendingCols, mr);
           break;
         }
         case FieldType::Type::DOUBLE: {
-          loadNumCol<DoubleColEmit>(req, field, fieldType, segDocs, sortedIdx, segRunLength, columnsProto, tg, pendingCols);
+          loadNumCol<DoubleColEmit>(req, field, fieldType, segDocs, sortedIdx, segRunLength, columnsProto, colCap, tg, pendingCols, mr);
           break;
         }
         case FieldType::Type::DATE: {
           // DATE is epoch millis in the int column; emit the raw millis as
           // col_i.  ISO-8601 string rendering is an input-side / JSON-layer
           // concern, not the typed gRPC column.
-          loadNumCol<IntColEmit>(req, field, fieldType, segDocs, sortedIdx, segRunLength, columnsProto, tg, pendingCols);
+          loadNumCol<IntColEmit>(req, field, fieldType, segDocs, sortedIdx, segRunLength, columnsProto, colCap, tg, pendingCols, mr);
           break;
         }
         case FieldType::Type::ID:
@@ -779,7 +774,7 @@ void emitDocsResponse(SearchRequest& req,
           if (fieldType.isStored()) {
             recordStoredReq(fieldType.storedResource_);
           } else if (fieldType.hasColumn()) {
-            loadStrCol(req, field, fieldType, segDocs, sortedIdx, segRunLength, columnsProto, tg, pendingCols);
+            loadStrCol(req, field, fieldType, segDocs, sortedIdx, segRunLength, columnsProto, colCap, tg, pendingCols, mr);
           }
           break;
         }
@@ -790,7 +785,7 @@ void emitDocsResponse(SearchRequest& req,
           break;
         }
         case FieldType::Type::VECTOR: {
-          loadVectorCol(req, field, fieldType, segDocs, sortedIdx, segRunLength, columnsProto, tg);
+          loadVectorCol(req, field, fieldType, segDocs, sortedIdx, segRunLength, columnsProto, colCap, tg, mr);
           break;
         }
         default:
@@ -810,22 +805,21 @@ void emitDocsResponse(SearchRequest& req,
       });
       if (anyStoredOnly) {
         loadStoredFields(req, resourceName, std::move(reqs),
-                         segDocs, sortedIdx, segRunLength, tg);
+                         segDocs, sortedIdx, segRunLength, tg, mr);
       } else {
         for (auto& r : reqs) {
           loadStrColWithTargets(req, r.fieldName, *r.fieldType, r.starget, r.mtarget, r.present,
-                                segDocs, sortedIdx, segRunLength, tg);
+                                segDocs, sortedIdx, segRunLength, tg, mr);
         }
       }
     }
 
     if (returnScores) {
-      auto& scoresProto = columnsProto["_score_"];
-      auto& floatColProto = *scoresProto.mutable_col_f();
-      auto& floatsProto = *floatColProto.mutable_v();
-      floatsProto.Reserve(columnSize);
+      auto& scoresProto = build::columnSlot(columnsProto, colCap, "_score_", mr);
+      auto& floatColProto = scoresProto.kind.template emplace<solux::api::ColFloat>();
+      float* scores = build::allocArray(floatColProto.v, columnSize, mr);
       for (int i = 0; i < columnSize; i++) {
-        floatsProto.Add(getScore(batchStart + i));
+        scores[i] = getScore(batchStart + i);
       }
     }
 

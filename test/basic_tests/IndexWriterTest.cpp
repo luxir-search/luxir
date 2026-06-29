@@ -81,14 +81,10 @@ bool waitForMergesCommit(IndexWriter& iw) {
 }
 
 std::vector<std::string> allIds(solux::test::CollectionHelper& helper) {
-  auto* req = solux::test::LocalReq::create(helper.getSearchEngine());
-  auto docs = req->collection("main")
-               .allQuery()
-               .fields({"id"})
-               .limit(-1)
-               .execute()
-               .getDocs();
-  req->done();
+  auto req = solux::test::localReq(helper.getSearchEngine());
+  req->collection("main").topDocs("q").allQuery().fields({"id"}).limit(-1);
+  req->execute();
+  auto docs = req->getDocs();
 
   std::vector<std::string> ids;
   ids.reserve(docs.size());
@@ -362,6 +358,7 @@ TEST_F(IndexWriterTest, mergeFailureContainmentRestoresSourcesAndGate) {
 
 // Multithreaded test of IndexWriter updates, commits, merges, and IndexReader reopen during those.
 TEST_F(IndexWriterTest, multiThreaded) {
+  using namespace solux::test;
   int requestThreads = 4;
   int docsToAdd = 100;
   int percentReads = 20;
@@ -394,22 +391,37 @@ TEST_F(IndexWriterTest, multiThreaded) {
   std::mutex testMutex;
 
 
-  class TestProtoUpdateMessage : public ProtoUpdateMessage {
-  private:
-    // Heap-allocate the request and hand its address to the base class - that way
-    // the proto is fully constructed before any base-class code touches it.  The
-    // owner unique_ptr is initialized after the base (member init follows base
-    // init) and just adopts the same pointer for cleanup at destruction time.
-    std::unique_ptr<solux::proto::UpdateRequest> updateRequestOwner_;
+  // Holds the build arena + concrete (non-owning) request the test submits.  As a
+  // base it is constructed before the ProtoUpdateMessage base (which reads
+  // request.commit), so the request is fully built in time (base-from-member idiom).
+  struct TestReq {
+    std::pmr::monotonic_buffer_resource mr;
+    solux::api::UpdateRequest request;
+    TestReq(std::string_view fieldName, int numAdds, bool doCommit, bool waitForMerges) {
+      if (numAdds > 0) {
+        solux::api::Map* docs = solux::api::build::allocArray(request.docs, numAdds, mr);
+        for (int i = 0; i < numAdds; i++) {
+          CollectionHelper::convertDocToProto(
+              flatdoc(std::string(fieldName), std::string("now is the time for all")), docs[i], mr);
+        }
+      }
+      if (doCommit) {
+        request.commit.emplace().wait_for_merges = waitForMerges;
+      }
+    }
+  };
+
+  class TestProtoUpdateMessage : private TestReq, public ProtoUpdateMessage {
   public:
-    solux::proto::UpdateRequest& updateRequest;
+    solux::api::UpdateRequest& updateRequest;
     std::function<void(TestProtoUpdateMessage&)> callback = nullptr;
 
-    TestProtoUpdateMessage(std::function<void(TestProtoUpdateMessage&)> callback)
-      : ProtoUpdateMessage(new solux::proto::UpdateRequest()),
-        updateRequestOwner_(this->req),
-        updateRequest(*updateRequestOwner_),
-        callback(callback) {}
+    TestProtoUpdateMessage(std::string_view fieldName, int numAdds, bool doCommit,
+                           bool waitForMerges, std::function<void(TestProtoUpdateMessage&)> callback)
+      : TestReq(fieldName, numAdds, doCommit, waitForMerges),
+        ProtoUpdateMessage(&this->request),
+        updateRequest(this->request),
+        callback(std::move(callback)) {}
 
     void done(IndexWriter& iw) override {
       unused(iw);
@@ -421,17 +433,17 @@ TEST_F(IndexWriterTest, multiThreaded) {
   };
 
   auto cb = [&](TestProtoUpdateMessage& msg) {
-            TEST_DEBUG("done called! adds in this request={}", msg.updateRequest.docs_size());
-    if (msg.updateRequest.has_commit()) {
+            TEST_DEBUG("done called! adds in this request={}", msg.updateRequest.docs.size());
+    if (msg.updateRequest.commit.has_value()) {
       commits++;
     }
-    docsAdded += msg.updateRequest.docs_size();
+    docsAdded += msg.updateRequest.docs.size();
     if (recordUpdates) {
       std::lock_guard<std::mutex> lock(testMutex);
-      for (int i = 0; i < msg.updateRequest.docs_size(); i++) {
+      for (int i = 0; i < (int)msg.updateRequest.docs.size(); i++) {
         UpdateInfo ui;
         ui.seqNum = msg.updateVersion;
-        ui.numAdds = msg.updateRequest.docs_size();
+        ui.numAdds = msg.updateRequest.docs.size();
         ui.commitType = (byte)msg.commit;
         updates.push_back(ui);
       }
@@ -502,8 +514,9 @@ TEST_F(IndexWriterTest, multiThreaded) {
                       // NOTE: since write submission is async and done in a loop, this can pile up a lot of writes in the queue
                       // really fast!  Perhaps we should yield when docsRequested - docsAdded is too large?
                       if (!writesDone) {
-                        auto* msg = new TestProtoUpdateMessage(cb);
-                        solux::proto::UpdateRequest* ureq = &msg->updateRequest;
+                        // Decide the request shape here; the message builds the concrete
+                        // (arena-backed) request from these params and the base ctor reads
+                        // commit/wait_for_merges off it.
                         bool doCommit = rng.rint(100) < percentCommits;
                         int64_t numAdds = rng.rint(doCommit ? 0 : 1,
                                                    3);  // lower bound on number of adds is 0 if we're going to commit
@@ -524,18 +537,9 @@ TEST_F(IndexWriterTest, multiThreaded) {
                           }
                         }
 
-                        if (doCommit) {
-                          auto* params = ureq->mutable_commit();
-                          if (rng.rint(100) < percentWaitForMerges) {
-                            params->set_wait_for_merges(true);
-                            msg->waitForMerges = true;
-                          }
-                        }
-                        // Normal ProtoUpdateMessage sets commit from request in constructor. Since that has already passed, need to do it manually here.
-                        msg->commit = doCommit ? UpdateMessage::CommitType::COMMIT : UpdateMessage::CommitType::NO_COMMIT;
-                        for (int i = 0; i < numAdds; i++) {
-                          auto& fields = *ureq->add_docs()->mutable_fields();
-                          fields[field].set_s("now is the time for all");
+                        bool waitForMerges = false;
+                        if (doCommit && rng.rint(100) < percentWaitForMerges) {
+                          waitForMerges = true;
                         }
 
                         if (doCommit) {
@@ -548,6 +552,7 @@ TEST_F(IndexWriterTest, multiThreaded) {
                         }
 
                         TEST_DEBUG("\tsubmitting update with {} adds, commit={}", numAdds, doCommit);
+                        auto* msg = new TestProtoUpdateMessage(field, (int)numAdds, doCommit, waitForMerges, cb);
                         auto success = iw.submitUpdate(msg);
                         if (!success) {
                           FAIL();
@@ -647,17 +652,13 @@ TEST_F(IndexWriterTest, versionFieldOverwrite) {
   EXPECT_GT(result3.updateVersion, result2.updateVersion);
 
   auto* req = LocalReq::create(helper.getSearchEngine());
-  auto docs = req->collection("main")
-                 .allQuery()
-                 .fields({"id", "text_w", "_version_"})
-                 .limit(-1)
-                 .execute()
-                 .getDocs();
-
+  req->collection("main").topDocs("q").allQuery().fields({"id", "text_w", "_version_"}).limit(-1);
+  req->execute();
+  auto docs = req->getDocs();
 
   req->done();
   ASSERT_EQ(3, docs.size());
-  
+
   // text_w is STORED by default, so the raw value comes back with the doc.
   // doc1 was indexed without overwrite, so it has no _version_ value and the
   // field is absent from the returned doc.
@@ -680,13 +681,9 @@ TEST_F(IndexWriterTest, versionFieldOverwrite) {
   Doc doc2Overwrite = flatdoc("id", "doc2", "text_w", "hello version world again");
   helper.index(doc2Overwrite, UpdateMessage::COMMIT, true);
   req = LocalReq::create(helper.getSearchEngine());
-  docs = req->collection("main")
-                 .allQuery()
-                 .fields({"id", "text_w", "_version_"})
-                 .limit(-1)
-                 .execute()
-                 .getDocs();
-
+  req->collection("main").topDocs("q").allQuery().fields({"id", "text_w", "_version_"}).limit(-1);
+  req->execute();
+  docs = req->getDocs();
 
   req->done();
   ASSERT_EQ(3, docs.size());
@@ -721,12 +718,16 @@ TEST_F(IndexWriterTest, sparseVersionColumnDeletes) {
   helper.deleteById("sv1", UpdateMessage::COMMIT);
 
   auto* req = LocalReq::create(helper.getSearchEngine());
-  auto docs1 = req->collection("main").matchQuery("text_w", "versioned").fields({"text_w"}).limit(-1).execute().getDocs();
+  req->collection("main").topDocs("q").matchQuery("text_w", "versioned").fields({"text_w"}).limit(-1);
+  req->execute();
+  auto docs1 = req->getDocs();
   req->done();
   EXPECT_EQ(0u, docs1.size());
 
   req = LocalReq::create(helper.getSearchEngine());
-  auto docs2 = req->collection("main").matchQuery("text_w", "anonymous").fields({"text_w"}).limit(-1).execute().getDocs();
+  req->collection("main").topDocs("q").matchQuery("text_w", "anonymous").fields({"text_w"}).limit(-1);
+  req->execute();
+  auto docs2 = req->getDocs();
   req->done();
   EXPECT_EQ(1u, docs2.size());
 }
@@ -912,12 +913,9 @@ TEST_F(IndexWriterTest, deletionInfrastructure) {
   
   // Verify the new document is searchable and we now have 2 documents
   auto* req2 = LocalReq::create(helper.getSearchEngine());
-  auto finalDocs2 = req2->collection("main")
-                      .allQuery()
-                      .fields({"id"})
-                      .limit(-1)
-                      .execute()
-                      .getDocs();
+  req2->collection("main").topDocs("q").allQuery().fields({"id"}).limit(-1);
+  req2->execute();
+  auto finalDocs2 = req2->getDocs();
   req2->done();
   
   EXPECT_EQ(2, finalDocs2.size()); // doc1 and doc4
@@ -1064,11 +1062,9 @@ static void runMultithreadedUpdates(uint64_t seed, int mergeFailPercent, int upd
             // TODO: store, expose, and test the update verision in the IndexReader
 
             auto* req = LocalReq::create(helper.getSearchEngine());
-            auto docs = req->collection("main")
-                          .matchQuery("id", docId)
-                          .fields({"id", "_version_"})
-                          .execute()
-                          .getDocs();
+            req->collection("main").topDocs("q").matchQuery("id", docId).fields({"id", "_version_"});
+            req->execute();
+            auto docs = req->getDocs();
             req->done();
 
             if (docVersions[localDoc] <= 0) {
@@ -1122,28 +1118,26 @@ static void runMultithreadedUpdates(uint64_t seed, int mergeFailPercent, int upd
               Doc doc = flatdoc("id", docId, "no_such_field", "boom");
               auto result = helper.index(doc, UpdateMessage::COMMIT, true);
               ASSERT_FALSE(result.success);
-              ASSERT_EQ(proto::UpdateResponse::ERROR, result.response.status());
-              ASSERT_EQ(1, result.response.errors_size());
-              EXPECT_EQ(docId, result.response.errors(0).id());
+              ASSERT_EQ(solux::api::UpdateResponse_::Status::ERROR, result.status);
+              ASSERT_EQ(1, (int)result.errors.size());
+              EXPECT_EQ(docId, result.errors[0].id);
             } else {
               // all_or_none batch: a good update of another owned doc gets
               // indexed, then the bad doc voids the batch; both docs must be
               // left exactly as they were.
               std::string otherId = std::to_string(r.rint(docsPerThread) + tid * 1000);
-              google::protobuf::Arena arena;
-              auto* request = google::protobuf::Arena::Create<proto::UpdateRequest>(&arena);
-              CollectionHelper::convertDocToProto(flatdoc("id", otherId), *request->add_docs());
-              CollectionHelper::convertDocToProto(flatdoc("id", docId, "no_such_field", "boom"),
-                                                  *request->add_docs());
-              request->set_overwrite(true);
-              request->set_all_or_none(true);
-              request->mutable_commit();
-              auto result = helper.submit(request);
+              CollectionHelper::UpdateBuilder b;
+              b.add(flatdoc("id", otherId));
+              b.add(flatdoc("id", docId, "no_such_field", "boom"));
+              b.overwrite(true);  // allow_dups = false
+              b.allOrNone(true);
+              b.commit();
+              auto result = helper.submit(b);
               ASSERT_FALSE(result.success);
-              ASSERT_EQ(proto::UpdateResponse::ERROR, result.response.status());
-              ASSERT_EQ(1, result.response.errors_size());
-              EXPECT_EQ(docId, result.response.errors(0).id());
-              EXPECT_EQ(1, result.response.errors(0).index());
+              ASSERT_EQ(solux::api::UpdateResponse_::Status::ERROR, result.status);
+              ASSERT_EQ(1, (int)result.errors.size());
+              EXPECT_EQ(docId, result.errors[0].id);
+              EXPECT_EQ(1, result.errors[0].index);
             }
             continue;
           }
@@ -1163,11 +1157,9 @@ static void runMultithreadedUpdates(uint64_t seed, int mergeFailPercent, int upd
           // TODO: store, expose, and test the update verision in the IndexReader
 
           auto* req = LocalReq::create(helper.getSearchEngine());
-          auto docs = req->collection("main")
-                        .matchQuery("id", docId)
-                        .fields({"id", "_version_"})
-                        .execute()
-                        .getDocs();
+          req->collection("main").topDocs("q").matchQuery("id", docId).fields({"id", "_version_"});
+          req->execute();
+          auto docs = req->getDocs();
           req->done();
 
           if (docVersions[localDoc] <= 0) {
@@ -1306,16 +1298,13 @@ TEST_F(IndexWriterTest, segmentMergerWithDeletes) {
   
   // Verify we can still search and find the expected documents
   auto* req = LocalReq::create(helper.getSearchEngine());
-  auto docs = req->collection("main")
-                 .allQuery()
-                 .fields({"id"})
-                 .limit(-1)
-                 .execute()
-                 .getDocs();
+  req->collection("main").topDocs("q").allQuery().fields({"id"}).limit(-1);
+  req->execute();
+  auto docs = req->getDocs();
   req->done();
-  
+
   EXPECT_EQ(3, docs.size());
-  
+
   // Verify doc2 is not in results
   bool foundDoc1 = false, foundDoc3 = false, foundDoc4 = false, foundDoc2 = false;
   for (const auto& doc : docs) {
@@ -1401,12 +1390,9 @@ TEST_F(IndexWriterTest, segmentMergerPositions) {
 
   // Test 2: Verify term/match queries on the "text_w" field for "world" retrieve documents with valid IDs
   auto* req = LocalReq::create(helper.getSearchEngine());
-  auto docs = req->collection("main")
-            .matchQuery("text_w", "world")
-            .limit(-1)
-            .fields({"id", })
-            .execute()
-            .getDocs();
+  req->collection("main").topDocs("q").matchQuery("text_w", "world").limit(-1).fields({"id", });
+  req->execute();
+  auto docs = req->getDocs();
   req->done();
 
   // should be all docs
@@ -1419,11 +1405,9 @@ TEST_F(IndexWriterTest, segmentMergerPositions) {
 
       // Test 1: Verify term/match queries on the "id" field retrieve the correct "id"
       req = LocalReq::create(helper.getSearchEngine());
-      docs = req->collection("main")
-                     .matchQuery("id", idStr)
-                     .fields({"id"})
-                     .execute()
-                     .getDocs();
+      req->collection("main").topDocs("q").matchQuery("id", idStr).fields({"id"});
+      req->execute();
+      docs = req->getDocs();
       req->done();
 
       bool wasDeleted = deletedIds.find(idStr) != deletedIds.end();
@@ -1436,11 +1420,9 @@ TEST_F(IndexWriterTest, segmentMergerPositions) {
 
       // Verify term/match queries on the "text_w" field for the id term is on the right doc.
       req = LocalReq::create(helper.getSearchEngine());
-      docs = req->collection("main")
-                .matchQuery("text_w", idStr)
-                .fields({"id", })
-                .execute()
-                .getDocs();
+      req->collection("main").topDocs("q").matchQuery("text_w", idStr).fields({"id", });
+      req->execute();
+      docs = req->getDocs();
       req->done();
 
       // should be a single result if not deleted.
@@ -1453,11 +1435,9 @@ TEST_F(IndexWriterTest, segmentMergerPositions) {
 
       // Verify that the positions lookups are correct.
       req = LocalReq::create(helper.getSearchEngine());
-      docs = req->collection("main")
-                .phraseQuery("text_w", {"world", idStr})
-                .fields({"id", })
-                .execute()
-                .getDocs();
+      req->collection("main").topDocs("q").phraseQuery("text_w", {"world", idStr}).fields({"id", });
+      req->execute();
+      docs = req->getDocs();
       req->done();
 
       // should be a single result if not deleted.
