@@ -1066,6 +1066,13 @@ public:
     constexpr static int32_t kWindowSize = DocsEnum::L1_DOCS;
     constexpr static int32_t kWindowWords = kWindowSize / 64;
     constexpr static size_t kBs1MinClauses = 16;
+    // Domain-drive gate weights: drive only when card*nClauses*W < SUM(clause.cost()).
+    // W is the per-advance penalty (advance cost vs a vectorized block decode). HARDWARE
+    // SENSITIVE (vector throughput vs scalar skip cost; ISA): calibrated on an Intel hybrid
+    // 2P+8E laptop to a ~1% crossover; RE-VALIDATE on uniform desktop / cloud / ARM (NEON/
+    // SVE shifts the ratio). W_ARRAY < W_BITSET because array stream membership is an
+    // O(log card) ArrDocSet::get binary search vs bitset O(1) get (W_ARRAY reasoned from the
+    // ~15% delta, not swept). See solux-private/tuning-constants.md + domain-pushdown.md.
     constexpr static int64_t W_BITSET = 32;
     constexpr static int64_t W_ARRAY = 28;
     static_assert((kWindowSize % 64) == 0);
