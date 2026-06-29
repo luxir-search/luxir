@@ -1,10 +1,12 @@
 #pragma once
 
+#include <algorithm>
 #include <bit>
 #include <cmath>
 
 #include "Query.h"
 #include "QueryPrep.h"
+#include "solux/util/screaming.h"
 
 namespace solux {
 
@@ -19,6 +21,8 @@ class BooleanQuery final : public solux::Query {
   int minShouldMatch;
 
 public:
+  static inline bool disableBulkDomainDriveForTests = false;
+
   BooleanQuery(std::span<Query*> mandatory, std::span<Query*> optional, std::span<Query*> prohibited,
                std::span<Query*> filter, int minShouldMatch = 0)
           : mandatory(mandatory), optional(optional), prohibited(prohibited), filter(filter),
@@ -309,12 +313,36 @@ public:
             || !filterSuppliers.empty() || minShouldMatch > 1 || optionalSources.size() < 2) {
           return nullptr;
         }
-        auto optionalScorers = QueryPrep::createScorers(targetPool, segment, optionalSources);
+        auto& optionalScorersVec = *targetPool.make_vec<Query::Scorer*>();
+        optionalScorersVec.reserve(optionalSources.size());
+        int64_t aggregateClauseCost = 0;
+        for (auto* source : optionalSources) {
+          auto* supplier = source->scorerSupplier(targetPool, segment);
+          if (supplier == nullptr) {
+            continue;
+          }
+          int64_t cost = supplier->cost();
+          auto* scorer = supplier->get(targetPool, std::numeric_limits<int64_t>::max());
+          if (scorer == nullptr) {
+            continue;
+          }
+          optionalScorersVec.push_back(scorer);
+          if (cost > 0
+              && aggregateClauseCost < std::numeric_limits<int64_t>::max()) {
+            int64_t room = std::numeric_limits<int64_t>::max() - aggregateClauseCost;
+            if (cost >= room) {
+              aggregateClauseCost = std::numeric_limits<int64_t>::max();
+            } else {
+              aggregateClauseCost += cost;
+            }
+          }
+        }
+        std::span<Query::Scorer*> optionalScorers(optionalScorersVec.data(), optionalScorersVec.size());
         if (optionalScorers.size() < 2) {
           return nullptr;
         }
         return targetPool.make<BooleanQuery::MaxScoreBulkScorer>(
-          targetPool, optionalScorers, segment.maxDoc());
+          targetPool, optionalScorers, segment.maxDoc(), aggregateClauseCost);
       }
     };
 
@@ -1038,6 +1066,8 @@ public:
     constexpr static int32_t kWindowSize = DocsEnum::L1_DOCS;
     constexpr static int32_t kWindowWords = kWindowSize / 64;
     constexpr static size_t kBs1MinClauses = 16;
+    constexpr static int64_t W_BITSET = 32;
+    constexpr static int64_t W_ARRAY = 28;
     static_assert((kWindowSize % 64) == 0);
 
     std::span<Query::Scorer*> scorers;  // stable global-max order, used for deterministic scoring
@@ -1052,10 +1082,15 @@ public:
     std::span<float> outScores;
 
     int32_t maxDoc;
+    int64_t aggregateClauseCost;
+    DocSet* arrayCursorFilter = nullptr;
+    size_t arrayCursor = 0;
+    int32_t arrayCursorLastWindowStart = -1;
     int32_t windowStart = 0;
     int32_t windowEnd = 0;
     size_t splitIndex = 0;
     int64_t bs1Windows = 0;
+    int64_t domainDriveWindows = 0;
     float minCompetitiveScore = std::numeric_limits<float>::lowest();
     double scoreBoundFactor = 1.0;
 
@@ -1176,6 +1211,105 @@ public:
       unused(scorer, doc);
       // Reserved for two-phase: approximation hits will call matches() here.
       return true;
+    }
+
+    bool shouldDriveFromDomain(DocSet* filter) {
+      if (disableBulkDomainDriveForTests || filter == nullptr) {
+        return false;
+      }
+      int64_t card = (int64_t) filter->card();
+      if (card == 0 || aggregateClauseCost <= 0) {
+        return false;
+      }
+      int64_t weight = filter->type == DocSet::BITSET ? W_BITSET : W_ARRAY;
+      int64_t nClauses = (int64_t) scorers.size();
+      if (nClauses <= 0 || nClauses > std::numeric_limits<int64_t>::max() / weight) {
+        return false;
+      }
+      int64_t scale = nClauses * weight;
+      // Drive cost is roughly card*nClauses advances. Stream cost is roughly
+      // sum(clause.cost()) vectorized decodes. W is the measured advance/decode
+      // ratio. ARRAY gets a lower W because stream-side membership is a binary
+      // search in ArrDocSet::get, while BITSET stream membership is bits.get().
+      return card <= (aggregateClauseCost - 1) / scale;
+    }
+
+    void setupDomainWindow(int32_t start, int32_t max) {
+      windowStart = start;
+      int32_t requestedEnd = windowStart + kWindowSize;
+      if (requestedEnd < windowStart) {
+        requestedEnd = max;
+      }
+      windowEnd = std::min(std::min(requestedEnd, max), maxDoc);
+    }
+
+    bool scoreDomainDoc(int32_t doc, float& score) {
+      float sum = 0.0f;
+      bool matched = false;
+      for (size_t i = 0; i < scorers.size(); i++) {
+        auto* scorer = scorers[i];
+        if (scorer->docId() < doc) {
+          scorer->advance(doc);
+        }
+        if (scorer->docId() == doc && verifyMatch(scorer, doc)) {
+          sum += scorer->score();
+          matched = true;
+        }
+      }
+      score = sum;
+      return matched;
+    }
+
+    void resetArrayCursorIfNeeded(DocSet* filter) {
+      if (filter != arrayCursorFilter || windowStart <= arrayCursorLastWindowStart) {
+        arrayCursorFilter = filter;
+        arrayCursor = 0;
+      }
+      arrayCursorLastWindowStart = windowStart;
+    }
+
+    void collectDomainDoc(ScoreWindow& out, int32_t doc) {
+      float score = 0.0f;
+      if (!scoreDomainDoc(doc, score)) {
+        return;
+      }
+      if (score >= minCompetitiveScore) {
+        assert(out.size < kWindowSize);
+        out.docs[(size_t) out.size] = doc;
+        out.scores[(size_t) out.size] = score;
+        out.size++;
+      }
+    }
+
+    void fillDomainDrivenCandidates(ScoreWindow& out, DocSet* filter) {
+      prepareOutputWindow(out);
+      if (filter->type == DocSet::ARRAY) {
+        ArrDocSet* arrDocs = (ArrDocSet*) filter;
+        auto docs = arrDocs->docs();
+        resetArrayCursorIfNeeded(filter);
+        if (arrayCursor < docs.size()) {
+          const int32_t* base = docs.data();
+          const int32_t* it = screaming::gallopLowerBound(
+            base + arrayCursor, base + docs.size(), windowStart);
+          arrayCursor = (size_t)(it - base);
+        }
+        while (arrayCursor < docs.size() && docs[arrayCursor] < windowEnd) {
+          collectDomainDoc(out, docs[arrayCursor]);
+          arrayCursor++;
+        }
+        return;
+      }
+
+      assert(filter->type == DocSet::BITSET);
+      const FixedBitSet& bits = ((BitDocSet*) filter)->bits();
+      int32_t doc = windowStart - 1;
+      while (doc + 1 < windowEnd) {
+        doc = bits.nextSetBit(doc + 1);
+        if (doc >= windowEnd) {
+          break;
+        }
+        collectDomainDoc(out, doc);
+      }
     }
 
     void fillEssentialCandidates(DocSet* filter, const FixedBitSet* domainBits) {
@@ -1307,7 +1441,7 @@ public:
   public:
     // The passed in span of scorers will be modified (rearranged).
     MaxScoreBulkScorer(solux::MemPool& pool, std::span<Query::Scorer*> scorers,
-                       int32_t maxDoc)
+                       int32_t maxDoc, int64_t aggregateClauseCost)
             : scorers(scorers),
               clauseMax(pool.make_arr<float>(scorers.size()), scorers.size()),
               windowMax(pool.make_arr<float>(scorers.size()), scorers.size()),
@@ -1319,7 +1453,8 @@ public:
               bs1Scores(pool.make_arr<float>((size_t) kWindowSize), (size_t) kWindowSize),
               outDocs(pool.make_arr<int32_t>((size_t) kWindowSize), (size_t) kWindowSize),
               outScores(pool.make_arr<float>((size_t) kWindowSize), (size_t) kWindowSize),
-              maxDoc(maxDoc) {
+              maxDoc(maxDoc),
+              aggregateClauseCost(aggregateClauseCost) {
       scoreBoundFactor = 1.0 + (double) scorers.size() * 0x1p-24;
       for (size_t i = 0; i < scorers.size(); i++) {
         clauseMax[i] = scorers[i]->getMaxScore(PostingsReader::END);
@@ -1344,6 +1479,16 @@ public:
       }
       if (minCompetitiveScore > this->minCompetitiveScore) {
         this->minCompetitiveScore = minCompetitiveScore;
+      }
+
+      if (filter != nullptr && filter->card() == 0) {
+        return PostingsReader::END;
+      }
+      if (shouldDriveFromDomain(filter)) {
+        setupDomainWindow(min, max);
+        domainDriveWindows++;
+        fillDomainDrivenCandidates(out, filter);
+        return windowEnd >= max ? PostingsReader::END : windowEnd;
       }
 
       const FixedBitSet* domainBits = nullptr;
@@ -1372,6 +1517,10 @@ public:
 
     int64_t bs1WindowCount() const {
       return bs1Windows;
+    }
+
+    int64_t domainDriveWindowCount() const {
+      return domainDriveWindows;
     }
   }; // MaxScoreBulkScorer
 

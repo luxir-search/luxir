@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <bit>
 #include <cmath>
 #include <map>
 #include <memory>
@@ -1657,6 +1658,75 @@ TEST_F(KnnQueryTest, ivfFilteredQueryWithDeletesMatchesExact) {
     EXPECT_NE(id, "d40") << "deleted doc must not appear despite passing the filter";
     EXPECT_NE(id, "d41") << "blue doc must not pass the red filter";
   }
+}
+
+TEST_F(KnnQueryTest, selectiveFilterPreparedSkipMatchesCollectorRecheck) {
+  IvfPqAuxGuard guard(/*nlist=*/4, /*m=*/2, /*bits=*/2,
+                      /*nprobe=*/4, /*minTraining=*/16, /*refineRatio=*/8);
+  CollectionHelper h("main");
+  h.clear();
+  installVecSchema(h.collection(), proto::VectorParams::L2);
+
+  for (int i = 0; i < 160; i++) {
+    bool keep = (i % 5) == 0;
+    h.index(flatdoc("id", "d" + std::to_string(i),
+                    "keep_s", keep ? "yes" : "no",
+                    "embedding_v", std::vector<float>{(float)i, 0.0f, 0.0f, 0.0f}));
+  }
+  h.commit({"*"});
+
+  auto makeReq = [&](bool wrapInBoolean) {
+    auto* req = LocalReq::create(soluxNode->getSearchEngine());
+    req->proto.mutable_collection()->add_name("main");
+    auto& topDocs = *(*req->proto.mutable_ops())["q"].mutable_top_docs();
+    topDocs.set_get_scores(true);
+    topDocs.set_get_number(true);
+    topDocs.mutable_fields()->Add("id");
+    if (wrapInBoolean) {
+      auto& boolean = *topDocs.mutable_query()->mutable_boolean();
+      setKnnQuery(*boolean.add_required(), "embedding_v",
+                  {42.2f, 0.0f, 0.0f, 0.0f}, 6,
+                  /*nprobe=*/4, /*refineCandidates=*/160);
+    } else {
+      setKnnQuery(*topDocs.mutable_query(), "embedding_v",
+                  {42.2f, 0.0f, 0.0f, 0.0f}, 6,
+                  /*nprobe=*/4, /*refineCandidates=*/160);
+    }
+    auto& nf = *topDocs.add_filter();
+    nf.set_name("keep");
+    auto& m = *nf.mutable_query()->mutable_match();
+    m.set_field("keep_s");
+    m.mutable_val()->set_s("yes");
+    return req;
+  };
+
+  auto* skip = makeReq(false);
+  skip->execute();
+  ASSERT_FALSE(skip->responses[0]->proto.has_error()) << skip->toString();
+  auto skipIds = resultIds(*skip);
+  auto skipScores = resultScores(*skip);
+
+  auto* recheck = makeReq(true);
+  recheck->execute();
+  ASSERT_FALSE(recheck->responses[0]->proto.has_error()) << recheck->toString();
+  auto recheckIds = resultIds(*recheck);
+  auto recheckScores = resultScores(*recheck);
+
+  ASSERT_EQ(skipIds.size(), 6u);
+  EXPECT_EQ(skipIds, recheckIds);
+  ASSERT_EQ(skipScores.size(), recheckScores.size());
+  for (size_t i = 0; i < skipScores.size(); i++) {
+    EXPECT_EQ(std::bit_cast<uint32_t>(skipScores[i]),
+              std::bit_cast<uint32_t>(recheckScores[i])) << "i=" << i;
+  }
+  for (const auto& id : skipIds) {
+    ASSERT_GE(id.size(), 2u);
+    int doc = std::stoi(id.substr(1));
+    EXPECT_EQ(doc % 5, 0) << id;
+  }
+
+  skip->done();
+  recheck->done();
 }
 
 // A NaN/Inf query vector is rejected loudly: NaN scores would break the

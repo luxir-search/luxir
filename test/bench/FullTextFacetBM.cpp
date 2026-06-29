@@ -4,6 +4,7 @@
 #include <charconv>
 #include <cmath>
 #include <limits>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -714,9 +715,30 @@ ScoreTopKResult runMultiTermDisjunctionTopK(IndexReader& reader,
   return result;
 }
 
+std::unique_ptr<DocSet> makeModuloBitsetDomain(int32_t maxDoc, int32_t step) {
+  if (step <= 1) return nullptr;
+  auto domain = std::make_unique<RAMBitDocSet>(maxDoc);
+  for (int32_t doc = 0; doc < maxDoc; doc += step) {
+    domain->mutableBits().set(doc);
+  }
+  return domain;
+}
+
+std::unique_ptr<DocSet> makeModuloArrayDomain(int32_t maxDoc, int32_t step) {
+  if (step <= 1) return nullptr;
+  std::vector<int32_t> docs;
+  docs.reserve((size_t)((maxDoc + step - 1) / step));
+  for (int32_t doc = 0; doc < maxDoc; doc += step) {
+    docs.push_back(doc);
+  }
+  return std::make_unique<ArrDocSet>(std::move(docs));
+}
+
 ScoreTopKResult runBulkOrPullDisjunctionTopK(IndexReader& reader,
                                              const std::vector<std::string>& terms,
-                                             int32_t topK, bool useBulk) {
+                                             int32_t topK, bool useBulk,
+                                             int32_t domainStep = 0,
+                                             bool domainArray = false) {
   MemPool pool;
   Query::Context qContext(pool, reader);
   std::vector<TermQuery> queries;
@@ -735,6 +757,10 @@ ScoreTopKResult runBulkOrPullDisjunctionTopK(IndexReader& reader,
   auto segments = qContext.topReader.segments();
   for (int32_t segnum = 0; segnum < (int32_t) segments.size(); segnum++) {
     auto& seg = segments[segnum];
+    auto domain = domainArray
+      ? makeModuloArrayDomain(seg.maxDoc(), domainStep)
+      : makeModuloBitsetDomain(seg.maxDoc(), domainStep);
+    DocSet* filter = domain.get();
     if (useBulk) {
       auto* supplier = weight->scorerSupplier(pool, seg);
       if (supplier == nullptr) {
@@ -743,7 +769,7 @@ ScoreTopKResult runBulkOrPullDisjunctionTopK(IndexReader& reader,
       auto* bulk = supplier->bulkScorer(pool);
       if (bulk != nullptr) {
         result.bulkSegments++;
-        collectTopKWindowed(segnum, bulk, nullptr, collector, nullptr, seg.maxDoc());
+        collectTopKWindowed(segnum, bulk, filter, collector, nullptr, seg.maxDoc());
         continue;
       }
       result.bulkFallbackSegments++;
@@ -753,14 +779,14 @@ ScoreTopKResult runBulkOrPullDisjunctionTopK(IndexReader& reader,
         continue;
       }
       scorer->setMinCompetitiveScore(collector.minCompetitiveVal);
-      collectTopK(segnum, scorer, nullptr, nullptr, collector);
+      collectTopK(segnum, scorer, filter, nullptr, collector);
     } else {
       auto* scorer = weight->createScorer(pool, seg);
       if (scorer == nullptr) {
         continue;
       }
       scorer->setMinCompetitiveScore(collector.minCompetitiveVal);
-      collectTopK(segnum, scorer, nullptr, nullptr, collector);
+      collectTopK(segnum, scorer, filter, nullptr, collector);
     }
   }
 
@@ -1341,7 +1367,9 @@ static void BM_FullTextScoreTopKMultiTermFrontier(benchmark::State& state,
 }
 
 static void BM_FullTextScoreTopKBulkDisjunction(benchmark::State& state,
-                                                BulkDisjunctionCorpus corpus, bool useBulk) {
+                                                BulkDisjunctionCorpus corpus, bool useBulk,
+                                                int32_t domainStep,
+                                                bool domainArray) {
   constexpr int32_t topK = 100;
   int64_t nDocs = solux::unit_tests ? 2000 : 1'000'000;
   int32_t numTerms = corpus == BulkDisjunctionCorpus::Dense ? 32 : 5;
@@ -1366,8 +1394,10 @@ static void BM_FullTextScoreTopKBulkDisjunction(benchmark::State& state,
   }
 
   auto reader = helper.getIndexWriter()->getIndexReader();
-  ScoreTopKResult pull = runBulkOrPullDisjunctionTopK(*reader, terms, topK, false);
-  ScoreTopKResult bulk = runBulkOrPullDisjunctionTopK(*reader, terms, topK, true);
+  ScoreTopKResult pull = runBulkOrPullDisjunctionTopK(
+    *reader, terms, topK, false, domainStep, domainArray);
+  ScoreTopKResult bulk = runBulkOrPullDisjunctionTopK(
+    *reader, terms, topK, true, domainStep, domainArray);
   ASSERT_EQ(0, bulk.bulkFallbackSegments);
   ASSERT_GT(bulk.bulkSegments, 0);
   ASSERT_EQ(pull.fp, bulk.fp);
@@ -1379,7 +1409,8 @@ static void BM_FullTextScoreTopKBulkDisjunction(benchmark::State& state,
   int64_t bulkSegments = 0;
   int64_t bulkFallbackSegments = 0;
   for (auto _ : state) {
-    ScoreTopKResult result = runBulkOrPullDisjunctionTopK(*reader, terms, topK, useBulk);
+    ScoreTopKResult result = runBulkOrPullDisjunctionTopK(
+      *reader, terms, topK, useBulk, domainStep, domainArray);
     benchmark::DoNotOptimize(result.fp);
     benchmark::DoNotOptimize(result.visited);
     benchmark::DoNotOptimize(result.bulkSegments);
@@ -1402,6 +1433,8 @@ static void BM_FullTextScoreTopKBulkDisjunction(benchmark::State& state,
   state.counters["visited"] = visited;
   state.counters["bulk"] = useBulk ? 1 : 0;
   state.counters["dense"] = corpus == BulkDisjunctionCorpus::Dense ? 1 : 0;
+  state.counters["domain_step"] = domainStep;
+  state.counters["domain_array"] = domainArray ? 1 : 0;
   state.counters["terms"] = numTerms;
   state.counters["bulk_segments"] = bulkSegments;
   state.counters["bulk_fallback_segments"] = bulkFallbackSegments;
@@ -1566,10 +1599,18 @@ SOLUX_BENCHMARK_CAPTURE(BM_FullTextScoreTopKMultiTermFrontier, multiterm_zipf_t1
 // Pull MaxScoreDisjunctionScorer vs the wired MaxScoreBulkScorer path. The dense
 // many-clause corpus is the pre-BS1 case where most clauses stay essential.
 SOLUX_BENCHMARK_CAPTURE(BM_FullTextScoreTopKBulkDisjunction, bulk_few,
-                        BulkDisjunctionCorpus::Few, true);
+                        BulkDisjunctionCorpus::Few, true, 0, false);
 SOLUX_BENCHMARK_CAPTURE(BM_FullTextScoreTopKBulkDisjunction, pull_few,
-                        BulkDisjunctionCorpus::Few, false);
+                        BulkDisjunctionCorpus::Few, false, 0, false);
 SOLUX_BENCHMARK_CAPTURE(BM_FullTextScoreTopKBulkDisjunction, bulk_dense,
-                        BulkDisjunctionCorpus::Dense, true);
+                        BulkDisjunctionCorpus::Dense, true, 0, false);
 SOLUX_BENCHMARK_CAPTURE(BM_FullTextScoreTopKBulkDisjunction, pull_dense,
-                        BulkDisjunctionCorpus::Dense, false);
+                        BulkDisjunctionCorpus::Dense, false, 0, false);
+SOLUX_BENCHMARK_CAPTURE(BM_FullTextScoreTopKBulkDisjunction, bulk_dense_domain,
+                        BulkDisjunctionCorpus::Dense, true, 16, false);
+SOLUX_BENCHMARK_CAPTURE(BM_FullTextScoreTopKBulkDisjunction, pull_dense_domain,
+                        BulkDisjunctionCorpus::Dense, false, 16, false);
+SOLUX_BENCHMARK_CAPTURE(BM_FullTextScoreTopKBulkDisjunction, bulk_dense_domain_sel,
+                        BulkDisjunctionCorpus::Dense, true, 256, false);
+SOLUX_BENCHMARK_CAPTURE(BM_FullTextScoreTopKBulkDisjunction, bulk_dense_domain_arr,
+                        BulkDisjunctionCorpus::Dense, true, 256, true);

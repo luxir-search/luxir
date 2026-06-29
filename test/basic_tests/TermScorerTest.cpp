@@ -4,6 +4,7 @@
 #include <bit>
 #include <cmath>
 #include <limits>
+#include <memory>
 #include <span>
 #include <string>
 #include <string_view>
@@ -66,6 +67,7 @@ struct DisjunctionTopKRun {
   int64_t visited = 0;
   int64_t nonEssentialLookups = 0;
   int64_t bs1Windows = 0;
+  int64_t domainDriveWindows = 0;
   std::vector<TopDocsCollector::ScoreDoc> topDocs;
 };
 
@@ -79,6 +81,19 @@ struct TermImpactTopKRun {
   int64_t visited = 0;
   int64_t skippedBlocks = 0;
   std::vector<TopDocsCollector::ScoreDoc> topDocs;
+};
+
+struct BulkDomainDriveGuard {
+  bool saved;
+
+  explicit BulkDomainDriveGuard(bool disabled)
+    : saved(BooleanQuery::disableBulkDomainDriveForTests) {
+    BooleanQuery::disableBulkDomainDriveForTests = disabled;
+  }
+
+  ~BulkDomainDriveGuard() {
+    BooleanQuery::disableBulkDomainDriveForTests = saved;
+  }
 };
 
 std::vector<TopDocsCollector::ScoreDoc> sortedCollectorDocs(TopDocsCollector& collector) {
@@ -342,12 +357,23 @@ void addDenseManyClauseDisjunctionDocs(CollectionHelper& helper, int32_t nDocs, 
   helper.indexAll(docs, UpdateMessage::COMMIT);
 }
 
-void setEveryOtherDoc(RAMBitDocSet& filter, int32_t maxDoc) {
+std::unique_ptr<DocSet> makeEveryNthDocSet(int32_t maxDoc, int32_t step, bool arrayDocSet) {
+  if (arrayDocSet) {
+    std::vector<int32_t> docs;
+    docs.reserve((size_t)((maxDoc + step - 1) / step));
+    for (int32_t doc = 0; doc < maxDoc; doc += step) {
+      docs.push_back(doc);
+    }
+    return std::make_unique<ArrDocSet>(std::move(docs));
+  }
+
+  auto filter = std::make_unique<RAMBitDocSet>(maxDoc);
   for (int32_t doc = 0; doc < maxDoc; doc++) {
-    if ((doc & 1) == 0) {
-      filter.mutableBits().set(doc);
+    if ((doc % step) == 0) {
+      filter->mutableBits().set(doc);
     }
   }
+  return filter;
 }
 
 Query::Weight* createDenseDisjunctionWeight(Query::Context& qContext, int32_t numTerms,
@@ -404,7 +430,8 @@ DisjunctionTopKRun runExhaustiveTermDisjunctionTopK(IndexReader& reader,
   return result;
 }
 
-DisjunctionTopKRun runDenseFilteredPullTopK(IndexReader& reader, int32_t numTerms, int32_t topK) {
+DisjunctionTopKRun runDenseFilteredPullTopK(IndexReader& reader, int32_t numTerms, int32_t topK,
+                                            int32_t filterStep = 2, bool arrayDocSet = false) {
   MemPool pool;
   Query::Context qContext(pool, reader);
   std::vector<std::string> terms;
@@ -415,11 +442,10 @@ DisjunctionTopKRun runDenseFilteredPullTopK(IndexReader& reader, int32_t numTerm
 
   auto segments = qContext.topReader.segments();
   for (int32_t segnum = 0; segnum < (int32_t) segments.size(); segnum++) {
-    RAMBitDocSet filter(segments[segnum].maxDoc());
-    setEveryOtherDoc(filter, segments[segnum].maxDoc());
+    auto filter = makeEveryNthDocSet(segments[segnum].maxDoc(), filterStep, arrayDocSet);
     auto* scorer = weight->createScorer(pool, segments[segnum]);
     if (scorer == nullptr) continue;
-    collectTopK(segnum, scorer, &filter, nullptr, collector);
+    collectTopK(segnum, scorer, filter.get(), nullptr, collector);
   }
 
   DisjunctionTopKRun result;
@@ -428,7 +454,8 @@ DisjunctionTopKRun runDenseFilteredPullTopK(IndexReader& reader, int32_t numTerm
   return result;
 }
 
-DisjunctionTopKRun runDenseFilteredBulkTopK(IndexReader& reader, int32_t numTerms, int32_t topK) {
+DisjunctionTopKRun runDenseFilteredBulkTopK(IndexReader& reader, int32_t numTerms, int32_t topK,
+                                            int32_t filterStep = 2, bool arrayDocSet = false) {
   MemPool pool;
   Query::Context qContext(pool, reader);
   std::vector<std::string> terms;
@@ -440,8 +467,7 @@ DisjunctionTopKRun runDenseFilteredBulkTopK(IndexReader& reader, int32_t numTerm
 
   auto segments = qContext.topReader.segments();
   for (int32_t segnum = 0; segnum < (int32_t) segments.size(); segnum++) {
-    RAMBitDocSet filter(segments[segnum].maxDoc());
-    setEveryOtherDoc(filter, segments[segnum].maxDoc());
+    auto filter = makeEveryNthDocSet(segments[segnum].maxDoc(), filterStep, arrayDocSet);
     auto* supplier = weight->scorerSupplier(pool, segments[segnum]);
     if (supplier == nullptr) continue;
     auto* bulk = supplier->bulkScorer(pool);
@@ -455,8 +481,10 @@ DisjunctionTopKRun runDenseFilteredBulkTopK(IndexReader& reader, int32_t numTerm
       continue;
     }
     int64_t beforeBs1Windows = maxScoreBulk->bs1WindowCount();
-    collectTopKWindowed(segnum, bulk, &filter, collector, nullptr, segments[segnum].maxDoc());
+    int64_t beforeDomainDriveWindows = maxScoreBulk->domainDriveWindowCount();
+    collectTopKWindowed(segnum, bulk, filter.get(), collector, nullptr, segments[segnum].maxDoc());
     result.bs1Windows += maxScoreBulk->bs1WindowCount() - beforeBs1Windows;
+    result.domainDriveWindows += maxScoreBulk->domainDriveWindowCount() - beforeDomainDriveWindows;
   }
 
   result.visited = collector.totalHits();
@@ -1769,9 +1797,35 @@ TEST_F(TermScorerTest, MaxScoreBulkScorerBs1BitsetFilterMatchesPull) {
   auto reader = helper.getIndexWriter()->getIndexReader();
 
   auto pull = runDenseFilteredPullTopK(*reader, numTerms, topK);
+  BulkDomainDriveGuard guard(true);
   auto bulk = runDenseFilteredBulkTopK(*reader, numTerms, topK);
   ASSERT_GT(bulk.bs1Windows, 0);
   assertSameTopKDocsExact(pull, bulk, topK);
+  helper.clear();
+}
+
+TEST_F(TermScorerTest, MaxScoreBulkScorerSelectiveDomainDriveMatchesStream) {
+  CollectionHelper helper("main");
+  const int32_t numTerms = 32;
+  const int32_t nDocs = 3 * DocsEnum::L1_DOCS + 37;
+  const int32_t topK = 50;
+  const int32_t filterStep = 512;
+  addDenseManyClauseDisjunctionDocs(helper, nDocs, numTerms);
+  auto reader = helper.getIndexWriter()->getIndexReader();
+
+  for (bool arrayDocSet : {false, true}) {
+    auto pull = runDenseFilteredPullTopK(*reader, numTerms, topK, filterStep, arrayDocSet);
+    DisjunctionTopKRun stream;
+    {
+      BulkDomainDriveGuard guard(true);
+      stream = runDenseFilteredBulkTopK(*reader, numTerms, topK, filterStep, arrayDocSet);
+    }
+    auto drive = runDenseFilteredBulkTopK(*reader, numTerms, topK, filterStep, arrayDocSet);
+
+    ASSERT_GT(drive.domainDriveWindows, 1) << "arrayDocSet=" << arrayDocSet;
+    assertSameTopKDocsExact(stream, drive, topK);
+    assertSameTopKDocsExact(pull, drive, topK);
+  }
   helper.clear();
 }
 

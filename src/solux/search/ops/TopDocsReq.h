@@ -290,11 +290,17 @@ public:
             }
           }
           DocSetBuilder* builderPtr = builder.has_value() ? &*builder : nullptr;
+          bool sourcePreparedAgainstFilter =
+            preparedMode && preparedWeight != nullptr && filter == domain;
+          DocSet* collectorFilter =
+            sourcePreparedAgainstFilter && preparedWeight->outputIsSubsetOfDomain()
+              ? nullptr
+              : filter;
           if (data->useFieldSort) {
             auto* scorer = supplier->get(poolGuard.pool(), std::numeric_limits<int64_t>::max());
             if (scorer != nullptr) {
               data->fieldCollector->setSegment(segnum, &seg.postingsReader());
-              collectTopK(segnum, scorer, filter, builderPtr, *data->fieldCollector);
+              collectTopK(segnum, scorer, collectorFilter, builderPtr, *data->fieldCollector);
             }
           } else {
             // get_number requests an exact total hit count, which is incompatible with
@@ -305,12 +311,12 @@ public:
               bulk = supplier->bulkScorer(poolGuard.pool());
             }
             if (bulk != nullptr) {
-              collectTopKWindowed(segnum, bulk, filter, *data->scoreCollector,
+              collectTopKWindowed(segnum, bulk, collectorFilter, *data->scoreCollector,
                                   &scoreAccumulator, seg.maxDoc());
             } else {
               auto* scorer = supplier->get(poolGuard.pool(), std::numeric_limits<int64_t>::max());
               if (scorer != nullptr) {
-                collectTopK(segnum, scorer, filter, builderPtr, *data->scoreCollector,
+                collectTopK(segnum, scorer, collectorFilter, builderPtr, *data->scoreCollector,
                             allowPruning, &scoreAccumulator);
               }
             }
