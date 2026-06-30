@@ -22,6 +22,10 @@ class BooleanQuery final : public solux::Query {
 
 public:
   static inline bool disableBulkDomainDriveForTests = false;
+  // A/B toggle: force the conjunction onto the eager single-phase path (each
+  // clause verifies inside its own advance) instead of two-phase (defer matches
+  // until the approximations agree). For benchmarking the two-phase win only.
+  static inline bool disableTwoPhaseForTests = false;
 
   BooleanQuery(std::span<Query*> mandatory, std::span<Query*> optional, std::span<Query*> prohibited,
                std::span<Query*> filter, int minShouldMatch = 0)
@@ -571,35 +575,65 @@ public:
 
 
   class ConjunctionScorer final : public Query::Scorer {
-    std::span<Scorer*> scorers;    // subset of allScorers that contributes to score()
-    std::span<Scorer*> allScorers; // every required iterator, ascending cost (lead first)
+    struct ApproxSlot {
+      Query::Scorer* scorer = nullptr;
+      bool twoPhase = false;
 
-    // TODO: OPT: heapifying with virtual methods prob isn't a good idea... pull out and save the docid.
-    constexpr static auto idComparator = [](Query::Scorer& a, Query::Scorer& b) { return b.docId() < a.docId(); };
+      int32_t next() const {
+        return twoPhase ? scorer->approximationNext() : scorer->next();
+      }
 
-    // with a ton of clauses, a maxHeap could help with quickly finding the largest number to skip to.
+      int32_t advance(int32_t target) const {
+        return twoPhase ? scorer->approximationAdvance(target) : scorer->advance(target);
+      }
+
+      int32_t docId() const {
+        return twoPhase ? scorer->approximationDocId() : scorer->docId();
+      }
+    };
+
+    struct VerifierSlot {
+      Query::Scorer* scorer = nullptr;
+      size_t approxIndex = 0;
+      float matchCost = 0.0f;
+    };
+
+    std::span<Query::Scorer*> scorers; // subset of required clauses that contributes to score()
+    std::span<ApproxSlot> approximations; // every required clause, ascending cost (lead first)
+    std::span<VerifierSlot> verifiers; // two-phase clauses sorted by matchCost
 
     int32_t docid = -1;
 
 
-    // internal utility method where first scorer has already been advanced and is equal to the target.
+    // internal utility method where first approximation has already been advanced to target.
     int32_t doNext(int32_t target) {
-      auto* firstScorer = allScorers[0];
+      ApproxSlot& first = approximations[0];
 
       outer:
       for (;;) {
-        for (int j = 1; j < allScorers.size(); j++) {
+        if (target == solux::PostingsReader::END) {
+          docid = target;
+          return docid;
+        }
+        for (int j = 1; j < (int) approximations.size(); j++) {
           // advance() is strict; skip sub-scorers already on target.
-          if (allScorers[j]->docId() < target) {
-            int32_t id = allScorers[j]->advance(target);
+          if (approximations[(size_t) j].docId() < target) {
+            int32_t id = approximations[(size_t) j].advance(target);
             assert(id >= target);
             if (id > target) {
-              target = firstScorer->advance(id);
+              target = first.advance(id);
               goto outer;  // could perhaps replace with "j=0; continue;" but that seems potentially worse?
             }
           }
         }
-        // if we made it through the loop, all scorers matched (maybe at END)
+        // if we made it through the loop, all approximations matched.
+        for (auto& verifier : verifiers) {
+          if (!verifier.scorer->matches()) {
+            int32_t id = approximations[verifier.approxIndex].next();
+            target = verifier.approxIndex == 0 ? id : first.advance(id);
+            goto outer;
+          }
+        }
         docid = target;
         return docid;
       }
@@ -613,18 +647,38 @@ public:
     // iterate but do not score); every entry must also appear in allScorers.
     // TODO: if any scoring scorer is boosted to 0 it could be dropped from the
     // scoring subset while staying in allScorers.
-    ConjunctionScorer(solux::MemPool& pool, std::span<Scorer*> allScorers, std::span<Scorer*> scoringScorers)
-            : scorers(scoringScorers), allScorers(allScorers) {
-      unused(pool);
+    ConjunctionScorer(solux::MemPool& pool, std::span<Query::Scorer*> allScorers,
+                      std::span<Query::Scorer*> scoringScorers)
+            : scorers(scoringScorers),
+              approximations(pool.make_arr<ApproxSlot>(allScorers.size()), allScorers.size()) {
+      size_t verifierCount = 0;
+      for (size_t i = 0; i < allScorers.size(); i++) {
+        bool twoPhase = !disableTwoPhaseForTests && allScorers[i]->hasTwoPhase();
+        approximations[i] = {allScorers[i], twoPhase};
+        if (twoPhase) verifierCount++;
+      }
+      verifiers = {pool.make_arr<VerifierSlot>(verifierCount), verifierCount};
+      size_t verifierIndex = 0;
+      for (size_t i = 0; i < allScorers.size(); i++) {
+        if (!approximations[i].twoPhase) {
+          continue;
+        }
+        auto* scorer = approximations[i].scorer;
+        verifiers[verifierIndex++] = {scorer, i, scorer->matchCost()};
+      }
+      std::sort(verifiers.begin(), verifiers.end(),
+                [](const VerifierSlot& a, const VerifierSlot& b) {
+                  return a.matchCost < b.matchCost;
+                });
     }
 
     int32_t next() override {
       assert(docid != solux::PostingsReader::END);
-      return doNext(allScorers[0]->next());
+      return doNext(approximations[0].next());
     }
 
     int32_t advance(int32_t docid) override {
-      return doNext(allScorers[0]->advance(docid));
+      return doNext(approximations[0].advance(docid));
     }
 
     /// doc we are positioned on

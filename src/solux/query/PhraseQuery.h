@@ -1,5 +1,6 @@
 #pragma once
 
+#include <algorithm>
 #include <optional>
 
 #include "Query.h"
@@ -147,6 +148,12 @@ public:
     int32_t pos = -1;    // position of last match, or END if no more matches.
     int32_t freq = 0;
     int32_t largestPossiblePos;   // largest possible position for a match
+    int32_t checkedDocid = -1;
+    bool checkedMatch = false;
+    float matchCostEstimate = 0.0f;
+#ifndef NDEBUG
+    int32_t protocol = 0;
+#endif
 
 
     // internal utility method where first scorer has already been advanced and is equal to the target.
@@ -213,11 +220,56 @@ public:
       // unreachable
     }
 
+    int32_t doApproximationNext() {
+      return doNext(docsEnums[0]->next());
+    }
+
+    int32_t doApproximationAdvance(int32_t target) {
+      return doNext(docsEnums[0]->advance(target));
+    }
+
+    bool doMatches() {
+      if (docid == checkedDocid) {
+        return checkedMatch;
+      }
+      checkedDocid = docid;
+      checkedMatch = false;
+      freq = 0;
+      if (docid == PostingsReader::END) {
+        pos = PostingsReader::END;
+        return false;
+      }
+      if (countMatchesForTests) {
+        matchCallsForTests++;
+      }
+      for (auto* docsEnum: docsEnums) {
+        docsEnum->startPositions();
+      }
+      checkedMatch = doNextPosition(docsEnums[0]->advancePosition(positions[0]) - positions[0]) != PostingsReader::END;
+      return checkedMatch;
+    }
+
+#ifndef NDEBUG
+    void markSinglePhase() {
+      assert(protocol != 2);
+      protocol = 1;
+    }
+
+    void markTwoPhase() {
+      assert(protocol != 1);
+      protocol = 2;
+    }
+#endif
+
 
   public:
+    static inline bool countMatchesForTests = false;
+    static inline int64_t matchCallsForTests = 0;
+
     Scorer(MemPool& targetPool, std::span<DocsEnum*> docsEnums, std::span<const int32_t> positions, NormsReader* normsReader,
            Similarity::BM25Scorer* simScorer)
             : docsEnums(docsEnums), positions(positions), simScorer(simScorer) {
+      unused(targetPool);
       // Scoring needs both BM25 and norms, or neither.
       assert((simScorer == nullptr) == (normsReader == nullptr));
       if (normsReader != nullptr) normsIter.emplace(*normsReader);
@@ -226,28 +278,77 @@ public:
         maxOff = std::max(maxOff, pos);
       }
       largestPossiblePos = PostingsReader::END - 1 - maxOff;
+      for (auto* docsEnum : docsEnums) {
+        int32_t numDocs = docsEnum->numDocs();
+        if (numDocs > 0) {
+          matchCostEstimate += (float) docsEnum->totalTermFreq() / (float) numDocs;
+        } else {
+          matchCostEstimate += 1.0f;
+        }
+      }
     }
 
     int32_t nextApprox() {
-      return doNext(docsEnums[0]->next());
+#ifndef NDEBUG
+      markTwoPhase();
+#endif
+      return doApproximationNext();
     }
 
     int32_t advanceApprox(int32_t docid) {
-      return doNext(docsEnums[0]->advance(docid));
+#ifndef NDEBUG
+      markTwoPhase();
+#endif
+      return doApproximationAdvance(docid);
     }
 
     bool confirmMatch() {
-      freq = 0;
-      for (auto* docsEnum: docsEnums) {
-        docsEnum->startPositions();
-      }
-      return doNextPosition(docsEnums[0]->advancePosition(positions[0]) - positions[0]) != PostingsReader::END;
+#ifndef NDEBUG
+      markTwoPhase();
+#endif
+      return doMatches();
+    }
+
+    bool hasTwoPhase() const override {
+      return true;
+    }
+
+    int32_t approximationNext() override {
+#ifndef NDEBUG
+      markTwoPhase();
+#endif
+      return doApproximationNext();
+    }
+
+    int32_t approximationAdvance(int32_t target) override {
+#ifndef NDEBUG
+      markTwoPhase();
+#endif
+      return doApproximationAdvance(target);
+    }
+
+    int32_t approximationDocId() override {
+      return docid;
+    }
+
+    bool matches() override {
+#ifndef NDEBUG
+      markTwoPhase();
+#endif
+      return doMatches();
+    }
+
+    float matchCost() override {
+      return matchCostEstimate;
     }
 
     int32_t next() override {
+#ifndef NDEBUG
+      markSinglePhase();
+#endif
       while (docid < PostingsReader::END) {
-        nextApprox();
-        if (confirmMatch()) {
+        doApproximationNext();
+        if (doMatches()) {
           return docid;
         }
       }
@@ -257,16 +358,19 @@ public:
     int32_t advance(int32_t target) override {
       // confirmMatch() consumes positions, so strict advance must not recheck the
       // current doc.
+#ifndef NDEBUG
+      markSinglePhase();
+#endif
       assert(docid < target);
-      advanceApprox(target);
+      doApproximationAdvance(target);
       for (;;) {
         if (docid == PostingsReader::END) {
           return PostingsReader::END;
         }
-        if (confirmMatch()) {
+        if (doMatches()) {
           return docid;
         }
-        nextApprox();
+        doApproximationNext();
       }
     }
 

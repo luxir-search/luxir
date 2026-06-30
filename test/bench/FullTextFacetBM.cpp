@@ -15,6 +15,7 @@
 #include "test/CollectionHelper.h"
 #include "test/LocalReq.h"
 #include "solux/query/BooleanQuery.h"
+#include "solux/query/PhraseQuery.h"
 #include "solux/query/TermQuery.h"
 #include "solux/search/Collector.h"
 
@@ -799,6 +800,86 @@ ScoreTopKResult runBulkOrPullDisjunctionTopK(IndexReader& reader,
   return result;
 }
 
+bool phraseFilterBenchAdjacent(int64_t doc, int32_t filterStep, int32_t adjacencyStep) {
+  int64_t block = doc / filterStep;
+  int32_t local = (int32_t)(doc % filterStep);
+  int32_t adjacentResidue = (block % adjacencyStep) == 0 ? 0 : adjacencyStep - 1;
+  return (local % adjacencyStep) == adjacentResidue;
+}
+
+void buildPhraseFilterBenchIndex(CollectionHelper& helper, int64_t nDocs,
+                                 int32_t filterStep, int32_t adjacencyStep) {
+  helper.clear();
+  auto iw = helper.getIndexWriter();
+  Inverter& inverter = iw->obtainInverter();
+  Inverter::IndexHandler& hId = inverter.getIndexHandler("id");
+  Inverter::IndexHandler& hBody = inverter.getIndexHandler("body_w");
+
+  std::string body;
+  for (int64_t doc = 0; doc < nDocs; doc++) {
+    body.clear();
+    appendTerm(body, "alpha", 1);
+    if (!phraseFilterBenchAdjacent(doc, filterStep, adjacencyStep)) {
+      appendTerm(body, "gap", 1);
+    }
+    appendTerm(body, "beta", 1);
+    appendTerm(body, "filler", 8 + (int32_t)(doc % 7));
+    if ((doc % filterStep) == 0) {
+      appendTerm(body, "needle", 1);
+    }
+
+    inverter.startDoc();
+    hId.index(inverter, std::to_string(doc));
+    hBody.index(inverter, body);
+    inverter.finishDoc();
+  }
+
+  iw->releaseInverter(inverter, true);
+  helper.commit();
+}
+
+ScoreTopKResult runPhraseFilterConjunctionTopK(IndexReader& reader, int32_t topK) {
+  MemPool pool;
+  Query::Context qContext(pool, reader);
+  std::vector<std::string_view> terms = {"alpha", "beta"};
+  std::vector<int32_t> positions = {0, 1};
+  PhraseQuery phrase("body_w", terms, positions);
+  TermQuery filterTerm("body_w", "needle");
+  std::vector<Query*> mandatory = {&phrase};
+  std::vector<Query*> filter = {&filterTerm};
+  BooleanQuery query(mandatory, {}, {}, filter);
+  auto* weight = query.createWeight(qContext, Query::NEED_SCORES);
+  TopDocsCollector collector(topK);
+
+  auto segments = qContext.topReader.segments();
+  for (int32_t segnum = 0; segnum < (int32_t) segments.size(); segnum++) {
+    auto* scorer = weight->createScorer(pool, segments[segnum]);
+    if (scorer == nullptr) {
+      continue;
+    }
+    scorer->setMinCompetitiveScore(collector.minCompetitiveVal);
+    collectTopK(segnum, scorer, nullptr, nullptr, collector);
+  }
+
+  ScoreTopKResult result;
+  result.visited = collector.totalHits();
+  auto topDocs = collector.sort();
+  result.topDocs.assign(topDocs.begin(), topDocs.end());
+  sortScoreDocs(result.topDocs);
+  result.fp = scoreTopKFingerprint(result.topDocs);
+  return result;
+}
+
+ScoreTopKResult runPhraseFilterConjunctionTopKCounted(IndexReader& reader, int32_t topK,
+                                                       int64_t& matchCalls) {
+  PhraseQuery::Scorer::matchCallsForTests = 0;
+  PhraseQuery::Scorer::countMatchesForTests = true;
+  ScoreTopKResult result = runPhraseFilterConjunctionTopK(reader, topK);
+  matchCalls = PhraseQuery::Scorer::matchCallsForTests;
+  PhraseQuery::Scorer::countMatchesForTests = false;
+  return result;
+}
+
 }  // namespace
 
 namespace solux {
@@ -1440,6 +1521,91 @@ static void BM_FullTextScoreTopKBulkDisjunction(benchmark::State& state,
   state.counters["RSS_max"] = mem.second / 1024;
 }
 
+// Opaque (noinline) read of run()'s returned fingerprint. A tight -O2 loop on
+// this toolchain can misread the NRVO'd struct member when nothing else touches
+// it between the return and the read; an out-of-line read returns the real
+// value. The engine is correct -- this only hardens the bench's determinism guard.
+SOLUX_NOINLINE static int64_t observeResultFp(const ScoreTopKResult& r) {
+  return r.fp;
+}
+
+static void BM_FullTextScoreTopKPhraseFilterConjunction(benchmark::State& state, bool twoPhase) {
+  constexpr int32_t topK = 100;
+  constexpr int32_t filterStep = 64;
+  constexpr int32_t adjacencyStep = 8;
+  int64_t nDocs = solux::unit_tests ? 2000 : 1'000'000;
+  std::vector<int32_t> docsPerSeg = {(int32_t) nDocs};
+
+  CollectionHelper helper;
+  static int64_t builtDocs = 0;
+  static int32_t builtFilterStep = 0;
+  static int32_t builtAdjacencyStep = 0;
+  bool reuseIndex = builtDocs == nDocs
+    && builtFilterStep == filterStep
+    && builtAdjacencyStep == adjacencyStep
+    && helper.indexMatchesShape(docsPerSeg);
+  if (!reuseIndex) {
+    buildPhraseFilterBenchIndex(helper, nDocs, filterStep, adjacencyStep);
+    builtDocs = nDocs;
+    builtFilterStep = filterStep;
+    builtAdjacencyStep = adjacencyStep;
+  }
+
+  auto reader = helper.getIndexWriter()->getIndexReader();
+
+  // Two-phase only changes WHEN positions are verified, not the match set, so it
+  // must be byte-identical to the eager path. Verify that once, outside timing.
+  int64_t tpGuardMatchCalls = 0;
+  int64_t eagerGuardMatchCalls = 0;
+  BooleanQuery::disableTwoPhaseForTests = false;
+  ScoreTopKResult tpGuard = runPhraseFilterConjunctionTopKCounted(
+    *reader, topK, tpGuardMatchCalls);
+  BooleanQuery::disableTwoPhaseForTests = true;
+  ScoreTopKResult eagerGuard = runPhraseFilterConjunctionTopKCounted(
+    *reader, topK, eagerGuardMatchCalls);
+  ASSERT_EQ(tpGuard.fp, eagerGuard.fp);
+  ASSERT_GT(tpGuard.visited, 0);
+  ASSERT_GT(eagerGuardMatchCalls, tpGuardMatchCalls);
+
+  // Select the mode under test for the timed loop.
+  BooleanQuery::disableTwoPhaseForTests = !twoPhase;
+  int64_t guardFp = twoPhase ? tpGuard.fp : eagerGuard.fp;
+
+  // Verify-count comes from the guard (measured once, outside timing). The timed
+  // loop must NOT count: countMatchesForTests gates an increment in doMatches(),
+  // and eager calls matches() ~7x more often, so counting inside the loop would
+  // charge eager that per-call overhead and inflate the measured timing win.
+  int64_t matchCalls = twoPhase ? tpGuardMatchCalls : eagerGuardMatchCalls;
+
+  RSSWatcher watcher;
+  int64_t fp = -1;
+  for (auto _ : state) {
+    ScoreTopKResult result = runPhraseFilterConjunctionTopK(*reader, topK);
+    // result.fp must be read through observeResultFp(): a tight -O2 loop on this
+    // toolchain misreads NRVO'd struct members read directly (result.visited read
+    // directly comes back garbage), so visited is taken from the guard, not here.
+    int64_t resultFp = observeResultFp(result);
+    ASSERT_EQ(guardFp, resultFp);
+    fp = resultFp;
+  }
+
+  state.counters["twophase"] = twoPhase ? 1 : 0;
+  state.counters["fp"] = fp;
+  state.counters["visited"] = tpGuard.visited;
+  state.counters["match_calls"] = matchCalls;
+  state.counters["guard_tp_match_calls"] = tpGuardMatchCalls;
+  state.counters["guard_eager_match_calls"] = eagerGuardMatchCalls;
+  state.counters["filter_step"] = filterStep;
+  state.counters["adjacency_step"] = adjacencyStep;
+  state.counters["guard_visited"] = tpGuard.visited;
+  state.counters["reused"] = reuseIndex;
+  state.counters["rate"] = benchmark::Counter(state.iterations(), benchmark::Counter::kIsRate);
+  auto mem = watcher.getDeltaKB();
+  state.counters["RSS_delta"] = mem.first / 1024;
+  state.counters["RSS_max"] = mem.second / 1024;
+  BooleanQuery::disableTwoPhaseForTests = false;  // restore default for other benches
+}
+
 static void BM_FullTextScoreTopKFrontierBounds(benchmark::State& state,
                                                FrontierCorpus corpus,
                                                FrontierBoundMode mode) {
@@ -1607,3 +1773,9 @@ SOLUX_BENCHMARK_CAPTURE(BM_FullTextScoreTopKBulkDisjunction, bulk_dense_domain_s
                         BulkDisjunctionCorpus::Dense, true, 256, false);
 SOLUX_BENCHMARK_CAPTURE(BM_FullTextScoreTopKBulkDisjunction, bulk_dense_domain_arr,
                         BulkDisjunctionCorpus::Dense, true, 256, true);
+
+// Phrase approximation conjoined with a selective filter term. The filter leads
+// the required conjunction, so two-phase phrase verification should only run on
+// docs that survive approximation agreement.
+SOLUX_BENCHMARK_CAPTURE(BM_FullTextScoreTopKPhraseFilterConjunction, twophase, true);
+SOLUX_BENCHMARK_CAPTURE(BM_FullTextScoreTopKPhraseFilterConjunction, eager,    false);

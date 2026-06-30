@@ -96,11 +96,114 @@ struct BulkDomainDriveGuard {
   }
 };
 
+struct PhraseMatchCountGuard {
+  bool savedEnabled;
+  int64_t savedCalls;
+
+  explicit PhraseMatchCountGuard(bool enabled)
+    : savedEnabled(PhraseQuery::Scorer::countMatchesForTests),
+      savedCalls(PhraseQuery::Scorer::matchCallsForTests) {
+    PhraseQuery::Scorer::matchCallsForTests = 0;
+    PhraseQuery::Scorer::countMatchesForTests = enabled;
+  }
+
+  ~PhraseMatchCountGuard() {
+    PhraseQuery::Scorer::countMatchesForTests = savedEnabled;
+    PhraseQuery::Scorer::matchCallsForTests = savedCalls;
+  }
+
+  int64_t calls() const {
+    return PhraseQuery::Scorer::matchCallsForTests;
+  }
+};
+
+struct PhraseFilterTopKRun {
+  int64_t visited = 0;
+  int64_t matchCalls = 0;
+  std::vector<TopDocsCollector::ScoreDoc> topDocs;
+};
+
 std::vector<TopDocsCollector::ScoreDoc> sortedCollectorDocs(TopDocsCollector& collector) {
   auto docs = collector.sort();
   std::vector<TopDocsCollector::ScoreDoc> out(docs.begin(), docs.end());
   std::sort(out.begin(), out.end(), TopDocsCollector::scoreAndDocComp);
   return out;
+}
+
+void addPhraseDeferralDocs(CollectionHelper& helper, int32_t nDocs, int32_t filterStep) {
+  helper.clear();
+  std::vector<Doc> docs;
+  docs.reserve((size_t) nDocs);
+  for (int32_t doc = 0; doc < nDocs; doc++) {
+    std::string body = "alpha beta filler";
+    if ((doc % filterStep) == 0) {
+      body += " needle";
+    }
+    docs.push_back(flatdoc("id", "p" + std::to_string(doc), "body_w", body));
+  }
+  helper.indexAll(docs, UpdateMessage::COMMIT);
+}
+
+int64_t countStandalonePhraseMatchChecks(IndexReader& reader) {
+  PhraseMatchCountGuard guard(true);
+  MemPool pool;
+  Query::Context qContext(pool, reader);
+  std::vector<std::string_view> terms = {"alpha", "beta"};
+  std::vector<int32_t> positions = {0, 1};
+  PhraseQuery phrase("body_w", terms, positions);
+  auto* weight = phrase.createWeight(qContext, 0);
+
+  auto segments = qContext.topReader.segments();
+  for (int32_t segnum = 0; segnum < (int32_t) segments.size(); segnum++) {
+    auto* scorer = weight->createScorer(pool, segments[segnum]);
+    if (scorer == nullptr) {
+      continue;
+    }
+    while (scorer->next() != PostingsReader::END) {}
+  }
+  return guard.calls();
+}
+
+PhraseFilterTopKRun runPhraseFilterConjunctionTopK(IndexReader& reader, int32_t topK,
+                                                   bool countMatches) {
+  PhraseMatchCountGuard guard(countMatches);
+  MemPool pool;
+  Query::Context qContext(pool, reader);
+  std::vector<std::string_view> terms = {"alpha", "beta"};
+  std::vector<int32_t> positions = {0, 1};
+  PhraseQuery phrase("body_w", terms, positions);
+  TermQuery filterTerm("body_w", "needle");
+  std::vector<Query*> mandatory = {&phrase};
+  std::vector<Query*> filter = {&filterTerm};
+  BooleanQuery query(mandatory, {}, {}, filter);
+  auto* weight = query.createWeight(qContext, Query::NEED_SCORES);
+  TopDocsCollector collector(topK);
+
+  auto segments = qContext.topReader.segments();
+  for (int32_t segnum = 0; segnum < (int32_t) segments.size(); segnum++) {
+    auto* scorer = weight->createScorer(pool, segments[segnum]);
+    if (scorer == nullptr) {
+      continue;
+    }
+    scorer->setMinCompetitiveScore(collector.minCompetitiveVal);
+    collectTopK(segnum, scorer, nullptr, nullptr, collector);
+  }
+
+  PhraseFilterTopKRun result;
+  result.visited = collector.totalHits();
+  result.matchCalls = guard.calls();
+  result.topDocs = sortedCollectorDocs(collector);
+  return result;
+}
+
+void assertSameTopKExact(const PhraseFilterTopKRun& expected,
+                         const PhraseFilterTopKRun& actual) {
+  ASSERT_EQ(expected.topDocs.size(), actual.topDocs.size());
+  for (size_t i = 0; i < expected.topDocs.size(); i++) {
+    EXPECT_EQ(expected.topDocs[i].doc, actual.topDocs[i].doc);
+    EXPECT_EQ(std::bit_cast<uint32_t>(expected.topDocs[i].score),
+              std::bit_cast<uint32_t>(actual.topDocs[i].score));
+  }
 }
 
 void appendRepeatedTerm(std::string& body, std::string_view term, int32_t count) {
@@ -1345,6 +1448,30 @@ TEST_F(TermScorerTest, boolScore) {
     }
 
   }
+}
+
+TEST_F(TermScorerTest, phraseConjunctionDefersPositionChecks) {
+  constexpr int32_t nDocs = 512;
+  constexpr int32_t filterStep = 64;
+  constexpr int32_t topK = 100;
+  CollectionHelper helper("main");
+  addPhraseDeferralDocs(helper, nDocs, filterStep);
+  auto reader = helper.getIndexWriter()->getIndexReader();
+
+  int64_t rawPhraseChecks = countStandalonePhraseMatchChecks(*reader);
+  EXPECT_EQ(nDocs, rawPhraseChecks);
+
+  PhraseFilterTopKRun baseline = runPhraseFilterConjunctionTopK(*reader, topK, false);
+  PhraseFilterTopKRun measured = runPhraseFilterConjunctionTopK(*reader, topK, true);
+
+  int64_t expectedMatches = (nDocs + filterStep - 1) / filterStep;
+  EXPECT_EQ(expectedMatches, baseline.visited);
+  EXPECT_EQ(expectedMatches, measured.visited);
+  EXPECT_EQ(expectedMatches, measured.matchCalls);
+  EXPECT_LT(measured.matchCalls * 4, rawPhraseChecks);
+  assertSameTopKExact(baseline, measured);
+
+  helper.clear();
 }
 
 

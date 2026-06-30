@@ -487,6 +487,31 @@ public:
     }
     /// doc we are positioned on
     virtual int32_t docId() = 0;
+    /// Two-phase iteration contract: a consumer picks one protocol for a
+    /// scorer lifetime. If hasTwoPhase() is true, consumers that opt in drive
+    /// approximation*()+matches() only and never call next()/advance() on that
+    /// scorer. matches() confirms the current approximation doc and leaves
+    /// score state ready; it must be idempotent for the current doc, or the
+    /// consumer must call it at most once per approximation doc. score() is only
+    /// valid after a successful match.
+    virtual bool hasTwoPhase() const {
+      return false;
+    }
+    virtual int32_t approximationNext() {
+      return next();
+    }
+    virtual int32_t approximationAdvance(int32_t target) {
+      return advance(target);
+    }
+    virtual int32_t approximationDocId() {
+      return docId();
+    }
+    virtual bool matches() {
+      return true;
+    }
+    virtual float matchCost() {
+      return 0.0f;
+    }
     /// term frequency for current doc
     virtual float score() = 0;
     /// Fill docs/scores from the current positioned doc while docid < upTo.
