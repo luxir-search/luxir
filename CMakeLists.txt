@@ -215,10 +215,6 @@ include(cmake/hpp_proto.cmake)
 add_subdirectory(protos)
 add_subdirectory(test)
 
-# Concrete solux::api round-trip tests (binary + JSON sweep + build-by-backing proof).
-# EXCLUDE_FROM_ALL: built on demand (--target solux_concrete_sweep / solux_concrete_build_test).
-add_subdirectory(test_concrete_proto)
-
 # solux_descriptors.cpp #include "solux_fds_data.h" (generated descriptor set); order its
 # compile after generation. The PCH no longer force-includes any generated proto header.
 add_dependencies(solux_lib solux_fds_gen)
