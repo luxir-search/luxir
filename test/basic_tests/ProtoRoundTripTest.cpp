@@ -35,6 +35,7 @@
 
 #include <glaze/glaze.hpp>
 
+#include "solux/api/padded_input.h"
 #include "solux/api/solux_types.hpp"
 #include "solux/api/solux.hpp"
 #include "solux/api/build.h"
@@ -193,12 +194,13 @@ void runOne(const char* nm, std::size_t arm, bool nonEmpty, Setup&& setup) {
   // message would serialize to "{}" and the fixpoint would hold trivially. A populated message
   // (or a non-monostate oneof arm) must produce more than an empty object.
   if (nonEmpty) EXPECT_GT(canon.size(), 2u) << nm << " arm" << arm << " filled to empty JSON";
-  {  // binary: encode -> decode (exact bounds, as the engine does) -> write_json == canon
+  {  // binary: encode -> decode (payload span with padded backing) -> write_json == canon
     std::vector<std::byte> w;
     ASSERT_TRUE(encode(in, w)) << nm << " arm" << arm << " encode";
     std::pmr::monotonic_buffer_resource a;
     M out{};
-    ASSERT_TRUE(decode(out, std::span<const std::byte>(w), a)) << nm << " arm" << arm << " decode";
+    auto padded = P::copyToPaddedInput(std::span<const std::byte>(w), a);
+    ASSERT_TRUE(decode(out, padded, a)) << nm << " arm" << arm << " decode";
     std::string j;
     ASSERT_TRUE(write_json(out, j)) << nm << " arm" << arm << " write_json(bin out)";
     EXPECT_EQ(canon, j) << nm << " arm" << arm << " BINARY round-trip mismatch";
@@ -357,14 +359,15 @@ TEST(ProtoRoundTrip, BuildByBacking) {
     P::SearchResponse resp = buildResponse(mr);
     verifyResponse(resp);
   }
-  {  // binary round-trip (exact bounds, as the engine decodes)
+  {  // binary round-trip (payload span with padded backing)
     std::pmr::monotonic_buffer_resource mr;
     P::SearchResponse resp = buildResponse(mr);
     std::vector<std::byte> wire;
     ASSERT_TRUE(encode(resp, wire));
     std::pmr::monotonic_buffer_resource arena;
     P::SearchResponse out{};
-    ASSERT_TRUE(decode(out, std::span<const std::byte>(wire), arena));
+    auto padded = P::copyToPaddedInput(std::span<const std::byte>(wire), arena);
+    ASSERT_TRUE(decode(out, padded, arena));
     verifyResponse(out);
   }
   {  // json round-trip

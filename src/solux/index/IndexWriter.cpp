@@ -6,6 +6,7 @@
 #include <boost/sort/spreadsort/string_sort.hpp>
 #include <boost/unordered/unordered_flat_set.hpp>
 #include <oneapi/tbb/task_group.h>
+#include "solux/api/padded_input.h"
 #include "solux/store/OutputStream.h"
 #include "solux/store/InputStream.h"
 #include "LiveDocsWriter.h"
@@ -76,7 +77,8 @@ IndexWriter::IndexWriter(Directory& dir, std::function<std::shared_ptr<Schema>()
     std::pmr::monotonic_buffer_resource iiArena;  // backs the non-owning IndexInfo view
     solux::api::IndexInfo indexInfo;
     std::span<const std::byte> indexInfoBytes((const std::byte*)segmentsIs.ptr(), segmentsIs.left());
-    if (!solux::api::decode(indexInfo, indexInfoBytes, iiArena)) {
+    auto padded = solux::api::copyToPaddedInput(indexInfoBytes, iiArena);
+    if (!solux::api::decode(indexInfo, padded, iiArena)) {
       throw std::runtime_error("Failed to parse IndexInfo protobuf");
     }
 

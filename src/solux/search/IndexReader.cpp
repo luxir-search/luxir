@@ -3,6 +3,7 @@
 #include "solux/reader/TestOverlayAuxReader.h"
 #include "solux/reader/VectorAuxReader.h"
 
+#include "solux/api/padded_input.h"
 #include "solux/api/solux_types.hpp"
 #include <boost/unordered/unordered_flat_map.hpp>
 #include <memory_resource>
@@ -145,8 +146,8 @@ IndexReader::IndexReader(Directory& dir, IndexReader* previousReader) {
       retry = false;
     }
 
-    // Non-owning IndexInfo view; its repeated messages live in indexInfoArena and its
-    // strings view the inputFile bytes (segmentsIs below), both alive through the loop.
+    // Non-owning IndexInfo view; its repeated messages and padded input copy live in
+    // indexInfoArena, which is alive through the loop.
     std::pmr::monotonic_buffer_resource indexInfoArena;
     solux::api::IndexInfo indexInfo;
 
@@ -161,7 +162,8 @@ IndexReader::IndexReader(Directory& dir, IndexReader* previousReader) {
       InputStream segmentsIs = inputFile->getInputStream();
 
       std::span<const char> indexInfoBytes(segmentsIs.ptr(), (size_t)segmentsIs.left());
-      if (!solux::api::decode(indexInfo, std::as_bytes(indexInfoBytes), indexInfoArena)) {
+      auto padded = solux::api::copyToPaddedInput(std::as_bytes(indexInfoBytes), indexInfoArena);
+      if (!solux::api::decode(indexInfo, padded, indexInfoArena)) {
         throw std::runtime_error("Failed to parse IndexInfo protobuf");
       }
 

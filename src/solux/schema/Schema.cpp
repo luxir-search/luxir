@@ -1,6 +1,7 @@
 #include "Schema.h"
 #include <memory_resource>
 #include "solux/api/build.h"
+#include "solux/api/padded_input.h"
 #include "solux/api/solux_types.hpp"
 
 #include <boost/unordered/unordered_flat_set.hpp>
@@ -61,11 +62,13 @@ static std::string serializeSchemaDef(const solux::api::SchemaDef& def) {
   return std::string((const char*)serialized.data(), serialized.size());
 }
 
-// Decode into `def`, whose non-owning views are backed by `arena` (+ the `bytes` buffer);
-// both must outlive any use of `def`.
+// Decode into `def`, whose non-owning views are backed by `arena`; the input bytes are
+// copied there with the padding required by solux::api::decode().
 static void parseSchemaDef(std::string_view bytes, solux::api::SchemaDef& def,
                            std::pmr::memory_resource& arena) {
-  if (!solux::api::decode(def, std::as_bytes(std::span<const char>(bytes.data(), bytes.size())), arena)) {
+  auto padded =
+    solux::api::copyToPaddedInput(std::as_bytes(std::span<const char>(bytes.data(), bytes.size())), arena);
+  if (!solux::api::decode(def, padded, arena)) {
     throw std::runtime_error("Failed to parse SchemaDef protobuf");
   }
 }

@@ -5,6 +5,7 @@
 #include "solux/schema/FieldType.h"
 #include "solux/store/InputStream.h"
 #include "solux/reader/Postings.h"
+#include "solux/api/padded_input.h"
 #include "solux/api/solux_types.hpp"
 #include "solux/api/build.h"
 #include "test/SoluxTest.h"
@@ -664,7 +665,8 @@ TEST_F(SchemaTest, schemaPersistence) {
   InputStream is = file->getInputStream();
   api::SchemaDef persistedDef;
   std::span<const char> persistedBytes(is.ptr(), (size_t)is.left());
-  ASSERT_TRUE(api::decode(persistedDef, std::as_bytes(persistedBytes), arena));
+  auto paddedPersistedBytes = api::copyToPaddedInput(std::as_bytes(persistedBytes), arena);
+  ASSERT_TRUE(api::decode(persistedDef, paddedPersistedBytes, arena));
 
   // The persisted def should contain "title" field
   bool foundTitle = false;
@@ -756,7 +758,8 @@ TEST_F(SchemaTest, schemaGenWrittenToIndexInfo) {
   InputStream is = indexInfoFile->getInputStream();
   api::IndexInfo indexInfo;
   std::span<const char> indexInfoBytes(is.ptr(), (size_t)is.left());
-  ASSERT_TRUE(api::decode(indexInfo, std::as_bytes(indexInfoBytes), arena));
+  auto paddedIndexInfoBytes = api::copyToPaddedInput(std::as_bytes(indexInfoBytes), arena);
+  ASSERT_TRUE(api::decode(indexInfo, paddedIndexInfoBytes, arena));
   EXPECT_EQ(expectedGen, indexInfo.schema_gen) << "IndexInfo should contain the current schema_gen";
 
   // Check that SegmentInfo also has schema_gen
@@ -836,7 +839,8 @@ TEST_F(SchemaTest, sourceDef) {
   // Parse back the sourceDef and verify it has parent references
   api::SchemaDef roundtripped;
   std::span<const char> sourceBytes(schema->sourceDef_.data(), schema->sourceDef_.size());
-  ASSERT_TRUE(api::decode(roundtripped, std::as_bytes(sourceBytes), arena));
+  auto paddedSourceBytes = api::copyToPaddedInput(std::as_bytes(sourceBytes), arena);
+  ASSERT_TRUE(api::decode(roundtripped, paddedSourceBytes, arena));
 
   bool foundChild = false;
   for (size_t i = 0; i < roundtripped.fields.size(); i++) {

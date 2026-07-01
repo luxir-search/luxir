@@ -3,7 +3,10 @@
 // grpc::Slice/ByteBuffer glue so the test TUs don't pull it in. See GrpcClient.h.
 #include "test/GrpcClient.h"
 
+#include "solux/api/padded_input.h"
+
 #include <grpcpp/support/slice.h>
+#include <span>
 
 namespace solux::test {
 namespace {
@@ -25,12 +28,14 @@ std::string parse(Msg& msg, const grpc::ByteBuffer& in, std::vector<std::byte>& 
   storage.clear();
   std::size_t size = 0;
   for (const auto& s : slices) size += s.size();
-  storage.reserve(size);
+  storage.reserve(size + solux::api::PADDED_PROTO_INPUT_BYTES);
   for (const auto& s : slices) {
     const auto* data = (const std::byte*)s.begin();
     storage.insert(storage.end(), data, data + s.size());
   }
-  if (!solux::api::decode(msg, storage, arena)) return "gRPC: failed to parse response";
+  storage.resize(size + solux::api::PADDED_PROTO_INPUT_BYTES);
+  std::span<const std::byte> payload(storage.data(), size);
+  if (!solux::api::decode(msg, payload, arena)) return "gRPC: failed to parse response";
   return {};
 }
 

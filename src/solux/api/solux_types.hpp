@@ -432,6 +432,8 @@ SOLUX_TD(SchemaRequest) SOLUX_TD(SchemaResponse) SOLUX_TD(UpdateResponse_::Error
 #undef SOLUX_TD
 
 // ===================== out-of-line codec entry-point declarations =====================
+// decode() uses hpp_proto::padded_input. Callers must pass a payload-only span
+// with 16 readable bytes past data.end(), and the first one must be zero.
 #define SOLUX_ENTRY(M)                                                                      \
   bool decode(M &, std::span<const std::byte> data, std::pmr::memory_resource &arena);      \
   bool encode(const M &, std::vector<std::byte> &out);                                      \

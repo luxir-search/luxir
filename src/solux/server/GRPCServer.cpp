@@ -20,6 +20,7 @@
 
 #include "GRPCServer.h"
 #include "SoluxNode.h"
+#include "solux/api/padded_input.h"
 #include "solux/api/solux.hpp"
 #include "solux/util/random.h"
 #include "solux/util/solux_util.h"
@@ -171,12 +172,12 @@ static grpc::Status dumpByteBuffer(grpc::ByteBuffer& buf, std::vector<std::byte>
   for (const auto& slice : slices) {
     size += slice.size();
   }
-  wire.reserve(size + 1);
+  wire.reserve(size + solux::api::PADDED_PROTO_INPUT_BYTES);
   for (const auto& slice : slices) {
     const auto* data = (const std::byte*)slice.begin();
     wire.insert(wire.end(), data, data + slice.size());
   }
-  wire.push_back(std::byte{0});
+  wire.resize(size + solux::api::PADDED_PROTO_INPUT_BYTES);
   return grpc::Status::OK;
 }
 
@@ -188,7 +189,8 @@ static bool parseRequest(grpc::ByteBuffer& buf, HppRequestState<Message>& state,
     return false;
   }
 
-  std::span<const std::byte> payload(state.wire.data(), state.wire.size() - 1);
+  const size_t payloadSize = state.wire.size() - solux::api::PADDED_PROTO_INPUT_BYTES;
+  std::span<const std::byte> payload(state.wire.data(), payloadSize);
   if (!solux::api::decode(state.proto, payload, state.resource)) {
     LOG_ERROR("{}: failed to parse request", method);
     return false;

@@ -30,6 +30,8 @@ struct HelloReply {
   std::int32_t response_number = {};
 };
 
+// decode() uses hpp_proto::padded_input. Callers must pass a payload-only span
+// with 16 readable bytes past data.end(), and the first one must be zero.
 #define SOLUX_ENTRY(M)                                                                      \
   bool decode(M &, std::span<const std::byte> data, std::pmr::memory_resource &arena);      \
   bool encode(const M &, std::vector<std::byte> &out);                                      \

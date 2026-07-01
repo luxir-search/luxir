@@ -14,6 +14,7 @@
 #include <vector>
 
 #include "solux/api/build.h"
+#include "solux/api/padded_input.h"
 #include "solux/api/solux_types.hpp"
 #include "solux/index/IndexWriter.h"
 #include "solux/index/VectorIndexBuilder.h"
@@ -123,9 +124,8 @@ std::vector<const solux::api::AuxIndexInfo*> vectorOverlays(const solux::api::In
   return out;
 }
 
-// solux::api::IndexInfo is NON-OWNING: its repeated messages live in the arena and its
-// strings (including aux file names) view the InputFile bytes.  Keep both alive next to
-// the decoded view so callers can read it after readIndexInfo returns.
+// solux::api::IndexInfo is NON-OWNING: its repeated messages and string views live in
+// the arena through the padded input copy.
 struct LoadedIndexInfo {
   std::shared_ptr<InputFile> file;
   std::unique_ptr<std::pmr::monotonic_buffer_resource> arena;
@@ -139,7 +139,8 @@ LoadedIndexInfo readIndexInfo(Directory& dir) {
   loaded.arena = std::make_unique<std::pmr::monotonic_buffer_resource>();
   auto is = loaded.file->getInputStream();
   std::span<const char> bytes(is.ptr(), (size_t)is.left());
-  EXPECT_TRUE(solux::api::decode(loaded.info, std::as_bytes(bytes), *loaded.arena));
+  auto padded = solux::api::copyToPaddedInput(std::as_bytes(bytes), *loaded.arena);
+  EXPECT_TRUE(solux::api::decode(loaded.info, padded, *loaded.arena));
   return loaded;
 }
 

@@ -15,6 +15,7 @@
 #include "solux/reader/Postings.h"
 #include "solux/util/Signal.h"
 #include "solux/util/log.h"
+#include "solux/api/padded_input.h"
 #include "solux/api/solux_types.hpp"
 #include "test/QueryBuild.h"
 
@@ -130,7 +131,8 @@ IndexInfoHolder readIndexInfo(Directory& dir) {
   IndexInfoHolder holder;
   auto is = file->getInputStream();
   std::span<const std::byte> bytes((const std::byte*)is.ptr(), (size_t)is.left());
-  EXPECT_TRUE(solux::api::decode(holder.info, bytes, *holder.arena));
+  auto padded = solux::api::copyToPaddedInput(bytes, *holder.arena);
+  EXPECT_TRUE(solux::api::decode(holder.info, padded, *holder.arena));
   return holder;
 }
 
