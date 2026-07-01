@@ -438,7 +438,8 @@ SOLUX_TD(SchemaRequest) SOLUX_TD(SchemaResponse) SOLUX_TD(UpdateResponse_::Error
   bool decode(M &, std::span<const std::byte> data, std::pmr::memory_resource &arena);      \
   bool encode(const M &, std::vector<std::byte> &out);                                      \
   bool write_json(const M &, std::string &out);                                             \
-  bool read_json(M &, std::string_view json, std::pmr::memory_resource &arena);
+  bool read_json(M &, std::string_view json, std::pmr::memory_resource &arena,              \
+                 std::string *error = nullptr);
 SOLUX_ENTRY(Target) SOLUX_ENTRY(SearchRequest) SOLUX_ENTRY(SearchOp) SOLUX_ENTRY(GenOp)
 SOLUX_ENTRY(TopDocs) SOLUX_ENTRY(Fusion) SOLUX_ENTRY(RrfFusion) SOLUX_ENTRY(SortSpec)
 SOLUX_ENTRY(Query) SOLUX_ENTRY(ForcePrepareQuery) SOLUX_ENTRY(ConstantScoreQuery)
@@ -458,3 +459,9 @@ SOLUX_ENTRY(SchemaDef) SOLUX_ENTRY(SchemaRequest) SOLUX_ENTRY(SchemaResponse)
 #undef SOLUX_ENTRY
 
 } // namespace solux::api
+
+// Solux JSON dialect: hand from/to<JSON> overrides of the generated glz::meta
+// (untagged Val, flattened Map, bare-array Vector, ...). Included here so every TU
+// that can instantiate glaze over these types (in practice only the generated
+// .json.cpp) agrees on the dialect.
+#include "json_dialect.h"

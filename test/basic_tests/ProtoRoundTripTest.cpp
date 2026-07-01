@@ -192,8 +192,11 @@ void runOne(const char* nm, std::size_t arm, bool nonEmpty, Setup&& setup) {
   ASSERT_TRUE(write_json(in, canon)) << nm << " arm" << arm << " write_json(in)";
   // Guard against a vacuous pass: if the filler silently stopped populating fields, every
   // message would serialize to "{}" and the fixpoint would hold trivially. A populated message
-  // (or a non-monostate oneof arm) must produce more than an empty object.
-  if (nonEmpty) EXPECT_GT(canon.size(), 2u) << nm << " arm" << arm << " filled to empty JSON";
+  // (or a non-monostate oneof arm) must produce something (untagged Val scalar arms are as
+  // short as "1", so only empty/empty-object trips it).
+  if (nonEmpty) {
+    EXPECT_TRUE(!canon.empty() && canon != "{}") << nm << " arm" << arm << " filled to empty JSON";
+  }
   {  // binary: encode -> decode (payload span with padded backing) -> write_json == canon
     std::vector<std::byte> w;
     ASSERT_TRUE(encode(in, w)) << nm << " arm" << arm << " encode";
@@ -370,7 +373,9 @@ TEST(ProtoRoundTrip, BuildByBacking) {
     ASSERT_TRUE(decode(out, padded, arena));
     verifyResponse(out);
   }
-  {  // json round-trip
+  {  // json round-trip: the dialect renders Val untagged (a raw JSON value), so the
+     // result-only DocList arm reads back as its JSON-native projection (a Map). Assert
+     // the text fixpoint plus spot-checks of the projected view.
     std::pmr::monotonic_buffer_resource mr;
     P::SearchResponse resp = buildResponse(mr);
     std::string js;
@@ -378,7 +383,22 @@ TEST(ProtoRoundTrip, BuildByBacking) {
     std::pmr::monotonic_buffer_resource arena;
     P::SearchResponse out{};
     ASSERT_TRUE(read_json(out, js, arena)) << "json=" << js;
-    verifyResponse(out);
+    std::string js2;
+    ASSERT_TRUE(write_json(out, js2));
+    EXPECT_EQ(js, js2) << "write(read(js)) fixpoint";
+
+    const auto* resultsIv = out.ops.find("results");
+    ASSERT_NE(resultsIv, nullptr);
+    const auto* m = std::get_if<P::Map>(&(*resultsIv)->kind);
+    ASSERT_NE(m, nullptr);
+    const auto* matches = m->fields.find("matches");
+    ASSERT_NE(matches, nullptr);
+    { const auto* n = std::get_if<std::int64_t>(&(**matches).kind);
+      ASSERT_NE(n, nullptr); EXPECT_EQ(*n, 42); }
+    const auto* statsIv = out.ops.find("stats");
+    ASSERT_NE(statsIv, nullptr);
+    { const auto* d = std::get_if<double>(&(*statsIv)->kind);
+      ASSERT_NE(d, nullptr); EXPECT_DOUBLE_EQ(*d, 3.14); }
   }
 }
 

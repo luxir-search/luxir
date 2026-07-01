@@ -27,7 +27,7 @@ $ ./make_deps.sh        # defaults: /opt/vcpkg /opt/vcpkg_asan
 1) Install dependencies via vcpkg (repeat in the asan root for asan presets):
 
 $ cd /opt/vcpkg
-$ ./vcpkg install boost-core boost-sort boost-thread boost-beast gtest benchmark xxhash gtl protobuf grpc spdlog lz4 cli11 faiss simdjson
+$ ./vcpkg install boost-core boost-sort boost-thread boost-beast gtest benchmark xxhash gtl protobuf grpc spdlog lz4 cli11 faiss glaze
 $ ./vcpkg install robin-hood-hashing   #optional... see MapBM.cpp
 
 Ubuntu:

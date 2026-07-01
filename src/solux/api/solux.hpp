@@ -36,7 +36,8 @@ struct HelloReply {
   bool decode(M &, std::span<const std::byte> data, std::pmr::memory_resource &arena);      \
   bool encode(const M &, std::vector<std::byte> &out);                                      \
   bool write_json(const M &, std::string &out);                                             \
-  bool read_json(M &, std::string_view json, std::pmr::memory_resource &arena);
+  bool read_json(M &, std::string_view json, std::pmr::memory_resource &arena,              \
+                 std::string *error = nullptr);
 SOLUX_ENTRY(HelloRequest) SOLUX_ENTRY(HelloReply)
 #undef SOLUX_ENTRY
 

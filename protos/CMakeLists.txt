@@ -62,7 +62,7 @@ add_custom_target(solux_fds_gen DEPENDS "${_fds_hdr}")
 # round-trip tests (test_concrete_proto/) link it now.
 find_package(glaze CONFIG REQUIRED)   # concrete .json.cpp pulls <hpp_proto/json.hpp> -> glaze
 set(_concrete_gen "${CMAKE_CURRENT_BINARY_DIR}/concrete")
-hpp_proto_generate(OUT_VAR _concrete_srcs OUT_DIR "${_concrete_gen}" CONCRETE
+hpp_proto_generate(OUT_VAR _concrete_srcs OUT_DIR "${_concrete_gen}" CONCRETE SNAKE_JSON
   CONCRETE_NAMESPACE solux.api   # -> namespace solux::api (coexists with templated solux::proto)
   IMPORT_DIRS "${CMAKE_CURRENT_SOURCE_DIR}" "${_pb_inc}"
   PROTOS "${CMAKE_CURRENT_SOURCE_DIR}/solux_types.proto"

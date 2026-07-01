@@ -8,9 +8,8 @@ file(GLOB_RECURSE Test_SOURCES CONFIGURE_DEPENDS *.cpp *.h)
 add_executable(solux_test ${Test_SOURCES})
 target_include_directories(solux_test PRIVATE .)
 target_link_libraries(solux_test PRIVATE solux_lib benchmark::benchmark GTest::gtest)
-# HttpApiTest's helper (test/HttpReq.h) parses NDJSON with simdjson and drives the
-# HTTP server with a header-only Boost.Beast client.
-target_link_libraries(solux_test PRIVATE simdjson::simdjson)
+# HttpApiTest's helper (test/HttpReq.h) parses NDJSON with glaze (via solux_lib) and
+# drives the HTTP server with a header-only Boost.Beast client.
 # uni-algo (vendored): AnalysisTest exercises Unicode case folding / NFKC / UAX#29
 # segmentation directly to gate conformance before the real filters are built.
 target_link_libraries(solux_test PRIVATE uni_algo)

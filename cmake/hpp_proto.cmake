@@ -50,9 +50,12 @@ target_compile_features(protoc-gen-hpp PRIVATE cxx_std_23)
 #   PROTOS <p1> [p2 ...]     # .proto files (each must live under one of IMPORT_DIRS)
 #   IMPORT_DIRS <d1> [d2 ...]# protoc -I search dirs (the dir containing a proto determines its output subpath)
 #   [NAMESPACE_PREFIX <p>]   # hpp-proto namespace_prefix option (e.g. hpptest)
+#   [SNAKE_JSON]             # JSON keys are the proto (snake_case) field names, one
+#                            # spelling only (no camelCase aliases); an explicit
+#                            # [json_name = "..."] override is still the primary key
 # )
 function(hpp_proto_generate)
-  cmake_parse_arguments(ARG "CONCRETE" "OUT_VAR;OUT_DIR;NAMESPACE_PREFIX;CONCRETE_NAMESPACE" "PROTOS;IMPORT_DIRS" ${ARGN})
+  cmake_parse_arguments(ARG "CONCRETE;SNAKE_JSON" "OUT_VAR;OUT_DIR;NAMESPACE_PREFIX;CONCRETE_NAMESPACE" "PROTOS;IMPORT_DIRS" ${ARGN})
   file(MAKE_DIRECTORY "${ARG_OUT_DIR}")
 
   set(_inc_flags)
@@ -71,6 +74,13 @@ function(hpp_proto_generate)
       # dotted (e.g. solux.api); the plugin converts dots to :: and retargets the
       # emitted metadata's namespace to it (coexists with the templated package ns).
       set(_opts "${_opts},concrete_namespace=${ARG_CONCRETE_NAMESPACE}")
+    endif()
+  endif()
+  if(ARG_SNAKE_JSON)
+    if(_opts)
+      set(_opts "${_opts},preserve_proto_field_names=true,json_aliases=false")
+    else()
+      set(_opts "preserve_proto_field_names=true,json_aliases=false")
     endif()
   endif()
   if(ARG_NAMESPACE_PREFIX)

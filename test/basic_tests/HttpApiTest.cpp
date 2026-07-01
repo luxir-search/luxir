@@ -96,7 +96,7 @@ TEST_F(HttpApiTest, matchQueryParityAndNull) {
 }
 
 // A string field containing JSON-significant characters round-trips through the
-// renderer's escaping and back via simdjson.
+// renderer's escaping and back via the glaze parse in HttpReq.
 TEST_F(HttpApiTest, stringEscaping) {
   helper.indexAll(std::array{
     flatdoc("id", std::string("e1"), "title_w", std::string("findme"),

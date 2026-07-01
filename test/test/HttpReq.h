@@ -9,7 +9,8 @@
 #include <boost/beast/http.hpp>
 #include <boost/asio/connect.hpp>
 #include <boost/asio/ip/tcp.hpp>
-#include <simdjson.h>
+#include <glaze/glaze.hpp>
+#include <glaze/json/generic.hpp>
 
 #include "TestUtils.h"
 
@@ -61,21 +62,23 @@ public:
   HttpReq& fields(std::initializer_list<std::string> fs) { fields_.assign(fs); return *this; }
   HttpReq& withStats() { count_ = true; scores_ = true; return *this; }
 
+  // The Solux JSON dialect for SearchRequest: one op "q" holding a top_docs with a
+  // match query in sugar form ({"<field>": <value>}).
   std::string buildJson() const {
-    std::string j = R"({"query":{"match":{)";
+    std::string j = R"({"ops":{"q":{"top_docs":{"query":{"match":{)";
     appendJsonStr(j, field_); j += ':'; appendJsonStr(j, value_);
     j += "}}";
     if (limit_)  j += R"(,"limit":)"      + std::to_string(*limit_);
     if (offset_) j += R"(,"offset":)"     + std::to_string(*offset_);
     if (batch_)  j += R"(,"batch_size":)" + std::to_string(*batch_);
-    if (count_)  j += R"(,"count":true)";
-    if (scores_) j += R"(,"scores":true)";
+    if (count_)  j += R"(,"get_number":true)";
+    if (scores_) j += R"(,"get_scores":true)";
     if (!fields_.empty()) {
       j += R"(,"fields":[)";
       for (size_t i = 0; i < fields_.size(); i++) { if (i) j += ','; appendJsonStr(j, fields_[i]); }
       j += ']';
     }
-    j += '}';
+    j += "}}}}";
     return j;
   }
 
@@ -100,12 +103,10 @@ public:
   // "found" from the first response line (0 if absent).
   int64_t found() const {
     for (auto& line : splitLines()) {
-      simdjson::dom::parser p;
-      simdjson::padded_string ps(line);
-      simdjson::dom::element doc;
-      if (p.parse(ps).get(doc)) continue;
-      int64_t f;
-      if (!doc["found"].get(f)) return f;
+      Json root;
+      if (glz::read_json(root, line)) continue;
+      if (!root.is_object() || !root.contains("found")) continue;
+      if (auto* f = root["found"].get_if<int64_t>()) return *f;
     }
     return 0;
   }
@@ -115,20 +116,19 @@ public:
   std::vector<Doc> getDocs() const {
     std::vector<Doc> out;
     for (auto& line : splitLines()) {
-      simdjson::dom::parser p;
-      simdjson::padded_string ps(line);
-      simdjson::dom::element root;
-      if (p.parse(ps).get(root)) continue;
-      simdjson::dom::array docs;
-      if (root["docs"].get(docs)) continue;
-      for (simdjson::dom::element d : docs) {
-        simdjson::dom::object obj;
-        if (d.get(obj)) continue;
+      Json root;
+      if (glz::read_json(root, line)) continue;
+      if (!root.is_object() || !root.contains("docs")) continue;
+      auto* docs = root["docs"].get_if<Json::array_t>();
+      if (!docs) continue;
+      for (const Json& d : *docs) {
+        auto* obj = d.get_if<Json::object_t>();
+        if (!obj) continue;
         Doc doc;
-        for (auto kv : obj) {
+        for (const auto& [key, el] : *obj) {
           FieldVal v;
-          if (!toFieldVal(kv.value, v)) continue;  // skip null / unsupported
-          doc.push_back(NameVal{std::string(kv.key), std::move(v)});
+          if (!toFieldVal(el, v)) continue;  // skip null / unsupported
+          doc.push_back(NameVal{key, std::move(v)});
         }
         out.push_back(std::move(doc));
       }
@@ -177,35 +177,33 @@ private:
     return lines;
   }
 
-  static bool toFieldVal(simdjson::dom::element el, FieldVal& out) {
-    using T = simdjson::dom::element_type;
-    switch (el.type()) {
-      case T::STRING:  out = std::string(el.get_string().value()); return true;
-      case T::INT64:   out = (int64_t)el.get_int64().value();      return true;
-      case T::UINT64:  out = (int64_t)el.get_uint64().value();     return true;
-      case T::DOUBLE:  out = el.get_double().value();              return true;
-      case T::BOOL:    out = el.get_bool().value();                return true;
-      case T::ARRAY: {
-        // Best-effort: homogeneous string or numeric arrays.
-        simdjson::dom::array a = el.get_array();
-        std::vector<std::string> svs;
-        std::vector<int64_t> ivs;
-        std::vector<double> dvs;
-        bool isStr = true, isInt = true, isDbl = true;
-        for (simdjson::dom::element e : a) {
-          if (e.type() == T::STRING) { svs.push_back(std::string(e.get_string().value())); isInt = isDbl = false; }
-          else if (e.type() == T::INT64 || e.type() == T::UINT64) { ivs.push_back((int64_t)e.get_int64().value()); dvs.push_back((double)ivs.back()); isStr = false; }
-          else if (e.type() == T::DOUBLE) { dvs.push_back(e.get_double().value()); isStr = isInt = false; }
-          else { return false; }
-        }
-        if (isStr) out = std::move(svs);
-        else if (isInt) out = std::move(ivs);
-        else if (isDbl) out = std::move(dvs);
-        else return false;
-        return true;
+  // Generic JSON DOM with int64 precision (response lines are small; owning is fine here).
+  using Json = glz::generic_i64;
+
+  static bool toFieldVal(const Json& el, FieldVal& out) {
+    if (auto* s = el.get_if<std::string>()) { out = *s;          return true; }
+    if (auto* i = el.get_if<int64_t>())     { out = *i;          return true; }
+    if (auto* d = el.get_if<double>())      { out = *d;          return true; }
+    if (auto* b = el.get_if<bool>())        { out = *b;          return true; }
+    if (auto* a = el.get_if<Json::array_t>()) {
+      // Best-effort: homogeneous string or numeric arrays.
+      std::vector<std::string> svs;
+      std::vector<int64_t> ivs;
+      std::vector<double> dvs;
+      bool isStr = true, isInt = true, isDbl = true;
+      for (const Json& e : *a) {
+        if (auto* s = e.get_if<std::string>()) { svs.push_back(*s); isInt = isDbl = false; }
+        else if (auto* i = e.get_if<int64_t>()) { ivs.push_back(*i); dvs.push_back((double)*i); isStr = false; }
+        else if (auto* d = e.get_if<double>()) { dvs.push_back(*d); isStr = isInt = false; }
+        else { return false; }
       }
-      default: return false;  // NULL_VALUE / OBJECT
+      if (isStr) out = std::move(svs);
+      else if (isInt) out = std::move(ivs);
+      else if (isDbl) out = std::move(dvs);
+      else return false;
+      return true;
     }
+    return false;  // null / object
   }
 };
 
