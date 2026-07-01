@@ -95,6 +95,35 @@ TEST_F(HttpApiTest, matchQueryParityAndNull) {
       << hreq.rawResponse();
 }
 
+// The root-level shorthand (the body IS one top_docs op, ES-comparable depth)
+// returns the same results as the full {"ops": ...} form.
+TEST_F(HttpApiTest, rootShorthand) {
+  helper.indexAll(std::array{
+    flatdoc("id", std::string("s1"), "status_s", std::string("active"),
+            "title_w", std::string("alpha")),
+    flatdoc("id", std::string("s2"), "status_s", std::string("inactive"),
+            "title_w", std::string("beta")),
+    flatdoc("id", std::string("s3"), "status_s", std::string("active"),
+            "title_w", std::string("gamma")),
+  }, UpdateMessage::COMMIT);
+
+  auto res = httpRequest(port(), http::verb::post, "/collections/main/query",
+      R"({"query":{"match":{"status_s":"active"}},"fields":["id"]})");
+  ASSERT_EQ(200, res.result_int()) << res.body();
+
+  HttpReq full(port());
+  full.matchQuery("status_s", "active").fields({"id"}).execute();
+  ASSERT_EQ(200, full.status());
+  EXPECT_EQ(res.body(), full.rawResponse());
+  EXPECT_EQ(2u, idsOf(full.getDocs()).size());
+
+  // an unknown root key is rejected with a client-facing error
+  auto bad = httpRequest(port(), http::verb::post, "/collections/main/query",
+      R"({"query":{"match":{"status_s":"active"}},"limt":10})");
+  EXPECT_EQ(400, bad.result_int());
+  EXPECT_NE(bad.body().find(R"("error")"), std::string::npos);
+}
+
 // A string field containing JSON-significant characters round-trips through the
 // renderer's escaping and back via the glaze parse in HttpReq.
 TEST_F(HttpApiTest, stringEscaping) {
