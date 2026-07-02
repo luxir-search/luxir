@@ -143,11 +143,16 @@ TEST_F(HttpApiTest, ndjsonStreamIndexesAndQueries) {
 }
 
 TEST_F(HttpApiTest, ndjsonStreamFlushesMultipleBatches) {
+  static constexpr int kDocCount = 180;
+  std::string payload(20 * 1024, 'x');
   std::string body;
-  for (int i = 0; i < 1005; i++) {
+  body.reserve((payload.size() + 80) * (std::size_t)kDocCount);
+  for (int i = 0; i < kDocCount; i++) {
     body += R"({"id":"nb)";
     body += std::to_string(i);
-    body += R"(","title_w":"ndbatch"})";
+    body += R"(","title_w":"ndbatch","blob_s":")";
+    body += payload;
+    body += R"("})";
     body += '\n';
   }
   body += R"({"_update_":{"commit":{}}})";
@@ -159,11 +164,11 @@ TEST_F(HttpApiTest, ndjsonStreamFlushesMultipleBatches) {
 
   HttpReq hreq(port());
   hreq.collection("main").matchQuery("title_w", "ndbatch").fields({"id"})
-      .limit(1010).withStats().execute();
+      .limit(kDocCount).withStats().execute();
 
   ASSERT_EQ(200, hreq.status()) << hreq.rawResponse();
-  EXPECT_EQ((int64_t)1005, hreq.found());
-  EXPECT_EQ(1005u, hreq.ids().size()) << hreq.rawResponse();
+  EXPECT_EQ((int64_t)kDocCount, hreq.found());
+  EXPECT_EQ((std::size_t)kDocCount, hreq.ids().size()) << hreq.rawResponse();
 }
 
 TEST_F(HttpApiTest, ndjsonMalformedRecordIs400) {
@@ -178,8 +183,8 @@ TEST_F(HttpApiTest, ndjsonMalformedRecordIs400) {
   EXPECT_NE(res.body().find("docs_indexed_so_far"), std::string::npos) << res.body();
 }
 
-// A single document larger than the server's 64 KiB body read buffer forces the
-// framer to carry a partial record across multiple real socket reads.
+// A single document larger than the debug streaming read buffer forces the framer
+// to carry a partial record across multiple real socket reads.
 TEST_F(HttpApiTest, ndjsonDocLargerThanReadBuffer) {
   std::string big(200 * 1024, 'x');  // ~200 KiB > 64 KiB read buffer, < 1 MiB cap
   std::string body =

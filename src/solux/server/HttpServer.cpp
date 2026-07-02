@@ -80,6 +80,7 @@ struct HttpStreamBatchState {
   std::pmr::monotonic_buffer_resource resource;
   HttpUpdateReqProto proto;  // non-owning; backed by `resource`
   solux::api::build::SpanBuilder<solux::api::Map> docs;
+  std::size_t sourceBytes = 0;
   std::size_t docCount = 0;
   std::size_t firstDocIndex = 0;
 
@@ -114,11 +115,18 @@ struct HttpStreamGroup {
 };
 
 struct HttpStreamUpdateState {
-  static constexpr std::size_t kBatchSize = 1000;
+  static constexpr std::size_t kBatchTargetBytes = 1024 * 1024;
+  static constexpr std::size_t kBatchMaxDocs = 10000;
+#ifdef NDEBUG
+  static constexpr std::size_t kStreamReadBufBytes = 1024 * 1024;
+#else
+  static constexpr std::size_t kStreamReadBufBytes = 64 * 1024;
+#endif
   static constexpr std::size_t kMaxRetainedErrors = 100;
   static constexpr std::size_t kMaxRetainedIds = 100;
 
   NdjsonFramer framer;
+  std::vector<char> readBuf;
   std::string collectionName;
   std::shared_ptr<Collection> collection;
   std::shared_ptr<IndexWriter> indexWriter;
@@ -134,7 +142,9 @@ struct HttpStreamUpdateState {
   bool updateInFlight = false;
   bool failed = false;
 
-  HttpStreamUpdateState() : batch(std::make_unique<HttpStreamBatchState>(kBatchSize)) {}
+  HttpStreamUpdateState()
+    : readBuf(kStreamReadBufBytes),
+      batch(std::make_unique<HttpStreamBatchState>(kBatchMaxDocs)) {}
 };
 
 // One SearchRequest per HTTP query.  Engine workers call reply() from a task
@@ -664,8 +674,8 @@ private:
       drainStreamRecords();
       return;
     }
-    parser_->get().body().data = bodyBuf_.data();
-    parser_->get().body().size = bodyBuf_.size();
+    parser_->get().body().data = state->readBuf.data();
+    parser_->get().body().size = state->readBuf.size();
     http::async_read(stream_, buffer_, *parser_,
         beast::bind_front_handler(&HttpSession::onStreamBodyRead, shared_from_this()));
   }
@@ -680,9 +690,9 @@ private:
       return;
     }
 
-    std::size_t produced = bodyBuf_.size() - parser_->get().body().size;
+    std::size_t produced = state->readBuf.size() - parser_->get().body().size;
     if (produced > 0) {
-      state->framer.feed(std::string_view(bodyBuf_.data(), produced));
+      state->framer.feed(std::string_view(state->readBuf.data(), produced));
       if (state->framer.error()) {
         failStreamingUpdate(state->framer.message());
         return;
@@ -825,7 +835,9 @@ private:
     }
 
     state->batch->docs.push_back(map);
-    if (state->batch->docs.size() >= HttpStreamUpdateState::kBatchSize) {
+    state->batch->sourceBytes += record.size();
+    if (state->batch->sourceBytes >= HttpStreamUpdateState::kBatchTargetBytes ||
+        state->batch->docs.size() >= HttpStreamUpdateState::kBatchMaxDocs) {
       submitStreamBatch(nullptr);
       return false;
     }
@@ -871,7 +883,7 @@ private:
     }
 
     std::shared_ptr<HttpStreamBatchState> batch(std::move(state->batch));
-    state->batch = std::make_unique<HttpStreamBatchState>(HttpStreamUpdateState::kBatchSize);
+    state->batch = std::make_unique<HttpStreamBatchState>(HttpStreamUpdateState::kBatchMaxDocs);
     state->updateInFlight = true;
 
     auto iw = state->indexWriter;
