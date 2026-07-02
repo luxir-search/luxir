@@ -462,3 +462,60 @@ TEST_F(SearchEngineTest, constantScoreWrapperSetsScore) {
   EXPECT_EQ(1, facetCounts["brown"]);
   EXPECT_EQ(1, facetCounts["red"]);
 }
+
+// Op and filter names are path-safe ([A-Za-z0-9_-]+): they appear in path-based
+// debug/warning addressing, URL overlays, and Domain include/exclude references.
+TEST_F(SearchEngineTest, opAndFilterNameCharset) {
+  CollectionHelper helper;
+  helper.clear();
+  helper.index(flatdoc("foo_w", "hello"), UpdateMessage::COMMIT);
+
+  {  // unusual but legal name
+    auto req = localReq(soluxNode->getSearchEngine());
+    req->collection("main");
+    req->topDocs("My-Op_2").matchQuery("foo_w", "hello");
+    req->execute();
+    ASSERT_EQ(1, req->responses.size()) << req->toString();
+    ASSERT_FALSE(hasError(req->responses[0]->proto)) << req->toString();
+  }
+  {  // path-unsafe op name is rejected with the teaching message
+    auto req = localReq(soluxNode->getSearchEngine());
+    req->collection("main");
+    req->topDocs("bad.name!").matchQuery("foo_w", "hello");
+    ExpectLog quiet("Search request failed:");
+    req->execute();
+    ASSERT_FALSE(req->responses.empty());
+    EXPECT_NE(req->errorMsg().find("restricted to"), std::string::npos) << req->errorMsg();
+  }
+  {  // filter names use the same rule
+    auto req = localReq(soluxNode->getSearchEngine());
+    req->collection("main");
+    auto& cur = req->topDocs("q").matchQuery("foo_w", "hello");
+    auto& td = std::get<solux::api::TopDocs>(cur.rawOp().kind);
+    auto* f = solux::api::build::allocArray(td.filter, 1, cur.mr());
+    f[0].name = "bad name";
+    auto* q = (solux::api::Query*)cur.mr().allocate(sizeof(solux::api::Query),
+                                                    alignof(solux::api::Query));
+    new (q) solux::api::Query(qb::match(cur.mr(), "foo_w", "hello"));
+    f[0].query = q;
+    ExpectLog quiet("Search request failed:");
+    req->execute();
+    ASSERT_FALSE(req->responses.empty());
+    EXPECT_NE(req->errorMsg().find("restricted to"), std::string::npos) << req->errorMsg();
+  }
+}
+
+// Missing or unknown collections error cleanly (previously a null deref in getResources).
+TEST_F(SearchEngineTest, missingCollectionErrors) {
+  {  // no collection at all
+    auto req = localReq(soluxNode->getSearchEngine());
+    req->topDocs("q").allQuery();
+    ExpectLog quiet("Search request failed:");
+    req->execute();
+    ASSERT_FALSE(req->responses.empty());
+    EXPECT_NE(req->errorMsg().find("no collection"), std::string::npos) << req->errorMsg();
+  }
+  // NOTE: the unknown-collection-NAME error is untestable today: SoluxNode::getCollection
+  // is a single-collection stub that ignores the name. The engine's null-check guards the
+  // path for when real lookup lands.
+}

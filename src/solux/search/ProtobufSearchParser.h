@@ -49,10 +49,29 @@ public:
     return &rootOp;
   }
 
+  // Op and filter names appear in path-based addressing (debug/warning entries like
+  // ops.q.top_docs.filter[0]), URL overlays, and cross-references (Domain
+  // include/exclude), so they are restricted to path-safe characters.
+  static void validateName(std::string_view name, const char* kind) {
+    bool ok = !name.empty();
+    for (char c : name) {
+      if (!((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
+            c == '_' || c == '-')) {
+        ok = false;
+        break;
+      }
+    }
+    if (!ok) {
+      throw std::runtime_error(std::string(kind) + " name '" + std::string(name) +
+                               "' is invalid: names are restricted to [A-Za-z0-9_-]+");
+    }
+  }
+
   void addSubs(SearchOp& currOp, OpsMap ops) {
     for (auto& [name, searchOp] : lastWins(ops)) {
       // map values are indirect views over the request bytes; deref to the SearchOp.
       // lastWins() collapses duplicate op names (protobuf map dedup semantics).
+      validateName(name, "op");
       auto* sub = parseOp(name, **searchOp);
       if (sub == nullptr) {
         continue; // skip this op
@@ -285,6 +304,7 @@ public:
       out = req.requestPool.make_span<std::pair<std::string_view, Query*>>(filtersProto.size());
       for (size_t i = 0; i < filtersProto.size(); i++) {
         auto& f = filtersProto[i];
+        validateName(f.name, "filter");
         if (!f.query.has_value()) {
           throw std::runtime_error("filter '" + std::string(f.name) + "' requires a query");
         }
