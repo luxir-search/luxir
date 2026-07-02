@@ -1,6 +1,7 @@
 
 #include <gtest/gtest.h>
 #include <iostream>
+#include <limits>
 #include <oneapi/tbb/task_group.h>
 
 #include "solux/store/Directory.h"
@@ -216,6 +217,35 @@ TEST_F(DirectoryTest, ramdirThreads) {
 TEST_F(DirectoryTest, dataTypes) {
   RAMDir dir;
   doDataTypes(dir);
+}
+
+TEST_F(DirectoryTest, varintBoundaries) {
+  RAMDir dir;
+  std::unique_ptr<File> f = dir.createFile("varints");
+  OutputStream os;
+  os.setFile(f.get());
+
+  uint32_t ints[] = {
+    0u, 1u, 0x7fu, 0x80u, 0x3fffu, 0x4000u, 0x1fffffu, 0x200000u,
+    0x0fffffffu, 0x10000000u, std::numeric_limits<uint32_t>::max()
+  };
+  uint64_t longs[] = {
+    0ull, 1ull, 0x7full, 0x80ull, 0x3fffull, 0x4000ull,
+    0x1fffffull, 0x200000ull, 0x0fffffffull, 0x10000000ull,
+    0x7ffffffffull, 0x800000000ull, 0x3fffffffffffull, 0x400000000000ull,
+    std::numeric_limits<uint64_t>::max()
+  };
+
+  for (uint32_t v : ints) os.writeVint(v);
+  for (uint64_t v : longs) os.writeVlong(v);
+  os.close();
+  dir.finishFile(*f);
+
+  auto input = dir.openFile("varints");
+  auto is = input->getInputStream();
+  for (uint32_t v : ints) EXPECT_EQ(is.readVint(), v);
+  for (uint64_t v : longs) EXPECT_EQ(is.readVlong(), v);
+  EXPECT_EQ(is.left(), 0);
 }
 
 TEST_F(DirectoryTest, fsdir) {

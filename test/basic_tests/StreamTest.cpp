@@ -1,6 +1,7 @@
 
 #include <gtest/gtest.h>
 #include <iostream>
+#include <limits>
 
 #include "solux/index/Stream.h"
 #include "solux/index/DocStream.h"
@@ -115,6 +116,42 @@ TEST_F(StreamTest, deltStream) {
   int32_t sum = 0;
   stream.pushValues(pool, [&](int32_t val){ sum += val; });
   ASSERT_EQ(7 + 11 + 23, sum);
+}
+
+TEST_F(StreamTest, varintBoundaries) {
+  {
+    MemPool pool;
+    Stream stream;
+    int32_t values[] = {
+      0, 1, 0x7f, 0x80, 0x3fff, 0x4000, 0x1fffff, 0x200000,
+      0x0fffffff, 0x10000000, std::numeric_limits<int32_t>::max(),
+      std::numeric_limits<int32_t>::min(), -1
+    };
+    for (int32_t v : values) stream.writeVInt(pool, v);
+    StreamReader reader(stream, pool);
+    for (int32_t v : values) {
+      ASSERT_FALSE(reader.eof());
+      EXPECT_EQ(reader.readVint(), v);
+    }
+    EXPECT_TRUE(reader.eof());
+  }
+
+  {
+    MemPool pool;
+    Stream stream;
+    int64_t values[] = {
+      0, 1, 0x7f, 0x80, 0x3fff, 0x4000, 0x1fffff, 0x200000,
+      0x0fffffff, 0x10000000, 0x7ffffffffLL, 0x800000000LL,
+      std::numeric_limits<int64_t>::max(), std::numeric_limits<int64_t>::min(), -1
+    };
+    for (int64_t v : values) stream.writeVLong(pool, v);
+    StreamReader reader(stream, pool);
+    for (int64_t v : values) {
+      ASSERT_FALSE(reader.eof());
+      EXPECT_EQ(reader.readVlong(), v);
+    }
+    EXPECT_TRUE(reader.eof());
+  }
 }
 
 } // end namespace

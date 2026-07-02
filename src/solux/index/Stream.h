@@ -1,5 +1,6 @@
 #pragma once
 
+#include <bit>
 #include <cstdint>
 #include <iostream>
 #include "solux/util/solux_util.h"
@@ -294,23 +295,23 @@ public:
   // TODO: consolidate with InputStream somehow... templatize?
   int32_t readVint() {
     char b = readByte();
-    int32_t val = b & 0x7f;
+    uint32_t val = (uint32_t)(b & 0x7f);
     // TODO: try replacing with a loop to 4 (to avoid running long if data is bad)
     for (int shift = 7; (b & 0x80) != 0; shift += 7) {
       b = readByte();
-      val |= (b & 0x7f) << shift;
+      val |= (uint32_t)(b & 0x7f) << shift;
     }
-    return val;
+    return std::bit_cast<int32_t>(val);
   }
 
   int64_t readVlong() {
     char b = readByte();
-    int64_t val = b & 0x7f;
+    uint64_t val = (uint64_t)(b & 0x7f);
     for (int shift = 7; (b & 0x80) != 0; shift += 7) {
       b = readByte();
       val |= (b & 0x7fULL) << shift;
     }
-    return val;
+    return std::bit_cast<int64_t>(val);
   }
 
 };
