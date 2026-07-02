@@ -49,6 +49,23 @@ void SoluxConfig::addOptions(CLI::App& app) {
                  "Per-inverter doc-count cap before an auto-flush to a segment")
       ->default_val(index.max_inverter_docs)
       ->check(CLI::PositiveNumber);
+
+  app.add_option("--ingest.max-request-body-mb", ingest.max_request_body_mb,
+                 "Max buffered (non-streaming) request body size (MiB); oversized -> 413")
+      ->default_val(ingest.max_request_body_mb)
+      ->check(CLI::PositiveNumber);
+  app.add_option("--ingest.stream-batch-target-kb", ingest.stream_batch_target_kb,
+                 "Streaming NDJSON: soft byte target (KiB) per auto-cut update batch")
+      ->default_val(ingest.stream_batch_target_kb)
+      ->check(CLI::PositiveNumber);
+  app.add_option("--ingest.stream-batch-max-docs", ingest.stream_batch_max_docs,
+                 "Streaming NDJSON: doc-count cut per auto-cut update batch")
+      ->default_val(ingest.stream_batch_max_docs)
+      ->check(CLI::PositiveNumber);
+  app.add_option("--ingest.max-record-mb", ingest.max_record_mb,
+                 "Max size of one NDJSON record / document (MiB)")
+      ->default_val(ingest.max_record_mb)
+      ->check(CLI::PositiveNumber);
 }
 
 void SoluxConfig::normalize() {

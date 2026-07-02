@@ -50,11 +50,34 @@ struct IndexConfig {
   int64_t max_inverter_docs = 8 * 1024 * 1024;   // doc-count cap
 };
 
+struct IngestConfig {
+  // Max size of a single buffered (non-streaming) request body - e.g. a /update
+  // carrying an all_or_none request, or a /query.  Oversized -> 413, rejected at the
+  // JSON layer (gRPC has its own max message size).  A whole such request lands in one
+  // inverter, so this is also what bounds a single non-streaming update's RAM.
+  // Keep it GENEROUS: a low limit is a trap - it passes in testing and fails fatally
+  // in production on a larger doc or atomic batch.  A future goal is to GUARANTEE a
+  // minimum acceptable size (a fixed doc count, or a whole nested document + its
+  // children, must always fit).
+  int64_t max_request_body_mb = 32;
+
+  // Streaming NDJSON ingest: soft byte target for auto-cutting the stream into one
+  // (non-atomic) UpdateRequest, plus a doc-count cut.  Bigger batches amortize the
+  // update-graph overhead at the cost of transient staging memory.
+  int64_t stream_batch_target_kb = 1024;   // 1 MiB
+  int64_t stream_batch_max_docs = 10000;
+
+  // Hard cap on one NDJSON record (one document).  Generous for the same trap reason;
+  // a large (e.g. nested) document must fit in a single record.
+  int64_t max_record_mb = 8;
+};
+
 struct SoluxConfig {
   std::string log_level = "info";
   ServerConfig server;
   StoreConfig store;
   IndexConfig index;
+  IngestConfig ingest;
 
   /// Register common CLI options on an app, bound to this config's fields.
   void addOptions(CLI::App& app);

@@ -262,7 +262,7 @@ TEST_F(HttpApiTest, ndjsonMalformedRecordIs400) {
 // A single document larger than the debug streaming read buffer forces the framer
 // to carry a partial record across multiple real socket reads.
 TEST_F(HttpApiTest, ndjsonDocLargerThanReadBuffer) {
-  std::string big(200 * 1024, 'x');  // ~200 KiB > 64 KiB read buffer, < 1 MiB cap
+  std::string big(200 * 1024, 'x');  // ~200 KiB > 64 KiB read buffer, < record cap
   std::string body =
       R"({"id":"big1","title_w":"bigtoken","title_s":")" + big + R"("})" "\n"
       R"({"_update_":{"commit":{}}})" "\n";
@@ -276,6 +276,33 @@ TEST_F(HttpApiTest, ndjsonDocLargerThanReadBuffer) {
       .limit(10).withStats().execute();
   ASSERT_EQ(200, hreq.status());
   EXPECT_EQ((int64_t)1, hreq.found()) << hreq.rawResponse().substr(0, 200);
+}
+
+// A buffered (non-streaming) request body past ingest.max_request_body_mb is rejected
+// with a clean 413.  We declare an oversized Content-Length; Beast rejects at header
+// parse, so no body is actually sent (this is what bounds a single atomic /update).
+TEST_F(HttpApiTest, oversizedBufferedBodyIs413) {
+  net::io_context cioc;
+  beast::tcp_stream stream(cioc);
+  tcp::resolver resolver(cioc);
+  stream.connect(resolver.resolve("127.0.0.1", std::to_string(port())));
+  stream.expires_after(std::chrono::seconds(10));
+
+  std::string header =
+      "POST /collections/main/update HTTP/1.1\r\n"
+      "Host: 127.0.0.1\r\n"
+      "Content-Type: application/json\r\n"
+      "Content-Length: 99000000\r\n"   // ~94 MiB, well past the 32 MiB default
+      "Connection: close\r\n"
+      "\r\n";
+  net::write(stream, net::buffer(header));
+
+  beast::flat_buffer buffer;
+  http::response<http::string_body> res;
+  beast::error_code ec;
+  http::read(stream, buffer, res, ec);
+  ASSERT_EQ(413, res.result_int()) << ec.message() << " body=" << res.body();
+  EXPECT_NE(res.body().find(R"("error")"), std::string::npos) << res.body();
 }
 
 TEST_F(HttpApiTest, ndjsonRequestIdControlEchoed) {

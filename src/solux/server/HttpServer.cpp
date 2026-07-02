@@ -111,8 +111,6 @@ struct HttpStreamInterval {
 };
 
 struct HttpStreamUpdateState {
-  static constexpr std::size_t kBatchTargetBytes = 1024 * 1024;
-  static constexpr std::size_t kBatchMaxDocs = 10000;
 #ifdef NDEBUG
   static constexpr std::size_t kStreamReadBufBytes = 1024 * 1024;
 #else
@@ -120,6 +118,10 @@ struct HttpStreamUpdateState {
 #endif
   static constexpr std::size_t kMaxRetainedErrors = 100;
   static constexpr std::size_t kMaxRetainedIds = 100;
+
+  // Auto-cut a batch when it reaches either bound (from IngestConfig).
+  std::size_t batchTargetBytes;
+  std::size_t batchMaxDocs;
 
   NdjsonFramer framer;
   std::vector<char> readBuf;
@@ -141,9 +143,12 @@ struct HttpStreamUpdateState {
   bool updateInFlight = false;
   bool failed = false;
 
-  HttpStreamUpdateState()
-    : readBuf(kStreamReadBufBytes),
-      batch(std::make_unique<HttpStreamBatchState>(kBatchMaxDocs)) {}
+  HttpStreamUpdateState(std::size_t batchTargetBytes, std::size_t batchMaxDocs, std::size_t maxRecordBytes)
+    : batchTargetBytes(batchTargetBytes),
+      batchMaxDocs(batchMaxDocs),
+      framer(maxRecordBytes),
+      readBuf(kStreamReadBufBytes),
+      batch(std::make_unique<HttpStreamBatchState>(batchMaxDocs)) {}
 };
 
 // One SearchRequest per HTTP query.  Engine workers call reply() from a task
@@ -231,11 +236,12 @@ private:
   bool chunkLastSent_ = false;
   bool errored_ = false;
 
-  static constexpr std::uint64_t kBufferedBodyLimit = 8 * 1024 * 1024;
-
   void doRead() {
     parser_.emplace();
-    parser_->body_limit(kBufferedBodyLimit);  // 8 MiB request-body cap
+    // Buffered (non-streaming) request-body cap; oversized -> 413.  A whole such
+    // request lands in one inverter, so this bounds a single non-streaming update's
+    // RAM (streaming NDJSON lifts the limit and auto-cuts into batches instead).
+    parser_->body_limit((std::uint64_t)node_.getConfig().ingest.max_request_body_mb * 1024 * 1024);
     buffer_.clear();
     bufferedBody_.clear();
     streamUpdate_.reset();
@@ -245,6 +251,8 @@ private:
 
   void onRead(beast::error_code ec, std::size_t) {
     if (ec == http::error::end_of_stream) { doClose(); return; }
+    // A Content-Length past the body limit is reported here at header parse time.
+    if (ec == http::error::body_limit) { respondPayloadTooLarge(); return; }
     if (ec) { LOG_TRACE("http read: {}", ec.message()); doClose(); return; }
 
     httpVersion_ = parser_->get().version();
@@ -279,6 +287,8 @@ private:
 
   void onBufferedBodyRead(beast::error_code ec, std::size_t) {
     bool needBuffer = ec == http::error::need_buffer;
+    // A body that grows past the limit (e.g. chunked, no Content-Length) surfaces here.
+    if (ec == http::error::body_limit) { respondPayloadTooLarge(); return; }
     if (ec && !needBuffer) { LOG_TRACE("http read: {}", ec.message()); doClose(); return; }
 
     std::size_t produced = bodyBuf_.size() - parser_->get().body().size;
@@ -642,7 +652,11 @@ private:
   }
 
   void startStreamingUpdate(std::string coll) {
-    auto state = std::make_shared<HttpStreamUpdateState>();
+    const auto& ingest = node_.getConfig().ingest;
+    auto state = std::make_shared<HttpStreamUpdateState>(
+        (std::size_t)ingest.stream_batch_target_kb * 1024,
+        (std::size_t)ingest.stream_batch_max_docs,
+        (std::size_t)ingest.max_record_mb * 1024 * 1024);
     state->collectionName = std::move(coll);
     state->workGuard = std::make_shared<net::executor_work_guard<net::any_io_executor>>(
         stream_.get_executor());
@@ -837,8 +851,8 @@ private:
 
     state->batch->docs.push_back(map);
     state->batch->sourceBytes += record.size();
-    if (state->batch->sourceBytes >= HttpStreamUpdateState::kBatchTargetBytes ||
-        state->batch->docs.size() >= HttpStreamUpdateState::kBatchMaxDocs) {
+    if (state->batch->sourceBytes >= state->batchTargetBytes ||
+        state->batch->docs.size() >= state->batchMaxDocs) {
       submitStreamBatch(nullptr);
       return false;
     }
@@ -897,7 +911,7 @@ private:
     }
 
     std::shared_ptr<HttpStreamBatchState> batch(std::move(state->batch));
-    state->batch = std::make_unique<HttpStreamBatchState>(HttpStreamUpdateState::kBatchMaxDocs);
+    state->batch = std::make_unique<HttpStreamBatchState>(state->batchMaxDocs);
     state->updateInFlight = true;
 
     auto iw = state->indexWriter;
@@ -1165,6 +1179,18 @@ private:
           if (resp->keep_alive()) self->doRead();
           else self->doClose();
         });
+  }
+
+  // A 413 for a request body past ingest.max-request-body-mb.  The body was not
+  // fully consumed, so the connection cannot be reused - respond, then close.
+  void respondPayloadTooLarge() {
+    keepAlive_ = false;
+    if (parser_.has_value()) {
+      unsigned v = parser_->get().version();
+      if (v != 0) httpVersion_ = v;
+    }
+    respondSimple(http::status::payload_too_large, "application/json",
+                  renderErrorBody("request body exceeds ingest.max-request-body-mb"));
   }
 
   void doClose() {
