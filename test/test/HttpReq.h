@@ -24,7 +24,8 @@ using tcp = net::ip::tcp;
 // Synchronous one-shot HTTP request against a locally running HttpServer.
 // Returns the full (de-chunked) response so NDJSON bodies arrive as one string.
 inline http::response<http::string_body>
-httpRequest(int port, http::verb method, std::string_view target, std::string body = {}) {
+httpRequest(int port, http::verb method, std::string_view target, std::string body = {},
+            std::string_view contentType = "application/json") {
   net::io_context ioc;
   tcp::resolver resolver(ioc);
   beast::tcp_stream stream(ioc);
@@ -33,7 +34,7 @@ httpRequest(int port, http::verb method, std::string_view target, std::string bo
 
   http::request<http::string_body> req(method, target, 11);
   req.set(http::field::host, "127.0.0.1");
-  req.set(http::field::content_type, "application/json");
+  req.set(http::field::content_type, contentType);
   if (!body.empty()) req.body() = std::move(body);
   req.prepare_payload();
   http::write(stream, req);

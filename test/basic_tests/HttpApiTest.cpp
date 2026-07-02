@@ -103,6 +103,96 @@ TEST_F(HttpApiTest, updateResponseUsesSnakeCase) {
   EXPECT_NE(res.body().find(R"("request_id":"req-1")"), std::string::npos) << res.body();
 }
 
+TEST_F(HttpApiTest, ndjsonStreamIndexesAndQueries) {
+  std::string body =
+      R"({"id":"n1","title_w":"streamtoken alpha","title_s":"Alpha"})" "\n"
+      R"({"id":"n2","title_w":"streamtoken beta","title_s":"Beta"})" "\n"
+      R"({"id":"n3","title_w":"streamtoken gamma","title_s":"Gamma"})" "\n"
+      R"({"_update_":{"commit":{}}})" "\n";
+
+  auto update = httpRequest(port(), http::verb::post, "/collections/main/update",
+                            std::move(body), "application/x-ndjson");
+  ASSERT_EQ(200, update.result_int()) << update.body();
+  EXPECT_NE(update.body().find(R"("update_version")"), std::string::npos) << update.body();
+
+  HttpReq hreq(port());
+  hreq.collection("main").matchQuery("title_w", "streamtoken").fields({"id"})
+      .limit(10).withStats().execute();
+
+  ASSERT_EQ(200, hreq.status()) << hreq.rawResponse();
+  EXPECT_EQ((int64_t)3, hreq.found());
+  EXPECT_EQ(std::set<std::string>({"n1", "n2", "n3"}), idsOf(hreq.getDocs()))
+      << hreq.rawResponse();
+}
+
+TEST_F(HttpApiTest, ndjsonStreamFlushesMultipleBatches) {
+  std::string body;
+  for (int i = 0; i < 1005; i++) {
+    body += R"({"id":"nb)";
+    body += std::to_string(i);
+    body += R"(","title_w":"ndbatch"})";
+    body += '\n';
+  }
+  body += R"({"_update_":{"commit":{}}})";
+  body += '\n';
+
+  auto update = httpRequest(port(), http::verb::post, "/collections/main/update",
+                            std::move(body), "application/x-ndjson");
+  ASSERT_EQ(200, update.result_int()) << update.body();
+
+  HttpReq hreq(port());
+  hreq.collection("main").matchQuery("title_w", "ndbatch").fields({"id"})
+      .limit(1010).withStats().execute();
+
+  ASSERT_EQ(200, hreq.status()) << hreq.rawResponse();
+  EXPECT_EQ((int64_t)1005, hreq.found());
+  EXPECT_EQ(1005u, hreq.ids().size()) << hreq.rawResponse();
+}
+
+TEST_F(HttpApiTest, ndjsonMalformedRecordIs400) {
+  std::string body =
+      R"({"id":"bad1","title_w":"badtoken"})" "\n"
+      "{not json\n";
+
+  auto res = httpRequest(port(), http::verb::post, "/collections/main/update",
+                         std::move(body), "application/x-ndjson");
+  EXPECT_EQ(400, res.result_int()) << res.body();
+  EXPECT_NE(res.body().find(R"("error")"), std::string::npos) << res.body();
+  EXPECT_NE(res.body().find("docs_indexed_so_far"), std::string::npos) << res.body();
+}
+
+// A single document larger than the server's 64 KiB body read buffer forces the
+// framer to carry a partial record across multiple real socket reads.
+TEST_F(HttpApiTest, ndjsonDocLargerThanReadBuffer) {
+  std::string big(200 * 1024, 'x');  // ~200 KiB > 64 KiB read buffer, < 1 MiB cap
+  std::string body =
+      R"({"id":"big1","title_w":"bigtoken","title_s":")" + big + R"("})" "\n"
+      R"({"_update_":{"commit":{}}})" "\n";
+
+  auto update = httpRequest(port(), http::verb::post, "/collections/main/update",
+                            std::move(body), "application/x-ndjson");
+  ASSERT_EQ(200, update.result_int()) << update.body().substr(0, 200);
+
+  HttpReq hreq(port());
+  hreq.collection("main").matchQuery("title_w", "bigtoken").fields({"id"})
+      .limit(10).withStats().execute();
+  ASSERT_EQ(200, hreq.status());
+  EXPECT_EQ((int64_t)1, hreq.found()) << hreq.rawResponse().substr(0, 200);
+}
+
+TEST_F(HttpApiTest, ndjsonRequestIdControlEchoed) {
+  std::string body =
+      R"({"_update_":{"request_id":"stream-req-1"}})" "\n"
+      R"({"id":"rid1","title_w":"ridtoken"})" "\n"
+      R"({"_update_":{"commit":{}}})" "\n";
+
+  auto res = httpRequest(port(), http::verb::post, "/collections/main/update",
+                         std::move(body), "application/x-ndjson");
+  ASSERT_EQ(200, res.result_int()) << res.body();
+  EXPECT_NE(res.body().find(R"("request_id":"stream-req-1")"), std::string::npos)
+      << res.body();
+}
+
 // HTTP results match the in-process engine for the same query, and a doc missing
 // a requested field renders that field as JSON null.
 TEST_F(HttpApiTest, matchQueryParityAndNull) {

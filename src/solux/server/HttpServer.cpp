@@ -1,9 +1,11 @@
 #include "HttpServer.h"
 
 #include <cassert>
+#include <array>
 #include <cstddef>
 #include <deque>
 #include <functional>
+#include <limits>
 #include <list>
 #include <memory_resource>
 #include <memory>
@@ -13,10 +15,12 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include <boost/beast/core.hpp>
 #include <boost/beast/http.hpp>
+#include <boost/none.hpp>
 #include <boost/asio/strand.hpp>
 #include <boost/asio/post.hpp>
 #include <boost/asio/dispatch.hpp>
@@ -27,6 +31,7 @@
 #include "JsonRequest.h"
 #include "solux/api/build.h"
 #include "JsonResponse.h"
+#include "NdjsonFramer.h"
 #include "ProtoUpdateMessage.h"
 #include "solux/util/thread.h"
 
@@ -50,6 +55,76 @@ struct HttpSearchRequestState {
 struct HttpUpdateState {
   std::pmr::monotonic_buffer_resource resource;
   HttpUpdateReqProto proto;  // non-owning; backed by `resource`
+};
+
+struct HttpStreamCommitControl {
+  std::uint64_t commitWithinUs = 0;
+  std::vector<std::string> buildAuxIndexes;
+  bool waitForMerges = false;
+  bool present = false;
+};
+
+struct HttpStreamControl {
+  std::optional<bool> allowDups;
+  std::optional<std::string> requestId;
+  HttpStreamCommitControl commit;
+};
+
+struct HttpStreamAccumError {
+  std::string id;
+  std::string errorMessage;
+  std::int32_t index = 0;
+};
+
+struct HttpStreamBatchState {
+  std::pmr::monotonic_buffer_resource resource;
+  HttpUpdateReqProto proto;  // non-owning; backed by `resource`
+  solux::api::build::SpanBuilder<solux::api::Map> docs;
+  std::size_t docCount = 0;
+  std::size_t firstDocIndex = 0;
+
+  explicit HttpStreamBatchState(std::size_t reserveDocs) : docs(resource) {
+    docs.reserve(reserveDocs);
+  }
+};
+
+struct HttpStreamBatchResult {
+  std::vector<std::string> ids;
+  std::vector<HttpStreamAccumError> errors;
+  std::string errorMessage;
+  solux::api::UpdateResponse_::Status status = solux::api::UpdateResponse_::Status::OK;
+  std::uint64_t updateVersion = 0;
+  std::size_t docCount = 0;
+  std::size_t firstDocIndex = 0;
+  bool failed = false;
+};
+
+struct HttpStreamUpdateState {
+  static constexpr std::size_t kBatchSize = 1000;
+  static constexpr std::size_t kMaxRetainedErrors = 100;
+  static constexpr std::size_t kMaxRetainedIds = 100;
+
+  NdjsonFramer framer;
+  std::string collectionName;
+  std::shared_ptr<Collection> collection;
+  std::shared_ptr<IndexWriter> indexWriter;
+  std::unique_ptr<HttpStreamBatchState> batch;
+  std::optional<HttpStreamControl> pendingControl;
+  std::shared_ptr<net::executor_work_guard<net::any_io_executor>> workGuard;
+  std::string requestId;
+  std::vector<std::string> ids;
+  std::vector<HttpStreamAccumError> errors;
+  std::uint64_t lastUpdateVersion = 0;
+  std::size_t docsSeen = 0;
+  std::size_t docsIndexed = 0;
+  std::size_t totalErrors = 0;
+  bool allowDups = false;
+  bool bodyDone = false;
+  bool tailFinished = false;
+  bool updateInFlight = false;
+  bool failed = false;
+
+  HttpStreamUpdateState() : batch(std::make_unique<HttpStreamBatchState>(kBatchSize)) {}
 };
 
 // One SearchRequest per HTTP query.  Engine workers call reply() from a task
@@ -117,7 +192,10 @@ private:
   std::shared_ptr<HttpSessionRegistry> registry_;
   std::function<void()> deregister_;  // removes this session from the registry
   beast::flat_buffer buffer_;
-  std::optional<http::request_parser<http::string_body>> parser_;
+  std::optional<http::request_parser<http::buffer_body>> parser_;
+  std::array<char, 64 * 1024> bodyBuf_{};
+  std::string bufferedBody_;
+  std::shared_ptr<HttpStreamUpdateState> streamUpdate_;
 
   // Carried from the request for the (later, async) streaming response.
   unsigned httpVersion_ = 11;
@@ -134,18 +212,72 @@ private:
   bool chunkLastSent_ = false;
   bool errored_ = false;
 
+  static constexpr std::uint64_t kBufferedBodyLimit = 8 * 1024 * 1024;
+
   void doRead() {
     parser_.emplace();
-    parser_->body_limit(8 * 1024 * 1024);  // 8 MiB request-body cap
+    parser_->body_limit(kBufferedBodyLimit);  // 8 MiB request-body cap
     buffer_.clear();
-    http::async_read(stream_, buffer_, *parser_,
+    bufferedBody_.clear();
+    streamUpdate_.reset();
+    http::async_read_header(stream_, buffer_, *parser_,
         beast::bind_front_handler(&HttpSession::onRead, shared_from_this()));
   }
 
   void onRead(beast::error_code ec, std::size_t) {
     if (ec == http::error::end_of_stream) { doClose(); return; }
     if (ec) { LOG_TRACE("http read: {}", ec.message()); doClose(); return; }
-    route(parser_->release());
+
+    httpVersion_ = parser_->get().version();
+    keepAlive_ = parser_->get().keep_alive();
+
+    std::string_view target(parser_->get().target());
+    if (auto q = target.find('?'); q != std::string_view::npos) {
+      target = target.substr(0, q);
+    }
+
+    std::string coll;
+    if (parser_->get().method() == http::verb::post && parseUpdatePath(target, coll) &&
+        isNdjsonContentType(std::string_view(parser_->get()[http::field::content_type]))) {
+      parser_->body_limit(boost::none);
+      startStreamingUpdate(std::move(coll));
+      return;
+    }
+
+    doBufferedBodyRead();
+  }
+
+  void doBufferedBodyRead() {
+    if (parser_->is_done()) {
+      dispatchBufferedRequest();
+      return;
+    }
+    parser_->get().body().data = bodyBuf_.data();
+    parser_->get().body().size = bodyBuf_.size();
+    http::async_read(stream_, buffer_, *parser_,
+        beast::bind_front_handler(&HttpSession::onBufferedBodyRead, shared_from_this()));
+  }
+
+  void onBufferedBodyRead(beast::error_code ec, std::size_t) {
+    bool needBuffer = ec == http::error::need_buffer;
+    if (ec && !needBuffer) { LOG_TRACE("http read: {}", ec.message()); doClose(); return; }
+
+    std::size_t produced = bodyBuf_.size() - parser_->get().body().size;
+    bufferedBody_.append(bodyBuf_.data(), produced);
+
+    if (parser_->is_done()) {
+      dispatchBufferedRequest();
+      return;
+    }
+    doBufferedBodyRead();
+  }
+
+  void dispatchBufferedRequest() {
+    http::request<http::string_body> req;
+    req.base() = parser_->get().base();
+    req.body() = std::move(bufferedBody_);
+    parser_.reset();
+    route(std::move(req));
   }
 
   static bool parseCollectionPath(std::string_view target, std::string_view suffix, std::string& coll) {
@@ -164,6 +296,33 @@ private:
 
   static bool parseUpdatePath(std::string_view target, std::string& coll) {
     return parseCollectionPath(target, "/update", coll);
+  }
+
+  static std::string_view trimHeaderValue(std::string_view v) {
+    while (!v.empty() && (v.front() == ' ' || v.front() == '\t')) v.remove_prefix(1);
+    while (!v.empty() && (v.back() == ' ' || v.back() == '\t')) v.remove_suffix(1);
+    return v;
+  }
+
+  static char asciiLower(char c) {
+    if (c >= 'A' && c <= 'Z') return (char)(c - 'A' + 'a');
+    return c;
+  }
+
+  static bool asciiEqualsIgnoreCase(std::string_view a, std::string_view b) {
+    if (a.size() != b.size()) return false;
+    for (std::size_t i = 0; i < a.size(); i++) {
+      if (asciiLower(a[i]) != asciiLower(b[i])) return false;
+    }
+    return true;
+  }
+
+  static bool isNdjsonContentType(std::string_view contentType) {
+    if (auto semi = contentType.find(';'); semi != std::string_view::npos) {
+      contentType = contentType.substr(0, semi);
+    }
+    contentType = trimHeaderValue(contentType);
+    return asciiEqualsIgnoreCase(contentType, "application/x-ndjson");
   }
 
   struct UrlParam {
@@ -375,6 +534,412 @@ private:
             self->respondSimple(status, "application/json", std::move(body));
           });
     });
+  }
+
+  static std::int32_t cappedErrorIndex(std::size_t index) {
+    constexpr std::size_t max = (std::size_t)std::numeric_limits<std::int32_t>::max();
+    return index > max ? std::numeric_limits<std::int32_t>::max() : (std::int32_t)index;
+  }
+
+  static void fillCommitParams(std::optional<solux::api::CommitParams>& out,
+                               const HttpStreamCommitControl& control,
+                               std::pmr::memory_resource& resource) {
+    auto& params = out.emplace();
+    params.commit_within_us = control.commitWithinUs;
+    params.wait_for_merges = control.waitForMerges;
+    std::string_view* names =
+        solux::api::build::allocArray(params.build_aux_indexes, control.buildAuxIndexes.size(), resource);
+    for (std::size_t i = 0; i < control.buildAuxIndexes.size(); i++) {
+      names[i] = solux::api::build::arenaStr(resource, control.buildAuxIndexes[i]);
+    }
+  }
+
+  static bool parseStreamCommitField(std::string_view name, const solux::api::Val& val,
+                                     HttpStreamCommitControl& commit, std::string& err) {
+    if (name == "commit_within_us") {
+      const auto* n = std::get_if<std::int64_t>(&val.kind);
+      if (n == nullptr || *n < 0) { err = "commit_within_us must be a non-negative integer"; return false; }
+      commit.commitWithinUs = (std::uint64_t)*n;
+      return true;
+    }
+    if (name == "wait_for_merges") {
+      const auto* b = std::get_if<bool>(&val.kind);
+      if (b == nullptr) { err = "wait_for_merges must be a boolean"; return false; }
+      commit.waitForMerges = *b;
+      return true;
+    }
+    if (name == "build_aux_indexes") {
+      const auto* arr = std::get_if<solux::api::ArrStr>(&val.kind);
+      if (arr == nullptr) { err = "build_aux_indexes must be an array of strings"; return false; }
+      commit.buildAuxIndexes.clear();
+      commit.buildAuxIndexes.reserve(arr->v.size());
+      for (std::string_view item : arr->v) commit.buildAuxIndexes.emplace_back(item);
+      return true;
+    }
+    err = "unsupported commit control field '" + std::string(name) + "'";
+    return false;
+  }
+
+  // A control record is a JSON object whose sole field is "_update_". Its payload is
+  // parsed as the v1 streaming control subset: request_id, allow_dups, and commit.
+  static bool extractStreamControl(const solux::api::Map& map, HttpStreamControl& control,
+                                   bool& isControl, std::string& err) {
+    isControl = false;
+    if (map.fields.size() != 1) return true;
+    const auto& entry = *map.fields.begin();
+    if (entry.first != "_update_") return true;
+
+    isControl = true;
+    const solux::api::Val& wrapper = *entry.second;
+    const auto* payload = std::get_if<solux::api::Map>(&wrapper.kind);
+    if (payload == nullptr) {
+      err = "_update_ control value must be an object";
+      return false;
+    }
+
+    for (const auto& [name, valView] : payload->fields) {
+      const solux::api::Val& val = *valView;
+      if (name == "allow_dups") {
+        const auto* b = std::get_if<bool>(&val.kind);
+        if (b == nullptr) { err = "allow_dups control must be a boolean"; return false; }
+        control.allowDups = *b;
+      } else if (name == "request_id") {
+        const auto* s = std::get_if<std::string_view>(&val.kind);
+        if (s == nullptr) { err = "request_id control must be a string"; return false; }
+        control.requestId = std::string(*s);
+      } else if (name == "commit") {
+        const auto* commitMap = std::get_if<solux::api::Map>(&val.kind);
+        if (commitMap == nullptr) { err = "commit control must be an object"; return false; }
+        control.commit.present = true;
+        for (const auto& [commitName, commitValView] : commitMap->fields) {
+          if (!parseStreamCommitField(commitName, *commitValView, control.commit, err)) return false;
+        }
+      } else {
+        err = "unsupported _update_ control field '" + std::string(name) + "'";
+        return false;
+      }
+    }
+    return true;
+  }
+
+  void startStreamingUpdate(std::string coll) {
+    auto state = std::make_shared<HttpStreamUpdateState>();
+    state->collectionName = std::move(coll);
+    state->workGuard = std::make_shared<net::executor_work_guard<net::any_io_executor>>(
+        stream_.get_executor());
+
+    try {
+      std::pmr::monotonic_buffer_resource targetResource;
+      std::optional<solux::api::Target> target;
+      setCollectionTarget(target, state->collectionName, targetResource);
+      state->collection = node_.resolveCollection(&*target);
+      state->indexWriter = state->collection->getShard()->getIndexWriter();
+    } catch (const std::exception& e) {
+      parser_.reset();
+      streamUpdate_ = state;
+      keepAlive_ = false;
+      respondSimple(http::status::internal_server_error, "application/json", renderErrorBody(e.what()));
+      return;
+    }
+
+    streamUpdate_ = std::move(state);
+    doStreamBodyRead();
+  }
+
+  void doStreamBodyRead() {
+    auto state = streamUpdate_;
+    if (!state || state->failed || state->updateInFlight) return;
+    if (parser_->is_done()) {
+      state->bodyDone = true;
+      drainStreamRecords();
+      return;
+    }
+    parser_->get().body().data = bodyBuf_.data();
+    parser_->get().body().size = bodyBuf_.size();
+    http::async_read(stream_, buffer_, *parser_,
+        beast::bind_front_handler(&HttpSession::onStreamBodyRead, shared_from_this()));
+  }
+
+  void onStreamBodyRead(beast::error_code ec, std::size_t) {
+    auto state = streamUpdate_;
+    if (!state || state->failed) return;
+
+    bool needBuffer = ec == http::error::need_buffer;
+    if (ec && !needBuffer) {
+      failStreamingUpdate("failed to read NDJSON request body: " + ec.message());
+      return;
+    }
+
+    std::size_t produced = bodyBuf_.size() - parser_->get().body().size;
+    if (produced > 0) {
+      state->framer.feed(std::string_view(bodyBuf_.data(), produced));
+      if (state->framer.error()) {
+        failStreamingUpdate(state->framer.message());
+        return;
+      }
+    }
+
+    if (parser_->is_done()) state->bodyDone = true;
+    drainStreamRecords();
+  }
+
+  void failStreamingUpdate(std::string message) {
+    auto state = streamUpdate_;
+    if (state && state->failed) return;
+    std::size_t docsIndexed = state ? state->docsIndexed : 0;
+    if (state) state->failed = true;
+    parser_.reset();
+    keepAlive_ = false;
+    message += " (docs_indexed_so_far=" + std::to_string(docsIndexed) + ")";
+    respondSimple(http::status::bad_request, "application/json", renderErrorBody(message));
+  }
+
+  bool processStreamRecord(std::string_view record) {
+    auto state = streamUpdate_;
+    assert(state != nullptr);
+    assert(state->batch != nullptr);
+
+    solux::api::Map map;
+    std::string err;
+    if (!solux::api::read_json(map, record, state->batch->resource, &err)) {
+      failStreamingUpdate(err.empty() ? "malformed NDJSON record" : err);
+      return false;
+    }
+
+    HttpStreamControl control;
+    bool isControl = false;
+    if (!extractStreamControl(map, control, isControl, err)) {
+      failStreamingUpdate(err);
+      return false;
+    }
+
+    if (isControl) {
+      if (state->batch->docs.size() > 0) {
+        state->pendingControl = std::move(control);
+        submitStreamBatch(nullptr);
+        return false;
+      }
+      return applyStreamControl(std::move(control));
+    }
+
+    state->batch->docs.push_back(map);
+    if (state->batch->docs.size() >= HttpStreamUpdateState::kBatchSize) {
+      submitStreamBatch(nullptr);
+      return false;
+    }
+    return true;
+  }
+
+  bool applyStreamControl(HttpStreamControl control) {
+    auto state = streamUpdate_;
+    assert(state != nullptr);
+    if (control.allowDups) state->allowDups = *control.allowDups;
+    if (control.requestId) state->requestId = std::move(*control.requestId);
+    if (control.commit.present) {
+      submitStreamBatch(&control.commit);
+      return false;
+    }
+    return true;
+  }
+
+  void submitStreamBatch(const HttpStreamCommitControl* commitControl) {
+    auto state = streamUpdate_;
+    assert(state != nullptr);
+    assert(!state->updateInFlight);
+    assert(state->batch != nullptr);
+
+    state->batch->docCount = state->batch->docs.size();
+    state->batch->firstDocIndex = state->docsSeen;
+    state->docsSeen += state->batch->docCount;
+    state->batch->proto.docs = state->batch->docs.finish();
+    state->batch->proto.allow_dups = state->allowDups;
+    setCollectionTarget(state->batch->proto.collection, state->collectionName, state->batch->resource);
+    if (commitControl != nullptr) {
+      fillCommitParams(state->batch->proto.commit, *commitControl, state->batch->resource);
+    }
+
+    std::shared_ptr<HttpStreamBatchState> batch(std::move(state->batch));
+    state->batch = std::make_unique<HttpStreamBatchState>(HttpStreamUpdateState::kBatchSize);
+    state->updateInFlight = true;
+
+    auto iw = state->indexWriter;
+    auto workGuard = state->workGuard;
+    node_.getTaskArena().enqueue(
+        [self = shared_from_this(), state, batch, iw, workGuard] {
+          HttpStreamBatchResult result;
+          result.docCount = batch->docCount;
+          result.firstDocIndex = batch->firstDocIndex;
+          try {
+            class BlockingUpdateMessage : public ProtoUpdateMessage {
+            public:
+              Blocker blocker;
+              explicit BlockingUpdateMessage(const HttpUpdateReqProto* req) : ProtoUpdateMessage(req) {}
+              void done(IndexWriter& iw) override {
+                unused(iw);
+                blocker.notify();
+              }
+            };
+
+            BlockingUpdateMessage msg(&batch->proto);
+            bool success = iw->submitUpdate(&msg);
+            assert(success);
+            unused(success);
+            msg.blocker.wait();
+            auto* resp = msg.finishResponse();
+            result.status = resp->status;
+            result.updateVersion = resp->update_version;
+            result.errorMessage = std::string(resp->error_message);
+            result.ids.reserve(resp->ids.size());
+            for (std::string_view id : resp->ids) result.ids.emplace_back(id);
+            result.errors.reserve(resp->errors.size());
+            for (const auto& e : resp->errors) {
+              result.errors.push_back({std::string(e.id), std::string(e.error_message), e.index});
+            }
+          } catch (const std::exception& e) {
+            result.failed = true;
+            result.errorMessage = e.what();
+          } catch (...) {
+            result.failed = true;
+            result.errorMessage = "unknown non-standard exception";
+          }
+
+          net::post(self->stream_.get_executor(),
+              [self, state, batch, workGuard, result = std::move(result)]() mutable {
+                self->onStreamBatchDone(state, batch, std::move(result));
+              });
+        });
+  }
+
+  void onStreamBatchDone(const std::shared_ptr<HttpStreamUpdateState>& state,
+                         const std::shared_ptr<HttpStreamBatchState>& batch,
+                         HttpStreamBatchResult result) {
+    unused(batch);
+    unused(result.status);
+    if (streamUpdate_ != state || state->failed) return;
+    state->updateInFlight = false;
+    if (result.failed) {
+      failStreamingUpdate("NDJSON update batch failed: " + result.errorMessage);
+      return;
+    }
+
+    foldStreamBatchResult(result);
+
+    if (state->pendingControl) {
+      HttpStreamControl control = std::move(*state->pendingControl);
+      state->pendingControl.reset();
+      if (!applyStreamControl(std::move(control))) return;
+    }
+    drainStreamRecords();
+  }
+
+  void foldStreamBatchResult(const HttpStreamBatchResult& result) {
+    auto state = streamUpdate_;
+    assert(state != nullptr);
+    state->lastUpdateVersion = result.updateVersion;
+
+    std::size_t failedDocs = result.errors.size();
+    if (failedDocs > result.docCount) failedDocs = result.docCount;
+    state->docsIndexed += result.docCount - failedDocs;
+
+    for (const auto& id : result.ids) {
+      if (state->ids.size() < HttpStreamUpdateState::kMaxRetainedIds) state->ids.push_back(id);
+    }
+
+    for (const auto& err : result.errors) {
+      state->totalErrors++;
+      if (state->errors.size() >= HttpStreamUpdateState::kMaxRetainedErrors) continue;
+      std::size_t globalIndex = result.firstDocIndex;
+      if (err.index >= 0) globalIndex += (std::size_t)err.index;
+      state->errors.push_back({err.id, err.errorMessage, cappedErrorIndex(globalIndex)});
+    }
+
+    if (!result.errorMessage.empty() && result.status == solux::api::UpdateResponse_::Status::ERROR) {
+      state->totalErrors++;
+      if (state->errors.size() < HttpStreamUpdateState::kMaxRetainedErrors) {
+        state->errors.push_back({"", result.errorMessage, cappedErrorIndex(result.firstDocIndex)});
+      }
+    }
+  }
+
+  void drainStreamRecords() {
+    auto state = streamUpdate_;
+    if (!state || state->failed || state->updateInFlight) return;
+
+    std::string_view record;
+    while (state->framer.next(record)) {
+      if (!processStreamRecord(record)) return;
+      if (state->failed || state->updateInFlight) return;
+    }
+
+    if (state->bodyDone) {
+      if (!state->tailFinished) {
+        state->tailFinished = true;
+        if (state->framer.finish(record)) {
+          if (!processStreamRecord(record)) return;
+          if (state->failed || state->updateInFlight) return;
+        } else if (state->framer.error()) {
+          failStreamingUpdate(state->framer.message());
+          return;
+        }
+      }
+
+      if (state->batch && state->batch->docs.size() > 0) {
+        submitStreamBatch(nullptr);
+        return;
+      }
+      finishStreamingUpdate();
+      return;
+    }
+
+    doStreamBodyRead();
+  }
+
+  void finishStreamingUpdate() {
+    auto state = streamUpdate_;
+    if (!state || state->failed) return;
+    parser_.reset();
+
+    std::pmr::monotonic_buffer_resource responseResource;
+    solux::api::UpdateResponse resp;
+    resp.request_id = solux::api::build::arenaStr(responseResource, state->requestId);
+    resp.update_version = state->lastUpdateVersion;
+
+    solux::api::build::SpanBuilder<std::string_view> ids(responseResource);
+    ids.reserve(state->ids.size());
+    for (const auto& id : state->ids) ids.push_back(solux::api::build::arenaStr(responseResource, id));
+    resp.ids = ids.finish();
+
+    solux::api::build::SpanBuilder<solux::api::UpdateResponse_::Error> errors(responseResource);
+    errors.reserve(state->errors.size());
+    for (const auto& src : state->errors) {
+      auto& dst = errors.emplace_back();
+      dst.id = solux::api::build::arenaStr(responseResource, src.id);
+      dst.error_message = solux::api::build::arenaStr(responseResource, src.errorMessage);
+      dst.index = src.index;
+    }
+    resp.errors = errors.finish();
+
+    if (state->totalErrors == 0) {
+      resp.status = solux::api::UpdateResponse_::Status::OK;
+    } else if (state->docsIndexed > 0) {
+      resp.status = solux::api::UpdateResponse_::Status::PARTIAL;
+    } else {
+      resp.status = solux::api::UpdateResponse_::Status::ERROR;
+    }
+    if (state->totalErrors > state->errors.size()) {
+      std::string msg = "retained first " + std::to_string(state->errors.size()) + " of " +
+          std::to_string(state->totalErrors) + " errors";
+      resp.error_message = solux::api::build::arenaStr(responseResource, msg);
+    }
+
+    std::string out;
+    if (!solux::api::write_json(resp, out)) {
+      keepAlive_ = false;
+      respondSimple(http::status::internal_server_error, "application/json",
+                    renderErrorBody("failed to serialize update response"));
+      return;
+    }
+    respondSimple(http::status::ok, "application/json", std::move(out));
   }
 
   // --- streaming (chunked NDJSON) write pump --------------------------------
