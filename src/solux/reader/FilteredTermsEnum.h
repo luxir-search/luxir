@@ -24,6 +24,9 @@ protected:
   // Classify the term `te` is currently positioned on.
   virtual Status accept() = 0;
 
+  // Move the underlying enum to the next candidate term.
+  virtual bool advance() { return te.nextTerm(); }
+
 public:
   explicit FilteredTermsEnum(TermsEnum& te) : te(te) {}
 
@@ -43,7 +46,7 @@ public:
       started = true;
       if (!seekStart()) return false;
     } else {
-      if (!te.nextTerm()) return false;
+      if (!advance()) return false;
     }
     for (;;) {
       switch (accept()) {
@@ -51,7 +54,7 @@ public:
         case Status::END:    return false;
         case Status::REJECT: break;
       }
-      if (!te.nextTerm()) return false;
+      if (!advance()) return false;
     }
   }
 };

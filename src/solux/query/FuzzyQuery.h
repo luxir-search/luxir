@@ -12,7 +12,7 @@
 #include "MatchNoDocsQuery.h"
 #include "MultiTermQuery.h"
 #include "TermQuery.h"
-#include "solux/reader/FuzzyTermsEnum.h"
+#include "solux/reader/FuzzySeekEnum.h"
 #include "solux/util/MemPool.h"
 
 namespace solux {
@@ -26,7 +26,7 @@ class FuzzyQuery final : public MultiTermQuery {
   int prefixLength;   // clamped to <= term length
   int maxExpansions;
 
-  // Copy transient term bytes (FuzzyTermsEnum reuses its buffer across terms)
+  // Copy transient term bytes (FuzzySeekEnum reuses its buffer across terms)
   // into `dst` so a string_view can outlive the enum's next advance.
   static std::string_view copyTerm(MemPool& dst, std::string_view t) {
     if (t.empty()) return {};
@@ -54,7 +54,7 @@ class FuzzyQuery final : public MultiTermQuery {
       if (segFieldInfo == nullptr) continue;
       auto& postingsReader = context.topReader.segments()[s].postingsReader();
       TermsEnum te(scratch, postingsReader, *segFieldInfo);
-      FuzzyTermsEnum fte(scratch, te, prefix, suffix, maxEdits);
+      FuzzySeekEnum fte(scratch, te, prefix, suffix, maxEdits);
       while (fte.next()) {
         std::string_view t = fte.termView();
         if (!termBoosts.contains(t)) {
@@ -97,7 +97,7 @@ public:
   FilteredTermsEnum* createFilteredEnum(MemPool& pool, TermsEnum& te) override {
     std::string_view prefix = term.substr(0, prefixLength);
     std::string_view suffix = term.substr(prefixLength);
-    return pool.make<FuzzyTermsEnum>(pool, te, prefix, suffix, maxEdits);
+    return pool.make<FuzzySeekEnum>(pool, te, prefix, suffix, maxEdits);
   }
 
   Query::Weight* createWeight(Context& context, int32_t flags) override {

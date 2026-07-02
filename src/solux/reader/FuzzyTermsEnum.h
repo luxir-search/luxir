@@ -16,17 +16,21 @@ class FuzzyTermsEnum final : public FilteredTermsEnum {
   std::string_view suffix;       // query bytes after the prefix (the fuzzy part)
   int maxEdits;
   int n;                         // suffix.size()
+  bool prefixMode;
   // Two reused rows of the edit-distance matrix, sized n+1, pool-owned.
   int* prev;
   int* cur;
   float score = 1.0f;            // similarity of the last accepted term
+  int bestPrefixDist = 0;
 
   // Bounded Levenshtein distance between `suffix` and `t`.
-  int editDistance(std::string_view t) const {
+  int editDistance(std::string_view t) {
     const int m = (int)t.size();
-    if (m - n > maxEdits || n - m > maxEdits) return maxEdits + 1;  // length filter
+    bestPrefixDist = maxEdits + 1;
+    if (!prefixMode && (m - n > maxEdits || n - m > maxEdits)) return maxEdits + 1;  // length filter
 
     for (int i = 0; i <= n; i++) prev[i] = i;
+    if (prefixMode) bestPrefixDist = std::min(maxEdits + 1, prev[n]);
     const char* q = suffix.data();
     int* p = prev;
     int* d = cur;
@@ -40,10 +44,13 @@ class FuzzyTermsEnum final : public FilteredTermsEnum {
         d[i] = v;
         best = std::min(best, v);
       }
-      if (best > maxEdits) return maxEdits + 1;  // cannot recover within budget
+      if (prefixMode) bestPrefixDist = std::min(bestPrefixDist, std::min(maxEdits + 1, d[n]));
+      if (best > maxEdits) {
+        return prefixMode && bestPrefixDist <= maxEdits ? bestPrefixDist : maxEdits + 1;
+      }
       std::swap(p, d);
     }
-    return p[n];  // p holds the last computed row after the final swap
+    return prefixMode ? bestPrefixDist : p[n];  // p holds the last computed row after the final swap
   }
 
 protected:
@@ -56,7 +63,8 @@ protected:
     int dist = editDistance(tsuffix);
     if (dist > maxEdits) return Status::REJECT;
     // Closer terms score higher; one edit matters more on shorter terms.
-    int denom = (int)prefix.size() + std::min(n, (int)tsuffix.size());
+    int denom = prefixMode ? (int)prefix.size() + n
+                           : (int)prefix.size() + std::min(n, (int)tsuffix.size());
     score = denom > 0 ? 1.0f - (float)dist / (float)denom : 1.0f;
     return Status::ACCEPT;
   }
@@ -64,9 +72,9 @@ protected:
 public:
   // `prefix` is exact; `suffix` is fuzzy. Both views must outlive this enum.
   FuzzyTermsEnum(MemPool& pool, TermsEnum& te, std::string_view prefix,
-                 std::string_view suffix, int maxEdits)
+                 std::string_view suffix, int maxEdits, bool prefixMode = false)
     : FilteredTermsEnum(te), prefix(prefix), suffix(suffix), maxEdits(maxEdits),
-      n((int)suffix.size()) {
+      n((int)suffix.size()), prefixMode(prefixMode) {
     prev = (int*)pool.alloc((n + 1) * sizeof(int), alignof(int));
     cur = (int*)pool.alloc((n + 1) * sizeof(int), alignof(int));
   }
