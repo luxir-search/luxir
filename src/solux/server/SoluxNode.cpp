@@ -107,6 +107,24 @@ SoluxNode::SoluxNode(SoluxConfig config) : config(std::move(config)) {
 SoluxNode::~SoluxNode() {
 }
 
+std::shared_ptr<Collection> SoluxNode::resolveCollection(const solux::api::Target* target) {
+  std::shared_ptr<Library> library = getLibrary(nullptr, "");
+  std::shared_ptr<Collection> collection;
+  if (target != nullptr) {
+    for (int i = 0; i < (int)target->name.size(); i++) {
+      if (i == (int)target->name.size() - 1) {
+        collection = getCollection(library.get(), target->name[i]);
+      } else {
+        library = getLibrary(library.get(), target->name[i]);
+      }
+    }
+  }
+  if (!collection) {
+    collection = getCollection("");
+  }
+  return collection;
+}
+
 std::shared_ptr<Collection> SoluxNode::initCollection(const std::string& name) {
   auto col = std::make_shared<Collection>();
   col->name = name;

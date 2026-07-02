@@ -11,6 +11,8 @@
 
 namespace solux {
 
+namespace api { struct Target; }
+
 /// There should normally be a single SoluxNode instance per process.
 /// A single SoluxNode can host many indexes.
 /// There still *may* be multiple SoluxNode instances per process, but it's currently more for testing.
@@ -118,6 +120,8 @@ public:
     unused(name);
     return collection;
   }
+
+  std::shared_ptr<Collection> resolveCollection(const solux::api::Target* target);
 
   std::shared_ptr<Collection> getCollection(Library* library, std::string_view name) {
     unused(library, name);

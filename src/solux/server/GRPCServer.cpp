@@ -349,21 +349,7 @@ public:
 
 // Helper to resolve a Collection from a Target proto
 static std::shared_ptr<Collection> resolveCollection(GRPCServer& server, const solux::api::Target* target) {
-  std::shared_ptr<Library> library = server.getSoluxNode().getLibrary(nullptr, "");
-  std::shared_ptr<Collection> collection;
-  if (target != nullptr) {
-    for (int i = 0; i < (int)target->name.size(); i++) {
-      if (i == (int)target->name.size() - 1) {
-        collection = server.getSoluxNode().getCollection(library.get(), target->name[i]);
-      } else {
-        library = server.getSoluxNode().getLibrary(library.get(), target->name[i]);
-      }
-    }
-  }
-  if (!collection) {
-    collection = server.getSoluxNode().getCollection("");
-  }
-  return collection;
+  return server.getSoluxNode().resolveCollection(target);
 }
 
 static std::shared_ptr<Collection> resolveCollection(GRPCServer& server,
@@ -373,22 +359,7 @@ static std::shared_ptr<Collection> resolveCollection(GRPCServer& server,
 
 template <typename Request>
 static std::shared_ptr<Collection> resolveUpdateCollection(GRPCServer& server, const Request& request) {
-  std::shared_ptr<Library> library = server.getSoluxNode().getLibrary(nullptr, "");
-  std::shared_ptr<Collection> collection;
-  if (request.collection.has_value()) {
-    const auto& target = *request.collection;
-    for (int i = 0; i < (int)target.name.size(); i++) {
-      if (i == (int)target.name.size() - 1) {
-        collection = server.getSoluxNode().getCollection(library.get(), target.name[i]);
-      } else {
-        library = server.getSoluxNode().getLibrary(library.get(), target.name[i]);
-      }
-    }
-  }
-  if (!collection) {
-    collection = server.getSoluxNode().getCollection("");
-  }
-  return collection;
+  return server.getSoluxNode().resolveCollection(request.collection.has_value() ? &*request.collection : nullptr);
 }
 
 

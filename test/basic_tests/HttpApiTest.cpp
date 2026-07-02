@@ -60,6 +60,49 @@ TEST_F(HttpApiTest, malformedJsonIs400) {
   EXPECT_NE(res.body().find(R"("error")"), std::string::npos);
 }
 
+TEST_F(HttpApiTest, updateIndexesAndQueryRoundTrip) {
+  auto update = httpRequest(port(), http::verb::post, "/collections/main/update",
+      R"({"docs":[{"id":"u1","title_w":"hello world","title_s":"Hello"}],"commit":{}})");
+  ASSERT_EQ(200, update.result_int()) << update.body();
+  EXPECT_NE(update.body().find(R"("update_version")"), std::string::npos) << update.body();
+
+  HttpReq hreq(port());
+  hreq.collection("main").matchQuery("title_w", "hello").fields({"id"}).execute();
+
+  ASSERT_EQ(200, hreq.status()) << hreq.rawResponse();
+  EXPECT_EQ(std::set<std::string>({"u1"}), idsOf(hreq.getDocs())) << hreq.rawResponse();
+}
+
+TEST_F(HttpApiTest, updateDeleteIds) {
+  auto index = httpRequest(port(), http::verb::post, "/collections/main/update",
+      R"({"docs":[{"id":"u1","title_w":"delete token"},{"id":"u2","title_w":"delete token"}],"commit":{}})");
+  ASSERT_EQ(200, index.result_int()) << index.body();
+
+  auto del = httpRequest(port(), http::verb::post, "/collections/main/update",
+      R"({"delete_ids":["u1"],"commit":{}})");
+  ASSERT_EQ(200, del.result_int()) << del.body();
+
+  HttpReq hreq(port());
+  hreq.collection("main").matchQuery("title_w", "token").fields({"id"}).execute();
+
+  ASSERT_EQ(200, hreq.status()) << hreq.rawResponse();
+  EXPECT_EQ(std::set<std::string>({"u2"}), idsOf(hreq.getDocs())) << hreq.rawResponse();
+}
+
+TEST_F(HttpApiTest, malformedUpdateJsonIs400) {
+  auto res = httpRequest(port(), http::verb::post, "/collections/main/update", "{not json");
+  EXPECT_EQ(400, res.result_int());
+  EXPECT_NE(res.body().find(R"("error")"), std::string::npos) << res.body();
+}
+
+TEST_F(HttpApiTest, updateResponseUsesSnakeCase) {
+  auto res = httpRequest(port(), http::verb::post, "/collections/main/update",
+      R"({"request_id":"req-1","docs":[{"id":"shape1","title_w":"shape"}],"commit":{}})");
+  ASSERT_EQ(200, res.result_int()) << res.body();
+  EXPECT_NE(res.body().find(R"("update_version")"), std::string::npos) << res.body();
+  EXPECT_NE(res.body().find(R"("request_id":"req-1")"), std::string::npos) << res.body();
+}
+
 // HTTP results match the in-process engine for the same query, and a doc missing
 // a requested field renders that field as JSON null.
 TEST_F(HttpApiTest, matchQueryParityAndNull) {

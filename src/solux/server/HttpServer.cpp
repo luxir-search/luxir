@@ -27,6 +27,8 @@
 #include "JsonRequest.h"
 #include "solux/api/build.h"
 #include "JsonResponse.h"
+#include "ProtoUpdateMessage.h"
+#include "solux/util/thread.h"
 
 namespace solux {
 
@@ -38,10 +40,16 @@ using tcp = net::ip::tcp;
 class HttpSession;
 
 using HttpSearchReqProto = solux::api::SearchRequest;
+using HttpUpdateReqProto = solux::api::UpdateRequest;
 
 struct HttpSearchRequestState {
   std::pmr::monotonic_buffer_resource resource;
   HttpSearchReqProto proto;  // non-owning; backed by `resource`
+};
+
+struct HttpUpdateState {
+  std::pmr::monotonic_buffer_resource resource;
+  HttpUpdateReqProto proto;  // non-owning; backed by `resource`
 };
 
 // One SearchRequest per HTTP query.  Engine workers call reply() from a task
@@ -140,15 +148,22 @@ private:
     route(parser_->release());
   }
 
-  static bool parseQueryPath(std::string_view target, std::string& coll) {
-    // /collections/{c}/query  (route() strips any ?query-string before matching)
+  static bool parseCollectionPath(std::string_view target, std::string_view suffix, std::string& coll) {
+    // /collections/{c}/{endpoint}  (route() strips any ?query-string before matching)
     constexpr std::string_view pre = "/collections/";
-    constexpr std::string_view suf = "/query";
-    if (!target.starts_with(pre) || !target.ends_with(suf)) return false;
-    auto name = target.substr(pre.size(), target.size() - pre.size() - suf.size());
+    if (!target.starts_with(pre) || !target.ends_with(suffix)) return false;
+    auto name = target.substr(pre.size(), target.size() - pre.size() - suffix.size());
     if (name.empty() || name.find('/') != std::string_view::npos) return false;
     coll.assign(name);
     return true;
+  }
+
+  static bool parseQueryPath(std::string_view target, std::string& coll) {
+    return parseCollectionPath(target, "/query", coll);
+  }
+
+  static bool parseUpdatePath(std::string_view target, std::string& coll) {
+    return parseCollectionPath(target, "/update", coll);
   }
 
   struct UrlParam {
@@ -236,10 +251,21 @@ private:
       } else {
         handleQuery(req.body(), coll);
       }
+    } else if (req.method() == http::verb::post && parseUpdatePath(target, coll)) {
+      handleUpdate(req.body(), coll);
     } else {
       respondSimple(http::status::not_found, "application/json",
                     renderErrorBody("not found"));
     }
+  }
+
+  static void setCollectionTarget(std::optional<solux::api::Target>& collection,
+                                  const std::string& coll,
+                                  std::pmr::memory_resource& resource) {
+    // Collection target: one-element name span, arena-backed (coll is transient).
+    auto& tgt = collection.emplace();
+    std::string_view* nm = solux::api::build::allocArray(tgt.name, 1, resource);
+    nm[0] = solux::api::build::arenaStr(resource, coll);
   }
 
   // Fill state.proto with the EFFECTIVE request: the parsed body (either dialect
@@ -249,10 +275,7 @@ private:
                                     HttpSearchRequestState& state) {
     // Build the NON-OWNING request directly into the request state's arena.
     parseQueryRequest(body, state.proto, state.resource);
-    // Collection target: one-element name span, arena-backed (coll is transient).
-    auto& tgt = state.proto.collection.emplace();
-    std::string_view* nm = solux::api::build::allocArray(tgt.name, 1, state.resource);
-    nm[0] = solux::api::build::arenaStr(state.resource, coll);
+    setCollectionTarget(state.proto.collection, coll, state.resource);
   }
 
   // ?explain=request: parse exactly as a query would be, then return the canonical
@@ -296,6 +319,62 @@ private:
     // Dispatch the synchronous engine.submit() off the strand so the io thread
     // is not blocked for the query's duration.  reply() posts results back here.
     node_.getTaskArena().enqueue([sreq, &engine] { engine.submit(*sreq, true); });
+  }
+
+  void handleUpdate(const std::string& body, const std::string& coll) {
+    auto state = std::make_shared<HttpUpdateState>();
+    try {
+      std::string err;
+      if (!solux::api::read_json(state->proto, body, state->resource, &err)) {
+        throw std::runtime_error(err.empty() ? "malformed update request" : err);
+      }
+      setCollectionTarget(state->proto.collection, coll, state->resource);
+    } catch (const std::exception& e) {
+      respondSimple(http::status::bad_request, "application/json",
+                    renderErrorBody(e.what()));
+      return;
+    }
+
+    auto workGuard = std::make_shared<net::executor_work_guard<net::any_io_executor>>(
+        stream_.get_executor());
+    node_.getTaskArena().enqueue([self = shared_from_this(), state, workGuard] {
+      http::status status = http::status::ok;
+      std::string out;
+      try {
+        std::shared_ptr<Collection> collection =
+            self->node_.resolveCollection(state->proto.collection ? &*state->proto.collection : nullptr);
+        auto shard = collection->getShard();
+        auto iw = shard->getIndexWriter();
+
+        class BlockingUpdateMessage : public ProtoUpdateMessage {
+        public:
+          Blocker blocker;
+          explicit BlockingUpdateMessage(const HttpUpdateReqProto* req) : ProtoUpdateMessage(req) {}
+          void done(IndexWriter& iw) override {
+            unused(iw);
+            blocker.notify();
+          }
+        };
+
+        BlockingUpdateMessage msg(&state->proto);
+        bool success = iw->submitUpdate(&msg);
+        assert(success);
+        unused(success);
+        msg.blocker.wait();
+        auto* resp = msg.finishResponse();
+        if (!solux::api::write_json(*resp, out)) {
+          throw std::runtime_error("failed to serialize update response");
+        }
+      } catch (const std::exception& e) {
+        status = http::status::internal_server_error;
+        out = renderErrorBody(e.what());
+      }
+
+      net::post(self->stream_.get_executor(),
+          [self, workGuard, status, body = std::move(out)]() mutable {
+            self->respondSimple(status, "application/json", std::move(body));
+          });
+    });
   }
 
   // --- streaming (chunked NDJSON) write pump --------------------------------
