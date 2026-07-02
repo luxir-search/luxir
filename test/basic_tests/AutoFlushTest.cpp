@@ -1,8 +1,11 @@
-// Inverter auto-flush: a single indexing request that grows past IndexWriter's
-// per-inverter caps flushes the current inverter to a segment mid-request and
-// continues into a fresh one, bounding the RAM one (e.g. non-stop-stream) request
-// holds.  Only non-atomic requests may flush mid-request; an all_or_none request
-// keeps every doc in one inverter so a later failure can roll the whole request back.
+// Inverter auto-flush: the size-based flush is checked ONCE per update message, at
+// the end of the batch (never mid-request). A whole message stays in one inverter,
+// so within-request id overwrites stay correct; a non-stop stream is byte-batched
+// into many messages that accumulate in the reused idle inverter, and the
+// per-message check flushes it once it grows past a cap. See ProtoUpdateMessage.cpp
+// and solux-private/inverter-autoflush.md for the rationale (mid-request flush was
+// rejected because it splits a request's shared updateVersion across segments and
+// breaks version-gated overwrite deletes).
 
 #include <gtest/gtest.h>
 
@@ -32,59 +35,62 @@ struct CapGuard {
 };
 }  // namespace
 
-// A non-atomic request of many docs, with a small doc cap, must flush to more than
-// one segment, and every doc must be durable + searchable after commit.
-TEST_F(AutoFlushTest, nonAtomicAutoFlushesToMultipleSegments) {
+// A single update message never splits mid-request, even far past the cap: it lands
+// in ONE segment, and a duplicate id within the message is overwritten in memory
+// (straddling would-be flush boundaries). If the request were split, the two copies
+// would share one updateVersion and the earlier one could not be superseded.
+TEST_F(AutoFlushTest, singleMessageKeptWholeAndOverwritesResolve) {
   CollectionHelper helper;
   helper.clear();
   CapGuard capGuard(helper.getIndexWriter());
-  helper.getIndexWriter()->perInverterMaxDocs = 5;  // force a flush every few docs
+  helper.getIndexWriter()->perInverterMaxDocs = 5;  // tiny cap: a split, if it happened, would be visible
 
   const int nDocs = 23;
   std::vector<Doc> docs;
   for (int i = 0; i < nDocs; i++) {
-    docs.push_back(flatdoc("id", std::to_string(i), "foo_w", "brown fox jumped"));
+    // Two docs (indices 1 and 17, straddling the 5/10/15 would-be flush points) reuse id "dup".
+    std::string id = (i == 1 || i == 17) ? "dup" : ("id" + std::to_string(i));
+    docs.push_back(flatdoc("id", id, "foo_w", "brown fox jumped"));
   }
-  helper.indexAll(docs, UpdateMessage::COMMIT);  // one non-atomic message, then commit
+  helper.indexAll(docs, UpdateMessage::COMMIT, /*overwrite=*/true);  // one message, overwrite mode
 
   auto reader = helper.getIndexWriter()->getIndexReader();
-  EXPECT_GT(reader->segments().size(), 1u)
-      << "expected mid-request auto-flush to produce multiple segments";
-
-  int64_t totalDocs = 0;
-  for (const auto& seg : reader->segments()) totalDocs += seg.postingsReader().maxDoc();
-  EXPECT_EQ(totalDocs, nDocs);
+  ASSERT_EQ(reader->segments().size(), 1u)
+      << "a single message must stay in one inverter/segment (no mid-request flush)";
 
   auto req = localReq(helper.getSearchEngine());
   req->collection("main");
   req->topDocs("q").allQuery().withStats().limit(100);
   req->execute();
   ASSERT_OK(req);
-  EXPECT_EQ(req->getMatchCount("q"), nDocs);
+  // 23 docs, two share id "dup" -> 22 unique live docs (the earlier "dup" was overwritten).
+  EXPECT_EQ(req->getMatchCount("q"), nDocs - 1);
 }
 
-// An all_or_none request must NOT auto-flush mid-request even past the cap: all docs
-// stay in one inverter (one segment) so the whole request could still be rolled back.
-TEST_F(AutoFlushTest, allOrNoneDoesNotAutoFlushMidRequest) {
+// A non-stop stream is many small messages that accumulate in the reused idle
+// inverter; the per-message end-of-batch check flushes it once it passes the cap,
+// so a run of small messages produces multiple bounded segments.
+TEST_F(AutoFlushTest, accumulationAcrossMessagesFlushesAtBoundaries) {
   CollectionHelper helper;
   helper.clear();
   CapGuard capGuard(helper.getIndexWriter());
   helper.getIndexWriter()->perInverterMaxDocs = 5;
 
-  const int nDocs = 23;
-  CollectionHelper::UpdateBuilder b;
+  const int nDocs = 24;
   for (int i = 0; i < nDocs; i++) {
-    b.add(flatdoc("id", std::to_string(i), "foo_w", "brown fox jumped"));
+    // One doc per message, no commit: each message reuses+grows the same idle inverter.
+    helper.index(flatdoc("id", "id" + std::to_string(i), "foo_w", "brown fox jumped"),
+                 UpdateMessage::NO_COMMIT);
   }
-  b.allOrNone(true);
-  b.commit();
-  auto result = helper.submit(b);
-  EXPECT_TRUE(result.success);
+  helper.commit();
 
   auto reader = helper.getIndexWriter()->getIndexReader();
-  ASSERT_EQ(reader->segments().size(), 1u)
-      << "all_or_none must keep every doc in one inverter (no mid-request flush)";
-  EXPECT_EQ(reader->segments()[0].postingsReader().maxDoc(), nDocs);
+  EXPECT_GT(reader->segments().size(), 1u)
+      << "per-message flush should bound accumulation into multiple segments";
+
+  int64_t totalDocs = 0;
+  for (const auto& seg : reader->segments()) totalDocs += seg.postingsReader().maxDoc();
+  EXPECT_EQ(totalDocs, nDocs);
 
   auto req = localReq(helper.getSearchEngine());
   req->collection("main");

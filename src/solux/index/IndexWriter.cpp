@@ -273,7 +273,10 @@ void IndexWriter::releaseInverter(Inverter& inverter, bool flush) {
   }
 
   // TODO: update and check global statistics
-  // TODO: if the inverter is over a certain size, flush it
+  // Size-based auto-flush is driven by the caller (ProtoUpdateMessage::handle passes
+  // flush=true at end of batch when inverter.shouldFlush() is true), not decided here:
+  // the message handler owns the safe flush point (a closed undo scope). Phase 2's
+  // global budget will add IndexWriter-side marking on top of this seam.
 
   // if this inverter is part of a commit, initiate a flush.
   if (inverter.commitInfo != nullptr || flush) {
