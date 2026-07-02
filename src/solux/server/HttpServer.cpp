@@ -141,9 +141,7 @@ private:
   }
 
   static bool parseQueryPath(std::string_view target, std::string& coll) {
-    // /collections/{c}/query  (ignore any ?query-string)
-    auto q = target.find('?');
-    if (q != std::string_view::npos) target = target.substr(0, q);
+    // /collections/{c}/query  (route() strips any ?query-string before matching)
     constexpr std::string_view pre = "/collections/";
     constexpr std::string_view suf = "/query";
     if (!target.starts_with(pre) || !target.ends_with(suf)) return false;
@@ -153,31 +151,135 @@ private:
     return true;
   }
 
+  struct UrlParam {
+    std::string key;
+    std::string value;
+  };
+
+  // Standard form-decoding: %XX hex escapes and '+' as space. Malformed escapes
+  // pass through literally (lenient - the URL is an open channel).
+  static std::string urlDecode(std::string_view s) {
+    auto hex = [](char c) -> int {
+      if (c >= '0' && c <= '9') return c - '0';
+      if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+      if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+      return -1;
+    };
+    std::string out;
+    out.reserve(s.size());
+    for (size_t i = 0; i < s.size(); i++) {
+      char c = s[i];
+      if (c == '+') {
+        out += ' ';
+      } else if (c == '%' && i + 2 < s.size() && hex(s[i + 1]) >= 0 && hex(s[i + 2]) >= 0) {
+        out += (char)(hex(s[i + 1]) * 16 + hex(s[i + 2]));
+        i += 2;
+      } else {
+        out += c;
+      }
+    }
+    return out;
+  }
+
+  // Parse the &-separated query string into decoded key/value pairs. Unknown
+  // parameters are KEPT, not rejected: the URL is an open ecosystem channel
+  // (correlation ids, tracing, middleware), and the parsed params are the seam
+  // for the future typed field overlay and $var substitution bindings. Keys we
+  // do recognize enforce their values strictly (a bad value on a known key is
+  // an author error, not middleware noise).
+  static std::vector<UrlParam> parseParams(std::string_view params) {
+    std::vector<UrlParam> out;
+    while (!params.empty()) {
+      auto amp = params.find('&');
+      std::string_view kv = params.substr(0, amp);
+      params = (amp == std::string_view::npos) ? std::string_view() : params.substr(amp + 1);
+      if (kv.empty()) continue;
+      auto eq = kv.find('=');
+      std::string_view k = kv.substr(0, eq);
+      std::string_view v = (eq == std::string_view::npos) ? std::string_view() : kv.substr(eq + 1);
+      out.push_back({urlDecode(k), urlDecode(v)});
+    }
+    return out;
+  }
+
+  // Last occurrence wins, matching map semantics elsewhere.
+  static const std::string* findParam(const std::vector<UrlParam>& params, std::string_view key) {
+    for (auto it = params.rbegin(); it != params.rend(); ++it) {
+      if (it->key == key) return &it->value;
+    }
+    return nullptr;
+  }
+
   void route(http::request<http::string_body> req) {
     httpVersion_ = req.version();
     keepAlive_ = req.keep_alive();
 
+    std::string_view target(req.target());
+    std::string_view query;
+    if (auto q = target.find('?'); q != std::string_view::npos) {
+      query = target.substr(q + 1);
+      target = target.substr(0, q);
+    }
+    std::vector<UrlParam> params = parseParams(query);
+
     std::string coll;
-    if (req.method() == http::verb::get && req.target() == "/health") {
+    if (req.method() == http::verb::get && target == "/health") {
       respondSimple(http::status::ok, "application/json", R"({"status":"ok"})");
-    } else if (req.method() == http::verb::post && parseQueryPath(req.target(), coll)) {
-      handleQuery(req.body(), coll);
+    } else if (req.method() == http::verb::post && parseQueryPath(target, coll)) {
+      if (const std::string* explain = findParam(params, "explain")) {
+        if (*explain != "request") {
+          respondSimple(http::status::bad_request, "application/json",
+                        renderErrorBody("unknown explain mode '" + *explain + "' (valid: request)"));
+          return;
+        }
+        handleExplain(req.body(), coll);
+      } else {
+        handleQuery(req.body(), coll);
+      }
     } else {
       respondSimple(http::status::not_found, "application/json",
                     renderErrorBody("not found"));
     }
   }
 
+  // Fill state.proto with the EFFECTIVE request: the parsed body (either dialect
+  // form) with the path-derived collection applied (overwrites a body-supplied one).
+  // Throws with a client-facing message on malformed input.
+  static void parseEffectiveRequest(const std::string& body, const std::string& coll,
+                                    HttpSearchRequestState& state) {
+    // Build the NON-OWNING request directly into the request state's arena.
+    parseQueryRequest(body, state.proto, state.resource);
+    // Collection target: one-element name span, arena-backed (coll is transient).
+    auto& tgt = state.proto.collection.emplace();
+    std::string_view* nm = solux::api::build::allocArray(tgt.name, 1, state.resource);
+    nm[0] = solux::api::build::arenaStr(state.resource, coll);
+  }
+
+  // ?explain=request: parse exactly as a query would be, then return the canonical
+  // JSON of the effective request INSTEAD of executing it. Sugar expands, shorthand
+  // lowers, and the output is itself a valid request body (posting it back runs the
+  // identical query). Parse + serialize only - no engine work, so it runs inline.
+  void handleExplain(const std::string& body, const std::string& coll) {
+    HttpSearchRequestState state;
+    std::string out;
+    try {
+      parseEffectiveRequest(body, coll, state);
+      if (!solux::api::write_json(state.proto, out)) {
+        throw std::runtime_error("failed to serialize request");
+      }
+    } catch (const std::exception& e) {
+      respondSimple(http::status::bad_request, "application/json",
+                    renderErrorBody(e.what()));
+      return;
+    }
+    respondSimple(http::status::ok, "application/json", out);
+  }
+
   void handleQuery(const std::string& body, const std::string& coll) {
     auto* arena = createArena();
     auto requestState = std::make_unique<HttpSearchRequestState>();
     try {
-      // Build the NON-OWNING request directly into the request state's arena.
-      parseQueryRequest(body, requestState->proto, requestState->resource);
-      // Collection target: one-element name span, arena-backed (coll is transient).
-      auto& tgt = requestState->proto.collection.emplace();
-      std::string_view* nm = solux::api::build::allocArray(tgt.name, 1, requestState->resource);
-      nm[0] = solux::api::build::arenaStr(requestState->resource, coll);
+      parseEffectiveRequest(body, coll, *requestState);
     } catch (const std::exception& e) {
       releaseArena(arena);
       respondSimple(http::status::bad_request, "application/json",

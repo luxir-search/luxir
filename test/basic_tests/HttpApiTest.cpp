@@ -124,6 +124,77 @@ TEST_F(HttpApiTest, rootShorthand) {
   EXPECT_NE(bad.body().find(R"("error")"), std::string::npos);
 }
 
+// ?explain=request echoes the canonical form of the parsed request instead of
+// executing it. The echo is itself a valid request body (POST-back equivalence)
+// and echoing the echo is a fixpoint.
+TEST_F(HttpApiTest, explainRequestEcho) {
+  helper.indexAll(std::array{
+    flatdoc("id", std::string("e1"), "status_s", std::string("active"),
+            "title_w", std::string("alpha")),
+    flatdoc("id", std::string("e2"), "status_s", std::string("inactive"),
+            "title_w", std::string("beta")),
+  }, UpdateMessage::COMMIT);
+
+  const std::string body = R"({"query":{"match":{"status_s":"active"}},"fields":["id"]})";
+  auto echo = httpRequest(port(), http::verb::post,
+                          "/collections/main/query?explain=request", body);
+  ASSERT_EQ(200, echo.result_int()) << echo.body();
+  const std::string canonical = echo.body();
+  // sugar expanded to canonical match, shorthand lowered into ops, collection applied
+  EXPECT_NE(canonical.find(R"("ops")"), std::string::npos) << canonical;
+  EXPECT_NE(canonical.find(R"("top_docs")"), std::string::npos) << canonical;
+  EXPECT_NE(canonical.find(R"("field":"status_s")"), std::string::npos) << canonical;
+  EXPECT_NE(canonical.find(R"("val":"active")"), std::string::npos) << canonical;
+  EXPECT_NE(canonical.find(R"("collection")"), std::string::npos) << canonical;
+  // not executed
+  EXPECT_EQ(canonical.find(R"("docs")"), std::string::npos) << canonical;
+  EXPECT_EQ(canonical.find(R"("found")"), std::string::npos) << canonical;
+
+  // POST-back equivalence: the echo output runs identically to the original body.
+  auto direct = httpRequest(port(), http::verb::post, "/collections/main/query", body);
+  auto viaEcho = httpRequest(port(), http::verb::post, "/collections/main/query", canonical);
+  ASSERT_EQ(200, viaEcho.result_int()) << viaEcho.body();
+  EXPECT_EQ(direct.body(), viaEcho.body());
+
+  // Fixpoint: echoing the echo is byte-identical.
+  auto echo2 = httpRequest(port(), http::verb::post,
+                           "/collections/main/query?explain=request", canonical);
+  ASSERT_EQ(200, echo2.result_int());
+  EXPECT_EQ(canonical, echo2.body());
+}
+
+// URL-parameter policy: unknown parameters are accepted and ignored (the URL is
+// an open channel - correlation ids, middleware); recognized keys enforce values.
+TEST_F(HttpApiTest, urlParamPolicy) {
+  // bad value on a RECOGNIZED key is an author error
+  auto bad = httpRequest(port(), http::verb::post, "/collections/main/query?explain=foo",
+                         R"({"limit":1})");
+  EXPECT_EQ(400, bad.result_int());
+  EXPECT_NE(bad.body().find(R"("error")"), std::string::npos) << bad.body();
+
+  // unknown params (e.g. a correlation id) pass through; the query executes
+  auto unknown = httpRequest(port(), http::verb::post,
+                             "/collections/main/query?trace_id=abc-123&_=17",
+                             R"({"limit":1})");
+  EXPECT_EQ(200, unknown.result_int()) << unknown.body();
+
+  // unknown params compose with explain (last-wins on repeats)
+  auto both = httpRequest(port(), http::verb::post,
+                          "/collections/main/query?trace_id=x&explain=request",
+                          R"({"limit":1})");
+  EXPECT_EQ(200, both.result_int()) << both.body();
+  EXPECT_NE(both.body().find(R"("ops")"), std::string::npos) << both.body();
+
+  auto malformed = httpRequest(port(), http::verb::post,
+                               "/collections/main/query?explain=request", "{not json");
+  EXPECT_EQ(400, malformed.result_int());
+  EXPECT_NE(malformed.body().find(R"("error")"), std::string::npos) << malformed.body();
+
+  // health ignores params entirely
+  auto health = httpRequest(port(), http::verb::get, "/health?explain=request&x=1");
+  EXPECT_EQ(200, health.result_int());
+}
+
 // A string field containing JSON-significant characters round-trips through the
 // renderer's escaping and back via the glaze parse in HttpReq.
 TEST_F(HttpApiTest, stringEscaping) {
