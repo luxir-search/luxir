@@ -1,7 +1,10 @@
 #include <array>
+#include <chrono>
 #include <optional>
 #include <set>
+#include <sstream>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "test/SoluxTest.h"
@@ -56,6 +59,79 @@ protected:
       start = nl + 1;
     }
     return lines;
+  }
+
+  static std::vector<std::string> idsInUpdateLine(const std::string& line) {
+    std::vector<std::string> out;
+    glz::generic_i64 root;
+    if (glz::read_json(root, line)) return out;
+    if (!root.is_object() || !root.contains("ids")) return out;
+    auto* ids = root["ids"].get_if<glz::generic_i64::array_t>();
+    if (ids == nullptr) return out;
+    for (const auto& id : *ids) {
+      if (auto* s = id.get_if<std::string>()) out.push_back(*s);
+    }
+    return out;
+  }
+
+  static void writeRawHttpChunk(beast::tcp_stream& stream, std::string_view body) {
+    std::ostringstream os;
+    os << std::hex << body.size();
+    std::string frame = os.str();
+    frame += "\r\n";
+    frame += body;
+    frame += "\r\n";
+    net::write(stream, net::buffer(frame));
+  }
+
+  static bool readNextBodyLine(beast::tcp_stream& stream, beast::flat_buffer& buffer,
+                               http::response_parser<http::buffer_body>& parser,
+                               std::string& pending, std::string& line, std::string& err) {
+    for (;;) {
+      std::size_t nl = pending.find('\n');
+      if (nl != std::string::npos) {
+        line = pending.substr(0, nl);
+        pending.erase(0, nl + 1);
+        return true;
+      }
+      if (parser.is_done()) {
+        err = "response ended before the next NDJSON line";
+        return false;
+      }
+
+      std::array<char, 4096> body{};
+      parser.get().body().data = body.data();
+      parser.get().body().size = body.size();
+      beast::error_code ec;
+      http::read_some(stream, buffer, parser, ec);
+      std::size_t produced = body.size() - parser.get().body().size;
+      pending.append(body.data(), produced);
+      if (ec == http::error::need_buffer) continue;
+      if (ec) {
+        err = ec.message();
+        return false;
+      }
+    }
+  }
+
+  static bool drainBody(beast::tcp_stream& stream, beast::flat_buffer& buffer,
+                        http::response_parser<http::buffer_body>& parser,
+                        std::string& pending, std::string& err) {
+    while (!parser.is_done()) {
+      std::array<char, 4096> body{};
+      parser.get().body().data = body.data();
+      parser.get().body().size = body.size();
+      beast::error_code ec;
+      http::read_some(stream, buffer, parser, ec);
+      std::size_t produced = body.size() - parser.get().body().size;
+      pending.append(body.data(), produced);
+      if (ec == http::error::need_buffer) continue;
+      if (ec) {
+        err = ec.message();
+        return false;
+      }
+    }
+    return true;
   }
 };
 
@@ -252,6 +328,110 @@ TEST_F(HttpApiTest, ndjsonNoGroupReturnsOneLine) {
   auto lines = splitLines(update.body());
   ASSERT_EQ(1u, lines.size()) << update.body();
   EXPECT_NE(lines[0].find(R"("update_version")"), std::string::npos) << update.body();
+}
+
+TEST_F(HttpApiTest, ndjsonCheckpointMarkerEmitsLineMidStream) {
+  std::string body =
+      R"({"_update_":{"request_id":"g1"}})" "\n"
+      R"({"id":"cp1","title_w":"checkpoint token"})" "\n"
+      "{}\n"
+      R"({"id":"cp2","title_w":"checkpoint token"})" "\n"
+      R"({"_update_":{"commit":{}}})" "\n";
+
+  auto update = httpRequest(port(), http::verb::post, "/collections/main/update",
+                            std::move(body), "application/x-ndjson");
+  ASSERT_EQ(200, update.result_int()) << update.body();
+  auto lines = splitLines(update.body());
+  ASSERT_EQ(2u, lines.size()) << update.body();
+  EXPECT_NE(lines[0].find(R"("request_id":"g1")"), std::string::npos) << update.body();
+  EXPECT_NE(lines[1].find(R"("request_id":"g1")"), std::string::npos) << update.body();
+  EXPECT_EQ(std::vector<std::string>({"cp1"}), idsInUpdateLine(lines[0])) << update.body();
+  EXPECT_EQ(std::vector<std::string>({"cp2"}), idsInUpdateLine(lines[1])) << update.body();
+
+  HttpReq hreq(port());
+  hreq.collection("main").matchQuery("title_w", "checkpoint").fields({"id"})
+      .limit(10).withStats().execute();
+
+  ASSERT_EQ(200, hreq.status()) << hreq.rawResponse();
+  EXPECT_EQ(std::set<std::string>({"cp1", "cp2"}), idsOf(hreq.getDocs()))
+      << hreq.rawResponse();
+}
+
+TEST_F(HttpApiTest, ndjsonCheckpointStatsAreDeltaNotCumulative) {
+  std::string body =
+      R"({"_update_":{"request_id":"delta"}})" "\n"
+      R"({"id":"dlt1","title_w":"deltatoken"})" "\n"
+      R"({"id":"dlt2","title_w":"deltatoken"})" "\n"
+      "{}\n"
+      R"({"id":"dlt3","title_w":"deltatoken"})" "\n"
+      R"({"_update_":{"commit":{}}})" "\n";
+
+  auto update = httpRequest(port(), http::verb::post, "/collections/main/update",
+                            std::move(body), "application/x-ndjson");
+  ASSERT_EQ(200, update.result_int()) << update.body();
+  auto lines = splitLines(update.body());
+  ASSERT_EQ(2u, lines.size()) << update.body();
+  auto firstIds = idsInUpdateLine(lines[0]);
+  auto secondIds = idsInUpdateLine(lines[1]);
+  EXPECT_EQ((std::vector<std::string>{"dlt1", "dlt2"}), firstIds) << update.body();
+  EXPECT_EQ((std::vector<std::string>{"dlt3"}), secondIds) << update.body();
+}
+
+TEST_F(HttpApiTest, ndjsonCheckpointAckArrivesBeforeRequestBodyEnds) {
+  net::io_context cioc;
+  beast::tcp_stream stream(cioc);
+  tcp::resolver resolver(cioc);
+  stream.connect(resolver.resolve("127.0.0.1", std::to_string(port())));
+  stream.expires_after(std::chrono::seconds(10));
+
+  std::string header =
+      "POST /collections/main/update HTTP/1.1\r\n"
+      "Host: 127.0.0.1\r\n"
+      "Content-Type: application/x-ndjson\r\n"
+      "Transfer-Encoding: chunked\r\n"
+      "\r\n";
+  net::write(stream, net::buffer(header));
+
+  writeRawHttpChunk(stream,
+      R"({"_update_":{"request_id":"g1"}})" "\n"
+      R"({"id":"bd1","title_w":"bidirectional token"})" "\n"
+      "{}\n");
+
+  beast::flat_buffer buffer;
+  http::response_parser<http::buffer_body> parser;
+  beast::error_code ec;
+  http::read_header(stream, buffer, parser, ec);
+  ASSERT_FALSE(ec) << ec.message();
+  ASSERT_EQ(200, parser.get().result_int());
+
+  std::string pending;
+  std::string err;
+  std::string firstLine;
+  ASSERT_TRUE(readNextBodyLine(stream, buffer, parser, pending, firstLine, err)) << err;
+  EXPECT_NE(firstLine.find(R"("request_id":"g1")"), std::string::npos) << firstLine;
+  EXPECT_EQ(std::vector<std::string>({"bd1"}), idsInUpdateLine(firstLine)) << firstLine;
+
+  writeRawHttpChunk(stream,
+      R"({"id":"bd2","title_w":"bidirectional token"})" "\n"
+      R"({"_update_":{"commit":{}}})" "\n");
+
+  std::string secondLine;
+  ASSERT_TRUE(readNextBodyLine(stream, buffer, parser, pending, secondLine, err)) << err;
+  EXPECT_NE(secondLine.find(R"("request_id":"g1")"), std::string::npos) << secondLine;
+  EXPECT_EQ(std::vector<std::string>({"bd2"}), idsInUpdateLine(secondLine)) << secondLine;
+
+  net::write(stream, net::buffer(std::string("0\r\n\r\n")));
+  ASSERT_TRUE(drainBody(stream, buffer, parser, pending, err)) << err;
+  EXPECT_TRUE(pending.empty()) << pending;
+
+  HttpReq hreq(port());
+  hreq.collection("main").matchQuery("title_w", "bidirectional").fields({"id"})
+      .limit(10).withStats().execute();
+  ASSERT_EQ(200, hreq.status()) << hreq.rawResponse();
+  EXPECT_EQ(std::set<std::string>({"bd1", "bd2"}), idsOf(hreq.getDocs()))
+      << hreq.rawResponse();
+
+  stream.socket().shutdown(tcp::socket::shutdown_both, ec);
 }
 
 TEST_F(HttpApiTest, ndjsonMidStreamErrorAfterGroupEmittedIsFinalLine) {

@@ -100,8 +100,7 @@ struct HttpStreamBatchResult {
   bool failed = false;
 };
 
-struct HttpStreamGroup {
-  std::string requestId;
+struct HttpStreamInterval {
   std::vector<std::string> ids;
   std::vector<HttpStreamAccumError> errors;
   std::uint64_t lastUpdateVersion = 0;
@@ -109,9 +108,6 @@ struct HttpStreamGroup {
   std::size_t docCount = 0;
   std::size_t docsIndexed = 0;
   std::size_t totalErrors = 0;
-  bool allowDups = false;
-  bool explicitRequestId = false;
-  bool touched = false;
 };
 
 struct HttpStreamUpdateState {
@@ -133,10 +129,13 @@ struct HttpStreamUpdateState {
   std::unique_ptr<HttpStreamBatchState> batch;
   std::optional<HttpStreamControl> pendingControl;
   std::shared_ptr<net::executor_work_guard<net::any_io_executor>> workGuard;
-  HttpStreamGroup group;
+  HttpStreamInterval interval;
+  std::string requestId;
   std::size_t docsSeen = 0;
   std::size_t docsIndexedSoFar = 0;
-  bool emittedGroup = false;
+  bool allowDups = false;
+  bool emitAfterBatch = false;
+  bool emittedLine = false;
   bool bodyDone = false;
   bool tailFinished = false;
   bool updateInFlight = false;
@@ -676,7 +675,7 @@ private:
     }
     parser_->get().body().data = state->readBuf.data();
     parser_->get().body().size = state->readBuf.size();
-    http::async_read(stream_, buffer_, *parser_,
+    http::async_read_some(stream_, buffer_, *parser_,
         beast::bind_front_handler(&HttpSession::onStreamBodyRead, shared_from_this()));
   }
 
@@ -703,31 +702,30 @@ private:
     drainStreamRecords();
   }
 
-  static bool shouldEmitStreamGroup(const HttpStreamUpdateState& state, bool last) {
-    return state.group.touched || state.group.explicitRequestId || (last && !state.emittedGroup);
+  static bool streamIntervalHasDocs(const HttpStreamUpdateState& state) {
+    return state.interval.docCount > 0;
   }
 
-  static void startStreamGroup(HttpStreamUpdateState& state, std::string requestId) {
-    state.group = HttpStreamGroup();
-    state.group.requestId = std::move(requestId);
-    state.group.firstDocIndex = state.docsSeen;
-    state.group.explicitRequestId = true;
+  static void resetStreamInterval(HttpStreamUpdateState& state) {
+    state.interval = HttpStreamInterval();
+    state.interval.firstDocIndex = state.docsSeen;
   }
 
-  static bool renderStreamGroupResponseLine(const HttpStreamGroup& group, std::string& out) {
+  static bool renderStreamIntervalResponseLine(const HttpStreamUpdateState& state, std::string& out) {
+    const auto& interval = state.interval;
     std::pmr::monotonic_buffer_resource responseResource;
     solux::api::UpdateResponse resp;
-    resp.request_id = solux::api::build::arenaStr(responseResource, group.requestId);
-    resp.update_version = group.lastUpdateVersion;
+    resp.request_id = solux::api::build::arenaStr(responseResource, state.requestId);
+    resp.update_version = interval.lastUpdateVersion;
 
     solux::api::build::SpanBuilder<std::string_view> ids(responseResource);
-    ids.reserve(group.ids.size());
-    for (const auto& id : group.ids) ids.push_back(solux::api::build::arenaStr(responseResource, id));
+    ids.reserve(interval.ids.size());
+    for (const auto& id : interval.ids) ids.push_back(solux::api::build::arenaStr(responseResource, id));
     resp.ids = ids.finish();
 
     solux::api::build::SpanBuilder<solux::api::UpdateResponse_::Error> errors(responseResource);
-    errors.reserve(group.errors.size());
-    for (const auto& src : group.errors) {
+    errors.reserve(interval.errors.size());
+    for (const auto& src : interval.errors) {
       auto& dst = errors.emplace_back();
       dst.id = solux::api::build::arenaStr(responseResource, src.id);
       dst.error_message = solux::api::build::arenaStr(responseResource, src.errorMessage);
@@ -735,16 +733,16 @@ private:
     }
     resp.errors = errors.finish();
 
-    if (group.totalErrors == 0) {
+    if (interval.totalErrors == 0) {
       resp.status = solux::api::UpdateResponse_::Status::OK;
-    } else if (group.docsIndexed > 0) {
+    } else if (interval.docsIndexed > 0) {
       resp.status = solux::api::UpdateResponse_::Status::PARTIAL;
     } else {
       resp.status = solux::api::UpdateResponse_::Status::ERROR;
     }
-    if (group.totalErrors > group.errors.size()) {
-      std::string msg = "retained first " + std::to_string(group.errors.size()) + " of " +
-          std::to_string(group.totalErrors) + " errors";
+    if (interval.totalErrors > interval.errors.size()) {
+      std::string msg = "retained first " + std::to_string(interval.errors.size()) + " of " +
+          std::to_string(interval.totalErrors) + " errors";
       resp.error_message = solux::api::build::arenaStr(responseResource, msg);
     }
 
@@ -769,17 +767,18 @@ private:
     return true;
   }
 
-  bool emitCurrentStreamGroup(bool last) {
+  bool emitCurrentStreamInterval(bool last, bool force) {
     auto state = streamUpdate_;
     assert(state != nullptr);
-    if (!shouldEmitStreamGroup(*state, last)) return true;
+    if (!force && !streamIntervalHasDocs(*state)) return true;
 
     std::string out;
-    if (!renderStreamGroupResponseLine(state->group, out)) {
+    if (!renderStreamIntervalResponseLine(*state, out)) {
       failStreamingUpdate("failed to serialize update response");
       return false;
     }
-    state->emittedGroup = true;
+    state->emittedLine = true;
+    resetStreamInterval(*state);
     enqueueLine(std::move(out), last);
     return true;
   }
@@ -794,8 +793,8 @@ private:
     message += " (docs_indexed_so_far=" + std::to_string(docsIndexed) + ")";
     if (headerSent_) {
       std::string out;
-      std::string_view requestId = state ? std::string_view(state->group.requestId) : std::string_view();
-      std::uint64_t updateVersion = state ? state->group.lastUpdateVersion : 0;
+      std::string_view requestId = state ? std::string_view(state->requestId) : std::string_view();
+      std::uint64_t updateVersion = state ? state->interval.lastUpdateVersion : 0;
       if (!renderStreamErrorResponseLine(requestId, updateVersion, message, out)) {
         doClose();
         return;
@@ -825,14 +824,9 @@ private:
       return false;
     }
 
-    if (isControl) {
-      if (state->batch->docs.size() > 0) {
-        state->pendingControl = std::move(control);
-        submitStreamBatch(nullptr);
-        return false;
-      }
-      return applyStreamControl(std::move(control));
-    }
+    if (isControl) return applyStreamControl(std::move(control));
+
+    if (map.fields.size() == 0) return checkpointStreamInterval(nullptr);
 
     state->batch->docs.push_back(map);
     state->batch->sourceBytes += record.size();
@@ -847,21 +841,34 @@ private:
   bool applyStreamControl(HttpStreamControl control) {
     auto state = streamUpdate_;
     assert(state != nullptr);
-    if (control.requestId) {
-      // A request_id control is a group boundary; sibling fields apply to the new group.
-      if (!emitCurrentStreamGroup(false)) return false;
-      startStreamGroup(*state, std::move(*control.requestId));
-    }
-    if (control.allowDups) {
-      state->group.allowDups = *control.allowDups;
-      state->group.touched = true;
-    }
-    if (control.commit.present) {
-      state->group.touched = true;
-      submitStreamBatch(&control.commit);
+    if (state->batch->docs.size() > 0 && (control.requestId || control.allowDups)) {
+      state->pendingControl = std::move(control);
+      submitStreamBatch(nullptr);
       return false;
     }
+    if (control.requestId) {
+      if (!emitCurrentStreamInterval(false, false)) return false;
+      state->requestId = std::move(*control.requestId);
+    }
+    if (control.allowDups) {
+      state->allowDups = *control.allowDups;
+    }
+    if (control.commit.present) {
+      return checkpointStreamInterval(&control.commit);
+    }
     return true;
+  }
+
+  bool checkpointStreamInterval(const HttpStreamCommitControl* commitControl) {
+    auto state = streamUpdate_;
+    assert(state != nullptr);
+    assert(state->batch != nullptr);
+    if (state->batch->docs.size() > 0 || commitControl != nullptr) {
+      state->emitAfterBatch = true;
+      submitStreamBatch(commitControl);
+      return false;
+    }
+    return emitCurrentStreamInterval(false, true);
   }
 
   void submitStreamBatch(const HttpStreamCommitControl* commitControl) {
@@ -873,10 +880,10 @@ private:
     state->batch->docCount = state->batch->docs.size();
     state->batch->firstDocIndex = state->docsSeen;
     state->docsSeen += state->batch->docCount;
-    state->group.touched = true;
-    state->group.docCount += state->batch->docCount;
+    state->interval.docCount += state->batch->docCount;
     state->batch->proto.docs = state->batch->docs.finish();
-    state->batch->proto.allow_dups = state->group.allowDups;
+    state->batch->proto.allow_dups = state->allowDups;
+    state->batch->proto.return_ids = true;
     setCollectionTarget(state->batch->proto.collection, state->collectionName, state->batch->resource);
     if (commitControl != nullptr) {
       fillCommitParams(state->batch->proto.commit, *commitControl, state->batch->resource);
@@ -948,6 +955,11 @@ private:
 
     foldStreamBatchResult(result);
 
+    if (state->emitAfterBatch) {
+      state->emitAfterBatch = false;
+      if (!emitCurrentStreamInterval(false, true)) return;
+    }
+
     if (state->pendingControl) {
       HttpStreamControl control = std::move(*state->pendingControl);
       state->pendingControl.reset();
@@ -959,34 +971,35 @@ private:
   void foldStreamBatchResult(const HttpStreamBatchResult& result) {
     auto state = streamUpdate_;
     assert(state != nullptr);
-    auto& group = state->group;
-    group.lastUpdateVersion = result.updateVersion;
+    auto& interval = state->interval;
+    interval.lastUpdateVersion = result.updateVersion;
 
     std::size_t failedDocs = result.errors.size();
     if (failedDocs > result.docCount) failedDocs = result.docCount;
     std::size_t indexedDocs = result.docCount - failedDocs;
-    group.docsIndexed += indexedDocs;
+    interval.docsIndexed += indexedDocs;
     state->docsIndexedSoFar += indexedDocs;
 
     for (const auto& id : result.ids) {
-      if (group.ids.size() < HttpStreamUpdateState::kMaxRetainedIds) group.ids.push_back(id);
+      if (interval.ids.size() < HttpStreamUpdateState::kMaxRetainedIds) interval.ids.push_back(id);
     }
 
     for (const auto& err : result.errors) {
-      group.totalErrors++;
-      if (group.errors.size() >= HttpStreamUpdateState::kMaxRetainedErrors) continue;
+      interval.totalErrors++;
+      if (interval.errors.size() >= HttpStreamUpdateState::kMaxRetainedErrors) continue;
       std::size_t globalIndex = result.firstDocIndex;
       if (err.index >= 0) globalIndex += (std::size_t)err.index;
-      std::size_t groupIndex = globalIndex >= group.firstDocIndex ? globalIndex - group.firstDocIndex : 0;
-      group.errors.push_back({err.id, err.errorMessage, cappedErrorIndex(groupIndex)});
+      std::size_t intervalIndex =
+          globalIndex >= interval.firstDocIndex ? globalIndex - interval.firstDocIndex : 0;
+      interval.errors.push_back({err.id, err.errorMessage, cappedErrorIndex(intervalIndex)});
     }
 
     if (!result.errorMessage.empty() && result.status == solux::api::UpdateResponse_::Status::ERROR) {
-      group.totalErrors++;
-      if (group.errors.size() < HttpStreamUpdateState::kMaxRetainedErrors) {
-        std::size_t groupIndex =
-            result.firstDocIndex >= group.firstDocIndex ? result.firstDocIndex - group.firstDocIndex : 0;
-        group.errors.push_back({"", result.errorMessage, cappedErrorIndex(groupIndex)});
+      interval.totalErrors++;
+      if (interval.errors.size() < HttpStreamUpdateState::kMaxRetainedErrors) {
+        std::size_t intervalIndex =
+            result.firstDocIndex >= interval.firstDocIndex ? result.firstDocIndex - interval.firstDocIndex : 0;
+        interval.errors.push_back({"", result.errorMessage, cappedErrorIndex(intervalIndex)});
       }
     }
   }
@@ -1029,7 +1042,11 @@ private:
     if (!state || state->failed) return;
     parser_.reset();
 
-    emitCurrentStreamGroup(true);
+    if (streamIntervalHasDocs(*state) || !state->emittedLine) {
+      emitCurrentStreamInterval(true, true);
+      return;
+    }
+    enqueueLine("", true);
   }
 
   // --- streaming (chunked NDJSON) write pump --------------------------------
@@ -1061,6 +1078,13 @@ private:
       pendingQ_.pop_front();
       inflightLine_ = std::move(p.line);
       if (p.last) lastSeen_ = true;
+      if (p.last && inflightLine_.empty()) {
+        chunkLastSent_ = true;
+        writeOutstanding_ = true;
+        net::async_write(stream_, http::make_chunk_last(),
+            beast::bind_front_handler(&HttpSession::onChunkLastWritten, shared_from_this()));
+        return;
+      }
       writeOutstanding_ = true;
       net::async_write(stream_, http::make_chunk(net::buffer(inflightLine_)),
           beast::bind_front_handler(&HttpSession::onChunkWritten, shared_from_this()));
