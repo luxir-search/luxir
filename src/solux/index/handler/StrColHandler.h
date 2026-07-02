@@ -106,8 +106,6 @@ public:
     accountExtraRam(inverter, valuesFile.size());
   }
 
-  void resetExtraRam() override { lastExtraBytes_ = valuesFile.size(); }
-
 protected:
   /// Whether to persist a per-value-rank -> owning-docId monotonic column (the
   /// reverse of endValueRankReader).  Only written for multi-valued columns whose

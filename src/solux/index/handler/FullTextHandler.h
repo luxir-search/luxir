@@ -96,8 +96,6 @@ public:
     accountExtraRam(inverter, termsHash.memSize());
   }
 
-  void resetExtraRam() override { lastExtraBytes_ = termsHash.memSize(); }
-
   void flush(Inverter& inverter) override {
     flushPositions(inverter);
   }

@@ -63,8 +63,6 @@ public:
     accountExtraRam(inverter, termsHash.memSize());
   }
 
-  void resetExtraRam() override { lastExtraBytes_ = termsHash.memSize(); }
-
   void index(Inverter& inverter, std::span<const std::string_view> vals) override {
     for (auto val : vals) {
       indexSingle(inverter, val);

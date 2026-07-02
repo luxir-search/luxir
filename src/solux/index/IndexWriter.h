@@ -397,6 +397,14 @@ public:
   explicit IndexWriter(Directory &dir, std::function<std::shared_ptr<Schema>()> schemaProvider = {});
   ~IndexWriter();
 
+  // Per-inverter auto-flush caps (Phase 1). When a non-atomic update indexes past
+  // either cap, the current inverter is flushed to a segment mid-request and a fresh
+  // one obtained, bounding the RAM an unbounded (e.g. non-stop-stream) update holds.
+  // Defaults: 64 MiB RAM; a large doc backstop (docmap/norms scale with doc count).
+  // Set from SoluxConfig at collection creation.
+  size_t perInverterRamBytes = 64 * 1024 * 1024;
+  size_t perInverterMaxDocs = 8 * 1024 * 1024;
+
   // Submit an update to the IndexWriter.
   // This is the primary entry point for indexing documents.
   bool submitUpdate(UpdateMessage* msg) {

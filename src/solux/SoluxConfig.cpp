@@ -40,6 +40,15 @@ void SoluxConfig::addOptions(CLI::App& app) {
   app.add_option("--store.checked-dir.sync", store.checked_dir.sync, "Check fsync correctness: off, warn, throw")
       ->default_val(store.checked_dir.sync)
       ->check(CLI::IsMember({"off", "warn", "throw"}));
+
+  app.add_option("--index.max-inverter-ram-mb", index.max_inverter_ram_mb,
+                 "Per-inverter RAM cap (MiB) before an auto-flush to a segment")
+      ->default_val(index.max_inverter_ram_mb)
+      ->check(CLI::PositiveNumber);
+  app.add_option("--index.max-inverter-docs", index.max_inverter_docs,
+                 "Per-inverter doc-count cap before an auto-flush to a segment")
+      ->default_val(index.max_inverter_docs)
+      ->check(CLI::PositiveNumber);
 }
 
 void SoluxConfig::normalize() {

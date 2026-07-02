@@ -110,8 +110,6 @@ public:
     undoLog_.clear();
   }
 
-  void resetExtraRam() override { lastExtraBytes_ = idExtraBytes(); }
-
 private:
   void indexId(Inverter& inverter, std::string_view id) {
     // version=0 marks non-overwrite entries so they can be excluded from the delete list.

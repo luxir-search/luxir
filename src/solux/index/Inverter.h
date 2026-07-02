@@ -179,15 +179,13 @@ public:
     // per index() with the new total; the delta since the last call is folded into
     // inverter.extraRamBytes. Grows monotonically during indexing (tables rehash up,
     // pools/RAMFiles grow); the signed delta also lets a flush that frees memory
-    // decrement correctly. lastExtraBytes_ resets when the inverter is reset for reuse.
+    // decrement correctly. A flushed inverter is destroyed, and an idle inverter
+    // reused across messages keeps accumulating, so the baseline is never reset.
     size_t lastExtraBytes_ = 0;
     void accountExtraRam(Inverter& inverter, size_t nowBytes) {
       inverter.addExtraRam((int64_t)nowBytes - (int64_t)lastExtraBytes_);
       lastExtraBytes_ = nowBytes;
     }
-    // Recompute lastExtraBytes_ from scratch (called by Inverter::resetForReuse so a
-    // reused, flushed inverter doesn't carry a stale baseline). Default: nothing held.
-    virtual void resetExtraRam() { lastExtraBytes_ = 0; }
 
     friend std::ostream& operator<<(std::ostream &out, const IndexHandler &sf) {
       return out << "{IndexHandler field:" << sf.fieldName << "}";
@@ -270,13 +268,11 @@ public:
     return pool.size() + extraRamBytes;
   }
 
-  // Re-baseline the extra-RAM accounting (call when an inverter is reused after a
-  // flush/release cycle: the pool is rewound elsewhere and handler structures were
-  // freed, so the counter and each handler's baseline must return to the post-free
-  // state). O(fields) but only on reuse, not per-doc.
-  void resetMemAccounting() {
-    extraRamBytes = 0;
-    for (auto& [name, h] : indexHandlers) h->resetExtraRam();
+  // True when this inverter has grown past a size cap and should be flushed to a
+  // segment. Checked at doc boundaries during non-atomic updates (an atomic
+  // all_or_none request must hold one inverter for rollback, so it never flushes).
+  bool shouldFlush(size_t ramCap, size_t docCap) {
+    return memSize() > ramCap || (size_t)getMaxDoc() > docCap;
   }
 
   /// finishes indexing this segment (also calls finish on the underlying postings writer)

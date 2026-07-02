@@ -41,10 +41,20 @@ struct StoreConfig {
   CheckedDirConfig checked_dir;
 };
 
+struct IndexConfig {
+  // Per-inverter auto-flush caps. An indexing request that grows an inverter past
+  // either cap flushes it to a segment mid-request (at a safe doc boundary in a
+  // non-atomic request), bounding the RAM an unbounded stream holds. See
+  // IndexWriter::perInverterRamBytes / perInverterMaxDocs.
+  int64_t max_inverter_ram_mb = 64;              // RAM cap (MiB)
+  int64_t max_inverter_docs = 8 * 1024 * 1024;   // doc-count cap
+};
+
 struct SoluxConfig {
   std::string log_level = "info";
   ServerConfig server;
   StoreConfig store;
+  IndexConfig index;
 
   /// Register common CLI options on an app, bound to this config's fields.
   void addOptions(CLI::App& app);
