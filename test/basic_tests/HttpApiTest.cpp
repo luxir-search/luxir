@@ -1,6 +1,8 @@
 #include <array>
 #include <optional>
 #include <set>
+#include <string>
+#include <vector>
 
 #include "test/SoluxTest.h"
 #include "test/CollectionHelper.h"
@@ -39,6 +41,21 @@ protected:
       }
     }
     return s;
+  }
+
+  static std::vector<std::string> splitLines(const std::string& body) {
+    std::vector<std::string> lines;
+    std::size_t start = 0;
+    while (start < body.size()) {
+      std::size_t nl = body.find('\n', start);
+      if (nl == std::string::npos) {
+        lines.push_back(body.substr(start));
+        break;
+      }
+      if (nl > start) lines.push_back(body.substr(start, nl - start));
+      start = nl + 1;
+    }
+    return lines;
   }
 };
 
@@ -191,6 +208,97 @@ TEST_F(HttpApiTest, ndjsonRequestIdControlEchoed) {
   ASSERT_EQ(200, res.result_int()) << res.body();
   EXPECT_NE(res.body().find(R"("request_id":"stream-req-1")"), std::string::npos)
       << res.body();
+}
+
+TEST_F(HttpApiTest, ndjsonMultipleGroupsReturnMultipleLines) {
+  std::string body =
+      R"({"_update_":{"request_id":"g1"}})" "\n"
+      R"({"id":"mg1","title_w":"mgroup token","title_s":"Group 1"})" "\n"
+      R"({"_update_":{"request_id":"g2"}})" "\n"
+      R"({"id":"mg2","title_w":"mgroup token","title_s":"Group 2"})" "\n"
+      R"({"_update_":{"commit":{}}})" "\n";
+
+  auto update = httpRequest(port(), http::verb::post, "/collections/main/update",
+                            std::move(body), "application/x-ndjson");
+  ASSERT_EQ(200, update.result_int()) << update.body();
+  auto lines = splitLines(update.body());
+  ASSERT_EQ(2u, lines.size()) << update.body();
+  EXPECT_NE(lines[0].find(R"("request_id":"g1")"), std::string::npos) << update.body();
+  EXPECT_NE(lines[1].find(R"("request_id":"g2")"), std::string::npos) << update.body();
+
+  HttpReq hreq(port());
+  hreq.collection("main").matchQuery("title_w", "mgroup").fields({"id"})
+      .limit(10).withStats().execute();
+
+  ASSERT_EQ(200, hreq.status()) << hreq.rawResponse();
+  EXPECT_EQ(std::set<std::string>({"mg1", "mg2"}), idsOf(hreq.getDocs()))
+      << hreq.rawResponse();
+}
+
+TEST_F(HttpApiTest, ndjsonNoGroupReturnsOneLine) {
+  std::string body =
+      R"({"id":"nog1","title_w":"nogroup token"})" "\n"
+      R"({"id":"nog2","title_w":"nogroup token"})" "\n"
+      R"({"_update_":{"commit":{}}})" "\n";
+
+  auto update = httpRequest(port(), http::verb::post, "/collections/main/update",
+                            std::move(body), "application/x-ndjson");
+  ASSERT_EQ(200, update.result_int()) << update.body();
+  auto lines = splitLines(update.body());
+  ASSERT_EQ(1u, lines.size()) << update.body();
+  EXPECT_NE(lines[0].find(R"("update_version")"), std::string::npos) << update.body();
+}
+
+TEST_F(HttpApiTest, ndjsonMidStreamErrorAfterGroupEmittedIsFinalLine) {
+  std::string body =
+      R"({"_update_":{"request_id":"g1"}})" "\n"
+      R"({"id":"eg1","title_w":"egroup token"})" "\n"
+      R"({"_update_":{"commit":{}}})" "\n"
+      R"({"_update_":{"request_id":"g2"}})" "\n"
+      "{not json\n";
+
+  auto res = httpRequest(port(), http::verb::post, "/collections/main/update",
+                         std::move(body), "application/x-ndjson");
+  ASSERT_EQ(200, res.result_int()) << res.body();
+  auto lines = splitLines(res.body());
+  ASSERT_EQ(2u, lines.size()) << res.body();
+  EXPECT_NE(lines[0].find(R"("request_id":"g1")"), std::string::npos) << res.body();
+  EXPECT_NE(lines.back().find("ERROR"), std::string::npos) << res.body();
+  EXPECT_NE(lines.back().find("docs_indexed_so_far"), std::string::npos) << res.body();
+}
+
+TEST_F(HttpApiTest, ndjsonStreamKeepsConnectionAliveAfterFinalLine) {
+  net::io_context cioc;
+  beast::tcp_stream stream(cioc);
+  tcp::resolver resolver(cioc);
+  stream.connect(resolver.resolve("127.0.0.1", std::to_string(port())));
+
+  http::request<http::string_body> updateReq(http::verb::post, "/collections/main/update", 11);
+  updateReq.set(http::field::host, "127.0.0.1");
+  updateReq.set(http::field::content_type, "application/x-ndjson");
+  updateReq.body() =
+      R"({"id":"ka1","title_w":"keepalive token"})" "\n"
+      R"({"_update_":{"commit":{}}})" "\n";
+  updateReq.prepare_payload();
+  http::write(stream, updateReq);
+
+  beast::flat_buffer buffer;
+  http::response<http::string_body> updateRes;
+  http::read(stream, buffer, updateRes);
+  ASSERT_EQ(200, updateRes.result_int()) << updateRes.body();
+  ASSERT_EQ(1u, splitLines(updateRes.body()).size()) << updateRes.body();
+
+  http::request<http::string_body> healthReq(http::verb::get, "/health", 11);
+  healthReq.set(http::field::host, "127.0.0.1");
+  http::write(stream, healthReq);
+
+  http::response<http::string_body> healthRes;
+  http::read(stream, buffer, healthRes);
+  EXPECT_EQ(200, healthRes.result_int()) << healthRes.body();
+  EXPECT_NE(healthRes.body().find(R"("status")"), std::string::npos) << healthRes.body();
+
+  beast::error_code ec;
+  stream.socket().shutdown(tcp::socket::shutdown_both, ec);
 }
 
 // HTTP results match the in-process engine for the same query, and a doc missing
