@@ -90,7 +90,13 @@ public:
     normBytes.writeByte(inverter.pool, encodedNorm);
     normDocsWithField.addDoc(inverter.pool, docid);
     numDocsWithField++;
+
+    // termsHash values (posting streams) live in inverter.pool; only its heap table
+    // is outside-pool. Account the table growth (usually a no-op: it rehashes rarely).
+    accountExtraRam(inverter, termsHash.memSize());
   }
+
+  void resetExtraRam() override { lastExtraBytes_ = termsHash.memSize(); }
 
   void flush(Inverter& inverter) override {
     flushPositions(inverter);

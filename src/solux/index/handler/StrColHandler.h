@@ -86,6 +86,9 @@ public:
     if (fieldType->flags_ & FieldType::MULTI_VALUED) {
       valCountStream.addVal(inverter.pool, 1);
     }
+    // Column value bytes accumulate in valuesFile (a RAMFile), outside inverter.pool.
+    // The metadata streams (docsWithVal/valSize/valCount) are in inverter.pool.
+    accountExtraRam(inverter, valuesFile.size());
   }
 
   void indexMulti(Inverter& inverter, std::span<const std::string_view> vals) {
@@ -100,7 +103,10 @@ public:
       addValue(inverter, val);
     }
     valCountStream.addVal(inverter.pool, (int64_t)vals.size());
+    accountExtraRam(inverter, valuesFile.size());
   }
+
+  void resetExtraRam() override { lastExtraBytes_ = valuesFile.size(); }
 
 protected:
   /// Whether to persist a per-value-rank -> owning-docId monotonic column (the

@@ -35,6 +35,14 @@ private:
 public:
   MemPool pool;
 
+  // Running total of RAM held OUTSIDE `pool` (heap hash tables, IdHandler's idPool,
+  // string/vector column RAMFiles). Handlers that hold such memory bump this via
+  // IndexHandler::accountExtraRam at their allocation sites, so memSize() is O(1) -
+  // no per-doc walk of indexHandlers. Directory-backed postings output streams spill
+  // to disk and are deliberately NOT counted.
+  size_t extraRamBytes = 0;
+  void addExtraRam(int64_t delta) { extraRamBytes = (size_t)((int64_t)extraRamBytes + delta); }
+
   // Having a handle to the postings writer means that we can start flushing whenever we want or
   // even directly write certain dense columns without uninverting first.
   // For now, we'll directly contain it, but in the future we may want to pass it in.
@@ -166,6 +174,21 @@ public:
 
     virtual void flush(Inverter &inverter) = 0;
 
+    // Extra (non-pool) RAM accounting. A handler that holds memory outside the
+    // inverter's pool tracks its current such size and calls accountExtraRam once
+    // per index() with the new total; the delta since the last call is folded into
+    // inverter.extraRamBytes. Grows monotonically during indexing (tables rehash up,
+    // pools/RAMFiles grow); the signed delta also lets a flush that frees memory
+    // decrement correctly. lastExtraBytes_ resets when the inverter is reset for reuse.
+    size_t lastExtraBytes_ = 0;
+    void accountExtraRam(Inverter& inverter, size_t nowBytes) {
+      inverter.addExtraRam((int64_t)nowBytes - (int64_t)lastExtraBytes_);
+      lastExtraBytes_ = nowBytes;
+    }
+    // Recompute lastExtraBytes_ from scratch (called by Inverter::resetForReuse so a
+    // reused, flushed inverter doesn't carry a stale baseline). Default: nothing held.
+    virtual void resetExtraRam() { lastExtraBytes_ = 0; }
+
     friend std::ostream& operator<<(std::ostream &out, const IndexHandler &sf) {
       return out << "{IndexHandler field:" << sf.fieldName << "}";
     }
@@ -240,9 +263,20 @@ public:
   void rollbackTo(const UndoMark& mark);
   void clearUndoLog();
 
+  // Rough (conservative) RAM estimate: the inverter's pool plus everything handlers
+  // hold outside it (extraRamBytes). O(1) - no walk. Over-estimates slightly (pool
+  // capacity steps by chunk), so a size-based flush trips a touch early, never late.
   size_t memSize() {
-    // TODO: take into account more than just the pool
-    return pool.size();
+    return pool.size() + extraRamBytes;
+  }
+
+  // Re-baseline the extra-RAM accounting (call when an inverter is reused after a
+  // flush/release cycle: the pool is rewound elsewhere and handler structures were
+  // freed, so the counter and each handler's baseline must return to the post-free
+  // state). O(fields) but only on reuse, not per-doc.
+  void resetMemAccounting() {
+    extraRamBytes = 0;
+    for (auto& [name, h] : indexHandlers) h->resetExtraRam();
   }
 
   /// finishes indexing this segment (also calls finish on the underlying postings writer)

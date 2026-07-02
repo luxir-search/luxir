@@ -59,7 +59,11 @@ public:
     if (entry->val().getLastDoc() != inverter.getDoc()) {
       entry->val().addDoc(termsHash.getMemPool(), inverter.getDoc());
     }
+    // values live in inverter.pool; only the heap table is outside-pool.
+    accountExtraRam(inverter, termsHash.memSize());
   }
+
+  void resetExtraRam() override { lastExtraBytes_ = termsHash.memSize(); }
 
   void index(Inverter& inverter, std::span<const std::string_view> vals) override {
     for (auto val : vals) {

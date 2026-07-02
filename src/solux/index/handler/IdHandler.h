@@ -110,6 +110,8 @@ public:
     undoLog_.clear();
   }
 
+  void resetExtraRam() override { lastExtraBytes_ = idExtraBytes(); }
+
 private:
   void indexId(Inverter& inverter, std::string_view id) {
     // version=0 marks non-overwrite entries so they can be excluded from the delete list.
@@ -139,6 +141,15 @@ private:
     } else {
       undoLog_.push_back({*entry, IdEntry(0, 0), true});
     }
+    // All id state (strings + IdEntry values + both hash tables) lives in the private
+    // idPool + heap tables, none in inverter.pool - account the whole lot here.
+    accountExtraRam(inverter, idExtraBytes());
+  }
+
+  // Non-pool RAM: the private idPool (id strings + IdEntry values, plus the values
+  // portion of both hashes) and the two heap hash tables.
+  size_t idExtraBytes() const {
+    return idPool->size() + termsHash.memSize() + (deleteHash ? deleteHash->memSize() : 0);
   }
 
   Inverter::IndexHandler& getVersionHandler(Inverter& inverter) {
