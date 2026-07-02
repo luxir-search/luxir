@@ -17,6 +17,7 @@
 #include "solux/query/Query.h"
 #include "solux/query/TermQuery.h"
 #include "solux/schema/Schema.h"
+#include "solux/schema/ValCoerce.h"
 
 namespace solux {
 
@@ -195,6 +196,28 @@ public:
       default:
         throw std::runtime_error(std::format("Match query on unsupported field type: {}", field));
     }
+  }
+
+  // Match against a wire Val: coerce to term text per the field type (the
+  // query-time half of the coercion contract; see schema/ValCoerce.h), then
+  // build as usual.  A numeric Val against a text/string field matches its
+  // canonical decimal rendering - the same rendering ingest indexes - so
+  // index-time and query-time coercion agree.  Uncoercible Vals (arrays,
+  // maps) throw.
+  Query* createMatchQuery(std::string_view field, const solux::api::Val& val,
+                          Operator op = Operator::OR, int minMatch = 0) {
+    char buf[coerce::TEXT_BUF_SIZE];
+    std::string_view text = coerce::isNull(val)
+        ? std::string_view{}
+        : schema.getFieldTypeEx(field)->coerceTerm(val, field, buf);
+    // A rendered numeric lives in stack-local buf: TEXT analysis copies terms
+    // out anyway, but the STRING/ID pass-through keeps the view, so copy it
+    // into the pool.  String/bytes arms view the request bytes, which already
+    // outlive the query tree.
+    if (text.data() == buf) {
+      text = copyTerm(text);
+    }
+    return createMatchQuery(field, text, op, minMatch);
   }
 
   // Build a phrase query from un-analyzed input by running the field's analyzer.

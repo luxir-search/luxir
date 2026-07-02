@@ -99,31 +99,16 @@ Inverter::IndexHandler& Inverter::createIndexHandler(const std::string_view name
       }
       break;
     case FieldType::Type::INT:
+    case FieldType::Type::FLOAT:
+    case FieldType::Type::DOUBLE:
+    case FieldType::Type::DATE:
+      // One handler pair serves the whole int-column family: the stored
+      // encoding (raw ints, sortable bits, epoch millis) comes from
+      // FieldType::coerceColInt64, not the handler.
       if (fieldType->multiValued()) {
         fieldHandler = pool.make_unique<handler::MultiIntColHandler>(*this, name, fieldType);
       } else {
         fieldHandler = pool.make_unique<handler::IntColHandler>(*this, name, fieldType);
-      }
-      break;
-    case FieldType::Type::FLOAT:
-      if (fieldType->multiValued()) {
-        fieldHandler = pool.make_unique<handler::MultiFloatColHandler>(*this, name, fieldType);
-      } else {
-        fieldHandler = pool.make_unique<handler::FloatColHandler>(*this, name, fieldType);
-      }
-      break;
-    case FieldType::Type::DOUBLE:
-      if (fieldType->multiValued()) {
-        fieldHandler = pool.make_unique<handler::MultiDoubleColHandler>(*this, name, fieldType);
-      } else {
-        fieldHandler = pool.make_unique<handler::DoubleColHandler>(*this, name, fieldType);
-      }
-      break;
-    case FieldType::Type::DATE:
-      if (fieldType->multiValued()) {
-        fieldHandler = pool.make_unique<handler::MultiDateColHandler>(*this, name, fieldType);
-      } else {
-        fieldHandler = pool.make_unique<handler::DateColHandler>(*this, name, fieldType);
       }
       break;
     case FieldType::Type::VECTOR:

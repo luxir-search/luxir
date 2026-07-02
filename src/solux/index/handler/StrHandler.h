@@ -4,6 +4,7 @@
 #include "solux/index/Inverter.h"
 #include "solux/index/OrdCollector.h"
 #include "solux/index/OrdColWriter.h"
+#include "solux/schema/ValCoerce.h"
 #include "solux/util/TermValHash.h"
 
 
@@ -28,23 +29,34 @@ public:
   ~StrHandler() override = default;
 
   void index(Inverter& inverter, const IndexVal& val) override {
-    std::string_view v;
-
-    if (std::holds_alternative<std::string_view>(val.kind)) {
-      v = std::get<std::string_view>(val.kind);
-    }
-    else if (std::holds_alternative<::hpp_proto::bytes_view>(val.kind)) {
-      const auto& b = std::get<::hpp_proto::bytes_view>(val.kind);
-      v = std::string_view((const char*)b.data(), b.size());
-    }
-    else if (std::holds_alternative<solux::api::ArrStr>(val.kind)) {
-      const auto& arr = std::get<solux::api::ArrStr>(val.kind).v;
-      index(inverter, std::span<const std::string_view>(arr.data(), arr.size()));
+    // expected kinds first, coercions last
+    if (auto s = std::get_if<std::string_view>(&val.kind)) {
+      indexSingle(inverter, *s);
       return;
     }
-    // TODO: handle arrays of binary as well
-
-    indexSingle(inverter, v);
+    if (auto b = std::get_if<::hpp_proto::bytes_view>(&val.kind)) {
+      indexSingle(inverter, std::string_view((const char*)b->data(), b->size()));
+      return;
+    }
+    if (auto a = std::get_if<solux::api::ArrStr>(&val.kind)) {
+      index(inverter, std::span<const std::string_view>(a->v.data(), a->v.size()));
+      return;
+    }
+    if (coerce::isNull(val)) return;
+    // Numeric arms (and arrays of them) index their canonical rendering.
+    // buf is reused per element: indexSingle copies the term into the hash
+    // before the next render.
+    char buf[coerce::TEXT_BUF_SIZE];
+    size_t n = 0;
+    bool wasArray = coerce::forEachElement(val, [&](const IndexVal& elem) {
+      indexSingle(inverter, fieldType->coerceTerm(elem, std::string_view(fieldName), buf));
+      n++;
+    });
+    if (wasArray) {
+      maxValues = std::max(maxValues, n);
+    } else {
+      indexSingle(inverter, fieldType->coerceTerm(val, std::string_view(fieldName), buf));
+    }
   }
 
   void index(Inverter& inverter, std::string_view val) override {

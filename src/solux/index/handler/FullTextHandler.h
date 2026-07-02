@@ -3,6 +3,7 @@
 #include "solux/index/DocStream.h"
 #include "solux/index/Inverter.h"
 #include "solux/index/NormsWriter.h"
+#include "solux/schema/ValCoerce.h"
 #include "solux/search/Similarity.h"
 
 
@@ -34,49 +35,91 @@ public:
 
   ~FullTextHandler() override = default;
 
+  // Positions jump by this between the values of a multi-valued text field so
+  // phrases never match across value boundaries (the OpenSearch convention).
+  static constexpr int POSITION_INCREMENT_GAP = 100;
+
   void index(Inverter& inverter, const IndexVal& val) override {
-    // TODO: handle bytes
-    std::string_view sv;
-    if (std::holds_alternative<std::string_view>(val.kind)) {
-      sv = std::get<std::string_view>(val.kind);
+    // expected kinds first, coercions last
+    if (auto s = std::get_if<std::string_view>(&val.kind)) {
+      indexValues(inverter, std::span<const std::string_view>(s, 1));
+      return;
     }
-    else if (std::holds_alternative<hpp_proto::non_owning_traits::bytes_t>(val.kind)) {
-      const auto& b = std::get<hpp_proto::non_owning_traits::bytes_t>(val.kind);
-      sv = std::string_view((const char*)b.data(), b.size());
+    if (auto b = std::get_if<::hpp_proto::bytes_view>(&val.kind)) {
+      std::string_view sv((const char*)b->data(), b->size());
+      indexValues(inverter, std::span<const std::string_view>(&sv, 1));
+      return;
     }
-
-    // TODO: handle arrays as well.  Hard to do in virtual methods where you can't use templates though.
-
-    indexSingle(inverter, sv);
+    if (auto a = std::get_if<solux::api::ArrStr>(&val.kind)) {
+      indexValues(inverter, std::span<const std::string_view>(a->v.data(), a->v.size()));
+      return;
+    }
+    if (coerce::isNull(val)) return;
+    if (coerce::isArray(val)) {
+      // mixed / numeric arrays: coerce every element up front (buf is
+      // per-element transient, so materialize) and index as multi-valued text
+      char buf[coerce::TEXT_BUF_SIZE];
+      std::vector<std::string> storage;
+      coerce::forEachElement(val, [&](const IndexVal& elem) {
+        storage.emplace_back(fieldType->coerceTerm(elem, std::string_view(fieldName), buf));
+      });
+      std::vector<std::string_view> views(storage.begin(), storage.end());
+      indexValues(inverter, std::span<const std::string_view>(views.data(), views.size()));
+      return;
+    }
+    // numeric scalars analyze their canonical rendering ({"n_w": 42} indexes "42")
+    char buf[coerce::TEXT_BUF_SIZE];
+    std::string_view sv = fieldType->coerceTerm(val, std::string_view(fieldName), buf);
+    indexValues(inverter, std::span<const std::string_view>(&sv, 1));
   }
 
   void index(Inverter& inverter, std::string_view val) override {
-    indexSingle(inverter, val);
+    indexValues(inverter, std::span<const std::string_view>(&val, 1));
   }
 
-  // TODO: handle multi-valued. Or is that a diff subclass?
-  void indexSingle(Inverter& inverter, std::string_view val) {
-    TokenChain& tc = *tokenChain;
-    tc.head.setValue(val);
-    tc.reset();
+  void index(Inverter& inverter, std::span<const std::string_view> vals) override {
+    indexValues(inverter, vals);
+  }
 
-    int numTokens = 0;
-    int pos = -1;
+  // Analyze one doc's values for this field: positions continue across values
+  // (with POSITION_INCREMENT_GAP between them) and ONE norm entry records the
+  // total token count.  Multiple values used to silently index an empty
+  // string (the values were only visible via the stored-fields copy, never
+  // searchable).
+  void indexValues(Inverter& inverter, std::span<const std::string_view> vals) {
+    if (vals.size() > 1 && !fieldType->multiValued()) {
+      throw std::runtime_error(fmt::format("Field '{}' is single-valued but received multiple values",
+                                           std::string_view(fieldName)));
+    }
+
+    TokenChain& tc = *tokenChain;
     Token& tok = tc.head.getToken();
     TokenStream& tail = *tc.tail;
     int docid = inverter.getDoc();
-    for (;;) {
-      bool hasNext = tail.incrementToken();
-      if (!hasNext) break;
-      ++numTokens;
-      pos += tok.positionIncrement;
-      // The token bytes are transient (the chain may reuse the buffer on the
-      // next pull); try_emplace copies them into the MemPool below.
-      std::string_view term = tok.text;
 
-      auto [entry, inserted] = termsHash.try_emplace(term, termsHash.getMemPool(), docid, pos);
-      if (!inserted) {
-        entry->val().addDoc(termsHash.getMemPool(), docid, pos);
+    int numTokens = 0;
+    int pos = -1;
+    bool first = true;
+    for (std::string_view val : vals) {
+      if (!first) {
+        pos += POSITION_INCREMENT_GAP;
+      }
+      first = false;
+      tc.head.setValue(val);
+      tc.reset();
+      for (;;) {
+        bool hasNext = tail.incrementToken();
+        if (!hasNext) break;
+        ++numTokens;
+        pos += tok.positionIncrement;
+        // The token bytes are transient (the chain may reuse the buffer on the
+        // next pull); try_emplace copies them into the MemPool below.
+        std::string_view term = tok.text;
+
+        auto [entry, inserted] = termsHash.try_emplace(term, termsHash.getMemPool(), docid, pos);
+        if (!inserted) {
+          entry->val().addDoc(termsHash.getMemPool(), docid, pos);
+        }
       }
     }
 

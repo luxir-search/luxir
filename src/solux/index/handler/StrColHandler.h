@@ -4,6 +4,7 @@
 #include "solux/index/Inverter.h"
 #include "solux/index/OrdCollector.h"
 #include "solux/index/OrdColWriter.h"
+#include "solux/schema/ValCoerce.h"
 #include "solux/util/TermValHash.h"
 
 
@@ -70,8 +71,25 @@ public:
       }
       indexMulti(inverter, std::span<const std::string_view>(views.data(), views.size()));
     }
+    else if (coerce::isNull(val)) {
+      return;
+    }
+    else if (coerce::isArray(val)) {
+      // numeric / mixed arrays: the column stores each element's canonical
+      // rendering.  Materialize (buf is per-element transient) so indexMulti
+      // sees stable views and the multi-valued check runs before any append.
+      char buf[coerce::TEXT_BUF_SIZE];
+      std::vector<std::string> storage;
+      coerce::forEachElement(val, [&](const IndexVal& elem) {
+        storage.emplace_back(fieldType->coerceTerm(elem, std::string_view(fieldName), buf));
+      });
+      std::vector<std::string_view> views(storage.begin(), storage.end());
+      indexMulti(inverter, std::span<const std::string_view>(views.data(), views.size()));
+    }
     else {
-      throw std::runtime_error("StrColHandler: expected string or binary value");
+      // numeric scalars: store the canonical rendering
+      char buf[coerce::TEXT_BUF_SIZE];
+      indexSingle(inverter, fieldType->coerceTerm(val, std::string_view(fieldName), buf));
     }
   }
 

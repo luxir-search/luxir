@@ -3,8 +3,7 @@
 #include "solux/index/DocStream.h"
 #include "solux/index/Inverter.h"
 #include "solux/index/IntColWriter.h"
-#include "solux/util/DateTime.h"
-#include "solux/util/NumericUtils.h"
+#include "solux/schema/ValCoerce.h"
 
 #include <fmt/format.h>
 
@@ -14,7 +13,13 @@ using namespace solux;
 namespace solux::handler {
 
 //
-// Info for one single valued column
+// Info for one single valued column.
+//
+// IntColHandler and MultiIntColHandler serve the whole int-column family
+// (INT, FLOAT, DOUBLE, DATE): the value a column stores is whatever
+// FieldType::coerceColInt64 returns (raw ints, sortable bits, epoch millis),
+// so the handlers themselves are encoding-blind.  Coercion failures throw,
+// which the per-doc update path recovers by marking the doc failed.
 //
 class IntColHandler : public Inverter::IndexHandler {
   friend class Inverter;
@@ -37,14 +42,14 @@ public:
   ~IntColHandler() override = default;
 
   void index(Inverter& inverter, const IndexVal& val) override {
-    if (std::holds_alternative<int64_t>(val.kind)) {
-      int64_t ival = std::get<int64_t>(val.kind);
-      indexSingle(inverter, ival);
-    }
+    // explicit null means "no value", same as an absent field
+    if (coerce::isNull(val)) return;
+    indexSingle(inverter, fieldType->coerceColInt64(val, std::string_view(fieldName)));
   }
 
   void index(Inverter& inverter, int64_t int64) override {
-    indexSingle(inverter, int64);
+    indexSingle(inverter, fieldType->coerceColInt64(coerce::scalarVal(int64),
+                                                    std::string_view(fieldName)));
   }
 
   void indexSingle(Inverter& inverter, int64_t val) {
@@ -134,20 +139,40 @@ public:
     // expected kinds first: array form, then a single value
     if (std::holds_alternative<solux::api::ArrInt>(val.kind)) {
       auto& arr = std::get<solux::api::ArrInt>(val.kind).v;
-      std::span<const int64_t> values(arr.data(), arr.size());
-      index(inverter, values);
+      index(inverter, std::span<const int64_t>(arr.data(), arr.size()));
+      return;
     }
-    else if (std::holds_alternative<int64_t>(val.kind)) {
+    if (std::holds_alternative<int64_t>(val.kind)) {
       index(inverter, std::get<int64_t>(val.kind));
+      return;
     }
+    if (coerce::isNull(val)) return;
+    // Coercions last, element-wise through the field type.  Materialize the
+    // full array before indexMulti: a throw partway through a lazy transform
+    // would leave already-appended values without their doc/length entries
+    // (the column reconstructs positionally, corrupting later docs); a throw
+    // before any stream mutation just fails the doc.
+    std::vector<int64_t> encoded;
+    bool wasArray = coerce::forEachElement(val, [&](const IndexVal& elem) {
+      encoded.push_back(fieldType->coerceColInt64(elem, std::string_view(fieldName)));
+    });
+    if (!wasArray) {
+      encoded.push_back(fieldType->coerceColInt64(val, std::string_view(fieldName)));
+    }
+    indexMulti(inverter, std::span<const int64_t>(encoded.data(), encoded.size()));
   }
 
   void index(Inverter& inverter, int64_t int64) override {
-    indexMulti(inverter, std::span<const int64_t>(&int64, 1));
+    indexMulti(inverter, std::views::single(
+        fieldType->coerceColInt64(coerce::scalarVal(int64), std::string_view(fieldName))));
   }
 
   void index(Inverter& inverter, std::span<const int64_t> vals) override {
-    indexMulti(inverter, vals);
+    // int64 -> any int-column type never throws, so the lazy transform is safe
+    // under the validate-before-mutate contract.
+    indexMulti(inverter, vals | std::views::transform([this](int64_t v) {
+      return fieldType->coerceColInt64(coerce::scalarVal(v), std::string_view(fieldName));
+    }));
   }
 
   void indexMulti(Inverter& inverter, std::ranges::input_range auto&& values) {
@@ -225,193 +250,6 @@ public:
       fieldInfo.monoMetaOff = endValueRankWriter.metaOff;
     }
 
-  }
-};
-
-
-//
-// FLOAT and DOUBLE columns reuse the int column machinery by storing
-// Lucene/Solr-style sortable bits (see util/NumericUtils.h): doubles as the full
-// 64-bit encoding, floats as the 32-bit encoding sign-extended to int64.
-// Incoming values are coerced from any numeric proto kind (i, f, d and the
-// array forms) to the field's own type before encoding, so clients don't
-// have to match the wire type exactly.
-//
-
-class DoubleColHandler final : public IntColHandler {
-public:
-  using IntColHandler::IntColHandler;
-
-  void index(Inverter& inverter, const IndexVal& val) override {
-    if (std::holds_alternative<double>(val.kind)) {
-      indexSingle(inverter, doubleToSortableInt64(std::get<double>(val.kind)));
-    } else if (std::holds_alternative<float>(val.kind)) {
-      indexSingle(inverter, doubleToSortableInt64((double)std::get<float>(val.kind)));
-    } else if (std::holds_alternative<int64_t>(val.kind)) {
-      indexSingle(inverter, doubleToSortableInt64((double)std::get<int64_t>(val.kind)));
-    }
-  }
-
-  void index(Inverter& inverter, int64_t int64) override {
-    indexSingle(inverter, doubleToSortableInt64((double)int64));
-  }
-};
-
-class FloatColHandler final : public IntColHandler {
-public:
-  using IntColHandler::IntColHandler;
-
-  void index(Inverter& inverter, const IndexVal& val) override {
-    if (std::holds_alternative<float>(val.kind)) {
-      indexSingle(inverter, (int64_t)floatToSortableInt32(std::get<float>(val.kind)));
-    } else if (std::holds_alternative<double>(val.kind)) {
-      indexSingle(inverter, (int64_t)floatToSortableInt32((float)std::get<double>(val.kind)));
-    } else if (std::holds_alternative<int64_t>(val.kind)) {
-      indexSingle(inverter, (int64_t)floatToSortableInt32((float)std::get<int64_t>(val.kind)));
-    }
-  }
-
-  void index(Inverter& inverter, int64_t int64) override {
-    indexSingle(inverter, (int64_t)floatToSortableInt32((float)int64));
-  }
-};
-
-class MultiDoubleColHandler final : public MultiIntColHandler {
-public:
-  using MultiIntColHandler::MultiIntColHandler;
-
-  void index(Inverter& inverter, const IndexVal& val) override {
-    auto encode = [](double d) { return doubleToSortableInt64(d); };
-    // expected kinds first (array form, then a single value), coercions after
-    if (std::holds_alternative<solux::api::ArrDouble>(val.kind)) {
-      indexMulti(inverter, std::get<solux::api::ArrDouble>(val.kind).v | std::views::transform(encode));
-    } else if (std::holds_alternative<double>(val.kind)) {
-      indexMulti(inverter, std::views::single(encode(std::get<double>(val.kind))));
-    } else if (std::holds_alternative<solux::api::ArrFloat>(val.kind)) {
-      indexMulti(inverter, std::get<solux::api::ArrFloat>(val.kind).v
-                 | std::views::transform([&](float f) { return encode((double)f); }));
-    } else if (std::holds_alternative<float>(val.kind)) {
-      indexMulti(inverter, std::views::single(encode((double)std::get<float>(val.kind))));
-    } else if (std::holds_alternative<solux::api::ArrInt>(val.kind)) {
-      indexMulti(inverter, std::get<solux::api::ArrInt>(val.kind).v
-                 | std::views::transform([&](int64_t i) { return encode((double)i); }));
-    } else if (std::holds_alternative<int64_t>(val.kind)) {
-      indexMulti(inverter, std::views::single(encode((double)std::get<int64_t>(val.kind))));
-    }
-  }
-
-  void index(Inverter& inverter, int64_t int64) override {
-    indexMulti(inverter, std::views::single(doubleToSortableInt64((double)int64)));
-  }
-
-  void index(Inverter& inverter, std::span<const int64_t> vals) override {
-    indexMulti(inverter, vals
-               | std::views::transform([](int64_t i) { return doubleToSortableInt64((double)i); }));
-  }
-};
-
-class MultiFloatColHandler final : public MultiIntColHandler {
-public:
-  using MultiIntColHandler::MultiIntColHandler;
-
-  void index(Inverter& inverter, const IndexVal& val) override {
-    auto encode = [](float f) { return (int64_t)floatToSortableInt32(f); };
-    // expected kinds first (array form, then a single value), coercions after
-    if (std::holds_alternative<solux::api::ArrFloat>(val.kind)) {
-      indexMulti(inverter, std::get<solux::api::ArrFloat>(val.kind).v | std::views::transform(encode));
-    } else if (std::holds_alternative<float>(val.kind)) {
-      indexMulti(inverter, std::views::single(encode(std::get<float>(val.kind))));
-    } else if (std::holds_alternative<solux::api::ArrDouble>(val.kind)) {
-      indexMulti(inverter, std::get<solux::api::ArrDouble>(val.kind).v
-                 | std::views::transform([&](double d) { return encode((float)d); }));
-    } else if (std::holds_alternative<double>(val.kind)) {
-      indexMulti(inverter, std::views::single(encode((float)std::get<double>(val.kind))));
-    } else if (std::holds_alternative<solux::api::ArrInt>(val.kind)) {
-      indexMulti(inverter, std::get<solux::api::ArrInt>(val.kind).v
-                 | std::views::transform([&](int64_t i) { return encode((float)i); }));
-    } else if (std::holds_alternative<int64_t>(val.kind)) {
-      indexMulti(inverter, std::views::single(encode((float)std::get<int64_t>(val.kind))));
-    }
-  }
-
-  void index(Inverter& inverter, int64_t int64) override {
-    indexMulti(inverter, std::views::single((int64_t)floatToSortableInt32((float)int64)));
-  }
-
-  void index(Inverter& inverter, std::span<const int64_t> vals) override {
-    indexMulti(inverter, vals
-               | std::views::transform([](int64_t i) { return (int64_t)floatToSortableInt32((float)i); }));
-  }
-};
-
-
-//
-// DATE columns store int64 milliseconds since the Unix epoch directly in the
-// int column (no sortable-bits transform - signed millis already sorts in
-// chronological order).  Incoming values are either an int (epoch millis,
-// passthrough) or an ISO-8601 string parsed via parseDateToEpochMillis.  A
-// string that does not parse throws, so the per-doc update path marks the doc
-// failed (same contract as VectorHandler).
-//
-
-// Parse an ISO-8601 / epoch-millis date string or throw a per-doc failure.
-inline int64_t parseDateOrThrow(std::string_view fieldName, std::string_view text) {
-  if (auto ms = parseDateToEpochMillis(text)) return *ms;
-  throw std::runtime_error(fmt::format(
-      "DATE field '{}': cannot parse '{}' as a date (expected ISO-8601 or epoch millis)",
-      fieldName, text));
-}
-
-class DateColHandler final : public IntColHandler {
-public:
-  using IntColHandler::IntColHandler;
-
-  void index(Inverter& inverter, const IndexVal& val) override {
-    if (std::holds_alternative<int64_t>(val.kind)) {
-      indexSingle(inverter, std::get<int64_t>(val.kind));
-    } else if (std::holds_alternative<std::string_view>(val.kind)) {
-      indexSingle(inverter, parseDateOrThrow(std::string_view(fieldName), std::get<std::string_view>(val.kind)));
-    }
-  }
-
-  void index(Inverter& inverter, int64_t int64) override {
-    indexSingle(inverter, int64);
-  }
-};
-
-class MultiDateColHandler final : public MultiIntColHandler {
-public:
-  using MultiIntColHandler::MultiIntColHandler;
-
-  void index(Inverter& inverter, const IndexVal& val) override {
-    auto parse = [&](std::string_view s) { return parseDateOrThrow(std::string_view(fieldName), s); };
-    // expected kinds first (array form, then a single value)
-    if (std::holds_alternative<solux::api::ArrInt>(val.kind)) {
-      index(inverter, std::span<const int64_t>(std::get<solux::api::ArrInt>(val.kind).v.data(), std::get<solux::api::ArrInt>(val.kind).v.size()));
-    } else if (std::holds_alternative<int64_t>(val.kind)) {
-      indexMulti(inverter, std::views::single(std::get<int64_t>(val.kind)));
-    } else if (std::holds_alternative<solux::api::ArrStr>(val.kind)) {
-      // Parse every element up front: indexMulti appends to the value stream
-      // as it iterates, so a throw partway through a lazy transform would
-      // leave already-parsed values orphaned (the column reconstructs
-      // positionally, corrupting later docs).  Materialize first so a parse
-      // failure throws before any stream mutation.
-      auto& arr = std::get<solux::api::ArrStr>(val.kind).v;
-      std::vector<int64_t> millis;
-      millis.reserve(arr.size());
-      for (const auto& s : arr) millis.push_back(parse(s));
-      index(inverter, std::span<const int64_t>(millis.data(), millis.size()));
-    } else if (std::holds_alternative<std::string_view>(val.kind)) {
-      indexMulti(inverter, std::views::single(parse(std::get<std::string_view>(val.kind))));
-    }
-  }
-
-  void index(Inverter& inverter, int64_t int64) override {
-    indexMulti(inverter, std::views::single(int64));
-  }
-
-  void index(Inverter& inverter, std::span<const int64_t> vals) override {
-    indexMulti(inverter, vals);
   }
 };
 

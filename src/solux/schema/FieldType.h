@@ -3,11 +3,16 @@
 #include "solux/analysis/Analyzer.h"
 #include "solux/reader/Postings.h"
 
+#include <cstdint>
 #include <memory>
+#include <span>
 #include <string>
+#include <string_view>
 #include <vector>
 
 namespace solux {
+
+namespace api { struct Val; }  // the wire value oneof (api/solux_types.hpp)
 
 
 
@@ -101,6 +106,28 @@ public:
 
   bool isStored() { return (bool) (flags_ & STORED); }
 
+  // ---- Val -> field-native coercion ----
+  // One contract shared by ingest and query build so both sides coerce
+  // identically (a doc ingested via one rule must be findable by querying the
+  // same literal).  Concrete field types override the primitive matching
+  // their native storage; the defaults throw.  The shared conversion core and
+  // the rules live in schema/ValCoerce.h; definitions are in ValCoerce.cpp so
+  // this widely-included header stays independent of the api types.
+
+  // The encoded int64 the standard int column stores for this field type:
+  // the raw integer for INT, sortable bits for FLOAT/DOUBLE (NumericUtils),
+  // epoch millis for DATE (ISO-8601 strings parsed on the way in).  Throws on
+  // impossible values (per-doc failure at ingest, request error at query
+  // build).
+  virtual int64_t coerceColInt64(const api::Val& val, std::string_view fieldName) const;
+
+  // Term/text bytes for term-backed fields (TEXT/STRING/ID).  Numeric and
+  // bool arms render canonically into buf (>= coerce::TEXT_BUF_SIZE bytes)
+  // and return a view of it; string/bytes arms pass through as views of the
+  // original value.  Callers must consume the result before buf is reused.
+  virtual std::string_view coerceTerm(const api::Val& val, std::string_view fieldName,
+                                      std::span<char> buf) const;
+
   // TODO: how to share analyzers (potentially expensive) among FieldTypes?
   // One way: Have a parent FieldType in the constructor.
 };
@@ -164,18 +191,25 @@ public:
     return std::make_unique<TokenChain>(headRef, std::move(tail), stateful);
   }
 
+  std::string_view coerceTerm(const api::Val& val, std::string_view fieldName,
+                              std::span<char> buf) const override;
 };
 
 class StrFieldType : public FieldType {
 public:
   StrFieldType(std::string_view name, int flags=INDEX_DOCS | COLUMN_STORED) : FieldType(name, FieldType::STRING, flags) {
   }
+
+  std::string_view coerceTerm(const api::Val& val, std::string_view fieldName,
+                              std::span<char> buf) const override;
 };
 
 class IntFieldType : public FieldType {
 public:
   IntFieldType(std::string_view name, int flags=COLUMN_STORED) : FieldType(name, FieldType::INT, flags) {
   }
+
+  int64_t coerceColInt64(const api::Val& val, std::string_view fieldName) const override;
 };
 
 // FLOAT and DOUBLE fields store Lucene-style sortable bits in the standard
@@ -186,12 +220,16 @@ class FloatFieldType : public FieldType {
 public:
   FloatFieldType(std::string_view name, int flags=COLUMN_STORED) : FieldType(name, FieldType::FLOAT, flags) {
   }
+
+  int64_t coerceColInt64(const api::Val& val, std::string_view fieldName) const override;
 };
 
 class DoubleFieldType : public FieldType {
 public:
   DoubleFieldType(std::string_view name, int flags=COLUMN_STORED) : FieldType(name, FieldType::DOUBLE, flags) {
   }
+
+  int64_t coerceColInt64(const api::Val& val, std::string_view fieldName) const override;
 };
 
 // DATE stores int64 milliseconds since the Unix epoch directly in the standard
@@ -203,6 +241,8 @@ class DateFieldType : public FieldType {
 public:
   DateFieldType(std::string_view name, int flags=COLUMN_STORED) : FieldType(name, FieldType::DATE, flags) {
   }
+
+  int64_t coerceColInt64(const api::Val& val, std::string_view fieldName) const override;
 };
 
 // Unique id field
@@ -210,6 +250,9 @@ class IdFieldType : public FieldType {
 public:
   IdFieldType(std::string_view name, int flags=INDEX_DOCS | COLUMN_STORED) : FieldType(name, FieldType::ID, flags) {
   }
+
+  std::string_view coerceTerm(const api::Val& val, std::string_view fieldName,
+                              std::span<char> buf) const override;
 };
 
 // Dense float vector field.  Values are stored as fixed-size byte blobs

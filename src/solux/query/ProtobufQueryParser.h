@@ -33,10 +33,10 @@ public:
   ProtobufQueryParser(MemPool& pool, Schema& schema) : pool(pool), schema(schema) {
   }
 
-  // return a single string_view from a protobuf Val or empty string view if the Val is not a string
-  // do we need to distinguish between an explicit empty string and a missing string?
-  // Static so the search-op parser can reuse it to read a Val argument without a
-  // ProtobufQueryParser instance.
+  // Return a single string_view from a protobuf Val or empty string view if the
+  // Val is not a string.  Only for reading search-op ARGUMENTS (static so the
+  // search-op parser can use it without an instance); query VALUES go through
+  // the coercion contract instead (QueryBuilder's Val overloads).
   static std::string_view getString(const solux::api::Val& val) {
     // The Val oneof holds the request's string view directly (s arm) or the raw
     // request bytes (bin arm); both view the kept-alive request buffer.
@@ -60,11 +60,14 @@ public:
                 ? QueryBuilder::Operator::AND
                 : QueryBuilder::Operator::OR;
 
-    std::string_view val = matchQuery.val.has_value() ? getString(*matchQuery.val)
-                                                      : std::string_view{};
-
     QueryBuilder builder(pool, schema);
-    return builder.createMatchQuery(field, val, op, matchQuery.min_match);
+    if (matchQuery.val.has_value()) {
+      // Val goes through the coercion contract: a numeric val against a
+      // text/string field matches its canonical rendering (it used to
+      // silently match nothing).
+      return builder.createMatchQuery(field, *matchQuery.val, op, matchQuery.min_match);
+    }
+    return builder.createMatchQuery(field, std::string_view{}, op, matchQuery.min_match);
   }
 
   // Copy a repeated string field into a pool-allocated MUTABLE span of
