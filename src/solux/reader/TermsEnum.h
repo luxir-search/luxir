@@ -146,10 +146,10 @@ protected:
     auto prefixLen = code >> 5;
     auto suffixLen = (code & 0x1f) + 1;
     if (prefixLen == 7) {
-      prefixLen = termsIS.readByte();
+      prefixLen = (uint8_t)termsIS.readByte();
     }
     if (suffixLen == 32) {
-      suffixLen = termsIS.readByte();
+      suffixLen = (uint8_t)termsIS.readByte();
     }
 
     auto [data, len] = currTerm.unpack();

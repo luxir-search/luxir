@@ -789,7 +789,7 @@ public:
     auto [refdata, reflen] = reference.unpack();
 
     // Write the terms block header.
-    termOutput.writeStr(refdata, reflen);
+    termOutput.writePackedTerm(reference);
     termOutput.writeVlong(locOfDocsForTermBlock - docsLoc);
     termOutput.writeVlong(locOfPositionsForTermBlock - posLoc);
 
