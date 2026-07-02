@@ -675,6 +675,13 @@ private:
     }
     parser_->get().body().data = state->readBuf.data();
     parser_->get().body().size = state->readBuf.size();
+    // async_read_SOME, not async_read: it delivers whatever bytes are available now
+    // (one read), so a partial arrival is processed immediately. This is load-bearing
+    // for checkpoints - a client that sends a small batch + a `{}` marker and then
+    // blocks waiting for its ack must have those bytes framed+indexed+responded now.
+    // async_read would instead wait until readBuf fills or the body ends, so the `{}`
+    // ack would never arrive before EOF and the client would deadlock. Do not "optimize"
+    // this to async_read.
     http::async_read_some(stream_, buffer_, *parser_,
         beast::bind_front_handler(&HttpSession::onStreamBodyRead, shared_from_this()));
   }
@@ -1078,6 +1085,11 @@ private:
       pendingQ_.pop_front();
       inflightLine_ = std::move(p.line);
       if (p.last) lastSeen_ = true;
+      // An empty final line means "close the stream, no more data" (streaming ingest
+      // ends this way when the last thing before EOF was already a response line, e.g.
+      // a trailing commit/`{}` - see finishStreamingUpdate). Skip make_chunk here: a
+      // chunk of an empty buffer encodes as `0\r\n\r\n`, which is itself the chunked
+      // terminator, so writing it and then make_chunk_last would double-terminate.
       if (p.last && inflightLine_.empty()) {
         chunkLastSent_ = true;
         writeOutstanding_ = true;
