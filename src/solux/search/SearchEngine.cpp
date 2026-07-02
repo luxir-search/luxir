@@ -63,6 +63,7 @@ void SearchEngine::getResources(SearchRequest& req) {
   int nameCount = request.collection ? (int)request.collection->name.size() : 0;
   if (nameCount == 0) {
     // TODO: do we support default collections (implicitly defined by something like an api-key?)
+    throw std::runtime_error("request specifies no collection");
   }
 
   std::shared_ptr<Library> library = node.getLibrary(nullptr, "");
@@ -74,11 +75,15 @@ void SearchEngine::getResources(SearchRequest& req) {
 
       // last element in path, so get collection.
       collection = node.getCollection(library.get(), name);
-      // TODO: handle lookup failure
+      if (collection == nullptr) {
+        throw std::runtime_error("unknown collection '" + std::string(name) + "'");
+      }
     } else {
       // not last element... get sub-library
       library = node.getLibrary(library.get(), name);
-      // TODO: handle lookup failure
+      if (library == nullptr) {
+        throw std::runtime_error("unknown library '" + std::string(name) + "'");
+      }
     }
   }
 
