@@ -223,8 +223,8 @@ private:
 
 public:
 
-  // Ctor must be nothrow (Arena::Create hazard).  ProtobufSearchParser
-  // resolves the OrdMap before allocation and passes it in.
+  // ProtobufSearchParser resolves the OrdMap and passes it in
+  // (see TopDocsReq's ctor comment).
   StrFacetOp(SearchRequest& req, const ReqFieldFacet& fieldFacet, std::string_view fieldName,
     std::string_view facetName, int64_t limit, int64_t minCount, bool missing,
     std::shared_ptr<OrdMap> ordMap) :

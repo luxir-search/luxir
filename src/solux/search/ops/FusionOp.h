@@ -50,9 +50,8 @@ public:
   std::span<Query::Weight*> filterWeights;
   int32_t rrfK = 60;
 
-  // Nothrow ctor (Arena::Create hazard - see TopDocsReq's ctor comment).
-  // ProtobufSearchParser builds each source TopDocsReq (with rankingSink
-  // wired) and the filter weights before allocation.
+  // ProtobufSearchParser builds each source TopDocsReq (with rankingSink wired)
+  // and the filter weights, then passes them in (see TopDocsReq's ctor comment).
   FusionOp(SearchRequest& req, std::string_view name, const ReqFusion& fusionProto,
            std::vector<TopDocsReq*>&& sources, int64_t topCount,
            std::span<std::pair<std::string_view, Query*>> filters,

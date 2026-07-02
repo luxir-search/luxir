@@ -101,7 +101,7 @@ public:
 
   static LocalReq* create(SearchEngine& engine, google::protobuf::Arena* arena = nullptr) {
     arena = arena ? arena : createArena();
-    return google::protobuf::Arena::Create<LocalReq>(arena, engine, *arena);
+    return solux::arenaCreate<LocalReq>(*arena, engine, *arena);
   }
 
   LocalReq(SearchEngine& engine, google::protobuf::Arena& arena)

@@ -380,11 +380,11 @@ public:
   };
 
 
-  // Arena::Create registers ~TopDocsReq with the arena *before* the ctor body
-  // runs.  Any throw mid-ctor leaves a half-constructed object scheduled for
-  // cleanup that crashes at arena reset.  Keep this ctor nothrow: all
-  // validation (sort field schema lookup, Weight construction, filter
-  // weights) is done by ProtobufSearchParser before Arena::Create.
+  // ProtobufSearchParser resolves everything that can fail (sort field schema
+  // lookup, Weight construction, filter weights) and passes the results in, so
+  // this ctor just binds members.  (arenaCreate registers ~TopDocsReq only
+  // after construction succeeds, so a throwing arena ctor is safe now - the
+  // parser split is parse-phase structure, not a nothrow requirement.)
   TopDocsReq(SearchRequest& req, std::string_view name, const ReqTopDocs& topDocsProto,
     Query::Context& qcontext, Query* query, Query::Weight* weight, int64_t topCount,
     std::vector<SortField>&& sortFields, bool useFieldSort,

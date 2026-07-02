@@ -1,9 +1,11 @@
 #include <atomic>
+#include <stdexcept>
 #include <thread>
 #include <vector>
 #include "test/SoluxTest.h"
 #include "solux/util/SharedLazyMap.h"
 #include "solux/util/log.h"
+#include "solux/util/proto.h"
 
 using namespace solux;
 
@@ -88,4 +90,54 @@ TEST_F(UtilTest, lazyMap) {
     // Verify we created exactly numKeys objects
     EXPECT_EQ(totalCreations.load(), numKeys);
   }
+}
+
+namespace {
+// Counters for arenaCreate exception-safety test.  File-scope so the tracked
+// types below don't need to reach into function locals.
+int arenaDtors = 0;    // ~Tracked / ~Boom calls (the arena-managed object)
+int memberDtors = 0;   // ~Member calls (a subobject built before any throw)
+
+struct Member {
+  ~Member() { memberDtors++; }
+};
+// Normal object: its dtor should run exactly once, at arena reset.
+struct Tracked {
+  Member m;
+  ~Tracked() { arenaDtors++; }
+};
+// Throwing ctor: the Member is fully built, then the ctor throws.  ~Boom must
+// NEVER run - the object was never fully constructed and (crucially) arenaCreate
+// registers the cleanup only on success, so nothing is scheduled for reset.
+struct Boom {
+  Member m;
+  Boom() { throw std::runtime_error("ctor boom"); }
+  ~Boom() { arenaDtors++; }
+};
+}  // namespace
+
+// arenaCreate constructs first and registers ~T() only on success (unlike
+// protobuf's Arena::Create, which registers before construction and would run
+// ~T() on half-constructed memory at reset).  Verify both halves.
+TEST_F(UtilTest, arenaCreateExceptionSafe) {
+  arenaDtors = 0;
+  memberDtors = 0;
+  auto* arena = createArena();
+
+  // Success path: dtor registered, not run yet.
+  auto* t = arenaCreate<Tracked>(*arena);
+  EXPECT_NE(t, nullptr);
+  EXPECT_EQ(arenaDtors, 0);
+  EXPECT_EQ(memberDtors, 0);
+
+  // Throwing ctor: throw propagates.  C++ unwinds the Member built before the
+  // throw (memberDtors == 1), but ~Boom is never scheduled for cleanup.
+  EXPECT_THROW(arenaCreate<Boom>(*arena), std::runtime_error);
+  EXPECT_EQ(memberDtors, 1);   // Boom::m unwound during the failed construction
+  EXPECT_EQ(arenaDtors, 0);    // ~Boom did NOT run
+
+  // Reset runs ~Tracked exactly once (and its Member), nothing for Boom.
+  releaseArena(arena);
+  EXPECT_EQ(arenaDtors, 1);    // only ~Tracked, never ~Boom
+  EXPECT_EQ(memberDtors, 2);   // Boom::m (unwind) + Tracked::m (reset)
 }

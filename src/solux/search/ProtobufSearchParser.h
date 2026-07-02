@@ -39,7 +39,7 @@ public:
     // for their input.
     // Their results go at the top-level however.
 
-    RootOp& rootOp = *google::protobuf::Arena::Create<RootOp>(&req.arena, req);
+    RootOp& rootOp = *solux::arenaCreate<RootOp>(req.arena, req);
     rootOp.parent = nullptr;
     addSubs(rootOp, req.proto.ops);
 
@@ -103,7 +103,7 @@ public:
         if (!facetReq.ops.empty() || !facetReq.sorts.empty()) {
           throw std::runtime_error("facet '" + std::string(name) + "': sub-ops/sorts are not yet supported for range facets");
         }
-        FacetReq* facet = google::protobuf::Arena::Create<IntFacetRangeReq>(&req.arena, req, facetReq, facetField, name, start, end, gap, minCount, missing);
+        FacetReq* facet = solux::arenaCreate<IntFacetRangeReq>(req.arena, req, facetReq, facetField, name, start, end, gap, minCount, missing);
         addSubs(*facet, facetReq.ops);
         return facet;
       },
@@ -112,10 +112,9 @@ public:
           if (avgOp.args.empty()) {
             throw std::runtime_error("Generic operation 'avg' requires a field argument");
           }
-          // Resolve the field type before Arena::Create (schema lookup may throw).
           std::string_view avgField = ProtobufQueryParser::getString(avgOp.args[0]);
           auto& avgFtype = req.schema->getFieldTypeEx(avgField);
-          return google::protobuf::Arena::Create<AvgOp>(&req.arena, req, name, avgField, avgFtype->type());
+          return solux::arenaCreate<AvgOp>(req.arena, req, name, avgField, avgFtype->type());
         }
         throw std::runtime_error("Unknown generic operation: " + std::string(avgOp.name));
       },
@@ -135,10 +134,8 @@ public:
     }
     bool missing = facetReq.missing;
 
-    // Resolve everything that could throw before Arena::Create: the arena
-    // registers the cleanup entry pre-construction, so a throwing ctor
-    // leaves the cleanup list pointing at uninitialized memory which
-    // crashes at arena reset.
+    // Resolve everything that could throw here in the parser and pass the
+    // results into the op ctors (see TopDocsReq's ctor comment).
     auto& ftype = req.schema->getFieldTypeEx(facetField);
 
     FacetReq* facet = nullptr;
@@ -155,20 +152,20 @@ public:
           throw std::runtime_error("facet '" + std::string(facetName) + "': sub-ops/sorts are not yet supported for int field facets");
         }
         auto range = IntFacetReq::scanGlobalRange(*req.reader, facetField);
-        facet = google::protobuf::Arena::Create<IntFacetReq>(&req.arena, req, facetReq, facetField, facetName, limit, minCount, missing, range.min, range.max, range.useVector);
+        facet = solux::arenaCreate<IntFacetReq>(req.arena, req, facetReq, facetField, facetName, limit, minCount, missing, range.min, range.max, range.useVector);
         break;
       }
       case FieldType::Type::ID:
       case FieldType::Type::STRING: {
         auto ordMap = req.reader->getOrdMap(facetField);
-        facet = google::protobuf::Arena::Create<StrFacetOp>(&req.arena, req, facetReq, facetField, facetName, limit, minCount, missing, std::move(ordMap));
+        facet = solux::arenaCreate<StrFacetOp>(req.arena, req, facetReq, facetField, facetName, limit, minCount, missing, std::move(ordMap));
         break;
       }
       case FieldType::Type::TEXT:
         if (!facetReq.ops.empty() || !facetReq.sorts.empty()) {
           throw std::runtime_error("facet '" + std::string(facetName) + "': sub-ops/sorts are not yet supported for text field facets");
         }
-        facet = google::protobuf::Arena::Create<FullTextFacetReq>(&req.arena, req, facetReq, facetField, facetName, limit, minCount, missing);
+        facet = solux::arenaCreate<FullTextFacetReq>(req.arena, req, facetReq, facetField, facetName, limit, minCount, missing);
         break;
       default: ;
     }
@@ -178,9 +175,9 @@ public:
     return facet;
   }
 
-  // Build SortField list from a proto SortSpec repeated field.  Schema
-  // lookups may throw, so this must run before any Arena::Create that
-  // consumes the result.
+  // Build SortField list from a proto SortSpec repeated field.  Schema lookups
+  // that may throw are done here in the parser; the result is passed to the
+  // TopDocsReq ctor.
   struct ParsedSorts {
     std::vector<SortField> sortFields;
     bool useFieldSort = false;
@@ -210,9 +207,8 @@ public:
     return out;
   }
 
-  // Build Weights for a filter list.  Weight ctors may throw (e.g. KnnQuery
-  // dim validation), so this must run before any Arena::Create that takes
-  // the resulting span.
+  // Build Weights for a filter list.  Weight ctors that may throw (e.g. KnnQuery
+  // dim validation) are resolved here; the resulting span is passed to the op ctor.
   std::span<Query::Weight*> buildFilterWeights(
       std::span<std::pair<std::string_view, Query*>> filters,
       Query::Context& qcontext, int32_t requestFlags) {
@@ -258,8 +254,8 @@ public:
 
     auto filters = parseNamedFilters(parser, topDocsReq.filter);
 
-    // All work that may throw (sort field schema lookup, Weight ctors)
-    // must complete before Arena::Create<TopDocsReq>.
+    // Sort field schema lookup and Weight ctors that may throw are resolved
+    // here in the parser and passed to the TopDocsReq ctor.
     auto parsedSorts = parseSorts(topDocsReq.sorts);
     auto* qcontext = Query::Context::create(&req.arena, req.requestPool, *req.reader);
     // Flags for this request's main query. Filters inherit these after
@@ -270,8 +266,8 @@ public:
     auto* weight = query->createWeight(*qcontext, requestFlags);
     auto filterWeights = buildFilterWeights(filters, *qcontext, requestFlags);
 
-    auto* qr = google::protobuf::Arena::Create<TopDocsReq>(
-      &req.arena, req, name, topDocsReq, *qcontext, query, weight, limit,
+    auto* qr = solux::arenaCreate<TopDocsReq>(
+      req.arena, req, name, topDocsReq, *qcontext, query, weight, limit,
       std::move(parsedSorts.sortFields), parsedSorts.useFieldSort,
       filters, filterWeights);
 
@@ -342,8 +338,8 @@ public:
     int64_t specifiedLimit = fusionProto.limit.has_value() ? *fusionProto.limit : 10;
     int64_t limit = specifiedLimit < 0 ? req.reader->maxDoc() : std::min(specifiedLimit, req.reader->maxDoc());
 
-    auto* fusion = google::protobuf::Arena::Create<FusionOp>(
-      &req.arena, req, name, fusionProto, std::move(sources), limit,
+    auto* fusion = solux::arenaCreate<FusionOp>(
+      req.arena, req, name, fusionProto, std::move(sources), limit,
       sharedFilters, sharedFilterWeights, rrfK);
 
     // Sources are children of this FusionOp in the SearchOp tree but not

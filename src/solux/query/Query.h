@@ -5,6 +5,7 @@
 #include <span>
 #include <solux/util/heap.h>
 #include "solux/util/MemPool.h"
+#include "solux/util/proto.h"
 #include "solux/util/StrRef.h"
 #include "solux/search/IndexReader.h"
 #include "solux/reader/FieldReader.h"
@@ -238,21 +239,19 @@ public:
     std::span<FieldReader> fieldReaders;
     FieldInfoMap fieldInfoMap;
 
-    // Nothrow ctor used by Context::create for arena allocation.
-    // Arena::Create registers ~Context before running the ctor body, so any
-    // throw mid-construction (pool allocation, FieldReader init, map bucket
-    // allocation) would leave a cleanup entry pointing at uninitialized
-    // memory.  This ctor only does noexcept member binds/moves; the
-    // throwing work is done by the factory before allocation.
+    // Ctor used by Context::create for arena allocation: the factory does the
+    // work that can throw (pool allocation, FieldReader init, map bucket
+    // allocation) and passes the results in, so this only binds/moves members.
+    // (solux::arenaCreate would make a throwing arena ctor safe now; the factory
+    // split is kept as structure, not a safety requirement.)
     Context(MemPool& pool, IndexReader& topReader,
             std::span<FieldReader> fieldReaders, FieldInfoMap&& fieldInfoMap)
       : pool(pool), topReader(topReader),
         fieldReaders(fieldReaders), fieldInfoMap(std::move(fieldInfoMap)) {
     }
 
-    // Convenience ctor for stack-allocated Contexts (tests, non-arena code).
-    // Safe to throw here since there's no arena cleanup entry that could be
-    // left dangling.
+    // Convenience ctor for stack-allocated Contexts (tests, non-arena code):
+    // does its own allocation/init inline.
     Context(MemPool& pool, IndexReader& topReader)
       : pool(pool), topReader(topReader), fieldInfoMap(4, pool.getAllocator()) {
       auto numSegs = topReader.segments().size();
@@ -269,8 +268,8 @@ public:
         new (&readers[i]) FieldReader(pool, topReader.segments()[i].postingsReader());
       }
       FieldInfoMap map(4, pool.getAllocator());
-      return google::protobuf::Arena::Create<Context>(
-        arena, pool, topReader, std::span<FieldReader>(readers, numSegs), std::move(map));
+      return solux::arenaCreate<Context>(
+        *arena, pool, topReader, std::span<FieldReader>(readers, numSegs), std::move(map));
     }
 
     // return number of segments

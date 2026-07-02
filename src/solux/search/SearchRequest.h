@@ -104,7 +104,7 @@ public:
     // If this is the last message, just use the same arena as the request since they will
     // have the same lifetimes.
     auto* arena = last ? &req.arena : createArena();
-    return google::protobuf::Arena::Create<SearchResponse>(arena, req, *arena, last);
+    return solux::arenaCreate<SearchResponse>(*arena, req, *arena, last);
   }
 
   // named columns, part of DocList or part of a FacetResult.

@@ -423,7 +423,7 @@ static void handleSearch(GenericCallData& call, grpc::ByteBuffer& readBuf) {
     return;
   }
   auto& engine = call.server.getSoluxNode().getSearchEngine();
-  auto& req = *google::protobuf::Arena::Create<GRPCSearchRequest>(arena, engine, request.proto, *arena);
+  auto& req = *solux::arenaCreate<GRPCSearchRequest>(*arena, engine, request.proto, *arena);
   req.parent = &call;
   // submit() is synchronous (waits on its task group), so the padded request
   // bytes and parse resource stay valid until all borrowed views are done.

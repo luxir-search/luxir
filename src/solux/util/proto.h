@@ -2,7 +2,9 @@
 #include <google/protobuf/arena.h>
 #include <iterator>
 #include <memory_resource>
+#include <new>
 #include <string_view>
+#include <type_traits>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -58,6 +60,33 @@ inline void releaseArena(google::protobuf::Arena* arena) {
     arena->Reset();
     ::operator delete((char*)arena);
   }
+}
+
+
+/// Exception-safe replacement for google::protobuf::Arena::Create<T>, for the hand-written
+/// engine objects (search ops, Query::Context, request/response wrappers) that own resources
+/// and need ~T() run when the request arena is reset.
+///
+/// protobuf's Arena::Create<T> registers the destructor cleanup node *before* running the
+/// constructor, so a ctor that throws leaves the arena scheduled to run ~T() on
+/// half-constructed memory - a crash at reset, far from the throw site.  arenaCreate
+/// constructs first and registers the destructor only on success (the same order protobuf
+/// itself uses for map entries in CreateInArenaStorage).  If the ctor throws, C++ unwinds the
+/// subobjects that were already built and the only thing "leaked" is the raw sizeof(T) bump
+/// region, which the arena reclaims wholesale at reset.  So ctors of arena objects are free
+/// to throw - there is no nothrow requirement.
+///
+/// T is placement-new'd into arena storage and never freed with delete, so `arena` must be a
+/// real arena (the reference makes that a contract, not a runtime check).  Trivially
+/// destructible T registers no cleanup node, matching Arena::Create.
+template <class T, class... Args>
+T* arenaCreate(google::protobuf::Arena& arena, Args&&... args) {
+  void* p = arena.AllocateAligned(sizeof(T), alignof(T));
+  T* obj = new (p) T(std::forward<Args>(args)...);
+  if constexpr (!std::is_trivially_destructible_v<T>) {
+    arena.OwnDestructor(obj);
+  }
+  return obj;
 }
 
 

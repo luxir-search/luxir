@@ -186,8 +186,8 @@ private:
     }
 
     auto& engine = node_.getSearchEngine();
-    auto* sreq = google::protobuf::Arena::Create<HttpSearchRequest>(
-        arena, engine, std::move(requestState), shared_from_this(), *arena);
+    auto* sreq = solux::arenaCreate<HttpSearchRequest>(
+        *arena, engine, std::move(requestState), shared_from_this(), *arena);
     // Keep the io_context busy until this query finishes so shutdown drains it.
     sreq->workGuard.emplace(stream_.get_executor());
 

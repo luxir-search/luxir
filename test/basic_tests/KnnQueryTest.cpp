@@ -2028,12 +2028,12 @@ TEST_F(KnnQueryTest, requestedNProbeCapsBreadthDeepening) {
 // logs+swallows the exception (so execute() returns), but we verify by
 // checking that the response carries no docs and the engine logged the error.
 //
-// Note: this used to crash the arena because TopDocsReq's ctor called
-// createWeight, and Arena::Create registers ~T() before the body runs - a
-// throwing ctor would leave a half-constructed object scheduled for cleanup.
-// The fix moved createWeight to TopDocsReq::init(), which runs after the
-// object is fully constructed and registered, so a throw here unwinds
-// cleanly.
+// Note: this used to crash the arena.  TopDocsReq's ctor called createWeight,
+// and protobuf's Arena::Create registered ~T() before the ctor body ran, so a
+// throwing ctor left a half-constructed object scheduled for cleanup.  The fix
+// moved createWeight to TopDocsReq::init() (runs after construction).  Solux now
+// also allocates ops via solux::arenaCreate, which registers the destructor only
+// after the ctor succeeds, so a throwing arena ctor is safe regardless.
 TEST_F(KnnQueryTest, dimMismatchReturnsErrorResponse) {
   CollectionHelper h("main");
   h.clear();

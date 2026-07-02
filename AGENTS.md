@@ -56,8 +56,12 @@ generated `*.pb.h` headers must exist). See [docs/build-setup.md](docs/build-set
 - members at top of C++ classes, no prefix / suffix
 - do not use em dashes or other non-ascii (in source or prose)
 - This is unreleased code, so NEVER worry about back compat.
-- Arena::Create<T> constructors must not throw. Protobuf registers the
-  destructor cleanup node before placement-new, and doesn't remove after exception.
+- Allocate engine objects that need a destructor (search ops, Query::Context,
+  request/response wrappers) with solux::arenaCreate<T> (src/solux/util/proto.h),
+  not protobuf's Arena::Create<T>. arenaCreate constructs first and registers the
+  destructor only on success, so a throwing ctor is safe. Raw Arena::Create<T>
+  registers the cleanup node before placement-new and runs ~T() on
+  half-constructed memory if the ctor throws -> crash at arena reset.
 
 ## Writing Tests
 

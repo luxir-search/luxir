@@ -32,9 +32,7 @@ public:
 
   // Non-owning view of the request proto's repeated sorts (a trivially
   // copyable span into the kept-alive request bytes, valid for the request
-  // lifetime).  Held by value: unlike the old RepeatedPtrField the span copy
-  // is nothrow, so it no longer risks the mid-ctor arena cleanup hazard (see
-  // TopDocsReq's ctor comment).
+  // lifetime).  Held by value.
   ReqSortList sorts;
   std::string_view facetName;
   std::vector<std::pair<const std::string_view, SearchOp*>> inlineSubOps;
@@ -181,9 +179,8 @@ public:
     }
   };
 public:
-  // Ctor must be nothrow (Arena::Create hazard).  ProtobufSearchParser
-  // computes globalMin/globalMax/useVector via scanGlobalRange before
-  // allocation and passes them in.
+  // ProtobufSearchParser computes globalMin/globalMax/useVector via
+  // scanGlobalRange and passes them in (see TopDocsReq's ctor comment).
   IntFacetReq(SearchRequest& req, const ReqFieldFacet& fieldFacet, std::string_view fieldName,
     std::string_view facetName, int64_t limit, int64_t minCount, bool missing,
     int64_t globalMin, int64_t globalMax, bool useVector) :
@@ -191,9 +188,8 @@ public:
   globalMin(globalMin), globalMax(globalMax), useVector(useVector) {}
 
   // Scan every segment for the column's min/max and decide vector vs map
-  // storage based on the resulting range.  Runs during parsing (before
-  // Arena::Create<IntFacetReq>) so any I/O exception propagates out
-  // cleanly.
+  // storage based on the resulting range.  Runs during parsing so the result
+  // can be passed to the IntFacetReq ctor.
   struct GlobalRange {
     int64_t min = std::numeric_limits<int64_t>::max();
     int64_t max = std::numeric_limits<int64_t>::min();
