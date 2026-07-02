@@ -160,7 +160,7 @@ struct Error { std::string_view id; std::string_view error_message; std::int32_t
 struct UpdateResponse {
   using Status = solux::api::UpdateResponse_::Status;
   using Error = solux::api::UpdateResponse_::Error;
-  ::hpp_proto::bytes_view request_id;
+  std::string_view request_id;
   std::uint64_t update_version = {};
   std::span<const std::string_view> ids;
   std::span<const Error> errors;
@@ -331,7 +331,7 @@ struct SearchOp {                                               // needs TopDocs
   std::variant<std::monostate, TopDocs, Fusion, FieldFacet, RangeFacet, GenOp> kind;
 };
 struct SearchRequest {                                          // needs Target
-  ::hpp_proto::bytes_view request_id;
+  std::string_view request_id;
   std::optional<Target> collection;
   map_view<std::string_view, ::hpp_proto::indirect_view<SearchOp>> ops;
   std::uint64_t freshness_us = {};
@@ -377,7 +377,7 @@ struct Val {                                                   // needs Map,ArrV
   std::string_view asString() const { return std::get<std::string_view>(kind); }
 };
 struct SearchResponse {
-  ::hpp_proto::bytes_view request_id;
+  std::string_view request_id;
   map_view<std::string_view, ::hpp_proto::indirect_view<Val>> ops;
   std::string_view error;
   bool more = {};
@@ -402,7 +402,7 @@ struct Query {                                                 // needs Match,Bo
 };
 struct NamedQuery { std::string_view name; ::hpp_proto::optional_indirect_view<Query> query; };
 struct UpdateRequest {                                         // needs Target,Columns,CommitParams
-  ::hpp_proto::bytes_view request_id;
+  std::string_view request_id;
   std::int64_t stream_id = {};
   std::optional<Target> collection;
   std::span<const Map> docs;

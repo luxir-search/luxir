@@ -130,7 +130,7 @@ public:
     return *this;
   }
   LocalReq& requestId(std::string_view id) {
-    view.request_id = build::arenaBytes(mr, std::as_bytes(std::span<const char>(id.data(), id.size())));
+    view.request_id = build::arenaStr(mr, id);
     return *this;
   }
 
@@ -173,7 +173,7 @@ public:
 
   // Compact textual dump for test-failure diagnostics.
   std::string toString() const {
-    std::string ret = "Request id=" + bytesToStr(view.request_id) + " ops=[";
+    std::string ret = "Request id=" + std::string(view.request_id) + " ops=[";
     bool first = true;
     for (const auto& [name, op] : view.ops) { ret += (first ? "" : ","); ret += std::string(name); first = false; }
     ret += "]\n";

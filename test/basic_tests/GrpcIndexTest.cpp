@@ -28,8 +28,8 @@ using namespace solux::test;  // HppClientReaderWriter, hppUnaryCall, Reply, rpc
 
 namespace {
 
-static std::string bytesToString(::hpp_proto::bytes_view bytes) {
-  return std::string(reinterpret_cast<const char*>(bytes.data()), bytes.size());
+static std::string idString(std::string_view id) {  // request_id, now a proto string
+  return std::string(id);
 }
 
 } // namespace
@@ -158,7 +158,7 @@ public:
     // The unary path fills a caller-supplied response: it must get the same
     // initialization (status, request_id) as an arena-created one.
     ASSERT_EQ(solux::api::UpdateResponse_::Status::OK, response.msg.status);
-    ASSERT_EQ(std::to_string(docnum), bytesToString(response.msg.request_id));
+    ASSERT_EQ(std::to_string(docnum), idString(response.msg.request_id));
     ASSERT_GT(response.msg.update_version, 0u);
   }
 
@@ -758,7 +758,7 @@ TEST_F(GrpcIndexTest, threadsafeIndex) {
     const auto& docList = std::get<solux::api::DocList>(response.ops.at("q")->kind);
     // because responses are streaming and not necessarily in order across different logical requests,
     // we need to get the number used to generate the query from the request id
-    std::string requestId = bytesToString(response.request_id);
+    std::string requestId = idString(response.request_id);
     long long reqid = 0;
     auto [ptr, ec] = std::from_chars(requestId.data(), requestId.data() + requestId.size(), reqid);
     ASSERT_EQ(std::errc(), ec);
@@ -812,7 +812,7 @@ TEST_F(GrpcIndexTest, addDocs) {
   if (!status.ok()) {
     LOG_ERROR("grpc call failed!: code={} msg={}", (int)status.error_code(), status.error_message());
   } else {
-    GRPC_DEBUG("I got id:{}", bytesToString(response.msg.request_id));
+    GRPC_DEBUG("I got id:{}", idString(response.msg.request_id));
   }
 
 }

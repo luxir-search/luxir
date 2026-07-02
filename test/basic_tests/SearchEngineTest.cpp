@@ -13,10 +13,6 @@ using namespace solux;
 using namespace solux::test;
 
 namespace {
-// request_id is a proto `bytes` field; view it as text for comparison/printing.
-std::string_view asStr(::hpp_proto::bytes_view b) {
-  return std::string_view(reinterpret_cast<const char*>(b.data()), b.size());
-}
 // FieldFacet.missing has no fluent OpCursor setter; reach through the raw op.
 OpCursor& facetMissing(OpCursor& cur) {
   std::get<solux::api::FieldFacet>(cur.rawOp().kind).missing = true;
@@ -92,7 +88,7 @@ TEST_F(SearchEngineTest, basic) {
     // LOG_DEBUG("ENGINE REQ: {}", req->toString());
 
     const auto& resp = req->responses[0]->proto;
-    ASSERT_EQ(asStr(req->proto.request_id), asStr(resp.request_id));
+    ASSERT_EQ(req->proto.request_id, resp.request_id);
     const auto& docs = *req->docList("q");
     ASSERT_EQ(3, docs.matches.value_or(0));
     ASSERT_EQ(ncols, docs.columns.size());
@@ -290,7 +286,7 @@ TEST_F(SearchEngineTest, basic) {
     req->execute(para);
 // LOG_DEBUG("ENGINE REQ: {}", req->toString());
 
-    ASSERT_EQ(asStr(req->proto.request_id), asStr(req->responses[0]->proto.request_id));
+    ASSERT_EQ(req->proto.request_id, req->responses[0]->proto.request_id);
     const auto& docs = *req->docList("q");
     auto colI = [&](const char* n) -> const solux::api::ColInt& {
       return std::get<solux::api::ColInt>(docs.columns.at(n).kind);
@@ -313,7 +309,7 @@ TEST_F(SearchEngineTest, basic) {
     ASSERT_TRUE(req->responses[0]->proto.more);
 
 
-    ASSERT_EQ(asStr(req->proto.request_id), asStr(req->responses[1]->proto.request_id));
+    ASSERT_EQ(req->proto.request_id, req->responses[1]->proto.request_id);
     const auto& docs2 = std::get<solux::api::DocList>(req->responses[1]->proto.ops.at("q")->kind);
     auto colI2 = [&](const char* n) -> const solux::api::ColInt& {
       return std::get<solux::api::ColInt>(docs2.columns.at(n).kind);

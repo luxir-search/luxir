@@ -28,8 +28,7 @@ private:
   solux::api::build::SpanBuilder<std::string_view> ids_{mr_};
 
   void initResponse(ResponseProto* rsp) {
-    rsp->request_id = solux::api::build::arenaBytes(
-        mr_, std::span<const std::byte>(req->request_id.data(), req->request_id.size()));
+    rsp->request_id = solux::api::build::arenaStr(mr_, req->request_id);
     rsp->status = ResponseStatus::OK;  // default status
   }
 

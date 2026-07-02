@@ -211,8 +211,7 @@ public:
       return *this;
     }
     UpdateBuilder& requestId(std::string_view id) {
-      request_.request_id = build::arenaBytes(
-          mr_, std::as_bytes(std::span<const char>(id.data(), id.size())));
+      request_.request_id = build::arenaStr(mr_, id);
       return *this;
     }
     UpdateBuilder& streamId(int64_t id) { request_.stream_id = id; return *this; }

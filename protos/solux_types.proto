@@ -22,7 +22,7 @@ message Target {
 message SearchRequest {
   // request_id is optional and opaque (server does not care what the value is).  If provided, the server will
   // echo it in the response.  Only really needed when a client streams multiple requests in the same RPC.
-  bytes request_id = 1;
+  string request_id = 1;
   Target collection = 2;
 
   // Multiple search operations in a single request.
@@ -310,7 +310,7 @@ message Domain {
 
 // Top-level response to a Search request
 message SearchResponse {
-  bytes request_id = 1;
+  string request_id = 1;
   map<string, Val> ops = 2; // the results of the search operations in the request, keyed by operation name.
   string error = 3;         // If non-empty, the request failed.  ops may be empty or partial.
   bool more = 15;  // if true, expect at least one more streaming response to the logical request.
@@ -374,7 +374,7 @@ message UpdateRequest {
   // request_id is optional and opaque (server does not care what the value is).  If provided, the server will
   // use it in the UpdateResponse.  This is useful for the client to correlate requests and responses in
   // streaming RPCs.
-  bytes request_id = 1;
+  string request_id = 1;
 
   // stream_id is optional.  When in streaming mode,
   // Update messages in the same logical stream will be processed serially.  A stream_id of 0
@@ -418,7 +418,7 @@ message UpdateRequest {
 // response per request.
 message UpdateResponse {
   // This is the request_id from the UpdateRequest, if it was set.
-  bytes request_id = 1;
+  string request_id = 1;
 
   // The update version assigned to the update request.
   uint64 update_version = 2;

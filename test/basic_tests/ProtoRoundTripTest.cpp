@@ -258,8 +258,7 @@ TEST(ProtoRoundTrip, AllMessages) {
 
 P::SearchResponse buildResponse(std::pmr::memory_resource& mr) {
   P::SearchResponse resp;
-  std::byte rid[] = {std::byte{1}, std::byte{2}, std::byte{3}};
-  resp.request_id = B::arenaBytes(mr, rid);
+  resp.request_id = B::arenaStr(mr, "rid-123");
   resp.more = false;
 
   // ops["results"] -> Val{DocList}
@@ -311,7 +310,7 @@ P::SearchResponse buildResponse(std::pmr::memory_resource& mr) {
 }
 
 void verifyResponse(const P::SearchResponse& o) {
-  EXPECT_EQ(o.request_id.size(), 3u);
+  EXPECT_EQ(o.request_id, "rid-123");
   ASSERT_EQ(o.ops.size(), 2u);
 
   const auto* resultsIv = o.ops.find("results");
