@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
+#include <cstring>
 #include <deque>
 #include <assert.h>
 #include <iostream>
@@ -10,6 +11,7 @@
 #include <sstream>
 #include <unordered_map>
 #include <vector>
+#include "solux/index/TrieBuilder.h"
 #include "solux/util/MemPool.h"
 #include "solux/util/StrRef.h"
 #include "solux/store/OutputStream.h"
@@ -296,6 +298,8 @@ private:
         fieldOutput.writeVint(finfo.nTerms);
         fieldOutput.writeVlong(finfo.sumDocFreq - finfo.nTerms);            // sumDocFreq >= nTerms
         fieldOutput.writeVlong(finfo.sumTotalTermFreq - finfo.sumDocFreq);  // sumTotalTermFreq >= sumDocFreq
+        fieldOutput.writeVal(finfo.trieLoc);
+        fieldOutput.writeVlong(finfo.trieRootOff);
       }
 
       // Things that have an int col: text fields (for norms), int col, float col, double col, string col (for ords)
@@ -439,6 +443,10 @@ class TextWriter {
   TextNormsView norms;
 
   std::vector<uint64_t> termBlockOffsets;  // offset from termsOffset (for this field) for each term block
+  TrieBuilder trieBuilder;
+  std::array<char, PackedTerm::MAX_BYTES> lastTermOfPrevBlock{};
+  uint32_t lastTermOfPrevBlockLen = 0;
+  bool hasLastTermOfPrevBlock = false;
   int64_t sumTotalTermFreq = 0; // updated in endTerm
   int64_t sumDocFreq = 0; // updated in endTerm
   int32_t numTerms; // currently only updated in flushTerms
@@ -565,6 +573,39 @@ private:  // some internal utility methods... not for use by indexers
     out.insert(out.end(), src, src + len);
   }
 
+  void addTrieSeparatorForCurrentBlock(uint32_t blockOrd) {
+    if (blockOrd == 0) {
+      return;
+    }
+
+    // Block 0 uses the trie's implicit empty separator.  For later blocks, the
+    // separator is the first term truncated one byte past its first mismatch
+    // with the previous block's last term.  That key is strictly greater than
+    // every term in the previous block and <= the first term in this block, so
+    // floorBlock routes between-block gaps to the later block.
+    assert(hasLastTermOfPrevBlock);
+    auto [firstData, firstLen] = termList[0].unpack();
+    uint32_t minLen = std::min(lastTermOfPrevBlockLen, firstLen);
+    uint32_t mismatch = 0;
+    while (mismatch < minLen
+           && (uint8_t)lastTermOfPrevBlock[mismatch] == (uint8_t)firstData[mismatch]) {
+      mismatch++;
+    }
+    assert(mismatch < firstLen);
+    if (mismatch < lastTermOfPrevBlockLen) {
+      assert((uint8_t)lastTermOfPrevBlock[mismatch] < (uint8_t)firstData[mismatch]);
+    }
+    trieBuilder.add(std::string_view(firstData, mismatch + 1), blockOrd);
+  }
+
+  void rememberLastTermOfCurrentBlock() {
+    auto [lastData, lastLen] = termList.back().unpack();
+    assert(lastLen <= PackedTerm::MAX_LEN);
+    memcpy(lastTermOfPrevBlock.data(), lastData, lastLen);
+    lastTermOfPrevBlockLen = lastLen;
+    hasLastTermOfPrevBlock = true;
+  }
+
   void appendL0Block(uint32_t lastDoc, uint32_t base, uint64_t blockByteLen,
                      uint32_t docCount, uint64_t tfSum, uint32_t maxTf, uint32_t minNorm) {
     appendL0Header(group_output, lastDoc, base, blockByteLen, docCount, tfSum, maxTf, minNorm);
@@ -681,6 +722,9 @@ public:
     // nocommit fieldInfo->flags |= 0x01;  // text field
 
     termBlockOffsets.resize(0);
+    trieBuilder.reset();
+    lastTermOfPrevBlockLen = 0;
+    hasLastTermOfPrevBlock = false;
 
     _startTermBlock(false);
   }
@@ -777,6 +821,9 @@ public:
       termBlockOffsets.pop_back();  // last block has no terms in it.
       return;
     }
+
+    uint32_t blockOrd = (uint32_t)termBlockOffsets.size() - 1;
+    addTrieSeparatorForCurrentBlock(blockOrd);
 
     numTerms += termList.size();
 
@@ -875,6 +922,7 @@ public:
     }
 
     assert(pulsedIdx == (int)pulsed.size());  // we should have read all pulsed docs/pos;
+    rememberLastTermOfCurrentBlock();
 
     if (!endingField) {
       _startTermBlock(endingField);
@@ -1047,6 +1095,13 @@ public:
     // one way this assert can fail is if numTerms==0, but I think so far this always represents a bug elsewhere.
     assert((int)termBlockOffsets.size() == ((numTerms-1) / Postings::TERMS_BLOCK_SIZE) + 1);
     termOutput.write(&(termBlockOffsets[0]), termBlockOffsets.size() * sizeof(termBlockOffsets[0]) );
+    // Append the trie after the fixed block-offset array.  trieRootOff is
+    // relative to trieLoc, while child links inside the trie are backward
+    // deltas within this appended byte region.
+    fieldInfo->trieLoc = seg_location(termOutput.streamNumber, termOutput.size());
+    fieldInfo->trieRootOff = (int64_t)trieBuilder.finish();
+    const std::vector<char>& trieBytes = trieBuilder.bytes();
+    termOutput.write(trieBytes.data(), trieBytes.size());
 
     fieldInfo->termsLoc = seg_location(termOutput.streamNumber, termsLoc);
     fieldInfo->docsLoc = seg_location(docOutput.streamNumber, docsLoc);

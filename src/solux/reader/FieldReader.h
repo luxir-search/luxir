@@ -28,6 +28,8 @@ struct SegFieldInfo {
   // One advantage of keeping this stuff here is it makes the TermBlockOffsets fixed size.
   int64_t sumDocFreq;
   int64_t sumTotalTermFreq;
+  seg_location trieLoc;
+  int64_t trieRootOff;
 
   // column
   seg_location docsWithFieldEndLoc;
@@ -162,6 +164,8 @@ public:
         fieldInfo.nTerms = fieldIS.readVint();
         fieldInfo.sumDocFreq = fieldInfo.nTerms + fieldIS.readVlong();
         fieldInfo.sumTotalTermFreq = fieldInfo.sumDocFreq + fieldIS.readVlong();
+        fieldInfo.trieLoc = fieldIS.readVal<seg_location>();
+        fieldInfo.trieRootOff = fieldIS.readVlong();
       }
 
       fieldInfo.docsWithFieldEndLoc = fieldIS.readVal<seg_location>();

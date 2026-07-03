@@ -2,6 +2,7 @@
 
 #include "FieldReader.h"
 #include "Postings.h"
+#include "TrieReader.h"
 
 namespace solux {
 class TermsEnum {
@@ -32,6 +33,8 @@ class TermsEnum {
 
   // term index level
   const int64_t* termBlockOffsets;
+  InputStream trieIS;
+  const char* trieBase;
   int32_t numTermBlocks;
 
 public:
@@ -41,6 +44,8 @@ public:
     numTermBlocks = ((fieldInfo.nTerms-1) / Postings::TERMS_BLOCK_SIZE) + 1;
     termsIS = postingsReader.getInputStreamSeek(fieldInfo.termBlockIndexLoc);
     termBlockOffsets = reinterpret_cast<const int64_t*>(termsIS.ptr());  // offsets from termsLoc
+    trieIS = postingsReader.getInputStreamSeek(fieldInfo.trieLoc);
+    trieBase = trieIS.ptr();
     currTerm = PackedTerm(pool.alloc(PackedTerm::getMemSize(PackedTerm::MAX_BYTES)), 0);
   }
 
@@ -167,25 +172,15 @@ protected:
     readTermMetadata();
   }
 
-  // Binary-search the block index for the block whose starting term is the
-  // greatest one that is <= target (considering only blocks at firstBlock or
-  // later), then seek to and load that block, leaving the enum at ord 0 of it.
+  // Find the block whose separator key is the greatest one that is <= target,
+  // then seek to and load that block, leaving the enum at ord 0 of it.
+  // Targets in a gap between two blocks route to the later block; such targets
+  // cannot be existing terms, and seekCeil must be able to land on that block.
   // Shared by seek(), seekForward(), and seekCeil().
   void seekBlock(std::string_view target, int32_t firstBlock) {
-    auto blockStart = termBlockOffsets + firstBlock;
-    auto blockEnd = termBlockOffsets + numTermBlocks;
-
-    auto blockOffsetPtr = std::upper_bound(blockStart, blockEnd, target,
-                                 [&](std::string_view key, const int64_t& blockOffset) {
-      auto termAtBlock = termsIS.readPackedTerm(fieldInfo.termsLoc.offset() + blockOffset);
-      return key < termAtBlock;
-    });
-
-    if (blockOffsetPtr > blockStart) {
-      blockOffsetPtr--;
-    }
-
-    termBlockIndex = (int32_t)(blockOffsetPtr - termBlockOffsets);
+    TrieReader trie(trieBase, (uint64_t)fieldInfo.trieRootOff, numTermBlocks);
+    termBlockIndex = trie.floorBlock(target);
+    assert(termBlockIndex >= firstBlock);
     readTermBlock();
   }
 
@@ -197,7 +192,7 @@ public:
 
   /// Forward-only seek for sorted iteration. Target must be >= the current term.
   /// If the target is in the current block, scans forward with nextTerm().
-  /// Otherwise narrows the binary search to blocks from the current position onward.
+  /// Otherwise descends the trie and asserts the result is at or after the next block.
   /// Can be called without a prior seek() - the first call will load the first block.
   bool seekForward(std::string_view target) {
     if (termBlockIndex < 0) {
@@ -211,15 +206,12 @@ public:
         !(target < termsIS.readPackedTerm(fieldInfo.termsLoc.offset() + termBlockOffsets[nextBlock]));
 
     if (beyondCurrentBlock) {
-      // Binary-search for the block that may contain target (from nextBlock
-      // onward) and load it, positioning at ord 0.  We then fall into the same
-      // linear scan as the in-block case.  We deliberately do NOT use
-      // seekInBlock here: its hash skip stops at the first hash-colliding term
+      // Load the block that may contain target, positioning at ord 0.  We
+      // then fall into the same linear scan as the in-block case.  We do not
+      // use seekInBlock here: its hash skip stops at the first hash-colliding term
       // past the target on a miss, leaving the enum beyond the true insertion
       // point, which would break the next seekForward (the post-miss position
       // must be the smallest term >= target for forward iteration to work).
-      // TODO: an exponential search from the current block could beat the
-      // binary search here.
       seekBlock(target, nextBlock);
     }
 
