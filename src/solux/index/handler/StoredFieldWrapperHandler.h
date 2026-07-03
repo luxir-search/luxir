@@ -1,21 +1,25 @@
 #pragma once
 
 #include <memory>
+#include <string>
 #include <string_view>
+#include <vector>
 
 #include "solux/index/Inverter.h"
 #include "solux/index/StoredFieldsWriter.h"
+#include "solux/schema/ValCoerce.h"
 
 namespace solux::handler {
 
-// Wraps an inner IndexHandler to additionally route raw field values to the
-// segment's StoredFieldsWriter.  Used when a FieldType has the STORED flag set.
-// Only instantiated for TEXT fields (see Inverter::createIndexHandler); numeric
-// stored-field storage is not supported in v1.
+// Wraps an inner IndexHandler to additionally route field values to the
+// segment's StoredFieldsWriter.  Used when a TEXT/STRING/ID FieldType has the
+// STORED flag set (see Inverter::createIndexHandler).
 //
 // The wrapper captures string / binary values from solux::api::Val (and the
-// equivalent direct string_view / span overloads) and forwards untouched to
-// the inner handler so normal indexing still runs.
+// equivalent direct string_view / span overloads); other value kinds store
+// the same canonical rendering the inner handler indexes (coerceTerm), so
+// what a search matches and what retrieval returns agree.  The value is
+// always forwarded untouched to the inner handler so normal indexing runs.
 class StoredFieldWrapperHandler final : public Inverter::IndexHandler {
 public:
   StoredFieldWrapperHandler(Inverter& inverter, std::string_view name,
@@ -50,8 +54,24 @@ public:
         views.push_back(std::string_view((const char*)bin.data(), bin.size()));
       }
       writer_->addValues(doc, name, std::span<const std::string_view>(views.data(), views.size()));
+    } else if (coerce::isNull(val)) {
+      // no value: nothing stored
+    } else if (coerce::isArray(val)) {
+      // numeric / mixed arrays: store each element's canonical rendering
+      // (materialized - buf is per-element transient)
+      char buf[coerce::TEXT_BUF_SIZE];
+      std::vector<std::string> storage;
+      coerce::forEachElement(val, [&](const IndexVal& elem) {
+        storage.emplace_back(fieldType->coerceTerm(elem, name, buf));
+      });
+      std::vector<std::string_view> views(storage.begin(), storage.end());
+      writer_->addValues(doc, name, std::span<const std::string_view>(views.data(), views.size()));
+    } else {
+      // numeric / bool scalars: store the canonical rendering, the same
+      // bytes the inner handler indexes
+      char buf[coerce::TEXT_BUF_SIZE];
+      writer_->addValue(doc, name, fieldType->coerceTerm(val, name, buf));
     }
-    // Non-string value types (int/float/double) are not stored in v1.
     inner_->index(inverter, val);
   }
 

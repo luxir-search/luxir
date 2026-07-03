@@ -307,6 +307,32 @@ TEST_F(ValCoerceTest, numericIdIndexesItsRendering) {
   helper.clear();
 }
 
+TEST_F(ValCoerceTest, storedFieldsKeepTheCanonicalRendering) {
+  CollectionHelper helper("main");
+  helper.clear();
+
+  auto schema = Schema::createDefaultSchema();
+  schema->fieldTypeMap["title"] = std::make_shared<TextFieldType>(
+      "title", FieldType::INDEX_DOCS_FREQS_POSITIONS | FieldType::STORED, "whitespace");
+  helper.collection().setSchema(schema);
+
+  // a numeric value into a STORED text field: searchable AND retrievable as
+  // the same canonical bytes (it used to index "42" but store nothing)
+  helper.index(flatdoc("id", "d1", "title", (int64_t)42), UpdateMessage::COMMIT);
+
+  auto req = localReq(helper.getSearchEngine());
+  req->collection("main").topDocs("q").matchQuery("title", "42")
+      .fields({"id", "title"}).limit(-1);
+  req->execute();
+  ASSERT_OK(req);
+  auto docs = req->getDocs();
+  ASSERT_EQ(1u, docs.size());
+  EXPECT_TRUE(containsDoc(docs, flatdoc("id", "d1", "title", "42")));
+
+  helper.clear();
+  helper.collection().setSchema(Schema::createDefaultSchema());
+}
+
 // ---- multi-valued text: arrays are now analyzed and searchable ----
 
 TEST_F(ValCoerceTest, multiValuedTextIsSearchable) {
