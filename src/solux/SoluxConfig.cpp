@@ -58,11 +58,11 @@ void SoluxConfig::addOptions(CLI::App& app) {
                  "Max size of one NDJSON record / document (default: max-request-body)")
       ->transform(CLI::AsSizeValue(false));
   app.add_option("--ingest.stream-batch-size", ingest.stream_batch_size,
-                 "Streaming NDJSON: byte size at which the stream is cut into one internal (non-atomic) update batch")
+                 "Streaming NDJSON: byte size for internal (non-atomic) mini-batches")
       ->transform(CLI::AsSizeValue(false))
       ->default_str("1MB");
   app.add_option("--ingest.stream-batch-docs", ingest.stream_batch_docs,
-                 "Streaming NDJSON: doc count at which the stream is cut into one internal (non-atomic) update batch")
+                 "Streaming NDJSON: doc count for internal (non-atomic) mini-batches")
       ->default_val(ingest.stream_batch_docs)
       ->check(CLI::PositiveNumber);
 }
