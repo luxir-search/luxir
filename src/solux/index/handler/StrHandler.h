@@ -18,7 +18,6 @@ class StrHandler final : public Inverter::IndexHandler {
 
   // TODO: for unique fields like "id", this could be TermValHash<int32_t>
   TermValHash<DocStream> termsHash; // the set of terms contained in this field
-  size_t maxValues = 1; // maximum number of values seen for a single doc
 
 public:
   StrHandler(Inverter& inverter, const std::string_view& fieldName, const std::shared_ptr<FieldType>& fieldType)
@@ -47,13 +46,15 @@ public:
     // buf is reused per element: indexSingle copies the term into the hash
     // before the next render.
     char buf[coerce::TEXT_BUF_SIZE];
-    size_t n = 0;
-    bool wasArray = coerce::forEachElement(val, [&](const IndexVal& elem) {
-      indexSingle(inverter, fieldType->coerceTerm(elem, std::string_view(fieldName), buf));
-      n++;
-    });
-    if (wasArray) {
-      maxValues = std::max(maxValues, n);
+    if (coerce::isArray(val)) {
+      checkMultiValued(inverter, [&] {
+        size_t n = 0;
+        coerce::forEachElement(val, [&](const IndexVal&) { n++; });
+        return n;
+      }());
+      coerce::forEachElement(val, [&](const IndexVal& elem) {
+        indexSingle(inverter, fieldType->coerceTerm(elem, std::string_view(fieldName), buf));
+      });
     } else {
       indexSingle(inverter, fieldType->coerceTerm(val, std::string_view(fieldName), buf));
     }
@@ -76,12 +77,25 @@ public:
   }
 
   void index(Inverter& inverter, std::span<const std::string_view> vals) override {
+    checkMultiValued(inverter, vals.size());
     for (auto val : vals) {
       indexSingle(inverter, val);
     }
-    maxValues = std::max(maxValues, vals.size());
-    // TODO: check if fieldType allows multiple values?
   }
+
+private:
+  // A single-valued STRING field must reject multi-value input before any
+  // append: the ord column would silently become multi-valued while readers
+  // shape results from the schema (and assert on the mismatch).
+  void checkMultiValued(Inverter& inverter, size_t n) {
+    unused(inverter);
+    if (n > 1 && !fieldType->multiValued()) {
+      throw std::runtime_error(fmt::format("Field '{}' is single-valued but received multiple values",
+                                           std::string_view(fieldName)));
+    }
+  }
+
+public:
 
   void flush(Inverter& inverter) override {
     int32_t uniqueVals = termsHash.size();

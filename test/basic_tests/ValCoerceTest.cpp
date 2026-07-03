@@ -229,6 +229,29 @@ TEST_F(ValCoerceTest, ingestBadArrayElementFailsBeforeAnyAppend) {
   helper.clear();
 }
 
+TEST_F(ValCoerceTest, singleValuedStringRejectsArrays) {
+  CollectionHelper helper("main");
+  helper.clear();
+
+  CollectionHelper::UpdateBuilder b;
+  b.add(flatdoc("id", "b1", "tag_s", std::vector<std::string>{"a", "b"}));
+  b.add(flatdoc("id", "g1", "tag_s", "solo"));
+  b.commit();
+  auto result = helper.submit(b);
+  ASSERT_EQ(ResponseStatus::PARTIAL, result.status);
+  ASSERT_EQ(1u, result.errors.size());
+  EXPECT_EQ("b1", result.errors[0].id);
+  EXPECT_NE(std::string::npos, result.errors[0].error_message.find("single-valued"));
+
+  auto req = localReq(helper.getSearchEngine());
+  req->collection("main").topDocs("q").allQuery().fields({"id", "tag_s"}).limit(-1);
+  req->execute();
+  auto docs = req->getDocs();
+  ASSERT_EQ(1u, docs.size());
+  EXPECT_TRUE(containsDoc(docs, flatdoc("id", "g1", "tag_s", "solo")));
+  helper.clear();
+}
+
 // ---- the findability invariant, both directions ----
 
 TEST_F(ValCoerceTest, numericIngestFindableByString) {
