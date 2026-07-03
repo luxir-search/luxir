@@ -51,6 +51,8 @@ struct IndexConfig {
 };
 
 struct IngestConfig {
+  // All byte sizes are stored in bytes; the CLI accepts size suffixes (e.g. 32MB).
+
   // Max size of a single buffered (non-streaming) request body - e.g. a /update
   // carrying an all_or_none request, or a /query.  Oversized -> 413, rejected at the
   // JSON layer (gRPC has its own max message size).  A whole such request lands in one
@@ -59,17 +61,26 @@ struct IngestConfig {
   // in production on a larger doc or atomic batch.  A future goal is to GUARANTEE a
   // minimum acceptable size (a fixed doc count, or a whole nested document + its
   // children, must always fit).
-  int64_t max_request_body_mb = 32;
+  int64_t max_request_body = 32 * 1024 * 1024;
 
-  // Streaming NDJSON ingest: soft byte target for auto-cutting the stream into one
-  // (non-atomic) UpdateRequest, plus a doc-count cut.  Bigger batches amortize the
-  // update-graph overhead at the cost of transient staging memory.
-  int64_t stream_batch_target_kb = 1024;   // 1 MiB
-  int64_t stream_batch_max_docs = 10000;
+  // Hard cap on ONE NDJSON record (one document) on the STREAMING path, where the
+  // buffered-body cap does NOT apply (the body is read unbounded).  It exists to stop
+  // a single record with no newline from accumulating unbounded in the framer; the
+  // buffered-body cap cannot serve that role because streaming lifts it.  Defaults to
+  // max_request_body (a single doc need be no larger than a whole buffered request);
+  // set explicitly only to cap individual streamed docs differently.
+  int64_t max_record = 0;   // 0 = inherit max_request_body
 
-  // Hard cap on one NDJSON record (one document).  Generous for the same trap reason;
-  // a large (e.g. nested) document must fit in a single record.
-  int64_t max_record_mb = 8;
+  // Streaming NDJSON: the stream is cut into internal update batches (each a separate
+  // NON-ATOMIC UpdateRequest) at whichever of these it reaches first.  NOT a limit on
+  // how many docs may be streamed (that is unbounded) - just the granularity at which
+  // docs are handed to the engine.  Bigger batches amortize the update-graph overhead
+  // at the cost of transient staging memory.
+  int64_t stream_batch_size = 1 * 1024 * 1024;
+  int64_t stream_batch_docs = 10000;
+
+  // Effective per-record cap: max_record if set, else the buffered-body cap.
+  int64_t maxRecordBytes() const { return max_record != 0 ? max_record : max_request_body; }
 };
 
 struct SoluxConfig {

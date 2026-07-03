@@ -241,7 +241,7 @@ private:
     // Buffered (non-streaming) request-body cap; oversized -> 413.  A whole such
     // request lands in one inverter, so this bounds a single non-streaming update's
     // RAM (streaming NDJSON lifts the limit and auto-cuts into batches instead).
-    parser_->body_limit((std::uint64_t)node_.getConfig().ingest.max_request_body_mb * 1024 * 1024);
+    parser_->body_limit((std::uint64_t)node_.getConfig().ingest.max_request_body);
     buffer_.clear();
     bufferedBody_.clear();
     streamUpdate_.reset();
@@ -654,9 +654,9 @@ private:
   void startStreamingUpdate(std::string coll) {
     const auto& ingest = node_.getConfig().ingest;
     auto state = std::make_shared<HttpStreamUpdateState>(
-        (std::size_t)ingest.stream_batch_target_kb * 1024,
-        (std::size_t)ingest.stream_batch_max_docs,
-        (std::size_t)ingest.max_record_mb * 1024 * 1024);
+        (std::size_t)ingest.stream_batch_size,
+        (std::size_t)ingest.stream_batch_docs,
+        (std::size_t)ingest.maxRecordBytes());
     state->collectionName = std::move(coll);
     state->workGuard = std::make_shared<net::executor_work_guard<net::any_io_executor>>(
         stream_.get_executor());
@@ -1181,8 +1181,8 @@ private:
         });
   }
 
-  // A 413 for a request body past ingest.max-request-body-mb.  The body was not
-  // fully consumed, so the connection cannot be reused - respond, then close.
+  // A 413 for a request body past ingest.max-request-body.  The body was not fully
+  // consumed, so the connection cannot be reused - respond, then close.
   void respondPayloadTooLarge() {
     keepAlive_ = false;
     if (parser_.has_value()) {
@@ -1190,7 +1190,7 @@ private:
       if (v != 0) httpVersion_ = v;
     }
     respondSimple(http::status::payload_too_large, "application/json",
-                  renderErrorBody("request body exceeds ingest.max-request-body-mb"));
+                  renderErrorBody("request body exceeds ingest.max-request-body"));
   }
 
   void doClose() {

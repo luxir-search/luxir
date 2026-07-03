@@ -50,21 +50,20 @@ void SoluxConfig::addOptions(CLI::App& app) {
       ->default_val(index.max_inverter_docs)
       ->check(CLI::PositiveNumber);
 
-  app.add_option("--ingest.max-request-body-mb", ingest.max_request_body_mb,
-                 "Max buffered (non-streaming) request body size (MiB); oversized -> 413")
-      ->default_val(ingest.max_request_body_mb)
-      ->check(CLI::PositiveNumber);
-  app.add_option("--ingest.stream-batch-target-kb", ingest.stream_batch_target_kb,
-                 "Streaming NDJSON: soft byte target (KiB) per auto-cut update batch")
-      ->default_val(ingest.stream_batch_target_kb)
-      ->check(CLI::PositiveNumber);
-  app.add_option("--ingest.stream-batch-max-docs", ingest.stream_batch_max_docs,
-                 "Streaming NDJSON: doc-count cut per auto-cut update batch")
-      ->default_val(ingest.stream_batch_max_docs)
-      ->check(CLI::PositiveNumber);
-  app.add_option("--ingest.max-record-mb", ingest.max_record_mb,
-                 "Max size of one NDJSON record / document (MiB)")
-      ->default_val(ingest.max_record_mb)
+  app.add_option("--ingest.max-request-body", ingest.max_request_body,
+                 "Max buffered (non-streaming) request body; oversized -> 413 (e.g. 32MB)")
+      ->transform(CLI::AsSizeValue(false))
+      ->default_str("32MB");
+  app.add_option("--ingest.max-record", ingest.max_record,
+                 "Max size of one NDJSON record / document (default: max-request-body)")
+      ->transform(CLI::AsSizeValue(false));
+  app.add_option("--ingest.stream-batch-size", ingest.stream_batch_size,
+                 "Streaming NDJSON: byte size at which the stream is cut into one internal (non-atomic) update batch")
+      ->transform(CLI::AsSizeValue(false))
+      ->default_str("1MB");
+  app.add_option("--ingest.stream-batch-docs", ingest.stream_batch_docs,
+                 "Streaming NDJSON: doc count at which the stream is cut into one internal (non-atomic) update batch")
+      ->default_val(ingest.stream_batch_docs)
       ->check(CLI::PositiveNumber);
 }
 
