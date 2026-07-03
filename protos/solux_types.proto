@@ -300,9 +300,13 @@ message SimpleQuery {
   // How adjacent clauses combine.  Unset = OR (any clause may match).
   Match.Operator operator = 3;
 
-  // Minimum number of top-level optional clauses that must match.  Applied
-  // only when the parsed top level is purely optional (mirrors
-  // BooleanQuery.min_match); otherwise ignored with a declared warning.
+  // Minimum number of top-level optional clauses that must match (mirrors
+  // BooleanQuery.min_match).  Silently inapplicable when the parsed top
+  // level cannot honor it (a single clause, required clauses from + or the
+  // AND operator): that depends on what the end user typed, and a query
+  // writer should not have to know user input to author a warning-free
+  // query.  A single clause is already its own min_match (the engine clamps
+  // to the clause count).
   int32 min_match = 4;
 
   // Narrows which field names the field:value syntax may reach.  Empty =
@@ -349,7 +353,7 @@ message Domain {
 // clamped announces itself here.  One channel, several tenants (degraded
 // simple_query clauses today; expansion clamps, partial results later).
 message Warning {
-  string code = 1;     // stable machine key, e.g. "field_degraded", "min_match_ignored"
+  string code = 1;     // stable machine key, e.g. "fuzzy_clamped", "field_narrowed"
   string message = 2;  // human-readable detail
 }
 

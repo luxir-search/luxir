@@ -333,6 +333,68 @@ TEST_F(ValCoerceTest, storedFieldsKeepTheCanonicalRendering) {
   helper.collection().setSchema(Schema::createDefaultSchema());
 }
 
+TEST_F(ValCoerceTest, storedMultiValuedTextStoresCoercedArrays) {
+  CollectionHelper helper("main");
+  helper.clear();
+
+  auto schema = Schema::createDefaultSchema();
+  schema->fieldTypeMap["tags"] = std::make_shared<TextFieldType>(
+      "tags",
+      FieldType::INDEX_DOCS_FREQS_POSITIONS | FieldType::MULTI_VALUED | FieldType::STORED,
+      "whitespace");
+  helper.collection().setSchema(schema);
+
+  // a numeric array into a STORED multi-valued text field: each element's
+  // rendering is searchable AND retrievable
+  helper.index(flatdoc("id", "d1", "tags", std::vector<int64_t>{1, 2}),
+               UpdateMessage::COMMIT);
+
+  auto req = localReq(helper.getSearchEngine());
+  req->collection("main").topDocs("q").matchQuery("tags", "2").fields({"id", "tags"}).limit(-1);
+  req->execute();
+  ASSERT_OK(req);
+  auto docs = req->getDocs();
+  ASSERT_EQ(1u, docs.size());
+  EXPECT_TRUE(containsDoc(docs, flatdoc("id", "d1", "tags",
+                                        std::vector<std::string>{"1", "2"})));
+
+  helper.clear();
+  helper.collection().setSchema(Schema::createDefaultSchema());
+}
+
+TEST_F(ValCoerceTest, storedFieldOfRejectedDocStaysInvisible) {
+  CollectionHelper helper("main");
+  helper.clear();
+
+  auto schema = Schema::createDefaultSchema();
+  schema->fieldTypeMap["tag"] = std::make_shared<StrFieldType>(
+      "tag", FieldType::INDEX_DOCS | FieldType::COLUMN_STORED | FieldType::STORED);
+  helper.collection().setSchema(schema);
+
+  // The stored-field wrapper writes before the inner handler validates; the
+  // per-doc failure contract makes that benign - the failed doc is marked
+  // deleted and nothing of it (stored bytes included) is ever visible.
+  CollectionHelper::UpdateBuilder b;
+  b.add(flatdoc("id", "b1", "tag", std::vector<std::string>{"a", "b"}));  // single-valued: rejected
+  b.add(flatdoc("id", "g1", "tag", "solo"));
+  b.commit();
+  auto result = helper.submit(b);
+  ASSERT_EQ(ResponseStatus::PARTIAL, result.status);
+  ASSERT_EQ(1u, result.errors.size());
+  EXPECT_EQ("b1", result.errors[0].id);
+
+  auto req = localReq(helper.getSearchEngine());
+  req->collection("main").topDocs("q").allQuery().fields({"id", "tag"}).limit(-1);
+  req->execute();
+  ASSERT_OK(req);
+  auto docs = req->getDocs();
+  ASSERT_EQ(1u, docs.size());
+  EXPECT_TRUE(containsDoc(docs, flatdoc("id", "g1", "tag", "solo")));
+
+  helper.clear();
+  helper.collection().setSchema(Schema::createDefaultSchema());
+}
+
 // ---- multi-valued text: arrays are now analyzed and searchable ----
 
 TEST_F(ValCoerceTest, multiValuedTextIsSearchable) {

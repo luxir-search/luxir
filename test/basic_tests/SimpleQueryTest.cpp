@@ -137,7 +137,8 @@ TEST_F(SimpleQueryTest, warningsRideTheResponse) {
 
 TEST_F(SimpleQueryTest, minMatchNeverBindsToFieldExpansion) {
   // one user clause over two fields with min_match=2: it must not require
-  // the term in BOTH fields (the expansion boolean is not a clause list)
+  // the term in BOTH fields (the expansion boolean is not a clause list),
+  // and inapplicability is silent - it depends on what the user typed
   auto req = localReq(helper.getSearchEngine());
   auto& cur = req->collection("main").topDocs("q");
   cur.simpleQuery("blade", {"title_wl", "body_wl"}).fields({"id"}).limit(-1);
@@ -145,7 +146,16 @@ TEST_F(SimpleQueryTest, minMatchNeverBindsToFieldExpansion) {
   req->execute();
   ASSERT_TRUE(req->ok()) << req->errorMsg();
   EXPECT_EQ(1u, req->getDocs().size());  // d1 matches via title alone
-  EXPECT_TRUE(req->hasWarning("min_match_ignored"));
+  EXPECT_TRUE(req->respWarnings().empty());
+}
+
+TEST_F(SimpleQueryTest, minMatchCountsMixedFieldTypeClauses) {
+  // 2 of 3 clauses: an exact STRING match counts alongside analyzed TEXT ones
+  auto docs = search("tag_s:scifi blade swords", {"title_wl", "body_wl"},
+                     [](solux::api::SimpleQuery& sq) { sq.min_match = 2; });
+  EXPECT_EQ(2u, docs.size());
+  EXPECT_TRUE(hasId(docs, "d1"));  // scifi + blade
+  EXPECT_TRUE(hasId(docs, "d3"));  // scifi + swords
 }
 
 TEST_F(SimpleQueryTest, quotedValueOnStringFieldIsExactMatch) {
@@ -158,16 +168,18 @@ TEST_F(SimpleQueryTest, quotedValueOnStringFieldIsExactMatch) {
   EXPECT_TRUE(hasId(docs, "d4"));
 }
 
-TEST_F(SimpleQueryTest, minMatchIgnoredIsDeclared) {
+TEST_F(SimpleQueryTest, minMatchOnRequiredTopLevelIsSilentlyInapplicable) {
   auto req = localReq(helper.getSearchEngine());
   auto& cur = req->collection("main").topDocs("q");
   // note a LEADING '+' would be ignored (nothing before it to combine with);
-  // this one makes the top level required, so min_match cannot apply
+  // this one makes the top level required, so min_match cannot apply - and
+  // that is user-input-contingent, so it costs no warning
   cur.simpleQuery("blade +runner", {"title_wl"}).fields({"id"}).limit(-1);
   std::get<solux::api::SimpleQuery>(cur.rawQuery().kind).min_match = 2;
   req->execute();
   ASSERT_TRUE(req->ok()) << req->errorMsg();
-  EXPECT_TRUE(req->hasWarning("min_match_ignored"));
+  EXPECT_EQ(1u, req->getDocs().size());  // both required terms: d1
+  EXPECT_TRUE(req->respWarnings().empty());
 }
 
 TEST_F(SimpleQueryTest, allowedFieldsNarrows) {

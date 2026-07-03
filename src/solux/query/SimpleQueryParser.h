@@ -60,7 +60,8 @@ struct SimpleQueryOptions {
   api::Match_::Operator operator_ = api::Match_::Operator::OPERATOR_UNSPECIFIED;
   // Minimum number of top-level optional USER clauses that must match.
   // Applied here, where user clauses are distinguishable from per-field
-  // expansion; ignored-with-a-warning when the top level cannot honor it.
+  // expansion; silently inapplicable when the top level cannot honor it
+  // (that is contingent on user input, which must not cost warnings).
   int32_t min_match = 0;
 };
 
@@ -183,28 +184,25 @@ public:
 
     // min_match applies over the top-level USER clauses (never to a leaf's
     // per-field expansion, which is also a BooleanQuery - the shapes are
-    // indistinguishable downstream, so the decision lives here).
+    // indistinguishable downstream, so the decision lives here).  When the
+    // top level cannot honor it - a single clause, a required level from
+    // +/operator=AND, match-all, empty input - it is SILENTLY inapplicable:
+    // whether min_match applies is contingent on what the end user typed,
+    // and a query writer should not have to know user input to author a
+    // warning-free query.  The semantics stay consistent with the engine's
+    // clamp (min_match above the clause count means "all of them", so a
+    // single clause is already its own min_match).
     const api::Query* root;
     if (!st.clauses.empty()) {
       const api::Query* collapsed = collapse(st);
-      if (opts.min_match > 0) {
-        if (st.clausesOccur == Occur::SHOULD) {
-          // our own freshly built arena node; the engine clamps to the count
-          std::get<api::BooleanQuery>(const_cast<api::Query*>(collapsed)->kind).min_match =
-              opts.min_match;
-        } else {
-          warn("min_match_ignored",
-               "min_match applies to optional clauses; this query's top-level clauses are required");
-        }
+      if (opts.min_match > 0 && st.clausesOccur == Occur::SHOULD) {
+        // our own freshly built arena node; the engine clamps to the count
+        std::get<api::BooleanQuery>(const_cast<api::Query*>(collapsed)->kind).min_match =
+            opts.min_match;
       }
       root = collapsed;
     } else {
       root = st.top;
-      if (opts.min_match > 1 && root != nullptr) {
-        warn("min_match_ignored",
-             fmt::format("min_match {} needs that many optional clauses; this query has one",
-                         opts.min_match));
-      }
     }
     return {root, warnings.finish()};
   }
@@ -467,15 +465,51 @@ private:
   }
 
   // The position of the ')' closing the '(' at openPos, honoring quotes and
-  // escapes, or NPOS.  Backed by the lazily built one-pass table.
+  // escapes, or NPOS.  Backed by a lazily built table whose quote handling
+  // mirrors the parse's degradation rule: quotes pair greedily left-to-right,
+  // and an UNPAIRED quote is not a quote (the parse treats it as extraneous
+  // and reparses its "contents"), so it must not hide the parens after it.
+  // Only real quoted regions protect parens.
   size_t matchingClose(size_t openPos) {
     if (!parenTableBuilt) {
       parenTableBuilt = true;
       parenClose.assign(inputEnd, NPOS);
+
+      // phase 1: pair unescaped quotes greedily
+      std::pmr::vector<std::pair<size_t, size_t>> quoted(&mr);
+      {
+        bool escaped = false;
+        size_t open = NPOS;
+        for (size_t i = 0; i < inputEnd; i++) {
+          if (escaped) {
+            escaped = false;
+            continue;
+          }
+          char c = data[i];
+          if (c == '\\') {
+            escaped = true;
+          } else if (c == '"') {
+            if (open == NPOS) {
+              open = i;
+            } else {
+              quoted.push_back({open, i});
+              open = NPOS;
+            }
+          }
+        }
+        // an unpaired trailing `open` is dropped: not a quote
+      }
+
+      // phase 2: pair parens, skipping the quoted regions
       std::pmr::vector<size_t> stack(&mr);
       bool escaped = false;
-      bool inQuote = false;
+      size_t qi = 0;
       for (size_t i = 0; i < inputEnd; i++) {
+        if (qi < quoted.size() && i == quoted[qi].first) {
+          i = quoted[qi].second;  // jump to the closing quote (loop ++ steps past)
+          qi++;
+          continue;
+        }
         if (escaped) {
           escaped = false;
           continue;
@@ -483,11 +517,9 @@ private:
         char c = data[i];
         if (c == '\\') {
           escaped = true;
-        } else if (c == '"') {
-          inQuote = !inQuote;
-        } else if (!inQuote && c == '(') {
+        } else if (c == '(') {
           stack.push_back(i);
-        } else if (!inQuote && c == ')' && !stack.empty()) {
+        } else if (c == ')' && !stack.empty()) {
           parenClose[stack.back()] = i;
           stack.pop_back();
         }

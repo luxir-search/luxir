@@ -377,24 +377,25 @@ TEST_F(SimpleQueryParserTest, minMatchBindsToUserClauses) {
   EXPECT_EQ(0, asBool(b.optional[0]).min_match);  // expansion untouched
 }
 
-TEST_F(SimpleQueryParserTest, minMatchOnSingleClauseIsDeclaredIgnored) {
+TEST_F(SimpleQueryParserTest, minMatchOnSingleClauseIsSilentlyInapplicable) {
   fields = {"title", "body"};
   minMatch = 2;
   // one user clause: its field expansion must NOT absorb min_match (that
-  // would require the term in BOTH fields)
+  // would require the term in BOTH fields).  Whether min_match applies is
+  // contingent on user input, so inapplicability costs no warning.
   auto r = parse("foo");
   const auto& b = asBool(*r.root);
   EXPECT_EQ(0, b.min_match);
-  EXPECT_TRUE(hasWarning(r, "min_match_ignored"));
+  EXPECT_TRUE(r.warnings.empty());
 }
 
-TEST_F(SimpleQueryParserTest, minMatchOnRequiredClausesIsDeclaredIgnored) {
+TEST_F(SimpleQueryParserTest, minMatchOnRequiredClausesIsSilentlyInapplicable) {
   minMatch = 2;
   auto r = parse("foo +bar");
   const auto& b = asBool(*r.root);
   ASSERT_EQ(2u, b.required.size());
   EXPECT_EQ(0, b.min_match);
-  EXPECT_TRUE(hasWarning(r, "min_match_ignored"));
+  EXPECT_TRUE(r.warnings.empty());
 }
 
 // ---- quote-aware grouping ----
@@ -422,4 +423,56 @@ TEST_F(SimpleQueryParserTest, unmatchedParenFloodStaysWellBehaved) {
   auto r = parse(q);
   ASSERT_NE(nullptr, r.root);
   EXPECT_EQ("foo", matchVal(*r.root));
+}
+
+TEST_F(SimpleQueryParserTest, unmatchedQuoteDoesNotPoisonLaterGroups) {
+  // the unterminated quote degrades and its contents reparse - the group
+  // after it must still be a group (an unpaired quote is not a quote)
+  auto r = parse("\"foo +(bar | baz)");
+  const auto& b = asBool(*r.root);
+  ASSERT_EQ(2u, b.required.size());
+  EXPECT_EQ("foo", matchVal(b.required[0]));
+  const auto& inner = asBool(b.required[1]);
+  EXPECT_EQ(2u, inner.optional.size());
+}
+
+TEST_F(SimpleQueryParserTest, escapedQuoteDoesNotProtectParens) {
+  // an escaped quote is a literal character, so the group is structural
+  auto r = parse("x\\\" (a b)");
+  const auto& b = asBool(*r.root);
+  ASSERT_EQ(2u, b.optional.size());
+  EXPECT_EQ("x\"", matchVal(b.optional[0]));
+  EXPECT_EQ(2u, asBool(b.optional[1]).optional.size());
+}
+
+TEST_F(SimpleQueryParserTest, minMatchCountsGroupsAsClauses) {
+  minMatch = 2;
+  auto r = parse("(a b) (c d)");
+  const auto& b = asBool(*r.root);
+  EXPECT_EQ(2, b.min_match);
+  ASSERT_EQ(2u, b.optional.size());
+  EXPECT_TRUE(r.warnings.empty());
+}
+
+TEST_F(SimpleQueryParserTest, minMatchAfterEmptyGroupIsSilentlyInapplicable) {
+  minMatch = 2;
+  auto r = parse("() a");  // the empty group is nothing; one clause remains
+  EXPECT_EQ("a", matchVal(*r.root));
+  EXPECT_TRUE(r.warnings.empty());
+}
+
+TEST_F(SimpleQueryParserTest, minMatchOnMatchAllIsSilentlyInapplicable) {
+  minMatch = 2;
+  auto r = parse("*");
+  EXPECT_TRUE(std::holds_alternative<bool>(r.root->kind));
+  EXPECT_TRUE(r.warnings.empty());
+}
+
+TEST_F(SimpleQueryParserTest, minMatchOnEmptyInputStaysSilent) {
+  // "at least N of zero clauses" is unsatisfiable: matching nothing IS the
+  // semantics honored, so no warning
+  minMatch = 2;
+  auto r = parse("   ");
+  EXPECT_EQ(nullptr, r.root);
+  EXPECT_TRUE(r.warnings.empty());
 }
