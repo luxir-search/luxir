@@ -100,7 +100,8 @@ namespace solux::api {
 struct Target; struct SearchRequest; struct SearchOp; struct GenOp; struct TopDocs;
 struct Fusion; struct RrfFusion; struct SortSpec; struct Query; struct ForcePrepareQuery;
 struct ConstantScoreQuery; struct KnnQuery; struct Match; struct NamedQuery; struct BooleanQuery;
-struct PrefixQuery; struct FuzzyQuery; struct PhraseQuery; struct FieldFacet; struct RangeFacet;
+struct PrefixQuery; struct FuzzyQuery; struct PhraseQuery; struct SimpleQuery; struct Warning;
+struct FieldFacet; struct RangeFacet;
 struct Domain; struct SearchResponse; struct DocList; struct FacetResult; struct Bucket;
 struct CommitParams; struct UpdateRequest; struct UpdateResponse; struct NamedValue; struct Map;
 struct Columns; struct Val; struct ArrVal; struct ArrStr; struct ArrInt; struct ArrFloat;
@@ -376,10 +377,12 @@ struct Val {                                                   // needs Map,ArrV
   bool asBool() const { return std::get<bool>(kind); }
   std::string_view asString() const { return std::get<std::string_view>(kind); }
 };
+struct Warning { std::string_view code; std::string_view message; };
 struct SearchResponse {
   std::string_view request_id;
   map_view<std::string_view, ::hpp_proto::indirect_view<Val>> ops;
   std::string_view error;
+  std::span<const Warning> warnings;
   bool more = {};
 };
 struct NamedValue { std::string_view name; ::hpp_proto::optional_indirect_view<Val> val; };
@@ -395,9 +398,17 @@ struct ConstantScoreQuery {
   std::optional<float> score;
 };
 struct ForcePrepareQuery { ::hpp_proto::optional_indirect_view<Query> query; };
-struct Query {                                                 // needs Match,BooleanQuery,Phrase,Knn,ConstantScore,Prefix,Fuzzy,ForcePrepare
+struct SimpleQuery {
+  using Operator = solux::api::Match_::Operator;
+  std::string_view q;
+  std::span<const std::string_view> fields;
+  std::span<const std::string_view> allowed_fields;
+  Operator operator_ = Operator::OPERATOR_UNSPECIFIED;
+  std::int32_t min_match = {};
+};
+struct Query {                                                 // needs Match,BooleanQuery,Phrase,Knn,ConstantScore,Prefix,Fuzzy,Simple,ForcePrepare
   std::variant<std::monostate, Match, BooleanQuery, bool, std::string_view, PhraseQuery, KnnQuery,
-               ConstantScoreQuery, PrefixQuery, FuzzyQuery, ForcePrepareQuery>
+               ConstantScoreQuery, PrefixQuery, FuzzyQuery, SimpleQuery, ForcePrepareQuery>
       kind;
 };
 struct NamedQuery { std::string_view name; ::hpp_proto::optional_indirect_view<Query> query; };
@@ -419,7 +430,8 @@ struct UpdateRequest {                                         // needs Target,C
 SOLUX_TD(Target) SOLUX_TD(SearchRequest) SOLUX_TD(SearchOp) SOLUX_TD(GenOp) SOLUX_TD(TopDocs)
 SOLUX_TD(Fusion) SOLUX_TD(RrfFusion) SOLUX_TD(SortSpec) SOLUX_TD(Query) SOLUX_TD(ForcePrepareQuery)
 SOLUX_TD(ConstantScoreQuery) SOLUX_TD(KnnQuery) SOLUX_TD(Match) SOLUX_TD(NamedQuery) SOLUX_TD(BooleanQuery)
-SOLUX_TD(PrefixQuery) SOLUX_TD(FuzzyQuery) SOLUX_TD(PhraseQuery) SOLUX_TD(FieldFacet) SOLUX_TD(RangeFacet)
+SOLUX_TD(PrefixQuery) SOLUX_TD(FuzzyQuery) SOLUX_TD(PhraseQuery) SOLUX_TD(SimpleQuery)
+SOLUX_TD(Warning) SOLUX_TD(FieldFacet) SOLUX_TD(RangeFacet)
 SOLUX_TD(Domain) SOLUX_TD(SearchResponse) SOLUX_TD(DocList) SOLUX_TD(FacetResult) SOLUX_TD(Bucket)
 SOLUX_TD(CommitParams) SOLUX_TD(UpdateRequest) SOLUX_TD(UpdateResponse) SOLUX_TD(NamedValue) SOLUX_TD(Map)
 SOLUX_TD(Columns) SOLUX_TD(Val) SOLUX_TD(ArrVal) SOLUX_TD(ArrStr) SOLUX_TD(ArrInt) SOLUX_TD(ArrFloat)
@@ -444,7 +456,8 @@ SOLUX_ENTRY(Target) SOLUX_ENTRY(SearchRequest) SOLUX_ENTRY(SearchOp) SOLUX_ENTRY
 SOLUX_ENTRY(TopDocs) SOLUX_ENTRY(Fusion) SOLUX_ENTRY(RrfFusion) SOLUX_ENTRY(SortSpec)
 SOLUX_ENTRY(Query) SOLUX_ENTRY(ForcePrepareQuery) SOLUX_ENTRY(ConstantScoreQuery)
 SOLUX_ENTRY(KnnQuery) SOLUX_ENTRY(Match) SOLUX_ENTRY(NamedQuery) SOLUX_ENTRY(BooleanQuery)
-SOLUX_ENTRY(PrefixQuery) SOLUX_ENTRY(FuzzyQuery) SOLUX_ENTRY(PhraseQuery) SOLUX_ENTRY(FieldFacet)
+SOLUX_ENTRY(PrefixQuery) SOLUX_ENTRY(FuzzyQuery) SOLUX_ENTRY(PhraseQuery) SOLUX_ENTRY(SimpleQuery)
+SOLUX_ENTRY(Warning) SOLUX_ENTRY(FieldFacet)
 SOLUX_ENTRY(RangeFacet) SOLUX_ENTRY(Domain) SOLUX_ENTRY(SearchResponse) SOLUX_ENTRY(DocList)
 SOLUX_ENTRY(FacetResult) SOLUX_ENTRY(Bucket) SOLUX_ENTRY(CommitParams) SOLUX_ENTRY(UpdateRequest)
 SOLUX_ENTRY(UpdateResponse) SOLUX_ENTRY(NamedValue) SOLUX_ENTRY(Map) SOLUX_ENTRY(Columns)

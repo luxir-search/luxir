@@ -49,6 +49,10 @@ public:
   oneapi::tbb::task_group* tg = nullptr; // optional top-level task group for this request.
   SearchResponse* lastResponse = nullptr;
   std::mutex mutex;
+  // Declared degradations accumulated during parse/build (see ParseContext);
+  // copied onto the FINAL response's SearchResponse.warnings.  Message views
+  // point into requestPool, which outlives response serialization.
+  std::vector<api::Warning> warnings;
 
   SearchRequest(SearchEngine& engine, const ReqProto& proto, google::protobuf::Arena& arena)
     : engine(engine), proto(proto), arena(arena) {

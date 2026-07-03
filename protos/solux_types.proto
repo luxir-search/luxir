@@ -145,9 +145,9 @@ message Query {
     ConstantScoreQuery constant_score = 7; // wraps a query and replaces each hit's score
     PrefixQuery prefix = 8;         // selects documents by term prefix
     FuzzyQuery fuzzy = 9;           // selects documents by fuzzy (edit-distance) term match
+    SimpleQuery simple_query = 10;  // forgiving end-user query string (search-box input)
 
-    // TODO: a looser string match that will auto-convert to correct type
-    // TODO: a text query type (parsed by QueryParser)
+    // TODO: the "expr" query-string language (the programmer's language; rigorous grammar)
     // TODO: wildcard query
     // TODO: function?
 
@@ -276,6 +276,42 @@ message PhraseQuery {
   repeated int32 positions = 15; // optional positions of the terms
 }
 
+// Forgiving end-user query for raw search-box input (dismax descendant).
+// NEVER fails to parse: any input degrades to some query, and degraded
+// constructs or ignored parameters are declared in SearchResponse.warnings.
+//
+// Syntax: bare words (searched across `fields`), + (the NEXT clause is
+// required; needs a preceding clause to combine with, so a leading + is
+// inert), -word (must not; under the default OR this is its own
+// all-except-word clause - restrictive negation needs operator AND),
+// a | b (or), "a phrase", (grouping), trailing * (prefix), word~N (fuzzy;
+// bare ~ = auto edits), \ escapes the next character, and field:value /
+// field:"a phrase" fielded terms.  A colon token whose field name is not
+// queryable degrades to literal text against `fields` - never an error
+// ("re: your email" must not blow up a search box).
+message SimpleQuery {
+  string q = 1;  // the raw user input
+
+  // The fields unfielded (bare) terms search; scores sum across fields.
+  // Required, non-empty: the never-fails contract covers q, not the request
+  // envelope, and bare words need a home.
+  repeated string fields = 2;
+
+  // How adjacent clauses combine.  Unset = OR (any clause may match).
+  Match.Operator operator = 3;
+
+  // Minimum number of top-level optional clauses that must match.  Applied
+  // only when the parsed top level is purely optional (mirrors
+  // BooleanQuery.min_match); otherwise ignored with a declared warning.
+  int32 min_match = 4;
+
+  // Narrows which field names the field:value syntax may reach.  Empty =
+  // every queryable schema field.  It can only narrow that set - listing a
+  // name the schema cannot query does not make it work.  A field: token
+  // outside the allowed set is literal text, never an error.
+  repeated string allowed_fields = 5;
+}
+
 
 message FieldFacet {
   string field = 1;
@@ -308,11 +344,21 @@ message Domain {
   repeated NamedQuery filter = 5;     // Additional named filters to apply
 }
 
+// A declared degradation: the request was served, but not exactly as written.
+// Silent substitution is forbidden - anything dropped, degraded, ignored, or
+// clamped announces itself here.  One channel, several tenants (degraded
+// simple_query clauses today; expansion clamps, partial results later).
+message Warning {
+  string code = 1;     // stable machine key, e.g. "field_degraded", "min_match_ignored"
+  string message = 2;  // human-readable detail
+}
+
 // Top-level response to a Search request
 message SearchResponse {
   string request_id = 1;
   map<string, Val> ops = 2; // the results of the search operations in the request, keyed by operation name.
   string error = 3;         // If non-empty, the request failed.  ops may be empty or partial.
+  repeated Warning warnings = 4; // declared degradations; the request still succeeded
   bool more = 15;  // if true, expect at least one more streaming response to the logical request.
 }
 

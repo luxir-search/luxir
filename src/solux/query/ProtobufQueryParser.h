@@ -4,7 +4,9 @@
 
 #include "PhraseQuery.h"
 #include "QueryBuilder.h"
+#include "solux/query/ParseContext.h"
 #include "solux/query/Query.h"
+#include "solux/query/SimpleQueryParser.h"
 #include "solux/query/TermQuery.h"
 #include "solux/query/AllQuery.h"
 #include "solux/query/BooleanQuery.h"
@@ -24,13 +26,15 @@ namespace solux {
 // (optional_)indirect views over the same bytes.
 
 class ProtobufQueryParser {
-  MemPool& pool;
-  Schema& schema;
+  ParseContext& context;
+  MemPool& pool;      // = context.pool (the parsed query tree's storage)
+  Schema& schema;     // = context.schema
 public:
-  // The provided pool will be used to store the parsed query tree.
-  // We need access to the schema to figure out what types of queries to produce.
-  // Both the pool and any parsed protobuf objects must outlive the query tree.
-  ProtobufQueryParser(MemPool& pool, Schema& schema) : pool(pool), schema(schema) {
+  // The context's pool stores the parsed query tree; the schema decides what
+  // types of queries to produce; warnings go to the context's sink.  The
+  // context, its pool, and any parsed protobuf objects must outlive the tree.
+  explicit ProtobufQueryParser(ParseContext& context)
+    : context(context), pool(context.pool), schema(context.schema) {
   }
 
   // Return a single string_view from a protobuf Val or empty string view if the
@@ -232,6 +236,48 @@ public:
     return pool.make<solux::BooleanQuery>(required, optional, prohibited, filter, minMatch);
   }
 
+  solux::Query* parseSimpleQuery(const solux::api::SimpleQuery& sq) {
+    // Envelope validation errors freely: the never-fails contract covers the
+    // STRING q, not the request shape (request-shape errors are
+    // author-controlled and deterministic).
+    if (sq.fields.empty()) {
+      throw std::runtime_error(
+        "simple_query requires a non-empty 'fields' list (the fields bare words search)");
+    }
+    if (sq.min_match < 0) {
+      throw std::runtime_error("simple_query 'min_match' must not be negative");
+    }
+    for (std::string_view f : sq.fields) {
+      FieldType* fieldType = schema.getFieldTypePtr(f);
+      if (fieldType == nullptr || !SimpleQueryParser::termQueryable(*fieldType)) {
+        throw std::runtime_error(std::format(
+          "simple_query 'fields' entry '{}' is not a queryable text/string/id field", f));
+      }
+    }
+
+    // The parser is schema-aware (arm selection by FieldType; analysis still
+    // happens at build) and applies min_match itself, where user clauses are
+    // distinguishable from per-field expansion.  allowed_fields only narrows;
+    // entries the schema cannot query are dead.
+    SimpleQueryOptions options;
+    options.fields = sq.fields;
+    options.schema = &schema;
+    options.allowed_fields = sq.allowed_fields;
+    options.operator_ = sq.operator_;
+    options.min_match = sq.min_match;
+
+    SimpleQueryResult result = solux::parseSimpleQuery(sq.q, options, pool);
+    for (const auto& w : result.warnings) {
+      context.warn(w.code, w.message);
+    }
+
+    if (result.root == nullptr) {
+      QueryBuilder builder(pool, schema);
+      return builder.matchNoDocs();
+    }
+    return parse(*result.root);
+  }
+
   solux::Query* parseForcePrepare(const solux::api::ForcePrepareQuery& forcePrepareQuery) {
     if (!forcePrepareQuery.query.has_value() ||
         forcePrepareQuery.query->kind.index() == 0) {
@@ -256,6 +302,7 @@ public:
       [&](const solux::api::PhraseQuery& p) -> solux::Query* { return parsePhrase(p); },
       [&](const solux::api::PrefixQuery& p) -> solux::Query* { return parsePrefix(p); },
       [&](const solux::api::FuzzyQuery& f) -> solux::Query* { return parseFuzzy(f); },
+      [&](const solux::api::SimpleQuery& s) -> solux::Query* { return parseSimpleQuery(s); },
       [&](bool) -> solux::Query* { return pool.make<solux::AllQuery>(); },  // the `all` arm
       [&](const solux::api::KnnQuery& k) -> solux::Query* { return parseKnn(k); },
       [&](const solux::api::BooleanQuery& b) -> solux::Query* { return parseBoolean(b); },

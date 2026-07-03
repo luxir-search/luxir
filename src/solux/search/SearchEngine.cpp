@@ -38,6 +38,16 @@ void SearchEngine::submitBody(SearchRequest& req) {
     req.lastResponse->proto.error = solux::api::build::arenaStr(req.lastResponse->mr, e.what());
   }
 
+  // Declared degradations ride on the final response (streaming responses
+  // with more=true do not carry them).
+  if (!req.warnings.empty()) {
+    auto* warnings = solux::api::build::allocArray(req.lastResponse->proto.warnings,
+                                                   req.warnings.size(), req.lastResponse->mr);
+    for (size_t i = 0; i < req.warnings.size(); i++) {
+      warnings[i] = req.warnings[i];
+    }
+  }
+
   // Send back the final response.  Do not access req after this point as it
   // maybe asynchronously deleted.
   req.reply(*req.lastResponse);

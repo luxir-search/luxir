@@ -166,6 +166,32 @@ TEST_F(HttpApiTest, updateIndexesAndQueryRoundTrip) {
   EXPECT_EQ(std::set<std::string>({"u1"}), idsOf(hreq.getDocs())) << hreq.rawResponse();
 }
 
+TEST_F(HttpApiTest, simpleQueryOverJson) {
+  auto update = httpRequest(port(), http::verb::post, "/collections/main/update",
+      R"({"docs":[{"id":"s1","title_w":"blade runner"},{"id":"s2","title_w":"running man"}],"commit":{}})");
+  ASSERT_EQ(200, update.result_int()) << update.body();
+
+  // the simple_query arm parses mechanically from the dialect (no sugar needed)
+  auto res = httpRequest(port(), http::verb::post, "/collections/main/query",
+      R"({"query":{"simple_query":{"q":"blade | man","fields":["title_w"]}},"fields":["id"]})");
+  ASSERT_EQ(200, res.result_int()) << res.body();
+  EXPECT_NE(res.body().find(R"("s1")"), std::string::npos) << res.body();
+  EXPECT_NE(res.body().find(R"("s2")"), std::string::npos) << res.body();
+
+  // declared degradations are visible on the wire (clamp-and-declare)
+  auto warned = httpRequest(port(), http::verb::post, "/collections/main/query",
+      R"({"query":{"simple_query":{"q":"blade~9","fields":["title_w"]}},"fields":["id"]})");
+  ASSERT_EQ(200, warned.result_int()) << warned.body();
+  EXPECT_NE(warned.body().find(R"("warnings")"), std::string::npos) << warned.body();
+  EXPECT_NE(warned.body().find(R"("fuzzy_clamped")"), std::string::npos) << warned.body();
+
+  // never-fails: garbage user input is still a 200 with results, not an error
+  auto garbage = httpRequest(port(), http::verb::post, "/collections/main/query",
+      R"({"query":{"simple_query":{"q":"re: \"unbalanced ((man","fields":["title_w"]}},"fields":["id"]})");
+  ASSERT_EQ(200, garbage.result_int()) << garbage.body();
+  EXPECT_NE(garbage.body().find(R"("s2")"), std::string::npos) << garbage.body();
+}
+
 TEST_F(HttpApiTest, updateDeleteIds) {
   auto index = httpRequest(port(), http::verb::post, "/collections/main/update",
       R"({"docs":[{"id":"u1","title_w":"delete token"},{"id":"u2","title_w":"delete token"}],"commit":{}})");

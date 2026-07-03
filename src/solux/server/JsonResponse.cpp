@@ -176,6 +176,19 @@ std::string renderSearchResponseLine(const solux::api::SearchResponse& resp) {
   } else {
     out += R"("docs":[])";
   }
+  if (!resp.warnings.empty()) {
+    // declared degradations (the request was served, but not exactly as written)
+    out += R"(,"warnings":[)";
+    for (size_t i = 0; i < resp.warnings.size(); i++) {
+      if (i) out += ',';
+      out += R"({"code":)";
+      appendJsonString(out, resp.warnings[i].code);
+      out += R"(,"message":)";
+      appendJsonString(out, resp.warnings[i].message);
+      out += '}';
+    }
+    out += ']';
+  }
   if (resp.more) out += R"(,"more":true)";
   out += "}\n";
   return out;

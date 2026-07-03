@@ -11,7 +11,9 @@ namespace solux {
 // (or, for multi-valued columns, an empty list) renders as JSON null.
 //
 // Shape:
-//   {"found": <matches>, "docs": [ {<field>: <val>, ...}, ... ], "more": true}
+//   {"found": <matches>, "docs": [ {<field>: <val>, ...}, ... ],
+//    "warnings": [ {"code": ..., "message": ...}, ... ], "more": true}
+// (warnings only when present: declared degradations, e.g. a clamped fuzzy)
 // or on engine error:
 //   {"error": "<message>"}
 //

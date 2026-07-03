@@ -55,6 +55,7 @@ public:
   OpCursor& prefixQuery(std::string_view field, std::string_view prefix);
   OpCursor& fuzzyQuery(std::string_view field, std::string_view term,
                        int maxEdits = -1, int prefixLength = -1, int maxExpansions = 0);
+  OpCursor& simpleQuery(std::string_view q, std::initializer_list<std::string> fieldNames);
   OpCursor& phraseQuery(std::string_view field, std::initializer_list<std::string> words);
   OpCursor& phraseText(std::string_view field, std::string_view text);
   OpCursor& phraseTerms(std::string_view field, std::initializer_list<std::string> terms);
@@ -149,6 +150,18 @@ public:
   // --- result inspection (reads go through the concrete classes' accessors) ---
   bool ok() const { return !responses.empty() && !hasError(responses[0]->proto); }
   std::string errorMsg() const { return responses.empty() ? "(no response)" : std::string(responses[0]->proto.error); }
+
+  // Declared degradations (SearchResponse.warnings) ride on the final response.
+  std::span<const solux::api::Warning> respWarnings() const {
+    return responses.empty() ? std::span<const solux::api::Warning>{}
+                             : responses.back()->proto.warnings;
+  }
+  bool hasWarning(std::string_view code) const {
+    for (const auto& w : respWarnings()) {
+      if (w.code == code) return true;
+    }
+    return false;
+  }
 
   // The DocList for op `opName` in the first response, or null.
   const solux::api::DocList* docList(std::string_view opName = "q") const {
@@ -382,6 +395,16 @@ inline OpCursor& OpCursor::matchQuery(std::string_view field, std::string_view v
 inline OpCursor& OpCursor::matchQuery(std::string_view field, std::string_view value, solux::api::Match_::Operator op) {
   matchQuery(field, value);
   std::get<solux::api::Match>(getOrCreateQuery().kind).operator_ = op;
+  return *this;
+}
+inline OpCursor& OpCursor::simpleQuery(std::string_view q, std::initializer_list<std::string> fieldNames) {
+  auto& s = getOrCreateQuery().kind.emplace<solux::api::SimpleQuery>();
+  s.q = build::arenaStr(req_->mr, q);
+  auto* arr = build::allocArray(s.fields, fieldNames.size(), req_->mr);
+  size_t i = 0;
+  for (const auto& f : fieldNames) {
+    arr[i++] = build::arenaStr(req_->mr, f);
+  }
   return *this;
 }
 inline OpCursor& OpCursor::prefixQuery(std::string_view field, std::string_view prefix) {
