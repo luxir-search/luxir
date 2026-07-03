@@ -904,7 +904,12 @@ private:
     state->interval.docCount += state->batch->docCount;
     state->batch->proto.docs = state->batch->docs.finish();
     state->batch->proto.allow_dups = state->allowDups;
-    state->batch->proto.return_ids = true;
+    // Only fetch ids while the interval can still retain more (capped at
+    // kMaxRetainedIds); past the cap the engine's ids are discarded in the fold, so
+    // skip the work on later slices of a large group.  Strict read/batch alternation
+    // means the prior slice's fold already ran, so interval.ids is current here.
+    state->batch->proto.return_ids =
+        state->interval.ids.size() < HttpStreamUpdateState::kMaxRetainedIds;
     setCollectionTarget(state->batch->proto.collection, state->collectionName, state->batch->resource);
     if (commitControl != nullptr) {
       fillCommitParams(state->batch->proto.commit, *commitControl, state->batch->resource);

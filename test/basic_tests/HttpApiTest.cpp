@@ -247,6 +247,41 @@ TEST_F(HttpApiTest, ndjsonStreamFlushesMultipleBatches) {
   EXPECT_EQ((std::size_t)kDocCount, hreq.ids().size()) << hreq.rawResponse();
 }
 
+// A single group spanning multiple internal batches retains exactly kMaxRetainedIds
+// (100) ids: once the interval fills, later slices set return_ids=false, but the cap
+// and every doc's indexing must be unaffected.
+TEST_F(HttpApiTest, streamGroupCapsRetainedIdsAcrossBatches) {
+  static constexpr int kDocCount = 150;
+  std::string payload(20 * 1024, 'y');  // ~20 KiB each -> several 1 MiB batches
+  std::string body;
+  body.reserve((payload.size() + 80) * (std::size_t)kDocCount);
+  for (int i = 0; i < kDocCount; i++) {
+    body += R"({"id":"cap)";
+    body += std::to_string(i);
+    body += R"(","title_w":"captoken","blob_s":")";
+    body += payload;
+    body += R"("})";
+    body += '\n';
+  }
+  body += R"({"_update_":{"commit":{}}})";
+  body += '\n';
+
+  auto update = httpRequest(port(), http::verb::post, "/collections/main/update",
+                            std::move(body), "application/x-ndjson");
+  ASSERT_EQ(200, update.result_int()) << update.body();
+
+  // One implicit group -> one response line; ids capped at 100 even though 150 indexed.
+  std::size_t retained = 0;
+  for (const auto& line : splitLines(update.body())) retained += idsInUpdateLine(line).size();
+  EXPECT_EQ((std::size_t)100, retained) << update.body().substr(0, 200);
+
+  HttpReq hreq(port());
+  hreq.collection("main").matchQuery("title_w", "captoken").fields({"id"})
+      .limit(kDocCount).withStats().execute();
+  ASSERT_EQ(200, hreq.status());
+  EXPECT_EQ((int64_t)kDocCount, hreq.found()) << hreq.rawResponse();
+}
+
 TEST_F(HttpApiTest, ndjsonMalformedRecordIs400) {
   std::string body =
       R"({"id":"bad1","title_w":"badtoken"})" "\n"
