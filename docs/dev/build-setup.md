@@ -13,7 +13,7 @@ Before installing vcpkg packages, run `deps/make_deps.sh` (idempotent): it
 fetches the pinned simdcomp sources, applies Solux's local patches to the
 vcpkg roots (triplet compile flags, FAISS SIMD opt level) and to simdcomp,
 and builds the simdcomp static libs. Then install packages per
-[deps/README.txt](../deps/README.txt). `deps/apply_patches.sh` is the
+[deps/README.txt](../../deps/README.txt). `deps/apply_patches.sh` is the
 patch-application step on its own.
 
 The project uses CMake (Ninja generator) with vcpkg. ccache, a fast linker (mold), and a

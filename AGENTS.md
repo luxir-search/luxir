@@ -2,13 +2,13 @@
 
 Solux is a high-performance hybrid search engine written in C++. It features a gRPC API, full-text indexing and searching, faceted search, and vector search.
 
-See [docs/architecture.md](docs/architecture.md) for the component layout, data organization, and request flow.
+See [docs/design/architecture.md](docs/design/architecture.md) for the component layout, data organization, and request flow. [docs/README.md](docs/README.md) maps the documentation tree (guide/ = user, design/ = architecture+decisions, dev/ = contributor).
 
 ## Build Commands
 
 Use the **gcc** presets (FAISS is only in the gcc vcpkg repos). Each preset
 builds into `build/<preset-name>/`, with binaries in `build/<preset-name>/bin/`. See
-[docs/build-setup.md](docs/build-setup.md) for requirements and IDE/clangd setup.
+[docs/dev/build-setup.md](docs/dev/build-setup.md) for requirements and IDE/clangd setup.
 
 ### Iterate (default): non-ASan, fastest edit-build-test
 
@@ -25,7 +25,7 @@ cmake --build --preset gcc-debug-asan   # binaries in build/gcc-debug-asan/bin/
 ```
 
 Fresh checkout or after `rm -rf build/`: build once before IDE code-insight works (the
-generated `*.pb.h` headers must exist). See [docs/build-setup.md](docs/build-setup.md).
+generated `*.pb.h` headers must exist). See [docs/dev/build-setup.md](docs/dev/build-setup.md).
 
 ## Test Commands
 
