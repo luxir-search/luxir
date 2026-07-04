@@ -38,6 +38,16 @@ class ConstantScoreQuery final : public solux::Query {
     float score() override {
       return constantScore;
     }
+
+    // Matching is exactly the child's, so forward two-phase iteration: a
+    // constant_score(range) / constant_score(phrase) clause keeps verifying
+    // cheaply in a conjunction instead of forcing its child to iterate fully.
+    bool hasTwoPhase() const override { return child->hasTwoPhase(); }
+    int32_t approximationNext() override { return child->approximationNext(); }
+    int32_t approximationAdvance(int32_t target) override { return child->approximationAdvance(target); }
+    int32_t approximationDocId() override { return child->approximationDocId(); }
+    bool matches() override { return child->matches(); }
+    float matchCost() override { return child->matchCost(); }
   };
 
   // Delegates cost to the child supplier and wraps its scorer with the constant
