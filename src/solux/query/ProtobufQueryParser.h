@@ -149,6 +149,14 @@ public:
     return builder.createPrefixQuery(prefixQuery.field, prefixQuery.prefix);
   }
 
+  solux::Query* parseRange(const solux::api::RangeQuery& rangeQuery) {
+    auto ptr = [](const ::hpp_proto::optional_indirect_view<solux::api::Val>& v)
+        -> const solux::api::Val* { return v.has_value() ? &*v : nullptr; };
+    QueryBuilder builder(pool, schema);
+    return builder.createRangeQuery(rangeQuery.field, ptr(rangeQuery.gte), ptr(rangeQuery.gt),
+                                    ptr(rangeQuery.lte), ptr(rangeQuery.lt));
+  }
+
   solux::Query* parseFuzzy(const solux::api::FuzzyQuery& fuzzyQuery) {
     QueryBuilder builder(pool, schema);
     std::optional<int> maxEdits = fuzzyQuery.max_edits.has_value()
@@ -301,6 +309,7 @@ public:
       [&](const solux::api::Match& m) -> solux::Query* { return parseMatch(m); },
       [&](const solux::api::PhraseQuery& p) -> solux::Query* { return parsePhrase(p); },
       [&](const solux::api::PrefixQuery& p) -> solux::Query* { return parsePrefix(p); },
+      [&](const solux::api::RangeQuery& r) -> solux::Query* { return parseRange(r); },
       [&](const solux::api::FuzzyQuery& f) -> solux::Query* { return parseFuzzy(f); },
       [&](const solux::api::SimpleQuery& s) -> solux::Query* { return parseSimpleQuery(s); },
       [&](bool) -> solux::Query* { return pool.make<solux::AllQuery>(); },  // the `all` arm

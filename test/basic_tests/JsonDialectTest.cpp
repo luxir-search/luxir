@@ -125,6 +125,20 @@ TEST(JsonDialect, MatchSugar) {
   EXPECT_FALSE(err.empty());
 }
 
+TEST(JsonDialect, RangeQuery) {
+  std::pmr::monotonic_buffer_resource mr;
+  P::Query q;
+  ASSERT_TRUE(P::read_json(q, R"({"range":{"field":"year_i","gte":1960,"lt":1970}})", mr));
+  const auto& r = std::get<P::RangeQuery>(q.kind);
+  EXPECT_EQ(r.field, "year_i");
+  ASSERT_TRUE(r.gte.has_value());
+  EXPECT_EQ(std::get<std::int64_t>(r.gte->kind), 1960);
+  EXPECT_FALSE(r.gt.has_value());
+  ASSERT_TRUE(r.lt.has_value());
+  EXPECT_EQ(std::get<std::int64_t>(r.lt->kind), 1970);
+  EXPECT_FALSE(r.lte.has_value());
+}
+
 TEST(JsonDialect, DepthLimitErrorsCleanly) {
   std::pmr::monotonic_buffer_resource mr;
   std::string deep(300, '[');

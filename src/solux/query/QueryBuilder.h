@@ -2,6 +2,7 @@
 
 #include <cstring>
 #include <format>
+#include <limits>
 #include <optional>
 #include <span>
 #include <stdexcept>
@@ -12,6 +13,7 @@
 #include "solux/query/BooleanQuery.h"
 #include "solux/query/FuzzyQuery.h"
 #include "solux/query/MatchNoDocsQuery.h"
+#include "solux/query/NumericRangeQuery.h"
 #include "solux/query/PhraseQuery.h"
 #include "solux/query/PrefixQuery.h"
 #include "solux/query/Query.h"
@@ -31,6 +33,14 @@ namespace solux {
 class QueryBuilder {
   MemPool& pool;
   Schema& schema;
+
+  // The numeric field types stored in the shared int column (INT raw,
+  // FLOAT/DOUBLE sortable bits, DATE epoch millis).  Match and range on these
+  // build a NumericRangeQuery over the column.
+  static bool isNumericColumnType(FieldType::Type t) {
+    return t == FieldType::Type::INT || t == FieldType::Type::FLOAT
+        || t == FieldType::Type::DOUBLE || t == FieldType::Type::DATE;
+  }
 
   // Resolve a field to its TextFieldType, throwing if it is not a text field:
   // phrase / analyzed queries only make sense over analyzed text.
@@ -193,6 +203,17 @@ public:
       case FieldType::Type::ID:
       case FieldType::Type::STRING:
         return pool.make<TermQuery>(field, value);
+      case FieldType::Type::INT:
+      case FieldType::Type::FLOAT:
+      case FieldType::Type::DOUBLE:
+      case FieldType::Type::DATE: {
+        // Exact numeric match == a degenerate inclusive [v, v] range; route
+        // through createRangeQuery so it shares the same column validation.
+        if (value.empty()) return matchNoDocs();
+        solux::api::Val v;
+        v.kind = value;  // string arm; coerceColInt64 parses per the field type
+        return createRangeQuery(field, &v, nullptr, &v, nullptr);
+      }
       default:
         throw std::runtime_error(std::format("Match query on unsupported field type: {}", field));
     }
@@ -206,10 +227,19 @@ public:
   // maps) throw.
   Query* createMatchQuery(std::string_view field, const solux::api::Val& val,
                           Operator op = Operator::OR, int minMatch = 0) {
+    FieldType& fieldType = *schema.getFieldTypeEx(field);
+    if (isNumericColumnType(fieldType.type())) {
+      // Exact numeric match == a degenerate inclusive [v, v] range; route
+      // through createRangeQuery so it shares the same column validation.  An
+      // array/uncoercible Val throws there (multi-value Match semantics are
+      // undefined yet); op / min_match don't apply to a single numeric value.
+      if (coerce::isNull(val)) return matchNoDocs();
+      return createRangeQuery(field, &val, nullptr, &val, nullptr);
+    }
     char buf[coerce::TEXT_BUF_SIZE];
     std::string_view text = coerce::isNull(val)
         ? std::string_view{}
-        : schema.getFieldTypeEx(field)->coerceTerm(val, field, buf);
+        : fieldType.coerceTerm(val, field, buf);
     // A rendered numeric lives in stack-local buf: TEXT analysis copies terms
     // out anyway, but the STRING/ID pass-through keeps the view, so copy it
     // into the pool.  String/bytes arms view the request bytes, which already
@@ -218,6 +248,61 @@ public:
       text = copyTerm(text);
     }
     return createMatchQuery(field, text, op, minMatch);
+  }
+
+  // Build a numeric range query over `field`'s column from raw bound Vals (any
+  // may be null for an open-ended side).  At most one of gte/gt (lower) and one
+  // of lte/lt (upper) may be set.  Bounds are coerced to the field's encoded
+  // int64 (FieldType::coerceColInt64) and folded to an inclusive [lo, hi]
+  // window; an empty range collapses to match-nothing.  The field must be a
+  // column-stored numeric type.
+  Query* createRangeQuery(std::string_view field,
+                          const solux::api::Val* gte, const solux::api::Val* gt,
+                          const solux::api::Val* lte, const solux::api::Val* lt) {
+    FieldType& fieldType = *schema.getFieldTypeEx(field);
+    if (!isNumericColumnType(fieldType.type())) {
+      throw std::runtime_error(std::format("Range query on unsupported field type: {}", field));
+    }
+    if (!fieldType.hasColumn()) {
+      throw std::runtime_error(std::format("Range query field '{}' is not column-stored", field));
+    }
+
+    bool hasGte = gte && !coerce::isNull(*gte);
+    bool hasGt  = gt  && !coerce::isNull(*gt);
+    bool hasLte = lte && !coerce::isNull(*lte);
+    bool hasLt  = lt  && !coerce::isNull(*lt);
+    if (hasGte && hasGt) {
+      throw std::runtime_error(std::format("Range query on '{}' sets both gte and gt", field));
+    }
+    if (hasLte && hasLt) {
+      throw std::runtime_error(std::format("Range query on '{}' sets both lte and lt", field));
+    }
+
+    // Coerce every supplied bound first, so a malformed bound is always a
+    // request error regardless of whether the range would collapse to empty.
+    std::optional<int64_t> loEnc, hiEnc;
+    if (hasGte || hasGt) loEnc = fieldType.coerceColInt64(hasGte ? *gte : *gt, field);
+    if (hasLte || hasLt) hiEnc = fieldType.coerceColInt64(hasLte ? *lte : *lt, field);
+
+    int64_t lo = std::numeric_limits<int64_t>::min();
+    int64_t hi = std::numeric_limits<int64_t>::max();
+    // Fold exclusive bounds to inclusive in encoded int64 space: since stored
+    // values are integers, v > k  <=>  v >= k+1 (and v < k  <=>  v <= k-1).
+    // Guard the extremes so the +/-1 never overflows.
+    if (hasGte) {
+      lo = *loEnc;
+    } else if (hasGt) {
+      if (*loEnc == std::numeric_limits<int64_t>::max()) return matchNoDocs();  // > max
+      lo = *loEnc + 1;
+    }
+    if (hasLte) {
+      hi = *hiEnc;
+    } else if (hasLt) {
+      if (*hiEnc == std::numeric_limits<int64_t>::min()) return matchNoDocs();  // < min
+      hi = *hiEnc - 1;
+    }
+    if (lo > hi) return matchNoDocs();  // empty range
+    return pool.make<NumericRangeQuery>(field, lo, hi);
   }
 
   // Build a phrase query from un-analyzed input by running the field's analyzer.

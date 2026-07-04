@@ -100,7 +100,7 @@ namespace solux::api {
 struct Target; struct SearchRequest; struct SearchOp; struct GenOp; struct TopDocs;
 struct Fusion; struct RrfFusion; struct SortSpec; struct Query; struct ForcePrepareQuery;
 struct ConstantScoreQuery; struct KnnQuery; struct Match; struct NamedQuery; struct BooleanQuery;
-struct PrefixQuery; struct FuzzyQuery; struct PhraseQuery; struct SimpleQuery; struct Warning;
+struct PrefixQuery; struct FuzzyQuery; struct PhraseQuery; struct SimpleQuery; struct RangeQuery; struct Warning;
 struct FieldFacet; struct RangeFacet;
 struct Domain; struct SearchResponse; struct DocList; struct FacetResult; struct Bucket;
 struct CommitParams; struct UpdateRequest; struct UpdateResponse; struct NamedValue; struct Map;
@@ -406,9 +406,16 @@ struct SimpleQuery {
   Operator operator_ = Operator::OPERATOR_UNSPECIFIED;
   std::int32_t min_match = {};
 };
-struct Query {                                                 // needs Match,BooleanQuery,Phrase,Knn,ConstantScore,Prefix,Fuzzy,Simple,ForcePrepare
+struct RangeQuery {                                            // needs Val
+  std::string_view field;
+  ::hpp_proto::optional_indirect_view<Val> gte;
+  ::hpp_proto::optional_indirect_view<Val> gt;
+  ::hpp_proto::optional_indirect_view<Val> lte;
+  ::hpp_proto::optional_indirect_view<Val> lt;
+};
+struct Query {                                                 // needs Match,BooleanQuery,Phrase,Knn,ConstantScore,Prefix,Fuzzy,Simple,Range,ForcePrepare
   std::variant<std::monostate, Match, BooleanQuery, bool, std::string_view, PhraseQuery, KnnQuery,
-               ConstantScoreQuery, PrefixQuery, FuzzyQuery, SimpleQuery, ForcePrepareQuery>
+               ConstantScoreQuery, PrefixQuery, FuzzyQuery, SimpleQuery, RangeQuery, ForcePrepareQuery>
       kind;
 };
 struct NamedQuery { std::string_view name; ::hpp_proto::optional_indirect_view<Query> query; };
@@ -430,7 +437,7 @@ struct UpdateRequest {                                         // needs Target,C
 SOLUX_TD(Target) SOLUX_TD(SearchRequest) SOLUX_TD(SearchOp) SOLUX_TD(GenOp) SOLUX_TD(TopDocs)
 SOLUX_TD(Fusion) SOLUX_TD(RrfFusion) SOLUX_TD(SortSpec) SOLUX_TD(Query) SOLUX_TD(ForcePrepareQuery)
 SOLUX_TD(ConstantScoreQuery) SOLUX_TD(KnnQuery) SOLUX_TD(Match) SOLUX_TD(NamedQuery) SOLUX_TD(BooleanQuery)
-SOLUX_TD(PrefixQuery) SOLUX_TD(FuzzyQuery) SOLUX_TD(PhraseQuery) SOLUX_TD(SimpleQuery)
+SOLUX_TD(PrefixQuery) SOLUX_TD(FuzzyQuery) SOLUX_TD(PhraseQuery) SOLUX_TD(SimpleQuery) SOLUX_TD(RangeQuery)
 SOLUX_TD(Warning) SOLUX_TD(FieldFacet) SOLUX_TD(RangeFacet)
 SOLUX_TD(Domain) SOLUX_TD(SearchResponse) SOLUX_TD(DocList) SOLUX_TD(FacetResult) SOLUX_TD(Bucket)
 SOLUX_TD(CommitParams) SOLUX_TD(UpdateRequest) SOLUX_TD(UpdateResponse) SOLUX_TD(NamedValue) SOLUX_TD(Map)
@@ -457,7 +464,7 @@ SOLUX_ENTRY(TopDocs) SOLUX_ENTRY(Fusion) SOLUX_ENTRY(RrfFusion) SOLUX_ENTRY(Sort
 SOLUX_ENTRY(Query) SOLUX_ENTRY(ForcePrepareQuery) SOLUX_ENTRY(ConstantScoreQuery)
 SOLUX_ENTRY(KnnQuery) SOLUX_ENTRY(Match) SOLUX_ENTRY(NamedQuery) SOLUX_ENTRY(BooleanQuery)
 SOLUX_ENTRY(PrefixQuery) SOLUX_ENTRY(FuzzyQuery) SOLUX_ENTRY(PhraseQuery) SOLUX_ENTRY(SimpleQuery)
-SOLUX_ENTRY(Warning) SOLUX_ENTRY(FieldFacet)
+SOLUX_ENTRY(RangeQuery) SOLUX_ENTRY(Warning) SOLUX_ENTRY(FieldFacet)
 SOLUX_ENTRY(RangeFacet) SOLUX_ENTRY(Domain) SOLUX_ENTRY(SearchResponse) SOLUX_ENTRY(DocList)
 SOLUX_ENTRY(FacetResult) SOLUX_ENTRY(Bucket) SOLUX_ENTRY(CommitParams) SOLUX_ENTRY(UpdateRequest)
 SOLUX_ENTRY(UpdateResponse) SOLUX_ENTRY(NamedValue) SOLUX_ENTRY(Map) SOLUX_ENTRY(Columns)

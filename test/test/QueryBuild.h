@@ -60,6 +60,41 @@ inline api::Query prefix(std::pmr::memory_resource& mr, std::string_view field,
   return q;
 }
 
+// ---- range bound Vals: allocate a Val with one scalar arm in the arena ----
+inline api::Val* valI64(std::pmr::memory_resource& mr, int64_t x) {
+  auto* v = (api::Val*)mr.allocate(sizeof(api::Val), alignof(api::Val));
+  new (v) api::Val();
+  v->kind = x;
+  return v;
+}
+inline api::Val* valF64(std::pmr::memory_resource& mr, double x) {
+  auto* v = (api::Val*)mr.allocate(sizeof(api::Val), alignof(api::Val));
+  new (v) api::Val();
+  v->kind = x;
+  return v;
+}
+inline api::Val* valStr(std::pmr::memory_resource& mr, std::string_view s) {
+  auto* v = (api::Val*)mr.allocate(sizeof(api::Val), alignof(api::Val));
+  new (v) api::Val();
+  v->kind = build::arenaStr(mr, s);
+  return v;
+}
+
+// RangeQuery with explicit bound Vals (any may be nullptr for an open side).
+// Build bounds with valI64 / valF64 / valStr.  Set at most one of gte/gt and
+// one of lte/lt (the builder errors otherwise).
+inline api::Query range(std::pmr::memory_resource& mr, std::string_view field,
+                        api::Val* gte, api::Val* gt, api::Val* lte, api::Val* lt) {
+  api::Query q;
+  auto& r = q.kind.emplace<api::RangeQuery>();
+  r.field = build::arenaStr(mr, field);
+  if (gte) r.gte = gte;
+  if (gt)  r.gt  = gt;
+  if (lte) r.lte = lte;
+  if (lt)  r.lt  = lt;
+  return q;
+}
+
 inline api::Query fuzzy(std::pmr::memory_resource& mr, std::string_view field,
                         std::string_view term, int maxEdits = -1, int prefixLength = -1,
                         int maxExpansions = 0) {
