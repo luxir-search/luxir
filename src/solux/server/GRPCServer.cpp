@@ -236,6 +236,7 @@ public:
   bool writeOutstanding = false;
   bool finishSent = false;
   int32_t responsesExpected = 0;
+  grpc::Status finishStatus = grpc::Status::OK;
 
   enum CallTags { READ = 1, WRITE = 2, FINISH = 3, CONNECT = 4 };
 
@@ -259,7 +260,7 @@ public:
   // mutex held
   void maybeSendFinish() {
     if (!finishSent && readsDone && pending.empty() && !writeOutstanding && responsesExpected <= 0) {
-      readerWriter.Finish(grpc::Status::OK, make_tag(FINISH));
+      readerWriter.Finish(finishStatus, make_tag(FINISH));
       finishSent = true;
     }
   }
@@ -282,6 +283,15 @@ public:
   void decrementOutstanding(int32_t finishCount = 1) {
     const std::lock_guard<std::mutex> lock(mutex);
     responsesExpected -= finishCount;
+    maybeSendFinish();
+  }
+
+  void finishWithError(grpc::Status status, int32_t finishCount = 1) {
+    const std::lock_guard<std::mutex> lock(mutex);
+    responsesExpected -= finishCount;
+    readsDone = true;
+    pending.clear();
+    finishStatus = status;
     maybeSendFinish();
   }
 
@@ -331,6 +341,10 @@ public:
         // returns, so account for the expected response before dispatching.
         { const std::lock_guard<std::mutex> lock(mutex); responsesExpected++; }
         methodEntry->handle(*this, readBuf);
+        {
+          const std::lock_guard<std::mutex> lock(mutex);
+          if (readsDone || finishSent) break;
+        }
         readRequest();
         break;
       case WRITE:
@@ -359,7 +373,19 @@ static std::shared_ptr<Collection> resolveCollection(GRPCServer& server,
 
 template <typename Request>
 static std::shared_ptr<Collection> resolveUpdateCollection(GRPCServer& server, const Request& request) {
-  return server.getSoluxNode().resolveCollection(request.collection.has_value() ? &*request.collection : nullptr);
+  return server.getSoluxNode().resolveOrCreateCollection(request.collection.has_value() ? &*request.collection : nullptr);
+}
+
+static std::shared_ptr<Collection> resolveSetSchemaCollection(GRPCServer& server,
+                                                              const std::optional<solux::api::Target>& target) {
+  return server.getSoluxNode().resolveOrCreateCollection(target.has_value() ? &*target : nullptr);
+}
+
+static void finishWithException(GenericCallData& call, const std::exception& e) {
+  grpc::StatusCode code = dynamic_cast<const CollectionResolutionError*>(&e) != nullptr
+      ? grpc::StatusCode::NOT_FOUND
+      : grpc::StatusCode::INTERNAL;
+  call.finishWithError(grpc::Status(code, e.what()));
 }
 
 
@@ -439,8 +465,12 @@ static void handleUpdate(GenericCallData& call, grpc::ByteBuffer& readBuf) {
     call.decrementOutstanding();
     return;
   }
-  grpc::ByteBuffer buf = doBlockingUpdate(call.server, request.proto);
-  call.respondRaw(std::move(buf), 1);
+  try {
+    grpc::ByteBuffer buf = doBlockingUpdate(call.server, request.proto);
+    call.respondRaw(std::move(buf), 1);
+  } catch (const std::exception& e) {
+    finishWithException(call, e);
+  }
 }
 
 //   rpc UpdateStream(stream UpdateRequest) returns (stream UpdateResponse)
@@ -450,10 +480,6 @@ static void handleUpdateStream(GenericCallData& call, grpc::ByteBuffer& readBuf)
     call.decrementOutstanding();
     return;
   }
-
-  std::shared_ptr<Collection> collection = resolveUpdateCollection(call.server, request->proto);
-  auto shard = collection->getShard();
-  auto iw = shard->getIndexWriter();
 
   // The update is async; its done() serializes the response into owned bytes, hands
   // them to the call, then deletes this message, freeing the borrowed request bytes
@@ -473,8 +499,21 @@ static void handleUpdateStream(GenericCallData& call, grpc::ByteBuffer& readBuf)
     }
   };
 
-  Update* updateMessage = new Update(std::move(request), &call);
-  iw->submitUpdate(updateMessage);
+  try {
+    auto collection = resolveUpdateCollection(call.server, request->proto);
+    auto shard = collection->getShard();
+    auto iw = shard->getIndexWriter();
+
+    Update* updateMessage = new Update(std::move(request), &call);
+    try {
+      iw->submitUpdate(updateMessage);
+    } catch (...) {
+      delete updateMessage;
+      throw;
+    }
+  } catch (const std::exception& e) {
+    finishWithException(call, e);
+  }
 }
 
 //   rpc SetSchema(SchemaRequest) returns (SchemaResponse)  [unary]
@@ -489,22 +528,26 @@ static void handleSetSchema(GenericCallData& call, grpc::ByteBuffer& readBuf) {
     call.decrementOutstanding();
     return;
   }
-  SchemaRespProto response;
-  std::pmr::monotonic_buffer_resource respArena;  // backs the non-owning response SchemaDef
+  try {
+    SchemaRespProto response;
+    std::pmr::monotonic_buffer_resource respArena;  // backs the non-owning response SchemaDef
 
-  auto collection = resolveCollection(call.server, request.proto.collection);
-  std::shared_ptr<Schema> newSchema;
-  if (request.proto.mode == solux::api::SchemaRequest_::Mode::MERGE) {
-    auto currentSchema = collection->getSchema();
-    newSchema = Schema::fromProto(*request.proto.schema, currentSchema.get());
-  } else {
-    newSchema = Schema::fromProto(*request.proto.schema);
+    auto collection = resolveSetSchemaCollection(call.server, request.proto.collection);
+    std::shared_ptr<Schema> newSchema;
+    if (request.proto.mode == solux::api::SchemaRequest_::Mode::MERGE) {
+      auto currentSchema = collection->getSchema();
+      newSchema = Schema::fromProto(*request.proto.schema, currentSchema.get());
+    } else {
+      newSchema = Schema::fromProto(*request.proto.schema);
+    }
+    collection->setSchema(newSchema);
+    newSchema->toProto(&response.schema.emplace(), respArena);
+
+    grpc::ByteBuffer buf = serializeToByteBuffer(response);
+    call.respondRaw(std::move(buf), 1);
+  } catch (const std::exception& e) {
+    finishWithException(call, e);
   }
-  collection->setSchema(newSchema);
-  newSchema->toProto(&response.schema.emplace(), respArena);
-
-  grpc::ByteBuffer buf = serializeToByteBuffer(response);
-  call.respondRaw(std::move(buf), 1);
 }
 
 //   rpc GetSchema(SchemaRequest) returns (SchemaResponse)  [unary]
@@ -514,15 +557,19 @@ static void handleGetSchema(GenericCallData& call, grpc::ByteBuffer& readBuf) {
     call.decrementOutstanding();
     return;
   }
-  SchemaRespProto response;
-  std::pmr::monotonic_buffer_resource respArena;  // backs the non-owning response SchemaDef
+  try {
+    SchemaRespProto response;
+    std::pmr::monotonic_buffer_resource respArena;  // backs the non-owning response SchemaDef
 
-  auto collection = resolveCollection(call.server, request.proto.collection);
-  auto schema = collection->getSchema();
-  schema->toProto(&response.schema.emplace(), respArena);
+    auto collection = resolveCollection(call.server, request.proto.collection);
+    auto schema = collection->getSchema();
+    schema->toProto(&response.schema.emplace(), respArena);
 
-  grpc::ByteBuffer buf = serializeToByteBuffer(response);
-  call.respondRaw(std::move(buf), 1);
+    grpc::ByteBuffer buf = serializeToByteBuffer(response);
+    call.respondRaw(std::move(buf), 1);
+  } catch (const std::exception& e) {
+    finishWithException(call, e);
+  }
 }
 
 //   rpc SayHello(HelloRequest) returns (HelloReply)  [unary] - demo

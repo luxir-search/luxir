@@ -817,6 +817,20 @@ TEST_F(GrpcIndexTest, addDocs) {
 
 }
 
+TEST_F(GrpcIndexTest, unsafeCollectionNameReturnsNotFound) {
+  CollectionHelper::UpdateBuilder b;
+  Reply<solux::api::UpdateResponse> response;
+  b.collection("../bad");
+  b.add(flatdoc("id", "grpc-bad-name", "title_w", "badname token"));
+
+  grpc::ClientContext context;
+  grpc::Status status = hppUnaryCall(channel.get(), rpc::Update, &context, b.finish(), &response);
+
+  EXPECT_EQ(grpc::StatusCode::NOT_FOUND, status.error_code());
+  EXPECT_NE(status.error_message().find("single path component"), std::string::npos)
+      << status.error_message();
+}
+
 TEST_F(GrpcIndexTest, addDocsStream) {
   // Setup request
   Reply<solux::api::UpdateResponse> response;

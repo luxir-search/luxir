@@ -1,8 +1,12 @@
 
 #include <gtest/gtest.h>
+#include <atomic>
 #include <cmath>
 #include <iostream>
 #include <map>
+#include <memory>
+#include <thread>
+#include <vector>
 #include "test/SoluxTest.h"
 #include "test/CollectionHelper.h"
 #include "test/LocalReq.h"
@@ -501,17 +505,62 @@ TEST_F(SearchEngineTest, opAndFilterNameCharset) {
   }
 }
 
-// Missing or unknown collections error cleanly (previously a null deref in getResources).
+// Missing collection targets error cleanly and do not auto-create on reads.
 TEST_F(SearchEngineTest, missingCollectionErrors) {
-  {  // no collection at all
-    auto req = localReq(soluxNode->getSearchEngine());
-    req->topDocs("q").allQuery();
-    ExpectLog quiet("Search request failed:");
-    req->execute();
-    ASSERT_FALSE(req->responses.empty());
-    EXPECT_NE(req->errorMsg().find("no collection"), std::string::npos) << req->errorMsg();
+  std::string name = "search_engine_missing_collection";
+  auto req = localReq(soluxNode->getSearchEngine());
+  req->collection(name);
+  req->topDocs("q").allQuery();
+  ExpectLog quiet("Search request failed:");
+  req->execute();
+  ASSERT_FALSE(req->responses.empty());
+  EXPECT_NE(req->errorMsg().find("collection '" + name + "' does not exist"),
+            std::string::npos) << req->errorMsg();
+  EXPECT_THROW(soluxNode->getCollection(name), CollectionResolutionError);
+}
+
+TEST_F(SearchEngineTest, unsafeCollectionNameErrors) {
+  auto req = localReq(soluxNode->getSearchEngine());
+  req->collection("../bad");
+  req->topDocs("q").allQuery();
+  ExpectLog quiet("Search request failed:");
+  req->execute();
+  ASSERT_FALSE(req->responses.empty());
+  EXPECT_NE(req->errorMsg().find("single path component"), std::string::npos) << req->errorMsg();
+}
+
+TEST_F(SearchEngineTest, concurrentCreateCollectionExactlyOnce) {
+  const std::string name = "concurrent_create_once_" + std::to_string(SoluxTest::rng_seed);
+  constexpr int numThreads = 32;
+
+  std::vector<std::shared_ptr<Collection>> collections(numThreads);
+  std::vector<std::thread> threads;
+  std::atomic<int> ready{0};
+  std::atomic<bool> start{false};
+
+  threads.reserve(numThreads);
+  for (int i = 0; i < numThreads; i++) {
+    threads.emplace_back([&, i]() {
+      ready.fetch_add(1);
+      while (!start.load()) {
+        std::this_thread::yield();
+      }
+      collections[i] = soluxNode->getOrCreateCollection(name);
+    });
   }
-  // NOTE: the unknown-collection-NAME error is untestable today: SoluxNode::getCollection
-  // is a single-collection stub that ignores the name. The engine's null-check guards the
-  // path for when real lookup lands.
+
+  while (ready.load() != numThreads) {
+    std::this_thread::yield();
+  }
+  start.store(true);
+
+  for (auto& thread : threads) {
+    thread.join();
+  }
+
+  ASSERT_NE(collections[0], nullptr);
+  for (const auto& collection : collections) {
+    EXPECT_EQ(collections[0], collection);
+  }
+  EXPECT_EQ(collections[0], soluxNode->getCollection(name));
 }

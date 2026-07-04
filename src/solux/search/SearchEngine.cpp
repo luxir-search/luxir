@@ -64,38 +64,9 @@ void SearchEngine::submit(SearchRequest& req, bool parallel) {
 
 void SearchEngine::getResources(SearchRequest& req) {
   // look up the correct index reader and the associated schema
-  std::shared_ptr<Collection> collection;
   auto& request = req.proto;
   auto& node = req.engine.node;
-
-  // collection is an optional Target; an absent or empty name path means no
-  // explicit collection was specified.
-  int nameCount = request.collection ? (int)request.collection->name.size() : 0;
-  if (nameCount == 0) {
-    // TODO: do we support default collections (implicitly defined by something like an api-key?)
-    throw std::runtime_error("request specifies no collection");
-  }
-
-  std::shared_ptr<Library> library = node.getLibrary(nullptr, "");
-  for (int i = 0; i < nameCount; i++) {
-    std::string_view name = request.collection->name[i];
-    // TODO: walk from our implicit root to find the correct collection.
-    if (i == nameCount - 1) {
-      // LOG_DEBUG("Looking up collection name '{}'", name);
-
-      // last element in path, so get collection.
-      collection = node.getCollection(library.get(), name);
-      if (collection == nullptr) {
-        throw std::runtime_error("unknown collection '" + std::string(name) + "'");
-      }
-    } else {
-      // not last element... get sub-library
-      library = node.getLibrary(library.get(), name);
-      if (library == nullptr) {
-        throw std::runtime_error("unknown library '" + std::string(name) + "'");
-      }
-    }
-  }
+  auto collection = node.resolveCollection(request.collection ? &*request.collection : nullptr);
 
   // get the index reader
   req.schema = collection->getSchema();

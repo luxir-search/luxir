@@ -1,4 +1,5 @@
 #include <atomic>
+#include <functional>
 #include <stdexcept>
 #include <thread>
 #include <vector>

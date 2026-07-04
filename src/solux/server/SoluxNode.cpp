@@ -6,6 +6,7 @@
 #include "solux/api/padded_input.h"
 #include "solux/api/solux_types.hpp"
 
+#include <cctype>
 #include <memory_resource>
 #include <span>
 
@@ -15,6 +16,38 @@ static constexpr std::string_view SCHEMA_PREFIX = "_schema_";
 
 static std::string schemaFileName(uint64_t gen) {
   return std::string(SCHEMA_PREFIX) + Postings::getSortableString(gen);
+}
+
+std::string SoluxNode::normalizedCollectionName(std::string_view name) {
+  return std::string(name);
+}
+
+void SoluxNode::validateCollectionName(std::string_view name) {
+  constexpr std::size_t kMaxCollectionNameBytes = 255;
+  if (name.empty()) {
+    throw CollectionResolutionError("collection name is empty");
+  }
+  if (name.size() > kMaxCollectionNameBytes) {
+    throw CollectionResolutionError("collection '" + std::string(name) + "' exceeds maximum length");
+  }
+  if (name[0] == '_') {
+    throw CollectionResolutionError("collection '" + std::string(name) + "' is reserved");
+  }
+  if (name == "." || name == "..") {
+    throw CollectionResolutionError("collection '" + std::string(name) + "' is reserved");
+  }
+  if (std::isspace((unsigned char)name.front()) || std::isspace((unsigned char)name.back())) {
+    throw CollectionResolutionError("collection '" + std::string(name) + "' has leading or trailing whitespace");
+  }
+  for (char c : name) {
+    unsigned char ch = (unsigned char)c;
+    if (ch < 0x20 || ch == 0x7f) {
+      throw CollectionResolutionError("collection '" + std::string(name) + "' contains a control character");
+    }
+    if (c == '/' || c == '\\') {
+      throw CollectionResolutionError("collection '" + std::string(name) + "' must be a single path component");
+    }
+  }
 }
 
 void Collection::setSchema(std::shared_ptr<Schema> newSchema) {
@@ -107,6 +140,26 @@ SoluxNode::SoluxNode(SoluxConfig config) : config(std::move(config)) {
 SoluxNode::~SoluxNode() {
 }
 
+std::shared_ptr<Collection> SoluxNode::getCollection(std::string_view name) {
+  return getCollection(root.get(), name);
+}
+
+std::shared_ptr<Collection> SoluxNode::getCollection(Library* library, std::string_view name) {
+  Library* targetLibrary = library != nullptr ? library : root.get();
+  if (targetLibrary == nullptr) {
+    throw CollectionResolutionError("root library is not initialized");
+  }
+
+  std::string collectionName = normalizedCollectionName(name);
+  validateCollectionName(collectionName);
+
+  if (auto collection = targetLibrary->collections.get(collectionName)) {
+    return collection;
+  }
+
+  throw CollectionResolutionError("collection '" + collectionName + "' does not exist");
+}
+
 std::shared_ptr<Collection> SoluxNode::resolveCollection(const solux::api::Target* target) {
   std::shared_ptr<Library> library = getLibrary(nullptr, "");
   std::shared_ptr<Collection> collection;
@@ -120,8 +173,70 @@ std::shared_ptr<Collection> SoluxNode::resolveCollection(const solux::api::Targe
     }
   }
   if (!collection) {
-    collection = getCollection("");
+    collection = getCollection(kDefaultCollectionName);
   }
+  return collection;
+}
+
+std::shared_ptr<Collection> SoluxNode::getOrCreateCollection(std::string_view name) {
+  return getOrCreateCollection(root.get(), name);
+}
+
+std::shared_ptr<Collection> SoluxNode::getOrCreateCollection(Library* library, std::string_view name) {
+  Library* targetLibrary = library != nullptr ? library : root.get();
+  if (targetLibrary == nullptr) {
+    throw CollectionResolutionError("root library is not initialized");
+  }
+
+  std::string collectionName = normalizedCollectionName(name);
+  validateCollectionName(collectionName);
+
+  auto collection = targetLibrary->collections.getOrCreate(collectionName, [&]() -> std::shared_ptr<Collection> {
+    if (!config.ingest.auto_create_collection) {
+      return nullptr;
+    }
+    auto created = initCollection(collectionName);
+    LOG_INFO("Created collection: {}", collectionName);
+    return created;
+  });
+  if (!collection) {
+    throw CollectionResolutionError("collection '" + collectionName + "' does not exist");
+  }
+  return collection;
+}
+
+std::shared_ptr<Collection> SoluxNode::resolveOrCreateCollection(const solux::api::Target* target) {
+  std::shared_ptr<Library> library = getLibrary(nullptr, "");
+  std::shared_ptr<Collection> collection;
+  if (target != nullptr) {
+    for (int i = 0; i < (int)target->name.size(); i++) {
+      if (i == (int)target->name.size() - 1) {
+        collection = getOrCreateCollection(library.get(), target->name[i]);
+      } else {
+        library = getLibrary(library.get(), target->name[i]);
+      }
+    }
+  }
+  if (!collection) {
+    collection = getOrCreateCollection(kDefaultCollectionName);
+  }
+  return collection;
+}
+
+std::shared_ptr<Collection> SoluxNode::createCollection(Library* library, std::string_view name) {
+  Library* targetLibrary = library != nullptr ? library : root.get();
+  if (targetLibrary == nullptr) {
+    throw CollectionResolutionError("root library is not initialized");
+  }
+
+  std::string collectionName = normalizedCollectionName(name);
+  validateCollectionName(collectionName);
+
+  auto collection = targetLibrary->collections.getOrCreate(collectionName, [&]() {
+    auto created = initCollection(collectionName);
+    LOG_INFO("Created collection: {}", collectionName);
+    return created;
+  });
   return collection;
 }
 
@@ -165,17 +280,16 @@ void SoluxNode::createSingletons() {
   // Discover existing collections from the store, or create default "main".
   auto existing = dirFactory->listCollections();
   if (existing.empty()) {
-    existing.push_back("main");
+    existing.emplace_back(kDefaultCollectionName);
   }
 
   for (const auto& name : existing) {
-    auto col = initCollection(name);
+    validateCollectionName(name);
+    root->collections.getOrCreate(name, [&]() {
+      return initCollection(name);
+    });
     LOG_INFO("Loaded collection: {}", name);
-    root->collections.emplace(name, col);
   }
-
-  // Keep backward-compat: set the singleton 'collection' to "main"
-  collection = root->collections.at("main");
 }
 
 } // namespace solux

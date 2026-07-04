@@ -81,6 +81,9 @@ struct IngestConfig {
 
   // Effective per-record cap: max_record if set, else the buffered-body cap.
   int64_t maxRecordBytes() const { return max_record != 0 ? max_record : max_request_body; }
+
+  // Missing collections are created on first use by default.
+  bool auto_create_collection = true;
 };
 
 struct SoluxConfig {

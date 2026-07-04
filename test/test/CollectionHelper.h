@@ -237,7 +237,7 @@ public:
   };
 
   CollectionHelper(std::string_view name = "main") {
-    collection_ = SoluxTest::soluxNode->getCollection(name);
+    collection_ = SoluxTest::soluxNode->getOrCreateCollection(name);
     getIndexWriter()->mergePolicy->setMergeFactor(10);  // reset in case other tests forget.
   }
 

@@ -1,13 +1,18 @@
 #pragma once
 
+#include <atomic>
+#include <memory>
+#include <stdexcept>
 #include <string>
-#include <gtl/phmap.hpp>
+#include <string_view>
+#include <vector>
 #include "solux/store/Directory.h"
 #include "solux/store/DirectoryFactory.h"
 #include "solux/index/IndexWriter.h"
 #include "oneapi/tbb/task_arena.h"
 #include "solux/search/SearchEngine.h"
 #include "solux/SoluxConfig.h"
+#include "solux/util/SharedLazyMap.h"
 
 namespace solux {
 
@@ -21,6 +26,11 @@ class SearchEngine;
 class Library;
 class Collection;
 class SoluxNode;
+
+class CollectionResolutionError : public std::runtime_error {
+public:
+  using std::runtime_error::runtime_error;
+};
 
 class Shard {
   Collection& collection; // hard reference to the collection that owns this shard
@@ -98,7 +108,7 @@ public:
 
 private:
   std::string name;
-  gtl::parallel_flat_hash_map<std::string, std::shared_ptr<Collection>> collections;
+  SharedLazyMap<std::string, Collection> collections;
   friend class SoluxNode;
 };
 
@@ -106,6 +116,8 @@ private:
 
 class SoluxNode {
 public:
+  static constexpr std::string_view kDefaultCollectionName = "main";
+
   SoluxNode() : SoluxNode(SoluxConfig{}) {}
   explicit SoluxNode(SoluxConfig config);
   ~SoluxNode();
@@ -116,17 +128,14 @@ public:
   // and represent metadata in the hierarchy.  This choice needs to be informed by the external representation
   // of collections.
 
-  std::shared_ptr<Collection> getCollection(std::string_view name) {
-    unused(name);
-    return collection;
-  }
+  std::shared_ptr<Collection> getCollection(std::string_view name);
+  std::shared_ptr<Collection> getOrCreateCollection(std::string_view name);
 
   std::shared_ptr<Collection> resolveCollection(const solux::api::Target* target);
+  std::shared_ptr<Collection> resolveOrCreateCollection(const solux::api::Target* target);
 
-  std::shared_ptr<Collection> getCollection(Library* library, std::string_view name) {
-    unused(library, name);
-    return collection;
-  }
+  std::shared_ptr<Collection> getCollection(Library* library, std::string_view name);
+  std::shared_ptr<Collection> getOrCreateCollection(Library* library, std::string_view name);
 
   std::shared_ptr<Library> getLibrary(std::string_view name) {
     unused(name);
@@ -146,10 +155,7 @@ public:
     return {};
   }
 
-  std::shared_ptr<Collection> createCollection(Library* library, std::string_view name) {
-    unused(library, name);
-    return {};
-  }
+  std::shared_ptr<Collection> createCollection(Library* library, std::string_view name);
 
   oneapi::tbb::task_arena& getTaskArena() {
     return taskArena;
@@ -164,14 +170,13 @@ private:
 
   void createSingletons();
   std::shared_ptr<Collection> initCollection(const std::string& name);
+  static std::string normalizedCollectionName(std::string_view name);
+  static void validateCollectionName(std::string_view name);
 
   SoluxConfig config;
   std::unique_ptr<SearchEngine> searchEngine;
   std::shared_ptr<Library> root;
   std::unique_ptr<DirectoryFactory> dirFactory;
-  // temporary singletons
-  std::shared_ptr<Shard> shard;
-  std::shared_ptr<Collection> collection;
 
   oneapi::tbb::task_arena taskArena;
 };

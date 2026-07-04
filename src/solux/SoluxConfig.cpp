@@ -65,6 +65,9 @@ void SoluxConfig::addOptions(CLI::App& app) {
                  "Streaming NDJSON: doc count for internal (non-atomic) mini-batches")
       ->default_val(ingest.stream_batch_docs)
       ->check(CLI::PositiveNumber);
+  app.add_flag("--ingest.auto-create-collection,!--no-ingest.auto-create-collection",
+               ingest.auto_create_collection, "Create missing collections on first use")
+      ->default_val(ingest.auto_create_collection);
 }
 
 void SoluxConfig::normalize() {

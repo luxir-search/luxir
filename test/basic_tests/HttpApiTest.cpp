@@ -1,5 +1,6 @@
 #include <array>
 #include <chrono>
+#include <filesystem>
 #include <optional>
 #include <set>
 #include <sstream>
@@ -166,6 +167,139 @@ TEST_F(HttpApiTest, updateIndexesAndQueryRoundTrip) {
   EXPECT_EQ(std::set<std::string>({"u1"}), idsOf(hreq.getDocs())) << hreq.rawResponse();
 }
 
+TEST_F(HttpApiTest, multiCollectionRoutingIsIsolated) {
+  SoluxTest::clearCollection("http_route_a");
+  SoluxTest::clearCollection("http_route_b");
+
+  auto updateA = httpRequest(port(), http::verb::post, "/collections/http_route_a/update",
+      R"({"docs":[{"id":"route-a","title_w":"routeshared token"}],"commit":{}})");
+  ASSERT_EQ(200, updateA.result_int()) << updateA.body();
+  auto updateB = httpRequest(port(), http::verb::post, "/collections/http_route_b/update",
+      R"({"docs":[{"id":"route-b","title_w":"routeshared token"}],"commit":{}})");
+  ASSERT_EQ(200, updateB.result_int()) << updateB.body();
+
+  HttpReq reqA(port());
+  reqA.collection("http_route_a").matchQuery("title_w", "routeshared").fields({"id"})
+      .limit(10).withStats().execute();
+  ASSERT_EQ(200, reqA.status()) << reqA.rawResponse();
+  EXPECT_EQ(std::set<std::string>({"route-a"}), idsOf(reqA.getDocs())) << reqA.rawResponse();
+
+  HttpReq reqB(port());
+  reqB.collection("http_route_b").matchQuery("title_w", "routeshared").fields({"id"})
+      .limit(10).withStats().execute();
+  ASSERT_EQ(200, reqB.status()) << reqB.rawResponse();
+  EXPECT_EQ(std::set<std::string>({"route-b"}), idsOf(reqB.getDocs())) << reqB.rawResponse();
+
+  SoluxTest::clearCollection("http_route_a");
+  SoluxTest::clearCollection("http_route_b");
+}
+
+TEST_F(HttpApiTest, autoCreateCollectionDefaultOn) {
+  auto update = httpRequest(port(), http::verb::post, "/collections/http_auto_create_on/update",
+      R"({"docs":[{"id":"auto-on","title_w":"autocreateon token"}],"commit":{}})");
+  ASSERT_EQ(200, update.result_int()) << update.body();
+  std::shared_ptr<Collection> created;
+  EXPECT_NO_THROW(created = SoluxTest::soluxNode->getCollection("http_auto_create_on"));
+  ASSERT_NE(nullptr, created);
+
+  HttpReq hreq(port());
+  hreq.collection("http_auto_create_on").matchQuery("title_w", "autocreateon")
+      .fields({"id"}).withStats().execute();
+  ASSERT_EQ(200, hreq.status()) << hreq.rawResponse();
+  EXPECT_EQ(std::set<std::string>({"auto-on"}), idsOf(hreq.getDocs())) << hreq.rawResponse();
+
+  SoluxTest::clearCollection("http_auto_create_on");
+}
+
+TEST_F(HttpApiTest, autoCreateCollectionCanBeDisabled) {
+  SoluxConfig config;
+  config.ingest.auto_create_collection = false;
+  SoluxNode node(config);
+  HttpServer localServer(node, 2, 0);
+  localServer.start();
+
+  auto update = httpRequest(localServer.getPort(), http::verb::post,
+      "/collections/http_auto_create_off/update",
+      R"({"docs":[{"id":"auto-off","title_w":"autocreateoff token"}],"commit":{}})");
+  localServer.shutdown();
+
+  EXPECT_EQ(400, update.result_int()) << update.body();
+  EXPECT_NE(update.body().find("collection 'http_auto_create_off' does not exist"),
+            std::string::npos) << update.body();
+  EXPECT_THROW(node.getCollection("http_auto_create_off"), CollectionResolutionError);
+}
+
+TEST_F(HttpApiTest, searchMissingCollectionErrorsWithoutCreating) {
+  std::string autoOnName = "http_missing_search_auto_on";
+  HttpReq autoOnReq(port());
+  autoOnReq.collection(autoOnName).matchQuery("title_w", "missingtoken")
+      .fields({"id"}).execute();
+  EXPECT_EQ(200, autoOnReq.status()) << autoOnReq.rawResponse();
+  EXPECT_NE(autoOnReq.rawResponse().find("collection '" + autoOnName + "' does not exist"),
+            std::string::npos) << autoOnReq.rawResponse();
+  EXPECT_THROW(SoluxTest::soluxNode->getCollection(autoOnName), CollectionResolutionError);
+
+  SoluxConfig config;
+  config.ingest.auto_create_collection = false;
+  SoluxNode node(config);
+  HttpServer localServer(node, 2, 0);
+  localServer.start();
+
+  std::string autoOffName = "http_missing_search_auto_off";
+  HttpReq autoOffReq(localServer.getPort());
+  autoOffReq.collection(autoOffName).matchQuery("title_w", "missingtoken")
+      .fields({"id"}).execute();
+  localServer.shutdown();
+
+  EXPECT_EQ(200, autoOffReq.status()) << autoOffReq.rawResponse();
+  EXPECT_NE(autoOffReq.rawResponse().find("collection '" + autoOffName + "' does not exist"),
+            std::string::npos) << autoOffReq.rawResponse();
+  EXPECT_THROW(node.getCollection(autoOffName), CollectionResolutionError);
+}
+
+TEST_F(HttpApiTest, leadingUnderscoreCollectionNameIsRejected) {
+  auto update = httpRequest(port(), http::verb::post, "/collections/_reserved/update",
+      R"({"docs":[{"id":"bad-reserved","title_w":"reserved token"}],"commit":{}})");
+  EXPECT_EQ(400, update.result_int()) << update.body();
+  EXPECT_NE(update.body().find("collection '_reserved' is reserved"), std::string::npos)
+      << update.body();
+  EXPECT_THROW(SoluxTest::soluxNode->getCollection("_reserved"), CollectionResolutionError);
+}
+
+TEST_F(HttpApiTest, unsafeCollectionNamesAreRejectedBeforeCreate) {
+  auto stamp = std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());
+  std::filesystem::path base = std::filesystem::temp_directory_path() / ("solux_unsafe_names_" + stamp);
+  std::filesystem::path absolute = std::filesystem::temp_directory_path() / ("solux_abs_collection_" + stamp);
+  std::filesystem::remove_all(base);
+  std::filesystem::remove_all(absolute);
+
+  SoluxConfig config;
+  config.store.backend = "fs";
+  config.store.data_dir = base.string();
+  SoluxNode node(config);
+  HttpServer localServer(node, 2, 0);
+  localServer.start();
+
+  auto expectRejected = [&](std::string target, std::string_view message) {
+    auto update = httpRequest(localServer.getPort(), http::verb::post, target,
+        R"({"docs":[{"id":"bad-name","title_w":"badname token"}],"commit":{}})");
+    EXPECT_EQ(400, update.result_int()) << target << " " << update.body();
+    EXPECT_NE(update.body().find(message), std::string::npos) << target << " " << update.body();
+  };
+
+  expectRejected("/collections/_reserved/update", "reserved");
+  expectRejected("/collections/unsafe/slash/update", "single path component");
+  expectRejected("/collections/../update", "reserved");
+  expectRejected("/collections/" + absolute.string() + "/update", "single path component");
+  expectRejected("/collections//update", "empty");
+
+  localServer.shutdown();
+
+  EXPECT_FALSE(std::filesystem::exists(base / "c" / "unsafe"));
+  EXPECT_FALSE(std::filesystem::exists(absolute));
+  std::filesystem::remove_all(base);
+}
+
 TEST_F(HttpApiTest, simpleQueryOverJson) {
   auto update = httpRequest(port(), http::verb::post, "/collections/main/update",
       R"({"docs":[{"id":"s1","title_w":"blade runner"},{"id":"s2","title_w":"running man"}],"commit":{}})");
@@ -227,7 +361,7 @@ TEST_F(HttpApiTest, ndjsonStreamIndexesAndQueries) {
       R"({"id":"n1","title_w":"streamtoken alpha","title_s":"Alpha"})" "\n"
       R"({"id":"n2","title_w":"streamtoken beta","title_s":"Beta"})" "\n"
       R"({"id":"n3","title_w":"streamtoken gamma","title_s":"Gamma"})" "\n"
-      R"({"_update_":{"commit":{}}})" "\n";
+      R"({"_end_":{"commit":{}}})" "\n";
 
   auto update = httpRequest(port(), http::verb::post, "/collections/main/update",
                             std::move(body), "application/x-ndjson");
@@ -257,7 +391,7 @@ TEST_F(HttpApiTest, ndjsonStreamFlushesMultipleBatches) {
     body += R"("})";
     body += '\n';
   }
-  body += R"({"_update_":{"commit":{}}})";
+  body += R"({"_end_":{"commit":{}}})";
   body += '\n';
 
   auto update = httpRequest(port(), http::verb::post, "/collections/main/update",
@@ -281,6 +415,8 @@ TEST_F(HttpApiTest, streamGroupCapsRetainedIdsAcrossBatches) {
   std::string payload(20 * 1024, 'y');  // ~20 KiB each -> several 1 MiB batches
   std::string body;
   body.reserve((payload.size() + 80) * (std::size_t)kDocCount);
+  body += R"({"_update_":{"return_ids":true}})";
+  body += '\n';
   for (int i = 0; i < kDocCount; i++) {
     body += R"({"id":"cap)";
     body += std::to_string(i);
@@ -289,14 +425,14 @@ TEST_F(HttpApiTest, streamGroupCapsRetainedIdsAcrossBatches) {
     body += R"("})";
     body += '\n';
   }
-  body += R"({"_update_":{"commit":{}}})";
+  body += R"({"_end_":{"commit":{}}})";
   body += '\n';
 
   auto update = httpRequest(port(), http::verb::post, "/collections/main/update",
                             std::move(body), "application/x-ndjson");
   ASSERT_EQ(200, update.result_int()) << update.body();
 
-  // One implicit group -> one response line; ids capped at 100 even though 150 indexed.
+  // One explicit group -> one response line; ids capped at 100 even though 150 indexed.
   std::size_t retained = 0;
   for (const auto& line : splitLines(update.body())) retained += idsInUpdateLine(line).size();
   EXPECT_EQ((std::size_t)100, retained) << update.body().substr(0, 200);
@@ -326,7 +462,7 @@ TEST_F(HttpApiTest, ndjsonDocLargerThanReadBuffer) {
   std::string big(200 * 1024, 'x');  // ~200 KiB > 64 KiB read buffer, < record cap
   std::string body =
       R"({"id":"big1","title_w":"bigtoken","title_s":")" + big + R"("})" "\n"
-      R"({"_update_":{"commit":{}}})" "\n";
+      R"({"_end_":{"commit":{}}})" "\n";
 
   auto update = httpRequest(port(), http::verb::post, "/collections/main/update",
                             std::move(body), "application/x-ndjson");
@@ -370,7 +506,7 @@ TEST_F(HttpApiTest, ndjsonRequestIdControlEchoed) {
   std::string body =
       R"({"_update_":{"request_id":"stream-req-1"}})" "\n"
       R"({"id":"rid1","title_w":"ridtoken"})" "\n"
-      R"({"_update_":{"commit":{}}})" "\n";
+      R"({"_end_":{"commit":{}}})" "\n";
 
   auto res = httpRequest(port(), http::verb::post, "/collections/main/update",
                          std::move(body), "application/x-ndjson");
@@ -385,7 +521,7 @@ TEST_F(HttpApiTest, ndjsonMultipleGroupsReturnMultipleLines) {
       R"({"id":"mg1","title_w":"mgroup token","title_s":"Group 1"})" "\n"
       R"({"_update_":{"request_id":"g2"}})" "\n"
       R"({"id":"mg2","title_w":"mgroup token","title_s":"Group 2"})" "\n"
-      R"({"_update_":{"commit":{}}})" "\n";
+      R"({"_end_":{"commit":{}}})" "\n";
 
   auto update = httpRequest(port(), http::verb::post, "/collections/main/update",
                             std::move(body), "application/x-ndjson");
@@ -408,7 +544,7 @@ TEST_F(HttpApiTest, ndjsonNoGroupReturnsOneLine) {
   std::string body =
       R"({"id":"nog1","title_w":"nogroup token"})" "\n"
       R"({"id":"nog2","title_w":"nogroup token"})" "\n"
-      R"({"_update_":{"commit":{}}})" "\n";
+      R"({"_end_":{"commit":{}}})" "\n";
 
   auto update = httpRequest(port(), http::verb::post, "/collections/main/update",
                             std::move(body), "application/x-ndjson");
@@ -420,11 +556,12 @@ TEST_F(HttpApiTest, ndjsonNoGroupReturnsOneLine) {
 
 TEST_F(HttpApiTest, ndjsonCheckpointMarkerEmitsLineMidStream) {
   std::string body =
-      R"({"_update_":{"request_id":"g1"}})" "\n"
+      R"({"_update_":{"request_id":"g1","return_ids":true}})" "\n"
       R"({"id":"cp1","title_w":"checkpoint token"})" "\n"
       "{}\n"
+      R"({"_update_":{"return_ids":true}})" "\n"
       R"({"id":"cp2","title_w":"checkpoint token"})" "\n"
-      R"({"_update_":{"commit":{}}})" "\n";
+      R"({"_end_":{"commit":{}}})" "\n";
 
   auto update = httpRequest(port(), http::verb::post, "/collections/main/update",
                             std::move(body), "application/x-ndjson");
@@ -432,7 +569,7 @@ TEST_F(HttpApiTest, ndjsonCheckpointMarkerEmitsLineMidStream) {
   auto lines = splitLines(update.body());
   ASSERT_EQ(2u, lines.size()) << update.body();
   EXPECT_NE(lines[0].find(R"("request_id":"g1")"), std::string::npos) << update.body();
-  EXPECT_NE(lines[1].find(R"("request_id":"g1")"), std::string::npos) << update.body();
+  EXPECT_EQ(lines[1].find(R"("request_id":"g1")"), std::string::npos) << update.body();
   EXPECT_EQ(std::vector<std::string>({"cp1"}), idsInUpdateLine(lines[0])) << update.body();
   EXPECT_EQ(std::vector<std::string>({"cp2"}), idsInUpdateLine(lines[1])) << update.body();
 
@@ -447,12 +584,13 @@ TEST_F(HttpApiTest, ndjsonCheckpointMarkerEmitsLineMidStream) {
 
 TEST_F(HttpApiTest, ndjsonCheckpointStatsAreDeltaNotCumulative) {
   std::string body =
-      R"({"_update_":{"request_id":"delta"}})" "\n"
+      R"({"_update_":{"request_id":"delta","return_ids":true}})" "\n"
       R"({"id":"dlt1","title_w":"deltatoken"})" "\n"
       R"({"id":"dlt2","title_w":"deltatoken"})" "\n"
       "{}\n"
+      R"({"_update_":{"return_ids":true}})" "\n"
       R"({"id":"dlt3","title_w":"deltatoken"})" "\n"
-      R"({"_update_":{"commit":{}}})" "\n";
+      R"({"_end_":{"commit":{}}})" "\n";
 
   auto update = httpRequest(port(), http::verb::post, "/collections/main/update",
                             std::move(body), "application/x-ndjson");
@@ -481,7 +619,7 @@ TEST_F(HttpApiTest, ndjsonCheckpointAckArrivesBeforeRequestBodyEnds) {
   net::write(stream, net::buffer(header));
 
   writeRawHttpChunk(stream,
-      R"({"_update_":{"request_id":"g1"}})" "\n"
+      R"({"_update_":{"request_id":"g1","return_ids":true}})" "\n"
       R"({"id":"bd1","title_w":"bidirectional token"})" "\n"
       "{}\n");
 
@@ -500,12 +638,13 @@ TEST_F(HttpApiTest, ndjsonCheckpointAckArrivesBeforeRequestBodyEnds) {
   EXPECT_EQ(std::vector<std::string>({"bd1"}), idsInUpdateLine(firstLine)) << firstLine;
 
   writeRawHttpChunk(stream,
+      R"({"_update_":{"return_ids":true}})" "\n"
       R"({"id":"bd2","title_w":"bidirectional token"})" "\n"
-      R"({"_update_":{"commit":{}}})" "\n");
+      R"({"_end_":{"commit":{}}})" "\n");
 
   std::string secondLine;
   ASSERT_TRUE(readNextBodyLine(stream, buffer, parser, pending, secondLine, err)) << err;
-  EXPECT_NE(secondLine.find(R"("request_id":"g1")"), std::string::npos) << secondLine;
+  EXPECT_EQ(secondLine.find(R"("request_id":"g1")"), std::string::npos) << secondLine;
   EXPECT_EQ(std::vector<std::string>({"bd2"}), idsInUpdateLine(secondLine)) << secondLine;
 
   net::write(stream, net::buffer(std::string("0\r\n\r\n")));
@@ -526,7 +665,7 @@ TEST_F(HttpApiTest, ndjsonMidStreamErrorAfterGroupEmittedIsFinalLine) {
   std::string body =
       R"({"_update_":{"request_id":"g1"}})" "\n"
       R"({"id":"eg1","title_w":"egroup token"})" "\n"
-      R"({"_update_":{"commit":{}}})" "\n"
+      R"({"_end_":{"commit":{}}})" "\n"
       R"({"_update_":{"request_id":"g2"}})" "\n"
       "{not json\n";
 
@@ -551,7 +690,7 @@ TEST_F(HttpApiTest, ndjsonStreamKeepsConnectionAliveAfterFinalLine) {
   updateReq.set(http::field::content_type, "application/x-ndjson");
   updateReq.body() =
       R"({"id":"ka1","title_w":"keepalive token"})" "\n"
-      R"({"_update_":{"commit":{}}})" "\n";
+      R"({"_end_":{"commit":{}}})" "\n";
   updateReq.prepare_payload();
   http::write(stream, updateReq);
 
@@ -572,6 +711,264 @@ TEST_F(HttpApiTest, ndjsonStreamKeepsConnectionAliveAfterFinalLine) {
 
   beast::error_code ec;
   stream.socket().shutdown(tcp::socket::shutdown_both, ec);
+}
+
+TEST_F(HttpApiTest, ndjsonUpdateControlDecodesFullRequestAndInlineDeletes) {
+  auto seed = httpRequest(port(), http::verb::post, "/collections/main/update",
+      R"({"docs":[{"id":"del-mid","title_w":"deletestream"}],"commit":{}})");
+  ASSERT_EQ(200, seed.result_int()) << seed.body();
+
+  std::string body =
+      R"({"_update_":{"allow_dups":true,"return_ids":true}})" "\n"
+      R"({"id":"dup-full","title_w":"fulldecode one"})" "\n"
+      R"({"id":"dup-full","title_w":"fulldecode two"})" "\n"
+      R"({"_update_":{"delete_ids":["del-mid"],"commit":{}}})" "\n";
+
+  auto update = httpRequest(port(), http::verb::post, "/collections/main/update",
+                            std::move(body), "application/x-ndjson");
+  ASSERT_EQ(200, update.result_int()) << update.body();
+  auto lines = splitLines(update.body());
+  ASSERT_EQ(2u, lines.size()) << update.body();
+  EXPECT_EQ((std::vector<std::string>{"dup-full", "dup-full"}), idsInUpdateLine(lines[0]))
+      << update.body();
+
+  HttpReq dupReq(port());
+  dupReq.collection("main").matchQuery("title_w", "fulldecode").fields({"id"})
+      .limit(10).withStats().execute();
+  ASSERT_EQ(200, dupReq.status()) << dupReq.rawResponse();
+  EXPECT_EQ((int64_t)2, dupReq.found()) << dupReq.rawResponse();
+
+  HttpReq delReq(port());
+  delReq.collection("main").matchQuery("title_w", "deletestream").fields({"id"})
+      .limit(10).withStats().execute();
+  ASSERT_EQ(200, delReq.status()) << delReq.rawResponse();
+  EXPECT_EQ((int64_t)0, delReq.found()) << delReq.rawResponse();
+}
+
+TEST_F(HttpApiTest, ndjsonInlineUpdateReturnIdsDefaultFalse) {
+  std::string withIds =
+      R"({"_update_":{"docs":[{"id":"inline-ret","title_w":"inlinereturn token"}],)"
+      R"("return_ids":true,"commit":{}}})" "\n";
+  auto returned = httpRequest(port(), http::verb::post, "/collections/main/update",
+                              std::move(withIds), "application/x-ndjson");
+  ASSERT_EQ(200, returned.result_int()) << returned.body();
+  auto returnedLines = splitLines(returned.body());
+  ASSERT_EQ(1u, returnedLines.size()) << returned.body();
+  EXPECT_EQ((std::vector<std::string>{"inline-ret"}), idsInUpdateLine(returnedLines[0]))
+      << returned.body();
+
+  std::string withoutIds =
+      R"({"_update_":{"docs":[{"id":"inline-no-ret","title_w":"inlinereturn token"}],)"
+      R"("commit":{}}})" "\n";
+  auto omitted = httpRequest(port(), http::verb::post, "/collections/main/update",
+                             std::move(withoutIds), "application/x-ndjson");
+  ASSERT_EQ(200, omitted.result_int()) << omitted.body();
+  auto omittedLines = splitLines(omitted.body());
+  ASSERT_EQ(1u, omittedLines.size()) << omitted.body();
+  EXPECT_TRUE(idsInUpdateLine(omittedLines[0]).empty()) << omitted.body();
+
+  HttpReq hreq(port());
+  hreq.collection("main").matchQuery("title_w", "inlinereturn").fields({"id"})
+      .limit(10).withStats().execute();
+  ASSERT_EQ(200, hreq.status()) << hreq.rawResponse();
+  EXPECT_EQ((int64_t)2, hreq.found()) << hreq.rawResponse();
+}
+
+TEST_F(HttpApiTest, ndjsonDeferredInlineUpdateEnforcesRequestBodyCap) {
+  SoluxConfig config;
+  config.ingest.max_request_body = 1024;
+  config.ingest.max_record = 4096;
+  SoluxNode node(config);
+  HttpServer localServer(node, 2, 0);
+  localServer.start();
+
+  std::string payload(1500, 'z');
+  std::string body =
+      R"({"id":"defer-pre","title_w":"defercap token"})" "\n"
+      R"({"_update_":{"docs":[{"id":"defer-big","title_w":"defercap token","blob_s":")" +
+      payload + R"("}]}})" "\n";
+
+  auto update = httpRequest(localServer.getPort(), http::verb::post, "/collections/main/update",
+                            std::move(body), "application/x-ndjson");
+  localServer.shutdown();
+
+  EXPECT_EQ(200, update.result_int()) << update.body();
+  EXPECT_NE(update.body().find("_update_ inline request exceeds ingest.max-request-body"),
+            std::string::npos) << update.body();
+}
+
+TEST_F(HttpApiTest, ndjsonGroupConfigDoesNotStickAfterEnd) {
+  std::string body =
+      R"({"_update_":{"all_or_none":true}})" "\n"
+      R"({"id":"nostick-rolled-back","title_w":"nostickyrolled token"})" "\n"
+      R"({"id":"nostick-bad","title_w":"nostickyrolled token","no_such_field":"boom"})" "\n"
+      "{}\n"
+      R"({"id":"nostick-good","title_w":"nostickygood token"})" "\n"
+      R"({"id":"nostick-bad2","title_w":"nostickygood token","no_such_field":"boom"})" "\n"
+      R"({"_end_":{"commit":{}}})" "\n";
+
+  auto update = httpRequest(port(), http::verb::post, "/collections/main/update",
+                            std::move(body), "application/x-ndjson");
+  ASSERT_EQ(200, update.result_int()) << update.body();
+  ASSERT_EQ(2u, splitLines(update.body()).size()) << update.body();
+
+  HttpReq rolledBackReq(port());
+  rolledBackReq.collection("main").matchQuery("title_w", "nostickyrolled").fields({"id"})
+      .limit(10).withStats().execute();
+  ASSERT_EQ(200, rolledBackReq.status()) << rolledBackReq.rawResponse();
+  EXPECT_EQ((int64_t)0, rolledBackReq.found()) << rolledBackReq.rawResponse();
+
+  HttpReq goodReq(port());
+  goodReq.collection("main").matchQuery("title_w", "nostickygood").fields({"id"})
+      .limit(10).withStats().execute();
+  ASSERT_EQ(200, goodReq.status()) << goodReq.rawResponse();
+  EXPECT_EQ((int64_t)1, goodReq.found()) << goodReq.rawResponse();
+}
+
+TEST_F(HttpApiTest, ndjsonUpdateCommitAppliesToOpenedGroupAtEof) {
+  std::string body =
+      R"({"_update_":{"request_id":"commit-open","commit":{}}})" "\n"
+      R"({"id":"uc1","title_w":"ucommit token"})" "\n";
+
+  auto update = httpRequest(port(), http::verb::post, "/collections/main/update",
+                            std::move(body), "application/x-ndjson");
+  ASSERT_EQ(200, update.result_int()) << update.body();
+  EXPECT_NE(update.body().find(R"("request_id":"commit-open")"), std::string::npos)
+      << update.body();
+
+  HttpReq hreq(port());
+  hreq.collection("main").matchQuery("title_w", "ucommit").fields({"id"})
+      .limit(10).withStats().execute();
+  ASSERT_EQ(200, hreq.status()) << hreq.rawResponse();
+  EXPECT_EQ((int64_t)1, hreq.found()) << hreq.rawResponse();
+}
+
+TEST_F(HttpApiTest, ndjsonUrlCommitCommitsAtEof) {
+  std::string body =
+      R"({"id":"urlc1","title_w":"urlcommit token"})" "\n";
+
+  auto update = httpRequest(port(), http::verb::post, "/collections/main/update?commit=true",
+                            std::move(body), "application/x-ndjson");
+  ASSERT_EQ(200, update.result_int()) << update.body();
+
+  HttpReq hreq(port());
+  hreq.collection("main").matchQuery("title_w", "urlcommit").fields({"id"})
+      .limit(10).withStats().execute();
+  ASSERT_EQ(200, hreq.status()) << hreq.rawResponse();
+  EXPECT_EQ((int64_t)1, hreq.found()) << hreq.rawResponse();
+}
+
+TEST_F(HttpApiTest, ndjsonEmptyUrlCommitCommitsDefaultCollection) {
+  SoluxNode node;
+  auto writer = node.getCollection("main")->getShard()->getIndexWriter();
+  std::uint64_t before = writer->getIndexReader()->commitTime();
+  HttpServer localServer(node, 2, 0);
+  localServer.start();
+
+  auto update = httpRequest(localServer.getPort(), http::verb::post,
+                            "/collections/main/update?commit=true", "",
+                            "application/x-ndjson");
+  localServer.shutdown();
+
+  ASSERT_EQ(200, update.result_int()) << update.body();
+  EXPECT_EQ(1u, splitLines(update.body()).size()) << update.body();
+  EXPECT_GT(writer->getIndexReader()->commitTime(), before);
+}
+
+TEST_F(HttpApiTest, ndjsonAllOrNoneStreamSuccess) {
+  std::string body =
+      R"({"_update_":{"all_or_none":true}})" "\n"
+      R"({"id":"aon1","title_w":"aonsuccess token"})" "\n"
+      R"({"id":"aon2","title_w":"aonsuccess token"})" "\n"
+      R"({"_end_":{"commit":{}}})" "\n";
+
+  auto update = httpRequest(port(), http::verb::post, "/collections/main/update",
+                            std::move(body), "application/x-ndjson");
+  ASSERT_EQ(200, update.result_int()) << update.body();
+
+  HttpReq hreq(port());
+  hreq.collection("main").matchQuery("title_w", "aonsuccess").fields({"id"})
+      .limit(10).withStats().execute();
+  ASSERT_EQ(200, hreq.status()) << hreq.rawResponse();
+  EXPECT_EQ((int64_t)2, hreq.found()) << hreq.rawResponse();
+}
+
+TEST_F(HttpApiTest, ndjsonAllOrNoneStreamFailureRollsBack) {
+  std::string body =
+      R"({"_update_":{"all_or_none":true}})" "\n"
+      R"({"id":"aon-good","title_w":"aonfail token"})" "\n"
+      R"({"id":"aon-bad","title_w":"aonfail token","no_such_field":"boom"})" "\n"
+      R"({"id":"aon-never","title_w":"aonfail token"})" "\n"
+      R"({"_end_":{"commit":{}}})" "\n";
+
+  auto update = httpRequest(port(), http::verb::post, "/collections/main/update",
+                            std::move(body), "application/x-ndjson");
+  ASSERT_EQ(200, update.result_int()) << update.body();
+  EXPECT_NE(update.body().find("ERROR"), std::string::npos) << update.body();
+
+  HttpReq hreq(port());
+  hreq.collection("main").matchQuery("title_w", "aonfail").fields({"id"})
+      .limit(10).withStats().execute();
+  ASSERT_EQ(200, hreq.status()) << hreq.rawResponse();
+  EXPECT_EQ((int64_t)0, hreq.found()) << hreq.rawResponse();
+}
+
+TEST_F(HttpApiTest, ndjsonAllOrNoneStreamOverCapIs400) {
+  SoluxConfig config;
+  config.ingest.max_request_body = 1024;
+  config.ingest.max_record = 2048;
+  SoluxNode node(config);
+  HttpServer localServer(node, 2, 0);
+  localServer.start();
+
+  std::string payload(700, 'x');
+  std::string body =
+      R"({"_update_":{"all_or_none":true}})" "\n"
+      R"({"id":"cap-a","title_w":"capatomic","blob_s":")" + payload + R"("})" "\n"
+      R"({"id":"cap-b","title_w":"capatomic","blob_s":")" + payload + R"("})" "\n";
+
+  auto update = httpRequest(localServer.getPort(), http::verb::post, "/collections/main/update",
+                            std::move(body), "application/x-ndjson");
+  localServer.shutdown();
+
+  EXPECT_EQ(400, update.result_int()) << update.body();
+  EXPECT_NE(update.body().find("all_or_none NDJSON group exceeds ingest.max-request-body"),
+            std::string::npos) << update.body();
+}
+
+TEST_F(HttpApiTest, ndjsonEndRejectsSubmitTimeConfig) {
+  std::string body =
+      R"({"id":"bad-end","title_w":"badend token"})" "\n"
+      R"({"_end_":{"all_or_none":true}})" "\n";
+
+  auto update = httpRequest(port(), http::verb::post, "/collections/main/update",
+                            std::move(body), "application/x-ndjson");
+  EXPECT_EQ(400, update.result_int()) << update.body();
+  EXPECT_NE(update.body().find("_end_ control cannot carry submit-time field 'all_or_none'"),
+            std::string::npos) << update.body();
+}
+
+TEST_F(HttpApiTest, ndjsonUpdateRejectsUnknownControlField) {
+  std::string body =
+      R"({"_update_":{"allow_dup":true}})" "\n";
+
+  auto update = httpRequest(port(), http::verb::post, "/collections/main/update",
+                            std::move(body), "application/x-ndjson");
+  EXPECT_EQ(400, update.result_int()) << update.body();
+  EXPECT_NE(update.body().find("unsupported _update_ control field 'allow_dup'"),
+            std::string::npos) << update.body();
+}
+
+TEST_F(HttpApiTest, ndjsonEndRejectsUnknownControlField) {
+  std::string body =
+      R"({"id":"bad-end-unknown","title_w":"badendunknown token"})" "\n"
+      R"({"_end_":{"all_or_non":true}})" "\n";
+
+  auto update = httpRequest(port(), http::verb::post, "/collections/main/update",
+                            std::move(body), "application/x-ndjson");
+  EXPECT_EQ(400, update.result_int()) << update.body();
+  EXPECT_NE(update.body().find("unsupported _end_ control field 'all_or_non'"),
+            std::string::npos) << update.body();
 }
 
 // HTTP results match the in-process engine for the same query, and a doc missing

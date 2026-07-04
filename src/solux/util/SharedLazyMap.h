@@ -1,5 +1,8 @@
 #pragma once
 
+#include <exception>
+#include <memory>
+#include <utility>
 #include <variant>
 #include <boost/unordered/concurrent_flat_map.hpp>
 #include <tbb/task_group.h>
@@ -37,19 +40,33 @@ public:
   SharedLazyMap() = default;
 
   /**
+   * Retrieves the value associated with the given key if it is already fully
+   * created. Returns nullptr if the key is absent or creation is in flight.
+   */
+  Pointer get(const Key& key) {
+    Pointer result;
+    dataMap.cvisit(key, [&result](const auto& elem) {
+      if (auto* p = std::get_if<Pointer>(&elem.second)) result = *p;
+    });
+    return result;
+  }
+
+  /**
    * Retrieves the value associated with the given key, or creates it
    * if it doesn't already exist.  nullptr values are not stored in the map.
    */
-  Pointer getOrCreate(const Key& key, std::function<Pointer()> createFunc) {
-    MapVal mapVal;
+  template <typename CreateFunc>
+  Pointer getOrCreate(const Key& key, CreateFunc&& createFunc) {
+    Pointer result;
+    std::shared_ptr<tbb::task_group> tg;
+    bool foundPointer = false;
 
     // insert with the task_group alternative.
-    auto inserted = dataMap.try_emplace_and_cvisit(key, MapVal{},
+    dataMap.try_emplace_and_cvisit(key, MapVal{},
       [&](auto& elem) {
         // LOG_DEBUG("CREATE {}", key);
-        auto tg = std::make_shared<tbb::task_group>();
+        tg = std::make_shared<tbb::task_group>();
         elem.second = tg;
-        mapVal = elem.second;
         // must create the task when inserting the task_group to prevent race conditions,
         // otherwise another thread could wait on the task group before we add the create task.
         // Capture by ref for everything is fine here since all callers will wait on tg.
@@ -57,9 +74,9 @@ public:
           try {
             // we aren't allowed to call dataMap methods inside another dataMap method,
             // but this is guaranteed to execute outside/after the try_emplace_and_cvisit method.
-            Pointer val = createFunc(); // do expensive part outside of visit
+            Pointer val = std::forward<CreateFunc>(createFunc)(); // do expensive part outside of visit
             if (val) {
-              dataMap.visit(key, [&createFunc, &val](auto& elem) {
+              dataMap.visit(key, [&val](auto& elem) {
                 elem.second = std::move(val);
               });
             } else {
@@ -77,17 +94,24 @@ public:
       },
       [&](const auto& elem) {
         // LOG_DEBUG("got {}", key);
-        mapVal = elem.second;
+        if (auto* p = std::get_if<Pointer>(&elem.second)) {
+          result = *p;
+          foundPointer = true;
+        } else {
+          tg = std::get<std::shared_ptr<tbb::task_group>>(elem.second);
+        }
       }
     );
 
     // If the value is here, return it.
-    if (std::holds_alternative<Pointer>(mapVal)) {
-      return std::get<Pointer>(mapVal);
+    if (foundPointer) {
+      return std::move(result);
     }
 
     // If the task_group is present, then wait on it.
-    auto tg = std::get<std::shared_ptr<tbb::task_group>>(mapVal);
+    if (!tg) {
+      return nullptr;
+    }
     tg->wait();
 
     MapVal outVal;

@@ -57,9 +57,10 @@ std::shared_ptr<grpc::Channel> GrpcSoluxTest::channel = nullptr;
 bool GrpcSoluxTest::serverStartFailed = false;
 
 void SoluxTest::clearCollection(std::string_view collectionName) {
-  auto collection = soluxNode->getCollection(collectionName);
-  if (collection) {
+  try {
+    auto collection = soluxNode->getCollection(collectionName);
     collection->getShard()->getIndexWriter()->testDeleteAllData();
+  } catch (const CollectionResolutionError&) {
   }
 }
 

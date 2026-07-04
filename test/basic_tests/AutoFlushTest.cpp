@@ -22,9 +22,9 @@ using namespace solux::test;
 class AutoFlushTest : public SoluxTest {};
 
 namespace {
-// Restores an IndexWriter's auto-flush caps on scope exit.  Tests share one "main"
-// collection (getCollection ignores the name for now) and clear() does not reset the
-// caps, so a tiny test cap must be undone or it starves later tests' segments.
+// Restores an IndexWriter's auto-flush caps on scope exit. Tests share the "main"
+// collection and clear() does not reset the caps, so a tiny test cap must be undone
+// or it starves later tests' segments.
 struct CapGuard {
   std::shared_ptr<IndexWriter> iw;
   size_t ram;
