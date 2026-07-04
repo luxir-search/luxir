@@ -364,13 +364,13 @@ private:
       IndirectPQ<TermsEnumIdx, decltype(termCmp)> termPQ(tenums, tenumPtrs, false);
 
       // iterate through the terms in sorted order
+      char termBuf[PackedTerm::MAX_BYTES];
       while (termPQ.size() > 0) {
         TermsEnumIdx& first = termPQ.top();
-        // Need to make a copy of the term since it will be invalidated after tenum.nextTerm()
-        // is called.  It needs to exist until the end of textWriter (currently).  See comments on startTerm()
-        // for ideas.
-        // TODO: FIXME: revisit this! We should add the term to a pool we can roll back as soon as possible.
-        PackedTerm term(pool, std::string_view(first.tenum.term()));
+        // Copy the term to local storage: it anchors the same-term do-while comparison
+        // below, and advancing the source enum overwrites the enum's term buffer.
+        PackedTerm term(termBuf);
+        first.tenum.term().copyTo(term);
         auto termOrd = textWriter.startTerm(term);
 
         do {

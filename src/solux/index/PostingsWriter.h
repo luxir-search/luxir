@@ -403,7 +403,11 @@ class TextWriter {
   //
 
   // needed to build each block
-  std::vector<TermRef> termList;  // list of terms in the current term block
+  std::vector<TermRef> termList;  // list of terms in the current term block, pointing into termBytes
+  // Block-local term storage: startTerm() copies each term here because flushTerms()
+  // re-reads the block's terms for prefix encoding, so callers need not keep term
+  // bytes alive past the startTerm() call.  Slot i backs termList[i].
+  std::array<char, Postings::TERMS_BLOCK_SIZE * PackedTerm::MAX_BYTES> termBytes;
   std::vector<uint64_t> termDocsEnd;  // cumulative trailer-free docs-region end offsets
   std::vector<uint32_t> termDocFreqs;
   std::vector<uint64_t> termTtfCodes;
@@ -1100,11 +1104,8 @@ public:
   }
 
 
-  /// NOTE! The provided term ref should be valid for the lifetime of this TextWriter (or at least until endField())
-  // TODO: We could do better for merging... instead of having to keep all terms around in memory until the field
-  // ends, we could provide a callback or another signal (perhaps a bool return from endField()) to release
-  // the term storage.  We could also have a startTerm(std::string_view) and an associated pool that we could
-  // roll back after we flush a term block.
+  /// The term is copied into block-local storage and only needs to be valid for the
+  /// duration of this call.
   // returns 1-based ordinal of term in this field
   int32_t startTerm(TermRef term) {
     docsFlushed = 0;
@@ -1120,7 +1121,9 @@ public:
     group_output.resize(0);
     locOfPositionsForTerm = posOutput.size();
     locOfDocsForTerm = docOutput.size();
-    termList.push_back(term);  // we don't really need the term name at this point (could add in endTerm), but it might be nice for debugging / exceptions?
+    PackedTerm stored(termBytes.data() + termList.size() * PackedTerm::MAX_BYTES);
+    term.copyTo(stored);
+    termList.push_back(stored);
     return numTerms + termList.size();
   }
 
