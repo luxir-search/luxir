@@ -267,7 +267,7 @@ message PrefixQuery {
 }
 
 // Matches indexed terms within byte-wise Levenshtein distance of `term`.
-// The term is used verbatim. Scoring queries sum boosted BM25 term scores;
+// The term is used verbatim. Scoring queries use blended BM25 statistics;
 // filter queries use constant scores.
 message FuzzyQuery {
   string field = 1;
@@ -277,8 +277,8 @@ message FuzzyQuery {
   optional int32 max_edits = 3;
   // Leading bytes that must match exactly. Unset = 1; 0 = no required prefix.
   optional int32 prefix_length = 4;
-  // Max scored term expansions, closest terms first. Unset = 50.
-  // Non-scoring filters are uncapped.
+  // Max scored term expansions, closest terms first. Unset/0 = complete.
+  // Positive values consent to truncation. Negative values are rejected.
   int32 max_expansions = 5;
 }
 

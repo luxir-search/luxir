@@ -277,7 +277,8 @@ public:
     // Sort field schema lookup and Weight ctors that may throw are resolved
     // here in the parser and passed to the TopDocsReq ctor.
     auto parsedSorts = parseSorts(topDocsReq.sorts);
-    auto* qcontext = Query::Context::create(&req.arena, req.requestPool, *req.reader);
+    auto* qcontext = Query::Context::create(&req.arena, req.requestPool, *req.reader,
+                                            {}, &req.warnings);
     // Flags for this request's main query. Filters inherit these after
     // buildFilterWeights clears NEED_SCORES.
     // TODO: drop NEED_SCORES for count-only / pure field-sort requests once the

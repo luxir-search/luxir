@@ -113,7 +113,7 @@ public:
   }
 
   // Build a fuzzy query over term-backed fields. The term is not analyzed.
-  // Defaults: maxEdits = AUTO, prefixLength = 1, maxExpansions = 50.
+  // Defaults: maxEdits = AUTO, prefixLength = 1, maxExpansions = 0 (complete).
   Query* createFuzzyQuery(std::string_view field, std::string_view term,
                           std::optional<int> maxEdits = std::nullopt,
                           std::optional<int> prefixLength = std::nullopt,
@@ -142,8 +142,9 @@ public:
       throw std::runtime_error(
         std::format("Fuzzy query prefix_length must not be negative (got {})", resolvedPrefix));
     }
-    if (maxExpansions <= 0) {
-      maxExpansions = 50;  // Lucene's default fuzzy expansion cap
+    if (maxExpansions < 0) {
+      throw std::runtime_error(
+        std::format("Fuzzy query max_expansions must not be negative (got {})", maxExpansions));
     }
     return pool.make<FuzzyQuery>(field, term, resolvedEdits, resolvedPrefix, maxExpansions);
   }

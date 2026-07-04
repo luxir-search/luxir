@@ -206,6 +206,7 @@ TEST_F(FuzzyQueryTest, builderValidationAndAuto) {
   // Invalid explicit knobs are rejected.
   EXPECT_THROW(builder.createFuzzyQuery("foo_w", "apple", -1), std::runtime_error);     // negative max_edits
   EXPECT_THROW(builder.createFuzzyQuery("foo_w", "apple", 1, -1), std::runtime_error);  // negative prefix_length
+  EXPECT_THROW(builder.createFuzzyQuery("foo_w", "apple", 1, 0, -1), std::runtime_error);  // negative max_expansions
 
   // AUTO thresholds.
   EXPECT_EQ(QueryBuilder::autoMaxEdits(2), 0);
@@ -315,4 +316,111 @@ TEST_F(FuzzyQueryE2ETest, stringFieldWithPrefix) {
   EXPECT_EQ(fuzzyIds("color_s", "red", 1), (S{"d1", "d3"}));
   // prefix_length 3 pins "red", so "read" (diverges at index 2) drops out.
   EXPECT_EQ(fuzzyIds("color_s", "red", 1, 3), (S{"d1"}));
+}
+
+TEST_F(FuzzyQueryE2ETest, negativeMaxExpansionsRejected) {
+  auto req = localReq(helper.getSearchEngine());
+  auto& cur = req->collection("main").topDocs("q");
+  cur.fuzzyQuery("body_w", "apple", 1, 0).fields({"id"}).limit(10);
+  auto& fuzzy = std::get<api::FuzzyQuery>(cur.rawQuery().kind);
+  fuzzy.max_expansions = -1;
+  req->execute();
+  EXPECT_FALSE(req->ok());
+  EXPECT_NE(req->errorMsg().find("max_expansions"), std::string::npos) << req->errorMsg();
+}
+
+static std::string twoEditVariant(int32_t idx) {
+  std::string out(8, 'a');
+  for (int32_t p1 = 0; p1 < 8; p1++) {
+    for (int32_t p2 = p1 + 1; p2 < 8; p2++) {
+      if (idx < 25 * 25) {
+        out[(size_t)p1] = (char)('b' + idx / 25);
+        out[(size_t)p2] = (char)('b' + idx % 25);
+        return out;
+      }
+      idx -= 25 * 25;
+    }
+  }
+  return out;
+}
+
+TEST_F(FuzzyQueryTest, exactOutranksRareOneAndTwoEditVariants) {
+  CollectionHelper helper{"main"};
+  helper.clear();
+  for (int32_t i = 0; i < 16; i++) {
+    helper.index(flatdoc("id", "exact" + std::to_string(i),
+                         "body_w", "apple pad"), UpdateMessage::NO_COMMIT);
+  }
+  helper.index(flatdoc("id", "one_typo", "body_w", "apply pad"), UpdateMessage::NO_COMMIT);
+  helper.index(flatdoc("id", "two_typo", "body_w", "appel pad"), UpdateMessage::COMMIT);
+
+  auto req = localReq(helper.getSearchEngine());
+  req->collection("main").topDocs("q")
+      .fuzzyQuery("body_w", "apple", 2, 0)
+      .fields({"id"}).limit(-1).getScores();
+  req->execute();
+  ASSERT_TRUE(req->ok()) << req->errorMsg();
+  const auto* docs = req->docList();
+  ASSERT_NE(docs, nullptr);
+  const auto& ids = std::get<api::ColStr>(docs->columns.at("id").kind).v;
+  const auto& scores = std::get<api::ColFloat>(docs->columns.at("_score_").kind).v;
+
+  auto findIndex = [&](std::string_view id) {
+    for (size_t i = 0; i < ids.size(); i++) {
+      if (ids[i] == id) return i;
+    }
+    return ids.size();
+  };
+  size_t firstExact = findIndex("exact0");
+  size_t oneTypo = findIndex("one_typo");
+  size_t twoTypo = findIndex("two_typo");
+  ASSERT_LT(firstExact, ids.size());
+  ASSERT_LT(oneTypo, ids.size());
+  ASSERT_LT(twoTypo, ids.size());
+  EXPECT_LT(firstExact, oneTypo);
+  EXPECT_LT(firstExact, twoTypo);
+  EXPECT_GT(scores[firstExact], scores[oneTypo]);
+  EXPECT_GT(scores[firstExact], scores[twoTypo]);
+  helper.clear();
+}
+
+TEST_F(FuzzyQueryTest, unsetMaxExpansionsIsCompletePastFifty) {
+  CollectionHelper helper{"main"};
+  helper.clear();
+  for (int32_t i = 0; i < 60; i++) {
+    std::string term = "aaaaa";
+    int32_t pos = 1 + i / 25;
+    term[(size_t)pos] = (char)('b' + (i % 25));
+    helper.index(flatdoc("id", "d" + std::to_string(i), "body_w", term),
+                 i == 59 ? UpdateMessage::COMMIT : UpdateMessage::NO_COMMIT);
+  }
+
+  auto req = localReq(helper.getSearchEngine());
+  req->collection("main").topDocs("q")
+      .fuzzyQuery("body_w", "aaaaa")
+      .fields({"id"}).limit(100);
+  req->execute();
+  ASSERT_TRUE(req->ok()) << req->errorMsg();
+  EXPECT_EQ(60u, req->getDocs().size());
+  EXPECT_TRUE(req->respWarnings().empty());
+  helper.clear();
+}
+
+TEST_F(FuzzyQueryTest, operatorExpansionClampWarns) {
+  CollectionHelper helper{"main"};
+  helper.clear();
+  constexpr int32_t kDocs = 10005;
+  for (int32_t i = 0; i < kDocs; i++) {
+    helper.index(flatdoc("id", "d" + std::to_string(i), "body_w", twoEditVariant(i)),
+                 i == kDocs - 1 ? UpdateMessage::COMMIT : UpdateMessage::NO_COMMIT);
+  }
+
+  auto req = localReq(helper.getSearchEngine());
+  req->collection("main").topDocs("q")
+      .fuzzyQuery("body_w", "aaaaaaaa", 2, 0)
+      .fields({"id"}).limit(1);
+  req->execute();
+  ASSERT_TRUE(req->ok()) << req->errorMsg();
+  EXPECT_TRUE(req->hasWarning("fuzzy_clamped"));
+  helper.clear();
 }

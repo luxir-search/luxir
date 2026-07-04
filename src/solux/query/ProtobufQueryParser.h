@@ -158,6 +158,11 @@ public:
   }
 
   solux::Query* parseFuzzy(const solux::api::FuzzyQuery& fuzzyQuery) {
+    if (fuzzyQuery.max_expansions < 0) {
+      throw std::runtime_error(
+        std::format("Fuzzy query max_expansions must not be negative (got {})",
+                    fuzzyQuery.max_expansions));
+    }
     QueryBuilder builder(pool, schema);
     std::optional<int> maxEdits = fuzzyQuery.max_edits.has_value()
         ? std::optional<int>(*fuzzyQuery.max_edits) : std::nullopt;

@@ -1,9 +1,12 @@
 #pragma once
 
+#include <cstring>
 #include <limits>
 #include <memory>
 #include <span>
+#include <vector>
 #include <solux/util/heap.h>
+#include "solux/api/solux_types.hpp"
 #include "solux/util/MemPool.h"
 #include "solux/util/proto.h"
 #include "solux/util/StrRef.h"
@@ -232,12 +235,21 @@ public:
   public:
     using FieldInfoMap = boost::unordered_node_map<std::string_view, CachedFieldInfo, PackedTermHash, PackedTermEqual, MemPool::allocator<std::pair<const std::string_view, CachedFieldInfo>>>;
 
+    struct Limits {
+      int32_t fuzzyMaxExpansions = 10000;
+
+      constexpr Limits(int32_t fuzzyMaxExpansions = 10000)
+        : fuzzyMaxExpansions(fuzzyMaxExpansions) {}
+    };
+
     MemPool& pool;
     IndexReader& topReader;
     // Weight* top = nullptr;  // if we don't need a top-weight, we can reuse a Context for multiple queries in the same request.
 
     std::span<FieldReader> fieldReaders;
     FieldInfoMap fieldInfoMap;
+    Limits limits;
+    std::vector<api::Warning>* warnings = nullptr;
 
     // Ctor used by Context::create for arena allocation: the factory does the
     // work that can throw (pool allocation, FieldReader init, map bucket
@@ -245,15 +257,19 @@ public:
     // (solux::arenaCreate would make a throwing arena ctor safe now; the factory
     // split is kept as structure, not a safety requirement.)
     Context(MemPool& pool, IndexReader& topReader,
-            std::span<FieldReader> fieldReaders, FieldInfoMap&& fieldInfoMap)
+            std::span<FieldReader> fieldReaders, FieldInfoMap&& fieldInfoMap,
+            Limits limits = {}, std::vector<api::Warning>* warnings = nullptr)
       : pool(pool), topReader(topReader),
-        fieldReaders(fieldReaders), fieldInfoMap(std::move(fieldInfoMap)) {
+        fieldReaders(fieldReaders), fieldInfoMap(std::move(fieldInfoMap)),
+        limits(limits), warnings(warnings) {
     }
 
     // Convenience ctor for stack-allocated Contexts (tests, non-arena code):
     // does its own allocation/init inline.
-    Context(MemPool& pool, IndexReader& topReader)
-      : pool(pool), topReader(topReader), fieldInfoMap(4, pool.getAllocator()) {
+    Context(MemPool& pool, IndexReader& topReader, Limits limits = {},
+            std::vector<api::Warning>* warnings = nullptr)
+      : pool(pool), topReader(topReader), fieldInfoMap(4, pool.getAllocator()),
+        limits(limits), warnings(warnings) {
       auto numSegs = topReader.segments().size();
       fieldReaders = {(FieldReader*)pool.alloc(sizeof(FieldReader)*numSegs, alignof(FieldReader)), numSegs};
       for (size_t i = 0; i < numSegs; i++) {
@@ -261,7 +277,8 @@ public:
       }
     }
 
-    static Context* create(google::protobuf::Arena* arena, MemPool& pool, IndexReader& topReader) {
+    static Context* create(google::protobuf::Arena* arena, MemPool& pool, IndexReader& topReader,
+                           Limits limits = {}, std::vector<api::Warning>* warnings = nullptr) {
       auto numSegs = topReader.segments().size();
       auto* readers = (FieldReader*)pool.alloc(sizeof(FieldReader)*numSegs, alignof(FieldReader));
       for (size_t i = 0; i < numSegs; i++) {
@@ -269,7 +286,16 @@ public:
       }
       FieldInfoMap map(4, pool.getAllocator());
       return solux::arenaCreate<Context>(
-        *arena, pool, topReader, std::span<FieldReader>(readers, numSegs), std::move(map));
+        *arena, pool, topReader, std::span<FieldReader>(readers, numSegs), std::move(map),
+        limits, warnings);
+    }
+
+    // code must have static storage duration.
+    void warn(std::string_view code, std::string_view message) {
+      if (warnings == nullptr) return;
+      char* copy = pool.alloc(message.size());
+      std::memcpy(copy, message.data(), message.size());
+      warnings->push_back({code, std::string_view(copy, message.size())});
     }
 
     // return number of segments
