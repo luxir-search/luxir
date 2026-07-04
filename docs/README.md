@@ -1,8 +1,11 @@
 # Solux Documentation
 
-- [guide/](guide/) - user documentation: schema, indexing, querying, vector
-  search. Written for someone with a running server and a client; no source
-  checkout assumed.
+New here? Start with the [Quickstart](guide/quickstart.md) - index and search
+with `curl` in a few commands.
+
+- [guide/](guide/) - user documentation: quickstart, schema, indexing,
+  querying, vector search. Written for someone with a running server and a
+  client; no source checkout assumed.
 - [design/](design/) - architecture, principles, and design decisions: the
   reference for how the engine works and why it works that way.
 - [dev/](dev/) - contributor documentation: building, testing, conventions.
