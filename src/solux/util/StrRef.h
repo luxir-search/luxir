@@ -166,6 +166,9 @@ public:
 
   // returns the number of bytes written to the target... either sz+1 or sz+2
   inline static uint32_t write(char *target, const void *data, uint32_t sz) noexcept {
+    // A longer value silently wraps the single length byte and corrupts whatever
+    // structure the term lands in; callers must enforce the limit first.
+    assert(sz <= MAX_LEN);
     target[0] = sz;
     memcpy(target + 1, data, (size_t) sz);
     return sz + 1;

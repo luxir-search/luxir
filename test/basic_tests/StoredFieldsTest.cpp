@@ -207,7 +207,9 @@ TEST_F(StoredFieldsTest, oversizeDoc) {
   RAMDir dir;
   auto schema = makeSchema();
   std::string big(40 * 1024, 'x');  // 40KB
-  for (size_t i = 0; i < big.size(); i++) big[i] = (char)('a' + (i % 26));
+  // Spaces keep individual tokens under the indexed-term length limit; the stored
+  // side (what this test exercises) still sees one 40KB value.
+  for (size_t i = 0; i < big.size(); i++) big[i] = (i % 100 == 99) ? ' ' : (char)('a' + (i % 26));
 
   {
     IndexWriter iw(dir, [&]() { return schema; });

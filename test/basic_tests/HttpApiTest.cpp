@@ -386,7 +386,7 @@ TEST_F(HttpApiTest, ndjsonStreamFlushesMultipleBatches) {
   for (int i = 0; i < kDocCount; i++) {
     body += R"({"id":"nb)";
     body += std::to_string(i);
-    body += R"(","title_w":"ndbatch","blob_s":")";
+    body += R"(","title_w":"ndbatch","blob_sc":")";
     body += payload;
     body += R"("})";
     body += '\n';
@@ -420,7 +420,7 @@ TEST_F(HttpApiTest, streamGroupCapsRetainedIdsAcrossBatches) {
   for (int i = 0; i < kDocCount; i++) {
     body += R"({"id":"cap)";
     body += std::to_string(i);
-    body += R"(","title_w":"captoken","blob_s":")";
+    body += R"(","title_w":"captoken","blob_sc":")";
     body += payload;
     body += R"("})";
     body += '\n';
@@ -461,7 +461,7 @@ TEST_F(HttpApiTest, ndjsonMalformedRecordIs400) {
 TEST_F(HttpApiTest, ndjsonDocLargerThanReadBuffer) {
   std::string big(200 * 1024, 'x');  // ~200 KiB > 64 KiB read buffer, < record cap
   std::string body =
-      R"({"id":"big1","title_w":"bigtoken","title_s":")" + big + R"("})" "\n"
+      R"({"id":"big1","title_w":"bigtoken","blob_sc":")" + big + R"("})" "\n"
       R"({"_end_":{"commit":{}}})" "\n";
 
   auto update = httpRequest(port(), http::verb::post, "/collections/main/update",
@@ -785,7 +785,7 @@ TEST_F(HttpApiTest, ndjsonDeferredInlineUpdateEnforcesRequestBodyCap) {
   std::string payload(1500, 'z');
   std::string body =
       R"({"id":"defer-pre","title_w":"defercap token"})" "\n"
-      R"({"_update_":{"docs":[{"id":"defer-big","title_w":"defercap token","blob_s":")" +
+      R"({"_update_":{"docs":[{"id":"defer-big","title_w":"defercap token","blob_sc":")" +
       payload + R"("}]}})" "\n";
 
   auto update = httpRequest(localServer.getPort(), http::verb::post, "/collections/main/update",
@@ -924,8 +924,8 @@ TEST_F(HttpApiTest, ndjsonAllOrNoneStreamOverCapIs400) {
   std::string payload(700, 'x');
   std::string body =
       R"({"_update_":{"all_or_none":true}})" "\n"
-      R"({"id":"cap-a","title_w":"capatomic","blob_s":")" + payload + R"("})" "\n"
-      R"({"id":"cap-b","title_w":"capatomic","blob_s":")" + payload + R"("})" "\n";
+      R"({"id":"cap-a","title_w":"capatomic","blob_sc":")" + payload + R"("})" "\n"
+      R"({"id":"cap-b","title_w":"capatomic","blob_sc":")" + payload + R"("})" "\n";
 
   auto update = httpRequest(localServer.getPort(), http::verb::post, "/collections/main/update",
                             std::move(body), "application/x-ndjson");
