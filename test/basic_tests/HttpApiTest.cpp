@@ -378,6 +378,30 @@ TEST_F(HttpApiTest, ndjsonStreamIndexesAndQueries) {
       << hreq.rawResponse();
 }
 
+// "found" is opt-in: it appears only when get_number is requested (an exact count
+// forgoes dynamic pruning).  A default query carries no count, and absence must be
+// omitted rather than rendered as found:0 (indistinguishable from zero matches).
+TEST_F(HttpApiTest, foundIsOptInWithGetNumber) {
+  helper.indexAll(std::array{
+    flatdoc("id", std::string("f1"), "title_w", std::string("foundtoken alpha")),
+    flatdoc("id", std::string("f2"), "title_w", std::string("foundtoken beta")),
+  }, UpdateMessage::COMMIT);
+
+  // Default request (no get_number): "found" omitted, docs still returned.
+  HttpReq noCount(port());
+  noCount.collection("main").matchQuery("title_w", "foundtoken").fields({"id"}).limit(10).execute();
+  ASSERT_EQ(200, noCount.status()) << noCount.rawResponse();
+  EXPECT_EQ(noCount.rawResponse().find(R"("found")"), std::string::npos) << noCount.rawResponse();
+  EXPECT_EQ((std::size_t)2, noCount.getDocs().size()) << noCount.rawResponse();
+
+  // With get_number: "found" present and accurate.
+  HttpReq withCount(port());
+  withCount.collection("main").matchQuery("title_w", "foundtoken").fields({"id"}).limit(10).withStats().execute();
+  ASSERT_EQ(200, withCount.status()) << withCount.rawResponse();
+  EXPECT_NE(withCount.rawResponse().find(R"("found")"), std::string::npos) << withCount.rawResponse();
+  EXPECT_EQ((int64_t)2, withCount.found()) << withCount.rawResponse();
+}
+
 TEST_F(HttpApiTest, ndjsonStreamFlushesMultipleBatches) {
   static constexpr int kDocCount = 180;
   std::string payload(20 * 1024, 'x');

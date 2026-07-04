@@ -169,9 +169,15 @@ std::string renderSearchResponseLine(const solux::api::SearchResponse& resp) {
     }
   }
   if (docs) {
-    out += R"("found":)";
-    appendInt(out, docs->matches.value_or(0));
-    out += R"(,"docs":)";
+    // "found" is opt-in: matches is set only when get_number was requested (an
+    // exact count forgoes dynamic pruning).  Omit the key when absent rather than
+    // rendering 0, so "not requested" is not confused with "zero matches".
+    if (docs->matches.has_value()) {
+      out += R"("found":)";
+      appendInt(out, *docs->matches);
+      out += ',';
+    }
+    out += R"("docs":)";
     appendDocs(out, *docs);
   } else {
     out += R"("docs":[])";

@@ -405,8 +405,8 @@ public:
   // shared streaming emitter (emitDocsResponse), which blocks until field
   // loading completes and sends multiple streaming responses (all but the
   // last).  The empty-index case (no segments -> no collector ever obtained)
-  // writes a matches=0 DocList into the request's lastResponse; submitBody
-  // then sends it.
+  // writes an empty DocList into the request's lastResponse (with matches=0 only
+  // when the count was requested); submitBody then sends it.
   void fillQueryTopNResponse(TopDocsReq::Calc& calc) {
     auto& qr = *this;
     auto* mergeableCollector = calc.collectorMerger.getData();
@@ -414,7 +414,9 @@ public:
     if (mergeableCollector == nullptr) {
       auto& searchResultProto = *calc.getTarget(nullptr);
       auto& docListProto = oneofMut<solux::api::DocList>(searchResultProto);
-      docListProto.matches = 0;
+      // matches is opt-in (see emitDocsResponse): only populate it when the
+      // count was requested, so an empty index matches the non-empty contract.
+      if (qr.topDocsProto.get_number) docListProto.matches = 0;
       return;
     }
 

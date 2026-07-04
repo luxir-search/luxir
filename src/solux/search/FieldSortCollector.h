@@ -54,7 +54,9 @@ public:
     : topCount(topCount),
       topDocs(topCount),
       comparator(std::move(comp)) {
-    assert(topCount > 0);
+    // topCount == 0 is valid ("count/aggregate only, no docs", e.g. limit 0): the heap is
+    // empty and collect() only counts.  Negative counts are a bug in the caller.
+    assert(topCount >= 0);
     assert(comparator != nullptr);
 
     // Initialize all SortDoc objects to ensure no garbage values
@@ -75,6 +77,12 @@ public:
 
   void collect(int32_t segment, int32_t docid, float score) {
     hitCount++;
+
+    // topCount == 0: keep no docs, just count hits (the heap has zero capacity, so the
+    // full-heap branch below would read pq->top() out of bounds).
+    if (topCount == 0) {
+      return;
+    }
 
     segdoc sdoc(segment, docid);
 

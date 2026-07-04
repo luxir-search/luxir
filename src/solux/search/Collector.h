@@ -75,11 +75,20 @@ class TopDocsCollector {
   DirectPQ<ScoreDoc, decltype(scoreAndDocComp)> pq;
 
   TopDocsCollector(int64_t topCount) : topCount(topCount), topDocs(topCount), pq(topDocs) {
-    assert(topCount > 0);
+    // topCount == 0 is valid ("count/aggregate only, no docs", e.g. limit 0): the heap is
+    // empty and collect() only counts.  Negative counts are a bug in the caller.
+    assert(topCount >= 0);
   }
 
   void collect(int32_t segment, int32_t docid, float score) {
     hitCount++;
+
+    // topCount == 0: keep no docs, just count hits (the heap has zero capacity, so any
+    // insert/top() would be out of bounds).  hitCount above still yields an accurate
+    // total, so get_number and sub-op domains are unaffected.
+    if (topCount == 0) {
+      return;
+    }
 
     // Admit anything that can match OR beat the k-th best score (>=, not >): a doc whose
     // score ties the k-th score is still competitive if its (seg, docid) sorts ahead of the

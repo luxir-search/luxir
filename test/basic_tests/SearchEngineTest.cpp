@@ -56,6 +56,61 @@ TEST_F(SearchEngineTest, avgOpsEmptyIndexEmitNan) {
   EXPECT_TRUE(std::isnan(std::get<double>(docs->ops.at("nested_avg")->kind)));
 }
 
+// limit 0 ("count/aggregate only, no docs") must return an accurate count and any
+// sub-op results without collecting or ranking documents - and must never crash the
+// top-K collector (which used to assert topCount > 0 / build a zero-capacity heap).
+TEST_F(SearchEngineTest, limitZeroCountsWithoutDocs) {
+  CollectionHelper helper;
+  helper.clear();
+  helper.index(flatdoc("foo_w", "brown cow", "foo_i", 17, "color_s", "red"), UpdateMessage::NO_COMMIT);
+  helper.index(flatdoc("foo_w", "charlie brown", "foo_i", 23, "color_s", "blue"), UpdateMessage::NO_COMMIT);
+  helper.index(flatdoc("foo_w", "brown", "foo_i", 5, "color_s", "brown"), UpdateMessage::COMMIT);
+
+  // Score path: match query, limit 0 + get_number.  Accurate count, zero docs.
+  {
+    auto req = localReq(soluxNode->getSearchEngine());
+    req->collection("main");
+    req->topDocs("q").matchQuery("foo_w", "brown").getNumber().limit(0);
+    req->execute();
+
+    ASSERT_OK(req);
+    EXPECT_EQ(3, req->getMatchCount("q"));
+    EXPECT_TRUE(req->getDocs("q").empty());
+  }
+
+  // A facet sub-op under a limit-0 topDocs still sees the full matching domain.
+  {
+    auto req = localReq(soluxNode->getSearchEngine());
+    req->collection("main");
+    auto& q = req->topDocs("q").matchQuery("foo_w", "brown").getNumber().limit(0);
+    q.facet("colors", "color_s").limit(-1);
+    req->execute();
+
+    ASSERT_OK(req);
+    EXPECT_EQ(3, req->getMatchCount("q"));
+    EXPECT_TRUE(req->getDocs("q").empty());
+
+    const auto& docs = *req->docList("q");
+    const auto& facet = std::get<solux::api::FacetResult>(docs.ops.at("colors")->kind);
+    int64_t facetTotal = 0;
+    for (auto c : facet.counts) facetTotal += c;
+    EXPECT_EQ(3, facetTotal);
+  }
+
+  // Field-sort path: sort by a column, limit 0 + get_number.  Accurate count, zero docs.
+  {
+    auto req = localReq(soluxNode->getSearchEngine());
+    req->collection("main");
+    auto& q = req->topDocs("q").matchQuery("foo_w", "brown").getNumber().limit(0);
+    qb::sort(q, "foo_i", qb::ASC);
+    req->execute();
+
+    ASSERT_OK(req);
+    EXPECT_EQ(3, req->getMatchCount("q"));
+    EXPECT_TRUE(req->getDocs("q").empty());
+  }
+}
+
 TEST_F(SearchEngineTest, basic) {
   bool para = true;
 
