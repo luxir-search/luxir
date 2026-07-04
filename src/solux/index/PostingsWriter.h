@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cstdint>
 #include <cstring>
 #include <deque>
@@ -403,8 +404,12 @@ class TextWriter {
 
   // needed to build each block
   std::vector<TermRef> termList;  // list of terms in the current term block
-  std::vector<uint32_t> docFileSize;         // size of the data in the docs file for this term (TODO: can we guarantee that this isn't bigger than 2B or 4B?)
-  std::vector<int32_t> pulsed; // if docFileSize==0, then the term has a single doc/pos that is pulsed, and those values are the next in this list.
+  std::vector<uint64_t> termDocsEnd;  // cumulative trailer-free docs-region end offsets
+  std::vector<uint32_t> termDocFreqs;
+  std::vector<uint64_t> termTtfCodes;
+  std::vector<uint64_t> termPosOffsets;
+  std::vector<uint32_t> pulsed; // pulsed doc/pos values for terms with a single occurrence
+  uint32_t termPulsedMask = 0;
 
   // needed for each term
   std::vector<int32_t> docs; // list of documents containing a term
@@ -499,6 +504,15 @@ private:  // some internal utility methods... not for use by indexers
     }
   }
 
+  static uint32_t commonPrefixLen(const char* a, uint32_t alen, const char* b, uint32_t blen) {
+    uint32_t len = std::min(alen, blen);
+    uint32_t prefixLen = 0;
+    while (prefixLen < len && a[prefixLen] == b[prefixLen]) {
+      prefixLen++;
+    }
+    return prefixLen;
+  }
+
   uint32_t normForDoc(int32_t docid) const {
     return norms.normForDoc(docid);
   }
@@ -571,6 +585,62 @@ private:  // some internal utility methods... not for use by indexers
   void appendBytes(std::vector<char>& out, const void* data, size_t len) {
     const char* src = (const char*) data;
     out.insert(out.end(), src, src + len);
+  }
+
+  void appendVlongRun(std::vector<char>& out, const std::vector<uint64_t>& values) {
+    for (uint64_t val : values) {
+      appendVlong(out, val);
+    }
+  }
+
+  void appendVlongDeltaRun(std::vector<char>& out, const std::vector<uint64_t>& values) {
+    uint64_t prev = 0;
+    for (uint64_t val : values) {
+      assert(val >= prev);
+      appendVlong(out, val - prev);
+      prev = val;
+    }
+  }
+
+  void appendSVBRun(std::vector<char>& out, const std::vector<uint32_t>& values) {
+    if (values.empty()) {
+      return;
+    }
+    uint32_t count = (uint32_t) values.size();
+    uint32_t keyBytes = svbKeyBytes(count);
+    std::vector<uint8_t> keys(keyBytes);
+    std::vector<uint8_t> data((size_t) count * sizeof(uint32_t));
+    uint8_t* dataEnd = svb_encode_scalar(values.data(), keys.data(), data.data(), count);
+    appendBytes(out, keys.data(), keys.size());
+    appendBytes(out, data.data(), (size_t) (dataEnd - data.data()));
+  }
+
+  void writeMetadataRunLen(size_t byteLen) {
+    assert(byteLen <= (size_t) (UINT32_MAX >> 1));
+    termOutput.writeVint(((uint32_t) byteLen) << 1u);
+  }
+
+  static uint32_t termMaskForCount(int nTerms) {
+    assert(nTerms > 0 && nTerms <= Postings::TERMS_BLOCK_SIZE);
+    return nTerms == 32 ? UINT32_MAX : ((1u << (uint32_t) nTerms) - 1u);
+  }
+
+  static bool allUInt64Equal(const std::vector<uint64_t>& values, uint64_t target) {
+    for (uint64_t value : values) {
+      if (value != target) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  static bool allUInt32Equal(const std::vector<uint32_t>& values, uint32_t target) {
+    for (uint32_t value : values) {
+      if (value != target) {
+        return false;
+      }
+    }
+    return true;
   }
 
   void addTrieSeparatorForCurrentBlock(uint32_t blockOrd) {
@@ -808,14 +878,94 @@ public:
   void _startTermBlock(bool endingField) {
     unused(endingField);
     termList.resize(0);
-    docFileSize.resize(0);
+    termDocsEnd.resize(0);
+    termDocFreqs.resize(0);
+    termTtfCodes.resize(0);
+    termPosOffsets.resize(0);
     pulsed.resize(0);
+    termPulsedMask = 0;
     locOfPositionsForTermBlock = posOutput.size();
     locOfDocsForTermBlock = docOutput.size();
 
     termBlockOffsets.push_back( termOutput.size() - termsLoc);
   }
 
+  // Term block on-disk format.  This writer is the authority; see
+  // TermsEnum::readTermBlock/readNextTermInBlock for the matching reader.
+  //
+  // A field's terms stream contains a sequence of fixed-size term blocks
+  // (except the last block).  Each block is laid out as:
+  //
+  //   header:
+  //     [firstTerm: PackedTerm]
+  //       The first term is stored whole.  Terms 1..n-1 are front-coded below.
+  //     [docsLocDelta: vlong]
+  //       Offset of this block's docs region from the field docsLoc.
+  //     [posLocDelta: vlong]
+  //       Offset of this block's positions region from the field posLoc.
+  //     [blockPrefixLen: u8]
+  //       lcp(first term, last term).  These bytes are factored out of every
+  //       in-block suffix and restored from the previous materialized term.
+  //     [pulsedMask: u32 little-endian]
+  //       Bit i is set when term i is pulsed, meaning its single doc, and
+  //       optional position, are stored in the pulsed metadata run instead of
+  //       occupying bytes in the docs stream.
+  //     [suffixBytesTotal: vint]
+  //       Total bytes in the dense suffix blob.  This lets the reader find the
+  //       metadata section on block entry without summing suffix lengths.
+  //
+  //   term scan section:
+  //     [hashes: n x u8]
+  //       One low byte of XXH3 per term, used to reject most seekExact misses
+  //       before materializing term bytes.
+  //     [prefixLen: (n-1) x raw u8]
+  //     [suffixLen: (n-1) x raw u8]
+  //       For term i > 0, prefixLen is measured against the previous term
+  //       after removing blockPrefixLen from both terms.  suffixLen is the
+  //       remaining byte count.  The first term is the header firstTerm.
+  //     [suffix blob: suffixBytesTotal bytes]
+  //       Dense concatenation of suffix bytes for terms 1..n-1.
+  //
+  //   metadata section:
+  //     Each sub-run begins with a vint code: (byteLen << 1) | encodingFlag.
+  //     The normal v1 encoding writes encodingFlag 0 and a nonzero byteLen.
+  //     Code 0 (byteLen 0, flag 0) is claimed as an all-default run marker;
+  //     otherwise the low flag bit remains reserved for a future alternate
+  //     encoding.  The byte-length vints are written first for every run,
+  //     followed by the non-default run bytes in the same order:
+  //
+  //     [docsEnd lengths/code][df lengths/code][ttfCode lengths/code?]
+  //     [posOff lengths/code?][pulsed lengths/code]
+  //     [docsEnd: cumulative vlong run]
+  //       Trailer-free slice ends within this block's docs region.  For term i,
+  //       docsSize_i = docsEnd_i - docsEnd_(i-1), with docsEnd_(-1) = 0.
+  //       Pulsed terms repeat the previous end, so their docsSize is 0.
+  //       Default: every slice is zero-size, which is legal only when every
+  //       term in the block is pulsed.
+  //     [df: StreamVByte run]
+  //       docFreq for every term in the block.
+  //       Default: every value is 1.
+  //     [ttfCode: vlong run, only when the field indexes freqs]
+  //       totalTermFreq - docFreq for every term.
+  //       Default: every value is 0.
+  //     [posOff: delta vlong run, only when the field indexes positions]
+  //       Position-stream start offsets within this block's positions region.
+  //       Pulsed terms repeat the running value; readers ignore the offset for
+  //       pulsed terms.
+  //       Default: every delta is 0, so every offset is 0.
+  //     [pulsed: StreamVByte run]
+  //       Values for pulsed terms only, in term order.  Each pulsed term stores
+  //       doc, and also pos when positions are indexed.  The value index for
+  //       term i is popcount(pulsedMask below bit i), scaled by the per-term
+  //       value count.
+  //
+  // The layout is column-stride on purpose.  Term scans, seekCeil, fuzzy
+  // enumeration, and most miss paths need only hashes, lengths, and suffix
+  // bytes.  Term stats decode as tier 1 (df/ttfCode), and postings-open
+  // metadata decodes as tier 2 (docsEnd/posOff/pulsed), both lazily in
+  // TermsEnum.  Per-doc tf values are not stored here: they are scoring data
+  // block-encoded alongside doc ids in the docs stream and remain part of the
+  // postings payload.
   void flushTerms(bool endingField) {
     if (termList.empty()) {
       termBlockOffsets.pop_back();  // last block has no terms in it.
@@ -827,20 +977,61 @@ public:
 
     numTerms += termList.size();
 
-    // TODO: find common prefix (i.e. min_prefix_len) for all terms in block and strip it off (same as common prefix of first and last)
-    // important for some things that share long prefixes, like URLs for example.
-    // TODO: store min term size (or minimum suffix length) and then code the suffix lengths as additional to that? Would help indexing things like text uuids.
-    // Store max term size to help optimize readers?
+    int nTerms = termList.size();
+    assert((int)termDocsEnd.size() == nTerms);
+    assert((int)termDocFreqs.size() == nTerms);
+    assert((int)termTtfCodes.size() == nTerms);
+    assert(!hasPositions || (int)termPosOffsets.size() == nTerms);
 
     TermRef reference = termList[0];
-    auto [refdata, reflen] = reference.unpack();
+    auto [firstData, firstLen] = reference.unpack();
+    auto [lastData, lastLen] = termList.back().unpack();
+    uint32_t blockPrefixLen = commonPrefixLen(firstData, firstLen, lastData, lastLen);
+    assert(blockPrefixLen <= UINT8_MAX);
 
-    // Write the terms block header.
+    std::vector<char> prefixLens;
+    std::vector<char> suffixLens;
+    std::vector<char> suffixBlob;
+    prefixLens.reserve((size_t) std::max(0, nTerms - 1));
+    suffixLens.reserve((size_t) std::max(0, nTerms - 1));
+    suffixBlob.reserve((size_t) nTerms * 8);
+
+    auto [refdata, reflen] = reference.unpack();
+    for (int i=1; i<nTerms; i++) {
+      auto term = termList[i];
+      auto [tdata, tlen] = term.unpack();
+      assert(blockPrefixLen <= reflen);
+      assert(blockPrefixLen <= tlen);
+      assert(memcmp(firstData, tdata, blockPrefixLen) == 0);
+
+      const char* refSuffix = refdata + blockPrefixLen;
+      const char* termSuffix = tdata + blockPrefixLen;
+      uint32_t refSuffixLen = reflen - blockPrefixLen;
+      uint32_t termSuffixLen = tlen - blockPrefixLen;
+      uint32_t prefixLen = commonPrefixLen(refSuffix, refSuffixLen, termSuffix, termSuffixLen);
+      uint32_t suffixLen = termSuffixLen - prefixLen;
+      assert(suffixLen > 0);
+      assert(prefixLen <= UINT8_MAX);
+      assert(suffixLen <= UINT8_MAX);
+      assert(prefixLen == refSuffixLen || refSuffix[prefixLen] != termSuffix[prefixLen]);
+
+      prefixLens.push_back((char) prefixLen);
+      suffixLens.push_back((char) suffixLen);
+      appendBytes(suffixBlob, termSuffix + prefixLen, suffixLen);
+
+      refdata = tdata;
+      reflen = tlen;
+    }
+
+    // Header: first term, postings block offsets, block-prefix length,
+    // pulsed mask, and total suffix blob bytes.  The total lets the reader
+    // locate metadata lazily without summing suffixLens on miss-only visits.
     termOutput.writePackedTerm(reference);
     termOutput.writeVlong(locOfDocsForTermBlock - docsLoc);
     termOutput.writeVlong(locOfPositionsForTermBlock - posLoc);
-
-    int nTerms = termList.size();
+    termOutput.write((char) blockPrefixLen);
+    termOutput.write(&termPulsedMask, sizeof(termPulsedMask));
+    termOutput.writeVint((uint32_t) suffixBlob.size());
 
     // now write hashes of the terms
     for (int i=0; i<nTerms; i++) {
@@ -848,80 +1039,59 @@ public:
       termOutput.write((char)XXH3_64bits(term.data(), term.size()));
     }
 
-    // now write the block:
-    int32_t pulsedIdx = 0;  // index of next pulsed data
-    for (int i=0; i<nTerms; i++) {
-      auto term = termList[i];
+    termOutput.write(prefixLens.data(), prefixLens.size());
+    termOutput.write(suffixLens.data(), suffixLens.size());
+    termOutput.write(suffixBlob.data(), suffixBlob.size());
 
-      if (i > 0) {
-        // If not the first term, find common prefix with previous term
-        auto[tdata, tlen] = term.unpack();
-        int minsize = std::min(tlen, reflen);
-        int prefixLen = 0;
-        // Is there a compiler intrinsic for this?  Or a SIMD version?  Seems like a SIMD subtract followed by find-first-nonzero would do it.
-        // Even w/o simd, if registers are in big endian (see movbe instr), then subtract, find high bit, divide to convert to byte.
-        while (prefixLen < minsize && tdata[prefixLen] == refdata[prefixLen]) {
-          prefixLen++;
-        }
-        // No longer needed. PackedTerm is now limited to 0xff length
-        // auto prefixLen = std::min(prefixLen,0x0ff);  // support a maximum prefix sharing of 255 to simplify coding.
-
-        // encode shared prefix length + suffix length in a single byte.
-        // 3 bits of prefix length starting at 0 (7 means this is followed by another byte encoding the prefix length)
-        // ORIG FORMAT to support lengths to 32K: 5 bits of suffix length starting at 1 (32 means this is followed by
-        // another vInt encoding the suffix length (and add 32) we start at 1 for the suffix since that is the min
-        // suffix length (otherwise it would be the same term))
-        // NEW: term lengths are limited to one byte, so 32 means just read the second byte for the exact suffix len.
-        auto suffixLen = tlen - prefixLen;
-        auto prefCode = (prefixLen < 7) ? (prefixLen << 5u) : (7u << 5u);
-        auto suffCode = (suffixLen < 32) ? (suffixLen - 1) : (32 - 1);
-        termOutput.write((char) (prefCode | suffCode));
-        if (prefixLen >= 7) {
-          termOutput.write((char) prefixLen);
-        }
-        if (suffixLen >= 32) {
-          // termOutput.writeVint(suffixLen - 32);
-          termOutput.write((char)suffixLen);
-        }
-
-        // now write the suffix of the current term
-        termOutput.write(tdata + prefixLen, suffixLen);
-
-        // update what we are prefix encoding relative to
-        refdata = tdata;
-        reflen = tlen;
-      }
-
-      // Write the term metadata that belongs in the term dictionary.
-      // We need pointer into the docs file.  Currently coded as the size in the docs file that *this* term takes up.  Hence
-      // One needs the doc pointer for the previous term to know the start of the docs block for this term.
-      // That's not good if we want to add skipping to the terms list... but maybe that's OK since we always access
-      // a doc block from its tail anyway.  We could save a little space (smaller doc skipping index) if we didn't need
-      // to encode the start of the block there though.
-
-      // This is also where we "pulse" (directly include) a term that only has a single doc and position.
-      // A doc block will have a minimum size... hence we cloud use (FUTURE) a small docBlockSize to encode the size of pulsed data.
-      auto docsSize = docFileSize[i];
-      if (docsSize == 0) {
-        auto doc = pulsed[pulsedIdx++];
-        // TODO: optimize this wasteful encoding.
-        // We could add enough to the minimum size of a docs block so that we could use the low 4 bits as a group
-        // varint encoding.  This would also speed up skipping over a pulsed term.  We could also put pulsed terms
-        // in a separate block... but we really want primary key lookup to be fast!
-        // We could also find something else to encode and always group encode 2 integers (like term freq)
-        // We could make the term freq or doc even if it's real or odd if it's a pulsed position.
-        termOutput.write(0);
-        termOutput.writeVint(doc);  // for now, just write vints (slower to skip though)
-        if (hasPositions) {
-          auto pos = pulsed[pulsedIdx++];
-          termOutput.writeVint(pos);
-        }
-      } else {
-        termOutput.writeVint(docsSize);
-      }
+    std::vector<char> docsEndRun;
+    std::vector<char> dfRun;
+    std::vector<char> ttfRun;
+    std::vector<char> posOffRun;
+    std::vector<char> pulsedRun;
+    appendVlongRun(docsEndRun, termDocsEnd);
+    appendSVBRun(dfRun, termDocFreqs);
+    if (hasFreqs) {
+      appendVlongRun(ttfRun, termTtfCodes);
     }
+    if (hasPositions) {
+      appendVlongDeltaRun(posOffRun, termPosOffsets);
+    }
+    appendSVBRun(pulsedRun, pulsed);
 
-    assert(pulsedIdx == (int)pulsed.size());  // we should have read all pulsed docs/pos;
+    bool docsEndDefault = allUInt64Equal(termDocsEnd, 0);
+    if (docsEndDefault) {
+      assert(termPulsedMask == termMaskForCount(nTerms));
+    }
+    bool dfDefault = allUInt32Equal(termDocFreqs, 1);
+    bool ttfDefault = allUInt64Equal(termTtfCodes, 0);
+    bool posOffDefault = hasPositions && allUInt64Equal(termPosOffsets, 0);
+
+    writeMetadataRunLen(docsEndDefault ? 0 : docsEndRun.size());
+    writeMetadataRunLen(dfDefault ? 0 : dfRun.size());
+    if (hasFreqs) {
+      writeMetadataRunLen(ttfDefault ? 0 : ttfRun.size());
+    }
+    if (hasPositions) {
+      writeMetadataRunLen(posOffDefault ? 0 : posOffRun.size());
+    }
+    writeMetadataRunLen(pulsedRun.size());
+
+    if (!docsEndDefault) {
+      termOutput.write(docsEndRun.data(), docsEndRun.size());
+    }
+    if (!dfDefault) {
+      termOutput.write(dfRun.data(), dfRun.size());
+    }
+    if (hasFreqs && !ttfDefault) {
+      termOutput.write(ttfRun.data(), ttfRun.size());
+    }
+    if (hasPositions && !posOffDefault) {
+      termOutput.write(posOffRun.data(), posOffRun.size());
+    }
+    termOutput.write(pulsedRun.data(), pulsedRun.size());
+
+    uint32_t pulsedTerms = std::popcount(termPulsedMask);
+    assert(pulsed.size() == (size_t)pulsedTerms * (hasPositions ? 2u : 1u));
     rememberLastTermOfCurrentBlock();
 
     if (!endingField) {
@@ -973,12 +1143,20 @@ public:
     if (totalTermFreq == 1) {
       assert(getDocFileSize()==0 && docs.size()==1 && tfreqs.size()==1);
       assert(posdeltas.size() == (hasPositions ? 1u : 0u));
+      int32_t blockTermOrd = (int32_t) termList.size() - 1;
+      assert(blockTermOrd >= 0 && blockTermOrd < Postings::TERMS_BLOCK_SIZE);
+      termPulsedMask |= 1u << (uint32_t) blockTermOrd;
       sumDocFreq += 1;
-      docFileSize.push_back(0);
-      // the doc (+ position, if indexed) will be remembered to be included directly in the term dictionary (i.e. pulsing)
-      pulsed.push_back(docs[0]);
+      termDocFreqs.push_back(1);
+      termTtfCodes.push_back(0);
+      termDocsEnd.push_back((uint64_t) (docOutput.size() - locOfDocsForTermBlock));
       if (hasPositions) {
-        pulsed.push_back(posdeltas.back());
+        termPosOffsets.push_back((uint64_t) (posOutput.size() - locOfPositionsForTermBlock));
+      }
+      // the doc (+ position, if indexed) will be remembered to be included directly in the term dictionary (i.e. pulsing)
+      pulsed.push_back((uint32_t) docs[0]);
+      if (hasPositions) {
+        pulsed.push_back((uint32_t) posdeltas.back());
         posdeltas.pop_back();
       }
 
@@ -1046,31 +1224,24 @@ public:
       flushL1Group();
 
 
-      // The reader can find the start or end of a doc block from the terms dictionary (since blocks are all adjacent)
-      // So we can store info at the end of the block as well (but need to encode backwards, or have a single byte metadata
-      // length at the end to enable backing up.)
-      auto metadataStart = docOutput.size();
-
       sumDocFreq += docfreq;  // docfreq computed at the top of endTerm
 
-      // Per-term metadata is level-dependent: docfreq always; ttfCode (ttf-docfreq)
-      // only when freqs are indexed; posOffset only when positions are indexed.
-      // TODO: encode as group, and can replace the metadataSize byte with the control byte.
-      docOutput.writeVint(docfreq);
+      uint64_t ttfCode = 0;
       if (hasFreqs) {
-        auto ttfCode = totalTermFreq - docfreq;
-        docOutput.writeVlong(ttfCode);
+        ttfCode = (uint64_t) (totalTermFreq - docfreq);
       }
+      uint64_t posOffset = 0;
       if (hasPositions) {
         // offset from start of positions in term dict block
-        auto posOffset = locOfPositionsForTerm - locOfPositionsForTermBlock;
-        docOutput.writeVlong(posOffset);
+        posOffset = (uint64_t) (locOfPositionsForTerm - locOfPositionsForTermBlock);
       }
 
-      auto metadataSize = docOutput.size() - metadataStart;
-      docOutput.write((char)metadataSize);
-
-      docFileSize.push_back(getDocFileSize());
+      termDocFreqs.push_back((uint32_t) docfreq);
+      termTtfCodes.push_back(ttfCode);
+      if (hasPositions) {
+        termPosOffsets.push_back(posOffset);
+      }
+      termDocsEnd.push_back((uint64_t) (docOutput.size() - locOfDocsForTermBlock));
     }
 
     if (termList.size() == Postings::TERMS_BLOCK_SIZE) {
@@ -1094,13 +1265,18 @@ public:
     fieldInfo->termBlockIndexLoc = seg_location(termOutput.streamNumber, termOutput.size());
     // one way this assert can fail is if numTerms==0, but I think so far this always represents a bug elsewhere.
     assert((int)termBlockOffsets.size() == ((numTerms-1) / Postings::TERMS_BLOCK_SIZE) + 1);
-    termOutput.write(&(termBlockOffsets[0]), termBlockOffsets.size() * sizeof(termBlockOffsets[0]) );
     // Append the trie after the fixed block-offset array.  trieRootOff is
     // relative to trieLoc, while child links inside the trie are backward
     // deltas within this appended byte region.
-    fieldInfo->trieLoc = seg_location(termOutput.streamNumber, termOutput.size());
     fieldInfo->trieRootOff = (int64_t)trieBuilder.finish();
     const std::vector<char>& trieBytes = trieBuilder.bytes();
+    // Dict metadata SVB runs are embedded in the terms stream.  The last run may
+    // be read with the AVX decoder's tail overread, so the block-offset table
+    // plus trie bytes that follow the final block must provide the same slack as
+    // pure postings files.
+    assert(termBlockOffsets.size() * sizeof(termBlockOffsets[0]) + trieBytes.size() >= SVB_OVERREAD_PAD);
+    termOutput.write(&(termBlockOffsets[0]), termBlockOffsets.size() * sizeof(termBlockOffsets[0]) );
+    fieldInfo->trieLoc = seg_location(termOutput.streamNumber, termOutput.size());
     termOutput.write(trieBytes.data(), trieBytes.size());
 
     fieldInfo->termsLoc = seg_location(termOutput.streamNumber, termsLoc);

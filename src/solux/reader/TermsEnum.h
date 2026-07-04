@@ -1,8 +1,15 @@
 #pragma once
 
+#include "solux/codec/StreamVByte.h"
 #include "FieldReader.h"
 #include "Postings.h"
 #include "TrieReader.h"
+
+#include <algorithm>
+#include <array>
+#include <bit>
+#include <cstdint>
+#include <cstring>
 
 namespace solux {
 class TermsEnum {
@@ -16,9 +23,6 @@ class TermsEnum {
 
   PackedTerm currTerm;
   int32_t ordInBlock = -1; // the term number local to the current block
-  int32_t docsSize;
-  int32_t pulsedDoc;
-  int32_t pulsedPos;
 
   // block-level information
 
@@ -28,8 +32,38 @@ class TermsEnum {
   int32_t maxOrdInBlock = -1;
   int64_t locOfDocsForTermBlock;  // absolute location... field offset + block offset
   int64_t locOfPositionsForTermBlock;  // absolute location... field offset + block offset
-  int64_t cumulativeDocsSize;
   const char* termHashes;
+  uint8_t blockPrefixLen = 0;
+  uint32_t pulsedMask = 0;
+
+  const char* prefixLens = nullptr;
+  const char* suffixLens = nullptr;
+  const char* suffixBlob = nullptr;
+  const char* metadataRuns = nullptr;
+  const char* blockEnd = nullptr;
+  uint32_t suffixBytesTotal = 0;
+  std::array<uint32_t, Postings::TERMS_BLOCK_SIZE> suffixStarts{};
+
+  const char* docsEndRun = nullptr;
+  const char* dfRun = nullptr;
+  const char* ttfCodeRun = nullptr;
+  const char* posOffRun = nullptr;
+  const char* pulsedRun = nullptr;
+  uint32_t docsEndRunLen = 0;
+  uint32_t dfRunLen = 0;
+  uint32_t ttfCodeRunLen = 0;
+  uint32_t posOffRunLen = 0;
+  uint32_t pulsedRunLen = 0;
+
+  std::array<uint64_t, Postings::TERMS_BLOCK_SIZE> docsEnds{};
+  std::array<uint32_t, Postings::TERMS_BLOCK_SIZE> docFreqs{};
+  std::array<uint64_t, Postings::TERMS_BLOCK_SIZE> ttfCodes{};
+  std::array<uint64_t, Postings::TERMS_BLOCK_SIZE> posOffsets{};
+  std::array<uint32_t, Postings::TERMS_BLOCK_SIZE * 2> pulsedValues{};
+  bool statsDecoded = false;
+  bool postingsDecoded = false;
+  bool suffixStartsDecoded = false;
+  bool metadataRunsParsed = false;
 
   // term index level
   const int64_t* termBlockOffsets;
@@ -85,33 +119,262 @@ public:
     return currTerm;
   }
 
-protected:
-  // read the data that comes after each term
-  void readTermMetadata() {
-    // see PostingsWriter.flushTerms
-    docsSize = termsIS.readVint();
-    cumulativeDocsSize += docsSize;
-    if (docsSize == 0) {
-      pulsedDoc = termsIS.readVint();
-      // the pulsed position is only present when the field indexes positions
-      if (FieldType::hasPositions(fieldInfo.flags)) {
-        pulsedPos = termsIS.readVint();
-      }
-    }
+  int32_t docFreq() {
+    assert(ordInBlock >= 0);
+    decodeStats();
+    return (int32_t) docFreqs[(size_t) ordInBlock];
   }
 
-  // seeks to termBlockIndex and reads the block metadata + first term
+  int64_t totalTermFreq() {
+    assert(ordInBlock >= 0);
+    decodeStats();
+    uint64_t ttf = docFreqs[(size_t) ordInBlock];
+    if (FieldType::hasFreqs(fieldInfo.flags)) {
+      ttf += ttfCodes[(size_t) ordInBlock];
+    }
+    assert(ttf <= INT64_MAX);
+    return (int64_t) ttf;
+  }
+
+protected:
+  uint32_t readMetadataRunLen(const char*& p, const char* end) {
+    uint32_t code = InputStream::readVint(p, end);
+    assert((code & 1u) == 0);
+    return code >> 1u;
+  }
+
+  uint32_t blockTermCount() const {
+    return (uint32_t) maxOrdInBlock + 1;
+  }
+
+  uint32_t validPulsedMask() const {
+    uint32_t count = blockTermCount();
+    return count == 32 ? UINT32_MAX : ((1u << count) - 1);
+  }
+
+  void decodeSuffixStarts() {
+    if (suffixStartsDecoded) {
+      return;
+    }
+    uint32_t suffixBytes = 0;
+    for (int32_t i = 0; i < maxOrdInBlock; i++) {
+      suffixStarts[(size_t) i] = suffixBytes;
+      suffixBytes += (uint8_t) suffixLens[i];
+    }
+    assert(suffixBytes == suffixBytesTotal);
+    suffixStartsDecoded = true;
+  }
+
+  void parseMetadataRuns() {
+    if (metadataRunsParsed) {
+      return;
+    }
+    // Metadata run lengths are parsed only when a stats or postings accessor
+    // asks for them.  This keeps block entry and pure term scans on the
+    // hashes/lengths/suffix path.  See PostingsWriter.flushTerms for the
+    // byte-length code and run order.  A zero byte length marks an all-default
+    // run for docsEnd/df/ttfCode/posOff; pulsedRun still uses zero length only
+    // for the existing empty-payload case.
+    const char* p = metadataRuns;
+    docsEndRunLen = readMetadataRunLen(p, blockEnd);
+    dfRunLen = readMetadataRunLen(p, blockEnd);
+    ttfCodeRunLen = FieldType::hasFreqs(fieldInfo.flags) ? readMetadataRunLen(p, blockEnd) : 0;
+    posOffRunLen = FieldType::hasPositions(fieldInfo.flags) ? readMetadataRunLen(p, blockEnd) : 0;
+    pulsedRunLen = readMetadataRunLen(p, blockEnd);
+
+    docsEndRun = p;
+    p += docsEndRunLen;
+    assert(p <= blockEnd);
+    dfRun = p;
+    p += dfRunLen;
+    assert(p <= blockEnd);
+    if (FieldType::hasFreqs(fieldInfo.flags)) {
+      ttfCodeRun = p;
+      p += ttfCodeRunLen;
+      assert(p <= blockEnd);
+    } else {
+      ttfCodeRun = nullptr;
+    }
+    if (FieldType::hasPositions(fieldInfo.flags)) {
+      posOffRun = p;
+      p += posOffRunLen;
+      assert(p <= blockEnd);
+    } else {
+      posOffRun = nullptr;
+    }
+    pulsedRun = p;
+    p += pulsedRunLen;
+    assert(p <= blockEnd);
+    metadataRunsParsed = true;
+  }
+
+  void decodeSVBRun(const char* run, uint32_t runLen, uint32_t* out, uint32_t count) {
+    if (count == 0) {
+      assert(runLen == 0);
+      return;
+    }
+    uint32_t keyBytes = svbKeyBytes(count);
+    assert(runLen >= keyBytes);
+    uint8_t* dataEnd = svb_decode_avx_simple(out, (uint8_t*) run, (uint8_t*) run + keyBytes, count);
+    assert(dataEnd == (uint8_t*) run + runLen);
+  }
+
+  void decodeStats() {
+    if (statsDecoded) {
+      return;
+    }
+    // Tier 1 metadata: term statistics only.  This decodes df and, for fields
+    // with freqs, ttfCode.  It deliberately does not touch docsEnd, posOff, or
+    // pulsed values, so stats-only callers do not pay to open postings.
+    parseMetadataRuns();
+    uint32_t n = blockTermCount();
+    if (dfRunLen == 0) {
+      std::fill_n(docFreqs.begin(), n, 1);
+    } else {
+      decodeSVBRun(dfRun, dfRunLen, docFreqs.data(), n);
+    }
+    if (FieldType::hasFreqs(fieldInfo.flags)) {
+      if (ttfCodeRunLen == 0) {
+        std::fill_n(ttfCodes.begin(), n, 0);
+      } else {
+        const char* p = ttfCodeRun;
+        const char* end = ttfCodeRun + ttfCodeRunLen;
+        for (uint32_t i = 0; i < n; i++) {
+          ttfCodes[i] = InputStream::readVlong(p, end);
+        }
+        assert(p == end);
+      }
+    }
+    statsDecoded = true;
+  }
+
+  void decodePostings() {
+    if (postingsDecoded) {
+      return;
+    }
+    // Tier 2 metadata: data needed to construct DocsEnum.  docsEnd supplies
+    // trailer-free docs slices, posOff supplies positions starts, and pulsedRun
+    // supplies inline doc/pos payloads for single-occurrence terms.
+    parseMetadataRuns();
+    uint32_t n = blockTermCount();
+    if (docsEndRunLen == 0) {
+      assert((pulsedMask & validPulsedMask()) == validPulsedMask());
+      std::fill_n(docsEnds.begin(), n, 0);
+    } else {
+      const char* p = docsEndRun;
+      const char* end = docsEndRun + docsEndRunLen;
+      uint64_t prevDocsEnd = 0;
+      for (uint32_t i = 0; i < n; i++) {
+        uint64_t docsEnd = InputStream::readVlong(p, end);
+        assert(docsEnd >= prevDocsEnd);
+        docsEnds[i] = docsEnd;
+        prevDocsEnd = docsEnd;
+      }
+      assert(p == end);
+    }
+
+    if (FieldType::hasPositions(fieldInfo.flags)) {
+      if (posOffRunLen == 0) {
+        std::fill_n(posOffsets.begin(), n, 0);
+      } else {
+        const char* p = posOffRun;
+        const char* end = posOffRun + posOffRunLen;
+        uint64_t posOffset = 0;
+        for (uint32_t i = 0; i < n; i++) {
+          posOffset += InputStream::readVlong(p, end);
+          posOffsets[i] = posOffset;
+        }
+        assert(p == end);
+      }
+    }
+
+    uint32_t pulsedTerms = std::popcount(pulsedMask & validPulsedMask());
+    uint32_t pulsedCount = pulsedTerms * (FieldType::hasPositions(fieldInfo.flags) ? 2u : 1u);
+    decodeSVBRun(pulsedRun, pulsedRunLen, pulsedValues.data(), pulsedCount);
+    postingsDecoded = true;
+  }
+
+  bool isPulsed() {
+    decodePostings();
+    return (pulsedMask & (1u << (uint32_t) ordInBlock)) != 0;
+  }
+
+  uint64_t docsStartOffset() {
+    assert(ordInBlock >= 0);
+    decodePostings();
+    return ordInBlock == 0 ? 0 : docsEnds[(size_t) ordInBlock - 1];
+  }
+
+  uint64_t docsEndOffset() {
+    assert(ordInBlock >= 0);
+    decodePostings();
+    return docsEnds[(size_t) ordInBlock];
+  }
+
+  int64_t docsStart() {
+    return locOfDocsForTermBlock + (int64_t) docsStartOffset();
+  }
+
+  int64_t docsEnd() {
+    return locOfDocsForTermBlock + (int64_t) docsEndOffset();
+  }
+
+  int64_t docsSize() {
+    uint64_t start = docsStartOffset();
+    uint64_t end = docsEndOffset();
+    assert(end >= start);
+    assert((end - start) <= INT64_MAX);
+    return (int64_t) (end - start);
+  }
+
+  uint64_t posOffset() {
+    assert(ordInBlock >= 0);
+    decodePostings();
+    assert(FieldType::hasPositions(fieldInfo.flags));
+    return posOffsets[(size_t) ordInBlock];
+  }
+
+  uint32_t pulsedValueIndex() {
+    assert(isPulsed());
+    uint32_t pulsedOrd = std::popcount(pulsedMask & ((1u << (uint32_t) ordInBlock) - 1));
+    return pulsedOrd * (FieldType::hasPositions(fieldInfo.flags) ? 2u : 1u);
+  }
+
+  int32_t pulsedDoc() {
+    decodePostings();
+    return (int32_t) pulsedValues[pulsedValueIndex()];
+  }
+
+  int32_t pulsedPos() {
+    decodePostings();
+    assert(FieldType::hasPositions(fieldInfo.flags));
+    return (int32_t) pulsedValues[pulsedValueIndex() + 1];
+  }
+
+  // Seeks to termBlockIndex and reads the eager block-entry state from the
+  // format written by PostingsWriter.flushTerms: header values, hash pointer,
+  // prefix/suffix length run pointers, suffix blob pointer, and metadata start.
+  // It does not prefix-sum suffixLen, parse metadata run byte lengths, or decode
+  // any stats/postings metadata.  Those happen on demand in decodeSuffixStarts,
+  // decodeStats, and decodePostings.
   void readTermBlock() {
     termsIS.seek(fieldInfo.termsLoc.offset() + termBlockOffsets[termBlockIndex]);
     startingOrd = termBlockIndex * Postings::TERMS_BLOCK_SIZE;  // we currently have fixed size blocks
-    cumulativeDocsSize = 0;
     ordInBlock = 0;
     maxOrdInBlock = std::min(Postings::TERMS_BLOCK_SIZE - 1, fieldInfo.nTerms - startingOrd - 1);
+    int64_t blockEndOffset = termBlockIndex + 1 < numTermBlocks
+        ? fieldInfo.termsLoc.offset() + termBlockOffsets[termBlockIndex + 1]
+        : fieldInfo.termBlockIndexLoc.offset();
+    blockEnd = termsIS.ptr(blockEndOffset);
 
     // see PostingsWriter.flushTerms
     startingTerm = termsIS.readPackedTerm();
     locOfDocsForTermBlock = fieldInfo.docsLoc.offset() + termsIS.readVlong();  // fieldOffset + blockOffset for docs
     locOfPositionsForTermBlock = fieldInfo.posLoc.offset() + termsIS.readVlong();
+    blockPrefixLen = (uint8_t) termsIS.readByte();
+    memcpy(&pulsedMask, termsIS.ptr(), sizeof(pulsedMask));
+    termsIS.skip(sizeof(pulsedMask));
+    suffixBytesTotal = termsIS.readVint();
 
     memcpy(currTerm.ptr(), startingTerm.ptr(), startingTerm.memorySize());
 
@@ -119,7 +382,19 @@ protected:
     termHashes = termsIS.ptr();
     termsIS.skip(maxOrdInBlock+1);  // ords are 0 based, so add 1 for the number of them. maxOrdInBlock is also inclusive (not one past the end)
 
-    readTermMetadata();
+    prefixLens = termsIS.ptr();
+    termsIS.skip(maxOrdInBlock);
+    suffixLens = termsIS.ptr();
+    termsIS.skip(maxOrdInBlock);
+    suffixBlob = termsIS.ptr();
+    termsIS.skip(suffixBytesTotal);
+    metadataRuns = termsIS.ptr();
+    assert(metadataRuns <= blockEnd);
+
+    statsDecoded = false;
+    postingsDecoded = false;
+    suffixStartsDecoded = false;
+    metadataRunsParsed = false;
   }
 
 public:
@@ -144,18 +419,11 @@ protected:
   // reads the next term in the block with no checking if one runs off the end of the block.
   void readNextTermInBlock() {
     assert(ordInBlock < maxOrdInBlock);
+    decodeSuffixStarts();
     ordInBlock++;
-    // read next suffix
-    // see PostingsWriter.flushTerms
-    uint8_t code = termsIS.readByte();
-    auto prefixLen = code >> 5;
-    auto suffixLen = (code & 0x1f) + 1;
-    if (prefixLen == 7) {
-      prefixLen = (uint8_t)termsIS.readByte();
-    }
-    if (suffixLen == 32) {
-      suffixLen = (uint8_t)termsIS.readByte();
-    }
+    uint32_t prefixLen = (uint8_t) prefixLens[ordInBlock - 1];
+    uint32_t suffixLen = (uint8_t) suffixLens[ordInBlock - 1];
+    const char* suffix = suffixBlob + suffixStarts[(size_t) ordInBlock - 1];
 
     auto [data, len] = currTerm.unpack();
     // TODO: things to try:
@@ -163,13 +431,17 @@ protected:
     // - an explict loop of 8 bytes at a time... requires making sure there are extra bytes at the end of termIS file.
     //   - try it as a do-while loop... easier branch prediction?
 
-    // try and catch unoptimal prefix compression (we had a bug before)
-    assert(uint32_t(prefixLen) == len || data[prefixLen] != *termsIS.ptr());
+    assert(blockPrefixLen <= len);
+    uint32_t factoredLen = len - blockPrefixLen;
+    assert(prefixLen <= factoredLen);
+    assert(blockPrefixLen + prefixLen + suffixLen <= PackedTerm::MAX_LEN);
+    // prefixLen is measured against the previous term after factoring out
+    // blockPrefixLen. The old "cannot extend by one more byte" assertion now
+    // compares at that factored boundary.
+    assert(prefixLen == factoredLen || data[blockPrefixLen + prefixLen] != *suffix);
 
-    termsIS.read(const_cast<char*>(data + prefixLen), suffixLen);
-    currTerm.setSize(prefixLen + suffixLen);
-
-    readTermMetadata();
+    memcpy(const_cast<char*>(data + blockPrefixLen + prefixLen), suffix, suffixLen);
+    currTerm.setSize(blockPrefixLen + prefixLen + suffixLen);
   }
 
   // Find the block whose separator key is the greatest one that is <= target,

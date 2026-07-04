@@ -370,6 +370,30 @@ public:
       return &result;
     }
 
+    bool lookupTermStats(CachedFieldInfo& cachedFieldInfo, std::string_view term, Similarity::TermStats& result) {
+      result = {};
+      bool found = false;
+      for (int i = 0; i < (int)numSegments(); ++i) {
+        auto& termsEnum = cachedFieldInfo.termsEnums[i];
+        if (!termsEnum || !termsEnum->seek(term)) {
+          continue;
+        }
+        found = true;
+        result.docFreq += termsEnum->docFreq();
+        result.totalTermFreq += termsEnum->totalTermFreq();
+      }
+      return found;
+    }
+
+    bool lookupTermStats(std::string_view field, std::string_view term, Similarity::TermStats& result) {
+      CachedFieldInfo* cachedFieldInfo = getCachedFieldInfo(field);
+      if (cachedFieldInfo == nullptr) {
+        result = {};
+        return false;
+      }
+      return lookupTermStats(*cachedFieldInfo, term, result);
+    }
+
   };
 
   // A weight is created by a query for execution over a specific index

@@ -57,11 +57,10 @@ class DocsEnum {
   int32_t docfreq; // number of docs containing this term
   int64_t ttf;    // totalTermFreq (sum of term freq across all docs for this term)
 
-  int32_t docsSize;  // size of the postings in the doc file for the given term
+  int64_t docsSize;  // size of the postings in the doc file for the given term
   int64_t startOfDocs;
-  int64_t metadataStart;
+  int64_t endOfDocs;
 
-  int64_t cumulativeDocsSize;
   int64_t locOfDocsForTermBlock;
   int64_t locOfPositionsForTermBlock;
 
@@ -157,23 +156,30 @@ public:
     // from the terms enum that we need (that may change.)
     // TODO: package those dependencies in a struct that can be simply assigned?  Or if there is enough overlap, simply copy the complete tenum?
     // Or we could invert the responsibility and make the client copy the tenum if they are going to change it.
-    docsSize = tenum.docsSize;
+    // Term-level postings bounds and stats are handed over by TermsEnum from
+    // the term-block metadata section.  The docs stream has no per-term trailer:
+    // DocsEnum receives absolute docsStart/docsEnd, df/ttf, posOffset, and any
+    // pulsed doc/pos payload through these accessors before it starts reading
+    // doc blocks or impact headers.
+    docsSize = tenum.docsSize();
     docid = -1;
 
     // TODO: look into deferring filling the buffer until we need it, then we can avoid allocating the buffers for a shared DocsEnum.
     if (docsSize == 0) {
       // postings pulsed
-      docfreq = 1;
+      docfreq = tenum.docFreq();
+      assert(docfreq == 1);
       tfreq = 1;
-      ttf = 1;
+      ttf = tenum.totalTermFreq();
+      assert(ttf == 1);
       // fill buffers with the single pulsed doc (+ position, if the field indexes them)
-      docBuf[0] = tenum.pulsedDoc;
+      docBuf[0] = tenum.pulsedDoc();
       docBufEnd = 1;
       tfreqBuf[0] = 1;
       tfreqBufEnd = 1;
       posBufIdx = 0;
       if (hasPositions) {
-        posBuf[0] = tenum.pulsedPos;
+        posBuf[0] = tenum.pulsedPos();
         posBufEndDoc = posBufEnd = 1;
       } else {
         posBufEndDoc = posBufEnd = 0;
@@ -185,33 +191,23 @@ public:
       pos = tfreq = -1;  // unnecessary initializations, but it makes some maybe-uninitialized warnings go away with -O3  // todo: revisit
       locOfDocsForTermBlock = tenum.locOfDocsForTermBlock;
       locOfPositionsForTermBlock = tenum.locOfPositionsForTermBlock;
-      cumulativeDocsSize = tenum.cumulativeDocsSize;
       docIS = postingsReader.getInputStream(fieldInfo.docsLoc.filenum());
-
-      // see the end of PostingsWriter.endTerm() for the term-specific metadata written there (docfreq, ttf, etc)
-
-      // read last byte of docs to get the metadata size
-      int64_t metaEnd = locOfDocsForTermBlock + cumulativeDocsSize - 1;  // the metaSize byte
-      docIS.seek(metaEnd);
-      uint8_t metaSize = docIS.readByte();
-      metadataStart = metaEnd - metaSize;
-      docIS.seek(metadataStart); // move to start of metadata
-      // Per-term metadata is level-dependent (see PostingsWriter::endTerm): docfreq always,
-      // then ttfCode only when freqs are indexed, then posOffset only when positions are.
-      docfreq = docIS.readVint();
-      ttf = hasFreqs ? (docfreq + docIS.readVlong()) : docfreq;
+      startOfDocs = tenum.docsStart();
+      endOfDocs = tenum.docsEnd();
+      assert(endOfDocs >= startOfDocs);
+      assert(endOfDocs - startOfDocs == docsSize);
+      docfreq = tenum.docFreq();
+      ttf = tenum.totalTermFreq();
       docBufEnd = 0;
       numDocBlocks = (docfreq + Postings::DOCS_BLOCK_SIZE - 1) / Postings::DOCS_BLOCK_SIZE;
       numDocGroups = (numDocBlocks + L1_PERIOD - 1) / L1_PERIOD;
 
       if (hasPositions) {
-        auto posOffset = docIS.readVlong();
+        auto posOffset = tenum.posOffset();
         posIS = postingsReader.getInputStream(fieldInfo.posLoc.filenum());
         posIS.seek(locOfPositionsForTermBlock + posOffset);
       }
 
-      // start of the actual docs is end of block - size
-      startOfDocs = locOfDocsForTermBlock + cumulativeDocsSize - docsSize;
       docIS.seek(startOfDocs);
 
       posBufEndDoc = posBufEnd = 0; // no positions read yet
@@ -492,7 +488,7 @@ public:
   void skipToBlock(int32_t target) {
     blockMode = false;
     const char* const streamStart = docIS.ptr(0);
-    const char* const end = docIS.ptr(metadataStart);
+    const char* const end = docIS.ptr(endOfDocs);
     const char* p = docIS.ptr();
     int32_t block = nextL0Block;
     uint32_t prevLastDoc = nextL0Base;
@@ -694,7 +690,7 @@ public:
       impactFrontiers->offsets.reserve((size_t) numDocBlocks + 1);
     }
 
-    const char* const end = docIS.ptr(metadataStart);
+    const char* const end = docIS.ptr(endOfDocs);
     const char* p = docIS.ptr(startOfDocs);
     uint32_t prevGroupLastDoc = 0;
     uint32_t prevBlockLastDoc = 0;

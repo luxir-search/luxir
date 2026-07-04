@@ -11,11 +11,15 @@
 #include <vector>
 
 #include "bench/solux_bench.h"
+#include "solux/index/IndexWriter.h"
 #include "solux/index/PostingsWriter.h"
 #include "solux/index/TrieBuilder.h"
+#include "solux/query/Query.h"
+#include "solux/reader/DocsEnum.h"
 #include "solux/reader/FuzzySeekEnum.h"
 #include "solux/reader/PostingsReader.h"
 #include "solux/reader/TermsEnum.h"
+#include "solux/store/Directory.h"
 #include "test/SegmentTest.h"
 
 using namespace solux;
@@ -108,6 +112,8 @@ int64_t trieRegionBytes(PostingsReader& postingsReader, const SegFieldInfo& fiel
 class TermSeekCorpus {
 public:
   SegmentTest seg;
+  RAMDir queryDir;
+  std::unique_ptr<IndexReader> queryReader;
   SegFieldInfo fieldInfo;
   std::vector<std::string> terms;
   std::vector<int32_t> hitOrds;
@@ -118,12 +124,20 @@ public:
   uint64_t seed;
   TermSource source;
   int32_t nBlocks = 0;
+  int64_t termsRegionBytes = 0;
   int64_t termBlockOffsetBytes = 0;
   int64_t trieBytes = 0;
 
   TermSeekCorpus(TermSource sourceIn, int32_t termCount, uint64_t seedIn)
       : nTerms(termCount), seed(seedIn), source(sourceIn) {
     build();
+  }
+
+  IndexReader& statsReader() {
+    if (queryReader == nullptr) {
+      buildStatsReader();
+    }
+    return *queryReader;
   }
 
 private:
@@ -214,6 +228,20 @@ private:
     ASSERT_EQ(nTerms, fieldInfo.nTerms);
   }
 
+  void buildStatsReader() {
+    IndexWriter writer(queryDir);
+    Inverter& inverter = writer.obtainInverter();
+    auto& handler = inverter.getIndexHandler(kFieldName);
+    for (int32_t ord = 0; ord < nTerms; ord++) {
+      inverter.setDoc(ord);
+      handler.index(inverter, std::string_view(terms[(size_t)ord]));
+    }
+    writer.releaseInverter(inverter);
+    writer.commit();
+    queryReader = std::make_unique<IndexReader>(queryDir);
+    ASSERT_EQ(queryReader->segments().size(), 1u);
+  }
+
   void build() {
     buildTerms();
     buildTargets();
@@ -221,6 +249,7 @@ private:
     readFieldInfo();
 
     nBlocks = ((fieldInfo.nTerms - 1) / Postings::TERMS_BLOCK_SIZE) + 1;
+    termsRegionBytes = fieldInfo.termBlockIndexLoc.offset() - fieldInfo.termsLoc.offset();
     termBlockOffsetBytes = (int64_t)nBlocks * (int64_t)sizeof(int64_t);
     trieBytes = trieRegionBytes(*seg.reader, fieldInfo);
   }
@@ -244,8 +273,32 @@ std::shared_ptr<TermSeekCorpus> getTermSeekCorpus(TermSource source) {
 void addSizingCounters(benchmark::State& state, const TermSeekCorpus& corpus) {
   state.counters["nTerms"] = corpus.nTerms;
   state.counters["nBlocks"] = corpus.nBlocks;
+  state.counters["termsRegionBytes"] = corpus.termsRegionBytes;
   state.counters["termBlockOffsetsBytes"] = corpus.termBlockOffsetBytes;
   state.counters["trieBytes"] = corpus.trieBytes;
+}
+
+uint64_t addStatsFingerprint(uint64_t fp, const Similarity::TermStats& stats) {
+  fp = fp * 31 + (uint64_t)stats.docFreq;
+  fp = fp * 31 + (uint64_t)stats.totalTermFreq;
+  return fp;
+}
+
+bool lookupTermStatsPostings(MemPool& pool, IndexReader& reader, CachedFieldInfo& cachedFieldInfo,
+                             std::string_view term, Similarity::TermStats& result) {
+  result = {};
+  bool found = false;
+  for (int i = 0; i < (int)reader.segments().size(); ++i) {
+    TermsEnum* termsEnum = cachedFieldInfo.termsEnums[i];
+    if (termsEnum == nullptr || !termsEnum->seek(term)) {
+      continue;
+    }
+    found = true;
+    DocsEnum docsEnum(pool, reader.segments()[i].postingsReader(), *termsEnum);
+    result.docFreq += docsEnum.numDocs();
+    result.totalTermFreq += docsEnum.totalTermFreq();
+  }
+  return found;
 }
 
 } // namespace
@@ -322,6 +375,68 @@ static void BM_TermSeekCeil_jump(benchmark::State& state, TermSource source) {
   state.counters["fp"] = (int64_t)(fingerprint % 100000);
 }
 
+static void BM_TermStats_dict(benchmark::State& state, TermSource source) {
+  auto corpus = getTermSeekCorpus(source);
+  if (skipBenchIfDataMissing(state, corpus != nullptr, kDictPath)) return;
+  IndexReader& reader = corpus->statsReader();
+  MemPool pool;
+  Query::Context context(pool, reader);
+  CachedFieldInfo* cachedFieldInfo = context.getCachedFieldInfo(kFieldName);
+  ASSERT_NE(cachedFieldInfo, nullptr);
+
+  uint64_t fingerprint = 0;
+  for (auto _ : state) {
+    uint64_t fp = 1;
+    for (int32_t ord : corpus->hitOrds) {
+      Similarity::TermStats stats;
+      bool found = context.lookupTermStats(*cachedFieldInfo, corpus->terms[(size_t)ord], stats);
+      assert(found);
+      fp = addStatsFingerprint(fp, stats);
+    }
+    benchmark::DoNotOptimize(fp);
+    fingerprint = fp;
+  }
+
+  state.SetItemsProcessed((int64_t)state.iterations() * (int64_t)corpus->hitOrds.size());
+  addSizingCounters(state, *corpus);
+  state.counters["fp"] = (int64_t)(fingerprint % 100000);
+}
+
+static void BM_TermStats_postings(benchmark::State& state, TermSource source) {
+  auto corpus = getTermSeekCorpus(source);
+  if (skipBenchIfDataMissing(state, corpus != nullptr, kDictPath)) return;
+  IndexReader& reader = corpus->statsReader();
+  MemPool pool;
+  Query::Context context(pool, reader);
+  CachedFieldInfo* cachedFieldInfo = context.getCachedFieldInfo(kFieldName);
+  ASSERT_NE(cachedFieldInfo, nullptr);
+
+  uint64_t fingerprint = 0;
+  for (auto _ : state) {
+    uint64_t fp = 1;
+    for (int32_t ord : corpus->hitOrds) {
+      std::string_view term = corpus->terms[(size_t)ord];
+      Similarity::TermStats stats;
+      bool found = lookupTermStatsPostings(pool, reader, *cachedFieldInfo, term, stats);
+      assert(found);
+      if (solux::unit_tests) {
+        Similarity::TermStats dictStats;
+        bool dictFound = context.lookupTermStats(*cachedFieldInfo, term, dictStats);
+        ASSERT_EQ(dictFound, found);
+        ASSERT_EQ(dictStats.docFreq, stats.docFreq);
+        ASSERT_EQ(dictStats.totalTermFreq, stats.totalTermFreq);
+      }
+      fp = addStatsFingerprint(fp, stats);
+    }
+    benchmark::DoNotOptimize(fp);
+    fingerprint = fp;
+  }
+
+  state.SetItemsProcessed((int64_t)state.iterations() * (int64_t)corpus->hitOrds.size());
+  addSizingCounters(state, *corpus);
+  state.counters["fp"] = (int64_t)(fingerprint % 100000);
+}
+
 // Whole-enum fuzzy matching: prefix_length=0 (jump-heavy - every prefix stays
 // alive), whole query as the automaton suffix, enumerate ALL matching terms.
 // This is the smart-seek enum's end-to-end cost, which seekBlock is only one
@@ -368,12 +483,18 @@ static void BM_FuzzyEnum(benchmark::State& state, TermSource source, int maxEdit
 SOLUX_BENCHMARK_CAPTURE(BM_TermSeekExact_hit, decimal, TermSource::DECIMAL);
 SOLUX_BENCHMARK_CAPTURE(BM_TermSeekExact_miss, decimal, TermSource::DECIMAL);
 SOLUX_BENCHMARK_CAPTURE(BM_TermSeekCeil_jump, decimal, TermSource::DECIMAL);
+SOLUX_BENCHMARK_CAPTURE(BM_TermStats_dict, decimal, TermSource::DECIMAL);
+SOLUX_BENCHMARK_CAPTURE(BM_TermStats_postings, decimal, TermSource::DECIMAL);
 SOLUX_BENCHMARK_CAPTURE(BM_TermSeekExact_hit, words, TermSource::WORDS);
 SOLUX_BENCHMARK_CAPTURE(BM_TermSeekExact_miss, words, TermSource::WORDS);
 SOLUX_BENCHMARK_CAPTURE(BM_TermSeekCeil_jump, words, TermSource::WORDS);
+SOLUX_BENCHMARK_CAPTURE(BM_TermStats_dict, words, TermSource::WORDS);
+SOLUX_BENCHMARK_CAPTURE(BM_TermStats_postings, words, TermSource::WORDS);
 SOLUX_BENCHMARK_CAPTURE(BM_TermSeekExact_hit, compound, TermSource::COMPOUND);
 SOLUX_BENCHMARK_CAPTURE(BM_TermSeekExact_miss, compound, TermSource::COMPOUND);
 SOLUX_BENCHMARK_CAPTURE(BM_TermSeekCeil_jump, compound, TermSource::COMPOUND);
+SOLUX_BENCHMARK_CAPTURE(BM_TermStats_dict, compound, TermSource::COMPOUND);
+SOLUX_BENCHMARK_CAPTURE(BM_TermStats_postings, compound, TermSource::COMPOUND);
 SOLUX_BENCHMARK_CAPTURE(BM_FuzzyEnum, compound_e2, TermSource::COMPOUND, 2);
 SOLUX_BENCHMARK_CAPTURE(BM_FuzzyEnum, words_e1, TermSource::WORDS, 1);
 SOLUX_BENCHMARK_CAPTURE(BM_FuzzyEnum, words_e2, TermSource::WORDS, 2);

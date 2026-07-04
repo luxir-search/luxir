@@ -154,7 +154,7 @@ protected:
                              const DocsEnum::ImpactFrontiers* expectedFrontiers = nullptr) {
     RAMDir dir;
     MemPool pool;
-    PostingsWriter postingsWriter(dir, 0, numDocs);
+    PostingsWriter postingsWriter(dir, 0, numDocs + Postings::DOCS_BLOCK_SIZE + 100);
     {
       TextWriter writer(postingsWriter);
       auto& finfo = postingsWriter.addField("f");
@@ -168,6 +168,13 @@ protected:
         writer.addDoc(doc, impactTfForDoc(doc));
       }
       writer.endTerm(term);
+
+      TermRef nextTerm(pool, "zzz", 3);
+      writer.startTerm(nextTerm);
+      for (int32_t doc = 0; doc < Postings::DOCS_BLOCK_SIZE + 3; doc++) {
+        writer.addDoc(numDocs + 10 + doc, 31);
+      }
+      writer.endTerm(nextTerm);
       writer.endField();
     }
     postingsWriter.finish();
@@ -324,6 +331,52 @@ TEST_F(DocsEnumAdvanceTest, advanceDocsOnly) {
     ASSERT_EQ(cur, target < N ? target : DocsEnum::END) << "advance(" << target << ")";  // dense -> exact
     if (cur != DocsEnum::END) { ASSERT_EQ(denum.termFreq(), 1); }
   }
+}
+
+TEST_F(DocsEnumAdvanceTest, advanceCrossesL1AndTailOnTrailerFreeSlice) {
+  const int32_t N = DocsEnum::L1_DOCS + Postings::DOCS_BLOCK_SIZE + 13;
+  RAMDir dir;
+  MemPool pool;
+  PostingsWriter postingsWriter(dir, 0, N + Postings::DOCS_BLOCK_SIZE + 100);
+  {
+    TextWriter writer(postingsWriter);
+    auto& finfo = postingsWriter.addField("f");
+    finfo.type = FieldType::TEXT;
+    finfo.flags = FieldType::INDEX_DOCS;
+    writer.startField(&finfo);
+
+    TermRef hot(pool, "hot", 3);
+    writer.startTerm(hot);
+    for (int32_t doc = 0; doc < N; doc++) {
+      writer.addDoc(doc, 1);
+    }
+    writer.endTerm(hot);
+
+    TermRef zzz(pool, "zzz", 3);
+    writer.startTerm(zzz);
+    for (int32_t doc = 0; doc < Postings::DOCS_BLOCK_SIZE + 7; doc++) {
+      writer.addDoc(N + 10 + doc, 1);
+    }
+    writer.endTerm(zzz);
+    writer.endField();
+  }
+  postingsWriter.finish();
+
+  PostingsReader reader(dir, 0);
+  FieldReader fieldReader(pool, reader);
+  ASSERT_TRUE(fieldReader.readNextField());
+  SegFieldInfo fieldInfo;
+  fieldReader.readFieldInfo(fieldInfo);
+  TermsEnum tenum(pool, reader, fieldInfo);
+  ASSERT_TRUE(tenum.seek("hot"));
+  DocsEnum denum(pool, reader, tenum);
+
+  for (int32_t target : {0, 1, DocsEnum::L1_DOCS - 1, DocsEnum::L1_DOCS,
+                         DocsEnum::L1_DOCS + 1, N - 2, N - 1}) {
+    ASSERT_EQ(denum.advance(target), target) << target;
+    ASSERT_EQ(denum.termFreq(), 1) << target;
+  }
+  ASSERT_EQ(denum.advance(N), DocsEnum::END);
 }
 
 TEST_F(DocsEnumAdvanceTest, blockImpactHeadersRoundTrip) {
