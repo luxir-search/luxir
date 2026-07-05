@@ -17,6 +17,7 @@
 #include "solux/query/BooleanQuery.h"
 #include "solux/query/PhraseQuery.h"
 #include "solux/query/TermQuery.h"
+#include "solux/reader/SkipStats.h"
 #include "solux/search/Collector.h"
 
 using namespace solux;
@@ -683,7 +684,8 @@ void buildDenseManyClauseIndex(CollectionHelper& helper, int64_t nDocs, int32_t 
 
 ScoreTopKResult runMultiTermDisjunctionTopK(IndexReader& reader,
                                             const std::vector<std::string>& terms,
-                                            int32_t topK, bool useFrontier) {
+                                            int32_t topK, bool useFrontier,
+                                            bool skip = true) {
   MemPool pool;
   Query::Context qContext(pool, reader);
   std::vector<TermQuery> queries;
@@ -704,8 +706,16 @@ ScoreTopKResult runMultiTermDisjunctionTopK(IndexReader& reader,
     if (scorer == nullptr) {
       continue;
     }
-    scorer->setMinCompetitiveScore(collector.minCompetitiveVal);
-    collectTopK(segnum, scorer, nullptr, nullptr, collector);
+    if (skip) {
+      scorer->setMinCompetitiveScore(collector.minCompetitiveVal);
+      collectTopK(segnum, scorer, nullptr, nullptr, collector);
+    } else {
+      // Exhaustive: no threshold feedback, so nothing prunes and every block is
+      // decoded -- the "blocks total" denominator for skip-effectiveness.
+      for (int32_t doc = scorer->next(); doc != PostingsReader::END; doc = scorer->next()) {
+        collector.collect(segnum, doc, scorer->score());
+      }
+    }
   }
 
   ScoreTopKResult result;
@@ -1440,6 +1450,82 @@ static void BM_FullTextScoreTopKMultiTermFrontier(benchmark::State& state,
   state.counters["RSS_max"] = mem.second / 1024;
 }
 
+//
+// Skip-effectiveness validation harness (the internal go/no-go for the
+// skip-vs-skip top-k benchmark, and the level2 decision). NOT primarily a timing
+// bench: the deliverable is the SkipStats counters. For a multi-term disjunction
+// over the Zipfian corpus it reports, per query class (term count x k):
+//   - blocks_decoded  : docs blocks decoded on the impact-pruned path (numerator)
+//   - blocks_total    : docs blocks decoded exhaustively (denominator)
+//   - pct_decoded     : the headline skip effectiveness
+//   - l0_header_steps : per-block header walk within L1 groups
+//   - l1_group_steps  : L1 group header walk -- THE level2 decision metric
+//   - advance_calls   : leapfrog / impact-skip advance() drivers
+// Run corner (T1) vs frontier (T2) to read bound tightness off pct_decoded.
+// SkipStats is non-atomic, so the counted runs are single-thread by construction
+// (one scorer chain per call); the timed loop runs with counters off.
+//
+enum class SkipQueryClass {
+  TwoTerm,   // common head + rare tail: the canonical WAND/MaxScore disjunction
+  ThreeTerm  // common + mid + rare
+};
+
+static void BM_SkipEffectiveness(benchmark::State& state,
+                                 SkipQueryClass queryClass,
+                                 int32_t topK, bool useFrontier) {
+  int64_t nDocs = solux::unit_tests ? 16000 : 1'000'000;
+  std::vector<int32_t> docsPerSeg = {(int32_t) nDocs};
+  // Zipfian body_w: rank 0 densest. t2 ~ head (many blocks), t50 mid, t500 tail.
+  std::vector<std::string> terms = queryClass == SkipQueryClass::TwoTerm
+    ? std::vector<std::string>{"t2", "t500"}
+    : std::vector<std::string>{"t2", "t50", "t500"};
+
+  CollectionHelper helper;
+  static std::vector<int32_t> builtShape;
+  bool reuseIndex = builtShape == docsPerSeg && helper.indexMatchesShape(docsPerSeg);
+  if (!reuseIndex) {
+    buildFullTextBenchIndex(helper, nDocs, docsPerSeg);
+    builtShape = docsPerSeg;
+  }
+
+  auto reader = helper.getIndexWriter()->getIndexReader();
+
+  // Numerator (impact-pruned) and denominator (exhaustive), measured once outside
+  // timing with counters on. Same top-k must fall out either way (byte-identical).
+  SkipStats::enabled = true;
+  SkipStats::reset();
+  ScoreTopKResult pruned = runMultiTermDisjunctionTopK(*reader, terms, topK, useFrontier, true);
+  int64_t blocksDecoded = SkipStats::docBlocksDecoded;
+  int64_t l0Steps = SkipStats::l0HeaderSteps;
+  int64_t l1Steps = SkipStats::l1GroupSteps;
+  int64_t advanceCalls = SkipStats::advanceCalls;
+  SkipStats::reset();
+  ScoreTopKResult exhaustive = runMultiTermDisjunctionTopK(*reader, terms, topK, useFrontier, false);
+  int64_t blocksTotal = SkipStats::docBlocksDecoded;
+  SkipStats::enabled = false;
+  assertSameTopK(pruned, exhaustive);
+
+  // Timed loop: pruned path, counters off -> the timing carries no gate cost.
+  for (auto _ : state) {
+    ScoreTopKResult result = runMultiTermDisjunctionTopK(*reader, terms, topK, useFrontier, true);
+    benchmark::DoNotOptimize(result.fp);
+  }
+
+  state.counters["terms"] = (double) terms.size();
+  state.counters["k"] = topK;
+  state.counters["frontier"] = useFrontier ? 1 : 0;
+  state.counters["blocks_decoded"] = (double) blocksDecoded;
+  state.counters["blocks_total"] = (double) blocksTotal;
+  state.counters["pct_decoded"] =
+    blocksTotal > 0 ? (double) blocksDecoded * 100.0 / (double) blocksTotal : 0.0;
+  state.counters["l0_header_steps"] = (double) l0Steps;
+  state.counters["l1_group_steps"] = (double) l1Steps;
+  state.counters["advance_calls"] = (double) advanceCalls;
+  state.counters["visited"] = (double) pruned.visited;
+  state.counters["reused"] = reuseIndex;
+  state.counters["rate"] = benchmark::Counter(state.iterations(), benchmark::Counter::kIsRate);
+}
+
 static void BM_FullTextScoreTopKBulkDisjunction(benchmark::State& state,
                                                 BulkDisjunctionCorpus corpus, bool useBulk,
                                                 int32_t domainStep,
@@ -1754,6 +1840,27 @@ SOLUX_BENCHMARK_CAPTURE(BM_FullTextScoreTopKMultiTermFrontier, multiterm_zipf_t2
                         FrontierBoundMode::Frontier, true);
 SOLUX_BENCHMARK_CAPTURE(BM_FullTextScoreTopKMultiTermFrontier, multiterm_zipf_t1,
                         FrontierBoundMode::Corner, true);
+
+// Skip-effectiveness validation harness. Frontier (T2) sweep over k for both
+// query classes, plus a corner (T1) pair at k=10 to read bound tightness off
+// pct_decoded. Report per class x k: pct_decoded (headline), l1_group_steps
+// (level2 decision), l0_header_steps, advance_calls.
+SOLUX_BENCHMARK_CAPTURE(BM_SkipEffectiveness, skip_2term_k10,
+                        SkipQueryClass::TwoTerm, 10, true);
+SOLUX_BENCHMARK_CAPTURE(BM_SkipEffectiveness, skip_2term_k100,
+                        SkipQueryClass::TwoTerm, 100, true);
+SOLUX_BENCHMARK_CAPTURE(BM_SkipEffectiveness, skip_2term_k1000,
+                        SkipQueryClass::TwoTerm, 1000, true);
+SOLUX_BENCHMARK_CAPTURE(BM_SkipEffectiveness, skip_3term_k10,
+                        SkipQueryClass::ThreeTerm, 10, true);
+SOLUX_BENCHMARK_CAPTURE(BM_SkipEffectiveness, skip_3term_k100,
+                        SkipQueryClass::ThreeTerm, 100, true);
+SOLUX_BENCHMARK_CAPTURE(BM_SkipEffectiveness, skip_3term_k1000,
+                        SkipQueryClass::ThreeTerm, 1000, true);
+SOLUX_BENCHMARK_CAPTURE(BM_SkipEffectiveness, skip_2term_k10_corner,
+                        SkipQueryClass::TwoTerm, 10, false);
+SOLUX_BENCHMARK_CAPTURE(BM_SkipEffectiveness, skip_3term_k10_corner,
+                        SkipQueryClass::ThreeTerm, 10, false);
 
 // Pull MaxScoreDisjunctionScorer vs the wired MaxScoreBulkScorer path. The dense
 // many-clause corpus is the pre-BS1 case where most clauses stay essential.

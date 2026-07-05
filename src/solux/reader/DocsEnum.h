@@ -1,6 +1,7 @@
 #pragma once
 
 #include "TermsEnum.h"
+#include "SkipStats.h"
 #include "solux/codec/Codec.h"
 #include "solux/codec/StreamVByte.h"
 #include <algorithm>
@@ -295,6 +296,8 @@ public:
       } else {
         bodyReady = false;
       }
+      // Every path from here decodes exactly one docs block (full block or tail).
+      skipCount(SkipStats::docBlocksDecoded);
 
       // Since we only read whole blocks, simply comparing with number of docs left to read is sufficient.
       // If we start partial decoding of blocks (say because of skipping), then we would want something
@@ -496,6 +499,7 @@ public:
 
     auto walkL0To = [&](int32_t maxBlock) -> bool {
       while (block < maxBlock && block < numDocBlocks) {
+        skipCount(SkipStats::l0HeaderSteps);
         uint32_t headerLen = InputStream::readVint(p, end);
         const char* headerEnd = p + headerLen;
         assert(headerEnd <= end);
@@ -564,6 +568,7 @@ public:
 
     while (block < numDocBlocks) {
       assert(isL1Boundary(block));
+      skipCount(SkipStats::l1GroupSteps);
       int32_t group = block / L1_PERIOD;
       nextL1Group = group;
       nextL1Base = prevLastDoc;
@@ -631,6 +636,7 @@ public:
   // ConstantScoreQuery, the column-join iterators.
   int32_t advance(int32_t target) {
     assert(docid < target);
+    skipCount(SkipStats::advanceCalls);
     if (nextL0Block < numDocBlocks
         && (docBufEnd == 0 || target > docBuf[docBufEnd - 1])) {
       skipToBlock(target);
