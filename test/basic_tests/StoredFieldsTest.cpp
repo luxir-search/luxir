@@ -1,16 +1,21 @@
 #include <gtest/gtest.h>
+#include <atomic>
 #include <random>
 #include <set>
 #include <string>
 #include <vector>
 
+#include "solux/index/IndexRamBudget.h"
 #include "solux/index/IndexWriter.h"
+#include "solux/index/MergeCostModel.h"
 #include "solux/reader/PostingsReader.h"
 #include "solux/reader/StoredFieldsReader.h"
 #include "solux/schema/Schema.h"
 #include "solux/search/IndexReader.h"
 #include "solux/server/SoluxNode.h"
 #include "solux/store/Directory.h"
+#include "solux/util/Signal.h"
+#include "solux/util/solux_util.h"
 #include "test/CollectionHelper.h"
 #include "test/LocalReq.h"
 #include "test/SoluxTest.h"
@@ -63,6 +68,16 @@ protected:
       for (auto v : values) entry.second.emplace_back(v);
     });
     return out;
+  }
+
+  static std::string bigStoredValue() {
+    std::string big(40 * 1024, 'x');  // 40KB
+    // Spaces keep individual tokens under the indexed-term length limit; the
+    // stored side still sees one 40KB value.
+    for (size_t i = 0; i < big.size(); i++) {
+      big[i] = (i % 100 == 99) ? ' ' : (char)('a' + (i % 26));
+    }
+    return big;
   }
 };
 
@@ -206,10 +221,7 @@ TEST_F(StoredFieldsTest, oversizeDoc) {
   // A single doc with more than 16KB of stored text must fit in its own chunk.
   RAMDir dir;
   auto schema = makeSchema();
-  std::string big(40 * 1024, 'x');  // 40KB
-  // Spaces keep individual tokens under the indexed-term length limit; the stored
-  // side (what this test exercises) still sees one 40KB value.
-  for (size_t i = 0; i < big.size(); i++) big[i] = (i % 100 == 99) ? ' ' : (char)('a' + (i % 26));
+  std::string big = bigStoredValue();
 
   {
     IndexWriter iw(dir, [&]() { return schema; });
@@ -231,6 +243,7 @@ TEST_F(StoredFieldsTest, oversizeDoc) {
   MemPool pool;
   auto sfr = StoredFieldsReader::open(reader->segments()[0].postingsReader());
   ASSERT_NE(sfr, nullptr);
+  EXPECT_GE(sfr->maxChunkBytes(), (int64_t)big.size());
   auto d0 = readStored(*sfr, 0).flat();
   ASSERT_EQ(d0.size(), 1u);
   EXPECT_EQ(d0[0].first, "body");
@@ -290,6 +303,59 @@ TEST_F(StoredFieldsTest, segmentMerge) {
             (std::vector<std::pair<std::string, std::string>>{{"body", "gamma"}}));
   EXPECT_EQ(readStored(*sfr, 3).flat(),
             (std::vector<std::pair<std::string, std::string>>{{"title", "delta title"}}));
+}
+
+TEST_F(StoredFieldsTest, oversizeDocMaxChunkBytesRoundTripsThroughMerge) {
+  RAMDir dir;
+  auto schema = makeSchema();
+  std::string big = bigStoredValue();
+  IndexRamBudget budget(MergeCostModel::LIGHT_BYTES + 128);
+  std::atomic<int64_t> maxReserved{0};
+
+  {
+    IndexWriter iw(dir, [&]() { return schema; }, &budget);
+
+    {
+      auto& inv = iw.obtainInverter();
+      inv.startDoc();
+      inv.getIndexHandler("body").index(inv, std::string_view(big));
+      inv.finishDoc();
+      iw.releaseInverter(inv, true);
+      iw.commit();
+    }
+    {
+      auto& inv = iw.obtainInverter();
+      inv.startDoc();
+      inv.getIndexHandler("body").index(inv, std::string_view("small"));
+      inv.finishDoc();
+      iw.releaseInverter(inv, true);
+      iw.commit();
+    }
+
+    solux::Signal::listen("segmentMergeBody",
+        [&budget, &maxReserved](void*, void*, void*) -> void* {
+          int64_t reserved = budget.reservedBytes();
+          int64_t prev = maxReserved.load(std::memory_order_relaxed);
+          while (prev < reserved
+                 && !maxReserved.compare_exchange_weak(
+                     prev, reserved, std::memory_order_relaxed)) {
+          }
+          return nullptr;
+        });
+    auto cleanup = solux::scope_guard([]() {
+      solux::Signal::unlisten("segmentMergeBody");
+    });
+
+    iw.mergeSegments();
+  }
+
+  auto reader = std::make_shared<IndexReader>(dir);
+  ASSERT_EQ(reader->segments().size(), 1u);
+  auto sfr = StoredFieldsReader::open(reader->segments()[0].postingsReader());
+  ASSERT_NE(sfr, nullptr);
+  EXPECT_GE(sfr->maxChunkBytes(), (int64_t)big.size());
+  EXPECT_GT(maxReserved.load(std::memory_order_relaxed),
+            MergeCostModel::LIGHT_BYTES + (int64_t)big.size());
 }
 
 TEST_F(StoredFieldsTest, mergeOneSegmentHasNoStored) {

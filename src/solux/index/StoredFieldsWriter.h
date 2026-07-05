@@ -1,5 +1,6 @@
 #pragma once
 
+#include <algorithm>
 #include <boost/unordered/unordered_flat_map.hpp>
 #include <lz4.h>
 #include <span>
@@ -35,8 +36,8 @@ namespace solux {
 //   <chunk 0: [int32 uncompressedSize][compressed LZ4 bytes]>
 //   <chunk 1: ...>
 //   ...
-//   <metadata: [varint numFields] then numFields PackedTerms (field names
-//              keyed by segment-local stored-field id)>
+//   <metadata: [vlong maxChunkBytes][varint numFields] then numFields
+//              PackedTerms (field names keyed by segment-local stored-field id)>
 //
 // Uncompressed chunk body (after LZ4 decompress):
 //   - an array of numDocs int32 byte offsets, one per doc, giving the doc's
@@ -88,6 +89,7 @@ private:
   // Completed chunk metadata.
   std::vector<int64_t> chunkFirstDocs;
   std::vector<int64_t> chunkFileOffsets;  // relative to chunksStart
+  int64_t maxChunkBytes = 0;
 
   // Reusable scratch buffers (avoid per-chunk reallocation).
   std::string uncompressedScratch;
@@ -175,6 +177,7 @@ public:
     int64_t chunksRegionEnd = (int64_t)chunkOutput->size() - chunksStart;
 
     // Metadata block follows chunks in the same file.
+    chunkOutput->writeVlong((uint64_t)maxChunkBytes);
     chunkOutput->writeVint((uint32_t)fieldNames.size());
     for (const auto& name : fieldNames) {
       chunkOutput->writePackedTerm(name);
@@ -246,7 +249,7 @@ private:
       return it->second;
     }
     uint32_t id = (uint32_t)fieldNames.size();
-    fieldNames.emplace_back(postingsWriter.pool, fieldName);
+    fieldNames.emplace_back(postingsWriter.copyTerm(fieldName));
     fieldNameToId.emplace(std::string(fieldName), id);
     return id;
   }
@@ -312,6 +315,7 @@ private:
     uncompressedScratch.append(chunkBody);
 
     int32_t uncompressedSize = (int32_t)uncompressedScratch.size();
+    maxChunkBytes = std::max(maxChunkBytes, (int64_t)uncompressedSize);
     int maxCompressed = LZ4_compressBound(uncompressedSize);
     compressScratch.resize((size_t)maxCompressed);
     int compressedSize = LZ4_compress_default(

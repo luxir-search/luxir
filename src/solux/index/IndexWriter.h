@@ -9,6 +9,7 @@
 #include <boost/unordered/unordered_flat_set.hpp>
 #include <oneapi/tbb/flow_graph.h>
 #include "solux/index/AuxInfo.h"
+#include "solux/index/IndexRamBudget.h"
 #include "solux/store/Directory.h"
 #include "solux/search/IndexReader.h"
 #include "solux/server/SoluxError.h"
@@ -255,6 +256,8 @@ public:
 
   Directory& dir;
   std::function<std::shared_ptr<Schema>()> schemaProvider_;
+  std::unique_ptr<IndexRamBudget> privateIndexRamBudget;
+  IndexRamBudget* indexRamBudget;
 
   // the last segId generated. Atomic since we don't grab any lock in the merge code to generate a new segment id.
   std::atomic_uint64_t lastSegId;
@@ -394,7 +397,10 @@ public:
   // Returns the schema generation read from IndexInfo (or 0 if none).
   uint64_t getSchemaGen() const { return schemaGen_.load(std::memory_order_relaxed); }
 
-  explicit IndexWriter(Directory &dir, std::function<std::shared_ptr<Schema>()> schemaProvider = {});
+  // indexRamBudget is the (usually node-wide) pool that parallel merge tasks
+  // reserve against; pass null for a private unlimited budget (tests, embedded).
+  explicit IndexWriter(Directory &dir, std::function<std::shared_ptr<Schema>()> schemaProvider = {},
+                       IndexRamBudget* indexRamBudget = nullptr);
   ~IndexWriter();
 
   // Per-inverter auto-flush caps (Phase 1). When a non-atomic update indexes past

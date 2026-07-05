@@ -1,5 +1,6 @@
 #pragma once
 #include "IndexWriter.h"
+#include "MergeCostModel.h"
 #include "OrdCollector.h"
 #include "OrdColWriter.h"
 #include "NormsWriter.h"
@@ -11,6 +12,7 @@
 #include "solux/search/IndexReader.h"
 
 #include <atomic>
+#include <oneapi/tbb/task_group.h>
 
 // This file is only included in IndexWriter.cpp
 
@@ -59,9 +61,234 @@ class SegmentMerger {
     Segment* seg;  // points to the segment that produced this.
   };
 
+  // One field's merge work, self-contained so it can run as a task: owned copies
+  // of the per-segment SegFieldInfos (their names/locations point into the open
+  // source segments, not into FieldReader scratch), plus its admission price -
+  // estimated peak RAM (see fieldMergeCost) and peak concurrent output streams
+  // (see fieldMergeStreams; concurrently held streams cannot share a file, so the
+  // stream cap is what bounds the merged segment's file count).
+  struct Batch {
+    int64_t cost = 0;
+    int32_t streams = 0;
+    std::string name;
+    std::vector<MergeFieldInfo> fields;
+  };
+
+  // Runs the per-field merge batches as parallel TBB tasks under IndexRamBudget
+  // admission.  Strategy: work waits, threads don't.
+  //  - Batches are enumerated up front and sorted largest-cost-first, so the
+  //    longest field merge starts earliest and small column merges pack around it.
+  //  - admitLoop() launches every pending batch whose streams fit and whose RAM
+  //    reserves; it is re-run from each task's completion path - completions are
+  //    the only moments capacity grows, so admission is event-driven and no thread
+  //    ever blocks on the budget.
+  //  - The driver's only wait is tg.wait() on its own running tasks.  If nothing
+  //    is in flight and nothing fits, it force-admits the head batch (bounded
+  //    budget overdraft): the merge always makes progress, an oversized field
+  //    still runs (alone), and a zero-parallelism outcome equals today's serial
+  //    merge rather than a stall.
+  //  - The budget/stream reservation travels INSIDE the task object (moved into
+  //    the capture), because a canceled task_group can destroy queued tasks
+  //    without running them - destruction must still release.  Lock order is
+  //    driver mutex -> budget mutex, never inverted (releases drop the budget
+  //    guard before taking the driver mutex).
+  // Failure containment is unchanged: a throwing batch cancels the group, wait()
+  // rethrows the first exception, and the caller's merge-failure handling applies.
+  class MergeAdmissionDriver {
+    SegmentMerger& merger;
+    IndexRamBudget& budget;
+    oneapi::tbb::task_group_context context;
+    oneapi::tbb::task_group tg;
+    std::mutex mutex;
+    std::vector<Batch> pending;
+    int32_t inFlight = 0;
+    int32_t inFlightStreams = 0;
+
+    class BatchAdmission {
+      MergeAdmissionDriver* driver = nullptr;
+      IndexRamBudget::Guard ramGuard;
+      int32_t streams = 0;
+
+    public:
+      BatchAdmission() = default;
+      BatchAdmission(MergeAdmissionDriver& driver, IndexRamBudget::Guard&& ramGuard, int32_t streams)
+        : driver(&driver), ramGuard(std::move(ramGuard)), streams(streams) {}
+      BatchAdmission(const BatchAdmission&) = delete;
+      BatchAdmission& operator=(const BatchAdmission&) = delete;
+
+      BatchAdmission(BatchAdmission&& other) noexcept
+        : driver(other.driver), ramGuard(std::move(other.ramGuard)), streams(other.streams) {
+        other.driver = nullptr;
+        other.streams = 0;
+      }
+
+      BatchAdmission& operator=(BatchAdmission&& other) noexcept {
+        if (this != &other) {
+          releaseResources(false);
+          driver = other.driver;
+          ramGuard = std::move(other.ramGuard);
+          streams = other.streams;
+          other.driver = nullptr;
+          other.streams = 0;
+        }
+        return *this;
+      }
+
+      ~BatchAdmission() {
+        releaseResources(false);
+      }
+
+      void completeAndAdmit() {
+        releaseResources(true);
+      }
+
+    private:
+      void releaseResources(bool runAdmit) {
+        MergeAdmissionDriver* target = driver;
+        if (target == nullptr) {
+          return;
+        }
+        int32_t releasedStreams = streams;
+        driver = nullptr;
+        streams = 0;
+
+        ramGuard.release();
+
+        {
+          const std::lock_guard<std::mutex> lock(target->mutex);
+          assert(target->inFlight > 0);
+          assert(target->inFlightStreams >= releasedStreams);
+          target->inFlight--;
+          target->inFlightStreams -= releasedStreams;
+        }
+
+        if (runAdmit) {
+          target->admitLoop();
+        }
+      }
+    };
+
+  public:
+    MergeAdmissionDriver(SegmentMerger& merger, IndexRamBudget& budget, std::vector<Batch>&& batches)
+      : merger(merger), budget(budget), context(), tg(context), pending(std::move(batches)) {}
+
+    void run() {
+      for (;;) {
+        bool admitted = admitLoop();
+        bool force = false;
+        {
+          const std::lock_guard<std::mutex> lock(mutex);
+          if (context.is_group_execution_cancelled()) {
+            break;
+          }
+          if (pending.empty() && inFlight == 0) {
+            break;
+          }
+          force = inFlight == 0 && !pending.empty() && !admitted;
+        }
+
+        if (force) {
+          forceAdmitFirst();
+        }
+
+        tg.wait();
+      }
+      tg.wait();
+    }
+
+  private:
+    bool admitLoop() {
+      bool admittedAny = false;
+      for (;;) {
+        Batch batch;
+        BatchAdmission admission;
+        bool haveBatch = false;
+
+        {
+          const std::lock_guard<std::mutex> lock(mutex);
+          if (context.is_group_execution_cancelled()) {
+            return admittedAny;
+          }
+
+          for (size_t i = 0; i < pending.size(); i++) {
+            Batch& candidate = pending[i];
+            if (inFlightStreams + candidate.streams > MergeCostModel::MAX_STREAMS) {
+              continue;
+            }
+
+            auto guard = budget.tryAcquireGuard(candidate.cost);
+            if (!guard) {
+              continue;
+            }
+
+            batch = std::move(candidate);
+            pending.erase(pending.begin() + (int64_t)i);
+            inFlight++;
+            inFlightStreams += batch.streams;
+            admission = BatchAdmission(*this, std::move(*guard), batch.streams);
+            haveBatch = true;
+            admittedAny = true;
+            break;
+          }
+        }
+
+        if (!haveBatch) {
+          return admittedAny;
+        }
+
+        spawn(std::move(batch), std::move(admission));
+      }
+    }
+
+    // TODO: overdrafts are currently uncoordinated across writers - every starved
+    // merge force-admits independently, so concurrent collections can overdraw the
+    // budget by one (possibly huge) batch EACH.  See the overdraft-token TODO in
+    // IndexRamBudget.h.
+    bool forceAdmitFirst() {
+      Batch batch;
+      BatchAdmission admission;
+      {
+        const std::lock_guard<std::mutex> lock(mutex);
+        if (context.is_group_execution_cancelled() || pending.empty() || inFlight != 0) {
+          return false;
+        }
+
+        batch = std::move(pending.front());
+        pending.erase(pending.begin());
+        IndexRamBudget::Guard guard = budget.forceAcquire(batch.cost);
+        inFlight++;
+        inFlightStreams += batch.streams;
+        admission = BatchAdmission(*this, std::move(guard), batch.streams);
+      }
+
+      spawn(std::move(batch), std::move(admission));
+      return true;
+    }
+
+    struct BatchTask {
+      MergeAdmissionDriver* driver;
+      mutable Batch batch;
+      mutable BatchAdmission admission;
+
+      void operator()() const {
+        driver->merger.mergeField(batch.fields);
+        Signal::emit("segmentMergeBody");
+        admission.completeAndAdmit();
+      }
+    };
+
+    void spawn(Batch&& batch, BatchAdmission&& admission) {
+      if (context.is_group_execution_cancelled()) {
+        return;
+      }
+      tg.run(BatchTask{this, std::move(batch), std::move(admission)});
+    }
+  };
+
   std::span<PostingsReader *> preaders;
   std::span<LiveDocs*> liveDocs; // parallel to preaders, nullptr if no deletes
   PostingsWriter& postingsWriter;
+  IndexRamBudget& ramBudget;
 
   std::vector<FieldReader> fieldReaders;  // todo - pool allocate (& use smart ptr on MergeSeg if destructors needed)
   std::vector<Segment> segs;
@@ -69,8 +296,9 @@ public:
 
 
 
-  SegmentMerger(std::span<PostingsReader *> preaders, std::span<LiveDocs*> liveDocs, PostingsWriter& postingsWriter)
-  : preaders(preaders), liveDocs(liveDocs), postingsWriter(postingsWriter)
+  SegmentMerger(std::span<PostingsReader *> preaders, std::span<LiveDocs*> liveDocs,
+                PostingsWriter& postingsWriter, IndexRamBudget& ramBudget)
+  : preaders(preaders), liveDocs(liveDocs), postingsWriter(postingsWriter), ramBudget(ramBudget)
   {
     assert(preaders.size() == liveDocs.size());
   }
@@ -122,15 +350,16 @@ public:
     // IndirectPQ<Segment, decltype(fnameComp)> fieldPQ(segs, segPtrs, false);
     IndirectPQ<Segment, decltype(fnameComp)> fieldPQ(segs, segPtrs);
 
-    std::vector<MergeFieldInfo> mergeFieldInfos;
-    mergeFieldInfos.reserve(segs.size());
+    std::vector<Batch> batches;
     while (fieldPQ.size() > 0) {
-      mergeFieldInfos.resize(0);
+      Batch batch;
+      batch.fields.reserve(segs.size());
       auto currField = fieldPQ.top().fieldReader->name();
+      batch.name = std::string((std::string_view)currField);
 
       // a redundant compare the first time through here, but simpler code.
       while (fieldPQ.size() > 0 && currField == fieldPQ.top().fieldReader->name()) {
-        MergeFieldInfo& segField = mergeFieldInfos.emplace_back();
+        MergeFieldInfo& segField = batch.fields.emplace_back();
         fieldPQ.top().fieldReader->readFieldInfo(segField.segFieldInfo);
         segField.seg = &fieldPQ.top();  // point to which segment produced the segFieldInfo
 
@@ -145,20 +374,108 @@ public:
       // If merging would break any of the segment max constraints (i.e. number of unique terms in a field)
       // we could bail early.
 
-      // TBB If this gets turned into a task, we would need to copy the mergeFieldInfos since
-      // they will be reused.
-      mergeField(mergeFieldInfos);
-
-      // Test hook: a listener may throw (or block) here to exercise
-      // merge-failure containment.  No-op in production (no listeners).
-      Signal::emit("segmentMergeBody");
+      batch.cost = estimateCost(batch.fields);
+      batch.streams = estimateStreams(batch.fields);
+      batches.push_back(std::move(batch));
     }
+
+    std::sort(batches.begin(), batches.end(), [](const Batch& a, const Batch& b) {
+      if (a.cost != b.cost) {
+        return a.cost > b.cost;
+      }
+      return a.name < b.name;
+    });
+
+    MergeAdmissionDriver driver(*this, ramBudget, std::move(batches));
+    driver.run();
 
     // Caller is responsible for calling postingsWriter.finish()
     // so it can collect the filenames written.
   }
 
 private:
+  static bool isStoredField(const SegFieldInfo& info) {
+    return info.type == FieldType::BIN && (info.flags & FieldType::STORED) != 0;
+  }
+
+  static void batchTypeAndFlags(std::span<const MergeFieldInfo> fields, FieldType::Type& type, int32_t& allFlags) {
+    type = FieldType::Type::NONE;
+    allFlags = 0;
+    for (const auto& field : fields) {
+      if (type == FieldType::Type::NONE) {
+        type = field.segFieldInfo.type;
+      }
+      allFlags |= field.segFieldInfo.flags;
+    }
+  }
+
+  int64_t estimateCost(std::span<const MergeFieldInfo> fields) const {
+    assert(!fields.empty());
+    if (isStoredField(fields[0].segFieldInfo)) {
+      int64_t maxChunkBytes = 0;
+      for (const auto& field : fields) {
+        maxChunkBytes = std::max(
+            maxChunkBytes,
+            StoredFieldsReader::peekMaxChunkBytes(*field.seg->postingsReader, field.segFieldInfo));
+      }
+      // Stored-field merge processes one source segment at a time.  The
+      // value-scaled buffers are: source decompressed chunk, writer per-doc
+      // staging, writer chunk body, writer assembled uncompressed chunk, and
+      // LZ4 compression output.  LIGHT_BYTES covers fixed stream/mono scratch
+      // and the small LZ4_compressBound overhead above 1x.
+      return MergeCostModel::storedFieldsBytes(maxChunkBytes);
+    }
+
+    FieldType::Type type;
+    int32_t allFlags;
+    batchTypeAndFlags(fields, type, allFlags);
+
+    int64_t numValues = 0;
+    int64_t docsWithField = 0;
+    for (const auto& field : fields) {
+      numValues += field.segFieldInfo.numValues;
+      docsWithField += field.segFieldInfo.docsWithField;
+    }
+
+    if (type == FieldType::Type::STRING && (allFlags & FieldType::INDEX_DOCS) != 0) {
+      // Ord columns hold the term-order -> doc-order transposition in RAM until the
+      // postings pass finishes: OrdCollector allocates ords[mergedMaxDoc] (int32)
+      // up front, plus roughly a TaggedPtr/entry of pool per value for multi-value
+      // chains.  This is the heavy class the budget exists for.
+      return (int64_t)postingsWriter.getMaxDoc() * 4 + numValues * 8 + MergeCostModel::LIGHT_BYTES;
+    }
+    if (type == FieldType::Type::TEXT && (allFlags & FieldType::INDEX_DOCS) != 0) {
+      // Text postings merge streams; what accumulates is the norms build
+      // (normBytes ~1 byte per doc-with-field plus its DocStream).
+      return docsWithField * 2 + MergeCostModel::LIGHT_BYTES;
+    }
+    // Int/str/vector columns and stored fields stream through fixed block buffers.
+    return MergeCostModel::LIGHT_BYTES;
+  }
+
+  static int32_t estimateStreams(std::span<const MergeFieldInfo> fields) {
+    assert(!fields.empty());
+    if (isStoredField(fields[0].segFieldInfo)) {
+      return MergeCostModel::STORED_STREAMS;
+    }
+
+    FieldType::Type type;
+    int32_t allFlags;
+    batchTypeAndFlags(fields, type, allFlags);
+
+    if (type == FieldType::Type::STRING && (allFlags & FieldType::INDEX_DOCS) != 0) {
+      return MergeCostModel::ORD_COL_STREAMS;
+    }
+    if (type == FieldType::Type::TEXT && (allFlags & FieldType::INDEX_DOCS) != 0) {
+      return MergeCostModel::TEXT_STREAMS;
+    }
+    if ((type == FieldType::Type::STRING || type == FieldType::Type::VECTOR)
+        && (allFlags & FieldType::INDEX_DOCS) == 0) {
+      return MergeCostModel::STR_COL_STREAMS;
+    }
+    return MergeCostModel::INT_COL_STREAMS;
+  }
+
   // Helper to build mapping from old doc IDs to new doc IDs for a segment, accounting for deletes
   // Returns a vector where vector[oldDocId] = newDocId, or -1 if deleted.
   // This is still 0 based, so add the base in both cases.
@@ -434,13 +751,13 @@ private:
     // Resource name comes from the (identical across segments) field name.
     std::string_view resourceName(mergeFieldInfos[0].segFieldInfo.fieldname);
 
-    // Build a per-segment reader vector indexed by seg ord.  Null for segments
-    // whose source had no stored-fields resource.
-    std::vector<std::unique_ptr<StoredFieldsReader>> readers(segs.size());
+    // Build a per-segment field-info vector indexed by seg ord.  Null for
+    // segments whose source had no stored-fields resource.  Readers are opened
+    // one source segment at a time below so decompressed chunk scratch does not
+    // accumulate across sources.
+    std::vector<const SegFieldInfo*> fieldInfos(segs.size());
     for (auto& mfi : mergeFieldInfos) {
-      auto ord = mfi.seg->ord;
-      readers[ord] = std::make_unique<StoredFieldsReader>(
-          *mfi.seg->postingsReader, mfi.segFieldInfo);
+      fieldInfos[mfi.seg->ord] = &mfi.segFieldInfo;
     }
 
     // Config isn't threaded through the merger yet; writer uses defaults.
@@ -449,13 +766,14 @@ private:
     StoredFieldsWriter writer(postingsWriter, resourceName);
 
     for (auto& seg : segs) {
-      auto* reader = readers[seg.ord].get();
-      if (!reader) continue;  // segment had no stored-fields; writer pads automatically
+      const SegFieldInfo* fieldInfo = fieldInfos[seg.ord];
+      if (!fieldInfo) continue;  // segment had no stored-fields; writer pads automatically
+      StoredFieldsReader reader(*seg.postingsReader, *fieldInfo);
       int32_t maxDocIn = seg.postingsReader->maxDoc();
       for (int32_t localId = 0; localId < maxDocIn; localId++) {
         auto [mappedDoc, isDeleted] = seg.remapDocId(localId);
         if (isDeleted) continue;
-        reader->readDoc(localId,
+        reader.readDoc(localId,
             [&](std::string_view name, std::span<const std::string_view> values) {
           if (values.size() == 1) {
             writer.addValue(mappedDoc, name, values[0]);

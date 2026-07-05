@@ -62,8 +62,12 @@ namespace solux {
 //    - applying deletes to segments doesn't work well with concurrent segment merges.
 //      See see finishCommitBody() for how we handle this.
 
-IndexWriter::IndexWriter(Directory& dir, std::function<std::shared_ptr<Schema>()> schemaProvider)
-  : dir(dir), schemaProvider_(std::move(schemaProvider)) {
+IndexWriter::IndexWriter(Directory& dir, std::function<std::shared_ptr<Schema>()> schemaProvider,
+                         IndexRamBudget* sharedIndexRamBudget)
+  : dir(dir),
+    schemaProvider_(std::move(schemaProvider)),
+    privateIndexRamBudget(sharedIndexRamBudget == nullptr ? std::make_unique<IndexRamBudget>() : nullptr),
+    indexRamBudget(sharedIndexRamBudget == nullptr ? privateIndexRamBudget.get() : sharedIndexRamBudget) {
   mergePolicy = std::make_unique<MergePolicy>(*this); // defer creation until needed?
   nextCommitInfo = std::make_unique<CommitInfo>();
   std::shared_ptr<InputFile> segFile = dir.openFile(Postings::INDEX_INFO_FILE, true);
@@ -1610,7 +1614,7 @@ void IndexWriter::mergeSegmentsBody(MergeMessage& msg) {
 
       phase = "segment_merge";
       // Do the actual merge.
-      SegmentMerger merger(preaderPtrs, liveDocsPtrs, pwriter);
+      SegmentMerger merger(preaderPtrs, liveDocsPtrs, pwriter, *indexRamBudget);
       merger.merge();
 
       phase = "new_segment_info";

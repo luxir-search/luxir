@@ -51,6 +51,10 @@ void SoluxConfig::addOptions(CLI::App& app) {
                  "Per-inverter doc-count cap before an auto-flush to a segment")
       ->default_val(index.max_inverter_docs)
       ->check(CLI::PositiveNumber);
+  app.add_option("--max-index-ram", index.max_index_ram_mb,
+                 "Shared index RAM cap for merge admission (MiB, 0 = unlimited)")
+      ->default_val(index.max_index_ram_mb)
+      ->check(CLI::NonNegativeNumber);
 
   app.add_option("--ingest.max-request-body", ingest.max_request_body,
                  "Max buffered (non-streaming) request body; oversized -> 413 (e.g. 32MB)")

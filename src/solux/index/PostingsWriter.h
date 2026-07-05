@@ -8,6 +8,7 @@
 #include <deque>
 #include <assert.h>
 #include <iostream>
+#include <mutex>
 #include <optional>
 #include <sstream>
 #include <unordered_map>
@@ -68,8 +69,12 @@ private:
   // These are dequeues so elements don't move
   // TODO: put these in the pool?
   std::deque<IndexFieldInfo> fieldInfos;
+  // Guards the shared writer state that concurrent field-merge tasks touch: the
+  // free-stream pool (freeFiles/files), the field registry (fieldInfos), and pool
+  // (via copyTerm).  Checked-out OutputStreams are exclusively owned and need no lock.
+  std::mutex mutex;
 public:
-  MemPool pool;  // perhaps migrate to googles Arena if segment writing becomes multi-threaded.
+  MemPool pool;  // during concurrent writing, access only under mutex (see copyTerm)
   uint64_t segId;
 
 public:
@@ -82,8 +87,10 @@ public:
     return directory;
   }
 
-  // not thread-safe
+  // Thread-safe; fields may be registered concurrently and in any order
+  // (finish() sorts the field table by name).
   IndexFieldInfo& addField(PackedTerm fieldName) {
+    const std::lock_guard<std::mutex> lock(mutex);
     fieldInfos.emplace_back(); // we should get default-initialization with this for the SegFieldInfo members
     fieldInfos.back().fieldname = fieldName;
     assert(fieldInfos.back().monoLoc.offset() == 0 && fieldInfos.back().monoMetaOff == 0 && fieldInfos.back().columnMetaOff == 0);
@@ -92,16 +99,28 @@ public:
     return fieldInfos.back();
   }
 
-  // not thread-safe
   // copies the fieldName into the pool associated with this PostingsWriter.
   IndexFieldInfo& addField(std::string_view fieldName) {
-    // making the PackedTerm in the pool also not thread safe
-    return addField(PackedTerm(pool, fieldName));
+    return addField(copyTerm(fieldName));
+  }
+
+  // Thread-safe copy of a term into this writer's pool; the copy lives until the
+  // writer is destroyed.
+  PackedTerm copyTerm(std::string_view s) {
+    const std::lock_guard<std::mutex> lock(mutex);
+    return PackedTerm(pool, s);
   }
 
 
   // make sure that numFiles can be obtained, and if not create more.
   void reserveFiles(size_t numFiles) {
+    const std::lock_guard<std::mutex> lock(mutex);
+    _reserveFiles(numFiles);
+  }
+
+private:
+  // caller holds mutex
+  void _reserveFiles(size_t numFiles) {
     while (freeFiles.size() < numFiles) {
       uint32_t fnum = (uint32_t)files.size();
       // TODO: in the future, if this does IO, we may not want to lock?
@@ -118,6 +137,7 @@ public:
     }
   }
 
+public:
   // Custom deleter that holds a reference to the factory (PostingsWriter) that was used to obtain it.
   class OutputStreamDeleter {
   public:
@@ -136,15 +156,16 @@ public:
 
   typedef std::unique_ptr<OutputStream, OutputStreamDeleter> OutputStreamPtr;
 
-  // TODO: make these thread safe before making flushing or merging multi-threaded.
+  // Thread-safe.  A checked-out stream is exclusively owned until released.
   OutputStreamPtr getOutputStream() {
     return std::move(getOutputStreams<1>()[0]);
   }
 
-  // TODO: make these thread safe before making flushing or merging multi-threaded.
+  // Thread-safe.  Checked-out streams are exclusively owned until released.
   template <std::size_t N>
   std::array<OutputStreamPtr, N> getOutputStreams() {
-    reserveFiles(N);
+    const std::lock_guard<std::mutex> lock(mutex);
+    _reserveFiles(N);
     std::array<OutputStreamPtr, N> os;
     for (size_t i = 0; i < N; ++i) {
       os[i] = OutputStreamPtr(freeFiles.back(), OutputStreamDeleter(this));
@@ -153,8 +174,9 @@ public:
     return os;
   }
 
-  // TODO: make these thread safe before making flushing or merging multi-threaded.
+  // Thread-safe (called by OutputStreamDeleter from whichever thread drops the stream).
   void releaseOutputStream(OutputStream* os) {
+    const std::lock_guard<std::mutex> lock(mutex);
     auto compareBySize = [](const OutputStream* a, const OutputStream* b) {
       return a->size() < b->size();
     };
@@ -162,7 +184,6 @@ public:
     freeFiles.insert(it, os);
   }
 
-  // TODO: make these thread safe before making flushing or merging multi-threaded.
   void releaseOutputStreams(std::span<OutputStreamPtr> streams) {
     for (auto& streamPtr : streams) {
       releaseOutputStream(streamPtr.release());

@@ -49,6 +49,7 @@ private:
   int64_t chunksRegionEnd = 0;
   int32_t numChunks_ = 0;
   int32_t maxDoc_ = 0;
+  int64_t maxChunkBytes_ = 0;
 
   std::vector<std::string_view> fieldNames_;
 
@@ -76,18 +77,20 @@ public:
     chunksRegionEnd = chunksStart + fieldInfo.columnMetaOff;
     numChunks_ = (int32_t)fieldInfo.numValues;
 
-    // Read metadata block (field names) which sits at chunksStart + columnMetaOff.
+    // Read metadata block (resource stats and field names) which sits at
+    // chunksStart + columnMetaOff.
     const char* metaPtr = chunkIS.ptr(chunksRegionEnd);
     const char* end = chunkIS.ptr(chunkIS.size());
+    maxChunkBytes_ = (int64_t)InputStream::readVlong(metaPtr, end);
     uint32_t numFields = InputStream::readVint(metaPtr, end);
     fieldNames_.reserve(numFields);
     for (uint32_t i = 0; i < numFields; i++) {
       // PackedTerm layout: one-byte length followed by the string bytes.  The
       // bytes live in the input stream for the reader's lifetime, so a view
       // is safe.
-      uint8_t len = (uint8_t)*metaPtr;
-      fieldNames_.emplace_back(metaPtr + 1, len);
-      metaPtr += 1 + len;
+      PackedTerm term(const_cast<char*>(metaPtr));
+      fieldNames_.emplace_back(term.data(), term.size());
+      metaPtr += term.memorySize();
     }
 
     firstDocCol.emplace(postingsReader, fieldInfo.monoLoc, fieldInfo.monoMetaOff, numChunks_);
@@ -233,6 +236,19 @@ public:
 
   int32_t numChunks() const { return numChunks_; }
   int32_t maxDoc() const { return maxDoc_; }
+  int64_t maxChunkBytes() const { return maxChunkBytes_; }
+
+  // Cheap metadata-only read for merge admission.  Does not allocate or build
+  // chunk offset readers; it only peeks at the stored-fields metadata header.
+  static int64_t peekMaxChunkBytes(PostingsReader& postingsReader,
+                                   const SegFieldInfo& fieldInfo) {
+    assert(fieldInfo.type == FieldType::BIN);
+    InputStream chunkIS = postingsReader.getInputStream(fieldInfo.columnLoc.filenum());
+    int64_t metadataOffset = (int64_t)fieldInfo.columnLoc.offset() + fieldInfo.columnMetaOff;
+    const char* metaPtr = chunkIS.ptr(metadataOffset);
+    const char* end = chunkIS.ptr(chunkIS.size());
+    return (int64_t)InputStream::readVlong(metaPtr, end);
+  }
 
   // Try to open a StoredFieldsReader for the given resource name in the
   // segment (default: Postings::STORED_DEFAULT_RESOURCE).  Returns nullptr

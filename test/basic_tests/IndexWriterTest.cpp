@@ -975,13 +975,19 @@ static void runMultithreadedUpdates(uint64_t seed, int mergeFailPercent, int upd
 
   // Merge-failure injection.  Driven by an Rng (not a fixed stride) so failure
   // runs - back-to-back, bursts, gaps - occur naturally; future IW failure
-  // handling (backoff/quarantine) will branch on consecutiveness.  The merge
-  // node is concurrency==1, so one Rng on this listener is single-threaded.
+  // handling (backoff/quarantine) will branch on consecutiveness.  Field merge
+  // tasks emit this signal concurrently, so the listener guards the shared Rng.
   Rng mergeRng(seed ^ 0x9e3779b97f4a7c15ULL);
+  std::mutex mergeRngMutex;
   if (mergeFailPercent > 0) {
     solux::Signal::listen("segmentMergeBody",
-        [&mergeRng, mergeFailPercent](void*, void*, void*) -> void* {
-          if (mergeRng.rint(100) < mergeFailPercent) {
+        [&mergeRng, &mergeRngMutex, mergeFailPercent](void*, void*, void*) -> void* {
+          bool shouldFail = false;
+          {
+            const std::lock_guard<std::mutex> lock(mergeRngMutex);
+            shouldFail = mergeRng.rint(100) < mergeFailPercent;
+          }
+          if (shouldFail) {
             throw std::runtime_error("injected merge failure (hammer)");
           }
           return nullptr;
