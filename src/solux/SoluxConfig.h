@@ -8,7 +8,9 @@ namespace solux {
 
 struct ServerConfig {
   struct Grpc {
-    int port = 50051;
+    // <0 means "derive from the HTTP port" (http.port + 1), resolved in normalize().
+    // An explicit --server.grpc.port / -p overrides.
+    int port = -1;
     int threads = 0;  // 0 = auto
 
     /// Resolve threads: 0 means auto (hw_concurrency/2, minimum 1).
@@ -20,7 +22,7 @@ struct ServerConfig {
 
   struct Http {
     bool enabled = true;
-    int port = 8080;
+    int port = 9400;
     int threads = 0;  // 0 = auto
 
     /// Resolve threads: 0 means auto (hw_concurrency/2, minimum 1).

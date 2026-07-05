@@ -11,7 +11,7 @@ to a working search in a few commands.
 solux
 ```
 
-That's it. The HTTP/JSON API is listening on port `8080`, storing data in
+That's it. The HTTP/JSON API is listening on port `9400`, storing data in
 memory. To keep data across restarts, point it at a directory:
 
 ```bash
@@ -21,13 +21,13 @@ solux --store.backend=fs --store.data-dir=./data
 Check it's alive:
 
 ```bash
-curl http://localhost:8080/health
+curl http://localhost:9400/health
 ```
 
 ## Index your first document
 
 ```bash
-curl -X POST http://localhost:8080/collections/main/update \
+curl -X POST http://localhost:9400/collections/main/update \
   -H 'Content-Type: application/json' \
   -d '{"docs":[{"id":"1","title_w":"the left hand of darkness","author_s":"Le Guin","year_i":1969}],"commit":{}}'
 ```
@@ -46,7 +46,7 @@ you want control - you do not need one to start.
 
 > **Reading the rest of this page:** examples below drop the `curl` wrapper and
 > show just the method, path, and JSON body. To run one, wrap it:
-> `curl -X POST http://localhost:8080<path> -H 'Content-Type: application/json' -d '<body>'`.
+> `curl -X POST http://localhost:9400<path> -H 'Content-Type: application/json' -d '<body>'`.
 
 ## Search
 
@@ -119,7 +119,7 @@ group and can commit. Everything in between is just documents. To index an
 NDJSON file you already have:
 
 ```bash
-curl -X POST http://localhost:8080/collections/main/update \
+curl -X POST http://localhost:9400/collections/main/update \
   -H 'Content-Type: application/x-ndjson' \
   --data-binary @books.ndjson
 ```

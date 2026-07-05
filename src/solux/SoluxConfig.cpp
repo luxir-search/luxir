@@ -20,14 +20,16 @@ void SoluxConfig::addOptions(CLI::App& app) {
   app.add_option("--log-level", log_level, "Log level (trace, debug, info, warn, error, critical)")
       ->default_val(log_level);
 
-  app.add_option("--server.grpc.port,-p", server.grpc.port, "gRPC listen port")
-      ->default_val(server.grpc.port);
-  app.add_option("--server.grpc.threads,-t", server.grpc.threads, "Number of server threads (0 = auto)")
+  // No default_val: leaving the bound field at its sentinel (<0) lets normalize()
+  // derive the gRPC port as http.port + 1 unless the user sets one explicitly.
+  app.add_option("--server.grpc.port", server.grpc.port, "gRPC listen port (default: HTTP port + 1)");
+  app.add_option("--server.grpc.threads", server.grpc.threads, "Number of server threads (0 = auto)")
       ->default_val(server.grpc.threads);
 
   app.add_flag("--server.http.enabled,!--no-http", server.http.enabled, "Enable the HTTP/JSON server")
       ->default_val(server.http.enabled);
-  app.add_option("--server.http.port", server.http.port, "HTTP/JSON listen port")
+  // -p is the HTTP port: the HTTP/JSON API is the surface developers hit first.
+  app.add_option("--server.http.port,-p", server.http.port, "HTTP/JSON listen port")
       ->default_val(server.http.port);
   app.add_option("--server.http.threads", server.http.threads, "Number of HTTP server threads (0 = auto)")
       ->default_val(server.http.threads);
@@ -71,6 +73,9 @@ void SoluxConfig::addOptions(CLI::App& app) {
 }
 
 void SoluxConfig::normalize() {
+  // Default the gRPC port to one past the HTTP port unless it was set explicitly.
+  if (server.grpc.port < 0) server.grpc.port = server.http.port + 1;
+
   if (store.backend == "ram" && store.data_dir != "solux_data") {
     spdlog::warn("store.data-dir is ignored when store.backend=ram");
   }
