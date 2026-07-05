@@ -66,6 +66,19 @@ class DocsEnum {
   int64_t locOfPositionsForTermBlock;
 
 public:
+  // The skip structure is two levels: L0 per-block headers, and L1 group headers
+  // every L1_PERIOD blocks (see skipToBlock). There is deliberately NO level 2
+  // (a coarser index above L1). Measured 2026-07-05 with the skip-effectiveness
+  // harness (BM_SkipEffectiveness) at 1M docs: even in the aggressive-skip regime
+  // (common + rare high-idf disjunction, ~15% of blocks decoded) the L1 group
+  // walk stays tiny (~100 group-header reads for the whole query), so an L2 above
+  // it would save almost nothing. The header cost that actually dominates there is
+  // the WITHIN-group L0 walk (up to L1_PERIOD headers to reach the target block),
+  // which an L2 does not touch - the levers for that would be L1_PERIOD or a
+  // within-group L0 jump, not another level. And it is not gating regardless: the
+  // L0 walk is cheap vint reads, so skipping is a clear wall-clock win as-is.
+  // Revisit only if l0HeaderSteps/blocksDecoded blows up on much longer lists
+  // (8M+ docs); measure with the harness before adding structure.
   static constexpr int32_t L1_PERIOD = 32;
   static constexpr int32_t L1_DOCS = L1_PERIOD * Postings::DOCS_BLOCK_SIZE;
 

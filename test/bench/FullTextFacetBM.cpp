@@ -1466,8 +1466,12 @@ static void BM_FullTextScoreTopKMultiTermFrontier(benchmark::State& state,
 // (one scorer chain per call); the timed loop runs with counters off.
 //
 enum class SkipQueryClass {
-  TwoTerm,   // common head + rare tail: the canonical WAND/MaxScore disjunction
-  ThreeTerm  // common + mid + rare
+  TwoTerm,       // two dense-ish terms: both stay essential, modest skipping
+  ThreeTerm,     // common + mid + rare
+  TwoTermRare    // dense common + rare HIGH-idf: the rare term dominates scoring
+                 // and stays essential, so the common term's long list is skipped
+                 // via big advance jumps -- the workload that stresses the L1
+                 // header walk (the level2 decision case).
 };
 
 static void BM_SkipEffectiveness(benchmark::State& state,
@@ -1475,10 +1479,14 @@ static void BM_SkipEffectiveness(benchmark::State& state,
                                  int32_t topK, bool useFrontier) {
   int64_t nDocs = solux::unit_tests ? 16000 : 1'000'000;
   std::vector<int32_t> docsPerSeg = {(int32_t) nDocs};
-  // Zipfian body_w: rank 0 densest. t2 ~ head (many blocks), t50 mid, t500 tail.
-  std::vector<std::string> terms = queryClass == SkipQueryClass::TwoTerm
-    ? std::vector<std::string>{"t2", "t500"}
-    : std::vector<std::string>{"t2", "t50", "t500"};
+  // Zipfian body_w: rank 0 densest. t2 ~ head (many blocks), t50 mid, t500 tail,
+  // t10000 ~ sparse high-idf tail.
+  std::vector<std::string> terms;
+  switch (queryClass) {
+    case SkipQueryClass::TwoTerm:     terms = {"t2", "t500"}; break;
+    case SkipQueryClass::ThreeTerm:   terms = {"t2", "t50", "t500"}; break;
+    case SkipQueryClass::TwoTermRare: terms = {"t2", "t10000"}; break;
+  }
 
   CollectionHelper helper;
   static std::vector<int32_t> builtShape;
@@ -1861,6 +1869,14 @@ SOLUX_BENCHMARK_CAPTURE(BM_SkipEffectiveness, skip_2term_k10_corner,
                         SkipQueryClass::TwoTerm, 10, false);
 SOLUX_BENCHMARK_CAPTURE(BM_SkipEffectiveness, skip_3term_k10_corner,
                         SkipQueryClass::ThreeTerm, 10, false);
+// Common + rare high-idf: the aggressive-skip case that stresses the L1 header
+// walk. Watch l1_group_steps relative to blocks_decoded here for the level2 call.
+SOLUX_BENCHMARK_CAPTURE(BM_SkipEffectiveness, skip_rare_k10,
+                        SkipQueryClass::TwoTermRare, 10, true);
+SOLUX_BENCHMARK_CAPTURE(BM_SkipEffectiveness, skip_rare_k100,
+                        SkipQueryClass::TwoTermRare, 100, true);
+SOLUX_BENCHMARK_CAPTURE(BM_SkipEffectiveness, skip_rare_k1000,
+                        SkipQueryClass::TwoTermRare, 1000, true);
 
 // Pull MaxScoreDisjunctionScorer vs the wired MaxScoreBulkScorer path. The dense
 // many-clause corpus is the pre-BS1 case where most clauses stay essential.
