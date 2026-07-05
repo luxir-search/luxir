@@ -89,6 +89,43 @@ TEST_F(SimpleQueryTest, fieldedTermStaysOnField) {
   EXPECT_EQ(0u, docs.size());
 }
 
+TEST_F(SimpleQueryTest, numericFieldExactMatch) {
+  // popularity:10 style: field:value on a numeric column is an exact match
+  // (a degenerate [10,10] range), lowered to a NumericRangeQuery
+  helper.index(flatdoc("id", "n1", "title_wl", "alpha", "pop_i", "10"), UpdateMessage::NO_COMMIT);
+  helper.index(flatdoc("id", "n2", "title_wl", "beta", "pop_i", "20"), UpdateMessage::NO_COMMIT);
+  helper.index(flatdoc("id", "n3", "title_wl", "gamma", "pop_i", "10"), UpdateMessage::COMMIT);
+
+  auto docs = search("pop_i:10", {"title_wl"});
+  EXPECT_EQ(2u, docs.size());
+  EXPECT_TRUE(hasId(docs, "n1"));
+  EXPECT_TRUE(hasId(docs, "n3"));
+
+  // a quoted value is the same exact match (quotes are just delimiters)
+  EXPECT_EQ(2u, search("pop_i:\"10\"", {"title_wl"}).size());
+
+  // combines with text clauses like any other leaf
+  docs = search("pop_i:10 +alpha", {"title_wl"});
+  ASSERT_EQ(1u, docs.size());
+  EXPECT_TRUE(hasId(docs, "n1"));
+}
+
+TEST_F(SimpleQueryTest, numericFieldSyntaxDegradesWithWarning) {
+  // wildcard/fuzzy have no numeric meaning, and a non-numeric value cannot be
+  // a numeric query: both degrade to text (matching nothing over the text
+  // fields here) and declare why, rather than failing the request
+  auto run = [&](std::string_view q, std::string_view warnCode) {
+    auto req = localReq(helper.getSearchEngine());
+    req->collection("main").topDocs("q").simpleQuery(q, {"title_wl"}).fields({"id"}).limit(-1);
+    req->execute();
+    ASSERT_TRUE(req->ok()) << req->errorMsg();
+    EXPECT_TRUE(req->hasWarning(warnCode)) << q;
+  };
+  run("pop_i:1*", "numeric_field_syntax");
+  run("pop_i:10~1", "numeric_field_syntax");
+  run("pop_i:abc", "numeric_field_value");
+}
+
 TEST_F(SimpleQueryTest, phraseAndPrefix) {
   auto docs = search("\"blade runner\"", {"title_wl"});
   ASSERT_EQ(1u, docs.size());

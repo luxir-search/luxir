@@ -124,9 +124,10 @@ class SimpleQueryParser {
   };
 
 public:
-  // A field simple_query may target: term-backed and indexed.  Column-only
-  // and numeric fields degrade at parse time (the name tier) until natural
-  // arms for them exist.
+  // Term-backed and indexed fields, which support every arm (match / phrase /
+  // prefix / fuzzy) and which bare clauses may expand over.  Numeric column
+  // fields are targetable too but only for exact match - see numericQueryable.
+  // Everything else degrades to text.
   static bool termQueryable(FieldType& fieldType) {
     switch (fieldType.type()) {
       case FieldType::Type::TEXT:
@@ -368,10 +369,53 @@ private:
 
   // ---- schema consultation (arm selection only; text stays uninterpreted) ----
 
+  // Column-numeric field types (INT/FLOAT/DOUBLE/DATE, stored in the shared int
+  // column).  field: syntax targets these with an exact-match arm only
+  // (field:value or a quoted value); wildcard/fuzzy have no numeric meaning and
+  // degrade to text.  Requires column storage - the match scan reads the column,
+  // so a numeric field without it is not targetable and degrades to text.
+  static bool numericQueryable(FieldType& fieldType) {
+    switch (fieldType.type()) {
+      case FieldType::Type::INT:
+      case FieldType::Type::FLOAT:
+      case FieldType::Type::DOUBLE:
+      case FieldType::Type::DATE:
+        return fieldType.hasColumn();
+      default:
+        return false;
+    }
+  }
+
+  static std::string_view numericTypeName(FieldType::Type t) {
+    switch (t) {
+      case FieldType::Type::INT: return "integer";
+      case FieldType::Type::DATE: return "date";
+      default: return "number";  // FLOAT / DOUBLE
+    }
+  }
+
+  // Whether `value` can be coerced to the numeric field's native value.  A value
+  // that cannot (price:abc) is not a numeric query and degrades to text, so
+  // simple_query still never hard-fails at build.  Uses the same coercion
+  // contract as ingest / query build, which signals failure by throwing.
+  bool numericCoercible(FieldType& fieldType, std::string_view value) {
+    api::Val v;
+    v.kind = value;
+    try {
+      fieldType.coerceColInt64(v, fieldType.name());
+      return true;
+    } catch (const std::exception&) {
+      return false;
+    }
+  }
+
   // The queryable FieldType for a field: token's head, or null (degrade).
+  // Term-backed fields support every arm; numeric column fields are resolved
+  // here too but the caller restricts them to the exact-match arm.
   FieldType* fieldFor(std::string_view name) {
     FieldType* fieldType = opts.schema->getFieldTypePtr(name);
-    return fieldType != nullptr && termQueryable(*fieldType) ? fieldType : nullptr;
+    if (fieldType == nullptr) return nullptr;
+    return termQueryable(*fieldType) || numericQueryable(*fieldType) ? fieldType : nullptr;
   }
 
   bool isAllowed(std::string_view name) {
@@ -627,15 +671,24 @@ private:
           continue;
         }
         if (tokenFinished(pos)) {
-          // `field:` immediately followed by a quote is a fielded phrase
+          // `field:` immediately followed by a quote is a fielded phrase.  For a
+          // numeric field the quotes are just value delimiters, so makePhrase
+          // emits an exact match (matchLeaf), not a positional phrase.
           if (c == '"' && firstColon && *firstColon > 0 && *firstColon == buf.size() - 1) {
             std::string_view head(buf.data(), *firstColon);
             if (FieldType* fieldType = fieldedHead(head)) {
-              std::string_view field = arenaStr(head);
+              std::string_view field = arenaStr(head);  // head dangles once buf is reused
               auto text = parsePhraseBody();
               if (text) {
                 if (text->empty()) {
                   st.currentOp = Occur::NONE;
+                } else if (numericQueryable(*fieldType) && !numericCoercible(*fieldType, *text)) {
+                  // Uncoercible numeric value: degrade the quoted text to a
+                  // phrase over the default fields (declared).
+                  warn("numeric_field_value",
+                       fmt::format("'{}' is not a valid {} for field '{}'; treated as text",
+                                   *text, numericTypeName(fieldType->type()), field));
+                  buildQueryTree(st, makePhrase({}, nullptr, *text));
                 } else {
                   buildQueryTree(st, makePhrase(field, fieldType, *text));
                 }
@@ -692,9 +745,29 @@ private:
       // an empty value is only meaningful with a prefix star (field:* = has field)
       if (!tail.empty() || (prefix && !sawFuzzy)) {
         if (FieldType* ft = fieldedHead(head)) {
-          field = head;
-          fieldType = ft;
-          value = tail;
+          if (numericQueryable(*ft)) {
+            // Numeric column fields take only an exact-match arm (field:value).
+            // Wildcard '*' / fuzzy '~' have no numeric meaning, and a value that
+            // is not a valid number/date cannot be a numeric query; both degrade
+            // to text (like an unknown field) with a declaration.
+            if (prefix || sawFuzzy) {
+              warn("numeric_field_syntax",
+                   fmt::format("field '{}' is numeric; wildcard '*' and fuzzy '~' do not "
+                               "apply - use {}:value for an exact match", head, head));
+            } else if (!numericCoercible(*ft, tail)) {
+              warn("numeric_field_value",
+                   fmt::format("'{}' is not a valid {} for field '{}'; treated as text",
+                               tail, numericTypeName(ft->type()), head));
+            } else {
+              field = head;
+              fieldType = ft;
+              value = tail;
+            }
+          } else {
+            field = head;
+            fieldType = ft;
+            value = tail;
+          }
         }
       }
     }

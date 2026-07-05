@@ -102,8 +102,9 @@ clauses, under facet domains, as fusion sources, as filters.
   participate in block-max pruning like any other clause.
 - `simple_query`: a never-fails search-box syntax for end-user input
   (`+`/`-`, `|`, quoted phrases, grouping, trailing-`*` prefix, `~N`
-  fuzzy, `field:` prefixes) - invalid syntax degrades to terms, never to
-  an error.
+  fuzzy, and `field:value` terms - including exact numeric and date
+  matches like `price:10` or `created:2024-01-01`) - invalid syntax
+  degrades to terms, never to an error.
 - Named non-scoring filters on top-docs and fusion sources.
 
 ## Search and ranking

@@ -28,11 +28,15 @@ public:
   int32_t minMatch = 0;
 
   SimpleQueryParserTest() {
-    // title/body analyzed text; status/url unanalyzed strings
+    // title/body analyzed text; status/url unanalyzed strings; count/rating/
+    // created numeric column fields (exact-match arm only)
     schema->fieldTypeMap["title"] = std::make_shared<TextFieldType>("title");
     schema->fieldTypeMap["body"] = std::make_shared<TextFieldType>("body");
     schema->fieldTypeMap["status"] = std::make_shared<StrFieldType>("status");
     schema->fieldTypeMap["url"] = std::make_shared<StrFieldType>("url");
+    schema->fieldTypeMap["count"] = std::make_shared<IntFieldType>("count");
+    schema->fieldTypeMap["rating"] = std::make_shared<FloatFieldType>("rating");
+    schema->fieldTypeMap["created"] = std::make_shared<DateFieldType>("created");
   }
 
   SimpleQueryResult parse(std::string_view q) {
@@ -363,6 +367,96 @@ TEST_F(SimpleQueryParserTest, matchOperatorOnlyOnTextLeaves) {
   // unanalyzed STRING is a single term, so it stays unset in the echo
   EXPECT_EQ(Operator::AND, asMatch(*parse("title:foo").root).operator_);
   EXPECT_EQ(Operator::OPERATOR_UNSPECIFIED, asMatch(*parse("status:foo").root).operator_);
+}
+
+// ---- numeric column fields: exact match; wildcard/fuzzy and bad values degrade ----
+
+TEST_F(SimpleQueryParserTest, numericFieldExactMatch) {
+  // popularity:10 style - an exact numeric match (a degenerate [10,10] range
+  // downstream), no analyzer operator on the leaf
+  auto r = parse("count:10");
+  const auto& m = asMatch(*r.root);
+  EXPECT_EQ("count", m.field);
+  EXPECT_EQ("10", matchVal(*r.root));
+  EXPECT_EQ(Operator::OPERATOR_UNSPECIFIED, m.operator_);
+  EXPECT_TRUE(r.warnings.empty());
+}
+
+TEST_F(SimpleQueryParserTest, floatFieldExactMatch) {
+  auto r = parse("rating:4.5");
+  const auto& m = asMatch(*r.root);
+  EXPECT_EQ("rating", m.field);
+  EXPECT_EQ("4.5", matchVal(*r.root));
+  EXPECT_TRUE(r.warnings.empty());
+}
+
+TEST_F(SimpleQueryParserTest, dateFieldExactMatch) {
+  auto r = parse("created:2024-01-01");
+  const auto& m = asMatch(*r.root);
+  EXPECT_EQ("created", m.field);
+  EXPECT_EQ("2024-01-01", matchVal(*r.root));
+  EXPECT_TRUE(r.warnings.empty());
+}
+
+TEST_F(SimpleQueryParserTest, quotedNumericValueIsExactMatch) {
+  // quotes on a numeric field are value delimiters, not a phrase
+  auto r = parse("count:\"10\"");
+  const auto& m = asMatch(*r.root);
+  EXPECT_EQ("count", m.field);
+  EXPECT_EQ("10", matchVal(*r.root));
+  EXPECT_TRUE(r.warnings.empty());
+}
+
+TEST_F(SimpleQueryParserTest, numericFieldWildcardDegrades) {
+  // '*' has no numeric meaning: the whole token becomes text, with a teaching
+  // warning
+  auto r = parse("count:10*");
+  const auto* p = std::get_if<api::PrefixQuery>(&r.root->kind);
+  ASSERT_NE(nullptr, p);
+  EXPECT_EQ("body", p->field);
+  EXPECT_EQ("count:10", p->prefix);
+  EXPECT_TRUE(hasWarning(r, "numeric_field_syntax"));
+}
+
+TEST_F(SimpleQueryParserTest, numericFieldFuzzyDegrades) {
+  auto r = parse("count:10~1");
+  const auto* f = std::get_if<api::FuzzyQuery>(&r.root->kind);
+  ASSERT_NE(nullptr, f);
+  EXPECT_EQ("body", f->field);
+  EXPECT_EQ("count:10", f->term);
+  EXPECT_TRUE(hasWarning(r, "numeric_field_syntax"));
+}
+
+TEST_F(SimpleQueryParserTest, numericFieldExistenceStarDegrades) {
+  // field:* (has-value via empty prefix) is a wildcard arm, so it degrades too
+  auto r = parse("count:*");
+  ASSERT_NE(nullptr, std::get_if<api::PrefixQuery>(&r.root->kind));
+  EXPECT_TRUE(hasWarning(r, "numeric_field_syntax"));
+}
+
+TEST_F(SimpleQueryParserTest, numericFieldBadValueDegrades) {
+  // not a number: literal text over the default field, never a build error
+  auto r = parse("count:abc");
+  const auto& m = asMatch(*r.root);
+  EXPECT_EQ("body", m.field);
+  EXPECT_EQ("count:abc", matchVal(*r.root));
+  EXPECT_TRUE(hasWarning(r, "numeric_field_value"));
+}
+
+TEST_F(SimpleQueryParserTest, numericFieldBadQuotedValueDegrades) {
+  auto r = parse("created:\"not-a-date\"");
+  ASSERT_NE(nullptr, std::get_if<api::PhraseQuery>(&r.root->kind));  // degrades to a phrase
+  EXPECT_TRUE(hasWarning(r, "numeric_field_value"));
+}
+
+TEST_F(SimpleQueryParserTest, numericFieldNotColumnStoredDegradesSilently) {
+  // a numeric field without a column cannot be match-queried; it is not
+  // targetable and degrades to text like an unknown field (no warning)
+  schema->fieldTypeMap["qty"] = std::make_shared<IntFieldType>("qty", FieldType::INDEX_DOCS);
+  auto r = parse("qty:5");
+  EXPECT_EQ("body", asMatch(*r.root).field);
+  EXPECT_EQ("qty:5", matchVal(*r.root));
+  EXPECT_TRUE(r.warnings.empty());
 }
 
 // ---- min_match binds to user clauses, never to per-field expansion ----
