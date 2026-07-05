@@ -14,11 +14,13 @@
 #include "solux/index/IndexWriter.h"
 #include "solux/index/PostingsWriter.h"
 #include "solux/index/TrieBuilder.h"
+#include "solux/query/FuzzyQuery.h"
 #include "solux/query/Query.h"
 #include "solux/reader/DocsEnum.h"
 #include "solux/reader/FuzzySeekEnum.h"
 #include "solux/reader/PostingsReader.h"
 #include "solux/reader/TermsEnum.h"
+#include "solux/search/Collector.h"
 #include "solux/store/Directory.h"
 #include "test/SegmentTest.h"
 
@@ -30,7 +32,13 @@ constexpr int32_t kUnitTerms = Postings::TERMS_BLOCK_SIZE * 20;
 constexpr int32_t kBenchTerms = 1000000;
 constexpr int32_t kCeilJumpBlocks = 7;
 constexpr std::string_view kFieldName = "term_seek_bench_s";
+constexpr std::string_view kStatsFieldName = "term_seek_bench_w";
 constexpr std::string_view kDictPath = "/usr/share/dict/american-english";
+constexpr int32_t kDenseTargetTerms = 256;
+constexpr int32_t kDenseExactDocsPerTerm = 100;
+constexpr int32_t kDenseVariantDocsPerTerm = 175;
+constexpr int32_t kDenseVariantTerms = 2;
+constexpr int32_t kStatsMaxDocs = 300000;
 
 // Term corpus shapes.  DECIMAL is synthetic and regular (deep, narrow,
 // digit-only fanout - the id-like shape).  WORDS is a real English
@@ -109,6 +117,52 @@ int64_t trieRegionBytes(PostingsReader& postingsReader, const SegFieldInfo& fiel
   return fieldInfo.trieRootOff + rootNodeSize(root) + 8;
 }
 
+void appendBenchToken(std::string& body, std::string_view term, int32_t count) {
+  for (int32_t i = 0; i < count; i++) {
+    if (!body.empty()) body.push_back(' ');
+    body.append(term);
+  }
+}
+
+std::string denseBenchBody(std::string_view term, int32_t docOrd) {
+  std::string body;
+  int32_t tf = 0;
+  int32_t filler = 0;
+  if (docOrd < 16) {
+    tf = 96;
+    filler = 0;
+  } else {
+    tf = 1 + (docOrd % 7);
+    filler = 24 + (docOrd % 37);
+  }
+  appendBenchToken(body, term, tf);
+  appendBenchToken(body, "zzbenchfiller", filler);
+  if ((docOrd & 3) == 0) {
+    appendBenchToken(body, "yybenchpad", 3);
+  }
+  return body;
+}
+
+std::string denseVariantBenchBody(std::string_view term, int32_t docOrd) {
+  std::string body;
+  int32_t tf = 1;
+  int32_t filler = 96 + (docOrd % 17);
+  appendBenchToken(body, term, tf);
+  appendBenchToken(body, "zzbenchfiller", filler);
+  if ((docOrd & 3) == 0) {
+    appendBenchToken(body, "yybenchpad", 3);
+  }
+  return body;
+}
+
+std::string denseVariantTerm(std::string_view term, int32_t variant) {
+  assert(term.size() > 1);
+  std::string ret(term);
+  int32_t pos = 1 + (variant % ((int32_t) ret.size() - 1));
+  ret[(size_t) pos] = (char)('0' + (variant % 10));
+  return ret;
+}
+
 class TermSeekCorpus {
 public:
   SegmentTest seg;
@@ -117,6 +171,7 @@ public:
   SegFieldInfo fieldInfo;
   std::vector<std::string> terms;
   std::vector<int32_t> hitOrds;
+  std::vector<int32_t> denseOrds;
   std::vector<std::string> missTargets;
   std::vector<std::string> ceilTargets;
   std::vector<int32_t> ceilExpectedOrds;
@@ -179,6 +234,38 @@ private:
     nTerms = (int32_t)terms.size();
   }
 
+  void buildDenseOrds() {
+    if (source != TermSource::WORDS) {
+      return;
+    }
+
+    int32_t extraDocsPerDense = kDenseExactDocsPerTerm
+        + kDenseVariantTerms * kDenseVariantDocsPerTerm - 1;
+    int32_t maxDenseByDocs = extraDocsPerDense > 0 && kStatsMaxDocs > nTerms
+        ? (kStatsMaxDocs - nTerms) / extraDocsPerDense
+        : 0;
+    int32_t target = std::min({kDenseTargetTerms, maxDenseByDocs, nTerms});
+    if (target <= 0) {
+      return;
+    }
+
+    std::vector<uint8_t> selected((size_t) nTerms, 0);
+    int32_t stride = std::max(1, nTerms / target);
+    auto addDenseOrd = [&](int32_t ord) {
+      if ((int32_t)terms[(size_t)ord].size() < 5 || selected[(size_t)ord]) {
+        return;
+      }
+      selected[(size_t)ord] = 1;
+      denseOrds.push_back(ord);
+    };
+    for (int32_t ord = 0; ord < nTerms && (int32_t)denseOrds.size() < target; ord += stride) {
+      addDenseOrd(ord);
+    }
+    for (int32_t ord = 0; ord < nTerms && (int32_t)denseOrds.size() < target; ord++) {
+      addDenseOrd(ord);
+    }
+  }
+
   void buildTargets() {
     hitOrds.resize(nTerms);
     std::iota(hitOrds.begin(), hitOrds.end(), 0);
@@ -231,10 +318,35 @@ private:
   void buildStatsReader() {
     IndexWriter writer(queryDir);
     Inverter& inverter = writer.obtainInverter();
-    auto& handler = inverter.getIndexHandler(kFieldName);
+    auto& handler = inverter.getIndexHandler(kStatsFieldName);
+    std::vector<uint8_t> dense((size_t)nTerms, 0);
+    for (int32_t ord : denseOrds) {
+      dense[(size_t)ord] = 1;
+    }
+    int32_t docid = 0;
     for (int32_t ord = 0; ord < nTerms; ord++) {
-      inverter.setDoc(ord);
-      handler.index(inverter, std::string_view(terms[(size_t)ord]));
+      std::string_view term = terms[(size_t)ord];
+      if (dense[(size_t)ord]) {
+        for (int32_t docOrd = 0; docOrd < kDenseExactDocsPerTerm; docOrd++) {
+          inverter.setDoc(docid++);
+          std::string body = denseBenchBody(term, docOrd);
+          handler.index(inverter, std::string_view(body));
+        }
+        for (int32_t variant = 0; variant < kDenseVariantTerms; variant++) {
+          std::string variantTerm = denseVariantTerm(term, variant);
+          for (int32_t docOrd = 0; docOrd < kDenseVariantDocsPerTerm; docOrd++) {
+            inverter.setDoc(docid++);
+            std::string body = denseVariantBenchBody(variantTerm, docOrd);
+            handler.index(inverter, std::string_view(body));
+          }
+        }
+      } else {
+        inverter.setDoc(docid++);
+        handler.index(inverter, term);
+      }
+    }
+    if (source == TermSource::WORDS) {
+      ASSERT_LE(docid, kStatsMaxDocs);
     }
     writer.releaseInverter(inverter);
     writer.commit();
@@ -244,6 +356,7 @@ private:
 
   void build() {
     buildTerms();
+    buildDenseOrds();
     buildTargets();
     writeIndex();
     readFieldInfo();
@@ -273,6 +386,8 @@ std::shared_ptr<TermSeekCorpus> getTermSeekCorpus(TermSource source) {
 void addSizingCounters(benchmark::State& state, const TermSeekCorpus& corpus) {
   state.counters["nTerms"] = corpus.nTerms;
   state.counters["nBlocks"] = corpus.nBlocks;
+  state.counters["denseBaseTerms"] = corpus.denseOrds.size();
+  state.counters["denseTerms"] = corpus.denseOrds.size() * (1 + kDenseVariantTerms);
   state.counters["termsRegionBytes"] = corpus.termsRegionBytes;
   state.counters["termBlockOffsetsBytes"] = corpus.termBlockOffsetBytes;
   state.counters["trieBytes"] = corpus.trieBytes;
@@ -299,6 +414,25 @@ bool lookupTermStatsPostings(MemPool& pool, IndexReader& reader, CachedFieldInfo
     result.totalTermFreq += docsEnum.totalTermFreq();
   }
   return found;
+}
+
+int64_t countScoredFuzzyMatches(IndexReader& reader, std::string_view q) {
+  MemPool pool;
+  Query::Context context(pool, reader);
+  FuzzyQuery fuzzy(kStatsFieldName, q, 1, 1);
+  auto* weight = fuzzy.createWeight(context, Query::NEED_SCORES);
+  int64_t total = 0;
+
+  auto segments = context.topReader.segments();
+  for (int32_t segnum = 0; segnum < (int32_t)segments.size(); segnum++) {
+    Query::Scorer* scorer = weight->createScorer(pool, segments[segnum]);
+    if (scorer == nullptr) continue;
+    for (int32_t doc = scorer->next(); doc != PostingsReader::END; doc = scorer->next()) {
+      total++;
+    }
+  }
+
+  return total;
 }
 
 } // namespace
@@ -381,7 +515,7 @@ static void BM_TermStats_dict(benchmark::State& state, TermSource source) {
   IndexReader& reader = corpus->statsReader();
   MemPool pool;
   Query::Context context(pool, reader);
-  CachedFieldInfo* cachedFieldInfo = context.getCachedFieldInfo(kFieldName);
+  CachedFieldInfo* cachedFieldInfo = context.getCachedFieldInfo(kStatsFieldName);
   ASSERT_NE(cachedFieldInfo, nullptr);
 
   uint64_t fingerprint = 0;
@@ -408,7 +542,7 @@ static void BM_TermStats_postings(benchmark::State& state, TermSource source) {
   IndexReader& reader = corpus->statsReader();
   MemPool pool;
   Query::Context context(pool, reader);
-  CachedFieldInfo* cachedFieldInfo = context.getCachedFieldInfo(kFieldName);
+  CachedFieldInfo* cachedFieldInfo = context.getCachedFieldInfo(kStatsFieldName);
   ASSERT_NE(cachedFieldInfo, nullptr);
 
   uint64_t fingerprint = 0;
@@ -479,6 +613,73 @@ static void BM_FuzzyEnum(benchmark::State& state, TermSource source, int maxEdit
   state.counters["jumps"] = jumps;
 }
 
+static void BM_FuzzyTopK(benchmark::State& state) {
+  auto corpus = getTermSeekCorpus(TermSource::WORDS);
+  if (skipBenchIfDataMissing(state, corpus != nullptr, kDictPath)) return;
+  IndexReader& reader = corpus->statsReader();
+
+  std::vector<std::string> queries;
+  int32_t queryTarget = solux::unit_tests ? 8 : 64;
+  int32_t stride = std::max(1, (int32_t)corpus->denseOrds.size() / queryTarget);
+  for (int32_t i = 0; i < (int32_t)corpus->denseOrds.size()
+       && (int32_t)queries.size() < queryTarget; i += stride) {
+    queries.push_back(corpus->terms[(size_t)corpus->denseOrds[(size_t)i]]);
+  }
+  if (queries.empty()) {
+    state.SkipWithMessage("no dense words for fuzzy top-k");
+    return;
+  }
+
+  int64_t totalMatches = 0;
+  for (const std::string& q : queries) {
+    totalMatches += countScoredFuzzyMatches(reader, q);
+  }
+
+  uint64_t fingerprint = 0;
+  int64_t visited = 0;
+  for (auto _ : state) {
+    uint64_t fp = 1;
+    visited = 0;
+    for (const std::string& q : queries) {
+      MemPool pool;
+      Query::Context context(pool, reader);
+      FuzzyQuery fuzzy(kStatsFieldName, q, 1, 1);
+      auto* weight = fuzzy.createWeight(context, Query::NEED_SCORES);
+      TopDocsCollector collector(10);
+      MaxScoreAccumulator accumulator;
+
+      auto segments = context.topReader.segments();
+      for (int32_t segnum = 0; segnum < (int32_t)segments.size(); segnum++) {
+        auto* scorer = weight->createScorer(pool, segments[segnum]);
+        if (scorer != nullptr) {
+          collectTopK(segnum, scorer, nullptr, nullptr, collector, true, &accumulator);
+        }
+      }
+
+      visited += collector.totalHits();
+      auto topDocs = collector.sort();
+      fp = fp * 31 + (uint64_t)collector.totalHits();
+      for (const auto& sd : topDocs) {
+        fp = fp * 31 + (uint64_t)sd.doc.docId();
+        fp = fp * 31 + (uint64_t)sd.doc.segment();
+        fp = fp * 31 + (uint64_t)std::bit_cast<uint32_t>(sd.score);
+      }
+    }
+    benchmark::DoNotOptimize(fp);
+    fingerprint = fp;
+  }
+
+  state.SetItemsProcessed((int64_t)state.iterations() * (int64_t)queries.size());
+  addSizingCounters(state, *corpus);
+  state.counters["queries"] = queries.size();
+  state.counters["visited"] = visited;
+  state.counters["totalMatches"] = totalMatches;
+  state.counters["visitedRatio"] = totalMatches > 0
+      ? (double) visited / (double) totalMatches
+      : 0.0;
+  state.counters["fp"] = (int64_t)(fingerprint % 100000);
+}
+
 // grouped by source so the single-slot corpus cache builds each corpus once
 SOLUX_BENCHMARK_CAPTURE(BM_TermSeekExact_hit, decimal, TermSource::DECIMAL);
 SOLUX_BENCHMARK_CAPTURE(BM_TermSeekExact_miss, decimal, TermSource::DECIMAL);
@@ -498,6 +699,7 @@ SOLUX_BENCHMARK_CAPTURE(BM_TermStats_postings, compound, TermSource::COMPOUND);
 SOLUX_BENCHMARK_CAPTURE(BM_FuzzyEnum, compound_e2, TermSource::COMPOUND, 2);
 SOLUX_BENCHMARK_CAPTURE(BM_FuzzyEnum, words_e1, TermSource::WORDS, 1);
 SOLUX_BENCHMARK_CAPTURE(BM_FuzzyEnum, words_e2, TermSource::WORDS, 2);
+SOLUX_BENCHMARK(BM_FuzzyTopK);
 // about 1.2% slower when not ommitting frame pointer
 // adding term hashes (without using them) resulted in a slowdown of ~1%
 // med is about 5% slower than small (before any optimizations like using hashes or pulling out prefixes from block starts)

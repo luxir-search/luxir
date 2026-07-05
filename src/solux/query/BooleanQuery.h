@@ -1113,6 +1113,10 @@ public:
     int32_t currentSplitIndex() const {
       return (int32_t) splitIndex;
     }
+
+    std::span<Scorer*> clauseScorersForTests() {
+      return scorers;
+    }
   }; // MaxScoreDisjunctionScorer
 
 

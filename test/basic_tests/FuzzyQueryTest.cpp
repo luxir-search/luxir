@@ -1,14 +1,20 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <bit>
+#include <string>
+#include <vector>
 
 #include "test/SoluxTest.h"
 #include "test/TestIndex.h"
 #include "test/CollectionHelper.h"
 #include "test/LocalReq.h"
+#include "solux/query/BooleanQuery.h"
 #include "solux/query/FuzzyQuery.h"
 #include "solux/query/QueryBuilder.h"
+#include "solux/reader/Postings.h"
 #include "solux/schema/Schema.h"
+#include "solux/search/Collector.h"
 
 using namespace solux;
 using namespace solux::test;
@@ -32,6 +38,94 @@ protected:
     return docs;
   }
 };
+
+struct FuzzyTopKRun {
+  int64_t visited = 0;
+  int64_t maxScoreVisited = 0;
+  int64_t nonEssentialLookups = 0;
+  int64_t clauseBoundsChecked = 0;
+  int32_t maxSplit = 0;
+  std::vector<TopDocsCollector::ScoreDoc> topDocs;
+};
+
+static std::vector<TopDocsCollector::ScoreDoc> sortedFuzzyDocs(TopDocsCollector& collector) {
+  auto docs = collector.sort();
+  return {docs.begin(), docs.end()};
+}
+
+static int64_t expectFuzzyClauseBoundsSound(
+    BooleanQuery::MaxScoreDisjunctionScorer& maxScore, int32_t segnum) {
+  int64_t checked = 0;
+  auto clauses = maxScore.clauseScorersForTests();
+  for (size_t i = 0; i < clauses.size(); i++) {
+    Query::Scorer* clause = clauses[i];
+    float bound = clause->getMaxScore(PostingsReader::END);
+    float observed = 0.0f;
+    for (int32_t doc = clause->next(); doc != PostingsReader::END; doc = clause->next()) {
+      observed = std::max(observed, clause->score());
+    }
+    EXPECT_GE(bound * 1.0000001f, observed)
+        << "seg=" << segnum << " clause=" << i
+        << " bound=" << bound << " observed=" << observed;
+    checked++;
+  }
+  return checked;
+}
+
+static FuzzyTopKRun runFuzzyTopK(IndexReader& reader, int32_t topK, bool allowPruning,
+                                 bool checkClauseBounds = false) {
+  MemPool pool;
+  Query::Context ctx(pool, reader);
+  FuzzyQuery fq("body_w", "aaaaa", 1, 0);
+  auto* weight = fq.createWeight(ctx, Query::NEED_SCORES);
+  TopDocsCollector collector(topK);
+  FuzzyTopKRun result;
+
+  auto segments = ctx.topReader.segments();
+  for (int32_t segnum = 0; segnum < (int32_t)segments.size(); segnum++) {
+    if (checkClauseBounds) {
+      auto* boundScorer = weight->createScorer(pool, segments[segnum]);
+      if (boundScorer != nullptr) {
+        auto* maxScore = dynamic_cast<BooleanQuery::MaxScoreDisjunctionScorer*>(boundScorer);
+        EXPECT_NE(maxScore, nullptr);
+        if (maxScore != nullptr) {
+          result.clauseBoundsChecked += expectFuzzyClauseBoundsSound(*maxScore, segnum);
+        }
+      }
+    }
+
+    auto* scorer = weight->createScorer(pool, segments[segnum]);
+    if (scorer == nullptr) continue;
+    auto* maxScore = dynamic_cast<BooleanQuery::MaxScoreDisjunctionScorer*>(scorer);
+    EXPECT_NE(maxScore, nullptr);
+    collectTopK(segnum, scorer, nullptr, nullptr, collector, allowPruning);
+    if (maxScore != nullptr) {
+      result.maxScoreVisited += maxScore->visited();
+      result.nonEssentialLookups += maxScore->nonEssentialLookupCount();
+      result.maxSplit = std::max(result.maxSplit, maxScore->currentSplitIndex());
+    }
+  }
+
+  result.visited = collector.totalHits();
+  result.topDocs = sortedFuzzyDocs(collector);
+  return result;
+}
+
+static void expectSameTopDocs(const FuzzyTopKRun& expected, const FuzzyTopKRun& actual) {
+  ASSERT_EQ(expected.topDocs.size(), actual.topDocs.size());
+  for (size_t i = 0; i < expected.topDocs.size(); i++) {
+    EXPECT_EQ(expected.topDocs[i].doc, actual.topDocs[i].doc);
+    EXPECT_EQ(std::bit_cast<uint32_t>(expected.topDocs[i].score),
+              std::bit_cast<uint32_t>(actual.topDocs[i].score));
+  }
+}
+
+static void appendRepeatedFuzzyTerm(std::string& body, std::string_view term, int32_t count) {
+  for (int32_t i = 0; i < count; i++) {
+    if (!body.empty()) body.push_back(' ');
+    body.append(term);
+  }
+}
 
 TEST_F(FuzzyQueryTest, editDistance) {
   TestIndex ti;
@@ -171,6 +265,30 @@ TEST_F(FuzzyQueryTest, scoredDisjunctionSums) {
   EXPECT_EQ(scorer->next(), 1);
   float summed = scorer->score();          // two 1-edit terms added
   EXPECT_GT(summed, single);
+}
+
+TEST_F(FuzzyQueryTest, multiVariantDocScoreIsSumOfVariantScores) {
+  TestIndex ti;
+  TestField f(ti, "foo_w");
+  f.startIndexing();
+  f.add(0, "apply pad");
+  f.add(1, "ample pad");
+  f.add(2, "apply ample");
+  ti.flush();
+  f.startReading();
+
+  auto g = ti.pool.rewindScopeGuard();
+  FuzzyQuery fq("foo_w", "apple", 1, 0);
+  Query::Context ctx(ti.pool, *ti.reader);
+  auto* scorer = fq.createWeight(ctx, Query::NEED_SCORES)
+      ->createScorer(ti.pool, ctx.topReader.segments()[0]);
+  ASSERT_NE(scorer, nullptr);
+  EXPECT_EQ(scorer->next(), 0);
+  float apply = scorer->score();
+  EXPECT_EQ(scorer->next(), 1);
+  float ample = scorer->score();
+  EXPECT_EQ(scorer->next(), 2);
+  EXPECT_FLOAT_EQ(apply + ample, scorer->score());
 }
 
 TEST_F(FuzzyQueryTest, multiSegment) {
@@ -403,6 +521,86 @@ TEST_F(FuzzyQueryTest, unsetMaxExpansionsIsCompletePastFifty) {
   ASSERT_TRUE(req->ok()) << req->errorMsg();
   EXPECT_EQ(60u, req->getDocs().size());
   EXPECT_TRUE(req->respWarnings().empty());
+  helper.clear();
+}
+
+TEST_F(FuzzyQueryTest, scoringClauseBudgetWarnsPastK) {
+  CollectionHelper helper{"main"};
+  helper.clear();
+  constexpr int32_t kMatches = FuzzyQuery::FUZZY_SCORING_CLAUSE_BUDGET + 1;
+  for (int32_t i = 0; i < kMatches; i++) {
+    std::string term = "aaaaa";
+    int32_t pos = 1 + i / 25;
+    term[(size_t)pos] = (char)('b' + (i % 25));
+    helper.index(flatdoc("id", "d" + std::to_string(i), "body_w", term),
+                 i == kMatches - 1 ? UpdateMessage::COMMIT : UpdateMessage::NO_COMMIT);
+  }
+
+  auto req = localReq(helper.getSearchEngine());
+  req->collection("main").topDocs("q")
+      .fuzzyQuery("body_w", "aaaaa", 1, 0)
+      .fields({"id"}).limit(100).getScores();
+  req->execute();
+  ASSERT_TRUE(req->ok()) << req->errorMsg();
+  EXPECT_EQ((size_t)FuzzyQuery::FUZZY_SCORING_CLAUSE_BUDGET, req->getDocs().size());
+  ASSERT_TRUE(req->hasWarning("fuzzy_scoring_truncated"));
+  std::string message;
+  for (const auto& warning : req->respWarnings()) {
+    if (warning.code == "fuzzy_scoring_truncated") {
+      message = std::string(warning.message);
+      break;
+    }
+  }
+  EXPECT_NE(message.find("matched 65 terms"), std::string::npos) << message;
+  EXPECT_NE(message.find("top 64"), std::string::npos) << message;
+  helper.clear();
+}
+
+TEST_F(FuzzyQueryTest, scoredFuzzyTopKMatchesBruteForceWithPruningEngaged) {
+  CollectionHelper helper{"main"};
+  helper.clear();
+
+  std::vector<Doc> docs;
+  docs.reserve((size_t)(8 + 3 + 5 * 384));
+  std::string body;
+  // Medium-strength exact matches FIRST: these raise the top-k threshold
+  // early. The true top-3 docs are appended LAST (below), so an
+  // under-estimated clause bound would wrongly skip the late window that
+  // contains them - this ordering is what lets the brute-force comparison
+  // detect unsound pruning bounds, not just measure that pruning happened.
+  for (int32_t i = 0; i < 8; i++) {
+    body.clear();
+    appendRepeatedFuzzyTerm(body, "aaaaa", 40 - i);
+    docs.push_back(flatdoc("id", "h" + std::to_string(i), "body_w", body));
+  }
+
+  std::vector<std::string> variants = {"aaaab", "aaaac", "aaaad", "aaaae", "aaaaf"};
+  for (size_t v = 0; v < variants.size(); v++) {
+    for (int32_t i = 0; i < 384; i++) {
+      body.clear();
+      appendRepeatedFuzzyTerm(body, variants[v], 1);
+      appendRepeatedFuzzyTerm(body, "filler", 320);
+      docs.push_back(flatdoc("id", "l" + std::to_string(v) + "_" + std::to_string(i),
+                             "body_w", body));
+    }
+  }
+  // True top-3 at the LAST docids (see the ordering comment above).
+  for (int32_t i = 0; i < 3; i++) {
+    body.clear();
+    appendRepeatedFuzzyTerm(body, "aaaaa", 80 - i);
+    docs.push_back(flatdoc("id", "z" + std::to_string(i), "body_w", body));
+  }
+  helper.indexAll(docs, UpdateMessage::COMMIT);
+
+  auto reader = helper.getIndexWriter()->getIndexReader();
+  FuzzyTopKRun bruteForce = runFuzzyTopK(*reader, 3, false, true);
+  FuzzyTopKRun pruned = runFuzzyTopK(*reader, 3, true);
+  expectSameTopDocs(bruteForce, pruned);
+  EXPECT_GT(bruteForce.clauseBoundsChecked, 0);
+  EXPECT_LT(pruned.visited, bruteForce.visited);
+  EXPECT_LT(pruned.maxScoreVisited, bruteForce.maxScoreVisited);
+  EXPECT_GT(pruned.maxSplit, 0);
+  EXPECT_GT(pruned.nonEssentialLookups, 0);
   helper.clear();
 }
 

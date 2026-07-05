@@ -17,12 +17,20 @@ class TermQuery final : public solux::Query {
 protected:
   std::string_view field;
   std::string_view term;
+  Similarity::TermStats injectedTermStats = {};
   float boost;
   bool useFrontierBound;
+  bool hasInjectedTermStats = false;
 public:
   TermQuery(std::string_view field, std::string_view term, float boost = 1.0f,
             bool useFrontierBound = true)
       : field(field), term(term), boost(boost), useFrontierBound(useFrontierBound) {}
+
+  TermQuery(std::string_view field, std::string_view term,
+            const Similarity::TermStats& injectedTermStats, float boost = 1.0f,
+            bool useFrontierBound = true)
+      : field(field), term(term), injectedTermStats(injectedTermStats), boost(boost),
+        useFrontierBound(useFrontierBound), hasInjectedTermStats(true) {}
 
   std::string_view getField() const {
     return field;
@@ -40,6 +48,14 @@ public:
     return useFrontierBound;
   }
 
+  bool hasInjectedStats() const {
+    return hasInjectedTermStats;
+  }
+
+  const Similarity::TermStats& scoringTermStats(const CachedTermInfo& cachedTermInfo) const {
+    return hasInjectedTermStats ? injectedTermStats : cachedTermInfo.termStats;
+  }
+
   TermQuery::Weight* createWeight(Context& context, int32_t flags) override {
     return context.pool.make<TermQuery::Weight>(context, *this, flags);
   }
@@ -49,6 +65,7 @@ public:
     TermQuery& query;
     solux::CachedFieldInfo* cachedFieldInfo = nullptr;
     solux::CachedTermInfo* cachedTermInfo = nullptr;
+    solux::Similarity::BM25Scorer* simScorer = nullptr;
   public:
     Weight(Context& context, TermQuery& query, int32_t flags)
             : Query::Weight(context, flags), query(query) {
@@ -60,11 +77,21 @@ public:
         cachedTermInfo = context.getCachedTerminfo(*cachedFieldInfo, query.getTerm());
       }
       // Only set up the BM25 sim scorer when this clause's score is actually
-      // read (the cache is shared, so a scoring clause for the same term still
-      // creates it lazily).
-      if (needScores && cachedTermInfo != nullptr && cachedTermInfo->simScorer == nullptr) {
-        cachedTermInfo->simScorer = context.pool.make<solux::Similarity::BM25Scorer>(
-                solux::Similarity().getScorer(1.0f, cachedFieldInfo->fieldStats, cachedTermInfo->termStats));
+      // read. FuzzyQuery injects blended stats per clause, so those scorers are
+      // weight-local; normal term queries keep sharing the cached scorer.
+      if (needScores && cachedTermInfo != nullptr) {
+        if (query.hasInjectedStats()) {
+          simScorer = context.pool.make<solux::Similarity::BM25Scorer>(
+              solux::Similarity().getScorer(
+                  1.0f, cachedFieldInfo->fieldStats, query.scoringTermStats(*cachedTermInfo)));
+        } else {
+          if (cachedTermInfo->simScorer == nullptr) {
+            cachedTermInfo->simScorer = context.pool.make<solux::Similarity::BM25Scorer>(
+                solux::Similarity().getScorer(1.0f, cachedFieldInfo->fieldStats,
+                                              cachedTermInfo->termStats));
+          }
+          simScorer = cachedTermInfo->simScorer;
+        }
       }
     }
 
@@ -94,7 +121,7 @@ public:
         valueReader = targetPool.make<solux::IntColReader>(segment.postingsReader(), *segFieldInfo);
       }
       return targetPool.make<TermQuery::Scorer>(targetPool, *docsEnum, normsReader, valueReader,
-                                                cachedTermInfo->simScorer, query.getBoost(),
+                                                simScorer, query.getBoost(),
                                                 query.shouldUseFrontierBound());
     }
 
