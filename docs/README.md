@@ -3,6 +3,8 @@
 New here? Start with the [Quickstart](guide/quickstart.md) - index and search
 with `curl` in a few commands.
 
+- [features.md](features.md) - what Solux is and what it can do today: the
+  quick-evaluation page.
 - [guide/](guide/) - user documentation: quickstart, schema, indexing,
   querying, vector search. Written for someone with a running server and a
   client; no source checkout assumed.

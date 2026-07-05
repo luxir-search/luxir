@@ -2,7 +2,7 @@
 
 Solux is a high-performance hybrid search engine written in C++. It features a gRPC API, full-text indexing and searching, faceted search, and vector search.
 
-See [docs/design/architecture.md](docs/design/architecture.md) for the component layout, data organization, and request flow. [docs/README.md](docs/README.md) maps the documentation tree (guide/ = user, design/ = architecture+decisions, dev/ = contributor).
+See [docs/dev/codebase-map.md](docs/dev/codebase-map.md) for the component/class layout, data organization, and request flow, and [docs/design/architecture.md](docs/design/architecture.md) for the design overview and rationale. [docs/README.md](docs/README.md) maps the documentation tree (guide/ = user, design/ = architecture+decisions, dev/ = contributor).
 
 ## Build Commands
 
