@@ -282,16 +282,15 @@ public:
     // Flags for this request's main query. Filters inherit these after
     // buildFilterWeights clears NEED_SCORES.
     //
-    // We always request NEED_SCORES for now, even for requests that read no
-    // score - a count- or facet-domain-only request (limit 0) or a field sort
-    // without get_scores.  Dropping it there would skip norms/impacts/BM25, but
-    // for FuzzyQuery NEED_SCORES also selects the MATCH semantics: the scored
-    // path caps the expansion (max_expansions / operator limit) while the
-    // constant-score filter path is complete, so clearing it would silently
-    // change which docs a fuzzy count/field-sort matches versus the same query
-    // at limit > 0.  Deferred until fuzzy's memory/resource/semantics story is
-    // worked out (including what faceting over a typo-tolerant expansion means).
-    int32_t requestFlags = Query::NEED_SCORES;
+    // NEED_SCORES is purely computational (fuzzy match semantics no longer
+    // hang off it - the expansion cap is a property of the query).  A
+    // count-/domain-only request (limit 0, no get_scores) reads no score, so
+    // it skips norms/impacts/BM25 and lets boolean prep pick non-scoring
+    // iterators.  Ranked requests (limit > 0) need scores to order docs even
+    // when get_scores doesn't return them; field sorts keep that conservative
+    // behavior for now.
+    int32_t requestFlags = (limit > 0 || topDocsReq.get_scores)
+        ? Query::NEED_SCORES : 0;
     auto* weight = query->createWeight(*qcontext, requestFlags);
     auto filterWeights = buildFilterWeights(filters, *qcontext, requestFlags);
 

@@ -408,6 +408,14 @@ void collectTopK(int32_t segnum, Query::Scorer* scorer, DocSet* filter,
     }
   }
 
+  // Count-only collection (topCount == 0) never reads a score back out of the
+  // collector, and under a request without NEED_SCORES the scorers may not
+  // even be able to produce one - so score() must not be called at all.
+  bool needScores = true;
+  if constexpr (requires { collector.topCount; }) {
+    needScores = collector.topCount > 0;
+  }
+
   if (filter == nullptr || filter->type == DocSet::BITSET) {
     BitDocSet* bitDocs = (BitDocSet*)filter;
     auto* domainBits = bitDocs ? &bitDocs->bits() : nullptr;
@@ -422,7 +430,7 @@ void collectTopK(int32_t segnum, Query::Scorer* scorer, DocSet* filter,
       if (builder) {
         builder->add(doc);
       }
-      auto score = scorer->score();
+      auto score = needScores ? scorer->score() : 0.0f;
       collectOne(doc, score);
     }
   } else {
@@ -438,7 +446,7 @@ void collectTopK(int32_t segnum, Query::Scorer* scorer, DocSet* filter,
       if (builder) {
         builder->add(doc);
       }
-      auto score = scorer->score();
+      auto score = needScores ? scorer->score() : 0.0f;
       collectOne(doc, score);
     }
   }
