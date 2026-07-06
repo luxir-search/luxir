@@ -20,7 +20,8 @@
       "inherits": "base",
       "hidden": true,
       "cacheVariables": {
-        "CMAKE_BUILD_TYPE": "Debug"
+        "CMAKE_BUILD_TYPE": "Debug",
+        "CMAKE_CXX_FLAGS_DEBUG": "-g -ftrivial-auto-var-init=pattern"
       }
     },
     {
@@ -28,7 +29,8 @@
       "inherits": "base",
       "hidden": true,
       "cacheVariables": {
-        "CMAKE_BUILD_TYPE": "Release"
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_CXX_FLAGS_RELEASE": "-O3 -DNDEBUG -ftrivial-auto-var-init=uninitialized"
       }
     },
     {
@@ -36,7 +38,8 @@
       "inherits": "base",
       "hidden": true,
       "cacheVariables": {
-        "CMAKE_BUILD_TYPE": "RelWithDebInfo"
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo",
+        "CMAKE_CXX_FLAGS_RELWITHDEBINFO": "-O2 -g -DNDEBUG -ftrivial-auto-var-init=uninitialized"
       }
     },
 

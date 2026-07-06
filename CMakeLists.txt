@@ -2,6 +2,12 @@ cmake_minimum_required(VERSION 3.16)
 project(Solux VERSION 0.1)
 set(CMAKE_CXX_STANDARD 26)
 set(CMAKE_CXX_STANDARD_REQUIRED True)
+# C++26 "erroneous behavior" makes gcc zero-fill automatic storage by default,
+# which taxes hot stack scratch buffers (measured ~35-40% on phrase queries).
+# The presets override per-config flags: release/benchmarks builds use
+# -ftrivial-auto-var-init=uninitialized (C++23 codegen); debug builds use
+# =pattern so uninitialized reads surface as loud garbage instead of being
+# masked by a plausible zero (zero-init also blinds valgrind/MSan detection).
 
 # Build acceleration
 # ccache: transparent compiler cache. No-op if ccache is not installed.
