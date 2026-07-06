@@ -211,17 +211,12 @@ TEST_F(FuzzyQueryTest, advanceAndScore) {
     EXPECT_EQ(scorer->advance(5), PostingsReader::END);
   }
 
-  // Filter path is constant-scoring.
+  // Unscored and scored weights match the identical doc set: the expansion
+  // cap is a property of the query, not of NEED_SCORES. (score() is only
+  // part of the contract when NEED_SCORES was requested.)
   {
-    auto g = ti.pool.rewindScopeGuard();
-    FuzzyQuery fq("foo_w", "apple", 1, 0);
-    Query::Context ctx(ti.pool, *ti.reader);
-    auto* weight = fq.createWeight(ctx, 0);
-    EXPECT_TRUE(weight->isConstantScoring());
-    auto* scorer = weight->createScorer(ti.pool, ctx.topReader.segments()[0]);
-    ASSERT_NE(scorer, nullptr);
-    EXPECT_EQ(scorer->next(), 0);
-    EXPECT_FLOAT_EQ(scorer->score(), 1.0f);
+    EXPECT_EQ(fuzzyDocs(ti, "foo_w", "apple", 1, 0, 0, 0),
+              fuzzyDocs(ti, "foo_w", "apple", 1, 0, 0, Query::NEED_SCORES));
   }
 
   // Scoring path applies the edit-distance boost to each BM25 term score.
@@ -502,7 +497,7 @@ TEST_F(FuzzyQueryTest, exactOutranksRareOneAndTwoEditVariants) {
   helper.clear();
 }
 
-TEST_F(FuzzyQueryTest, unsetMaxExpansionsIsCompletePastFifty) {
+TEST_F(FuzzyQueryTest, unsetMaxExpansionsDefaultsToFifty) {
   CollectionHelper helper{"main"};
   helper.clear();
   for (int32_t i = 0; i < 60; i++) {
@@ -513,21 +508,32 @@ TEST_F(FuzzyQueryTest, unsetMaxExpansionsIsCompletePastFifty) {
                  i == 59 ? UpdateMessage::COMMIT : UpdateMessage::NO_COMMIT);
   }
 
+  // Unset max_expansions caps at the Lucene-compatible default (50), silently
+  // (matching Lucene/ES; the default is documented, not a surprise clamp).
   auto req = localReq(helper.getSearchEngine());
   req->collection("main").topDocs("q")
       .fuzzyQuery("body_w", "aaaaa")
       .fields({"id"}).limit(100);
   req->execute();
   ASSERT_TRUE(req->ok()) << req->errorMsg();
-  EXPECT_EQ(60u, req->getDocs().size());
+  EXPECT_EQ((size_t)FuzzyQuery::DEFAULT_MAX_EXPANSIONS, req->getDocs().size());
   EXPECT_TRUE(req->respWarnings().empty());
+
+  // An explicit max_expansions above the matched count returns everything.
+  auto req2 = localReq(helper.getSearchEngine());
+  req2->collection("main").topDocs("q")
+      .fuzzyQuery("body_w", "aaaaa", 1, 0, 100)
+      .fields({"id"}).limit(100);
+  req2->execute();
+  ASSERT_TRUE(req2->ok()) << req2->errorMsg();
+  EXPECT_EQ(60u, req2->getDocs().size());
   helper.clear();
 }
 
 TEST_F(FuzzyQueryTest, scoringClauseBudgetWarnsPastK) {
   CollectionHelper helper{"main"};
   helper.clear();
-  constexpr int32_t kMatches = FuzzyQuery::FUZZY_SCORING_CLAUSE_BUDGET + 1;
+  constexpr int32_t kMatches = FuzzyQuery::FUZZY_CLAUSE_BUDGET + 1;
   for (int32_t i = 0; i < kMatches; i++) {
     std::string term = "aaaaa";
     int32_t pos = 1 + i / 25;
@@ -536,13 +542,15 @@ TEST_F(FuzzyQueryTest, scoringClauseBudgetWarnsPastK) {
                  i == kMatches - 1 ? UpdateMessage::COMMIT : UpdateMessage::NO_COMMIT);
   }
 
+  // Explicit max_expansions above the budget: the budget clamps and warns
+  // (the silent default-50 path can't reach it).
   auto req = localReq(helper.getSearchEngine());
   req->collection("main").topDocs("q")
-      .fuzzyQuery("body_w", "aaaaa", 1, 0)
+      .fuzzyQuery("body_w", "aaaaa", 1, 0, 100)
       .fields({"id"}).limit(100).getScores();
   req->execute();
   ASSERT_TRUE(req->ok()) << req->errorMsg();
-  EXPECT_EQ((size_t)FuzzyQuery::FUZZY_SCORING_CLAUSE_BUDGET, req->getDocs().size());
+  EXPECT_EQ((size_t)FuzzyQuery::FUZZY_CLAUSE_BUDGET, req->getDocs().size());
   ASSERT_TRUE(req->hasWarning("fuzzy_scoring_truncated"));
   std::string message;
   for (const auto& warning : req->respWarnings()) {
@@ -613,9 +621,11 @@ TEST_F(FuzzyQueryTest, operatorExpansionClampWarns) {
                  i == kDocs - 1 ? UpdateMessage::COMMIT : UpdateMessage::NO_COMMIT);
   }
 
+  // Explicit max_expansions above the operator limit: the operator clamp
+  // engages and warns (the default-50 cap sits far below the operator limit).
   auto req = localReq(helper.getSearchEngine());
   req->collection("main").topDocs("q")
-      .fuzzyQuery("body_w", "aaaaaaaa", 2, 0)
+      .fuzzyQuery("body_w", "aaaaaaaa", 2, 0, 20000)
       .fields({"id"}).limit(1);
   req->execute();
   ASSERT_TRUE(req->ok()) << req->errorMsg();

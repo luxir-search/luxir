@@ -12,21 +12,26 @@
 
 #include "BooleanQuery.h"
 #include "MatchNoDocsQuery.h"
-#include "MultiTermQuery.h"
+#include "Query.h"
 #include "TermQuery.h"
 #include "solux/reader/FuzzySeekEnum.h"
 #include "solux/util/MemPool.h"
 
 namespace solux {
 
-// Fuzzy term query over byte-wise Levenshtein distance. Filter use cases take
-// the constant-score MultiTermQuery path; scoring use cases blend expansion
-// stats and rewrite to a prunable disjunction of damped TermQuery clauses.
-class FuzzyQuery final : public MultiTermQuery {
+// Fuzzy term query over byte-wise Levenshtein distance. Always rewrites to a
+// capped disjunction over the closest expanded terms (Lucene-style
+// maxExpansions, default 50), so the match set is one property of the query -
+// identical across scored, count-only, and filter use. Whether the rewritten
+// clauses score (blended stats, damped TermQuery boosts) is decided by the
+// request's NEED_SCORES flag alone.
+class FuzzyQuery final : public Query {
+  std::string_view field;
+  float boost;
   std::string_view term;
   int maxEdits;
   int prefixLength;   // clamped to <= term length
-  int maxExpansions;  // 0 means complete matching; scored path also has a clause budget
+  int maxExpansions;  // 0/unset means DEFAULT_MAX_EXPANSIONS; also clause-budget capped
 
   struct ExpansionCandidate {
     std::string_view term;
@@ -48,35 +53,41 @@ class FuzzyQuery final : public MultiTermQuery {
     return a.term < b.term;
   }
 
-  int scoringClauseLimit(Context& context) const {
-    int userLimit = maxExpansions > 0 ? maxExpansions : std::numeric_limits<int>::max();
+  // Explicit maxExpansions pins the cap; unset adopts the Lucene-compatible
+  // default rather than complete matching, so an expansion set that outgrows
+  // the corpus never silently changes query cost or (via the clause budget)
+  // which docs can match.
+  int userExpansionLimit() const {
+    return maxExpansions > 0 ? maxExpansions : DEFAULT_MAX_EXPANSIONS;
+  }
+
+  int clauseLimit(Context& context) const {
     int operatorLimit = context.limits.fuzzyMaxExpansions > 0
         ? context.limits.fuzzyMaxExpansions
         : std::numeric_limits<int>::max();
-    return std::min({userLimit, operatorLimit, FUZZY_SCORING_CLAUSE_BUDGET});
+    return std::min({userExpansionLimit(), operatorLimit, FUZZY_CLAUSE_BUDGET});
   }
 
 public:
-  // HARDWARE SENSITIVE: interim scored-fuzzy clause cap. Laptop-tuned per the
-  // tuning registry convention; re-validate on target desktop/cloud/ARM.
-  static constexpr int FUZZY_SCORING_CLAUSE_BUDGET = 64;
+  // Default expansion cap when max_expansions is unset (Lucene parity).
+  static constexpr int DEFAULT_MAX_EXPANSIONS = 50;
+
+  // HARDWARE SENSITIVE: interim clause cap (applies scored or not, so the
+  // match set stays uniform). Laptop-tuned per the tuning registry convention;
+  // re-validate on target desktop/cloud/ARM.
+  static constexpr int FUZZY_CLAUSE_BUDGET = 64;
 
   FuzzyQuery(std::string_view field, std::string_view term, int maxEdits,
              int prefixLength = 0, int maxExpansions = 0, float boost = 1.0f)
-    : MultiTermQuery(field, boost), term(term), maxEdits(maxEdits),
+    : field(field), boost(boost), term(term), maxEdits(maxEdits),
       prefixLength(std::min(prefixLength, (int)term.size())), maxExpansions(maxExpansions) {}
 
+  std::string_view getField() const { return field; }
+  float getBoost() const { return boost; }
   std::string_view getTerm() const { return term; }
   int getMaxEdits() const { return maxEdits; }
   int getPrefixLength() const { return prefixLength; }
   int getMaxExpansions() const { return maxExpansions; }
-
-  // Filter path: MultiTermQuery builds the constant-score bitset from this.
-  FilteredTermsEnum* createFilteredEnum(MemPool& pool, TermsEnum& te) override {
-    std::string_view prefix = term.substr(0, prefixLength);
-    std::string_view suffix = term.substr(prefixLength);
-    return pool.make<FuzzySeekEnum>(pool, te, prefix, suffix, maxEdits);
-  }
 
 private:
   std::vector<ExpansionCandidate> collectCandidates(Context& context, MemPool& scratch,
@@ -112,14 +123,14 @@ private:
     return candidates;
   }
 
-  void truncateScoringCandidates(Context& context,
-                                 std::vector<ExpansionCandidate>& candidates) const {
+  void truncateCandidates(Context& context,
+                          std::vector<ExpansionCandidate>& candidates) const {
     int matched = (int)candidates.size();
-    int userLimit = maxExpansions > 0 ? maxExpansions : std::numeric_limits<int>::max();
+    int userLimit = userExpansionLimit();
     int operatorLimit = context.limits.fuzzyMaxExpansions > 0
         ? context.limits.fuzzyMaxExpansions
         : std::numeric_limits<int>::max();
-    int limit = scoringClauseLimit(context);
+    int limit = clauseLimit(context);
 
     if (matched > limit) {
       std::partial_sort(candidates.begin(), candidates.begin() + limit, candidates.end(),
@@ -135,28 +146,29 @@ private:
                                "operator limit {} kept closest terms",
                                matched, getField(), getTerm(), operatorLimit));
     }
-    if (matched > FUZZY_SCORING_CLAUSE_BUDGET
-        && userLimit >= FUZZY_SCORING_CLAUSE_BUDGET
-        && operatorLimit >= FUZZY_SCORING_CLAUSE_BUDGET) {
+    if (matched > FUZZY_CLAUSE_BUDGET
+        && userLimit >= FUZZY_CLAUSE_BUDGET
+        && operatorLimit >= FUZZY_CLAUSE_BUDGET) {
       context.warn("fuzzy_scoring_truncated",
                    std::format("fuzzy expansion matched {} terms for field '{}' term '{}'; "
-                               "scoring top {} by damp with term-order tie-break",
-                               matched, getField(), getTerm(), FUZZY_SCORING_CLAUSE_BUDGET));
+                               "kept top {} by damp with term-order tie-break",
+                               matched, getField(), getTerm(), FUZZY_CLAUSE_BUDGET));
     }
   }
 
-  // The scored rewrite shares one blended TermStats across every kept clause:
+  // The rewrite shares one blended TermStats across every kept clause:
   // docFreq/ttf = max across the kept expanded terms (each already summed
   // across segments during collection). Per-term IDF would invert relevance for
   // on-by-default typo handling because misspellings are rare; blending makes
-  // edit-distance damp the intended separator.
-  Query* rewriteToScoringDisjunction(Context& context) const {
+  // edit-distance damp the intended separator. (Stats and damped boosts only
+  // matter when the request needs scores; the clause set is the same either way.)
+  Query* rewriteToDisjunction(Context& context) const {
     CachedFieldInfo* cachedFieldInfo = context.getCachedFieldInfo(getField());
     if (cachedFieldInfo == nullptr) return context.pool.make<MatchNoDocsQuery>();
 
     MemPool scratch;
     auto candidates = collectCandidates(context, scratch, *cachedFieldInfo);
-    truncateScoringCandidates(context, candidates);
+    truncateCandidates(context, candidates);
     if (candidates.empty()) return context.pool.make<MatchNoDocsQuery>();
 
     Similarity::TermStats blendedStats = {};
@@ -180,11 +192,10 @@ private:
   }
 
 public:
+  // The expansion set is selected here, independent of `flags`: NEED_SCORES
+  // decides only whether the kept clauses score, never which docs match.
   Query::Weight* createWeight(Context& context, int32_t flags) override {
-    if ((flags & NEED_SCORES) == 0) {
-      return MultiTermQuery::createWeight(context, flags);
-    }
-    return rewriteToScoringDisjunction(context)->createWeight(context, flags);
+    return rewriteToDisjunction(context)->createWeight(context, flags);
   }
 };
 
