@@ -78,7 +78,7 @@ class SimpleQueryParser {
   static constexpr int MAX_DEPTH = 64;
   static constexpr size_t NPOS = (size_t)-1;
 
-  enum class Occur : uint8_t { NONE, MUST, SHOULD };
+  enum class Occur : uint8_t { NONE, MUST, SHOULD, MUST_NOT };
 
   const SimpleQueryOptions& opts;
   std::pmr::memory_resource& mr;
@@ -108,19 +108,28 @@ class SimpleQueryParser {
   std::pmr::vector<size_t> parenClose;
   bool parenTableBuilt = false;
 
-  // One clause level under construction, mirroring Lucene's State: `top`
-  // holds the tree while it is a single node; once composed, `clauses` holds
-  // the current flat level (all one occur - an operator change collapses the
-  // level into a node and starts a new one holding it).
-  struct TreeState {
-    const api::Query* top = nullptr;
-    std::pmr::vector<const api::Query*> clauses;
-    Occur clausesOccur = Occur::NONE;
-    Occur currentOp = Occur::NONE;
-    Occur prevOp = Occur::NONE;
-    int notCount = 0;
-    explicit TreeState(std::pmr::memory_resource& mr) : clauses(&mr) {}
-    bool hasAny() const { return top != nullptr || !clauses.empty(); }
+  // A consumed unit (term / phrase / group) with the occurrence it takes in
+  // its clause list, derived from the classic-QueryParser rules below.
+  struct Clause {
+    const api::Query* q;
+    Occur occur;
+  };
+
+  // One clause list under construction (the top level or one group), in the
+  // classic QueryParser shape: a flat list of clauses, each carrying its own
+  // occur, collapsed into a single BooleanQuery (required / optional /
+  // prohibited buckets).  A '+'/'-' modifier binds to the immediately
+  // following unit (whitespace breaks the binding - the long-standing rule
+  // for '-', applied to '+' too); '|' is an OR conjunction to the next unit
+  // that survives whitespace and, under the default-AND operator, demotes the
+  // preceding clause to optional (Lucene classic QueryParser's addClause).
+  struct Level {
+    std::pmr::vector<Clause> clauses;  // in source order
+    int notCount = 0;                  // pending '-' parity (adjacency)
+    bool plus = false;                 // pending '+' (adjacency)
+    bool orConj = false;               // a '|' since the last unit
+    explicit Level(std::pmr::memory_resource& mr) : clauses(&mr) {}
+    bool hasAny() const { return !clauses.empty(); }
   };
 
 public:
@@ -180,32 +189,20 @@ public:
       return {allocQuery(all), warnings.finish()};
     }
 
-    TreeState st(mr);
+    Level st(mr);
     runRange(st, 0, end, 0);
 
     // min_match applies over the top-level USER clauses (never to a leaf's
     // per-field expansion, which is also a BooleanQuery - the shapes are
-    // indistinguishable downstream, so the decision lives here).  When the
-    // top level cannot honor it - a single clause, a required level from
-    // +/operator=AND, match-all, empty input - it is SILENTLY inapplicable:
-    // whether min_match applies is contingent on what the end user typed,
-    // and a query writer should not have to know user input to author a
-    // warning-free query.  The semantics stay consistent with the engine's
-    // clamp (min_match above the clause count means "all of them", so a
-    // single clause is already its own min_match).
-    const api::Query* root;
-    if (!st.clauses.empty()) {
-      const api::Query* collapsed = collapse(st);
-      if (opts.min_match > 0 && st.clausesOccur == Occur::SHOULD) {
-        // our own freshly built arena node; the engine clamps to the count
-        std::get<api::BooleanQuery>(const_cast<api::Query*>(collapsed)->kind).min_match =
-            opts.min_match;
-      }
-      root = collapsed;
-    } else {
-      root = st.top;
-    }
-    return {root, warnings.finish()};
+    // indistinguishable downstream, so the decision lives here).  It binds
+    // only to an optional-only top level (the engine restriction, and the
+    // classic min-should-match semantics); when the top level cannot honor
+    // it - a single clause, any required clause from +/operator=AND, a
+    // pure-negative or match-all level, empty input - it is SILENTLY
+    // inapplicable, because whether it applies is contingent on what the end
+    // user typed and a query writer should not have to know user input to
+    // author a warning-free query.  collapse() applies it at the top level.
+    return {collapse(st, /*applyMinMatch=*/true), warnings.finish()};
   }
 
 private:
@@ -325,35 +322,51 @@ private:
     return expand([&](const ExpField& f) { return mk(f.name); });
   }
 
-  // Lucene's negation shape: MUST_NOT(branch) + SHOULD(match-all).
-  const api::Query* negate(const api::Query* branch) {
-    api::Query* opt = (api::Query*)mr.allocate(sizeof(api::Query), alignof(api::Query));
-    new (opt) api::Query();
-    opt->kind = true;  // the `all` arm
-    api::Query* pro = (api::Query*)mr.allocate(sizeof(api::Query), alignof(api::Query));
-    new (pro) api::Query(*branch);
-    api::BooleanQuery bq;
-    bq.optional = std::span<const api::Query>(opt, 1);
-    bq.prohibited = std::span<const api::Query>(pro, 1);
-    api::Query q;
-    q.kind = bq;
-    return allocQuery(q);
+  api::Query* allocArr(size_t n) {
+    return (api::Query*)mr.allocate(sizeof(api::Query) * n, alignof(api::Query));
   }
 
-  // Materialize the state's tree: the active clause level becomes a
-  // BooleanQuery node (required for MUST, optional for SHOULD).
-  const api::Query* collapse(TreeState& st) {
-    if (st.clauses.empty()) return st.top;  // single node or nothing
+  // Materialize a clause list into a single node: one positive clause is
+  // returned unwrapped (a single term is not a BooleanQuery); otherwise the
+  // clauses split into the required / optional / prohibited buckets.  A level
+  // with only prohibited clauses gets a match-all optional so `-foo` means
+  // "everything except foo" (edismax behavior - the engine matches nothing on
+  // a purely negative BooleanQuery).  min_match binds only when applyMinMatch
+  // and the level is optional-only with real user optionals.
+  const api::Query* collapse(Level& st, bool applyMinMatch) {
     size_t n = st.clauses.size();
-    api::Query* arr = (api::Query*)mr.allocate(sizeof(api::Query) * n, alignof(api::Query));
-    for (size_t i = 0; i < n; i++) {
-      new (&arr[i]) api::Query(*st.clauses[i]);
+    if (n == 0) return nullptr;
+    if (n == 1 && st.clauses[0].occur != Occur::MUST_NOT) return st.clauses[0].q;
+
+    size_t nReq = 0, nOpt = 0, nPro = 0;
+    for (const Clause& c : st.clauses) {
+      if (c.occur == Occur::MUST) nReq++;
+      else if (c.occur == Occur::MUST_NOT) nPro++;
+      else nOpt++;
     }
+    bool pureNegative = (nReq == 0 && nOpt == 0);  // only prohibited -> all-except
+    size_t nOptOut = pureNegative ? 1 : nOpt;
+
+    api::Query* req = nReq ? allocArr(nReq) : nullptr;
+    api::Query* opt = nOptOut ? allocArr(nOptOut) : nullptr;
+    api::Query* pro = nPro ? allocArr(nPro) : nullptr;
+    size_t ri = 0, oi = 0, pi = 0;
+    for (const Clause& c : st.clauses) {
+      if (c.occur == Occur::MUST) new (&req[ri++]) api::Query(*c.q);
+      else if (c.occur == Occur::MUST_NOT) new (&pro[pi++]) api::Query(*c.q);
+      else new (&opt[oi++]) api::Query(*c.q);
+    }
+    if (pureNegative) {
+      new (&opt[0]) api::Query();
+      opt[0].kind = true;  // the match-all `all` arm
+    }
+
     api::BooleanQuery bq;
-    if (st.clausesOccur == Occur::MUST) {
-      bq.required = std::span<const api::Query>(arr, n);
-    } else {
-      bq.optional = std::span<const api::Query>(arr, n);
+    if (nReq) bq.required = std::span<const api::Query>(req, nReq);
+    if (nOptOut) bq.optional = std::span<const api::Query>(opt, nOptOut);
+    if (nPro) bq.prohibited = std::span<const api::Query>(pro, nPro);
+    if (applyMinMatch && opts.min_match > 0 && nReq == 0 && nOpt > 0) {
+      bq.min_match = opts.min_match;  // the engine clamps to the count
     }
     api::Query q;
     q.kind = bq;
@@ -574,7 +587,7 @@ private:
 
   // ---- the Lucene state machine ----
 
-  void runRange(TreeState& st, size_t start, size_t stop, int depth) {
+  void runRange(Level& st, size_t start, size_t stop, int depth) {
     size_t savedPos = pos;
     size_t savedEnd = end;
     pos = start;
@@ -589,16 +602,17 @@ private:
       } else if (c == '"') {
         consumePhrase(st);
       } else if (c == '+') {
-        // ignored if an operation is already pending or there is nothing yet
-        // to combine with
-        if (st.currentOp == Occur::NONE && st.hasAny()) st.currentOp = Occur::MUST;
+        // a required modifier on the immediately following unit
+        st.plus = true;
         ++pos;
+        continue;
       } else if (c == '|') {
-        if (st.currentOp == Occur::NONE && st.hasAny()) st.currentOp = Occur::SHOULD;
+        // an OR conjunction to the next unit; ignored with nothing before it
+        if (st.hasAny()) st.orConj = true;
         ++pos;
+        continue;
       } else if (c == '-') {
-        // two in a row negate each other; even whitespace between '-' and its
-        // clause breaks the negation (hence the notCount reset below)
+        // a prohibited modifier; two in a row cancel
         ++st.notCount;
         ++pos;
         continue;
@@ -607,6 +621,11 @@ private:
       } else {
         consumeToken(st);
       }
+      // Adjacency reset: a pending +/- binds only to a unit that immediately
+      // follows it, so whitespace or a stray ')' between them drops it.
+      // orConj is NOT reset here - it is the conjunction to the next unit
+      // (spaces and all) and is cleared when that unit is consumed.
+      st.plus = false;
       st.notCount = 0;
     }
 
@@ -615,12 +634,12 @@ private:
   }
 
   const api::Query* parseRange(size_t start, size_t stop, int depth) {
-    TreeState st(mr);
+    Level st(mr);
     runRange(st, start, stop, depth);
-    return collapse(st);
+    return collapse(st, /*applyMinMatch=*/false);  // min_match is a top-level knob
   }
 
-  void consumeSubQuery(TreeState& st, int depth) {
+  void consumeSubQuery(Level& st, int depth) {
     size_t open = pos;
     size_t start = open + 1;
     size_t close = matchingClose(open);
@@ -629,8 +648,8 @@ private:
       // contents reparse
       pos = start;
     } else if (close == start) {
-      // "()" resets a pending operation (it would have applied to this group)
-      st.currentOp = Occur::NONE;
+      // "()" drops a pending modifier (it would have applied to this group)
+      clearPending(st);
       pos = close + 1;
     } else if (depth + 1 >= MAX_DEPTH) {
       warn("depth_clamped",
@@ -639,22 +658,22 @@ private:
     } else {
       const api::Query* sub = parseRange(start, close, depth + 1);
       pos = close + 1;
-      buildQueryTree(st, sub);
+      addUnit(st, sub);  // null (empty group) just drops the pending modifier
     }
   }
 
-  void consumePhrase(TreeState& st) {
+  void consumePhrase(Level& st) {
     auto text = parsePhraseBody();
     if (!text) return;  // unterminated: opening quote extraneous
     if (text->empty()) {
-      // "" resets a pending operation (Lucene behavior)
-      st.currentOp = Occur::NONE;
+      // "" drops a pending modifier (Lucene behavior)
+      clearPending(st);
       return;
     }
-    buildQueryTree(st, makePhrase({}, nullptr, *text));
+    addUnit(st, makePhrase({}, nullptr, *text));
   }
 
-  void consumeToken(TreeState& st) {
+  void consumeToken(Level& st) {
     buf.clear();
     bool escaped = false;
     bool prefix = false;
@@ -681,16 +700,16 @@ private:
               auto text = parsePhraseBody();
               if (text) {
                 if (text->empty()) {
-                  st.currentOp = Occur::NONE;
+                  clearPending(st);
                 } else if (numericQueryable(*fieldType) && !numericCoercible(*fieldType, *text)) {
                   // Uncoercible numeric value: degrade the quoted text to a
                   // phrase over the default fields (declared).
                   warn("numeric_field_value",
                        fmt::format("'{}' is not a valid {} for field '{}'; treated as text",
                                    *text, numericTypeName(fieldType->type()), field));
-                  buildQueryTree(st, makePhrase({}, nullptr, *text));
+                  addUnit(st, makePhrase({}, nullptr, *text));
                 } else {
-                  buildQueryTree(st, makePhrase(field, fieldType, *text));
+                  addUnit(st, makePhrase(field, fieldType, *text));
                 }
                 return;
               }
@@ -781,31 +800,42 @@ private:
     } else {
       branch = makeDefault(field, fieldType, value);
     }
-    buildQueryTree(st, branch);
+    addUnit(st, branch);
   }
 
-  // Fold a consumed clause into the tree (Lucene buildQueryTree): the level
-  // stays flat while the operator repeats; an operator change collapses the
-  // level into a single node and starts a new level holding it.
-  void buildQueryTree(TreeState& st, const api::Query* branch) {
-    if (branch == nullptr) return;
-    if (st.notCount % 2 == 1) branch = negate(branch);
+  void clearPending(Level& st) {
+    st.plus = false;
+    st.notCount = 0;
+    st.orConj = false;
+  }
 
-    if (!st.hasAny()) {
-      st.top = branch;
-    } else {
-      if (st.currentOp == Occur::NONE) st.currentOp = defaultOccur;
-      if (st.prevOp != st.currentOp) {
-        const api::Query* old = collapse(st);
-        st.top = nullptr;
-        st.clauses.clear();
-        st.clauses.push_back(old);
-        st.clausesOccur = st.currentOp;
-      }
-      st.clauses.push_back(branch);
-      st.prevOp = st.currentOp;
+  // Add a consumed unit as a clause, deriving its occur from the pending
+  // modifiers/conjunction (classic Lucene QueryParser addClause, restricted to
+  // this dialect's operator set: conjunction is none or '|'/OR, modifier is
+  // none, '+'/required, or '-'/prohibited).  The default operator decides only
+  // BARE clauses: '-' always prohibits and '+' always requires.  Under the
+  // default-AND operator an OR conjunction demotes the preceding clause to
+  // optional too, so `a | b` stays a disjunction.  A null branch (empty group)
+  // just consumes the pending modifiers.
+  void addUnit(Level& st, const api::Query* branch) {
+    if (branch == nullptr) {
+      clearPending(st);
+      return;
     }
-    st.currentOp = Occur::NONE;
+    bool prohibited = (st.notCount % 2 == 1);
+    bool plus = st.plus;
+    bool orConj = st.orConj;
+    clearPending(st);
+
+    if (defaultOccur == Occur::MUST && orConj && !st.clauses.empty()) {
+      Clause& prev = st.clauses.back();
+      if (prev.occur != Occur::MUST_NOT) prev.occur = Occur::SHOULD;
+    }
+
+    Occur occ = prohibited                     ? Occur::MUST_NOT
+              : defaultOccur == Occur::MUST     ? (orConj ? Occur::SHOULD : Occur::MUST)
+              :                                   (plus ? Occur::MUST : Occur::SHOULD);
+    st.clauses.push_back({branch, occ});
   }
 };
 

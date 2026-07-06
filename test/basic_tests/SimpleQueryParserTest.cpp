@@ -90,11 +90,42 @@ TEST_F(SimpleQueryParserTest, juxtapositionIsOptionalByDefault) {
   EXPECT_EQ("bar", matchVal(b.optional[1]));
 }
 
-TEST_F(SimpleQueryParserTest, andOperatorMakesRequired) {
-  auto r = parse("foo +bar");  // '+' applies between clauses
+TEST_F(SimpleQueryParserTest, plusIsUnaryRequired) {
+  // '+' is a unary modifier on the next clause, not an infix operator: the
+  // default operator applies only to the bare clause (classic QueryParser /
+  // Google precedence).  '+foo bar' = require foo, bar optional.
+  auto r = parse("+foo bar");
   const auto& b = asBool(*r.root);
-  ASSERT_EQ(2u, b.required.size());
-  EXPECT_TRUE(b.optional.empty());
+  ASSERT_EQ(1u, b.required.size());
+  EXPECT_EQ("foo", matchVal(b.required[0]));
+  ASSERT_EQ(1u, b.optional.size());
+  EXPECT_EQ("bar", matchVal(b.optional[0]));
+
+  // all-'+' is a pure conjunction (how the benchmark corpus expresses AND)
+  const auto& b2 = asBool(*parse("+foo +bar").root);
+  ASSERT_EQ(2u, b2.required.size());
+  EXPECT_TRUE(b2.optional.empty());
+
+  // a trailing '+' with nothing after it is dropped (never fails)
+  EXPECT_EQ("foo", matchVal(*parse("foo+").root));
+}
+
+TEST_F(SimpleQueryParserTest, minusIsUnaryProhibitedAndRestricts) {
+  // '-foo bar' restricts: prohibit foo, bar optional (not the old widening
+  // "all-except-foo OR bar")
+  auto r = parse("-foo bar");
+  const auto& b = asBool(*r.root);
+  ASSERT_EQ(1u, b.prohibited.size());
+  EXPECT_EQ("foo", matchVal(b.prohibited[0]));
+  ASSERT_EQ(1u, b.optional.size());
+  EXPECT_EQ("bar", matchVal(b.optional[0]));
+  EXPECT_TRUE(b.required.empty());
+}
+
+TEST_F(SimpleQueryParserTest, plusBindsOnlyWhenAdjacent) {
+  // whitespace between '+' and its clause drops it, mirroring the '-' rule
+  auto r = parse("+ foo");
+  EXPECT_EQ("foo", matchVal(*r.root));
 }
 
 TEST_F(SimpleQueryParserTest, defaultOperatorAnd) {
@@ -106,14 +137,20 @@ TEST_F(SimpleQueryParserTest, defaultOperatorAnd) {
   EXPECT_EQ(Operator::AND, asMatch(b.required[0]).operator_);
 }
 
-TEST_F(SimpleQueryParserTest, operatorChangeNests) {
-  // left fold: (foo OR bar) AND baz
-  auto r = parse("foo | bar + baz");
-  const auto& outer = asBool(*r.root);
-  ASSERT_EQ(2u, outer.required.size());
-  const auto& inner = asBool(outer.required[0]);
-  ASSERT_EQ(2u, inner.optional.size());
-  EXPECT_EQ("baz", matchVal(outer.required[1]));
+TEST_F(SimpleQueryParserTest, orConjunction) {
+  // under the default OR, '|' is a no-op: both clauses are already optional
+  const auto& b = asBool(*parse("foo | bar").root);
+  ASSERT_EQ(2u, b.optional.size());
+  EXPECT_TRUE(b.required.empty());
+
+  // under the default AND, '|' keeps its two operands optional (classic
+  // QueryParser: an OR conjunction demotes the preceding clause); a bare
+  // neighbor stays required
+  op = Operator::AND;
+  const auto& b2 = asBool(*parse("foo | bar baz").root);
+  ASSERT_EQ(2u, b2.optional.size());  // foo, bar
+  ASSERT_EQ(1u, b2.required.size());  // baz
+  EXPECT_EQ("baz", matchVal(b2.required[0]));
 }
 
 TEST_F(SimpleQueryParserTest, negation) {
@@ -137,11 +174,13 @@ TEST_F(SimpleQueryParserTest, whitespaceBreaksNegation) {
 }
 
 TEST_F(SimpleQueryParserTest, precedenceGroups) {
+  // '+' applies to the group; the bare word stays optional (default OR)
   auto r = parse("foo +(bar | baz)");
   const auto& outer = asBool(*r.root);
-  ASSERT_EQ(2u, outer.required.size());
-  EXPECT_EQ("foo", matchVal(outer.required[0]));
-  const auto& inner = asBool(outer.required[1]);
+  ASSERT_EQ(1u, outer.required.size());  // the +(...) group
+  ASSERT_EQ(1u, outer.optional.size());  // bare foo
+  EXPECT_EQ("foo", matchVal(outer.optional[0]));
+  const auto& inner = asBool(outer.required[0]);
   ASSERT_EQ(2u, inner.optional.size());
 }
 
@@ -487,8 +526,8 @@ TEST_F(SimpleQueryParserTest, minMatchOnRequiredClausesIsSilentlyInapplicable) {
   minMatch = 2;
   auto r = parse("foo +bar");
   const auto& b = asBool(*r.root);
-  ASSERT_EQ(2u, b.required.size());
-  EXPECT_EQ(0, b.min_match);
+  ASSERT_EQ(1u, b.required.size());  // +bar; foo is optional
+  EXPECT_EQ(0, b.min_match);         // a required clause is present: inapplicable
   EXPECT_TRUE(r.warnings.empty());
 }
 
@@ -524,9 +563,10 @@ TEST_F(SimpleQueryParserTest, unmatchedQuoteDoesNotPoisonLaterGroups) {
   // after it must still be a group (an unpaired quote is not a quote)
   auto r = parse("\"foo +(bar | baz)");
   const auto& b = asBool(*r.root);
-  ASSERT_EQ(2u, b.required.size());
-  EXPECT_EQ("foo", matchVal(b.required[0]));
-  const auto& inner = asBool(b.required[1]);
+  ASSERT_EQ(1u, b.required.size());  // the +(...) group
+  ASSERT_EQ(1u, b.optional.size());  // bare foo
+  EXPECT_EQ("foo", matchVal(b.optional[0]));
+  const auto& inner = asBool(b.required[0]);
   EXPECT_EQ(2u, inner.optional.size());
 }
 

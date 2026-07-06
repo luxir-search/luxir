@@ -68,16 +68,17 @@ TEST_F(SimpleQueryTest, mustAndMustNot) {
   ASSERT_EQ(1u, docs.size());
   EXPECT_TRUE(hasId(docs, "d2"));
 
-  // Lucene semantics: under the default OR, a negated clause is its own
-  // optional leg (all-except-x), so it widens rather than restricts
+  // '-' is a unary prohibition that RESTRICTS even under the default OR
+  // (classic QueryParser): scifi-tagged docs minus those with "blade" in the
+  // title leaves d3 (d1 is excluded)
   docs = search("tag_s:scifi -blade", {"title_wl"});
-  EXPECT_EQ(3u, docs.size());
-
-  // restrictive negation comes from the AND operator
-  docs = search("tag_s:scifi -blade", {"title_wl"},
-                [](solux::api::SimpleQuery& sq) { sq.operator_ = Operator::AND; });
   ASSERT_EQ(1u, docs.size());
   EXPECT_TRUE(hasId(docs, "d3"));
+
+  // a purely negative query is "everything except": all docs minus title:blade
+  docs = search("-blade", {"title_wl"});
+  EXPECT_EQ(2u, docs.size());  // d2, d3
+  EXPECT_FALSE(hasId(docs, "d1"));
 }
 
 TEST_F(SimpleQueryTest, fieldedTermStaysOnField) {
@@ -208,9 +209,9 @@ TEST_F(SimpleQueryTest, quotedValueOnStringFieldIsExactMatch) {
 TEST_F(SimpleQueryTest, minMatchOnRequiredTopLevelIsSilentlyInapplicable) {
   auto req = localReq(helper.getSearchEngine());
   auto& cur = req->collection("main").topDocs("q");
-  // note a LEADING '+' would be ignored (nothing before it to combine with);
-  // this one makes the top level required, so min_match cannot apply - and
-  // that is user-input-contingent, so it costs no warning
+  // '+runner' is a required clause, so the top level is not optional-only and
+  // min_match cannot apply - that is user-input-contingent, so it costs no
+  // warning
   cur.simpleQuery("blade +runner", {"title_wl"}).fields({"id"}).limit(-1);
   std::get<solux::api::SimpleQuery>(cur.rawQuery().kind).min_match = 2;
   req->execute();
