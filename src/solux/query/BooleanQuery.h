@@ -313,7 +313,13 @@ public:
       }
 
       BulkScorer* bulkScorer(MemPool& targetPool) override {
-        if (!needsScores || !mandatorySources.empty() || !prohibitedSources.empty()
+        // Shape gate only - scoring is not required. Without scores the clause
+        // scorers report score()=0 / getMaxScore()=+inf, the window split stays
+        // at zero (every clause essential), and the window loop degenerates to
+        // an exhaustive per-clause OR into the window bitset - the right
+        // execution for unscored counting, far cheaper than the doc-at-a-time
+        // heap disjunction.
+        if (!mandatorySources.empty() || !prohibitedSources.empty()
             || !filterSuppliers.empty() || minShouldMatch > 1 || optionalSources.size() < 2) {
           return nullptr;
         }

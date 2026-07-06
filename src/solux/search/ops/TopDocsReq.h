@@ -306,16 +306,20 @@ public:
           } else {
             // get_number requests an exact total hit count, which is incompatible with
             // impact block skipping (skipped docs are not visited, so not counted).
-            // keep origin/main's bulk-scorer pruning path; concrete TopDocs has get_number
-            // as a bare field (was the protobuf get_number() accessor).
+            // The windowed bulk path is still used - it just runs with theta pinned
+            // (allowPruning=false) so every matching doc is visited: per-clause
+            // window drives beat the doc-at-a-time heap disjunction even without
+            // skipping. The accumulator is withheld too, so this segment's
+            // threshold cannot leak into sibling segments' pruning decisions.
             bool allowPruning = !op.topDocsProto.get_number;
             BulkScorer* bulk = nullptr;
-            if (allowPruning && builderPtr == nullptr) {
+            if (builderPtr == nullptr) {
               bulk = supplier->bulkScorer(poolGuard.pool());
             }
             if (bulk != nullptr) {
               collectTopKWindowed(segnum, bulk, collectorFilter, *data->scoreCollector,
-                                  &scoreAccumulator, seg.maxDoc());
+                                  allowPruning ? &scoreAccumulator : nullptr, seg.maxDoc(),
+                                  allowPruning);
             } else {
               auto* scorer = supplier->get(poolGuard.pool(), std::numeric_limits<int64_t>::max());
               if (scorer != nullptr) {

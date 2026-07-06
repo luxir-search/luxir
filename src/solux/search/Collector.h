@@ -452,10 +452,15 @@ void collectTopK(int32_t segnum, Query::Scorer* scorer, DocSet* filter,
   }
 }
 
+// allowPruning=false pins theta at lowest so the bulk scorer must visit every
+// matching doc (exact total counts). The collector's rising min-competitive
+// value is deliberately NOT forwarded in that mode - skipped docs cannot be
+// counted. Callers should also pass accumulator=nullptr then, so this
+// segment's threshold does not leak to sibling segments.
 template <typename Collector>
 void collectTopKWindowed(int32_t segnum, BulkScorer* bulk, DocSet* filter,
                          Collector& collector, MaxScoreAccumulator* accumulator,
-                         int32_t maxDoc) {
+                         int32_t maxDoc, bool allowPruning = true) {
   static_assert(requires(Collector& c) { c.minCompetitiveVal; },
                 "collectTopKWindowed is only for score top-k collectors");
 
@@ -463,9 +468,11 @@ void collectTopKWindowed(int32_t segnum, BulkScorer* bulk, DocSet* filter,
   int32_t cursor = 0;
   ScoreWindow window;
   while (cursor != PostingsReader::END && cursor < maxDoc) {
-    float theta = accumulator != nullptr
-      ? std::max(collector.minCompetitiveVal, accumulator->get())
-      : collector.minCompetitiveVal;
+    float theta = !allowPruning
+      ? std::numeric_limits<float>::lowest()
+      : accumulator != nullptr
+        ? std::max(collector.minCompetitiveVal, accumulator->get())
+        : collector.minCompetitiveVal;
     int32_t next = bulk->scoreNextWindow(window, filter, cursor, maxDoc, theta);
 
     for (int32_t i = 0; i < window.size; i++) {
