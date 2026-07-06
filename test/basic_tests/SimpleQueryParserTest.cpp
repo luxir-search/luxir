@@ -106,8 +106,9 @@ TEST_F(SimpleQueryParserTest, plusIsUnaryRequired) {
   ASSERT_EQ(2u, b2.required.size());
   EXPECT_TRUE(b2.optional.empty());
 
-  // a trailing '+' with nothing after it is dropped (never fails)
-  EXPECT_EQ("foo", matchVal(*parse("foo+").root));
+  // a '+' glued to a term is literal (operators are only operators at a
+  // clause boundary): "foo+" is the single term "foo+"
+  EXPECT_EQ("foo+", matchVal(*parse("foo+").root));
 }
 
 TEST_F(SimpleQueryParserTest, minusIsUnaryProhibitedAndRestricts) {
@@ -162,9 +163,59 @@ TEST_F(SimpleQueryParserTest, negation) {
   EXPECT_EQ("foo", matchVal(b.prohibited[0]));
 }
 
-TEST_F(SimpleQueryParserTest, doubleNegationCancels) {
-  auto r = parse("--foo");
-  EXPECT_EQ("foo", matchVal(*r.root));
+TEST_F(SimpleQueryParserTest, operatorsAreLiteralMidToken) {
+  // '+' '|' are operators ONLY at a clause boundary; glued into a term they
+  // are ordinary bytes and pass through to analysis (the distinguishing rule)
+  EXPECT_EQ("c++", matchVal(*parse("c++").root));
+  EXPECT_EQ("a+b", matchVal(*parse("a+b").root));
+  EXPECT_EQ("a|b", matchVal(*parse("a|b").root));
+
+  // the rule extends into fielded values too
+  EXPECT_EQ("+foo", matchVal(*parse("status:+foo").root));
+  EXPECT_EQ("a|b", matchVal(*parse("status:a|b").root));
+
+  // space-separated, the same characters are operators again
+  EXPECT_EQ(2u, asBool(*parse("a | b").root).optional.size());
+  const auto& b = asBool(*parse("a +b").root);
+  ASSERT_EQ(1u, b.required.size());
+  EXPECT_EQ("b", matchVal(b.required[0]));
+  ASSERT_EQ(1u, b.optional.size());
+  EXPECT_EQ("a", matchVal(b.optional[0]));
+}
+
+TEST_F(SimpleQueryParserTest, stackedLeadingSignsFirstWins) {
+  // only the FIRST sign at a boundary is a modifier; the rest are literal
+  // term bytes.  '+-foo' = require the term "-foo" (single clause, unwrapped)
+  EXPECT_EQ("-foo", matchVal(*parse("+-foo").root));
+
+  // '-+foo' = prohibit the term "+foo"; a pure-negative level gets a match-all
+  // companion so it means "everything except"
+  const auto& b = asBool(*parse("-+foo").root);
+  ASSERT_EQ(1u, b.prohibited.size());
+  EXPECT_EQ("+foo", matchVal(b.prohibited[0]));
+  ASSERT_EQ(1u, b.optional.size());
+  EXPECT_TRUE(std::holds_alternative<bool>(b.optional[0].kind));
+
+  // '--foo' no longer cancels: '-' modifier + literal term "-foo"
+  const auto& b2 = asBool(*parse("--foo").root);
+  ASSERT_EQ(1u, b2.prohibited.size());
+  EXPECT_EQ("-foo", matchVal(b2.prohibited[0]));
+
+  // '-|foo' = prohibit the term "|foo" (the '|' is literal after the sign)
+  const auto& b3 = asBool(*parse("-|foo").root);
+  ASSERT_EQ(1u, b3.prohibited.size());
+  EXPECT_EQ("|foo", matchVal(b3.prohibited[0]));
+}
+
+TEST_F(SimpleQueryParserTest, extraneousParenNeutralForBoundary) {
+  // an unmatched '(' is extraneous and leaves the clause boundary untouched,
+  // so a following sign is still a modifier (as it is in a matched group)
+  const auto& b = asBool(*parse("(-foo").root);
+  ASSERT_EQ(1u, b.prohibited.size());
+  EXPECT_EQ("foo", matchVal(b.prohibited[0]));
+
+  EXPECT_EQ("foo", matchVal(*parse("(+foo").root));  // required single -> leaf
+  EXPECT_EQ("foo", matchVal(*parse(")+foo").root));  // a stray ')' is neutral too
 }
 
 TEST_F(SimpleQueryParserTest, whitespaceBreaksNegation) {
@@ -246,8 +297,11 @@ TEST_F(SimpleQueryParserTest, fuzzyOperator) {
   // ~0 is a plain term
   EXPECT_EQ("abc", matchVal(*parse("abc~0").root));
 
-  // garbage after ~ is swallowed (Lucene behavior)
-  EXPECT_EQ("abc", matchVal(*parse("abc~xyz").root));
+  // a '~' is a fuzzy operator only as a clean trailing suffix (digits then a
+  // token boundary); mangled fuzzy syntax is a literal byte, so the whole
+  // thing reads as one term (like '*' anywhere but the token end)
+  EXPECT_EQ("abc~xyz", matchVal(*parse("abc~xyz").root));
+  EXPECT_EQ("abc~2+d", matchVal(*parse("abc~2+d").root));
 }
 
 TEST_F(SimpleQueryParserTest, fuzzyClampDeclared) {

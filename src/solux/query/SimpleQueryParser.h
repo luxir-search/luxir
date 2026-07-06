@@ -118,11 +118,11 @@ class SimpleQueryParser {
   // One clause list under construction (the top level or one group), in the
   // classic QueryParser shape: a flat list of clauses, each carrying its own
   // occur, collapsed into a single BooleanQuery (required / optional /
-  // prohibited buckets).  A '+'/'-' modifier binds to the immediately
-  // following unit (whitespace breaks the binding - the long-standing rule
-  // for '-', applied to '+' too); '|' is an OR conjunction to the next unit
-  // that survives whitespace and, under the default-AND operator, demotes the
-  // preceding clause to optional (Lucene classic QueryParser's addClause).
+  // prohibited buckets).  A leading '+'/'-' at a clause boundary is a
+  // required/prohibited modifier on the next unit (runRange defines the
+  // boundary); '|' is an OR conjunction to the next unit that, under the
+  // default-AND operator, demotes the preceding clause to optional (Lucene
+  // classic QueryParser's addClause).
   struct Level {
     std::pmr::vector<Clause> clauses;  // in source order
     int notCount = 0;                  // pending '-' parity (adjacency)
@@ -464,9 +464,23 @@ private:
     return 0;
   }
 
+  // A token ends at a quote, a paren, or whitespace.  The operator characters
+  // '+' '-' '|' do NOT end a token: they are operators only at a clause
+  // boundary (see runRange), so mid-token they are ordinary term bytes and
+  // pass through to analysis (c++, at&t, a|b, rock-n-roll ... stay one token).
   bool tokenFinished(size_t i) const {
     char c = data[i];
-    return c == '"' || c == '|' || c == '+' || c == '(' || c == ')' || wsLen(i) > 0;
+    return c == '"' || c == '(' || c == ')' || wsLen(i) > 0;
+  }
+
+  // Is the '~' at tildePos a clean trailing fuzzy operator: '~' then optional
+  // ASCII digits then a token boundary (or end)?  If not - '~' with non-digit
+  // junk after it, e.g. abc~2+d or abc~xyz - the '~' is a literal term byte,
+  // like '*' anywhere but the token end.  Mangled decorations read as text.
+  bool fuzzySuffix(size_t tildePos) const {
+    size_t i = tildePos + 1;
+    while (i < end && data[i] >= '0' && data[i] <= '9') i++;
+    return i >= end || tokenFinished(i);
   }
 
   // At '~': consume it and the following characters up to a token boundary.
@@ -593,38 +607,52 @@ private:
     pos = start;
     end = stop;
 
+    // '+' '-' '|' are operators only at a clause boundary: the start of the
+    // range, just after whitespace, or just after an opening '('.  Anywhere
+    // else they are ordinary term bytes (see tokenFinished), so `+foo`/`-foo`
+    // is a modifier but `a+b`/`c++`/`a|b` is one literal token, and only the
+    // FIRST leading sign is a modifier (`+-foo` = require the term "-foo").
+    // Whitespace re-opens a boundary and drops any pending sign that never
+    // reached a unit.  orConj survives whitespace (it is the conjunction to
+    // the next unit, spaces and all) and is cleared when that unit lands.
+    bool atBoundary = true;
     while (pos < end) {
       char c = data[pos];
       if (c == '(') {
-        consumeSubQuery(st, depth);
+        // a consumed group is a unit (boundary after it); an extraneous '('
+        // is ignored and leaves the boundary state untouched
+        if (consumeSubQuery(st, depth)) atBoundary = false;
       } else if (c == ')') {
-        ++pos;  // extraneous closing parenthesis: ignored
+        ++pos;  // extraneous ')': ignored, neutral for boundary state
       } else if (c == '"') {
         consumePhrase(st);
-      } else if (c == '+') {
-        // a required modifier on the immediately following unit
-        st.plus = true;
+        atBoundary = false;
+      } else if (c == '+' && atBoundary) {
+        st.plus = true;  // required modifier on the next unit
         ++pos;
+        atBoundary = false;
         continue;
-      } else if (c == '|') {
-        // an OR conjunction to the next unit; ignored with nothing before it
+      } else if (c == '|' && atBoundary) {
+        // OR conjunction to the next unit; ignored with nothing before it
         if (st.hasAny()) st.orConj = true;
         ++pos;
+        atBoundary = false;
         continue;
-      } else if (c == '-') {
-        // a prohibited modifier; two in a row cancel
-        ++st.notCount;
+      } else if (c == '-' && atBoundary) {
+        ++st.notCount;  // prohibited modifier on the next unit
         ++pos;
+        atBoundary = false;
         continue;
       } else if (size_t n = wsLen(pos)) {
         pos += n;
+        atBoundary = true;
       } else {
         consumeToken(st);
+        atBoundary = false;
       }
-      // Adjacency reset: a pending +/- binds only to a unit that immediately
-      // follows it, so whitespace or a stray ')' between them drops it.
-      // orConj is NOT reset here - it is the conjunction to the next unit
-      // (spaces and all) and is cleared when that unit is consumed.
+      // A pending sign binds only to a unit; whitespace or a stray unit
+      // boundary between the sign and its unit drops it.  orConj is not
+      // cleared here - it is cleared when the next unit is consumed.
       st.plus = false;
       st.notCount = 0;
     }
@@ -639,26 +667,32 @@ private:
     return collapse(st, /*applyMinMatch=*/false);  // min_match is a top-level knob
   }
 
-  void consumeSubQuery(Level& st, int depth) {
+  // Returns true only when a real group unit was consumed (so the caller
+  // leaves a clause boundary behind it); an extraneous '(' is neutral.
+  bool consumeSubQuery(Level& st, int depth) {
     size_t open = pos;
     size_t start = open + 1;
     size_t close = matchingClose(open);
     if (close == NPOS || close >= end) {
       // no closing parenthesis in range: the opening one is extraneous;
-      // contents reparse
+      // contents reparse (the '(' does not disturb the boundary state)
       pos = start;
+      return false;
     } else if (close == start) {
       // "()" drops a pending modifier (it would have applied to this group)
       clearPending(st);
       pos = close + 1;
+      return false;
     } else if (depth + 1 >= MAX_DEPTH) {
       warn("depth_clamped",
            "parenthesis nesting exceeds the supported depth; deeper parentheses are ignored");
       pos = start;
+      return false;
     } else {
       const api::Query* sub = parseRange(start, close, depth + 1);
       pos = close + 1;
       addUnit(st, sub);  // null (empty group) just drops the pending modifier
+      return sub != nullptr;
     }
   }
 
@@ -718,7 +752,7 @@ private:
           }
           break;
         }
-        if (!buf.empty() && c == '~') {
+        if (!buf.empty() && c == '~' && fuzzySuffix(pos)) {
           sawFuzzy = true;
           break;
         }
