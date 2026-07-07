@@ -121,6 +121,14 @@ private:
   int64_t nextL1CumTf = 0;     // cumulative tf before nextL1Group
   bool bodyReady = false;      // docIS already points at the current block body after an L0 walk
 
+  // Position metadata repair can be deferred while a positions-tracking enum is
+  // only being advanced through decoded docs. The dirty range is always within
+  // the current decoded doc/freq block; block skips and block-boundary decodes
+  // re-anchor cumulativeTermFreq from L0 metadata and clear it.
+  bool posRepairDirty = false;
+  int32_t posRepairStart = 0;  // inclusive index in tfreqBuf/docBuf
+  int32_t posRepairEnd = 0;    // exclusive index; current doc is end - 1
+
   int32_t db[Postings::DOCS_BLOCK_SIZE];  // temporary...
   int32_t pb[Postings::POSITIONS_BLOCK_SIZE];
   int32_t tb[Postings::POSITIONS_BLOCK_SIZE];
@@ -155,6 +163,70 @@ private:
 
   static bool isL1Boundary(int32_t block) {
     return (block % L1_PERIOD) == 0;
+  }
+
+  static constexpr int32_t DECODED_ADVANCE_LINEAR_PROBE = 8;
+
+  int32_t findDecodedRemainderGEQ(int32_t start, int32_t target) const {
+    int32_t j = start;
+    const int32_t linearEnd = std::min(docBufEnd, start + DECODED_ADVANCE_LINEAR_PROBE);
+    while (j < linearEnd && docBuf[j] < target) {
+      j++;
+    }
+    if (j < linearEnd) {
+      return j;
+    }
+    return (int32_t) (std::lower_bound(docBuf + j, docBuf + docBufEnd, target) - docBuf);
+  }
+
+  void clearPendingPositionRepair() {
+    posRepairDirty = false;
+    posRepairStart = posRepairEnd = 0;
+  }
+
+  void markPendingPositionRepair(int32_t start, int32_t end) {
+    if (!trackPositions || start >= end) {
+      return;
+    }
+    if (posRepairDirty) {
+      assert(start == posRepairEnd);
+      posRepairEnd = end;
+    } else {
+      posRepairDirty = true;
+      posRepairStart = start;
+      posRepairEnd = end;
+    }
+  }
+
+  void materializePendingPositionRepair() {
+    if (!posRepairDirty) {
+      return;
+    }
+    int64_t sum = 0;
+    if (hasFreqs) {
+      for (int32_t i = posRepairStart; i < posRepairEnd; i++) {
+        sum += (uint32_t) tfreqBuf[i];
+      }
+    } else {
+      sum = posRepairEnd - posRepairStart;
+    }
+    cumulativeTermFreq += sum;
+    posOrdStart = cumulativeTermFreq - tfreq;
+    clearPendingPositionRepair();
+  }
+
+  void discardPendingPositionRepairAtBlockBoundary() {
+    if (!posRepairDirty) {
+      return;
+    }
+    if (docsSize == 0) {
+      // Pulsed postings have no block header to re-anchor from; the dirty range
+      // is one doc, so materializing is still cheap.
+      materializePendingPositionRepair();
+      return;
+    }
+    cumulativeTermFreq = nextL0CumTf;
+    clearPendingPositionRepair();
   }
 
 public:
@@ -267,6 +339,9 @@ public:
 
   void setTrackPositions(bool enabled) {
     trackPositions = enabled && hasPositions;
+    if (!trackPositions) {
+      clearPendingPositionRepair();
+    }
   }
 
   /// number of documents containing the term
@@ -301,6 +376,7 @@ public:
     assert(!docsOnlyConsumed);
     blockMode = false;
     if (docBufIdx >= docBufEnd) {
+      discardPendingPositionRepairAtBlockBoundary();
       auto leftToRead = docfreq - docOrd;
       // Boundary analysis: if docfreq==1 and docOrd==1 (meaning we already read ord 0, but not 1), we are done.
       if (leftToRead <= 0) {
@@ -419,8 +495,7 @@ public:
       tfreq = 1;
     }
     if (trackPositions) {
-      posOrdStart = cumulativeTermFreq;
-      cumulativeTermFreq += tfreq;
+      markPendingPositionRepair(docBufIdx - 1, docBufIdx);
     }
 
     return docid;
@@ -670,6 +745,12 @@ public:
     }
     docid = docBuf[limit - 1];
     blockMode = true;
+    if (trackPositions) {
+      // Preserve this API's contract: block consumers do not repair position
+      // metadata. Since the current doc changed, any deferred repair for the
+      // previous cursor position is no longer meaningful.
+      clearPendingPositionRepair();
+    }
   }
 
 
@@ -677,6 +758,7 @@ public:
   // repaired by cumulativeTermFreq; the position stream itself stays lazy.
   void skipToBlock(int32_t target) {
     blockMode = false;
+    clearPendingPositionRepair();
     const char* const streamStart = docIS.ptr(0);
     const char* const end = docIS.ptr(endOfDocs);
     const char* p = docIS.ptr();
@@ -875,8 +957,7 @@ public:
     // they skip cumulative-tf repair entirely.
     blockMode = false;
     const int32_t start = docBufIdx;
-    const int32_t j = (int32_t) (std::lower_bound(docBuf + start, docBuf + docBufEnd, target)
-                                 - docBuf);
+    const int32_t j = findDecodedRemainderGEQ(start, target);
     assert(j < docBufEnd);
     const int32_t consumed = j + 1 - start;
     docOrd += consumed;
@@ -885,18 +966,12 @@ public:
       tfreqOrd += consumed;
       tfreqBufIdx = j + 1;
       if (trackPositions) {
-        int64_t sum = 0;
-        for (int32_t i = start; i <= j; i++) {
-          sum += (uint32_t) tfreqBuf[i];
-        }
-        cumulativeTermFreq += sum;
-        posOrdStart = cumulativeTermFreq - tfreq;
+        markPendingPositionRepair(start, j + 1);
       }
     } else {
       tfreq = 1;
       if (trackPositions) {
-        cumulativeTermFreq += consumed;
-        posOrdStart = cumulativeTermFreq - tfreq;
+        markPendingPositionRepair(start, j + 1);
       }
     }
     docBufIdx = j + 1;
@@ -1232,6 +1307,7 @@ public:
     assert(!docsOnlyConsumed);
     assert(hasPositions);  // positions are only queried on fields that index them
     assert(trackPositions);
+    materializePendingPositionRepair();
     pos = -1;
     while (posOrd < posOrdStart) {
       // need to skip some positions.
