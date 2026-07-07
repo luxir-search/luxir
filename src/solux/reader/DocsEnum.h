@@ -620,11 +620,18 @@ public:
       if (hasPositions) {
         groupTfSum += InputStream::readVint(p, groupHeaderEnd);
       }
-      if (hasFreqs) {
+      if (hasFreqs && hasNorms) {
+        uint32_t frontierCount = InputStream::readVint(p, groupHeaderEnd);
+        for (uint32_t i = 0; i < frontierCount; i++) {
+          assert(p < groupHeaderEnd);
+          p++;  // norm: one raw byte
+          auto tfDelta = InputStream::readVint(p, groupHeaderEnd);
+          unused(tfDelta);
+        }
+      } else if (hasFreqs) {
         auto spanImpact = InputStream::readVint(p, groupHeaderEnd);
         unused(spanImpact);
-      }
-      if (hasNorms) {
+      } else if (hasNorms) {
         auto spanMinNorm = InputStream::readVint(p, groupHeaderEnd);
         unused(spanMinNorm);
       }
@@ -784,12 +791,27 @@ public:
         auto groupCumTfDelta = InputStream::readVint(p, groupHeaderEnd);
         unused(groupCumTfDelta);
       }
+      // The group corner (max tf, min norm) is the staircase's last tf and
+      // first norm for freqs+norms fields; stored directly otherwise.
       int32_t spanImpact = 1;
-      if (hasFreqs) {
-        spanImpact = (int32_t) InputStream::readVint(p, groupHeaderEnd);
-      }
       int32_t spanMinNorm = 0;
-      if (hasNorms) {
+      if (hasFreqs && hasNorms) {
+        uint32_t frontierCount = InputStream::readVint(p, groupHeaderEnd);
+        assert(frontierCount > 0);
+        int32_t tf = 0;
+        for (uint32_t i = 0; i < frontierCount; i++) {
+          assert(p < groupHeaderEnd);
+          int32_t norm = (int32_t) (uint8_t) *p;  // raw byte (absolute)
+          p++;
+          tf += (int32_t) InputStream::readVint(p, groupHeaderEnd);  // tf delta
+          if (i == 0) {
+            spanMinNorm = norm;
+          }
+        }
+        spanImpact = tf;
+      } else if (hasFreqs) {
+        spanImpact = (int32_t) InputStream::readVint(p, groupHeaderEnd);
+      } else if (hasNorms) {
         spanMinNorm = (int32_t) InputStream::readVint(p, groupHeaderEnd);
       }
       assert(p == groupHeaderEnd);
@@ -882,15 +904,18 @@ public:
 
   // Group-level impact scan: walks ONLY the L1 group headers, hopping each
   // group's body via its byte length - ~df/4096 steps instead of the whole-
-  // list walk readBlockMaxTf does.  Emits per group: last doc, the corner
-  // impact span (maxTf, minNorm), and what a later lazy parse of that group's
-  // L0 headers needs (body offset relative to startOfDocs, delta bases).
+  // list walk readBlockMaxTf does.  Emits per group: last doc, the group's
+  // stored impact frontier (with its (maxTf, minNorm) corner derived for
+  // consumers that want a single span), and what a later lazy parse of that
+  // group's L0 headers needs (body offset relative to startOfDocs, delta
+  // bases).  Fields without freqs+norms have empty frontier ranges.
   struct GroupImpacts {
     std::vector<int32_t> lastDocs;
     std::vector<int32_t> spanMaxTfs;
     std::vector<int32_t> spanMinNorms;
     std::vector<int64_t> bodyOffsets;   // relative to startOfDocs
     std::vector<int32_t> baseLastDocs;  // last doc before the group (L0 delta base)
+    ImpactFrontiers frontiers;          // per-group frontier staircases
   };
 
   void readGroupImpacts(GroupImpacts& out) const {
@@ -899,6 +924,7 @@ public:
     out.spanMinNorms.resize(0);
     out.bodyOffsets.resize(0);
     out.baseLastDocs.resize(0);
+    out.frontiers.clear();
     if (docsSize == 0) {
       return;
     }
@@ -907,6 +933,7 @@ public:
     out.spanMinNorms.reserve(numDocGroups);
     out.bodyOffsets.reserve(numDocGroups);
     out.baseLastDocs.reserve(numDocGroups);
+    out.frontiers.offsets.reserve((size_t) numDocGroups + 1);
 
     const char* const streamStart = docIS.ptr(0);
     const char* const end = docIS.ptr(endOfDocs);
@@ -923,11 +950,27 @@ public:
         unused(groupCumTfDelta);
       }
       int32_t spanImpact = 1;
-      if (hasFreqs) {
-        spanImpact = (int32_t) InputStream::readVint(p, groupHeaderEnd);
-      }
       int32_t spanMinNorm = 0;
-      if (hasNorms) {
+      out.frontiers.offsets.push_back((int32_t) out.frontiers.tfs.size());
+      if (hasFreqs && hasNorms) {
+        uint32_t frontierCount = InputStream::readVint(p, groupHeaderEnd);
+        assert(frontierCount > 0);
+        int32_t tf = 0;
+        for (uint32_t i = 0; i < frontierCount; i++) {
+          assert(p < groupHeaderEnd);
+          int32_t norm = (int32_t) (uint8_t) *p;  // raw byte (absolute)
+          p++;
+          tf += (int32_t) InputStream::readVint(p, groupHeaderEnd);  // tf delta
+          if (i == 0) {
+            spanMinNorm = norm;
+          }
+          out.frontiers.norms.push_back(norm);
+          out.frontiers.tfs.push_back(tf);
+        }
+        spanImpact = tf;
+      } else if (hasFreqs) {
+        spanImpact = (int32_t) InputStream::readVint(p, groupHeaderEnd);
+      } else if (hasNorms) {
         spanMinNorm = (int32_t) InputStream::readVint(p, groupHeaderEnd);
       }
       assert(p == groupHeaderEnd);
@@ -940,6 +983,7 @@ public:
       assert(p <= end);
       prevGroupLastDoc = groupLastDoc;
     }
+    out.frontiers.offsets.push_back((int32_t) out.frontiers.tfs.size());
     assert(p == end);
   }
 

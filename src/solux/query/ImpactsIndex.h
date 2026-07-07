@@ -15,8 +15,8 @@ namespace solux {
 //
 // The build is GROUP-FIRST AND LAZY: construction walks only the L1 group
 // headers (~df/4096 steps, hopping group bodies), scoring each group's stored
-// corner span (maxTf, minNorm).  A group's 32 per-block frontiers are parsed
-// and BM25-scored only the first time a query resolves a block inside it.
+// impact frontier.  A group's 32 per-block frontiers are parsed and
+// BM25-scored only the first time a query resolves a block inside it.
 // Never walk the whole postings up front - a "the"-sized term has ~35K block
 // headers and queries touch a handful.
 //
@@ -44,7 +44,7 @@ class ImpactsIndex {
   int32_t* groupLastDocs = nullptr;
   int32_t* groupBaseLastDocs = nullptr;
   int64_t* groupBodyOffs = nullptr;
-  float* groupUpper = nullptr;       // corner bound per group
+  float* groupUpper = nullptr;       // frontier bound per group
   float* groupSuffixUpper = nullptr; // max of groupUpper[g..]
   mutable Chunk** chunks = nullptr;  // lazily parsed per group
 
@@ -120,8 +120,22 @@ public:
       groupLastDocs[g] = groups.lastDocs[(size_t) g];
       groupBaseLastDocs[g] = groups.baseLastDocs[(size_t) g];
       groupBodyOffs[g] = groups.bodyOffsets[(size_t) g];
-      groupUpper[g] = boost * simScorer->score((float) groups.spanMaxTfs[(size_t) g],
-                                               (int64_t) groups.spanMinNorms[(size_t) g]);
+      int32_t fStart = groups.frontiers.offsets[(size_t) g];
+      int32_t fEnd = groups.frontiers.offsets[(size_t) g + 1];
+      if (useFrontierBound && fStart < fEnd) {
+        // Stored group frontier: real (norm, tf) pairs, so the bound is what
+        // some doc in the group can actually score - no cross-doc corner slack.
+        float maxImpact = 0.0f;
+        for (int32_t j = fStart; j < fEnd; j++) {
+          maxImpact = std::max(
+              maxImpact, boost * simScorer->score((float) groups.frontiers.tfs[(size_t) j],
+                                                  (int64_t) groups.frontiers.norms[(size_t) j]));
+        }
+        groupUpper[g] = maxImpact;
+      } else {
+        groupUpper[g] = boost * simScorer->score((float) groups.spanMaxTfs[(size_t) g],
+                                                 (int64_t) groups.spanMinNorms[(size_t) g]);
+      }
       chunks[g] = nullptr;
     }
     float running = 0.0f;
@@ -162,7 +176,7 @@ public:
     return bound;
   }
 
-  // Max impact over blocks [fromBlock, toBlock], using parse-free group corner
+  // Max impact over blocks [fromBlock, toBlock], using parse-free group
   // bounds for fully covered middle groups (only the edge groups pay a parse).
   float maxImpactInRange(int32_t fromBlock, int32_t toBlock) const {
     assert(fromBlock >= 0 && fromBlock <= toBlock && toBlock < count);
@@ -189,7 +203,7 @@ public:
   }
 
   // First doc at or after `doc` that lies in a block whose bound reaches
-  // minScore: hops non-competitive GROUPS on their corner bounds without
+  // minScore: hops non-competitive GROUPS on their frontier bounds without
   // parsing them, so a term-wide skip costs a group-table scan, not a
   // per-block walk (Lucene ImpactsDISI's getSkipUpTo shape).  Returns `doc`
   // itself when its own block competes (or lies past the impact data), and

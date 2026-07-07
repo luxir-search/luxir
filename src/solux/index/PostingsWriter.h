@@ -471,6 +471,11 @@ class TextWriter {
   uint64_t l1GroupTfSum = 0;
   uint32_t l1GroupMaxTf = 0;
   uint32_t l1GroupMinNorm = 0;
+  // Group-level (norm -> maxTf) surface for the buffered L1 group, merged from
+  // each flushed block's frontier points.  The group header stores its Pareto
+  // frontier (same staircase as L0 and the term dictionary) so group bounds
+  // come from real (norm, tf) pairs, not a cross-doc (maxTf, minNorm) corner.
+  std::array<uint32_t, 256> l1GroupMaxTfPerNorm{};
 
   // Index level for this field, decoded from the field flags in startField().  These gate
   // whether the freq stream and position stream are written at all.
@@ -766,6 +771,16 @@ private:  // some internal utility methods... not for use by indexers
       assert(minNorm <= 255);
       l1GroupMinNorm = l1GroupBlockCount == 1 ? minNorm : std::min(l1GroupMinNorm, minNorm);
     }
+    if (hasFreqs && hasNorms) {
+      // Merge this block's frontier (still live from buildImpactFrontier) into
+      // the group surface; dominated points fall out when the group frontier is
+      // re-extracted at flush.
+      assert(frontierTfs.size() == frontierNorms.size());
+      for (size_t i = 0; i < frontierNorms.size(); i++) {
+        uint32_t norm = frontierNorms[i];
+        l1GroupMaxTfPerNorm[norm] = std::max(l1GroupMaxTfPerNorm[norm], frontierTfs[i]);
+      }
+    }
     if (l1GroupBlockCount == L1_PERIOD) {
       flushL1Group();
     }
@@ -797,11 +812,14 @@ private:  // some internal utility methods... not for use by indexers
       assert(l1GroupTfSum >= (uint64_t) l1GroupDocCount);
       appendVint(header_output, (uint32_t) (l1GroupTfSum - (uint64_t) l1GroupDocCount));
     }
-    if (hasFreqs) {
+    if (hasFreqs && hasNorms) {
+      // Group impact frontier, same staircase as the L0 headers.  Non-empty:
+      // every flushed block contributed at least one frontier point.
+      appendImpactFrontier(header_output, l1GroupMaxTfPerNorm);
+    } else if (hasFreqs) {
       assert(l1GroupMaxTf > 0);
       appendVint(header_output, l1GroupMaxTf);
-    }
-    if (hasNorms) {
+    } else if (hasNorms) {
       assert(l1GroupMinNorm <= 255);
       appendVint(header_output, l1GroupMinNorm);
     }
@@ -816,6 +834,7 @@ private:  // some internal utility methods... not for use by indexers
     l1GroupTfSum = 0;
     l1GroupMaxTf = 0;
     l1GroupMinNorm = 0;
+    l1GroupMaxTfPerNorm.fill(0);
   }
 
   // number of docs for the current term
@@ -1199,6 +1218,7 @@ public:
     l1GroupTfSum = 0;
     l1GroupMaxTf = 0;
     l1GroupMinNorm = 0;
+    l1GroupMaxTfPerNorm.fill(0);
     group_output.resize(0);
     termMaxTfPerNorm.fill(0);
     locOfPositionsForTerm = posOutput.size();

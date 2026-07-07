@@ -61,21 +61,24 @@ protected:
     return expected;
   }
 
-  static DocsEnum::ImpactFrontiers expectedBlockFrontiers(int32_t numDocs,
-                                                          bool hasFreqs,
-                                                          bool hasNorms) {
-    int32_t numBlocks = (numDocs + Postings::DOCS_BLOCK_SIZE - 1) / Postings::DOCS_BLOCK_SIZE;
+  // Model frontiers over any span size: DOCS_BLOCK_SIZE for L0 block headers,
+  // DocsEnum::L1_DOCS for L1 group headers.
+  static DocsEnum::ImpactFrontiers expectedSpanFrontiers(int32_t numDocs,
+                                                         bool hasFreqs,
+                                                         bool hasNorms,
+                                                         int32_t spanDocs) {
+    int32_t numSpans = (numDocs + spanDocs - 1) / spanDocs;
     DocsEnum::ImpactFrontiers expected;
-    expected.offsets.reserve((size_t) numBlocks + 1);
+    expected.offsets.reserve((size_t) numSpans + 1);
     std::array<int32_t, 256> maxTfPerNorm;
-    for (int32_t block = 0; block < numBlocks; block++) {
+    for (int32_t span = 0; span < numSpans; span++) {
       expected.offsets.push_back((int32_t) expected.tfs.size());
       if (!(hasFreqs && hasNorms)) {
         continue;
       }
       maxTfPerNorm.fill(0);
-      int32_t start = block * Postings::DOCS_BLOCK_SIZE;
-      int32_t end = std::min(start + Postings::DOCS_BLOCK_SIZE, numDocs);
+      int32_t start = span * spanDocs;
+      int32_t end = std::min(start + spanDocs, numDocs);
       for (int32_t doc = start; doc < end; doc++) {
         int32_t norm = SmallFloat::intToByte4(impactTokenCountForDoc(doc));
         maxTfPerNorm[(size_t) norm] = std::max(maxTfPerNorm[(size_t) norm], impactTfForDoc(doc));
@@ -129,13 +132,16 @@ protected:
   void assertImpactHeaders(DocsEnum& denum, const std::vector<int32_t>& expectedBlockMaxTf,
                            const std::vector<int32_t>& expectedBlockMinNorm,
                            std::string_view label,
-                           const DocsEnum::ImpactFrontiers* expectedFrontiers = nullptr) {
+                           const DocsEnum::ImpactFrontiers* expectedFrontiers = nullptr,
+                           const DocsEnum::ImpactFrontiers* expectedGroupFrontiers = nullptr) {
     std::vector<int32_t> blockMaxTf;
     std::vector<int32_t> groupSpanImpacts;
+    std::vector<int32_t> blockLastDocs;
     std::vector<int32_t> blockMinNorm;
     std::vector<int32_t> groupSpanMinNorms;
     DocsEnum::ImpactFrontiers frontiers;
-    denum.readBlockMaxTf(blockMaxTf, &groupSpanImpacts, nullptr, &blockMinNorm, &groupSpanMinNorms,
+    denum.readBlockMaxTf(blockMaxTf, &groupSpanImpacts, &blockLastDocs, &blockMinNorm,
+                         &groupSpanMinNorms,
                          expectedFrontiers == nullptr ? nullptr : &frontiers);
     ASSERT_EQ(blockMaxTf, expectedBlockMaxTf) << label;
     ASSERT_EQ(groupSpanImpacts, expectedGroupSpanImpacts(expectedBlockMaxTf)) << label;
@@ -146,12 +152,30 @@ protected:
       ASSERT_EQ(frontiers.tfs, expectedFrontiers->tfs) << label;
       ASSERT_EQ(frontiers.norms, expectedFrontiers->norms) << label;
     }
+
+    // The group-header-only scan must agree with the full walk.
+    DocsEnum::GroupImpacts groups;
+    denum.readGroupImpacts(groups);
+    ASSERT_EQ(groups.spanMaxTfs, groupSpanImpacts) << label;
+    ASSERT_EQ(groups.spanMinNorms, groupSpanMinNorms) << label;
+    std::vector<int32_t> expectedGroupLastDocs;
+    for (size_t block = 0; block < blockLastDocs.size(); block += DocsEnum::L1_PERIOD) {
+      size_t last = std::min(block + DocsEnum::L1_PERIOD, blockLastDocs.size()) - 1;
+      expectedGroupLastDocs.push_back(blockLastDocs[last]);
+    }
+    ASSERT_EQ(groups.lastDocs, expectedGroupLastDocs) << label;
+    if (expectedGroupFrontiers != nullptr) {
+      ASSERT_EQ(groups.frontiers.offsets, expectedGroupFrontiers->offsets) << label;
+      ASSERT_EQ(groups.frontiers.tfs, expectedGroupFrontiers->tfs) << label;
+      ASSERT_EQ(groups.frontiers.norms, expectedGroupFrontiers->norms) << label;
+    }
   }
 
   void checkRawImpactHeaders(FieldType::flag_type flags, const std::vector<int32_t>& expectedBlockMaxTf,
                              const std::vector<int32_t>& expectedBlockMinNorm, int32_t numDocs,
                              std::string_view label,
-                             const DocsEnum::ImpactFrontiers* expectedFrontiers = nullptr) {
+                             const DocsEnum::ImpactFrontiers* expectedFrontiers = nullptr,
+                             const DocsEnum::ImpactFrontiers* expectedGroupFrontiers = nullptr) {
     RAMDir dir;
     MemPool pool;
     PostingsWriter postingsWriter(dir, 0, numDocs + Postings::DOCS_BLOCK_SIZE + 100);
@@ -187,7 +211,8 @@ protected:
     TermsEnum tenum(pool, reader, fieldInfo);
     ASSERT_TRUE(tenum.seek("hot")) << label;
     DocsEnum denum(pool, reader, tenum);
-    assertImpactHeaders(denum, expectedBlockMaxTf, expectedBlockMinNorm, label, expectedFrontiers);
+    assertImpactHeaders(denum, expectedBlockMaxTf, expectedBlockMinNorm, label, expectedFrontiers,
+                        expectedGroupFrontiers);
   }
 
   void addImpactDocs(TestField& f, int32_t firstDoc, int32_t numDocs, int32_t globalBase) {
@@ -210,11 +235,13 @@ protected:
   void assertImpactHeadersForField(TestField& f, const std::vector<int32_t>& expectedBlockMaxTf,
                                    const std::vector<int32_t>& expectedBlockMinNorm,
                                    std::string_view label,
-                                   const DocsEnum::ImpactFrontiers* expectedFrontiers = nullptr) {
+                                   const DocsEnum::ImpactFrontiers* expectedFrontiers = nullptr,
+                                   const DocsEnum::ImpactFrontiers* expectedGroupFrontiers = nullptr) {
     TermsEnum tenum = f.createTermsEnum();
     ASSERT_TRUE(tenum.seek("hot")) << label;
     DocsEnum denum(f.testIndex.pool, f.currentSegment()->postingsReader(), tenum);
-    assertImpactHeaders(denum, expectedBlockMaxTf, expectedBlockMinNorm, label, expectedFrontiers);
+    assertImpactHeaders(denum, expectedBlockMaxTf, expectedBlockMinNorm, label, expectedFrontiers,
+                        expectedGroupFrontiers);
   }
 
   void checkAdvanceWalk(TestIndex& testIndex, PostingsReader& reader, TermsEnum& tenum,
@@ -452,8 +479,14 @@ TEST_F(DocsEnumAdvanceTest, blockImpactHeadersRoundTrip) {
   std::vector<int32_t> expectedDocsOnlyImpacts = expectedBlockMaxTf(N, false);
   std::vector<int32_t> expectedNorms = expectedBlockMinNorm(N, true);
   std::vector<int32_t> expectedNoNorms = expectedBlockMinNorm(N, false);
-  DocsEnum::ImpactFrontiers expectedFrontiers = expectedBlockFrontiers(N, true, true);
-  DocsEnum::ImpactFrontiers expectedNoFrontiers = expectedBlockFrontiers(N, true, false);
+  DocsEnum::ImpactFrontiers expectedFrontiers =
+      expectedSpanFrontiers(N, true, true, Postings::DOCS_BLOCK_SIZE);
+  DocsEnum::ImpactFrontiers expectedNoFrontiers =
+      expectedSpanFrontiers(N, true, false, Postings::DOCS_BLOCK_SIZE);
+  DocsEnum::ImpactFrontiers expectedGroupFrontiers =
+      expectedSpanFrontiers(N, true, true, DocsEnum::L1_DOCS);
+  DocsEnum::ImpactFrontiers expectedNoGroupFrontiers =
+      expectedSpanFrontiers(N, true, false, DocsEnum::L1_DOCS);
 
   {
     TestIndex testIndex;
@@ -463,7 +496,8 @@ TEST_F(DocsEnumAdvanceTest, blockImpactHeadersRoundTrip) {
     testIndex.flush();
     f.startReading();
 
-    assertImpactHeadersForField(f, expectedFreqImpacts, expectedNorms, "positions", &expectedFrontiers);
+    assertImpactHeadersForField(f, expectedFreqImpacts, expectedNorms, "positions",
+                                &expectedFrontiers, &expectedGroupFrontiers);
   }
 
   {
@@ -482,13 +516,13 @@ TEST_F(DocsEnumAdvanceTest, blockImpactHeadersRoundTrip) {
     ASSERT_EQ(testIndex.reader->segments().size(), 1u);
 
     assertImpactHeadersForField(f, expectedFreqImpacts, expectedNorms, "merged positions",
-                                &expectedFrontiers);
+                                &expectedFrontiers, &expectedGroupFrontiers);
   }
 
   checkRawImpactHeaders(FieldType::INDEX_DOCS_FREQS, expectedFreqImpacts, expectedNoNorms, N,
-                        "docs+freqs", &expectedNoFrontiers);
+                        "docs+freqs", &expectedNoFrontiers, &expectedNoGroupFrontiers);
   checkRawImpactHeaders(FieldType::INDEX_DOCS, expectedDocsOnlyImpacts, expectedNoNorms, N,
-                        "docs-only", &expectedNoFrontiers);
+                        "docs-only", &expectedNoFrontiers, &expectedNoGroupFrontiers);
 }
 
 // Position reads after far advances must land exactly where sequential decoding
