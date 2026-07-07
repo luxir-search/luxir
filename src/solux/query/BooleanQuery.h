@@ -1156,14 +1156,17 @@ public:
     constexpr static int64_t W_ARRAY = 28;
     static_assert((kWindowSize % 64) == 0);
 
-    std::span<Query::Scorer*> scorers;  // stable global-max order, used for deterministic scoring
+    std::span<Query::Scorer*> scorers;  // stable global-max order
     std::span<float> clauseMax;
     std::span<float> windowMax;
     std::span<int32_t> windowOrder;
     std::span<bool> isEssential;
     std::span<uint64_t> windowBits;
-    std::span<float> essentialScores;
-    std::span<float> bs1Scores;
+    // One shared per-window score accumulation row for all fill modes.
+    // Clauses add into it in fill order, so the sum's rounding depends on
+    // which clauses are essential in a window - accepted policy (execution
+    // paths are not required to be bit-identical).
+    std::span<float> windowScores;
     std::span<int32_t> outDocs;
     std::span<float> outScores;
 
@@ -1267,10 +1270,6 @@ public:
       sortWindowOrder();
       splitIndex = computeWindowSplit();
       markEssentialScorers();
-    }
-
-    float* essentialScoreRow(size_t scorerIndex) {
-      return essentialScores.data() + scorerIndex * (size_t) kWindowSize;
     }
 
     void clearWindowBits() {
@@ -1430,14 +1429,13 @@ public:
     // block fills below cannot skip docs.
     void fillEssentialCandidates(DocSet* filter, const FixedBitSet* domainBits) {
       clearWindowBits();
+      std::fill(windowScores.begin(), windowScores.end(), 0.0f);
       int32_t blockDocs[Postings::DOCS_BLOCK_SIZE];
       float blockScores[Postings::DOCS_BLOCK_SIZE];
       for (size_t i = 0; i < scorers.size(); i++) {
         if (!isEssential[i]) {
           continue;
         }
-        float* row = essentialScoreRow(i);
-        std::fill(row, row + kWindowSize, 0.0f);
         auto* scorer = scorers[i];
         if (scorer->docId() < windowStart) {
           scorer->advance(windowStart);
@@ -1450,7 +1448,7 @@ public:
             if (acceptsDoc(filter, domainBits, doc)) {
               int32_t index = doc - windowStart;
               setWindowBit(index);
-              row[(size_t) index] = blockScores[j];
+              windowScores[(size_t) index] += blockScores[j];
             }
           }
         }
@@ -1459,7 +1457,7 @@ public:
 
     void fillBs1Candidates() {
       clearWindowBits();
-      std::fill(bs1Scores.begin(), bs1Scores.end(), 0.0f);
+      std::fill(windowScores.begin(), windowScores.end(), 0.0f);
       int32_t blockDocs[Postings::DOCS_BLOCK_SIZE];
       float blockScores[Postings::DOCS_BLOCK_SIZE];
       for (size_t i = 0; i < scorers.size(); i++) {
@@ -1474,20 +1472,20 @@ public:
           for (int32_t j = 0; j < count; j++) {
             int32_t index = blockDocs[j] - windowStart;
             setWindowBit(index);
-            bs1Scores[(size_t) index] += blockScores[j];
+            windowScores[(size_t) index] += blockScores[j];
           }
         }
       }
     }
 
     float scoreCandidate(int32_t doc, int32_t index) {
-      float sum = 0.0f;
-      for (size_t i = 0; i < scorers.size(); i++) {
-        if (isEssential[i]) {
-          sum += essentialScoreRow(i)[(size_t) index];
-          continue;
-        }
-        auto* scorer = scorers[i];
+      // Essential contributions were accumulated during the fill; only the
+      // window-non-essential clauses (windowOrder[0..splitIndex)) still need
+      // a per-candidate advance + score. splitIndex == 0 - the common case
+      // until the threshold rises - reads a single float.
+      float sum = windowScores[(size_t) index];
+      for (size_t s = 0; s < splitIndex; s++) {
+        auto* scorer = scorers[(size_t) windowOrder[s]];
         if (scorer->docId() < doc) {
           scorer->advance(doc);
         }
@@ -1547,7 +1545,7 @@ public:
           // Selective filters may accumulate rejected docs, but dense windows are the
           // path this mode is for.
           if (acceptsDoc(filter, domainBits, doc)) {
-            float score = bs1Scores[(size_t) index];
+            float score = windowScores[(size_t) index];
             if (score >= minCompetitiveScore) {
               out.docs[(size_t) out.size] = doc;
               out.scores[(size_t) out.size] = score;
@@ -1569,9 +1567,7 @@ public:
               windowOrder(pool.make_arr<int32_t>(scorers.size()), scorers.size()),
               isEssential(pool.make_arr<bool>(scorers.size()), scorers.size()),
               windowBits(pool.make_arr<uint64_t>((size_t) kWindowWords), (size_t) kWindowWords),
-              essentialScores(pool.make_arr<float>(scorers.size() * (size_t) kWindowSize),
-                              scorers.size() * (size_t) kWindowSize),
-              bs1Scores(pool.make_arr<float>((size_t) kWindowSize), (size_t) kWindowSize),
+              windowScores(pool.make_arr<float>((size_t) kWindowSize), (size_t) kWindowSize),
               outDocs(pool.make_arr<int32_t>((size_t) kWindowSize), (size_t) kWindowSize),
               outScores(pool.make_arr<float>((size_t) kWindowSize), (size_t) kWindowSize),
               maxDoc(maxDoc),
