@@ -33,6 +33,9 @@ struct SkipStats {
   // (skipToBlock), whole position blocks hopped without unpacking
   // (startPositions), and position block body decodes.
   static inline int64_t posSeeks = 0;
+  // Block-max conjunction: bound evaluations vs ranges actually skipped.
+  static inline int64_t conjRangeEvals = 0;
+  static inline int64_t conjRangeSkips = 0;
   static inline int64_t posBlocksSkipped = 0;
   static inline int64_t posBlocksDecoded = 0;
 
@@ -42,6 +45,8 @@ struct SkipStats {
     l1GroupSteps = 0;
     advanceCalls = 0;
     posSeeks = 0;
+    conjRangeEvals = 0;
+    conjRangeSkips = 0;
     posBlocksSkipped = 0;
     posBlocksDecoded = 0;
   }

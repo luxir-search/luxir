@@ -5,6 +5,7 @@
 #include <cmath>
 
 #include "Query.h"
+#include "solux/reader/SkipStats.h"
 #include "QueryPrep.h"
 #include "solux/util/screaming.h"
 
@@ -654,6 +655,7 @@ public:
         if (target >= solux::PostingsReader::END - 1) {
           return solux::PostingsReader::END;
         }
+        skipCount(SkipStats::conjRangeEvals);
         int32_t upTo = solux::PostingsReader::END;
         for (auto* scorer : scorers) {
           upTo = std::min(upTo, scorer->advanceShallow(target));
@@ -667,6 +669,7 @@ public:
           return target;
         }
         skippedRangeCount++;
+        skipCount(SkipStats::conjRangeSkips);
         if (upTo >= solux::PostingsReader::END - 1) {
           return solux::PostingsReader::END;
         }
