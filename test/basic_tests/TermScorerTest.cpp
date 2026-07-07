@@ -1827,11 +1827,12 @@ TEST_F(TermScorerTest, termImpactTopKSkippingMatchesExhaustive) {
 }
 
 // Phrase pruning: block 0 holds the strong phrase docs (high phrase tf, short
-// docs) so the top-k threshold rises past what any later block's per-term
-// bounds allow; later blocks are long low-tf docs plus decoys where both terms
-// appear non-adjacent (conjunction candidates that fail position verification).
-// The pruned run must return the exact exhaustive top-k while verifying far
-// fewer candidates - the decoy blocks are skipped without touching positions.
+// docs) so the top-k threshold rises past what any later doc's per-doc bound
+// (min term tf with its norm) allows; later blocks are long low-tf docs plus
+// decoys where both terms appear non-adjacent (conjunction candidates that
+// fail position verification).  The pruned run must return the exact
+// exhaustive top-k while position-verifying far fewer candidates - the
+// pre-position bound in doMatches rejects the rest before touching positions.
 TEST_F(TermScorerTest, phraseImpactTopKMatchesExhaustive) {
   const int32_t N = 14 * Postings::DOCS_BLOCK_SIZE + 23;
   TestIndex testIndex;
@@ -1882,17 +1883,21 @@ TEST_F(TermScorerTest, phraseImpactTopKMatchesExhaustive) {
       exhaustiveMatchCalls = guard.calls();
     }
 
-    int64_t prunedMatchCalls;
-    int64_t skippedRanges;
+    int64_t boundRejects;
+    int64_t verifies;
     TopDocsCollector prunedCollector(k);
     {
-      PhraseMatchCountGuard guard(true);
+      bool statsWereEnabled = SkipStats::enabled;
+      SkipStats::enabled = true;
+      int64_t rejectsBefore = SkipStats::phraseBoundRejects;
+      int64_t verifiesBefore = SkipStats::phraseVerifies;
       auto* scorer = dynamic_cast<PhraseQuery::Scorer*>(
           prunedWeight->createScorer(testIndex.pool, segment));
       ASSERT_NE(scorer, nullptr);
       collectTopK(0, scorer, nullptr, nullptr, prunedCollector);
-      prunedMatchCalls = guard.calls();
-      skippedRanges = scorer->skippedRanges();
+      boundRejects = SkipStats::phraseBoundRejects - rejectsBefore;
+      verifies = SkipStats::phraseVerifies - verifiesBefore;
+      SkipStats::enabled = statsWereEnabled;
     }
 
     auto expected = exhaustiveCollector.sort();
@@ -1903,8 +1908,75 @@ TEST_F(TermScorerTest, phraseImpactTopKMatchesExhaustive) {
       EXPECT_EQ(std::bit_cast<uint32_t>(actual[i].score),
                 std::bit_cast<uint32_t>(expected[i].score)) << "k=" << k << " i=" << i;
     }
-    EXPECT_LT(prunedMatchCalls, exhaustiveMatchCalls) << "k=" << k;
-    EXPECT_GT(skippedRanges, 0) << "k=" << k;
+    // Every conjunction candidate reaches doMatches, but under the risen
+    // threshold most are rejected by the per-doc bound before position work.
+    EXPECT_GT(boundRejects, 0) << "k=" << k;
+    EXPECT_LT(verifies, exhaustiveMatchCalls) << "k=" << k;
+  }
+}
+
+// docFreq-sorted phrase execution is an internal permutation: match sets and
+// scores must be bit-identical to text-order execution.  Shapes covered: the
+// rare term after the lead, a position gap with the rare term late, and a
+// repeated term (independent enums over the same postings).
+TEST_F(TermScorerTest, phraseSortedExecutionMatchesTextOrder) {
+  const int32_t N = 3 * Postings::DOCS_BLOCK_SIZE + 17;
+  TestIndex testIndex;
+  TestField f(testIndex, "body_w");
+  f.startIndexing();
+  for (int32_t doc = 0; doc < N; doc++) {
+    switch (doc % 7) {
+      case 0: f.add(doc, "common rare pad pad"); break;    // "common rare" adjacent
+      case 1: f.add(doc, "common pad rare pad"); break;    // gap phrase {0,2}
+      case 2: f.add(doc, "common common pad pad"); break;  // repeated-term phrase
+      case 3: f.add(doc, "rare common common pad"); break; // repeated term, offset start
+      default: f.add(doc, "common pad pad pad"); break;    // df(common) >> df(rare)
+    }
+  }
+  testIndex.flush();
+  f.startReading();
+
+  auto poolFree = testIndex.pool.rewindScopeGuard();
+  Query::Context qContext(testIndex.pool, *testIndex.reader);
+  auto& segment = qContext.topReader.segments()[0];
+
+  std::vector<std::string_view> adjacent = {"common", "rare"};
+  std::vector<int32_t> adjacentPos = {0, 1};
+  std::vector<std::string_view> gapped = {"common", "rare"};
+  std::vector<int32_t> gappedPos = {0, 2};
+  std::vector<std::string_view> repeated = {"common", "common"};
+  std::vector<int32_t> repeatedPos = {0, 1};
+
+  struct Hit { int32_t doc; uint32_t scoreBits; };
+  auto run = [&](std::span<std::string_view> terms, std::span<const int32_t> positions,
+                 bool sorted) {
+    bool saved = PhraseQuery::Scorer::disableSortForTests;
+    PhraseQuery::Scorer::disableSortForTests = !sorted;
+    PhraseQuery phrase("body_w", terms, positions);
+    auto* weight = phrase.createWeight(qContext, Query::NEED_SCORES);
+    auto* scorer = weight->createScorer(testIndex.pool, segment);
+    std::vector<Hit> hits;
+    if (scorer != nullptr) {
+      for (int32_t doc = scorer->next(); doc != PostingsReader::END; doc = scorer->next()) {
+        hits.push_back({doc, std::bit_cast<uint32_t>(scorer->score())});
+      }
+    }
+    PhraseQuery::Scorer::disableSortForTests = saved;
+    return hits;
+  };
+
+  struct Case { std::span<std::string_view> terms; std::span<const int32_t> pos; const char* label; };
+  for (auto& c : std::initializer_list<Case>{{adjacent, adjacentPos, "adjacent"},
+                                             {gapped, gappedPos, "gapped"},
+                                             {repeated, repeatedPos, "repeated"}}) {
+    auto textOrder = run(c.terms, c.pos, false);
+    auto sorted = run(c.terms, c.pos, true);
+    ASSERT_FALSE(textOrder.empty()) << c.label;
+    ASSERT_EQ(sorted.size(), textOrder.size()) << c.label;
+    for (size_t i = 0; i < textOrder.size(); i++) {
+      EXPECT_EQ(sorted[i].doc, textOrder[i].doc) << c.label << " i=" << i;
+      EXPECT_EQ(sorted[i].scoreBits, textOrder[i].scoreBits) << c.label << " i=" << i;
+    }
   }
 }
 

@@ -38,6 +38,10 @@ struct SkipStats {
   static inline int64_t conjRangeSkips = 0;
   static inline int64_t posBlocksSkipped = 0;
   static inline int64_t posBlocksDecoded = 0;
+  // Phrase per-candidate outcomes: docs rejected by the pre-position score
+  // bound vs docs that paid a position verification.
+  static inline int64_t phraseBoundRejects = 0;
+  static inline int64_t phraseVerifies = 0;
 
   static void reset() {
     docBlocksDecoded = 0;
@@ -49,6 +53,8 @@ struct SkipStats {
     conjRangeSkips = 0;
     posBlocksSkipped = 0;
     posBlocksDecoded = 0;
+    phraseBoundRejects = 0;
+    phraseVerifies = 0;
   }
 };
 

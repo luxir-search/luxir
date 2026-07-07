@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <optional>
+#include <vector>
 
 #include "ImpactsIndex.h"
 #include "Query.h"
@@ -91,17 +92,49 @@ public:
         }
       }
 
+      // Execute the phrase over its terms in increasing docFreq order (Lucene
+      // sorts exact phrase postings the same way): docsEnums[0] leads both the
+      // doc conjunction and the position walk, and phrases often start with
+      // their most common word ("the incredibles"), making text order a poor
+      // lead.  The query's public term order and idf are untouched; each
+      // position offset travels with its term, and the position algorithm
+      // assigns no meaning to offset order.
+      auto positions = targetPool.make_span<int32_t>(docsEnums.size());
+      {
+        std::vector<int32_t> order(docsEnums.size());
+        for (size_t i = 0; i < order.size(); i++) {
+          order[i] = (int32_t) i;
+        }
+        if (!PhraseQuery::Scorer::disableSortForTests) {
+          std::sort(order.begin(), order.end(), [&](int32_t a, int32_t b) {
+            auto* ea = docsEnums[(size_t) a];
+            auto* eb = docsEnums[(size_t) b];
+            if (ea->numDocs() != eb->numDocs()) return ea->numDocs() < eb->numDocs();
+            if (ea->totalTermFreq() != eb->totalTermFreq()) {
+              return ea->totalTermFreq() < eb->totalTermFreq();
+            }
+            return a < b;  // deterministic; keeps repeated terms in text order
+          });
+        }
+        std::vector<DocsEnum*> byOrder(docsEnums.begin(), docsEnums.end());
+        for (size_t k = 0; k < order.size(); k++) {
+          docsEnums[k] = byOrder[(size_t) order[k]];
+          positions[k] = query.getPositions()[(size_t) order[k]];
+        }
+      }
+
       // Position matching does not need norms when score() is never read.
       NormsReader* normsReader = (inputFlags & NEED_SCORES) != 0
               ? targetPool.make<NormsReader>(segment.postingsReader(), *segFieldInfo)
               : nullptr;
 
       // Per-term block impact indexes evaluated with the PHRASE's scorer:
-      // phraseFreq <= each term's freq in a doc, so every term's (maxTf,
-      // minNorm) frontier bounds the phrase score, and the min across terms
-      // bounds any doc range.  Much looser than a term's own bound (real
-      // phrase freq is usually far below the min term tf), so pruning bites
-      // later - but skipped ranges never touch their position bytes.
+      // phraseFreq <= each term's freq in a doc, so every term's frontier
+      // bounds the phrase score, and the min across terms bounds any doc
+      // range.  These serve getMaxScore/advanceShallow when a block-max
+      // parent drives the phrase as a clause; the phrase's own single-phase
+      // pruning is the per-doc bound in doMatches (a range-skip loop here was
+      // measured a net loss - the range bounds are too loose to fire).
       std::span<ImpactsIndex> impacts;
       if (simScorer != nullptr && normsReader != nullptr) {
         auto built = targetPool.make_span<ImpactsIndex>(docsEnums.size());
@@ -115,10 +148,7 @@ public:
         }
       }
 
-      // no need to make copy, the query will outlive the scorers.
-      // auto pos = targetPool.copy_span<const int32_t>(query.getPositions());
-
-      return targetPool.make<PhraseQuery::Scorer>(targetPool, docsEnums, query.getPositions(), normsReader, simScorer, impacts);
+      return targetPool.make<PhraseQuery::Scorer>(targetPool, docsEnums, positions, normsReader, simScorer, impacts);
     }
 
     // A phrase matches a subset of the docs containing its rarest term, so its
@@ -167,12 +197,7 @@ public:
     // when not scoring or when any term lacks impact data.
     std::span<ImpactsIndex> impacts;
     float minCompetitiveScore = 0.0f;
-    // Candidates <= competitiveUpTo passed the bound check under the current
-    // threshold; they skip re-evaluation (the common case is many candidates
-    // per block range).  Reset when the threshold rises.
-    int32_t competitiveUpTo = -1;
     int32_t shallowTarget = -1;
-    int64_t skippedRangeCount = 0;
 
     int32_t docid = -1;
     int32_t pos = -1;    // position of last match, or END if no more matches.
@@ -181,6 +206,12 @@ public:
     int32_t checkedDocid = -1;
     bool checkedMatch = false;
     float matchCostEstimate = 0.0f;
+    // One norm read per doc: the pre-position bound in doMatches() and score()
+    // both need it, and the sparse norms iterator is strict-advance (it cannot
+    // re-advance to the doc it already sits on).  Flat norms bypass the cache.
+    const uint8_t* flatNormsBase = nullptr;
+    int32_t cachedNormDoc = -1;
+    uint8_t cachedNorm = 0;
 #ifndef NDEBUG
     int32_t protocol = 0;
 #endif
@@ -258,47 +289,18 @@ public:
       return doNext(docsEnums[0]->advance(target));
     }
 
-    // Hop the conjunction past doc-block ranges whose phrase score bound cannot
-    // reach the collector's threshold, leaving docid on a candidate worth
-    // position-verifying (or END).  Skipped ranges never touch their position
-    // bytes: the doc-level skip repairs the position stream lazily.  Only the
-    // single-phase drivers (next/advance) prune; matches() stays pure so a
-    // two-phase parent gets unchanged match semantics.
-    void advanceToCompetitive() {
-      if (docid <= competitiveUpTo) {
-        return;  // this block range already passed under the current threshold
+    int64_t lookupNorm(int32_t doc) {
+      if (flatNormsBase != nullptr) {
+        return flatNormsBase[doc];
       }
-      if (impacts.empty() || !(minCompetitiveScore > 0.0f) || disablePruningForTests) {
-        return;
+      if (doc != cachedNormDoc) {
+        int32_t normDoc = normsIter->advance(doc);
+        assert(normDoc == doc);
+        unused(normDoc);
+        cachedNormDoc = doc;
+        cachedNorm = normsIter->value();
       }
-      while (docid != PostingsReader::END) {
-        float bound = std::numeric_limits<float>::infinity();
-        float remainingBound = std::numeric_limits<float>::infinity();
-        int32_t rangeEnd = PostingsReader::END - 1;
-        for (const auto& termImpacts : impacts) {
-          int32_t block = termImpacts.blockContaining(docid);
-          // a conjunction candidate lies within every term's postings
-          assert(block < termImpacts.blockCount());
-          bound = std::min(bound, termImpacts.impact(block));
-          remainingBound = std::min(remainingBound, termImpacts.maxImpactFrom(block));
-          rangeEnd = std::min(rangeEnd, termImpacts.lastDoc(block));
-        }
-        if (bound >= minCompetitiveScore) {
-          competitiveUpTo = rangeEnd;
-          return;
-        }
-        skippedRangeCount++;
-        if (remainingBound < minCompetitiveScore) {
-          // no later doc can compete for ANY term; the phrase is done
-          docid = PostingsReader::END;
-          return;
-        }
-        if (rangeEnd >= PostingsReader::END - 1) {
-          docid = PostingsReader::END;
-          return;
-        }
-        doApproximationAdvance(rangeEnd + 1);
-      }
+      return cachedNorm;
     }
 
     bool doMatches() {
@@ -315,6 +317,25 @@ public:
       if (countMatchesForTests) {
         matchCallsForTests++;
       }
+      // Reject this candidate before touching its positions when even the
+      // largest possible phrase freq cannot reach the collector's threshold
+      // (Lucene PhraseScorer.matches parity): phraseFreq <= min(term tf), and
+      // BM25 is monotone in freq.  A nonzero threshold is the caller's
+      // guarantee that sub-threshold matches are droppable, so a two-phase
+      // parent that forwards its threshold opts into pruned matches; without a
+      // threshold, match semantics are unchanged.
+      if (minCompetitiveScore > 0.0f && simScorer != nullptr && !disableDocBoundForTests) {
+        int32_t maxFreq = docsEnums[0]->termFreq();
+        for (size_t j = 1; j < docsEnums.size(); j++) {
+          maxFreq = std::min(maxFreq, docsEnums[j]->termFreq());
+        }
+        if (simScorer->score((float) maxFreq, lookupNorm(docid)) < minCompetitiveScore) {
+          skipCount(SkipStats::phraseBoundRejects);
+          pos = PostingsReader::END;
+          return false;
+        }
+      }
+      skipCount(SkipStats::phraseVerifies);
       for (auto* docsEnum: docsEnums) {
         docsEnum->startPositions();
       }
@@ -338,8 +359,10 @@ public:
   public:
     static inline bool countMatchesForTests = false;
     static inline int64_t matchCallsForTests = 0;
-    // A/B hook: turn off impact-based range skipping (bounds still built).
-    static inline bool disablePruningForTests = false;
+    // A/B hook: turn off the per-doc pre-position score bound in doMatches().
+    static inline bool disableDocBoundForTests = false;
+    // A/B hook: keep phrase execution in query text order instead of docFreq order.
+    static inline bool disableSortForTests = false;
 
     Scorer(MemPool& targetPool, std::span<DocsEnum*> docsEnums, std::span<const int32_t> positions, NormsReader* normsReader,
            Similarity::BM25Scorer* simScorer, std::span<ImpactsIndex> impacts = {})
@@ -347,7 +370,10 @@ public:
       unused(targetPool);
       // Scoring needs both BM25 and norms, or neither.
       assert((simScorer == nullptr) == (normsReader == nullptr));
-      if (normsReader != nullptr) normsIter.emplace(*normsReader);
+      if (normsReader != nullptr) {
+        normsIter.emplace(*normsReader);
+        flatNormsBase = normsReader->flatBase();
+      }
       int32_t maxOff = 0;
       for (auto pos: positions) {
         maxOff = std::max(maxOff, pos);
@@ -426,7 +452,6 @@ public:
       }
       doApproximationNext();
       for (;;) {
-        advanceToCompetitive();
         if (docid == PostingsReader::END) {
           return PostingsReader::END;
         }
@@ -446,7 +471,6 @@ public:
       assert(docid < target);
       doApproximationAdvance(target);
       for (;;) {
-        advanceToCompetitive();
         if (docid == PostingsReader::END) {
           return PostingsReader::END;
         }
@@ -471,7 +495,6 @@ public:
 
     void setMinCompetitiveScore(float minScore) override {
       minCompetitiveScore = minScore;
-      competitiveUpTo = -1;  // re-evaluate ranges under the higher threshold
     }
 
     // Upper bound on the phrase score over [shallow target, upTo] (or from the
@@ -525,16 +548,9 @@ public:
       return upTo;
     }
 
-    int64_t skippedRanges() const {
-      return skippedRangeCount;
-    }
-
     float score() override {
       if (simScorer == nullptr) return 0.0f;
-      int32_t normDoc = normsIter->advance(docid);
-      assert(normDoc == docid);
-      auto encodedNorm = normsIter->value();
-      return simScorer->score((float) freq, encodedNorm);
+      return simScorer->score((float) freq, lookupNorm(docid));
     }
   };
 
