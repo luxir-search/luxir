@@ -348,6 +348,11 @@ public:
     // SOLUX_NOINLINE and drop it if the inliner no longer over-pulls.
     // Observed on: g++ (Ubuntu) 16.0.1 20260322 experimental (trunk r16-8246).
     int64_t lookupNorm(int32_t doc) {
+      // Flat norms (the common text case) are a direct byte load - same
+      // equivalence the block path (fillScoresFromSpans) already relies on.
+      if (flatNormsBase != nullptr) {
+        return flatNormsBase[doc];
+      }
       if (normsIter) {
         int32_t normDoc = normsIter->advance(doc);
         assert(normDoc == doc);
@@ -366,7 +371,11 @@ public:
       if (simScorer == nullptr) return 0.0f;
       auto docid = docsEnum.docId();
       int32_t tf = docsEnum.termFreq();
-      int64_t encodedNorm = advanceNorm(docid);
+      // Keep the flat-norms load inline (it is one indexed byte read); the
+      // NOINLINE advanceNorm wrapper stays for the sparse iterator walk only,
+      // which is the code the inliner used to over-pull into score().
+      int64_t encodedNorm = flatNormsBase != nullptr ? flatNormsBase[docid]
+                                                     : advanceNorm(docid);
       return boost * simScorer->score((float) tf, encodedNorm);
     }
 
