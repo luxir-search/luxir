@@ -78,6 +78,7 @@ public:
 
   /// Record an explicit delete-by-id (not an overwrite).
   void addDelete(std::string_view id, uint64_t version) {
+    id = PackedTerm::truncate(id);  // must match indexId's truncation
     if (deleteHash == nullptr) {
       deleteHash = std::make_unique<TermValHash<IdEntry>>(*idPool, 4);
     }
@@ -121,6 +122,10 @@ public:
 
 private:
   void indexId(Inverter& inverter, std::string_view id) {
+    // Oversized ids index truncated; overwrite, delete-by-id, and query lookups
+    // all truncate the same way, so they keep agreeing. Two ids sharing their
+    // first 255 bytes collide into one doc - accepted for degenerate ids.
+    id = PackedTerm::truncate(id);
     // version=0 marks non-overwrite entries so they can be excluded from the delete list.
     // Update versions start at 1, so 0 is a safe sentinel.
     uint64_t version = 0;

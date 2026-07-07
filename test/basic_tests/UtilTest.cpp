@@ -5,6 +5,7 @@
 #include <vector>
 #include "test/SoluxTest.h"
 #include "solux/util/SharedLazyMap.h"
+#include "solux/util/StrRef.h"
 #include "solux/util/log.h"
 #include "solux/util/proto.h"
 
@@ -13,6 +14,22 @@ using namespace solux;
 class UtilTest : public SoluxTest {
 protected:
 };
+
+TEST_F(UtilTest, packedTermTruncate) {
+  std::string atCap(PackedTerm::MAX_LEN, 'a');
+  EXPECT_EQ(atCap, PackedTerm::truncate(atCap));            // at the cap: identity
+  EXPECT_EQ(atCap, PackedTerm::truncate(atCap + "tail"));   // over: cut at MAX_LEN
+
+  // A multi-byte sequence straddling the cap backs up to its boundary:
+  // 130 x 2-byte e-acute = 260 bytes; byte 255 splits a sequence, so cut at 254.
+  std::string acc;
+  for (int i = 0; i < 130; i++) acc += "\xC3\xA9";
+  EXPECT_EQ(acc.substr(0, 254), PackedTerm::truncate(acc));
+
+  // An invalid continuation run longer than the cap cuts at MAX_LEN exactly.
+  std::string cont(300, '\x80');
+  EXPECT_EQ(cont.substr(0, PackedTerm::MAX_LEN), PackedTerm::truncate(cont));
+}
 
 TEST_F(UtilTest, lazyMap) {
   // test exception handling

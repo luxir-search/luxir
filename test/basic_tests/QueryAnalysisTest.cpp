@@ -6,6 +6,7 @@
 #include "test/CollectionHelper.h"
 #include "test/LocalReq.h"
 #include "test/QueryBuild.h"
+#include "solux/util/StrRef.h"
 
 using namespace solux;
 using namespace solux::test;
@@ -187,6 +188,42 @@ TEST_F(QueryAnalysisTest, caseSensitiveFieldRespectsCase) {
   // body_w is whitespace-only, case-sensitive: query analysis leaves bytes alone.
   EXPECT_EQ(1, phraseTextCount("body_w", "Thomas Anderson"));   // exact case matches
   EXPECT_EQ(0, phraseTextCount("body_w", "thomas anderson"));   // wrong case misses
+}
+
+// --- max term length (indexed terms truncate to PackedTerm::MAX_LEN) ----------
+
+TEST_F(QueryAnalysisTest, oversizedTextTokenTruncatesConsistently) {
+  std::string longTok(PackedTerm::MAX_LEN + 17, 'x');
+  helper.index(flatdoc("id", "d3", "body_w", "before " + longTok + " after"), UpdateMessage::COMMIT);
+  // Index and query time truncate identically, so the full oversized token
+  // matches, and the indexed term is exactly the MAX_LEN-byte prefix.
+  EXPECT_EQ(1, matchCount("body_w", longTok));
+  EXPECT_EQ(1, matchCount("body_w", longTok.substr(0, PackedTerm::MAX_LEN)));
+  EXPECT_EQ(0, matchCount("body_w", longTok.substr(PackedTerm::MAX_LEN)));  // the cut tail is not a term
+  // Truncation keeps one token per token: phrase positions stay adjacent.
+  EXPECT_EQ(1, phraseTextCount("body_w", "before " + longTok + " after"));
+}
+
+TEST_F(QueryAnalysisTest, oversizedStringValueTruncatesConsistently) {
+  std::string longVal(PackedTerm::MAX_LEN + 33, 'y');
+  helper.index(flatdoc("id", "d3", "tag_s", longVal), UpdateMessage::COMMIT);
+  EXPECT_EQ(1, matchCount("tag_s", longVal));
+  // Values sharing their first MAX_LEN bytes are the same term (accepted
+  // truncation semantics); a shorter value is a different term.
+  EXPECT_EQ(1, matchCount("tag_s", longVal + "zzz"));
+  EXPECT_EQ(0, matchCount("tag_s", longVal.substr(0, PackedTerm::MAX_LEN - 1)));
+}
+
+TEST_F(QueryAnalysisTest, oversizedIdTruncatesConsistently) {
+  std::string longId(PackedTerm::MAX_LEN + 9, 'i');
+  helper.index(flatdoc("id", longId, "body_w", "first"), UpdateMessage::NO_COMMIT, true /*overwrite*/);
+  helper.index(flatdoc("id", longId, "body_w", "second"), UpdateMessage::COMMIT, true /*overwrite*/);
+  // The same oversized id overwrites, it does not duplicate.
+  EXPECT_EQ(0, matchCount("body_w", "first"));
+  EXPECT_EQ(1, matchCount("body_w", "second"));
+  // Delete-by-id truncates the same way and finds the doc.
+  helper.deleteById(longId, UpdateMessage::COMMIT);
+  EXPECT_EQ(0, matchCount("body_w", "second"));
 }
 
 // --- match (parseMatch) query-time analysis -----------------------------------

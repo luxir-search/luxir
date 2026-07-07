@@ -20,6 +20,7 @@
 #include "solux/query/TermQuery.h"
 #include "solux/schema/Schema.h"
 #include "solux/schema/ValCoerce.h"
+#include "solux/util/StrRef.h"
 
 namespace solux {
 
@@ -58,8 +59,11 @@ private:
 
   // Copy transient token bytes into the request pool. Analyzer chains reuse
   // their output buffers across tokens (the borrow contract), so a term we keep
-  // past the next pull must be copied out.
+  // past the next pull must be copied out. Terms are indexed truncated to
+  // PackedTerm::MAX_LEN; truncate identically here so an oversized query token
+  // matches what ingest indexed.
   std::string_view copyTerm(std::string_view term) {
+    term = PackedTerm::truncate(term);
     if (term.empty()) return {};
     char* dst = pool.alloc(term.size());
     std::memcpy(dst, term.data(), term.size());
@@ -103,7 +107,9 @@ public:
       case FieldType::Type::TEXT:
       case FieldType::Type::ID:
       case FieldType::Type::STRING:
-        return pool.make<PrefixQuery>(field, prefix);
+        // Indexed terms carry at most PackedTerm::MAX_LEN bytes; a longer
+        // prefix is truncated so it matches terms of oversized source values.
+        return pool.make<PrefixQuery>(field, PackedTerm::truncate(prefix));
       default:
         throw std::runtime_error(std::format("Prefix query on unsupported field type: {}", field));
     }
@@ -131,6 +137,7 @@ public:
       default:
         throw std::runtime_error(std::format("Fuzzy query on unsupported field type: {}", field));
     }
+    term = PackedTerm::truncate(term);  // indexed terms are truncated; compare in their space
     int resolvedEdits;
     if (!maxEdits) {
       resolvedEdits = autoMaxEdits(term.size());
@@ -207,7 +214,8 @@ public:
       }
       case FieldType::Type::ID:
       case FieldType::Type::STRING:
-        return pool.make<TermQuery>(field, value);
+        // Indexed truncated (StrHandler/IdHandler); truncate to match.
+        return pool.make<TermQuery>(field, PackedTerm::truncate(value));
       case FieldType::Type::INT:
       case FieldType::Type::FLOAT:
       case FieldType::Type::DOUBLE:
@@ -392,6 +400,10 @@ public:
   Query* createPhraseFromTerms(std::string_view field, std::span<std::string_view> terms,
                                std::span<const int32_t> positions) {
     textFieldType(field);  // validate it is a text field
+
+    // Verbatim terms still honor the indexed-term length cap; rewrite entries
+    // in place (the span is mutable by contract).
+    for (auto& t : terms) t = PackedTerm::truncate(t);
 
     if (!positions.empty() && positions.size() != terms.size()) {
       throw std::runtime_error(std::format(

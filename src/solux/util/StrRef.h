@@ -164,6 +164,18 @@ public:
   static constexpr uint32_t getMemSize(uint32_t size) noexcept { return size + 1; }
   static constexpr uint32_t getExactMemSize(uint32_t size) noexcept { return size + 1; }
 
+  // Truncate term bytes to MAX_LEN so they fit the one-byte length, backing up
+  // over UTF-8 continuation bytes so the cut cannot split a multi-byte sequence
+  // (a bogus continuation run longer than the cap cuts at MAX_LEN exactly).
+  // Term consumers (index handlers, query building) apply this at their
+  // boundary; producers (tokenizers, filters) never deal with the limit.
+  inline static std::string_view truncate(std::string_view term) noexcept {
+    if (term.size() <= MAX_LEN) return term;
+    uint32_t len = MAX_LEN;
+    while (len > 0 && ((unsigned char) term[len] & 0xC0) == 0x80) len--;
+    return term.substr(0, len ? len : MAX_LEN);
+  }
+
   // returns the number of bytes written to the target... either sz+1 or sz+2
   inline static uint32_t write(char *target, const void *data, uint32_t sz) noexcept {
     // A longer value silently wraps the single length byte and corrupts whatever

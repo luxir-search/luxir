@@ -65,7 +65,10 @@ public:
   }
 
   void indexSingle(Inverter& inverter, std::string_view term) {
-    // TODO: error check if term is too long to index.
+    // Oversized values index truncated (the stored/column value keeps its full
+    // bytes); query-time term building truncates identically, so exact match
+    // on the full value still works.
+    term = PackedTerm::truncate(term);
     auto [entry, inserted] = termsHash.try_emplace(term, termsHash.getMemPool());
     unused(inserted);
     // don't record duplicates for the same doc.

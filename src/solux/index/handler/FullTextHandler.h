@@ -114,7 +114,9 @@ public:
         pos += tok.positionIncrement;
         // The token bytes are transient (the chain may reuse the buffer on the
         // next pull); try_emplace copies them into the MemPool below.
-        std::string_view term = tok.text;
+        // Oversized tokens index truncated; query-time term building truncates
+        // identically (QueryBuilder::copyTerm), so exact match still works.
+        std::string_view term = PackedTerm::truncate(tok.text);
 
         auto [entry, inserted] = termsHash.try_emplace(term, termsHash.getMemPool(), docid, pos);
         if (!inserted) {
