@@ -495,6 +495,11 @@ class TextWriter {
   std::array<uint32_t, 256> maxTfPerNorm;
   std::vector<uint32_t> frontierNorms;
   std::vector<uint32_t> frontierTfs;
+  // Term-level (maxTf, norm) surface accumulated across the whole term, so the
+  // term dictionary can store the term's impact frontier: a scorer's global
+  // max score must come from stored data, never a walk of the postings.
+  std::array<uint32_t, 256> termMaxTfPerNorm;
+  std::vector<char> termImpactRun;  // per-term encoded frontiers for the current term block
 
 private:  // some internal utility methods... not for use by indexers
   static void appendVint(std::vector<char>& out, uint32_t val) {
@@ -562,6 +567,7 @@ private:  // some internal utility methods... not for use by indexers
       assert(norm <= 255);
       uint32_t tf = (uint32_t) tfreqs[i];
       maxTfPerNorm[norm] = std::max(maxTfPerNorm[norm], tf);
+      termMaxTfPerNorm[norm] = std::max(termMaxTfPerNorm[norm], tf);
     }
 
     uint32_t runningMaxTf = 0;
@@ -570,6 +576,31 @@ private:  // some internal utility methods... not for use by indexers
       if (tf > runningMaxTf) {
         frontierNorms.push_back(norm);
         frontierTfs.push_back(tf);
+        runningMaxTf = tf;
+      }
+    }
+  }
+
+  // Encode the Pareto frontier of a (norm -> maxTf) surface as
+  // [count vint][(norm u8, tf-delta vint)*], the same staircase the L0
+  // headers use.  count == 0 only for fields without freqs+norms.
+  static void appendImpactFrontier(std::vector<char>& out,
+                                   const std::array<uint32_t, 256>& surface) {
+    uint32_t count = 0;
+    uint32_t runningMaxTf = 0;
+    for (uint32_t norm = 0; norm < surface.size(); norm++) {
+      if (surface[norm] > runningMaxTf) {
+        count++;
+        runningMaxTf = surface[norm];
+      }
+    }
+    appendVint(out, count);
+    runningMaxTf = 0;
+    for (uint32_t norm = 0; norm < surface.size(); norm++) {
+      uint32_t tf = surface[norm];
+      if (tf > runningMaxTf) {
+        out.push_back((char) (uint8_t) norm);
+        appendVint(out, tf - runningMaxTf);
         runningMaxTf = tf;
       }
     }
@@ -924,6 +955,7 @@ public:
     termDocFreqs.resize(0);
     termTtfCodes.resize(0);
     termPosOffsets.resize(0);
+    termImpactRun.resize(0);
     pulsed.resize(0);
     termPulsedMask = 0;
     locOfPositionsForTermBlock = posOutput.size();
@@ -995,6 +1027,10 @@ public:
   //       Pulsed terms repeat the running value; readers ignore the offset for
   //       pulsed terms.
   //       Default: every delta is 0, so every offset is 0.
+  //     [termImpact: frontier run, only when the field indexes freqs+norms]
+  //       Per term, the whole-term (norm, maxTf) Pareto frontier as
+  //       [count vint][(norm u8, tf-delta vint)*] - the stored source for a
+  //       scorer's global max score.  Never default-coded.
   //     [pulsed: StreamVByte run]
   //       Values for pulsed terms only, in term order.  Each pulsed term stores
   //       doc, and also pos when positions are indexed.  The value index for
@@ -1099,6 +1135,7 @@ public:
       appendVlongDeltaRun(posOffRun, termPosOffsets);
     }
     appendSVBRun(pulsedRun, pulsed);
+    bool hasTermImpacts = hasFreqs && hasNorms;
 
     bool docsEndDefault = allUInt64Equal(termDocsEnd, 0);
     if (docsEndDefault) {
@@ -1116,6 +1153,9 @@ public:
     if (hasPositions) {
       writeMetadataRunLen(posOffDefault ? 0 : posOffRun.size());
     }
+    if (hasTermImpacts) {
+      writeMetadataRunLen(termImpactRun.size());
+    }
     writeMetadataRunLen(pulsedRun.size());
 
     if (!docsEndDefault) {
@@ -1129,6 +1169,9 @@ public:
     }
     if (hasPositions && !posOffDefault) {
       termOutput.write(posOffRun.data(), posOffRun.size());
+    }
+    if (hasTermImpacts) {
+      termOutput.write(termImpactRun.data(), termImpactRun.size());
     }
     termOutput.write(pulsedRun.data(), pulsedRun.size());
 
@@ -1157,6 +1200,7 @@ public:
     l1GroupMaxTf = 0;
     l1GroupMinNorm = 0;
     group_output.resize(0);
+    termMaxTfPerNorm.fill(0);
     locOfPositionsForTerm = posOutput.size();
     pendingBlockPosByteOff = locOfPositionsForTerm;
     locOfDocsForTerm = docOutput.size();
@@ -1189,6 +1233,14 @@ public:
       assert(blockTermOrd >= 0 && blockTermOrd < Postings::TERMS_BLOCK_SIZE);
       termPulsedMask |= 1u << (uint32_t) blockTermOrd;
       sumDocFreq += 1;
+      if (hasFreqs && hasNorms) {
+        // single-doc term: exact one-point frontier from its norm
+        termMaxTfPerNorm.fill(0);
+        uint32_t norm = normForDoc(docs[0]);
+        assert(norm <= 255);
+        termMaxTfPerNorm[norm] = 1;
+        appendImpactFrontier(termImpactRun, termMaxTfPerNorm);
+      }
       termDocFreqs.push_back(1);
       termTtfCodes.push_back(0);
       termDocsEnd.push_back((uint64_t) (docOutput.size() - locOfDocsForTermBlock));
@@ -1282,6 +1334,9 @@ public:
       termTtfCodes.push_back(ttfCode);
       if (hasPositions) {
         termPosOffsets.push_back(posOffset);
+      }
+      if (hasFreqs && hasNorms) {
+        appendImpactFrontier(termImpactRun, termMaxTfPerNorm);
       }
       termDocsEnd.push_back((uint64_t) (docOutput.size() - locOfDocsForTermBlock));
     }

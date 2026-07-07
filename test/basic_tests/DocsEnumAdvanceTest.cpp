@@ -379,6 +379,73 @@ TEST_F(DocsEnumAdvanceTest, advanceCrossesL1AndTailOnTrailerFreeSlice) {
   ASSERT_EQ(denum.advance(N), DocsEnum::END);
 }
 
+// The whole-term impact frontier stored in the term dictionary must equal the
+// staircase over the term's global (norm -> maxTf) surface - on a fresh
+// segment and after a merge (the merger regenerates it by replay).
+TEST_F(DocsEnumAdvanceTest, termImpactFrontierRoundTrip) {
+  const int32_t N = 72 * Postings::DOCS_BLOCK_SIZE + 17;
+  std::array<int32_t, 256> surface{};
+  for (int32_t doc = 0; doc < N; doc++) {
+    int32_t norm = SmallFloat::intToByte4(impactTokenCountForDoc(doc));
+    surface[(size_t) norm] = std::max(surface[(size_t) norm], impactTfForDoc(doc));
+  }
+  std::vector<int32_t> expNorms;
+  std::vector<int32_t> expTfs;
+  int32_t running = 0;
+  for (int32_t norm = 0; norm < 256; norm++) {
+    if (surface[(size_t) norm] > running) {
+      expNorms.push_back(norm);
+      expTfs.push_back(surface[(size_t) norm]);
+      running = surface[(size_t) norm];
+    }
+  }
+
+  auto check = [&](TestField& f, std::string_view label) {
+    TermsEnum tenum = f.createTermsEnum();
+    ASSERT_TRUE(tenum.seek("hot")) << label;
+    std::vector<int32_t> norms;
+    std::vector<int32_t> tfs;
+    tenum.readTermImpactFrontier(norms, tfs);
+    EXPECT_EQ(norms, expNorms) << label;
+    EXPECT_EQ(tfs, expTfs) << label;
+  };
+
+  {
+    TestIndex testIndex;
+    TestField f(testIndex, "body_w");
+    f.startIndexing();
+    addImpactDocs(f, 0, N, 0);
+    // a pulsed (single-doc) term shares the block: exact one-point frontier
+    f.add(N, "solo x y z");
+    testIndex.flush();
+    f.startReading();
+    check(f, "fresh");
+
+    TermsEnum tenum = f.createTermsEnum();
+    ASSERT_TRUE(tenum.seek("solo"));
+    std::vector<int32_t> norms;
+    std::vector<int32_t> tfs;
+    ASSERT_EQ(tenum.readTermImpactFrontier(norms, tfs), 1);
+    EXPECT_EQ(tfs[0], 1);
+    EXPECT_EQ(norms[0], SmallFloat::intToByte4(4));
+  }
+
+  {
+    const int32_t split = 40 * Postings::DOCS_BLOCK_SIZE + 9;
+    TestIndex testIndex;
+    TestField f(testIndex, "body_w");
+    f.startIndexing();
+    addImpactDocs(f, 0, split, 0);
+    testIndex.flush();
+    f.startIndexing();
+    addImpactDocs(f, 0, N - split, split);
+    testIndex.flush();
+    testIndex.iw->mergeSegments();
+    f.startReading();
+    check(f, "merged");
+  }
+}
+
 TEST_F(DocsEnumAdvanceTest, blockImpactHeadersRoundTrip) {
   const int32_t N = 72 * Postings::DOCS_BLOCK_SIZE + 17;
   std::vector<int32_t> expectedFreqImpacts = expectedBlockMaxTf(N, true);

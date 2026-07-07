@@ -48,11 +48,13 @@ class TermsEnum {
   const char* dfRun = nullptr;
   const char* ttfCodeRun = nullptr;
   const char* posOffRun = nullptr;
+  const char* termImpactRun = nullptr;
   const char* pulsedRun = nullptr;
   uint32_t docsEndRunLen = 0;
   uint32_t dfRunLen = 0;
   uint32_t ttfCodeRunLen = 0;
   uint32_t posOffRunLen = 0;
+  uint32_t termImpactRunLen = 0;
   uint32_t pulsedRunLen = 0;
 
   std::array<uint64_t, Postings::TERMS_BLOCK_SIZE> docsEnds{};
@@ -136,6 +138,45 @@ public:
     return (int64_t) ttf;
   }
 
+  // The whole-term (norm, maxTf) Pareto frontier stored in the term block
+  // metadata (see PostingsWriter.flushTerms): the source for a scorer's
+  // global max score - never derived by walking postings.  Returns the
+  // number of frontier points appended to norms/tfs.
+  int32_t readTermImpactFrontier(std::vector<int32_t>& norms, std::vector<int32_t>& tfs) {
+    norms.resize(0);
+    tfs.resize(0);
+    if (!hasTermImpacts()) {
+      return 0;
+    }
+    parseMetadataRuns();
+    const char* p = termImpactRun;
+    const char* end = termImpactRun + termImpactRunLen;
+    // frontiers are variable length: skip the terms before ours
+    for (int32_t t = 0; t < ordInBlock; t++) {
+      uint32_t count = InputStream::readVint(p, end);
+      for (uint32_t j = 0; j < count; j++) {
+        p++;  // norm byte
+        InputStream::readVint(p, end);  // tf delta
+      }
+    }
+    uint32_t count = InputStream::readVint(p, end);
+    int32_t tf = 0;
+    for (uint32_t j = 0; j < count; j++) {
+      assert(p < end);
+      int32_t norm = (int32_t) (uint8_t) *p;
+      p++;
+      tf += (int32_t) InputStream::readVint(p, end);
+      norms.push_back(norm);
+      tfs.push_back(tf);
+    }
+    assert(p <= end);
+    return (int32_t) count;
+  }
+
+  bool hasTermImpacts() const {
+    return FieldType::hasFreqs(fieldInfo.flags) && FieldType::hasPositions(fieldInfo.flags);
+  }
+
 protected:
   uint32_t readMetadataRunLen(const char*& p, const char* end) {
     uint32_t code = InputStream::readVint(p, end);
@@ -180,6 +221,7 @@ protected:
     dfRunLen = readMetadataRunLen(p, blockEnd);
     ttfCodeRunLen = FieldType::hasFreqs(fieldInfo.flags) ? readMetadataRunLen(p, blockEnd) : 0;
     posOffRunLen = FieldType::hasPositions(fieldInfo.flags) ? readMetadataRunLen(p, blockEnd) : 0;
+    termImpactRunLen = hasTermImpacts() ? readMetadataRunLen(p, blockEnd) : 0;
     pulsedRunLen = readMetadataRunLen(p, blockEnd);
 
     docsEndRun = p;
@@ -201,6 +243,13 @@ protected:
       assert(p <= blockEnd);
     } else {
       posOffRun = nullptr;
+    }
+    if (hasTermImpacts()) {
+      termImpactRun = p;
+      p += termImpactRunLen;
+      assert(p <= blockEnd);
+    } else {
+      termImpactRun = nullptr;
     }
     pulsedRun = p;
     p += pulsedRunLen;
