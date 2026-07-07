@@ -256,3 +256,25 @@ TEST_F(SimpleQueryTest, emptyStringMatchesNothing) {
 TEST_F(SimpleQueryTest, wholeInputStarMatchesAll) {
   EXPECT_EQ(3u, search("*", {"title_wl"}).size());
 }
+
+TEST_F(SimpleQueryTest, expansionSplicesIntoRequestTree) {
+  // after execution the simple_query arm has been replaced by its structured
+  // expansion (same request-storage lifetime), so serializing the request
+  // shows the canonical equivalent - the echo-mode contract, same as expr
+  auto req = localReq(helper.getSearchEngine());
+  auto& cur = req->collection("main").topDocs("q");
+  cur.simpleQuery("tag_s:scifi", {"title_wl"}).fields({"id"}).limit(-1);
+  req->execute();
+  ASSERT_TRUE(req->ok()) << req->errorMsg();
+  EXPECT_TRUE(std::holds_alternative<solux::api::Match>(cur.rawQuery().kind));
+
+  // a q that parses to nothing has no structured equivalent to splice; the
+  // string arm stays put and the query matches no documents
+  auto req2 = localReq(helper.getSearchEngine());
+  auto& cur2 = req2->collection("main").topDocs("q");
+  cur2.simpleQuery("+ | -", {"title_wl"}).fields({"id"}).limit(-1);
+  req2->execute();
+  ASSERT_TRUE(req2->ok()) << req2->errorMsg();
+  EXPECT_TRUE(std::holds_alternative<solux::api::SimpleQuery>(cur2.rawQuery().kind));
+  EXPECT_EQ(0u, req2->getDocs().size());
+}

@@ -249,7 +249,7 @@ public:
     return pool.make<solux::BooleanQuery>(required, optional, prohibited, filter, minMatch);
   }
 
-  solux::Query* parseSimpleQuery(const solux::api::SimpleQuery& sq) {
+  solux::Query* parseSimpleQuery(const solux::api::SimpleQuery& sq, const solux::api::Query& node) {
     // Envelope validation errors freely: the never-fails contract covers the
     // STRING q, not the request shape (request-shape errors are
     // author-controlled and deterministic).
@@ -285,9 +285,18 @@ public:
     }
 
     if (result.root == nullptr) {
+      // Nothing parsed (e.g. all-whitespace q).  There is no structured
+      // match-nothing arm to splice, so the string stays; the warnings
+      // channel declares the degradation.
       QueryBuilder builder(pool, schema);
       return builder.matchNoDocs();
     }
+    // Splice the expansion over the simple_query arm, same as expr: both live
+    // in the request storage, so any later serialization of the request shows
+    // the structured equivalent instead of the opaque string.  sq lives
+    // inside node.kind and dies here; everything it fed (options, result) was
+    // copied or points at request/pool bytes that outlive the splice.
+    const_cast<solux::api::Query&>(node).kind = result.root->kind;
     return parse(*result.root);
   }
 
@@ -330,7 +339,7 @@ public:
       [&](const solux::api::PrefixQuery& p) -> solux::Query* { return parsePrefix(p); },
       [&](const solux::api::RangeQuery& r) -> solux::Query* { return parseRange(r); },
       [&](const solux::api::FuzzyQuery& f) -> solux::Query* { return parseFuzzy(f); },
-      [&](const solux::api::SimpleQuery& s) -> solux::Query* { return parseSimpleQuery(s); },
+      [&](const solux::api::SimpleQuery& s) -> solux::Query* { return parseSimpleQuery(s, pquery); },
       [&](const solux::api::ExprQuery& e) -> solux::Query* { return parseExpr(e, pquery); },
       [&](bool) -> solux::Query* { return pool.make<solux::AllQuery>(); },  // the `all` arm
       [&](const solux::api::KnnQuery& k) -> solux::Query* { return parseKnn(k); },
