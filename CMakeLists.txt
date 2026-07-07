@@ -260,3 +260,7 @@ target_link_libraries(solux_lib PRIVATE faiss)
 # uni-algo (vendored): Unicode case folding / NFKC / UAX#29 segmentation, used by
 # the analysis chain (src/solux/analysis/Analyzer.cpp).
 target_link_libraries(solux_lib PRIVATE uni_algo)
+
+# Optional, untracked developer-machine additions (extra tools/targets that
+# should not live in the shared build). Silently skipped when absent.
+include(LocalTargets.cmake OPTIONAL)
