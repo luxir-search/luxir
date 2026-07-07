@@ -1141,12 +1141,16 @@ public:
     bodyReady = false;
   }
 
-  // Strict (like the Scorer / Lucene PostingsEnum contract): target must be beyond
-  // the current doc.  Callers: ConjunctionScorer / MandOpt / MandNot, PhraseQuery,
-  // ConstantScoreQuery, the column-join iterators.
-  int32_t advance(int32_t target) {
+private:
+  template <bool DOCS_ONLY>
+  int32_t advanceImpl(int32_t target) {
     assert(docid < target);
-    assert(!docsOnlyConsumed);
+    if constexpr (DOCS_ONLY) {
+      assert(!trackPositions);
+      docsOnlyConsumed = true;
+    } else {
+      assert(!docsOnlyConsumed);
+    }
     skipCount(SkipStats::advanceCalls);
     if (nextL0Block < numDocBlocks
         && (docBufEnd == 0 || target > docBuf[docBufEnd - 1])) {
@@ -1154,7 +1158,7 @@ public:
     }
     if (docBufIdx >= docBufEnd) {
       // fresh block (or END) after the block-level skip
-      if (nextDoc() >= target) {
+      if (nextDocImpl<DOCS_ONLY>() >= target) {
         return docid;
       }
     }
@@ -1162,7 +1166,7 @@ public:
       // target is past the final decoded block (last block of the list, or a
       // pulsed posting): walk out to END the simple way.
       while (docid < target) {
-        nextDoc();
+        nextDocImpl<DOCS_ONLY>();
       }
       return docid;
     }
@@ -1176,22 +1180,44 @@ public:
     assert(j < docBufEnd);
     const int32_t consumed = j + 1 - start;
     docOrd += consumed;
-    if (hasFreqs) {
-      tfreq = tfreqBuf[j];
-      tfreqOrd += consumed;
-      tfreqBufIdx = j + 1;
-      if (trackPositions) {
-        markPendingPositionRepair(start, j + 1);
+    if constexpr (DOCS_ONLY) {
+      if (hasFreqs) {
+        tfreqOrd += consumed;
+        tfreqBufIdx = j + 1;
       }
-    } else {
       tfreq = 1;
-      if (trackPositions) {
-        markPendingPositionRepair(start, j + 1);
+    } else {
+      if (hasFreqs) {
+        tfreq = tfreqBuf[j];
+        tfreqOrd += consumed;
+        tfreqBufIdx = j + 1;
+        if (trackPositions) {
+          markPendingPositionRepair(start, j + 1);
+        }
+      } else {
+        tfreq = 1;
+        if (trackPositions) {
+          markPendingPositionRepair(start, j + 1);
+        }
       }
     }
     docBufIdx = j + 1;
     docid = docBuf[j];
     return docid;
+  }
+
+public:
+  // Strict (like the Scorer / Lucene PostingsEnum contract): target must be beyond
+  // the current doc.  Callers: ConjunctionScorer / MandOpt / MandNot, PhraseQuery,
+  // ConstantScoreQuery, the column-join iterators.
+  int32_t advance(int32_t target) {
+    return advanceImpl<false>(target);
+  }
+
+  // Docs-only strict advance: same cursor contract as advance(), but skips freqs
+  // and permanently switches the enum to docs-only consumption.
+  int32_t advanceDocOnly(int32_t target) {
+    return advanceImpl<true>(target);
   }
 
   // Read stored impact data without decoding postings bodies.  DOCS-only fields

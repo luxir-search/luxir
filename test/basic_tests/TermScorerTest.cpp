@@ -688,6 +688,63 @@ int64_t countPullTermDisjunctionSegment(MemPool& pool, Query::Context& qContext,
   return count;
 }
 
+int64_t countBulkTermConjunctionSegment(MemPool& pool, Query::Context& qContext,
+                                        IndexReader::Segment& segment,
+                                        std::span<const std::string_view> terms,
+                                        DocSet* filter) {
+  auto queries = makeTermQueries(terms);
+  auto mandatory = queryPointers(queries);
+  std::span<Query*> empty;
+  BooleanQuery query(std::span<Query*>(mandatory.data(), mandatory.size()), empty, empty, empty);
+  auto* weight = query.createWeight(qContext, Query::NEED_SCORES);
+  auto* supplier = weight->scorerSupplier(pool, segment);
+  if (supplier == nullptr) {
+    return 0;
+  }
+  auto* bulk = supplier->bulkScorer(pool);
+  if (bulk == nullptr) {
+    ADD_FAILURE() << "bulkScorer returned null";
+    return -1;
+  }
+
+  int64_t count = 0;
+  for (int32_t cursor = 0; cursor != PostingsReader::END && cursor < segment.maxDoc(); ) {
+    int32_t next = bulk->countNextWindow(count, filter, cursor, segment.maxDoc());
+    if (next == PostingsReader::END) {
+      break;
+    }
+    if (next <= cursor) {
+      ADD_FAILURE() << "countNextWindow made no progress";
+      break;
+    }
+    cursor = next;
+  }
+  return count;
+}
+
+int64_t countPullTermConjunctionSegment(MemPool& pool, Query::Context& qContext,
+                                        IndexReader::Segment& segment,
+                                        std::span<const std::string_view> terms,
+                                        DocSet* filter) {
+  auto queries = makeTermQueries(terms);
+  auto mandatory = queryPointers(queries);
+  std::span<Query*> empty;
+  BooleanQuery query(std::span<Query*>(mandatory.data(), mandatory.size()), empty, empty, empty);
+  auto* weight = query.createWeight(qContext, Query::NEED_SCORES);
+  auto* scorer = weight->createScorer(pool, segment);
+  if (scorer == nullptr) {
+    return 0;
+  }
+
+  int64_t count = 0;
+  for (int32_t doc = scorer->next(); doc != PostingsReader::END; doc = scorer->next()) {
+    if (filter == nullptr || filter->get(doc)) {
+      count++;
+    }
+  }
+  return count;
+}
+
 void addBulkFillTermDoc(TestField& f, int32_t doc, bool a, bool b, bool c) {
   std::string body;
   if (a) appendRepeatedTerm(body, "bf_a", 1 + (doc % 5));
@@ -2564,6 +2621,205 @@ TEST_F(TermScorerTest, intoBitSetWordBlocksMatchIteration) {
     }
   }
   EXPECT_EQ(got2, want2);
+}
+
+TEST_F(TermScorerTest, advanceDocOnlyCoversBlockEncodingsAndSkips) {
+  const int32_t N = 3 * DocsEnum::L1_DOCS + 257;
+  TestIndex testIndex;
+  TestField f(testIndex, "body_w");
+  f.startIndexing();
+  uint32_t state = 0x9e3779b9u;
+  auto nextRand = [&]() {
+    state = state * 1664525u + 1013904223u;
+    return state;
+  };
+  std::vector<int32_t> contigExpected;
+  std::vector<int32_t> wordExpected;
+  std::vector<int32_t> packedExpected;
+  contigExpected.reserve((size_t) N);
+  for (int32_t doc = 0; doc < N; doc++) {
+    std::string body = "ado_contig";
+    contigExpected.push_back(doc);
+    if ((nextRand() & 0x3u) != 0) {
+      body += " ado_word";
+      wordExpected.push_back(doc);
+    }
+    if ((doc % 10) == 0) {
+      body += " ado_packed";
+      packedExpected.push_back(doc);
+    }
+    body += " filler";
+    f.add(doc, body);
+  }
+  testIndex.flush();
+  f.startReading();
+
+  auto poolFree = testIndex.pool.rewindScopeGuard();
+  auto& segment = testIndex.reader->segments()[0];
+  PostingsReader& postingsReader = segment.postingsReader();
+  FieldReader fieldReader(testIndex.pool, postingsReader);
+  ASSERT_TRUE(fieldReader.seek("body_w"));
+  SegFieldInfo fieldInfo;
+  fieldReader.readFieldInfo(fieldInfo);
+
+  auto checkAdvance = [&](std::string_view term, const std::vector<int32_t>& expected,
+                          std::initializer_list<int32_t> targets) {
+    TermsEnum tenum(testIndex.pool, postingsReader, fieldInfo);
+    ASSERT_TRUE(tenum.seek(term));
+    DocsEnum denum(testIndex.pool, postingsReader, tenum);
+    denum.setTrackPositions(false);
+    int32_t last = -1;
+    for (int32_t target : targets) {
+      ASSERT_GT(target, last) << term;
+      int32_t got = denum.advanceDocOnly(target);
+      auto it = std::lower_bound(expected.begin(), expected.end(), target);
+      int32_t want = it == expected.end() ? PostingsReader::END : *it;
+      EXPECT_EQ(got, want) << term << " target=" << target;
+      last = got;
+      if (got == PostingsReader::END) {
+        break;
+      }
+    }
+  };
+
+  bool savedStats = SkipStats::enabled;
+  SkipStats::enabled = true;
+  SkipStats::reset();
+  checkAdvance("ado_contig", contigExpected, {0, 64, 127, 128, 4096, 9000, N + 1});
+  checkAdvance("ado_word", wordExpected, {0, 64, 127, 128, 4096, 9000, N + 1});
+  checkAdvance("ado_packed", packedExpected, {0, 9, 129, 4096, 9000, N + 1});
+
+  TermsEnum tenum(testIndex.pool, postingsReader, fieldInfo);
+  ASSERT_TRUE(tenum.seek("ado_word"));
+  DocsEnum denum(testIndex.pool, postingsReader, tenum);
+  denum.setTrackPositions(false);
+  auto firstWindowDoc = std::lower_bound(wordExpected.begin(), wordExpected.end(), 4096);
+  ASSERT_NE(firstWindowDoc, wordExpected.end());
+  int32_t from = *firstWindowDoc;
+  int32_t to = std::min(from + 777, N);
+  ASSERT_EQ(denum.advanceDocOnly(from), from);
+  std::vector<uint64_t> bits((size_t) (to - from + 63) / 64, 0);
+  denum.intoBitSet(bits, from, to);
+  std::vector<int32_t> got;
+  for (int32_t i = 0; i < to - from; i++) {
+    if (bits[(size_t) i >> 6] & (1ULL << (i & 63))) {
+      got.push_back(from + i);
+    }
+  }
+  std::vector<int32_t> want;
+  for (int32_t doc : wordExpected) {
+    if (doc >= from && doc < to) {
+      want.push_back(doc);
+    }
+  }
+  EXPECT_EQ(got, want);
+  EXPECT_GT(SkipStats::docsOnlyFreqBlocksSkipped, 0);
+  SkipStats::enabled = savedStats;
+}
+
+TEST_F(TermScorerTest, conjunctionDenseCountMatchesPullWithFilters) {
+  const int32_t N = 2 * DocsEnum::L1_DOCS + 321;
+  TestIndex testIndex;
+  TestField f(testIndex, "body_w");
+  f.startIndexing();
+  for (int32_t doc = 0; doc < N; doc++) {
+    std::string body;
+    if ((doc % 17) != 5) appendRepeatedTerm(body, "dca", 1 + (doc % 3));
+    if ((doc % 19) != 7) appendRepeatedTerm(body, "dcb", 1 + (doc % 5));
+    if ((doc % 23) != 11) appendRepeatedTerm(body, "dcc", 1 + (doc % 2));
+    appendRepeatedTerm(body, "filler", 3);
+    f.add(doc, body);
+  }
+  testIndex.flush();
+  f.startReading();
+
+  auto poolFree = testIndex.pool.rewindScopeGuard();
+  Query::Context qContext(testIndex.pool, *testIndex.reader);
+  auto& segment = qContext.topReader.segments()[0];
+  std::array<std::string_view, 2> terms = {"dca", "dcb"};
+  auto bitsetFilter = makeEveryNthDocSet(N, 3, false);
+  auto arrayFilter = makeEveryNthDocSet(N, 5, true);
+
+  bool savedStats = SkipStats::enabled;
+  SkipStats::enabled = true;
+  SkipStats::reset();
+  int64_t pull = countPullTermConjunctionSegment(testIndex.pool, qContext, segment, terms, nullptr);
+  int64_t bulk = countBulkTermConjunctionSegment(testIndex.pool, qContext, segment, terms, nullptr);
+  EXPECT_EQ(bulk, pull);
+  EXPECT_GT(SkipStats::conjDenseCountWindows, 0);
+  EXPECT_GT(SkipStats::countBulkFillWordBlocks, 0);
+
+  pull = countPullTermConjunctionSegment(testIndex.pool, qContext, segment, terms, bitsetFilter.get());
+  bulk = countBulkTermConjunctionSegment(testIndex.pool, qContext, segment, terms, bitsetFilter.get());
+  EXPECT_EQ(bulk, pull);
+
+  pull = countPullTermConjunctionSegment(testIndex.pool, qContext, segment, terms, arrayFilter.get());
+  bulk = countBulkTermConjunctionSegment(testIndex.pool, qContext, segment, terms, arrayFilter.get());
+  EXPECT_EQ(bulk, pull);
+  SkipStats::enabled = savedStats;
+}
+
+TEST_F(TermScorerTest, conjunctionDenseCountThreeClauseLeapfrogMatchesPull) {
+  const int32_t N = 3 * DocsEnum::L1_DOCS + 17;
+  TestIndex testIndex;
+  TestField f(testIndex, "body_w");
+  f.startIndexing();
+  for (int32_t doc = 0; doc < N; doc++) {
+    std::string body;
+    if ((doc % 8) == 0) appendRepeatedTerm(body, "lfa", 1 + (doc % 3));
+    if ((doc % 9) == 0) appendRepeatedTerm(body, "lfb", 1 + (doc % 4));
+    if ((doc % 7) == 0) appendRepeatedTerm(body, "lfc", 1 + (doc % 2));
+    appendRepeatedTerm(body, "filler", 2);
+    f.add(doc, body);
+  }
+  testIndex.flush();
+  f.startReading();
+
+  auto poolFree = testIndex.pool.rewindScopeGuard();
+  Query::Context qContext(testIndex.pool, *testIndex.reader);
+  auto& segment = qContext.topReader.segments()[0];
+  std::array<std::string_view, 3> terms = {"lfa", "lfb", "lfc"};
+
+  bool savedStats = SkipStats::enabled;
+  SkipStats::enabled = true;
+  SkipStats::reset();
+  int64_t pull = countPullTermConjunctionSegment(testIndex.pool, qContext, segment, terms, nullptr);
+  int64_t bulk = countBulkTermConjunctionSegment(testIndex.pool, qContext, segment, terms, nullptr);
+  EXPECT_EQ(bulk, pull);
+  EXPECT_GT(SkipStats::conjDenseCountWindows, 0);
+  EXPECT_LT(SkipStats::countBulkFillCalls,
+            SkipStats::conjDenseCountWindows * (int64_t) terms.size());
+  SkipStats::enabled = savedStats;
+}
+
+TEST_F(TermScorerTest, conjunctionSparseCountFallbackMatchesPull) {
+  const int32_t N = 2 * DocsEnum::L1_DOCS + 200;
+  TestIndex testIndex;
+  TestField f(testIndex, "body_w");
+  f.startIndexing();
+  for (int32_t doc = 0; doc < N; doc++) {
+    std::string body = "scommon";
+    if ((doc % 100) == 0) body += " srare";
+    body += " filler";
+    f.add(doc, body);
+  }
+  testIndex.flush();
+  f.startReading();
+
+  auto poolFree = testIndex.pool.rewindScopeGuard();
+  Query::Context qContext(testIndex.pool, *testIndex.reader);
+  auto& segment = qContext.topReader.segments()[0];
+  std::array<std::string_view, 2> terms = {"srare", "scommon"};
+
+  bool savedStats = SkipStats::enabled;
+  SkipStats::enabled = true;
+  SkipStats::reset();
+  int64_t pull = countPullTermConjunctionSegment(testIndex.pool, qContext, segment, terms, nullptr);
+  int64_t bulk = countBulkTermConjunctionSegment(testIndex.pool, qContext, segment, terms, nullptr);
+  EXPECT_EQ(bulk, pull);
+  EXPECT_EQ(SkipStats::conjDenseCountWindows, 0);
+  EXPECT_GT(SkipStats::conjCountFallbacks, 0);
+  SkipStats::enabled = savedStats;
 }
 
 TEST_F(TermScorerTest, docsOnlyEnumProtocolAssertsOnFreqAndPositions) {

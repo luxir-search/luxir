@@ -353,7 +353,7 @@ public:
           arr[i] = scorer;
         }
         return targetPool.make<BooleanQuery::ConjunctionBulkScorer>(
-            targetPool, std::span<Query::Scorer*>(arr, entries.size()), segment.maxDoc());
+            targetPool, std::span<Query::Scorer*>(arr, entries.size()), segment.maxDoc(), leadCost);
       }
 
       BulkScorer* bulkScorer(MemPool& targetPool) override {
@@ -894,6 +894,32 @@ public:
     }
   }; // ConjuctionScorer
 
+  static void applyDomainBitsToWindow(std::span<uint64_t> windowBits,
+                                      int32_t windowStart, int32_t windowEnd,
+                                      const FixedBitSet* domainBits) {
+    assert(domainBits != nullptr);
+    int32_t domainWords = (int32_t) FixedBitSet::sizeInWords(domainBits->size());
+    for (size_t w = 0; w < windowBits.size(); w++) {
+      int32_t firstDoc = windowStart + (int32_t) (w << 6);
+      int32_t remaining = windowEnd - firstDoc;
+      if (remaining <= 0) {
+        windowBits[w] = 0;
+        continue;
+      }
+      uint64_t validMask = remaining >= 64 ? ~0ULL : (1ULL << remaining) - 1ULL;
+      int32_t sourceWord = firstDoc >> 6;
+      int32_t shift = firstDoc & 63;
+      uint64_t domainWord = 0;
+      if (sourceWord < domainWords) {
+        domainWord = domainBits->words[sourceWord] >> shift;
+        if (shift != 0 && sourceWord + 1 < domainWords) {
+          domainWord |= domainBits->words[sourceWord + 1] << (64 - shift);
+        }
+      }
+      windowBits[w] &= domainWord & validMask;
+    }
+  }
+
   // Bulk execution for pure scored conjunctions (every clause required AND
   // scoring, no two-phase members): windows anchor on the lead's current doc,
   // whole windows are skipped when the summed clause bounds cannot reach the
@@ -903,6 +929,11 @@ public:
   // abandonment, instead of a per-doc virtual leapfrog.
   class ConjunctionBulkScorer final : public BulkScorer {
     static constexpr int32_t kChunk = Postings::DOCS_BLOCK_SIZE;
+    static constexpr int32_t kWindowSize = DocsEnum::L1_DOCS;
+    static constexpr int32_t kWindowWords = kWindowSize / 64;
+    static constexpr int32_t kDenseThresholdInverse = 32;
+    static constexpr int32_t kDenseLeapfrogThreshold = kWindowSize / 32;
+    static_assert((kWindowSize % 64) == 0);
 
     std::span<Query::Scorer*> scorers;  // ascending cost; scorers[0] leads
     std::span<TermQuery::Scorer*> termScorers; // populated when every scorer is a term
@@ -912,11 +943,14 @@ public:
     std::span<float> candScores;
     std::span<int32_t> outDocs;
     std::span<float> outScores;
+    std::span<uint64_t> windowBits;
+    std::span<uint64_t> clauseBits;
     int32_t maxDoc;
     float minCompetitiveScore = std::numeric_limits<float>::lowest();
     double scoreBoundFactor = 1.0;
     int64_t skippedWindowCount = 0;
     bool allTermScorers = false;
+    bool denseCountPath = false;
 
     template <bool TermFast>
     int32_t scorerDocId(size_t index) {
@@ -931,6 +965,15 @@ public:
     int32_t scorerAdvance(size_t index, int32_t target) {
       if constexpr (TermFast) {
         return termScorers[index]->docsEnum.advance(target);
+      } else {
+        return scorers[index]->advance(target);
+      }
+    }
+
+    template <bool TermFast>
+    int32_t scorerCountAdvance(size_t index, int32_t target) {
+      if constexpr (TermFast) {
+        return termScorers[index]->docsEnum.advanceDocOnly(target);
       } else {
         return scorers[index]->advance(target);
       }
@@ -1097,16 +1140,186 @@ public:
       }
     }
 
+    void clearWindowBits(std::span<uint64_t> bits) {
+      std::fill(bits.begin(), bits.end(), 0);
+    }
+
+    int64_t popCountWindowBits() const {
+      int64_t total = 0;
+      for (uint64_t bits : windowBits) {
+        total += std::popcount(bits);
+      }
+      return total;
+    }
+
+    int64_t countWindowBitsWithFilter(DocSet* filter, int32_t windowBase,
+                                      int32_t windowEnd) const {
+      int64_t total = 0;
+      int32_t innerSize = windowEnd - windowBase;
+      for (int32_t word = 0; word < kWindowWords; word++) {
+        uint64_t bits = windowBits[(size_t) word];
+        while (bits != 0) {
+          int32_t bit = (int32_t) std::countr_zero(bits);
+          int32_t index = (word << 6) + bit;
+          if (index >= innerSize) {
+            break;
+          }
+          int32_t doc = windowBase + index;
+          if (filter->get(doc)) {
+            total++;
+          }
+          bits &= bits - 1;
+        }
+      }
+      return total;
+    }
+
+    int32_t ratchetDenseWindow(int32_t min, int32_t max) {
+      for (size_t c = 0; c < termScorers.size(); c++) {
+        int32_t doc = termScorers[c]->docsEnum.docId();
+        if (doc < min) {
+          doc = termScorers[c]->docsEnum.advanceDocOnly(min);
+        }
+        if (doc > min) {
+          min = doc;
+        }
+        if (min >= max) {
+          break;
+        }
+      }
+      // May be >= max (or END): every doc below it fails some clause, so it
+      // is a sound resume point either way.
+      return min;
+    }
+
+    void leapfrogRemainingDenseClauses(size_t firstClause,
+                                       int32_t windowBase, int32_t windowEnd) {
+      int32_t innerSize = windowEnd - windowBase;
+      for (int32_t word = 0; word < kWindowWords; word++) {
+        uint64_t bits = windowBits[(size_t) word];
+        while (bits != 0) {
+          int32_t bit = (int32_t) std::countr_zero(bits);
+          int32_t index = (word << 6) + bit;
+          if (index >= innerSize) {
+            break;
+          }
+          int32_t doc = windowBase + index;
+          bool matched = true;
+          for (size_t c = firstClause; c < termScorers.size(); c++) {
+            int32_t scorerDoc = termScorers[c]->docsEnum.docId();
+            if (scorerDoc < doc) {
+              scorerDoc = termScorers[c]->docsEnum.advanceDocOnly(doc);
+            }
+            if (scorerDoc != doc) {
+              matched = false;
+              break;
+            }
+          }
+          if (!matched) {
+            windowBits[(size_t) word] &= ~(1ULL << bit);
+          }
+          bits &= bits - 1;
+        }
+      }
+    }
+
+    int32_t countNextWindowDense(int64_t& count, DocSet* filter, int32_t min, int32_t max) {
+      int32_t windowBase = ratchetDenseWindow(min, max);
+      if (windowBase >= max) {
+        return windowBase;
+      }
+
+      int32_t requestedEnd = windowBase + kWindowSize;
+      if (requestedEnd < windowBase) {
+        requestedEnd = max;
+      }
+      int32_t windowEnd = std::min(requestedEnd, max);
+
+      skipCount(SkipStats::conjDenseCountWindows);
+      clearWindowBits(windowBits);
+      termScorers[0]->fillWindowBits(windowBits, windowBase, windowEnd);
+      for (size_t c = 1; c < termScorers.size(); c++) {
+        clearWindowBits(clauseBits);
+        termScorers[c]->fillWindowBits(clauseBits, windowBase, windowEnd);
+        for (int32_t w = 0; w < kWindowWords; w++) {
+          windowBits[(size_t) w] &= clauseBits[(size_t) w];
+        }
+        if (termScorers.size() >= 3 && c + 1 < termScorers.size()) {
+          int32_t card = 0;
+          for (uint64_t bits : windowBits) {
+            card += (int32_t) std::popcount(bits);
+          }
+          if (card < kDenseLeapfrogThreshold) {
+            leapfrogRemainingDenseClauses(c + 1, windowBase, windowEnd);
+            break;
+          }
+        }
+      }
+
+      if (filter == nullptr) {
+        count += popCountWindowBits();
+      } else if (filter->type == DocSet::BITSET) {
+        applyDomainBitsToWindow(windowBits, windowBase, windowEnd,
+                                &((BitDocSet*) filter)->bits());
+        count += popCountWindowBits();
+      } else {
+        count += countWindowBitsWithFilter(filter, windowBase, windowEnd);
+      }
+
+      return windowEnd >= max ? PostingsReader::END : windowEnd;
+    }
+
+    template <bool TermFast>
+    int32_t countNextWindowSparse(int64_t& count, DocSet* filter, int32_t min, int32_t max) {
+      skipCount(SkipStats::conjCountFallbacks);
+      int32_t target = min;
+      while (target < max) {
+        int32_t doc = scorerDocId<TermFast>(0);
+        if (doc < target) {
+          doc = scorerCountAdvance<TermFast>(0, target);
+        }
+        if (doc >= max) {
+          return doc;  // sound resume point (or END); covers doc == END
+        }
+        target = doc;
+
+        bool matched = true;
+        for (size_t c = 1; c < scorers.size(); c++) {
+          int32_t scorerDoc = scorerDocId<TermFast>(c);
+          if (scorerDoc < target) {
+            scorerDoc = scorerCountAdvance<TermFast>(c, target);
+          }
+          if (scorerDoc != target) {
+            target = scorerDoc;
+            matched = false;
+            break;
+          }
+        }
+        if (!matched) {
+          continue;
+        }
+
+        if (filter == nullptr || filter->get(target)) {
+          count++;
+        }
+        target++;
+      }
+      return target;  // >= max: a failing clause's position or matched doc + 1
+    }
+
   public:
-    ConjunctionBulkScorer(solux::MemPool& pool, std::span<Query::Scorer*> scorers, int32_t maxDoc)
+    ConjunctionBulkScorer(solux::MemPool& pool, std::span<Query::Scorer*> scorers,
+                          int32_t maxDoc, int64_t leadCost)
         : scorers(scorers),
           termScorers(pool.make_arr<TermQuery::Scorer*>(scorers.size()), scorers.size()),
           windowMax(pool.make_arr<float>(scorers.size()), scorers.size()),
           suffixMax(pool.make_arr<double>(scorers.size() + 1), scorers.size() + 1),
           candDocs(pool.make_arr<int32_t>((size_t) kChunk), (size_t) kChunk),
           candScores(pool.make_arr<float>((size_t) kChunk), (size_t) kChunk),
-          outDocs(pool.make_arr<int32_t>((size_t) DocsEnum::L1_DOCS), (size_t) DocsEnum::L1_DOCS),
-          outScores(pool.make_arr<float>((size_t) DocsEnum::L1_DOCS), (size_t) DocsEnum::L1_DOCS),
+          outDocs(pool.make_arr<int32_t>((size_t) kWindowSize), (size_t) kWindowSize),
+          outScores(pool.make_arr<float>((size_t) kWindowSize), (size_t) kWindowSize),
+          windowBits(pool.make_arr<uint64_t>((size_t) kWindowWords), (size_t) kWindowWords),
+          clauseBits(pool.make_arr<uint64_t>((size_t) kWindowWords), (size_t) kWindowWords),
           maxDoc(maxDoc) {
       assert(scorers.size() >= 2);
       // Float-summation error headroom for the double bounds (see the MaxScore
@@ -1117,6 +1330,8 @@ public:
         termScorers[i] = dynamic_cast<TermQuery::Scorer*>(scorers[i]);
         allTermScorers &= termScorers[i] != nullptr;
       }
+      denseCountPath = allTermScorers && maxDoc >= kWindowSize
+          && leadCost >= std::max<int64_t>(1, (int64_t) maxDoc / kDenseThresholdInverse);
     }
 
     int32_t scoreNextWindow(ScoreWindow& out, DocSet* filter, int32_t min, int32_t max,
@@ -1124,6 +1339,22 @@ public:
       return allTermScorers
           ? scoreNextWindowImpl<true>(out, filter, min, max, minCompetitiveScore)
           : scoreNextWindowImpl<false>(out, filter, min, max, minCompetitiveScore);
+    }
+
+    int32_t countNextWindow(int64_t& count, DocSet* filter, int32_t min, int32_t max) override {
+      max = std::min(max, maxDoc);
+      if (min >= max) {
+        return PostingsReader::END;
+      }
+      if (filter != nullptr && filter->card() == 0) {
+        return PostingsReader::END;
+      }
+      if (denseCountPath) {
+        return countNextWindowDense(count, filter, min, max);
+      }
+      return allTermScorers
+          ? countNextWindowSparse<true>(count, filter, min, max)
+          : countNextWindowSparse<false>(count, filter, min, max);
     }
 
     int64_t skippedWindows() const {
@@ -1838,27 +2069,7 @@ public:
     }
 
     void applyDomainBits(const FixedBitSet* domainBits) {
-      assert(domainBits != nullptr);
-      int32_t domainWords = (int32_t) FixedBitSet::sizeInWords(domainBits->size());
-      for (size_t w = 0; w < windowBits.size(); w++) {
-        int32_t firstDoc = windowStart + (int32_t) (w << 6);
-        int32_t remaining = windowEnd - firstDoc;
-        if (remaining <= 0) {
-          windowBits[w] = 0;
-          continue;
-        }
-        uint64_t validMask = remaining >= 64 ? ~0ULL : (1ULL << remaining) - 1ULL;
-        int32_t sourceWord = firstDoc >> 6;
-        int32_t shift = firstDoc & 63;
-        uint64_t domainWord = 0;
-        if (sourceWord < domainWords) {
-          domainWord = domainBits->words[sourceWord] >> shift;
-          if (shift != 0 && sourceWord + 1 < domainWords) {
-            domainWord |= domainBits->words[sourceWord + 1] << (64 - shift);
-          }
-        }
-        windowBits[w] &= domainWord & validMask;
-      }
+      applyDomainBitsToWindow(windowBits, windowStart, windowEnd, domainBits);
     }
 
     bool verifyMatch(Query::Scorer* scorer, int32_t doc) const {

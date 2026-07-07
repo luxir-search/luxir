@@ -61,6 +61,8 @@ struct SkipStats {
   // Whole word-encoded (bitset/contiguous) doc blocks OR'd into count windows
   // straight from the stream, without decoding to the doc buffer.
   static inline int64_t countBulkFillWordBlocks = 0;
+  static inline int64_t conjDenseCountWindows = 0;
+  static inline int64_t conjCountFallbacks = 0;
   static inline int64_t docsOnlyFreqBlocksSkipped = 0;
 
   static void reset() {
@@ -90,6 +92,8 @@ struct SkipStats {
     countBulkFillDocs = 0;
     countBulkFillContiguousBlocks = 0;
     countBulkFillWordBlocks = 0;
+    conjDenseCountWindows = 0;
+    conjCountFallbacks = 0;
     docsOnlyFreqBlocksSkipped = 0;
   }
 };

@@ -8,6 +8,9 @@
 #include "test/CollectionHelper.h"
 #include "test/LocalReq.h"
 #include "test/QueryBuild.h"
+#include "solux/query/BooleanQuery.h"
+#include "solux/query/TermQuery.h"
+#include "solux/search/DocSet.h"
 
 using namespace solux;
 using namespace solux::test;
@@ -355,4 +358,112 @@ TEST_F(BooleanFuzzTest, randomBooleanMatchesOracle) {
       break;
     }
   }
+}
+
+TEST_F(BooleanFuzzTest, conjunctionBulkCountMatchesPullOnMixedBlockShapes) {
+  helper.clear();
+  const int32_t numDocs = 2 * DocsEnum::L1_DOCS + 513;
+  std::vector<Doc> docs;
+  docs.reserve((size_t) numDocs);
+  for (int32_t doc = 0; doc < numDocs; doc++) {
+    std::string body = "bc_contig";
+    if ((doc % 4) != 1) body += " bc_word";
+    if ((doc % 10) == 0) body += " bc_packed";
+    if ((doc % 100) == 0) body += " bc_rare";
+    body += " filler";
+    docs.push_back(flatdoc("id", "bc" + std::to_string(doc), "body_w", body));
+  }
+  helper.indexAll(docs, UpdateMessage::COMMIT);
+  auto reader = helper.getIndexWriter()->getIndexReader();
+
+  auto makeFilter = [](int32_t maxDoc, int32_t mode) -> std::unique_ptr<DocSet> {
+    if (mode == 0) {
+      return nullptr;
+    }
+    if (mode == 1) {
+      auto filter = std::make_unique<RAMBitDocSet>(maxDoc);
+      for (int32_t doc = 0; doc < maxDoc; doc++) {
+        if ((doc % 3) != 1) {
+          filter->mutableBits().set(doc);
+        }
+      }
+      return filter;
+    }
+    std::vector<int32_t> filterDocs;
+    for (int32_t doc = 0; doc < maxDoc; doc++) {
+      if ((doc % 7) == 0) {
+        filterDocs.push_back(doc);
+      }
+    }
+    return std::make_unique<ArrDocSet>(std::move(filterDocs));
+  };
+
+  auto runCount = [&](std::span<const std::string_view> terms, bool bulk,
+                      int32_t filterMode) -> int64_t {
+    MemPool pool;
+    Query::Context qContext(pool, *reader);
+    std::vector<TermQuery> queries;
+    queries.reserve(terms.size());
+    std::vector<Query*> mandatory;
+    mandatory.reserve(terms.size());
+    for (auto term : terms) {
+      queries.emplace_back("body_w", term);
+      mandatory.push_back(&queries.back());
+    }
+    std::span<Query*> empty;
+    BooleanQuery query(std::span<Query*>(mandatory.data(), mandatory.size()),
+                       empty, empty, empty);
+    auto* weight = query.createWeight(qContext, Query::NEED_SCORES);
+    int64_t total = 0;
+    auto segments = qContext.topReader.segments();
+    for (auto& segment : segments) {
+      auto filter = makeFilter(segment.maxDoc(), filterMode);
+      if (bulk) {
+        auto* supplier = weight->scorerSupplier(pool, segment);
+        if (supplier == nullptr) continue;
+        auto* bulkScorer = supplier->bulkScorer(pool);
+        if (bulkScorer == nullptr) {
+          ADD_FAILURE() << "bulkScorer returned null";
+          return -1;
+        }
+        for (int32_t cursor = 0; cursor != PostingsReader::END && cursor < segment.maxDoc(); ) {
+          int32_t next = bulkScorer->countNextWindow(total, filter.get(), cursor, segment.maxDoc());
+          if (next == PostingsReader::END) break;
+          if (next <= cursor) {
+            ADD_FAILURE() << "countNextWindow made no progress";
+            return -1;
+          }
+          cursor = next;
+        }
+      } else {
+        auto* scorer = weight->createScorer(pool, segment);
+        if (scorer == nullptr) continue;
+        for (int32_t doc = scorer->next(); doc != PostingsReader::END; doc = scorer->next()) {
+          if (filter == nullptr || filter->get(doc)) {
+            total++;
+          }
+        }
+      }
+    }
+    return total;
+  };
+
+  std::array<std::string_view, 2> dense2 = {"bc_contig", "bc_word"};
+  std::array<std::string_view, 3> dense3 = {"bc_contig", "bc_word", "bc_packed"};
+  std::array<std::string_view, 2> sparse = {"bc_contig", "bc_rare"};
+
+  bool savedStats = SkipStats::enabled;
+  SkipStats::enabled = true;
+  SkipStats::reset();
+  for (int32_t filterMode : {0, 1, 2}) {
+    EXPECT_EQ(runCount(dense2, true, filterMode), runCount(dense2, false, filterMode))
+        << "dense2 filter=" << filterMode;
+    EXPECT_EQ(runCount(dense3, true, filterMode), runCount(dense3, false, filterMode))
+        << "dense3 filter=" << filterMode;
+    EXPECT_EQ(runCount(sparse, true, filterMode), runCount(sparse, false, filterMode))
+        << "sparse filter=" << filterMode;
+  }
+  EXPECT_GT(SkipStats::conjDenseCountWindows, 0);
+  EXPECT_GT(SkipStats::conjCountFallbacks, 0);
+  SkipStats::enabled = savedStats;
 }
