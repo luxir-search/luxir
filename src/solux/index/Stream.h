@@ -48,7 +48,7 @@ public:
   // ptr_ starts out pointing at bbStart_, which can hold 4 bytes.  Then when we write the forwarding address, it will be equal to
   // what we would have set bbStart_ to anyway!  When reading back, we just need to check size.
   // TODO: convert to union?
-  int bbStart_;  // byte block address of the start of the stream. For 2 related streams (freq, prox), the second can just be an offset from the first... (but not if we use the optimization where we store data here first!)
+  uint32_t bbStart_;  // byte block address of the start of the stream. For 2 related streams (freq, prox), the second can just be an offset from the first... (but not if we use the optimization where we store data here first!)
   int allocatedSz_; // total number of bytes allocated in the stream (i.e. subtract amount left over to get size of stream).  Does not include pointer bytes.
 
   uint8_t left_;  // size left in the slice     // TODO : pack left_ or slizeSz_ in ptr_?
@@ -128,13 +128,13 @@ public:
     if (left_ == 0) {
       // pull this out into a function?
       sliceSz_ = nextSliceSize(sliceSz_);
-      int blockAddr = pool.allocateBBP(sliceSz_);
+      uint32_t blockAddr = pool.allocateBBP(sliceSz_);
 
       char *newPointer = pool.ptr(blockAddr);  // TODO: what about a version that returns pointer and the block address
       // move last 4 bytes to new area... we do this in one chunk using an integer.
       // this works for both both little endian and big endian since we're only moving.
-      int *lastWord = reinterpret_cast<int *>(ptr_ - 4);
-      *reinterpret_cast<int *>(newPointer) = *lastWord;
+      uint32_t *lastWord = reinterpret_cast<uint32_t *>(ptr_ - 4);
+      *reinterpret_cast<uint32_t *>(newPointer) = *lastWord;
       *lastWord = blockAddr;  // point to the new area with the last 4 bytes of the old area
       // TODO: this can alias bbStart_... is there anything we can do before reading bbStart_ to ensure this write is seen?
       // NOTE: we never read bbStart_ during the inversion phase of indexing, only when flushing.
@@ -209,7 +209,7 @@ class StreamReader {
   uint8_t remainingInSlice_;
   uint8_t sliceSize_;
 
-  void initFromBBPointer(int bbptr) {
+  void initFromBBPointer(uint32_t bbptr) {
     ptr_ = pool_.ptr(bbptr);
     sliceSize_ = Stream::nextSliceSize(sliceSize_);
     remainingInSlice_ = static_cast<uint8_t>( remaining_ > sliceSize_ ? (sliceSize_ - 4) : remaining_ );
@@ -232,7 +232,7 @@ public:
         remainingInSlice_ = static_cast<uint8_t>(remaining_);
       }
     } else {
-      int bbStart = source.bbStart_;
+      uint32_t bbStart = source.bbStart_;
       // nocommit memcpy(&bbStart, &source.bbStart_, sizeof(int));  // This is just trying to tell the compiler that bbStart_ was written through an alias, so get the actual bytes!
       initFromBBPointer(bbStart);
     }
@@ -247,7 +247,7 @@ public:
       } else {
         // follow the next link in the chain
         remaining_ -= (sliceSize_ - 4);
-        int bbptr = *reinterpret_cast<const int *>(ptr_);
+        uint32_t bbptr = *reinterpret_cast<const uint32_t *>(ptr_);
         initFromBBPointer(bbptr);
       }
     }

@@ -269,7 +269,9 @@ public:
   // TODO: avoid using ptr() directly since it won't work when switching to malloc
   char *ptr() { return buffer + pos; }
 
-  char *ptr(int bbAddr) const {
+  // Byte-block addresses are UNSIGNED 32-bit (4 GiB pool ceiling by design);
+  // signed handling here used to wrap at 2 GiB and index buffers[] negatively.
+  char *ptr(uint32_t bbAddr) const {
 #ifndef MEMPOOL_MALLOC
     return buffers[bbAddr >> BYTE_BLOCK_SHIFT] + (bbAddr & BYTE_BLOCK_MASK);
 #else
@@ -279,7 +281,8 @@ public:
 
   uint32_t bbAddress() {
 #ifndef MEMPOOL_MALLOC
-    return (bufferIdx << BYTE_BLOCK_SHIFT) | pos;
+    // bufferIdx must widen BEFORE the shift: as int it overflows at 2 GiB
+    return ((uint32_t) bufferIdx << BYTE_BLOCK_SHIFT) | (uint32_t) pos;
 #else
     return (int)pointers.size();
 #endif
@@ -341,11 +344,11 @@ public:
     return newEnd;
   }
 
-  int allocateBBP(uint32_t size) {
+  uint32_t allocateBBP(uint32_t size) {
 #ifndef MEMPOOL_MALLOC
     int newEnd = reserveBBP(size);
     // char* p = buffer + pos;
-    int bbAddr = bbAddress();
+    uint32_t bbAddr = bbAddress();
     pos = newEnd;
     return bbAddr;
 #else
@@ -353,7 +356,7 @@ public:
     allocated += size;
     // if (pointers.size() < 100) { std::cout << "PTR=" << (void*)(pointers.back().get()) << "\tnum="  << (pointers.size()-1) << std::endl; }
     // we could scribble over memory, but that would confuse other memory checkers
-    return (int)pointers.size() - 1;
+    return (uint32_t)pointers.size() - 1;
 #endif
   }
 
@@ -402,10 +405,10 @@ public:
   }
 
   // do allocation and return both the normal pointer as well as the short pool specific pointer (bbptr)
-  std::pair<char *, int> allocateAddrs(uint32_t size) {
+  std::pair<char *, uint32_t> allocateAddrs(uint32_t size) {
 #ifndef MEMPOOL_MALLOC
     int newEnd = reserveBBP(size);
-    int bbAddr = bbAddress();
+    uint32_t bbAddr = bbAddress();
     auto p = ptr();
     pos = newEnd;
     return {p, bbAddr};
@@ -428,12 +431,12 @@ public:
   }
 
   template<class T>
-  int allocateTypeAligned(T *&out) {
+  uint32_t allocateTypeAligned(T *&out) {
 #ifndef MEMPOOL_MALLOC
     align();
     int newEnd = reserveBBP((int) sizeof(T));
     out = reinterpret_cast<T *>( ptr());
-    int bbAddr = bbAddress();
+    uint32_t bbAddr = bbAddress();
     pos = newEnd;
     return bbAddr;
 #else
