@@ -246,8 +246,10 @@ TEST(NumericRangeBuilder, validation) {
   // At most one of gte/gt and one of lte/lt.
   EXPECT_THROW(builder.createRangeQuery("num_i", &a, &b, nullptr, nullptr), std::runtime_error);
   EXPECT_THROW(builder.createRangeQuery("num_i", nullptr, nullptr, &a, &b), std::runtime_error);
-  // Range only applies to numeric column fields.
-  EXPECT_THROW(builder.createRangeQuery("text_w", &a, nullptr, &b, nullptr), std::runtime_error);
+  // Term-backed fields build a term range (numeric Vals coerce to term text).
+  EXPECT_NE(builder.createRangeQuery("text_w", &a, nullptr, &b, nullptr), nullptr);
+  // Ranges do not apply to vector fields.
+  EXPECT_THROW(builder.createRangeQuery("emb_v", &a, nullptr, &b, nullptr), std::runtime_error);
   // A malformed bound errors deterministically even when the other side would
   // already collapse the range to empty (gt=INT64_MAX).
   api::Val maxV; maxV.kind = std::numeric_limits<int64_t>::max();

@@ -216,16 +216,23 @@ message Match {
   }
 }
 
-// Matches documents whose numeric field (INT/FLOAT/DOUBLE/DATE) value falls in
-// the given range.  All bounds are optional; omit a side for an open-ended
-// range.  Set at most one of gte/gt (lower) and at most one of lte/lt (upper);
-// setting both of a pair is an error.  With no bounds the query matches every
-// document that has a value for the field.  A doc with no value never matches.
+// Matches documents whose field value falls in the given range.  All bounds
+// are optional; omit a side for an open-ended range.  Set at most one of
+// gte/gt (lower) and at most one of lte/lt (upper); setting both of a pair is
+// an error.  With no bounds the query matches every document that has a value
+// for the field.  A doc with no value never matches.
 //
-// Bounds go through the same value-coercion contract as ingest, so querying a
-// literal finds the documents ingested with it (DATE accepts ISO-8601 strings or
-// epoch millis).  FLOAT/DOUBLE compare by IEEE-754 total order: -0.0 sorts
-// below +0.0 and NaN sorts above +Inf.
+// Numeric fields (INT/FLOAT/DOUBLE/DATE) range over the column.  Bounds go
+// through the same value-coercion contract as ingest, so querying a literal
+// finds the documents ingested with it.  DATE accepts ISO-8601 strings or
+// epoch millis, and a partial date names its whole window: bounds include the
+// granule they name ([2024-01 TO 2024-06] covers January through June;
+// exclusive bounds exclude the granule whole).  FLOAT/DOUBLE compare by
+// IEEE-754 total order: -0.0 sorts below +0.0 and NaN sorts above +Inf.
+//
+// Term-backed fields (TEXT/STRING/ID) range over the terms dictionary in
+// byte order (no collation), constant-scoring.  TEXT bounds are folded the
+// way the field folds (case etc.), never tokenized.
 message RangeQuery {
   string field = 1;
   Val gte = 2;   // lower bound, inclusive (>=)

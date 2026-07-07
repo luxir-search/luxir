@@ -130,7 +130,7 @@ use `NOT`: `temp_i:(NOT 5)`.
 
 ## Ranges and comparisons
 
-Numeric and date fields take ranges. Square brackets include the endpoint,
+Any queryable field takes a range. Square brackets include the endpoint,
 curly braces exclude it, and the two mix. `*` leaves an end open.
 
 ```
@@ -139,8 +139,13 @@ year_i:{1960 TO 1970}
 year_i:[1960 TO 1970}
 year_i:[* TO 1970]
 created_dt:[2020-01-01T10:30:00Z TO *]
+id:[user_100 TO user_200]        string/text fields range over their terms
 year_i:>=1960                    also >, <=, <
 ```
+
+On string, id, and text fields the range runs over the indexed terms in
+plain byte order (no collation), and matches score a constant. Text
+endpoints fold the way the field folds, like prefix and fuzzy text.
 
 Endpoints are converted exactly the way field values are at indexing time,
 so querying a literal finds the documents indexed with it.

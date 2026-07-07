@@ -599,11 +599,11 @@ private:
     }
     if (c == '[' || c == '{') {
       if (scope == nullptr) fail(pos, "a range needs a field: field:[low TO high]");
-      return parseRangeForm(scope->field, *scope->type, pos);
+      return parseRangeForm(scope->field);
     }
     if (c == '<' || c == '>') {
       if (scope == nullptr) fail(pos, "a comparison needs a field: field:>=value");
-      return parseComparisonForm(scope->field, *scope->type, pos, stops);
+      return parseComparisonForm(scope->field, stops);
     }
     if (c == '$') {
       if (scope == nullptr) {
@@ -669,8 +669,8 @@ private:
       return node;
     }
     if (c == '"' || c == '\'') return parsePhraseForm(field, ft);
-    if (c == '[' || c == '{') return parseRangeForm(field, ft, pos);
-    if (c == '<' || c == '>') return parseComparisonForm(field, ft, pos, stops);
+    if (c == '[' || c == '{') return parseRangeForm(field);
+    if (c == '<' || c == '>') return parseComparisonForm(field, stops);
     if (c == '$') {
       const api::Val* val = parseVarRef();
       rejectDecorations("a $variable");
@@ -703,16 +703,9 @@ private:
   }
 
   // ---- ranges and comparisons ----
-
-  void requireNumeric(std::string_view field, FieldType& ft, size_t pos, std::string_view what) {
-    if (!QueryBuilder::isNumericColumnType(ft.type())) {
-      fail(pos, fmt::format("{} on non-numeric field '{}' (term ranges are not supported yet)",
-                            what, field));
-    }
-    if (!ft.hasColumn()) {
-      fail(pos, fmt::format("{} field '{}' is not column-stored", what, field));
-    }
-  }
+  // Any queryable field takes a range (resolveField already gated
+  // queryability): numeric/date columns get the numeric arm's semantics,
+  // term-backed fields a byte-order term range - the builder decides.
 
   // One range endpoint: a bare token, a quoted value, or $var; '*' = open end
   // (returns nullptr).  Values stay strings - the field type coerces them at
@@ -732,8 +725,7 @@ private:
     return allocVal(t.text);
   }
 
-  const api::Query* parseRangeForm(std::string_view field, FieldType& ft, size_t pos) {
-    requireNumeric(field, ft, pos, "a range");
+  const api::Query* parseRangeForm(std::string_view field) {
     bool loInclusive = cur.peek() == '[';
     cur.advance();
 
@@ -764,9 +756,7 @@ private:
     return q;
   }
 
-  const api::Query* parseComparisonForm(std::string_view field, FieldType& ft, size_t pos,
-                                        std::string_view stops) {
-    requireNumeric(field, ft, pos, "a comparison");
+  const api::Query* parseComparisonForm(std::string_view field, std::string_view stops) {
     char op = cur.peek();
     cur.advance();
     bool orEqual = cur.consume('=');
@@ -775,7 +765,7 @@ private:
       fail(cur.position(), "a comparison needs a value (use field:* for existence)");
     }
     const api::Val* v = parseRangeEndpoint(stops);
-    if (v == nullptr) fail(pos, "a comparison needs a value");
+    if (v == nullptr) fail(cur.position(), "a comparison needs a value");
     rejectDecorations("a comparison");
 
     api::RangeQuery r;

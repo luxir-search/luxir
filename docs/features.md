@@ -90,11 +90,12 @@ clauses, under facet domains, as fusion sources, as filters.
 - `match` (analyzed; AND/OR operator; minimum-match; over numeric fields,
   equality against the column), `boolean` (required / optional /
   prohibited / filter clauses, minimum-match), `phrase` (position-based),
-  `range` over numeric and date fields (`gte`/`gt`/`lte`/`lt`, any side
-  open-ended; dates accept ISO-8601 or epoch millis, and a partial date
-  means the window it names - equality on `2024-06-25` matches the whole
-  day; with no bounds it matches every document that has a value - a
-  field-exists query),
+  `range` over numeric, date, and term-backed fields (`gte`/`gt`/`lte`/`lt`,
+  any side open-ended; dates accept ISO-8601 or epoch millis, and a partial
+  date means the window it names - equality on `2024-06-25` matches the
+  whole day; string/text fields range over their indexed terms in byte
+  order, constant-scoring; with no bounds it matches every document that
+  has a value - a field-exists query),
   `prefix`, `fuzzy`, `constant_score`, match-all, and `knn` (vector search
   is just a query).
 - Fuzzy matching is complete by default: an expansion cap is explicit

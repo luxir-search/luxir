@@ -129,6 +129,22 @@ TEST_F(ExprQueryTest, multitermDecorationsAreNormalized) {
   EXPECT_EQ(0u, docs.size());
 }
 
+TEST_F(ExprQueryTest, termRanges) {
+  // tag_s: action(d2), scifi(d1, d3) - byte-order term ranges
+  auto docs = search("tag_s:[action TO scifi]");
+  EXPECT_EQ(3u, docs.size());
+  docs = search("tag_s:[action TO scifi}");  // exclusive upper drops scifi
+  ASSERT_EQ(1u, docs.size());
+  EXPECT_TRUE(hasId(docs, "d2"));
+  docs = search("tag_s:>=s");
+  EXPECT_EQ(2u, docs.size());
+  docs = search("title_wl:[Blade TO Bladed]");  // TEXT endpoints fold
+  EXPECT_EQ(2u, docs.size());  // blade(d1), bladed(d3)
+  docs = search("title_wl:{blade TO bladed]");  // exclusive lower
+  ASSERT_EQ(1u, docs.size());
+  EXPECT_TRUE(hasId(docs, "d3"));
+}
+
 TEST_F(ExprQueryTest, fieldGroupDistribution) {
   auto docs = search("title_wl:(blade OR running)");
   EXPECT_EQ(2u, docs.size());

@@ -18,6 +18,7 @@
 #include "solux/query/PrefixQuery.h"
 #include "solux/query/Query.h"
 #include "solux/query/TermQuery.h"
+#include "solux/query/TermRangeQuery.h"
 #include "solux/schema/Schema.h"
 #include "solux/schema/ValCoerce.h"
 #include "solux/util/StrRef.h"
@@ -285,12 +286,13 @@ public:
     return createMatchQuery(field, text, op, minMatch);
   }
 
-  // Build a numeric range query over `field`'s column from raw bound Vals (any
-  // may be null for an open-ended side).  At most one of gte/gt (lower) and one
-  // of lte/lt (upper) may be set.  Bounds are coerced to the field's encoded
-  // int64 (FieldType::coerceColInt64) and folded to an inclusive [lo, hi]
-  // window; an empty range collapses to match-nothing.  The field must be a
-  // column-stored numeric type.
+  // Build a range query over `field` from raw bound Vals (any may be null for
+  // an open-ended side).  At most one of gte/gt (lower) and one of lte/lt
+  // (upper) may be set.
+  //
+  // Numeric/date column fields build a NumericRangeQuery: bounds coerce to
+  // the field's encoded int64 (FieldType::coerceColInt64) and fold to an
+  // inclusive [lo, hi] window; an empty range collapses to match-nothing.
   //
   // DATE bounds round by the granularity the literal names (the window from
   // DateFieldType::coerceDateRange): gte/lt use the window start, lte/gt the
@@ -298,15 +300,28 @@ public:
   // and {2024-01 TO 2024-06} excludes both whole months.  Match on a DATE
   // field routes through here with gte == lte, so equality on a day matches
   // the whole day.
+  //
+  // Term-backed fields (TEXT/STRING/ID) build a constant-scoring
+  // TermRangeQuery over the terms dictionary in byte order: bounds coerce to
+  // term bytes, TEXT bounds fold like the field folds (normalizeMultiterm),
+  // and both truncate the way indexed terms were.
   Query* createRangeQuery(std::string_view field,
                           const solux::api::Val* gte, const solux::api::Val* gt,
                           const solux::api::Val* lte, const solux::api::Val* lt) {
     FieldType& fieldType = *schema.getFieldTypeEx(field);
-    if (!isNumericColumnType(fieldType.type())) {
-      throw std::runtime_error(std::format("Range query on unsupported field type: {}", field));
-    }
-    if (!fieldType.hasColumn()) {
-      throw std::runtime_error(std::format("Range query field '{}' is not column-stored", field));
+    bool numeric = isNumericColumnType(fieldType.type());
+    switch (fieldType.type()) {
+      case FieldType::Type::TEXT:
+      case FieldType::Type::ID:
+      case FieldType::Type::STRING:
+        break;
+      default:
+        if (!numeric) {
+          throw std::runtime_error(std::format("Range query on unsupported field type: {}", field));
+        }
+        if (!fieldType.hasColumn()) {
+          throw std::runtime_error(std::format("Range query field '{}' is not column-stored", field));
+        }
     }
 
     bool hasGte = gte && !coerce::isNull(*gte);
@@ -318,6 +333,22 @@ public:
     }
     if (hasLte && hasLt) {
       throw std::runtime_error(std::format("Range query on '{}' sets both lte and lt", field));
+    }
+
+    if (!numeric) {
+      auto termBound = [&](const api::Val& v) -> std::string_view {
+        char buf[coerce::TEXT_BUF_SIZE];
+        std::string_view t = fieldType.coerceTerm(v, field, buf);
+        if (t.data() == buf) t = copyTerm(t);  // rendered numerics live in stack buf
+        if (fieldType.type() == FieldType::Type::TEXT) {
+          t = normalizeMultiterm((TextFieldType&)fieldType, field, t);
+        }
+        return PackedTerm::truncate(t);  // compare in indexed-term space
+      };
+      std::optional<std::string_view> lower, upper;
+      if (hasGte || hasGt) lower = termBound(hasGte ? *gte : *gt);
+      if (hasLte || hasLt) upper = termBound(hasLte ? *lte : *lt);
+      return pool.make<TermRangeQuery>(field, lower, hasGte, upper, hasLte);
     }
 
     // Coerce every supplied bound first, so a malformed bound is always a

@@ -378,8 +378,17 @@ TEST_F(ExprParserTest, juxtaposedSameFieldRangesError) {
   EXPECT_EQ(2u, asBool(*parse("count:* rating:*")).optional.size());
 }
 
+TEST_F(ExprParserTest, termRanges) {
+  // term-backed fields take ranges too (byte order over the terms dictionary)
+  const auto& r = asRange(*parse("status:[alpha TO mike]"));
+  EXPECT_EQ("status", r.field);
+  EXPECT_EQ("alpha", valStr(r.gte));
+  EXPECT_EQ("mike", valStr(r.lte));
+  EXPECT_EQ("m", valStr(asRange(*parse("status:>=m")).gte));
+  EXPECT_EQ("m", valStr(asRange(*parse("title:{m TO *]")).gt));
+}
+
 TEST_F(ExprParserTest, rangeErrors) {
-  expectContains(parseErr("status:[a TO b]"), "term ranges are not supported yet");
   expectContains(parseErr("count:[1 TO 2"), "expected ']' or '}'");
   expectContains(parseErr("count:[1 2]"), "expected TO");
   expectContains(parseErr("count:[TO 2]"), "expected a range endpoint");

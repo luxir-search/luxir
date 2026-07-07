@@ -1,5 +1,6 @@
 #pragma once
 
+#include <optional>
 #include <string_view>
 
 #include "TermsEnum.h"
@@ -73,6 +74,37 @@ protected:
 public:
   PrefixTermsEnum(TermsEnum& te, std::string_view prefix)
     : FilteredTermsEnum(te), prefix(prefix) {}
+};
+
+// Accepts terms in [lower, upper] under byte order; either end may be open
+// (nullopt) or exclusive.  Terms are sorted, so the scan seeks to the lower
+// endpoint and stops at the first term past the upper one.
+class RangeTermsEnum final : public FilteredTermsEnum {
+  std::optional<std::string_view> lower;
+  std::optional<std::string_view> upper;
+  bool includeLower;
+  bool includeUpper;
+
+protected:
+  bool seekStart() override {
+    if (!lower.has_value()) return te.nextTerm();
+    if (!te.seekCeil(*lower)) return false;
+    if (!includeLower && termView() == *lower) return te.nextTerm();
+    return true;
+  }
+
+  Status accept() override {
+    if (!upper.has_value()) return Status::ACCEPT;
+    int cmp = termView().compare(*upper);
+    if (cmp < 0 || (cmp == 0 && includeUpper)) return Status::ACCEPT;
+    return Status::END;
+  }
+
+public:
+  RangeTermsEnum(TermsEnum& te, std::optional<std::string_view> lower, bool includeLower,
+                 std::optional<std::string_view> upper, bool includeUpper)
+    : FilteredTermsEnum(te), lower(lower), upper(upper),
+      includeLower(includeLower), includeUpper(includeUpper) {}
 };
 
 } // namespace solux
