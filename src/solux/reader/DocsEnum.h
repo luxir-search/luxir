@@ -675,12 +675,48 @@ public:
         && (docBufEnd == 0 || target > docBuf[docBufEnd - 1])) {
       skipToBlock(target);
     }
-    // TODO: try galloping or branchless binary search here?
-    // requires ability to fix up cumulative metadata maintained in nextDoc(), revisit
-    // if/when we defer "tf" decoding.
-    while (docid < target) {
-      nextDoc();
+    if (docBufIdx >= docBufEnd) {
+      // fresh block (or END) after the block-level skip
+      if (nextDoc() >= target) {
+        return docid;
+      }
     }
+    if (docBuf[docBufEnd - 1] < target) {
+      // target is past the final decoded block (last block of the list, or a
+      // pulsed posting): walk out to END the simple way.
+      while (docid < target) {
+        nextDoc();
+      }
+      return docid;
+    }
+
+    // The target lies in the decoded remainder: jump to it directly instead of
+    // a per-doc nextDoc() walk, repairing the cumulative-tf chain with one
+    // bulk sum over the skipped freqs (the per-doc loop's branches and state
+    // updates dominate leapfrog-heavy queries).
+    blockMode = false;
+    const int32_t start = docBufIdx;
+    const int32_t j = (int32_t) (std::lower_bound(docBuf + start, docBuf + docBufEnd, target)
+                                 - docBuf);
+    assert(j < docBufEnd);
+    const int32_t consumed = j + 1 - start;
+    docOrd += consumed;
+    if (hasFreqs) {
+      int64_t sum = 0;
+      for (int32_t i = start; i <= j; i++) {
+        sum += (uint32_t) tfreqBuf[i];
+      }
+      cumulativeTermFreq += sum;
+      tfreq = tfreqBuf[j];
+      tfreqOrd += consumed;
+      tfreqBufIdx = j + 1;
+    } else {
+      cumulativeTermFreq += consumed;
+      tfreq = 1;
+    }
+    posOrdStart = cumulativeTermFreq - tfreq;
+    docBufIdx = j + 1;
+    docid = docBuf[j];
     return docid;
   }
 
