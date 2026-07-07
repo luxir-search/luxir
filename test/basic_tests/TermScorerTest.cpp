@@ -1918,6 +1918,62 @@ TEST_F(TermScorerTest, phraseImpactTopKMatchesExhaustive) {
   }
 }
 
+// "+a b" without scores: the optional clause is a pure score add under a
+// mandatory clause, so a non-scoring weight drops it - membership is
+// unchanged and the single-clause count() shortcut engages (Lucene's
+// BooleanWeight simplification).
+TEST_F(TermScorerTest, nonScoringBooleanDropsOptionalUnderMandatory) {
+  const int32_t N = 1500;
+  TestIndex testIndex;
+  TestField f(testIndex, "body_w");
+  f.startIndexing();
+  int32_t dfA = 0;
+  for (int32_t d = 0; d < N; d++) {
+    std::string text;
+    if (d % 3 == 0) { text += "aterm "; dfA++; }
+    if (d % 5 == 0) { text += "bterm "; }
+    text += "pad";
+    f.add(d, text);
+  }
+  testIndex.flush();
+  f.startReading();
+
+  auto poolFree = testIndex.pool.rewindScopeGuard();
+  Query::Context qContext(testIndex.pool, *testIndex.reader);
+  auto& segment = qContext.topReader.segments()[0];
+
+  TermQuery a("body_w", "aterm");
+  TermQuery b("body_w", "bterm");
+  std::vector<Query*> mand = {&a};
+  std::vector<Query*> opt = {&b};
+  BooleanQuery q(mand, opt, {}, {});
+
+  // Non-scoring: optional dropped -> O(1) exact count, and iteration = df(a).
+  auto* countWeight = q.createWeight(qContext, 0);
+  EXPECT_EQ(countWeight->count(segment), dfA);
+  auto* countScorer = countWeight->createScorer(testIndex.pool, segment);
+  ASSERT_NE(countScorer, nullptr);
+  int32_t iterated = 0;
+  for (int32_t d = countScorer->next(); d != PostingsReader::END; d = countScorer->next()) {
+    EXPECT_EQ(d % 3, 0);
+    iterated++;
+  }
+  EXPECT_EQ(iterated, dfA);
+
+  // Scoring: optional kept -> no compound-count shortcut, same match set.
+  Query::Context qContext2(testIndex.pool, *testIndex.reader);
+  BooleanQuery q2(mand, opt, {}, {});
+  auto* scoredWeight = q2.createWeight(qContext2, Query::NEED_SCORES);
+  EXPECT_EQ(scoredWeight->count(segment), -1);
+  auto* scoredScorer = scoredWeight->createScorer(testIndex.pool, segment);
+  ASSERT_NE(scoredScorer, nullptr);
+  int32_t scoredCount = 0;
+  for (int32_t d = scoredScorer->next(); d != PostingsReader::END; d = scoredScorer->next()) {
+    scoredCount++;
+  }
+  EXPECT_EQ(scoredCount, dfA);
+}
+
 TEST_F(TermScorerTest, maxScoreDisjunctionTopKMatchesExhaustive) {
   CollectionHelper helper("main");
   addMaxScoreDisjunctionDocs(helper);

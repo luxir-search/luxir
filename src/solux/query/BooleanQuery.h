@@ -405,7 +405,15 @@ public:
       // Only mandatory and optional clauses can contribute to score.
       int32_t noScore = flags & ~NEED_SCORES;
       mandatoryWeights = createWeights(context.pool, context, query.mandatory, flags);
-      optionalWeights = createWeights(context.pool, context, query.optional, flags);
+      // With a mandatory clause and minShouldMatch <= 1, optional clauses are a
+      // pure score add (MandOpt) - they never affect membership.  Without
+      // scores they contribute nothing, so skip building their weights entirely
+      // (Lucene's BooleanWeight scorer simplification).  This also exposes
+      // "+a b" count-only requests to the single-clause count() shortcut.
+      bool dropOptional = !needsScores && !query.mandatory.empty() && query.minShouldMatch <= 1;
+      optionalWeights = dropOptional
+        ? std::span<Query::Weight*>{}
+        : createWeights(context.pool, context, query.optional, flags);
       prohibitedWeights = createWeights(context.pool, context, query.prohibited, noScore);
       filterWeights = createWeights(context.pool, context, query.filter, noScore);
       minShouldMatch = query.minShouldMatch;
