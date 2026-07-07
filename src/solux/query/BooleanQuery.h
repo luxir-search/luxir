@@ -897,6 +897,11 @@ public:
     std::span<int32_t> windowOrder;
     std::span<bool> isEssential;
     std::span<Scorer*> essentialPointers;
+    // Probe order + cumulative bounds for the demoted (non-essential) clauses:
+    // neOrder[0..splitIndex) ascending by bound, nePrefix[s] = sum of bounds
+    // over neOrder[0..s] (see scoreCurrentDoc).
+    std::span<int32_t> neOrder;
+    std::span<double> nePrefix;
 
     // TODO: OPT: heapifying with virtual methods prob isn't a good idea... pull out and save the docid.
     constexpr static auto idComparator = [](Query::Scorer& a, Query::Scorer& b) { return b.docId() < a.docId(); };
@@ -978,6 +983,12 @@ public:
         isEssential[splitIndex + i] = true;
         essentialPointers[i] = scorers[splitIndex + i];
       }
+      double acc = 0.0;
+      for (size_t s = 0; s < splitIndex; s++) {
+        neOrder[s] = (int32_t) s;  // global order is already ascending clauseMax
+        acc += (double) clauseMax[s];
+        nePrefix[s] = acc;
+      }
       pq = pool.make<solux::IndirectPQ<Scorer, decltype(idComparator)>>(essentialPointers, essentialCount);
     }
 
@@ -1026,6 +1037,12 @@ public:
         isEssential[(size_t) idx] = true;
         essentialPointers[essentialCount++] = scorers[(size_t) idx];
       }
+      double acc = 0.0;
+      for (size_t s = 0; s < splitIndex; s++) {
+        neOrder[s] = windowOrder[s];
+        acc += (double) windowMax[(size_t) windowOrder[s]];
+        nePrefix[s] = acc;
+      }
       pq = pool.make<solux::IndirectPQ<Scorer, decltype(idComparator)>>(essentialPointers, essentialCount);
     }
 
@@ -1062,21 +1079,30 @@ public:
     }
 
     void scoreCurrentDoc() {
-      // Sum every matching clause in a single fixed pass over the (clauseMax-sorted) array,
-      // independent of splitIndex.  This keeps a doc's score a deterministic function of the
-      // doc (not of when the threshold happened to advance), so the pruned and exhaustive
-      // runs of this scorer produce bit-identical scores regardless of clause count.
+      // Essential clauses sit on the heap at docid: sum them first, then probe
+      // the demoted clauses from the largest bound down, abandoning the doc as
+      // soon as the unprobed bounds cannot lift it over the threshold (the
+      // bulk scorer's scoreCandidate shape).  An abandoned doc keeps its
+      // partial sum, which is below the pushed threshold, so the collector
+      // discards it.  Summation order is NOT bit-stable across execution
+      // paths; only match sets are (accepted policy).
       float sum = 0.0f;
       for (size_t i = 0; i < scorers.size(); i++) {
-        if (!isEssential[i]) {
-          // Non-essential: not driven by the essential union, so seek it to docid.
-          nonEssentialLookups++;
-          if (scorers[i]->docId() < docid) {
-            scorers[i]->advance(docid);
-          }
-        }
-        if (scorers[i]->docId() == docid) {
+        if (isEssential[i] && scorers[i]->docId() == docid) {
           sum += scorers[i]->score();
+        }
+      }
+      for (size_t s = splitIndex; s-- > 0; ) {
+        if (((double) sum + nePrefix[s]) * scoreBoundFactor < (double) minCompetitiveScore) {
+          break;
+        }
+        auto* scorer = scorers[(size_t) neOrder[s]];
+        nonEssentialLookups++;
+        if (scorer->docId() < docid) {
+          scorer->advance(docid);
+        }
+        if (scorer->docId() == docid) {
+          sum += scorer->score();
         }
       }
       currentScore = sum;
@@ -1174,6 +1200,8 @@ public:
               windowOrder(pool.make_arr<int32_t>(scorers.size()), scorers.size()),
               isEssential(pool.make_arr<bool>(scorers.size()), scorers.size()),
               essentialPointers(pool.make_arr<Scorer*>(scorers.size()), scorers.size()),
+              neOrder(pool.make_arr<int32_t>(scorers.size()), scorers.size()),
+              nePrefix(pool.make_arr<double>(scorers.size()), scorers.size()),
               maxDoc(maxDoc),
               windowSize(normalizeWindowSize(windowSize)),
               globalMode(normalizeWindowSize(windowSize) >= maxDoc) {
