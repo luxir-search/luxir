@@ -1677,10 +1677,10 @@ TEST_F(TermScorerTest, termImpactShallowMaxScoreUsesWindowBlocks) {
 
   int32_t startBlock = windowScorer->blockContaining(ws);
   int32_t endBlock = windowScorer->blockContaining(we);
-  ASSERT_LT(endBlock, windowScorer->impactBlockCount);
+  ASSERT_LT(endBlock, windowScorer->impacts.blockCount());
   float bruteMax = 0.0f;
   for (int32_t block = startBlock; block <= endBlock; block++) {
-    bruteMax = std::max(bruteMax, windowScorer->blockImpact[block]);
+    bruteMax = std::max(bruteMax, windowScorer->impacts.impact(block));
   }
 
   float windowMax = windowScorer->getMaxScore(we);
@@ -1718,25 +1718,25 @@ TEST_F(TermScorerTest, termImpactFrontierIsExactBlockMax) {
   ASSERT_NE(frontierScorer, nullptr);
   ASSERT_NE(cornerScorer, nullptr);
   ASSERT_NE(actualScorer, nullptr);
-  ASSERT_EQ(frontierScorer->impactBlockCount, cornerScorer->impactBlockCount);
+  ASSERT_EQ(frontierScorer->impacts.blockCount(), cornerScorer->impacts.blockCount());
 
-  std::vector<float> brute((size_t) frontierScorer->impactBlockCount, 0.0f);
+  std::vector<float> brute((size_t) frontierScorer->impacts.blockCount(), 0.0f);
   int32_t block = 0;
   for (int32_t doc = actualScorer->next(); doc != PostingsReader::END; doc = actualScorer->next()) {
-    while (block + 1 < frontierScorer->impactBlockCount
-           && doc > frontierScorer->impactLastDoc[block]) {
+    while (block + 1 < frontierScorer->impacts.blockCount()
+           && doc > frontierScorer->impacts.lastDoc(block)) {
       block++;
     }
-    ASSERT_LE(doc, frontierScorer->impactLastDoc[block]);
+    ASSERT_LE(doc, frontierScorer->impacts.lastDoc(block));
     brute[(size_t) block] = std::max(brute[(size_t) block], actualScorer->score());
   }
 
   bool sawTighterBlock = false;
-  for (int32_t i = 0; i < frontierScorer->impactBlockCount; i++) {
-    EXPECT_FLOAT_EQ(frontierScorer->blockImpact[i], brute[(size_t) i]) << "block=" << i;
-    EXPECT_LE(frontierScorer->blockImpact[i], cornerScorer->blockImpact[i] + 1e-6f)
+  for (int32_t i = 0; i < frontierScorer->impacts.blockCount(); i++) {
+    EXPECT_FLOAT_EQ(frontierScorer->impacts.impact(i), brute[(size_t) i]) << "block=" << i;
+    EXPECT_LE(frontierScorer->impacts.impact(i), cornerScorer->impacts.impact(i) + 1e-6f)
         << "block=" << i;
-    sawTighterBlock |= frontierScorer->blockImpact[i] + 1e-6f < cornerScorer->blockImpact[i];
+    sawTighterBlock |= frontierScorer->impacts.impact(i) + 1e-6f < cornerScorer->impacts.impact(i);
   }
   EXPECT_TRUE(sawTighterBlock);
 }

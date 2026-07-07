@@ -6,6 +6,7 @@
 #include <span>
 #include <vector>
 
+#include "ImpactsIndex.h"
 #include "Query.h"
 #include "solux/reader/IntColReader.h"
 #include "solux/reader/NormsReader.h"
@@ -177,10 +178,7 @@ public:
     std::optional<solux::IntColReader::Iterator> valueIter;
     const uint8_t* flatNormsBase = nullptr;
     solux::Similarity::BM25Scorer* simScorer;
-    int32_t impactBlockCount = 0;
-    int32_t* impactLastDoc = nullptr;
-    float* blockImpact = nullptr;
-    float* maxImpactFrom = nullptr;
+    ImpactsIndex impacts;
     float minCompetitiveScore = 0.0f;
     int32_t shallowBlock = -1;
     // Query-time multiplier for boosted term clauses, e.g. fuzzy rewrites.
@@ -223,7 +221,7 @@ public:
     }
 
     bool hasImpacts() const {
-      return impactBlockCount > 0;
+      return !impacts.empty();
     }
 
     void buildImpacts(solux::MemPool& pool, bool hasNormLookup,
@@ -231,64 +229,11 @@ public:
       if (simScorer == nullptr || !hasNormLookup) {
         return;
       }
-
-      // T2 frontier bound: evaluate each block's impact at all real Pareto frontier
-      // points.  The old T1 corner bound remains available for A/B measurement.
-      std::vector<int32_t> blockMaxTf;
-      std::vector<int32_t> blockLastDoc;
-      std::vector<int32_t> blockMinNorm;
-      DocsEnum::ImpactFrontiers impactFrontiers;
-      docsEnum.readBlockMaxTf(blockMaxTf, nullptr, &blockLastDoc, &blockMinNorm,
-                              nullptr, useFrontierBound ? &impactFrontiers : nullptr);
-      if (blockMaxTf.empty()) {
-        return;
-      }
-      assert(blockMaxTf.size() == blockLastDoc.size());
-      assert(blockMaxTf.size() == blockMinNorm.size());
-      assert(!useFrontierBound
-             || impactFrontiers.offsets.size() == blockMaxTf.size() + 1);
-
-      impactBlockCount = (int32_t) blockMaxTf.size();
-      impactLastDoc = pool.make_arr<int32_t>((size_t) impactBlockCount);
-      blockImpact = pool.make_arr<float>((size_t) impactBlockCount);
-      maxImpactFrom = pool.make_arr<float>((size_t) impactBlockCount);
-
-      for (int32_t i = 0; i < impactBlockCount; i++) {
-        impactLastDoc[i] = blockLastDoc[i];
-        if (useFrontierBound) {
-          int32_t start = impactFrontiers.offsets[(size_t) i];
-          int32_t end = impactFrontiers.offsets[(size_t) i + 1];
-          if (start < end) {
-            float maxImpact = 0.0f;
-            for (int32_t j = start; j < end; j++) {
-              maxImpact = std::max(
-                  maxImpact,
-                  boost * simScorer->score((float) impactFrontiers.tfs[(size_t) j],
-                                            (int64_t) impactFrontiers.norms[(size_t) j]));
-            }
-            blockImpact[i] = maxImpact;
-          } else {
-            blockImpact[i] = boost * simScorer->score((float) blockMaxTf[i], (int64_t) blockMinNorm[i]);
-          }
-        } else {
-          blockImpact[i] = boost * simScorer->score((float) blockMaxTf[i], (int64_t) blockMinNorm[i]);
-        }
-      }
-      float suffixMax = 0.0f;
-      for (int32_t i = impactBlockCount - 1; i >= 0; i--) {
-        suffixMax = std::max(suffixMax, blockImpact[i]);
-        maxImpactFrom[i] = suffixMax;
-      }
+      impacts.build(pool, docsEnum, *simScorer, boost, useFrontierBound);
     }
 
     int32_t blockContaining(int32_t target) const {
-      if (!hasImpacts()) {
-        return impactBlockCount;
-      }
-      int32_t* begin = impactLastDoc;
-      int32_t* end = impactLastDoc + impactBlockCount;
-      int32_t* it = std::lower_bound(begin, end, target);
-      return (int32_t) (it - begin);
+      return impacts.blockContaining(target);
     }
 
     int32_t skipNonCompetitiveBlocks(int32_t doc) {
@@ -296,21 +241,21 @@ public:
         return doc;
       }
       while (doc != PostingsReader::END) {
-        int32_t block = blockContaining(doc);
-        if (block >= impactBlockCount) {
+        int32_t block = impacts.blockContaining(doc);
+        if (block >= impacts.blockCount()) {
           return doc;
         }
-        if (maxImpactFrom[block] < minCompetitiveScore) {
-          skippedImpactBlocks += impactBlockCount - block;
+        if (impacts.maxImpactFrom(block) < minCompetitiveScore) {
+          skippedImpactBlocks += impacts.blockCount() - block;
           return PostingsReader::END;
         }
-        if (blockImpact[block] >= minCompetitiveScore) {
+        if (impacts.impact(block) >= minCompetitiveScore) {
           return doc;
         }
-        if (impactLastDoc[block] >= PostingsReader::END - 1) {
+        if (impacts.lastDoc(block) >= PostingsReader::END - 1) {
           return PostingsReader::END;
         }
-        int32_t target = impactLastDoc[block] + 1;
+        int32_t target = impacts.lastDoc(block) + 1;
         if (target <= doc) {
           return doc;
         }
@@ -488,24 +433,24 @@ public:
 
       int32_t docBlock = blockContaining(docsEnum.docId());
       int32_t startBlock = shallowBlock >= 0 ? std::min(docBlock, shallowBlock) : docBlock;
-      if (startBlock >= impactBlockCount) {
+      if (startBlock >= impacts.blockCount()) {
         return std::numeric_limits<float>::infinity();
       }
 
       int32_t upBlock = blockContaining(upTo);
-      if (upBlock >= impactBlockCount) {
-        upBlock = impactBlockCount - 1;
+      if (upBlock >= impacts.blockCount()) {
+        upBlock = impacts.blockCount() - 1;
       }
       if (upBlock < startBlock) {
         return std::numeric_limits<float>::infinity();
       }
-      if (upBlock == impactBlockCount - 1) {
-        return maxImpactFrom[startBlock];
+      if (upBlock == impacts.blockCount() - 1) {
+        return impacts.maxImpactFrom(startBlock);
       }
 
       float maxScore = 0.0f;
       for (int32_t i = startBlock; i <= upBlock; i++) {
-        maxScore = std::max(maxScore, blockImpact[i]);
+        maxScore = std::max(maxScore, impacts.impact(i));
       }
       return maxScore;
     }
@@ -515,10 +460,10 @@ public:
         return PostingsReader::END;
       }
       shallowBlock = blockContaining(target);
-      if (shallowBlock >= impactBlockCount) {
+      if (shallowBlock >= impacts.blockCount()) {
         return PostingsReader::END;
       }
-      return impactLastDoc[shallowBlock];
+      return impacts.lastDoc(shallowBlock);
     }
 
     int64_t skippedBlocks() const {
