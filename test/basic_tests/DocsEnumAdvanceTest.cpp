@@ -424,6 +424,138 @@ TEST_F(DocsEnumAdvanceTest, blockImpactHeadersRoundTrip) {
                         "docs-only", &expectedNoFrontiers);
 }
 
+// Position reads after far advances must land exactly where sequential decoding
+// would, now that skipToBlock repairs the position stream through the L0
+// posByteOff anchors.  Every doc holds all three terms, so the per-term
+// cumulative tf pins each doc block's anchor alignment deterministically:
+//   one (tf=1)    - anchors on exact position-block boundaries, and the final
+//                   doc block's anchor at the vint-tail start (N % 128 != 0).
+//   cst (tf=128)  - each doc is exactly one position block; anchors aligned.
+//   var (tf=1+((d*7+3)%250)) - anchors rotate through in-block ords, docs
+//                   straddle position blocks.
+// Sized to span multiple L1 groups so far advances take the group step-over
+// into a direct seek.  Runs on a single segment and again after a merge (the
+// merger regenerates the anchors by replaying positions through TextWriter).
+class PositionSeekTest : public DocsEnumAdvanceTest {
+protected:
+  static constexpr int32_t N = 2 * DocsEnum::L1_DOCS + 300;  // 66 full doc blocks + tail
+
+  static int32_t tfFor(std::string_view term, int32_t globalDoc) {
+    if (term == "one") return 1;
+    if (term == "cst") return Postings::POSITIONS_BLOCK_SIZE;
+    return 1 + ((globalDoc * 7 + 3) % 250);  // var
+  }
+
+  static int32_t firstPosFor(std::string_view term, int32_t globalDoc) {
+    if (term == "one") return 0;
+    if (term == "var") return 1;
+    return 1 + tfFor("var", globalDoc);  // cst
+  }
+
+  static void addSeekDocs(TestField& f, int32_t firstDoc, int32_t numDocs, int32_t globalBase) {
+    std::string text;
+    for (int32_t i = 0; i < numDocs; i++) {
+      int32_t globalDoc = globalBase + i;
+      text = "one ";
+      for (int32_t k = 0; k < tfFor("var", globalDoc); k++) text += "var ";
+      for (int32_t k = 0; k < tfFor("cst", globalDoc); k++) text += "cst ";
+      f.add(firstDoc + i, text);
+    }
+  }
+
+  // readMode: 0 = all positions + END, 1 = half, 2 = none except one position
+  // every 4th landing (repeated seeks over stale buffer states).
+  void checkSeekWalk(TestField& f, std::string_view term,
+                     const std::vector<int32_t>& targets, int readMode) {
+    SCOPED_TRACE(::testing::Message() << "term=" << term << " readMode=" << readMode);
+    TermsEnum tenum = f.createTermsEnum();
+    ASSERT_TRUE(tenum.seek(term));
+    DocsEnum denum(f.testIndex.pool, f.currentSegment()->postingsReader(), tenum);
+
+    int32_t landings = 0;
+    for (int32_t target : targets) {
+      if (target <= denum.docId()) continue;
+      int32_t doc = denum.advance(target);
+      ASSERT_EQ(doc, target < N ? target : DocsEnum::END) << "advance(" << target << ")";
+      if (doc == DocsEnum::END) break;
+      int32_t tf = tfFor(term, doc);
+      ASSERT_EQ(denum.termFreq(), tf) << "doc " << doc;
+      int32_t toRead = readMode == 0 ? tf
+                     : readMode == 1 ? tf / 2
+                     : (landings % 4 == 0 ? 1 : 0);
+      landings++;
+      if (readMode == 2 && toRead == 0) continue;
+      denum.startPositions();
+      int32_t firstPos = firstPosFor(term, doc);
+      for (int32_t k = 0; k < toRead; k++) {
+        ASSERT_EQ(denum.nextPosition(), firstPos + k) << "doc " << doc << " pos " << k;
+      }
+      if (toRead == tf) {
+        ASSERT_EQ(denum.nextPosition(), DocsEnum::END) << "doc " << doc << " pos end";
+      }
+    }
+  }
+
+  void checkAllWalks(TestField& f) {
+    // Block/group boundary singles (L1_DOCS = 4096; tail starts at 8448 for one/cst).
+    std::vector<int32_t> boundaries = {1, 2, 127, 128, 130, 258, 4095, 4096, 4097,
+                                       5000, 8191, 8192, 8300, 8447, 8448, 8449,
+                                       8460, N - 1, N};
+    for (std::string_view term : {"one", "cst", "var"}) {
+      checkSeekWalk(f, term, boundaries, 0);
+      int readMode = 0;
+      for (int32_t stride : {997, 313, 129}) {
+        std::vector<int32_t> targets;
+        for (int32_t t = stride / 2; t <= N; t += stride) targets.push_back(t);
+        checkSeekWalk(f, term, targets, readMode++);
+      }
+      // Sequential reads resuming after a far seek, then another far seek.
+      std::vector<int32_t> mixed;
+      mixed.push_back(3000);
+      for (int32_t d = 3001; d < 3200; d++) mixed.push_back(d);
+      mixed.push_back(8400);
+      checkSeekWalk(f, term, mixed, 0);
+    }
+  }
+};
+
+TEST_F(PositionSeekTest, positionSeekAlignments) {
+  bool savedStats = SkipStats::enabled;
+  SkipStats::enabled = true;
+  SkipStats::reset();
+
+  {
+    TestIndex testIndex;
+    TestField f(testIndex, "body_w");
+    f.startIndexing();
+    addSeekDocs(f, 0, N, 0);
+    testIndex.flush();
+    f.startReading();
+    checkAllWalks(f);
+    ASSERT_GT(SkipStats::posSeeks, 0);  // the new anchor-seek path engaged
+  }
+
+  {
+    const int32_t split = 40 * Postings::DOCS_BLOCK_SIZE + 9;
+    TestIndex testIndex;
+    TestField f(testIndex, "body_w");
+    f.startIndexing();
+    addSeekDocs(f, 0, split, 0);
+    testIndex.flush();
+    f.startIndexing();
+    addSeekDocs(f, 0, N - split, split);
+    testIndex.flush();
+
+    testIndex.iw->mergeSegments();
+    f.startReading();
+    ASSERT_EQ(testIndex.reader->segments().size(), 1u);
+    checkAllWalks(f);
+  }
+
+  SkipStats::enabled = savedStats;
+  SkipStats::reset();
+}
+
 // A conjunction's advance() must route through the skip list (TermQuery::Scorer
 // forwards advance() to DocsEnum::advance()).  The sparse term leads and advance()s
 // the dense one across many blocks; some sparse docs are not dense, exercising the

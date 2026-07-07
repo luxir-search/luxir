@@ -64,6 +64,7 @@ class DocsEnum {
 
   int64_t locOfDocsForTermBlock;
   int64_t locOfPositionsForTermBlock;
+  int64_t posStartLoc = 0;  // absolute location of this term's positions (base for L0 posByteOff)
 
 public:
   // The skip structure is two levels: L0 per-block headers, and L1 group headers
@@ -219,7 +220,8 @@ public:
       if (hasPositions) {
         auto posOffset = tenum.posOffset();
         posIS = postingsReader.getInputStream(fieldInfo.posLoc.filenum());
-        posIS.seek(locOfPositionsForTermBlock + posOffset);
+        posStartLoc = locOfPositionsForTermBlock + posOffset;
+        posIS.seek(posStartLoc);
       }
 
       docIS.seek(startOfDocs);
@@ -522,8 +524,10 @@ public:
         int32_t blockDocCount = std::min(Postings::DOCS_BLOCK_SIZE,
                                          docfreq - block * Postings::DOCS_BLOCK_SIZE);
         int64_t blockTfSum = blockDocCount;
+        uint64_t blockPosByteOff = 0;
         if (hasPositions) {
           blockTfSum += InputStream::readVint(p, headerEnd);
+          blockPosByteOff = InputStream::readVlong(p, headerEnd);
         }
         if (hasFreqs && hasNorms) {
           uint32_t frontierCount = InputStream::readVint(p, headerEnd);
@@ -548,6 +552,23 @@ public:
           docOrd = block * Postings::DOCS_BLOCK_SIZE;
           tfreqOrd = docOrd;
           cumulativeTermFreq = cumTf;  // restores position alignment; unused when !hasPositions
+          if (hasPositions) {
+            // This doc block's first position is cumTf % POSITIONS_BLOCK_SIZE
+            // positions into the position block at posByteOff.  Seek there
+            // directly instead of letting startPositions walk the intervening
+            // blocks - unless the stream already sits at or past that block
+            // (then the buffered state is still the cheapest path forward).
+            int64_t posBlockStartOrd = cumTf - (cumTf % Postings::POSITIONS_BLOCK_SIZE);
+            int64_t streamOrd = posOrd + (posBufEnd - posBufIdx);
+            if (posBlockStartOrd > streamOrd) {
+              posIS.seek(posStartLoc + (int64_t) blockPosByteOff);
+              posOrd = posBlockStartOrd;
+              // Full buffer reset (stale posBufEndDoc reads past posBuf - see
+              // the startPositions whole-block skip note).
+              posBufIdx = posBufEnd = posBufEndDoc = 0;
+              skipCount(SkipStats::posSeeks);
+            }
+          }
           docBuf[Postings::DOCS_BLOCK_SIZE - 1] = (int32_t) prevLastDoc;
           docBufIdx = docBufEnd = Postings::DOCS_BLOCK_SIZE;   // force a decode on the next nextDoc()
           tfreqBufIdx = tfreqBufEnd = 0;
@@ -757,6 +778,8 @@ public:
         if (hasPositions) {
           auto blockCumTfDelta = InputStream::readVint(p, headerEnd);
           unused(blockCumTfDelta);
+          auto blockPosByteOff = InputStream::readVlong(p, headerEnd);
+          unused(blockPosByteOff);
         }
         int32_t maxTf = 1;
         int32_t minNorm = 0;
@@ -848,6 +871,7 @@ public:
         auto bytesSkipped = IndexCodec::posCodec.skipBlock(posIS.ptr(), posIS.left());
         posIS.skip(bytesSkipped);
         posOrd += Postings::POSITIONS_BLOCK_SIZE;
+        skipCount(SkipStats::posBlocksSkipped);
         // Fully reset buffer state: a skip that lands exactly on posOrdStart
         // exits the loop without another decode, and nextPosition() must then
         // take its fresh-decode path (a stale posBufEndDoc < posBufEnd would
@@ -880,6 +904,7 @@ public:
       auto bytesRead = IndexCodec::posCodec.decodeBlock(posIS.ptr(), posIS.left(), (uint32_t*)posBuf, outSz);
       posIS.skip(bytesRead);
       assert(outSz == Postings::POSITIONS_BLOCK_SIZE);
+      skipCount(SkipStats::posBlocksDecoded);
       posBufIdx = 0;
       posBufEnd = outSz;
       posBufEndDoc = std::min(posBufEnd, tfreq);
@@ -917,6 +942,7 @@ public:
           auto bytesRead = IndexCodec::posCodec.decodeBlock(posIS.ptr(), posIS.left(), (uint32_t*)posBuf, outSz);
           posIS.skip(bytesRead);
           assert(outSz == Postings::POSITIONS_BLOCK_SIZE);
+          skipCount(SkipStats::posBlocksDecoded);
           posBufIdx = 0;
           posBufEnd = outSz;
           // This doc may have started in the previous positions block.

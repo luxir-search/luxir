@@ -29,12 +29,21 @@ struct SkipStats {
   static inline int64_t l1GroupSteps = 0;
   // DocsEnum::advance() invocations (leapfrog / impact-skip driver calls).
   static inline int64_t advanceCalls = 0;
+  // Position-stream accounting: O(1) seeks off the L0 posByteOff anchors
+  // (skipToBlock), whole position blocks hopped without unpacking
+  // (startPositions), and position block body decodes.
+  static inline int64_t posSeeks = 0;
+  static inline int64_t posBlocksSkipped = 0;
+  static inline int64_t posBlocksDecoded = 0;
 
   static void reset() {
     docBlocksDecoded = 0;
     l0HeaderSteps = 0;
     l1GroupSteps = 0;
     advanceCalls = 0;
+    posSeeks = 0;
+    posBlocksSkipped = 0;
+    posBlocksDecoded = 0;
   }
 };
 

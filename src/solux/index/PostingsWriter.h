@@ -453,6 +453,13 @@ class TextWriter {
   int64_t locOfPositionsForTerm;
   int64_t locOfDocsForTerm;
 
+  // Absolute posOutput location of the position block that holds the current
+  // doc block's first position.  Captured when a doc block starts (startDoc
+  // with an empty docs buffer): at that moment posOutput holds exactly the
+  // fully flushed position blocks, so its size is the in-progress block's
+  // start - the block the next position lands in.  Consumed by appendL0Block.
+  int64_t pendingBlockPosByteOff = 0;
+
   int32_t docsFlushed;  /// number of documents flushed for the current term so far
   int32_t curTf = 0;    /// occurrences (term freq) seen so far for the current doc
   int64_t ttfAcc = 0;   /// total term freq (sum of tf over docs) accumulated for the current term
@@ -570,7 +577,7 @@ private:  // some internal utility methods... not for use by indexers
 
   void appendL0Header(std::vector<char>& out, uint32_t lastDoc, uint32_t base,
                       uint64_t blockByteLen, uint32_t docCount, uint64_t tfSum,
-                      uint32_t maxTf, uint32_t minNorm) {
+                      uint32_t maxTf, uint32_t minNorm, uint64_t posByteOff) {
     header_output.resize(0);
     assert(lastDoc >= base);
     appendVint15(header_output, lastDoc - base);
@@ -578,6 +585,11 @@ private:  // some internal utility methods... not for use by indexers
     if (hasPositions) {
       assert(tfSum >= docCount);
       appendVint(header_output, (uint32_t) (tfSum - docCount));
+      // Byte offset (from the term's position start) of the position block
+      // holding this doc block's first position.  The ord within that block is
+      // not stored: it is cumTf-before-block % POSITIONS_BLOCK_SIZE, which the
+      // reader already tracks via the tfSum chain.
+      appendVlong(header_output, posByteOff);
     }
     if (hasFreqs && hasNorms) {
       assert(!frontierTfs.empty());
@@ -703,7 +715,12 @@ private:  // some internal utility methods... not for use by indexers
 
   void appendL0Block(uint32_t lastDoc, uint32_t base, uint64_t blockByteLen,
                      uint32_t docCount, uint64_t tfSum, uint32_t maxTf, uint32_t minNorm) {
-    appendL0Header(group_output, lastDoc, base, blockByteLen, docCount, tfSum, maxTf, minNorm);
+    // Position anchor for this doc block, captured at its first startDoc.
+    assert(pendingBlockPosByteOff >= locOfPositionsForTerm);
+    uint64_t posByteOff = hasPositions
+        ? (uint64_t) (pendingBlockPosByteOff - locOfPositionsForTerm) : 0;
+    appendL0Header(group_output, lastDoc, base, blockByteLen, docCount, tfSum, maxTf, minNorm,
+                   posByteOff);
     appendBytes(group_output, compressed_output.data(), blockByteLen);
     l1GroupLastDoc = lastDoc;
     l1GroupBlockCount++;
@@ -1141,6 +1158,7 @@ public:
     l1GroupMinNorm = 0;
     group_output.resize(0);
     locOfPositionsForTerm = posOutput.size();
+    pendingBlockPosByteOff = locOfPositionsForTerm;
     locOfDocsForTerm = docOutput.size();
     PackedTerm stored(termBytes.data() + termList.size() * PackedTerm::MAX_BYTES);
     term.copyTo(stored);
@@ -1313,10 +1331,12 @@ public:
     unused(doc);
     curTf = 0;
 
-    // Do we need to know the current doc?
-
-    // We don't keep track of positions for the doc... we block encode all positions for a term together.
-    // locationOfPositionsForDoc = posOutput->size();
+    // This doc starts a new doc block: anchor the block to the position stream
+    // before any of the doc's positions are added.  (All positioned paths -
+    // Inverter's pushDocs and the merger's addDocsPos - route through here.)
+    if (hasPositions && docs.empty()) {
+      pendingBlockPosByteOff = posOutput.size();
+    }
   }
 
   // Record a doc with a known term freq and no positions.  Positionless fields (string/id,
