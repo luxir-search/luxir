@@ -664,3 +664,59 @@ TEST_F(SimpleQueryParserTest, minMatchOnEmptyInputStaysSilent) {
   EXPECT_EQ(nullptr, r.root);
   EXPECT_TRUE(r.warnings.empty());
 }
+
+TEST_F(SimpleQueryParserTest, quotesOpenOnlyWhereAValueBegins) {
+  // mid-token quotes are ordinary term bytes (apostrophe-safe search boxes)
+  EXPECT_EQ("can\"t", matchVal(*parse("can\"t").root));
+
+  auto r = parse("say\"hi there\"");
+  const auto& b = asBool(*r.root);
+  ASSERT_EQ(2u, b.optional.size());
+  EXPECT_EQ("say\"hi", matchVal(b.optional[0]));
+  EXPECT_EQ("there\"", matchVal(b.optional[1]));
+
+  // ...but a quote still opens a phrase at a boundary or after one sign
+  const auto* p = std::get_if<api::PhraseQuery>(&parse("\"foo bar\"").root->kind);
+  ASSERT_NE(nullptr, p);
+  const auto& neg = asBool(*parse("-\"foo bar\"").root);
+  ASSERT_EQ(1u, neg.prohibited.size());
+  EXPECT_NE(nullptr, std::get_if<api::PhraseQuery>(&neg.prohibited[0].kind));
+}
+
+TEST_F(SimpleQueryParserTest, unknownFieldQuotedValueKeepsPhrase) {
+  // site: is not a field; the head stays literal text and the quoted value
+  // is still a phrase over the default fields
+  auto r = parse("site:\"foo bar\"");
+  const auto& b = asBool(*r.root);
+  ASSERT_EQ(2u, b.optional.size());
+  EXPECT_EQ("site:", matchVal(b.optional[0]));
+  const auto* p = std::get_if<api::PhraseQuery>(&b.optional[1].kind);
+  ASSERT_NE(nullptr, p);
+  EXPECT_EQ("foo bar", p->text);
+}
+
+TEST_F(SimpleQueryParserTest, unterminatedFieldedQuote) {
+  // the unpaired quote is not a quote: the token continues without it
+  // (this used to emit the phrase bytes twice and lose the field entirely)
+  auto r = parse("status:\"abc");
+  const auto& m = asMatch(*r.root);
+  EXPECT_EQ("status", m.field);
+  EXPECT_EQ("abc", matchVal(*r.root));
+}
+
+TEST_F(SimpleQueryParserTest, parenTableMatchesQuoteRule) {
+  // a boundary quote protects parens inside the phrase...
+  auto r = parse("(\"a )\" b)");
+  const auto& g = asBool(*r.root);
+  ASSERT_EQ(2u, g.optional.size());
+  const auto* p = std::get_if<api::PhraseQuery>(&g.optional[0].kind);
+  ASSERT_NE(nullptr, p);
+  EXPECT_EQ("a )", p->text);
+
+  // ...but a mid-token quote does not hide a real group behind it
+  r = parse("say\"hi (a b)");
+  const auto& t = asBool(*r.root);
+  ASSERT_EQ(2u, t.optional.size());
+  EXPECT_EQ("say\"hi", matchVal(t.optional[0]));
+  EXPECT_EQ(2u, asBool(t.optional[1]).optional.size());
+}

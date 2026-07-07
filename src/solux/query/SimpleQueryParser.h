@@ -24,8 +24,12 @@ namespace solux {
 //
 // Contract: NEVER fails to parse.  Every input degrades to some query:
 // unbalanced quotes and parentheses are extraneous characters, a colon token
-// whose field name is not queryable is literal text, garbage after ~ is
-// swallowed.  Degradations worth declaring go on the warnings list.
+// whose field name is not queryable is literal text, mangled decorations
+// read as literal text.  Degradations worth declaring go on the warnings
+// list.  Specials are POSITIONAL: '+' '-' '|' act only at a clause boundary,
+// '*' and '~' only as clean trailing suffixes, and a quote opens a phrase
+// only where a value can begin (a boundary, after one leading sign, or right
+// after field:) - so can't, say"hi, c++, and a|b are single terms.
 //
 // The parser is SCHEMA-AWARE but ANALYZER-BLIND: it consults FieldType to
 // emit the most natural arm for each clause (a quoted value against an
@@ -464,13 +468,17 @@ private:
     return 0;
   }
 
-  // A token ends at a quote, a paren, or whitespace.  The operator characters
-  // '+' '-' '|' do NOT end a token: they are operators only at a clause
-  // boundary (see runRange), so mid-token they are ordinary term bytes and
-  // pass through to analysis (c++, at&t, a|b, rock-n-roll ... stay one token).
+  // A token ends at a paren or whitespace.  The operator characters '+' '-'
+  // '|' do NOT end a token: they are operators only at a clause boundary
+  // (see runRange), so mid-token they are ordinary term bytes and pass
+  // through to analysis (c++, at&t, a|b, rock-n-roll ... stay one token).
+  // Quotes do not end a token either: a quote opens a phrase only where a
+  // value can begin - at a clause boundary, after one leading sign, or right
+  // after a token's first ':' (field:"...") - so can"t and say"hi stay one
+  // token (same positional rule, applied to quotes).
   bool tokenFinished(size_t i) const {
     char c = data[i];
-    return c == '"' || c == '(' || c == ')' || wsLen(i) > 0;
+    return c == '(' || c == ')' || wsLen(i) > 0;
   }
 
   // Is the '~' at tildePos a clean trailing fuzzy operator: '~' then optional
@@ -537,38 +545,116 @@ private:
 
   // The position of the ')' closing the '(' at openPos, honoring quotes and
   // escapes, or NPOS.  Backed by a lazily built table whose quote handling
-  // mirrors the parse's degradation rule: quotes pair greedily left-to-right,
-  // and an UNPAIRED quote is not a quote (the parse treats it as extraneous
-  // and reparses its "contents"), so it must not hide the parens after it.
-  // Only real quoted regions protect parens.
+  // mirrors the parse's positional rule: a quote OPENS only where a value can
+  // begin - a clause boundary (start / after whitespace / after '(' / after
+  // one boundary sign) or right after a token's first ':' - and closes at the
+  // next unescaped quote.  An UNPAIRED opening quote is not a quote (the
+  // parse drops it), so it must not hide the parens after it; only real
+  // quoted regions protect parens.  The boundary simulation approximates
+  // where exactness would need the paren pairing this pass feeds (real vs
+  // extraneous parens); a divergence degrades the parse, never breaks it.
   size_t matchingClose(size_t openPos) {
     if (!parenTableBuilt) {
       parenTableBuilt = true;
       parenClose.assign(inputEnd, NPOS);
 
-      // phase 1: pair unescaped quotes greedily
+      // phase 1: find quote regions with the boundary-aware opening rule
       std::pmr::vector<std::pair<size_t, size_t>> quoted(&mr);
       {
+        // wsLen() checks against the (possibly narrowed) `end`; the table
+        // covers the whole input
+        auto wsAt = [&](size_t i) -> size_t {
+          char c = data[i];
+          if (c == ' ' || c == '\t' || c == '\n' || c == '\r') return 1;
+          if ((uint8_t)c == 0xE3 && i + 2 < inputEnd && (uint8_t)data[i + 1] == 0x80 &&
+              (uint8_t)data[i + 2] == 0x80) {
+            return 3;
+          }
+          return 0;
+        };
         bool escaped = false;
-        size_t open = NPOS;
+        bool canOpen = true;      // a value can begin here
+        bool signTaken = false;   // one boundary sign consumed; a value may follow
+        bool colonJustBefore = false;
+        bool colonSeen = false;
+        size_t tokenLen = 0;
+        auto tokenByte = [&] {
+          canOpen = false;
+          signTaken = false;
+          colonJustBefore = false;
+          tokenLen++;
+        };
         for (size_t i = 0; i < inputEnd; i++) {
           if (escaped) {
             escaped = false;
+            tokenByte();  // an escaped byte is a token byte (even a ':')
             continue;
           }
           char c = data[i];
-          if (c == '\\') {
+          if (size_t n = wsAt(i)) {
+            i += n - 1;
+            canOpen = true;
+            signTaken = false;
+            colonSeen = false;
+            colonJustBefore = false;
+            tokenLen = 0;
+          } else if (c == '\\') {
             escaped = true;
-          } else if (c == '"') {
-            if (open == NPOS) {
-              open = i;
+          } else if (c == '(') {
+            canOpen = true;
+            signTaken = false;
+            colonSeen = false;
+            colonJustBefore = false;
+            tokenLen = 0;
+          } else if (c == ')') {
+            // neutral for the boundary, like the parse; ends any token
+            signTaken = false;
+            colonSeen = false;
+            colonJustBefore = false;
+            tokenLen = 0;
+          } else if (c == '+' || c == '-' || c == '|') {
+            if (canOpen && !signTaken) {
+              signTaken = true;  // canOpen survives: -"a b" opens a phrase
+              colonJustBefore = false;
             } else {
-              quoted.push_back({open, i});
-              open = NPOS;
+              tokenByte();
             }
+          } else if (c == '"') {
+            size_t close = NPOS;
+            if (canOpen || colonJustBefore) {
+              bool esc2 = false;
+              for (size_t j = i + 1; j < inputEnd; j++) {
+                if (esc2) {
+                  esc2 = false;
+                } else if (data[j] == '\\') {
+                  esc2 = true;
+                } else if (data[j] == '"') {
+                  close = j;
+                  break;
+                }
+              }
+            }
+            if (close != NPOS) {
+              quoted.push_back({i, close});
+              i = close;
+              canOpen = false;
+              signTaken = false;
+              colonSeen = false;
+              colonJustBefore = false;
+              tokenLen = 0;
+            } else {
+              tokenByte();  // no open position or unterminated: a literal byte
+            }
+          } else if (c == ':') {
+            colonJustBefore = !colonSeen && tokenLen > 0;
+            colonSeen = true;
+            canOpen = false;
+            signTaken = false;
+            tokenLen++;
+          } else {
+            tokenByte();
           }
         }
-        // an unpaired trailing `open` is dropped: not a quote
       }
 
       // phase 2: pair parens, skipping the quoted regions
@@ -612,36 +698,44 @@ private:
     // else they are ordinary term bytes (see tokenFinished), so `+foo`/`-foo`
     // is a modifier but `a+b`/`c++`/`a|b` is one literal token, and only the
     // FIRST leading sign is a modifier (`+-foo` = require the term "-foo").
+    // A quote opens a phrase at a boundary OR right after that one sign
+    // (-"a b" prohibits the phrase); anywhere else it is a term byte.
     // Whitespace re-opens a boundary and drops any pending sign that never
     // reached a unit.  orConj survives whitespace (it is the conjunction to
     // the next unit, spaces and all) and is cleared when that unit lands.
     bool atBoundary = true;
+    bool afterOp = false;  // one boundary sign consumed; a value may follow
     while (pos < end) {
       char c = data[pos];
+      bool quoteOpens = atBoundary || afterOp;
+      afterOp = false;
       if (c == '(') {
         // a consumed group is a unit (boundary after it); an extraneous '('
         // is ignored and leaves the boundary state untouched
         if (consumeSubQuery(st, depth)) atBoundary = false;
       } else if (c == ')') {
         ++pos;  // extraneous ')': ignored, neutral for boundary state
-      } else if (c == '"') {
+      } else if (c == '"' && quoteOpens) {
         consumePhrase(st);
         atBoundary = false;
       } else if (c == '+' && atBoundary) {
         st.plus = true;  // required modifier on the next unit
         ++pos;
         atBoundary = false;
+        afterOp = true;
         continue;
       } else if (c == '|' && atBoundary) {
         // OR conjunction to the next unit; ignored with nothing before it
         if (st.hasAny()) st.orConj = true;
         ++pos;
         atBoundary = false;
+        afterOp = true;
         continue;
       } else if (c == '-' && atBoundary) {
         ++st.notCount;  // prohibited modifier on the next unit
         ++pos;
         atBoundary = false;
+        afterOp = true;
         continue;
       } else if (size_t n = wsLen(pos)) {
         pos += n;
@@ -723,34 +817,47 @@ private:
           ++pos;
           continue;
         }
-        if (tokenFinished(pos)) {
-          // `field:` immediately followed by a quote is a fielded phrase.  For a
+        if (tokenFinished(pos)) break;
+        if (c == '"') {
+          // A quote is special mid-token only right after the token's first
+          // ':' - the fielded-value position (status:"in stock"; for a
           // numeric field the quotes are just value delimiters, so makePhrase
-          // emits an exact match (matchLeaf), not a positional phrase.
-          if (c == '"' && firstColon && *firstColon > 0 && *firstColon == buf.size() - 1) {
-            std::string_view head(buf.data(), *firstColon);
-            if (FieldType* fieldType = fieldedHead(head)) {
-              std::string_view field = arenaStr(head);  // head dangles once buf is reused
-              auto text = parsePhraseBody();
-              if (text) {
-                if (text->empty()) {
-                  clearPending(st);
-                } else if (numericQueryable(*fieldType) && !numericCoercible(*fieldType, *text)) {
-                  // Uncoercible numeric value: degrade the quoted text to a
-                  // phrase over the default fields (declared).
-                  warn("numeric_field_value",
-                       fmt::format("'{}' is not a valid {} for field '{}'; treated as text",
-                                   *text, numericTypeName(fieldType->type()), field));
-                  addUnit(st, makePhrase({}, nullptr, *text));
-                } else {
-                  addUnit(st, makePhrase(field, fieldType, *text));
-                }
-                return;
+          // emits an exact match).  Anywhere else it is an ordinary term byte
+          // (can"t, say"hi stay one token).
+          if (firstColon && *firstColon > 0 && *firstColon == buf.size() - 1) {
+            // parsePhraseBody reuses buf: copy the token bytes (and the head
+            // view they back) out first
+            std::string_view tokenText = arenaStr(std::string_view(buf.data(), buf.size()));
+            std::string_view field = tokenText.substr(0, *firstColon);
+            FieldType* fieldType = fieldedHead(field);
+            auto text = parsePhraseBody();
+            if (text) {
+              if (fieldType == nullptr) {
+                // the head is not a queryable field: the token so far stays
+                // literal text and the quoted value is an unfielded phrase
+                // (site:"foo bar" from a search box keeps its phrase-ness)
+                addUnit(st, makeDefault({}, nullptr, tokenText));
+                if (!text->empty()) addUnit(st, makePhrase({}, nullptr, *text));
+              } else if (text->empty()) {
+                clearPending(st);
+              } else if (numericQueryable(*fieldType) && !numericCoercible(*fieldType, *text)) {
+                // Uncoercible numeric value: degrade the quoted text to a
+                // phrase over the default fields (declared).
+                warn("numeric_field_value",
+                     fmt::format("'{}' is not a valid {} for field '{}'; treated as text",
+                                 *text, numericTypeName(fieldType->type()), field));
+                addUnit(st, makePhrase({}, nullptr, *text));
+              } else {
+                addUnit(st, makePhrase(field, fieldType, *text));
               }
-              // unterminated phrase: fall through, `field:` is literal text
+              return;
             }
+            // unterminated: the quote is not a quote; drop it and keep
+            // scanning the token (pos already sits past it)
+            buf.assign(tokenText.begin(), tokenText.end());
+            continue;
           }
-          break;
+          // fall through: an ordinary term byte
         }
         if (!buf.empty() && c == '~' && fuzzySuffix(pos)) {
           sawFuzzy = true;
