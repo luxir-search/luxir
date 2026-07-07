@@ -54,6 +54,12 @@ public:
   // point into requestPool, which outlives response serialization.
   std::vector<api::Warning> warnings;
 
+  // TEST-ONLY: wrap each top-docs root query in ForcePrepareQuery so tests
+  // can assert prepared execution matches normal execution end-to-end.  This
+  // is the engine seam that replaced the force_prepare wire arm (debug
+  // machinery does not belong on the public API); nothing wire-facing sets it.
+  bool testForcePrepare = false;
+
   SearchRequest(SearchEngine& engine, const ReqProto& proto, google::protobuf::Arena& arena)
     : engine(engine), proto(proto), arena(arena) {
   }

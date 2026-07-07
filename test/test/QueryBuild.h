@@ -163,15 +163,6 @@ inline api::Query constantScore(std::pmr::memory_resource& mr, const api::Query&
   return q;
 }
 
-inline api::Query forcePrepare(std::pmr::memory_resource& mr, const api::Query& inner) {
-  api::Query q;
-  auto& f = q.kind.emplace<api::ForcePrepareQuery>();
-  auto* p = (api::Query*)mr.allocate(sizeof(api::Query), alignof(api::Query));
-  new (p) api::Query(inner);
-  f.query = p;
-  return q;
-}
-
 // ---- boolean: copy the clause lists into arena spans ----
 inline void setSpan(std::span<const api::Query>& target, std::pmr::memory_resource& mr,
                     std::span<const api::Query> src) {

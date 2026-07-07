@@ -711,11 +711,12 @@ TEST_F(FacetTest, emptyIndexForcePrepareNestedOps) {
   helper.clear();
 
   auto req = localReq(soluxNode->getSearchEngine());
+  req->testForcePrepare = true;  // wraps the root: force_prepare(all)
   req->collection("main");
 
   auto& topDocs = req->topDocs();
   topDocs.getNumber(true);
-  topDocs.rawQuery() = qb::forcePrepare(topDocs.mr(), qb::all());
+  topDocs.rawQuery() = qb::all();
 
   topDocs.facet("f", "category_s").limit(10);
 

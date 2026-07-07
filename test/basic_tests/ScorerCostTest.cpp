@@ -121,6 +121,13 @@ TEST_F(ScorerCostTest, forcePrepareCostDelegatesToChild) {
   EXPECT_EQ(1, cost(pool.make<ForcePrepareQuery>(term("c"))));
 }
 
+TEST_F(ScorerCostTest, constantScoreOverPreparingChild) {
+  // ConstantScore forwards prepare to a NEEDS_PREPARE child; cost still
+  // delegates through the prepared supplier.
+  auto* forced = pool.make<ForcePrepareQuery>(term("c"));
+  EXPECT_EQ(1, cost(pool.make<ConstantScoreQuery>(forced, 7.5f)));
+}
+
 TEST_F(ScorerCostTest, preparedBooleanFilterUsesDocSetCardinality) {
   // A ForcePrepare optional clause forces the boolean through prepare(), so the
   // filter c materializes into a DocSet (card 1) exposed via DocSetSupplier.

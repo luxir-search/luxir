@@ -29,7 +29,7 @@ class LocalReq;
 //
 // The concrete solux::api classes are the public API: reads go through their named accessors
 // (val.docList()/asDouble(), map_view.find). This cursor only hides the ARENA/build-by-backing
-// mechanics on the write side. For rare wrapper queries (ConstantScore/ForcePrepare) use
+// mechanics on the write side. For rare wrapper queries (ConstantScore) use
 // rawQuery() and build the wrapper chain on the concrete classes directly.
 class OpCursor {
   friend class LocalReq;
@@ -72,7 +72,7 @@ public:
   OpCursor& range(int64_t start, int64_t end, int64_t gap);  // RangeFacet bounds
 
   // --- escape hatch: the mutable arena Query& of this TopDocs op, for wrapper queries
-  //     (ConstantScore/ForcePrepare) the fluent helpers don't cover. ---
+  //     (ConstantScore) the fluent helpers don't cover. ---
   solux::api::Query& rawQuery();
 
   // --- escape hatches for op fields the fluent helpers don't cover (sorts, knn, fusion

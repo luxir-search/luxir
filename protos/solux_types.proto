@@ -151,19 +151,9 @@ message Query {
 
     // TODO: wildcard query
     // TODO: function?
-
-    // Debug/test wrappers use high field numbers so ordinary query types keep
-    // the lower tag space.
-    ForcePrepareQuery force_prepare = 1000;
   }
 
 
-}
-
-// Debug/testing wrapper that forces its child through the prepared execution
-// path. Matching and scores should be identical to the wrapped query.
-message ForcePrepareQuery {
-  Query query = 1;
 }
 
 message ConstantScoreQuery {

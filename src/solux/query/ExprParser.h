@@ -825,8 +825,8 @@ private:
     if (name.text == "expr") {
       fail(name.pos, "expr is not callable within expr; write the expression inline");
     }
-    if (name.text == "force_prepare" || name.text == "field") {
-      fail(name.pos, fmt::format("'{}' is not a callable query type", name.text));
+    if (name.text == "field") {
+      fail(name.pos, "'field' is not a callable query type");
     }
     if (name.text == "all") {
       cur.skipWs();

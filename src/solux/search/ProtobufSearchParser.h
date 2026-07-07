@@ -11,6 +11,7 @@
 #include "ops/StatsOp.h"
 #include "ops/FusionOp.h"
 #include "ops/TopDocsReq.h"
+#include "solux/query/ForcePrepareQuery.h"
 #include "solux/query/ProtobufQueryParser.h"
 #include "solux/util/Overloaded.h"
 
@@ -266,6 +267,9 @@ public:
       throw std::runtime_error("TopDocs requires a query");
     }
     Query* query = parser.parse(*topDocsReq.query);
+    if (req.testForcePrepare) {
+      query = req.requestPool.make<ForcePrepareQuery>(query);
+    }
     int64_t offset = topDocsReq.offset;
     unused(offset); // TODO
     int64_t specifiedLimit = topDocsReq.limit.has_value() ? *topDocsReq.limit : 10;

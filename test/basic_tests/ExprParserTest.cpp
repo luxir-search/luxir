@@ -469,7 +469,6 @@ TEST_F(ExprParserTest, functionErrors) {
   expectContains(parseErr("boolean(x)"), "takes only named arguments");
   expectContains(parseErr("all(x)"), "all() takes no arguments");
   expectContains(parseErr("expr(status:live)"), "not callable within expr");
-  expectContains(parseErr("force_prepare(status:live)"), "not a callable query type");
   expectContains(parseErr("match(x, min_match=abc)"), "expects a number");
   expectContains(parseErr("match(x, operator=XOR)"), "expects AND or OR");
   expectContains(parseErr("knn(field=status, query=[1,2])"), "cannot express");

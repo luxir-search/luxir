@@ -12,7 +12,6 @@
 #include "solux/query/AllQuery.h"
 #include "solux/query/BooleanQuery.h"
 #include "solux/query/ConstantScoreQuery.h"
-#include "solux/query/ForcePrepareQuery.h"
 #include "solux/query/KnnQuery.h"
 #include "solux/schema/Schema.h"
 #include "solux/api/solux_types.hpp"
@@ -310,14 +309,6 @@ public:
     return parse(*root);
   }
 
-  solux::Query* parseForcePrepare(const solux::api::ForcePrepareQuery& forcePrepareQuery) {
-    if (!forcePrepareQuery.query.has_value() ||
-        forcePrepareQuery.query->kind.index() == 0) {
-      throw std::runtime_error("ForcePrepareQuery requires a child query");
-    }
-    return pool.make<solux::ForcePrepareQuery>(parse(*forcePrepareQuery.query));
-  }
-
   solux::Query* parseConstantScore(const solux::api::ConstantScoreQuery& constantScoreQuery) {
     if (!constantScoreQuery.query.has_value() ||
         constantScoreQuery.query->kind.index() == 0) {
@@ -345,7 +336,6 @@ public:
       [&](const solux::api::KnnQuery& k) -> solux::Query* { return parseKnn(k); },
       [&](const solux::api::BooleanQuery& b) -> solux::Query* { return parseBoolean(b); },
       [&](const solux::api::ConstantScoreQuery& c) -> solux::Query* { return parseConstantScore(c); },
-      [&](const solux::api::ForcePrepareQuery& fp) -> solux::Query* { return parseForcePrepare(fp); },
       [&](std::monostate) -> solux::Query* { throw std::runtime_error("query oneof not set"); },
       [&](std::string_view) -> solux::Query* {  // the bare `field` string arm is not a query
         throw std::runtime_error("field-only query arm is not a valid query");

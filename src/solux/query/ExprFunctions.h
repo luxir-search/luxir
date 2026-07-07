@@ -30,7 +30,7 @@ namespace solux::expr {
 // field order).  The static_assert keeps this table in lockstep with the
 // variant: a new arm fails to compile until it is named here (and its expr
 // callability decided).
-inline constexpr std::array<std::string_view, 14> ARM_NAMES = {
+inline constexpr std::array<std::string_view, 13> ARM_NAMES = {
     "",               // monostate (unset)
     "match",          // Match
     "boolean",        // BooleanQuery
@@ -44,7 +44,6 @@ inline constexpr std::array<std::string_view, 14> ARM_NAMES = {
     "simple_query",   // SimpleQuery
     "range",          // RangeQuery
     "expr",           // ExprQuery - not callable within expr (write it inline)
-    "force_prepare",  // ForcePrepareQuery - debug wrapper, not public surface
 };
 static_assert(std::variant_size_v<decltype(api::Query::kind)> == ARM_NAMES.size(),
               "Query gained an arm: name it in ARM_NAMES and decide its expr callability");
@@ -75,15 +74,15 @@ inline constexpr std::string_view jsonName(std::string_view member) {
 // Emplace the message arm named `name` in q and invoke f on the fresh
 // message.  Returns false when no callable message arm has that name; the
 // caller owns the error (and the special cases: "all" is the bool arm,
-// "expr"/"force_prepare"/"field" exist but are deliberately not callable).
+// "expr"/"field" exist but are deliberately not callable).
 template <typename F>
 bool withCallableArm(api::Query& q, std::string_view name, F&& f) {
   bool called = false;
   auto tryArm = [&]<size_t I>() {
     using Arm = std::variant_alternative_t<I, decltype(api::Query::kind)>;
     if constexpr (std::is_class_v<Arm> && !std::is_same_v<Arm, std::monostate> &&
-                  !std::is_same_v<Arm, std::string_view> && !std::is_same_v<Arm, api::ExprQuery> &&
-                  !std::is_same_v<Arm, api::ForcePrepareQuery>) {
+                  !std::is_same_v<Arm, std::string_view> &&
+                  !std::is_same_v<Arm, api::ExprQuery>) {
       if (!called && name == ARM_NAMES[I]) {
         called = true;
         f(q.kind.template emplace<I>());

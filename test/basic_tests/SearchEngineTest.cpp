@@ -422,17 +422,24 @@ TEST_F(SearchEngineTest, forcePrepareWrapperMatchesChild) {
   auto req = localReq(soluxNode->getSearchEngine());
   req->collection("main");
   addBrownTopDocs(req->topDocs("normal"));
-
-  auto& forced = req->topDocs("forced").withStats().fields({"foo_i", "color_s"});
-  forced.rawQuery() = qb::forcePrepare(forced.mr(), qb::match(forced.mr(), "foo_w", "brown"));
-  forced.facet("colors", "color_s").limit(-1);
-
   req->execute();
   ASSERT_EQ(1, req->responses.size()) << req->toString();
   ASSERT_FALSE(hasError(req->responses[0]->proto)) << req->toString();
 
+  // Same query through the prepared path: the engine test seam wraps each
+  // top-docs root in ForcePrepareQuery (the wrapper is not on the wire).
+  auto forcedReq = localReq(soluxNode->getSearchEngine());
+  forcedReq->testForcePrepare = true;
+  forcedReq->collection("main");
+  auto& forced = forcedReq->topDocs("forced");
+  addBrownTopDocs(forced);
+  forced.facet("colors", "color_s").limit(-1);
+  forcedReq->execute();
+  ASSERT_EQ(1, forcedReq->responses.size()) << forcedReq->toString();
+  ASSERT_FALSE(hasError(forcedReq->responses[0]->proto)) << forcedReq->toString();
+
   const auto& normalDocs = *req->docList("normal");
-  const auto& forcedDocs = *req->docList("forced");
+  const auto& forcedDocs = *forcedReq->docList("forced");
   ASSERT_EQ(normalDocs.matches.value_or(0), forcedDocs.matches.value_or(0));
 
   const auto& normalFoo = std::get<solux::api::ColInt>(normalDocs.columns.at("foo_i").kind).v;
@@ -476,11 +483,15 @@ TEST_F(SearchEngineTest, constantScoreWrapperSetsScore) {
   helper.index(flatdoc("foo_w", "brown", "foo_i", 5, "color_s", "brown"), UpdateMessage::COMMIT);
 
   auto req = localReq(soluxNode->getSearchEngine());
+  // The prepared path must not disturb the constant score: the test seam
+  // wraps the root, so this runs ForcePrepare(ConstantScore(match)).  (The
+  // reverse composition, ConstantScore over a preparing child, is covered at
+  // the engine level in ScorerCostTest.)
+  req->testForcePrepare = true;
   req->collection("main");
 
   auto& cur = req->topDocs("constant").withStats().fields({"foo_i", "color_s"});
-  cur.rawQuery() = qb::constantScore(cur.mr(),
-      qb::forcePrepare(cur.mr(), qb::match(cur.mr(), "foo_w", "brown")), 7.5f);
+  cur.rawQuery() = qb::constantScore(cur.mr(), qb::match(cur.mr(), "foo_w", "brown"), 7.5f);
   cur.facet("colors", "color_s").limit(-1);
 
   req->execute();

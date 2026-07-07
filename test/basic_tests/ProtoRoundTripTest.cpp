@@ -14,7 +14,7 @@
 // Scope/limits: this is self-round-trip (fixpoint), so it catches dropped/mis-tagged fields and
 // struct<->meta drift, but NOT encode+decode sharing the *same* wrong tag (= wire-incompatible
 // with real protobuf); that needs a golden-bytes-vs-protobuf check, which the protobuf/hpp-proto
-// TU conflict pushes to a separate harness (TODO). Recursion (Query->ForcePrepareQuery->Query,
+// TU conflict pushes to a separate harness (TODO). Recursion (Query->ConstantScoreQuery->Query,
 // Val->Map->Val) is broken by a depth cap; depth only bounds how deep we exercise - the fixpoint
 // is correct at any depth. BuildByBacking (below) stays hand-written: it tests the build.h helper
 // API (slots/SpanBuilder/lifetime), not the schema, so an explicit example is the right tool.
@@ -236,7 +236,7 @@ void roundTripType(const char* nm) {
 // The one hand-maintained list: every message type. Add a message -> add a line.
 #define SOLUX_MSGS(X)                                                                              \
   X(Target) X(SearchRequest) X(SearchOp) X(GenOp) X(TopDocs) X(Fusion) X(RrfFusion) X(SortSpec)    \
-  X(Query) X(ForcePrepareQuery) X(ConstantScoreQuery) X(KnnQuery) X(Match) X(NamedQuery)           \
+  X(Query) X(ConstantScoreQuery) X(KnnQuery) X(Match) X(NamedQuery)                                 \
   X(BooleanQuery) X(PrefixQuery) X(FuzzyQuery) X(PhraseQuery) X(FieldFacet) X(RangeFacet) X(Domain) \
   X(SearchResponse) X(DocList) X(FacetResult) X(Bucket) X(CommitParams) X(UpdateRequest)           \
   X(UpdateResponse) X(NamedValue) X(Map) X(Columns) X(Val) X(ArrVal) X(ArrStr) X(ArrInt)           \

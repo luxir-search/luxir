@@ -257,8 +257,6 @@ struct from<JSON, solux::api::Query> {
             arm(std::in_place_type<api::RangeQuery>);
           } else if (key == "expr") {
             arm(std::in_place_type<api::ExprQuery>);
-          } else if (key == "force_prepare") {
-            arm(std::in_place_type<api::ForcePrepareQuery>);
           } else {
             ctx.error = error_code::unknown_key;
             return true;
