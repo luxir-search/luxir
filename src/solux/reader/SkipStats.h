@@ -42,6 +42,10 @@ struct SkipStats {
   // bound vs docs that paid a position verification.
   static inline int64_t phraseBoundRejects = 0;
   static inline int64_t phraseVerifies = 0;
+  // Shallow-advance outcomes: targets answered from the cached shallow block
+  // vs calls that had to move the block cursor (search + possible group parse).
+  static inline int64_t shallowCacheHits = 0;
+  static inline int64_t shallowCursorMoves = 0;
 
   static void reset() {
     docBlocksDecoded = 0;
@@ -55,6 +59,8 @@ struct SkipStats {
     posBlocksDecoded = 0;
     phraseBoundRejects = 0;
     phraseVerifies = 0;
+    shallowCacheHits = 0;
+    shallowCursorMoves = 0;
   }
 };
 

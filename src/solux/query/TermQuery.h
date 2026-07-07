@@ -181,7 +181,14 @@ public:
     solux::Similarity::BM25Scorer* simScorer;
     ImpactsIndex impacts;
     float minCompetitiveScore = 0.0f;
+    // Shallow cursor: the block containing the last advanceShallow target,
+    // with its lastDoc/impact cached so same-block targets (low-df clauses
+    // whose blocks span many caller windows) answer without touching chunks.
+    // shallowUpTo is -1 whenever shallowBlock does not name a valid block.
     int32_t shallowBlock = -1;
+    int32_t shallowUpTo = -1;
+    int32_t shallowTarget = -1;
+    float shallowImpact = 0.0f;
     // Query-time multiplier for boosted term clauses, e.g. fuzzy rewrites.
     float boost;
     int64_t skippedImpactBlocks = 0;
@@ -430,6 +437,14 @@ public:
         return std::numeric_limits<float>::infinity();
       }
 
+      // Bound contained in the cached shallow block: answered from the cursor
+      // (the value maxImpactInRange(shallowBlock, shallowBlock) would return).
+      // Conjunction windows end at the minimum clause shallow-block end, so
+      // this is their common shape.
+      if (upTo <= shallowUpTo) {
+        return shallowImpact;
+      }
+
       int32_t startBlock = shallowBlock >= 0 ? shallowBlock
                                              : blockContaining(docsEnum.docId());
       if (startBlock >= impacts.blockCount()) {
@@ -460,13 +475,26 @@ public:
       if (!hasImpacts()) {
         return PostingsReader::END;
       }
-      // Shallow targets are monotone (window walks, block-max hops): resume
-      // the block cursor instead of re-searching the whole impact array.
+      // Same-block fast path: a forward target still under the cached block's
+      // lastDoc stays in that block (the previous target already lay inside
+      // it), so nothing needs to be searched or parsed.  The monotone guard
+      // matters: a backward target under shallowUpTo could belong to an
+      // earlier block.
+      if (target >= shallowTarget && target <= shallowUpTo) {
+        shallowTarget = target;
+        skipCount(SkipStats::shallowCacheHits);
+        return shallowUpTo;
+      }
+      skipCount(SkipStats::shallowCursorMoves);
+      shallowTarget = target;
       shallowBlock = impacts.blockContainingFrom(shallowBlock, target);
       if (shallowBlock >= impacts.blockCount()) {
+        shallowUpTo = -1;
         return PostingsReader::END;
       }
-      return impacts.lastDoc(shallowBlock);
+      shallowUpTo = impacts.lastDoc(shallowBlock);
+      shallowImpact = impacts.impact(shallowBlock);
+      return shallowUpTo;
     }
 
     int64_t skippedBlocks() const {
