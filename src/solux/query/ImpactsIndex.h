@@ -55,11 +55,14 @@ class ImpactsIndex {
     if (chunks[g] != nullptr) {
       return *chunks[g];
     }
-    // scratch is transient; chunk arrays live in the pool
-    std::vector<int32_t> lastDocs;
-    std::vector<int32_t> maxTf;
-    std::vector<int32_t> minNorm;
-    DocsEnum::ImpactFrontiers frontiers;
+    // Scratch is transient (chunk arrays live in the pool) and reused across
+    // parses: readGroupBlockImpacts resets lengths, capacity persists.
+    // thread_local rather than members because pool-resident objects must
+    // stay trivially destructible.
+    static thread_local std::vector<int32_t> lastDocs;
+    static thread_local std::vector<int32_t> maxTf;
+    static thread_local std::vector<int32_t> minNorm;
+    static thread_local DocsEnum::ImpactFrontiers frontiers;
     docsEnum->readGroupBlockImpacts(g, groupBodyOffs[g], groupBaseLastDocs[g], lastDocs,
                                     maxTf, minNorm, useFrontierBound ? &frontiers : nullptr);
     auto* chunk = pool->make<Chunk>();
@@ -97,7 +100,7 @@ class ImpactsIndex {
 public:
   void build(MemPool& pool_, DocsEnum& docsEnum_, Similarity::BM25Scorer& simScorer_,
              float boost_, bool useFrontierBound_ = true) {
-    DocsEnum::GroupImpacts groups;
+    static thread_local DocsEnum::GroupImpacts groups;  // reused; reset by readGroupImpacts
     docsEnum_.readGroupImpacts(groups);
     if (groups.lastDocs.empty()) {
       return;
