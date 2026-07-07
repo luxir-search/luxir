@@ -632,7 +632,62 @@ public:
     std::span<VerifierSlot> verifiers; // two-phase clauses sorted by matchCost
 
     int32_t docid = -1;
+    float minCompetitiveScore = 0.0f;
+    // Lead docs <= competitiveUpTo lie in block ranges whose summed clause
+    // bounds passed the threshold check; they skip re-evaluation.  Reset when
+    // the threshold rises.
+    int32_t competitiveUpTo = -1;
+    int64_t skippedRangeCount = 0;
 
+    // Skip past doc-block ranges where the SUM of the scoring clauses' score
+    // bounds cannot reach the collector's threshold (Lucene's
+    // BlockMaxConjunctionScorer shape).  Returns a possibly-competitive target
+    // or END.  A clause without impact data bounds as +infinity; that caches
+    // as competitive-through-upTo, so the check stays one compare per lead
+    // move rather than a permanent re-evaluation.
+    int32_t advanceTarget(int32_t target) {
+      if (target <= competitiveUpTo || !(minCompetitiveScore > 0.0f)
+          || disablePruningForTests) {
+        return target;
+      }
+      for (;;) {
+        if (target >= solux::PostingsReader::END - 1) {
+          return solux::PostingsReader::END;
+        }
+        int32_t upTo = solux::PostingsReader::END;
+        for (auto* scorer : scorers) {
+          upTo = std::min(upTo, scorer->advanceShallow(target));
+        }
+        float maxScore = 0.0f;
+        for (auto* scorer : scorers) {
+          maxScore += scorer->getMaxScore(upTo);
+        }
+        if (maxScore >= minCompetitiveScore) {
+          competitiveUpTo = upTo;
+          return target;
+        }
+        skippedRangeCount++;
+        if (upTo >= solux::PostingsReader::END - 1) {
+          return solux::PostingsReader::END;
+        }
+        target = upTo + 1;
+      }
+    }
+
+    // Route a lead landing doc through advanceTarget so every candidate that
+    // enters the conjunction loop is in a competitive block range.
+    int32_t leadTo(int32_t id) {
+      for (;;) {
+        int32_t pruned = advanceTarget(id);
+        if (pruned == id) {
+          return id;
+        }
+        if (pruned == solux::PostingsReader::END) {
+          return solux::PostingsReader::END;
+        }
+        id = approximations[0].advance(pruned);
+      }
+    }
 
     // internal utility method where first approximation has already been advanced to target.
     int32_t doNext(int32_t target) {
@@ -650,7 +705,7 @@ public:
             int32_t id = approximations[(size_t) j].advance(target);
             assert(id >= target);
             if (id > target) {
-              target = first.advance(id);
+              target = leadTo(first.advance(id));
               goto outer;  // could perhaps replace with "j=0; continue;" but that seems potentially worse?
             }
           }
@@ -659,7 +714,7 @@ public:
         for (auto& verifier : verifiers) {
           if (!verifier.scorer->matches()) {
             int32_t id = approximations[verifier.approxIndex].next();
-            target = verifier.approxIndex == 0 ? id : first.advance(id);
+            target = leadTo(verifier.approxIndex == 0 ? id : first.advance(id));
             goto outer;
           }
         }
@@ -670,6 +725,12 @@ public:
     }
 
   public:
+    // A/B hook: turn off block-max range skipping entirely.  (A minimum
+    // evaluation stride like Lucene's window minimum was tried and measured
+    // neutral-to-worse at 5M - the natural per-block range prunes best at low
+    // k; revisit only with fresh profiles.)
+    static inline bool disablePruningForTests = false;
+
     // allScorers: every required iterator, ordered by ascending cost so
     // allScorers[0] is the sparsest and leads the matching. scoringScorers: the
     // subset whose score() contributes to the conjunction score (filter clauses
@@ -703,11 +764,11 @@ public:
 
     int32_t next() override {
       assert(docid != solux::PostingsReader::END);
-      return doNext(approximations[0].next());
+      return doNext(leadTo(approximations[0].next()));
     }
 
     int32_t advance(int32_t docid) override {
-      return doNext(approximations[0].advance(docid));
+      return doNext(leadTo(approximations[0].advance(docid)));
     }
 
     /// doc we are positioned on
@@ -722,6 +783,36 @@ public:
         score += scorer->score();
       }
       return score;
+    }
+
+    void setMinCompetitiveScore(float minScore) override {
+      // The threshold applies to the conjunction's SUM; children must not see
+      // it (a child pruning on its own score alone would drop docs whose sum
+      // is competitive).
+      minCompetitiveScore = minScore;
+      competitiveUpTo = -1;  // re-evaluate block ranges under the higher threshold
+    }
+
+    // Bounds for a parent compound scorer: sum of clause bounds over the range
+    // (infinity propagates from clauses without impact data).
+    float getMaxScore(int32_t upTo) override {
+      float sum = 0.0f;
+      for (auto* scorer : scorers) {
+        sum += scorer->getMaxScore(upTo);
+      }
+      return sum;
+    }
+
+    int32_t advanceShallow(int32_t target) override {
+      int32_t upTo = solux::PostingsReader::END;
+      for (auto* scorer : scorers) {
+        upTo = std::min(upTo, scorer->advanceShallow(target));
+      }
+      return upTo;
+    }
+
+    int64_t skippedRanges() const {
+      return skippedRangeCount;
     }
   }; // ConjuctionScorer
 

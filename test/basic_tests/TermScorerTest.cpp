@@ -1918,6 +1918,72 @@ TEST_F(TermScorerTest, phraseImpactTopKMatchesExhaustive) {
   }
 }
 
+// Block-max conjunction: the summed clause bounds let a scored "+a +b" skip
+// doc-block ranges that cannot beat the threshold.  Two separated strong
+// regions (blocks 0 and 8) force real range hops, weak long docs in between;
+// pruned top-k must equal exhaustive exactly while visiting fewer docs.
+TEST_F(TermScorerTest, blockMaxConjunctionTopKMatchesExhaustive) {
+  const int32_t N = 14 * Postings::DOCS_BLOCK_SIZE + 23;
+  TestIndex testIndex;
+  TestField f(testIndex, "body_w");
+  f.startIndexing();
+  for (int32_t doc = 0; doc < N; doc++) {
+    std::string text;
+    int32_t block = doc / Postings::DOCS_BLOCK_SIZE;
+    if (block == 0 || block == 8) {
+      int32_t tf = (block == 0 ? 6 : 5) - (doc % 3);
+      for (int32_t i = 0; i < tf; i++) text += "cja cjb ";
+      for (int32_t i = 0; i < 4 + (doc % 5); i++) text += "pad ";
+    } else {
+      text = "cja cjb ";
+      for (int32_t i = 0; i < 250 + (doc % 37); i++) text += "pad ";
+    }
+    f.add(doc, text);
+  }
+  testIndex.flush();
+  f.startReading();
+
+  auto poolFree = testIndex.pool.rewindScopeGuard();
+  Query::Context qContext(testIndex.pool, *testIndex.reader);
+  auto& segment = qContext.topReader.segments()[0];
+  TermQuery a("body_w", "cja");
+  TermQuery b("body_w", "cjb");
+  std::vector<Query*> mand = {&a, &b};
+
+  for (int32_t k : {1, 5}) {
+    BooleanQuery exhaustiveQ(mand, {}, {}, {});
+    BooleanQuery prunedQ(mand, {}, {}, {});
+    auto* exhaustiveWeight = exhaustiveQ.createWeight(qContext, Query::NEED_SCORES);
+    auto* prunedWeight = prunedQ.createWeight(qContext, Query::NEED_SCORES);
+
+    auto* exhaustiveScorer = exhaustiveWeight->createScorer(testIndex.pool, segment);
+    ASSERT_NE(exhaustiveScorer, nullptr);
+    TopDocsCollector exhaustiveCollector(k);
+    for (int32_t d = exhaustiveScorer->next(); d != PostingsReader::END;
+         d = exhaustiveScorer->next()) {
+      exhaustiveCollector.collect(0, d, exhaustiveScorer->score());
+    }
+    ASSERT_EQ(exhaustiveCollector.totalHits(), N);
+
+    auto* prunedScorer = dynamic_cast<BooleanQuery::ConjunctionScorer*>(
+        prunedWeight->createScorer(testIndex.pool, segment));
+    ASSERT_NE(prunedScorer, nullptr);
+    TopDocsCollector prunedCollector(k);
+    collectTopK(0, prunedScorer, nullptr, nullptr, prunedCollector);
+
+    auto expected = sortedCollectorDocs(exhaustiveCollector);
+    auto actual = sortedCollectorDocs(prunedCollector);
+    ASSERT_EQ(actual.size(), expected.size()) << "k=" << k;
+    for (size_t i = 0; i < expected.size(); i++) {
+      EXPECT_EQ(actual[i].doc, expected[i].doc) << "k=" << k << " i=" << i;
+      EXPECT_EQ(std::bit_cast<uint32_t>(actual[i].score),
+                std::bit_cast<uint32_t>(expected[i].score)) << "k=" << k << " i=" << i;
+    }
+    EXPECT_LT(prunedCollector.totalHits(), exhaustiveCollector.totalHits()) << "k=" << k;
+    EXPECT_GT(prunedScorer->skippedRanges(), 0) << "k=" << k;
+  }
+}
+
 // "+a b" without scores: the optional clause is a pure score add under a
 // mandatory clause, so a non-scoring weight drops it - membership is
 // unchanged and the single-clause count() shortcut engages (Lucene's
