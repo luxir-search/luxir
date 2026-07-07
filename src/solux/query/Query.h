@@ -165,12 +165,15 @@ struct CachedTermInfo {
   /// scorer-creation time, but sharedCount can rise afterwards, so a createWeight for
   /// this term that ran after a scorer had already advanced the cached enum would later
   /// clone the mutated state.  Cloning unconditionally removes that ordering hazard.
-  DocsEnum* useDocsEnum(MemPool& targetPool, IndexReader::Segment& segment) {
+  DocsEnum* useDocsEnum(MemPool& targetPool, IndexReader::Segment& segment,
+                        bool trackPositions = true) {
     auto* docsEnum = docsEnums[segment.ord];
     if (docsEnum == nullptr) {
       return nullptr;
     }
-    return targetPool.make<DocsEnum>(targetPool, *docsEnum);
+    auto* clone = targetPool.make<DocsEnum>(targetPool, *docsEnum);
+    clone->setTrackPositions(trackPositions);
+    return clone;
   }
 
 

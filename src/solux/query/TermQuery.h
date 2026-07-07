@@ -102,7 +102,8 @@ public:
         // term doesn't exist in any segment
         return nullptr;
       }
-      solux::DocsEnum* docsEnum = cachedTermInfo->useDocsEnum(targetPool, segment);
+      solux::DocsEnum* docsEnum = cachedTermInfo->useDocsEnum(
+          targetPool, segment, /*trackPositions=*/false);
       if (docsEnum == nullptr) {
         // term doesn't exist in this segment
         return nullptr;

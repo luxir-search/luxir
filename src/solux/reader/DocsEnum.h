@@ -54,6 +54,7 @@ class DocsEnum {
   MemPool* pool;
   bool hasFreqs;      // field indexes term freqs (else tfreq is implicitly 1)
   bool hasPositions;  // field indexes positions (else there is no position stream)
+  bool trackPositions; // keep cumulative-tf/position state current for startPositions()
   bool hasNorms;      // text fields with positions carry encoded length norms
   int32_t docfreq; // number of docs containing this term
   int64_t ttf;    // totalTermFreq (sum of term freq across all docs for this term)
@@ -165,6 +166,7 @@ public:
     tfreqBuf=tb;
     hasFreqs = FieldType::hasFreqs(fieldInfo.flags);
     hasPositions = FieldType::hasPositions(fieldInfo.flags);
+    trackPositions = hasPositions;
     hasNorms = hasPositions;
 
     // Since the same terms enum will often be used for multiple docs enum, we should copy everything we need
@@ -256,6 +258,10 @@ public:
     return hasPositions;
   }
 
+  void setTrackPositions(bool enabled) {
+    trackPositions = enabled && hasPositions;
+  }
+
   /// number of documents containing the term
   int32_t numDocs() {
     return docfreq;
@@ -337,7 +343,7 @@ public:
           tfreqBufEnd = Postings::DOCS_BLOCK_SIZE;
         }
         // std::cout << "read tfreq block: " << std::endl;
-        if (hasPositions) {
+        if (trackPositions) {
           int64_t blockTfSum = 0;
           for (int i = 0; i < Postings::DOCS_BLOCK_SIZE; i++) {
             blockTfSum += tfreqBuf[i];
@@ -370,7 +376,7 @@ public:
 
         docBufIdx = 0;
         docBufEnd = leftToRead;
-        if (hasPositions) {
+        if (trackPositions) {
           int64_t blockTfSum = 0;
           for (int i = 0; i < leftToRead; i++) {
             blockTfSum += tfreqBuf[i];
@@ -388,8 +394,8 @@ public:
       } // end decode tail
     }
 
-    // Keep tfreq and cumulativeTermFreq current because position decoding still
-    // reads them eagerly; they can be made lazy once positions are decoded lazily too.
+    // Keep tfreq current for scoring; cumulativeTermFreq is only needed by
+    // position consumers such as PhraseQuery.
     assert(!hasFreqs || docBufIdx == tfreqBufIdx);
     assert(!hasFreqs || docOrd == tfreqOrd);
 
@@ -403,8 +409,10 @@ public:
     } else {
       tfreq = 1;
     }
-    posOrdStart = cumulativeTermFreq;
-    cumulativeTermFreq += tfreq;
+    if (trackPositions) {
+      posOrdStart = cumulativeTermFreq;
+      cumulativeTermFreq += tfreq;
+    }
 
     return docid;
   }
@@ -551,8 +559,8 @@ public:
           docIS.seek(body - streamStart);
           docOrd = block * Postings::DOCS_BLOCK_SIZE;
           tfreqOrd = docOrd;
-          cumulativeTermFreq = cumTf;  // restores position alignment; unused when !hasPositions
-          if (hasPositions) {
+          cumulativeTermFreq = cumTf;  // restores position alignment; unused when !trackPositions
+          if (trackPositions) {
             // This doc block's first position is cumTf % POSITIONS_BLOCK_SIZE
             // positions into the position block at posByteOff.  Seek there
             // directly instead of letting startPositions walk the intervening
@@ -698,9 +706,8 @@ public:
     }
 
     // The target lies in the decoded remainder: jump to it directly instead of
-    // a per-doc nextDoc() walk, repairing the cumulative-tf chain with one
-    // bulk sum over the skipped freqs (the per-doc loop's branches and state
-    // updates dominate leapfrog-heavy queries).
+    // a per-doc nextDoc() walk. Plain term scorers do not consume positions, so
+    // they skip cumulative-tf repair entirely.
     blockMode = false;
     const int32_t start = docBufIdx;
     const int32_t j = (int32_t) (std::lower_bound(docBuf + start, docBuf + docBufEnd, target)
@@ -709,19 +716,24 @@ public:
     const int32_t consumed = j + 1 - start;
     docOrd += consumed;
     if (hasFreqs) {
-      int64_t sum = 0;
-      for (int32_t i = start; i <= j; i++) {
-        sum += (uint32_t) tfreqBuf[i];
-      }
-      cumulativeTermFreq += sum;
       tfreq = tfreqBuf[j];
       tfreqOrd += consumed;
       tfreqBufIdx = j + 1;
+      if (trackPositions) {
+        int64_t sum = 0;
+        for (int32_t i = start; i <= j; i++) {
+          sum += (uint32_t) tfreqBuf[i];
+        }
+        cumulativeTermFreq += sum;
+        posOrdStart = cumulativeTermFreq - tfreq;
+      }
     } else {
-      cumulativeTermFreq += consumed;
       tfreq = 1;
+      if (trackPositions) {
+        cumulativeTermFreq += consumed;
+        posOrdStart = cumulativeTermFreq - tfreq;
+      }
     }
-    posOrdStart = cumulativeTermFreq - tfreq;
     docBufIdx = j + 1;
     docid = docBuf[j];
     return docid;
@@ -1062,6 +1074,7 @@ public:
 
   void startPositions() {
     assert(hasPositions);  // positions are only queried on fields that index them
+    assert(trackPositions);
     pos = -1;
     while (posOrd < posOrdStart) {
       // need to skip some positions.
