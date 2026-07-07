@@ -313,7 +313,44 @@ public:
                               prohibitedSources, filterSuppliers, minShouldMatch, needsScores);
       }
 
+      // Bulk path for pure scored conjunctions (>= 2 mandatory clauses, nothing
+      // else).  Clauses are created in ascending cost order (the sparsest
+      // leads, as in assembleRequired); any two-phase member bails to the pull
+      // ConjunctionScorer, which owns the verifier machinery.
+      BulkScorer* conjunctionBulkScorer(MemPool& targetPool) {
+        struct Entry {
+          int64_t cost;
+          Query::ScorerSupplier* supplier;
+        };
+        boost::container::small_vector<Entry, 16> entries;
+        for (auto* source : mandatorySources) {
+          auto* supplier = source->scorerSupplier(targetPool, segment);
+          if (supplier == nullptr) {
+            return nullptr;  // a required clause cannot match this segment
+          }
+          entries.push_back({supplier->cost(), supplier});
+        }
+        int64_t leadCost = std::numeric_limits<int64_t>::max();
+        for (auto& e : entries) leadCost = std::min(leadCost, e.cost);
+        std::sort(entries.begin(), entries.end(),
+                  [](const Entry& a, const Entry& b) { return a.cost < b.cost; });
+        auto* arr = targetPool.make_arr<Query::Scorer*>(entries.size());
+        for (size_t i = 0; i < entries.size(); i++) {
+          auto* scorer = entries[i].supplier->get(targetPool, leadCost);
+          if (scorer == nullptr || scorer->hasTwoPhase()) {
+            return nullptr;
+          }
+          arr[i] = scorer;
+        }
+        return targetPool.make<BooleanQuery::ConjunctionBulkScorer>(
+            targetPool, std::span<Query::Scorer*>(arr, entries.size()), segment.maxDoc());
+      }
+
       BulkScorer* bulkScorer(MemPool& targetPool) override {
+        if (needsScores && optionalSources.empty() && prohibitedSources.empty()
+            && filterSuppliers.empty() && mandatorySources.size() >= 2) {
+          return conjunctionBulkScorer(targetPool);
+        }
         // Shape gate only - scoring is not required. Without scores the clause
         // scorers report score()=0 / getMaxScore()=+inf, the window split stays
         // at zero (every clause essential), and the window loop degenerates to
@@ -818,6 +855,172 @@ public:
       return skippedRangeCount;
     }
   }; // ConjuctionScorer
+
+  // Bulk execution for pure scored conjunctions (every clause required AND
+  // scoring, no two-phase members): windows anchor on the lead's current doc,
+  // whole windows are skipped when the summed clause bounds cannot reach the
+  // threshold (Lucene BlockMaxConjunctionBulkScorer shape), and surviving
+  // windows intersect the lead's decoded blocks against the other clauses in
+  // candidate batches - one tight pass per clause with early candidate
+  // abandonment, instead of a per-doc virtual leapfrog.
+  class ConjunctionBulkScorer final : public BulkScorer {
+    static constexpr int32_t kChunk = Postings::DOCS_BLOCK_SIZE;
+
+    std::span<Query::Scorer*> scorers;  // ascending cost; scorers[0] leads
+    std::span<float> windowMax;         // per-clause bound over the current window
+    std::span<double> suffixMax;        // suffixMax[c] = sum of windowMax[c..n)
+    std::span<int32_t> candDocs;
+    std::span<float> candScores;
+    std::span<int32_t> outDocs;
+    std::span<float> outScores;
+    int32_t maxDoc;
+    float minCompetitiveScore = std::numeric_limits<float>::lowest();
+    double scoreBoundFactor = 1.0;
+    int64_t skippedWindowCount = 0;
+
+  public:
+    ConjunctionBulkScorer(solux::MemPool& pool, std::span<Query::Scorer*> scorers, int32_t maxDoc)
+        : scorers(scorers),
+          windowMax(pool.make_arr<float>(scorers.size()), scorers.size()),
+          suffixMax(pool.make_arr<double>(scorers.size() + 1), scorers.size() + 1),
+          candDocs(pool.make_arr<int32_t>((size_t) kChunk), (size_t) kChunk),
+          candScores(pool.make_arr<float>((size_t) kChunk), (size_t) kChunk),
+          outDocs(pool.make_arr<int32_t>((size_t) DocsEnum::L1_DOCS), (size_t) DocsEnum::L1_DOCS),
+          outScores(pool.make_arr<float>((size_t) DocsEnum::L1_DOCS), (size_t) DocsEnum::L1_DOCS),
+          maxDoc(maxDoc) {
+      assert(scorers.size() >= 2);
+      // Float-summation error headroom for the double bounds (see the MaxScore
+      // scorers' scoreBoundFactor).
+      scoreBoundFactor = 1.0 + (double) scorers.size() * 0x1p-24;
+    }
+
+    int32_t scoreNextWindow(ScoreWindow& out, DocSet* filter, int32_t min, int32_t max,
+                            float minCompetitiveScore) override {
+      out.min = min;
+      out.max = min;
+      out.size = 0;
+      out.docs = outDocs;
+      out.scores = outScores;
+
+      max = std::min(max, maxDoc);
+      if (min >= max) {
+        return solux::PostingsReader::END;
+      }
+      if (minCompetitiveScore > this->minCompetitiveScore) {
+        this->minCompetitiveScore = minCompetitiveScore;
+      }
+
+      auto* lead = scorers[0];
+      int32_t leadDoc = lead->docId();
+      if (leadDoc < min) {
+        leadDoc = lead->advance(min);
+      }
+
+      for (;;) {
+        if (leadDoc == solux::PostingsReader::END) {
+          out.max = max;
+          return solux::PostingsReader::END;
+        }
+        if (leadDoc >= max) {
+          out.max = max;
+          return leadDoc;
+        }
+
+        // Window = [leadDoc, upTo], bounded by every clause's shallow block.
+        int32_t upTo = max - 1;
+        for (auto* scorer : scorers) {
+          upTo = std::min(upTo, scorer->advanceShallow(leadDoc));
+        }
+        if (upTo < leadDoc) {
+          upTo = leadDoc;
+        }
+        suffixMax[scorers.size()] = 0.0;
+        for (size_t c = scorers.size(); c-- > 0; ) {
+          windowMax[c] = scorers[c]->getMaxScore(upTo);
+          suffixMax[c] = suffixMax[c + 1] + (double) windowMax[c];
+        }
+        if (suffixMax[0] * scoreBoundFactor < (double) this->minCompetitiveScore) {
+          // Nothing in this window can compete: hop the lead without touching
+          // the other clauses or any scoring.
+          skippedWindowCount++;
+          if (upTo >= max - 1) {
+            out.max = max;
+            return upTo + 1;
+          }
+          leadDoc = lead->advance(upTo + 1);
+          continue;
+        }
+
+        // Produce this window: chunks of lead docs, one pass per other clause.
+        out.max = upTo + 1;
+        // Last lead doc fully decided (emitted or rejected).  Resume from this,
+        // not from lead->docId(): fill contracts differ on where the lead rests
+        // after a fill (TermQuery leaves it ON the last emitted doc; the base
+        // Scorer contract has already advanced PAST it), so a docId()-based
+        // resume can skip a doc at a buffer boundary.
+        int32_t lastDecided = -1;
+        for (;;) {
+          if (out.size + kChunk > (int32_t) outDocs.size()) {
+            // out is nearly full: end the window early; the next call resumes
+            // the rest of this window right after the last decided doc.
+            assert(lastDecided >= 0);
+            return lastDecided + 1;
+          }
+          int32_t n = lead->fillScoreBlock(candDocs.data(), candScores.data(), kChunk, upTo + 1);
+          if (n == 0) {
+            break;
+          }
+          lastDecided = candDocs[(size_t) n - 1];
+          if (filter != nullptr) {
+            int32_t w = 0;
+            for (int32_t i = 0; i < n; i++) {
+              if (filter->get(candDocs[(size_t) i])) {
+                candDocs[(size_t) w] = candDocs[(size_t) i];
+                candScores[(size_t) w] = candScores[(size_t) i];
+                w++;
+              }
+            }
+            n = w;
+          }
+          for (size_t c = 1; c < scorers.size() && n > 0; c++) {
+            auto* scorer = scorers[c];
+            const double remaining = suffixMax[c];  // clauses [c, end) add at most this
+            int32_t w = 0;
+            for (int32_t i = 0; i < n; i++) {
+              int32_t doc = candDocs[(size_t) i];
+              float sum = candScores[(size_t) i];
+              if (((double) sum + remaining) * scoreBoundFactor
+                  < (double) this->minCompetitiveScore) {
+                continue;  // cannot compete no matter what the rest contribute
+              }
+              if (scorer->docId() < doc) {
+                scorer->advance(doc);
+              }
+              if (scorer->docId() != doc) {
+                continue;  // not in the conjunction
+              }
+              candDocs[(size_t) w] = doc;
+              candScores[(size_t) w] = sum + scorer->score();
+              w++;
+            }
+            n = w;
+          }
+          for (int32_t i = 0; i < n; i++) {
+            if (candScores[(size_t) i] >= this->minCompetitiveScore) {
+              outDocs[(size_t) out.size] = candDocs[(size_t) i];
+              outScores[(size_t) out.size] = candScores[(size_t) i];
+              out.size++;
+            }
+          }
+        }
+        return upTo + 1;
+      }
+    }
+
+    int64_t skippedWindows() const {
+      return skippedWindowCount;
+    }
+  }; // ConjunctionBulkScorer
 
 
   class DisjunctionScorer final : public Query::Scorer {

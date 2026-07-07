@@ -1974,6 +1974,83 @@ TEST_F(TermScorerTest, blockMaxConjunctionTopKMatchesExhaustive) {
   }
 }
 
+// The bulk conjunction path must produce the same top-k as the pull
+// ConjunctionScorer (tie-group equivalent), and with pruning disabled
+// (exact-count mode pins the threshold at lowest) it must emit every match.
+TEST_F(TermScorerTest, conjunctionBulkScorerMatchesPull) {
+  const int32_t N = 14 * Postings::DOCS_BLOCK_SIZE + 23;
+  TestIndex testIndex;
+  TestField f(testIndex, "body_w");
+  f.startIndexing();
+  int32_t bothCount = 0;
+  for (int32_t doc = 0; doc < N; doc++) {
+    std::string text;
+    int32_t block = doc / Postings::DOCS_BLOCK_SIZE;
+    bool hasA = (doc % 2) == 0;
+    bool hasB = (doc % 3) != 1;
+    if (block == 0 || block == 8) {
+      int32_t tf = (block == 0 ? 6 : 5) - (doc % 3);
+      for (int32_t i = 0; i < tf; i++) {
+        if (hasA) text += "bca ";
+        if (hasB) text += "bcb ";
+      }
+      for (int32_t i = 0; i < 4 + (doc % 5); i++) text += "pad ";
+    } else {
+      if (hasA) text += "bca ";
+      if (hasB) text += "bcb ";
+      for (int32_t i = 0; i < 250 + (doc % 37); i++) text += "pad ";
+    }
+    if (hasA && hasB) bothCount++;
+    f.add(doc, text);
+  }
+  testIndex.flush();
+  f.startReading();
+
+  auto poolFree = testIndex.pool.rewindScopeGuard();
+  Query::Context qContext(testIndex.pool, *testIndex.reader);
+  auto& segment = qContext.topReader.segments()[0];
+  TermQuery a("body_w", "bca");
+  TermQuery b("body_w", "bcb");
+  std::vector<Query*> mand = {&a, &b};
+
+  for (int32_t k : {1, 5, 100}) {
+    BooleanQuery pullQ(mand, {}, {}, {});
+    BooleanQuery bulkQ(mand, {}, {}, {});
+    auto* pullWeight = pullQ.createWeight(qContext, Query::NEED_SCORES);
+    auto* bulkWeight = bulkQ.createWeight(qContext, Query::NEED_SCORES);
+
+    auto* pullScorer = pullWeight->createScorer(testIndex.pool, segment);
+    ASSERT_NE(pullScorer, nullptr);
+    TopDocsCollector pullCollector(k);
+    for (int32_t d = pullScorer->next(); d != PostingsReader::END; d = pullScorer->next()) {
+      pullCollector.collect(0, d, pullScorer->score());
+    }
+    ASSERT_EQ(pullCollector.totalHits(), bothCount);
+
+    auto* supplier = bulkWeight->scorerSupplier(testIndex.pool, segment);
+    ASSERT_NE(supplier, nullptr);
+    auto* bulk = supplier->bulkScorer(testIndex.pool);
+    ASSERT_NE(bulk, nullptr) << "pure scored conjunction should get the bulk path";
+    TopDocsCollector bulkCollector(k);
+    collectTopKWindowed(0, bulk, nullptr, bulkCollector, nullptr, segment.maxDoc());
+
+    auto expected = sortedCollectorDocs(pullCollector);
+    auto actual = sortedCollectorDocs(bulkCollector);
+    assertTopKEquivalent(expected, actual);
+  }
+
+  // Exhaustive mode (theta pinned): the bulk path must visit and emit every match.
+  BooleanQuery exactQ(mand, {}, {}, {});
+  auto* exactWeight = exactQ.createWeight(qContext, Query::NEED_SCORES);
+  auto* supplier = exactWeight->scorerSupplier(testIndex.pool, segment);
+  auto* bulk = supplier->bulkScorer(testIndex.pool);
+  ASSERT_NE(bulk, nullptr);
+  TopDocsCollector exactCollector(10);
+  collectTopKWindowed(0, bulk, nullptr, exactCollector, nullptr, segment.maxDoc(),
+                      /*allowPruning=*/false);
+  EXPECT_EQ(exactCollector.totalHits(), bothCount);
+}
+
 // "+a b" without scores: the optional clause is a pure score add under a
 // mandatory clause, so a non-scoring weight drops it - membership is
 // unchanged and the single-clause count() shortcut engages (Lucene's
