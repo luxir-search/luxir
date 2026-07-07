@@ -48,6 +48,21 @@ class HttpSession;
 using HttpSearchReqProto = solux::api::SearchRequest;
 using HttpUpdateReqProto = solux::api::UpdateRequest;
 
+// Pins the io_context on behalf of off-io-thread work (engine / task-arena
+// tasks).  The guard keeps run() from returning until the work completes (the
+// graceful-drain contract of HttpServer::shutdown()); the shared_ptr keeps the
+// context itself alive so the guard's executor copy - a non-owning view of the
+// context - can be destroyed on any thread, in any lambda-capture order, even
+// after shutdown() has joined the io threads.  `ioc` is declared first so it
+// outlives the guard's strand teardown.  Off-io holders must use this (via
+// HttpSession::makeIoPin), never a raw executor_work_guard.
+struct IoPin {
+  std::shared_ptr<net::io_context> ioc;
+  net::executor_work_guard<net::any_io_executor> guard;
+  IoPin(std::shared_ptr<net::io_context> ioc, net::any_io_executor ex)
+    : ioc(std::move(ioc)), guard(std::move(ex)) {}
+};
+
 struct HttpSearchRequestState {
   std::pmr::monotonic_buffer_resource resource;
   HttpSearchReqProto proto;  // non-owning; backed by `resource`
@@ -158,7 +173,7 @@ struct HttpStreamUpdateState {
   std::map<std::string, HttpStreamWriterTarget> writerCache;
   std::unique_ptr<HttpStreamBatchState> batch;
   std::optional<HttpStreamControl> pendingControl;
-  std::shared_ptr<net::executor_work_guard<net::any_io_executor>> workGuard;
+  std::shared_ptr<IoPin> ioPin;
   HttpStreamInterval interval;
   std::size_t docsSeen = 0;
   std::size_t docsIndexedSoFar = 0;
@@ -185,13 +200,13 @@ struct HttpStreamUpdateState {
 // One SearchRequest per HTTP query.  Engine workers call reply() from a task
 // arena thread; it renders one NDJSON line and hands it to the session strand.
 // Holds a shared_ptr to the session so the connection outlives in-flight work,
-// and a work guard so the io_context does not finish draining until this request
-// completes (used by graceful shutdown).
+// and an IoPin so shutdown drains this request and the io_context survives the
+// request's teardown here on the task-arena thread.
 class HttpSearchRequest : public SearchRequest {
 public:
   std::unique_ptr<HttpSearchRequestState> requestState;
   std::shared_ptr<HttpSession> session;
-  std::optional<net::executor_work_guard<net::any_io_executor>> workGuard;
+  std::shared_ptr<IoPin> ioPin;
 
   HttpSearchRequest(SearchEngine& engine, std::unique_ptr<HttpSearchRequestState> requestState,
                     std::shared_ptr<HttpSession> s, google::protobuf::Arena& arena)
@@ -200,8 +215,8 @@ public:
       session(std::move(s)) {}
 
   int reply(SearchResponse& response) override;  // defined after HttpSession
-  // done() is inherited: releaseArena(&arena) frees this request (and its work
-  // guard).  reply() calls it eagerly once the final line is enqueued - the line
+  // done() is inherited: releaseArena(&arena) frees this request (and its
+  // IoPin).  reply() calls it eagerly once the final line is enqueued - the line
   // owns its bytes, so cleanup does not wait for the write to complete.
 };
 
@@ -210,8 +225,9 @@ public:
 // thread producers reach it through enqueueLine.
 class HttpSession : public std::enable_shared_from_this<HttpSession> {
 public:
-  HttpSession(tcp::socket&& sock, SoluxNode& node, std::shared_ptr<HttpSessionRegistry> registry)
-    : stream_(std::move(sock)), node_(node), registry_(std::move(registry)) {}
+  HttpSession(std::shared_ptr<net::io_context> ioc, tcp::socket&& sock, SoluxNode& node,
+              std::shared_ptr<HttpSessionRegistry> registry)
+    : ioc_(std::move(ioc)), stream_(std::move(sock)), node_(node), registry_(std::move(registry)) {}
 
   ~HttpSession() { if (deregister_) deregister_(); }
 
@@ -239,9 +255,21 @@ public:
         });
   }
 
+  // Every off-io-thread holder of this session's executor must pin the context
+  // through this helper, never via a raw executor_work_guard: IoPin's member
+  // order guarantees the io_context outlives the guard's teardown wherever the
+  // last reference drops.
+  std::shared_ptr<IoPin> makeIoPin() {
+    return std::make_shared<IoPin>(ioc_, stream_.get_executor());
+  }
+
 private:
   struct Pending { std::string line; bool last; };
 
+  // Co-owns the io_context: the last session ref can drop on a task-arena thread
+  // after shutdown() has joined, and ~stream_ releases its strand through the
+  // context.  Declared first so it is destroyed last.
+  std::shared_ptr<net::io_context> ioc_;
   beast::tcp_stream stream_;
   SoluxNode& node_;
   std::shared_ptr<HttpSessionRegistry> registry_;
@@ -547,8 +575,9 @@ private:
     auto& engine = node_.getSearchEngine();
     auto* sreq = solux::arenaCreate<HttpSearchRequest>(
         *arena, engine, std::move(requestState), shared_from_this(), *arena);
-    // Keep the io_context busy until this query finishes so shutdown drains it.
-    sreq->workGuard.emplace(stream_.get_executor());
+    // Pin the io_context: shutdown drains until this query finishes, and the
+    // context survives the request's teardown on the task-arena thread.
+    sreq->ioPin = makeIoPin();
 
     // Dispatch the synchronous engine.submit() off the strand so the io thread
     // is not blocked for the query's duration.  reply() posts results back here.
@@ -569,9 +598,8 @@ private:
       return;
     }
 
-    auto workGuard = std::make_shared<net::executor_work_guard<net::any_io_executor>>(
-        stream_.get_executor());
-    node_.getTaskArena().enqueue([self = shared_from_this(), state, workGuard] {
+    auto ioPin = makeIoPin();
+    node_.getTaskArena().enqueue([self = shared_from_this(), state, ioPin] {
       http::status status = http::status::ok;
       std::string out;
       try {
@@ -608,7 +636,7 @@ private:
       }
 
       net::post(self->stream_.get_executor(),
-          [self, workGuard, status, body = std::move(out)]() mutable {
+          [self, ioPin, status, body = std::move(out)]() mutable {
             self->respondSimple(status, "application/json", std::move(body));
           });
     });
@@ -741,8 +769,7 @@ private:
     state->defaultCollectionName = std::move(coll);
     state->group.collectionName = state->defaultCollectionName;
     state->urlCommit = urlCommit;
-    state->workGuard = std::make_shared<net::executor_work_guard<net::any_io_executor>>(
-        stream_.get_executor());
+    state->ioPin = makeIoPin();
 
     streamUpdate_ = std::move(state);
     doStreamBodyRead();
@@ -979,9 +1006,9 @@ private:
     state->updateInFlight = true;
 
     auto iw = target->indexWriter;
-    auto workGuard = state->workGuard;
+    auto ioPin = state->ioPin;
     node_.getTaskArena().enqueue(
-        [self = shared_from_this(), state, batch, iw, workGuard] {
+        [self = shared_from_this(), state, batch, iw, ioPin] {
           HttpStreamBatchResult result;
           result.docCount = batch->docCount;
           result.deleteCount = batch->deleteCount;
@@ -1021,7 +1048,7 @@ private:
           }
 
           net::post(self->stream_.get_executor(),
-              [self, state, batch, workGuard, result = std::move(result)]() mutable {
+              [self, state, batch, ioPin, result = std::move(result)]() mutable {
                 self->onStreamBatchDone(state, batch, std::move(result));
               });
         });
@@ -1338,9 +1365,9 @@ private:
     state->urlCommit = false;
     state->urlCommitInFlight = true;
 
-    auto workGuard = state->workGuard;
+    auto ioPin = state->ioPin;
     node_.getTaskArena().enqueue(
-        [self = shared_from_this(), state, writers = std::move(writers), workGuard] {
+        [self = shared_from_this(), state, writers = std::move(writers), ioPin] {
           std::string err;
           try {
             for (const auto& [name, writer] : writers) {
@@ -1354,7 +1381,7 @@ private:
           }
 
           net::post(self->stream_.get_executor(),
-              [self, state, workGuard, err = std::move(err)]() mutable {
+              [self, state, ioPin, err = std::move(err)]() mutable {
                 if (self->streamUpdate_ != state || state->failed) return;
                 state->urlCommitInFlight = false;
                 if (!err.empty()) {
@@ -1546,7 +1573,8 @@ int HttpSearchRequest::reply(SearchResponse& response) {
 }
 
 HttpServer::HttpServer(SoluxNode& node, int threads, int port)
-  : node(node), nthreads(threads), requestedPort(port) {}
+  : node(node), nthreads(threads), requestedPort(port),
+    ioc(std::make_shared<net::io_context>()) {}
 
 HttpServer::~HttpServer() { shutdown(); }
 
@@ -1559,11 +1587,11 @@ void HttpServer::start() {
   tcp::endpoint ep(net::ip::make_address(host), (unsigned short)requestedPort);
 
   registry = std::make_shared<HttpSessionRegistry>();
-  workGuard.emplace(ioc.get_executor());
+  workGuard.emplace(ioc->get_executor());
 
   // The acceptor runs on its own strand so its operations (async_accept in the
   // accept loop, and close() during shutdown) are serialized on one executor.
-  acceptor.emplace(net::make_strand(ioc));
+  acceptor.emplace(net::make_strand(*ioc));
   acceptor->open(ep.protocol());
   acceptor->set_option(net::socket_base::reuse_address(true));
   acceptor->bind(ep);
@@ -1573,17 +1601,17 @@ void HttpServer::start() {
   doAccept();
 
   threads.reserve(n);
-  for (int i = 0; i < n; i++) threads.emplace_back([this] { ioc.run(); });
+  for (int i = 0; i < n; i++) threads.emplace_back([this] { ioc->run(); });
   started = true;
   LOG_INFO("HTTP server listening on {}:{}", host, port_);
 }
 
 void HttpServer::doAccept() {
-  acceptor->async_accept(net::make_strand(ioc),
+  acceptor->async_accept(net::make_strand(*ioc),
       [this](beast::error_code ec, tcp::socket sock) {
         if (ec == net::error::operation_aborted) return;  // shutting down
         if (!ec) {
-          std::make_shared<HttpSession>(std::move(sock), node, registry)->run();
+          std::make_shared<HttpSession>(ioc, std::move(sock), node, registry)->run();
         }
         if (acceptor && acceptor->is_open()) doAccept();
       });
@@ -1625,6 +1653,10 @@ void HttpServer::shutdown() {
   live.clear();
 
   // 4) Release the keep-alive guard and let run() return once work drains.
+  //    This must stay a drain - never ioc->stop().  stop() would leave uninvoked
+  //    handlers owned by the context; those handlers hold session refs and each
+  //    session co-owns the context, so stopping would create a retention cycle
+  //    instead of a clean teardown.
   workGuard.reset();
   for (auto& t : threads) if (t.joinable()) t.join();
   threads.clear();

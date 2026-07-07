@@ -28,7 +28,8 @@ public:
   // valid after this returns.  Throws on bind failure.
   void start();
 
-  // Stop accepting, stop the io_context, and join workers.  Idempotent.
+  // Stop accepting, drain in-flight work, and join workers.  Idempotent.
+  // Drains rather than stopping the io_context (see the comment in the impl).
   void shutdown();
 
   int getPort() const { return port_; }
@@ -44,11 +45,15 @@ private:
   int port_ = 0;
   bool started = false;
 
-  boost::asio::io_context ioc;
+  // Shared: sessions and off-io work pins co-own the context so their teardown
+  // (strand release through the context's allocator) is safe from any thread,
+  // even after shutdown() has joined the io threads.  The context may therefore
+  // briefly outlive this object.  See IoPin in HttpServer.cpp.
+  std::shared_ptr<boost::asio::io_context> ioc;
   std::optional<boost::asio::ip::tcp::acceptor> acceptor;
   std::vector<std::thread> threads;
   std::shared_ptr<HttpSessionRegistry> registry;
-  // Keeps the io_context alive while idle; reset during shutdown so run() returns
+  // Keeps run() from returning while idle; reset during shutdown so run() returns
   // once in-flight work has drained.
   std::optional<boost::asio::executor_work_guard<boost::asio::io_context::executor_type>> workGuard;
 
