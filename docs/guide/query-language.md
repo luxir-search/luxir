@@ -157,6 +157,10 @@ year_i:*             documents with any value in the field
 
 `field:*` works on every field type.
 
+Prefix and fuzzy text is folded the way the field folds - `title_wl:Runn*`
+finds what "Runner" indexed - but never split into words. On unanalyzed
+string fields the text is used exactly as written.
+
 ## Functions
 
 Every query type can be written as a function call. The function name is

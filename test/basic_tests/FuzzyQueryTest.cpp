@@ -422,6 +422,17 @@ TEST_F(FuzzyQueryE2ETest, autoFuzziness) {
   EXPECT_EQ(fuzzyIds("body_w", "apple"), (S{"d1", "d2", "d3"}));
 }
 
+TEST_F(FuzzyQueryE2ETest, textTermIsNormalized) {
+  using S = std::vector<std::string>;
+  // multiterm input folds the way the field folds; AUTO edits come from the
+  // normalized bytes
+  helper.index(flatdoc("id", "d5", "title_wl", "Blade Runner"), UpdateMessage::COMMIT);
+  EXPECT_EQ(fuzzyIds("title_wl", "Blabe", 1), (S{"d5"}));
+  EXPECT_EQ(fuzzyIds("title_wl", "RUNNER", 0), (S{"d5"}));  // fold, then exact
+  // STRING fields are unanalyzed: the term stays verbatim
+  EXPECT_TRUE(fuzzyIds("color_s", "RED", 1).empty());
+}
+
 TEST_F(FuzzyQueryE2ETest, stringFieldWithPrefix) {
   using S = std::vector<std::string>;
   // STRING field, exact term storage: "red"/"reddish"/"read".

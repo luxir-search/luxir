@@ -79,6 +79,17 @@ public:
   virtual void reset() {}
 
   virtual bool incrementToken() = 0;
+
+  // Normalize a single term's bytes IN PLACE the way this stage transforms
+  // token text, without segmentation (the Lucene Analyzer::normalize
+  // lineage): case/character folds apply, word-boundary decisions do not.
+  // For multiterm query input - prefix and fuzzy terms (and term-range
+  // endpoints when those land) never go through tokenization, but must still
+  // fold the way indexed terms were folded or a capitalized prefix silently
+  // matches nothing.  Default identity; rewriting filters (and tokenizers
+  // with a fused fold) override.  See TokenFilter::normalizeTerm for
+  // forwarding.  Cold path: per-call std::string allocation is fine.
+  virtual void normalizeTerm(std::string& term) { unused(term); }
 };
 
 class Tokenizer : public TokenStream {
@@ -116,6 +127,11 @@ public:
   // only invoked when the chain actually contains a stateful filter (see
   // TokenChain::reset); the common stateless chain skips it entirely.
   void reset() override { tokSource->reset(); }
+
+  // Forward normalizeTerm source-ward so every stage sees the term in chain
+  // order. A rewriting filter overrides, calls this first, then applies its
+  // own fold.
+  void normalizeTerm(std::string& term) override { tokSource->normalizeTerm(term); }
 };
 
 // Splits the source on ASCII whitespace, viewing the source bytes directly (no
@@ -249,6 +265,13 @@ public:
     token.text = std::string_view(buf.data(), buf.size());
     return true;
   }
+
+  void normalizeTerm(std::string& term) override {
+    TokenFilter::normalizeTerm(term);
+    for (char& c : term) {
+      if (c >= 'A' && c <= 'Z') c = (char) (c + ('a' - 'A'));
+    }
+  }
 };
 
 // UAX#29 word-boundary tokenizer and NFKC_CF (toNFKC_Casefold) fold filter, built
@@ -302,6 +325,10 @@ public:
   void reset() {
     if (stateful) tail->reset();
   }
+
+  // Normalize a single term the way this chain folds token text, without
+  // segmentation - the multiterm entry point (see TokenStream::normalizeTerm).
+  void normalizeTerm(std::string& term) { tail->normalizeTerm(term); }
 };
 
 

@@ -116,6 +116,19 @@ TEST_F(ExprQueryTest, decorations) {
   EXPECT_EQ(3u, docs.size());
 }
 
+TEST_F(ExprQueryTest, multitermDecorationsAreNormalized) {
+  // prefix/fuzzy text folds the way the field folds - Runn* finds "runner"
+  auto docs = search("title_wl:Runn*");
+  EXPECT_EQ(2u, docs.size());  // runner, running
+
+  docs = search("title_wl:Blabe~1");
+  ASSERT_EQ(1u, docs.size());
+  EXPECT_TRUE(hasId(docs, "d1"));
+
+  docs = search("tag_s:SCIFI*");  // STRING stays verbatim
+  EXPECT_EQ(0u, docs.size());
+}
+
 TEST_F(ExprQueryTest, fieldGroupDistribution) {
   auto docs = search("title_wl:(blade OR running)");
   EXPECT_EQ(2u, docs.size());

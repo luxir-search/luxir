@@ -199,6 +199,17 @@ TEST_F(PrefixQueryE2ETest, asBooleanFilter) {
   EXPECT_EQ(ids, (std::vector<std::string>{"d1", "d4"}));
 }
 
+TEST_F(PrefixQueryE2ETest, textPrefixIsNormalized) {
+  // multiterm input folds the way the field folds (never tokenized), so a
+  // capitalized prefix finds lowercased indexed terms
+  helper.index(flatdoc("id", "d5", "title_wl", "Blade Runner"), UpdateMessage::COMMIT);
+  EXPECT_EQ(prefixCount("title_wl", "Runn"), 1);
+  EXPECT_EQ(prefixCount("title_wl", "runn"), 1);
+  EXPECT_EQ(prefixCount("title_wl", "BLADE"), 1);
+  // STRING fields are unanalyzed: the prefix stays verbatim
+  EXPECT_EQ(prefixCount("color_s", "RED"), 0);
+}
+
 TEST_F(PrefixQueryE2ETest, stringField) {
   EXPECT_EQ(prefixCount("color_s", "re"), 3);    // red (d1, d4), reddish (d2)
   EXPECT_EQ(prefixCount("color_s", "red"), 3);   // "red" still matches "reddish"

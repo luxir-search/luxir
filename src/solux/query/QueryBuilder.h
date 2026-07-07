@@ -99,12 +99,30 @@ public:
     return pool.make<MatchNoDocsQuery>();
   }
 
-  // Build a prefix query over term-backed fields. The prefix is not analyzed,
-  // and the field and prefix views must outlive the returned query.
+  // Normalize multiterm query input (a prefix or fuzzy term) for a TEXT
+  // field: the field's normalization chain applies - case/character folds,
+  // never segmentation - so THOM* finds what "Thomas" indexed (the classic
+  // multiterm trap; Lucene's Analyzer::normalize).  Returns a view that
+  // outlives the query tree (the input, or a pool copy when folding rewrote
+  // it).  STRING/ID input stays verbatim - callers skip this for them.
+  std::string_view normalizeMultiterm(TextFieldType& fieldType, std::string_view field,
+                                      std::string_view text) {
+    auto chain = fieldType.createAnalyzer(field);
+    std::string norm(text);
+    chain->normalizeTerm(norm);
+    if (norm == text) return text;
+    return copyTerm(norm);
+  }
+
+  // Build a prefix query over term-backed fields. The prefix is normalized
+  // (not tokenized) for analyzed TEXT fields and used verbatim for STRING/ID;
+  // the field and prefix views must outlive the returned query.
   Query* createPrefixQuery(std::string_view field, std::string_view prefix) {
     FieldType& fieldType = *schema.getFieldTypeEx(field);
     switch (fieldType.type()) {
       case FieldType::Type::TEXT:
+        prefix = normalizeMultiterm((TextFieldType&)fieldType, field, prefix);
+        [[fallthrough]];
       case FieldType::Type::ID:
       case FieldType::Type::STRING:
         // Indexed terms carry at most PackedTerm::MAX_LEN bytes; a longer
@@ -122,7 +140,9 @@ public:
     return 2;
   }
 
-  // Build a fuzzy query over term-backed fields. The term is not analyzed.
+  // Build a fuzzy query over term-backed fields. The term is normalized (not
+  // tokenized) for analyzed TEXT fields - AUTO edits are computed from the
+  // normalized bytes - and used verbatim for STRING/ID.
   // Defaults: maxEdits = AUTO, prefixLength = 1, maxExpansions = 0 (complete).
   Query* createFuzzyQuery(std::string_view field, std::string_view term,
                           std::optional<int> maxEdits = std::nullopt,
@@ -131,6 +151,8 @@ public:
     FieldType& fieldType = *schema.getFieldTypeEx(field);
     switch (fieldType.type()) {
       case FieldType::Type::TEXT:
+        term = normalizeMultiterm((TextFieldType&)fieldType, field, term);
+        break;
       case FieldType::Type::ID:
       case FieldType::Type::STRING:
         break;

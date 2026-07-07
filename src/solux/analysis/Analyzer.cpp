@@ -182,6 +182,14 @@ public:
     view.reset();
   }
 
+  // The fused nfkc_cf half applies to a bare term; the segmentation half does
+  // not (see TokenStream::normalizeTerm).
+  void normalizeTerm(std::string& term) override {
+    std::string scratch;
+    std::string_view folded = applyNfkcCf(term, scratch);
+    if (folded.data() != term.data()) term.assign(folded);
+  }
+
   bool incrementToken() override {
     token.clear();
     for (;;) {
@@ -288,6 +296,13 @@ public:
     token.text = applyNfkcCf(token.text, buf);
     return true;
   }
+
+  void normalizeTerm(std::string& term) override {
+    TokenFilter::normalizeTerm(term);
+    std::string scratch;
+    std::string_view folded = applyNfkcCf(term, scratch);
+    if (folded.data() != term.data()) term.assign(folded);
+  }
 };
 
 // Accent/diacritic folding: strips combining marks so an accented letter matches
@@ -314,6 +329,16 @@ public:
       token.text = buf;
     }
     return true;
+  }
+
+  void normalizeTerm(std::string& term) override {
+    TokenFilter::normalizeTerm(term);
+    for (unsigned char c : term) {
+      if (c & 0x80) {
+        term = una::norm::to_unaccent_utf8(term);
+        return;
+      }
+    }
   }
 };
 
