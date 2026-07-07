@@ -326,7 +326,7 @@ public:
       // threshold, match semantics are unchanged.
       if (minCompetitiveScore > 0.0f && simScorer != nullptr && !disableDocBoundForTests) {
         int32_t maxFreq = docsEnums[0]->termFreq();
-        for (size_t j = 1; j < docsEnums.size(); j++) {
+        for (size_t j = 1; j < docsEnums.size() && maxFreq > 1; j++) {
           maxFreq = std::min(maxFreq, docsEnums[j]->termFreq());
         }
         if (simScorer->score((float) maxFreq, lookupNorm(docid)) < minCompetitiveScore) {
