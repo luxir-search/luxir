@@ -66,8 +66,9 @@ public:
     for (int i = 0; i < nproh; i++) prohibited.push_back(genClause(mr, depth));
     for (int i = 0; i < nfilter; i++) filter.push_back(genClause(mr, depth));
     int minMatch = 0;
-    // min_match is only valid for optional-only clauses (no required/filter).
-    if (nopt > 0 && nreq == 0 && nfilter == 0) {
+    // min_match composes with required/filter clauses (the optional group
+    // becomes a constraint); it just needs optional clauses to apply to.
+    if (nopt > 0) {
       minMatch = (int)rng.rint(nopt + 1);  // 0..nopt
     }
     return qb::boolean(mr, required, optional, prohibited, filter, minMatch);
@@ -166,28 +167,27 @@ public:
     }
     bool hasPositive = b.required.size() > 0 || b.optional.size() > 0 || b.filter.size() > 0;
     if (!hasPositive) return false;
-    // Optional must match unless there is a mandatory (required) clause, which
-    // makes the optional side scoring-only (MandOpt). A filter does NOT relax
-    // that - filter + optional conjoins them, so the optional is still required.
-    if (!b.optional.empty() && b.required.empty()) {
+    // The optional group constrains when min_match >= 1, or when nothing else
+    // (required/filter) carries the match; otherwise optionals only rank.
+    bool constrains = b.min_match >= 1 || (b.required.empty() && b.filter.empty());
+    if (!b.optional.empty() && constrains) {
       int matched = 0;
       for (const auto& o : b.optional) {
         if (clauseMatches(o, toks)) matched++;
       }
-      int mm = b.min_match;
-      int eff = mm >= 1 ? std::min(mm, (int)b.optional.size()) : 1;  // unset/0 -> any (>=1)
+      int eff = std::max(1, std::min(b.min_match, (int)b.optional.size()));
       if (matched < eff) return false;
     }
     return true;
   }
 };
 
-TEST_F(BooleanFuzzTest, filterRequiresOptionalToMatch) {
+TEST_F(BooleanFuzzTest, optionalRanksUnlessMinMatchConstrains) {
   helper.clear();
   helper.index(flatdoc("id", "x1", "body_w", "f a"), UpdateMessage::NO_COMMIT);  // f + a
   helper.index(flatdoc("id", "x2", "body_w", "f"), UpdateMessage::COMMIT);        // f, no a; z nowhere
 
-  auto run = [&](const char* filterTerm, const char* optTerm) {
+  auto run = [&](const char* filterTerm, const char* optTerm, int minMatch) {
     auto req = localReq(helper.getSearchEngine());
     req->collection("main");
     auto& cur = req->topDocs("q");
@@ -196,17 +196,46 @@ TEST_F(BooleanFuzzTest, filterRequiresOptionalToMatch) {
         /*required=*/{},
         /*optional=*/{qb::match(cur.mr(), "body_w", optTerm)},
         /*prohibited=*/{},
-        /*filter=*/{qb::match(cur.mr(), "body_w", filterTerm)});
+        /*filter=*/{qb::match(cur.mr(), "body_w", filterTerm)}, minMatch);
     req->execute();
     std::set<std::string> got;
     for (const auto& d : req->getDocs()) got.insert(std::get<std::string>(*find(d, "id")));
     return got;
   };
 
-  // No mandatory clause, so the optional is required (conjoined with the filter).
-  EXPECT_EQ((std::set<std::string>{"x1"}), run("f", "a"));  // x2 has f but not a
-  // Optional term absent everywhere -> filter must NOT match on its own.
-  EXPECT_EQ((std::set<std::string>{}), run("f", "z"));
+  // min_match unset: the filter carries the match and the optional only ranks
+  // (Lucene bool semantics) - even when the optional term is absent everywhere.
+  EXPECT_EQ((std::set<std::string>{"x1", "x2"}), run("f", "a", 0));
+  EXPECT_EQ((std::set<std::string>{"x1", "x2"}), run("f", "z", 0));
+  // min_match=1 makes the optional group a real constraint.
+  EXPECT_EQ((std::set<std::string>{"x1"}), run("f", "a", 1));
+  EXPECT_EQ((std::set<std::string>{}), run("f", "z", 1));
+}
+
+TEST_F(BooleanFuzzTest, minMatchComposesWithRequired) {
+  helper.clear();
+  helper.index(flatdoc("id", "y1", "body_w", "r a b"), UpdateMessage::NO_COMMIT);  // r + both opts
+  helper.index(flatdoc("id", "y2", "body_w", "r a"), UpdateMessage::NO_COMMIT);    // r + one opt
+  helper.index(flatdoc("id", "y3", "body_w", "r"), UpdateMessage::COMMIT);          // r only
+
+  auto run = [&](int minMatch) {
+    auto req = localReq(helper.getSearchEngine());
+    req->collection("main");
+    auto& cur = req->topDocs("q");
+    cur.limit(100).fields({"id"});
+    cur.rawQuery() = qb::boolean(cur.mr(),
+        /*required=*/{qb::match(cur.mr(), "body_w", "r")},
+        /*optional=*/{qb::match(cur.mr(), "body_w", "a"), qb::match(cur.mr(), "body_w", "b")},
+        /*prohibited=*/{}, /*filter=*/{}, minMatch);
+    req->execute();
+    std::set<std::string> got;
+    for (const auto& d : req->getDocs()) got.insert(std::get<std::string>(*find(d, "id")));
+    return got;
+  };
+
+  EXPECT_EQ((std::set<std::string>{"y1", "y2", "y3"}), run(0));  // optionals rank only
+  EXPECT_EQ((std::set<std::string>{"y1", "y2"}), run(1));
+  EXPECT_EQ((std::set<std::string>{"y1"}), run(2));
 }
 
 TEST_F(BooleanFuzzTest, twoTermConjunctionAcrossSegments) {

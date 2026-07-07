@@ -231,11 +231,8 @@ public:
       throw std::runtime_error(std::format("BooleanQuery min_match must not be negative (got {})", minMatch));
     }
     if (minMatch >= 1) {
-      // The min-should-match scorer only constrains the optional group; its
-      // interaction with required/filter clauses is not wired yet.
-      if (booleanQuery.optional.empty() || !booleanQuery.required.empty() || !booleanQuery.filter.empty()) {
-        throw std::runtime_error(
-          "BooleanQuery min_match is only supported for optional-only boolean queries (no required/filter)");
+      if (booleanQuery.optional.empty()) {
+        throw std::runtime_error("BooleanQuery min_match needs optional clauses to apply to");
       }
       // Asking for more matches than there are clauses just means "all of them".
       if (minMatch > (int)booleanQuery.optional.size()) {

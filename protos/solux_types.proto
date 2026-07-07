@@ -245,7 +245,13 @@ message BooleanQuery {
   repeated Query required = 2;     // required clauses that do add to the score
   repeated Query optional = 3;     // optional clauses that add to the score
   repeated Query prohibited = 4;   // prohibited clauses that must not match
-  int32 min_match = 5;             // minimum number of optional clauses that must match
+
+  // Minimum number of optional clauses that must match.  Unset (0): with any
+  // required or filter clause present, optional clauses only rank coincident
+  // matches; with only optional clauses, at least one must match.  Setting
+  // min_match >= 1 makes the optional group a real constraint alongside
+  // required/filter clauses; values above the clause count mean all of them.
+  int32 min_match = 5;
 }
 
 // Matches documents where `field` has a term starting with `prefix`.

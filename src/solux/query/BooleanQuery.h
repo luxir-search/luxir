@@ -16,9 +16,11 @@ class BooleanQuery final : public solux::Query {
   std::span<Query*> optional;
   std::span<Query*> prohibited;
   std::span<Query*> filter;
-  // Minimum number of `optional` clauses a doc must match. 0 (or 1) is the
-  // plain disjunction (any optional). > 1 selects the min-should-match scorer.
-  // Only supported for optional-only queries (no mandatory/filter) for now.
+  // Minimum number of `optional` clauses a doc must match.  Unset (0): with
+  // any mandatory or filter clause present the optional side only ranks
+  // coincident matches; with only optional clauses at least one must match.
+  // >= 1 makes the optional group a real constraint alongside
+  // mandatory/filter clauses (> 1 selects the min-should-match scorer).
   int minShouldMatch;
 
 public:
@@ -141,11 +143,14 @@ public:
       Required req = assembleRequired(targetPool, segment, mandatorySources, filterSuppliers);
       if (req.unsatisfiable) return nullptr;
       Query::Scorer* reqScorer = req.scorer;
-      // Whether a scoring-required (mandatory) clause exists decides how optionals
-      // combine: with a mandatory clause they are a pure score add (ReqOpt); with
-      // only filters they must match (conjunction). This mirrors the prior
-      // mandScorer-vs-filter discriminator.
       bool hasMandatory = !mandatorySources.empty();
+      // Whether the optional group CONSTRAINS matching (Lucene bool
+      // semantics): min_match >= 1 makes it a real constraint; otherwise
+      // optionals only rank, provided a required or filter clause already
+      // carries the match (reqScorer non-null iff such clauses exist).  With
+      // nothing else, at least one optional must match - the classic
+      // should-only boolean.
+      bool optionalsConstrain = minShouldMatch >= 1 || reqScorer == nullptr;
 
       // For min-should-match (> 1) order the optional scorers by cost so the
       // pigeonhole lead/tail split leads with the cheapest (sparsest) iterators.
@@ -190,23 +195,27 @@ public:
         boolScorer = optScorer;
       } else if (optScorer == nullptr) {
         // reqScorer present, but no optional scorer survived this segment (the
-        // optional terms are absent, or fewer survive than minShouldMatch). With
-        // no mandatory clause the optionals are required (conjoined with the
-        // filters), so that is no match here - returning reqScorer would wrongly
-        // emit filter-only docs. With no optional clauses at all, the filters
-        // stand alone, which is correct.
-        if (!hasMandatory && !optionalSources.empty()) return nullptr;
+        // optional terms are absent, or fewer survive than minShouldMatch).  A
+        // constraining optional group means no match here - returning
+        // reqScorer would wrongly emit filter/required-only docs.  A rank-only
+        // group is simply absent.
+        if (optionalsConstrain && !optionalSources.empty()) return nullptr;
         boolScorer = reqScorer;
-      } else if (hasMandatory) {
+      } else if (!optionalsConstrain) {
+        // min_match unset with required/filter clauses: optionals rank
+        // coincident matches but never decide them.
         boolScorer = targetPool.make<BooleanQuery::MandOptScorer>(targetPool, reqScorer, optScorer);
       } else {
-        // Filters + optionals, no mandatory: the optional side must match, so
-        // conjoin it with the required filters; only the optional side scores.
+        // min_match >= 1 alongside required/filter clauses: the optional
+        // group is a constraint, conjoined with the required side.  Scoring
+        // clauses on both sides contribute (filters score nothing).
         std::span<Query::Scorer*> allSpan(targetPool.make_arr<Query::Scorer*>(2), 2);
         allSpan[0] = reqScorer;
         allSpan[1] = optScorer;
-        std::span<Query::Scorer*> scoringSpan(targetPool.make_arr<Query::Scorer*>(1), 1);
-        scoringSpan[0] = optScorer;
+        size_t nscoring = hasMandatory ? 2 : 1;
+        std::span<Query::Scorer*> scoringSpan(targetPool.make_arr<Query::Scorer*>(nscoring), nscoring);
+        scoringSpan[nscoring - 1] = optScorer;
+        if (hasMandatory) scoringSpan[0] = reqScorer;
         boolScorer = targetPool.make<BooleanQuery::ConjunctionScorer>(targetPool, allSpan, scoringSpan);
       }
 
@@ -269,10 +278,10 @@ public:
           if (supplier == nullptr) return 0;
           minReq = std::min(minReq, supplier->cost());
         }
-        // A mandatory clause makes the optional side score-only (MandOpt), so it
-        // doesn't constrain. With only filters, the optional side is conjoined
-        // (it must match) and can tighten the estimate.
-        if (!hasMandatory && !optionalSources.empty()) {
+        // A rank-only optional group (min_match unset) never decides a match,
+        // so it cannot tighten the estimate; a constraining group
+        // (min_match >= 1) is conjoined and can.
+        if (minShouldMatch >= 1 && !optionalSources.empty()) {
           return std::min(minReq, optionalCost(targetPool, segment, optionalSources, minShouldMatch, maxDoc));
         }
         return minReq;

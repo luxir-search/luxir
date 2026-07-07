@@ -59,9 +59,10 @@ public:
     return pool.make<BooleanQuery>(mandatory, optional, none, none, minShouldMatch);
   }
 
-  BooleanQuery* filterBoolq(std::span<Query*> filter, std::span<Query*> optional) {
+  BooleanQuery* filterBoolq(std::span<Query*> filter, std::span<Query*> optional,
+                            int minShouldMatch = 0) {
     std::span<Query*> none{};
-    return pool.make<BooleanQuery>(none, optional, none, filter, 0);
+    return pool.make<BooleanQuery>(none, optional, none, filter, minShouldMatch);
   }
 
   // Build a weight with the given input flags and inspect its computed traits.
@@ -109,10 +110,13 @@ TEST_F(ScorerCostTest, nestedBooleanCompositeCost) {
   EXPECT_EQ(4, cost(boolq(clauses({term("a"), inner}), {})));
 }
 
-TEST_F(ScorerCostTest, filterPlusOptionalCapsByOptional) {
-  // No mandatory: filter and optional are conjoined, so the rare optional caps
-  // the estimate. filter a(6) AND optional c(1) -> 1, not the filter's 6.
-  EXPECT_EQ(1, cost(filterBoolq(clauses({term("a")}), clauses({term("c")}))));
+TEST_F(ScorerCostTest, filterPlusOptionalCost) {
+  // min_match unset: the optional only ranks, so it cannot tighten the
+  // estimate - the filter's own cost stands. filter a(6) + optional c(1) -> 6.
+  EXPECT_EQ(6, cost(filterBoolq(clauses({term("a")}), clauses({term("c")}))));
+  // min_match=1 makes the optional group a constraint; the rare optional caps
+  // the estimate again.
+  EXPECT_EQ(1, cost(filterBoolq(clauses({term("a")}), clauses({term("c")}), 1)));
 }
 
 TEST_F(ScorerCostTest, forcePrepareCostDelegatesToChild) {

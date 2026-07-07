@@ -290,18 +290,24 @@ TEST_F(QueryAnalysisTest, booleanMinMatchOptionalClauses) {
   EXPECT_EQ(1, req->getMatchCount());  // only d1 has >= 2 of welcome/here/met
 }
 
-TEST_F(QueryAnalysisTest, booleanMinMatchWithRequiredRejected) {
-  // min_match alongside required/filter clauses is not wired yet.
-  auto req = localReq(helper.getSearchEngine());
-  auto& cur = req->collection("main").topDocs("q");
-  auto& mr = cur.mr();
-  cur.rawQuery() = qb::boolean(mr, /*required=*/{qb::match(mr, "body_wl", "anderson")},
-      /*optional=*/{qb::match(mr, "body_wl", "thomas")},
-      /*prohibited=*/{}, /*filter=*/{}, /*minMatch=*/2);
-  cur.withStats();
-  req->execute();
-  ASSERT_FALSE(req->responses.empty());
-  EXPECT_TRUE(hasError(req->responses[0]->proto));
+TEST_F(QueryAnalysisTest, booleanMinMatchComposesWithRequired) {
+  // min_match >= 1 makes the optional group a constraint alongside required
+  // clauses; unset means the optionals only rank.
+  auto run = [&](int minMatch) {
+    auto req = localReq(helper.getSearchEngine());
+    auto& cur = req->collection("main").topDocs("q");
+    auto& mr = cur.mr();
+    cur.rawQuery() = qb::boolean(mr, /*required=*/{qb::match(mr, "body_wl", "anderson")},
+        /*optional=*/{qb::match(mr, "body_wl", "thomas"), qb::match(mr, "body_wl", "welcome")},
+        /*prohibited=*/{}, /*filter=*/{}, minMatch);
+    cur.withStats();
+    req->execute();
+    EXPECT_TRUE(req->ok()) << req->errorMsg();
+    return req->getMatchCount();
+  };
+  EXPECT_EQ(2, run(0));  // both docs have anderson; optionals rank only
+  EXPECT_EQ(2, run(1));  // both also have thomas
+  EXPECT_EQ(1, run(2));  // only d1 has thomas AND welcome
 }
 
 TEST_F(QueryAnalysisTest, matchMinShouldMatchManyTerms) {

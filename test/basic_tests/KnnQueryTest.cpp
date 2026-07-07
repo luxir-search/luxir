@@ -928,25 +928,25 @@ TEST_F(KnnQueryTest, booleanFilterOnlyAppliesProhibited) {
   req->done();
 }
 
-TEST_F(KnnQueryTest, booleanMinMatchWithRequiredIsRejected) {
+TEST_F(KnnQueryTest, booleanMinMatchWithRequiredConstrains) {
   CollectionHelper h("main");
   h.clear();
   h.index(flatdoc("id", std::string("a"), "foo_w", "apple"), UpdateMessage::COMMIT);
 
   auto* req = LocalReq::create(soluxNode->getSearchEngine());
   auto& cur = req->collection("main").topDocs("q");
+  cur.getNumber();
   cur.rawQuery() = qb::boolean(cur.mr(),
       /*required=*/{qb::match(cur.mr(), "foo_w", "apple")},
       /*optional=*/{qb::match(cur.mr(), "foo_w", "banana")},
       /*prohibited=*/{}, /*filter=*/{}, /*minMatch=*/1);
+  req->execute();
 
-  {
-    ExpectLog quiet("Search request failed:");
-    req->execute();
-  }
-
+  // min_match composes with required clauses: the optional group is a real
+  // constraint, and "banana" matches nothing here.
   ASSERT_EQ(req->responses.size(), 1u);
-  EXPECT_NE(req->responses[0]->proto.error.find("min_match"), std::string::npos);
+  EXPECT_TRUE(req->responses[0]->proto.error.empty()) << req->responses[0]->proto.error;
+  EXPECT_EQ(0, req->getMatchCount());
 
   req->done();
 }
