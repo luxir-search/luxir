@@ -1406,8 +1406,17 @@ public:
       return false;
     }
 
+    // Essential clauses drive via the block-fill API rather than per-doc
+    // next()/score(): whole decoded blocks land at once and text terms score
+    // through the vectorized flat-norms kernel. Scores may differ from the
+    // doc-at-a-time paths in the last bit (vectorized vs scalar rounding) -
+    // accepted policy, execution paths are not required to be bit-identical.
+    // No clause-level threshold is ever pushed by this bulk scorer, so the
+    // block fills below cannot skip docs.
     void fillEssentialCandidates(DocSet* filter, const FixedBitSet* domainBits) {
       clearWindowBits();
+      int32_t blockDocs[Postings::DOCS_BLOCK_SIZE];
+      float blockScores[Postings::DOCS_BLOCK_SIZE];
       for (size_t i = 0; i < scorers.size(); i++) {
         if (!isEssential[i]) {
           continue;
@@ -1415,17 +1424,20 @@ public:
         float* row = essentialScoreRow(i);
         std::fill(row, row + kWindowSize, 0.0f);
         auto* scorer = scorers[i];
-        int32_t doc = scorer->docId();
-        if (doc < windowStart) {
-          doc = scorer->advance(windowStart);
+        if (scorer->docId() < windowStart) {
+          scorer->advance(windowStart);
         }
-        while (doc < windowEnd) {
-          if (acceptsDoc(filter, domainBits, doc)) {
-            int32_t index = doc - windowStart;
-            setWindowBit(index);
-            row[(size_t) index] = scorer->score();
+        int32_t n;
+        while ((n = scorer->fillScoreBlock(blockDocs, blockScores,
+                                           Postings::DOCS_BLOCK_SIZE, windowEnd)) > 0) {
+          for (int32_t j = 0; j < n; j++) {
+            int32_t doc = blockDocs[j];
+            if (acceptsDoc(filter, domainBits, doc)) {
+              int32_t index = doc - windowStart;
+              setWindowBit(index);
+              row[(size_t) index] = blockScores[j];
+            }
           }
-          doc = scorer->next();
         }
       }
     }
