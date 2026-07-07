@@ -1260,6 +1260,10 @@ public:
     std::span<float> windowMax;
     std::span<int32_t> windowOrder;
     std::span<bool> isEssential;
+    // nonEssentialPrefixMax[s] = sum of windowMax over windowOrder[0..s]: the
+    // most the not-yet-probed non-essential clauses can add when probing runs
+    // from s = splitIndex-1 downward (see scoreCandidate).
+    std::span<double> nonEssentialPrefixMax;
     std::span<uint64_t> windowBits;
     // One shared per-window score accumulation row for all fill modes.
     // Clauses add into it in fill order, so the sum's rounding depends on
@@ -1369,6 +1373,11 @@ public:
       sortWindowOrder();
       splitIndex = computeWindowSplit();
       markEssentialScorers();
+      double acc = 0.0;
+      for (size_t s = 0; s < splitIndex; s++) {
+        acc += (double) windowMax[(size_t) windowOrder[s]];
+        nonEssentialPrefixMax[s] = acc;
+      }
     }
 
     void clearWindowBits() {
@@ -1582,8 +1591,18 @@ public:
       // window-non-essential clauses (windowOrder[0..splitIndex)) still need
       // a per-candidate advance + score. splitIndex == 0 - the common case
       // until the threshold rises - reads a single float.
+      //
+      // Probe from the largest window bound downward, abandoning the candidate
+      // as soon as the unprobed clauses cannot lift it over the threshold
+      // (Lucene's filterCompetitiveHits shape): the partial sum is returned
+      // and the caller's threshold check discards it, so most candidates never
+      // advance the low-impact clauses at all.
       float sum = windowScores[(size_t) index];
-      for (size_t s = 0; s < splitIndex; s++) {
+      for (size_t s = splitIndex; s-- > 0; ) {
+        if (((double) sum + nonEssentialPrefixMax[s]) * scoreBoundFactor
+            < (double) minCompetitiveScore) {
+          return sum;
+        }
         auto* scorer = scorers[(size_t) windowOrder[s]];
         if (scorer->docId() < doc) {
           scorer->advance(doc);
@@ -1665,6 +1684,7 @@ public:
               windowMax(pool.make_arr<float>(scorers.size()), scorers.size()),
               windowOrder(pool.make_arr<int32_t>(scorers.size()), scorers.size()),
               isEssential(pool.make_arr<bool>(scorers.size()), scorers.size()),
+              nonEssentialPrefixMax(pool.make_arr<double>(scorers.size()), scorers.size()),
               windowBits(pool.make_arr<uint64_t>((size_t) kWindowWords), (size_t) kWindowWords),
               windowScores(pool.make_arr<float>((size_t) kWindowSize), (size_t) kWindowSize),
               outDocs(pool.make_arr<int32_t>((size_t) kWindowSize), (size_t) kWindowSize),
