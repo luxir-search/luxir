@@ -370,13 +370,20 @@ public:
     return nextDoc();
   }
 
-  int32_t nextDoc() {
+private:
+  // Shared block-decode walk behind nextDoc()/nextDocOnly(). DOCS_ONLY skips
+  // freq blocks undecoded via the codec (StreamVByte tails carry no length
+  // prefix, so tail freqs still decode), pins tfreq to 1, and maintains no
+  // position/cumulative-tf state (a docs-only enum can never serve positions).
+  template <bool DOCS_ONLY>
+  int32_t nextDocImpl() {
     // Contract: callers must not re-poll after END (see Query::Scorer).
     assert(docid != PostingsReader::END);
-    assert(!docsOnlyConsumed);
     blockMode = false;
     if (docBufIdx >= docBufEnd) {
-      discardPendingPositionRepairAtBlockBoundary();
+      if constexpr (!DOCS_ONLY) {
+        discardPendingPositionRepairAtBlockBoundary();
+      }
       auto leftToRead = docfreq - docOrd;
       // Boundary analysis: if docfreq==1 and docOrd==1 (meaning we already read ord 0, but not 1), we are done.
       if (leftToRead <= 0) {
@@ -390,7 +397,6 @@ public:
       // (full blocks via the docs codec, the partial tail via StreamVByte d1).
       const uint32_t base = (docOrd == 0) ? 0 : (uint32_t) docBuf[Postings::DOCS_BLOCK_SIZE - 1];
       const int32_t blockStartOrd = docOrd;
-      const int64_t blockStartCumTf = cumulativeTermFreq;
 
       if (!bodyReady) {
         if (isL1Boundary(nextL0Block)) {
@@ -415,37 +421,40 @@ public:
         assert(outSz == Postings::DOCS_BLOCK_SIZE);
         docBufIdx = 0;
         docBufEnd = Postings::DOCS_BLOCK_SIZE;
-        // std::cout << "read doc block: " << std::endl;
 
         // Term freqs are omitted entirely for DOCS-only fields; tfreq is then implicitly 1.
-        // TODO: we should really decode term freqs lazily in case they aren't needed... but this is far simpler for now.
         if (hasFreqs) {
-          outSz = Postings::DOCS_BLOCK_SIZE;  // currently parallel to docs, so must be same block size
-          bytesRead = IndexCodec::tfreqCodec.decodeBlock(docIS.ptr(), docIS.left(), (uint32_t*)tfreqBuf, outSz);
-          docIS.skip(bytesRead);
-          assert(outSz == Postings::DOCS_BLOCK_SIZE);
+          if constexpr (DOCS_ONLY) {
+            auto bytesSkipped = IndexCodec::tfreqCodec.skipBlock(docIS.ptr(), docIS.left());
+            docIS.skip(bytesSkipped);
+            skipCount(SkipStats::docsOnlyFreqBlocksSkipped);
+          } else {
+            outSz = Postings::DOCS_BLOCK_SIZE;  // currently parallel to docs, so must be same block size
+            bytesRead = IndexCodec::tfreqCodec.decodeBlock(docIS.ptr(), docIS.left(), (uint32_t*)tfreqBuf, outSz);
+            docIS.skip(bytesRead);
+            assert(outSz == Postings::DOCS_BLOCK_SIZE);
+          }
           tfreqBufIdx = 0;
           tfreqBufEnd = Postings::DOCS_BLOCK_SIZE;
         }
-        // std::cout << "read tfreq block: " << std::endl;
-        if (trackPositions) {
-          int64_t blockTfSum = 0;
-          for (int i = 0; i < Postings::DOCS_BLOCK_SIZE; i++) {
-            blockTfSum += tfreqBuf[i];
+        if constexpr (!DOCS_ONLY) {
+          if (trackPositions) {
+            // cumulativeTermFreq still sits at the block start here: the
+            // boundary discard above re-anchored it, and only the per-doc
+            // advance below moves it. Constant loop bound: this sum is on the
+            // phrase-decode hot path.
+            int64_t blockTfSum = 0;
+            for (int i = 0; i < Postings::DOCS_BLOCK_SIZE; i++) {
+              blockTfSum += tfreqBuf[i];
+            }
+            nextL0CumTf = cumulativeTermFreq + blockTfSum;
           }
-          nextL0CumTf = blockStartCumTf + blockTfSum;
-        }
-        nextL0Base = (uint32_t) docBuf[Postings::DOCS_BLOCK_SIZE - 1];
-        nextL0Block = blockStartOrd / Postings::DOCS_BLOCK_SIZE + 1;
-        if (isL1Boundary(nextL0Block)) {
-          nextL1Group = nextL0Block / L1_PERIOD;
-          nextL1Base = nextL0Base;
-          nextL1CumTf = nextL0CumTf;
         }
       } else {
         // StreamVByte tail layout written by PostingsWriter::endTerm:
         //   [docKeys][docData] followed, for fields with freqs, by [tfreqKeys][tfreqData].
-        // Docs are d1 decoded; freqs are plain StreamVByte values. The AVX decoders
+        // Docs are d1 decoded; freqs are plain StreamVByte values with no length
+        // prefix, so even docs-only consumption decodes them. The AVX decoders
         // may read up to SVB_OVERREAD_PAD bytes past the encoded data, covered by
         // the trailing padding PostingsWriter::finish() reserves on the docs file.
         const uint32_t n = (uint32_t) leftToRead;
@@ -461,22 +470,24 @@ public:
 
         docBufIdx = 0;
         docBufEnd = leftToRead;
-        if (trackPositions) {
-          int64_t blockTfSum = 0;
-          for (int i = 0; i < leftToRead; i++) {
-            blockTfSum += tfreqBuf[i];
+        if constexpr (!DOCS_ONLY) {
+          if (trackPositions) {
+            int64_t blockTfSum = 0;
+            for (int i = 0; i < leftToRead; i++) {
+              blockTfSum += tfreqBuf[i];
+            }
+            nextL0CumTf = cumulativeTermFreq + blockTfSum;
           }
-          nextL0CumTf = blockStartCumTf + blockTfSum;
         }
-        nextL0Base = (uint32_t) docBuf[leftToRead - 1];
-        nextL0Block = blockStartOrd / Postings::DOCS_BLOCK_SIZE + 1;
-        if (isL1Boundary(nextL0Block)) {
-          nextL1Group = nextL0Block / L1_PERIOD;
-          nextL1Base = nextL0Base;
-          nextL1CumTf = nextL0CumTf;
-        }
+      }
 
-      } // end decode tail
+      nextL0Base = (uint32_t) docBuf[docBufEnd - 1];
+      nextL0Block = blockStartOrd / Postings::DOCS_BLOCK_SIZE + 1;
+      if (isL1Boundary(nextL0Block)) {
+        nextL1Group = nextL0Block / L1_PERIOD;
+        nextL1Base = nextL0Base;
+        nextL1CumTf = nextL0CumTf;
+      }
     }
 
     // Keep tfreq current for scoring; cumulativeTermFreq is only needed by
@@ -487,103 +498,40 @@ public:
     docid = docBuf[docBufIdx++];
     docOrd++;
 
-    // DOCS-only fields have no freq stream; tfreq is implicitly 1.
-    if (hasFreqs) {
-      tfreq = tfreqBuf[tfreqBufIdx++];
-      tfreqOrd++;
-    } else {
+    if constexpr (DOCS_ONLY) {
+      if (hasFreqs) {
+        tfreqBufIdx = docBufIdx;
+        tfreqOrd++;
+      }
       tfreq = 1;
-    }
-    if (trackPositions) {
-      markPendingPositionRepair(docBufIdx - 1, docBufIdx);
+    } else {
+      // DOCS-only fields have no freq stream; tfreq is implicitly 1.
+      if (hasFreqs) {
+        tfreq = tfreqBuf[tfreqBufIdx++];
+        tfreqOrd++;
+      } else {
+        tfreq = 1;
+      }
+      if (trackPositions) {
+        markPendingPositionRepair(docBufIdx - 1, docBufIdx);
+      }
     }
 
     return docid;
   }
 
+public:
+  int32_t nextDoc() {
+    assert(!docsOnlyConsumed);
+    return nextDocImpl<false>();
+  }
+
+  // Docs-only consumption: freq blocks are skipped without decoding and tfreq
+  // is pinned to 1. One-way: after the first nextDocOnly() this enum can never
+  // serve termFreq() or positions again.
   int32_t nextDocOnly() {
-    assert(docid != PostingsReader::END);
     docsOnlyConsumed = true;
-    blockMode = false;
-    if (docBufIdx >= docBufEnd) {
-      auto leftToRead = docfreq - docOrd;
-      if (leftToRead <= 0) {
-        assert(leftToRead == 0);
-        docid = PostingsReader::END;
-        return docid;
-      }
-
-      const uint32_t base = (docOrd == 0) ? 0 : (uint32_t) docBuf[Postings::DOCS_BLOCK_SIZE - 1];
-      const int32_t blockStartOrd = docOrd;
-
-      if (!bodyReady) {
-        if (isL1Boundary(nextL0Block)) {
-          auto groupHeaderLen = docIS.readVint();
-          docIS.skip(groupHeaderLen);
-        }
-        auto headerLen = docIS.readVint();
-        docIS.skip(headerLen);
-      } else {
-        bodyReady = false;
-      }
-      skipCount(SkipStats::docBlocksDecoded);
-
-      if (leftToRead >= Postings::DOCS_BLOCK_SIZE) {
-        uint32_t outSz = Postings::DOCS_BLOCK_SIZE;
-        auto bytesRead = IndexCodec::docCodec.decodeBlock(docIS.ptr(), docIS.left(), (uint32_t*)docBuf, outSz, base);
-        docIS.skip(bytesRead);
-        assert(outSz == Postings::DOCS_BLOCK_SIZE);
-        docBufIdx = 0;
-        docBufEnd = Postings::DOCS_BLOCK_SIZE;
-
-        if (hasFreqs) {
-          auto bytesSkipped = IndexCodec::tfreqCodec.skipBlock(docIS.ptr(), docIS.left());
-          docIS.skip(bytesSkipped);
-          skipCount(SkipStats::docsOnlyFreqBlocksSkipped);
-          tfreqBufIdx = 0;
-          tfreqBufEnd = Postings::DOCS_BLOCK_SIZE;
-        }
-        nextL0Base = (uint32_t) docBuf[Postings::DOCS_BLOCK_SIZE - 1];
-        nextL0Block = blockStartOrd / Postings::DOCS_BLOCK_SIZE + 1;
-        if (isL1Boundary(nextL0Block)) {
-          nextL1Group = nextL0Block / L1_PERIOD;
-          nextL1Base = nextL0Base;
-          nextL1CumTf = nextL0CumTf;
-        }
-      } else {
-        const uint32_t n = (uint32_t) leftToRead;
-        const uint32_t kb = svbKeyBytes(n);
-        uint8_t* p = (uint8_t*) docIS.ptr();
-        uint8_t* dataEnd = svb_decode_avx_d1_init((uint32_t*) docBuf, p, p + kb, n, base);
-        if (hasFreqs) {
-          dataEnd = svb_decode_avx_simple((uint32_t*) tfreqBuf, dataEnd, dataEnd + kb, n);
-          tfreqBufIdx = 0;
-          tfreqBufEnd = leftToRead;
-        }
-        docIS.skip(dataEnd - p);
-
-        docBufIdx = 0;
-        docBufEnd = leftToRead;
-        nextL0Base = (uint32_t) docBuf[leftToRead - 1];
-        nextL0Block = blockStartOrd / Postings::DOCS_BLOCK_SIZE + 1;
-        if (isL1Boundary(nextL0Block)) {
-          nextL1Group = nextL0Block / L1_PERIOD;
-          nextL1Base = nextL0Base;
-          nextL1CumTf = nextL0CumTf;
-        }
-      }
-    }
-
-    assert(!hasFreqs || docOrd == tfreqOrd);
-
-    docid = docBuf[docBufIdx++];
-    docOrd++;
-    if (hasFreqs) {
-      tfreqBufIdx = docBufIdx;
-      tfreqOrd++;
-    }
-    tfreq = 1;
-    return docid;
+    return nextDocImpl<true>();
   }
 
   std::span<const int32_t> peekDocOnlyBlock() {
