@@ -426,20 +426,33 @@ public:
       minCompetitiveScore = minScore;
     }
 
+    // Bounds scores over [shallow target, upTo] once advanceShallow() has been
+    // called (the Lucene ImpactsDISI contract - callers only score docs at or
+    // past their shallow target); before any advanceShallow it bounds from the
+    // current doc.  Using the stale current doc to WIDEN the range here made
+    // block-max conjunction hops quadratic: the enum stays behind while the
+    // target hops ahead, and the widened scan walked every block in between.
     float getMaxScore(int32_t upTo) override {
       if (!hasImpacts()) {
         return std::numeric_limits<float>::infinity();
       }
 
-      int32_t docBlock = blockContaining(docsEnum.docId());
-      int32_t startBlock = shallowBlock >= 0 ? std::min(docBlock, shallowBlock) : docBlock;
+      int32_t startBlock = shallowBlock >= 0 ? shallowBlock
+                                             : blockContaining(docsEnum.docId());
       if (startBlock >= impacts.blockCount()) {
         return std::numeric_limits<float>::infinity();
       }
 
-      int32_t upBlock = blockContaining(upTo);
-      if (upBlock >= impacts.blockCount()) {
-        upBlock = impacts.blockCount() - 1;
+      // Fast path for the block-max hop pattern: upTo inside the shallow block
+      // itself (one array read, no search).
+      int32_t upBlock;
+      if (upTo <= impacts.lastDoc(startBlock)) {
+        upBlock = startBlock;
+      } else {
+        upBlock = impacts.blockContainingFrom(startBlock, upTo);
+        if (upBlock >= impacts.blockCount()) {
+          upBlock = impacts.blockCount() - 1;
+        }
       }
       if (upBlock < startBlock) {
         return std::numeric_limits<float>::infinity();
@@ -459,7 +472,9 @@ public:
       if (!hasImpacts()) {
         return PostingsReader::END;
       }
-      shallowBlock = blockContaining(target);
+      // Shallow targets are monotone (window walks, block-max hops): resume
+      // the block cursor instead of re-searching the whole impact array.
+      shallowBlock = impacts.blockContainingFrom(shallowBlock, target);
       if (shallowBlock >= impacts.blockCount()) {
         return PostingsReader::END;
       }

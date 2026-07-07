@@ -108,6 +108,37 @@ public:
     const int32_t* it = std::lower_bound(begin, end, target);
     return (int32_t) (it - begin);
   }
+
+  // blockContaining with a resume hint for monotone callers (block-max hops,
+  // window walks): gallop forward from `from` instead of re-searching the
+  // whole array.  `from` may be -1 or stale-behind; a target behind the hinted
+  // block falls back to the full search.
+  int32_t blockContainingFrom(int32_t from, int32_t target) const {
+    if (from < 0) {
+      return blockContaining(target);
+    }
+    if (from >= count) {
+      return count;  // cursor already past the last block; targets only grow
+    }
+    if (from > 0 && target <= lastDocs[from - 1]) {
+      return blockContaining(target);  // moved backward; rare
+    }
+    // gallop: probe from+1, from+2, from+4, ... then binary search the bracket
+    int32_t lo = from;
+    int32_t step = 1;
+    while (lo < count && lastDocs[lo] < target) {
+      lo += step;
+      step <<= 1;
+    }
+    if (lo >= count) {
+      lo = count;
+    }
+    int32_t bracketLo = std::max(from, lo - (step >> 1));
+    const int32_t* begin = lastDocs + bracketLo;
+    const int32_t* end = lastDocs + std::min(lo + 1, count);
+    const int32_t* it = std::lower_bound(begin, end, target);
+    return (int32_t) (it - lastDocs);
+  }
 };
 
 } // namespace solux

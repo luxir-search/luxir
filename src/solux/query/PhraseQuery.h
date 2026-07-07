@@ -474,17 +474,16 @@ public:
       competitiveUpTo = -1;  // re-evaluate ranges under the higher threshold
     }
 
-    // Upper bound on the phrase score over [current doc, upTo]: the min across
-    // terms of each term's max block impact over that range (phraseFreq <= every
-    // term's freq makes each term's bound valid for the phrase).
+    // Upper bound on the phrase score over [shallow target, upTo] (or from the
+    // current doc before any advanceShallow): the min across terms of each
+    // term's max block impact over that range (phraseFreq <= every term's freq
+    // makes each term's bound valid for the phrase).  Shallow-based, like
+    // TermQuery::Scorer::getMaxScore - see the quadratic-hop note there.
     float getMaxScore(int32_t upTo) override {
       if (impacts.empty()) {
         return std::numeric_limits<float>::infinity();
       }
-      int32_t startDoc = docid;
-      if (shallowTarget >= 0) {
-        startDoc = docid >= 0 ? std::min(docid, shallowTarget) : shallowTarget;
-      }
+      int32_t startDoc = shallowTarget >= 0 ? shallowTarget : docid;
       float maxScore = std::numeric_limits<float>::infinity();
       for (const auto& termImpacts : impacts) {
         int32_t startBlock = termImpacts.blockContaining(startDoc);
