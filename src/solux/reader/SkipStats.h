@@ -54,6 +54,11 @@ struct SkipStats {
   static inline int64_t maxScoreInnerWindows = 0;
   static inline int64_t maxScoreOuterWindowRefines = 0;
   static inline int64_t maxScoreSetupFallbackBlockBounds = 0;
+  static inline int64_t countBulkFillCalls = 0;
+  static inline int64_t countBulkFillBlocks = 0;
+  static inline int64_t countBulkFillDocs = 0;
+  static inline int64_t countBulkFillContiguousBlocks = 0;
+  static inline int64_t docsOnlyFreqBlocksSkipped = 0;
 
   static void reset() {
     docBlocksDecoded = 0;
@@ -77,6 +82,11 @@ struct SkipStats {
     maxScoreInnerWindows = 0;
     maxScoreOuterWindowRefines = 0;
     maxScoreSetupFallbackBlockBounds = 0;
+    countBulkFillCalls = 0;
+    countBulkFillBlocks = 0;
+    countBulkFillDocs = 0;
+    countBulkFillContiguousBlocks = 0;
+    docsOnlyFreqBlocksSkipped = 0;
   }
 };
 

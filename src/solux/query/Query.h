@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstring>
+#include <cstdint>
 #include <limits>
 #include <memory>
 #include <span>
@@ -606,6 +607,28 @@ public:
         doc = next();
       }
       return filled;
+    }
+    virtual void fillWindowBits(std::span<uint64_t> windowBits, int32_t windowStart,
+                                int32_t windowEnd) {
+      skipCount(SkipStats::countBulkFillCalls);
+      if (windowEnd <= windowStart) {
+        return;
+      }
+      int32_t doc = docId();
+      if (doc < windowStart) {
+        doc = advance(windowStart);
+      }
+      unused(doc);
+      int32_t blockDocs[Postings::DOCS_BLOCK_SIZE];
+      float blockScores[Postings::DOCS_BLOCK_SIZE];
+      int32_t n;
+      while ((n = fillScoreBlock(blockDocs, blockScores,
+                                 Postings::DOCS_BLOCK_SIZE, windowEnd)) > 0) {
+        for (int32_t i = 0; i < n; i++) {
+          int32_t index = blockDocs[i] - windowStart;
+          windowBits[(size_t) (index >> 6)] |= 1ULL << (index & 63);
+        }
+      }
     }
     virtual void setMinCompetitiveScore(float minScore) {
       unused(minScore);

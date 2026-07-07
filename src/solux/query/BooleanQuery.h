@@ -1837,6 +1837,30 @@ public:
       return filter->get(doc);
     }
 
+    void applyDomainBits(const FixedBitSet* domainBits) {
+      assert(domainBits != nullptr);
+      int32_t domainWords = (int32_t) FixedBitSet::sizeInWords(domainBits->size());
+      for (size_t w = 0; w < windowBits.size(); w++) {
+        int32_t firstDoc = windowStart + (int32_t) (w << 6);
+        int32_t remaining = windowEnd - firstDoc;
+        if (remaining <= 0) {
+          windowBits[w] = 0;
+          continue;
+        }
+        uint64_t validMask = remaining >= 64 ? ~0ULL : (1ULL << remaining) - 1ULL;
+        int32_t sourceWord = firstDoc >> 6;
+        int32_t shift = firstDoc & 63;
+        uint64_t domainWord = 0;
+        if (sourceWord < domainWords) {
+          domainWord = domainBits->words[sourceWord] >> shift;
+          if (shift != 0 && sourceWord + 1 < domainWords) {
+            domainWord |= domainBits->words[sourceWord + 1] << (64 - shift);
+          }
+        }
+        windowBits[w] &= domainWord & validMask;
+      }
+    }
+
     bool verifyMatch(Query::Scorer* scorer, int32_t doc) const {
       unused(scorer, doc);
       // Reserved for two-phase: approximation hits will call matches() here.
@@ -2253,32 +2277,39 @@ public:
       const FixedBitSet* domainBits = nullptr;
       if (filter != nullptr && filter->type == DocSet::BITSET) {
         domainBits = &((BitDocSet*) filter)->bits();
-      }
-
-      setWindowBounds(min, max);
-      clearWindowBits();
-      int32_t blockDocs[Postings::DOCS_BLOCK_SIZE];
-      float blockScores[Postings::DOCS_BLOCK_SIZE];
-      for (size_t i = 0; i < scorers.size(); i++) {
-        auto* scorer = scorers[i];
-        if (scorer->docId() < windowStart) {
-          scorer->advance(windowStart);
-        }
-        int32_t n;
-        while ((n = scorer->fillScoreBlock(blockDocs, blockScores,
-                                           Postings::DOCS_BLOCK_SIZE, windowEnd)) > 0) {
-          if (filter == nullptr) {
+      } else if (filter != nullptr) {
+        setWindowBounds(min, max);
+        clearWindowBits();
+        int32_t blockDocs[Postings::DOCS_BLOCK_SIZE];
+        float blockScores[Postings::DOCS_BLOCK_SIZE];
+        for (size_t i = 0; i < scorers.size(); i++) {
+          auto* scorer = scorers[i];
+          if (scorer->docId() < windowStart) {
+            scorer->advance(windowStart);
+          }
+          int32_t n;
+          while ((n = scorer->fillScoreBlock(blockDocs, blockScores,
+                                             Postings::DOCS_BLOCK_SIZE, windowEnd)) > 0) {
             for (int32_t j = 0; j < n; j++) {
-              setWindowBit(blockDocs[j] - windowStart);
-            }
-          } else {
-            for (int32_t j = 0; j < n; j++) {
-              if (acceptsDoc(filter, domainBits, blockDocs[j])) {
+              if (acceptsDoc(filter, nullptr, blockDocs[j])) {
                 setWindowBit(blockDocs[j] - windowStart);
               }
             }
           }
         }
+        for (size_t w = 0; w < windowBits.size(); w++) {
+          count += std::popcount(windowBits[w]);
+        }
+        return windowEnd >= max ? PostingsReader::END : windowEnd;
+      }
+
+      setWindowBounds(min, max);
+      clearWindowBits();
+      for (size_t i = 0; i < scorers.size(); i++) {
+        scorers[i]->fillWindowBits(windowBits, windowStart, windowEnd);
+      }
+      if (domainBits != nullptr) {
+        applyDomainBits(domainBits);
       }
       for (size_t w = 0; w < windowBits.size(); w++) {
         count += std::popcount(windowBits[w]);

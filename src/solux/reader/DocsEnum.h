@@ -37,6 +37,7 @@ class DocsEnum {
   int32_t docBufEnd;     // index of one-past the last valid element
   int32_t docid;         // current docid
   bool blockMode = false;
+  bool docsOnlyConsumed = false;
 
   // For term freqs, since they are parallel to docs, we don't actually need
   // all of these variables.  But it sets the stage for separating the two
@@ -285,6 +286,7 @@ public:
 
   /// number of times the term appears in the current document
   int32_t termFreq() {
+    assert(!docsOnlyConsumed);
     return tfreq;
   }
 
@@ -296,6 +298,7 @@ public:
   int32_t nextDoc() {
     // Contract: callers must not re-poll after END (see Query::Scorer).
     assert(docid != PostingsReader::END);
+    assert(!docsOnlyConsumed);
     blockMode = false;
     if (docBufIdx >= docBufEnd) {
       auto leftToRead = docfreq - docOrd;
@@ -423,6 +426,160 @@ public:
     return docid;
   }
 
+  int32_t nextDocOnly() {
+    assert(docid != PostingsReader::END);
+    docsOnlyConsumed = true;
+    blockMode = false;
+    if (docBufIdx >= docBufEnd) {
+      auto leftToRead = docfreq - docOrd;
+      if (leftToRead <= 0) {
+        assert(leftToRead == 0);
+        docid = PostingsReader::END;
+        return docid;
+      }
+
+      const uint32_t base = (docOrd == 0) ? 0 : (uint32_t) docBuf[Postings::DOCS_BLOCK_SIZE - 1];
+      const int32_t blockStartOrd = docOrd;
+
+      if (!bodyReady) {
+        if (isL1Boundary(nextL0Block)) {
+          auto groupHeaderLen = docIS.readVint();
+          docIS.skip(groupHeaderLen);
+        }
+        auto headerLen = docIS.readVint();
+        docIS.skip(headerLen);
+      } else {
+        bodyReady = false;
+      }
+      skipCount(SkipStats::docBlocksDecoded);
+
+      if (leftToRead >= Postings::DOCS_BLOCK_SIZE) {
+        uint32_t outSz = Postings::DOCS_BLOCK_SIZE;
+        auto bytesRead = IndexCodec::docCodec.decodeBlock(docIS.ptr(), docIS.left(), (uint32_t*)docBuf, outSz, base);
+        docIS.skip(bytesRead);
+        assert(outSz == Postings::DOCS_BLOCK_SIZE);
+        docBufIdx = 0;
+        docBufEnd = Postings::DOCS_BLOCK_SIZE;
+
+        if (hasFreqs) {
+          auto bytesSkipped = IndexCodec::tfreqCodec.skipBlock(docIS.ptr(), docIS.left());
+          docIS.skip(bytesSkipped);
+          skipCount(SkipStats::docsOnlyFreqBlocksSkipped);
+          tfreqBufIdx = 0;
+          tfreqBufEnd = Postings::DOCS_BLOCK_SIZE;
+        }
+        nextL0Base = (uint32_t) docBuf[Postings::DOCS_BLOCK_SIZE - 1];
+        nextL0Block = blockStartOrd / Postings::DOCS_BLOCK_SIZE + 1;
+        if (isL1Boundary(nextL0Block)) {
+          nextL1Group = nextL0Block / L1_PERIOD;
+          nextL1Base = nextL0Base;
+          nextL1CumTf = nextL0CumTf;
+        }
+      } else {
+        const uint32_t n = (uint32_t) leftToRead;
+        const uint32_t kb = svbKeyBytes(n);
+        uint8_t* p = (uint8_t*) docIS.ptr();
+        uint8_t* dataEnd = svb_decode_avx_d1_init((uint32_t*) docBuf, p, p + kb, n, base);
+        if (hasFreqs) {
+          dataEnd = svb_decode_avx_simple((uint32_t*) tfreqBuf, dataEnd, dataEnd + kb, n);
+          tfreqBufIdx = 0;
+          tfreqBufEnd = leftToRead;
+        }
+        docIS.skip(dataEnd - p);
+
+        docBufIdx = 0;
+        docBufEnd = leftToRead;
+        nextL0Base = (uint32_t) docBuf[leftToRead - 1];
+        nextL0Block = blockStartOrd / Postings::DOCS_BLOCK_SIZE + 1;
+        if (isL1Boundary(nextL0Block)) {
+          nextL1Group = nextL0Block / L1_PERIOD;
+          nextL1Base = nextL0Base;
+          nextL1CumTf = nextL0CumTf;
+        }
+      }
+    }
+
+    assert(!hasFreqs || docOrd == tfreqOrd);
+
+    docid = docBuf[docBufIdx++];
+    docOrd++;
+    if (hasFreqs) {
+      tfreqBufIdx = docBufIdx;
+      tfreqOrd++;
+    }
+    tfreq = 1;
+    return docid;
+  }
+
+  std::span<const int32_t> peekDocOnlyBlock() {
+    if (docid == PostingsReader::END) {
+      return {};
+    }
+
+    int32_t start = 0;
+    if (!blockMode) {
+      if (docid < 0) {
+        int32_t doc = nextDocOnly();
+        if (doc == PostingsReader::END) {
+          return {};
+        }
+      }
+      start = docBufIdx - 1;
+    } else {
+      if (docBufIdx >= docBufEnd) {
+        int32_t doc = nextDocOnly();
+        if (doc == PostingsReader::END) {
+          return {};
+        }
+        start = docBufIdx - 1;
+      } else {
+        start = docBufIdx;
+      }
+    }
+
+    if (start >= docBufEnd) {
+      return {};
+    }
+
+    int32_t emitted = docBufEnd - start;
+    return std::span<const int32_t>(docBuf + start, (size_t) emitted);
+  }
+
+  void consumeDocOnlyBlock(int32_t n) {
+    assert(n >= 0);
+    if (n == 0) {
+      return;
+    }
+    assert(docsOnlyConsumed);
+    assert(docid != PostingsReader::END);
+
+    int32_t start = 0;
+    bool countedCurrent = false;
+    if (!blockMode) {
+      assert(docid >= 0);
+      start = docBufIdx - 1;
+      countedCurrent = true;
+    } else {
+      start = docBufIdx;
+    }
+
+    int32_t limit = start + n;
+    assert(start >= 0);
+    assert(limit <= docBufEnd);
+
+    int32_t newlyCounted = n - (countedCurrent ? 1 : 0);
+    assert(newlyCounted >= 0);
+    docOrd += newlyCounted;
+    if (hasFreqs) {
+      tfreqOrd += newlyCounted;
+      tfreqBufIdx = limit;
+    }
+    docBufIdx = limit;
+    tfreq = 1;
+    docid = docBuf[limit - 1];
+    blockMode = true;
+  }
+
   // Return remaining decoded docs/freqs from the current block. This is a
   // peek-only block-mode API: consumeDocFreqBlock() is the only cursor mutation
   // past the returned span. It may call nextDoc() to decode the next block, and
@@ -432,6 +589,7 @@ public:
   // Impact threshold ownership remains with TermQuery::Scorer; this exposes raw
   // decoded postings and does not know minCompetitiveScore.
   std::pair<std::span<const int32_t>, std::span<const int32_t>> peekDocFreqBlock() {
+    assert(!docsOnlyConsumed);
     if (docid == PostingsReader::END) {
       return {};
     }
@@ -473,7 +631,7 @@ public:
   }
 
   std::span<const int32_t> peekDocBlock() {
-    return peekDocFreqBlock().first;
+    return peekDocOnlyBlock();
   }
 
   void consumeDocFreqBlock(int32_t n) {
@@ -691,6 +849,7 @@ public:
   // ConstantScoreQuery, the column-join iterators.
   int32_t advance(int32_t target) {
     assert(docid < target);
+    assert(!docsOnlyConsumed);
     skipCount(SkipStats::advanceCalls);
     if (nextL0Block < numDocBlocks
         && (docBufEnd == 0 || target > docBuf[docBufEnd - 1])) {
@@ -1070,6 +1229,7 @@ public:
   }
 
   void startPositions() {
+    assert(!docsOnlyConsumed);
     assert(hasPositions);  // positions are only queried on fields that index them
     assert(trackPositions);
     pos = -1;
