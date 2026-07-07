@@ -491,6 +491,25 @@ private:
       if (items.size() == 1 && (items[0].mod == Mod::NONE || items[0].mod == Mod::PLUS)) {
         return items[0].node;
       }
+      // Juxtaposed comparisons/ranges on ONE field would combine as SHOULD:
+      // matching EITHER side of count:(>5 <10) is almost never what the
+      // writer meant, and the mistake hides (nearly every doc with a value
+      // matches).  Make them pick an operator.  Different fields, required
+      // (+), and prohibited ranges compose deliberately and stay legal.
+      for (size_t i = 0; i < items.size(); i++) {
+        if (items[i].mod != Mod::NONE) continue;
+        const auto* r = std::get_if<api::RangeQuery>(&items[i].node->kind);
+        if (r == nullptr) continue;
+        for (size_t j = 0; j < i; j++) {
+          if (items[j].mod != Mod::NONE) continue;
+          const auto* prev = std::get_if<api::RangeQuery>(&items[j].node->kind);
+          if (prev != nullptr && prev->field == r->field) {
+            fail(items[i].pos,
+                 "juxtaposed ranges/comparisons on one field combine as OR (either may "
+                 "match); write AND or OR between them");
+          }
+        }
+      }
       std::pmr::vector<const api::Query*> required(&mr), optional(&mr), prohibited(&mr);
       for (const Item& it : items) {
         switch (it.mod) {

@@ -841,11 +841,13 @@ private:
               } else if (text->empty()) {
                 clearPending(st);
               } else if (numericQueryable(*fieldType) && !numericCoercible(*fieldType, *text)) {
-                // Uncoercible numeric value: degrade the quoted text to a
+                // Uncoercible numeric value: degrade like an unknown field -
+                // the head stays literal text and the quoted value is a
                 // phrase over the default fields (declared).
                 warn("numeric_field_value",
                      fmt::format("'{}' is not a valid {} for field '{}'; treated as text",
                                  *text, numericTypeName(fieldType->type()), field));
+                addUnit(st, makeDefault({}, nullptr, tokenText));
                 addUnit(st, makePhrase({}, nullptr, *text));
               } else {
                 addUnit(st, makePhrase(field, fieldType, *text));
@@ -872,6 +874,14 @@ private:
     }
 
     if (buf.empty()) return;
+
+    // *:* - the traditional Lucene/Solr match-all spelling
+    if (std::string_view(buf.data(), buf.size()) == "*:*") {
+      api::Query all;
+      all.kind = true;
+      addUnit(st, allocQuery(all));
+      return;
+    }
 
     // fuzzy wins over prefix (Lucene branch order); ~0 degrades to a plain term
     std::optional<int32_t> fuzzEdits;
@@ -906,10 +916,20 @@ private:
       if (!tail.empty() || (prefix && !sawFuzzy)) {
         if (FieldType* ft = fieldedHead(head)) {
           if (numericQueryable(*ft)) {
-            // Numeric column fields take only an exact-match arm (field:value).
-            // Wildcard '*' / fuzzy '~' have no numeric meaning, and a value that
-            // is not a valid number/date cannot be a numeric query; both degrade
-            // to text (like an unknown field) with a declaration.
+            // field:* is the universal "has a value" idiom: an unbounded range
+            // over the column (the same exists query expr compiles).
+            if (prefix && !sawFuzzy && tail.empty()) {
+              api::RangeQuery r;
+              r.field = arenaStr(head);
+              api::Query q;
+              q.kind = r;
+              addUnit(st, allocQuery(q));
+              return;
+            }
+            // Otherwise numeric column fields take only an exact-match arm
+            // (field:value).  Wildcard '*' / fuzzy '~' have no numeric meaning,
+            // and a value that is not a valid number/date cannot be a numeric
+            // query; both degrade to text (like an unknown field), declared.
             if (prefix || sawFuzzy) {
               warn("numeric_field_syntax",
                    fmt::format("field '{}' is numeric; wildcard '*' and fuzzy '~' do not "

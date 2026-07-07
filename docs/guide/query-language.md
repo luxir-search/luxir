@@ -145,6 +145,16 @@ year_i:>=1960                    also >, <=, <
 Endpoints are converted exactly the way field values are at indexing time,
 so querying a literal finds the documents indexed with it.
 
+A date literal means the window it names: `created_dt:2024-06-25` matches
+the whole day, `created_dt:2024-06` the whole month, and range endpoints
+include the granule they name - `[2024-01 TO 2024-06]` covers January
+through June, `{... TO 2024-06}` excludes all of June. A full timestamp is
+still a single instant.
+
+Juxtaposed comparisons on one field are a parse error - `year_i:(>=1960
+<1970)` would mean "either side", which is never what anyone wants; write
+`AND` (or `OR` if you do want either).
+
 ## Prefix, fuzzy, existence
 
 ```
@@ -160,6 +170,11 @@ year_i:*             documents with any value in the field
 Prefix and fuzzy text is folded the way the field folds - `title_wl:Runn*`
 finds what "Runner" indexed - but never split into words. On unanalyzed
 string fields the text is used exactly as written.
+
+Fuzzy matching currently requires the first byte to match exactly (the
+default `prefix_length` is 1, which bounds the scan); `hte~1` will not find
+"the". Pass `prefix_length=0` through the `fuzzy(...)` function to trade a
+wider scan for first-position typos.
 
 ## Functions
 
@@ -191,6 +206,11 @@ Quoting an argument protects it from the grammar but does not change what
 it means: `match("foo bar")` and `match(foo bar)` search the same text. If
 you want a phrase, say so - `phrase(foo bar, field=title_w)`. This differs
 from term position, where `title_w:"foo bar"` is a phrase.
+
+In `boolean(...)`, optional clauses only rank matches when a required or
+filter clause is present; set `min_match` to make the optional group a real
+constraint ("at least N of these"). With only optional clauses, at least
+one must match.
 
 ## Variables
 

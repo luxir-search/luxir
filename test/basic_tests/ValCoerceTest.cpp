@@ -68,8 +68,13 @@ TEST_F(ValCoerceTest, toInt64Arms) {
   EXPECT_EQ(42, coerce::toInt64(sval("42"), "f"));
   EXPECT_EQ(3, coerce::toInt64(coerce::scalarVal(3.0), "f"));    // integral double narrows
   EXPECT_EQ(2, coerce::toInt64(coerce::scalarVal(2.0f), "f"));
+  // an integral decimal STRING narrows like the double arm would: the same
+  // visible literal must not diverge between JSON numbers and string parsers
+  EXPECT_EQ(3, coerce::toInt64(sval("3.0"), "f"));
+  EXPECT_EQ(1000, coerce::toInt64(sval("1e3"), "f"));
 
   EXPECT_THROW(coerce::toInt64(coerce::scalarVal(3.5), "f"), std::runtime_error);
+  EXPECT_THROW(coerce::toInt64(sval("3.5"), "f"), std::runtime_error);
   EXPECT_THROW(coerce::toInt64(coerce::scalarVal(std::nan("")), "f"), std::runtime_error);
   EXPECT_THROW(coerce::toInt64(coerce::scalarVal(1e19), "f"), std::runtime_error);  // out of range
   EXPECT_THROW(coerce::toInt64(coerce::scalarVal(true), "f"), std::runtime_error);

@@ -367,6 +367,17 @@ TEST_F(ExprParserTest, comparisons) {
   EXPECT_EQ("1990", valStr(asRange(*parse("count:<1990")).lt));
 }
 
+TEST_F(ExprParserTest, juxtaposedSameFieldRangesError) {
+  // count:(>5 <10) as OR matches nearly everything; make the writer pick
+  expectContains(parseErr("count:(>5 <10)"), "combine as OR");
+  expectContains(parseErr("count:[1 TO 5] count:[10 TO 20]"), "combine as OR");
+  // explicit operators, required prefixes, and different fields are all fine
+  EXPECT_EQ(2u, asBool(*parse("count:(>5 AND <10)")).required.size());
+  EXPECT_EQ(2u, asBool(*parse("count:(>5 OR <10)")).optional.size());
+  EXPECT_EQ(2u, asBool(*parse("count:(+>5 +<10)")).required.size());
+  EXPECT_EQ(2u, asBool(*parse("count:* rating:*")).optional.size());
+}
+
 TEST_F(ExprParserTest, rangeErrors) {
   expectContains(parseErr("status:[a TO b]"), "term ranges are not supported yet");
   expectContains(parseErr("count:[1 TO 2"), "expected ']' or '}'");

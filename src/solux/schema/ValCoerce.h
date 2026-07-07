@@ -80,6 +80,14 @@ inline int64_t toInt64(const api::Val& val, std::string_view fieldName) {
   if (auto i = std::get_if<int64_t>(&val.kind)) return *i;
   if (auto s = std::get_if<std::string_view>(&val.kind)) {
     if (auto v = parseInt64(*s)) return *v;
+    // A decimal string with an integral value ("3.0") narrows exactly like a
+    // double Val does - the same visible literal must not diverge between a
+    // JSON number and query-string/quoted text (index == query invariant).
+    if (auto d = parseDouble(*s)) {
+      if (*d >= INT64_LO && *d < INT64_HI && std::trunc(*d) == *d) return (int64_t)*d;
+      throw std::runtime_error(fmt::format(
+          "field '{}': cannot use '{}' as an integer (value is not integral)", fieldName, *s));
+    }
     throw std::runtime_error(fmt::format(
         "field '{}': cannot parse '{}' as an integer", fieldName, *s));
   }

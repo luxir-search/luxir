@@ -520,11 +520,24 @@ TEST_F(SimpleQueryParserTest, numericFieldFuzzyDegrades) {
   EXPECT_TRUE(hasWarning(r, "numeric_field_syntax"));
 }
 
-TEST_F(SimpleQueryParserTest, numericFieldExistenceStarDegrades) {
-  // field:* (has-value via empty prefix) is a wildcard arm, so it degrades too
+TEST_F(SimpleQueryParserTest, numericFieldExistenceStar) {
+  // field:* is the universal has-a-value idiom: an unbounded range over the
+  // column, same as expr (and no warning - nothing degraded)
   auto r = parse("count:*");
-  ASSERT_NE(nullptr, std::get_if<api::PrefixQuery>(&r.root->kind));
-  EXPECT_TRUE(hasWarning(r, "numeric_field_syntax"));
+  const auto* rq = std::get_if<api::RangeQuery>(&r.root->kind);
+  ASSERT_NE(nullptr, rq);
+  EXPECT_EQ("count", rq->field);
+  EXPECT_FALSE(rq->gte.has_value() || rq->gt.has_value() || rq->lte.has_value() ||
+               rq->lt.has_value());
+  EXPECT_TRUE(r.warnings.empty());
+}
+
+TEST_F(SimpleQueryParserTest, starColonStarIsMatchAll) {
+  EXPECT_TRUE(std::holds_alternative<bool>(parse("*:*").root->kind));
+  // composes like any clause
+  auto r = parse("*:* -foo");
+  const auto& b = asBool(*r.root);
+  ASSERT_EQ(1u, b.prohibited.size());
 }
 
 TEST_F(SimpleQueryParserTest, numericFieldBadValueDegrades) {
@@ -537,8 +550,13 @@ TEST_F(SimpleQueryParserTest, numericFieldBadValueDegrades) {
 }
 
 TEST_F(SimpleQueryParserTest, numericFieldBadQuotedValueDegrades) {
+  // degrades like an unknown field: the head stays literal text and the
+  // value stays a phrase (dropping the head would silently widen results)
   auto r = parse("created:\"not-a-date\"");
-  ASSERT_NE(nullptr, std::get_if<api::PhraseQuery>(&r.root->kind));  // degrades to a phrase
+  const auto& b = asBool(*r.root);
+  ASSERT_EQ(2u, b.optional.size());
+  EXPECT_EQ("created:", matchVal(b.optional[0]));
+  ASSERT_NE(nullptr, std::get_if<api::PhraseQuery>(&b.optional[1].kind));
   EXPECT_TRUE(hasWarning(r, "numeric_field_value"));
 }
 
