@@ -24,13 +24,13 @@ The string form is shorthand for the `expr` arm:
 `{"query": {"expr": {"q": "..."}}}`. Echo mode (`?explain=request`) prints
 the request back in the structured form.
 
-An expression only describes the shape of a query: fields, boolean
-structure, ranges. The parser never interprets the text itself - values
-pass through to query building unmodified and are analyzed there, per field
-type, exactly as if you had sent the structured JSON. The parser does
-consult the schema to decide what kind of query a clause becomes, but never
-guesses from the value: `zip_s:02134` keeps its leading zero because
-`zip_s` is a string field, not because the parser looked at the digits.
+An expression is plain shorthand: it builds the same query the equivalent
+structured JSON would. The syntax contributes structure - which fields, how
+clauses combine, ranges - and nothing else. Your search words reach the
+field's analyzer untouched, exactly as they would from a structured `match`
+query, and what a value means is decided by its field, not by its shape:
+`zip_s:02134` stays the string "02134", leading zero and all, because
+`zip_s` is a string field.
 
 ## Terms and phrases
 
@@ -184,10 +184,12 @@ from term position, where `title_w:"foo bar"` is a phrase.
 }}}
 ```
 
-A variable is substituted as a value and never re-parsed as syntax, which
-makes it the right way to feed user input into an expression: nothing the
-text contains can change the query's structure. A `$` inside quotes or
-inside a token is just a character (`status_s:costs$5`).
+A variable's contents are used as a value, never read as more query syntax:
+operators, quotes, and parentheses inside it are just text to search for.
+That makes `$name` the safe way to hand user input to an expression - as in
+the example above, where the injection attempt searches for its own
+punctuation. A `$` inside quotes or inside a word is an ordinary character
+(`status_s:costs$5`).
 
 ## Errors
 
