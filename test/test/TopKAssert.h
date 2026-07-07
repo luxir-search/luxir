@@ -37,7 +37,13 @@ inline void assertTopKEquivalent(std::span<const TopDocsCollector::ScoreDoc> exp
           << "rank " << r << ": score " << actual[r].score << " vs expected "
           << expected[r].score;
     }
-    if (j < expected.size()) {
+    // Doc identity is skipped ONLY for a multi-element tie group cut by the k
+    // boundary: its members may legitimately swap with near-tied docs beyond
+    // k.  A singleton final group has no observed tie, so its doc must match
+    // (a genuine unseen near-tie partner just past k would make this flaky in
+    // theory; test corpora keep boundary scores separated).
+    bool cutMultiGroup = (j == expected.size()) && (j - i > 1);
+    if (!cutMultiGroup) {
       std::multiset<segdoc> expectedDocs;
       std::multiset<segdoc> actualDocs;
       for (size_t r = i; r < j; r++) {
