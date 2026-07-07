@@ -46,6 +46,14 @@ struct SkipStats {
   // vs calls that had to move the block cursor (search + possible group parse).
   static inline int64_t shallowCacheHits = 0;
   static inline int64_t shallowCursorMoves = 0;
+  static inline int64_t impactGroupBoundCalls = 0;
+  static inline int64_t impactGroupBoundNoL0 = 0;
+  static inline int64_t impactL0GroupParses = 0;
+  static inline int64_t impactL0GroupParseScratchSpills = 0;
+  static inline int64_t maxScoreOuterWindows = 0;
+  static inline int64_t maxScoreInnerWindows = 0;
+  static inline int64_t maxScoreOuterWindowRefines = 0;
+  static inline int64_t maxScoreSetupFallbackBlockBounds = 0;
 
   static void reset() {
     docBlocksDecoded = 0;
@@ -61,6 +69,14 @@ struct SkipStats {
     phraseVerifies = 0;
     shallowCacheHits = 0;
     shallowCursorMoves = 0;
+    impactGroupBoundCalls = 0;
+    impactGroupBoundNoL0 = 0;
+    impactL0GroupParses = 0;
+    impactL0GroupParseScratchSpills = 0;
+    maxScoreOuterWindows = 0;
+    maxScoreInnerWindows = 0;
+    maxScoreOuterWindowRefines = 0;
+    maxScoreSetupFallbackBlockBounds = 0;
   }
 };
 

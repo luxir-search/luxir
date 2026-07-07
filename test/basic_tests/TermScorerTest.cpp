@@ -1731,6 +1731,200 @@ TEST_F(TermScorerTest, termImpactFrontierIsExactBlockMax) {
   EXPECT_TRUE(sawTighterBlock);
 }
 
+TEST_F(TermScorerTest, termImpactGroupBoundsMatchBlockBoundsOnGroupAlignedRanges) {
+  const int32_t postingCount = 2 * DocsEnum::L1_DOCS + 19;
+  TestIndex testIndex;
+  TestField f(testIndex, "body_w");
+  f.startIndexing();
+  addAntiCorrelatedFrontierDocs(f, postingCount);
+  testIndex.flush();
+  f.startReading();
+
+  auto poolFree = testIndex.pool.rewindScopeGuard();
+  Query::Context qContext(testIndex.pool, *testIndex.reader);
+  auto& segment = qContext.topReader.segments()[0];
+  TermQuery query("body_w", "frontier", 1.0f, true);
+  auto* weight = query.createWeight(qContext, Query::NEED_SCORES);
+  auto* scorer = dynamic_cast<TermQuery::Scorer*>(weight->createScorer(testIndex.pool, segment));
+  ASSERT_NE(scorer, nullptr);
+  ASSERT_TRUE(scorer->hasImpacts());
+
+  int32_t groupCount = scorer->impacts.groupContainingFrom(-1, PostingsReader::END);
+  ASSERT_GT(groupCount, 1);
+  for (int32_t g = 0; g < groupCount; g++) {
+    int32_t fromBlock = g * DocsEnum::L1_PERIOD;
+    int32_t toBlock = std::min(scorer->impacts.blockCount() - 1,
+                               fromBlock + DocsEnum::L1_PERIOD - 1);
+    float blockBound = fromBlock == scorer->impacts.blockCount() - 1
+        ? scorer->impacts.maxImpactFrom(fromBlock)
+        : scorer->impacts.maxImpactInRange(fromBlock, toBlock);
+    float groupBound = g == groupCount - 1
+        ? scorer->impacts.maxGroupImpactFrom(g)
+        : scorer->impacts.maxGroupImpactInRange(g, g);
+    EXPECT_FLOAT_EQ(groupBound, blockBound) << "group=" << g;
+  }
+}
+
+TEST_F(TermScorerTest, termImpactGroupBoundsCoverUnalignedBlockRanges) {
+  const int32_t postingCount = 3 * DocsEnum::L1_DOCS + 37;
+  TestIndex testIndex;
+  TestField f(testIndex, "body_w");
+  f.startIndexing();
+  addAntiCorrelatedFrontierDocs(f, postingCount);
+  testIndex.flush();
+  f.startReading();
+
+  auto poolFree = testIndex.pool.rewindScopeGuard();
+  Query::Context qContext(testIndex.pool, *testIndex.reader);
+  auto& segment = qContext.topReader.segments()[0];
+  TermQuery query("body_w", "frontier", 1.0f, true);
+  auto* weight = query.createWeight(qContext, Query::NEED_SCORES);
+  auto* scorer = dynamic_cast<TermQuery::Scorer*>(weight->createScorer(testIndex.pool, segment));
+  ASSERT_NE(scorer, nullptr);
+
+  std::array<std::pair<int32_t, int32_t>, 4> ranges = {{
+    {1, DocsEnum::L1_PERIOD - 2},
+    {3, DocsEnum::L1_PERIOD + 5},
+    {DocsEnum::L1_PERIOD + 7, 2 * DocsEnum::L1_PERIOD + 1},
+    {2 * DocsEnum::L1_PERIOD + 3, scorer->impacts.blockCount() - 2}
+  }};
+  for (auto [fromBlock, toBlock] : ranges) {
+    ASSERT_LT(fromBlock, toBlock);
+    float blockBound = scorer->impacts.maxImpactInRange(fromBlock, toBlock);
+    int32_t fromGroup = fromBlock / DocsEnum::L1_PERIOD;
+    int32_t toGroup = toBlock / DocsEnum::L1_PERIOD;
+    float groupBound = scorer->impacts.maxGroupImpactInRange(fromGroup, toGroup);
+    EXPECT_GE(groupBound + 1e-6f, blockBound)
+        << "fromBlock=" << fromBlock << " toBlock=" << toBlock;
+  }
+}
+
+TEST_F(TermScorerTest, maxScoreSetupUsesGroupBoundsWithoutL0Parse) {
+  const int32_t nDocs = 3 * DocsEnum::L1_DOCS + 113;
+  CollectionHelper helper("main");
+  addDenseManyClauseDisjunctionDocs(helper, nDocs, 8);
+  auto reader = helper.getIndexWriter()->getIndexReader();
+
+  bool savedStats = SkipStats::enabled;
+  SkipStats::enabled = true;
+  SkipStats::reset();
+  {
+    MemPool pool;
+    Query::Context qContext(pool, *reader);
+    std::vector<std::string> terms;
+    std::vector<TermQuery> queries;
+    std::vector<Query*> optional;
+    auto* weight = createDenseDisjunctionWeight(qContext, 8, terms, queries, optional);
+    auto& segment = qContext.topReader.segments()[0];
+    auto* supplier = weight->scorerSupplier(pool, segment);
+    ASSERT_NE(supplier, nullptr);
+    auto* bulk = supplier->bulkScorer(pool);
+    ASSERT_NE(bulk, nullptr);
+    ScoreWindow out;
+    ASSERT_NE(bulk->scoreNextWindow(out, nullptr, 0, segment.maxDoc(),
+                                    std::numeric_limits<float>::lowest()),
+              PostingsReader::END);
+  }
+  EXPECT_GT(SkipStats::impactGroupBoundNoL0, 0);
+  EXPECT_EQ(SkipStats::impactL0GroupParses, 0);
+  SkipStats::enabled = savedStats;
+}
+
+TEST_F(TermScorerTest, groupSetupPulsedTermBehaviorUnchanged) {
+  TestIndex testIndex;
+  TestField f(testIndex, "body_w");
+  f.startIndexing();
+  f.add(7, "pulse only");
+  testIndex.flush();
+  f.startReading();
+
+  auto poolFree = testIndex.pool.rewindScopeGuard();
+  Query::Context qContext(testIndex.pool, *testIndex.reader);
+  auto& segment = qContext.topReader.segments()[0];
+  TermQuery query("body_w", "pulse");
+  auto* weight = query.createWeight(qContext, Query::NEED_SCORES);
+  auto* scorer = dynamic_cast<TermQuery::Scorer*>(weight->createScorer(testIndex.pool, segment));
+  ASSERT_NE(scorer, nullptr);
+  EXPECT_FALSE(scorer->hasImpacts());
+  EXPECT_TRUE(std::isinf(scorer->getMaxScore(PostingsReader::END)));
+  EXPECT_TRUE(std::isinf(scorer->getMaxScoreForSetup(PostingsReader::END)));
+  EXPECT_EQ(scorer->advanceShallow(0), PostingsReader::END);
+  EXPECT_EQ(scorer->advanceShallowForSetup(0), PostingsReader::END);
+}
+
+TEST_F(TermScorerTest, termImpactGroupBoundsHandleFinalPartialGroup) {
+  const int32_t postingCount = DocsEnum::L1_DOCS + Postings::DOCS_BLOCK_SIZE + 17;
+  TestIndex testIndex;
+  TestField f(testIndex, "body_w");
+  f.startIndexing();
+  addAntiCorrelatedFrontierDocs(f, postingCount);
+  testIndex.flush();
+  f.startReading();
+
+  auto poolFree = testIndex.pool.rewindScopeGuard();
+  Query::Context qContext(testIndex.pool, *testIndex.reader);
+  auto& segment = qContext.topReader.segments()[0];
+  TermQuery query("body_w", "frontier", 1.0f, true);
+  auto* weight = query.createWeight(qContext, Query::NEED_SCORES);
+  auto* scorer = dynamic_cast<TermQuery::Scorer*>(weight->createScorer(testIndex.pool, segment));
+  ASSERT_NE(scorer, nullptr);
+
+  int32_t groupCount = scorer->impacts.groupContainingFrom(-1, PostingsReader::END);
+  ASSERT_EQ(groupCount, 2);
+  int32_t fromBlock = DocsEnum::L1_PERIOD;
+  int32_t toBlock = scorer->impacts.blockCount() - 1;
+  ASSERT_LT(fromBlock, toBlock);
+  EXPECT_FLOAT_EQ(scorer->impacts.maxGroupImpactFrom(1),
+                  scorer->impacts.maxImpactInRange(fromBlock, toBlock));
+}
+
+TEST_F(TermScorerTest, termImpactGroupBoundsHandleFreqOnlyScalarHeaders) {
+  const int32_t N = DocsEnum::L1_DOCS + 19;
+  RAMDir dir;
+  MemPool pool;
+  PostingsWriter postingsWriter(dir, 0, N + 16);
+  {
+    TextWriter writer(postingsWriter);
+    auto& finfo = postingsWriter.addField("f");
+    finfo.type = FieldType::TEXT;
+    finfo.flags = FieldType::INDEX_DOCS_FREQS;
+    writer.startField(&finfo);
+    TermRef hot(pool, "hot", 3);
+    writer.startTerm(hot);
+    for (int32_t doc = 0; doc < N; doc++) {
+      writer.addDoc(doc, 1 + (doc % 9));
+    }
+    writer.endTerm(hot);
+    writer.endField();
+  }
+  postingsWriter.finish();
+
+  PostingsReader reader(dir, 0);
+  FieldReader fieldReader(pool, reader);
+  ASSERT_TRUE(fieldReader.readNextField());
+  SegFieldInfo fieldInfo;
+  fieldReader.readFieldInfo(fieldInfo);
+  TermsEnum tenum(pool, reader, fieldInfo);
+  ASSERT_TRUE(tenum.seek("hot"));
+  DocsEnum denum(pool, reader, tenum);
+
+  Similarity::FieldStats fieldStats;
+  fieldStats.sumTotalTermFreq = tenum.sumTotalTermFreq();
+  fieldStats.sumDocFreq = tenum.sumDocFreq();
+  fieldStats.docsWithField = tenum.docsWithField();
+  fieldStats.maxDoc = reader.maxDoc();
+  Similarity::TermStats termStats;
+  termStats.docFreq = denum.numDocs();
+  termStats.totalTermFreq = denum.totalTermFreq();
+  Similarity sim;
+  auto simScorer = sim.getScorer(1.0f, fieldStats, termStats);
+  ImpactsIndex impacts;
+  impacts.build(pool, denum, simScorer, 1.0f, true);
+  ASSERT_FALSE(impacts.empty());
+  EXPECT_FLOAT_EQ(impacts.maxGroupImpactFrom(0),
+                  impacts.maxImpactInRange(0, impacts.blockCount() - 1));
+}
+
 TEST_F(TermScorerTest, termImpactFrontierTopKMatchesCornerAndExhaustive) {
   const int32_t postingCount = 14 * Postings::DOCS_BLOCK_SIZE;
   TestIndex testIndex;
@@ -2329,6 +2523,26 @@ TEST_F(TermScorerTest, MaxScoreBulkScorerSelectiveDomainDriveMatchesStream) {
     assertSameTopKDocs(stream, drive, topK);
     assertSameTopKDocs(pull, drive, topK);
   }
+  helper.clear();
+}
+
+TEST_F(TermScorerTest, MaxScoreBulkScorerFilteredDeletedTopKMatchesPull) {
+  CollectionHelper helper("main");
+  const int32_t numTerms = 16;
+  const int32_t nDocs = 4 * DocsEnum::L1_DOCS + 53;
+  const int32_t topK = 75;
+  addDenseManyClauseDisjunctionDocs(helper, nDocs, numTerms);
+  std::vector<std::string> deleteIds;
+  for (int32_t doc = 0; doc < nDocs; doc += 11) {
+    deleteIds.push_back("bs1_" + std::to_string(doc));
+  }
+  helper.deleteByIds(deleteIds, UpdateMessage::COMMIT);
+  auto reader = helper.getIndexWriter()->getIndexReader();
+
+  auto pull = runDenseFilteredPullTopK(*reader, numTerms, topK, 3, false);
+  BulkDomainDriveGuard guard(true);
+  auto bulk = runDenseFilteredBulkTopK(*reader, numTerms, topK, 3, false);
+  assertSameTopKDocs(pull, bulk, topK);
   helper.clear();
 }
 

@@ -189,6 +189,9 @@ public:
     int32_t shallowUpTo = -1;
     int32_t shallowTarget = -1;
     float shallowImpact = 0.0f;
+    // Group cursor for the setup-only bound methods; independent of the
+    // block-granular shallow cursor above.
+    int32_t shallowGroup = -1;
     // Query-time multiplier for boosted term clauses, e.g. fuzzy rewrites.
     float boost;
     int64_t skippedImpactBlocks = 0;
@@ -469,6 +472,44 @@ public:
         return impacts.maxImpactFrom(startBlock);
       }
       return impacts.maxImpactInRange(startBlock, upBlock);
+    }
+
+    float getMaxScoreForSetup(int32_t upTo) override {
+      if (!hasImpacts()) {
+        return std::numeric_limits<float>::infinity();
+      }
+
+      int32_t startGroup = shallowGroup >= 0
+          ? shallowGroup
+          : impacts.groupContainingFrom(-1, docsEnum.docId());
+      int32_t groupCount = impacts.numGroups();
+      if (startGroup >= groupCount) {
+        return std::numeric_limits<float>::infinity();
+      }
+
+      int32_t upGroup;
+      if (upTo <= impacts.groupLastDoc(startGroup)) {
+        upGroup = startGroup;
+      } else {
+        upGroup = impacts.groupContainingFrom(startGroup, upTo);
+        if (upGroup >= groupCount) {
+          upGroup = groupCount - 1;
+        }
+      }
+      if (upGroup < startGroup) {
+        return std::numeric_limits<float>::infinity();
+      }
+      if (upGroup == groupCount - 1) {
+        return impacts.maxGroupImpactFrom(startGroup);
+      }
+      return impacts.maxGroupImpactInRange(startGroup, upGroup);
+    }
+
+    int32_t advanceShallowForSetup(int32_t target) override {
+      if (!hasImpacts()) return PostingsReader::END;
+      shallowGroup = impacts.groupContainingFrom(shallowGroup, target);
+      return shallowGroup >= impacts.numGroups() ? PostingsReader::END
+                                                 : impacts.groupLastDoc(shallowGroup);
     }
 
     int32_t advanceShallow(int32_t target) override {

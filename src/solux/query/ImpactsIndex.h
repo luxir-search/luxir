@@ -50,44 +50,43 @@ class ImpactsIndex {
 
   static constexpr int32_t GROUP = DocsEnum::L1_PERIOD;
 
+  int32_t blockCountForGroup(int32_t g) const {
+    return std::min(GROUP, count - g * GROUP);
+  }
+
   const Chunk& ensureGroup(int32_t g) const {
     assert(g >= 0 && g < groupCount);
     if (chunks[g] != nullptr) {
       return *chunks[g];
     }
-    // Scratch is transient (chunk arrays live in the pool) and reused across
-    // parses: readGroupBlockImpacts resets lengths, capacity persists.
-    // thread_local rather than members because pool-resident objects must
-    // stay trivially destructible.
-    static thread_local std::vector<int32_t> lastDocs;
-    static thread_local std::vector<int32_t> maxTf;
-    static thread_local std::vector<int32_t> minNorm;
-    static thread_local DocsEnum::ImpactFrontiers frontiers;
-    docsEnum->readGroupBlockImpacts(g, groupBodyOffs[g], groupBaseLastDocs[g], lastDocs,
-                                    maxTf, minNorm, useFrontierBound ? &frontiers : nullptr);
+    skipCount(SkipStats::impactL0GroupParses);
     auto* chunk = pool->make<Chunk>();
-    chunk->blockCount = (int32_t) lastDocs.size();
-    chunk->lastDocs = pool->make_arr<int32_t>(lastDocs.size());
-    chunk->impacts = pool->make_arr<float>(lastDocs.size());
-    chunk->suffixWithin = pool->make_arr<float>(lastDocs.size());
-    for (size_t i = 0; i < lastDocs.size(); i++) {
-      chunk->lastDocs[i] = lastDocs[i];
-      if (useFrontierBound) {
-        int32_t start = frontiers.offsets[i];
-        int32_t end = frontiers.offsets[i + 1];
-        if (start < end) {
-          float maxImpact = 0.0f;
-          for (int32_t j = start; j < end; j++) {
-            maxImpact = std::max(
-                maxImpact, boost * simScorer->score((float) frontiers.tfs[(size_t) j],
-                                                    (int64_t) frontiers.norms[(size_t) j]));
+    chunk->blockCount = blockCountForGroup(g);
+    chunk->lastDocs = pool->make_arr<int32_t>((size_t) chunk->blockCount);
+    chunk->impacts = pool->make_arr<float>((size_t) chunk->blockCount);
+    chunk->suffixWithin = pool->make_arr<float>((size_t) chunk->blockCount);
+
+    DocsEnum::GroupBlockImpactScratch scratch;
+    docsEnum->visitGroupBlockImpacts(
+        g, groupBodyOffs[g], groupBaseLastDocs[g], scratch,
+        [&](int32_t block, int32_t lastDoc, int32_t maxTf, int32_t minNorm,
+            std::span<const int32_t> tfs, std::span<const int32_t> norms,
+            bool frontierSpilled) {
+          assert(block >= 0 && block < chunk->blockCount);
+          chunk->lastDocs[block] = lastDoc;
+          if (useFrontierBound && !frontierSpilled && !tfs.empty()) {
+            float maxImpact = 0.0f;
+            for (size_t j = 0; j < tfs.size(); j++) {
+              maxImpact = std::max(maxImpact, boost * simScorer->score((float) tfs[j],
+                                                                       (int64_t) norms[j]));
+            }
+            chunk->impacts[block] = maxImpact;
+          } else {
+            chunk->impacts[block] =
+                boost * simScorer->score((float) maxTf, (int64_t) minNorm);
           }
-          chunk->impacts[i] = maxImpact;
-          continue;
         }
-      }
-      chunk->impacts[i] = boost * simScorer->score((float) maxTf[i], (int64_t) minNorm[i]);
-    }
+    );
     float running = 0.0f;
     for (int32_t i = chunk->blockCount - 1; i >= 0; i--) {
       running = std::max(running, chunk->impacts[i]);
@@ -154,6 +153,67 @@ public:
 
   int32_t blockCount() const {
     return count;
+  }
+
+  int32_t numGroups() const {
+    return groupCount;
+  }
+
+  int32_t groupContainingFrom(int32_t fromGroup, int32_t target) const {
+    if (groupCount == 0) {
+      return 0;
+    }
+    if (fromGroup < 0 || fromGroup >= groupCount) {
+      if (fromGroup >= groupCount && fromGroup >= 0) {
+        return groupCount;
+      }
+      const int32_t* it = std::lower_bound(groupLastDocs, groupLastDocs + groupCount, target);
+      return (int32_t) (it - groupLastDocs);
+    }
+    if (fromGroup > 0 && target <= groupLastDocs[fromGroup - 1]) {
+      const int32_t* it = std::lower_bound(groupLastDocs, groupLastDocs + groupCount, target);
+      return (int32_t) (it - groupLastDocs);
+    }
+    int32_t lo = fromGroup;
+    int32_t step = 1;
+    while (lo < groupCount && groupLastDocs[lo] < target) {
+      lo += step;
+      step <<= 1;
+    }
+    if (lo >= groupCount) {
+      lo = groupCount;
+    }
+    int32_t bracketLo = std::max(fromGroup, lo - (step >> 1));
+    const int32_t* begin = groupLastDocs + bracketLo;
+    const int32_t* end = groupLastDocs + std::min(lo + 1, groupCount);
+    const int32_t* it = std::lower_bound(begin, end, target);
+    return (int32_t) (it - groupLastDocs);
+  }
+
+  int32_t groupLastDoc(int32_t group) const {
+    assert(group >= 0 && group < groupCount);
+    return groupLastDocs[group];
+  }
+
+  float maxGroupImpactFrom(int32_t group) const {
+    assert(group >= 0 && group < groupCount);
+    skipCount(SkipStats::impactGroupBoundCalls);
+    skipCount(SkipStats::impactGroupBoundNoL0);
+    return groupSuffixUpper[group];
+  }
+
+  float maxGroupImpactInRange(int32_t fromGroup, int32_t toGroup) const {
+    assert(fromGroup >= 0 && fromGroup <= toGroup && toGroup < groupCount);
+    skipCount(SkipStats::impactGroupBoundCalls);
+    skipCount(SkipStats::impactGroupBoundNoL0);
+    if (toGroup == groupCount - 1) {
+      return groupSuffixUpper[fromGroup];
+    }
+    float bound = 0.0f;
+    for (int32_t g = fromGroup; g <= toGroup; g++) {
+      bound = std::max(bound, groupUpper[g]);
+    }
+    return bound;
   }
 
   int32_t lastDoc(int32_t block) const {

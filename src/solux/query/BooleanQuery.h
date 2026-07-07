@@ -1373,8 +1373,8 @@ public:
           // for the window, not just a valid upper bound.
           windowMax[i] = 0.0f;
         } else {
-          scorers[i]->advanceShallow(windowStart);
-          windowMax[i] = scorers[i]->getMaxScore(windowEnd - 1);
+          scorers[i]->advanceShallowForSetup(windowStart);
+          windowMax[i] = scorers[i]->getMaxScoreForSetup(windowEnd - 1);
         }
         windowOrder[i] = (int32_t) i;
       }
@@ -1527,7 +1527,7 @@ public:
       // Float-summation error headroom for the double split bound (see member).
       scoreBoundFactor = 1.0 + (double) scorers.size() * 0x1p-24;
       for (size_t i = 0; i < scorers.size(); i++) {
-        clauseMax[i] = scorers[i]->getMaxScore(PostingsReader::END);
+        clauseMax[i] = scorers[i]->getMaxScoreForSetup(PostingsReader::END);
       }
       sortByClauseMax();
       for (size_t i = 0; i < scorers.size(); i++) {
@@ -1632,6 +1632,12 @@ public:
     int32_t arrayCursorLastWindowStart = -1;
     int32_t windowStart = 0;
     int32_t windowEnd = 0;
+    int32_t outerWindowStart = 0;
+    int32_t outerWindowEnd = 0;
+    bool outerWindowReady = false;
+    int64_t numOuterWindows = 0;
+    int64_t numCandidates = 0;
+    int32_t minWindowSize = 1;
     size_t splitIndex = 0;
     int64_t bs1Windows = 0;
     int64_t domainDriveWindows = 0;
@@ -1706,27 +1712,20 @@ public:
       return scorers.size() >= kBs1MinClauses && splitIndex * 2 <= scorers.size();
     }
 
-    void setupWindow(int32_t start, int32_t max) {
-      windowStart = start;
-      int32_t requestedEnd = windowStart + kWindowSize;
-      if (requestedEnd < windowStart) {
-        requestedEnd = max;
-      }
-      windowEnd = std::min(std::min(requestedEnd, max), maxDoc);
-
-      // Setup never moves clause iterators (the fill paths and per-candidate
-      // probes advance lagging clauses themselves); a clause already past the
-      // window bounds 0, which is exact since iterators only move forward.
+    void updateMaxWindowScores(int32_t start, int32_t end) {
       for (size_t i = 0; i < scorers.size(); i++) {
         int32_t doc = scorers[i]->docId();
-        if (doc >= windowEnd) {
+        if (doc >= end) {
           windowMax[i] = 0.0f;
         } else {
-          scorers[i]->advanceShallow(windowStart);
-          windowMax[i] = scorers[i]->getMaxScore(windowEnd - 1);
+          scorers[i]->advanceShallowForSetup(start);
+          windowMax[i] = scorers[i]->getMaxScoreForSetup(end - 1);
         }
         windowOrder[i] = (int32_t) i;
       }
+    }
+
+    void partitionWindow() {
       sortWindowOrder();
       splitIndex = computeWindowSplit();
       markEssentialScorers();
@@ -1735,6 +1734,76 @@ public:
         acc += (double) windowMax[(size_t) windowOrder[s]];
         nonEssentialPrefixMax[s] = acc;
       }
+    }
+
+    int32_t computeOuterWindowMax(int32_t start, int32_t max) {
+      if (scorers.empty()) return std::min(max, maxDoc);
+      size_t firstWindowLead = std::min(splitIndex, scorers.size() - 1);
+      int32_t end = PostingsReader::END;
+      for (size_t i = firstWindowLead; i < scorers.size(); i++) {
+        auto* scorer = scorers[i];
+        if (scorer->docId() >= max) continue;
+        int32_t target = std::max(scorer->docId(), start);
+        int32_t upTo = scorer->advanceShallowForSetup(target);
+        if (upTo != PostingsReader::END) {
+          end = std::min(end, upTo >= PostingsReader::END - 1 ? PostingsReader::END : upTo + 1);
+        }
+      }
+
+      if (scorers.size() - firstWindowLead > 1) {
+        int64_t threshold = numOuterWindows * 32LL * (int64_t) scorers.size();
+        if (numCandidates < threshold) {
+          minWindowSize = std::min(minWindowSize << 1, kWindowSize);
+        } else {
+          minWindowSize = 1;
+        }
+        int32_t minWindowEnd = start + minWindowSize;
+        if (minWindowEnd < start) {
+          minWindowEnd = max;
+        }
+        end = std::max(end, minWindowEnd);
+      }
+
+      end = std::min(std::min(end, max), maxDoc);
+      if (end <= start) {
+        int32_t requestedEnd = start + kWindowSize;
+        if (requestedEnd < start) {
+          requestedEnd = max;
+        }
+        end = std::min(std::min(requestedEnd, max), maxDoc);
+      }
+      return end;
+    }
+
+    void setupOuterWindow(int32_t start, int32_t max) {
+      skipCount(SkipStats::maxScoreOuterWindows);
+      outerWindowStart = start;
+      outerWindowEnd = computeOuterWindowMax(start, max);
+      for (;;) {
+        updateMaxWindowScores(start, outerWindowEnd);
+        partitionWindow();
+        int32_t nextEnd = computeOuterWindowMax(start, max);
+        if (nextEnd >= outerWindowEnd) {
+          break;
+        }
+        outerWindowEnd = nextEnd;
+        skipCount(SkipStats::maxScoreOuterWindowRefines);
+      }
+      outerWindowReady = true;
+      numOuterWindows++;
+    }
+
+    void setupWindow(int32_t start, int32_t max) {
+      if (!outerWindowReady || start < outerWindowStart || start >= outerWindowEnd) {
+        setupOuterWindow(start, max);
+      }
+      windowStart = start;
+      int32_t requestedEnd = windowStart + kWindowSize;
+      if (requestedEnd < windowStart) {
+        requestedEnd = max;
+      }
+      windowEnd = std::min(std::min(std::min(requestedEnd, outerWindowEnd), max), maxDoc);
+      skipCount(SkipStats::maxScoreInnerWindows);
     }
 
     void clearWindowBits() {
@@ -2095,7 +2164,7 @@ public:
               aggregateClauseCost(aggregateClauseCost) {
       scoreBoundFactor = 1.0 + (double) scorers.size() * 0x1p-24;
       for (size_t i = 0; i < scorers.size(); i++) {
-        clauseMax[i] = scorers[i]->getMaxScore(PostingsReader::END);
+        clauseMax[i] = scorers[i]->getMaxScoreForSetup(PostingsReader::END);
       }
       sortByClauseMax();
       for (size_t i = 0; i < scorers.size(); i++) {
@@ -2117,6 +2186,7 @@ public:
       }
       if (minCompetitiveScore > this->minCompetitiveScore) {
         this->minCompetitiveScore = minCompetitiveScore;
+        outerWindowReady = false;
       }
 
       if (filter != nullptr && filter->card() == 0) {
@@ -2152,6 +2222,7 @@ public:
         out.max = windowEnd;
       }
 
+      numCandidates += out.size;
       return windowEnd >= max ? PostingsReader::END : windowEnd;
     }
 

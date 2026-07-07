@@ -102,6 +102,12 @@ public:
     }
   };
 
+  struct GroupBlockImpactScratch {
+    static constexpr int32_t FRONTIER_CAP = 256;
+    int32_t frontierTfs[FRONTIER_CAP];
+    int32_t frontierNorms[FRONTIER_CAP];
+  };
+
 private:
 
   int32_t numDocBlocks = 0;
@@ -1000,18 +1006,9 @@ public:
   }
 
   // Parse ONE group's L0 block headers, located by readGroupImpacts output.
-  // Appends up to L1_PERIOD entries per output vector.
-  void readGroupBlockImpacts(int32_t groupIndex, int64_t bodyOffset, int32_t baseLastDoc,
-                             std::vector<int32_t>& blockLastDocs,
-                             std::vector<int32_t>& blockMaxTf,
-                             std::vector<int32_t>& blockMinNorm,
-                             ImpactFrontiers* impactFrontiers) const {
-    blockLastDocs.resize(0);
-    blockMaxTf.resize(0);
-    blockMinNorm.resize(0);
-    if (impactFrontiers != nullptr) {
-      impactFrontiers->clear();
-    }
+  template <typename Visitor>
+  void visitGroupBlockImpacts(int32_t groupIndex, int64_t bodyOffset, int32_t baseLastDoc,
+                              GroupBlockImpactScratch& scratch, Visitor&& visitor) const {
     int32_t groupStartBlock = groupIndex * L1_PERIOD;
     int32_t groupBlockCount = std::min(L1_PERIOD, numDocBlocks - groupStartBlock);
     assert(groupBlockCount > 0);
@@ -1033,11 +1030,12 @@ public:
       }
       int32_t maxTf = 1;
       int32_t minNorm = 0;
-      if (impactFrontiers != nullptr) {
-        impactFrontiers->offsets.push_back((int32_t) impactFrontiers->tfs.size());
-      }
+      int32_t frontierStored = 0;
+      bool frontierSpilled = false;
       if (hasFreqs && hasNorms) {
         uint32_t frontierCount = InputStream::readVint(p, headerEnd);
+        frontierSpilled = frontierCount > (uint32_t) GroupBlockImpactScratch::FRONTIER_CAP;
+        if (frontierSpilled) skipCount(SkipStats::impactL0GroupParseScratchSpills);
         assert(frontierCount > 0);
         int32_t tf = 0;
         for (uint32_t j = 0; j < frontierCount; j++) {
@@ -1049,9 +1047,10 @@ public:
             minNorm = norm;
           }
           maxTf = tf;
-          if (impactFrontiers != nullptr) {
-            impactFrontiers->norms.push_back(norm);
-            impactFrontiers->tfs.push_back(tf);
+          if (!frontierSpilled) {
+            scratch.frontierNorms[frontierStored] = norm;
+            scratch.frontierTfs[frontierStored] = tf;
+            frontierStored++;
           }
         }
       } else if (hasFreqs) {
@@ -1060,15 +1059,13 @@ public:
         minNorm = (int32_t) InputStream::readVint(p, headerEnd);
       }
       assert(p == headerEnd);
-      blockLastDocs.push_back((int32_t) blockLastDocValue);
-      blockMaxTf.push_back(maxTf);
-      blockMinNorm.push_back(minNorm);
+      visitor(i, (int32_t) blockLastDocValue, maxTf, minNorm,
+              std::span<const int32_t>(scratch.frontierTfs, (size_t) frontierStored),
+              std::span<const int32_t>(scratch.frontierNorms, (size_t) frontierStored),
+              frontierSpilled);
       p = headerEnd + (int64_t) blockByteLen;
       assert(p <= end);
       prevBlockLastDoc = blockLastDocValue;
-    }
-    if (impactFrontiers != nullptr) {
-      impactFrontiers->offsets.push_back((int32_t) impactFrontiers->tfs.size());
     }
   }
 

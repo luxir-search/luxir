@@ -618,6 +618,14 @@ public:
       unused(target);
       return PostingsReader::END;
     }
+    virtual float getMaxScoreForSetup(int32_t upTo) {
+      skipCount(SkipStats::maxScoreSetupFallbackBlockBounds);
+      return getMaxScore(upTo);
+    }
+    virtual int32_t advanceShallowForSetup(int32_t target) {
+      skipCount(SkipStats::maxScoreSetupFallbackBlockBounds);
+      return advanceShallow(target);
+    }
 
     // NOTE: no virtual destructor, so subclasses should be made trivially destructible
   };
