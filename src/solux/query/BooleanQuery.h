@@ -593,6 +593,29 @@ public:
       }
       return score;
     }
+
+    // The optional side can add at most its global max: docs whose required
+    // score cannot reach (threshold - optMax) cannot compete, so the required
+    // side may prune with that reduced threshold (Lucene ReqOptSumScorer's
+    // setMinCompetitiveScore shape).  An unbounded optional forwards nothing.
+    void setMinCompetitiveScore(float minScore) override {
+      float optMax = optScorer->getMaxScore(solux::PostingsReader::END);
+      if (std::isfinite(optMax)) {
+        // Round the reduced threshold DOWN so float rounding can only make the
+        // required side less aggressive, never skip a doc whose sum could
+        // still reach minScore.
+        mandScorer->setMinCompetitiveScore(
+            std::nextafter(minScore - optMax, -std::numeric_limits<float>::infinity()));
+      }
+    }
+
+    float getMaxScore(int32_t upTo) override {
+      return mandScorer->getMaxScore(upTo) + optScorer->getMaxScore(upTo);
+    }
+
+    int32_t advanceShallow(int32_t target) override {
+      return mandScorer->advanceShallow(target);
+    }
   }; // MandOptScorer
 
   class MandNotScorer final : public Query::Scorer {
