@@ -1291,12 +1291,19 @@ public:
       int32_t remaining = maxDoc - windowStart;
       windowEnd = remaining > windowSize ? windowStart + windowSize : maxDoc;
 
+      // Setup never moves clause iterators: lagging clauses are advanced by
+      // whoever needs them (the essential heap drive, or a per-candidate
+      // probe), so demoted clauses that are never probed never advance.
       for (size_t i = 0; i < scorers.size(); i++) {
-        if (scorers[i]->docId() < windowStart) {
-          scorers[i]->advance(windowStart);
+        int32_t doc = scorers[i]->docId();
+        if (doc >= windowEnd) {
+          // Iterators only move forward, so 0 is this clause's exact bound
+          // for the window, not just a valid upper bound.
+          windowMax[i] = 0.0f;
+        } else {
+          scorers[i]->advanceShallow(windowStart);
+          windowMax[i] = scorers[i]->getMaxScore(windowEnd - 1);
         }
-        scorers[i]->advanceShallow(windowStart);
-        windowMax[i] = scorers[i]->getMaxScore(windowEnd - 1);
         windowOrder[i] = (int32_t) i;
       }
       sortWindowOrder();
@@ -1537,6 +1544,8 @@ public:
     std::span<double> nonEssentialPrefixMax;
     std::span<uint64_t> windowBits;
     // One shared per-window score accumulation row for all fill modes.
+    // Never cleared: a slot is valid only under a set window bit, and
+    // addWindowScore overwrites on the first touch of a window.
     // Clauses add into it in fill order, so the sum's rounding depends on
     // which clauses are essential in a window - accepted policy (execution
     // paths are not required to be bit-identical).
@@ -1633,12 +1642,17 @@ public:
       }
       windowEnd = std::min(std::min(requestedEnd, max), maxDoc);
 
+      // Setup never moves clause iterators (the fill paths and per-candidate
+      // probes advance lagging clauses themselves); a clause already past the
+      // window bounds 0, which is exact since iterators only move forward.
       for (size_t i = 0; i < scorers.size(); i++) {
-        if (scorers[i]->docId() < windowStart) {
-          scorers[i]->advance(windowStart);
+        int32_t doc = scorers[i]->docId();
+        if (doc >= windowEnd) {
+          windowMax[i] = 0.0f;
+        } else {
+          scorers[i]->advanceShallow(windowStart);
+          windowMax[i] = scorers[i]->getMaxScore(windowEnd - 1);
         }
-        scorers[i]->advanceShallow(windowStart);
-        windowMax[i] = scorers[i]->getMaxScore(windowEnd - 1);
         windowOrder[i] = (int32_t) i;
       }
       sortWindowOrder();
@@ -1657,6 +1671,17 @@ public:
 
     void setWindowBit(int32_t index) {
       windowBits[(size_t) (index >> 6)] |= 1ULL << (index & 63);
+    }
+
+    void addWindowScore(int32_t index, float score) {
+      uint64_t& word = windowBits[(size_t) (index >> 6)];
+      uint64_t mask = 1ULL << (index & 63);
+      if ((word & mask) == 0) {
+        word |= mask;
+        windowScores[(size_t) index] = score;
+      } else {
+        windowScores[(size_t) index] += score;
+      }
     }
 
     bool acceptsDoc(DocSet* filter, const FixedBitSet* domainBits, int32_t doc) const {
@@ -1808,7 +1833,6 @@ public:
     // block fills below cannot skip docs.
     void fillEssentialCandidates(DocSet* filter, const FixedBitSet* domainBits) {
       clearWindowBits();
-      std::fill(windowScores.begin(), windowScores.end(), 0.0f);
       int32_t blockDocs[Postings::DOCS_BLOCK_SIZE];
       float blockScores[Postings::DOCS_BLOCK_SIZE];
       for (size_t i = 0; i < scorers.size(); i++) {
@@ -1826,8 +1850,7 @@ public:
             int32_t doc = blockDocs[j];
             if (acceptsDoc(filter, domainBits, doc)) {
               int32_t index = doc - windowStart;
-              setWindowBit(index);
-              windowScores[(size_t) index] += blockScores[j];
+              addWindowScore(index, blockScores[j]);
             }
           }
         }
@@ -1836,7 +1859,6 @@ public:
 
     void fillBs1Candidates() {
       clearWindowBits();
-      std::fill(windowScores.begin(), windowScores.end(), 0.0f);
       int32_t blockDocs[Postings::DOCS_BLOCK_SIZE];
       float blockScores[Postings::DOCS_BLOCK_SIZE];
       for (size_t i = 0; i < scorers.size(); i++) {
@@ -1850,25 +1872,24 @@ public:
                     blockDocs, blockScores, Postings::DOCS_BLOCK_SIZE, windowEnd)) > 0) {
           for (int32_t j = 0; j < count; j++) {
             int32_t index = blockDocs[j] - windowStart;
-            setWindowBit(index);
-            windowScores[(size_t) index] += blockScores[j];
+            addWindowScore(index, blockScores[j]);
           }
         }
       }
     }
 
-    float scoreCandidate(int32_t doc, int32_t index) {
-      // Essential contributions were accumulated during the fill; only the
+    float scoreCandidateWithBase(int32_t doc, float sum) {
+      // Essential contributions were accumulated during the fill, or passed
+      // directly by the single-essential fast path; only the
       // window-non-essential clauses (windowOrder[0..splitIndex)) still need
       // a per-candidate advance + score. splitIndex == 0 - the common case
-      // until the threshold rises - reads a single float.
+      // until the threshold rises - returns the base score unchanged.
       //
       // Probe from the largest window bound downward, abandoning the candidate
       // as soon as the unprobed clauses cannot lift it over the threshold
       // (Lucene's filterCompetitiveHits shape): the partial sum is returned
       // and the caller's threshold check discards it, so most candidates never
       // advance the low-impact clauses at all.
-      float sum = windowScores[(size_t) index];
       for (size_t s = splitIndex; s-- > 0; ) {
         if (((double) sum + nonEssentialPrefixMax[s]) * scoreBoundFactor
             < (double) minCompetitiveScore) {
@@ -1883,6 +1904,10 @@ public:
         }
       }
       return sum;
+    }
+
+    float scoreCandidate(int32_t doc, int32_t index) {
+      return scoreCandidateWithBase(doc, windowScores[(size_t) index]);
     }
 
     void prepareOutputWindow(ScoreWindow& out) {
@@ -1913,6 +1938,40 @@ public:
             out.size++;
           }
           bits &= bits - 1;
+        }
+      }
+    }
+
+    // With one essential clause each candidate surfaces exactly once, so its
+    // blocks stream straight to the output window with no bitset/score-row
+    // accumulation pass. This is the common window shape at low k once the
+    // threshold has risen.
+    void fillSingleEssentialCandidates(ScoreWindow& out, DocSet* filter,
+                                       const FixedBitSet* domainBits) {
+      prepareOutputWindow(out);
+      int32_t essentialIdx = windowOrder[splitIndex];
+      auto* scorer = scorers[(size_t) essentialIdx];
+      if (scorer->docId() < windowStart) {
+        scorer->advance(windowStart);
+      }
+
+      int32_t blockDocs[Postings::DOCS_BLOCK_SIZE];
+      float blockScores[Postings::DOCS_BLOCK_SIZE];
+      int32_t n;
+      while ((n = scorer->fillScoreBlock(blockDocs, blockScores,
+                                         Postings::DOCS_BLOCK_SIZE, windowEnd)) > 0) {
+        for (int32_t j = 0; j < n; j++) {
+          int32_t doc = blockDocs[j];
+          if (!acceptsDoc(filter, domainBits, doc)) {
+            continue;
+          }
+          float score = scoreCandidateWithBase(doc, blockScores[j]);
+          if (score >= minCompetitiveScore) {
+            assert(out.size < kWindowSize);
+            out.docs[(size_t) out.size] = doc;
+            out.scores[(size_t) out.size] = score;
+            out.size++;
+          }
         }
       }
     }
@@ -2009,6 +2068,8 @@ public:
           bs1Windows++;
           fillBs1Candidates();
           finalizeBs1Candidates(out, filter, domainBits);
+        } else if (scorers.size() - splitIndex == 1) {
+          fillSingleEssentialCandidates(out, filter, domainBits);
         } else {
           fillEssentialCandidates(filter, domainBits);
           finalizeCandidates(out);
