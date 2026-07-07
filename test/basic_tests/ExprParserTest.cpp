@@ -160,6 +160,27 @@ TEST_F(ExprParserTest, positionalSpecialsNeedNoEscaping) {
   EXPECT_EQ("a^b", matchVal(*parse("status:a^b")));
 }
 
+TEST_F(ExprParserTest, quotesArePositionalToo) {
+  // a quote is special only where a value can begin; mid-word it is a byte,
+  // so apostrophes in ordinary text do not need escaping
+  EXPECT_EQ("don't", matchVal(*parse("title:don't")));
+  EXPECT_EQ("say\"hi\"", matchVal(*parse("status:say\"hi\"")));
+
+  const auto& b = asBool(*parse("title:(can't won't)"));
+  ASSERT_EQ(2u, b.optional.size());
+  EXPECT_EQ("can't", matchVal(b.optional[0]));
+  EXPECT_EQ("won't", matchVal(b.optional[1]));
+
+  // raw-text function arguments carry apostrophes through verbatim
+  const auto& m = asMatch(*parse("match(don't stop, field=title)"));
+  EXPECT_EQ("don't stop", valStr(m.val));
+  // ...and a WHOLE-value quote still protects grammar characters
+  EXPECT_EQ("a, don't", valStr(asMatch(*parse("match(\"a, don't\", field=title)")).val));
+
+  // fuzzy suffix still binds after a quote byte
+  EXPECT_EQ("don't", asFuzzy(*parse("title:don't~1")).term);
+}
+
 TEST_F(ExprParserTest, escapes) {
   EXPECT_EQ("a:b", matchVal(*parse("status:a\\:b")));   // escaped colon does not split
   EXPECT_EQ("ab*", matchVal(*parse("status:ab\\*")));   // escaped star is literal
@@ -349,6 +370,8 @@ TEST_F(ExprParserTest, prefixAndFuzzy) {
 
 TEST_F(ExprParserTest, decorationErrors) {
   expectContains(parseErr("title:dune~3"), "exceeds the maximum of 2");
+  // old Lucene float similarity: a teaching error, not a silent literal
+  expectContains(parseErr("title:roam~0.8"), "whole number of edits");
   expectContains(parseErr("count:10~1"), "does not apply to numeric field");
   expectContains(parseErr("count:10*"), "does not apply to numeric field");
   expectContains(parseErr("title:ab*~1"), "cannot combine '*' and '~'");

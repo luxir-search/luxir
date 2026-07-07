@@ -54,9 +54,13 @@ namespace solux {
 //
 // Positional specials, not Lucene's reserved-char sprawl: ':' splits only at
 // the FIRST unescaped colon of a clause, '*' and '~' act only as clean
-// trailing suffixes - so url:https://x and time:12:30 need no escaping.  '^'
-// is reserved for boost: as a clean trailing suffix it is a parse error until
+// trailing suffixes, and quotes open a string only where a value can begin -
+// so url:https://x, time:12:30, and title:don't need no escaping.  '^' is
+// reserved for boost: as a clean trailing suffix it is a parse error until
 // the engine has per-clause boost semantics; elsewhere it is a literal byte.
+// Mid-token '*' and '?' are PERMANENTLY literal (never wildcards): future
+// wildcard/regex query types arrive as named functions, and quoting a value
+// is the universal way to make it literal to the grammar.
 //
 // Unfielded bare words are a parse error naming the fixes (deleted from the
 // language by design: expr has no default field - use simple_query for
@@ -232,13 +236,13 @@ private:
 
   // True when the input `ahead` bytes past the cursor begins a new token:
   // end of input, whitespace (the full U+3000 sequence, not just its lead
-  // byte), a structural character, or a stop byte.  Real NUL bytes and
-  // non-whitespace multi-byte sequences are ordinary token bytes, so
-  // NOT-x / ANDroid / AND<kana> are tokens, not operators.
+  // byte), a structural character, or a stop byte.  Real NUL bytes,
+  // non-whitespace multi-byte sequences, and quotes are ordinary token
+  // bytes here, so NOT-x / ANDroid / AND"x" are tokens, not operators.
   bool boundaryAt(size_t ahead, std::string_view stops) const {
     if (ahead >= cur.remaining()) return true;  // end of input
     char c = cur.peekAt(ahead);
-    if (c == '(' || c == ')' || c == '"' || c == '\'' || c == '[' || c == '{') return true;
+    if (c == '(' || c == ')' || c == '[' || c == '{') return true;
     if (isStop(c, stops)) return true;
     if (c == ' ' || c == '\t' || c == '\n' || c == '\r') return true;
     return (uint8_t)c == 0xE3 && (uint8_t)cur.peekAt(ahead + 1) == 0x80 &&
@@ -268,12 +272,17 @@ private:
     bool empty() const { return text.empty(); }
   };
 
+  // Quotes are deliberately NOT terminators: a quote is special only where a
+  // value can BEGIN (operand / field-value / argument / endpoint position -
+  // each dispatches on the quote before scanning a token).  Mid-token quotes
+  // are ordinary bytes, so title:don't and say"hi" are single terms - the
+  // positional-specials rule applied to quotes.
   bool tokenTerminator(char c, std::string_view stops) const {
-    if (c == '(' || c == ')' || c == '"' || c == '\'') return true;
+    if (c == '(' || c == ')') return true;
     return isStop(c, stops);
   }
 
-  // Scan a token: bytes up to whitespace / a structural char / a stop byte.
+  // Scan a token: bytes up to whitespace / a paren / a stop byte.
   // '\' escapes the next byte (any byte).  When stopAtColon, the scan also
   // ends AT the first unescaped ':' without consuming it (the fielded-clause
   // boundary); otherwise ':' is an ordinary byte (positional specials: only
@@ -315,6 +324,16 @@ private:
     };
     t.tildeAt = cleanSuffix('~', [](char c) { return digit(c); });
     t.caretAt = cleanSuffix('^', [](char c) { return digit(c) || c == '.'; });
+    if (t.tildeAt == NPOS) {
+      // ~N.N is old Lucene float similarity: teach rather than silently
+      // matching the literal token (a genuinely literal ~1.5 can be quoted)
+      size_t floatTilde = cleanSuffix('~', [](char c) { return digit(c) || c == '.'; });
+      if (floatTilde != NPOS && floatTilde + 1 < n) {
+        fail(t.pos + floatTilde,
+             "fuzzy edit distance is a whole number of edits (term~1, term~2); "
+             "float similarity is not supported - quote the value for a literal '~'");
+      }
+    }
     if (t.tildeAt != NPOS && t.tildeAt > 0 && buf[t.tildeAt - 1] == '*' && !esc[t.tildeAt - 1]) {
       t.starBeforeTilde = true;
     }
@@ -1147,10 +1166,11 @@ private:
   }
 
   // Raw text for the declared positional slot: verbatim bytes to the first
-  // top-level ',' or ')' (parens/brackets nest; quoted regions protect
-  // grammar bytes), trailing whitespace trimmed, no escape processing.  A
-  // value that is entirely one quoted string delivers its unescaped content;
-  // quotes appearing mid-text are ordinary bytes.
+  // top-level ',' or ')' (parens/brackets nest), trailing whitespace trimmed,
+  // no escape processing.  A value that is entirely ONE quoted string
+  // delivers its unescaped content (quote the whole value to protect commas
+  // and parens); a quote anywhere else is an ordinary byte, so
+  // match(don't stop, ...) just works.
   std::string_view parseRawText(std::string_view fn) {
     cur.skipWs();
     size_t start = cur.position();
@@ -1164,7 +1184,7 @@ private:
       char nxt = cur.peek();
       cur.seek(after);
       if (nxt == ',' || nxt == ')') return body;
-      cur.seek(save);  // the quotes were interior; raw text includes them
+      cur.seek(save);  // the quote was interior; raw text includes it
     }
 
     int parens = 0;
@@ -1176,11 +1196,6 @@ private:
         continue;
       }
       char b = cur.peek();
-      if (b == '"' || b == '\'') {
-        scanQuoted();  // protected region (errors when unterminated)
-        lastNonWs = cur.position();
-        continue;
-      }
       if (b == '(') parens++;
       if (b == '[') brackets++;
       if (b == ']' && brackets > 0) brackets--;

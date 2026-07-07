@@ -55,15 +55,25 @@ most values need no escaping:
   `url_s:https://x.com/a?b=1` and `time_s:12:30:00` parse as you'd hope.
 - `*` is a wildcard only at the end of a term. `mess*` is a prefix query;
   `a*b` is the literal term `a*b`.
-- `~` is fuzzy only as a trailing `~` or `~N`. `dune~1` is fuzzy; `a~b` is
-  literal.
+- `~` is fuzzy only as a trailing `~` or `~N` (a whole number of edits).
+  `dune~1` is fuzzy; `a~b` is literal.
 - `^` is reserved for boost, which is not implemented yet. A trailing `^2`
   is a parse error; anywhere else it is a literal character.
+- Quotes start a quoted value only where a value can begin - right after
+  `field:`, whitespace, `(`, a `,` or `=` in arguments. Anywhere else a
+  quote is an ordinary character, so `title_w:don't` is one word.
 - `\` escapes the next character when you do need one: `status_s:a\:b`.
 - Inside quotes the only escapes are `\"`, `\'`, and `\\`.
 
-Whitespace, parentheses, and quotes are always structural; quote or escape
-values that contain them.
+Whitespace and parentheses are always structural; when a value contains
+them - or anything else you don't want the grammar to see - quote the whole
+value. Inside quotes, nothing is special except the closing quote and the
+three escapes above.
+
+Coming from Lucene or Solr: `?` and mid-word `*` are **not** wildcards here,
+and `/re/` is not a regex - all three are ordinary characters, and that will
+not change. Wildcard and regex queries will arrive as named functions
+(`wildcard(...)`, `regex(...)`) when the engine grows the query types.
 
 ## AND, OR, NOT, and +/-
 
