@@ -937,17 +937,56 @@ public:
     }
     buildImpactFrontier(Postings::DOCS_BLOCK_SIZE);
 
+    // Doc-part encoding decision (token byte + body; see Postings::DOC_BLOCK_*
+    // and DocsEnum). Dense blocks store doc ids as a bitset over (base, lastDoc]
+    // instead of PFor deltas, and a fully consecutive block stores nothing at
+    // all. Storage rule as in Lucene: the bitset wins whenever it costs no more
+    // than the next-larger packed width, biasing ties toward the bitset (its
+    // word-OR count fill and cheaper decode are worth it).
+    // docBase = the doc id bit 0 of the bitset form maps to. The term's first
+    // block has no previous doc and docid 0 is legal, so its span starts AT the
+    // (zero) base; later blocks start one past the previous block's last id.
+    // A flushed block's last doc is >= DOCS_BLOCK_SIZE - 1 > 0, so base == 0
+    // identifies the first block (mirrors the reader's docOrd == 0 test).
+    const uint32_t docBase = base + (base == 0 ? 0 : 1);
+    const uint32_t spanBits = lastDoc - docBase + 1;
+    assert(spanBits >= (uint32_t) Postings::DOCS_BLOCK_SIZE);
+    uint32_t deltaOr = (uint32_t) docs[0] - base;
+    for (size_t i = 1; i < docs.size(); i++) {
+      deltaOr |= (uint32_t) (docs[i] - docs[i - 1]);
+    }
+    const uint32_t bitsPerValue = 32 - (uint32_t) std::countl_zero(deltaOr | 1);
+    const uint32_t numWords = (spanBits + 63) / 64;
+
     compressed_output.resize(2 * (Postings::DOCS_BLOCK_SIZE * sizeof(int32_t) + 1024));
-    uint32_t compressedSize = (uint32_t) compressed_output.size(); // this gets changed to the actual size
-    IndexCodec::docCodec.encodeBlock(reinterpret_cast<uint32_t *>(docs.data()), docs.size(), compressed_output.data(),
-                                  compressedSize, base);
-    uint32_t blockByteLen = compressedSize;
+    uint32_t blockByteLen;
+    if (spanBits == (uint32_t) Postings::DOCS_BLOCK_SIZE) {
+      compressed_output[0] = Postings::DOC_BLOCK_CONTIGUOUS;
+      blockByteLen = 1;
+    } else if (std::min(32u, bitsPerValue + 1) * (uint32_t) Postings::DOCS_BLOCK_SIZE <= numWords * 64) {
+      compressed_output[0] = Postings::DOC_BLOCK_PACKED;
+      uint32_t compressedSize = (uint32_t) compressed_output.size() - 1; // this gets changed to the actual size
+      IndexCodec::docCodec.encodeBlock(reinterpret_cast<uint32_t *>(docs.data()), docs.size(), compressed_output.data() + 1,
+                                    compressedSize, base);
+      blockByteLen = 1 + compressedSize;
+    } else {
+      assert(numWords <= 63);
+      compressed_output[0] = (char) (int8_t) -(int32_t) numWords;
+      uint64_t words[64];
+      memset(words, 0, numWords * 8);
+      for (auto d : docs) {
+        const uint32_t s = (uint32_t) d - docBase;
+        words[s >> 6] |= 1ULL << (s & 63);
+      }
+      memcpy(compressed_output.data() + 1, words, numWords * 8);
+      blockByteLen = 1 + numWords * 8;
+    }
 
     //
     // now the term freqs (omitted entirely for DOCS-only fields)
     //
     if (hasFreqs) {
-      compressedSize = (uint32_t) compressed_output.size() - blockByteLen; // this gets changed to the actual size
+      uint32_t compressedSize = (uint32_t) compressed_output.size() - blockByteLen; // this gets changed to the actual size
       IndexCodec::tfreqCodec.encodeBlock(reinterpret_cast<uint32_t *>(tfreqs.data()), tfreqs.size(), compressed_output.data() + blockByteLen,
                                       compressedSize);
       blockByteLen += compressedSize;

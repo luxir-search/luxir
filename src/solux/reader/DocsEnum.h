@@ -5,6 +5,9 @@
 #include "solux/codec/Codec.h"
 #include "solux/codec/StreamVByte.h"
 #include <algorithm>
+#include <array>
+#include <bit>
+#include <cstring>
 #include <span>
 #include <utility>
 #include <vector>
@@ -129,7 +132,9 @@ private:
   int32_t posRepairStart = 0;  // inclusive index in tfreqBuf/docBuf
   int32_t posRepairEnd = 0;    // exclusive index; current doc is end - 1
 
-  int32_t db[Postings::DOCS_BLOCK_SIZE];  // temporary...
+  // +7: expandDocWords writes branchless 8-wide rows, spilling up to 7 slots
+  // past the last doc.
+  int32_t db[Postings::DOCS_BLOCK_SIZE + 7];  // temporary...
   int32_t pb[Postings::POSITIONS_BLOCK_SIZE];
   int32_t tb[Postings::POSITIONS_BLOCK_SIZE];
 
@@ -166,6 +171,60 @@ private:
   }
 
   static constexpr int32_t DECODED_ADVANCE_LINEAR_PROBE = 8;
+
+  // Position docIS at the current block body: skip the group header on an L1
+  // boundary and the L0 header, unless an L0 walk already left the stream at
+  // the body (bodyReady).
+  void seekToBlockBody() {
+    if (!bodyReady) {
+      if (isL1Boundary(nextL0Block)) {
+        auto groupHeaderLen = docIS.readVint();
+        docIS.skip(groupHeaderLen);
+      }
+      auto headerLen = docIS.readVint();
+      docIS.skip(headerLen);
+    } else {
+      bodyReady = false;
+    }
+  }
+
+  // BITPOS[b][i] = bit index of the i-th set bit of byte b (0 in unused slots).
+  static constexpr auto BITPOS = [] {
+    std::array<std::array<uint8_t, 8>, 256> t{};
+    for (int b = 0; b < 256; b++) {
+      int n = 0;
+      for (int i = 0; i < 8; i++) {
+        if (b & (1 << i)) {
+          t[(size_t) b][(size_t) n++] = (uint8_t) i;
+        }
+      }
+    }
+    return t;
+  }();
+
+  // Expand a bitset-encoded doc block (numWords 64-bit words over
+  // [docBase, lastDoc], see Postings::DOC_BLOCK_*) into docBuf. Exactly
+  // DOCS_BLOCK_SIZE bits are set. Each byte emits a branchless 8-wide row
+  // (vectorized u8->i32 widen + add); dst advances by the byte's popcount, so
+  // up to 7 slots past the final doc are scribbled (docBuf is padded for it).
+  void expandDocWords(const char* p, int32_t numWords, uint32_t docBase) {
+    int32_t* dst = docBuf;
+    for (int32_t w = 0; w < numWords; w++) {
+      uint64_t word;
+      memcpy(&word, p + (int64_t) w * 8, 8);
+      const uint32_t wordBase = docBase + (uint32_t) (w << 6);
+      for (int32_t b = 0; b < 8; b++) {
+        const uint8_t byte = (uint8_t) (word >> (b * 8));
+        const uint32_t byteBase = wordBase + (uint32_t) (b << 3);
+        const uint8_t* row = BITPOS[byte].data();
+        for (int32_t i = 0; i < 8; i++) {
+          dst[i] = (int32_t) (byteBase + row[i]);
+        }
+        dst += std::popcount(byte);
+      }
+    }
+    assert(dst - docBuf == Postings::DOCS_BLOCK_SIZE);
+  }
 
   int32_t findDecodedRemainderGEQ(int32_t start, int32_t target) const {
     int32_t j = start;
@@ -398,16 +457,7 @@ private:
       const uint32_t base = (docOrd == 0) ? 0 : (uint32_t) docBuf[Postings::DOCS_BLOCK_SIZE - 1];
       const int32_t blockStartOrd = docOrd;
 
-      if (!bodyReady) {
-        if (isL1Boundary(nextL0Block)) {
-          auto groupHeaderLen = docIS.readVint();
-          docIS.skip(groupHeaderLen);
-        }
-        auto headerLen = docIS.readVint();
-        docIS.skip(headerLen);
-      } else {
-        bodyReady = false;
-      }
+      seekToBlockBody();
       // Every path from here decodes exactly one docs block (full block or tail).
       skipCount(SkipStats::docBlocksDecoded);
 
@@ -415,10 +465,27 @@ private:
       // If we start partial decoding of blocks (say because of skipping), then we would want something
       // like lastBlockEncodedPosOrd, but for docs.
       if (leftToRead >= Postings::DOCS_BLOCK_SIZE) {
-        uint32_t outSz = Postings::DOCS_BLOCK_SIZE;
-        auto bytesRead = IndexCodec::docCodec.decodeBlock(docIS.ptr(), docIS.left(), (uint32_t*)docBuf, outSz, base);
-        docIS.skip(bytesRead);
-        assert(outSz == Postings::DOCS_BLOCK_SIZE);
+        const int8_t token = (int8_t) *docIS.ptr();
+        docIS.skip(1);
+        if (token > 0) {
+          uint32_t outSz = Postings::DOCS_BLOCK_SIZE;
+          auto bytesRead = IndexCodec::docCodec.decodeBlock(docIS.ptr(), docIS.left(), (uint32_t*)docBuf, outSz, base);
+          docIS.skip(bytesRead);
+          assert(outSz == Postings::DOCS_BLOCK_SIZE);
+        } else {
+          // docBase = doc id of bit 0: the term's first block spans from the
+          // (zero) base itself, later blocks from one past the previous
+          // block's last id (see PostingsWriter::flushDocs).
+          const uint32_t docBase = base + (blockStartOrd == 0 ? 0 : 1);
+          if (token == Postings::DOC_BLOCK_CONTIGUOUS) {
+            for (int32_t i = 0; i < Postings::DOCS_BLOCK_SIZE; i++) {
+              docBuf[i] = (int32_t) docBase + i;
+            }
+          } else {
+            expandDocWords(docIS.ptr(), -token, docBase);
+            docIS.skip((int64_t) -token * 8);
+          }
+        }
         docBufIdx = 0;
         docBufEnd = Postings::DOCS_BLOCK_SIZE;
 
@@ -429,8 +496,8 @@ private:
             docIS.skip(bytesSkipped);
             skipCount(SkipStats::docsOnlyFreqBlocksSkipped);
           } else {
-            outSz = Postings::DOCS_BLOCK_SIZE;  // currently parallel to docs, so must be same block size
-            bytesRead = IndexCodec::tfreqCodec.decodeBlock(docIS.ptr(), docIS.left(), (uint32_t*)tfreqBuf, outSz);
+            uint32_t outSz = Postings::DOCS_BLOCK_SIZE;  // currently parallel to docs, so must be same block size
+            auto bytesRead = IndexCodec::tfreqCodec.decodeBlock(docIS.ptr(), docIS.left(), (uint32_t*)tfreqBuf, outSz);
             docIS.skip(bytesRead);
             assert(outSz == Postings::DOCS_BLOCK_SIZE);
           }
@@ -601,6 +668,206 @@ public:
     tfreq = 1;
     docid = docBuf[limit - 1];
     blockMode = true;
+  }
+
+private:
+  // OR decoded doc ids into `bits` (bit = doc - bitsBase); a contiguous run
+  // collapses to a word-mask range fill.
+  static void orDocBits(std::span<uint64_t> bits, const int32_t* docs,
+                        int32_t count, int32_t bitsBase) {
+    if (count <= 0) {
+      return;
+    }
+    if (docs[count - 1] - docs[0] == count - 1) {
+      skipCount(SkipStats::countBulkFillContiguousBlocks);
+      orBitRange(bits, docs[0] - bitsBase, count);
+      return;
+    }
+    for (int32_t i = 0; i < count; i++) {
+      int32_t index = docs[i] - bitsBase;
+      bits[(size_t) (index >> 6)] |= 1ULL << (index & 63);
+    }
+  }
+
+  static void orBitRange(std::span<uint64_t> bits, int32_t firstIndex,
+                         int32_t count) {
+    assert(firstIndex >= 0);
+    assert(count >= 0);
+    int32_t word = firstIndex >> 6;
+    int32_t bit = firstIndex & 63;
+    while (count > 0) {
+      int32_t take = std::min(count, 64 - bit);
+      uint64_t mask = take == 64 ? ~0ULL : ((1ULL << take) - 1ULL) << bit;
+      bits[(size_t) word] |= mask;
+      count -= take;
+      word++;
+      bit = 0;
+    }
+  }
+
+  // OR stored bitset words (bit i = doc docBase + i) into `bits`
+  // (bit j = doc bitsBase + j), recording only docs >= clipDoc. Requires
+  // clipDoc >= bitsBase; the caller guarantees every recorded bit lands
+  // inside `bits`.
+  static void orShiftedWords(std::span<uint64_t> bits, int32_t bitsBase,
+                             const char* src, int32_t numWords,
+                             uint32_t docBase, int32_t clipDoc) {
+    assert(clipDoc >= bitsBase);
+    for (int32_t w = 0; w < numWords; w++) {
+      uint64_t word;
+      memcpy(&word, src + (int64_t) w * 8, 8);
+      if (word == 0) {
+        continue;
+      }
+      const int64_t wordDoc0 = (int64_t) docBase + ((int64_t) w << 6);
+      if (wordDoc0 + 63 < clipDoc) {
+        continue;
+      }
+      if (clipDoc > wordDoc0) {
+        word &= ~0ULL << (clipDoc - wordDoc0);
+        if (word == 0) {
+          continue;
+        }
+      }
+      int64_t dstBit0 = wordDoc0 - bitsBase;
+      if (dstBit0 < 0) {
+        // Bits below bitsBase were cleared by the clip (clipDoc >= bitsBase),
+        // so the surviving bits shift into range.
+        word >>= (uint32_t) -dstBit0;
+        dstBit0 = 0;
+      }
+      const size_t idx = (size_t) (dstBit0 >> 6);
+      const int32_t off = (int32_t) (dstBit0 & 63);
+      bits[idx] |= word << off;
+      if (off != 0) {
+        uint64_t hi = word >> (64 - off);
+        if (hi != 0) {
+          bits[idx + 1] |= hi;
+        }
+      }
+    }
+  }
+
+  // Consume whole word-encoded full blocks lying entirely below upTo, OR-ing
+  // their bits into `bits` without expanding to docBuf. Stops with the stream
+  // ready for the regular decode on a packed block, the tail, or a block
+  // straddling upTo. Returns whether any block was consumed.
+  bool orWholeWordBlocks(std::span<uint64_t> bits, int32_t bitsBase,
+                         int32_t upTo) {
+    bool consumed = false;
+    while (docfreq - docOrd >= Postings::DOCS_BLOCK_SIZE) {
+      seekToBlockBody();
+      bodyReady = true;  // the stream is committed past the headers either way
+      const int8_t token = (int8_t) *docIS.ptr();
+      if (token > 0) {
+        break;  // packed: the regular decode path takes it from here
+      }
+      const uint32_t base = (docOrd == 0) ? 0 : (uint32_t) docBuf[Postings::DOCS_BLOCK_SIZE - 1];
+      const uint32_t docBase = base + (docOrd == 0 ? 0 : 1);
+      const int32_t numWords = token == Postings::DOC_BLOCK_CONTIGUOUS ? 0 : -token;
+      uint32_t blockLast;
+      if (token == Postings::DOC_BLOCK_CONTIGUOUS) {
+        blockLast = docBase + Postings::DOCS_BLOCK_SIZE - 1;
+      } else {
+        uint64_t lastWord;
+        memcpy(&lastWord, docIS.ptr() + 1 + (int64_t) (numWords - 1) * 8, 8);
+        assert(lastWord != 0);
+        blockLast = docBase + (uint32_t) (numWords - 1) * 64
+                    + (63 - (uint32_t) std::countl_zero(lastWord));
+      }
+      if ((int32_t) blockLast >= upTo) {
+        break;  // straddles upTo: the decode path splits it per doc
+      }
+
+      const int32_t clipDoc = std::max((int32_t) docBase, bitsBase);
+      if (token == Postings::DOC_BLOCK_CONTIGUOUS) {
+        if ((int32_t) blockLast >= clipDoc) {
+          orBitRange(bits, clipDoc - bitsBase, (int32_t) blockLast - clipDoc + 1);
+        }
+      } else {
+        orShiftedWords(bits, bitsBase, docIS.ptr() + 1, numWords, docBase, clipDoc);
+      }
+      skipCount(SkipStats::countBulkFillWordBlocks);
+
+      // Wholesale consume, mirroring skipToBlock's re-anchor shape: the next
+      // decode's cross-block base is this block's last id in docBuf.
+      docIS.skip(1 + (int64_t) numWords * 8);
+      if (hasFreqs) {
+        auto bytesSkipped = IndexCodec::tfreqCodec.skipBlock(docIS.ptr(), docIS.left());
+        docIS.skip(bytesSkipped);
+        skipCount(SkipStats::docsOnlyFreqBlocksSkipped);
+        tfreqOrd += Postings::DOCS_BLOCK_SIZE;
+      }
+      bodyReady = false;
+      const int32_t blockStartOrd = docOrd;
+      docOrd += Postings::DOCS_BLOCK_SIZE;
+      tfreqBufIdx = tfreqBufEnd = 0;
+      tfreq = 1;
+      docid = (int32_t) blockLast;
+      blockMode = true;
+      docBuf[Postings::DOCS_BLOCK_SIZE - 1] = (int32_t) blockLast;
+      docBufIdx = docBufEnd = Postings::DOCS_BLOCK_SIZE;
+      nextL0Base = blockLast;
+      nextL0Block = blockStartOrd / Postings::DOCS_BLOCK_SIZE + 1;
+      if (isL1Boundary(nextL0Block)) {
+        nextL1Group = nextL0Block / L1_PERIOD;
+        nextL1Base = nextL0Base;
+        nextL1CumTf = nextL0CumTf;
+      }
+      consumed = true;
+    }
+    return consumed;
+  }
+
+public:
+  // Bulk count fill (the Lucene PostingsEnum#intoBitSet shape): consume every
+  // remaining doc below upTo, setting bit (doc - bitsBase) for docs at or past
+  // bitsBase; docs below bitsBase are consumed unrecorded (the caller's window
+  // can open past the current position). Docs-only consumption: freq blocks
+  // are skipped and this enum can never serve termFreq() or positions again.
+  // Whole word-encoded blocks below upTo are OR'd straight from the stream;
+  // everything else decodes and scatters per doc.
+  void intoBitSet(std::span<uint64_t> bits, int32_t bitsBase, int32_t upTo) {
+    assert(!trackPositions);
+    docsOnlyConsumed = true;
+    for (;;) {
+      if ((docid < 0 || blockMode) && docBufIdx >= docBufEnd
+          && orWholeWordBlocks(bits, bitsBase, upTo)) {
+        continue;
+      }
+      auto blockDocs = peekDocOnlyBlock();
+      int32_t available = (int32_t) blockDocs.size();
+      if (available == 0) {
+        return;
+      }
+
+      int32_t used = 0;
+      while (used < available && blockDocs[(size_t) used] < bitsBase) {
+        used++;
+      }
+      int32_t firstEmit = used;
+      while (used < available && blockDocs[(size_t) used] < upTo) {
+        used++;
+      }
+
+      int32_t emit = used - firstEmit;
+      if (emit > 0) {
+        skipCount(SkipStats::countBulkFillBlocks);
+        if (SkipStats::enabled) {
+          SkipStats::countBulkFillDocs += emit;
+        }
+        orDocBits(bits, blockDocs.data() + firstEmit, emit, bitsBase);
+      }
+
+      if (used == 0) {
+        return;
+      }
+      consumeDocOnlyBlock(used);
+
+      if (used < available) {
+        return;
+      }
+    }
   }
 
   // Return remaining decoded docs/freqs from the current block. This is a

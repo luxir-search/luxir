@@ -2485,6 +2485,87 @@ TEST_F(TermScorerTest, countBulkFillContiguousDenseBlocks) {
   SkipStats::enabled = savedStats;
 }
 
+// Dense-but-not-contiguous postings store as bitset words; intoBitSet must OR
+// whole word blocks straight from the stream (no decode) and agree with the
+// indexed doc list across window boundaries that straddle blocks.
+TEST_F(TermScorerTest, intoBitSetWordBlocksMatchIteration) {
+  const int32_t N = 10000;
+  TestIndex testIndex;
+  TestField f(testIndex, "body_w");
+  f.startIndexing();
+  uint32_t state = 0xb17b17u;
+  auto nextRand = [&]() {
+    state = state * 1664525u + 1013904223u;
+    return state;
+  };
+  std::vector<int32_t> expected;
+  for (int32_t doc = 0; doc < N; doc++) {
+    std::string body;
+    if ((nextRand() & 0x3u) != 3) {  // ~3/4 density -> unary word blocks
+      body += "wordy ";
+      expected.push_back(doc);
+    }
+    body += "filler";
+    f.add(doc, body);
+  }
+  testIndex.flush();
+  f.startReading();
+
+  auto poolFree = testIndex.pool.rewindScopeGuard();
+  auto& segment = testIndex.reader->segments()[0];
+  PostingsReader& postingsReader = segment.postingsReader();
+  FieldReader fieldReader(testIndex.pool, postingsReader);
+  ASSERT_TRUE(fieldReader.seek("body_w"));
+  SegFieldInfo fieldInfo;
+  fieldReader.readFieldInfo(fieldInfo);
+  TermsEnum tenum(testIndex.pool, postingsReader, fieldInfo);
+  ASSERT_TRUE(tenum.seek("wordy"));
+
+  bool savedStats = SkipStats::enabled;
+  SkipStats::enabled = true;
+  SkipStats::reset();
+
+  // Contiguous windows with boundaries that land inside word blocks (4097 is
+  // deliberately off the 128-doc grid).
+  DocsEnum denum(testIndex.pool, postingsReader, tenum);
+  denum.setTrackPositions(false);
+  const int32_t bounds[] = {0, 1000, 4097, 6000, N + 100};
+  std::vector<int32_t> got;
+  for (size_t w = 0; w + 1 < std::size(bounds); w++) {
+    const int32_t from = bounds[w], to = bounds[w + 1];
+    std::vector<uint64_t> bits((size_t) (to - from + 63) / 64, 0);
+    denum.intoBitSet(bits, from, to);
+    for (int32_t i = 0; i < to - from; i++) {
+      if (bits[(size_t) i >> 6] & (1ULL << (i & 63))) {
+        got.push_back(from + i);
+      }
+    }
+  }
+  EXPECT_EQ(got, expected);
+  EXPECT_GT(SkipStats::countBulkFillWordBlocks, 0);
+  SkipStats::enabled = savedStats;
+
+  // A window opening past the enum position: leading docs are consumed
+  // unrecorded and the first word block is clipped.
+  DocsEnum denum2(testIndex.pool, postingsReader, tenum);
+  denum2.setTrackPositions(false);
+  const int32_t from = 50, to = 700;
+  std::vector<uint64_t> bits((size_t) (to - from + 63) / 64, 0);
+  denum2.intoBitSet(bits, from, to);
+  std::vector<int32_t> got2, want2;
+  for (int32_t i = 0; i < to - from; i++) {
+    if (bits[(size_t) i >> 6] & (1ULL << (i & 63))) {
+      got2.push_back(from + i);
+    }
+  }
+  for (int32_t d : expected) {
+    if (d >= from && d < to) {
+      want2.push_back(d);
+    }
+  }
+  EXPECT_EQ(got2, want2);
+}
+
 TEST_F(TermScorerTest, docsOnlyEnumProtocolAssertsOnFreqAndPositions) {
 #ifndef NDEBUG
   const int32_t N = 8;

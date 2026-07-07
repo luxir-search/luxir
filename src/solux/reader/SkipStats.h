@@ -58,6 +58,9 @@ struct SkipStats {
   static inline int64_t countBulkFillBlocks = 0;
   static inline int64_t countBulkFillDocs = 0;
   static inline int64_t countBulkFillContiguousBlocks = 0;
+  // Whole word-encoded (bitset/contiguous) doc blocks OR'd into count windows
+  // straight from the stream, without decoding to the doc buffer.
+  static inline int64_t countBulkFillWordBlocks = 0;
   static inline int64_t docsOnlyFreqBlocksSkipped = 0;
 
   static void reset() {
@@ -86,6 +89,7 @@ struct SkipStats {
     countBulkFillBlocks = 0;
     countBulkFillDocs = 0;
     countBulkFillContiguousBlocks = 0;
+    countBulkFillWordBlocks = 0;
     docsOnlyFreqBlocksSkipped = 0;
   }
 };

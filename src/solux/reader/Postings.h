@@ -17,6 +17,21 @@ public:
   static constexpr int32_t DOCS_BLOCK_SIZE =  128;
   static constexpr int32_t NUMERIC_BLOCK_SIZE = 16384;
 
+  // First byte of every full doc-block body selects the doc-id encoding
+  // (PostingsWriter::flushDocs writes it; DocsEnum dispatches on it):
+  //   positive: PFor-delta blob (the docs codec's own framing follows)
+  //   zero:     all DOCS_BLOCK_SIZE docs are consecutive after the cross-block
+  //             base; the body is empty
+  //   negative: -numWords 64-bit little-endian bitset words spanning
+  //             [docBase, lastDoc], bit index = doc - docBase, where docBase
+  //             is the cross-block base + 1 (or the zero base itself for the
+  //             term's first block, since docid 0 is legal)
+  // Partial tail blocks (StreamVByte) carry no token. The bitset form caps at
+  // 63 words (the writer only picks it when it beats packed deltas, which are
+  // at most 32 bits/doc = 64 words).
+  static constexpr int8_t DOC_BLOCK_PACKED = 1;
+  static constexpr int8_t DOC_BLOCK_CONTIGUOUS = 0;
+
   // Filename related utilities.  We try to keep filenames short for many reasons, including
   // being able to fit in short-string optimization.
 

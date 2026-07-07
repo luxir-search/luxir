@@ -381,38 +381,6 @@ public:
       }
     }
 
-    static void orWindowRange(std::span<uint64_t> windowBits, int32_t firstIndex,
-                              int32_t count) {
-      assert(firstIndex >= 0);
-      assert(count >= 0);
-      int32_t word = firstIndex >> 6;
-      int32_t bit = firstIndex & 63;
-      while (count > 0) {
-        int32_t take = std::min(count, 64 - bit);
-        uint64_t mask = take == 64 ? ~0ULL : ((1ULL << take) - 1ULL) << bit;
-        windowBits[(size_t) word] |= mask;
-        count -= take;
-        word++;
-        bit = 0;
-      }
-    }
-
-    static void orWindowDocs(std::span<uint64_t> windowBits, const int32_t* docs,
-                             int32_t count, int32_t windowStart) {
-      if (count <= 0) {
-        return;
-      }
-      if (docs[count - 1] - docs[0] == count - 1) {
-        skipCount(SkipStats::countBulkFillContiguousBlocks);
-        orWindowRange(windowBits, docs[0] - windowStart, count);
-        return;
-      }
-      for (int32_t i = 0; i < count; i++) {
-        int32_t index = docs[i] - windowStart;
-        windowBits[(size_t) (index >> 6)] |= 1ULL << (index & 63);
-      }
-    }
-
     int32_t fillScoreBlock(int32_t* docs, float* scores, int32_t count, int32_t upTo) override {
       assert(count >= 0);
       if (count <= 0) {
@@ -464,41 +432,7 @@ public:
       if (windowEnd <= windowStart) {
         return;
       }
-
-      for (;;) {
-        auto blockDocs = docsEnum.peekDocBlock();
-        int32_t available = (int32_t) blockDocs.size();
-        if (available == 0) {
-          break;
-        }
-
-        int32_t used = 0;
-        while (used < available && blockDocs[(size_t) used] < windowStart) {
-          used++;
-        }
-        int32_t firstEmit = used;
-        while (used < available && blockDocs[(size_t) used] < windowEnd) {
-          used++;
-        }
-
-        int32_t emit = used - firstEmit;
-        if (emit > 0) {
-          skipCount(SkipStats::countBulkFillBlocks);
-          if (SkipStats::enabled) {
-            SkipStats::countBulkFillDocs += emit;
-          }
-          orWindowDocs(windowBits, blockDocs.data() + firstEmit, emit, windowStart);
-        }
-
-        if (used == 0) {
-          break;
-        }
-        docsEnum.consumeDocOnlyBlock(used);
-
-        if (used < available) {
-          break;
-        }
-      }
+      docsEnum.intoBitSet(windowBits, windowStart, windowEnd);
     }
 
     void setMinCompetitiveScore(float minScore) override {
