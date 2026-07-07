@@ -533,6 +533,16 @@ public:
     /// or populate/mutate Query::Context caches.
     virtual Query::Scorer* createScorer(MemPool& target, IndexReader::Segment& segment) = 0;
 
+    /// Exact number of matching docs in this segment, or -1 when that is not
+    /// known cheaply. A non-negative return must equal what iterating the
+    /// scorer would count. Implementations must return -1 when the segment
+    /// has deleted docs they do not account for; callers must not use this
+    /// when an external filter or domain further restricts eligibility.
+    virtual int64_t count(IndexReader::Segment& segment) {
+      unused(segment);
+      return -1;
+    }
+
     // NOTE: no virtual destructor, so subclasses should be made trivially destructible
   };
 

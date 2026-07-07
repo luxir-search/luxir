@@ -125,6 +125,19 @@ public:
                                                 query.shouldUseFrontierBound());
     }
 
+    // A term's exact match count is its docFreq - free from the term stats -
+    // unless deletions could have removed some of its docs.
+    int64_t count(solux::IndexReader::Segment& segment) override {
+      if (segment.liveDocs() != nullptr) {
+        return -1;
+      }
+      if (cachedTermInfo == nullptr) {
+        return 0;
+      }
+      auto* docsEnum = cachedTermInfo->docsEnums[segment.ord];
+      return docsEnum == nullptr ? 0 : docsEnum->numDocs();
+    }
+
     // Per-segment supplier that exposes the term's real cost (its number of docs
     // in this segment) so compound scorers can order leaders by cost. The
     // default supplier reports maxDoc for every clause, which is useless for

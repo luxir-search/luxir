@@ -297,7 +297,22 @@ public:
             sourcePreparedAgainstFilter && preparedWeight->outputIsSubsetOfDomain()
               ? nullptr
               : filter;
-          if (data->useFieldSort) {
+          // Exact-count shortcut: a count-only collection (limit 0) over the
+          // raw query - no filters, no deletes (null filter per the domain
+          // contract), no sub-op domain to build - can often read the count
+          // straight from index stats (a term's docFreq) without iterating.
+          bool counted = false;
+          if (!preparedMode && builderPtr == nullptr && filter == nullptr
+              && !data->useFieldSort && data->scoreCollector->topCount == 0) {
+            int64_t exact = op.weight->count(seg);
+            if (exact >= 0) {
+              data->scoreCollector->hitCount += exact;
+              counted = true;
+            }
+          }
+          if (counted) {
+            // fall through to the sub-calc/merge tail below
+          } else if (data->useFieldSort) {
             auto* scorer = supplier->get(poolGuard.pool(), std::numeric_limits<int64_t>::max());
             if (scorer != nullptr) {
               data->fieldCollector->setSegment(segnum, &seg.postingsReader());

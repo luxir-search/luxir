@@ -472,6 +472,21 @@ public:
     Scorer* createScorer(solux::MemPool& targetPool, solux::IndexReader::Segment& segment) override {
       return scorerSupplier(targetPool, segment)->get(targetPool, std::numeric_limits<int64_t>::max());
     }
+
+    // Single-clause boolean shapes delegate to the wrapped clause; compound
+    // shapes have no cheap exact count (clause overlap is unknown).
+    int64_t count(solux::IndexReader::Segment& segment) override {
+      if (!prohibitedWeights.empty() || !filterWeights.empty() || minShouldMatch > 1) {
+        return -1;
+      }
+      if (mandatoryWeights.size() == 1 && optionalWeights.empty()) {
+        return mandatoryWeights[0]->count(segment);
+      }
+      if (mandatoryWeights.empty() && optionalWeights.size() == 1) {
+        return optionalWeights[0]->count(segment);
+      }
+      return -1;
+    }
   };  // BooleanQuery::Weight
 
   class Scorer final : public Query::Scorer {
