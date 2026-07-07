@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <optional>
 
+#include "ImpactsIndex.h"
 #include "Query.h"
 #include "solux/reader/NormsReader.h"
 
@@ -95,10 +96,29 @@ public:
               ? targetPool.make<NormsReader>(segment.postingsReader(), *segFieldInfo)
               : nullptr;
 
+      // Per-term block impact indexes evaluated with the PHRASE's scorer:
+      // phraseFreq <= each term's freq in a doc, so every term's (maxTf,
+      // minNorm) frontier bounds the phrase score, and the min across terms
+      // bounds any doc range.  Much looser than a term's own bound (real
+      // phrase freq is usually far below the min term tf), so pruning bites
+      // later - but skipped ranges never touch their position bytes.
+      std::span<ImpactsIndex> impacts;
+      if (simScorer != nullptr && normsReader != nullptr) {
+        auto built = targetPool.make_span<ImpactsIndex>(docsEnums.size());
+        bool allBuilt = true;
+        for (size_t i = 0; i < docsEnums.size(); i++) {
+          built[i].build(targetPool, *docsEnums[i], *simScorer, 1.0f);
+          allBuilt &= !built[i].empty();
+        }
+        if (allBuilt) {
+          impacts = built;  // a term without impact data (pulsed) disables bounding
+        }
+      }
+
       // no need to make copy, the query will outlive the scorers.
       // auto pos = targetPool.copy_span<const int32_t>(query.getPositions());
 
-      return targetPool.make<PhraseQuery::Scorer>(targetPool, docsEnums, query.getPositions(), normsReader, simScorer);
+      return targetPool.make<PhraseQuery::Scorer>(targetPool, docsEnums, query.getPositions(), normsReader, simScorer, impacts);
     }
 
     // A phrase matches a subset of the docs containing its rarest term, so its
@@ -143,6 +163,16 @@ public:
     // Both absent when scores are not needed; score() is 0.
     std::optional<NormsReader::Iterator> normsIter;
     Similarity::BM25Scorer* simScorer;
+    // One impact index per term, evaluated with the phrase's simScorer; empty
+    // when not scoring or when any term lacks impact data.
+    std::span<ImpactsIndex> impacts;
+    float minCompetitiveScore = 0.0f;
+    // Candidates <= competitiveUpTo passed the bound check under the current
+    // threshold; they skip re-evaluation (the common case is many candidates
+    // per block range).  Reset when the threshold rises.
+    int32_t competitiveUpTo = -1;
+    int32_t shallowTarget = -1;
+    int64_t skippedRangeCount = 0;
 
     int32_t docid = -1;
     int32_t pos = -1;    // position of last match, or END if no more matches.
@@ -228,6 +258,49 @@ public:
       return doNext(docsEnums[0]->advance(target));
     }
 
+    // Hop the conjunction past doc-block ranges whose phrase score bound cannot
+    // reach the collector's threshold, leaving docid on a candidate worth
+    // position-verifying (or END).  Skipped ranges never touch their position
+    // bytes: the doc-level skip repairs the position stream lazily.  Only the
+    // single-phase drivers (next/advance) prune; matches() stays pure so a
+    // two-phase parent gets unchanged match semantics.
+    void advanceToCompetitive() {
+      if (docid <= competitiveUpTo) {
+        return;  // this block range already passed under the current threshold
+      }
+      if (impacts.empty() || !(minCompetitiveScore > 0.0f) || disablePruningForTests) {
+        return;
+      }
+      while (docid != PostingsReader::END) {
+        float bound = std::numeric_limits<float>::infinity();
+        float remainingBound = std::numeric_limits<float>::infinity();
+        int32_t rangeEnd = PostingsReader::END - 1;
+        for (const auto& termImpacts : impacts) {
+          int32_t block = termImpacts.blockContaining(docid);
+          // a conjunction candidate lies within every term's postings
+          assert(block < termImpacts.blockCount());
+          bound = std::min(bound, termImpacts.impact(block));
+          remainingBound = std::min(remainingBound, termImpacts.maxImpactFrom(block));
+          rangeEnd = std::min(rangeEnd, termImpacts.lastDoc(block));
+        }
+        if (bound >= minCompetitiveScore) {
+          competitiveUpTo = rangeEnd;
+          return;
+        }
+        skippedRangeCount++;
+        if (remainingBound < minCompetitiveScore) {
+          // no later doc can compete for ANY term; the phrase is done
+          docid = PostingsReader::END;
+          return;
+        }
+        if (rangeEnd >= PostingsReader::END - 1) {
+          docid = PostingsReader::END;
+          return;
+        }
+        doApproximationAdvance(rangeEnd + 1);
+      }
+    }
+
     bool doMatches() {
       if (docid == checkedDocid) {
         return checkedMatch;
@@ -265,10 +338,12 @@ public:
   public:
     static inline bool countMatchesForTests = false;
     static inline int64_t matchCallsForTests = 0;
+    // A/B hook: turn off impact-based range skipping (bounds still built).
+    static inline bool disablePruningForTests = false;
 
     Scorer(MemPool& targetPool, std::span<DocsEnum*> docsEnums, std::span<const int32_t> positions, NormsReader* normsReader,
-           Similarity::BM25Scorer* simScorer)
-            : docsEnums(docsEnums), positions(positions), simScorer(simScorer) {
+           Similarity::BM25Scorer* simScorer, std::span<ImpactsIndex> impacts = {})
+            : docsEnums(docsEnums), positions(positions), simScorer(simScorer), impacts(impacts) {
       unused(targetPool);
       // Scoring needs both BM25 and norms, or neither.
       assert((simScorer == nullptr) == (normsReader == nullptr));
@@ -346,13 +421,20 @@ public:
 #ifndef NDEBUG
       markSinglePhase();
 #endif
-      while (docid < PostingsReader::END) {
-        doApproximationNext();
+      if (docid == PostingsReader::END) {
+        return PostingsReader::END;
+      }
+      doApproximationNext();
+      for (;;) {
+        advanceToCompetitive();
+        if (docid == PostingsReader::END) {
+          return PostingsReader::END;
+        }
         if (doMatches()) {
           return docid;
         }
+        doApproximationNext();
       }
-      return PostingsReader::END;
     }
 
     int32_t advance(int32_t target) override {
@@ -364,6 +446,7 @@ public:
       assert(docid < target);
       doApproximationAdvance(target);
       for (;;) {
+        advanceToCompetitive();
         if (docid == PostingsReader::END) {
           return PostingsReader::END;
         }
@@ -384,6 +467,70 @@ public:
         doNextPosition(docsEnums[0]->nextPosition() - positions[0]);
       }
       return freq;
+    }
+
+    void setMinCompetitiveScore(float minScore) override {
+      minCompetitiveScore = minScore;
+      competitiveUpTo = -1;  // re-evaluate ranges under the higher threshold
+    }
+
+    // Upper bound on the phrase score over [current doc, upTo]: the min across
+    // terms of each term's max block impact over that range (phraseFreq <= every
+    // term's freq makes each term's bound valid for the phrase).
+    float getMaxScore(int32_t upTo) override {
+      if (impacts.empty()) {
+        return std::numeric_limits<float>::infinity();
+      }
+      int32_t startDoc = docid;
+      if (shallowTarget >= 0) {
+        startDoc = docid >= 0 ? std::min(docid, shallowTarget) : shallowTarget;
+      }
+      float maxScore = std::numeric_limits<float>::infinity();
+      for (const auto& termImpacts : impacts) {
+        int32_t startBlock = termImpacts.blockContaining(startDoc);
+        if (startBlock >= termImpacts.blockCount()) {
+          continue;  // no data for the range from this term; it cannot lower the min
+        }
+        int32_t upBlock = termImpacts.blockContaining(upTo);
+        if (upBlock >= termImpacts.blockCount()) {
+          upBlock = termImpacts.blockCount() - 1;
+        }
+        if (upBlock < startBlock) {
+          continue;
+        }
+        float termMax;
+        if (upBlock == termImpacts.blockCount() - 1) {
+          termMax = termImpacts.maxImpactFrom(startBlock);
+        } else {
+          termMax = 0.0f;
+          for (int32_t i = startBlock; i <= upBlock; i++) {
+            termMax = std::max(termMax, termImpacts.impact(i));
+          }
+        }
+        maxScore = std::min(maxScore, termMax);
+      }
+      return maxScore;
+    }
+
+    // The bound above target is stable up to the earliest per-term block end.
+    int32_t advanceShallow(int32_t target) override {
+      if (impacts.empty()) {
+        return PostingsReader::END;
+      }
+      shallowTarget = target;
+      int32_t upTo = PostingsReader::END;
+      for (const auto& termImpacts : impacts) {
+        int32_t block = termImpacts.blockContaining(target);
+        if (block >= termImpacts.blockCount()) {
+          return PostingsReader::END;  // a term has no docs past target -> neither does the phrase
+        }
+        upTo = std::min(upTo, termImpacts.lastDoc(block));
+      }
+      return upTo;
+    }
+
+    int64_t skippedRanges() const {
+      return skippedRangeCount;
     }
 
     float score() override {

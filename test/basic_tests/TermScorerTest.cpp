@@ -1836,6 +1836,88 @@ TEST_F(TermScorerTest, termImpactTopKSkippingMatchesExhaustive) {
   }
 }
 
+// Phrase pruning: block 0 holds the strong phrase docs (high phrase tf, short
+// docs) so the top-k threshold rises past what any later block's per-term
+// bounds allow; later blocks are long low-tf docs plus decoys where both terms
+// appear non-adjacent (conjunction candidates that fail position verification).
+// The pruned run must return the exact exhaustive top-k while verifying far
+// fewer candidates - the decoy blocks are skipped without touching positions.
+TEST_F(TermScorerTest, phraseImpactTopKMatchesExhaustive) {
+  const int32_t N = 14 * Postings::DOCS_BLOCK_SIZE + 23;
+  TestIndex testIndex;
+  TestField f(testIndex, "body_w");
+  f.startIndexing();
+  for (int32_t doc = 0; doc < N; doc++) {
+    std::string text;
+    int32_t block = doc / Postings::DOCS_BLOCK_SIZE;
+    if (block == 0 || block == 8) {
+      // Two separated strong regions: the threshold set in block 0 forces the
+      // pruned run to hop the weak ranges between them (not just early-exit).
+      int32_t tf = (block == 0 ? 6 : 5) - (doc % 3);
+      for (int32_t i = 0; i < tf; i++) text += "alpha beta ";
+      for (int32_t i = 0; i < 4 + (doc % 5); i++) text += "pad ";
+    } else if (doc % 7 == 3) {
+      text = "alpha pad beta ";  // decoy: candidate, no phrase
+      for (int32_t i = 0; i < 250 + (doc % 37); i++) text += "pad ";
+    } else {
+      text = "alpha beta ";
+      for (int32_t i = 0; i < 250 + (doc % 37); i++) text += "pad ";
+    }
+    f.add(doc, text);
+  }
+  testIndex.flush();
+  f.startReading();
+
+  auto poolFree = testIndex.pool.rewindScopeGuard();
+  Query::Context qContext(testIndex.pool, *testIndex.reader);
+  auto& segment = qContext.topReader.segments()[0];
+  std::vector<std::string_view> terms = {"alpha", "beta"};
+  std::vector<int32_t> positions = {0, 1};
+
+  for (int32_t k : {1, 5}) {
+    PhraseQuery exhaustiveQuery("body_w", terms, positions);
+    PhraseQuery prunedQuery("body_w", terms, positions);
+    auto* exhaustiveWeight = exhaustiveQuery.createWeight(qContext, Query::NEED_SCORES);
+    auto* prunedWeight = prunedQuery.createWeight(qContext, Query::NEED_SCORES);
+
+    int64_t exhaustiveMatchCalls;
+    TopDocsCollector exhaustiveCollector(k);
+    {
+      PhraseMatchCountGuard guard(true);
+      auto* scorer = exhaustiveWeight->createScorer(testIndex.pool, segment);
+      ASSERT_NE(scorer, nullptr);
+      for (int32_t doc = scorer->next(); doc != PostingsReader::END; doc = scorer->next()) {
+        exhaustiveCollector.collect(0, doc, scorer->score());
+      }
+      exhaustiveMatchCalls = guard.calls();
+    }
+
+    int64_t prunedMatchCalls;
+    int64_t skippedRanges;
+    TopDocsCollector prunedCollector(k);
+    {
+      PhraseMatchCountGuard guard(true);
+      auto* scorer = dynamic_cast<PhraseQuery::Scorer*>(
+          prunedWeight->createScorer(testIndex.pool, segment));
+      ASSERT_NE(scorer, nullptr);
+      collectTopK(0, scorer, nullptr, nullptr, prunedCollector);
+      prunedMatchCalls = guard.calls();
+      skippedRanges = scorer->skippedRanges();
+    }
+
+    auto expected = exhaustiveCollector.sort();
+    auto actual = prunedCollector.sort();
+    ASSERT_EQ(actual.size(), expected.size()) << "k=" << k;
+    for (size_t i = 0; i < expected.size(); i++) {
+      EXPECT_EQ(actual[i].doc, expected[i].doc) << "k=" << k << " i=" << i;
+      EXPECT_EQ(std::bit_cast<uint32_t>(actual[i].score),
+                std::bit_cast<uint32_t>(expected[i].score)) << "k=" << k << " i=" << i;
+    }
+    EXPECT_LT(prunedMatchCalls, exhaustiveMatchCalls) << "k=" << k;
+    EXPECT_GT(skippedRanges, 0) << "k=" << k;
+  }
+}
+
 TEST_F(TermScorerTest, maxScoreDisjunctionTopKMatchesExhaustive) {
   CollectionHelper helper("main");
   addMaxScoreDisjunctionDocs(helper);
