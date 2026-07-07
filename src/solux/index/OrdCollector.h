@@ -43,6 +43,10 @@ public:
       multiValued_ = true;
       // need to convert from a single value to a stream
       auto [ptr, streamAddr] = pool.allocateAddrs(sizeof(IntDeltaStream));  // IntDeltaStream is current 22 bytes, relatively heavyweight.
+      // The tag bit halves the pool's 4 GiB address space: this collector's
+      // pool must stay under 2 GiB (its per-flush scratch pools are far
+      // smaller in practice).
+      assert((streamAddr & 0x80000000u) == 0);
       stream = new (ptr) IntDeltaStream(pool);
       stream->addVal(pool, v);
       ords[docid] = streamAddr | 0x80000000;
