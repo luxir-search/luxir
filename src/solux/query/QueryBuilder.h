@@ -291,6 +291,13 @@ public:
   // int64 (FieldType::coerceColInt64) and folded to an inclusive [lo, hi]
   // window; an empty range collapses to match-nothing.  The field must be a
   // column-stored numeric type.
+  //
+  // DATE bounds round by the granularity the literal names (the window from
+  // DateFieldType::coerceDateRange): gte/lt use the window start, lte/gt the
+  // window end, so [2024-01 TO 2024-06] covers January through June inclusive
+  // and {2024-01 TO 2024-06} excludes both whole months.  Match on a DATE
+  // field routes through here with gte == lte, so equality on a day matches
+  // the whole day.
   Query* createRangeQuery(std::string_view field,
                           const solux::api::Val* gte, const solux::api::Val* gt,
                           const solux::api::Val* lte, const solux::api::Val* lt) {
@@ -316,8 +323,19 @@ public:
     // Coerce every supplied bound first, so a malformed bound is always a
     // request error regardless of whether the range would collapse to empty.
     std::optional<int64_t> loEnc, hiEnc;
-    if (hasGte || hasGt) loEnc = fieldType.coerceColInt64(hasGte ? *gte : *gt, field);
-    if (hasLte || hasLt) hiEnc = fieldType.coerceColInt64(hasLte ? *lte : *lt, field);
+    if (fieldType.type() == FieldType::Type::DATE) {
+      auto& dateType = (DateFieldType&)fieldType;
+      // Window edges chosen so the existing +/-1 exclusive fold below lands
+      // on the granule boundary: gt = the window's last milli (+1 = past it),
+      // lt = the window's first milli (-1 = before it).
+      if (hasGte) loEnc = dateType.coerceDateRange(*gte, field).first;
+      if (hasGt)  loEnc = dateType.coerceDateRange(*gt, field).second - 1;
+      if (hasLte) hiEnc = dateType.coerceDateRange(*lte, field).second - 1;
+      if (hasLt)  hiEnc = dateType.coerceDateRange(*lt, field).first;
+    } else {
+      if (hasGte || hasGt) loEnc = fieldType.coerceColInt64(hasGte ? *gte : *gt, field);
+      if (hasLte || hasLt) hiEnc = fieldType.coerceColInt64(hasLte ? *lte : *lt, field);
+    }
 
     int64_t lo = std::numeric_limits<int64_t>::min();
     int64_t hi = std::numeric_limits<int64_t>::max();

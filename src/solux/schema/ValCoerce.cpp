@@ -46,6 +46,18 @@ int64_t DateFieldType::coerceColInt64(const api::Val& val, std::string_view fiel
   coerce::throwCoerce(fieldName, val, "a date");
 }
 
+std::pair<int64_t, int64_t> DateFieldType::coerceDateRange(const api::Val& val,
+                                                           std::string_view fieldName) const {
+  if (auto i = std::get_if<int64_t>(&val.kind)) return {*i, *i + 1};  // an exact instant
+  if (auto s = std::get_if<std::string_view>(&val.kind)) {
+    if (auto r = parseDateRange(*s)) return {r->lo, r->hiExclusive};
+    throw std::runtime_error(fmt::format(
+        "DATE field '{}': cannot parse '{}' as a date (expected ISO-8601 or epoch millis)",
+        fieldName, *s));
+  }
+  coerce::throwCoerce(fieldName, val, "a date");
+}
+
 std::string_view TextFieldType::coerceTerm(const api::Val& val, std::string_view fieldName,
                                            std::span<char> buf) const {
   return coerce::toText(val, fieldName, buf);

@@ -243,6 +243,13 @@ public:
   }
 
   int64_t coerceColInt64(const api::Val& val, std::string_view fieldName) const override;
+
+  // The [lo, hiExclusive) epoch-millis window a query-side date literal
+  // denotes at its own granularity: "2024-06-25" is the whole day, "2024-06"
+  // the month, epoch millis a single instant.  Queries match/round by the
+  // window; ingest and sorting use coerceColInt64 (the window start).
+  std::pair<int64_t, int64_t> coerceDateRange(const api::Val& val,
+                                              std::string_view fieldName) const;
 };
 
 // Unique id field

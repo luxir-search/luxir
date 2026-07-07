@@ -20,12 +20,19 @@ namespace solux {
 // parseDateToEpochMillis accepts the union of OpenSearch's default
 // "strict_date_optional_time || epoch_millis" (a superset of Solr's canonical
 // 'YYYY-MM-DDThh:mm:ssZ'):
-//   - an ISO-8601 calendar date 'YYYY-MM-DD' with an optional time
-//     ('Thh', 'Thh:mm', 'Thh:mm:ss', optional '.fff' fractional seconds) and
-//     an optional 'Z' or +/-hh:mm zone offset (absent zone == UTC);
-//   - a bare integer (optionally signed), interpreted as epoch milliseconds.
+//   - an ISO-8601 calendar date 'YYYY-MM-DD' (or a month, 'YYYY-MM') with an
+//     optional time ('Thh', 'Thh:mm', 'Thh:mm:ss', optional '.fff' fractional
+//     seconds) and an optional 'Z' or +/-hh:mm zone offset (absent zone == UTC);
+//   - a bare integer (optionally signed), interpreted as epoch milliseconds
+//     (never as a bare year - the integer form keeps its meaning).
 // Returns nullopt if the text is not a recognized form.  Fractional seconds
 // beyond millisecond precision are truncated.
+//
+// parseDateRange additionally reports the time WINDOW the text denotes at its
+// own granularity: '2024-06-25' is the whole day, '2024-06' the whole month,
+// '...T10:30' the whole minute.  Queries use the window (equality on a day
+// matches the day; range endpoints include the granule they name); ingest and
+// sorting use the window start (an instant).
 
 namespace datetime_detail {
 
@@ -110,7 +117,13 @@ public:
 
 } // namespace datetime_detail
 
-inline std::optional<int64_t> parseDateToEpochMillis(std::string_view s) {
+// The [start, end) window a date text denotes at its own granularity.
+struct DateRange {
+  int64_t lo;
+  int64_t hiExclusive;
+};
+
+inline std::optional<DateRange> parseDateRange(std::string_view s) {
   using namespace std::chrono;
   namespace dd = datetime_detail;
   if (s.empty() || s.size() > dd::kMaxParseLen) return std::nullopt;
@@ -130,7 +143,7 @@ inline std::optional<int64_t> parseDateToEpochMillis(std::string_view s) {
       auto [ptr, ec] = std::from_chars(start, s.data() + s.size(), v);
       if (ec != std::errc{} || ptr != s.data() + s.size()) return std::nullopt;
       if (v < dd::kMinEpochMs || v > dd::kMaxEpochMs) return std::nullopt;
-      return v;
+      return DateRange{v, v + 1};
     }
   }
 
@@ -139,30 +152,41 @@ inline std::optional<int64_t> parseDateToEpochMillis(std::string_view s) {
   if (c.accept('-')) sign = -1;
   else c.accept('+');
 
-  // Variable-width year, then '-MM-DD'.
+  // Variable-width year, then '-MM' and an optional '-DD'.
   long year = 0;
   if (c.varDigits(9, year) == 0) return std::nullopt;
   year *= sign;
-  int mo = 0, day = 0;
+  int mo = 0, day = 1;
   if (!c.accept('-') || !c.fixedDigits(2, mo)) return std::nullopt;
-  if (!c.accept('-') || !c.fixedDigits(2, day)) return std::nullopt;
+  bool haveDay = false;
+  if (c.accept('-')) {
+    if (!c.fixedDigits(2, day)) return std::nullopt;
+    haveDay = true;
+  }
 
   int hh = 0, mm = 0, ss = 0, frac = 0, offsetMin = 0;
+  // The granule width the text pins down, as fixed millis; 0 = a calendar
+  // month (variable width, handled by date arithmetic below).
+  int64_t granuleMs = haveDay ? dd::kMsPerDay : 0;
 
-  // Optional time: 'T'/'t'/' ' then hh[:mm[:ss[.fff]]].
-  if (!c.eof()) {
+  // Optional time: 'T'/'t'/' ' then hh[:mm[:ss[.fff]]] (a time needs a day).
+  if (!c.eof() && haveDay) {
     char t = c.peek();
     if (t != 'T' && t != 't' && t != ' ') return std::nullopt;  // junk after date
     c.advance();
     if (!c.fixedDigits(2, hh)) return std::nullopt;
+    granuleMs = 3600000LL;
     if (c.accept(':')) {
       if (!c.fixedDigits(2, mm)) return std::nullopt;
+      granuleMs = 60000LL;
       if (c.accept(':')) {
         if (!c.fixedDigits(2, ss)) return std::nullopt;
+        granuleMs = 1000LL;
         char dot = c.peek();
         if (dot == '.' || dot == ',') {
           c.advance();
           if (!(c.peek() >= '0' && c.peek() <= '9')) return std::nullopt;  // need >= 1 digit
+          granuleMs = 1;
           int scale = 100;  // first three fractional digits -> millis; rest truncated
           while (c.peek() >= '0' && c.peek() <= '9') {
             if (scale > 0) { frac += (c.peek() - '0') * scale; scale /= 10; }
@@ -211,7 +235,26 @@ inline std::optional<int64_t> parseDateToEpochMillis(std::string_view s) {
                  + (int64_t)hh * 3600000LL + (int64_t)mm * 60000LL
                  + (int64_t)ss * 1000LL + frac
                  - (int64_t)offsetMin * 60000LL;
-  return millis;
+
+  if (granuleMs != 0) {
+    return DateRange{millis, millis + granuleMs};
+  }
+  // Month granularity: the window ends at the first instant of the next month.
+  year_month_day next = (mo == 12)
+      ? year_month_day{std::chrono::year{(int)year + 1}, std::chrono::month{1}, std::chrono::day{1}}
+      : year_month_day{ymd.year(), std::chrono::month{(unsigned)mo + 1}, std::chrono::day{1}};
+  if ((int)next.year() > dd::kMaxYear) {
+    return DateRange{millis, dd::kMaxEpochMs + 1};
+  }
+  int64_t hiExclusive = sys_days{next}.time_since_epoch().count() * dd::kMsPerDay
+                      - (int64_t)offsetMin * 60000LL;
+  return DateRange{millis, hiExclusive};
+}
+
+inline std::optional<int64_t> parseDateToEpochMillis(std::string_view s) {
+  auto r = parseDateRange(s);
+  if (!r) return std::nullopt;
+  return r->lo;  // ingest/sort use the window start (an instant)
 }
 
 // Render epoch millis as canonical UTC ISO-8601: 'YYYY-MM-DDThh:mm:ssZ', with

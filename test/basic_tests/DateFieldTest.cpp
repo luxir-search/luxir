@@ -250,6 +250,84 @@ TEST_F(DateFieldTest, multiStringPartialFailureNoCorruption) {
   EXPECT_TRUE(containsDoc(retrieved, flatdoc("id", "g2", "stamps_dts", vec_i(y2003, y2004))));
 }
 
+// Query-side granularity: a date literal denotes the window it names.
+TEST_F(DateFieldTest, parseGranularityWindows) {
+  auto day = parseDateRange("2024-06-25");
+  ASSERT_TRUE(day.has_value());
+  EXPECT_EQ(day->lo, *parseDateToEpochMillis("2024-06-25T00:00:00Z"));
+  EXPECT_EQ(day->hiExclusive, *parseDateToEpochMillis("2024-06-26T00:00:00Z"));
+
+  auto month = parseDateRange("2024-02");  // leap February
+  ASSERT_TRUE(month.has_value());
+  EXPECT_EQ(29 * 86400000LL, month->hiExclusive - month->lo);
+  auto dec = parseDateRange("2024-12");    // year rollover
+  ASSERT_TRUE(dec.has_value());
+  EXPECT_EQ(dec->hiExclusive, *parseDateToEpochMillis("2025-01-01"));
+
+  auto minute = parseDateRange("2024-06-25T10:30");
+  ASSERT_TRUE(minute.has_value());
+  EXPECT_EQ(60000, minute->hiExclusive - minute->lo);
+  auto instant = parseDateRange("2024-06-25T10:30:00.123Z");
+  ASSERT_TRUE(instant.has_value());
+  EXPECT_EQ(1, instant->hiExclusive - instant->lo);
+  auto epoch = parseDateRange("1700000000000");
+  ASSERT_TRUE(epoch.has_value());
+  EXPECT_EQ(1, epoch->hiExclusive - epoch->lo);
+
+  // a zone offset shifts the whole window
+  auto offs = parseDateRange("2024-06-25T10-07:00");
+  ASSERT_TRUE(offs.has_value());
+  EXPECT_EQ(3600000, offs->hiExclusive - offs->lo);
+  EXPECT_EQ(offs->lo, *parseDateToEpochMillis("2024-06-25T17:00:00Z"));
+
+  // a time needs a day: month + time stays invalid
+  EXPECT_FALSE(parseDateRange("2024-06T10").has_value());
+}
+
+// Equality and range endpoints round by the literal's granularity end-to-end.
+TEST_F(DateFieldTest, queryGranularity) {
+  CollectionHelper helper;
+  helper.clear();
+  helper.index(flatdoc("id", "d1", "when_dt", "2024-06-25T08:00:00Z"), UpdateMessage::NO_COMMIT);
+  helper.index(flatdoc("id", "d2", "when_dt", "2024-06-25T18:30:00Z"), UpdateMessage::NO_COMMIT);
+  helper.index(flatdoc("id", "d3", "when_dt", "2024-06-26T00:00:00Z"), UpdateMessage::COMMIT);
+
+  auto count = [&](std::function<void(OpCursor&)> setQuery) {
+    auto req = localReq(soluxNode->getSearchEngine());
+    auto& cur = req->collection("main").topDocs("q");
+    setQuery(cur);
+    cur.withStats();
+    req->execute();
+    EXPECT_TRUE(req->ok()) << req->errorMsg();
+    return req->getMatchCount();
+  };
+
+  // equality on a day matches the whole day, not the midnight instant
+  EXPECT_EQ(2, count([](OpCursor& c) { c.matchQuery("when_dt", "2024-06-25"); }));
+  EXPECT_EQ(1, count([](OpCursor& c) { c.matchQuery("when_dt", "2024-06-25T08:00:00Z"); }));
+  EXPECT_EQ(3, count([](OpCursor& c) { c.matchQuery("when_dt", "2024-06"); }));
+
+  // range endpoints include the granule they name; exclusive excludes it whole
+  auto range = [&](const char* gteV, const char* ltV, bool loIncl, bool hiIncl) {
+    return count([&](OpCursor& c) {
+      auto& r = c.rawQuery().kind.emplace<solux::api::RangeQuery>();
+      auto& mr = c.mr();
+      r.field = build::arenaStr(mr, "when_dt");
+      auto* loVal = (solux::api::Val*)mr.allocate(sizeof(solux::api::Val), alignof(solux::api::Val));
+      new (loVal) solux::api::Val();
+      loVal->kind = build::arenaStr(mr, gteV);
+      auto* hiVal = (solux::api::Val*)mr.allocate(sizeof(solux::api::Val), alignof(solux::api::Val));
+      new (hiVal) solux::api::Val();
+      hiVal->kind = build::arenaStr(mr, ltV);
+      if (loIncl) r.gte = loVal; else r.gt = loVal;
+      if (hiIncl) r.lte = hiVal; else r.lt = hiVal;
+    });
+  };
+  EXPECT_EQ(3, range("2024-06-25", "2024-06-26", true, true));   // both days whole
+  EXPECT_EQ(2, range("2024-06-25", "2024-06-26", true, false));  // lt excludes day 26
+  EXPECT_EQ(1, range("2024-06-25", "2024-06-26", false, true));  // gt excludes day 25
+}
+
 // An unparseable date string fails just that doc (same contract as a bad
 // vector value): the doc is reported in errors, peers index normally.
 TEST_F(DateFieldTest, badDateMarksDocFailed) {
