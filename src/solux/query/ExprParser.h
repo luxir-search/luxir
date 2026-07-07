@@ -433,13 +433,13 @@ private:
         mod = Mod::NOT;
         cur.skipWs();
         bool nextIsNot = cur.startsWith("NOT") && boundaryAt(3, stops);
-        if (cur.peek() == '+' || cur.peek() == '-' || nextIsNot) {
+        if (cur.peek() == '+' || (cur.peek() == '-' && !minusSignOfNumber(scope)) || nextIsNot) {
           fail(cur.position(), "at most one of +/-/NOT per clause");
         }
         if (cur.atEnd() || isStop(cur.peek(), stops)) {
           fail(cur.position(), "expected a clause after NOT");
         }
-      } else if (cur.peek() == '+' || cur.peek() == '-') {
+      } else if ((cur.peek() == '+' || cur.peek() == '-') && !minusSignOfNumber(scope)) {
         mod = cur.peek() == '+' ? Mod::PLUS : Mod::MINUS;
         cur.advance();
         // a sign binds only when adjacent to its clause
@@ -454,6 +454,17 @@ private:
     }
 
     return buildLevel(items);
+  }
+
+  // In a NUMERIC field's scope, a '-' right before a number binds tightest -
+  // it is the value's sign, not an exclusion: year_i:(-5) matches -5.
+  // Prohibition there is spelled NOT ("NOT 5").  '+' stays an operator: a
+  // leading plus is not part of any numeric literal the coercion accepts,
+  // and "+5 required" happens to mean what the writer meant anyway.
+  bool minusSignOfNumber(const FieldScope* scope) const {
+    if (cur.peek() != '-' || scope == nullptr || !numericQueryable(*scope->type)) return false;
+    char next = cur.peekAt(1);
+    return digit(next) || next == '.';
   }
 
   // Fold one level's items into a query node.

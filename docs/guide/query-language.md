@@ -118,10 +118,15 @@ title_w:(dune OR messiah)        same as title_w:dune OR title_w:messiah
 title_w:(dune mess* fuzz~1)      terms, prefixes, fuzzy, all against title_w
 year_i:(>=1960 AND <1970)
 title_w:(dune OR body_w:spice)   a field named inside the group overrides it
+temp_i:(-5 OR 10)                on a numeric field, - is the value's sign
 ```
 
 A group is boolean structure, not a bag of words. To match the words
 together as one analyzed value, use `match(dune messiah, field=title_w)`.
+
+In a numeric field's group, `-` in front of a number binds to the number:
+`temp_i:(-5)` matches -5 rather than excluding 5. To exclude a value there,
+use `NOT`: `temp_i:(NOT 5)`.
 
 ## Ranges and comparisons
 

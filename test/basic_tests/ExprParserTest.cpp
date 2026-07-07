@@ -298,6 +298,29 @@ TEST_F(ExprParserTest, fieldGroupJuxtapositionAndDecorations) {
   EXPECT_EQ("a b", asPhrase(b.optional[3]).text);
 }
 
+TEST_F(ExprParserTest, numericScopeSignBindsToValue) {
+  // in a numeric field's group, '-' before a number is the value's sign
+  EXPECT_EQ("-5", matchVal(*parse("count:(-5)")));
+  EXPECT_EQ("-.5", matchVal(*parse("rating:(-.5)")));
+
+  const auto& b = asBool(*parse("count:(10 -5)"));
+  ASSERT_EQ(2u, b.optional.size());
+  EXPECT_EQ("10", matchVal(b.optional[0]));
+  EXPECT_EQ("-5", matchVal(b.optional[1]));
+
+  // exclusion in a numeric scope is spelled NOT
+  const auto& n = asBool(*parse("count:(NOT -5)"));
+  ASSERT_EQ(1u, n.prohibited.size());
+  EXPECT_EQ("-5", matchVal(n.prohibited[0]));
+
+  // '-' before a non-number, or in a non-numeric scope, is still an operator
+  const auto& t = asBool(*parse("title:(-foo)"));
+  ASSERT_EQ(1u, t.prohibited.size());
+  EXPECT_EQ("foo", matchVal(t.prohibited[0]));
+  const auto& a = asBool(*parse("count:(-abc)"));
+  ASSERT_EQ(1u, a.prohibited.size());
+}
+
 TEST_F(ExprParserTest, fieldGroupInnerOverrideAndRanges) {
   const auto& b = asBool(*parse("title:(dune OR status:live)"));
   ASSERT_EQ(2u, b.optional.size());
