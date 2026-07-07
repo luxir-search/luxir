@@ -220,6 +220,45 @@ uint32_t decodeBlockPFor(const char* inc, uint32_t* out) {
   return (uint32_t) (reinterpret_cast<const char*>(in) - inc);
 }
 
+// Byte length of one encoded PFor block, from its header alone - no unpack.
+// Section walk MUST stay in lockstep with decodeBlockPFor / readLane above:
+// [header, word-padded][simd base: 4*bestb words][exception lane, width > 1].
+uint32_t skipBlockPFor(const char* inc) {
+  const uint8_t* h = reinterpret_cast<const uint8_t*>(inc);
+  const uint8_t bestb = h[0];
+  const uint8_t cexcept = h[1];
+  uint32_t headerBytes = 2;
+  uint8_t maxb = 0;
+  if (cexcept > 0) {
+    maxb = h[2];
+    headerBytes = 3 + cexcept;
+  }
+  const uint32_t headerWords = (headerBytes + sizeof(uint32_t) - 1) / sizeof(uint32_t);
+  const uint32_t* in = reinterpret_cast<const uint32_t*>(inc) + headerWords;
+
+  in += 4 * bestb;
+
+  if (cexcept > 0 && (uint32_t) (maxb - bestb) > 1) {
+    // Mirror SoluxBitPacker::readLane's pointer arithmetic for lane
+    // k = maxb - bestb - 1 ((k+1)-bit values, count = cexcept) - INCLUDING
+    // its final back-out of the padded partial group's over-counted words,
+    // which matches what writeLane actually wrote.
+    const uint32_t k = (uint32_t) (maxb - bestb) - 1;
+    const uint32_t count = cexcept;
+    uint32_t j = 0;
+    for (; j + 128 <= count; j += 128) {
+      in += 4 * (k + 1);
+    }
+    for (; j + 31 < count; j += 32) {
+      in += k + 1;
+    }
+    const uint32_t jPadded = (count + 31) / 32 * 32;
+    in += (jPadded - j) / 32 * (k + 1);
+    in -= (jPadded - count) * (k + 1) / 32;
+  }
+  return (uint32_t) (reinterpret_cast<const char*>(in) - inc);
+}
+
 // Compact 4-lane bit layout for partial (tail) blocks, matching the addressing
 // in SoluxSIMDFor::selectWithMeta. Full blocks go through the SIMD kernels; the
 // final partial block is packed compactly here (NOT padded to 128) so the
@@ -365,6 +404,17 @@ uint32_t SoluxPFOR::decodeBlock(const char* in, uint32_t inSz, uint32_t* out, ui
   assert(outSz == BLOCK_SIZE);
   unused(outSz);
   return decodeBlockPFor(in, out);
+}
+
+uint32_t SoluxPFOR::skipBlock(const char* in, uint32_t inSz) {
+  unused(inSz);
+  uint32_t skipped = skipBlockPFor(in);
+#ifndef NDEBUG
+  // Lockstep tripwire: the header-only walk must agree with the real decoder.
+  uint32_t scratch[BLOCK_SIZE];
+  assert(skipped == decodeBlockPFor(in, scratch));
+#endif
+  return skipped;
 }
 
 // --- SoluxPFORd (documents, delta) ---

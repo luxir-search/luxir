@@ -841,16 +841,18 @@ public:
       posBufIdx = posBufEnd;
 
       if (numToSkip >= Postings::POSITIONS_BLOCK_SIZE) {
-        // TODO: skip whole block
-        // std::cout << "skipping blocks: id=" << docid << " numToSkip=" << numToSkip << std::endl;
-        // For now, just decode the whole block.  Optimize this later.
-        uint32_t outSz = Postings::POSITIONS_BLOCK_SIZE;
-        auto bytesRead = IndexCodec::posCodec.decodeBlock(posIS.ptr(), posIS.left(), (uint32_t*)posBuf, outSz);
-        posIS.skip(bytesRead);
-        assert(outSz == Postings::POSITIONS_BLOCK_SIZE);
-        posBufIdx = 0;
-        posBufEnd = outSz;
-        // posBufEndDoc = std::min(posBufEnd, tfreq);  // not needed, we will be skipping the block
+        // Skip the entire encoded block from its header - no unpack. posOrd is
+        // block-aligned here (initial state or driven to a boundary above), and
+        // numToSkip >= a full block guarantees the next block is block-encoded,
+        // exactly as the old decode-and-discard relied on.
+        auto bytesSkipped = IndexCodec::posCodec.skipBlock(posIS.ptr(), posIS.left());
+        posIS.skip(bytesSkipped);
+        posOrd += Postings::POSITIONS_BLOCK_SIZE;
+        // Fully reset buffer state: a skip that lands exactly on posOrdStart
+        // exits the loop without another decode, and nextPosition() must then
+        // take its fresh-decode path (a stale posBufEndDoc < posBufEnd would
+        // send it into the still-buffered branch and read past posBuf).
+        posBufIdx = posBufEnd = posBufEndDoc = 0;
         continue;
       }
 

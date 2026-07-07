@@ -173,6 +173,11 @@ public:
   ~SoluxPFOR() override = default;
   void encodeBlock(uint32_t* in, uint32_t inSz, char* out, uint32_t& outSz) override;
   uint32_t decodeBlock(const char* in, uint32_t inSz, uint32_t* out, uint32_t& outSz) override;
+
+  // Advance over one encoded block without unpacking it: the 2-3 byte block
+  // header fully determines every section's size. Returns the encoded byte
+  // length (the same value decodeBlock would return).
+  uint32_t skipBlock(const char* in, uint32_t inSz);
 };
 
 /// Delta-coded PForDelta -- the documents codec. Applies an adjacent delta over
