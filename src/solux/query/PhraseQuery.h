@@ -501,10 +501,7 @@ public:
         if (upBlock == termImpacts.blockCount() - 1) {
           termMax = termImpacts.maxImpactFrom(startBlock);
         } else {
-          termMax = 0.0f;
-          for (int32_t i = startBlock; i <= upBlock; i++) {
-            termMax = std::max(termMax, termImpacts.impact(i));
-          }
+          termMax = termImpacts.maxImpactInRange(startBlock, upBlock);
         }
         maxScore = std::min(maxScore, termMax);
       }

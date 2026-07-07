@@ -240,26 +240,18 @@ public:
       if (!hasImpacts() || !(minCompetitiveScore > 0.0f)) {
         return doc;
       }
+      // The impacts index resolves the whole hop internally (skipping dead
+      // groups on their corner bounds without parsing them); the enum advances
+      // ONCE per competitive landing rather than once per block.
       while (doc != PostingsReader::END) {
-        int32_t block = impacts.blockContaining(doc);
-        if (block >= impacts.blockCount()) {
+        int32_t target = impacts.firstCompetitiveTarget(doc, minCompetitiveScore,
+                                                        skippedImpactBlocks);
+        if (target == doc) {
           return doc;
         }
-        if (impacts.maxImpactFrom(block) < minCompetitiveScore) {
-          skippedImpactBlocks += impacts.blockCount() - block;
+        if (target == PostingsReader::END) {
           return PostingsReader::END;
         }
-        if (impacts.impact(block) >= minCompetitiveScore) {
-          return doc;
-        }
-        if (impacts.lastDoc(block) >= PostingsReader::END - 1) {
-          return PostingsReader::END;
-        }
-        int32_t target = impacts.lastDoc(block) + 1;
-        if (target <= doc) {
-          return doc;
-        }
-        skippedImpactBlocks++;
         doc = docsEnum.advance(target);
       }
       return doc;
@@ -460,12 +452,7 @@ public:
       if (upBlock == impacts.blockCount() - 1) {
         return impacts.maxImpactFrom(startBlock);
       }
-
-      float maxScore = 0.0f;
-      for (int32_t i = startBlock; i <= upBlock; i++) {
-        maxScore = std::max(maxScore, impacts.impact(i));
-      }
-      return maxScore;
+      return impacts.maxImpactInRange(startBlock, upBlock);
     }
 
     int32_t advanceShallow(int32_t target) override {

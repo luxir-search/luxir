@@ -875,6 +875,147 @@ public:
     assert(p == end);
   }
 
+  /// total number of doc blocks (L0) for this term - sizes impact indexes
+  int32_t numImpactBlocks() const {
+    return numDocBlocks;
+  }
+
+  // Group-level impact scan: walks ONLY the L1 group headers, hopping each
+  // group's body via its byte length - ~df/4096 steps instead of the whole-
+  // list walk readBlockMaxTf does.  Emits per group: last doc, the corner
+  // impact span (maxTf, minNorm), and what a later lazy parse of that group's
+  // L0 headers needs (body offset relative to startOfDocs, delta bases).
+  struct GroupImpacts {
+    std::vector<int32_t> lastDocs;
+    std::vector<int32_t> spanMaxTfs;
+    std::vector<int32_t> spanMinNorms;
+    std::vector<int64_t> bodyOffsets;   // relative to startOfDocs
+    std::vector<int32_t> baseLastDocs;  // last doc before the group (L0 delta base)
+  };
+
+  void readGroupImpacts(GroupImpacts& out) const {
+    out.lastDocs.resize(0);
+    out.spanMaxTfs.resize(0);
+    out.spanMinNorms.resize(0);
+    out.bodyOffsets.resize(0);
+    out.baseLastDocs.resize(0);
+    if (docsSize == 0) {
+      return;
+    }
+    out.lastDocs.reserve(numDocGroups);
+    out.spanMaxTfs.reserve(numDocGroups);
+    out.spanMinNorms.reserve(numDocGroups);
+    out.bodyOffsets.reserve(numDocGroups);
+    out.baseLastDocs.reserve(numDocGroups);
+
+    const char* const streamStart = docIS.ptr(0);
+    const char* const end = docIS.ptr(endOfDocs);
+    const char* p = docIS.ptr(startOfDocs);
+    uint32_t prevGroupLastDoc = 0;
+    for (int32_t group = 0; group < numDocGroups; group++) {
+      uint32_t groupHeaderLen = InputStream::readVint(p, end);
+      const char* groupHeaderEnd = p + groupHeaderLen;
+      assert(groupHeaderEnd <= end);
+      uint32_t groupLastDoc = prevGroupLastDoc + readVint15(p, groupHeaderEnd);
+      uint64_t groupByteLen = readVlong15(p, groupHeaderEnd);
+      if (hasPositions) {
+        auto groupCumTfDelta = InputStream::readVint(p, groupHeaderEnd);
+        unused(groupCumTfDelta);
+      }
+      int32_t spanImpact = 1;
+      if (hasFreqs) {
+        spanImpact = (int32_t) InputStream::readVint(p, groupHeaderEnd);
+      }
+      int32_t spanMinNorm = 0;
+      if (hasNorms) {
+        spanMinNorm = (int32_t) InputStream::readVint(p, groupHeaderEnd);
+      }
+      assert(p == groupHeaderEnd);
+      out.baseLastDocs.push_back((int32_t) prevGroupLastDoc);
+      out.lastDocs.push_back((int32_t) groupLastDoc);
+      out.spanMaxTfs.push_back(spanImpact);
+      out.spanMinNorms.push_back(spanMinNorm);
+      out.bodyOffsets.push_back((int64_t) (groupHeaderEnd - streamStart) - startOfDocs);
+      p = groupHeaderEnd + (int64_t) groupByteLen;
+      assert(p <= end);
+      prevGroupLastDoc = groupLastDoc;
+    }
+    assert(p == end);
+  }
+
+  // Parse ONE group's L0 block headers, located by readGroupImpacts output.
+  // Appends up to L1_PERIOD entries per output vector.
+  void readGroupBlockImpacts(int32_t groupIndex, int64_t bodyOffset, int32_t baseLastDoc,
+                             std::vector<int32_t>& blockLastDocs,
+                             std::vector<int32_t>& blockMaxTf,
+                             std::vector<int32_t>& blockMinNorm,
+                             ImpactFrontiers* impactFrontiers) const {
+    blockLastDocs.resize(0);
+    blockMaxTf.resize(0);
+    blockMinNorm.resize(0);
+    if (impactFrontiers != nullptr) {
+      impactFrontiers->clear();
+    }
+    int32_t groupStartBlock = groupIndex * L1_PERIOD;
+    int32_t groupBlockCount = std::min(L1_PERIOD, numDocBlocks - groupStartBlock);
+    assert(groupBlockCount > 0);
+
+    const char* const end = docIS.ptr(endOfDocs);
+    const char* p = docIS.ptr(startOfDocs + bodyOffset);
+    uint32_t prevBlockLastDoc = (uint32_t) baseLastDoc;
+    for (int32_t i = 0; i < groupBlockCount; i++) {
+      uint32_t headerLen = InputStream::readVint(p, end);
+      const char* headerEnd = p + headerLen;
+      assert(headerEnd <= end);
+      uint32_t blockLastDocValue = prevBlockLastDoc + readVint15(p, headerEnd);
+      uint64_t blockByteLen = readVlong15(p, headerEnd);
+      if (hasPositions) {
+        auto blockCumTfDelta = InputStream::readVint(p, headerEnd);
+        unused(blockCumTfDelta);
+        auto blockPosByteOff = InputStream::readVlong(p, headerEnd);
+        unused(blockPosByteOff);
+      }
+      int32_t maxTf = 1;
+      int32_t minNorm = 0;
+      if (impactFrontiers != nullptr) {
+        impactFrontiers->offsets.push_back((int32_t) impactFrontiers->tfs.size());
+      }
+      if (hasFreqs && hasNorms) {
+        uint32_t frontierCount = InputStream::readVint(p, headerEnd);
+        assert(frontierCount > 0);
+        int32_t tf = 0;
+        for (uint32_t j = 0; j < frontierCount; j++) {
+          assert(p < headerEnd);
+          int32_t norm = (int32_t) (uint8_t) *p;
+          p++;
+          tf += (int32_t) InputStream::readVint(p, headerEnd);
+          if (j == 0) {
+            minNorm = norm;
+          }
+          maxTf = tf;
+          if (impactFrontiers != nullptr) {
+            impactFrontiers->norms.push_back(norm);
+            impactFrontiers->tfs.push_back(tf);
+          }
+        }
+      } else if (hasFreqs) {
+        maxTf = (int32_t) InputStream::readVint(p, headerEnd);
+      } else if (hasNorms) {
+        minNorm = (int32_t) InputStream::readVint(p, headerEnd);
+      }
+      assert(p == headerEnd);
+      blockLastDocs.push_back((int32_t) blockLastDocValue);
+      blockMaxTf.push_back(maxTf);
+      blockMinNorm.push_back(minNorm);
+      p = headerEnd + (int64_t) blockByteLen;
+      assert(p <= end);
+      prevBlockLastDoc = blockLastDocValue;
+    }
+    if (impactFrontiers != nullptr) {
+      impactFrontiers->offsets.push_back((int32_t) impactFrontiers->tfs.size());
+    }
+  }
+
   void startPositions() {
     assert(hasPositions);  // positions are only queried on fields that index them
     pos = -1;
