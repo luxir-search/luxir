@@ -4,6 +4,7 @@
 
 #include "PhraseQuery.h"
 #include "QueryBuilder.h"
+#include "solux/query/ExprParser.h"
 #include "solux/query/ParseContext.h"
 #include "solux/query/Query.h"
 #include "solux/query/SimpleQueryParser.h"
@@ -291,6 +292,24 @@ public:
     return parse(*result.root);
   }
 
+  // Parse the expr string into an api::Query subtree, splice that expansion
+  // over the expr arm in the request tree (both live in the request arena, so
+  // lifetimes are identical - and any later serialization of the request
+  // shows the canonical structured equivalent instead of the opaque string),
+  // then lower it through the same path as every other node.
+  solux::Query* parseExpr(const solux::api::ExprQuery& exprQuery, const solux::api::Query& node) {
+    if (exprQuery.q.empty()) {
+      throw std::runtime_error("expr requires a non-empty query string");
+    }
+    ExprOptions options;
+    options.schema = &schema;
+    options.vars = exprQuery.vars;
+    options.nestingBudget = &context.nestingBudget;
+    const solux::api::Query* root = solux::parseExpr(exprQuery.q, options, pool);
+    const_cast<solux::api::Query&>(node).kind = root->kind;
+    return parse(*root);
+  }
+
   solux::Query* parseForcePrepare(const solux::api::ForcePrepareQuery& forcePrepareQuery) {
     if (!forcePrepareQuery.query.has_value() ||
         forcePrepareQuery.query->kind.index() == 0) {
@@ -309,6 +328,10 @@ public:
   }
 
   solux::Query* parse(const solux::api::Query& pquery) {
+    // The one recursion choke point for structured trees: every nested node
+    // passes through here, so the shared budget bounds tree depth no matter
+    // which parser (wire, JSON, expr, simple_query) produced the tree.
+    NestingScope nesting(context);
     // Exhaustive dispatch over the Query oneof: a new arm is a compile error until handled.
     return std::visit(solux::overloaded{
       [&](const solux::api::Match& m) -> solux::Query* { return parseMatch(m); },
@@ -317,6 +340,7 @@ public:
       [&](const solux::api::RangeQuery& r) -> solux::Query* { return parseRange(r); },
       [&](const solux::api::FuzzyQuery& f) -> solux::Query* { return parseFuzzy(f); },
       [&](const solux::api::SimpleQuery& s) -> solux::Query* { return parseSimpleQuery(s); },
+      [&](const solux::api::ExprQuery& e) -> solux::Query* { return parseExpr(e, pquery); },
       [&](bool) -> solux::Query* { return pool.make<solux::AllQuery>(); },  // the `all` arm
       [&](const solux::api::KnnQuery& k) -> solux::Query* { return parseKnn(k); },
       [&](const solux::api::BooleanQuery& b) -> solux::Query* { return parseBoolean(b); },

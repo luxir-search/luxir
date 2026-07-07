@@ -95,6 +95,26 @@ POST /collections/main/query
 {"found":2,"docs":[{"id":"2"},{"id":"1"}]}
 ```
 
+### The query language
+
+When you're the one writing the query, a bare string anywhere a query object
+goes is an expression in the [Solux query language](query-language.md):
+fielded terms, AND/OR/NOT, ranges, and a function form that reaches every
+query type. Unlike `simple_query`, malformed input is a parse error, not a
+guess:
+
+```
+POST /collections/main/query
+{"query": "title_w:(darkness OR earthsea) AND year_i:[1960 TO 1970]", "fields": ["id"], "get_number": true}
+```
+
+```json
+{"found":1,"docs":[{"id":"1"}]}
+```
+
+*"a wizard of earthsea"* matched the title group but has no `year_i`, so the
+range clause excluded it.
+
 ## Bulk ingest: stream a whole file
 
 Set the content type to `application/x-ndjson` and send one document per line.

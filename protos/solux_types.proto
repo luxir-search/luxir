@@ -147,8 +147,8 @@ message Query {
     FuzzyQuery fuzzy = 9;           // selects documents by fuzzy (edit-distance) term match
     SimpleQuery simple_query = 10;  // forgiving end-user query string (search-box input)
     RangeQuery range = 11;          // selects documents whose numeric field value is in a range
+    ExprQuery expr = 12;            // an expression in the Solux query language (rigorous grammar)
 
-    // TODO: the "expr" query-string language (the programmer's language; rigorous grammar)
     // TODO: wildcard query
     // TODO: function?
 
@@ -293,6 +293,30 @@ message PhraseQuery {
 
   // TODO: add a parameter for slop?
   repeated int32 positions = 15; // optional positions of the terms
+}
+
+// An expression in the Solux query language: the programmer's query string,
+// with a rigorous grammar and precise parse errors (raw end-user input belongs
+// in SimpleQuery instead).  Structure-only sugar over the Query tree - every
+// expression has an exact structured equivalent, and text is never interpreted
+// by the parser: value bytes pass through unanalyzed and analysis happens at
+// query build, per field type.
+//
+// Syntax summary: field:value, field:"a phrase" (or '...'), field:(grouped
+// boolean scope), AND / OR / NOT with real precedence (NOT > AND > OR),
+// +required / -prohibited prefixes (may not mix with AND/OR at one level),
+// ranges field:[a TO b] / {a TO b} and comparisons field:>=v, trailing * for
+// prefix, term~N for fuzzy (bare ~ = auto), *:* matches everything, and the
+// function form name(main value, arg=value, ...) reaching every query type by
+// its JSON name.  $name references a value bound in `vars`.  Unfielded bare
+// words are a parse error.
+message ExprQuery {
+  string q = 1;  // the expression
+
+  // Values referenced from the expression as $name.  Bound as VALUES (never
+  // re-parsed as syntax), so end-user input is safe to pass through:
+  // {"q": "simple_query($input, fields=[title])", "vars": {"input": ...}}.
+  map<string, Val> vars = 2;
 }
 
 // Forgiving end-user query for raw search-box input (dismax descendant).

@@ -105,7 +105,20 @@ clauses, under facet domains, as fusion sources, as filters.
   fuzzy, and `field:value` terms - including exact numeric and date
   matches like `price:10` or `created:2024-01-01`) - invalid syntax
   degrades to terms, never to an error.
-- Named non-scoring filters on top-docs and fusion sources.
+- `expr`: the [query language](guide/query-language.md) for developers
+  writing queries - a bare string anywhere the JSON API takes a query
+  object.  Fielded terms and phrases, AND/OR/NOT with real precedence,
+  `+`/`-` prefixes, ranges (`year_i:[1960 TO 1970}`) and comparisons
+  (`year_i:>=1960`), field groups (`title_w:(a OR b)`), and a function form
+  that reaches every query type by its JSON name
+  (`fuzzy(smith, field=name_s, max_edits=2)`).  Special characters only act
+  in the position where they mean something, so `url_s:https://x` needs no
+  escaping; `$vars` substitute request values without re-parsing them, so
+  user input cannot inject syntax.  Strict grammar, byte-offset parse
+  errors; degrading gracefully is `simple_query`'s job.
+- Named non-scoring filters on top-docs and fusion sources - and a filter
+  is where an expression string shines: `"filter": [{"name": "live",
+  "query": "status_s:active AND year_i:>=1960"}]`.
 
 ## Search and ranking
 

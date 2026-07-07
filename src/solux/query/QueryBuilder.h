@@ -34,13 +34,17 @@ class QueryBuilder {
   MemPool& pool;
   Schema& schema;
 
+public:
   // The numeric field types stored in the shared int column (INT raw,
   // FLOAT/DOUBLE sortable bits, DATE epoch millis).  Match and range on these
-  // build a NumericRangeQuery over the column.
+  // build a NumericRangeQuery over the column.  Public because schema-aware
+  // string parsers select arms by the same classification.
   static bool isNumericColumnType(FieldType::Type t) {
     return t == FieldType::Type::INT || t == FieldType::Type::FLOAT
         || t == FieldType::Type::DOUBLE || t == FieldType::Type::DATE;
   }
+
+private:
 
   // Resolve a field to its TextFieldType, throwing if it is not a text field:
   // phrase / analyzed queries only make sense over analyzed text.

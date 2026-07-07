@@ -28,6 +28,13 @@ locations, browse `src/solux/<area>/`.
    - `Weight`: Query adapted to specific index
    - `Scorer`: Executes query on specific segment
    - Supports Term, Boolean, Phrase, and All queries
+   - `ProtobufQueryParser` lowers the wire tree (`solux::api::Query`) via `QueryBuilder`
+     (the single place query-time analysis is applied); `ParseContext` carries the
+     request pool, schema, warnings sink, and shared nesting budget
+   - String parsers emit `api::Query` subtrees and lower through the same path:
+     `SimpleQueryParser` (never-fails search-box input) and `ExprParser` (the rigorous
+     `expr` query language; `Cursor` is its bounds-checked input, `ExprFunctions.h` the
+     reflection-driven function-form registry)
 
 5. **Indexing** (`src/solux/index/`)
    - `IndexWriter`: Handles multi-threaded indexing with TBB flow graph pipeline.

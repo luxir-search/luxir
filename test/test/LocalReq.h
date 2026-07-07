@@ -56,6 +56,7 @@ public:
   OpCursor& fuzzyQuery(std::string_view field, std::string_view term,
                        int maxEdits = -1, int prefixLength = -1, int maxExpansions = 0);
   OpCursor& simpleQuery(std::string_view q, std::initializer_list<std::string> fieldNames);
+  OpCursor& exprQuery(std::string_view q);
   OpCursor& phraseQuery(std::string_view field, std::initializer_list<std::string> words);
   OpCursor& phraseText(std::string_view field, std::string_view text);
   OpCursor& phraseTerms(std::string_view field, std::initializer_list<std::string> terms);
@@ -405,6 +406,11 @@ inline OpCursor& OpCursor::simpleQuery(std::string_view q, std::initializer_list
   for (const auto& f : fieldNames) {
     arr[i++] = build::arenaStr(req_->mr, f);
   }
+  return *this;
+}
+inline OpCursor& OpCursor::exprQuery(std::string_view q) {
+  auto& e = getOrCreateQuery().kind.emplace<solux::api::ExprQuery>();
+  e.q = build::arenaStr(req_->mr, q);
   return *this;
 }
 inline OpCursor& OpCursor::prefixQuery(std::string_view field, std::string_view prefix) {

@@ -28,6 +28,12 @@
 //   field+val and composes with operator/min_match; combining it with an explicit
 //   "field"/"val" (or a second unknown key) is an error. A schema field literally
 //   named like a canonical key needs the canonical form. Writes are always canonical.
+// - Query reads accept a bare STRING anywhere a query object goes: it is sugar for
+//   the expr arm ({"query": "status:active AND year:>=1960"}), which also gives
+//   TopDocs.filter string filters for free. ExprQuery itself reads a bare string as
+//   its q ({"expr": "..."} == {"expr": {"q": "..."}}). A Query object takes exactly
+//   ONE arm key (proto3 canonical JSON; a second arm is an error, not last-wins).
+//   Writes stay canonical, so echo mode shows the structured form.
 
 #pragma once
 
@@ -144,6 +150,118 @@ struct from<JSON, solux::api::Match> {
             value.field = key;
             from<JSON, ::hpp_proto::optional_indirect_view<api::Val>>::template op<O>(value.val, ctx,
                                                                                       vit, vend);
+          }
+          return bool(ctx.error);
+        },
+        [](auto &, auto &) {});
+  }
+};
+
+// ----- ExprQuery: bare string = q-only sugar -----
+template <>
+struct from<JSON, solux::api::ExprQuery> {
+  template <auto Opts>
+  static void op(solux::api::ExprQuery &value, hpp_proto::concepts::is_non_owning_context auto &ctx,
+                 auto &it, auto &end) {
+    if constexpr (!check_ws_handled(Opts)) {
+      if (skip_ws<Opts>(ctx, it, end)) {
+        return;
+      }
+    }
+    static constexpr auto O = ws_handled<Opts>();
+    if ((char)*it == '"') {
+      util::from_json<O>(value.q, ctx, it, end);
+      return;
+    }
+    static constexpr auto V = opening_handled_off<ws_handled_off<Opts>()>();
+    std::string_view key;
+    decltype(auto) keyTarget = ::hpp_proto::detail::as_modifiable(ctx, key);
+    util::scan_object_fields<O, true>(
+        ctx, it, end, keyTarget, [](auto &, auto &) {},
+        [&](auto &vit, auto &vend) {
+          if (key == "q") {
+            util::from_json<V>(value.q, ctx, vit, vend);
+          } else if (key == "vars") {
+            decltype(auto) vars = ::hpp_proto::detail::as_modifiable(ctx, value.vars);
+            glz::util::parse_repeated<V>(true, vars, ctx, vit, vend);
+          } else {
+            ctx.error = error_code::unknown_key;
+            return true;
+          }
+          return bool(ctx.error);
+        },
+        [](auto &, auto &) {});
+  }
+};
+
+// ----- Query: canonical one-arm object, or a bare string (expr sugar) -----
+// The hand-written key dispatch replaces the generated oneof-object read so the
+// string form can be recognized first; keys and arms must track the Query oneof
+// (the static_assert in query/ExprFunctions.h ARM_NAMES pins the same list).
+template <>
+struct from<JSON, solux::api::Query> {
+  template <auto Opts>
+  static void op(solux::api::Query &value, hpp_proto::concepts::is_non_owning_context auto &ctx,
+                 auto &it, auto &end) {
+    namespace api = solux::api;
+    if constexpr (!check_ws_handled(Opts)) {
+      if (skip_ws<Opts>(ctx, it, end)) {
+        return;
+      }
+    }
+    static constexpr auto O = ws_handled<Opts>();
+    if ((char)*it == '"') {
+      // bare string in query position = an expr expression
+      auto &e = value.kind.template emplace<api::ExprQuery>();
+      util::from_json<O>(e.q, ctx, it, end);
+      return;
+    }
+    static constexpr auto V = opening_handled_off<ws_handled_off<Opts>()>();
+    std::string_view key;
+    decltype(auto) keyTarget = ::hpp_proto::detail::as_modifiable(ctx, key);
+    bool sawArm = false;
+    util::scan_object_fields<O, true>(
+        ctx, it, end, keyTarget, [](auto &, auto &) {},
+        [&](auto &vit, auto &vend) {
+          // exactly one arm: a Query object IS the oneof, so a second key is
+          // an error (proto3 canonical JSON), not a silent last-wins
+          if (sawArm) {
+            ctx.error = error_code::unknown_key;
+            return true;
+          }
+          sawArm = true;
+          auto arm = [&]<typename T>(std::in_place_type_t<T>) {
+            util::from_json<V>(value.kind.template emplace<T>(), ctx, vit, vend);
+          };
+          if (key == "match") {
+            arm(std::in_place_type<api::Match>);
+          } else if (key == "boolean") {
+            arm(std::in_place_type<api::BooleanQuery>);
+          } else if (key == "all") {
+            util::from_json<V>(value.kind.template emplace<bool>(), ctx, vit, vend);
+          } else if (key == "field") {
+            util::from_json<V>(value.kind.template emplace<std::string_view>(), ctx, vit, vend);
+          } else if (key == "phrase") {
+            arm(std::in_place_type<api::PhraseQuery>);
+          } else if (key == "knn") {
+            arm(std::in_place_type<api::KnnQuery>);
+          } else if (key == "constant_score") {
+            arm(std::in_place_type<api::ConstantScoreQuery>);
+          } else if (key == "prefix") {
+            arm(std::in_place_type<api::PrefixQuery>);
+          } else if (key == "fuzzy") {
+            arm(std::in_place_type<api::FuzzyQuery>);
+          } else if (key == "simple_query") {
+            arm(std::in_place_type<api::SimpleQuery>);
+          } else if (key == "range") {
+            arm(std::in_place_type<api::RangeQuery>);
+          } else if (key == "expr") {
+            arm(std::in_place_type<api::ExprQuery>);
+          } else if (key == "force_prepare") {
+            arm(std::in_place_type<api::ForcePrepareQuery>);
+          } else {
+            ctx.error = error_code::unknown_key;
+            return true;
           }
           return bool(ctx.error);
         },

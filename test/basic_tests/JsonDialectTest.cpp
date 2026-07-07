@@ -139,6 +139,53 @@ TEST(JsonDialect, RangeQuery) {
   EXPECT_FALSE(r.lte.has_value());
 }
 
+TEST(JsonDialect, QueryBareStringIsExprSugar) {
+  std::pmr::monotonic_buffer_resource mr;
+  P::Query q;
+  ASSERT_TRUE(P::read_json(q, R"("status:active AND year_i:>=1960")", mr));
+  const auto& e = std::get<P::ExprQuery>(q.kind);
+  EXPECT_EQ(e.q, "status:active AND year_i:>=1960");
+
+  // the sugar composes anywhere a query object goes, e.g. TopDocs.query
+  P::TopDocs td;
+  ASSERT_TRUE(P::read_json(td, R"({"query":"tag_s:scifi","limit":5})", mr));
+  ASSERT_TRUE(td.query.has_value());
+  EXPECT_EQ(std::get<P::ExprQuery>(td.query->kind).q, "tag_s:scifi");
+
+  // canonical object arms still read through the same dispatch
+  P::Query m;
+  ASSERT_TRUE(P::read_json(m, R"({"match":{"title_w":"dune"}})", mr));
+  EXPECT_EQ(std::get<P::Match>(m.kind).field, "title_w");
+  P::Query bad;
+  EXPECT_FALSE(P::read_json(bad, R"({"not_an_arm":1})", mr));
+
+  // a Query object IS the oneof: a second arm is an error, not last-wins
+  P::Query two;
+  EXPECT_FALSE(P::read_json(two, R"({"match":{"title_w":"dune"},"all":true})", mr));
+}
+
+TEST(JsonDialect, ExprQueryStringAndObjectForms) {
+  std::pmr::monotonic_buffer_resource mr;
+  P::Query q;
+  // bare string = q-only sugar on the arm itself
+  ASSERT_TRUE(P::read_json(q, R"({"expr":"status:active"})", mr));
+  EXPECT_EQ(std::get<P::ExprQuery>(q.kind).q, "status:active");
+
+  // object form carries vars; values are untagged Vals
+  P::Query qv;
+  ASSERT_TRUE(P::read_json(qv, R"({"expr":{"q":"count_i:$n","vars":{"n":42}}})", mr));
+  const auto& e = std::get<P::ExprQuery>(qv.kind);
+  EXPECT_EQ(e.q, "count_i:$n");
+  const auto* n = e.vars.find("n");
+  ASSERT_NE(nullptr, n);
+  EXPECT_EQ(std::get<std::int64_t>((*n)->kind), 42);
+
+  // writes stay canonical: the structured object, not the string sugar
+  std::string out;
+  ASSERT_TRUE(P::write_json(q, out));
+  EXPECT_EQ(out, R"({"expr":{"q":"status:active"}})");
+}
+
 TEST(JsonDialect, DepthLimitErrorsCleanly) {
   std::pmr::monotonic_buffer_resource mr;
   std::string deep(300, '[');
