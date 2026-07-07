@@ -2177,6 +2177,21 @@ TEST_F(TermScorerTest, nonScoringBooleanDropsOptionalUnderMandatory) {
     scoredCount++;
   }
   EXPECT_EQ(scoredCount, dfA);
+
+  // min_match=1 makes the optional group a membership constraint: the
+  // non-scoring path must NOT drop it (found by BooleanFuzzTest as a filter
+  // clause matching docs with none of its optionals).
+  Query::Context qContext3(testIndex.pool, *testIndex.reader);
+  BooleanQuery q3(mand, opt, {}, {}, 1);
+  auto* mmWeight = q3.createWeight(qContext3, 0);
+  auto* mmScorer = mmWeight->createScorer(testIndex.pool, segment);
+  ASSERT_NE(mmScorer, nullptr);
+  int32_t mmCount = 0;
+  for (int32_t d = mmScorer->next(); d != PostingsReader::END; d = mmScorer->next()) {
+    EXPECT_EQ(d % 15, 0) << "doc must hold aterm AND bterm";
+    mmCount++;
+  }
+  EXPECT_EQ(mmCount, (N + 14) / 15);
 }
 
 TEST_F(TermScorerTest, maxScoreDisjunctionTopKMatchesExhaustive) {
