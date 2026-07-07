@@ -2121,6 +2121,22 @@ TEST_F(TermScorerTest, conjunctionBulkScorerMatchesPull) {
   collectTopKWindowed(0, bulk, nullptr, exactCollector, nullptr, segment.maxDoc(),
                       /*allowPruning=*/false);
   EXPECT_EQ(exactCollector.totalHits(), bothCount);
+
+  BooleanQuery countQ(mand, {}, {}, {});
+  auto* countWeight = countQ.createWeight(qContext, Query::NEED_SCORES);
+  auto* countSupplier = countWeight->scorerSupplier(testIndex.pool, segment);
+  auto* countBulk = countSupplier->bulkScorer(testIndex.pool);
+  ASSERT_NE(countBulk, nullptr);
+  int64_t counted = 0;
+  for (int32_t cursor = 0; cursor != PostingsReader::END && cursor < segment.maxDoc(); ) {
+    int32_t next = countBulk->countNextWindow(counted, nullptr, cursor, segment.maxDoc());
+    if (next == PostingsReader::END) {
+      break;
+    }
+    ASSERT_GT(next, cursor);
+    cursor = next;
+  }
+  EXPECT_EQ(counted, bothCount);
 }
 
 // "+a b" without scores: the optional clause is a pure score add under a

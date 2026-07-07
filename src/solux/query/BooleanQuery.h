@@ -5,6 +5,7 @@
 #include <cmath>
 
 #include "Query.h"
+#include "TermQuery.h"
 #include "solux/reader/SkipStats.h"
 #include "QueryPrep.h"
 #include "solux/util/screaming.h"
@@ -904,6 +905,7 @@ public:
     static constexpr int32_t kChunk = Postings::DOCS_BLOCK_SIZE;
 
     std::span<Query::Scorer*> scorers;  // ascending cost; scorers[0] leads
+    std::span<TermQuery::Scorer*> termScorers; // populated when every scorer is a term
     std::span<float> windowMax;         // per-clause bound over the current window
     std::span<double> suffixMax;        // suffixMax[c] = sum of windowMax[c..n)
     std::span<int32_t> candDocs;
@@ -914,25 +916,66 @@ public:
     float minCompetitiveScore = std::numeric_limits<float>::lowest();
     double scoreBoundFactor = 1.0;
     int64_t skippedWindowCount = 0;
+    bool allTermScorers = false;
 
-  public:
-    ConjunctionBulkScorer(solux::MemPool& pool, std::span<Query::Scorer*> scorers, int32_t maxDoc)
-        : scorers(scorers),
-          windowMax(pool.make_arr<float>(scorers.size()), scorers.size()),
-          suffixMax(pool.make_arr<double>(scorers.size() + 1), scorers.size() + 1),
-          candDocs(pool.make_arr<int32_t>((size_t) kChunk), (size_t) kChunk),
-          candScores(pool.make_arr<float>((size_t) kChunk), (size_t) kChunk),
-          outDocs(pool.make_arr<int32_t>((size_t) DocsEnum::L1_DOCS), (size_t) DocsEnum::L1_DOCS),
-          outScores(pool.make_arr<float>((size_t) DocsEnum::L1_DOCS), (size_t) DocsEnum::L1_DOCS),
-          maxDoc(maxDoc) {
-      assert(scorers.size() >= 2);
-      // Float-summation error headroom for the double bounds (see the MaxScore
-      // scorers' scoreBoundFactor).
-      scoreBoundFactor = 1.0 + (double) scorers.size() * 0x1p-24;
+    template <bool TermFast>
+    int32_t scorerDocId(size_t index) {
+      if constexpr (TermFast) {
+        return termScorers[index]->docsEnum.docId();
+      } else {
+        return scorers[index]->docId();
+      }
     }
 
-    int32_t scoreNextWindow(ScoreWindow& out, DocSet* filter, int32_t min, int32_t max,
-                            float minCompetitiveScore) override {
+    template <bool TermFast>
+    int32_t scorerAdvance(size_t index, int32_t target) {
+      if constexpr (TermFast) {
+        return termScorers[index]->docsEnum.advance(target);
+      } else {
+        return scorers[index]->advance(target);
+      }
+    }
+
+    template <bool TermFast>
+    int32_t scorerAdvanceShallow(size_t index, int32_t target) {
+      if constexpr (TermFast) {
+        return termScorers[index]->advanceShallow(target);
+      } else {
+        return scorers[index]->advanceShallow(target);
+      }
+    }
+
+    template <bool TermFast>
+    float scorerGetMaxScore(size_t index, int32_t upTo) {
+      if constexpr (TermFast) {
+        return termScorers[index]->getMaxScore(upTo);
+      } else {
+        return scorers[index]->getMaxScore(upTo);
+      }
+    }
+
+    template <bool TermFast>
+    int32_t scorerFillScoreBlock(size_t index, int32_t* docs, float* scores,
+                                 int32_t count, int32_t upTo) {
+      if constexpr (TermFast) {
+        return termScorers[index]->fillScoreBlock(docs, scores, count, upTo);
+      } else {
+        return scorers[index]->fillScoreBlock(docs, scores, count, upTo);
+      }
+    }
+
+    template <bool TermFast>
+    float scorerScore(size_t index) {
+      if constexpr (TermFast) {
+        return termScorers[index]->score();
+      } else {
+        return scorers[index]->score();
+      }
+    }
+
+    template <bool TermFast>
+    int32_t scoreNextWindowImpl(ScoreWindow& out, DocSet* filter, int32_t min, int32_t max,
+                                float minCompetitiveScore) {
       out.min = min;
       out.max = min;
       out.size = 0;
@@ -947,10 +990,9 @@ public:
         this->minCompetitiveScore = minCompetitiveScore;
       }
 
-      auto* lead = scorers[0];
-      int32_t leadDoc = lead->docId();
+      int32_t leadDoc = scorerDocId<TermFast>(0);
       if (leadDoc < min) {
-        leadDoc = lead->advance(min);
+        leadDoc = scorerAdvance<TermFast>(0, min);
       }
 
       for (;;) {
@@ -965,15 +1007,15 @@ public:
 
         // Window = [leadDoc, upTo], bounded by every clause's shallow block.
         int32_t upTo = max - 1;
-        for (auto* scorer : scorers) {
-          upTo = std::min(upTo, scorer->advanceShallow(leadDoc));
+        for (size_t c = 0; c < scorers.size(); c++) {
+          upTo = std::min(upTo, scorerAdvanceShallow<TermFast>(c, leadDoc));
         }
         if (upTo < leadDoc) {
           upTo = leadDoc;
         }
         suffixMax[scorers.size()] = 0.0;
         for (size_t c = scorers.size(); c-- > 0; ) {
-          windowMax[c] = scorers[c]->getMaxScore(upTo);
+          windowMax[c] = scorerGetMaxScore<TermFast>(c, upTo);
           suffixMax[c] = suffixMax[c + 1] + (double) windowMax[c];
         }
         if (suffixMax[0] * scoreBoundFactor < (double) this->minCompetitiveScore) {
@@ -984,7 +1026,7 @@ public:
             out.max = max;
             return upTo + 1;
           }
-          leadDoc = lead->advance(upTo + 1);
+          leadDoc = scorerAdvance<TermFast>(0, upTo + 1);
           continue;
         }
 
@@ -1003,7 +1045,8 @@ public:
             assert(lastDecided >= 0);
             return lastDecided + 1;
           }
-          int32_t n = lead->fillScoreBlock(candDocs.data(), candScores.data(), kChunk, upTo + 1);
+          int32_t n = scorerFillScoreBlock<TermFast>(
+              0, candDocs.data(), candScores.data(), kChunk, upTo + 1);
           if (n == 0) {
             break;
           }
@@ -1020,8 +1063,8 @@ public:
             n = w;
           }
           for (size_t c = 1; c < scorers.size() && n > 0; c++) {
-            auto* scorer = scorers[c];
             const double remaining = suffixMax[c];  // clauses [c, end) add at most this
+            int32_t scorerDoc = scorerDocId<TermFast>(c);
             int32_t w = 0;
             for (int32_t i = 0; i < n; i++) {
               int32_t doc = candDocs[(size_t) i];
@@ -1030,14 +1073,14 @@ public:
                   < (double) this->minCompetitiveScore) {
                 continue;  // cannot compete no matter what the rest contribute
               }
-              if (scorer->docId() < doc) {
-                scorer->advance(doc);
+              if (scorerDoc < doc) {
+                scorerDoc = scorerAdvance<TermFast>(c, doc);
               }
-              if (scorer->docId() != doc) {
+              if (scorerDoc != doc) {
                 continue;  // not in the conjunction
               }
               candDocs[(size_t) w] = doc;
-              candScores[(size_t) w] = sum + scorer->score();
+              candScores[(size_t) w] = sum + scorerScore<TermFast>(c);
               w++;
             }
             n = w;
@@ -1052,6 +1095,35 @@ public:
         }
         return upTo + 1;
       }
+    }
+
+  public:
+    ConjunctionBulkScorer(solux::MemPool& pool, std::span<Query::Scorer*> scorers, int32_t maxDoc)
+        : scorers(scorers),
+          termScorers(pool.make_arr<TermQuery::Scorer*>(scorers.size()), scorers.size()),
+          windowMax(pool.make_arr<float>(scorers.size()), scorers.size()),
+          suffixMax(pool.make_arr<double>(scorers.size() + 1), scorers.size() + 1),
+          candDocs(pool.make_arr<int32_t>((size_t) kChunk), (size_t) kChunk),
+          candScores(pool.make_arr<float>((size_t) kChunk), (size_t) kChunk),
+          outDocs(pool.make_arr<int32_t>((size_t) DocsEnum::L1_DOCS), (size_t) DocsEnum::L1_DOCS),
+          outScores(pool.make_arr<float>((size_t) DocsEnum::L1_DOCS), (size_t) DocsEnum::L1_DOCS),
+          maxDoc(maxDoc) {
+      assert(scorers.size() >= 2);
+      // Float-summation error headroom for the double bounds (see the MaxScore
+      // scorers' scoreBoundFactor).
+      scoreBoundFactor = 1.0 + (double) scorers.size() * 0x1p-24;
+      allTermScorers = true;
+      for (size_t i = 0; i < scorers.size(); i++) {
+        termScorers[i] = dynamic_cast<TermQuery::Scorer*>(scorers[i]);
+        allTermScorers &= termScorers[i] != nullptr;
+      }
+    }
+
+    int32_t scoreNextWindow(ScoreWindow& out, DocSet* filter, int32_t min, int32_t max,
+                            float minCompetitiveScore) override {
+      return allTermScorers
+          ? scoreNextWindowImpl<true>(out, filter, min, max, minCompetitiveScore)
+          : scoreNextWindowImpl<false>(out, filter, min, max, minCompetitiveScore);
     }
 
     int64_t skippedWindows() const {
