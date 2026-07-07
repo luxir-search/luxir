@@ -347,7 +347,10 @@ public:
       }
 
       BulkScorer* bulkScorer(MemPool& targetPool) override {
-        if (needsScores && optionalSources.empty() && prohibitedSources.empty()
+        // Scored or not: unscored clauses bound as +infinity, so the window
+        // skip never fires and the bulk intersection runs exhaustively - the
+        // right execution for exact conjunction counts too.
+        if (optionalSources.empty() && prohibitedSources.empty()
             && filterSuppliers.empty() && mandatorySources.size() >= 2) {
           return conjunctionBulkScorer(targetPool);
         }
