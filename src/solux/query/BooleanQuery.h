@@ -1305,7 +1305,9 @@ public:
       return card <= (aggregateClauseCost - 1) / scale;
     }
 
-    void setupDomainWindow(int32_t start, int32_t max) {
+    // Window bounds only - none of setupWindow's max-score machinery. Used by
+    // the domain-driven and counting paths, which never consult impacts.
+    void setWindowBounds(int32_t start, int32_t max) {
       windowStart = start;
       int32_t requestedEnd = windowStart + kWindowSize;
       if (requestedEnd < windowStart) {
@@ -1352,8 +1354,9 @@ public:
       }
     }
 
-    void fillDomainDrivenCandidates(ScoreWindow& out, DocSet* filter) {
-      prepareOutputWindow(out);
+    // Visit every domain doc in the current window in order.
+    template <typename PerDoc>
+    void forEachDomainDoc(DocSet* filter, PerDoc&& perDoc) {
       if (filter->type == DocSet::ARRAY) {
         ArrDocSet* arrDocs = (ArrDocSet*) filter;
         auto docs = arrDocs->docs();
@@ -1365,7 +1368,7 @@ public:
           arrayCursor = (size_t)(it - base);
         }
         while (arrayCursor < docs.size() && docs[arrayCursor] < windowEnd) {
-          collectDomainDoc(out, docs[arrayCursor]);
+          perDoc(docs[arrayCursor]);
           arrayCursor++;
         }
         return;
@@ -1379,8 +1382,28 @@ public:
         if (doc >= windowEnd) {
           break;
         }
-        collectDomainDoc(out, doc);
+        perDoc(doc);
       }
+    }
+
+    void fillDomainDrivenCandidates(ScoreWindow& out, DocSet* filter) {
+      prepareOutputWindow(out);
+      forEachDomainDoc(filter, [&](int32_t doc) { collectDomainDoc(out, doc); });
+    }
+
+    // Membership-only variant of scoreDomainDoc: stops at the first matching
+    // clause instead of advancing and scoring all of them.
+    bool matchesAnyClause(int32_t doc) {
+      for (size_t i = 0; i < scorers.size(); i++) {
+        auto* scorer = scorers[i];
+        if (scorer->docId() < doc) {
+          scorer->advance(doc);
+        }
+        if (scorer->docId() == doc && verifyMatch(scorer, doc)) {
+          return true;
+        }
+      }
+      return false;
     }
 
     void fillEssentialCandidates(DocSet* filter, const FixedBitSet* domainBits) {
@@ -1556,7 +1579,7 @@ public:
         return PostingsReader::END;
       }
       if (shouldDriveFromDomain(filter)) {
-        setupDomainWindow(min, max);
+        setWindowBounds(min, max);
         domainDriveWindows++;
         fillDomainDrivenCandidates(out, filter);
         return windowEnd >= max ? PostingsReader::END : windowEnd;
@@ -1583,6 +1606,66 @@ public:
         out.max = windowEnd;
       }
 
+      return windowEnd >= max ? PostingsReader::END : windowEnd;
+    }
+
+    // Exhaustive window count: per-clause block drives OR into the window
+    // bitset, then popcount. No score rows, no impact bookkeeping, no
+    // candidate materialization - counting needs none of them. Only used for
+    // count-only collection, where nothing ever raises a clause's competitive
+    // threshold, so the block fills below cannot skip.
+    int32_t countNextWindow(int64_t& count, DocSet* filter, int32_t min, int32_t max) override {
+      max = std::min(max, maxDoc);
+      if (min >= max) {
+        return PostingsReader::END;
+      }
+      if (filter != nullptr && filter->card() == 0) {
+        return PostingsReader::END;
+      }
+      if (shouldDriveFromDomain(filter)) {
+        setWindowBounds(min, max);
+        domainDriveWindows++;
+        forEachDomainDoc(filter, [&](int32_t doc) {
+          if (matchesAnyClause(doc)) {
+            count++;
+          }
+        });
+        return windowEnd >= max ? PostingsReader::END : windowEnd;
+      }
+
+      const FixedBitSet* domainBits = nullptr;
+      if (filter != nullptr && filter->type == DocSet::BITSET) {
+        domainBits = &((BitDocSet*) filter)->bits();
+      }
+
+      setWindowBounds(min, max);
+      clearWindowBits();
+      int32_t blockDocs[Postings::DOCS_BLOCK_SIZE];
+      float blockScores[Postings::DOCS_BLOCK_SIZE];
+      for (size_t i = 0; i < scorers.size(); i++) {
+        auto* scorer = scorers[i];
+        if (scorer->docId() < windowStart) {
+          scorer->advance(windowStart);
+        }
+        int32_t n;
+        while ((n = scorer->fillScoreBlock(blockDocs, blockScores,
+                                           Postings::DOCS_BLOCK_SIZE, windowEnd)) > 0) {
+          if (filter == nullptr) {
+            for (int32_t j = 0; j < n; j++) {
+              setWindowBit(blockDocs[j] - windowStart);
+            }
+          } else {
+            for (int32_t j = 0; j < n; j++) {
+              if (acceptsDoc(filter, domainBits, blockDocs[j])) {
+                setWindowBit(blockDocs[j] - windowStart);
+              }
+            }
+          }
+        }
+      }
+      for (size_t w = 0; w < windowBits.size(); w++) {
+        count += std::popcount(windowBits[w]);
+      }
       return windowEnd >= max ? PostingsReader::END : windowEnd;
     }
 

@@ -457,6 +457,22 @@ void collectTopK(int32_t segnum, Query::Scorer* scorer, DocSet* filter,
 // value is deliberately NOT forwarded in that mode - skipped docs cannot be
 // counted. Callers should also pass accumulator=nullptr then, so this
 // segment's threshold does not leak to sibling segments.
+// Count-only collection over the windowed bulk path: no docs or scores are
+// ever materialized, only the per-window match counts. Callers must only use
+// this when the collector keeps nothing but hitCount (topCount == 0) and no
+// doc-set builder is attached.
+inline void collectCountWindowed(BulkScorer* bulk, DocSet* filter,
+                                 TopDocsCollector& collector, int32_t maxDoc) {
+  assert(bulk != nullptr);
+  assert(collector.topCount == 0);
+  int64_t count = 0;
+  int32_t cursor = 0;
+  while (cursor != PostingsReader::END && cursor < maxDoc) {
+    cursor = bulk->countNextWindow(count, filter, cursor, maxDoc);
+  }
+  collector.hitCount += count;
+}
+
 template <typename Collector>
 void collectTopKWindowed(int32_t segnum, BulkScorer* bulk, DocSet* filter,
                          Collector& collector, MaxScoreAccumulator* accumulator,

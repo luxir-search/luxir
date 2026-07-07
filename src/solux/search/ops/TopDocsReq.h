@@ -317,9 +317,16 @@ public:
               bulk = supplier->bulkScorer(poolGuard.pool());
             }
             if (bulk != nullptr) {
-              collectTopKWindowed(segnum, bulk, collectorFilter, *data->scoreCollector,
-                                  allowPruning ? &scoreAccumulator : nullptr, seg.maxDoc(),
-                                  allowPruning);
+              if (data->scoreCollector->topCount == 0) {
+                // limit 0: the collector keeps nothing but the total, so count
+                // windows without materializing docs or scores.
+                collectCountWindowed(bulk, collectorFilter, *data->scoreCollector,
+                                     seg.maxDoc());
+              } else {
+                collectTopKWindowed(segnum, bulk, collectorFilter, *data->scoreCollector,
+                                    allowPruning ? &scoreAccumulator : nullptr, seg.maxDoc(),
+                                    allowPruning);
+              }
             } else {
               auto* scorer = supplier->get(poolGuard.pool(), std::numeric_limits<int64_t>::max());
               if (scorer != nullptr) {

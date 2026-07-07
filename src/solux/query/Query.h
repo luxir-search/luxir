@@ -39,6 +39,19 @@ public:
   // The spans in out are valid until the next call.
   virtual int32_t scoreNextWindow(ScoreWindow& out, DocSet* filter, int32_t min, int32_t max,
                                   float minCompetitiveScore) = 0;
+
+  // Count (rather than emit) the matches of the next window in [min, max),
+  // intersected with filter. Adds to count and returns the resume docid like
+  // scoreNextWindow. Exhaustive by definition - no competitive threshold.
+  // The default delegates to scoreNextWindow; subclasses override when they
+  // can count cheaper than they can emit (no scores, no doc materialization).
+  virtual int32_t countNextWindow(int64_t& count, DocSet* filter, int32_t min, int32_t max) {
+    ScoreWindow window;
+    int32_t next = scoreNextWindow(window, filter, min, max,
+                                   std::numeric_limits<float>::lowest());
+    count += window.size;
+    return next;
+  }
 };
 
 // Overview
