@@ -15,6 +15,7 @@
 #include "solux/reader/FieldReader.h"
 #include "solux/reader/TermsEnum.h"
 #include "solux/reader/DocsEnum.h"
+#include "solux/search/DocSet.h"
 #include "solux/search/Similarity.h"
 #include <boost/unordered/unordered_node_map.hpp>
 #include <google/protobuf/arena.h>
@@ -22,6 +23,7 @@
 namespace solux {
 
 class DocSet;
+class DocSetBuilder;
 
 struct ScoreWindow {
   int32_t min = 0;
@@ -46,10 +48,17 @@ public:
   // scoreNextWindow. Exhaustive by definition - no competitive threshold.
   // The default delegates to scoreNextWindow; subclasses override when they
   // can count cheaper than they can emit (no scores, no doc materialization).
-  virtual int32_t countNextWindow(int64_t& count, DocSet* filter, int32_t min, int32_t max) {
+  virtual int32_t countNextWindow(int64_t& count, DocSetBuilder* domainOut,
+                                  DocSet* filter, int32_t min, int32_t max) {
     ScoreWindow window;
     int32_t next = scoreNextWindow(window, filter, min, max,
                                    std::numeric_limits<float>::lowest());
+    if (domainOut != nullptr) {
+      skipCount(SkipStats::bulkDomainWindowsFed);
+      for (int32_t i = 0; i < window.size; i++) {
+        domainOut->add(window.docs[(size_t) i]);
+      }
+    }
     count += window.size;
     return next;
   }

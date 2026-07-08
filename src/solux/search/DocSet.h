@@ -1,4 +1,6 @@
 #pragma once
+#include <algorithm>
+#include <bit>
 #include <vector>
 #include <span>
 #include <solux/util/screaming.h>
@@ -133,6 +135,139 @@ public:
 };
 
 class DocSetBuilder {
+  #ifndef NDEBUG
+  int32_t lastDoc = -1;
+
+  void checkMonotonic(int32_t docid) {
+    assert(docid >= 0);
+    assert(docid < max);
+    assert(docid > lastDoc);
+    lastDoc = docid;
+  }
+
+  void checkWindowWordsMonotonic(const uint64_t* words, int32_t windowStart,
+                                 int32_t windowEnd) {
+    assert(windowStart >= 0);
+    assert(windowEnd >= windowStart);
+    assert(windowEnd <= max);
+    int32_t nbits = windowEnd - windowStart;
+    int32_t nwords = (nbits + 63) >> 6;
+    for (int32_t wordIdx = 0; wordIdx < nwords; wordIdx++) {
+      uint64_t word = maskedWindowWord(words[wordIdx], wordIdx, nwords, nbits);
+      while (word != 0) {
+        int32_t bit = (int32_t) std::countr_zero(word);
+        checkMonotonic(windowStart + (wordIdx << 6) + bit);
+        word &= word - 1;
+      }
+    }
+  }
+  #endif
+
+  static uint64_t lowBitsMask(int32_t bits) {
+    assert(bits >= 0 && bits <= 64);
+    if (bits == 0) return 0;
+    if (bits == 64) return ~0ULL;
+    return (1ULL << bits) - 1ULL;
+  }
+
+  static uint64_t maskedWindowWord(uint64_t word, int32_t wordIdx,
+                                   int32_t nwords, int32_t nbits) {
+    if (wordIdx + 1 == nwords) {
+      int32_t validBits = nbits & 63;
+      if (validBits != 0) {
+        word &= lowBitsMask(validBits);
+      }
+    }
+    return word;
+  }
+
+  int32_t popCountWindowWords(const uint64_t* words, int32_t windowStart,
+                              int32_t windowEnd) const {
+    unused(windowStart);
+    int32_t nbits = windowEnd - windowStart;
+    int32_t nwords = (nbits + 63) >> 6;
+    int32_t count = 0;
+    for (int32_t i = 0; i < nwords; i++) {
+      count += (int32_t) std::popcount(maskedWindowWord(words[i], i, nwords, nbits));
+    }
+    return count;
+  }
+
+  int32_t arrayLimit() const {
+    return (max + 31) >> 5;
+  }
+
+  void promoteToBits() {
+    assert(!bits);
+    bitDocs.emplace(max);
+    bits = &bitDocs->mutableBits();
+    for (auto d : docs) {
+      bits->set(d);
+    }
+    bitDocs->setCard((int32_t) docs.size());
+    docs.clear();
+    docs.shrink_to_fit();
+  }
+
+  void appendWindowDocsToArray(const uint64_t* words, int32_t windowStart,
+                               int32_t windowEnd, int32_t maxDocsToAppend) {
+    if (maxDocsToAppend <= 0) {
+      return;
+    }
+    int32_t nbits = windowEnd - windowStart;
+    int32_t nwords = (nbits + 63) >> 6;
+    for (int32_t wordIdx = 0; wordIdx < nwords && maxDocsToAppend > 0; wordIdx++) {
+      uint64_t word = maskedWindowWord(words[wordIdx], wordIdx, nwords, nbits);
+      while (word != 0 && maxDocsToAppend > 0) {
+        int32_t bit = (int32_t) std::countr_zero(word);
+        docs.emplace_back(windowStart + (wordIdx << 6) + bit);
+        maxDocsToAppend--;
+        word &= word - 1;
+      }
+    }
+  }
+
+  void orWindowWordsToBits(const uint64_t* words, int32_t windowStart,
+                           int32_t windowEnd) {
+    assert(bits != nullptr);
+    int32_t nbits = windowEnd - windowStart;
+    int32_t nwords = (nbits + 63) >> 6;
+    int32_t destWord = windowStart >> 6;
+    int32_t shift = windowStart & 63;
+    int32_t bitWordCount = (int32_t) FixedBitSet::sizeInWords(max);
+    int32_t added = 0;
+
+    for (int32_t i = 0; i < nwords; i++) {
+      uint64_t source = maskedWindowWord(words[i], i, nwords, nbits);
+      if (source == 0) {
+        continue;
+      }
+
+      int32_t lowWord = destWord + i;
+      if (lowWord < bitWordCount) {
+        uint64_t low = shift == 0 ? source : source << shift;
+        uint64_t before = bits->words[lowWord];
+        uint64_t after = before | low;
+        bits->words[lowWord] = after;
+        added += (int32_t) std::popcount(after) - (int32_t) std::popcount(before);
+      }
+
+      if (shift != 0) {
+        int32_t highWord = lowWord + 1;
+        if (highWord < bitWordCount) {
+          uint64_t high = source >> (64 - shift);
+          if (high != 0) {
+            uint64_t before = bits->words[highWord];
+            uint64_t after = before | high;
+            bits->words[highWord] = after;
+            added += (int32_t) std::popcount(after) - (int32_t) std::popcount(before);
+          }
+        }
+      }
+    }
+    bitDocs->card_ += added;
+  }
+
 public:
   const int32_t max;
   std::vector<int32_t> docs;
@@ -143,6 +278,9 @@ public:
   }
 
   void add(int32_t docid) SOLUX_INLINE {
+    #ifndef NDEBUG
+    checkMonotonic(docid);
+    #endif
     if (bits) {
       bits->set(docid);
       bitDocs->card_++;
@@ -152,15 +290,48 @@ public:
       docs.emplace_back(docid);
       return;
     }
-    bitDocs.emplace(max);
-    bits = &bitDocs->mutableBits();
-    for (auto d : docs) {
-      bitDocs->mutableBits().set(d);
+    promoteToBits();
+    bits->set(docid);
+    bitDocs->card_++;
+  }
+
+  int32_t card() const {
+    return bits ? bitDocs->cachedCard() : (int32_t) docs.size();
+  }
+
+  void addWindowWords(const uint64_t* words, int32_t windowStart, int32_t windowEnd) {
+    assert(words != nullptr);
+    assert(windowStart >= 0);
+    assert(windowEnd >= windowStart);
+    windowEnd = std::min(windowEnd, max);
+    if (windowEnd <= windowStart) {
+      return;
     }
-    bitDocs->mutableBits().set(docid);
-    bitDocs->setCard(docs.size() + 1);
-    docs.clear();
-    docs.shrink_to_fit();
+
+    int32_t wordCard = popCountWindowWords(words, windowStart, windowEnd);
+    if (wordCard == 0) {
+      return;
+    }
+
+    #ifndef NDEBUG
+    checkWindowWordsMonotonic(words, windowStart, windowEnd);
+    #endif
+
+    if (bits) {
+      orWindowWordsToBits(words, windowStart, windowEnd);
+      return;
+    }
+
+    int32_t limit = arrayLimit();
+    if ((int32_t) docs.size() + wordCard <= limit) {
+      appendWindowDocsToArray(words, windowStart, windowEnd, wordCard);
+      return;
+    }
+
+    int32_t appendBeforePromotion = std::max<int32_t>(0, limit - (int32_t) docs.size());
+    appendWindowDocsToArray(words, windowStart, windowEnd, appendBeforePromotion);
+    promoteToBits();
+    orWindowWordsToBits(words, windowStart, windowEnd);
   }
 
   std::unique_ptr<DocSet> build() {

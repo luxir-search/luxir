@@ -11,6 +11,7 @@
 #include "test/CollectionHelper.h"
 #include "test/LocalReq.h"
 #include "test/QueryBuild.h"
+#include "solux/reader/SkipStats.h"
 #include "solux/server/GRPCServer.h"
 
 using namespace solux;
@@ -109,6 +110,42 @@ TEST_F(SearchEngineTest, limitZeroCountsWithoutDocs) {
     EXPECT_EQ(3, req->getMatchCount("q"));
     EXPECT_TRUE(req->getDocs("q").empty());
   }
+}
+
+TEST_F(SearchEngineTest, singleTermLimitZeroFacetUsesBulkDomain) {
+  CollectionHelper helper;
+  helper.clear();
+  std::vector<Doc> docs;
+  docs.reserve(256);
+  for (int32_t i = 0; i < 256; i++) {
+    std::string body = (i % 3) == 0 ? "needle filler" : "filler";
+    std::string color = (i % 2) == 0 ? "red" : "blue";
+    docs.push_back(flatdoc("id", "bdf_" + std::to_string(i),
+                           "foo_w", body, "color_s", color));
+  }
+  helper.indexAll(docs, UpdateMessage::COMMIT);
+
+  bool savedStats = SkipStats::enabled;
+  SkipStats::enabled = true;
+  SkipStats::reset();
+
+  auto req = localReq(soluxNode->getSearchEngine());
+  req->collection("main");
+  auto& q = req->topDocs("q").matchQuery("foo_w", "needle").getNumber().limit(0);
+  q.facet("colors", "color_s").limit(-1);
+  req->execute(false);
+
+  ASSERT_OK(req);
+  EXPECT_EQ(86, req->getMatchCount("q"));
+  const auto& docsOut = *req->docList("q");
+  const auto& facet = std::get<solux::api::FacetResult>(docsOut.ops.at("colors")->kind);
+  int64_t facetTotal = 0;
+  for (auto c : facet.counts) facetTotal += c;
+  EXPECT_EQ(86, facetTotal);
+  EXPECT_GT(SkipStats::bulkDomainWindowsFed, 0);
+
+  SkipStats::enabled = savedStats;
+  helper.clear();
 }
 
 TEST_F(SearchEngineTest, basic) {

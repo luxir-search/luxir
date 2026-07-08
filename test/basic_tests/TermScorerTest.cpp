@@ -575,7 +575,8 @@ DisjunctionTopKRun runDenseFilteredBulkTopK(IndexReader& reader, int32_t numTerm
     }
     int64_t beforeBs1Windows = maxScoreBulk->bs1WindowCount();
     int64_t beforeDomainDriveWindows = maxScoreBulk->domainDriveWindowCount();
-    collectTopKWindowed(segnum, bulk, filter.get(), collector, nullptr, segments[segnum].maxDoc());
+    collectTopKWindowed(segnum, bulk, filter.get(), nullptr, collector, nullptr,
+                        segments[segnum].maxDoc());
     result.bs1Windows += maxScoreBulk->bs1WindowCount() - beforeBs1Windows;
     result.domainDriveWindows += maxScoreBulk->domainDriveWindowCount() - beforeDomainDriveWindows;
   }
@@ -612,11 +613,11 @@ DisjunctionTopKRun runBulkTermDisjunctionTopK(IndexReader& reader,
     }
     if (segmentCollectors) {
       TopDocsCollector segmentCollector(topK);
-      collectTopKWindowed(segnum, bulk, nullptr, segmentCollector, accumulator, segments[segnum].maxDoc());
+      collectTopKWindowed(segnum, bulk, nullptr, nullptr, segmentCollector, accumulator, segments[segnum].maxDoc());
       visited += segmentCollector.totalHits();
       merged.merge(segmentCollector);
     } else {
-      collectTopKWindowed(segnum, bulk, nullptr, single, accumulator, segments[segnum].maxDoc());
+      collectTopKWindowed(segnum, bulk, nullptr, nullptr, single, accumulator, segments[segnum].maxDoc());
     }
   }
 
@@ -652,7 +653,7 @@ int64_t countBulkTermDisjunctionSegment(MemPool& pool, Query::Context& qContext,
 
   int64_t count = 0;
   for (int32_t cursor = 0; cursor != PostingsReader::END && cursor < segment.maxDoc(); ) {
-    int32_t next = bulk->countNextWindow(count, filter, cursor, segment.maxDoc());
+    int32_t next = bulk->countNextWindow(count, nullptr, filter, cursor, segment.maxDoc());
     if (next == PostingsReader::END) {
       break;
     }
@@ -709,7 +710,7 @@ int64_t countBulkTermConjunctionSegment(MemPool& pool, Query::Context& qContext,
 
   int64_t count = 0;
   for (int32_t cursor = 0; cursor != PostingsReader::END && cursor < segment.maxDoc(); ) {
-    int32_t next = bulk->countNextWindow(count, filter, cursor, segment.maxDoc());
+    int32_t next = bulk->countNextWindow(count, nullptr, filter, cursor, segment.maxDoc());
     if (next == PostingsReader::END) {
       break;
     }
@@ -743,6 +744,97 @@ int64_t countPullTermConjunctionSegment(MemPool& pool, Query::Context& qContext,
     }
   }
   return count;
+}
+
+struct DomainCountRun {
+  int64_t count = 0;
+  std::unique_ptr<DocSet> domain;
+};
+
+std::vector<int32_t> docSetDocs(DocSet* docSet, int32_t maxDoc) {
+  std::vector<int32_t> docs;
+  if (docSet == nullptr) {
+    return docs;
+  }
+  docs.reserve((size_t) docSet->card());
+  if (docSet->type == DocSet::ARRAY) {
+    auto arr = ((ArrDocSet*) docSet)->docs();
+    docs.assign(arr.begin(), arr.end());
+    return docs;
+  }
+  const auto& bits = ((BitDocSet*) docSet)->bits();
+  int32_t doc = maxDoc == 0 ? FixedBitSet::MAX_INDEX : bits.nextSetBit(0);
+  while (doc < maxDoc) {
+    docs.push_back(doc);
+    if (doc + 1 >= maxDoc) {
+      break;
+    }
+    doc = bits.nextSetBit(doc + 1);
+  }
+  return docs;
+}
+
+void expectDocSetEqual(DocSet* actual, DocSet* expected, int32_t maxDoc) {
+  ASSERT_NE(actual, nullptr);
+  ASSERT_NE(expected, nullptr);
+  EXPECT_EQ(actual->card(), expected->card());
+  EXPECT_EQ(docSetDocs(actual, maxDoc), docSetDocs(expected, maxDoc));
+  for (int32_t doc = 0; doc < maxDoc; doc++) {
+    ASSERT_EQ(actual->get(doc), expected->get(doc)) << "doc=" << doc;
+  }
+}
+
+DomainCountRun pullDomain(Query::Weight* weight, MemPool& pool,
+                          IndexReader::Segment& segment, DocSet* filter) {
+  DocSetBuilder builder(segment.maxDoc());
+  int64_t count = 0;
+  auto* scorer = weight->createScorer(pool, segment);
+  if (scorer != nullptr) {
+    for (int32_t doc = scorer->next(); doc != PostingsReader::END; doc = scorer->next()) {
+      if (filter != nullptr && !filter->get(doc)) {
+        continue;
+      }
+      builder.add(doc);
+      count++;
+    }
+  }
+  return {count, builder.build()};
+}
+
+DomainCountRun bulkCountDomain(Query::Weight* weight, MemPool& pool,
+                               IndexReader::Segment& segment, DocSet* filter) {
+  DocSetBuilder builder(segment.maxDoc());
+  int64_t count = 0;
+  auto* supplier = weight->scorerSupplier(pool, segment);
+  if (supplier != nullptr) {
+    auto* bulk = supplier->bulkScorer(pool);
+    if (bulk == nullptr) {
+      ADD_FAILURE() << "bulkScorer returned null";
+    } else {
+      for (int32_t cursor = 0; cursor != PostingsReader::END && cursor < segment.maxDoc(); ) {
+        int32_t next = bulk->countNextWindow(count, &builder, filter, cursor, segment.maxDoc());
+        if (next == PostingsReader::END) {
+          break;
+        }
+        if (next <= cursor) {
+          ADD_FAILURE() << "countNextWindow made no progress";
+          break;
+        }
+        cursor = next;
+      }
+    }
+  }
+  EXPECT_EQ(count, builder.card());
+  return {count, builder.build()};
+}
+
+void expectBulkDomainMatchesPull(Query::Weight* bulkWeight, Query::Weight* pullWeight,
+                                 MemPool& pool, IndexReader::Segment& segment,
+                                 DocSet* filter) {
+  auto expected = pullDomain(pullWeight, pool, segment, filter);
+  auto actual = bulkCountDomain(bulkWeight, pool, segment, filter);
+  EXPECT_EQ(actual.count, expected.count);
+  expectDocSetEqual(actual.domain.get(), expected.domain.get(), segment.maxDoc());
 }
 
 void addBulkFillTermDoc(TestField& f, int32_t doc, bool a, bool b, bool c) {
@@ -2513,7 +2605,7 @@ TEST_F(TermScorerTest, conjunctionBulkScorerMatchesPull) {
     auto* bulk = supplier->bulkScorer(testIndex.pool);
     ASSERT_NE(bulk, nullptr) << "pure scored conjunction should get the bulk path";
     TopDocsCollector bulkCollector(k);
-    collectTopKWindowed(0, bulk, nullptr, bulkCollector, nullptr, segment.maxDoc());
+    collectTopKWindowed(0, bulk, nullptr, nullptr, bulkCollector, nullptr, segment.maxDoc());
 
     auto expected = sortedCollectorDocs(pullCollector);
     auto actual = sortedCollectorDocs(bulkCollector);
@@ -2527,7 +2619,7 @@ TEST_F(TermScorerTest, conjunctionBulkScorerMatchesPull) {
   auto* bulk = supplier->bulkScorer(testIndex.pool);
   ASSERT_NE(bulk, nullptr);
   TopDocsCollector exactCollector(10);
-  collectTopKWindowed(0, bulk, nullptr, exactCollector, nullptr, segment.maxDoc(),
+  collectTopKWindowed(0, bulk, nullptr, nullptr, exactCollector, nullptr, segment.maxDoc(),
                       /*allowPruning=*/false);
   EXPECT_EQ(exactCollector.totalHits(), bothCount);
 
@@ -2538,7 +2630,7 @@ TEST_F(TermScorerTest, conjunctionBulkScorerMatchesPull) {
   ASSERT_NE(countBulk, nullptr);
   int64_t counted = 0;
   for (int32_t cursor = 0; cursor != PostingsReader::END && cursor < segment.maxDoc(); ) {
-    int32_t next = countBulk->countNextWindow(counted, nullptr, cursor, segment.maxDoc());
+    int32_t next = countBulk->countNextWindow(counted, nullptr, nullptr, cursor, segment.maxDoc());
     if (next == PostingsReader::END) {
       break;
     }
@@ -2992,6 +3084,263 @@ TEST_F(TermScorerTest, countBulkFillWithDeletesMatchesPull) {
   int64_t pull = countPullTermDisjunctionSegment(testIndex.pool, qContext, segment, terms, liveDocs);
   int64_t bulk = countBulkTermDisjunctionSegment(testIndex.pool, qContext, segment, terms, liveDocs);
   EXPECT_EQ(bulk, pull);
+}
+
+TEST_F(TermScorerTest, bulkCountDomainDisjunctionMatchesPullAcrossFiltersAndDeletes) {
+  const int32_t N = 2 * DocsEnum::L1_DOCS + 97;
+  TestIndex testIndex;
+  TestField f(testIndex, "body_w");
+  f.startIndexing();
+  for (int32_t doc = 0; doc < N; doc++) {
+    std::string body;
+    if ((doc % 2) == 0) appendRepeatedTerm(body, "bda", 1 + (doc % 3));
+    if ((doc % 3) != 1) appendRepeatedTerm(body, "bdb", 1 + (doc % 5));
+    if ((doc % 11) == 0) appendRepeatedTerm(body, "bdc", 1);
+    appendRepeatedTerm(body, "filler", 2);
+    f.add(doc, body);
+    if ((doc % 17) == 0) {
+      testIndex.deleteDoc(doc);
+    }
+  }
+  testIndex.flush();
+  f.startReading();
+
+  auto poolFree = testIndex.pool.rewindScopeGuard();
+  Query::Context qContext(testIndex.pool, *testIndex.reader);
+  auto& segment = qContext.topReader.segments()[0];
+  ASSERT_NE(segment.liveDocs(), nullptr);
+  auto bitsetFilter = makeEveryNthDocSet(segment.maxDoc(), 4, false);
+  auto arrayFilter = makeEveryNthDocSet(segment.maxDoc(), 5, true);
+
+  std::array<std::string_view, 3> terms = {"bda", "bdb", "bdc"};
+  auto queries = makeTermQueries(terms);
+  auto optional = queryPointers(queries);
+  std::span<Query*> empty;
+
+  auto check = [&](DocSet* filter, bool disableDomainDrive) {
+    BulkDomainDriveGuard guard(disableDomainDrive);
+    BooleanQuery bulkQ(empty, std::span<Query*>(optional.data(), optional.size()), empty, empty);
+    BooleanQuery pullQ(empty, std::span<Query*>(optional.data(), optional.size()), empty, empty);
+    auto* bulkWeight = bulkQ.createWeight(qContext, Query::NEED_SCORES);
+    auto* pullWeight = pullQ.createWeight(qContext, Query::NEED_SCORES);
+    expectBulkDomainMatchesPull(bulkWeight, pullWeight, testIndex.pool, segment, filter);
+  };
+
+  check(nullptr, true);
+  check(&segment.liveDocs()->docset(), true);
+  check(bitsetFilter.get(), true);
+  check(arrayFilter.get(), true);
+}
+
+TEST_F(TermScorerTest, bulkCountDomainDisjunctionDomainDriveMatchesPull) {
+  CollectionHelper helper("main");
+  const int32_t numTerms = 32;
+  const int32_t nDocs = 3 * DocsEnum::L1_DOCS + 37;
+  const int32_t filterStep = 512;
+  addDenseManyClauseDisjunctionDocs(helper, nDocs, numTerms);
+  auto reader = helper.getIndexWriter()->getIndexReader();
+
+  MemPool pool;
+  Query::Context qContext(pool, *reader);
+  auto& segment = qContext.topReader.segments()[0];
+  std::vector<std::string> termStrings = makeMtTermStrings(numTerms);
+  std::vector<std::string_view> termViews;
+  termViews.reserve(termStrings.size());
+  for (auto& term : termStrings) termViews.push_back(term);
+  auto queries = makeTermQueries(termViews);
+  auto optional = queryPointers(queries);
+  std::span<Query*> empty;
+
+  for (bool arrayDocSet : {false, true}) {
+    auto filter = makeEveryNthDocSet(segment.maxDoc(), filterStep, arrayDocSet);
+    BooleanQuery bulkQ(empty, std::span<Query*>(optional.data(), optional.size()), empty, empty);
+    BooleanQuery pullQ(empty, std::span<Query*>(optional.data(), optional.size()), empty, empty);
+    auto* bulkWeight = bulkQ.createWeight(qContext, Query::NEED_SCORES);
+    auto* pullWeight = pullQ.createWeight(qContext, Query::NEED_SCORES);
+    auto expected = pullDomain(pullWeight, pool, segment, filter.get());
+
+    DocSetBuilder builder(segment.maxDoc());
+    int64_t count = 0;
+    auto* supplier = bulkWeight->scorerSupplier(pool, segment);
+    ASSERT_NE(supplier, nullptr);
+    auto* bulk = supplier->bulkScorer(pool);
+    ASSERT_NE(bulk, nullptr);
+    auto* maxScoreBulk = dynamic_cast<BooleanQuery::MaxScoreBulkScorer*>(bulk);
+    ASSERT_NE(maxScoreBulk, nullptr);
+    for (int32_t cursor = 0; cursor != PostingsReader::END && cursor < segment.maxDoc(); ) {
+      int32_t next = bulk->countNextWindow(count, &builder, filter.get(), cursor, segment.maxDoc());
+      if (next == PostingsReader::END) break;
+      ASSERT_GT(next, cursor);
+      cursor = next;
+    }
+    ASSERT_GT(maxScoreBulk->domainDriveWindowCount(), 0) << "arrayDocSet=" << arrayDocSet;
+    EXPECT_EQ(count, expected.count);
+    EXPECT_EQ(count, builder.card());
+    auto actual = builder.build();
+    expectDocSetEqual(actual.get(), expected.domain.get(), segment.maxDoc());
+  }
+  helper.clear();
+}
+
+TEST_F(TermScorerTest, bulkCountDomainConjunctionDenseAndSparseMatchPull) {
+  {
+    const int32_t N = 2 * DocsEnum::L1_DOCS + 321;
+    TestIndex testIndex;
+    TestField f(testIndex, "body_w");
+    f.startIndexing();
+    for (int32_t doc = 0; doc < N; doc++) {
+      std::string body;
+      if ((doc % 17) != 5) appendRepeatedTerm(body, "bcda", 1 + (doc % 3));
+      if ((doc % 19) != 7) appendRepeatedTerm(body, "bcdb", 1 + (doc % 5));
+      appendRepeatedTerm(body, "filler", 2);
+      f.add(doc, body);
+    }
+    testIndex.flush();
+    f.startReading();
+
+    auto poolFree = testIndex.pool.rewindScopeGuard();
+    Query::Context qContext(testIndex.pool, *testIndex.reader);
+    auto& segment = qContext.topReader.segments()[0];
+    auto bitsetFilter = makeEveryNthDocSet(segment.maxDoc(), 3, false);
+    auto arrayFilter = makeEveryNthDocSet(segment.maxDoc(), 5, true);
+    std::array<std::string_view, 2> terms = {"bcda", "bcdb"};
+    auto queries = makeTermQueries(terms);
+    auto mandatory = queryPointers(queries);
+    std::span<Query*> empty;
+
+    std::array<DocSet*, 3> filters = {nullptr, bitsetFilter.get(), arrayFilter.get()};
+    for (DocSet* filter : filters) {
+      BooleanQuery bulkQ(std::span<Query*>(mandatory.data(), mandatory.size()), empty, empty, empty);
+      BooleanQuery pullQ(std::span<Query*>(mandatory.data(), mandatory.size()), empty, empty, empty);
+      auto* bulkWeight = bulkQ.createWeight(qContext, Query::NEED_SCORES);
+      auto* pullWeight = pullQ.createWeight(qContext, Query::NEED_SCORES);
+      expectBulkDomainMatchesPull(bulkWeight, pullWeight, testIndex.pool, segment, filter);
+    }
+  }
+
+  {
+    const int32_t N = 2 * DocsEnum::L1_DOCS + 200;
+    const int32_t rareMax =
+        N / BooleanQuery::ConjunctionBulkScorer::kDenseThresholdInverse - 1;
+    TestIndex testIndex;
+    TestField f(testIndex, "body_w");
+    f.startIndexing();
+    int32_t rareCount = 0;
+    for (int32_t doc = 0; doc < N; doc++) {
+      std::string body = "bcscommon";
+      if (rareCount < rareMax && (doc % 500) == 0) {
+        body += " bcsrare";
+        rareCount++;
+      }
+      body += " filler";
+      f.add(doc, body);
+    }
+    testIndex.flush();
+    f.startReading();
+
+    auto poolFree = testIndex.pool.rewindScopeGuard();
+    Query::Context qContext(testIndex.pool, *testIndex.reader);
+    auto& segment = qContext.topReader.segments()[0];
+    auto filter = makeEveryNthDocSet(segment.maxDoc(), 2, false);
+    std::array<std::string_view, 2> terms = {"bcsrare", "bcscommon"};
+    auto queries = makeTermQueries(terms);
+    auto mandatory = queryPointers(queries);
+    std::span<Query*> empty;
+
+    bool savedStats = SkipStats::enabled;
+    SkipStats::enabled = true;
+    SkipStats::reset();
+    BooleanQuery bulkQ(std::span<Query*>(mandatory.data(), mandatory.size()), empty, empty, empty);
+    BooleanQuery pullQ(std::span<Query*>(mandatory.data(), mandatory.size()), empty, empty, empty);
+    auto* bulkWeight = bulkQ.createWeight(qContext, Query::NEED_SCORES);
+    auto* pullWeight = pullQ.createWeight(qContext, Query::NEED_SCORES);
+    expectBulkDomainMatchesPull(bulkWeight, pullWeight, testIndex.pool, segment, filter.get());
+    EXPECT_GT(SkipStats::conjCountFallbacks, 0);
+    SkipStats::enabled = savedStats;
+  }
+}
+
+TEST_F(TermScorerTest, bulkTopKWithBuilderPinsThetaAndMatchesPullDomain) {
+  CollectionHelper helper("main");
+  addMaxScoreDisjunctionDocs(helper);
+  auto reader = helper.getIndexWriter()->getIndexReader();
+
+  MemPool pool;
+  Query::Context qContext(pool, *reader);
+  auto& segment = qContext.topReader.segments()[0];
+  std::array<std::string_view, 3> terms = {"common", "medium", "rare"};
+  auto queries = makeTermQueries(terms);
+  auto optional = queryPointers(queries);
+  std::span<Query*> empty;
+  const int32_t topK = 3;
+
+  BooleanQuery pullQ(empty, std::span<Query*>(optional.data(), optional.size()), empty, empty);
+  auto* pullWeight = pullQ.createWeight(qContext, Query::NEED_SCORES);
+  DocSetBuilder pullBuilder(segment.maxDoc());
+  TopDocsCollector pullCollector(topK);
+  auto* pullScorer = pullWeight->createScorer(pool, segment);
+  ASSERT_NE(pullScorer, nullptr);
+  collectTopK(0, pullScorer, nullptr, &pullBuilder, pullCollector, /*allowPruning=*/false);
+  auto pullDomainSet = pullBuilder.build();
+
+  BooleanQuery bulkQ(empty, std::span<Query*>(optional.data(), optional.size()), empty, empty);
+  auto* bulkWeight = bulkQ.createWeight(qContext, Query::NEED_SCORES);
+  auto* supplier = bulkWeight->scorerSupplier(pool, segment);
+  ASSERT_NE(supplier, nullptr);
+  auto* bulk = supplier->bulkScorer(pool);
+  ASSERT_NE(bulk, nullptr);
+  DocSetBuilder bulkBuilder(segment.maxDoc());
+  TopDocsCollector bulkCollector(topK);
+  MaxScoreAccumulator accumulator;
+  collectTopKWindowed(0, bulk, nullptr, &bulkBuilder, bulkCollector, &accumulator,
+                      segment.maxDoc(), /*allowPruning=*/true);
+  auto bulkDomainSet = bulkBuilder.build();
+
+  EXPECT_EQ(bulkCollector.totalHits(), pullCollector.totalHits());
+  assertTopKEquivalent(sortedCollectorDocs(pullCollector), sortedCollectorDocs(bulkCollector));
+  expectDocSetEqual(bulkDomainSet.get(), pullDomainSet.get(), segment.maxDoc());
+  helper.clear();
+}
+
+TEST_F(TermScorerTest, queryPrepMaterializeBulkDomainMatchesPull) {
+  const int32_t N = 2 * DocsEnum::L1_DOCS + 77;
+  TestIndex testIndex;
+  TestField f(testIndex, "body_w");
+  f.startIndexing();
+  for (int32_t doc = 0; doc < N; doc++) {
+    std::string body;
+    if ((doc % 2) == 0) body += "qp_a ";
+    if ((doc % 3) == 0) body += "qp_b ";
+    if ((doc % 5) == 0) body += "qp_c ";
+    body += "filler";
+    f.add(doc, body);
+  }
+  testIndex.flush();
+  f.startReading();
+
+  auto poolFree = testIndex.pool.rewindScopeGuard();
+  Query::Context qContext(testIndex.pool, *testIndex.reader);
+  auto& segment = qContext.topReader.segments()[0];
+  auto filter = makeEveryNthDocSet(segment.maxDoc(), 4, true);
+  std::array<std::string_view, 3> terms = {"qp_a", "qp_b", "qp_c"};
+  auto queries = makeTermQueries(terms);
+  auto optional = queryPointers(queries);
+  std::span<Query*> empty;
+
+  BooleanQuery pullQ(empty, std::span<Query*>(optional.data(), optional.size()), empty, empty);
+  auto* pullWeight = pullQ.createWeight(qContext, Query::NEED_SCORES);
+  auto expected = pullDomain(pullWeight, testIndex.pool, segment, filter.get());
+
+  bool savedStats = SkipStats::enabled;
+  SkipStats::enabled = true;
+  SkipStats::reset();
+  BooleanQuery materializeQ(empty, std::span<Query*>(optional.data(), optional.size()), empty, empty);
+  auto* materializeWeight = materializeQ.createWeight(qContext, Query::NEED_SCORES);
+  auto actual = QueryPrep::materialize(*materializeWeight, nullptr, segment, filter.get());
+  EXPECT_GT(SkipStats::bulkDomainWindowsFed, 0);
+  SkipStats::enabled = savedStats;
+
+  expectDocSetEqual(actual.get(), expected.domain.get(), segment.maxDoc());
 }
 
 // "+a b" without scores: the optional clause is a pure score add under a

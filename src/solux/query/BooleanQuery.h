@@ -1246,6 +1246,26 @@ public:
       return total;
     }
 
+    void applyDocSetFilterToWindow(DocSet* filter, int32_t windowBase,
+                                   int32_t windowEnd) {
+      int32_t innerSize = windowEnd - windowBase;
+      for (int32_t word = 0; word < kWindowWords; word++) {
+        uint64_t bits = windowBits[(size_t) word];
+        while (bits != 0) {
+          int32_t bit = (int32_t) std::countr_zero(bits);
+          int32_t index = (word << 6) + bit;
+          if (index >= innerSize) {
+            break;
+          }
+          int32_t doc = windowBase + index;
+          if (!filter->get(doc)) {
+            windowBits[(size_t) word] &= ~(1ULL << bit);
+          }
+          bits &= bits - 1;
+        }
+      }
+    }
+
     int32_t ratchetDenseWindow(int32_t min, int32_t max) {
       for (size_t c = 0; c < termScorers.size(); c++) {
         int32_t doc = termScorers[c]->docsEnum.docId();
@@ -1295,7 +1315,8 @@ public:
       }
     }
 
-    int32_t countNextWindowDense(int64_t& count, DocSet* filter, int32_t min, int32_t max) {
+    int32_t countNextWindowDense(int64_t& count, DocSetBuilder* domainOut,
+                                 DocSet* filter, int32_t min, int32_t max) {
       int32_t windowBase = ratchetDenseWindow(min, max);
       if (windowBase >= max) {
         return windowBase;
@@ -1328,21 +1349,24 @@ public:
         }
       }
 
-      if (filter == nullptr) {
-        count += popCountWindowBits();
-      } else if (filter->type == DocSet::BITSET) {
+      if (filter != nullptr && filter->type == DocSet::BITSET) {
         applyDomainBitsToWindow(windowBits, windowBase, windowEnd,
                                 &((BitDocSet*) filter)->bits());
-        count += popCountWindowBits();
-      } else {
-        count += countWindowBitsWithFilter(filter, windowBase, windowEnd);
+      } else if (filter != nullptr) {
+        applyDocSetFilterToWindow(filter, windowBase, windowEnd);
       }
+
+      if (domainOut != nullptr) {
+        domainOut->addWindowWords(windowBits.data(), windowBase, windowEnd);
+      }
+      count += popCountWindowBits();
 
       return windowEnd >= max ? PostingsReader::END : windowEnd;
     }
 
     template <bool TermFast>
-    int32_t countNextWindowSparse(int64_t& count, DocSet* filter, int32_t min, int32_t max) {
+    int32_t countNextWindowSparse(int64_t& count, DocSetBuilder* domainOut,
+                                  DocSet* filter, int32_t min, int32_t max) {
       skipCount(SkipStats::conjCountFallbacks);
       int32_t target = min;
       while (target < max) {
@@ -1373,6 +1397,9 @@ public:
 
         if (filter == nullptr || filter->get(target)) {
           count++;
+          if (domainOut != nullptr) {
+            domainOut->add(target);
+          }
         }
         target++;
       }
@@ -1413,7 +1440,8 @@ public:
           : scoreNextWindowImpl<false>(out, filter, min, max, minCompetitiveScore);
     }
 
-    int32_t countNextWindow(int64_t& count, DocSet* filter, int32_t min, int32_t max) override {
+    int32_t countNextWindow(int64_t& count, DocSetBuilder* domainOut,
+                            DocSet* filter, int32_t min, int32_t max) override {
       max = std::min(max, maxDoc);
       if (min >= max) {
         return PostingsReader::END;
@@ -1421,12 +1449,15 @@ public:
       if (filter != nullptr && filter->card() == 0) {
         return PostingsReader::END;
       }
+      if (domainOut != nullptr) {
+        skipCount(SkipStats::bulkDomainWindowsFed);
+      }
       if (denseCountPath) {
-        return countNextWindowDense(count, filter, min, max);
+        return countNextWindowDense(count, domainOut, filter, min, max);
       }
       return allTermScorers
-          ? countNextWindowSparse<true>(count, filter, min, max)
-          : countNextWindowSparse<false>(count, filter, min, max);
+          ? countNextWindowSparse<true>(count, domainOut, filter, min, max)
+          : countNextWindowSparse<false>(count, domainOut, filter, min, max);
     }
 
     int64_t skippedWindows() const {
@@ -2569,7 +2600,8 @@ public:
     // candidate materialization - counting needs none of them. Only used for
     // count-only collection, where nothing ever raises a clause's competitive
     // threshold, so the block fills below cannot skip.
-    int32_t countNextWindow(int64_t& count, DocSet* filter, int32_t min, int32_t max) override {
+    int32_t countNextWindow(int64_t& count, DocSetBuilder* domainOut,
+                            DocSet* filter, int32_t min, int32_t max) override {
       max = std::min(max, maxDoc);
       if (min >= max) {
         return PostingsReader::END;
@@ -2577,12 +2609,18 @@ public:
       if (filter != nullptr && filter->card() == 0) {
         return PostingsReader::END;
       }
+      if (domainOut != nullptr) {
+        skipCount(SkipStats::bulkDomainWindowsFed);
+      }
       if (shouldDriveFromDomain(filter)) {
         setWindowBounds(min, max);
         domainDriveWindows++;
         forEachDomainDoc(filter, [&](int32_t doc) {
           if (matchesAnyClause(doc)) {
             count++;
+            if (domainOut != nullptr) {
+              domainOut->add(doc);
+            }
           }
         });
         return windowEnd >= max ? PostingsReader::END : windowEnd;
@@ -2614,6 +2652,9 @@ public:
         for (size_t w = 0; w < windowBits.size(); w++) {
           count += std::popcount(windowBits[w]);
         }
+        if (domainOut != nullptr) {
+          domainOut->addWindowWords(windowBits.data(), windowStart, windowEnd);
+        }
         return windowEnd >= max ? PostingsReader::END : windowEnd;
       }
 
@@ -2624,6 +2665,9 @@ public:
       }
       if (domainBits != nullptr) {
         applyDomainBits(domainBits);
+      }
+      if (domainOut != nullptr) {
+        domainOut->addWindowWords(windowBits.data(), windowStart, windowEnd);
       }
       for (size_t w = 0; w < windowBits.size(); w++) {
         count += std::popcount(windowBits[w]);

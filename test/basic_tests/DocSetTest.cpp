@@ -98,4 +98,33 @@ TEST_F(DocSetTest, bitsetResultsHaveCardinality) {
   EXPECT_EQ(DocSet::intersect(sets)->card(), 2);
 }
 
+TEST_F(DocSetTest, builderAddWindowWordsMasksFinalPartialWord) {
+  DocSetBuilder builder(130);
+  std::array<uint64_t, 2> words{};
+  words[0] = (1ULL << 0) | (1ULL << 1) | (1ULL << 63);
+  words[1] = (1ULL << 0) | (1ULL << 4) | (1ULL << 10);
+
+  builder.addWindowWords(words.data(), 3, 72);
+  auto set = builder.build();
+
+  ASSERT_EQ(set->type, DocSet::ARRAY);
+  EXPECT_EQ(set->card(), 5);
+  EXPECT_EQ(collect(*set, 130), (std::vector<int32_t>{3, 4, 66, 67, 71}));
+}
+
+TEST_F(DocSetTest, builderAddWindowWordsPromotesAtAddBoundary) {
+  DocSetBuilder builder(96);
+  builder.add(1);
+  builder.add(2);
+
+  std::array<uint64_t, 1> words{};
+  words[0] = (1ULL << 0) | (1ULL << 10);
+  builder.addWindowWords(words.data(), 10, 21);
+  auto set = builder.build();
+
+  ASSERT_EQ(set->type, DocSet::BITSET);
+  EXPECT_EQ(set->card(), 4);
+  EXPECT_EQ(collect(*set, 96), (std::vector<int32_t>{1, 2, 10, 20}));
+}
+
 }  // namespace solux::test

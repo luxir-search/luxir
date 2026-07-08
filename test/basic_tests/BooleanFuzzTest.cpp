@@ -517,7 +517,7 @@ TEST_F(BooleanFuzzTest, conjunctionBulkCountMatchesPullOnMixedBlockShapes) {
           return -1;
         }
         for (int32_t cursor = 0; cursor != PostingsReader::END && cursor < segment.maxDoc(); ) {
-          int32_t next = bulkScorer->countNextWindow(total, filter.get(), cursor, segment.maxDoc());
+          int32_t next = bulkScorer->countNextWindow(total, nullptr, filter.get(), cursor, segment.maxDoc());
           if (next == PostingsReader::END) break;
           if (next <= cursor) {
             ADD_FAILURE() << "countNextWindow made no progress";

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <algorithm>
+#include <cmath>
 #include <limits>
 #include <optional>
 #include <span>
@@ -23,6 +24,9 @@ protected:
   bool useFrontierBound;
   bool hasInjectedTermStats = false;
 public:
+  class Scorer;
+  class TermBulkScorer;
+
   TermQuery(std::string_view field, std::string_view term, float boost = 1.0f,
             bool useFrontierBound = true)
       : field(field), term(term), boost(boost), useFrontierBound(useFrontierBound) {}
@@ -97,7 +101,7 @@ public:
     }
 
 
-    TermQuery::Scorer* createScorer(solux::MemPool& targetPool, solux::IndexReader::Segment& segment) override {
+    Query::Scorer* createScorer(solux::MemPool& targetPool, solux::IndexReader::Segment& segment) override {
       if (cachedTermInfo == nullptr) {
         // term doesn't exist in any segment
         return nullptr;
@@ -161,6 +165,8 @@ public:
         unused(leadCost);
         return weight.createScorer(targetPool, segment);
       }
+
+      BulkScorer* bulkScorer(MemPool& targetPool) override;
     };
 
     Query::ScorerSupplier* scorerSupplier(solux::MemPool& targetPool,
@@ -668,6 +674,225 @@ public:
 
   };
 
+  class TermBulkScorer final : public BulkScorer {
+    static constexpr int32_t kWindowSize = DocsEnum::L1_DOCS;
+    static constexpr int32_t kWindowWords = kWindowSize / 64;
+    static_assert((kWindowSize % 64) == 0);
+
+    TermQuery::Scorer* scorer;
+    std::span<uint64_t> windowBits;
+    std::span<int32_t> outDocs;
+    std::span<float> outScores;
+    int32_t maxDoc;
+    int32_t windowStart = 0;
+    int32_t windowEnd = 0;
+    float minCompetitiveScore = std::numeric_limits<float>::lowest();
+
+    void setWindowBounds(int32_t start, int32_t max) {
+      windowStart = start;
+      int32_t requestedEnd = windowStart + kWindowSize;
+      if (requestedEnd < windowStart) {
+        requestedEnd = max;
+      }
+      windowEnd = std::min(std::min(requestedEnd, max), maxDoc);
+    }
+
+    void clearWindowBits() {
+      std::fill(windowBits.begin(), windowBits.end(), 0);
+    }
+
+    static uint64_t validMask(int32_t remaining) {
+      if (remaining >= 64) return ~0ULL;
+      if (remaining <= 0) return 0;
+      return (1ULL << remaining) - 1ULL;
+    }
+
+    void applyDomainBits(const FixedBitSet* domainBits) {
+      assert(domainBits != nullptr);
+      int32_t domainWords = (int32_t) FixedBitSet::sizeInWords(domainBits->size());
+      for (size_t w = 0; w < windowBits.size(); w++) {
+        int32_t firstDoc = windowStart + (int32_t) (w << 6);
+        int32_t remaining = windowEnd - firstDoc;
+        if (remaining <= 0) {
+          windowBits[w] = 0;
+          continue;
+        }
+        uint64_t mask = validMask(remaining);
+        int32_t sourceWord = firstDoc >> 6;
+        int32_t shift = firstDoc & 63;
+        uint64_t domainWord = 0;
+        if (sourceWord < domainWords) {
+          domainWord = domainBits->words[sourceWord] >> shift;
+          if (shift != 0 && sourceWord + 1 < domainWords) {
+            domainWord |= domainBits->words[sourceWord + 1] << (64 - shift);
+          }
+        }
+        windowBits[w] &= domainWord & mask;
+      }
+    }
+
+    void applyDocSetFilter(DocSet* filter) {
+      int32_t innerSize = windowEnd - windowStart;
+      for (int32_t word = 0; word < kWindowWords; word++) {
+        uint64_t bits = windowBits[(size_t) word];
+        while (bits != 0) {
+          int32_t bit = (int32_t) std::countr_zero(bits);
+          int32_t index = (word << 6) + bit;
+          if (index >= innerSize) {
+            break;
+          }
+          int32_t doc = windowStart + index;
+          if (!filter->get(doc)) {
+            windowBits[(size_t) word] &= ~(1ULL << bit);
+          }
+          bits &= bits - 1;
+        }
+      }
+    }
+
+    int64_t popCountWindowBits() const {
+      int64_t total = 0;
+      for (uint64_t bits : windowBits) {
+        total += std::popcount(bits);
+      }
+      return total;
+    }
+
+    bool acceptsDoc(DocSet* filter, int32_t doc) const {
+      return filter == nullptr || filter->get(doc);
+    }
+
+    void prepareOutputWindow(ScoreWindow& out) {
+      out.min = windowStart;
+      out.max = windowEnd;
+      out.size = 0;
+      out.docs = outDocs;
+      out.scores = outScores;
+    }
+
+  public:
+    TermBulkScorer(MemPool& pool, TermQuery::Scorer* scorer, int32_t maxDoc)
+        : scorer(scorer),
+          windowBits(pool.make_arr<uint64_t>((size_t) kWindowWords), (size_t) kWindowWords),
+          outDocs(pool.make_arr<int32_t>((size_t) kWindowSize), (size_t) kWindowSize),
+          outScores(pool.make_arr<float>((size_t) kWindowSize), (size_t) kWindowSize),
+          maxDoc(maxDoc) {
+    }
+
+    int32_t countNextWindow(int64_t& count, DocSetBuilder* domainOut,
+                            DocSet* filter, int32_t min, int32_t max) override {
+      max = std::min(max, maxDoc);
+      if (min >= max) {
+        return PostingsReader::END;
+      }
+      if (filter != nullptr && filter->card() == 0) {
+        return PostingsReader::END;
+      }
+
+      setWindowBounds(min, max);
+      clearWindowBits();
+      scorer->fillWindowBits(windowBits, windowStart, windowEnd);
+      if (filter != nullptr && filter->type == DocSet::BITSET) {
+        applyDomainBits(&((BitDocSet*) filter)->bits());
+      } else if (filter != nullptr) {
+        applyDocSetFilter(filter);
+      }
+      if (domainOut != nullptr) {
+        skipCount(SkipStats::bulkDomainWindowsFed);
+        domainOut->addWindowWords(windowBits.data(), windowStart, windowEnd);
+      }
+      count += popCountWindowBits();
+
+      if (windowEnd >= max) {
+        return PostingsReader::END;
+      }
+      return windowEnd;
+    }
+
+    int32_t scoreNextWindow(ScoreWindow& out, DocSet* filter, int32_t min, int32_t max,
+                            float minCompetitiveScore) override {
+      max = std::min(max, maxDoc);
+      out.min = min;
+      out.max = min;
+      out.size = 0;
+      out.docs = outDocs;
+      out.scores = outScores;
+      if (min >= max) {
+        return PostingsReader::END;
+      }
+      if (filter != nullptr && filter->card() == 0) {
+        return PostingsReader::END;
+      }
+      if (minCompetitiveScore > this->minCompetitiveScore) {
+        this->minCompetitiveScore = minCompetitiveScore;
+        scorer->setMinCompetitiveScore(minCompetitiveScore);
+      }
+
+      int32_t doc = scorer->docId();
+      if (doc < min) {
+        doc = scorer->advance(min);
+      }
+      while (doc < max) {
+        windowStart = doc;
+        int32_t requestedEnd = windowStart + kWindowSize;
+        if (requestedEnd < windowStart) {
+          requestedEnd = max;
+        }
+        windowEnd = std::min(std::min(requestedEnd, max), maxDoc);
+
+        int32_t upTo = scorer->advanceShallow(doc);
+        if (upTo != PostingsReader::END) {
+          if (upTo < doc) {
+            upTo = doc;
+          }
+          int32_t shallowEnd = upTo >= PostingsReader::END - 1 ? max : upTo + 1;
+          windowEnd = std::min(windowEnd, shallowEnd);
+        }
+
+        float maxScore = scorer->getMaxScore(windowEnd - 1);
+        if (std::isfinite(maxScore)
+            && (double) maxScore < (double) this->minCompetitiveScore) {
+          if (windowEnd >= max) {
+            out.max = max;
+            return PostingsReader::END;
+          }
+          doc = scorer->advance(windowEnd);
+          continue;
+        }
+
+        prepareOutputWindow(out);
+        int32_t blockDocs[Postings::DOCS_BLOCK_SIZE];
+        float blockScores[Postings::DOCS_BLOCK_SIZE];
+        int32_t n = 0;
+        while ((n = scorer->fillScoreBlock(blockDocs, blockScores,
+                                           Postings::DOCS_BLOCK_SIZE, windowEnd)) > 0) {
+          for (int32_t i = 0; i < n; i++) {
+            int32_t matchedDoc = blockDocs[i];
+            float score = blockScores[i];
+            if (acceptsDoc(filter, matchedDoc)
+                && score >= this->minCompetitiveScore) {
+              assert(out.size < kWindowSize);
+              out.docs[(size_t) out.size] = matchedDoc;
+              out.scores[(size_t) out.size] = score;
+              out.size++;
+            }
+          }
+        }
+        return windowEnd >= max ? PostingsReader::END : windowEnd;
+      }
+      out.max = max;
+      return PostingsReader::END;
+    }
+  };
+
 };
+
+inline BulkScorer* TermQuery::Weight::Supplier::bulkScorer(MemPool& targetPool) {
+  auto* scorer = dynamic_cast<TermQuery::Scorer*>(weight.createScorer(targetPool, segment));
+  if (scorer == nullptr) {
+    return nullptr;
+  }
+  return targetPool.make<TermQuery::TermBulkScorer>(targetPool, scorer, segment.maxDoc());
+}
 
 } // namespace solux

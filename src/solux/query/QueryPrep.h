@@ -233,9 +233,26 @@ inline std::unique_ptr<DocSet> materialize(Query::SegmentSource& source,
   // temporaries out of Query::Context's shared request pool.
   auto guard = MemPool::threadLocalPoolGuard();
   MemPool& scratch = guard.pool();
-  auto* scorer = createScorer(scratch, segment, source);
   DocSetBuilder builder(segment.maxDoc());
-  if (scorer != nullptr) {
+  auto* supplier = source.scorerSupplier(scratch, segment);
+  if (supplier != nullptr) {
+    auto* bulk = supplier->bulkScorer(scratch);
+    if (bulk != nullptr) {
+      int64_t count = 0;
+      for (int32_t cursor = 0; cursor != PostingsReader::END && cursor < segment.maxDoc(); ) {
+        int32_t next = bulk->countNextWindow(count, &builder, domain, cursor, segment.maxDoc());
+        if (next == PostingsReader::END) break;
+        assert(next > cursor);
+        cursor = next;
+      }
+      assert(count == builder.card());
+      return builder.build();
+    }
+
+    auto* scorer = supplier->get(scratch, std::numeric_limits<int64_t>::max());
+    if (scorer == nullptr) {
+      return builder.build();
+    }
     for (;;) {
       auto doc = scorer->next();
       if (doc == PostingsReader::END) break;
