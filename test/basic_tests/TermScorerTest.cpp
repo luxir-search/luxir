@@ -124,6 +124,19 @@ struct PhraseFilterTopKRun {
   std::vector<TopDocsCollector::ScoreDoc> topDocs;
 };
 
+struct SkipStatsGuard {
+  bool saved;
+
+  explicit SkipStatsGuard(bool enabled = true) : saved(SkipStats::enabled) {
+    SkipStats::enabled = enabled;
+    SkipStats::reset();
+  }
+
+  ~SkipStatsGuard() {
+    SkipStats::enabled = saved;
+  }
+};
+
 std::vector<TopDocsCollector::ScoreDoc> sortedCollectorDocs(TopDocsCollector& collector) {
   auto docs = collector.sort();
   std::vector<TopDocsCollector::ScoreDoc> out(docs.begin(), docs.end());
@@ -396,6 +409,38 @@ DisjunctionTopKRun runExhaustiveDisjunctionTopK(IndexReader& reader, int32_t top
 void assertSameTopKDocs(const DisjunctionTopKRun& expected, const DisjunctionTopKRun& actual, int32_t topK) {
   SCOPED_TRACE(::testing::Message() << "k=" << topK);
   assertTopKEquivalent(expected.topDocs, actual.topDocs);
+}
+
+DisjunctionTopKRun runBooleanTopK(IndexReader& reader, std::span<Query*> mandatory,
+                                  std::span<Query*> optional, int32_t topK,
+                                  bool allowPruning) {
+  MemPool pool;
+  Query::Context qContext(pool, reader);
+  BooleanQuery query(mandatory, optional, {}, {});
+  auto* weight = query.createWeight(qContext, Query::NEED_SCORES);
+  TopDocsCollector collector(topK);
+
+  auto segments = qContext.topReader.segments();
+  for (int32_t segnum = 0; segnum < (int32_t) segments.size(); segnum++) {
+    auto* scorer = weight->createScorer(pool, segments[segnum]);
+    if (scorer == nullptr) {
+      continue;
+    }
+    collectTopK(segnum, scorer, nullptr, nullptr, collector, allowPruning);
+  }
+
+  DisjunctionTopKRun result;
+  result.visited = collector.totalHits();
+  result.topDocs = sortedCollectorDocs(collector);
+  return result;
+}
+
+std::vector<int32_t> collectDocIds(Query::Scorer* scorer) {
+  std::vector<int32_t> docs;
+  for (int32_t doc = scorer->next(); doc != PostingsReader::END; doc = scorer->next()) {
+    docs.push_back(doc);
+  }
+  return docs;
 }
 
 std::vector<TermQuery> makeTermQueries(std::span<const std::string_view> terms) {
@@ -2116,6 +2161,541 @@ TEST_F(TermScorerTest, groupSetupPulsedTermBehaviorUnchanged) {
   EXPECT_TRUE(std::isinf(scorer->getMaxScoreForSetup(PostingsReader::END)));
   EXPECT_EQ(scorer->advanceShallow(0), PostingsReader::END);
   EXPECT_EQ(scorer->advanceShallowForSetup(0), PostingsReader::END);
+}
+
+TEST_F(TermScorerTest, mandOptSingleOptionalSparseAndDenseTopKMatchesExhaustive) {
+  const int32_t nDocs = 2 * DocsEnum::L1_DOCS + 113;
+  for (bool denseOpt : {false, true}) {
+    SCOPED_TRACE(denseOpt ? "dense optional" : "sparse optional");
+    TestIndex testIndex;
+    TestField f(testIndex, "body_w");
+    f.startIndexing();
+    for (int32_t doc = 0; doc < nDocs; doc++) {
+      bool hot = doc < 24;
+      int32_t reqTf = hot ? 80 - (doc % 7) : 1;
+      int32_t len = hot ? reqTf + 3 : 360 + (doc % 29);
+      std::string body;
+      int32_t used = 0;
+      appendRepeatedTerm(body, "mand_req", reqTf);
+      used += reqTf;
+      bool hasOpt = denseOpt || (doc % 257) == 17;
+      if (hasOpt) {
+        int32_t optTf = denseOpt ? 1 : 120;
+        appendRepeatedTerm(body, denseOpt ? "mand_opt_dense" : "mand_opt_sparse", optTf);
+        used += optTf;
+      }
+      if (len < used + 2) {
+        len = used + 2;
+      }
+      appendRepeatedTerm(body, "filler", len - used);
+      f.add(doc, body);
+    }
+    testIndex.flush();
+    f.startReading();
+
+    TermQuery req("body_w", "mand_req");
+    TermQuery opt("body_w", denseOpt ? "mand_opt_dense" : "mand_opt_sparse");
+    std::vector<Query*> mandatory = {&req};
+    std::vector<Query*> optional = {&opt};
+
+    auto expected = runBooleanTopK(*testIndex.reader, mandatory, optional, 10, false);
+    SkipStatsGuard stats;
+    auto actual = runBooleanTopK(*testIndex.reader, mandatory, optional, 10, true);
+    assertSameTopKDocs(expected, actual, 10);
+    EXPECT_GT(SkipStats::mandOptWindowEvals, 0);
+    if (!denseOpt) {
+      EXPECT_GT(SkipStats::mandOptWindowSkips, 0);
+    }
+  }
+}
+
+TEST_F(TermScorerTest, mandOptWindowWalkBacksOffWhenNothingSkips) {
+  // Uniform mandatory scores keep every window competitive and never
+  // conjunctive; a periodic optional fragments windows at each of its docs.
+  // The walk must stop evaluating windows after its patience runs out.
+  const int32_t nDocs = 4 * Postings::DOCS_BLOCK_SIZE + 60;
+  TestIndex testIndex;
+  TestField f(testIndex, "body_w");
+  f.startIndexing();
+  for (int32_t doc = 0; doc < nDocs; doc++) {
+    std::string body = "bk_req";
+    if ((doc % 2) == 0) {
+      body += " bk_opt";
+    }
+    body += " filler filler";
+    f.add(doc, body);
+  }
+  testIndex.flush();
+  f.startReading();
+
+  auto poolFree = testIndex.pool.rewindScopeGuard();
+  Query::Context qContext(testIndex.pool, *testIndex.reader);
+  auto& segment = qContext.topReader.segments()[0];
+  TermQuery req("body_w", "bk_req");
+  TermQuery opt("body_w", "bk_opt");
+  std::vector<Query*> mandatory = {&req};
+  std::vector<Query*> optional = {&opt};
+  BooleanQuery query(mandatory, optional, {}, {});
+  auto* weight = query.createWeight(qContext, Query::NEED_SCORES);
+  auto* scorer = dynamic_cast<BooleanQuery::MandOptScorer*>(
+      weight->createScorer(testIndex.pool, segment));
+  ASSERT_NE(scorer, nullptr);
+  // Theta below the mandatory clause's own max: every window stays
+  // competitive on the required score alone (no skips, no conjunctions).
+  float reqMax;
+  {
+    TermQuery reqOnly("body_w", "bk_req");
+    auto* reqWeight = reqOnly.createWeight(qContext, Query::NEED_SCORES);
+    auto* reqScorer = reqWeight->createScorer(testIndex.pool, segment);
+    ASSERT_NE(reqScorer, nullptr);
+    reqMax = reqScorer->getMaxScoreForSetup(PostingsReader::END);
+  }
+  ASSERT_TRUE(std::isfinite(reqMax));
+
+  SkipStatsGuard stats;
+  scorer->setMinCompetitiveScore(reqMax * 0.5f);
+  int32_t seen = 0;
+  for (int32_t doc = scorer->next(); doc != PostingsReader::END; doc = scorer->next()) {
+    seen++;
+  }
+  EXPECT_EQ(seen, nDocs);  // uniform scores: nothing skippable
+  EXPECT_EQ(SkipStats::mandOptWindowSkips, 0);
+  EXPECT_EQ(SkipStats::mandOptConjunctionWindows, 0);
+  // ~286 optional docs fragment ~286 windows; the walk must give up once its
+  // patience runs out.
+  EXPECT_GT(SkipStats::mandOptWindowEvals, 0);
+  EXPECT_LE(SkipStats::mandOptWindowEvals, 70);
+}
+
+TEST_F(TermScorerTest, mandOptConjunctionTransitionReturnsIntersectionUntilOptionalExhausts) {
+  const int32_t nDocs = 2 * DocsEnum::L1_DOCS + 31;
+  const std::vector<int32_t> optDocs = {
+    17,
+    Postings::DOCS_BLOCK_SIZE + 11,
+    DocsEnum::L1_DOCS + 23
+  };
+  TestIndex testIndex;
+  TestField f(testIndex, "body_w");
+  f.startIndexing();
+  for (int32_t doc = 0; doc < nDocs; doc++) {
+    std::string body;
+    int32_t used = 0;
+    appendRepeatedTerm(body, "conj_req", 1);
+    used++;
+    if (std::find(optDocs.begin(), optDocs.end(), doc) != optDocs.end()) {
+      appendRepeatedTerm(body, "conj_opt", 120);
+      used += 120;
+    }
+    appendRepeatedTerm(body, "filler", std::max(1, 80 - used));
+    f.add(doc, body);
+  }
+  testIndex.flush();
+  f.startReading();
+
+  auto poolFree = testIndex.pool.rewindScopeGuard();
+  Query::Context qContext(testIndex.pool, *testIndex.reader);
+  auto& segment = qContext.topReader.segments()[0];
+  TermQuery reqForMax("body_w", "conj_req");
+  auto* reqMaxWeight = reqForMax.createWeight(qContext, Query::NEED_SCORES);
+  auto* reqMaxScorer = reqMaxWeight->createScorer(testIndex.pool, segment);
+  ASSERT_NE(reqMaxScorer, nullptr);
+  float theta = std::nextafter(reqMaxScorer->getMaxScore(PostingsReader::END),
+                               std::numeric_limits<float>::infinity());
+  ASSERT_TRUE(std::isfinite(theta));
+
+  TermQuery req("body_w", "conj_req");
+  TermQuery opt("body_w", "conj_opt");
+  std::vector<Query*> mandatory = {&req};
+  std::vector<Query*> optional = {&opt};
+  BooleanQuery query(mandatory, optional, {}, {});
+  auto* weight = query.createWeight(qContext, Query::NEED_SCORES);
+  auto* scorer = dynamic_cast<BooleanQuery::MandOptScorer*>(
+      weight->createScorer(testIndex.pool, segment));
+  ASSERT_NE(scorer, nullptr);
+
+  SkipStatsGuard stats;
+  scorer->setMinCompetitiveScore(theta);
+  EXPECT_EQ(collectDocIds(scorer), optDocs);
+  EXPECT_GT(SkipStats::mandOptWindowEvals, 0);
+  EXPECT_GT(SkipStats::mandOptConjunctionWindows, 0);
+}
+
+TEST_F(TermScorerTest, mandOptThresholdRiseReclassifiesCurrentWindow) {
+  const int32_t nDocs = DocsEnum::L1_DOCS + 19;
+  TestIndex testIndex;
+  TestField f(testIndex, "body_w");
+  f.startIndexing();
+  for (int32_t doc = 0; doc < nDocs; doc++) {
+    std::string body;
+    appendRepeatedTerm(body, "rise_req", 1);
+    if ((doc % 200) == 17) {
+      appendRepeatedTerm(body, "rise_opt", 80);
+    }
+    appendRepeatedTerm(body, "filler", 80);
+    f.add(doc, body);
+  }
+  testIndex.flush();
+  f.startReading();
+
+  auto poolFree = testIndex.pool.rewindScopeGuard();
+  Query::Context qContext(testIndex.pool, *testIndex.reader);
+  auto& segment = qContext.topReader.segments()[0];
+  TermQuery reqForMax("body_w", "rise_req");
+  auto* reqMaxWeight = reqForMax.createWeight(qContext, Query::NEED_SCORES);
+  auto* reqMaxScorer = reqMaxWeight->createScorer(testIndex.pool, segment);
+  ASSERT_NE(reqMaxScorer, nullptr);
+  float theta = std::nextafter(reqMaxScorer->getMaxScore(PostingsReader::END),
+                               std::numeric_limits<float>::infinity());
+  ASSERT_TRUE(std::isfinite(theta));
+
+  TermQuery req("body_w", "rise_req");
+  TermQuery opt("body_w", "rise_opt");
+  std::vector<Query*> mandatory = {&req};
+  std::vector<Query*> optional = {&opt};
+  BooleanQuery query(mandatory, optional, {}, {});
+  auto* weight = query.createWeight(qContext, Query::NEED_SCORES);
+  auto* scorer = dynamic_cast<BooleanQuery::MandOptScorer*>(
+      weight->createScorer(testIndex.pool, segment));
+  ASSERT_NE(scorer, nullptr);
+
+  SkipStatsGuard stats;
+  scorer->setMinCompetitiveScore(reqMaxScorer->getMaxScore(PostingsReader::END) * 0.5f);
+  ASSERT_EQ(scorer->next(), 0);
+  scorer->setMinCompetitiveScore(theta);
+  EXPECT_EQ(scorer->next(), 17);
+  EXPECT_GT(SkipStats::mandOptConjunctionWindows, 0);
+}
+
+TEST_F(TermScorerTest, mandOptMinScoreZeroBypassesWindowWalk) {
+  const int32_t nDocs = Postings::DOCS_BLOCK_SIZE + 37;
+  TestIndex testIndex;
+  TestField f(testIndex, "body_w");
+  f.startIndexing();
+  for (int32_t doc = 0; doc < nDocs; doc++) {
+    std::string body = "zero_req";
+    if ((doc % 11) == 3) {
+      body += " zero_opt";
+    }
+    body += " filler";
+    f.add(doc, body);
+  }
+  testIndex.flush();
+  f.startReading();
+
+  auto poolFree = testIndex.pool.rewindScopeGuard();
+  Query::Context qContext(testIndex.pool, *testIndex.reader);
+  auto& segment = qContext.topReader.segments()[0];
+  TermQuery req("body_w", "zero_req");
+  TermQuery opt("body_w", "zero_opt");
+  std::vector<Query*> mandatory = {&req};
+  std::vector<Query*> optional = {&opt};
+  BooleanQuery query(mandatory, optional, {}, {});
+  auto* weight = query.createWeight(qContext, Query::NEED_SCORES);
+  auto* scorer = dynamic_cast<BooleanQuery::MandOptScorer*>(
+      weight->createScorer(testIndex.pool, segment));
+  ASSERT_NE(scorer, nullptr);
+
+  SkipStatsGuard stats;
+  scorer->setMinCompetitiveScore(0.0f);
+  EXPECT_EQ((int32_t) collectDocIds(scorer).size(), nDocs);
+  EXPECT_EQ(SkipStats::mandOptWindowEvals, 0);
+  EXPECT_EQ(SkipStats::mandOptConjunctionWindows, 0);
+  EXPECT_EQ(SkipStats::mandOptWindowSkips, 0);
+}
+
+TEST_F(TermScorerTest, mandOptFilterRequiredPushesThetaToRequiredOptional) {
+  const int32_t nDocs = 3 * Postings::DOCS_BLOCK_SIZE + 11;
+  TestIndex testIndex;
+  TestField f(testIndex, "body_w");
+  f.startIndexing();
+  for (int32_t doc = 0; doc < nDocs; doc++) {
+    std::string body = "filter_req ";
+    if (doc < 6) {
+      body += "alpha beta";
+    } else {
+      body += "alpha beta ";
+      appendRepeatedTerm(body, "filler", 2000 + (doc % 23));
+    }
+    f.add(doc, body);
+  }
+  testIndex.flush();
+  f.startReading();
+
+  auto poolFree = testIndex.pool.rewindScopeGuard();
+  Query::Context qContext(testIndex.pool, *testIndex.reader);
+  auto& segment = qContext.topReader.segments()[0];
+  std::vector<std::string_view> terms = {"alpha", "beta"};
+  std::vector<int32_t> positions = {0, 1};
+  float highScore = 0.0f;
+  float weakScore = 0.0f;
+  {
+    PhraseQuery phraseForScores("body_w", terms, positions);
+    auto* phraseWeight = phraseForScores.createWeight(qContext, Query::NEED_SCORES);
+    auto* phraseScorer = phraseWeight->createScorer(testIndex.pool, segment);
+    ASSERT_NE(phraseScorer, nullptr);
+    for (int32_t doc = phraseScorer->next(); doc != PostingsReader::END; doc = phraseScorer->next()) {
+      if (doc == 0) {
+        highScore = phraseScorer->score();
+      } else if (doc == 6) {
+        weakScore = phraseScorer->score();
+        break;
+      }
+    }
+  }
+  ASSERT_GT(highScore, weakScore);
+  float theta = (highScore + weakScore) * 0.5f;
+  ASSERT_GT(theta, weakScore);
+
+  TermQuery filterTerm("body_w", "filter_req");
+  PhraseQuery phrase("body_w", terms, positions);
+  std::vector<Query*> optional = {&phrase};
+  std::vector<Query*> filter = {&filterTerm};
+  BooleanQuery query({}, optional, {}, filter);
+  auto* weight = query.createWeight(qContext, Query::NEED_SCORES);
+  auto* scorer = dynamic_cast<BooleanQuery::MandOptScorer*>(
+      weight->createScorer(testIndex.pool, segment));
+  ASSERT_NE(scorer, nullptr);
+
+  SkipStatsGuard stats;
+  scorer->setMinCompetitiveScore(theta);
+  int32_t seen = 0;
+  for (int32_t doc = scorer->next(); doc != PostingsReader::END; doc = scorer->next()) {
+    EXPECT_LT(doc, 6);
+    EXPECT_GE(scorer->score(), theta);
+    seen++;
+  }
+  EXPECT_GT(seen, 0);
+  EXPECT_GT(SkipStats::mandOptConjunctionWindows, 0);
+  EXPECT_GT(SkipStats::phraseBoundRejects, 0);
+}
+
+TEST_F(TermScorerTest, mandOptTwoPhaseMandatoryPhraseMatchesExhaustive) {
+  const int32_t nDocs = 5 * Postings::DOCS_BLOCK_SIZE + 29;
+  TestIndex testIndex;
+  TestField f(testIndex, "body_w");
+  f.startIndexing();
+  for (int32_t doc = 0; doc < nDocs; doc++) {
+    std::string body;
+    bool decoy = (doc % 6) == 0;
+    int32_t phraseRepeats = doc < 20 ? 6 - (doc % 3) : 1;
+    if (decoy) {
+      body = "alpha pad beta ";
+    } else {
+      for (int32_t i = 0; i < phraseRepeats; i++) {
+        body += "alpha beta ";
+      }
+    }
+    if ((doc % 97) == 7) {
+      appendRepeatedTerm(body, "phrase_boost", 40);
+    }
+    appendRepeatedTerm(body, "filler", doc < 20 ? 3 : 240 + (doc % 31));
+    f.add(doc, body);
+  }
+  testIndex.flush();
+  f.startReading();
+
+  std::vector<std::string_view> terms = {"alpha", "beta"};
+  std::vector<int32_t> positions = {0, 1};
+  PhraseQuery phrase("body_w", terms, positions);
+  TermQuery opt("body_w", "phrase_boost");
+  std::vector<Query*> mandatory = {&phrase};
+  std::vector<Query*> optional = {&opt};
+
+  auto expected = runBooleanTopK(*testIndex.reader, mandatory, optional, 8, false);
+  SkipStatsGuard stats;
+  auto actual = runBooleanTopK(*testIndex.reader, mandatory, optional, 8, true);
+  assertSameTopKDocs(expected, actual, 8);
+  EXPECT_GT(SkipStats::mandOptWindowEvals, 0);
+}
+
+TEST_F(TermScorerTest, mandOptTwoPhaseOptionalScoresOnlyConfirmedMatches) {
+  TestIndex testIndex;
+  TestField f(testIndex, "body_w");
+  f.startIndexing();
+  f.add(0, "req alpha pad beta filler filler");
+  f.add(1, "req alpha beta filler");
+  f.add(2, "req filler filler filler");
+  testIndex.flush();
+  f.startReading();
+
+  auto poolFree = testIndex.pool.rewindScopeGuard();
+  Query::Context qContext(testIndex.pool, *testIndex.reader);
+  auto& segment = qContext.topReader.segments()[0];
+  std::vector<float> reqScores(3, 0.0f);
+  {
+    TermQuery reqOnly("body_w", "req");
+    auto* weight = reqOnly.createWeight(qContext, Query::NEED_SCORES);
+    auto* scorer = weight->createScorer(testIndex.pool, segment);
+    ASSERT_NE(scorer, nullptr);
+    for (int32_t doc = scorer->next(); doc != PostingsReader::END; doc = scorer->next()) {
+      reqScores[(size_t) doc] = scorer->score();
+    }
+  }
+
+  TermQuery req("body_w", "req");
+  std::vector<std::string_view> terms = {"alpha", "beta"};
+  std::vector<int32_t> positions = {0, 1};
+  PhraseQuery phrase("body_w", terms, positions);
+  std::vector<Query*> mandatory = {&req};
+  std::vector<Query*> optional = {&phrase};
+  BooleanQuery query(mandatory, optional, {}, {});
+  auto* weight = query.createWeight(qContext, Query::NEED_SCORES);
+  auto* scorer = weight->createScorer(testIndex.pool, segment);
+  ASSERT_NE(scorer, nullptr);
+
+  ASSERT_EQ(scorer->next(), 0);
+  EXPECT_FLOAT_EQ(scorer->score(), reqScores[0]);
+  ASSERT_EQ(scorer->next(), 1);
+  EXPECT_GT(scorer->score(), reqScores[1]);
+  ASSERT_EQ(scorer->next(), 2);
+  EXPECT_FLOAT_EQ(scorer->score(), reqScores[2]);
+  EXPECT_EQ(scorer->next(), PostingsReader::END);
+}
+
+TEST_F(TermScorerTest, disjunctionBoundsAreFiniteConservativeAndRefinable) {
+  const int32_t nDocs = 3 * Postings::DOCS_BLOCK_SIZE + 17;
+  TestIndex testIndex;
+  TestField f(testIndex, "body_w");
+  f.startIndexing();
+  for (int32_t doc = 0; doc < nDocs; doc++) {
+    std::string body;
+    int32_t used = 0;
+    appendRepeatedTerm(body, "bound_a", 1 + (doc % 5));
+    used += 1 + (doc % 5);
+    if ((doc % 3) == 0) {
+      appendRepeatedTerm(body, "bound_b", 1 + ((doc / 3) % 7));
+      used += 1 + ((doc / 3) % 7);
+    }
+    if ((doc % 5) == 2) {
+      appendRepeatedTerm(body, "bound_c", 1 + ((doc / 5) % 3));
+      used += 1 + ((doc / 5) % 3);
+    }
+    appendRepeatedTerm(body, "filler", 60 + (doc % 19) - std::min(used, 60 + (doc % 19)));
+    f.add(doc, body);
+  }
+  testIndex.flush();
+  f.startReading();
+
+  auto poolFree = testIndex.pool.rewindScopeGuard();
+  Query::Context qContext(testIndex.pool, *testIndex.reader);
+  auto& segment = qContext.topReader.segments()[0];
+  std::array<const char*, 3> termNames = {"bound_a", "bound_b", "bound_c"};
+  std::array<std::vector<float>, 3> termScores;
+  for (size_t t = 0; t < termNames.size(); t++) {
+    termScores[t].assign((size_t) nDocs, 0.0f);
+    TermQuery query("body_w", termNames[t]);
+    auto* weight = query.createWeight(qContext, Query::NEED_SCORES);
+    auto* scorer = weight->createScorer(testIndex.pool, segment);
+    ASSERT_NE(scorer, nullptr);
+    for (int32_t doc = scorer->next(); doc != PostingsReader::END; doc = scorer->next()) {
+      termScores[t][(size_t) doc] = scorer->score();
+    }
+  }
+
+  auto* scorers = testIndex.pool.make_arr<Query::Scorer*>(termNames.size());
+  std::array<TermQuery, 3> queries = {
+    TermQuery("body_w", "bound_a"),
+    TermQuery("body_w", "bound_b"),
+    TermQuery("body_w", "bound_c")
+  };
+  for (size_t t = 0; t < queries.size(); t++) {
+    auto* weight = queries[t].createWeight(qContext, Query::NEED_SCORES);
+    scorers[t] = weight->createScorer(testIndex.pool, segment);
+    ASSERT_NE(scorers[t], nullptr);
+  }
+  auto* disj = testIndex.pool.make<BooleanQuery::DisjunctionScorer>(
+      testIndex.pool, std::span<Query::Scorer*>(scorers, termNames.size()));
+
+  int32_t target = Postings::DOCS_BLOCK_SIZE + 5;
+  int32_t upTo = disj->advanceShallow(target);
+  ASSERT_GE(upTo, target);
+  float cheap = disj->getMaxScore(upTo);
+  float refined = disj->refineMaxScore(upTo);
+  ASSERT_TRUE(std::isfinite(cheap));
+  ASSERT_TRUE(std::isfinite(refined));
+
+  float brute = 0.0f;
+  for (int32_t doc = target; doc <= upTo && doc < nDocs; doc++) {
+    float sum = 0.0f;
+    for (size_t t = 0; t < termNames.size(); t++) {
+      sum += termScores[t][(size_t) doc];
+    }
+    brute = std::max(brute, sum);
+  }
+  EXPECT_GE(cheap + 1e-6f, brute);
+  EXPECT_GE(refined + 1e-6f, brute);
+  EXPECT_LE(refined, cheap + 1e-6f);
+}
+
+TEST_F(TermScorerTest, mandOptNearThetaRefineSkipsCoarseCompetitiveGroup) {
+  const int32_t nDocs = 5 * Postings::DOCS_BLOCK_SIZE;
+  TestIndex testIndex;
+  TestField f(testIndex, "body_w");
+  f.startIndexing();
+  for (int32_t doc = 0; doc < nDocs; doc++) {
+    int32_t block = doc / Postings::DOCS_BLOCK_SIZE;
+    int32_t reqTf = block == 0 ? 50 : 1;
+    int32_t len = block == 0 ? reqTf + 2 : 220;
+    std::string body;
+    int32_t used = 0;
+    appendRepeatedTerm(body, "near_req_probe", reqTf);
+    appendRepeatedTerm(body, "near_req", reqTf);
+    used += 2 * reqTf;
+    appendRepeatedTerm(body, "near_opt_probe", 1);
+    appendRepeatedTerm(body, "near_opt", 1);
+    used += 2;
+    if (len < used + 2) {
+      len = used + 2;
+    }
+    appendRepeatedTerm(body, "filler", len - used);
+    f.add(doc, body);
+  }
+  testIndex.flush();
+  f.startReading();
+
+  auto poolFree = testIndex.pool.rewindScopeGuard();
+  Query::Context qContext(testIndex.pool, *testIndex.reader);
+  auto& segment = qContext.topReader.segments()[0];
+  int32_t target = 2 * Postings::DOCS_BLOCK_SIZE + 7;
+  float theta;
+  {
+    TermQuery req("body_w", "near_req_probe");
+    TermQuery opt("body_w", "near_opt_probe");
+    std::vector<Query*> mandatory = {&req};
+    std::vector<Query*> optional = {&opt};
+    BooleanQuery query(mandatory, optional, {}, {});
+    auto* weight = query.createWeight(qContext, Query::NEED_SCORES);
+    auto* scorer = dynamic_cast<BooleanQuery::MandOptScorer*>(
+        weight->createScorer(testIndex.pool, segment));
+    ASSERT_NE(scorer, nullptr);
+    int32_t upTo = scorer->advanceShallow(target);
+    float cheap = scorer->getMaxScore(upTo);
+    float refined = scorer->refineMaxScore(upTo);
+    ASSERT_TRUE(std::isfinite(cheap));
+    ASSERT_TRUE(std::isfinite(refined));
+    ASSERT_LT(refined, cheap);
+    theta = std::nextafter(
+        std::max(refined, (float) (BooleanQuery::kRefineBeta * (double) cheap)),
+        std::numeric_limits<float>::infinity());
+    ASSERT_GT(theta, refined);
+    ASSERT_LT(theta, cheap);
+  }
+
+  TermQuery req("body_w", "near_req");
+  TermQuery opt("body_w", "near_opt");
+  std::vector<Query*> mandatory = {&req};
+  std::vector<Query*> optional = {&opt};
+  BooleanQuery query(mandatory, optional, {}, {});
+  auto* weight = query.createWeight(qContext, Query::NEED_SCORES);
+  auto* scorer = dynamic_cast<BooleanQuery::MandOptScorer*>(
+      weight->createScorer(testIndex.pool, segment));
+  ASSERT_NE(scorer, nullptr);
+
+  SkipStatsGuard stats;
+  scorer->setMinCompetitiveScore(theta);
+  EXPECT_NE(scorer->advance(target), target);
+  EXPECT_GT(SkipStats::mandOptWindowSkips, 0);
+  EXPECT_GT(SkipStats::impactRefinesTriggered, 0);
 }
 
 TEST_F(TermScorerTest, termImpactGroupBoundsHandleFinalPartialGroup) {

@@ -572,13 +572,205 @@ public:
   };
 
   class MandOptScorer final : public Query::Scorer {
-    Scorer* mandScorer;
-    Scorer* optScorer;
+    struct ApproxSlot {
+      Query::Scorer* scorer = nullptr;
+      bool twoPhase = false;
+
+      int32_t next() const {
+        return twoPhase ? scorer->approximationNext() : scorer->next();
+      }
+
+      int32_t advance(int32_t target) const {
+        return twoPhase ? scorer->approximationAdvance(target) : scorer->advance(target);
+      }
+
+      int32_t docId() const {
+        return twoPhase ? scorer->approximationDocId() : scorer->docId();
+      }
+    };
+
+    ApproxSlot mand;
+    ApproxSlot opt;
     int32_t id = -1;
+    float minCompetitiveScore = 0.0f;
+    float reqMaxScore = std::numeric_limits<float>::infinity();
+    int32_t windowUpTo = -1;
+    float windowReqMaxScore = std::numeric_limits<float>::infinity();
+    float windowMaxScore = std::numeric_limits<float>::infinity();
+    bool optIsRequired = false;
+    // The window walk earns its keep through skips and conjunction windows.
+    // When neither happens for a stretch (small corpora, low thresholds), it
+    // disables itself and only re-arms once theta has grown past the theta it
+    // failed at by the near-bound margin. The global reqMaxScore collapse in
+    // setMinCompetitiveScore stays active regardless. Patience must survive a
+    // fragment storm: windows split at every optional-side doc, so one coarse
+    // competitive group can produce dozens of useless evals before the walk
+    // reaches the next group where bounds actually change.
+    static constexpr int32_t kWindowWalkPatience = 64;
+    int32_t uselessWindowEvals = 0;
+    bool windowWalkDisabled = false;
+    float windowWalkDisabledAtTheta = 0.0f;
+
+    bool anyTwoPhase() const {
+      return mand.twoPhase || opt.twoPhase;
+    }
+
+    bool optCanExist(int32_t upTo) const {
+      int32_t optDoc = opt.docId();
+      return optDoc != solux::PostingsReader::END && optDoc <= upTo;
+    }
+
+    float maxScoreAt(int32_t upTo, bool refined) {
+      float maxScore = refined ? mand.scorer->refineMaxScore(upTo)
+                               : mand.scorer->getMaxScore(upTo);
+      if (optCanExist(upTo)) {
+        maxScore += refined ? opt.scorer->refineMaxScore(upTo)
+                            : opt.scorer->getMaxScore(upTo);
+      }
+      return maxScore;
+    }
+
+    void refineWindowNearTheta() {
+      if (!(minCompetitiveScore > 0.0f)) {
+        return;
+      }
+
+      if (windowReqMaxScore >= minCompetitiveScore && std::isfinite(windowReqMaxScore)
+          && (double) minCompetitiveScore >= kRefineBeta * (double) windowReqMaxScore) {
+        float refinedReqMax = mand.scorer->refineMaxScore(windowUpTo);
+        if (refinedReqMax < windowReqMaxScore) {
+          windowReqMaxScore = refinedReqMax;
+        }
+      }
+
+      if (windowMaxScore >= minCompetitiveScore && std::isfinite(windowMaxScore)
+          && (double) minCompetitiveScore >= kRefineBeta * (double) windowMaxScore) {
+        float refinedMax = maxScoreAt(windowUpTo, true);
+        if (refinedMax < windowMaxScore) {
+          windowMaxScore = refinedMax;
+        }
+      }
+    }
+
+    void moveToNextBlock(int32_t target) {
+      skipCount(SkipStats::mandOptWindowEvals);
+      windowUpTo = advanceShallow(target);
+      windowReqMaxScore = mand.scorer->getMaxScore(windowUpTo);
+      windowMaxScore = maxScoreAt(windowUpTo, false);
+      refineWindowNearTheta();
+      optIsRequired = windowReqMaxScore < minCompetitiveScore;
+      if (optIsRequired) {
+        skipCount(SkipStats::mandOptConjunctionWindows);
+      }
+    }
+
+    int32_t advanceImpacts(int32_t target) {
+      if (windowWalkDisabled) {
+        if (windowWalkDisabledAtTheta >= kRefineBeta * (double) minCompetitiveScore) {
+          return target;
+        }
+        windowWalkDisabled = false;
+        uselessWindowEvals = 0;
+      }
+      bool evaluated = false;
+      if (target > windowUpTo) {
+        moveToNextBlock(target);
+        evaluated = true;
+      }
+
+      for (;;) {
+        if (windowMaxScore >= minCompetitiveScore) {
+          // Patience is charged per window EVALUATION, never per advance:
+          // in-window advances answer from the cached bound and carry no
+          // signal about whether the walk is paying off.
+          if (evaluated) {
+            if (optIsRequired) {
+              uselessWindowEvals = 0;
+            } else if (++uselessWindowEvals > kWindowWalkPatience) {
+              windowWalkDisabled = true;
+              windowWalkDisabledAtTheta = minCompetitiveScore;
+            }
+          }
+          return target;
+        }
+        uselessWindowEvals = 0;
+        skipCount(SkipStats::mandOptWindowSkips);
+        if (windowUpTo >= solux::PostingsReader::END - 1) {
+          return solux::PostingsReader::END;
+        }
+        target = windowUpTo + 1;
+        moveToNextBlock(target);
+        evaluated = true;
+      }
+    }
+
+    int32_t advanceInternal(int32_t target) {
+      if (target == solux::PostingsReader::END) {
+        id = mand.docId() < target ? mand.advance(target) : target;
+        return id;
+      }
+
+      int32_t reqDoc = target;
+      advanceHead:
+      for (;;) {
+        if (minCompetitiveScore > 0.0f) {
+          reqDoc = advanceImpacts(reqDoc);
+        }
+        if (mand.docId() < reqDoc) {
+          reqDoc = mand.advance(reqDoc);
+        }
+        if (reqDoc == solux::PostingsReader::END || !optIsRequired) {
+          id = reqDoc;
+          return id;
+        }
+
+        int32_t upperBound = reqMaxScore < minCompetitiveScore
+          ? solux::PostingsReader::END
+          : windowUpTo;
+        if (reqDoc > upperBound) {
+          continue;
+        }
+
+        for (;;) {
+          int32_t optDoc = opt.docId();
+          if (optDoc < reqDoc) {
+            optDoc = opt.advance(reqDoc);
+          }
+          if (optDoc > upperBound) {
+            reqDoc = upperBound >= solux::PostingsReader::END - 1
+              ? solux::PostingsReader::END
+              : upperBound + 1;
+            goto advanceHead;
+          }
+
+          if (optDoc != reqDoc) {
+            reqDoc = mand.advance(optDoc);
+            if (reqDoc > upperBound) {
+              goto advanceHead;
+            }
+          }
+
+          if (reqDoc == solux::PostingsReader::END || optDoc == reqDoc) {
+            id = reqDoc;
+            return id;
+          }
+        }
+      }
+    }
+
+    int32_t nextMatched(int32_t doc) {
+      while (doc != solux::PostingsReader::END && !matches()) {
+        doc = approximationNext();
+      }
+      return doc;
+    }
+
   public:
-    MandOptScorer(solux::MemPool& targetPool, Scorer* mandScorer, Scorer* optScorer) : mandScorer(mandScorer),
-                                                                                       optScorer(optScorer) {
+    MandOptScorer(solux::MemPool& targetPool, Scorer* mandScorer, Scorer* optScorer)
+      : mand{mandScorer, !disableTwoPhaseForTests && mandScorer->hasTwoPhase()},
+        opt{optScorer, !disableTwoPhaseForTests && optScorer->hasTwoPhase()} {
       unused(targetPool);
+      reqMaxScore = mand.scorer->getMaxScoreForSetup(solux::PostingsReader::END);
     }
 
     int32_t docId() override {
@@ -587,24 +779,92 @@ public:
 
     int32_t next() override {
       assert(id != solux::PostingsReader::END);
-      id = mandScorer->next();
-      return id;
+      int32_t doc = approximationNext();
+      return anyTwoPhase() ? nextMatched(doc) : doc;
     }
 
     int32_t advance(int32_t docid) override {
-      id = mandScorer->advance(docid);
+      int32_t doc = approximationAdvance(docid);
+      return anyTwoPhase() ? nextMatched(doc) : doc;
+    }
+
+    bool hasTwoPhase() const override {
+      return anyTwoPhase();
+    }
+
+    int32_t approximationNext() override {
+      assert(id != solux::PostingsReader::END);
+      // Without a threshold the window walk is inert and optIsRequired can
+      // never be set; keep the mandatory clause on its sequential next()
+      // (exhaustive consumers like exact counts scan every posting, and the
+      // advance path costs measurably more per step).
+      if (!(minCompetitiveScore > 0.0f)) {
+        id = mand.next();
+        return id;
+      }
+      return advanceInternal(mand.docId() + 1);
+    }
+
+    int32_t approximationAdvance(int32_t target) override {
+      if (!(minCompetitiveScore > 0.0f)) {
+        id = mand.advance(target);
+        return id;
+      }
+      return advanceInternal(target);
+    }
+
+    int32_t approximationDocId() override {
       return id;
     }
 
+    bool matches() override {
+      int32_t reqDoc = mand.docId();
+      if (mand.twoPhase && !mand.scorer->matches()) {
+        return false;
+      }
+
+      if (optIsRequired) {
+        int32_t optDoc = opt.docId();
+        if (optDoc < reqDoc) {
+          optDoc = opt.advance(reqDoc);
+        }
+        if (optDoc != reqDoc) {
+          return false;
+        }
+        if (opt.twoPhase && !opt.scorer->matches()) {
+          opt.next();
+          return false;
+        }
+      } else if (opt.twoPhase && opt.docId() == reqDoc && !opt.scorer->matches()) {
+        opt.next();
+      }
+      return true;
+    }
+
+    float matchCost() override {
+      float cost = 1.0f;
+      if (mand.twoPhase) {
+        cost += mand.scorer->matchCost();
+      }
+      if (opt.twoPhase) {
+        cost += opt.scorer->matchCost();
+      }
+      return cost;
+    }
+
     float score() override {
-      float score = mandScorer->score();
+      float score = mand.scorer->score();
       // Consult the optional scorer for this exact doc (Lucene's ReqOptSumScorer
       // style): advance it only if behind, then add its score on an exact hit.
-      if (optScorer->docId() < id) {
-        optScorer->advance(id);
+      int32_t optDoc = opt.docId();
+      if (optDoc < id) {
+        optDoc = opt.advance(id);
       }
-      if (optScorer->docId() == id) {
-        score += optScorer->score();
+      if (opt.twoPhase && optDoc == id && !opt.scorer->matches()) {
+        optDoc = opt.next();
+      }
+      if (optDoc == id) {
+        score += opt.scorer->score();
       }
       return score;
     }
@@ -614,26 +874,45 @@ public:
     // side may prune with that reduced threshold (Lucene ReqOptSumScorer's
     // setMinCompetitiveScore shape).  An unbounded optional forwards nothing.
     void setMinCompetitiveScore(float minScore) override {
-      float optMax = optScorer->getMaxScore(solux::PostingsReader::END);
+      float optMax = opt.scorer->getMaxScore(solux::PostingsReader::END);
       if (std::isfinite(optMax)) {
         // Round the reduced threshold DOWN so float rounding can only make the
         // required side less aggressive, never skip a doc whose sum could
         // still reach minScore.
-        mandScorer->setMinCompetitiveScore(
+        mand.scorer->setMinCompetitiveScore(
             std::nextafter(minScore - optMax, -std::numeric_limits<float>::infinity()));
+      }
+      if (minScore > minCompetitiveScore) {
+        minCompetitiveScore = minScore;
+        windowUpTo = -1;
+      }
+      if (reqMaxScore < minScore) {
+        optIsRequired = true;
+        if (reqMaxScore == 0.0f) {
+          opt.scorer->setMinCompetitiveScore(minScore);
+        }
       }
     }
 
     float getMaxScore(int32_t upTo) override {
-      return mandScorer->getMaxScore(upTo) + optScorer->getMaxScore(upTo);
+      return maxScoreAt(upTo, false);
     }
 
     float refineMaxScore(int32_t upTo) override {
-      return mandScorer->refineMaxScore(upTo) + optScorer->refineMaxScore(upTo);
+      return maxScoreAt(upTo, true);
     }
 
     int32_t advanceShallow(int32_t target) override {
-      return mandScorer->advanceShallow(target);
+      int32_t upTo = mand.scorer->advanceShallow(target);
+      int32_t optDoc = opt.docId();
+      if (optDoc != solux::PostingsReader::END) {
+        if (optDoc <= target) {
+          upTo = std::min(upTo, opt.scorer->advanceShallow(target));
+        } else {
+          upTo = std::min(upTo, optDoc - 1);
+        }
+      }
+      return upTo;
     }
   }; // MandOptScorer
 
@@ -1550,6 +1829,38 @@ public:
         }
       }
       return score;
+    }
+
+    int32_t advanceShallow(int32_t target) override {
+      int32_t upTo = solux::PostingsReader::END;
+      for (int32_t i = 0; i < (int32_t) pq.size(); i++) {
+        upTo = std::min(upTo, scorers[(size_t) i]->advanceShallow(target));
+      }
+      return upTo;
+    }
+
+    float getMaxScore(int32_t upTo) override {
+      float sum = 0.0f;
+      for (int32_t i = 0; i < (int32_t) pq.size(); i++) {
+        auto* scorer = scorers[(size_t) i];
+        int32_t doc = scorer->docId();
+        if (doc != solux::PostingsReader::END && doc <= upTo) {
+          sum += scorer->getMaxScore(upTo);
+        }
+      }
+      return sum;
+    }
+
+    float refineMaxScore(int32_t upTo) override {
+      float sum = 0.0f;
+      for (int32_t i = 0; i < (int32_t) pq.size(); i++) {
+        auto* scorer = scorers[(size_t) i];
+        int32_t doc = scorer->docId();
+        if (doc != solux::PostingsReader::END && doc <= upTo) {
+          sum += scorer->refineMaxScore(upTo);
+        }
+      }
+      return sum;
     }
   }; // DisjunctionScorer
 
