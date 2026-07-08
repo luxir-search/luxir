@@ -24,6 +24,96 @@ class BooleanQuery final : public solux::Query {
   // mandatory/filter clauses (> 1 selects the min-should-match scorer).
   int minShouldMatch;
 
+  static TermQuery* dedupableTerm(Query* query) {
+    auto* term = dynamic_cast<TermQuery*>(query);
+    if (term == nullptr || term->hasInjectedStats()) return nullptr;
+    return term;
+  }
+
+  static bool sameTermIdentity(const TermQuery& lhs, const TermQuery& rhs) {
+    return lhs.shouldUseFrontierBound() == rhs.shouldUseFrontierBound()
+        && lhs.getField() == rhs.getField() && lhs.getTerm() == rhs.getTerm();
+  }
+
+  // Weight-time duplicate-clause normalization. Lucene dedups at rewrite, not
+  // query creation; a Solux query tree is built per request and has no rewrite
+  // phase, so weight creation is the equivalent seam - it keeps query objects
+  // untouched (merges clone into the request pool) and sits where the
+  // similarity would be consulted if query-term weighting ever became a knob.
+  // Solux intentionally sums boosts: Lucene's computeQueryTermWeight only
+  // saturates duplicate qtf when BM25 k3 is configured, the default is linear
+  // (equal to boost summing), and Solux has no qtf hook.
+  //
+  // TODO: replace the O(n^2) scans with hashing, extend identity beyond
+  // TermQuery (needs Query equality), and do full duplicate removal ACROSS
+  // the mandatory/optional/prohibited lists (an optional clause duplicating
+  // a mandatory one folds its boost into the mandatory clause; a prohibited
+  // duplicate of a required clause matches nothing).
+  static std::span<Query*> mergeDuplicateScoringTerms(solux::MemPool& pool,
+                                                      std::span<Query*> clauses) {
+    boost::container::small_vector<Query*, 16> out;
+    boost::container::small_vector<bool, 16> consumed(clauses.size(), false);
+    bool changed = false;
+    for (size_t i = 0; i < clauses.size(); i++) {
+      if (consumed[i]) continue;
+      Query* query = clauses[i];
+      if (auto* term = dedupableTerm(query)) {
+        float boost = term->getBoost();
+        bool merged = false;
+        for (size_t j = i + 1; j < clauses.size(); j++) {
+          if (consumed[j]) continue;
+          auto* other = dedupableTerm(clauses[j]);
+          if (other == nullptr || !sameTermIdentity(*term, *other)) continue;
+          boost += other->getBoost();
+          consumed[j] = true;
+          merged = true;
+        }
+        if (merged) {
+          query = pool.make<TermQuery>(term->getField(), term->getTerm(), boost,
+                                       term->shouldUseFrontierBound());
+          changed = true;
+        }
+      }
+      out.push_back(query);
+    }
+    if (!changed) {
+      return clauses;
+    }
+    auto* kept = pool.make_arr<Query*>(out.size());
+    std::copy(out.begin(), out.end(), kept);
+    return {kept, out.size()};
+  }
+
+  static std::span<Query*> dropDuplicateFilterTerms(solux::MemPool& pool,
+                                                    std::span<Query*> clauses) {
+    boost::container::small_vector<Query*, 16> out;
+    bool changed = false;
+    for (size_t i = 0; i < clauses.size(); i++) {
+      auto* term = dedupableTerm(clauses[i]);
+      bool duplicate = false;
+      if (term != nullptr) {
+        for (Query* prior : out) {
+          auto* priorTerm = dedupableTerm(prior);
+          if (priorTerm != nullptr && sameTermIdentity(*priorTerm, *term)) {
+            duplicate = true;
+            break;
+          }
+        }
+      }
+      if (duplicate) {
+        changed = true;
+        continue;
+      }
+      out.push_back(clauses[i]);
+    }
+    if (!changed) {
+      return clauses;
+    }
+    auto* kept = pool.make_arr<Query*>(out.size());
+    std::copy(out.begin(), out.end(), kept);
+    return {kept, out.size()};
+  }
+
 public:
   static inline bool disableBulkDomainDriveForTests = false;
   // A/B toggle: force the conjunction onto the eager single-phase path (each
@@ -458,7 +548,17 @@ public:
       needsScores = (flags & Query::NEED_SCORES) != 0;
       // Only mandatory and optional clauses can contribute to score.
       int32_t noScore = flags & ~NEED_SCORES;
-      mandatoryWeights = createWeights(context.pool, context, query.mandatory, flags);
+      // Duplicate clauses normalize here (see mergeDuplicateScoringTerms).
+      // The optional side keeps duplicates under minShouldMatch > 1:
+      // MinShouldMatchScorer and WAND count matching scorer instances, so
+      // duplicate terms can legitimately satisfy multiple match slots.
+      auto mandatoryClauses = mergeDuplicateScoringTerms(context.pool, query.mandatory);
+      auto optionalClauses = query.minShouldMatch <= 1
+        ? mergeDuplicateScoringTerms(context.pool, query.optional)
+        : query.optional;
+      auto prohibitedClauses = dropDuplicateFilterTerms(context.pool, query.prohibited);
+      auto filterClauses = dropDuplicateFilterTerms(context.pool, query.filter);
+      mandatoryWeights = createWeights(context.pool, context, mandatoryClauses, flags);
       // With a mandatory clause and minShouldMatch unset, optional clauses are
       // a pure score add (MandOpt) - they never affect membership.  Without
       // scores they contribute nothing, so skip building their weights entirely
@@ -466,12 +566,12 @@ public:
       // "+a b" count-only requests to the single-clause count() shortcut.
       // minShouldMatch >= 1 makes the optional group a membership constraint
       // even under a mandatory clause, so it must be kept.
-      bool dropOptional = !needsScores && !query.mandatory.empty() && query.minShouldMatch < 1;
+      bool dropOptional = !needsScores && !mandatoryClauses.empty() && query.minShouldMatch < 1;
       optionalWeights = dropOptional
         ? std::span<Query::Weight*>{}
-        : createWeights(context.pool, context, query.optional, flags);
-      prohibitedWeights = createWeights(context.pool, context, query.prohibited, noScore);
-      filterWeights = createWeights(context.pool, context, query.filter, noScore);
+        : createWeights(context.pool, context, optionalClauses, flags);
+      prohibitedWeights = createWeights(context.pool, context, prohibitedClauses, noScore);
+      filterWeights = createWeights(context.pool, context, filterClauses, noScore);
       minShouldMatch = query.minShouldMatch;
 
       if (QueryPrep::anyNeedsPrepare(mandatoryWeights) ||

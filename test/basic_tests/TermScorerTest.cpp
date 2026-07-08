@@ -5100,3 +5100,4 @@ TEST_F(TermScorerTest, interleavedScorersForSameTermAreIndependent) {
   // Pre-fix this cloned the exhausted cached enum and counted far fewer than N.
   EXPECT_EQ(countAll("needle"), (int64_t) N);
 }
+

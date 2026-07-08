@@ -226,6 +226,10 @@ public:
         }
         int n = (int)terms.size();
         int k = minMatch > 0 ? minMatch : (op == Operator::AND ? n : 1);
+        // BooleanQuery dedups after this k decision. For k <= 1, SHOULD
+        // dedup is safe; for k >= n the conjunction arm stores no k; for the
+        // middle min-should-match arm the ctor's msm > 1 guard preserves
+        // duplicate scorer instances.
         std::span<Query*> none{};
         if (k >= n) {
           return pool.make<BooleanQuery>(clauses, none, none, none);  // conjunction (all)
