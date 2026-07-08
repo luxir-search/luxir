@@ -599,6 +599,44 @@ public:
     }
     /// term frequency for current doc
     virtual float score() = 0;
+    /// Sweep this single-phase scorer over a sorted candidate buffer.
+    ///
+    /// For every candidate doc that this scorer matches, add score() into the
+    /// parallel scores[] slot. When required is false the candidate buffer is
+    /// left in place and size is returned. When required is true, non-matching
+    /// docs are removed from docs[]/scores[] in-place and the compacted size is
+    /// returned.
+    ///
+    /// Protocol rule: the default implementation drives exact advance()+score()
+    /// for this scorer lifetime. Do not call it on a scorer that is already
+    /// being consumed through approximation*()+matches() unless this method is
+    /// first made explicitly two-phase-aware.
+    virtual int32_t applyToCandidates(int32_t* docs, float* scores,
+                                      int32_t size, bool required) {
+      assert(size >= 0);
+      int32_t write = 0;
+      for (int32_t i = 0; i < size; i++) {
+        int32_t target = docs[i];
+        if (docId() < target) {
+          advance(target);
+        }
+        bool matched = docId() == target;
+        if (matched) {
+          scores[i] += score();
+        }
+        if (!required) {
+          continue;
+        }
+        if (matched) {
+          if (write != i) {
+            docs[write] = docs[i];
+            scores[write] = scores[i];
+          }
+          write++;
+        }
+      }
+      return required ? write : size;
+    }
     /// Fill docs/scores from the current positioned doc while docid < upTo.
     /// The scorer is advanced after each emitted doc, so repeated calls continue
     /// at the first unfilled doc.

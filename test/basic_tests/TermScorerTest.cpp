@@ -791,6 +791,222 @@ int64_t countPullTermConjunctionSegment(MemPool& pool, Query::Context& qContext,
   return count;
 }
 
+std::vector<std::string_view> termViews(std::span<const std::string> terms) {
+  std::vector<std::string_view> views;
+  views.reserve(terms.size());
+  for (const auto& term : terms) {
+    views.push_back(term);
+  }
+  return views;
+}
+
+std::vector<std::string> makeSweepTermStrings(int32_t numTerms) {
+  std::vector<std::string> terms;
+  terms.reserve((size_t) numTerms);
+  for (int32_t i = 0; i < numTerms; i++) {
+    terms.push_back("sweep" + std::to_string(i));
+  }
+  return terms;
+}
+
+void addSweepDisjunctionDocs(CollectionHelper& helper, int32_t numTerms) {
+  const int32_t nDocs = 3 * DocsEnum::L1_DOCS + 211;
+  auto terms = makeSweepTermStrings(numTerms);
+  helper.clear();
+  std::vector<Doc> docs;
+  docs.reserve((size_t) nDocs);
+
+  for (int32_t doc = 0; doc < nDocs; doc++) {
+    std::string body;
+    int32_t used = 0;
+    auto add = [&](std::string_view term, int32_t count) {
+      appendRepeatedTerm(body, term, count);
+      used += count;
+    };
+
+    if (doc < 32) {
+      for (int32_t term = 0; term < numTerms; term++) {
+        add(terms[(size_t) term], 8 + ((doc + term) % 4));
+      }
+    } else {
+      bool any = false;
+      for (int32_t term = 0; term < numTerms; term++) {
+        bool match = ((doc + term * 7) % (term + 2)) == 0;
+        if (doc % 97 == 0) {
+          match = true;
+        }
+        if (match) {
+          any = true;
+          add(terms[(size_t) term], 1 + ((doc + term) % 3));
+        }
+      }
+      if (!any) {
+        add("sweep_filler", 1);
+      }
+    }
+
+    int32_t len = used + 18 + (doc % 19);
+    add("sweep_filler", len - used);
+    docs.push_back(flatdoc("id", "sweep_" + std::to_string(doc), "body_w", body));
+  }
+
+  helper.indexAll(docs, UpdateMessage::COMMIT);
+}
+
+std::unique_ptr<DocSet> makeEveryNthSegmentDocSet(IndexReader::Segment& segment,
+                                                  int32_t step, bool arrayDocSet,
+                                                  bool liveOnly) {
+  if (step <= 0) {
+    return nullptr;
+  }
+  auto isLive = [&](int32_t doc) {
+    return !liveOnly || segment.liveDocs() == nullptr || segment.liveDocs()->bitset().get(doc);
+  };
+  if (arrayDocSet) {
+    std::vector<int32_t> docs;
+    docs.reserve((size_t) ((segment.maxDoc() + step - 1) / step));
+    for (int32_t doc = 0; doc < segment.maxDoc(); doc += step) {
+      if (isLive(doc)) {
+        docs.push_back(doc);
+      }
+    }
+    return std::make_unique<ArrDocSet>(std::move(docs));
+  }
+
+  auto filter = std::make_unique<RAMBitDocSet>(segment.maxDoc());
+  for (int32_t doc = 0; doc < segment.maxDoc(); doc += step) {
+    if (isLive(doc)) {
+      filter->mutableBits().set(doc);
+    }
+  }
+  return filter;
+}
+
+DisjunctionTopKRun runFilteredExhaustiveTermDisjunctionTopK(
+    IndexReader& reader, std::span<const std::string_view> terms, int32_t topK,
+    int32_t filterStep = 0, bool arrayDocSet = false, bool liveOnly = false) {
+  MemPool pool;
+  Query::Context qContext(pool, reader);
+  auto queries = makeTermQueries(terms);
+  std::vector<Query::Weight*> weights;
+  weights.reserve(queries.size());
+  for (auto& query : queries) {
+    weights.push_back(query.createWeight(qContext, Query::NEED_SCORES));
+  }
+
+  TopDocsCollector collector(topK);
+  auto segments = qContext.topReader.segments();
+  for (int32_t segnum = 0; segnum < (int32_t) segments.size(); segnum++) {
+    auto* arr = pool.make_arr<Query::Scorer*>(weights.size());
+    int32_t count = 0;
+    for (auto* weight : weights) {
+      auto* scorer = weight->createScorer(pool, segments[segnum]);
+      if (scorer != nullptr) arr[count++] = scorer;
+    }
+    if (count == 0) continue;
+    Query::Scorer* scorer = count == 1
+      ? arr[0]
+      : pool.make<BooleanQuery::DisjunctionScorer>(
+          pool, std::span<Query::Scorer*>(arr, (size_t) count));
+    auto filter = makeEveryNthSegmentDocSet(segments[segnum], filterStep,
+                                            arrayDocSet, liveOnly);
+    collectTopK(segnum, scorer, filter.get(), nullptr, collector, false);
+  }
+
+  DisjunctionTopKRun result;
+  result.visited = collector.totalHits();
+  result.topDocs = sortedCollectorDocs(collector);
+  return result;
+}
+
+DisjunctionTopKRun runFilteredBulkTermDisjunctionTopK(
+    IndexReader& reader, std::span<const std::string_view> terms, int32_t topK,
+    int32_t filterStep = 0, bool arrayDocSet = false, bool liveOnly = false) {
+  MemPool pool;
+  Query::Context qContext(pool, reader);
+  auto queries = makeTermQueries(terms);
+  auto optional = queryPointers(queries);
+  std::span<Query*> empty;
+  BooleanQuery query(empty, std::span<Query*>(optional.data(), optional.size()), empty, empty);
+  auto* weight = query.createWeight(qContext, Query::NEED_SCORES);
+  TopDocsCollector collector(topK);
+
+  auto segments = qContext.topReader.segments();
+  for (int32_t segnum = 0; segnum < (int32_t) segments.size(); segnum++) {
+    auto* supplier = weight->scorerSupplier(pool, segments[segnum]);
+    if (supplier == nullptr) continue;
+    auto* bulk = supplier->bulkScorer(pool);
+    if (bulk == nullptr) {
+      ADD_FAILURE() << "bulkScorer returned null for segment " << segnum;
+      continue;
+    }
+    auto filter = makeEveryNthSegmentDocSet(segments[segnum], filterStep,
+                                            arrayDocSet, liveOnly);
+    collectTopKWindowed(segnum, bulk, filter.get(), nullptr, collector, nullptr,
+                        segments[segnum].maxDoc());
+  }
+
+  DisjunctionTopKRun result;
+  result.visited = collector.totalHits();
+  result.topDocs = sortedCollectorDocs(collector);
+  return result;
+}
+
+struct WindowScore {
+  int32_t doc = 0;
+  float score = 0.0f;
+};
+
+std::vector<WindowScore> exhaustiveWindowScores(IndexReader& reader,
+                                                std::span<const std::string_view> terms,
+                                                int32_t minDoc, int32_t maxDoc) {
+  MemPool pool;
+  Query::Context qContext(pool, reader);
+  auto queries = makeTermQueries(terms);
+  std::vector<Query::Weight*> weights;
+  weights.reserve(queries.size());
+  for (auto& query : queries) {
+    weights.push_back(query.createWeight(qContext, Query::NEED_SCORES));
+  }
+
+  std::vector<WindowScore> scores;
+  auto& segment = qContext.topReader.segments()[0];
+  auto* arr = pool.make_arr<Query::Scorer*>(weights.size());
+  int32_t count = 0;
+  for (auto* weight : weights) {
+    auto* scorer = weight->createScorer(pool, segment);
+    if (scorer != nullptr) arr[count++] = scorer;
+  }
+  if (count == 0) {
+    return scores;
+  }
+  Query::Scorer* scorer = count == 1
+    ? arr[0]
+    : pool.make<BooleanQuery::DisjunctionScorer>(
+        pool, std::span<Query::Scorer*>(arr, (size_t) count));
+  int32_t doc = scorer->docId() < minDoc ? scorer->advance(minDoc) : scorer->docId();
+  while (doc < maxDoc) {
+    scores.push_back({doc, scorer->score()});
+    doc = scorer->next();
+  }
+  return scores;
+}
+
+BulkScorer* createBulkTermDisjunctionScorer(MemPool& pool, Query::Context& qContext,
+                                            IndexReader::Segment& segment,
+                                            std::span<const std::string_view> terms) {
+  auto queries = makeTermQueries(terms);
+  auto optional = queryPointers(queries);
+  std::span<Query*> empty;
+  BooleanQuery query(empty, std::span<Query*>(optional.data(), optional.size()), empty, empty);
+  auto* weight = query.createWeight(qContext, Query::NEED_SCORES);
+  auto* supplier = weight->scorerSupplier(pool, segment);
+  if (supplier == nullptr) {
+    return nullptr;
+  }
+  return supplier->bulkScorer(pool);
+}
+
 struct DomainCountRun {
   int64_t count = 0;
   std::unique_ptr<DocSet> domain;
@@ -4072,6 +4288,137 @@ TEST_F(TermScorerTest, MaxScoreBulkScorerSharedAccumulatorMatchesBaseline) {
   assertSameTopKDocs(exhaustive, bulk, k);
   assertSameTopKDocs(baseline, bulk, k);
   ASSERT_GT(accumulator.get(), std::numeric_limits<float>::lowest());
+  helper.clear();
+}
+
+TEST_F(TermScorerTest, MaxScoreBulkScorerBufferSweepsMatchExhaustiveAcrossShapes) {
+  CollectionHelper helper("main");
+  const int32_t maxClauses = 6;
+  addSweepDisjunctionDocs(helper, maxClauses);
+  auto reader = helper.getIndexWriter()->getIndexReader();
+  auto termStrings = makeSweepTermStrings(maxClauses);
+  auto views = termViews(termStrings);
+
+  int64_t sweepWindows = 0;
+  int64_t compactionDrops = 0;
+  for (int32_t clauses : {2, 3, 6}) {
+    std::span<const std::string_view> terms(views.data(), (size_t) clauses);
+    for (int32_t topK : {5, 11, 3 * DocsEnum::L1_DOCS + 500}) {
+      auto expected = runFilteredExhaustiveTermDisjunctionTopK(*reader, terms, topK);
+      SkipStatsGuard stats;
+      auto actual = runFilteredBulkTermDisjunctionTopK(*reader, terms, topK);
+      sweepWindows += SkipStats::maxScoreSweepWindows;
+      compactionDrops += SkipStats::maxScoreBufferCompactions;
+      assertSameTopKDocs(expected, actual, topK);
+    }
+  }
+
+  EXPECT_GT(sweepWindows, 0);
+  EXPECT_GT(compactionDrops, 0);
+  helper.clear();
+}
+
+TEST_F(TermScorerTest, MaxScoreBulkScorerRequiredPromotionMakesHighThetaTwoClauseConjunction) {
+  CollectionHelper helper("main");
+  const int32_t windowStart = DocsEnum::L1_DOCS;
+  const int32_t windowEnd = 2 * DocsEnum::L1_DOCS;
+  const int32_t nDocs = windowEnd + 31;
+  helper.clear();
+  std::vector<Doc> docs;
+  docs.reserve((size_t) nDocs);
+  for (int32_t doc = 0; doc < nDocs; doc++) {
+    std::string body;
+    int32_t local = doc - windowStart;
+    if (doc >= windowStart && doc < windowEnd) {
+      if ((local % 2) == 0) appendRepeatedTerm(body, "req_a", 1);
+      if ((local % 3) == 0) appendRepeatedTerm(body, "req_b", 1);
+    } else {
+      appendRepeatedTerm(body, "req_a", 1);
+      appendRepeatedTerm(body, "req_b", 1);
+    }
+    appendRepeatedTerm(body, "req_pad", 3);
+    docs.push_back(flatdoc("id", "req_" + std::to_string(doc), "body_w", body));
+  }
+  helper.indexAll(docs, UpdateMessage::COMMIT);
+  auto reader = helper.getIndexWriter()->getIndexReader();
+  std::array<std::string_view, 2> terms = {"req_a", "req_b"};
+
+  auto scores = exhaustiveWindowScores(*reader, terms, windowStart, windowEnd);
+  float maxSingle = std::numeric_limits<float>::lowest();
+  float minBoth = std::numeric_limits<float>::infinity();
+  std::vector<int32_t> expectedDocs;
+  for (auto hit : scores) {
+    int32_t local = hit.doc - windowStart;
+    bool both = (local % 6) == 0;
+    if (both) {
+      minBoth = std::min(minBoth, hit.score);
+    } else {
+      maxSingle = std::max(maxSingle, hit.score);
+    }
+  }
+  ASSERT_GT(minBoth, maxSingle);
+  float theta = (maxSingle + minBoth) * 0.5f;
+  for (auto hit : scores) {
+    if (hit.score >= theta) {
+      expectedDocs.push_back(hit.doc);
+    }
+  }
+  ASSERT_FALSE(expectedDocs.empty());
+
+  MemPool pool;
+  Query::Context qContext(pool, *reader);
+  auto& segment = qContext.topReader.segments()[0];
+  auto* bulk = createBulkTermDisjunctionScorer(pool, qContext, segment, terms);
+  ASSERT_NE(bulk, nullptr);
+
+  ScoreWindow window;
+  SkipStatsGuard stats;
+  int32_t next = bulk->scoreNextWindow(window, nullptr, windowStart, windowEnd, theta);
+  EXPECT_EQ(next, PostingsReader::END);
+  std::vector<int32_t> actualDocs;
+  actualDocs.reserve((size_t) window.size);
+  for (int32_t i = 0; i < window.size; i++) {
+    actualDocs.push_back(window.docs[(size_t) i]);
+    EXPECT_GE(window.scores[(size_t) i], theta);
+    EXPECT_EQ((window.docs[(size_t) i] - windowStart) % 6, 0);
+  }
+  EXPECT_EQ(actualDocs, expectedDocs);
+  EXPECT_GT(SkipStats::maxScoreSweepWindows, 0);
+  EXPECT_GT(SkipStats::maxScoreRequiredSweeps, 0);
+  EXPECT_GT(SkipStats::maxScoreBufferCompactions, 0);
+
+  MemPool countPool;
+  Query::Context countContext(countPool, *reader);
+  auto& countSegment = countContext.topReader.segments()[0];
+  EXPECT_EQ(countBulkTermDisjunctionSegment(countPool, countContext, countSegment, terms, nullptr),
+            countPullTermDisjunctionSegment(countPool, countContext, countSegment, terms, nullptr));
+  helper.clear();
+}
+
+TEST_F(TermScorerTest, MaxScoreBulkScorerBufferSweepsRespectFiltersAndDeletes) {
+  CollectionHelper helper("main");
+  const int32_t clauses = 5;
+  addSweepDisjunctionDocs(helper, clauses);
+  std::vector<std::string> deleteIds;
+  for (int32_t doc = 0; doc < 3 * DocsEnum::L1_DOCS + 211; doc += 13) {
+    deleteIds.push_back("sweep_" + std::to_string(doc));
+  }
+  helper.deleteByIds(deleteIds, UpdateMessage::COMMIT);
+  auto reader = helper.getIndexWriter()->getIndexReader();
+  auto termStrings = makeSweepTermStrings(clauses);
+  auto views = termViews(termStrings);
+  std::span<const std::string_view> terms(views.data(), views.size());
+
+  BulkDomainDriveGuard guard(true);
+  for (bool arrayDocSet : {false, true}) {
+    auto expected = runFilteredExhaustiveTermDisjunctionTopK(
+        *reader, terms, 40, 3, arrayDocSet, true);
+    SkipStatsGuard stats;
+    auto actual = runFilteredBulkTermDisjunctionTopK(
+        *reader, terms, 40, 3, arrayDocSet, true);
+    EXPECT_GT(SkipStats::maxScoreSweepWindows, 0) << "arrayDocSet=" << arrayDocSet;
+    assertSameTopKDocs(expected, actual, 40);
+  }
   helper.clear();
 }
 

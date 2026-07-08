@@ -338,6 +338,37 @@ public:
       return boost * simScorer->score((float) tf, encodedNorm);
     }
 
+    int32_t applyToCandidates(int32_t* docs, float* scores,
+                              int32_t size, bool required) override {
+      assert(size >= 0);
+      int32_t write = 0;
+      int32_t current = docsEnum.docId();
+      for (int32_t i = 0; i < size; i++) {
+        int32_t target = docs[i];
+        if (current < target) {
+          current = docsEnum.advance(target);
+        }
+        bool matched = current == target;
+        if (matched && simScorer != nullptr) {
+          int32_t tf = docsEnum.termFreq();
+          int64_t encodedNorm = flatNormsBase != nullptr ? flatNormsBase[target]
+                                                         : advanceNorm(target);
+          scores[i] += boost * simScorer->score((float) tf, encodedNorm);
+        }
+        if (!required) {
+          continue;
+        }
+        if (matched) {
+          if (write != i) {
+            docs[write] = docs[i];
+            scores[write] = scores[i];
+          }
+          write++;
+        }
+      }
+      return required ? write : size;
+    }
+
     int32_t fillScoreBlockScalar(int32_t* docs, float* scores, int32_t count, int32_t upTo,
                                  bool includeCurrent) {
       assert(count >= 0);

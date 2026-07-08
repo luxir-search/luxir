@@ -2287,8 +2287,8 @@ public:
     std::span<int32_t> windowOrder;
     std::span<bool> isEssential;
     // nonEssentialPrefixMax[s] = sum of windowMax over windowOrder[0..s]: the
-    // most the not-yet-probed non-essential clauses can add when probing runs
-    // from s = splitIndex-1 downward (see scoreCandidate).
+    // most the not-yet-swept non-essential clauses can add when sweeps run from
+    // s = splitIndex-1 downward.
     std::span<double> nonEssentialPrefixMax;
     std::span<uint64_t> windowBits;
     // One shared per-window score accumulation row for all fill modes.
@@ -2315,6 +2315,7 @@ public:
     int64_t numCandidates = 0;
     int32_t minWindowSize = 1;
     size_t splitIndex = 0;
+    size_t firstRequired = 0;
     int64_t bs1Windows = 0;
     int64_t domainDriveWindows = 0;
     float minCompetitiveScore = std::numeric_limits<float>::lowest();
@@ -2340,6 +2341,10 @@ public:
         scorers[j] = scorer;
         clauseMax[j] = maxScore;
       }
+    }
+
+    bool canReach(float score, double bound) const {
+      return ((double) score + bound) * scoreBoundFactor >= (double) minCompetitiveScore;
     }
 
     bool lessWindowOrder(int32_t a, int32_t b) const {
@@ -2371,7 +2376,7 @@ public:
         float maxScore = windowMax[(size_t) windowOrder[s]];
         if (!std::isfinite(maxScore)) break;
         double nextSum = sum + (double) maxScore;
-        if (!(nextSum * scoreBoundFactor < (double) minCompetitiveScore)) break;
+        if (canReach(0.0f, nextSum)) break;
         sum = nextSum;
       }
       return s;
@@ -2401,6 +2406,29 @@ public:
       }
     }
 
+    void promoteRequiredScorers() {
+      assert(scorers.size() - splitIndex == 1);
+      firstRequired = splitIndex;
+      double maxRequiredScore = (double) windowMax[(size_t) windowOrder[splitIndex]];
+      // Required promotion is only a sweep-time intersection, not an essential
+      // fill change. The invariant is: after promoting windowOrder[firstRequired],
+      // any buffer doc that misses that clause cannot reach theta even if it
+      // takes every lower non-essential clause. That makes dropping it from the
+      // union buffer safe for top-k scoring; count/domain paths do not use this
+      // scorer loop.
+      while (firstRequired > 0) {
+        double bound = maxRequiredScore;
+        if (firstRequired > 1) {
+          bound += nonEssentialPrefixMax[firstRequired - 2];
+        }
+        if (canReach(0.0f, bound)) {
+          break;
+        }
+        firstRequired--;
+        maxRequiredScore += (double) windowMax[(size_t) windowOrder[firstRequired]];
+      }
+    }
+
     void partitionWindow() {
       sortWindowOrder();
       splitIndex = computeWindowSplit();
@@ -2409,6 +2437,10 @@ public:
       for (size_t s = 0; s < splitIndex; s++) {
         acc += (double) windowMax[(size_t) windowOrder[s]];
         nonEssentialPrefixMax[s] = acc;
+      }
+      firstRequired = splitIndex;
+      if (scorers.size() - splitIndex == 1) {
+        promoteRequiredScorers();
       }
     }
 
@@ -2699,44 +2731,78 @@ public:
       }
     }
 
-    float scoreCandidateWithBase(int32_t doc, float sum) {
-      // Essential contributions were accumulated during the fill, or passed
-      // directly by the single-essential fast path; only the
-      // window-non-essential clauses (windowOrder[0..splitIndex)) still need
-      // a per-candidate advance + score. splitIndex == 0 - the common case
-      // until the threshold rises - returns the base score unchanged.
-      //
-      // Probe from the largest window bound downward, abandoning the candidate
-      // as soon as the unprobed clauses cannot lift it over the threshold
-      // (Lucene's filterCompetitiveHits shape): the partial sum is returned
-      // and the caller's threshold check discards it, so most candidates never
-      // advance the low-impact clauses at all.
-      for (size_t s = splitIndex; s-- > 0; ) {
-        if (((double) sum + nonEssentialPrefixMax[s]) * scoreBoundFactor
-            < (double) minCompetitiveScore) {
-          return sum;
-        }
-        auto* scorer = scorers[(size_t) windowOrder[s]];
-        if (scorer->docId() < doc) {
-          scorer->advance(doc);
-        }
-        if (scorer->docId() == doc && verifyMatch(scorer, doc)) {
-          sum += scorer->score();
-        }
-      }
-      return sum;
-    }
-
-    float scoreCandidate(int32_t doc, int32_t index) {
-      return scoreCandidateWithBase(doc, windowScores[(size_t) index]);
-    }
-
     void prepareOutputWindow(ScoreWindow& out) {
       out.min = windowStart;
       out.max = windowEnd;
       out.size = 0;
       out.docs = outDocs;
       out.scores = outScores;
+    }
+
+    void recordBufferDrops(int32_t before, int32_t after) {
+      if (SkipStats::enabled && after < before) {
+        SkipStats::maxScoreBufferCompactions += (int64_t) (before - after);
+      }
+    }
+
+    int32_t compactCompetitive(ScoreWindow& out, double bound) {
+      int32_t write = 0;
+      for (int32_t read = 0; read < out.size; read++) {
+        if (!canReach(out.scores[(size_t) read], bound)) {
+          continue;
+        }
+        if (write != read) {
+          out.docs[(size_t) write] = out.docs[(size_t) read];
+          out.scores[(size_t) write] = out.scores[(size_t) read];
+        }
+        write++;
+      }
+      recordBufferDrops(out.size, write);
+      return write;
+    }
+
+    void finishCompetitive(ScoreWindow& out) {
+      int32_t write = 0;
+      for (int32_t read = 0; read < out.size; read++) {
+        if (out.scores[(size_t) read] < minCompetitiveScore) {
+          continue;
+        }
+        if (write != read) {
+          out.docs[(size_t) write] = out.docs[(size_t) read];
+          out.scores[(size_t) write] = out.scores[(size_t) read];
+        }
+        write++;
+      }
+      out.size = write;
+    }
+
+    void applyNonEssentialSweeps(ScoreWindow& out) {
+      if (splitIndex > 0) {
+        skipCount(SkipStats::maxScoreSweepWindows);
+      }
+      // The buffer is sorted and already contains only accepted essential
+      // candidates. Sweeping one non-essential clause at a time keeps each child
+      // scorer monotone through the window; compactCompetitive runs before each
+      // sweep and guarantees every removed doc cannot reach theta even if all
+      // remaining unswept clauses hit their window maxima.
+      for (size_t s = splitIndex; s-- > 0; ) {
+        out.size = compactCompetitive(out, nonEssentialPrefixMax[s]);
+        if (out.size == 0) {
+          return;
+        }
+        bool required = s >= firstRequired;
+        if (required) {
+          skipCount(SkipStats::maxScoreRequiredSweeps);
+        }
+        int32_t before = out.size;
+        auto* scorer = scorers[(size_t) windowOrder[s]];
+        out.size = scorer->applyToCandidates(out.docs.data(), out.scores.data(),
+                                             out.size, required);
+        if (required) {
+          recordBufferDrops(before, out.size);
+        }
+      }
+      finishCompetitive(out);
     }
 
     void finalizeCandidates(ScoreWindow& out) {
@@ -2752,21 +2818,19 @@ public:
             break;
           }
           int32_t doc = windowStart + index;
-          float score = scoreCandidate(doc, index);
-          if (score >= minCompetitiveScore) {
-            out.docs[(size_t) out.size] = doc;
-            out.scores[(size_t) out.size] = score;
-            out.size++;
-          }
+          out.docs[(size_t) out.size] = doc;
+          out.scores[(size_t) out.size] = windowScores[(size_t) index];
+          out.size++;
           bits &= bits - 1;
         }
       }
+      applyNonEssentialSweeps(out);
     }
 
     // With one essential clause each candidate surfaces exactly once, so its
-    // blocks stream straight to the output window with no bitset/score-row
-    // accumulation pass. This is the common window shape at low k once the
-    // threshold has risen.
+    // blocks stream straight to the candidate buffer with no bitset/score-row
+    // accumulation pass. The non-essential side is still swept clause-at-a-time
+    // over the whole buffer rather than probed per candidate.
     void fillSingleEssentialCandidates(ScoreWindow& out, DocSet* filter,
                                        const FixedBitSet* domainBits) {
       prepareOutputWindow(out);
@@ -2786,15 +2850,13 @@ public:
           if (!acceptsDoc(filter, domainBits, doc)) {
             continue;
           }
-          float score = scoreCandidateWithBase(doc, blockScores[j]);
-          if (score >= minCompetitiveScore) {
-            assert(out.size < kWindowSize);
-            out.docs[(size_t) out.size] = doc;
-            out.scores[(size_t) out.size] = score;
-            out.size++;
-          }
+          assert(out.size < kWindowSize);
+          out.docs[(size_t) out.size] = doc;
+          out.scores[(size_t) out.size] = blockScores[j];
+          out.size++;
         }
       }
+      applyNonEssentialSweeps(out);
     }
 
     void finalizeBs1Candidates(ScoreWindow& out, DocSet* filter, const FixedBitSet* domainBits) {
