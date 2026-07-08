@@ -3620,6 +3620,70 @@ TEST_F(TermScorerTest, phraseRepeatedTermDedupMatchesPerOccurrenceEnums) {
   EXPECT_LT(dedupDecodes, dupDecodes);
 }
 
+// Phrase frequency semantics: score() drains the full per-doc match count
+// (doMatches stops at the first alignment), and alignment starts may
+// overlap, matching Lucene's exact-phrase freq.
+TEST_F(TermScorerTest, phraseScoreUsesFullOverlappingFrequency) {
+  TestIndex testIndex;
+  TestField f(testIndex, "body_w");
+  f.startIndexing();
+  f.add(0, "a b pad pad pad pad");   // freq 1
+  f.add(1, "a b a b pad pad");       // freq 2, same length as doc 0
+  f.add(2, "a x a x a x");           // self-overlapping pattern host
+  f.add(3, "a a a pad pad pad");     // "a a" freq 2 (overlapping, repeat term)
+  testIndex.flush();
+  f.startReading();
+
+  auto poolFree = testIndex.pool.rewindScopeGuard();
+  Query::Context qContext(testIndex.pool, *testIndex.reader);
+  auto& segment = qContext.topReader.segments()[0];
+
+  auto runFreqs = [&](std::span<std::string_view> terms, std::span<const int32_t> positions) {
+    PhraseQuery phrase("body_w", terms, positions);
+    auto* weight = phrase.createWeight(qContext, Query::NEED_SCORES);
+    auto* scorer = weight->createScorer(testIndex.pool, segment);
+    std::vector<std::pair<int32_t, float>> hits;  // doc -> score
+    std::vector<int32_t> freqs;
+    if (scorer != nullptr) {
+      auto* phraseScorer = (PhraseQuery::Scorer*) scorer;
+      for (int32_t doc = scorer->next(); doc != PostingsReader::END; doc = scorer->next()) {
+        float s = scorer->score();
+        hits.push_back({doc, s});
+        freqs.push_back(phraseScorer->numMatches());
+      }
+    }
+    return std::pair(hits, freqs);
+  };
+
+  std::vector<std::string_view> ab = {"a", "b"};
+  std::vector<int32_t> pos01 = {0, 1};
+  auto [abHits, abFreqs] = runFreqs(ab, pos01);
+  ASSERT_EQ(2u, abHits.size());
+  EXPECT_EQ(1, abFreqs[0]);
+  EXPECT_EQ(2, abFreqs[1]);
+  // Same length docs, freq 2 vs 1: BM25 must rank doc 1 higher.
+  EXPECT_GT(abHits[1].second, abHits[0].second);
+
+  std::vector<std::string_view> axax = {"a", "x", "a", "x"};
+  std::vector<int32_t> pos0123 = {0, 1, 2, 3};
+  auto [axHits, axFreqs] = runFreqs(axax, pos0123);
+  ASSERT_EQ(1u, axHits.size());
+  EXPECT_EQ(2, axHits[0].first);
+  EXPECT_EQ(2, axFreqs[0]);  // bases 0 and 2 overlap
+
+  std::vector<std::string_view> aa = {"a", "a"};
+  auto [aaHits, aaFreqs] = runFreqs(aa, pos01);
+  ASSERT_FALSE(aaHits.empty());
+  bool sawDoc3 = false;
+  for (size_t i = 0; i < aaHits.size(); i++) {
+    if (aaHits[i].first == 3) {
+      sawDoc3 = true;
+      EXPECT_EQ(2, aaFreqs[i]);  // "a a a": bases 0 and 1, repeat term
+    }
+  }
+  EXPECT_TRUE(sawDoc3);
+}
+
 // Fuzz the repeat-dedup scorer against the per-occurrence oracle: random
 // docs over a tiny alphabet (repeats collide constantly), random phrases
 // with repeated terms and gaps, both execution orders. Docs and score bits

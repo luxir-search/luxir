@@ -287,6 +287,9 @@ public:
     int32_t docid = -1;
     int32_t pos = -1;    // position of last match, or END if no more matches.
     int32_t freq = 0;
+    // freq holds only the first match until score() needs the real phrase
+    // frequency; count paths and docs never scored never drain the rest.
+    bool freqComplete = true;
     int32_t largestPossiblePos;   // largest possible position for a match
     int32_t checkedDocid = -1;
     bool checkedMatch = false;
@@ -529,6 +532,7 @@ public:
         checkedMatch = doNextPositionRepeats(
             repeatSlotAdvance(0, positions[0]) - positions[0]) != PostingsReader::END;
       }
+      freqComplete = !checkedMatch;
       return checkedMatch;
     }
 
@@ -682,6 +686,9 @@ public:
       return docid;
     }
 
+    // Full phrase frequency: every alignment start position counts, so
+    // matches of a self-overlapping pattern overlap (Lucene's exact-phrase
+    // semantics: "a x a x" over "a x a x a x" has freq 2).
     int32_t numMatches() {
       while (pos != PostingsReader::END) {
         if (!hasRepeats) {
@@ -690,6 +697,7 @@ public:
           doNextPositionRepeats(repeatSlotNext(0) - positions[0]);
         }
       }
+      freqComplete = true;
       return freq;
     }
 
@@ -750,6 +758,11 @@ public:
 
     float score() override {
       if (simScorer == nullptr) return 0.0f;
+      // BM25 wants the real phrase frequency; doMatches stopped at the first
+      // alignment, so drain the rest of the doc's matches on first read.
+      if (!freqComplete) {
+        numMatches();
+      }
       return simScorer->score((float) freq, lookupNorm(docid));
     }
   };
