@@ -2946,6 +2946,19 @@ public:
         scorer->advance(windowStart);
       }
 
+      if (filter == nullptr) {
+        int32_t n;
+        while ((n = scorer->fillScoreBlock(out.docs.data() + out.size,
+                                           out.scores.data() + out.size,
+                                           kWindowSize - out.size, windowEnd)) > 0) {
+          skipCount(SkipStats::maxScoreDirectFills);
+          out.size += n;
+          assert(out.size <= kWindowSize);
+        }
+        applyNonEssentialSweeps(out);
+        return;
+      }
+
       int32_t blockDocs[Postings::DOCS_BLOCK_SIZE];
       float blockScores[Postings::DOCS_BLOCK_SIZE];
       int32_t n;

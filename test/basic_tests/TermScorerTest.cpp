@@ -1214,6 +1214,46 @@ BulkScorer* createBulkTermDisjunctionScorer(MemPool& pool, Query::Context& qCont
   return supplier->bulkScorer(pool);
 }
 
+struct SingleEssentialWindowRun {
+  std::vector<int32_t> docs;
+  std::vector<float> scores;
+  int64_t directFills = 0;
+  int64_t sweepWindows = 0;
+};
+
+SingleEssentialWindowRun runSingleEssentialBulkWindow(IndexReader& reader,
+                                                      std::span<const std::string_view> terms,
+                                                      int32_t windowStart, int32_t windowEnd,
+                                                      float theta, bool withFilter) {
+  MemPool pool;
+  Query::Context qContext(pool, reader);
+  auto& segment = qContext.topReader.segments()[0];
+  auto* bulk = createBulkTermDisjunctionScorer(pool, qContext, segment, terms);
+  EXPECT_NE(bulk, nullptr);
+
+  std::unique_ptr<DocSet> filter;
+  if (withFilter) {
+    filter = makeEveryNthDocSet(segment.maxDoc(), 1, false);
+  }
+
+  ScoreWindow window;
+  SingleEssentialWindowRun run;
+  SkipStatsGuard stats;
+  if (bulk != nullptr) {
+    int32_t next = bulk->scoreNextWindow(window, filter.get(), windowStart, windowEnd, theta);
+    EXPECT_EQ(next, PostingsReader::END);
+    run.docs.reserve((size_t) window.size);
+    run.scores.reserve((size_t) window.size);
+    for (int32_t i = 0; i < window.size; i++) {
+      run.docs.push_back(window.docs[(size_t) i]);
+      run.scores.push_back(window.scores[(size_t) i]);
+    }
+  }
+  run.directFills = SkipStats::maxScoreDirectFills;
+  run.sweepWindows = SkipStats::maxScoreSweepWindows;
+  return run;
+}
+
 struct DomainCountRun {
   int64_t count = 0;
   std::unique_ptr<DocSet> domain;
@@ -4985,6 +5025,64 @@ TEST_F(TermScorerTest, ScoredWordProbeSkipStatsSeparateFromPackedFallback) {
   }
 }
 
+TEST_F(TermScorerTest, MaxScoreBulkScorerSingleEssentialDirectFillMatchesFilteredWindow) {
+  CollectionHelper helper("main");
+  const int32_t windowStart = DocsEnum::L1_DOCS;
+  const int32_t windowEnd = 2 * DocsEnum::L1_DOCS;
+  const int32_t nDocs = windowEnd + 31;
+  helper.clear();
+  std::vector<Doc> docs;
+  docs.reserve((size_t) nDocs);
+  for (int32_t doc = 0; doc < nDocs; doc++) {
+    std::string body;
+    int32_t local = doc - windowStart;
+    if (doc >= windowStart && doc < windowEnd) {
+      if ((local % 2) == 0) appendRepeatedTerm(body, "direct_a", 1);
+      if ((local % 3) == 0) appendRepeatedTerm(body, "direct_b", 1);
+    } else {
+      appendRepeatedTerm(body, "direct_a", 1);
+      appendRepeatedTerm(body, "direct_b", 1);
+    }
+    appendRepeatedTerm(body, "direct_pad", 3);
+    docs.push_back(flatdoc("id", "direct_" + std::to_string(doc), "body_w", body));
+  }
+  helper.indexAll(docs, UpdateMessage::COMMIT);
+  auto reader = helper.getIndexWriter()->getIndexReader();
+  std::array<std::string_view, 2> terms = {"direct_a", "direct_b"};
+
+  auto scores = exhaustiveWindowScores(*reader, terms, windowStart, windowEnd);
+  float maxSingle = std::numeric_limits<float>::lowest();
+  float minBoth = std::numeric_limits<float>::infinity();
+  for (auto hit : scores) {
+    int32_t local = hit.doc - windowStart;
+    if ((local % 6) == 0) {
+      minBoth = std::min(minBoth, hit.score);
+    } else {
+      maxSingle = std::max(maxSingle, hit.score);
+    }
+  }
+  ASSERT_GT(minBoth, maxSingle);
+  float theta = (maxSingle + minBoth) * 0.5f;
+
+  BulkDomainDriveGuard domainDriveGuard(true);
+  auto unfiltered = runSingleEssentialBulkWindow(*reader, terms, windowStart, windowEnd,
+                                                 theta, false);
+  auto filtered = runSingleEssentialBulkWindow(*reader, terms, windowStart, windowEnd,
+                                               theta, true);
+
+  EXPECT_GT(unfiltered.directFills, 0);
+  EXPECT_EQ(filtered.directFills, 0);
+  EXPECT_GT(unfiltered.sweepWindows, 0);
+  EXPECT_GT(filtered.sweepWindows, 0);
+  ASSERT_EQ(unfiltered.docs, filtered.docs);
+  ASSERT_EQ(unfiltered.scores.size(), filtered.scores.size());
+  for (size_t i = 0; i < unfiltered.scores.size(); i++) {
+    EXPECT_EQ(std::bit_cast<uint32_t>(unfiltered.scores[i]),
+              std::bit_cast<uint32_t>(filtered.scores[i])) << "i=" << i;
+  }
+  helper.clear();
+}
+
 TEST_F(TermScorerTest, MaxScoreBulkScorerRequiredPromotionMakesHighThetaTwoClauseConjunction) {
   CollectionHelper helper("main");
   const int32_t windowStart = DocsEnum::L1_DOCS;
@@ -5381,4 +5479,3 @@ TEST_F(TermScorerTest, interleavedScorersForSameTermAreIndependent) {
   // Pre-fix this cloned the exhausted cached enum and counted far fewer than N.
   EXPECT_EQ(countAll("needle"), (int64_t) N);
 }
-
