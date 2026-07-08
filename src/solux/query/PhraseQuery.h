@@ -83,6 +83,13 @@ public:
       if (segFieldInfo == nullptr) {
         return nullptr;
       }
+      // TODO: share one enum across repeated terms. A phrase like
+      // "to be or not to be" opens six postings+positions streams where four
+      // would do. The half measure dedups only the doc-level conjunction
+      // (each distinct term advances once); but since positions decode per
+      // (enum, doc) into a buffer anyway, the deduped enum's buffer can serve
+      // every offset that term covers - decode docs AND positions once, with
+      // per-slot cursors over the shared buffer.
       auto docsEnums = targetPool.make_span<DocsEnum*>(cachedTermInfos.size());
       for (int i = 0; i < cachedTermInfos.size(); i++) {
         docsEnums[i] = cachedTermInfos[i]->useDocsEnum(targetPool, segment);
