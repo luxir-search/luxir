@@ -296,6 +296,88 @@ TEST_F(BooleanFuzzTest, phraseMultiDoc) {
   }
 }
 
+// Multi-member exclusion and rank-only optional sides advance their
+// disjunction per candidate (DisjunctionScorer::advance): drive that over
+// full postings blocks with members that exhaust mid-stream, against a
+// counted oracle.
+TEST_F(BooleanFuzzTest, negatedAndRankOnlyDisjunctionAdvanceMatchesOracle) {
+  helper.clear();
+  const int32_t numDocs = 2 * DocsEnum::L1_DOCS + 300;
+  int64_t expectNegated = 0;
+  int64_t expectMandOpt = 0;
+  std::vector<Doc> docs;
+  docs.reserve((size_t) numDocs);
+  for (int32_t doc = 0; doc < numDocs; doc++) {
+    std::string body;
+    bool req = (doc % 3) == 1;
+    bool ex1 = (doc % 4) != 2;
+    // ex2 only exists in the first quarter: its enum hits END mid-stream.
+    bool ex2 = doc < numDocs / 4 && (doc % 5) == 0;
+    if (req) body += " na_req";
+    if (ex1) body += " na_ex1";
+    if (ex2) body += " na_ex2";
+    if ((doc % 7) == 3) body += " na_opt1";
+    if ((doc % 11) == 6) body += " na_opt2";
+    body += " filler";
+    docs.push_back(flatdoc("id", "na" + std::to_string(doc), "body_w", body));
+    if (req && !ex1 && !ex2) expectNegated++;
+    if (req) expectMandOpt++;
+  }
+  helper.indexAll(docs, UpdateMessage::COMMIT);
+
+  auto countOf = [&](api::Query q) {
+    auto req = localReq(helper.getSearchEngine());
+    req->collection("main");
+    auto& cur = req->topDocs("q");
+    cur.getNumber().limit(10);
+    cur.rawQuery() = q;
+    req->execute(false);
+    return req->getMatchCount();
+  };
+
+  {
+    auto req = localReq(helper.getSearchEngine());
+    auto& cur = req->topDocs("q");
+    auto q = qb::boolean(cur.mr(),
+        /*required=*/{qb::match(cur.mr(), "body_w", "na_req")},
+        /*optional=*/{},
+        /*prohibited=*/{qb::match(cur.mr(), "body_w", "na_ex1"),
+                        qb::match(cur.mr(), "body_w", "na_ex2")});
+    EXPECT_EQ(expectNegated, countOf(q));
+  }
+  {
+    auto req = localReq(helper.getSearchEngine());
+    auto& cur = req->topDocs("q");
+    // Rank-only optionals: match count is the required side's alone, but
+    // scoring probes the optional disjunction per candidate.
+    auto q = qb::boolean(cur.mr(),
+        /*required=*/{qb::match(cur.mr(), "body_w", "na_req")},
+        /*optional=*/{qb::match(cur.mr(), "body_w", "na_opt1"),
+                      qb::match(cur.mr(), "body_w", "na_opt2")});
+    EXPECT_EQ(expectMandOpt, countOf(q));
+  }
+  {
+    // Nested OR under AND, count-only (no scores): the nested clause is a
+    // plain DisjunctionScorer inside a ConjunctionScorer, driven with
+    // interleaved next()/advance() including advance-before-first-next.
+    int64_t expectNested = 0;
+    for (int32_t doc = 0; doc < numDocs; doc++) {
+      bool isReq = (doc % 3) == 1;
+      bool o1 = (doc % 7) == 3;
+      bool o2 = (doc % 11) == 6;
+      if (isReq && (o1 || o2)) expectNested++;
+    }
+    auto req = localReq(helper.getSearchEngine());
+    auto& cur = req->topDocs("q");
+    std::vector<api::Query> nestedOr = {qb::match(cur.mr(), "body_w", "na_opt1"),
+                                        qb::match(cur.mr(), "body_w", "na_opt2")};
+    auto q = qb::boolean(cur.mr(),
+        /*required=*/{qb::match(cur.mr(), "body_w", "na_req"),
+                      qb::boolean(cur.mr(), /*required=*/{}, /*optional=*/nestedOr)});
+    EXPECT_EQ(expectNested, countOf(q));
+  }
+}
+
 TEST_F(BooleanFuzzTest, randomBooleanMatchesOracle) {
   helper.clear();
 

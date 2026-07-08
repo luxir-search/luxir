@@ -1481,6 +1481,25 @@ public:
       return docid;
     }
 
+    // Advance every member below target through its own advance (block
+    // skips) instead of the base linear next() walk. Members are touched at
+    // most once: each surfaces at the top while behind, advances to >=
+    // target, and sifts down. Without this, per-candidate probes of a
+    // disjunction (the MandNot exclusion side, the MandOpt rank-only side)
+    // walk every doc of every member between candidates.
+    int32_t advance(int32_t target) override {
+      assert(docid < target);
+      while (pq.size() > 0 && pq.top().docId() < target) {
+        if (pq.top().advance(target) == solux::PostingsReader::END) {
+          pq.removeTop();
+        } else {
+          pq.updateTop();
+        }
+      }
+      docid = pq.size() > 0 ? pq.top().docId() : solux::PostingsReader::END;
+      return docid;
+    }
+
     /// doc we are positioned on
     int32_t docId() override {
       return docid;
