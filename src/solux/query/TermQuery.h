@@ -181,16 +181,21 @@ public:
     solux::Similarity::BM25Scorer* simScorer;
     ImpactsIndex impacts;
     float minCompetitiveScore = 0.0f;
-    // Shallow cursor: the block containing the last advanceShallow target,
-    // with its lastDoc/impact cached so same-block targets (low-df clauses
-    // whose blocks span many caller windows) answer without touching chunks.
-    // shallowUpTo is -1 whenever shallowBlock does not name a valid block.
+    enum class ShallowGranularity { NONE, GROUP, BLOCK };
+    // Shallow cursor: the group or block containing the last advanceShallow
+    // target, with its lastDoc/impact cached so repeated targets answer
+    // without touching chunks.  GROUP means the group is still unparsed and
+    // shallowImpact is the group frontier bound. BLOCK means the group is
+    // parsed and shallowImpact is the exact block bound. shallowUpTo is -1
+    // whenever the cursor is invalid.
     int32_t shallowBlock = -1;
+    int32_t shallowMainGroup = -1;
     int32_t shallowUpTo = -1;
     int32_t shallowTarget = -1;
     float shallowImpact = 0.0f;
+    ShallowGranularity shallowGranularity = ShallowGranularity::NONE;
     // Group cursor for the setup-only bound methods; independent of the
-    // block-granular shallow cursor above.
+    // main shallow cursor above.
     int32_t shallowGroup = -1;
     // Query-time multiplier for boosted term clauses, e.g. fuzzy rewrites.
     float boost;
@@ -439,6 +444,64 @@ public:
       minCompetitiveScore = minScore;
     }
 
+    int32_t parsedBlockContainingClamped(int32_t group, int32_t target) const {
+      int32_t block = impacts.blockContainingInParsedGroup(group, target);
+      int32_t last = impacts.groupLastBlock(group);
+      return block > last ? last : block;
+    }
+
+    int32_t rangeStartDoc() const {
+      return shallowGranularity == ShallowGranularity::NONE ? docsEnum.docId() : shallowTarget;
+    }
+
+    void resetShallowCursor() {
+      shallowBlock = -1;
+      shallowMainGroup = -1;
+      shallowUpTo = -1;
+      shallowImpact = 0.0f;
+      shallowGranularity = ShallowGranularity::NONE;
+    }
+
+    void setShallowToParsedBlock(int32_t target, int32_t group) {
+      shallowMainGroup = group;
+      shallowBlock = parsedBlockContainingClamped(group, target);
+      shallowUpTo = impacts.parsedBlockLastDoc(shallowBlock);
+      shallowImpact = impacts.parsedBlockImpact(shallowBlock);
+      shallowGranularity = ShallowGranularity::BLOCK;
+    }
+
+    void setShallowToGroup(int32_t group) {
+      shallowMainGroup = group;
+      shallowBlock = -1;
+      shallowUpTo = impacts.groupLastDoc(group);
+      shallowImpact = impacts.maxGroupImpactInRange(group, group);
+      shallowGranularity = ShallowGranularity::GROUP;
+      skipCount(SkipStats::impactGroupShallowAnswers);
+    }
+
+    bool refreshShallowIfParsed() {
+      if (shallowGranularity == ShallowGranularity::GROUP && shallowMainGroup >= 0
+          && impacts.groupParsed(shallowMainGroup)) {
+        setShallowToParsedBlock(shallowTarget, shallowMainGroup);
+        return true;
+      }
+      return false;
+    }
+
+    int32_t rangeStartBlockNoParse(int32_t group, int32_t startDoc) const {
+      if (!impacts.groupParsed(group)) {
+        return impacts.groupFirstBlock(group);
+      }
+      return parsedBlockContainingClamped(group, startDoc);
+    }
+
+    int32_t rangeEndBlockNoParse(int32_t group, int32_t upTo) const {
+      if (!impacts.groupParsed(group) || upTo > impacts.groupLastDoc(group)) {
+        return impacts.groupLastBlock(group);
+      }
+      return parsedBlockContainingClamped(group, upTo);
+    }
+
     // Bounds scores over [shallow target, upTo] once advanceShallow() has been
     // called (the Lucene ImpactsDISI contract - callers only score docs at or
     // past their shallow target); before any advanceShallow it bounds from the
@@ -450,24 +513,68 @@ public:
         return std::numeric_limits<float>::infinity();
       }
 
-      // Bound contained in the cached shallow block: answered from the cursor
-      // (the value maxImpactInRange(shallowBlock, shallowBlock) would return).
-      // Conjunction windows end at the minimum clause shallow-block end, so
-      // this is their common shape.
+      refreshShallowIfParsed();
+
+      // Bound contained in the cached shallow range: answered from the cursor.
+      // GROUP is a coarse frontier bound; BLOCK is the exact parsed block
+      // bound. A parsed group is refreshed above before this fast path.
       if (upTo <= shallowUpTo) {
         return shallowImpact;
       }
 
-      int32_t startBlock = shallowBlock >= 0 ? shallowBlock
-                                             : blockContaining(docsEnum.docId());
+      int32_t groupCount = impacts.numGroups();
+      int32_t startDoc = rangeStartDoc();
+      int32_t startGroup = shallowGranularity == ShallowGranularity::NONE
+          ? impacts.groupContainingFrom(-1, startDoc)
+          : shallowMainGroup;
+      if (startGroup >= groupCount) {
+        return std::numeric_limits<float>::infinity();
+      }
+
+      int32_t upGroup;
+      if (upTo <= impacts.groupLastDoc(startGroup)) {
+        upGroup = startGroup;
+      } else {
+        upGroup = impacts.groupContainingFrom(startGroup, upTo);
+        if (upGroup >= groupCount) {
+          upGroup = groupCount - 1;
+        }
+      }
+      if (upGroup < startGroup) {
+        return std::numeric_limits<float>::infinity();
+      }
+
+      int32_t startBlock = rangeStartBlockNoParse(startGroup, startDoc);
+      int32_t upBlock = rangeEndBlockNoParse(upGroup, upTo);
+      if (upBlock < startBlock) {
+        return std::numeric_limits<float>::infinity();
+      }
+      if (startBlock == impacts.groupFirstBlock(startGroup)
+          && upBlock == impacts.groupLastBlock(upGroup)) {
+        if (upGroup == groupCount - 1) {
+          return impacts.maxGroupImpactFrom(startGroup);
+        }
+        return impacts.maxGroupImpactInRange(startGroup, upGroup);
+      }
+      return impacts.maxImpactInRangeNoParse(startBlock, upBlock);
+    }
+
+    float refineMaxScore(int32_t upTo) override {
+      if (!hasImpacts()) {
+        return std::numeric_limits<float>::infinity();
+      }
+      skipCount(SkipStats::impactRefinesTriggered);
+
+      int32_t startDoc = rangeStartDoc();
+      int32_t startBlock = shallowGranularity == ShallowGranularity::BLOCK
+          ? shallowBlock
+          : impacts.blockContainingFrom(shallowBlock, startDoc);
       if (startBlock >= impacts.blockCount()) {
         return std::numeric_limits<float>::infinity();
       }
 
-      // Fast path for the block-max hop pattern: upTo inside the shallow block
-      // itself (one array read, no search).
       int32_t upBlock;
-      if (upTo <= impacts.lastDoc(startBlock)) {
+      if (upTo <= impacts.parsedBlockLastDoc(startBlock)) {
         upBlock = startBlock;
       } else {
         upBlock = impacts.blockContainingFrom(startBlock, upTo);
@@ -478,10 +585,9 @@ public:
       if (upBlock < startBlock) {
         return std::numeric_limits<float>::infinity();
       }
-      if (upBlock == impacts.blockCount() - 1) {
-        return impacts.maxImpactFrom(startBlock);
-      }
-      return impacts.maxImpactInRange(startBlock, upBlock);
+      float bound = impacts.maxImpactInRangeParsed(startBlock, upBlock);
+      refreshShallowIfParsed();
+      return bound;
     }
 
     float getMaxScoreForSetup(int32_t upTo) override {
@@ -526,25 +632,26 @@ public:
       if (!hasImpacts()) {
         return PostingsReader::END;
       }
-      // Same-block fast path: a forward target still under the cached block's
-      // lastDoc stays in that block (the previous target already lay inside
-      // it), so nothing needs to be searched or parsed.  The monotone guard
-      // matters: a backward target under shallowUpTo could belong to an
-      // earlier block.
-      if (target >= shallowTarget && target <= shallowUpTo) {
+      // Same-range fast path.  A cached GROUP range is refreshed if another
+      // caller refined it since it was cached.
+      if (target >= shallowTarget && target <= shallowUpTo && !refreshShallowIfParsed()) {
         shallowTarget = target;
         skipCount(SkipStats::shallowCacheHits);
         return shallowUpTo;
       }
       skipCount(SkipStats::shallowCursorMoves);
       shallowTarget = target;
-      shallowBlock = impacts.blockContainingFrom(shallowBlock, target);
-      if (shallowBlock >= impacts.blockCount()) {
-        shallowUpTo = -1;
+      shallowMainGroup = impacts.groupContainingFrom(shallowMainGroup, target);
+      if (shallowMainGroup >= impacts.numGroups()) {
+        resetShallowCursor();
+        shallowTarget = target;
         return PostingsReader::END;
       }
-      shallowUpTo = impacts.lastDoc(shallowBlock);
-      shallowImpact = impacts.impact(shallowBlock);
+      if (impacts.groupParsed(shallowMainGroup)) {
+        setShallowToParsedBlock(target, shallowMainGroup);
+      } else {
+        setShallowToGroup(shallowMainGroup);
+      }
       return shallowUpTo;
     }
 

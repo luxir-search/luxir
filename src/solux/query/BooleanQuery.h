@@ -30,6 +30,9 @@ public:
   // clause verifies inside its own advance) instead of two-phase (defer matches
   // until the approximations agree). For benchmarking the two-phase win only.
   static inline bool disableTwoPhaseForTests = false;
+  // Pull-conjunction refinement band: refine bounds to block granularity when
+  // theta reaches this fraction of the group-granular range bound.
+  static constexpr double kRefineBeta = 0.75;
 
   BooleanQuery(std::span<Query*> mandatory, std::span<Query*> optional, std::span<Query*> prohibited,
                std::span<Query*> filter, int minShouldMatch = 0)
@@ -625,6 +628,10 @@ public:
       return mandScorer->getMaxScore(upTo) + optScorer->getMaxScore(upTo);
     }
 
+    float refineMaxScore(int32_t upTo) override {
+      return mandScorer->refineMaxScore(upTo) + optScorer->refineMaxScore(upTo);
+    }
+
     int32_t advanceShallow(int32_t target) override {
       return mandScorer->advanceShallow(target);
     }
@@ -735,11 +742,57 @@ public:
         for (auto* scorer : scorers) {
           upTo = std::min(upTo, scorer->advanceShallow(target));
         }
-        float maxScore = 0.0f;
+        double maxScore = 0.0;
         for (auto* scorer : scorers) {
-          maxScore += scorer->getMaxScore(upTo);
+          float scorerMax = scorer->getMaxScore(upTo);
+          if (!std::isfinite(scorerMax)) {
+            maxScore = std::numeric_limits<double>::infinity();
+            break;
+          }
+          maxScore += (double) scorerMax;
         }
-        if (maxScore >= minCompetitiveScore) {
+        // The pull conjunction refines near-theta ranges to block granularity:
+        // its members can be two-phase (phrases), so a skipped range saves
+        // position verification, unlike the all-term bulk scorer where block
+        // refinement measured as a net loss and stays group-granular.
+        bool competitive = maxScore >= (double) minCompetitiveScore;
+        if (competitive && std::isfinite(maxScore)
+            && (double) minCompetitiveScore >= kRefineBeta * maxScore) {
+          double refinedMax = maxScore;
+          for (auto* scorer : scorers) {
+            float cheapMax = scorer->getMaxScore(upTo);
+            float refined = scorer->refineMaxScore(upTo);
+            if (!std::isfinite(refined)) {
+              refinedMax = std::numeric_limits<double>::infinity();
+              break;
+            }
+            refinedMax += (double) refined - (double) cheapMax;
+            if (refinedMax < (double) minCompetitiveScore) {
+              competitive = false;
+              break;
+            }
+          }
+          if (competitive) {
+            int32_t refinedUpTo = solux::PostingsReader::END;
+            for (auto* scorer : scorers) {
+              refinedUpTo = std::min(refinedUpTo, scorer->advanceShallow(target));
+            }
+            if (refinedUpTo < upTo) {
+              upTo = refinedUpTo;
+              refinedMax = 0.0;
+              for (auto* scorer : scorers) {
+                float refined = scorer->refineMaxScore(upTo);
+                if (!std::isfinite(refined)) {
+                  refinedMax = std::numeric_limits<double>::infinity();
+                  break;
+                }
+                refinedMax += (double) refined;
+              }
+              competitive = refinedMax >= (double) minCompetitiveScore;
+            }
+          }
+        }
+        if (competitive) {
           competitiveUpTo = upTo;
           return target;
         }
@@ -877,6 +930,14 @@ public:
       float sum = 0.0f;
       for (auto* scorer : scorers) {
         sum += scorer->getMaxScore(upTo);
+      }
+      return sum;
+    }
+
+    float refineMaxScore(int32_t upTo) override {
+      float sum = 0.0f;
+      for (auto* scorer : scorers) {
+        sum += scorer->refineMaxScore(upTo);
       }
       return sum;
     }
@@ -1069,6 +1130,9 @@ public:
           windowMax[c] = scorerGetMaxScore<TermFast>(c, upTo);
           suffixMax[c] = suffixMax[c + 1] + (double) windowMax[c];
         }
+        // Group-granular bounds only (see ConjunctionScorer::advanceCompetitive
+        // note): block-level refinement measured as a net loss here - the
+        // parse plus the 32x window shrink cost more than the added skips.
         if (suffixMax[0] * scoreBoundFactor < (double) this->minCompetitiveScore) {
           // Nothing in this window can compete: hop the lead without touching
           // the other clauses or any scoring.
@@ -1803,6 +1867,18 @@ public:
       float sum = 0.0f;
       for (auto* scorer : scorers) {
         float maxScore = scorer->getMaxScore(upTo);
+        if (!std::isfinite(maxScore)) {
+          return std::numeric_limits<float>::infinity();
+        }
+        sum += maxScore;
+      }
+      return sum;
+    }
+
+    float refineMaxScore(int32_t upTo) override {
+      float sum = 0.0f;
+      for (auto* scorer : scorers) {
+        float maxScore = scorer->refineMaxScore(upTo);
         if (!std::isfinite(maxScore)) {
           return std::numeric_limits<float>::infinity();
         }
@@ -2839,6 +2915,26 @@ public:
       }
       // Same float-accumulation headroom as the pivot bound, so this is a true upper
       // bound on score() when the scorer nests under another impact scorer.
+      sum *= scoreBoundFactor;
+      if (!std::isfinite(sum) || sum > (double) std::numeric_limits<float>::max()) {
+        return std::numeric_limits<float>::infinity();
+      }
+      float ret = (float) sum;
+      if ((double) ret < sum) {
+        ret = std::nextafter(ret, std::numeric_limits<float>::infinity());
+      }
+      return ret;
+    }
+
+    float refineMaxScore(int32_t upTo) override {
+      double sum = 0.0;
+      for (auto* scorer : scorers) {
+        float maxScore = scorer->refineMaxScore(upTo);
+        if (!std::isfinite(maxScore)) {
+          return std::numeric_limits<float>::infinity();
+        }
+        sum += (double) maxScore;
+      }
       sum *= scoreBoundFactor;
       if (!std::isfinite(sum) || sum > (double) std::numeric_limits<float>::max()) {
         return std::numeric_limits<float>::infinity();

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <algorithm>
+#include <limits>
 #include <vector>
 
 #include "solux/reader/DocsEnum.h"
@@ -54,6 +55,10 @@ class ImpactsIndex {
     return std::min(GROUP, count - g * GROUP);
   }
 
+  float scoreImpact(int32_t tf, int32_t norm) const {
+    return boost * simScorer->score((float) tf, (int64_t) norm);
+  }
+
   const Chunk& ensureGroup(int32_t g) const {
     assert(g >= 0 && g < groupCount);
     if (chunks[g] != nullptr) {
@@ -77,13 +82,11 @@ class ImpactsIndex {
           if (useFrontierBound && !frontierSpilled && !tfs.empty()) {
             float maxImpact = 0.0f;
             for (size_t j = 0; j < tfs.size(); j++) {
-              maxImpact = std::max(maxImpact, boost * simScorer->score((float) tfs[j],
-                                                                       (int64_t) norms[j]));
+              maxImpact = std::max(maxImpact, scoreImpact(tfs[j], norms[j]));
             }
             chunk->impacts[block] = maxImpact;
           } else {
-            chunk->impacts[block] =
-                boost * simScorer->score((float) maxTf, (int64_t) minNorm);
+            chunk->impacts[block] = scoreImpact(maxTf, minNorm);
           }
         }
     );
@@ -130,13 +133,13 @@ public:
         float maxImpact = 0.0f;
         for (int32_t j = fStart; j < fEnd; j++) {
           maxImpact = std::max(
-              maxImpact, boost * simScorer->score((float) groups.frontiers.tfs[(size_t) j],
-                                                  (int64_t) groups.frontiers.norms[(size_t) j]));
+              maxImpact, scoreImpact(groups.frontiers.tfs[(size_t) j],
+                                     groups.frontiers.norms[(size_t) j]));
         }
         groupUpper[g] = maxImpact;
       } else {
-        groupUpper[g] = boost * simScorer->score((float) groups.spanMaxTfs[(size_t) g],
-                                                 (int64_t) groups.spanMinNorms[(size_t) g]);
+        groupUpper[g] = scoreImpact(groups.spanMaxTfs[(size_t) g],
+                                    groups.spanMinNorms[(size_t) g]);
       }
       chunks[g] = nullptr;
     }
@@ -193,6 +196,44 @@ public:
   int32_t groupLastDoc(int32_t group) const {
     assert(group >= 0 && group < groupCount);
     return groupLastDocs[group];
+  }
+
+  bool groupParsed(int32_t group) const {
+    assert(group >= 0 && group < groupCount);
+    return chunks[group] != nullptr;
+  }
+
+  int32_t groupFirstBlock(int32_t group) const {
+    assert(group >= 0 && group < groupCount);
+    return group * GROUP;
+  }
+
+  int32_t groupLastBlock(int32_t group) const {
+    assert(group >= 0 && group < groupCount);
+    return group * GROUP + blockCountForGroup(group) - 1;
+  }
+
+  int32_t blockContainingInParsedGroup(int32_t group, int32_t target) const {
+    assert(group >= 0 && group < groupCount);
+    assert(chunks[group] != nullptr);
+    const Chunk& chunk = *chunks[group];
+    const int32_t* it = std::lower_bound(chunk.lastDocs, chunk.lastDocs + chunk.blockCount,
+                                         target);
+    return group * GROUP + (int32_t) (it - chunk.lastDocs);
+  }
+
+  int32_t parsedBlockLastDoc(int32_t block) const {
+    assert(block >= 0 && block < count);
+    int32_t group = block / GROUP;
+    assert(chunks[group] != nullptr);
+    return chunks[group]->lastDocs[block % GROUP];
+  }
+
+  float parsedBlockImpact(int32_t block) const {
+    assert(block >= 0 && block < count);
+    int32_t group = block / GROUP;
+    assert(chunks[group] != nullptr);
+    return chunks[group]->impacts[block % GROUP];
   }
 
   float maxGroupImpactFrom(int32_t group) const {
@@ -261,6 +302,53 @@ public:
     const Chunk& tail = ensureGroup(gTo);
     for (int32_t i = 0; i <= toBlock % GROUP; i++) {
       bound = std::max(bound, tail.impacts[i]);
+    }
+    return bound;
+  }
+
+  // Max impact over blocks [fromBlock, toBlock] without materializing any
+  // additional group. Parsed groups use their block impacts; unparsed groups
+  // fall back to their group frontier bound.
+  float maxImpactInRangeNoParse(int32_t fromBlock, int32_t toBlock) const {
+    assert(fromBlock >= 0 && fromBlock <= toBlock && toBlock < count);
+    int32_t gFrom = fromBlock / GROUP;
+    int32_t gTo = toBlock / GROUP;
+    float bound = 0.0f;
+    bool usedGroupBound = false;
+    for (int32_t g = gFrom; g <= gTo; g++) {
+      int32_t first = std::max(fromBlock, groupFirstBlock(g));
+      int32_t last = std::min(toBlock, groupLastBlock(g));
+      if (chunks[g] == nullptr) {
+        bound = std::max(bound, groupUpper[g]);
+        usedGroupBound = true;
+        continue;
+      }
+      const Chunk& chunk = *chunks[g];
+      for (int32_t block = first; block <= last; block++) {
+        bound = std::max(bound, chunk.impacts[block % GROUP]);
+      }
+    }
+    if (usedGroupBound) {
+      skipCount(SkipStats::impactGroupBoundCalls);
+      skipCount(SkipStats::impactGroupBoundNoL0);
+    }
+    return bound;
+  }
+
+  // Tight block-granular bound over [fromBlock, toBlock]. This is the explicit
+  // refinement path: every covering group may be parsed.
+  float maxImpactInRangeParsed(int32_t fromBlock, int32_t toBlock) const {
+    assert(fromBlock >= 0 && fromBlock <= toBlock && toBlock < count);
+    int32_t gFrom = fromBlock / GROUP;
+    int32_t gTo = toBlock / GROUP;
+    float bound = 0.0f;
+    for (int32_t g = gFrom; g <= gTo; g++) {
+      const Chunk& chunk = ensureGroup(g);
+      int32_t first = std::max(fromBlock, groupFirstBlock(g));
+      int32_t last = std::min(toBlock, groupLastBlock(g));
+      for (int32_t block = first; block <= last; block++) {
+        bound = std::max(bound, chunk.impacts[block % GROUP]);
+      }
     }
     return bound;
   }

@@ -637,6 +637,9 @@ public:
       unused(upTo);
       return std::numeric_limits<float>::infinity();
     }
+    virtual float refineMaxScore(int32_t upTo) {
+      return getMaxScore(upTo);
+    }
     virtual int32_t advanceShallow(int32_t target) {
       unused(target);
       return PostingsReader::END;

@@ -1718,15 +1718,15 @@ TEST_F(TermScorerTest, termImpactMaxScoreBounds) {
       boundWeight->createScorer(testIndex.pool, segment));
   ASSERT_NE(shallowScorer, nullptr);
   ASSERT_EQ(shallowScorer->docId(), -1);
-  auto expectedBlockLastDoc = [&](int32_t target) {
+  auto expectedGroupLastDoc = [&](int32_t target) {
     if (target >= N) {
       return PostingsReader::END;
     }
-    int32_t block = target / Postings::DOCS_BLOCK_SIZE;
-    return std::min(N - 1, (block + 1) * Postings::DOCS_BLOCK_SIZE - 1);
+    int32_t group = target / DocsEnum::L1_DOCS;
+    return std::min(N - 1, (group + 1) * DocsEnum::L1_DOCS - 1);
   };
   for (int32_t target : {0, 1, 127, 128, 129, 3 * Postings::DOCS_BLOCK_SIZE + 5, N - 1}) {
-    EXPECT_EQ(shallowScorer->advanceShallow(target), expectedBlockLastDoc(target)) << target;
+    EXPECT_EQ(shallowScorer->advanceShallow(target), expectedGroupLastDoc(target)) << target;
     EXPECT_EQ(shallowScorer->docId(), -1);
   }
   EXPECT_EQ(shallowScorer->advanceShallow(N + 10), PostingsReader::END);
@@ -1741,7 +1741,7 @@ TEST_F(TermScorerTest, termImpactMaxScoreBounds) {
   EXPECT_EQ(rareScorer->advanceShallow(0), PostingsReader::END);
 }
 
-TEST_F(TermScorerTest, termImpactShallowMaxScoreUsesWindowBlocks) {
+TEST_F(TermScorerTest, termImpactRefineMaxScoreUsesWindowBlocks) {
   const int32_t N = 5 * Postings::DOCS_BLOCK_SIZE;
   TestIndex testIndex;
   TestField f(testIndex, "body_w");
@@ -1780,8 +1780,12 @@ TEST_F(TermScorerTest, termImpactShallowMaxScoreUsesWindowBlocks) {
   int32_t ws = 2 * Postings::DOCS_BLOCK_SIZE;
   int32_t we = 3 * Postings::DOCS_BLOCK_SIZE - 1;
   ASSERT_EQ(windowScorer->advance(ws), ws);
-  ASSERT_EQ(windowScorer->advanceShallow(ws), we);
+  ASSERT_EQ(windowScorer->advanceShallow(ws), N - 1);
+  float cheapWindowMax = windowScorer->getMaxScore(we);
+  EXPECT_FLOAT_EQ(cheapWindowMax, globalMax);
 
+  float refinedMax = windowScorer->refineMaxScore(we);
+  ASSERT_EQ(windowScorer->advanceShallow(ws), we);
   int32_t startBlock = windowScorer->blockContaining(ws);
   int32_t endBlock = windowScorer->blockContaining(we);
   ASSERT_LT(endBlock, windowScorer->impacts.blockCount());
@@ -1790,10 +1794,63 @@ TEST_F(TermScorerTest, termImpactShallowMaxScoreUsesWindowBlocks) {
     bruteMax = std::max(bruteMax, windowScorer->impacts.impact(block));
   }
 
-  float windowMax = windowScorer->getMaxScore(we);
-  EXPECT_FLOAT_EQ(windowMax, bruteMax);
-  EXPECT_LE(windowMax, globalMax);
-  EXPECT_LT(windowMax, globalMax);
+  EXPECT_FLOAT_EQ(refinedMax, bruteMax);
+  EXPECT_LE(refinedMax, cheapWindowMax);
+  EXPECT_LT(refinedMax, cheapWindowMax);
+}
+
+TEST_F(TermScorerTest, termImpactGroupShallowRefreshesAfterRefine) {
+  const int32_t N = 5 * Postings::DOCS_BLOCK_SIZE;
+  TestIndex testIndex;
+  TestField f(testIndex, "body_w");
+  f.startIndexing();
+
+  for (int32_t doc = 0; doc < N; doc++) {
+    int32_t block = doc / Postings::DOCS_BLOCK_SIZE;
+    int32_t tf = block == 0 ? 40 : block == 2 ? 3 : 2;
+    int32_t len = block == 0 ? tf : 120;
+    std::string text;
+    for (int32_t i = 0; i < tf; i++) text += "refreshimpact ";
+    for (int32_t i = tf; i < len; i++) text += "filler ";
+    f.add(doc, text);
+  }
+  testIndex.flush();
+  f.startReading();
+
+  auto poolFree = testIndex.pool.rewindScopeGuard();
+  Query::Context qContext(testIndex.pool, *testIndex.reader);
+  auto& segment = qContext.topReader.segments()[0];
+  TermQuery query("body_w", "refreshimpact");
+  auto* weight = query.createWeight(qContext, Query::NEED_SCORES);
+
+  bool savedStats = SkipStats::enabled;
+  SkipStats::enabled = true;
+  SkipStats::reset();
+
+  auto* scorer = dynamic_cast<TermQuery::Scorer*>(
+      weight->createScorer(testIndex.pool, segment));
+  ASSERT_NE(scorer, nullptr);
+
+  int32_t target = 2 * Postings::DOCS_BLOCK_SIZE + 7;
+  int32_t blockEnd = 3 * Postings::DOCS_BLOCK_SIZE - 1;
+  ASSERT_EQ(scorer->advanceShallow(target), N - 1);
+  EXPECT_EQ(SkipStats::impactL0GroupParses, 0);
+  EXPECT_GT(SkipStats::impactGroupShallowAnswers, 0);
+
+  float cheapMax = scorer->getMaxScore(blockEnd);
+  EXPECT_EQ(SkipStats::impactL0GroupParses, 0);
+
+  float refinedMax = scorer->refineMaxScore(blockEnd);
+  EXPECT_EQ(SkipStats::impactRefinesTriggered, 1);
+  EXPECT_EQ(SkipStats::impactL0GroupParses, 1);
+  EXPECT_LT(refinedMax, cheapMax);
+
+  int64_t cacheHitsBefore = SkipStats::shallowCacheHits;
+  EXPECT_EQ(scorer->advanceShallow(target), blockEnd);
+  EXPECT_GT(SkipStats::shallowCacheHits, cacheHitsBefore);
+  EXPECT_FLOAT_EQ(scorer->getMaxScore(blockEnd), refinedMax);
+
+  SkipStats::enabled = savedStats;
 }
 
 TEST_F(TermScorerTest, termImpactFrontierIsExactBlockMax) {
@@ -2135,6 +2192,47 @@ TEST_F(TermScorerTest, termImpactTopKSkippingMatchesExhaustive) {
     }
     EXPECT_LT(prunedCollector.totalHits(), exhaustiveCollector.totalHits()) << "k=" << k;
   }
+}
+
+TEST_F(TermScorerTest, phraseImpactShallowStillUsesBlockGranularity) {
+  const int32_t N = 5 * Postings::DOCS_BLOCK_SIZE;
+  TestIndex testIndex;
+  TestField f(testIndex, "body_w");
+  f.startIndexing();
+
+  for (int32_t doc = 0; doc < N; doc++) {
+    std::string text = "alpha beta ";
+    for (int32_t i = 0; i < 20 + (doc % 7); i++) {
+      text += "pad ";
+    }
+    f.add(doc, text);
+  }
+  testIndex.flush();
+  f.startReading();
+
+  auto poolFree = testIndex.pool.rewindScopeGuard();
+  Query::Context qContext(testIndex.pool, *testIndex.reader);
+  auto& segment = qContext.topReader.segments()[0];
+  std::vector<std::string_view> terms = {"alpha", "beta"};
+  std::vector<int32_t> positions = {0, 1};
+  PhraseQuery query("body_w", terms, positions);
+  auto* weight = query.createWeight(qContext, Query::NEED_SCORES);
+
+  bool savedStats = SkipStats::enabled;
+  SkipStats::enabled = true;
+  SkipStats::reset();
+
+  auto* scorer = dynamic_cast<PhraseQuery::Scorer*>(
+      weight->createScorer(testIndex.pool, segment));
+  ASSERT_NE(scorer, nullptr);
+  int32_t target = 2 * Postings::DOCS_BLOCK_SIZE + 3;
+  int32_t blockEnd = 3 * Postings::DOCS_BLOCK_SIZE - 1;
+  EXPECT_EQ(scorer->advanceShallow(target), blockEnd);
+  EXPECT_GT(SkipStats::impactL0GroupParses, 0);
+  EXPECT_EQ(SkipStats::impactGroupShallowAnswers, 0);
+  EXPECT_TRUE(std::isfinite(scorer->getMaxScore(blockEnd)));
+
+  SkipStats::enabled = savedStats;
 }
 
 // Phrase pruning: block 0 holds the strong phrase docs (high phrase tf, short
