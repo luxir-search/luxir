@@ -6,6 +6,7 @@
 
 #include "Query.h"
 #include "TermQuery.h"
+#include "ScoreCompact.h"
 #include "solux/reader/SkipStats.h"
 #include "QueryPrep.h"
 #include "solux/util/screaming.h"
@@ -2467,7 +2468,7 @@ public:
     }
 
     bool canReach(float score, double bound) const {
-      return ((double) score + bound) * scoreBoundFactor >= (double) minCompetitiveScore;
+      return scoreCanReach(score, bound, minCompetitiveScore, scoreBoundFactor);
     }
 
     bool lessWindowOrder(int32_t a, int32_t b) const {
@@ -2869,34 +2870,16 @@ public:
     }
 
     int32_t compactCompetitive(ScoreWindow& out, double bound) {
-      int32_t write = 0;
-      for (int32_t read = 0; read < out.size; read++) {
-        if (!canReach(out.scores[(size_t) read], bound)) {
-          continue;
-        }
-        if (write != read) {
-          out.docs[(size_t) write] = out.docs[(size_t) read];
-          out.scores[(size_t) write] = out.scores[(size_t) read];
-        }
-        write++;
-      }
+      float threshold = competitiveScoreThreshold(minCompetitiveScore, scoreBoundFactor, bound);
+      int32_t write = compactByScoreThreshold(out.docs.data(), out.scores.data(),
+                                              out.size, threshold);
       recordBufferDrops(out.size, write);
       return write;
     }
 
     void finishCompetitive(ScoreWindow& out) {
-      int32_t write = 0;
-      for (int32_t read = 0; read < out.size; read++) {
-        if (out.scores[(size_t) read] < minCompetitiveScore) {
-          continue;
-        }
-        if (write != read) {
-          out.docs[(size_t) write] = out.docs[(size_t) read];
-          out.scores[(size_t) write] = out.scores[(size_t) read];
-        }
-        write++;
-      }
-      out.size = write;
+      out.size = compactByScoreNotLessThanThreshold(out.docs.data(), out.scores.data(),
+                                                    out.size, minCompetitiveScore);
     }
 
     void applyNonEssentialSweeps(ScoreWindow& out) {
