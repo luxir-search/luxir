@@ -363,13 +363,21 @@ TEST_F(BooleanFuzzTest, randomBooleanMatchesOracle) {
 TEST_F(BooleanFuzzTest, conjunctionBulkCountMatchesPullOnMixedBlockShapes) {
   helper.clear();
   const int32_t numDocs = 2 * DocsEnum::L1_DOCS + 513;
+  // bc_rare stays below the dense gate so the sparse combo hits the fallback.
+  const int32_t rareMax =
+      numDocs / BooleanQuery::ConjunctionBulkScorer::kDenseThresholdInverse - 1;
+  ASSERT_GT(rareMax, 1);
   std::vector<Doc> docs;
   docs.reserve((size_t) numDocs);
+  int32_t rareCount = 0;
   for (int32_t doc = 0; doc < numDocs; doc++) {
     std::string body = "bc_contig";
     if ((doc % 4) != 1) body += " bc_word";
     if ((doc % 10) == 0) body += " bc_packed";
-    if ((doc % 100) == 0) body += " bc_rare";
+    if (rareCount < rareMax && (doc % 500) == 0) {
+      body += " bc_rare";
+      rareCount++;
+    }
     body += " filler";
     docs.push_back(flatdoc("id", "bc" + std::to_string(doc), "body_w", body));
   }

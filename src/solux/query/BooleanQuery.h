@@ -928,10 +928,18 @@ public:
   // candidate batches - one tight pass per clause with early candidate
   // abandonment, instead of a per-doc virtual leapfrog.
   class ConjunctionBulkScorer final : public BulkScorer {
+  public:
+    // Dense count windows engage when the lead matches at least
+    // maxDoc / kDenseThresholdInverse docs.  Far below Lucene's 32: word-
+    // encoded blocks make clause window fills cheap, so windows beat the
+    // docs-only leapfrog until the lead gets quite sparse (measured minimum
+    // on the 5M benchmark corpus; 32 and 16384 are both ~20% slower).
+    static constexpr int32_t kDenseThresholdInverse = 512;
+
+  private:
     static constexpr int32_t kChunk = Postings::DOCS_BLOCK_SIZE;
     static constexpr int32_t kWindowSize = DocsEnum::L1_DOCS;
     static constexpr int32_t kWindowWords = kWindowSize / 64;
-    static constexpr int32_t kDenseThresholdInverse = 32;
     static constexpr int32_t kDenseLeapfrogThreshold = kWindowSize / 32;
     static_assert((kWindowSize % 64) == 0);
 

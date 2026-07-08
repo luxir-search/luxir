@@ -2794,12 +2794,20 @@ TEST_F(TermScorerTest, conjunctionDenseCountThreeClauseLeapfrogMatchesPull) {
 
 TEST_F(TermScorerTest, conjunctionSparseCountFallbackMatchesPull) {
   const int32_t N = 2 * DocsEnum::L1_DOCS + 200;
+  // Keep srare's docFreq below the dense gate so the leapfrog fallback runs.
+  const int32_t rareMax =
+      N / BooleanQuery::ConjunctionBulkScorer::kDenseThresholdInverse - 1;
+  ASSERT_GT(rareMax, 1);
   TestIndex testIndex;
   TestField f(testIndex, "body_w");
   f.startIndexing();
+  int32_t rareCount = 0;
   for (int32_t doc = 0; doc < N; doc++) {
     std::string body = "scommon";
-    if ((doc % 100) == 0) body += " srare";
+    if (rareCount < rareMax && (doc % 500) == 0) {
+      body += " srare";
+      rareCount++;
+    }
     body += " filler";
     f.add(doc, body);
   }

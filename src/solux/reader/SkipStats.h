@@ -64,6 +64,7 @@ struct SkipStats {
   static inline int64_t conjDenseCountWindows = 0;
   static inline int64_t conjCountFallbacks = 0;
   static inline int64_t docsOnlyFreqBlocksSkipped = 0;
+  static inline int64_t docsOnlyWordProbeAdvances = 0;
 
   static void reset() {
     docBlocksDecoded = 0;
@@ -95,6 +96,7 @@ struct SkipStats {
     conjDenseCountWindows = 0;
     conjCountFallbacks = 0;
     docsOnlyFreqBlocksSkipped = 0;
+    docsOnlyWordProbeAdvances = 0;
   }
 };
 

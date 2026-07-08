@@ -41,6 +41,12 @@ class DocsEnum {
   int32_t docid;         // current docid
   bool blockMode = false;
   bool docsOnlyConsumed = false;
+  bool docBlockResident = false;
+  const char* residentWordsPtr = nullptr;
+  uint32_t residentDocBase = 0;
+  uint32_t residentBlockLast = 0;
+  int32_t residentBlockStartOrd = 0;
+  int32_t residentNumWords = 0;  // zero means a contiguous resident block
 
   // For term freqs, since they are parallel to docs, we don't actually need
   // all of these variables.  But it sets the stage for separating the two
@@ -172,6 +178,23 @@ private:
 
   static constexpr int32_t DECODED_ADVANCE_LINEAR_PROBE = 8;
 
+  static uint64_t lowBitsMask(int32_t bits) {
+    assert(bits >= 0 && bits <= 64);
+    if (bits == 0) {
+      return 0;
+    }
+    if (bits == 64) {
+      return ~0ULL;
+    }
+    return (1ULL << bits) - 1ULL;
+  }
+
+  static uint64_t loadWord64(const char* p) {
+    uint64_t word;
+    memcpy(&word, p, 8);
+    return word;
+  }
+
   // Position docIS at the current block body: skip the group header on an L1
   // boundary and the L0 header, unless an L0 walk already left the stream at
   // the body (bodyReady).
@@ -224,6 +247,197 @@ private:
       }
     }
     assert(dst - docBuf == Postings::DOCS_BLOCK_SIZE);
+  }
+
+  void clearDocBlockResident() {
+    docBlockResident = false;
+    residentWordsPtr = nullptr;
+    residentDocBase = 0;
+    residentBlockLast = 0;
+    residentBlockStartOrd = 0;
+    residentNumWords = 0;
+  }
+
+  uint64_t residentWord(int32_t wordIndex) const {
+    assert(docBlockResident);
+    assert(residentNumWords > 0);
+    assert(wordIndex >= 0 && wordIndex < residentNumWords);
+    return loadWord64(residentWordsPtr + (int64_t) wordIndex * 8);
+  }
+
+  int32_t residentBlockEndOrd() const {
+    assert(docBlockResident);
+    return residentBlockStartOrd + Postings::DOCS_BLOCK_SIZE;
+  }
+
+  int32_t residentOrdinalAfterDoc(int32_t doc) const {
+    assert(docBlockResident);
+    assert(doc >= (int32_t) residentDocBase && doc <= (int32_t) residentBlockLast);
+    if (residentNumWords == 0) {
+      return residentBlockStartOrd + doc - (int32_t) residentDocBase + 1;
+    }
+
+    const int32_t bitIndex = doc - (int32_t) residentDocBase;
+    const int32_t wordIndex = bitIndex >> 6;
+    const int32_t bit = bitIndex & 63;
+    int32_t ordInBlock = 0;
+    for (int32_t w = 0; w < wordIndex; w++) {
+      ordInBlock += (int32_t) std::popcount(residentWord(w));
+    }
+    const uint64_t word = residentWord(wordIndex);
+    assert((word & (1ULL << bit)) != 0);
+    ordInBlock += (int32_t) std::popcount(word & lowBitsMask(bit)) + 1;
+    return residentBlockStartOrd + ordInBlock;
+  }
+
+  bool findResidentGEQ(int32_t target, int32_t& landing, int32_t& ordAfter) const {
+    assert(docBlockResident);
+    if (target > (int32_t) residentBlockLast) {
+      return false;
+    }
+    if (residentNumWords == 0) {
+      landing = std::max(target, (int32_t) residentDocBase);
+      if (landing > (int32_t) residentBlockLast) {
+        return false;
+      }
+      ordAfter = residentBlockStartOrd + landing - (int32_t) residentDocBase + 1;
+      return true;
+    }
+
+    int32_t bitIndex = target - (int32_t) residentDocBase;
+    if (bitIndex < 0) {
+      bitIndex = 0;
+    }
+    int32_t startWord = bitIndex >> 6;
+    int32_t startBit = bitIndex & 63;
+    if (startWord >= residentNumWords) {
+      return false;
+    }
+
+    int32_t prefix = 0;
+    for (int32_t w = 0; w < residentNumWords; w++) {
+      const uint64_t word = residentWord(w);
+      if (w < startWord) {
+        prefix += (int32_t) std::popcount(word);
+        continue;
+      }
+
+      uint64_t probe = word;
+      if (w == startWord) {
+        probe &= ~lowBitsMask(startBit);
+      }
+      if (probe != 0) {
+        const int32_t bit = (int32_t) std::countr_zero(probe);
+        landing = (int32_t) residentDocBase + (w << 6) + bit;
+        ordAfter = residentBlockStartOrd + prefix
+                   + (int32_t) std::popcount(word & lowBitsMask(bit)) + 1;
+        return true;
+      }
+      prefix += (int32_t) std::popcount(word);
+    }
+    return false;
+  }
+
+  bool findResidentLastBefore(int32_t upTo, int32_t minDoc,
+                              int32_t& lastDoc, int32_t& ordAfter) const {
+    assert(docBlockResident);
+    if (upTo <= minDoc || minDoc > (int32_t) residentBlockLast) {
+      return false;
+    }
+    if (residentNumWords == 0) {
+      lastDoc = std::min((int32_t) residentBlockLast, upTo - 1);
+      if (lastDoc < std::max(minDoc, (int32_t) residentDocBase)) {
+        return false;
+      }
+      ordAfter = residentBlockStartOrd + lastDoc - (int32_t) residentDocBase + 1;
+      return true;
+    }
+
+    int32_t startBit = minDoc - (int32_t) residentDocBase;
+    if (startBit < 0) {
+      startBit = 0;
+    }
+    int32_t endBit = upTo - (int32_t) residentDocBase;
+    if (endBit <= startBit) {
+      return false;
+    }
+    const int32_t maxBits = residentNumWords << 6;
+    if (endBit > maxBits) {
+      endBit = maxBits;
+    }
+
+    int32_t found = -1;
+    const int32_t firstWord = startBit >> 6;
+    const int32_t lastWord = (endBit - 1) >> 6;
+    for (int32_t w = firstWord; w <= lastWord && w < residentNumWords; w++) {
+      uint64_t word = residentWord(w);
+      const int32_t lo = w == firstWord ? (startBit & 63) : 0;
+      const int32_t hi = w == lastWord ? ((endBit - 1) & 63) + 1 : 64;
+      word &= lowBitsMask(hi) & ~lowBitsMask(lo);
+      if (word != 0) {
+        found = (w << 6) + (63 - (int32_t) std::countl_zero(word));
+      }
+    }
+    if (found < 0) {
+      return false;
+    }
+    lastDoc = (int32_t) residentDocBase + found;
+    ordAfter = residentOrdinalAfterDoc(lastDoc);
+    return true;
+  }
+
+  void positionDocOnlyResidentAt(int32_t landing, int32_t ordAfter, bool asBlockMode) {
+    assert(docBlockResident);
+    assert(ordAfter >= residentBlockStartOrd + 1);
+    assert(ordAfter <= residentBlockEndOrd());
+    docid = landing;
+    docOrd = ordAfter;
+    docBufIdx = ordAfter - residentBlockStartOrd;
+    docBufEnd = Postings::DOCS_BLOCK_SIZE;
+    if (hasFreqs) {
+      tfreqOrd = ordAfter;
+      tfreqBufIdx = docBufIdx;
+      tfreqBufEnd = Postings::DOCS_BLOCK_SIZE;
+    }
+    tfreq = 1;
+    blockMode = asBlockMode;
+  }
+
+  void finishDocOnlyResidentBlock() {
+    assert(docBlockResident);
+    docid = (int32_t) residentBlockLast;
+    docOrd = residentBlockEndOrd();
+    docBufIdx = docBufEnd = Postings::DOCS_BLOCK_SIZE;
+    if (hasFreqs) {
+      tfreqOrd = docOrd;
+      tfreqBufIdx = tfreqBufEnd = Postings::DOCS_BLOCK_SIZE;
+    }
+    tfreq = 1;
+    blockMode = true;
+    docBuf[Postings::DOCS_BLOCK_SIZE - 1] = (int32_t) residentBlockLast;
+    clearDocBlockResident();
+  }
+
+  void materializeDocOnlyResidentBlock() {
+    if (!docBlockResident) {
+      return;
+    }
+    const int32_t idx = docOrd - residentBlockStartOrd;
+    const uint32_t docBase = residentDocBase;
+    const uint32_t blockLast = residentBlockLast;
+    const int32_t numWords = residentNumWords;
+    const char* wordsPtr = residentWordsPtr;
+    if (numWords == 0) {
+      for (int32_t i = 0; i < Postings::DOCS_BLOCK_SIZE; i++) {
+        docBuf[i] = (int32_t) docBase + i;
+      }
+    } else {
+      expandDocWords(wordsPtr, numWords, docBase);
+    }
+    assert(docBuf[Postings::DOCS_BLOCK_SIZE - 1] == (int32_t) blockLast);
+    clearDocBlockResident();
+    docBufIdx = idx;
+    docBufEnd = Postings::DOCS_BLOCK_SIZE;
   }
 
   int32_t findDecodedRemainderGEQ(int32_t start, int32_t target) const {
@@ -420,6 +634,7 @@ public:
 
   /// number of times the term appears in the current document
   int32_t termFreq() {
+    assert(!docBlockResident);
     assert(!docsOnlyConsumed);
     return tfreq;
   }
@@ -438,6 +653,7 @@ private:
   int32_t nextDocImpl() {
     // Contract: callers must not re-poll after END (see Query::Scorer).
     assert(docid != PostingsReader::END);
+    assert(!docBlockResident);
     blockMode = false;
     if (docBufIdx >= docBufEnd) {
       if constexpr (!DOCS_ONLY) {
@@ -589,6 +805,7 @@ private:
 
 public:
   int32_t nextDoc() {
+    assert(!docBlockResident);
     assert(!docsOnlyConsumed);
     return nextDocImpl<false>();
   }
@@ -598,6 +815,15 @@ public:
   // serve termFreq() or positions again.
   int32_t nextDocOnly() {
     docsOnlyConsumed = true;
+    if (docBlockResident) {
+      int32_t landing = 0;
+      int32_t ordAfter = 0;
+      if (findResidentGEQ(docid + 1, landing, ordAfter)) {
+        positionDocOnlyResidentAt(landing, ordAfter, false);
+        return docid;
+      }
+      finishDocOnlyResidentBlock();
+    }
     return nextDocImpl<true>();
   }
 
@@ -605,6 +831,7 @@ public:
     if (docid == PostingsReader::END) {
       return {};
     }
+    materializeDocOnlyResidentBlock();
 
     int32_t start = 0;
     if (!blockMode) {
@@ -642,6 +869,7 @@ public:
     }
     assert(docsOnlyConsumed);
     assert(docid != PostingsReader::END);
+    materializeDocOnlyResidentBlock();
 
     int32_t start = 0;
     bool countedCurrent = false;
@@ -748,6 +976,168 @@ private:
     }
   }
 
+  static void orShiftedWordsRange(std::span<uint64_t> bits, int32_t bitsBase,
+                                  const char* src, int32_t numWords,
+                                  uint32_t docBase, int32_t clipDoc,
+                                  int32_t upTo) {
+    assert(clipDoc >= bitsBase);
+    assert(upTo >= clipDoc);
+    for (int32_t w = 0; w < numWords; w++) {
+      uint64_t word;
+      memcpy(&word, src + (int64_t) w * 8, 8);
+      if (word == 0) {
+        continue;
+      }
+      const int64_t wordDoc0 = (int64_t) docBase + ((int64_t) w << 6);
+      if (wordDoc0 + 63 < clipDoc) {
+        continue;
+      }
+      if (wordDoc0 >= upTo) {
+        break;
+      }
+      int32_t lo = 0;
+      int32_t hi = 64;
+      if (clipDoc > wordDoc0) {
+        lo = clipDoc - (int32_t) wordDoc0;
+      }
+      if ((int64_t) upTo < wordDoc0 + 64) {
+        hi = upTo - (int32_t) wordDoc0;
+      }
+      if (lo >= hi) {
+        continue;
+      }
+      word &= lowBitsMask(hi) & ~lowBitsMask(lo);
+      if (word == 0) {
+        continue;
+      }
+      int64_t dstBit0 = wordDoc0 - bitsBase;
+      if (dstBit0 < 0) {
+        word >>= (uint32_t) -dstBit0;
+        dstBit0 = 0;
+      }
+      const size_t idx = (size_t) (dstBit0 >> 6);
+      const int32_t off = (int32_t) (dstBit0 & 63);
+      bits[idx] |= word << off;
+      if (off != 0) {
+        uint64_t hiWord = word >> (64 - off);
+        if (hiWord != 0) {
+          bits[idx + 1] |= hiWord;
+        }
+      }
+    }
+  }
+
+  bool advanceDocOnlyResident(int32_t target) {
+    assert(docBlockResident);
+    int32_t landing = 0;
+    int32_t ordAfter = 0;
+    if (!findResidentGEQ(target, landing, ordAfter)) {
+      finishDocOnlyResidentBlock();
+      return false;
+    }
+    positionDocOnlyResidentAt(landing, ordAfter, false);
+    skipCount(SkipStats::docsOnlyWordProbeAdvances);
+    return true;
+  }
+
+  bool tryEnterDocOnlyResidentBlock(int32_t target) {
+    assert(!docBlockResident);
+    assert(!trackPositions);
+    if (docfreq - docOrd < Postings::DOCS_BLOCK_SIZE) {
+      return false;
+    }
+
+    const int32_t blockStartOrd = docOrd;
+    const uint32_t base = (docOrd == 0) ? 0 : (uint32_t) docBuf[Postings::DOCS_BLOCK_SIZE - 1];
+    const uint32_t docBase = base + (blockStartOrd == 0 ? 0 : 1);
+
+    seekToBlockBody();
+    bodyReady = true;
+    const int8_t token = (int8_t) *docIS.ptr();
+    if (token > 0) {
+      return false;
+    }
+
+    bodyReady = false;
+    docIS.skip(1);
+    const int32_t numWords = token == Postings::DOC_BLOCK_CONTIGUOUS ? 0 : -token;
+    const char* wordsPtr = docIS.ptr();
+    uint32_t blockLast;
+    if (token == Postings::DOC_BLOCK_CONTIGUOUS) {
+      blockLast = docBase + Postings::DOCS_BLOCK_SIZE - 1;
+    } else {
+      assert(numWords > 0);
+      uint64_t lastWord = loadWord64(wordsPtr + (int64_t) (numWords - 1) * 8);
+      assert(lastWord != 0);
+      blockLast = docBase + (uint32_t) (numWords - 1) * 64
+                  + (63 - (uint32_t) std::countl_zero(lastWord));
+      docIS.skip((int64_t) numWords * 8);
+    }
+
+    if (hasFreqs) {
+      auto bytesSkipped = IndexCodec::tfreqCodec.skipBlock(docIS.ptr(), docIS.left());
+      docIS.skip(bytesSkipped);
+      skipCount(SkipStats::docsOnlyFreqBlocksSkipped);
+    }
+
+    docBlockResident = true;
+    residentWordsPtr = wordsPtr;
+    residentDocBase = docBase;
+    residentBlockLast = blockLast;
+    residentBlockStartOrd = blockStartOrd;
+    residentNumWords = numWords;
+
+    docBuf[Postings::DOCS_BLOCK_SIZE - 1] = (int32_t) blockLast;
+    docBufEnd = Postings::DOCS_BLOCK_SIZE;
+    nextL0Base = blockLast;
+    nextL0Block = blockStartOrd / Postings::DOCS_BLOCK_SIZE + 1;
+    if (isL1Boundary(nextL0Block)) {
+      nextL1Group = nextL0Block / L1_PERIOD;
+      nextL1Base = nextL0Base;
+      nextL1CumTf = nextL0CumTf;
+    }
+
+    if (!advanceDocOnlyResident(target)) {
+      return false;
+    }
+    return true;
+  }
+
+  bool orDocOnlyResidentIntoBitSet(std::span<uint64_t> bits, int32_t bitsBase,
+                                   int32_t upTo) {
+    assert(docBlockResident);
+    assert(docid >= 0);
+    if (upTo <= docid) {
+      return false;
+    }
+
+    int32_t lastDoc = 0;
+    int32_t ordAfter = 0;
+    if (!findResidentLastBefore(upTo, docid, lastDoc, ordAfter)) {
+      return false;
+    }
+
+    const int32_t clipDoc = std::max(docid, bitsBase);
+    const int32_t emitTo = std::min(upTo, (int32_t) residentBlockLast + 1);
+    if (clipDoc < emitTo) {
+      if (residentNumWords == 0) {
+        orBitRange(bits, clipDoc - bitsBase, emitTo - clipDoc);
+      } else {
+        orShiftedWordsRange(bits, bitsBase, residentWordsPtr, residentNumWords,
+                            residentDocBase, clipDoc, emitTo);
+      }
+      skipCount(SkipStats::countBulkFillWordBlocks);
+    }
+
+    if (lastDoc == (int32_t) residentBlockLast) {
+      finishDocOnlyResidentBlock();
+      return true;
+    }
+
+    positionDocOnlyResidentAt(lastDoc, ordAfter, true);
+    return false;
+  }
+
   // Consume whole word-encoded full blocks lying entirely below upTo, OR-ing
   // their bits into `bits` without expanding to docBuf. Stops with the stream
   // ready for the regular decode on a packed block, the tail, or a block
@@ -831,6 +1221,12 @@ public:
     assert(!trackPositions);
     docsOnlyConsumed = true;
     for (;;) {
+      if (docBlockResident) {
+        if (orDocOnlyResidentIntoBitSet(bits, bitsBase, upTo)) {
+          continue;
+        }
+        return;
+      }
       if ((docid < 0 || blockMode) && docBufIdx >= docBufEnd
           && orWholeWordBlocks(bits, bitsBase, upTo)) {
         continue;
@@ -879,6 +1275,7 @@ public:
   // Impact threshold ownership remains with TermQuery::Scorer; this exposes raw
   // decoded postings and does not know minCompetitiveScore.
   std::pair<std::span<const int32_t>, std::span<const int32_t>> peekDocFreqBlock() {
+    assert(!docBlockResident);
     assert(!docsOnlyConsumed);
     if (docid == PostingsReader::END) {
       return {};
@@ -929,6 +1326,8 @@ public:
     if (n == 0) {
       return;
     }
+    assert(!docBlockResident);
+    assert(!docsOnlyConsumed);
     assert(docid != PostingsReader::END);
 
     int32_t start = 0;
@@ -972,6 +1371,7 @@ public:
   // Reset the doc decoder to the block that may contain target.  Position state is
   // repaired by cumulativeTermFreq; the position stream itself stays lazy.
   void skipToBlock(int32_t target) {
+    assert(!docBlockResident);
     blockMode = false;
     clearPendingPositionRepair();
     const char* const streamStart = docIS.ptr(0);
@@ -1145,16 +1545,27 @@ private:
   template <bool DOCS_ONLY>
   int32_t advanceImpl(int32_t target) {
     assert(docid < target);
+    skipCount(SkipStats::advanceCalls);
     if constexpr (DOCS_ONLY) {
       assert(!trackPositions);
       docsOnlyConsumed = true;
+      if (docBlockResident) {
+        if (advanceDocOnlyResident(target)) {
+          return docid;
+        }
+      }
     } else {
+      assert(!docBlockResident);
       assert(!docsOnlyConsumed);
     }
-    skipCount(SkipStats::advanceCalls);
     if (nextL0Block < numDocBlocks
         && (docBufEnd == 0 || target > docBuf[docBufEnd - 1])) {
       skipToBlock(target);
+    }
+    if constexpr (DOCS_ONLY) {
+      if (docBufIdx >= docBufEnd && tryEnterDocOnlyResidentBlock(target)) {
+        return docid;
+      }
     }
     if (docBufIdx >= docBufEnd) {
       // fresh block (or END) after the block-level skip
@@ -1545,6 +1956,7 @@ public:
   }
 
   void startPositions() {
+    assert(!docBlockResident);
     assert(!docsOnlyConsumed);
     assert(hasPositions);  // positions are only queried on fields that index them
     assert(trackPositions);
@@ -1620,6 +2032,7 @@ public:
   }
 
   int32_t nextPosition() {
+    assert(!docBlockResident);
     if (posBufIdx >= posBufEndDoc) {
       // Reached the end of buffered pos deltas, either because
       // there are no more positions for this doc, or because we need
@@ -1680,6 +2093,7 @@ public:
   }
 
   int32_t advancePosition(int32_t target) {
+    assert(!docBlockResident);
     while (pos < target) {
       nextPosition();
     }

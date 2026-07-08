@@ -129,6 +129,79 @@ protected:
     return expected;
   }
 
+  static std::vector<int32_t> makeWordProbeDocs(int32_t fullBlocks) {
+    std::vector<int32_t> docs;
+    docs.reserve((size_t) fullBlocks * Postings::DOCS_BLOCK_SIZE);
+    for (int32_t block = 0; block < fullBlocks; block++) {
+      const int32_t docBase = block * 192;
+      for (int32_t bit = 0; bit < 192; bit++) {
+        if ((bit % 3) != 1) {
+          docs.push_back(docBase + bit);
+        }
+      }
+    }
+    return docs;
+  }
+
+  static std::vector<int32_t> makeContiguousDocs(int32_t count) {
+    std::vector<int32_t> docs;
+    docs.reserve((size_t) count);
+    for (int32_t doc = 0; doc < count; doc++) {
+      docs.push_back(doc);
+    }
+    return docs;
+  }
+
+  static int32_t modelCeil(const std::vector<int32_t>& docs, int32_t target) {
+    auto it = std::lower_bound(docs.begin(), docs.end(), target);
+    return it == docs.end() ? DocsEnum::END : *it;
+  }
+
+  void writeRawSingleTerm(RAMDir& dir, MemPool& pool, std::string_view term,
+                          const std::vector<int32_t>& docs) {
+    ASSERT_FALSE(docs.empty());
+    PostingsWriter postingsWriter(dir, 0, docs.back() + Postings::DOCS_BLOCK_SIZE + 100);
+    {
+      TextWriter writer(postingsWriter);
+      auto& finfo = postingsWriter.addField("f");
+      finfo.type = FieldType::TEXT;
+      finfo.flags = FieldType::INDEX_DOCS_FREQS;
+      writer.startField(&finfo);
+
+      TermRef tref(pool, term.data(), (uint32_t) term.size());
+      writer.startTerm(tref);
+      for (int32_t doc : docs) {
+        writer.addDoc(doc, 1 + (doc % 5));
+      }
+      writer.endTerm(tref);
+      writer.endField();
+    }
+    postingsWriter.finish();
+  }
+
+  std::vector<int32_t> docsFromBits(const std::vector<uint64_t>& bits,
+                                    int32_t bitsBase, int32_t upTo) {
+    std::vector<int32_t> got;
+    for (int32_t doc = bitsBase; doc < upTo; doc++) {
+      int32_t index = doc - bitsBase;
+      if ((bits[(size_t) index >> 6] & (1ULL << (index & 63))) != 0) {
+        got.push_back(doc);
+      }
+    }
+    return got;
+  }
+
+  std::vector<int32_t> modelWindow(const std::vector<int32_t>& docs,
+                                   int32_t from, int32_t to) {
+    std::vector<int32_t> want;
+    auto it = std::lower_bound(docs.begin(), docs.end(), from);
+    while (it != docs.end() && *it < to) {
+      want.push_back(*it);
+      ++it;
+    }
+    return want;
+  }
+
   void assertImpactHeaders(DocsEnum& denum, const std::vector<int32_t>& expectedBlockMaxTf,
                            const std::vector<int32_t>& expectedBlockMinNorm,
                            std::string_view label,
@@ -404,6 +477,178 @@ TEST_F(DocsEnumAdvanceTest, advanceCrossesL1AndTailOnTrailerFreeSlice) {
     ASSERT_EQ(denum.termFreq(), 1) << target;
   }
   ASSERT_EQ(denum.advance(N), DocsEnum::END);
+}
+
+TEST_F(DocsEnumAdvanceTest, advanceDocOnlyProbesWordBlocksWithoutDecoding) {
+  const std::vector<int32_t> docs = makeWordProbeDocs(3);
+  RAMDir dir;
+  MemPool pool;
+  writeRawSingleTerm(dir, pool, "wordprobe", docs);
+
+  PostingsReader reader(dir, 0);
+  FieldReader fieldReader(pool, reader);
+  ASSERT_TRUE(fieldReader.readNextField());
+  SegFieldInfo fieldInfo;
+  fieldReader.readFieldInfo(fieldInfo);
+  TermsEnum tenum(pool, reader, fieldInfo);
+  ASSERT_TRUE(tenum.seek("wordprobe"));
+
+  DocsEnum denum(pool, reader, tenum);
+  denum.setTrackPositions(false);
+
+  bool savedStats = SkipStats::enabled;
+  SkipStats::enabled = true;
+  SkipStats::reset();
+
+  int32_t cur = -1;
+  for (int32_t target : {1, 63, 64, 127, 191, 192, 256, 319, 383, 384, 576}) {
+    ASSERT_GT(target, cur);
+    cur = denum.advanceDocOnly(target);
+    ASSERT_EQ(cur, modelCeil(docs, target)) << "target=" << target;
+    if (cur == DocsEnum::END) {
+      break;
+    }
+  }
+
+  EXPECT_EQ(SkipStats::docBlocksDecoded, 0);
+  EXPECT_GT(SkipStats::docsOnlyFreqBlocksSkipped, 0);
+  EXPECT_GT(SkipStats::docsOnlyWordProbeAdvances, 6);
+  SkipStats::enabled = savedStats;
+  SkipStats::reset();
+}
+
+TEST_F(DocsEnumAdvanceTest, nextDocOnlyWalksResidentWordBlock) {
+  const std::vector<int32_t> docs = makeWordProbeDocs(2);
+  RAMDir dir;
+  MemPool pool;
+  writeRawSingleTerm(dir, pool, "wordprobe", docs);
+
+  PostingsReader reader(dir, 0);
+  FieldReader fieldReader(pool, reader);
+  ASSERT_TRUE(fieldReader.readNextField());
+  SegFieldInfo fieldInfo;
+  fieldReader.readFieldInfo(fieldInfo);
+  TermsEnum tenum(pool, reader, fieldInfo);
+  ASSERT_TRUE(tenum.seek("wordprobe"));
+
+  DocsEnum denum(pool, reader, tenum);
+  denum.setTrackPositions(false);
+  ASSERT_EQ(denum.advanceDocOnly(1), 2);
+  ASSERT_EQ(denum.nextDocOnly(), 3);
+  ASSERT_EQ(denum.advanceDocOnly(64), 65);
+  ASSERT_EQ(denum.nextDocOnly(), 66);
+  ASSERT_EQ(denum.advanceDocOnly(127), 128);
+  ASSERT_EQ(denum.nextDocOnly(), 129);
+  ASSERT_EQ(denum.advanceDocOnly(191), 191);
+  ASSERT_EQ(denum.advanceDocOnly(192), 192);
+}
+
+TEST_F(DocsEnumAdvanceTest, intoBitSetUsesResidentWordBlockAndStopsInsideWindow) {
+  const std::vector<int32_t> docs = makeWordProbeDocs(2);
+  RAMDir dir;
+  MemPool pool;
+  writeRawSingleTerm(dir, pool, "wordprobe", docs);
+
+  PostingsReader reader(dir, 0);
+  FieldReader fieldReader(pool, reader);
+  ASSERT_TRUE(fieldReader.readNextField());
+  SegFieldInfo fieldInfo;
+  fieldReader.readFieldInfo(fieldInfo);
+  TermsEnum tenum(pool, reader, fieldInfo);
+  ASSERT_TRUE(tenum.seek("wordprobe"));
+
+  DocsEnum denum(pool, reader, tenum);
+  denum.setTrackPositions(false);
+
+  bool savedStats = SkipStats::enabled;
+  SkipStats::enabled = true;
+  SkipStats::reset();
+
+  ASSERT_EQ(denum.advanceDocOnly(64), 65);
+  const int32_t from = 60;
+  const int32_t to = 100;
+  std::vector<uint64_t> bits((size_t) (to - from + 63) / 64, 0);
+  denum.intoBitSet(bits, from, to);
+  EXPECT_EQ(docsFromBits(bits, from, to), modelWindow(docs, 65, to));
+  EXPECT_EQ(denum.docId(), 99);
+  EXPECT_EQ(denum.nextDocOnly(), 101);
+
+  EXPECT_GT(SkipStats::countBulkFillWordBlocks, 0);
+  EXPECT_GT(SkipStats::docsOnlyWordProbeAdvances, 0);
+  SkipStats::enabled = savedStats;
+  SkipStats::reset();
+}
+
+TEST_F(DocsEnumAdvanceTest, advanceAndIntoBitSetProbeContiguousRuns) {
+  const std::vector<int32_t> docs = makeContiguousDocs(3 * Postings::DOCS_BLOCK_SIZE);
+  RAMDir dir;
+  MemPool pool;
+  writeRawSingleTerm(dir, pool, "runprobe", docs);
+
+  PostingsReader reader(dir, 0);
+  FieldReader fieldReader(pool, reader);
+  ASSERT_TRUE(fieldReader.readNextField());
+  SegFieldInfo fieldInfo;
+  fieldReader.readFieldInfo(fieldInfo);
+  TermsEnum tenum(pool, reader, fieldInfo);
+  ASSERT_TRUE(tenum.seek("runprobe"));
+
+  DocsEnum denum(pool, reader, tenum);
+  denum.setTrackPositions(false);
+
+  bool savedStats = SkipStats::enabled;
+  SkipStats::enabled = true;
+  SkipStats::reset();
+
+  ASSERT_EQ(denum.advanceDocOnly(10), 10);
+  ASSERT_EQ(denum.nextDocOnly(), 11);
+  ASSERT_EQ(denum.advanceDocOnly(64), 64);
+  ASSERT_EQ(denum.advanceDocOnly(127), 127);
+  ASSERT_EQ(denum.advanceDocOnly(128), 128);
+  ASSERT_EQ(denum.advanceDocOnly(130), 130);
+
+  const int32_t from = 120;
+  const int32_t to = 140;
+  std::vector<uint64_t> bits((size_t) (to - from + 63) / 64, 0);
+  denum.intoBitSet(bits, from, to);
+  EXPECT_EQ(docsFromBits(bits, from, to), modelWindow(docs, 130, to));
+  EXPECT_EQ(denum.docId(), 139);
+  EXPECT_EQ(denum.nextDocOnly(), 140);
+  EXPECT_EQ(SkipStats::docBlocksDecoded, 0);
+  EXPECT_GT(SkipStats::docsOnlyWordProbeAdvances, 3);
+  SkipStats::enabled = savedStats;
+  SkipStats::reset();
+}
+
+TEST_F(DocsEnumAdvanceTest, residentDocOnlyBlockPeekAndConsumeMaterializeSpan) {
+  const std::vector<int32_t> docs = makeWordProbeDocs(1);
+  RAMDir dir;
+  MemPool pool;
+  writeRawSingleTerm(dir, pool, "wordprobe", docs);
+
+  PostingsReader reader(dir, 0);
+  FieldReader fieldReader(pool, reader);
+  ASSERT_TRUE(fieldReader.readNextField());
+  SegFieldInfo fieldInfo;
+  fieldReader.readFieldInfo(fieldInfo);
+  TermsEnum tenum(pool, reader, fieldInfo);
+  ASSERT_TRUE(tenum.seek("wordprobe"));
+
+  DocsEnum denum(pool, reader, tenum);
+  denum.setTrackPositions(false);
+  ASSERT_EQ(denum.advanceDocOnly(64), 65);
+
+  auto expectedStart = std::lower_bound(docs.begin(), docs.end(), 65);
+  std::vector<int32_t> expected(expectedStart, docs.end());
+  auto span = denum.peekDocOnlyBlock();
+  ASSERT_EQ((int32_t) span.size(), (int32_t) expected.size());
+  EXPECT_TRUE(std::equal(span.begin(), span.end(), expected.begin()));
+
+  denum.consumeDocOnlyBlock(5);
+  ASSERT_EQ(denum.docId(), expected[4]);
+  auto span2 = denum.peekDocOnlyBlock();
+  ASSERT_EQ((int32_t) span2.size(), (int32_t) expected.size() - 5);
+  EXPECT_TRUE(std::equal(span2.begin(), span2.end(), expected.begin() + 5));
 }
 
 // The whole-term impact frontier stored in the term dictionary must equal the
