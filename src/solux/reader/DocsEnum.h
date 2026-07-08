@@ -42,11 +42,17 @@ class DocsEnum {
   bool blockMode = false;
   bool docsOnlyConsumed = false;
   bool docBlockResident = false;
+  bool scoredWordProbeActive = false;
   const char* residentWordsPtr = nullptr;
   uint32_t residentDocBase = 0;
   uint32_t residentBlockLast = 0;
   int32_t residentBlockStartOrd = 0;
   int32_t residentNumWords = 0;  // zero means a contiguous resident block
+  const char* scoredProbeWordsPtr = nullptr;
+  uint32_t scoredProbeDocBase = 0;
+  uint32_t scoredProbeBlockLast = 0;
+  int32_t scoredProbeBlockStartOrd = 0;
+  int32_t scoredProbeNumWords = 0;  // zero means a contiguous scored probe block
 
   // For term freqs, since they are parallel to docs, we don't actually need
   // all of these variables.  But it sets the stage for separating the two
@@ -116,6 +122,27 @@ public:
     static constexpr int32_t FRONTIER_CAP = 256;
     int32_t frontierTfs[FRONTIER_CAP];
     int32_t frontierNorms[FRONTIER_CAP];
+  };
+
+  // Scoped scored-word probe state for TermQuery::Scorer::applyToCandidates.
+  // A successful probe consumes the block body from the stream and decodes its
+  // freq block, but deliberately leaves doc ids as resident words until the
+  // caller finishes the scope. During that scope no normal DocsEnum method is
+  // legal: exposing lazy materialization through advance()/score()/peek would
+  // recreate the old scored-path resident-state tax. That is the opposite of
+  // the docs-only design, where docsOnlyConsumed is a one-way latch that makes
+  // termFreq()/positions permanently illegal after freq blocks are skipped.
+  struct ScoredWordProbe {
+    uint32_t docBase;
+    int32_t blockLast;
+    int32_t blockStartOrd;
+    int32_t numWords;       // 0 contiguous, >0 word-bitset
+    const char* words;      // null for contiguous
+    std::span<const int32_t> freqs;
+    struct RankCursor {
+      int32_t wordIndex;
+      int32_t ordBeforeWord;
+    };
   };
 
 private:
@@ -256,6 +283,15 @@ private:
     residentBlockLast = 0;
     residentBlockStartOrd = 0;
     residentNumWords = 0;
+  }
+
+  void clearScoredWordProbe() {
+    scoredWordProbeActive = false;
+    scoredProbeWordsPtr = nullptr;
+    scoredProbeDocBase = 0;
+    scoredProbeBlockLast = 0;
+    scoredProbeBlockStartOrd = 0;
+    scoredProbeNumWords = 0;
   }
 
   uint64_t residentWord(int32_t wordIndex) const {
@@ -440,6 +476,19 @@ private:
     docBufEnd = Postings::DOCS_BLOCK_SIZE;
   }
 
+  void materializeScoredWordProbeBlock() {
+    assert(scoredWordProbeActive);
+    if (scoredProbeNumWords == 0) {
+      for (int32_t i = 0; i < Postings::DOCS_BLOCK_SIZE; i++) {
+        docBuf[i] = (int32_t) scoredProbeDocBase + i;
+      }
+    } else {
+      expandDocWords(scoredProbeWordsPtr, scoredProbeNumWords, scoredProbeDocBase);
+    }
+    assert(docBuf[Postings::DOCS_BLOCK_SIZE - 1] == (int32_t) scoredProbeBlockLast);
+    docBufEnd = Postings::DOCS_BLOCK_SIZE;
+  }
+
   int32_t findDecodedRemainderGEQ(int32_t start, int32_t target) const {
     int32_t j = start;
     const int32_t linearEnd = std::min(docBufEnd, start + DECODED_ADVANCE_LINEAR_PROBE);
@@ -450,6 +499,45 @@ private:
       return j;
     }
     return (int32_t) (std::lower_bound(docBuf + j, docBuf + docBufEnd, target) - docBuf);
+  }
+
+  int32_t advanceScoredNoPositionsFromReadyBlock(int32_t target) {
+    assert(docid < target);
+    assert(!trackPositions);
+    assert(!docsOnlyConsumed);
+    assert(!docBlockResident);
+    assert(!scoredWordProbeActive);
+    if (docBufIdx >= docBufEnd) {
+      if (nextDocImpl<false>() >= target) {
+        return docid;
+      }
+    }
+    if (docid == PostingsReader::END) {
+      return docid;
+    }
+    if (docBuf[docBufEnd - 1] < target) {
+      while (docid < target) {
+        nextDocImpl<false>();
+      }
+      return docid;
+    }
+
+    blockMode = false;
+    const int32_t start = docBufIdx;
+    const int32_t j = findDecodedRemainderGEQ(start, target);
+    assert(j < docBufEnd);
+    const int32_t consumed = j + 1 - start;
+    docOrd += consumed;
+    if (hasFreqs) {
+      tfreq = tfreqBuf[j];
+      tfreqOrd += consumed;
+      tfreqBufIdx = j + 1;
+    } else {
+      tfreq = 1;
+    }
+    docBufIdx = j + 1;
+    docid = docBuf[j];
+    return docid;
   }
 
   void clearPendingPositionRepair() {
@@ -612,6 +700,7 @@ public:
 
   void setTrackPositions(bool enabled) {
     assert(!(enabled && docBlockResident));  // resident state never serves positions
+    assert(!scoredWordProbeActive);
     trackPositions = enabled && hasPositions;
     if (!trackPositions) {
       clearPendingPositionRepair();
@@ -630,6 +719,7 @@ public:
 
   /// the document this iterator is currently positions on
   int32_t docId() {
+    assert(!scoredWordProbeActive);
     return docid;
   }
 
@@ -637,6 +727,7 @@ public:
   int32_t termFreq() {
     assert(!docBlockResident);
     assert(!docsOnlyConsumed);
+    assert(!scoredWordProbeActive);
     return tfreq;
   }
 
@@ -808,6 +899,7 @@ public:
   int32_t nextDoc() {
     assert(!docBlockResident);
     assert(!docsOnlyConsumed);
+    assert(!scoredWordProbeActive);
     return nextDocImpl<false>();
   }
 
@@ -815,6 +907,7 @@ public:
   // is pinned to 1. One-way: after the first nextDocOnly() this enum can never
   // serve termFreq() or positions again.
   int32_t nextDocOnly() {
+    assert(!scoredWordProbeActive);
     docsOnlyConsumed = true;
     if (docBlockResident) {
       int32_t landing = 0;
@@ -829,6 +922,7 @@ public:
   }
 
   std::span<const int32_t> peekDocOnlyBlock() {
+    assert(!scoredWordProbeActive);
     // One-way docs-only consumption, like nextDocOnly(): a peeked block may be
     // materialized from resident words with freqs skipped, so termFreq() and
     // positions are off the table from here on.
@@ -869,6 +963,7 @@ public:
 
   void consumeDocOnlyBlock(int32_t n) {
     assert(n >= 0);
+    assert(!scoredWordProbeActive);
     if (n == 0) {
       return;
     }
@@ -1224,6 +1319,7 @@ public:
   // everything else decodes and scatters per doc.
   void intoBitSet(std::span<uint64_t> bits, int32_t bitsBase, int32_t upTo) {
     assert(!trackPositions);
+    assert(!scoredWordProbeActive);
     docsOnlyConsumed = true;
     for (;;) {
       if (docBlockResident) {
@@ -1282,6 +1378,7 @@ public:
   std::pair<std::span<const int32_t>, std::span<const int32_t>> peekDocFreqBlock() {
     assert(!docBlockResident);
     assert(!docsOnlyConsumed);
+    assert(!scoredWordProbeActive);
     if (docid == PostingsReader::END) {
       return {};
     }
@@ -1328,6 +1425,7 @@ public:
 
   void consumeDocFreqBlock(int32_t n) {
     assert(n >= 0);
+    assert(!scoredWordProbeActive);
     if (n == 0) {
       return;
     }
@@ -1372,11 +1470,137 @@ public:
     }
   }
 
+  bool advanceOrBeginScoredWordProbe(int32_t target, ScoredWordProbe& probe) {
+    assert(target > docid);
+    assert(!docsOnlyConsumed);
+    assert(!docBlockResident);
+    assert(!trackPositions);
+    assert(!scoredWordProbeActive);
+    skipCount(SkipStats::advanceCalls);
+
+    if (docBufEnd > 0 && target <= docBuf[docBufEnd - 1]) {
+      advanceScoredNoPositionsFromReadyBlock(target);
+      return false;
+    }
+
+    if (nextL0Block < numDocBlocks
+        && (docBufEnd == 0 || target > docBuf[docBufEnd - 1])) {
+      skipToBlock(target);
+    }
+
+    if (docOrd >= docfreq || docfreq - docOrd < Postings::DOCS_BLOCK_SIZE) {
+      advanceScoredNoPositionsFromReadyBlock(target);
+      return false;
+    }
+
+    const int32_t blockStartOrd = docOrd;
+    const uint32_t base = (docOrd == 0) ? 0 : (uint32_t) docBuf[Postings::DOCS_BLOCK_SIZE - 1];
+    const uint32_t docBase = base + (blockStartOrd == 0 ? 0 : 1);
+
+    seekToBlockBody();
+    bodyReady = true;
+    const int8_t token = (int8_t) *docIS.ptr();
+    if (token > 0) {
+      advanceScoredNoPositionsFromReadyBlock(target);
+      return false;
+    }
+
+    bodyReady = false;
+    docIS.skip(1);
+    const int32_t numWords = token == Postings::DOC_BLOCK_CONTIGUOUS ? 0 : -token;
+    const char* wordsPtr = numWords == 0 ? nullptr : docIS.ptr();
+    uint32_t blockLast;
+    if (numWords == 0) {
+      blockLast = docBase + Postings::DOCS_BLOCK_SIZE - 1;
+    } else {
+      assert(numWords > 0);
+      uint64_t lastWord = loadWord64(wordsPtr + (int64_t) (numWords - 1) * 8);
+      assert(lastWord != 0);
+      blockLast = docBase + (uint32_t) (numWords - 1) * 64
+                  + (63 - (uint32_t) std::countl_zero(lastWord));
+      docIS.skip((int64_t) numWords * 8);
+    }
+
+    if (hasFreqs) {
+      uint32_t outSz = Postings::DOCS_BLOCK_SIZE;
+      auto bytesRead = IndexCodec::tfreqCodec.decodeBlock(docIS.ptr(), docIS.left(),
+                                                          (uint32_t*) tfreqBuf, outSz);
+      docIS.skip(bytesRead);
+      assert(outSz == Postings::DOCS_BLOCK_SIZE);
+    } else {
+      std::fill(tfreqBuf, tfreqBuf + Postings::DOCS_BLOCK_SIZE, 1);
+    }
+    tfreqBufIdx = 0;
+    tfreqBufEnd = Postings::DOCS_BLOCK_SIZE;
+
+    scoredWordProbeActive = true;
+    scoredProbeWordsPtr = wordsPtr;
+    scoredProbeDocBase = docBase;
+    scoredProbeBlockLast = blockLast;
+    scoredProbeBlockStartOrd = blockStartOrd;
+    scoredProbeNumWords = numWords;
+
+    docBuf[Postings::DOCS_BLOCK_SIZE - 1] = (int32_t) blockLast;
+    docBufIdx = docBufEnd = Postings::DOCS_BLOCK_SIZE;
+    nextL0Base = blockLast;
+    nextL0Block = blockStartOrd / Postings::DOCS_BLOCK_SIZE + 1;
+    if (isL1Boundary(nextL0Block)) {
+      nextL1Group = nextL0Block / L1_PERIOD;
+      nextL1Base = nextL0Base;
+      nextL1CumTf = nextL0CumTf;
+    }
+
+    probe.docBase = docBase;
+    probe.blockLast = (int32_t) blockLast;
+    probe.blockStartOrd = blockStartOrd;
+    probe.numWords = numWords;
+    probe.words = wordsPtr;
+    probe.freqs = std::span<const int32_t>(tfreqBuf, (size_t) Postings::DOCS_BLOCK_SIZE);
+    skipCount(SkipStats::scoredWordProbeAdvances);
+    return true;
+  }
+
+  void finishScoredWordProbeAt(int32_t doc, int32_t ordAfter) {
+    assert(scoredWordProbeActive);
+    assert(doc >= (int32_t) scoredProbeDocBase);
+    assert(doc <= (int32_t) scoredProbeBlockLast);
+    assert(ordAfter > scoredProbeBlockStartOrd);
+    assert(ordAfter <= scoredProbeBlockStartOrd + Postings::DOCS_BLOCK_SIZE);
+    materializeScoredWordProbeBlock();
+    const int32_t idx = ordAfter - scoredProbeBlockStartOrd - 1;
+    assert(idx >= 0 && idx < Postings::DOCS_BLOCK_SIZE);
+    assert(docBuf[idx] == doc);
+    docid = doc;
+    docOrd = ordAfter;
+    docBufIdx = idx + 1;
+    docBufEnd = Postings::DOCS_BLOCK_SIZE;
+    tfreqOrd = ordAfter;
+    tfreqBufIdx = idx + 1;
+    tfreqBufEnd = Postings::DOCS_BLOCK_SIZE;
+    tfreq = hasFreqs ? tfreqBuf[idx] : 1;
+    blockMode = false;
+    clearScoredWordProbe();
+  }
+
+  void finishScoredWordProbeAtBlockEnd() {
+    assert(scoredWordProbeActive);
+    docid = (int32_t) scoredProbeBlockLast;
+    docOrd = scoredProbeBlockStartOrd + Postings::DOCS_BLOCK_SIZE;
+    docBuf[Postings::DOCS_BLOCK_SIZE - 1] = (int32_t) scoredProbeBlockLast;
+    docBufIdx = docBufEnd = Postings::DOCS_BLOCK_SIZE;
+    tfreqOrd = docOrd;
+    tfreqBufIdx = tfreqBufEnd = Postings::DOCS_BLOCK_SIZE;
+    tfreq = tfreqBuf[Postings::DOCS_BLOCK_SIZE - 1];
+    blockMode = true;
+    clearScoredWordProbe();
+  }
+
 
   // Reset the doc decoder to the block that may contain target.  Position state is
   // repaired by cumulativeTermFreq; the position stream itself stays lazy.
   void skipToBlock(int32_t target) {
     assert(!docBlockResident);
+    assert(!scoredWordProbeActive);
     blockMode = false;
     clearPendingPositionRepair();
     const char* const streamStart = docIS.ptr(0);
@@ -1550,6 +1774,7 @@ private:
   template <bool DOCS_ONLY>
   int32_t advanceImpl(int32_t target) {
     assert(docid < target);
+    assert(!scoredWordProbeActive);
     skipCount(SkipStats::advanceCalls);
     if constexpr (DOCS_ONLY) {
       assert(!trackPositions);
@@ -1963,6 +2188,7 @@ public:
   void startPositions() {
     assert(!docBlockResident);
     assert(!docsOnlyConsumed);
+    assert(!scoredWordProbeActive);
     assert(hasPositions);  // positions are only queried on fields that index them
     assert(trackPositions);
     materializePendingPositionRepair();
@@ -2038,6 +2264,7 @@ public:
 
   int32_t nextPosition() {
     assert(!docBlockResident);
+    assert(!scoredWordProbeActive);
     if (posBufIdx >= posBufEndDoc) {
       // Reached the end of buffered pos deltas, either because
       // there are no more positions for this doc, or because we need
@@ -2099,6 +2326,7 @@ public:
 
   int32_t advancePosition(int32_t target) {
     assert(!docBlockResident);
+    assert(!scoredWordProbeActive);
     while (pos < target) {
       nextPosition();
     }

@@ -579,6 +579,57 @@ TEST_F(DocsEnumAdvanceTest, intoBitSetUsesResidentWordBlockAndStopsInsideWindow)
   SkipStats::reset();
 }
 
+TEST_F(DocsEnumAdvanceTest, intoBitSetPackedScatterClipsAndCrossesWords) {
+  std::vector<int32_t> docs;
+  docs.reserve((size_t) Postings::DOCS_BLOCK_SIZE);
+  for (int32_t i = 0; i < Postings::DOCS_BLOCK_SIZE; i++) {
+    docs.push_back(i * 33);
+  }
+
+  RAMDir dir;
+  MemPool pool;
+  writeRawSingleTerm(dir, pool, "packedscatter", docs);
+
+  PostingsReader reader(dir, 0);
+  FieldReader fieldReader(pool, reader);
+  ASSERT_TRUE(fieldReader.readNextField());
+  SegFieldInfo fieldInfo;
+  fieldReader.readFieldInfo(fieldInfo);
+  TermsEnum tenum(pool, reader, fieldInfo);
+  ASSERT_TRUE(tenum.seek("packedscatter"));
+
+  bool savedStats = SkipStats::enabled;
+  SkipStats::enabled = true;
+  SkipStats::reset();
+
+  DocsEnum denum(pool, reader, tenum);
+  denum.setTrackPositions(false);
+  const int32_t from = 50;
+  const int32_t to = 260;
+  std::vector<uint64_t> bits((size_t) (to - from + 63) / 64, 0);
+  denum.intoBitSet(bits, from, to);
+  EXPECT_EQ(docsFromBits(bits, from, to), modelWindow(docs, from, to));
+  EXPECT_EQ(denum.docId(), 231);
+  EXPECT_EQ(denum.nextDocOnly(), 264);
+
+  DocsEnum single(pool, reader, tenum);
+  single.setTrackPositions(false);
+  const int32_t singleFrom = 132;
+  const int32_t singleTo = 133;
+  std::vector<uint64_t> singleBits((size_t) (singleTo - singleFrom + 63) / 64, 0);
+  single.intoBitSet(singleBits, singleFrom, singleTo);
+  EXPECT_EQ(docsFromBits(singleBits, singleFrom, singleTo),
+            modelWindow(docs, singleFrom, singleTo));
+  EXPECT_EQ(single.docId(), 132);
+  EXPECT_EQ(single.nextDocOnly(), 165);
+
+  EXPECT_GT(SkipStats::docBlocksDecoded, 0);
+  EXPECT_GT(SkipStats::countBulkFillBlocks, 1);
+  EXPECT_EQ(SkipStats::countBulkFillWordBlocks, 0);
+  SkipStats::enabled = savedStats;
+  SkipStats::reset();
+}
+
 TEST_F(DocsEnumAdvanceTest, advanceAndIntoBitSetProbeContiguousRuns) {
   const std::vector<int32_t> docs = makeContiguousDocs(3 * Postings::DOCS_BLOCK_SIZE);
   RAMDir dir;

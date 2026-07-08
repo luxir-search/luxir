@@ -853,6 +853,213 @@ void addSweepDisjunctionDocs(CollectionHelper& helper, int32_t numTerms) {
   helper.indexAll(docs, UpdateMessage::COMMIT);
 }
 
+std::vector<int32_t> makeContiguousProbeBlock(int32_t docBase) {
+  std::vector<int32_t> docs;
+  docs.reserve(Postings::DOCS_BLOCK_SIZE);
+  for (int32_t i = 0; i < Postings::DOCS_BLOCK_SIZE; i++) {
+    docs.push_back(docBase + i);
+  }
+  return docs;
+}
+
+std::vector<int32_t> makePackedProbeBlock(int32_t docBase) {
+  std::vector<int32_t> docs;
+  docs.reserve(Postings::DOCS_BLOCK_SIZE);
+  for (int32_t i = 0; i < Postings::DOCS_BLOCK_SIZE; i++) {
+    docs.push_back(docBase + i * 8);
+  }
+  return docs;
+}
+
+std::vector<int32_t> makeWordProbeBlock(int32_t docBase) {
+  std::vector<int32_t> docs;
+  docs.reserve(Postings::DOCS_BLOCK_SIZE);
+  int32_t doc = docBase;
+  for (int32_t i = 0; i < Postings::DOCS_BLOCK_SIZE; i++) {
+    if (i == 0) {
+      doc = docBase;
+    } else {
+      doc += (i % 37) == 0 ? 31 : ((i % 3) == 0 ? 2 : 3);
+    }
+    docs.push_back(doc);
+  }
+  return docs;
+}
+
+std::vector<int32_t> makeMixedProbePostings() {
+  auto docs = makeContiguousProbeBlock(0);
+  auto packed = makePackedProbeBlock(docs.back() + 1);
+  docs.insert(docs.end(), packed.begin(), packed.end());
+  auto word = makeWordProbeBlock(docs.back() + 1);
+  docs.insert(docs.end(), word.begin(), word.end());
+  return docs;
+}
+
+void indexProbeTermDocs(CollectionHelper& helper, std::string_view term,
+                        const std::vector<int32_t>& postings,
+                        std::string_view idPrefix, int32_t extraDocs = 8) {
+  helper.clear();
+  std::vector<Doc> docs;
+  int32_t maxDoc = postings.empty() ? extraDocs : postings.back() + extraDocs;
+  docs.reserve((size_t) maxDoc);
+  size_t posting = 0;
+  for (int32_t doc = 0; doc < maxDoc; doc++) {
+    std::string body;
+    int32_t used = 0;
+    if (posting < postings.size() && postings[posting] == doc) {
+      int32_t tf = 1 + (int32_t) (posting % 5);
+      appendRepeatedTerm(body, term, tf);
+      used += tf;
+      posting++;
+    }
+    int32_t len = used + 17 + (doc % 11);
+    appendRepeatedTerm(body, "probe_filler", len - used);
+    docs.push_back(flatdoc("id", std::string(idPrefix) + "_" + std::to_string(doc),
+                           "body_w", body));
+  }
+  ASSERT_EQ(posting, postings.size());
+  helper.indexAll(docs, UpdateMessage::COMMIT);
+}
+
+std::vector<float> initialCandidateScores(int32_t size) {
+  std::vector<float> scores((size_t) size);
+  for (int32_t i = 0; i < size; i++) {
+    scores[(size_t) i] = (float) (i % 9) * 0.125f;
+  }
+  return scores;
+}
+
+struct CandidateSweepRun {
+  std::vector<int32_t> docs;
+  std::vector<float> scores;
+  int64_t scoredWordProbes = 0;
+};
+
+CandidateSweepRun runApplyTermCandidateSweep(IndexReader& reader, std::string_view term,
+                                             const std::vector<int32_t>& candidates,
+                                             bool required, bool collectStats = false) {
+  MemPool pool;
+  Query::Context qContext(pool, reader);
+  TermQuery query("body_w", term);
+  auto* weight = query.createWeight(qContext, Query::NEED_SCORES);
+  auto& segment = qContext.topReader.segments()[0];
+  auto* scorer = weight->createScorer(pool, segment);
+  EXPECT_NE(scorer, nullptr);
+
+  CandidateSweepRun run;
+  run.docs = candidates;
+  run.scores = initialCandidateScores((int32_t) candidates.size());
+  bool savedStats = SkipStats::enabled;
+  if (collectStats) {
+    SkipStats::enabled = true;
+    SkipStats::reset();
+  }
+  int32_t size = scorer == nullptr ? 0 : scorer->applyToCandidates(
+      run.docs.data(), run.scores.data(), (int32_t) run.docs.size(), required);
+  if (required) {
+    run.docs.resize((size_t) size);
+    run.scores.resize((size_t) size);
+  }
+  if (collectStats) {
+    run.scoredWordProbes = SkipStats::scoredWordProbeAdvances;
+    SkipStats::enabled = savedStats;
+  }
+  return run;
+}
+
+CandidateSweepRun runPerDocTermCandidateSweep(IndexReader& reader, std::string_view term,
+                                              const std::vector<int32_t>& candidates,
+                                              bool required) {
+  MemPool pool;
+  Query::Context qContext(pool, reader);
+  TermQuery query("body_w", term);
+  auto* weight = query.createWeight(qContext, Query::NEED_SCORES);
+  auto& segment = qContext.topReader.segments()[0];
+  auto* scorer = weight->createScorer(pool, segment);
+  EXPECT_NE(scorer, nullptr);
+
+  CandidateSweepRun run;
+  run.docs = candidates;
+  run.scores = initialCandidateScores((int32_t) candidates.size());
+  if (scorer == nullptr) {
+    if (required) {
+      run.docs.clear();
+      run.scores.clear();
+    }
+    return run;
+  }
+
+  int32_t write = 0;
+  int32_t current = scorer->docId();
+  for (int32_t i = 0; i < (int32_t) candidates.size(); i++) {
+    int32_t target = run.docs[(size_t) i];
+    if (current < target) {
+      current = scorer->advance(target);
+    }
+    bool matched = current == target;
+    if (matched) {
+      run.scores[(size_t) i] += scorer->score();
+    }
+    if (required && matched) {
+      if (write != i) {
+        run.docs[(size_t) write] = run.docs[(size_t) i];
+        run.scores[(size_t) write] = run.scores[(size_t) i];
+      }
+      write++;
+    }
+  }
+  if (required) {
+    run.docs.resize((size_t) write);
+    run.scores.resize((size_t) write);
+  }
+  return run;
+}
+
+void expectCandidateSweepEqual(const CandidateSweepRun& expected,
+                               const CandidateSweepRun& actual) {
+  ASSERT_EQ(expected.docs, actual.docs);
+  ASSERT_EQ(expected.scores.size(), actual.scores.size());
+  for (size_t i = 0; i < expected.scores.size(); i++) {
+    EXPECT_EQ(std::bit_cast<uint32_t>(expected.scores[i]),
+              std::bit_cast<uint32_t>(actual.scores[i])) << "i=" << i;
+  }
+}
+
+struct FillRun {
+  std::vector<int32_t> docs;
+  std::vector<float> scores;
+};
+
+FillRun collectTermPerDoc(IndexReader& reader, std::string_view term,
+                          int32_t start, int32_t upTo) {
+  MemPool pool;
+  Query::Context qContext(pool, reader);
+  TermQuery query("body_w", term);
+  auto* weight = query.createWeight(qContext, Query::NEED_SCORES);
+  auto& segment = qContext.topReader.segments()[0];
+  auto* scorer = weight->createScorer(pool, segment);
+  FillRun run;
+  if (scorer == nullptr) {
+    return run;
+  }
+  int32_t doc = scorer->docId() < start ? scorer->advance(start) : scorer->docId();
+  while (doc < upTo) {
+    run.docs.push_back(doc);
+    run.scores.push_back(scorer->score());
+    doc = scorer->next();
+  }
+  return run;
+}
+
+void expectFillRunNear(const FillRun& expected, const FillRun& actual) {
+  ASSERT_EQ(expected.docs, actual.docs);
+  ASSERT_EQ(expected.scores.size(), actual.scores.size());
+  for (size_t i = 0; i < expected.scores.size(); i++) {
+    EXPECT_NEAR(expected.scores[i], actual.scores[i], 1.0e-5f) << "doc="
+                                                              << expected.docs[i];
+  }
+}
+
 std::unique_ptr<DocSet> makeEveryNthSegmentDocSet(IndexReader::Segment& segment,
                                                   int32_t step, bool arrayDocSet,
                                                   bool liveOnly) {
@@ -4316,6 +4523,185 @@ TEST_F(TermScorerTest, MaxScoreBulkScorerBufferSweepsMatchExhaustiveAcrossShapes
   EXPECT_GT(sweepWindows, 0);
   EXPECT_GT(compactionDrops, 0);
   helper.clear();
+}
+
+TEST_F(TermScorerTest, ScoredWordProbeApplyToCandidatesMatchesPerDocAdvanceAcrossBlockShapes) {
+  CollectionHelper helper("main");
+  auto postings = makeMixedProbePostings();
+  indexProbeTermDocs(helper, "probe_mix", postings, "probe_mix");
+  auto reader = helper.getIndexWriter()->getIndexReader();
+  const int32_t packedOrd = Postings::DOCS_BLOCK_SIZE;
+  const int32_t wordOrd = 2 * Postings::DOCS_BLOCK_SIZE;
+
+  std::vector<int32_t> candidates = {
+    0, 1, 63, 127,
+    postings[(size_t) packedOrd],
+    postings[(size_t) packedOrd] + 1,
+    postings[(size_t) packedOrd + 1],
+    postings[(size_t) packedOrd + 22],
+    postings[(size_t) packedOrd + 22] + 1,
+    postings[(size_t) wordOrd],
+    postings[(size_t) wordOrd] + 1,
+    postings[(size_t) wordOrd + 1],
+    postings[(size_t) wordOrd + 5],
+    postings[(size_t) wordOrd + 34],
+    postings[(size_t) wordOrd + 70],
+    postings[(size_t) wordOrd + 127],
+    postings.back() + 1
+  };
+  std::sort(candidates.begin(), candidates.end());
+  candidates.erase(std::unique(candidates.begin(), candidates.end()), candidates.end());
+
+  for (bool required : {false, true}) {
+    auto expected = runPerDocTermCandidateSweep(*reader, "probe_mix", candidates, required);
+    auto actual = runApplyTermCandidateSweep(*reader, "probe_mix", candidates,
+                                             required, !required);
+    expectCandidateSweepEqual(expected, actual);
+    if (!required) {
+      EXPECT_GT(actual.scoredWordProbes, 0);
+    }
+  }
+  helper.clear();
+}
+
+TEST_F(TermScorerTest, ScoredWordProbeRankAndEarlyCompactionKeepsCursorCoherent) {
+  CollectionHelper helper("main");
+  auto postings = makeWordProbeBlock(0);
+  indexProbeTermDocs(helper, "rank_probe", postings, "rank_probe");
+  auto reader = helper.getIndexWriter()->getIndexReader();
+
+  std::vector<int32_t> rankCandidates = {
+    postings[0],
+    postings[1],
+    postings[2],
+    postings[1] + 1,
+    postings[31],
+    postings[63],
+    postings[96],
+    postings[127]
+  };
+  std::sort(rankCandidates.begin(), rankCandidates.end());
+  auto expected = runPerDocTermCandidateSweep(*reader, "rank_probe", rankCandidates, false);
+  auto actual = runApplyTermCandidateSweep(*reader, "rank_probe", rankCandidates, false, true);
+  expectCandidateSweepEqual(expected, actual);
+  EXPECT_GT(actual.scoredWordProbes, 0);
+
+  MemPool pool;
+  Query::Context qContext(pool, *reader);
+  TermQuery query("body_w", "rank_probe");
+  auto* weight = query.createWeight(qContext, Query::NEED_SCORES);
+  auto& segment = qContext.topReader.segments()[0];
+  auto* scorer = weight->createScorer(pool, segment);
+  ASSERT_NE(scorer, nullptr);
+
+  std::vector<int32_t> missDocs = {1, 2};
+  auto missScores = initialCandidateScores((int32_t) missDocs.size());
+  bool savedStats = SkipStats::enabled;
+  SkipStats::enabled = true;
+  SkipStats::reset();
+  int32_t kept = scorer->applyToCandidates(missDocs.data(), missScores.data(),
+                                           (int32_t) missDocs.size(), true);
+  EXPECT_EQ(kept, 0);
+  EXPECT_GT(SkipStats::scoredWordProbeAdvances, 0);
+  SkipStats::enabled = savedStats;
+
+  FillRun filled;
+  int32_t blockDocs[Postings::DOCS_BLOCK_SIZE];
+  float blockScores[Postings::DOCS_BLOCK_SIZE];
+  int32_t upTo = postings[12] + 1;
+  int32_t n = 0;
+  while ((n = scorer->fillScoreBlock(blockDocs, blockScores,
+                                     Postings::DOCS_BLOCK_SIZE, upTo)) > 0) {
+    for (int32_t i = 0; i < n; i++) {
+      filled.docs.push_back(blockDocs[i]);
+      filled.scores.push_back(blockScores[i]);
+    }
+  }
+  auto oracle = collectTermPerDoc(*reader, "rank_probe", postings[1], upTo);
+  expectFillRunNear(oracle, filled);
+  helper.clear();
+}
+
+TEST_F(TermScorerTest, ScoredWordProbeSweepThenEssentialFillAcrossWindowBoundaryMatchesOracle) {
+  CollectionHelper helper("main");
+  auto postings = makeWordProbeBlock(0);
+  indexProbeTermDocs(helper, "flip_probe", postings, "flip_probe");
+  auto reader = helper.getIndexWriter()->getIndexReader();
+
+  MemPool pool;
+  Query::Context qContext(pool, *reader);
+  TermQuery query("body_w", "flip_probe");
+  auto* weight = query.createWeight(qContext, Query::NEED_SCORES);
+  auto& segment = qContext.topReader.segments()[0];
+  auto* scorer = weight->createScorer(pool, segment);
+  ASSERT_NE(scorer, nullptr);
+
+  std::vector<int32_t> windowNCandidates = {
+    1,
+    postings[10],
+    postings[10] + 1,
+    postings[20]
+  };
+  auto scores = initialCandidateScores((int32_t) windowNCandidates.size());
+  int32_t kept = scorer->applyToCandidates(windowNCandidates.data(), scores.data(),
+                                           (int32_t) windowNCandidates.size(), false);
+  EXPECT_EQ(kept, (int32_t) windowNCandidates.size());
+
+  int32_t windowStart = postings[60];
+  int32_t upTo = postings[92] + 1;
+  if (scorer->docId() < windowStart) {
+    scorer->advance(windowStart);
+  }
+
+  FillRun filled;
+  int32_t blockDocs[Postings::DOCS_BLOCK_SIZE];
+  float blockScores[Postings::DOCS_BLOCK_SIZE];
+  int32_t n = 0;
+  while ((n = scorer->fillScoreBlock(blockDocs, blockScores,
+                                     Postings::DOCS_BLOCK_SIZE, upTo)) > 0) {
+    for (int32_t i = 0; i < n; i++) {
+      filled.docs.push_back(blockDocs[i]);
+      filled.scores.push_back(blockScores[i]);
+    }
+  }
+
+  auto oracle = collectTermPerDoc(*reader, "flip_probe", windowStart, upTo);
+  expectFillRunNear(oracle, filled);
+  helper.clear();
+}
+
+TEST_F(TermScorerTest, ScoredWordProbeSkipStatsSeparateFromPackedFallback) {
+  {
+    CollectionHelper helper("main");
+    auto postings = makeWordProbeBlock(0);
+    indexProbeTermDocs(helper, "word_stats_probe", postings, "word_stats_probe");
+    auto reader = helper.getIndexWriter()->getIndexReader();
+    std::vector<int32_t> candidates = {
+      postings[0],
+      postings[1] + 1,
+      postings[32],
+      postings[80]
+    };
+    auto actual = runApplyTermCandidateSweep(*reader, "word_stats_probe", candidates,
+                                             false, true);
+    EXPECT_GT(actual.scoredWordProbes, 0);
+    helper.clear();
+  }
+
+  {
+    CollectionHelper helper("main");
+    auto postings = makePackedProbeBlock(0);
+    indexProbeTermDocs(helper, "packed_stats_probe", postings, "packed_stats_probe");
+    auto reader = helper.getIndexWriter()->getIndexReader();
+    std::vector<int32_t> candidates = {0, 1, 8, 64, 65, postings.back()};
+    auto expected = runPerDocTermCandidateSweep(*reader, "packed_stats_probe",
+                                                candidates, false);
+    auto actual = runApplyTermCandidateSweep(*reader, "packed_stats_probe",
+                                             candidates, false, true);
+    expectCandidateSweepEqual(expected, actual);
+    EXPECT_EQ(actual.scoredWordProbes, 0);
+    helper.clear();
+  }
 }
 
 TEST_F(TermScorerTest, MaxScoreBulkScorerRequiredPromotionMakesHighThetaTwoClauseConjunction) {

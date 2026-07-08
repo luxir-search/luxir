@@ -27,7 +27,8 @@ struct SkipStats {
   // L1 group headers walked in skipToBlock. The level2 decision metric: if this
   // dominates on long-list queries, a coarser third level pays off.
   static inline int64_t l1GroupSteps = 0;
-  // DocsEnum::advance() invocations (leapfrog / impact-skip driver calls).
+  // DocsEnum::advance() and advance-or-begin probe invocations (leapfrog /
+  // impact-skip driver calls).
   static inline int64_t advanceCalls = 0;
   // Position-stream accounting: O(1) seeks off the L0 posByteOff anchors
   // (skipToBlock), whole position blocks hopped without unpacking
@@ -74,6 +75,7 @@ struct SkipStats {
   static inline int64_t bulkDomainWindowsFed = 0;
   static inline int64_t docsOnlyFreqBlocksSkipped = 0;
   static inline int64_t docsOnlyWordProbeAdvances = 0;
+  static inline int64_t scoredWordProbeAdvances = 0;
 
   static void reset() {
     docBlocksDecoded = 0;
@@ -115,6 +117,7 @@ struct SkipStats {
     bulkDomainWindowsFed = 0;
     docsOnlyFreqBlocksSkipped = 0;
     docsOnlyWordProbeAdvances = 0;
+    scoredWordProbeAdvances = 0;
   }
 };
 
