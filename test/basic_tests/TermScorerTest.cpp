@@ -3484,6 +3484,223 @@ TEST_F(TermScorerTest, phraseSortedExecutionMatchesTextOrder) {
   }
 }
 
+// Repeated-term phrases share one postings enum per distinct term; the
+// dedup-off hook is the oracle. Shapes: repeat at lead and tail, two repeat
+// groups ("t1 t2 t3 t4 t1 t2"), gapped repeats, overlapping matches, and a
+// term frequency past POSITIONS_BLOCK_SIZE so the drain crosses a position
+// block boundary.
+TEST_F(TermScorerTest, phraseRepeatedTermDedupMatchesPerOccurrenceEnums) {
+  const int32_t N = 3 * Postings::DOCS_BLOCK_SIZE + 17;
+  TestIndex testIndex;
+  TestField f(testIndex, "body_w");
+  f.startIndexing();
+  std::string big;
+  for (int32_t k = 0; k < Postings::POSITIONS_BLOCK_SIZE + 40; k++) {
+    big += "w x ";
+  }
+  for (int32_t doc = 0; doc < N; doc++) {
+    switch (doc % 14) {
+      case 0: f.add(doc, "a b a pad"); break;         // match at 0
+      case 1: f.add(doc, "a b b a"); break;           // miss
+      case 2: f.add(doc, "a a b pad"); break;         // lead-repeat match
+      case 3: f.add(doc, "b a b a b a"); break;       // overlapping matches
+      case 4: f.add(doc, "t1 t2 t3 t4 t1 t2"); break; // two repeat groups
+      case 5: f.add(doc, "t1 t2 t3 t4 t1 pad"); break; // 6-gram miss
+      case 6: f.add(doc, big); break;                 // tf(w) crosses a pos block
+      case 7: f.add(doc, "a pad a pad"); break;       // gapped repeat match
+      case 8: f.add(doc, "a pad pad a"); break;       // gapped repeat miss
+      case 9: f.add(doc, "x w x pad"); break;
+      // A failed candidate must not strand the lead repeat slot past a
+      // middle "a" that starts the real match ("a x a x a" cases): the
+      // per-slot cursors resume mid-buffer after the base re-kicks.
+      case 10: f.add(doc, "a y a x a x a"); break;    // match at 2 after 0 fails
+      case 11: f.add(doc, "a x a y a x a x a"); break; // match at 4 after 0,2 fail
+      case 12: f.add(doc, "a y a x a"); break;        // all candidates fail
+      default: f.add(doc, "pad a b pad"); break;
+    }
+  }
+  testIndex.flush();
+  f.startReading();
+
+  auto poolFree = testIndex.pool.rewindScopeGuard();
+  Query::Context qContext(testIndex.pool, *testIndex.reader);
+  auto& segment = qContext.topReader.segments()[0];
+
+  struct Hit { int32_t doc; uint32_t scoreBits; };
+  // Clause order matters for coverage: the docFreq sort usually leads with
+  // the rarest term, which can keep the repeated term out of the lead slot;
+  // text order (sorted=false) forces the repeated term to lead in the
+  // "a x a x a" shapes. Every case runs both ways.
+  auto run = [&](std::span<std::string_view> terms, std::span<const int32_t> positions,
+                 bool dedup, bool sorted, int64_t* decodes = nullptr) {
+    bool savedDedup = PhraseQuery::Scorer::disableRepeatDedupForTests;
+    bool savedSort = PhraseQuery::Scorer::disableSortForTests;
+    PhraseQuery::Scorer::disableRepeatDedupForTests = !dedup;
+    PhraseQuery::Scorer::disableSortForTests = !sorted;
+    SkipStatsGuard stats;
+    PhraseQuery phrase("body_w", terms, positions);
+    auto* weight = phrase.createWeight(qContext, Query::NEED_SCORES);
+    auto* scorer = weight->createScorer(testIndex.pool, segment);
+    std::vector<Hit> hits;
+    if (scorer != nullptr) {
+      for (int32_t doc = scorer->next(); doc != PostingsReader::END; doc = scorer->next()) {
+        hits.push_back({doc, std::bit_cast<uint32_t>(scorer->score())});
+      }
+    }
+    if (decodes != nullptr) {
+      *decodes = SkipStats::docBlocksDecoded + SkipStats::posBlocksDecoded;
+    }
+    PhraseQuery::Scorer::disableRepeatDedupForTests = savedDedup;
+    PhraseQuery::Scorer::disableSortForTests = savedSort;
+    return hits;
+  };
+
+  std::vector<std::string_view> aba = {"a", "b", "a"};
+  std::vector<int32_t> pos012 = {0, 1, 2};
+  std::vector<std::string_view> aab = {"a", "a", "b"};
+  std::vector<std::string_view> sixGram = {"t1", "t2", "t3", "t4", "t1", "t2"};
+  std::vector<int32_t> pos6 = {0, 1, 2, 3, 4, 5};
+  std::vector<std::string_view> wxw = {"w", "x", "w"};
+  std::vector<std::string_view> aGapA = {"a", "a"};
+  std::vector<int32_t> pos02 = {0, 2};
+  std::vector<std::string_view> axaxa = {"a", "x", "a", "x", "a"};
+  std::vector<int32_t> pos5 = {0, 1, 2, 3, 4};
+
+  struct Case { std::span<std::string_view> terms; std::span<const int32_t> pos; const char* label; };
+  for (auto& c : std::initializer_list<Case>{{aba, pos012, "a b a"},
+                                             {aab, pos012, "a a b"},
+                                             {sixGram, pos6, "t1 t2 t3 t4 t1 t2"},
+                                             {wxw, pos012, "w x w"},
+                                             {aGapA, pos02, "a _ a"},
+                                             {axaxa, pos5, "a x a x a"}}) {
+    for (bool sorted : {true, false}) {
+      auto expected = run(c.terms, c.pos, false, sorted);
+      auto actual = run(c.terms, c.pos, true, sorted);
+      ASSERT_FALSE(expected.empty()) << c.label << " sorted=" << sorted;
+      ASSERT_EQ(expected.size(), actual.size()) << c.label << " sorted=" << sorted;
+      for (size_t i = 0; i < expected.size(); i++) {
+        EXPECT_EQ(expected[i].doc, actual[i].doc) << c.label << " sorted=" << sorted << " i=" << i;
+        EXPECT_EQ(expected[i].scoreBits, actual[i].scoreBits)
+            << c.label << " sorted=" << sorted << " i=" << i;
+      }
+    }
+  }
+
+  // Ground truth independent of the oracle: the 6-gram matches exactly the
+  // doc % 14 == 4 docs, and "a x a x a" matches exactly the mid-start docs
+  // (cases 10 and 11), not the all-candidates-fail case 12.
+  auto sixHits = run(sixGram, pos6, true, true);
+  ASSERT_FALSE(sixHits.empty());
+  size_t expectSix = 0;
+  for (int32_t d = 0; d < N; d++) {
+    if (d % 14 == 4) expectSix++;
+  }
+  for (auto& h : sixHits) {
+    EXPECT_EQ(4, h.doc % 14);
+  }
+  EXPECT_EQ(expectSix, sixHits.size());
+
+  auto axaxaHits = run(axaxa, pos5, true, false);
+  ASSERT_FALSE(axaxaHits.empty());
+  size_t expectAxaxa = 0;
+  for (int32_t d = 0; d < N; d++) {
+    if (d % 14 == 10 || d % 14 == 11) expectAxaxa++;
+  }
+  for (auto& h : axaxaHits) {
+    int32_t c = h.doc % 14;
+    EXPECT_TRUE(c == 10 || c == 11) << "doc " << h.doc;
+  }
+  EXPECT_EQ(expectAxaxa, axaxaHits.size());
+
+  // The shared enum decodes each duplicated term's blocks once: strictly
+  // fewer doc+position block decodes than per-occurrence enums.
+  int64_t dedupDecodes = 0, dupDecodes = 0;
+  run(wxw, pos012, true, true, &dedupDecodes);
+  run(wxw, pos012, false, true, &dupDecodes);
+  EXPECT_LT(dedupDecodes, dupDecodes);
+}
+
+// Fuzz the repeat-dedup scorer against the per-occurrence oracle: random
+// docs over a tiny alphabet (repeats collide constantly), random phrases
+// with repeated terms and gaps, both execution orders. Docs and score bits
+// must agree exactly.
+TEST_F(TermScorerTest, phraseRepeatedTermDedupFuzzMatchesOracle) {
+  constexpr int32_t kDocs = 500;
+  constexpr int32_t kPhrases = 150;
+  static constexpr std::string_view kVocab[] = {"a", "b", "c", "d"};
+  constexpr size_t kVocabSize = std::size(kVocab);
+
+  TestIndex testIndex;
+  TestField f(testIndex, "body_w");
+  f.startIndexing();
+  for (int32_t doc = 0; doc < kDocs; doc++) {
+    int32_t len = (int32_t) rng.rint(3, 30);
+    std::string body;
+    for (int32_t k = 0; k < len; k++) {
+      if (!body.empty()) body.push_back(' ');
+      // skew: "a" twice as likely, so repeated-"a" phrases hit often
+      size_t pick = (size_t) rng.rint(kVocabSize + 2);
+      body.append(kVocab[pick >= kVocabSize ? 0 : pick]);
+    }
+    f.add(doc, body);
+  }
+  testIndex.flush();
+  f.startReading();
+
+  auto poolFree = testIndex.pool.rewindScopeGuard();
+  Query::Context qContext(testIndex.pool, *testIndex.reader);
+  auto& segment = qContext.topReader.segments()[0];
+
+  struct Hit { int32_t doc; uint32_t scoreBits; };
+  auto run = [&](std::span<std::string_view> terms, std::span<const int32_t> positions,
+                 bool dedup, bool sorted) {
+    bool savedDedup = PhraseQuery::Scorer::disableRepeatDedupForTests;
+    bool savedSort = PhraseQuery::Scorer::disableSortForTests;
+    PhraseQuery::Scorer::disableRepeatDedupForTests = !dedup;
+    PhraseQuery::Scorer::disableSortForTests = !sorted;
+    PhraseQuery phrase("body_w", terms, positions);
+    auto* weight = phrase.createWeight(qContext, Query::NEED_SCORES);
+    auto* scorer = weight->createScorer(testIndex.pool, segment);
+    std::vector<Hit> hits;
+    if (scorer != nullptr) {
+      for (int32_t doc = scorer->next(); doc != PostingsReader::END; doc = scorer->next()) {
+        hits.push_back({doc, std::bit_cast<uint32_t>(scorer->score())});
+      }
+    }
+    PhraseQuery::Scorer::disableRepeatDedupForTests = savedDedup;
+    PhraseQuery::Scorer::disableSortForTests = savedSort;
+    return hits;
+  };
+
+  for (int32_t q = 0; q < kPhrases; q++) {
+    int32_t len = (int32_t) rng.rint(2, 7);
+    std::vector<std::string_view> terms;
+    std::vector<int32_t> positions;
+    int32_t pos = 0;
+    std::string label;
+    for (int32_t k = 0; k < len; k++) {
+      size_t pick = (size_t) rng.rint(kVocabSize + 2);
+      terms.push_back(kVocab[pick >= kVocabSize ? 0 : pick]);
+      positions.push_back(pos);
+      label += terms.back();
+      label += " ";
+      pos += 1 + (int32_t) (rng.rint(5) == 0);  // ~20% gapped slot
+    }
+    for (bool sorted : {true, false}) {
+      auto expected = run(terms, positions, false, sorted);
+      auto actual = run(terms, positions, true, sorted);
+      ASSERT_EQ(expected.size(), actual.size())
+          << "phrase '" << label << "' sorted=" << sorted;
+      for (size_t i = 0; i < expected.size(); i++) {
+        ASSERT_EQ(expected[i].doc, actual[i].doc)
+            << "phrase '" << label << "' sorted=" << sorted << " i=" << i;
+        ASSERT_EQ(expected[i].scoreBits, actual[i].scoreBits)
+            << "phrase '" << label << "' sorted=" << sorted << " i=" << i;
+      }
+    }
+  }
+}
+
 // Block-max conjunction: the summed clause bounds let a scored "+a +b" skip
 // doc-block ranges that cannot beat the threshold.  Two separated strong
 // regions (blocks 0 and 8) force real range hops, weak long docs in between;

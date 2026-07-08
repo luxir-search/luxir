@@ -83,15 +83,31 @@ public:
       if (segFieldInfo == nullptr) {
         return nullptr;
       }
-      // TODO: share one enum across repeated terms. A phrase like
-      // "to be or not to be" opens six postings+positions streams where four
-      // would do. The half measure dedups only the doc-level conjunction
-      // (each distinct term advances once); but since positions decode per
-      // (enum, doc) into a buffer anyway, the deduped enum's buffer can serve
-      // every offset that term covers - decode docs AND positions once, with
-      // per-slot cursors over the shared buffer.
+      // Repeated terms share one postings enum, so a duplicated term's doc
+      // and position blocks decode once. The doc conjunction needs no special
+      // handling for the aliases (doNext's strict-advance guard skips an enum
+      // already at the target); position verification reads the shared
+      // positions through per-slot cursors (see Scorer::RepeatGroup).
       auto docsEnums = targetPool.make_span<DocsEnum*>(cachedTermInfos.size());
+      auto terms = query.getTerms();
+      int32_t distinctCount = 0;
+      bool hasRepeats = false;
       for (int i = 0; i < cachedTermInfos.size(); i++) {
+        int32_t first = (int32_t) i;
+        if (!Scorer::disableRepeatDedupForTests) {
+          for (int32_t j = 0; j < (int32_t) i; j++) {
+            if (terms[(size_t) j] == terms[(size_t) i]) {
+              first = j;
+              break;
+            }
+          }
+        }
+        if (first != (int32_t) i) {
+          docsEnums[i] = docsEnums[(size_t) first];
+          hasRepeats = true;
+          continue;
+        }
+        distinctCount++;
         docsEnums[i] = cachedTermInfos[i]->useDocsEnum(targetPool, segment);
         if (docsEnums[i] == nullptr) {
           // term doesn't exist in this segment
@@ -130,6 +146,35 @@ public:
         }
       }
 
+      // Map slots that share an enum onto repeat groups for the position walk.
+      std::span<const int32_t> slotGroup{};
+      std::span<Scorer::RepeatGroup> groups{};
+      if (hasRepeats) {
+        auto sg = targetPool.make_span<int32_t>(docsEnums.size());
+        std::fill(sg.begin(), sg.end(), -1);
+        int32_t numGroups = 0;
+        for (size_t i = 0; i < docsEnums.size(); i++) {
+          if (sg[i] >= 0) continue;
+          int32_t gid = -1;
+          for (size_t j = i + 1; j < docsEnums.size(); j++) {
+            if (docsEnums[j] == docsEnums[i]) {
+              if (gid < 0) {
+                gid = numGroups++;
+                sg[i] = gid;
+              }
+              sg[j] = gid;
+            }
+          }
+        }
+        groups = targetPool.make_span<Scorer::RepeatGroup>((size_t) numGroups);
+        for (size_t i = 0; i < docsEnums.size(); i++) {
+          if (sg[i] >= 0) {
+            groups[(size_t) sg[i]].docsEnum = docsEnums[i];
+          }
+        }
+        slotGroup = sg;
+      }
+
       // Position matching does not need norms when score() is never read.
       NormsReader* normsReader = (inputFlags & NEED_SCORES) != 0
               ? targetPool.make<NormsReader>(segment.postingsReader(), *segFieldInfo)
@@ -142,20 +187,31 @@ public:
       // parent drives the phrase as a clause; the phrase's own single-phase
       // pruning is the per-doc bound in doMatches (a range-skip loop here was
       // measured a net loss - the range bounds are too loose to fire).
+      // One index per DISTINCT enum: getMaxScore/advanceShallow take a min
+      // over the entries, so a duplicated term contributes once.
       std::span<ImpactsIndex> impacts;
       if (simScorer != nullptr && normsReader != nullptr) {
-        auto built = targetPool.make_span<ImpactsIndex>(docsEnums.size());
+        auto built = targetPool.make_span<ImpactsIndex>((size_t) distinctCount);
         bool allBuilt = true;
+        size_t n = 0;
         for (size_t i = 0; i < docsEnums.size(); i++) {
-          built[i].build(targetPool, *docsEnums[i], *simScorer, 1.0f);
-          allBuilt &= !built[i].empty();
+          bool seen = false;
+          for (size_t j = 0; j < i && !seen; j++) {
+            seen = docsEnums[j] == docsEnums[i];
+          }
+          if (seen) continue;
+          built[n].build(targetPool, *docsEnums[i], *simScorer, 1.0f);
+          allBuilt &= !built[n].empty();
+          n++;
         }
+        assert(n == (size_t) distinctCount);
         if (allBuilt) {
           impacts = built;  // a term without impact data (pulsed) disables bounding
         }
       }
 
-      return targetPool.make<PhraseQuery::Scorer>(targetPool, docsEnums, positions, normsReader, simScorer, impacts);
+      return targetPool.make<PhraseQuery::Scorer>(targetPool, docsEnums, positions, normsReader,
+                                                  simScorer, impacts, slotGroup, groups);
     }
 
     // A phrase matches a subset of the docs containing its rarest term, so its
@@ -195,8 +251,30 @@ public:
 
 
   class Scorer final : public Query::Scorer {
+  public:
+    // One duplicated term's positions for the current doc, drained once and
+    // read by every slot of that term through its own cursor. A shared
+    // advancePosition cursor would be wrong: when the base candidate advances
+    // by less than the gap between two offsets of the same term, the lower
+    // offset's next target lies behind where the shared cursor already moved.
+    struct RepeatGroup {
+      DocsEnum* docsEnum = nullptr;
+      int32_t* buf = nullptr;  // absolute positions of the current doc + END sentinel
+      int32_t cap = 0;
+      int32_t count = 0;       // termFreq of the current doc
+      int32_t filled = 0;      // positions pulled so far; buf[count] is the sentinel
+    };
+
+  private:
     std::span<DocsEnum*> docsEnums;
     std::span<const int32_t> positions;
+    // Repeated-term support; groups is empty (and the fields dormant) for the
+    // common no-repeats phrase, whose verification path is unchanged.
+    MemPool* pool;
+    std::span<const int32_t> slotGroup;  // slot -> repeat group, -1 = own enum
+    std::span<RepeatGroup> groups;
+    std::span<int32_t> slotCursor;       // per-slot index into its group's buf
+    bool hasRepeats = false;
     // Both absent when scores are not needed; score() is 0.
     std::optional<NormsReader::Iterator> normsIter;
     Similarity::BM25Scorer* simScorer;
@@ -288,6 +366,102 @@ public:
       // unreachable
     }
 
+    // Per-doc reset only: positions are pulled lazily as the cursors need
+    // them (an eager drain measured 7% slower on repeat stopword phrases -
+    // failed candidates abandon after a few positions, and eager decoding of
+    // every candidate's full tf threw that away). buf[count] is the END
+    // sentinel, placed up front so cursor scans always terminate.
+    void resetRepeatGroups() {
+      for (auto& group : groups) {
+        group.count = group.docsEnum->termFreq();
+        if (group.count >= group.cap) {
+          group.cap = std::max(group.count + 1, group.cap * 2);
+          group.buf = pool->make_arr<int32_t>((size_t) group.cap);
+        }
+        group.filled = 0;
+        group.buf[group.count] = PostingsReader::END;
+      }
+      std::fill(slotCursor.begin(), slotCursor.end(), 0);
+    }
+
+    // advancePosition for a slot: direct for a slot that owns its enum,
+    // cursor-over-shared-buffer for a repeat slot, filling the buffer from
+    // the enum on demand. Each position is decoded once no matter how many
+    // slots read it. The sentinel bounds the scan (targets never exceed
+    // largestPossiblePos < END).
+    int32_t repeatSlotAdvance(int32_t slot, int32_t target) {
+      int32_t g = slotGroup[(size_t) slot];
+      if (g < 0) {
+        return docsEnums[(size_t) slot]->advancePosition(target);
+      }
+      RepeatGroup& group = groups[(size_t) g];
+      int32_t idx = slotCursor[(size_t) slot];
+      for (;;) {
+        while (idx >= group.filled && group.filled < group.count) {
+          group.buf[group.filled++] = group.docsEnum->nextPosition();
+        }
+        if (group.buf[idx] >= target) {
+          break;
+        }
+        idx++;
+      }
+      slotCursor[(size_t) slot] = idx;
+      return group.buf[idx];
+    }
+
+    // nextPosition for a slot, mirroring repeatSlotAdvance's cursor semantics
+    // (the cursor rests on the last returned position).
+    int32_t repeatSlotNext(int32_t slot) {
+      int32_t g = slotGroup[(size_t) slot];
+      if (g < 0) {
+        return docsEnums[(size_t) slot]->nextPosition();
+      }
+      RepeatGroup& group = groups[(size_t) g];
+      int32_t idx = slotCursor[(size_t) slot];
+      if (idx >= group.count) {
+        return PostingsReader::END;  // resting on the sentinel already
+      }
+      idx++;
+      while (idx >= group.filled && group.filled < group.count) {
+        group.buf[group.filled++] = group.docsEnum->nextPosition();
+      }
+      slotCursor[(size_t) slot] = idx;
+      return group.buf[idx];
+    }
+
+    // doNextPosition for phrases with repeated terms: identical walk, with
+    // per-slot cursors standing in for per-enum position cursors.
+    int32_t doNextPositionRepeats(int32_t target) {
+      outer:
+      for (;;) {
+        if (target > largestPossiblePos) {
+          pos = PostingsReader::END;
+          return PostingsReader::END;
+        }
+
+        for (int j = 1; j < docsEnums.size(); j++) {
+          int32_t adjustedTarget = target + positions[j];
+          int32_t p = repeatSlotAdvance(j, adjustedTarget);
+          assert(p >= adjustedTarget);
+          if (p > adjustedTarget) {
+            target = p - positions[j];
+            if (target > largestPossiblePos) {
+              pos = PostingsReader::END;
+              return PostingsReader::END;
+            }
+            adjustedTarget = target + positions[0];
+            p = repeatSlotAdvance(0, adjustedTarget);
+            target = p - positions[0];
+            goto outer;
+          }
+        }
+        pos = target;
+        freq++;
+        return pos;
+      }
+      // unreachable
+    }
+
     int32_t doApproximationNext() {
       return doNext(docsEnums[0]->next());
     }
@@ -343,10 +517,18 @@ public:
         }
       }
       skipCount(SkipStats::phraseVerifies);
+      // startPositions is idempotent once positioned (posOrd == posOrdStart),
+      // so alias slots of a repeated term are harmless no-ops here.
       for (auto* docsEnum: docsEnums) {
         docsEnum->startPositions();
       }
-      checkedMatch = doNextPosition(docsEnums[0]->advancePosition(positions[0]) - positions[0]) != PostingsReader::END;
+      if (!hasRepeats) {
+        checkedMatch = doNextPosition(docsEnums[0]->advancePosition(positions[0]) - positions[0]) != PostingsReader::END;
+      } else {
+        resetRepeatGroups();
+        checkedMatch = doNextPositionRepeats(
+            repeatSlotAdvance(0, positions[0]) - positions[0]) != PostingsReader::END;
+      }
       return checkedMatch;
     }
 
@@ -370,11 +552,18 @@ public:
     static inline bool disableDocBoundForTests = false;
     // A/B hook: keep phrase execution in query text order instead of docFreq order.
     static inline bool disableSortForTests = false;
+    // A/B hook: give every repeated term its own enum, as before dedup.
+    static inline bool disableRepeatDedupForTests = false;
 
     Scorer(MemPool& targetPool, std::span<DocsEnum*> docsEnums, std::span<const int32_t> positions, NormsReader* normsReader,
-           Similarity::BM25Scorer* simScorer, std::span<ImpactsIndex> impacts = {})
-            : docsEnums(docsEnums), positions(positions), simScorer(simScorer), impacts(impacts) {
-      unused(targetPool);
+           Similarity::BM25Scorer* simScorer, std::span<ImpactsIndex> impacts = {},
+           std::span<const int32_t> slotGroup = {}, std::span<RepeatGroup> groups = {})
+            : docsEnums(docsEnums), positions(positions), pool(&targetPool), slotGroup(slotGroup),
+              groups(groups), simScorer(simScorer), impacts(impacts) {
+      hasRepeats = !groups.empty();
+      if (hasRepeats) {
+        slotCursor = targetPool.make_span<int32_t>(docsEnums.size());
+      }
       // Scoring needs both BM25 and norms, or neither.
       assert((simScorer == nullptr) == (normsReader == nullptr));
       if (normsReader != nullptr) {
@@ -495,7 +684,11 @@ public:
 
     int32_t numMatches() {
       while (pos != PostingsReader::END) {
-        doNextPosition(docsEnums[0]->nextPosition() - positions[0]);
+        if (!hasRepeats) {
+          doNextPosition(docsEnums[0]->nextPosition() - positions[0]);
+        } else {
+          doNextPositionRepeats(repeatSlotNext(0) - positions[0]);
+        }
       }
       return freq;
     }
