@@ -50,7 +50,8 @@ class BooleanQuery final : public solux::Query {
   // a mandatory one folds its boost into the mandatory clause; a prohibited
   // duplicate of a required clause matches nothing).
   static std::span<Query*> mergeDuplicateScoringTerms(solux::MemPool& pool,
-                                                      std::span<Query*> clauses) {
+                                                      std::span<Query*> clauses,
+                                                      int32_t* removedOut = nullptr) {
     boost::container::small_vector<Query*, 16> out;
     boost::container::small_vector<bool, 16> consumed(clauses.size(), false);
     bool changed = false;
@@ -75,6 +76,9 @@ class BooleanQuery final : public solux::Query {
         }
       }
       out.push_back(query);
+    }
+    if (removedOut != nullptr) {
+      *removedOut = (int32_t) (clauses.size() - out.size());
     }
     if (!changed) {
       return clauses;
@@ -549,13 +553,10 @@ public:
       // Only mandatory and optional clauses can contribute to score.
       int32_t noScore = flags & ~NEED_SCORES;
       // Duplicate clauses normalize here (see mergeDuplicateScoringTerms).
-      // The optional side keeps duplicates under minShouldMatch > 1:
-      // MinShouldMatchScorer and WAND count matching scorer instances, so
-      // duplicate terms can legitimately satisfy multiple match slots.
       auto mandatoryClauses = mergeDuplicateScoringTerms(context.pool, query.mandatory);
-      auto optionalClauses = query.minShouldMatch <= 1
-        ? mergeDuplicateScoringTerms(context.pool, query.optional)
-        : query.optional;
+      int32_t removedOptional = 0;
+      auto optionalClauses =
+        mergeDuplicateScoringTerms(context.pool, query.optional, &removedOptional);
       auto prohibitedClauses = dropDuplicateFilterTerms(context.pool, query.prohibited);
       auto filterClauses = dropDuplicateFilterTerms(context.pool, query.filter);
       mandatoryWeights = createWeights(context.pool, context, mandatoryClauses, flags);
@@ -572,7 +573,29 @@ public:
         : createWeights(context.pool, context, optionalClauses, flags);
       prohibitedWeights = createWeights(context.pool, context, prohibitedClauses, noScore);
       filterWeights = createWeights(context.pool, context, filterClauses, noScore);
+      // Solux-defined min_match semantics under duplicate removal, split by
+      // the intent the value expresses (Lucene instead refuses to dedup when
+      // min_match > 1 and lets duplicates satisfy multiple match slots):
+      // - min_match above half the clauses ("10 words, mm=9") is a MISS
+      //   BUDGET: the user allows N - mm absences. Each removed duplicate
+      //   decrements min_match (floored at 1), keeping the budget constant -
+      //   a doc containing the duplicated term matches exactly as before,
+      //   and a doc missing it is no longer charged for one absent term
+      //   more than once.
+      // - min_match at or below half ("10 words, mm=2") is an ABSOLUTE
+      //   COUNT: match at least mm distinct words. It stays as-is, capped
+      //   at the deduped clause count so an all-duplicates query remains
+      //   satisfiable.
+      // The common producer is min_match computed from raw token counts of
+      // pasted text, where repeats would otherwise skew either reading.
       minShouldMatch = query.minShouldMatch;
+      if (minShouldMatch > 1 && removedOptional > 0) {
+        if ((int64_t) minShouldMatch * 2 > (int64_t) query.optional.size()) {
+          minShouldMatch = std::max(1, minShouldMatch - removedOptional);
+        } else {
+          minShouldMatch = std::min(minShouldMatch, (int32_t) optionalClauses.size());
+        }
+      }
 
       if (QueryPrep::anyNeedsPrepare(mandatoryWeights) ||
           QueryPrep::anyNeedsPrepare(optionalWeights) ||

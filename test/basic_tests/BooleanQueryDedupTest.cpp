@@ -138,21 +138,73 @@ TEST_F(BooleanQueryDedupTest, optionalTripleDuplicateScoresLikeBoostThreeWithinE
   assertSameScoresNear(boostThreeHits, duplicateHits);
 }
 
-TEST_F(BooleanQueryDedupTest, optionalDuplicatesPreserveMinShouldMatchSemantics) {
+// Solux-defined semantics, split by intent: min_match above half the
+// clauses is a miss budget (each removed duplicate decrements it, floor 1);
+// min_match at or below half is an absolute distinct-word count (kept,
+// capped at the deduped clause count).
+TEST_F(BooleanQueryDedupTest, minShouldMatchAdjustsForRemovedDuplicatesByIntent) {
   TestIndex testIndex;
-  const std::string_view bodies[] = {"a", "b", "a b", "c"};
+  const std::string_view bodies[] = {"a", "b", "a b", "c", "b c"};
   buildBodyIndex(testIndex, bodies);
 
+  // Miss budget (2 of 3 > half): "a a b" mm=2 allows one absence -> merged
+  // "a^2 b" mm=1. Docs with a or b match; "c" does not.
   TermQuery a1("body_w", "a");
   TermQuery a2("body_w", "a");
   TermQuery b("body_w", "b");
   std::vector<Query*> optionalClauses = {&a1, &a2, &b};
   BooleanQuery query({}, optionalClauses, {}, {}, 2);
-
   auto hits = collectHits(*testIndex.reader, query);
-  ASSERT_EQ(2u, hits.size());
+  ASSERT_EQ(4u, hits.size());
   EXPECT_EQ(0, hits[0].doc.docId());
-  EXPECT_EQ(2, hits[1].doc.docId());
+  EXPECT_EQ(1, hits[1].doc.docId());
+  EXPECT_EQ(2, hits[2].doc.docId());
+  EXPECT_EQ(4, hits[3].doc.docId());
+
+  // Absolute count (2 of 5 <= half): "a a a b c" mm=2 means two distinct
+  // words -> merged "a^3 b c" keeps mm=2. Only docs with two of {a,b,c}.
+  TermQuery w1("body_w", "a");
+  TermQuery w2("body_w", "a");
+  TermQuery w3("body_w", "a");
+  TermQuery wb("body_w", "b");
+  TermQuery wc("body_w", "c");
+  std::vector<Query*> absClauses = {&w1, &w2, &w3, &wb, &wc};
+  BooleanQuery absolute({}, absClauses, {}, {}, 2);
+  auto absHits = collectHits(*testIndex.reader, absolute);
+  ASSERT_EQ(2u, absHits.size());
+  EXPECT_EQ(2, absHits[0].doc.docId());
+  EXPECT_EQ(4, absHits[1].doc.docId());
+
+  // Absolute-count cap: "a a a a" mm=2 (2 of 4 <= half) dedups to one
+  // clause; mm caps at the clause count so the query stays satisfiable.
+  TermQuery c1("body_w", "a");
+  TermQuery c2("body_w", "a");
+  TermQuery c3("body_w", "a");
+  TermQuery c4("body_w", "a");
+  std::vector<Query*> capClauses = {&c1, &c2, &c3, &c4};
+  BooleanQuery capped({}, capClauses, {}, {}, 2);
+  auto capHits = collectHits(*testIndex.reader, capped);
+  ASSERT_EQ(2u, capHits.size());
+  EXPECT_EQ(0, capHits[0].doc.docId());
+  EXPECT_EQ(2, capHits[1].doc.docId());
+
+  // Miss-budget floor: "a a" mm=2 -> mm=1 still matches "a" docs.
+  TermQuery f1("body_w", "a");
+  TermQuery f2("body_w", "a");
+  std::vector<Query*> floorClauses = {&f1, &f2};
+  BooleanQuery floored({}, floorClauses, {}, {}, 2);
+  auto floorHits = collectHits(*testIndex.reader, floored);
+  ASSERT_EQ(2u, floorHits.size());
+  EXPECT_EQ(0, floorHits[0].doc.docId());
+  EXPECT_EQ(2, floorHits[1].doc.docId());
+
+  // Miss budget, unsatisfiable stays unsatisfiable: "a a" mm=3 -> mm=2 over
+  // one clause matches nothing (same as instance counting: max freq 2).
+  TermQuery u1("body_w", "a");
+  TermQuery u2("body_w", "a");
+  std::vector<Query*> unsatClauses = {&u1, &u2};
+  BooleanQuery unsat({}, unsatClauses, {}, {}, 3);
+  EXPECT_EQ(0u, collectHits(*testIndex.reader, unsat).size());
 }
 
 TEST_F(BooleanQueryDedupTest, mandatoryDuplicateScoresLikeBoostedRequiredTerm) {
