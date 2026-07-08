@@ -611,6 +611,7 @@ public:
   }
 
   void setTrackPositions(bool enabled) {
+    assert(!(enabled && docBlockResident));  // resident state never serves positions
     trackPositions = enabled && hasPositions;
     if (!trackPositions) {
       clearPendingPositionRepair();
@@ -828,6 +829,10 @@ public:
   }
 
   std::span<const int32_t> peekDocOnlyBlock() {
+    // One-way docs-only consumption, like nextDocOnly(): a peeked block may be
+    // materialized from resident words with freqs skipped, so termFreq() and
+    // positions are off the table from here on.
+    docsOnlyConsumed = true;
     if (docid == PostingsReader::END) {
       return {};
     }
