@@ -152,6 +152,33 @@ protected:
     return docs;
   }
 
+  static int32_t nextBlockBase(const std::vector<int32_t>& docs) {
+    return docs.empty() ? 0 : docs.back() + 1;
+  }
+
+  static void appendWordBlock(std::vector<int32_t>& docs) {
+    const int32_t base = nextBlockBase(docs);
+    for (int32_t bit = 0; bit < 192; bit++) {
+      if ((bit % 3) != 1) {
+        docs.push_back(base + bit);
+      }
+    }
+  }
+
+  static void appendContiguousBlock(std::vector<int32_t>& docs) {
+    const int32_t base = nextBlockBase(docs);
+    for (int32_t i = 0; i < Postings::DOCS_BLOCK_SIZE; i++) {
+      docs.push_back(base + i);
+    }
+  }
+
+  static void appendPackedBlock(std::vector<int32_t>& docs) {
+    const int32_t base = nextBlockBase(docs);
+    for (int32_t i = 0; i < Postings::DOCS_BLOCK_SIZE; i++) {
+      docs.push_back(base + i * 33);
+    }
+  }
+
   static int32_t modelCeil(const std::vector<int32_t>& docs, int32_t target) {
     auto it = std::lower_bound(docs.begin(), docs.end(), target);
     return it == docs.end() ? DocsEnum::END : *it;
@@ -200,6 +227,17 @@ protected:
       ++it;
     }
     return want;
+  }
+
+  void appendIntoBitSetWindow(DocsEnum& denum, const std::vector<int32_t>& docs,
+                              int32_t from, int32_t to,
+                              std::vector<int32_t>& got) {
+    ASSERT_LT(from, to);
+    std::vector<uint64_t> bits((size_t) (to - from + 63) / 64, 0);
+    denum.intoBitSet(bits, from, to);
+    std::vector<int32_t> window = docsFromBits(bits, from, to);
+    EXPECT_EQ(window, modelWindow(docs, from, to)) << "window [" << from << "," << to << ")";
+    got.insert(got.end(), window.begin(), window.end());
   }
 
   void assertImpactHeaders(DocsEnum& denum, const std::vector<int32_t>& expectedBlockMaxTf,
@@ -628,6 +666,223 @@ TEST_F(DocsEnumAdvanceTest, intoBitSetPackedScatterClipsAndCrossesWords) {
   EXPECT_EQ(SkipStats::countBulkFillWordBlocks, 0);
   SkipStats::enabled = savedStats;
   SkipStats::reset();
+}
+
+TEST_F(DocsEnumAdvanceTest, intoBitSetStraddleWordBlockStaysResidentAcrossWindows) {
+  const std::vector<int32_t> docs = makeWordProbeDocs(1);
+  RAMDir dir;
+  MemPool pool;
+  writeRawSingleTerm(dir, pool, "wordprobe", docs);
+
+  PostingsReader reader(dir, 0);
+  FieldReader fieldReader(pool, reader);
+  ASSERT_TRUE(fieldReader.readNextField());
+  SegFieldInfo fieldInfo;
+  fieldReader.readFieldInfo(fieldInfo);
+  TermsEnum tenum(pool, reader, fieldInfo);
+  ASSERT_TRUE(tenum.seek("wordprobe"));
+
+  DocsEnum denum(pool, reader, tenum);
+  denum.setTrackPositions(false);
+
+  bool savedStats = SkipStats::enabled;
+  SkipStats::enabled = true;
+  SkipStats::reset();
+
+  std::vector<int32_t> got;
+  appendIntoBitSetWindow(denum, docs, 0, 64, got);
+  appendIntoBitSetWindow(denum, docs, 64, 95, got);
+  appendIntoBitSetWindow(denum, docs, 95, 130, got);
+  appendIntoBitSetWindow(denum, docs, 130, 160, got);
+  appendIntoBitSetWindow(denum, docs, 160, 192, got);
+
+  EXPECT_EQ(got, docs);
+  EXPECT_EQ(denum.docId(), DocsEnum::END);
+  EXPECT_EQ(SkipStats::docBlocksDecoded, 0);
+  EXPECT_EQ(SkipStats::docsOnlyFreqBlocksSkipped, 1);
+  EXPECT_GE(SkipStats::countBulkFillWordBlocks, 5);
+  SkipStats::enabled = savedStats;
+  SkipStats::reset();
+}
+
+TEST_F(DocsEnumAdvanceTest, intoBitSetFirstStraddleWithNoEmitDoesNotConsume) {
+  std::vector<int32_t> docs;
+  docs.reserve((size_t) Postings::DOCS_BLOCK_SIZE);
+  for (int32_t doc = 65; doc < 65 + Postings::DOCS_BLOCK_SIZE; doc++) {
+    docs.push_back(doc);
+  }
+
+  RAMDir dir;
+  MemPool pool;
+  writeRawSingleTerm(dir, pool, "gapword", docs);
+
+  PostingsReader reader(dir, 0);
+  FieldReader fieldReader(pool, reader);
+  ASSERT_TRUE(fieldReader.readNextField());
+  SegFieldInfo fieldInfo;
+  fieldReader.readFieldInfo(fieldInfo);
+  TermsEnum tenum(pool, reader, fieldInfo);
+  ASSERT_TRUE(tenum.seek("gapword"));
+
+  DocsEnum denum(pool, reader, tenum);
+  denum.setTrackPositions(false);
+
+  bool savedStats = SkipStats::enabled;
+  SkipStats::enabled = true;
+  SkipStats::reset();
+
+  std::vector<uint64_t> bits(1, 0);
+  denum.intoBitSet(bits, 0, 64);
+  EXPECT_TRUE(docsFromBits(bits, 0, 64).empty());
+  // Nothing was reported, so the cursor must not rest on a live doc: a
+  // docs-only successor scans from docid + 1 and would skip it.
+  EXPECT_LT(denum.docId(), 0);
+  EXPECT_EQ(denum.nextDocOnly(), 65);
+
+  std::vector<int32_t> got;
+  appendIntoBitSetWindow(denum, docs, 64, 100, got);
+  EXPECT_EQ(got, modelWindow(docs, 64, 100));
+  EXPECT_EQ(SkipStats::docBlocksDecoded, 0);
+  EXPECT_EQ(SkipStats::docsOnlyFreqBlocksSkipped, 1);
+  SkipStats::enabled = savedStats;
+  SkipStats::reset();
+}
+
+TEST_F(DocsEnumAdvanceTest, intoBitSetStraddleContiguousBlockReachesBlockBoundary) {
+  const std::vector<int32_t> docs = makeContiguousDocs(Postings::DOCS_BLOCK_SIZE);
+  RAMDir dir;
+  MemPool pool;
+  writeRawSingleTerm(dir, pool, "runprobe", docs);
+
+  PostingsReader reader(dir, 0);
+  FieldReader fieldReader(pool, reader);
+  ASSERT_TRUE(fieldReader.readNextField());
+  SegFieldInfo fieldInfo;
+  fieldReader.readFieldInfo(fieldInfo);
+  TermsEnum tenum(pool, reader, fieldInfo);
+  ASSERT_TRUE(tenum.seek("runprobe"));
+
+  DocsEnum denum(pool, reader, tenum);
+  denum.setTrackPositions(false);
+
+  bool savedStats = SkipStats::enabled;
+  SkipStats::enabled = true;
+  SkipStats::reset();
+
+  std::vector<int32_t> got;
+  appendIntoBitSetWindow(denum, docs, 0, 17, got);
+  appendIntoBitSetWindow(denum, docs, 17, 64, got);
+  appendIntoBitSetWindow(denum, docs, 64, 127, got);
+  appendIntoBitSetWindow(denum, docs, 127, 128, got);
+
+  EXPECT_EQ(got, docs);
+  EXPECT_EQ(denum.docId(), DocsEnum::END);
+  EXPECT_EQ(SkipStats::docBlocksDecoded, 0);
+  EXPECT_EQ(SkipStats::docsOnlyFreqBlocksSkipped, 1);
+  EXPECT_GE(SkipStats::countBulkFillWordBlocks, 4);
+  SkipStats::enabled = savedStats;
+  SkipStats::reset();
+}
+
+TEST_F(DocsEnumAdvanceTest, intoBitSetStraddleKeepsFreqStreamAlignedForFollowingBlocks) {
+  std::vector<int32_t> docs = makeWordProbeDocs(2);
+  appendPackedBlock(docs);
+  RAMDir dir;
+  MemPool pool;
+  writeRawSingleTerm(dir, pool, "mixedprobe", docs);
+
+  PostingsReader reader(dir, 0);
+  FieldReader fieldReader(pool, reader);
+  ASSERT_TRUE(fieldReader.readNextField());
+  SegFieldInfo fieldInfo;
+  fieldReader.readFieldInfo(fieldInfo);
+  TermsEnum tenum(pool, reader, fieldInfo);
+  ASSERT_TRUE(tenum.seek("mixedprobe"));
+
+  DocsEnum denum(pool, reader, tenum);
+  denum.setTrackPositions(false);
+
+  bool savedStats = SkipStats::enabled;
+  SkipStats::enabled = true;
+  SkipStats::reset();
+
+  std::vector<int32_t> got;
+  appendIntoBitSetWindow(denum, docs, 0, 64, got);
+  appendIntoBitSetWindow(denum, docs, 64, 150, got);
+  appendIntoBitSetWindow(denum, docs, 150, 260, got);
+  appendIntoBitSetWindow(denum, docs, 260, docs.back() + 1, got);
+
+  EXPECT_EQ(got, docs);
+  EXPECT_EQ(denum.docId(), DocsEnum::END);
+  EXPECT_EQ(SkipStats::docsOnlyFreqBlocksSkipped, 3);
+  EXPECT_EQ(SkipStats::docBlocksDecoded, 1);
+  SkipStats::enabled = savedStats;
+  SkipStats::reset();
+}
+
+TEST_F(DocsEnumAdvanceTest, intoBitSetRandomPartitionsMatchNextDocOracle) {
+  std::vector<int32_t> docs;
+  for (int32_t block = 0; block < 12; block++) {
+    if (block % 3 == 0) {
+      appendContiguousBlock(docs);
+    } else if (block % 3 == 1) {
+      appendWordBlock(docs);
+    } else {
+      appendPackedBlock(docs);
+    }
+  }
+  const int32_t tailBase = nextBlockBase(docs) + 5;
+  for (int32_t i = 0; i < 73; i++) {
+    docs.push_back(tailBase + i * 7);
+  }
+
+  RAMDir dir;
+  MemPool pool;
+  writeRawSingleTerm(dir, pool, "mixedprobe", docs);
+
+  PostingsReader reader(dir, 0);
+  FieldReader fieldReader(pool, reader);
+  ASSERT_TRUE(fieldReader.readNextField());
+  SegFieldInfo fieldInfo;
+  fieldReader.readFieldInfo(fieldInfo);
+  TermsEnum tenum(pool, reader, fieldInfo);
+  ASSERT_TRUE(tenum.seek("mixedprobe"));
+
+  const int32_t maxDoc = docs.back() + 97;
+  std::vector<uint64_t> oracleBits((size_t) (maxDoc + 63) / 64, 0);
+  DocsEnum oracle(pool, reader, tenum);
+  for (int32_t doc = oracle.nextDoc(); doc != DocsEnum::END; doc = oracle.nextDoc()) {
+    ASSERT_LT(doc, maxDoc);
+    oracleBits[(size_t) doc >> 6] |= 1ULL << (doc & 63);
+  }
+
+  for (int32_t iter = 0; iter < 12; iter++) {
+    DocsEnum denum(pool, reader, tenum);
+    denum.setTrackPositions(false);
+    std::vector<uint64_t> gotBits(oracleBits.size(), 0);
+    int32_t from = 0;
+    while (from < maxDoc) {
+      int32_t step;
+      if (rng.rint(0, 5) == 0) {
+        step = 64;
+      } else if (rng.rint(0, 5) == 0) {
+        step = Postings::DOCS_BLOCK_SIZE;
+      } else {
+        step = 1 + (int32_t) rng.rint(0, 311);
+      }
+      const int32_t to = std::min(maxDoc, from + step);
+      std::vector<uint64_t> bits((size_t) (to - from + 63) / 64, 0);
+      denum.intoBitSet(bits, from, to);
+      for (int32_t bit = 0; bit < to - from; bit++) {
+        if ((bits[(size_t) bit >> 6] & (1ULL << (bit & 63))) != 0) {
+          const int32_t doc = from + bit;
+          gotBits[(size_t) doc >> 6] |= 1ULL << (doc & 63);
+        }
+      }
+      from = to;
+    }
+    EXPECT_EQ(gotBits, oracleBits) << "iter=" << iter;
+  }
 }
 
 TEST_F(DocsEnumAdvanceTest, advanceAndIntoBitSetProbeContiguousRuns) {

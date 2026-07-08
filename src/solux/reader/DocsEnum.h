@@ -1140,39 +1140,17 @@ private:
     return true;
   }
 
-  bool tryEnterDocOnlyResidentBlock(int32_t target) {
+  void enterDocOnlyResidentBlock(int32_t blockStartOrd, uint32_t docBase,
+                                 uint32_t blockLast, int32_t numWords) {
     assert(!docBlockResident);
     assert(!trackPositions);
-    if (docfreq - docOrd < Postings::DOCS_BLOCK_SIZE) {
-      return false;
-    }
-
-    const int32_t blockStartOrd = docOrd;
-    const uint32_t base = (docOrd == 0) ? 0 : (uint32_t) docBuf[Postings::DOCS_BLOCK_SIZE - 1];
-    const uint32_t docBase = base + (blockStartOrd == 0 ? 0 : 1);
-
-    seekToBlockBody();
-    bodyReady = true;
-    const int8_t token = (int8_t) *docIS.ptr();
-    if (token > 0) {
-      return false;
-    }
+    assert(bodyReady);
+    assert(docIS.ptr() < docIS.ptr(endOfDocs));
 
     bodyReady = false;
     docIS.skip(1);
-    const int32_t numWords = token == Postings::DOC_BLOCK_CONTIGUOUS ? 0 : -token;
-    const char* wordsPtr = docIS.ptr();
-    uint32_t blockLast;
-    if (token == Postings::DOC_BLOCK_CONTIGUOUS) {
-      blockLast = docBase + Postings::DOCS_BLOCK_SIZE - 1;
-    } else {
-      assert(numWords > 0);
-      uint64_t lastWord = loadWord64(wordsPtr + (int64_t) (numWords - 1) * 8);
-      assert(lastWord != 0);
-      blockLast = docBase + (uint32_t) (numWords - 1) * 64
-                  + (63 - (uint32_t) std::countl_zero(lastWord));
-      docIS.skip((int64_t) numWords * 8);
-    }
+    const char* wordsPtr = numWords == 0 ? nullptr : docIS.ptr();
+    docIS.skip((int64_t) numWords * 8);
 
     if (hasFreqs) {
       auto bytesSkipped = IndexCodec::tfreqCodec.skipBlock(docIS.ptr(), docIS.left());
@@ -1196,7 +1174,40 @@ private:
       nextL1Base = nextL0Base;
       nextL1CumTf = nextL0CumTf;
     }
+  }
 
+  bool tryEnterDocOnlyResidentBlock(int32_t target) {
+    assert(!docBlockResident);
+    assert(!trackPositions);
+    if (docfreq - docOrd < Postings::DOCS_BLOCK_SIZE) {
+      return false;
+    }
+
+    const int32_t blockStartOrd = docOrd;
+    const uint32_t base = (docOrd == 0) ? 0 : (uint32_t) docBuf[Postings::DOCS_BLOCK_SIZE - 1];
+    const uint32_t docBase = base + (blockStartOrd == 0 ? 0 : 1);
+
+    seekToBlockBody();
+    bodyReady = true;
+    const int8_t token = (int8_t) *docIS.ptr();
+    if (token > 0) {
+      return false;
+    }
+
+    const int32_t numWords = token == Postings::DOC_BLOCK_CONTIGUOUS ? 0 : -token;
+    const char* wordsPtr = docIS.ptr() + 1;
+    uint32_t blockLast;
+    if (token == Postings::DOC_BLOCK_CONTIGUOUS) {
+      blockLast = docBase + Postings::DOCS_BLOCK_SIZE - 1;
+    } else {
+      assert(numWords > 0);
+      uint64_t lastWord = loadWord64(wordsPtr + (int64_t) (numWords - 1) * 8);
+      assert(lastWord != 0);
+      blockLast = docBase + (uint32_t) (numWords - 1) * 64
+                  + (63 - (uint32_t) std::countl_zero(lastWord));
+    }
+
+    enterDocOnlyResidentBlock(blockStartOrd, docBase, blockLast, numWords);
     if (!advanceDocOnlyResident(target)) {
       return false;
     }
@@ -1206,18 +1217,21 @@ private:
   bool orDocOnlyResidentIntoBitSet(std::span<uint64_t> bits, int32_t bitsBase,
                                    int32_t upTo) {
     assert(docBlockResident);
-    assert(docid >= 0);
-    if (upTo <= docid) {
+    const int32_t minDoc = docid < 0 ? (int32_t) residentDocBase : docid;
+    if (upTo <= minDoc) {
       return false;
     }
 
     int32_t lastDoc = 0;
     int32_t ordAfter = 0;
-    if (!findResidentLastBefore(upTo, docid, lastDoc, ordAfter)) {
+    if (!findResidentLastBefore(upTo, minDoc, lastDoc, ordAfter)) {
+      // No doc below upTo (a leading gap spans the window). Leave the cursor
+      // alone: docid must only ever rest on a doc already reported to the
+      // consumer, or nextDocOnly()'s docid+1 scan would skip a live doc.
       return false;
     }
 
-    const int32_t clipDoc = std::max(docid, bitsBase);
+    const int32_t clipDoc = std::max(minDoc, bitsBase);
     const int32_t emitTo = std::min(upTo, (int32_t) residentBlockLast + 1);
     if (clipDoc < emitTo) {
       if (residentNumWords == 0) {
@@ -1239,9 +1253,11 @@ private:
   }
 
   // Consume whole word-encoded full blocks lying entirely below upTo, OR-ing
-  // their bits into `bits` without expanding to docBuf. Stops with the stream
-  // ready for the regular decode on a packed block, the tail, or a block
-  // straddling upTo. Returns whether any block was consumed.
+  // their bits into `bits` without expanding to docBuf. A word/contiguous
+  // block that straddles upTo enters resident state for clipped window fills.
+  // Stops with the stream ready for the regular decode on a packed block, the
+  // tail, or a word/contiguous block that begins at or above upTo. Returns
+  // whether any block was consumed.
   bool orWholeWordBlocks(std::span<uint64_t> bits, int32_t bitsBase,
                          int32_t upTo) {
     bool consumed = false;
@@ -1265,8 +1281,13 @@ private:
         blockLast = docBase + (uint32_t) (numWords - 1) * 64
                     + (63 - (uint32_t) std::countl_zero(lastWord));
       }
+      if ((int32_t) docBase >= upTo) {
+        break;
+      }
       if ((int32_t) blockLast >= upTo) {
-        break;  // straddles upTo: the decode path splits it per doc
+        enterDocOnlyResidentBlock(docOrd, docBase, blockLast, numWords);
+        consumed = true;
+        break;
       }
 
       const int32_t clipDoc = std::max((int32_t) docBase, bitsBase);
