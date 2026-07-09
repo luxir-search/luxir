@@ -4,6 +4,7 @@
 #include "SkipStats.h"
 #include "solux/codec/Codec.h"
 #include "solux/codec/StreamVByte.h"
+#include "solux/util/BranchlessSearch.h"
 #include <algorithm>
 #include <array>
 #include <bit>
@@ -562,7 +563,11 @@ private:
     if (j < linearEnd) {
       return j;
     }
-    return (int32_t) (std::lower_bound(docBuf + j, docBuf + docBufEnd, target) - docBuf);
+    // The decoded block is L1-resident and probe targets are unpredictable:
+    // the branchless-search win case.
+    return (int32_t) (BranchlessIndex<int32_t>::lowerBound(docBuf + j,
+                                                           (size_t) (docBufEnd - j),
+                                                           target) - docBuf);
   }
 
   int32_t advanceScoredNoPositionsFromReadyBlock(int32_t target) {
