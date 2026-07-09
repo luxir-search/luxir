@@ -1753,22 +1753,7 @@ public:
           blockTfSum += InputStream::readVint(p, headerEnd);
           blockPosByteOff = InputStream::readVlong(p, headerEnd);
         }
-        if (hasFreqs && hasNorms) {
-          uint32_t frontierCount = InputStream::readVint(p, headerEnd);
-          for (uint32_t i = 0; i < frontierCount; i++) {
-            assert(p < headerEnd);
-            p++;  // norm: one raw byte
-            auto tfDelta = InputStream::readVint(p, headerEnd);
-            unused(tfDelta);
-          }
-        } else if (hasFreqs) {
-          auto maxTf = InputStream::readVint(p, headerEnd);
-          unused(maxTf);
-        } else if (hasNorms) {
-          auto minNorm = InputStream::readVint(p, headerEnd);
-          unused(minNorm);
-        }
-        assert(p == headerEnd);
+        p = headerEnd;
 
         const char* body = headerEnd;
         if (target <= (int32_t) blockLastDoc) {
