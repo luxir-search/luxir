@@ -1,5 +1,8 @@
 #include <algorithm>
 #include <array>
+#include <bit>
+#include <cmath>
+#include <cstring>
 #include <iterator>
 #include <string>
 #include <vector>
@@ -95,6 +98,104 @@ protected:
     }
     expected.offsets.push_back((int32_t) expected.tfs.size());
     return expected;
+  }
+
+  static DocsEnum::ImpactFrontiers expectedRawSpanFrontiers(const std::vector<uint8_t>& norms,
+                                                            const std::vector<int32_t>& tfs,
+                                                            int32_t spanDocs) {
+    assert(norms.size() == tfs.size());
+    int32_t numDocs = (int32_t) tfs.size();
+    int32_t numSpans = (numDocs + spanDocs - 1) / spanDocs;
+    DocsEnum::ImpactFrontiers expected;
+    expected.offsets.reserve((size_t) numSpans + 1);
+    std::array<int32_t, 256> maxTfPerNorm;
+    for (int32_t span = 0; span < numSpans; span++) {
+      expected.offsets.push_back((int32_t) expected.tfs.size());
+      maxTfPerNorm.fill(0);
+      int32_t start = span * spanDocs;
+      int32_t end = std::min(start + spanDocs, numDocs);
+      for (int32_t doc = start; doc < end; doc++) {
+        int32_t norm = (int32_t) norms[(size_t) doc];
+        maxTfPerNorm[(size_t) norm] = std::max(maxTfPerNorm[(size_t) norm], tfs[(size_t) doc]);
+      }
+      int32_t runningMaxTf = 0;
+      for (int32_t norm = 0; norm < 256; norm++) {
+        int32_t tf = maxTfPerNorm[(size_t) norm];
+        if (tf > runningMaxTf) {
+          expected.norms.push_back(norm);
+          expected.tfs.push_back(tf);
+          runningMaxTf = tf;
+        }
+      }
+    }
+    expected.offsets.push_back((int32_t) expected.tfs.size());
+    return expected;
+  }
+
+  static std::vector<int32_t> expectedRawBlockMaxTf(const std::vector<int32_t>& tfs) {
+    int32_t numBlocks = ((int32_t) tfs.size() + Postings::DOCS_BLOCK_SIZE - 1)
+                        / Postings::DOCS_BLOCK_SIZE;
+    std::vector<int32_t> expected(numBlocks, 0);
+    for (int32_t doc = 0; doc < (int32_t) tfs.size(); doc++) {
+      int32_t block = doc / Postings::DOCS_BLOCK_SIZE;
+      expected[(size_t) block] = std::max(expected[(size_t) block], tfs[(size_t) doc]);
+    }
+    return expected;
+  }
+
+  static std::vector<int32_t> expectedRawBlockMinNorm(const std::vector<uint8_t>& norms) {
+    int32_t numBlocks = ((int32_t) norms.size() + Postings::DOCS_BLOCK_SIZE - 1)
+                        / Postings::DOCS_BLOCK_SIZE;
+    std::vector<int32_t> expected(numBlocks, 255);
+    for (int32_t doc = 0; doc < (int32_t) norms.size(); doc++) {
+      int32_t block = doc / Postings::DOCS_BLOCK_SIZE;
+      expected[(size_t) block] = std::min(expected[(size_t) block],
+                                          (int32_t) norms[(size_t) doc]);
+    }
+    return expected;
+  }
+
+  void writeRawPositionsImpactTerm(RAMDir& dir, MemPool& pool,
+                                   const std::vector<uint8_t>& norms,
+                                   const std::vector<int32_t>& tfs,
+                                   std::string_view term = "hot") {
+    ASSERT_FALSE(tfs.empty());
+    ASSERT_EQ(norms.size(), tfs.size());
+    PostingsWriter postingsWriter(dir, 0, (int32_t) tfs.size() + Postings::DOCS_BLOCK_SIZE + 100);
+    {
+      TextWriter writer(postingsWriter);
+      auto& finfo = postingsWriter.addField("f");
+      finfo.type = FieldType::TEXT;
+      finfo.flags = FieldType::INDEX_DOCS_FREQS_POSITIONS;
+      writer.startField(&finfo);
+      writer.setNorms(TextNormsView(norms, nullptr));
+
+      TermRef tref(pool, term.data(), (uint32_t) term.size());
+      writer.startTerm(tref);
+      for (int32_t doc = 0; doc < (int32_t) tfs.size(); doc++) {
+        writer.addDoc(doc, tfs[(size_t) doc]);
+      }
+      writer.endTerm(tref);
+      writer.endField();
+    }
+    postingsWriter.finish();
+  }
+
+  static std::vector<char> encodeTfBytes(const std::vector<uint32_t>& tfs, uint32_t width) {
+    std::vector<char> bytes;
+    bytes.reserve(tfs.size() * width);
+    for (uint32_t tf : tfs) {
+      if (width == 2) {
+        bytes.push_back((char) tf);
+        bytes.push_back((char) (tf >> 8));
+      } else {
+        bytes.push_back((char) tf);
+        bytes.push_back((char) (tf >> 8));
+        bytes.push_back((char) (tf >> 16));
+        bytes.push_back((char) (tf >> 24));
+      }
+    }
+    return bytes;
   }
 
   static std::vector<int32_t> expectedGroupSpanImpacts(const std::vector<int32_t>& blockMaxTf) {
@@ -1074,6 +1175,178 @@ TEST_F(DocsEnumAdvanceTest, blockImpactHeadersRoundTrip) {
                         "docs+freqs", &expectedNoFrontiers, &expectedNoGroupFrontiers);
   checkRawImpactHeaders(FieldType::INDEX_DOCS, expectedDocsOnlyImpacts, expectedNoNorms, N,
                         "docs-only", &expectedNoFrontiers, &expectedNoGroupFrontiers);
+}
+
+TEST_F(DocsEnumAdvanceTest, packedL1GroupFrontierRoundTripShapesAndWidths) {
+  auto run = [&](std::string_view label, const std::vector<uint8_t>& norms,
+                 const std::vector<int32_t>& tfs, int32_t expectedCount,
+                 uint32_t expectedWidth, int32_t expectedMaxTf) {
+    SCOPED_TRACE(std::string(label));
+    RAMDir dir;
+    MemPool pool;
+    writeRawPositionsImpactTerm(dir, pool, norms, tfs);
+
+    PostingsReader reader(dir, 0);
+    FieldReader fieldReader(pool, reader);
+    ASSERT_TRUE(fieldReader.readNextField());
+    SegFieldInfo fieldInfo;
+    fieldReader.readFieldInfo(fieldInfo);
+    TermsEnum tenum(pool, reader, fieldInfo);
+    ASSERT_TRUE(tenum.seek("hot"));
+    DocsEnum denum(pool, reader, tenum);
+
+    DocsEnum::GroupImpactCursor cursor;
+    DocsEnum::GroupImpactHeader firstHeader;
+    ASSERT_EQ(denum.readGroupImpactHeadersThrough(
+                  cursor, 0, false,
+                  [&](const DocsEnum::GroupImpactHeader& header) {
+                    firstHeader = header;
+                  }),
+              1);
+    ASSERT_EQ((int32_t) firstHeader.frontierNorms.size(), expectedCount);
+    ASSERT_EQ(firstHeader.frontierTfWidth, expectedWidth);
+    ASSERT_EQ(firstHeader.spanMaxTf, expectedMaxTf);
+
+    DocsEnum::ImpactFrontiers expectedGroups =
+        expectedRawSpanFrontiers(norms, tfs, DocsEnum::L1_DOCS);
+    DocsEnum::GroupImpacts groups;
+    denum.readGroupImpacts(groups);
+    ASSERT_EQ(groups.frontiers.offsets, expectedGroups.offsets);
+    ASSERT_EQ(groups.frontiers.norms, expectedGroups.norms);
+    ASSERT_EQ(groups.frontiers.tfs, expectedGroups.tfs);
+
+    std::vector<int32_t> blockMaxTf;
+    std::vector<int32_t> groupSpanImpacts;
+    std::vector<int32_t> blockMinNorms;
+    std::vector<int32_t> groupSpanMinNorms;
+    denum.readBlockMaxTf(blockMaxTf, &groupSpanImpacts, nullptr, &blockMinNorms,
+                         &groupSpanMinNorms);
+    ASSERT_EQ(blockMaxTf, expectedRawBlockMaxTf(tfs));
+    ASSERT_EQ(blockMinNorms, expectedRawBlockMinNorm(norms));
+    ASSERT_EQ(groupSpanImpacts, expectedGroupSpanImpacts(blockMaxTf));
+    ASSERT_EQ(groupSpanMinNorms, expectedGroupSpanMinNorms(blockMinNorms));
+  };
+
+  std::vector<uint8_t> normsOne((size_t) DocsEnum::L1_DOCS, 7);
+  std::vector<int32_t> tfsOne((size_t) DocsEnum::L1_DOCS, 5);
+  run("N=1 u16", normsOne, tfsOne, 1, 2, 5);
+
+  std::vector<uint8_t> normsFull((size_t) DocsEnum::L1_DOCS);
+  std::vector<int32_t> tfsFull((size_t) DocsEnum::L1_DOCS);
+  for (int32_t doc = 0; doc < DocsEnum::L1_DOCS; doc++) {
+    uint8_t norm = (uint8_t) (doc & 255);
+    normsFull[(size_t) doc] = norm;
+    tfsFull[(size_t) doc] = (int32_t) norm + 1;
+  }
+  run("N=256 absolute tfs", normsFull, tfsFull, 256, 2, 256);
+
+  std::vector<uint8_t> normsU16((size_t) DocsEnum::L1_DOCS, 3);
+  std::vector<int32_t> tfsU16((size_t) DocsEnum::L1_DOCS, 1);
+  tfsU16[17] = 65535;
+  run("u16 boundary", normsU16, tfsU16, 1, 2, 65535);
+
+  std::vector<uint8_t> normsU32((size_t) DocsEnum::L1_DOCS, 3);
+  std::vector<int32_t> tfsU32((size_t) DocsEnum::L1_DOCS, 1);
+  tfsU32[19] = 65536;
+  run("u32 escape", normsU32, tfsU32, 1, 4, 65536);
+}
+
+TEST_F(DocsEnumAdvanceTest, packedL1SkipToBlockAcrossManyGroups) {
+  const int32_t N = 10 * DocsEnum::L1_DOCS + 77;
+  std::vector<uint8_t> norms((size_t) N);
+  std::vector<int32_t> tfs((size_t) N);
+  for (int32_t doc = 0; doc < N; doc++) {
+    norms[(size_t) doc] = (uint8_t) ((doc * 29) & 255);
+    tfs[(size_t) doc] = 1 + ((doc * 17) % 97);
+  }
+
+  RAMDir dir;
+  MemPool pool;
+  writeRawPositionsImpactTerm(dir, pool, norms, tfs);
+
+  PostingsReader reader(dir, 0);
+  FieldReader fieldReader(pool, reader);
+  ASSERT_TRUE(fieldReader.readNextField());
+  SegFieldInfo fieldInfo;
+  fieldReader.readFieldInfo(fieldInfo);
+  TermsEnum tenum(pool, reader, fieldInfo);
+  ASSERT_TRUE(tenum.seek("hot"));
+  DocsEnum denum(pool, reader, tenum);
+  denum.setTrackPositions(false);
+
+  bool savedStats = SkipStats::enabled;
+  SkipStats::enabled = true;
+  SkipStats::reset();
+  for (int32_t target : {17, DocsEnum::L1_DOCS + 9, 3 * DocsEnum::L1_DOCS + 123,
+                         6 * DocsEnum::L1_DOCS + 7, 9 * DocsEnum::L1_DOCS + 31,
+                         N - 1}) {
+    ASSERT_EQ(denum.advance(target), target);
+    ASSERT_EQ(denum.termFreq(), tfs[(size_t) target]);
+  }
+  ASSERT_GT(SkipStats::l1GroupSteps, 0);
+  SkipStats::enabled = savedStats;
+  SkipStats::reset();
+}
+
+TEST_F(DocsEnumAdvanceTest, packedFrontierScoreMatchesScalarBitExact) {
+  Similarity sim;
+  Similarity::FieldStats fieldStats;
+  fieldStats.maxDoc = 10000;
+  fieldStats.docsWithField = 10000;
+  fieldStats.sumTotalTermFreq = 70000;
+  Similarity::TermStats termStats;
+  termStats.docFreq = 137;
+  termStats.totalTermFreq = 2000;
+  auto scorer = sim.getScorer(1.0f, fieldStats, termStats);
+  const float boost = 1.75f;
+
+  for (int32_t iter = 0; iter < 200; iter++) {
+    uint32_t width = (iter & 1) == 0 ? 2u : 4u;
+    int32_t count = 1 + rng.rint(256);
+    std::vector<uint8_t> norms((size_t) count);
+    std::vector<uint32_t> tfs((size_t) count);
+    for (int32_t i = 0; i < count; i++) {
+      norms[(size_t) i] = (uint8_t) rng.rint(256);
+      if (width == 2) {
+        tfs[(size_t) i] = 1u + (uint32_t) rng.rint(65535);
+      } else {
+        tfs[(size_t) i] = 65536u + (uint32_t) rng.rint(1000000);
+      }
+    }
+    std::vector<char> bytes = encodeTfBytes(tfs, width);
+    float expected = 0.0f;
+    for (int32_t i = 0; i < count; i++) {
+      float score = boost * scorer.score((float) tfs[(size_t) i],
+                                         (int64_t) norms[(size_t) i]);
+      ASSERT_TRUE(std::isfinite(score));
+      expected = std::max(expected, score);
+    }
+    float actual = scorer.scoreFrontier(norms, bytes, width, boost);
+    EXPECT_EQ(std::bit_cast<uint32_t>(actual), std::bit_cast<uint32_t>(expected))
+        << "iter=" << iter << " width=" << width << " count=" << count;
+  }
+}
+
+TEST_F(DocsEnumAdvanceTest, wrongSegmentMagicIsRejected) {
+  RAMDir dir;
+  MemPool pool;
+  writeRawSingleTerm(dir, pool, "hot", {0, 7, 19, 43});
+
+  std::string segName = Postings::getIndexFileName(Postings::getSortableString(0), 0);
+  auto input = dir.openFile(segName);
+  ASSERT_NE(input, nullptr);
+  std::string bytes(input->read());
+  ASSERT_GE(bytes.size(), Postings::SOLUX_HEADER.size());
+  memcpy(bytes.data(), "SOLUX000", Postings::SOLUX_HEADER.size());
+
+  ASSERT_TRUE(dir.deleteFile(segName));
+  auto outFile = dir.createFile(segName);
+  OutputStream out(outFile.get());
+  out.write(bytes.data(), bytes.size());
+  out.close();
+  dir.finishFile(*outFile);
+
+  EXPECT_THROW({ PostingsReader reader(dir, 0); }, std::runtime_error);
 }
 
 // Position reads after far advances must land exactly where sequential decoding

@@ -126,36 +126,6 @@ public:
     int32_t frontierNorms[FRONTIER_CAP];
   };
 
-  struct GroupImpactHeaderScratch {
-    static constexpr int32_t FRONTIER_CAP = 256;
-    int32_t frontierTfs[FRONTIER_CAP];
-    int32_t frontierNorms[FRONTIER_CAP];
-    int32_t frontierStored = 0;
-    bool frontierSpilled = false;
-
-    void reset(uint32_t frontierCount) {
-      frontierStored = 0;
-      frontierSpilled = frontierCount > (uint32_t) FRONTIER_CAP;
-    }
-
-    void add(int32_t norm, int32_t tf) {
-      if (frontierSpilled) {
-        return;
-      }
-      frontierNorms[frontierStored] = norm;
-      frontierTfs[frontierStored] = tf;
-      frontierStored++;
-    }
-
-    std::span<const int32_t> tfs() const {
-      return {frontierTfs, (size_t) frontierStored};
-    }
-
-    std::span<const int32_t> norms() const {
-      return {frontierNorms, (size_t) frontierStored};
-    }
-  };
-
   struct GroupImpactCursor {
     const char* next = nullptr;
     uint32_t prevGroupLastDoc = 0;
@@ -171,6 +141,9 @@ public:
     int64_t bodyOffset = 0;   // relative to startOfDocs
     int32_t baseLastDoc = 0;
     bool frontierSpilled = false;
+    std::span<const uint8_t> frontierNorms;
+    std::span<const char> frontierTfBytes;
+    uint32_t frontierTfWidth = 0;
   };
 
   // Scoped scored-word probe state for TermQuery::Scorer::applyToCandidates.
@@ -246,6 +219,48 @@ private:
       return s;
     }
     return (s & 0x7fffull) | (InputStream::readVlong(pos, end) << 15);
+  }
+
+  static uint32_t readU16LE(const char* p) {
+    uint8_t b[2];
+    memcpy(b, p, sizeof(b));
+    return (uint32_t) b[0] | ((uint32_t) b[1] << 8);
+  }
+
+  static uint32_t readU32LE(const char* p) {
+    uint8_t b[4];
+    memcpy(b, p, sizeof(b));
+    return (uint32_t) b[0] | ((uint32_t) b[1] << 8)
+           | ((uint32_t) b[2] << 16) | ((uint32_t) b[3] << 24);
+  }
+
+  static uint32_t readPackedL1Tf(std::span<const char> bytes, uint32_t width,
+                                 uint32_t index) {
+    assert(width == 2 || width == 4);
+    const char* p = bytes.data() + (size_t) index * width;
+    assert(p + width <= bytes.data() + bytes.size());
+    return width == 2 ? readU16LE(p) : readU32LE(p);
+  }
+
+  static void decodePackedL1Frontier(const char*& p, const char* end,
+                                     GroupImpactHeader& header) {
+    uint32_t code = InputStream::readVint(p, end);
+    uint32_t count = code >> 1;
+    uint32_t width = (code & 1u) != 0 ? 4u : 2u;
+    assert(count > 0 && count <= 256);
+    assert(p + count <= end);
+    const uint8_t* norms = (const uint8_t*) p;
+    p += count;
+    size_t tfBytes = (size_t) count * width;
+    assert(p + tfBytes <= end);
+    const char* tfs = p;
+    p += tfBytes;
+    header.frontierNorms = {norms, (size_t) count};
+    header.frontierTfBytes = {tfs, tfBytes};
+    header.frontierTfWidth = width;
+    header.spanMinNorm = (int32_t) norms[0];
+    header.spanMaxTf = (int32_t) readPackedL1Tf(header.frontierTfBytes, width, count - 1);
+    header.frontierSpilled = false;
   }
 
   static bool isL1Boundary(int32_t block) {
@@ -1830,13 +1845,13 @@ public:
         groupTfSum += InputStream::readVint(p, groupHeaderEnd);
       }
       if (hasFreqs && hasNorms) {
-        uint32_t frontierCount = InputStream::readVint(p, groupHeaderEnd);
-        for (uint32_t i = 0; i < frontierCount; i++) {
-          assert(p < groupHeaderEnd);
-          p++;  // norm: one raw byte
-          auto tfDelta = InputStream::readVint(p, groupHeaderEnd);
-          unused(tfDelta);
-        }
+        uint32_t code = InputStream::readVint(p, groupHeaderEnd);
+        uint32_t frontierCount = code >> 1;
+        uint32_t tfWidth = (code & 1u) != 0 ? 4u : 2u;
+        assert(frontierCount > 0 && frontierCount <= 256);
+        size_t payloadBytes = frontierCount + (size_t) frontierCount * tfWidth;
+        assert(p + payloadBytes <= groupHeaderEnd);
+        p += payloadBytes;
       } else if (hasFreqs) {
         auto spanImpact = InputStream::readVint(p, groupHeaderEnd);
         unused(spanImpact);
@@ -2041,19 +2056,10 @@ public:
       int32_t spanImpact = 1;
       int32_t spanMinNorm = 0;
       if (hasFreqs && hasNorms) {
-        uint32_t frontierCount = InputStream::readVint(p, groupHeaderEnd);
-        assert(frontierCount > 0);
-        int32_t tf = 0;
-        for (uint32_t i = 0; i < frontierCount; i++) {
-          assert(p < groupHeaderEnd);
-          int32_t norm = (int32_t) (uint8_t) *p;  // raw byte (absolute)
-          p++;
-          tf += (int32_t) InputStream::readVint(p, groupHeaderEnd);  // tf delta
-          if (i == 0) {
-            spanMinNorm = norm;
-          }
-        }
-        spanImpact = tf;
+        GroupImpactHeader packed;
+        decodePackedL1Frontier(p, groupHeaderEnd, packed);
+        spanMinNorm = packed.spanMinNorm;
+        spanImpact = packed.spanMaxTf;
       } else if (hasFreqs) {
         spanImpact = (int32_t) InputStream::readVint(p, groupHeaderEnd);
       } else if (hasNorms) {
@@ -2175,9 +2181,7 @@ private:
     cursor.initialized = true;
   }
 
-  template <typename FrontierSink>
-  GroupImpactHeader parseNextGroupImpactHeader(GroupImpactCursor& cursor,
-                                               FrontierSink&& frontierSink) const {
+  GroupImpactHeader parseNextGroupImpactHeader(GroupImpactCursor& cursor) const {
     assert(docsSize != 0);
     if (!cursor.initialized) {
       initGroupImpactCursor(cursor);
@@ -2200,30 +2204,11 @@ private:
       unused(groupCumTfDelta);
     }
     if (hasFreqs && hasNorms) {
-      uint32_t frontierCount = InputStream::readVint(p, groupHeaderEnd);
-      assert(frontierCount > 0);
-      frontierSink.reset(frontierCount);
-      int32_t tf = 0;
-      for (uint32_t i = 0; i < frontierCount; i++) {
-        assert(p < groupHeaderEnd);
-        int32_t norm = (int32_t) (uint8_t) *p;
-        p++;
-        tf += (int32_t) InputStream::readVint(p, groupHeaderEnd);
-        if (i == 0) {
-          header.spanMinNorm = norm;
-        }
-        frontierSink.add(norm, tf);
-      }
-      header.spanMaxTf = tf;
-      header.frontierSpilled = frontierSink.spilled();
+      decodePackedL1Frontier(p, groupHeaderEnd, header);
     } else if (hasFreqs) {
-      frontierSink.reset(0);
       header.spanMaxTf = (int32_t) InputStream::readVint(p, groupHeaderEnd);
     } else if (hasNorms) {
-      frontierSink.reset(0);
       header.spanMinNorm = (int32_t) InputStream::readVint(p, groupHeaderEnd);
-    } else {
-      frontierSink.reset(0);
     }
     assert(p == groupHeaderEnd);
     header.bodyOffset = (int64_t) (groupHeaderEnd - streamStart) - startOfDocs;
@@ -2237,7 +2222,6 @@ private:
 public:
   template <typename Visitor>
   int32_t readGroupImpactHeadersThrough(GroupImpactCursor& cursor, int32_t throughGroup,
-                                        GroupImpactHeaderScratch& scratch,
                                         bool countLazyParses, Visitor&& visitor) const {
     if (docsSize == 0 || throughGroup < 0) {
       return 0;
@@ -2248,17 +2232,11 @@ public:
     int32_t parsed = 0;
     int32_t stop = std::min(throughGroup, numDocGroups - 1);
     while (cursor.nextGroup <= stop) {
-      struct ScratchSink {
-        GroupImpactHeaderScratch& scratch;
-        void reset(uint32_t count) { scratch.reset(count); }
-        void add(int32_t norm, int32_t tf) { scratch.add(norm, tf); }
-        bool spilled() const { return scratch.frontierSpilled; }
-      } sink{scratch};
-      GroupImpactHeader header = parseNextGroupImpactHeader(cursor, sink);
+      GroupImpactHeader header = parseNextGroupImpactHeader(cursor);
       if (countLazyParses) {
         skipCount(SkipStats::impactGroupHeaderParses);
       }
-      visitor(header, scratch.tfs(), scratch.norms());
+      visitor(header);
       parsed++;
     }
     if (cursor.nextGroup == numDocGroups) {
@@ -2284,32 +2262,24 @@ public:
     out.baseLastDocs.reserve(numDocGroups);
     out.frontiers.offsets.reserve((size_t) numDocGroups + 1);
 
-    struct VectorSink {
-      ImpactFrontiers& frontiers;
-      bool wasSpilled = false;
-      void reset(uint32_t) {
-        wasSpilled = false;
-        frontiers.offsets.push_back((int32_t) frontiers.tfs.size());
-      }
-      void add(int32_t norm, int32_t tf) {
-        frontiers.norms.push_back(norm);
-        frontiers.tfs.push_back(tf);
-      }
-      bool spilled() const { return wasSpilled; }
-    } sink{out.frontiers};
-
     // Pulsed terms have no doc stream (docsSize == 0, docIS never opened):
     // emit the same empty output the pre-cursor walk produced.
     if (docsSize != 0) {
       GroupImpactCursor cursor;
       initGroupImpactCursor(cursor);
       while (cursor.nextGroup < numDocGroups) {
-        GroupImpactHeader header = parseNextGroupImpactHeader(cursor, sink);
+        GroupImpactHeader header = parseNextGroupImpactHeader(cursor);
         out.baseLastDocs.push_back(header.baseLastDoc);
         out.lastDocs.push_back(header.lastDoc);
         out.spanMaxTfs.push_back(header.spanMaxTf);
         out.spanMinNorms.push_back(header.spanMinNorm);
         out.bodyOffsets.push_back(header.bodyOffset);
+        out.frontiers.offsets.push_back((int32_t) out.frontiers.tfs.size());
+        for (uint32_t i = 0; i < (uint32_t) header.frontierNorms.size(); i++) {
+          out.frontiers.norms.push_back((int32_t) header.frontierNorms[i]);
+          out.frontiers.tfs.push_back(
+              (int32_t) readPackedL1Tf(header.frontierTfBytes, header.frontierTfWidth, i));
+        }
       }
       assert(cursor.next == docIS.ptr(endOfDocs));
     }

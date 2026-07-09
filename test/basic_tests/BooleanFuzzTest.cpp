@@ -158,6 +158,43 @@ public:
     return std::holds_alternative<bool>(q.kind);
   }
 
+  static const api::Match* dedupableMatch(const api::Query& q) {
+    const auto* m = std::get_if<api::Match>(&q.kind);
+    if (m == nullptr || !m->val.has_value()
+        || !std::holds_alternative<std::string_view>(m->val->kind)) {
+      return nullptr;
+    }
+    return m;
+  }
+
+  static bool sameMatchIdentity(const api::Match& lhs, const api::Match& rhs) {
+    return lhs.field == rhs.field
+        && std::get<std::string_view>(lhs.val->kind)
+           == std::get<std::string_view>(rhs.val->kind);
+  }
+
+  static std::vector<const api::Query*> dedupOptionalOracle(std::span<const api::Query> clauses,
+                                                            int32_t& removed) {
+    std::vector<const api::Query*> out;
+    std::vector<bool> consumed(clauses.size(), false);
+    for (size_t i = 0; i < clauses.size(); i++) {
+      if (consumed[i]) continue;
+      const api::Query* q = &clauses[i];
+      if (const auto* m = dedupableMatch(*q)) {
+        for (size_t j = i + 1; j < clauses.size(); j++) {
+          if (consumed[j]) continue;
+          const auto* other = dedupableMatch(clauses[j]);
+          if (other != nullptr && sameMatchIdentity(*m, *other)) {
+            consumed[j] = true;
+          }
+        }
+      }
+      out.push_back(q);
+    }
+    removed = (int32_t) clauses.size() - (int32_t) out.size();
+    return out;
+  }
+
   static bool boolMatches(const api::BooleanQuery& b, const std::vector<std::string>& toks) {
     for (const auto& r : b.required) {
       if (!clauseMatches(r, toks)) return false;
@@ -168,17 +205,27 @@ public:
     for (const auto& p : b.prohibited) {
       if (clauseMatches(p, toks)) return false;
     }
-    bool hasPositive = b.required.size() > 0 || b.optional.size() > 0 || b.filter.size() > 0;
+    int32_t removedOptional = 0;
+    std::vector<const api::Query*> optional = dedupOptionalOracle(b.optional, removedOptional);
+    int minMatch = b.min_match;
+    if (minMatch > 1 && removedOptional > 0) {
+      if ((int64_t) minMatch * 2 > (int64_t) b.optional.size()) {
+        minMatch = std::max(1, minMatch - removedOptional);
+      } else {
+        minMatch = std::min(minMatch, (int32_t) optional.size());
+      }
+    }
+    bool hasPositive = b.required.size() > 0 || !optional.empty() || b.filter.size() > 0;
     if (!hasPositive) return false;
     // The optional group constrains when min_match >= 1, or when nothing else
     // (required/filter) carries the match; otherwise optionals only rank.
-    bool constrains = b.min_match >= 1 || (b.required.empty() && b.filter.empty());
-    if (!b.optional.empty() && constrains) {
+    bool constrains = minMatch >= 1 || (b.required.empty() && b.filter.empty());
+    if (!optional.empty() && constrains) {
       int matched = 0;
-      for (const auto& o : b.optional) {
-        if (clauseMatches(o, toks)) matched++;
+      for (const api::Query* o : optional) {
+        if (clauseMatches(*o, toks)) matched++;
       }
-      int eff = std::max(1, std::min(b.min_match, (int)b.optional.size()));
+      int eff = std::max(1, std::min(minMatch, (int)optional.size()));
       if (matched < eff) return false;
     }
     return true;

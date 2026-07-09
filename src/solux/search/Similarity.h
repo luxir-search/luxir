@@ -5,6 +5,8 @@
 #include <array>
 #include <cassert>
 #include <bit>
+#include <algorithm>
+#include <cstring>
 #include <span>
 #include "solux/reader/Postings.h"
 #include "solux/util/solux_util.h"
@@ -148,6 +150,19 @@ public:
     const float idf;
     const float avgdl;
 
+    static uint32_t readU16LE(const char* p) {
+      uint8_t b[2];
+      memcpy(b, p, sizeof(b));
+      return (uint32_t) b[0] | ((uint32_t) b[1] << 8);
+    }
+
+    static uint32_t readU32LE(const char* p) {
+      uint8_t b[4];
+      memcpy(b, p, sizeof(b));
+      return (uint32_t) b[0] | ((uint32_t) b[1] << 8)
+             | ((uint32_t) b[2] << 16) | ((uint32_t) b[3] << 24);
+    }
+
   public:
     BM25Scorer(float boost, float k1, float b, float idf, float avgdl);
 
@@ -182,6 +197,37 @@ public:
       for (int32_t i = 0; i < count; i++) {
         out[i] = boost * (weight - weight / (1.0f + (float)tf[i] * factor[i]));
       }
+    }
+
+    float scoreFrontier(std::span<const uint8_t> norms, std::span<const char> tfBytes,
+                        uint32_t tfWidth, float boost) const {
+      assert(tfWidth == 2 || tfWidth == 4);
+      int32_t count = (int32_t) norms.size();
+      assert(count >= 0 && count <= 256);
+      assert(tfBytes.size() == (size_t) count * tfWidth);
+      float factor[256];
+      float termFreq[256];
+      for (int32_t i = 0; i < count; i++) {
+        factor[i] = invNorm[norms[(size_t) i]];
+        if (tfWidth == 2) {
+          termFreq[i] = (float) readU16LE(tfBytes.data() + (size_t) i * 2);
+        } else {
+          termFreq[i] = (float) readU32LE(tfBytes.data() + (size_t) i * 4);
+        }
+      }
+      // Same two-loop split as scoreBlock above: a max fold inside the math
+      // loop is an FP reduction gcc will not vectorize, so score into an
+      // array (vdivps 8-wide) and fold separately.
+      float scores[256];
+      for (int32_t i = 0; i < count; i++) {
+        scores[i] = boost * (weight - weight / (1.0f + termFreq[i] * factor[i]));
+      }
+      float maxScore = 0.0f;
+      for (int32_t i = 0; i < count; i++) {
+        assert(std::isfinite(scores[i]));
+        maxScore = std::max(maxScore, scores[i]);
+      }
+      return maxScore;
     }
   };
 

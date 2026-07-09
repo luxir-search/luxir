@@ -528,6 +528,13 @@ private:  // some internal utility methods... not for use by indexers
     out.push_back((char) (val >> 8));
   }
 
+  static void appendIntLE(std::vector<char>& out, uint32_t val) {
+    out.push_back((char) val);
+    out.push_back((char) (val >> 8));
+    out.push_back((char) (val >> 16));
+    out.push_back((char) (val >> 24));
+  }
+
   static void appendVint15(std::vector<char>& out, uint32_t val) {
     if ((val & ~0x7fffu) == 0) {
       appendShortLE(out, (uint16_t) val);
@@ -606,6 +613,47 @@ private:  // some internal utility methods... not for use by indexers
       if (tf > runningMaxTf) {
         out.push_back((char) (uint8_t) norm);
         appendVint(out, tf - runningMaxTf);
+        runningMaxTf = tf;
+      }
+    }
+  }
+
+  static void appendL1ImpactFrontier(std::vector<char>& out,
+                                     const std::array<uint32_t, 256>& surface,
+                                     uint32_t maxTf) {
+    uint32_t count = 0;
+    uint32_t runningMaxTf = 0;
+    for (uint32_t norm = 0; norm < surface.size(); norm++) {
+      uint32_t tf = surface[norm];
+      if (tf > runningMaxTf) {
+        count++;
+        runningMaxTf = tf;
+      }
+    }
+    assert(count > 0);
+    bool useU32 = maxTf > 65535u;
+    appendVint(out, (count << 1) | (useU32 ? 1u : 0u));
+
+    runningMaxTf = 0;
+    for (uint32_t norm = 0; norm < surface.size(); norm++) {
+      uint32_t tf = surface[norm];
+      if (tf > runningMaxTf) {
+        assert(norm <= 255);
+        out.push_back((char) (uint8_t) norm);
+        runningMaxTf = tf;
+      }
+    }
+
+    runningMaxTf = 0;
+    for (uint32_t norm = 0; norm < surface.size(); norm++) {
+      uint32_t tf = surface[norm];
+      if (tf > runningMaxTf) {
+        if (useU32) {
+          appendIntLE(out, tf);
+        } else {
+          assert(tf <= 65535u);
+          appendShortLE(out, (uint16_t) tf);
+        }
         runningMaxTf = tf;
       }
     }
@@ -813,9 +861,8 @@ private:  // some internal utility methods... not for use by indexers
       appendVint(header_output, (uint32_t) (l1GroupTfSum - (uint64_t) l1GroupDocCount));
     }
     if (hasFreqs && hasNorms) {
-      // Group impact frontier, same staircase as the L0 headers.  Non-empty:
-      // every flushed block contributed at least one frontier point.
-      appendImpactFrontier(header_output, l1GroupMaxTfPerNorm);
+      assert(l1GroupMaxTf > 0);
+      appendL1ImpactFrontier(header_output, l1GroupMaxTfPerNorm, l1GroupMaxTf);
     } else if (hasFreqs) {
       assert(l1GroupMaxTf > 0);
       appendVint(header_output, l1GroupMaxTf);

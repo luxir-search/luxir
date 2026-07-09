@@ -54,7 +54,6 @@ class ImpactsIndex {
   float* groupSuffixUpper = nullptr; // eager path: max of groupUpper[g..]
   mutable Chunk** chunks = nullptr;  // lazily parsed per group
   mutable DocsEnum::GroupImpactCursor groupCursor;
-  mutable DocsEnum::GroupImpactHeaderScratch groupHeaderScratch;
 
   static constexpr int32_t GROUP = DocsEnum::L1_PERIOD;
 
@@ -66,17 +65,12 @@ class ImpactsIndex {
     return boost * simScorer->score((float) tf, (int64_t) norm);
   }
 
-  float scoreFrontier(std::span<const int32_t> tfs, std::span<const int32_t> norms,
-                      int32_t fallbackTf, int32_t fallbackNorm,
-                      bool frontierSpilled) const {
-    if (useFrontierBound && !frontierSpilled && !tfs.empty()) {
-      float maxImpact = 0.0f;
-      for (size_t j = 0; j < tfs.size(); j++) {
-        maxImpact = std::max(maxImpact, scoreImpact(tfs[j], norms[j]));
-      }
-      return maxImpact;
+  float scoreFrontier(const DocsEnum::GroupImpactHeader& header) const {
+    if (useFrontierBound && !header.frontierNorms.empty()) {
+      return simScorer->scoreFrontier(header.frontierNorms, header.frontierTfBytes,
+                                      header.frontierTfWidth, boost);
     }
-    return scoreImpact(fallbackTf, fallbackNorm);
+    return scoreImpact(header.spanMaxTf, header.spanMinNorm);
   }
 
   void ensureGroupHeadersThrough(int32_t g) const {
@@ -93,16 +87,14 @@ class ImpactsIndex {
       return;
     }
     docsEnum->readGroupImpactHeadersThrough(
-        groupCursor, g, groupHeaderScratch, true,
-        [&](const DocsEnum::GroupImpactHeader& header, std::span<const int32_t> tfs,
-            std::span<const int32_t> norms) {
+        groupCursor, g, true,
+        [&](const DocsEnum::GroupImpactHeader& header) {
           int32_t idx = groupHeadersParsed;
           assert(header.group == idx);
           groupLastDocs[idx] = header.lastDoc;
           groupBaseLastDocs[idx] = header.baseLastDoc;
           groupBodyOffs[idx] = header.bodyOffset;
-          groupUpper[idx] = scoreFrontier(tfs, norms, header.spanMaxTf,
-                                          header.spanMinNorm, header.frontierSpilled);
+          groupUpper[idx] = scoreFrontier(header);
           chunks[idx] = nullptr;
           groupHeadersParsed++;
         });

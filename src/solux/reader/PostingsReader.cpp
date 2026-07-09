@@ -1,9 +1,27 @@
 #include "PostingsReader.h"
 
+#include <cstring>
 #include <filesystem>
+#include <format>
+#include <stdexcept>
 #include "Postings.h"
 
 namespace solux {
+
+namespace {
+
+void validateSegmentFileHeader(InputFile& file, std::string_view fileName) {
+  InputStream is = file.getInputStream();
+  std::string_view header = Postings::SOLUX_HEADER;
+  if (is.size() < (int64_t) header.size()
+      || std::memcmp(is.ptr(0), header.data(), header.size()) != 0) {
+    throw std::runtime_error(std::format(
+        "Segment file '{}' has invalid Solux magic; expected '{}'",
+        fileName, header));
+  }
+}
+
+} // namespace
 
 
 // Initialize from files, returns false if missing files and missingFileOK=true
@@ -20,6 +38,7 @@ bool PostingsReader::initializeFromFiles(Directory& dir, uint64_t segId, bool mi
             std::format("Can't find/open first segment file '{}'", segInfoFile),
             std::make_error_code(std::errc::no_such_file_or_directory));
   }
+  validateSegmentFileHeader(*files.back(), segInfoFile);
 
   inputStreams.emplace_back(files[0]->getInputStream());
   InputStream firstIS = inputStreams[0];
@@ -46,6 +65,7 @@ bool PostingsReader::initializeFromFiles(Directory& dir, uint64_t segId, bool mi
               std::format("Can't find/open segment file '{}'", Postings::getIndexFileName(segStr, i)),
               std::make_error_code(std::errc::no_such_file_or_directory));
     }
+    validateSegmentFileHeader(*files.back(), Postings::getIndexFileName(segStr, i));
     inputStreams.emplace_back(files.back()->getInputStream());
   }
   return true;
