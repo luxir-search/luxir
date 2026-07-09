@@ -121,6 +121,7 @@ class BooleanQuery final : public solux::Query {
 
 public:
   static inline bool disableBulkDomainDriveForTests = false;
+  static inline bool disableWindowDispatchForTests = false;
   static inline bool disableMandOptBulkForTests = false;
   // A/B toggle: force the conjunction onto the eager single-phase path (each
   // clause verifies inside its own advance) instead of two-phase (defer matches
@@ -2975,6 +2976,8 @@ public:
     // most the not-yet-swept non-essential clauses can add when sweeps run from
     // s = splitIndex-1 downward.
     std::span<double> nonEssentialPrefixMax;
+    std::span<float> compactThresholds;
+    std::span<bool> compactThresholdReady;
     std::span<uint64_t> windowBits;
     // One shared per-window score accumulation row for all fill modes.
     // Never cleared: a slot is valid only under a set window bit, and
@@ -3118,6 +3121,7 @@ public:
       sortWindowOrder();
       splitIndex = computeWindowSplit();
       markEssentialScorers();
+      std::fill(compactThresholdReady.begin(), compactThresholdReady.end(), false);
       double acc = 0.0;
       for (size_t s = 0; s < splitIndex; s++) {
         acc += (double) windowMax[(size_t) windowOrder[s]];
@@ -3197,6 +3201,52 @@ public:
       }
       windowEnd = std::min(std::min(std::min(requestedEnd, outerWindowEnd), max), maxDoc);
       skipCount(SkipStats::maxScoreInnerWindows);
+    }
+
+    int32_t consumeOuterWindow(ScoreWindow& out, int32_t max) {
+      windowEnd = outerWindowEnd;
+      out.min = windowStart;
+      out.max = outerWindowEnd;
+      out.size = 0;
+      return outerWindowEnd >= max ? PostingsReader::END : outerWindowEnd;
+    }
+
+    bool positionEssentialScorers(int32_t& top1, int32_t& top2, int32_t& top1Index) {
+      top1 = PostingsReader::END;
+      top2 = PostingsReader::END;
+      top1Index = -1;
+      for (size_t i = splitIndex; i < scorers.size(); i++) {
+        int32_t scorerIndex = windowOrder[i];
+        auto* scorer = scorers[(size_t) scorerIndex];
+        int32_t doc = scorer->docId();
+        if (doc < windowStart) {
+          doc = scorer->advance(windowStart);
+        }
+        if (doc == PostingsReader::END) {
+          continue;
+        }
+        if (doc < top1) {
+          top2 = top1;
+          top1 = doc;
+          top1Index = scorerIndex;
+        } else if (doc < top2) {
+          top2 = doc;
+        }
+      }
+      return top1Index >= 0;
+    }
+
+    void anchorWindowAt(int32_t top1, int32_t max) {
+      if (top1 <= windowStart) {
+        return;
+      }
+      windowStart = top1;
+      int32_t requestedEnd = windowStart + kWindowSize;
+      if (requestedEnd < windowStart) {
+        requestedEnd = max;
+      }
+      windowEnd = std::min(std::min(std::min(requestedEnd, outerWindowEnd), max), maxDoc);
+      skipCount(SkipStats::maxScoreAnchorJumps);
     }
 
     void clearWindowBits() {
@@ -3430,8 +3480,18 @@ public:
       }
     }
 
-    int32_t compactCompetitive(ScoreWindow& out, double bound) {
-      float threshold = competitiveScoreThreshold(minCompetitiveScore, scoreBoundFactor, bound);
+    float cachedCompetitiveThreshold(size_t sweepLevel) {
+      if (!compactThresholdReady[sweepLevel]) {
+        compactThresholds[sweepLevel] =
+            competitiveScoreThreshold(minCompetitiveScore, scoreBoundFactor,
+                                      nonEssentialPrefixMax[sweepLevel]);
+        compactThresholdReady[sweepLevel] = true;
+      }
+      return compactThresholds[sweepLevel];
+    }
+
+    int32_t compactCompetitive(ScoreWindow& out, size_t sweepLevel) {
+      float threshold = cachedCompetitiveThreshold(sweepLevel);
       int32_t write = compactByScoreThreshold(out.docs.data(), out.scores.data(),
                                               out.size, threshold);
       recordBufferDrops(out.size, write);
@@ -3453,7 +3513,7 @@ public:
       // sweep and guarantees every removed doc cannot reach theta even if all
       // remaining unswept clauses hit their window maxima.
       for (size_t s = splitIndex; s-- > 0; ) {
-        out.size = compactCompetitive(out, nonEssentialPrefixMax[s]);
+        out.size = compactCompetitive(out, s);
         if (out.size == 0) {
           return;
         }
@@ -3499,9 +3559,9 @@ public:
     // accumulation pass. The non-essential side is still swept clause-at-a-time
     // over the whole buffer rather than probed per candidate.
     void fillSingleEssentialCandidates(ScoreWindow& out, DocSet* filter,
-                                       const FixedBitSet* domainBits) {
+                                       const FixedBitSet* domainBits,
+                                       int32_t essentialIdx) {
       prepareOutputWindow(out);
-      int32_t essentialIdx = windowOrder[splitIndex];
       auto* scorer = scorers[(size_t) essentialIdx];
       if (scorer->docId() < windowStart) {
         scorer->advance(windowStart);
@@ -3578,6 +3638,8 @@ public:
               windowOrder(pool.make_arr<int32_t>(scorers.size()), scorers.size()),
               isEssential(pool.make_arr<bool>(scorers.size()), scorers.size()),
               nonEssentialPrefixMax(pool.make_arr<double>(scorers.size()), scorers.size()),
+              compactThresholds(pool.make_arr<float>(scorers.size()), scorers.size()),
+              compactThresholdReady(pool.make_arr<bool>(scorers.size()), scorers.size()),
               windowBits(pool.make_arr<uint64_t>((size_t) kWindowWords), (size_t) kWindowWords),
               windowScores(pool.make_arr<float>((size_t) kWindowSize), (size_t) kWindowSize),
               outDocs(pool.make_arr<int32_t>((size_t) kWindowSize), (size_t) kWindowSize),
@@ -3627,13 +3689,37 @@ public:
       }
 
       setupWindow(min, max);
-      if (splitIndex < scorers.size()) {
-        if (useBs1ForWindow()) {
-          bs1Windows++;
-          fillBs1Candidates();
-          finalizeBs1Candidates(out, filter, domainBits);
+      if (splitIndex < scorers.size() && useBs1ForWindow()) {
+        bs1Windows++;
+        fillBs1Candidates();
+        finalizeBs1Candidates(out, filter, domainBits);
+      } else if (!disableWindowDispatchForTests && splitIndex == scorers.size()) {
+        skipCount(SkipStats::maxScoreDeadOuterJumps);
+        int32_t next = consumeOuterWindow(out, max);
+        numCandidates += out.size;
+        return next;
+      } else if (splitIndex < scorers.size()) {
+        if (!disableWindowDispatchForTests) {
+          int32_t top1 = PostingsReader::END;
+          int32_t top2 = PostingsReader::END;
+          int32_t top1Index = -1;
+          if (!positionEssentialScorers(top1, top2, top1Index) || top1 >= outerWindowEnd) {
+            int32_t next = consumeOuterWindow(out, max);
+            numCandidates += out.size;
+            return next;
+          }
+          anchorWindowAt(top1, max);
+          if (scorers.size() - splitIndex == 1) {
+            fillSingleEssentialCandidates(out, filter, domainBits, top1Index);
+          } else if (top2 >= windowEnd) {
+            skipCount(SkipStats::maxScoreTop2Conversions);
+            fillSingleEssentialCandidates(out, filter, domainBits, top1Index);
+          } else {
+            fillEssentialCandidates(filter, domainBits);
+            finalizeCandidates(out);
+          }
         } else if (scorers.size() - splitIndex == 1) {
-          fillSingleEssentialCandidates(out, filter, domainBits);
+          fillSingleEssentialCandidates(out, filter, domainBits, windowOrder[splitIndex]);
         } else {
           fillEssentialCandidates(filter, domainBits);
           finalizeCandidates(out);

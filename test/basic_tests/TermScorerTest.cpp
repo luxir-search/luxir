@@ -98,6 +98,19 @@ struct BulkDomainDriveGuard {
   }
 };
 
+struct WindowDispatchGuard {
+  bool saved;
+
+  explicit WindowDispatchGuard(bool disabled)
+    : saved(BooleanQuery::disableWindowDispatchForTests) {
+    BooleanQuery::disableWindowDispatchForTests = disabled;
+  }
+
+  ~WindowDispatchGuard() {
+    BooleanQuery::disableWindowDispatchForTests = saved;
+  }
+};
+
 struct MandOptBulkGuard {
   bool saved;
 
@@ -748,6 +761,42 @@ int64_t countPullTermDisjunctionSegment(MemPool& pool, Query::Context& qContext,
   return count;
 }
 
+std::unique_ptr<DocSet> makeEveryNthSegmentDocSet(IndexReader::Segment& segment,
+                                                  int32_t step, bool arrayDocSet,
+                                                  bool liveOnly);
+
+int64_t countBulkTermDisjunctionAll(IndexReader& reader,
+                                    std::span<const std::string_view> terms,
+                                    int32_t filterStep, bool arrayDocSet, bool liveOnly) {
+  MemPool pool;
+  Query::Context qContext(pool, reader);
+  int64_t count = 0;
+  auto segments = qContext.topReader.segments();
+  for (int32_t segnum = 0; segnum < (int32_t) segments.size(); segnum++) {
+    auto filter = makeEveryNthSegmentDocSet(segments[segnum], filterStep,
+                                            arrayDocSet, liveOnly);
+    count += countBulkTermDisjunctionSegment(pool, qContext, segments[segnum],
+                                             terms, filter.get());
+  }
+  return count;
+}
+
+int64_t countPullTermDisjunctionAll(IndexReader& reader,
+                                    std::span<const std::string_view> terms,
+                                    int32_t filterStep, bool arrayDocSet, bool liveOnly) {
+  MemPool pool;
+  Query::Context qContext(pool, reader);
+  int64_t count = 0;
+  auto segments = qContext.topReader.segments();
+  for (int32_t segnum = 0; segnum < (int32_t) segments.size(); segnum++) {
+    auto filter = makeEveryNthSegmentDocSet(segments[segnum], filterStep,
+                                            arrayDocSet, liveOnly);
+    count += countPullTermDisjunctionSegment(pool, qContext, segments[segnum],
+                                             terms, filter.get());
+  }
+  return count;
+}
+
 int64_t countBulkTermConjunctionSegment(MemPool& pool, Query::Context& qContext,
                                         IndexReader::Segment& segment,
                                         std::span<const std::string_view> terms,
@@ -864,6 +913,97 @@ void addSweepDisjunctionDocs(CollectionHelper& helper, int32_t numTerms) {
     docs.push_back(flatdoc("id", "sweep_" + std::to_string(doc), "body_w", body));
   }
 
+  helper.indexAll(docs, UpdateMessage::COMMIT);
+}
+
+std::vector<std::string> makeWindowDispatchTermStrings(int32_t numTerms) {
+  std::vector<std::string> terms;
+  terms.reserve((size_t) numTerms);
+  for (int32_t i = 0; i < numTerms; i++) {
+    terms.push_back("wd_t" + std::to_string(i));
+  }
+  return terms;
+}
+
+void addWindowDispatchRandomDocs(CollectionHelper& helper, int32_t nDocs, int32_t numTerms) {
+  auto terms = makeWindowDispatchTermStrings(numTerms);
+  helper.clear();
+  std::vector<Doc> docs;
+  docs.reserve((size_t) nDocs);
+  uint32_t state = 0x51ed1234U;
+  auto nextRand = [&]() {
+    state = state * 1664525U + 1013904223U;
+    return state;
+  };
+
+  for (int32_t doc = 0; doc < nDocs; doc++) {
+    std::string body;
+    int32_t used = 0;
+    for (int32_t term = 0; term < numTerms; term++) {
+      int32_t period = term == 0 ? 2
+        : term == 1 ? 3
+        : term == 2 ? 5
+        : term == 3 ? 11
+        : term == 4 ? 31
+        : term == 5 ? 97
+        : term == 6 ? 257
+        : 521;
+      bool match = ((doc + term * 17) % period) == 0;
+      if ((nextRand() & ((1U << (term + 1)) - 1U)) == 0U) {
+        match = true;
+      }
+      if (doc == DocsEnum::L1_DOCS && term == 0) {
+        match = true;
+      }
+      if (doc == 2 * DocsEnum::L1_DOCS && term == 1) {
+        match = true;
+      }
+      if (match) {
+        int32_t repeats = 1 + (int32_t) ((doc + term) % 3);
+        appendRepeatedTerm(body, terms[(size_t) term], repeats);
+        used += repeats;
+      }
+    }
+    int32_t len = used + 12 + (doc % 23);
+    appendRepeatedTerm(body, "wd_pad", len - used);
+    docs.push_back(flatdoc("id", "wd_" + std::to_string(doc), "body_w", body));
+  }
+
+  helper.indexAll(docs, UpdateMessage::COMMIT);
+}
+
+void addWindowDispatchBoundaryDocs(CollectionHelper& helper) {
+  const int32_t nDocs = 3 * DocsEnum::L1_DOCS + 100;
+  helper.clear();
+  std::vector<Doc> docs;
+  docs.reserve((size_t) nDocs);
+  for (int32_t doc = 0; doc < nDocs; doc++) {
+    std::string body;
+    int32_t used = 0;
+    auto add = [&](std::string_view term) {
+      appendRepeatedTerm(body, term, 1);
+      used++;
+    };
+
+    if (doc == DocsEnum::L1_DOCS) add("wd_at_end_a");
+    if (doc == 2 * DocsEnum::L1_DOCS) add("wd_at_end_b");
+    if (doc == 0) add("wd_top2_end_a");
+    if (doc == DocsEnum::L1_DOCS) add("wd_top2_end_b");
+    if (doc == 17) {
+      add("wd_same_a");
+      add("wd_same_b");
+    }
+    if (doc == 1000) add("wd_exhaust_a");
+    if (doc == 7000 || doc == 11000) add("wd_exhaust_b");
+    if (doc == 1000) add("wd_rare_driver");
+    if (doc >= 7000 && (doc % 3) == 0) add("wd_common_late");
+    if ((doc % 2) == 0) add("wd_dead_dense_a");
+    if ((doc % 3) == 0) add("wd_dead_dense_b");
+
+    int32_t len = used + 20 + (doc % 17);
+    appendRepeatedTerm(body, "wd_boundary_pad", len - used);
+    docs.push_back(flatdoc("id", "wd_boundary_" + std::to_string(doc), "body_w", body));
+  }
   helper.indexAll(docs, UpdateMessage::COMMIT);
 }
 
@@ -1142,7 +1282,9 @@ DisjunctionTopKRun runFilteredExhaustiveTermDisjunctionTopK(
 
 DisjunctionTopKRun runFilteredBulkTermDisjunctionTopK(
     IndexReader& reader, std::span<const std::string_view> terms, int32_t topK,
-    int32_t filterStep = 0, bool arrayDocSet = false, bool liveOnly = false) {
+    int32_t filterStep = 0, bool arrayDocSet = false, bool liveOnly = false,
+    bool allowPruning = true, bool disableWindowDispatch = false) {
+  WindowDispatchGuard dispatchGuard(disableWindowDispatch);
   MemPool pool;
   Query::Context qContext(pool, reader);
   auto queries = makeTermQueries(terms);
@@ -1164,7 +1306,7 @@ DisjunctionTopKRun runFilteredBulkTermDisjunctionTopK(
     auto filter = makeEveryNthSegmentDocSet(segments[segnum], filterStep,
                                             arrayDocSet, liveOnly);
     collectTopKWindowed(segnum, bulk, filter.get(), nullptr, collector, nullptr,
-                        segments[segnum].maxDoc());
+                        segments[segnum].maxDoc(), allowPruning);
   }
 
   DisjunctionTopKRun result;
@@ -1332,6 +1474,58 @@ SingleEssentialWindowRun runSingleEssentialBulkWindow(IndexReader& reader,
   run.directFills = SkipStats::maxScoreDirectFills;
   run.sweepWindows = SkipStats::maxScoreSweepWindows;
   return run;
+}
+
+struct BulkWindowRun {
+  std::vector<int32_t> docs;
+  std::vector<float> scores;
+  int64_t deadOuterJumps = 0;
+  int64_t anchorJumps = 0;
+  int64_t top2Conversions = 0;
+};
+
+BulkWindowRun collectBulkWindows(IndexReader& reader, std::span<const std::string_view> terms,
+                                 int32_t minDoc, int32_t maxDoc, float theta,
+                                 bool disableWindowDispatch) {
+  WindowDispatchGuard dispatchGuard(disableWindowDispatch);
+  MemPool pool;
+  Query::Context qContext(pool, reader);
+  auto& segment = qContext.topReader.segments()[0];
+  auto* bulk = createBulkTermDisjunctionScorer(pool, qContext, segment, terms);
+  EXPECT_NE(bulk, nullptr);
+
+  BulkWindowRun run;
+  if (bulk == nullptr) {
+    return run;
+  }
+
+  ScoreWindow window;
+  SkipStatsGuard stats;
+  for (int32_t cursor = minDoc; cursor != PostingsReader::END && cursor < maxDoc; ) {
+    int32_t next = bulk->scoreNextWindow(window, nullptr, cursor, maxDoc, theta);
+    for (int32_t i = 0; i < window.size; i++) {
+      run.docs.push_back(window.docs[(size_t) i]);
+      run.scores.push_back(window.scores[(size_t) i]);
+    }
+    if (next == PostingsReader::END) {
+      break;
+    }
+    EXPECT_GT(next, cursor);
+    cursor = next;
+  }
+  run.deadOuterJumps = SkipStats::maxScoreDeadOuterJumps;
+  run.anchorJumps = SkipStats::maxScoreAnchorJumps;
+  run.top2Conversions = SkipStats::maxScoreTop2Conversions;
+  return run;
+}
+
+void expectBulkWindowRunsEqual(const BulkWindowRun& expected, const BulkWindowRun& actual) {
+  ASSERT_EQ(expected.docs, actual.docs);
+  ASSERT_EQ(expected.scores.size(), actual.scores.size());
+  for (size_t i = 0; i < expected.scores.size(); i++) {
+    EXPECT_EQ(std::bit_cast<uint32_t>(expected.scores[i]),
+              std::bit_cast<uint32_t>(actual.scores[i])) << "doc=" << expected.docs[i];
+  }
 }
 
 struct DomainCountRun {
@@ -2655,7 +2849,7 @@ TEST_F(TermScorerTest, termImpactGroupBoundsCoverUnalignedBlockRanges) {
 
 TEST_F(TermScorerTest, maxScoreSetupUsesGroupBoundsWithoutL0Parse) {
   const int32_t nDocs = 3 * DocsEnum::L1_DOCS + 113;
-  CollectionHelper helper("main");
+  CollectionHelper helper("max_score_setup_group_bounds");
   addDenseManyClauseDisjunctionDocs(helper, nDocs, 8);
   auto reader = helper.getIndexWriter()->getIndexReader();
 
@@ -5250,6 +5444,80 @@ TEST_F(TermScorerTest, windowedMaxScoreDisjunctionTopKMatchesExhaustiveAndGlobal
   helper.clear();
 }
 
+TEST_F(TermScorerTest, CompetitiveScoreThresholdSeededMatchesReference) {
+  struct ThresholdCase {
+    float mcs;
+    double factor;
+    double bound;
+  };
+
+  std::vector<ThresholdCase> cases = {
+    {0.0f, 1.0, 0.0},
+    {-1.0f, 1.0, 0.0},
+    {1.0f, 1.0, 0.0},
+    {std::numeric_limits<float>::lowest(), 1.0, 0.0},
+    {std::numeric_limits<float>::max(), 1.0, 0.0},
+    {std::numeric_limits<float>::denorm_min(), 1.0 + 0x1p-24, 0.0},
+    {-std::numeric_limits<float>::denorm_min(), 1.0 + 0x1p-24, 0.0},
+    {std::numeric_limits<float>::infinity(), 1.0, 0.0},
+    {-std::numeric_limits<float>::infinity(), 1.0, 0.0},
+    {17.0f, std::numeric_limits<double>::infinity(), 0.0},
+    {17.0f, 1.0, std::numeric_limits<double>::infinity()},
+    {17.0f, 1.0, -std::numeric_limits<double>::infinity()},
+    {42.0f, 1.0 + 0x1p-24, 42.0 / (1.0 + 0x1p-24)},
+    {42.0f, 1.0 + 0x1p-24, 42.0 / (1.0 + 0x1p-24) - 0x1p-40},
+    {42.0f, 1.0 + 0x1p-24, 42.0 / (1.0 + 0x1p-24) + 0x1p-40},
+    {-42.0f, 3.5, -42.0 / 3.5 - 0x1p-30},
+    {std::numeric_limits<float>::max(), 0x1p-64, 0.0},
+    {-std::numeric_limits<float>::max(), 0x1p-64, 0.0}
+  };
+
+  uint32_t state = 0xdeadbeefU;
+  auto nextUnit = [&]() {
+    state = state * 1664525U + 1013904223U;
+    return (double) (state >> 8) / (double) (1U << 24);
+  };
+  for (int32_t i = 0; i < 200; i++) {
+    int32_t exp = -80 + (int32_t) (nextUnit() * 160.0);
+    double raw = (nextUnit() * 2.0 - 1.0) * std::ldexp(1.0, exp);
+    float mcs = (float) raw;
+    double factor = 0.25 + nextUnit() * 8.0;
+    double cancellation = (double) mcs / factor;
+    double offset = (nextUnit() * 2.0 - 1.0) * std::ldexp(1.0, exp - 24);
+    cases.push_back({mcs, factor, cancellation + offset});
+    cases.push_back({mcs, factor, offset});
+  }
+
+  for (const auto& testCase : cases) {
+    float expected = competitiveScoreThresholdReference(testCase.mcs, testCase.factor,
+                                                        testCase.bound);
+    float actual = competitiveScoreThreshold(testCase.mcs, testCase.factor, testCase.bound);
+    EXPECT_EQ(std::bit_cast<uint32_t>(actual), std::bit_cast<uint32_t>(expected))
+        << "mcs=" << testCase.mcs << " factor=" << testCase.factor
+        << " bound=" << testCase.bound;
+  }
+
+  int32_t docs[] = {1, 2, 3, 4};
+  float scores[] = {
+    std::numeric_limits<float>::quiet_NaN(), 0.5f, 1.0f, 2.0f
+  };
+  int32_t strictDocs[] = {1, 2, 3, 4};
+  float strictScores[] = {
+    std::numeric_limits<float>::quiet_NaN(), 0.5f, 1.0f, 2.0f
+  };
+  int32_t strictKept = compactByScoreThreshold(strictDocs, strictScores, 4, 1.0f);
+  EXPECT_EQ(strictKept, 2);
+  EXPECT_EQ(strictDocs[0], 3);
+  EXPECT_EQ(strictDocs[1], 4);
+
+  int32_t finishKept = compactByScoreNotLessThanThreshold(docs, scores, 4, 1.0f);
+  EXPECT_EQ(finishKept, 3);
+  EXPECT_EQ(docs[0], 1);
+  EXPECT_TRUE(std::isnan(scores[0]));
+  EXPECT_EQ(docs[1], 3);
+  EXPECT_EQ(docs[2], 4);
+}
+
 TEST_F(TermScorerTest, MaxScoreBulkScorerWindowedTopKMatchesBaseline) {
   CollectionHelper helper("main");
   addMaxScoreDisjunctionDocs(helper);
@@ -5308,6 +5576,132 @@ TEST_F(TermScorerTest, MaxScoreBulkScorerBufferSweepsMatchExhaustiveAcrossShapes
 
   EXPECT_GT(sweepWindows, 0);
   EXPECT_GT(compactionDrops, 0);
+  helper.clear();
+}
+
+TEST_F(TermScorerTest, MaxScoreBulkScorerWindowDispatchMatchesDisabledAcrossRandomizedUnions) {
+  for (bool tinySegment : {true, false}) {
+    CollectionHelper helper(tinySegment ? "window_dispatch_random_tiny"
+                                        : "window_dispatch_random_large");
+    const int32_t maxClauses = 8;
+    int32_t nDocs = tinySegment ? 997 : 2 * DocsEnum::L1_DOCS + 333;
+    addWindowDispatchRandomDocs(helper, nDocs, maxClauses);
+    if (!tinySegment) {
+      std::vector<std::string> deleteIds;
+      for (int32_t doc = 5; doc < nDocs; doc += 13) {
+        deleteIds.push_back("wd_" + std::to_string(doc));
+      }
+      helper.deleteByIds(deleteIds, UpdateMessage::COMMIT);
+    }
+    auto reader = helper.getIndexWriter()->getIndexReader();
+    auto termStrings = makeWindowDispatchTermStrings(maxClauses);
+    auto views = termViews(termStrings);
+    bool liveOnly = !tinySegment;
+
+    BulkDomainDriveGuard domainGuard(true);
+    for (int32_t clauses = 2; clauses <= maxClauses; clauses++) {
+      std::span<const std::string_view> terms(views.data(), (size_t) clauses);
+      for (int32_t mode = 0; mode < 3; mode++) {
+        int32_t filterStep = mode == 0 ? 0 : mode == 1 ? 7 : 11;
+        bool arrayDocSet = mode == 2;
+        int32_t topK = clauses + 5;
+        auto disabled = runFilteredBulkTermDisjunctionTopK(
+            *reader, terms, topK, filterStep, arrayDocSet, liveOnly, true, true);
+        auto enabled = runFilteredBulkTermDisjunctionTopK(
+            *reader, terms, topK, filterStep, arrayDocSet, liveOnly, true, false);
+        assertSameTopKDocs(disabled, enabled, topK);
+
+        auto pull = runFilteredExhaustiveTermDisjunctionTopK(
+            *reader, terms, topK, filterStep, arrayDocSet, liveOnly);
+        assertSameTopKDocs(pull, enabled, topK);
+
+        auto disabledExhaustive = runFilteredBulkTermDisjunctionTopK(
+            *reader, terms, topK, filterStep, arrayDocSet, liveOnly, false, true);
+        auto enabledExhaustive = runFilteredBulkTermDisjunctionTopK(
+            *reader, terms, topK, filterStep, arrayDocSet, liveOnly, false, false);
+        assertSameTopKDocs(disabledExhaustive, enabledExhaustive, topK);
+
+        EXPECT_EQ(countBulkTermDisjunctionAll(*reader, terms, filterStep,
+                                              arrayDocSet, liveOnly),
+                  countPullTermDisjunctionAll(*reader, terms, filterStep,
+                                              arrayDocSet, liveOnly))
+            << "tiny=" << tinySegment << " clauses=" << clauses << " mode=" << mode;
+      }
+    }
+    helper.clear();
+  }
+}
+
+TEST_F(TermScorerTest, MaxScoreBulkScorerWindowDispatchBoundaryCasesMatchDisabled) {
+  CollectionHelper helper("window_dispatch_boundary");
+  addWindowDispatchBoundaryDocs(helper);
+  auto reader = helper.getIndexWriter()->getIndexReader();
+  const int32_t maxDoc = 3 * DocsEnum::L1_DOCS + 100;
+
+  auto assertParity = [&](std::span<const std::string_view> terms,
+                          int32_t minDoc, int32_t max, float theta) {
+    auto disabled = collectBulkWindows(*reader, terms, minDoc, max, theta, true);
+    auto enabled = collectBulkWindows(*reader, terms, minDoc, max, theta, false);
+    expectBulkWindowRunsEqual(disabled, enabled);
+    return enabled;
+  };
+
+  std::array<std::string_view, 2> top1AtWindowEnd = {"wd_at_end_a", "wd_at_end_b"};
+  auto atWindowEnd = assertParity(top1AtWindowEnd, 0, maxDoc, 0.0f);
+  ASSERT_EQ(atWindowEnd.docs.size(), 2);
+  EXPECT_EQ(atWindowEnd.docs[0], DocsEnum::L1_DOCS);
+  EXPECT_EQ(atWindowEnd.docs[1], 2 * DocsEnum::L1_DOCS);
+
+  std::array<std::string_view, 2> top1AtOuterEnd = {"wd_at_end_a", "wd_at_end_b"};
+  auto atOuterEnd = assertParity(top1AtOuterEnd, 0, DocsEnum::L1_DOCS, 0.0f);
+  EXPECT_TRUE(atOuterEnd.docs.empty());
+
+  std::array<std::string_view, 2> top2AtWindowEnd = {"wd_top2_end_a", "wd_top2_end_b"};
+  auto atTop2End = assertParity(top2AtWindowEnd, 0, maxDoc, 0.0f);
+  EXPECT_GT(atTop2End.top2Conversions, 0);
+
+  std::array<std::string_view, 2> sameTop = {"wd_same_a", "wd_same_b"};
+  auto sameTopRun = assertParity(sameTop, 0, maxDoc, 0.0f);
+  EXPECT_EQ(sameTopRun.top2Conversions, 0);
+
+  std::array<std::string_view, 2> allEnd = {"wd_same_a", "wd_same_b"};
+  auto allEndRun = assertParity(allEnd, 2 * DocsEnum::L1_DOCS + 10, maxDoc, 0.0f);
+  EXPECT_TRUE(allEndRun.docs.empty());
+
+  std::array<std::string_view, 2> exhausting = {"wd_exhaust_a", "wd_exhaust_b"};
+  auto exhaustingRun = assertParity(exhausting, 0, maxDoc, 0.0f);
+  ASSERT_EQ(exhaustingRun.docs.size(), 3);
+  EXPECT_EQ(exhaustingRun.docs[0], 1000);
+  EXPECT_EQ(exhaustingRun.docs[1], 7000);
+  EXPECT_EQ(exhaustingRun.docs[2], 11000);
+  EXPECT_GT(exhaustingRun.anchorJumps, 0);
+  EXPECT_GT(exhaustingRun.top2Conversions, 0);
+
+  std::array<std::string_view, 2> convertedDifferentDriver = {
+    "wd_common_late", "wd_rare_driver"
+  };
+  auto convertedRun = assertParity(convertedDifferentDriver, 0, maxDoc, 0.0f);
+  EXPECT_GT(convertedRun.top2Conversions, 0);
+  ASSERT_FALSE(convertedRun.docs.empty());
+  EXPECT_EQ(convertedRun.docs[0], 1000);
+  helper.clear();
+}
+
+TEST_F(TermScorerTest, MaxScoreBulkScorerWindowDispatchSkipStatsCountersFire) {
+  CollectionHelper helper("window_dispatch_stats");
+  addWindowDispatchBoundaryDocs(helper);
+  auto reader = helper.getIndexWriter()->getIndexReader();
+  const int32_t maxDoc = 3 * DocsEnum::L1_DOCS + 100;
+
+  std::array<std::string_view, 2> deadTerms = {"wd_dead_dense_a", "wd_dead_dense_b"};
+  auto deadRun = collectBulkWindows(*reader, deadTerms, 0, maxDoc, 1.0e30f, false);
+  EXPECT_TRUE(deadRun.docs.empty());
+  EXPECT_GT(deadRun.deadOuterJumps, 0);
+
+  std::array<std::string_view, 2> anchoredTerms = {"wd_exhaust_a", "wd_exhaust_b"};
+  auto anchoredRun = collectBulkWindows(*reader, anchoredTerms, 0, maxDoc, 0.0f, false);
+  EXPECT_GT(anchoredRun.anchorJumps, 0);
+  EXPECT_GT(anchoredRun.top2Conversions, 0);
   helper.clear();
 }
 
