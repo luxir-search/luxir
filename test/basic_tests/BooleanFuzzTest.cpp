@@ -557,3 +557,117 @@ TEST_F(BooleanFuzzTest, conjunctionBulkCountMatchesPullOnMixedBlockShapes) {
   EXPECT_GT(SkipStats::conjCountFallbacks, 0);
   SkipStats::enabled = savedStats;
 }
+
+TEST_F(BooleanFuzzTest, mandOptBulkCountMatchesPullOnMixedBlockShapes) {
+  helper.clear();
+  const int32_t numDocs = 2 * DocsEnum::L1_DOCS + 513;
+  std::vector<Doc> docs;
+  docs.reserve((size_t) numDocs);
+  for (int32_t doc = 0; doc < numDocs; doc++) {
+    std::string body = "bm_mand_contig";
+    if ((doc % 17) == 0) body += " bm_mand_sparse";
+    if ((doc % 4) != 1) body += " bm_opt_word";
+    if ((doc % 10) == 0) body += " bm_opt_packed";
+    if (doc < DocsEnum::L1_DOCS && (doc % 257) == 17) body += " bm_opt_tail";
+    body += " filler";
+    docs.push_back(flatdoc("id", "bm" + std::to_string(doc), "body_w", body));
+  }
+  helper.indexAll(docs, UpdateMessage::COMMIT);
+  auto reader = helper.getIndexWriter()->getIndexReader();
+
+  auto makeFilter = [](int32_t maxDoc, int32_t mode) -> std::unique_ptr<DocSet> {
+    if (mode == 0) {
+      return nullptr;
+    }
+    if (mode == 1) {
+      auto filter = std::make_unique<RAMBitDocSet>(maxDoc);
+      for (int32_t doc = 0; doc < maxDoc; doc++) {
+        if ((doc % 3) != 1) {
+          filter->mutableBits().set(doc);
+        }
+      }
+      return filter;
+    }
+    std::vector<int32_t> filterDocs;
+    for (int32_t doc = 0; doc < maxDoc; doc++) {
+      if ((doc % 7) == 0) {
+        filterDocs.push_back(doc);
+      }
+    }
+    return std::make_unique<ArrDocSet>(std::move(filterDocs));
+  };
+
+  auto runCount = [&](std::string_view mandTerm, std::span<const std::string_view> optTerms,
+                      bool bulk, int32_t filterMode) -> int64_t {
+    MemPool pool;
+    Query::Context qContext(pool, *reader);
+    TermQuery mandQuery("body_w", mandTerm);
+    std::array<Query*, 1> mandatory = {&mandQuery};
+    std::vector<TermQuery> optQueries;
+    std::vector<Query*> optional;
+    optQueries.reserve(optTerms.size());
+    optional.reserve(optTerms.size());
+    for (auto term : optTerms) {
+      optQueries.emplace_back("body_w", term);
+      optional.push_back(&optQueries.back());
+    }
+    std::span<Query*> empty;
+    BooleanQuery query(std::span<Query*>(mandatory.data(), mandatory.size()),
+                       std::span<Query*>(optional.data(), optional.size()),
+                       empty, empty);
+    auto* weight = query.createWeight(qContext, Query::NEED_SCORES);
+    int64_t total = 0;
+    auto segments = qContext.topReader.segments();
+    for (auto& segment : segments) {
+      auto filter = makeFilter(segment.maxDoc(), filterMode);
+      if (bulk) {
+        auto* supplier = weight->scorerSupplier(pool, segment);
+        if (supplier == nullptr) continue;
+        auto* bulkScorer = supplier->bulkScorer(pool);
+        if (bulkScorer == nullptr) {
+          ADD_FAILURE() << "bulkScorer returned null";
+          return -1;
+        }
+        for (int32_t cursor = 0; cursor != PostingsReader::END && cursor < segment.maxDoc(); ) {
+          int32_t next = bulkScorer->countNextWindow(total, nullptr, filter.get(),
+                                                     cursor, segment.maxDoc());
+          if (next == PostingsReader::END) break;
+          if (next <= cursor) {
+            ADD_FAILURE() << "countNextWindow made no progress";
+            return -1;
+          }
+          cursor = next;
+        }
+      } else {
+        auto* scorer = weight->createScorer(pool, segment);
+        if (scorer == nullptr) continue;
+        for (int32_t doc = scorer->next(); doc != PostingsReader::END; doc = scorer->next()) {
+          if (filter == nullptr || filter->get(doc)) {
+            total++;
+          }
+        }
+      }
+    }
+    return total;
+  };
+
+  std::array<std::string_view, 1> oneOpt = {"bm_opt_word"};
+  std::array<std::string_view, 3> threeOpts = {"bm_opt_word", "bm_opt_packed", "bm_opt_tail"};
+
+  bool savedStats = SkipStats::enabled;
+  SkipStats::enabled = true;
+  SkipStats::reset();
+  for (int32_t filterMode : {0, 1, 2}) {
+    EXPECT_EQ(runCount("bm_mand_contig", oneOpt, true, filterMode),
+              runCount("bm_mand_contig", oneOpt, false, filterMode))
+        << "contig oneOpt filter=" << filterMode;
+    EXPECT_EQ(runCount("bm_mand_contig", threeOpts, true, filterMode),
+              runCount("bm_mand_contig", threeOpts, false, filterMode))
+        << "contig threeOpts filter=" << filterMode;
+    EXPECT_EQ(runCount("bm_mand_sparse", threeOpts, true, filterMode),
+              runCount("bm_mand_sparse", threeOpts, false, filterMode))
+        << "sparse threeOpts filter=" << filterMode;
+  }
+  EXPECT_GT(SkipStats::mandOptBulkWindows, 0);
+  SkipStats::enabled = savedStats;
+}

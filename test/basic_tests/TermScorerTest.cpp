@@ -19,6 +19,7 @@
 #include "solux/query/TermQuery.h"
 #include "solux/query/PhraseQuery.h"
 #include "solux/query/BooleanQuery.h"
+#include "solux/query/ForcePrepareQuery.h"
 #include "solux/search/Collector.h"
 
 
@@ -94,6 +95,19 @@ struct BulkDomainDriveGuard {
 
   ~BulkDomainDriveGuard() {
     BooleanQuery::disableBulkDomainDriveForTests = saved;
+  }
+};
+
+struct MandOptBulkGuard {
+  bool saved;
+
+  explicit MandOptBulkGuard(bool disabled)
+    : saved(BooleanQuery::disableMandOptBulkForTests) {
+    BooleanQuery::disableMandOptBulkForTests = disabled;
+  }
+
+  ~MandOptBulkGuard() {
+    BooleanQuery::disableMandOptBulkForTests = saved;
   }
 };
 
@@ -1157,6 +1171,72 @@ DisjunctionTopKRun runFilteredBulkTermDisjunctionTopK(
   result.visited = collector.totalHits();
   result.topDocs = sortedCollectorDocs(collector);
   return result;
+}
+
+DisjunctionTopKRun runMandOptSupplierTopK(IndexReader& reader,
+                                          std::span<Query*> mandatory,
+                                          std::span<Query*> optional,
+                                          int32_t topK,
+                                          bool disableBulk,
+                                          int32_t filterStep = 0,
+                                          bool arrayDocSet = false,
+                                          bool liveOnly = false,
+                                          bool allowPruning = true,
+                                          bool* sawBulkOut = nullptr) {
+  MandOptBulkGuard guard(disableBulk);
+  MemPool pool;
+  Query::Context qContext(pool, reader);
+  std::span<Query*> empty;
+  BooleanQuery query(mandatory, optional, empty, empty);
+  auto* weight = query.createWeight(qContext, Query::NEED_SCORES);
+  TopDocsCollector collector(topK);
+  MaxScoreAccumulator accumulator;
+  bool sawBulk = false;
+
+  auto segments = qContext.topReader.segments();
+  for (int32_t segnum = 0; segnum < (int32_t) segments.size(); segnum++) {
+    auto* supplier = weight->scorerSupplier(pool, segments[segnum]);
+    if (supplier == nullptr) {
+      continue;
+    }
+    auto filter = makeEveryNthSegmentDocSet(segments[segnum], filterStep,
+                                            arrayDocSet, liveOnly);
+    auto* bulk = supplier->bulkScorer(pool);
+    if (bulk != nullptr) {
+      sawBulk = true;
+      collectTopKWindowed(segnum, bulk, filter.get(), nullptr, collector,
+                          allowPruning ? &accumulator : nullptr,
+                          segments[segnum].maxDoc(), allowPruning);
+      continue;
+    }
+    auto* scorer = supplier->get(pool, std::numeric_limits<int64_t>::max());
+    if (scorer != nullptr) {
+      collectTopK(segnum, scorer, filter.get(), nullptr, collector, allowPruning,
+                  allowPruning ? &accumulator : nullptr);
+    }
+  }
+
+  if (sawBulkOut != nullptr) {
+    *sawBulkOut = sawBulk;
+  }
+  DisjunctionTopKRun result;
+  result.visited = collector.totalHits();
+  result.topDocs = sortedCollectorDocs(collector);
+  return result;
+}
+
+BulkScorer* createMandOptBulkScorer(MemPool& pool, Query::Context& qContext,
+                                    IndexReader::Segment& segment,
+                                    std::span<Query*> mandatory,
+                                    std::span<Query*> optional) {
+  std::span<Query*> empty;
+  BooleanQuery query(mandatory, optional, empty, empty);
+  auto* weight = query.createWeight(qContext, Query::NEED_SCORES);
+  auto* supplier = weight->scorerSupplier(pool, segment);
+  if (supplier == nullptr) {
+    return nullptr;
+  }
+  return supplier->bulkScorer(pool);
 }
 
 struct WindowScore {
@@ -3013,6 +3093,391 @@ TEST_F(TermScorerTest, mandOptTwoPhaseOptionalScoresOnlyConfirmedMatches) {
   ASSERT_EQ(scorer->next(), 2);
   EXPECT_FLOAT_EQ(scorer->score(), reqScores[2]);
   EXPECT_EQ(scorer->next(), PostingsReader::END);
+}
+
+TEST_F(TermScorerTest, mandOptBulkMatchesPullAcrossClauseCountsFiltersAndDeletes) {
+  CollectionHelper helper("main");
+  const int32_t segDocs = DocsEnum::L1_DOCS + 257;
+  std::vector<std::string> deleteIds;
+  for (int32_t seg = 0; seg < 3; seg++) {
+    std::vector<Doc> docs;
+    docs.reserve((size_t) segDocs);
+    for (int32_t local = 0; local < segDocs; local++) {
+      int32_t doc = seg * segDocs + local;
+      std::string body;
+      appendRepeatedTerm(body, "mob_mand_dense", 1 + (doc % 5));
+      if ((doc % 17) == 0) appendRepeatedTerm(body, "mob_mand_sparse", 2 + (doc % 3));
+      if ((local % 4) != 1) appendRepeatedTerm(body, "mob_opt_a", 1 + (doc % 4));
+      if ((doc % 10) == 0) appendRepeatedTerm(body, "mob_opt_b", 9);
+      if (seg < 2 && (local % 257) == 17) appendRepeatedTerm(body, "mob_opt_c", 25);
+      if (seg == 0 && (local % 31) == 3) appendRepeatedTerm(body, "mob_opt_d", 17);
+      appendRepeatedTerm(body, "mob_filler", 12 + (doc % 19));
+      docs.push_back(flatdoc("id", "mob_" + std::to_string(doc), "body_w", body));
+      if ((doc % 29) == 11) {
+        deleteIds.push_back("mob_" + std::to_string(doc));
+      }
+    }
+    helper.indexAll(docs, UpdateMessage::COMMIT);
+  }
+  helper.deleteByIds(deleteIds, UpdateMessage::COMMIT);
+  auto reader = helper.getIndexWriter()->getIndexReader();
+
+  TermQuery mandDense("body_w", "mob_mand_dense");
+  TermQuery mandSparse("body_w", "mob_mand_sparse");
+  TermQuery optA("body_w", "mob_opt_a");
+  TermQuery optB("body_w", "mob_opt_b");
+  TermQuery optC("body_w", "mob_opt_c");
+  TermQuery optD("body_w", "mob_opt_d");
+  std::array<Query*, 2> mandQueries = {&mandDense, &mandSparse};
+  std::array<Query*, 4> optQueries = {&optA, &optB, &optC, &optD};
+
+  int64_t bulkWindows = 0;
+  int64_t bulkSweeps = 0;
+  for (Query* mand : mandQueries) {
+    std::span<Query*> mandatory(&mand, (size_t) 1);
+    for (int32_t optCount : {1, 2, 4}) {
+      std::span<Query*> optional(optQueries.data(), (size_t) optCount);
+      for (int32_t filterMode : {0, 1, 2}) {
+        int32_t filterStep = filterMode == 0 ? 0 : filterMode == 1 ? 3 : 5;
+        bool arrayFilter = filterMode == 2;
+        bool liveOnly = filterMode != 0;
+        bool sawBulk = false;
+        auto expected = runMandOptSupplierTopK(
+            *reader, mandatory, optional, 13, true, filterStep, arrayFilter, liveOnly);
+        SkipStatsGuard stats;
+        auto actual = runMandOptSupplierTopK(
+            *reader, mandatory, optional, 13, false, filterStep, arrayFilter, liveOnly,
+            true, &sawBulk);
+        EXPECT_TRUE(sawBulk) << "optCount=" << optCount << " filterMode=" << filterMode;
+        assertSameTopKDocs(expected, actual, 13);
+        bulkWindows += SkipStats::mandOptBulkWindows;
+        bulkSweeps += SkipStats::mandOptBulkSweeps;
+      }
+    }
+  }
+  EXPECT_GT(bulkWindows, 0);
+  EXPECT_GT(bulkSweeps, 0);
+  helper.clear();
+}
+
+TEST_F(TermScorerTest, mandOptBulkZeroAndOneSurvivingOptionalScorers) {
+  CollectionHelper helper("main");
+  helper.index(flatdoc("id", "z0", "body_w", "mob_zero_mand"), UpdateMessage::COMMIT);
+  helper.index(flatdoc("id", "z1", "body_w", "mob_zero_mand mob_one_opt"), UpdateMessage::COMMIT);
+  auto reader = helper.getIndexWriter()->getIndexReader();
+
+  MemPool pool;
+  Query::Context qContext(pool, *reader);
+  TermQuery mand("body_w", "mob_zero_mand");
+  TermQuery presentOpt("body_w", "mob_one_opt");
+  TermQuery absentOpt("body_w", "mob_absent_opt");
+  std::array<Query*, 1> mandatory = {&mand};
+  std::array<Query*, 2> optional = {&presentOpt, &absentOpt};
+  std::span<Query*> mandatorySpan(mandatory.data(), mandatory.size());
+  std::span<Query*> optionalSpan(optional.data(), optional.size());
+  std::span<Query*> empty;
+  BooleanQuery query(mandatorySpan, optionalSpan, empty, empty);
+  auto* weight = query.createWeight(qContext, Query::NEED_SCORES);
+  auto segments = qContext.topReader.segments();
+  ASSERT_EQ(segments.size(), 2u);
+
+  auto* seg0Supplier = weight->scorerSupplier(pool, segments[0]);
+  ASSERT_NE(seg0Supplier, nullptr);
+  EXPECT_EQ(seg0Supplier->bulkScorer(pool), nullptr);
+  auto* seg0Scorer = seg0Supplier->get(pool, std::numeric_limits<int64_t>::max());
+  ASSERT_NE(seg0Scorer, nullptr);
+  EXPECT_EQ(collectDocIds(seg0Scorer), std::vector<int32_t>({0}));
+
+  auto* seg1Supplier = weight->scorerSupplier(pool, segments[1]);
+  ASSERT_NE(seg1Supplier, nullptr);
+  auto* bulk = seg1Supplier->bulkScorer(pool);
+  EXPECT_NE(dynamic_cast<BooleanQuery::MandOptBulkScorer*>(bulk), nullptr);
+  helper.clear();
+}
+
+TEST_F(TermScorerTest, mandOptBulkFallbackRoutingAndTwoPhaseChildren) {
+  TestIndex testIndex;
+  TestField f(testIndex, "body_w");
+  f.startIndexing();
+  f.add(0, "route_mand route_opt route_filter alpha beta");
+  f.add(1, "route_mand route_opt route_block alpha pad beta");
+  testIndex.flush();
+  f.startReading();
+
+  auto poolFree = testIndex.pool.rewindScopeGuard();
+  Query::Context qContext(testIndex.pool, *testIndex.reader);
+  auto& segment = qContext.topReader.segments()[0];
+  TermQuery mand("body_w", "route_mand");
+  TermQuery opt("body_w", "route_opt");
+  TermQuery filterTerm("body_w", "route_filter");
+  TermQuery prohibited("body_w", "route_block");
+  std::vector<std::string_view> phraseTerms = {"alpha", "beta"};
+  std::vector<int32_t> positions = {0, 1};
+  PhraseQuery phrase("body_w", phraseTerms, positions);
+  ForcePrepareQuery wrappedPhrase(&phrase);
+  std::span<Query*> empty;
+
+  auto expectNoBulk = [&](std::span<Query*> mandatory, std::span<Query*> optional,
+                          std::span<Query*> prohibitedSpan, std::span<Query*> filter,
+                          int minShouldMatch) {
+    BooleanQuery query(mandatory, optional, prohibitedSpan, filter, minShouldMatch);
+    auto* weight = query.createWeight(qContext, Query::NEED_SCORES);
+    auto* supplier = weight->scorerSupplier(testIndex.pool, segment);
+    ASSERT_NE(supplier, nullptr);
+    EXPECT_EQ(supplier->bulkScorer(testIndex.pool), nullptr);
+  };
+
+  std::array<Query*, 1> mandOnly = {&mand};
+  std::array<Query*, 1> optOnly = {&opt};
+  std::array<Query*, 1> filterOnly = {&filterTerm};
+  std::array<Query*, 1> prohibitedOnly = {&prohibited};
+  expectNoBulk(mandOnly, optOnly, empty, filterOnly, 0);
+  expectNoBulk(mandOnly, optOnly, prohibitedOnly, empty, 0);
+  expectNoBulk(mandOnly, optOnly, empty, empty, 1);
+
+  std::array<Query*, 1> phraseMand = {&phrase};
+  expectNoBulk(phraseMand, optOnly, empty, empty, 0);
+  std::array<Query*, 1> phraseOpt = {&phrase};
+  expectNoBulk(mandOnly, phraseOpt, empty, empty, 0);
+  std::array<Query*, 1> wrappedOpt = {&wrappedPhrase};
+  expectNoBulk(mandOnly, wrappedOpt, empty, empty, 0);
+}
+
+TEST_F(TermScorerTest, mandOptBulkHybridEngagesForDenseMandSparseOptHighTheta) {
+  const int32_t nDocs = 2 * DocsEnum::L1_DOCS + 31;
+  TestIndex testIndex;
+  TestField f(testIndex, "body_w");
+  f.startIndexing();
+  std::vector<int32_t> optDocs;
+  for (int32_t doc = 0; doc < nDocs; doc++) {
+    std::string body;
+    appendRepeatedTerm(body, "hyb_mand", 1);
+    if ((doc % 257) == 17) {
+      appendRepeatedTerm(body, "hyb_opt", 60);
+      optDocs.push_back(doc);
+    }
+    appendRepeatedTerm(body, "hyb_filler", 80 + (doc % 7));
+    f.add(doc, body);
+  }
+  testIndex.flush();
+  f.startReading();
+
+  auto poolFree = testIndex.pool.rewindScopeGuard();
+  Query::Context qContext(testIndex.pool, *testIndex.reader);
+  auto& segment = qContext.topReader.segments()[0];
+  float mandMax = 0.0f;
+  {
+    TermQuery mandOnly("body_w", "hyb_mand");
+    auto* weight = mandOnly.createWeight(qContext, Query::NEED_SCORES);
+    auto* scorer = weight->createScorer(testIndex.pool, segment);
+    ASSERT_NE(scorer, nullptr);
+    mandMax = scorer->getMaxScoreForSetup(PostingsReader::END);
+  }
+  ASSERT_TRUE(std::isfinite(mandMax));
+  float theta = std::nextafter(mandMax * 1.05f, std::numeric_limits<float>::infinity());
+
+  TermQuery mand("body_w", "hyb_mand");
+  TermQuery opt("body_w", "hyb_opt");
+  std::array<Query*, 1> mandatory = {&mand};
+  std::array<Query*, 1> optional = {&opt};
+  auto* bulk = createMandOptBulkScorer(
+      testIndex.pool, qContext, segment,
+      std::span<Query*>(mandatory.data(), mandatory.size()),
+      std::span<Query*>(optional.data(), optional.size()));
+  ASSERT_NE(dynamic_cast<BooleanQuery::MandOptBulkScorer*>(bulk), nullptr);
+
+  SkipStatsGuard stats;
+  std::vector<int32_t> docs;
+  for (int32_t cursor = 0; cursor != PostingsReader::END && cursor < segment.maxDoc(); ) {
+    ScoreWindow window;
+    int32_t next = bulk->scoreNextWindow(window, nullptr, cursor, segment.maxDoc(), theta);
+    for (int32_t i = 0; i < window.size; i++) {
+      docs.push_back(window.docs[(size_t) i]);
+      EXPECT_GE(window.scores[(size_t) i], theta);
+    }
+    if (next == PostingsReader::END) break;
+    ASSERT_GT(next, cursor);
+    cursor = next;
+  }
+  EXPECT_EQ(docs, optDocs);
+  EXPECT_GT(SkipStats::mandOptBulkOptDrivenWindows, 0);
+}
+
+TEST_F(TermScorerTest, mandOptBulkInfiniteMaxOptionalDegradesSafely) {
+  const int32_t nDocs = 3 * Postings::DOCS_BLOCK_SIZE + 9;
+  TestIndex testIndex;
+  TestField f(testIndex, "body_w");
+  f.startIndexing();
+  for (int32_t doc = 0; doc < nDocs; doc++) {
+    std::string body = "inf_mand";
+    if (doc == 7) {
+      body += " inf_opt";
+    }
+    body += " inf_filler";
+    f.add(doc, body);
+  }
+  testIndex.flush();
+  f.startReading();
+
+  TermQuery mand("body_w", "inf_mand");
+  TermQuery opt("body_w", "inf_opt");
+  std::array<Query*, 1> mandatory = {&mand};
+  std::array<Query*, 1> optional = {&opt};
+  bool sawBulk = false;
+  auto expected = runMandOptSupplierTopK(
+      *testIndex.reader, mandatory, optional, 20, true);
+  SkipStatsGuard stats;
+  auto actual = runMandOptSupplierTopK(
+      *testIndex.reader, mandatory, optional, 20, false, 0, false, false, true, &sawBulk);
+  EXPECT_TRUE(sawBulk);
+  assertSameTopKDocs(expected, actual, 20);
+  EXPECT_GT(SkipStats::mandOptBulkWindows, 0);
+  EXPECT_EQ(SkipStats::mandOptBulkWindowSkips, 0);
+}
+
+TEST_F(TermScorerTest, mandOptBulkThetaZeroBypassesWindowWalk) {
+  const int32_t nDocs = Postings::DOCS_BLOCK_SIZE + 37;
+  TestIndex testIndex;
+  TestField f(testIndex, "body_w");
+  f.startIndexing();
+  for (int32_t doc = 0; doc < nDocs; doc++) {
+    std::string body = "zero_bulk_mand";
+    if ((doc % 11) == 3) body += " zero_bulk_opt";
+    body += " zero_bulk_filler";
+    f.add(doc, body);
+  }
+  testIndex.flush();
+  f.startReading();
+
+  auto poolFree = testIndex.pool.rewindScopeGuard();
+  Query::Context qContext(testIndex.pool, *testIndex.reader);
+  auto& segment = qContext.topReader.segments()[0];
+  TermQuery mand("body_w", "zero_bulk_mand");
+  TermQuery opt("body_w", "zero_bulk_opt");
+  std::array<Query*, 1> mandatory = {&mand};
+  std::array<Query*, 1> optional = {&opt};
+  auto* bulk = createMandOptBulkScorer(
+      testIndex.pool, qContext, segment,
+      std::span<Query*>(mandatory.data(), mandatory.size()),
+      std::span<Query*>(optional.data(), optional.size()));
+  ASSERT_NE(bulk, nullptr);
+
+  int32_t seen = 0;
+  SkipStatsGuard stats;
+  for (int32_t cursor = 0; cursor != PostingsReader::END && cursor < segment.maxDoc(); ) {
+    ScoreWindow window;
+    int32_t next = bulk->scoreNextWindow(window, nullptr, cursor, segment.maxDoc(), 0.0f);
+    seen += window.size;
+    if (next == PostingsReader::END) break;
+    ASSERT_GT(next, cursor);
+    cursor = next;
+  }
+  EXPECT_EQ(seen, nDocs);
+  EXPECT_EQ(SkipStats::mandOptBulkWindowSkips, 0);
+  EXPECT_EQ(SkipStats::shallowCursorMoves, 0);
+}
+
+TEST_F(TermScorerTest, mandOptBulkCapacityWindowAndCountDomainUseMandDocs) {
+  const int32_t nDocs = DocsEnum::L1_DOCS;
+  TestIndex testIndex;
+  TestField f(testIndex, "body_w");
+  f.startIndexing();
+  for (int32_t doc = 0; doc < nDocs; doc++) {
+    std::string body = "cap_mand";
+    if ((doc % 2) == 0) body += " cap_opt";
+    body += " cap_filler";
+    f.add(doc, body);
+  }
+  testIndex.flush();
+  f.startReading();
+
+  auto poolFree = testIndex.pool.rewindScopeGuard();
+  Query::Context qContext(testIndex.pool, *testIndex.reader);
+  auto& segment = qContext.topReader.segments()[0];
+  TermQuery mand("body_w", "cap_mand");
+  TermQuery opt("body_w", "cap_opt");
+  std::array<Query*, 1> mandatory = {&mand};
+  std::array<Query*, 1> optional = {&opt};
+
+  {
+    auto* bulk = createMandOptBulkScorer(
+        testIndex.pool, qContext, segment,
+        std::span<Query*>(mandatory.data(), mandatory.size()),
+        std::span<Query*>(optional.data(), optional.size()));
+    ASSERT_NE(bulk, nullptr);
+    ScoreWindow window;
+    int32_t next = bulk->scoreNextWindow(
+        window, nullptr, 0, segment.maxDoc(), std::numeric_limits<float>::lowest());
+    EXPECT_EQ(next, PostingsReader::END);
+    EXPECT_EQ(window.min, 0);
+    EXPECT_EQ(window.max, nDocs);
+    EXPECT_EQ(window.size, nDocs);
+  }
+
+  for (bool arrayDocSet : {false, true}) {
+    MemPool countPool;
+    Query::Context countContext(countPool, *testIndex.reader);
+    auto& countSegment = countContext.topReader.segments()[0];
+    TermQuery countMand("body_w", "cap_mand");
+    TermQuery countOpt("body_w", "cap_opt");
+    std::array<Query*, 1> countMandatory = {&countMand};
+    std::array<Query*, 1> countOptional = {&countOpt};
+    auto* bulk = createMandOptBulkScorer(
+        countPool, countContext, countSegment,
+        std::span<Query*>(countMandatory.data(), countMandatory.size()),
+        std::span<Query*>(countOptional.data(), countOptional.size()));
+    ASSERT_NE(bulk, nullptr);
+    auto filter = makeEveryNthSegmentDocSet(countSegment, arrayDocSet ? 5 : 3,
+                                            arrayDocSet, false);
+    DocSetBuilder builder(countSegment.maxDoc());
+    int64_t count = 0;
+    for (int32_t cursor = 0; cursor != PostingsReader::END && cursor < countSegment.maxDoc(); ) {
+      int32_t next = bulk->countNextWindow(count, &builder, filter.get(),
+                                           cursor, countSegment.maxDoc());
+      if (next == PostingsReader::END) break;
+      ASSERT_GT(next, cursor);
+      cursor = next;
+    }
+    auto actual = builder.build();
+
+    DocSetBuilder expectedBuilder(countSegment.maxDoc());
+    for (int32_t doc = 0; doc < countSegment.maxDoc(); doc++) {
+      if (filter->get(doc)) {
+        expectedBuilder.add(doc);
+      }
+    }
+    auto expected = expectedBuilder.build();
+    EXPECT_EQ(count, expected->card()) << "arrayDocSet=" << arrayDocSet;
+    expectDocSetEqual(actual.get(), expected.get(), countSegment.maxDoc());
+  }
+}
+
+TEST_F(TermScorerTest, mandOptBulkPreparedSourcesCanRouteToBulk) {
+  CollectionHelper helper("main");
+  helper.index(flatdoc("id", "prep0", "body_w", "prep_mand prep_opt"), UpdateMessage::NO_COMMIT);
+  helper.index(flatdoc("id", "prep1", "body_w", "prep_mand"), UpdateMessage::COMMIT);
+  auto reader = helper.getIndexWriter()->getIndexReader();
+
+  MemPool pool;
+  Query::Context qContext(pool, *reader);
+  TermQuery mandTerm("body_w", "prep_mand");
+  TermQuery optTerm("body_w", "prep_opt");
+  ForcePrepareQuery mand(&mandTerm);
+  ForcePrepareQuery opt(&optTerm);
+  std::array<Query*, 1> mandatory = {&mand};
+  std::array<Query*, 1> optional = {&opt};
+  std::span<Query*> empty;
+  BooleanQuery query(mandatory, optional, empty, empty);
+  auto* weight = query.createWeight(qContext, Query::NEED_SCORES);
+  ASSERT_TRUE(weight->needsPrepare());
+  Query::Weight::PrepareContext pctx{*reader, std::span<DocSet* const>{}, false};
+  auto prepared = weight->prepare(pctx);
+  auto& segment = qContext.topReader.segments()[0];
+  auto* supplier = prepared->scorerSupplier(pool, segment);
+  ASSERT_NE(supplier, nullptr);
+  auto* bulk = supplier->bulkScorer(pool);
+  EXPECT_NE(dynamic_cast<BooleanQuery::MandOptBulkScorer*>(bulk), nullptr);
+  helper.clear();
 }
 
 TEST_F(TermScorerTest, disjunctionBoundsAreFiniteConservativeAndRefinable) {

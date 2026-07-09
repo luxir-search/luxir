@@ -64,6 +64,11 @@ struct SkipStats {
   static inline int64_t mandOptWindowSkips = 0;
   static inline int64_t mandOptConjunctionWindows = 0;
   static inline int64_t mandOptWindowEvals = 0;
+  static inline int64_t mandOptBulkWindows = 0;
+  static inline int64_t mandOptBulkWindowSkips = 0;
+  static inline int64_t mandOptBulkSweeps = 0;
+  static inline int64_t mandOptBulkCompactions = 0;
+  static inline int64_t mandOptBulkOptDrivenWindows = 0;
   static inline int64_t countBulkFillCalls = 0;
   static inline int64_t countBulkFillBlocks = 0;
   static inline int64_t countBulkFillDocs = 0;
@@ -109,6 +114,11 @@ struct SkipStats {
     mandOptWindowSkips = 0;
     mandOptConjunctionWindows = 0;
     mandOptWindowEvals = 0;
+    mandOptBulkWindows = 0;
+    mandOptBulkWindowSkips = 0;
+    mandOptBulkSweeps = 0;
+    mandOptBulkCompactions = 0;
+    mandOptBulkOptDrivenWindows = 0;
     countBulkFillCalls = 0;
     countBulkFillBlocks = 0;
     countBulkFillDocs = 0;

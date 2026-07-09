@@ -121,6 +121,7 @@ class BooleanQuery final : public solux::Query {
 
 public:
   static inline bool disableBulkDomainDriveForTests = false;
+  static inline bool disableMandOptBulkForTests = false;
   // A/B toggle: force the conjunction onto the eager single-phase path (each
   // clause verifies inside its own advance) instead of two-phase (defer matches
   // until the approximations agree). For benchmarking the two-phase win only.
@@ -454,6 +455,48 @@ public:
             targetPool, std::span<Query::Scorer*>(arr, entries.size()), segment.maxDoc(), leadCost);
       }
 
+      BulkScorer* mandOptBulkScorer(MemPool& targetPool) {
+        auto* mandSupplier = mandatorySources[0]->scorerSupplier(targetPool, segment);
+        if (mandSupplier == nullptr) {
+          return nullptr;
+        }
+        int64_t mandCost = mandSupplier->cost();
+        auto* mandScorer = mandSupplier->get(targetPool, mandCost);
+        if (mandScorer == nullptr || mandScorer->hasTwoPhase()) {
+          return nullptr;
+        }
+
+        auto& optScorers = *targetPool.make_vec<Query::Scorer*>();
+        auto& optCosts = *targetPool.make_vec<int64_t>();
+        optScorers.reserve(optionalSources.size());
+        optCosts.reserve(optionalSources.size());
+        for (auto* source : optionalSources) {
+          auto* supplier = source->scorerSupplier(targetPool, segment);
+          if (supplier == nullptr) {
+            continue;
+          }
+          int64_t cost = supplier->cost();
+          auto* scorer = supplier->get(targetPool, mandCost);
+          if (scorer == nullptr) {
+            continue;
+          }
+          if (scorer->hasTwoPhase()) {
+            return nullptr;
+          }
+          optScorers.push_back(scorer);
+          optCosts.push_back(cost);
+        }
+        if (optScorers.empty()) {
+          return nullptr;
+        }
+
+        return targetPool.make<BooleanQuery::MandOptBulkScorer>(
+            targetPool, mandScorer,
+            std::span<Query::Scorer*>(optScorers.data(), optScorers.size()),
+            std::span<int64_t>(optCosts.data(), optCosts.size()),
+            segment.maxDoc(), mandCost);
+      }
+
       BulkScorer* bulkScorer(MemPool& targetPool) override {
         // Scored or not: unscored clauses bound as +infinity, so the window
         // skip never fires and the bulk intersection runs exhaustively - the
@@ -461,6 +504,11 @@ public:
         if (optionalSources.empty() && prohibitedSources.empty()
             && filterSuppliers.empty() && mandatorySources.size() >= 2) {
           return conjunctionBulkScorer(targetPool);
+        }
+        if (!disableMandOptBulkForTests && mandatorySources.size() == 1
+            && !optionalSources.empty() && prohibitedSources.empty()
+            && filterSuppliers.empty() && minShouldMatch < 1) {
+          return mandOptBulkScorer(targetPool);
         }
         // Shape gate only - scoring is not required. Without scores the clause
         // scorers report score()=0 / getMaxScore()=+inf, the window split stays
@@ -1039,6 +1087,519 @@ public:
       return upTo;
     }
   }; // MandOptScorer
+
+  class MandOptBulkScorer final : public BulkScorer {
+    constexpr static int32_t kWindowSize = DocsEnum::L1_DOCS;
+    constexpr static int32_t kWindowWords = kWindowSize / 64;
+    static_assert((kWindowSize % 64) == 0);
+
+    Query::Scorer* mand;
+    std::span<Query::Scorer*> opts;
+    std::span<int64_t> optCosts;
+    std::span<float> optWindowMax;
+    std::span<int32_t> optOrder;
+    std::span<double> optRemainingMax;
+    std::span<uint64_t> windowBits;
+    // Valid only for set bits in windowBits; first touch overwrites the row.
+    std::span<float> windowScores;
+    std::span<int32_t> outDocs;
+    std::span<float> outScores;
+
+    int32_t maxDoc;
+    int64_t mandCost;
+    int32_t windowStart = 0;
+    int32_t windowEnd = 0;
+    int32_t liveOptCount = 0;
+    float minCompetitiveScore = std::numeric_limits<float>::lowest();
+    double scoreBoundFactor = 1.0;
+    double optGlobalMax = 0.0;
+    bool optGlobalMaxFinite = true;
+    float mandWindowMax = std::numeric_limits<float>::infinity();
+    double optWindowMaxSum = 0.0;
+
+    static bool lessMaxScore(float a, float b) {
+      bool finiteA = std::isfinite(a);
+      bool finiteB = std::isfinite(b);
+      if (finiteA != finiteB) return finiteA;
+      return a < b;
+    }
+
+    bool greaterWindowOrder(int32_t a, int32_t b) const {
+      float maxA = optWindowMax[(size_t) a];
+      float maxB = optWindowMax[(size_t) b];
+      if (maxA != maxB) return lessMaxScore(maxB, maxA);
+      return a < b;
+    }
+
+    bool competitiveEnabled() const {
+      return minCompetitiveScore > 0.0f;
+    }
+
+    bool canReach(float score, double bound) const {
+      return scoreCanReach(score, bound, minCompetitiveScore, scoreBoundFactor);
+    }
+
+    void pushMandMinCompetitiveScore(float minScore) {
+      if (!optGlobalMaxFinite) {
+        return;
+      }
+      float reduced = (float) ((double) minScore - optGlobalMax);
+      mand->setMinCompetitiveScore(
+          std::nextafter(reduced, -std::numeric_limits<float>::infinity()));
+    }
+
+    void clearWindowBits() {
+      std::fill(windowBits.begin(), windowBits.end(), 0);
+    }
+
+    void addWindowScore(int32_t index, float score) {
+      uint64_t& word = windowBits[(size_t) (index >> 6)];
+      uint64_t mask = 1ULL << (index & 63);
+      if ((word & mask) == 0) {
+        word |= mask;
+        windowScores[(size_t) index] = score;
+      } else {
+        windowScores[(size_t) index] += score;
+      }
+    }
+
+    bool acceptsDoc(DocSet* filter, int32_t doc) const {
+      return filter == nullptr || filter->get(doc);
+    }
+
+    void setWindowBounds(int32_t start, int32_t max) {
+      windowStart = start;
+      int32_t requestedEnd = windowStart + kWindowSize;
+      if (requestedEnd < windowStart) {
+        requestedEnd = max;
+      }
+      windowEnd = std::min(std::min(requestedEnd, max), maxDoc);
+    }
+
+    void prepareOutputWindow(ScoreWindow& out) {
+      out.min = windowStart;
+      out.max = windowEnd;
+      out.size = 0;
+      out.docs = outDocs;
+      out.scores = outScores;
+    }
+
+    int32_t computeSkipUpTo(int32_t target, int32_t max) {
+      int32_t upTo = mand->advanceShallow(target);
+      if (upTo >= max) {
+        upTo = max - 1;
+      }
+      for (size_t i = 0; i < opts.size(); i++) {
+        auto* opt = opts[i];
+        int32_t doc = opt->docId();
+        if (doc == PostingsReader::END) {
+          continue;
+        }
+        if (doc <= target) {
+          upTo = std::min(upTo, opt->advanceShallow(target));
+        } else {
+          upTo = std::min(upTo, doc - 1);
+        }
+      }
+      if (upTo >= max) {
+        upTo = max - 1;
+      }
+      return std::max(upTo, target);
+    }
+
+    double skipMaxScoreAt(int32_t upTo, bool refined) {
+      double sum = (double) (refined ? mand->refineMaxScore(upTo)
+                                    : mand->getMaxScore(upTo));
+      for (size_t i = 0; i < opts.size(); i++) {
+        auto* opt = opts[i];
+        int32_t doc = opt->docId();
+        if (doc != PostingsReader::END && doc <= upTo) {
+          sum += (double) (refined ? opt->refineMaxScore(upTo)
+                                   : opt->getMaxScore(upTo));
+        }
+      }
+      return sum;
+    }
+
+    int32_t skipToCompetitiveWindow(int32_t start, int32_t max) {
+      int32_t target = start;
+      while (target < max) {
+        int32_t upTo = computeSkipUpTo(target, max);
+        double maxScore = skipMaxScoreAt(upTo, false);
+        if (canReach(0.0f, maxScore) && std::isfinite(maxScore)
+            && (double) minCompetitiveScore >= kRefineBeta * maxScore) {
+          double refined = skipMaxScoreAt(upTo, true);
+          if (refined < maxScore) {
+            maxScore = refined;
+          }
+        }
+        if (canReach(0.0f, maxScore)) {
+          return target;
+        }
+        skipCount(SkipStats::mandOptBulkWindowSkips);
+        if (upTo >= max - 1 || upTo >= PostingsReader::END - 1) {
+          return PostingsReader::END;
+        }
+        target = upTo + 1;
+      }
+      return target;
+    }
+
+    void sortWindowOrder() {
+      for (int32_t i = 1; i < liveOptCount; i++) {
+        int32_t idx = optOrder[(size_t) i];
+        int32_t j = i;
+        while (j > 0 && greaterWindowOrder(idx, optOrder[(size_t) j - 1])) {
+          optOrder[(size_t) j] = optOrder[(size_t) j - 1];
+          j--;
+        }
+        optOrder[(size_t) j] = idx;
+      }
+    }
+
+    void buildRemainingMax() {
+      optRemainingMax[(size_t) liveOptCount] = 0.0;
+      for (int32_t i = liveOptCount; i-- > 0; ) {
+        int32_t idx = optOrder[(size_t) i];
+        optRemainingMax[(size_t) i] =
+            optRemainingMax[(size_t) i + 1] + (double) optWindowMax[(size_t) idx];
+      }
+      optWindowMaxSum = optRemainingMax[0];
+    }
+
+    void updateProductionMaxScores() {
+      int32_t mandDoc = mand->docId();
+      if (mandDoc >= windowEnd) {
+        mandWindowMax = 0.0f;
+      } else {
+        mand->advanceShallowForSetup(windowStart);
+        mandWindowMax = mand->getMaxScoreForSetup(windowEnd - 1);
+      }
+
+      liveOptCount = 0;
+      for (size_t i = 0; i < opts.size(); i++) {
+        auto* opt = opts[i];
+        int32_t doc = opt->docId();
+        if (doc >= windowEnd) {
+          optWindowMax[i] = 0.0f;
+          continue;
+        }
+        opt->advanceShallowForSetup(windowStart);
+        optWindowMax[i] = opt->getMaxScoreForSetup(windowEnd - 1);
+        optOrder[(size_t) liveOptCount++] = (int32_t) i;
+      }
+      sortWindowOrder();
+      buildRemainingMax();
+    }
+
+    void updateLiveOptsWithoutBounds() {
+      mandWindowMax = std::numeric_limits<float>::infinity();
+      liveOptCount = 0;
+      optWindowMaxSum = 0.0;
+      for (size_t i = 0; i < opts.size(); i++) {
+        optWindowMax[i] = 0.0f;
+        if (opts[i]->docId() < windowEnd) {
+          optOrder[(size_t) liveOptCount++] = (int32_t) i;
+        }
+      }
+      optRemainingMax[(size_t) liveOptCount] = 0.0;
+      for (int32_t i = liveOptCount; i-- > 0; ) {
+        optRemainingMax[(size_t) i] = 0.0;
+      }
+    }
+
+    void setupProductionWindow(int32_t start, int32_t max) {
+      setWindowBounds(start, max);
+      if (competitiveEnabled()) {
+        updateProductionMaxScores();
+      } else {
+        updateLiveOptsWithoutBounds();
+      }
+      skipCount(SkipStats::mandOptBulkWindows);
+    }
+
+    void recordCompaction(int32_t before, int32_t after) {
+      if (SkipStats::enabled && after < before) {
+        SkipStats::mandOptBulkCompactions += (int64_t) (before - after);
+      }
+    }
+
+    int32_t compactCompetitive(ScoreWindow& out, double bound) {
+      float threshold = competitiveScoreThreshold(minCompetitiveScore, scoreBoundFactor, bound);
+      int32_t write = compactByScoreThreshold(out.docs.data(), out.scores.data(),
+                                              out.size, threshold);
+      recordCompaction(out.size, write);
+      return write;
+    }
+
+    void finishCompetitive(ScoreWindow& out) {
+      if (competitiveEnabled()) {
+        out.size = compactByScoreNotLessThanThreshold(out.docs.data(), out.scores.data(),
+                                                      out.size, minCompetitiveScore);
+      }
+    }
+
+    int64_t liveOptCostSum() const {
+      int64_t sum = 0;
+      for (int32_t i = 0; i < liveOptCount; i++) {
+        int64_t cost = optCosts[(size_t) optOrder[(size_t) i]];
+        if (cost <= 0) {
+          continue;
+        }
+        int64_t room = std::numeric_limits<int64_t>::max() - sum;
+        if (cost >= room) {
+          return std::numeric_limits<int64_t>::max();
+        }
+        sum += cost;
+      }
+      return sum;
+    }
+
+    bool useOptDrivenFill() const {
+      return competitiveEnabled() && !canReach(0.0f, (double) mandWindowMax)
+          && liveOptCostSum() < mandCost;
+    }
+
+    void applyOptSweeps(ScoreWindow& out) {
+      if (competitiveEnabled()) {
+        out.size = compactCompetitive(out, optRemainingMax[0]);
+      }
+      for (int32_t i = 0; i < liveOptCount && out.size > 0; i++) {
+        int32_t idx = optOrder[(size_t) i];
+        skipCount(SkipStats::mandOptBulkSweeps);
+        out.size = opts[(size_t) idx]->applyToCandidates(out.docs.data(), out.scores.data(),
+                                                         out.size, false);
+        if (competitiveEnabled() && i + 1 < liveOptCount) {
+          out.size = compactCompetitive(out, optRemainingMax[(size_t) i + 1]);
+        }
+      }
+      finishCompetitive(out);
+    }
+
+    bool fillMandDrivenCandidates(ScoreWindow& out, DocSet* filter) {
+      prepareOutputWindow(out);
+      if (mand->docId() < windowStart && mand->advance(windowStart) == PostingsReader::END) {
+        return false;
+      }
+
+      if (filter == nullptr) {
+        int32_t n;
+        while ((n = mand->fillScoreBlock(out.docs.data() + out.size,
+                                         out.scores.data() + out.size,
+                                         kWindowSize - out.size, windowEnd)) > 0) {
+          skipCount(SkipStats::maxScoreDirectFills);
+          out.size += n;
+          assert(out.size <= kWindowSize);
+        }
+        applyOptSweeps(out);
+        return mand->docId() != PostingsReader::END;
+      }
+
+      int32_t blockDocs[Postings::DOCS_BLOCK_SIZE];
+      float blockScores[Postings::DOCS_BLOCK_SIZE];
+      int32_t n;
+      while ((n = mand->fillScoreBlock(blockDocs, blockScores,
+                                       Postings::DOCS_BLOCK_SIZE, windowEnd)) > 0) {
+        for (int32_t i = 0; i < n; i++) {
+          int32_t doc = blockDocs[i];
+          if (!acceptsDoc(filter, doc)) {
+            continue;
+          }
+          assert(out.size < kWindowSize);
+          out.docs[(size_t) out.size] = doc;
+          out.scores[(size_t) out.size] = blockScores[i];
+          out.size++;
+        }
+      }
+      applyOptSweeps(out);
+      return mand->docId() != PostingsReader::END;
+    }
+
+    void extractOptDrivenCandidates(ScoreWindow& out) {
+      int32_t innerSize = windowEnd - windowStart;
+      for (int32_t word = 0; word < kWindowWords; word++) {
+        uint64_t bits = windowBits[(size_t) word];
+        while (bits != 0) {
+          int32_t bit = (int32_t) std::countr_zero(bits);
+          int32_t index = (word << 6) + bit;
+          if (index >= innerSize) {
+            break;
+          }
+          out.docs[(size_t) out.size] = windowStart + index;
+          out.scores[(size_t) out.size] = windowScores[(size_t) index];
+          out.size++;
+          bits &= bits - 1;
+        }
+      }
+    }
+
+    bool fillOptDrivenCandidates(ScoreWindow& out, DocSet* filter) {
+      skipCount(SkipStats::mandOptBulkOptDrivenWindows);
+      prepareOutputWindow(out);
+      clearWindowBits();
+      int32_t blockDocs[Postings::DOCS_BLOCK_SIZE];
+      float blockScores[Postings::DOCS_BLOCK_SIZE];
+      for (int32_t i = 0; i < liveOptCount; i++) {
+        auto* opt = opts[(size_t) optOrder[(size_t) i]];
+        if (opt->docId() < windowStart) {
+          opt->advance(windowStart);
+        }
+        int32_t n;
+        while ((n = opt->fillScoreBlock(blockDocs, blockScores,
+                                        Postings::DOCS_BLOCK_SIZE, windowEnd)) > 0) {
+          for (int32_t j = 0; j < n; j++) {
+            int32_t doc = blockDocs[j];
+            if (acceptsDoc(filter, doc)) {
+              addWindowScore(doc - windowStart, blockScores[j]);
+            }
+          }
+        }
+      }
+
+      extractOptDrivenCandidates(out);
+      if (competitiveEnabled()) {
+        out.size = compactCompetitive(out, (double) mandWindowMax);
+      }
+      if (out.size == 0) {
+        return mand->docId() != PostingsReader::END;
+      }
+      if (mand->docId() < windowStart && mand->advance(windowStart) == PostingsReader::END) {
+        out.size = 0;
+        return false;
+      }
+      int32_t before = out.size;
+      out.size = mand->applyToCandidates(out.docs.data(), out.scores.data(),
+                                         out.size, true);
+      recordCompaction(before, out.size);
+      finishCompetitive(out);
+      return mand->docId() != PostingsReader::END;
+    }
+
+  public:
+    MandOptBulkScorer(solux::MemPool& pool, Query::Scorer* mand,
+                      std::span<Query::Scorer*> opts, std::span<int64_t> optCosts,
+                      int32_t maxDoc, int64_t mandCost)
+        : mand(mand),
+          opts(opts),
+          optCosts(optCosts),
+          optWindowMax(pool.make_arr<float>(opts.size()), opts.size()),
+          optOrder(pool.make_arr<int32_t>(opts.size()), opts.size()),
+          optRemainingMax(pool.make_arr<double>(opts.size() + 1), opts.size() + 1),
+          windowBits(pool.make_arr<uint64_t>((size_t) kWindowWords), (size_t) kWindowWords),
+          windowScores(pool.make_arr<float>((size_t) kWindowSize), (size_t) kWindowSize),
+          outDocs(pool.make_arr<int32_t>((size_t) kWindowSize), (size_t) kWindowSize),
+          outScores(pool.make_arr<float>((size_t) kWindowSize), (size_t) kWindowSize),
+          maxDoc(maxDoc),
+          mandCost(mandCost) {
+      assert(mand != nullptr);
+      assert(!mand->hasTwoPhase());
+      assert(!opts.empty());
+      scoreBoundFactor = 1.0 + (double) (opts.size() + 1) * 0x1p-24;
+      for (auto* opt : opts) {
+        assert(opt != nullptr);
+        assert(!opt->hasTwoPhase());
+        float maxScore = opt->getMaxScoreForSetup(PostingsReader::END);
+        if (!std::isfinite(maxScore) || !optGlobalMaxFinite) {
+          optGlobalMaxFinite = false;
+        } else {
+          optGlobalMax += (double) maxScore;
+        }
+      }
+    }
+
+    int32_t scoreNextWindow(ScoreWindow& out, DocSet* filter, int32_t min, int32_t max,
+                            float minCompetitiveScore) override {
+      out.min = min;
+      out.max = min;
+      out.size = 0;
+      out.docs = outDocs;
+      out.scores = outScores;
+
+      max = std::min(max, maxDoc);
+      if (min >= max) {
+        return PostingsReader::END;
+      }
+      if (filter != nullptr && filter->card() == 0) {
+        return PostingsReader::END;
+      }
+      if (minCompetitiveScore > this->minCompetitiveScore) {
+        this->minCompetitiveScore = minCompetitiveScore;
+        pushMandMinCompetitiveScore(minCompetitiveScore);
+      }
+
+      int32_t start = min;
+      if (competitiveEnabled()) {
+        start = skipToCompetitiveWindow(start, max);
+        if (start == PostingsReader::END || start >= max) {
+          out.max = max;
+          return PostingsReader::END;
+        }
+      }
+
+      setupProductionWindow(start, max);
+      // Candidates require an unconsumed mandatory doc inside the window; an
+      // empty window must not pay the fill (opt-driven would decode every
+      // optional posting only to intersect against nothing).
+      int32_t mandDoc = mand->docId();
+      if (mandDoc >= windowEnd) {
+        out.min = windowStart;
+        out.max = windowEnd;
+        if (mandDoc == PostingsReader::END) {
+          out.max = max;
+          return PostingsReader::END;
+        }
+        return windowEnd >= max ? PostingsReader::END : windowEnd;
+      }
+      bool mandMayContinue = useOptDrivenFill()
+          ? fillOptDrivenCandidates(out, filter)
+          : fillMandDrivenCandidates(out, filter);
+      if (!mandMayContinue && out.size == 0) {
+        out.max = max;
+        return PostingsReader::END;
+      }
+      return windowEnd >= max ? PostingsReader::END : windowEnd;
+    }
+
+    int32_t countNextWindow(int64_t& count, DocSetBuilder* domainOut,
+                            DocSet* filter, int32_t min, int32_t max) override {
+      max = std::min(max, maxDoc);
+      if (min >= max) {
+        return PostingsReader::END;
+      }
+      if (filter != nullptr && filter->card() == 0) {
+        return PostingsReader::END;
+      }
+      if (domainOut != nullptr) {
+        skipCount(SkipStats::bulkDomainWindowsFed);
+      }
+      setWindowBounds(min, max);
+      skipCount(SkipStats::mandOptBulkWindows);
+      if (mand->docId() < windowStart && mand->advance(windowStart) == PostingsReader::END) {
+        return PostingsReader::END;
+      }
+
+      int32_t blockDocs[Postings::DOCS_BLOCK_SIZE];
+      float blockScores[Postings::DOCS_BLOCK_SIZE];
+      int32_t n;
+      while ((n = mand->fillScoreBlock(blockDocs, blockScores,
+                                       Postings::DOCS_BLOCK_SIZE, windowEnd)) > 0) {
+        unused(blockScores);
+        for (int32_t i = 0; i < n; i++) {
+          int32_t doc = blockDocs[i];
+          if (acceptsDoc(filter, doc)) {
+            count++;
+            if (domainOut != nullptr) {
+              domainOut->add(doc);
+            }
+          }
+        }
+      }
+      if (mand->docId() == PostingsReader::END) {
+        return PostingsReader::END;
+      }
+      return windowEnd >= max ? PostingsReader::END : windowEnd;
+    }
+  }; // MandOptBulkScorer
 
   class MandNotScorer final : public Query::Scorer {
     Scorer* mandScorer;
