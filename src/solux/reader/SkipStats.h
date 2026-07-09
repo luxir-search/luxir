@@ -51,6 +51,7 @@ struct SkipStats {
   static inline int64_t impactGroupBoundNoL0 = 0;
   static inline int64_t impactGroupShallowAnswers = 0;
   static inline int64_t impactRefinesTriggered = 0;
+  static inline int64_t impactGroupHeaderParses = 0;
   static inline int64_t impactL0GroupParses = 0;
   static inline int64_t impactL0GroupParseScratchSpills = 0;
   static inline int64_t maxScoreOuterWindows = 0;
@@ -104,6 +105,7 @@ struct SkipStats {
     impactGroupBoundNoL0 = 0;
     impactGroupShallowAnswers = 0;
     impactRefinesTriggered = 0;
+    impactGroupHeaderParses = 0;
     impactL0GroupParses = 0;
     impactL0GroupParseScratchSpills = 0;
     maxScoreOuterWindows = 0;

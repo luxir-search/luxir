@@ -74,6 +74,11 @@ class TermsEnum {
   int32_t numTermBlocks;
 
 public:
+  struct EncodedImpactFrontier {
+    const char* ptr = nullptr;
+    uint32_t len = 0;
+  };
+
   // fieldInfo is not copied and should remain valid throughout the lifetime of this TermsEnum and any related classes such as DocsEnum
   TermsEnum(MemPool& pool, PostingsReader& postingsReader, const SegFieldInfo& fieldInfo) : pool(pool), postingsReader(postingsReader), fieldInfo(fieldInfo) {
     unused(this->pool, this->postingsReader);
@@ -145,20 +150,12 @@ public:
   int32_t readTermImpactFrontier(std::vector<int32_t>& norms, std::vector<int32_t>& tfs) {
     norms.resize(0);
     tfs.resize(0);
-    if (!hasTermImpacts()) {
+    EncodedImpactFrontier encoded = currentTermImpactFrontierSpan();
+    if (encoded.ptr == nullptr) {
       return 0;
     }
-    parseMetadataRuns();
-    const char* p = termImpactRun;
-    const char* end = termImpactRun + termImpactRunLen;
-    // frontiers are variable length: skip the terms before ours
-    for (int32_t t = 0; t < ordInBlock; t++) {
-      uint32_t count = InputStream::readVint(p, end);
-      for (uint32_t j = 0; j < count; j++) {
-        p++;  // norm byte
-        InputStream::readVint(p, end);  // tf delta
-      }
-    }
+    const char* p = encoded.ptr;
+    const char* end = encoded.ptr + encoded.len;
     uint32_t count = InputStream::readVint(p, end);
     int32_t tf = 0;
     for (uint32_t j = 0; j < count; j++) {
@@ -177,7 +174,33 @@ public:
     return FieldType::hasFreqs(fieldInfo.flags) && FieldType::hasPositions(fieldInfo.flags);
   }
 
+  EncodedImpactFrontier currentTermImpactFrontierSpan() {
+    assert(ordInBlock >= 0);
+    if (!hasTermImpacts()) {
+      return {};
+    }
+    parseMetadataRuns();
+    const char* p = termImpactRun;
+    const char* end = termImpactRun + termImpactRunLen;
+    for (int32_t t = 0; t < ordInBlock; t++) {
+      skipEncodedImpactFrontier(p, end);
+    }
+    const char* start = p;
+    skipEncodedImpactFrontier(p, end);
+    assert(p <= end);
+    return {start, (uint32_t) (p - start)};
+  }
+
 protected:
+  static void skipEncodedImpactFrontier(const char*& p, const char* end) {
+    uint32_t count = InputStream::readVint(p, end);
+    for (uint32_t j = 0; j < count; j++) {
+      assert(p < end);
+      p++;
+      InputStream::readVint(p, end);
+    }
+  }
+
   uint32_t readMetadataRunLen(const char*& p, const char* end) {
     uint32_t code = InputStream::readVint(p, end);
     assert((code & 1u) == 0);

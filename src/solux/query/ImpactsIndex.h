@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <limits>
+#include <span>
 #include <vector>
 
 #include "solux/reader/DocsEnum.h"
@@ -14,12 +15,13 @@ namespace solux {
 // impact data stored in the docs-stream block headers.  Scorers consult it to
 // skip doc blocks that cannot beat the collector's min-competitive score.
 //
-// The build is GROUP-FIRST AND LAZY: construction walks only the L1 group
-// headers (~df/4096 steps, hopping group bodies), scoring each group's stored
-// impact frontier.  A group's 32 per-block frontiers are parsed and
+// Production build is term-frontier first: construction scores only the
+// dictionary's whole-term frontier for the global max. L1 group headers are
+// parsed into a prefix on first touch, and a group's 32 per-block frontiers are
 // BM25-scored only the first time a query resolves a block inside it.
 // Never walk the whole postings up front - a "the"-sized term has ~35K block
-// headers and queries touch a handful.
+// headers and queries touch a handful. The forced eager path is kept as the
+// test oracle and for fields without dictionary term frontiers.
 //
 // The simScorer defines what "score" means.  A term scorer passes its own BM25
 // scorer.  PhraseQuery passes the PHRASE's scorer over each member term's
@@ -39,15 +41,20 @@ class ImpactsIndex {
   Similarity::BM25Scorer* simScorer = nullptr;
   float boost = 1.0f;
   bool useFrontierBound = true;
+  bool lazyGroupHeaders = false;
+  float globalMax = 0.0f;
 
   int32_t count = 0;       // total blocks
   int32_t groupCount = 0;
+  mutable int32_t groupHeadersParsed = 0;
   int32_t* groupLastDocs = nullptr;
   int32_t* groupBaseLastDocs = nullptr;
   int64_t* groupBodyOffs = nullptr;
   float* groupUpper = nullptr;       // frontier bound per group
-  float* groupSuffixUpper = nullptr; // max of groupUpper[g..]
+  float* groupSuffixUpper = nullptr; // eager path: max of groupUpper[g..]
   mutable Chunk** chunks = nullptr;  // lazily parsed per group
+  mutable DocsEnum::GroupImpactCursor groupCursor;
+  mutable DocsEnum::GroupImpactHeaderScratch groupHeaderScratch;
 
   static constexpr int32_t GROUP = DocsEnum::L1_PERIOD;
 
@@ -59,8 +66,74 @@ class ImpactsIndex {
     return boost * simScorer->score((float) tf, (int64_t) norm);
   }
 
+  float scoreFrontier(std::span<const int32_t> tfs, std::span<const int32_t> norms,
+                      int32_t fallbackTf, int32_t fallbackNorm,
+                      bool frontierSpilled) const {
+    if (useFrontierBound && !frontierSpilled && !tfs.empty()) {
+      float maxImpact = 0.0f;
+      for (size_t j = 0; j < tfs.size(); j++) {
+        maxImpact = std::max(maxImpact, scoreImpact(tfs[j], norms[j]));
+      }
+      return maxImpact;
+    }
+    return scoreImpact(fallbackTf, fallbackNorm);
+  }
+
+  void ensureGroupHeadersThrough(int32_t g) const {
+    if (!lazyGroupHeaders || groupCount == 0) {
+      return;
+    }
+    if (g < 0) {
+      return;
+    }
+    if (g >= groupCount) {
+      g = groupCount - 1;
+    }
+    if (g < groupHeadersParsed) {
+      return;
+    }
+    docsEnum->readGroupImpactHeadersThrough(
+        groupCursor, g, groupHeaderScratch, true,
+        [&](const DocsEnum::GroupImpactHeader& header, std::span<const int32_t> tfs,
+            std::span<const int32_t> norms) {
+          int32_t idx = groupHeadersParsed;
+          assert(header.group == idx);
+          groupLastDocs[idx] = header.lastDoc;
+          groupBaseLastDocs[idx] = header.baseLastDoc;
+          groupBodyOffs[idx] = header.bodyOffset;
+          groupUpper[idx] = scoreFrontier(tfs, norms, header.spanMaxTf,
+                                          header.spanMinNorm, header.frontierSpilled);
+          chunks[idx] = nullptr;
+          groupHeadersParsed++;
+        });
+    assert(g < groupHeadersParsed);
+  }
+
+  void ensureGroupHeadersCoverDoc(int32_t target) const {
+    if (!lazyGroupHeaders || groupCount == 0) {
+      return;
+    }
+    while (groupHeadersParsed < groupCount) {
+      if (groupHeadersParsed > 0 && target <= groupLastDocs[groupHeadersParsed - 1]) {
+        return;
+      }
+      ensureGroupHeadersThrough(groupHeadersParsed);
+    }
+  }
+
+  float maxParsedGroupUpper(int32_t fromGroup, int32_t toGroup) const {
+    assert(fromGroup >= 0 && fromGroup <= toGroup);
+    assert(toGroup < groupHeadersParsed);
+    float bound = 0.0f;
+    for (int32_t g = fromGroup; g <= toGroup; g++) {
+      bound = std::max(bound, groupUpper[g]);
+    }
+    return bound;
+  }
+
   const Chunk& ensureGroup(int32_t g) const {
     assert(g >= 0 && g < groupCount);
+    ensureGroupHeadersThrough(g);
     if (chunks[g] != nullptr) {
       return *chunks[g];
     }
@@ -100,21 +173,49 @@ class ImpactsIndex {
   }
 
 public:
+  static inline bool forceEagerForTests = false;
+
   void build(MemPool& pool_, DocsEnum& docsEnum_, Similarity::BM25Scorer& simScorer_,
              float boost_, bool useFrontierBound_ = true) {
-    static thread_local DocsEnum::GroupImpacts groups;  // reused; reset by readGroupImpacts
-    docsEnum_.readGroupImpacts(groups);
-    if (groups.lastDocs.empty()) {
-      return;
-    }
     pool = &pool_;
     docsEnum = &docsEnum_;
     simScorer = &simScorer_;
     boost = boost_;
     useFrontierBound = useFrontierBound_;
+    lazyGroupHeaders = false;
+    globalMax = 0.0f;
+    count = docsEnum_.numImpactBlocks();
+    groupCount = docsEnum_.numImpactGroups();
+    groupHeadersParsed = 0;
+    groupCursor = {};
+
+    if (useFrontierBound && docsEnum_.hasTermImpacts() && !forceEagerForTests) {
+      docsEnum_.visitTermImpactFrontier([&](int32_t tf, int32_t norm) {
+        globalMax = std::max(globalMax, scoreImpact(tf, norm));
+      });
+      if (groupCount == 0) {
+        return;
+      }
+      groupLastDocs = pool->make_arr<int32_t>((size_t) groupCount);
+      groupBaseLastDocs = pool->make_arr<int32_t>((size_t) groupCount);
+      groupBodyOffs = pool->make_arr<int64_t>((size_t) groupCount);
+      groupUpper = pool->make_arr<float>((size_t) groupCount);
+      groupSuffixUpper = nullptr;
+      chunks = pool->make_arr<Chunk*>((size_t) groupCount);
+      for (int32_t g = 0; g < groupCount; g++) {
+        chunks[g] = nullptr;
+      }
+      lazyGroupHeaders = true;
+      return;
+    }
+
+    static thread_local DocsEnum::GroupImpacts groups;  // reused; reset by readGroupImpacts
+    docsEnum_.readGroupImpacts(groups);
+    if (groups.lastDocs.empty()) {
+      return;
+    }
 
     groupCount = (int32_t) groups.lastDocs.size();
-    count = docsEnum_.numImpactBlocks();
     groupLastDocs = pool->make_arr<int32_t>((size_t) groupCount);
     groupBaseLastDocs = pool->make_arr<int32_t>((size_t) groupCount);
     groupBodyOffs = pool->make_arr<int64_t>((size_t) groupCount);
@@ -148,6 +249,8 @@ public:
       running = std::max(running, groupUpper[g]);
       groupSuffixUpper[g] = running;
     }
+    globalMax = groupSuffixUpper[0];
+    groupHeadersParsed = groupCount;
   }
 
   bool empty() const {
@@ -162,9 +265,20 @@ public:
     return groupCount;
   }
 
+  float globalMaxImpact() const {
+    return globalMax;
+  }
+
   int32_t groupContainingFrom(int32_t fromGroup, int32_t target) const {
     if (groupCount == 0) {
       return 0;
+    }
+    if (lazyGroupHeaders) {
+      unused(fromGroup);
+      ensureGroupHeadersCoverDoc(target);
+      const int32_t* it = std::lower_bound(groupLastDocs, groupLastDocs + groupHeadersParsed,
+                                           target);
+      return (int32_t) (it - groupLastDocs);
     }
     if (fromGroup < 0 || fromGroup >= groupCount) {
       if (fromGroup >= groupCount && fromGroup >= 0) {
@@ -195,6 +309,7 @@ public:
 
   int32_t groupLastDoc(int32_t group) const {
     assert(group >= 0 && group < groupCount);
+    ensureGroupHeadersThrough(group);
     return groupLastDocs[group];
   }
 
@@ -240,6 +355,14 @@ public:
     assert(group >= 0 && group < groupCount);
     skipCount(SkipStats::impactGroupBoundCalls);
     skipCount(SkipStats::impactGroupBoundNoL0);
+    ensureGroupHeadersThrough(group);
+    if (lazyGroupHeaders) {
+      float bound = maxParsedGroupUpper(group, groupHeadersParsed - 1);
+      if (groupHeadersParsed < groupCount) {
+        bound = std::max(bound, globalMax);
+      }
+      return bound;
+    }
     return groupSuffixUpper[group];
   }
 
@@ -247,6 +370,10 @@ public:
     assert(fromGroup >= 0 && fromGroup <= toGroup && toGroup < groupCount);
     skipCount(SkipStats::impactGroupBoundCalls);
     skipCount(SkipStats::impactGroupBoundNoL0);
+    ensureGroupHeadersThrough(toGroup);
+    if (lazyGroupHeaders) {
+      return maxParsedGroupUpper(fromGroup, toGroup);
+    }
     if (toGroup == groupCount - 1) {
       return groupSuffixUpper[fromGroup];
     }
@@ -275,7 +402,16 @@ public:
     const Chunk& chunk = ensureGroup(g);
     float bound = chunk.suffixWithin[block % GROUP];
     if (g + 1 < groupCount) {
-      bound = std::max(bound, groupSuffixUpper[g + 1]);
+      if (lazyGroupHeaders) {
+        if (groupHeadersParsed > g + 1) {
+          bound = std::max(bound, maxParsedGroupUpper(g + 1, groupHeadersParsed - 1));
+        }
+        if (groupHeadersParsed < groupCount) {
+          bound = std::max(bound, globalMax);
+        }
+      } else {
+        bound = std::max(bound, groupSuffixUpper[g + 1]);
+      }
     }
     return bound;
   }
@@ -296,6 +432,7 @@ public:
     }
     const Chunk& head = ensureGroup(gFrom);
     float bound = head.suffixWithin[fromBlock % GROUP];
+    ensureGroupHeadersThrough(gTo);
     for (int32_t g = gFrom + 1; g < gTo; g++) {
       bound = std::max(bound, groupUpper[g]);
     }
@@ -313,6 +450,7 @@ public:
     assert(fromBlock >= 0 && fromBlock <= toBlock && toBlock < count);
     int32_t gFrom = fromBlock / GROUP;
     int32_t gTo = toBlock / GROUP;
+    ensureGroupHeadersThrough(gTo);
     float bound = 0.0f;
     bool usedGroupBound = false;
     for (int32_t g = gFrom; g <= gTo; g++) {
@@ -341,6 +479,7 @@ public:
     assert(fromBlock >= 0 && fromBlock <= toBlock && toBlock < count);
     int32_t gFrom = fromBlock / GROUP;
     int32_t gTo = toBlock / GROUP;
+    ensureGroupHeadersThrough(gTo);
     float bound = 0.0f;
     for (int32_t g = gFrom; g <= gTo; g++) {
       const Chunk& chunk = ensureGroup(g);
@@ -360,16 +499,16 @@ public:
   // itself when its own block competes (or lies past the impact data), and
   // DocsEnum::END when nothing later can compete.
   int32_t firstCompetitiveTarget(int32_t doc, float minScore, int64_t& skippedBlocks) const {
-    const int32_t* it = std::lower_bound(groupLastDocs, groupLastDocs + groupCount, doc);
-    int32_t g = (int32_t) (it - groupLastDocs);
+    if (globalMax < minScore) {
+      skippedBlocks += count;
+      return DocsEnum::END;
+    }
+    int32_t g = groupContainingFrom(-1, doc);
     if (g >= groupCount) {
       return doc;  // past the impact data; the enum will run out naturally
     }
     for (;;) {
-      if (groupSuffixUpper[g] < minScore) {
-        skippedBlocks += count - g * GROUP;
-        return DocsEnum::END;  // no group from here on can compete
-      }
+      ensureGroupHeadersThrough(g);
       if (groupUpper[g] >= minScore) {
         const Chunk& chunk = ensureGroup(g);
         const int32_t* bit =
@@ -384,7 +523,7 @@ public:
           skippedBlocks++;
         }
       } else {
-        skippedBlocks += GROUP;
+        skippedBlocks += blockCountForGroup(g);
       }
       if (g + 1 >= groupCount) {
         return DocsEnum::END;  // scanned to the end without a competitive block
@@ -398,8 +537,7 @@ public:
   // target); blockCount() when target is past the last block, or when the
   // index is empty.
   int32_t blockContaining(int32_t target) const {
-    const int32_t* it = std::lower_bound(groupLastDocs, groupLastDocs + groupCount, target);
-    int32_t g = (int32_t) (it - groupLastDocs);
+    int32_t g = groupContainingFrom(-1, target);
     if (g >= groupCount) {
       return count;
     }
@@ -412,6 +550,10 @@ public:
   // window walks): gallop forward over the group table from `from`'s group.
   // A target behind the hinted block falls back to the full search.
   int32_t blockContainingFrom(int32_t from, int32_t target) const {
+    if (lazyGroupHeaders) {
+      unused(from);
+      return blockContaining(target);
+    }
     if (from < 0 || from >= count) {
       return from >= count && from >= 0 ? count : blockContaining(target);
     }

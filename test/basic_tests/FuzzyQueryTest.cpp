@@ -73,10 +73,10 @@ static int64_t expectFuzzyClauseBoundsSound(
 }
 
 static FuzzyTopKRun runFuzzyTopK(IndexReader& reader, int32_t topK, bool allowPruning,
-                                 bool checkClauseBounds = false) {
+                                 bool checkClauseBounds = false, float boost = 1.0f) {
   MemPool pool;
   Query::Context ctx(pool, reader);
-  FuzzyQuery fq("body_w", "aaaaa", 1, 0);
+  FuzzyQuery fq("body_w", "aaaaa", 1, 0, 0, boost);
   auto* weight = fq.createWeight(ctx, Query::NEED_SCORES);
   TopDocsCollector collector(topK);
   FuzzyTopKRun result;
@@ -620,6 +620,44 @@ TEST_F(FuzzyQueryTest, scoredFuzzyTopKMatchesBruteForceWithPruningEngaged) {
   EXPECT_LT(pruned.maxScoreVisited, bruteForce.maxScoreVisited);
   EXPECT_GT(pruned.maxSplit, 0);
   EXPECT_GT(pruned.nonEssentialLookups, 0);
+  helper.clear();
+}
+
+TEST_F(FuzzyQueryTest, boostedFuzzyTopKMatchesBruteForceWithPruningEngaged) {
+  CollectionHelper helper{"main"};
+  helper.clear();
+
+  std::vector<Doc> docs;
+  docs.reserve((size_t)(5 + 3 * 256 + 3));
+  std::string body;
+  for (int32_t i = 0; i < 5; i++) {
+    body.clear();
+    appendRepeatedFuzzyTerm(body, "aaaaa", 28 - i);
+    docs.push_back(flatdoc("id", "bh" + std::to_string(i), "body_w", body));
+  }
+  std::vector<std::string> variants = {"aaaab", "aaaac", "aaaad"};
+  for (size_t v = 0; v < variants.size(); v++) {
+    for (int32_t i = 0; i < 256; i++) {
+      body.clear();
+      appendRepeatedFuzzyTerm(body, variants[v], 1);
+      appendRepeatedFuzzyTerm(body, "filler", 260);
+      docs.push_back(flatdoc("id", "bl" + std::to_string(v) + "_" + std::to_string(i),
+                             "body_w", body));
+    }
+  }
+  for (int32_t i = 0; i < 3; i++) {
+    body.clear();
+    appendRepeatedFuzzyTerm(body, "aaaaa", 60 - i);
+    docs.push_back(flatdoc("id", "bz" + std::to_string(i), "body_w", body));
+  }
+  helper.indexAll(docs, UpdateMessage::COMMIT);
+
+  auto reader = helper.getIndexWriter()->getIndexReader();
+  FuzzyTopKRun bruteForce = runFuzzyTopK(*reader, 3, false, true, 2.75f);
+  FuzzyTopKRun pruned = runFuzzyTopK(*reader, 3, true, false, 2.75f);
+  expectSameTopDocs(bruteForce, pruned);
+  EXPECT_GT(bruteForce.clauseBoundsChecked, 0);
+  EXPECT_LT(pruned.visited, bruteForce.visited);
   helper.clear();
 }
 

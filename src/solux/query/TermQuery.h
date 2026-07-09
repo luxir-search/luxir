@@ -707,6 +707,9 @@ public:
       if (!hasImpacts()) {
         return std::numeric_limits<float>::infinity();
       }
+      if (upTo == PostingsReader::END) {
+        return impacts.globalMaxImpact();
+      }
 
       refreshShallowIfParsed();
 
@@ -788,6 +791,9 @@ public:
     float getMaxScoreForSetup(int32_t upTo) override {
       if (!hasImpacts()) {
         return std::numeric_limits<float>::infinity();
+      }
+      if (upTo == PostingsReader::END) {
+        return impacts.globalMaxImpact();
       }
 
       int32_t startGroup = shallowGroup >= 0

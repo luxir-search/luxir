@@ -82,6 +82,8 @@ class DocsEnum {
   int64_t locOfDocsForTermBlock;
   int64_t locOfPositionsForTermBlock;
   int64_t posStartLoc = 0;  // absolute location of this term's positions (base for L0 posByteOff)
+  const char* termImpactFrontierPtr = nullptr;
+  uint32_t termImpactFrontierLen = 0;
 
 public:
   // The skip structure is two levels: L0 per-block headers, and L1 group headers
@@ -122,6 +124,53 @@ public:
     static constexpr int32_t FRONTIER_CAP = 256;
     int32_t frontierTfs[FRONTIER_CAP];
     int32_t frontierNorms[FRONTIER_CAP];
+  };
+
+  struct GroupImpactHeaderScratch {
+    static constexpr int32_t FRONTIER_CAP = 256;
+    int32_t frontierTfs[FRONTIER_CAP];
+    int32_t frontierNorms[FRONTIER_CAP];
+    int32_t frontierStored = 0;
+    bool frontierSpilled = false;
+
+    void reset(uint32_t frontierCount) {
+      frontierStored = 0;
+      frontierSpilled = frontierCount > (uint32_t) FRONTIER_CAP;
+    }
+
+    void add(int32_t norm, int32_t tf) {
+      if (frontierSpilled) {
+        return;
+      }
+      frontierNorms[frontierStored] = norm;
+      frontierTfs[frontierStored] = tf;
+      frontierStored++;
+    }
+
+    std::span<const int32_t> tfs() const {
+      return {frontierTfs, (size_t) frontierStored};
+    }
+
+    std::span<const int32_t> norms() const {
+      return {frontierNorms, (size_t) frontierStored};
+    }
+  };
+
+  struct GroupImpactCursor {
+    const char* next = nullptr;
+    uint32_t prevGroupLastDoc = 0;
+    int32_t nextGroup = 0;
+    bool initialized = false;
+  };
+
+  struct GroupImpactHeader {
+    int32_t group = 0;
+    int32_t lastDoc = 0;
+    int32_t spanMaxTf = 1;
+    int32_t spanMinNorm = 0;
+    int64_t bodyOffset = 0;   // relative to startOfDocs
+    int32_t baseLastDoc = 0;
+    bool frontierSpilled = false;
   };
 
   // Scoped scored-word probe state for TermQuery::Scorer::applyToCandidates.
@@ -608,6 +657,9 @@ public:
     hasPositions = FieldType::hasPositions(fieldInfo.flags);
     trackPositions = hasPositions;
     hasNorms = hasPositions;
+    auto termFrontier = tenum.currentTermImpactFrontierSpan();
+    termImpactFrontierPtr = termFrontier.ptr;
+    termImpactFrontierLen = termFrontier.len;
 
     // Since the same terms enum will often be used for multiple docs enum, we should copy everything we need
     // from the terms enum that we need (that may change.)
@@ -715,6 +767,44 @@ public:
   /// sum of term freq across all documents (i.e. total number of appearances for this term)
   int32_t totalTermFreq() {
     return ttf;
+  }
+
+  bool hasTermImpacts() const {
+    return termImpactFrontierPtr != nullptr;
+  }
+
+  std::span<const char> encodedTermImpactFrontier() const {
+    return {termImpactFrontierPtr, (size_t) termImpactFrontierLen};
+  }
+
+  template <typename Visitor>
+  int32_t visitTermImpactFrontier(Visitor&& visitor) const {
+    if (!hasTermImpacts()) {
+      return 0;
+    }
+    const char* p = termImpactFrontierPtr;
+    const char* end = termImpactFrontierPtr + termImpactFrontierLen;
+    uint32_t count = InputStream::readVint(p, end);
+    int32_t tf = 0;
+    for (uint32_t i = 0; i < count; i++) {
+      assert(p < end);
+      int32_t norm = (int32_t) (uint8_t) *p;
+      p++;
+      tf += (int32_t) InputStream::readVint(p, end);
+      visitor(tf, norm);
+    }
+    assert(p == end);
+    return (int32_t) count;
+  }
+
+  int32_t readTermImpactFrontier(std::vector<int32_t>& norms,
+                                 std::vector<int32_t>& tfs) const {
+    norms.resize(0);
+    tfs.resize(0);
+    return visitTermImpactFrontier([&](int32_t tf, int32_t norm) {
+      tfs.push_back(tf);
+      norms.push_back(norm);
+    });
   }
 
   /// the document this iterator is currently positions on
@@ -2057,6 +2147,10 @@ public:
     return numDocBlocks;
   }
 
+  int32_t numImpactGroups() const {
+    return numDocGroups;
+  }
+
   // Group-level impact scan: walks ONLY the L1 group headers, hopping each
   // group's body via its byte length - ~df/4096 steps instead of the whole-
   // list walk readBlockMaxTf does.  Emits per group: last doc, the group's
@@ -2072,6 +2166,106 @@ public:
     std::vector<int32_t> baseLastDocs;  // last doc before the group (L0 delta base)
     ImpactFrontiers frontiers;          // per-group frontier staircases
   };
+
+private:
+  void initGroupImpactCursor(GroupImpactCursor& cursor) const {
+    cursor.next = docsSize == 0 ? nullptr : docIS.ptr(startOfDocs);
+    cursor.prevGroupLastDoc = 0;
+    cursor.nextGroup = 0;
+    cursor.initialized = true;
+  }
+
+  template <typename FrontierSink>
+  GroupImpactHeader parseNextGroupImpactHeader(GroupImpactCursor& cursor,
+                                               FrontierSink&& frontierSink) const {
+    assert(docsSize != 0);
+    if (!cursor.initialized) {
+      initGroupImpactCursor(cursor);
+    }
+    assert(cursor.nextGroup >= 0 && cursor.nextGroup < numDocGroups);
+    const char* const streamStart = docIS.ptr(0);
+    const char* const end = docIS.ptr(endOfDocs);
+    const char* p = cursor.next;
+    GroupImpactHeader header;
+    header.group = cursor.nextGroup;
+    header.baseLastDoc = (int32_t) cursor.prevGroupLastDoc;
+
+    uint32_t groupHeaderLen = InputStream::readVint(p, end);
+    const char* groupHeaderEnd = p + groupHeaderLen;
+    assert(groupHeaderEnd <= end);
+    header.lastDoc = (int32_t) (cursor.prevGroupLastDoc + readVint15(p, groupHeaderEnd));
+    uint64_t groupByteLen = readVlong15(p, groupHeaderEnd);
+    if (hasPositions) {
+      auto groupCumTfDelta = InputStream::readVint(p, groupHeaderEnd);
+      unused(groupCumTfDelta);
+    }
+    if (hasFreqs && hasNorms) {
+      uint32_t frontierCount = InputStream::readVint(p, groupHeaderEnd);
+      assert(frontierCount > 0);
+      frontierSink.reset(frontierCount);
+      int32_t tf = 0;
+      for (uint32_t i = 0; i < frontierCount; i++) {
+        assert(p < groupHeaderEnd);
+        int32_t norm = (int32_t) (uint8_t) *p;
+        p++;
+        tf += (int32_t) InputStream::readVint(p, groupHeaderEnd);
+        if (i == 0) {
+          header.spanMinNorm = norm;
+        }
+        frontierSink.add(norm, tf);
+      }
+      header.spanMaxTf = tf;
+      header.frontierSpilled = frontierSink.spilled();
+    } else if (hasFreqs) {
+      frontierSink.reset(0);
+      header.spanMaxTf = (int32_t) InputStream::readVint(p, groupHeaderEnd);
+    } else if (hasNorms) {
+      frontierSink.reset(0);
+      header.spanMinNorm = (int32_t) InputStream::readVint(p, groupHeaderEnd);
+    } else {
+      frontierSink.reset(0);
+    }
+    assert(p == groupHeaderEnd);
+    header.bodyOffset = (int64_t) (groupHeaderEnd - streamStart) - startOfDocs;
+    cursor.next = groupHeaderEnd + (int64_t) groupByteLen;
+    assert(cursor.next <= end);
+    cursor.prevGroupLastDoc = (uint32_t) header.lastDoc;
+    cursor.nextGroup++;
+    return header;
+  }
+
+public:
+  template <typename Visitor>
+  int32_t readGroupImpactHeadersThrough(GroupImpactCursor& cursor, int32_t throughGroup,
+                                        GroupImpactHeaderScratch& scratch,
+                                        bool countLazyParses, Visitor&& visitor) const {
+    if (docsSize == 0 || throughGroup < 0) {
+      return 0;
+    }
+    if (!cursor.initialized) {
+      initGroupImpactCursor(cursor);
+    }
+    int32_t parsed = 0;
+    int32_t stop = std::min(throughGroup, numDocGroups - 1);
+    while (cursor.nextGroup <= stop) {
+      struct ScratchSink {
+        GroupImpactHeaderScratch& scratch;
+        void reset(uint32_t count) { scratch.reset(count); }
+        void add(int32_t norm, int32_t tf) { scratch.add(norm, tf); }
+        bool spilled() const { return scratch.frontierSpilled; }
+      } sink{scratch};
+      GroupImpactHeader header = parseNextGroupImpactHeader(cursor, sink);
+      if (countLazyParses) {
+        skipCount(SkipStats::impactGroupHeaderParses);
+      }
+      visitor(header, scratch.tfs(), scratch.norms());
+      parsed++;
+    }
+    if (cursor.nextGroup == numDocGroups) {
+      assert(cursor.next == docIS.ptr(endOfDocs));
+    }
+    return parsed;
+  }
 
   void readGroupImpacts(GroupImpacts& out) const {
     out.lastDocs.resize(0);
@@ -2090,56 +2284,36 @@ public:
     out.baseLastDocs.reserve(numDocGroups);
     out.frontiers.offsets.reserve((size_t) numDocGroups + 1);
 
-    const char* const streamStart = docIS.ptr(0);
-    const char* const end = docIS.ptr(endOfDocs);
-    const char* p = docIS.ptr(startOfDocs);
-    uint32_t prevGroupLastDoc = 0;
-    for (int32_t group = 0; group < numDocGroups; group++) {
-      uint32_t groupHeaderLen = InputStream::readVint(p, end);
-      const char* groupHeaderEnd = p + groupHeaderLen;
-      assert(groupHeaderEnd <= end);
-      uint32_t groupLastDoc = prevGroupLastDoc + readVint15(p, groupHeaderEnd);
-      uint64_t groupByteLen = readVlong15(p, groupHeaderEnd);
-      if (hasPositions) {
-        auto groupCumTfDelta = InputStream::readVint(p, groupHeaderEnd);
-        unused(groupCumTfDelta);
+    struct VectorSink {
+      ImpactFrontiers& frontiers;
+      bool wasSpilled = false;
+      void reset(uint32_t) {
+        wasSpilled = false;
+        frontiers.offsets.push_back((int32_t) frontiers.tfs.size());
       }
-      int32_t spanImpact = 1;
-      int32_t spanMinNorm = 0;
-      out.frontiers.offsets.push_back((int32_t) out.frontiers.tfs.size());
-      if (hasFreqs && hasNorms) {
-        uint32_t frontierCount = InputStream::readVint(p, groupHeaderEnd);
-        assert(frontierCount > 0);
-        int32_t tf = 0;
-        for (uint32_t i = 0; i < frontierCount; i++) {
-          assert(p < groupHeaderEnd);
-          int32_t norm = (int32_t) (uint8_t) *p;  // raw byte (absolute)
-          p++;
-          tf += (int32_t) InputStream::readVint(p, groupHeaderEnd);  // tf delta
-          if (i == 0) {
-            spanMinNorm = norm;
-          }
-          out.frontiers.norms.push_back(norm);
-          out.frontiers.tfs.push_back(tf);
-        }
-        spanImpact = tf;
-      } else if (hasFreqs) {
-        spanImpact = (int32_t) InputStream::readVint(p, groupHeaderEnd);
-      } else if (hasNorms) {
-        spanMinNorm = (int32_t) InputStream::readVint(p, groupHeaderEnd);
+      void add(int32_t norm, int32_t tf) {
+        frontiers.norms.push_back(norm);
+        frontiers.tfs.push_back(tf);
       }
-      assert(p == groupHeaderEnd);
-      out.baseLastDocs.push_back((int32_t) prevGroupLastDoc);
-      out.lastDocs.push_back((int32_t) groupLastDoc);
-      out.spanMaxTfs.push_back(spanImpact);
-      out.spanMinNorms.push_back(spanMinNorm);
-      out.bodyOffsets.push_back((int64_t) (groupHeaderEnd - streamStart) - startOfDocs);
-      p = groupHeaderEnd + (int64_t) groupByteLen;
-      assert(p <= end);
-      prevGroupLastDoc = groupLastDoc;
+      bool spilled() const { return wasSpilled; }
+    } sink{out.frontiers};
+
+    // Pulsed terms have no doc stream (docsSize == 0, docIS never opened):
+    // emit the same empty output the pre-cursor walk produced.
+    if (docsSize != 0) {
+      GroupImpactCursor cursor;
+      initGroupImpactCursor(cursor);
+      while (cursor.nextGroup < numDocGroups) {
+        GroupImpactHeader header = parseNextGroupImpactHeader(cursor, sink);
+        out.baseLastDocs.push_back(header.baseLastDoc);
+        out.lastDocs.push_back(header.lastDoc);
+        out.spanMaxTfs.push_back(header.spanMaxTf);
+        out.spanMinNorms.push_back(header.spanMinNorm);
+        out.bodyOffsets.push_back(header.bodyOffset);
+      }
+      assert(cursor.next == docIS.ptr(endOfDocs));
     }
     out.frontiers.offsets.push_back((int32_t) out.frontiers.tfs.size());
-    assert(p == end);
   }
 
   // Parse ONE group's L0 block headers, located by readGroupImpacts output.

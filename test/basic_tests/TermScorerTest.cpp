@@ -164,6 +164,19 @@ struct SkipStatsGuard {
   }
 };
 
+struct ForceEagerImpactsGuard {
+  bool saved;
+
+  explicit ForceEagerImpactsGuard(bool enabled)
+    : saved(ImpactsIndex::forceEagerForTests) {
+    ImpactsIndex::forceEagerForTests = enabled;
+  }
+
+  ~ForceEagerImpactsGuard() {
+    ImpactsIndex::forceEagerForTests = saved;
+  }
+};
+
 std::vector<TopDocsCollector::ScoreDoc> sortedCollectorDocs(TopDocsCollector& collector) {
   auto docs = collector.sort();
   std::vector<TopDocsCollector::ScoreDoc> out(docs.begin(), docs.end());
@@ -2779,6 +2792,128 @@ TEST_F(TermScorerTest, termImpactFrontierIsExactBlockMax) {
   EXPECT_TRUE(sawTighterBlock);
 }
 
+TEST_F(TermScorerTest, cachedDocsEnumKeepsCurrentTermFrontierAfterTermsEnumSeek) {
+  TestIndex testIndex;
+  TestField f(testIndex, "body_w");
+  f.startIndexing();
+  f.add(0, "alpha alpha filler");
+  f.add(1, "alpha filler");
+  f.add(2, "omega omega omega omega filler");
+  f.add(3, "omega filler");
+  testIndex.flush();
+  f.startReading();
+
+  auto poolFree = testIndex.pool.rewindScopeGuard();
+  TermsEnum direct = f.createTermsEnum();
+  ASSERT_TRUE(direct.seek("alpha"));
+  std::vector<int32_t> alphaNorms;
+  std::vector<int32_t> alphaTfs;
+  ASSERT_GT(direct.readTermImpactFrontier(alphaNorms, alphaTfs), 0);
+  ASSERT_TRUE(direct.seek("omega"));
+  std::vector<int32_t> omegaNorms;
+  std::vector<int32_t> omegaTfs;
+  ASSERT_GT(direct.readTermImpactFrontier(omegaNorms, omegaTfs), 0);
+  ASSERT_TRUE(alphaNorms != omegaNorms || alphaTfs != omegaTfs);
+
+  Query::Context qContext(testIndex.pool, *testIndex.reader);
+  auto& segment = qContext.topReader.segments()[0];
+  TermQuery alphaQuery("body_w", "alpha");
+  auto* alphaWeight = alphaQuery.createWeight(qContext, Query::NEED_SCORES);
+  TermQuery omegaQuery("body_w", "omega");
+  auto* omegaWeight = omegaQuery.createWeight(qContext, Query::NEED_SCORES);
+  unused(omegaWeight);
+
+  auto* alphaScorer = dynamic_cast<TermQuery::Scorer*>(
+      alphaWeight->createScorer(testIndex.pool, segment));
+  ASSERT_NE(alphaScorer, nullptr);
+  std::vector<int32_t> clonedNorms;
+  std::vector<int32_t> clonedTfs;
+  ASSERT_GT(alphaScorer->docsEnum.readTermImpactFrontier(clonedNorms, clonedTfs), 0);
+  EXPECT_EQ(clonedNorms, alphaNorms);
+  EXPECT_EQ(clonedTfs, alphaTfs);
+
+  DocsEnum copied(testIndex.pool, alphaScorer->docsEnum);
+  clonedNorms.clear();
+  clonedTfs.clear();
+  ASSERT_GT(copied.readTermImpactFrontier(clonedNorms, clonedTfs), 0);
+  EXPECT_EQ(clonedNorms, alphaNorms);
+  EXPECT_EQ(clonedTfs, alphaTfs);
+}
+
+TEST_F(TermScorerTest, lazyImpactsMatchForcedEagerFrontierOracle) {
+  const int32_t N = 2 * DocsEnum::L1_DOCS + 55;
+  constexpr int32_t TERM_COUNT = 5;
+  TestIndex testIndex;
+  TestField f(testIndex, "body_w");
+  f.startIndexing();
+
+  std::array<std::string, TERM_COUNT> terms = {"r0", "r1", "r2", "r3", "r4"};
+  uint32_t state = 0x5eed1234u;
+  for (int32_t doc = 0; doc < N; doc++) {
+    std::string body;
+    int32_t used = 0;
+    for (int32_t t = 0; t < TERM_COUNT; t++) {
+      state = state * 1664525u + 1013904223u;
+      int32_t tf = 1 + (int32_t) ((state >> 16) % 9);
+      appendRepeatedTerm(body, terms[(size_t) t], tf);
+      used += tf;
+    }
+    int32_t len = used + 20 + (int32_t) (state % 80);
+    appendRepeatedTerm(body, "filler", len - used);
+    f.add(doc, body);
+  }
+  testIndex.flush();
+  f.startReading();
+
+  auto poolFree = testIndex.pool.rewindScopeGuard();
+  Query::Context qContext(testIndex.pool, *testIndex.reader);
+  auto& segment = qContext.topReader.segments()[0];
+
+  for (const std::string& term : terms) {
+    SCOPED_TRACE(term);
+    TermQuery lazyQuery("body_w", term, 1.7f, true);
+    auto* lazyWeight = lazyQuery.createWeight(qContext, Query::NEED_SCORES);
+    auto* lazy = dynamic_cast<TermQuery::Scorer*>(
+        lazyWeight->createScorer(testIndex.pool, segment));
+
+    ForceEagerImpactsGuard eagerGuard(true);
+    TermQuery eagerQuery("body_w", term, 1.7f, true);
+    auto* eagerWeight = eagerQuery.createWeight(qContext, Query::NEED_SCORES);
+    auto* eager = dynamic_cast<TermQuery::Scorer*>(
+        eagerWeight->createScorer(testIndex.pool, segment));
+    ASSERT_NE(lazy, nullptr);
+    ASSERT_NE(eager, nullptr);
+    ASSERT_TRUE(lazy->hasImpacts());
+    ASSERT_TRUE(eager->hasImpacts());
+    ASSERT_EQ(lazy->impacts.blockCount(), eager->impacts.blockCount());
+    ASSERT_EQ(lazy->impacts.numGroups(), eager->impacts.numGroups());
+
+    EXPECT_FLOAT_EQ(lazy->impacts.globalMaxImpact(), eager->impacts.globalMaxImpact());
+    EXPECT_FLOAT_EQ(lazy->impacts.maxGroupImpactFrom(0),
+                    lazy->impacts.globalMaxImpact());
+
+    for (int32_t g = 0; g < lazy->impacts.numGroups(); g++) {
+      EXPECT_FLOAT_EQ(lazy->impacts.maxGroupImpactInRange(g, g),
+                      eager->impacts.maxGroupImpactInRange(g, g)) << "group=" << g;
+    }
+    for (int32_t target : {N - 1, 0, 127, 128, DocsEnum::L1_DOCS + 3,
+                           N / 2, PostingsReader::END}) {
+      EXPECT_EQ(lazy->impacts.blockContaining(target), eager->impacts.blockContaining(target))
+          << "target=" << target;
+    }
+    for (int32_t target : {0, Postings::DOCS_BLOCK_SIZE + 5, DocsEnum::L1_DOCS + 9}) {
+      for (float minScore : {0.0f, lazy->impacts.globalMaxImpact() * 0.5f,
+                             lazy->impacts.globalMaxImpact() + 0.001f}) {
+        int64_t lazySkipped = 0;
+        int64_t eagerSkipped = 0;
+        EXPECT_EQ(lazy->impacts.firstCompetitiveTarget(target, minScore, lazySkipped),
+                  eager->impacts.firstCompetitiveTarget(target, minScore, eagerSkipped))
+            << "target=" << target << " minScore=" << minScore;
+      }
+    }
+  }
+}
+
 TEST_F(TermScorerTest, termImpactGroupBoundsMatchBlockBoundsOnGroupAlignedRanges) {
   const int32_t postingCount = 2 * DocsEnum::L1_DOCS + 19;
   TestIndex testIndex;
@@ -2878,6 +3013,87 @@ TEST_F(TermScorerTest, maxScoreSetupUsesGroupBoundsWithoutL0Parse) {
   SkipStats::enabled = savedStats;
 }
 
+TEST_F(TermScorerTest, lazyHeaderParsesStayBelowDenseTermGroupCount) {
+  const int32_t nDocs = 8 * DocsEnum::L1_DOCS + 19;
+  TestIndex testIndex;
+  TestField f(testIndex, "body_w");
+  f.startIndexing();
+  for (int32_t doc = 0; doc < nDocs; doc++) {
+    std::string body;
+    int32_t tf = doc < 16 ? 80 - (doc % 5) : 1 + (doc % 3);
+    appendRepeatedTerm(body, "dense_header", tf);
+    appendRepeatedTerm(body, "filler", doc < 16 ? 3 : 240 + (doc % 17));
+    f.add(doc, body);
+  }
+  testIndex.flush();
+  f.startReading();
+
+  auto poolFree = testIndex.pool.rewindScopeGuard();
+  SkipStatsGuard stats;
+  Query::Context qContext(testIndex.pool, *testIndex.reader);
+  auto& segment = qContext.topReader.segments()[0];
+  TermQuery query("body_w", "dense_header");
+  auto* weight = query.createWeight(qContext, Query::NEED_SCORES);
+  auto* scorer = dynamic_cast<TermQuery::Scorer*>(
+      weight->createScorer(testIndex.pool, segment));
+  ASSERT_NE(scorer, nullptr);
+  ASSERT_TRUE(scorer->hasImpacts());
+  ASSERT_GT(scorer->impacts.numGroups(), 4);
+
+  EXPECT_EQ(SkipStats::impactGroupHeaderParses, 0);
+  EXPECT_TRUE(std::isfinite(scorer->getMaxScoreForSetup(PostingsReader::END)));
+  EXPECT_EQ(SkipStats::impactGroupHeaderParses, 0);
+  EXPECT_EQ(scorer->advanceShallowForSetup(0), DocsEnum::L1_DOCS - 1);
+  EXPECT_GT(SkipStats::impactGroupHeaderParses, 0);
+  EXPECT_LT(SkipStats::impactGroupHeaderParses, scorer->impacts.numGroups());
+
+  int64_t parsedBeforeDeath = SkipStats::impactGroupHeaderParses;
+  int64_t skipped = 0;
+  EXPECT_EQ(scorer->impacts.firstCompetitiveTarget(
+                0, scorer->impacts.globalMaxImpact() + 1.0f, skipped),
+            DocsEnum::END);
+  EXPECT_EQ(SkipStats::impactGroupHeaderParses, parsedBeforeDeath);
+}
+
+TEST_F(TermScorerTest, lazySetupAndMainShallowCursorsCanInterleaveNonMonotone) {
+  const int32_t nDocs = 3 * DocsEnum::L1_DOCS + 17;
+  TestIndex testIndex;
+  TestField f(testIndex, "body_w");
+  f.startIndexing();
+  for (int32_t doc = 0; doc < nDocs; doc++) {
+    std::string body;
+    appendRepeatedTerm(body, "interleave", 1 + (doc % 5));
+    appendRepeatedTerm(body, "filler", 20 + (doc % 13));
+    f.add(doc, body);
+  }
+  testIndex.flush();
+  f.startReading();
+
+  auto poolFree = testIndex.pool.rewindScopeGuard();
+  Query::Context qContext(testIndex.pool, *testIndex.reader);
+  auto& segment = qContext.topReader.segments()[0];
+  TermQuery query("body_w", "interleave");
+  auto* weight = query.createWeight(qContext, Query::NEED_SCORES);
+  auto* scorer = dynamic_cast<TermQuery::Scorer*>(
+      weight->createScorer(testIndex.pool, segment));
+  ASSERT_NE(scorer, nullptr);
+
+  auto groupEnd = [&](int32_t target) {
+    if (target >= nDocs) return PostingsReader::END;
+    int32_t group = target / DocsEnum::L1_DOCS;
+    return std::min(nDocs - 1, (group + 1) * DocsEnum::L1_DOCS - 1);
+  };
+
+  EXPECT_EQ(scorer->advanceShallowForSetup(2 * DocsEnum::L1_DOCS + 7),
+            groupEnd(2 * DocsEnum::L1_DOCS + 7));
+  EXPECT_EQ(scorer->advanceShallow(3), groupEnd(3));
+  EXPECT_EQ(scorer->advanceShallowForSetup(DocsEnum::L1_DOCS + 9),
+            groupEnd(DocsEnum::L1_DOCS + 9));
+  EXPECT_EQ(scorer->advanceShallow(2 * DocsEnum::L1_DOCS + 11),
+            groupEnd(2 * DocsEnum::L1_DOCS + 11));
+  EXPECT_EQ(scorer->advanceShallow(10), groupEnd(10));
+}
+
 TEST_F(TermScorerTest, groupSetupPulsedTermBehaviorUnchanged) {
   TestIndex testIndex;
   TestField f(testIndex, "body_w");
@@ -2887,17 +3103,32 @@ TEST_F(TermScorerTest, groupSetupPulsedTermBehaviorUnchanged) {
   f.startReading();
 
   auto poolFree = testIndex.pool.rewindScopeGuard();
-  Query::Context qContext(testIndex.pool, *testIndex.reader);
-  auto& segment = qContext.topReader.segments()[0];
-  TermQuery query("body_w", "pulse");
-  auto* weight = query.createWeight(qContext, Query::NEED_SCORES);
-  auto* scorer = dynamic_cast<TermQuery::Scorer*>(weight->createScorer(testIndex.pool, segment));
-  ASSERT_NE(scorer, nullptr);
-  EXPECT_FALSE(scorer->hasImpacts());
-  EXPECT_TRUE(std::isinf(scorer->getMaxScore(PostingsReader::END)));
-  EXPECT_TRUE(std::isinf(scorer->getMaxScoreForSetup(PostingsReader::END)));
-  EXPECT_EQ(scorer->advanceShallow(0), PostingsReader::END);
-  EXPECT_EQ(scorer->advanceShallowForSetup(0), PostingsReader::END);
+  TermsEnum tenum = f.createTermsEnum();
+  ASSERT_TRUE(tenum.seek("pulse"));
+  DocsEnum denum(testIndex.pool, f.currentSegment()->postingsReader(), tenum);
+  EXPECT_TRUE(denum.hasTermImpacts());
+  EXPECT_EQ(denum.numImpactBlocks(), 0);
+  std::vector<int32_t> norms;
+  std::vector<int32_t> tfs;
+  EXPECT_GT(denum.readTermImpactFrontier(norms, tfs), 0);
+
+  // Both build paths must degrade identically on a pulsed term (no doc
+  // stream): the eager path's group walk sees zero groups.
+  for (bool forceEager : {false, true}) {
+    SCOPED_TRACE(forceEager ? "eager" : "lazy");
+    ForceEagerImpactsGuard eagerGuard(forceEager);
+    Query::Context qContext(testIndex.pool, *testIndex.reader);
+    auto& segment = qContext.topReader.segments()[0];
+    TermQuery query("body_w", "pulse");
+    auto* weight = query.createWeight(qContext, Query::NEED_SCORES);
+    auto* scorer = dynamic_cast<TermQuery::Scorer*>(weight->createScorer(testIndex.pool, segment));
+    ASSERT_NE(scorer, nullptr);
+    EXPECT_FALSE(scorer->hasImpacts());
+    EXPECT_TRUE(std::isinf(scorer->getMaxScore(PostingsReader::END)));
+    EXPECT_TRUE(std::isinf(scorer->getMaxScoreForSetup(PostingsReader::END)));
+    EXPECT_EQ(scorer->advanceShallow(0), PostingsReader::END);
+    EXPECT_EQ(scorer->advanceShallowForSetup(0), PostingsReader::END);
+  }
 }
 
 TEST_F(TermScorerTest, mandOptSingleOptionalSparseAndDenseTopKMatchesExhaustive) {
@@ -3355,7 +3586,7 @@ TEST_F(TermScorerTest, mandOptBulkMatchesPullAcrossClauseCountsFiltersAndDeletes
 }
 
 TEST_F(TermScorerTest, mandOptBulkZeroAndOneSurvivingOptionalScorers) {
-  CollectionHelper helper("main");
+  CollectionHelper helper("mand_opt_zero_one_surviving_optional");
   helper.index(flatdoc("id", "z0", "body_w", "mob_zero_mand"), UpdateMessage::COMMIT);
   helper.index(flatdoc("id", "z1", "body_w", "mob_zero_mand mob_one_opt"), UpdateMessage::COMMIT);
   auto reader = helper.getIndexWriter()->getIndexReader();
@@ -3875,6 +4106,7 @@ TEST_F(TermScorerTest, termImpactGroupBoundsHandleFreqOnlyScalarHeaders) {
   TermsEnum tenum(pool, reader, fieldInfo);
   ASSERT_TRUE(tenum.seek("hot"));
   DocsEnum denum(pool, reader, tenum);
+  EXPECT_FALSE(denum.hasTermImpacts());
 
   Similarity::FieldStats fieldStats;
   fieldStats.sumTotalTermFreq = tenum.sumTotalTermFreq();
@@ -3886,11 +4118,13 @@ TEST_F(TermScorerTest, termImpactGroupBoundsHandleFreqOnlyScalarHeaders) {
   termStats.totalTermFreq = denum.totalTermFreq();
   Similarity sim;
   auto simScorer = sim.getScorer(1.0f, fieldStats, termStats);
+  SkipStatsGuard stats;
   ImpactsIndex impacts;
   impacts.build(pool, denum, simScorer, 1.0f, true);
   ASSERT_FALSE(impacts.empty());
   EXPECT_FLOAT_EQ(impacts.maxGroupImpactFrom(0),
                   impacts.maxImpactInRange(0, impacts.blockCount() - 1));
+  EXPECT_EQ(SkipStats::impactGroupHeaderParses, 0);
 }
 
 TEST_F(TermScorerTest, termImpactFrontierTopKMatchesCornerAndExhaustive) {
@@ -4027,6 +4261,47 @@ TEST_F(TermScorerTest, phraseImpactShallowStillUsesBlockGranularity) {
   EXPECT_TRUE(std::isfinite(scorer->getMaxScore(blockEnd)));
 
   SkipStats::enabled = savedStats;
+}
+
+TEST_F(TermScorerTest, phraseRepeatedTermLazyBoundsCoverScores) {
+  const int32_t N = DocsEnum::L1_DOCS + 37;
+  TestIndex testIndex;
+  TestField f(testIndex, "body_w");
+  f.startIndexing();
+  for (int32_t doc = 0; doc < N; doc++) {
+    std::string text = "a b a ";
+    appendRepeatedTerm(text, "a", doc % 4);
+    appendRepeatedTerm(text, "filler", 20 + (doc % 31));
+    f.add(doc, text);
+  }
+  testIndex.flush();
+  f.startReading();
+
+  auto poolFree = testIndex.pool.rewindScopeGuard();
+  Query::Context qContext(testIndex.pool, *testIndex.reader);
+  auto& segment = qContext.topReader.segments()[0];
+  std::vector<std::string_view> terms = {"a", "b", "a"};
+  std::vector<int32_t> positions = {0, 1, 2};
+  PhraseQuery query("body_w", terms, positions);
+  auto* weight = query.createWeight(qContext, Query::NEED_SCORES);
+
+  auto* boundScorer = dynamic_cast<PhraseQuery::Scorer*>(
+      weight->createScorer(testIndex.pool, segment));
+  ASSERT_NE(boundScorer, nullptr);
+  int32_t upTo = boundScorer->advanceShallow(0);
+  ASSERT_NE(upTo, PostingsReader::END);
+  float bound = boundScorer->getMaxScore(upTo);
+  ASSERT_TRUE(std::isfinite(bound));
+  EXPECT_EQ(boundScorer->advanceShallow(DocsEnum::L1_DOCS + 5), N - 1);
+  EXPECT_EQ(boundScorer->advanceShallow(3), upTo);
+
+  auto* scoreScorer = dynamic_cast<PhraseQuery::Scorer*>(
+      weight->createScorer(testIndex.pool, segment));
+  ASSERT_NE(scoreScorer, nullptr);
+  for (int32_t doc = scoreScorer->next(); doc != PostingsReader::END && doc <= upTo;
+       doc = scoreScorer->next()) {
+    EXPECT_LE(scoreScorer->score(), bound * 1.000001f) << "doc=" << doc;
+  }
 }
 
 // Phrase pruning: block 0 holds the strong phrase docs (high phrase tf, short
