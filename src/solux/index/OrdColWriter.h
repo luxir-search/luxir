@@ -1,5 +1,6 @@
 #pragma once
 
+#include <span>
 #include "PostingsWriter.h"
 #include "IntColWriter.h"
 #include "OrdCollector.h"
@@ -25,20 +26,27 @@ public:
     }
   }
 
-  void finish() {
+  // rankToDoc maps a rank-indexed collector's slot (a field-rank) back to its docid.
+  // Empty means the collector is indexed directly by docid (slot == docid).
+  void finish(std::span<const int32_t> rankToDoc = {}) {
     int32_t nDocs = postingsWriter.getMaxDoc();
+    int32_t nSlots = ords.size();
+    // Either docid-indexed (no map) or one docid per slot.
+    assert(rankToDoc.empty() || (int32_t)rankToDoc.size() == nSlots);
     fieldInfo.docsWithField = ords.docsWithValue();
 
     // Write the ordinals to the postings file.
     // This is pretty much repeated code from Inverter::StringIndexHandler - TODO: refactor to own Writer.
+    // Slots are walked in index order, which is doc order for both docid- and rank-indexed
+    // collectors, so the ord column comes out doc-ordered either way.
     {
       auto outputPtr = postingsWriter.getOutputStream();
       IntColWriter ordCol(*outputPtr);
 
       int64_t nValues = 0;
-      for (int docid = 0; docid < nDocs; docid++) {
+      for (int slot = 0; slot < nSlots; slot++) {
         auto prev = nValues;
-        ords.pushValues(docid, [&](int32_t ord) {
+        ords.pushValues(slot, [&](int32_t ord) {
           ordCol.addInt64(ord);
           nValues++;
         });
@@ -46,7 +54,6 @@ public:
         if (prev != nValues && endValueRankWriter) {
           endValueRankWriter->addInt64(nValues);
         }
-        prev = nValues;
       }
 
       ordCol.finish(fieldInfo);
@@ -68,9 +75,9 @@ public:
     if (!full) {
       auto guard = pool.rewindScopeGuard();
       DocsWithValWriter docsWriter(pool, postingsWriter, fieldInfo);
-      for (int docid = 0; docid < nDocs; docid++) {
-        if (ords.hasValues(docid)) {
-          docsWriter.startDoc(docid);
+      for (int slot = 0; slot < nSlots; slot++) {
+        if (ords.hasValues(slot)) {
+          docsWriter.startDoc(rankToDoc.empty() ? slot : rankToDoc[slot]);
         }
       }
       docsWriter.finish();

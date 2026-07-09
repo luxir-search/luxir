@@ -19,10 +19,18 @@ class StrHandler final : public Inverter::IndexHandler {
   // TODO: for unique fields like "id", this could be TermValHash<int32_t>
   TermValHash<DocStream> termsHash; // the set of terms contained in this field
 
+  // Postings store a field-rank (the doc's rank among docs-with-value) rather than a
+  // docid, so the ord collector at flush is sized to docsWithField, not maxDoc.
+  // docsWithField maps rank->docid, in doc order, and resolves the real docids back
+  // for the inverted-index and the docs-with-field column.
+  DocStream docsWithField;
+  int32_t nDocsWithField = 0;   // next field-rank == count of docs with a value
+  int32_t lastFieldDoc = -1;    // last doc that contributed a value to this field
+
 public:
   StrHandler(Inverter& inverter, const std::string_view& fieldName, const std::shared_ptr<FieldType>& fieldType)
     : IndexHandler(PackedTerm(inverter.pool, fieldName), fieldType),
-      termsHash(inverter.pool, 4) {
+      termsHash(inverter.pool, 4), docsWithField(inverter.pool) {
   }
 
   ~StrHandler() override = default;
@@ -69,11 +77,23 @@ public:
     // bytes); query-time term building truncates identically, so exact match
     // on the full value still works.
     term = PackedTerm::truncate(term);
+    // Assign this doc a field-rank the first time it contributes any value, recording
+    // rank->docid in docsWithField.  All of a doc's terms then share that rank.
+    int32_t doc = inverter.getDoc();
+    if (lastFieldDoc != doc) {
+      lastFieldDoc = doc;
+      // Built and read back through termsHash's pool, like the per-term streams, so
+      // both sides name the same pool explicitly rather than relying on it happening
+      // to equal inverter.pool.
+      docsWithField.addDoc(termsHash.getMemPool(), doc);
+      nDocsWithField++;
+    }
+    int32_t rank = nDocsWithField - 1;
     auto [entry, inserted] = termsHash.try_emplace(term, termsHash.getMemPool());
     unused(inserted);
-    // don't record duplicates for the same doc.
-    if (entry->val().getLastDoc() != inverter.getDoc()) {
-      entry->val().addDoc(termsHash.getMemPool(), inverter.getDoc());
+    // don't record duplicates for the same doc (postings are keyed by rank).
+    if (entry->val().getLastDoc() != rank) {
+      entry->val().addDoc(termsHash.getMemPool(), rank);
     }
     // values live in inverter.pool; only the heap table is outside-pool.
     accountExtraRam(inverter, termsHash.memSize());
@@ -120,24 +140,28 @@ public:
     fieldInfo.type = fieldType->type();
     fieldInfo.flags = fieldType->flags_ & ~FieldType::ABSTRACT;
 
-    // For ordinals, we already know the number of unique terms, so we can use an optimal number of bits right off the bat
-    // for dense fields.  Then we could simply memcpy the ordinals into the postings file.
-    // std::vector<int> docToOrd(inverter.currDoc+1, 0); // This is very inefficient temporary implementation.
-    // ord vec must me 0 initialized since that is value that means "missing".
-    OrdCollector ords(guard.pool(), nDocs);
+    // Postings are keyed by field-rank, so the ord collector is sized to docsWithField
+    // (not maxDoc).  For a full field rank == docid, so we skip the rank->docid table
+    // and index directly; otherwise materialize it once for both the inverted-index
+    // scatter and the docs-with-field column.
+    bool full = (nDocsWithField == nDocs);
+    std::vector<int32_t> rankToDoc;
+    if (!full) {
+      rankToDoc.reserve((size_t)nDocsWithField);
+      docsWithField.forEachDoc(termsHash.getMemPool(), [&](int d) { rankToDoc.push_back(d); });
+    }
+
+    OrdCollector ords(guard.pool(), nDocsWithField);
 
     textWriter.startField(&fieldInfo);
     for (int32_t tnum = 0; tnum < uniqueVals; tnum++) {
       auto term = terms[tnum];
       textWriter.startTerm(term);
       // push all the docs for this term to the TextWriter, as well as record the ordinal for each doc
-      term.val().forEachDoc(inverter.pool, [&](int docid) {
-        // LOG_INFO("WRITE docid={}, tnum={}", docid, tnum);
+      term.val().forEachDoc(termsHash.getMemPool(), [&](int rank) {
+        int32_t docid = full ? rank : rankToDoc[rank];
         textWriter.addDoc(docid, 1);  // DOCS-only field: record the doc, no freq/position stored
-
-        // single-valued version.
-        // docToOrd[docid] = tnum + 1;  // +1 because 0 means "missing"
-        ords.add(docid, tnum + 1);
+        ords.add(rank, tnum + 1);
       });
       textWriter.endTerm(term);
     }
@@ -145,7 +169,7 @@ public:
     termsHash.free();
 
     OrdColWriter ordsWriter(guard.pool(), inverter.postingsWriter, fieldInfo, ords);
-    ordsWriter.finish();
+    ordsWriter.finish(rankToDoc);
   }
 
 };
