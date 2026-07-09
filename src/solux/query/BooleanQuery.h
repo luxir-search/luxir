@@ -3175,7 +3175,7 @@ public:
       size_t firstWindowLead = std::min(splitIndex, scorers.size() - 1);
       int32_t end = PostingsReader::END;
       for (size_t i = firstWindowLead; i < scorers.size(); i++) {
-        auto* scorer = scorers[i];
+        auto* scorer = scorers[(size_t) windowOrder[i]];
         if (scorer->docId() >= max) continue;
         int32_t target = std::max(scorer->docId(), start);
         int32_t upTo = scorer->advanceShallowForSetup(target);
