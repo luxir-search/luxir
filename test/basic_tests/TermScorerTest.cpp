@@ -1251,6 +1251,41 @@ void expectFillRunNear(const FillRun& expected, const FillRun& actual) {
   }
 }
 
+FillRun fillTermScoreBlockCalls(IndexReader& reader, std::string_view term,
+                                int32_t start, int32_t upTo,
+                                std::span<const int32_t> counts,
+                                float minCompetitiveScore) {
+  MemPool pool;
+  Query::Context qContext(pool, reader);
+  TermQuery query("body_w", term);
+  auto* weight = query.createWeight(qContext, Query::NEED_SCORES);
+  auto& segment = qContext.topReader.segments()[0];
+  auto* scorer = weight->createScorer(pool, segment);
+  EXPECT_NE(scorer, nullptr);
+
+  FillRun run;
+  if (scorer == nullptr) {
+    return run;
+  }
+  scorer->setMinCompetitiveScore(minCompetitiveScore);
+  if (scorer->docId() < start) {
+    scorer->advance(start);
+  }
+
+  std::vector<int32_t> docs;
+  std::vector<float> scores;
+  for (int32_t count : counts) {
+    docs.resize((size_t) count);
+    scores.resize((size_t) count);
+    int32_t n = scorer->fillScoreBlock(docs.data(), scores.data(), count, upTo);
+    for (int32_t i = 0; i < n; i++) {
+      run.docs.push_back(docs[(size_t) i]);
+      run.scores.push_back(scores[(size_t) i]);
+    }
+  }
+  return run;
+}
+
 std::unique_ptr<DocSet> makeEveryNthSegmentDocSet(IndexReader::Segment& segment,
                                                   int32_t step, bool arrayDocSet,
                                                   bool liveOnly) {
@@ -6178,6 +6213,35 @@ TEST_F(TermScorerTest, ScoredWordProbeApplyToCandidatesMatchesPerDocAdvanceAcros
     if (!required) {
       EXPECT_GT(actual.scoredWordProbes, 0);
     }
+  }
+  helper.clear();
+}
+
+// fillScoreBlock is count-driven: a call that stops on count (not upTo) must
+// leave the enum positioned so the next call resumes exactly, on both the
+// block-span path (mcs == 0) and the impact-skipping scalar path (mcs > 0).
+TEST_F(TermScorerTest, FillScoreBlockCountLimitedCallsResumeOnBothFillPaths) {
+  CollectionHelper helper("main");
+  auto postings = makeMixedProbePostings();
+  indexProbeTermDocs(helper, "count_limited", postings, "count_limited");
+  auto reader = helper.getIndexWriter()->getIndexReader();
+
+  int32_t start = postings[5];
+  int32_t upTo = postings.back() + 1;
+  int32_t unlimitedCount = (int32_t) postings.size() + 16;
+  std::array<int32_t, 1> unlimited = {unlimitedCount};
+  std::array<int32_t, 2> limited = {73, unlimitedCount};
+
+  for (float minCompetitiveScore : {0.0f, std::numeric_limits<float>::denorm_min()}) {
+    auto expected = fillTermScoreBlockCalls(*reader, "count_limited", start, upTo,
+                                            unlimited, minCompetitiveScore);
+    auto actual = fillTermScoreBlockCalls(*reader, "count_limited", start, upTo,
+                                          limited, minCompetitiveScore);
+    SCOPED_TRACE(::testing::Message() << "mcs=" << minCompetitiveScore);
+    expectFillRunNear(expected, actual);
+    ASSERT_FALSE(actual.docs.empty());
+    EXPECT_EQ(actual.docs.front(), start);
+    EXPECT_EQ(actual.docs.back(), postings.back());
   }
   helper.clear();
 }
