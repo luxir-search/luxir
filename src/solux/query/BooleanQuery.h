@@ -3542,18 +3542,35 @@ public:
       float threshold = cachedCompetitiveThreshold(sweepLevel);
       int32_t write = compactByScoreThreshold(out.docs.data(), out.scores.data(),
                                               out.size, threshold);
+      if (SkipStats::enabled) {
+        SkipStats::maxScoreCompactionInput += out.size;
+        SkipStats::maxScoreCompactionKept += write;
+        if (sweepLevel < SkipStats::MAX_SWEEP_LEVELS) {
+          SkipStats::maxScoreCompactionInputByLevel[sweepLevel] += out.size;
+          SkipStats::maxScoreCompactionKeptByLevel[sweepLevel] += write;
+        }
+      }
       recordBufferDrops(out.size, write);
       return write;
     }
 
     void finishCompetitive(ScoreWindow& out) {
+      int32_t before = out.size;
       out.size = compactByScoreNotLessThanThreshold(out.docs.data(), out.scores.data(),
                                                     out.size, minCompetitiveScore);
+      if (SkipStats::enabled && splitIndex > 0) {
+        SkipStats::maxScoreFinalCompactionInput += before;
+        SkipStats::maxScoreFinalCompactionKept += out.size;
+      }
     }
 
     void applyNonEssentialSweeps(ScoreWindow& out) {
       if (splitIndex > 0) {
         skipCount(SkipStats::maxScoreSweepWindows);
+        if (SkipStats::enabled) {
+          SkipStats::maxScoreSweepCalls += 1;
+          SkipStats::maxScoreSweepEntryCandidates += out.size;
+        }
       }
       // The buffer is sorted and already contains only accepted essential
       // candidates. Sweeping one non-essential clause at a time keeps each child
@@ -3571,8 +3588,34 @@ public:
         }
         int32_t before = out.size;
         auto* scorer = scorers[(size_t) windowOrder[s]];
+        const int64_t advancesBefore = SkipStats::applyToCandidatesAdvances;
+        const int64_t matchesBefore = SkipStats::applyToCandidatesMatches;
+        if (SkipStats::enabled) {
+          SkipStats::maxScoreProbeCandidates += out.size;
+          if (required) {
+            SkipStats::maxScoreRequiredProbeCandidates += out.size;
+          } else {
+            SkipStats::maxScoreOptionalProbeCandidates += out.size;
+          }
+          if (s < SkipStats::MAX_SWEEP_LEVELS) {
+            SkipStats::maxScoreProbeCandidatesByLevel[s] += out.size;
+          }
+        }
         out.size = scorer->applyToCandidates(out.docs.data(), out.scores.data(),
                                              out.size, required);
+        if (SkipStats::enabled) {
+          const int64_t advances = SkipStats::applyToCandidatesAdvances - advancesBefore;
+          const int64_t matches = SkipStats::applyToCandidatesMatches - matchesBefore;
+          if (required) {
+            SkipStats::maxScoreRequiredMatches += matches;
+          } else {
+            SkipStats::maxScoreOptionalMatches += matches;
+          }
+          if (s < SkipStats::MAX_SWEEP_LEVELS) {
+            SkipStats::maxScoreAdvancesByLevel[s] += advances;
+            SkipStats::maxScoreMatchesByLevel[s] += matches;
+          }
+        }
         if (required) {
           recordBufferDrops(before, out.size);
         }

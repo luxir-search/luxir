@@ -404,6 +404,9 @@ public:
     int32_t applyToCandidates(int32_t* docs, float* scores,
                               int32_t size, bool required) override {
       assert(size >= 0);
+      const int64_t advanceCallsBefore = SkipStats::advanceCalls;
+      const int64_t wordProbeBeginsBefore = SkipStats::scoredWordProbeAdvances;
+      int32_t matches = 0;
       int32_t write = 0;
       int32_t current = docsEnum.docId();
       int32_t i = 0;
@@ -419,6 +422,7 @@ public:
             int32_t finishOrdAfter = probe.blockStartOrd + 1;
 
             if (probe.numWords == 0) {
+              const int32_t batchStart = i;
               while (i < size && docs[i] <= probe.blockLast) {
                 target = docs[i];
                 assert(target >= (int32_t) probe.docBase);
@@ -441,6 +445,7 @@ public:
                 finishOrdAfter = probe.blockStartOrd + freqIndex + 1;
                 i++;
               }
+              matches += i - batchStart;
             } else {
               // Candidate docs are sorted, so the rank cursor only moves
               // forward. That popcounts each completed 64-doc word at most
@@ -458,6 +463,7 @@ public:
                 advanceRankCursorToWord(probe, cursor, wordIndex);
                 const uint64_t word = probeWord(probe, wordIndex);
                 const bool matched = (word & (1ULL << bit)) != 0;
+                matches += (int32_t) matched;
                 if (matched) {
                   const int32_t ordAfter = cursor.ordBeforeWord
                       + (int32_t) std::popcount(word & lowBitsMask(bit)) + 1;
@@ -509,6 +515,7 @@ public:
           current = docsEnum.docId();
         }
         bool matched = current == target;
+        matches += (int32_t) matched;
         if (matched && simScorer != nullptr) {
           int32_t tf = docsEnum.termFreq();
           int64_t encodedNorm = flatNormsBase != nullptr ? flatNormsBase[target]
@@ -523,6 +530,17 @@ public:
           write++;
         }
         i++;
+      }
+      if (SkipStats::enabled) {
+        const int64_t advances = SkipStats::advanceCalls - advanceCallsBefore;
+        const int64_t wordProbeBegins =
+            SkipStats::scoredWordProbeAdvances - wordProbeBeginsBefore;
+        SkipStats::applyToCandidatesCalls += 1;
+        SkipStats::applyToCandidatesCandidates += size;
+        SkipStats::applyToCandidatesAdvances += advances;
+        SkipStats::applyToCandidatesMatches += matches;
+        SkipStats::applyToCandidatesWordProbeBegins += wordProbeBegins;
+        SkipStats::applyToCandidatesPlainAdvanceFallbacks += advances - wordProbeBegins;
       }
       return required ? write : size;
     }

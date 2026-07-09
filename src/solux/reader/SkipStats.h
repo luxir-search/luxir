@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <cstdint>
 
 namespace solux {
@@ -15,6 +16,8 @@ namespace solux {
 // false), a branch predicted-not-taken, and the counted events are per-block /
 // per-skip, not per-doc.
 struct SkipStats {
+  static constexpr size_t MAX_SWEEP_LEVELS = 16;
+
   static inline bool enabled = false;
 
   // Docs-block body decodes (full 128-doc blocks + the StreamVByte tail). This is
@@ -90,6 +93,32 @@ struct SkipStats {
   static inline int64_t docsOnlyFreqBlocksSkipped = 0;
   static inline int64_t docsOnlyWordProbeAdvances = 0;
   static inline int64_t scoredWordProbeAdvances = 0;
+  // MaxScore non-essential sweep economics. Counter writes are aggregate-only:
+  // candidate-sized batches are added at call boundaries, never from the
+  // per-candidate loops. The generic applyToCandidates totals let the
+  // measurement harness reconcile the per-level MaxScore accounting.
+  static inline int64_t applyToCandidatesCalls = 0;
+  static inline int64_t applyToCandidatesCandidates = 0;
+  static inline int64_t applyToCandidatesAdvances = 0;
+  static inline int64_t applyToCandidatesMatches = 0;
+  static inline int64_t applyToCandidatesWordProbeBegins = 0;
+  static inline int64_t applyToCandidatesPlainAdvanceFallbacks = 0;
+  static inline int64_t maxScoreSweepCalls = 0;
+  static inline int64_t maxScoreSweepEntryCandidates = 0;
+  static inline int64_t maxScoreProbeCandidates = 0;
+  static inline int64_t maxScoreRequiredProbeCandidates = 0;
+  static inline int64_t maxScoreOptionalProbeCandidates = 0;
+  static inline int64_t maxScoreRequiredMatches = 0;
+  static inline int64_t maxScoreOptionalMatches = 0;
+  static inline int64_t maxScoreCompactionInput = 0;
+  static inline int64_t maxScoreCompactionKept = 0;
+  static inline int64_t maxScoreFinalCompactionInput = 0;
+  static inline int64_t maxScoreFinalCompactionKept = 0;
+  static inline std::array<int64_t, MAX_SWEEP_LEVELS> maxScoreProbeCandidatesByLevel{};
+  static inline std::array<int64_t, MAX_SWEEP_LEVELS> maxScoreAdvancesByLevel{};
+  static inline std::array<int64_t, MAX_SWEEP_LEVELS> maxScoreMatchesByLevel{};
+  static inline std::array<int64_t, MAX_SWEEP_LEVELS> maxScoreCompactionInputByLevel{};
+  static inline std::array<int64_t, MAX_SWEEP_LEVELS> maxScoreCompactionKeptByLevel{};
 
   static void reset() {
     docBlocksDecoded = 0;
@@ -146,6 +175,28 @@ struct SkipStats {
     docsOnlyFreqBlocksSkipped = 0;
     docsOnlyWordProbeAdvances = 0;
     scoredWordProbeAdvances = 0;
+    applyToCandidatesCalls = 0;
+    applyToCandidatesCandidates = 0;
+    applyToCandidatesAdvances = 0;
+    applyToCandidatesMatches = 0;
+    applyToCandidatesWordProbeBegins = 0;
+    applyToCandidatesPlainAdvanceFallbacks = 0;
+    maxScoreSweepCalls = 0;
+    maxScoreSweepEntryCandidates = 0;
+    maxScoreProbeCandidates = 0;
+    maxScoreRequiredProbeCandidates = 0;
+    maxScoreOptionalProbeCandidates = 0;
+    maxScoreRequiredMatches = 0;
+    maxScoreOptionalMatches = 0;
+    maxScoreCompactionInput = 0;
+    maxScoreCompactionKept = 0;
+    maxScoreFinalCompactionInput = 0;
+    maxScoreFinalCompactionKept = 0;
+    maxScoreProbeCandidatesByLevel.fill(0);
+    maxScoreAdvancesByLevel.fill(0);
+    maxScoreMatchesByLevel.fill(0);
+    maxScoreCompactionInputByLevel.fill(0);
+    maxScoreCompactionKeptByLevel.fill(0);
   }
 };
 
