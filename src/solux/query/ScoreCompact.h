@@ -58,7 +58,7 @@ inline float competitiveScoreThresholdReference(float minCompetitiveScore,
 }
 
 inline float competitiveScoreThreshold(float minCompetitiveScore, double scoreBoundFactor,
-                                       double bound) {
+                                       double bound, double seed) {
   auto canReach = [&](float score) {
     return scoreCanReach(score, bound, minCompetitiveScore, scoreBoundFactor);
   };
@@ -72,7 +72,6 @@ inline float competitiveScoreThreshold(float minCompetitiveScore, double scoreBo
 
   uint32_t lo = orderedFloatBits(std::numeric_limits<float>::lowest());
   uint32_t hi = orderedFloatBits(std::numeric_limits<float>::max());
-  double seed = (double) minCompetitiveScore / scoreBoundFactor - bound;
   double lowFloat = (double) std::numeric_limits<float>::lowest();
   double highFloat = (double) std::numeric_limits<float>::max();
   if (std::isnan(seed)) {
@@ -130,6 +129,12 @@ inline float competitiveScoreThreshold(float minCompetitiveScore, double scoreBo
     }
   }
   return competitiveScoreThresholdBisection(lo, hi, canReach);
+}
+
+inline float competitiveScoreThreshold(float minCompetitiveScore, double scoreBoundFactor,
+                                       double bound) {
+  double seed = (double) minCompetitiveScore / scoreBoundFactor - bound;
+  return competitiveScoreThreshold(minCompetitiveScore, scoreBoundFactor, bound, seed);
 }
 
 inline int32_t compactByScoreThreshold(int32_t* docs, float* scores, int32_t size,

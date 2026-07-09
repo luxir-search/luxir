@@ -122,6 +122,7 @@ class BooleanQuery final : public solux::Query {
 public:
   static inline bool disableBulkDomainDriveForTests = false;
   static inline bool disableWindowDispatchForTests = false;
+  static inline bool disablePartitionLatchForTests = false;
   static inline bool disableMandOptBulkForTests = false;
   // A/B toggle: force the conjunction onto the eager single-phase path (each
   // clause verifies inside its own advance) instead of two-phase (defer matches
@@ -2977,6 +2978,7 @@ public:
     // s = splitIndex-1 downward.
     std::span<double> nonEssentialPrefixMax;
     std::span<float> compactThresholds;
+    std::span<float> compactThresholdMcs;
     std::span<bool> compactThresholdReady;
     std::span<uint64_t> windowBits;
     // One shared per-window score accumulation row for all fill modes.
@@ -3007,6 +3009,7 @@ public:
     int64_t bs1Windows = 0;
     int64_t domainDriveWindows = 0;
     float minCompetitiveScore = std::numeric_limits<float>::lowest();
+    float nextPartitionMcs = std::numeric_limits<float>::infinity();
     double scoreBoundFactor = 1.0;
 
     static bool lessMaxScore(float a, float b) {
@@ -3033,6 +3036,23 @@ public:
 
     bool canReach(float score, double bound) const {
       return scoreCanReach(score, bound, minCompetitiveScore, scoreBoundFactor);
+    }
+
+    static float firstFloatGreaterThan(double value) {
+      if (std::isnan(value)) {
+        return std::numeric_limits<float>::infinity();
+      }
+      if (value < (double) std::numeric_limits<float>::lowest()) {
+        return std::numeric_limits<float>::lowest();
+      }
+      if (value == std::numeric_limits<double>::infinity()) {
+        return std::numeric_limits<float>::infinity();
+      }
+      float candidate = (float) value;
+      if ((double) candidate <= value) {
+        candidate = std::nextafter(candidate, std::numeric_limits<float>::infinity());
+      }
+      return candidate;
     }
 
     bool lessWindowOrder(int32_t a, int32_t b) const {
@@ -3068,6 +3088,22 @@ public:
         sum = nextSum;
       }
       return s;
+    }
+
+    float computeNextPartitionMcs() const {
+      double sum = 0.0;
+      for (size_t s = 0; s < scorers.size(); s++) {
+        float maxScore = windowMax[(size_t) windowOrder[s]];
+        if (!std::isfinite(maxScore)) {
+          break;
+        }
+        double nextSum = sum + (double) maxScore;
+        if (canReach(0.0f, nextSum)) {
+          return firstFloatGreaterThan(nextSum * scoreBoundFactor);
+        }
+        sum = nextSum;
+      }
+      return std::numeric_limits<float>::infinity();
     }
 
     void markEssentialScorers() {
@@ -3120,6 +3156,7 @@ public:
     void partitionWindow() {
       sortWindowOrder();
       splitIndex = computeWindowSplit();
+      nextPartitionMcs = computeNextPartitionMcs();
       markEssentialScorers();
       std::fill(compactThresholdReady.begin(), compactThresholdReady.end(), false);
       double acc = 0.0;
@@ -3481,10 +3518,21 @@ public:
     }
 
     float cachedCompetitiveThreshold(size_t sweepLevel) {
-      if (!compactThresholdReady[sweepLevel]) {
+      bool refresh = compactThresholdReady[sweepLevel];
+      if (!refresh || compactThresholdMcs[sweepLevel] != minCompetitiveScore) {
+        // A stale threshold from a lower mcs in this partition is the ideal
+        // bisection seed: the exact result moves at most a few ulps.
         compactThresholds[sweepLevel] =
-            competitiveScoreThreshold(minCompetitiveScore, scoreBoundFactor,
-                                      nonEssentialPrefixMax[sweepLevel]);
+            refresh
+              ? competitiveScoreThreshold(minCompetitiveScore, scoreBoundFactor,
+                                          nonEssentialPrefixMax[sweepLevel],
+                                          (double) compactThresholds[sweepLevel])
+              : competitiveScoreThreshold(minCompetitiveScore, scoreBoundFactor,
+                                          nonEssentialPrefixMax[sweepLevel]);
+        if (refresh) {
+          skipCount(SkipStats::maxScoreThresholdRefreshes);
+        }
+        compactThresholdMcs[sweepLevel] = minCompetitiveScore;
         compactThresholdReady[sweepLevel] = true;
       }
       return compactThresholds[sweepLevel];
@@ -3639,6 +3687,7 @@ public:
               isEssential(pool.make_arr<bool>(scorers.size()), scorers.size()),
               nonEssentialPrefixMax(pool.make_arr<double>(scorers.size()), scorers.size()),
               compactThresholds(pool.make_arr<float>(scorers.size()), scorers.size()),
+              compactThresholdMcs(pool.make_arr<float>(scorers.size()), scorers.size()),
               compactThresholdReady(pool.make_arr<bool>(scorers.size()), scorers.size()),
               windowBits(pool.make_arr<uint64_t>((size_t) kWindowWords), (size_t) kWindowWords),
               windowScores(pool.make_arr<float>((size_t) kWindowSize), (size_t) kWindowSize),
@@ -3670,7 +3719,16 @@ public:
       }
       if (minCompetitiveScore > this->minCompetitiveScore) {
         this->minCompetitiveScore = minCompetitiveScore;
-        outerWindowReady = false;
+        bool insideOuterWindow = outerWindowReady && min >= outerWindowStart && min < outerWindowEnd;
+        if (!insideOuterWindow || disablePartitionLatchForTests
+            || minCompetitiveScore >= nextPartitionMcs) {
+          if (insideOuterWindow && !disablePartitionLatchForTests) {
+            skipCount(SkipStats::maxScorePartitionLatchBreaks);
+          }
+          outerWindowReady = false;
+        } else {
+          skipCount(SkipStats::maxScorePartitionLatchReuses);
+        }
       }
 
       if (filter != nullptr && filter->card() == 0) {
@@ -3713,6 +3771,10 @@ public:
             fillSingleEssentialCandidates(out, filter, domainBits, top1Index);
           } else if (top2 >= windowEnd) {
             skipCount(SkipStats::maxScoreTop2Conversions);
+            fillSingleEssentialCandidates(out, filter, domainBits, top1Index);
+          } else if (top2 - kWindowSize / 2 >= top1) {
+            windowEnd = std::min(windowEnd, top2);
+            skipCount(SkipStats::maxScoreHalfWindowClips);
             fillSingleEssentialCandidates(out, filter, domainBits, top1Index);
           } else {
             fillEssentialCandidates(filter, domainBits);
@@ -3820,6 +3882,14 @@ public:
 
     int64_t domainDriveWindowCount() const {
       return domainDriveWindows;
+    }
+
+    float nextPartitionMcsForTests() const {
+      return nextPartitionMcs;
+    }
+
+    int32_t outerWindowEndForTests() const {
+      return outerWindowEnd;
     }
   }; // MaxScoreBulkScorer
 

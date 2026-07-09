@@ -111,6 +111,19 @@ struct WindowDispatchGuard {
   }
 };
 
+struct PartitionLatchGuard {
+  bool saved;
+
+  explicit PartitionLatchGuard(bool disabled)
+    : saved(BooleanQuery::disablePartitionLatchForTests) {
+    BooleanQuery::disablePartitionLatchForTests = disabled;
+  }
+
+  ~PartitionLatchGuard() {
+    BooleanQuery::disablePartitionLatchForTests = saved;
+  }
+};
+
 struct MandOptBulkGuard {
   bool saved;
 
@@ -1010,6 +1023,17 @@ void addWindowDispatchBoundaryDocs(CollectionHelper& helper) {
     if (doc == 7000 || doc == 11000) add("wd_exhaust_b");
     if (doc == 1000) add("wd_rare_driver");
     if (doc >= 7000 && (doc % 3) == 0) add("wd_common_late");
+    if (doc < DocsEnum::L1_DOCS) add("wd_half_exact_a");
+    if (doc >= DocsEnum::L1_DOCS / 2 && doc < DocsEnum::L1_DOCS) add("wd_half_exact_b");
+    if (doc < DocsEnum::L1_DOCS) add("wd_half_inside_a");
+    if (doc >= DocsEnum::L1_DOCS / 2 - 1 && doc < DocsEnum::L1_DOCS) {
+      add("wd_half_inside_b");
+    }
+    if (doc == 0 || doc == 3000) add("wd_half_gap_a");
+    if (doc >= DocsEnum::L1_DOCS / 2 && doc < DocsEnum::L1_DOCS) add("wd_half_gap_b");
+    if ((doc % 2) == 0) add("wd_latch_low");
+    if (doc >= 1000 && doc < 12000 && (doc % 2) == 0) add("wd_latch_a");
+    if (doc >= 7000 && doc < 12000 && (doc % 2) == 0) add("wd_latch_b");
     if ((doc % 2) == 0) add("wd_dead_dense_a");
     if ((doc % 3) == 0) add("wd_dead_dense_b");
 
@@ -1495,6 +1519,10 @@ struct BulkWindowRun {
   int64_t deadOuterJumps = 0;
   int64_t anchorJumps = 0;
   int64_t top2Conversions = 0;
+  int64_t halfWindowClips = 0;
+  int64_t partitionLatchReuses = 0;
+  int64_t partitionLatchBreaks = 0;
+  int64_t thresholdRefreshes = 0;
 };
 
 BulkWindowRun collectBulkWindows(IndexReader& reader, std::span<const std::string_view> terms,
@@ -1529,6 +1557,10 @@ BulkWindowRun collectBulkWindows(IndexReader& reader, std::span<const std::strin
   run.deadOuterJumps = SkipStats::maxScoreDeadOuterJumps;
   run.anchorJumps = SkipStats::maxScoreAnchorJumps;
   run.top2Conversions = SkipStats::maxScoreTop2Conversions;
+  run.halfWindowClips = SkipStats::maxScoreHalfWindowClips;
+  run.partitionLatchReuses = SkipStats::maxScorePartitionLatchReuses;
+  run.partitionLatchBreaks = SkipStats::maxScorePartitionLatchBreaks;
+  run.thresholdRefreshes = SkipStats::maxScoreThresholdRefreshes;
   return run;
 }
 
@@ -5959,6 +5991,124 @@ TEST_F(TermScorerTest, MaxScoreBulkScorerWindowDispatchBoundaryCasesMatchDisable
   EXPECT_GT(convertedRun.top2Conversions, 0);
   ASSERT_FALSE(convertedRun.docs.empty());
   EXPECT_EQ(convertedRun.docs[0], 1000);
+
+  std::array<std::string_view, 2> halfExact = {"wd_half_exact_a", "wd_half_exact_b"};
+  auto halfExactRun = assertParity(halfExact, 0, maxDoc, 0.0f);
+  EXPECT_GT(halfExactRun.halfWindowClips, 0);
+
+  std::array<std::string_view, 2> halfInside = {"wd_half_inside_a", "wd_half_inside_b"};
+  auto halfInsideRun = assertParity(halfInside, 0, maxDoc, 0.0f);
+  EXPECT_EQ(halfInsideRun.halfWindowClips, 0);
+
+  std::array<std::string_view, 2> halfGap = {"wd_half_gap_a", "wd_half_gap_b"};
+  auto halfGapRun = assertParity(halfGap, 0, maxDoc, 0.0f);
+  EXPECT_GT(halfGapRun.halfWindowClips, 0);
+
+  auto tinyRun = assertParity(halfExact, 0, 100, 0.0f);
+  EXPECT_EQ(tinyRun.halfWindowClips, 0);
+  helper.clear();
+}
+
+TEST_F(TermScorerTest, MaxScoreBulkScorerPartitionLatchBoundaryCounters) {
+  CollectionHelper helper("partition_latch_boundary");
+  addWindowDispatchBoundaryDocs(helper);
+  auto reader = helper.getIndexWriter()->getIndexReader();
+  const int32_t maxDoc = 3 * DocsEnum::L1_DOCS + 100;
+  std::array<std::string_view, 3> terms = {"wd_latch_low", "wd_latch_a", "wd_latch_b"};
+
+  auto setup = [&](MemPool& pool, Query::Context& qContext) {
+    auto& segment = qContext.topReader.segments()[0];
+    auto* bulk = createBulkTermDisjunctionScorer(pool, qContext, segment, terms);
+    auto* maxScoreBulk = dynamic_cast<BooleanQuery::MaxScoreBulkScorer*>(bulk);
+    EXPECT_NE(maxScoreBulk, nullptr);
+    ScoreWindow window;
+    int32_t next = maxScoreBulk->scoreNextWindow(window, nullptr, 0, maxDoc, 0.0f);
+    EXPECT_NE(next, PostingsReader::END);
+    EXPECT_LT(next, maxScoreBulk->outerWindowEndForTests());
+    return std::pair<BooleanQuery::MaxScoreBulkScorer*, int32_t>(maxScoreBulk, next);
+  };
+
+  float boundary = 0.0f;
+  {
+    PartitionLatchGuard latchEnabled(false);
+    SkipStatsGuard stats;
+    MemPool pool;
+    Query::Context qContext(pool, *reader);
+    auto [bulk, next] = setup(pool, qContext);
+    ASSERT_NE(bulk, nullptr);
+    boundary = bulk->nextPartitionMcsForTests();
+    ASSERT_TRUE(std::isfinite(boundary));
+    float belowBoundary = std::nextafter(boundary, -std::numeric_limits<float>::infinity());
+    ASSERT_GT(belowBoundary, 0.0f);
+    ScoreWindow window;
+    bulk->scoreNextWindow(window, nullptr, next, maxDoc, belowBoundary);
+    EXPECT_GT(SkipStats::maxScorePartitionLatchReuses, 0);
+    EXPECT_EQ(SkipStats::maxScorePartitionLatchBreaks, 0);
+  }
+
+  {
+    PartitionLatchGuard latchEnabled(false);
+    SkipStatsGuard stats;
+    MemPool pool;
+    Query::Context qContext(pool, *reader);
+    auto [bulk, next] = setup(pool, qContext);
+    ASSERT_NE(bulk, nullptr);
+    ASSERT_EQ(std::bit_cast<uint32_t>(bulk->nextPartitionMcsForTests()),
+              std::bit_cast<uint32_t>(boundary));
+    ScoreWindow window;
+    bulk->scoreNextWindow(window, nullptr, next, maxDoc, boundary);
+    EXPECT_GT(SkipStats::maxScorePartitionLatchBreaks, 0);
+  }
+
+  {
+    PartitionLatchGuard latchEnabled(false);
+    SkipStatsGuard stats;
+    MemPool pool;
+    Query::Context qContext(pool, *reader);
+    auto& segment = qContext.topReader.segments()[0];
+    auto* bulk = createBulkTermDisjunctionScorer(pool, qContext, segment, terms);
+    auto* maxScoreBulk = dynamic_cast<BooleanQuery::MaxScoreBulkScorer*>(bulk);
+    ASSERT_NE(maxScoreBulk, nullptr);
+    ScoreWindow window;
+    int32_t next = maxScoreBulk->scoreNextWindow(window, nullptr, 0, maxDoc, boundary);
+    ASSERT_NE(next, PostingsReader::END);
+    ASSERT_LT(next, maxScoreBulk->outerWindowEndForTests());
+    float nextBoundary = maxScoreBulk->nextPartitionMcsForTests();
+    ASSERT_TRUE(std::isfinite(nextBoundary));
+    float belowNextBoundary =
+        std::nextafter(nextBoundary, -std::numeric_limits<float>::infinity());
+    ASSERT_GT(belowNextBoundary, boundary);
+    maxScoreBulk->scoreNextWindow(window, nullptr, next, maxDoc, belowNextBoundary);
+    EXPECT_GT(SkipStats::maxScorePartitionLatchReuses, 0);
+    EXPECT_GT(SkipStats::maxScoreThresholdRefreshes, 0);
+  }
+
+  helper.clear();
+}
+
+TEST_F(TermScorerTest, MaxScoreBulkScorerPartitionLatchMatchesDisabledAcrossRisingTheta) {
+  CollectionHelper helper("partition_latch_oracle");
+  const int32_t maxClauses = 8;
+  addSweepDisjunctionDocs(helper, maxClauses);
+  auto reader = helper.getIndexWriter()->getIndexReader();
+  auto termStrings = makeSweepTermStrings(maxClauses);
+  auto views = termViews(termStrings);
+
+  BulkDomainDriveGuard domainGuard(true);
+  for (int32_t clauses = 2; clauses <= maxClauses; clauses++) {
+    std::span<const std::string_view> terms(views.data(), (size_t) clauses);
+    PartitionLatchGuard disabledLatch(true);
+    auto disabled = runFilteredBulkTermDisjunctionTopK(*reader, terms, clauses + 3);
+    {
+      PartitionLatchGuard enabledLatch(false);
+      SkipStatsGuard stats;
+      auto enabled = runFilteredBulkTermDisjunctionTopK(*reader, terms, clauses + 3);
+      assertSameTopKDocs(disabled, enabled, clauses + 3);
+      auto exhaustive = runFilteredExhaustiveTermDisjunctionTopK(*reader, terms, clauses + 3);
+      assertSameTopKDocs(exhaustive, enabled, clauses + 3);
+    }
+  }
+
   helper.clear();
 }
 
@@ -5977,6 +6127,19 @@ TEST_F(TermScorerTest, MaxScoreBulkScorerWindowDispatchSkipStatsCountersFire) {
   auto anchoredRun = collectBulkWindows(*reader, anchoredTerms, 0, maxDoc, 0.0f, false);
   EXPECT_GT(anchoredRun.anchorJumps, 0);
   EXPECT_GT(anchoredRun.top2Conversions, 0);
+
+  std::array<std::string_view, 2> halfTerms = {"wd_half_exact_a", "wd_half_exact_b"};
+  auto halfRun = collectBulkWindows(*reader, halfTerms, 0, maxDoc, 0.0f, false);
+  EXPECT_GT(halfRun.halfWindowClips, 0);
+
+  std::array<std::string_view, 3> latchTerms = {"wd_latch_low", "wd_latch_a", "wd_latch_b"};
+  {
+    PartitionLatchGuard latchEnabled(false);
+    SkipStatsGuard stats;
+    auto latchRun = runFilteredBulkTermDisjunctionTopK(*reader, latchTerms, 3);
+    unused(latchRun);
+    EXPECT_GT(SkipStats::maxScorePartitionLatchReuses, 0);
+  }
   helper.clear();
 }
 

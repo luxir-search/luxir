@@ -65,6 +65,10 @@ struct SkipStats {
   static inline int64_t maxScoreDeadOuterJumps = 0;
   static inline int64_t maxScoreAnchorJumps = 0;
   static inline int64_t maxScoreTop2Conversions = 0;
+  static inline int64_t maxScorePartitionLatchReuses = 0;
+  static inline int64_t maxScorePartitionLatchBreaks = 0;
+  static inline int64_t maxScoreThresholdRefreshes = 0;
+  static inline int64_t maxScoreHalfWindowClips = 0;
   static inline int64_t mandOptWindowSkips = 0;
   static inline int64_t mandOptConjunctionWindows = 0;
   static inline int64_t mandOptWindowEvals = 0;
@@ -119,6 +123,10 @@ struct SkipStats {
     maxScoreDeadOuterJumps = 0;
     maxScoreAnchorJumps = 0;
     maxScoreTop2Conversions = 0;
+    maxScorePartitionLatchReuses = 0;
+    maxScorePartitionLatchBreaks = 0;
+    maxScoreThresholdRefreshes = 0;
+    maxScoreHalfWindowClips = 0;
     mandOptWindowSkips = 0;
     mandOptConjunctionWindows = 0;
     mandOptWindowEvals = 0;

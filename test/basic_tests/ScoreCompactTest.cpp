@@ -183,6 +183,58 @@ TEST(ScoreCompactTest, CompetitiveThresholdMatchesCanReach) {
   }
 }
 
+TEST(ScoreCompactTest, CompetitiveThresholdSeedOverloadMatchesReference) {
+  double nearFactor = 1.0 + (double) 7 * 0x1p-24;
+  std::vector<ThresholdCase> cases = {
+    {0.0f, 1.0, 0.0},
+    {1.0f, 1.0, 0.0},
+    {-1.0f, 1.0, 0.0},
+    {std::numeric_limits<float>::infinity(), 1.0, 0.0},
+    {-std::numeric_limits<float>::infinity(), 1.0, 0.0},
+    {42.0f, nearFactor, 42.0 / nearFactor},
+    {42.0f, nearFactor, 42.0 / nearFactor - 0x1p-40},
+    {42.0f, nearFactor, 42.0 / nearFactor + 0x1p-40},
+    {std::numeric_limits<float>::max(), nearFactor,
+     (double) std::numeric_limits<float>::max() / nearFactor - 1.0e30},
+    {1.0f, 1.0, 1.0e20},
+    {1.0f, 1.0, -1.0e20}
+  };
+
+  for (const auto& testCase : cases) {
+    float expected = competitiveScoreThresholdReference(testCase.minCompetitiveScore,
+                                                        testCase.scoreBoundFactor,
+                                                        testCase.bound);
+    std::vector<float> seeds = {
+      -std::numeric_limits<float>::infinity(),
+      std::numeric_limits<float>::infinity(),
+      std::numeric_limits<float>::lowest(),
+      std::numeric_limits<float>::max(),
+      -128.0f,
+      0.0f,
+      128.0f,
+      expected
+    };
+    if (std::isfinite(expected)) {
+      seeds.push_back(std::nextafter(expected, -std::numeric_limits<float>::infinity()));
+      seeds.push_back(std::nextafter(expected, std::numeric_limits<float>::infinity()));
+      seeds.push_back(expected - 16.0f);
+      seeds.push_back(expected + 16.0f);
+    }
+
+    for (float seed : seeds) {
+      SCOPED_TRACE(::testing::Message()
+                   << "mcs=" << testCase.minCompetitiveScore
+                   << " factor=" << testCase.scoreBoundFactor
+                   << " bound=" << testCase.bound
+                   << " seed=" << seed);
+      float actual = competitiveScoreThreshold(testCase.minCompetitiveScore,
+                                               testCase.scoreBoundFactor,
+                                               testCase.bound, seed);
+      EXPECT_EQ(std::bit_cast<uint32_t>(actual), std::bit_cast<uint32_t>(expected));
+    }
+  }
+}
+
 TEST(ScoreCompactTest, CompactByScoreThresholdMatchesReference) {
   float thresholds[] = {
     1.0f,

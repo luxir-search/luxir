@@ -1506,6 +1506,10 @@ static void BM_SkipEffectiveness(benchmark::State& state,
   int64_t l0Steps = SkipStats::l0HeaderSteps;
   int64_t l1Steps = SkipStats::l1GroupSteps;
   int64_t advanceCalls = SkipStats::advanceCalls;
+  int64_t partitionLatchReuses = SkipStats::maxScorePartitionLatchReuses;
+  int64_t partitionLatchBreaks = SkipStats::maxScorePartitionLatchBreaks;
+  int64_t thresholdRefreshes = SkipStats::maxScoreThresholdRefreshes;
+  int64_t halfWindowClips = SkipStats::maxScoreHalfWindowClips;
   SkipStats::reset();
   ScoreTopKResult exhaustive = runMultiTermDisjunctionTopK(*reader, terms, topK, useFrontier, false);
   int64_t blocksTotal = SkipStats::docBlocksDecoded;
@@ -1528,6 +1532,10 @@ static void BM_SkipEffectiveness(benchmark::State& state,
   state.counters["l0_header_steps"] = (double) l0Steps;
   state.counters["l1_group_steps"] = (double) l1Steps;
   state.counters["advance_calls"] = (double) advanceCalls;
+  state.counters["partition_latch_reuses"] = (double) partitionLatchReuses;
+  state.counters["partition_latch_breaks"] = (double) partitionLatchBreaks;
+  state.counters["threshold_refreshes"] = (double) thresholdRefreshes;
+  state.counters["half_window_clips"] = (double) halfWindowClips;
   state.counters["visited"] = (double) pruned.visited;
   state.counters["reused"] = reuseIndex;
   state.counters["rate"] = benchmark::Counter(state.iterations(), benchmark::Counter::kIsRate);
