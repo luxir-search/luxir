@@ -90,6 +90,10 @@ struct SkipStats {
   static inline int64_t conjDenseCountWindows = 0;
   static inline int64_t conjCountFallbacks = 0;
   static inline int64_t bulkDomainWindowsFed = 0;
+  static inline int64_t numericRangeSparseVerifyArms = 0;
+  static inline int64_t numericRangeComplementArms = 0;
+  static inline int64_t numericRangePointsArms = 0;
+  static inline int64_t numericRangeZoneArms = 0;
   static inline int64_t docsOnlyFreqBlocksSkipped = 0;
   static inline int64_t docsOnlyWordProbeAdvances = 0;
   static inline int64_t scoredWordProbeAdvances = 0;
@@ -172,6 +176,10 @@ struct SkipStats {
     conjDenseCountWindows = 0;
     conjCountFallbacks = 0;
     bulkDomainWindowsFed = 0;
+    numericRangeSparseVerifyArms = 0;
+    numericRangeComplementArms = 0;
+    numericRangePointsArms = 0;
+    numericRangeZoneArms = 0;
     docsOnlyFreqBlocksSkipped = 0;
     docsOnlyWordProbeAdvances = 0;
     scoredWordProbeAdvances = 0;

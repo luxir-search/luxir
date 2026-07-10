@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <cstring>
 #include <limits>
+#include <span>
 #include <stdexcept>
 #include <vector>
 
@@ -83,6 +84,19 @@ class PointsReader {
   }
 
 public:
+  struct FenceRange {
+    uint32_t firstLeaf = 0;
+    uint32_t lastLeaf = 0;
+    uint64_t firstOrdinal = 0;
+    uint64_t endOrdinal = 0;
+    bool empty = true;
+  };
+
+  struct LeafValueBounds {
+    uint16_t lower = 0;
+    uint16_t upper = 0;
+  };
+
   struct Point {
     int64_t value;
     int32_t docid;
@@ -116,6 +130,141 @@ public:
   uint16_t maxPointsPerLeaf() const { return leafSizeMax; }
   uint32_t flags() const { return metadataFlags; }
 
+  uint64_t leafOrdinalStart(uint32_t leafIndex) const {
+    if (leafIndex >= leavesCount) throw std::out_of_range("PointsReader: leaf index");
+    return (uint64_t)leafIndex * leafSizeMax;
+  }
+
+  uint64_t leafOrdinalEnd(uint32_t leafIndex) const {
+    return std::min(pointsCount, leafOrdinalStart(leafIndex) + leafSizeMax);
+  }
+
+  FenceRange fenceRange(int64_t lo, int64_t hi) const {
+    FenceRange range;
+    if (hi < lo) return range;
+
+    uint32_t leftLo = 0;
+    uint32_t leftHi = leavesCount;
+    while (leftLo < leftHi) {
+      uint32_t mid = leftLo + (leftHi - leftLo) / 2;
+      if (leafMax(mid) < lo) leftLo = mid + 1;
+      else leftHi = mid;
+    }
+
+    uint32_t rightLo = 0;
+    uint32_t rightHi = leavesCount;
+    while (rightLo < rightHi) {
+      uint32_t mid = rightLo + (rightHi - rightLo) / 2;
+      if (leafMin(mid) <= hi) rightLo = mid + 1;
+      else rightHi = mid;
+    }
+    if (leftLo >= rightLo) return range;
+
+    range.firstLeaf = leftLo;
+    range.lastLeaf = rightLo - 1;
+    range.firstOrdinal = leafOrdinalStart(range.firstLeaf);
+    range.endOrdinal = leafOrdinalEnd(range.lastLeaf);
+    range.empty = false;
+    return range;
+  }
+
+  LeafValueBounds valueBounds(uint32_t leafIndex, int64_t lo, int64_t hi,
+                              std::span<uint32_t> residualScratch,
+                              std::span<int64_t> rawScratch) const {
+    LeafInfo info = leafInfo(leafIndex);
+    LeafValueBounds bounds;
+    int64_t min = leafMin(leafIndex);
+    int64_t max = leafMax(leafIndex);
+    if (hi < min || max < lo) return bounds;
+    if (lo <= min && max <= hi) return {0, info.count};
+
+    const char* payload = points + leafFP(leafIndex) + PointsWriter::LEAF_HEADER_SIZE
+                        + info.docBytes;
+    if (info.valueFormat <= 32) {
+      if (residualScratch.size() < info.count) {
+        throw std::invalid_argument("PointsReader: residual scratch is too small");
+      }
+      IndexCodec::numericCodec.decodeWithMeta(payload, residualScratch.data(),
+                                               info.count, info.valueFormat);
+      uint64_t lower = 0;
+      if (lo > min) {
+        uint64_t delta = (uint64_t)lo - (uint64_t)min;
+        lower = delta / info.valueGcd + (delta % info.valueGcd != 0);
+      }
+      uint64_t upper = ((uint64_t)max - (uint64_t)min) / info.valueGcd;
+      if (hi < max) {
+        upper = ((uint64_t)hi - (uint64_t)min) / info.valueGcd;
+      }
+      if (lower > UINT32_MAX) return bounds;
+      uint32_t lowerResidual = (uint32_t)lower;
+      uint32_t upperResidual = upper > UINT32_MAX ? UINT32_MAX : (uint32_t)upper;
+      auto values = residualScratch.first(info.count);
+      bounds.lower = (uint16_t)(std::lower_bound(values.begin(), values.end(),
+                                                  lowerResidual) - values.begin());
+      bounds.upper = (uint16_t)(std::upper_bound(values.begin(), values.end(),
+                                                  upperResidual) - values.begin());
+      return bounds;
+    }
+
+    if (rawScratch.size() < info.count) {
+      throw std::invalid_argument("PointsReader: raw scratch is too small");
+    }
+    memcpy(rawScratch.data(), payload, (size_t)info.count * sizeof(int64_t));
+    auto values = rawScratch.first(info.count);
+    bounds.lower = (uint16_t)(std::lower_bound(values.begin(), values.end(), lo)
+                               - values.begin());
+    bounds.upper = (uint16_t)(std::upper_bound(values.begin(), values.end(), hi)
+                               - values.begin());
+    return bounds;
+  }
+
+  template <class EmitDoc, class EmitRun>
+  void emitDocids(uint32_t leafIndex, uint16_t begin, uint16_t end,
+                  std::span<uint32_t> docScratch, EmitDoc emitDoc,
+                  EmitRun emitRun) const {
+    LeafInfo info = leafInfo(leafIndex);
+    if (begin > end || end > info.count) {
+      throw std::out_of_range("PointsReader: leaf point range");
+    }
+    if (begin == end) return;
+    if (info.docCodec == PointsWriter::DOC_CONTIG) {
+      emitRun((int32_t)(info.docBase + begin), (int32_t)(info.docBase + end));
+      return;
+    }
+    if (info.docCodec != PointsWriter::DOC_FOR) invalid("reserved docid codec");
+    if (docScratch.size() < info.count) {
+      throw std::invalid_argument("PointsReader: docid scratch is too small");
+    }
+    const char* payload = points + leafFP(leafIndex) + PointsWriter::LEAF_HEADER_SIZE;
+    IndexCodec::numericCodec.decodeWithMeta(payload, docScratch.data(), info.count,
+                                             info.docBits);
+    for (uint16_t i = begin; i < end; i++) {
+      uint64_t doc = (uint64_t)info.docBase + docScratch[i];
+      if (doc > (uint64_t)std::numeric_limits<int32_t>::max()) {
+        invalid("decoded docid exceeds int32");
+      }
+      emitDoc((int32_t)doc);
+    }
+  }
+
+  template <class EmitDoc, class EmitRun>
+  void emitOrdinalRange(uint64_t begin, uint64_t end,
+                        std::span<uint32_t> docScratch, EmitDoc emitDoc,
+                        EmitRun emitRun) const {
+    if (begin > end || end > pointsCount) {
+      throw std::out_of_range("PointsReader: point ordinal range");
+    }
+    while (begin < end) {
+      uint32_t leafIndex = (uint32_t)(begin / leafSizeMax);
+      uint64_t leafStart = leafOrdinalStart(leafIndex);
+      uint64_t leafEnd = leafOrdinalEnd(leafIndex);
+      uint64_t partEnd = std::min(end, leafEnd);
+      emitDocids(leafIndex, (uint16_t)(begin - leafStart),
+                 (uint16_t)(partEnd - leafStart), docScratch, emitDoc, emitRun);
+      begin = partEnd;
+    }
+  }
+
   void validate() const {
     uint64_t countedPoints = 0;
     for (uint32_t i = 0; i < leavesCount; i++) {
@@ -130,6 +279,9 @@ public:
 
       auto info = leafInfo(i);
       if (info.count == 0 || info.count > leafSizeMax) invalid("invalid leaf point count");
+      if (i + 1 < leavesCount && info.count != leafSizeMax) {
+        invalid("non-final leaf is not full");
+      }
       if (info.valueMin != leafMin(i)) invalid("leaf valueMin does not match directory");
       if (info.valueGcd == 0) invalid("valueGcd must be positive");
       if (info.docBase > (uint32_t)std::numeric_limits<int32_t>::max()) invalid("docBase exceeds int32");

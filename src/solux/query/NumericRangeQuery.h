@@ -6,10 +6,13 @@
 #include <limits>
 #include <span>
 #include <string_view>
+#include <tuple>
+#include <type_traits>
 #include <vector>
 
 #include "solux/query/Query.h"
 #include "solux/reader/IntColReader.h"
+#include "solux/reader/PointsReader.h"
 
 namespace solux {
 
@@ -523,6 +526,258 @@ public:
     }
   };
 
+  class PointsArrayScorer final : public Query::Scorer {
+    std::span<const int32_t> docs;
+    int64_t index = -1;
+    int32_t docid = -1;
+
+  public:
+    explicit PointsArrayScorer(std::span<const int32_t> docs) : docs(docs) {}
+
+    int32_t next() override {
+      assert(docid != PostingsReader::END);
+      index++;
+      return docid = index < (int64_t)docs.size()
+          ? docs[(size_t)index] : PostingsReader::END;
+    }
+
+    int32_t advance(int32_t target) override {
+      assert(docid < target);
+      auto begin = docs.begin() + std::min<int64_t>(index + 1, docs.size());
+      auto found = std::lower_bound(begin, docs.end(), target);
+      index = found - docs.begin();
+      return docid = found == docs.end() ? PostingsReader::END : *found;
+    }
+
+    int32_t docId() override { return docid; }
+    float score() override { return 0.0f; }
+  };
+
+  class PointsBitScorer final : public Query::Scorer {
+    FixedBitSet bits;
+    int32_t docid = -1;
+
+    int32_t seek(int32_t target) {
+      if (target >= bits.size()) return docid = PostingsReader::END;
+      int32_t found = bits.nextSetBit(target);
+      return docid = found == FixedBitSet::MAX_INDEX
+          ? PostingsReader::END : found;
+    }
+
+  public:
+    explicit PointsBitScorer(FixedBitSet bits) : bits(bits) {}
+
+    int32_t next() override {
+      assert(docid != PostingsReader::END);
+      return seek(docid + 1);
+    }
+    int32_t advance(int32_t target) override {
+      assert(docid < target);
+      return seek(target);
+    }
+    int32_t docId() override { return docid; }
+    float score() override { return 0.0f; }
+  };
+
+  class PointsArrayBulkScorer final : public BulkScorer {
+    std::span<const int32_t> docs;
+    std::span<int32_t> outDocs;
+    std::span<float> outScores;
+
+    bool accepted(DocSet* filter, int32_t doc) const {
+      return filter == nullptr || filter->get(doc);
+    }
+
+  public:
+    PointsArrayBulkScorer(MemPool& pool, std::span<const int32_t> docs)
+        : docs(docs), outDocs(pool.make_span<int32_t>(docs.size())),
+          outScores(pool.make_span<float>(docs.size())) {}
+
+    int32_t countNextWindow(int64_t& count, DocSetBuilder* domainOut,
+                            DocSet* filter, int32_t min, int32_t max) override {
+      if (min >= max || (filter != nullptr && filter->card() == 0)) {
+        return PostingsReader::END;
+      }
+      auto begin = std::lower_bound(docs.begin(), docs.end(), min);
+      auto end = std::lower_bound(begin, docs.end(), max);
+      for (auto it = begin; it != end; ++it) {
+        if (!accepted(filter, *it)) continue;
+        if (domainOut != nullptr) domainOut->add(*it);
+        count++;
+      }
+      if (domainOut != nullptr) skipCount(SkipStats::bulkDomainWindowsFed);
+      return PostingsReader::END;
+    }
+
+    int32_t scoreNextWindow(ScoreWindow& out, DocSet* filter, int32_t min,
+                            int32_t max, float minCompetitiveScore) override {
+      out.min = min;
+      out.max = max;
+      out.size = 0;
+      out.docs = outDocs;
+      out.scores = outScores;
+      if (min >= max || minCompetitiveScore > 0.0f
+          || (filter != nullptr && filter->card() == 0)) {
+        return PostingsReader::END;
+      }
+      auto begin = std::lower_bound(docs.begin(), docs.end(), min);
+      auto end = std::lower_bound(begin, docs.end(), max);
+      for (auto it = begin; it != end; ++it) {
+        if (!accepted(filter, *it)) continue;
+        outDocs[(size_t)out.size] = *it;
+        outScores[(size_t)out.size] = 0.0f;
+        out.size++;
+      }
+      return PostingsReader::END;
+    }
+  };
+
+  class PointsBitBulkScorer final : public BulkScorer {
+    static constexpr int32_t WINDOW_SIZE = 4096;
+    static constexpr int32_t WINDOW_WORDS = WINDOW_SIZE / 64;
+
+    FixedBitSet bits;
+    std::span<uint64_t> windowBits;
+    std::span<int32_t> outDocs;
+    std::span<float> outScores;
+    int32_t windowStart = 0;
+    int32_t windowEnd = 0;
+
+    static uint64_t validMask(int32_t remaining) {
+      if (remaining >= 64) return ~0ULL;
+      if (remaining <= 0) return 0;
+      return (1ULL << remaining) - 1ULL;
+    }
+
+    void loadSource(int32_t min, int32_t max) {
+      windowStart = min;
+      windowEnd = (int32_t)std::min<int64_t>(
+          std::min(bits.size(), max), (int64_t)min + WINDOW_SIZE);
+      int32_t sourceWords = (int32_t)FixedBitSet::sizeInWords(bits.size());
+      for (int32_t w = 0; w < WINDOW_WORDS; w++) {
+        int32_t firstDoc = windowStart + (w << 6);
+        int32_t remaining = windowEnd - firstDoc;
+        if (remaining <= 0) {
+          windowBits[(size_t)w] = 0;
+          continue;
+        }
+        int32_t sourceWord = firstDoc >> 6;
+        int32_t shift = firstDoc & 63;
+        uint64_t source = sourceWord < sourceWords
+            ? bits.words[sourceWord] >> shift : 0;
+        if (shift != 0 && sourceWord + 1 < sourceWords) {
+          source |= bits.words[sourceWord + 1] << (64 - shift);
+        }
+        windowBits[(size_t)w] = source & validMask(remaining);
+      }
+    }
+
+    void applyFilter(DocSet* filter) {
+      if (filter == nullptr) return;
+      if (filter->type == DocSet::BITSET) {
+        const auto& filterBits = ((BitDocSet*)filter)->bits();
+        int32_t sourceWords = (int32_t)FixedBitSet::sizeInWords(filterBits.size());
+        for (int32_t w = 0; w < WINDOW_WORDS; w++) {
+          int32_t firstDoc = windowStart + (w << 6);
+          int32_t remaining = windowEnd - firstDoc;
+          if (remaining <= 0) continue;
+          int32_t sourceWord = firstDoc >> 6;
+          int32_t shift = firstDoc & 63;
+          uint64_t source = sourceWord < sourceWords
+              ? filterBits.words[sourceWord] >> shift : 0;
+          if (shift != 0 && sourceWord + 1 < sourceWords) {
+            source |= filterBits.words[sourceWord + 1] << (64 - shift);
+          }
+          windowBits[(size_t)w] &= source & validMask(remaining);
+        }
+        return;
+      }
+      int32_t nbits = windowEnd - windowStart;
+      for (int32_t w = 0; w < WINDOW_WORDS; w++) {
+        uint64_t word = windowBits[(size_t)w];
+        while (word != 0) {
+          int32_t bit = (int32_t)std::countr_zero(word);
+          int32_t index = (w << 6) + bit;
+          if (index >= nbits) break;
+          if (!filter->get(windowStart + index)) {
+            windowBits[(size_t)w] &= ~(1ULL << bit);
+          }
+          word &= word - 1;
+        }
+      }
+    }
+
+    int32_t cardinality() const {
+      int32_t count = 0;
+      for (uint64_t word : windowBits) count += (int32_t)std::popcount(word);
+      return count;
+    }
+
+    void fillWindow(DocSet* filter, int32_t min, int32_t max) {
+      loadSource(min, max);
+      applyFilter(filter);
+    }
+
+  public:
+    PointsBitBulkScorer(MemPool& pool, FixedBitSet bits)
+        : bits(bits),
+          windowBits(pool.make_span<uint64_t>(WINDOW_WORDS)),
+          outDocs(pool.make_span<int32_t>(WINDOW_SIZE)),
+          outScores(pool.make_span<float>(WINDOW_SIZE)) {}
+
+    int32_t countNextWindow(int64_t& count, DocSetBuilder* domainOut,
+                            DocSet* filter, int32_t min, int32_t max) override {
+      max = std::min(max, bits.size());
+      if (min >= max || (filter != nullptr && filter->card() == 0)) {
+        return PostingsReader::END;
+      }
+      fillWindow(filter, min, max);
+      if (domainOut != nullptr) {
+        skipCount(SkipStats::bulkDomainWindowsFed);
+        domainOut->addWindowWords(windowBits.data(), windowStart, windowEnd);
+      }
+      count += cardinality();
+      return windowEnd >= max ? PostingsReader::END : windowEnd;
+    }
+
+    int32_t scoreNextWindow(ScoreWindow& out, DocSet* filter, int32_t min,
+                            int32_t max, float minCompetitiveScore) override {
+      max = std::min(max, bits.size());
+      out.min = min;
+      out.max = min;
+      out.size = 0;
+      out.docs = outDocs;
+      out.scores = outScores;
+      if (min >= max || (filter != nullptr && filter->card() == 0)) {
+        return PostingsReader::END;
+      }
+      fillWindow(filter, min, max);
+      out.min = windowStart;
+      out.max = windowEnd;
+      if (minCompetitiveScore <= 0.0f) {
+        int32_t nbits = windowEnd - windowStart;
+        for (int32_t w = 0; w < WINDOW_WORDS; w++) {
+          uint64_t word = windowBits[(size_t)w];
+          while (word != 0) {
+            int32_t bit = (int32_t)std::countr_zero(word);
+            int32_t index = (w << 6) + bit;
+            if (index >= nbits) break;
+            outDocs[(size_t)out.size] = windowStart + index;
+            outScores[(size_t)out.size] = 0.0f;
+            out.size++;
+            word &= word - 1;
+          }
+        }
+      }
+      return windowEnd >= max ? PostingsReader::END : windowEnd;
+    }
+  };
+
+  static_assert(std::is_trivially_destructible_v<PointsArrayScorer>);
+  static_assert(std::is_trivially_destructible_v<PointsBitScorer>);
+  static_assert(std::is_trivially_destructible_v<PointsArrayBulkScorer>);
+  static_assert(std::is_trivially_destructible_v<PointsBitBulkScorer>);
+
   class Weight final : public Query::Weight {
     NumericRangeQuery& query;
     std::span<SegFieldInfo*> segInfos;
@@ -546,6 +801,21 @@ public:
       return std::min<int64_t>(estimate, reader.docsWithValue());
     }
 
+    static std::pair<uint64_t, uint64_t> exactPointPositions(
+        PointsReader& points, const PointsReader::FenceRange& fence,
+        int64_t lo, int64_t hi, std::span<uint32_t> residualScratch,
+        std::span<int64_t> rawScratch) {
+      auto first = points.valueBounds(fence.firstLeaf, lo, hi,
+                                      residualScratch, rawScratch);
+      uint64_t loPos = points.leafOrdinalStart(fence.firstLeaf) + first.lower;
+      if (fence.firstLeaf == fence.lastLeaf) {
+        return {loPos, points.leafOrdinalStart(fence.firstLeaf) + first.upper};
+      }
+      auto last = points.valueBounds(fence.lastLeaf, lo, hi,
+                                     residualScratch, rawScratch);
+      return {loPos, points.leafOrdinalStart(fence.lastLeaf) + last.upper};
+    }
+
     bool segmentInfo(IndexReader::Segment& segment, SegFieldInfo*& segInfo) const {
       if (segInfos.empty()) return false;
       segInfo = segInfos[segment.ord];
@@ -565,21 +835,178 @@ public:
       // Measured with gcc-release on 2026-07-10 on a hybrid-core laptop, the
       // least representative hardware described by the tuning caveat.
       static constexpr int64_t ZONE_MAP_MIN_PRUNABLE_FRACTION_DENOMINATOR = 2;
+      // Provisional until the points-vs-column scan crossover is measured by
+      // the phase-2 benchmark on representative production hardware.
+      static constexpr uint64_t PTS_VS_SCAN_DENOM = 4;
+
+      struct Materialized {
+        std::span<int32_t> docs;
+        uint64_t* words = nullptr;
+      };
 
       NumericRangeQuery::Weight& weight;
       IndexReader::Segment& segment;
       IntColReader& reader;
+      PointsReader* points;
       std::span<const BlockPlan> plans;
+      PointsReader::FenceRange fence;
       int64_t estimatedCost;
       bool allMatch;
       bool useZoneMap;
+      bool exactReady = false;
+      uint64_t loPos = 0;
+      uint64_t hiPos = 0;
+
+      static void setRun(FixedBitSet& bits, int32_t begin, int32_t end) {
+        if (begin >= end) return;
+        int32_t firstWord = begin >> 6;
+        int32_t lastWord = (end - 1) >> 6;
+        uint64_t firstMask = ~0ULL << (begin & 63);
+        uint64_t lastMask = (end & 63) == 0
+            ? ~0ULL : (1ULL << (end & 63)) - 1ULL;
+        if (firstWord == lastWord) {
+          bits.words[firstWord] |= firstMask & lastMask;
+          return;
+        }
+        bits.words[firstWord] |= firstMask;
+        for (int32_t word = firstWord + 1; word < lastWord; word++) {
+          bits.words[word] = ~0ULL;
+        }
+        bits.words[lastWord] |= lastMask;
+      }
+
+      std::pair<uint64_t, uint64_t> exactPositions(MemPool& pool) {
+        assert(points != nullptr);
+        if (!exactReady) {
+          auto residuals = pool.make_span<uint32_t>(points->maxPointsPerLeaf());
+          auto raw = pool.make_span<int64_t>(points->maxPointsPerLeaf());
+          std::tie(loPos, hiPos) = Weight::exactPointPositions(
+              *points, fence, weight.query.getLo(), weight.query.getHi(),
+              residuals, raw);
+          exactReady = true;
+        }
+        return {loPos, hiPos};
+      }
+
+      Materialized materializePoints(MemPool& pool, uint64_t begin,
+                                     uint64_t end) {
+        assert(points != nullptr && begin <= end);
+        uint64_t expected = end - begin;
+        uint64_t arrayLimit = ((uint64_t)(uint32_t)segment.maxDoc() + 31) >> 5;
+        auto docScratch = pool.make_span<uint32_t>(points->maxPointsPerLeaf());
+        if (expected > arrayLimit) {
+          auto words = pool.make_span<uint64_t>(
+              FixedBitSet::sizeInWords(segment.maxDoc()));
+          std::fill(words.begin(), words.end(), 0);
+          FixedBitSet bits(words.data(), segment.maxDoc());
+          points->emitOrdinalRange(begin, end, docScratch,
+              [&bits](int32_t doc) { bits.set(doc); },
+              [&bits](int32_t runBegin, int32_t runEnd) {
+                setRun(bits, runBegin, runEnd);
+              });
+          return {{}, words.data()};
+        }
+
+        auto docs = pool.make_span<int32_t>((size_t)expected);
+        size_t size = 0;
+        points->emitOrdinalRange(begin, end, docScratch,
+            [&docs, &size](int32_t doc) { docs[size++] = doc; },
+            [&docs, &size](int32_t runBegin, int32_t runEnd) {
+              for (int32_t doc = runBegin; doc < runEnd; doc++) {
+                docs[size++] = doc;
+              }
+            });
+        assert(size == expected);
+        std::sort(docs.begin(), docs.end());
+        if (reader.multiValued()) {
+          size = (size_t)(std::unique(docs.begin(), docs.end()) - docs.begin());
+        }
+        return {docs.first(size), nullptr};
+      }
+
+      Materialized materializeComplement(MemPool& pool, uint64_t begin,
+                                         uint64_t end) {
+        assert(points != nullptr && !reader.multiValued());
+        auto words = pool.make_span<uint64_t>(
+            FixedBitSet::sizeInWords(segment.maxDoc()));
+        std::fill(words.begin(), words.end(), 0);
+        FixedBitSet bits(words.data(), segment.maxDoc());
+        if (reader.denseDocsWithValue()) {
+          setRun(bits, 0, segment.maxDoc());
+        } else {
+          screaming::BitSet::Iterator iter(reader.docsWithValueBitSet());
+          for (int32_t doc = iter.next(); doc != screaming::BitSet::END;
+               doc = iter.next()) {
+            bits.set(doc);
+          }
+        }
+
+        auto docScratch = pool.make_span<uint32_t>(points->maxPointsPerLeaf());
+        auto clearDoc = [&bits](int32_t doc) { bits.clear(doc); };
+        auto clearRun = [&bits](int32_t runBegin, int32_t runEnd) {
+          for (int32_t doc = runBegin; doc < runEnd; doc++) bits.clear(doc);
+        };
+        points->emitOrdinalRange(0, begin, docScratch, clearDoc, clearRun);
+        points->emitOrdinalRange(end, points->pointCount(), docScratch,
+                                 clearDoc, clearRun);
+        return {{}, words.data()};
+      }
+
+      Query::Scorer* scorerFor(MemPool& pool, const Materialized& result) {
+        if (result.words != nullptr) {
+          return pool.make<PointsBitScorer>(
+              FixedBitSet(result.words, segment.maxDoc()));
+        }
+        return pool.make<PointsArrayScorer>(result.docs);
+      }
+
+      BulkScorer* bulkFor(MemPool& pool, const Materialized& result) {
+        if (result.words != nullptr) {
+          return pool.make<PointsBitBulkScorer>(
+              pool, FixedBitSet(result.words, segment.maxDoc()));
+        }
+        return pool.make<PointsArrayBulkScorer>(pool, result.docs);
+      }
+
+      Query::Scorer* phaseOneScorer(MemPool& pool) {
+        if (!useZoneMap) {
+          return pool.make<RangeScorer<IntColReader::Iterator>>(
+              reader, weight.query.getLo(), weight.query.getHi(), allMatch);
+        }
+        skipCount(SkipStats::numericRangeZoneArms);
+        return pool.make<ZoneMapScorer>(
+            pool, reader, plans, weight.query.getLo(), weight.query.getHi(),
+            segment.maxDoc());
+      }
+
+      BulkScorer* phaseOneBulkScorer(MemPool& pool) {
+        if (!useZoneMap) return nullptr;
+        skipCount(SkipStats::numericRangeZoneArms);
+        auto* scorer = pool.make<ZoneMapScorer>(
+            pool, reader, plans, weight.query.getLo(), weight.query.getHi(),
+            segment.maxDoc());
+        return pool.make<RangeBulkScorer>(pool, scorer, segment.maxDoc());
+      }
+
+      bool useComplement(uint64_t exactCount) const {
+        return points != nullptr && !reader.multiValued()
+            && exactCount > (uint64_t)reader.docsWithValue() / 2;
+      }
+
+      bool usePoints(uint64_t exactCount) const {
+        // numValues is the actual column scan work for multi-valued fields.
+        return points != nullptr
+            && exactCount <= (uint64_t)reader.numValues() / PTS_VS_SCAN_DENOM;
+      }
 
     public:
       Supplier(NumericRangeQuery::Weight& weight, IndexReader::Segment& segment,
                IntColReader& reader, std::span<const BlockPlan> plans,
-               int64_t estimatedCost, bool allMatch)
-          : weight(weight), segment(segment), reader(reader), plans(plans),
-            estimatedCost(estimatedCost), allMatch(allMatch) {
+               int64_t estimatedCost, bool allMatch, PointsReader* points,
+               PointsReader::FenceRange fence)
+          : weight(weight), segment(segment), reader(reader), points(points),
+            plans(plans), fence(fence), estimatedCost(estimatedCost),
+            allMatch(allMatch) {
         int64_t prunableValues = 0;
         for (int64_t blockNum = 0; blockNum < reader.numBlocks(); blockNum++) {
           if (plans[(size_t)blockNum].relation != BlockRelation::CROSSES) {
@@ -596,26 +1023,43 @@ public:
 
       Query::Scorer* get(MemPool& targetPool, int64_t leadCost) override {
         if (leadCost < cost()) {
-          // Keep the existing sparse two-phase verification path unchanged.
+          skipCount(SkipStats::numericRangeSparseVerifyArms);
           return targetPool.make<RangeScorer<IntColReader::SparseIterator>>(
               reader, weight.query.getLo(), weight.query.getHi(), allMatch);
         }
-        if (!useZoneMap) {
-          return targetPool.make<RangeScorer<IntColReader::Iterator>>(
-              reader, weight.query.getLo(), weight.query.getHi(), allMatch);
+        if (points != nullptr) {
+          auto [begin, end] = exactPositions(targetPool);
+          uint64_t exactCount = end - begin;
+          if (useComplement(exactCount)) {
+            skipCount(SkipStats::numericRangeComplementArms);
+            return scorerFor(targetPool,
+                materializeComplement(targetPool, begin, end));
+          }
+          if (usePoints(exactCount)) {
+            skipCount(SkipStats::numericRangePointsArms);
+            return scorerFor(targetPool,
+                materializePoints(targetPool, begin, end));
+          }
         }
-        return targetPool.make<ZoneMapScorer>(
-            targetPool, reader, plans, weight.query.getLo(),
-            weight.query.getHi(), segment.maxDoc());
+        return phaseOneScorer(targetPool);
       }
 
       BulkScorer* bulkScorer(MemPool& targetPool) override {
-        if (!useZoneMap) return nullptr;
-        auto* scorer = targetPool.make<ZoneMapScorer>(
-            targetPool, reader, plans, weight.query.getLo(),
-            weight.query.getHi(), segment.maxDoc());
-        return targetPool.make<RangeBulkScorer>(targetPool, scorer,
-                                                segment.maxDoc());
+        if (points != nullptr) {
+          auto [begin, end] = exactPositions(targetPool);
+          uint64_t exactCount = end - begin;
+          if (useComplement(exactCount)) {
+            skipCount(SkipStats::numericRangeComplementArms);
+            return bulkFor(targetPool,
+                materializeComplement(targetPool, begin, end));
+          }
+          if (usePoints(exactCount)) {
+            skipCount(SkipStats::numericRangePointsArms);
+            return bulkFor(targetPool,
+                materializePoints(targetPool, begin, end));
+          }
+        }
+        return phaseOneBulkScorer(targetPool);
       }
     };
 
@@ -636,8 +1080,25 @@ public:
       }
       bool allMatch = query.getLo() <= colMin && colMax <= query.getHi();
       int64_t cost = estimateCost(*reader, plans);
+      PointsReader* points = nullptr;
+      PointsReader::FenceRange fence;
+      if (segInfo->pointsMetaOff != 0) {
+        points = targetPool.make<PointsReader>(segment.postingsReader(), *segInfo);
+        if (points->pointCount() != (uint64_t)reader->numValues()) {
+          throw std::runtime_error("NumericRangeQuery: points/column value count mismatch");
+        }
+        fence = points->fenceRange(query.getLo(), query.getHi());
+        if (fence.empty) return nullptr;
+        uint64_t fenceCount = fence.endOrdinal - fence.firstOrdinal;
+        if (reader->multiValued()) {
+          // Repeated docids make this a safe upper bound, not an exact count
+          // of unique matching documents.
+          fenceCount = std::min<uint64_t>(fenceCount, reader->docsWithValue());
+        }
+        cost = (int64_t)fenceCount;
+      }
       return targetPool.make<Supplier>(*this, segment, *reader, plans, cost,
-                                       allMatch);
+                                       allMatch, points, fence);
     }
 
     Query::Scorer* createScorer(MemPool& targetPool,
@@ -670,6 +1131,20 @@ public:
       if (reader.numValues() == 0) return 0;
       if (reader.getMax() < query.getLo() || query.getHi() < reader.getMin()) {
         return 0;
+      }
+      if (segInfo->pointsMetaOff != 0 && !reader.multiValued()) {
+        PointsReader points(segment.postingsReader(), *segInfo);
+        if (points.pointCount() != (uint64_t)reader.numValues()) {
+          throw std::runtime_error("NumericRangeQuery: points/column value count mismatch");
+        }
+        auto fence = points.fenceRange(query.getLo(), query.getHi());
+        if (fence.empty) return 0;
+        auto guard = MemPool::threadLocalPoolGuard();
+        auto residuals = guard.pool().make_span<uint32_t>(points.maxPointsPerLeaf());
+        auto raw = guard.pool().make_span<int64_t>(points.maxPointsPerLeaf());
+        auto [begin, end] = exactPointPositions(
+            points, fence, query.getLo(), query.getHi(), residuals, raw);
+        return (int64_t)(end - begin);
       }
 
       std::vector<BlockPlan> plans((size_t)reader.numBlocks());
