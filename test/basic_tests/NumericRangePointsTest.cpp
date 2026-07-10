@@ -3,14 +3,17 @@
 #include <algorithm>
 #include <cstdint>
 #include <memory_resource>
+#include <optional>
 #include <span>
 #include <string_view>
 #include <vector>
 
 #include "solux/api/build.h"
+#include "solux/index/PointsWriter.h"
 #include "solux/query/NumericRangeQuery.h"
 #include "solux/query/QueryPrep.h"
 #include "solux/reader/FieldReader.h"
+#include "solux/reader/PointsReader.h"
 #include "solux/schema/Schema.h"
 #include "test/CollectionHelper.h"
 #include "test/SoluxTest.h"
@@ -116,13 +119,29 @@ int64_t exactCount(IndexReader& reader, std::string_view field,
   return state.weight->count(reader.segments()[0]);
 }
 
-SegFieldInfo fieldInfo(IndexReader::Segment& segment, std::string_view field) {
+std::optional<SegFieldInfo> tryFieldInfo(IndexReader::Segment& segment,
+                                         std::string_view field) {
   MemPool pool;
   FieldReader fields(pool, segment.postingsReader());
-  if (!fields.seek(field)) throw std::runtime_error("missing test field");
+  if (!fields.seek(field)) return std::nullopt;
   SegFieldInfo info;
   fields.readFieldInfo(info);
-  return info;
+  return {info};
+}
+
+SegFieldInfo fieldInfo(IndexReader::Segment& segment, std::string_view field) {
+  auto info = tryFieldInfo(segment, field);
+  if (!info) throw std::runtime_error("missing test field");
+  return *info;
+}
+
+std::vector<PointsReader::Point> readPoints(IndexReader::Segment& segment,
+                                             std::string_view field) {
+  SegFieldInfo info = fieldInfo(segment, field);
+  if (info.pointsMetaOff == 0) return {};
+  PointsReader points(segment.postingsReader(), info);
+  points.validate();
+  return points.readAll();
 }
 
 } // namespace
@@ -464,7 +483,8 @@ TEST_F(NumericRangePointsTest, boundaryInsideGcdStepAndRawLeaf) {
   }
 }
 
-TEST_F(NumericRangePointsTest, mergedSegmentFallsBackWithoutPoints) {
+TEST_F(NumericRangePointsTest, mergedSegmentRetainsPoints) {
+  constexpr int32_t DOCS_PER_SEGMENT = 350;
   CollectionHelper helper;
   helper.clear();
   const RangeField fields[] = {{"merged_range"}};
@@ -474,9 +494,9 @@ TEST_F(NumericRangePointsTest, mergedSegmentFallsBackWithoutPoints) {
   for (int32_t segmentNum = 0; segmentNum < 2; segmentNum++) {
     Inverter& inverter = writer->obtainInverter();
     auto& handler = inverter.getIndexHandler("merged_range");
-    for (int32_t doc = 0; doc < 40; doc++) {
+    for (int32_t doc = 0; doc < DOCS_PER_SEGMENT; doc++) {
       inverter.startDoc();
-      handler.index(inverter, segmentNum * 40 + doc);
+      handler.index(inverter, segmentNum * DOCS_PER_SEGMENT + doc);
       inverter.finishDoc();
     }
     writer->releaseInverter(inverter);
@@ -485,8 +505,92 @@ TEST_F(NumericRangePointsTest, mergedSegmentFallsBackWithoutPoints) {
   writer->mergeSegments();
   auto reader = writer->getIndexReader();
   ASSERT_EQ(reader->segments().size(), 1);
-  EXPECT_EQ(fieldInfo(reader->segments()[0], "merged_range").pointsMetaOff, 0);
+  SegFieldInfo info = fieldInfo(reader->segments()[0], "merged_range");
+  ASSERT_NE(info.pointsMetaOff, 0);
+  PointsReader points(reader->segments()[0].postingsReader(), info);
+  points.validate();
+  EXPECT_EQ(points.leafCount(), 2);
+  EXPECT_EQ(points.leafInfo(0).count,
+            PointsWriter::DEFAULT_MAX_POINTS_PER_LEAF);
   EXPECT_EQ(selectedScorer(*reader, "merged_range", 20, 59,
                            std::numeric_limits<int64_t>::max()),
             fullScan(*reader, "merged_range", 20, 59));
+}
+
+TEST_F(NumericRangePointsTest, mergedPointsMatchFreshRebuild) {
+  CollectionHelper helper;
+  helper.clear();
+  auto writer = helper.getIndexWriter();
+
+  std::vector<Doc> source1 = {
+      flatdoc("id", "s1-a", "merge_values_is", vec_i(2, 2, 10)),
+      flatdoc("id", "s1-b", "merge_values_is", vec_i(14))};
+  ASSERT_TRUE(helper.indexAll(source1, UpdateMessage::COMMIT).success);
+  auto preRangeReader = writer->getIndexReader();
+  ASSERT_EQ(preRangeReader->segments().size(), 1);
+  EXPECT_EQ(fieldInfo(preRangeReader->segments()[0],
+                      "merge_values_is").pointsMetaOff, 0);
+
+  const RangeField fields[] = {{"merge_values_is", true}};
+  setRangeSchema(helper, fields);
+  std::vector<Doc> source2 = {
+      flatdoc("id", "s2-a", "merge_values_is", vec_i(4, 8)),
+      flatdoc("id", "s2-delete", "merge_values_is", vec_i(12, 12)),
+      flatdoc("id", "s2-b", "merge_values_is", vec_i(16, 20))};
+  std::vector<Doc> source3 = {
+      flatdoc("id", "s3-absent-a"),
+      flatdoc("id", "s3-absent-b")};
+  std::vector<Doc> source4 = {
+      flatdoc("id", "s4-a", "merge_values_is", vec_i(6, 6, 18)),
+      flatdoc("id", "s4-b", "merge_values_is", vec_i(22, 26))};
+  ASSERT_TRUE(helper.indexAll(source2, UpdateMessage::COMMIT).success);
+  ASSERT_TRUE(helper.indexAll(source3, UpdateMessage::COMMIT).success);
+  ASSERT_TRUE(helper.indexAll(source4, UpdateMessage::COMMIT).success);
+  ASSERT_TRUE(helper.deleteById("s2-delete", UpdateMessage::COMMIT).success);
+
+  auto sourceReader = writer->getIndexReader();
+  ASSERT_EQ(sourceReader->segments().size(), 4);
+  int32_t pointSources = 0;
+  int32_t synthesizedSources = 0;
+  int32_t absentSources = 0;
+  for (auto& segment : sourceReader->segments()) {
+    auto info = tryFieldInfo(segment, "merge_values_is");
+    if (!info) absentSources++;
+    else if (info->pointsMetaOff == 0) synthesizedSources++;
+    else pointSources++;
+  }
+  EXPECT_EQ(pointSources, 2);
+  EXPECT_EQ(synthesizedSources, 1);
+  EXPECT_EQ(absentSources, 1);
+
+  writer->mergeSegments();
+  auto mergedReader = writer->getIndexReader();
+  ASSERT_EQ(mergedReader->segments().size(), 1);
+  auto& mergedSegment = mergedReader->segments()[0];
+  SegFieldInfo mergedInfo = fieldInfo(mergedSegment, "merge_values_is");
+  ASSERT_NE(mergedInfo.pointsMetaOff, 0);
+  PointsReader mergedPoints(mergedSegment.postingsReader(), mergedInfo);
+  mergedPoints.validate();
+
+  CollectionHelper fresh("points_merge_fresh");
+  fresh.clear();
+  setRangeSchema(fresh, fields);
+  std::vector<Doc> liveDocs = {source1[0], source1[1], source2[0], source2[2],
+                               source3[0], source3[1], source4[0], source4[1]};
+  ASSERT_TRUE(fresh.indexAll(liveDocs, UpdateMessage::COMMIT).success);
+  auto freshReader = fresh.getIndexWriter()->getIndexReader();
+  ASSERT_EQ(freshReader->segments().size(), 1);
+
+  auto merged = mergedPoints.readAll();
+  auto rebuilt = readPoints(freshReader->segments()[0], "merge_values_is");
+  EXPECT_EQ(merged, rebuilt);
+  EXPECT_EQ(std::count(merged.begin(), merged.end(),
+                       PointsReader::Point{6, 6}), 2);
+  EXPECT_EQ(std::count_if(merged.begin(), merged.end(), [](const auto& point) {
+              return point.value == 12;
+            }), 0);
+  EXPECT_GT(mergedPoints.leafInfo(0).valueGcd, 1);
+  EXPECT_EQ(selectedScorer(*mergedReader, "merge_values_is", 5, 19,
+                           std::numeric_limits<int64_t>::max()),
+            fullScan(*mergedReader, "merge_values_is", 5, 19));
 }

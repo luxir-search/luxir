@@ -1123,6 +1123,25 @@ public:
           *reader, query.getLo(), query.getHi(), allMatch);
     }
 
+    Query::Scorer* createZoneMapScorerForTests(MemPool& targetPool,
+                                               IndexReader::Segment& segment) {
+      SegFieldInfo* segInfo = nullptr;
+      if (!segmentInfo(segment, segInfo)) return nullptr;
+      auto* reader = targetPool.make<IntColReader>(segment.postingsReader(), *segInfo);
+      if (reader->numValues() == 0) return nullptr;
+      if (reader->getMax() < query.getLo() || query.getHi() < reader->getMin()) {
+        return nullptr;
+      }
+      auto plans = targetPool.make_span<BlockPlan>((size_t)reader->numBlocks());
+      for (int64_t i = 0; i < reader->numBlocks(); i++) {
+        plans[(size_t)i] = classifyBlock(reader->blockInfo(i), query.getLo(),
+                                         query.getHi());
+      }
+      return targetPool.make<ZoneMapScorer>(
+          targetPool, *reader, plans, query.getLo(), query.getHi(),
+          segment.maxDoc());
+    }
+
     int64_t count(IndexReader::Segment& segment) override {
       if (segment.liveDocs() != nullptr) return -1;
       SegFieldInfo* segInfo = nullptr;

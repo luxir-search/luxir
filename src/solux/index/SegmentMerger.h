@@ -4,9 +4,11 @@
 #include "OrdCollector.h"
 #include "OrdColWriter.h"
 #include "NormsWriter.h"
+#include "PointsWriter.h"
 #include "StoredFieldsWriter.h"
 #include "solux/reader/DocsEnum.h"
 #include "solux/reader/NormsReader.h"
+#include "solux/reader/PointsReader.h"
 #include "solux/reader/StoredFieldsReader.h"
 #include "solux/reader/StrColReader.h"
 #include "solux/search/IndexReader.h"
@@ -59,6 +61,77 @@ class SegmentMerger {
   struct MergeFieldInfo {
     SegFieldInfo segFieldInfo;
     Segment* seg;  // points to the segment that produced this.
+  };
+
+  struct MergePoint {
+    int64_t value;
+    int32_t docid;
+  };
+
+  static_assert(sizeof(MergePoint) == MergeCostModel::SYNTHESIZED_POINT_BYTES);
+  static_assert(PointsWriter::DEFAULT_MAX_POINTS_PER_LEAF
+                == MergeCostModel::POINTS_PER_LEAF);
+
+  class PointRun {
+    Segment* segment;
+    PointsReader* reader = nullptr;
+    std::span<int64_t> leafValues;
+    std::span<uint32_t> leafDocids;
+    std::span<uint32_t> leafResiduals;
+    std::vector<MergePoint> synthesized;
+    uint32_t leafIndex = 0;
+    uint16_t pointIndex = 0;
+    uint16_t pointsInLeaf = 0;
+    size_t synthesizedIndex = 0;
+    MergePoint currentPoint{};
+
+  public:
+    PointRun(Segment& segment, PointsReader& reader, MemPool& pool)
+        : segment(&segment), reader(&reader),
+          leafValues(pool.make_span<int64_t>(reader.maxPointsPerLeaf())),
+          leafDocids(pool.make_span<uint32_t>(reader.maxPointsPerLeaf())),
+          leafResiduals(pool.make_span<uint32_t>(reader.maxPointsPerLeaf())) {}
+
+    PointRun(Segment& segment, std::vector<MergePoint>&& synthesized)
+        : segment(&segment), synthesized(std::move(synthesized)) {}
+
+    int sourceOrd() const { return segment->ord; }
+    const MergePoint& point() const { return currentPoint; }
+
+    bool next() {
+      if (reader == nullptr) {
+        if (synthesizedIndex >= synthesized.size()) return false;
+        currentPoint = synthesized[synthesizedIndex++];
+        return true;
+      }
+
+      for (;;) {
+        if (pointIndex >= pointsInLeaf) {
+          if (leafIndex >= reader->leafCount()) return false;
+          pointsInLeaf = reader->decodeLeafInto(
+              leafIndex++, leafValues, leafDocids, leafResiduals);
+          pointIndex = 0;
+        }
+        uint16_t index = pointIndex++;
+        // Live-doc compaction is monotone, so filtering/remapping cannot
+        // disturb this source run's (value, docid) order.
+        auto [mappedDoc, isDeleted] = segment->remapDocId(
+            (int32_t)leafDocids[index]);
+        if (isDeleted) continue;
+        currentPoint = {leafValues[index], mappedDoc};
+        return true;
+      }
+    }
+  };
+
+  struct PointRunCompare {
+    bool operator()(const PointRun& lhs, const PointRun& rhs) const {
+      const MergePoint& a = lhs.point();
+      const MergePoint& b = rhs.point();
+      if (a.value != b.value) return a.value > b.value;
+      if (a.docid != b.docid) return a.docid > b.docid;
+      return lhs.sourceOrd() > rhs.sourceOrd();
+    }
   };
 
   // One field's merge work, self-contained so it can run as a task: owned copies
@@ -432,25 +505,34 @@ private:
 
     int64_t numValues = 0;
     int64_t docsWithField = 0;
+    int64_t synthesizedPointValues = 0;
     for (const auto& field : fields) {
       numValues += field.segFieldInfo.numValues;
       docsWithField += field.segFieldInfo.docsWithField;
+      if (field.segFieldInfo.pointsMetaOff == 0) {
+        synthesizedPointValues += field.segFieldInfo.numValues;
+      }
     }
+    int64_t pointsBytes = (allFlags & FieldType::INDEX_RANGE) != 0
+        ? MergeCostModel::pointsBytes((int64_t)fields.size(), numValues,
+                                      synthesizedPointValues)
+        : 0;
 
     if (type == FieldType::Type::STRING && (allFlags & FieldType::INDEX_DOCS) != 0) {
       // Ord columns hold the term-order -> doc-order transposition in RAM until the
       // postings pass finishes: OrdCollector allocates ords[mergedMaxDoc] (int32)
       // up front, plus roughly a TaggedPtr/entry of pool per value for multi-value
       // chains.  This is the heavy class the budget exists for.
-      return (int64_t)postingsWriter.getMaxDoc() * 4 + numValues * 8 + MergeCostModel::LIGHT_BYTES;
+      return (int64_t)postingsWriter.getMaxDoc() * 4 + numValues * 8
+          + MergeCostModel::LIGHT_BYTES + pointsBytes;
     }
     if (type == FieldType::Type::TEXT && (allFlags & FieldType::INDEX_DOCS) != 0) {
       // Text postings merge streams; what accumulates is the norms build
       // (normBytes ~1 byte per doc-with-field plus its DocStream).
-      return docsWithField * 2 + MergeCostModel::LIGHT_BYTES;
+      return docsWithField * 2 + MergeCostModel::LIGHT_BYTES + pointsBytes;
     }
     // Int/str/vector columns and stored fields stream through fixed block buffers.
-    return MergeCostModel::LIGHT_BYTES;
+    return MergeCostModel::LIGHT_BYTES + pointsBytes;
   }
 
   static int32_t estimateStreams(std::span<const MergeFieldInfo> fields) {
@@ -473,7 +555,9 @@ private:
         && (allFlags & FieldType::INDEX_DOCS) == 0) {
       return MergeCostModel::STR_COL_STREAMS;
     }
-    return MergeCostModel::INT_COL_STREAMS;
+    return MergeCostModel::INT_COL_STREAMS
+        + ((allFlags & FieldType::INDEX_RANGE) != 0
+           ? MergeCostModel::POINTS_STREAMS : 0);
   }
 
   // Helper to build mapping from old doc IDs to new doc IDs for a segment, accounting for deletes
@@ -737,6 +821,9 @@ private:
     } else {
       // int column that is not an ord column (assume all other field types have this (currently true)
       mergeIntCol2(sortedFields, postingsWriter, outputFieldInfo);
+      if ((allFlags & FieldType::INDEX_RANGE) != 0) {
+        mergePoints(sortedFields, postingsWriter, outputFieldInfo);
+      }
     }
   }
 
@@ -1061,6 +1148,73 @@ private:
     } else {
       outputFieldInfo.docsWithFieldEndLoc = {0, 0};
     }
+  }
+
+  std::vector<MergePoint> synthesizePointRun(MergeFieldInfo& field) {
+    Segment& segment = *field.seg;
+    IntColReader reader(*segment.postingsReader, field.segFieldInfo);
+    IntColReader::Iterator docs(reader);
+    std::vector<MergePoint> run;
+    run.reserve((size_t)field.segFieldInfo.numValues);
+    for (int32_t localDoc = docs.next(); localDoc != IntColReader::ENDDOC;
+         localDoc = docs.next()) {
+      auto [mappedDoc, isDeleted] = segment.remapDocId(localDoc);
+      if (!reader.multiValued()) {
+        if (!isDeleted) run.push_back({docs.value(), mappedDoc});
+        continue;
+      }
+      auto [start, end] = reader.getStartEndValueRank(docs.rank());
+      if (isDeleted) continue;
+      for (int64_t rank = start; rank < end; rank++) {
+        run.push_back({docs.values().valueAt(rank), mappedDoc});
+      }
+    }
+    std::sort(run.begin(), run.end(), [](const MergePoint& lhs,
+                                         const MergePoint& rhs) {
+      return lhs.value < rhs.value
+          || (lhs.value == rhs.value && lhs.docid < rhs.docid);
+    });
+    return run;
+  }
+
+  void mergePoints(std::span<MergeFieldInfo*> sortedFields,
+                   PostingsWriter& postingsWriter,
+                   PostingsWriter::IndexFieldInfo& outputFieldInfo) {
+    auto poolGuard = MemPool::threadLocalPoolGuard();
+    MemPool& pool = poolGuard.pool();
+    std::vector<PointRun> runs;
+    runs.reserve(sortedFields.size());
+    for (MergeFieldInfo* field : sortedFields) {
+      if (field == nullptr) continue;
+      if (field->segFieldInfo.pointsMetaOff != 0) {
+        auto* reader = pool.make<PointsReader>(
+            *field->seg->postingsReader, field->segFieldInfo);
+        runs.emplace_back(*field->seg, *reader, pool);
+      } else {
+        runs.emplace_back(*field->seg, synthesizePointRun(*field));
+      }
+    }
+
+    std::vector<PointRun*> active;
+    active.reserve(runs.size());
+    for (PointRun& run : runs) {
+      if (run.next()) active.push_back(&run);
+    }
+    if (active.empty()) return;
+
+    IndirectPQ<PointRun, PointRunCompare> queue(active);
+    auto output = postingsWriter.getOutputStream();
+    PointsWriter writer(*output);
+    while (queue.size() != 0) {
+      PointRun& run = queue.top();
+      writer.addPoint(run.point().value, run.point().docid);
+      if (run.next()) queue.updateTop();
+      else queue.removeTop();
+    }
+    auto data = writer.finish();
+    assert(data.pointCount == (uint64_t)outputFieldInfo.numValues);
+    outputFieldInfo.pointsLoc = data.pointsLoc;
+    outputFieldInfo.pointsMetaOff = data.pointsMetaOff;
   }
 
   void mergeIntCol2(std::span<MergeFieldInfo*> sortedFields, PostingsWriter& postingsWriter,

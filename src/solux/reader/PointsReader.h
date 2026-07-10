@@ -265,6 +265,46 @@ public:
     }
   }
 
+  uint16_t decodeLeafInto(uint32_t leafIndex, std::span<int64_t> values,
+                          std::span<uint32_t> docids,
+                          std::span<uint32_t> residualScratch) const {
+    LeafInfo info = leafInfo(leafIndex);
+    if (values.size() < info.count || docids.size() < info.count
+        || residualScratch.size() < info.count) {
+      throw std::invalid_argument("PointsReader: leaf decode scratch is too small");
+    }
+
+    const char* docPayload = points + leafFP(leafIndex) + PointsWriter::LEAF_HEADER_SIZE;
+    const char* valuePayload = docPayload + info.docBytes;
+    if (info.docCodec == PointsWriter::DOC_CONTIG) {
+      for (uint32_t i = 0; i < info.count; i++) docids[i] = info.docBase + i;
+    } else if (info.docCodec == PointsWriter::DOC_FOR) {
+      IndexCodec::numericCodec.decodeWithMeta(docPayload, docids.data(), info.count,
+                                               info.docBits);
+      for (uint32_t i = 0; i < info.count; i++) {
+        uint64_t doc = (uint64_t)info.docBase + docids[i];
+        if (doc > (uint64_t)std::numeric_limits<int32_t>::max()) {
+          invalid("decoded docid exceeds int32");
+        }
+        docids[i] = (uint32_t)doc;
+      }
+    } else {
+      invalid("reserved docid codec");
+    }
+
+    if (info.valueFormat <= 32) {
+      IndexCodec::numericCodec.decodeWithMeta(valuePayload, residualScratch.data(),
+                                               info.count, info.valueFormat);
+      for (uint32_t i = 0; i < info.count; i++) {
+        values[i] = (int64_t)((uint64_t)residualScratch[i] * info.valueGcd
+                              + (uint64_t)info.valueMin);
+      }
+    } else {
+      memcpy(values.data(), valuePayload, (size_t)info.count * sizeof(int64_t));
+    }
+    return info.count;
+  }
+
   void validate() const {
     uint64_t countedPoints = 0;
     for (uint32_t i = 0; i < leavesCount; i++) {

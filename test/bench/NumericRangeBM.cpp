@@ -2,13 +2,17 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <limits>
 #include <memory>
+#include <memory_resource>
 #include <numeric>
 #include <string_view>
 #include <vector>
 
 #include "bench/solux_bench.h"
+#include "solux/api/build.h"
 #include "solux/query/NumericRangeQuery.h"
+#include "solux/schema/Schema.h"
 #include "solux/util/random.h"
 #include "test/TestIndex.h"
 
@@ -17,12 +21,41 @@ using namespace solux::test;
 
 namespace {
 
+enum BenchPath : int32_t {
+  SELECTED,
+  ZONE,
+  FULL
+};
+
+enum BenchArm : int32_t {
+  VERIFY,
+  POINTS,
+  ZONE_ARM,
+  COMPLEMENT
+};
+
 class NumericRangeBenchIndex {
 public:
   TestIndex index;
+  std::shared_ptr<Schema> schema;
   int32_t numDocs;
 
   NumericRangeBenchIndex() : numDocs(solux::unit_tests ? 50'000 : 500'000) {
+    std::pmr::monotonic_buffer_resource arena;
+    api::SchemaDef def;
+    api::FieldDef* fields = api::build::allocArray(def.fields, 2, arena);
+    for (auto [slot, name] : {
+           std::pair<int32_t, std::string_view>{0, "range_correlated_i"},
+           {1, "range_shuffled_i"}}) {
+      fields[slot].name = name;
+      fields[slot].field_class = api::FieldDef::FieldClass::INT;
+      fields[slot].index = api::FieldDef::IndexMode::RANGE;
+    }
+    auto base = Schema::createDefaultSchema();
+    schema = Schema::fromProto(def, base.get());
+    index.iw = std::make_unique<IndexWriter>(
+        index.dir, [this]() { return schema; });
+
     std::vector<int32_t> shuffled((size_t)numDocs);
     std::iota(shuffled.begin(), shuffled.end(), 0);
     SplitMix64 rng(0x76a5b31d);
@@ -49,8 +82,8 @@ NumericRangeBenchIndex& benchIndex() {
   return fixture;
 }
 
-void BM_NumericRangeZoneMap(benchmark::State& state, bool correlated,
-                            bool pruned, int32_t perMille) {
+void BM_NumericRangePoints(benchmark::State& state, bool correlated,
+                           int32_t path, int32_t arm, int32_t perMille) {
   auto& fixture = benchIndex();
   std::string_view field = correlated
       ? "range_correlated_i" : "range_shuffled_i";
@@ -66,9 +99,19 @@ void BM_NumericRangeZoneMap(benchmark::State& state, bool correlated,
     auto* weight = static_cast<NumericRangeQuery::Weight*>(
         query.createWeight(context, 0));
     auto& segment = fixture.index.reader->segments()[0];
-    Query::Scorer* scorer = pruned
-        ? weight->createScorer(pool, segment)
-        : weight->createFullScanScorerForTests(pool, segment);
+    Query::Scorer* scorer = nullptr;
+    if (path == FULL) {
+      scorer = weight->createFullScanScorerForTests(pool, segment);
+    } else if (path == ZONE) {
+      scorer = weight->createZoneMapScorerForTests(pool, segment);
+    } else {
+      auto* supplier = weight->scorerSupplier(pool, segment);
+      if (supplier != nullptr) {
+        int64_t leadCost = arm == VERIFY
+            ? 0 : std::numeric_limits<int64_t>::max();
+        scorer = supplier->get(pool, leadCost);
+      }
+    }
     int32_t count = 0;
     if (scorer != nullptr) {
       while (scorer->next() != PostingsReader::END) count++;
@@ -85,29 +128,21 @@ void BM_NumericRangeZoneMap(benchmark::State& state, bool correlated,
 
 } // namespace
 
-SOLUX_BENCHMARK_CAPTURE(BM_NumericRangeZoneMap, correlated_full_0_1pct,
-                        true, false, 1);
-SOLUX_BENCHMARK_CAPTURE(BM_NumericRangeZoneMap, correlated_pruned_0_1pct,
-                        true, true, 1);
-SOLUX_BENCHMARK_CAPTURE(BM_NumericRangeZoneMap, correlated_full_5pct,
-                        true, false, 50);
-SOLUX_BENCHMARK_CAPTURE(BM_NumericRangeZoneMap, correlated_pruned_5pct,
-                        true, true, 50);
-SOLUX_BENCHMARK_CAPTURE(BM_NumericRangeZoneMap, correlated_full_50pct,
-                        true, false, 500);
-SOLUX_BENCHMARK_CAPTURE(BM_NumericRangeZoneMap, correlated_pruned_50pct,
-                        true, true, 500);
+#define RANGE_BENCH_CASE(shape, correlated, arm, per_mille)                    \
+  SOLUX_BENCHMARK_CAPTURE(BM_NumericRangePoints, shape##_##arm##_selected,     \
+                          correlated, SELECTED, arm, per_mille);               \
+  SOLUX_BENCHMARK_CAPTURE(BM_NumericRangePoints, shape##_##arm##_zone,         \
+                          correlated, ZONE, arm, per_mille);                   \
+  SOLUX_BENCHMARK_CAPTURE(BM_NumericRangePoints, shape##_##arm##_full,         \
+                          correlated, FULL, arm, per_mille)
 
-SOLUX_BENCHMARK_CAPTURE(BM_NumericRangeZoneMap, shuffled_full_0_1pct,
-                        false, false, 1);
-SOLUX_BENCHMARK_CAPTURE(BM_NumericRangeZoneMap, shuffled_pruned_0_1pct,
-                        false, true, 1);
-SOLUX_BENCHMARK_CAPTURE(BM_NumericRangeZoneMap, shuffled_full_5pct,
-                        false, false, 50);
-SOLUX_BENCHMARK_CAPTURE(BM_NumericRangeZoneMap, shuffled_pruned_5pct,
-                        false, true, 50);
-SOLUX_BENCHMARK_CAPTURE(BM_NumericRangeZoneMap, shuffled_full_50pct,
-                        false, false, 500);
-SOLUX_BENCHMARK_CAPTURE(BM_NumericRangeZoneMap, shuffled_pruned_50pct,
-                        false, true, 500);
+RANGE_BENCH_CASE(correlated, true, VERIFY, 1);
+RANGE_BENCH_CASE(correlated, true, POINTS, 50);
+RANGE_BENCH_CASE(correlated, true, ZONE_ARM, 330);
+RANGE_BENCH_CASE(correlated, true, COMPLEMENT, 750);
+RANGE_BENCH_CASE(shuffled, false, VERIFY, 1);
+RANGE_BENCH_CASE(shuffled, false, POINTS, 50);
+RANGE_BENCH_CASE(shuffled, false, ZONE_ARM, 330);
+RANGE_BENCH_CASE(shuffled, false, COMPLEMENT, 750);
 
+#undef RANGE_BENCH_CASE
