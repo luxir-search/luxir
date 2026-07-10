@@ -25,9 +25,7 @@ static_assert(sizeof(FlushPoint) == 16);
 inline void writePoints(PostingsWriter& postingsWriter,
                         PostingsWriter::IndexFieldInfo& fieldInfo,
                         std::vector<FlushPoint>& points) {
-  std::sort(points.begin(), points.end(), [](const FlushPoint& lhs, const FlushPoint& rhs) {
-    return lhs.value < rhs.value || (lhs.value == rhs.value && lhs.docid < rhs.docid);
-  });
+  sortPointsByValueDocid(std::span<FlushPoint>(points));
   auto output = postingsWriter.getOutputStream();
   PointsWriter writer(*output);
   for (const auto& point : points) writer.addPoint(point.value, point.docid);

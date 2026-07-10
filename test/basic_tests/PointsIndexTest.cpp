@@ -241,6 +241,34 @@ TEST_F(PointsIndexTest, deepValidationIsExplicit) {
   });
 }
 
+// Large equal-value runs at a scale where integer_sort actually radix
+// partitions (small inputs fall back to comparison sort, which hides tie
+// bugs): a naive single-pass spreadsort with a tie-refining comparator
+// leaves equal-value docids scrambled once radix bits are exhausted.
+TEST_F(PointsIndexTest, sortPointsKeepsDocidOrderInLongTieRuns) {
+  constexpr size_t N = 200'000;
+  struct TestPoint {
+    int64_t value;
+    int32_t docid;
+  };
+  std::vector<TestPoint> points(N);
+  uint64_t state = 0x9e3779b97f4a7c15ULL;
+  for (size_t i = 0; i < N; i++) {
+    state = state * 6364136223846793005ULL + 1442695040888963407ULL;
+    points[i] = {(int64_t)(state % 16) * 1'000'000'007LL, (int32_t)i};
+  }
+  auto reference = points;
+  std::sort(reference.begin(), reference.end(),
+            [](const TestPoint& a, const TestPoint& b) {
+    return a.value < b.value || (a.value == b.value && a.docid < b.docid);
+  });
+  sortPointsByValueDocid(std::span<TestPoint>(points));
+  for (size_t i = 0; i < N; i++) {
+    ASSERT_EQ(points[i].value, reference[i].value) << i;
+    ASSERT_EQ(points[i].docid, reference[i].docid) << i;
+  }
+}
+
 TEST_F(PointsIndexTest, flushMatchesSingleAndMultiValuedColumns) {
   CollectionHelper helper;
   helper.clear();

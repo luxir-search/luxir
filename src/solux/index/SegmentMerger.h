@@ -1169,11 +1169,7 @@ private:
         run.push_back({docs.values().valueAt(rank), mappedDoc});
       }
     }
-    std::sort(run.begin(), run.end(), [](const MergePoint& lhs,
-                                         const MergePoint& rhs) {
-      return lhs.value < rhs.value
-          || (lhs.value == rhs.value && lhs.docid < rhs.docid);
-    });
+    sortPointsByValueDocid(std::span<MergePoint>(run));
     return run;
   }
 

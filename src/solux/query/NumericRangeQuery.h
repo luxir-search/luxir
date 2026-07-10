@@ -917,7 +917,7 @@ public:
               }
             });
         assert(size == expected);
-        std::sort(docs.begin(), docs.end());
+        boost::sort::spreadsort::integer_sort(docs.begin(), docs.end());
         if (reader.multiValued()) {
           size = (size_t)(std::unique(docs.begin(), docs.end()) - docs.begin());
         }
