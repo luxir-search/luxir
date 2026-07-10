@@ -103,6 +103,18 @@ public:
   // encodeWithMeta: caller supplies minval + bits (from block metadata); stores no header.
   void encodeWithMeta(uint32_t* in, uint32_t inSz, char* target, uint32_t& outSz, uint32_t minval, uint8_t bits);
 
+  static constexpr uint64_t byteSize(uint32_t count, uint8_t bits) {
+    if (bits == 0) return 0;
+    uint64_t fullBlocks = count / 128;
+    uint32_t tail = count % 128;
+    uint64_t bytes = fullBlocks * 4 * bits * sizeof(uint32_t);
+    if (tail != 0) {
+      uint64_t rows = (tail + 3) / 4;
+      bytes += 4 * ((rows * bits + 31) / 32) * sizeof(uint32_t);
+    }
+    return bytes;
+  }
+
   // decodeWithMeta: inline so the column readers' decode loops fold it in and DCE around it.
   // Production frame-of-reference min is always 0, so a value IS its unpacked delta -- no minval,
   // no unused size arg. The 0/32-bit edge formats and a partial tail are cold (out-of-line).

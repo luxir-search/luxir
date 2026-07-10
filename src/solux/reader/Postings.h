@@ -37,7 +37,7 @@ public:
 
   static constexpr std::string_view INDEX_INFO_FILE = "s.olux"; // lists all segments in the index
   static constexpr std::string_view PREFIX_FNAME = "s";         // prefix for all data files
-  static constexpr std::string_view SOLUX_HEADER = "SOLUX001";  // every data file starts with this header
+  static constexpr std::string_view SOLUX_HEADER = "SOLUX002";  // every data file starts with this header
 
   // Reserved field name under which the default stored-fields resource is
   // registered in a segment's per-field index.  Named column families live

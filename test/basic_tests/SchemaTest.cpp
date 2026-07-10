@@ -620,9 +620,8 @@ TEST_F(SchemaTest, fieldClassDefaults) {
 }
 
 
-// The schema must reject index modes the engine cannot honor: RANGE everywhere
-// (points index not built yet), MATCH on numerics (no numeric term postings)
-// and on VECTOR.  UNSET behaves exactly like an absent field.
+// RANGE is accepted only for numeric columns. MATCH on numerics (no numeric
+// term postings) and on VECTOR remains rejected. UNSET behaves like absence.
 TEST_F(SchemaTest, indexModeValidation) {
   auto trySchema = [](const char* name, FieldClass fc, IndexMode mode) {
     std::pmr::monotonic_buffer_resource arena;
@@ -634,8 +633,10 @@ TEST_F(SchemaTest, indexModeValidation) {
     return Schema::fromProto(def);
   };
 
-  EXPECT_THROW(trySchema("price", FieldClass::INT, IndexMode::RANGE), std::runtime_error);
-  EXPECT_THROW(trySchema("when", FieldClass::DATE, IndexMode::RANGE), std::runtime_error);
+  EXPECT_TRUE(trySchema("price", FieldClass::INT, IndexMode::RANGE)->getFieldTypePtr("price")->rangeIndexed());
+  EXPECT_TRUE(trySchema("score", FieldClass::FLOAT, IndexMode::RANGE)->getFieldTypePtr("score")->rangeIndexed());
+  EXPECT_TRUE(trySchema("score", FieldClass::DOUBLE, IndexMode::RANGE)->getFieldTypePtr("score")->rangeIndexed());
+  EXPECT_TRUE(trySchema("when", FieldClass::DATE, IndexMode::RANGE)->getFieldTypePtr("when")->rangeIndexed());
   EXPECT_THROW(trySchema("title", FieldClass::TEXT, IndexMode::RANGE), std::runtime_error);
   EXPECT_THROW(trySchema("tag", FieldClass::STRING, IndexMode::RANGE), std::runtime_error);
   EXPECT_THROW(trySchema("price", FieldClass::INT, IndexMode::MATCH), std::runtime_error);
@@ -652,8 +653,40 @@ TEST_F(SchemaTest, indexModeValidation) {
   EXPECT_FALSE(trySchema("price", FieldClass::INT, IndexMode::UNSET)->getFieldTypePtr("price")->indexed());
 }
 
+TEST_F(SchemaTest, rangeRoundTripsAndRequiresColumn) {
+  std::pmr::monotonic_buffer_resource arena;
+  api::SchemaDef def;
+  api::FieldDef* fields = build::allocArray(def.fields, 1, arena);
+  fields[0].name = "price";
+  fields[0].field_class = FieldClass::INT;
+  fields[0].index = IndexMode::RANGE;
+  auto schema = Schema::fromProto(def);
+  ASSERT_TRUE(schema->getFieldTypePtr("price")->rangeIndexed());
+  ASSERT_TRUE(schema->getFieldTypePtr("price")->hasColumn());
 
-// index mode round-trips through toProto as MATCH / NONE
+  api::SchemaDef roundTrip;
+  schema->toProto(&roundTrip, arena);
+  auto roundTripped = Schema::fromProto(roundTrip);
+  EXPECT_TRUE(roundTripped->getFieldTypePtr("price")->rangeIndexed());
+
+  api::SchemaDef mergeDef;
+  api::FieldDef* mergeFields = build::allocArray(mergeDef.fields, 1, arena);
+  mergeFields[0].name = "quantity";
+  mergeFields[0].field_class = FieldClass::INT;
+  auto merged = Schema::fromProto(mergeDef, schema.get());
+  EXPECT_TRUE(merged->getFieldTypePtr("price")->rangeIndexed());
+
+  api::SchemaDef noColumnDef;
+  api::FieldDef* noColumn = build::allocArray(noColumnDef.fields, 1, arena);
+  noColumn[0].name = "bad";
+  noColumn[0].field_class = FieldClass::DOUBLE;
+  noColumn[0].index = IndexMode::RANGE;
+  noColumn[0].column_stored = false;
+  EXPECT_THROW(Schema::fromProto(noColumnDef), std::runtime_error);
+}
+
+
+// Index modes round-trip through toProto without collapsing their flags.
 TEST_F(SchemaTest, indexModeToProto) {
   std::pmr::monotonic_buffer_resource arena;
   api::SchemaDef def;

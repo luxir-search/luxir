@@ -284,7 +284,8 @@ std::shared_ptr<Schema> Schema::fromProto(const solux::api::SchemaDef& def, cons
         default:                r.fieldClass = FieldClass::BIN; break;
       }
       r.hasIndex = true;
-      r.index = ft->indexed() ? IndexMode::MATCH : IndexMode::NONE;
+      r.index = ft->rangeIndexed() ? IndexMode::RANGE
+                                  : (ft->indexed() ? IndexMode::MATCH : IndexMode::NONE);
       r.hasColumnStored = true;
       r.columnStored = ft->hasColumn();
       r.hasMultiValued = true;
@@ -342,17 +343,29 @@ std::shared_ptr<Schema> Schema::fromProto(const solux::api::SchemaDef& def, cons
       }
     }
 
-    // Reject index modes the engine cannot honor yet (or ever): the schema
-    // must not accept a contract it cannot deliver.
+    if (!r.hasColumnStored) {
+      switch (r.fieldClass) {
+        case FieldClass::ID:     columnStored = true; break;
+        case FieldClass::STRING: columnStored = true; break;
+        case FieldClass::TEXT:   columnStored = false; break;
+        case FieldClass::INT:    columnStored = true; break;
+        default: columnStored = true; break;
+      }
+    }
+
+    // Reject index modes the engine cannot honor. RANGE is defined only for
+    // numeric columns because the points build consumes the encoded column stream.
     bool numericClass = r.fieldClass == FieldClass::INT || r.fieldClass == FieldClass::FLOAT ||
                         r.fieldClass == FieldClass::DOUBLE || r.fieldClass == FieldClass::DATE;
     if (index == IndexMode::RANGE) {
-      if (numericClass) {
-        throw std::runtime_error("index=RANGE is not yet implemented for field: " + std::string(name));
+      if (!numericClass) {
+        throw std::runtime_error(
+          "index=RANGE is not supported for this field_class (field: " + std::string(name) +
+          "); MATCH-indexed string/id fields answer range queries through the terms dictionary");
       }
-      throw std::runtime_error(
-        "index=RANGE is not supported for this field_class (field: " + std::string(name) +
-        "); MATCH-indexed string/id fields answer range queries through the terms dictionary");
+      if (!columnStored) {
+        throw std::runtime_error("index=RANGE requires column_stored=true for field: " + std::string(name));
+      }
     }
     if (index == IndexMode::MATCH) {
       if (numericClass) {
@@ -361,15 +374,6 @@ std::shared_ptr<Schema> Schema::fromProto(const solux::api::SchemaDef& def, cons
       }
       if (r.fieldClass == FieldClass::VECTOR || r.fieldClass == FieldClass::BIN) {
         throw std::runtime_error("index=MATCH is not supported for this field_class (field: " + std::string(name) + ")");
-      }
-    }
-    if (!r.hasColumnStored) {
-      switch (r.fieldClass) {
-        case FieldClass::ID:     columnStored = true; break;
-        case FieldClass::STRING: columnStored = true; break;
-        case FieldClass::TEXT:   columnStored = false; break;
-        case FieldClass::INT:    columnStored = true; break;
-        default: columnStored = true; break;
       }
     }
     if (!r.hasMultiValued) {
@@ -391,6 +395,7 @@ std::shared_ptr<Schema> Schema::fromProto(const solux::api::SchemaDef& def, cons
         flags |= FieldType::INDEX_DOCS;
       }
     }
+    if (index == IndexMode::RANGE) flags |= FieldType::INDEX_RANGE;
     if (columnStored) flags |= FieldType::COLUMN_STORED;
     if (multiValued) flags |= FieldType::MULTI_VALUED;
     if (stored) flags |= FieldType::STORED;
@@ -505,7 +510,8 @@ void Schema::toProto(solux::api::SchemaDef* def, std::pmr::memory_resource& aren
     }
 
     // Set flags
-    fieldDef.index = ft->indexed() ? IndexMode::MATCH : IndexMode::NONE;
+    fieldDef.index = ft->rangeIndexed() ? IndexMode::RANGE
+                                       : (ft->indexed() ? IndexMode::MATCH : IndexMode::NONE);
     fieldDef.column_stored = ft->hasColumn();
     fieldDef.multi_valued = ft->multiValued();
     fieldDef.stored = ft->isStored();

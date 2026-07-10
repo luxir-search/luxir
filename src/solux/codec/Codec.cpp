@@ -266,8 +266,7 @@ uint32_t skipBlockPFor(const char* inc) {
 // `bits` is in 1..31 (the 0 and 32 cases are handled separately).
 
 uint32_t tailWords(uint32_t len, uint8_t bits) {
-  const uint32_t rows = (len + 3) / 4;
-  return 4 * ((rows * bits + 31) / 32);
+  return (uint32_t)(SoluxSIMDFor::byteSize(len, bits) / sizeof(uint32_t));
 }
 
 uint32_t packTail(const uint32_t* residuals, uint32_t len, uint8_t bits, uint32_t* out) {
@@ -335,6 +334,7 @@ void SoluxSIMDFor::encodeWithMeta(uint32_t* in, uint32_t inSz, char* target, uin
     out += packTail(tmp, rem, bits, out);
   }
   outSz = (char*) out - target;
+  assert(outSz == byteSize(inSz, bits));
 }
 
 // Cold partial-tail decode (min==0): unpack the <128 remainder straight into the output buffer

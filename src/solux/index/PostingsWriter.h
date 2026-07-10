@@ -94,6 +94,7 @@ public:
     fieldInfos.emplace_back(); // we should get default-initialization with this for the SegFieldInfo members
     fieldInfos.back().fieldname = fieldName;
     assert(fieldInfos.back().monoLoc.offset() == 0 && fieldInfos.back().monoMetaOff == 0 && fieldInfos.back().columnMetaOff == 0);
+    assert(fieldInfos.back().pointsMetaOff == 0);
     assert(fieldInfos.back().mono2Loc.offset() == 0 && fieldInfos.back().mono2MetaOff == 0);
     assert(fieldInfos.back().valDocLoc.offset() == 0 && fieldInfos.back().valDocMetaOff == 0);
     return fieldInfos.back();
@@ -332,6 +333,8 @@ private:
       fieldOutput.writeVal(finfo.columnLoc);
       fieldOutput.writeVlong(finfo.columnMetaOff);
       fieldOutput.writeVlong(finfo.numValues);
+      fieldOutput.writeVal(finfo.pointsLoc);
+      fieldOutput.writeVlong(finfo.pointsMetaOff);
       fieldOutput.writeVint((uint32_t)finfo.normsFormat);
       fieldOutput.writeVal(finfo.normsLoc);
       fieldOutput.writeVlong(finfo.normsLen);

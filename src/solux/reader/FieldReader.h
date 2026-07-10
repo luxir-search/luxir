@@ -38,6 +38,11 @@ struct SegFieldInfo {
   int64_t numValues;         // total number of values in the column across all docs.
                              // For single-valued fields numValues == docsWithField; for multi-valued it is >=.
 
+  // Optional 1-D sorted-leaf points index. Absence is pointsMetaOff == 0;
+  // pointsLoc.offset() may be zero for a present index in a nonzero file.
+  seg_location pointsLoc;
+  int64_t pointsMetaOff = 0;
+
   // Dedicated text norms column.  The docs-with-field bitset remains in
   // docsWithFieldEndLoc/docsWithField; this region stores only the raw norm bytes.
   int32_t normsFormat;
@@ -172,6 +177,8 @@ public:
       fieldInfo.columnLoc = fieldIS.readVal<seg_location>();
       fieldInfo.columnMetaOff = fieldIS.readVlong();
       fieldInfo.numValues = fieldIS.readVlong();
+      fieldInfo.pointsLoc = fieldIS.readVal<seg_location>();
+      fieldInfo.pointsMetaOff = fieldIS.readVlong();
       fieldInfo.normsFormat = fieldIS.readVint();
       fieldInfo.normsLoc = fieldIS.readVal<seg_location>();
       fieldInfo.normsLen = fieldIS.readVlong();

@@ -3,6 +3,7 @@
 #include "solux/index/DocStream.h"
 #include "solux/index/Inverter.h"
 #include "solux/index/IntColWriter.h"
+#include "solux/index/PointsWriter.h"
 #include "solux/schema/ValCoerce.h"
 
 #include <fmt/format.h>
@@ -11,6 +12,29 @@
 
 using namespace solux;
 namespace solux::handler {
+
+// RANGE flush adds this 16-byte-per-value peak outside inverter.pool, so the
+// inverter autoflush cap must leave headroom for the transient sort array.
+struct FlushPoint {
+  int64_t value;
+  int32_t docid;
+};
+
+static_assert(sizeof(FlushPoint) == 16);
+
+inline void writePoints(PostingsWriter& postingsWriter,
+                        PostingsWriter::IndexFieldInfo& fieldInfo,
+                        std::vector<FlushPoint>& points) {
+  std::sort(points.begin(), points.end(), [](const FlushPoint& lhs, const FlushPoint& rhs) {
+    return lhs.value < rhs.value || (lhs.value == rhs.value && lhs.docid < rhs.docid);
+  });
+  auto output = postingsWriter.getOutputStream();
+  PointsWriter writer(*output);
+  for (const auto& point : points) writer.addPoint(point.value, point.docid);
+  auto data = writer.finish();
+  fieldInfo.pointsLoc = data.pointsLoc;
+  fieldInfo.pointsMetaOff = data.pointsMetaOff;
+}
 
 //
 // Info for one single valued column.
@@ -98,6 +122,21 @@ public:
       // individual values)
       longStream.pushValues(inverter.pool, writer);
       writer.finish(fieldInfo);
+    }
+
+    if (fieldType->rangeIndexed()) {
+      std::vector<FlushPoint> points;
+      points.reserve((size_t)numVals);
+      longStream.visitValues(inverter.pool, [&](int64_t value) {
+        points.push_back({value, 0});
+      });
+      size_t pointIndex = 0;
+      docsWithVal.forEachDoc(inverter.pool, [&](int32_t docid) {
+        assert(pointIndex < points.size());
+        points[pointIndex++].docid = docid;
+      });
+      assert(pointIndex == points.size());
+      writePoints(postingsWriter, fieldInfo, points);
     }
 
     // push docs
@@ -217,6 +256,29 @@ public:
       IntColWriter writer(*outputPtr);
       longStream.pushValues(inverter.pool, writer);
       writer.finish(fieldInfo);
+    }
+
+    if (fieldType->rangeIndexed()) {
+      std::vector<FlushPoint> points;
+      points.reserve((size_t)numVals);
+      longStream.visitValues(inverter.pool, [&](int64_t value) {
+        points.push_back({value, 0});
+      });
+
+      IntStream::Reader lengths(lengthStream, inverter.pool);
+      size_t pointIndex = 0;
+      docsWithVal.forEachDoc(inverter.pool, [&](int32_t docid) {
+        assert(!lengths.eof());
+        int32_t length = lengths.next();
+        assert(length >= 0);
+        for (int32_t i = 0; i < length; i++) {
+          assert(pointIndex < points.size());
+          points[pointIndex++].docid = docid;
+        }
+      });
+      assert(lengths.eof());
+      assert(pointIndex == points.size());
+      writePoints(postingsWriter, fieldInfo, points);
     }
 
     // push docs

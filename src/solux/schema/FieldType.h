@@ -51,6 +51,7 @@ public:
   static constexpr flag_type FIXED_SIZE = (1 << 8);     // if all values have the same size in bytes (for otherwise variable-length fields)
   static constexpr flag_type ABSTRACT = (1 << 9);       // Abstract fields are only usable via suffix matching or inheritance
   static constexpr flag_type STORED = (1 << 10);        // Set if the field's raw values are kept in the segment's stored-fields resource for per-doc retrieval
+  static constexpr flag_type INDEX_RANGE = (1 << 11);   // Set if a numeric field has a points index
 
   const FieldType::Type type_;
   const std::string name_;
@@ -85,6 +86,8 @@ public:
 
   // TODO: check standard on cast of int to bool (check generated code too)
   bool indexed() { return (bool) (flags_ & INDEX_DOCS); }
+
+  bool rangeIndexed() const { return (bool) (flags_ & INDEX_RANGE); }
 
   // The index level is cumulative: DOCS < DOCS_FREQS < DOCS_FREQS_POSITIONS.
   // A level is present only when all of that level's bits are set; a plain

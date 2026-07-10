@@ -267,6 +267,26 @@ public:
   Stream storage;
   int32_t lastVal;
 
+  class Reader {
+    StreamReader stream;
+    int32_t previous = 0;
+
+  public:
+    Reader(const IntStream& source, const MemPool& pool) : stream(source.storage, pool) {
+    }
+
+    bool eof() const {
+      return stream.eof();
+    }
+
+    int32_t next() {
+      assert(!eof());
+      int32_t value = previous ^ stream.readVint();
+      previous = value;
+      return value;
+    }
+  };
+
   IntStream(MemPool &pool) : lastVal(0) {
     unused(pool);
   }
@@ -289,25 +309,17 @@ public:
   /// Calls sink.addInt32(int32_t val)
   template <class PostingsConsumer>
   void pushValues(MemPool& pool, PostingsConsumer& sink) {
-    StreamReader vstream(storage, pool);
-    int32_t prev = 0;
-    while (!vstream.eof()) {
-      int32_t code = vstream.readVint();
-      int32_t val = prev ^ code;
-      prev = val;
-      sink.addInt32(val);
+    Reader reader(*this, pool);
+    while (!reader.eof()) {
+      sink.addInt32(reader.next());
     }
   }
 
   // lambda / callable version
   void visitValues(MemPool& pool, auto&& sink) {
-    StreamReader vstream(storage, pool);
-    int32_t prev = 0;
-    while (!vstream.eof()) {
-      int32_t code = vstream.readVint();
-      int32_t val = prev ^ code;
-      prev = val;
-      sink(val);
+    Reader reader(*this, pool);
+    while (!reader.eof()) {
+      sink(reader.next());
     }
   }
 
@@ -384,13 +396,17 @@ public:
   /// Calls sink.addInt64(int64_t val)
   template <class PostingsConsumer>
   void pushValues(MemPool& pool, PostingsConsumer& sink) {
+    visitValues(pool, [&](int64_t value) { sink.addInt64(value); });
+  }
+
+  void visitValues(MemPool& pool, auto&& sink) {
     StreamReader vstream(storage, pool);
     int64_t prev = 0;
     while (!vstream.eof()) {
       int64_t code = vstream.readVlong();
       int64_t val = prev ^ code;
       prev = val;
-      sink.addInt64(val);
+      sink(val);
     }
   }
 
