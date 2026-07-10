@@ -171,6 +171,39 @@ public:
     return range;
   }
 
+  // Benchmark-only min-directory arm. It may include one extra left leaf.
+  FenceRange fenceRangeMinOnlyForBench(int64_t lo, int64_t hi) const {
+    FenceRange range;
+    if (hi < lo) return range;
+
+    uint32_t leftLo = 0;
+    uint32_t leftHi = leavesCount;
+    while (leftLo < leftHi) {
+      uint32_t mid = leftLo + (leftHi - leftLo) / 2;
+      if (mid + 1 < leavesCount && leafMin(mid + 1) < lo) {
+        leftLo = mid + 1;
+      } else {
+        leftHi = mid;
+      }
+    }
+
+    uint32_t rightLo = 0;
+    uint32_t rightHi = leavesCount;
+    while (rightLo < rightHi) {
+      uint32_t mid = rightLo + (rightHi - rightLo) / 2;
+      if (leafMin(mid) <= hi) rightLo = mid + 1;
+      else rightHi = mid;
+    }
+    if (leftLo >= rightLo) return range;
+
+    range.firstLeaf = leftLo;
+    range.lastLeaf = rightLo - 1;
+    range.firstOrdinal = leafOrdinalStart(range.firstLeaf);
+    range.endOrdinal = leafOrdinalEnd(range.lastLeaf);
+    range.empty = false;
+    return range;
+  }
+
   LeafValueBounds valueBounds(uint32_t leafIndex, int64_t lo, int64_t hi,
                               std::span<uint32_t> residualScratch,
                               std::span<int64_t> rawScratch) const {
