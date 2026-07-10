@@ -875,6 +875,24 @@ public:
         bits.words[lastWord] |= lastMask;
       }
 
+      static void clearRun(FixedBitSet& bits, int32_t begin, int32_t end) {
+        if (begin >= end) return;
+        int32_t firstWord = begin >> 6;
+        int32_t lastWord = (end - 1) >> 6;
+        uint64_t firstMask = ~0ULL << (begin & 63);
+        uint64_t lastMask = (end & 63) == 0
+            ? ~0ULL : (1ULL << (end & 63)) - 1ULL;
+        if (firstWord == lastWord) {
+          bits.words[firstWord] &= ~(firstMask & lastMask);
+          return;
+        }
+        bits.words[firstWord] &= ~firstMask;
+        for (int32_t word = firstWord + 1; word < lastWord; word++) {
+          bits.words[word] = 0;
+        }
+        bits.words[lastWord] &= ~lastMask;
+      }
+
       std::pair<uint64_t, uint64_t> exactPositions(MemPool& pool) {
         assert(points != nullptr);
         if (!exactReady) {
@@ -943,12 +961,12 @@ public:
 
         auto docScratch = pool.make_span<uint32_t>(points->maxPointsPerLeaf());
         auto clearDoc = [&bits](int32_t doc) { bits.clear(doc); };
-        auto clearRun = [&bits](int32_t runBegin, int32_t runEnd) {
-          for (int32_t doc = runBegin; doc < runEnd; doc++) bits.clear(doc);
+        auto clearDocRun = [&bits](int32_t runBegin, int32_t runEnd) {
+          clearRun(bits, runBegin, runEnd);
         };
-        points->emitOrdinalRange(0, begin, docScratch, clearDoc, clearRun);
+        points->emitOrdinalRange(0, begin, docScratch, clearDoc, clearDocRun);
         points->emitOrdinalRange(end, points->pointCount(), docScratch,
-                                 clearDoc, clearRun);
+                                 clearDoc, clearDocRun);
         return {{}, words.data()};
       }
 
