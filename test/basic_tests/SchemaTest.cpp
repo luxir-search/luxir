@@ -22,6 +22,7 @@ using namespace solux::test;
 namespace api = solux::api;
 namespace build = solux::api::build;
 using FieldClass = solux::api::FieldDef::FieldClass;
+using IndexMode = solux::api::FieldDef::IndexMode;
 
 static std::string schemaFileName(uint64_t gen) {
   return "_schema_" + Postings::getSortableString(gen);
@@ -117,7 +118,7 @@ TEST_F(SchemaTest, fromProtoBasic) {
   auto& f = fields[0];
   f.name = "title";
   f.field_class = FieldClass::TEXT;
-  f.indexed = true;
+  f.index = IndexMode::MATCH;
   setAnalyzer(f, "whitespace", {"lowercase"}, arena);
 
   auto& f2 = fields[1];
@@ -149,7 +150,7 @@ TEST_F(SchemaTest, inheritance) {
   auto& parent = fields[0];
   parent.name = "_wl";
   parent.field_class = FieldClass::TEXT;
-  parent.indexed = true;
+  parent.index = IndexMode::MATCH;
   parent.abstract = true;
   setAnalyzer(parent, "whitespace", {"lowercase"}, arena);
 
@@ -182,7 +183,7 @@ TEST_F(SchemaTest, inheritanceOverride) {
   auto& parent = fields[0];
   parent.name = "_wl";
   parent.field_class = FieldClass::TEXT;
-  parent.indexed = true;
+  parent.index = IndexMode::MATCH;
   parent.abstract = true;
   setAnalyzer(parent, "whitespace", {"lowercase"}, arena);
 
@@ -232,7 +233,7 @@ TEST_F(SchemaTest, mergeMode) {
   auto& f1 = baseFields[0];
   f1.name = "title";
   f1.field_class = FieldClass::TEXT;
-  f1.indexed = true;
+  f1.index = IndexMode::MATCH;
   setAnalyzer(f1, "whitespace", {}, arena);
 
   auto& f2 = baseFields[1];
@@ -297,7 +298,7 @@ TEST_F(SchemaTest, replaceMode) {
   auto& f1 = baseFields[0];
   f1.name = "title";
   f1.field_class = FieldClass::TEXT;
-  f1.indexed = true;
+  f1.index = IndexMode::MATCH;
   setAnalyzer(f1, "whitespace", {}, arena);
 
   auto& f2 = baseFields[1];
@@ -332,7 +333,7 @@ TEST_F(SchemaTest, inheritStoredFromParent) {
   auto& parent = fields[0];
   parent.name = "_body_";
   parent.field_class = FieldClass::TEXT;
-  parent.indexed = true;
+  parent.index = IndexMode::MATCH;
   parent.abstract = true;
   parent.stored = true;
   setAnalyzer(parent, "whitespace", {}, arena);
@@ -378,19 +379,19 @@ TEST_F(SchemaTest, storedRoundtripsThroughProto) {
   auto& t = fields[0];
   t.name = "body";
   t.field_class = FieldClass::TEXT;
-  t.indexed = true;
+  t.index = IndexMode::MATCH;
   t.stored = true;
   auto& s = fields[1];
   s.name = "tag";
   s.field_class = FieldClass::STRING;
-  s.indexed = true;
+  s.index = IndexMode::MATCH;
   s.column_stored = false;
   s.stored = true;
   // A non-stored field for contrast.
   auto& p = fields[2];
   p.name = "plain";
   p.field_class = FieldClass::TEXT;
-  p.indexed = true;
+  p.index = IndexMode::MATCH;
   p.stored = false;
 
   auto original = Schema::fromProto(def);
@@ -415,14 +416,14 @@ TEST_F(SchemaTest, storedResourceRoundtripsThroughProto) {
   auto& custom = fields[0];
   custom.name = "paragraphs";
   custom.field_class = FieldClass::TEXT;
-  custom.indexed = true;
+  custom.index = IndexMode::MATCH;
   custom.stored = true;
   custom.stored_resource = "_stored_embeddings_";
 
   auto& defaulted = fields[1];
   defaulted.name = "body";
   defaulted.field_class = FieldClass::TEXT;
-  defaulted.indexed = true;
+  defaulted.index = IndexMode::MATCH;
   defaulted.stored = true;
 
   auto s1 = Schema::fromProto(def);
@@ -446,7 +447,7 @@ TEST_F(SchemaTest, storedResourceInheritedFromParent) {
   auto& parent = fields[0];
   parent.name = "_emb_";
   parent.field_class = FieldClass::TEXT;
-  parent.indexed = true;
+  parent.index = IndexMode::MATCH;
   parent.abstract = true;
   parent.stored = true;
   parent.stored_resource = "_stored_embeddings_";
@@ -475,7 +476,7 @@ TEST_F(SchemaTest, mergePreservesStoredResource) {
   auto& b = baseFields[0];
   b.name = "body";
   b.field_class = FieldClass::TEXT;
-  b.indexed = true;
+  b.index = IndexMode::MATCH;
   b.stored = true;
   b.stored_resource = "_stored_embeddings_";
   auto base = Schema::fromProto(baseDef);
@@ -541,7 +542,7 @@ TEST_F(SchemaTest, indexAndSearchWithExplicitField) {
   auto& titleField = fields[n];
   titleField.name = "title";
   titleField.field_class = FieldClass::TEXT;
-  titleField.indexed = true;
+  titleField.index = IndexMode::MATCH;
   setAnalyzer(titleField, "whitespace", {"lowercase"}, arena);
 
   auto newSchema = Schema::fromProto(customDef);
@@ -585,17 +586,17 @@ TEST_F(SchemaTest, fieldClassDefaults) {
   api::SchemaDef def;
   api::FieldDef* fields = build::allocArray(def.fields, 3, arena);
 
-  // STRING field with no explicit flags - should get default indexed=true, column_stored=true
+  // STRING field with no explicit flags - should get default index=MATCH, column_stored=true
   auto& f1 = fields[0];
   f1.name = "str_field";
   f1.field_class = FieldClass::STRING;
 
-  // INT field with no explicit flags - should get default indexed=false, column_stored=true
+  // INT field with no explicit flags - should get default index=NONE, column_stored=true
   auto& f2 = fields[1];
   f2.name = "int_field";
   f2.field_class = FieldClass::INT;
 
-  // TEXT field with no explicit flags - should get default indexed=true, column_stored=false
+  // TEXT field with no explicit flags - should get default index=MATCH, column_stored=false
   auto& f3 = fields[2];
   f3.name = "text_field";
   f3.field_class = FieldClass::TEXT;
@@ -616,6 +617,64 @@ TEST_F(SchemaTest, fieldClassDefaults) {
   ASSERT_NE(nullptr, text);
   EXPECT_TRUE(text->indexed());
   EXPECT_FALSE(text->hasColumn());
+}
+
+
+// The schema must reject index modes the engine cannot honor: RANGE everywhere
+// (points index not built yet), MATCH on numerics (no numeric term postings)
+// and on VECTOR.  UNSET behaves exactly like an absent field.
+TEST_F(SchemaTest, indexModeValidation) {
+  auto trySchema = [](const char* name, FieldClass fc, IndexMode mode) {
+    std::pmr::monotonic_buffer_resource arena;
+    api::SchemaDef def;
+    api::FieldDef* fields = build::allocArray(def.fields, 1, arena);
+    fields[0].name = name;
+    fields[0].field_class = fc;
+    fields[0].index = mode;
+    return Schema::fromProto(def);
+  };
+
+  EXPECT_THROW(trySchema("price", FieldClass::INT, IndexMode::RANGE), std::runtime_error);
+  EXPECT_THROW(trySchema("when", FieldClass::DATE, IndexMode::RANGE), std::runtime_error);
+  EXPECT_THROW(trySchema("title", FieldClass::TEXT, IndexMode::RANGE), std::runtime_error);
+  EXPECT_THROW(trySchema("tag", FieldClass::STRING, IndexMode::RANGE), std::runtime_error);
+  EXPECT_THROW(trySchema("price", FieldClass::INT, IndexMode::MATCH), std::runtime_error);
+  EXPECT_THROW(trySchema("score", FieldClass::FLOAT, IndexMode::MATCH), std::runtime_error);
+  EXPECT_THROW(trySchema("emb", FieldClass::VECTOR, IndexMode::MATCH), std::runtime_error);
+
+  // Accepted modes map onto the internal flags
+  EXPECT_TRUE(trySchema("tag", FieldClass::STRING, IndexMode::MATCH)->getFieldTypePtr("tag")->indexed());
+  EXPECT_FALSE(trySchema("tag", FieldClass::STRING, IndexMode::NONE)->getFieldTypePtr("tag")->indexed());
+  EXPECT_FALSE(trySchema("price", FieldClass::INT, IndexMode::NONE)->getFieldTypePtr("price")->indexed());
+
+  // UNSET = absent: the field_class default applies
+  EXPECT_TRUE(trySchema("tag", FieldClass::STRING, IndexMode::UNSET)->getFieldTypePtr("tag")->indexed());
+  EXPECT_FALSE(trySchema("price", FieldClass::INT, IndexMode::UNSET)->getFieldTypePtr("price")->indexed());
+}
+
+
+// index mode round-trips through toProto as MATCH / NONE
+TEST_F(SchemaTest, indexModeToProto) {
+  std::pmr::monotonic_buffer_resource arena;
+  api::SchemaDef def;
+  api::FieldDef* fields = build::allocArray(def.fields, 2, arena);
+  fields[0].name = "tag";
+  fields[0].field_class = FieldClass::STRING;
+  fields[0].index = IndexMode::MATCH;
+  fields[1].name = "price";
+  fields[1].field_class = FieldClass::INT;
+
+  auto schema = Schema::fromProto(def);
+  api::SchemaDef out;
+  schema->toProto(&out, arena);
+  for (const auto& f : out.fields) {
+    ASSERT_TRUE(f.index.has_value()) << f.name;
+    if (f.name == "tag") {
+      EXPECT_EQ(IndexMode::MATCH, *f.index);
+    } else if (f.name == "price") {
+      EXPECT_EQ(IndexMode::NONE, *f.index);
+    }
+  }
 }
 
 
@@ -644,7 +703,7 @@ TEST_F(SchemaTest, schemaPersistence) {
   auto& titleField = fields[0];
   titleField.name = "title";
   titleField.field_class = FieldClass::TEXT;
-  titleField.indexed = true;
+  titleField.index = IndexMode::MATCH;
   setAnalyzer(titleField, "whitespace", {"lowercase"}, arena);
 
   auto newSchema = Schema::fromProto(customDef, defaultSchema.get());
@@ -738,7 +797,7 @@ TEST_F(SchemaTest, schemaGenWrittenToIndexInfo) {
   auto& f = fields[0];
   f.name = "title";
   f.field_class = FieldClass::TEXT;
-  f.indexed = true;
+  f.index = IndexMode::MATCH;
   setAnalyzer(f, "whitespace", {}, arena);
 
   auto newSchema = Schema::fromProto(customDef, defaultSchema.get());
@@ -783,7 +842,7 @@ TEST_F(SchemaTest, schemaLoadOnRestart) {
   auto& f = fields[0];
   f.name = "title";
   f.field_class = FieldClass::TEXT;
-  f.indexed = true;
+  f.index = IndexMode::MATCH;
   setAnalyzer(f, "whitespace", {"lowercase"}, arena);
 
   auto newSchema = Schema::fromProto(customDef, defaultSchema.get());
@@ -825,7 +884,7 @@ TEST_F(SchemaTest, sourceDef) {
   auto& parent = fields[0];
   parent.name = "_wl";
   parent.field_class = FieldClass::TEXT;
-  parent.indexed = true;
+  parent.index = IndexMode::MATCH;
   parent.abstract = true;
   setAnalyzer(parent, "whitespace", {"lowercase"}, arena);
 

@@ -13,6 +13,7 @@
 namespace solux {
 
 using FieldClass = solux::api::FieldDef_::FieldClass;
+using IndexMode = solux::api::FieldDef_::IndexMode;
 using VectorMetric = solux::api::VectorParams_::Metric;
 
 // Resolved state for a single FieldDef during fromProto processing
@@ -20,8 +21,8 @@ struct ResolvedField {
   bool abstract = false;
   bool hasFieldClass = false;
   FieldClass fieldClass = FieldClass::STRING;
-  bool hasIndexed = false;
-  bool indexed = false;
+  bool hasIndex = false;
+  IndexMode index = IndexMode::NONE;
   bool hasColumnStored = false;
   bool columnStored = false;
   bool hasMultiValued = false;
@@ -111,13 +112,13 @@ static void resolveField(std::string_view name,
     r.fieldClass = parentResolved.fieldClass;
   }
 
-  // indexed
-  if (def.indexed.has_value()) {
-    r.hasIndexed = true;
-    r.indexed = *def.indexed;
+  // index mode (UNSET is treated the same as absent)
+  if (def.index.has_value() && *def.index != IndexMode::UNSET) {
+    r.hasIndex = true;
+    r.index = *def.index;
   } else {
-    r.hasIndexed = parentResolved.hasIndexed;
-    r.indexed = parentResolved.indexed;
+    r.hasIndex = parentResolved.hasIndex;
+    r.index = parentResolved.index;
   }
 
   // column_stored
@@ -282,8 +283,8 @@ std::shared_ptr<Schema> Schema::fromProto(const solux::api::SchemaDef& def, cons
         case FieldType::VECTOR: r.fieldClass = FieldClass::VECTOR; break;
         default:                r.fieldClass = FieldClass::BIN; break;
       }
-      r.hasIndexed = true;
-      r.indexed = ft->indexed();
+      r.hasIndex = true;
+      r.index = ft->indexed() ? IndexMode::MATCH : IndexMode::NONE;
       r.hasColumnStored = true;
       r.columnStored = ft->hasColumn();
       r.hasMultiValued = true;
@@ -325,19 +326,41 @@ std::shared_ptr<Schema> Schema::fromProto(const solux::api::SchemaDef& def, cons
     }
 
     // Apply defaults based on field_class if properties were not explicitly set
-    bool indexed = r.indexed;
+    IndexMode index = r.index;
     bool columnStored = r.columnStored;
     bool multiValued = r.multiValued;
     bool stored = r.stored;
 
-    if (!r.hasIndexed) {
+    if (!r.hasIndex) {
       // defaults by field_class
       switch (r.fieldClass) {
-        case FieldClass::ID:     indexed = true; break;
-        case FieldClass::STRING: indexed = true; break;
-        case FieldClass::TEXT:   indexed = true; break;
-        case FieldClass::INT:    indexed = false; break;
-        default: indexed = false; break;
+        case FieldClass::ID:     index = IndexMode::MATCH; break;
+        case FieldClass::STRING: index = IndexMode::MATCH; break;
+        case FieldClass::TEXT:   index = IndexMode::MATCH; break;
+        case FieldClass::INT:    index = IndexMode::NONE; break;
+        default: index = IndexMode::NONE; break;
+      }
+    }
+
+    // Reject index modes the engine cannot honor yet (or ever): the schema
+    // must not accept a contract it cannot deliver.
+    bool numericClass = r.fieldClass == FieldClass::INT || r.fieldClass == FieldClass::FLOAT ||
+                        r.fieldClass == FieldClass::DOUBLE || r.fieldClass == FieldClass::DATE;
+    if (index == IndexMode::RANGE) {
+      if (numericClass) {
+        throw std::runtime_error("index=RANGE is not yet implemented for field: " + std::string(name));
+      }
+      throw std::runtime_error(
+        "index=RANGE is not supported for this field_class (field: " + std::string(name) +
+        "); MATCH-indexed string/id fields answer range queries through the terms dictionary");
+    }
+    if (index == IndexMode::MATCH) {
+      if (numericClass) {
+        throw std::runtime_error(
+          "index=MATCH (numeric term postings) is not yet implemented for field: " + std::string(name));
+      }
+      if (r.fieldClass == FieldClass::VECTOR || r.fieldClass == FieldClass::BIN) {
+        throw std::runtime_error("index=MATCH is not supported for this field_class (field: " + std::string(name) + ")");
       }
     }
     if (!r.hasColumnStored) {
@@ -361,7 +384,7 @@ std::shared_ptr<Schema> Schema::fromProto(const solux::api::SchemaDef& def, cons
 
     // Build flags
     FieldType::flag_type flags = 0;
-    if (indexed) {
+    if (index == IndexMode::MATCH) {
       if (r.fieldClass == FieldClass::TEXT) {
         flags |= FieldType::INDEX_DOCS_FREQS_POSITIONS;
       } else {
@@ -482,7 +505,7 @@ void Schema::toProto(solux::api::SchemaDef* def, std::pmr::memory_resource& aren
     }
 
     // Set flags
-    fieldDef.indexed = ft->indexed();
+    fieldDef.index = ft->indexed() ? IndexMode::MATCH : IndexMode::NONE;
     fieldDef.column_stored = ft->hasColumn();
     fieldDef.multi_valued = ft->multiValued();
     fieldDef.stored = ft->isStored();
@@ -540,7 +563,7 @@ std::shared_ptr<Schema> Schema::createDefaultSchema() {
   // Helper lambda to add a field.  `stored` is tri-state: -1 means "leave
   // unset so the field_class default applies", 0/1 set it explicitly.
   auto addField = [&](const char* name, FieldClass fc,
-                      bool abstract, bool indexed, bool columnStored,
+                      bool abstract, IndexMode index, bool columnStored,
                       bool multiValued = false,
                       const char* tokenizer = nullptr,
                       std::vector<std::string_view> filters = {},
@@ -549,7 +572,7 @@ std::shared_ptr<Schema> Schema::createDefaultSchema() {
     f.name = name;
     f.abstract = abstract;
     f.field_class = fc;
-    f.indexed = indexed;
+    f.index = index;
     f.column_stored = columnStored;
     f.multi_valued = multiValued;
     if (stored >= 0) f.stored = stored != 0;
@@ -565,36 +588,36 @@ std::shared_ptr<Schema> Schema::createDefaultSchema() {
   };
 
   // Concrete fields
-  addField("id", FieldClass::ID, false, true, true);
-  addField("_version_", FieldClass::INT, false, false, true);
+  addField("id", FieldClass::ID, false, IndexMode::MATCH, true);
+  addField("_version_", FieldClass::INT, false, IndexMode::NONE, true);
 
   // Abstract dynamic suffix fields.  TEXT suffixes inherit the field_class
   // default (stored=true) so the raw value can be returned in search results.
-  addField("_s", FieldClass::STRING, true, true, true);
-  addField("_sc", FieldClass::STRING, true, false, true);
-  addField("_ss", FieldClass::STRING, true, true, true, true);
-  addField("_ssc", FieldClass::STRING, true, false, true, true);
-  addField("_i", FieldClass::INT, true, false, true);
-  addField("_is", FieldClass::INT, true, false, true, true);
-  addField("_f", FieldClass::FLOAT, true, false, true);
-  addField("_fs", FieldClass::FLOAT, true, false, true, true);
-  addField("_d", FieldClass::DOUBLE, true, false, true);
-  addField("_ds", FieldClass::DOUBLE, true, false, true, true);
-  addField("_dt", FieldClass::DATE, true, false, true);
-  addField("_dts", FieldClass::DATE, true, false, true, true);
+  addField("_s", FieldClass::STRING, true, IndexMode::MATCH, true);
+  addField("_sc", FieldClass::STRING, true, IndexMode::NONE, true);
+  addField("_ss", FieldClass::STRING, true, IndexMode::MATCH, true, true);
+  addField("_ssc", FieldClass::STRING, true, IndexMode::NONE, true, true);
+  addField("_i", FieldClass::INT, true, IndexMode::NONE, true);
+  addField("_is", FieldClass::INT, true, IndexMode::NONE, true, true);
+  addField("_f", FieldClass::FLOAT, true, IndexMode::NONE, true);
+  addField("_fs", FieldClass::FLOAT, true, IndexMode::NONE, true, true);
+  addField("_d", FieldClass::DOUBLE, true, IndexMode::NONE, true);
+  addField("_ds", FieldClass::DOUBLE, true, IndexMode::NONE, true, true);
+  addField("_dt", FieldClass::DATE, true, IndexMode::NONE, true);
+  addField("_dts", FieldClass::DATE, true, IndexMode::NONE, true, true);
   // Text suffixes, from raw to fully folded:
   //   _w  raw whitespace tokens (case- and accent-sensitive)
   //   _wl Unicode word segmentation + NFKC case folding, accents PRESERVED
   //       (the opt-out for accent-sensitive languages: Swedish a-ring, Spanish n-tilde, ...)
   //   _t  the general default: also folds accents, so cafe matches cafe-with-accent
   //       (US/adoption-centric; lossy for some languages - use _wl there)
-  addField("_w", FieldClass::TEXT, true, true, false, false, "whitespace");
-  addField("_wl", FieldClass::TEXT, true, true, false, false, "unicode_word", {"nfkc_cf"});
-  addField("_t", FieldClass::TEXT, true, true, false, false, "unicode_word", {"nfkc_cf", "fold"});
+  addField("_w", FieldClass::TEXT, true, IndexMode::MATCH, false, false, "whitespace");
+  addField("_wl", FieldClass::TEXT, true, IndexMode::MATCH, false, false, "unicode_word", {"nfkc_cf"});
+  addField("_t", FieldClass::TEXT, true, IndexMode::MATCH, false, false, "unicode_word", {"nfkc_cf", "fold"});
   // VECTOR suffixes: single-valued (_v) and multi-valued (_vs).  dims is left
   // unset on the abstract suffix; concrete fields may pin it via VectorParams.
-  addField("_v", FieldClass::VECTOR, true, false, true);
-  addField("_vs", FieldClass::VECTOR, true, false, true, true);
+  addField("_v", FieldClass::VECTOR, true, IndexMode::NONE, true);
+  addField("_vs", FieldClass::VECTOR, true, IndexMode::NONE, true, true);
 
   // fromProto ensures the default "_stored_" resource is present.  Users can
   // override or add additional named resources (e.g. "_stored_paragraphs_")

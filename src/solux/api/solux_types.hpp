@@ -120,6 +120,7 @@ namespace Match_ { enum class Operator { OPERATOR_UNSPECIFIED = 0, OR = 1, AND =
 namespace UpdateResponse_ { enum class Status { UNKNOWN = 0, OK = 1, PARTIAL = 2, ERROR = 3 }; }
 namespace FieldDef_ {
 enum class FieldClass { STRING = 0, TEXT = 1, INT = 2, FLOAT = 3, DOUBLE = 4, BIN = 5, ID = 6, VECTOR = 7, DATE = 8 };
+enum class IndexMode { UNSET = 0, NONE = 1, MATCH = 2, RANGE = 3 };
 }
 namespace VectorParams_ { enum class Metric { NONE = 0, L2 = 1, IP = 2, COSINE = 3 }; }
 namespace SchemaRequest_ { enum class Mode { MERGE = 0, REPLACE = 1 }; }
@@ -202,14 +203,15 @@ struct VectorParams {
 };
 struct FieldDef {
   using FieldClass = solux::api::FieldDef_::FieldClass;
+  using IndexMode = solux::api::FieldDef_::IndexMode;
   std::string_view name;
   std::string_view parent;
   std::optional<AnalyzerDef> analyzer;                          // align 8
   std::string_view stored_resource;
   std::optional<FieldClass> field_class;                        // align 4 (enum)
+  std::optional<IndexMode> index;                               // align 4 (enum)
   std::optional<VectorParams> vector;                           // align 4
   bool abstract = {};                                           // align 1 (bools + optional<bool>)
-  std::optional<bool> indexed;
   std::optional<bool> column_stored;
   std::optional<bool> multi_valued;
   std::optional<bool> stored;

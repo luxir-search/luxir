@@ -826,7 +826,17 @@ message FieldDef {
   }
   optional FieldClass field_class = 4;  // if unset (default), inherited from parent
 
-  optional bool indexed = 5;
+  // Which query classes are index-accelerated for this field.  Values name the
+  // result contract, not the structure: NONE still answers Match / Range
+  // queries through a column scan when column_stored is set, just without an
+  // index.  RANGE is a superset of MATCH (an exact match is a [v,v] range).
+  enum IndexMode {
+    UNSET = 0;   // same as absent: inherit from parent, else the field_class default
+    NONE = 1;    // no index
+    MATCH = 2;   // Match queries accelerated (term postings; TEXT: analyzed full-text)
+    RANGE = 3;   // Range and Match queries accelerated (numeric / DATE fields)
+  }
+  optional IndexMode index = 5;
   optional bool column_stored = 6;
   optional bool multi_valued = 7;
 

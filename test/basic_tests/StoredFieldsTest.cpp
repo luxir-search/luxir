@@ -21,6 +21,7 @@
 #include "test/SoluxTest.h"
 
 using namespace solux;
+using IndexMode = solux::api::FieldDef::IndexMode;
 
 class StoredFieldsTest : public ::testing::Test {
 protected:
@@ -739,13 +740,13 @@ TEST_F(StoredFieldsSearchTest, storedStringField) {
     auto& f = fields.emplace_back();
     f.name = "label";
     f.field_class = solux::api::FieldDef::FieldClass::STRING;
-    f.indexed = true;
+    f.index = IndexMode::MATCH;
     f.column_stored = false;
     f.stored = true;
     auto& f2 = fields.emplace_back();
     f2.name = "aliases";
     f2.field_class = solux::api::FieldDef::FieldClass::STRING;
-    f2.indexed = true;
+    f2.index = IndexMode::MATCH;
     f2.column_stored = false;
     f2.multi_valued = true;
     f2.stored = true;
@@ -798,7 +799,7 @@ TEST_F(StoredFieldsSearchTest, columnPreferredOverStored) {
   auto& f = fields.emplace_back();
   f.name = "tag";
   f.field_class = solux::api::FieldDef::FieldClass::STRING;
-  f.indexed = false;
+  f.index = IndexMode::NONE;
   f.column_stored = true;
   f.stored = true;
   def.fields = fields;
@@ -849,12 +850,12 @@ TEST_F(StoredFieldsSearchTest, customStoredResourceFromProto) {
   auto& body = fields.emplace_back();
   body.name = "body";
   body.field_class = solux::api::FieldDef::FieldClass::TEXT;
-  body.indexed = true;
+  body.index = IndexMode::MATCH;
   body.stored = true;
   auto& para = fields.emplace_back();
   para.name = "paragraphs";
   para.field_class = solux::api::FieldDef::FieldClass::TEXT;
-  para.indexed = true;
+  para.index = IndexMode::MATCH;
   para.stored = true;
   para.stored_resource = "_stored_embeddings_";
   def.fields = fields;
@@ -938,7 +939,7 @@ TEST_F(StoredFieldsSearchTest, preStoredSegmentFallbackToColumn) {
     auto& f = fields.emplace_back();
     f.name = "name";
     f.field_class = solux::api::FieldDef::FieldClass::STRING;
-    f.indexed = true;
+    f.index = IndexMode::MATCH;
     f.column_stored = true;
     f.stored = false;
     def.fields = fields;
@@ -958,7 +959,7 @@ TEST_F(StoredFieldsSearchTest, preStoredSegmentFallbackToColumn) {
     auto& f = fields.emplace_back();
     f.name = "name";
     f.field_class = solux::api::FieldDef::FieldClass::STRING;
-    f.indexed = true;
+    f.index = IndexMode::MATCH;
     f.column_stored = false;
     f.stored = true;
     def.fields = fields;
@@ -1012,7 +1013,7 @@ TEST_F(StoredFieldsSearchTest, opportunisticStoredPullsColumnPeerFromChunk) {
     auto& f = fields.emplace_back();
     f.name = "author";
     f.field_class = solux::api::FieldDef::FieldClass::STRING;
-    f.indexed = false;
+    f.index = IndexMode::NONE;
     f.column_stored = true;
     f.stored = true;
     def.fields = fields;

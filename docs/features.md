@@ -57,7 +57,7 @@ engine is built the way it is.
   field inheritance, merge or replace semantics.
 - Field types: analyzed text, string, int, float, double, date (ISO-8601
   in, epoch-millis storage), binary, id, vector.
-- Per-field choices: indexed, multi-valued, column-stored (for sorting,
+- Per-field choices: index mode (match / range acceleration), multi-valued, column-stored (for sorting,
   faceting, and analytics), stored (for document retrieval; LZ4-compressed
   chunks).
 - Floats and doubles are stored order-preserving, so numeric sorting and
