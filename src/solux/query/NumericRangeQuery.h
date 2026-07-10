@@ -1021,6 +1021,20 @@ public:
 
       int64_t cost() override { return estimatedCost; }
 
+      Query::Scorer* createPointsScorerForTests(MemPool& targetPool) {
+        if (points == nullptr) return nullptr;
+        auto [begin, end] = exactPositions(targetPool);
+        return scorerFor(targetPool,
+            materializePoints(targetPool, begin, end));
+      }
+
+      Query::Scorer* createComplementScorerForTests(MemPool& targetPool) {
+        if (points == nullptr || reader.multiValued()) return nullptr;
+        auto [begin, end] = exactPositions(targetPool);
+        return scorerFor(targetPool,
+            materializeComplement(targetPool, begin, end));
+      }
+
       Query::Scorer* get(MemPool& targetPool, int64_t leadCost) override {
         if (leadCost < cost()) {
           skipCount(SkipStats::numericRangeSparseVerifyArms);
@@ -1106,6 +1120,20 @@ public:
       auto* supplier = scorerSupplier(targetPool, segment);
       return supplier == nullptr ? nullptr
           : supplier->get(targetPool, std::numeric_limits<int64_t>::max());
+    }
+
+    Query::Scorer* createPointsScorerForTests(MemPool& targetPool,
+                                              IndexReader::Segment& segment) {
+      auto* supplier = static_cast<Supplier*>(scorerSupplier(targetPool, segment));
+      return supplier == nullptr ? nullptr
+          : supplier->createPointsScorerForTests(targetPool);
+    }
+
+    Query::Scorer* createComplementScorerForTests(
+        MemPool& targetPool, IndexReader::Segment& segment) {
+      auto* supplier = static_cast<Supplier*>(scorerSupplier(targetPool, segment));
+      return supplier == nullptr ? nullptr
+          : supplier->createComplementScorerForTests(targetPool);
     }
 
     // Test/benchmark baseline: the exact pre-change full block-decode scan.

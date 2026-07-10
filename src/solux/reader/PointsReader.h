@@ -24,6 +24,7 @@ class PointsReader {
   uint64_t pointsFileOffset = 0;
   uint64_t metaOffset = 0;
   uint64_t pointsCount = 0;
+  uint64_t byteSize = 0;
   uint32_t leavesCount = 0;
   uint16_t leafSizeMax = 0;
   uint32_t metadataFlags = 0;
@@ -75,6 +76,7 @@ class PointsReader {
         || directoryBytes > (uint64_t)(fileEnd - points) - directoryOff) {
       invalid("truncated leaf directory");
     }
+    byteSize = directoryOff + directoryBytes;
     leafMins = points + directoryOff;
     leafMaxes = leafMins + (uint64_t)leavesCount * sizeof(int64_t);
     leafPointers = leafMaxes + (uint64_t)leavesCount * sizeof(int64_t);
@@ -126,6 +128,7 @@ public:
   }
 
   uint64_t pointCount() const { return pointsCount; }
+  uint64_t sizeInBytes() const { return byteSize; }
   uint32_t leafCount() const { return leavesCount; }
   uint16_t maxPointsPerLeaf() const { return leafSizeMax; }
   uint32_t flags() const { return metadataFlags; }
