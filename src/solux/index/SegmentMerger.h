@@ -1200,7 +1200,7 @@ private:
 
     IndirectPQ<PointRun, PointRunCompare> queue(active);
     auto output = postingsWriter.getOutputStream();
-    PointsWriter writer(*output);
+    PointsWriter writer(*output, PointsWriter::Options{});
     while (queue.size() != 0) {
       PointRun& run = queue.top();
       writer.addPoint(run.point().value, run.point().docid);

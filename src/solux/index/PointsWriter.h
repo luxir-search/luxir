@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <bit>
 #include <cstdint>
+#include <cstring>
 #include <limits>
 #include <numeric>
 #include <span>
@@ -42,6 +43,31 @@ void sortPointsByValueDocid(std::span<Point> points) {
 }
 
 class PointsWriter {
+public:
+  static constexpr uint32_t MAGIC = 0x31545053;
+  static constexpr uint16_t VERSION = 1;
+  static constexpr uint8_t FORMAT_KIND = 1;
+  static constexpr uint32_t FLAG_LEAF_MAX = 1;
+  static constexpr uint16_t DEFAULT_MAX_POINTS_PER_LEAF = 512;
+  static constexpr uint32_t FIXED_HEADER_SIZE = 28;
+  static constexpr uint32_t LEAF_HEADER_SIZE = 32;
+  static constexpr uint8_t DOC_CONTIG = 0;
+  static constexpr uint8_t DOC_FOR = 1;
+  // Codec value 2 remains reserved. BITSET is valid only when docids are
+  // strictly ascending in ordinal order, which also excludes duplicates.
+  // emitDocids serves partial ordinal ranges, and ascending order makes
+  // ordinal i the i-th set bit so boundary ranges remain word-emittable.
+  // Payload word w is absolute word (docBase >> 6) + w. docBytes covers
+  // through the word containing maxDocid, with edge bits outside the span 0.
+  static constexpr uint8_t DOC_BITSET = 3;
+
+  struct Options {
+    uint16_t maxPointsPerLeaf = DEFAULT_MAX_POINTS_PER_LEAF;
+    bool bitsetDocids = true;
+    bool valueGcd = true;
+  };
+
+private:
   struct BufferedPoint {
     int64_t value;
     int32_t docid;
@@ -49,7 +75,7 @@ class PointsWriter {
 
   OutputStream& out;
   size_t pointsStart;
-  uint16_t maxPointsPerLeaf;
+  Options options;
   uint64_t pointCount = 0;
   bool finished = false;
   bool hasLastPoint = false;
@@ -62,6 +88,7 @@ class PointsWriter {
   std::vector<uint32_t> residuals;
   std::vector<char> encodedDocs;
   std::vector<char> encodedValues;
+  std::vector<uint64_t> docWords;
 
   static void writeU16(OutputStream& target, uint16_t value) {
     target.write(&value, sizeof(value));
@@ -101,10 +128,13 @@ class PointsWriter {
 
     int64_t valueMin = leaf.front().value;
     int64_t valueMax = leaf.back().value;
-    uint64_t valueGcd = 0;
-    for (const auto& point : leaf) {
-      if (valueGcd == 1) break;
-      valueGcd = std::gcd(valueGcd, (uint64_t)point.value - (uint64_t)valueMin);
+    uint64_t valueGcd = options.valueGcd ? 0 : 1;
+    if (options.valueGcd) {
+      for (const auto& point : leaf) {
+        if (valueGcd == 1) break;
+        valueGcd = std::gcd(
+            valueGcd, (uint64_t)point.value - (uint64_t)valueMin);
+      }
     }
     if (valueGcd == 0) valueGcd = 1;
     uint64_t valueRange = ((uint64_t)valueMax - (uint64_t)valueMin) / valueGcd;
@@ -117,6 +147,14 @@ class PointsWriter {
     for (size_t i = 0; i < leaf.size(); i++) {
       if ((uint64_t)leaf[i].docid != (uint64_t)docBase + i) {
         contiguous = false;
+        break;
+      }
+    }
+
+    bool strictlyAscending = true;
+    for (size_t i = 1; i < leaf.size(); i++) {
+      if (leaf[i - 1].docid >= leaf[i].docid) {
+        strictlyAscending = false;
         break;
       }
     }
@@ -135,6 +173,27 @@ class PointsWriter {
       docBits = (uint8_t)std::bit_width(maxResidual);
       assert(docBits <= 31);
       encode(residuals, docBits, encodedDocs);
+
+      uint32_t maxDocid = (uint32_t)leaf.front().docid;
+      for (const auto& point : leaf) {
+        maxDocid = std::max(maxDocid, (uint32_t)point.docid);
+      }
+      uint64_t firstWord = (uint64_t)docBase >> 6;
+      uint64_t lastWord = (uint64_t)maxDocid >> 6;
+      uint64_t bitsetBytes = (lastWord - firstWord + 1) * sizeof(uint64_t);
+      if (options.bitsetDocids && strictlyAscending
+          && bitsetBytes < encodedDocs.size()) {
+        docCodec = DOC_BITSET;
+        docBits = 0;
+        docWords.assign((size_t)(lastWord - firstWord + 1), 0);
+        for (const auto& point : leaf) {
+          uint32_t docid = (uint32_t)point.docid;
+          size_t word = (size_t)(((uint64_t)docid >> 6) - firstWord);
+          docWords[word] |= 1ULL << (docid & 63);
+        }
+        encodedDocs.resize((size_t)bitsetBytes);
+        memcpy(encodedDocs.data(), docWords.data(), encodedDocs.size());
+      }
     }
 
     encodedValues.clear();
@@ -173,16 +232,6 @@ class PointsWriter {
   }
 
 public:
-  static constexpr uint32_t MAGIC = 0x31545053;
-  static constexpr uint16_t VERSION = 1;
-  static constexpr uint8_t FORMAT_KIND = 1;
-  static constexpr uint32_t FLAG_LEAF_MAX = 1;
-  static constexpr uint16_t DEFAULT_MAX_POINTS_PER_LEAF = 512;
-  static constexpr uint32_t FIXED_HEADER_SIZE = 28;
-  static constexpr uint32_t LEAF_HEADER_SIZE = 32;
-  static constexpr uint8_t DOC_CONTIG = 0;
-  static constexpr uint8_t DOC_FOR = 1;
-
   struct Data {
     seg_location pointsLoc;
     int64_t pointsMetaOff;
@@ -190,14 +239,15 @@ public:
     uint32_t leafCount;
   };
 
-  explicit PointsWriter(OutputStream& out,
-                        uint16_t maxPointsPerLeaf = DEFAULT_MAX_POINTS_PER_LEAF)
-      : out(out), pointsStart(out.size()), maxPointsPerLeaf(maxPointsPerLeaf) {
+  explicit PointsWriter(OutputStream& out) : PointsWriter(out, Options{}) {}
+
+  PointsWriter(OutputStream& out, Options options)
+      : out(out), pointsStart(out.size()), options(options) {
     static_assert(std::endian::native == std::endian::little);
-    if (maxPointsPerLeaf == 0) {
+    if (options.maxPointsPerLeaf == 0) {
       throw std::invalid_argument("PointsWriter: maxPointsPerLeaf must be positive");
     }
-    leaf.reserve(maxPointsPerLeaf);
+    leaf.reserve(options.maxPointsPerLeaf);
   }
 
   void addPoint(int64_t value, int32_t docid) {
@@ -214,7 +264,7 @@ public:
     hasLastPoint = true;
     lastValue = value;
     lastDocid = docid;
-    if (leaf.size() == maxPointsPerLeaf) flushLeaf();
+    if (leaf.size() == options.maxPointsPerLeaf) flushLeaf();
   }
 
   Data finish() {
@@ -237,7 +287,7 @@ public:
     out.write((char)0x11);
     writeU32(out, FLAG_LEAF_MAX);
     writeU32(out, (uint32_t)leafMin.size());
-    writeU16(out, maxPointsPerLeaf);
+    writeU16(out, options.maxPointsPerLeaf);
     writeU16(out, 0x1111);
     writeU64(out, pointCount);
     assert((uint64_t)(out.size() - pointsStart) == pointsMetaOff + FIXED_HEADER_SIZE);

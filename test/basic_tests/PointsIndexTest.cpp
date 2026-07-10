@@ -4,6 +4,7 @@
 #include <limits>
 #include <memory_resource>
 #include <span>
+#include <utility>
 #include <vector>
 
 #include <gtest/gtest.h>
@@ -36,14 +37,14 @@ T load(const char* ptr) {
 }
 
 template <class Callback>
-void withPoints(std::span<const Point> expected, uint16_t maxPointsPerLeaf,
-                Callback&& callback) {
+void withPointsOptions(std::span<const Point> expected,
+                       PointsWriter::Options options, Callback&& callback) {
   RAMDir dir;
   auto file = dir.createFile("points");
   OutputStream out(file.get());
   out.streamNumber = 0;
   out.writeBytes("pre");
-  PointsWriter writer(out, maxPointsPerLeaf);
+  PointsWriter writer(out, options);
   for (const auto& point : expected) writer.addPoint(point.value, point.docid);
   auto data = writer.finish();
   out.close();
@@ -58,9 +59,36 @@ void withPoints(std::span<const Point> expected, uint16_t maxPointsPerLeaf,
   callback(reader, data, input);
 }
 
+template <class Callback>
+void withPoints(std::span<const Point> expected, uint16_t maxPointsPerLeaf,
+                Callback&& callback) {
+  withPointsOptions(
+      expected, {.maxPointsPerLeaf = maxPointsPerLeaf},
+      std::forward<Callback>(callback));
+}
+
 void expectRoundTrip(std::span<const Point> expected, uint16_t maxPointsPerLeaf) {
   withPoints(expected, maxPointsPerLeaf, [](const PointsReader&, const PointsWriter::Data&,
                                             const InputStream&) {});
+}
+
+std::vector<int32_t> emitOrdinals(const PointsReader& reader,
+                                  uint64_t begin, uint64_t end) {
+  std::vector<int32_t> docs;
+  std::vector<uint32_t> scratch(reader.maxPointsPerLeaf());
+  reader.emitOrdinalRange(begin, end, scratch,
+      [&docs](int32_t doc) { docs.push_back(doc); },
+      [&docs](int32_t runBegin, int32_t runEnd) {
+        for (int32_t doc = runBegin; doc < runEnd; doc++) docs.push_back(doc);
+      },
+      [&docs](int32_t wordIndex, uint64_t word) {
+        while (word != 0) {
+          int32_t bit = (int32_t)std::countr_zero(word);
+          docs.push_back(wordIndex * 64 + bit);
+          word &= word - 1;
+        }
+      });
+  return docs;
 }
 
 std::vector<Point> pointsFromColumn(PostingsReader& postingsReader,
@@ -190,9 +218,10 @@ TEST_F(PointsIndexTest, valueEncodingExtremes) {
 
 TEST_F(PointsIndexTest, docidCodecSelection) {
   std::vector<Point> points = {
-    {1, 3}, {1, 4}, {1, 5},
-    {2, 3}, {2, 3}, {2, 5},
-    {3, 0}, {3, std::numeric_limits<int32_t>::max()}
+    {1000, 3}, {2000, 4}, {3000, 5},
+    {4000, 3}, {5000, 3}, {6000, 5},
+    {7000, 5}, {8000, 9}, {9000, 17},
+    {10'000, 0}, {11'000, std::numeric_limits<int32_t>::max()}
   };
   withPoints(points, 3, [](const PointsReader& reader, const PointsWriter::Data&,
                            const InputStream&) {
@@ -200,8 +229,11 @@ TEST_F(PointsIndexTest, docidCodecSelection) {
     EXPECT_EQ(0, reader.leafInfo(0).docBytes);
     EXPECT_EQ(PointsWriter::DOC_FOR, reader.leafInfo(1).docCodec);
     EXPECT_EQ(2, reader.leafInfo(1).docBits);
-    EXPECT_EQ(PointsWriter::DOC_FOR, reader.leafInfo(2).docCodec);
-    EXPECT_EQ(31, reader.leafInfo(2).docBits);
+    EXPECT_EQ(PointsWriter::DOC_BITSET, reader.leafInfo(2).docCodec);
+    EXPECT_EQ(0, reader.leafInfo(2).docBits);
+    EXPECT_EQ(8, reader.leafInfo(2).docBytes);
+    EXPECT_EQ(PointsWriter::DOC_FOR, reader.leafInfo(3).docCodec);
+    EXPECT_EQ(31, reader.leafInfo(3).docBits);
   });
 
   std::vector<Point> sameDocDuplicates = {{9, 17}, {9, 17}};
@@ -210,6 +242,60 @@ TEST_F(PointsIndexTest, docidCodecSelection) {
     EXPECT_EQ(PointsWriter::DOC_FOR, reader.leafInfo(0).docCodec);
     EXPECT_EQ(0, reader.leafInfo(0).docBits);
     EXPECT_EQ(0, reader.leafInfo(0).docBytes);
+  });
+}
+
+TEST_F(PointsIndexTest, bitsetOrdinalWindowsAndOptions) {
+  std::vector<Point> points;
+  for (int32_t doc = 5; doc <= 150; doc++) {
+    if (doc % 3 != 0 || doc == 63 || doc == 64
+        || doc == 127 || doc == 128) {
+      points.push_back({(int64_t)points.size() * 1000, doc});
+    }
+  }
+
+  withPointsOptions(points, {.maxPointsPerLeaf = 64},
+      [&](const PointsReader& reader, const PointsWriter::Data&,
+          const InputStream&) {
+    ASSERT_EQ(2u, reader.leafCount());
+    EXPECT_EQ(PointsWriter::DOC_BITSET, reader.leafInfo(0).docCodec);
+    EXPECT_EQ(PointsWriter::DOC_BITSET, reader.leafInfo(1).docCodec);
+    EXPECT_GT(reader.leafInfo(0).valueGcd, 1);
+    EXPECT_EQ(5u, reader.leafInfo(0).docBase);
+
+    auto expectRange = [&](uint64_t begin, uint64_t end) {
+      std::vector<int32_t> expected;
+      for (uint64_t i = begin; i < end; i++) {
+        expected.push_back(points[(size_t)i].docid);
+      }
+      EXPECT_EQ(expected, emitOrdinals(reader, begin, end));
+    };
+    expectRange(0, points.size());
+    expectRange(7, points.size() - 7);
+    expectRange(60, 68);
+
+    auto ordinal = [&](int32_t doc) {
+      return (uint64_t)(std::find_if(points.begin(), points.end(),
+          [doc](const Point& point) { return point.docid == doc; })
+          - points.begin());
+    };
+    expectRange(ordinal(64), ordinal(127));
+    expectRange(ordinal(63), ordinal(128) + 1);
+  });
+
+  withPointsOptions(points,
+      {.maxPointsPerLeaf = 128, .valueGcd = false},
+      [](const PointsReader& reader, const PointsWriter::Data&,
+         const InputStream&) {
+    EXPECT_EQ(1u, reader.leafInfo(0).valueGcd);
+    EXPECT_EQ(PointsWriter::DOC_BITSET, reader.leafInfo(0).docCodec);
+  });
+  withPointsOptions(points,
+      {.maxPointsPerLeaf = 128, .bitsetDocids = false},
+      [](const PointsReader& reader, const PointsWriter::Data&,
+         const InputStream&) {
+    EXPECT_GT(reader.leafInfo(0).valueGcd, 1);
+    EXPECT_EQ(PointsWriter::DOC_FOR, reader.leafInfo(0).docCodec);
   });
 }
 

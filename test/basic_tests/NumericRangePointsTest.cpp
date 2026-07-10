@@ -1,6 +1,7 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <memory_resource>
 #include <optional>
@@ -15,6 +16,7 @@
 #include "solux/reader/FieldReader.h"
 #include "solux/reader/PointsReader.h"
 #include "solux/schema/Schema.h"
+#include "solux/util/random.h"
 #include "test/CollectionHelper.h"
 #include "test/SoluxTest.h"
 
@@ -194,6 +196,61 @@ TEST_F(NumericRangePointsTest, randomizedOracleAcrossScorerAndBulkPaths) {
       EXPECT_EQ(materialized(*reader, field, lo, hi), expected);
       EXPECT_EQ(exactCount(*reader, field, lo, hi), (int64_t)expected.size());
     }
+  }
+}
+
+TEST_F(NumericRangePointsTest, bitsetLeavesMatchEveryQueryArm) {
+  constexpr int32_t N = 1400;
+  CollectionHelper helper;
+  helper.clear();
+  const RangeField fields[] = {{"bitset_point"}};
+  setRangeSchema(helper, fields);
+
+  std::vector<std::vector<int64_t>> values(N);
+  auto writer = helper.getIndexWriter();
+  Inverter& inverter = writer->obtainInverter();
+  auto& field = inverter.getIndexHandler("bitset_point");
+  SplitMix64 rng(0x91c7a5e3);
+  for (int32_t doc = 0; doc < N; doc++) {
+    inverter.startDoc();
+    if (rng.rint(2) == 0) {
+      values[(size_t)doc] = {(int64_t)doc * 3};
+      field.index(inverter, values[(size_t)doc][0]);
+    }
+    inverter.finishDoc();
+  }
+  writer->releaseInverter(inverter);
+  writer->commit();
+  auto reader = writer->getIndexReader();
+  auto& segment = reader->segments()[0];
+  SegFieldInfo info = fieldInfo(segment, "bitset_point");
+  PointsReader points(segment.postingsReader(), info);
+  points.validate();
+  ASSERT_EQ(2u, points.leafCount());
+  EXPECT_EQ(PointsWriter::DOC_BITSET, points.leafInfo(0).docCodec);
+  EXPECT_EQ(PointsWriter::DOC_BITSET, points.leafInfo(1).docCodec);
+  EXPECT_GT(points.leafInfo(0).valueGcd, 1);
+
+  const std::array<std::pair<int64_t, int64_t>, 4> ranges = {{
+    {0, 30},
+    {300, 2700},
+    {3000, 3300},
+    {0, (int64_t)N * 3},
+  }};
+  for (auto [lo, hi] : ranges) {
+    auto expected = oracle(values, lo, hi);
+    MemPool pool;
+    QueryState state(pool, *reader, "bitset_point", lo, hi);
+    EXPECT_EQ(expected, collect(state.weight->createFullScanScorerForTests(
+                            pool, segment)));
+    EXPECT_EQ(expected, collect(state.weight->createPointsScorerForTests(
+                            pool, segment)));
+    EXPECT_EQ(expected, collect(state.weight->createComplementScorerForTests(
+                            pool, segment)));
+    EXPECT_EQ(expected, collect(state.weight->createZoneMapScorerForTests(
+                            pool, segment)));
+    EXPECT_EQ(expected, collect(state.weight->createScorer(pool, segment)));
+    EXPECT_EQ(expected, materialized(*reader, "bitset_point", lo, hi));
   }
 }
 

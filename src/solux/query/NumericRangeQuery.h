@@ -921,6 +921,9 @@ public:
               [&bits](int32_t doc) { bits.set(doc); },
               [&bits](int32_t runBegin, int32_t runEnd) {
                 setRun(bits, runBegin, runEnd);
+              },
+              [&bits](int32_t wordIndex, uint64_t word) {
+                bits.words[wordIndex] |= word;
               });
           return {{}, words.data()};
         }
@@ -932,6 +935,13 @@ public:
             [&docs, &size](int32_t runBegin, int32_t runEnd) {
               for (int32_t doc = runBegin; doc < runEnd; doc++) {
                 docs[size++] = doc;
+              }
+            },
+            [&docs, &size](int32_t wordIndex, uint64_t word) {
+              while (word != 0) {
+                int32_t bit = (int32_t)std::countr_zero(word);
+                docs[size++] = wordIndex * 64 + bit;
+                word &= word - 1;
               }
             });
         assert(size == expected);
@@ -964,9 +974,13 @@ public:
         auto clearDocRun = [&bits](int32_t runBegin, int32_t runEnd) {
           clearRun(bits, runBegin, runEnd);
         };
-        points->emitOrdinalRange(0, begin, docScratch, clearDoc, clearDocRun);
+        auto clearWord = [&bits](int32_t wordIndex, uint64_t word) {
+          bits.words[wordIndex] &= ~word;
+        };
+        points->emitOrdinalRange(
+            0, begin, docScratch, clearDoc, clearDocRun, clearWord);
         points->emitOrdinalRange(end, points->pointCount(), docScratch,
-                                 clearDoc, clearDocRun);
+                                 clearDoc, clearDocRun, clearWord);
         return {{}, words.data()};
       }
 

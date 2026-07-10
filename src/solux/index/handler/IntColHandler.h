@@ -27,7 +27,7 @@ inline void writePoints(PostingsWriter& postingsWriter,
                         std::vector<FlushPoint>& points) {
   sortPointsByValueDocid(std::span<FlushPoint>(points));
   auto output = postingsWriter.getOutputStream();
-  PointsWriter writer(*output);
+  PointsWriter writer(*output, PointsWriter::Options{});
   for (const auto& point : points) writer.addPoint(point.value, point.docid);
   auto data = writer.finish();
   fieldInfo.pointsLoc = data.pointsLoc;

@@ -221,10 +221,10 @@ public:
     return bounds;
   }
 
-  template <class EmitDoc, class EmitRun>
+  template <class EmitDoc, class EmitRun, class EmitWord>
   void emitDocids(uint32_t leafIndex, uint16_t begin, uint16_t end,
                   std::span<uint32_t> docScratch, EmitDoc emitDoc,
-                  EmitRun emitRun) const {
+                  EmitRun emitRun, EmitWord emitWord) const {
     LeafInfo info = leafInfo(leafIndex);
     if (begin > end || end > info.count) {
       throw std::out_of_range("PointsReader: leaf point range");
@@ -234,11 +234,55 @@ public:
       emitRun((int32_t)(info.docBase + begin), (int32_t)(info.docBase + end));
       return;
     }
+    const char* payload =
+        points + leafFP(leafIndex) + PointsWriter::LEAF_HEADER_SIZE;
+    if (info.docCodec == PointsWriter::DOC_BITSET) {
+      uint32_t wordCount = info.docBytes / sizeof(uint64_t);
+      int32_t wordBase = (int32_t)(info.docBase >> 6);
+      if (begin == 0 && end == info.count) {
+        for (uint32_t wordIndex = 0; wordIndex < wordCount; wordIndex++) {
+          uint64_t word = load<uint64_t>(
+              payload + (uint64_t)wordIndex * sizeof(uint64_t));
+          if (word != 0) emitWord(wordBase + (int32_t)wordIndex, word);
+        }
+        return;
+      }
+
+      auto selectBit = [&](uint16_t ordinal) {
+        if (ordinal == info.count) return wordCount << 6;
+        uint32_t remaining = ordinal;
+        for (uint32_t wordIndex = 0; wordIndex < wordCount; wordIndex++) {
+          uint64_t word = load<uint64_t>(
+              payload + (uint64_t)wordIndex * sizeof(uint64_t));
+          uint32_t count = (uint32_t)std::popcount(word);
+          if (remaining < count) {
+            while (remaining-- != 0) word &= word - 1;
+            return (wordIndex << 6) + (uint32_t)std::countr_zero(word);
+          }
+          remaining -= count;
+        }
+        invalid("BITSET ordinal exceeds popcount");
+      };
+
+      uint32_t firstBit = selectBit(begin);
+      uint32_t endBit = selectBit(end);
+      uint32_t firstWord = firstBit >> 6;
+      uint32_t lastWord = (endBit - 1) >> 6;
+      for (uint32_t wordIndex = firstWord; wordIndex <= lastWord; wordIndex++) {
+        uint64_t word = load<uint64_t>(
+            payload + (uint64_t)wordIndex * sizeof(uint64_t));
+        if (wordIndex == firstWord) word &= ~0ULL << (firstBit & 63);
+        if (wordIndex == lastWord && (endBit & 63) != 0) {
+          word &= (1ULL << (endBit & 63)) - 1ULL;
+        }
+        if (word != 0) emitWord(wordBase + (int32_t)wordIndex, word);
+      }
+      return;
+    }
     if (info.docCodec != PointsWriter::DOC_FOR) invalid("reserved docid codec");
     if (docScratch.size() < info.count) {
       throw std::invalid_argument("PointsReader: docid scratch is too small");
     }
-    const char* payload = points + leafFP(leafIndex) + PointsWriter::LEAF_HEADER_SIZE;
     IndexCodec::numericCodec.decodeWithMeta(payload, docScratch.data(), info.count,
                                              info.docBits);
     for (uint16_t i = begin; i < end; i++) {
@@ -250,10 +294,10 @@ public:
     }
   }
 
-  template <class EmitDoc, class EmitRun>
+  template <class EmitDoc, class EmitRun, class EmitWord>
   void emitOrdinalRange(uint64_t begin, uint64_t end,
                         std::span<uint32_t> docScratch, EmitDoc emitDoc,
-                        EmitRun emitRun) const {
+                        EmitRun emitRun, EmitWord emitWord) const {
     if (begin > end || end > pointsCount) {
       throw std::out_of_range("PointsReader: point ordinal range");
     }
@@ -263,7 +307,8 @@ public:
       uint64_t leafEnd = leafOrdinalEnd(leafIndex);
       uint64_t partEnd = std::min(end, leafEnd);
       emitDocids(leafIndex, (uint16_t)(begin - leafStart),
-                 (uint16_t)(partEnd - leafStart), docScratch, emitDoc, emitRun);
+                 (uint16_t)(partEnd - leafStart), docScratch, emitDoc, emitRun,
+                 emitWord);
       begin = partEnd;
     }
   }
@@ -291,6 +336,23 @@ public:
         }
         docids[i] = (uint32_t)doc;
       }
+    } else if (info.docCodec == PointsWriter::DOC_BITSET) {
+      uint32_t size = 0;
+      uint32_t wordBase = info.docBase >> 6;
+      uint32_t wordCount = info.docBytes / sizeof(uint64_t);
+      for (uint32_t wordIndex = 0; wordIndex < wordCount; wordIndex++) {
+        uint64_t word = load<uint64_t>(
+            docPayload + (uint64_t)wordIndex * sizeof(uint64_t));
+        while (word != 0) {
+          if (size == info.count) {
+            invalid("BITSET popcount exceeds count");
+          }
+          uint32_t bit = (uint32_t)std::countr_zero(word);
+          docids[size++] = (wordBase + wordIndex) * 64 + bit;
+          word &= word - 1;
+        }
+      }
+      if (size != info.count) invalid("BITSET popcount does not match count");
     } else {
       invalid("reserved docid codec");
     }
@@ -333,6 +395,9 @@ public:
           || (uint8_t)points[start + 7] != 0x11) {
         invalid("bad leaf reserved bytes");
       }
+      if ((uint64_t)PointsWriter::LEAF_HEADER_SIZE + info.docBytes > end - start) {
+        invalid("docid payload exceeds leaf");
+      }
       if (info.docCodec == PointsWriter::DOC_CONTIG) {
         if (info.docBits != 0 || info.docBytes != 0) invalid("invalid CONTIG metadata");
         if ((uint64_t)info.docBase + info.count - 1
@@ -344,11 +409,46 @@ public:
         if (info.docBytes != SoluxSIMDFor::byteSize(info.count, info.docBits)) {
           invalid("invalid FOR byte length");
         }
+      } else if (info.docCodec == PointsWriter::DOC_BITSET) {
+        if (info.docBits != 0) invalid("BITSET docBits must be zero");
+        if (info.docBytes == 0 || info.docBytes % sizeof(uint64_t) != 0) {
+          invalid("invalid BITSET byte length");
+        }
+        const char* payload = points + start + PointsWriter::LEAF_HEADER_SIZE;
+        uint32_t wordCount = info.docBytes / sizeof(uint64_t);
+        uint64_t firstWord = load<uint64_t>(payload);
+        uint32_t baseBit = info.docBase & 63;
+        uint64_t belowBaseMask = baseBit == 0
+            ? 0 : (1ULL << baseBit) - 1ULL;
+        if ((firstWord & belowBaseMask) != 0
+            || (firstWord & (1ULL << baseBit)) == 0) {
+          invalid("BITSET has bits below docBase or omits docBase");
+        }
+        uint64_t popcount = 0;
+        for (uint32_t wordIndex = 0; wordIndex < wordCount; wordIndex++) {
+          popcount += (uint64_t)std::popcount(load<uint64_t>(
+              payload + (uint64_t)wordIndex * sizeof(uint64_t)));
+        }
+        if (popcount != info.count) {
+          invalid("BITSET popcount does not match count");
+        }
+        uint64_t lastWord = load<uint64_t>(
+            payload + (uint64_t)(wordCount - 1) * sizeof(uint64_t));
+        if (lastWord == 0) invalid("BITSET has trailing zero words");
+        uint32_t maxBit = 63 - (uint32_t)std::countl_zero(lastWord);
+        uint64_t maxDocid = ((uint64_t)(info.docBase >> 6) + wordCount - 1) * 64
+                          + maxBit;
+        if (maxDocid > (uint64_t)std::numeric_limits<int32_t>::max()) {
+          invalid("BITSET docid exceeds int32");
+        }
+        uint64_t expectedBytes =
+            (((maxDocid >> 6) - ((uint64_t)info.docBase >> 6)) + 1)
+            * sizeof(uint64_t);
+        if (expectedBytes != info.docBytes) {
+          invalid("BITSET byte length does not match docid span");
+        }
       } else {
         invalid("reserved docid codec");
-      }
-      if ((uint64_t)PointsWriter::LEAF_HEADER_SIZE + info.docBytes > end - start) {
-        invalid("docid payload exceeds leaf");
       }
       uint64_t valueBytes = end - start - PointsWriter::LEAF_HEADER_SIZE - info.docBytes;
       uint64_t expectedValueBytes = info.valueFormat <= 32
@@ -411,7 +511,7 @@ public:
 
     if (info.docCodec == PointsWriter::DOC_CONTIG) {
       for (uint32_t i = 0; i < info.count; i++) docs[i] = info.docBase + i;
-    } else {
+    } else if (info.docCodec == PointsWriter::DOC_FOR) {
       uint32_t read = IndexCodec::numericCodec.decodeWithMeta(docPayload, docs.data(),
                                                                info.count, info.docBits);
       if (read != info.docBytes) invalid("FOR decoder byte length mismatch");
@@ -420,6 +520,25 @@ public:
         if (restored > (uint64_t)std::numeric_limits<int32_t>::max()) invalid("decoded docid exceeds int32");
         doc = (uint32_t)restored;
       }
+    } else if (info.docCodec == PointsWriter::DOC_BITSET) {
+      uint32_t size = 0;
+      uint32_t wordBase = info.docBase >> 6;
+      uint32_t wordCount = info.docBytes / sizeof(uint64_t);
+      for (uint32_t wordIndex = 0; wordIndex < wordCount; wordIndex++) {
+        uint64_t word = load<uint64_t>(
+            docPayload + (uint64_t)wordIndex * sizeof(uint64_t));
+        while (word != 0) {
+          if (size == info.count) {
+            invalid("BITSET popcount exceeds count");
+          }
+          uint32_t bit = (uint32_t)std::countr_zero(word);
+          docs[size++] = (wordBase + wordIndex) * 64 + bit;
+          word &= word - 1;
+        }
+      }
+      if (size != info.count) invalid("BITSET popcount does not match count");
+    } else {
+      invalid("reserved docid codec");
     }
 
     if (info.valueFormat <= 32) {
