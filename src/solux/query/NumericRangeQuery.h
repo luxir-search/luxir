@@ -1,36 +1,27 @@
 #pragma once
 
+#include <algorithm>
 #include <cassert>
 #include <cstdint>
+#include <limits>
 #include <span>
 #include <string_view>
+#include <vector>
 
 #include "solux/query/Query.h"
 #include "solux/reader/IntColReader.h"
 
 namespace solux {
 
-// Numeric range query executed by scanning the field's numeric column (there is
-// no points/BKD index yet).  Every numeric field type stores an
-// order-preserving encoded int64 in one shared int column (INT raw, FLOAT/DOUBLE
-// Lucene sortable bits, DATE epoch millis - see NumericUtils.h / ValCoerce.cpp),
-// so the query works purely in encoded int64 space: the builder coerces the
-// user's endpoints with FieldType::coerceColInt64 and folds exclusive bounds
-// into an inclusive [lo, hi] window (integers, so v > k  <=>  v >= k+1).  A doc
-// matches iff any of its values falls in [lo, hi]; a doc with no value never
-// matches.  Comparisons follow the field's encoded sortable order, so for
-// FLOAT/DOUBLE -0.0 sorts below +0.0 and NaN sorts above +Inf.
-//
-// Two-phase iteration: the approximation walks the column's docs-with-value and
-// matches() verifies the value(s) at the current doc.  In a selective
-// conjunction a cheaper clause leads and this query verifies its candidates by
-// random-access column reads instead of a full scan.  Constant scoring (score 0,
-// filter semantics) like AllQuery; deletes/domain are applied by the collector,
-// not here.
+// Numeric range query over the doc-order numeric column. Every numeric field
+// type stores an order-preserving encoded int64 (INT raw, FLOAT/DOUBLE Lucene
+// sortable bits, DATE epoch millis), so all pruning and comparisons happen in
+// encoded space. A document matches when any value is in inclusive [lo, hi].
 class NumericRangeQuery final : public Query {
   std::string_view field;
-  int64_t lo;  // inclusive lower bound, encoded
-  int64_t hi;  // inclusive upper bound, encoded
+  int64_t lo;
+  int64_t hi;
+
 public:
   NumericRangeQuery(std::string_view field, int64_t lo, int64_t hi)
     : field(field), lo(lo), hi(hi) {}
@@ -43,34 +34,26 @@ public:
     return context.pool.make<Weight>(context, *this, flags);
   }
 
-  // Two-phase scorer over one segment's numeric column.  ColIter selects the
-  // value-decode strategy: bulk Iterator (block decode) when this scorer DRIVES
-  // iteration (a full scan), SparseIterator (per-value decode) when it VERIFIES
-  // a cheaper lead's candidates in a conjunction.  Both expose the same
-  // DocIterator API.
+  // This is deliberately the pre-zone-map scorer. It remains the sparse
+  // two-phase verifier and is also exposed to the benchmark as the old full
+  // column-scan baseline when instantiated with IntColReader::Iterator.
   template <class ColIter>
   class RangeScorer final : public Query::Scorer {
     IntColReader& reader;
     ColIter iter;
     int64_t lo;
     int64_t hi;
-    bool allMatch;  // segment column entirely within [lo,hi]: skip per-value compares
+    bool allMatch;
     bool multi;
     int32_t docid = -1;
 
-    // Test the value(s) at the current approximation doc against [lo, hi].
-    // Idempotent: reads column values, consumes no iterator state.
     bool valueInRange() {
       if (docid == PostingsReader::END) return false;
       if (!multi) {
-        // A single-valued doc-with-value always has exactly one value.
         if (allMatch) return true;
         int64_t v = iter.value();
         return lo <= v && v <= hi;
       }
-      // Multi-valued: match if ANY value is in range.  Empty arrays are stored
-      // as docs-with-value with an empty rank range, so they must not match even
-      // under allMatch (hence the start < end guard).
       auto [start, end] = reader.getStartEndValueRank(iter.rank());
       if (allMatch) return start < end;
       for (int64_t r = start; r < end; r++) {
@@ -85,20 +68,21 @@ public:
       : reader(reader), iter(reader), lo(lo), hi(hi), allMatch(allMatch),
         multi(reader.multiValued()) {}
 
-    // ---- two-phase iteration ----
     bool hasTwoPhase() const override { return true; }
     int32_t approximationNext() override { docid = iter.next(); return docid; }
-    int32_t approximationAdvance(int32_t target) override { docid = iter.advance(target); return docid; }
+    int32_t approximationAdvance(int32_t target) override {
+      docid = iter.advance(target);
+      return docid;
+    }
     int32_t approximationDocId() override { return docid; }
     bool matches() override { return valueInRange(); }
     float matchCost() override {
       if (allMatch) return 0.0f;
-      if (!multi) return 1.0f;  // one column read + compare
+      if (!multi) return 1.0f;
       int64_t docs = reader.docsWithValue();
       return docs > 0 ? (float)reader.numValues() / (float)docs : 1.0f;
     }
 
-    // ---- single-phase (standalone / non-two-phase consumers) ----
     int32_t next() override {
       for (;;) {
         docid = iter.next();
@@ -117,66 +101,624 @@ public:
     float score() override { return 0.0f; }
   };
 
+  enum class BlockRelation : uint8_t {
+    OUTSIDE,
+    INSIDE,
+    CROSSES
+  };
+
+  struct BlockPlan {
+    BlockRelation relation = BlockRelation::OUTSIDE;
+    uint32_t lowerResidual = 0;
+    uint32_t upperResidual = 0;
+  };
+
+  static BlockPlan classifyBlock(const IntColReader::NumericBlockInfo& block,
+                                 int64_t lo, int64_t hi) {
+    BlockPlan plan;
+    if (block.max < lo || hi < block.min) {
+      return plan;
+    }
+    if (lo <= block.min && block.max <= hi) {
+      plan.relation = BlockRelation::INSIDE;
+      return plan;
+    }
+
+    plan.relation = BlockRelation::CROSSES;
+    if (block.format > 32) {
+      return plan;
+    }
+
+    // CROSSES guarantees every subtraction below represents a non-negative
+    // signed-order distance. Unsigned subtraction makes the full INT64 span
+    // exact, and quotient+remainder implements ceil without overflow.
+    uint64_t gcd = (uint64_t)block.gcd;
+    assert(gcd != 0);
+    uint64_t lower = 0;
+    if (lo > block.min) {
+      uint64_t delta = (uint64_t)lo - (uint64_t)block.min;
+      lower = delta / gcd + (delta % gcd != 0);
+    }
+    uint64_t upper;
+    if (hi >= block.max) {
+      upper = ((uint64_t)block.max - (uint64_t)block.min) / gcd;
+    } else {
+      upper = ((uint64_t)hi - (uint64_t)block.min) / gcd;
+    }
+    // A compressed block's maximum persisted residual fits its format<=32.
+    // Saturation keeps a defensive release build correct at both signed
+    // extremes even if future metadata admits a wider residual.
+    plan.lowerResidual = lower > UINT32_MAX ? UINT32_MAX : (uint32_t)lower;
+    plan.upperResidual = upper > UINT32_MAX ? UINT32_MAX : (uint32_t)upper;
+    return plan;
+  }
+
+  class CrossingValues {
+    IntColReader& reader;
+    int64_t residualStart = -1;
+    int64_t rawStart = -1;
+    uint32_t residualCount = 0;
+    uint32_t rawCount = 0;
+    uint32_t residuals[128];
+    int64_t raw[128];
+
+  public:
+    explicit CrossingValues(IntColReader& reader) : reader(reader) {}
+
+    bool matches(int64_t valueRank, const BlockPlan& plan, int64_t lo, int64_t hi) {
+      int64_t blockNum = valueRank / Postings::NUMERIC_BLOCK_SIZE;
+      const auto& block = reader.blockInfo(blockNum);
+      if (block.format <= 32) {
+        if (valueRank < residualStart
+            || valueRank >= residualStart + (int64_t)residualCount) {
+          residualStart = reader.decodeResidualSubBlock(valueRank, residuals,
+                                                        residualCount);
+        }
+        uint32_t v = residuals[valueRank - residualStart];
+        return plan.lowerResidual <= v && v <= plan.upperResidual;
+      }
+      if (valueRank < rawStart || valueRank >= rawStart + (int64_t)rawCount) {
+        rawStart = reader.decodeRawSubBlock(valueRank, raw, rawCount);
+      }
+      int64_t v = raw[valueRank - rawStart];
+      return lo <= v && v <= hi;
+    }
+  };
+
+  class ZoneMapScorer final : public Query::Scorer {
+    static constexpr int32_t ITER_WINDOW_SIZE = 4096;
+    static constexpr int32_t ITER_WINDOW_WORDS = ITER_WINDOW_SIZE / 64;
+
+    IntColReader& reader;
+    std::span<const BlockPlan> plans;
+    screaming::BitSet::Selector* selector = nullptr;
+    CrossingValues crossing;
+    std::span<uint64_t> iterBits;
+    int64_t lo;
+    int64_t hi;
+    int32_t maxDoc;
+    int32_t docid = -1;
+    int32_t iterWindowStart = 0;
+    int32_t iterWindowEnd = 0;
+
+    static void setBit(std::span<uint64_t> words, int32_t windowStart,
+                       int32_t doc) {
+      int32_t index = doc - windowStart;
+      words[(size_t)(index >> 6)] |= 1ULL << (index & 63);
+    }
+
+    static void setRun(std::span<uint64_t> words, int32_t windowStart,
+                       int32_t start, int32_t end) {
+      if (start >= end) return;
+      int32_t first = start - windowStart;
+      int32_t last = end - windowStart;
+      int32_t firstWord = first >> 6;
+      int32_t lastWord = (last - 1) >> 6;
+      uint64_t firstMask = ~0ULL << (first & 63);
+      uint64_t lastMask = ((last & 63) == 0)
+          ? ~0ULL : ((1ULL << (last & 63)) - 1ULL);
+      if (firstWord == lastWord) {
+        words[(size_t)firstWord] |= firstMask & lastMask;
+        return;
+      }
+      words[(size_t)firstWord] |= firstMask;
+      for (int32_t w = firstWord + 1; w < lastWord; w++) {
+        words[(size_t)w] = ~0ULL;
+      }
+      words[(size_t)lastWord] |= lastMask;
+    }
+
+    int32_t docForRank(int32_t rank) const {
+      return selector == nullptr ? rank : selector->select(rank);
+    }
+
+    std::pair<int32_t, int32_t> firstDocRank(int32_t min) const {
+      if (reader.denseDocsWithValue()) {
+        if (min >= reader.docsWithValue()) return {PostingsReader::END, 0};
+        return {min, min};
+      }
+      screaming::BitSet::Iterator iter(reader.docsWithValueBitSet());
+      int32_t doc = iter.advance(min);
+      if (doc == screaming::BitSet::END) return {PostingsReader::END, 0};
+      return {doc, iter.rank()};
+    }
+
+    void fillSingle(std::span<uint64_t> words, int32_t min, int32_t max) {
+      auto [doc, rank] = firstDocRank(min);
+      int64_t nvals = reader.numValues();
+      while (doc < max && rank < nvals) {
+        int64_t blockNum = rank / Postings::NUMERIC_BLOCK_SIZE;
+        int64_t blockEnd = std::min<int64_t>(nvals,
+            (blockNum + 1) * (int64_t)Postings::NUMERIC_BLOCK_SIZE);
+        const BlockPlan& plan = plans[(size_t)blockNum];
+        if (plan.relation == BlockRelation::OUTSIDE) {
+          rank = (int32_t)blockEnd;
+          if (rank >= nvals) break;
+          doc = docForRank(rank);
+          continue;
+        }
+        if (plan.relation == BlockRelation::INSIDE
+            && reader.denseDocsWithValue()) {
+          int32_t runEnd = (int32_t)std::min<int64_t>(blockEnd, max);
+          setRun(words, min, doc, runEnd);
+          rank = runEnd;
+          doc = runEnd;
+          continue;
+        }
+
+        int64_t limit = blockEnd;
+        while (rank < limit) {
+          doc = docForRank(rank);
+          if (doc >= max) return;
+          if (plan.relation == BlockRelation::INSIDE
+              || crossing.matches(rank, plan, lo, hi)) {
+            setBit(words, min, doc);
+          }
+          rank++;
+        }
+        if (rank < nvals) doc = docForRank(rank);
+      }
+    }
+
+    bool docValuesMatch(int64_t start, int64_t end) {
+      int64_t rank = start;
+      while (rank < end) {
+        int64_t blockNum = rank / Postings::NUMERIC_BLOCK_SIZE;
+        int64_t blockEnd = std::min<int64_t>(end,
+            (blockNum + 1) * (int64_t)Postings::NUMERIC_BLOCK_SIZE);
+        const BlockPlan& plan = plans[(size_t)blockNum];
+        if (plan.relation == BlockRelation::INSIDE) return true;
+        if (plan.relation == BlockRelation::CROSSES) {
+          while (rank < blockEnd) {
+            if (crossing.matches(rank, plan, lo, hi)) return true;
+            rank++;
+          }
+        } else {
+          rank = blockEnd;
+        }
+      }
+      return false;
+    }
+
+    void fillMulti(std::span<uint64_t> words, int32_t min, int32_t max) {
+      auto [doc, docRank] = firstDocRank(min);
+      while (doc < max && docRank < reader.docsWithValue()) {
+        auto [start, end] = reader.getStartEndValueRank(docRank);
+        if (start < end && docValuesMatch(start, end)) {
+          setBit(words, min, doc);
+        }
+        docRank++;
+        if (docRank >= reader.docsWithValue()) break;
+        doc = docForRank(docRank);
+      }
+    }
+
+    int32_t findInIterationWindow(int32_t target) const {
+      if (target < iterWindowStart || target >= iterWindowEnd) {
+        return PostingsReader::END;
+      }
+      int32_t index = target - iterWindowStart;
+      int32_t word = index >> 6;
+      uint64_t bits = iterBits[(size_t)word] & (~0ULL << (index & 63));
+      while (true) {
+        if (bits != 0) {
+          int32_t found = iterWindowStart + (word << 6)
+              + (int32_t)std::countr_zero(bits);
+          return found < iterWindowEnd ? found : PostingsReader::END;
+        }
+        word++;
+        if (word >= ITER_WINDOW_WORDS
+            || iterWindowStart + (word << 6) >= iterWindowEnd) {
+          return PostingsReader::END;
+        }
+        bits = iterBits[(size_t)word];
+      }
+    }
+
+    int32_t seek(int32_t target) {
+      int32_t found = findInIterationWindow(target);
+      if (found != PostingsReader::END) return docid = found;
+      while (target < maxDoc) {
+        iterWindowStart = target;
+        iterWindowEnd = (int32_t)std::min<int64_t>(maxDoc,
+            (int64_t)target + ITER_WINDOW_SIZE);
+        std::fill(iterBits.begin(), iterBits.end(), 0);
+        fillWindowBits(iterBits, iterWindowStart, iterWindowEnd);
+        found = findInIterationWindow(target);
+        if (found != PostingsReader::END) return docid = found;
+        target = iterWindowEnd;
+      }
+      return docid = PostingsReader::END;
+    }
+
+  public:
+    ZoneMapScorer(MemPool& pool, IntColReader& reader,
+                  std::span<const BlockPlan> plans, int64_t lo, int64_t hi,
+                  int32_t maxDoc)
+        : reader(reader), plans(plans), crossing(reader),
+          iterBits(pool.make_arr<uint64_t>(ITER_WINDOW_WORDS), ITER_WINDOW_WORDS),
+          lo(lo), hi(hi), maxDoc(maxDoc) {
+      if (!reader.denseDocsWithValue()) {
+        const auto& bits = reader.docsWithValueBitSet();
+        selector = pool.make<screaming::BitSet::Selector>(
+            bits, pool.make_span<int32_t>((size_t)bits.nBuckets + 1));
+      }
+      std::fill(iterBits.begin(), iterBits.end(), 0);
+    }
+
+    void fillWindowBits(std::span<uint64_t> words, int32_t min, int32_t max) {
+      assert(min >= 0 && min <= max && max <= maxDoc);
+      if (reader.multiValued()) {
+        fillMulti(words, min, max);
+      } else {
+        fillSingle(words, min, max);
+      }
+    }
+
+    int32_t next() override {
+      assert(docid != PostingsReader::END);
+      return seek(docid + 1);
+    }
+    int32_t advance(int32_t target) override {
+      assert(docid < target);
+      return seek(target);
+    }
+    int32_t docId() override { return docid; }
+    float score() override { return 0.0f; }
+  };
+
+  class RangeBulkScorer final : public BulkScorer {
+    static constexpr int32_t WINDOW_SIZE = 4096;
+    static constexpr int32_t WINDOW_WORDS = WINDOW_SIZE / 64;
+
+    ZoneMapScorer* scorer;
+    std::span<uint64_t> windowBits;
+    std::span<int32_t> outDocs;
+    std::span<float> outScores;
+    int32_t maxDoc;
+    int32_t windowStart = 0;
+    int32_t windowEnd = 0;
+
+    static uint64_t validMask(int32_t remaining) {
+      if (remaining >= 64) return ~0ULL;
+      if (remaining <= 0) return 0;
+      return (1ULL << remaining) - 1ULL;
+    }
+
+    void setWindowBounds(int32_t min, int32_t max) {
+      windowStart = min;
+      windowEnd = (int32_t)std::min<int64_t>(
+          std::min(maxDoc, max), (int64_t)min + WINDOW_SIZE);
+    }
+
+    void applyBitFilter(const FixedBitSet& filter) {
+      int32_t sourceWords = (int32_t)FixedBitSet::sizeInWords(filter.size());
+      for (int32_t w = 0; w < WINDOW_WORDS; w++) {
+        int32_t firstDoc = windowStart + (w << 6);
+        int32_t remaining = windowEnd - firstDoc;
+        if (remaining <= 0) {
+          windowBits[(size_t)w] = 0;
+          continue;
+        }
+        int32_t sourceWord = firstDoc >> 6;
+        int32_t shift = firstDoc & 63;
+        uint64_t source = 0;
+        if (sourceWord < sourceWords) {
+          source = filter.words[sourceWord] >> shift;
+          if (shift != 0 && sourceWord + 1 < sourceWords) {
+            source |= filter.words[sourceWord + 1] << (64 - shift);
+          }
+        }
+        windowBits[(size_t)w] &= source & validMask(remaining);
+      }
+    }
+
+    void applyFilter(DocSet* filter) {
+      if (filter == nullptr) return;
+      if (filter->type == DocSet::BITSET) {
+        applyBitFilter(((BitDocSet*)filter)->bits());
+        return;
+      }
+      int32_t nbits = windowEnd - windowStart;
+      for (int32_t w = 0; w < WINDOW_WORDS; w++) {
+        uint64_t bits = windowBits[(size_t)w];
+        while (bits != 0) {
+          int32_t bit = (int32_t)std::countr_zero(bits);
+          int32_t index = (w << 6) + bit;
+          if (index >= nbits) break;
+          if (!filter->get(windowStart + index)) {
+            windowBits[(size_t)w] &= ~(1ULL << bit);
+          }
+          bits &= bits - 1;
+        }
+      }
+    }
+
+    int32_t windowCardinality() const {
+      int32_t count = 0;
+      for (uint64_t bits : windowBits) count += (int32_t)std::popcount(bits);
+      return count;
+    }
+
+    void fillWindow(DocSet* filter, int32_t min, int32_t max) {
+      setWindowBounds(min, max);
+      std::fill(windowBits.begin(), windowBits.end(), 0);
+      scorer->fillWindowBits(windowBits, windowStart, windowEnd);
+      applyFilter(filter);
+    }
+
+  public:
+    RangeBulkScorer(MemPool& pool, ZoneMapScorer* scorer, int32_t maxDoc)
+        : scorer(scorer),
+          windowBits(pool.make_arr<uint64_t>(WINDOW_WORDS), WINDOW_WORDS),
+          outDocs(pool.make_arr<int32_t>(WINDOW_SIZE), WINDOW_SIZE),
+          outScores(pool.make_arr<float>(WINDOW_SIZE), WINDOW_SIZE),
+          maxDoc(maxDoc) {}
+
+    int32_t countNextWindow(int64_t& count, DocSetBuilder* domainOut,
+                            DocSet* filter, int32_t min, int32_t max) override {
+      max = std::min(max, maxDoc);
+      if (min >= max || (filter != nullptr && filter->card() == 0)) {
+        return PostingsReader::END;
+      }
+      fillWindow(filter, min, max);
+      if (domainOut != nullptr) {
+        skipCount(SkipStats::bulkDomainWindowsFed);
+        domainOut->addWindowWords(windowBits.data(), windowStart, windowEnd);
+      }
+      count += windowCardinality();
+      return windowEnd >= max ? PostingsReader::END : windowEnd;
+    }
+
+    int32_t scoreNextWindow(ScoreWindow& out, DocSet* filter, int32_t min,
+                            int32_t max, float minCompetitiveScore) override {
+      max = std::min(max, maxDoc);
+      out.min = min;
+      out.max = min;
+      out.size = 0;
+      out.docs = outDocs;
+      out.scores = outScores;
+      if (min >= max || (filter != nullptr && filter->card() == 0)) {
+        return PostingsReader::END;
+      }
+      fillWindow(filter, min, max);
+      out.min = windowStart;
+      out.max = windowEnd;
+      if (minCompetitiveScore <= 0.0f) {
+        int32_t nbits = windowEnd - windowStart;
+        for (int32_t w = 0; w < WINDOW_WORDS; w++) {
+          uint64_t bits = windowBits[(size_t)w];
+          while (bits != 0) {
+            int32_t bit = (int32_t)std::countr_zero(bits);
+            int32_t index = (w << 6) + bit;
+            if (index >= nbits) break;
+            outDocs[(size_t)out.size] = windowStart + index;
+            outScores[(size_t)out.size] = 0.0f;
+            out.size++;
+            bits &= bits - 1;
+          }
+        }
+      }
+      return windowEnd >= max ? PostingsReader::END : windowEnd;
+    }
+  };
+
   class Weight final : public Query::Weight {
     NumericRangeQuery& query;
-    std::span<SegFieldInfo*> segInfos;  // per-segment; null entry = field absent here
+    std::span<SegFieldInfo*> segInfos;
+
+    static int64_t estimateCost(IntColReader& reader,
+                                std::span<const BlockPlan> plans) {
+      int64_t estimate = 0;
+      for (int64_t blockNum = 0; blockNum < reader.numBlocks(); blockNum++) {
+        int64_t count = reader.valuesInBlock(blockNum);
+        switch (plans[(size_t)blockNum].relation) {
+          case BlockRelation::INSIDE:
+            estimate += count;
+            break;
+          case BlockRelation::CROSSES:
+            estimate += (count + 1) / 2;
+            break;
+          case BlockRelation::OUTSIDE:
+            break;
+        }
+      }
+      return std::min<int64_t>(estimate, reader.docsWithValue());
+    }
+
+    bool segmentInfo(IndexReader::Segment& segment, SegFieldInfo*& segInfo) const {
+      if (segInfos.empty()) return false;
+      segInfo = segInfos[segment.ord];
+      return segInfo != nullptr && segInfo->columnLoc.offset() > 0;
+    }
+
   public:
     Weight(Context& context, NumericRangeQuery& query, int32_t flags)
         : Query::Weight(context, flags), query(query) {
-      traits |= IS_CONSTANT_SCORING;  // every match scores 0
-      // Column-only path: read per-segment field info directly.  getCachedFieldInfo
-      // would eagerly build term enums a column-stored numeric field doesn't have.
+      traits |= IS_CONSTANT_SCORING;
       segInfos = context.readSegInfos(query.getField());
     }
 
-    // sparse=true builds a per-value-decode scorer (for verifying a cheaper
-    // lead's candidates); false builds a block-decode scorer (for driving a scan).
-    Query::Scorer* buildScorer(MemPool& targetPool, IndexReader::Segment& segment, bool sparse) {
-      if (segInfos.empty()) return nullptr;
-      SegFieldInfo* segInfo = segInfos[segment.ord];
-      if (segInfo == nullptr || segInfo->columnLoc.offset() <= 0) return nullptr;
+    class Supplier final : public Query::ScorerSupplier {
+      // Crossing values cost about 2x the old dense scan. Require at least
+      // half the values to be structurally prunable before using zone maps.
+      // Measured with gcc-release on 2026-07-10 on a hybrid-core laptop, the
+      // least representative hardware described by the tuning caveat.
+      static constexpr int64_t ZONE_MAP_MIN_PRUNABLE_FRACTION_DENOMINATOR = 2;
+
+      NumericRangeQuery::Weight& weight;
+      IndexReader::Segment& segment;
+      IntColReader& reader;
+      std::span<const BlockPlan> plans;
+      int64_t estimatedCost;
+      bool allMatch;
+      bool useZoneMap;
+
+    public:
+      Supplier(NumericRangeQuery::Weight& weight, IndexReader::Segment& segment,
+               IntColReader& reader, std::span<const BlockPlan> plans,
+               int64_t estimatedCost, bool allMatch)
+          : weight(weight), segment(segment), reader(reader), plans(plans),
+            estimatedCost(estimatedCost), allMatch(allMatch) {
+        int64_t prunableValues = 0;
+        for (int64_t blockNum = 0; blockNum < reader.numBlocks(); blockNum++) {
+          if (plans[(size_t)blockNum].relation != BlockRelation::CROSSES) {
+            prunableValues += reader.valuesInBlock(blockNum);
+          }
+        }
+        int64_t denominator = ZONE_MAP_MIN_PRUNABLE_FRACTION_DENOMINATOR;
+        int64_t minPrunable = reader.numValues() / denominator
+            + (reader.numValues() % denominator != 0);
+        useZoneMap = prunableValues >= minPrunable;
+      }
+
+      int64_t cost() override { return estimatedCost; }
+
+      Query::Scorer* get(MemPool& targetPool, int64_t leadCost) override {
+        if (leadCost < cost()) {
+          // Keep the existing sparse two-phase verification path unchanged.
+          return targetPool.make<RangeScorer<IntColReader::SparseIterator>>(
+              reader, weight.query.getLo(), weight.query.getHi(), allMatch);
+        }
+        if (!useZoneMap) {
+          return targetPool.make<RangeScorer<IntColReader::Iterator>>(
+              reader, weight.query.getLo(), weight.query.getHi(), allMatch);
+        }
+        return targetPool.make<ZoneMapScorer>(
+            targetPool, reader, plans, weight.query.getLo(),
+            weight.query.getHi(), segment.maxDoc());
+      }
+
+      BulkScorer* bulkScorer(MemPool& targetPool) override {
+        if (!useZoneMap) return nullptr;
+        auto* scorer = targetPool.make<ZoneMapScorer>(
+            targetPool, reader, plans, weight.query.getLo(),
+            weight.query.getHi(), segment.maxDoc());
+        return targetPool.make<RangeBulkScorer>(targetPool, scorer,
+                                                segment.maxDoc());
+      }
+    };
+
+    Query::ScorerSupplier* scorerSupplier(MemPool& targetPool,
+                                           IndexReader::Segment& segment) override {
+      SegFieldInfo* segInfo = nullptr;
+      if (!segmentInfo(segment, segInfo)) return nullptr;
       auto* reader = targetPool.make<IntColReader>(segment.postingsReader(), *segInfo);
-      if (reader->numValues() == 0) return nullptr;  // no real values (e.g. all-empty arrays)
+      if (reader->numValues() == 0) return nullptr;
       int64_t colMin = reader->getMin();
       int64_t colMax = reader->getMax();
-      if (colMax < query.getLo() || query.getHi() < colMin) return nullptr;  // disjoint
-      bool allMatch = (query.getLo() <= colMin && colMax <= query.getHi());  // subset
-      if (sparse) {
-        return targetPool.make<RangeScorer<IntColReader::SparseIterator>>(
-            *reader, query.getLo(), query.getHi(), allMatch);
+      if (colMax < query.getLo() || query.getHi() < colMin) return nullptr;
+
+      auto plans = targetPool.make_span<BlockPlan>((size_t)reader->numBlocks());
+      for (int64_t i = 0; i < reader->numBlocks(); i++) {
+        plans[(size_t)i] = classifyBlock(reader->blockInfo(i), query.getLo(),
+                                         query.getHi());
       }
+      bool allMatch = query.getLo() <= colMin && colMax <= query.getHi();
+      int64_t cost = estimateCost(*reader, plans);
+      return targetPool.make<Supplier>(*this, segment, *reader, plans, cost,
+                                       allMatch);
+    }
+
+    Query::Scorer* createScorer(MemPool& targetPool,
+                                IndexReader::Segment& segment) override {
+      auto* supplier = scorerSupplier(targetPool, segment);
+      return supplier == nullptr ? nullptr
+          : supplier->get(targetPool, std::numeric_limits<int64_t>::max());
+    }
+
+    // Test/benchmark baseline: the exact pre-change full block-decode scan.
+    Query::Scorer* createFullScanScorerForTests(MemPool& targetPool,
+                                                IndexReader::Segment& segment) {
+      SegFieldInfo* segInfo = nullptr;
+      if (!segmentInfo(segment, segInfo)) return nullptr;
+      auto* reader = targetPool.make<IntColReader>(segment.postingsReader(), *segInfo);
+      if (reader->numValues() == 0) return nullptr;
+      int64_t colMin = reader->getMin();
+      int64_t colMax = reader->getMax();
+      if (colMax < query.getLo() || query.getHi() < colMin) return nullptr;
+      bool allMatch = query.getLo() <= colMin && colMax <= query.getHi();
       return targetPool.make<RangeScorer<IntColReader::Iterator>>(
           *reader, query.getLo(), query.getHi(), allMatch);
     }
 
-    // Default SegmentSource path drives the scorer directly -> block iterator.
-    Query::Scorer* createScorer(MemPool& targetPool, IndexReader::Segment& segment) override {
-      return buildScorer(targetPool, segment, /*sparse=*/false);
-    }
-
-    class Supplier final : public Query::ScorerSupplier {
-      NumericRangeQuery::Weight& weight;
-      IndexReader::Segment& segment;
-    public:
-      Supplier(NumericRangeQuery::Weight& weight, IndexReader::Segment& segment)
-        : weight(weight), segment(segment) {}
-
-      int64_t cost() override {
-        if (weight.segInfos.empty()) return 0;
-        SegFieldInfo* segInfo = weight.segInfos[segment.ord];
-        return segInfo == nullptr ? 0 : segInfo->docsWithField;
+    int64_t count(IndexReader::Segment& segment) override {
+      if (segment.liveDocs() != nullptr) return -1;
+      SegFieldInfo* segInfo = nullptr;
+      if (!segmentInfo(segment, segInfo)) return 0;
+      IntColReader reader(segment.postingsReader(), *segInfo);
+      if (reader.numValues() == 0) return 0;
+      if (reader.getMax() < query.getLo() || query.getHi() < reader.getMin()) {
+        return 0;
       }
 
-      Query::Scorer* get(MemPool& targetPool, int64_t leadCost) override {
-        // A lead cheaper than this clause's cardinality means we verify its
-        // candidates (sparse random access); otherwise we drive (dense scan).
-        bool sparse = leadCost < cost();
-        return weight.buildScorer(targetPool, segment, sparse);
+      std::vector<BlockPlan> plans((size_t)reader.numBlocks());
+      for (int64_t i = 0; i < reader.numBlocks(); i++) {
+        plans[(size_t)i] = classifyBlock(reader.blockInfo(i), query.getLo(),
+                                         query.getHi());
       }
-    };
+      CrossingValues crossing(reader);
+      if (!reader.multiValued()) {
+        int64_t count = 0;
+        for (int64_t blockNum = 0; blockNum < reader.numBlocks(); blockNum++) {
+          const BlockPlan& plan = plans[(size_t)blockNum];
+          int64_t start = blockNum * (int64_t)Postings::NUMERIC_BLOCK_SIZE;
+          int64_t end = start + reader.valuesInBlock(blockNum);
+          if (plan.relation == BlockRelation::INSIDE) {
+            count += end - start;
+          } else if (plan.relation == BlockRelation::CROSSES) {
+            for (int64_t rank = start; rank < end; rank++) {
+              count += crossing.matches(rank, plan, query.getLo(), query.getHi());
+            }
+          }
+        }
+        return count;
+      }
 
-    Query::ScorerSupplier* scorerSupplier(MemPool& targetPool, IndexReader::Segment& segment) override {
-      return targetPool.make<Supplier>(*this, segment);
+      int64_t count = 0;
+      for (int32_t docRank = 0; docRank < reader.docsWithValue(); docRank++) {
+        auto [start, end] = reader.getStartEndValueRank(docRank);
+        int64_t rank = start;
+        bool matched = false;
+        while (rank < end && !matched) {
+          int64_t blockNum = rank / Postings::NUMERIC_BLOCK_SIZE;
+          int64_t blockEnd = std::min<int64_t>(end,
+              (blockNum + 1) * (int64_t)Postings::NUMERIC_BLOCK_SIZE);
+          const BlockPlan& plan = plans[(size_t)blockNum];
+          if (plan.relation == BlockRelation::INSIDE) {
+            matched = true;
+          } else if (plan.relation == BlockRelation::CROSSES) {
+            while (rank < blockEnd && !matched) {
+              matched = crossing.matches(rank, plan, query.getLo(), query.getHi());
+              rank++;
+            }
+          } else {
+            rank = blockEnd;
+          }
+        }
+        count += matched;
+      }
+      return count;
     }
   };
 };

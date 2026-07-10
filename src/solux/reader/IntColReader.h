@@ -302,6 +302,71 @@ public:
     return columnMax;
   }
 
+  int64_t numBlocks() const {
+    return (nvals + Postings::NUMERIC_BLOCK_SIZE - 1) / Postings::NUMERIC_BLOCK_SIZE;
+  }
+
+  const NumericBlockInfo& blockInfo(int64_t blockNum) const {
+    assert(blockNum >= 0 && blockNum < numBlocks());
+    return blockMeta[blockNum];
+  }
+
+  int32_t valuesInBlock(int64_t blockNum) const {
+    assert(blockNum >= 0 && blockNum < numBlocks());
+    int64_t start = blockNum * (int64_t)Postings::NUMERIC_BLOCK_SIZE;
+    return (int32_t)std::min<int64_t>(Postings::NUMERIC_BLOCK_SIZE, nvals - start);
+  }
+
+  bool denseDocsWithValue() const {
+    return !docs.hasBitset();
+  }
+
+  const screaming::BitSet& docsWithValueBitSet() const {
+    assert(docs.hasBitset());
+    return docs.bitset();
+  }
+
+  // Decode the 128-value codec sub-block containing valueRank without restoring
+  // block min/gcd. The returned residuals are directly comparable with query
+  // bounds transformed into the block's residual domain. Returns the global
+  // value rank of decoded[0] and writes the number of valid values to count.
+  int64_t decodeResidualSubBlock(int64_t valueRank, uint32_t* decoded,
+                                 uint32_t& count) const {
+    constexpr int64_t SUB_BLOCK_SIZE = 128;
+    static_assert(Postings::NUMERIC_BLOCK_SIZE % SUB_BLOCK_SIZE == 0);
+    assert(valueRank >= 0 && valueRank < nvals);
+    int64_t start = valueRank / SUB_BLOCK_SIZE * SUB_BLOCK_SIZE;
+    int64_t blockNum = start / Postings::NUMERIC_BLOCK_SIZE;
+    int64_t rankInBlock = start % Postings::NUMERIC_BLOCK_SIZE;
+    const auto& block = blockMeta[blockNum];
+    assert(block.format <= 32);
+    uint32_t subBlockBytes = (uint32_t)(SUB_BLOCK_SIZE * (int64_t)block.format / 8);
+    const char* subBlockStart = blocks + block.blockOffset
+        + (rankInBlock / SUB_BLOCK_SIZE) * subBlockBytes;
+    count = (uint32_t)std::min<int64_t>(SUB_BLOCK_SIZE, nvals - start);
+    IndexCodec::numericCodec.decodeSingleBlock(subBlockStart, decoded, count,
+                                                (uint8_t)block.format);
+    return start;
+  }
+
+  // Raw blocks (format > 32) already contain reconstructed int64 values.
+  // Copy the 128-value sub-block containing valueRank into decoded.
+  int64_t decodeRawSubBlock(int64_t valueRank, int64_t* decoded,
+                            uint32_t& count) const {
+    constexpr int64_t SUB_BLOCK_SIZE = 128;
+    static_assert(Postings::NUMERIC_BLOCK_SIZE % SUB_BLOCK_SIZE == 0);
+    assert(valueRank >= 0 && valueRank < nvals);
+    int64_t start = valueRank / SUB_BLOCK_SIZE * SUB_BLOCK_SIZE;
+    int64_t blockNum = start / Postings::NUMERIC_BLOCK_SIZE;
+    int64_t rankInBlock = start % Postings::NUMERIC_BLOCK_SIZE;
+    const auto& block = blockMeta[blockNum];
+    assert(block.format > 32);
+    count = (uint32_t)std::min<int64_t>(SUB_BLOCK_SIZE, nvals - start);
+    memcpy(decoded, reinterpret_cast<const int64_t*>(blocks + block.blockOffset)
+        + rankInBlock, count * sizeof(int64_t));
+    return start;
+  }
+
   /// Retrieves the [startValueRank, endValueRank) range for the given doc rank.
   /// only valid if multiValued() is true
   std::pair<int64_t, int64_t> getStartEndValueRank(int32_t docRank) {
