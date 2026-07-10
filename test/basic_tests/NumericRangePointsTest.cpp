@@ -208,10 +208,14 @@ TEST_F(NumericRangePointsTest, allSelectionArmsAreReachable) {
   Inverter& inverter = writer->obtainInverter();
   auto& sorted = inverter.getIndexHandler("arm_sorted");
   auto& shuffled = inverter.getIndexHandler("arm_shuffled");
+  auto& scanSorted = inverter.getIndexHandler("arm_scan_sorted_i");
+  auto& scanShuffled = inverter.getIndexHandler("arm_scan_shuffled_i");
   for (int32_t doc = 0; doc < N; doc++) {
     inverter.startDoc();
     sorted.index(inverter, doc);
     shuffled.index(inverter, (int64_t)((doc * 7919) % 33001));
+    scanSorted.index(inverter, doc);
+    scanShuffled.index(inverter, (int64_t)((doc * 7919) % 33001));
     inverter.finishDoc();
   }
   writer->releaseInverter(inverter);
@@ -243,23 +247,40 @@ TEST_F(NumericRangePointsTest, allSelectionArmsAreReachable) {
   auto points = select("arm_sorted", 100, 100,
                        std::numeric_limits<int64_t>::max());
   EXPECT_EQ(std::get<3>(points), 1);
-  auto complement = select("arm_sorted", 0, 20'000,
+  auto complement = select("arm_sorted", 0, 26'000,
                            std::numeric_limits<int64_t>::max());
   EXPECT_EQ(std::get<2>(complement), 1);
-  auto zone = select("arm_sorted", 0, Postings::NUMERIC_BLOCK_SIZE - 1,
+  auto midPoints = select("arm_sorted", 0,
+                          Postings::NUMERIC_BLOCK_SIZE - 1,
+                          std::numeric_limits<int64_t>::max());
+  EXPECT_EQ(std::get<3>(midPoints), 1);
+  EXPECT_EQ(std::get<4>(midPoints), 0);
+  auto shuffledPoints = select("arm_shuffled", 0, 9'999,
+                               std::numeric_limits<int64_t>::max());
+  EXPECT_EQ(std::get<3>(shuffledPoints), 1);
+  EXPECT_FALSE(std::get<5>(shuffledPoints));
+  auto zone = select("arm_scan_sorted_i", 0,
+                     Postings::NUMERIC_BLOCK_SIZE - 1,
                      std::numeric_limits<int64_t>::max());
   EXPECT_EQ(std::get<4>(zone), 1);
-  auto full = select("arm_shuffled", 0, 9'999,
+  EXPECT_EQ(std::get<3>(zone), 0);
+  auto full = select("arm_scan_shuffled_i", 0, 9'999,
                      std::numeric_limits<int64_t>::max());
   EXPECT_TRUE(std::get<5>(full));
+  EXPECT_EQ(std::get<3>(full), 0);
 
   EXPECT_EQ(std::get<0>(sparse), fullScan(*reader, "arm_sorted", 100, 100));
   EXPECT_EQ(std::get<0>(points), std::get<0>(sparse));
   EXPECT_EQ(std::get<0>(complement),
-            fullScan(*reader, "arm_sorted", 0, 20'000));
-  EXPECT_EQ(std::get<0>(zone), fullScan(
+            fullScan(*reader, "arm_sorted", 0, 26'000));
+  EXPECT_EQ(std::get<0>(midPoints), fullScan(
       *reader, "arm_sorted", 0, Postings::NUMERIC_BLOCK_SIZE - 1));
-  EXPECT_EQ(std::get<0>(full), fullScan(*reader, "arm_shuffled", 0, 9'999));
+  EXPECT_EQ(std::get<0>(shuffledPoints),
+            fullScan(*reader, "arm_shuffled", 0, 9'999));
+  EXPECT_EQ(std::get<0>(zone), fullScan(
+      *reader, "arm_scan_sorted_i", 0, Postings::NUMERIC_BLOCK_SIZE - 1));
+  EXPECT_EQ(std::get<0>(full),
+            fullScan(*reader, "arm_scan_shuffled_i", 0, 9'999));
 }
 
 TEST_F(NumericRangePointsTest, optionalComplementAndMultiLeafDedup) {

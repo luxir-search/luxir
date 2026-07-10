@@ -835,9 +835,9 @@ public:
       // Measured with gcc-release on 2026-07-10 on a hybrid-core laptop, the
       // least representative hardware described by the tuning caveat.
       static constexpr int64_t ZONE_MAP_MIN_PRUNABLE_FRACTION_DENOMINATOR = 2;
-      // Provisional until the points-vs-column scan crossover is measured by
-      // the phase-2 benchmark on representative production hardware.
-      static constexpr uint64_t PTS_VS_SCAN_DENOM = 4;
+      // The direct points arm beat the best scan arm at every measured
+      // selectivity and field shape. Measured with gcc-release on 2026-07-10
+      // on a hybrid-core laptop per the tuning caveat.
 
       struct Materialized {
         std::span<int32_t> docs;
@@ -1006,15 +1006,16 @@ public:
         return pool.make<RangeBulkScorer>(pool, scorer, segment.maxDoc());
       }
 
+      // Complement is a wash against direct materialization when the range's
+      // docids are clustered (both emit word-masked runs) and only clearly
+      // wins on scattered docids above ~75% selectivity; below that the
+      // outside-tail decode dominates. Sparse fields pay an unpriced
+      // base-bitset build, so the threshold rounds up. Measured with
+      // gcc-release on 2026-07-10 on a hybrid-core laptop per the tuning
+      // caveat.
       bool useComplement(uint64_t exactCount) const {
         return points != nullptr && !reader.multiValued()
-            && exactCount > (uint64_t)reader.docsWithValue() / 2;
-      }
-
-      bool usePoints(uint64_t exactCount) const {
-        // numValues is the actual column scan work for multi-valued fields.
-        return points != nullptr
-            && exactCount <= (uint64_t)reader.numValues() / PTS_VS_SCAN_DENOM;
+            && exactCount > (uint64_t)reader.docsWithValue() * 3 / 4;
       }
 
     public:
@@ -1067,11 +1068,9 @@ public:
             return scorerFor(targetPool,
                 materializeComplement(targetPool, begin, end));
           }
-          if (usePoints(exactCount)) {
-            skipCount(SkipStats::numericRangePointsArms);
-            return scorerFor(targetPool,
-                materializePoints(targetPool, begin, end));
-          }
+          skipCount(SkipStats::numericRangePointsArms);
+          return scorerFor(targetPool,
+              materializePoints(targetPool, begin, end));
         }
         return phaseOneScorer(targetPool);
       }
@@ -1085,11 +1084,9 @@ public:
             return bulkFor(targetPool,
                 materializeComplement(targetPool, begin, end));
           }
-          if (usePoints(exactCount)) {
-            skipCount(SkipStats::numericRangePointsArms);
-            return bulkFor(targetPool,
-                materializePoints(targetPool, begin, end));
-          }
+          skipCount(SkipStats::numericRangePointsArms);
+          return bulkFor(targetPool,
+              materializePoints(targetPool, begin, end));
         }
         return phaseOneBulkScorer(targetPool);
       }
