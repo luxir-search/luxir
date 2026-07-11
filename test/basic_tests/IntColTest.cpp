@@ -228,6 +228,29 @@ TEST_F(IntColTest, wideRangeBlock) {
   }
 }
 
+TEST_F(IntColTest, wideRangeUnalignedAdvance) {
+  // raw64 (>32-bit-residual) blocks decode 128-value sub-blocks. An advance
+  // into the middle of a sub-block must copy from the 128-aligned base, not
+  // the requested rank (regression: every value shifted by index minus base).
+  TestIndex testIndex;
+  TestField f(testIndex, "foo_i");
+  f.startIndexing();
+  const int32_t N = 400;
+  auto expected = [](int32_t doc) {
+    return (int64_t)doc * (int64_t(1) << 40) + doc % 3;  // gcd 1, range > 2^32
+  };
+  for (int32_t doc = 0; doc < N; doc++) f.add(doc, expected(doc));
+  testIndex.flush();
+
+  f.startReading();
+  ASSERT_EQ(0, f.nextDoc());
+  ASSERT_EQ(expected(0), f.val());
+  for (int32_t target : {5, 130, 131, 259, 300, 399}) {
+    ASSERT_EQ(target, f.iter->advance(target));
+    ASSERT_EQ(expected(target), f.iter->value()) << "doc " << target;
+  }
+}
+
 TEST_F(IntColTest, basic2) {
   TestIndex testIndex;
   std::vector<FieldAndValues> fvs;

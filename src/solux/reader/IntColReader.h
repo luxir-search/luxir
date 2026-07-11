@@ -155,8 +155,11 @@ public:
           decoded[i] = scaled;
         }
       } else {
-        // 64-bit, temp impl uncompressed
-        auto rankInBlock = (uint64_t)index % Postings::NUMERIC_BLOCK_SIZE;
+        // 64-bit, temp impl uncompressed. Copy from the 128-aligned decode
+        // base, not the requested index: decodedStart is the aligned start,
+        // so an unaligned advance()/valueAt() would otherwise read values
+        // shifted by (index - start).
+        auto rankInBlock = start % Postings::NUMERIC_BLOCK_SIZE;
         memcpy(decoded, reinterpret_cast<const int64_t*>(blocks + block.blockOffset) + rankInBlock, num * sizeof(int64_t));
       }
     }
@@ -507,8 +510,11 @@ public:
           decoded[i] = int64_t(uint64_t(ints[i]) * uint64_t(block.gcd) + uint64_t(block.min));
         }
       } else {
-        // 64-bit, temp impl uncompressed
-        auto rankInBlock = (uint64_t)index % Postings::NUMERIC_BLOCK_SIZE;
+        // 64-bit, temp impl uncompressed. Copy from the 128-aligned decode
+        // base, not the requested index: decodedStart is the aligned start,
+        // so an unaligned advance()/valueAt() would otherwise read values
+        // shifted by (index - start).
+        auto rankInBlock = start % Postings::NUMERIC_BLOCK_SIZE;
         memcpy(decoded, reinterpret_cast<const int64_t*>(blocks + block.blockOffset) + rankInBlock, num * sizeof(int64_t));
       }
     }
