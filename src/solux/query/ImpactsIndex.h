@@ -30,6 +30,14 @@ namespace solux {
 // a valid (if loose) upper bound on the phrase's score, and the min across
 // the terms' indexes bounds any doc range.
 class ImpactsIndex {
+public:
+  struct CompetitiveTarget {
+    int32_t doc;
+    int32_t lastDoc;
+    float impact;
+  };
+
+private:
   struct Chunk {
     int32_t blockCount = 0;
     int32_t* lastDocs = nullptr;
@@ -536,15 +544,18 @@ public:
   // parsing them, so a term-wide skip costs a group-table scan, not a
   // per-block walk (Lucene ImpactsDISI's getSkipUpTo shape).  Returns `doc`
   // itself when its own block competes (or lies past the impact data), and
-  // DocsEnum::END when nothing later can compete.
-  int32_t firstCompetitiveTarget(int32_t doc, float minScore, int64_t& skippedBlocks) const {
+  // DocsEnum::END when nothing later can compete. lastDoc and impact certify
+  // the competitive landing block; past the impact data they permanently
+  // certify the remainder of the posting list.
+  CompetitiveTarget firstCompetitiveTarget(int32_t doc, float minScore,
+                                            int64_t& skippedBlocks) const {
     if (globalMax < minScore) {
       skippedBlocks += count;
-      return DocsEnum::END;
+      return {DocsEnum::END, DocsEnum::END, std::numeric_limits<float>::infinity()};
     }
     int32_t g = groupContainingFrom(-1, doc);
     if (g >= groupCount) {
-      return doc;  // past the impact data; the enum will run out naturally
+      return {doc, DocsEnum::END, std::numeric_limits<float>::infinity()};
     }
     for (;;) {
       ensureGroupHeadersThrough(g);
@@ -557,7 +568,7 @@ public:
           if (chunk.impacts[i] >= minScore) {
             int32_t blockStart = i == 0 ? (g == 0 ? 0 : groupLastDocs[g - 1] + 1)
                                         : chunk.lastDocs[i - 1] + 1;
-            return std::max(doc, blockStart);
+            return {std::max(doc, blockStart), chunk.lastDocs[i], chunk.impacts[i]};
           }
           skippedBlocks++;
         }
@@ -565,7 +576,7 @@ public:
         skippedBlocks += blockCountForGroup(g);
       }
       if (g + 1 >= groupCount) {
-        return DocsEnum::END;  // scanned to the end without a competitive block
+        return {DocsEnum::END, DocsEnum::END, std::numeric_limits<float>::infinity()};
       }
       doc = groupLastDocs[g] + 1;
       g++;

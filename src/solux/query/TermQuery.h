@@ -212,6 +212,8 @@ public:
     // Query-time multiplier for boosted term clauses, e.g. fuzzy rewrites.
     float boost;
     int64_t skippedImpactBlocks = 0;
+    int32_t competitiveUpTo = PostingsReader::END;
+    float competitiveBound = 0.0f;
 
     Scorer(solux::DocsEnum& docsEnum, solux::NormsReader* normsReader,
            solux::Similarity::BM25Scorer* simScorer, float boost = 1.0f,
@@ -232,6 +234,7 @@ public:
         flatNormsBase = normsReader->flatBase();
       }
       if (valueReader != nullptr) valueIter.emplace(*valueReader);
+      competitiveBound = std::numeric_limits<float>::infinity();
     }
 
     Scorer(solux::MemPool& pool, solux::DocsEnum& docsEnum, solux::NormsReader* normsReader,
@@ -258,38 +261,51 @@ public:
                       bool useFrontierBound = true,
                       BlockBounds::TermView sidecar = {}) {
       if (simScorer == nullptr || !hasNormLookup) {
+        competitiveUpTo = PostingsReader::END;
+        competitiveBound = std::numeric_limits<float>::infinity();
         return;
       }
       impacts.build(pool, docsEnum, *simScorer, boost, useFrontierBound, sidecar);
+      competitiveUpTo = PostingsReader::END;
+      competitiveBound = hasImpacts() ? 0.0f : std::numeric_limits<float>::infinity();
     }
 
     int32_t blockContaining(int32_t target) const {
       return impacts.blockContaining(target);
     }
 
-    int32_t skipNonCompetitiveBlocks(int32_t doc) {
+    int32_t SOLUX_NOINLINE skipNonCompetitiveBlocks(int32_t doc) {
       if (!hasImpacts() || !(minCompetitiveScore > 0.0f)) {
+        competitiveUpTo = PostingsReader::END;
+        competitiveBound = hasImpacts() ? 0.0f : std::numeric_limits<float>::infinity();
         return doc;
       }
       // The impacts index resolves the whole hop internally (skipping dead
       // groups on their corner bounds without parsing them); the enum advances
       // ONCE per competitive landing rather than once per block.
       while (doc != PostingsReader::END) {
-        int32_t target = impacts.firstCompetitiveTarget(doc, minCompetitiveScore,
-                                                        skippedImpactBlocks);
-        if (target == doc) {
-          return doc;
-        }
-        if (target == PostingsReader::END) {
+        skipCount(SkipStats::impactCompetitiveColdLookups);
+        auto landing = impacts.firstCompetitiveTarget(doc, minCompetitiveScore,
+                                                      skippedImpactBlocks);
+        if (landing.doc == PostingsReader::END) {
           return PostingsReader::END;
         }
-        doc = docsEnum.advance(target);
+        competitiveUpTo = landing.lastDoc;
+        competitiveBound = landing.impact;
+        if (landing.doc == doc) {
+          return doc;
+        }
+        doc = docsEnum.advance(landing.doc);
+        if (doc <= competitiveUpTo) {
+          return doc;
+        }
       }
       return doc;
     }
 
     int32_t next() override {
-      return skipNonCompetitiveBlocks(docsEnum.nextDoc());
+      int32_t doc = docsEnum.nextDoc();
+      return doc <= competitiveUpTo ? doc : skipNonCompetitiveBlocks(doc);
     }
 
     int32_t advance(int32_t target) override {
@@ -661,7 +677,17 @@ public:
     }
 
     void setMinCompetitiveScore(float minScore) override {
+      bool rose = minScore > minCompetitiveScore;
       minCompetitiveScore = minScore;
+      if (!rose || competitiveUpTo < 0) {
+        return;
+      }
+      if (minScore > competitiveBound) {
+        competitiveUpTo = -1;
+        skipCount(SkipStats::impactCertificateInvalidations);
+      } else {
+        skipCount(SkipStats::impactCertificateSurvivedRises);
+      }
     }
 
     int32_t parsedBlockContainingClamped(int32_t group, int32_t target) const {

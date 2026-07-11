@@ -57,6 +57,9 @@ struct SkipStats {
   static inline int64_t impactGroupHeaderParses = 0;
   static inline int64_t impactL0GroupParses = 0;
   static inline int64_t impactL0GroupParseScratchSpills = 0;
+  static inline int64_t impactCompetitiveColdLookups = 0;
+  static inline int64_t impactCertificateInvalidations = 0;
+  static inline int64_t impactCertificateSurvivedRises = 0;
   static inline int64_t maxScoreOuterWindows = 0;
   static inline int64_t maxScoreInnerWindows = 0;
   static inline int64_t maxScoreOuterWindowRefines = 0;
@@ -149,6 +152,9 @@ struct SkipStats {
     impactGroupHeaderParses = 0;
     impactL0GroupParses = 0;
     impactL0GroupParseScratchSpills = 0;
+    impactCompetitiveColdLookups = 0;
+    impactCertificateInvalidations = 0;
+    impactCertificateSurvivedRises = 0;
     maxScoreOuterWindows = 0;
     maxScoreInnerWindows = 0;
     maxScoreOuterWindowRefines = 0;

@@ -1633,6 +1633,30 @@ public:
       return mandScorer->score();
     }
 
+    void setMinCompetitiveScore(float minScore) override {
+      mandScorer->setMinCompetitiveScore(minScore);
+    }
+
+    float getMaxScore(int32_t upTo) override {
+      return mandScorer->getMaxScore(upTo);
+    }
+
+    float refineMaxScore(int32_t upTo) override {
+      return mandScorer->refineMaxScore(upTo);
+    }
+
+    int32_t advanceShallow(int32_t target) override {
+      return mandScorer->advanceShallow(target);
+    }
+
+    float getMaxScoreForSetup(int32_t upTo) override {
+      return mandScorer->getMaxScoreForSetup(upTo);
+    }
+
+    int32_t advanceShallowForSetup(int32_t target) override {
+      return mandScorer->advanceShallowForSetup(target);
+    }
+
   private:
 
     // mandScorer should be advanced and id set before calling this

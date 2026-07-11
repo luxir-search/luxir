@@ -85,6 +85,11 @@ struct TermImpactTopKRun {
   std::vector<TopDocsCollector::ScoreDoc> topDocs;
 };
 
+struct QueryTopKRun {
+  int64_t visited = 0;
+  std::vector<TopDocsCollector::ScoreDoc> topDocs;
+};
+
 struct BulkDomainDriveGuard {
   bool saved;
 
@@ -278,6 +283,82 @@ void appendRepeatedTerm(std::string& body, std::string_view term, int32_t count)
     if (!body.empty()) body.push_back(' ');
     body.append(term);
   }
+}
+
+void addNegatedThetaDocs(CollectionHelper& helper, int32_t nDocs) {
+  helper.clear();
+  std::vector<Doc> docs;
+  docs.reserve((size_t) nDocs);
+  for (int32_t doc = 0; doc < nDocs; doc++) {
+    std::string body;
+    int32_t block = doc / Postings::DOCS_BLOCK_SIZE;
+    int32_t tf = block == 0 ? 20 - (doc % 7) : (block == 9 ? 9 - (doc % 3) : 1);
+    appendRepeatedTerm(body, "mand", tf);
+    body += " join conjoin quick fox";
+    if ((doc % 3) == 0) body += " bonus";
+    if ((doc % 13) == 0) body += " rarebonus rarebonus";
+    if ((doc % 7) == 0) body += " excludeone";
+    if ((doc % 11) == 0) body += " excludetwo";
+    appendRepeatedTerm(body, "filler", 20 + (doc % 41));
+    docs.push_back(flatdoc("id", "n" + std::to_string(doc), "body_w", body));
+  }
+  helper.indexAll(docs, UpdateMessage::COMMIT);
+}
+
+QueryTopKRun runQueryTopK(IndexReader& reader, Query& query, int32_t topK,
+                          bool allowPruning) {
+  MemPool pool;
+  Query::Context context(pool, reader);
+  auto* weight = query.createWeight(context, Query::NEED_SCORES);
+  TopDocsCollector collector(topK);
+  auto segments = context.topReader.segments();
+  for (int32_t segnum = 0; segnum < (int32_t) segments.size(); segnum++) {
+    auto* scorer = weight->createScorer(pool, segments[segnum]);
+    if (scorer != nullptr) {
+      collectTopK(segnum, scorer, nullptr, nullptr, collector, allowPruning);
+    }
+  }
+  return {collector.totalHits(), sortedCollectorDocs(collector)};
+}
+
+void assertQueryTopKExact(const QueryTopKRun& expected, const QueryTopKRun& actual) {
+  ASSERT_EQ(expected.topDocs.size(), actual.topDocs.size());
+  for (size_t i = 0; i < expected.topDocs.size(); i++) {
+    EXPECT_EQ(expected.topDocs[i].doc, actual.topDocs[i].doc) << "i=" << i;
+    EXPECT_EQ(std::bit_cast<uint32_t>(expected.topDocs[i].score),
+              std::bit_cast<uint32_t>(actual.topDocs[i].score)) << "i=" << i;
+  }
+}
+
+QueryTopKRun runComposedMaxScoreTopK(IndexReader& reader, std::span<Query*> queries,
+                                     int32_t topK, int32_t windowSize,
+                                     bool allowPruning, int32_t prepositionFirst = -1) {
+  MemPool pool;
+  Query::Context context(pool, reader);
+  auto segments = context.topReader.segments();
+  TopDocsCollector collector(topK);
+  for (int32_t segnum = 0; segnum < (int32_t) segments.size(); segnum++) {
+    auto scorers = pool.make_span<Query::Scorer*>(queries.size());
+    size_t count = 0;
+    for (auto* query : queries) {
+      auto* weight = query->createWeight(context, Query::NEED_SCORES);
+      auto* scorer = weight->createScorer(pool, segments[segnum]);
+      if (scorer != nullptr) scorers[count++] = scorer;
+    }
+    scorers = scorers.first(count);
+    if (scorers.empty()) {
+      ADD_FAILURE() << "no scorers for segment " << segnum;
+      continue;
+    }
+    if (prepositionFirst >= 0) {
+      EXPECT_NE(dynamic_cast<BooleanQuery::MandNotScorer*>(scorers[0]), nullptr);
+      scorers[0]->advance(prepositionFirst);
+    }
+    auto* scorer = pool.make<BooleanQuery::MaxScoreDisjunctionScorer>(
+        pool, scorers, segments[segnum].maxDoc(), windowSize);
+    collectTopK(segnum, scorer, nullptr, nullptr, collector, allowPruning);
+  }
+  return {collector.totalHits(), sortedCollectorDocs(collector)};
 }
 
 void antiCorrelatedTfLen(int32_t postingOrd, int32_t& tf, int32_t& len) {
@@ -2973,8 +3054,13 @@ TEST_F(TermScorerTest, lazyImpactsMatchForcedEagerFrontierOracle) {
                              lazy->impacts.globalMaxImpact() + 0.001f}) {
         int64_t lazySkipped = 0;
         int64_t eagerSkipped = 0;
-        EXPECT_EQ(lazy->impacts.firstCompetitiveTarget(target, minScore, lazySkipped),
-                  eager->impacts.firstCompetitiveTarget(target, minScore, eagerSkipped))
+        auto lazyTarget = lazy->impacts.firstCompetitiveTarget(target, minScore, lazySkipped);
+        auto eagerTarget = eager->impacts.firstCompetitiveTarget(target, minScore, eagerSkipped);
+        EXPECT_EQ(lazyTarget.doc, eagerTarget.doc)
+            << "target=" << target << " minScore=" << minScore;
+        EXPECT_EQ(lazyTarget.lastDoc, eagerTarget.lastDoc)
+            << "target=" << target << " minScore=" << minScore;
+        EXPECT_FLOAT_EQ(lazyTarget.impact, eagerTarget.impact)
             << "target=" << target << " minScore=" << minScore;
       }
     }
@@ -3117,7 +3203,7 @@ TEST_F(TermScorerTest, lazyHeaderParsesStayBelowDenseTermGroupCount) {
   int64_t parsedBeforeDeath = SkipStats::impactGroupHeaderParses;
   int64_t skipped = 0;
   EXPECT_EQ(scorer->impacts.firstCompetitiveTarget(
-                0, scorer->impacts.globalMaxImpact() + 1.0f, skipped),
+                0, scorer->impacts.globalMaxImpact() + 1.0f, skipped).doc,
             DocsEnum::END);
   EXPECT_EQ(SkipStats::impactGroupHeaderParses, parsedBeforeDeath);
 }
@@ -4870,6 +4956,192 @@ TEST_F(TermScorerTest, blockMaxConjunctionTopKMatchesExhaustive) {
     EXPECT_LT(prunedCollector.totalHits(), exhaustiveCollector.totalHits()) << "k=" << k;
     EXPECT_GT(prunedScorer->skippedRanges(), 0) << "k=" << k;
   }
+}
+
+TEST_F(TermScorerTest, negatedTopKMatchesExhaustiveAtBothDepths) {
+  const int32_t nDocs = 18 * Postings::DOCS_BLOCK_SIZE + 37;
+  CollectionHelper helper("negated_topk_oracle");
+  addNegatedThetaDocs(helper, nDocs);
+  auto reader = helper.getIndexWriter()->getIndexReader();
+
+  TermQuery mand("body_w", "mand");
+  TermQuery excludeOne("body_w", "excludeone");
+  TermQuery excludeTwo("body_w", "excludetwo");
+  std::vector<Query*> mandatory = {&mand};
+  std::vector<Query*> prohibitedOne = {&excludeOne};
+  std::vector<Query*> prohibitedTwo = {&excludeOne, &excludeTwo};
+  BooleanQuery oneExclusion(mandatory, {}, prohibitedOne, {});
+  BooleanQuery twoExclusions(mandatory, {}, prohibitedTwo, {});
+
+  for (auto* query : std::array<Query*, 2>{&oneExclusion, &twoExclusions}) {
+    for (int32_t topK : {10, 100}) {
+      SCOPED_TRACE(::testing::Message() << "topK=" << topK);
+      auto expected = runQueryTopK(*reader, *query, topK, false);
+      auto actual = runQueryTopK(*reader, *query, topK, true);
+      assertQueryTopKExact(expected, actual);
+      EXPECT_LT(actual.visited, expected.visited);
+    }
+  }
+  helper.clear();
+}
+
+TEST_F(TermScorerTest, negatedBoundsComposeThroughNestedScorers) {
+  const int32_t nDocs = 16 * Postings::DOCS_BLOCK_SIZE + 29;
+  CollectionHelper helper("negated_nested_oracles");
+  addNegatedThetaDocs(helper, nDocs);
+  auto reader = helper.getIndexWriter()->getIndexReader();
+
+  TermQuery mand("body_w", "mand");
+  TermQuery join("body_w", "join");
+  TermQuery conjoin("body_w", "conjoin");
+  TermQuery bonus("body_w", "bonus");
+  TermQuery excludeOne("body_w", "excludeone");
+  std::vector<Query*> conjunctionMand = {&mand, &conjoin};
+  std::vector<Query*> prohibited = {&excludeOne};
+  BooleanQuery negatedConjunction(conjunctionMand, {}, prohibited, {});
+  std::vector<Query*> outerMand = {&negatedConjunction, &join};
+  BooleanQuery nestedConjunction(outerMand, {}, {}, {});
+
+  std::vector<std::string_view> phraseTerms = {"quick", "fox"};
+  std::vector<int32_t> phrasePositions = {0, 1};
+  PhraseQuery phrase("body_w", phraseTerms, phrasePositions);
+  std::vector<Query*> phraseMand = {&phrase};
+  BooleanQuery negatedPhrase(phraseMand, {}, prohibited, {});
+
+  std::vector<Query*> mandOptMand = {&mand};
+  std::vector<Query*> mandOptOptional = {&bonus};
+  BooleanQuery mandOpt(mandOptMand, mandOptOptional, {}, {});
+  std::vector<Query*> wrappedMandOpt = {&mandOpt};
+  BooleanQuery negatedMandOpt(wrappedMandOpt, {}, prohibited, {});
+
+  for (auto* query : std::array<Query*, 3>{
+           &nestedConjunction, &negatedPhrase, &negatedMandOpt}) {
+    for (int32_t topK : {10, 100}) {
+      auto expected = runQueryTopK(*reader, *query, topK, false);
+      auto actual = runQueryTopK(*reader, *query, topK, true);
+      assertQueryTopKExact(expected, actual);
+    }
+  }
+  helper.clear();
+}
+
+TEST_F(TermScorerTest, negatedOptionalChildComposesWithWindowedAndGlobalMaxScore) {
+  const int32_t nDocs = 18 * Postings::DOCS_BLOCK_SIZE + 41;
+  CollectionHelper helper("negated_maxscore_oracles");
+  addNegatedThetaDocs(helper, nDocs);
+  auto reader = helper.getIndexWriter()->getIndexReader();
+
+  TermQuery mand("body_w", "mand");
+  TermQuery excludeOne("body_w", "excludeone");
+  TermQuery bonus("body_w", "bonus");
+  TermQuery rareBonus("body_w", "rarebonus");
+  std::vector<Query*> mandatory = {&mand};
+  std::vector<Query*> prohibited = {&excludeOne};
+  BooleanQuery negated(mandatory, {}, prohibited, {});
+  std::array<Query*, 3> optional = {&negated, &bonus, &rareBonus};
+
+  SkipStatsGuard stats;
+  for (int32_t topK : {10, 100}) {
+    auto expected = runComposedMaxScoreTopK(
+        *reader, optional, topK, std::numeric_limits<int32_t>::max(), false);
+    auto global = runComposedMaxScoreTopK(
+        *reader, optional, topK, std::numeric_limits<int32_t>::max(), true);
+    auto windowed = runComposedMaxScoreTopK(*reader, optional, topK, 256, true);
+    assertTopKEquivalent(expected.topDocs, global.topDocs);
+    assertTopKEquivalent(expected.topDocs, windowed.topDocs);
+  }
+
+  int32_t ahead = 2 * Postings::DOCS_BLOCK_SIZE + 7;
+  auto positionedExpected = runComposedMaxScoreTopK(
+      *reader, optional, 10, std::numeric_limits<int32_t>::max(), false, ahead);
+  auto positionedWindowed = runComposedMaxScoreTopK(
+      *reader, optional, 10, 256, true, ahead);
+  assertTopKEquivalent(positionedExpected.topDocs, positionedWindowed.topDocs);
+  EXPECT_EQ(SkipStats::maxScoreSetupFallbackBlockBounds, 0);
+  helper.clear();
+}
+
+TEST_F(TermScorerTest, termCompetitiveBlockCertificateTracksThetaAndBoundaries) {
+  const int32_t nDocs = DocsEnum::L1_DOCS + 2 * Postings::DOCS_BLOCK_SIZE + 17;
+  CollectionHelper helper("term_competitive_certificate");
+  addNegatedThetaDocs(helper, nDocs);
+  auto reader = helper.getIndexWriter()->getIndexReader();
+
+  MemPool pool;
+  Query::Context context(pool, *reader);
+  auto& segment = context.topReader.segments()[0];
+  TermQuery query("body_w", "mand");
+  auto* weight = query.createWeight(context, Query::NEED_SCORES);
+  auto* scorer = dynamic_cast<TermQuery::Scorer*>(weight->createScorer(pool, segment));
+  ASSERT_NE(scorer, nullptr);
+  ASSERT_TRUE(scorer->hasImpacts());
+
+  SkipStatsGuard stats;
+  float weakTheta = std::numeric_limits<float>::denorm_min();
+  scorer->setMinCompetitiveScore(weakTheta);
+  EXPECT_EQ(SkipStats::impactCertificateInvalidations, 1);
+  int32_t doc = scorer->next();
+  ASSERT_NE(doc, PostingsReader::END);
+  EXPECT_EQ(SkipStats::impactCompetitiveColdLookups, 1);
+  int32_t firstLastDoc = scorer->competitiveUpTo;
+  float firstBound = scorer->competitiveBound;
+  ASSERT_GT(firstBound, weakTheta);
+
+  float survivedTheta = std::nextafter(weakTheta, std::numeric_limits<float>::infinity());
+  scorer->setMinCompetitiveScore(survivedTheta);
+  scorer->setMinCompetitiveScore(
+      std::nextafter(survivedTheta, std::numeric_limits<float>::infinity()));
+  EXPECT_EQ(SkipStats::impactCertificateInvalidations, 1);
+  EXPECT_EQ(SkipStats::impactCertificateSurvivedRises, 2);
+  while (doc < firstLastDoc) {
+    doc = scorer->next();
+  }
+  ASSERT_EQ(doc, firstLastDoc);
+  EXPECT_EQ(SkipStats::impactCompetitiveColdLookups, 1);
+  ASSERT_NE(scorer->next(), PostingsReader::END);
+  EXPECT_EQ(SkipStats::impactCompetitiveColdLookups, 2);
+
+  float breakingTheta = std::nextafter(scorer->competitiveBound,
+                                       std::numeric_limits<float>::infinity());
+  scorer->setMinCompetitiveScore(breakingTheta);
+  EXPECT_EQ(SkipStats::impactCertificateInvalidations, 2);
+  scorer->next();
+  EXPECT_GE(SkipStats::impactCompetitiveColdLookups, 3);
+
+  SkipStats::reset();
+  Query::Context weakContext(pool, *reader);
+  auto* weakWeight = query.createWeight(weakContext, Query::NEED_SCORES);
+  auto* weakScorer = dynamic_cast<TermQuery::Scorer*>(
+      weakWeight->createScorer(pool, weakContext.topReader.segments()[0]));
+  ASSERT_NE(weakScorer, nullptr);
+  weakScorer->setMinCompetitiveScore(weakTheta);
+  int32_t visited = 0;
+  while (weakScorer->next() != PostingsReader::END) visited++;
+  EXPECT_EQ(visited, nDocs);
+  EXPECT_EQ(weakScorer->skippedBlocks(), 0);
+  EXPECT_EQ(SkipStats::impactCompetitiveColdLookups,
+            (int64_t) weakScorer->impacts.blockCount());
+
+  int32_t lastImpactDoc = weakScorer->impacts.groupLastDoc(
+      weakScorer->impacts.numGroups() - 1);
+  EXPECT_EQ(weakScorer->skipNonCompetitiveBlocks(lastImpactDoc + 1),
+            lastImpactDoc + 1);
+  EXPECT_EQ(weakScorer->competitiveUpTo, PostingsReader::END);
+  EXPECT_TRUE(std::isinf(weakScorer->competitiveBound));
+
+  SkipStats::reset();
+  Query::Context noScoreContext(pool, *reader);
+  auto* noScoreWeight = query.createWeight(noScoreContext, 0);
+  auto* noImpactScorer = dynamic_cast<TermQuery::Scorer*>(
+      noScoreWeight->createScorer(pool, noScoreContext.topReader.segments()[0]));
+  ASSERT_NE(noImpactScorer, nullptr);
+  ASSERT_FALSE(noImpactScorer->hasImpacts());
+  noImpactScorer->setMinCompetitiveScore(1.0f);
+  while (noImpactScorer->next() != PostingsReader::END) {}
+  EXPECT_EQ(SkipStats::impactCompetitiveColdLookups, 0);
+  EXPECT_EQ(noImpactScorer->competitiveUpTo, PostingsReader::END);
+  EXPECT_TRUE(std::isinf(noImpactScorer->competitiveBound));
+  helper.clear();
 }
 
 // The bulk conjunction path must produce the same top-k as the pull
