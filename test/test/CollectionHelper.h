@@ -196,6 +196,11 @@ public:
       convertDocToProto(doc, docs_.emplace_back(), mr_);
       return *this;
     }
+    template <typename Fill>
+    UpdateBuilder& addRaw(Fill&& fill) {
+      fill(docs_.emplace_back(), mr_);
+      return *this;
+    }
     UpdateBuilder& remove(std::string_view id) {
       deleteIds_.push_back(build::arenaStr(mr_, id));
       return *this;

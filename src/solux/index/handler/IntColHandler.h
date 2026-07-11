@@ -46,6 +46,50 @@ inline void writeGeoPoints(PostingsWriter& postingsWriter,
   fieldInfo.pointsMetaOff = data.pointsMetaOff;
 }
 
+[[noreturn]] inline void throwGeoPointWire(std::string_view fieldName,
+                                           std::string_view detail) {
+  throw std::runtime_error(fmt::format(
+      "field '{}': cannot coerce value to GEO_POINT [x, y] = [lon, lat]: {}",
+      fieldName, detail));
+}
+
+inline GeoPoint parseGeoPointWire(const IndexVal& val,
+                                  std::string_view fieldName) {
+  auto checkArity = [&](size_t size) {
+    if (size != 2) {
+      throwGeoPointWire(fieldName,
+                        fmt::format("expected exactly 2 elements, got {}", size));
+    }
+  };
+  if (const auto* a = std::get_if<solux::api::ArrDouble>(&val.kind)) {
+    checkArity(a->v.size());
+    return {a->v[1], a->v[0]};
+  }
+  if (const auto* a = std::get_if<solux::api::ArrInt>(&val.kind)) {
+    checkArity(a->v.size());
+    return {(double)a->v[1], (double)a->v[0]};
+  }
+  if (const auto* a = std::get_if<solux::api::ArrVal>(&val.kind)) {
+    checkArity(a->v.size());
+    auto numeric = [&](size_t index) {
+      const IndexVal& element = a->v[index];
+      if (!std::holds_alternative<int64_t>(element.kind) &&
+          !std::holds_alternative<double>(element.kind) &&
+          !std::holds_alternative<float>(element.kind)) {
+        throwGeoPointWire(fieldName,
+                          fmt::format("element {} ({}) is not numeric", index,
+                                      coerce::describe(element)));
+      }
+      return coerce::toDouble(element, fieldName);
+    };
+    double longitude = numeric(0);
+    double latitude = numeric(1);
+    return {latitude, longitude};
+  }
+  throwGeoPointWire(fieldName,
+                    "expected a two-element numeric array");
+}
+
 //
 // Info for one single valued column.
 //
@@ -382,8 +426,10 @@ public:
     index(inverter, points[0].latitude, points[0].longitude);
   }
 
-  void index(Inverter&, const IndexVal&) override {
-    throw std::invalid_argument("GEO_POINT wire ingestion is not defined");
+  void index(Inverter& inverter, const IndexVal& val) override {
+    if (coerce::isNull(val)) return;
+    GeoPoint point = parseGeoPointWire(val, std::string_view(fieldName));
+    index(inverter, point.latitude, point.longitude);
   }
 };
 
@@ -407,8 +453,19 @@ public:
     indexMulti(inverter, packed);
   }
 
-  void index(Inverter&, const IndexVal&) override {
-    throw std::invalid_argument("GEO_POINT wire ingestion is not defined");
+  void index(Inverter& inverter, const IndexVal& val) override {
+    if (coerce::isNull(val)) return;
+    const auto* arr = std::get_if<solux::api::ArrVal>(&val.kind);
+    if (arr == nullptr) {
+      throwGeoPointWire(std::string_view(fieldName),
+                        "multi-valued fields require an array of point arrays");
+    }
+    std::vector<GeoPoint> points;
+    points.reserve(arr->v.size());
+    for (const auto& point : arr->v) {
+      points.push_back(parseGeoPointWire(point, std::string_view(fieldName)));
+    }
+    index(inverter, std::span<const GeoPoint>(points));
   }
 };
 

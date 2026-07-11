@@ -148,6 +148,7 @@ message Query {
     SimpleQuery simple_query = 10;  // forgiving end-user query string (search-box input)
     RangeQuery range = 11;          // selects documents whose numeric field value is in a range
     ExprQuery expr = 12;            // an expression in the Solux query language (rigorous grammar)
+    GeoBoxQuery geo_box = 13;       // selects GEO_POINT values inside an inclusive bounding box
 
     // TODO: wildcard query
     // TODO: function?
@@ -239,6 +240,21 @@ message RangeQuery {
   Val gt  = 3;   // lower bound, exclusive (>)
   Val lte = 4;   // upper bound, inclusive (<=)
   Val lt  = 5;   // upper bound, exclusive (<)
+}
+
+// Inclusive geographic bounding box in degrees. Bounds are quantized to the
+// storage grid exactly like ingest. min_lon > max_lon crosses the dateline;
+// min_lat > max_lat is an error. Boxes degenerate at +90 latitude or +180
+// longitude match nothing.
+//
+// Named scalar bounds deliberately avoid positional ambiguity: the VALUE
+// array contract [x, y] = [lon, lat] does not apply to this message.
+message GeoBoxQuery {
+  string field = 1;
+  double min_lat = 2; // south edge, degrees in [-90, 90]
+  double max_lat = 3; // north edge
+  double min_lon = 4; // west edge, degrees in [-180, 180]
+  double max_lon = 5; // east edge; min_lon > max_lon crosses the dateline
 }
 
 // Attach a name to a query so it can be referenced by other queries or facets.

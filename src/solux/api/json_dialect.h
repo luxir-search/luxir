@@ -255,6 +255,8 @@ struct from<JSON, solux::api::Query> {
             arm(std::in_place_type<api::SimpleQuery>);
           } else if (key == "range") {
             arm(std::in_place_type<api::RangeQuery>);
+          } else if (key == "geo_box") {
+            arm(std::in_place_type<api::GeoBoxQuery>);
           } else if (key == "expr") {
             arm(std::in_place_type<api::ExprQuery>);
           } else {

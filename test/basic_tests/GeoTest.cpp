@@ -4,6 +4,7 @@
 #include <array>
 #include <cmath>
 #include <cstdint>
+#include <initializer_list>
 #include <limits>
 #include <memory_resource>
 #include <span>
@@ -20,6 +21,7 @@
 #include "solux/util/geo.h"
 #include "solux/util/random.h"
 #include "test/CollectionHelper.h"
+#include "test/QueryBuild.h"
 #include "test/SoluxTest.h"
 
 using namespace solux;
@@ -132,6 +134,45 @@ SegFieldInfo fieldInfo(IndexReader::Segment& segment, std::string_view field) {
   return info;
 }
 
+template <typename Fill>
+void addWireDoc(CollectionHelper::UpdateBuilder& builder, std::string_view id,
+                std::string_view field, Fill&& fill) {
+  builder.addRaw([=](api::Map& doc, std::pmr::memory_resource& mr) mutable {
+    using Pair = std::pair<std::string_view, ::hpp_proto::indirect_view<api::Val>>;
+    Pair* fields = api::build::allocArray(doc.fields, 2, mr);
+    auto* idVal = (api::Val*)mr.allocate(sizeof(api::Val), alignof(api::Val));
+    new (idVal) api::Val();
+    idVal->kind = api::build::arenaStr(mr, id);
+    auto* fieldVal = (api::Val*)mr.allocate(sizeof(api::Val), alignof(api::Val));
+    new (fieldVal) api::Val();
+    fill(*fieldVal, mr);
+    fields[0] = Pair{api::build::arenaStr(mr, "id"), {idVal}};
+    fields[1] = Pair{api::build::arenaStr(mr, field), {fieldVal}};
+  });
+}
+
+void setDoubles(api::Val& val, std::pmr::memory_resource& mr,
+                std::initializer_list<double> values) {
+  auto& arr = val.kind.emplace<api::ArrDouble>();
+  double* out = api::build::allocArray(arr.v, values.size(), mr);
+  std::copy(values.begin(), values.end(), out);
+}
+
+void setInts(api::Val& val, std::pmr::memory_resource& mr,
+             std::initializer_list<int64_t> values) {
+  auto& arr = val.kind.emplace<api::ArrInt>();
+  int64_t* out = api::build::allocArray(arr.v, values.size(), mr);
+  std::copy(values.begin(), values.end(), out);
+}
+
+template <typename Fill>
+void setValues(api::Val& val, std::pmr::memory_resource& mr, size_t size,
+               Fill&& fill) {
+  auto& arr = val.kind.emplace<api::ArrVal>();
+  api::Val* out = api::build::allocArray(arr.v, size, mr);
+  for (size_t i = 0; i < size; i++) fill(out[i], i, mr);
+}
+
 } // namespace
 
 class GeoEncodingTest : public SoluxTest {};
@@ -205,6 +246,133 @@ TEST_F(GeoEncodingTest, quantizationBoundariesAndRandomRoundTrips) {
 }
 
 class GeoBoxQueryTest : public SoluxTest {};
+
+TEST_F(GeoBoxQueryTest, publicWireIngestAndProtoQueryRoundTrip) {
+  CollectionHelper helper;
+  helper.clear();
+  setGeoSchema(helper);
+
+  CollectionHelper::UpdateBuilder update;
+  addWireDoc(update, "ny", "geo_single", [](api::Val& val, auto& mr) {
+    setDoubles(val, mr, {-74.0060, 40.7128});
+  });
+  addWireDoc(update, "order", "geo_single", [](api::Val& val, auto& mr) {
+    setInts(val, mr, {10, 50});
+  });
+  addWireDoc(update, "tokyo", "geo_single", [](api::Val& val, auto& mr) {
+    setValues(val, mr, 2, [](api::Val& elem, size_t i, auto&) {
+      if (i == 0) elem.kind = 139.6503;
+      else elem.kind = 35.6762f;
+    });
+  });
+  addWireDoc(update, "multi", "geo_multi", [](api::Val& val, auto& mr) {
+    setValues(val, mr, 3, [](api::Val& point, size_t i, auto& innerMr) {
+      if (i == 0) {
+        setDoubles(point, innerMr, {179.0, 0.0});
+      } else if (i == 1) {
+        setInts(point, innerMr, {-179, 1});
+      } else {
+        setValues(point, innerMr, 2, [](api::Val& elem, size_t j, auto&) {
+          if (j == 0) elem.kind = 151.2093;
+          else elem.kind = -33.8688f;
+        });
+      }
+    });
+  });
+  update.commit();
+  IndexResult result = helper.submit(update);
+  ASSERT_EQ(IndexResult::Status::OK, result.status);
+
+  const std::vector<std::string> ids{"ny", "order", "tokyo", "multi"};
+  std::vector<std::vector<QuantizedPoint>> single(4), multi(4);
+  single[0].push_back(quantize(40.7128, -74.0060));
+  single[1].push_back(quantize(50.0, 10.0));
+  single[2].push_back(quantize((double)35.6762f, 139.6503));
+  multi[3].push_back(quantize(0.0, 179.0));
+  multi[3].push_back(quantize(1.0, -179.0));
+  multi[3].push_back(quantize((double)-33.8688f, 151.2093));
+
+  auto queryIds = [&](std::string_view field, const Box& box) {
+    auto req = localReq(soluxNode->getSearchEngine());
+    auto& cur = req->collection("main").topDocs("q");
+    cur.rawQuery() = qb::geoBox(cur.mr(), field, box.minLat, box.maxLat,
+                                box.minLon, box.maxLon);
+    cur.fields({"id"}).limit(20);
+    req->execute();
+    EXPECT_OK(req);
+    std::vector<std::string> found;
+    for (const auto& doc : req->getDocs()) {
+      found.push_back(std::get<std::string>(*find(doc, "id")));
+    }
+    std::sort(found.begin(), found.end());
+    return found;
+  };
+  auto expectedIds = [&](const auto& points, const Box& box) {
+    std::vector<std::string> expected;
+    for (int32_t doc : oracle(points, box)) expected.push_back(ids[(size_t)doc]);
+    std::sort(expected.begin(), expected.end());
+    return expected;
+  };
+
+  for (const Box& box : {Box{40.0, 41.0, -75.0, -73.0},
+                         Box{49.0, 51.0, 9.0, 11.0},
+                         Box{35.0, 36.0, 139.0, 140.0}}) {
+    EXPECT_EQ(expectedIds(single, box), queryIds("geo_single", box));
+  }
+  Box dateline{-5.0, 5.0, 170.0, -170.0};
+  EXPECT_EQ(expectedIds(multi, dateline), queryIds("geo_multi", dateline));
+
+  // Order proof: VALUE arrays are [lon, lat], while query bounds are named.
+  EXPECT_EQ((std::vector<std::string>{"order"}),
+            queryIds("geo_single", Box{49.0, 51.0, 9.0, 11.0}));
+  EXPECT_TRUE(queryIds("geo_single", Box{9.0, 11.0, 49.0, 51.0}).empty());
+}
+
+TEST_F(GeoBoxQueryTest, publicWireRejectsBadPointsWithoutCorruptingLaterDocs) {
+  CollectionHelper helper;
+  helper.clear();
+  setGeoSchema(helper);
+
+  CollectionHelper::UpdateBuilder update;
+  addWireDoc(update, "short", "geo_single", [](api::Val& val, auto& mr) {
+    setDoubles(val, mr, {1.0});
+  });
+  addWireDoc(update, "long", "geo_single", [](api::Val& val, auto& mr) {
+    setInts(val, mr, {1, 2, 3});
+  });
+  addWireDoc(update, "text", "geo_single", [](api::Val& val, auto& mr) {
+    setValues(val, mr, 2, [](api::Val& elem, size_t i, auto&) {
+      elem.kind = i == 0 ? std::string_view("a") : std::string_view("b");
+    });
+  });
+  addWireDoc(update, "nested", "geo_single", [](api::Val& val, auto& mr) {
+    setValues(val, mr, 2, [](api::Val& point, size_t i, auto& innerMr) {
+      setDoubles(point, innerMr, {(double)i, (double)i});
+    });
+  });
+  addWireDoc(update, "good", "geo_single", [](api::Val& val, auto& mr) {
+    setDoubles(val, mr, {10.0, 50.0});
+  });
+  update.commit();
+  IndexResult result = helper.submit(update);
+  ASSERT_EQ(IndexResult::Status::PARTIAL, result.status);
+  ASSERT_EQ(4u, result.errors.size());
+  for (const auto& error : result.errors) {
+    EXPECT_NE(std::string::npos, error.error_message.find("field 'geo_single'"));
+    EXPECT_NE(std::string::npos,
+              error.error_message.find("[x, y] = [lon, lat]"));
+  }
+
+  auto req = localReq(soluxNode->getSearchEngine());
+  auto& cur = req->collection("main").topDocs("q");
+  cur.rawQuery() = qb::geoBox(cur.mr(), "geo_single", 49.0, 51.0, 9.0, 11.0);
+  cur.fields({"id"}).limit(10);
+  req->execute();
+  ASSERT_OK(req);
+  auto docs = req->getDocs();
+  ASSERT_EQ(1u, docs.size());
+  EXPECT_EQ("good", std::get<std::string>(*find(docs[0], "id")));
+}
 
 TEST_F(GeoBoxQueryTest, randomizedQuantizedOracleSingleAndMulti) {
   constexpr int32_t N = 700;

@@ -95,6 +95,19 @@ inline api::Query range(std::pmr::memory_resource& mr, std::string_view field,
   return q;
 }
 
+inline api::Query geoBox(std::pmr::memory_resource& mr, std::string_view field,
+                         double minLat, double maxLat, double minLon,
+                         double maxLon) {
+  api::Query q;
+  auto& g = q.kind.emplace<api::GeoBoxQuery>();
+  g.field = build::arenaStr(mr, field);
+  g.min_lat = minLat;
+  g.max_lat = maxLat;
+  g.min_lon = minLon;
+  g.max_lon = maxLon;
+  return q;
+}
+
 inline api::Query fuzzy(std::pmr::memory_resource& mr, std::string_view field,
                         std::string_view term, int maxEdits = -1, int prefixLength = -1,
                         int maxExpansions = 0) {
