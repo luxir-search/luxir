@@ -16,6 +16,7 @@
 #include "bench/solux_bench.h"
 #include "solux/api/build.h"
 #include "solux/query/GeoBoxQuery.h"
+#include "solux/query/GeoDistanceQuery.h"
 #include "solux/reader/BKDReader.h"
 #include "solux/reader/FieldReader.h"
 #include "solux/reader/SkipStats.h"
@@ -64,6 +65,17 @@ enum GeoOp : uint8_t {
   ESTIMATE
 };
 
+enum DistanceCase : uint8_t {
+  DISTANCE_TINY,
+  DISTANCE_CITY,
+  DISTANCE_METRO,
+  DISTANCE_REGION,
+  DISTANCE_CONTINENT,
+  DISTANCE_HEMISPHERE,
+  DISTANCE_GLOBAL_MINUS_SLIVER,
+  DISTANCE_CASE_COUNT
+};
+
 struct CorpusSpec {
   CorpusShape shape;
   std::string_view name;
@@ -75,6 +87,12 @@ struct BoxSpec {
   double maxLat;
   double minLon;
   double maxLon;
+};
+
+struct CircleSpec {
+  double lat;
+  double lon;
+  double radiusMeters;
 };
 
 struct RawPoint {
@@ -94,6 +112,11 @@ constexpr std::array<std::string_view, BOX_CASE_COUNT> BOX_NAMES{{
     "tiny", "city", "metro", "region", "continent", "hemisphere",
     "global_minus_sliver", "lat_band_slice", "lon_band_slice",
     "dateline", "disjoint",
+}};
+
+constexpr std::array<std::string_view, DISTANCE_CASE_COUNT> DISTANCE_NAMES{{
+    "tiny", "city", "metro", "region", "continent", "hemisphere",
+    "global_minus_sliver",
 }};
 
 constexpr std::array<RawPoint, 20> CITY_CENTERS{{
@@ -171,6 +194,45 @@ std::array<BoxSpec, BOX_CASE_COUNT> boxesFor(CorpusShape shape) {
            {-1.0, 1.0, -2.0, 2.0},
            {-1.0, 1.0, 178.2, -178.2},
            {89.999, 89.9995, 179.999, 179.9995}}};
+}
+
+std::array<CircleSpec, DISTANCE_CASE_COUNT> circlesFor(CorpusShape shape) {
+  // Calibrated against the deterministic generators to the box ladder's
+  // approximate selectivities: tiny, 0.1%, 1%, 10%, 35%, 50%, and 90%.
+  if (shape == CLUSTERED) {
+    return {{{40.7128, -74.0060, 275.0},
+             {40.7128, -74.0060, 1000.0},
+             {40.7128, -74.0060, 3400.0},
+             {40.0, -98.0, 2200000.0},
+             {15.0, -40.0, 7000000.0},
+             {0.0, -90.0, 10007557.0},
+             {0.0, 0.0, 15000000.0}}};
+  }
+  if (shape == DIAGONAL) {
+    return {{{0.0, 0.0, 1573.0},
+             {0.0, 0.0, 14153.0},
+             {0.0, 0.0, 141526.0},
+             {0.0, 0.0, 1412098.0},
+             {0.0, 0.0, 4790000.0},
+             {0.0, 0.0, 6672000.0},
+             {0.0, 0.0, 9800000.0}}};
+  }
+  if (shape == LATBAND) {
+    return {{{0.0, 0.0, 1250.0},
+             {0.0, 0.0, 53000.0},
+             {0.0, 0.0, 210000.0},
+             {0.0, 0.0, 2002000.0},
+             {0.0, 0.0, 7005000.0},
+             {0.0, 0.0, 10007557.0},
+             {0.0, 0.0, 18013600.0}}};
+  }
+  return {{{0.0, 0.0, 1250.0},
+           {0.0, 0.0, 500000.0},
+           {0.0, 0.0, 1600000.0},
+           {0.0, 0.0, 5000000.0},
+           {0.0, 0.0, 8700000.0},
+           {0.0, 0.0, 10007557.0},
+           {0.0, 0.0, 15000000.0}}};
 }
 
 class CorpusGenerator {
@@ -267,6 +329,14 @@ bool packedMatches(int64_t packed, const GeoBoxQuery& query) {
                                query.getMaxLongitude());
 }
 
+bool packedMatches(int64_t packed, double centerLat, double centerLon,
+                   double sortKey) {
+  return geo::haversinSortKey(
+      centerLat, centerLon,
+      geo::decodeLatitude(geo::unpackLatitude(packed)),
+      geo::decodeLongitude(geo::unpackLongitude(packed))) <= sortKey;
+}
+
 class GeoFixture {
   TestIndex index;
   std::shared_ptr<Schema> schema;
@@ -274,13 +344,15 @@ class GeoFixture {
   int32_t docs;
   uint64_t points;
   std::array<BoxSpec, BOX_CASE_COUNT> boxes;
-  std::array<int32_t, BOX_CASE_COUNT> expected{};
+  std::array<CircleSpec, DISTANCE_CASE_COUNT> circles;
+  std::array<int32_t, BOX_CASE_COUNT> expectedBoxes{};
+  std::array<int32_t, DISTANCE_CASE_COUNT> expectedDistances{};
 
 public:
   explicit GeoFixture(CorpusSpec corpus)
       : corpus(corpus), docs(documentCount()),
         points((uint64_t)docs * (corpus.multi ? 2ULL : 1ULL)),
-        boxes(boxesFor(corpus.shape)) {
+        boxes(boxesFor(corpus.shape)), circles(circlesFor(corpus.shape)) {
     schema = geoSchema(corpus.multi);
     index.iw = std::make_unique<IndexWriter>(
         index.dir, [this]() { return schema; });
@@ -308,14 +380,36 @@ public:
           }
         }
       }
-      expected[(size_t)boxIndex] = matches;
+      expectedBoxes[(size_t)boxIndex] = matches;
+    }
+    for (int32_t circleIndex = 0;
+         circleIndex < DISTANCE_CASE_COUNT; circleIndex++) {
+      const CircleSpec& circle = circles[(size_t)circleIndex];
+      double sortKey = geo::distanceQuerySortKey(circle.radiusMeters);
+      int32_t matches = 0;
+      for (const auto& docPoints : packed) {
+        for (int32_t value = 0; value < valuesPerDoc; value++) {
+          if (packedMatches(docPoints[(size_t)value], circle.lat, circle.lon,
+                            sortKey)) {
+            matches++;
+            break;
+          }
+        }
+      }
+      expectedDistances[(size_t)circleIndex] = matches;
     }
   }
 
   TestIndex& testIndex() { return index; }
   const BoxSpec& box(BoxCase boxCase) const { return boxes[(size_t)boxCase]; }
   int32_t expectedCount(BoxCase boxCase) const {
-    return expected[(size_t)boxCase];
+    return expectedBoxes[(size_t)boxCase];
+  }
+  const CircleSpec& circle(DistanceCase distanceCase) const {
+    return circles[(size_t)distanceCase];
+  }
+  int32_t expectedCount(DistanceCase distanceCase) const {
+    return expectedDistances[(size_t)distanceCase];
   }
   int32_t docCount() const { return docs; }
   uint64_t pointCount() const { return points; }
@@ -354,6 +448,14 @@ bool unitTimingCase(CorpusShape shape, BoxCase box) {
   bool corpusSelected = shape == UNIFORM || shape == CLUSTERED;
   bool boxSelected = box == CITY || box == REGION || box == DATELINE;
   return corpusSelected && boxSelected;
+}
+
+bool unitTimingCase(CorpusShape shape, DistanceCase circle) {
+  if (!solux::unit_tests) return true;
+  bool corpusSelected = shape == UNIFORM || shape == CLUSTERED;
+  bool circleSelected = circle == DISTANCE_CITY || circle == DISTANCE_REGION
+                     || circle == DISTANCE_GLOBAL_MINUS_SLIVER;
+  return corpusSelected && circleSelected;
 }
 
 void skipReduced(benchmark::State& state) {
@@ -470,6 +572,119 @@ void BM_GeoEstimate(benchmark::State& state, CorpusShape shape) {
   state.counters["exact_count"] = data.expectedCount(boxCase);
 }
 
+void BM_GeoDistanceIterate(benchmark::State& state, CorpusShape shape,
+                           GeoOp op) {
+  DistanceCase distanceCase = (DistanceCase)state.range(0);
+  if (!unitTimingCase(shape, distanceCase)) {
+    skipReduced(state);
+    return;
+  }
+  GeoFixture& data = fixture(shape);
+  const CircleSpec& circle = data.circle(distanceCase);
+  int32_t expected = data.expectedCount(distanceCase);
+  auto& segment = data.testIndex().reader->segments()[0];
+  int64_t armBKD = 0;
+  int64_t armScan = 0;
+
+  if (op == QUERY) {
+    MemPool pool;
+    Query::Context context(pool, *data.testIndex().reader);
+    GeoDistanceQuery query(FIELD, circle.lat, circle.lon,
+                           circle.radiusMeters);
+    auto* weight = static_cast<GeoDistanceQuery::Weight*>(
+        query.createWeight(context, 0));
+    bool saved = SkipStats::enabled;
+    SkipStats::enabled = true;
+    int64_t bkdBefore = SkipStats::geoBKDArms;
+    int64_t scanBefore = SkipStats::geoScanArms;
+    Query::Scorer* scorer = weight->createScorer(pool, segment);
+    armBKD = SkipStats::geoBKDArms - bkdBefore;
+    armScan = SkipStats::geoScanArms - scanBefore;
+    SkipStats::enabled = saved;
+    if (countMatches(scorer) != expected) {
+      state.SkipWithError(
+          "geo distance selected scorer differs from quantized oracle");
+      return;
+    }
+  }
+
+  for (auto _ : state) {
+    MemPool pool;
+    Query::Context context(pool, *data.testIndex().reader);
+    GeoDistanceQuery query(FIELD, circle.lat, circle.lon,
+                           circle.radiusMeters);
+    auto* weight = static_cast<GeoDistanceQuery::Weight*>(
+        query.createWeight(context, 0));
+    Query::Scorer* scorer = op == SCAN_FORCED
+        ? weight->createScanScorerForTests(pool, segment)
+        : weight->createScorer(pool, segment);
+    int32_t count = countMatches(scorer);
+    benchmark::DoNotOptimize(count);
+    if (count != expected) {
+      state.SkipWithError("geo distance scorer differs from quantized oracle");
+      break;
+    }
+  }
+  state.counters["docs"] = data.docCount();
+  state.counters["matches"] = expected;
+  if (op == QUERY) {
+    state.counters["arm_bkd"] = armBKD != 0 ? 1 : 0;
+    state.counters["arm_scan"] = armScan != 0 ? 1 : 0;
+  }
+}
+
+void BM_GeoDistanceCount(benchmark::State& state, CorpusShape shape) {
+  DistanceCase distanceCase = (DistanceCase)state.range(0);
+  if (!unitTimingCase(shape, distanceCase)) {
+    skipReduced(state);
+    return;
+  }
+  GeoFixture& data = fixture(shape);
+  const CircleSpec& circle = data.circle(distanceCase);
+  int32_t expected = data.expectedCount(distanceCase);
+  auto& segment = data.testIndex().reader->segments()[0];
+  for (auto _ : state) {
+    MemPool pool;
+    Query::Context context(pool, *data.testIndex().reader);
+    GeoDistanceQuery query(FIELD, circle.lat, circle.lon,
+                           circle.radiusMeters);
+    auto* weight = static_cast<GeoDistanceQuery::Weight*>(
+        query.createWeight(context, 0));
+    int64_t count = weight->count(segment);
+    benchmark::DoNotOptimize(count);
+    if (count != expected) {
+      state.SkipWithError("geo distance count differs from quantized oracle");
+      break;
+    }
+  }
+  state.counters["docs"] = data.docCount();
+  state.counters["matches"] = expected;
+}
+
+void BM_GeoDistanceEstimate(benchmark::State& state, CorpusShape shape) {
+  if (solux::unit_tests) {
+    skipReduced(state);
+    return;
+  }
+  DistanceCase distanceCase = (DistanceCase)state.range(0);
+  GeoFixture& data = fixture(shape);
+  const CircleSpec& circle = data.circle(distanceCase);
+  SegFieldInfo info = data.fieldInfo();
+  auto& segment = data.testIndex().reader->segments()[0];
+  BKDReader reader(segment.postingsReader(), info);
+  GeoDistanceQuery query(FIELD, circle.lat, circle.lon,
+                         circle.radiusMeters);
+  BKDDistanceRelation relation = query.makeRelation();
+  BKDReader::EstimateResult estimate{};
+  for (auto _ : state) {
+    estimate = reader.estimateIntersect(relation);
+    benchmark::DoNotOptimize(estimate);
+  }
+  state.counters["estimated_count"] = (double)estimate.estimatedCount;
+  state.counters["upper_bound"] = (double)estimate.upperBound;
+  state.counters["exact_count"] = data.expectedCount(distanceCase);
+}
+
 void BM_GeoSize(benchmark::State& state, CorpusShape shape) {
   if (solux::unit_tests) {
     skipReduced(state);
@@ -573,6 +788,12 @@ std::string benchName(const CorpusSpec& corpus, std::string_view op,
   return name;
 }
 
+std::string distanceBenchName(const CorpusSpec& corpus, std::string_view op,
+                              std::string_view circle) {
+  return "BM_GeoDistance/" + std::string(corpus.name) + "/"
+       + std::string(op) + "/" + std::string(circle);
+}
+
 void registerCase(const CorpusSpec& corpus, GeoOp op, BoxCase box) {
   auto* registration = benchmark::RegisterBenchmark(
       benchName(corpus, opName(op), BOX_NAMES[(size_t)box]),
@@ -586,6 +807,24 @@ void registerCase(const CorpusSpec& corpus, GeoOp op, BoxCase box) {
         }
       });
   registration->ArgName("box_id")->Arg((int32_t)box)->UseRealTime();
+  if (op == ESTIMATE) registration->Iterations(1);
+}
+
+void registerDistanceCase(const CorpusSpec& corpus, GeoOp op,
+                          DistanceCase circle) {
+  auto* registration = benchmark::RegisterBenchmark(
+      distanceBenchName(corpus, opName(op),
+                        DISTANCE_NAMES[(size_t)circle]),
+      [shape = corpus.shape, op](benchmark::State& state) {
+        if (op == COUNT) {
+          BM_GeoDistanceCount(state, shape);
+        } else if (op == ESTIMATE) {
+          BM_GeoDistanceEstimate(state, shape);
+        } else {
+          BM_GeoDistanceIterate(state, shape, op);
+        }
+      });
+  registration->ArgName("circle_id")->Arg((int32_t)circle)->UseRealTime();
   if (op == ESTIMATE) registration->Iterations(1);
 }
 
@@ -614,6 +853,13 @@ void registerBuildMerge(const CorpusSpec& corpus, bool merge) {
       registerCase(corpus, SCAN_FORCED, boxCase);
       if (!corpus.multi) registerCase(corpus, COUNT, boxCase);
       registerCase(corpus, ESTIMATE, boxCase);
+    }
+    for (int32_t circle = 0; circle < DISTANCE_CASE_COUNT; circle++) {
+      DistanceCase distanceCase = (DistanceCase)circle;
+      registerDistanceCase(corpus, QUERY, distanceCase);
+      registerDistanceCase(corpus, SCAN_FORCED, distanceCase);
+      if (!corpus.multi) registerDistanceCase(corpus, COUNT, distanceCase);
+      registerDistanceCase(corpus, ESTIMATE, distanceCase);
     }
     registerSize(corpus);
     registerBuildMerge(corpus, false);
