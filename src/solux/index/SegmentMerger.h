@@ -472,8 +472,8 @@ private:
   }
 
   static bool hasOneDimensionalPoints(FieldType::Type type, int32_t flags) {
-    // TODO(pass B): GEO_POINT RANGE uses a 2-D BKD tree. Do not synthesize a
-    // 1-D points run from its packed column during merges.
+    // TODO(pass C): merge GEO_POINT RANGE BKD trees. Until then merged geo
+    // fields intentionally have pointsMetaOff == 0 and use column scans.
     return type != FieldType::GEO_POINT && (flags & FieldType::INDEX_RANGE) != 0;
   }
 

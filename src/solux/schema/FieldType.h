@@ -52,8 +52,8 @@ public:
   static constexpr flag_type FIXED_SIZE = (1 << 8);     // if all values have the same size in bytes (for otherwise variable-length fields)
   static constexpr flag_type ABSTRACT = (1 << 9);       // Abstract fields are only usable via suffix matching or inheritance
   static constexpr flag_type STORED = (1 << 10);        // Set if the field's raw values are kept in the segment's stored-fields resource for per-doc retrieval
-  // RANGE query contract. Numeric fields currently have a 1-D points index;
-  // GEO_POINT is column-only until its 2-D BKD index lands in pass B.
+  // RANGE query contract. Numeric fields use a 1-D points index. GEO_POINT
+  // flushes a 2-D BKD index; its query and merge consumers land in pass C.
   static constexpr flag_type INDEX_RANGE = (1 << 11);
 
   const FieldType::Type type_;

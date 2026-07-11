@@ -12,6 +12,7 @@
 
 #include "solux/api/build.h"
 #include "solux/query/GeoBoxQuery.h"
+#include "solux/reader/BKDReader.h"
 #include "solux/reader/FieldReader.h"
 #include "solux/reader/IntColReader.h"
 #include "solux/schema/Schema.h"
@@ -257,9 +258,14 @@ TEST_F(GeoBoxQueryTest, randomizedQuantizedOracleSingleAndMulti) {
   auto reader = writer->getIndexReader();
   ASSERT_EQ(1u, reader->segments().size());
   auto& segment = reader->segments()[0];
-  EXPECT_EQ(0, fieldInfo(segment, "geo_single").pointsMetaOff);
+  SegFieldInfo singleInfo = fieldInfo(segment, "geo_single");
+  ASSERT_NE(0, singleInfo.pointsMetaOff);
+  BKDReader singleBKD(segment.postingsReader(), singleInfo);
+  EXPECT_NO_THROW(singleBKD.validate());
   SegFieldInfo multiInfo = fieldInfo(segment, "geo_multi");
-  EXPECT_EQ(0, multiInfo.pointsMetaOff);
+  ASSERT_NE(0, multiInfo.pointsMetaOff);
+  BKDReader multiBKD(segment.postingsReader(), multiInfo);
+  EXPECT_NO_THROW(multiBKD.validate());
   {
     IntColReader column(segment.postingsReader(), multiInfo);
     IntColReader::Iterator iter(column);
@@ -325,4 +331,38 @@ TEST_F(GeoBoxQueryTest, rejectsInvalidBoxesAndTreatsUnrepresentableEdgesAsEmpty)
                std::invalid_argument);
   EXPECT_TRUE(GeoBoxQuery("geo", 90.0, 90.0, -180.0, 180.0).isEmpty());
   EXPECT_TRUE(GeoBoxQuery("geo", -90.0, 90.0, 180.0, 180.0).isEmpty());
+}
+
+TEST_F(GeoBoxQueryTest, flushWritesBKDButMergeDefersGeoPointsToPassC) {
+  CollectionHelper helper;
+  helper.clear();
+  setGeoSchema(helper);
+  auto writer = helper.getIndexWriter();
+
+  for (int32_t segmentNumber = 0; segmentNumber < 2; segmentNumber++) {
+    Inverter& inverter = writer->obtainInverter();
+    auto& handler = inverter.getIndexHandler("geo_single");
+    for (int32_t doc = 0; doc < 20; doc++) {
+      inverter.startDoc();
+      handler.index(inverter, -40.0 + doc,
+                    -170.0 + segmentNumber * 100.0 + doc);
+      inverter.finishDoc();
+    }
+    writer->releaseInverter(inverter);
+    writer->commit();
+  }
+
+  auto beforeMerge = writer->getIndexReader();
+  ASSERT_EQ(2u, beforeMerge->segments().size());
+  for (auto& segment : beforeMerge->segments()) {
+    SegFieldInfo info = fieldInfo(segment, "geo_single");
+    ASSERT_NE(0, info.pointsMetaOff);
+    BKDReader bkd(segment.postingsReader(), info);
+    EXPECT_NO_THROW(bkd.validate());
+  }
+
+  writer->mergeSegments();
+  auto afterMerge = writer->getIndexReader();
+  ASSERT_EQ(1u, afterMerge->segments().size());
+  EXPECT_EQ(0, fieldInfo(afterMerge->segments()[0], "geo_single").pointsMetaOff);
 }

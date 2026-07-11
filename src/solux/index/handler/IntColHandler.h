@@ -1,6 +1,7 @@
 #pragma once
 
 #include "solux/index/DocStream.h"
+#include "solux/index/BKDWriter.h"
 #include "solux/index/Inverter.h"
 #include "solux/index/IntColWriter.h"
 #include "solux/index/PointsWriter.h"
@@ -31,6 +32,16 @@ inline void writePoints(PostingsWriter& postingsWriter,
   PointsWriter writer(*output, PointsWriter::Options{});
   for (const auto& point : points) writer.addPoint(point.value, point.docid);
   auto data = writer.finish();
+  fieldInfo.pointsLoc = data.pointsLoc;
+  fieldInfo.pointsMetaOff = data.pointsMetaOff;
+}
+
+inline void writeGeoPoints(PostingsWriter& postingsWriter,
+                           PostingsWriter::IndexFieldInfo& fieldInfo,
+                           std::vector<BKDWriter::Point>& points) {
+  auto output = postingsWriter.getOutputStream();
+  BKDWriter writer(*output);
+  auto data = writer.write(points);
   fieldInfo.pointsLoc = data.pointsLoc;
   fieldInfo.pointsMetaOff = data.pointsMetaOff;
 }
@@ -123,21 +134,35 @@ public:
       writer.finish(fieldInfo);
     }
 
-    // TODO(pass B): GEO_POINT RANGE builds a 2-D BKD index. Until then it is
-    // intentionally column-only and must not enter the 1-D numeric points path.
-    if (fieldType->rangeIndexed() && fieldType->type() != FieldType::GEO_POINT) {
-      std::vector<FlushPoint> points;
-      points.reserve((size_t)numVals);
-      longStream.visitValues(inverter.pool, [&](int64_t value) {
-        points.push_back({value, 0});
-      });
-      size_t pointIndex = 0;
-      docsWithVal.forEachDoc(inverter.pool, [&](int32_t docid) {
-        assert(pointIndex < points.size());
-        points[pointIndex++].docid = docid;
-      });
-      assert(pointIndex == points.size());
-      writePoints(postingsWriter, fieldInfo, points);
+    if (fieldType->rangeIndexed()) {
+      if (fieldType->type() == FieldType::GEO_POINT) {
+        std::vector<BKDWriter::Point> points;
+        points.reserve((size_t)numVals);
+        longStream.visitValues(inverter.pool, [&](int64_t value) {
+          points.push_back({geo::unpackLatitude(value),
+                            geo::unpackLongitude(value), 0});
+        });
+        size_t pointIndex = 0;
+        docsWithVal.forEachDoc(inverter.pool, [&](int32_t docid) {
+          assert(pointIndex < points.size());
+          points[pointIndex++].docid = docid;
+        });
+        assert(pointIndex == points.size());
+        writeGeoPoints(postingsWriter, fieldInfo, points);
+      } else {
+        std::vector<FlushPoint> points;
+        points.reserve((size_t)numVals);
+        longStream.visitValues(inverter.pool, [&](int64_t value) {
+          points.push_back({value, 0});
+        });
+        size_t pointIndex = 0;
+        docsWithVal.forEachDoc(inverter.pool, [&](int32_t docid) {
+          assert(pointIndex < points.size());
+          points[pointIndex++].docid = docid;
+        });
+        assert(pointIndex == points.size());
+        writePoints(postingsWriter, fieldInfo, points);
+      }
     }
 
     // push docs
@@ -259,29 +284,50 @@ public:
       writer.finish(fieldInfo);
     }
 
-    // TODO(pass B): GEO_POINT RANGE builds a 2-D BKD index. Until then it is
-    // intentionally column-only and must not enter the 1-D numeric points path.
-    if (fieldType->rangeIndexed() && fieldType->type() != FieldType::GEO_POINT) {
-      std::vector<FlushPoint> points;
-      points.reserve((size_t)numVals);
-      longStream.visitValues(inverter.pool, [&](int64_t value) {
-        points.push_back({value, 0});
-      });
+    if (fieldType->rangeIndexed()) {
+      if (fieldType->type() == FieldType::GEO_POINT) {
+        std::vector<BKDWriter::Point> points;
+        points.reserve((size_t)numVals);
+        longStream.visitValues(inverter.pool, [&](int64_t value) {
+          points.push_back({geo::unpackLatitude(value),
+                            geo::unpackLongitude(value), 0});
+        });
+        IntStream::Reader lengths(lengthStream, inverter.pool);
+        size_t pointIndex = 0;
+        docsWithVal.forEachDoc(inverter.pool, [&](int32_t docid) {
+          assert(!lengths.eof());
+          int32_t length = lengths.next();
+          assert(length >= 0);
+          for (int32_t i = 0; i < length; i++) {
+            assert(pointIndex < points.size());
+            points[pointIndex++].docid = docid;
+          }
+        });
+        assert(lengths.eof());
+        assert(pointIndex == points.size());
+        writeGeoPoints(postingsWriter, fieldInfo, points);
+      } else {
+        std::vector<FlushPoint> points;
+        points.reserve((size_t)numVals);
+        longStream.visitValues(inverter.pool, [&](int64_t value) {
+          points.push_back({value, 0});
+        });
 
-      IntStream::Reader lengths(lengthStream, inverter.pool);
-      size_t pointIndex = 0;
-      docsWithVal.forEachDoc(inverter.pool, [&](int32_t docid) {
-        assert(!lengths.eof());
-        int32_t length = lengths.next();
-        assert(length >= 0);
-        for (int32_t i = 0; i < length; i++) {
-          assert(pointIndex < points.size());
-          points[pointIndex++].docid = docid;
-        }
-      });
-      assert(lengths.eof());
-      assert(pointIndex == points.size());
-      writePoints(postingsWriter, fieldInfo, points);
+        IntStream::Reader lengths(lengthStream, inverter.pool);
+        size_t pointIndex = 0;
+        docsWithVal.forEachDoc(inverter.pool, [&](int32_t docid) {
+          assert(!lengths.eof());
+          int32_t length = lengths.next();
+          assert(length >= 0);
+          for (int32_t i = 0; i < length; i++) {
+            assert(pointIndex < points.size());
+            points[pointIndex++].docid = docid;
+          }
+        });
+        assert(lengths.eof());
+        assert(pointIndex == points.size());
+        writePoints(postingsWriter, fieldInfo, points);
+      }
     }
 
     // push docs
