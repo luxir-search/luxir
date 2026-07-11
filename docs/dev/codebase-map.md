@@ -22,12 +22,23 @@ locations, browse `src/solux/<area>/`.
    - `FieldReader` finds metadata for a field in the segment (`SegFieldInfo`)
    - `TermsEnum` enumerates or finds indexed terms for a field found by `FieldReader`
    - `DocsEnum` returns the documents for a term found with the `TermsEnum`. Optionally returns term positions for each document.
+   - `IntColReader` reads the doc-order numeric column (all numeric field
+     classes store an order-preserving encoded int64)
+   - `PointsReader` reads the optional 1-D sorted-leaf points index of a
+     `RANGE`-indexed numeric field (value-sorted leaves + fence directory;
+     exact ordinal counts). `BKDReader` reads the 2-D int32 BKD of a
+     `GEO_POINT` field. Absence of either = `SegFieldInfo.pointsMetaOff == 0`.
 
 4. **Query System** (`src/solux/query/`)
    - `Query`: Abstract query representation
    - `Weight`: Query adapted to specific index
    - `Scorer`: Executes query on specific segment
    - Supports Term, Boolean, Phrase, and All queries
+   - `NumericRangeQuery` executes through the points index when present
+     (direct materialization or complement), else zone-map pruned or full
+     column scans; `GeoBoxQuery` executes through the BKD. Both share the
+     `PointsMaterialize` scorer/bitset primitives and keep a sparse
+     two-phase column verify for small lead costs.
    - `ProtobufQueryParser` lowers the wire tree (`solux::api::Query`) via `QueryBuilder`
      (the single place query-time analysis is applied); `ParseContext` carries the
      request pool, schema, warnings sink, and shared nesting budget
@@ -41,6 +52,9 @@ locations, browse `src/solux/<area>/`.
      - Manages `Inverter` instances, flushing, merging, and commits.
    - `Inverter`: Low level single-threaded document processing for a single segment.
    - `PostingsWriter`: used by an Inverter on flush to write a new segment.
+   - `PointsWriter` (1-D sorted leaves) and `BKDWriter` (2-D geo) build the
+     optional points indexes at flush; `SegmentMerger` carries 1-D points
+     forward by run-merging and rebuilds geo BKDs from the merged column.
 
 6. **Vector Search** (`src/solux/index/`, `src/solux/reader/`)
    - `VectorReader`: reads column-stored vectors for exact flat KNN

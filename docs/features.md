@@ -56,7 +56,9 @@ engine is built the way it is.
 - Explicit schema API: field definitions, per-field analyzers,
   field inheritance, merge or replace semantics.
 - Field types: analyzed text, string, int, float, double, date (ISO-8601
-  in, epoch-millis storage), binary, id, vector.
+  in, epoch-millis storage), binary, id, vector, geo point (lat/lon;
+  values ingest as `[lon, lat]` arrays, GeoJSON coordinate order,
+  quantized to ~1cm).
 - Per-field choices: index mode (match / range acceleration), multi-valued, column-stored (for sorting,
   faceting, and analytics), stored (for document retrieval; LZ4-compressed
   chunks).
@@ -96,8 +98,13 @@ clauses, under facet domains, as fusion sources, as filters.
   whole day; string/text fields range over their indexed terms in byte
   order, constant-scoring; with no bounds it matches every document that
   has a value - a field-exists query),
-  `prefix`, `fuzzy`, `constant_score`, match-all, and `knn` (vector search
-  is just a query).
+  `prefix`, `fuzzy`, `constant_score`, match-all, `geo_box` (bounding-box
+  over geo point fields, dateline-aware), and `knn` (vector search is just
+  a query).
+- Numeric, date, and geo fields declared `index: RANGE` build a points
+  index that answers ranges, boxes, and whole-index range facets far
+  faster than a column scan; without it the same queries still run off
+  the column.
 - Fuzzy matching is complete by default: an expansion cap is explicit
   consent to truncation, and any truncation (including the operator
   backstop) is declared in the response warnings. Blended scoring keeps
