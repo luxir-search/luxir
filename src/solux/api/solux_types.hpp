@@ -119,7 +119,7 @@ namespace SortSpec_ { enum class SortDir { UNKNOWN = 0, ASC = 1, ASCENDING = 1, 
 namespace Match_ { enum class Operator { OPERATOR_UNSPECIFIED = 0, OR = 1, AND = 2 }; }
 namespace UpdateResponse_ { enum class Status { UNKNOWN = 0, OK = 1, PARTIAL = 2, ERROR = 3 }; }
 namespace FieldDef_ {
-enum class FieldClass { STRING = 0, TEXT = 1, INT = 2, FLOAT = 3, DOUBLE = 4, BIN = 5, ID = 6, VECTOR = 7, DATE = 8 };
+enum class FieldClass { STRING = 0, TEXT = 1, INT = 2, FLOAT = 3, DOUBLE = 4, BIN = 5, ID = 6, VECTOR = 7, DATE = 8, GEO_POINT = 9 };
 enum class IndexMode { UNSET = 0, NONE = 1, MATCH = 2, RANGE = 3 };
 }
 namespace VectorParams_ { enum class Metric { NONE = 0, L2 = 1, IP = 2, COSINE = 3 }; }

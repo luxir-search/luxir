@@ -280,6 +280,7 @@ std::shared_ptr<Schema> Schema::fromProto(const solux::api::SchemaDef& def, cons
         case FieldType::FLOAT:  r.fieldClass = FieldClass::FLOAT; break;
         case FieldType::DOUBLE: r.fieldClass = FieldClass::DOUBLE; break;
         case FieldType::DATE:   r.fieldClass = FieldClass::DATE; break;
+        case FieldType::GEO_POINT: r.fieldClass = FieldClass::GEO_POINT; break;
         case FieldType::VECTOR: r.fieldClass = FieldClass::VECTOR; break;
         default:                r.fieldClass = FieldClass::BIN; break;
       }
@@ -353,12 +354,13 @@ std::shared_ptr<Schema> Schema::fromProto(const solux::api::SchemaDef& def, cons
       }
     }
 
-    // Reject index modes the engine cannot honor. RANGE is defined only for
-    // numeric columns because the points build consumes the encoded column stream.
+    // Reject index modes the engine cannot honor. RANGE covers 1-D numeric
+    // ranges and 2-D GEO_POINT boxes; both require a column in this phase.
     bool numericClass = r.fieldClass == FieldClass::INT || r.fieldClass == FieldClass::FLOAT ||
                         r.fieldClass == FieldClass::DOUBLE || r.fieldClass == FieldClass::DATE;
+    bool geoClass = r.fieldClass == FieldClass::GEO_POINT;
     if (index == IndexMode::RANGE) {
-      if (!numericClass) {
+      if (!numericClass && !geoClass) {
         throw std::runtime_error(
           "index=RANGE is not supported for this field_class (field: " + std::string(name) +
           "); MATCH-indexed string/id fields answer range queries through the terms dictionary");
@@ -368,7 +370,7 @@ std::shared_ptr<Schema> Schema::fromProto(const solux::api::SchemaDef& def, cons
       }
     }
     if (index == IndexMode::MATCH) {
-      if (numericClass) {
+      if (numericClass || geoClass) {
         throw std::runtime_error(
           "index=MATCH (numeric term postings) is not yet implemented for field: " + std::string(name));
       }
@@ -426,6 +428,9 @@ std::shared_ptr<Schema> Schema::fromProto(const solux::api::SchemaDef& def, cons
         break;
       case FieldClass::DATE:
         ft = std::make_shared<DateFieldType>(name, flags);
+        break;
+      case FieldClass::GEO_POINT:
+        ft = std::make_shared<GeoPointFieldType>(name, flags);
         break;
       case FieldClass::VECTOR: {
         // VECTOR is always fixed-size (every value in a segment must share dims).
@@ -498,6 +503,9 @@ void Schema::toProto(solux::api::SchemaDef* def, std::pmr::memory_resource& aren
         break;
       case FieldType::DATE:
         fieldDef.field_class = FieldClass::DATE;
+        break;
+      case FieldType::GEO_POINT:
+        fieldDef.field_class = FieldClass::GEO_POINT;
         break;
       case FieldType::BIN:
         fieldDef.field_class = FieldClass::BIN;

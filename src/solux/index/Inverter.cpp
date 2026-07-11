@@ -111,6 +111,13 @@ Inverter::IndexHandler& Inverter::createIndexHandler(const std::string_view name
         fieldHandler = pool.make_unique<handler::IntColHandler>(*this, name, fieldType);
       }
       break;
+    case FieldType::Type::GEO_POINT:
+      if (fieldType->multiValued()) {
+        fieldHandler = pool.make_unique<handler::MultiGeoPointHandler>(*this, name, fieldType);
+      } else {
+        fieldHandler = pool.make_unique<handler::GeoPointHandler>(*this, name, fieldType);
+      }
+      break;
     case FieldType::Type::VECTOR:
       fieldHandler = pool.make_unique<handler::VectorHandler>(*this, name, fieldType);
       break;

@@ -637,10 +637,12 @@ TEST_F(SchemaTest, indexModeValidation) {
   EXPECT_TRUE(trySchema("score", FieldClass::FLOAT, IndexMode::RANGE)->getFieldTypePtr("score")->rangeIndexed());
   EXPECT_TRUE(trySchema("score", FieldClass::DOUBLE, IndexMode::RANGE)->getFieldTypePtr("score")->rangeIndexed());
   EXPECT_TRUE(trySchema("when", FieldClass::DATE, IndexMode::RANGE)->getFieldTypePtr("when")->rangeIndexed());
+  EXPECT_TRUE(trySchema("location", FieldClass::GEO_POINT, IndexMode::RANGE)->getFieldTypePtr("location")->rangeIndexed());
   EXPECT_THROW(trySchema("title", FieldClass::TEXT, IndexMode::RANGE), std::runtime_error);
   EXPECT_THROW(trySchema("tag", FieldClass::STRING, IndexMode::RANGE), std::runtime_error);
   EXPECT_THROW(trySchema("price", FieldClass::INT, IndexMode::MATCH), std::runtime_error);
   EXPECT_THROW(trySchema("score", FieldClass::FLOAT, IndexMode::MATCH), std::runtime_error);
+  EXPECT_THROW(trySchema("location", FieldClass::GEO_POINT, IndexMode::MATCH), std::runtime_error);
   EXPECT_THROW(trySchema("emb", FieldClass::VECTOR, IndexMode::MATCH), std::runtime_error);
 
   // Accepted modes map onto the internal flags
@@ -651,6 +653,42 @@ TEST_F(SchemaTest, indexModeValidation) {
   // UNSET = absent: the field_class default applies
   EXPECT_TRUE(trySchema("tag", FieldClass::STRING, IndexMode::UNSET)->getFieldTypePtr("tag")->indexed());
   EXPECT_FALSE(trySchema("price", FieldClass::INT, IndexMode::UNSET)->getFieldTypePtr("price")->indexed());
+}
+
+TEST_F(SchemaTest, geoPointRoundTripsAndSurvivesMergeReconstruction) {
+  std::pmr::monotonic_buffer_resource arena;
+  api::SchemaDef def;
+  api::FieldDef* fields = build::allocArray(def.fields, 1, arena);
+  fields[0].name = "location";
+  fields[0].field_class = FieldClass::GEO_POINT;
+  fields[0].index = IndexMode::RANGE;
+  fields[0].multi_valued = true;
+
+  auto schema = Schema::fromProto(def);
+  FieldType* location = schema->getFieldTypePtr("location");
+  ASSERT_NE(nullptr, location);
+  EXPECT_EQ(FieldType::GEO_POINT, location->type());
+  EXPECT_TRUE(location->rangeIndexed());
+  EXPECT_TRUE(location->hasColumn());
+  EXPECT_TRUE(location->multiValued());
+
+  api::SchemaDef persisted;
+  schema->toProto(&persisted, arena);
+  auto roundTripped = Schema::fromProto(persisted);
+  EXPECT_EQ(FieldType::GEO_POINT,
+            roundTripped->getFieldTypePtr("location")->type());
+  EXPECT_TRUE(roundTripped->getFieldTypePtr("location")->rangeIndexed());
+
+  api::SchemaDef mergeDef;
+  api::FieldDef* mergedFields = build::allocArray(mergeDef.fields, 1, arena);
+  mergedFields[0].name = "quantity";
+  mergedFields[0].field_class = FieldClass::INT;
+  auto merged = Schema::fromProto(mergeDef, schema.get());
+  FieldType* mergedLocation = merged->getFieldTypePtr("location");
+  ASSERT_NE(nullptr, mergedLocation);
+  EXPECT_EQ(FieldType::GEO_POINT, mergedLocation->type());
+  EXPECT_TRUE(mergedLocation->rangeIndexed());
+  EXPECT_TRUE(mergedLocation->multiValued());
 }
 
 TEST_F(SchemaTest, rangeRoundTripsAndRequiresColumn) {

@@ -14,6 +14,11 @@
 
 namespace solux {
 
+struct GeoPoint {
+  double latitude;
+  double longitude;
+};
+
 // The indexing path reads field values straight out of the inbound UpdateRequest
 // bytes, which are kept alive for the duration of (synchronous) indexing, so the
 // indexing Val is a non-owning view (string_t = std::string_view, arrays = spans).
@@ -162,6 +167,12 @@ public:
     virtual void index(Inverter& inverter, std::span<const int64_t> vals) {
       unused(inverter, vals);
     }
+    virtual void index(Inverter& inverter, double latitude, double longitude) {
+      unused(inverter, latitude, longitude);
+    }
+    virtual void index(Inverter& inverter, std::span<const GeoPoint> points) {
+      unused(inverter, points);
+    }
 
     virtual void index(Inverter& inverter, const IndexVal& val) {
       if (std::holds_alternative<std::string_view>(val.kind)) {
@@ -309,4 +320,3 @@ inline std::string format_as(const Inverter& inverter) {
 }
 
 } // end namespace
-

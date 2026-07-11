@@ -471,6 +471,12 @@ private:
     return info.type == FieldType::BIN && (info.flags & FieldType::STORED) != 0;
   }
 
+  static bool hasOneDimensionalPoints(FieldType::Type type, int32_t flags) {
+    // TODO(pass B): GEO_POINT RANGE uses a 2-D BKD tree. Do not synthesize a
+    // 1-D points run from its packed column during merges.
+    return type != FieldType::GEO_POINT && (flags & FieldType::INDEX_RANGE) != 0;
+  }
+
   static void batchTypeAndFlags(std::span<const MergeFieldInfo> fields, FieldType::Type& type, int32_t& allFlags) {
     type = FieldType::Type::NONE;
     allFlags = 0;
@@ -513,7 +519,7 @@ private:
         synthesizedPointValues += field.segFieldInfo.numValues;
       }
     }
-    int64_t pointsBytes = (allFlags & FieldType::INDEX_RANGE) != 0
+    int64_t pointsBytes = hasOneDimensionalPoints(type, allFlags)
         ? MergeCostModel::pointsBytes((int64_t)fields.size(), numValues,
                                       synthesizedPointValues)
         : 0;
@@ -556,7 +562,7 @@ private:
       return MergeCostModel::STR_COL_STREAMS;
     }
     return MergeCostModel::INT_COL_STREAMS
-        + ((allFlags & FieldType::INDEX_RANGE) != 0
+        + (hasOneDimensionalPoints(type, allFlags)
            ? MergeCostModel::POINTS_STREAMS : 0);
   }
 
@@ -821,7 +827,7 @@ private:
     } else {
       // int column that is not an ord column (assume all other field types have this (currently true)
       mergeIntCol2(sortedFields, postingsWriter, outputFieldInfo);
-      if ((allFlags & FieldType::INDEX_RANGE) != 0) {
+      if (hasOneDimensionalPoints(type, allFlags)) {
         mergePoints(sortedFields, postingsWriter, outputFieldInfo);
       }
     }

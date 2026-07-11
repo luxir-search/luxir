@@ -823,6 +823,7 @@ message FieldDef {
     ID = 6;        // unique id field with co-located version
     VECTOR = 7;    // dense float vector, stored as a fixed-size binary column
     DATE = 8;      // timestamp, stored as int64 milliseconds since the Unix epoch
+    GEO_POINT = 9; // latitude/longitude point, packed into one int64 column value
   }
   optional FieldClass field_class = 4;  // if unset (default), inherited from parent
 
@@ -834,7 +835,7 @@ message FieldDef {
     UNSET = 0;   // same as absent: inherit from parent, else the field_class default
     NONE = 1;    // no index
     MATCH = 2;   // Match queries accelerated (term postings; TEXT: analyzed full-text)
-    RANGE = 3;   // Range and Match queries accelerated (numeric / DATE fields)
+    RANGE = 3;   // Range and Match queries accelerated (numeric / DATE / GEO_POINT fields)
   }
   optional IndexMode index = 5;
   optional bool column_stored = 6;

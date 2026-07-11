@@ -34,7 +34,8 @@ public:
     DOUBLE,
     ID,       // unique id field
     VECTOR,   // dense float vector; column-stored as fixed-size bytes
-    DATE      // timestamp; column-stored as int64 milliseconds since the Unix epoch
+    DATE,     // timestamp; column-stored as int64 milliseconds since the Unix epoch
+    GEO_POINT // latitude/longitude point; packed into one int64 column value
   };
 
   using flag_type = int32_t;
@@ -51,7 +52,9 @@ public:
   static constexpr flag_type FIXED_SIZE = (1 << 8);     // if all values have the same size in bytes (for otherwise variable-length fields)
   static constexpr flag_type ABSTRACT = (1 << 9);       // Abstract fields are only usable via suffix matching or inheritance
   static constexpr flag_type STORED = (1 << 10);        // Set if the field's raw values are kept in the segment's stored-fields resource for per-doc retrieval
-  static constexpr flag_type INDEX_RANGE = (1 << 11);   // Set if a numeric field has a points index
+  // RANGE query contract. Numeric fields currently have a 1-D points index;
+  // GEO_POINT is column-only until its 2-D BKD index lands in pass B.
+  static constexpr flag_type INDEX_RANGE = (1 << 11);
 
   const FieldType::Type type_;
   const std::string name_;
@@ -253,6 +256,13 @@ public:
   // window; ingest and sorting use coerceColInt64 (the window start).
   std::pair<int64_t, int64_t> coerceDateRange(const api::Val& val,
                                               std::string_view fieldName) const;
+};
+
+class GeoPointFieldType : public FieldType {
+public:
+  GeoPointFieldType(std::string_view name, int flags=COLUMN_STORED)
+    : FieldType(name, FieldType::GEO_POINT, flags) {
+  }
 };
 
 // Unique id field

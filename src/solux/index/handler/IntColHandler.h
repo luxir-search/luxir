@@ -5,6 +5,7 @@
 #include "solux/index/IntColWriter.h"
 #include "solux/index/PointsWriter.h"
 #include "solux/schema/ValCoerce.h"
+#include "solux/util/geo.h"
 
 #include <fmt/format.h>
 
@@ -38,7 +39,7 @@ inline void writePoints(PostingsWriter& postingsWriter,
 // Info for one single valued column.
 //
 // IntColHandler and MultiIntColHandler serve the whole int-column family
-// (INT, FLOAT, DOUBLE, DATE): the value a column stores is whatever
+// (INT, FLOAT, DOUBLE, DATE, GEO_POINT): the value a column stores is whatever
 // FieldType::coerceColInt64 returns (raw ints, sortable bits, epoch millis),
 // so the handlers themselves are encoding-blind.  Coercion failures throw,
 // which the per-doc update path recovers by marking the doc failed.
@@ -122,7 +123,9 @@ public:
       writer.finish(fieldInfo);
     }
 
-    if (fieldType->rangeIndexed()) {
+    // TODO(pass B): GEO_POINT RANGE builds a 2-D BKD index. Until then it is
+    // intentionally column-only and must not enter the 1-D numeric points path.
+    if (fieldType->rangeIndexed() && fieldType->type() != FieldType::GEO_POINT) {
       std::vector<FlushPoint> points;
       points.reserve((size_t)numVals);
       longStream.visitValues(inverter.pool, [&](int64_t value) {
@@ -256,7 +259,9 @@ public:
       writer.finish(fieldInfo);
     }
 
-    if (fieldType->rangeIndexed()) {
+    // TODO(pass B): GEO_POINT RANGE builds a 2-D BKD index. Until then it is
+    // intentionally column-only and must not enter the 1-D numeric points path.
+    if (fieldType->rangeIndexed() && fieldType->type() != FieldType::GEO_POINT) {
       std::vector<FlushPoint> points;
       points.reserve((size_t)numVals);
       longStream.visitValues(inverter.pool, [&](int64_t value) {
@@ -310,6 +315,54 @@ public:
       fieldInfo.monoMetaOff = endValueRankWriter.metaOff;
     }
 
+  }
+};
+
+class GeoPointHandler final : public IntColHandler {
+public:
+  GeoPointHandler(Inverter& inverter, const std::string_view& fieldName,
+                  const std::shared_ptr<FieldType>& fieldType)
+    : IntColHandler(inverter, fieldName, fieldType) {}
+
+  void index(Inverter& inverter, double latitude, double longitude) override {
+    indexSingle(inverter, geo::encodePoint(latitude, longitude));
+  }
+
+  void index(Inverter& inverter, std::span<const GeoPoint> points) override {
+    if (points.empty()) return;
+    if (points.size() != 1) {
+      throw std::invalid_argument("single-valued GEO_POINT field received multiple points");
+    }
+    index(inverter, points[0].latitude, points[0].longitude);
+  }
+
+  void index(Inverter&, const IndexVal&) override {
+    throw std::invalid_argument("GEO_POINT wire ingestion is not defined");
+  }
+};
+
+class MultiGeoPointHandler final : public MultiIntColHandler {
+public:
+  MultiGeoPointHandler(Inverter& inverter, const std::string_view& fieldName,
+                       const std::shared_ptr<FieldType>& fieldType)
+    : MultiIntColHandler(inverter, fieldName, fieldType) {}
+
+  void index(Inverter& inverter, double latitude, double longitude) override {
+    int64_t packed = geo::encodePoint(latitude, longitude);
+    indexMulti(inverter, std::views::single(packed));
+  }
+
+  void index(Inverter& inverter, std::span<const GeoPoint> points) override {
+    std::vector<int64_t> packed;
+    packed.reserve(points.size());
+    for (const auto& point : points) {
+      packed.push_back(geo::encodePoint(point.latitude, point.longitude));
+    }
+    indexMulti(inverter, packed);
+  }
+
+  void index(Inverter&, const IndexVal&) override {
+    throw std::invalid_argument("GEO_POINT wire ingestion is not defined");
   }
 };
 
