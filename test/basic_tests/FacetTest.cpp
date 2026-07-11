@@ -19,6 +19,8 @@
 #include "solux/util/proto.h"
 #include "solux/index/Inverter.h"
 #include "solux/index/IndexWriter.h"
+#include "solux/reader/SkipStats.h"
+#include "solux/search/ops/FacetOp.h"
 #include "solux/search/ops/StrFacetOp.h"
 
 using namespace solux;
@@ -27,6 +29,71 @@ using namespace solux::test;
 class FacetTest : public SoluxTest {
 protected:
 };
+
+namespace {
+
+struct RangeSchemaField {
+  std::string_view name;
+  bool points;
+  bool multi;
+};
+
+void setRangeFacetSchema(CollectionHelper& helper,
+                         std::span<const RangeSchemaField> fields) {
+  std::pmr::monotonic_buffer_resource arena;
+  api::SchemaDef def;
+  api::FieldDef* defs = api::build::allocArray(def.fields, fields.size(), arena);
+  for (size_t i = 0; i < fields.size(); i++) {
+    defs[i].name = fields[i].name;
+    defs[i].field_class = api::FieldDef::FieldClass::INT;
+    defs[i].index = fields[i].points ? api::FieldDef::IndexMode::RANGE
+                                    : api::FieldDef::IndexMode::NONE;
+    defs[i].multi_valued = fields[i].multi;
+  }
+  helper.collection().setSchema(
+      Schema::fromProto(def, helper.collection().getSchema().get()));
+}
+
+const api::FacetResult& rootFacetResult(const LocalReq& req,
+                                        std::string_view name) {
+  return *req.responses[0]->proto.ops.at(name)->facetResult();
+}
+
+std::vector<std::byte> encodeFacetResult(const LocalReq& req,
+                                         std::string_view name) {
+  std::vector<std::byte> encoded;
+  EXPECT_TRUE(api::encode(rootFacetResult(req, name), encoded));
+  return encoded;
+}
+
+void expectRangeResult(const api::FacetResult& result,
+                       std::span<const std::pair<int64_t, int64_t>> bounds,
+                       std::span<const int64_t> counts, int64_t missing) {
+  ASSERT_TRUE(result.bucket_ids.has_value());
+  const auto& actualBounds = std::get<api::ArrArrInt>(result.bucket_ids->kind).v;
+  ASSERT_EQ(bounds.size(), actualBounds.size());
+  ASSERT_EQ(counts.size(), result.counts.size());
+  for (size_t i = 0; i < bounds.size(); i++) {
+    ASSERT_EQ(2u, actualBounds[i].v.size());
+    EXPECT_EQ(bounds[i].first, actualBounds[i].v[0]);
+    EXPECT_EQ(bounds[i].second, actualBounds[i].v[1]);
+    EXPECT_EQ(counts[i], result.counts[i]);
+  }
+  EXPECT_EQ(missing, result.missing.value_or(-1));
+}
+
+class PointsRangeFacetTestGuard {
+  bool savedDisabled = IntFacetRangeReq::disablePointsRangeFacetForTests;
+  bool savedStatsEnabled = SkipStats::enabled;
+public:
+  PointsRangeFacetTestGuard() { SkipStats::enabled = true; }
+  ~PointsRangeFacetTestGuard() {
+    IntFacetRangeReq::disablePointsRangeFacetForTests = savedDisabled;
+    SkipStats::enabled = savedStatsEnabled;
+  }
+};
+
+} // namespace
 
 TEST_F(FacetTest, mergeableStrDataMergeVariants) {
   using Data = StrFacetOp::MergeableStrData;
@@ -251,6 +318,157 @@ TEST_F(FacetTest, emptyIndex) {
       // Since we requested missing=true, missing count should be 0 for empty index
       ASSERT_EQ(0, facetResult->missing.value_or(0)) << "Failed for " << fieldType.description;
     }
+  }
+}
+
+TEST_F(FacetTest, pointsRangeFacetMatchesColumnWalk) {
+  CollectionHelper helper;
+  helper.clear();
+  const std::array fields = {
+    RangeSchemaField{"range_is", true, true},
+    RangeSchemaField{"extreme_is", true, true}
+  };
+  setRangeFacetSchema(helper, fields);
+
+  const int64_t i64min = std::numeric_limits<int64_t>::min();
+  const int64_t i64max = std::numeric_limits<int64_t>::max();
+  std::vector<Doc> docs = {
+    flatdoc("id", "a", "range_is", vec_i(-5000, -1000, 0),
+            "extreme_is", vec_i(i64min, i64min + 20)),
+    flatdoc("id", "b", "range_is", vec_i(1000, 2000),
+            "extreme_is", vec_i(0, 10)),
+    flatdoc("id", "c", "range_is", vec_i(3000, 7000, 8000),
+            "extreme_is", vec_i(i64max - 11, i64max)),
+    flatdoc("id", "d", "range_is", vec_i(12000)),
+    flatdoc("id", "missing")
+  };
+  ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT).success);
+
+  PointsRangeFacetTestGuard guard;
+  auto run = [&](bool disablePoints) {
+    IntFacetRangeReq::disablePointsRangeFacetForTests = disablePoints;
+    SkipStats::reset();
+    auto req = localReq(soluxNode->getSearchEngine());
+    req->collection("main");
+    auto& all = req->rangeFacet("all", "range_is").range(-1500, 9100, 2700);
+    std::get<api::RangeFacet>(all.rawOp().kind).missing = true;
+    auto& filtered = req->rangeFacet("filtered", "range_is")
+                         .range(-1500, 9100, 2700).mincount(3);
+    std::get<api::RangeFacet>(filtered.rawOp().kind).missing = true;
+    auto& extreme = req->rangeFacet("extreme", "extreme_is")
+                        .range(i64min + 10, i64max - 10, i64max);
+    std::get<api::RangeFacet>(extreme.rawOp().kind).missing = true;
+    req->execute(false);
+    EXPECT_FALSE(hasError(req->responses[0]->proto)) << req->toString();
+
+    const std::array allBounds = {
+      std::pair<int64_t, int64_t>{-1500, 1200},
+      std::pair<int64_t, int64_t>{1200, 3900},
+      std::pair<int64_t, int64_t>{6600, 9100}
+    };
+    const std::array<int64_t, 3> allCounts = {3, 2, 2};
+    expectRangeResult(rootFacetResult(*req, "all"), allBounds, allCounts, 1);
+    const std::array filteredBounds = {
+      std::pair<int64_t, int64_t>{-1500, 1200}
+    };
+    const std::array<int64_t, 1> filteredCounts = {3};
+    expectRangeResult(rootFacetResult(*req, "filtered"), filteredBounds,
+                      filteredCounts, 1);
+    const std::array extremeBounds = {
+      std::pair<int64_t, int64_t>{i64min + 10, 9},
+      std::pair<int64_t, int64_t>{9, i64max - 10}
+    };
+    const std::array<int64_t, 2> extremeCounts = {2, 2};
+    expectRangeResult(rootFacetResult(*req, "extreme"), extremeBounds,
+                      extremeCounts, 2);
+
+    std::array<std::vector<std::byte>, 3> encoded = {
+      encodeFacetResult(*req, "all"), encodeFacetResult(*req, "filtered"),
+      encodeFacetResult(*req, "extreme")
+    };
+    return std::pair{std::move(encoded), SkipStats::rangeFacetPointsArms};
+  };
+
+  auto [pointsResults, pointsArms] = run(false);
+  auto [walkResults, walkArms] = run(true);
+  EXPECT_EQ(3, pointsArms);
+  EXPECT_EQ(0, walkArms);
+  EXPECT_EQ(pointsResults, walkResults);
+  // Later tests (TermScorerTest) index into "main" without clearing first.
+  helper.clear();
+}
+
+TEST_F(FacetTest, pointsRangeFacetFallbacks) {
+  PointsRangeFacetTestGuard guard;
+  IntFacetRangeReq::disablePointsRangeFacetForTests = false;
+
+  auto indexDocs = [](CollectionHelper& helper) {
+    const std::array fields = {
+      RangeSchemaField{"range_i", true, false},
+      RangeSchemaField{"walk_i", false, false}
+    };
+    setRangeFacetSchema(helper, fields);
+    std::vector<Doc> docs = {
+      flatdoc("id", "a", "tag_s", "keep", "range_i", 1000, "walk_i", 1000),
+      flatdoc("id", "b", "tag_s", "drop", "range_i", 2000, "walk_i", 2000),
+      flatdoc("id", "c", "tag_s", "keep")
+    };
+    ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT).success);
+  };
+  const std::array oneBound = {std::pair<int64_t, int64_t>{1000, 2000}};
+  const std::array<int64_t, 1> oneCount = {1};
+
+  {
+    CollectionHelper helper;
+    helper.clear();
+    indexDocs(helper);
+    ASSERT_TRUE(helper.deleteById("b", UpdateMessage::COMMIT).success);
+    SkipStats::reset();
+    auto req = localReq(soluxNode->getSearchEngine());
+    req->collection("main");
+    auto& facet = req->rangeFacet("f", "range_i").range(0, 3000, 1000);
+    std::get<api::RangeFacet>(facet.rawOp().kind).missing = true;
+    req->execute(false);
+    EXPECT_EQ(0, SkipStats::rangeFacetPointsArms);
+    expectRangeResult(rootFacetResult(*req, "f"), oneBound, oneCount, 1);
+  }
+
+  {
+    CollectionHelper helper;
+    helper.clear();
+    indexDocs(helper);
+    SkipStats::reset();
+    auto req = localReq(soluxNode->getSearchEngine());
+    req->collection("main");
+    auto& top = req->topDocs("q");
+    top.matchQuery("tag_s", "keep");
+    auto& facet = top.rangeFacet("f", "range_i").range(0, 3000, 1000);
+    std::get<api::RangeFacet>(facet.rawOp().kind).missing = true;
+    req->execute(false);
+    EXPECT_EQ(0, SkipStats::rangeFacetPointsArms);
+    const auto* docs = req->docList("q");
+    ASSERT_NE(nullptr, docs);
+    expectRangeResult(*docs->ops.at("f")->facetResult(), oneBound, oneCount, 1);
+  }
+
+  {
+    CollectionHelper helper;
+    helper.clear();
+    indexDocs(helper);
+    SkipStats::reset();
+    auto req = localReq(soluxNode->getSearchEngine());
+    req->collection("main");
+    auto& facet = req->rangeFacet("f", "walk_i").range(0, 3000, 1000);
+    std::get<api::RangeFacet>(facet.rawOp().kind).missing = true;
+    req->execute(false);
+    EXPECT_EQ(0, SkipStats::rangeFacetPointsArms);
+    const std::array bounds = {
+      std::pair<int64_t, int64_t>{1000, 2000},
+      std::pair<int64_t, int64_t>{2000, 3000}
+    };
+    const std::array<int64_t, 2> counts = {1, 1};
+    expectRangeResult(rootFacetResult(*req, "f"), bounds, counts, 1);
+    helper.clear();
   }
 }
 
@@ -1643,6 +1861,20 @@ protected:
                        const std::vector<FieldDef>& fields,
                        int maxSegments = MERGE_FACTOR-1, int maxDocsPerSegment = 100) {
     helper.clear();
+
+    std::vector<api::FieldDef> rangeFields;
+    for (const auto& field : fields) {
+      if (!field.isInt) continue;
+      auto& def = rangeFields.emplace_back();
+      def.name = field.name;
+      def.field_class = api::FieldDef::FieldClass::INT;
+      def.index = api::FieldDef::IndexMode::RANGE;
+      def.multi_valued = field.multiValued;
+    }
+    api::SchemaDef schemaDef;
+    schemaDef.fields = std::span<const api::FieldDef>(rangeFields);
+    helper.collection().setSchema(
+        Schema::fromProto(schemaDef, helper.collection().getSchema().get()));
     
     // Random number of segments
     int numSegments = rng.rint(1, std::min(maxSegments, MERGE_FACTOR));

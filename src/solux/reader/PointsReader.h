@@ -254,6 +254,23 @@ public:
     return bounds;
   }
 
+  // Global ordinal of the first point whose value is at least value.
+  uint64_t ordinalOfFirstAtLeast(int64_t value,
+                                 std::span<uint32_t> residualScratch,
+                                 std::span<int64_t> rawScratch) const {
+    uint32_t lo = 0;
+    uint32_t hi = leavesCount;
+    while (lo < hi) {
+      uint32_t mid = lo + (hi - lo) / 2;
+      if (leafMax(mid) < value) lo = mid + 1;
+      else hi = mid;
+    }
+    if (lo == leavesCount) return pointsCount;
+    auto bounds = valueBounds(lo, value, std::numeric_limits<int64_t>::max(),
+                              residualScratch, rawScratch);
+    return leafOrdinalStart(lo) + bounds.lower;
+  }
+
   template <class EmitDoc, class EmitRun, class EmitWord>
   void emitDocids(uint32_t leafIndex, uint16_t begin, uint16_t end,
                   std::span<uint32_t> docScratch, EmitDoc emitDoc,

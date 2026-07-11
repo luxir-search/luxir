@@ -11,6 +11,8 @@
 #include "solux/reader/DocsEnum.h"
 #include "solux/reader/DocsReader.h"
 #include "solux/reader/IntColReader.h"
+#include "solux/reader/PointsReader.h"
+#include "solux/reader/SkipStats.h"
 #include "solux/reader/TermsEnum.h"
 #include "solux/schema/Schema.h"
 #include "solux/search/OrdMapStr.h"
@@ -486,6 +488,8 @@ class IntFacetRangeReq : public FacetReq {
   int64_t end;
   int64_t gap;
 public:
+  static inline bool disablePointsRangeFacetForTests = false;
+
   // rangeFacet must reference the request proto (not a temporary): FacetReq
   // captures a span over rangeFacet.sorts that points into the request bytes.
   IntFacetRangeReq(SearchRequest& req, const ReqRangeFacet& rangeFacet,
@@ -526,6 +530,55 @@ public:
         auto end = thisOp().end;
         auto gap = thisOp().gap;
         auto& facetReq = (FacetReq&)getOp();
+        auto& segment = facetReq.reader.segments()[segnum];
+        bool noSubOps = thisOp().subOps.empty()
+                     && thisOp().inlineSubOps.empty()
+                     && thisOp().sorts.empty();
+        if (!IntFacetRangeReq::disablePointsRangeFacetForTests
+            && domain == nullptr && segment.liveDocs() == nullptr && noSubOps
+            && start <= end) {
+          auto poolGuard = MemPool::threadLocalPoolGuard();
+          FieldReader fieldReader(poolGuard.pool(), segment.postingsReader());
+          if (fieldReader.seek(thisOp().fieldName)) {
+            fieldReader.readFieldInfo(segFieldInfo);
+            bool oneDimensionalNumeric = segFieldInfo.type == FieldType::INT
+                                        || segFieldInfo.type == FieldType::FLOAT
+                                        || segFieldInfo.type == FieldType::DOUBLE
+                                        || segFieldInfo.type == FieldType::DATE;
+            if (segFieldInfo.pointsMetaOff != 0 && oneDimensionalNumeric) {
+              IntColReader column(segment.postingsReader(), segFieldInfo);
+              PointsReader points(segment.postingsReader(), segFieldInfo);
+              if (points.pointCount() != (uint64_t)column.numValues()) {
+                throw std::runtime_error(
+                    "IntFacetRangeReq: points/column value count mismatch");
+              }
+              data.missing_num += segment.maxDoc() - column.docsWithValue();
+              auto residualScratch = poolGuard.pool().make_span<uint32_t>(
+                  points.maxPointsPerLeaf());
+              auto rawScratch = poolGuard.pool().make_span<int64_t>(
+                  points.maxPointsPerLeaf());
+              uint64_t distance = (uint64_t)end - (uint64_t)start;
+              uint64_t bucketCount = distance / (uint64_t)gap
+                                   + (distance % (uint64_t)gap != 0);
+              uint64_t ordinal = points.ordinalOfFirstAtLeast(
+                  start, residualScratch, rawScratch);
+              uint64_t edgeOffset = 0;
+              for (uint64_t bucket = 0; bucket < bucketCount; bucket++) {
+                edgeOffset = distance - edgeOffset > (uint64_t)gap
+                           ? edgeOffset + (uint64_t)gap : distance;
+                int64_t edge = (int64_t)((uint64_t)start + edgeOffset);
+                uint64_t nextOrdinal = points.ordinalOfFirstAtLeast(
+                    edge, residualScratch, rawScratch);
+                if (nextOrdinal != ordinal) {
+                  count[(int64_t)bucket] += (int64_t)(nextOrdinal - ordinal);
+                }
+                ordinal = nextOrdinal;
+              }
+              skipCount(SkipStats::rangeFacetPointsArms);
+              return;
+            }
+          }
+        }
         facetReq.facetSegIntCol(domain, segnum, data.missing_num, segFieldInfo, [&](int32_t docid, int64_t val) SOLUX_INLINE {
           unused(docid);
           if (val < start || val >= end) {

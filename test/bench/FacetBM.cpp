@@ -1,8 +1,12 @@
 #include <charconv>
 #include <latch>
+#include <memory_resource>
 #include <variant>
 
+#include <tbb/task_group.h>
+
 #include "bench/solux_bench.h"
+#include "solux/search/ops/FacetOp.h"
 #include "test/CollectionHelper.h"
 #include "test/LocalReq.h"
 
@@ -99,6 +103,85 @@ static void BM_Facet(benchmark::State& state, int64_t nDocs, std::string_view sh
   state.counters["RSS_max"] = mem.second / 1024;
 }
 
+static void buildRangeFacetBenchIndex(CollectionHelper& helper,
+                                      std::span<const int32_t> docsPerSeg) {
+  helper.clear();
+  std::pmr::monotonic_buffer_resource arena;
+  api::SchemaDef schemaDef;
+  api::FieldDef* field = api::build::allocArray(schemaDef.fields, 1, arena);
+  field->name = "range_bm_i";
+  field->field_class = api::FieldDef::FieldClass::INT;
+  field->index = api::FieldDef::IndexMode::RANGE;
+  helper.collection().setSchema(
+      Schema::fromProto(schemaDef, helper.collection().getSchema().get()));
+
+  auto iw = helper.getIndexWriter();
+  std::vector<Inverter*> inverters;
+  std::vector<int64_t> starts;
+  int64_t start = 0;
+  for (int32_t docs : docsPerSeg) {
+    inverters.push_back(&iw->obtainInverter());
+    starts.push_back(start);
+    start += docs;
+  }
+  tbb::task_group tg;
+  for (size_t seg = 0; seg < docsPerSeg.size(); seg++) {
+    tg.run([&, seg]() {
+      Inverter& inverter = *inverters[seg];
+      auto& id = inverter.getIndexHandler("id");
+      auto& value = inverter.getIndexHandler("range_bm_i");
+      int64_t doc = starts[seg];
+      for (int32_t i = 0; i < docsPerSeg[seg]; i++, doc++) {
+        inverter.startDoc();
+        id.index(inverter, std::to_string(doc));
+        value.index(inverter, doc % 10'000 * 1000);
+        inverter.finishDoc();
+      }
+      iw->releaseInverter(inverter, true);
+    });
+  }
+  tg.wait();
+  helper.commit();
+}
+
+static void BM_RangeFacet(benchmark::State& state, int64_t nDocs,
+                          std::string_view shape, bool forceWalk) {
+  if (solux::unit_tests) nDocs = 200;
+  std::vector<int32_t> docsPerSeg;
+  CollectionHelper::calcSegSizes(nDocs, 10, shape, docsPerSeg);
+  CollectionHelper helper("facet_range_bm");
+  bool reuseIndex = helper.indexMatchesShape(docsPerSeg);
+  if (!reuseIndex) buildRangeFacetBenchIndex(helper, docsPerSeg);
+
+  struct HookGuard {
+    bool saved = IntFacetRangeReq::disablePointsRangeFacetForTests;
+    ~HookGuard() { IntFacetRangeReq::disablePointsRangeFacetForTests = saved; }
+  } hookGuard;
+  IntFacetRangeReq::disablePointsRangeFacetForTests = forceWalk;
+  int64_t fingerprint = -1;
+  for (auto _ : state) {
+    auto req = localReq(SoluxTest::soluxNode->getSearchEngine());
+    req->collection("facet_range_bm");
+    req->rangeFacet("f", "range_bm_i").range(-500, 10'000'500, 100'003);
+    req->execute(false);
+    const auto* result = req->responses[0]->proto.ops.at("f")->facetResult();
+    int64_t current = 0;
+    const auto& bounds = std::get<api::ArrArrInt>(result->bucket_ids->kind).v;
+    for (size_t i = 0; i < result->counts.size(); i++) {
+      current = current * 31 + bounds[i].v[0] + result->counts[i];
+    }
+    benchmark::DoNotOptimize(current);
+    if (fingerprint != -1) {
+      ASSERT_EQ(fingerprint, current);
+    }
+    fingerprint = current;
+  }
+  state.counters["fp"] = fingerprint;
+  state.counters["reused"] = reuseIndex;
+  state.counters["rate"] = benchmark::Counter(
+      state.iterations(), benchmark::Counter::kIsRate);
+}
+
 
 constexpr int32_t nDocs = 10'000'000;
 constexpr const char* shape = "9555"; // 9 segments, 555 docs per segment
@@ -130,3 +213,6 @@ SOLUX_BENCHMARK_CAPTURE(BM_Facet, bigD_u100k_s,     nDocs, shape, "short_u10_s",
 SOLUX_BENCHMARK_CAPTURE(BM_Facet, bigD_u100k_s,     nDocs, shape, "short_u10_s", "short_u100k_s", true);
 SOLUX_BENCHMARK_CAPTURE(BM_Facet, bigD_u1m_s,       nDocs, shape, "short_u10_s", "short_u1m_s", false);
 SOLUX_BENCHMARK_CAPTURE(BM_Facet, bigD_u1m_s,       nDocs, shape, "short_u10_s", "short_u1m_s", true);
+
+SOLUX_BENCHMARK_CAPTURE(BM_RangeFacet, points,      nDocs, shape, false);
+SOLUX_BENCHMARK_CAPTURE(BM_RangeFacet, forced_walk, nDocs, shape, true);

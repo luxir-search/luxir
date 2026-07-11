@@ -181,6 +181,29 @@ TEST_F(PointsIndexTest, leafBoundariesAndDirectory) {
   });
 }
 
+TEST_F(PointsIndexTest, ordinalOfFirstAtLeast) {
+  std::vector<Point> points = {
+    {-5000, 0}, {-1000, 1}, {0, 2}, {0, 3}, {1000, 4}, {3000, 5}, {7000, 6}
+  };
+  withPoints(points, 3, [](const PointsReader& reader,
+                            const PointsWriter::Data&, const InputStream&) {
+    std::vector<uint32_t> residuals(reader.maxPointsPerLeaf());
+    std::vector<int64_t> raw(reader.maxPointsPerLeaf());
+    auto ordinal = [&](int64_t value) {
+      return reader.ordinalOfFirstAtLeast(value, residuals, raw);
+    };
+    EXPECT_EQ(0u, ordinal(std::numeric_limits<int64_t>::min()));
+    EXPECT_EQ(0u, ordinal(-5000));
+    EXPECT_EQ(1u, ordinal(-4999));
+    EXPECT_EQ(2u, ordinal(-999));
+    EXPECT_EQ(2u, ordinal(0));
+    EXPECT_EQ(4u, ordinal(1));
+    EXPECT_EQ(6u, ordinal(7000));
+    EXPECT_EQ(reader.pointCount(), ordinal(7001));
+    EXPECT_EQ(reader.pointCount(), ordinal(std::numeric_limits<int64_t>::max()));
+  });
+}
+
 TEST_F(PointsIndexTest, valueEncodingExtremes) {
   const int64_t i64min = std::numeric_limits<int64_t>::min();
   const int64_t i64max = std::numeric_limits<int64_t>::max();
