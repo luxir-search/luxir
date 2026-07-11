@@ -67,7 +67,11 @@ void expectRoundTrip(std::span<const Point> points,
 std::vector<int32_t> intersectDocs(const BKDReader& reader,
                                    auto&& relation) {
   std::vector<int32_t> docs;
-  reader.intersect(relation,
+  std::vector<uint32_t> docScratch(reader.maxPointsPerLeaf());
+  std::vector<uint32_t> latScratch(reader.maxPointsPerLeaf());
+  std::vector<uint32_t> lonScratch(reader.maxPointsPerLeaf());
+  BKDReader::Scratch scratch{docScratch, latScratch, lonScratch};
+  reader.intersect(relation, scratch,
       [&](int32_t doc) { docs.push_back(doc); },
       [&](int32_t begin, int32_t end) {
         for (int32_t doc = begin; doc < end; doc++) docs.push_back(doc);
@@ -306,7 +310,10 @@ TEST_F(BKDIndexTest, randomizedBoxOracleWrappedBoundsAndCount) {
 
       CountingBox counted{box, &tightBounds};
       EXPECT_EQ(expected, intersectDocs(reader, counted));
-      EXPECT_EQ(expected.size(), reader.countIntersect(box).exactCount);
+      std::vector<uint32_t> latScratch(reader.maxPointsPerLeaf());
+      std::vector<uint32_t> lonScratch(reader.maxPointsPerLeaf());
+      BKDReader::Scratch scratch{{}, latScratch, lonScratch};
+      EXPECT_EQ(expected.size(), reader.countIntersect(box, scratch).exactCount);
       outside += counted.outside;
       inside += counted.inside;
       crosses += counted.crosses;

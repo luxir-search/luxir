@@ -4,6 +4,7 @@
 #include "OrdCollector.h"
 #include "OrdColWriter.h"
 #include "NormsWriter.h"
+#include "BKDWriter.h"
 #include "PointsWriter.h"
 #include "StoredFieldsWriter.h"
 #include "solux/reader/DocsEnum.h"
@@ -12,6 +13,7 @@
 #include "solux/reader/StoredFieldsReader.h"
 #include "solux/reader/StrColReader.h"
 #include "solux/search/IndexReader.h"
+#include "solux/util/geo.h"
 
 #include <atomic>
 #include <oneapi/tbb/task_group.h>
@@ -472,9 +474,11 @@ private:
   }
 
   static bool hasOneDimensionalPoints(FieldType::Type type, int32_t flags) {
-    // TODO(pass C): merge GEO_POINT RANGE BKD trees. Until then merged geo
-    // fields intentionally have pointsMetaOff == 0 and use column scans.
     return type != FieldType::GEO_POINT && (flags & FieldType::INDEX_RANGE) != 0;
+  }
+
+  static bool hasGeoPoints(FieldType::Type type, int32_t flags) {
+    return type == FieldType::GEO_POINT && (flags & FieldType::INDEX_RANGE) != 0;
   }
 
   static void batchTypeAndFlags(std::span<const MergeFieldInfo> fields, FieldType::Type& type, int32_t& allFlags) {
@@ -522,7 +526,8 @@ private:
     int64_t pointsBytes = hasOneDimensionalPoints(type, allFlags)
         ? MergeCostModel::pointsBytes((int64_t)fields.size(), numValues,
                                       synthesizedPointValues)
-        : 0;
+        : hasGeoPoints(type, allFlags)
+          ? MergeCostModel::geoPointsBytes(numValues) : 0;
 
     if (type == FieldType::Type::STRING && (allFlags & FieldType::INDEX_DOCS) != 0) {
       // Ord columns hold the term-order -> doc-order transposition in RAM until the
@@ -563,7 +568,9 @@ private:
     }
     return MergeCostModel::INT_COL_STREAMS
         + (hasOneDimensionalPoints(type, allFlags)
-           ? MergeCostModel::POINTS_STREAMS : 0);
+           ? MergeCostModel::POINTS_STREAMS
+           : hasGeoPoints(type, allFlags)
+             ? MergeCostModel::GEO_POINTS_STREAMS : 0);
   }
 
   // Helper to build mapping from old doc IDs to new doc IDs for a segment, accounting for deletes
@@ -826,8 +833,20 @@ private:
       mergeStrCol(sortedFields, postingsWriter, outputFieldInfo);
     } else {
       // int column that is not an ord column (assume all other field types have this (currently true)
-      mergeIntCol2(sortedFields, postingsWriter, outputFieldInfo);
-      if (hasOneDimensionalPoints(type, allFlags)) {
+      std::vector<BKDWriter::Point> geoPoints;
+      bool rebuildGeo = hasGeoPoints(type, allFlags);
+      mergeIntCol2(sortedFields, postingsWriter, outputFieldInfo,
+                   rebuildGeo ? &geoPoints : nullptr);
+      if (rebuildGeo) {
+        if (!geoPoints.empty()) {
+          auto output = postingsWriter.getOutputStream();
+          BKDWriter writer(*output);
+          auto data = writer.write(geoPoints);
+          assert(data.pointCount == (uint64_t)outputFieldInfo.numValues);
+          outputFieldInfo.pointsLoc = data.pointsLoc;
+          outputFieldInfo.pointsMetaOff = data.pointsMetaOff;
+        }
+      } else if (hasOneDimensionalPoints(type, allFlags)) {
         mergePoints(sortedFields, postingsWriter, outputFieldInfo);
       }
     }
@@ -1219,8 +1238,10 @@ private:
     outputFieldInfo.pointsMetaOff = data.pointsMetaOff;
   }
 
-  void mergeIntCol2(std::span<MergeFieldInfo*> sortedFields, PostingsWriter& postingsWriter,
-                   PostingsWriter::IndexFieldInfo& outputFieldInfo) {
+  void mergeIntCol2(std::span<MergeFieldInfo*> sortedFields,
+                    PostingsWriter& postingsWriter,
+                    PostingsWriter::IndexFieldInfo& outputFieldInfo,
+                    std::vector<BKDWriter::Point>* geoPoints) {
     assert(sortedFields.size() == segs.size());  // expect non-compacted fields to make the code a little simpler.
 
     auto poolGuard = MemPool::threadLocalPoolGuard();
@@ -1341,6 +1362,10 @@ private:
           for (int64_t inRank = lastEndValueRankIn; inRank < endValueRank; inRank++) {
             auto val = values.valueAt(inRank);
             intColWriter->addInt64(val);
+            if (geoPoints != nullptr) {
+              geoPoints->push_back({geo::unpackLatitude(val),
+                                    geo::unpackLongitude(val), mappedDoc});
+            }
           }
 
           // TODO: if doc was deleted, then adjust endValueRankBase down by nValues.
@@ -1349,6 +1374,10 @@ private:
           // single-valued
           auto val = values.valueAt(docRankIn);
           intColWriter->addInt64(val);
+          if (geoPoints != nullptr) {
+            geoPoints->push_back({geo::unpackLatitude(val),
+                                  geo::unpackLongitude(val), mappedDoc});
+          }
         }
       }
 

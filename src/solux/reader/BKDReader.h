@@ -96,6 +96,17 @@ public:
     uint64_t exactCount;
   };
 
+  struct EstimateResult {
+    uint64_t estimatedCount;
+    uint64_t upperBound;
+  };
+
+  struct Scratch {
+    std::span<uint32_t> docs;
+    std::span<uint32_t> lat;
+    std::span<uint32_t> lon;
+  };
+
 private:
   const char* points = nullptr;
   const char* fileEnd = nullptr;
@@ -540,11 +551,12 @@ public:
   }
 
   template <class Relation, class EmitDoc, class EmitRun, class EmitWord>
-  void intersect(Relation&& relation, EmitDoc emitDoc, EmitRun emitRun,
-                 EmitWord emitWord) const {
-    std::vector<uint32_t> docs(leafSizeMax);
-    std::vector<uint32_t> lat(leafSizeMax);
-    std::vector<uint32_t> lon(leafSizeMax);
+  void intersect(Relation&& relation, Scratch scratch, EmitDoc emitDoc,
+                 EmitRun emitRun, EmitWord emitWord) const {
+    if (scratch.docs.size() < leafSizeMax || scratch.lat.size() < leafSizeMax
+        || scratch.lon.size() < leafSizeMax) {
+      throw std::invalid_argument("BKDReader: intersect scratch is too small");
+    }
 
     auto visit = [&](auto&& self, uint32_t nodeId, uint32_t leaves,
                      uint32_t firstLeaf, int32_t cellLatMin,
@@ -556,7 +568,7 @@ public:
       if (relationToCell == BKDRelation::INSIDE) {
         for (uint32_t leaf = firstLeaf; leaf < firstLeaf + leaves; leaf++) {
           LeafInfo info = leafInfo(leaf);
-          emitLeafDocids(leaf, info, docs, emitDoc, emitRun, emitWord);
+          emitLeafDocids(leaf, info, scratch.docs, emitDoc, emitRun, emitWord);
         }
         return;
       }
@@ -585,16 +597,16 @@ public:
           leafMinLon(firstLeaf), leafMaxLon(firstLeaf));
       if (tight == BKDRelation::OUTSIDE) return;
       if (tight == BKDRelation::INSIDE) {
-        emitLeafDocids(firstLeaf, info, docs, emitDoc, emitRun, emitWord);
+        emitLeafDocids(firstLeaf, info, scratch.docs, emitDoc, emitRun, emitWord);
         return;
       }
-      decodeDocids(firstLeaf, info, docs);
-      decodeCoordinates(firstLeaf, info, lat, lon);
+      decodeDocids(firstLeaf, info, scratch.docs);
+      decodeCoordinates(firstLeaf, info, scratch.lat, scratch.lon);
       for (uint16_t i = 0; i < info.count; i++) {
-        int32_t decodedLat = (int32_t)((uint32_t)info.latMin + lat[i]);
-        int32_t decodedLon = (int32_t)((uint32_t)info.lonMin + lon[i]);
+        int32_t decodedLat = (int32_t)((uint32_t)info.latMin + scratch.lat[i]);
+        int32_t decodedLon = (int32_t)((uint32_t)info.lonMin + scratch.lon[i]);
         if (relation.matches(decodedLat, decodedLon)) {
-          emitDoc((int32_t)docs[i]);
+          emitDoc((int32_t)scratch.docs[i]);
         }
       }
     };
@@ -603,9 +615,68 @@ public:
   }
 
   template <class Relation>
-  CountResult countIntersect(Relation&& relation) const {
-    std::vector<uint32_t> lat(leafSizeMax);
-    std::vector<uint32_t> lon(leafSizeMax);
+  EstimateResult estimateIntersect(Relation&& relation) const {
+    uint64_t estimated = 0;
+    uint64_t upper = 0;
+    auto addLeaves = [&](uint32_t firstLeaf, uint32_t leaves) {
+      for (uint32_t leaf = firstLeaf; leaf < firstLeaf + leaves; leaf++) {
+        uint64_t count = leafInfo(leaf).count;
+        estimated += count;
+        upper += count;
+      }
+    };
+    auto visit = [&](auto&& self, uint32_t nodeId, uint32_t leaves,
+                     uint32_t firstLeaf, int32_t cellLatMin,
+                     int32_t cellLatMax, int32_t cellLonMin,
+                     int32_t cellLonMax) -> void {
+      BKDRelation relationToCell = relation.compare(
+          cellLatMin, cellLatMax, cellLonMin, cellLonMax);
+      if (relationToCell == BKDRelation::OUTSIDE) return;
+      if (relationToCell == BKDRelation::INSIDE) {
+        addLeaves(firstLeaf, leaves);
+        return;
+      }
+      if (leaves != 1) {
+        InnerNode node = innerNode(nodeId);
+        uint32_t leftLeaves = numLeftLeaves(leaves);
+        if (node.splitDim == 0) {
+          self(self, nodeId * 2, leftLeaves, firstLeaf, cellLatMin,
+               node.splitValue, cellLonMin, cellLonMax);
+          self(self, nodeId * 2 + 1, leaves - leftLeaves,
+               firstLeaf + leftLeaves, node.splitValue, cellLatMax,
+               cellLonMin, cellLonMax);
+        } else {
+          self(self, nodeId * 2, leftLeaves, firstLeaf, cellLatMin,
+               cellLatMax, cellLonMin, node.splitValue);
+          self(self, nodeId * 2 + 1, leaves - leftLeaves,
+               firstLeaf + leftLeaves, cellLatMin, cellLatMax,
+               node.splitValue, cellLonMax);
+        }
+        return;
+      }
+
+      LeafInfo info = leafInfo(firstLeaf);
+      BKDRelation tight = relation.compare(
+          leafMinLat(firstLeaf), leafMaxLat(firstLeaf),
+          leafMinLon(firstLeaf), leafMaxLon(firstLeaf));
+      if (tight == BKDRelation::INSIDE) {
+        estimated += info.count;
+        upper += info.count;
+      } else if (tight == BKDRelation::CROSSES) {
+        estimated += ((uint64_t)info.count + 1) / 2;
+        upper += info.count;
+      }
+    };
+    visit(visit, 1, leavesCount, 0, INT32_MIN, INT32_MAX,
+          INT32_MIN, INT32_MAX);
+    return {estimated, upper};
+  }
+
+  template <class Relation>
+  CountResult countIntersect(Relation&& relation, Scratch scratch) const {
+    if (scratch.lat.size() < leafSizeMax || scratch.lon.size() < leafSizeMax) {
+      throw std::invalid_argument("BKDReader: count scratch is too small");
+    }
     uint64_t count = 0;
     auto visit = [&](auto&& self, uint32_t nodeId, uint32_t leaves,
                      uint32_t firstLeaf, int32_t cellLatMin,
@@ -647,10 +718,10 @@ public:
         count += info.count;
         return;
       }
-      decodeCoordinates(firstLeaf, info, lat, lon);
+      decodeCoordinates(firstLeaf, info, scratch.lat, scratch.lon);
       for (uint16_t i = 0; i < info.count; i++) {
-        int32_t decodedLat = (int32_t)((uint32_t)info.latMin + lat[i]);
-        int32_t decodedLon = (int32_t)((uint32_t)info.lonMin + lon[i]);
+        int32_t decodedLat = (int32_t)((uint32_t)info.latMin + scratch.lat[i]);
+        int32_t decodedLon = (int32_t)((uint32_t)info.lonMin + scratch.lon[i]);
         if (relation.matches(decodedLat, decodedLon)) count++;
       }
     };

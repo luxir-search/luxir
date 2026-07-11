@@ -94,6 +94,9 @@ struct SkipStats {
   static inline int64_t numericRangeComplementArms = 0;
   static inline int64_t numericRangePointsArms = 0;
   static inline int64_t numericRangeZoneArms = 0;
+  static inline int64_t geoBKDArms = 0;
+  static inline int64_t geoScanArms = 0;
+  static inline int64_t geoSparseVerifyArms = 0;
   static inline int64_t docsOnlyFreqBlocksSkipped = 0;
   static inline int64_t docsOnlyWordProbeAdvances = 0;
   static inline int64_t scoredWordProbeAdvances = 0;
@@ -180,6 +183,9 @@ struct SkipStats {
     numericRangeComplementArms = 0;
     numericRangePointsArms = 0;
     numericRangeZoneArms = 0;
+    geoBKDArms = 0;
+    geoScanArms = 0;
+    geoSparseVerifyArms = 0;
     docsOnlyFreqBlocksSkipped = 0;
     docsOnlyWordProbeAdvances = 0;
     scoredWordProbeAdvances = 0;

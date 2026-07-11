@@ -8,6 +8,7 @@
 #include <memory_resource>
 #include <span>
 #include <string_view>
+#include <tuple>
 #include <vector>
 
 #include "solux/api/build.h"
@@ -83,14 +84,13 @@ struct QueryState {
 std::vector<int32_t> collect(Query::Scorer* scorer, bool twoPhase) {
   std::vector<int32_t> docs;
   if (scorer == nullptr) return docs;
-  if (!twoPhase) {
+  if (!twoPhase || !scorer->hasTwoPhase()) {
     for (int32_t doc = scorer->next(); doc != PostingsReader::END;
          doc = scorer->next()) {
       docs.push_back(doc);
     }
     return docs;
   }
-  EXPECT_TRUE(scorer->hasTwoPhase());
   for (int32_t doc = scorer->approximationNext(); doc != PostingsReader::END;
        doc = scorer->approximationNext()) {
     if (scorer->matches()) docs.push_back(doc);
@@ -106,16 +106,18 @@ std::vector<int32_t> run(IndexReader& reader, std::string_view field,
                  twoPhase);
 }
 
-void setGeoSchema(CollectionHelper& helper) {
+void setGeoSchema(CollectionHelper& helper, bool range = true) {
   std::pmr::monotonic_buffer_resource arena;
   api::SchemaDef def;
   api::FieldDef* fields = api::build::allocArray(def.fields, 2, arena);
   fields[0].name = "geo_single";
   fields[0].field_class = api::FieldDef::FieldClass::GEO_POINT;
-  fields[0].index = api::FieldDef::IndexMode::RANGE;
+  fields[0].index = range ? api::FieldDef::IndexMode::RANGE
+                          : api::FieldDef::IndexMode::NONE;
   fields[1].name = "geo_multi";
   fields[1].field_class = api::FieldDef::FieldClass::GEO_POINT;
-  fields[1].index = api::FieldDef::IndexMode::RANGE;
+  fields[1].index = range ? api::FieldDef::IndexMode::RANGE
+                          : api::FieldDef::IndexMode::NONE;
   fields[1].multi_valued = true;
   helper.collection().setSchema(
       Schema::fromProto(def, helper.collection().getSchema().get()));
@@ -299,6 +301,8 @@ TEST_F(GeoBoxQueryTest, randomizedQuantizedOracleSingleAndMulti) {
                                       exact.longitude, 180.0},
                                      {-33.9, -33.8, 151.1, 151.3}}};
 
+  SkipStats::reset();
+  SkipStats::enabled = true;
   for (size_t boxIndex = 0; boxIndex < boxes.size(); boxIndex++) {
     const auto& box = boxes[boxIndex];
     for (auto [field, values] : {
@@ -310,15 +314,33 @@ TEST_F(GeoBoxQueryTest, randomizedQuantizedOracleSingleAndMulti) {
       auto expected = oracle(*values, box);
       EXPECT_EQ(expected, run(*reader, field, box, false));
       EXPECT_EQ(expected, run(*reader, field, box, true));
+      MemPool countPool;
+      QueryState countState(countPool, *reader, field, box);
+      EXPECT_EQ(field == "geo_single" ? (int64_t)expected.size() : -1,
+                countState.weight->count(segment));
     }
   }
+  SkipStats::enabled = false;
+  EXPECT_GT(SkipStats::geoBKDArms, 0);
+  EXPECT_EQ(0, SkipStats::geoScanArms);
 
   MemPool pool;
   QueryState state(pool, *reader, "geo_single", boxes[2]);
   auto* supplier = state.weight->scorerSupplier(pool, segment);
   ASSERT_NE(nullptr, supplier);
   EXPECT_EQ((int64_t)(N - (N + 4) / 5), supplier->cost());
-  EXPECT_EQ(-1, state.weight->count(segment));
+  EXPECT_EQ((int64_t)oracle(single, boxes[2]).size(),
+            state.weight->count(segment));
+  int64_t sparseBefore = SkipStats::geoSparseVerifyArms;
+  SkipStats::enabled = true;
+  auto* sparse = supplier->get(pool, 0);
+  SkipStats::enabled = false;
+  ASSERT_NE(nullptr, sparse);
+  EXPECT_TRUE(sparse->hasTwoPhase());
+  EXPECT_EQ(sparseBefore + 1, SkipStats::geoSparseVerifyArms);
+
+  QueryState multiState(pool, *reader, "geo_multi", boxes[2]);
+  EXPECT_EQ(-1, multiState.weight->count(segment));
 }
 
 TEST_F(GeoBoxQueryTest, rejectsInvalidBoxesAndTreatsUnrepresentableEdgesAsEmpty) {
@@ -333,7 +355,36 @@ TEST_F(GeoBoxQueryTest, rejectsInvalidBoxesAndTreatsUnrepresentableEdgesAsEmpty)
   EXPECT_TRUE(GeoBoxQuery("geo", -90.0, 90.0, 180.0, 180.0).isEmpty());
 }
 
-TEST_F(GeoBoxQueryTest, flushWritesBKDButMergeDefersGeoPointsToPassC) {
+TEST_F(GeoBoxQueryTest, scanFallbackWithoutPointsUsesDenseColumnPath) {
+  CollectionHelper helper;
+  helper.clear();
+  setGeoSchema(helper, false);
+  auto writer = helper.getIndexWriter();
+  Inverter& inverter = writer->obtainInverter();
+  auto& handler = inverter.getIndexHandler("geo_single");
+  std::vector<std::vector<QuantizedPoint>> points(30);
+  for (int32_t doc = 0; doc < 30; doc++) {
+    inverter.startDoc();
+    double lat = -20.0 + doc;
+    double lon = 150.0 + doc;
+    handler.index(inverter, lat, lon);
+    points[(size_t)doc].push_back(quantize(lat, lon));
+    inverter.finishDoc();
+  }
+  writer->releaseInverter(inverter);
+  writer->commit();
+  auto reader = writer->getIndexReader();
+  auto& segment = reader->segments()[0];
+  EXPECT_EQ(0, fieldInfo(segment, "geo_single").pointsMetaOff);
+  Box box{-10.0, 10.0, 160.0, -170.0};
+  SkipStats::reset();
+  SkipStats::enabled = true;
+  EXPECT_EQ(oracle(points, box), run(*reader, "geo_single", box, false));
+  SkipStats::enabled = false;
+  EXPECT_EQ(1, SkipStats::geoScanArms);
+}
+
+TEST_F(GeoBoxQueryTest, mergeRebuildsSingleAndMultiBKDWithDeletes) {
   CollectionHelper helper;
   helper.clear();
   setGeoSchema(helper);
@@ -341,13 +392,18 @@ TEST_F(GeoBoxQueryTest, flushWritesBKDButMergeDefersGeoPointsToPassC) {
 
   for (int32_t segmentNumber = 0; segmentNumber < 2; segmentNumber++) {
     Inverter& inverter = writer->obtainInverter();
-    auto& handler = inverter.getIndexHandler("geo_single");
+    auto& singleHandler = inverter.getIndexHandler("geo_single");
+    auto& multiHandler = inverter.getIndexHandler("geo_multi");
     for (int32_t doc = 0; doc < 20; doc++) {
       inverter.startDoc();
-      handler.index(inverter, -40.0 + doc,
-                    -170.0 + segmentNumber * 100.0 + doc);
+      double lat = -40.0 + segmentNumber * 35.0 + doc;
+      double lon = -170.0 + segmentNumber * 300.0 + doc;
+      singleHandler.index(inverter, lat, lon);
+      std::array<GeoPoint, 2> values{{{lat, lon}, {-lat, -lon}}};
+      multiHandler.index(inverter, std::span<const GeoPoint>(values));
       inverter.finishDoc();
     }
+    if (segmentNumber == 1) inverter.deleteDoc(5);
     writer->releaseInverter(inverter);
     writer->commit();
   }
@@ -355,14 +411,73 @@ TEST_F(GeoBoxQueryTest, flushWritesBKDButMergeDefersGeoPointsToPassC) {
   auto beforeMerge = writer->getIndexReader();
   ASSERT_EQ(2u, beforeMerge->segments().size());
   for (auto& segment : beforeMerge->segments()) {
-    SegFieldInfo info = fieldInfo(segment, "geo_single");
-    ASSERT_NE(0, info.pointsMetaOff);
-    BKDReader bkd(segment.postingsReader(), info);
-    EXPECT_NO_THROW(bkd.validate());
+    for (std::string_view field : {"geo_single", "geo_multi"}) {
+      SegFieldInfo info = fieldInfo(segment, field);
+      ASSERT_NE(0, info.pointsMetaOff);
+      BKDReader bkd(segment.postingsReader(), info);
+      EXPECT_NO_THROW(bkd.validate());
+    }
   }
+
+  Box all{-90.0, 90.0, -180.0, 180.0};
+  MemPool deletedCountPool;
+  QueryState deletedCountState(deletedCountPool, *beforeMerge,
+                               "geo_single", all);
+  EXPECT_EQ(-1, deletedCountState.weight->count(beforeMerge->segments()[1]));
 
   writer->mergeSegments();
   auto afterMerge = writer->getIndexReader();
   ASSERT_EQ(1u, afterMerge->segments().size());
-  EXPECT_EQ(0, fieldInfo(afterMerge->segments()[0], "geo_single").pointsMetaOff);
+  auto& merged = afterMerge->segments()[0];
+  for (std::string_view field : {"geo_single", "geo_multi"}) {
+    SegFieldInfo info = fieldInfo(merged, field);
+    ASSERT_NE(0, info.pointsMetaOff);
+    BKDReader bkd(merged.postingsReader(), info);
+    EXPECT_NO_THROW(bkd.validate());
+
+    std::vector<BKDReader::Point> expected;
+    IntColReader column(merged.postingsReader(), info);
+    IntColReader::Iterator iter(column);
+    for (int32_t doc = iter.next(); doc != PostingsReader::END;
+         doc = iter.next()) {
+      if (!column.multiValued()) {
+        expected.push_back({geo::unpackLatitude(iter.value()),
+                            geo::unpackLongitude(iter.value()), doc});
+      } else {
+        auto [start, end] = column.getStartEndValueRank(iter.rank());
+        for (int64_t rank = start; rank < end; rank++) {
+          int64_t packed = iter.values().valueAt(rank);
+          expected.push_back({geo::unpackLatitude(packed),
+                              geo::unpackLongitude(packed), doc});
+        }
+      }
+    }
+    auto actual = bkd.readAll();
+    std::vector<std::vector<QuantizedPoint>> surviving(
+        (size_t)merged.maxDoc());
+    for (const auto& point : expected) {
+      surviving[(size_t)point.docid].push_back(
+          {geo::decodeLatitude(point.lat), geo::decodeLongitude(point.lon)});
+    }
+    const std::array<Box, 4> boxes = {{{-90.0, 90.0, -180.0, 180.0},
+                                       {-30.0, 5.0, 160.0, -160.0},
+                                       {-10.0, 10.0, 120.0, 170.0},
+                                       {20.0, 45.0, -180.0, -120.0}}};
+    for (const Box& box : boxes) {
+      EXPECT_EQ(oracle(surviving, box), run(*afterMerge, field, box, false));
+    }
+    auto byPoint = [](const auto& left, const auto& right) {
+      return std::tie(left.lat, left.lon, left.docid)
+           < std::tie(right.lat, right.lon, right.docid);
+    };
+    std::sort(expected.begin(), expected.end(), byPoint);
+    std::sort(actual.begin(), actual.end(), byPoint);
+    EXPECT_EQ(expected, actual);
+  }
+
+  MemPool countPool;
+  QueryState singleCountState(countPool, *afterMerge, "geo_single", all);
+  EXPECT_EQ(39, singleCountState.weight->count(merged));
+  QueryState multiCountState(countPool, *afterMerge, "geo_multi", all);
+  EXPECT_EQ(-1, multiCountState.weight->count(merged));
 }

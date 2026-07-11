@@ -22,12 +22,15 @@ struct MergeCostModel {
   static constexpr int32_t STR_COL_STREAMS = 5;   // values + endValueRank + valDoc + endOffset + docsWithVal.
   static constexpr int32_t STORED_STREAMS = 1;    // chunk, mono, and mono2 streams are opened sequentially.
   static constexpr int32_t POINTS_STREAMS = 1;
+  static constexpr int32_t GEO_POINTS_STREAMS = 1;
 
   static constexpr int64_t POINTS_PER_LEAF = 512;
   static constexpr int64_t POINTS_WRITER_BYTES = 64 * 1024;
   static constexpr int64_t POINTS_RUN_BYTES = 1024;
   static constexpr int64_t POINTS_DECODE_BYTES = POINTS_PER_LEAF * (8 + 4 + 4);
   static constexpr int64_t SYNTHESIZED_POINT_BYTES = 16;
+  // vector growth can retain nearly 2x the 16-byte triple payload.
+  static constexpr int64_t GEO_POINT_BYTES = 32;
   // Three 8-byte directory arrays can each retain nearly 2x vector capacity.
   static constexpr int64_t POINTS_DIRECTORY_BYTES_PER_LEAF = 48;
 
@@ -43,6 +46,16 @@ struct MergeCostModel {
         + sourceRuns * (POINTS_RUN_BYTES + POINTS_DECODE_BYTES)
         + leaves * POINTS_DIRECTORY_BYTES_PER_LEAF
         + synthesizedValues * SYNTHESIZED_POINT_BYTES;
+  }
+
+  static int64_t geoPointsBytes(int64_t totalValues) {
+    int64_t leaves = totalValues / POINTS_PER_LEAF
+        + (totalValues % POINTS_PER_LEAF != 0);
+    // The merged-column walk buffers every output triple. BKDWriter partitions
+    // that array in place and retains the same directory shape as 1-D points.
+    return POINTS_WRITER_BYTES
+        + totalValues * GEO_POINT_BYTES
+        + leaves * POINTS_DIRECTORY_BYTES_PER_LEAF;
   }
 };
 
