@@ -535,6 +535,8 @@ TEST_F(ExprParserTest, functionErrors) {
   expectContains(parseErr("boolean(x)"), "takes only named arguments");
   expectContains(parseErr("all(x)"), "all() takes no arguments");
   expectContains(parseErr("expr(status:live)"), "not callable within expr");
+  expectContains(parseErr("geo_distance(field=geo, lat=0, lon=0, radius_meters=1)"),
+                 "unknown query function 'geo_distance'");
   expectContains(parseErr("match(x, min_match=abc)"), "expects a number");
   expectContains(parseErr("match(x, operator=XOR)"), "expects AND or OR");
   expectContains(parseErr("knn(field=status, query=[1,2])"), "cannot express");

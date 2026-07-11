@@ -108,6 +108,18 @@ inline api::Query geoBox(std::pmr::memory_resource& mr, std::string_view field,
   return q;
 }
 
+inline api::Query geoDistance(std::pmr::memory_resource& mr,
+                              std::string_view field, double lat, double lon,
+                              double radiusMeters) {
+  api::Query q;
+  auto& g = q.kind.emplace<api::GeoDistanceQuery>();
+  g.field = build::arenaStr(mr, field);
+  g.lat = lat;
+  g.lon = lon;
+  g.radius_meters = radiusMeters;
+  return q;
+}
+
 inline api::Query fuzzy(std::pmr::memory_resource& mr, std::string_view field,
                         std::string_view term, int maxEdits = -1, int prefixLength = -1,
                         int maxExpansions = 0) {

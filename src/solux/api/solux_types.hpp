@@ -101,7 +101,7 @@ struct Target; struct SearchRequest; struct SearchOp; struct GenOp; struct TopDo
 struct Fusion; struct RrfFusion; struct SortSpec; struct Query;
 struct ConstantScoreQuery; struct KnnQuery; struct Match; struct NamedQuery; struct BooleanQuery;
 struct PrefixQuery; struct FuzzyQuery; struct PhraseQuery; struct SimpleQuery; struct RangeQuery;
-struct GeoBoxQuery; struct ExprQuery; struct Warning;
+struct GeoBoxQuery; struct GeoDistanceQuery; struct ExprQuery; struct Warning;
 struct FieldFacet; struct RangeFacet;
 struct Domain; struct SearchResponse; struct DocList; struct FacetResult; struct Bucket;
 struct CommitParams; struct UpdateRequest; struct UpdateResponse; struct NamedValue; struct Map;
@@ -422,14 +422,20 @@ struct GeoBoxQuery {
   double min_lon = {};
   double max_lon = {};
 };
+struct GeoDistanceQuery {
+  std::string_view field;
+  double lat = {};
+  double lon = {};
+  double radius_meters = {};
+};
 struct ExprQuery {                                             // map value indirect: Val may be incomplete, but is complete here anyway
   std::string_view q;
   map_view<std::string_view, ::hpp_proto::indirect_view<Val>> vars;
 };
-struct Query {                                                 // needs Match,BooleanQuery,Phrase,Knn,ConstantScore,Prefix,Fuzzy,Simple,Range,Expr,GeoBox
+struct Query {                                                 // needs Match,BooleanQuery,Phrase,Knn,ConstantScore,Prefix,Fuzzy,Simple,Range,Expr,GeoBox,GeoDistance
   std::variant<std::monostate, Match, BooleanQuery, bool, std::string_view, PhraseQuery, KnnQuery,
                ConstantScoreQuery, PrefixQuery, FuzzyQuery, SimpleQuery, RangeQuery, ExprQuery,
-               GeoBoxQuery>
+               GeoBoxQuery, GeoDistanceQuery>
       kind;
 };
 struct NamedQuery { std::string_view name; ::hpp_proto::optional_indirect_view<Query> query; };
@@ -452,7 +458,7 @@ SOLUX_TD(Target) SOLUX_TD(SearchRequest) SOLUX_TD(SearchOp) SOLUX_TD(GenOp) SOLU
 SOLUX_TD(Fusion) SOLUX_TD(RrfFusion) SOLUX_TD(SortSpec) SOLUX_TD(Query)
 SOLUX_TD(ConstantScoreQuery) SOLUX_TD(KnnQuery) SOLUX_TD(Match) SOLUX_TD(NamedQuery) SOLUX_TD(BooleanQuery)
 SOLUX_TD(PrefixQuery) SOLUX_TD(FuzzyQuery) SOLUX_TD(PhraseQuery) SOLUX_TD(SimpleQuery) SOLUX_TD(RangeQuery)
-SOLUX_TD(GeoBoxQuery) SOLUX_TD(ExprQuery)
+SOLUX_TD(GeoBoxQuery) SOLUX_TD(GeoDistanceQuery) SOLUX_TD(ExprQuery)
 SOLUX_TD(Warning) SOLUX_TD(FieldFacet) SOLUX_TD(RangeFacet)
 SOLUX_TD(Domain) SOLUX_TD(SearchResponse) SOLUX_TD(DocList) SOLUX_TD(FacetResult) SOLUX_TD(Bucket)
 SOLUX_TD(CommitParams) SOLUX_TD(UpdateRequest) SOLUX_TD(UpdateResponse) SOLUX_TD(NamedValue) SOLUX_TD(Map)
@@ -479,7 +485,8 @@ SOLUX_ENTRY(TopDocs) SOLUX_ENTRY(Fusion) SOLUX_ENTRY(RrfFusion) SOLUX_ENTRY(Sort
 SOLUX_ENTRY(Query) SOLUX_ENTRY(ConstantScoreQuery)
 SOLUX_ENTRY(KnnQuery) SOLUX_ENTRY(Match) SOLUX_ENTRY(NamedQuery) SOLUX_ENTRY(BooleanQuery)
 SOLUX_ENTRY(PrefixQuery) SOLUX_ENTRY(FuzzyQuery) SOLUX_ENTRY(PhraseQuery) SOLUX_ENTRY(SimpleQuery)
-SOLUX_ENTRY(RangeQuery) SOLUX_ENTRY(GeoBoxQuery) SOLUX_ENTRY(ExprQuery) SOLUX_ENTRY(Warning) SOLUX_ENTRY(FieldFacet)
+SOLUX_ENTRY(RangeQuery) SOLUX_ENTRY(GeoBoxQuery) SOLUX_ENTRY(GeoDistanceQuery) SOLUX_ENTRY(ExprQuery)
+SOLUX_ENTRY(Warning) SOLUX_ENTRY(FieldFacet)
 SOLUX_ENTRY(RangeFacet) SOLUX_ENTRY(Domain) SOLUX_ENTRY(SearchResponse) SOLUX_ENTRY(DocList)
 SOLUX_ENTRY(FacetResult) SOLUX_ENTRY(Bucket) SOLUX_ENTRY(CommitParams) SOLUX_ENTRY(UpdateRequest)
 SOLUX_ENTRY(UpdateResponse) SOLUX_ENTRY(NamedValue) SOLUX_ENTRY(Map) SOLUX_ENTRY(Columns)

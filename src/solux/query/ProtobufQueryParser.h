@@ -13,6 +13,7 @@
 #include "solux/query/BooleanQuery.h"
 #include "solux/query/ConstantScoreQuery.h"
 #include "solux/query/GeoBoxQuery.h"
+#include "solux/query/GeoDistanceQuery.h"
 #include "solux/query/KnnQuery.h"
 #include "solux/schema/Schema.h"
 #include "solux/api/solux_types.hpp"
@@ -162,6 +163,13 @@ public:
     return pool.make<solux::GeoBoxQuery>(
         geoBoxQuery.field, geoBoxQuery.min_lat, geoBoxQuery.max_lat,
         geoBoxQuery.min_lon, geoBoxQuery.max_lon);
+  }
+
+  solux::Query* parseGeoDistance(
+      const solux::api::GeoDistanceQuery& geoDistanceQuery) {
+    return pool.make<solux::GeoDistanceQuery>(
+        geoDistanceQuery.field, geoDistanceQuery.lat, geoDistanceQuery.lon,
+        geoDistanceQuery.radius_meters);
   }
 
   solux::Query* parseFuzzy(const solux::api::FuzzyQuery& fuzzyQuery) {
@@ -343,6 +351,9 @@ public:
       [&](const solux::api::PrefixQuery& p) -> solux::Query* { return parsePrefix(p); },
       [&](const solux::api::RangeQuery& r) -> solux::Query* { return parseRange(r); },
       [&](const solux::api::GeoBoxQuery& g) -> solux::Query* { return parseGeoBox(g); },
+      [&](const solux::api::GeoDistanceQuery& g) -> solux::Query* {
+        return parseGeoDistance(g);
+      },
       [&](const solux::api::FuzzyQuery& f) -> solux::Query* { return parseFuzzy(f); },
       [&](const solux::api::SimpleQuery& s) -> solux::Query* { return parseSimpleQuery(s, pquery); },
       [&](const solux::api::ExprQuery& e) -> solux::Query* { return parseExpr(e, pquery); },

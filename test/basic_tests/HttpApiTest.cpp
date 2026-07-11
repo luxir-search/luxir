@@ -12,6 +12,8 @@
 #include "test/CollectionHelper.h"
 #include "test/LocalReq.h"
 #include "test/HttpReq.h"
+#include "solux/api/build.h"
+#include "solux/schema/Schema.h"
 #include "solux/server/HttpServer.h"
 
 namespace solux::test {
@@ -324,6 +326,29 @@ TEST_F(HttpApiTest, simpleQueryOverJson) {
       R"({"query":{"simple_query":{"q":"re: \"unbalanced ((man","fields":["title_w"]}},"fields":["id"]})");
   ASSERT_EQ(200, garbage.result_int()) << garbage.body();
   EXPECT_NE(garbage.body().find(R"("s2")"), std::string::npos) << garbage.body();
+}
+
+TEST_F(HttpApiTest, geoDistanceQueryOverJson) {
+  std::pmr::monotonic_buffer_resource arena;
+  api::SchemaDef def;
+  api::FieldDef* field = api::build::allocArray(def.fields, 1, arena);
+  field->name = "geo";
+  field->field_class = api::FieldDef::FieldClass::GEO_POINT;
+  field->index = api::FieldDef::IndexMode::RANGE;
+  helper.collection().setSchema(
+      Schema::fromProto(def, helper.collection().getSchema().get()));
+
+  auto update = httpRequest(port(), http::verb::post,
+      "/collections/main/update",
+      R"({"docs":[{"id":"ny","geo":[-74.0060,40.7128]},{"id":"la","geo":[-118.2437,34.0522]}],"commit":{}})");
+  ASSERT_EQ(200, update.result_int()) << update.body();
+
+  auto result = httpRequest(port(), http::verb::post,
+      "/collections/main/query",
+      R"({"query":{"geo_distance":{"field":"geo","lat":40.7128,"lon":-74.0060,"radius_meters":1000}},"fields":["id"]})");
+  ASSERT_EQ(200, result.result_int()) << result.body();
+  EXPECT_NE(result.body().find(R"("ny")"), std::string::npos) << result.body();
+  EXPECT_EQ(result.body().find(R"("la")"), std::string::npos) << result.body();
 }
 
 TEST_F(HttpApiTest, updateDeleteIds) {

@@ -149,6 +149,7 @@ message Query {
     RangeQuery range = 11;          // selects documents whose numeric field value is in a range
     ExprQuery expr = 12;            // an expression in the Solux query language (rigorous grammar)
     GeoBoxQuery geo_box = 13;       // selects GEO_POINT values inside an inclusive bounding box
+    GeoDistanceQuery geo_distance = 14; // selects GEO_POINT values within a radius of a center
 
     // TODO: wildcard query
     // TODO: function?
@@ -255,6 +256,18 @@ message GeoBoxQuery {
   double max_lat = 3; // north edge
   double min_lon = 4; // west edge, degrees in [-180, 180]
   double max_lon = 5; // east edge; min_lon > max_lon crosses the dateline
+}
+
+// Geographic distance query with a center in degrees and radius in meters.
+// Matches when at least one GEO_POINT value is within the inclusive radius.
+//
+// Named center scalars deliberately avoid positional ambiguity: the VALUE
+// array contract [x, y] = [lon, lat] does not apply to this message.
+message GeoDistanceQuery {
+  string field = 1;
+  double lat = 2;           // center latitude, degrees in [-90, 90]
+  double lon = 3;           // center longitude, degrees in [-180, 180]
+  double radius_meters = 4; // inclusive radius, finite and non-negative
 }
 
 // Attach a name to a query so it can be referenced by other queries or facets.

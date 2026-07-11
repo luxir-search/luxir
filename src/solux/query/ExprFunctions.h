@@ -30,7 +30,7 @@ namespace solux::expr {
 // field order).  The static_assert keeps this table in lockstep with the
 // variant: a new arm fails to compile until it is named here (and its expr
 // callability decided).
-inline constexpr std::array<std::string_view, 14> ARM_NAMES = {
+inline constexpr std::array<std::string_view, 15> ARM_NAMES = {
     "",               // monostate (unset)
     "match",          // Match
     "boolean",        // BooleanQuery
@@ -45,6 +45,7 @@ inline constexpr std::array<std::string_view, 14> ARM_NAMES = {
     "range",          // RangeQuery
     "expr",           // ExprQuery - not callable within expr (write it inline)
     "geo_box",        // GeoBoxQuery - not callable in this pass
+    "geo_distance",   // GeoDistanceQuery - not callable in this pass
 };
 static_assert(std::variant_size_v<decltype(api::Query::kind)> == ARM_NAMES.size(),
               "Query gained an arm: name it in ARM_NAMES and decide its expr callability");
@@ -84,7 +85,8 @@ bool withCallableArm(api::Query& q, std::string_view name, F&& f) {
     if constexpr (std::is_class_v<Arm> && !std::is_same_v<Arm, std::monostate> &&
                   !std::is_same_v<Arm, std::string_view> &&
                   !std::is_same_v<Arm, api::ExprQuery> &&
-                  !std::is_same_v<Arm, api::GeoBoxQuery>) {
+                  !std::is_same_v<Arm, api::GeoBoxQuery> &&
+                  !std::is_same_v<Arm, api::GeoDistanceQuery>) {
       if (!called && name == ARM_NAMES[I]) {
         called = true;
         f(q.kind.template emplace<I>());
