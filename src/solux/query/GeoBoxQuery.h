@@ -299,6 +299,23 @@ public:
           : supplier->get(targetPool, std::numeric_limits<int64_t>::max());
     }
 
+    // Test/benchmark baseline: force the dense column scan and bypass BKD.
+    Query::Scorer* createScanScorerForTests(MemPool& targetPool,
+                                            IndexReader::Segment& segment) {
+      if (query.isEmpty()) return nullptr;
+      SegFieldInfo* info = nullptr;
+      if (!segmentInfo(segment, info)) return nullptr;
+      if (info->type != FieldType::GEO_POINT) {
+        throw std::runtime_error("GeoBoxQuery requires a GEO_POINT field");
+      }
+      auto* reader = targetPool.make<IntColReader>(segment.postingsReader(),
+                                                   *info);
+      if (reader->numValues() == 0) return nullptr;
+      return targetPool.make<BoxScorer<IntColReader::Iterator>>(
+          *reader, query.getMinLatitude(), query.getMaxLatitude(),
+          query.getMinLongitude(), query.getMaxLongitude());
+    }
+
     int64_t count(IndexReader::Segment& segment) override {
       if (query.isEmpty()) return 0;
       if (segment.liveDocs() != nullptr) return -1;
