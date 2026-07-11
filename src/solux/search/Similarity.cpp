@@ -36,7 +36,7 @@ Similarity::BM25Scorer::BM25Scorer(float boost, float k1, float b, float idf, fl
 
   for (auto i = 0u; i < invNorm.size(); i++) {
     auto fieldLength = SmallFloat::decodeLengthByte((uint8_t)i);
-    invNorm[i] = 1.0f / (k1 * ((1 - b) + b * fieldLength / avgdl));
+    invNorm[i] = bm25InvNorm(k1, b, fieldLength, avgdl);
   }
 
   // We could also choose to not precompute this if docCount for the term is less than 256 (actually we should base

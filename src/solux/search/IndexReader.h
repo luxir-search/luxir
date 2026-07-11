@@ -7,6 +7,7 @@
 #include "OrdMap.h"
 #include "solux/reader/AuxReader.h"
 #include "solux/reader/PostingsReader.h"
+#include "solux/reader/BlockBounds.h"
 #include "solux/util/screaming.h"
 #include "solux/util/SharedLazyMap.h"
 
@@ -65,6 +66,7 @@ public:
     const std::shared_ptr<PostingsReader> sharedPostingsReader;
     const std::shared_ptr<LiveDocs> sharedLiveDocs;
     const std::vector<std::shared_ptr<AuxReader>> sharedAuxReaders;
+    std::vector<std::pair<std::string, std::shared_ptr<BlockBounds>>> blockBoundsFields;
   public:
     friend class IndexReader;
 
@@ -114,6 +116,20 @@ public:
       }
       return nullptr;
     }
+
+    const BlockBounds* blockBounds(std::string_view field) const {
+      for (const auto& entry : blockBoundsFields) {
+        if (entry.first == field) return entry.second.get();
+      }
+      return nullptr;
+    }
+
+  private:
+    void attachBlockBounds(std::string field, std::shared_ptr<BlockBounds> bounds) {
+      blockBoundsFields.emplace_back(std::move(field), std::move(bounds));
+    }
+
+  public:
 
     int32_t maxDoc() const noexcept {
       return segInfo.max_doc;

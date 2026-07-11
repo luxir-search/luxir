@@ -192,6 +192,7 @@ public:
       std::span<ImpactsIndex> impacts;
       if (simScorer != nullptr && normsReader != nullptr) {
         auto built = targetPool.make_span<ImpactsIndex>((size_t) distinctCount);
+        const BlockBounds* sidecarField = segment.blockBounds(query.getField());
         bool allBuilt = true;
         size_t n = 0;
         for (size_t i = 0; i < docsEnums.size(); i++) {
@@ -200,7 +201,9 @@ public:
             seen = docsEnums[j] == docsEnums[i];
           }
           if (seen) continue;
-          built[n].build(targetPool, *docsEnums[i], *simScorer, 1.0f);
+          BlockBounds::TermView sidecarTerm = sidecarField
+              ? sidecarField->find(docsEnums[i]->termOrd()) : BlockBounds::TermView{};
+          built[n].build(targetPool, *docsEnums[i], *simScorer, 1.0f, true, sidecarTerm);
           allBuilt &= !built[n].empty();
           n++;
         }

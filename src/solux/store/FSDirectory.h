@@ -230,6 +230,10 @@ public:
     std::filesystem::rename(fsFile.tmpPath_, fsFile.path_);
   }
 
+  void renameFile(std::string_view from, std::string_view to) override {
+    std::filesystem::rename(filePath(from), filePath(to));
+  }
+
   // Fsync the given files.  Use "." to fsync the directory itself
   // (to ensure renames/creates are durable).
   void sync(std::span<const std::string> filenames) override {

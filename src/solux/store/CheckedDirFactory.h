@@ -93,6 +93,17 @@ public:
     if (verbose_) LOG_DEBUG("CheckedDirectory: finishFile({}) size={}", file.name(), file.size());
   }
 
+  void renameFile(std::string_view from, std::string_view to) override {
+    delegate_->renameFile(from, to);
+    std::lock_guard lock(mu_);
+    auto it = unsyncedFiles_.find(std::string(from));
+    if (it != unsyncedFiles_.end()) {
+      unsyncedFiles_.erase(it);
+      unsyncedFiles_.insert(std::string(to));
+    }
+    if (verbose_) LOG_DEBUG("CheckedDirectory: renameFile({} -> {})", from, to);
+  }
+
   void sync(std::span<const std::string> filenames) override {
     delegate_->sync(filenames);
     {

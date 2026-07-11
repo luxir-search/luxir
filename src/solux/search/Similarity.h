@@ -94,6 +94,30 @@ public:
 //
 class Similarity {
 public:
+  static constexpr uint32_t SCORING_NORM_REVISION = 1;
+
+  static float bm25InvNorm(float k1, float b, float fieldLength, float avgdl) {
+    return 1.0f / (k1 * ((1 - b) + b * fieldLength / avgdl));
+  }
+
+  static float bm25Denominator(float termFreq, float invNorm) {
+    return 1.0f + termFreq * invNorm;
+  }
+
+  static float bm25ScoreFromDenominator(float weight, float denominator, float boost) {
+    return boost * (weight - weight / denominator);
+  }
+
+  // Build a float denominator that is strictly no smaller than the production
+  // denominator at the same inputs. nextafter calls materialize every rounded
+  // intermediate and prevent contraction across the directed-rounding steps.
+  static float bm25DenominatorUpper(uint32_t termFreq, float invNorm) {
+    const float inf = std::numeric_limits<float>::infinity();
+    float invHi = std::nextafter(invNorm, inf);
+    float productHi = std::nextafter((float) termFreq * invHi, inf);
+    return std::nextafter(1.0f + productHi, inf);
+  }
+
   const float k1;
   const float b;
 
@@ -170,7 +194,7 @@ public:
       solux::unused(boost,k1,b,idf,avgdl); // already folded in
       // Adapted from lucene, see BM25Similarity.java for more details.
       auto normInverse = invNorm[ (uint8_t)encodedNorm ];
-      return weight - weight / (1.0f + termFreq * normInverse);
+      return bm25ScoreFromDenominator(weight, bm25Denominator(termFreq, normInverse), 1.0f);
     }
 
     // PERF-CRITICAL, RELIES ON AUTO-VECTORIZATION. Block BM25 for the dense
@@ -195,7 +219,8 @@ public:
         factor[i] = invNorm[norms[i]];
       }
       for (int32_t i = 0; i < count; i++) {
-        out[i] = boost * (weight - weight / (1.0f + (float)tf[i] * factor[i]));
+        out[i] = bm25ScoreFromDenominator(
+            weight, bm25Denominator((float) tf[i], factor[i]), boost);
       }
     }
 
@@ -220,7 +245,8 @@ public:
       // array (vdivps 8-wide) and fold separately.
       float scores[256];
       for (int32_t i = 0; i < count; i++) {
-        scores[i] = boost * (weight - weight / (1.0f + termFreq[i] * factor[i]));
+        scores[i] = bm25ScoreFromDenominator(
+            weight, bm25Denominator(termFreq[i], factor[i]), boost);
       }
       float maxScore = 0.0f;
       for (int32_t i = 0; i < count; i++) {
@@ -229,6 +255,12 @@ public:
       }
       return maxScore;
     }
+
+    float scoreFromUpperDenominator(float denominator, float externalBoost) const {
+      return bm25ScoreFromDenominator(weight, denominator, externalBoost);
+    }
+
+    float internalWeight() const { return weight; }
   };
 
 

@@ -188,6 +188,9 @@ add_library(solux_lib STATIC ${Proj_SOURCES})
 add_executable(solux src/solux/main.cpp)
 target_link_libraries(solux solux_lib)
 
+add_executable(solux_block_bounds tools/block_bounds.cpp)
+target_link_libraries(solux_block_bounds PRIVATE solux_lib)
+
 # Precompiled headers
 # Heavy, rarely-changing external/generated headers shared across translation
 # units. Project headers are intentionally excluded so editing them does not

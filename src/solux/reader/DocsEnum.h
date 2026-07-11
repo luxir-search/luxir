@@ -85,6 +85,7 @@ class DocsEnum {
   int64_t posStartLoc = 0;  // absolute location of this term's positions (base for L0 posByteOff)
   const char* termImpactFrontierPtr = nullptr;
   uint32_t termImpactFrontierLen = 0;
+  int32_t termOrdinal = -1;  // captured once from the positioned TermsEnum
 
 public:
   // The skip structure is two levels: L0 per-block headers, and L1 group headers
@@ -667,7 +668,8 @@ public:
   // This instance *does* rely on fieldInfo that was passed into the TermsEnum instance still being valid.
   DocsEnum(MemPool& pool, PostingsReader& postingsReader, TermsEnum& tenum,
            int32_t* docsScratch=nullptr, int32_t* posScratch=nullptr, int32_t* tfreqScratch=nullptr)
-  : postingsReader(postingsReader), fieldInfo(tenum.fieldInfo), pool(&pool)
+  : postingsReader(postingsReader), fieldInfo(tenum.fieldInfo), pool(&pool),
+    termOrdinal(tenum.ord())
   {
     unused(docsScratch, posScratch, tfreqScratch);
     docBuf=db;
@@ -788,6 +790,8 @@ public:
   int32_t totalTermFreq() {
     return ttf;
   }
+
+  int32_t termOrd() const { return termOrdinal; }
 
   bool hasTermImpacts() const {
     return termImpactFrontierPtr != nullptr;

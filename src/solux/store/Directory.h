@@ -45,6 +45,11 @@ public:
   // owning Directory.
   virtual void finishFile(File &file) = 0;
 
+  // Atomically replace `to` with the already-finished file `from` when the
+  // backing store supports it. Offline derivative builders use this only
+  // after reopening and validating the unique source name.
+  virtual void renameFile(std::string_view from, std::string_view to) = 0;
+
   // Fsync the given files to ensure durability.
   // Use "." to fsync the directory itself (to persist renames/creates).
   // The default implementation is a no-op (e.g. for RAMDir).
@@ -142,6 +147,17 @@ public:
       // TODO: we take pains to add files in order, so we should try a hint to add it at the end of the list.
       files[file.name()] = std::move(inputFile);
     }
+  }
+
+  void renameFile(std::string_view from, std::string_view to) override {
+    std::lock_guard<std::mutex> lock(mutex);
+    auto it = files.find(from);
+    if (it == files.end()) {
+      throw std::runtime_error("RAMDir::renameFile: source not found");
+    }
+    auto value = std::move(it->second);
+    files.erase(it);
+    files[std::string(to)] = std::move(value);
   }
 
   int64_t totalFileSize() {
