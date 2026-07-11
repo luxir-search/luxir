@@ -2,9 +2,11 @@
 
 #include <algorithm>
 #include <bit>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <limits>
+#include <numbers>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -18,6 +20,25 @@
 namespace solux {
 
 enum class BKDRelation : uint8_t { OUTSIDE, INSIDE, CROSSES };
+
+struct BKDLongitudeRelation {
+  bool inside;
+  bool outside;
+};
+
+inline BKDLongitudeRelation compareBKDLongitudeInterval(
+    int32_t intervalMin, int32_t intervalMax,
+    int32_t cellMin, int32_t cellMax) {
+  if (intervalMin <= intervalMax) {
+    return {intervalMin <= cellMin && cellMax <= intervalMax,
+            cellMax < intervalMin || intervalMax < cellMin};
+  }
+  bool insideUpper = intervalMin <= cellMin;
+  bool insideLower = cellMax <= intervalMax;
+  bool disjointUpper = cellMax < intervalMin;
+  bool disjointLower = intervalMax < cellMin;
+  return {insideUpper || insideLower, disjointUpper && disjointLower};
+}
 
 // Inclusive encoded-space box. Reversed longitude bounds describe one
 // wrapped interval and are evaluated as two arms inside one traversal.
@@ -42,27 +63,116 @@ struct BKDBoxRelation {
     }
     bool latInside = latMin <= cellLatMin && cellLatMax <= latMax;
 
-    bool lonInside;
-    bool lonOutside;
-    if (lonMin <= lonMax) {
-      lonInside = lonMin <= cellLonMin && cellLonMax <= lonMax;
-      lonOutside = cellLonMax < lonMin || lonMax < cellLonMin;
-    } else {
-      bool insideUpper = lonMin <= cellLonMin;
-      bool insideLower = cellLonMax <= lonMax;
-      lonInside = insideUpper || insideLower;
-      bool disjointUpper = cellLonMax < lonMin;
-      bool disjointLower = lonMax < cellLonMin;
-      lonOutside = disjointUpper && disjointLower;
-    }
-    if (lonOutside) return BKDRelation::OUTSIDE;
-    return latInside && lonInside
+    BKDLongitudeRelation lon = compareBKDLongitudeInterval(
+        lonMin, lonMax, cellLonMin, cellLonMax);
+    if (lon.outside) return BKDRelation::OUTSIDE;
+    return latInside && lon.inside
         ? BKDRelation::INSIDE : BKDRelation::CROSSES;
   }
 
   bool matches(int32_t lat, int32_t lon) const {
     return latMin <= lat && lat <= latMax
         && geo::longitudeInRange(lon, lonMin, lonMax);
+  }
+};
+
+struct BKDDistanceRelation {
+  double centerLat;
+  double centerLon;
+  double centerLatRadians;
+  double centerLatCos;
+  double radiusMeters;
+  double sortKey;
+  double axisLatitude;
+  int32_t latMin;
+  int32_t latMax;
+  int32_t lonMin;
+  int32_t lonMax;
+
+private:
+  static bool within90LonDegrees(double lon, double minLon, double maxLon) {
+    if (maxLon <= lon - 180.0) {
+      lon -= 360.0;
+    } else if (minLon >= lon + 180.0) {
+      lon += 360.0;
+    }
+    return maxLon - lon < 90.0 && lon - minLon < 90.0;
+  }
+
+  double pointSortKey(double lat, double lon) const {
+    double pointLatRadians = lat * (std::numbers::pi / 180.0);
+    double value = (1.0 - std::cos(centerLatRadians - pointLatRadians))
+        + centerLatCos * std::cos(pointLatRadians)
+            * (1.0 - std::cos((centerLon - lon)
+                              * (std::numbers::pi / 180.0)));
+    uint64_t bits = std::bit_cast<uint64_t>(value)
+                  & UINT64_C(0xfffffffffffffff8);
+    return std::bit_cast<double>(bits);
+  }
+
+public:
+  BKDDistanceRelation(double centerLat, double centerLon,
+                      double radiusMeters)
+      : centerLat(centerLat), centerLon(centerLon),
+        centerLatRadians(centerLat * (std::numbers::pi / 180.0)),
+        centerLatCos(std::cos(centerLatRadians)), radiusMeters(radiusMeters),
+        sortKey(0.0), axisLatitude(0.0), latMin(0), latMax(0), lonMin(0),
+        lonMax(0) {
+    geo::checkLatitude(centerLat);
+    geo::checkLongitude(centerLon);
+    if (!std::isfinite(radiusMeters) || radiusMeters < 0.0) {
+      throw std::invalid_argument(
+          "BKDDistanceRelation: radius must be finite and non-negative");
+    }
+    geo::BoundingBox box =
+        geo::circleBoundingBox(centerLat, centerLon, radiusMeters);
+    latMin = geo::encodeLatitude(box.minLat);
+    latMax = geo::encodeLatitude(box.maxLat);
+    lonMin = geo::encodeLongitude(box.minLon);
+    lonMax = geo::encodeLongitude(box.maxLon);
+    sortKey = geo::distanceQuerySortKey(radiusMeters);
+    axisLatitude = geo::axisLat(centerLat, radiusMeters);
+  }
+
+  BKDRelation compare(int32_t cellLatMin, int32_t cellLatMax,
+                      int32_t cellLonMin, int32_t cellLonMax) const {
+    BKDLongitudeRelation lon = compareBKDLongitudeInterval(
+        lonMin, lonMax, cellLonMin, cellLonMax);
+    if (cellLatMax < latMin || latMax < cellLatMin || lon.outside) {
+      return BKDRelation::OUTSIDE;
+    }
+
+    double minLat = geo::decodeLatitude(cellLatMin);
+    double maxLat = geo::decodeLatitude(cellLatMax);
+    double minLon = geo::decodeLongitude(cellLonMin);
+    double maxLon = geo::decodeLongitude(cellLonMax);
+    double minMin = pointSortKey(minLat, minLon);
+    double minMax = pointSortKey(minLat, maxLon);
+    double maxMin = pointSortKey(maxLat, minLon);
+    double maxMax = pointSortKey(maxLat, maxLon);
+
+    if ((centerLon < minLon || centerLon > maxLon)
+        && (axisLatitude + geo::AXISLAT_ERROR < minLat
+            || axisLatitude - geo::AXISLAT_ERROR > maxLat)
+        && minMin > sortKey && minMax > sortKey
+        && maxMin > sortKey && maxMax > sortKey) {
+      return BKDRelation::OUTSIDE;
+    }
+    if (within90LonDegrees(centerLon, minLon, maxLon)
+        && minMin <= sortKey && minMax <= sortKey
+        && maxMin <= sortKey && maxMax <= sortKey) {
+      return BKDRelation::INSIDE;
+    }
+    return BKDRelation::CROSSES;
+  }
+
+  bool matches(int32_t lat, int32_t lon) const {
+    if (lat < latMin || lat > latMax
+        || !geo::longitudeInRange(lon, lonMin, lonMax)) {
+      return false;
+    }
+    return pointSortKey(geo::decodeLatitude(lat), geo::decodeLongitude(lon))
+        <= sortKey;
   }
 };
 
