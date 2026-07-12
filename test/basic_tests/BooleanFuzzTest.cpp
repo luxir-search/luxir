@@ -233,7 +233,6 @@ public:
 };
 
 TEST_F(BooleanFuzzTest, optionalRanksUnlessMinMatchConstrains) {
-  helper.clear();
   helper.index(flatdoc("id", "x1", "body_w", "f a"), UpdateMessage::NO_COMMIT);  // f + a
   helper.index(flatdoc("id", "x2", "body_w", "f"), UpdateMessage::COMMIT);        // f, no a; z nowhere
 
@@ -263,7 +262,6 @@ TEST_F(BooleanFuzzTest, optionalRanksUnlessMinMatchConstrains) {
 }
 
 TEST_F(BooleanFuzzTest, minMatchComposesWithRequired) {
-  helper.clear();
   helper.index(flatdoc("id", "y1", "body_w", "r a b"), UpdateMessage::NO_COMMIT);  // r + both opts
   helper.index(flatdoc("id", "y2", "body_w", "r a"), UpdateMessage::NO_COMMIT);    // r + one opt
   helper.index(flatdoc("id", "y3", "body_w", "r"), UpdateMessage::COMMIT);          // r only
@@ -289,7 +287,6 @@ TEST_F(BooleanFuzzTest, minMatchComposesWithRequired) {
 }
 
 TEST_F(BooleanFuzzTest, twoTermConjunctionAcrossSegments) {
-  helper.clear();
   helper.index(flatdoc("id", "x1", "body_w", "b d"), UpdateMessage::COMMIT);        // seg0
   helper.index(flatdoc("id", "x2", "body_w", "b d c g b"), UpdateMessage::COMMIT);  // seg1
   helper.index(flatdoc("id", "x3", "body_w", "b d b f"), UpdateMessage::COMMIT);    // seg2
@@ -311,7 +308,6 @@ TEST_F(BooleanFuzzTest, twoTermConjunctionAcrossSegments) {
 }
 
 TEST_F(BooleanFuzzTest, phraseMultiDoc) {
-  helper.clear();
   helper.index(flatdoc("id", "p0", "body_w", "x y z"), UpdateMessage::NO_COMMIT);
   helper.index(flatdoc("id", "p1", "body_w", "a e g c e d"), UpdateMessage::NO_COMMIT);  // "a e" @0
   helper.index(flatdoc("id", "p2", "body_w", "e a"), UpdateMessage::NO_COMMIT);          // "e a", not "a e"
@@ -348,7 +344,6 @@ TEST_F(BooleanFuzzTest, phraseMultiDoc) {
 // full postings blocks with members that exhaust mid-stream, against a
 // counted oracle.
 TEST_F(BooleanFuzzTest, negatedAndRankOnlyDisjunctionAdvanceMatchesOracle) {
-  helper.clear();
   const int32_t numDocs = 2 * DocsEnum::L1_DOCS + 300;
   int64_t expectNegated = 0;
   int64_t expectMandOpt = 0;
@@ -426,7 +421,6 @@ TEST_F(BooleanFuzzTest, negatedAndRankOnlyDisjunctionAdvanceMatchesOracle) {
 }
 
 TEST_F(BooleanFuzzTest, randomBooleanMatchesOracle) {
-  helper.clear();
 
   const int numDocs = 48;
   std::vector<std::pair<std::string, std::vector<std::string>>> docs;
@@ -490,7 +484,6 @@ TEST_F(BooleanFuzzTest, randomBooleanMatchesOracle) {
 }
 
 TEST_F(BooleanFuzzTest, conjunctionBulkCountMatchesPullOnMixedBlockShapes) {
-  helper.clear();
   const int32_t numDocs = 2 * DocsEnum::L1_DOCS + 513;
   // bc_rare stays below the dense gate so the sparse combo hits the fallback.
   const int32_t rareMax =
@@ -606,7 +599,6 @@ TEST_F(BooleanFuzzTest, conjunctionBulkCountMatchesPullOnMixedBlockShapes) {
 }
 
 TEST_F(BooleanFuzzTest, mandOptBulkCountMatchesPullOnMixedBlockShapes) {
-  helper.clear();
   const int32_t numDocs = 2 * DocsEnum::L1_DOCS + 513;
   std::vector<Doc> docs;
   docs.reserve((size_t) numDocs);

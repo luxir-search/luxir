@@ -68,7 +68,6 @@ public:
 
 TEST_F(UpdateErrorTest, partialFailureMarksDocDeleted) {
   CollectionHelper helper("main");
-  helper.clear();
 
   std::vector<Doc> docs = {
     flatdoc("id", "g1", "text_w", "alpha bravo"),
@@ -96,7 +95,6 @@ TEST_F(UpdateErrorTest, partialFailureMarksDocDeleted) {
 
 TEST_F(UpdateErrorTest, failedOverwriteKeepsOldVersion) {
   CollectionHelper helper("main");
-  helper.clear();
 
   helper.index(flatdoc("id", "x1", "text_w", "original content"), UpdateMessage::COMMIT, true);
 
@@ -116,7 +114,6 @@ TEST_F(UpdateErrorTest, failedOverwriteKeepsOldVersion) {
 
 TEST_F(UpdateErrorTest, allOrNoneRollsBackBatch) {
   CollectionHelper helper("main");
-  helper.clear();
 
   helper.index(flatdoc("id", "a", "text_w", "aye one"), UpdateMessage::COMMIT, true);
   helper.index(flatdoc("id", "b", "text_w", "bee one"), UpdateMessage::COMMIT, true);
@@ -149,7 +146,6 @@ TEST_F(UpdateErrorTest, allOrNoneRollsBackBatch) {
 
 TEST_F(UpdateErrorTest, allOrNoneRollsBackDeletes) {
   CollectionHelper helper("main");
-  helper.clear();
 
   helper.index(flatdoc("id", "y1", "text_w", "keep me"), UpdateMessage::COMMIT, true);
 
@@ -173,7 +169,6 @@ TEST_F(UpdateErrorTest, allOrNoneRollsBackDeletes) {
 
 TEST_F(UpdateErrorTest, allFailedIsError) {
   CollectionHelper helper("main");
-  helper.clear();
 
   std::vector<Doc> docs = {
     flatdoc("id", "b1", "text_w", "one", BAD_FIELD, "boom"),
@@ -192,7 +187,6 @@ TEST_F(UpdateErrorTest, allFailedIsError) {
 
 TEST_F(UpdateErrorTest, returnIdsListsOnlySuccesses) {
   CollectionHelper helper("main");
-  helper.clear();
 
   std::vector<Doc> docs = {
     flatdoc("id", "g1", "text_w", "alpha"),
@@ -213,7 +207,6 @@ TEST_F(UpdateErrorTest, returnIdsListsOnlySuccesses) {
 
 TEST_F(UpdateErrorTest, failedDocThenSameIdSucceeds) {
   CollectionHelper helper("main");
-  helper.clear();
 
   std::vector<Doc> docs = {
     flatdoc("id", "r1", "text_w", "bad attempt", BAD_FIELD, "boom"),
@@ -235,7 +228,6 @@ TEST_F(UpdateErrorTest, failedDocThenSameIdSucceeds) {
 // only list the latest doc per id).
 TEST_F(UpdateErrorTest, inSegmentDuplicateOverwrite) {
   CollectionHelper helper("main");
-  helper.clear();
 
   std::vector<Doc> docs = {
     flatdoc("id", "dup", "text_w", "first version"),
@@ -259,7 +251,6 @@ TEST_F(UpdateErrorTest, inSegmentDuplicateOverwrite) {
 // is appended the constraint is real: v3 (dims=4) fails against it.
 TEST_F(UpdateErrorTest, failedDocDoesNotLockVectorDims) {
   CollectionHelper helper("main");
-  helper.clear();
 
   std::vector<Doc> docs = {
     flatdoc("id", "v1", "vec_vs", std::vector<std::vector<float>>{{1.0f, 2.0f, 3.0f}, {1.0f, 2.0f}}),
@@ -285,7 +276,6 @@ TEST_F(UpdateErrorTest, failedDocDoesNotLockVectorDims) {
 // same inverter): the cross-request overwrite must also leave a single live doc.
 TEST_F(UpdateErrorTest, crossRequestDuplicateOverwrite) {
   CollectionHelper helper("main");
-  helper.clear();
 
   helper.index(flatdoc("id", "dup", "text_w", "first version"), UpdateMessage::NO_COMMIT, true);
   helper.index(flatdoc("id", "dup", "text_w", "second version"), UpdateMessage::COMMIT, true);

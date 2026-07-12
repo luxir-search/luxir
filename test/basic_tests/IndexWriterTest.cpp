@@ -275,7 +275,6 @@ TEST_F(IndexWriterTest, mergeFailureContainmentRestoresSourcesAndGate) {
   using namespace solux::test;
 
   CollectionHelper helper("main");
-  helper.clear();
   auto iw = helper.getIndexWriter();
 
   std::vector<std::string> expectedIds;
@@ -638,7 +637,6 @@ TEST_F(IndexWriterTest, versionFieldOverwrite) {
   using namespace solux::test;
   
   CollectionHelper helper("main");
-  helper.clear();
 
   Doc doc1 = flatdoc("id", "doc1", "text_w", "hello world");
   helper.index(doc1, UpdateMessage::COMMIT, false);
@@ -703,7 +701,6 @@ TEST_F(IndexWriterTest, sparseVersionColumnDeletes) {
   using namespace solux::test;
 
   CollectionHelper helper("main");
-  helper.clear();
 
   // One batch -> one segment: doc 0 has no id (no _version_ value), doc 1 has
   // an id and an overwrite version.  The column holds 1 value but maxDoc is 2,
@@ -737,7 +734,6 @@ TEST_F(IndexWriterTest, deletionInfrastructure) {
   using namespace solux::test;
   
   CollectionHelper helper("main");
-  helper.clear();
 
   // Delete-by-id on a fresh/empty index - exercises the delete-only inverter path
   // where no documents are indexed but deletes still need to flow through IdHandler.
@@ -961,7 +957,6 @@ static void runMultithreadedUpdates(uint64_t seed, int mergeFailPercent, int upd
   using namespace solux::test;
 
   CollectionHelper helper("main");
-  helper.clear();
 
   auto indexWriter = helper.getIndexWriter();
   indexWriter->mergePolicy->setMergeFactor(3);  // low merge factor to stress merge concurrency with other operations
@@ -1241,7 +1236,6 @@ TEST_F(IndexWriterTest, segmentMergerWithDeletes) {
   using namespace solux::test;
   
   CollectionHelper helper("main");
-  helper.clear();
   
   auto indexWriter = helper.getIndexWriter();
   indexWriter->mergePolicy->setMergeFactor(3);
@@ -1341,7 +1335,6 @@ TEST_F(IndexWriterTest, segmentMergerPositions) {
   int numSegs = 10;
 
   CollectionHelper helper("main");
-  helper.clear();
 
   auto indexWriter = helper.getIndexWriter();
   indexWriter->mergePolicy->setMergeFactor(numSegs);
@@ -1597,7 +1590,6 @@ TEST_F(IndexWriterTest, removeFields) {
   using namespace solux::test;
   
   CollectionHelper helper("main");
-  helper.clear();
   
   auto indexWriter = helper.getIndexWriter();
 

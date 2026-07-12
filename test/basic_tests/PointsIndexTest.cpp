@@ -380,7 +380,6 @@ TEST_F(PointsIndexTest, sortPointsKeepsDocidOrderInLongTieRuns) {
 
 TEST_F(PointsIndexTest, flushMatchesSingleAndMultiValuedColumns) {
   CollectionHelper helper;
-  helper.clear();
 
   std::pmr::monotonic_buffer_resource arena;
   api::SchemaDef def;
@@ -417,5 +416,4 @@ TEST_F(PointsIndexTest, flushMatchesSingleAndMultiValuedColumns) {
     EXPECT_EQ(pointsFromColumn(postingsReader, info), points.readAll()) << field;
   }
 
-  helper.clear();
 }

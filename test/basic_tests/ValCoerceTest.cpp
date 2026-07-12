@@ -138,7 +138,6 @@ TEST_F(ValCoerceTest, fieldTypeDefaultsThrow) {
 
 TEST_F(ValCoerceTest, ingestCoercesQuotedNumbers) {
   CollectionHelper helper("main");
-  helper.clear();
 
   helper.index(flatdoc("id", "d1", "popularity_i", "10", "score_d", "2.5"),
                UpdateMessage::COMMIT);
@@ -152,12 +151,10 @@ TEST_F(ValCoerceTest, ingestCoercesQuotedNumbers) {
   ASSERT_EQ(1u, docs.size());
   EXPECT_TRUE(containsDoc(docs, flatdoc("id", "d1", "popularity_i", (int64_t)10,
                                         "score_d", 2.5)));
-  helper.clear();
 }
 
 TEST_F(ValCoerceTest, ingestCoercesIntegralDoubleToIntCol) {
   CollectionHelper helper("main");
-  helper.clear();
 
   helper.index(flatdoc("id", "d1", "popularity_i", 10.0), UpdateMessage::COMMIT);
 
@@ -166,12 +163,10 @@ TEST_F(ValCoerceTest, ingestCoercesIntegralDoubleToIntCol) {
   req->execute();
   ASSERT_OK(req);
   EXPECT_TRUE(containsDoc(req->getDocs(), flatdoc("id", "d1", "popularity_i", (int64_t)10)));
-  helper.clear();
 }
 
 TEST_F(ValCoerceTest, ingestCoercesElementWiseArrays) {
   CollectionHelper helper("main");
-  helper.clear();
 
   helper.index(flatdoc("id", "d1", "nums_is", std::vector<std::string>{"1", "2"}),
                UpdateMessage::COMMIT);
@@ -182,12 +177,10 @@ TEST_F(ValCoerceTest, ingestCoercesElementWiseArrays) {
   ASSERT_OK(req);
   EXPECT_TRUE(containsDoc(req->getDocs(),
                           flatdoc("id", "d1", "nums_is", std::vector<int64_t>{1, 2})));
-  helper.clear();
 }
 
 TEST_F(ValCoerceTest, ingestBadValueFailsTheDocOnly) {
   CollectionHelper helper("main");
-  helper.clear();
 
   CollectionHelper::UpdateBuilder b;
   b.add(flatdoc("id", "g1", "popularity_i", (int64_t)1));
@@ -210,12 +203,10 @@ TEST_F(ValCoerceTest, ingestBadValueFailsTheDocOnly) {
   ASSERT_EQ(2u, docs.size());
   EXPECT_TRUE(containsDoc(docs, flatdoc("id", "g1")));
   EXPECT_TRUE(containsDoc(docs, flatdoc("id", "g2")));
-  helper.clear();
 }
 
 TEST_F(ValCoerceTest, ingestBadArrayElementFailsBeforeAnyAppend) {
   CollectionHelper helper("main");
-  helper.clear();
 
   CollectionHelper::UpdateBuilder b;
   b.add(flatdoc("id", "b1", "nums_is", std::vector<std::string>{"1", "x"}));
@@ -231,12 +222,10 @@ TEST_F(ValCoerceTest, ingestBadArrayElementFailsBeforeAnyAppend) {
   auto docs = req->getDocs();
   ASSERT_EQ(1u, docs.size());
   EXPECT_TRUE(containsDoc(docs, flatdoc("id", "g1", "nums_is", std::vector<int64_t>{5})));
-  helper.clear();
 }
 
 TEST_F(ValCoerceTest, singleValuedStringRejectsArrays) {
   CollectionHelper helper("main");
-  helper.clear();
 
   CollectionHelper::UpdateBuilder b;
   b.add(flatdoc("id", "b1", "tag_s", std::vector<std::string>{"a", "b"}));
@@ -254,14 +243,12 @@ TEST_F(ValCoerceTest, singleValuedStringRejectsArrays) {
   auto docs = req->getDocs();
   ASSERT_EQ(1u, docs.size());
   EXPECT_TRUE(containsDoc(docs, flatdoc("id", "g1", "tag_s", "solo")));
-  helper.clear();
 }
 
 // ---- the findability invariant, both directions ----
 
 TEST_F(ValCoerceTest, numericIngestFindableByString) {
   CollectionHelper helper("main");
-  helper.clear();
 
   // {"tag_s": 42} used to index an EMPTY term; {"body_w": 42} likewise
   helper.index(flatdoc("id", "d1", "tag_s", (int64_t)42, "body_w", (int64_t)42),
@@ -269,12 +256,10 @@ TEST_F(ValCoerceTest, numericIngestFindableByString) {
 
   EXPECT_EQ(1u, matchDocs(helper, "tag_s", "42").size());
   EXPECT_EQ(1u, matchDocs(helper, "body_w", "42").size());
-  helper.clear();
 }
 
 TEST_F(ValCoerceTest, stringIngestFindableByNumericVal) {
   CollectionHelper helper("main");
-  helper.clear();
 
   helper.index(flatdoc("id", "d1", "tag_s", "42"), UpdateMessage::COMMIT);
 
@@ -292,12 +277,10 @@ TEST_F(ValCoerceTest, stringIngestFindableByNumericVal) {
   req->execute();
   ASSERT_OK(req);
   EXPECT_EQ(1u, req->getDocs().size());
-  helper.clear();
 }
 
 TEST_F(ValCoerceTest, numericIdIndexesItsRendering) {
   CollectionHelper helper("main");
-  helper.clear();
 
   // a numeric id used to index NOTHING (doc had no id, so not overwritable)
   helper.index(flatdoc("id", (int64_t)123, "body_w", "one"), UpdateMessage::COMMIT, true);
@@ -309,12 +292,10 @@ TEST_F(ValCoerceTest, numericIdIndexesItsRendering) {
   auto docs = req->getDocs();
   ASSERT_EQ(1u, docs.size());  // same id: second write overwrote the first
   EXPECT_TRUE(containsDoc(docs, flatdoc("id", "123")));
-  helper.clear();
 }
 
 TEST_F(ValCoerceTest, storedFieldsKeepTheCanonicalRendering) {
   CollectionHelper helper("main");
-  helper.clear();
 
   auto schema = Schema::createDefaultSchema();
   schema->fieldTypeMap["title"] = std::make_shared<TextFieldType>(
@@ -334,13 +315,11 @@ TEST_F(ValCoerceTest, storedFieldsKeepTheCanonicalRendering) {
   ASSERT_EQ(1u, docs.size());
   EXPECT_TRUE(containsDoc(docs, flatdoc("id", "d1", "title", "42")));
 
-  helper.clear();
   helper.collection().setSchema(Schema::createDefaultSchema());
 }
 
 TEST_F(ValCoerceTest, storedMultiValuedTextStoresCoercedArrays) {
   CollectionHelper helper("main");
-  helper.clear();
 
   auto schema = Schema::createDefaultSchema();
   schema->fieldTypeMap["tags"] = std::make_shared<TextFieldType>(
@@ -363,13 +342,11 @@ TEST_F(ValCoerceTest, storedMultiValuedTextStoresCoercedArrays) {
   EXPECT_TRUE(containsDoc(docs, flatdoc("id", "d1", "tags",
                                         std::vector<std::string>{"1", "2"})));
 
-  helper.clear();
   helper.collection().setSchema(Schema::createDefaultSchema());
 }
 
 TEST_F(ValCoerceTest, storedFieldOfRejectedDocStaysInvisible) {
   CollectionHelper helper("main");
-  helper.clear();
 
   auto schema = Schema::createDefaultSchema();
   schema->fieldTypeMap["tag"] = std::make_shared<StrFieldType>(
@@ -396,7 +373,6 @@ TEST_F(ValCoerceTest, storedFieldOfRejectedDocStaysInvisible) {
   ASSERT_EQ(1u, docs.size());
   EXPECT_TRUE(containsDoc(docs, flatdoc("id", "g1", "tag", "solo")));
 
-  helper.clear();
   helper.collection().setSchema(Schema::createDefaultSchema());
 }
 
@@ -404,7 +380,6 @@ TEST_F(ValCoerceTest, storedFieldOfRejectedDocStaysInvisible) {
 
 TEST_F(ValCoerceTest, multiValuedTextIsSearchable) {
   CollectionHelper helper("main");
-  helper.clear();
 
   auto schema = Schema::createDefaultSchema();
   schema->fieldTypeMap["tags"] = std::make_shared<TextFieldType>(
@@ -430,6 +405,5 @@ TEST_F(ValCoerceTest, multiValuedTextIsSearchable) {
   EXPECT_EQ(1, phraseCount("blue fish"));
   EXPECT_EQ(0, phraseCount("fish blue"));  // crosses the boundary: the gap forbids it
 
-  helper.clear();
   helper.collection().setSchema(Schema::createDefaultSchema());
 }

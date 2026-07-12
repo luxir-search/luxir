@@ -111,7 +111,6 @@ void SoluxTest::clearCollection(std::string_view collectionName) {
 class SoluxTestListener : public testing::EmptyTestEventListener {
   uint64_t suiteHash;
   uint64_t rng_seed;
-  std::string previousTest;
 
   void OnTestSuiteStart(const testing::TestSuite &suite) override {
     // std::cout << "STARTING SUITE " << suite.name() << std::endl;
@@ -131,14 +130,11 @@ class SoluxTestListener : public testing::EmptyTestEventListener {
         // exposure tests have today and is not worth an updateGraph.wait_for_all() on every clean check.
         bool dirty = !writer->testIsEmpty() || !SoluxTest::isDefaultSchema(collection->getSchema());
         if (dirty) {
+          // Tests intentionally leave main populated; reset it silently before the next test.
           writer->testDeleteAllData();
           if (!SoluxTest::isDefaultSchema(collection->getSchema())) {
             collection->setSchema(Schema::createDefaultSchema());
           }
-          std::cout << "collection 'main' left dirty by "
-                    << (previousTest.empty() ? "<unknown>" : previousTest)
-                    << "; reset before " << test_info.test_suite_name() << "." << test_info.name()
-                    << std::endl;
         }
       } catch (const CollectionResolutionError&) {
       }
@@ -151,7 +147,7 @@ class SoluxTestListener : public testing::EmptyTestEventListener {
   }
 
   void OnTestEnd(const testing::TestInfo &test_info) override {
-    previousTest = std::string(test_info.test_suite_name()) + "." + test_info.name();
+    unused(test_info);
     // std::cout << "ENDING TEST " << test_info.name() << std::endl;
     assert(MemPool::sanityCheck());
   }

@@ -347,7 +347,6 @@ protected:
 // the second vector would map to docRank 1, which is a no-vector doc).
 TEST_F(KnnQueryTest, basicOrdering) {
   CollectionHelper h("main");
-  h.clear();
   installVecSchema(h.collection(), api::VectorParams::Metric::L2);
 
   // Mix of vector docs ("a","b","c","d") and bare-id docs ("g1","g2","g3").
@@ -388,7 +387,6 @@ TEST_F(KnnQueryTest, basicOrdering) {
 // basis (different segments have different sparse layouts).
 TEST_F(KnnQueryTest, multiSegment) {
   CollectionHelper h("main");
-  h.clear();
   installVecSchema(h.collection(), api::VectorParams::Metric::L2);
 
   // Segment 0: vec, no-vec, vec.  s0_a at docRank 0, s0_b at docRank 2.
@@ -433,7 +431,6 @@ TEST_F(KnnQueryTest, multiSegment) {
 // is used.  A delete phase then exercises the multi-valued is_member resolve path.
 TEST_F(KnnQueryTest, multiValuedGrouping) {
   CollectionHelper h("main");
-  h.clear();
   installMultiVecSchema(h.collection(), api::VectorParams::Metric::L2);
 
   // docRank 0: "a" owns the two closest chunks to the query.
@@ -475,7 +472,6 @@ TEST_F(KnnQueryTest, multiValuedGrouping) {
 
 TEST_F(KnnQueryTest, multiValuedGuaranteesKDocs) {
   CollectionHelper h("main");
-  h.clear();
   installMultiVecSchema(h.collection(), api::VectorParams::Metric::L2);
 
   // "a" owns the top 3 vectors.  A k-vectors implementation returns only "a";
@@ -505,7 +501,6 @@ TEST_F(KnnQueryTest, multiValuedGuaranteesKDocs) {
 
 TEST_F(KnnQueryTest, multiValuedKExceedsDistinctDocs) {
   CollectionHelper h("main");
-  h.clear();
   installMultiVecSchema(h.collection(), api::VectorParams::Metric::L2);
 
   h.index(flatdoc("id", std::string("a"), "emb_vs",
@@ -534,7 +529,6 @@ TEST_F(KnnQueryTest, multiValuedKExceedsDistinctDocs) {
 
 TEST_F(KnnQueryTest, multiValuedFillsAfterDeletingTopDoc) {
   CollectionHelper h("main");
-  h.clear();
   installMultiVecSchema(h.collection(), api::VectorParams::Metric::L2);
 
   h.index(flatdoc("id", std::string("a"), "emb_vs",
@@ -566,7 +560,6 @@ TEST_F(KnnQueryTest, multiValuedFillsAfterDeletingTopDoc) {
 TEST_F(KnnQueryTest, multiValuedCandidateCapIsBestEffort) {
   MaxKnnCandidatesGuard guard(3);
   CollectionHelper h("main");
-  h.clear();
   installMultiVecSchema(h.collection(), api::VectorParams::Metric::L2);
 
   h.index(flatdoc("id", std::string("a"), "emb_vs",
@@ -602,7 +595,6 @@ TEST_F(KnnQueryTest, multiValuedCandidateCapIsBestEffort) {
 // per-segment maps are applied (not valueRank-as-docId).
 TEST_F(KnnQueryTest, multiValuedMultiSegment) {
   CollectionHelper h("main");
-  h.clear();
   installMultiVecSchema(h.collection(), api::VectorParams::Metric::L2);
 
   // Segment 0 (docRanks): s0_a[0] 2 vecs, s0_g[1] none, s0_b[2] 1 vec.
@@ -641,7 +633,6 @@ TEST_F(KnnQueryTest, multiValuedMultiSegment) {
 // FAISS aux + query resolve hits to the correct merged docs.
 TEST_F(KnnQueryTest, multiValuedSurvivesMerge) {
   CollectionHelper h("main");
-  h.clear();
   installMultiVecSchema(h.collection(), api::VectorParams::Metric::L2);
 
   // Segment 0: a (2 vecs), b (1 vec).
@@ -683,7 +674,6 @@ TEST_F(KnnQueryTest, multiValuedSurvivesMerge) {
 // the deleted one.
 TEST_F(KnnQueryTest, filtersDeletedDocs) {
   CollectionHelper h("main");
-  h.clear();
   installVecSchema(h.collection(), api::VectorParams::Metric::L2);
 
   // Layout (docRank -> id, vector):
@@ -726,7 +716,6 @@ TEST_F(KnnQueryTest, filtersDeletedDocs) {
 
 TEST_F(KnnQueryTest, topDocsFilterConstrainsKnnSearch) {
   CollectionHelper h("main");
-  h.clear();
   installVecSchema(h.collection(), api::VectorParams::Metric::L2);
 
   h.index(flatdoc("id", std::string("blue_a"), "color_s", "blue",
@@ -757,7 +746,6 @@ TEST_F(KnnQueryTest, topDocsFilterConstrainsKnnSearch) {
 
 TEST_F(KnnQueryTest, booleanOptionalKnnsCanFacet) {
   CollectionHelper h("main");
-  h.clear();
   installVecSchema(h.collection(), api::VectorParams::Metric::L2);
 
   h.index(flatdoc("id", std::string("a"), "group_s", "left",
@@ -808,7 +796,6 @@ TEST_F(KnnQueryTest, booleanOptionalKnnsCanFacet) {
 
 TEST_F(KnnQueryTest, booleanKnnFilterConstrainsRequiredKnn) {
   CollectionHelper h("main");
-  h.clear();
   installVecSchema(h.collection(), api::VectorParams::Metric::L2);
 
   h.index(flatdoc("id", std::string("a"),
@@ -842,7 +829,6 @@ TEST_F(KnnQueryTest, booleanKnnFilterConstrainsRequiredKnn) {
 
 TEST_F(KnnQueryTest, booleanTermRequiredUsesKnnFilter) {
   CollectionHelper h("main");
-  h.clear();
   installVecSchema(h.collection(), api::VectorParams::Metric::L2);
 
   h.index(flatdoc("id", std::string("a"), "foo_w", "apple",
@@ -873,7 +859,6 @@ TEST_F(KnnQueryTest, booleanTermRequiredUsesKnnFilter) {
 
 TEST_F(KnnQueryTest, booleanDisjointRequiredAndKnnFilterReturnsEmpty) {
   CollectionHelper h("main");
-  h.clear();
   installVecSchema(h.collection(), api::VectorParams::Metric::L2);
 
   h.index(flatdoc("id", std::string("a"), "foo_w", "apple",
@@ -900,7 +885,6 @@ TEST_F(KnnQueryTest, booleanDisjointRequiredAndKnnFilterReturnsEmpty) {
 
 TEST_F(KnnQueryTest, booleanFilterOnlyAppliesProhibited) {
   CollectionHelper h("main");
-  h.clear();
 
   h.index(flatdoc("id", std::string("a"), "foo_w", "apple", "state_s", "ok"));
   h.index(flatdoc("id", std::string("b"), "foo_w", "apple", "state_s", "blocked"));
@@ -930,7 +914,6 @@ TEST_F(KnnQueryTest, booleanFilterOnlyAppliesProhibited) {
 
 TEST_F(KnnQueryTest, booleanMinMatchWithRequiredConstrains) {
   CollectionHelper h("main");
-  h.clear();
   h.index(flatdoc("id", std::string("a"), "foo_w", "apple"), UpdateMessage::COMMIT);
 
   auto* req = LocalReq::create(soluxNode->getSearchEngine());
@@ -955,7 +938,6 @@ TEST_F(KnnQueryTest, booleanMinMatchWithRequiredConstrains) {
 // get k live docs back.
 TEST_F(KnnQueryTest, manyDeletes) {
   CollectionHelper h("main");
-  h.clear();
   installVecSchema(h.collection(), api::VectorParams::Metric::L2);
 
   // 6 docs at distances [0, .02, .08, .18, .32, .50] from query [1, 0].
@@ -985,7 +967,6 @@ TEST_F(KnnQueryTest, manyDeletes) {
 // FAISS aux entry.  Query falls back to exact flat-over-column.
 TEST_F(KnnQueryTest, missingAuxIndexFallsBackToColumnScan) {
   CollectionHelper h("main");
-  h.clear();
   installVecSchema(h.collection(), api::VectorParams::Metric::L2);
 
   // Index but DO NOT build an aux index (commit without selectors).
@@ -1007,7 +988,6 @@ TEST_F(KnnQueryTest, ivfPqAuxUsesColumnRescore) {
   IvfPqAuxGuard guard(/*nlist=*/4, /*m=*/2, /*bits=*/2,
                       /*nprobe=*/4, /*minTraining=*/16, /*refineRatio=*/64);
   CollectionHelper h("main");
-  h.clear();
   installVecSchema(h.collection(), api::VectorParams::Metric::L2);
 
   for (int i = 0; i < 160; i++) {
@@ -1041,7 +1021,6 @@ TEST_F(KnnQueryTest, ivfPqApproximateRecallAtOneProbe) {
   IvfPqAuxGuard guard(/*nlist=*/4, /*m=*/2, /*bits=*/2,
                       /*nprobe=*/1, /*minTraining=*/16, /*refineRatio=*/8);
   CollectionHelper h("main");
-  h.clear();
   installVecSchema(h.collection(), api::VectorParams::Metric::L2);
 
   for (int cluster = 0; cluster < 4; cluster++) {
@@ -1082,7 +1061,6 @@ TEST_F(KnnQueryTest, exactBypassesApproximateIndex) {
   IvfPqAuxGuard guard(/*nlist=*/2, /*m=*/2, /*bits=*/2,
                       /*nprobe=*/1, /*minTraining=*/16, /*refineRatio=*/8);
   CollectionHelper h("main");
-  h.clear();
   installVecSchema(h.collection(), api::VectorParams::Metric::L2);
 
   for (int i = 0; i < 80; i++) {
@@ -1134,7 +1112,6 @@ TEST_F(KnnQueryTest, minScanFractionFloorsExplicitNProbe) {
   IvfPqAuxGuard guard(/*nlist=*/2, /*m=*/2, /*bits=*/2,
                       /*nprobe=*/1, /*minTraining=*/16, /*refineRatio=*/8);
   CollectionHelper h("main");
-  h.clear();
   installVecSchema(h.collection(), api::VectorParams::Metric::L2);
 
   for (int i = 0; i < 80; i++) {
@@ -1191,7 +1168,6 @@ TEST_F(KnnQueryTest, defaultNProbeStaysLeanNotFullScan) {
   IvfPqAuxGuard guard(/*nlist=*/2, /*m=*/2, /*bits=*/2,
                       /*nprobe=*/1, /*minTraining=*/16, /*refineRatio=*/8);
   CollectionHelper h("main");
-  h.clear();
   installVecSchema(h.collection(), api::VectorParams::Metric::L2);
 
   for (int i = 0; i < 80; i++) {
@@ -1231,7 +1207,6 @@ TEST_F(KnnQueryTest, mixedIndexedAndBelowThresholdCompositionMatchesExact) {
   IvfPqAuxGuard guard(/*nlist=*/2, /*m=*/1, /*bits=*/1,
                       /*nprobe=*/2, /*minTraining=*/2, /*refineRatio=*/64);
   CollectionHelper h("main");
-  h.clear();
   installVecSchema(h.collection(), api::VectorParams::Metric::L2);
 
   for (int i = 0; i < 80; i++) {
@@ -1269,7 +1244,6 @@ TEST_F(KnnQueryTest, perSegmentExactBypassesApproximateMiss) {
   IvfPqAuxGuard guard(/*nlist=*/2, /*m=*/2, /*bits=*/2,
                       /*nprobe=*/1, /*minTraining=*/16, /*refineRatio=*/8);
   CollectionHelper h("main");
-  h.clear();
   installVecSchema(h.collection(), api::VectorParams::Metric::L2);
 
   for (int i = 0; i < 80; i++) {
@@ -1324,7 +1298,6 @@ TEST_F(KnnQueryTest, parallelChunkedScanMatchesSerialAndExact) {
                       /*nprobe=*/4, /*minTraining=*/16, /*refineRatio=*/8);
   ScanGrainGuard grains(/*scanGrainVectors=*/1, /*rescoreGrainCandidates=*/1);
   CollectionHelper h("main");
-  h.clear();
   installVecSchema(h.collection(), api::VectorParams::Metric::L2);
 
   // 160 vectors per segment: above the PQ training floor (39 * 2^bits =
@@ -1405,7 +1378,6 @@ TEST_F(KnnQueryTest, parallelMultiValuedIvfMatchesSerial) {
                       /*nprobe=*/4, /*minTraining=*/16, /*refineRatio=*/8);
   ScanGrainGuard grains(/*scanGrainVectors=*/1, /*rescoreGrainCandidates=*/1);
   CollectionHelper h("main");
-  h.clear();
   installMultiVecSchema(h.collection(), api::VectorParams::Metric::L2);
 
   // Vector counts (180 and 160) sit above the PQ training floor of 156.
@@ -1465,7 +1437,6 @@ TEST_F(KnnQueryTest, booleanNestedKnnPropagatesParallelism) {
                       /*nprobe=*/4, /*minTraining=*/16, /*refineRatio=*/8);
   ScanGrainGuard grains(/*scanGrainVectors=*/1, /*rescoreGrainCandidates=*/1);
   CollectionHelper h("main");
-  h.clear();
   installVecSchema(h.collection(), api::VectorParams::Metric::L2);
 
   for (int i = 0; i < 160; i++) {
@@ -1511,7 +1482,6 @@ TEST_F(KnnQueryTest, ivfDeletesUseCachedRankLiveBitmap) {
   IvfPqAuxGuard guard(/*nlist=*/4, /*m=*/2, /*bits=*/2,
                       /*nprobe=*/4, /*minTraining=*/16, /*refineRatio=*/8);
   CollectionHelper h("main");
-  h.clear();
   installVecSchema(h.collection(), api::VectorParams::Metric::L2);
 
   for (int i = 0; i < 160; i++) {
@@ -1577,7 +1547,6 @@ TEST_F(KnnQueryTest, ivfFilteredQueryWithDeletesMatchesExact) {
   IvfPqAuxGuard guard(/*nlist=*/4, /*m=*/2, /*bits=*/2,
                       /*nprobe=*/4, /*minTraining=*/16, /*refineRatio=*/8);
   CollectionHelper h("main");
-  h.clear();
   installVecSchema(h.collection(), api::VectorParams::Metric::L2);
 
   for (int i = 0; i < 160; i++) {
@@ -1629,7 +1598,6 @@ TEST_F(KnnQueryTest, selectiveFilterPreparedSkipMatchesCollectorRecheck) {
   IvfPqAuxGuard guard(/*nlist=*/4, /*m=*/2, /*bits=*/2,
                       /*nprobe=*/4, /*minTraining=*/16, /*refineRatio=*/8);
   CollectionHelper h("main");
-  h.clear();
   installVecSchema(h.collection(), api::VectorParams::Metric::L2);
 
   for (int i = 0; i < 160; i++) {
@@ -1687,7 +1655,6 @@ TEST_F(KnnQueryTest, selectiveFilterPreparedSkipMatchesCollectorRecheck) {
 // rely on.
 TEST_F(KnnQueryTest, nanQueryVectorReturnsErrorResponse) {
   CollectionHelper h("main");
-  h.clear();
   installVecSchema(h.collection(), api::VectorParams::Metric::L2);
   h.index(flatdoc("id", std::string("a"), "embedding_v", std::vector<float>{1, 0, 0}));
   h.commit({"*"});
@@ -1711,7 +1678,6 @@ TEST_F(KnnQueryTest, nanQueryVectorReturnsErrorResponse) {
 // sentinel would silently drop).
 TEST_F(KnnQueryTest, nanStoredVectorRanksLast) {
   CollectionHelper h("main");
-  h.clear();
   installVecSchema(h.collection(), api::VectorParams::Metric::IP);
 
   h.index(flatdoc("id", std::string("good1"), "embedding_v", std::vector<float>{3, 0, 0}));
@@ -1737,7 +1703,6 @@ TEST_F(KnnQueryTest, exactIgnoresMaxKnnCandidatesCap) {
   MaxKnnCandidatesGuard guard(2);
 
   CollectionHelper h("main");
-  h.clear();
   installVecSchema(h.collection(), api::VectorParams::Metric::L2);
   for (int i = 0; i < 10; i++) {
     h.index(flatdoc("id", "doc" + std::to_string(i),
@@ -1769,7 +1734,6 @@ TEST_F(KnnQueryTest, ivfPqMultiValuedUsesReverseMapAndCollapse) {
   IvfPqAuxGuard guard(/*nlist=*/4, /*m=*/2, /*bits=*/2,
                       /*nprobe=*/4, /*minTraining=*/16, /*refineRatio=*/64);
   CollectionHelper h("main");
-  h.clear();
   installMultiVecSchema(h.collection(), api::VectorParams::Metric::L2);
 
   h.index(flatdoc("id", std::string("a"), "emb_vs",
@@ -1815,7 +1779,6 @@ TEST_F(KnnQueryTest, ivfPqMultiValuedDeletesClearAllRanks) {
   IvfPqAuxGuard guard(/*nlist=*/4, /*m=*/2, /*bits=*/2,
                       /*nprobe=*/4, /*minTraining=*/16, /*refineRatio=*/64);
   CollectionHelper h("main");
-  h.clear();
   installMultiVecSchema(h.collection(), api::VectorParams::Metric::L2);
 
   h.index(flatdoc("id", std::string("a"), "emb_vs",
@@ -1877,7 +1840,6 @@ TEST_F(KnnQueryTest, ivfDeepenExcludesPooledAndDeleted) {
   IvfPqAuxGuard guard(/*nlist=*/4, /*m=*/2, /*bits=*/2,
                       /*nprobe=*/4, /*minTraining=*/16, /*refineRatio=*/8);
   CollectionHelper h("main");
-  h.clear();
   installMultiVecSchema(h.collection(), api::VectorParams::Metric::L2);
 
   std::vector<std::vector<float>> zvecs;
@@ -1945,7 +1907,6 @@ TEST_F(KnnQueryTest, ivfPqCosineRawColumnRescoreNormalizes) {
   IvfPqAuxGuard guard(/*nlist=*/4, /*m=*/2, /*bits=*/2,
                       /*nprobe=*/4, /*minTraining=*/16, /*refineRatio=*/64);
   CollectionHelper h("main");
-  h.clear();
   installVecSchemaCosineRaw(h.collection());
 
   h.index(flatdoc("id", std::string("east"), "embedding_v", std::vector<float>{5, 0, 0, 0}));
@@ -1982,7 +1943,6 @@ TEST_F(KnnQueryTest, requestedNProbeCapsBreadthDeepening) {
   IvfPqAuxGuard guard(/*nlist=*/2, /*m=*/2, /*bits=*/2,
                       /*nprobe=*/1, /*minTraining=*/16, /*refineRatio=*/32);
   CollectionHelper h("main");
-  h.clear();
   installVecSchema(h.collection(), api::VectorParams::Metric::L2);
 
   for (int i = 0; i < 160; i++) {
@@ -2036,7 +1996,6 @@ TEST_F(KnnQueryTest, requestedNProbeCapsBreadthDeepening) {
 // after the ctor succeeds, so a throwing arena ctor is safe regardless.
 TEST_F(KnnQueryTest, dimMismatchReturnsErrorResponse) {
   CollectionHelper h("main");
-  h.clear();
   installVecSchema(h.collection(), api::VectorParams::Metric::L2);
 
   h.index(flatdoc("id", std::string("a"), "embedding_v", std::vector<float>{1, 0, 0, 0}));
@@ -2060,7 +2019,6 @@ TEST_F(KnnQueryTest, dimMismatchReturnsErrorResponse) {
 
 TEST_F(KnnQueryTest, emptyQueryVectorReturnsErrorResponse) {
   CollectionHelper h("main");
-  h.clear();
   installVecSchema(h.collection(), api::VectorParams::Metric::L2);
 
   h.index(flatdoc("id", std::string("a"), "embedding_v", std::vector<float>{1, 0, 0}));
@@ -2087,7 +2045,6 @@ TEST_F(KnnQueryTest, emptyQueryVectorReturnsErrorResponse) {
 // for COSINE (which currently passes IP through unchanged).
 TEST_F(KnnQueryTest, cosineMetric) {
   CollectionHelper h("main");
-  h.clear();
   installVecSchema(h.collection(), api::VectorParams::Metric::COSINE);
 
   // Three vectors in distinct directions, all non-unit length so the
@@ -2130,7 +2087,6 @@ TEST_F(KnnQueryTest, cosineMetric) {
 
 TEST_F(KnnQueryTest, zeroOnlyCosineSegmentDoesNotPoisonColumnScan) {
   CollectionHelper h("main");
-  h.clear();
   installVecSchema(h.collection(), api::VectorParams::Metric::COSINE);
 
   {
@@ -2159,7 +2115,6 @@ TEST_F(KnnQueryTest, zeroOnlyCosineSegmentDoesNotPoisonColumnScan) {
 // squared L2.  Verify the formula end-to-end with concrete distances.
 TEST_F(KnnQueryTest, l2Scores) {
   CollectionHelper h("main");
-  h.clear();
   installVecSchema(h.collection(), api::VectorParams::Metric::L2);
 
   // Squared distances from query [0,0]:
@@ -2201,7 +2156,6 @@ TEST_F(KnnQueryTest, breadthRoundsKeepCandidatePoolSorted) {
     return std::make_unique<BreadthSplitEngine>(flat, ntotal, 7);
   });
   CollectionHelper h("main");
-  h.clear();
   installMultiVecSchema(h.collection(), api::VectorParams::Metric::IP);
 
   // valueRanks 0-5 (list 0): a's six vectors.  rank 6 (list 0): x's low
@@ -2255,7 +2209,6 @@ TEST_F(KnnQueryTest, approximateScoresRescoredFromColumn) {
     return std::make_unique<QuantizingEngine>(flat);
   });
   CollectionHelper h("main");
-  h.clear();
   installMultiVecSchema(h.collection(), api::VectorParams::Metric::L2);
 
   h.index(flatdoc("id", std::string("a"), "emb_vs",
@@ -2297,7 +2250,6 @@ TEST_F(KnnQueryTest, mixedExactSegmentsSkipColumnRescore) {
     return std::make_unique<PartiallyExactEngine>(flat, 0, 0.25f);
   });
   CollectionHelper h("main");
-  h.clear();
   installVecSchema(h.collection(), api::VectorParams::Metric::L2);
 
   // Segment 0: the exact-claimed segment.
@@ -2340,7 +2292,6 @@ TEST_F(KnnQueryTest, cosineRawColumnRescoreNormalizes) {
     return std::make_unique<QuantizingEngine>(flat);
   });
   CollectionHelper h("main");
-  h.clear();
   installVecSchemaCosineRaw(h.collection());
 
   // Raw (non-unit) vectors with distinct cosines vs the +x query direction:

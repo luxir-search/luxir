@@ -168,7 +168,6 @@ const solux::api::AuxIndexInfo& onlyVectorOverlay(const solux::api::IndexInfo& i
 TEST_F(IndexReaderAuxTest, opensVectorAuxAfterBuild) {
   IvfPqGuard guard;
   CollectionHelper h("main");
-  h.clear();
   enableL2OnVecSuffix(h.collection());
 
   std::vector<std::vector<float>> vecs;
@@ -215,7 +214,6 @@ TEST_F(IndexReaderAuxTest, opensVectorAuxAfterBuild) {
 TEST_F(IndexReaderAuxTest, ivfListsAreServedFromFileView) {
   IvfPqGuard guard;
   CollectionHelper h("main");
-  h.clear();
   enableL2OnVecSuffix(h.collection());
 
   constexpr int N = 80;
@@ -291,7 +289,6 @@ TEST_F(IndexReaderAuxTest, cosineSkipsL2PrecomputedTable) {
 
   {
     CollectionHelper h("main");
-    h.clear();
     enableCosineOnVecSuffix(h.collection(), true);
     indexDocs(h);
     auto opened = openIvfPq(h);
@@ -314,7 +311,6 @@ TEST_F(IndexReaderAuxTest, cosineSkipsL2PrecomputedTable) {
 TEST_F(IndexReaderAuxTest, cosineRawColumnSetsRescorePolicy) {
   IvfPqGuard guard;
   CollectionHelper h("main");
-  h.clear();
   enableCosineOnVecSuffix(h.collection(), false);
 
   for (int i = 0; i < 80; i++) {
@@ -335,7 +331,6 @@ TEST_F(IndexReaderAuxTest, cosineRawColumnSetsRescorePolicy) {
 // No aux entries -> reader has no aux readers (default schema, no metric).
 TEST_F(IndexReaderAuxTest, noAuxEntriesIsEmpty) {
   CollectionHelper h("main");
-  h.clear();
 
   h.index(flatdoc("id", std::string("a"), "embedding_v", std::vector<float>{1, 2, 3}),
           UpdateMessage::COMMIT);
@@ -350,7 +345,6 @@ TEST_F(IndexReaderAuxTest, noAuxEntriesIsEmpty) {
 TEST_F(IndexReaderAuxTest, opensCleanlyAfterTinyCommitCarryForward) {
   IvfPqGuard guard;
   CollectionHelper h("main");
-  h.clear();
   enableL2OnVecSuffix(h.collection());
 
   // First commit + build.
@@ -414,7 +408,6 @@ TEST_F(IndexReaderAuxTest, opensCleanlyAfterTinyCommitCarryForward) {
 TEST_F(IndexReaderAuxTest, retryEscalatesWhenAuxFilePersistentlyMissing) {
   IvfPqGuard guard;
   CollectionHelper h("main");
-  h.clear();
   enableL2OnVecSuffix(h.collection());
 
   for (int i = 0; i < 80; i++) {
@@ -445,7 +438,6 @@ TEST_F(IndexReaderAuxTest, retryEscalatesWhenAuxFilePersistentlyMissing) {
   // collection persists across tests/benchmarks, so leaving the IndexInfo
   // referencing a deleted aux file would break any later code that opens
   // an IndexReader on this collection.
-  h.clear();
 }
 
 // Carry-forward reuse: when the new commit's segment overlay has the same
@@ -454,7 +446,6 @@ TEST_F(IndexReaderAuxTest, retryEscalatesWhenAuxFilePersistentlyMissing) {
 TEST_F(IndexReaderAuxTest, reusesAuxReaderOnCarryForward) {
   IvfPqGuard guard;
   CollectionHelper h("main");
-  h.clear();
   enableL2OnVecSuffix(h.collection());
 
   // Build aux index.
@@ -488,7 +479,6 @@ TEST_F(IndexReaderAuxTest, reusesAuxReaderOnCarryForward) {
 TEST_F(IndexReaderAuxTest, newSegmentGetsFreshAuxReader) {
   IvfPqGuard guard;
   CollectionHelper h("main");
-  h.clear();
   enableL2OnVecSuffix(h.collection());
 
   for (int i = 0; i < 80; i++) {
@@ -525,7 +515,6 @@ TEST_F(IndexReaderAuxTest, newSegmentGetsFreshAuxReader) {
 
 TEST_F(IndexReaderAuxTest, testOverlayConcurrentOpenHammer) {
   CollectionHelper h("main");
-  h.clear();
   auto iw = h.getIndexWriter();
   iw->mergePolicy->setMergeFactor(100);
 
@@ -598,7 +587,6 @@ TEST_F(IndexReaderAuxTest, testOverlayConcurrentOpenHammer) {
 // a modified s.olux on top of an existing index.
 TEST_F(IndexReaderAuxTest, unknownAuxKindIsSkipped) {
   CollectionHelper h("main");
-  h.clear();
 
   h.index(flatdoc("id", std::string("a")), UpdateMessage::COMMIT);
 

@@ -200,7 +200,6 @@ TEST_F(TermsEnumSeekFuzzTest, GapRoutingAcrossSeparatorBoundary) {
 TEST_F(TermsEnumSeekFuzzTest, RandomCollectionTermsMatchVectorReference) {
   std::mt19937_64 rng(0x5eedf00d);
   CollectionHelper helper;
-  helper.clear();
 
   std::vector<std::string> terms = makeTerms(rng);
   ASSERT_GT(terms.size(), (size_t)Postings::TERMS_BLOCK_SIZE * 3);

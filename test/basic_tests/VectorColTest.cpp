@@ -309,7 +309,6 @@ TEST_F(VectorColTest, strictDimsRejectsMismatch) {
 // gRPC round trip (single-valued): index via CollectionHelper, retrieve via LocalReq.
 TEST_F(VectorColTest, grpcSingleFieldsRoundTrip) {
   CollectionHelper h("main");
-  h.clear();
 
   Doc doc1 = flatdoc("id", std::string("a"), "vec_v", std::vector<float>{1.0f, 2.0f, 3.0f});
   Doc doc2 = flatdoc("id", std::string("b"), "vec_v", std::vector<float>{4.5f, -5.5f, 6.5f});
@@ -353,7 +352,6 @@ TEST_F(VectorColTest, grpcSingleFieldsRoundTrip) {
 // gRPC round trip (multi-valued): exercises the loadVectorColForSegmentMulti path.
 TEST_F(VectorColTest, grpcMultiFieldsRoundTrip) {
   CollectionHelper h("main");
-  h.clear();
 
   std::vector<std::vector<float>> aVecs = {{1, 2}, {3, 4}, {5, 6}};
   std::vector<std::vector<float>> bVecs = {{7, 8}};
@@ -391,7 +389,6 @@ TEST_F(VectorColTest, grpcMultiFieldsRoundTrip) {
 
 TEST_F(VectorColTest, cosineDefaultsToNormalizedColumnStorage) {
   CollectionHelper h("main");
-  h.clear();
 
   std::pmr::monotonic_buffer_resource mr;
   solux::api::SchemaDef def;
@@ -424,7 +421,6 @@ TEST_F(VectorColTest, cosineDefaultsToNormalizedColumnStorage) {
 
 TEST_F(VectorColTest, cosineNormalizeOnWriteFalseKeepsRawColumnStorage) {
   CollectionHelper h("main");
-  h.clear();
   enableCosineOnVecSuffix(h.collection(), false);
 
   Doc doc = flatdoc("id", std::string("a"), "vec_v", std::vector<float>{3.0f, 4.0f});
@@ -448,7 +444,6 @@ TEST_F(VectorColTest, cosineNormalizeOnWriteFalseKeepsRawColumnStorage) {
 
 TEST_F(VectorColTest, cosineNormalizedFlagKeepsRawColumnStorage) {
   CollectionHelper h("main");
-  h.clear();
 
   std::pmr::monotonic_buffer_resource mr;
   solux::api::SchemaDef def;
@@ -491,7 +486,6 @@ TEST_F(VectorColTest, cosineNormalizedFlagKeepsRawColumnStorage) {
 // update we skip the value (the doc is indexed with no vector for that field).
 TEST_F(VectorColTest, cosineSkipsZeroVector) {
   CollectionHelper h("main");
-  h.clear();
 
   std::pmr::monotonic_buffer_resource mr;
   solux::api::SchemaDef def;

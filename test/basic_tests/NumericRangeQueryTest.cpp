@@ -64,7 +64,6 @@ auto i64Range(std::string_view field, std::optional<int64_t> gte, std::optional<
 
 TEST_F(NumericRangeQueryTest, intBoundsMissingAndOpen) {
   CollectionHelper helper;
-  helper.clear();
   helper.index(flatdoc("id_s", "a", "num_i", 5), UpdateMessage::NO_COMMIT);
   helper.index(flatdoc("id_s", "b", "num_i", 10), UpdateMessage::NO_COMMIT);
   helper.index(flatdoc("id_s", "c", "num_i", 15), UpdateMessage::COMMIT);
@@ -99,7 +98,6 @@ TEST_F(NumericRangeQueryTest, intBoundsMissingAndOpen) {
 
 TEST_F(NumericRangeQueryTest, numericMatchEquality) {
   CollectionHelper helper;
-  helper.clear();
   helper.index(flatdoc("id_s", "a", "num_i", 5), UpdateMessage::NO_COMMIT);
   helper.index(flatdoc("id_s", "b", "num_i", 10), UpdateMessage::NO_COMMIT);
   helper.index(flatdoc("id_s", "c", "num_i", 10), UpdateMessage::COMMIT);
@@ -125,7 +123,6 @@ TEST_F(NumericRangeQueryTest, numericMatchEquality) {
 
 TEST_F(NumericRangeQueryTest, multiValuedAnyAndEmptyArray) {
   CollectionHelper helper;
-  helper.clear();
   helper.index(flatdoc("id_s", "a", "prices_is", vec_i(20, 35, 45)), UpdateMessage::NO_COMMIT);
   helper.index(flatdoc("id_s", "b", "prices_is", 35), UpdateMessage::NO_COMMIT);
   helper.index(flatdoc("id_s", "c", "prices_is", vec_i()), UpdateMessage::NO_COMMIT);  // empty array
@@ -142,7 +139,6 @@ TEST_F(NumericRangeQueryTest, multiValuedAnyAndEmptyArray) {
 
 TEST_F(NumericRangeQueryTest, floatSortableOrderAndSignedZero) {
   CollectionHelper helper;
-  helper.clear();
   helper.index(flatdoc("id_s", "a", "val_f", -3.5f), UpdateMessage::NO_COMMIT);
   helper.index(flatdoc("id_s", "b", "val_f", -0.5f), UpdateMessage::NO_COMMIT);
   helper.index(flatdoc("id_s", "n", "val_f", -0.0f), UpdateMessage::NO_COMMIT);
@@ -171,7 +167,6 @@ TEST_F(NumericRangeQueryTest, floatSortableOrderAndSignedZero) {
 
 TEST_F(NumericRangeQueryTest, doubleRange) {
   CollectionHelper helper;
-  helper.clear();
   helper.index(flatdoc("id_s", "a", "val_d", -2.5), UpdateMessage::NO_COMMIT);
   helper.index(flatdoc("id_s", "b", "val_d", 3.14), UpdateMessage::NO_COMMIT);
   helper.index(flatdoc("id_s", "c", "val_d", 1e10), UpdateMessage::COMMIT);
@@ -189,7 +184,6 @@ TEST_F(NumericRangeQueryTest, doubleRange) {
 
 TEST_F(NumericRangeQueryTest, dateRangeIsoStrings) {
   CollectionHelper helper;
-  helper.clear();
   helper.index(flatdoc("id_s", "a", "when_dt", "2000-01-01"), UpdateMessage::NO_COMMIT);
   helper.index(flatdoc("id_s", "b", "when_dt", "2010-06-15T12:00:00Z"), UpdateMessage::NO_COMMIT);
   helper.index(flatdoc("id_s", "c", "when_dt", "2020-12-31"), UpdateMessage::COMMIT);
@@ -209,7 +203,6 @@ TEST_F(NumericRangeQueryTest, dateRangeIsoStrings) {
 
 TEST_F(NumericRangeQueryTest, conjunctionAndConstantScore) {
   CollectionHelper helper;
-  helper.clear();
   helper.index(flatdoc("id_s", "a", "text_w", "red apple", "num_i", 5), UpdateMessage::NO_COMMIT);
   helper.index(flatdoc("id_s", "b", "text_w", "red apple", "num_i", 15), UpdateMessage::NO_COMMIT);
   helper.index(flatdoc("id_s", "c", "text_w", "green apple", "num_i", 15), UpdateMessage::COMMIT);
@@ -261,7 +254,6 @@ TEST(NumericRangeBuilder, validation) {
 
 TEST_F(NumericRangeQueryTest, int64Extremes) {
   CollectionHelper helper;
-  helper.clear();
   helper.index(flatdoc("id_s", "lo", "num_i", std::numeric_limits<int64_t>::min()),
                UpdateMessage::NO_COMMIT);
   helper.index(flatdoc("id_s", "mid", "num_i", 0), UpdateMessage::NO_COMMIT);

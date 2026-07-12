@@ -667,7 +667,6 @@ TEST_F(GrpcIndexTest, threadsafeIndex) {
 
   // clear the index
   solux::test::CollectionHelper ch("main");
-  ch.clear();
 
   doThreadSafeIndex(nThreads, nDocs, streamingPercent, commitPercent, waitForMergesPercent);
 
@@ -874,7 +873,6 @@ TEST_F(GrpcIndexTest, addDocsStream2) {
 }
 
 TEST_F(GrpcIndexTest, visibility) {
-   clearCollection();
    ASSERT_EQ(0, getDocCount());
 
   // Write Stream

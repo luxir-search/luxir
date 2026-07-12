@@ -26,7 +26,6 @@ public:
   }
 
   QueryAnalysisTest() {
-    helper.clear();
     helper.index(flatdoc("id", "d1", "body_wl", "Welcome Thomas Anderson here",
                          "body_w", "Welcome Thomas Anderson here"), UpdateMessage::NO_COMMIT);
     helper.index(flatdoc("id", "d2", "body_wl", "Anderson met Thomas",

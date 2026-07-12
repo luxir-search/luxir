@@ -158,7 +158,6 @@ protected:
 //     d (2.0) falls outside the k=3 cutoff.
 TEST_F(FusionOpTest, rrfTextAndKnn) {
   CollectionHelper h("main");
-  h.clear();
   installVecSchema(h.collection(), solux::api::VectorParams::Metric::L2);
 
   h.index(flatdoc("id", std::string("a"), "foo_w", "apple",  "embedding_v", std::vector<float>{1.0f, 0,    0   }));
@@ -212,7 +211,6 @@ TEST_F(FusionOpTest, rrfTextAndKnn) {
 // can assert exact fused scores.
 TEST_F(FusionOpTest, sharedFilter) {
   CollectionHelper h("main");
-  h.clear();
 
   // All three match "apple".  After the color=red filter, only a and c
   // remain; a is shorter so BM25 ranks it first.
@@ -254,7 +252,6 @@ TEST_F(FusionOpTest, sharedFilter) {
 
 TEST_F(FusionOpTest, sharedKnnFilter) {
   CollectionHelper h("main");
-  h.clear();
   installVecSchema(h.collection(), solux::api::VectorParams::Metric::L2);
 
   h.index(flatdoc("id", std::string("a"), "foo_w", "apple",
@@ -301,7 +298,6 @@ TEST_F(FusionOpTest, sharedKnnFilter) {
 //                                        -> banana ranks 1..4
 TEST_F(FusionOpTest, rrfMultiSegment) {
   CollectionHelper h("main");
-  h.clear();
 
   // Seg 0: a (apple only), b (both).
   h.index(flatdoc("id", std::string("a"), "foo_w", "apple",              "prio_i", (int64_t)50));
@@ -370,7 +366,6 @@ TEST_F(FusionOpTest, rrfMultiSegment) {
 // should be applied; only docs satisfying both pass through.
 TEST_F(FusionOpTest, sharedAndPerSourceFilter) {
   CollectionHelper h("main");
-  h.clear();
 
   // Docs: id, foo_w, color_s, owner_s
   //   a: apple, red,  alice  - passes shared (red) and per-source (alice)
@@ -419,7 +414,6 @@ TEST_F(FusionOpTest, sharedAndPerSourceFilter) {
 // errors in the response.
 TEST_F(FusionOpTest, validation) {
   CollectionHelper h("main");
-  h.clear();
   h.index(flatdoc("id", std::string("a"), "foo_w", "apple"), UpdateMessage::COMMIT);
 
   auto buildBase = [&]() {
@@ -489,7 +483,6 @@ TEST_F(FusionOpTest, validation) {
 // branch should still emit a well-formed (empty) DocList.
 TEST_F(FusionOpTest, emptyIndex) {
   CollectionHelper h("main");
-  h.clear();
 
   auto* lreq = LocalReq::create(soluxNode->getSearchEngine());
   lreq->collection("main");
@@ -520,7 +513,6 @@ TEST_F(FusionOpTest, emptyIndex) {
 //
 TEST_F(FusionOpTest, concurrentKnnPrepareSharesRequestPool) {
   CollectionHelper h("main");
-  h.clear();
   installVecSchema(h.collection(), solux::api::VectorParams::Metric::L2);
 
   // ~40 docs across 5 segments; ~1/3 lack the vector field so the sparse

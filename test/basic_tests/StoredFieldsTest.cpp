@@ -614,7 +614,6 @@ TEST_F(StoredFieldsSearchTest, returnsStoredTextInSearch) {
   using namespace solux::test;
 
   CollectionHelper ch;
-  ch.clear();
 
   // Start from the default schema (which has "id" and the "_stored_" resource)
   // and add two explicit TEXT fields with STORED set: "body" single-valued and
@@ -662,7 +661,6 @@ TEST_F(StoredFieldsSearchTest, returnsStoredTextInSearch) {
                                         "body", std::string("third"),
                                         "tags", vecs("solo"))));
 
-  ch.clear();
   ch.collection().setSchema(Schema::createDefaultSchema());
 }
 
@@ -673,7 +671,6 @@ TEST_F(StoredFieldsSearchTest, defaultTSuffixIsStored) {
   using namespace solux::test;
 
   CollectionHelper ch;
-  ch.clear();
   // Ensure we're on the default schema.
   ch.collection().setSchema(Schema::createDefaultSchema());
 
@@ -718,7 +715,6 @@ TEST_F(StoredFieldsSearchTest, defaultTSuffixIsStored) {
                                              "body_t", std::string("The Quick Brown Fox"))));
   }
 
-  ch.clear();
 }
 
 // A custom schema can mark a STRING field STORED to get raw-value retrieval
@@ -728,7 +724,6 @@ TEST_F(StoredFieldsSearchTest, storedStringField) {
   using namespace solux::test;
 
   CollectionHelper ch;
-  ch.clear();
 
   auto schema = Schema::createDefaultSchema();
   // Indexed STRING fields (no column) with STORED set so retrieval goes
@@ -779,7 +774,6 @@ TEST_F(StoredFieldsSearchTest, storedStringField) {
   EXPECT_TRUE(containsDoc(docs, flatdoc("id", std::string("s2"),
                                         "label", std::string("Second"))));
 
-  ch.clear();
   ch.collection().setSchema(Schema::createDefaultSchema());
 }
 
@@ -790,7 +784,6 @@ TEST_F(StoredFieldsSearchTest, columnPreferredOverStored) {
   using namespace solux::test;
 
   CollectionHelper ch;
-  ch.clear();
 
   auto schema = Schema::createDefaultSchema();
   // Column-only (not indexed) STRING that is also STORED.
@@ -824,7 +817,6 @@ TEST_F(StoredFieldsSearchTest, columnPreferredOverStored) {
   EXPECT_TRUE(containsDoc(docs, flatdoc("id", std::string("d1"), "tag", std::string("red"))));
   EXPECT_TRUE(containsDoc(docs, flatdoc("id", std::string("d2"), "tag", std::string("blue"))));
 
-  ch.clear();
   ch.collection().setSchema(Schema::createDefaultSchema());
 }
 
@@ -836,7 +828,6 @@ TEST_F(StoredFieldsSearchTest, customStoredResourceFromProto) {
   using namespace solux::test;
 
   CollectionHelper ch;
-  ch.clear();
 
   // Build a schema with two stored-fields resources and two TEXT fields
   // routed into them.  The "_stored_" default resource is auto-added by
@@ -882,7 +873,6 @@ TEST_F(StoredFieldsSearchTest, customStoredResourceFromProto) {
                                         "body", std::string("default resource"),
                                         "paragraphs", std::string("custom resource"))));
 
-  ch.clear();
   ch.collection().setSchema(Schema::createDefaultSchema());
 }
 
@@ -894,7 +884,6 @@ TEST_F(StoredFieldsSearchTest, storedIdField) {
   using namespace solux::test;
 
   CollectionHelper ch;
-  ch.clear();
 
   auto schema = Schema::createDefaultSchema();
   schema->fieldTypeMap["id"] = std::make_shared<IdFieldType>(
@@ -917,7 +906,6 @@ TEST_F(StoredFieldsSearchTest, storedIdField) {
   EXPECT_TRUE(containsDoc(docs, flatdoc("id", std::string("xyz"))));
   EXPECT_TRUE(containsDoc(docs, flatdoc("id", std::string("abc"))));
 
-  ch.clear();
   ch.collection().setSchema(Schema::createDefaultSchema());
 }
 
@@ -929,7 +917,6 @@ TEST_F(StoredFieldsSearchTest, preStoredSegmentFallbackToColumn) {
   using namespace solux::test;
 
   CollectionHelper ch;
-  ch.clear();
 
   // Segment 1: schema has the STRING field WITHOUT stored - only column.
   {
@@ -988,7 +975,6 @@ TEST_F(StoredFieldsSearchTest, preStoredSegmentFallbackToColumn) {
   EXPECT_TRUE(containsDoc(docs, flatdoc("id", std::string("b"),
                                         "name", std::string("beta"))));
 
-  ch.clear();
   ch.collection().setSchema(Schema::createDefaultSchema());
 }
 
@@ -1002,7 +988,6 @@ TEST_F(StoredFieldsSearchTest, opportunisticStoredPullsColumnPeerFromChunk) {
   using namespace solux::test;
 
   CollectionHelper ch;
-  ch.clear();
 
   auto schema = Schema::createDefaultSchema();
   // body_t is already stored-only via the default _t suffix (TEXT, no column).
@@ -1047,7 +1032,6 @@ TEST_F(StoredFieldsSearchTest, opportunisticStoredPullsColumnPeerFromChunk) {
                                         "body_t", std::string("second body text"),
                                         "author", std::string("bob"))));
 
-  ch.clear();
   ch.collection().setSchema(Schema::createDefaultSchema());
 }
 
@@ -1059,7 +1043,6 @@ TEST_F(StoredFieldsSearchTest, multipleFieldsShareResource) {
   using namespace solux::test;
 
   CollectionHelper ch;
-  ch.clear();
   ch.collection().setSchema(Schema::createDefaultSchema());
 
   ch.index(flatdoc("id", std::string("d1"),
@@ -1092,5 +1075,4 @@ TEST_F(StoredFieldsSearchTest, multipleFieldsShareResource) {
                                         "b_t", std::string("beta two"),
                                         "c_t", std::string("gamma two"))));
 
-  ch.clear();
 }

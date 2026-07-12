@@ -113,7 +113,6 @@ TEST_F(DateFieldTest, parseFuzzSafetyAndInvariants) {
 // chronological sort order must survive a multi-segment force-merge.
 TEST_F(DateFieldTest, mergeAcrossSegments) {
   CollectionHelper helper;
-  helper.clear();
 
   int64_t a = *parseDateToEpochMillis("1980-05-05T00:00:00Z");
   int64_t b = *parseDateToEpochMillis("2010-10-10T00:00:00Z");
@@ -164,7 +163,6 @@ TEST_F(DateFieldTest, parseFormatRoundTrip) {
 
 TEST_F(DateFieldTest, roundTrip) {
   CollectionHelper helper;
-  helper.clear();
 
   int64_t ms1 = *parseDateToEpochMillis("2026-06-24T12:00:00Z");
   int64_t ms2 = *parseDateToEpochMillis("1999-12-31T23:59:59.250Z");
@@ -199,7 +197,6 @@ TEST_F(DateFieldTest, roundTrip) {
 // Sorting runs on the raw millis column (chronological order, no decode).
 TEST_F(DateFieldTest, sort) {
   CollectionHelper helper;
-  helper.clear();
 
   helper.index(flatdoc("id_s", "a", "when_dt", "2020-03-15T00:00:00Z"), UpdateMessage::NO_COMMIT);
   helper.index(flatdoc("id_s", "b", "when_dt", "1995-01-01T00:00:00Z"), UpdateMessage::COMMIT);
@@ -224,7 +221,6 @@ TEST_F(DateFieldTest, sort) {
 // back exactly its own values.
 TEST_F(DateFieldTest, multiStringPartialFailureNoCorruption) {
   CollectionHelper helper;
-  helper.clear();
 
   int64_t y2001 = *parseDateToEpochMillis("2001-01-01");
   int64_t y2003 = *parseDateToEpochMillis("2003-03-03");
@@ -287,7 +283,6 @@ TEST_F(DateFieldTest, parseGranularityWindows) {
 // Equality and range endpoints round by the literal's granularity end-to-end.
 TEST_F(DateFieldTest, queryGranularity) {
   CollectionHelper helper;
-  helper.clear();
   helper.index(flatdoc("id", "d1", "when_dt", "2024-06-25T08:00:00Z"), UpdateMessage::NO_COMMIT);
   helper.index(flatdoc("id", "d2", "when_dt", "2024-06-25T18:30:00Z"), UpdateMessage::NO_COMMIT);
   helper.index(flatdoc("id", "d3", "when_dt", "2024-06-26T00:00:00Z"), UpdateMessage::COMMIT);
@@ -332,7 +327,6 @@ TEST_F(DateFieldTest, queryGranularity) {
 // vector value): the doc is reported in errors, peers index normally.
 TEST_F(DateFieldTest, badDateMarksDocFailed) {
   CollectionHelper helper;
-  helper.clear();
 
   std::vector<Doc> docs = {
     flatdoc("id", "g1", "when_dt", "2020-01-01T00:00:00Z"),

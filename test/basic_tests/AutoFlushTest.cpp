@@ -41,7 +41,6 @@ struct CapGuard {
 // would share one updateVersion and the earlier one could not be superseded.
 TEST_F(AutoFlushTest, singleMessageKeptWholeAndOverwritesResolve) {
   CollectionHelper helper;
-  helper.clear();
   CapGuard capGuard(helper.getIndexWriter());
   helper.getIndexWriter()->perInverterMaxDocs = 5;  // tiny cap: a split, if it happened, would be visible
 
@@ -72,7 +71,6 @@ TEST_F(AutoFlushTest, singleMessageKeptWholeAndOverwritesResolve) {
 // so a run of small messages produces multiple bounded segments.
 TEST_F(AutoFlushTest, accumulationAcrossMessagesFlushesAtBoundaries) {
   CollectionHelper helper;
-  helper.clear();
   CapGuard capGuard(helper.getIndexWriter());
   helper.getIndexWriter()->perInverterMaxDocs = 5;
 

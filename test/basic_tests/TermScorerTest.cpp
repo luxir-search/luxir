@@ -203,7 +203,6 @@ std::vector<TopDocsCollector::ScoreDoc> sortedCollectorDocs(TopDocsCollector& co
 }
 
 void addPhraseDeferralDocs(CollectionHelper& helper, int32_t nDocs, int32_t filterStep) {
-  helper.clear();
   std::vector<Doc> docs;
   docs.reserve((size_t) nDocs);
   for (int32_t doc = 0; doc < nDocs; doc++) {
@@ -434,7 +433,6 @@ TermImpactTopKRun runSingleTermFrontierTopK(IndexReader& reader, int32_t topK,
 void addMaxScoreDisjunctionDocs(CollectionHelper& helper) {
   const int32_t segDocs = kMaxScoreDisjunctionSegDocs;
   const int32_t segCount = 3;
-  helper.clear();
 
   for (int32_t seg = 0; seg < segCount; seg++) {
     std::vector<Doc> docs;
@@ -1790,7 +1788,6 @@ void addBulkFillTermDoc(TestField& f, int32_t doc, bool a, bool b, bool c) {
 }
 
 void addBulkTieDisjunctionDocs(CollectionHelper& helper) {
-  helper.clear();
   for (int32_t seg = 0; seg < 2; seg++) {
     std::vector<Doc> docs;
     docs.reserve(32);
@@ -1819,7 +1816,6 @@ void addCrossSegmentAccumulatorDocs(CollectionHelper& helper, std::vector<std::v
     6 * Postings::DOCS_BLOCK_SIZE + 31,
     4 * Postings::DOCS_BLOCK_SIZE + 19
   };
-  helper.clear();
   idsBySeg.clear();
   idsBySeg.resize((size_t) segCount);
 
@@ -1913,7 +1909,6 @@ std::vector<float> localResultScores(LocalReq& req, std::string_view opName = "q
 
 void addWandMsmDocs(CollectionHelper& helper) {
   const int32_t nDocs = 8 * Postings::DOCS_BLOCK_SIZE + 73;
-  helper.clear();
   std::vector<Doc> docs;
   docs.reserve((size_t) nDocs);
 
@@ -2054,7 +2049,6 @@ void assertSameMsmMatches(std::span<const TopDocsCollector::ScoreDoc> expected,
 // clauses (the failure mode the 5-clause tests do not reach).
 void addManyTermMsmDocs(CollectionHelper& helper, int32_t numTerms) {
   const int32_t nDocs = 6 * Postings::DOCS_BLOCK_SIZE + 51;
-  helper.clear();
   std::vector<Doc> docs;
   docs.reserve((size_t) nDocs);
   for (int32_t doc = 0; doc < nDocs; doc++) {
@@ -2613,7 +2607,6 @@ TEST_F(TermScorerTest, phraseConjunctionDefersPositionChecks) {
   EXPECT_LT(measured.matchCalls * 4, rawPhraseChecks);
   assertSameTopKExact(baseline, measured);
 
-  helper.clear();
 }
 
 
@@ -3735,7 +3728,6 @@ TEST_F(TermScorerTest, mandOptBulkMatchesPullAcrossClauseCountsFiltersAndDeletes
   }
   EXPECT_GT(bulkWindows, 0);
   EXPECT_GT(bulkSweeps, 0);
-  helper.clear();
 }
 
 TEST_F(TermScorerTest, mandOptBulkZeroAndOneSurvivingOptionalScorers) {
@@ -4055,7 +4047,6 @@ TEST_F(TermScorerTest, mandOptBulkPreparedSourcesCanRouteToBulk) {
   ASSERT_NE(supplier, nullptr);
   auto* bulk = supplier->bulkScorer(pool);
   EXPECT_NE(dynamic_cast<BooleanQuery::MandOptBulkScorer*>(bulk), nullptr);
-  helper.clear();
 }
 
 TEST_F(TermScorerTest, disjunctionBoundsAreFiniteConservativeAndRefinable) {
@@ -5807,7 +5798,6 @@ TEST_F(TermScorerTest, bulkCountDomainDisjunctionDomainDriveMatchesPull) {
     auto actual = builder.build();
     expectDocSetEqual(actual.get(), expected.domain.get(), segment.maxDoc());
   }
-  helper.clear();
 }
 
 TEST_F(TermScorerTest, bulkCountDomainConjunctionDenseAndSparseMatchPull) {
@@ -5927,7 +5917,6 @@ TEST_F(TermScorerTest, bulkTopKWithBuilderPinsThetaAndMatchesPullDomain) {
   EXPECT_EQ(bulkCollector.totalHits(), pullCollector.totalHits());
   assertTopKEquivalent(sortedCollectorDocs(pullCollector), sortedCollectorDocs(bulkCollector));
   expectDocSetEqual(bulkDomainSet.get(), pullDomainSet.get(), segment.maxDoc());
-  helper.clear();
 }
 
 TEST_F(TermScorerTest, queryPrepMaterializeBulkDomainMatchesPull) {
@@ -6062,7 +6051,6 @@ TEST_F(TermScorerTest, maxScoreDisjunctionTopKMatchesExhaustive) {
       EXPECT_EQ(actual.nonEssentialLookups, 0);
     }
   }
-  helper.clear();
 }
 
 TEST_F(TermScorerTest, windowedMaxScoreDisjunctionTopKMatchesExhaustiveAndGlobal) {
@@ -6086,7 +6074,6 @@ TEST_F(TermScorerTest, windowedMaxScoreDisjunctionTopKMatchesExhaustiveAndGlobal
       EXPECT_EQ(windowed.nonEssentialLookups, 0);
     }
   }
-  helper.clear();
 }
 
 TEST_F(TermScorerTest, CompetitiveScoreThresholdSeededMatchesReference) {
@@ -6177,7 +6164,6 @@ TEST_F(TermScorerTest, MaxScoreBulkScorerWindowedTopKMatchesBaseline) {
     assertSameTopKDocs(exhaustive, bulk, k);
     assertSameTopKDocs(baseline, bulk, k);
   }
-  helper.clear();
 }
 
 TEST_F(TermScorerTest, MaxScoreBulkScorerSharedAccumulatorMatchesBaseline) {
@@ -6194,7 +6180,6 @@ TEST_F(TermScorerTest, MaxScoreBulkScorerSharedAccumulatorMatchesBaseline) {
   assertSameTopKDocs(exhaustive, bulk, k);
   assertSameTopKDocs(baseline, bulk, k);
   ASSERT_GT(accumulator.get(), std::numeric_limits<float>::lowest());
-  helper.clear();
 }
 
 TEST_F(TermScorerTest, MaxScoreBulkScorerBufferSweepsMatchExhaustiveAcrossShapes) {
@@ -6221,7 +6206,6 @@ TEST_F(TermScorerTest, MaxScoreBulkScorerBufferSweepsMatchExhaustiveAcrossShapes
 
   EXPECT_GT(sweepWindows, 0);
   EXPECT_GT(compactionDrops, 0);
-  helper.clear();
 }
 
 TEST_F(TermScorerTest, MaxScoreBulkScorerWindowDispatchMatchesDisabledAcrossRandomizedUnions) {
@@ -6517,7 +6501,6 @@ TEST_F(TermScorerTest, ScoredWordProbeApplyToCandidatesMatchesPerDocAdvanceAcros
       EXPECT_GT(actual.scoredWordProbes, 0);
     }
   }
-  helper.clear();
 }
 
 // fillScoreBlock is count-driven: a call that stops on count (not upTo) must
@@ -6546,7 +6529,6 @@ TEST_F(TermScorerTest, FillScoreBlockCountLimitedCallsResumeOnBothFillPaths) {
     EXPECT_EQ(actual.docs.front(), start);
     EXPECT_EQ(actual.docs.back(), postings.back());
   }
-  helper.clear();
 }
 
 TEST_F(TermScorerTest, ScoredWordProbeRankAndEarlyCompactionKeepsCursorCoherent) {
@@ -6604,7 +6586,6 @@ TEST_F(TermScorerTest, ScoredWordProbeRankAndEarlyCompactionKeepsCursorCoherent)
   }
   auto oracle = collectTermPerDoc(*reader, "rank_probe", postings[1], upTo);
   expectFillRunNear(oracle, filled);
-  helper.clear();
 }
 
 TEST_F(TermScorerTest, ScoredWordProbeSweepThenEssentialFillAcrossWindowBoundaryMatchesOracle) {
@@ -6652,7 +6633,6 @@ TEST_F(TermScorerTest, ScoredWordProbeSweepThenEssentialFillAcrossWindowBoundary
 
   auto oracle = collectTermPerDoc(*reader, "flip_probe", windowStart, upTo);
   expectFillRunNear(oracle, filled);
-  helper.clear();
 }
 
 TEST_F(TermScorerTest, ScoredWordProbeSkipStatsSeparateFromPackedFallback) {
@@ -6685,7 +6665,6 @@ TEST_F(TermScorerTest, ScoredWordProbeSkipStatsSeparateFromPackedFallback) {
                                              candidates, false, true);
     expectCandidateSweepEqual(expected, actual);
     EXPECT_EQ(actual.scoredWordProbes, 0);
-    helper.clear();
   }
 }
 
@@ -6694,7 +6673,6 @@ TEST_F(TermScorerTest, MaxScoreBulkScorerSingleEssentialDirectFillMatchesFiltere
   const int32_t windowStart = DocsEnum::L1_DOCS;
   const int32_t windowEnd = 2 * DocsEnum::L1_DOCS;
   const int32_t nDocs = windowEnd + 31;
-  helper.clear();
   std::vector<Doc> docs;
   docs.reserve((size_t) nDocs);
   for (int32_t doc = 0; doc < nDocs; doc++) {
@@ -6744,7 +6722,6 @@ TEST_F(TermScorerTest, MaxScoreBulkScorerSingleEssentialDirectFillMatchesFiltere
     EXPECT_EQ(std::bit_cast<uint32_t>(unfiltered.scores[i]),
               std::bit_cast<uint32_t>(filtered.scores[i])) << "i=" << i;
   }
-  helper.clear();
 }
 
 TEST_F(TermScorerTest, MaxScoreBulkScorerRequiredPromotionMakesHighThetaTwoClauseConjunction) {
@@ -6752,7 +6729,6 @@ TEST_F(TermScorerTest, MaxScoreBulkScorerRequiredPromotionMakesHighThetaTwoClaus
   const int32_t windowStart = DocsEnum::L1_DOCS;
   const int32_t windowEnd = 2 * DocsEnum::L1_DOCS;
   const int32_t nDocs = windowEnd + 31;
-  helper.clear();
   std::vector<Doc> docs;
   docs.reserve((size_t) nDocs);
   for (int32_t doc = 0; doc < nDocs; doc++) {
@@ -6821,7 +6797,6 @@ TEST_F(TermScorerTest, MaxScoreBulkScorerRequiredPromotionMakesHighThetaTwoClaus
   auto& countSegment = countContext.topReader.segments()[0];
   EXPECT_EQ(countBulkTermDisjunctionSegment(countPool, countContext, countSegment, terms, nullptr),
             countPullTermDisjunctionSegment(countPool, countContext, countSegment, terms, nullptr));
-  helper.clear();
 }
 
 TEST_F(TermScorerTest, MaxScoreBulkScorerBufferSweepsRespectFiltersAndDeletes) {
@@ -6848,7 +6823,6 @@ TEST_F(TermScorerTest, MaxScoreBulkScorerBufferSweepsRespectFiltersAndDeletes) {
     EXPECT_GT(SkipStats::maxScoreSweepWindows, 0) << "arrayDocSet=" << arrayDocSet;
     assertSameTopKDocs(expected, actual, 40);
   }
-  helper.clear();
 }
 
 TEST_F(TermScorerTest, MaxScoreBulkScorerBs1BitsetFilterMatchesPull) {
@@ -6864,7 +6838,6 @@ TEST_F(TermScorerTest, MaxScoreBulkScorerBs1BitsetFilterMatchesPull) {
   auto bulk = runDenseFilteredBulkTopK(*reader, numTerms, topK);
   ASSERT_GT(bulk.bs1Windows, 0);
   assertSameTopKDocs(pull, bulk, topK);
-  helper.clear();
 }
 
 TEST_F(TermScorerTest, MaxScoreBulkScorerSelectiveDomainDriveMatchesStream) {
@@ -6889,7 +6862,6 @@ TEST_F(TermScorerTest, MaxScoreBulkScorerSelectiveDomainDriveMatchesStream) {
     assertSameTopKDocs(stream, drive, topK);
     assertSameTopKDocs(pull, drive, topK);
   }
-  helper.clear();
 }
 
 TEST_F(TermScorerTest, MaxScoreBulkScorerFilteredDeletedTopKMatchesPull) {
@@ -6909,7 +6881,6 @@ TEST_F(TermScorerTest, MaxScoreBulkScorerFilteredDeletedTopKMatchesPull) {
   BulkDomainDriveGuard guard(true);
   auto bulk = runDenseFilteredBulkTopK(*reader, numTerms, topK, 3, false);
   assertSameTopKDocs(pull, bulk, topK);
-  helper.clear();
 }
 
 TEST_F(TermScorerTest, MaxScoreBulkScorerTiesMatchExhaustive) {
@@ -6922,7 +6893,6 @@ TEST_F(TermScorerTest, MaxScoreBulkScorerTiesMatchExhaustive) {
   auto expected = runExhaustiveTermDisjunctionTopK(*reader, terms, k);
   auto bulk = runBulkTermDisjunctionTopK(*reader, terms, k, false, nullptr);
   assertSameTopKDocs(expected, bulk, k);
-  helper.clear();
 }
 
 TEST_F(TermScorerTest, WandMinShouldMatchTopKMatchesExhaustive) {
@@ -6948,7 +6918,6 @@ TEST_F(TermScorerTest, WandMinShouldMatchTopKMatchesExhaustive) {
       }
     }
   }
-  helper.clear();
 }
 
 TEST_F(TermScorerTest, WandManyClauseMsmMatchesExhaustive) {
@@ -6968,7 +6937,6 @@ TEST_F(TermScorerTest, WandManyClauseMsmMatchesExhaustive) {
       }
     }
   }
-  helper.clear();
 }
 
 TEST_F(TermScorerTest, MaxScoreAccumulatorConcurrentMax) {
@@ -7031,7 +6999,6 @@ TEST_F(TermScorerTest, CrossSegmentAccumulatorRealOpMatchesExhaustive) {
     EXPECT_EQ(ids[i], idsBySeg[seg][doc]) << "i=" << i;
     EXPECT_FLOAT_EQ(scores[i], expected.topDocs[i].score) << "i=" << i;
   }
-  helper.clear();
 }
 
 TEST_F(TermScorerTest, CrossSegmentAccumulatorPropagatesThresholdSequential) {
@@ -7063,7 +7030,6 @@ TEST_F(TermScorerTest, CrossSegmentAccumulatorPropagatesThresholdSequential) {
   actual.topDocs = sortedCollectorDocs(merged);
   auto expected = runCrossSegmentTermTopK(*reader, k, false);
   assertSameTopKDocs(expected, actual, k);
-  helper.clear();
 }
 
 // Regression for the 1f bug: impact block skipping under-counts the total hit count

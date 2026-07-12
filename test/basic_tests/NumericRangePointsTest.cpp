@@ -153,7 +153,6 @@ class NumericRangePointsTest : public SoluxTest {};
 TEST_F(NumericRangePointsTest, randomizedOracleAcrossScorerAndBulkPaths) {
   constexpr int32_t N = 2600;
   CollectionHelper helper;
-  helper.clear();
   const RangeField fields[] = {{"point_single"}, {"point_multi", true}};
   setRangeSchema(helper, fields);
 
@@ -202,7 +201,6 @@ TEST_F(NumericRangePointsTest, randomizedOracleAcrossScorerAndBulkPaths) {
 TEST_F(NumericRangePointsTest, bitsetLeavesMatchEveryQueryArm) {
   constexpr int32_t N = 1400;
   CollectionHelper helper;
-  helper.clear();
   const RangeField fields[] = {{"bitset_point"}};
   setRangeSchema(helper, fields);
 
@@ -257,7 +255,6 @@ TEST_F(NumericRangePointsTest, bitsetLeavesMatchEveryQueryArm) {
 TEST_F(NumericRangePointsTest, allSelectionArmsAreReachable) {
   constexpr int32_t N = 33'000;
   CollectionHelper helper;
-  helper.clear();
   const RangeField fields[] = {{"arm_sorted"}, {"arm_shuffled"}};
   setRangeSchema(helper, fields);
 
@@ -343,7 +340,6 @@ TEST_F(NumericRangePointsTest, allSelectionArmsAreReachable) {
 TEST_F(NumericRangePointsTest, optionalComplementAndMultiLeafDedup) {
   constexpr int32_t N = 1300;
   CollectionHelper helper;
-  helper.clear();
   const RangeField fields[] = {{"optional_point"}, {"multi_leaf", true}};
   setRangeSchema(helper, fields);
 
@@ -386,7 +382,6 @@ TEST_F(NumericRangePointsTest, optionalComplementAndMultiLeafDedup) {
 TEST_F(NumericRangePointsTest, fanoutCostAndArrayBitsetBoundary) {
   constexpr int32_t N = 16;
   CollectionHelper helper;
-  helper.clear();
   const RangeField fields[] = {{"fanout", true}};
   setRangeSchema(helper, fields);
 
@@ -429,7 +424,6 @@ TEST_F(NumericRangePointsTest, fanoutCostAndArrayBitsetBoundary) {
 TEST_F(NumericRangePointsTest, exactCountDuplicatesAndBulkDomain) {
   constexpr int32_t N = 1200;
   CollectionHelper helper;
-  helper.clear();
   const RangeField fields[] = {{"duplicate_endpoint"}, {"domain_point"}};
   setRangeSchema(helper, fields);
 
@@ -476,7 +470,6 @@ TEST_F(NumericRangePointsTest, exactCountDuplicatesAndBulkDomain) {
 TEST_F(NumericRangePointsTest, arrayPathDedupsMultiValuedDuplicates) {
   constexpr int32_t N = 1400;
   CollectionHelper helper;
-  helper.clear();
   const RangeField fields[] = {{"dup_multi", true}};
   setRangeSchema(helper, fields);
 
@@ -515,7 +508,6 @@ TEST_F(NumericRangePointsTest, arrayPathDedupsMultiValuedDuplicates) {
 TEST_F(NumericRangePointsTest, boundaryInsideGcdStepAndRawLeaf) {
   constexpr int32_t N = 200;
   CollectionHelper helper;
-  helper.clear();
   const RangeField fields[] = {{"even_point"}, {"wide_point"}};
   setRangeSchema(helper, fields);
 
@@ -564,7 +556,6 @@ TEST_F(NumericRangePointsTest, boundaryInsideGcdStepAndRawLeaf) {
 TEST_F(NumericRangePointsTest, mergedSegmentRetainsPoints) {
   constexpr int32_t DOCS_PER_SEGMENT = 350;
   CollectionHelper helper;
-  helper.clear();
   const RangeField fields[] = {{"merged_range"}};
   setRangeSchema(helper, fields);
   auto writer = helper.getIndexWriter();
@@ -597,7 +588,6 @@ TEST_F(NumericRangePointsTest, mergedSegmentRetainsPoints) {
 
 TEST_F(NumericRangePointsTest, mergedPointsMatchFreshRebuild) {
   CollectionHelper helper;
-  helper.clear();
   auto writer = helper.getIndexWriter();
 
   std::vector<Doc> source1 = {

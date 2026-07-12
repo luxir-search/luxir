@@ -29,7 +29,6 @@ protected:
 
 TEST_F(MissingValuesTest, intLadder) {
   CollectionHelper helper;
-  helper.clear();
 
   // all values positive -> 0 is free
   helper.index(flatdoc("id_s", "a", "num_i", 5), UpdateMessage::NO_COMMIT);
@@ -87,7 +86,6 @@ TEST_F(MissingValuesTest, intLadder) {
 
 TEST_F(MissingValuesTest, doubleCollisions) {
   CollectionHelper helper;
-  helper.clear();
 
   // lowest() is a real value (the old fixed sentinel); -0.0 occupies the
   // zero slot so 0.0 can't be the filler either.
@@ -110,7 +108,6 @@ TEST_F(MissingValuesTest, doubleCollisions) {
 
 TEST_F(MissingValuesTest, floatZeroPreferred) {
   CollectionHelper helper;
-  helper.clear();
 
   helper.index(flatdoc("id_s", "a", "p_f", 1.5f), UpdateMessage::NO_COMMIT);
   helper.index(flatdoc("id_s", "b"), UpdateMessage::COMMIT);
@@ -125,7 +122,6 @@ TEST_F(MissingValuesTest, floatZeroPreferred) {
 
 TEST_F(MissingValuesTest, stringEmptyCollision) {
   CollectionHelper helper;
-  helper.clear();
 
   // A real empty-string value: the "" filler would conflate it with the
   // missing doc, so the filler becomes a string above every batch value.
@@ -146,7 +142,6 @@ TEST_F(MissingValuesTest, stringEmptyCollision) {
 
 TEST_F(MissingValuesTest, stringDenseDefault) {
   CollectionHelper helper;
-  helper.clear();
 
   // No empty strings in the batch: filler stays the default "".
   helper.index(flatdoc("id_s", "a", "tag_sc", "x"), UpdateMessage::NO_COMMIT);

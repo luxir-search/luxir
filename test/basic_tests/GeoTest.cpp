@@ -249,7 +249,6 @@ class GeoBoxQueryTest : public SoluxTest {};
 
 TEST_F(GeoBoxQueryTest, publicWireIngestAndProtoQueryRoundTrip) {
   CollectionHelper helper;
-  helper.clear();
   setGeoSchema(helper);
 
   CollectionHelper::UpdateBuilder update;
@@ -330,7 +329,6 @@ TEST_F(GeoBoxQueryTest, publicWireIngestAndProtoQueryRoundTrip) {
 
 TEST_F(GeoBoxQueryTest, publicWireRejectsBadPointsWithoutCorruptingLaterDocs) {
   CollectionHelper helper;
-  helper.clear();
   setGeoSchema(helper);
 
   CollectionHelper::UpdateBuilder update;
@@ -377,7 +375,6 @@ TEST_F(GeoBoxQueryTest, publicWireRejectsBadPointsWithoutCorruptingLaterDocs) {
 TEST_F(GeoBoxQueryTest, randomizedQuantizedOracleSingleAndMulti) {
   constexpr int32_t N = 700;
   CollectionHelper helper;
-  helper.clear();
   setGeoSchema(helper);
 
   std::vector<std::vector<QuantizedPoint>> single(N);
@@ -525,7 +522,6 @@ TEST_F(GeoBoxQueryTest, rejectsInvalidBoxesAndTreatsUnrepresentableEdgesAsEmpty)
 
 TEST_F(GeoBoxQueryTest, scanFallbackWithoutPointsUsesDenseColumnPath) {
   CollectionHelper helper;
-  helper.clear();
   setGeoSchema(helper, false);
   auto writer = helper.getIndexWriter();
   Inverter& inverter = writer->obtainInverter();
@@ -554,7 +550,6 @@ TEST_F(GeoBoxQueryTest, scanFallbackWithoutPointsUsesDenseColumnPath) {
 
 TEST_F(GeoBoxQueryTest, mergeRebuildsSingleAndMultiBKDWithDeletes) {
   CollectionHelper helper;
-  helper.clear();
   setGeoSchema(helper);
   auto writer = helper.getIndexWriter();
 

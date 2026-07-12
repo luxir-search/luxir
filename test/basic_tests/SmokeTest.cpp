@@ -81,7 +81,6 @@ TEST_F(SmokeTest, ConvertDocAllArmsRoundTrip) {
 // Full data path: index (sync) -> commit -> search via fluent builder -> non-owning response.
 TEST_F(SmokeTest, IndexSearchRoundTrip) {
   CollectionHelper helper;
-  helper.clear();
 
   helper.index(flatdoc("id", std::string("1"), "foo_w", "how now brown cow",
                        "foo_i", (int64_t)17, "color_s", "red", "colors_ss", vecs("red", "green")),
@@ -149,7 +148,6 @@ TEST_F(SmokeTest, IndexSearchRoundTrip) {
 // fires the callback.
 TEST_F(SmokeTest, AsyncIndex) {
   CollectionHelper helper;
-  helper.clear();
 
   Blocker blocker;
   bool ok = false;

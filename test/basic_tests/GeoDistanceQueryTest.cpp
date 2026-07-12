@@ -397,7 +397,6 @@ TEST_F(GeoDistanceQueryTest, bkdScanAndColumnOraclesAcrossCorpora) {
 
 TEST_F(GeoDistanceQueryTest, scanFallbackAndCountGating) {
   CollectionHelper helper;
-  helper.clear();
   setGeoSchema(helper, false);
   auto writer = helper.getIndexWriter();
   Inverter& inverter = writer->obtainInverter();
@@ -421,7 +420,6 @@ TEST_F(GeoDistanceQueryTest, scanFallbackAndCountGating) {
 
 TEST_F(GeoDistanceQueryTest, countRejectsDeletedSegment) {
   CollectionHelper helper;
-  helper.clear();
   setGeoSchema(helper);
   auto writer = helper.getIndexWriter();
   Inverter& inverter = writer->obtainInverter();

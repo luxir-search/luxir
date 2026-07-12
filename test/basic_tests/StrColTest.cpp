@@ -705,7 +705,6 @@ TEST_F(StrColTest, mergeNonIndexedStrCol) {
 
 TEST_F(StrColTest, BasicMultiValuedColumnStoredStrings) {
   CollectionHelper helper;
-  helper.clear();
   
   // Add documents with multi-valued column-stored-only string fields
   {
@@ -778,7 +777,6 @@ TEST_F(StrColTest, BasicMultiValuedColumnStoredStrings) {
 
 TEST_F(StrColTest, EmptyAndMissingValues) {
   CollectionHelper helper;
-  helper.clear();
   
   // Document with empty array
   {
@@ -845,7 +843,6 @@ TEST_F(StrColTest, EmptyAndMissingValues) {
 TEST_F(StrColTest, MultiValuedFixedSizeOptimization) {
   // Test that multi-valued fields with uniform block sizes use fixed-size optimization
   CollectionHelper helper;
-  helper.clear();
   
   // Add documents with multi-valued fields where all values are the same size (5 chars).
   // This exercises the fixed-size path where no endOffsetReader is needed; the per-doc
@@ -928,7 +925,6 @@ TEST_F(StrColTest, DocValuesManyValuesPerDoc) {
   constexpr int N = 300;
 
   CollectionHelper helper;
-  helper.clear();
 
   // Variable-size: every value has a different length (1..N).
   std::vector<std::string> varValues;

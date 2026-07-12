@@ -247,7 +247,6 @@ TEST_F(FacetTest, ensureRepUpgradesAndPreservesCounts) {
 
 TEST_F(FacetTest, emptyIndex) {
   CollectionHelper helper;
-  helper.clear();
   
   // Test all field types that support faceting
   struct FieldTypeTest {
@@ -323,7 +322,6 @@ TEST_F(FacetTest, emptyIndex) {
 
 TEST_F(FacetTest, pointsRangeFacetMatchesColumnWalk) {
   CollectionHelper helper;
-  helper.clear();
   const std::array fields = {
     RangeSchemaField{"range_is", true, true},
     RangeSchemaField{"extreme_is", true, true}
@@ -395,7 +393,6 @@ TEST_F(FacetTest, pointsRangeFacetMatchesColumnWalk) {
   EXPECT_EQ(0, walkArms);
   EXPECT_EQ(pointsResults, walkResults);
   // Later tests (TermScorerTest) index into "main" without clearing first.
-  helper.clear();
 }
 
 TEST_F(FacetTest, pointsRangeFacetFallbacks) {
@@ -420,7 +417,6 @@ TEST_F(FacetTest, pointsRangeFacetFallbacks) {
 
   {
     CollectionHelper helper;
-    helper.clear();
     indexDocs(helper);
     ASSERT_TRUE(helper.deleteById("b", UpdateMessage::COMMIT).success);
     SkipStats::reset();
@@ -468,13 +464,11 @@ TEST_F(FacetTest, pointsRangeFacetFallbacks) {
     };
     const std::array<int64_t, 2> counts = {1, 1};
     expectRangeResult(rootFacetResult(*req, "f"), bounds, counts, 1);
-    helper.clear();
   }
 }
 
 TEST_F(FacetTest, emptyIndexNestedFacet) {
   CollectionHelper helper;
-  helper.clear();
 
   auto req = localReq(soluxNode->getSearchEngine());
   req->collection("main");
@@ -502,7 +496,6 @@ TEST_F(FacetTest, emptyIndexNestedFacet) {
 
 TEST_F(FacetTest, singleSegment) {
   CollectionHelper helper;
-  helper.clear();
   
   // Add some documents with integer and string fields using dynamic field naming
   std::vector<std::string> colors = {"red", "blue", "green", "red", "blue"};
@@ -577,7 +570,6 @@ TEST_F(FacetTest, singleSegment) {
 
 TEST_F(FacetTest, multipleSegments) {
   CollectionHelper helper;
-  helper.clear();
   
   // Add documents and commit multiple times to create multiple segments
   for (int seg = 0; seg < 3; seg++) {
@@ -612,7 +604,6 @@ TEST_F(FacetTest, multipleSegments) {
 
 TEST_F(FacetTest, fullTextFacetSegmentMissingField) {
   CollectionHelper helper;
-  helper.clear();
 
   helper.index(flatdoc("id", "a", "body_w", "alpha beta"), UpdateMessage::NO_COMMIT);
   helper.index(flatdoc("id", "b", "body_w", "alpha"), UpdateMessage::COMMIT);
@@ -646,7 +637,6 @@ TEST_F(FacetTest, fullTextFacetSegmentMissingField) {
 
 TEST_F(FacetTest, fullTextFacetNestedSparseArrayDomain) {
   CollectionHelper helper;
-  helper.clear();
 
   for (int i = 0; i < 100; i++) {
     std::string id = std::to_string(i);
@@ -694,7 +684,6 @@ TEST_F(FacetTest, fullTextFacetNestedSparseArrayDomain) {
 
 TEST_F(FacetTest, vectorOptimization) {
   CollectionHelper helper;
-  helper.clear();
   
   // Add documents with a small range of values to trigger vector optimization
   for (int i = 0; i < 100; i++) {
@@ -733,7 +722,6 @@ TEST_F(FacetTest, vectorOptimization) {
 // which inlines via a different branch and so masks regressions in this one.
 TEST_F(FacetTest, sortBySubOp) {
   CollectionHelper helper;
-  helper.clear();
   // 2 segments.  Per-category foo_i avg differs from per-category count so that
   // an avg-ascending sort produces a different bucket order than count-desc.
   //   a: count 3, avg 100
@@ -926,7 +914,6 @@ TEST_F(FacetTest, sortByMinSubOpWithEmptyBucket) {
 
 TEST_F(FacetTest, limitMinusOneInlinesMultipleAvgSubOps) {
   CollectionHelper helper;
-  helper.clear();
 
   const int totalDocs = 6000;
   auto categoryName = [](int i) {
@@ -984,7 +971,6 @@ TEST_F(FacetTest, limitMinusOneInlinesMultipleAvgSubOps) {
 
 TEST_F(FacetTest, unsupportedFacetOptionsRejected) {
   CollectionHelper helper;
-  helper.clear();
   helper.index(flatdoc("cat_s", "a", "foo_i", 1, "body_w", "alpha"), UpdateMessage::NO_COMMIT);
   helper.index(flatdoc("cat_s", "b", "foo_i", 2, "body_w", "beta"), UpdateMessage::COMMIT);
 
@@ -1049,7 +1035,6 @@ TEST_F(FacetTest, unsupportedFacetOptionsRejected) {
 // called doneCollecting() and dropped the nested facet/avg.
 TEST_F(FacetTest, emptyIndexForcePrepareNestedOps) {
   CollectionHelper helper;
-  helper.clear();
 
   auto req = localReq(soluxNode->getSearchEngine());
   req->testForcePrepare = true;  // wraps the root: force_prepare(all)
@@ -1080,7 +1065,6 @@ TEST_F(FacetTest, emptyIndexForcePrepareNestedOps) {
 
 TEST_F(FacetTest, stringFacetMincountZeroShowsAllValues) {
   CollectionHelper helper;
-  helper.clear();
   const int aDocs = 700;
   std::vector<Doc> docs;
   for (int i = 0; i < aDocs; i++) {
@@ -1117,7 +1101,6 @@ TEST_F(FacetTest, stringFacetMincountZeroShowsAllValues) {
 
 TEST_F(FacetTest, stringFacetMincountZeroPadsZerosByValue) {
   CollectionHelper helper;
-  helper.clear();
   helper.index(flatdoc("id", "1", "cat_s", "x", "sel_s", "yes"), UpdateMessage::NO_COMMIT);
   helper.index(flatdoc("id", "2", "cat_s", "x", "sel_s", "yes"), UpdateMessage::NO_COMMIT);
   helper.index(flatdoc("id", "3", "cat_s", "y", "sel_s", "no"), UpdateMessage::NO_COMMIT);
@@ -1151,7 +1134,6 @@ TEST_F(FacetTest, stringFacetMincountZeroPadsZerosByValue) {
 
 TEST_F(FacetTest, stringFacetMincountZeroPadsToFiniteLimit) {
   CollectionHelper helper;
-  helper.clear();
   helper.index(flatdoc("id", "1", "cat_s", "a", "sel_s", "yes"), UpdateMessage::NO_COMMIT);
   helper.index(flatdoc("id", "2", "cat_s", "a", "sel_s", "yes"), UpdateMessage::NO_COMMIT);
   helper.index(flatdoc("id", "3", "cat_s", "b", "sel_s", "yes"), UpdateMessage::NO_COMMIT);
@@ -1189,7 +1171,6 @@ TEST_F(FacetTest, stringFacetMincountZeroPadsToFiniteLimit) {
 
 TEST_F(FacetTest, fullTextFacetMincountZeroShowsOutOfDomainTerms) {
   CollectionHelper helper;
-  helper.clear();
   helper.index(flatdoc("id", "1", "sel_s", "yes", "body_w", "alpha beta"), UpdateMessage::NO_COMMIT);
   helper.index(flatdoc("id", "2", "sel_s", "yes", "body_w", "alpha"), UpdateMessage::NO_COMMIT);
   helper.index(flatdoc("id", "3", "sel_s", "no", "body_w", "gamma"), UpdateMessage::NO_COMMIT);
@@ -1227,7 +1208,6 @@ TEST_F(FacetTest, fullTextFacetMincountZeroShowsOutOfDomainTerms) {
 // Locks in correct sparse-domain handling after dropping the BitDocSet C-cast.
 TEST_F(FacetTest, avgNestedSparseArrayDomain) {
   CollectionHelper helper;
-  helper.clear();
   for (int i = 0; i < 100; i++) {
     std::string id = std::to_string(i);
     if (i == 5) {
@@ -1265,7 +1245,6 @@ TEST_F(FacetTest, avgNestedSparseArrayDomain) {
 // Pre-fix, missing was only counted when the whole segment lacked the field.
 TEST_F(FacetTest, fullTextFacetMixedPresenceMissing) {
   CollectionHelper helper;
-  helper.clear();
   // single segment, mixed presence: 2 docs with body_w, 2 without.
   helper.index(flatdoc("id", "1", "body_w", "alpha beta"), UpdateMessage::NO_COMMIT);
   helper.index(flatdoc("id", "2", "body_w", "alpha"), UpdateMessage::NO_COMMIT);
@@ -1305,7 +1284,6 @@ TEST_F(FacetTest, fullTextFacetMixedPresenceMissing) {
 // excluded from both the buckets and the have-field count.
 TEST_F(FacetTest, fullTextFacetSparseDomainMissing) {
   CollectionHelper helper;
-  helper.clear();
   for (int i = 0; i < 100; i++) {
     std::string id = std::to_string(i);
     if (i == 5) {
@@ -1358,7 +1336,6 @@ TEST_F(FacetTest, fullTextFacetSparseDomainMissing) {
 // different avgval so a domain leak is obvious.
 TEST_F(FacetTest, facetAvgRespectsSelectiveDomain) {
   CollectionHelper helper;
-  helper.clear();
   helper.index(flatdoc("id", "A", "cat_s", "x", "sel_s", "yes", "avgval_i", 10), UpdateMessage::NO_COMMIT);
   helper.index(flatdoc("id", "B", "cat_s", "x", "sel_s", "no",  "avgval_i", 1000), UpdateMessage::NO_COMMIT);
   helper.index(flatdoc("id", "C", "cat_s", "y", "sel_s", "yes", "avgval_i", 20), UpdateMessage::NO_COMMIT);
@@ -1404,7 +1381,6 @@ TEST_F(FacetTest, facetAvgRespectsSelectiveDomain) {
 // (== all-docs) domain when the field/value is absent in a segment.
 TEST_F(FacetTest, facetAvgFieldAbsentInSegment) {
   CollectionHelper helper;
-  helper.clear();
   // seg1 has cat_s; seg2 has NO cat_s at all (only avgval).
   helper.index(flatdoc("id", "A", "cat_s", "x", "sel_s", "yes", "avgval_i", 10), UpdateMessage::NO_COMMIT);
   helper.index(flatdoc("id", "B", "cat_s", "x", "sel_s", "yes", "avgval_i", 20), UpdateMessage::COMMIT);
@@ -1436,7 +1412,7 @@ TEST_F(FacetTest, facetAvgFieldAbsentInSegment) {
 // Nested facet: a string facet under a string facet, returning a per-parent-
 // bucket sub-facet (ops[name].arr.v[i].facet parallel to bucket_ids).
 TEST_F(FacetTest, nestedStringFacet) {
-  CollectionHelper helper; helper.clear();
+  CollectionHelper helper;
   helper.index(flatdoc("id", "1", "cat_s", "x", "sub_s", "p"), UpdateMessage::NO_COMMIT);
   helper.index(flatdoc("id", "2", "cat_s", "x", "sub_s", "q"), UpdateMessage::NO_COMMIT);
   helper.index(flatdoc("id", "3", "cat_s", "y", "sub_s", "p"), UpdateMessage::COMMIT);

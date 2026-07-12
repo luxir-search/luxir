@@ -27,14 +27,12 @@ protected:
   CollectionHelper helper{"main"};
 
   void SetUp() override {
-    helper.clear();
     server.emplace(*SoluxTest::soluxNode, 2 /*threads*/, 0 /*OS-assigned port*/);
     server->start();
   }
 
   void TearDown() override {
     if (server) server->shutdown();
-    helper.clear();
   }
 
   int port() { return server->getPort(); }

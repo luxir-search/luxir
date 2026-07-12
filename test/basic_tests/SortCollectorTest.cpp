@@ -174,7 +174,6 @@ TEST_F(SortCollectorTest, scoreTieBreakEdgeCases) {
 TEST_F(SortCollectorTest, smallEdge) {
   // Hit edge cases by manually collecting and merging
   CollectionHelper helper;
-  helper.clear();
 
   // Add documents with different prices
   helper.index(flatdoc("id_s", "doc1", "price_i", 50, "rating_i", 5), UpdateMessage::NO_COMMIT);
@@ -274,7 +273,6 @@ TEST_F(SortCollectorTest, randomSmall) {
   // Hit edge cases by manually collecting and merging
   int32_t iterations = 100;
   CollectionHelper helper;
-  helper.clear();
 
   // Create a mock IntFieldType for testing
   IntFieldType priceType("price_i");
@@ -387,7 +385,6 @@ TEST_F(SortCollectorTest, randomSmall) {
 
 TEST_F(SortCollectorTest, SortByStringField) {
   CollectionHelper helper;
-  helper.clear();
 
   // Add documents with string values that will sort alphabetically
   helper.index(flatdoc("id_s", "doc1", "name_s", "charlie"), UpdateMessage::NO_COMMIT);
@@ -463,7 +460,6 @@ TEST_F(SortCollectorTest, SortByStringField) {
 
 TEST_F(SortCollectorTest, SortByPriceAscending) {
   CollectionHelper helper;
-  helper.clear();
 
   // Add documents with different prices - also add zero-padded string prices
   helper.index(flatdoc("id_s", "doc1", "price_i", 100, "price_s", "00100", "rating_i", 5), UpdateMessage::NO_COMMIT);
@@ -538,7 +534,6 @@ TEST_F(SortCollectorTest, SortByPriceAscending) {
 
 TEST_F(SortCollectorTest, SortByMultipleFields) {
   CollectionHelper helper;
-  helper.clear();
 
   // Add documents with different ratings and prices
   helper.index(flatdoc("id_s", "doc1", "price_i", 100, "rating_i", 5), UpdateMessage::NO_COMMIT);
@@ -589,7 +584,6 @@ TEST_F(SortCollectorTest, SortByMultipleFields) {
 
 TEST_F(SortCollectorTest, SortByPriceDescending) {
   CollectionHelper helper;
-  helper.clear();
 
   // Add documents
   helper.index(flatdoc("id_s", "doc1", "price_i", 100), UpdateMessage::NO_COMMIT);
@@ -621,7 +615,6 @@ TEST_F(SortCollectorTest, SortByPriceDescending) {
 
 TEST_F(SortCollectorTest, SortWithBatchedResponses) {
   CollectionHelper helper;
-  helper.clear();
 
   // Add 10 documents with different prices
   for (int i = 1; i <= 10; i++) {
@@ -685,7 +678,6 @@ TEST_F(SortCollectorTest, SortWithBatchedResponses) {
 
 TEST_F(SortCollectorTest, SortWithMissingValues) {
   CollectionHelper helper;
-  helper.clear();
   
   // Add documents with some missing the sort field
   helper.index(flatdoc("id_s", "doc1", "price_i", 100), UpdateMessage::NO_COMMIT);
@@ -732,7 +724,6 @@ TEST_F(SortCollectorTest, SortWithMissingValues) {
 
 TEST_F(SortCollectorTest, EmptyResults) {
   CollectionHelper helper;
-  helper.clear();
   
   // Add documents but search for non-existent field value
   helper.index(flatdoc("id_s", "doc1", "price_i", 100), UpdateMessage::NO_COMMIT);
@@ -757,7 +748,6 @@ TEST_F(SortCollectorTest, EmptyResults) {
 
 TEST_F(SortCollectorTest, SingleDocument) {
   CollectionHelper helper;
-  helper.clear();
   
   // Add only one document
   helper.index(flatdoc("id_s", "doc1", "price_i", 100), UpdateMessage::COMMIT);
@@ -780,7 +770,6 @@ TEST_F(SortCollectorTest, SingleDocument) {
 
 TEST_F(SortCollectorTest, ResultsExceedingTopCount) {
   CollectionHelper helper;
-  helper.clear();
   
   // Add 20 documents
   for (int i = 1; i <= 20; i++) {
@@ -813,7 +802,6 @@ TEST_F(SortCollectorTest, ResultsExceedingTopCount) {
 
 TEST_F(SortCollectorTest, LimitOne) {
   CollectionHelper helper;
-  helper.clear();
   
   // Add multiple documents
   helper.index(flatdoc("id_s", "doc1", "price_i", 100), UpdateMessage::NO_COMMIT);
@@ -848,7 +836,6 @@ TEST_F(SortCollectorTest, LimitOne) {
 
 TEST_F(SortCollectorTest, DeterministicParallelSort) {
   CollectionHelper helper;
-  helper.clear();
   
   // Create multiple segments to trigger parallel execution
   // First segment
@@ -907,7 +894,6 @@ TEST_F(SortCollectorTest, DeterministicParallelSort) {
 
 TEST_F(SortCollectorTest, SortByNonIndexedStringColumn) {
   CollectionHelper helper;
-  helper.clear();
   
   // Add documents with both indexed string fields (_s) and non-indexed string columns (_sc)
   helper.index(flatdoc("id_s", "doc1", "name_s", "charlie", "description_sc", "third person"), UpdateMessage::NO_COMMIT);
@@ -1010,7 +996,6 @@ TEST_F(SortCollectorTest, SortByNonIndexedStringColumn) {
 
 TEST_F(SortCollectorTest, RandomValuesWithTieBreaking) {
   CollectionHelper helper;
-  helper.clear();
 
   int nSegs = 9;
   int docsPerSeg = 10;

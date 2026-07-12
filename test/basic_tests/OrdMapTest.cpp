@@ -11,7 +11,6 @@ class OrdMapTest : public ::testing::Test {
 protected:
   void SetUp() override {
     helper = std::make_unique<CollectionHelper>();
-    helper->clear();
   }
 
   void TearDown() override {

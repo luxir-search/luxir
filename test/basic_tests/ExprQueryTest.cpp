@@ -19,7 +19,6 @@ public:
   CollectionHelper helper{"main"};
 
   void SetUp() override {
-    helper.clear();
     helper.index(flatdoc("id", "d1", "title_wl", "Blade Runner", "body_wl", "a replicant story",
                          "tag_s", "scifi", "year_i", "1982"),
                  UpdateMessage::NO_COMMIT);
@@ -31,7 +30,6 @@ public:
                  UpdateMessage::COMMIT);
   }
 
-  void TearDown() override { helper.clear(); }
 
   std::vector<Doc> search(std::string_view q,
                           std::function<void(solux::api::Query&)> tweak = {}) {

@@ -75,7 +75,6 @@ TEST_F(SchemaTest, defaultSchema) {
 
 TEST_F(SchemaTest, collectionHelperClearRestoresDefaultSchema) {
   CollectionHelper ch;
-  ch.clear();
 
   std::pmr::monotonic_buffer_resource arena;
   api::SchemaDef def;
@@ -98,7 +97,6 @@ TEST_F(SchemaTest, collectionHelperClearRestoresDefaultSchema) {
 
 TEST_F(SchemaTest, collectionHelperClearSkipsDefaultSchemaReset) {
   CollectionHelper ch;
-  ch.clear();
 
   auto schema = ch.collection().getSchema();
   uint64_t nextGen = ch.collection().schemaGen();
@@ -525,7 +523,6 @@ TEST_F(SchemaTest, roundtrip) {
 
 TEST_F(SchemaTest, indexAndSearchWithExplicitField) {
   CollectionHelper ch;
-  ch.clear();
 
   // Set a custom schema on the collection: "title" as TEXT with whitespace+lowercase
   auto defaultSchema = Schema::createDefaultSchema();
@@ -576,7 +573,6 @@ TEST_F(SchemaTest, indexAndSearchWithExplicitField) {
   EXPECT_EQ(1, req->getMatchCount());
 
   // Clean up
-  ch.clear();
   ch.collection().setSchema(Schema::createDefaultSchema());
 }
 
@@ -764,7 +760,6 @@ TEST_F(SchemaTest, missingFieldClass) {
 
 TEST_F(SchemaTest, schemaPersistence) {
   CollectionHelper ch;
-  ch.clear();
 
   // Set a custom schema with an explicit "title" field
   auto defaultSchema = Schema::createDefaultSchema();
@@ -809,14 +804,12 @@ TEST_F(SchemaTest, schemaPersistence) {
   }
   EXPECT_TRUE(foundTitle) << "Persisted schema should contain 'title' field";
 
-  ch.clear();
   ch.collection().setSchema(Schema::createDefaultSchema());
 }
 
 
 TEST_F(SchemaTest, schemaGenIncrements) {
   CollectionHelper ch;
-  ch.clear();
 
   auto defaultSchema = Schema::createDefaultSchema();
   std::pmr::monotonic_buffer_resource arena;
@@ -851,14 +844,12 @@ TEST_F(SchemaTest, schemaGenIncrements) {
   auto newFile = ch.collection().getShard()->getDirectory()->openFile(schemaFileName(gen2));
   EXPECT_NE(nullptr, newFile.get()) << "New schema file should exist";
 
-  ch.clear();
   ch.collection().setSchema(Schema::createDefaultSchema());
 }
 
 
 TEST_F(SchemaTest, schemaGenWrittenToIndexInfo) {
   CollectionHelper ch;
-  ch.clear();
 
   // Set a custom schema
   auto defaultSchema = Schema::createDefaultSchema();
@@ -896,14 +887,12 @@ TEST_F(SchemaTest, schemaGenWrittenToIndexInfo) {
   ASSERT_GT(indexInfo.segments.size(), 0u);
   EXPECT_EQ(expectedGen, indexInfo.segments[0].schema_gen) << "SegmentInfo should have schema_gen";
 
-  ch.clear();
   ch.collection().setSchema(Schema::createDefaultSchema());
 }
 
 
 TEST_F(SchemaTest, schemaLoadOnRestart) {
   CollectionHelper ch;
-  ch.clear();
 
   // Set a custom schema with "title" field
   auto defaultSchema = Schema::createDefaultSchema();
@@ -941,7 +930,6 @@ TEST_F(SchemaTest, schemaLoadOnRestart) {
   EXPECT_NE(nullptr, loadedSchema->getFieldTypePtr("id"));
   EXPECT_NE(nullptr, loadedSchema->getFieldTypePtr("title_s"));
 
-  ch.clear();
   ch.collection().setSchema(Schema::createDefaultSchema());
 }
 
@@ -991,7 +979,6 @@ TEST_F(SchemaTest, loadSchemaAfterOldFileDeleted) {
   // Without the retry logic, this test fails because the only schema file
   // is manually deleted before calling loadSchema().
   CollectionHelper ch;
-  ch.clear();
 
   auto baseSchema = Schema::createDefaultSchema();
   std::pmr::monotonic_buffer_resource arena;
@@ -1036,6 +1023,5 @@ TEST_F(SchemaTest, loadSchemaAfterOldFileDeleted) {
   EXPECT_NE(nullptr, loadedSchema->getFieldTypePtr("field3"))
     << "Loaded schema should contain 'field3' from the newest schema";
 
-  ch.clear();
   ch.collection().setSchema(Schema::createDefaultSchema());
 }

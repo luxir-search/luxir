@@ -382,7 +382,6 @@ public:
   CollectionHelper helper;
 
   FuzzyQueryE2ETest() {
-    helper.clear();
     helper.index(flatdoc("id", "d1", "body_w", "apple", "color_s", "red"),
                  UpdateMessage::NO_COMMIT);
     helper.index(flatdoc("id", "d2", "body_w", "apply", "color_s", "reddish"),
@@ -470,7 +469,6 @@ static std::string twoEditVariant(int32_t idx) {
 
 TEST_F(FuzzyQueryTest, exactOutranksRareOneAndTwoEditVariants) {
   CollectionHelper helper{"main"};
-  helper.clear();
   for (int32_t i = 0; i < 16; i++) {
     helper.index(flatdoc("id", "exact" + std::to_string(i),
                          "body_w", "apple pad"), UpdateMessage::NO_COMMIT);
@@ -505,12 +503,10 @@ TEST_F(FuzzyQueryTest, exactOutranksRareOneAndTwoEditVariants) {
   EXPECT_LT(firstExact, twoTypo);
   EXPECT_GT(scores[firstExact], scores[oneTypo]);
   EXPECT_GT(scores[firstExact], scores[twoTypo]);
-  helper.clear();
 }
 
 TEST_F(FuzzyQueryTest, unsetMaxExpansionsDefaultsToFifty) {
   CollectionHelper helper{"main"};
-  helper.clear();
   for (int32_t i = 0; i < 60; i++) {
     std::string term = "aaaaa";
     int32_t pos = 1 + i / 25;
@@ -538,12 +534,10 @@ TEST_F(FuzzyQueryTest, unsetMaxExpansionsDefaultsToFifty) {
   req2->execute();
   ASSERT_TRUE(req2->ok()) << req2->errorMsg();
   EXPECT_EQ(60u, req2->getDocs().size());
-  helper.clear();
 }
 
 TEST_F(FuzzyQueryTest, scoringClauseBudgetWarnsPastK) {
   CollectionHelper helper{"main"};
-  helper.clear();
   constexpr int32_t kMatches = FuzzyQuery::FUZZY_CLAUSE_BUDGET + 1;
   for (int32_t i = 0; i < kMatches; i++) {
     std::string term = "aaaaa";
@@ -572,12 +566,10 @@ TEST_F(FuzzyQueryTest, scoringClauseBudgetWarnsPastK) {
   }
   EXPECT_NE(message.find("matched 65 terms"), std::string::npos) << message;
   EXPECT_NE(message.find("top 64"), std::string::npos) << message;
-  helper.clear();
 }
 
 TEST_F(FuzzyQueryTest, scoredFuzzyTopKMatchesBruteForceWithPruningEngaged) {
   CollectionHelper helper{"main"};
-  helper.clear();
 
   std::vector<Doc> docs;
   docs.reserve((size_t)(8 + 3 + 5 * 384));
@@ -620,12 +612,10 @@ TEST_F(FuzzyQueryTest, scoredFuzzyTopKMatchesBruteForceWithPruningEngaged) {
   EXPECT_LT(pruned.maxScoreVisited, bruteForce.maxScoreVisited);
   EXPECT_GT(pruned.maxSplit, 0);
   EXPECT_GT(pruned.nonEssentialLookups, 0);
-  helper.clear();
 }
 
 TEST_F(FuzzyQueryTest, boostedFuzzyTopKMatchesBruteForceWithPruningEngaged) {
   CollectionHelper helper{"main"};
-  helper.clear();
 
   std::vector<Doc> docs;
   docs.reserve((size_t)(5 + 3 * 256 + 3));
@@ -658,12 +648,10 @@ TEST_F(FuzzyQueryTest, boostedFuzzyTopKMatchesBruteForceWithPruningEngaged) {
   expectSameTopDocs(bruteForce, pruned);
   EXPECT_GT(bruteForce.clauseBoundsChecked, 0);
   EXPECT_LT(pruned.visited, bruteForce.visited);
-  helper.clear();
 }
 
 TEST_F(FuzzyQueryTest, operatorExpansionClampWarns) {
   CollectionHelper helper{"main"};
-  helper.clear();
   constexpr int32_t kDocs = 10005;
   for (int32_t i = 0; i < kDocs; i++) {
     helper.index(flatdoc("id", "d" + std::to_string(i), "body_w", twoEditVariant(i)),
@@ -679,5 +667,4 @@ TEST_F(FuzzyQueryTest, operatorExpansionClampWarns) {
   req->execute();
   ASSERT_TRUE(req->ok()) << req->errorMsg();
   EXPECT_TRUE(req->hasWarning("fuzzy_clamped"));
-  helper.clear();
 }

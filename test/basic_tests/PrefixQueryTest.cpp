@@ -140,7 +140,6 @@ public:
   CollectionHelper helper;
 
   PrefixQueryE2ETest() {
-    helper.clear();
     helper.index(flatdoc("id", "d1", "body_w", "apple apricot", "color_s", "red"),
                  UpdateMessage::NO_COMMIT);
     helper.index(flatdoc("id", "d2", "body_w", "banana", "color_s", "reddish"),

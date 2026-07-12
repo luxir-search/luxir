@@ -31,7 +31,6 @@ public:
 
 TEST_F(SearchEngineTest, statsOpsEmptyIndexEmitNan) {
   CollectionHelper helper;
-  helper.clear();
 
   auto req = localReq(soluxNode->getSearchEngine());
   req->collection("main");
@@ -104,7 +103,6 @@ TEST_F(SearchEngineTest, minMaxOps) {
 // top-K collector (which used to assert topCount > 0 / build a zero-capacity heap).
 TEST_F(SearchEngineTest, limitZeroCountsWithoutDocs) {
   CollectionHelper helper;
-  helper.clear();
   helper.index(flatdoc("foo_w", "brown cow", "foo_i", 17, "color_s", "red"), UpdateMessage::NO_COMMIT);
   helper.index(flatdoc("foo_w", "charlie brown", "foo_i", 23, "color_s", "blue"), UpdateMessage::NO_COMMIT);
   helper.index(flatdoc("foo_w", "brown", "foo_i", 5, "color_s", "brown"), UpdateMessage::COMMIT);
@@ -156,7 +154,6 @@ TEST_F(SearchEngineTest, limitZeroCountsWithoutDocs) {
 
 TEST_F(SearchEngineTest, singleTermLimitZeroFacetUsesBulkDomain) {
   CollectionHelper helper;
-  helper.clear();
   std::vector<Doc> docs;
   docs.reserve(256);
   for (int32_t i = 0; i < 256; i++) {
@@ -187,14 +184,12 @@ TEST_F(SearchEngineTest, singleTermLimitZeroFacetUsesBulkDomain) {
   EXPECT_GT(SkipStats::bulkDomainWindowsFed, 0);
 
   SkipStats::enabled = savedStats;
-  helper.clear();
 }
 
 TEST_F(SearchEngineTest, basic) {
   bool para = true;
 
   CollectionHelper helper;
-  helper.clear();
   helper.index(flatdoc("foo_w","how now brown cow", "foo_i", 17, "color_s","red", "colors_ss", "red", "prices_is", vec_i(20, 35, 45)),UpdateMessage::COMMIT);
   helper.index(flatdoc("foo_w","charlie brown", "foo_i", 23, "color_s","blue", "prices_is", 35),UpdateMessage::NO_COMMIT);
   helper.index(flatdoc("foo_w","brown", "foo_i", 5, "color_s","brown", "colors_ss",vecs("red","black")),UpdateMessage::COMMIT);
@@ -489,7 +484,6 @@ TEST_F(SearchEngineTest, basic) {
 
 TEST_F(SearchEngineTest, forcePrepareWrapperMatchesChild) {
   CollectionHelper helper;
-  helper.clear();
   helper.index(flatdoc("foo_w", "how now brown cow", "foo_i", 17, "color_s", "red"), UpdateMessage::COMMIT);
   helper.index(flatdoc("foo_w", "charlie brown", "foo_i", 23, "color_s", "blue"), UpdateMessage::NO_COMMIT);
   helper.index(flatdoc("foo_w", "brown", "foo_i", 5, "color_s", "brown"), UpdateMessage::COMMIT);
@@ -556,7 +550,6 @@ TEST_F(SearchEngineTest, forcePrepareWrapperMatchesChild) {
 
 TEST_F(SearchEngineTest, constantScoreWrapperSetsScore) {
   CollectionHelper helper;
-  helper.clear();
   helper.index(flatdoc("foo_w", "how now brown cow", "foo_i", 17, "color_s", "red"), UpdateMessage::COMMIT);
   helper.index(flatdoc("foo_w", "charlie brown", "foo_i", 23, "color_s", "blue"), UpdateMessage::NO_COMMIT);
   helper.index(flatdoc("foo_w", "brown", "foo_i", 5, "color_s", "brown"), UpdateMessage::COMMIT);
@@ -612,7 +605,6 @@ TEST_F(SearchEngineTest, constantScoreWrapperSetsScore) {
 // debug/warning addressing, URL overlays, and Domain include/exclude references.
 TEST_F(SearchEngineTest, opAndFilterNameCharset) {
   CollectionHelper helper;
-  helper.clear();
   helper.index(flatdoc("foo_w", "hello"), UpdateMessage::COMMIT);
 
   {  // unusual but legal name

@@ -20,7 +20,6 @@ public:
   MemPool pool;
 
   ScorerCostTest() {
-    helper.clear();
     helper.index(flatdoc("id", "d0", "body_w", "a b c"), UpdateMessage::NO_COMMIT);
     helper.index(flatdoc("id", "d1", "body_w", "a b"), UpdateMessage::NO_COMMIT);
     helper.index(flatdoc("id", "d2", "body_w", "a"), UpdateMessage::NO_COMMIT);

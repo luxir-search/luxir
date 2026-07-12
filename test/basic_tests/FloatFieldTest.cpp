@@ -75,7 +75,6 @@ TEST_F(FloatFieldTest, sortableEncoding) {
 
 TEST_F(FloatFieldTest, roundTrip) {
   CollectionHelper helper;
-  helper.clear();
 
   // multi-valued float input goes in as vector<double> (vector<float> is
   // reserved for dense VECTOR fields); values come back as vector<float>.
@@ -108,7 +107,6 @@ TEST_F(FloatFieldTest, roundTrip) {
 // where a raw IEEE-bits encoding would order wrong.
 TEST_F(FloatFieldTest, sortFloat) {
   CollectionHelper helper;
-  helper.clear();
 
   helper.index(flatdoc("id_s", "a", "price_f", 2.0f), UpdateMessage::NO_COMMIT);
   helper.index(flatdoc("id_s", "b", "price_f", -3.5f), UpdateMessage::COMMIT);
@@ -140,7 +138,6 @@ TEST_F(FloatFieldTest, sortFloat) {
 
 TEST_F(FloatFieldTest, sortDouble) {
   CollectionHelper helper;
-  helper.clear();
 
   helper.index(flatdoc("id_s", "a", "weight_d", -1e300), UpdateMessage::NO_COMMIT);
   helper.index(flatdoc("id_s", "b", "weight_d", 1e-300), UpdateMessage::COMMIT);
@@ -164,7 +161,6 @@ TEST_F(FloatFieldTest, sortDouble) {
 // the non-inline path - not by the bucket's doc count.
 TEST_F(FloatFieldTest, avgFacetInline) {
   CollectionHelper helper;
-  helper.clear();
 
   helper.index(flatdoc("id_s", "a", "color_s", "red", "vals_ds", vec(1.0, 3.0), "nums_is", vec_i(10, 20)),
                UpdateMessage::NO_COMMIT);
@@ -206,7 +202,6 @@ TEST_F(FloatFieldTest, avgFacetInline) {
 // values is meaningless even though their order is correct.
 TEST_F(FloatFieldTest, avg) {
   CollectionHelper helper;
-  helper.clear();
 
   helper.index(flatdoc("id_s", "a", "price_f", 1.0f, "weight_d", -1.5), UpdateMessage::NO_COMMIT);
   helper.index(flatdoc("id_s", "b", "price_f", 2.0f, "weight_d", 2.5), UpdateMessage::COMMIT);

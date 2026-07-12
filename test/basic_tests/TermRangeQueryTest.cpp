@@ -96,7 +96,6 @@ public:
   CollectionHelper helper;
 
   TermRangeE2ETest() {
-    helper.clear();
     helper.index(flatdoc("id", "d1", "tag_s", "action", "title_wl", "Alpha"),
                  UpdateMessage::NO_COMMIT);
     helper.index(flatdoc("id", "d2", "tag_s", "drama", "title_wl", "Mike"),

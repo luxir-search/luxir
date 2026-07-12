@@ -20,7 +20,6 @@ public:
   CollectionHelper helper{"main"};
 
   void SetUp() override {
-    helper.clear();
     helper.index(flatdoc("id", "d1", "title_wl", "Blade Runner",
                          "body_wl", "a replicant story", "tag_s", "scifi"),
                  UpdateMessage::NO_COMMIT);
@@ -32,7 +31,6 @@ public:
                  UpdateMessage::COMMIT);
   }
 
-  void TearDown() override { helper.clear(); }
 
   // run q over the given fields; returns doc ids (empty on error)
   std::vector<Doc> search(std::string_view q, std::initializer_list<std::string> fields,
