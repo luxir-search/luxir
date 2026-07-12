@@ -1939,6 +1939,15 @@ void IndexWriter::mergeSegments() {
 
 
 /// TEST CODE (called from tests)
+bool IndexWriter::testIsEmpty() {
+  const std::lock_guard<std::mutex> lock(indexMutex);
+  return segInfos.empty()
+         && segmentsToDelete.empty()
+         && idleInverters.empty()
+         && busyInverters.empty()
+         && flushingInverters.empty();
+}
+
 void IndexWriter::testDeleteAllData() {
   INDEX_DEBUG("testDeleteAllData: deleting all data.");
   // wait for things in the execution graph to finish.

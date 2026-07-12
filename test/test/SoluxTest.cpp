@@ -4,8 +4,11 @@
 #include <cstdlib>
 #include <cstring>
 #include <new>
+#include <typeinfo>
 #include "SoluxTest.h"
 #include "GrpcSoluxTest.h"
+#include "solux/index/IndexWriter.h"
+#include "solux/schema/Schema.h"
 #include "solux/solux_main.h"
 #include "solux/SoluxConfig.h"
 #include "benchmark/benchmark.h"
@@ -55,6 +58,47 @@ GRPCServer* GrpcSoluxTest::server = nullptr;
 std::thread GrpcSoluxTest::serverThread;
 std::shared_ptr<grpc::Channel> GrpcSoluxTest::channel = nullptr;
 bool GrpcSoluxTest::serverStartFailed = false;
+bool unit_tests = true;
+
+static bool fieldTypesEqual(const FieldType& lhs, const FieldType& rhs) {
+  if (lhs.type_ != rhs.type_
+      || lhs.name_ != rhs.name_
+      || lhs.flags_ != rhs.flags_
+      || lhs.storedResource_ != rhs.storedResource_) {
+    return false;
+  }
+  if (auto* l = dynamic_cast<const TextFieldType*>(&lhs)) {
+    auto* r = dynamic_cast<const TextFieldType*>(&rhs);
+    return r != nullptr && l->tokenizer_ == r->tokenizer_ && l->filters_ == r->filters_;
+  }
+  if (auto* l = dynamic_cast<const VectorFieldType*>(&lhs)) {
+    auto* r = dynamic_cast<const VectorFieldType*>(&rhs);
+    return r != nullptr
+           && l->dims_ == r->dims_
+           && l->metric_ == r->metric_
+           && l->normalized_ == r->normalized_
+           && l->normalizeOnWrite_ == r->normalizeOnWrite_;
+  }
+  if (auto* l = dynamic_cast<const StoredFieldType*>(&lhs)) {
+    auto* r = dynamic_cast<const StoredFieldType*>(&rhs);
+    return r != nullptr
+           && l->codec_ == r->codec_
+           && l->chunkTargetUncompressed_ == r->chunkTargetUncompressed_
+           && l->maxDocsPerChunk_ == r->maxDocsPerChunk_;
+  }
+  return typeid(lhs) == typeid(rhs);
+}
+
+bool SoluxTest::isDefaultSchema(const std::shared_ptr<Schema>& schema) {
+  if (schema == nullptr) return false;
+  static const std::shared_ptr<Schema> defaultSchema = Schema::createDefaultSchema();
+  if (schema->fieldTypeMap.size() != defaultSchema->fieldTypeMap.size()) return false;
+  for (const auto& [name, defaultField] : defaultSchema->fieldTypeMap) {
+    auto it = schema->fieldTypeMap.find(name);
+    if (it == schema->fieldTypeMap.end() || !fieldTypesEqual(*it->second, *defaultField)) return false;
+  }
+  return true;
+}
 
 void SoluxTest::clearCollection(std::string_view collectionName) {
   try {
@@ -67,6 +111,7 @@ void SoluxTest::clearCollection(std::string_view collectionName) {
 class SoluxTestListener : public testing::EmptyTestEventListener {
   uint64_t suiteHash;
   uint64_t rng_seed;
+  std::string previousTest;
 
   void OnTestSuiteStart(const testing::TestSuite &suite) override {
     // std::cout << "STARTING SUITE " << suite.name() << std::endl;
@@ -76,7 +121,28 @@ class SoluxTestListener : public testing::EmptyTestEventListener {
 
   void OnTestStart(const testing::TestInfo &test_info) override {
     // std::cout << "STARTING TEST " << test_info.name() << std::endl;
-    solux::Signal::clear(); // clear all listeners before each test
+    // Listeners must be purged before forcing leftover graph work to completion.
+    solux::Signal::clear();
+    if (solux::unit_tests) {
+      try {
+        auto collection = SoluxTest::soluxNode->getCollection("main");
+        auto writer = collection->getShard()->getIndexWriter();
+        // An async update still queued from the previous test can be invisible here. This is the same
+        // exposure tests have today and is not worth an updateGraph.wait_for_all() on every clean check.
+        bool dirty = !writer->testIsEmpty() || !SoluxTest::isDefaultSchema(collection->getSchema());
+        if (dirty) {
+          writer->testDeleteAllData();
+          if (!SoluxTest::isDefaultSchema(collection->getSchema())) {
+            collection->setSchema(Schema::createDefaultSchema());
+          }
+          std::cout << "collection 'main' left dirty by "
+                    << (previousTest.empty() ? "<unknown>" : previousTest)
+                    << "; reset before " << test_info.test_suite_name() << "." << test_info.name()
+                    << std::endl;
+        }
+      } catch (const CollectionResolutionError&) {
+      }
+    }
     auto testnameHash = Hash::hash(test_info.name(), strlen(test_info.name()));
     rng_seed = (suiteHash << 32) +
                testnameHash;  // these are currently 32 bit hashes (from Hash::hash) so combine by shifting.
@@ -85,7 +151,7 @@ class SoluxTestListener : public testing::EmptyTestEventListener {
   }
 
   void OnTestEnd(const testing::TestInfo &test_info) override {
-    unused(test_info);
+    previousTest = std::string(test_info.test_suite_name()) + "." + test_info.name();
     // std::cout << "ENDING TEST " << test_info.name() << std::endl;
     assert(MemPool::sanityCheck());
   }
@@ -110,7 +176,6 @@ public:
   }
 };
 
-bool unit_tests = true;
 } // end namespace
 
 // global argc/argv

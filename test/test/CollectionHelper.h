@@ -8,7 +8,6 @@
 #include "solux/api/build.h"
 #include "LocalReq.h"
 #include <memory_resource>
-#include <typeinfo>
 
 #include "solux/util/thread.h"
 
@@ -38,46 +37,6 @@ struct IndexResult {
 class CollectionHelper {
 private:
   std::shared_ptr<Collection> collection_;
-
-  static bool fieldTypesEqual(const FieldType& lhs, const FieldType& rhs) {
-    if (lhs.type_ != rhs.type_
-        || lhs.name_ != rhs.name_
-        || lhs.flags_ != rhs.flags_
-        || lhs.storedResource_ != rhs.storedResource_) {
-      return false;
-    }
-    if (auto* l = dynamic_cast<const TextFieldType*>(&lhs)) {
-      auto* r = dynamic_cast<const TextFieldType*>(&rhs);
-      return r != nullptr && l->tokenizer_ == r->tokenizer_ && l->filters_ == r->filters_;
-    }
-    if (auto* l = dynamic_cast<const VectorFieldType*>(&lhs)) {
-      auto* r = dynamic_cast<const VectorFieldType*>(&rhs);
-      return r != nullptr
-             && l->dims_ == r->dims_
-             && l->metric_ == r->metric_
-             && l->normalized_ == r->normalized_
-             && l->normalizeOnWrite_ == r->normalizeOnWrite_;
-    }
-    if (auto* l = dynamic_cast<const StoredFieldType*>(&lhs)) {
-      auto* r = dynamic_cast<const StoredFieldType*>(&rhs);
-      return r != nullptr
-             && l->codec_ == r->codec_
-             && l->chunkTargetUncompressed_ == r->chunkTargetUncompressed_
-             && l->maxDocsPerChunk_ == r->maxDocsPerChunk_;
-    }
-    return typeid(lhs) == typeid(rhs);
-  }
-
-  static bool isDefaultSchema(const std::shared_ptr<Schema>& schema) {
-    if (schema == nullptr) return false;
-    static const std::shared_ptr<Schema> defaultSchema = Schema::createDefaultSchema();
-    if (schema->fieldTypeMap.size() != defaultSchema->fieldTypeMap.size()) return false;
-    for (const auto& [name, defaultField] : defaultSchema->fieldTypeMap) {
-      auto it = schema->fieldTypeMap.find(name);
-      if (it == schema->fieldTypeMap.end() || !fieldTypesEqual(*it->second, *defaultField)) return false;
-    }
-    return true;
-  }
 
   // Extract owning copies of the (non-owning) response into the result; called from done(),
   // where the message (and its response arena) are still alive.
@@ -333,7 +292,7 @@ public:
   void clear() {
     auto writer = collection().getShard()->getIndexWriter();
     writer->testDeleteAllData();
-    if (!isDefaultSchema(collection().getSchema())) {
+    if (!SoluxTest::isDefaultSchema(collection().getSchema())) {
       collection().setSchema(Schema::createDefaultSchema());
     }
   }

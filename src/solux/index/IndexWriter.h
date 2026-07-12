@@ -564,6 +564,9 @@ public:
   // the API and then use that (prob through the merge code since it's the only place segments are removed)
   void testDeleteAllData();
 
+  // Cheap test-only snapshot of committed and buffered index state.
+  bool testIsEmpty();
+
   // Test hook for the rebuild-without-reindex path: remove an overlay entry
   // from one live segment, leaving the segment data untouched.
   bool testDropSegmentOverlay(std::string_view name, size_t segmentOrd);
