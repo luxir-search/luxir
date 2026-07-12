@@ -1611,6 +1611,11 @@ void HttpServer::doAccept() {
       [this](beast::error_code ec, tcp::socket sock) {
         if (ec == net::error::operation_aborted) return;  // shutting down
         if (!ec) {
+          // Small request/response exchanges on a keep-alive connection stall
+          // ~40ms per round trip under Nagle + delayed ACK; disable Nagle like
+          // every HTTP server does.  Best-effort: an ec here is not fatal.
+          beast::error_code nde;
+          sock.set_option(tcp::no_delay(true), nde);
           std::make_shared<HttpSession>(ioc, std::move(sock), node, registry)->run();
         }
         if (acceptor && acceptor->is_open()) doAccept();
