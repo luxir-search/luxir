@@ -29,7 +29,7 @@ void SearchEngine::submitBody(SearchRequest& req) {
       // TODO: notify other tasks about the error?
       try { req.tg->wait(); } catch (...) {}
     }
-    LOG_DEBUG("Search request failed: {}", e.what());
+    LOG_WARN("Search request failed: {}", e.what());
     if (req.lastResponse == nullptr) {
       req.lastResponse = SearchResponse::create(req, true);
     }
