@@ -127,16 +127,23 @@ public:
         addSubs(*facet, facetReq.ops);
         return facet;
       },
-      [&](const solux::api::GenOp& avgOp) -> SearchOp* {
-        if (avgOp.name == "avg" || avgOp.name == "average") {
-          if (avgOp.args.empty()) {
-            throw std::runtime_error("Generic operation 'avg' requires a field argument");
-          }
-          std::string_view avgField = ProtobufQueryParser::getString(avgOp.args[0]);
-          auto& avgFtype = req.schema->getFieldTypeEx(avgField);
-          return solux::arenaCreate<AvgOp>(req.arena, req, name, avgField, avgFtype->type());
+      [&](const solux::api::GenOp& genOp) -> SearchOp* {
+        StatsOp::Kind kind;
+        if (genOp.name == "avg" || genOp.name == "average") {
+          kind = StatsOp::AVG;
+        } else if (genOp.name == "min") {
+          kind = StatsOp::MIN;
+        } else if (genOp.name == "max") {
+          kind = StatsOp::MAX;
+        } else {
+          throw std::runtime_error("Unknown generic operation: " + std::string(genOp.name));
         }
-        throw std::runtime_error("Unknown generic operation: " + std::string(avgOp.name));
+        if (genOp.args.empty()) {
+          throw std::runtime_error("Generic operation '" + std::string(genOp.name) + "' requires a field argument");
+        }
+        std::string_view statsField = ProtobufQueryParser::getString(genOp.args[0]);
+        auto& statsFtype = req.schema->getFieldTypeEx(statsField);
+        return solux::arenaCreate<StatsOp>(req.arena, req, name, statsField, statsFtype->type(), kind);
       },
       [&](std::monostate) -> SearchOp* { throw std::runtime_error("search op oneof not set"); },
     }, searchOp.kind);

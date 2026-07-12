@@ -452,7 +452,7 @@ public:
         if (slot >= 0) {
           // sub-facet: this Val is shared by all parent buckets, so index by
           // slot into a per-bucket array (parallel to the parent bucket_ids),
-          // allocated once at numSlots under the mutex like AvgOp's arr_d.
+          // allocated once at numSlots under the mutex like StatsOp's arr_d.
           auto& arr = oneofMut<solux::api::ArrVal>(val);
           if (arr.v.empty()) build::allocArray(arr.v, numSlots, mr);
         }
@@ -692,7 +692,7 @@ public:
             }
           }
           // Always pass a (possibly empty) bucket domain.  A null domain means
-          // "all docs" to a sub-op (e.g. AvgOp), so when the field or value is
+          // "all docs" to a sub-op (e.g. StatsOp), so when the field or value is
           // absent in this segment the bucket would wrongly absorb every doc in
           // the segment.  The bucket has no docs here, so the domain is empty.
           std::unique_ptr<DocSet> bucketDomain = builder.build();

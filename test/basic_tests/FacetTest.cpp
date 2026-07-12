@@ -801,6 +801,129 @@ TEST_F(FacetTest, sortBySubOp) {
   }
 }
 
+// min/max sub-ops on a string facet across 2 segments, including a bucket
+// whose docs carry no value for the stats field (reports NaN).  Runs both the
+// deferred per-bucket path (finite limit, no sort) and the inline path
+// (limit -1); results must agree.
+TEST_F(FacetTest, minMaxSubOps) {
+  CollectionHelper helper;
+  helper.clear();
+  // 2 segments; bucket 'a' spans both so min/max must merge across segments.
+  //   a: {10, 30, -5} -> min -5, max 30
+  //   b: {7, 7}       -> min 7, max 7
+  //   c: {42}         -> min 42, max 42 (second segment only)
+  //   d: no foo_i     -> NaN
+  helper.index(flatdoc("cat_s", "a", "foo_i", 10), UpdateMessage::NO_COMMIT);
+  helper.index(flatdoc("cat_s", "a", "foo_i", 30), UpdateMessage::NO_COMMIT);
+  helper.index(flatdoc("cat_s", "b", "foo_i", 7), UpdateMessage::NO_COMMIT);
+  helper.index(flatdoc("cat_s", "d", "other_i", 1), UpdateMessage::COMMIT);
+  helper.index(flatdoc("cat_s", "a", "foo_i", -5), UpdateMessage::NO_COMMIT);
+  helper.index(flatdoc("cat_s", "b", "foo_i", 7), UpdateMessage::NO_COMMIT);
+  helper.index(flatdoc("cat_s", "c", "foo_i", 42), UpdateMessage::NO_COMMIT);
+  helper.index(flatdoc("cat_s", "d", "other_i", 1), UpdateMessage::COMMIT);
+
+  // Default count-desc sort with bucket-id tiebreak: a(3), b(2), d(2), c(1).
+  for (int64_t limit : {10, -1}) {  // 10 = deferred sub-op path, -1 = inline path
+    auto req = localReq(soluxNode->getSearchEngine());
+    req->collection("main");
+    req->topDocs().getNumber(true).allQuery();
+    auto& facet = req->facet("f", "cat_s");
+    facet.limit(limit);
+    facet.min("mn", "foo_i");
+    facet.max("mx", "foo_i");
+    req->execute(true);
+
+    ASSERT_EQ(1u, req->responses.size()) << req->toString();
+    const auto* facetResult = req->responses[0]->proto.ops.at("f")->facetResult();
+    ASSERT_NE(facetResult, nullptr);
+    const auto& bucketIds = std::get<solux::api::ColStr>(facetResult->bucket_ids->kind);
+    ASSERT_EQ(4, (int)bucketIds.v.size()) << "limit=" << limit;
+    EXPECT_EQ("a", bucketIds.v[0]);
+    EXPECT_EQ("b", bucketIds.v[1]);
+    EXPECT_EQ("d", bucketIds.v[2]);
+    EXPECT_EQ("c", bucketIds.v[3]);
+    const auto& mn = std::get<solux::api::ArrDouble>(facetResult->ops.at("mn")->kind);
+    const auto& mx = std::get<solux::api::ArrDouble>(facetResult->ops.at("mx")->kind);
+    ASSERT_EQ(4, (int)mn.v.size()) << "limit=" << limit;
+    ASSERT_EQ(4, (int)mx.v.size()) << "limit=" << limit;
+    EXPECT_EQ(-5, mn.v[0]);
+    EXPECT_EQ(30, mx.v[0]);
+    EXPECT_EQ(7, mn.v[1]);
+    EXPECT_EQ(7, mx.v[1]);
+    EXPECT_TRUE(std::isnan(mn.v[2])) << "limit=" << limit;
+    EXPECT_TRUE(std::isnan(mx.v[2])) << "limit=" << limit;
+    EXPECT_EQ(42, mn.v[3]);
+    EXPECT_EQ(42, mx.v[3]);
+  }
+}
+
+// Facet sorted by a min sub-op, with a bucket that has no values for the stats
+// field: empty buckets order below every non-empty bucket (first in ASC, last
+// in DESC) so NaN never reaches the sort comparator.
+TEST_F(FacetTest, sortByMinSubOpWithEmptyBucket) {
+  CollectionHelper helper;
+  helper.clear();
+  //   a: min 100 (count 2)
+  //   b: min 1   (count 1)
+  //   c: min 50  (count 2)
+  //   d: no foo_i (count 2) -> empty
+  helper.index(flatdoc("cat_s", "a", "foo_i", 100), UpdateMessage::NO_COMMIT);
+  helper.index(flatdoc("cat_s", "b", "foo_i", 1), UpdateMessage::NO_COMMIT);
+  helper.index(flatdoc("cat_s", "c", "foo_i", 75), UpdateMessage::COMMIT);
+  helper.index(flatdoc("cat_s", "a", "foo_i", 200), UpdateMessage::NO_COMMIT);
+  helper.index(flatdoc("cat_s", "c", "foo_i", 50), UpdateMessage::NO_COMMIT);
+  helper.index(flatdoc("cat_s", "d", "other_i", 1), UpdateMessage::NO_COMMIT);
+  helper.index(flatdoc("cat_s", "d", "other_i", 1), UpdateMessage::COMMIT);
+
+  auto runFacet = [&](int64_t limit, qb::SortDir dir) {
+    auto req = localReq(soluxNode->getSearchEngine());
+    req->collection("main");
+    req->topDocs().getNumber(true).allQuery();
+    auto& facet = req->facet("f", "cat_s");
+    facet.limit(limit);
+    facet.min("mn", "foo_i");
+    qb::sort(facet, "mn", dir);
+    req->execute(true);
+    return req;
+  };
+
+  // Ascending: the empty bucket first, then b(1), c(50), a(100).
+  {
+    auto req = runFacet(10, qb::ASC);
+    const auto* facet = req->responses[0]->proto.ops.at("f")->facetResult();
+    ASSERT_NE(facet, nullptr);
+    const auto& bucketIds = std::get<solux::api::ColStr>(facet->bucket_ids->kind);
+    ASSERT_EQ(4, (int)bucketIds.v.size());
+    EXPECT_EQ("d", bucketIds.v[0]);
+    EXPECT_EQ("b", bucketIds.v[1]);
+    EXPECT_EQ("c", bucketIds.v[2]);
+    EXPECT_EQ("a", bucketIds.v[3]);
+    const auto& mn = std::get<solux::api::ArrDouble>(facet->ops.at("mn")->kind);
+    ASSERT_EQ(4, (int)mn.v.size());
+    EXPECT_TRUE(std::isnan(mn.v[0]));
+    EXPECT_EQ(1, mn.v[1]);
+    EXPECT_EQ(50, mn.v[2]);
+    EXPECT_EQ(100, mn.v[3]);
+  }
+
+  // Descending with a limit that cuts the (last-sorted) empty bucket off.
+  {
+    auto req = runFacet(3, qb::DESC);
+    const auto* facet = req->responses[0]->proto.ops.at("f")->facetResult();
+    ASSERT_NE(facet, nullptr);
+    const auto& bucketIds = std::get<solux::api::ColStr>(facet->bucket_ids->kind);
+    ASSERT_EQ(3, (int)bucketIds.v.size());
+    EXPECT_EQ("a", bucketIds.v[0]);
+    EXPECT_EQ("c", bucketIds.v[1]);
+    EXPECT_EQ("b", bucketIds.v[2]);
+    const auto& mn = std::get<solux::api::ArrDouble>(facet->ops.at("mn")->kind);
+    ASSERT_EQ(3, (int)mn.v.size());
+    EXPECT_EQ(100, mn.v[0]);
+    EXPECT_EQ(50, mn.v[1]);
+    EXPECT_EQ(1, mn.v[2]);
+  }
+}
+
 TEST_F(FacetTest, limitMinusOneInlinesMultipleAvgSubOps) {
   CollectionHelper helper;
   helper.clear();

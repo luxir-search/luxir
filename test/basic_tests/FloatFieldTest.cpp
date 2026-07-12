@@ -196,9 +196,10 @@ TEST_F(FloatFieldTest, avgFacetInline) {
   ASSERT_DOUBLE_EQ(6.0, std::get<solux::api::ArrDouble>(fr->ops.at("avgd")->kind).v[1]);
 
   // multi-valued int through the same inline path
-  // red: (10+20+30)/3 = 20.0 ; blue has no values -> 0.0
+  // red: (10+20+30)/3 = 20.0 ; blue has no values -> NaN, matching the
+  // non-inline path (rendered as null by the JSON layer)
   ASSERT_DOUBLE_EQ(20.0, std::get<solux::api::ArrDouble>(fr->ops.at("avgi")->kind).v[0]);
-  ASSERT_DOUBLE_EQ(0.0, std::get<solux::api::ArrDouble>(fr->ops.at("avgi")->kind).v[1]);
+  ASSERT_TRUE(std::isnan(std::get<solux::api::ArrDouble>(fr->ops.at("avgi")->kind).v[1]));
 }
 
 // avg must decode the sortable bits before summing - the sum of raw encoded

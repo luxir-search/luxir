@@ -29,18 +29,20 @@ class SearchEngineTest : public SoluxTest {
 public:
 };
 
-TEST_F(SearchEngineTest, avgOpsEmptyIndexEmitNan) {
+TEST_F(SearchEngineTest, statsOpsEmptyIndexEmitNan) {
   CollectionHelper helper;
   helper.clear();
 
   auto req = localReq(soluxNode->getSearchEngine());
   req->collection("main");
-  req->requestId("test_avg_ops_empty_index_emit_nan");
+  req->requestId("test_stats_ops_empty_index_emit_nan");
 
   auto& topDocs = req->topDocs("q").allQuery().getNumber();
   topDocs.avg("nested_avg", "foo_i");
 
   req->avg("root_avg", "foo_i");
+  req->min("root_min", "foo_i");
+  req->max("root_max", "foo_i");
 
   req->execute();
 
@@ -49,12 +51,52 @@ TEST_F(SearchEngineTest, avgOpsEmptyIndexEmitNan) {
   ASSERT_FALSE(hasError(response)) << req->toString();
   ASSERT_TRUE(response.ops.contains("root_avg")) << req->toString();
   EXPECT_TRUE(std::isnan(req->scalar<double>("root_avg")));
+  EXPECT_TRUE(std::isnan(req->scalar<double>("root_min")));
+  EXPECT_TRUE(std::isnan(req->scalar<double>("root_max")));
 
   const auto* docs = req->docList("q");
   ASSERT_NE(docs, nullptr);
   ASSERT_EQ(0, docs->matches.value_or(0));
   ASSERT_TRUE(docs->ops.contains("nested_avg")) << req->toString();
   EXPECT_TRUE(std::isnan(std::get<double>(docs->ops.at("nested_avg")->kind)));
+}
+
+// Root-level min/max across 2 segments over int, float, double, and
+// multi-valued int fields.  Negative values matter: the sortable encodings
+// must keep ordering across the sign, since min/max compare raw encoded bits.
+TEST_F(SearchEngineTest, minMaxOps) {
+  CollectionHelper helper;
+  helper.clear();
+  helper.index(flatdoc("foo_i", -8, "foo_f", -2.5, "foo_d", 3.5,
+                       "prices_is", vec_i(20, 35, 45)), UpdateMessage::COMMIT);
+  helper.index(flatdoc("foo_i", 23, "foo_f", 1.25, "foo_d", -1e100,
+                       "prices_is", 3), UpdateMessage::NO_COMMIT);
+  helper.index(flatdoc("foo_i", 5), UpdateMessage::COMMIT);
+
+  auto req = localReq(soluxNode->getSearchEngine());
+  req->collection("main");
+  req->topDocs("q").allQuery().getNumber();
+  req->min("min_i", "foo_i");
+  req->max("max_i", "foo_i");
+  req->min("min_f", "foo_f");
+  req->max("max_f", "foo_f");
+  req->min("min_d", "foo_d");
+  req->max("max_d", "foo_d");
+  req->min("min_is", "prices_is");
+  req->max("max_is", "prices_is");
+
+  req->execute();
+
+  ASSERT_EQ(1u, req->responses.size()) << req->toString();
+  ASSERT_FALSE(hasError(req->responses[0]->proto)) << req->toString();
+  EXPECT_EQ(-8.0, req->scalar<double>("min_i"));
+  EXPECT_EQ(23.0, req->scalar<double>("max_i"));
+  EXPECT_EQ(-2.5, req->scalar<double>("min_f"));
+  EXPECT_EQ(1.25, req->scalar<double>("max_f"));
+  EXPECT_EQ(-1e100, req->scalar<double>("min_d"));
+  EXPECT_EQ(3.5, req->scalar<double>("max_d"));
+  EXPECT_EQ(3.0, req->scalar<double>("min_is"));
+  EXPECT_EQ(45.0, req->scalar<double>("max_is"));
 }
 
 // limit 0 ("count/aggregate only, no docs") must return an accurate count and any
