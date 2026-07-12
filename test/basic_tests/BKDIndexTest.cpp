@@ -11,6 +11,9 @@
 #include <utility>
 #include <vector>
 
+#include <oneapi/tbb/global_control.h>
+#include <oneapi/tbb/task_arena.h>
+
 #include "solux/index/BKDWriter.h"
 #include "solux/reader/BKDReader.h"
 #include "solux/store/Directory.h"
@@ -62,6 +65,16 @@ void expectRoundTrip(std::span<const Point> points,
     std::sort(actual.begin(), actual.end());
     EXPECT_EQ(expected, actual);
   });
+}
+
+std::vector<char> buildBytes(std::span<const Point> points) {
+  std::vector<char> bytes;
+  withBKD(points, {},
+          [&](const BKDReader&, const BKDWriter::Data&,
+              const InputStream& input) {
+    bytes.assign(input.ptr(0), input.ptr(input.size()));
+  });
+  return bytes;
 }
 
 std::vector<int32_t> intersectDocs(const BKDReader& reader,
@@ -195,6 +208,53 @@ TEST_F(BKDIndexTest, roundTripDistributionsExtremesAndLeafBoundaries) {
     duplicateDocs.push_back({i * 100, -i * 50, i % 9});
   }
   expectRoundTrip(duplicateDocs, 8);
+}
+
+TEST_F(BKDIndexTest, parallelBuildIsByteIdentical) {
+  constexpr int32_t pointCount = 1 << 18;
+  constexpr int32_t sectionSize = pointCount / 3;
+  SplitMix64 rng(0xb7a23f91);
+  std::vector<Point> points;
+  points.reserve(pointCount);
+  for (int32_t i = 0; i < pointCount; i++) {
+    if (i < sectionSize) {
+      points.push_back({(int32_t)rng(), (int32_t)rng(), i});
+    } else if (i < sectionSize * 2) {
+      int32_t duplicate = (i - sectionSize) / 2;
+      points.push_back({(duplicate % 32) * 11, (duplicate % 17) * -19,
+                        sectionSize + duplicate});
+    } else {
+      int32_t cluster = i % 6;
+      points.push_back({cluster * 100000 + (int32_t)(rng() % 65),
+                        cluster * -200000 + (int32_t)(rng() % 49), i});
+    }
+  }
+
+  // A single-worker environment would compare two serial builds and prove
+  // nothing; skip loudly rather than pass vacuously.
+  if (oneapi::tbb::this_task_arena::max_concurrency() < 2) {
+    GTEST_SKIP() << "needs >= 2 TBB workers to exercise the parallel build";
+  }
+
+  std::vector<char> serial;
+  {
+    oneapi::tbb::global_control control(
+        oneapi::tbb::global_control::max_allowed_parallelism, 1);
+    serial = buildBytes(points);
+  }
+  for (int32_t threads : {2, 0}) {  // 0 = the default arena
+    for (int32_t rep = 0; rep < 3; rep++) {
+      std::vector<char> parallel;
+      if (threads == 0) {
+        parallel = buildBytes(points);
+      } else {
+        oneapi::tbb::task_arena arena(threads);
+        arena.execute([&] { parallel = buildBytes(points); });
+      }
+      ASSERT_TRUE(serial == parallel)
+          << "threads=" << threads << " rep=" << rep;
+    }
+  }
 }
 
 TEST_F(BKDIndexTest, derivedTreeShapeAndEverythingTraversal) {
