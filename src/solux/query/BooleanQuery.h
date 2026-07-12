@@ -1710,6 +1710,18 @@ public:
     // bounds passed the threshold check; they skip re-evaluation.  Reset when
     // the threshold rises.
     int32_t competitiveUpTo = -1;
+    // Consecutive competitive (non-skipping) evaluations back off: each
+    // failure extends the certified horizon geometrically, so hopeless bound
+    // checks decay to O(log) per threshold epoch instead of one evaluation
+    // per posting block of the densest clause (a stopword-ish phrase member
+    // otherwise pays impact walks on every block that never prune).  A
+    // successful skip or a threshold rise resets to fine granularity;
+    // instances that have proven able to skip (skipSeen) ramp far more
+    // gently so intermittent skip opportunities survive.  The policy only
+    // changes how often bounds are consulted - admitted ranges are still
+    // fully intersected and verified, so results are exact regardless.
+    int failStreak = 0;
+    bool skipSeen = false;
     int64_t skippedRangeCount = 0;
 
     // Skip past doc-block ranges where the SUM of the scoring clauses' score
@@ -1728,6 +1740,7 @@ public:
           return solux::PostingsReader::END;
         }
         skipCount(SkipStats::conjRangeEvals);
+        int32_t evalStartTarget = target;
         int32_t upTo = solux::PostingsReader::END;
         for (auto* scorer : scorers) {
           upTo = std::min(upTo, scorer->advanceShallow(target));
@@ -1784,10 +1797,31 @@ public:
         }
         if (competitive) {
           competitiveUpTo = upTo;
+          if (failStreak > 0 && upTo < solux::PostingsReader::END - 1) {
+            constexpr int kBackoffShiftCap = 15;
+            int kBackoffInitialShift = skipSeen ? 15 : 3;
+            int shift = failStreak - 1 - kBackoffInitialShift;
+            int64_t span = (int64_t) upTo - (int64_t) evalStartTarget + 1;
+            int64_t extension = shift >= 0
+                ? span << std::min(shift, kBackoffShiftCap)
+                : std::max<int64_t>(1, span >> -shift);
+            int64_t extended = (int64_t) upTo + extension;
+            int64_t maxDoc = (int64_t) solux::PostingsReader::END - 1;
+            int32_t backedOffUpTo = (int32_t) std::min(extended, maxDoc);
+            if (backedOffUpTo > upTo) {
+              competitiveUpTo = backedOffUpTo;
+              skipCount(SkipStats::conjEvalBackoffs);
+            }
+          }
+          if (failStreak <= 15 + 15) {
+            failStreak++;
+          }
           return target;
         }
         skippedRangeCount++;
         skipCount(SkipStats::conjRangeSkips);
+        failStreak = 0;
+        skipSeen = true;
         if (upTo >= solux::PostingsReader::END - 1) {
           return solux::PostingsReader::END;
         }
@@ -1910,6 +1944,9 @@ public:
       // The threshold applies to the conjunction's SUM; children must not see
       // it (a child pruning on its own score alone would drop docs whose sum
       // is competitive).
+      if (minScore > minCompetitiveScore) {
+        failStreak = 0;
+      }
       minCompetitiveScore = minScore;
       competitiveUpTo = -1;  // re-evaluate block ranges under the higher threshold
     }

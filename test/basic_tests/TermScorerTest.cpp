@@ -4958,6 +4958,37 @@ TEST_F(TermScorerTest, blockMaxConjunctionTopKMatchesExhaustive) {
   }
 }
 
+TEST_F(TermScorerTest, conjunctionFailedEvalBackoffEngages) {
+  SkipStatsGuard stats;
+  const int32_t N = 70 * Postings::DOCS_BLOCK_SIZE + 7;
+  TestIndex testIndex;
+  TestField f(testIndex, "body_w");
+  f.startIndexing();
+  for (int32_t doc = 0; doc < N; doc++) {
+    f.add(doc, "backa backb");
+  }
+  testIndex.flush();
+  f.startReading();
+
+  auto poolFree = testIndex.pool.rewindScopeGuard();
+  Query::Context qContext(testIndex.pool, *testIndex.reader);
+  auto& segment = qContext.topReader.segments()[0];
+  TermQuery a("body_w", "backa");
+  TermQuery b("body_w", "backb");
+  std::vector<Query*> mand = {&a, &b};
+  BooleanQuery backoffQ(mand, {}, {}, {});
+  auto* backoffWeight = backoffQ.createWeight(qContext, Query::NEED_SCORES);
+  auto* backoffScorer = dynamic_cast<BooleanQuery::ConjunctionScorer*>(
+      backoffWeight->createScorer(testIndex.pool, segment));
+  ASSERT_NE(backoffScorer, nullptr);
+  backoffScorer->setMinCompetitiveScore(std::numeric_limits<float>::denorm_min());
+  int32_t visited = 0;
+  while (backoffScorer->next() != PostingsReader::END) visited++;
+  EXPECT_EQ(visited, N);
+  EXPECT_EQ(backoffScorer->skippedRanges(), 0);
+  EXPECT_GT(SkipStats::conjEvalBackoffs, 0);
+}
+
 TEST_F(TermScorerTest, negatedTopKMatchesExhaustiveAtBothDepths) {
   const int32_t nDocs = 18 * Postings::DOCS_BLOCK_SIZE + 37;
   CollectionHelper helper("negated_topk_oracle");

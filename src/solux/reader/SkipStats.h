@@ -40,6 +40,9 @@ struct SkipStats {
   // Block-max conjunction: bound evaluations vs ranges actually skipped.
   static inline int64_t conjRangeEvals = 0;
   static inline int64_t conjRangeSkips = 0;
+  // Competitive conjunction evaluations whose certified horizon was extended
+  // by the adaptive geometric back-off.
+  static inline int64_t conjEvalBackoffs = 0;
   static inline int64_t posBlocksSkipped = 0;
   static inline int64_t posBlocksDecoded = 0;
   // Phrase per-candidate outcomes: docs rejected by the pre-position score
@@ -139,6 +142,7 @@ struct SkipStats {
     posSeeks = 0;
     conjRangeEvals = 0;
     conjRangeSkips = 0;
+    conjEvalBackoffs = 0;
     posBlocksSkipped = 0;
     posBlocksDecoded = 0;
     phraseBoundRejects = 0;
