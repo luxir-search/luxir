@@ -32,8 +32,13 @@ $ ./vcpkg install robin-hood-hashing   #optional... see MapBM.cpp
 
 Ubuntu:
 ```
-sudo apt install libtbb-dev    #TODO - try the tbb in vcpkg now.
+sudo apt install libtbb-dev pkg-config "gfortran-$(gcc -dumpversion)"
 ```
+
+The gfortran major version must match the gcc/g++ selected for the presets.
+CMake's Fortran/C interface detection can produce an empty mangling header
+when the compiler majors differ, which prevents the FAISS LAPACK dependency
+from configuring.
 
 FastPFOR
 --------

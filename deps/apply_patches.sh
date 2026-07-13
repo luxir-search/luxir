@@ -22,6 +22,12 @@
 #     PQ code distance) are never compiled and FAISS distance kernels run
 #     SSE-only. Takes effect on the next faiss build (see reminder below).
 #
+#   <vcpkg>/ports/openblas/portfile.cmake (both roots; ASan conditional)
+#     OpenBLAS selects an AVX512 Cooper Lake kernel on Zen 5. GCC cannot add
+#     ASan instrumentation to its register-saturated inline assembly, so ASan
+#     builds use the portable AVX2 Haswell kernel instead. Normal builds keep
+#     native CPU detection.
+#
 #   deps/FastPFOR (cloned by make_deps.sh; gitignored)
 #     patches/fastpfor*.diff (if any): local fixes to the vendored FastPFOR.
 #     None are needed at present; the hook below applies them if/when added.
@@ -68,10 +74,12 @@ apply() {  # apply <repo-dir> <patch-file>
 echo "vcpkg: $VCPKG_ROOT"
 apply "$VCPKG_ROOT" "$PATCH_DIR"/vcpkg-triplet-x64-linux.patch
 apply "$VCPKG_ROOT" "$PATCH_DIR"/vcpkg-faiss-opt-level-dd.patch
+apply "$VCPKG_ROOT" "$PATCH_DIR"/vcpkg-openblas-asan-avx2.patch
 
 echo "vcpkg (asan): $VCPKG_ASAN_ROOT"
 apply "$VCPKG_ASAN_ROOT" "$PATCH_DIR"/vcpkg-asan-triplet-x64-linux.patch
 apply "$VCPKG_ASAN_ROOT" "$PATCH_DIR"/vcpkg-faiss-opt-level-dd.patch
+apply "$VCPKG_ASAN_ROOT" "$PATCH_DIR"/vcpkg-openblas-asan-avx2.patch
 
 echo "uni-algo (vendored): $(pwd)/uni-algo"
 apply .. "$PATCH_DIR"/uni-algo-word-only-newline-leak.patch

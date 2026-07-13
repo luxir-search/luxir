@@ -7,6 +7,7 @@ Detailed build/environment notes. For the common build and test commands, see CL
 - C++23 compatible compiler (GCC or Clang)
 - CMake 3.16+
 - vcpkg (toolchain files expected at `/opt/vcpkg/`)
+- Host tools: pkg-config and gfortran matching the selected GCC major version
 - Dependencies: Protobuf, gRPC, Intel TBB, Boost, xxHash, spdlog
 
 Before installing vcpkg packages, run `deps/make_deps.sh` (idempotent): it

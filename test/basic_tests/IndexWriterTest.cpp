@@ -603,7 +603,7 @@ TEST_F(IndexWriterTest, multiThreaded) {
         int start = std::max(0, (int)updates.size() - 100);
         for (int i = start; i < (int)updates.size(); i++) {
           auto& ui = updates[i];
-          LOG_INFO("{}: seqNum={} numAdds={} commitType={}", i, ui.seqNum, ui.numAdds, ui.commitType);
+          LOG_INFO("{}: seqNum={} numAdds={} commitType={}", i, ui.seqNum, ui.numAdds, (int)ui.commitType);
         }
 
         iw.commit();

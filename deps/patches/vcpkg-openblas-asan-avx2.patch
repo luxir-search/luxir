@@ -1,0 +1,19 @@
+diff --git a/ports/openblas/portfile.cmake b/ports/openblas/portfile.cmake
+index 687b61518d..54db98ea13 100644
+--- a/ports/openblas/portfile.cmake
++++ b/ports/openblas/portfile.cmake
+@@ -15,6 +15,14 @@ vcpkg_check_features(OUT_FEATURE_OPTIONS OPTIONS
+         dynamic-arch   DYNAMIC_ARCH
+ )
+ 
++# The AVX512 Cooper Lake kernel exhausts its inline-assembly registers when
++# GCC adds ASan instrumentation. ASan is for correctness rather than BLAS
++# performance, so use the compatible AVX2 kernel in sanitized builds.
++if("${VCPKG_C_FLAGS}" MATCHES "-fsanitize=address"
++   AND VCPKG_TARGET_ARCHITECTURE STREQUAL "x64")
++    list(APPEND OPTIONS -DTARGET=HASWELL -DNO_AVX512=ON)
++endif()
++
+ # If not explicitly configured for a cross build, OpenBLAS wants to run 
+ # getarch executables in order to optimize for the target.
+ # Adapting this to vcpkg triplets:
