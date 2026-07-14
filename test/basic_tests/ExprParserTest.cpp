@@ -174,6 +174,12 @@ TEST_F(ExprParserTest, phraseSlopSuffixIsStrict) {
 
   expectContains(parseErr("status:\"in stock\"~2"), "non-TEXT field 'status'");
   expectContains(parseErr("count:\"10\"~2"), "non-TEXT field 'count'");
+
+  // slop and score decorations compose: sloppy phrase inside the wrapper
+  const auto& sloppyBoosted = asBoost(*parse("title:\"dune messiah\"~2^3"));
+  ASSERT_TRUE(sloppyBoosted.query.has_value());
+  EXPECT_EQ(2, asPhrase(*sloppyBoosted.query).slop);
+  EXPECT_FLOAT_EQ(3.0f, *sloppyBoosted.boost);
 }
 
 TEST_F(ExprParserTest, positionalSpecialsNeedNoEscaping) {
