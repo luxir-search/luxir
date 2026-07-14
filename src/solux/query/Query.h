@@ -2,9 +2,11 @@
 
 #include <cstring>
 #include <cstdint>
+#include <cmath>
 #include <limits>
 #include <memory>
 #include <span>
+#include <stdexcept>
 #include <vector>
 #include <solux/util/heap.h>
 #include "solux/api/solux_types.hpp"
@@ -215,7 +217,16 @@ public:
   /// Returns a non-owning pointer to the created weight.  The Query::Context
   /// is responsible for the lifecycle of the created Weight.
   /// A Context is not generally thread-safe, so don't create weights from multiple threads with the same Context.
-  virtual Query::Weight* createWeight(Query::Context& context, int32_t flags) = 0;
+  virtual Query::Weight* createWeight(Query::Context& context, int32_t flags,
+                                      float multiplier = 1.0f) = 0;
+
+  static float checkedBoostProduct(float inherited, float local) {
+    float product = inherited * local;
+    if (!std::isfinite(product)) {
+      throw std::runtime_error("query boost product must be finite");
+    }
+    return product;
+  }
 
   /// Per-segment planning state. Suppliers are allocated from the segment-local
   /// targetPool and only need to live until their parent has called get().

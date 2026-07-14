@@ -237,7 +237,7 @@ void roundTripType(const char* nm) {
 // The one hand-maintained list: every message type. Add a message -> add a line.
 #define SOLUX_MSGS(X)                                                                              \
   X(Target) X(SearchRequest) X(SearchOp) X(GenOp) X(TopDocs) X(Fusion) X(RrfFusion) X(SortSpec)    \
-  X(Query) X(ConstantScoreQuery) X(KnnQuery) X(Match) X(NamedQuery)                                 \
+  X(Query) X(ConstantScoreQuery) X(BoostQuery) X(KnnQuery) X(Match) X(NamedQuery)                   \
   X(BooleanQuery) X(PrefixQuery) X(FuzzyQuery) X(PhraseQuery) X(GeoBoxQuery) X(GeoDistanceQuery)   \
   X(FieldFacet)                                                                                     \
   X(RangeFacet) X(Domain)                                                                           \

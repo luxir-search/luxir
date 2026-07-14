@@ -33,7 +33,9 @@
 //   TopDocs.filter string filters for free. ExprQuery itself reads a bare string as
 //   its q ({"expr": "..."} == {"expr": {"q": "..."}}). A Query object takes exactly
 //   ONE arm key (proto3 canonical JSON; a second arm is an error, not last-wins).
-//   Writes stay canonical, so echo mode shows the structured form.
+//   A numeric "boost" sibling wraps that arm in BoostQuery; an object-valued
+//   "boost" is the BoostQuery arm itself. Writes stay canonical, so echo mode
+//   shows the wrapper rather than the sibling sugar.
 
 #pragma once
 
@@ -220,9 +222,39 @@ struct from<JSON, solux::api::Query> {
     std::string_view key;
     decltype(auto) keyTarget = ::hpp_proto::detail::as_modifiable(ctx, key);
     bool sawArm = false;
+    bool sawSiblingBoost = false;
+    std::optional<float> siblingBoost;
     util::scan_object_fields<O, true>(
         ctx, it, end, keyTarget, [](auto &, auto &) {},
         [&](auto &vit, auto &vend) {
+          // "boost" is type-directed: a JSON object is the oneof arm, while a
+          // number is the sole non-arm sibling accepted on a Query object.
+          if (key == "boost") {
+            auto probe = vit;
+            while (probe != vend) {
+              char c = (char)*probe;
+              if (c != ' ' && c != '\t' && c != '\n' && c != '\r') break;
+              ++probe;
+            }
+            if (probe == vend || (char)*probe != '{') {
+              if (sawSiblingBoost) {
+                ctx.error = error_code::unknown_key;
+                return true;
+              }
+              sawSiblingBoost = true;
+              util::from_json<V>(siblingBoost.emplace(), ctx, vit, vend);
+              auto after = vit;
+              while (after != vend) {
+                char c = (char)*after;
+                if (c != ' ' && c != '\t' && c != '\n' && c != '\r') break;
+                ++after;
+              }
+              if (!bool(ctx.error) && !sawArm && after != vend && (char)*after == '}') {
+                ctx.error = error_code::unknown_key;
+              }
+              return bool(ctx.error);
+            }
+          }
           // exactly one arm: a Query object IS the oneof, so a second key is
           // an error (proto3 canonical JSON), not a silent last-wins
           if (sawArm) {
@@ -259,6 +291,8 @@ struct from<JSON, solux::api::Query> {
             arm(std::in_place_type<api::GeoBoxQuery>);
           } else if (key == "geo_distance") {
             arm(std::in_place_type<api::GeoDistanceQuery>);
+          } else if (key == "boost") {
+            arm(std::in_place_type<api::BoostQuery>);
           } else if (key == "expr") {
             arm(std::in_place_type<api::ExprQuery>);
           } else {
@@ -267,7 +301,16 @@ struct from<JSON, solux::api::Query> {
           }
           return bool(ctx.error);
         },
-        [](auto &, auto &) {});
+        [&](auto &after, auto &) {
+          if ((char)*after != '}' || bool(ctx.error) || !sawSiblingBoost || !sawArm) return;
+          auto &mr = ctx.memory_resource();
+          auto *child = (api::Query *)mr.allocate(sizeof(api::Query), alignof(api::Query));
+          new (child) api::Query(value);
+          api::BoostQuery wrapper;
+          wrapper.query = child;
+          wrapper.boost = siblingBoost;
+          value.kind = wrapper;
+        });
   }
 };
 

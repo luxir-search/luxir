@@ -273,16 +273,18 @@ public:
   float getMinScanFraction() const noexcept { return minScanFraction; }
   bool getExact() const noexcept { return exact; }
 
-  Query::Weight* createWeight(Query::Context& context, int32_t flags) override {
-    return context.pool.make<KnnQuery::Weight>(context, *this, flags);
+  Query::Weight* createWeight(Query::Context& context, int32_t flags,
+                              float multiplier = 1.0f) override {
+    return context.pool.make<KnnQuery::Weight>(context, *this, flags, multiplier);
   }
 
   class Weight final : public Query::Weight {
     KnnQuery& query;
+    float boost;
 
   public:
-    Weight(Query::Context& context, KnnQuery& query, int32_t flags)
-      : Query::Weight(context, flags), query(query) {
+    Weight(Query::Context& context, KnnQuery& query, int32_t flags, float multiplier)
+      : Query::Weight(context, flags), query(query), boost(multiplier) {
       traits |= NEEDS_PREPARE;  // index-level ANN pass
       if (!query.getFieldType().knnSearchable()) {
         throw std::runtime_error(std::format(
@@ -804,6 +806,12 @@ public:
                                      kDocs, docHits, ctx.parallel);
       } else if ((int64_t)docHits.size() > kDocs) {
         collapseCandidates(candidateHits, v2dSpan, kDocs, docHits, seenDocs);
+      }
+
+      // Boost is applied only after the raw-similarity top-k cut, so it can
+      // change scores (including zeroing them) but never the retained docs.
+      if (boost != 1.0f) {
+        for (auto& hit : docHits) hit.score *= boost;
       }
 
       if ((int64_t)docHits.size() < kDocs && cap < ntotal) {

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <charconv>
+#include <cmath>
 #include <cstdint>
 #include <limits>
 #include <memory_resource>
@@ -55,9 +56,9 @@ namespace solux {
 // Positional specials, not Lucene's reserved-char sprawl: ':' splits only at
 // the FIRST unescaped colon of a clause, '*' and '~' act only as clean
 // trailing suffixes, and quotes open a string only where a value can begin -
-// so url:https://x, time:12:30, and title:don't need no escaping.  '^' is
-// reserved for boost: as a clean trailing suffix it is a parse error until
-// the engine has per-clause boost semantics; elsewhere it is a literal byte.
+// so url:https://x, time:12:30, and title:don't need no escaping.  '^N' boosts
+// a clause and '^=N' assigns it a constant score; elsewhere '^' is a literal
+// byte.
 // Mid-token '*' and '?' are PERMANENTLY literal (never wildcards): future
 // wildcard/regex query types arrive as named functions, and quoting a value
 // is the universal way to make it literal to the grammar.
@@ -197,6 +198,30 @@ private:
     return q;
   }
 
+  api::Query* copyQuery(const api::Query& source) {
+    api::Query* q = allocQuery();
+    *q = source;
+    return q;
+  }
+
+  const api::Query* makeBoost(const api::Query* child, float boost) {
+    api::BoostQuery b;
+    b.query = copyQuery(*child);
+    b.boost = boost;
+    api::Query* q = allocQuery();
+    q->kind = b;
+    return q;
+  }
+
+  const api::Query* makeConstantScore(const api::Query* child, float score) {
+    api::ConstantScoreQuery c;
+    c.query = copyQuery(*child);
+    c.score = score;
+    api::Query* q = allocQuery();
+    q->kind = c;
+    return q;
+  }
+
   // ---- schema consultation (arm selection only; text stays uninterpreted) ----
 
   static bool termQueryable(FieldType& ft) { return SimpleQueryParser::termQueryable(ft); }
@@ -264,7 +289,10 @@ private:
     bool escaped = false;
     // clean trailing suffixes; mid-token occurrences are literal bytes
     size_t tildeAt = NPOS;    // '~' followed only by digits, or NPOS
-    size_t caretAt = NPOS;    // '^' followed only by digits/'.', or NPOS
+    size_t caretAt = NPOS;    // score suffix '^N' / '^=N', or NPOS
+    bool constantScore = false;
+    bool negativeScore = false;
+    bool doubleScoreDecoration = false;
     bool trailingStar = false;
     bool starBeforeTilde = false;  // ...*~N (rejected: prefix+fuzzy combine)
     bool empty() const { return text.empty(); }
@@ -309,24 +337,37 @@ private:
     }
 
     size_t n = buf.size();
-    t.trailingStar = n > 0 && buf[n - 1] == '*' && !esc[n - 1];
     // clean trailing suffix: the last unescaped `mark` followed only by
     // unescaped bytes suffixOk accepts
-    auto cleanSuffix = [&](char mark, auto&& suffixOk) -> size_t {
-      for (size_t i = n; i-- > 0;) {
+    auto cleanSuffix = [&](size_t endAt, char mark, auto&& suffixOk) -> size_t {
+      for (size_t i = endAt; i-- > 0;) {
         if (esc[i]) return NPOS;
         if (buf[i] == mark) return i;
         if (!suffixOk(buf[i])) return NPOS;
       }
       return NPOS;
     };
-    t.tildeAt = cleanSuffix('~', [](char c) { return digit(c); });
-    t.caretAt = cleanSuffix('^', [](char c) { return digit(c) || c == '.'; });
+    t.caretAt = cleanSuffix(n, '^', [](char c) {
+      return digit(c) || c == '.' || c == '=' || c == '-';
+    });
+    size_t termEnd = t.caretAt == NPOS ? n : t.caretAt;
+    if (t.caretAt != NPOS) {
+      size_t suffix = t.caretAt + 1;
+      t.constantScore = suffix < n && buf[suffix] == '=';
+      if (t.constantScore) suffix++;
+      t.negativeScore = suffix < n && buf[suffix] == '-';
+      t.doubleScoreDecoration =
+          cleanSuffix(t.caretAt, '^', [](char c) {
+            return digit(c) || c == '.' || c == '=' || c == '-';
+          }) != NPOS;
+    }
+    t.trailingStar = termEnd > 0 && buf[termEnd - 1] == '*' && !esc[termEnd - 1];
+    t.tildeAt = cleanSuffix(termEnd, '~', [](char c) { return digit(c); });
     if (t.tildeAt == NPOS) {
       // ~N.N is old Lucene float similarity: teach rather than silently
       // matching the literal token (a genuinely literal ~1.5 can be quoted)
-      size_t floatTilde = cleanSuffix('~', [](char c) { return digit(c) || c == '.'; });
-      if (floatTilde != NPOS && floatTilde + 1 < n) {
+      size_t floatTilde = cleanSuffix(termEnd, '~', [](char c) { return digit(c) || c == '.'; });
+      if (floatTilde != NPOS && floatTilde + 1 < termEnd) {
         fail(t.pos + floatTilde,
              "fuzzy edit distance is a whole number of edits (term~1, term~2); "
              "float similarity is not supported - quote the value for a literal '~'");
@@ -375,13 +416,53 @@ private:
     return body;
   }
 
-  // After a group/phrase/range/$var: trailing decorations that do not apply
-  // there are precise errors, not silent surprises.
-  void rejectDecorations(std::string_view what) {
+  float parseScoreNumber(std::string_view text, size_t pos) {
+    if (text.empty()) fail(pos, "score decoration requires a number after '^' or '^='");
+    float value = 0.0f;
+    auto [p, ec] = std::from_chars(text.data(), text.data() + text.size(), value);
+    if (ec != std::errc() || p != text.data() + text.size() || !std::isfinite(value)) {
+      fail(pos, fmt::format("score decoration expects a finite number (got '{}')", text));
+    }
+    if (value < 0.0f) fail(pos, "score decoration must not be negative");
+    return value;
+  }
+
+  const api::Query* decorateToken(const api::Query* node, const Token& t) {
+    if (t.caretAt == NPOS) return node;
+    if (t.doubleScoreDecoration) {
+      fail(t.pos + t.caretAt, "at most one score decoration per clause");
+    }
+    size_t valueAt = t.caretAt + 1 + (t.constantScore ? 1 : 0);
+    std::string_view number = t.text.substr(valueAt);
+    if (t.negativeScore) {
+      fail(t.pos + valueAt, "score decoration must not be negative");
+    }
+    float value = parseScoreNumber(number, t.pos + valueAt);
+    return t.constantScore ? makeConstantScore(node, value) : makeBoost(node, value);
+  }
+
+  // After a group/phrase/range/$var/function: consume its one legal score
+  // decoration, while retaining precise errors for unrelated suffixes.
+  const api::Query* finishDecorations(const api::Query* node, std::string_view what) {
     char c = cur.peek();
     if (c == '~') fail(cur.position(), fmt::format("'~' does not apply to {}", what));
-    if (c == '^') fail(cur.position(), "boost (^) is reserved but not implemented yet");
+    if (c == '^') {
+      cur.advance();
+      bool constant = cur.consume('=');  // longest match: '^=' before '^'
+      size_t numberAt = cur.position();
+      if (cur.peek() == '-') {
+        fail(numberAt, "score decoration must not be negative");
+      }
+      std::string_view number = cur.takeWhile([](char b) { return digit(b) || b == '.'; });
+      float value = parseScoreNumber(number, numberAt);
+      node = constant ? makeConstantScore(node, value) : makeBoost(node, value);
+      if (cur.peek() == '^') {
+        fail(cur.position(), "at most one score decoration per clause");
+      }
+      c = cur.peek();
+    }
     if (c == '*') fail(cur.position(), fmt::format("'*' does not apply to {}", what));
+    return node;
   }
 
   // ---- $var binding ----
@@ -584,8 +665,7 @@ private:
       const api::Query* node = parseLevel(scope, ")");
       if (!cur.consume(')')) fail(pos, "unmatched '('");
       if (node == nullptr) fail(pos, "empty parentheses");
-      rejectDecorations("a group");
-      return node;
+      return finishDecorations(node, "a group");
     }
     if (c == '"' || c == '\'') {
       if (scope == nullptr) {
@@ -608,17 +688,17 @@ private:
         fail(pos, "a $variable is a value, not a clause; use field:$name or a function argument");
       }
       const api::Val* val = parseVarRef();
-      rejectDecorations("a $variable");
-      return makeMatch(scope->field, val);
+      return finishDecorations(makeMatch(scope->field, val), "a $variable");
     }
     if (c == ')' || c == ',' || c == ']' || c == '}' || c == '=') {
       fail(pos, fmt::format("unexpected '{}'", c));
     }
 
     // *:* - the traditional match-all spelling
-    if (c == '*' && cur.peekAt(1) == ':' && cur.peekAt(2) == '*' && boundaryAt(3, stops)) {
+    if (c == '*' && cur.peekAt(1) == ':' && cur.peekAt(2) == '*'
+        && (boundaryAt(3, stops) || cur.peekAt(3) == '^')) {
       cur.advance(3);
-      return matchAll();
+      return finishDecorations(matchAll(), "match-all");
     }
 
     Token head = scanToken(stops, /*stopAtColon=*/true);
@@ -640,7 +720,7 @@ private:
 
     // function call: identifier immediately followed by '('
     if (cur.peek() == '(' && !head.escaped && isIdentifier(head.text)) {
-      return parseFunction(head);
+      return finishDecorations(parseFunction(head), "a function call");
     }
 
     if (scope != nullptr) {
@@ -663,16 +743,14 @@ private:
       const api::Query* node = parseLevel(&scope, ")");
       if (!cur.consume(')')) fail(pos, "unmatched '(' in field group");
       if (node == nullptr) fail(pos, "empty field group");
-      rejectDecorations("a group");
-      return node;
+      return finishDecorations(node, "a group");
     }
     if (c == '"' || c == '\'') return parsePhraseForm(field, ft);
     if (c == '[' || c == '{') return parseRangeForm(field);
     if (c == '<' || c == '>') return parseComparisonForm(field, stops);
     if (c == '$') {
       const api::Val* val = parseVarRef();
-      rejectDecorations("a $variable");
-      return makeMatch(field, val);
+      return finishDecorations(makeMatch(field, val), "a $variable");
     }
 
     Token value = scanToken(stops, /*stopAtColon=*/false);
@@ -707,7 +785,7 @@ private:
         fail(slopPos, fmt::format("phrase slop does not apply to non-TEXT field '{}'", field));
       }
     }
-    rejectDecorations("a quoted value");
+    const api::Query* node;
     if (ft.type() == FieldType::Type::TEXT) {
       api::PhraseQuery p;
       p.field = field;
@@ -715,9 +793,11 @@ private:
       p.slop = slop;
       api::Query* q = allocQuery();
       q->kind = p;
-      return q;
+      node = q;
+    } else {
+      node = makeMatch(field, allocVal(body));
     }
-    return makeMatch(field, allocVal(body));
+    return finishDecorations(node, "a quoted value");
   }
 
   // ---- ranges and comparisons ----
@@ -763,15 +843,13 @@ private:
     } else {
       fail(cur.position(), "unterminated range: expected ']' or '}'");
     }
-    rejectDecorations("a range");
-
     api::RangeQuery r;
     r.field = field;
     if (lo != nullptr) (loInclusive ? r.gte : r.gt) = lo;
     if (hi != nullptr) (hiInclusive ? r.lte : r.lt) = hi;
     api::Query* q = allocQuery();
     q->kind = r;
-    return q;
+    return finishDecorations(q, "a range");
   }
 
   const api::Query* parseComparisonForm(std::string_view field, std::string_view stops) {
@@ -784,8 +862,6 @@ private:
     }
     const api::Val* v = parseRangeEndpoint(stops);
     if (v == nullptr) fail(cur.position(), "a comparison needs a value");
-    rejectDecorations("a comparison");
-
     api::RangeQuery r;
     r.field = field;
     if (op == '>') {
@@ -795,17 +871,13 @@ private:
     }
     api::Query* q = allocQuery();
     q->kind = r;
-    return q;
+    return finishDecorations(q, "a comparison");
   }
 
   // ---- term emission (decorations + FieldType arm selection) ----
 
   const api::Query* emitTerm(std::string_view field, FieldType& ft, const Token& t) {
-    if (t.caretAt != NPOS) {
-      fail(t.pos + t.caretAt, "boost (^) is reserved but not implemented yet");
-    }
-
-    std::string_view text = t.text;
+    std::string_view text = t.caretAt == NPOS ? t.text : t.text.substr(0, t.caretAt);
 
     // fuzzy: a clean trailing ~N / ~ suffix (mid-token '~' is a literal byte)
     if (t.tildeAt != NPOS) {
@@ -822,7 +894,7 @@ private:
                fmt::format("fuzzy edit distance '{}' exceeds the maximum of 2", digits));
         }
         if (v == 0) {
-          return makeMatch(field, allocVal(base));  // ~0 = exact
+          return decorateToken(makeMatch(field, allocVal(base)), t);  // ~0 = exact
         }
         maxEdits = v;
       }
@@ -835,7 +907,7 @@ private:
       fq.max_edits = maxEdits;
       api::Query* q = allocQuery();
       q->kind = fq;
-      return q;
+      return decorateToken(q, t);
     }
 
     // field:* - "has a value", by the field's natural mechanism: an unbounded
@@ -847,14 +919,14 @@ private:
         r.field = field;
         api::Query* q = allocQuery();
         q->kind = r;
-        return q;
+        return decorateToken(q, t);
       }
       api::PrefixQuery p;
       p.field = field;
       p.prefix = {};
       api::Query* q = allocQuery();
       q->kind = p;
-      return q;
+      return decorateToken(q, t);
     }
 
     // prefix: an unescaped trailing '*' (mid-token '*' is a literal byte)
@@ -867,10 +939,10 @@ private:
       p.prefix = text.substr(0, text.size() - 1);
       api::Query* q = allocQuery();
       q->kind = p;
-      return q;
+      return decorateToken(q, t);
     }
 
-    return makeMatch(field, allocVal(text));
+    return decorateToken(makeMatch(field, allocVal(text)), t);
   }
 
   // ---- the function form: name(main value, arg=value, ...) ----

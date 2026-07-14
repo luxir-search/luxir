@@ -380,6 +380,36 @@ TEST_F(KnnQueryTest, basicOrdering) {
   req->done();
 }
 
+TEST_F(KnnQueryTest, zeroBoostKeepsKnnMatchSetAndZeroesScores) {
+  CollectionHelper h("main");
+  installVecSchema(h.collection(), api::VectorParams::Metric::L2);
+  h.index(flatdoc("id", std::string("a"), "embedding_v", std::vector<float>{0, 0}));
+  h.index(flatdoc("id", std::string("b"), "embedding_v", std::vector<float>{1, 0}));
+  h.index(flatdoc("id", std::string("c"), "embedding_v", std::vector<float>{2, 0}));
+  h.index(flatdoc("id", std::string("d"), "embedding_v", std::vector<float>{3, 0}));
+  h.commit({"*"});
+
+  auto* baseline = makeKnnReq(*soluxNode, "embedding_v", {0, 0}, 3);
+  baseline->execute();
+  ASSERT_TRUE(baseline->ok()) << baseline->errorMsg();
+  auto expectedIds = resultIds(*baseline);
+
+  auto* zero = LocalReq::create(soluxNode->getSearchEngine());
+  auto& cur = zero->collection("main").topDocs("q");
+  cur.getScores().getNumber().fields({"id"});
+  auto knn = qb::knn(cur.mr(), "embedding_v", {0, 0}, 3);
+  cur.rawQuery() = qb::boost(cur.mr(), knn, 0.0f);
+  zero->execute();
+  ASSERT_TRUE(zero->ok()) << zero->errorMsg();
+  EXPECT_EQ(expectedIds, resultIds(*zero));
+  auto scores = resultScores(*zero);
+  ASSERT_EQ(expectedIds.size(), scores.size());
+  for (float score : scores) EXPECT_FLOAT_EQ(0.0f, score);
+
+  baseline->done();
+  zero->done();
+}
+
 // Multi-segment: each segment contributes its share to the top-K, and the
 // FAISS-id -> (segment, docRank) mapping is correct.  Interleaves no-vector
 // docs in seg0 and seg1 so the per-segment columns are sparse - surfaces

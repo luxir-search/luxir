@@ -30,7 +30,7 @@ namespace solux::expr {
 // field order).  The static_assert keeps this table in lockstep with the
 // variant: a new arm fails to compile until it is named here (and its expr
 // callability decided).
-inline constexpr std::array<std::string_view, 15> ARM_NAMES = {
+inline constexpr std::array<std::string_view, 16> ARM_NAMES = {
     "",               // monostate (unset)
     "match",          // Match
     "boolean",        // BooleanQuery
@@ -46,6 +46,7 @@ inline constexpr std::array<std::string_view, 15> ARM_NAMES = {
     "expr",           // ExprQuery - not callable within expr (write it inline)
     "geo_box",        // GeoBoxQuery - not callable in this pass
     "geo_distance",   // GeoDistanceQuery - not callable in this pass
+    "boost",          // BoostQuery
 };
 static_assert(std::variant_size_v<decltype(api::Query::kind)> == ARM_NAMES.size(),
               "Query gained an arm: name it in ARM_NAMES and decide its expr callability");
@@ -63,6 +64,7 @@ inline constexpr std::string_view mainValueArg(std::string_view fn) {
   if (fn == "prefix") return "prefix";
   if (fn == "fuzzy") return "term";
   if (fn == "constant_score") return "query";
+  if (fn == "boost") return "query";
   return {};
 }
 

@@ -64,7 +64,9 @@ public:
     return {minLatitude, maxLatitude, minLongitude, maxLongitude};
   }
 
-  Query::Weight* createWeight(Context& context, int32_t flags) override {
+  Query::Weight* createWeight(Context& context, int32_t flags,
+                              float multiplier = 1.0f) override {
+    unused(multiplier);
     return context.pool.make<Weight>(context, *this, flags);
   }
 };

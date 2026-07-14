@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cmath>
 #include <variant>
 
 #include "PhraseQuery.h"
@@ -11,6 +12,7 @@
 #include "solux/query/TermQuery.h"
 #include "solux/query/AllQuery.h"
 #include "solux/query/BooleanQuery.h"
+#include "solux/query/BoostQuery.h"
 #include "solux/query/ConstantScoreQuery.h"
 #include "solux/query/GeoBoxQuery.h"
 #include "solux/query/GeoDistanceQuery.h"
@@ -352,6 +354,18 @@ public:
     return pool.make<solux::ConstantScoreQuery>(parse(*constantScoreQuery.query), score);
   }
 
+  solux::Query* parseBoost(const solux::api::BoostQuery& boostQuery) {
+    if (!boostQuery.query.has_value() || boostQuery.query->kind.index() == 0) {
+      throw std::runtime_error("BoostQuery requires a child query");
+    }
+    float boost = boostQuery.boost.has_value() ? *boostQuery.boost : 1.0f;
+    if (!std::isfinite(boost) || boost < 0.0f) {
+      throw std::runtime_error(std::format(
+        "BoostQuery boost must be finite and non-negative (got {})", boost));
+    }
+    return pool.make<solux::BoostQuery>(parse(*boostQuery.query), boost);
+  }
+
   solux::Query* parse(const solux::api::Query& pquery) {
     // The one recursion choke point for structured trees: every nested node
     // passes through here, so the shared budget bounds tree depth no matter
@@ -374,6 +388,7 @@ public:
       [&](const solux::api::KnnQuery& k) -> solux::Query* { return parseKnn(k); },
       [&](const solux::api::BooleanQuery& b) -> solux::Query* { return parseBoolean(b); },
       [&](const solux::api::ConstantScoreQuery& c) -> solux::Query* { return parseConstantScore(c); },
+      [&](const solux::api::BoostQuery& b) -> solux::Query* { return parseBoost(b); },
       [&](std::monostate) -> solux::Query* { throw std::runtime_error("query oneof not set"); },
       [&](std::string_view) -> solux::Query* {  // the bare `field` string arm is not a query
         throw std::runtime_error("field-only query arm is not a valid query");

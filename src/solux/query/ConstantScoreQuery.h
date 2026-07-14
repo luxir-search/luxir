@@ -72,8 +72,10 @@ class ConstantScoreQuery final : public solux::Query {
 public:
   ConstantScoreQuery(Query* child, float constantScore = 1.0f) : child(child), constantScore(constantScore) {}
 
-  Weight* createWeight(Context& context, int32_t flags) override {
-    return context.pool.make<ConstantScoreQuery::Weight>(context, *this, flags);
+  Weight* createWeight(Context& context, int32_t flags,
+                       float multiplier = 1.0f) override {
+    return context.pool.make<ConstantScoreQuery::Weight>(context, *this, flags,
+                                                         multiplier);
   }
 
   class Weight final : public Query::Weight {
@@ -106,10 +108,11 @@ public:
     };
 
   public:
-    Weight(Context& context, ConstantScoreQuery& query, int32_t flags)
-      : Query::Weight(context, flags), constantScore(query.constantScore) {
+    Weight(Context& context, ConstantScoreQuery& query, int32_t flags, float multiplier)
+      : Query::Weight(context, flags),
+        constantScore(checkedBoostProduct(query.constantScore, multiplier)) {
       // The child constrains matches; this wrapper replaces its score.
-      childWeight = query.child->createWeight(context, flags & ~NEED_SCORES);
+      childWeight = query.child->createWeight(context, flags & ~NEED_SCORES, 1.0f);
       // The wrapper is constant-scoring; prepare still follows the child.
       traits |= IS_CONSTANT_SCORING | (childWeight->getFlags() & NEEDS_PREPARE);
     }

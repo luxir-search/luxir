@@ -71,8 +71,8 @@ most values need no escaping:
   is fuzzy only as a trailing `~` or `~N` (a whole number of edits).
   `"dune messiah"~2` is a sloppy phrase, `dune~1` is fuzzy, and `a~b` is
   literal.
-- `^` is reserved for boost, which is not implemented yet. A trailing `^2`
-  is a parse error; anywhere else it is a literal character.
+- `^N` multiplies a clause's scores by `N`, and `^=N` replaces its scores
+  with the constant `N`. Elsewhere `^` is a literal character.
 - Quotes start a quoted value only where a value can begin - right after
   `field:`, whitespace, `(`, a `,` or `=` in arguments. Anywhere else a
   quote is an ordinary character, so `title_w:don't` is one word.
@@ -195,6 +195,35 @@ default `prefix_length` is 1, which bounds the scan); `hte~1` will not find
 "the". Pass `prefix_length=0` through the `fuzzy(...)` function to trade a
 wider scan for first-position typos.
 
+## Per-clause scores
+
+A score decoration applies to the clause immediately before it:
+
+```
+title_w:dune^2
+title_w:"dune messiah"^1.5
+(title_w:dune OR title_w:messiah)^3
+status_s:active^=2
+```
+
+`^N` multiplies every matching score by `N`. Boosts nest by multiplication.
+`^=N` is shorthand for `constant_score(..., score=N)`: it keeps the match set
+but replaces the child score. Only one score decoration is allowed on one
+clause. The value must be a literal finite non-negative number; `$variables`
+are not accepted as score-decoration values.
+
+The structured arm is `{"boost":{"query":...,"boost":N}}`. JSON also
+accepts a numeric `boost` sibling as input sugar:
+`{"match":{"title_w":"dune"},"boost":2}`. An object-valued `boost` is the
+arm itself, not the sibling sugar. Request echo and other encoding always use
+the structured wrapper form.
+
+An omitted boost means `1.0`. A boost of `0` is legal: matching documents
+remain in the result set and their scores become zero. Boost has no effect in
+filter or prohibited context because those clauses are built without scores.
+Inside `constant_score`, a child boost is discarded; a boost outside
+`constant_score` multiplies the constant.
+
 ## Functions
 
 Every query type can be written as a function call. The function name is
@@ -209,6 +238,7 @@ phrase(dune messiah, field=title_w, slop=2)
 fuzzy(smith, field=name_s, max_edits=2, prefix_length=0)
 prefix(mess, field=title_w)
 range(field=year_i, gte=1960, lt=1970)
+boost(title_w:dune, boost=2)
 constant_score(status_s:active AND year_i:>=1960, score=1.0)
 boolean(required=[status_s:active], optional=[title_w:dune, title_w:messiah], min_match=1)
 simple_query($user_input, fields=[title_w, body_w], operator=AND)
@@ -218,7 +248,7 @@ all()
 Arguments work like Python's: at most one positional argument, then
 `name=value` pairs. The positional slot is the query's main value and takes
 raw text up to the closing `,` or `)`; where the slot is itself a query
-(`constant_score`, or lists like `required=[...]`), it takes a full
+(`boost`, `constant_score`, or lists like `required=[...]`), it takes a full
 expression instead. Values are typed by the argument: numbers,
 `true`/`false`, `AND`/`OR`, `[lists]`, quoted strings.
 

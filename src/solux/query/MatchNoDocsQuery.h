@@ -11,7 +11,9 @@ class MatchNoDocsQuery final : public solux::Query {
 public:
   MatchNoDocsQuery() {}
 
-  MatchNoDocsQuery::Weight* createWeight(Context& context, int32_t flags) override {
+  MatchNoDocsQuery::Weight* createWeight(Context& context, int32_t flags,
+                                         float multiplier = 1.0f) override {
+    unused(multiplier);
     return context.pool.make<MatchNoDocsQuery::Weight>(context, flags);
   }
 

@@ -58,8 +58,9 @@ public:
   [[nodiscard]] std::span<const int32_t> getPositions() const { return positions; }
   [[nodiscard]] int32_t getSlop() const { return slop; }
 
-  Weight* createWeight(Context& context, int32_t flags) override {
-    return context.pool.make<PhraseQuery::Weight>(context, *this, flags);
+  Weight* createWeight(Context& context, int32_t flags,
+                       float multiplier = 1.0f) override {
+    return context.pool.make<PhraseQuery::Weight>(context, *this, flags, multiplier);
   }
 
   class Weight final : public Query::Weight {
@@ -69,7 +70,7 @@ public:
     Similarity::BM25Scorer* simScorer = nullptr;
 
   public:
-    Weight(Query::Context& context, PhraseQuery& query, int32_t flags)
+    Weight(Query::Context& context, PhraseQuery& query, int32_t flags, float multiplier)
         : Query::Weight(context, flags), query(query) {
       bool needScores = (flags & NEED_SCORES) != 0;
       if (!needScores) traits |= IS_CONSTANT_SCORING;
@@ -89,7 +90,7 @@ public:
       }
       if (needScores) {
         simScorer = context.pool.make<Similarity::BM25Scorer>(
-            similarity.getScorer(1.0f, cachedFieldInfo->fieldStats, (float) idf));
+            similarity.getScorer(multiplier, cachedFieldInfo->fieldStats, (float) idf));
       }
     }
 

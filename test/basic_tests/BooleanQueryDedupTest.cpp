@@ -12,6 +12,7 @@
 #include "test/TestIndex.h"
 #include "solux/query/AllQuery.h"
 #include "solux/query/BooleanQuery.h"
+#include "solux/query/BoostQuery.h"
 #include "solux/query/TermQuery.h"
 #include "solux/reader/SkipStats.h"
 #include "solux/search/Collector.h"
@@ -89,6 +90,7 @@ protected:
       EXPECT_NEAR(expected[i].score, actual[i].score, 1e-6f * scale) << "rank " << i;
     }
   }
+
 };
 
 TEST_F(BooleanQueryDedupTest, optionalDuplicateScoresExactlyLikeBoostTwo) {
@@ -136,6 +138,44 @@ TEST_F(BooleanQueryDedupTest, optionalTripleDuplicateScoresLikeBoostThreeWithinE
   auto boostThreeHits = collectHits(*testIndex.reader, boostThreeA);
 
   assertSameScoresNear(boostThreeHits, duplicateHits);
+}
+
+TEST_F(BooleanQueryDedupTest, wrappedDuplicateTermsCombineWrapperFactors) {
+  TestIndex testIndex;
+  const std::string_view bodies[] = {"a", "a b", "b", "a a"};
+  buildBodyIndex(testIndex, bodies);
+
+  TermQuery a1("body_w", "a");
+  TermQuery a2("body_w", "a");
+  BoostQuery boostedA1(&a1, 2.0f);
+  BoostQuery boostedA2(&a2, 3.0f);
+  std::vector<Query*> duplicates = {&boostedA1, &boostedA2};
+  BooleanQuery duplicate({}, duplicates, {}, {});
+
+  TermQuery oracleA("body_w", "a", 5.0f);
+  assertSameScoresExact(collectHits(*testIndex.reader, oracleA),
+                        collectHits(*testIndex.reader, duplicate));
+}
+
+TEST_F(BooleanQueryDedupTest, wrappedDuplicateTermsPreserveMinMatch) {
+  TestIndex testIndex;
+  const std::string_view bodies[] = {"a", "b", "a b", "c"};
+  buildBodyIndex(testIndex, bodies);
+
+  TermQuery a1("body_w", "a");
+  TermQuery a2("body_w", "a");
+  TermQuery b1("body_w", "b");
+  BoostQuery boostedA1(&a1, 2.0f);
+  BoostQuery boostedA2(&a2, 3.0f);
+  std::vector<Query*> duplicates = {&boostedA1, &boostedA2, &b1};
+  BooleanQuery duplicate({}, duplicates, {}, {}, 2);
+
+  TermQuery oracleA("body_w", "a", 5.0f);
+  TermQuery oracleB("body_w", "b");
+  std::vector<Query*> oracleClauses = {&oracleA, &oracleB};
+  BooleanQuery oracle({}, oracleClauses, {}, {}, 1);
+  assertSameScoresExact(collectHits(*testIndex.reader, oracle),
+                        collectHits(*testIndex.reader, duplicate));
 }
 
 // Solux-defined semantics, split by intent: min_match above half the

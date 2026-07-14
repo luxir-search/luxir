@@ -25,8 +25,9 @@ public:
   // Build the per-segment filtered term iterator.
   virtual FilteredTermsEnum* createFilteredEnum(MemPool& pool, TermsEnum& te) = 0;
 
-  Weight* createWeight(Context& context, int32_t flags) override {
-    return context.pool.make<MultiTermQuery::Weight>(context, *this, flags);
+  Weight* createWeight(Context& context, int32_t flags,
+                       float multiplier = 1.0f) override {
+    return context.pool.make<MultiTermQuery::Weight>(context, *this, flags, multiplier);
   }
 
   // Iterates set bits of the membership bitset under a constant score.
@@ -60,10 +61,12 @@ public:
   class Weight final : public Query::Weight {
     MultiTermQuery& query;
     CachedFieldInfo* cachedFieldInfo = nullptr;
+    float boost;
 
   public:
-    Weight(Context& context, MultiTermQuery& query, int32_t flags)
-      : Query::Weight(context, flags), query(query) {
+    Weight(Context& context, MultiTermQuery& query, int32_t flags, float multiplier)
+      : Query::Weight(context, flags), query(query),
+        boost(checkedBoostProduct(multiplier, query.getBoost())) {
       traits |= IS_CONSTANT_SCORING;  // every match scores the same
       cachedFieldInfo = context.getCachedFieldInfo(query.getField());
     }
@@ -99,7 +102,7 @@ public:
       }
 
       if (!anyTerm) return nullptr;  // the field exists but no term matched
-      return targetPool.make<MultiTermQuery::Scorer>(bits, maxDoc, query.getBoost());
+      return targetPool.make<MultiTermQuery::Scorer>(bits, maxDoc, boost);
     }
   };
 };

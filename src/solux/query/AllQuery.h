@@ -8,7 +8,9 @@ class AllQuery final : public solux::Query {
 public:
   AllQuery() {}
 
-  AllQuery::Weight* createWeight(Context& context, int32_t flags) override {
+  AllQuery::Weight* createWeight(Context& context, int32_t flags,
+                                 float multiplier = 1.0f) override {
+    unused(multiplier);
     AllQuery::Weight* weight = context.pool.make<AllQuery::Weight>(context, *this, flags);
     return weight;
   }

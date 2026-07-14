@@ -63,8 +63,9 @@ public:
     return hasInjectedTermStats ? injectedTermStats : cachedTermInfo.termStats;
   }
 
-  TermQuery::Weight* createWeight(Context& context, int32_t flags) override {
-    return context.pool.make<TermQuery::Weight>(context, *this, flags);
+  TermQuery::Weight* createWeight(Context& context, int32_t flags,
+                                  float multiplier = 1.0f) override {
+    return context.pool.make<TermQuery::Weight>(context, *this, flags, multiplier);
   }
 
   class Weight final : public Query::Weight {
@@ -73,9 +74,11 @@ public:
     solux::CachedFieldInfo* cachedFieldInfo = nullptr;
     solux::CachedTermInfo* cachedTermInfo = nullptr;
     solux::Similarity::BM25Scorer* simScorer = nullptr;
+    float boost;
   public:
-    Weight(Context& context, TermQuery& query, int32_t flags)
-            : Query::Weight(context, flags), query(query) {
+    Weight(Context& context, TermQuery& query, int32_t flags, float multiplier)
+            : Query::Weight(context, flags), query(query),
+              boost(checkedBoostProduct(multiplier, query.getBoost())) {
       bool needScores = (flags & NEED_SCORES) != 0;
       // Filter-style terms match normally but always score 0.
       if (!needScores) traits |= IS_CONSTANT_SCORING;
@@ -117,7 +120,7 @@ public:
 
       if ((inputFlags & NEED_SCORES) == 0) {
         // Matching does not need norms or BM25 when score() is never read.
-        return targetPool.make<TermQuery::Scorer>(*docsEnum, nullptr, nullptr, query.getBoost());
+        return targetPool.make<TermQuery::Scorer>(*docsEnum, nullptr, nullptr, boost);
       }
 
       auto* segFieldInfo = cachedFieldInfo->segInfos[segment.ord]; // this segFieldInfo can't be null at this point
@@ -133,7 +136,7 @@ public:
         sidecarTerm = bounds->find(docsEnum->termOrd());
       }
       return targetPool.make<TermQuery::Scorer>(targetPool, *docsEnum, normsReader, valueReader,
-                                                simScorer, query.getBoost(),
+                                                simScorer, boost,
                                                 query.shouldUseFrontierBound(), sidecarTerm);
     }
 

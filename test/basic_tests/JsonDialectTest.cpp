@@ -164,6 +164,44 @@ TEST(JsonDialect, QueryBareStringIsExprSugar) {
   EXPECT_FALSE(P::read_json(two, R"({"match":{"title_w":"dune"},"all":true})", mr));
 }
 
+TEST(JsonDialect, QueryBoostSiblingSugarAndArm) {
+  std::pmr::monotonic_buffer_resource mr;
+  P::Query flat;
+  ASSERT_TRUE(P::read_json(
+      flat, R"({"match":{"title_w":"dune"},"boost":2})", mr));
+  ASSERT_TRUE(std::holds_alternative<P::BoostQuery>(flat.kind));
+  const auto& lifted = std::get<P::BoostQuery>(flat.kind);
+  ASSERT_TRUE(lifted.query.has_value());
+  ASSERT_TRUE(lifted.boost.has_value());
+  EXPECT_FLOAT_EQ(2.0f, *lifted.boost);
+  EXPECT_EQ("title_w", std::get<P::Match>(lifted.query->kind).field);
+
+  std::string canonical;
+  ASSERT_TRUE(P::write_json(flat, canonical));
+  EXPECT_EQ(canonical,
+            R"({"boost":{"query":{"match":{"field":"title_w","val":"dune"}},"boost":2}})");
+
+  P::Query siblingFirst;
+  ASSERT_TRUE(P::read_json(
+      siblingFirst, R"({"boost":2,"match":{"title_w":"dune"}})", mr));
+  EXPECT_TRUE(std::holds_alternative<P::BoostQuery>(siblingFirst.kind));
+
+  P::Query arm;
+  ASSERT_TRUE(P::read_json(
+      arm,
+      R"({"boost":{"query":{"match":{"title_w":"dune"}},"boost":2}})",
+      mr));
+  ASSERT_TRUE(std::holds_alternative<P::BoostQuery>(arm.kind));
+  const auto& explicitArm = std::get<P::BoostQuery>(arm.kind);
+  ASSERT_TRUE(explicitArm.query.has_value());
+  EXPECT_FLOAT_EQ(2.0f, *explicitArm.boost);
+
+  P::Query bad;
+  EXPECT_FALSE(P::read_json(bad, R"({"boost":2})", mr));
+  EXPECT_FALSE(P::read_json(
+      bad, R"({"matc":{"title_w":"dune"},"boost":2})", mr));
+}
+
 TEST(JsonDialect, ExprQueryStringAndObjectForms) {
   std::pmr::monotonic_buffer_resource mr;
   P::Query q;

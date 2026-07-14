@@ -101,6 +101,16 @@ public:
     EXPECT_NE(nullptr, r);
     return *r;
   }
+  static const api::BoostQuery& asBoost(const api::Query& q) {
+    const auto* b = std::get_if<api::BoostQuery>(&q.kind);
+    EXPECT_NE(nullptr, b);
+    return *b;
+  }
+  static const api::ConstantScoreQuery& asConstantScore(const api::Query& q) {
+    const auto* c = std::get_if<api::ConstantScoreQuery>(&q.kind);
+    EXPECT_NE(nullptr, c);
+    return *c;
+  }
   static std::string_view matchVal(const api::Query& q) {
     const auto& m = asMatch(q);
     return m.val.has_value() ? m.val->asString() : std::string_view{};
@@ -434,8 +444,38 @@ TEST_F(ExprParserTest, decorationErrors) {
   expectContains(parseErr("count:10~1"), "does not apply to numeric field");
   expectContains(parseErr("count:10*"), "does not apply to numeric field");
   expectContains(parseErr("title:ab*~1"), "cannot combine '*' and '~'");
-  expectContains(parseErr("title:dune^2"), "boost (^) is reserved");
-  expectContains(parseErr("title:dune^2.5"), "boost (^) is reserved");
+}
+
+TEST_F(ExprParserTest, scoreDecorationsLowerToWrappers) {
+  const auto& boosted = asBoost(*parse("title:dune^2"));
+  ASSERT_TRUE(boosted.query.has_value());
+  EXPECT_FLOAT_EQ(2.0f, *boosted.boost);
+  EXPECT_EQ("dune", matchVal(*boosted.query));
+
+  const auto& constant = asConstantScore(*parse("title:dune^=1.5"));
+  ASSERT_TRUE(constant.query.has_value());
+  EXPECT_FLOAT_EQ(1.5f, *constant.score);
+  EXPECT_EQ("dune", matchVal(*constant.query));
+
+  const auto& group = asBoost(*parse("(title:dune OR title:messiah)^3"));
+  EXPECT_EQ(2u, asBool(*group.query).optional.size());
+  const auto& phrase = asBoost(*parse("title:\"dune messiah\"^4"));
+  EXPECT_EQ("dune messiah", asPhrase(*phrase.query).text);
+}
+
+TEST_F(ExprParserTest, boostFunctionForm) {
+  const auto& boosted = asBoost(*parse("boost(match(dune, field=title), boost=2)"));
+  ASSERT_TRUE(boosted.query.has_value());
+  EXPECT_FLOAT_EQ(2.0f, *boosted.boost);
+  EXPECT_EQ("dune", matchVal(*boosted.query));
+}
+
+TEST_F(ExprParserTest, scoreDecorationErrors) {
+  expectContains(parseErr("title:dune^"), "requires a number");
+  expectContains(parseErr("title:dune^="), "requires a number");
+  expectContains(parseErr("title:dune^2^3"), "at most one score decoration");
+  expectContains(parseErr("title:dune^2^=3"), "at most one score decoration");
+  expectContains(parseErr("title:dune^-2"), "must not be negative");
 }
 
 TEST_F(ExprParserTest, existsAndMatchAll) {

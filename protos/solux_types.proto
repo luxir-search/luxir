@@ -150,6 +150,7 @@ message Query {
     ExprQuery expr = 12;            // an expression in the Solux query language (rigorous grammar)
     GeoBoxQuery geo_box = 13;       // selects GEO_POINT values inside an inclusive bounding box
     GeoDistanceQuery geo_distance = 14; // selects GEO_POINT values within a radius of a center
+    BoostQuery boost = 15;          // multiplies every hit score of a wrapped query
 
     // TODO: wildcard query
     // TODO: function?
@@ -164,6 +165,14 @@ message ConstantScoreQuery {
   // constant score. The `optional` keyword gives this field explicit presence
   // so callers can distinguish those cases.
   optional float score = 2;
+}
+
+message BoostQuery {
+  Query query = 1;
+  // Multiplies every hit score of the wrapped query. Unset means 1.0;
+  // explicit presence so 0 (legal: matches survive, scores become 0) is
+  // representable. Must be finite and >= 0.
+  optional float boost = 2;
 }
 
 // Nearest-neighbor query against a searchable vector field.  Exact flat search
