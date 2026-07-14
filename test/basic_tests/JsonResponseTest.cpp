@@ -159,6 +159,48 @@ TEST_F(JsonResponseTest, firstDocListIsPromotedAndFacetRemains) {
       renderSearchResponseLine(req->responses[0]->proto));
 }
 
+TEST_F(JsonResponseTest, promotedDocListNestedOpsHoistIntoOps) {
+  CollectionHelper helper;
+  helper.indexAll(std::array{
+    flatdoc("id", "1", "cat_s", "x"),
+    flatdoc("id", "2", "cat_s", "x"),
+    flatdoc("id", "3", "cat_s", "y"),
+  }, UpdateMessage::COMMIT);
+
+  auto req = localReq(helper.getSearchEngine());
+  req->collection("main");
+  auto& td = req->topDocs("q");
+  td.allQuery().fields({"id"}).limit(1).getNumber();
+  td.facet("cats", "cat_s").limit(-1);
+  req->execute(false);
+  ASSERT_OK(req);
+
+  EXPECT_EQ(
+      R"({"found":3,"docs":[{"id":"1"}],"ops":{"cats":{"buckets":[{"val":"x","count":2},{"val":"y","count":1}]}}})" "\n",
+      renderSearchResponseLine(req->responses[0]->proto));
+}
+
+TEST_F(JsonResponseTest, secondDocListRendersItsNestedOps) {
+  CollectionHelper helper;
+  helper.indexAll(std::array{
+    flatdoc("id", "1", "cat_s", "x"),
+    flatdoc("id", "2", "cat_s", "y"),
+  }, UpdateMessage::COMMIT);
+
+  auto req = localReq(helper.getSearchEngine());
+  req->collection("main");
+  req->topDocs("first").allQuery().fields({"id"}).limit(1).getNumber();
+  auto& second = req->topDocs("second");
+  second.allQuery().fields({"id"}).limit(1);
+  second.facet("cats", "cat_s").limit(-1);
+  req->execute(false);
+  ASSERT_OK(req);
+
+  EXPECT_EQ(
+      R"({"found":2,"docs":[{"id":"1"}],"ops":{"second":{"docs":[{"id":"1"}],"ops":{"cats":{"buckets":[{"val":"x","count":1},{"val":"y","count":1}]}}}}})" "\n",
+      renderSearchResponseLine(req->responses[0]->proto));
+}
+
 TEST_F(JsonResponseTest, secondDocListRendersUnderOps) {
   CollectionHelper helper;
   helper.indexAll(std::array{

@@ -178,6 +178,18 @@ void appendDocList(std::string& out, const solux::api::DocList& docs) {
   }
   out += R"("docs":)";
   appendDocs(out, docs);
+  if (!docs.ops.empty()) {
+    out += R"(,"ops":{)";
+    bool firstOp = true;
+    for (const auto& [name, val] : docs.ops) {
+      if (!firstOp) out += ',';
+      firstOp = false;
+      appendJsonString(out, name);
+      out += ':';
+      appendOpVal(out, *val);
+    }
+    out += '}';
+  }
   out += '}';
 }
 
@@ -299,18 +311,26 @@ std::string renderSearchResponseLine(const solux::api::SearchResponse& resp) {
     appendKey("docs");
     appendDocs(out, *docs);
   }
-  if (resp.ops.size() > (docs ? 1 : 0)) {
+  // The promoted DocList's nested op results are hoisted into the same "ops"
+  // object as the remaining sibling ops, mirroring the found/docs promotion.
+  if (resp.ops.size() > (docs ? 1 : 0) || (docs && !docs->ops.empty())) {
     appendKey("ops");
     out += '{';
-    opIndex = 0;
     bool firstOp = true;
-    for (const auto& [name, val] : resp.ops) {
-      if (opIndex++ == promotedIndex) continue;
+    auto appendOp = [&](std::string_view name, const solux::api::Val& val) {
       if (!firstOp) out += ',';
       firstOp = false;
       appendJsonString(out, name);
       out += ':';
-      appendOpVal(out, *val);
+      appendOpVal(out, val);
+    };
+    if (docs) {
+      for (const auto& [name, val] : docs->ops) appendOp(name, *val);
+    }
+    opIndex = 0;
+    for (const auto& [name, val] : resp.ops) {
+      if (opIndex++ == promotedIndex) continue;
+      appendOp(name, *val);
     }
     out += '}';
   }
