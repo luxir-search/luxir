@@ -147,6 +147,7 @@ public:
   // Pull-conjunction refinement band: refine bounds to block granularity when
   // theta reaches this fraction of the group-granular range bound.
   static constexpr double kRefineBeta = 0.75;
+  static constexpr size_t kCostAwareOrderMinClauses = 4;
 
   BooleanQuery(std::span<Query*> mandatory, std::span<Query*> optional, std::span<Query*> prohibited,
                std::span<Query*> filter, int minShouldMatch = 0)
@@ -542,6 +543,11 @@ public:
         }
         auto& optionalScorersVec = *targetPool.make_vec<Query::Scorer*>();
         optionalScorersVec.reserve(optionalSources.size());
+        auto* optionalCostsVec = optionalSources.size() >= kCostAwareOrderMinClauses
+          ? targetPool.make_vec<int64_t>() : nullptr;
+        if (optionalCostsVec != nullptr) {
+          optionalCostsVec->reserve(optionalSources.size());
+        }
         int64_t aggregateClauseCost = 0;
         for (auto* source : optionalSources) {
           auto* supplier = source->scorerSupplier(targetPool, segment);
@@ -554,6 +560,9 @@ public:
             continue;
           }
           optionalScorersVec.push_back(scorer);
+          if (optionalCostsVec != nullptr) {
+            optionalCostsVec->push_back(cost);
+          }
           if (cost > 0
               && aggregateClauseCost < std::numeric_limits<int64_t>::max()) {
             int64_t room = std::numeric_limits<int64_t>::max() - aggregateClauseCost;
@@ -565,11 +574,15 @@ public:
           }
         }
         std::span<Query::Scorer*> optionalScorers(optionalScorersVec.data(), optionalScorersVec.size());
+        std::span<int64_t> optionalCosts;
+        if (optionalCostsVec != nullptr) {
+          optionalCosts = {optionalCostsVec->data(), optionalCostsVec->size()};
+        }
         if (optionalScorers.size() < 2) {
           return nullptr;
         }
         return targetPool.make<BooleanQuery::MaxScoreBulkScorer>(
-          targetPool, optionalScorers, segment.maxDoc(), aggregateClauseCost);
+          targetPool, optionalScorers, optionalCosts, segment.maxDoc(), aggregateClauseCost);
       }
     };
 
@@ -3023,6 +3036,7 @@ public:
     static_assert((kWindowSize % 64) == 0);
 
     std::span<Query::Scorer*> scorers;  // stable global-max order
+    std::span<int64_t> clauseCosts;     // kept aligned with scorers
     std::span<float> clauseMax;
     std::span<float> windowMax;
     std::span<int32_t> windowOrder;
@@ -3076,14 +3090,21 @@ public:
     void sortByClauseMax() {
       for (size_t i = 1; i < scorers.size(); i++) {
         Query::Scorer* scorer = scorers[i];
+        int64_t cost = clauseCosts.empty() ? 0 : clauseCosts[i];
         float maxScore = clauseMax[i];
         size_t j = i;
         while (j > 0 && lessMaxScore(maxScore, clauseMax[j - 1])) {
           scorers[j] = scorers[j - 1];
+          if (!clauseCosts.empty()) {
+            clauseCosts[j] = clauseCosts[j - 1];
+          }
           clauseMax[j] = clauseMax[j - 1];
           j--;
         }
         scorers[j] = scorer;
+        if (!clauseCosts.empty()) {
+          clauseCosts[j] = cost;
+        }
         clauseMax[j] = maxScore;
       }
     }
@@ -3110,6 +3131,22 @@ public:
     }
 
     bool lessWindowOrder(int32_t a, int32_t b) const {
+      // Lucene's score-per-cost order prevents a boosted dense clause from
+      // becoming the union driver ahead of much cheaper sparse clauses. Keep
+      // raw-max order for two and three clauses: there it preserves Solux's
+      // single-essential direct-fill path and is faster despite extra probes.
+      if (scorers.size() >= kCostAwareOrderMinClauses) {
+        float maxA = windowMax[(size_t) a];
+        float maxB = windowMax[(size_t) b];
+        bool finiteA = std::isfinite(maxA);
+        bool finiteB = std::isfinite(maxB);
+        if (finiteA != finiteB) return finiteA;
+        double ratioA = (double) maxA
+          / (double) std::max<int64_t>(1, clauseCosts[(size_t) a]);
+        double ratioB = (double) maxB
+          / (double) std::max<int64_t>(1, clauseCosts[(size_t) b]);
+        return ratioA < ratioB;
+      }
       return lessMaxScore(windowMax[(size_t) a], windowMax[(size_t) b]);
     }
 
@@ -3776,8 +3813,10 @@ public:
   public:
     // The passed in span of scorers will be modified (rearranged).
     MaxScoreBulkScorer(solux::MemPool& pool, std::span<Query::Scorer*> scorers,
+                       std::span<int64_t> clauseCosts,
                        int32_t maxDoc, int64_t aggregateClauseCost)
             : scorers(scorers),
+              clauseCosts(clauseCosts),
               clauseMax(pool.make_arr<float>(scorers.size()), scorers.size()),
               windowMax(pool.make_arr<float>(scorers.size()), scorers.size()),
               windowOrder(pool.make_arr<int32_t>(scorers.size()), scorers.size()),
@@ -3792,6 +3831,7 @@ public:
               outScores(pool.make_arr<float>((size_t) kWindowSize), (size_t) kWindowSize),
               maxDoc(maxDoc),
               aggregateClauseCost(aggregateClauseCost) {
+      assert(clauseCosts.empty() || scorers.size() == clauseCosts.size());
       scoreBoundFactor = 1.0 + (double) scorers.size() * 0x1p-24;
       for (size_t i = 0; i < scorers.size(); i++) {
         clauseMax[i] = scorers[i]->getMaxScoreForSetup(PostingsReader::END);
@@ -3987,6 +4027,10 @@ public:
 
     int32_t outerWindowEndForTests() const {
       return outerWindowEnd;
+    }
+
+    bool usesCostAwareWindowOrderForTests() const {
+      return scorers.size() >= kCostAwareOrderMinClauses;
     }
   }; // MaxScoreBulkScorer
 

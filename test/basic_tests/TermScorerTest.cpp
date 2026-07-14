@@ -1466,6 +1466,42 @@ DisjunctionTopKRun runFilteredBulkTermDisjunctionTopK(
   return result;
 }
 
+DisjunctionTopKRun runBulkBooleanTopK(IndexReader& reader,
+                                      std::span<Query*> optional,
+                                      int32_t topK,
+                                      bool* usedCostAwareOrder) {
+  MemPool pool;
+  Query::Context qContext(pool, reader);
+  std::span<Query*> empty;
+  BooleanQuery query(empty, optional, empty, empty);
+  auto* weight = query.createWeight(qContext, Query::NEED_SCORES);
+  TopDocsCollector collector(topK);
+  bool usedCostOrder = false;
+
+  auto segments = qContext.topReader.segments();
+  for (int32_t segnum = 0; segnum < (int32_t) segments.size(); segnum++) {
+    auto* supplier = weight->scorerSupplier(pool, segments[segnum]);
+    if (supplier == nullptr) continue;
+    auto* bulk = supplier->bulkScorer(pool);
+    auto* maxScoreBulk = dynamic_cast<BooleanQuery::MaxScoreBulkScorer*>(bulk);
+    if (maxScoreBulk == nullptr) {
+      ADD_FAILURE() << "bulkScorer returned unexpected type for segment " << segnum;
+      continue;
+    }
+    usedCostOrder |= maxScoreBulk->usesCostAwareWindowOrderForTests();
+    collectTopKWindowed(segnum, bulk, nullptr, nullptr, collector, nullptr,
+                        segments[segnum].maxDoc());
+  }
+
+  if (usedCostAwareOrder != nullptr) {
+    *usedCostAwareOrder = usedCostOrder;
+  }
+  DisjunctionTopKRun result;
+  result.visited = collector.totalHits();
+  result.topDocs = sortedCollectorDocs(collector);
+  return result;
+}
+
 DisjunctionTopKRun runMandOptSupplierTopK(IndexReader& reader,
                                           std::span<Query*> mandatory,
                                           std::span<Query*> optional,
@@ -6316,6 +6352,29 @@ TEST_F(TermScorerTest, MaxScoreBulkScorerBufferSweepsMatchExhaustiveAcrossShapes
 
   EXPECT_GT(sweepWindows, 0);
   EXPECT_GT(compactionDrops, 0);
+}
+
+TEST_F(TermScorerTest, MaxScoreBulkScorerCostAwareOrderIsGuardedAndExact) {
+  CollectionHelper helper("maxscore_cost_order");
+  addSweepDisjunctionDocs(helper, 4);
+  auto reader = helper.getIndexWriter()->getIndexReader();
+
+  std::vector<TermQuery> queries;
+  queries.emplace_back("body_w", "sweep0", 8.0f);
+  queries.emplace_back("body_w", "sweep1");
+  queries.emplace_back("body_w", "sweep2");
+  queries.emplace_back("body_w", "sweep3");
+  auto optional = queryPointers(queries);
+  std::span<Query*> empty;
+
+  for (int32_t clauses : {3, 4}) {
+    std::span<Query*> selected(optional.data(), (size_t) clauses);
+    auto expected = runBooleanTopK(*reader, empty, selected, 11, false);
+    bool usedCostOrder = false;
+    auto actual = runBulkBooleanTopK(*reader, selected, 11, &usedCostOrder);
+    EXPECT_EQ(clauses >= 4, usedCostOrder);
+    assertSameTopKDocs(expected, actual, 11);
+  }
 }
 
 TEST_F(TermScorerTest, MaxScoreBulkScorerWindowDispatchMatchesDisabledAcrossRandomizedUnions) {
