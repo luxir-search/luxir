@@ -14,6 +14,7 @@
 
 #include "solux/api/build.h"
 #include "solux/api/solux_types.hpp"
+#include "solux/query/Cursor.h"
 #include "solux/schema/Schema.h"
 
 namespace solux {
@@ -40,9 +41,9 @@ namespace solux {
 // interprets text: token bytes pass through unanalyzed, and analysis happens
 // at query build like every other node.
 //
-// Byte-oriented lexing: every metachar is ASCII and UTF-8 is
-// self-synchronizing, so multi-byte sequences pass through opaquely.
-// Whitespace is ASCII plus U+3000 (ideographic space).
+// Byte-oriented lexing over a bounds-checked Cursor: every metachar is ASCII
+// and UTF-8 is self-synchronizing, so multi-byte sequences pass through
+// opaquely.  Whitespace is ASCII plus U+3000 (ideographic space).
 //
 // The emitted tree is allocated in the caller's arena (per-request pool),
 // spliced where the simple_query arm sat, and lowered by the same
@@ -89,10 +90,8 @@ class SimpleQueryParser {
   std::pmr::memory_resource& mr;
   Occur defaultOccur;
 
-  const char* data = nullptr;
-  size_t pos = 0;
+  Cursor cur{std::string_view{}};
   size_t end = 0;
-  size_t inputEnd = 0;  // q.size(); `end` narrows during group recursion
 
   std::pmr::vector<char> buf;  // escape-processed token/phrase bytes (transient)
   api::build::SpanBuilder<api::Warning> warnings;
@@ -168,27 +167,24 @@ public:
   }
 
   SimpleQueryResult parse(std::string_view q) {
-    data = q.data();
-    pos = 0;
-    end = q.size();
-    inputEnd = q.size();
+    cur = Cursor(q);
+    end = cur.size();  // narrows during group recursion
 
     // Input that is exactly "*" (ignoring whitespace) selects everything
     // (Lucene SimpleQueryParser special case).
     size_t first = NPOS;
     size_t lastEnd = 0;
-    for (size_t i = 0; i < end;) {
-      if (size_t n = wsLen(i)) {
-        i += n;
-        continue;
-      }
-      if (first == NPOS) first = i;
-      lastEnd = ++i;
+    Cursor scan = cur;
+    while (!scan.atEnd()) {
+      if (scan.skipWs()) continue;
+      if (first == NPOS) first = scan.position();
+      scan.advance();
+      lastEnd = scan.position();
     }
     if (first == NPOS) {
       return {nullptr, warnings.finish()};  // empty / all-whitespace
     }
-    if (lastEnd - first == 1 && data[first] == '*') {
+    if (cur.slice(first, lastEnd) == "*") {
       api::Query all;
       all.kind = true;
       return {allocQuery(all), warnings.finish()};
@@ -465,19 +461,6 @@ private:
 
   // ---- lexing ----
 
-  // Whitespace length at i: ASCII space/tab/newline/return, or U+3000
-  // (ideographic space, E3 80 80 - the one non-ASCII whitespace two decades
-  // of Lucene needed).  0 = not whitespace.
-  size_t wsLen(size_t i) const {
-    char c = data[i];
-    if (c == ' ' || c == '\t' || c == '\n' || c == '\r') return 1;
-    if ((uint8_t)c == 0xE3 && i + 2 < end && (uint8_t)data[i + 1] == 0x80 &&
-        (uint8_t)data[i + 2] == 0x80) {
-      return 3;
-    }
-    return 0;
-  }
-
   // A token ends at a paren or whitespace.  The operator characters '+' '-'
   // '|' do NOT end a token: they are operators only at a clause boundary
   // (see runRange), so mid-token they are ordinary term bytes and pass
@@ -486,9 +469,9 @@ private:
   // value can begin - at a clause boundary, after one leading sign, or right
   // after a token's first ':' (field:"...") - so can"t and say"hi stay one
   // token (same positional rule, applied to quotes).
-  bool tokenFinished(size_t i) const {
-    char c = data[i];
-    return c == '(' || c == ')' || wsLen(i) > 0;
+  bool tokenFinished(const Cursor& scan) const {
+    char c = scan.peek();
+    return c == '(' || c == ')' || scan.wsLen() > 0;
   }
 
   // Is the '~' at tildePos a clean trailing fuzzy operator: '~' then optional
@@ -496,19 +479,22 @@ private:
   // junk after it, e.g. abc~2+d or abc~xyz - the '~' is a literal term byte,
   // like '*' anywhere but the token end.  Mangled decorations read as text.
   bool fuzzySuffix(size_t tildePos) const {
-    size_t i = tildePos + 1;
-    while (i < end && data[i] >= '0' && data[i] <= '9') i++;
-    return i >= end || tokenFinished(i);
+    Cursor scan = cur;
+    scan.seek(tildePos + 1);
+    while (scan.position() < end && scan.peek() >= '0' && scan.peek() <= '9') {
+      scan.advance();
+    }
+    return scan.position() >= end || tokenFinished(scan);
   }
 
   // At '~': consume it and the following characters up to a token boundary.
   // nullopt = bare '~' (AUTO); otherwise the parsed number, with garbage
   // swallowed to 0 and negatives floored to 0 (Lucene behaviors).
   std::optional<int> parseFuzziness() {
-    ++pos;
-    size_t s = pos;
-    while (pos < end && !tokenFinished(pos)) ++pos;
-    std::string_view digits(data + s, pos - s);
+    cur.advance();
+    size_t s = cur.position();
+    while (cur.position() < end && !tokenFinished(cur)) cur.advance();
+    std::string_view digits = cur.slice(s, cur.position());
     if (digits.empty()) return std::nullopt;
     int v = 0;
     auto [p, ec] = std::from_chars(digits.data(), digits.data() + digits.size(), v);
@@ -524,31 +510,32 @@ private:
 
   // At an opening '"': collect the phrase bytes (escape-processed) through
   // the closing quote and consume a trailing ~ suffix. Returns an
-  // ARENA-BACKED copy, or nullopt
-  // with pos reset past the opening quote when unterminated (the quote is
-  // then extraneous and its contents reparse as tokens).
+  // ARENA-BACKED copy, or nullopt with the cursor reset past the opening
+  // quote when unterminated (the quote is then extraneous and its contents
+  // reparse as tokens).
   std::optional<PhraseBody> parsePhraseBody() {
-    size_t start = ++pos;
+    cur.advance();
+    size_t start = cur.position();
     buf.clear();
     bool escaped = false;
-    while (pos < end) {
-      char c = data[pos];
+    while (cur.position() < end) {
+      char c = cur.peek();
       if (!escaped) {
         if (c == '\\') {
           escaped = true;
-          ++pos;
+          cur.advance();
           continue;
         }
         if (c == '"') {
-          ++pos;  // past the closing quote
+          cur.advance();  // past the closing quote
           int32_t slop = 0;
           bool suffixPresent = false;
-          if (pos < end && data[pos] == '~') {
+          if (cur.position() < end && cur.peek() == '~') {
             suffixPresent = true;
-            ++pos;
-            size_t suffixStart = pos;
-            while (pos < end && !tokenFinished(pos)) ++pos;
-            std::string_view suffix(data + suffixStart, pos - suffixStart);
+            cur.advance();
+            size_t suffixStart = cur.position();
+            while (cur.position() < end && !tokenFinished(cur)) cur.advance();
+            std::string_view suffix = cur.slice(suffixStart, cur.position());
             bool malformed = suffix.empty();
             bool overflow = false;
             int64_t value = 0;
@@ -581,9 +568,9 @@ private:
       }
       escaped = false;
       buf.push_back(c);
-      ++pos;
+      cur.advance();
     }
-    pos = start;
+    cur.seek(start);
     return std::nullopt;
   }
 
@@ -600,22 +587,13 @@ private:
   size_t matchingClose(size_t openPos) {
     if (!parenTableBuilt) {
       parenTableBuilt = true;
-      parenClose.assign(inputEnd, NPOS);
+      parenClose.assign(cur.size(), NPOS);
 
       // phase 1: find quote regions with the boundary-aware opening rule
       std::pmr::vector<std::pair<size_t, size_t>> quoted(&mr);
       {
-        // wsLen() checks against the (possibly narrowed) `end`; the table
-        // covers the whole input
-        auto wsAt = [&](size_t i) -> size_t {
-          char c = data[i];
-          if (c == ' ' || c == '\t' || c == '\n' || c == '\r') return 1;
-          if ((uint8_t)c == 0xE3 && i + 2 < inputEnd && (uint8_t)data[i + 1] == 0x80 &&
-              (uint8_t)data[i + 2] == 0x80) {
-            return 3;
-          }
-          return 0;
-        };
+        Cursor scan = cur;
+        scan.seek(0);
         bool escaped = false;
         bool canOpen = true;      // a value can begin here
         bool signTaken = false;   // one boundary sign consumed; a value may follow
@@ -628,20 +606,23 @@ private:
           colonJustBefore = false;
           tokenLen++;
         };
-        for (size_t i = 0; i < inputEnd; i++) {
+        while (!scan.atEnd()) {
+          size_t i = scan.position();
           if (escaped) {
             escaped = false;
             tokenByte();  // an escaped byte is a token byte (even a ':')
+            scan.advance();
             continue;
           }
-          char c = data[i];
-          if (size_t n = wsAt(i)) {
-            i += n - 1;
+          char c = scan.peek();
+          if (size_t n = scan.wsLen()) {
+            scan.advance(n);
             canOpen = true;
             signTaken = false;
             colonSeen = false;
             colonJustBefore = false;
             tokenLen = 0;
+            continue;
           } else if (c == '\\') {
             escaped = true;
           } else if (c == '(') {
@@ -666,21 +647,25 @@ private:
           } else if (c == '"') {
             size_t close = NPOS;
             if (canOpen || colonJustBefore) {
+              Cursor quoteScan = scan;
+              quoteScan.advance();
               bool esc2 = false;
-              for (size_t j = i + 1; j < inputEnd; j++) {
+              while (!quoteScan.atEnd()) {
+                char quoteByte = quoteScan.peek();
                 if (esc2) {
                   esc2 = false;
-                } else if (data[j] == '\\') {
+                } else if (quoteByte == '\\') {
                   esc2 = true;
-                } else if (data[j] == '"') {
-                  close = j;
+                } else if (quoteByte == '"') {
+                  close = quoteScan.position();
                   break;
                 }
+                quoteScan.advance();
               }
             }
             if (close != NPOS) {
               quoted.push_back({i, close});
-              i = close;
+              scan.seek(close);
               canOpen = false;
               signTaken = false;
               colonSeen = false;
@@ -698,24 +683,30 @@ private:
           } else {
             tokenByte();
           }
+          scan.advance();
         }
       }
 
       // phase 2: pair parens, skipping the quoted regions
       std::pmr::vector<size_t> stack(&mr);
+      Cursor scan = cur;
+      scan.seek(0);
       bool escaped = false;
       size_t qi = 0;
-      for (size_t i = 0; i < inputEnd; i++) {
+      while (!scan.atEnd()) {
+        size_t i = scan.position();
         if (qi < quoted.size() && i == quoted[qi].first) {
-          i = quoted[qi].second;  // jump to the closing quote (loop ++ steps past)
+          scan.seek(quoted[qi].second);
+          scan.advance();  // jump past the closing quote
           qi++;
           continue;
         }
         if (escaped) {
           escaped = false;
+          scan.advance();
           continue;
         }
-        char c = data[i];
+        char c = scan.peek();
         if (c == '\\') {
           escaped = true;
         } else if (c == '(') {
@@ -724,6 +715,7 @@ private:
           parenClose[stack.back()] = i;
           stack.pop_back();
         }
+        scan.advance();
       }
     }
     return parenClose[openPos];
@@ -732,9 +724,9 @@ private:
   // ---- the Lucene state machine ----
 
   void runRange(Level& st, size_t start, size_t stop, int depth) {
-    size_t savedPos = pos;
+    size_t savedPos = cur.position();
     size_t savedEnd = end;
-    pos = start;
+    cur.seek(start);
     end = stop;
 
     // '+' '-' '|' are operators only at a clause boundary: the start of the
@@ -749,8 +741,8 @@ private:
     // the next unit, spaces and all) and is cleared when that unit lands.
     bool atBoundary = true;
     bool afterOp = false;  // one boundary sign consumed; a value may follow
-    while (pos < end) {
-      char c = data[pos];
+    while (cur.position() < end) {
+      char c = cur.peek();
       bool quoteOpens = atBoundary || afterOp;
       afterOp = false;
       if (c == '(') {
@@ -758,31 +750,31 @@ private:
         // is ignored and leaves the boundary state untouched
         if (consumeSubQuery(st, depth)) atBoundary = false;
       } else if (c == ')') {
-        ++pos;  // extraneous ')': ignored, neutral for boundary state
+        cur.advance();  // extraneous ')': ignored, neutral for boundary state
       } else if (c == '"' && quoteOpens) {
         consumePhrase(st);
         atBoundary = false;
       } else if (c == '+' && atBoundary) {
         st.plus = true;  // required modifier on the next unit
-        ++pos;
+        cur.advance();
         atBoundary = false;
         afterOp = true;
         continue;
       } else if (c == '|' && atBoundary) {
         // OR conjunction to the next unit; ignored with nothing before it
         if (st.hasAny()) st.orConj = true;
-        ++pos;
+        cur.advance();
         atBoundary = false;
         afterOp = true;
         continue;
       } else if (c == '-' && atBoundary) {
         ++st.notCount;  // prohibited modifier on the next unit
-        ++pos;
+        cur.advance();
         atBoundary = false;
         afterOp = true;
         continue;
-      } else if (size_t n = wsLen(pos)) {
-        pos += n;
+      } else if (size_t n = cur.wsLen()) {
+        cur.advance(n);
         atBoundary = true;
       } else {
         consumeToken(st);
@@ -795,7 +787,7 @@ private:
       st.notCount = 0;
     }
 
-    pos = savedPos;
+    cur.seek(savedPos);
     end = savedEnd;
   }
 
@@ -808,27 +800,27 @@ private:
   // Returns true only when a real group unit was consumed (so the caller
   // leaves a clause boundary behind it); an extraneous '(' is neutral.
   bool consumeSubQuery(Level& st, int depth) {
-    size_t open = pos;
+    size_t open = cur.position();
     size_t start = open + 1;
     size_t close = matchingClose(open);
     if (close == NPOS || close >= end) {
       // no closing parenthesis in range: the opening one is extraneous;
       // contents reparse (the '(' does not disturb the boundary state)
-      pos = start;
+      cur.seek(start);
       return false;
     } else if (close == start) {
       // "()" drops a pending modifier (it would have applied to this group)
       clearPending(st);
-      pos = close + 1;
+      cur.seek(close + 1);
       return false;
     } else if (depth + 1 >= MAX_DEPTH) {
       warn("depth_clamped",
            "parenthesis nesting exceeds the supported depth; deeper parentheses are ignored");
-      pos = start;
+      cur.seek(start);
       return false;
     } else {
       const api::Query* sub = parseRange(start, close, depth + 1);
-      pos = close + 1;
+      cur.seek(close + 1);
       addUnit(st, sub);  // null (empty group) just drops the pending modifier
       return sub != nullptr;
     }
@@ -853,16 +845,16 @@ private:
     bool sawFuzzy = false;
     std::optional<size_t> firstColon;  // buf position of the first unescaped ':'
 
-    while (pos < end) {
-      char c = data[pos];
+    while (cur.position() < end) {
+      char c = cur.peek();
       if (!escaped) {
         if (c == '\\') {
           escaped = true;
           prefix = false;
-          ++pos;
+          cur.advance();
           continue;
         }
-        if (tokenFinished(pos)) break;
+        if (tokenFinished(cur)) break;
         if (c == '"') {
           // A quote is special mid-token only right after the token's first
           // ':' - the fielded-value position (status:"in stock"; for a
@@ -906,13 +898,13 @@ private:
               return;
             }
             // unterminated: the quote is not a quote; drop it and keep
-            // scanning the token (pos already sits past it)
+            // scanning the token (the cursor already sits past it)
             buf.assign(tokenText.begin(), tokenText.end());
             continue;
           }
           // fall through: an ordinary term byte
         }
-        if (!buf.empty() && c == '~' && fuzzySuffix(pos)) {
+        if (!buf.empty() && c == '~' && fuzzySuffix(cur.position())) {
           sawFuzzy = true;
           break;
         }
@@ -921,7 +913,7 @@ private:
       }
       escaped = false;
       buf.push_back(c);
-      ++pos;
+      cur.advance();
     }
 
     if (buf.empty()) return;

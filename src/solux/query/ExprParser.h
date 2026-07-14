@@ -244,9 +244,7 @@ private:
     char c = cur.peekAt(ahead);
     if (c == '(' || c == ')' || c == '[' || c == '{') return true;
     if (isStop(c, stops)) return true;
-    if (c == ' ' || c == '\t' || c == '\n' || c == '\r') return true;
-    return (uint8_t)c == 0xE3 && (uint8_t)cur.peekAt(ahead + 1) == 0x80 &&
-           (uint8_t)cur.peekAt(ahead + 2) == 0x80;  // U+3000
+    return cur.wsLenAt(ahead) > 0;
   }
 
   bool consumeKeyword(std::string_view kw, std::string_view stops) {

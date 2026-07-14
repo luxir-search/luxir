@@ -80,19 +80,25 @@ public:
     return {base + start, pos - start};
   }
 
-  // Inter-token whitespace length at the current position: ASCII
-  // space/tab/newline/return, or U+3000 (ideographic space, E3 80 80 - the
-  // one non-ASCII whitespace two decades of Lucene needed).  0 = none.
-  size_t wsLen() const {
-    if (pos >= len) return 0;
-    char c = base[pos];
+  // Inter-token whitespace length `ahead` bytes from the current position:
+  // ASCII space/tab/newline/return, or U+3000 (ideographic space, E3 80 80 -
+  // the one non-ASCII whitespace two decades of Lucene needed).  0 = none.
+  size_t wsLenAt(size_t ahead) const {
+    if (ahead >= remaining()) return 0;
+    char c = base[pos + ahead];
     if (c == ' ' || c == '\t' || c == '\n' || c == '\r') return 1;
-    if ((uint8_t)c == 0xE3 && remaining() >= 3 && (uint8_t)base[pos + 1] == 0x80 &&
-        (uint8_t)base[pos + 2] == 0x80) {
+    size_t left = remaining() - ahead;
+    if ((uint8_t)c == 0xE3 && left >= 3 && (uint8_t)base[pos + ahead + 1] == 0x80 &&
+        (uint8_t)base[pos + ahead + 2] == 0x80) {
       return 3;
     }
     return 0;
   }
+
+  // Inter-token whitespace length at the current position: ASCII
+  // space/tab/newline/return, or U+3000 (ideographic space, E3 80 80 - the
+  // one non-ASCII whitespace two decades of Lucene needed).  0 = none.
+  size_t wsLen() const { return wsLenAt(0); }
 
   // Skip whitespace; returns whether any was skipped.
   bool skipWs() {
