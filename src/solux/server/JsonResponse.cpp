@@ -126,6 +126,24 @@ void appendCell(std::string& out, const solux::api::Column& col, size_t i) {
   }
 }
 
+// Facet bucket IDs are always present. Unlike document columns, their Column
+// storage does not use missing_val sentinels.
+void appendBucketId(std::string& out, const solux::api::Column& col, size_t i) {
+  if (auto* c = std::get_if<solux::api::ColInt>(&col.kind)) {
+    if (i < c->v.size()) appendInt(out, c->v[i]);
+    else out += "null";
+  } else if (auto* c = std::get_if<solux::api::ColStr>(&col.kind)) {
+    if (i < c->v.size()) appendJsonString(out, c->v[i]);
+    else out += "null";
+  } else if (auto* c = std::get_if<solux::api::ArrArrInt>(&col.kind)) {
+    if (i < c->v.size() && !c->v[i].v.empty())
+      appendArray(out, c->v[i].v, [&](int64_t x){ appendInt(out, x); });
+    else out += "null";
+  } else {
+    out += "null";
+  }
+}
+
 void appendDocs(std::string& out, const solux::api::DocList& docs) {
   size_t numDocs = 0;
   for (const auto& [name, col] : docs.columns) {
@@ -149,6 +167,97 @@ void appendDocs(std::string& out, const solux::api::DocList& docs) {
   out += ']';
 }
 
+void appendOpVal(std::string& out, const solux::api::Val& val);
+
+void appendDocList(std::string& out, const solux::api::DocList& docs) {
+  out += '{';
+  if (docs.matches.has_value()) {
+    out += R"("found":)";
+    appendInt(out, *docs.matches);
+    out += ',';
+  }
+  out += R"("docs":)";
+  appendDocs(out, docs);
+  out += '}';
+}
+
+void appendFacetSlot(std::string& out, const solux::api::Val& val, size_t i) {
+  if (auto* arr = std::get_if<solux::api::ArrDouble>(&val.kind)) {
+    if (i < arr->v.size()) appendFloating(out, arr->v[i]);
+    else out += "null";
+  } else if (auto* arr = std::get_if<solux::api::ArrFloat>(&val.kind)) {
+    if (i < arr->v.size()) appendFloating(out, arr->v[i]);
+    else out += "null";
+  } else if (auto* arr = std::get_if<solux::api::ArrInt>(&val.kind)) {
+    if (i < arr->v.size()) appendInt(out, arr->v[i]);
+    else out += "null";
+  } else if (auto* arr = std::get_if<solux::api::ArrStr>(&val.kind)) {
+    if (i < arr->v.size()) appendJsonString(out, arr->v[i]);
+    else out += "null";
+  } else if (auto* arr = std::get_if<solux::api::ArrVal>(&val.kind)) {
+    if (i < arr->v.size()) appendOpVal(out, arr->v[i]);
+    else out += "null";
+  } else {
+    out += "null";
+  }
+}
+
+void appendFacetResult(std::string& out, const solux::api::FacetResult& facet) {
+  out += R"({"buckets":[)";
+  for (size_t i = 0; i < facet.counts.size(); i++) {
+    if (i) out += ',';
+    out += R"({"val":)";
+    if (facet.bucket_ids.has_value()) appendBucketId(out, *facet.bucket_ids, i);
+    else out += "null";
+    out += R"(,"count":)";
+    appendInt(out, facet.counts[i]);
+    for (const auto& [name, val] : facet.ops) {
+      out += ',';
+      appendJsonString(out, name);
+      out += ':';
+      appendFacetSlot(out, *val, i);
+    }
+    out += '}';
+  }
+  out += ']';
+  if (facet.missing.has_value()) {
+    out += R"(,"missing":)";
+    appendInt(out, *facet.missing);
+  }
+  if (facet.total_buckets.has_value()) {
+    out += R"(,"total_buckets":)";
+    appendInt(out, *facet.total_buckets);
+  }
+  out += '}';
+}
+
+void appendOpVal(std::string& out, const solux::api::Val& val) {
+  if (std::holds_alternative<std::monostate>(val.kind) ||
+      std::holds_alternative<google::protobuf::NullValue>(val.kind)) {
+    out += "null";
+  } else if (auto* s = std::get_if<std::string_view>(&val.kind)) {
+    appendJsonString(out, *s);
+  } else if (auto* i = std::get_if<int64_t>(&val.kind)) {
+    appendInt(out, *i);
+  } else if (auto* d = std::get_if<double>(&val.kind)) {
+    appendFloating(out, *d);
+  } else if (auto* f = std::get_if<float>(&val.kind)) {
+    appendFloating(out, *f);
+  } else if (auto* b = std::get_if<bool>(&val.kind)) {
+    out += *b ? "true" : "false";
+  } else if (auto* docs = std::get_if<solux::api::DocList>(&val.kind)) {
+    appendDocList(out, *docs);
+  } else if (auto* facet = std::get_if<solux::api::FacetResult>(&val.kind)) {
+    appendFacetResult(out, *facet);
+  } else {
+    // The generated Val writer starts at offset zero, so serialize into a
+    // temporary before appending the canonical form of the remaining arms.
+    std::string tmp;
+    if (solux::api::write_json(val, tmp)) out += tmp;
+    else out += "null";
+  }
+}
+
 } // namespace
 
 std::string renderSearchResponseLine(const solux::api::SearchResponse& resp) {
@@ -162,29 +271,53 @@ std::string renderSearchResponseLine(const solux::api::SearchResponse& resp) {
   }
 
   const solux::api::DocList* docs = nullptr;
+  size_t promotedIndex = resp.ops.size();
+  size_t opIndex = 0;
   for (const auto& [name, val] : resp.ops) {
     if (auto* docList = std::get_if<solux::api::DocList>(&val->kind)) {
       docs = docList;
+      promotedIndex = opIndex;
       break;
     }
+    opIndex++;
   }
+  bool first = true;
+  auto appendKey = [&](std::string_view name) {
+    if (!first) out += ',';
+    first = false;
+    appendJsonString(out, name);
+    out += ':';
+  };
   if (docs) {
     // "found" is opt-in: matches is set only when get_number was requested (an
     // exact count forgoes dynamic pruning).  Omit the key when absent rather than
     // rendering 0, so "not requested" is not confused with "zero matches".
     if (docs->matches.has_value()) {
-      out += R"("found":)";
+      appendKey("found");
       appendInt(out, *docs->matches);
-      out += ',';
     }
-    out += R"("docs":)";
+    appendKey("docs");
     appendDocs(out, *docs);
-  } else {
-    out += R"("docs":[])";
+  }
+  if (resp.ops.size() > (docs ? 1 : 0)) {
+    appendKey("ops");
+    out += '{';
+    opIndex = 0;
+    bool firstOp = true;
+    for (const auto& [name, val] : resp.ops) {
+      if (opIndex++ == promotedIndex) continue;
+      if (!firstOp) out += ',';
+      firstOp = false;
+      appendJsonString(out, name);
+      out += ':';
+      appendOpVal(out, *val);
+    }
+    out += '}';
   }
   if (!resp.warnings.empty()) {
     // declared degradations (the request was served, but not exactly as written)
-    out += R"(,"warnings":[)";
+    appendKey("warnings");
+    out += '[';
     for (size_t i = 0; i < resp.warnings.size(); i++) {
       if (i) out += ',';
       out += R"({"code":)";
@@ -195,7 +328,10 @@ std::string renderSearchResponseLine(const solux::api::SearchResponse& resp) {
     }
     out += ']';
   }
-  if (resp.more) out += R"(,"more":true)";
+  if (resp.more) {
+    appendKey("more");
+    out += "true";
+  }
   out += "}\n";
   return out;
 }

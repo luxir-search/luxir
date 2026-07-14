@@ -6,19 +6,17 @@
 namespace solux {
 
 // Render one solux::api::SearchResponse as a single bespoke JSON object, terminated
-// with a newline (one NDJSON line).  The columnar DocList is flattened to a
-// row-major array of objects; a column slot that holds its missing_val sentinel
-// (or, for multi-valued columns, an empty list) renders as JSON null.
+// with a newline (one NDJSON line). Columnar DocList and FacetResult values are
+// flattened to row-major JSON; missing and non-finite slots render as JSON null.
 //
 // Shape:
 //   {"found": <matches>, "docs": [ {<field>: <val>, ...}, ... ],
+//    "ops": {<name>: <row-shaped value>, ...},
 //    "warnings": [ {"code": ..., "message": ...}, ... ], "more": true}
-// (warnings only when present: declared degradations, e.g. a clamped fuzzy)
-// or on engine error:
+// Optional keys are omitted when absent. The first DocList is promoted to
+// found/docs; all remaining response ops stay under ops in response order.
+// On engine error:
 //   {"error": "<message>"}
-//
-// Phase 0 renders the first response op that carries a DocList (the single
-// top_docs query).  Facet / multi-op shaping is deferred.
 std::string renderSearchResponseLine(const solux::api::SearchResponse& resp);
 
 // Build a minimal JSON error body (no trailing newline) for transport-level

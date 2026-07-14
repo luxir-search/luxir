@@ -167,6 +167,19 @@ TEST_F(HttpApiTest, updateIndexesAndQueryRoundTrip) {
   EXPECT_EQ(std::set<std::string>({"u1"}), idsOf(hreq.getDocs())) << hreq.rawResponse();
 }
 
+TEST_F(HttpApiTest, facetResponseUsesBucketRows) {
+  auto update = httpRequest(port(), http::verb::post, "/collections/main/update",
+      R"({"docs":[{"id":"f1","http_facet_s":"x"},{"id":"f2","http_facet_s":"x"},{"id":"f3","http_facet_s":"y"},{"id":"f4"}],"commit":{}})");
+  ASSERT_EQ(200, update.result_int()) << update.body();
+
+  auto response = httpRequest(port(), http::verb::post, "/collections/main/query",
+      R"({"ops":{"cats":{"field_facet":{"field":"http_facet_s","limit":-1,"missing":true}}}})");
+  ASSERT_EQ(200, response.result_int()) << response.body();
+  EXPECT_EQ(
+      R"({"ops":{"cats":{"buckets":[{"val":"x","count":2},{"val":"y","count":1}],"missing":1}}})" "\n",
+      response.body());
+}
+
 TEST_F(HttpApiTest, multiCollectionRoutingIsIsolated) {
   SoluxTest::clearCollection("http_route_a");
   SoluxTest::clearCollection("http_route_b");
