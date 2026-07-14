@@ -19,16 +19,17 @@ class ConstantScoreQuery final : public solux::Query {
   class Scorer final : public Query::Scorer {
     Query::Scorer* child;
     float constantScore;
+    bool exhausted = false;  // latched when the constant can no longer compete
 
   public:
     Scorer(Query::Scorer* child, float constantScore) : child(child), constantScore(constantScore) {}
 
     int32_t next() override {
-      return child->next();
+      return exhausted ? PostingsReader::END : child->next();
     }
 
     int32_t advance(int32_t docid) override {
-      return child->advance(docid);
+      return exhausted ? PostingsReader::END : child->advance(docid);
     }
 
     int32_t docId() override {
@@ -39,12 +40,38 @@ class ConstantScoreQuery final : public solux::Query {
       return constantScore;
     }
 
+    // Every match scores exactly the constant, so the bound is flat and
+    // exact: no shallow structure, and once the collector's floor rises
+    // above it no remaining doc can compete (ties stay competitive, same
+    // convention as impact skipping).  The current position stays valid;
+    // only future iteration ends.  Not forwarded to the child: it was built
+    // scoreless, so the wrapper owns all score semantics.
+    void setMinCompetitiveScore(float minScore) override {
+      if (minScore > constantScore) exhausted = true;
+    }
+    float getMaxScore(int32_t upTo) override {
+      unused(upTo);
+      return constantScore;
+    }
+    float getMaxScoreForSetup(int32_t upTo) override {
+      unused(upTo);
+      return constantScore;
+    }
+    int32_t advanceShallowForSetup(int32_t target) override {
+      unused(target);
+      return PostingsReader::END;
+    }
+
     // Matching is exactly the child's, so forward two-phase iteration: a
     // constant_score(range) / constant_score(phrase) clause keeps verifying
     // cheaply in a conjunction instead of forcing its child to iterate fully.
     bool hasTwoPhase() const override { return child->hasTwoPhase(); }
-    int32_t approximationNext() override { return child->approximationNext(); }
-    int32_t approximationAdvance(int32_t target) override { return child->approximationAdvance(target); }
+    int32_t approximationNext() override {
+      return exhausted ? PostingsReader::END : child->approximationNext();
+    }
+    int32_t approximationAdvance(int32_t target) override {
+      return exhausted ? PostingsReader::END : child->approximationAdvance(target);
+    }
     int32_t approximationDocId() override { return child->approximationDocId(); }
     bool matches() override { return child->matches(); }
     float matchCost() override { return child->matchCost(); }

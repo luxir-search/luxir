@@ -36,6 +36,7 @@ public:
     int32_t maxDoc;
     float boost;
     int32_t docid = -1;
+    bool exhausted = false;  // latched when `boost` can no longer compete
 
     // First set bit at or after `from`, or END when none remain.
     int32_t advanceTo(int32_t from) {
@@ -47,15 +48,35 @@ public:
     Scorer(FixedBitSet bits, int32_t maxDoc, float boost) : bits(bits), maxDoc(maxDoc), boost(boost) {}
 
     int32_t next() override {
-      if (docid == PostingsReader::END) return docid;  // idempotent at END
+      if (exhausted || docid == PostingsReader::END) return docid = PostingsReader::END;
       return advanceTo(docid + 1);
     }
     int32_t advance(int32_t target) override {
+      if (exhausted) return docid = PostingsReader::END;
       assert(docid < target);  // strict advance
       return advanceTo(target);
     }
     int32_t docId() override { return docid; }
     float score() override { return boost; }
+
+    // Every match scores exactly `boost`: a flat, exact bound with no
+    // shallow structure.  Once the collector's floor rises above it, no
+    // remaining doc can compete (ties stay competitive).
+    void setMinCompetitiveScore(float minScore) override {
+      if (minScore > boost) exhausted = true;
+    }
+    float getMaxScore(int32_t upTo) override {
+      unused(upTo);
+      return boost;
+    }
+    float getMaxScoreForSetup(int32_t upTo) override {
+      unused(upTo);
+      return boost;
+    }
+    int32_t advanceShallowForSetup(int32_t target) override {
+      unused(target);
+      return PostingsReader::END;
+    }
   };
 
   class Weight final : public Query::Weight {

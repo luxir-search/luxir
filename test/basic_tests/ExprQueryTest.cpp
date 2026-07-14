@@ -24,6 +24,7 @@
 #include "solux/query/ConstantScoreQuery.h"
 #include "solux/query/FuzzyQuery.h"
 #include "solux/query/PhraseQuery.h"
+#include "solux/query/PrefixQuery.h"
 #include "solux/query/TermQuery.h"
 #include "solux/search/Collector.h"
 
@@ -167,6 +168,58 @@ TEST_F(BoostQueryTest, foldedBoundsMatchExhaustiveAcrossQueryKinds) {
   TermQuery zeroTerm("body_w", "alpha");
   BoostQuery zero(&zeroTerm, 0.0f);
   assertPrunedTopKMatchesExhaustive(*index.reader, zero, "zero", 5, false);
+
+  // constant_score as a scoring clause of a disjunction: its flat bound
+  // (below and above the term's score range) must stay admissible
+  TermQuery alphaOpt("body_w", "alpha");
+  TermQuery gammaOpt("body_w", "gamma");
+  ConstantScoreQuery lowConstant(&gammaOpt, 0.1f);
+  std::vector<Query*> lowClauses = {&alphaOpt, &lowConstant};
+  BooleanQuery lowOr({}, lowClauses, {}, {});
+  assertPrunedTopKMatchesExhaustive(*index.reader, lowOr, "low-constant OR", 5, false);
+
+  ConstantScoreQuery highConstant(&gammaOpt, 50.0f);
+  std::vector<Query*> highClauses = {&alphaOpt, &highConstant};
+  BooleanQuery highOr({}, highClauses, {}, {});
+  assertPrunedTopKMatchesExhaustive(*index.reader, highOr, "high-constant OR", 5, false);
+}
+
+TEST_F(BoostQueryTest, flatBoundScorersReportExactBoundsAndExhaust) {
+  TestIndex index;
+  TestField body(index, "body_w");
+  body.startIndexing();
+  body.add(0, "alpha");
+  body.add(1, "alpha alternate");
+  index.flush();
+  body.startReading();
+
+  MemPool pool;
+  Query::Context context(pool, *index.reader);
+  auto& segment = index.reader->segments()[0];
+
+  TermQuery term("body_w", "alpha");
+  ConstantScoreQuery constant(&term, 2.0f);
+  auto* scorer = constant.createWeight(context, Query::NEED_SCORES)
+      ->createScorer(pool, segment);
+  ASSERT_NE(nullptr, scorer);
+  EXPECT_FLOAT_EQ(2.0f, scorer->getMaxScore(PostingsReader::END));
+  EXPECT_FLOAT_EQ(2.0f, scorer->getMaxScoreForSetup(PostingsReader::END));
+  scorer->setMinCompetitiveScore(2.0f);  // a tie stays competitive
+  EXPECT_EQ(0, scorer->next());
+  scorer->setMinCompetitiveScore(2.5f);  // above the constant: exhausted
+  EXPECT_EQ(PostingsReader::END, scorer->next());
+
+  PrefixQuery prefix("body_w", "al");
+  BoostQuery boosted(&prefix, 3.0f);
+  auto* multiTerm = boosted.createWeight(context, Query::NEED_SCORES)
+      ->createScorer(pool, segment);
+  ASSERT_NE(nullptr, multiTerm);
+  EXPECT_FLOAT_EQ(3.0f, multiTerm->getMaxScore(PostingsReader::END));
+  EXPECT_EQ(0, multiTerm->next());
+  multiTerm->setMinCompetitiveScore(3.0f);  // tie: keeps iterating
+  EXPECT_EQ(1, multiTerm->next());
+  multiTerm->setMinCompetitiveScore(3.5f);  // above the constant: exhausted
+  EXPECT_EQ(PostingsReader::END, multiTerm->next());
 }
 
 TEST_F(BoostQueryTest, constantScoreAbsorbsOnlyOuterBoost) {

@@ -80,6 +80,20 @@ public:
   }
   int32_t docId() override { return docid; }
   float score() override { return 0.0f; }
+
+  // Every match scores 0: a flat, exact bound with no shallow structure.
+  float getMaxScore(int32_t upTo) override {
+    unused(upTo);
+    return 0.0f;
+  }
+  float getMaxScoreForSetup(int32_t upTo) override {
+    unused(upTo);
+    return 0.0f;
+  }
+  int32_t advanceShallowForSetup(int32_t target) override {
+    unused(target);
+    return PostingsReader::END;
+  }
 };
 
 template <class QueryType, class Relation>
