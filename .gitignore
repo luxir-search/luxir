@@ -61,3 +61,6 @@ protos/*.grpc.pb.h
 # Local agent and dependency worktrees
 .claude/
 deps/FastPFOR/
+
+# Per-machine build additions (hooked via `include(LocalTargets.cmake OPTIONAL)`)
+LocalTargets.cmake
