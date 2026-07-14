@@ -35,8 +35,9 @@ public:
 
   ~FullTextHandler() override = default;
 
-  // Positions jump by this between the values of a multi-valued text field so
-  // phrases never match across value boundaries (the OpenSearch convention).
+  // Positions jump by this between values of a multi-valued text field. The
+  // gap discourages ordinary phrase matches but does not isolate values:
+  // slop >= 100 can cross the boundary (adjacent raw positions differ by 101).
   static constexpr int POSITION_INCREMENT_GAP = 100;
 
   void index(Inverter& inverter, const IndexVal& val) override {

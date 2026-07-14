@@ -323,7 +323,10 @@ message PhraseQuery {
   repeated string terms = 4;     // analyzed list of terms as strings
   repeated bytes terms_bin = 5;  // analyzed list of binary (raw bytes) terms
 
-  // TODO: add a parameter for slop?
+  // Maximum spread of rebased positions: max(docPos-queryPos) minus
+  // min(docPos-queryPos). Must be nonnegative. Adjacent transposition costs
+  // 2; this is not the number of words between terms. Zero is exact.
+  int32 slop = 6;
   repeated int32 positions = 15; // optional positions of the terms
 }
 

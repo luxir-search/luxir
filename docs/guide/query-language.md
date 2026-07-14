@@ -38,6 +38,7 @@ query, and what a value means is decided by its field, not by its shape:
 title_w:dune                term match, analyzed like the field was
 title_w:"dune messiah"      phrase (on analyzed text fields)
 title_w:'dune messiah'      same thing; handy inside JSON
+title_w:"dune messiah"~2    phrase allowing a positional spread of 2
 tag_s:"in stock"            on an unanalyzed string field: one exact term
 year_i:1982                 exact numeric match
 ```
@@ -45,6 +46,17 @@ year_i:1982                 exact numeric match
 A word with no field is a parse error. There is no default search field:
 either name one (`title_w:dune`), use `match(dune, field=title_w)`, or use
 `simple_query` if the text came from a search box.
+
+Phrase slop measures the spread of the query-adjusted positions: for a
+candidate occurrence of every phrase term, subtract that term's query
+position, then take `max - min`. A match is accepted when that spread is no
+greater than the slop. Slop zero is an exact phrase. Terms may reorder; an
+adjacent transposition costs 2, so `"a b"~1` does not match `b a`, while
+`"a b"~2` does. Position holes count naturally under the same rule.
+
+Multi-valued text fields place a position gap of 100 between values. This
+discourages accidental cross-value phrases but does not make values an
+absolute boundary: a phrase can cross adjacent values at slop 100 or more.
 
 ## Special characters
 
@@ -55,8 +67,10 @@ most values need no escaping:
   `url_s:https://x.com/a?b=1` and `time_s:12:30:00` parse as you'd hope.
 - `*` is a wildcard only at the end of a term. `mess*` is a prefix query;
   `a*b` is the literal term `a*b`.
-- `~` is fuzzy only as a trailing `~` or `~N` (a whole number of edits).
-  `dune~1` is fuzzy; `a~b` is literal.
+- `~` after a quoted TEXT phrase sets phrase slop; after an unquoted term it
+  is fuzzy only as a trailing `~` or `~N` (a whole number of edits).
+  `"dune messiah"~2` is a sloppy phrase, `dune~1` is fuzzy, and `a~b` is
+  literal.
 - `^` is reserved for boost, which is not implemented yet. A trailing `^2`
   is a parse error; anywhere else it is a literal character.
 - Quotes start a quoted value only where a value can begin - right after
@@ -191,6 +205,7 @@ for query types added after this page was written:
 ```
 match(dune messiah, field=title_w, operator=AND, min_match=2)
 phrase(dune messiah, field=title_w)
+phrase(dune messiah, field=title_w, slop=2)
 fuzzy(smith, field=name_s, max_edits=2, prefix_length=0)
 prefix(mess, field=title_w)
 range(field=year_i, gte=1960, lt=1970)

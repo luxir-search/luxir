@@ -103,6 +103,16 @@ public:
     QueryBuilder builder(pool, schema);
 
     std::span<const int32_t> positions = phraseQuery.positions;
+    if (phraseQuery.slop < 0) {
+      throw std::runtime_error("Phrase query slop must be nonnegative");
+    }
+    if (phraseQuery.words.size() > QueryBuilder::MAX_PHRASE_SLOTS
+        || phraseQuery.terms.size() > QueryBuilder::MAX_PHRASE_SLOTS
+        || phraseQuery.terms_bin.size() > QueryBuilder::MAX_PHRASE_SLOTS
+        || positions.size() > QueryBuilder::MAX_PHRASE_SLOTS) {
+      throw std::runtime_error(std::format(
+          "Phrase query exceeds the {} raw-slot limit", QueryBuilder::MAX_PHRASE_SLOTS));
+    }
 
     // Exactly one of text / words / terms / terms_bin selects the phrase input.
     // text and words are un-analyzed (run through the field's analyzer here, at
@@ -124,18 +134,21 @@ public:
           "Phrase query 'positions' cannot be combined with 'text' (text has no word boundaries to position)");
       }
       std::string_view text = phraseQuery.text;
-      return builder.createPhraseQuery(field, std::span<const std::string_view>(&text, 1));
+      return builder.createPhraseQuery(field, std::span<const std::string_view>(&text, 1), {},
+                                       phraseQuery.slop);
     }
     if (hasWords) {
       // positions (when given) are one per word; the builder shifts them to
       // absorb words that analyze to multiple tokens.
-      return builder.createPhraseQuery(field, phraseQuery.words, positions);
+      return builder.createPhraseQuery(field, phraseQuery.words, positions, phraseQuery.slop);
     }
     if (hasTerms) {
-      return builder.createPhraseFromTerms(field, toSpan(phraseQuery.terms), positions);
+      return builder.createPhraseFromTerms(field, toSpan(phraseQuery.terms), positions,
+                                           phraseQuery.slop);
     }
     if (hasTermsBin) {
-      return builder.createPhraseFromTerms(field, binToSpan(phraseQuery.terms_bin), positions);
+      return builder.createPhraseFromTerms(field, binToSpan(phraseQuery.terms_bin), positions,
+                                           phraseQuery.slop);
     }
 
     // No phrase terms at all.

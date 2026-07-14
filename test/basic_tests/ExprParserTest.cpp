@@ -150,6 +150,22 @@ TEST_F(ExprParserTest, phraseArmPerFieldType) {
   EXPECT_EQ("dune messiah", asPhrase(*parse("title:'dune messiah'")).text);
 }
 
+TEST_F(ExprParserTest, phraseSlopSuffixIsStrict) {
+  EXPECT_EQ(2, asPhrase(*parse("title:\"dune messiah\"~2")).slop);
+  EXPECT_EQ(0, asPhrase(*parse("title:'dune messiah'~0")).slop);
+
+  for (std::string_view q : {"title:\"a b\"~", "title:\"a b\"~-1",
+                             "title:\"a b\"~xyz", "title:\"a b\"~2x",
+                             "title:\"a b\"~2147483648"}) {
+    auto msg = parseErr(q);
+    expectContains(msg, "phrase slop");
+    expectContains(msg, "byte");
+  }
+
+  expectContains(parseErr("status:\"in stock\"~2"), "non-TEXT field 'status'");
+  expectContains(parseErr("count:\"10\"~2"), "non-TEXT field 'count'");
+}
+
 TEST_F(ExprParserTest, positionalSpecialsNeedNoEscaping) {
   // ':' splits only at the first colon; '*' and '~' only at token end
   EXPECT_EQ("https://x.com/a?b=1", matchVal(*parse("url:https://x.com/a?b=1")));
@@ -420,7 +436,6 @@ TEST_F(ExprParserTest, decorationErrors) {
   expectContains(parseErr("title:ab*~1"), "cannot combine '*' and '~'");
   expectContains(parseErr("title:dune^2"), "boost (^) is reserved");
   expectContains(parseErr("title:dune^2.5"), "boost (^) is reserved");
-  expectContains(parseErr("title:\"a b\"~2"), "phrase slop");
 }
 
 TEST_F(ExprParserTest, existsAndMatchAll) {
@@ -478,6 +493,7 @@ TEST_F(ExprParserTest, functionMatch) {
 TEST_F(ExprParserTest, functionVariety) {
   const auto& p = asPhrase(*parse("phrase(dune messiah, field=title)"));
   EXPECT_EQ("dune messiah", p.text);
+  EXPECT_EQ(7, asPhrase(*parse("phrase(dune messiah, field=title, slop=7)")).slop);
 
   const auto& f = asFuzzy(*parse("fuzzy(smith, field=status, max_edits=2, prefix_length=0)"));
   EXPECT_EQ("smith", f.term);

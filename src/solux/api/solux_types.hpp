@@ -148,6 +148,7 @@ struct PhraseQuery {
   std::span<const std::string_view> words;
   std::span<const std::string_view> terms;
   std::span<const ::hpp_proto::bytes_view> terms_bin;
+  std::int32_t slop = {};
   std::span<const std::int32_t> positions;
 };
 struct CommitParams {

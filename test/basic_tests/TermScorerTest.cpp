@@ -4802,6 +4802,66 @@ TEST_F(TermScorerTest, phraseScoreUsesFullOverlappingFrequency) {
   EXPECT_TRUE(sawDoc3);
 }
 
+// Safety net for PhraseScorer matcher-policy extraction: these are the exact
+// production float bits before the refactor. Default/absent slop and explicit
+// slop=0 must retain them without changing IDF, frequency, norm, or score
+// operation order.
+TEST_F(TermScorerTest, phraseExactScoreBitGoldens) {
+  TestIndex testIndex;
+  TestField f(testIndex, "body_w");
+  f.startIndexing();
+  f.add(0, "a b pad pad pad pad");
+  f.add(1, "a b a b pad pad");
+  f.add(2, "a b a b a b");
+  f.add(3, "a a a pad pad pad");
+  f.add(4, "a pad b pad pad pad");
+  testIndex.flush();
+  f.startReading();
+
+  auto poolFree = testIndex.pool.rewindScopeGuard();
+  Query::Context qContext(testIndex.pool, *testIndex.reader);
+  auto& segment = qContext.topReader.segments()[0];
+
+  auto run = [&](std::span<std::string_view> terms, std::span<const int32_t> positions,
+                 bool explicitZero = false) {
+    auto collect = [&](PhraseQuery& phrase) {
+      auto* weight = phrase.createWeight(qContext, Query::NEED_SCORES);
+      auto* scorer = weight->createScorer(testIndex.pool, segment);
+      std::vector<std::pair<int32_t, uint32_t>> hits;
+      if (scorer != nullptr) {
+        for (int32_t doc = scorer->next(); doc != PostingsReader::END; doc = scorer->next()) {
+          hits.emplace_back(doc, std::bit_cast<uint32_t>(scorer->score()));
+        }
+      }
+      return hits;
+    };
+    if (explicitZero) {
+      PhraseQuery phrase("body_w", terms, positions, 0);
+      return collect(phrase);
+    }
+    PhraseQuery phrase("body_w", terms, positions);
+    return collect(phrase);
+  };
+
+  std::vector<std::string_view> ab = {"a", "b"};
+  std::vector<int32_t> adjacent = {0, 1};
+  std::vector<int32_t> gapped = {0, 2};
+  std::vector<std::string_view> aa = {"a", "a"};
+
+  const std::vector<std::pair<int32_t, uint32_t>> adjacentGolden = {
+      {0, 1043228443}, {1, 1047514566}, {2, 1049167839}};
+  const std::vector<std::pair<int32_t, uint32_t>> gappedGolden = {{4, 1043228443}};
+  const std::vector<std::pair<int32_t, uint32_t>> repeatedGolden = {
+      {3, 1038008262}};
+
+  EXPECT_EQ(adjacentGolden, run(ab, adjacent));
+  EXPECT_EQ(adjacentGolden, run(ab, adjacent, true));
+  EXPECT_EQ(gappedGolden, run(ab, gapped));
+  EXPECT_EQ(gappedGolden, run(ab, gapped, true));
+  EXPECT_EQ(repeatedGolden, run(aa, adjacent));
+  EXPECT_EQ(repeatedGolden, run(aa, adjacent, true));
+}
+
 // Fuzz the repeat-dedup scorer against the per-occurrence oracle: random
 // docs over a tiny alphabet (repeats collide constantly), random phrases
 // with repeated terms and gaps, both execution orders. Docs and score bits

@@ -1,11 +1,18 @@
 #include <gtest/gtest.h>
 
 #include <cstddef>
+#include <limits>
+#include <memory>
+#include <string>
+#include <vector>
 
 #include "test/SoluxTest.h"
 #include "test/CollectionHelper.h"
 #include "test/LocalReq.h"
 #include "test/QueryBuild.h"
+#include "solux/query/PhraseQuery.h"
+#include "solux/query/QueryBuilder.h"
+#include "solux/query/TermQuery.h"
 #include "solux/util/StrRef.h"
 
 using namespace solux;
@@ -187,6 +194,132 @@ TEST_F(QueryAnalysisTest, caseSensitiveFieldRespectsCase) {
   // body_w is whitespace-only, case-sensitive: query analysis leaves bytes alone.
   EXPECT_EQ(1, phraseTextCount("body_w", "Thomas Anderson"));   // exact case matches
   EXPECT_EQ(0, phraseTextCount("body_w", "thomas anderson"));   // wrong case misses
+}
+
+TEST_F(QueryAnalysisTest, structuredSlopPassesThrough) {
+  helper.index(flatdoc("id", "d3", "body_wl", "Anderson Thomas"), UpdateMessage::COMMIT);
+  auto req = localReq(helper.getSearchEngine());
+  auto& cur = req->collection("main").topDocs("q");
+  auto& phrase = cur.rawQuery().kind.emplace<api::PhraseQuery>();
+  phrase.field = "body_wl";
+  phrase.text = "Thomas Anderson";
+  phrase.slop = 2;
+  cur.withStats();
+  req->execute();
+  EXPECT_TRUE(req->ok()) << req->errorMsg();
+  EXPECT_EQ(2, req->getMatchCount());
+}
+
+TEST_F(QueryAnalysisTest, structuredNegativeSlopRejected) {
+  auto req = localReq(helper.getSearchEngine());
+  auto& cur = req->collection("main").topDocs("q");
+  auto& phrase = cur.rawQuery().kind.emplace<api::PhraseQuery>();
+  phrase.field = "body_wl";
+  phrase.text = "Thomas Anderson";
+  phrase.slop = -1;
+  cur.withStats();
+  req->execute();
+  EXPECT_FALSE(req->ok());
+  EXPECT_NE(req->errorMsg().find("slop must be nonnegative"), std::string::npos);
+}
+
+TEST_F(QueryAnalysisTest, structuredRawSlotCapRejectedBeforeCopy) {
+  auto req = localReq(helper.getSearchEngine());
+  auto& cur = req->collection("main").topDocs("q");
+  auto& phrase = cur.rawQuery().kind.emplace<api::PhraseQuery>();
+  phrase.field = "body_wl";
+  auto* terms = api::build::allocArray(
+      phrase.terms, QueryBuilder::MAX_PHRASE_SLOTS + 1, cur.mr());
+  for (size_t i = 0; i < QueryBuilder::MAX_PHRASE_SLOTS + 1; i++) terms[i] = "x";
+  cur.withStats();
+  req->execute();
+  EXPECT_FALSE(req->ok());
+  EXPECT_NE(req->errorMsg().find("raw-slot limit"), std::string::npos);
+}
+
+TEST(QueryBuilderPhraseCanonicalization, validatesAndNormalizesSlots) {
+  MemPool pool;
+  auto schema = Schema::createDefaultSchema();
+  schema->fieldTypeMap["no_positions"] = std::make_shared<TextFieldType>(
+      "no_positions", FieldType::INDEX_DOCS_FREQS);
+  QueryBuilder builder(pool, *schema);
+
+  std::vector<std::string_view> terms = {"a", "a", "b"};
+  std::vector<int32_t> positions = {
+      std::numeric_limits<int32_t>::max() - 1,
+      std::numeric_limits<int32_t>::max() - 1,
+      std::numeric_limits<int32_t>::max()};
+  auto* query = dynamic_cast<PhraseQuery*>(
+      builder.createPhraseFromTerms("body_w", terms, positions, 7));
+  ASSERT_NE(query, nullptr);
+  ASSERT_EQ(2u, query->getTerms().size());
+  EXPECT_EQ("a", query->getTerms()[0]);
+  EXPECT_EQ("b", query->getTerms()[1]);
+  EXPECT_EQ((std::vector<int32_t>{0, 1}),
+            std::vector<int32_t>(query->getPositions().begin(), query->getPositions().end()));
+  EXPECT_EQ(7, query->getSlop());
+
+  std::vector<std::string_view> sameOffsetTerms = {"a", "b"};
+  std::vector<int32_t> sameOffsetPositions = {10, 10};
+  auto* sameOffset = dynamic_cast<PhraseQuery*>(
+      builder.createPhraseFromTerms("body_w", sameOffsetTerms, sameOffsetPositions, 1));
+  ASSERT_NE(sameOffset, nullptr);
+  EXPECT_EQ((std::vector<int32_t>{0, 0}),
+            std::vector<int32_t>(sameOffset->getPositions().begin(),
+                                 sameOffset->getPositions().end()));
+
+  std::vector<int32_t> holePositions = {5, 9};
+  auto* hole = dynamic_cast<PhraseQuery*>(
+      builder.createPhraseFromTerms("body_w", sameOffsetTerms, holePositions, 1));
+  ASSERT_NE(hole, nullptr);
+  EXPECT_EQ((std::vector<int32_t>{0, 4}),
+            std::vector<int32_t>(hole->getPositions().begin(), hole->getPositions().end()));
+
+  std::vector<std::string_view> one = {"a", "a"};
+  std::vector<int32_t> same = {5, 5};
+  EXPECT_NE(nullptr, dynamic_cast<TermQuery*>(
+      builder.createPhraseFromTerms("body_w", one, same, 99)));
+
+  std::vector<std::string_view> ab = {"a", "b"};
+  std::vector<int32_t> negative = {-1, 0};
+  std::vector<int32_t> decreasing = {2, 1};
+  EXPECT_THROW(builder.createPhraseFromTerms("body_w", ab, negative, 0), std::runtime_error);
+  EXPECT_THROW(builder.createPhraseFromTerms("body_w", ab, decreasing, 0), std::runtime_error);
+  EXPECT_THROW(builder.createPhraseFromTerms("body_w", ab, {}, -1), std::runtime_error);
+  EXPECT_THROW(builder.createPhraseFromTerms("no_positions", ab, {}, 0), std::runtime_error);
+}
+
+TEST(QueryBuilderPhraseCanonicalization, capsAnalysisAndRejectsNormalizedOverflow) {
+  MemPool pool;
+  auto schema = Schema::createDefaultSchema();
+  QueryBuilder builder(pool, *schema);
+
+  std::string many;
+  for (size_t i = 0; i < QueryBuilder::MAX_PHRASE_SLOTS + 1; i++) {
+    if (!many.empty()) many.push_back(' ');
+    many += "x";
+  }
+  std::string_view manyView = many;
+  EXPECT_THROW(builder.createPhraseQuery(
+      "body_w", std::span<const std::string_view>(&manyView, 1), {}, 1),
+      std::runtime_error);
+
+  std::vector<std::string_view> values = {"a b", "c"};
+  std::vector<int32_t> positions = {0, std::numeric_limits<int32_t>::max()};
+  EXPECT_THROW(builder.createPhraseQuery("body_w", values, positions, 1),
+               std::runtime_error);
+
+  std::vector<std::string_view> dropped = {"...", "Thomas", "Anderson"};
+  std::vector<int32_t> droppedPositions = {0, 1, 2};
+  auto* query = dynamic_cast<PhraseQuery*>(
+      builder.createPhraseQuery("body_wl", dropped, droppedPositions, 3));
+  ASSERT_NE(query, nullptr);
+  EXPECT_EQ((std::vector<int32_t>{0, 1}),
+            std::vector<int32_t>(query->getPositions().begin(), query->getPositions().end()));
+
+  std::string_view single = "Thomas";
+  EXPECT_NE(nullptr, dynamic_cast<TermQuery*>(builder.createPhraseQuery(
+      "body_wl", std::span<const std::string_view>(&single, 1), {}, 50)));
 }
 
 // --- max term length (indexed terms truncate to PackedTerm::MAX_LEN) ----------

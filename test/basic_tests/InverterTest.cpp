@@ -99,6 +99,23 @@ TEST_F(InverterTest, simplePos) {
   ASSERT_EQ(c1, c);
 }
 
+TEST_F(InverterTest, duplicateTermPositionsCanonicalizedAndDecreasingRejected) {
+  MemPool pool;
+  DocFreqPosStream stream(pool, 0, 0);
+  stream.addDoc(pool, 0, 0);
+  stream.addDoc(pool, 0, 2);
+  EXPECT_THROW(stream.addDoc(pool, 0, 1), std::runtime_error);
+
+  TestConsumer actual;
+  stream.pushDocs(pool, actual);
+  TestConsumer expected;
+  expected.startDoc(0);
+  expected.addPositionDelta(1);
+  expected.addPositionDelta(2);
+  expected.endDoc(0);
+  EXPECT_EQ(expected, actual);
+}
+
 
 
 TEST_F(InverterTest, interleavedPos) {

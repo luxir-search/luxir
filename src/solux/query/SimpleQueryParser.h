@@ -4,6 +4,7 @@
 #include <cassert>
 #include <charconv>
 #include <cstdint>
+#include <limits>
 #include <memory_resource>
 #include <optional>
 #include <span>
@@ -275,16 +276,25 @@ private:
   // PhraseQuery for analyzed TEXT; for unanalyzed STRING/ID the whole quoted
   // text is one exact term, so it is a plain Match.
   const api::Query* makePhrase(std::string_view field, FieldType* fieldType,
-                               std::string_view text) {
+                               std::string_view text, int32_t slop,
+                               bool suffixPresent) {
     api::Val* val = nullptr;  // lazily shared by non-TEXT arms
+    bool warnedInapplicable = false;
     auto mk = [&](std::string_view f, FieldType& t) {
       if (t.type() == FieldType::Type::TEXT) {
         api::PhraseQuery p;
         p.field = f;
         p.text = text;  // already arena-backed (parsePhraseBody copies)
+        p.slop = slop;
         api::Query q;
         q.kind = p;
         return q;
+      }
+      if (suffixPresent && !warnedInapplicable) {
+        warn("phrase_slop_inapplicable",
+             fmt::format("phrase slop does not apply to non-TEXT field '{}'; "
+                         "the quoted value remains an exact match", f));
+        warnedInapplicable = true;
       }
       if (val == nullptr) val = allocVal(text);
       return matchLeaf(f, t, val);
@@ -506,12 +516,18 @@ private:
     return v < 0 ? 0 : v;
   }
 
+  struct PhraseBody {
+    std::string_view text;
+    int32_t slop = 0;
+    bool suffixPresent = false;
+  };
+
   // At an opening '"': collect the phrase bytes (escape-processed) through
-  // the closing quote, consuming a trailing ~N (slop is not on the wire yet,
-  // so it is declared ignored).  Returns an ARENA-BACKED copy, or nullopt
+  // the closing quote and consume a trailing ~ suffix. Returns an
+  // ARENA-BACKED copy, or nullopt
   // with pos reset past the opening quote when unterminated (the quote is
   // then extraneous and its contents reparse as tokens).
-  std::optional<std::string_view> parsePhraseBody() {
+  std::optional<PhraseBody> parsePhraseBody() {
     size_t start = ++pos;
     buf.clear();
     bool escaped = false;
@@ -525,14 +541,42 @@ private:
         }
         if (c == '"') {
           ++pos;  // past the closing quote
+          int32_t slop = 0;
+          bool suffixPresent = false;
           if (pos < end && data[pos] == '~') {
-            auto slop = parseFuzziness();
-            if (!slop.has_value() || *slop > 0) {
-              warn("phrase_slop_ignored",
-                   "phrase slop (\"...\"~N) is not supported yet; the phrase matches exactly");
+            suffixPresent = true;
+            ++pos;
+            size_t suffixStart = pos;
+            while (pos < end && !tokenFinished(pos)) ++pos;
+            std::string_view suffix(data + suffixStart, pos - suffixStart);
+            bool malformed = suffix.empty();
+            bool overflow = false;
+            int64_t value = 0;
+            for (char d : suffix) {
+              if (d < '0' || d > '9') {
+                malformed = true;
+                break;
+              }
+              if (!overflow) {
+                value = value * 10 + (d - '0');
+                if (value > std::numeric_limits<int32_t>::max()) {
+                  overflow = true;
+                }
+              }
+            }
+            if (malformed) {
+              warn("phrase_slop_malformed",
+                   "malformed phrase slop suffix consumed; exact slop 0 is used");
+            } else if (overflow) {
+              slop = std::numeric_limits<int32_t>::max();
+              warn("phrase_slop_clamped",
+                   "phrase slop overflow clamped to INT_MAX");
+            } else {
+              slop = (int32_t) value;
             }
           }
-          return arenaStr(std::string_view(buf.data(), buf.size()));
+          return PhraseBody{arenaStr(std::string_view(buf.data(), buf.size())),
+                            slop, suffixPresent};
         }
       }
       escaped = false;
@@ -791,14 +835,15 @@ private:
   }
 
   void consumePhrase(Level& st) {
-    auto text = parsePhraseBody();
-    if (!text) return;  // unterminated: opening quote extraneous
-    if (text->empty()) {
+    auto phrase = parsePhraseBody();
+    if (!phrase) return;  // unterminated: opening quote extraneous
+    if (phrase->text.empty()) {
       // "" drops a pending modifier (Lucene behavior)
       clearPending(st);
       return;
     }
-    addUnit(st, makePhrase({}, nullptr, *text));
+    addUnit(st, makePhrase({}, nullptr, phrase->text, phrase->slop,
+                           phrase->suffixPresent));
   }
 
   void consumeToken(Level& st) {
@@ -830,27 +875,33 @@ private:
             std::string_view tokenText = arenaStr(std::string_view(buf.data(), buf.size()));
             std::string_view field = tokenText.substr(0, *firstColon);
             FieldType* fieldType = fieldedHead(field);
-            auto text = parsePhraseBody();
-            if (text) {
+            auto phrase = parsePhraseBody();
+            if (phrase) {
               if (fieldType == nullptr) {
                 // the head is not a queryable field: the token so far stays
                 // literal text and the quoted value is an unfielded phrase
                 // (site:"foo bar" from a search box keeps its phrase-ness)
                 addUnit(st, makeDefault({}, nullptr, tokenText));
-                if (!text->empty()) addUnit(st, makePhrase({}, nullptr, *text));
-              } else if (text->empty()) {
+                if (!phrase->text.empty()) {
+                  addUnit(st, makePhrase({}, nullptr, phrase->text, phrase->slop,
+                                         phrase->suffixPresent));
+                }
+              } else if (phrase->text.empty()) {
                 clearPending(st);
-              } else if (numericQueryable(*fieldType) && !numericCoercible(*fieldType, *text)) {
+              } else if (numericQueryable(*fieldType)
+                         && !numericCoercible(*fieldType, phrase->text)) {
                 // Uncoercible numeric value: degrade like an unknown field -
                 // the head stays literal text and the quoted value is a
                 // phrase over the default fields (declared).
                 warn("numeric_field_value",
                      fmt::format("'{}' is not a valid {} for field '{}'; treated as text",
-                                 *text, numericTypeName(fieldType->type()), field));
+                                 phrase->text, numericTypeName(fieldType->type()), field));
                 addUnit(st, makeDefault({}, nullptr, tokenText));
-                addUnit(st, makePhrase({}, nullptr, *text));
+                addUnit(st, makePhrase({}, nullptr, phrase->text, phrase->slop,
+                                       phrase->suffixPresent));
               } else {
-                addUnit(st, makePhrase(field, fieldType, *text));
+                addUnit(st, makePhrase(field, fieldType, phrase->text, phrase->slop,
+                                       phrase->suffixPresent));
               }
               return;
             }

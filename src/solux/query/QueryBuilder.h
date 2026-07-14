@@ -37,6 +37,8 @@ class QueryBuilder {
   Schema& schema;
 
 public:
+  static constexpr size_t MAX_PHRASE_SLOTS = 256;
+
   // The numeric field types stored in the shared int column (INT raw,
   // FLOAT/DOUBLE sortable bits, DATE epoch millis).  Match and range on these
   // build a NumericRangeQuery over the column.  Public because schema-aware
@@ -56,6 +58,34 @@ private:
       throw std::runtime_error(std::format("Phrase query on non-text field: {}", field));
     }
     return (TextFieldType&)fieldType;
+  }
+
+  TextFieldType& positionalTextFieldType(std::string_view field) {
+    TextFieldType& fieldType = textFieldType(field);
+    if (!fieldType.hasPositions()) {
+      throw std::runtime_error(std::format(
+          "Phrase query requires indexed positions on field: {}", field));
+    }
+    return fieldType;
+  }
+
+  static void validatePositions(std::span<const int32_t> positions,
+                                size_t valueCount, std::string_view inputName) {
+    if (!positions.empty() && positions.size() != valueCount) {
+      throw std::runtime_error(std::format(
+          "Phrase query positions size {} does not match {} size {}",
+          positions.size(), inputName, valueCount));
+    }
+    int32_t previous = -1;
+    for (int32_t position : positions) {
+      if (position < 0) {
+        throw std::runtime_error("Phrase query positions must be nonnegative");
+      }
+      if (position < previous) {
+        throw std::runtime_error("Phrase query positions must be nondecreasing");
+      }
+      previous = position;
+    }
   }
 
   // Copy transient token bytes into the request pool. Analyzer chains reuse
@@ -78,15 +108,57 @@ private:
   //   N terms -> PhraseQuery
   // terms and positions must already live in storage that outlives the query
   // tree (the pool, or the caller's source bytes for pass-through terms).
-  Query* buildPhrase(std::string_view field, std::span<std::string_view> terms,
-                     std::span<const int32_t> positions) {
+  Query* buildPhrase(std::string_view field, std::span<std::string_view> inputTerms,
+                     std::span<const int64_t> inputPositions, int32_t slop) {
+    if (slop < 0) {
+      throw std::runtime_error("Phrase query slop must be nonnegative");
+    }
+    positionalTextFieldType(field);
+    if (inputTerms.size() != inputPositions.size()) {
+      throw std::runtime_error("Phrase query internal term/position size mismatch");
+    }
+    if (inputTerms.size() > MAX_PHRASE_SLOTS) {
+      throw std::runtime_error(std::format(
+          "Phrase query exceeds the {} slot limit", MAX_PHRASE_SLOTS));
+    }
+
+    std::vector<std::string_view> terms;
+    std::vector<int32_t> positions;
+    terms.reserve(inputTerms.size());
+    positions.reserve(inputPositions.size());
+    int64_t base = inputPositions.empty() ? 0 : inputPositions[0];
+    for (size_t i = 0; i < inputTerms.size(); i++) {
+      std::string_view term = PackedTerm::truncate(inputTerms[i]);
+      int64_t normalized = inputPositions[i] - base;
+      if (normalized < 0 || normalized > std::numeric_limits<int32_t>::max()) {
+        throw std::runtime_error(
+            "Phrase query normalized positions must be in [0, INT_MAX]");
+      }
+      int32_t position = (int32_t) normalized;
+      bool duplicate = false;
+      for (size_t j = 0; j < terms.size(); j++) {
+        if (terms[j] == term && positions[j] == position) {
+          duplicate = true;
+          break;
+        }
+      }
+      if (!duplicate) {
+        terms.push_back(term);
+        positions.push_back(position);
+      }
+    }
+
     if (terms.empty()) {
       return pool.make<MatchNoDocsQuery>();
     }
     if (terms.size() == 1) {
       return pool.make<TermQuery>(field, terms[0]);
     }
-    return pool.make<PhraseQuery>(field, terms, positions);
+    return pool.make<PhraseQuery>(
+        field,
+        pool.copy_span(std::span<std::string_view>(terms.data(), terms.size())),
+        pool.copy_span(std::span<int32_t>(positions.data(), positions.size())),
+        slop);
   }
 
 public:
@@ -409,14 +481,17 @@ public:
   //     value is shifted by that overflow so the caller's gaps survive
   //     multi-token expansion.
   Query* createPhraseQuery(std::string_view field, std::span<const std::string_view> values,
-                           std::span<const int32_t> valuePositions = {}) {
-    if (!valuePositions.empty() && valuePositions.size() != values.size()) {
+                           std::span<const int32_t> valuePositions = {}, int32_t slop = 0) {
+    validatePositions(valuePositions, values.size(), "words");
+    if (slop < 0) {
+      throw std::runtime_error("Phrase query slop must be nonnegative");
+    }
+    if (values.size() > MAX_PHRASE_SLOTS) {
       throw std::runtime_error(std::format(
-        "Phrase query positions size {} does not match words size {}",
-        valuePositions.size(), values.size()));
+          "Phrase query exceeds the {} raw-value limit", MAX_PHRASE_SLOTS));
     }
 
-    TextFieldType& fieldType = textFieldType(field);
+    TextFieldType& fieldType = positionalTextFieldType(field);
     auto chain = fieldType.createAnalyzer(field);
     TokenChain& tc = *chain;
     Token& tok = tc.head.getToken();
@@ -425,30 +500,37 @@ public:
     // Collected here, then copied into pool-backed spans. Query parsing is a
     // per-request cold path, so a transient std::vector is fine.
     std::vector<std::string_view> terms;
-    std::vector<int32_t> positions;
+    std::vector<int64_t> positions;
+
+    auto emit = [&](int64_t position) {
+      if (terms.size() >= MAX_PHRASE_SLOTS) {
+        throw std::runtime_error(std::format(
+            "Phrase query exceeds the {} analyzed-slot limit", MAX_PHRASE_SLOTS));
+      }
+      terms.push_back(copyTerm(tok.text));
+      positions.push_back(position);
+    };
 
     if (valuePositions.empty()) {
-      int32_t pos = -1;  // first token's positionIncrement (>= 1) lands it at >= 0
+      int64_t pos = -1;  // first token's positionIncrement (>= 1) lands it at >= 0
       for (std::string_view value : values) {
         tc.head.setValue(value);
         tc.reset();
         while (tail.incrementToken()) {
-          pos += tok.positionIncrement;
-          terms.push_back(copyTerm(tok.text));
-          positions.push_back(pos);
+          pos += (int64_t) tok.positionIncrement;
+          emit(pos);
         }
       }
     } else {
-      int32_t carry = 0;  // extra positions consumed by prior values' expansion
+      int64_t carry = 0;  // extra positions consumed by prior values' expansion
       for (size_t i = 0; i < values.size(); i++) {
-        int32_t base = valuePositions[i] + carry;
-        int32_t relPos = -1;  // position within this value, relative to base
+        int64_t base = (int64_t) valuePositions[i] + carry;
+        int64_t relPos = -1;  // position within this value, relative to base
         tc.head.setValue(values[i]);
         tc.reset();
         while (tail.incrementToken()) {
-          relPos += tok.positionIncrement;
-          terms.push_back(copyTerm(tok.text));
-          positions.push_back(base + relPos);
+          relPos += (int64_t) tok.positionIncrement;
+          emit(base + relPos);
         }
         // A single-token value spans relPos 0 (no overflow); a value spanning
         // relPos slots pushes the rest by relPos. A dropped value (relPos < 0)
@@ -459,12 +541,9 @@ public:
       }
     }
 
-    if (terms.empty()) {
-      return matchNoDocs();
-    }
     return buildPhrase(field,
-                       pool.copy_span(std::span<std::string_view>(terms.data(), terms.size())),
-                       pool.copy_span(std::span<int32_t>(positions.data(), positions.size())));
+                       std::span<std::string_view>(terms.data(), terms.size()),
+                       std::span<const int64_t>(positions.data(), positions.size()), slop);
   }
 
   // Build a phrase query from already-analyzed terms; the terms are used
@@ -473,25 +552,36 @@ public:
   //
   // The provided span contents are not copied and thus should outlive the returned query.
   Query* createPhraseFromTerms(std::string_view field, std::span<std::string_view> terms,
-                               std::span<const int32_t> positions) {
-    textFieldType(field);  // validate it is a text field
+                               std::span<const int32_t> positions, int32_t slop = 0) {
+    positionalTextFieldType(field);
+    validatePositions(positions, terms.size(), "terms");
+    if (slop < 0) {
+      throw std::runtime_error("Phrase query slop must be nonnegative");
+    }
+    if (terms.size() > MAX_PHRASE_SLOTS) {
+      throw std::runtime_error(std::format(
+          "Phrase query exceeds the {} slot limit", MAX_PHRASE_SLOTS));
+    }
 
     // Verbatim terms still honor the indexed-term length cap; rewrite entries
     // in place (the span is mutable by contract).
     for (auto& t : terms) t = PackedTerm::truncate(t);
 
-    if (!positions.empty() && positions.size() != terms.size()) {
-      throw std::runtime_error(std::format(
-        "Phrase query positions size {} does not match terms size {}", positions.size(), terms.size()));
-    }
-    if (positions.empty() && terms.size() >= 2) {
-      auto pos = pool.make_span<int32_t>(terms.size());
+    std::span<const int64_t> canonicalPositions;
+    if (positions.empty()) {
+      auto pos = pool.make_span<int64_t>(terms.size());
       for (size_t i = 0; i < terms.size(); i++) {
-        pos[i] = (int32_t)i;
+        pos[i] = (int64_t) i;
       }
-      positions = pos;
+      canonicalPositions = pos;
+    } else {
+      auto pos = pool.make_span<int64_t>(positions.size());
+      for (size_t i = 0; i < positions.size(); i++) {
+        pos[i] = positions[i];
+      }
+      canonicalPositions = pos;
     }
-    return buildPhrase(field, terms, positions);
+    return buildPhrase(field, terms, canonicalPositions, slop);
   }
 };
 

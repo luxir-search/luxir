@@ -6,7 +6,9 @@
 
 #include <gtest/gtest.h>
 
+#include <limits>
 #include <memory_resource>
+#include <string>
 
 #include "solux/query/SimpleQueryParser.h"
 #include "solux/schema/Schema.h"
@@ -320,14 +322,43 @@ TEST_F(SimpleQueryParserTest, phrase) {
   EXPECT_EQ("body", p->field);
 }
 
-TEST_F(SimpleQueryParserTest, phraseSlopDeclaredIgnored) {
+TEST_F(SimpleQueryParserTest, phraseSlopSuffixMatrix) {
   auto r = parse("\"foo bar\"~2");
-  ASSERT_NE(nullptr, std::get_if<api::PhraseQuery>(&r.root->kind));
-  EXPECT_TRUE(hasWarning(r, "phrase_slop_ignored"));
+  const auto* p = std::get_if<api::PhraseQuery>(&r.root->kind);
+  ASSERT_NE(nullptr, p);
+  EXPECT_EQ(2, p->slop);
+  EXPECT_TRUE(r.warnings.empty());
 
-  // explicit ~0 changes nothing and warns nothing
   auto r0 = parse("\"foo bar\"~0");
+  ASSERT_NE(nullptr, std::get_if<api::PhraseQuery>(&r0.root->kind));
+  EXPECT_EQ(0, std::get<api::PhraseQuery>(r0.root->kind).slop);
   EXPECT_TRUE(r0.warnings.empty());
+
+  for (std::string_view suffix : {"~", "~-1", "~xyz", "~2x"}) {
+    auto malformed = parse(std::string("\"foo bar\"") + std::string(suffix));
+    ASSERT_NE(nullptr, std::get_if<api::PhraseQuery>(&malformed.root->kind));
+    EXPECT_EQ(0, std::get<api::PhraseQuery>(malformed.root->kind).slop) << suffix;
+    EXPECT_TRUE(hasWarning(malformed, "phrase_slop_malformed")) << suffix;
+  }
+
+  auto overflow = parse("\"foo bar\"~999999999999999999999999");
+  EXPECT_EQ(std::numeric_limits<int32_t>::max(),
+            std::get<api::PhraseQuery>(overflow.root->kind).slop);
+  EXPECT_TRUE(hasWarning(overflow, "phrase_slop_clamped"));
+
+  auto fielded = parse("title:\"foo bar\"~7");
+  EXPECT_EQ(7, std::get<api::PhraseQuery>(fielded.root->kind).slop);
+
+  auto nonText = parse("status:\"in stock\"~0");
+  EXPECT_EQ("in stock", matchVal(*nonText.root));
+  EXPECT_TRUE(hasWarning(nonText, "phrase_slop_inapplicable"));
+
+  fields = {"title", "status"};
+  auto mixed = parse("\"foo bar\"~3");
+  const auto& expanded = asBool(*mixed.root);
+  ASSERT_EQ(2u, expanded.optional.size());
+  EXPECT_EQ(3, std::get<api::PhraseQuery>(expanded.optional[0].kind).slop);
+  EXPECT_TRUE(hasWarning(mixed, "phrase_slop_inapplicable"));
 }
 
 TEST_F(SimpleQueryParserTest, multiFieldExpansionSums) {

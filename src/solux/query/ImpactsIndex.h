@@ -24,11 +24,11 @@ namespace solux {
 // headers and queries touch a handful. The forced eager path is kept as the
 // test oracle and for fields without dictionary term frontiers.
 //
-// The simScorer defines what "score" means.  A term scorer passes its own BM25
-// scorer.  PhraseQuery passes the PHRASE's scorer over each member term's
-// data: phraseFreq <= that term's freq in every doc, so each term's bound is
-// a valid (if loose) upper bound on the phrase's score, and the min across
-// the terms' indexes bounds any doc range.
+// The simScorer defines what "score" means. A term scorer passes its own BM25
+// scorer. Exact phrases also use scored impacts because exact phrase frequency
+// is bounded by every slot's term frequency. Sloppy phrases instead consume
+// the raw tf/norm range metadata and score one combined envelope; their phrase
+// frequency can exceed an individual term frequency.
 class ImpactsIndex {
 public:
   struct CompetitiveTarget {
@@ -37,12 +37,19 @@ public:
     float impact;
   };
 
+  struct RawRange {
+    int32_t maxTf = 0;
+    int32_t minNorm = std::numeric_limits<int32_t>::max();
+  };
+
 private:
   struct Chunk {
     int32_t blockCount = 0;
     int32_t* lastDocs = nullptr;
     float* impacts = nullptr;
     float* suffixWithin = nullptr;  // max of impacts[i..] within the chunk
+    int32_t* maxTfs = nullptr;
+    int32_t* minNorms = nullptr;
   };
 
   MemPool* pool = nullptr;
@@ -62,6 +69,8 @@ private:
   int64_t* groupBodyOffs = nullptr;
   float* groupUpper = nullptr;       // frontier bound per group
   float* groupSuffixUpper = nullptr; // eager path: max of groupUpper[g..]
+  int32_t* groupMaxTfs = nullptr;
+  int32_t* groupMinNorms = nullptr;
   mutable Chunk** chunks = nullptr;  // lazily parsed per group
   mutable DocsEnum::GroupImpactCursor groupCursor;
 
@@ -105,6 +114,8 @@ private:
           groupBaseLastDocs[idx] = header.baseLastDoc;
           groupBodyOffs[idx] = header.bodyOffset;
           groupUpper[idx] = scoreFrontier(header);
+          groupMaxTfs[idx] = header.spanMaxTf;
+          groupMinNorms[idx] = header.spanMinNorm;
           chunks[idx] = nullptr;
           groupHeadersParsed++;
         });
@@ -145,6 +156,8 @@ private:
     chunk->lastDocs = pool->make_arr<int32_t>((size_t) chunk->blockCount);
     chunk->impacts = pool->make_arr<float>((size_t) chunk->blockCount);
     chunk->suffixWithin = pool->make_arr<float>((size_t) chunk->blockCount);
+    chunk->maxTfs = pool->make_arr<int32_t>((size_t) chunk->blockCount);
+    chunk->minNorms = pool->make_arr<int32_t>((size_t) chunk->blockCount);
 
     DocsEnum::GroupBlockImpactScratch scratch;
     docsEnum->visitGroupBlockImpacts(
@@ -154,6 +167,8 @@ private:
             bool frontierSpilled) {
           assert(block >= 0 && block < chunk->blockCount);
           chunk->lastDocs[block] = lastDoc;
+          chunk->maxTfs[block] = maxTf;
+          chunk->minNorms[block] = minNorm;
           if (useFrontierBound && !frontierSpilled && !tfs.empty()) {
             float maxImpact = 0.0f;
             for (size_t j = 0; j < tfs.size(); j++) {
@@ -211,6 +226,8 @@ public:
       groupBodyOffs = pool->make_arr<int64_t>((size_t) groupCount);
       groupUpper = pool->make_arr<float>((size_t) groupCount);
       groupSuffixUpper = nullptr;
+      groupMaxTfs = pool->make_arr<int32_t>((size_t) groupCount);
+      groupMinNorms = pool->make_arr<int32_t>((size_t) groupCount);
       chunks = pool->make_arr<Chunk*>((size_t) groupCount);
       for (int32_t g = 0; g < groupCount; g++) {
         chunks[g] = nullptr;
@@ -231,11 +248,15 @@ public:
     groupBodyOffs = pool->make_arr<int64_t>((size_t) groupCount);
     groupUpper = pool->make_arr<float>((size_t) groupCount);
     groupSuffixUpper = pool->make_arr<float>((size_t) groupCount);
+    groupMaxTfs = pool->make_arr<int32_t>((size_t) groupCount);
+    groupMinNorms = pool->make_arr<int32_t>((size_t) groupCount);
     chunks = pool->make_arr<Chunk*>((size_t) groupCount);
     for (int32_t g = 0; g < groupCount; g++) {
       groupLastDocs[g] = groups.lastDocs[(size_t) g];
       groupBaseLastDocs[g] = groups.baseLastDocs[(size_t) g];
       groupBodyOffs[g] = groups.bodyOffsets[(size_t) g];
+      groupMaxTfs[g] = groups.spanMaxTfs[(size_t) g];
+      groupMinNorms[g] = groups.spanMinNorms[(size_t) g];
       int32_t fStart = groups.frontiers.offsets[(size_t) g];
       int32_t fEnd = groups.frontiers.offsets[(size_t) g + 1];
       if (useFrontierBound && fStart < fEnd) {
@@ -488,6 +509,37 @@ public:
       bound = std::max(bound, tail.impacts[i]);
     }
     return bound;
+  }
+
+  // Raw score-independent envelope over blocks [fromBlock, toBlock]. Fully
+  // covered middle groups use the L1 span header; edge groups use their
+  // decoded L0 block corners. Sloppy phrases combine these once at the common
+  // phrase scorer, avoiding unsafe sums of already-rounded float impacts.
+  RawRange rawRangeInRange(int32_t fromBlock, int32_t toBlock) const {
+    assert(fromBlock >= 0 && fromBlock <= toBlock && toBlock < count);
+    int32_t gFrom = fromBlock / GROUP;
+    int32_t gTo = toBlock / GROUP;
+    ensureGroupHeadersThrough(gTo);
+    RawRange range;
+    auto addBlocks = [&](int32_t group, int32_t first, int32_t last) {
+      const Chunk& chunk = ensureGroup(group);
+      for (int32_t block = first; block <= last; block++) {
+        int32_t i = block % GROUP;
+        range.maxTf = std::max(range.maxTf, chunk.maxTfs[i]);
+        range.minNorm = std::min(range.minNorm, chunk.minNorms[i]);
+      }
+    };
+    if (gFrom == gTo) {
+      addBlocks(gFrom, fromBlock, toBlock);
+      return range;
+    }
+    addBlocks(gFrom, fromBlock, groupLastBlock(gFrom));
+    for (int32_t g = gFrom + 1; g < gTo; g++) {
+      range.maxTf = std::max(range.maxTf, groupMaxTfs[g]);
+      range.minNorm = std::min(range.minNorm, groupMinNorms[g]);
+    }
+    addBlocks(gTo, groupFirstBlock(gTo), toBlock);
+    return range;
   }
 
   // Max impact over blocks [fromBlock, toBlock] without materializing any

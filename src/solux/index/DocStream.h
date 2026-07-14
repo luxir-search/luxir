@@ -1,5 +1,7 @@
 #pragma once
 
+#include <stdexcept>
+
 #include "Stream.h"
 
 namespace solux {
@@ -169,8 +171,9 @@ class alignas(1) DocFreqPosStream {
 
   void writePos(MemPool &pool, int pos) {
     int posCode = pos - lastPos;
-    assert(posCode >= 0);
-    // TODO: do we need to support duplicate positions for the same term for the same doc???  Would seem to make search code more complex.
+    if (posCode <= 0) {
+      throw std::runtime_error("Term positions must be strictly increasing within a document");
+    }
     positions.writeVInt(pool, posCode);
     lastPos = pos;
   }
@@ -193,6 +196,12 @@ public:
     int delta = docid - lastDoc;
     if (delta == 0) {
       // same document
+      if (pos == lastPos) {
+        return;  // canonicalize duplicate (term, doc, position) occurrences
+      }
+      if (pos < lastPos) {
+        throw std::runtime_error("Term positions must be strictly increasing within a document");
+      }
       ++termFreq;
       writePos(pool, pos);
     } else {

@@ -91,7 +91,10 @@ clauses, under facet domains, as fusion sources, as filters.
 
 - `match` (analyzed; AND/OR operator; minimum-match; over numeric fields,
   equality against the column), `boolean` (required / optional /
-  prohibited / filter clauses, minimum-match), `phrase` (position-based),
+  prohibited / filter clauses, minimum-match), `phrase` (position-based,
+  with optional slop measured as the spread of query-adjusted positions;
+  reordered terms are allowed, an adjacent transposition costs 2, and the
+  multi-value position gap of 100 can be crossed at slop 100 or more),
   `range` over numeric, date, and term-backed fields (`gte`/`gt`/`lte`/`lt`,
   any side open-ended; dates accept ISO-8601 or epoch millis, and a partial
   date means the window it names - equality on `2024-06-25` matches the
@@ -111,13 +114,14 @@ clauses, under facet domains, as fusion sources, as filters.
   rare misspellings from outranking the exact term, and fuzzy clauses
   participate in block-max pruning like any other clause.
 - `simple_query`: a never-fails search-box syntax for end-user input
-  (`+`/`-`, `|`, quoted phrases, grouping, trailing-`*` prefix, `~N`
-  fuzzy, and `field:value` terms - including exact numeric and date
+  (`+`/`-`, `|`, quoted phrases with an optional `~N` slop, grouping,
+  trailing-`*` prefix, `~N` fuzzy terms, and `field:value` terms - including exact numeric and date
   matches like `price:10` or `created:2024-01-01`) - invalid syntax
   degrades to terms, never to an error.
 - `expr`: the [query language](guide/query-language.md) for developers
   writing queries - a bare string anywhere the JSON API takes a query
-  object.  Fielded terms and phrases, AND/OR/NOT with real precedence,
+  object.  Fielded terms and phrases (including strict quoted-phrase
+  `~N` slop), AND/OR/NOT with real precedence,
   `+`/`-` prefixes, ranges (`year_i:[1960 TO 1970}`) and comparisons
   (`year_i:>=1960`), field groups (`title_w:(a OR b)`), and a function form
   that reaches every query type by its JSON name

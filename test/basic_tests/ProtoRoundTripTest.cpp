@@ -23,6 +23,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <memory_resource>
 #include <optional>
 #include <span>
@@ -252,6 +253,40 @@ TEST(ProtoRoundTrip, AllMessages) {
 #define RT(T) roundTripType<P::T>(#T);
   SOLUX_MSGS(RT)
 #undef RT
+}
+
+TEST(ProtoRoundTrip, PhraseSlopValues) {
+  auto check = [](int32_t value) {
+    P::PhraseQuery in;
+    in.field = "body_w";
+    in.text = "a b";
+    in.slop = value;
+
+    std::vector<std::byte> wire;
+    ASSERT_TRUE(encode(in, wire));
+    std::pmr::monotonic_buffer_resource binaryArena;
+    P::PhraseQuery binaryOut;
+    auto padded = P::copyToPaddedInput(std::span<const std::byte>(wire), binaryArena);
+    ASSERT_TRUE(decode(binaryOut, padded, binaryArena));
+    EXPECT_EQ(value, binaryOut.slop);
+
+    std::string json;
+    ASSERT_TRUE(write_json(in, json));
+    std::pmr::monotonic_buffer_resource jsonArena;
+    P::PhraseQuery jsonOut;
+    ASSERT_TRUE(read_json(jsonOut, json, jsonArena)) << json;
+    EXPECT_EQ(value, jsonOut.slop);
+  };
+
+  check(0);
+  check(7);
+  check(std::numeric_limits<int32_t>::max());
+  check(-1);  // The wire accepts it; query validation rejects it.
+
+  std::pmr::monotonic_buffer_resource arena;
+  P::PhraseQuery absent;
+  ASSERT_TRUE(read_json(absent, R"({"field":"body_w","text":"a b"})", arena));
+  EXPECT_EQ(0, absent.slop);
 }
 
 // ---- build-by-backing: assemble a non-owning SearchResponse with the build.h helpers, then

@@ -687,14 +687,34 @@ private:
   // numeric columns match the exact value (the quotes only delimit).
   const api::Query* parsePhraseForm(std::string_view field, FieldType& ft) {
     std::string_view body = scanQuoted();
+    int32_t slop = 0;
     if (cur.peek() == '~') {
-      fail(cur.position(), "phrase slop (\"...\"~N) is not supported yet");
+      size_t slopPos = cur.position();
+      cur.advance();
+      size_t digitsPos = cur.position();
+      std::string_view digits = cur.takeWhile([](char c) { return digit(c); });
+      if (digits.empty()) {
+        fail(slopPos, "phrase slop requires a nonnegative integer after '~'");
+      }
+      auto [p, ec] = std::from_chars(digits.data(), digits.data() + digits.size(), slop);
+      if (ec != std::errc() || p != digits.data() + digits.size()) {
+        fail(digitsPos, "phrase slop exceeds INT_MAX");
+      }
+      char next = cur.peek();
+      if (!cur.atEnd() && cur.wsLen() == 0 && next != ')' && next != '^'
+          && next != '*' && next != '~') {
+        fail(cur.position(), "malformed phrase slop suffix");
+      }
+      if (ft.type() != FieldType::Type::TEXT) {
+        fail(slopPos, fmt::format("phrase slop does not apply to non-TEXT field '{}'", field));
+      }
     }
     rejectDecorations("a quoted value");
     if (ft.type() == FieldType::Type::TEXT) {
       api::PhraseQuery p;
       p.field = field;
       p.text = body;
+      p.slop = slop;
       api::Query* q = allocQuery();
       q->kind = p;
       return q;
