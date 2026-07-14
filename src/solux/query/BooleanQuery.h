@@ -1063,19 +1063,10 @@ public:
       return score;
     }
 
-    // The optional side can add at most its global max: docs whose required
-    // score cannot reach (threshold - optMax) cannot compete, so the required
-    // side may prune with that reduced threshold (Lucene ReqOptSumScorer's
-    // setMinCompetitiveScore shape).  An unbounded optional forwards nothing.
     void setMinCompetitiveScore(float minScore) override {
-      float optMax = opt.scorer->getMaxScore(solux::PostingsReader::END);
-      if (std::isfinite(optMax)) {
-        // Round the reduced threshold DOWN so float rounding can only make the
-        // required side less aggressive, never skip a doc whose sum could
-        // still reach minScore.
-        mand.scorer->setMinCompetitiveScore(
-            std::nextafter(minScore - optMax, -std::numeric_limits<float>::infinity()));
-      }
+      // Keep theta at the MandOpt level. Forwarding (theta - optMax) into a
+      // term scorer switches its bulk fill from vectorized block scoring to
+      // scalar impact hopping, which can cost far more than the skips it adds.
       if (minScore > minCompetitiveScore) {
         minCompetitiveScore = minScore;
         windowUpTo = -1;
@@ -1134,8 +1125,6 @@ public:
     int32_t liveOptCount = 0;
     float minCompetitiveScore = std::numeric_limits<float>::lowest();
     double scoreBoundFactor = 1.0;
-    double optGlobalMax = 0.0;
-    bool optGlobalMaxFinite = true;
     float mandWindowMax = std::numeric_limits<float>::infinity();
     double optWindowMaxSum = 0.0;
 
@@ -1159,15 +1148,6 @@ public:
 
     bool canReach(float score, double bound) const {
       return scoreCanReach(score, bound, minCompetitiveScore, scoreBoundFactor);
-    }
-
-    void pushMandMinCompetitiveScore(float minScore) {
-      if (!optGlobalMaxFinite) {
-        return;
-      }
-      float reduced = (float) ((double) minScore - optGlobalMax);
-      mand->setMinCompetitiveScore(
-          std::nextafter(reduced, -std::numeric_limits<float>::infinity()));
     }
 
     void clearWindowBits() {
@@ -1520,12 +1500,6 @@ public:
       for (auto* opt : opts) {
         assert(opt != nullptr);
         assert(!opt->hasTwoPhase());
-        float maxScore = opt->getMaxScoreForSetup(PostingsReader::END);
-        if (!std::isfinite(maxScore) || !optGlobalMaxFinite) {
-          optGlobalMaxFinite = false;
-        } else {
-          optGlobalMax += (double) maxScore;
-        }
       }
     }
 
@@ -1546,7 +1520,6 @@ public:
       }
       if (minCompetitiveScore > this->minCompetitiveScore) {
         this->minCompetitiveScore = minCompetitiveScore;
-        pushMandMinCompetitiveScore(minCompetitiveScore);
       }
 
       int32_t start = min;

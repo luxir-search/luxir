@@ -3947,6 +3947,56 @@ TEST_F(TermScorerTest, mandOptBulkThetaZeroBypassesWindowWalk) {
   EXPECT_EQ(SkipStats::shallowCursorMoves, 0);
 }
 
+TEST_F(TermScorerTest, mandOptKeepsThetaOutOfMandatoryTermScorer) {
+  const int32_t nDocs = 3 * Postings::DOCS_BLOCK_SIZE + 11;
+  TestIndex testIndex;
+  TestField f(testIndex, "body_w");
+  f.startIndexing();
+  for (int32_t doc = 0; doc < nDocs; doc++) {
+    std::string body = "theta_mand filler";
+    if ((doc % 3) == 0) {
+      body += " theta_opt";
+    }
+    f.add(doc, body);
+  }
+  testIndex.flush();
+  f.startReading();
+
+  for (bool bulkPath : {false, true}) {
+    SCOPED_TRACE(bulkPath ? "bulk" : "pull");
+    MemPool pool;
+    Query::Context qContext(pool, *testIndex.reader);
+    auto& segment = qContext.topReader.segments()[0];
+    TermQuery mand("body_w", "theta_mand", 4.0f);
+    TermQuery opt("body_w", "theta_opt");
+    std::array<Query*, 1> mandatory = {&mand};
+    std::array<Query*, 1> optional = {&opt};
+    std::span<Query*> empty;
+    BooleanQuery query(mandatory, optional, empty, empty);
+    auto* weight = query.createWeight(qContext, Query::NEED_SCORES);
+    auto* supplier = weight->scorerSupplier(pool, segment);
+    ASSERT_NE(supplier, nullptr);
+
+    SkipStatsGuard stats;
+    if (bulkPath) {
+      auto* bulk = supplier->bulkScorer(pool);
+      ASSERT_NE(dynamic_cast<BooleanQuery::MandOptBulkScorer*>(bulk), nullptr);
+      ScoreWindow window;
+      bulk->scoreNextWindow(window, nullptr, 0, segment.maxDoc(), 100.0f);
+      EXPECT_GT(SkipStats::mandOptBulkWindowSkips, 0);
+    } else {
+      auto* scorer = dynamic_cast<BooleanQuery::MandOptScorer*>(
+          supplier->get(pool, std::numeric_limits<int64_t>::max()));
+      ASSERT_NE(scorer, nullptr);
+      scorer->setMinCompetitiveScore(100.0f);
+      EXPECT_EQ(scorer->next(), PostingsReader::END);
+      EXPECT_GT(SkipStats::mandOptWindowEvals, 0);
+    }
+    EXPECT_EQ(SkipStats::impactCertificateInvalidations, 0);
+    EXPECT_EQ(SkipStats::impactCertificateSurvivedRises, 0);
+  }
+}
+
 TEST_F(TermScorerTest, mandOptBulkCapacityWindowAndCountDomainUseMandDocs) {
   const int32_t nDocs = DocsEnum::L1_DOCS;
   TestIndex testIndex;
