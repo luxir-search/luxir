@@ -7009,6 +7009,56 @@ TEST_F(TermScorerTest, MaxScoreBulkScorerBs1BitsetFilterMatchesPull) {
   assertSameTopKDocs(pull, bulk, topK);
 }
 
+TEST_F(TermScorerTest, MaxScoreBulkScorerBs1OnlyForAllEssentialWindows) {
+  CollectionHelper helper("main");
+  const int32_t numTerms = 32;
+  const int32_t nDocs = 12 * Postings::DOCS_BLOCK_SIZE + 37;
+  addDenseManyClauseDisjunctionDocs(helper, nDocs, numTerms);
+  auto reader = helper.getIndexWriter()->getIndexReader();
+
+  float partialThreshold = 0.0f;
+  {
+    MemPool pool;
+    Query::Context qContext(pool, *reader);
+    std::vector<std::string> terms;
+    std::vector<TermQuery> queries;
+    std::vector<Query*> optional;
+    auto* weight = createDenseDisjunctionWeight(qContext, numTerms, terms, queries, optional);
+    auto& segment = qContext.topReader.segments()[0];
+    auto* supplier = weight->scorerSupplier(pool, segment);
+    ASSERT_NE(supplier, nullptr);
+    auto* bulk = dynamic_cast<BooleanQuery::MaxScoreBulkScorer*>(supplier->bulkScorer(pool));
+    ASSERT_NE(bulk, nullptr);
+
+    ScoreWindow window;
+    bulk->scoreNextWindow(window, nullptr, 0, segment.maxDoc(),
+                          std::numeric_limits<float>::lowest());
+    EXPECT_EQ(bulk->bs1WindowCount(), 1);
+    EXPECT_GT(window.size, 0);
+    partialThreshold = bulk->nextPartitionMcsForTests();
+    ASSERT_TRUE(std::isfinite(partialThreshold));
+  }
+
+  {
+    MemPool pool;
+    Query::Context qContext(pool, *reader);
+    std::vector<std::string> terms;
+    std::vector<TermQuery> queries;
+    std::vector<Query*> optional;
+    auto* weight = createDenseDisjunctionWeight(qContext, numTerms, terms, queries, optional);
+    auto& segment = qContext.topReader.segments()[0];
+    auto* supplier = weight->scorerSupplier(pool, segment);
+    ASSERT_NE(supplier, nullptr);
+    auto* bulk = dynamic_cast<BooleanQuery::MaxScoreBulkScorer*>(supplier->bulkScorer(pool));
+    ASSERT_NE(bulk, nullptr);
+
+    ScoreWindow window;
+    bulk->scoreNextWindow(window, nullptr, 0, segment.maxDoc(), partialThreshold);
+    EXPECT_EQ(bulk->bs1WindowCount(), 0);
+    EXPECT_GT(window.size, 0);  // Some clauses are still essential; the window is not dead.
+  }
+}
+
 TEST_F(TermScorerTest, MaxScoreBulkScorerSelectiveDomainDriveMatchesStream) {
   CollectionHelper helper("main");
   const int32_t numTerms = 32;

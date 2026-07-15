@@ -3205,7 +3205,11 @@ public:
     }
 
     bool useBs1ForWindow() const {
-      return scorers.size() >= kBs1MinClauses && splitIndex * 2 <= scorers.size();
+      // BS1 wins when every clause streams exhaustively into the shared score
+      // row. Once a clause is non-essential, the ordinary path can leave its
+      // postings untouched and probe only surviving candidates; BS1 instead
+      // decodes and scores that clause across the whole window.
+      return scorers.size() >= kBs1MinClauses && splitIndex == 0;
     }
 
     void updateMaxWindowScores(int32_t start, int32_t end) {
