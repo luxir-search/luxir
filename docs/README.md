@@ -5,6 +5,8 @@ with `curl` in a few commands.
 
 - [features.md](features.md) - what Solux is and what it can do today: the
   quick-evaluation page.
+- [guide/dates.md](guide/dates.md) - date fields, date math, and time zones:
+  what a zoned request means and how to bucket by calendar time.
 - [guide/faceting.md](guide/faceting.md) - field and range facets, including
   calendar gaps and facet time zones.
 - [guide/](guide/) - user documentation: quickstart, schema, indexing,
