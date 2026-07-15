@@ -5,9 +5,11 @@ with `curl` in a few commands.
 
 - [features.md](features.md) - what Solux is and what it can do today: the
   quick-evaluation page.
+- [guide/faceting.md](guide/faceting.md) - field and range facets, including
+  calendar gaps and facet time zones.
 - [guide/](guide/) - user documentation: quickstart, schema, indexing,
-  querying, vector search. Written for someone with a running server and a
-  client; no source checkout assumed.
+  querying, faceting, vector search. Written for someone with a running server
+  and a client; no source checkout assumed.
 - [design/](design/) - architecture, principles, and design decisions: the
   reference for how the engine works and why it works that way.
 - [dev/](dev/) - contributor documentation: building, testing, conventions.

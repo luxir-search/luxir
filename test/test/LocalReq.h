@@ -73,6 +73,10 @@ public:
   OpCursor& limit(int64_t n);     // TopDocs.limit or FieldFacet.limit, by op kind
   OpCursor& mincount(int64_t n);  // FieldFacet / RangeFacet
   OpCursor& range(int64_t start, int64_t end, int64_t gap);  // RangeFacet bounds
+  OpCursor& range(std::string_view start, std::string_view end, int64_t gap);
+  OpCursor& calendarRange(
+      std::string_view start, std::string_view end, int32_t n,
+      solux::api::CalendarGap_::Unit unit, std::string_view timeZone = {});
 
   // --- escape hatch: the mutable arena Query& of this TopDocs op, for wrapper queries
   //     (ConstantScore) the fluent helpers don't cover. ---
@@ -504,7 +508,41 @@ inline OpCursor& OpCursor::mincount(int64_t n) {
 }
 inline OpCursor& OpCursor::range(int64_t start, int64_t end, int64_t gap) {
   auto& r = std::get<solux::api::RangeFacet>(op_->kind);
-  r.start = start; r.end = end; r.gap = gap;
+  auto* startVal = req_->arenaNew<solux::api::Val>();
+  auto* endVal = req_->arenaNew<solux::api::Val>();
+  startVal->kind = start;
+  endVal->kind = end;
+  r.start = startVal;
+  r.end = endVal;
+  r.gap_kind.emplace<solux::api::Val>().kind = gap;
+  return *this;
+}
+inline OpCursor& OpCursor::range(
+    std::string_view start, std::string_view end, int64_t gap) {
+  auto& r = std::get<solux::api::RangeFacet>(op_->kind);
+  auto* startVal = req_->arenaNew<solux::api::Val>();
+  auto* endVal = req_->arenaNew<solux::api::Val>();
+  startVal->kind = build::arenaStr(req_->mr, start);
+  endVal->kind = build::arenaStr(req_->mr, end);
+  r.start = startVal;
+  r.end = endVal;
+  r.gap_kind.emplace<solux::api::Val>().kind = gap;
+  return *this;
+}
+inline OpCursor& OpCursor::calendarRange(
+    std::string_view start, std::string_view end, int32_t n,
+    solux::api::CalendarGap_::Unit unit, std::string_view timeZone) {
+  auto& r = std::get<solux::api::RangeFacet>(op_->kind);
+  auto* startVal = req_->arenaNew<solux::api::Val>();
+  auto* endVal = req_->arenaNew<solux::api::Val>();
+  startVal->kind = build::arenaStr(req_->mr, start);
+  endVal->kind = build::arenaStr(req_->mr, end);
+  r.start = startVal;
+  r.end = endVal;
+  auto& gap = r.gap_kind.emplace<solux::api::CalendarGap>();
+  gap.n = n;
+  gap.unit = unit;
+  r.time_zone = build::arenaStr(req_->mr, timeZone);
   return *this;
 }
 

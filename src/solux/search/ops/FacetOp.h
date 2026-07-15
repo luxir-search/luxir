@@ -484,9 +484,12 @@ public:
 };
 
 class IntFacetRangeReq : public FacetReq {
-  int64_t start;
-  int64_t end;
-  int64_t gap;
+  std::span<const int64_t> fences;
+  int64_t affineGap;
+  bool affine;
+
+  size_t bucketCount() const { return fences.size() - 1; }
+
 public:
   static inline bool disablePointsRangeFacetForTests = false;
 
@@ -494,19 +497,40 @@ public:
   // captures a span over rangeFacet.sorts that points into the request bytes.
   IntFacetRangeReq(SearchRequest& req, const ReqRangeFacet& rangeFacet,
     std::string_view fieldName, std::string_view facetName,
-    int64_t start, int64_t end, int64_t gap, int64_t minCount, bool missing)
+    std::span<const int64_t> fences, bool affine, int64_t affineGap,
+    int64_t minCount, bool missing)
   : FacetReq(req, fieldName, facetName, -1, minCount, missing, rangeFacet.sorts),
-    start(start), end(end), gap(gap) {}
+    fences(fences), affineGap(affineGap), affine(affine) {}
 
   virtual ~IntFacetRangeReq() = default;
 
+  class MergeableRangeFacet : public MergeableData {
+  public:
+    std::vector<int64_t> counts;
+    int64_t missing_num = 0;
+
+    static MergeableRangeFacet* merge(
+        MergeableRangeFacet* a, MergeableRangeFacet* b) {
+      if (a->counts.empty()) {
+        std::swap(a, b);
+      } else if (!b->counts.empty()) {
+        assert(a->counts.size() == b->counts.size());
+        for (size_t i = 0; i < a->counts.size(); i++) {
+          a->counts[i] += b->counts[i];
+        }
+      }
+      a->missing_num += b->missing_num;
+      return a;
+    }
+  };
+
   class Calc : public Calculator {
-    SegmentMergeDriver<IntFacetReq::MergeableIntFacet> driver;
+    SegmentMergeDriver<MergeableRangeFacet> driver;
   public:
     Calc(SearchOp& op, Calculator* parent, int64_t slot, int64_t numSlots)
       : Calculator(op, parent, slot, numSlots),
         driver(op.req.reader->segments().size(),
-               [this](std::unique_ptr<IntFacetReq::MergeableIntFacet> m){ facetResult(*m); }) {}
+               [this](std::unique_ptr<MergeableRangeFacet> m){ facetResult(*m); }) {}
     IntFacetRangeReq& thisOp() {
       return (IntFacetRangeReq&)getOp();
     }
@@ -516,19 +540,16 @@ public:
     };
     void calc(oneapi::tbb::task_group* tg, int32_t segnum, DocSet* domain) override {
       if (segnum == -1) {
-        driver.completeEmpty();  // empty index -> empty result (facetResult handles monostate)
+        driver.completeEmpty();
         return;
       }
-      driver.contribute([&](IntFacetReq::MergeableIntFacet& data) {
+      driver.contribute([&](MergeableRangeFacet& data) {
         SegFieldInfo segFieldInfo;
-        // IntFacetRangeReq always uses map storage since ranges can be arbitrary.
-        if (std::holds_alternative<std::monostate>(data.counts)) {
-          data.counts = IntFacetReq::MergeableIntFacet::IntHash();
+        if (data.counts.empty()) {
+          data.counts.assign(thisOp().bucketCount(), 0);
         }
-        auto& count = std::get<IntFacetReq::MergeableIntFacet::IntHash>(data.counts);
-        auto start = thisOp().start;
-        auto end = thisOp().end;
-        auto gap = thisOp().gap;
+        auto start = thisOp().fences.front();
+        auto end = thisOp().fences.back();
         auto& facetReq = (FacetReq&)getOp();
         auto& segment = facetReq.reader.segments()[segnum];
         bool noSubOps = thisOp().subOps.empty()
@@ -536,7 +557,7 @@ public:
                      && thisOp().sorts.empty();
         if (!IntFacetRangeReq::disablePointsRangeFacetForTests
             && domain == nullptr && segment.liveDocs() == nullptr && noSubOps
-            && start <= end) {
+            && start < end) {
           auto poolGuard = MemPool::threadLocalPoolGuard();
           FieldReader fieldReader(poolGuard.pool(), segment.postingsReader());
           if (fieldReader.seek(thisOp().fieldName)) {
@@ -557,21 +578,13 @@ public:
                   points.maxPointsPerLeaf());
               auto rawScratch = poolGuard.pool().make_span<int64_t>(
                   points.maxPointsPerLeaf());
-              uint64_t distance = (uint64_t)end - (uint64_t)start;
-              uint64_t bucketCount = distance / (uint64_t)gap
-                                   + (distance % (uint64_t)gap != 0);
               uint64_t ordinal = points.ordinalOfFirstAtLeast(
                   start, residualScratch, rawScratch);
-              uint64_t edgeOffset = 0;
-              for (uint64_t bucket = 0; bucket < bucketCount; bucket++) {
-                edgeOffset = distance - edgeOffset > (uint64_t)gap
-                           ? edgeOffset + (uint64_t)gap : distance;
-                int64_t edge = (int64_t)((uint64_t)start + edgeOffset);
+              for (size_t bucket = 0; bucket < thisOp().bucketCount(); bucket++) {
+                int64_t edge = thisOp().fences[bucket + 1];
                 uint64_t nextOrdinal = points.ordinalOfFirstAtLeast(
                     edge, residualScratch, rawScratch);
-                if (nextOrdinal != ordinal) {
-                  count[(int64_t)bucket] += (int64_t)(nextOrdinal - ordinal);
-                }
+                data.counts[bucket] += (int64_t)(nextOrdinal - ordinal);
                 ordinal = nextOrdinal;
               }
               skipCount(SkipStats::rangeFacetPointsArms);
@@ -584,65 +597,44 @@ public:
           if (val < start || val >= end) {
             return; // value is out of range
           }
-          // Unsigned distance: val-start can exceed int64 (e.g. start near
-          // INT64_MIN and val near INT64_MAX), which is signed-overflow UB.
-          // The guard above ensures start <= val < end, so the distance is a
-          // valid nonnegative bucket offset.
-          count[(int64_t)(((uint64_t)val - (uint64_t)start) / (uint64_t)gap)]++;
+          size_t bucket;
+          if (thisOp().affine) {
+            bucket = (size_t)(((uint64_t)val - (uint64_t)start)
+                              / (uint64_t)thisOp().affineGap);
+          } else {
+            bucket = (size_t)(std::upper_bound(
+                thisOp().fences.begin(), thisOp().fences.end(), val)
+                - thisOp().fences.begin() - 1);
+          }
+          data.counts[bucket]++;
         });
       });
     };
 
-    void facetResult(IntFacetReq::MergeableIntFacet& merged) {
+    void facetResult(MergeableRangeFacet& merged) {
       auto& mr = op.req.lastResponse->mr;  // arena for this leaf result (getTarget(nullptr) builds here)
       auto* myVal = getTarget(nullptr);
       solux::api::FacetResult& facetResultProto = oneofMut<solux::api::FacetResult>(*myVal);
       auto minCount = thisOp().minCount;
-      auto limit = thisOp().limit;
       auto missing = thisOp().missing;
-      auto start = thisOp().start;
-      auto end = thisOp().end;
-      auto gap = thisOp().gap;
 
-      std::vector<std::pair<int64_t, int64_t>> countVec;
-      // IntFacetRangeReq always uses map storage; monostate only for an empty index.
-      if (auto* counts = std::get_if<IntFacetReq::MergeableIntFacet::IntHash>(&merged.counts)) {
-        for (auto [val, count] : *counts) {
-          if (minCount == -1 || count >= minCount) {
-            countVec.emplace_back(val, count);
-          }
-        }
-      }
-      // Bucket keys are unsigned bucket indices stored in int64; for a range
-      // spanning > INT64_MAX buckets a key exceeds INT64_MAX and reads back
-      // negative, so order them unsigned to keep ascending bucket order.
-      std::sort(countVec.begin(), countVec.end(), [](auto& a, auto& b) {
-        return (uint64_t)a.first < (uint64_t)b.first;
-      });
-      if (limit >= 0 && limit < (int64_t)countVec.size()) {
-        countVec.resize(limit);
+      std::vector<size_t> emitted;
+      emitted.reserve(thisOp().bucketCount());
+      for (size_t i = 0; i < thisOp().bucketCount(); i++) {
+        int64_t count = merged.counts.empty() ? 0 : merged.counts[i];
+        if (count >= minCount) emitted.push_back(i);
       }
 
-      // fill in the facet result proto (non-owning: sizes known from countVec)
       auto& bucketIds = facetResultProto.bucket_ids.emplace().kind.emplace<solux::api::ArrArrInt>();
-      size_t n = countVec.size();
+      size_t n = emitted.size();
       solux::api::ArrInt* pairs = build::allocArray(bucketIds.v, n, mr);
       int64_t* counts = build::allocArray(facetResultProto.counts, n, mr);
-      // Bucket bounds via unsigned offsets from start.  k*gap and (k+1)*gap can
-      // exceed int64 for a large user gap/range; clamping the end offset before
-      // converting back keeps both bounds in [start, end] with no signed
-      // overflow and no wrap-to-negative (std::min on the converted value would
-      // pick the wrapped-negative bound instead of clamping to end).
-      uint64_t endOffset = (uint64_t)end - (uint64_t)start;
       for (size_t i = 0; i < n; i++) {
-        auto [val, count] = countVec[i];
-        uint64_t k = (uint64_t)val;
-        uint64_t loOff = k * (uint64_t)gap;  // < endOffset (key came from a real value)
-        uint64_t hiOff = endOffset - loOff > (uint64_t)gap ? loOff + (uint64_t)gap : endOffset;
+        size_t bucket = emitted[i];
         int64_t* bounds = build::allocArray(pairs[i].v, 2, mr);
-        bounds[0] = (int64_t)((uint64_t)start + loOff);
-        bounds[1] = (int64_t)((uint64_t)start + hiOff);
-        counts[i] = count;
+        bounds[0] = thisOp().fences[bucket];
+        bounds[1] = thisOp().fences[bucket + 1];
+        counts[i] = merged.counts.empty() ? 0 : merged.counts[bucket];
       }
       if (missing) {
         facetResultProto.missing = merged.missing_num;

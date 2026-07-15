@@ -102,7 +102,7 @@ struct Fusion; struct RrfFusion; struct SortSpec; struct Query;
 struct ConstantScoreQuery; struct BoostQuery; struct KnnQuery; struct Match; struct NamedQuery; struct BooleanQuery;
 struct PrefixQuery; struct FuzzyQuery; struct PhraseQuery; struct SimpleQuery; struct RangeQuery;
 struct GeoBoxQuery; struct GeoDistanceQuery; struct ExprQuery; struct Warning;
-struct FieldFacet; struct RangeFacet;
+struct FieldFacet; struct CalendarGap; struct RangeFacet;
 struct Domain; struct SearchResponse; struct DocList; struct FacetResult; struct Bucket;
 struct CommitParams; struct UpdateRequest; struct UpdateResponse; struct NamedValue; struct Map;
 struct Columns; struct Val; struct ArrVal; struct ArrStr; struct ArrInt; struct ArrFloat;
@@ -117,6 +117,9 @@ namespace UpdateResponse_ { struct Error; }
 // ---- nested enums (Foo_ namespace; matches generated metadata refs) ----
 namespace SortSpec_ { enum class SortDir { UNKNOWN = 0, ASC = 1, ASCENDING = 1, DESC = 2, DESCENDING = 2 }; }
 namespace Match_ { enum class Operator { OPERATOR_UNSPECIFIED = 0, OR = 1, AND = 2 }; }
+namespace CalendarGap_ {
+enum class Unit { UNKNOWN = 0, DAY = 1, WEEK = 2, MONTH = 3, QUARTER = 4, YEAR = 5 };
+}
 namespace UpdateResponse_ { enum class Status { UNKNOWN = 0, OK = 1, PARTIAL = 2, ERROR = 3 }; }
 namespace FieldDef_ {
 enum class FieldClass { STRING = 0, TEXT = 1, INT = 2, FLOAT = 3, DOUBLE = 4, BIN = 5, ID = 6, VECTOR = 7, DATE = 8, GEO_POINT = 9 };
@@ -129,6 +132,11 @@ namespace SchemaRequest_ { enum class Mode { MERGE = 0, REPLACE = 1 }; }
 
 struct Target { std::span<const std::string_view> name; };
 struct RrfFusion { int32_t k = 0; };
+struct CalendarGap {
+  using Unit = solux::api::CalendarGap_::Unit;
+  int32_t n = 0;
+  Unit unit = Unit::UNKNOWN;
+};
 struct SortSpec {
   using SortDir = solux::api::SortSpec_::SortDir;
   std::string_view field;
@@ -323,19 +331,6 @@ struct FieldFacet {
   map_view<std::string_view, ::hpp_proto::indirect_view<SearchOp>> ops;
   bool missing = false;
 };
-struct RangeFacet {
-  std::string_view field;
-  std::optional<std::int64_t> start;
-  std::optional<std::int64_t> end;
-  int64_t gap = 0;
-  std::optional<std::int64_t> mincount;
-  std::span<const SortSpec> sorts;
-  map_view<std::string_view, ::hpp_proto::indirect_view<SearchOp>> ops;
-  bool missing = false;
-};
-struct SearchOp {                                               // needs TopDocs,Fusion,FieldFacet,RangeFacet,GenOp
-  std::variant<std::monostate, TopDocs, Fusion, FieldFacet, RangeFacet, GenOp> kind;
-};
 struct SearchRequest {                                          // needs Target
   std::string_view request_id;
   std::optional<Target> collection;
@@ -382,6 +377,20 @@ struct Val {                                                   // needs Map,ArrV
   float asFloat() const { return std::get<float>(kind); }
   bool asBool() const { return std::get<bool>(kind); }
   std::string_view asString() const { return std::get<std::string_view>(kind); }
+};
+struct RangeFacet {                                             // needs Val,CalendarGap
+  std::variant<std::monostate, Val, CalendarGap> gap_kind;
+  std::string_view field;
+  ::hpp_proto::optional_indirect_view<Val> start;
+  ::hpp_proto::optional_indirect_view<Val> end;
+  std::optional<std::int64_t> mincount;
+  std::span<const SortSpec> sorts;
+  map_view<std::string_view, ::hpp_proto::indirect_view<SearchOp>> ops;
+  std::string_view time_zone;
+  bool missing = false;
+};
+struct SearchOp {                                               // needs TopDocs,Fusion,FieldFacet,RangeFacet,GenOp
+  std::variant<std::monostate, TopDocs, Fusion, FieldFacet, RangeFacet, GenOp> kind;
 };
 struct Warning { std::string_view code; std::string_view message; };
 struct SearchResponse {
@@ -466,7 +475,7 @@ SOLUX_TD(Fusion) SOLUX_TD(RrfFusion) SOLUX_TD(SortSpec) SOLUX_TD(Query)
 SOLUX_TD(ConstantScoreQuery) SOLUX_TD(BoostQuery) SOLUX_TD(KnnQuery) SOLUX_TD(Match) SOLUX_TD(NamedQuery) SOLUX_TD(BooleanQuery)
 SOLUX_TD(PrefixQuery) SOLUX_TD(FuzzyQuery) SOLUX_TD(PhraseQuery) SOLUX_TD(SimpleQuery) SOLUX_TD(RangeQuery)
 SOLUX_TD(GeoBoxQuery) SOLUX_TD(GeoDistanceQuery) SOLUX_TD(ExprQuery)
-SOLUX_TD(Warning) SOLUX_TD(FieldFacet) SOLUX_TD(RangeFacet)
+SOLUX_TD(Warning) SOLUX_TD(FieldFacet) SOLUX_TD(CalendarGap) SOLUX_TD(RangeFacet)
 SOLUX_TD(Domain) SOLUX_TD(SearchResponse) SOLUX_TD(DocList) SOLUX_TD(FacetResult) SOLUX_TD(Bucket)
 SOLUX_TD(CommitParams) SOLUX_TD(UpdateRequest) SOLUX_TD(UpdateResponse) SOLUX_TD(NamedValue) SOLUX_TD(Map)
 SOLUX_TD(Columns) SOLUX_TD(Val) SOLUX_TD(ArrVal) SOLUX_TD(ArrStr) SOLUX_TD(ArrInt) SOLUX_TD(ArrFloat)
@@ -494,7 +503,7 @@ SOLUX_ENTRY(KnnQuery) SOLUX_ENTRY(Match) SOLUX_ENTRY(NamedQuery) SOLUX_ENTRY(Boo
 SOLUX_ENTRY(PrefixQuery) SOLUX_ENTRY(FuzzyQuery) SOLUX_ENTRY(PhraseQuery) SOLUX_ENTRY(SimpleQuery)
 SOLUX_ENTRY(RangeQuery) SOLUX_ENTRY(GeoBoxQuery) SOLUX_ENTRY(GeoDistanceQuery) SOLUX_ENTRY(ExprQuery)
 SOLUX_ENTRY(Warning) SOLUX_ENTRY(FieldFacet)
-SOLUX_ENTRY(RangeFacet) SOLUX_ENTRY(Domain) SOLUX_ENTRY(SearchResponse) SOLUX_ENTRY(DocList)
+SOLUX_ENTRY(CalendarGap) SOLUX_ENTRY(RangeFacet) SOLUX_ENTRY(Domain) SOLUX_ENTRY(SearchResponse) SOLUX_ENTRY(DocList)
 SOLUX_ENTRY(FacetResult) SOLUX_ENTRY(Bucket) SOLUX_ENTRY(CommitParams) SOLUX_ENTRY(UpdateRequest)
 SOLUX_ENTRY(UpdateResponse) SOLUX_ENTRY(NamedValue) SOLUX_ENTRY(Map) SOLUX_ENTRY(Columns)
 SOLUX_ENTRY(Val) SOLUX_ENTRY(ArrVal) SOLUX_ENTRY(ArrStr) SOLUX_ENTRY(ArrInt) SOLUX_ENTRY(ArrFloat)

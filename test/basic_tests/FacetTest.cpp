@@ -5,6 +5,7 @@
 #include <cmath>
 #include <functional>
 #include <map>
+#include <numeric>
 #include <optional>
 #include <variant>
 #include <unordered_map>
@@ -36,6 +37,7 @@ struct RangeSchemaField {
   std::string_view name;
   bool points;
   bool multi;
+  api::FieldDef::FieldClass fieldClass = api::FieldDef::FieldClass::INT;
 };
 
 void setRangeFacetSchema(CollectionHelper& helper,
@@ -45,7 +47,7 @@ void setRangeFacetSchema(CollectionHelper& helper,
   api::FieldDef* defs = api::build::allocArray(def.fields, fields.size(), arena);
   for (size_t i = 0; i < fields.size(); i++) {
     defs[i].name = fields[i].name;
-    defs[i].field_class = api::FieldDef::FieldClass::INT;
+    defs[i].field_class = fields[i].fieldClass;
     defs[i].index = fields[i].points ? api::FieldDef::IndexMode::RANGE
                                     : api::FieldDef::IndexMode::NONE;
     defs[i].multi_valued = fields[i].multi;
@@ -80,6 +82,25 @@ void expectRangeResult(const api::FacetResult& result,
     EXPECT_EQ(counts[i], result.counts[i]);
   }
   EXPECT_EQ(missing, result.missing.value_or(-1));
+}
+
+int64_t epoch(std::string_view text) {
+  auto value = parseDateToEpochMillis(text);
+  EXPECT_TRUE(value.has_value()) << text;
+  return value.value_or(0);
+}
+
+TimeZone zone(std::string_view name) {
+  auto value = resolveTimeZone(name);
+  EXPECT_TRUE(value.has_value()) << name;
+  return value.value_or(TimeZone::utc());
+}
+
+int64_t localLo(std::string_view text, const TimeZone& timeZone,
+                int64_t now = 0) {
+  auto value = parseDateRange(text, now, timeZone);
+  EXPECT_TRUE(value.has_value()) << text << " in " << timeZone.name();
+  return value ? value->lo : 0;
 }
 
 class PointsRangeFacetTestGuard {
@@ -296,9 +317,10 @@ TEST_F(FacetTest, emptyIndex) {
       const auto* facetResult = ops.at("f_range")->facetResult();
       ASSERT_NE(facetResult, nullptr) << "Failed for " << fieldType.description;
 
-      // Range facets should have empty buckets
-      ASSERT_EQ(0, (int)std::get<solux::api::ArrArrInt>(facetResult->bucket_ids->kind).v.size()) << "Failed for " << fieldType.description;
-      ASSERT_EQ(0, (int)facetResult->counts.size()) << "Failed for " << fieldType.description;
+      const auto& ids = std::get<solux::api::ArrArrInt>(facetResult->bucket_ids->kind);
+      ASSERT_EQ(10, (int)ids.v.size()) << "Failed for " << fieldType.description;
+      ASSERT_EQ(10, (int)facetResult->counts.size()) << "Failed for " << fieldType.description;
+      for (int64_t count : facetResult->counts) EXPECT_EQ(0, count);
     } else {
       ASSERT_TRUE(ops.contains("f")) << "Failed for " << fieldType.description;
       const auto* facetResult = ops.at("f")->facetResult();
@@ -362,9 +384,10 @@ TEST_F(FacetTest, pointsRangeFacetMatchesColumnWalk) {
     const std::array allBounds = {
       std::pair<int64_t, int64_t>{-1500, 1200},
       std::pair<int64_t, int64_t>{1200, 3900},
+      std::pair<int64_t, int64_t>{3900, 6600},
       std::pair<int64_t, int64_t>{6600, 9100}
     };
-    const std::array<int64_t, 3> allCounts = {3, 2, 2};
+    const std::array<int64_t, 4> allCounts = {3, 2, 0, 2};
     expectRangeResult(rootFacetResult(*req, "all"), allBounds, allCounts, 1);
     const std::array filteredBounds = {
       std::pair<int64_t, int64_t>{-1500, 1200}
@@ -412,8 +435,11 @@ TEST_F(FacetTest, pointsRangeFacetFallbacks) {
     };
     ASSERT_TRUE(helper.indexAll(docs, UpdateMessage::COMMIT).success);
   };
-  const std::array oneBound = {std::pair<int64_t, int64_t>{1000, 2000}};
-  const std::array<int64_t, 1> oneCount = {1};
+  const std::array bounds = {
+    std::pair<int64_t, int64_t>{0, 1000},
+    std::pair<int64_t, int64_t>{1000, 2000},
+    std::pair<int64_t, int64_t>{2000, 3000}
+  };
 
   {
     CollectionHelper helper;
@@ -426,7 +452,8 @@ TEST_F(FacetTest, pointsRangeFacetFallbacks) {
     std::get<api::RangeFacet>(facet.rawOp().kind).missing = true;
     req->execute(false);
     EXPECT_EQ(0, SkipStats::rangeFacetPointsArms);
-    expectRangeResult(rootFacetResult(*req, "f"), oneBound, oneCount, 1);
+    const std::array<int64_t, 3> counts = {0, 1, 0};
+    expectRangeResult(rootFacetResult(*req, "f"), bounds, counts, 1);
   }
 
   {
@@ -444,7 +471,8 @@ TEST_F(FacetTest, pointsRangeFacetFallbacks) {
     EXPECT_EQ(0, SkipStats::rangeFacetPointsArms);
     const auto* docs = req->docList("q");
     ASSERT_NE(nullptr, docs);
-    expectRangeResult(*docs->ops.at("f")->facetResult(), oneBound, oneCount, 1);
+    const std::array<int64_t, 3> counts = {0, 1, 0};
+    expectRangeResult(*docs->ops.at("f")->facetResult(), bounds, counts, 1);
   }
 
   {
@@ -458,13 +486,351 @@ TEST_F(FacetTest, pointsRangeFacetFallbacks) {
     std::get<api::RangeFacet>(facet.rawOp().kind).missing = true;
     req->execute(false);
     EXPECT_EQ(0, SkipStats::rangeFacetPointsArms);
-    const std::array bounds = {
-      std::pair<int64_t, int64_t>{1000, 2000},
-      std::pair<int64_t, int64_t>{2000, 3000}
-    };
-    const std::array<int64_t, 2> counts = {1, 1};
+    const std::array<int64_t, 3> counts = {0, 1, 1};
     expectRangeResult(rootFacetResult(*req, "f"), bounds, counts, 1);
   }
+}
+
+// Historical transition expectations depend on the process tzdb snapshot.
+TEST_F(FacetTest, calendarDateRangeDenverDstAndPointsParity) {
+  CollectionHelper helper;
+  helper.clear();
+  const std::array fields = {
+    RangeSchemaField{"when_dt", true, false, api::FieldDef::FieldClass::DATE}
+  };
+  setRangeFacetSchema(helper, fields);
+
+  TimeZone denver = zone("America/Denver");
+  std::array<int64_t, 6> fences;
+  const std::array dates = {
+    "2024-03-09", "2024-03-10", "2024-03-11",
+    "2024-03-12", "2024-03-13", "2024-03-14"
+  };
+  for (size_t i = 0; i < fences.size(); i++) fences[i] = localLo(dates[i], denver);
+  EXPECT_EQ(24 * 60 * 60 * 1000LL, fences[1] - fences[0]);
+  EXPECT_EQ(23 * 60 * 60 * 1000LL, fences[2] - fences[1]);
+  EXPECT_EQ(24 * 60 * 60 * 1000LL, fences[3] - fences[2]);
+
+  const std::array values = {
+    fences[0], fences[1] - 1,
+    fences[1], fences[1] + 1, fences[2] - 1,
+    fences[2], fences[3] - 1,
+    fences[3], fences[4] - 1
+  };
+  for (size_t i = 0; i < values.size(); i++) {
+    ASSERT_TRUE(helper.index(
+        flatdoc("id", std::to_string(i), "when_dt", values[i]),
+        i + 1 == values.size() ? UpdateMessage::COMMIT
+                               : UpdateMessage::NO_COMMIT).success);
+  }
+
+  PointsRangeFacetTestGuard guard;
+  auto run = [&](bool disablePoints) {
+    IntFacetRangeReq::disablePointsRangeFacetForTests = disablePoints;
+    auto req = localReq(soluxNode->getSearchEngine());
+    req->collection("main");
+    req->rangeFacet("days", "when_dt").calendarRange(
+        "2024-03-09", "2024-03-14", 1,
+        api::CalendarGap_::Unit::DAY, "America/Denver");
+    req->execute(false);
+    EXPECT_TRUE(req->ok()) << req->errorMsg();
+    const auto& result = rootFacetResult(*req, "days");
+    const std::array expectedCounts = {2LL, 3LL, 2LL, 2LL, 0LL};
+    EXPECT_EQ(expectedCounts.size(), result.counts.size());
+    std::vector<int64_t> actualCounts(result.counts.begin(), result.counts.end());
+    std::vector<int64_t> wantedCounts(expectedCounts.begin(), expectedCounts.end());
+    EXPECT_EQ(wantedCounts, actualCounts);
+    EXPECT_EQ((int64_t)values.size(),
+              std::accumulate(result.counts.begin(), result.counts.end(), 0LL));
+    return encodeFacetResult(*req, "days");
+  };
+  EXPECT_EQ(run(false), run(true));
+}
+
+TEST_F(FacetTest, calendarDateRangeTransitionFenceEdges) {
+  CollectionHelper helper;
+  helper.clear();
+  const std::array fields = {
+    RangeSchemaField{"when_dt", true, false, api::FieldDef::FieldClass::DATE}
+  };
+  setRangeFacetSchema(helper, fields);
+
+  int64_t transition = epoch("2024-03-10T09:00:00Z");
+  ASSERT_TRUE(helper.index(flatdoc("id", "a", "when_dt", transition - 1),
+                           UpdateMessage::NO_COMMIT).success);
+  ASSERT_TRUE(helper.index(flatdoc("id", "b", "when_dt", transition),
+                           UpdateMessage::NO_COMMIT).success);
+  ASSERT_TRUE(helper.index(flatdoc("id", "c", "when_dt", transition + 1),
+                           UpdateMessage::COMMIT).success);
+
+  auto req = localReq(soluxNode->getSearchEngine());
+  req->collection("main");
+  req->rangeFacet("days", "when_dt").calendarRange(
+      "2024-03-09T02", "2024-03-11T02", 1,
+      api::CalendarGap_::Unit::DAY, "America/Denver");
+  req->execute(false);
+  ASSERT_OK(req);
+  const std::array bounds = {
+    std::pair{epoch("2024-03-09T09:00:00Z"), transition},
+    std::pair{transition, epoch("2024-03-11T08:00:00Z")}
+  };
+  const std::array<int64_t, 2> counts = {1, 2};
+  expectRangeResult(rootFacetResult(*req, "days"), bounds, counts, -1);
+}
+
+TEST_F(FacetTest, dateRangeFacetZoneInheritanceAndOverrides) {
+  CollectionHelper helper;
+  helper.clear();
+  const std::array fields = {
+    RangeSchemaField{"when_dt", false, false, api::FieldDef::FieldClass::DATE}
+  };
+  setRangeFacetSchema(helper, fields);
+
+  auto req = localReq(soluxNode->getSearchEngine());
+  req->collection("main").timeZone("America/Denver");
+  req->rangeFacet("inherited", "when_dt").calendarRange(
+      "2024-03-10", "2024-03-11", 1, api::CalendarGap_::Unit::DAY);
+  req->rangeFacet("override", "when_dt").calendarRange(
+      "2024-03-10", "2024-03-11", 1, api::CalendarGap_::Unit::DAY,
+      "America/New_York");
+  req->rangeFacet("utc", "when_dt").calendarRange(
+      "2024-03-10", "2024-03-11", 1, api::CalendarGap_::Unit::DAY, "UTC");
+  req->execute(false);
+  ASSERT_OK(req);
+
+  auto firstBound = [&](std::string_view name) {
+    return std::get<api::ArrArrInt>(
+        rootFacetResult(*req, name).bucket_ids->kind).v[0].v[0];
+  };
+  EXPECT_EQ(epoch("2024-03-10T07:00:00Z"), firstBound("inherited"));
+  EXPECT_EQ(epoch("2024-03-10T05:00:00Z"), firstBound("override"));
+  EXPECT_EQ(epoch("2024-03-10T00:00:00Z"), firstBound("utc"));
+}
+
+TEST_F(FacetTest, dateRangeFacetDateMathBounds) {
+  CollectionHelper helper;
+  helper.clear();
+  const std::array fields = {
+    RangeSchemaField{"when_dt", false, false, api::FieldDef::FieldClass::DATE}
+  };
+  setRangeFacetSchema(helper, fields);
+
+  auto req = localReq(soluxNode->getSearchEngine());
+  req->collection("main");
+  int64_t now = req->dateMathNowEpochMillis;
+  req->rangeFacet("days", "when_dt").range(
+      "NOW/DAY-30DAYS", "NOW/DAY+1DAY", 86400000);
+  req->execute(false);
+  ASSERT_OK(req);
+  const auto& bounds = std::get<api::ArrArrInt>(
+      rootFacetResult(*req, "days").bucket_ids->kind).v;
+  ASSERT_EQ(31u, bounds.size());
+  EXPECT_EQ(localLo("NOW/DAY-30DAYS", TimeZone::utc(), now), bounds.front().v[0]);
+  EXPECT_EQ(localLo("NOW/DAY+1DAY", TimeZone::utc(), now), bounds.back().v[1]);
+}
+
+TEST_F(FacetTest, dateRangeFacetSkippedBoundWarns) {
+  CollectionHelper helper;
+  helper.clear();
+  const std::array fields = {
+    RangeSchemaField{"when_dt", false, false, api::FieldDef::FieldClass::DATE}
+  };
+  setRangeFacetSchema(helper, fields);
+
+  auto req = localReq(soluxNode->getSearchEngine());
+  req->collection("main");
+  auto& cursor = req->rangeFacet("minutes", "when_dt")
+                     .range("2024-03-10T02:30", "2024-03-10T04", 60000);
+  std::get<api::RangeFacet>(cursor.rawOp().kind).time_zone = "America/Denver";
+  req->execute(false);
+  ASSERT_OK(req);
+  ASSERT_TRUE(req->hasWarning("date_granule_skipped"));
+  bool actionable = false;
+  for (const auto& warning : req->respWarnings()) {
+    if (warning.code == "date_granule_skipped") {
+      actionable = warning.message.find("facet 'minutes'") != std::string_view::npos
+          && warning.message.find("2024-03-10T02:30") != std::string_view::npos;
+    }
+  }
+  EXPECT_TRUE(actionable);
+}
+
+TEST_F(FacetTest, calendarDateRangeFromStartAndFoldProvenance) {
+  CollectionHelper helper;
+  helper.clear();
+  const std::array fields = {
+    RangeSchemaField{"when_dt", false, false, api::FieldDef::FieldClass::DATE}
+  };
+  setRangeFacetSchema(helper, fields);
+
+  auto req = localReq(soluxNode->getSearchEngine());
+  req->collection("main");
+  req->rangeFacet("month_ends", "when_dt").calendarRange(
+      "2024-01-31", "2024-04-01", 1,
+      api::CalendarGap_::Unit::MONTH, "UTC");
+  req->rangeFacet("havana", "when_dt").calendarRange(
+      "2015-01-01T00", "2015-12-01T00", 1,
+      api::CalendarGap_::Unit::MONTH, "America/Havana");
+  req->rangeFacet("fixed_days", "when_dt").calendarRange(
+      "2024-03-09", "2024-03-12", 1,
+      api::CalendarGap_::Unit::DAY, "+05:30");
+  req->execute(false);
+  ASSERT_OK(req);
+
+  const auto& months = std::get<api::ArrArrInt>(
+      rootFacetResult(*req, "month_ends").bucket_ids->kind).v;
+  ASSERT_EQ(3u, months.size());
+  EXPECT_EQ(epoch("2024-02-29T00:00:00Z"), months[0].v[1]);
+  EXPECT_EQ(epoch("2024-03-31T00:00:00Z"), months[1].v[1]);
+  EXPECT_EQ(epoch("2024-04-01T00:00:00Z"), months[2].v[1]);
+
+  const auto& havana = std::get<api::ArrArrInt>(
+      rootFacetResult(*req, "havana").bucket_ids->kind).v;
+  ASSERT_EQ(11u, havana.size());
+  EXPECT_EQ(epoch("2015-11-01T05:00:00Z"), havana[9].v[1]);
+
+  const auto& fixed = std::get<api::ArrArrInt>(
+      rootFacetResult(*req, "fixed_days").bucket_ids->kind).v;
+  ASSERT_EQ(3u, fixed.size());
+  for (const auto& pair : fixed) EXPECT_EQ(86400000, pair.v[1] - pair.v[0]);
+}
+
+// Pacific/Apia skipped 2011-12-30 when it moved across the dateline.
+TEST_F(FacetTest, calendarDateRangeApiaSkippedDayParityAndWarning) {
+  CollectionHelper helper;
+  helper.clear();
+  const std::array fields = {
+    RangeSchemaField{"when_dt", true, false, api::FieldDef::FieldClass::DATE}
+  };
+  setRangeFacetSchema(helper, fields);
+  const std::array values = {
+    epoch("2011-12-29T10:00:00Z"),
+    epoch("2011-12-30T10:00:00Z"),
+    epoch("2011-12-31T10:00:00Z")
+  };
+  for (size_t i = 0; i < values.size(); i++) {
+    ASSERT_TRUE(helper.index(
+        flatdoc("id", std::to_string(i), "when_dt", values[i]),
+        i + 1 == values.size() ? UpdateMessage::COMMIT
+                               : UpdateMessage::NO_COMMIT).success);
+  }
+
+  PointsRangeFacetTestGuard guard;
+  auto run = [&](bool disablePoints) {
+    IntFacetRangeReq::disablePointsRangeFacetForTests = disablePoints;
+    auto req = localReq(soluxNode->getSearchEngine());
+    req->collection("main");
+    req->rangeFacet("by_day", "when_dt").calendarRange(
+        "2011-12-29", "2012-01-02", 1,
+        api::CalendarGap_::Unit::DAY, "Pacific/Apia");
+    req->execute(false);
+    EXPECT_TRUE(req->ok()) << req->errorMsg();
+    EXPECT_TRUE(req->hasWarning("calendar_bucket_skipped"));
+    bool actionable = false;
+    for (const auto& warning : req->respWarnings()) {
+      if (warning.code == "calendar_bucket_skipped") {
+        EXPECT_NE(warning.message.find("facet 'by_day'"), std::string_view::npos)
+            << warning.message;
+        EXPECT_NE(warning.message.find("2011-12-30"), std::string_view::npos)
+            << warning.message;
+        actionable = warning.message.find("facet 'by_day'") != std::string_view::npos
+            && warning.message.find("2011-12-30") != std::string_view::npos;
+      }
+    }
+    EXPECT_TRUE(actionable);
+    EXPECT_EQ(3u, rootFacetResult(*req, "by_day").counts.size());
+    return encodeFacetResult(*req, "by_day");
+  };
+  EXPECT_EQ(run(false), run(true));
+}
+
+TEST_F(FacetTest, rangeFacetValidationAndDegenerateRanges) {
+  CollectionHelper helper;
+  helper.clear();
+  const std::array fields = {
+    RangeSchemaField{"number_i", false, false},
+    RangeSchemaField{"when_dt", false, false, api::FieldDef::FieldClass::DATE},
+    RangeSchemaField{"number_f", false, false, api::FieldDef::FieldClass::FLOAT}
+  };
+  setRangeFacetSchema(helper, fields);
+
+  auto expectError = [&](auto configure, std::string_view text) {
+    auto req = localReq(soluxNode->getSearchEngine());
+    req->collection("main");
+    configure(*req);
+    req->execute(false);
+    EXPECT_FALSE(req->ok());
+    EXPECT_NE(req->errorMsg().find(text), std::string::npos) << req->errorMsg();
+  };
+  expectError([](LocalReq& req) { req.rangeFacet("f", "number_i"); },
+              "start and end are required");
+  expectError([](LocalReq& req) {
+    auto& cursor = req.rangeFacet("f", "number_i").range(0, 10, 1);
+    std::get<api::RangeFacet>(cursor.rawOp().kind).end.reset();
+  }, "start and end are required");
+  expectError([](LocalReq& req) { req.rangeFacet("f", "number_i").range(4, 4, 1); },
+              "start must be less than end");
+  expectError([](LocalReq& req) { req.rangeFacet("f", "number_i").range(5, 4, 1); },
+              "start must be less than end");
+  expectError([](LocalReq& req) {
+    auto& cursor = req.rangeFacet("f", "when_dt")
+                       .range("2024-03-10T02", "2024-03-10T03", 1);
+    std::get<api::RangeFacet>(cursor.rawOp().kind).time_zone = "America/Denver";
+  }, "start must be less than end");
+  expectError([](LocalReq& req) {
+    auto& cursor = req.rangeFacet("f", "number_i").range(0, 10, 1);
+    std::get<api::RangeFacet>(cursor.rawOp().kind).time_zone = "UTC";
+  }, "only valid for DATE fields");
+  expectError([](LocalReq& req) {
+    req.rangeFacet("f", "number_i").calendarRange(
+        "0", "10", 1, api::CalendarGap_::Unit::DAY);
+  }, "only valid for DATE fields");
+  expectError([](LocalReq& req) {
+    req.rangeFacet("f", "when_dt").calendarRange(
+        "2024-01-01", "2024-01-02", 1, api::CalendarGap_::Unit::DAY,
+        "No/Such_Zone");
+  }, "No/Such_Zone");
+  expectError([](LocalReq& req) {
+    req.rangeFacet("f", "number_i").range(0, 100001, 1);
+  }, "100000 bucket limit");
+  expectError([](LocalReq& req) {
+    req.rangeFacet("f", "number_i").range(0, 10, 0);
+  }, "gap must be > 0");
+  expectError([](LocalReq& req) {
+    req.rangeFacet("f", "when_dt").calendarRange(
+        "2024-01-01", "2024-01-02", 0, api::CalendarGap_::Unit::DAY);
+  }, "requires n > 0");
+  expectError([](LocalReq& req) {
+    req.rangeFacet("f", "when_dt").calendarRange(
+        "2024-01-01", "2024-01-02", 1, api::CalendarGap_::Unit::UNKNOWN);
+  }, "requires n > 0");
+  expectError([](LocalReq& req) {
+    req.rangeFacet("f", "number_f").range(0, 10, 1);
+  }, "float/double range facets are not yet supported");
+}
+
+TEST_F(FacetTest, rangeFacetEmptyDomainAndPartialLastBucket) {
+  CollectionHelper helper;
+  helper.clear();
+  ASSERT_TRUE(helper.index(flatdoc("id", "a", "number_i", 9, "pick_s", "no"),
+                           UpdateMessage::COMMIT).success);
+
+  auto req = localReq(soluxNode->getSearchEngine());
+  req->collection("main");
+  auto& top = req->topDocs("q");
+  top.matchQuery("pick_s", "yes");
+  top.rangeFacet("f", "number_i").range(0, 10, 4);
+  req->execute(false);
+  ASSERT_OK(req);
+  const auto* docs = req->docList("q");
+  ASSERT_NE(nullptr, docs);
+  const std::array bounds = {
+    std::pair<int64_t, int64_t>{0, 4},
+    std::pair<int64_t, int64_t>{4, 8},
+    std::pair<int64_t, int64_t>{8, 10}
+  };
+  const std::array<int64_t, 3> counts = {0, 0, 0};
+  expectRangeResult(*docs->ops.at("f")->facetResult(), bounds, counts, -1);
 }
 
 TEST_F(FacetTest, emptyIndexNestedFacet) {
@@ -999,9 +1365,9 @@ TEST_F(FacetTest, unsupportedFacetOptionsRejected) {
       facet.range(0, 10, 1);
       qb::sort(facet, "avg", qb::ASC);
     }, "not yet supported for range facets"},
-    {"range_mincount_zero", [](LocalReq& req) {
-      req.rangeFacet("f", "foo_i").range(0, 10, 1).mincount(0);
-    }, "not supported for range facets"},
+    {"range_mincount_negative", [](LocalReq& req) {
+      req.rangeFacet("f", "foo_i").range(0, 10, 1).mincount(-1);
+    }, "mincount must be >= 0"},
     {"string_unknown_sort", [](LocalReq& req) {
       auto& facet = req.facet("f", "cat_s");
       qb::sort(facet, "not_a_subop", qb::ASC);
@@ -1915,21 +2281,22 @@ protected:
       return out;
     }
 
-    // Expected result for an int range facet. Buckets are nonzero only, in
-    // bucket-index order; out-of-range values are dropped (not missing);
+    // Expected result for an int range facet. Buckets are dense and in
+    // bucket order; out-of-range values are dropped (not missing);
     // missing = domain docs with no int value for the field.
     ExpFacet calculateRangeFacet(const solux::api::RangeFacet& rf,
                                  const std::vector<size_t>& domainDocs) const {
       ExpFacet out;
       out.isRange = true;
       std::string fieldName(rf.field);
-      int64_t start = rf.start.value_or(0);
-      int64_t end = rf.end.value_or(0);
-      int64_t gap = rf.gap;  // bare: unset (0) -> 1 via the clamp below
-      if (gap <= 0) gap = 1;
-      int64_t minCount = rf.mincount.has_value() ? *rf.mincount : -1;  // engine: unset == -1
+      int64_t start = std::get<int64_t>((*rf.start).kind);
+      int64_t end = std::get<int64_t>((*rf.end).kind);
+      int64_t gap = std::get<int64_t>(
+          std::get<solux::api::Val>(rf.gap_kind).kind);
+      int64_t minCount = rf.mincount.value_or(0);
 
-      std::map<int64_t, int64_t> bucketCounts;  // bucket index -> count (ascending)
+      int64_t bucketCount = (end - start) / gap + ((end - start) % gap != 0);
+      std::vector<int64_t> bucketCounts((size_t)bucketCount, 0);
       int64_t missingCount = 0;
       std::vector<const FieldVal*> vals;
       for (auto docIdx : domainDocs) {
@@ -1940,13 +2307,14 @@ protected:
             hasField = true;
             int64_t v = *iv;
             if (v < start || v >= end) continue;  // out of range -> dropped
-            bucketCounts[(v - start) / gap]++;
+            bucketCounts[(size_t)((v - start) / gap)]++;
           }
         }
         if (!hasField) missingCount++;
       }
-      for (auto [k, count] : bucketCounts) {
-        if (minCount != -1 && count < minCount) continue;
+      for (int64_t k = 0; k < bucketCount; k++) {
+        int64_t count = bucketCounts[(size_t)k];
+        if (count < minCount) continue;
         out.rangePairs.push_back({start + k * gap, std::min(start + (k + 1) * gap, end)});
         out.counts.push_back(count);
       }
@@ -2161,7 +2529,7 @@ protected:
 
   // Random int range facet (start may be negative, end may exceed the value
   // range, gap may not divide evenly -> exercises out-of-range and partial
-  // buckets). Range rejects mincount<1 and float/double, so unset or >=1.
+  // buckets). Float/double remain unsupported in this stage.
   // `cur` is the RangeFacet cursor (its field is already set).
   static void generateRandomRangeFacet(Rng& rng, OpCursor& cur, const FieldDef& field) {
     int n = field.numUniqueValues;
@@ -2170,8 +2538,7 @@ protected:
     int64_t gap = 1 + rng.rint(std::max(1, n / 3));                 // >= 1
     cur.range(start, end, gap);
     int mc = rng.rint(3);
-    if (mc == 1) cur.mincount(1);
-    else if (mc == 2) cur.mincount(2);
+    if (mc != 0) cur.mincount(mc - 1);
     std::get<solux::api::RangeFacet>(cur.rawOp().kind).missing = rng.rbool();
   }
 

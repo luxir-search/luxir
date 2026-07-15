@@ -5,6 +5,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <limits>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -284,6 +285,13 @@ struct CivilTime {
   std::chrono::seconds offset;
 };
 
+enum class CalendarUnit : uint8_t { DAY, WEEK, MONTH, QUARTER, YEAR };
+
+struct CivilFence {
+  int64_t civilMillis;
+  int64_t instant;
+};
+
 inline std::optional<CivilTime> civilFromInstant(int64_t millis, const TimeZone& zone) {
   namespace dd = datetime_detail;
   using namespace std::chrono;
@@ -308,6 +316,48 @@ inline std::optional<CivilTime> civilFromInstant(int64_t millis, const TimeZone&
   return CivilTime{(int64_t)local, offset};
 }
 
+namespace datetime_detail {
+
+inline std::chrono::seconds offsetForLocalInfo(
+    int64_t civilMillis, const std::chrono::local_info& info,
+    std::optional<std::chrono::seconds> preferredOffset) {
+  using namespace std::chrono;
+  if (info.result == local_info::unique) return info.first.offset;
+  if (info.result == local_info::ambiguous) {
+    // libstdc++ 16 classifies the exact upper endpoint of some transition
+    // intervals with the interval itself. Civil transition intervals are
+    // half-open; at that endpoint only the post-transition offset is valid.
+    auto transition = duration_cast<milliseconds>(
+        info.first.end.time_since_epoch()).count();
+    __int128 overlapEnd = (__int128)transition
+                        + duration_cast<milliseconds>(info.first.offset).count();
+    if ((__int128)civilMillis >= overlapEnd) return info.second.offset;
+    // Java ZonedDateTime.ofLocal: retain a valid preferred source offset;
+    // otherwise use the earlier (pre-transition) offset.
+    return preferredOffset && *preferredOffset == info.second.offset
+        ? info.second.offset : info.first.offset;
+  }
+  auto transition = duration_cast<milliseconds>(
+      info.second.begin.time_since_epoch()).count();
+  __int128 gapEnd = (__int128)transition
+                  + duration_cast<milliseconds>(info.second.offset).count();
+  if ((__int128)civilMillis >= gapEnd) return info.second.offset;
+  // Java's gap shift is local - pre-transition offset. This deliberately
+  // does not use to_sys(choose::), which clamps to the transition instant.
+  return info.first.offset;
+}
+
+inline std::optional<int64_t> instantWithOffset(
+    int64_t civilMillis, std::chrono::seconds offset) {
+  using namespace std::chrono;
+  __int128 instant = (__int128)civilMillis
+                   - duration_cast<milliseconds>(offset).count();
+  if (instant < kMinEpochMs || instant > kMaxEpochMs) return std::nullopt;
+  return (int64_t)instant;
+}
+
+} // namespace datetime_detail
+
 inline std::optional<int64_t> instantFromCivil(
     int64_t civilMillis, const TimeZone& zone,
     std::optional<std::chrono::seconds> preferredOffset = std::nullopt) {
@@ -321,47 +371,112 @@ inline std::optional<int64_t> instantFromCivil(
   if (zone.isFixed()) {
     offset = minutes{zone.offsetMinutes()};
   } else if (zone.isIana()) {
-    local_info info;
     try {
-      info = zone.ianaZone()->get_info(local_time<milliseconds>{milliseconds{civilMillis}});
+      auto info = zone.ianaZone()->get_info(
+          local_time<milliseconds>{milliseconds{civilMillis}});
+      offset = dd::offsetForLocalInfo(civilMillis, info, preferredOffset);
     } catch (const std::exception&) {
       return std::nullopt;
     }
-    if (info.result == local_info::unique) {
-      offset = info.first.offset;
-    } else if (info.result == local_info::ambiguous) {
-      // libstdc++ 16 classifies the exact upper endpoint of some transition
-      // intervals with the interval itself. Civil transition intervals are
-      // half-open; at that endpoint only the post-transition offset is valid.
-      auto transition = duration_cast<milliseconds>(info.first.end.time_since_epoch()).count();
-      __int128 overlapEnd = (__int128)transition
-                          + duration_cast<milliseconds>(info.first.offset).count();
-      if ((__int128)civilMillis >= overlapEnd) {
-        offset = info.second.offset;
-      } else {
-        // Java ZonedDateTime.ofLocal: retain a valid preferred source offset;
-        // otherwise use the earlier (pre-transition) offset.
-        offset = preferredOffset && *preferredOffset == info.second.offset
-            ? info.second.offset : info.first.offset;
-      }
+  }
+  return dd::instantWithOffset(civilMillis, offset);
+}
+
+// Detect a nominal civil interval covered by a single forward offset jump.
+// This also normalizes libstdc++ text-tzdb endpoint discrepancies such as
+// Pacific/Apia's 2011 skipped date, where adjacent resolved starts alone do
+// not identify the intended civil label reliably.
+inline bool civilIntervalSkipped(
+    int64_t civilLo, int64_t civilNext, const TimeZone& zone) {
+  using namespace std::chrono;
+  if (!zone.isIana() || civilNext <= civilLo) return false;
+  try {
+    auto info = zone.ianaZone()->get_info(
+        local_time<milliseconds>{milliseconds{civilNext - 1}});
+    int64_t jump = duration_cast<milliseconds>(
+        info.second.offset - info.first.offset).count();
+    return info.result == local_info::nonexistent
+        && jump >= civilNext - civilLo;
+  } catch (const std::exception&) {
+    return false;
+  }
+}
+
+namespace datetime_detail {
+
+// Forward-only local resolver for dense civil fence sequences. A cached
+// local_info interval avoids repeated tzdb searches while a sequence stays in
+// one transition window. A jump outside the interval performs one direct
+// get_info lookup instead of walking intervening transitions.
+class LocalTimeResolver {
+  TimeZone zone;
+  std::optional<std::chrono::seconds> preferredOffset;
+  std::chrono::local_info cachedInfo;
+  __int128 cachedBegin = 0;
+  __int128 cachedEnd = 0;
+  bool cached = false;
+
+  void cache(int64_t civilMillis, const std::chrono::local_info& info) {
+    using namespace std::chrono;
+    cachedInfo = info;
+    if (info.result == local_info::ambiguous) {
+      auto transition = duration_cast<milliseconds>(
+          info.first.end.time_since_epoch()).count();
+      cachedBegin = (__int128)transition
+                  + duration_cast<milliseconds>(info.second.offset).count();
+      cachedEnd = (__int128)transition
+                + duration_cast<milliseconds>(info.first.offset).count();
+    } else if (info.result == local_info::nonexistent) {
+      auto transition = duration_cast<milliseconds>(
+          info.second.begin.time_since_epoch()).count();
+      cachedBegin = (__int128)transition
+                  + duration_cast<milliseconds>(info.first.offset).count();
+      cachedEnd = (__int128)transition
+                + duration_cast<milliseconds>(info.second.offset).count();
     } else {
-      auto transition = duration_cast<milliseconds>(info.second.begin.time_since_epoch()).count();
-      __int128 gapEnd = (__int128)transition
-                      + duration_cast<milliseconds>(info.second.offset).count();
-      if ((__int128)civilMillis >= gapEnd) {
-        offset = info.second.offset;
+      cachedBegin = civilMillis;
+      if (info.first.end == sys_seconds::max()) {
+        cachedEnd = (__int128)kMaxEpochMs + 1;
       } else {
-        // Java's gap shift is local - pre-transition offset. This deliberately
-        // does not use to_sys(choose::), which clamps to the transition instant.
-        offset = info.first.offset;
+        auto next = zone.ianaZone()->get_info(info.first.end);
+        auto transition = duration_cast<milliseconds>(
+            info.first.end.time_since_epoch()).count();
+        auto endOffset = std::min(info.first.offset, next.offset);
+        cachedEnd = (__int128)transition
+                  + duration_cast<milliseconds>(endOffset).count();
       }
     }
+    cached = cachedBegin <= civilMillis && (__int128)civilMillis < cachedEnd;
   }
 
-  __int128 instant = (__int128)civilMillis - duration_cast<milliseconds>(offset).count();
-  if (instant < dd::kMinEpochMs || instant > dd::kMaxEpochMs) return std::nullopt;
-  return (int64_t)instant;
-}
+public:
+  LocalTimeResolver(const TimeZone& zone,
+                    std::optional<std::chrono::seconds> preferredOffset)
+    : zone(zone), preferredOffset(preferredOffset) {}
+
+  std::optional<int64_t> resolve(int64_t civilMillis) {
+    using namespace std::chrono;
+    if (!zone.isIana()) {
+      return instantFromCivil(civilMillis, zone, preferredOffset);
+    }
+    try {
+      if (!cached || (__int128)civilMillis < cachedBegin
+          || (__int128)civilMillis >= cachedEnd) {
+        auto info = zone.ianaZone()->get_info(
+            local_time<milliseconds>{milliseconds{civilMillis}});
+        cache(civilMillis, info);
+      }
+      seconds offset = offsetForLocalInfo(
+          civilMillis, cachedInfo, preferredOffset);
+      return instantWithOffset(civilMillis, offset);
+    } catch (const std::exception&) {
+      cached = false;
+      return std::nullopt;
+    }
+  }
+};
+
+} // namespace datetime_detail
 
 // Parse only the literal forms above. Date-math splitting calls this for each
 // possible fixed anchor, so it deliberately requires the whole input.
@@ -523,16 +638,7 @@ inline std::optional<DateLiteralRange> parseDateLiteralRange(
       // resolving the next label does not compare equal. If get_info reports a
       // forward jump at least as wide as the whole nominal granule containing
       // its last millisecond, this is the same zero-width-granule condition.
-      try {
-        auto info = frameZone.ianaZone()->get_info(
-            local_time<milliseconds>{milliseconds{civilLast}});
-        int64_t jump = duration_cast<milliseconds>(
-            info.second.offset - info.first.offset).count();
-        granuleSkipped = info.result == local_info::nonexistent
-                      && jump >= *civilNext - civilLo;
-      } catch (const std::exception&) {
-        return std::nullopt;
-      }
+      granuleSkipped = civilIntervalSkipped(civilLo, *civilNext, frameZone);
     }
   }
   return DateLiteralRange{DateRange{*lo, *last + 1, granuleSkipped}, hasExplicitOffset};
@@ -592,13 +698,11 @@ inline std::optional<int64_t> addFixed(int64_t millis, int64_t amount, int64_t u
 }
 
 // Calendar addition with end-of-month clamping (Jan 31 + 1 month is the last
-// day of February). The source instant's offset is the fold preference.
-inline std::optional<int64_t> addCalendar(int64_t millis, int64_t amount,
-                                          DateMathUnit unit, const TimeZone& zone) {
+// day of February), computed from the supplied civil start.
+inline std::optional<int64_t> calendarCivil(
+    int64_t civilMillis, int64_t amount, DateMathUnit unit) {
   using namespace std::chrono;
-  auto source = civilFromInstant(millis, zone);
-  if (!source) return std::nullopt;
-  local_time<milliseconds> tp{milliseconds{source->millis}};
+  local_time<milliseconds> tp{milliseconds{civilMillis}};
   local_days dp = floor<days>(tp);
   milliseconds timeOfDay = tp - dp;
   year_month_day ymd{dp};
@@ -627,7 +731,18 @@ inline std::optional<int64_t> addCalendar(int64_t millis, int64_t amount,
   int64_t outCivil = local_days{year_month_day{y, m, day{targetDay}}}
                        .time_since_epoch().count() * kMsPerDay
                    + timeOfDay.count();
-  return instantFromCivil(outCivil, zone, source->offset);
+  return outCivil;
+}
+
+// Calendar addition on an instant. The source instant's offset is the fold
+// preference at the target.
+inline std::optional<int64_t> addCalendar(int64_t millis, int64_t amount,
+                                          DateMathUnit unit, const TimeZone& zone) {
+  auto source = civilFromInstant(millis, zone);
+  if (!source) return std::nullopt;
+  auto outCivil = calendarCivil(source->millis, amount, unit);
+  if (!outCivil) return std::nullopt;
+  return instantFromCivil(*outCivil, zone, source->offset);
 }
 
 inline std::optional<int64_t> addUnit(int64_t millis, int64_t amount,
@@ -777,6 +892,56 @@ inline bool startsWithNow(const Cursor& input) {
 }
 
 } // namespace datetime_detail
+
+// From-start civil stepping for calendar facet fences. The start instant's
+// frame offset is retained as the ofLocal preference for every independently
+// computed fence.
+class CivilCalendarStepper {
+  TimeZone zone;
+  std::optional<CivilTime> startCivil;
+  datetime_detail::LocalTimeResolver resolver;
+
+public:
+  CivilCalendarStepper(int64_t startInstant, const TimeZone& zone)
+    : zone(zone), startCivil(civilFromInstant(startInstant, zone)),
+      resolver(zone, startCivil
+          ? std::optional<std::chrono::seconds>{startCivil->offset}
+          : std::nullopt) {}
+
+  bool valid() const { return startCivil.has_value(); }
+
+  std::optional<CivilFence> at(int64_t amount, CalendarUnit unit) {
+    namespace dd = datetime_detail;
+    if (!startCivil) return std::nullopt;
+
+    std::optional<int64_t> civil;
+    if (unit == CalendarUnit::DAY || unit == CalendarUnit::WEEK) {
+      int64_t daysPerUnit = unit == CalendarUnit::WEEK ? 7 : 1;
+      __int128 target = (__int128)startCivil->millis
+                      + (__int128)amount * daysPerUnit * dd::kMsPerDay;
+      if (target < dd::kMinEpochMs || target > dd::kMaxEpochMs) {
+        return std::nullopt;
+      }
+      civil = (int64_t)target;
+    } else if (unit == CalendarUnit::YEAR) {
+      civil = dd::calendarCivil(
+          startCivil->millis, amount, dd::DateMathUnit::YEAR);
+    } else {
+      __int128 months = amount;
+      if (unit == CalendarUnit::QUARTER) months *= 3;
+      if (months < std::numeric_limits<int64_t>::min()
+          || months > std::numeric_limits<int64_t>::max()) {
+        return std::nullopt;
+      }
+      civil = dd::calendarCivil(
+          startCivil->millis, (int64_t)months, dd::DateMathUnit::MONTH);
+    }
+    if (!civil) return std::nullopt;
+    auto instant = resolver.resolve(*civil);
+    if (!instant) return std::nullopt;
+    return CivilFence{*civil, *instant};
+  }
+};
 
 inline std::optional<DateRange> parseDateRange(std::string_view s, int64_t nowEpochMillis,
                                                const TimeZone& zone) {
