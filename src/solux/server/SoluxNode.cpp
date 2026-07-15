@@ -146,6 +146,14 @@ std::shared_ptr<Collection> SoluxNode::getCollection(std::string_view name) {
   return getCollection(root.get(), name);
 }
 
+std::shared_ptr<Collection> SoluxNode::checkLoaded(std::shared_ptr<Collection> collection) {
+  if (collection && !collection->loadError.empty()) {
+    throw CollectionResolutionError(
+        "collection '" + collection->name + "' failed to load: " + collection->loadError);
+  }
+  return collection;
+}
+
 std::shared_ptr<Collection> SoluxNode::getCollection(Library* library, std::string_view name) {
   Library* targetLibrary = library != nullptr ? library : root.get();
   if (targetLibrary == nullptr) {
@@ -156,7 +164,7 @@ std::shared_ptr<Collection> SoluxNode::getCollection(Library* library, std::stri
   validateCollectionName(collectionName);
 
   if (auto collection = targetLibrary->collections.get(collectionName)) {
-    return collection;
+    return checkLoaded(std::move(collection));
   }
 
   throw CollectionResolutionError("collection '" + collectionName + "' does not exist");
@@ -204,7 +212,7 @@ std::shared_ptr<Collection> SoluxNode::getOrCreateCollection(Library* library, s
   if (!collection) {
     throw CollectionResolutionError("collection '" + collectionName + "' does not exist");
   }
-  return collection;
+  return checkLoaded(std::move(collection));
 }
 
 std::shared_ptr<Collection> SoluxNode::resolveOrCreateCollection(const solux::api::Target* target) {
@@ -239,7 +247,7 @@ std::shared_ptr<Collection> SoluxNode::createCollection(Library* library, std::s
     LOG_INFO("Created collection: {}", collectionName);
     return created;
   });
-  return collection;
+  return checkLoaded(std::move(collection));
 }
 
 std::shared_ptr<Collection> SoluxNode::initCollection(const std::string& name) {
@@ -286,11 +294,22 @@ void SoluxNode::createSingletons() {
   }
 
   for (const auto& name : existing) {
-    validateCollectionName(name);
-    root->collections.getOrCreate(name, [&]() {
-      return initCollection(name);
-    });
-    LOG_INFO("Loaded collection: {}", name);
+    try {
+      validateCollectionName(name);
+      root->collections.getOrCreate(name, [&]() {
+        return initCollection(name);
+      });
+      LOG_INFO("Loaded collection: {}", name);
+    } catch (const std::exception& e) {
+      // Keep the node up: register a tombstone so the name resolves to a clear
+      // error instead of "does not exist", and can't be silently re-created
+      // over the on-disk data.
+      LOG_ERROR("Failed to load collection '{}': {}", name, e.what());
+      auto tombstone = std::make_shared<Collection>();
+      tombstone->name = name;
+      tombstone->loadError = e.what();
+      root->collections.getOrCreate(name, [&]() { return tombstone; });
+    }
   }
 }
 

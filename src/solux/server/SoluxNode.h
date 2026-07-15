@@ -68,6 +68,7 @@ class Schema;
 // consist of multiple shards.
 class Collection {
   std::string name;
+  std::string loadError;  // non-empty means the collection failed to load at startup; resolution rejects it
   std::atomic<std::shared_ptr<Schema>> schema;  // atomic for lock-free reader access
   std::shared_ptr<Shard> shard;
   std::vector<std::shared_ptr<Shard>> shards;
@@ -175,6 +176,8 @@ private:
 
   void createSingletons();
   std::shared_ptr<Collection> initCollection(const std::string& name);
+  // Returns the collection unchanged, or throws CollectionResolutionError if it is a load-failure tombstone.
+  static std::shared_ptr<Collection> checkLoaded(std::shared_ptr<Collection> collection);
   static std::string normalizedCollectionName(std::string_view name);
   static void validateCollectionName(std::string_view name);
 

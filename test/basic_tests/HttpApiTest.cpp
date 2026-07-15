@@ -1,6 +1,7 @@
 #include <array>
 #include <chrono>
 #include <filesystem>
+#include <fstream>
 #include <optional>
 #include <set>
 #include <sstream>
@@ -13,6 +14,7 @@
 #include "test/LocalReq.h"
 #include "test/HttpReq.h"
 #include "solux/api/build.h"
+#include "solux/reader/Postings.h"
 #include "solux/schema/Schema.h"
 #include "solux/server/HttpServer.h"
 
@@ -310,6 +312,58 @@ TEST_F(HttpApiTest, unsafeCollectionNamesAreRejectedBeforeCreate) {
 
   EXPECT_FALSE(std::filesystem::exists(base / "c" / "unsafe"));
   EXPECT_FALSE(std::filesystem::exists(absolute));
+  std::filesystem::remove_all(base);
+}
+
+TEST_F(HttpApiTest, corruptCollectionTombstonedAtStartup) {
+  auto stamp = std::to_string(std::chrono::steady_clock::now().time_since_epoch().count());
+  std::filesystem::path base = std::filesystem::temp_directory_path() / ("solux_corrupt_col_" + stamp);
+  std::filesystem::remove_all(base);
+
+  SoluxConfig config;
+  config.store.backend = "fs";
+  config.store.data_dir = base.string();
+
+  {
+    SoluxNode node(config);
+    HttpServer localServer(node, 2, 0);
+    localServer.start();
+    auto good = httpRequest(localServer.getPort(), http::verb::post, "/collections/good/update",
+        R"({"docs":[{"id":"g1","title_w":"good token"}],"commit":{}})");
+    ASSERT_EQ(200, good.result_int()) << good.body();
+    auto bad = httpRequest(localServer.getPort(), http::verb::post, "/collections/bad/update",
+        R"({"docs":[{"id":"b1","title_w":"bad token"}],"commit":{}})");
+    ASSERT_EQ(200, bad.result_int()) << bad.body();
+    localServer.shutdown();
+  }
+
+  {
+    std::ofstream out(base / "c" / "bad" / std::string(Postings::INDEX_INFO_FILE),
+                      std::ios::binary | std::ios::trunc);
+    out << "\xff\xff\xff\xff\xff\xff\xff\xff";
+  }
+
+  // Node startup must survive the corrupt collection and serve the good one.
+  SoluxNode node(config);
+  HttpServer localServer(node, 2, 0);
+  localServer.start();
+
+  auto query = httpRequest(localServer.getPort(), http::verb::post, "/collections/good/query",
+      R"({"query":{"match":{"title_w":"good"}},"fields":["id"]})");
+  EXPECT_EQ(200, query.result_int()) << query.body();
+  EXPECT_NE(query.body().find(R"("g1")"), std::string::npos) << query.body();
+
+  auto badQuery = httpRequest(localServer.getPort(), http::verb::post, "/collections/bad/query",
+      R"({"query":{"match":{"title_w":"bad"}},"fields":["id"]})");
+  EXPECT_NE(badQuery.body().find("failed to load"), std::string::npos) << badQuery.body();
+
+  // Updates resolve to the tombstone too: no silent re-create over the corrupt data.
+  auto badUpdate = httpRequest(localServer.getPort(), http::verb::post, "/collections/bad/update",
+      R"({"docs":[{"id":"b2","title_w":"more"}],"commit":{}})");
+  EXPECT_NE(badUpdate.body().find("failed to load"), std::string::npos) << badUpdate.body();
+  EXPECT_THROW(node.getCollection("bad"), CollectionResolutionError);
+
+  localServer.shutdown();
   std::filesystem::remove_all(base);
 }
 
