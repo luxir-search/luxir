@@ -28,6 +28,10 @@ protected:
 public:
   class Calc;
 
+  // A/B baseline for measuring folded Boolean filters against the former
+  // passive TopDocs domain path. Default false means folding is enabled.
+  static inline bool disableTopDocsFilterFoldForTests = false;
+
   const ReqTopDocs& topDocsProto;  // the relevant part of the protobuf request
   Query::Context& qcontext;
   Query* query;

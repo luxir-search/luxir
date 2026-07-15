@@ -556,8 +556,8 @@ private:
   //    prefixes folding into ONE flat boolean (bare = optional, + = required,
   //    -/NOT = prohibited) - the classic search-box model.
   // A purely negative level gets a match-all optional injected, so NOT a /
-  // -a means "everything except a" (the engine matches nothing on a
-  // prohibited-only boolean; the classic silent Lucene surprise is fixed).
+  // -a means "everything except a" in the canonical parser output. The engine
+  // supplies the same complement semantics for raw prohibited-only booleans.
   const api::Query* buildLevel(std::span<const Item> items) {
     if (items.empty()) return nullptr;
 

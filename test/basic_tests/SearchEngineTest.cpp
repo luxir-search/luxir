@@ -1,5 +1,6 @@
 
 #include <gtest/gtest.h>
+#include <algorithm>
 #include <atomic>
 #include <cmath>
 #include <iostream>
@@ -12,12 +13,84 @@
 #include "test/LocalReq.h"
 #include "test/QueryBuild.h"
 #include "solux/reader/SkipStats.h"
+#include "solux/search/ops/TopDocsReq.h"
 #include "solux/server/GRPCServer.h"
 
 using namespace solux;
 using namespace solux::test;
 
 namespace {
+class TopDocsFilterFoldGuard {
+  bool saved;
+
+public:
+  explicit TopDocsFilterFoldGuard(bool disabled)
+    : saved(TopDocsReq::disableTopDocsFilterFoldForTests) {
+    TopDocsReq::disableTopDocsFilterFoldForTests = disabled;
+  }
+  ~TopDocsFilterFoldGuard() {
+    TopDocsReq::disableTopDocsFilterFoldForTests = saved;
+  }
+};
+
+std::vector<std::string> resultIds(const LocalReq& req, std::string_view opName) {
+  std::vector<std::string> out;
+  const auto* docs = req.docList(opName);
+  if (docs == nullptr) return out;
+  const auto* column = docs->columns.find("id");
+  if (column == nullptr) return out;
+  const auto* ids = std::get_if<api::ColStr>(&column->kind);
+  if (ids == nullptr) return out;
+  for (auto id : ids->v) out.emplace_back(id);
+  return out;
+}
+
+std::map<std::string, float> resultScoreMap(const LocalReq& req,
+                                             std::string_view opName) {
+  std::map<std::string, float> out;
+  const auto* docs = req.docList(opName);
+  if (docs == nullptr) return out;
+  const auto* idColumn = docs->columns.find("id");
+  const auto* scoreColumn = docs->columns.find("_score_");
+  if (idColumn == nullptr || scoreColumn == nullptr) return out;
+  const auto* ids = std::get_if<api::ColStr>(&idColumn->kind);
+  const auto* scores = std::get_if<api::ColFloat>(&scoreColumn->kind);
+  if (ids == nullptr || scores == nullptr || ids->v.size() != scores->v.size()) return out;
+  for (size_t i = 0; i < ids->v.size(); i++) {
+    out.emplace(std::string(ids->v[i]), scores->v[i]);
+  }
+  return out;
+}
+
+std::map<std::string, int64_t> resultFacetMap(const LocalReq& req,
+                                               std::string_view opName,
+                                               std::string_view facetName) {
+  std::map<std::string, int64_t> out;
+  const auto* docs = req.docList(opName);
+  if (docs == nullptr) return out;
+  const auto* value = docs->ops.find(facetName);
+  if (value == nullptr) return out;
+  const auto* facet = std::get_if<api::FacetResult>(&(*value)->kind);
+  if (facet == nullptr || !facet->bucket_ids.has_value()) return out;
+  const auto* ids = std::get_if<api::ColStr>(&facet->bucket_ids->kind);
+  if (ids == nullptr || ids->v.size() != facet->counts.size()) return out;
+  for (size_t i = 0; i < ids->v.size(); i++) {
+    out.emplace(std::string(ids->v[i]), facet->counts[i]);
+  }
+  return out;
+}
+
+void expectSameScoreMap(const std::map<std::string, float>& expected,
+                        const std::map<std::string, float>& actual) {
+  ASSERT_EQ(expected.size(), actual.size());
+  for (const auto& [id, expectedScore] : expected) {
+    auto found = actual.find(id);
+    ASSERT_NE(found, actual.end()) << id;
+    float scale = std::max({std::fabs(expectedScore), std::fabs(found->second), 1.0f});
+    EXPECT_NEAR(expectedScore, found->second, 1e-6f * scale) << id;
+  }
+}
+
 // FieldFacet.missing has no fluent OpCursor setter; reach through the raw op.
 OpCursor& facetMissing(OpCursor& cur) {
   std::get<solux::api::FieldFacet>(cur.rawOp().kind).missing = true;
@@ -687,6 +760,132 @@ TEST_F(SearchEngineTest, topDocsFilters) {
     EXPECT_EQ(1, facet.counts[0]);  // one "hello"+"big" doc in each of a and b
     EXPECT_EQ(1, facet.counts[1]);
   }
+}
+
+TEST_F(SearchEngineTest, topDocsFilterFoldMatchesExplicitBoolean) {
+  CollectionHelper helper;
+  helper.indexAll(std::array{
+    flatdoc("id", "d1", "body_w", "apple apple", "keep_s", "yes"),
+    flatdoc("id", "d2", "body_w", "apple", "keep_s", "yes"),
+    flatdoc("id", "d3", "body_w", "apple apple apple", "keep_s", "no"),
+    flatdoc("id", "d4", "body_w", "banana", "keep_s", "yes"),
+  }, UpdateMessage::COMMIT);
+
+  auto folded = localReq(soluxNode->getSearchEngine());
+  folded->collection("main");
+  folded->topDocs("q").matchQuery("body_w", "apple").withStats().fields({"id"})
+      .limit(-1).matchFilter("keep", "keep_s", "yes");
+  folded->execute();
+  ASSERT_OK(folded);
+
+  auto explicitFilter = localReq(soluxNode->getSearchEngine());
+  explicitFilter->collection("main");
+  auto& cur = explicitFilter->topDocs("q").withStats().fields({"id"}).limit(-1);
+  cur.rawQuery() = qb::boolean(cur.mr(),
+      /*required=*/{qb::match(cur.mr(), "body_w", "apple")},
+      /*optional=*/{}, /*prohibited=*/{},
+      /*filter=*/{qb::match(cur.mr(), "keep_s", "yes")});
+  explicitFilter->execute();
+  ASSERT_OK(explicitFilter);
+
+  EXPECT_EQ(resultIds(*folded, "q"), resultIds(*explicitFilter, "q"));
+  expectSameScoreMap(resultScoreMap(*folded, "q"),
+                     resultScoreMap(*explicitFilter, "q"));
+}
+
+TEST_F(SearchEngineTest, topDocsFilterFoldMatchesPassivePath) {
+  CollectionHelper helper;
+  helper.indexAll(std::array{
+    flatdoc("id", "d1", "body_w", "apple apple apple", "keep_s", "yes", "group_s", "x"),
+    flatdoc("id", "d2", "body_w", "apple apple", "keep_s", "no", "group_s", "x"),
+    flatdoc("id", "d3", "body_w", "apple", "keep_s", "yes", "group_s", "y"),
+    flatdoc("id", "d4", "body_w", "apple banana", "keep_s", "yes", "group_s", "y"),
+    flatdoc("id", "d5", "body_w", "banana", "keep_s", "yes", "group_s", "x"),
+  }, UpdateMessage::COMMIT);
+
+  struct Result {
+    std::vector<std::string> ids;
+    std::map<std::string, float> scores;
+    std::map<std::string, int64_t> facets;
+    int64_t count = 0;
+  };
+
+  auto run = [&](bool passive) {
+    auto req = localReq(soluxNode->getSearchEngine());
+    req->collection("main");
+    req->topDocs("ranked").matchQuery("body_w", "apple").withStats().fields({"id"})
+        .limit(2).matchFilter("keep", "keep_s", "yes");
+    auto& count = req->topDocs("count").matchQuery("body_w", "apple")
+        .getNumber().limit(0).matchFilter("keep", "keep_s", "yes");
+    count.facet("groups", "group_s").limit(-1);
+    {
+      TopDocsFilterFoldGuard guard(passive);
+      req->execute(false);
+    }
+    EXPECT_TRUE(req->ok()) << req->errorMsg();
+    return Result{
+      resultIds(*req, "ranked"),
+      resultScoreMap(*req, "ranked"),
+      resultFacetMap(*req, "count", "groups"),
+      req->getMatchCount("count")
+    };
+  };
+
+  auto folded = run(false);
+  auto passive = run(true);
+  ASSERT_EQ(2u, folded.ids.size());
+  EXPECT_EQ(3, folded.count);
+  EXPECT_EQ((std::map<std::string, int64_t>{{"x", 1}, {"y", 2}}), folded.facets);
+  EXPECT_EQ(folded.ids, passive.ids);
+  EXPECT_EQ(folded.count, passive.count);
+  EXPECT_EQ(folded.facets, passive.facets);
+  expectSameScoreMap(folded.scores, passive.scores);
+}
+
+TEST_F(SearchEngineTest, topDocsFilterFoldAllPrepareAndDeletes) {
+  CollectionHelper helper;
+  helper.indexAll(std::array{
+    flatdoc("id", "d1", "body_w", "apple", "keep_s", "yes", "group_s", "x"),
+    flatdoc("id", "d2", "body_w", "apple", "keep_s", "no", "group_s", "x"),
+    flatdoc("id", "d3", "body_w", "banana", "keep_s", "yes", "group_s", "y"),
+    flatdoc("id", "d4", "body_w", "apple", "keep_s", "yes", "group_s", "y"),
+  }, UpdateMessage::COMMIT);
+
+  auto runAll = [&](bool filtered) {
+    auto req = localReq(soluxNode->getSearchEngine());
+    req->collection("main");
+    auto& cur = req->topDocs("q").allQuery().getNumber().fields({"id"}).limit(-1);
+    if (filtered) cur.matchFilter("keep", "keep_s", "yes");
+    cur.facet("groups", "group_s").limit(-1);
+    req->execute();
+    EXPECT_TRUE(req->ok()) << req->errorMsg();
+    return std::pair{req->getMatchCount("q"), resultFacetMap(*req, "q", "groups")};
+  };
+
+  auto filteredAll = runAll(true);
+  EXPECT_EQ(3, filteredAll.first);
+  EXPECT_EQ((std::map<std::string, int64_t>{{"x", 1}, {"y", 2}}), filteredAll.second);
+  auto unfilteredAll = runAll(false);
+  EXPECT_EQ(4, unfilteredAll.first);
+  EXPECT_EQ((std::map<std::string, int64_t>{{"x", 2}, {"y", 2}}), unfilteredAll.second);
+
+  auto prepared = localReq(soluxNode->getSearchEngine());
+  prepared->testForcePrepare = true;
+  prepared->collection("main");
+  auto& preparedCur = prepared->topDocs("q").matchQuery("body_w", "apple")
+      .getNumber().fields({"id"}).limit(-1).matchFilter("keep", "keep_s", "yes");
+  preparedCur.facet("groups", "group_s").limit(-1);
+  prepared->execute();
+  ASSERT_OK(prepared);
+  EXPECT_EQ(2, prepared->getMatchCount("q"));
+  EXPECT_EQ((std::map<std::string, int64_t>{{"x", 1}, {"y", 1}}),
+            resultFacetMap(*prepared, "q", "groups"));
+
+  std::vector<std::string> deleted{"d1"};
+  helper.deleteByIds(deleted, UpdateMessage::COMMIT);
+  auto afterDelete = runAll(true);
+  EXPECT_EQ(2, afterDelete.first);
+  EXPECT_EQ((std::map<std::string, int64_t>{{"y", 2}}), afterDelete.second);
 }
 
 // Missing collection targets error cleanly and do not auto-create on reads.

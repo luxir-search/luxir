@@ -3,9 +3,12 @@
 #include <algorithm>
 #include <bit>
 #include <cmath>
+#include <typeindex>
 
 #include "Query.h"
+#include "AllQuery.h"
 #include "BoostQuery.h"
+#include "ConstantScoreQuery.h"
 #include "TermQuery.h"
 #include "ScoreCompact.h"
 #include "solux/reader/SkipStats.h"
@@ -25,6 +28,222 @@ class BooleanQuery final : public solux::Query {
   // >= 1 makes the optional group a real constraint alongside
   // mandatory/filter clauses (> 1 selects the min-should-match scorer).
   int minShouldMatch;
+
+public:
+  enum NormalizeRule : uint32_t {
+    R1_REQUIRED_INLINE = 1u << 0,
+    R2_DISJUNCTION_FLATTEN = 1u << 1,
+    R3_REQUIRED_DISJUNCTION_HOIST = 1u << 2,
+    R4_SINGLE_CLAUSE_UNWRAP = 1u << 3,
+  };
+
+  // Snapshot of the query-pointer plan immediately before duplicate removal
+  // and weight creation. It deliberately exposes no child Query pointers.
+  struct NormalizeTestView {
+    size_t mandatoryCount = 0;
+    size_t optionalCount = 0;
+    size_t prohibitedCount = 0;
+    size_t filterCount = 0;
+    int minShouldMatch = 0;
+    uint32_t ruleMask = 0;
+    std::type_index singleChildType = typeid(void);
+    boost::container::small_vector<std::type_index, 16> mandatoryTypes;
+    boost::container::small_vector<std::type_index, 16> optionalTypes;
+    boost::container::small_vector<std::type_index, 16> prohibitedTypes;
+    boost::container::small_vector<std::type_index, 16> filterTypes;
+  };
+
+private:
+  using ClauseList = boost::container::small_vector<Query*, 16>;
+
+  struct NormalizedBoolean {
+    ClauseList mandatory;
+    ClauseList optional;
+    ClauseList prohibited;
+    ClauseList filter;
+    int minShouldMatch;
+    Query* singleChild = nullptr;
+    uint32_t ruleMask = 0;
+
+    explicit NormalizedBoolean(const BooleanQuery& query)
+      : mandatory(query.mandatory.begin(), query.mandatory.end()),
+        optional(query.optional.begin(), query.optional.end()),
+        prohibited(query.prohibited.begin(), query.prohibited.end()),
+        filter(query.filter.begin(), query.filter.end()),
+        minShouldMatch(query.minShouldMatch) {}
+  };
+
+  struct TransparentBoolean {
+    BooleanQuery* query = nullptr;
+    float boost = 1.0f;
+  };
+
+  static TransparentBoolean transparentBoolean(Query* query,
+                                                bool allowConstantScore) {
+    float boost = 1.0f;
+    while (true) {
+      if (auto* wrapped = dynamic_cast<BoostQuery*>(query)) {
+        boost = checkedBoostProduct(boost, wrapped->getBoost());
+        query = wrapped->getChild();
+        continue;
+      }
+      if (allowConstantScore) {
+        if (auto* wrapped = dynamic_cast<ConstantScoreQuery*>(query)) {
+          query = wrapped->getChild();
+          continue;
+        }
+      }
+      break;
+    }
+    return {dynamic_cast<BooleanQuery*>(query), boost};
+  }
+
+  static Query* scoringClause(MemPool& pool, Query* query, float boost) {
+    return boost == 1.0f ? query : pool.make<BoostQuery>(query, boost);
+  }
+
+  static bool isPureNegative(const BooleanQuery& query) {
+    return query.mandatory.empty() && query.optional.empty()
+        && !query.prohibited.empty() && query.filter.empty()
+        && query.minShouldMatch <= 1;
+  }
+
+  static bool isComplementForm(const BooleanQuery& query) {
+    return query.mandatory.empty() && query.optional.size() == 1
+        && !query.prohibited.empty() && query.filter.empty()
+        && query.minShouldMatch <= 1
+        && dynamic_cast<AllQuery*>(query.optional[0]) != nullptr;
+  }
+
+  static void normalizeRequiredList(NormalizedBoolean& plan, ClauseList& parents,
+                                    bool parentIsFilter, MemPool& pool) {
+    size_t i = 0;
+    while (i < parents.size()) {
+      TransparentBoolean child = transparentBoolean(
+        parents[i], /*allowConstantScore=*/parentIsFilter);
+      BooleanQuery* inner = child.query;
+      if (inner != nullptr && (isPureNegative(*inner) || isComplementForm(*inner))) {
+        // Required complements contribute no score: drop their match-all
+        // carrier (if present), strip wrappers, and merge the exclusions.
+        // If an exclusion is itself a pure-negative Boolean it deliberately
+        // stays opaque here. Prohibited-list normalization is not part of R1.
+        plan.prohibited.insert(plan.prohibited.end(), inner->prohibited.begin(),
+                               inner->prohibited.end());
+        parents.erase(parents.begin() + (ptrdiff_t) i);
+        plan.ruleMask |= R1_REQUIRED_INLINE;
+        // Re-examine the clause shifted into this slot.
+        continue;
+      }
+      bool hasRequired = inner != nullptr
+        && (!inner->mandatory.empty() || !inner->filter.empty());
+      bool optionalsAllowed = parentIsFilter || (inner != nullptr && inner->optional.empty());
+      if (inner == nullptr || inner->minShouldMatch != 0 || !hasRequired
+          || !optionalsAllowed) {
+        i++;
+        continue;
+      }
+
+      ClauseList replacement;
+      if (parentIsFilter) {
+        replacement.insert(replacement.end(), inner->mandatory.begin(), inner->mandatory.end());
+        replacement.insert(replacement.end(), inner->filter.begin(), inner->filter.end());
+      } else {
+        for (Query* query : inner->mandatory) {
+          replacement.push_back(scoringClause(pool, query, child.boost));
+        }
+        plan.filter.insert(plan.filter.end(), inner->filter.begin(), inner->filter.end());
+      }
+      plan.prohibited.insert(plan.prohibited.end(), inner->prohibited.begin(),
+                             inner->prohibited.end());
+
+      parents.erase(parents.begin() + (ptrdiff_t) i);
+      parents.insert(parents.begin() + (ptrdiff_t) i,
+                     replacement.begin(), replacement.end());
+      plan.ruleMask |= R1_REQUIRED_INLINE;
+      // Re-examine the replacement (or the clause shifted into this slot).
+    }
+  }
+
+  static void flattenDisjunctions(NormalizedBoolean& plan, MemPool& pool) {
+    if (plan.minShouldMatch > 1) return;
+    size_t i = 0;
+    while (i < plan.optional.size()) {
+      TransparentBoolean child = transparentBoolean(
+        plan.optional[i], /*allowConstantScore=*/false);
+      BooleanQuery* inner = child.query;
+      bool pureDisjunction = inner != nullptr && !inner->optional.empty()
+        && inner->mandatory.empty() && inner->prohibited.empty() && inner->filter.empty()
+        && inner->minShouldMatch <= 1;
+      if (!pureDisjunction) {
+        i++;
+        continue;
+      }
+
+      ClauseList replacement;
+      for (Query* query : inner->optional) {
+        replacement.push_back(scoringClause(pool, query, child.boost));
+      }
+      plan.optional.erase(plan.optional.begin() + (ptrdiff_t) i);
+      plan.optional.insert(plan.optional.begin() + (ptrdiff_t) i,
+                           replacement.begin(), replacement.end());
+      plan.ruleMask |= R2_DISJUNCTION_FLATTEN;
+      // Re-examine the first inserted clause for nested disjunctions.
+    }
+  }
+
+  NormalizedBoolean normalize(MemPool& pool) const {
+    NormalizedBoolean plan(*this);
+
+    normalizeRequiredList(plan, plan.mandatory, /*parentIsFilter=*/false, pool);
+    normalizeRequiredList(plan, plan.filter, /*parentIsFilter=*/true, pool);
+    flattenDisjunctions(plan, pool);
+
+    // With no outer optional group, one required pure disjunction can become
+    // that group even beside other required clauses. This covers parser forms
+    // such as "a AND (b OR c)" while preserving independent nested groups.
+    if (plan.optional.empty()) {
+      for (size_t i = 0; i < plan.mandatory.size(); i++) {
+        TransparentBoolean child = transparentBoolean(
+          plan.mandatory[i], /*allowConstantScore=*/false);
+        BooleanQuery* inner = child.query;
+        bool pureDisjunction = inner != nullptr && !inner->optional.empty()
+          && inner->mandatory.empty() && inner->prohibited.empty() && inner->filter.empty();
+        if (!pureDisjunction) continue;
+
+        plan.mandatory.erase(plan.mandatory.begin() + (ptrdiff_t) i);
+        for (Query* query : inner->optional) {
+          plan.optional.push_back(scoringClause(pool, query, child.boost));
+        }
+        plan.minShouldMatch = std::max(1, inner->minShouldMatch);
+        plan.ruleMask |= R3_REQUIRED_DISJUNCTION_HOIST;
+        flattenDisjunctions(plan, pool);
+        break;
+      }
+    }
+
+    // Pure negation is an engine-level complement. Seeding the positive side
+    // here covers raw API trees; expr/simple_query already emit the equivalent
+    // AllQuery carrier. Keep minShouldMatch unchanged so deliberately
+    // impossible direct-construction values remain impossible.
+    if (plan.mandatory.empty() && plan.optional.empty() && plan.filter.empty()
+        && !plan.prohibited.empty()) {
+      plan.optional.push_back(pool.make<AllQuery>());
+    }
+
+    if (plan.prohibited.empty() && plan.filter.empty()) {
+      if (plan.minShouldMatch == 0 && plan.mandatory.size() == 1
+          && plan.optional.empty()) {
+        plan.singleChild = plan.mandatory[0];
+      } else if (plan.minShouldMatch <= 1 && plan.mandatory.empty()
+                 && plan.optional.size() == 1) {
+        plan.singleChild = plan.optional[0];
+      }
+      if (plan.singleChild != nullptr) {
+        plan.ruleMask |= R4_SINGLE_CLAUSE_UNWRAP;
+      }
+    }
+    return plan;
+  }
 
   struct DedupableTerm {
     TermQuery* term = nullptr;
@@ -155,9 +374,32 @@ public:
             minShouldMatch(minShouldMatch) {
   }
 
-  Weight* createWeight(Context& context, int32_t flags,
-                       float multiplier = 1.0f) override {
-    return context.pool.make<BooleanQuery::Weight>(context, *this, flags, multiplier);
+  NormalizeTestView normalizationForTest(MemPool& pool) const {
+    NormalizedBoolean plan = normalize(pool);
+    NormalizeTestView view;
+    view.mandatoryCount = plan.mandatory.size();
+    view.optionalCount = plan.optional.size();
+    view.prohibitedCount = plan.prohibited.size();
+    view.filterCount = plan.filter.size();
+    view.minShouldMatch = plan.minShouldMatch;
+    view.ruleMask = plan.ruleMask;
+    if (plan.singleChild != nullptr) {
+      view.singleChildType = typeid(*plan.singleChild);
+    }
+    for (Query* query : plan.mandatory) view.mandatoryTypes.emplace_back(typeid(*query));
+    for (Query* query : plan.optional) view.optionalTypes.emplace_back(typeid(*query));
+    for (Query* query : plan.prohibited) view.prohibitedTypes.emplace_back(typeid(*query));
+    for (Query* query : plan.filter) view.filterTypes.emplace_back(typeid(*query));
+    return view;
+  }
+
+  Query::Weight* createWeight(Context& context, int32_t flags,
+                              float multiplier = 1.0f) override {
+    NormalizedBoolean plan = normalize(context.pool);
+    if (plan.singleChild != nullptr) {
+      return plan.singleChild->createWeight(context, flags, multiplier);
+    }
+    return context.pool.make<BooleanQuery::Weight>(context, plan, flags, multiplier);
   }
 
   class Weight final : public Query::Weight {
@@ -626,11 +868,18 @@ public:
       Query::Scorer* createScorer(MemPool& targetPool, IndexReader::Segment& segment) override {
         return scorerSupplier(targetPool, segment)->get(targetPool, std::numeric_limits<int64_t>::max());
       }
+
+      bool outputIsSubsetOfDomain() const noexcept override {
+        // Filter domains are materialized inside the outer prepare domains and
+        // installed as a required supplier, so every emitted doc is a member
+        // of the domain this weight was prepared against.
+        return hasFilters;
+      }
     };
 
 
   public:
-    Weight(Context& context, BooleanQuery& query, int32_t flags, float multiplier)
+    Weight(Context& context, NormalizedBoolean& query, int32_t flags, float multiplier)
       : Query::Weight(context, flags) {
       needsScores = (flags & Query::NEED_SCORES) != 0;
       // Only mandatory and optional clauses can contribute to score.
@@ -651,7 +900,9 @@ public:
       // "+a b" count-only requests to the single-clause count() shortcut.
       // minShouldMatch >= 1 makes the optional group a membership constraint
       // even under a mandatory clause, so it must be kept.
-      bool dropOptional = !needsScores && !mandatoryClauses.empty() && query.minShouldMatch < 1;
+      bool dropOptional = !needsScores
+        && (!mandatoryClauses.empty() || !filterClauses.empty())
+        && query.minShouldMatch < 1;
       optionalWeights = dropOptional
         ? std::span<Query::Weight*>{}
         : createWeights(context.pool, context, optionalClauses, flags, multiplier);
@@ -690,7 +941,10 @@ public:
       // Boolean scoring is constant only when every match gets the same sum.
       // Optional clauses make the sum data-dependent; mandatory clauses are
       // safe only if each mandatory child is constant.
-      bool constant = optionalWeights.empty();
+      bool constant = optionalWeights.empty()
+        || (mandatoryWeights.empty() && filterWeights.empty()
+            && optionalWeights.size() == 1
+            && optionalWeights[0]->isConstantScoring());
       for (auto* w : mandatoryWeights) {
         if (!w->isConstantScoring()) constant = false;
       }

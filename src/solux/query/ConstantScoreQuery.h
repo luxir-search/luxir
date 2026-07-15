@@ -99,6 +99,8 @@ class ConstantScoreQuery final : public solux::Query {
 public:
   ConstantScoreQuery(Query* child, float constantScore = 1.0f) : child(child), constantScore(constantScore) {}
 
+  Query* getChild() const { return child; }
+
   Weight* createWeight(Context& context, int32_t flags,
                        float multiplier = 1.0f) override {
     return context.pool.make<ConstantScoreQuery::Weight>(context, *this, flags,

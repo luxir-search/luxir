@@ -11,6 +11,7 @@
 #include "ops/StatsOp.h"
 #include "ops/FusionOp.h"
 #include "ops/TopDocsReq.h"
+#include "solux/query/BooleanQuery.h"
 #include "solux/query/ForcePrepareQuery.h"
 #include "solux/query/ProtobufQueryParser.h"
 #include "solux/util/Overloaded.h"
@@ -274,9 +275,6 @@ public:
       throw std::runtime_error("TopDocs requires a query");
     }
     Query* query = parser.parse(*topDocsReq.query);
-    if (req.testForcePrepare) {
-      query = req.requestPool.make<ForcePrepareQuery>(query);
-    }
     int64_t offset = topDocsReq.offset;
     unused(offset); // TODO
     int64_t specifiedLimit = topDocsReq.limit.has_value() ? *topDocsReq.limit : 10;
@@ -284,6 +282,27 @@ public:
     int64_t limit = specifiedLimit < 0 ? req.reader->maxDoc() : std::min(specifiedLimit, req.reader->maxDoc());
 
     auto filters = parseNamedFilters(parser, topDocsReq.filter);
+
+    // By default TopDocs filters are ordinary Boolean filter clauses, so one
+    // query tree owns both matching and preparation. Keep the named filter
+    // metadata on TopDocsReq; the toggle preserves the former passive domain
+    // path as the benchmark baseline.
+    bool foldFilters = !filters.empty() && !TopDocsReq::disableTopDocsFilterFoldForTests;
+    if (foldFilters) {
+      auto mandatory = req.requestPool.make_span<Query*>(1);
+      mandatory[0] = query;
+      auto filterClauses = req.requestPool.make_span<Query*>(filters.size());
+      for (size_t i = 0; i < filters.size(); i++) {
+        filterClauses[i] = filters[i].second;
+      }
+      query = req.requestPool.make<BooleanQuery>(
+        mandatory, std::span<Query*>{}, std::span<Query*>{}, filterClauses);
+    }
+    // The test-only wrapper must cover the complete effective query. This
+    // also leaves the Boolean tree visible to normalization before wrapping.
+    if (req.testForcePrepare) {
+      query = req.requestPool.make<ForcePrepareQuery>(query);
+    }
 
     // Sort field schema lookup and Weight ctors that may throw are resolved
     // here in the parser and passed to the TopDocsReq ctor.
@@ -303,7 +322,9 @@ public:
     int32_t requestFlags = (limit > 0 || topDocsReq.get_scores)
         ? Query::NEED_SCORES : 0;
     auto* weight = query->createWeight(*qcontext, requestFlags);
-    auto filterWeights = buildFilterWeights(filters, *qcontext, requestFlags);
+    auto filterWeights = foldFilters
+      ? std::span<Query::Weight*>{}
+      : buildFilterWeights(filters, *qcontext, requestFlags);
 
     auto* qr = solux::arenaCreate<TopDocsReq>(
       req.arena, req, name, topDocsReq, *qcontext, query, weight, limit,

@@ -13,6 +13,7 @@
 #include "solux/query/KnnQuery.h"
 #include "solux/query/VectorEngine.h"
 #include "solux/schema/Schema.h"
+#include "solux/search/ops/TopDocsReq.h"
 #include "solux/server/SoluxNode.h"
 #include "test/CollectionHelper.h"
 #include "test/LocalReq.h"
@@ -132,6 +133,18 @@ public:
 
 class KnnQueryTest : public SoluxTest {
 protected:
+  struct TopDocsFilterFoldGuard {
+    bool saved;
+
+    explicit TopDocsFilterFoldGuard(bool disabled)
+      : saved(TopDocsReq::disableTopDocsFilterFoldForTests) {
+      TopDocsReq::disableTopDocsFilterFoldForTests = disabled;
+    }
+    ~TopDocsFilterFoldGuard() {
+      TopDocsReq::disableTopDocsFilterFoldForTests = saved;
+    }
+  };
+
   struct MaxKnnCandidatesGuard {
     int64_t saved;
     explicit MaxKnnCandidatesGuard(int64_t value) : saved(KnnQuery::maxKnnCandidates) {
@@ -1657,8 +1670,16 @@ TEST_F(KnnQueryTest, selectiveFilterPreparedSkipMatchesCollectorRecheck) {
   auto skipIds = resultIds(*skip);
   auto skipScores = resultScores(*skip);
 
+  // Folding gives the Boolean root an internal materialized filter domain,
+  // so it advertises that its prepared output is already a subset. Keep the
+  // comparison arm genuinely different: the passive filter builds the outer
+  // domain, while the filter-free Boolean wrapper does not advertise subset
+  // membership and the collector rechecks that domain.
   auto* recheck = makeReq(true);
-  recheck->execute();
+  {
+    TopDocsFilterFoldGuard passive(/*disabled=*/true);
+    recheck->execute();
+  }
   ASSERT_OK(recheck);
   auto recheckIds = resultIds(*recheck);
   auto recheckScores = resultScores(*recheck);

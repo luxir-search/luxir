@@ -1,7 +1,12 @@
 #include <gtest/gtest.h>
 
+#include <algorithm>
+#include <array>
+#include <cmath>
+#include <map>
 #include <set>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "test/SoluxTest.h"
@@ -107,6 +112,10 @@ public:
       out += "], filter=[";
       appendQueriesSummary(b->filter, out);
       out += "], min_match=" + std::to_string(b->min_match) + ")";
+    } else if (const auto* boost = std::get_if<api::BoostQuery>(&q.kind)) {
+      out += "boost(";
+      if (boost->query) appendQuerySummary(*boost->query, out);
+      out += ", " + std::to_string(boost->boost.value_or(1.0f)) + ")";
     } else if (std::holds_alternative<bool>(q.kind)) {
       out += "all";
     } else {
@@ -155,11 +164,22 @@ public:
     if (const auto* b = std::get_if<api::BooleanQuery>(&q.kind)) {
       return boolMatches(*b, toks);
     }
+    if (const auto* boost = std::get_if<api::BoostQuery>(&q.kind)) {
+      return boost->query && clauseMatches(*boost->query, toks);
+    }
+    if (const auto* constant = std::get_if<api::ConstantScoreQuery>(&q.kind)) {
+      return constant->query && clauseMatches(*constant->query, toks);
+    }
     return std::holds_alternative<bool>(q.kind);
   }
 
   static const api::Match* dedupableMatch(const api::Query& q) {
-    const auto* m = std::get_if<api::Match>(&q.kind);
+    const api::Query* query = &q;
+    while (const auto* boost = std::get_if<api::BoostQuery>(&query->kind)) {
+      if (!boost->query) return nullptr;
+      query = &*boost->query;
+    }
+    const auto* m = std::get_if<api::Match>(&query->kind);
     if (m == nullptr || !m->val.has_value()
         || !std::holds_alternative<std::string_view>(m->val->kind)) {
       return nullptr;
@@ -216,7 +236,7 @@ public:
       }
     }
     bool hasPositive = b.required.size() > 0 || !optional.empty() || b.filter.size() > 0;
-    if (!hasPositive) return false;
+    if (!hasPositive) return !b.prohibited.empty();
     // The optional group constrains when min_match >= 1, or when nothing else
     // (required/filter) carries the match; otherwise optionals only rank.
     bool constrains = minMatch >= 1 || (b.required.empty() && b.filter.empty());
@@ -229,6 +249,110 @@ public:
       if (matched < eff) return false;
     }
     return true;
+  }
+
+  struct ExplicitCase {
+    int kind;
+    std::array<std::string, 6> terms;
+    float factor;
+    int minMatch;
+  };
+
+  static api::Query nestedBoost(std::pmr::memory_resource& mr, const api::Query& query,
+                                float factor) {
+    return qb::boost(mr, qb::boost(mr, query, 2.0f), factor);
+  }
+
+  static std::pair<api::Query, api::Query> explicitCase(
+      std::pmr::memory_resource& mr, const ExplicitCase& spec) {
+    auto term = [&](int index) {
+      return qb::match(mr, "body_w", spec.terms[(size_t) index]);
+    };
+    float totalBoost = 2.0f * spec.factor;
+
+    if (spec.kind == 0) {
+      // R1 under mandatory, including inner filter/prohibited clauses.
+      auto inner = qb::boolean(mr, {term(1), term(2)}, {}, {term(4)}, {term(3)});
+      auto nested = qb::boolean(mr, {term(0), nestedBoost(mr, inner, spec.factor)});
+      auto twin = qb::boolean(
+        mr, {term(0), qb::boost(mr, term(1), totalBoost),
+             qb::boost(mr, term(2), totalBoost)}, {}, {term(4)}, {term(3)});
+      return {nested, twin};
+    }
+    if (spec.kind == 1) {
+      // R1 under filter: mandatory maps to filter, rank-only optional drops,
+      // and the wrapping boost is stripped.
+      auto inner = qb::boolean(mr, {term(1)}, {term(3)}, {term(4)}, {term(2)});
+      auto nested = qb::boolean(
+        mr, {term(0)}, {}, {}, {nestedBoost(mr, inner, spec.factor)});
+      auto twin = qb::boolean(mr, {term(0)}, {}, {term(4)}, {term(1), term(2)});
+      return {nested, twin};
+    }
+    if (spec.kind == 2) {
+      // R2 with a duplicate spanning the nested/outer boundary.
+      auto inner = qb::boolean(mr, {}, {term(1), term(2)}, {}, {}, spec.minMatch);
+      auto nested = qb::boolean(
+        mr, {}, {term(0), nestedBoost(mr, inner, spec.factor), term(1)}, {}, {},
+        spec.minMatch);
+      auto twin = qb::boolean(
+        mr, {}, {term(0), qb::boost(mr, term(1), totalBoost),
+                 qb::boost(mr, term(2), totalBoost), term(1)}, {}, {}, spec.minMatch);
+      return {nested, twin};
+    }
+    if (spec.kind == 3) {
+      // R3 beside outer filters/prohibited. For msm <= 1 this also reruns R2
+      // and dedups across the newly flattened boundary; msm=2 uses five direct
+      // optionals to exercise absolute-count duplicate handling.
+      api::Query inner;
+      std::vector<api::Query> flatOptional;
+      if (spec.minMatch <= 1) {
+        auto subgroup = qb::boolean(mr, {}, {term(1), term(2)}, {}, {}, 1);
+        inner = qb::boolean(mr, {}, {subgroup, term(1), term(3)}, {}, {},
+                            spec.minMatch);
+        flatOptional = {
+          qb::boost(mr, term(1), totalBoost),
+          qb::boost(mr, term(2), totalBoost),
+          qb::boost(mr, term(1), totalBoost),
+          qb::boost(mr, term(3), totalBoost)};
+      } else {
+        inner = qb::boolean(mr, {}, {term(1), term(1), term(2), term(3), term(4)},
+                            {}, {}, spec.minMatch);
+        flatOptional = {
+          qb::boost(mr, term(1), totalBoost),
+          qb::boost(mr, term(1), totalBoost),
+          qb::boost(mr, term(2), totalBoost),
+          qb::boost(mr, term(3), totalBoost),
+          qb::boost(mr, term(4), totalBoost)};
+      }
+      auto nested = qb::boolean(
+        mr, {nestedBoost(mr, inner, spec.factor)}, {}, {term(5)}, {term(0)});
+      auto twin = qb::boolean(
+        mr, {}, flatOptional, {term(5)}, {term(0)}, std::max(1, spec.minMatch));
+      return {nested, twin};
+    }
+    if (spec.kind == 4) {
+      // Empty required children are deliberately opaque and unsatisfiable.
+      auto empty1 = qb::boolean(mr, {});
+      auto empty2 = qb::boolean(mr, {});
+      return {
+        qb::boolean(mr, {term(0), nestedBoost(mr, empty1, spec.factor)}),
+        qb::boolean(mr, {term(0), nestedBoost(mr, empty2, spec.factor)})};
+    }
+    if (spec.kind == 5) {
+      // A required pure-negative child is a complement: its boost disappears
+      // and its prohibited clause joins the parent.
+      auto negative = qb::boolean(mr, {}, {}, {term(1)});
+      return {
+        qb::boolean(mr, {term(0), nestedBoost(mr, negative, spec.factor)}),
+        qb::boolean(mr, {term(0)}, {}, {term(1)})};
+    }
+    // Parser complement form under a filter parent: the AllQuery carrier and
+    // boost both disappear, leaving the exclusion at the outer level.
+    auto complement = qb::boolean(mr, {}, {qb::all()}, {term(1)}, {}, 1);
+    return {
+      qb::boolean(mr, {term(0)}, {}, {},
+                  {nestedBoost(mr, complement, spec.factor)}),
+      qb::boolean(mr, {term(0)}, {}, {term(1)})};
   }
 };
 
@@ -480,6 +604,165 @@ TEST_F(BooleanFuzzTest, randomBooleanMatchesOracle) {
                     << "\ndiff docs:\n" << diff << "query=\n" << querySummary(rootQuery);
       break;
     }
+  }
+}
+
+TEST_F(BooleanFuzzTest, explicitFlatteningTransformsMatchOracleAndTwin) {
+  using ScoreMap = std::map<std::string, float>;
+
+  // Every subset of six terms gives each transformation both matching and
+  // non-matching docs, and four commits exercise multi-segment planning.
+  std::vector<std::pair<std::string, std::vector<std::string>>> docs;
+  for (int bits = 0; bits < 64; bits++) {
+    std::string id = "d" + std::to_string(bits);
+    std::string text = "z";
+    std::vector<std::string> tokens = {"z"};
+    for (int term = 0; term < 6; term++) {
+      if ((bits & (1 << term)) == 0) continue;
+      text += " ";
+      text += VOCAB[term];
+      tokens.push_back(VOCAB[term]);
+    }
+    docs.emplace_back(id, std::move(tokens));
+    helper.index(flatdoc("id", id, "body_w", text),
+                 (bits + 1) % 16 == 0 ? UpdateMessage::COMMIT
+                                      : UpdateMessage::NO_COMMIT);
+  }
+
+  auto expectedDocs = [&](const api::Query& query) {
+    std::set<std::string> expected;
+    for (const auto& [id, tokens] : docs) {
+      if (clauseMatches(query, tokens)) expected.insert(id);
+    }
+    return expected;
+  };
+
+  auto readScores = [&](LocalReq& req, std::string_view name) {
+    ScoreMap result;
+    const auto* list = req.docList(name);
+    if (list == nullptr) {
+      ADD_FAILURE() << "missing doc list for " << name;
+      return result;
+    }
+    if (list->matches.value_or(0) == 0) return result;
+    const auto* ids = list->columns.find("id");
+    const auto* scores = list->columns.find("_score_");
+    if (ids == nullptr || scores == nullptr) {
+      ADD_FAILURE() << "missing id/score columns for " << name;
+      return result;
+    }
+    const auto& idValues = std::get<api::ColStr>(ids->kind).v;
+    const auto& scoreValues = std::get<api::ColFloat>(scores->kind).v;
+    if (idValues.size() != scoreValues.size()) {
+      ADD_FAILURE() << "id/score column size mismatch for " << name;
+      return result;
+    }
+    for (size_t i = 0; i < idValues.size(); i++) {
+      result[std::string(idValues[i])] = scoreValues[i];
+    }
+    return result;
+  };
+
+  auto mapDocs = [](const ScoreMap& scores) {
+    std::set<std::string> result;
+    for (const auto& [id, score] : scores) {
+      unused(score);
+      result.insert(id);
+    }
+    return result;
+  };
+
+  auto expectScoresNear = [](const ScoreMap& expected, const ScoreMap& actual,
+                             const ExplicitCase& spec, const char* comparison) {
+    ASSERT_EQ(expected.size(), actual.size())
+      << comparison << " kind=" << spec.kind;
+    auto expectedIt = expected.begin();
+    auto actualIt = actual.begin();
+    for (; expectedIt != expected.end(); expectedIt++, actualIt++) {
+      ASSERT_EQ(expectedIt->first, actualIt->first)
+        << comparison << " kind=" << spec.kind;
+      float scale = std::max({std::fabs(expectedIt->second),
+                              std::fabs(actualIt->second), 1.0f});
+      EXPECT_NEAR(expectedIt->second, actualIt->second, 8e-6f * scale)
+        << comparison << " kind=" << spec.kind << " doc=" << expectedIt->first;
+    }
+  };
+
+  for (int iter = 0; iter < 42; iter++) {
+    ExplicitCase spec;
+    spec.kind = iter % 7;
+    int offset = (int) rng.rint(6);
+    int step = rng.rint(2) == 0 ? 1 : 5;
+    for (int i = 0; i < 6; i++) {
+      spec.terms[(size_t) i] = VOCAB[(offset + i * step) % 6];
+    }
+    spec.factor = std::array<float, 3>{0.5f, 1.5f, 2.0f}[(size_t) (iter % 3)];
+    spec.minMatch = spec.kind == 3 ? (iter / 6) % 3 : iter % 2;
+
+    auto runScored = [&](bool prepared) {
+      auto req = localReq(helper.getSearchEngine());
+      req->collection("main");
+      auto& nestedCursor = req->topDocs("nested");
+      auto queries = explicitCase(nestedCursor.mr(), spec);
+      nestedCursor.getNumber().getScores().limit(64).batchSize(65).fields({"id"});
+      nestedCursor.rawQuery() = queries.first;
+      auto& twinCursor = req->topDocs("twin");
+      twinCursor.getNumber().getScores().limit(64).batchSize(65).fields({"id"});
+      twinCursor.rawQuery() = queries.second;
+      req->testForcePrepare = prepared;
+      req->execute(iter % 2 == 0);
+      EXPECT_TRUE(req->ok()) << req->errorMsg();
+
+      auto expected = expectedDocs(queries.first);
+      auto twinExpected = expectedDocs(queries.second);
+      EXPECT_EQ(expected, twinExpected)
+        << "token oracle/twin kind=" << spec.kind
+        << " nested=" << querySummary(queries.first)
+        << " twin=" << querySummary(queries.second);
+      ScoreMap nestedScores = readScores(*req, "nested");
+      ScoreMap twinScores = readScores(*req, "twin");
+      EXPECT_EQ(expected, mapDocs(nestedScores))
+        << "nested token oracle kind=" << spec.kind
+        << " query=" << querySummary(queries.first);
+      EXPECT_EQ(expected, mapDocs(twinScores))
+        << "twin token oracle kind=" << spec.kind
+        << " query=" << querySummary(queries.second);
+      expectScoresNear(twinScores, nestedScores, spec, "nested vs twin");
+      return std::pair<ScoreMap, ScoreMap>{std::move(nestedScores),
+                                           std::move(twinScores)};
+    };
+
+    auto runNoScores = [&](bool prepared) {
+      auto req = localReq(helper.getSearchEngine());
+      req->collection("main");
+      auto& nestedCursor = req->topDocs("nested");
+      auto queries = explicitCase(nestedCursor.mr(), spec);
+      nestedCursor.getNumber().limit(0);
+      nestedCursor.rawQuery() = queries.first;
+      auto& twinCursor = req->topDocs("twin");
+      twinCursor.getNumber().limit(0);
+      twinCursor.rawQuery() = queries.second;
+      req->testForcePrepare = prepared;
+      req->execute(iter % 2 != 0);
+      EXPECT_TRUE(req->ok()) << req->errorMsg();
+      int64_t expected = (int64_t) expectedDocs(queries.first).size();
+      EXPECT_EQ(expected, req->getMatchCount("nested"))
+        << "no-scores nested kind=" << spec.kind;
+      EXPECT_EQ(expected, req->getMatchCount("twin"))
+        << "no-scores twin kind=" << spec.kind;
+      return std::pair<int64_t, int64_t>{req->getMatchCount("nested"),
+                                         req->getMatchCount("twin")};
+    };
+
+    auto liveScores = runScored(false);
+    auto preparedScores = runScored(true);
+    expectScoresNear(liveScores.first, preparedScores.first, spec,
+                     "live vs prepared nested");
+    expectScoresNear(liveScores.second, preparedScores.second, spec,
+                     "live vs prepared twin");
+    auto liveCounts = runNoScores(false);
+    auto preparedCounts = runNoScores(true);
+    EXPECT_EQ(liveCounts, preparedCounts) << "count live/prepared kind=" << spec.kind;
   }
 }
 

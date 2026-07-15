@@ -340,8 +340,9 @@ private:
   // returned unwrapped (a single term is not a BooleanQuery); otherwise the
   // clauses split into the required / optional / prohibited buckets.  A level
   // with only prohibited clauses gets a match-all optional so `-foo` means
-  // "everything except foo" (edismax behavior - the engine matches nothing on
-  // a purely negative BooleanQuery).  min_match binds only when applyMinMatch
+  // "everything except foo" in the canonical parser output. The engine also
+  // supplies this complement for raw pure-negative BooleanQuery trees.
+  // min_match binds only when applyMinMatch
   // and the level is optional-only with real user optionals.
   const api::Query* collapse(Level& st, bool applyMinMatch) {
     size_t n = st.clauses.size();
