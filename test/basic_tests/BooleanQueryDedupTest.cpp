@@ -352,7 +352,8 @@ TEST_F(BooleanQueryDedupTest, injectedTermStatsClauseNeverMerges) {
 
 // Structural probes at weight creation: merging clones into the request pool
 // (the query tree is never mutated), and a merged duplicate walks its
-// postings once while a non-dedupable duplicate pair still walks twice.
+// postings once for optional and mandatory clauses while a non-dedupable
+// duplicate pair still walks twice.
 // Score comparisons alone cannot prove the merge: an N=2 merge is
 // bit-identical to the unmerged sum (s + s == 2 * s).
 TEST_F(BooleanQueryDedupTest, weightDedupClonesAndWalksPostingsOnce) {
@@ -414,4 +415,21 @@ TEST_F(BooleanQueryDedupTest, weightDedupClonesAndWalksPostingsOnce) {
   ASSERT_GT(singleDecodes, 0);
   EXPECT_EQ(countDecodes(dup), singleDecodes);
   EXPECT_EQ(countDecodes(injected), 2 * singleDecodes);
+
+  TermQuery mandatorySingleTerm("body_w", "a");
+  std::vector<Query*> mandatorySingleClause = {&mandatorySingleTerm};
+  BooleanQuery mandatorySingle(mandatorySingleClause, {}, {}, {});
+  TermQuery mandatoryDup1("body_w", "a");
+  TermQuery mandatoryDup2("body_w", "a");
+  std::vector<Query*> mandatoryDupPair = {&mandatoryDup1, &mandatoryDup2};
+  BooleanQuery mandatoryDup(mandatoryDupPair, {}, {}, {});
+  TermQuery mandatoryInjected1("body_w", "a", stats);
+  TermQuery mandatoryInjected2("body_w", "a", stats);
+  std::vector<Query*> mandatoryInjectedPair = {&mandatoryInjected1, &mandatoryInjected2};
+  BooleanQuery mandatoryInjected(mandatoryInjectedPair, {}, {}, {});
+
+  int64_t mandatorySingleDecodes = countDecodes(mandatorySingle);
+  ASSERT_GT(mandatorySingleDecodes, 0);
+  EXPECT_EQ(countDecodes(mandatoryDup), mandatorySingleDecodes);
+  EXPECT_EQ(countDecodes(mandatoryInjected), 2 * mandatorySingleDecodes);
 }
