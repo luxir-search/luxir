@@ -26,6 +26,7 @@
 #include "solux/search/IndexReader.h"
 #include "solux/server/SoluxNode.h"
 #include "test/CollectionHelper.h"
+#include "test/DurableIndexInfo.h"
 #include "test/SoluxTest.h"
 #include "test/TestUtils.h"
 
@@ -122,26 +123,6 @@ std::vector<const solux::api::AuxIndexInfo*> vectorOverlays(const solux::api::In
     }
   }
   return out;
-}
-
-// solux::api::IndexInfo is NON-OWNING: its repeated messages and string views live in
-// the arena through the padded input copy.
-struct LoadedIndexInfo {
-  std::shared_ptr<InputFile> file;
-  std::unique_ptr<std::pmr::monotonic_buffer_resource> arena;
-  solux::api::IndexInfo info;
-};
-
-LoadedIndexInfo readIndexInfo(Directory& dir) {
-  LoadedIndexInfo loaded;
-  loaded.file = dir.openFile(Postings::INDEX_INFO_FILE);
-  EXPECT_NE(loaded.file, nullptr);
-  loaded.arena = std::make_unique<std::pmr::monotonic_buffer_resource>();
-  auto is = loaded.file->getInputStream();
-  std::span<const char> bytes(is.ptr(), (size_t)is.left());
-  auto padded = solux::api::copyToPaddedInput(std::as_bytes(bytes), *loaded.arena);
-  EXPECT_TRUE(solux::api::decode(loaded.info, padded, *loaded.arena));
-  return loaded;
 }
 
 // Registry split: per-segment overlays are looked up via Segment::getAuxReader,
@@ -373,7 +354,7 @@ TEST_F(IndexReaderAuxTest, opensCleanlyAfterTinyCommitCarryForward) {
     auto aux = firstSegmentAux(*reader1, "vec.embedding_v");
     ASSERT_NE(aux, nullptr);
     // Find the file referenced by this aux entry via the on-disk IndexInfo.
-    auto loaded = readIndexInfo(dir);
+    auto loaded = readDurableIndexInfo(dir);
     const auto& auxInfo = onlyVectorOverlay(loaded.info);
     ASSERT_EQ(auxInfo.files.size(), 1u);
     oldFile = std::string(auxInfo.files[0]);
@@ -421,7 +402,7 @@ TEST_F(IndexReaderAuxTest, retryEscalatesWhenAuxFilePersistentlyMissing) {
   // Find the aux file referenced by the current IndexInfo and delete it.
   std::string auxFile;
   {
-    auto loaded = readIndexInfo(dir);
+    auto loaded = readDurableIndexInfo(dir);
     const auto& auxInfo = onlyVectorOverlay(loaded.info);
     ASSERT_EQ(auxInfo.files.size(), 1u);
     auxFile = std::string(auxInfo.files[0]);
@@ -595,7 +576,7 @@ TEST_F(IndexReaderAuxTest, unknownAuxKindIsSkipped) {
   // Read existing IndexInfo, append an unknown aux entry, write it back.  The concrete
   // IndexInfo is non-owning (aux_indexes / files are spans), so grow the arrays into the
   // loaded arena instead of emplace_back, then re-encode while the loaded view is alive.
-  auto loaded = readIndexInfo(dir);
+  auto loaded = readDurableIndexInfo(dir);
   auto oldAux = loaded.info.aux_indexes;
   solux::api::AuxIndexInfo* aux =
       solux::api::build::allocArray(loaded.info.aux_indexes, oldAux.size() + 1, *loaded.arena);

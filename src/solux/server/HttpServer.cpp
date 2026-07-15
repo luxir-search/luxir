@@ -653,6 +653,7 @@ private:
     auto& params = out.emplace();
     params.commit_within_us = src.commit_within_us;
     params.wait_for_merges = src.wait_for_merges;
+    params.max_segments = src.max_segments;
     std::string_view* names =
         solux::api::build::allocArray(params.build_aux_indexes, src.build_aux_indexes.size(), resource);
     for (std::size_t i = 0; i < src.build_aux_indexes.size(); i++) {

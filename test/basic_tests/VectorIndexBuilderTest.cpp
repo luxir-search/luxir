@@ -1,6 +1,7 @@
 #include "gtest/gtest.h"
 #include "test/SoluxTest.h"
 #include "test/CollectionHelper.h"
+#include "test/DurableIndexInfo.h"
 #include "test/LocalReq.h"
 #include "test/TestUtils.h"
 #include "solux/index/IndexWriter.h"
@@ -114,26 +115,10 @@ struct VectorBuildFailureGuard {
   }
 };
 
-// Owns the decode arena and the non-owning IndexInfo view it backs.  The arena lives on the
-// heap so the view stays valid after the holder is moved out of readIndexInfo().
-struct IndexInfoHolder {
-  std::unique_ptr<std::pmr::monotonic_buffer_resource> arena =
-      std::make_unique<std::pmr::monotonic_buffer_resource>();
-  solux::api::IndexInfo info;
-  const solux::api::IndexInfo* operator->() const { return &info; }
-  const solux::api::IndexInfo& operator*() const { return info; }
-};
+using IndexInfoHolder = DurableIndexInfo;
 
-// Reads s.olux and returns the parsed IndexInfo (and its backing arena).
 IndexInfoHolder readIndexInfo(Directory& dir) {
-  auto file = dir.openFile(Postings::INDEX_INFO_FILE);
-  EXPECT_NE(file, nullptr);
-  IndexInfoHolder holder;
-  auto is = file->getInputStream();
-  std::span<const std::byte> bytes((const std::byte*)is.ptr(), (size_t)is.left());
-  auto padded = solux::api::copyToPaddedInput(bytes, *holder.arena);
-  EXPECT_TRUE(solux::api::decode(holder.info, padded, *holder.arena));
-  return holder;
+  return readDurableIndexInfo(dir);
 }
 
 // Reads a faiss::IndexFlat from a directory file.
@@ -711,7 +696,7 @@ TEST_F(VectorIndexBuilderTest, mergeDropsOldOverlayFiles) {
   EXPECT_EQ(idx->ntotal, 160);
 }
 
-TEST_F(VectorIndexBuilderTest, mergeBuildsOverlayBeforePlainPublishDuringActiveIndexing) {
+TEST_F(VectorIndexBuilderTest, forceMergeFlushesPendingIndexingAndBuildsOverlayBeforePublish) {
   IvfPqGuard guard(/*nlist=*/2, /*m=*/1, /*bits=*/1, /*nprobe=*/2, /*minTraining=*/2);
   CollectionHelper h("main");
   enableL2OnVecSuffix(h.collection());
@@ -741,17 +726,19 @@ TEST_F(VectorIndexBuilderTest, mergeBuildsOverlayBeforePlainPublishDuringActiveI
                                /*nprobe=*/fullEffortNProbe, /*refineCandidates=*/200, /*exact=*/true);
   EXPECT_EQ(beforeApprox, beforeExact);
 
+  // The commit-backed force-merge helper already flushed the pending inverter
+  // and durably published its merged output.  This plain commit remains a no-op.
   h.commit();
   EXPECT_EQ(vectorCommitBuildCount(), 0)
       << "plain publication commit should not run ANN builds";
   EXPECT_EQ(vectorMergeBuildCount(), 1);
 
   auto info = readIndexInfo(h.getIndexWriter()->dir);
-  ASSERT_EQ(info->segments.size(), 2);
+  ASSERT_EQ(info->segments.size(), 1);
   auto overlays = vectorOverlays(info);
   ASSERT_EQ(overlays.size(), 1u);
   auto idx = readFaissIndex(h.getIndexWriter()->dir, overlays[0]->files[0]);
-  EXPECT_EQ(idx->ntotal, 160);
+  EXPECT_EQ(idx->ntotal, 161);
 
   auto afterApprox = runKnnIds(h.getSearchEngine(), "embedding_v",
                                {0.2f, 1.0f, 1.0f, 0.0f}, 3,

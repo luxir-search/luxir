@@ -489,6 +489,26 @@ public:
 
 };
 
+TEST_F(GrpcIndexTest, maxSegmentsCommitDurablyPublishesMergedLayout) {
+  CollectionHelper helper("main");
+  helper.getIndexWriter()->mergePolicy->setMergeFactor(100);
+  for (int i = 0; i < 3; i++) {
+    helper.index(flatdoc("id", "grpc-merge-" + std::to_string(i)), UpdateMessage::COMMIT);
+  }
+  ASSERT_EQ(3u, helper.durableSegmentCount());
+
+  CollectionHelper::UpdateBuilder request;
+  request.collection("main").commit(false, 1);
+  Reply<solux::api::UpdateResponse> response;
+  grpc::ClientContext context;
+  grpc::Status status = hppUnaryCall(channel.get(), rpc::Update, &context,
+                                     request.finish(), &response);
+
+  ASSERT_TRUE(status.ok()) << status.error_message();
+  EXPECT_EQ(solux::api::UpdateResponse_::Status::OK, response.msg.status);
+  EXPECT_EQ(1u, helper.durableSegmentCount());
+}
+
 
 TEST_F(GrpcIndexTest, streamingHello) {
   solux::api::HelloRequest req;

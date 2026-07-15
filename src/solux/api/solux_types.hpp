@@ -128,7 +128,7 @@ namespace SchemaRequest_ { enum class Mode { MERGE = 0, REPLACE = 1 }; }
 // ===================== message definitions (strict topological order) =====================
 
 struct Target { std::span<const std::string_view> name; };
-struct RrfFusion { std::int32_t k = {}; };
+struct RrfFusion { int32_t k = 0; };
 struct SortSpec {
   using SortDir = solux::api::SortSpec_::SortDir;
   std::string_view field;
@@ -140,7 +140,7 @@ struct FuzzyQuery {
   std::string_view term;
   std::optional<std::int32_t> max_edits;
   std::optional<std::int32_t> prefix_length;
-  std::int32_t max_expansions = {};
+  int32_t max_expansions = 0;
 };
 struct PhraseQuery {
   std::string_view field;
@@ -148,24 +148,25 @@ struct PhraseQuery {
   std::span<const std::string_view> words;
   std::span<const std::string_view> terms;
   std::span<const ::hpp_proto::bytes_view> terms_bin;
-  std::int32_t slop = {};
+  int32_t slop = 0;
   std::span<const std::int32_t> positions;
 };
 struct CommitParams {
-  std::uint64_t commit_within_us = {};
+  uint64_t commit_within_us = 0;
   std::span<const std::string_view> build_aux_indexes;
-  bool wait_for_merges = {};
+  bool wait_for_merges = false;
+  uint32_t max_segments = 0;
 };
 
 namespace UpdateResponse_ {
-struct Error { std::string_view id; std::string_view error_message; std::int32_t index = {}; };
+struct Error { std::string_view id; std::string_view error_message; int32_t index = 0; };
 } // namespace UpdateResponse_
 
 struct UpdateResponse {
   using Status = solux::api::UpdateResponse_::Status;
   using Error = solux::api::UpdateResponse_::Error;
   std::string_view request_id;
-  std::uint64_t update_version = {};
+  uint64_t update_version = 0;
   std::span<const std::string_view> ids;
   std::span<const Error> errors;
   std::string_view error_message;
@@ -180,24 +181,24 @@ struct ArrBin { std::span<const ::hpp_proto::bytes_view> v; };
 struct ArrInt32 { std::span<const std::int32_t> v; };
 
 struct ColStr { std::string_view missing_val; std::span<const std::string_view> v; };
-struct ColInt { std::int64_t missing_val = {}; std::span<const std::int64_t> v; };
-struct ColFloat { float missing_val = {}; std::span<const float> v; };
-struct ColDouble { double missing_val = {}; std::span<const double> v; };
+struct ColInt { int64_t missing_val = 0; std::span<const std::int64_t> v; };
+struct ColFloat { float missing_val = 0.0f; std::span<const float> v; };
+struct ColDouble { double missing_val = 0.0; std::span<const double> v; };
 
 struct AuxIndexInfo {
   std::string_view kind;
   std::string_view field;
   std::string_view name;
-  std::uint64_t gen = {};
-  std::uint64_t commit_time = {};
+  uint64_t gen = 0;
+  uint64_t commit_time = 0;
   std::span<const std::string_view> files;
   ::hpp_proto::bytes_view opaque_meta;
-  std::uint64_t built_core_gen = {};
+  uint64_t built_core_gen = 0;
 };
 struct AnalyzerDef { std::string_view tokenizer; std::span<const std::string_view> filters; };
 struct VectorParams {
   using Metric = solux::api::VectorParams_::Metric;
-  std::int32_t dims = {};
+  int32_t dims = 0;
   Metric metric = Metric::NONE;
   std::optional<bool> normalized;
   std::optional<bool> normalize_on_write;
@@ -212,29 +213,29 @@ struct FieldDef {
   std::optional<FieldClass> field_class;                        // align 4 (enum)
   std::optional<IndexMode> index;                               // align 4 (enum)
   std::optional<VectorParams> vector;                           // align 4
-  bool abstract = {};                                           // align 1 (bools + optional<bool>)
+  bool abstract = false;                                           // align 1 (bools + optional<bool>)
   std::optional<bool> column_stored;
   std::optional<bool> multi_valued;
   std::optional<bool> stored;
 };
 struct SegmentInfo {
-  std::uint64_t seg_id = {};
-  std::uint64_t live_gen = {};
-  std::uint64_t min_version = {};
-  std::uint64_t max_version = {};
-  std::uint64_t commit_time = {};
-  std::uint64_t schema_gen = {};
+  uint64_t seg_id = 0;
+  uint64_t live_gen = 0;
+  uint64_t min_version = 0;
+  uint64_t max_version = 0;
+  uint64_t commit_time = 0;
+  uint64_t schema_gen = 0;
   std::span<const AuxIndexInfo> overlays;
-  std::int32_t max_doc = {};
-  std::int32_t live_docs = {};
+  int32_t max_doc = 0;
+  int32_t live_docs = 0;
 };
 struct IndexInfo {
-  std::uint64_t version = {};
-  std::uint64_t commit_time = {};
-  std::uint64_t index_gen = {};
-  std::uint64_t core_gen = {};
-  std::uint64_t update_version = {};
-  std::uint64_t schema_gen = {};
+  uint64_t version = 0;
+  uint64_t commit_time = 0;
+  uint64_t index_gen = 0;
+  uint64_t core_gen = 0;
+  uint64_t update_version = 0;
+  uint64_t schema_gen = 0;
   std::span<const SegmentInfo> segments;
   std::span<const AuxIndexInfo> aux_indexes;
 };
@@ -248,11 +249,11 @@ struct ArrArrDouble { std::span<const ArrDouble> v; };
 struct KnnQuery {                                                // needs Vector
   std::string_view field;
   std::optional<Vector> query;
-  std::int32_t k = {};
-  std::int32_t nprobe = {};
-  std::int32_t refine_candidates = {};
-  float min_scan_fraction = {};
-  bool exact = {};
+  int32_t k = 0;
+  int32_t nprobe = 0;
+  int32_t refine_candidates = 0;
+  float min_scan_fraction = 0.0f;
+  bool exact = false;
 };
 struct SchemaDef { std::span<const FieldDef> fields; };
 struct ColVector { std::span<const Vector> v; };
@@ -280,31 +281,31 @@ struct BooleanQuery {                                            // span<incompl
   std::span<const Query> required;
   std::span<const Query> optional;
   std::span<const Query> prohibited;
-  std::int32_t min_match = {};
+  int32_t min_match = 0;
 };
 struct TopDocs {                                                 // all indirect/span/opt-scalar
   ::hpp_proto::optional_indirect_view<Query> query;
   std::span<const NamedQuery> filter;
-  std::int64_t offset = {};
+  int64_t offset = 0;
   std::optional<std::int64_t> limit;
   std::span<const std::string_view> fields;
   std::span<const SortSpec> sorts;
   map_view<std::string_view, ::hpp_proto::indirect_view<SearchOp>> ops;
-  std::int32_t batch_size = {};
-  bool get_number = {};
-  bool get_scores = {};
+  int32_t batch_size = 0;
+  bool get_number = false;
+  bool get_scores = false;
 };
 struct Fusion {                                                  // needs TopDocs, RrfFusion
   map_view<std::string_view, TopDocs> sources;
   std::span<const NamedQuery> filter;
   std::optional<std::int64_t> limit;
-  std::int64_t offset = {};
+  int64_t offset = 0;
   std::span<const std::string_view> fields;
   map_view<std::string_view, ::hpp_proto::indirect_view<SearchOp>> ops;
   std::optional<RrfFusion> rrf;                                  // align 4 (RrfFusion is one int32)
-  std::int32_t batch_size = {};
-  bool get_number = {};
-  bool get_scores = {};
+  int32_t batch_size = 0;
+  bool get_number = false;
+  bool get_scores = false;
 };
 struct Domain {
   std::string_view op_name;
@@ -320,17 +321,17 @@ struct FieldFacet {
   std::optional<std::int64_t> mincount;
   std::span<const SortSpec> sorts;
   map_view<std::string_view, ::hpp_proto::indirect_view<SearchOp>> ops;
-  bool missing = {};
+  bool missing = false;
 };
 struct RangeFacet {
   std::string_view field;
   std::optional<std::int64_t> start;
   std::optional<std::int64_t> end;
-  std::int64_t gap = {};
+  int64_t gap = 0;
   std::optional<std::int64_t> mincount;
   std::span<const SortSpec> sorts;
   map_view<std::string_view, ::hpp_proto::indirect_view<SearchOp>> ops;
-  bool missing = {};
+  bool missing = false;
 };
 struct SearchOp {                                               // needs TopDocs,Fusion,FieldFacet,RangeFacet,GenOp
   std::variant<std::monostate, TopDocs, Fusion, FieldFacet, RangeFacet, GenOp> kind;
@@ -339,7 +340,7 @@ struct SearchRequest {                                          // needs Target
   std::string_view request_id;
   std::optional<Target> collection;
   map_view<std::string_view, ::hpp_proto::indirect_view<SearchOp>> ops;
-  std::uint64_t freshness_us = {};
+  uint64_t freshness_us = 0;
 };
 struct Map { map_view<std::string_view, ::hpp_proto::indirect_view<Val>> fields; };
 struct Bucket {
@@ -349,10 +350,10 @@ struct Bucket {
 struct DocList {                                                // needs Column (map by value)
   std::optional<std::int64_t> matches;
   map_view<std::string_view, Column> columns;
-  std::int64_t offset = {};
+  int64_t offset = 0;
   map_view<std::string_view, ::hpp_proto::indirect_view<Val>> ops;
   std::optional<float> max_score;                              // align 4
-  bool more = {};
+  bool more = false;
 };
 struct FacetResult {                                           // needs Column (optional)
   std::optional<std::int64_t> total_buckets;
@@ -360,7 +361,7 @@ struct FacetResult {                                           // needs Column (
   std::span<const std::int64_t> counts;
   std::optional<std::int64_t> missing;
   map_view<std::string_view, ::hpp_proto::indirect_view<Val>> ops;
-  std::int64_t offset = {};
+  int64_t offset = 0;
 };
 struct Val {                                                   // needs Map,ArrVal,Arr*,Vector,ArrVector,DocList,FacetResult
   std::variant<std::monostate, google::protobuf::NullValue, std::string_view, std::int64_t,
@@ -387,7 +388,7 @@ struct SearchResponse {
   map_view<std::string_view, ::hpp_proto::indirect_view<Val>> ops;
   std::string_view error;
   std::span<const Warning> warnings;
-  bool more = {};
+  bool more = false;
 };
 struct NamedValue { std::string_view name; ::hpp_proto::optional_indirect_view<Val> val; };
 struct Match {
@@ -395,7 +396,7 @@ struct Match {
   std::string_view field;
   ::hpp_proto::optional_indirect_view<Val> val;
   Operator operator_ = Operator::OPERATOR_UNSPECIFIED;
-  std::int32_t min_match = {};
+  int32_t min_match = 0;
 };
 struct ConstantScoreQuery {
   ::hpp_proto::optional_indirect_view<Query> query;
@@ -411,7 +412,7 @@ struct SimpleQuery {
   std::span<const std::string_view> fields;
   std::span<const std::string_view> allowed_fields;
   Operator operator_ = Operator::OPERATOR_UNSPECIFIED;
-  std::int32_t min_match = {};
+  int32_t min_match = 0;
 };
 struct RangeQuery {                                            // needs Val
   std::string_view field;
@@ -422,16 +423,16 @@ struct RangeQuery {                                            // needs Val
 };
 struct GeoBoxQuery {
   std::string_view field;
-  double min_lat = {};
-  double max_lat = {};
-  double min_lon = {};
-  double max_lon = {};
+  double min_lat = 0.0;
+  double max_lat = 0.0;
+  double min_lon = 0.0;
+  double max_lon = 0.0;
 };
 struct GeoDistanceQuery {
   std::string_view field;
-  double lat = {};
-  double lon = {};
-  double radius_meters = {};
+  double lat = 0.0;
+  double lon = 0.0;
+  double radius_meters = 0.0;
 };
 struct ExprQuery {                                             // map value indirect: Val may be incomplete, but is complete here anyway
   std::string_view q;
@@ -446,15 +447,15 @@ struct Query {                                                 // needs Match,Bo
 struct NamedQuery { std::string_view name; ::hpp_proto::optional_indirect_view<Query> query; };
 struct UpdateRequest {                                         // needs Target,Columns,CommitParams
   std::string_view request_id;
-  std::int64_t stream_id = {};
+  int64_t stream_id = 0;
   std::optional<Target> collection;
   std::span<const Map> docs;
   std::optional<Columns> columns;
   std::span<const std::string_view> delete_ids;
   std::optional<CommitParams> commit;
-  bool allow_dups = {};
-  bool all_or_none = {};
-  bool return_ids = {};
+  bool allow_dups = false;
+  bool all_or_none = false;
+  bool return_ids = false;
 };
 
 // ===================== trivial-destructibility checks =====================

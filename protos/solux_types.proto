@@ -505,6 +505,15 @@ message CommitParams {
 
   // If true, this commit will wait for any in-flight merges to finish before publishing.
   bool wait_for_merges = 3;
+
+  // Merge down so the data visible at this commit resides in at most this many
+  // segments. 0 (default) = no forced merging. The response is not sent until
+  // the merged index is durably published: at return, everything this commit
+  // made visible lives in <= max_segments segments (concurrent ingestion after
+  // this commit may add new segments; they are not covered by the promise).
+  // The response waits for the merged layout even when commit_within_us is
+  // positive.
+  uint32 max_segments = 4;
 }
 
 message UpdateRequest {

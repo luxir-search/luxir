@@ -392,6 +392,32 @@ TEST_F(HttpApiTest, updateResponseUsesSnakeCase) {
   EXPECT_NE(res.body().find(R"("request_id":"req-1")"), std::string::npos) << res.body();
 }
 
+TEST_F(HttpApiTest, bufferedMaxSegmentsCommitDurablyPublishesMergedLayout) {
+  helper.getIndexWriter()->mergePolicy->setMergeFactor(100);
+  for (int i = 0; i < 3; i++) {
+    helper.index(flatdoc("id", "http-buffered-merge-" + std::to_string(i)), UpdateMessage::COMMIT);
+  }
+  ASSERT_EQ(3u, helper.durableSegmentCount());
+
+  auto response = httpRequest(port(), http::verb::post, "/collections/main/update",
+                              R"({"commit":{"max_segments":1}})");
+  ASSERT_EQ(200, response.result_int()) << response.body();
+  EXPECT_EQ(1u, helper.durableSegmentCount());
+}
+
+TEST_F(HttpApiTest, ndjsonEndMaxSegmentsCommitDurablyPublishesMergedLayout) {
+  helper.getIndexWriter()->mergePolicy->setMergeFactor(100);
+  for (int i = 0; i < 3; i++) {
+    helper.index(flatdoc("id", "http-ndjson-merge-" + std::to_string(i)), UpdateMessage::COMMIT);
+  }
+  ASSERT_EQ(3u, helper.durableSegmentCount());
+
+  auto response = httpRequest(port(), http::verb::post, "/collections/main/update",
+      R"({"_end_":{"commit":{"max_segments":1}}})" "\n", "application/x-ndjson");
+  ASSERT_EQ(200, response.result_int()) << response.body();
+  EXPECT_EQ(1u, helper.durableSegmentCount());
+}
+
 TEST_F(HttpApiTest, ndjsonStreamIndexesAndQueries) {
   std::string body =
       R"({"id":"n1","title_w":"streamtoken alpha","title_s":"Alpha"})" "\n"

@@ -62,6 +62,11 @@ public:
   };
   CommitType commit;
   int32_t commit_within;  // TODO: implement this
+  int32_t maxSegments = 0;  // 0 means no client-requested merge target.
+
+  // Internal synthetic commits use this to publish an already-produced segment
+  // layout without flushing unrelated inverter state that arrived later.
+  bool publishOnly = false;
 
   // Aux index rebuild request, applied during this commit (no effect if commit == NO_COMMIT).
   // See proto CommitParams.build_aux_indexes for semantics:
@@ -87,7 +92,7 @@ public:
 class MergeMessage : public UpdateMessage {
 public:
   int32_t mergeLevel = -1;  // Segment level to merge.  -1 means unspecified.
-  int32_t maxSegments = 0;  // Merge down to this number of segments.
+  UpdateMessage* forcedBy = nullptr;  // Client commit whose layout promise this merge completes.
 };
 
 }

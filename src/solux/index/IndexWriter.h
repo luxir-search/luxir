@@ -1,6 +1,7 @@
 #pragma once
 
 #include <atomic>
+#include <deque>
 #include <optional>
 #include <string>
 #include <mutex>
@@ -117,7 +118,7 @@ public:
   public:
     static constexpr int32_t DEFAULT_MERGE_FACTOR = 10;
     IndexWriter& iw;
-    bool mergeRunning = false;
+    int32_t outstandingMerges = 0;
     int32_t mergeFactor = DEFAULT_MERGE_FACTOR;
     // TODO: Hmmm, a high merge floor can lead to some O^N2 behavior: see https://issues.apache.org/jira/browse/LUCENE-10574
     // Perhaps an alternative would be to remove the floor and then kick off merges like normal, *but*
@@ -223,11 +224,9 @@ public:
       {
         // const std::lock_guard<std::mutex> lock(iw.indexMutex);
         mergeLevel = _update(seg);
-        if (mergeLevel < 0 || mergeRunning) {
+        if (mergeLevel < 0 || outstandingMerges > 0) {
           return false;
         }
-
-        mergeRunning = true;
       }
 
       class MyMergeMessage : public MergeMessage {
@@ -239,17 +238,12 @@ public:
         }
       };
 
-      MyMergeMessage* msg = new MyMergeMessage();
+      auto msg = std::make_unique<MyMergeMessage>();
       msg->mergeLevel = mergeLevel;
-      // Maintain the invariant that every member of waitingForMerges has +1
-      // on leftToFlush while a merge is running.  The merge tail walks the
-      // list again to undo this; late joiners (added between now and merge
-      // end) self-bump in initiateCommit since they observe mergeRunning.
-      for (auto* waitingMsg : iw.waitingForMerges) {
-        assert(waitingMsg->commitInfo);
-        waitingMsg->commitInfo->leftToFlush++;
+      if (!iw._submitMergeLocked(msg.get())) {
+        return false;
       }
-      iw.mergeSegmentsNode->try_put(msg);
+      msg.release();
       return true;
     }
   };  // end MergePolicy
@@ -286,14 +280,16 @@ public:
   boost::unordered_flat_map<Inverter*, std::unique_ptr<Inverter>> busyInverters;
   boost::unordered_flat_map<Inverter*, std::unique_ptr<Inverter>> flushingInverters;
 
-  // Commits whose finishCommitBody must wait for in-flight merges to complete
-  // (i.e. msg.waitForMerges was set).  Invariant: while a merge is running,
-  // every member has +1 on its commitInfo.leftToFlush.  Maintained by the
-  // four mutation points: add (initiateCommit, with self-bump if mergeRunning),
-  // remove (_releaseToCommitSequencer when leftToFlush hit 0), merge start
-  // (bumps every member), merge tail (decrements every member, possibly
-  // re-bumped by a chain merge first).  Protected by indexMutex.
+  // Commits whose finishCommitBody must wait for submitted merges to complete.
+  // Every waiter has one leftToFlush hold per outstanding merge.  Protected by
+  // indexMutex.
   std::vector<UpdateMessage*> waitingForMerges;
+
+  // Client merge-down requests are serialized through their durable publish
+  // commit.  The original UpdateMessage remains owned here until its response
+  // is completed.  Protected by indexMutex.
+  std::deque<UpdateMessage*> pendingForceMerges;
+  UpdateMessage* activeForceMerge = nullptr;
 
   // The last updateNumber generated (the first update number generated will be 1)
   uint64_t updateNumber = 0;
@@ -466,6 +462,20 @@ public:
   void commit(UpdateMessage::CommitType commitType=UpdateMessage::COMMIT);
 
 private:
+  class ForceMergeMessage final : public MergeMessage {
+  public:
+    void handle(IndexWriter& iw) override { unused(iw); }
+    void done(IndexWriter& iw) override;
+  };
+
+  class MergeCommitMessage final : public UpdateMessage {
+  public:
+    MergeMessage* origMessage = nullptr;
+
+    void handle(IndexWriter& iw) override { unused(iw); }
+    void done(IndexWriter& iw) override;
+  };
+
   void startUpdateBody(UpdateMessage& msg) {
     // if the start node can reject updates, then assigning sequence numbers should be done after that.
     // Sequences must start at 0 for the sequencer nodes.
@@ -514,8 +524,16 @@ private:
   // before the try_put so subsequent merges don't bump a counter nobody reads.
   // Caller must hold indexMutex.
   void _releaseToCommitSequencer(UpdateMessage* msg);
+  void _addMergeWaiterHoldsLocked();
+  void _releaseMergeWaiterHoldsLocked();
+  bool _submitMergeLocked(MergeMessage* msg);
+  void _activateNextForceMergeLocked(std::vector<UpdateMessage*>& rejectedOrigins);
+  void completeForceMergeOrigins(const std::vector<UpdateMessage*>& origins);
+  void enqueueForceMerge(UpdateMessage& origin);
+  void completeForceMerge(MergeMessage& msg);
+  bool submitMergeCommit(MergeMessage& msg, bool publishOnly);
   void segmentFlushBody(Inverter& inverter);
-  void finishCommitBody(UpdateMessage& msg);
+  bool finishCommitBody(UpdateMessage& msg);
   void writeIndexInfoFile(std::span<SegInfo*> segs, CommitInfo* commitInfo = nullptr,
                           std::span<const AuxInfo> auxIndexes = {});
   std::vector<AuxInfo> buildAuxIndexes(const UpdateMessage& msg,
@@ -550,7 +568,7 @@ private:
   void applyDeletes(std::span<SegInfo*> segs, MultiDeletesData& multiDeletesData);
   void applyDeletes(SegInfo& seg, SortedDeletes::EntrySpan commitDeletes);
   bool finishMergeTail(bool allowSyntheticCommit, bool chainNextMerge = true);
-  void mergeSegmentsBody(MergeMessage& msg);
+  bool mergeSegmentsBody(MergeMessage& msg);
 
 public:
   /// THIS SECTION ONLY FOR TEST CODE!

@@ -1,11 +1,13 @@
 #pragma once
 
+#include "DurableIndexInfo.h"
 #include "TestUtils.h"
 #include "solux/index/IndexWriter.h"
 #include "solux/schema/Schema.h"
 #include "solux/server/ProtoUpdateMessage.h"
 #include "solux/search/SearchEngine.h"
 #include "solux/api/build.h"
+#include "solux/api/padded_input.h"
 #include "LocalReq.h"
 #include <memory_resource>
 
@@ -179,9 +181,10 @@ public:
       return *this;
     }
     UpdateBuilder& streamId(int64_t id) { request_.stream_id = id; return *this; }
-    UpdateBuilder& commit(bool waitForMerges = false) {
+    UpdateBuilder& commit(bool waitForMerges = false, uint32_t maxSegments = 0) {
       auto& p = request_.commit.emplace();
       p.wait_for_merges = waitForMerges;
+      p.max_segments = maxSegments;
       return *this;
     }
     UpdateBuilder& commitWithAux(std::span<const std::string> names) {
@@ -216,8 +219,9 @@ public:
     runSync(b.finish());
   }
 
-  IndexResult index(const Doc& doc, UpdateMessage::CommitType commitType = UpdateMessage::NO_COMMIT, bool overwrite = false) {
-    return indexAll({&doc, 1}, commitType, overwrite);
+  IndexResult index(const Doc& doc, UpdateMessage::CommitType commitType = UpdateMessage::NO_COMMIT,
+                    bool overwrite = false, uint32_t maxSegments = 0) {
+    return indexAll({&doc, 1}, commitType, overwrite, maxSegments);
   }
 
   // Submit a fully-built UpdateBuilder (for cases the convenience methods don't cover:
@@ -226,23 +230,29 @@ public:
 
   // NOTE: distinct name (not an `index` overload) - std::span's initializer_list ctor would
   // make index({{"id","1"}}) ambiguous. Mirrors deleteById / deleteByIds.
-  IndexResult indexAll(std::span<const Doc> docs, UpdateMessage::CommitType commitType = UpdateMessage::NO_COMMIT, bool overwrite = false) {
+  IndexResult indexAll(std::span<const Doc> docs,
+                       UpdateMessage::CommitType commitType = UpdateMessage::NO_COMMIT,
+                       bool overwrite = false, uint32_t maxSegments = 0) {
     UpdateBuilder b;
     for (const auto& doc : docs) b.add(doc);
-    if (commitType != UpdateMessage::NO_COMMIT) b.commit();
+    if (commitType != UpdateMessage::NO_COMMIT) b.commit(false, maxSegments);
     b.overwrite(overwrite);
     return runSync(b.finish());
   }
 
-  IndexResult deleteByIds(std::span<const std::string> ids, UpdateMessage::CommitType commitType = UpdateMessage::NO_COMMIT) {
+  IndexResult deleteByIds(std::span<const std::string> ids,
+                          UpdateMessage::CommitType commitType = UpdateMessage::NO_COMMIT,
+                          uint32_t maxSegments = 0) {
     UpdateBuilder b;
     for (const auto& id : ids) b.remove(id);
-    if (commitType != UpdateMessage::NO_COMMIT) b.commit();
+    if (commitType != UpdateMessage::NO_COMMIT) b.commit(false, maxSegments);
     return runSync(b.finish());
   }
 
-  IndexResult deleteById(const std::string& id, UpdateMessage::CommitType commitType = UpdateMessage::NO_COMMIT) {
-    return deleteByIds({&id, 1}, commitType);
+  IndexResult deleteById(const std::string& id,
+                         UpdateMessage::CommitType commitType = UpdateMessage::NO_COMMIT,
+                         uint32_t maxSegments = 0) {
+    return deleteByIds({&id, 1}, commitType, maxSegments);
   }
 
   // Async version of index.  Docs are copied into the update message's arena.
@@ -299,6 +309,10 @@ public:
 
   std::shared_ptr<IndexWriter> getIndexWriter() { return collection().getShard()->getIndexWriter(); }
 
+  size_t durableSegmentCount() {
+    return readDurableIndexInfo(getIndexWriter()->dir)->segments.size();
+  }
+
   SearchEngine& getSearchEngine() { return SoluxTest::soluxNode->getSearchEngine(); }
 
   /// Given nDocs, mergeFactor, and a base-36 "shape" string, fill docsPerSeg with
@@ -350,5 +364,19 @@ public:
     return reuseIndex;
   }
 };
+
+inline std::vector<std::string> allIds(CollectionHelper& helper) {
+  auto request = localReq(helper.getSearchEngine());
+  request->collection("main").topDocs("q").allQuery().fields({"id"}).limit(-1);
+  request->execute();
+  std::vector<std::string> ids;
+  for (const auto& doc : request->getDocs()) {
+    if (auto* value = find(doc, "id")) {
+      ids.push_back(std::get<std::string>(*value));
+    }
+  }
+  std::sort(ids.begin(), ids.end());
+  return ids;
+}
 
 } // namespace solux::test

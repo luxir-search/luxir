@@ -2,6 +2,7 @@
 
 #include <memory>
 #include <memory_resource>
+#include <limits>
 #include <string>
 
 #include "solux/index/UpdateMessage.h"
@@ -53,6 +54,10 @@ public:
       const auto& params = *req->commit;
       commit_within = params.commit_within_us;
       waitForMerges = params.wait_for_merges;
+      constexpr uint32_t maxInt32 = (uint32_t)std::numeric_limits<int32_t>::max();
+      maxSegments = params.max_segments > maxInt32
+                      ? std::numeric_limits<int32_t>::max()
+                      : (int32_t)params.max_segments;
       buildAuxIndexes.reserve(params.build_aux_indexes.size());
       for (const auto& name : params.build_aux_indexes) {
         buildAuxIndexes.emplace_back(name);

@@ -80,20 +80,9 @@ bool waitForMergesCommit(IndexWriter& iw) {
   return msg.success;
 }
 
-std::vector<std::string> allIds(solux::test::CollectionHelper& helper) {
-  auto req = solux::test::localReq(helper.getSearchEngine());
-  req->collection("main").topDocs("q").allQuery().fields({"id"}).limit(-1);
-  req->execute();
-  auto docs = req->getDocs();
-
-  std::vector<std::string> ids;
-  ids.reserve(docs.size());
-  for (const auto& doc : docs) {
-    auto* val = solux::test::find(doc, "id");
-    if (val) ids.push_back(std::get<std::string>(*val));
-  }
-  std::sort(ids.begin(), ids.end());
-  return ids;
+uint32_t randomForceMergeTarget(Rng& r) {
+  if (r.rint(100) >= 12) return 0;
+  return (uint32_t)r.rint(3) + 1;
 }
 
 bool segmentPrefixAbsent(Directory& dir, uint64_t segId) {
@@ -333,7 +322,7 @@ TEST_F(IndexWriterTest, mergeFailureContainmentRestoresSourcesAndGate) {
   EXPECT_TRUE(waitCommitDone.load(std::memory_order_relaxed));
   // Benign ordering: the waitForMerges commit may register before or after the
   // failure tail's decrement walk.  Both orderings succeed - a late joiner sees
-  // mergeRunning==false and does not wait - so this is not a flaky race, the
+  // no outstanding merges and does not wait - so this is not a flaky race, the
   // success holds either way.  Do not "fix" it with added synchronization.
   EXPECT_TRUE(waitCommitSuccess.load(std::memory_order_relaxed));
   auto failure = iw->testLastMergeFailure();
@@ -375,6 +364,10 @@ TEST_F(IndexWriterTest, multiThreaded) {
   std::atomic_long docsVisible(0);
   std::atomic_long commitsRequested(0);
   std::atomic_long commits(0);
+  std::atomic_long forceMergesRequested(0);
+  std::atomic_long forceMergesCompleted(0);
+  std::atomic_long forceMergeErrors(0);
+  uint64_t requestSeed = rng();
 
   class UpdateInfo {
   public:
@@ -396,7 +389,8 @@ TEST_F(IndexWriterTest, multiThreaded) {
   struct TestReq {
     std::pmr::monotonic_buffer_resource mr;
     solux::api::UpdateRequest request;
-    TestReq(std::string_view fieldName, int numAdds, bool doCommit, bool waitForMerges) {
+    TestReq(std::string_view fieldName, int numAdds, bool doCommit, bool waitForMerges,
+            uint32_t maxSegments) {
       if (numAdds > 0) {
         solux::api::Map* docs = solux::api::build::allocArray(request.docs, numAdds, mr);
         for (int i = 0; i < numAdds; i++) {
@@ -405,7 +399,9 @@ TEST_F(IndexWriterTest, multiThreaded) {
         }
       }
       if (doCommit) {
-        request.commit.emplace().wait_for_merges = waitForMerges;
+        auto& params = request.commit.emplace();
+        params.wait_for_merges = waitForMerges;
+        params.max_segments = maxSegments;
       }
     }
   };
@@ -416,8 +412,9 @@ TEST_F(IndexWriterTest, multiThreaded) {
     std::function<void(TestProtoUpdateMessage&)> callback = nullptr;
 
     TestProtoUpdateMessage(std::string_view fieldName, int numAdds, bool doCommit,
-                           bool waitForMerges, std::function<void(TestProtoUpdateMessage&)> callback)
-      : TestReq(fieldName, numAdds, doCommit, waitForMerges),
+                           bool waitForMerges, uint32_t maxSegments,
+                           std::function<void(TestProtoUpdateMessage&)> callback)
+      : TestReq(fieldName, numAdds, doCommit, waitForMerges, maxSegments),
         ProtoUpdateMessage(&this->request),
         updateRequest(this->request),
         callback(std::move(callback)) {}
@@ -435,6 +432,10 @@ TEST_F(IndexWriterTest, multiThreaded) {
             TEST_DEBUG("done called! adds in this request={}", msg.updateRequest.docs.size());
     if (msg.updateRequest.commit.has_value()) {
       commits++;
+      if (msg.updateRequest.commit->max_segments > 0) {
+        forceMergesCompleted++;
+        if (msg.result.errored()) forceMergeErrors++;
+      }
     }
     docsAdded += msg.updateRequest.docs.size();
     if (recordUpdates) {
@@ -476,11 +477,12 @@ TEST_F(IndexWriterTest, multiThreaded) {
 
     for (int iter = 0; iter < requestThreads; iter++) {
       // create a thread
-      threads.emplace_back([&]() {
+      threads.emplace_back([&, iter]() {
                   try {
+                    Rng r(requestSeed + (uint64_t)iter);
                     bool writesDone = false;
                     for (;;) {
-                      if (writesDone || rng.rint(100) < percentReads) {
+                      if (writesDone || r.rint(100) < percentReads) {
                         // do this *before* opening the reader, so we can ensure that the reader should see at least
                         // that many updates.
                         auto globalDocsVisible = docsVisible.load();
@@ -516,9 +518,9 @@ TEST_F(IndexWriterTest, multiThreaded) {
                         // Decide the request shape here; the message builds the concrete
                         // (arena-backed) request from these params and the base ctor reads
                         // commit/wait_for_merges off it.
-                        bool doCommit = rng.rint(100) < percentCommits;
-                        int64_t numAdds = rng.rint(doCommit ? 0 : 1,
-                                                   3);  // lower bound on number of adds is 0 if we're going to commit
+                        bool doCommit = r.rint(100) < percentCommits;
+                        int64_t numAdds = r.rint(doCommit ? 0 : 1,
+                                                 3);  // lower bound on number of adds is 0 if we're going to commit
 
                         // make sure we don't go over the number of docs we want to add
                         // this makes it harder to figure out when we should do final commits.
@@ -537,12 +539,14 @@ TEST_F(IndexWriterTest, multiThreaded) {
                         }
 
                         bool waitForMerges = false;
-                        if (doCommit && rng.rint(100) < percentWaitForMerges) {
+                        if (doCommit && r.rint(100) < percentWaitForMerges) {
                           waitForMerges = true;
                         }
+                        uint32_t maxSegments = doCommit ? randomForceMergeTarget(r) : 0;
 
                         if (doCommit) {
                           commitsRequested++;
+                          if (maxSegments > 0) forceMergesRequested++;
                         }
 
                         if (doCommit && docsRequested.load() >= docsToAdd) {
@@ -551,7 +555,8 @@ TEST_F(IndexWriterTest, multiThreaded) {
                         }
 
                         TEST_DEBUG("\tsubmitting update with {} adds, commit={}", numAdds, doCommit);
-                        auto* msg = new TestProtoUpdateMessage(field, (int)numAdds, doCommit, waitForMerges, cb);
+                        auto* msg = new TestProtoUpdateMessage(
+                            field, (int)numAdds, doCommit, waitForMerges, maxSegments, cb);
                         auto success = iw.submitUpdate(msg);
                         if (!success) {
                           FAIL();
@@ -629,6 +634,9 @@ TEST_F(IndexWriterTest, multiThreaded) {
   EXPECT_EQ(docsRequested.load(), docsAdded.load());
   EXPECT_EQ(docsRequested.load(), docsVisible.load());
   EXPECT_EQ(commitsRequested.load(), commits.load());
+  EXPECT_EQ(forceMergesRequested.load(), forceMergesCompleted.load());
+  EXPECT_EQ(0, forceMergeErrors.load());
+  EXPECT_FALSE(iw.testMergeRunning());
 }
 
 
@@ -962,6 +970,29 @@ static void runMultithreadedUpdates(uint64_t seed, int mergeFailPercent, int upd
   indexWriter->mergePolicy->setMergeFactor(3);  // low merge factor to stress merge concurrency with other operations
 
   std::atomic<int> injectedDocFailures{0};
+  std::atomic<int> forceMergesRequested{0};
+  std::atomic<int> forceMergesCompleted{0};
+  std::atomic<int> forceMergeErrorResponses{0};
+
+  auto nextCommitMaxSegments = [&](Rng& r) {
+    uint32_t maxSegments = randomForceMergeTarget(r);
+    if (maxSegments > 0) forceMergesRequested++;
+    return maxSegments;
+  };
+
+  auto recordForceMergeResponse = [&](uint32_t maxSegments, const IndexResult& result) {
+    if (maxSegments == 0) return;
+    forceMergesCompleted++;
+    if (!result.success) forceMergeErrorResponses++;
+  };
+
+  auto checkCommittedResponse = [&](uint32_t maxSegments, const IndexResult& result) {
+    recordForceMergeResponse(maxSegments, result);
+    if (result.success) return;
+    EXPECT_GT(maxSegments, 0u);
+    EXPECT_GT(mergeFailPercent, 0);
+    EXPECT_EQ(solux::api::UpdateResponse_::Status::ERROR, result.status);
+  };
 
   auto numThreads = 16;
   auto opsPerThread = 50;  // total operations per thread
@@ -1048,15 +1079,17 @@ static void runMultithreadedUpdates(uint64_t seed, int mergeFailPercent, int upd
           int operation = r.rint(3);  // 0 == update, 1 == delete, 2 = read
 
           if (operation == 0) { // Index
+            uint32_t maxSegments = nextCommitMaxSegments(r);
             Doc doc = flatdoc("id", docId);
-            auto result = helper.index(doc, UpdateMessage::COMMIT, true);
-            ASSERT_TRUE(result.success);
+            auto result = helper.index(doc, UpdateMessage::COMMIT, true, maxSegments);
+            checkCommittedResponse(maxSegments, result);
             // TODO: expose and get SoluxError for actual error message / stack trace.
             docVersions[localDoc] = result.updateVersion;
 
           } else if (operation == 1) { // Delete
-            auto result = helper.deleteById(docId, UpdateMessage::COMMIT);
-            ASSERT_TRUE(result.success);
+            uint32_t maxSegments = nextCommitMaxSegments(r);
+            auto result = helper.deleteById(docId, UpdateMessage::COMMIT, maxSegments);
+            checkCommittedResponse(maxSegments, result);
             docVersions[localDoc] = -1; // Mark as deleted
           } else { // Read
             indexWriter->getIndexReader();
@@ -1109,6 +1142,7 @@ static void runMultithreadedUpdates(uint64_t seed, int mergeFailPercent, int upd
         int operation = r.rint(3);  // 0 == update, 1 == delete, 2 = read
 
         if (operation == 0) { // Index
+          uint32_t maxSegments = nextCommitMaxSegments(r);
           // Inject a failing update: the doc must keep its previous state, so
           // docVersions is deliberately NOT updated and the version oracle in
           // the read path verifies the rollback was invisible.
@@ -1117,7 +1151,8 @@ static void runMultithreadedUpdates(uint64_t seed, int mergeFailPercent, int upd
             if (r.rint(2) == 0) {
               // Single doc that fails on an unknown field.
               Doc doc = flatdoc("id", docId, "no_such_field", "boom");
-              auto result = helper.index(doc, UpdateMessage::COMMIT, true);
+              auto result = helper.index(doc, UpdateMessage::COMMIT, true, maxSegments);
+              recordForceMergeResponse(maxSegments, result);
               ASSERT_FALSE(result.success);
               ASSERT_EQ(solux::api::UpdateResponse_::Status::ERROR, result.status);
               ASSERT_EQ(1, (int)result.errors.size());
@@ -1132,8 +1167,9 @@ static void runMultithreadedUpdates(uint64_t seed, int mergeFailPercent, int upd
               b.add(flatdoc("id", docId, "no_such_field", "boom"));
               b.overwrite(true);  // allow_dups = false
               b.allOrNone(true);
-              b.commit();
+              b.commit(false, maxSegments);
               auto result = helper.submit(b);
+              recordForceMergeResponse(maxSegments, result);
               ASSERT_FALSE(result.success);
               ASSERT_EQ(solux::api::UpdateResponse_::Status::ERROR, result.status);
               ASSERT_EQ(1, (int)result.errors.size());
@@ -1144,14 +1180,15 @@ static void runMultithreadedUpdates(uint64_t seed, int mergeFailPercent, int upd
           }
 
           Doc doc = flatdoc("id", docId);
-          auto result = helper.index(doc, UpdateMessage::COMMIT, true);
-          ASSERT_TRUE(result.success);
+          auto result = helper.index(doc, UpdateMessage::COMMIT, true, maxSegments);
+          checkCommittedResponse(maxSegments, result);
           // TODO: expose and get SoluxError for actual error message / stack trace.
           docVersions[localDoc] = result.updateVersion;
 
         } else if (operation == 1) { // Delete
-          auto result = helper.deleteById(docId, UpdateMessage::COMMIT);
-          ASSERT_TRUE(result.success);
+          uint32_t maxSegments = nextCommitMaxSegments(r);
+          auto result = helper.deleteById(docId, UpdateMessage::COMMIT, maxSegments);
+          checkCommittedResponse(maxSegments, result);
           docVersions[localDoc] = -1; // Mark as deleted
         } else { // Read
           indexWriter->getIndexReader();
@@ -1191,6 +1228,13 @@ static void runMultithreadedUpdates(uint64_t seed, int mergeFailPercent, int upd
   // make sure we don't leave any tasks in the updateGraph (drains in-flight
   // merges, including injected-failure ones, before we drop the listener).
   indexWriter->updateGraph.wait_for_all();
+  EXPECT_GT(forceMergesRequested.load(), 0);
+  EXPECT_EQ(forceMergesRequested.load(), forceMergesCompleted.load());
+  EXPECT_LE(forceMergeErrorResponses.load(), forceMergesCompleted.load());
+  if (mergeFailPercent == 0 && updateFailPercent == 0) {
+    EXPECT_EQ(0, forceMergeErrorResponses.load());
+  }
+  EXPECT_FALSE(indexWriter->testMergeRunning());
 
   if (mergeFailPercent > 0) {
     // The run is meaningless if no merge actually failed; the version oracle

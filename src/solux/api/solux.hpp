@@ -17,17 +17,17 @@ namespace solux::api {
 
 struct HelloRequest {
   std::string_view name;
-  std::int32_t response_count = {};
-  std::int32_t min_sleep_us = {};
-  std::int32_t max_sleep_us = {};
-  std::int32_t n_threads = {};
-  bool async = {};
-  bool debug = {};
+  int32_t response_count = 0;
+  int32_t min_sleep_us = 0;
+  int32_t max_sleep_us = 0;
+  int32_t n_threads = 0;
+  bool async = false;
+  bool debug = false;
 };
 
 struct HelloReply {
   std::string_view message;
-  std::int32_t response_number = {};
+  int32_t response_number = 0;
 };
 
 // decode() uses hpp_proto::padded_input. Callers must pass a payload-only span
