@@ -85,7 +85,7 @@ public:
 
   HttpReq& execute() {
     auto res = httpRequest(port_, http::verb::post,
-                           "/collections/" + collection_ + "/query", buildJson());
+                           "/collections/" + collection_ + "/_query", buildJson());
     status_ = res.result_int();
     body_ = res.body();
     return *this;

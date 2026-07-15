@@ -7,8 +7,6 @@
 #include <atomic>
 #include <chrono>
 #include <memory>
-#include <memory_resource>
-#include <span>
 #include <string>
 #include <thread>
 #include <vector>
@@ -27,6 +25,7 @@
 #include "solux/server/SoluxNode.h"
 #include "test/CollectionHelper.h"
 #include "test/DurableIndexInfo.h"
+#include "test/SchemaBuilder.h"
 #include "test/SoluxTest.h"
 #include "test/TestUtils.h"
 
@@ -83,33 +82,22 @@ protected:
   // Install a schema where _v has metric=L2 so the suffix-rule fields
   // (e.g. "embedding_v") become eligible for FAISS aux indexing.
   static void enableL2OnVecSuffix(Collection& col) {
-    // The concrete SchemaDef is non-owning (fields is a span); build a single FieldDef on
-    // the stack and view it, valid for the duration of the fromProto call.
-    solux::api::FieldDef f;
-    f.name = "_v";
-    f.field_class = solux::api::FieldDef_::FieldClass::VECTOR;
-    f.abstract = true;
-    f.column_stored = true;
-    f.vector.emplace().metric = solux::api::VectorParams_::Metric::L2;
-    solux::api::SchemaDef def;
-    def.fields = std::span<const solux::api::FieldDef>(&f, 1);
-    auto base = col.getSchema();
-    col.setSchema(Schema::fromProto(def, base.get()));
+    SchemaBuilder b;
+    auto& f = b.templ("_v");
+    f.type = solux::api::FieldDef_::FieldClass::VECTOR;
+    f.column = true;
+    f.metric = solux::api::VectorMetric::L2;
+    b.set(col);
   }
 
   static void enableCosineOnVecSuffix(Collection& col, bool normalizeOnWrite) {
-    solux::api::FieldDef f;
-    f.name = "_v";
-    f.field_class = solux::api::FieldDef_::FieldClass::VECTOR;
-    f.abstract = true;
-    f.column_stored = true;
-    auto& vector = f.vector.emplace();
-    vector.metric = solux::api::VectorParams_::Metric::COSINE;
-    vector.normalize_on_write = normalizeOnWrite;
-    solux::api::SchemaDef def;
-    def.fields = std::span<const solux::api::FieldDef>(&f, 1);
-    auto base = col.getSchema();
-    col.setSchema(Schema::fromProto(def, base.get()));
+    SchemaBuilder b;
+    auto& f = b.templ("_v");
+    f.type = solux::api::FieldDef_::FieldClass::VECTOR;
+    f.column = true;
+    f.metric = solux::api::VectorMetric::COSINE;
+    f.normalize_on_write = normalizeOnWrite;
+    b.set(col);
   }
 };
 
@@ -176,7 +164,7 @@ TEST_F(IndexReaderAuxTest, opensVectorAuxAfterBuild) {
   ASSERT_NE(vaux, nullptr);
   EXPECT_EQ(vaux->getField(), "embedding_v");
   EXPECT_EQ(vaux->getDims(), 4);
-  EXPECT_EQ(vaux->getMetric(), (int32_t)solux::api::VectorParams_::Metric::L2);
+  EXPECT_EQ(vaux->getMetric(), (int32_t)solux::api::VectorMetric::L2);
   EXPECT_FALSE(vaux->shouldNormalizeColumnOnCosineRescore());
 
   auto* idx = vaux->getFaissIndex();
@@ -305,7 +293,7 @@ TEST_F(IndexReaderAuxTest, cosineRawColumnSetsRescorePolicy) {
   ASSERT_NE(aux, nullptr);
   auto* vaux = dynamic_cast<VectorAuxReader*>(aux.get());
   ASSERT_NE(vaux, nullptr);
-  EXPECT_EQ(vaux->getMetric(), (int32_t)solux::api::VectorParams_::Metric::COSINE);
+  EXPECT_EQ(vaux->getMetric(), (int32_t)solux::api::VectorMetric::COSINE);
   EXPECT_TRUE(vaux->shouldNormalizeColumnOnCosineRescore());
 }
 

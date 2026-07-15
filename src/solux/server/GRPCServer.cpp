@@ -382,9 +382,12 @@ static std::shared_ptr<Collection> resolveSetSchemaCollection(GRPCServer& server
 }
 
 static void finishWithException(GenericCallData& call, const std::exception& e) {
-  grpc::StatusCode code = dynamic_cast<const CollectionResolutionError*>(&e) != nullptr
-      ? grpc::StatusCode::NOT_FOUND
-      : grpc::StatusCode::INTERNAL;
+  grpc::StatusCode code = grpc::StatusCode::INTERNAL;
+  if (dynamic_cast<const CollectionResolutionError*>(&e) != nullptr) {
+    code = grpc::StatusCode::NOT_FOUND;
+  } else if (dynamic_cast<const SchemaError*>(&e) != nullptr) {
+    code = grpc::StatusCode::INVALID_ARGUMENT;
+  }
   call.finishWithError(grpc::Status(code, e.what()));
 }
 
@@ -533,14 +536,7 @@ static void handleSetSchema(GenericCallData& call, grpc::ByteBuffer& readBuf) {
     std::pmr::monotonic_buffer_resource respArena;  // backs the non-owning response SchemaDef
 
     auto collection = resolveSetSchemaCollection(call.server, request.proto.collection);
-    std::shared_ptr<Schema> newSchema;
-    if (request.proto.mode == solux::api::SchemaRequest_::Mode::MERGE) {
-      auto currentSchema = collection->getSchema();
-      newSchema = Schema::fromProto(*request.proto.schema, currentSchema.get());
-    } else {
-      newSchema = Schema::fromProto(*request.proto.schema);
-    }
-    collection->setSchema(newSchema);
+    auto newSchema = collection->updateSchema(*request.proto.schema, request.proto.mode);
     newSchema->toProto(&response.schema.emplace(), respArena);
 
     grpc::ByteBuffer buf = serializeToByteBuffer(response);

@@ -14,7 +14,7 @@ namespace solux {
 class HttpSessionRegistry;  // tracks live sessions for graceful shutdown (defined in the .cpp)
 
 // A hand-written async HTTP/JSON front end (Boost.Beast) beside the gRPC server.
-// Phase 0: a single POST /collections/{c}/query endpoint plus GET /health.
+// Endpoints: /collections/{c}/_query, /_update, /_schema, plus GET /health.
 // Search responses stream as NDJSON (application/x-ndjson, chunked); each engine
 // SearchResponse becomes one line.
 class HttpServer {

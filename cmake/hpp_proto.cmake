@@ -50,9 +50,11 @@ target_compile_features(protoc-gen-hpp PRIVATE cxx_std_23)
 #   PROTOS <p1> [p2 ...]     # .proto files (each must live under one of IMPORT_DIRS)
 #   IMPORT_DIRS <d1> [d2 ...]# protoc -I search dirs (the dir containing a proto determines its output subpath)
 #   [NAMESPACE_PREFIX <p>]   # hpp-proto namespace_prefix option (e.g. hpptest)
-#   [SNAKE_JSON]             # JSON keys are the proto (snake_case) field names, one
-#                            # spelling only (no camelCase aliases); an explicit
-#                            # [json_name = "..."] override is still the primary key
+#   [SNAKE_JSON]             # the solux JSON convention: keys are the proto
+#                            # (snake_case) field names, one spelling only (no
+#                            # camelCase aliases); an explicit [json_name = "..."]
+#                            # override is still the primary key; enum values
+#                            # serialize as lowercase names ("text", not "TEXT")
 # )
 function(hpp_proto_generate)
   cmake_parse_arguments(ARG "CONCRETE;SNAKE_JSON" "OUT_VAR;OUT_DIR;NAMESPACE_PREFIX;CONCRETE_NAMESPACE" "PROTOS;IMPORT_DIRS" ${ARGN})
@@ -78,9 +80,9 @@ function(hpp_proto_generate)
   endif()
   if(ARG_SNAKE_JSON)
     if(_opts)
-      set(_opts "${_opts},preserve_proto_field_names=true,json_aliases=false")
+      set(_opts "${_opts},preserve_proto_field_names=true,json_aliases=false,lowercase_enum_json=true")
     else()
-      set(_opts "preserve_proto_field_names=true,json_aliases=false")
+      set(_opts "preserve_proto_field_names=true,json_aliases=false,lowercase_enum_json=true")
     endif()
   endif()
   if(ARG_NAMESPACE_PREFIX)

@@ -3,17 +3,16 @@
 #include <array>
 #include <cstdint>
 #include <memory>
-#include <memory_resource>
 #include <numeric>
 #include <string>
 #include <string_view>
 #include <vector>
 
 #include "bench/solux_bench.h"
-#include "solux/api/build.h"
 #include "solux/query/NumericRangeQuery.h"
 #include "solux/schema/Schema.h"
 #include "solux/util/random.h"
+#include "test/SchemaBuilder.h"
 #include "test/TestIndex.h"
 
 using namespace solux;
@@ -78,16 +77,14 @@ class NumericRangeBenchIndex {
 
 public:
   NumericRangeBenchIndex() : numDocs(solux::unit_tests ? 51'200 : 512'000) {
-    std::pmr::monotonic_buffer_resource arena;
-    api::SchemaDef def;
-    api::FieldDef* fields = api::build::allocArray(def.fields, FIELDS.size(), arena);
-    for (size_t slot = 0; slot < FIELDS.size(); slot++) {
-      fields[slot].name = FIELDS[slot].name;
-      fields[slot].field_class = api::FieldDef::FieldClass::INT;
-      fields[slot].index = api::FieldDef::IndexMode::RANGE;
+    SchemaBuilder b;
+    for (const FieldSpec& spec : FIELDS) {
+      auto& f = b.field(spec.name);
+      f.type = api::FieldDef::FieldClass::INT;
+      f.index = api::FieldDef::IndexMode::RANGE;
     }
     auto base = Schema::createDefaultSchema();
-    schema = Schema::fromProto(def, base.get());
+    schema = b.build(base.get());
     index.iw = std::make_unique<IndexWriter>(
         index.dir, [this]() { return schema; });
 

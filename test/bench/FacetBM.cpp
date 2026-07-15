@@ -1,6 +1,5 @@
 #include <charconv>
 #include <latch>
-#include <memory_resource>
 #include <variant>
 
 #include <tbb/task_group.h>
@@ -9,6 +8,7 @@
 #include "solux/search/ops/FacetOp.h"
 #include "test/CollectionHelper.h"
 #include "test/LocalReq.h"
+#include "test/SchemaBuilder.h"
 
 using namespace solux;
 using namespace solux::test;
@@ -106,14 +106,11 @@ static void BM_Facet(benchmark::State& state, int64_t nDocs, std::string_view sh
 static void buildRangeFacetBenchIndex(CollectionHelper& helper,
                                       std::span<const int32_t> docsPerSeg) {
   helper.clear();
-  std::pmr::monotonic_buffer_resource arena;
-  api::SchemaDef schemaDef;
-  api::FieldDef* field = api::build::allocArray(schemaDef.fields, 1, arena);
-  field->name = "range_bm_i";
-  field->field_class = api::FieldDef::FieldClass::INT;
-  field->index = api::FieldDef::IndexMode::RANGE;
-  helper.collection().setSchema(
-      Schema::fromProto(schemaDef, helper.collection().getSchema().get()));
+  SchemaBuilder b;
+  auto& field = b.field("range_bm_i");
+  field.type = api::FieldDef::FieldClass::INT;
+  field.index = api::FieldDef::IndexMode::RANGE;
+  b.set(helper.collection());
 
   auto iw = helper.getIndexWriter();
   std::vector<Inverter*> inverters;

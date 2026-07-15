@@ -18,6 +18,7 @@
 #include "solux/util/solux_util.h"
 #include "test/CollectionHelper.h"
 #include "test/LocalReq.h"
+#include "test/SchemaBuilder.h"
 #include "test/SoluxTest.h"
 
 using namespace solux;
@@ -729,24 +730,19 @@ TEST_F(StoredFieldsSearchTest, storedStringField) {
   // Indexed STRING fields (no column) with STORED set so retrieval goes
   // through the stored-fields resource rather than the ord column.
   {
-    solux::api::SchemaDef def;
-    std::vector<solux::api::FieldDef> fields;
-    fields.reserve(2);
-    auto& f = fields.emplace_back();
-    f.name = "label";
-    f.field_class = solux::api::FieldDef::FieldClass::STRING;
+    SchemaBuilder b;
+    auto& f = b.field("label");
+    f.type = solux::api::FieldDef::FieldClass::STRING;
     f.index = IndexMode::MATCH;
-    f.column_stored = false;
+    f.column = false;
     f.stored = true;
-    auto& f2 = fields.emplace_back();
-    f2.name = "aliases";
-    f2.field_class = solux::api::FieldDef::FieldClass::STRING;
+    auto& f2 = b.field("aliases");
+    f2.type = solux::api::FieldDef::FieldClass::STRING;
     f2.index = IndexMode::MATCH;
-    f2.column_stored = false;
-    f2.multi_valued = true;
+    f2.column = false;
+    f2.multi = true;
     f2.stored = true;
-    def.fields = fields;
-    schema = Schema::fromProto(def, schema.get());
+    schema = b.build(schema.get());
   }
   ch.collection().setSchema(schema);
 
@@ -787,16 +783,13 @@ TEST_F(StoredFieldsSearchTest, columnPreferredOverStored) {
 
   auto schema = Schema::createDefaultSchema();
   // Column-only (not indexed) STRING that is also STORED.
-  solux::api::SchemaDef def;
-  std::vector<solux::api::FieldDef> fields;
-  auto& f = fields.emplace_back();
-  f.name = "tag";
-  f.field_class = solux::api::FieldDef::FieldClass::STRING;
+  SchemaBuilder b;
+  auto& f = b.field("tag");
+  f.type = solux::api::FieldDef::FieldClass::STRING;
   f.index = IndexMode::NONE;
-  f.column_stored = true;
+  f.column = true;
   f.stored = true;
-  def.fields = fields;
-  schema = Schema::fromProto(def, schema.get());
+  schema = b.build(schema.get());
   ch.collection().setSchema(schema);
 
   ch.index(flatdoc("id", std::string("d1"), "tag", std::string("red")),
@@ -835,22 +828,17 @@ TEST_F(StoredFieldsSearchTest, customStoredResourceFromProto) {
   auto schema = Schema::createDefaultSchema();
   schema->fieldTypeMap["_stored_embeddings_"] =
       std::make_shared<StoredFieldType>("_stored_embeddings_");
-  solux::api::SchemaDef def;
-  std::vector<solux::api::FieldDef> fields;
-  fields.reserve(2);
-  auto& body = fields.emplace_back();
-  body.name = "body";
-  body.field_class = solux::api::FieldDef::FieldClass::TEXT;
+  SchemaBuilder b;
+  auto& body = b.field("body");
+  body.type = solux::api::FieldDef::FieldClass::TEXT;
   body.index = IndexMode::MATCH;
   body.stored = true;
-  auto& para = fields.emplace_back();
-  para.name = "paragraphs";
-  para.field_class = solux::api::FieldDef::FieldClass::TEXT;
+  auto& para = b.field("paragraphs");
+  para.type = solux::api::FieldDef::FieldClass::TEXT;
   para.index = IndexMode::MATCH;
   para.stored = true;
   para.stored_resource = "_stored_embeddings_";
-  def.fields = fields;
-  schema = Schema::fromProto(def, schema.get());
+  schema = b.build(schema.get());
   ASSERT_EQ("_stored_embeddings_", schema->getFieldTypePtr("paragraphs")->storedResource_);
   ch.collection().setSchema(schema);
 
@@ -921,16 +909,13 @@ TEST_F(StoredFieldsSearchTest, preStoredSegmentFallbackToColumn) {
   // Segment 1: schema has the STRING field WITHOUT stored - only column.
   {
     auto schema = Schema::createDefaultSchema();
-    solux::api::SchemaDef def;
-    std::vector<solux::api::FieldDef> fields;
-    auto& f = fields.emplace_back();
-    f.name = "name";
-    f.field_class = solux::api::FieldDef::FieldClass::STRING;
+    SchemaBuilder b;
+    auto& f = b.field("name");
+    f.type = solux::api::FieldDef::FieldClass::STRING;
     f.index = IndexMode::MATCH;
-    f.column_stored = true;
+    f.column = true;
     f.stored = false;
-    def.fields = fields;
-    schema = Schema::fromProto(def, schema.get());
+    schema = b.build(schema.get());
     ch.collection().setSchema(schema);
 
     ch.index(flatdoc("id", std::string("a"),
@@ -941,16 +926,13 @@ TEST_F(StoredFieldsSearchTest, preStoredSegmentFallbackToColumn) {
   // Segment 2: schema now marks "name" as STORED (and drops the column).
   {
     auto schema = Schema::createDefaultSchema();
-    solux::api::SchemaDef def;
-    std::vector<solux::api::FieldDef> fields;
-    auto& f = fields.emplace_back();
-    f.name = "name";
-    f.field_class = solux::api::FieldDef::FieldClass::STRING;
+    SchemaBuilder b;
+    auto& f = b.field("name");
+    f.type = solux::api::FieldDef::FieldClass::STRING;
     f.index = IndexMode::MATCH;
-    f.column_stored = false;
+    f.column = false;
     f.stored = true;
-    def.fields = fields;
-    schema = Schema::fromProto(def, schema.get());
+    schema = b.build(schema.get());
     ch.collection().setSchema(schema);
 
     ch.index(flatdoc("id", std::string("b"),
@@ -993,16 +975,13 @@ TEST_F(StoredFieldsSearchTest, opportunisticStoredPullsColumnPeerFromChunk) {
   // body_t is already stored-only via the default _t suffix (TEXT, no column).
   // Add a STRING field that is BOTH column-stored and STORED.
   {
-    solux::api::SchemaDef def;
-    std::vector<solux::api::FieldDef> fields;
-    auto& f = fields.emplace_back();
-    f.name = "author";
-    f.field_class = solux::api::FieldDef::FieldClass::STRING;
+    SchemaBuilder b;
+    auto& f = b.field("author");
+    f.type = solux::api::FieldDef::FieldClass::STRING;
     f.index = IndexMode::NONE;
-    f.column_stored = true;
+    f.column = true;
     f.stored = true;
-    def.fields = fields;
-    schema = Schema::fromProto(def, schema.get());
+    schema = b.build(schema.get());
   }
   ch.collection().setSchema(schema);
 

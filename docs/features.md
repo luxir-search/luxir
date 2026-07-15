@@ -10,7 +10,7 @@ stealing task scheduler, async IO, and SIMD acceleration.
 The ten-second version:
 
 ```
-POST /collections/main/query
+POST /collections/main/_query
 {"query": {"match": {"title_w": "darkness"}}, "fields": ["id", "author_s", "year_i"]}
 ```
 
@@ -53,8 +53,13 @@ engine is built the way it is.
 - Schemaless start: field types inferred from name suffixes (`title_w`,
   `year_i`, `tags_ss`, `date_dt`, `embedding_v`, ...); no up-front schema
   required.
-- Explicit schema API: field definitions, per-field analyzers,
-  field inheritance, merge or replace semantics.
+- Explicit schema API over HTTP/JSON and gRPC: field definitions, per-field
+  analyzers, field inheritance (templates). `GET /collections/{c}/_schema`
+  returns the authored schema and the output is itself a valid write body;
+  `POST` sets the named definitions (`mode=set`, the default) or replaces the
+  whole schema (`mode=replace_all` - the destructive operation must be typed,
+  never implied by an HTTP verb). Reserved fields (`id`, `_version_`) are
+  always materialized, so a replace cannot brick a collection.
 - Field types: analyzed text, string, int, float, double, date (ISO-8601
   in, epoch-millis storage), binary, id, vector, geo point (lat/lon;
   values ingest as `[lon, lat]` arrays, GeoJSON coordinate order,
@@ -182,9 +187,9 @@ clauses, under facet domains, as fusion sources, as filters.
 
 - gRPC: streaming search, unary and streaming update, schema admin,
   server reflection, health checks.
-- HTTP/JSON: query, update (JSON and NDJSON), health. The JSON is designed
-  for humans: snake_case, untagged values, shorthands with exact
-  structured equivalents.
+- HTTP/JSON: query, update (JSON and NDJSON), schema, health. The JSON is
+  designed for humans: snake_case, untagged values, lowercase enum names,
+  shorthands with exact structured equivalents.
 - `?explain=request` echo mode: send the terse form, get back the
   canonical structured form.
 - Strict validation everywhere: unknown keys are errors, not silence;

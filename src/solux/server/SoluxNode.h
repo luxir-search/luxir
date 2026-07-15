@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <memory>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -64,6 +65,9 @@ public:
 
 class Schema;
 
+namespace api { struct SchemaDef; }
+namespace api::SchemaRequest_ { enum class Mode; }
+
 // A single logical collection of docs which may
 // consist of multiple shards.
 class Collection {
@@ -73,6 +77,7 @@ class Collection {
   std::shared_ptr<Shard> shard;
   std::vector<std::shared_ptr<Shard>> shards;
   std::atomic<uint64_t> schemaGen_{1};  // starts at 1 for default schema
+  std::mutex schemaMutex_;  // serializes schema read-modify-write + persistence
 public:
 
   std::shared_ptr<Shard> getShard() {
@@ -84,6 +89,13 @@ public:
     return schema.load();
   }
 
+  // The schema mutation transaction: applies `def` to the current schema
+  // (SET) or replaces it (REPLACE_ALL), persists, swaps, and returns the
+  // installed schema.  All external schema mutation (gRPC, HTTP) goes through
+  // here; concurrent calls serialize per collection.
+  std::shared_ptr<Schema> updateSchema(const solux::api::SchemaDef& def,
+                                       solux::api::SchemaRequest_::Mode mode);
+
   // Atomically replaces the schema and persists it to the shard's Directory.
   void setSchema(std::shared_ptr<Schema> newSchema);
 
@@ -92,6 +104,9 @@ public:
   // Load the latest schema from the Directory.
   // Returns true if schema was loaded, false if no schema file found.
   bool loadSchema();
+
+private:
+  void setSchemaLocked(std::shared_ptr<Schema> newSchema);
 
   friend class Library;
   friend class SoluxNode;

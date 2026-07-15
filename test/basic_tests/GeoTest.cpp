@@ -17,11 +17,11 @@
 #include "solux/reader/BKDReader.h"
 #include "solux/reader/FieldReader.h"
 #include "solux/reader/IntColReader.h"
-#include "solux/schema/Schema.h"
 #include "solux/util/geo.h"
 #include "solux/util/random.h"
 #include "test/CollectionHelper.h"
 #include "test/QueryBuild.h"
+#include "test/SchemaBuilder.h"
 #include "test/SoluxTest.h"
 
 using namespace solux;
@@ -109,20 +109,17 @@ std::vector<int32_t> run(IndexReader& reader, std::string_view field,
 }
 
 void setGeoSchema(CollectionHelper& helper, bool range = true) {
-  std::pmr::monotonic_buffer_resource arena;
-  api::SchemaDef def;
-  api::FieldDef* fields = api::build::allocArray(def.fields, 2, arena);
-  fields[0].name = "geo_single";
-  fields[0].field_class = api::FieldDef::FieldClass::GEO_POINT;
-  fields[0].index = range ? api::FieldDef::IndexMode::RANGE
-                          : api::FieldDef::IndexMode::NONE;
-  fields[1].name = "geo_multi";
-  fields[1].field_class = api::FieldDef::FieldClass::GEO_POINT;
-  fields[1].index = range ? api::FieldDef::IndexMode::RANGE
-                          : api::FieldDef::IndexMode::NONE;
-  fields[1].multi_valued = true;
-  helper.collection().setSchema(
-      Schema::fromProto(def, helper.collection().getSchema().get()));
+  SchemaBuilder b;
+  api::FieldDef::IndexMode index = range ? api::FieldDef::IndexMode::RANGE
+                                         : api::FieldDef::IndexMode::NONE;
+  auto& single = b.field("geo_single");
+  single.type = api::FieldDef::FieldClass::GEO_POINT;
+  single.index = index;
+  auto& multi = b.field("geo_multi");
+  multi.type = api::FieldDef::FieldClass::GEO_POINT;
+  multi.index = index;
+  multi.multi = true;
+  b.set(helper.collection());
 }
 
 SegFieldInfo fieldInfo(IndexReader::Segment& segment, std::string_view field) {

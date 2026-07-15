@@ -246,7 +246,7 @@ void roundTripType(const char* nm) {
   X(ArrFloat) X(ArrDouble) X(ArrBin) X(ArrArrStr) X(ArrArrInt) X(ArrArrFloat) X(ArrArrDouble)      \
   X(ArrArrBin) X(Vector) X(ArrVector) X(ColStr) X(Column) X(ColVector) X(MultiVector) X(ColInt)    \
   X(ColFloat) X(ColDouble) X(ColMap) X(IndexInfo) X(AuxIndexInfo) X(SegmentInfo) X(AnalyzerDef)    \
-  X(FieldDef) X(VectorParams) X(SchemaDef) X(SchemaRequest) X(SchemaResponse)                      \
+  X(FieldDef) X(SchemaDef) X(SchemaRequest) X(SchemaResponse)                                      \
   X(HelloRequest) X(HelloReply)
 
 TEST(ProtoRoundTrip, AllMessages) {

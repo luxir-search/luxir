@@ -13,6 +13,7 @@
 #include "test/CollectionHelper.h"
 #include "test/LocalReq.h"
 #include "test/QueryBuild.h"
+#include "test/SchemaBuilder.h"
 #include "test/SoluxTest.h"
 #include "test/TestUtils.h"
 
@@ -28,17 +29,13 @@ protected:
 
   // Override _v with a vector field so the same docs can carry both an
   // analyzed text field (_w) and a dense vector for fusion across both.
-  static void installVecSchema(Collection& col, solux::api::VectorParams::Metric metric) {
-    std::pmr::monotonic_buffer_resource pool;
-    solux::api::SchemaDef def;
-    solux::api::FieldDef* f = build::allocArray(def.fields, 1, pool);
-    f->name = build::arenaStr(pool, "_v");
-    f->field_class = solux::api::FieldDef_::FieldClass::VECTOR;
-    f->abstract = true;
-    f->column_stored = true;
-    f->vector.emplace().metric = metric;
-    auto base = col.getSchema();
-    col.setSchema(Schema::fromProto(def, base.get()));
+  static void installVecSchema(Collection& col, solux::api::VectorMetric metric) {
+    SchemaBuilder b;
+    auto& f = b.templ("_v");
+    f.type = solux::api::FieldDef_::FieldClass::VECTOR;
+    f.column = true;
+    f.metric = metric;
+    b.set(col);
   }
 
   // --- arena builders for the Fusion op the OpCursor fluent API doesn't cover ---
@@ -158,7 +155,7 @@ protected:
 //     d (2.0) falls outside the k=3 cutoff.
 TEST_F(FusionOpTest, rrfTextAndKnn) {
   CollectionHelper h("main");
-  installVecSchema(h.collection(), solux::api::VectorParams::Metric::L2);
+  installVecSchema(h.collection(), solux::api::VectorMetric::L2);
 
   h.index(flatdoc("id", std::string("a"), "foo_w", "apple",  "embedding_v", std::vector<float>{1.0f, 0,    0   }));
   h.index(flatdoc("id", std::string("b"), "foo_w", "orange", "embedding_v", std::vector<float>{0.9f, 0.1f, 0   }));
@@ -252,7 +249,7 @@ TEST_F(FusionOpTest, sharedFilter) {
 
 TEST_F(FusionOpTest, sharedKnnFilter) {
   CollectionHelper h("main");
-  installVecSchema(h.collection(), solux::api::VectorParams::Metric::L2);
+  installVecSchema(h.collection(), solux::api::VectorMetric::L2);
 
   h.index(flatdoc("id", std::string("a"), "foo_w", "apple",
                   "embedding_v", std::vector<float>{1.0f, 0.0f}));
@@ -513,7 +510,7 @@ TEST_F(FusionOpTest, emptyIndex) {
 //
 TEST_F(FusionOpTest, concurrentKnnPrepareSharesRequestPool) {
   CollectionHelper h("main");
-  installVecSchema(h.collection(), solux::api::VectorParams::Metric::L2);
+  installVecSchema(h.collection(), solux::api::VectorMetric::L2);
 
   // ~40 docs across 5 segments; ~1/3 lack the vector field so the sparse
   // single-valued valueRank->docId selector path runs.  Distinct vectors keep

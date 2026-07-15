@@ -157,6 +157,18 @@ public:
   std::string tokenizer_;                // e.g., "whitespace", "keyword"
   std::vector<std::string> filters_;     // e.g., {"lowercase"}
 
+  // The component-name registry, kept beside createAnalyzer so the validation
+  // and the construction switch cannot drift.  Schema::fromProto rejects
+  // unknown names with a teaching error before a schema is installed.
+  static constexpr std::string_view VALID_TOKENIZERS = "whitespace, keyword, unicode_word";
+  static constexpr std::string_view VALID_FILTERS = "lowercase, nfkc_cf, fold";
+  static bool validTokenizer(std::string_view t) {
+    return t == "whitespace" || t == "keyword" || t == "unicode_word";
+  }
+  static bool validFilter(std::string_view f) {
+    return f == "lowercase" || f == "nfkc_cf" || f == "fold";
+  }
+
   TextFieldType(std::string_view name, int flags=INDEX_DOCS_FREQS_POSITIONS,
                 std::string_view tokenizer = "whitespace", std::vector<std::string> filters = {})
     : FieldType(name, FieldType::TEXT, flags), tokenizer_(tokenizer), filters_(std::move(filters)) {}
@@ -165,10 +177,8 @@ public:
   std::unique_ptr<TokenChain> createAnalyzer(std::string_view fieldName) {
     unused(fieldName);
 
-    // Create tokenizer by name. The old "whitespace"/"nocopy_whitespace" split
-    // is gone: under the read-only borrow contract the tokenizer always views
-    // the source, so there is a single WhitespaceTokenizer. ("nocopy_whitespace"
-    // is still accepted as an alias until schemas are migrated.)
+    // Create tokenizer by name (validated against the registry above at
+    // schema-build time; the trailing else keeps this total).
     std::unique_ptr<Tokenizer> tok;
     bool stateful = false;
     size_t firstFilter = 0;  // index of the first filter still to apply (some get fused into the tokenizer)
@@ -187,7 +197,7 @@ public:
         tok = makeUnicodeWordTokenizer();
       }
     } else {
-      // default: "whitespace" (and the "nocopy_whitespace" alias)
+      // default: "whitespace"
       tok = std::make_unique<WhitespaceTokenizer>();
     }
 

@@ -112,7 +112,7 @@ TEST(JsonDialect, MatchSugar) {
   EXPECT_EQ(std::get<std::string_view>(m.val->kind), "dune");
 
   m = {};
-  ASSERT_TRUE(P::read_json(m, R"({"price_i":42,"operator":"AND"})", mr));
+  ASSERT_TRUE(P::read_json(m, R"({"price_i":42,"operator":"and"})", mr));
   EXPECT_EQ(m.field, "price_i");
   EXPECT_EQ(std::get<std::int64_t>(m.val->kind), 42);
   EXPECT_EQ(m.operator_, P::Match::Operator::AND);
@@ -231,6 +231,72 @@ TEST(JsonDialect, DepthLimitErrorsCleanly) {
   deep.append(300, ']');
   P::Val v;
   EXPECT_FALSE(P::read_json(v, deep, mr));
+}
+
+// ---- schema (SchemaDef / FieldDef) golden wire text ----
+
+TEST(JsonDialect, SchemaDefGoldenWire) {
+  // The full friendly shape: name-keyed maps, lowercase enums, flattened
+  // vector params, sparse presence. Literal text pins the public contract.
+  constexpr std::string_view wire =
+      R"({"fields":{"title":{"type":"text","analyzer":{"tokenizer":"unicode_word","filters":["nfkc_cf","fold"]},"stored":true},"year":{"type":"int","index":"range"},"vec":{"type":"vector","dims":4,"metric":"cosine"}},"templates":{"_x":{"type":"string","multi":true}}})";
+
+  std::pmr::monotonic_buffer_resource mr;
+  P::SchemaDef def;
+  std::string err;
+  ASSERT_TRUE(P::read_json(def, wire, mr, &err)) << err;
+
+  const P::FieldDef* title = def.fields.find("title");
+  ASSERT_NE(nullptr, title);
+  EXPECT_EQ(P::FieldDef::FieldClass::TEXT, *title->type);
+  EXPECT_EQ("unicode_word", title->analyzer->tokenizer);
+  EXPECT_TRUE(*title->stored);
+  const P::FieldDef* vec = def.fields.find("vec");
+  ASSERT_NE(nullptr, vec);
+  EXPECT_EQ(4, *vec->dims);
+  EXPECT_EQ(P::VectorMetric::COSINE, *vec->metric);
+  EXPECT_FALSE(vec->stored.has_value()) << "sparse presence preserved";
+  const P::FieldDef* tmpl = def.templates.find("_x");
+  ASSERT_NE(nullptr, tmpl);
+  EXPECT_TRUE(*tmpl->multi);
+
+  // write(read(x)) is text-identity: the canonical form round-trips exactly.
+  std::string out;
+  ASSERT_TRUE(P::write_json(def, out));
+  EXPECT_EQ(wire, out);
+}
+
+TEST(JsonDialect, FieldDefStringShorthand) {
+  // {"year": "int"} == {"year": {"type": "int"}}; writes stay canonical.
+  std::pmr::monotonic_buffer_resource mr;
+  P::SchemaDef def;
+  ASSERT_TRUE(P::read_json(def, R"({"fields":{"year":"int","tag":"string"}})", mr));
+  const P::FieldDef* year = def.fields.find("year");
+  ASSERT_NE(nullptr, year);
+  EXPECT_EQ(P::FieldDef::FieldClass::INT, *year->type);
+  EXPECT_EQ(P::FieldDef::FieldClass::STRING, *def.fields.find("tag")->type);
+
+  std::string out;
+  ASSERT_TRUE(P::write_json(def, out));
+  EXPECT_EQ(R"({"fields":{"year":{"type":"int"},"tag":{"type":"string"}}})", out);
+}
+
+TEST(JsonDialect, FieldDefStrictReads) {
+  std::pmr::monotonic_buffer_resource mr;
+  {  // unknown key -> error, not silent ignore
+    P::SchemaDef def;
+    EXPECT_FALSE(P::read_json(def, R"({"fields":{"x":{"typ":"int"}}})", mr));
+  }
+  {  // enum names are lowercase-exact; the old uppercase spelling is rejected
+    P::SchemaDef def;
+    EXPECT_FALSE(P::read_json(def, R"({"fields":{"x":{"type":"INT"}}})", mr));
+  }
+  {  // parent + inherited type reads fine with no type at all
+    P::SchemaDef def;
+    ASSERT_TRUE(P::read_json(def, R"({"fields":{"t":{"parent":"_wl"}}})", mr));
+    EXPECT_FALSE(def.fields.find("t")->type.has_value());
+    EXPECT_EQ("_wl", def.fields.find("t")->parent);
+  }
 }
 
 }  // namespace

@@ -6,7 +6,6 @@
 #include <cstdint>
 #include <limits>
 #include <memory>
-#include <memory_resource>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -14,7 +13,6 @@
 #include <vector>
 
 #include "bench/solux_bench.h"
-#include "solux/api/build.h"
 #include "solux/query/GeoBoxQuery.h"
 #include "solux/query/GeoDistanceQuery.h"
 #include "solux/reader/BKDReader.h"
@@ -23,6 +21,7 @@
 #include "solux/schema/Schema.h"
 #include "solux/util/geo.h"
 #include "solux/util/random.h"
+#include "test/SchemaBuilder.h"
 #include "test/TestIndex.h"
 
 using namespace solux;
@@ -282,15 +281,13 @@ public:
 };
 
 std::shared_ptr<Schema> geoSchema(bool multi) {
-  std::pmr::monotonic_buffer_resource arena;
-  api::SchemaDef def;
-  api::FieldDef* field = api::build::allocArray(def.fields, 1, arena);
-  field->name = FIELD;
-  field->field_class = api::FieldDef::FieldClass::GEO_POINT;
-  field->index = api::FieldDef::IndexMode::RANGE;
-  field->multi_valued = multi;
+  SchemaBuilder b;
+  auto& field = b.field(FIELD);
+  field.type = api::FieldDef::FieldClass::GEO_POINT;
+  field.index = api::FieldDef::IndexMode::RANGE;
+  field.multi = multi;
   auto base = Schema::createDefaultSchema();
-  return Schema::fromProto(def, base.get());
+  return b.build(base.get());
 }
 
 void populate(Inverter& inverter, CorpusShape shape, bool multi,

@@ -36,7 +36,7 @@ namespace solux {
 SOLUX_PACKED_START
 struct VectorAuxMeta {
   int32_t dims = 0;
-  int32_t metric = 0;       // raw solux::api::VectorParams::Metric value
+  int32_t metric = 0;       // raw solux::api::VectorMetric value
   int32_t cosineNormalizeColumnOnRescore = 0;  // bool: raw cosine column, renorm at rescore
   int32_t engine = 0;       // ENGINE_IVFPQ
   int32_t nlist = 0;        // IVF only

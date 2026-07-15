@@ -36,6 +36,9 @@
 //   A numeric "boost" sibling wraps that arm in BoostQuery; an object-valued
 //   "boost" is the BoostQuery arm itself. Writes stay canonical, so echo mode
 //   shows the wrapper rather than the sibling sugar.
+// - FieldDef reads accept a bare STRING as type-only sugar: {"year": "int"} ==
+//   {"year": {"type": "int"}} in a schema's fields/templates maps. Writes stay
+//   canonical (the object form).
 
 #pragma once
 
@@ -186,6 +189,62 @@ struct from<JSON, solux::api::ExprQuery> {
           } else if (key == "vars") {
             decltype(auto) vars = ::hpp_proto::detail::as_modifiable(ctx, value.vars);
             glz::util::parse_repeated<V>(true, vars, ctx, vit, vend);
+          } else {
+            ctx.error = error_code::unknown_key;
+            return true;
+          }
+          return bool(ctx.error);
+        },
+        [](auto &, auto &) {});
+  }
+};
+
+// ----- FieldDef: canonical object, or a bare string (type-only sugar) -----
+template <>
+struct from<JSON, solux::api::FieldDef> {
+  template <auto Opts>
+  static void op(solux::api::FieldDef &value, hpp_proto::concepts::is_non_owning_context auto &ctx,
+                 auto &it, auto &end) {
+    if constexpr (!check_ws_handled(Opts)) {
+      if (skip_ws<Opts>(ctx, it, end)) {
+        return;
+      }
+    }
+    static constexpr auto O = ws_handled<Opts>();
+    if ((char)*it == '"') {
+      util::from_json<O>(value.type.emplace(), ctx, it, end);
+      return;
+    }
+    static constexpr auto V = opening_handled_off<ws_handled_off<Opts>()>();
+    std::string_view key;
+    decltype(auto) keyTarget = ::hpp_proto::detail::as_modifiable(ctx, key);
+    util::scan_object_fields<O, true>(
+        ctx, it, end, keyTarget, [](auto &, auto &) {},
+        [&](auto &vit, auto &vend) {
+          if (key == "parent") {
+            util::from_json<V>(value.parent, ctx, vit, vend);
+          } else if (key == "type") {
+            util::from_json<V>(value.type, ctx, vit, vend);
+          } else if (key == "index") {
+            util::from_json<V>(value.index, ctx, vit, vend);
+          } else if (key == "column") {
+            util::from_json<V>(value.column, ctx, vit, vend);
+          } else if (key == "multi") {
+            util::from_json<V>(value.multi, ctx, vit, vend);
+          } else if (key == "analyzer") {
+            util::from_json<V>(value.analyzer, ctx, vit, vend);
+          } else if (key == "stored") {
+            util::from_json<V>(value.stored, ctx, vit, vend);
+          } else if (key == "stored_resource") {
+            util::from_json<V>(value.stored_resource, ctx, vit, vend);
+          } else if (key == "dims") {
+            util::from_json<V>(value.dims, ctx, vit, vend);
+          } else if (key == "metric") {
+            util::from_json<V>(value.metric, ctx, vit, vend);
+          } else if (key == "normalized") {
+            util::from_json<V>(value.normalized, ctx, vit, vend);
+          } else if (key == "normalize_on_write") {
+            util::from_json<V>(value.normalize_on_write, ctx, vit, vend);
           } else {
             ctx.error = error_code::unknown_key;
             return true;

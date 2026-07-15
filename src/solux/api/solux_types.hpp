@@ -110,7 +110,7 @@ struct ArrDouble; struct ArrBin; struct ArrArrStr; struct ArrArrInt; struct ArrA
 struct ArrArrDouble; struct ArrArrBin; struct Vector; struct ArrVector; struct ArrInt32;
 struct ColStr; struct Column; struct ColVector; struct MultiVector; struct ColInt;
 struct ColFloat; struct ColDouble; struct ColMap; struct IndexInfo; struct AuxIndexInfo;
-struct SegmentInfo; struct AnalyzerDef; struct FieldDef; struct VectorParams; struct SchemaDef;
+struct SegmentInfo; struct AnalyzerDef; struct FieldDef; struct SchemaDef;
 struct SchemaRequest; struct SchemaResponse;
 namespace UpdateResponse_ { struct Error; }
 
@@ -121,12 +121,12 @@ namespace CalendarGap_ {
 enum class Unit { UNKNOWN = 0, DAY = 1, WEEK = 2, MONTH = 3, QUARTER = 4, YEAR = 5 };
 }
 namespace UpdateResponse_ { enum class Status { UNKNOWN = 0, OK = 1, PARTIAL = 2, ERROR = 3 }; }
+enum class VectorMetric { NONE = 0, L2 = 1, IP = 2, COSINE = 3 };
 namespace FieldDef_ {
 enum class FieldClass { STRING = 0, TEXT = 1, INT = 2, FLOAT = 3, DOUBLE = 4, BIN = 5, ID = 6, VECTOR = 7, DATE = 8, GEO_POINT = 9 };
-enum class IndexMode { UNSET = 0, NONE = 1, MATCH = 2, RANGE = 3 };
+enum class IndexMode { NONE = 0, MATCH = 1, RANGE = 2 };
 }
-namespace VectorParams_ { enum class Metric { NONE = 0, L2 = 1, IP = 2, COSINE = 3 }; }
-namespace SchemaRequest_ { enum class Mode { MERGE = 0, REPLACE = 1 }; }
+namespace SchemaRequest_ { enum class Mode { SET = 0, REPLACE_ALL = 1 }; }
 
 // ===================== message definitions (strict topological order) =====================
 
@@ -204,27 +204,22 @@ struct AuxIndexInfo {
   uint64_t built_core_gen = 0;
 };
 struct AnalyzerDef { std::string_view tokenizer; std::span<const std::string_view> filters; };
-struct VectorParams {
-  using Metric = solux::api::VectorParams_::Metric;
-  int32_t dims = 0;
-  Metric metric = Metric::NONE;
-  std::optional<bool> normalized;
-  std::optional<bool> normalize_on_write;
-};
 struct FieldDef {
   using FieldClass = solux::api::FieldDef_::FieldClass;
   using IndexMode = solux::api::FieldDef_::IndexMode;
-  std::string_view name;
+  using Metric = solux::api::VectorMetric;
   std::string_view parent;
   std::optional<AnalyzerDef> analyzer;                          // align 8
   std::string_view stored_resource;
-  std::optional<FieldClass> field_class;                        // align 4 (enum)
+  std::optional<FieldClass> type;                               // align 4 (enum)
   std::optional<IndexMode> index;                               // align 4 (enum)
-  std::optional<VectorParams> vector;                           // align 4
-  bool abstract = false;                                           // align 1 (bools + optional<bool>)
-  std::optional<bool> column_stored;
-  std::optional<bool> multi_valued;
+  std::optional<std::int32_t> dims;                             // align 4
+  std::optional<Metric> metric;                                 // align 4 (enum)
+  std::optional<bool> column;                                   // align 1 (optional<bool>s)
+  std::optional<bool> multi;
   std::optional<bool> stored;
+  std::optional<bool> normalized;
+  std::optional<bool> normalize_on_write;
 };
 struct SegmentInfo {
   uint64_t seg_id = 0;
@@ -263,7 +258,10 @@ struct KnnQuery {                                                // needs Vector
   float min_scan_fraction = 0.0f;
   bool exact = false;
 };
-struct SchemaDef { std::span<const FieldDef> fields; };
+struct SchemaDef {
+  map_view<std::string_view, FieldDef> fields;
+  map_view<std::string_view, FieldDef> templates;
+};
 struct ColVector { std::span<const Vector> v; };
 struct ArrVector { std::span<const Vector> v; };
 struct SchemaResponse { std::optional<SchemaDef> schema; };      // needs SchemaDef
@@ -271,7 +269,7 @@ struct SchemaRequest {                                           // needs Target
   using Mode = solux::api::SchemaRequest_::Mode;
   std::optional<Target> collection;
   std::optional<SchemaDef> schema;
-  Mode mode = Mode::MERGE;                                      // align 4 (enum)
+  Mode mode = Mode::SET;                                      // align 4 (enum)
 };
 struct MultiVector { std::span<const ArrVector> v; };
 struct ColMap { std::span<const Map> v; };                       // span<incomplete Map> OK
@@ -483,7 +481,7 @@ SOLUX_TD(ArrDouble) SOLUX_TD(ArrBin) SOLUX_TD(ArrArrStr) SOLUX_TD(ArrArrInt) SOL
 SOLUX_TD(ArrArrDouble) SOLUX_TD(ArrArrBin) SOLUX_TD(Vector) SOLUX_TD(ArrVector) SOLUX_TD(ArrInt32)
 SOLUX_TD(ColStr) SOLUX_TD(Column) SOLUX_TD(ColVector) SOLUX_TD(MultiVector) SOLUX_TD(ColInt)
 SOLUX_TD(ColFloat) SOLUX_TD(ColDouble) SOLUX_TD(ColMap) SOLUX_TD(IndexInfo) SOLUX_TD(AuxIndexInfo)
-SOLUX_TD(SegmentInfo) SOLUX_TD(AnalyzerDef) SOLUX_TD(FieldDef) SOLUX_TD(VectorParams) SOLUX_TD(SchemaDef)
+SOLUX_TD(SegmentInfo) SOLUX_TD(AnalyzerDef) SOLUX_TD(FieldDef) SOLUX_TD(SchemaDef)
 SOLUX_TD(SchemaRequest) SOLUX_TD(SchemaResponse) SOLUX_TD(UpdateResponse_::Error)
 #undef SOLUX_TD
 
@@ -512,7 +510,7 @@ SOLUX_ENTRY(ArrArrFloat) SOLUX_ENTRY(ArrArrDouble) SOLUX_ENTRY(ArrArrBin) SOLUX_
 SOLUX_ENTRY(ArrVector) SOLUX_ENTRY(ArrInt32) SOLUX_ENTRY(ColStr) SOLUX_ENTRY(Column)
 SOLUX_ENTRY(ColVector) SOLUX_ENTRY(MultiVector) SOLUX_ENTRY(ColInt) SOLUX_ENTRY(ColFloat)
 SOLUX_ENTRY(ColDouble) SOLUX_ENTRY(ColMap) SOLUX_ENTRY(IndexInfo) SOLUX_ENTRY(AuxIndexInfo)
-SOLUX_ENTRY(SegmentInfo) SOLUX_ENTRY(AnalyzerDef) SOLUX_ENTRY(FieldDef) SOLUX_ENTRY(VectorParams)
+SOLUX_ENTRY(SegmentInfo) SOLUX_ENTRY(AnalyzerDef) SOLUX_ENTRY(FieldDef)
 SOLUX_ENTRY(SchemaDef) SOLUX_ENTRY(SchemaRequest) SOLUX_ENTRY(SchemaResponse)
 #undef SOLUX_ENTRY
 

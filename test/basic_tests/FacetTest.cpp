@@ -11,6 +11,7 @@
 #include <unordered_map>
 #include <tbb/task_group.h>
 #include <boost/unordered/unordered_flat_map.hpp>
+#include "test/SchemaBuilder.h"
 #include "test/SoluxTest.h"
 #include "test/CollectionHelper.h"
 #include "test/LocalReq.h"
@@ -43,18 +44,15 @@ struct RangeSchemaField {
 
 void setRangeFacetSchema(CollectionHelper& helper,
                          std::span<const RangeSchemaField> fields) {
-  std::pmr::monotonic_buffer_resource arena;
-  api::SchemaDef def;
-  api::FieldDef* defs = api::build::allocArray(def.fields, fields.size(), arena);
-  for (size_t i = 0; i < fields.size(); i++) {
-    defs[i].name = fields[i].name;
-    defs[i].field_class = fields[i].fieldClass;
-    defs[i].index = fields[i].points ? api::FieldDef::IndexMode::RANGE
-                                    : api::FieldDef::IndexMode::NONE;
-    defs[i].multi_valued = fields[i].multi;
+  SchemaBuilder b;
+  for (const auto& fs : fields) {
+    auto& f = b.field(fs.name);
+    f.type = fs.fieldClass;
+    f.index = fs.points ? api::FieldDef::IndexMode::RANGE
+                        : api::FieldDef::IndexMode::NONE;
+    f.multi = fs.multi;
   }
-  helper.collection().setSchema(
-      Schema::fromProto(def, helper.collection().getSchema().get()));
+  b.set(helper.collection());
 }
 
 const api::FacetResult& rootFacetResult(const LocalReq& req,
@@ -2493,19 +2491,15 @@ protected:
                        int maxSegments = MERGE_FACTOR-1, int maxDocsPerSegment = 100) {
     helper.clear();
 
-    std::vector<api::FieldDef> rangeFields;
+    SchemaBuilder b;
     for (const auto& field : fields) {
       if (!field.isInt) continue;
-      auto& def = rangeFields.emplace_back();
-      def.name = field.name;
-      def.field_class = api::FieldDef::FieldClass::INT;
+      auto& def = b.field(field.name);
+      def.type = api::FieldDef::FieldClass::INT;
       def.index = api::FieldDef::IndexMode::RANGE;
-      def.multi_valued = field.multiValued;
+      def.multi = field.multiValued;
     }
-    api::SchemaDef schemaDef;
-    schemaDef.fields = std::span<const api::FieldDef>(rangeFields);
-    helper.collection().setSchema(
-        Schema::fromProto(schemaDef, helper.collection().getSchema().get()));
+    b.set(helper.collection());
     
     // Random number of segments
     int numSegments = rng.rint(1, std::min(maxSegments, MERGE_FACTOR));

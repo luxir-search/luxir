@@ -2,11 +2,20 @@
 
 #include <boost/unordered/unordered_flat_map.hpp>
 #include <memory_resource>
+#include <stdexcept>
 #include "solux/api/solux_types.hpp"
 #include "solux/util/StrRef.h"
 #include "FieldType.h"
 
 namespace solux {
+
+// A user error in a schema definition (unknown parent, bad analyzer name,
+// reserved-field violation, ...).  Transports map this to a client error
+// (HTTP 400 / gRPC INVALID_ARGUMENT); other exceptions are server-side.
+class SchemaError : public std::runtime_error {
+public:
+  using std::runtime_error::runtime_error;
+};
 
 // Schema objects are currently immutable after construction.
 class Schema {
@@ -17,7 +26,7 @@ public:
 
   map_type fieldTypeMap;
   uint64_t gen_ = 0;          // schema generation, set when persisted
-  std::string sourceDef_;     // serialized bytes of the original SchemaDef proto (before inheritance resolution)
+  std::string sourceDef_;     // serialized bytes of the authored SchemaDef proto (before inheritance resolution)
 
 public:
   Schema() {};
@@ -27,22 +36,21 @@ public:
   }
 
   // Returns a const_iterator to the FieldType for the fieldName or end() if not found.
-  // Abstract fields are skipped during exact-name lookup but found during suffix matching.
+  // Exact-name lookup matches concrete fields only; suffix matching ("title_w" ->
+  // "_w") matches templates (abstract entries) only.
   const_iterator getFieldType(std::string_view fieldName) const {
     auto it = fieldTypeMap.find(fieldName);
     if (it != fieldTypeMap.end()) {
       if (it->second->isAbstract()) return fieldTypeMap.end();
       return it;
     }
-    // Not found - try a suffix match
+    // Not found - try a suffix match against templates
     auto underscorePos = fieldName.find_last_of('_');
     if (underscorePos != std::string_view::npos && underscorePos > 0) {
       std::string_view suffix = fieldName.substr(underscorePos);
-      if (!suffix.empty()) {
-        it = fieldTypeMap.find(suffix);
-        if (it != fieldTypeMap.end()) {
-          return it;
-        }
+      it = fieldTypeMap.find(suffix);
+      if (it != fieldTypeMap.end() && it->second->isAbstract()) {
+        return it;
       }
     }
     return fieldTypeMap.end();
@@ -77,11 +85,19 @@ public:
     return it->second.get();
   }
 
-  // Build a Schema from a SchemaDef proto.
-  // If base is provided (MERGE mode), start from the base schema's fields.
+  // Build a Schema from a SchemaDef proto (fields + templates maps).
+  // If base is provided (SET mode), the def is unioned into the base's
+  // AUTHORED source def by name (a name in the def replaces the base entry
+  // wherever it lived) and the whole merged graph is re-resolved, so replacing
+  // a template also rebuilds fields that inherit from it.  The reserved "id"
+  // and "_version_" fields are materialized when absent and validated when
+  // present.  Throws SchemaError on definition errors.
   static std::shared_ptr<Schema> fromProto(const solux::api::SchemaDef& def, const Schema* base = nullptr);
 
-  // Serialize this schema to a SchemaDef proto (all fields, including dynamic suffix fields).
+  // Emit the AUTHORED source def (parents and sparse presence preserved,
+  // deterministic order: fields = id, _version_, then alpha; templates alpha).
+  // This is what GET /_schema and gRPC SchemaResponse return; it is a valid
+  // fromProto input that reproduces this schema exactly.
   void toProto(solux::api::SchemaDef* def, std::pmr::memory_resource& arena) const;
 
   // Create the default schema with built-in fields.

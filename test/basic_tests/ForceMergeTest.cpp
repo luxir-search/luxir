@@ -12,6 +12,7 @@
 #include "solux/util/Signal.h"
 #include "test/CollectionHelper.h"
 #include "test/LocalReq.h"
+#include "test/SchemaBuilder.h"
 #include "test/SoluxTest.h"
 #include "test/TestUtils.h"
 
@@ -38,16 +39,12 @@ bool addSegment(CollectionHelper& helper, std::string_view prefix, int count) {
 }
 
 void enableL2VectorSuffix(Collection& collection) {
-  std::pmr::monotonic_buffer_resource arena;
-  solux::api::SchemaDef definition;
-  auto* field = solux::api::build::allocArray(definition.fields, 1, arena);
-  field->name = "_v";
-  field->field_class = solux::api::FieldDef_::FieldClass::VECTOR;
-  field->abstract = true;
-  field->column_stored = true;
-  field->vector.emplace().metric = solux::api::VectorParams_::Metric::L2;
-  auto base = collection.getSchema();
-  collection.setSchema(Schema::fromProto(definition, base.get()));
+  SchemaBuilder b;
+  auto& f = b.templ("_v");
+  f.type = solux::api::FieldDef_::FieldClass::VECTOR;
+  f.column = true;
+  f.metric = solux::api::VectorMetric::L2;
+  b.set(collection);
 }
 
 class AsyncForceCommit final : public UpdateMessage {

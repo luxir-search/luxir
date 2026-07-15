@@ -478,7 +478,7 @@ public:
       // local copy; the caller's span is unmodified.
       std::vector<float> queryBuf;
       const float* queryPtr = query.getQueryVec().data();
-      if (metric == (int32_t)solux::api::VectorParams_::Metric::COSINE) {
+      if (metric == (int32_t)solux::api::VectorMetric::COSINE) {
         queryBuf.assign(query.getQueryVec().begin(), query.getQueryVec().end());
         faiss::fvec_renorm_L2((size_t)dims, 1, queryBuf.data());
         queryPtr = queryBuf.data();
@@ -2130,13 +2130,13 @@ private:
     assert(queryPtr != nullptr);
     assert((int32_t)vec.size() == dims);
     switch (metric) {
-      case (int32_t)solux::api::VectorParams_::Metric::L2: {
+      case (int32_t)solux::api::VectorMetric::L2: {
         float dist = faiss::fvec_L2sqr(queryPtr, vec.data(), (size_t)dims);
         return finiteScore(1.0f / (1.0f + dist));
       }
-      case (int32_t)solux::api::VectorParams_::Metric::IP:
+      case (int32_t)solux::api::VectorMetric::IP:
         return finiteScore(faiss::fvec_inner_product(queryPtr, vec.data(), (size_t)dims));
-      case (int32_t)solux::api::VectorParams_::Metric::COSINE: {
+      case (int32_t)solux::api::VectorMetric::COSINE: {
         float sum = faiss::fvec_inner_product(queryPtr, vec.data(), (size_t)dims);
         if (!normalizeColumnOnCosineRescore) return finiteScore(sum);
 
@@ -2184,10 +2184,10 @@ private:
   // NaN distances map to the worst score (see finiteScore).
   static float scoreFromDist(float dist, int32_t metric) {
     switch (metric) {
-      case (int32_t)solux::api::VectorParams_::Metric::L2:
+      case (int32_t)solux::api::VectorMetric::L2:
         return finiteScore(1.0f / (1.0f + dist));
-      case (int32_t)solux::api::VectorParams_::Metric::IP:
-      case (int32_t)solux::api::VectorParams_::Metric::COSINE:
+      case (int32_t)solux::api::VectorMetric::IP:
+      case (int32_t)solux::api::VectorMetric::COSINE:
       default:
         return finiteScore(dist);
     }

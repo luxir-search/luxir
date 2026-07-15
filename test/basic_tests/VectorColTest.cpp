@@ -2,11 +2,12 @@
 
 #include <deque>
 
+#include "test/CollectionHelper.h"
+#include "test/LocalReq.h"
+#include "test/SchemaBuilder.h"
 #include "test/SoluxTest.h"
 #include "test/TestIndex.h"
 #include "test/TestUtils.h"
-#include "test/CollectionHelper.h"
-#include "test/LocalReq.h"
 #include "solux/index/handler/VectorHandler.h"
 #include "solux/reader/VectorReader.h"
 #include "solux/reader/FieldReader.h"
@@ -44,19 +45,13 @@ static void indexVal(Inverter& inverter, Inverter::IndexHandler& handler, const 
 }
 
 static void enableCosineOnVecSuffix(Collection& col, bool normalizeOnWrite = true) {
-  std::pmr::monotonic_buffer_resource mr;
-  solux::api::SchemaDef def;
-  auto* f = solux::api::build::allocArray(def.fields, 1, mr);
-  f->name = "_v";
-  f->field_class = solux::api::FieldDef_::FieldClass::VECTOR;
-  f->abstract = true;
-  f->column_stored = true;
-  auto& vector = f->vector.emplace();
-  vector.metric = solux::api::VectorParams_::Metric::COSINE;
-  vector.normalize_on_write = normalizeOnWrite;
-
-  auto base = col.getSchema();
-  col.setSchema(Schema::fromProto(def, base.get()));
+  SchemaBuilder b;
+  auto& f = b.templ("_v");
+  f.type = solux::api::FieldDef_::FieldClass::VECTOR;
+  f.column = true;
+  f.metric = solux::api::VectorMetric::COSINE;
+  f.normalize_on_write = normalizeOnWrite;
+  b.set(col);
 }
 
 // Index a multi-valued vector value (arr_vec) for the given doc.
@@ -390,15 +385,12 @@ TEST_F(VectorColTest, grpcMultiFieldsRoundTrip) {
 TEST_F(VectorColTest, cosineDefaultsToNormalizedColumnStorage) {
   CollectionHelper h("main");
 
-  std::pmr::monotonic_buffer_resource mr;
-  solux::api::SchemaDef def;
-  auto* f = solux::api::build::allocArray(def.fields, 1, mr);
-  f->name = "_v";
-  f->field_class = solux::api::FieldDef_::FieldClass::VECTOR;
-  f->abstract = true;
-  f->column_stored = true;
-  f->vector.emplace().metric = solux::api::VectorParams_::Metric::COSINE;
-  h.collection().setSchema(Schema::fromProto(def, h.collection().getSchema().get()));
+  SchemaBuilder b;
+  auto& f = b.templ("_v");
+  f.type = solux::api::FieldDef_::FieldClass::VECTOR;
+  f.column = true;
+  f.metric = solux::api::VectorMetric::COSINE;
+  b.set(h.collection());
 
   Doc doc = flatdoc("id", std::string("a"), "vec_v", std::vector<float>{3.0f, 4.0f});
   h.index(doc, UpdateMessage::COMMIT);
@@ -445,23 +437,18 @@ TEST_F(VectorColTest, cosineNormalizeOnWriteFalseKeepsRawColumnStorage) {
 TEST_F(VectorColTest, cosineNormalizedFlagKeepsRawColumnStorage) {
   CollectionHelper h("main");
 
-  std::pmr::monotonic_buffer_resource mr;
-  solux::api::SchemaDef def;
-  auto* f = solux::api::build::allocArray(def.fields, 1, mr);
-  f->name = "_v";
-  f->field_class = solux::api::FieldDef_::FieldClass::VECTOR;
-  f->abstract = true;
-  f->column_stored = true;
-  auto& vector = f->vector.emplace();
-  vector.metric = solux::api::VectorParams_::Metric::COSINE;
-  vector.normalized = true;
+  SchemaBuilder b;
+  auto& f = b.templ("_v");
+  f.type = solux::api::FieldDef_::FieldClass::VECTOR;
+  f.column = true;
+  f.metric = solux::api::VectorMetric::COSINE;
+  f.normalized = true;
 
-  auto schema = Schema::fromProto(def, h.collection().getSchema().get());
+  auto schema = b.set(h.collection());
   auto* ft = dynamic_cast<VectorFieldType*>(schema->getFieldTypePtr("vec_v"));
   ASSERT_NE(nullptr, ft);
   EXPECT_TRUE(ft->normalized());
   EXPECT_FALSE(ft->normalizeOnWrite());
-  h.collection().setSchema(schema);
 
   Doc doc = flatdoc("id", std::string("a"), "vec_v", std::vector<float>{3.0f, 4.0f});
   h.index(doc, UpdateMessage::COMMIT);
@@ -487,15 +474,12 @@ TEST_F(VectorColTest, cosineNormalizedFlagKeepsRawColumnStorage) {
 TEST_F(VectorColTest, cosineSkipsZeroVector) {
   CollectionHelper h("main");
 
-  std::pmr::monotonic_buffer_resource mr;
-  solux::api::SchemaDef def;
-  auto* f = solux::api::build::allocArray(def.fields, 1, mr);
-  f->name = "_v";
-  f->field_class = solux::api::FieldDef_::FieldClass::VECTOR;
-  f->abstract = true;
-  f->column_stored = true;
-  f->vector.emplace().metric = solux::api::VectorParams_::Metric::COSINE;
-  h.collection().setSchema(Schema::fromProto(def, h.collection().getSchema().get()));
+  SchemaBuilder b;
+  auto& f = b.templ("_v");
+  f.type = solux::api::FieldDef_::FieldClass::VECTOR;
+  f.column = true;
+  f.metric = solux::api::VectorMetric::COSINE;
+  b.set(h.collection());
 
   // Doc "a" has a zero vector (skipped); doc "b" has a usable one (kept).
   {
@@ -545,17 +529,14 @@ TEST_F(VectorColTest, cosineNormalizedFlagTrustsZeroVector) {
 
 // Schema round-trip: toProto/fromProto preserves VECTOR field with dims.
 TEST_F(VectorColTest, schemaProtoRoundTrip) {
-  std::pmr::monotonic_buffer_resource mr;
-  solux::api::SchemaDef def;
-  auto* f = solux::api::build::allocArray(def.fields, 1, mr);
-  f->name = "embedding";
-  f->field_class = solux::api::FieldDef_::FieldClass::VECTOR;
-  f->column_stored = true;
-  auto& vector = f->vector.emplace();
-  vector.dims = 384;
-  vector.metric = solux::api::VectorParams_::Metric::COSINE;
+  SchemaBuilder b;
+  auto& f = b.field("embedding");
+  f.type = solux::api::FieldDef_::FieldClass::VECTOR;
+  f.column = true;
+  f.dims = 384;
+  f.metric = solux::api::VectorMetric::COSINE;
 
-  auto schema = Schema::fromProto(def);
+  auto schema = b.build();
   auto it = schema->getFieldType("embedding");
   ASSERT_NE(it, schema->end());
   auto* vft = dynamic_cast<VectorFieldType*>(it->second.get());
@@ -569,18 +550,15 @@ TEST_F(VectorColTest, schemaProtoRoundTrip) {
   solux::api::SchemaDef outDef;
   std::pmr::monotonic_buffer_resource outMr;
   schema->toProto(&outDef, outMr);
-  bool found = false;
-  for (const auto& field : outDef.fields) {
-    if (field.name == "embedding") {
-      ASSERT_TRUE(field.field_class.has_value());
-      ASSERT_TRUE(field.vector.has_value());
-      EXPECT_EQ(solux::api::FieldDef_::FieldClass::VECTOR, *field.field_class);
-      EXPECT_EQ(384, field.vector->dims);
-      EXPECT_EQ(solux::api::VectorParams_::Metric::COSINE, field.vector->metric);
-      ASSERT_TRUE(field.vector->normalize_on_write.has_value());
-      EXPECT_TRUE(*field.vector->normalize_on_write);
-      found = true;
-    }
-  }
-  EXPECT_TRUE(found);
+  const auto* fd = outDef.fields.find("embedding");
+  ASSERT_NE(nullptr, fd);
+  ASSERT_TRUE(fd->type.has_value());
+  EXPECT_EQ(solux::api::FieldDef_::FieldClass::VECTOR, *fd->type);
+  ASSERT_TRUE(fd->dims.has_value());
+  EXPECT_EQ(384, *fd->dims);
+  ASSERT_TRUE(fd->metric.has_value());
+  EXPECT_EQ(solux::api::VectorMetric::COSINE, *fd->metric);
+  // toProto emits the authored sparse def: normalize_on_write was never set
+  // (the on-write default is derived from COSINE), so it round-trips as absent.
+  EXPECT_FALSE(fd->normalize_on_write.has_value());
 }

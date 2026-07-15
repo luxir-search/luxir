@@ -3,6 +3,7 @@
 #include "test/CollectionHelper.h"
 #include "test/DurableIndexInfo.h"
 #include "test/LocalReq.h"
+#include "test/SchemaBuilder.h"
 #include "test/TestUtils.h"
 #include "solux/index/IndexWriter.h"
 #include "solux/index/UpdateMessage.h"
@@ -231,19 +232,14 @@ const solux::api::AuxIndexInfo& onlyVectorOverlay(const IndexInfoHolder& info) {
 
 // Install a schema where _v has metric=L2.
 void enableL2OnVecSuffix(Collection& col) {
-  std::pmr::monotonic_buffer_resource mr;
-  solux::api::SchemaDef def;
-  auto* f = solux::api::build::allocArray(def.fields, 1, mr);
-  f->name = "_v";
-  f->field_class = solux::api::FieldDef_::FieldClass::VECTOR;
-  f->abstract = true;
-  f->column_stored = true;
-  f->vector.emplace().metric = solux::api::VectorParams_::Metric::L2;
-
-  // fromProto with the existing schema as base preserves all built-in fields and
-  // overrides _v with the metric-bearing definition.
-  auto base = col.getSchema();
-  col.setSchema(Schema::fromProto(def, base.get()));
+  SchemaBuilder b;
+  auto& f = b.templ("_v");
+  f.type = solux::api::FieldDef_::FieldClass::VECTOR;
+  f.column = true;
+  f.metric = solux::api::VectorMetric::L2;
+  // Merge preserves all built-in fields and overrides _v with the
+  // metric-bearing definition.
+  b.set(col);
 }
 
 std::vector<std::string> runKnnIds(SearchEngine& engine, std::string_view field,
@@ -415,7 +411,7 @@ TEST_F(VectorIndexBuilderTest, buildAcrossMultipleSegments) {
 
     auto meta = readVectorAuxMeta(*aux);
     EXPECT_EQ(meta.dims, 3);
-    EXPECT_EQ(meta.metric, (int32_t)solux::api::VectorParams_::Metric::L2);
+    EXPECT_EQ(meta.metric, (int32_t)solux::api::VectorMetric::L2);
     EXPECT_EQ(meta.cosineNormalizeColumnOnRescore, 0);
   }
 }
@@ -1183,15 +1179,12 @@ TEST_F(VectorIndexBuilderTest, cosineNormalizeOnWriteBuildsInnerProductIndex) {
   CollectionHelper h("main");
 
   // Schema: _v with metric=COSINE.
-  std::pmr::monotonic_buffer_resource mr;
-  solux::api::SchemaDef def;
-  auto* f = solux::api::build::allocArray(def.fields, 1, mr);
-  f->name = "_v";
-  f->field_class = solux::api::FieldDef_::FieldClass::VECTOR;
-  f->abstract = true;
-  f->column_stored = true;
-  f->vector.emplace().metric = solux::api::VectorParams_::Metric::COSINE;
-  h.collection().setSchema(Schema::fromProto(def, h.collection().getSchema().get()));
+  SchemaBuilder b;
+  auto& f = b.templ("_v");
+  f.type = solux::api::FieldDef_::FieldClass::VECTOR;
+  f.column = true;
+  f.metric = solux::api::VectorMetric::COSINE;
+  b.set(h.collection());
 
   for (int i = 0; i < 80; i++) {
     h.index(flatdoc("id", "doc" + std::to_string(i),
@@ -1214,17 +1207,13 @@ TEST_F(VectorIndexBuilderTest, normalizedFlagSkipsRenorm) {
   IvfPqGuard guard(/*nlist=*/2, /*m=*/1, /*bits=*/1, /*nprobe=*/2, /*minTraining=*/2);
   CollectionHelper h("main");
 
-  std::pmr::monotonic_buffer_resource mr;
-  solux::api::SchemaDef def;
-  auto* f = solux::api::build::allocArray(def.fields, 1, mr);
-  f->name = "_v";
-  f->field_class = solux::api::FieldDef_::FieldClass::VECTOR;
-  f->abstract = true;
-  f->column_stored = true;
-  auto& vector = f->vector.emplace();
-  vector.metric = solux::api::VectorParams_::Metric::COSINE;
-  vector.normalized = true;
-  h.collection().setSchema(Schema::fromProto(def, h.collection().getSchema().get()));
+  SchemaBuilder b;
+  auto& f = b.templ("_v");
+  f.type = solux::api::FieldDef_::FieldClass::VECTOR;
+  f.column = true;
+  f.metric = solux::api::VectorMetric::COSINE;
+  f.normalized = true;
+  b.set(h.collection());
 
   for (int i = 0; i < 80; i++) {
     h.index(flatdoc("id", "doc" + std::to_string(i),
@@ -1282,17 +1271,13 @@ TEST_F(VectorIndexBuilderTest, cosineRenormChunkBoundaries) {
 
   CollectionHelper h("main");
 
-  std::pmr::monotonic_buffer_resource mr;
-  solux::api::SchemaDef def;
-  auto* f = solux::api::build::allocArray(def.fields, 1, mr);
-  f->name = "_v";
-  f->field_class = solux::api::FieldDef_::FieldClass::VECTOR;
-  f->abstract = true;
-  f->column_stored = true;
-  auto& vector = f->vector.emplace();
-  vector.metric = solux::api::VectorParams_::Metric::COSINE;
-  vector.normalize_on_write = false;
-  h.collection().setSchema(Schema::fromProto(def, h.collection().getSchema().get()));
+  SchemaBuilder b;
+  auto& f = b.templ("_v");
+  f.type = solux::api::FieldDef_::FieldClass::VECTOR;
+  f.column = true;
+  f.metric = solux::api::VectorMetric::COSINE;
+  f.normalize_on_write = false;
+  b.set(h.collection());
 
   std::vector<std::vector<float>> vecs = {
     {3, 0, 0, 0}, {0, 5, 0, 0}, {0, 0, 7, 0}, {0, 0, 0, 9},

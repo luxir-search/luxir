@@ -879,10 +879,22 @@ message AnalyzerDef {
   repeated string filters = 2;    // e.g., ["lowercase"] - applied in order
 }
 
+// Vector similarity metric.  NONE = storage-only, not kNN-searchable;
+// L2 / IP / COSINE select the metric for exact column search and any
+// aux-backed ANN engine.  (File-scope because proto enum values scope to the
+// enclosing message, and FieldDef.IndexMode already claims NONE.)
+enum VectorMetric {
+  NONE = 0;
+  L2 = 1;
+  IP = 2;
+  COSINE = 3;
+}
+
+// A field (or template) definition.  The field's name is the SchemaDef map key,
+// not a member.  Every property is optional-presence: absent means "inherit from
+// parent, else the type's default"; JSON enum values are lowercase ("text").
 message FieldDef {
-  string name = 1;              // field name ("title") or dynamic suffix ("_s", "_wl")
-  string parent = 2;            // inherit properties from this field
-  bool abstract = 3;            // if true, only usable via suffix matching or inheritance
+  string parent = 1;            // inherit properties from this field or template
 
   enum FieldClass {
     STRING = 0;    // unanalyzed string
@@ -896,76 +908,78 @@ message FieldDef {
     DATE = 8;      // timestamp, stored as int64 milliseconds since the Unix epoch
     GEO_POINT = 9; // latitude/longitude point, packed into one int64 column value
   }
-  optional FieldClass field_class = 4;  // if unset (default), inherited from parent
+  optional FieldClass type = 2;  // if unset, inherited from parent
 
   // Which query classes are index-accelerated for this field.  Values name the
   // result contract, not the structure: NONE still answers Match / Range
-  // queries through a column scan when column_stored is set, just without an
+  // queries through a column scan when column is set, just without an
   // index.  RANGE is a superset of MATCH (an exact match is a [v,v] range).
   enum IndexMode {
-    UNSET = 0;   // same as absent: inherit from parent, else the field_class default
-    NONE = 1;    // no index
-    MATCH = 2;   // Match queries accelerated (term postings; TEXT: analyzed full-text)
-    RANGE = 3;   // Range and Match queries accelerated (numeric / DATE / GEO_POINT fields)
+    NONE = 0;    // no index
+    MATCH = 1;   // Match queries accelerated (term postings; TEXT: analyzed full-text)
+    RANGE = 2;   // Range and Match queries accelerated (numeric / DATE / GEO_POINT fields)
   }
-  optional IndexMode index = 5;
-  optional bool column_stored = 6;
-  optional bool multi_valued = 7;
+  optional IndexMode index = 3;  // absent: inherit from parent, else the type default
 
-  AnalyzerDef analyzer = 8;            // for TEXT fields; if unset, inherited from parent
+  optional bool column = 4;      // store values in a per-field column
+  optional bool multi = 5;       // multi-valued
 
-  optional bool stored = 9;              // if true, raw values are kept in the segment's stored-fields resource
+  AnalyzerDef analyzer = 6;      // for TEXT fields; if unset, inherited from parent
+
+  optional bool stored = 7;      // if true, raw values are kept in the segment's stored-fields resource
 
   // When stored=true, names the target stored-fields resource (StoredFieldType
   // entry in the schema).  Empty / unset means the default "_stored_" resource.
   // Use named resources to group fields into separate column families (e.g.
   // "_stored_embeddings_" for co-located embedding bytes).
-  string stored_resource = 10;
+  string stored_resource = 8;
 
-  // For VECTOR fields.  If unset, dims is inferred per-segment from the first
-  // indexed value; within a segment all vectors must share the same dims.
-  VectorParams vector = 11;
-}
+  // --- VECTOR fields ---
 
-message VectorParams {
-  // Vector dimensionality.  0 / unset means "infer from first indexed value";
+  // Vector dimensionality.  Absent/0 means "infer from first indexed value";
   // a positive value enforces strict validation at index time.
-  int32 dims = 1;
+  optional int32 dims = 9;
 
-  // Vector similarity metric.  NONE = storage-only, not kNN-searchable;
-  // L2 / IP / COSINE select the metric for exact column search and any
-  // aux-backed ANN engine.
-  enum Metric {
-    NONE = 0;
-    L2 = 1;
-    IP = 2;
-    COSINE = 3;
-  }
-  Metric metric = 2;
+  // Vector similarity metric.  Absent means inherit, else NONE (storage-only).
+  optional VectorMetric metric = 10;
 
   // Caller asserts that all values for this field are already L2-normalized
   // (unit length).  For COSINE, this disables write-time and aux-build
   // normalization.  No effect on non-COSINE metrics.  Trust-only: not
   // validated at index time.
-  optional bool normalized = 3;
+  optional bool normalized = 11;
 
   // For COSINE fields, normalize vectors before storing them in the column.
   // If unset, COSINE defaults to true unless normalized is true; other metrics
   // default to false.  A cosine field skips and logs zero / near-zero vectors
   // when normalized is false.
-  optional bool normalize_on_write = 4;
+  optional bool normalize_on_write = 12;
 }
 
 message SchemaDef {
-  repeated FieldDef fields = 1;
+  // Concrete fields, keyed by field name.  Exact-name lookup consults only this
+  // map.  The reserved "id" and "_version_" fields are always materialized: a
+  // REPLACE_ALL that omits them gets the defaults; redefining them incompatibly, or
+  // defining a second ID-class field, is an error.
+  map<string, FieldDef> fields = 1;
+
+  // Abstract definitions, keyed by template name.  Never directly usable as a
+  // doc field; suffix matching ("title_w" -> "_w") consults only this map, and
+  // any field/template may name one as parent.  A name in both maps is an error.
+  map<string, FieldDef> templates = 2;
 }
 
 message SchemaRequest {
   Target collection = 1;
 
   enum Mode {
-    MERGE = 0;     // add/update fields, keep existing fields not in this request
-    REPLACE = 1;   // replace entire schema with this definition
+    // Each named definition is SET to exactly the request's definition
+    // (whole-definition, never a property-level merge); definitions not named
+    // in the request are untouched.
+    SET = 0;
+    // Replace the entire schema with this definition (the reserved id and
+    // _version_ fields are materialized when omitted).
+    REPLACE_ALL = 1;
   }
   Mode mode = 2;
   SchemaDef schema = 3;

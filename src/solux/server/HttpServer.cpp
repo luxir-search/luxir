@@ -26,7 +26,10 @@
 #include <boost/asio/post.hpp>
 #include <boost/asio/dispatch.hpp>
 
+#include <glaze/json/prettify.hpp>
+
 #include "solux/util/log.h"
+#include "solux/schema/Schema.h"
 #include "solux/search/SearchEngine.h"
 #include "solux/search/SearchRequest.h"
 #include "JsonRequest.h"
@@ -394,11 +397,15 @@ private:
   }
 
   static bool parseQueryPath(std::string_view target, std::string& coll) {
-    return parseCollectionPath(target, "/query", coll);
+    return parseCollectionPath(target, "/_query", coll);
   }
 
   static bool parseUpdatePath(std::string_view target, std::string& coll) {
-    return parseCollectionPath(target, "/update", coll);
+    return parseCollectionPath(target, "/_update", coll);
+  }
+
+  static bool parseSchemaPath(std::string_view target, std::string& coll) {
+    return parseCollectionPath(target, "/_schema", coll);
   }
 
   static std::string_view trimHeaderValue(std::string_view v) {
@@ -515,6 +522,31 @@ private:
       }
     } else if (req.method() == http::verb::post && parseUpdatePath(target, coll)) {
       handleUpdate(req.body(), coll);
+    } else if (parseSchemaPath(target, coll)) {
+      // Writes are POST; the operation is the visible, typeable ?mode= param,
+      // never an invisible HTTP verb.  mode=set (the default, and curl's
+      // zero-flag path) sets each named definition exactly; the destructive
+      // mode=replace_all must be typed.  PUT/PATCH are reserved.
+      if (req.method() == http::verb::get) {
+        handleSchemaGet(coll);
+      } else if (req.method() == http::verb::post) {
+        auto mode = solux::api::SchemaRequest_::Mode::SET;
+        if (const std::string* m = findParam(params, "mode")) {
+          if (*m == "replace_all") {
+            mode = solux::api::SchemaRequest_::Mode::REPLACE_ALL;
+          } else if (*m != "set") {
+            respondSimple(http::status::bad_request, "application/json",
+                          renderErrorBody("unknown mode '" + *m + "' (valid: set, replace_all)"));
+            return;
+          }
+        }
+        handleSchemaSet(req.body(), coll, mode);
+      } else {
+        respondMethodNotAllowed(
+            "GET, POST",
+            "method not allowed; schema writes are POST (mode=set adds or replaces the "
+            "named definitions, mode=replace_all replaces the whole schema)");
+      }
     } else {
       respondSimple(http::status::not_found, "application/json",
                     renderErrorBody("not found"));
@@ -640,6 +672,114 @@ private:
             self->respondSimple(status, "application/json", std::move(body));
           });
     });
+  }
+
+  // ---- /_schema -------------------------------------------------------------
+  // The schema JSON is a for-humans surface (it gets pasted into forums and
+  // docs), so responses are pretty-printed.  GET output is a valid write body:
+  // both directions speak the authored source form (Schema::toProto), and
+  // POSTing a GET body back is a no-op under either mode.
+
+  static std::string renderSchemaBody(Schema& schema) {
+    std::pmr::monotonic_buffer_resource arena;
+    solux::api::SchemaDef def;
+    schema.toProto(&def, arena);
+    std::string compact;
+    if (!solux::api::write_json(def, compact)) {
+      throw std::runtime_error("failed to serialize schema");
+    }
+    std::string pretty;
+    glz::prettify_json(compact, pretty);
+    pretty += '\n';
+    return pretty;
+  }
+
+  void handleSchemaGet(const std::string& coll) {
+    // Read-only: never creates the collection, and the schema is an atomic
+    // load + pure render, so this runs inline on the io thread.
+    http::status status = http::status::ok;
+    std::string out;
+    try {
+      std::pmr::monotonic_buffer_resource targetResource;
+      std::optional<solux::api::Target> target;
+      setCollectionTarget(target, coll, targetResource);
+      auto collection = node_.resolveCollection(&*target);
+      auto schema = collection->getSchema();
+      out = renderSchemaBody(*schema);
+    } catch (const CollectionResolutionError& e) {
+      status = http::status::not_found;
+      out = renderErrorBody(e.what());
+    } catch (const std::exception& e) {
+      status = http::status::internal_server_error;
+      out = renderErrorBody(e.what());
+    }
+    respondSimple(status, "application/json", std::move(out));
+  }
+
+  void handleSchemaSet(const std::string& body, const std::string& coll,
+                       solux::api::SchemaRequest_::Mode mode) {
+    struct SchemaSetState {
+      std::pmr::monotonic_buffer_resource resource;
+      solux::api::SchemaDef def;  // non-owning; backed by `resource`
+    };
+    auto state = std::make_shared<SchemaSetState>();
+    try {
+      std::string err;
+      if (!solux::api::read_json(state->def, body, state->resource, &err)) {
+        throw std::runtime_error(err.empty() ? "malformed schema" : err);
+      }
+    } catch (const std::exception& e) {
+      respondSimple(http::status::bad_request, "application/json",
+                    renderErrorBody(e.what()));
+      return;
+    }
+
+    // updateSchema persists (fsync) under the collection's schema lock, so run
+    // it off the io thread like handleUpdate.
+    auto ioPin = makeIoPin();
+    node_.getTaskArena().enqueue([self = shared_from_this(), state, ioPin, mode, coll] {
+      http::status status = http::status::ok;
+      std::string out;
+      try {
+        std::pmr::monotonic_buffer_resource targetResource;
+        std::optional<solux::api::Target> target;
+        setCollectionTarget(target, coll, targetResource);
+        auto collection = self->node_.resolveOrCreateCollection(&*target);
+        auto newSchema = collection->updateSchema(state->def, mode);
+        out = renderSchemaBody(*newSchema);
+      } catch (const SchemaError& e) {
+        status = http::status::bad_request;
+        out = renderErrorBody(e.what());
+      } catch (const CollectionResolutionError& e) {
+        status = http::status::bad_request;
+        out = renderErrorBody(e.what());
+      } catch (const std::exception& e) {
+        status = http::status::internal_server_error;
+        out = renderErrorBody(e.what());
+      }
+
+      net::post(self->stream_.get_executor(),
+          [self, ioPin, status, body = std::move(out)]() mutable {
+            self->respondSimple(status, "application/json", std::move(body));
+          });
+    });
+  }
+
+  void respondMethodNotAllowed(std::string_view allow, std::string_view message) {
+    auto resp = std::make_shared<http::response<http::string_body>>(
+        http::status::method_not_allowed, httpVersion_);
+    resp->set(http::field::server, "solux");
+    resp->set(http::field::content_type, "application/json");
+    resp->set(http::field::allow, allow);
+    resp->keep_alive(keepAlive_);
+    resp->body() = renderErrorBody(message);
+    resp->prepare_payload();
+    http::async_write(stream_, *resp,
+        [self = shared_from_this(), resp](beast::error_code ec, std::size_t) {
+          if (ec) { self->doClose(); return; }
+          if (resp->keep_alive()) self->doRead();
+          else self->doClose();
+        });
   }
 
   static std::int32_t cappedErrorIndex(std::size_t index) {

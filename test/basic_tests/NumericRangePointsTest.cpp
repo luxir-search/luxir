@@ -3,21 +3,19 @@
 #include <algorithm>
 #include <array>
 #include <cstdint>
-#include <memory_resource>
 #include <optional>
 #include <span>
 #include <string_view>
 #include <vector>
 
-#include "solux/api/build.h"
 #include "solux/index/PointsWriter.h"
 #include "solux/query/NumericRangeQuery.h"
 #include "solux/query/QueryPrep.h"
 #include "solux/reader/FieldReader.h"
 #include "solux/reader/PointsReader.h"
-#include "solux/schema/Schema.h"
 #include "solux/util/random.h"
 #include "test/CollectionHelper.h"
+#include "test/SchemaBuilder.h"
 #include "test/SoluxTest.h"
 
 using namespace solux;
@@ -43,17 +41,14 @@ struct QueryState {
 };
 
 void setRangeSchema(CollectionHelper& helper, std::span<const RangeField> fields) {
-  std::pmr::monotonic_buffer_resource arena;
-  api::SchemaDef def;
-  api::FieldDef* defs = api::build::allocArray(def.fields, fields.size(), arena);
-  for (size_t i = 0; i < fields.size(); i++) {
-    defs[i].name = fields[i].name;
-    defs[i].field_class = api::FieldDef::FieldClass::INT;
-    defs[i].index = api::FieldDef::IndexMode::RANGE;
-    defs[i].multi_valued = fields[i].multi;
+  SchemaBuilder b;
+  for (const auto& fs : fields) {
+    auto& f = b.field(fs.name);
+    f.type = api::FieldDef::FieldClass::INT;
+    f.index = api::FieldDef::IndexMode::RANGE;
+    f.multi = fs.multi;
   }
-  helper.collection().setSchema(
-      Schema::fromProto(def, helper.collection().getSchema().get()));
+  b.set(helper.collection());
 }
 
 std::vector<int32_t> collect(Query::Scorer* scorer) {

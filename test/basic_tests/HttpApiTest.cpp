@@ -13,6 +13,7 @@
 #include "test/CollectionHelper.h"
 #include "test/LocalReq.h"
 #include "test/HttpReq.h"
+#include "test/SchemaBuilder.h"
 #include "solux/api/build.h"
 #include "solux/reader/Postings.h"
 #include "solux/schema/Schema.h"
@@ -151,13 +152,13 @@ TEST_F(HttpApiTest, unknownRouteIs404) {
 }
 
 TEST_F(HttpApiTest, malformedJsonIs400) {
-  auto res = httpRequest(port(), http::verb::post, "/collections/main/query", "{not json");
+  auto res = httpRequest(port(), http::verb::post, "/collections/main/_query", "{not json");
   EXPECT_EQ(400, res.result_int());
   EXPECT_NE(res.body().find(R"("error")"), std::string::npos);
 }
 
 TEST_F(HttpApiTest, updateIndexesAndQueryRoundTrip) {
-  auto update = httpRequest(port(), http::verb::post, "/collections/main/update",
+  auto update = httpRequest(port(), http::verb::post, "/collections/main/_update",
       R"({"docs":[{"id":"u1","title_w":"hello world","title_s":"Hello"}],"commit":{}})");
   ASSERT_EQ(200, update.result_int()) << update.body();
   EXPECT_NE(update.body().find(R"("update_version")"), std::string::npos) << update.body();
@@ -170,11 +171,11 @@ TEST_F(HttpApiTest, updateIndexesAndQueryRoundTrip) {
 }
 
 TEST_F(HttpApiTest, facetResponseUsesBucketRows) {
-  auto update = httpRequest(port(), http::verb::post, "/collections/main/update",
+  auto update = httpRequest(port(), http::verb::post, "/collections/main/_update",
       R"({"docs":[{"id":"f1","http_facet_s":"x"},{"id":"f2","http_facet_s":"x"},{"id":"f3","http_facet_s":"y"},{"id":"f4"}],"commit":{}})");
   ASSERT_EQ(200, update.result_int()) << update.body();
 
-  auto response = httpRequest(port(), http::verb::post, "/collections/main/query",
+  auto response = httpRequest(port(), http::verb::post, "/collections/main/_query",
       R"({"ops":{"cats":{"field_facet":{"field":"http_facet_s","limit":-1,"missing":true}}}})");
   ASSERT_EQ(200, response.result_int()) << response.body();
   EXPECT_EQ(
@@ -186,10 +187,10 @@ TEST_F(HttpApiTest, multiCollectionRoutingIsIsolated) {
   SoluxTest::clearCollection("http_route_a");
   SoluxTest::clearCollection("http_route_b");
 
-  auto updateA = httpRequest(port(), http::verb::post, "/collections/http_route_a/update",
+  auto updateA = httpRequest(port(), http::verb::post, "/collections/http_route_a/_update",
       R"({"docs":[{"id":"route-a","title_w":"routeshared token"}],"commit":{}})");
   ASSERT_EQ(200, updateA.result_int()) << updateA.body();
-  auto updateB = httpRequest(port(), http::verb::post, "/collections/http_route_b/update",
+  auto updateB = httpRequest(port(), http::verb::post, "/collections/http_route_b/_update",
       R"({"docs":[{"id":"route-b","title_w":"routeshared token"}],"commit":{}})");
   ASSERT_EQ(200, updateB.result_int()) << updateB.body();
 
@@ -210,7 +211,7 @@ TEST_F(HttpApiTest, multiCollectionRoutingIsIsolated) {
 }
 
 TEST_F(HttpApiTest, autoCreateCollectionDefaultOn) {
-  auto update = httpRequest(port(), http::verb::post, "/collections/http_auto_create_on/update",
+  auto update = httpRequest(port(), http::verb::post, "/collections/http_auto_create_on/_update",
       R"({"docs":[{"id":"auto-on","title_w":"autocreateon token"}],"commit":{}})");
   ASSERT_EQ(200, update.result_int()) << update.body();
   std::shared_ptr<Collection> created;
@@ -234,7 +235,7 @@ TEST_F(HttpApiTest, autoCreateCollectionCanBeDisabled) {
   localServer.start();
 
   auto update = httpRequest(localServer.getPort(), http::verb::post,
-      "/collections/http_auto_create_off/update",
+      "/collections/http_auto_create_off/_update",
       R"({"docs":[{"id":"auto-off","title_w":"autocreateoff token"}],"commit":{}})");
   localServer.shutdown();
 
@@ -273,7 +274,7 @@ TEST_F(HttpApiTest, searchMissingCollectionErrorsWithoutCreating) {
 }
 
 TEST_F(HttpApiTest, leadingUnderscoreCollectionNameIsRejected) {
-  auto update = httpRequest(port(), http::verb::post, "/collections/_reserved/update",
+  auto update = httpRequest(port(), http::verb::post, "/collections/_reserved/_update",
       R"({"docs":[{"id":"bad-reserved","title_w":"reserved token"}],"commit":{}})");
   EXPECT_EQ(400, update.result_int()) << update.body();
   EXPECT_NE(update.body().find("collection '_reserved' is reserved"), std::string::npos)
@@ -302,11 +303,11 @@ TEST_F(HttpApiTest, unsafeCollectionNamesAreRejectedBeforeCreate) {
     EXPECT_NE(update.body().find(message), std::string::npos) << target << " " << update.body();
   };
 
-  expectRejected("/collections/_reserved/update", "reserved");
-  expectRejected("/collections/unsafe/slash/update", "single path component");
-  expectRejected("/collections/../update", "reserved");
-  expectRejected("/collections/" + absolute.string() + "/update", "single path component");
-  expectRejected("/collections//update", "empty");
+  expectRejected("/collections/_reserved/_update", "reserved");
+  expectRejected("/collections/unsafe/slash/_update", "single path component");
+  expectRejected("/collections/../_update", "reserved");
+  expectRejected("/collections/" + absolute.string() + "/_update", "single path component");
+  expectRejected("/collections//_update", "empty");
 
   localServer.shutdown();
 
@@ -328,10 +329,10 @@ TEST_F(HttpApiTest, corruptCollectionTombstonedAtStartup) {
     SoluxNode node(config);
     HttpServer localServer(node, 2, 0);
     localServer.start();
-    auto good = httpRequest(localServer.getPort(), http::verb::post, "/collections/good/update",
+    auto good = httpRequest(localServer.getPort(), http::verb::post, "/collections/good/_update",
         R"({"docs":[{"id":"g1","title_w":"good token"}],"commit":{}})");
     ASSERT_EQ(200, good.result_int()) << good.body();
-    auto bad = httpRequest(localServer.getPort(), http::verb::post, "/collections/bad/update",
+    auto bad = httpRequest(localServer.getPort(), http::verb::post, "/collections/bad/_update",
         R"({"docs":[{"id":"b1","title_w":"bad token"}],"commit":{}})");
     ASSERT_EQ(200, bad.result_int()) << bad.body();
     localServer.shutdown();
@@ -348,17 +349,17 @@ TEST_F(HttpApiTest, corruptCollectionTombstonedAtStartup) {
   HttpServer localServer(node, 2, 0);
   localServer.start();
 
-  auto query = httpRequest(localServer.getPort(), http::verb::post, "/collections/good/query",
+  auto query = httpRequest(localServer.getPort(), http::verb::post, "/collections/good/_query",
       R"({"query":{"match":{"title_w":"good"}},"fields":["id"]})");
   EXPECT_EQ(200, query.result_int()) << query.body();
   EXPECT_NE(query.body().find(R"("g1")"), std::string::npos) << query.body();
 
-  auto badQuery = httpRequest(localServer.getPort(), http::verb::post, "/collections/bad/query",
+  auto badQuery = httpRequest(localServer.getPort(), http::verb::post, "/collections/bad/_query",
       R"({"query":{"match":{"title_w":"bad"}},"fields":["id"]})");
   EXPECT_NE(badQuery.body().find("failed to load"), std::string::npos) << badQuery.body();
 
   // Updates resolve to the tombstone too: no silent re-create over the corrupt data.
-  auto badUpdate = httpRequest(localServer.getPort(), http::verb::post, "/collections/bad/update",
+  auto badUpdate = httpRequest(localServer.getPort(), http::verb::post, "/collections/bad/_update",
       R"({"docs":[{"id":"b2","title_w":"more"}],"commit":{}})");
   EXPECT_NE(badUpdate.body().find("failed to load"), std::string::npos) << badUpdate.body();
   EXPECT_THROW(node.getCollection("bad"), CollectionResolutionError);
@@ -368,48 +369,45 @@ TEST_F(HttpApiTest, corruptCollectionTombstonedAtStartup) {
 }
 
 TEST_F(HttpApiTest, simpleQueryOverJson) {
-  auto update = httpRequest(port(), http::verb::post, "/collections/main/update",
+  auto update = httpRequest(port(), http::verb::post, "/collections/main/_update",
       R"({"docs":[{"id":"s1","title_w":"blade runner"},{"id":"s2","title_w":"running man"}],"commit":{}})");
   ASSERT_EQ(200, update.result_int()) << update.body();
 
   // the simple_query arm parses mechanically from the dialect (no sugar needed)
-  auto res = httpRequest(port(), http::verb::post, "/collections/main/query",
+  auto res = httpRequest(port(), http::verb::post, "/collections/main/_query",
       R"({"query":{"simple_query":{"q":"blade | man","fields":["title_w"]}},"fields":["id"]})");
   ASSERT_EQ(200, res.result_int()) << res.body();
   EXPECT_NE(res.body().find(R"("s1")"), std::string::npos) << res.body();
   EXPECT_NE(res.body().find(R"("s2")"), std::string::npos) << res.body();
 
   // declared degradations are visible on the wire (clamp-and-declare)
-  auto warned = httpRequest(port(), http::verb::post, "/collections/main/query",
+  auto warned = httpRequest(port(), http::verb::post, "/collections/main/_query",
       R"({"query":{"simple_query":{"q":"blade~9","fields":["title_w"]}},"fields":["id"]})");
   ASSERT_EQ(200, warned.result_int()) << warned.body();
   EXPECT_NE(warned.body().find(R"("warnings")"), std::string::npos) << warned.body();
   EXPECT_NE(warned.body().find(R"("fuzzy_clamped")"), std::string::npos) << warned.body();
 
   // never-fails: garbage user input is still a 200 with results, not an error
-  auto garbage = httpRequest(port(), http::verb::post, "/collections/main/query",
+  auto garbage = httpRequest(port(), http::verb::post, "/collections/main/_query",
       R"({"query":{"simple_query":{"q":"re: \"unbalanced ((man","fields":["title_w"]}},"fields":["id"]})");
   ASSERT_EQ(200, garbage.result_int()) << garbage.body();
   EXPECT_NE(garbage.body().find(R"("s2")"), std::string::npos) << garbage.body();
 }
 
 TEST_F(HttpApiTest, geoDistanceQueryOverJson) {
-  std::pmr::monotonic_buffer_resource arena;
-  api::SchemaDef def;
-  api::FieldDef* field = api::build::allocArray(def.fields, 1, arena);
-  field->name = "geo";
-  field->field_class = api::FieldDef::FieldClass::GEO_POINT;
-  field->index = api::FieldDef::IndexMode::RANGE;
-  helper.collection().setSchema(
-      Schema::fromProto(def, helper.collection().getSchema().get()));
+  SchemaBuilder b;
+  auto& field = b.field("geo");
+  field.type = api::FieldDef::FieldClass::GEO_POINT;
+  field.index = api::FieldDef::IndexMode::RANGE;
+  b.set(helper.collection());
 
   auto update = httpRequest(port(), http::verb::post,
-      "/collections/main/update",
+      "/collections/main/_update",
       R"({"docs":[{"id":"ny","geo":[-74.0060,40.7128]},{"id":"la","geo":[-118.2437,34.0522]}],"commit":{}})");
   ASSERT_EQ(200, update.result_int()) << update.body();
 
   auto result = httpRequest(port(), http::verb::post,
-      "/collections/main/query",
+      "/collections/main/_query",
       R"({"query":{"geo_distance":{"field":"geo","lat":40.7128,"lon":-74.0060,"radius_meters":1000}},"fields":["id"]})");
   ASSERT_EQ(200, result.result_int()) << result.body();
   EXPECT_NE(result.body().find(R"("ny")"), std::string::npos) << result.body();
@@ -417,11 +415,11 @@ TEST_F(HttpApiTest, geoDistanceQueryOverJson) {
 }
 
 TEST_F(HttpApiTest, updateDeleteIds) {
-  auto index = httpRequest(port(), http::verb::post, "/collections/main/update",
+  auto index = httpRequest(port(), http::verb::post, "/collections/main/_update",
       R"({"docs":[{"id":"u1","title_w":"delete token"},{"id":"u2","title_w":"delete token"}],"commit":{}})");
   ASSERT_EQ(200, index.result_int()) << index.body();
 
-  auto del = httpRequest(port(), http::verb::post, "/collections/main/update",
+  auto del = httpRequest(port(), http::verb::post, "/collections/main/_update",
       R"({"delete_ids":["u1"],"commit":{}})");
   ASSERT_EQ(200, del.result_int()) << del.body();
 
@@ -433,13 +431,13 @@ TEST_F(HttpApiTest, updateDeleteIds) {
 }
 
 TEST_F(HttpApiTest, malformedUpdateJsonIs400) {
-  auto res = httpRequest(port(), http::verb::post, "/collections/main/update", "{not json");
+  auto res = httpRequest(port(), http::verb::post, "/collections/main/_update", "{not json");
   EXPECT_EQ(400, res.result_int());
   EXPECT_NE(res.body().find(R"("error")"), std::string::npos) << res.body();
 }
 
 TEST_F(HttpApiTest, updateResponseUsesSnakeCase) {
-  auto res = httpRequest(port(), http::verb::post, "/collections/main/update",
+  auto res = httpRequest(port(), http::verb::post, "/collections/main/_update",
       R"({"request_id":"req-1","docs":[{"id":"shape1","title_w":"shape"}],"commit":{}})");
   ASSERT_EQ(200, res.result_int()) << res.body();
   EXPECT_NE(res.body().find(R"("update_version")"), std::string::npos) << res.body();
@@ -453,7 +451,7 @@ TEST_F(HttpApiTest, bufferedMaxSegmentsCommitDurablyPublishesMergedLayout) {
   }
   ASSERT_EQ(3u, helper.durableSegmentCount());
 
-  auto response = httpRequest(port(), http::verb::post, "/collections/main/update",
+  auto response = httpRequest(port(), http::verb::post, "/collections/main/_update",
                               R"({"commit":{"max_segments":1}})");
   ASSERT_EQ(200, response.result_int()) << response.body();
   EXPECT_EQ(1u, helper.durableSegmentCount());
@@ -466,7 +464,7 @@ TEST_F(HttpApiTest, ndjsonEndMaxSegmentsCommitDurablyPublishesMergedLayout) {
   }
   ASSERT_EQ(3u, helper.durableSegmentCount());
 
-  auto response = httpRequest(port(), http::verb::post, "/collections/main/update",
+  auto response = httpRequest(port(), http::verb::post, "/collections/main/_update",
       R"({"_end_":{"commit":{"max_segments":1}}})" "\n", "application/x-ndjson");
   ASSERT_EQ(200, response.result_int()) << response.body();
   EXPECT_EQ(1u, helper.durableSegmentCount());
@@ -479,7 +477,7 @@ TEST_F(HttpApiTest, ndjsonStreamIndexesAndQueries) {
       R"({"id":"n3","title_w":"streamtoken gamma","title_s":"Gamma"})" "\n"
       R"({"_end_":{"commit":{}}})" "\n";
 
-  auto update = httpRequest(port(), http::verb::post, "/collections/main/update",
+  auto update = httpRequest(port(), http::verb::post, "/collections/main/_update",
                             std::move(body), "application/x-ndjson");
   ASSERT_EQ(200, update.result_int()) << update.body();
   EXPECT_NE(update.body().find(R"("update_version")"), std::string::npos) << update.body();
@@ -534,7 +532,7 @@ TEST_F(HttpApiTest, ndjsonStreamFlushesMultipleBatches) {
   body += R"({"_end_":{"commit":{}}})";
   body += '\n';
 
-  auto update = httpRequest(port(), http::verb::post, "/collections/main/update",
+  auto update = httpRequest(port(), http::verb::post, "/collections/main/_update",
                             std::move(body), "application/x-ndjson");
   ASSERT_EQ(200, update.result_int()) << update.body();
 
@@ -568,7 +566,7 @@ TEST_F(HttpApiTest, streamGroupCapsRetainedIdsAcrossBatches) {
   body += R"({"_end_":{"commit":{}}})";
   body += '\n';
 
-  auto update = httpRequest(port(), http::verb::post, "/collections/main/update",
+  auto update = httpRequest(port(), http::verb::post, "/collections/main/_update",
                             std::move(body), "application/x-ndjson");
   ASSERT_EQ(200, update.result_int()) << update.body();
 
@@ -589,7 +587,7 @@ TEST_F(HttpApiTest, ndjsonMalformedRecordIs400) {
       R"({"id":"bad1","title_w":"badtoken"})" "\n"
       "{not json\n";
 
-  auto res = httpRequest(port(), http::verb::post, "/collections/main/update",
+  auto res = httpRequest(port(), http::verb::post, "/collections/main/_update",
                          std::move(body), "application/x-ndjson");
   EXPECT_EQ(400, res.result_int()) << res.body();
   EXPECT_NE(res.body().find(R"("error")"), std::string::npos) << res.body();
@@ -604,7 +602,7 @@ TEST_F(HttpApiTest, ndjsonDocLargerThanReadBuffer) {
       R"({"id":"big1","title_w":"bigtoken","blob_sc":")" + big + R"("})" "\n"
       R"({"_end_":{"commit":{}}})" "\n";
 
-  auto update = httpRequest(port(), http::verb::post, "/collections/main/update",
+  auto update = httpRequest(port(), http::verb::post, "/collections/main/_update",
                             std::move(body), "application/x-ndjson");
   ASSERT_EQ(200, update.result_int()) << update.body().substr(0, 200);
 
@@ -626,7 +624,7 @@ TEST_F(HttpApiTest, oversizedBufferedBodyIs413) {
   stream.expires_after(std::chrono::seconds(10));
 
   std::string header =
-      "POST /collections/main/update HTTP/1.1\r\n"
+      "POST /collections/main/_update HTTP/1.1\r\n"
       "Host: 127.0.0.1\r\n"
       "Content-Type: application/json\r\n"
       "Content-Length: 99000000\r\n"   // ~94 MiB, well past the 32 MiB default
@@ -648,7 +646,7 @@ TEST_F(HttpApiTest, ndjsonRequestIdControlEchoed) {
       R"({"id":"rid1","title_w":"ridtoken"})" "\n"
       R"({"_end_":{"commit":{}}})" "\n";
 
-  auto res = httpRequest(port(), http::verb::post, "/collections/main/update",
+  auto res = httpRequest(port(), http::verb::post, "/collections/main/_update",
                          std::move(body), "application/x-ndjson");
   ASSERT_EQ(200, res.result_int()) << res.body();
   EXPECT_NE(res.body().find(R"("request_id":"stream-req-1")"), std::string::npos)
@@ -663,7 +661,7 @@ TEST_F(HttpApiTest, ndjsonMultipleGroupsReturnMultipleLines) {
       R"({"id":"mg2","title_w":"mgroup token","title_s":"Group 2"})" "\n"
       R"({"_end_":{"commit":{}}})" "\n";
 
-  auto update = httpRequest(port(), http::verb::post, "/collections/main/update",
+  auto update = httpRequest(port(), http::verb::post, "/collections/main/_update",
                             std::move(body), "application/x-ndjson");
   ASSERT_EQ(200, update.result_int()) << update.body();
   auto lines = splitLines(update.body());
@@ -686,7 +684,7 @@ TEST_F(HttpApiTest, ndjsonNoGroupReturnsOneLine) {
       R"({"id":"nog2","title_w":"nogroup token"})" "\n"
       R"({"_end_":{"commit":{}}})" "\n";
 
-  auto update = httpRequest(port(), http::verb::post, "/collections/main/update",
+  auto update = httpRequest(port(), http::verb::post, "/collections/main/_update",
                             std::move(body), "application/x-ndjson");
   ASSERT_EQ(200, update.result_int()) << update.body();
   auto lines = splitLines(update.body());
@@ -703,7 +701,7 @@ TEST_F(HttpApiTest, ndjsonCheckpointMarkerEmitsLineMidStream) {
       R"({"id":"cp2","title_w":"checkpoint token"})" "\n"
       R"({"_end_":{"commit":{}}})" "\n";
 
-  auto update = httpRequest(port(), http::verb::post, "/collections/main/update",
+  auto update = httpRequest(port(), http::verb::post, "/collections/main/_update",
                             std::move(body), "application/x-ndjson");
   ASSERT_EQ(200, update.result_int()) << update.body();
   auto lines = splitLines(update.body());
@@ -732,7 +730,7 @@ TEST_F(HttpApiTest, ndjsonCheckpointStatsAreDeltaNotCumulative) {
       R"({"id":"dlt3","title_w":"deltatoken"})" "\n"
       R"({"_end_":{"commit":{}}})" "\n";
 
-  auto update = httpRequest(port(), http::verb::post, "/collections/main/update",
+  auto update = httpRequest(port(), http::verb::post, "/collections/main/_update",
                             std::move(body), "application/x-ndjson");
   ASSERT_EQ(200, update.result_int()) << update.body();
   auto lines = splitLines(update.body());
@@ -751,7 +749,7 @@ TEST_F(HttpApiTest, ndjsonCheckpointAckArrivesBeforeRequestBodyEnds) {
   stream.expires_after(std::chrono::seconds(10));
 
   std::string header =
-      "POST /collections/main/update HTTP/1.1\r\n"
+      "POST /collections/main/_update HTTP/1.1\r\n"
       "Host: 127.0.0.1\r\n"
       "Content-Type: application/x-ndjson\r\n"
       "Transfer-Encoding: chunked\r\n"
@@ -809,13 +807,13 @@ TEST_F(HttpApiTest, ndjsonMidStreamErrorAfterGroupEmittedIsFinalLine) {
       R"({"_update_":{"request_id":"g2"}})" "\n"
       "{not json\n";
 
-  auto res = httpRequest(port(), http::verb::post, "/collections/main/update",
+  auto res = httpRequest(port(), http::verb::post, "/collections/main/_update",
                          std::move(body), "application/x-ndjson");
   ASSERT_EQ(200, res.result_int()) << res.body();
   auto lines = splitLines(res.body());
   ASSERT_EQ(2u, lines.size()) << res.body();
   EXPECT_NE(lines[0].find(R"("request_id":"g1")"), std::string::npos) << res.body();
-  EXPECT_NE(lines.back().find("ERROR"), std::string::npos) << res.body();
+  EXPECT_NE(lines.back().find(R"("status":"error")"), std::string::npos) << res.body();
   EXPECT_NE(lines.back().find("docs_indexed_so_far"), std::string::npos) << res.body();
 }
 
@@ -825,7 +823,7 @@ TEST_F(HttpApiTest, ndjsonStreamKeepsConnectionAliveAfterFinalLine) {
   tcp::resolver resolver(cioc);
   stream.connect(resolver.resolve("127.0.0.1", std::to_string(port())));
 
-  http::request<http::string_body> updateReq(http::verb::post, "/collections/main/update", 11);
+  http::request<http::string_body> updateReq(http::verb::post, "/collections/main/_update", 11);
   updateReq.set(http::field::host, "127.0.0.1");
   updateReq.set(http::field::content_type, "application/x-ndjson");
   updateReq.body() =
@@ -854,7 +852,7 @@ TEST_F(HttpApiTest, ndjsonStreamKeepsConnectionAliveAfterFinalLine) {
 }
 
 TEST_F(HttpApiTest, ndjsonUpdateControlDecodesFullRequestAndInlineDeletes) {
-  auto seed = httpRequest(port(), http::verb::post, "/collections/main/update",
+  auto seed = httpRequest(port(), http::verb::post, "/collections/main/_update",
       R"({"docs":[{"id":"del-mid","title_w":"deletestream"}],"commit":{}})");
   ASSERT_EQ(200, seed.result_int()) << seed.body();
 
@@ -864,7 +862,7 @@ TEST_F(HttpApiTest, ndjsonUpdateControlDecodesFullRequestAndInlineDeletes) {
       R"({"id":"dup-full","title_w":"fulldecode two"})" "\n"
       R"({"_update_":{"delete_ids":["del-mid"],"commit":{}}})" "\n";
 
-  auto update = httpRequest(port(), http::verb::post, "/collections/main/update",
+  auto update = httpRequest(port(), http::verb::post, "/collections/main/_update",
                             std::move(body), "application/x-ndjson");
   ASSERT_EQ(200, update.result_int()) << update.body();
   auto lines = splitLines(update.body());
@@ -889,7 +887,7 @@ TEST_F(HttpApiTest, ndjsonInlineUpdateReturnIdsDefaultFalse) {
   std::string withIds =
       R"({"_update_":{"docs":[{"id":"inline-ret","title_w":"inlinereturn token"}],)"
       R"("return_ids":true,"commit":{}}})" "\n";
-  auto returned = httpRequest(port(), http::verb::post, "/collections/main/update",
+  auto returned = httpRequest(port(), http::verb::post, "/collections/main/_update",
                               std::move(withIds), "application/x-ndjson");
   ASSERT_EQ(200, returned.result_int()) << returned.body();
   auto returnedLines = splitLines(returned.body());
@@ -900,7 +898,7 @@ TEST_F(HttpApiTest, ndjsonInlineUpdateReturnIdsDefaultFalse) {
   std::string withoutIds =
       R"({"_update_":{"docs":[{"id":"inline-no-ret","title_w":"inlinereturn token"}],)"
       R"("commit":{}}})" "\n";
-  auto omitted = httpRequest(port(), http::verb::post, "/collections/main/update",
+  auto omitted = httpRequest(port(), http::verb::post, "/collections/main/_update",
                              std::move(withoutIds), "application/x-ndjson");
   ASSERT_EQ(200, omitted.result_int()) << omitted.body();
   auto omittedLines = splitLines(omitted.body());
@@ -928,7 +926,7 @@ TEST_F(HttpApiTest, ndjsonDeferredInlineUpdateEnforcesRequestBodyCap) {
       R"({"_update_":{"docs":[{"id":"defer-big","title_w":"defercap token","blob_sc":")" +
       payload + R"("}]}})" "\n";
 
-  auto update = httpRequest(localServer.getPort(), http::verb::post, "/collections/main/update",
+  auto update = httpRequest(localServer.getPort(), http::verb::post, "/collections/main/_update",
                             std::move(body), "application/x-ndjson");
   localServer.shutdown();
 
@@ -947,7 +945,7 @@ TEST_F(HttpApiTest, ndjsonGroupConfigDoesNotStickAfterEnd) {
       R"({"id":"nostick-bad2","title_w":"nostickygood token","no_such_field":"boom"})" "\n"
       R"({"_end_":{"commit":{}}})" "\n";
 
-  auto update = httpRequest(port(), http::verb::post, "/collections/main/update",
+  auto update = httpRequest(port(), http::verb::post, "/collections/main/_update",
                             std::move(body), "application/x-ndjson");
   ASSERT_EQ(200, update.result_int()) << update.body();
   ASSERT_EQ(2u, splitLines(update.body()).size()) << update.body();
@@ -970,7 +968,7 @@ TEST_F(HttpApiTest, ndjsonUpdateCommitAppliesToOpenedGroupAtEof) {
       R"({"_update_":{"request_id":"commit-open","commit":{}}})" "\n"
       R"({"id":"uc1","title_w":"ucommit token"})" "\n";
 
-  auto update = httpRequest(port(), http::verb::post, "/collections/main/update",
+  auto update = httpRequest(port(), http::verb::post, "/collections/main/_update",
                             std::move(body), "application/x-ndjson");
   ASSERT_EQ(200, update.result_int()) << update.body();
   EXPECT_NE(update.body().find(R"("request_id":"commit-open")"), std::string::npos)
@@ -987,7 +985,7 @@ TEST_F(HttpApiTest, ndjsonUrlCommitCommitsAtEof) {
   std::string body =
       R"({"id":"urlc1","title_w":"urlcommit token"})" "\n";
 
-  auto update = httpRequest(port(), http::verb::post, "/collections/main/update?commit=true",
+  auto update = httpRequest(port(), http::verb::post, "/collections/main/_update?commit=true",
                             std::move(body), "application/x-ndjson");
   ASSERT_EQ(200, update.result_int()) << update.body();
 
@@ -1006,7 +1004,7 @@ TEST_F(HttpApiTest, ndjsonEmptyUrlCommitCommitsDefaultCollection) {
   localServer.start();
 
   auto update = httpRequest(localServer.getPort(), http::verb::post,
-                            "/collections/main/update?commit=true", "",
+                            "/collections/main/_update?commit=true", "",
                             "application/x-ndjson");
   localServer.shutdown();
 
@@ -1022,7 +1020,7 @@ TEST_F(HttpApiTest, ndjsonAllOrNoneStreamSuccess) {
       R"({"id":"aon2","title_w":"aonsuccess token"})" "\n"
       R"({"_end_":{"commit":{}}})" "\n";
 
-  auto update = httpRequest(port(), http::verb::post, "/collections/main/update",
+  auto update = httpRequest(port(), http::verb::post, "/collections/main/_update",
                             std::move(body), "application/x-ndjson");
   ASSERT_EQ(200, update.result_int()) << update.body();
 
@@ -1041,10 +1039,10 @@ TEST_F(HttpApiTest, ndjsonAllOrNoneStreamFailureRollsBack) {
       R"({"id":"aon-never","title_w":"aonfail token"})" "\n"
       R"({"_end_":{"commit":{}}})" "\n";
 
-  auto update = httpRequest(port(), http::verb::post, "/collections/main/update",
+  auto update = httpRequest(port(), http::verb::post, "/collections/main/_update",
                             std::move(body), "application/x-ndjson");
   ASSERT_EQ(200, update.result_int()) << update.body();
-  EXPECT_NE(update.body().find("ERROR"), std::string::npos) << update.body();
+  EXPECT_NE(update.body().find(R"("status":"error")"), std::string::npos) << update.body();
 
   HttpReq hreq(port());
   hreq.collection("main").matchQuery("title_w", "aonfail").fields({"id"})
@@ -1067,7 +1065,7 @@ TEST_F(HttpApiTest, ndjsonAllOrNoneStreamOverCapIs400) {
       R"({"id":"cap-a","title_w":"capatomic","blob_sc":")" + payload + R"("})" "\n"
       R"({"id":"cap-b","title_w":"capatomic","blob_sc":")" + payload + R"("})" "\n";
 
-  auto update = httpRequest(localServer.getPort(), http::verb::post, "/collections/main/update",
+  auto update = httpRequest(localServer.getPort(), http::verb::post, "/collections/main/_update",
                             std::move(body), "application/x-ndjson");
   localServer.shutdown();
 
@@ -1081,7 +1079,7 @@ TEST_F(HttpApiTest, ndjsonEndRejectsSubmitTimeConfig) {
       R"({"id":"bad-end","title_w":"badend token"})" "\n"
       R"({"_end_":{"all_or_none":true}})" "\n";
 
-  auto update = httpRequest(port(), http::verb::post, "/collections/main/update",
+  auto update = httpRequest(port(), http::verb::post, "/collections/main/_update",
                             std::move(body), "application/x-ndjson");
   EXPECT_EQ(400, update.result_int()) << update.body();
   EXPECT_NE(update.body().find("_end_ control cannot carry submit-time field 'all_or_none'"),
@@ -1092,7 +1090,7 @@ TEST_F(HttpApiTest, ndjsonUpdateRejectsUnknownControlField) {
   std::string body =
       R"({"_update_":{"allow_dup":true}})" "\n";
 
-  auto update = httpRequest(port(), http::verb::post, "/collections/main/update",
+  auto update = httpRequest(port(), http::verb::post, "/collections/main/_update",
                             std::move(body), "application/x-ndjson");
   EXPECT_EQ(400, update.result_int()) << update.body();
   EXPECT_NE(update.body().find("unsupported _update_ control field 'allow_dup'"),
@@ -1104,7 +1102,7 @@ TEST_F(HttpApiTest, ndjsonEndRejectsUnknownControlField) {
       R"({"id":"bad-end-unknown","title_w":"badendunknown token"})" "\n"
       R"({"_end_":{"all_or_non":true}})" "\n";
 
-  auto update = httpRequest(port(), http::verb::post, "/collections/main/update",
+  auto update = httpRequest(port(), http::verb::post, "/collections/main/_update",
                             std::move(body), "application/x-ndjson");
   EXPECT_EQ(400, update.result_int()) << update.body();
   EXPECT_NE(update.body().find("unsupported _end_ control field 'all_or_non'"),
@@ -1158,7 +1156,7 @@ TEST_F(HttpApiTest, rootShorthand) {
             "title_w", std::string("gamma")),
   }, UpdateMessage::COMMIT);
 
-  auto res = httpRequest(port(), http::verb::post, "/collections/main/query",
+  auto res = httpRequest(port(), http::verb::post, "/collections/main/_query",
       R"({"query":{"match":{"status_s":"active"}},"fields":["id"]})");
   ASSERT_EQ(200, res.result_int()) << res.body();
 
@@ -1169,7 +1167,7 @@ TEST_F(HttpApiTest, rootShorthand) {
   EXPECT_EQ(2u, idsOf(full.getDocs()).size());
 
   // an unknown root key is rejected with a client-facing error
-  auto bad = httpRequest(port(), http::verb::post, "/collections/main/query",
+  auto bad = httpRequest(port(), http::verb::post, "/collections/main/_query",
       R"({"query":{"match":{"status_s":"active"}},"limt":10})");
   EXPECT_EQ(400, bad.result_int());
   EXPECT_NE(bad.body().find(R"("error")"), std::string::npos);
@@ -1188,7 +1186,7 @@ TEST_F(HttpApiTest, explainRequestEcho) {
 
   const std::string body = R"({"query":{"match":{"status_s":"active"}},"fields":["id"]})";
   auto echo = httpRequest(port(), http::verb::post,
-                          "/collections/main/query?explain=request", body);
+                          "/collections/main/_query?explain=request", body);
   ASSERT_EQ(200, echo.result_int()) << echo.body();
   const std::string canonical = echo.body();
   // sugar expanded to canonical match, shorthand lowered into ops, collection applied
@@ -1202,14 +1200,14 @@ TEST_F(HttpApiTest, explainRequestEcho) {
   EXPECT_EQ(canonical.find(R"("found")"), std::string::npos) << canonical;
 
   // POST-back equivalence: the echo output runs identically to the original body.
-  auto direct = httpRequest(port(), http::verb::post, "/collections/main/query", body);
-  auto viaEcho = httpRequest(port(), http::verb::post, "/collections/main/query", canonical);
+  auto direct = httpRequest(port(), http::verb::post, "/collections/main/_query", body);
+  auto viaEcho = httpRequest(port(), http::verb::post, "/collections/main/_query", canonical);
   ASSERT_EQ(200, viaEcho.result_int()) << viaEcho.body();
   EXPECT_EQ(direct.body(), viaEcho.body());
 
   // Fixpoint: echoing the echo is byte-identical.
   auto echo2 = httpRequest(port(), http::verb::post,
-                           "/collections/main/query?explain=request", canonical);
+                           "/collections/main/_query?explain=request", canonical);
   ASSERT_EQ(200, echo2.result_int());
   EXPECT_EQ(canonical, echo2.body());
 }
@@ -1218,26 +1216,26 @@ TEST_F(HttpApiTest, explainRequestEcho) {
 // an open channel - correlation ids, middleware); recognized keys enforce values.
 TEST_F(HttpApiTest, urlParamPolicy) {
   // bad value on a RECOGNIZED key is an author error
-  auto bad = httpRequest(port(), http::verb::post, "/collections/main/query?explain=foo",
+  auto bad = httpRequest(port(), http::verb::post, "/collections/main/_query?explain=foo",
                          R"({"limit":1})");
   EXPECT_EQ(400, bad.result_int());
   EXPECT_NE(bad.body().find(R"("error")"), std::string::npos) << bad.body();
 
   // unknown params (e.g. a correlation id) pass through; the query executes
   auto unknown = httpRequest(port(), http::verb::post,
-                             "/collections/main/query?trace_id=abc-123&_=17",
+                             "/collections/main/_query?trace_id=abc-123&_=17",
                              R"({"limit":1})");
   EXPECT_EQ(200, unknown.result_int()) << unknown.body();
 
   // unknown params compose with explain (last-wins on repeats)
   auto both = httpRequest(port(), http::verb::post,
-                          "/collections/main/query?trace_id=x&explain=request",
+                          "/collections/main/_query?trace_id=x&explain=request",
                           R"({"limit":1})");
   EXPECT_EQ(200, both.result_int()) << both.body();
   EXPECT_NE(both.body().find(R"("ops")"), std::string::npos) << both.body();
 
   auto malformed = httpRequest(port(), http::verb::post,
-                               "/collections/main/query?explain=request", "{not json");
+                               "/collections/main/_query?explain=request", "{not json");
   EXPECT_EQ(400, malformed.result_int());
   EXPECT_NE(malformed.body().find(R"("error")"), std::string::npos) << malformed.body();
 
@@ -1310,6 +1308,171 @@ TEST_F(HttpApiTest, streamingMultipleBatches) {
 // streaming) query is in flight, without the client reading the response.  The
 // graceful-drain path must release the request arena and return without hanging
 // or use-after-free (validated under ASan).
+// ---- /_schema ---------------------------------------------------------------
+
+TEST_F(HttpApiTest, schemaGetDefault) {
+  auto res = httpRequest(port(), http::verb::get, "/collections/main/_schema");
+  ASSERT_EQ(200, res.result_int()) << res.body();
+  // The default schema: reserved fields + suffix templates, pretty-printed.
+  EXPECT_NE(res.body().find("\"fields\""), std::string::npos);
+  EXPECT_NE(res.body().find("\"templates\""), std::string::npos);
+  EXPECT_NE(res.body().find("\"id\""), std::string::npos);
+  EXPECT_NE(res.body().find("\"_t\""), std::string::npos);
+  EXPECT_NE(res.body().find("\"type\": \"text\""), std::string::npos) << "pretty + lowercase";
+  EXPECT_NE(res.body().find('\n'), std::string::npos) << "schema responses are pretty-printed";
+}
+
+TEST_F(HttpApiTest, schemaSetGetRoundTrip) {
+  const std::string schema = R"({
+    "fields": {
+      "title": {"type": "text", "stored": true,
+                "analyzer": {"tokenizer": "unicode_word", "filters": ["nfkc_cf", "fold"]}},
+      "year":  {"type": "int", "index": "range"},
+      "vec":   {"type": "vector", "dims": 4, "metric": "cosine"}
+    }
+  })";
+  auto set = httpRequest(port(), http::verb::post, "/collections/main/_schema", schema);
+  ASSERT_EQ(200, set.result_int()) << set.body();
+  EXPECT_NE(set.body().find("\"title\""), std::string::npos);
+  EXPECT_NE(set.body().find("\"metric\": \"cosine\""), std::string::npos);
+
+  auto get = httpRequest(port(), http::verb::get, "/collections/main/_schema");
+  ASSERT_EQ(200, get.result_int());
+  EXPECT_EQ(set.body(), get.body()) << "write response and GET speak the same shape";
+
+  // Echo doctrine: GET output is a valid write body, and posting it back is a
+  // no-op under BOTH modes (set of identical defs is identity).
+  auto setBack = httpRequest(port(), http::verb::post, "/collections/main/_schema", get.body());
+  ASSERT_EQ(200, setBack.result_int()) << setBack.body();
+  EXPECT_EQ(get.body(), setBack.body());
+  auto replaceBack = httpRequest(port(), http::verb::post,
+                                 "/collections/main/_schema?mode=replace_all", get.body());
+  ASSERT_EQ(200, replaceBack.result_int()) << replaceBack.body();
+  EXPECT_EQ(get.body(), replaceBack.body());
+}
+
+TEST_F(HttpApiTest, schemaSetAndReplaceAllModes) {
+  auto seed = httpRequest(port(), http::verb::post, "/collections/main/_schema",
+                          R"({"fields": {"title": {"type": "text"}}})");
+  ASSERT_EQ(200, seed.result_int()) << seed.body();
+
+  // Default mode=set: sets the named definitions, keeps title.
+  auto post = httpRequest(port(), http::verb::post, "/collections/main/_schema",
+                          R"({"fields": {"published": {"type": "date", "index": "range"}}})");
+  ASSERT_EQ(200, post.result_int()) << post.body();
+  EXPECT_NE(post.body().find("\"published\""), std::string::npos);
+  EXPECT_NE(post.body().find("\"title\""), std::string::npos);
+
+  // set on an EXISTING name replaces that WHOLE definition (not a property merge).
+  auto redefine = httpRequest(port(), http::verb::post, "/collections/main/_schema",
+                              R"({"fields": {"published": {"type": "date"}}})");
+  ASSERT_EQ(200, redefine.result_int()) << redefine.body();
+  EXPECT_EQ(redefine.body().find("\"index\": \"range\""), std::string::npos)
+      << "whole-definition set dropped the old index property: " << redefine.body();
+
+  // mode=replace_all: title/published gone, reserved fields materialized.
+  auto replace = httpRequest(port(), http::verb::post,
+                             "/collections/main/_schema?mode=replace_all",
+                             R"({"fields": {"price": "int"}})");
+  ASSERT_EQ(200, replace.result_int()) << replace.body();
+  EXPECT_EQ(replace.body().find("\"title\""), std::string::npos);
+  EXPECT_EQ(replace.body().find("\"published\""), std::string::npos);
+  EXPECT_NE(replace.body().find("\"price\""), std::string::npos);
+  EXPECT_NE(replace.body().find("\"id\""), std::string::npos);
+  EXPECT_NE(replace.body().find("\"_version_\""), std::string::npos);
+  // The string shorthand reads as {"type": "int"} and writes canonically.
+  EXPECT_NE(replace.body().find("\"type\": \"int\""), std::string::npos);
+
+  // Unknown mode: 400 naming the valid modes.
+  auto badMode = httpRequest(port(), http::verb::post,
+                             "/collections/main/_schema?mode=merge",
+                             R"({"fields": {"x": "int"}})");
+  EXPECT_EQ(400, badMode.result_int());
+  EXPECT_NE(badMode.body().find("valid: set, replace_all"), std::string::npos) << badMode.body();
+}
+
+TEST_F(HttpApiTest, schemaErrorsAreTeaching) {
+  // Unknown analyzer component: 400 naming the valid set.
+  auto badTok = httpRequest(port(), http::verb::post, "/collections/main/_schema",
+      R"({"fields": {"t": {"type": "text", "analyzer": {"tokenizer": "standard"}}}})");
+  EXPECT_EQ(400, badTok.result_int());
+  EXPECT_NE(badTok.body().find("unknown tokenizer 'standard'"), std::string::npos) << badTok.body();
+  EXPECT_NE(badTok.body().find("whitespace"), std::string::npos) << "lists valid tokenizers";
+
+  // Unknown FieldDef key: strict dialect, 400.
+  auto badKey = httpRequest(port(), http::verb::post, "/collections/main/_schema",
+      R"({"fields": {"x": {"typ": "int"}}})");
+  EXPECT_EQ(400, badKey.result_int());
+
+  // Unknown type name: 400 (enum names are lowercase, exact).
+  auto badType = httpRequest(port(), http::verb::post, "/collections/main/_schema",
+      R"({"fields": {"x": {"type": "INT"}}})");
+  EXPECT_EQ(400, badType.result_int());
+
+  // id redefined incompatibly: 400 with a reserved-field message.
+  auto badId = httpRequest(port(), http::verb::post, "/collections/main/_schema",
+      R"({"fields": {"id": {"type": "string"}}})");
+  EXPECT_EQ(400, badId.result_int());
+  EXPECT_NE(badId.body().find("reserved field 'id'"), std::string::npos) << badId.body();
+
+  // Bare-integer enum values are rejected at parse over JSON (positioned
+  // error); the engine-level range check (SchemaTest.unknownEnumValuesRejected)
+  // guards the binary/gRPC path where integers do decode.
+  auto badEnum = httpRequest(port(), http::verb::post, "/collections/main/_schema",
+      R"({"fields": {"v": {"type": "vector", "metric": 99}}})");
+  EXPECT_EQ(400, badEnum.result_int());
+  EXPECT_NE(badEnum.body().find("metric"), std::string::npos) << badEnum.body();
+}
+
+TEST_F(HttpApiTest, schemaGetMissingCollectionIs404) {
+  auto res = httpRequest(port(), http::verb::get, "/collections/never_created/_schema");
+  EXPECT_EQ(404, res.result_int());
+  EXPECT_NE(res.body().find("\"error\""), std::string::npos);
+}
+
+TEST_F(HttpApiTest, schemaMethodNotAllowed) {
+  // The verb carries no schema semantics: writes are POST + ?mode=..., and the
+  // 405 teaches that spelling.
+  for (auto verb : {http::verb::put, http::verb::patch}) {
+    auto res = httpRequest(port(), verb, "/collections/main/_schema",
+                           R"({"fields": {}})");
+    EXPECT_EQ(405, res.result_int());
+    EXPECT_EQ("GET, POST", res[http::field::allow]);
+    EXPECT_NE(res.body().find("mode=replace_all"), std::string::npos) << res.body();
+  }
+}
+
+TEST_F(HttpApiTest, schemaDrivesIndexingEndToEnd) {
+  // Install a schema over HTTP, index through it, and query through it: the
+  // whole loop on one connection surface.
+  auto set = httpRequest(port(), http::verb::post, "/collections/main/_schema", R"({
+    "fields": {
+      "title": {"type": "text", "analyzer": {"tokenizer": "whitespace", "filters": ["lowercase"]}},
+      "year":  {"type": "int", "index": "range"}
+    }
+  })");
+  ASSERT_EQ(200, set.result_int()) << set.body();
+
+  auto update = httpRequest(port(), http::verb::post, "/collections/main/_update",
+      R"({"docs":[{"id":"1","title":"DUNE rising","year":1965},
+                  {"id":"2","title":"other book","year":2001}],"commit":{}})");
+  ASSERT_EQ(200, update.result_int()) << update.body();
+
+  // lowercase filter applied at index time -> query for "dune" matches "DUNE".
+  auto q = httpRequest(port(), http::verb::post, "/collections/main/_query",
+      R"({"query":{"match":{"title":"dune"}},"fields":["id"]})");
+  ASSERT_EQ(200, q.result_int()) << q.body();
+  EXPECT_NE(q.body().find(R"("id":"1")"), std::string::npos) << q.body();
+  EXPECT_EQ(q.body().find(R"("id":"2")"), std::string::npos) << q.body();
+
+  // Range index installed via the schema answers a range query.
+  auto range = httpRequest(port(), http::verb::post, "/collections/main/_query",
+      R"({"query":"year:[1900 TO 1970]","fields":["id"]})");
+  ASSERT_EQ(200, range.result_int()) << range.body();
+  EXPECT_NE(range.body().find(R"("id":"1")"), std::string::npos) << range.body();
+  EXPECT_EQ(range.body().find(R"("id":"2")"), std::string::npos) << range.body();
+}
+
 TEST_F(HttpApiTest, shutdownDuringInflightRequest) {
   std::vector<Doc> docs;
   for (int i = 0; i < 250; i++) {
@@ -1323,7 +1486,7 @@ TEST_F(HttpApiTest, shutdownDuringInflightRequest) {
   tcp::resolver resolver(cioc);
   net::connect(sock, resolver.resolve("127.0.0.1", std::to_string(port())));
 
-  http::request<http::string_body> req(http::verb::post, "/collections/main/query", 11);
+  http::request<http::string_body> req(http::verb::post, "/collections/main/_query", 11);
   req.set(http::field::host, "127.0.0.1");
   req.set(http::field::content_type, "application/json");
   req.body() = R"({"query":{"match":{"title_w":"banana"}},"limit":250,"batch_size":50,"fields":["id"]})";

@@ -2,23 +2,21 @@
 #include <bit>
 #include <cstring>
 #include <limits>
-#include <memory_resource>
 #include <span>
 #include <utility>
 #include <vector>
 
 #include <gtest/gtest.h>
 
-#include "solux/api/build.h"
 #include "solux/index/PointsWriter.h"
 #include "solux/reader/FieldReader.h"
 #include "solux/reader/IntColReader.h"
 #include "solux/reader/PointsReader.h"
-#include "solux/schema/Schema.h"
 #include "solux/store/Directory.h"
 #include "solux/util/NumericUtils.h"
 #include "test/CollectionHelper.h"
 #include "test/LocalReq.h"
+#include "test/SchemaBuilder.h"
 #include "test/SoluxTest.h"
 #include "test/TestUtils.h"
 
@@ -381,18 +379,15 @@ TEST_F(PointsIndexTest, sortPointsKeepsDocidOrderInLongTieRuns) {
 TEST_F(PointsIndexTest, flushMatchesSingleAndMultiValuedColumns) {
   CollectionHelper helper;
 
-  std::pmr::monotonic_buffer_resource arena;
-  api::SchemaDef def;
-  api::FieldDef* fields = api::build::allocArray(def.fields, 2, arena);
-  fields[0].name = "range_single";
-  fields[0].field_class = api::FieldDef::FieldClass::INT;
-  fields[0].index = api::FieldDef::IndexMode::RANGE;
-  fields[1].name = "range_multi";
-  fields[1].field_class = api::FieldDef::FieldClass::INT;
-  fields[1].index = api::FieldDef::IndexMode::RANGE;
-  fields[1].multi_valued = true;
-  auto schema = Schema::fromProto(def, helper.collection().getSchema().get());
-  helper.collection().setSchema(schema);
+  SchemaBuilder b;
+  auto& single = b.field("range_single");
+  single.type = api::FieldDef::FieldClass::INT;
+  single.index = api::FieldDef::IndexMode::RANGE;
+  auto& multi = b.field("range_multi");
+  multi.type = api::FieldDef::FieldClass::INT;
+  multi.index = api::FieldDef::IndexMode::RANGE;
+  multi.multi = true;
+  b.set(helper.collection());
 
   std::vector<Doc> docs = {
     flatdoc("id_s", "a", "range_single", 30, "range_multi", vec_i(7, 7, 2)),

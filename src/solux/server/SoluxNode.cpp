@@ -51,31 +51,76 @@ void SoluxNode::validateCollectionName(std::string_view name) {
   }
 }
 
+std::shared_ptr<Schema> Collection::updateSchema(const solux::api::SchemaDef& def,
+                                                 solux::api::SchemaRequest_::Mode mode) {
+  // One transaction per collection: read-current -> apply -> resolve ->
+  // persist -> swap.  Without the lock, two concurrent SETs could each build
+  // from the same base and the second swap would silently drop the first's
+  // fields (and their persistence passes would delete each other's files).
+  std::lock_guard<std::mutex> lock(schemaMutex_);
+  std::shared_ptr<Schema> newSchema;
+  if (mode == solux::api::SchemaRequest_::Mode::SET) {
+    auto current = getSchema();
+    newSchema = Schema::fromProto(def, current.get());
+  } else {
+    newSchema = Schema::fromProto(def);
+  }
+  setSchemaLocked(newSchema);
+  return newSchema;
+}
+
 void Collection::setSchema(std::shared_ptr<Schema> newSchema) {
+  std::lock_guard<std::mutex> lock(schemaMutex_);
+  setSchemaLocked(std::move(newSchema));
+}
+
+void Collection::setSchemaLocked(std::shared_ptr<Schema> newSchema) {
   uint64_t gen = schemaGen_++;
   newSchema->gen_ = gen;
 
-  // Persist the schema source def to the Directory
+  // Persist the schema source def to the Directory.  The durable file IS the
+  // publication point: once it is synced, restart would load this generation,
+  // so the in-memory swap below must happen (and the caller must see success)
+  // regardless of anything after the sync.  A failure BEFORE the sync removes
+  // the staged file so a partial write can never be selected at startup.
   if (shard && shard->dir && !newSchema->sourceDef_.empty()) {
     std::string fileName = schemaFileName(gen);
-    auto file = shard->dir->createFile(fileName);
-    OutputStream out;
-    out.setFile(&*file);
-    out.write(newSchema->sourceDef_.data(), newSchema->sourceDef_.size());
-    out.close();
-    shard->dir->finishFile(*file);
+    try {
+      auto file = shard->dir->createFile(fileName);
+      OutputStream out;
+      out.setFile(&*file);
+      out.write(newSchema->sourceDef_.data(), newSchema->sourceDef_.size());
+      out.close();
+      shard->dir->finishFile(*file);
 
-    std::vector<std::string> syncFiles = {fileName, "."};
-    shard->dir->sync(syncFiles);
-
-    // Delete older schema files
-    std::vector<std::string> files;
-    shard->dir->listFiles(files);
-    for (const auto& f : files) {
-      if (f.starts_with(SCHEMA_PREFIX) && f != fileName) {
-        shard->dir->deleteFile(f);
+      std::vector<std::string> syncFiles = {fileName, "."};
+      shard->dir->sync(syncFiles);
+    } catch (...) {
+      try {
+        shard->dir->deleteFile(fileName);
+      } catch (...) {
+        LOG_WARN("failed to remove staged schema file {} after write failure", fileName);
       }
+      throw;
     }
+
+    schema.store(std::move(newSchema));
+
+    // Best-effort cleanup of older generations: the new schema is already
+    // durable and published, so a cleanup failure must not fail the request
+    // (loadSchema always picks the highest generation anyway).
+    try {
+      std::vector<std::string> files;
+      shard->dir->listFiles(files);
+      for (const auto& f : files) {
+        if (f.starts_with(SCHEMA_PREFIX) && f != fileName) {
+          shard->dir->deleteFile(f);
+        }
+      }
+    } catch (const std::exception& e) {
+      LOG_WARN("failed to clean up old schema files: {}", e.what());
+    }
+    return;
   }
 
   schema.store(std::move(newSchema));

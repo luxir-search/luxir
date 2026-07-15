@@ -13,11 +13,11 @@
 #include "solux/index/VectorIndexBuilder.h"
 #include "solux/query/KnnQuery.h"
 #include "solux/reader/VectorAuxReader.h"
-#include "solux/schema/Schema.h"
 #include "solux/util/random.h"
 #include "test/CollectionHelper.h"
 #include "test/LocalReq.h"
 #include "test/QueryBuild.h"
+#include "test/SchemaBuilder.h"
 
 using namespace solux;
 using namespace solux::test;
@@ -27,37 +27,23 @@ namespace api = solux::api;
 namespace {
 
 void installVectorBenchSchema(Collection& col, int32_t dims,
-                              api::VectorParams_::Metric metric = api::VectorParams_::Metric::IP) {
-  // Non-owning build: field names are string literals (stable); the FieldDef
-  // structs live in `fields`, which outlives the fromProto() call below.
-  std::vector<api::FieldDef> fields;
+                              api::VectorMetric metric = api::VectorMetric::IP) {
+  SchemaBuilder b;
 
-  api::FieldDef single;
-  single.name = "_v";
-  single.field_class = api::FieldDef_::FieldClass::VECTOR;
-  single.abstract = true;
-  single.column_stored = true;
-  auto& singleVector = single.vector.emplace();
-  singleVector.dims = dims;
-  singleVector.metric = metric;
-  fields.push_back(single);
+  auto& single = b.templ("_v");
+  single.type = api::FieldDef_::FieldClass::VECTOR;
+  single.column = true;
+  single.dims = dims;
+  single.metric = metric;
 
-  api::FieldDef multi;
-  multi.name = "_vs";
-  multi.field_class = api::FieldDef_::FieldClass::VECTOR;
-  multi.abstract = true;
-  multi.column_stored = true;
-  multi.multi_valued = true;
-  auto& multiVector = multi.vector.emplace();
-  multiVector.dims = dims;
-  multiVector.metric = metric;
-  fields.push_back(multi);
+  auto& multi = b.templ("_vs");
+  multi.type = api::FieldDef_::FieldClass::VECTOR;
+  multi.column = true;
+  multi.multi = true;
+  multi.dims = dims;
+  multi.metric = metric;
 
-  api::SchemaDef def;
-  def.fields = std::span<const api::FieldDef>(fields.data(), fields.size());
-
-  auto base = Schema::createDefaultSchema();
-  col.setSchema(Schema::fromProto(def, base.get()));
+  b.set(col);
 }
 
 float nextFloat(SplitMix64& rng) {
@@ -377,7 +363,7 @@ bool clusteredIndexReusable(CollectionHelper& helper, std::span<const int32_t> d
     auto* vaux = dynamic_cast<VectorAuxReader*>(aux.get());
     if (vaux == nullptr ||
         vaux->getEngine() != VectorAuxMeta::ENGINE_IVFPQ ||
-        vaux->getMetric() != (int32_t)api::VectorParams_::Metric::L2) {
+        vaux->getMetric() != (int32_t)api::VectorMetric::L2) {
       return false;
     }
   }
@@ -387,7 +373,7 @@ bool clusteredIndexReusable(CollectionHelper& helper, std::span<const int32_t> d
 void buildClusteredVectorIndex(CollectionHelper& helper, int32_t dims,
                                int32_t nClusters, std::span<const int32_t> docsPerSeg) {
   helper.clear();
-  installVectorBenchSchema(helper.collection(), dims, api::VectorParams_::Metric::L2);
+  installVectorBenchSchema(helper.collection(), dims, api::VectorMetric::L2);
 
   constexpr int64_t batchSize = 256;
   std::vector<Doc> docs;
@@ -607,7 +593,7 @@ void BM_VectorIvfPqBuild(benchmark::State& state) {
     // want isolated, so inline its steps here.
     auto wallStart = std::chrono::steady_clock::now();
     helper.clear();
-    installVectorBenchSchema(helper.collection(), dims, api::VectorParams_::Metric::L2);
+    installVectorBenchSchema(helper.collection(), dims, api::VectorMetric::L2);
     constexpr int64_t batchSize = 256;
     std::vector<Doc> docs;
     docs.reserve((size_t)batchSize);
@@ -666,7 +652,7 @@ void BM_VectorIvfPqIncrementalBuild(benchmark::State& state) {
   for (auto _ : state) {
     auto setupStart = std::chrono::steady_clock::now();
     helper.clear();
-    installVectorBenchSchema(helper.collection(), dims, api::VectorParams_::Metric::L2);
+    installVectorBenchSchema(helper.collection(), dims, api::VectorMetric::L2);
     constexpr int64_t batchSize = 256;
     std::vector<Doc> docs;
     docs.reserve((size_t)batchSize);
