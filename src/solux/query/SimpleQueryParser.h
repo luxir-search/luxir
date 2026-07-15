@@ -14,8 +14,9 @@
 
 #include "solux/api/build.h"
 #include "solux/api/solux_types.hpp"
-#include "solux/query/Cursor.h"
+#include "solux/util/Cursor.h"
 #include "solux/schema/Schema.h"
+#include "solux/util/Clock.h"
 
 namespace solux {
 
@@ -69,6 +70,9 @@ struct SimpleQueryOptions {
   // expansion; silently inapplicable when the top level cannot honor it
   // (that is contingent on user input, which must not cost warnings).
   int32_t min_match = 0;
+  // Used only while validating DATE field:value arms. Lowering receives the
+  // same snapshot through ParseContext/QueryBuilder.
+  int64_t dateMathNowEpochMillis = currentEpochMillis();
 };
 
 struct SimpleQueryResult {
@@ -426,7 +430,7 @@ private:
     api::Val v;
     v.kind = value;
     try {
-      fieldType.coerceColInt64(v, fieldType.name());
+      fieldType.coerceColInt64(v, fieldType.name(), {opts.dateMathNowEpochMillis});
       return true;
     } catch (const std::exception&) {
       return false;

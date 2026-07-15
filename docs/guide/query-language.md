@@ -170,6 +170,28 @@ include the granule they name - `[2024-01 TO 2024-06]` covers January
 through June, `{... TO 2024-06}` excludes all of June. A full timestamp is
 still a single instant.
 
+Date fields accept both Solr and OpenSearch date math. `NOW` and `now` use one
+clock snapshot for the entire search request or update message. Commands are
+evaluated left-to-right;
+accepted forms include `NOW-1DAY/DAY`, `2024-01-01T00:00:00Z+2MONTHS`, and
+`2024-01-01T00:00:00Z||+2M`. Solr word units are
+case-insensitive (`YEARS`, `MONTHS`, `DAYS`/`DATE`, `HOURS`, `MINUTES`,
+`SECONDS`, and the millisecond aliases). OpenSearch abbreviations are
+case-sensitive: `y`, `M`, `w`, `d`, `h`/`H`, `m`, and `s`, so `M` means month
+while `m` means minute. Week rounding starts Monday. Math and rounding use UTC;
+there is no request time-zone override yet.
+
+The direct Solr suffix and OpenSearch `||` separator are both accepted. Prefer
+`||` when a truncated time or numeric zone offset makes the anchor boundary
+hard to read; direct suffix parsing otherwise chooses the longest valid anchor.
+
+Without math, a partial literal retains the window described above. Once a
+math suffix begins, its anchor is the start instant of that literal; a `/unit`
+command creates a window. This makes `gte`, `gt`, `lte`, and `lt` around rounded
+date math select the same lower/upper edges as OpenSearch. Math commands cannot
+contain whitespace; they can otherwise be bare field values in `expr` and
+`simple_query`.
+
 Juxtaposed comparisons on one field are a parse error - `year_i:(>=1960
 <1970)` would mean "either side", which is never what anyone wants; write
 `AND` (or `OR` if you do want either).

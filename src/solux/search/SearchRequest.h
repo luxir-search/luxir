@@ -8,6 +8,7 @@
 #include "solux/api/build.h"
 #include "IndexReader.h"
 #include "solux/schema/Schema.h"
+#include "solux/util/Clock.h"
 #include "solux/util/proto.h"
 
 namespace solux {
@@ -45,6 +46,9 @@ public:
   // immutable after publication, so query objects may keep FieldType references
   // derived from this schema for the request lifetime.
   std::shared_ptr<Schema> schema;
+  // One clock snapshot for every query tree/op in this request. Parsers are
+  // short-lived and numerous, so NOW belongs here rather than in a parser.
+  const int64_t dateMathNowEpochMillis;
   MemPool requestPool;
   oneapi::tbb::task_group* tg = nullptr; // optional top-level task group for this request.
   SearchResponse* lastResponse = nullptr;
@@ -61,7 +65,8 @@ public:
   bool testForcePrepare = false;
 
   SearchRequest(SearchEngine& engine, const ReqProto& proto, google::protobuf::Arena& arena)
-    : engine(engine), proto(proto), arena(arena) {
+    : engine(engine), proto(proto), arena(arena),
+      dateMathNowEpochMillis(currentEpochMillis()) {
   }
 
   virtual ~SearchRequest() = default;

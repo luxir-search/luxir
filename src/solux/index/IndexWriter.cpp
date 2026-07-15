@@ -462,6 +462,10 @@ Inverter& IndexWriter::obtainInverter(uint64_t updateVersion) {
     busyInverters.emplace(inverter, std::move(it->second));
     idleInverters.erase(it);
   }
+  // Coercion context never leaks across update-message acquisitions. The
+  // normal protobuf path immediately installs its request clock; custom/test
+  // messages without one fall back to call-time DATE coercion.
+  inverter->coerceContext = {};
   inverter->updateVersions(updateVersion);
   return *inverter;
 }

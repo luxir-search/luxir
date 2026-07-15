@@ -21,6 +21,7 @@
 #include "solux/query/TermRangeQuery.h"
 #include "solux/schema/Schema.h"
 #include "solux/schema/ValCoerce.h"
+#include "solux/util/Clock.h"
 #include "solux/util/StrRef.h"
 
 namespace solux {
@@ -35,6 +36,7 @@ namespace solux {
 class QueryBuilder {
   MemPool& pool;
   Schema& schema;
+  CoerceContext coerceContext;
 
 public:
   static constexpr size_t MAX_PHRASE_SLOTS = 256;
@@ -166,7 +168,9 @@ public:
   // Mirrors the OpenSearch match "operator".
   enum class Operator { OR, AND };
 
-  QueryBuilder(MemPool& pool, Schema& schema) : pool(pool), schema(schema) {}
+  QueryBuilder(MemPool& pool, Schema& schema,
+               int64_t dateMathNowEpochMillis = currentEpochMillis())
+    : pool(pool), schema(schema), coerceContext{dateMathNowEpochMillis} {}
 
   Query* matchNoDocs() {
     return pool.make<MatchNoDocsQuery>();
@@ -435,10 +439,14 @@ public:
       // Window edges chosen so the existing +/-1 exclusive fold below lands
       // on the granule boundary: gt = the window's last milli (+1 = past it),
       // lt = the window's first milli (-1 = before it).
-      if (hasGte) loEnc = dateType.coerceDateRange(*gte, field).first;
-      if (hasGt)  loEnc = dateType.coerceDateRange(*gt, field).second - 1;
-      if (hasLte) hiEnc = dateType.coerceDateRange(*lte, field).second - 1;
-      if (hasLt)  hiEnc = dateType.coerceDateRange(*lt, field).first;
+      if (hasGte) loEnc = dateType.coerceDateRange(
+          *gte, field, coerceContext).first;
+      if (hasGt)  loEnc = dateType.coerceDateRange(
+          *gt, field, coerceContext).second - 1;
+      if (hasLte) hiEnc = dateType.coerceDateRange(
+          *lte, field, coerceContext).second - 1;
+      if (hasLt)  hiEnc = dateType.coerceDateRange(
+          *lt, field, coerceContext).first;
     } else {
       if (hasGte || hasGt) loEnc = fieldType.coerceColInt64(hasGte ? *gte : *gt, field);
       if (hasLte || hasLt) hiEnc = fieldType.coerceColInt64(hasLte ? *lte : *lt, field);

@@ -122,12 +122,14 @@ public:
   void index(Inverter& inverter, const IndexVal& val) override {
     // explicit null means "no value", same as an absent field
     if (coerce::isNull(val)) return;
-    indexSingle(inverter, fieldType->coerceColInt64(val, std::string_view(fieldName)));
+    indexSingle(inverter, fieldType->coerceColInt64(
+        val, std::string_view(fieldName), inverter.coerceContext));
   }
 
   void index(Inverter& inverter, int64_t int64) override {
-    indexSingle(inverter, fieldType->coerceColInt64(coerce::scalarVal(int64),
-                                                    std::string_view(fieldName)));
+    indexSingle(inverter, fieldType->coerceColInt64(
+        coerce::scalarVal(int64), std::string_view(fieldName),
+        inverter.coerceContext));
   }
 
   void indexSingle(Inverter& inverter, int64_t val) {
@@ -263,24 +265,28 @@ public:
     // before any stream mutation just fails the doc.
     std::vector<int64_t> encoded;
     bool wasArray = coerce::forEachElement(val, [&](const IndexVal& elem) {
-      encoded.push_back(fieldType->coerceColInt64(elem, std::string_view(fieldName)));
+      encoded.push_back(fieldType->coerceColInt64(
+          elem, std::string_view(fieldName), inverter.coerceContext));
     });
     if (!wasArray) {
-      encoded.push_back(fieldType->coerceColInt64(val, std::string_view(fieldName)));
+      encoded.push_back(fieldType->coerceColInt64(
+          val, std::string_view(fieldName), inverter.coerceContext));
     }
     indexMulti(inverter, std::span<const int64_t>(encoded.data(), encoded.size()));
   }
 
   void index(Inverter& inverter, int64_t int64) override {
     indexMulti(inverter, std::views::single(
-        fieldType->coerceColInt64(coerce::scalarVal(int64), std::string_view(fieldName))));
+        fieldType->coerceColInt64(coerce::scalarVal(int64), std::string_view(fieldName),
+                                  inverter.coerceContext)));
   }
 
   void index(Inverter& inverter, std::span<const int64_t> vals) override {
     // int64 -> any int-column type never throws, so the lazy transform is safe
     // under the validate-before-mutate contract.
-    indexMulti(inverter, vals | std::views::transform([this](int64_t v) {
-      return fieldType->coerceColInt64(coerce::scalarVal(v), std::string_view(fieldName));
+    indexMulti(inverter, vals | std::views::transform([this, &inverter](int64_t v) {
+      return fieldType->coerceColInt64(coerce::scalarVal(v), std::string_view(fieldName),
+                                       inverter.coerceContext);
     }));
   }
 

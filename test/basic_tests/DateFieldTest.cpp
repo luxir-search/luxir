@@ -5,6 +5,8 @@
 #include "test/CollectionHelper.h"
 #include "test/LocalReq.h"
 #include "test/QueryBuild.h"
+#include "solux/query/NumericRangeQuery.h"
+#include "solux/query/QueryBuilder.h"
 #include "solux/util/DateTime.h"
 
 using namespace solux;
@@ -58,6 +60,95 @@ TEST_F(DateFieldTest, parseEpochMillisInteger) {
   EXPECT_EQ(0, parseDateToEpochMillis("0"));
 }
 
+TEST_F(DateFieldTest, parseSolrDateMath) {
+  int64_t now = *parseDateToEpochMillis("2024-06-25T10:30:45.123Z");
+  EXPECT_EQ(now, parseDateToEpochMillis("NOW", now));
+  EXPECT_EQ(*parseDateToEpochMillis("2024-08-22T00:00:00Z"),
+            parseDateToEpochMillis("NOW+2MONTHS-3DAYS/DAY", now));
+  EXPECT_EQ(*parseDateToEpochMillis("1972-11-23T00:00:00Z"),
+            parseDateToEpochMillis(
+                "1972-05-20T17:33:18.772Z+6MONTHS+3DAYS/DAY", now));
+
+  // Calendar addition clamps rather than rolling into the following month.
+  EXPECT_EQ(*parseDateToEpochMillis("2024-02-29T12:00:00Z"),
+            parseDateToEpochMillis("2024-01-31T12:00:00Z+1MONTH", now));
+  EXPECT_EQ(*parseDateToEpochMillis("2025-02-28T12:00:00Z"),
+            parseDateToEpochMillis("2024-02-29T12:00:00Z+1YEAR", now));
+  EXPECT_EQ(now + datetime_detail::kMsPerDay + 60001,
+            parseDateToEpochMillis("NOW+1DATE+1MINUTE+1MILLI", now));
+  // The longest valid anchor wins, including its numeric zone offset.
+  EXPECT_EQ(*parseDateToEpochMillis("2024-06-25T09:30:00Z"),
+            parseDateToEpochMillis("2024-06-25T10:30:00+02:00+1HOUR", now));
+}
+
+TEST_F(DateFieldTest, parseOpenSearchDateMath) {
+  int64_t now = *parseDateToEpochMillis("2024-06-25T10:30:45.123Z");
+  EXPECT_EQ(*parseDateToEpochMillis("2024-07-25T10:30:45.123Z"),
+            parseDateToEpochMillis("now+1M", now));
+  EXPECT_EQ(now + 60000, parseDateToEpochMillis("now+1m", now));
+  EXPECT_EQ(now + 3601000, parseDateToEpochMillis("now+1H+1s", now));
+  EXPECT_EQ(*parseDateToEpochMillis("2022-07-17T00:00:00Z"),
+            parseDateToEpochMillis("2022-05-18T15:23:17.789||+2M-1d/d", now));
+
+  auto day = parseDateRange("2022-05-18T15:23||/d", now);
+  ASSERT_TRUE(day.has_value());
+  EXPECT_EQ(*parseDateToEpochMillis("2022-05-18T00:00:00Z"), day->lo);
+  EXPECT_EQ(*parseDateToEpochMillis("2022-05-19T00:00:00Z"), day->hiExclusive);
+
+  auto week = parseDateRange("2024-06-26T12:00:00Z||/w", now);  // Wednesday
+  ASSERT_TRUE(week.has_value());
+  EXPECT_EQ(*parseDateToEpochMillis("2024-06-24T00:00:00Z"), week->lo);  // Monday
+  EXPECT_EQ(*parseDateToEpochMillis("2024-07-01T00:00:00Z"), week->hiExclusive);
+}
+
+TEST_F(DateFieldTest, dateMathRoundingWindowAndAnchorCollision) {
+  int64_t now = *parseDateToEpochMillis("2024-06-25T10:30:45.123Z");
+  auto shiftedDay = parseDateRange("NOW/DAY+1HOUR", now);
+  ASSERT_TRUE(shiftedDay.has_value());
+  EXPECT_EQ(*parseDateToEpochMillis("2024-06-25T01:00:00Z"), shiftedDay->lo);
+  EXPECT_EQ(*parseDateToEpochMillis("2024-06-26T01:00:00Z"), shiftedDay->hiExclusive);
+
+  // No math preserves the existing partial-literal window. Once math starts,
+  // the partial anchor is its start instant; only slash creates a new window.
+  auto june = parseDateRange("2024-06", now);
+  auto july = parseDateRange("2024-06||+1M", now);
+  ASSERT_TRUE(june.has_value());
+  ASSERT_TRUE(july.has_value());
+  EXPECT_EQ(30 * datetime_detail::kMsPerDay, june->hiExclusive - june->lo);
+  EXPECT_EQ(1, july->hiExclusive - july->lo);
+  EXPECT_EQ(*parseDateToEpochMillis("2024-07-01T00:00:00Z"), july->lo);
+
+  // Solr direct suffixes remain available on partial anchors too.
+  EXPECT_EQ(*parseDateToEpochMillis("2024-05-31T00:00:00Z"),
+            parseDateToEpochMillis("2024-06-1DAY", now));
+}
+
+TEST_F(DateFieldTest, dateMathRejectsMalformedAndOverflow) {
+  int64_t now = *parseDateToEpochMillis("2024-06-25T10:30:45.123Z");
+  for (std::string_view bad : {
+         "NOW+DAY", "NOW+1", "NOW/", "NOW+1FORTNIGHT", "NOW +1DAY",
+         "NOW||", "2024-01-01||", "2024-01-01||||+1d",
+         "now+1D", "now+9223372036854775807y",
+         "32767-12-31T23:59:59.999Z+1MILLI"
+       }) {
+    EXPECT_FALSE(parseDateRange(bad, now).has_value()) << bad;
+  }
+}
+
+TEST(DateMathQueryBuilder, usesOneExplicitNowAndRoundingWindow) {
+  auto schema = Schema::createDefaultSchema();
+  MemPool pool;
+  int64_t now = *parseDateToEpochMillis("2024-06-25T10:30:45.123Z");
+  QueryBuilder builder(pool, *schema, now);
+  api::Val val;
+  val.kind = std::string_view("NOW/DAY");
+  auto* range = dynamic_cast<NumericRangeQuery*>(
+      builder.createMatchQuery("when_dt", val));
+  ASSERT_NE(nullptr, range);
+  EXPECT_EQ(*parseDateToEpochMillis("2024-06-25T00:00:00Z"), range->getLo());
+  EXPECT_EQ(*parseDateToEpochMillis("2024-06-25T23:59:59.999Z"), range->getHi());
+}
+
 TEST_F(DateFieldTest, parseRejectsInvalid) {
   EXPECT_FALSE(parseDateToEpochMillis("").has_value());
   EXPECT_FALSE(parseDateToEpochMillis("not a date").has_value());
@@ -83,6 +174,10 @@ TEST_F(DateFieldTest, parseRejectsOutOfRange) {
   EXPECT_FALSE(parseDateToEpochMillis("100000-01-01").has_value());
   // boundary still parses (year 9999 ~ 2.5e14 ms, well inside the range)
   EXPECT_TRUE(parseDateToEpochMillis("9999-12-31T23:59:59Z").has_value());
+  auto maxMonth = parseDateRange("32767-12");
+  ASSERT_TRUE(maxMonth.has_value());
+  EXPECT_EQ(datetime_detail::kMaxEpochMs + 1, maxMonth->hiExclusive);
+  EXPECT_FALSE(parseDateToEpochMillis("32767-12-31T23:59:59-01:00").has_value());
 }
 
 // Date strings are untrusted user input, so the parser is an attack surface.
@@ -92,10 +187,10 @@ TEST_F(DateFieldTest, parseRejectsOutOfRange) {
 // through the formatter.  Biased toward date-shaped bytes so the structured
 // paths are exercised, not just early rejects.
 TEST_F(DateFieldTest, parseFuzzSafetyAndInvariants) {
-  static const char alphabet[] = "0123456789-:.TtZz+ ,";
+  static const char alphabet[] = "0123456789-:.TtZz+ ,/|NOWymwdhHsMILLISECONDS";
   std::string buf;
   for (int iter = 0; iter < 100000; iter++) {
-    size_t len = rng() % 72;  // spans up to / past kMaxParseLen (64)
+    size_t len = iter % 100 == 0 ? 257 : rng() % 72;  // regularly cross the 256-byte cap
     buf.resize(len);
     for (size_t i = 0; i < len; i++) {
       buf[i] = (rng() & 3) ? alphabet[rng() % (sizeof(alphabet) - 1)] : (char)(rng() & 0xff);
@@ -192,6 +287,42 @@ TEST_F(DateFieldTest, roundTrip) {
                                         "stamps_dts", vec_i(a, b))));
   EXPECT_TRUE(containsDoc(docs, flatdoc("id_s", "d2", "when_dt", ms2,
                                         "stamps_dts", vec_i(a, b))));
+}
+
+TEST_F(DateFieldTest, indexDateMathAndStableNowPerUpdate) {
+  CollectionHelper helper;
+  std::vector<Doc> docs = {
+    flatdoc("id", "solr", "when_dt", "2024-06-24T12:00:00Z+1DAY"),
+    flatdoc("id", "opensearch", "when_dt", "2024-06-24T12:00:00Z||+1d"),
+    flatdoc("id", "now1", "when_dt", "NOW"),
+    flatdoc("id", "now2", "when_dt", "now"),
+  };
+  auto result = helper.indexAll(docs, UpdateMessage::COMMIT);
+  ASSERT_EQ(solux::api::UpdateResponse_::Status::OK, result.status);
+
+  auto req = localReq(soluxNode->getSearchEngine());
+  req->collection("main").topDocs("q").allQuery().fields({"id", "when_dt"}).limit(10);
+  req->execute();
+  ASSERT_TRUE(req->ok()) << req->errorMsg();
+
+  int64_t expected = *parseDateToEpochMillis("2024-06-25T12:00:00Z");
+  std::optional<int64_t> now1, now2;
+  for (auto& doc : req->getDocs()) {
+    auto* id = find(doc, "id");
+    auto* when = find(doc, "when_dt");
+    ASSERT_NE(nullptr, id);
+    ASSERT_NE(nullptr, when);
+    std::string value = std::get<std::string>(*id);
+    int64_t millis = std::get<int64_t>(*when);
+    if (value == "solr" || value == "opensearch") {
+      EXPECT_EQ(expected, millis);
+    }
+    if (value == "now1") now1 = millis;
+    if (value == "now2") now2 = millis;
+  }
+  ASSERT_TRUE(now1.has_value());
+  ASSERT_TRUE(now2.has_value());
+  EXPECT_EQ(*now1, *now2);
 }
 
 // Sorting runs on the raw millis column (chronological order, no decode).
@@ -301,6 +432,12 @@ TEST_F(DateFieldTest, queryGranularity) {
   EXPECT_EQ(2, count([](OpCursor& c) { c.matchQuery("when_dt", "2024-06-25"); }));
   EXPECT_EQ(1, count([](OpCursor& c) { c.matchQuery("when_dt", "2024-06-25T08:00:00Z"); }));
   EXPECT_EQ(3, count([](OpCursor& c) { c.matchQuery("when_dt", "2024-06"); }));
+  EXPECT_EQ(2, count([](OpCursor& c) {
+    c.exprQuery("when_dt:2024-06-25T12:00:00Z||/d");
+  }));
+  EXPECT_EQ(2, count([](OpCursor& c) {
+    c.simpleQuery("when_dt:2024-06-25T12:00:00Z/DAY", {"id"});
+  }));
 
   // range endpoints include the granule they name; exclusive excludes it whole
   auto range = [&](const char* gteV, const char* ltV, bool loIncl, bool hiIncl) {

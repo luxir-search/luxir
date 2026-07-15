@@ -269,7 +269,8 @@ public:
 
     // Place the Query in the requestPool since it uses things like string_view that directly reference
     // the request.
-    ParseContext parseContext{req.requestPool, *req.schema, &req.warnings};
+    ParseContext parseContext{
+      req.requestPool, *req.schema, &req.warnings, req.dateMathNowEpochMillis};
     ProtobufQueryParser parser(parseContext);
     if (!topDocsReq.query.has_value()) {
       throw std::runtime_error("TopDocs requires a query");
@@ -388,7 +389,8 @@ public:
       sources.push_back(src);
     }
 
-    ParseContext parseContext{req.requestPool, *req.schema, &req.warnings};
+    ParseContext parseContext{
+      req.requestPool, *req.schema, &req.warnings, req.dateMathNowEpochMillis};
     ProtobufQueryParser parser(parseContext);
     auto sharedFilters = parseNamedFilters(parser, fusionProto.filter);
     // Reuse the first source's qcontext to build the shared filter

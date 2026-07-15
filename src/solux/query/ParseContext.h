@@ -7,6 +7,7 @@
 
 #include "solux/api/solux_types.hpp"
 #include "solux/schema/Schema.h"
+#include "solux/util/Clock.h"
 #include "solux/util/MemPool.h"
 
 namespace solux {
@@ -31,6 +32,17 @@ struct ParseContext {
   // limit: deterministic for a given request, so exceeding it errors freely.
   // The value is a generous default until the limits-config snapshot exists.
   int nestingBudget = 128;
+
+  // Stable across every short-lived QueryBuilder participating in this parse.
+  // SearchRequest supplies its request snapshot; direct users get one when
+  // they construct the context.
+  int64_t dateMathNowEpochMillis = currentEpochMillis();
+
+  ParseContext(MemPool& pool, Schema& schema,
+               std::vector<api::Warning>* warnings = nullptr,
+               int64_t dateMathNowEpochMillis = currentEpochMillis())
+    : pool(pool), schema(schema), warnings(warnings),
+      dateMathNowEpochMillis(dateMathNowEpochMillis) {}
 
   // code must be a string with static storage duration (a literal).
   void warn(std::string_view code, std::string_view message) {

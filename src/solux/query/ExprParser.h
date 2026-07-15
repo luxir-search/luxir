@@ -16,7 +16,7 @@
 
 #include "solux/api/build.h"
 #include "solux/api/solux_types.hpp"
-#include "solux/query/Cursor.h"
+#include "solux/util/Cursor.h"
 #include "solux/query/ExprFunctions.h"
 #include "solux/query/QueryBuilder.h"
 #include "solux/query/SimpleQueryParser.h"

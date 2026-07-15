@@ -96,7 +96,8 @@ clauses, under facet domains, as fusion sources, as filters.
   reordered terms are allowed, an adjacent transposition costs 2, and the
   multi-value position gap of 100 can be crossed at slop 100 or more),
   `range` over numeric, date, and term-backed fields (`gte`/`gt`/`lte`/`lt`,
-  any side open-ended; dates accept ISO-8601 or epoch millis, and a partial
+  any side open-ended; dates accept ISO-8601, epoch millis, or combined
+  Solr/OpenSearch date math with request-stable `NOW`/`now`, and a partial
   date means the window it names - equality on `2024-06-25` matches the
   whole day; string/text fields range over their indexed terms in byte
   order, constant-scoring; with no bounds it matches every document that

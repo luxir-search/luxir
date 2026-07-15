@@ -55,6 +55,11 @@ public:
 
   std::shared_ptr<Schema> schema;
 
+  // Fixed by ProtoUpdateMessage for the duration of one update so every NOW
+  // in every document/value resolves identically. Direct test indexing leaves
+  // this unset and DATE coercion captures the clock at the call site.
+  CoerceContext coerceContext;
+
   // If the flush of this inverter is part of a commit, then this will point to the CommitInfo
   // It is set asynchronously and consumed by the IndexWriter and is not used by the Inverter itself.
   CommitInfo* commitInfo = nullptr;

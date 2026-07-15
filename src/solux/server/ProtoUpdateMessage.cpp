@@ -135,6 +135,7 @@ void ProtoUpdateMessage::handle(IndexWriter& iw) {
 
   Inverter& inverter = iw.obtainInverter(this->updateVersion);
   inverter.overwrite = !req->allow_dups;
+  inverter.coerceContext.dateMathNowEpochMillis = dateMathNowEpochMillis;
 
   // Captured before deletes are queued so an all_or_none failure rolls them back too.
   auto requestMark = inverter.undoMark();

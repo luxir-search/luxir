@@ -5,6 +5,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -13,6 +14,13 @@
 namespace solux {
 
 namespace api { struct Val; }  // the wire value oneof (api/solux_types.hpp)
+
+// Request/update-scoped inputs that can affect value coercion. NOW is the only
+// one today; a context avoids teaching generic column handlers about DATE and
+// leaves one seam for a future date-math time zone or other contextual types.
+struct CoerceContext {
+  std::optional<int64_t> dateMathNowEpochMillis;
+};
 
 
 
@@ -125,7 +133,11 @@ public:
   // epoch millis for DATE (ISO-8601 strings parsed on the way in).  Throws on
   // impossible values (per-doc failure at ingest, request error at query
   // build).
-  virtual int64_t coerceColInt64(const api::Val& val, std::string_view fieldName) const;
+  // context fixes NOW for the surrounding request/update. Other numeric types
+  // ignore it; a missing value lets DATE capture the clock at this call.
+  virtual int64_t coerceColInt64(
+      const api::Val& val, std::string_view fieldName,
+      const CoerceContext& context = {}) const;
 
   // Term/text bytes for term-backed fields (TEXT/STRING/ID).  Numeric and
   // bool arms render canonically into buf (>= coerce::TEXT_BUF_SIZE bytes)
@@ -215,7 +227,9 @@ public:
   IntFieldType(std::string_view name, int flags=COLUMN_STORED) : FieldType(name, FieldType::INT, flags) {
   }
 
-  int64_t coerceColInt64(const api::Val& val, std::string_view fieldName) const override;
+  int64_t coerceColInt64(
+      const api::Val& val, std::string_view fieldName,
+      const CoerceContext& context = {}) const override;
 };
 
 // FLOAT and DOUBLE fields store Lucene-style sortable bits in the standard
@@ -227,7 +241,9 @@ public:
   FloatFieldType(std::string_view name, int flags=COLUMN_STORED) : FieldType(name, FieldType::FLOAT, flags) {
   }
 
-  int64_t coerceColInt64(const api::Val& val, std::string_view fieldName) const override;
+  int64_t coerceColInt64(
+      const api::Val& val, std::string_view fieldName,
+      const CoerceContext& context = {}) const override;
 };
 
 class DoubleFieldType : public FieldType {
@@ -235,7 +251,9 @@ public:
   DoubleFieldType(std::string_view name, int flags=COLUMN_STORED) : FieldType(name, FieldType::DOUBLE, flags) {
   }
 
-  int64_t coerceColInt64(const api::Val& val, std::string_view fieldName) const override;
+  int64_t coerceColInt64(
+      const api::Val& val, std::string_view fieldName,
+      const CoerceContext& context = {}) const override;
 };
 
 // DATE stores int64 milliseconds since the Unix epoch directly in the standard
@@ -248,14 +266,17 @@ public:
   DateFieldType(std::string_view name, int flags=COLUMN_STORED) : FieldType(name, FieldType::DATE, flags) {
   }
 
-  int64_t coerceColInt64(const api::Val& val, std::string_view fieldName) const override;
+  int64_t coerceColInt64(
+      const api::Val& val, std::string_view fieldName,
+      const CoerceContext& context = {}) const override;
 
   // The [lo, hiExclusive) epoch-millis window a query-side date literal
   // denotes at its own granularity: "2024-06-25" is the whole day, "2024-06"
   // the month, epoch millis a single instant.  Queries match/round by the
   // window; ingest and sorting use coerceColInt64 (the window start).
-  std::pair<int64_t, int64_t> coerceDateRange(const api::Val& val,
-                                              std::string_view fieldName) const;
+  std::pair<int64_t, int64_t> coerceDateRange(
+      const api::Val& val, std::string_view fieldName,
+      const CoerceContext& context = {}) const;
 };
 
 class GeoPointFieldType : public FieldType {

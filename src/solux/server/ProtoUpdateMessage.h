@@ -7,6 +7,7 @@
 
 #include "solux/index/UpdateMessage.h"
 #include "solux/api/build.h"
+#include "solux/util/Clock.h"
 
 namespace solux {
 
@@ -42,8 +43,10 @@ public:
   void clearIds() { ids_.clear(); }
 
   const RequestProto* req;  // The request object may become unavailable after the callback is called
+  const int64_t dateMathNowEpochMillis;
 
-  ProtoUpdateMessage(const RequestProto* req, ResponseProto* rsp=nullptr) : response(rsp), req(req) {
+  ProtoUpdateMessage(const RequestProto* req, ResponseProto* rsp=nullptr)
+    : response(rsp), req(req), dateMathNowEpochMillis(currentEpochMillis()) {
     if (response != nullptr) {
       // A caller-supplied response (unary path) gets the same initialization an
       // on-demand one gets in getResponse().
