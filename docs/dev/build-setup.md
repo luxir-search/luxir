@@ -36,3 +36,12 @@ as missing. Each preset you open in the IDE needs its own one-time build. The re
 gcc/ninja build still uses the PCH normally.
 
 Delete any non-preset CLion "Debug" profile -- it has no vcpkg toolchain and will fail.
+
+## Time-zone database at runtime
+
+`std::chrono` time-zone support requires the system zoneinfo database to be
+present at runtime. Without it, the service degrades to UTC and fixed-offset
+zones only. The loaded tzdb version is logged at startup. Keep the zoneinfo
+data and the C++ runtime consistent across a fleet: identical tzdb version
+strings do not guarantee identical transition decoding across different
+parser implementations.

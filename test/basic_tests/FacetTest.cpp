@@ -23,6 +23,7 @@
 #include "solux/reader/SkipStats.h"
 #include "solux/search/ops/FacetOp.h"
 #include "solux/search/ops/StrFacetOp.h"
+#include "solux/util/NumericUtils.h"
 
 using namespace solux;
 using namespace solux::test;
@@ -82,6 +83,42 @@ void expectRangeResult(const api::FacetResult& result,
     EXPECT_EQ(counts[i], result.counts[i]);
   }
   EXPECT_EQ(missing, result.missing.value_or(-1));
+}
+
+int64_t fpEncoded(float value) {
+  return (int64_t)floatToSortableInt32(value);
+}
+
+int64_t fpEncoded(double value) {
+  return doubleToSortableInt64(value);
+}
+
+template<typename Outer, typename T>
+void expectFloatingRangeResult(const api::FacetResult& result,
+                               std::span<const T> fences,
+                               std::span<const T> values) {
+  ASSERT_TRUE(result.bucket_ids.has_value());
+  const auto& bounds = std::get<Outer>(result.bucket_ids->kind).v;
+  ASSERT_EQ(fences.size() - 1, bounds.size());
+  ASSERT_EQ(bounds.size(), result.counts.size());
+
+  std::vector<int64_t> expected(bounds.size());
+  for (T value : values) {
+    int64_t encoded = fpEncoded(value);
+    for (size_t bucket = 0; bucket < bounds.size(); bucket++) {
+      if (encoded >= fpEncoded(fences[bucket])
+          && encoded < fpEncoded(fences[bucket + 1])) {
+        expected[bucket]++;
+        break;
+      }
+    }
+  }
+  for (size_t bucket = 0; bucket < bounds.size(); bucket++) {
+    ASSERT_EQ(2u, bounds[bucket].v.size());
+    EXPECT_EQ(fences[bucket], bounds[bucket].v[0]);
+    EXPECT_EQ(fences[bucket + 1], bounds[bucket].v[1]);
+    EXPECT_EQ(expected[bucket], result.counts[bucket]);
+  }
 }
 
 int64_t epoch(std::string_view text) {
@@ -418,6 +455,102 @@ TEST_F(FacetTest, pointsRangeFacetMatchesColumnWalk) {
   // Later tests (TermScorerTest) index into "main" without clearing first.
 }
 
+TEST_F(FacetTest, floatingRangeFacetMatchesScanAndColumnWalk) {
+  CollectionHelper helper;
+  helper.clear();
+  const std::array fields = {
+    RangeSchemaField{"value_f", true, false, api::FieldDef::FieldClass::FLOAT},
+    RangeSchemaField{"value_d", true, false, api::FieldDef::FieldClass::DOUBLE}
+  };
+  setRangeFacetSchema(helper, fields);
+
+  const float floatEdge = 0.2f;
+  const std::array floatValues = {
+    -std::numeric_limits<float>::infinity(), -0.0f, 0.0f,
+    std::nextafter(floatEdge, -std::numeric_limits<float>::infinity()),
+    floatEdge,
+    std::nextafter(floatEdge, std::numeric_limits<float>::infinity()),
+    0.8f, std::nextafter(1.0f, 0.0f), 1.0f,
+    std::numeric_limits<float>::infinity(),
+    std::numeric_limits<float>::quiet_NaN()
+  };
+  const double doubleEdge = 0.25;
+  const std::array doubleValues = {
+    -std::numeric_limits<double>::infinity(), -0.0, 0.0,
+    std::nextafter(doubleEdge, -std::numeric_limits<double>::infinity()),
+    doubleEdge,
+    std::nextafter(doubleEdge, std::numeric_limits<double>::infinity()),
+    0.75, std::nextafter(1.0, 0.0), 1.0,
+    std::numeric_limits<double>::infinity(),
+    std::numeric_limits<double>::quiet_NaN()
+  };
+  for (size_t i = 0; i < floatValues.size(); i++) {
+    ASSERT_TRUE(helper.index(flatdoc("id", "f" + std::to_string(i),
+                                     "value_f", floatValues[i]),
+                             UpdateMessage::NO_COMMIT).success);
+  }
+  for (size_t i = 0; i < doubleValues.size(); i++) {
+    ASSERT_TRUE(helper.index(flatdoc("id", "d" + std::to_string(i),
+                                     "value_d", doubleValues[i]),
+                             i + 1 == doubleValues.size()
+                                 ? UpdateMessage::COMMIT
+                                 : UpdateMessage::NO_COMMIT).success);
+  }
+
+  const std::array<float, 6> floatFences = {
+    0.0f, 0.2f, 0.4f, 0.6f, 0.8f, 1.0f
+  };
+  const std::array<double, 5> doubleFences = {
+    0.0, 0.25, 0.5, 0.75, 1.0
+  };
+  PointsRangeFacetTestGuard guard;
+  auto run = [&](bool disablePoints) {
+    IntFacetRangeReq::disablePointsRangeFacetForTests = disablePoints;
+    SkipStats::reset();
+    auto req = localReq(soluxNode->getSearchEngine());
+    req->collection("main");
+    req->rangeFacet("floats", "value_f").rangeFp(-0.0, 1.0, 0.2);
+    req->rangeFacet("doubles", "value_d").rangeFp(-0.0, 1.0, 0.25);
+    req->rangeFacet("none", "value_d").rangeFp(0.0, 1.0, 0.25)
+        .mincount(100);
+    req->execute(false);
+    EXPECT_TRUE(req->ok()) << req->errorMsg();
+
+    const auto& floatResult = rootFacetResult(*req, "floats");
+    expectFloatingRangeResult<api::ArrArrFloat>(
+        floatResult, std::span<const float>(floatFences),
+        std::span<const float>(floatValues));
+    const auto& floatBounds = std::get<api::ArrArrFloat>(
+        floatResult.bucket_ids->kind).v;
+    EXPECT_EQ(0, std::bit_cast<uint32_t>(floatBounds.front().v.front()));
+    EXPECT_EQ(0, floatResult.counts[2]);
+
+    const auto& doubleResult = rootFacetResult(*req, "doubles");
+    expectFloatingRangeResult<api::ArrArrDouble>(
+        doubleResult, std::span<const double>(doubleFences),
+        std::span<const double>(doubleValues));
+    const auto& doubleBounds = std::get<api::ArrArrDouble>(
+        doubleResult.bucket_ids->kind).v;
+    EXPECT_EQ(0, std::bit_cast<uint64_t>(doubleBounds.front().v.front()));
+    EXPECT_EQ(0, doubleResult.counts[2]);
+
+    const auto& none = rootFacetResult(*req, "none");
+    EXPECT_TRUE(std::get<api::ArrArrDouble>(none.bucket_ids->kind).v.empty());
+    EXPECT_TRUE(none.counts.empty());
+    std::array<std::vector<std::byte>, 3> encoded = {
+      encodeFacetResult(*req, "floats"), encodeFacetResult(*req, "doubles"),
+      encodeFacetResult(*req, "none")
+    };
+    return std::pair{std::move(encoded), SkipStats::rangeFacetPointsArms};
+  };
+
+  auto [pointsResults, pointsArms] = run(false);
+  auto [walkResults, walkArms] = run(true);
+  EXPECT_EQ(3, pointsArms);
+  EXPECT_EQ(0, walkArms);
+  EXPECT_EQ(pointsResults, walkResults);
+}
+
 TEST_F(FacetTest, pointsRangeFacetFallbacks) {
   PointsRangeFacetTestGuard guard;
   IntFacetRangeReq::disablePointsRangeFacetForTests = false;
@@ -750,7 +883,8 @@ TEST_F(FacetTest, rangeFacetValidationAndDegenerateRanges) {
   const std::array fields = {
     RangeSchemaField{"number_i", false, false},
     RangeSchemaField{"when_dt", false, false, api::FieldDef::FieldClass::DATE},
-    RangeSchemaField{"number_f", false, false, api::FieldDef::FieldClass::FLOAT}
+    RangeSchemaField{"number_f", false, false, api::FieldDef::FieldClass::FLOAT},
+    RangeSchemaField{"number_d", false, false, api::FieldDef::FieldClass::DOUBLE}
   };
   setRangeFacetSchema(helper, fields);
 
@@ -805,8 +939,38 @@ TEST_F(FacetTest, rangeFacetValidationAndDegenerateRanges) {
         "2024-01-01", "2024-01-02", 1, api::CalendarGap_::Unit::UNKNOWN);
   }, "requires n > 0");
   expectError([](LocalReq& req) {
-    req.rangeFacet("f", "number_f").range(0, 10, 1);
-  }, "float/double range facets are not yet supported");
+    req.rangeFacet("f", "number_f").rangeFp(
+        std::numeric_limits<double>::quiet_NaN(), 1.0, 0.1);
+  }, "range start must be finite");
+  expectError([](LocalReq& req) {
+    req.rangeFacet("f", "number_d").rangeFp(
+        0.0, std::numeric_limits<double>::infinity(), 0.1);
+  }, "range end must be finite");
+  expectError([](LocalReq& req) {
+    req.rangeFacet("f", "number_d").rangeFp(
+        0.0, 1.0, std::numeric_limits<double>::quiet_NaN());
+  }, "range gap must be finite");
+  expectError([](LocalReq& req) {
+    req.rangeFacet("f", "number_f").rangeFp(
+        0.0, 1.0, std::numeric_limits<double>::infinity());
+  }, "range gap must be finite");
+  expectError([](LocalReq& req) {
+    req.rangeFacet("f", "number_f").rangeFp(0.0, 1.0, -0.0);
+  }, "gap must be > 0");
+  expectError([](LocalReq& req) {
+    req.rangeFacet("f", "number_f").rangeFp(16777216.0, 16777220.0, 1.0);
+  }, "fence 1");
+  expectError([](LocalReq& req) {
+    req.rangeFacet("f", "number_f").rangeFp(0.0, 1e300, 1e299);
+  }, "not finite after FLOAT rounding");
+  expectError([](LocalReq& req) {
+    auto& cursor = req.rangeFacet("f", "number_f").rangeFp(0.0, 1.0, 0.1);
+    std::get<api::RangeFacet>(cursor.rawOp().kind).time_zone = "UTC";
+  }, "only valid for DATE fields");
+  expectError([](LocalReq& req) {
+    req.rangeFacet("f", "number_d").calendarRange(
+        "0", "1", 1, api::CalendarGap_::Unit::DAY);
+  }, "only valid for DATE fields");
 }
 
 TEST_F(FacetTest, rangeFacetEmptyDomainAndPartialLastBucket) {

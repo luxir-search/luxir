@@ -2,6 +2,7 @@
 
 #include "solux/util/proto.h"
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 #include <limits>
 #include <variant>
@@ -18,6 +19,8 @@
 #include "solux/query/BooleanQuery.h"
 #include "solux/query/ForcePrepareQuery.h"
 #include "solux/query/ProtobufQueryParser.h"
+#include "solux/schema/ValCoerce.h"
+#include "solux/util/NumericUtils.h"
 #include "solux/util/Overloaded.h"
 
 namespace solux {
@@ -63,6 +66,46 @@ class ProtobufSearchParser {
       fences[(size_t)i] = (int64_t)((uint64_t)start + offset);
     }
     return {fences, gap, true};
+  }
+
+  ParsedFences makeFloatingFences(std::string_view facetName,
+                                  FieldType::Type type,
+                                  double start, double end, double gap) {
+    std::vector<int64_t> built;
+    built.reserve(256);
+    for (size_t i = 0; ; i++) {
+      if (i > MAX_RANGE_BUCKETS) {
+        throw std::runtime_error("facet '" + std::string(facetName)
+            + "': range exceeds the 100000 bucket limit");
+      }
+      double nominal = start + (double)i * gap;
+      double value = nominal < end ? nominal : end;
+      int64_t encoded;
+      if (type == FieldType::Type::FLOAT) {
+        float rounded = (float)value;
+        if (!std::isfinite(rounded)) {
+          throw std::runtime_error("facet '" + std::string(facetName)
+              + "': fence " + std::to_string(i)
+              + " is not finite after FLOAT rounding");
+        }
+        encoded = (int64_t)floatToSortableInt32(rounded);
+      } else {
+        encoded = doubleToSortableInt64(value);
+      }
+      if (!built.empty() && encoded <= built.back()) {
+        throw std::runtime_error("facet '" + std::string(facetName)
+            + "': fence " + std::to_string(i)
+            + " is not strictly increasing after "
+            + (type == FieldType::Type::FLOAT ? "FLOAT" : "DOUBLE")
+            + " rounding");
+      }
+      built.push_back(encoded);
+      if (value == end) break;
+    }
+
+    auto fences = req.requestPool.make_span<int64_t>(built.size());
+    std::copy(built.begin(), built.end(), fences.begin());
+    return {fences, 0, false};
   }
 
   static std::optional<CalendarUnit> calendarUnit(
@@ -349,15 +392,12 @@ public:
     }
 
     auto& fieldType = req.schema->getFieldTypeEx(facetField);
-    if (fieldType->type() == FieldType::Type::FLOAT
-        || fieldType->type() == FieldType::Type::DOUBLE) {
-      throw std::runtime_error("facet '" + std::string(facetName)
-          + "': float/double range facets are not yet supported");
-    }
     if (fieldType->type() != FieldType::Type::INT
-        && fieldType->type() != FieldType::Type::DATE) {
+        && fieldType->type() != FieldType::Type::DATE
+        && fieldType->type() != FieldType::Type::FLOAT
+        && fieldType->type() != FieldType::Type::DOUBLE) {
       throw std::runtime_error("facet '" + std::string(facetName)
-          + "': range facets require an INT or DATE field");
+          + "': range facets require an INT, DATE, FLOAT, or DOUBLE field");
     }
 
     bool calendar = std::holds_alternative<api::CalendarGap>(facetReq.gap_kind);
@@ -405,6 +445,42 @@ public:
       }
       return range.lo;
     };
+
+    bool floating = fieldType->type() == FieldType::Type::FLOAT
+                 || fieldType->type() == FieldType::Type::DOUBLE;
+    if (floating) {
+      auto floatingValue = [&](const api::Val& value, std::string_view name) {
+        double result = coerce::toDouble(value, facetField);
+        if (!std::isfinite(result)) {
+          throw std::runtime_error("facet '" + std::string(facetName)
+              + "': range " + std::string(name) + " must be finite");
+        }
+        return result == 0.0 ? 0.0 : result;
+      };
+      double start = floatingValue(*facetReq.start, "start");
+      double end = floatingValue(*facetReq.end, "end");
+      if (start >= end) {
+        throw std::runtime_error("facet '" + std::string(facetName)
+            + "': range start must be less than end");
+      }
+      const auto* gapValue = std::get_if<api::Val>(&facetReq.gap_kind);
+      if (gapValue == nullptr) {
+        throw std::runtime_error("facet '" + std::string(facetName)
+            + "': time_zone and calendar_gap are only valid for DATE fields");
+      }
+      double gap = floatingValue(*gapValue, "gap");
+      if (gap <= 0.0) {
+        throw std::runtime_error("facet '" + std::string(facetName)
+            + "': range gap must be > 0");
+      }
+      ParsedFences parsed = makeFloatingFences(
+          facetName, fieldType->type(), start, end, gap);
+      return solux::arenaCreate<IntFacetRangeReq>(
+          req.arena, req, facetReq, facetField, facetName, parsed.values,
+          parsed.affine, parsed.affineGap, fieldType->type(), minCount,
+          facetReq.missing);
+    }
+
     int64_t start = fieldType->type() == FieldType::Type::DATE
         ? dateBound(*facetReq.start)
         : fieldType->coerceColInt64(*facetReq.start, facetField, context);
@@ -441,7 +517,8 @@ public:
 
     return solux::arenaCreate<IntFacetRangeReq>(
         req.arena, req, facetReq, facetField, facetName, parsed.values,
-        parsed.affine, parsed.affineGap, minCount, facetReq.missing);
+        parsed.affine, parsed.affineGap, fieldType->type(), minCount,
+        facetReq.missing);
   }
 
   // Build SortField list from a proto SortSpec repeated field.  Schema lookups

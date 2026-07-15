@@ -73,6 +73,7 @@ public:
   OpCursor& limit(int64_t n);     // TopDocs.limit or FieldFacet.limit, by op kind
   OpCursor& mincount(int64_t n);  // FieldFacet / RangeFacet
   OpCursor& range(int64_t start, int64_t end, int64_t gap);  // RangeFacet bounds
+  OpCursor& rangeFp(double start, double end, double gap);
   OpCursor& range(std::string_view start, std::string_view end, int64_t gap);
   OpCursor& calendarRange(
       std::string_view start, std::string_view end, int32_t n,
@@ -507,6 +508,17 @@ inline OpCursor& OpCursor::mincount(int64_t n) {
   return *this;
 }
 inline OpCursor& OpCursor::range(int64_t start, int64_t end, int64_t gap) {
+  auto& r = std::get<solux::api::RangeFacet>(op_->kind);
+  auto* startVal = req_->arenaNew<solux::api::Val>();
+  auto* endVal = req_->arenaNew<solux::api::Val>();
+  startVal->kind = start;
+  endVal->kind = end;
+  r.start = startVal;
+  r.end = endVal;
+  r.gap_kind.emplace<solux::api::Val>().kind = gap;
+  return *this;
+}
+inline OpCursor& OpCursor::rangeFp(double start, double end, double gap) {
   auto& r = std::get<solux::api::RangeFacet>(op_->kind);
   auto* startVal = req_->arenaNew<solux::api::Val>();
   auto* endVal = req_->arenaNew<solux::api::Val>();

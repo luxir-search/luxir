@@ -17,6 +17,7 @@
 #include "solux/schema/Schema.h"
 #include "solux/search/OrdMapStr.h"
 #include "solux/util/AtomicMerger.h"
+#include "solux/util/NumericUtils.h"
 #include "solux/util/SegmentMergeDriver.h"
 #include "solux/search/ops/DomainIter.h"
 
@@ -486,6 +487,7 @@ public:
 class IntFacetRangeReq : public FacetReq {
   std::span<const int64_t> fences;
   int64_t affineGap;
+  FieldType::Type valueType;
   bool affine;
 
   size_t bucketCount() const { return fences.size() - 1; }
@@ -498,9 +500,9 @@ public:
   IntFacetRangeReq(SearchRequest& req, const ReqRangeFacet& rangeFacet,
     std::string_view fieldName, std::string_view facetName,
     std::span<const int64_t> fences, bool affine, int64_t affineGap,
-    int64_t minCount, bool missing)
+    FieldType::Type valueType, int64_t minCount, bool missing)
   : FacetReq(req, fieldName, facetName, -1, minCount, missing, rangeFacet.sorts),
-    fences(fences), affineGap(affineGap), affine(affine) {}
+    fences(fences), affineGap(affineGap), valueType(valueType), affine(affine) {}
 
   virtual ~IntFacetRangeReq() = default;
 
@@ -625,16 +627,34 @@ public:
         if (count >= minCount) emitted.push_back(i);
       }
 
-      auto& bucketIds = facetResultProto.bucket_ids.emplace().kind.emplace<solux::api::ArrArrInt>();
       size_t n = emitted.size();
-      solux::api::ArrInt* pairs = build::allocArray(bucketIds.v, n, mr);
-      int64_t* counts = build::allocArray(facetResultProto.counts, n, mr);
-      for (size_t i = 0; i < n; i++) {
-        size_t bucket = emitted[i];
-        int64_t* bounds = build::allocArray(pairs[i].v, 2, mr);
-        bounds[0] = thisOp().fences[bucket];
-        bounds[1] = thisOp().fences[bucket + 1];
-        counts[i] = merged.counts.empty() ? 0 : merged.counts[bucket];
+      auto emitBounds = [&]<typename Outer>(auto decode) {
+        auto& bucketIds = facetResultProto.bucket_ids.emplace().kind.emplace<Outer>();
+        auto* pairs = build::allocArray(bucketIds.v, n, mr);
+        int64_t* counts = build::allocArray(facetResultProto.counts, n, mr);
+        for (size_t i = 0; i < n; i++) {
+          size_t bucket = emitted[i];
+          auto* bounds = build::allocArray(pairs[i].v, 2, mr);
+          bounds[0] = decode(thisOp().fences[bucket]);
+          bounds[1] = decode(thisOp().fences[bucket + 1]);
+          counts[i] = merged.counts.empty() ? 0 : merged.counts[bucket];
+        }
+      };
+      switch (thisOp().valueType) {
+        case FieldType::Type::FLOAT:
+          emitBounds.template operator()<solux::api::ArrArrFloat>(
+              [](int64_t encoded) {
+                return sortableInt32ToFloat((int32_t)encoded);
+              });
+          break;
+        case FieldType::Type::DOUBLE:
+          emitBounds.template operator()<solux::api::ArrArrDouble>(
+              [](int64_t encoded) { return sortableInt64ToDouble(encoded); });
+          break;
+        default:
+          emitBounds.template operator()<solux::api::ArrArrInt>(
+              [](int64_t value) { return value; });
+          break;
       }
       if (missing) {
         facetResultProto.missing = merged.missing_num;
