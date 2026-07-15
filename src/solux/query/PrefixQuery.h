@@ -7,7 +7,8 @@
 namespace solux {
 
 // Matches documents with a term in `field` starting with `prefix`.  The prefix
-// is used verbatim; an empty prefix matches documents that have the field.
+// is used verbatim; an empty prefix matches documents that have at least one
+// indexed term in the field.
 // Every hit scores `boost` (a prefix match has no per-term ranking).
 class PrefixQuery final : public MultiTermQuery {
   std::string_view prefix;

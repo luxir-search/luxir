@@ -91,6 +91,11 @@ public:
     EXPECT_NE(nullptr, p);
     return *p;
   }
+  static const api::ExistsQuery& asExists(const api::Query& q) {
+    const auto* e = std::get_if<api::ExistsQuery>(&q.kind);
+    EXPECT_NE(nullptr, e);
+    return *e;
+  }
   static const api::FuzzyQuery& asFuzzy(const api::Query& q) {
     const auto* f = std::get_if<api::FuzzyQuery>(&q.kind);
     EXPECT_NE(nullptr, f);
@@ -487,13 +492,8 @@ TEST_F(ExprParserTest, scoreDecorationErrors) {
 TEST_F(ExprParserTest, existsAndMatchAll) {
   EXPECT_TRUE(std::holds_alternative<bool>(parse("*:*")->kind));
 
-  const auto& p = asPrefix(*parse("title:*"));  // term field: empty prefix
-  EXPECT_EQ("title", p.field);
-  EXPECT_TRUE(p.prefix.empty());
-
-  const auto& r = asRange(*parse("count:*"));  // numeric column: unbounded range
-  EXPECT_EQ("count", r.field);
-  EXPECT_FALSE(r.gte.has_value() || r.gt.has_value() || r.lte.has_value() || r.lt.has_value());
+  EXPECT_EQ("title", asExists(*parse("title:*")).field);
+  EXPECT_EQ("count", asExists(*parse("count:*")).field);
 }
 
 // ---------- $var binding ----------
@@ -554,6 +554,7 @@ TEST_F(ExprParserTest, functionVariety) {
   EXPECT_EQ("2000", valStr(r.lt));
 
   EXPECT_TRUE(std::holds_alternative<bool>(parse("all()")->kind));
+  EXPECT_EQ("title", asExists(*parse("exists(title)")).field);
 
   const auto* cs = std::get_if<api::ConstantScoreQuery>(&parse("constant_score(status:live, score=2.5)")->kind);
   ASSERT_NE(nullptr, cs);

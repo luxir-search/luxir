@@ -231,10 +231,19 @@ title_w:mess*        terms starting with "mess"
 title_w:dune~        fuzzy; edit distance chosen from the term length
 title_w:dune~1       fuzzy, one edit (maximum 2; ~0 means exact)
 year_i:*             documents with any value in the field
+exists(year_i)       the same existence query in function form
 *:*                  every document
 ```
 
-`field:*` works on every field type.
+`field:*` works on every indexed or column-stored field type and lowers to the
+structured `{"exists":{"field":"field"}}` query. It matches documents that
+supplied at least one accepted value: an empty string and text that analyzes to
+zero tokens are present, while an empty multi-valued array is missing. Values
+discarded during ingestion, such as a zero-norm cosine vector, are also missing.
+Stored-only fields cannot be queried for existence.
+
+Existence matches score `0`. Use the constant-score decoration when existence
+should contribute to ranking, for example `field:*^=2`.
 
 Prefix and fuzzy text is folded the way the field folds - `title_wl:Runn*`
 finds what "Runner" indexed - but never split into words. On unanalyzed
@@ -287,6 +296,7 @@ phrase(dune messiah, field=title_w)
 phrase(dune messiah, field=title_w, slop=2)
 fuzzy(smith, field=name_s, max_edits=2, prefix_length=0)
 prefix(mess, field=title_w)
+exists(year_i)
 range(field=year_i, gte=1960, lt=1970)
 boost(title_w:dune, boost=2)
 constant_score(status_s:active AND year_i:>=1960, score=1.0)

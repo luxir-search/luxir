@@ -1,5 +1,7 @@
 #pragma once
 
+#include <algorithm>
+
 #include "Query.h"
 
 namespace solux {
@@ -68,6 +70,32 @@ public:
     int32_t advanceShallowForSetup(int32_t target) override {
       unused(target);
       return PostingsReader::END;
+    }
+
+    void fillWindowBits(std::span<uint64_t> windowBits, int32_t windowStart,
+                        int32_t windowEnd) override {
+      skipCount(SkipStats::countBulkFillCalls);
+      if (windowEnd <= windowStart || docid == PostingsReader::END || docid >= windowEnd) return;
+
+      int32_t start = std::max(windowStart, docid < 0 ? windowStart : docid);
+      int32_t end = std::min(windowEnd, lastDoc + 1);
+      if (start < end) {
+        int32_t first = start - windowStart;
+        int32_t last = end - windowStart;
+        int32_t firstWord = first >> 6;
+        int32_t lastWord = (last - 1) >> 6;
+        uint64_t firstMask = ~0ULL << (first & 63);
+        uint64_t lastMask = ~0ULL >> (63 - ((last - 1) & 63));
+        if (firstWord == lastWord) {
+          windowBits[(size_t)firstWord] |= firstMask & lastMask;
+        } else {
+          windowBits[(size_t)firstWord] |= firstMask;
+          std::fill(windowBits.begin() + firstWord + 1,
+                    windowBits.begin() + lastWord, ~0ULL);
+          windowBits[(size_t)lastWord] |= lastMask;
+        }
+      }
+      docid = windowEnd <= lastDoc ? windowEnd : PostingsReader::END;
     }
   };
 

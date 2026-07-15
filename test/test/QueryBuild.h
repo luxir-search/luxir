@@ -60,6 +60,13 @@ inline api::Query prefix(std::pmr::memory_resource& mr, std::string_view field,
   return q;
 }
 
+inline api::Query exists(std::pmr::memory_resource& mr, std::string_view field) {
+  api::Query q;
+  auto& e = q.kind.emplace<api::ExistsQuery>();
+  e.field = build::arenaStr(mr, field);
+  return q;
+}
+
 // ---- range bound Vals: allocate a Val with one scalar arm in the arena ----
 inline api::Val* valI64(std::pmr::memory_resource& mr, int64_t x) {
   auto* v = (api::Val*)mr.allocate(sizeof(api::Val), alignof(api::Val));

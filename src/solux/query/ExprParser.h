@@ -233,10 +233,14 @@ private:
   FieldType& resolveField(std::string_view name, size_t pos) {
     FieldType* ft = opts.schema->getFieldTypePtr(name);
     if (ft == nullptr) fail(pos, fmt::format("unknown field '{}'", name));
-    if (!termQueryable(*ft) && !numericQueryable(*ft)) {
-      fail(pos, fmt::format("field '{}' is not queryable", name));
-    }
     return *ft;
+  }
+
+  void requireValueQueryable(std::string_view field, FieldType& ft, size_t pos) {
+    if (!termQueryable(ft) && !numericQueryable(ft)) {
+      fail(pos, fmt::format(
+          "field '{}' does not support term, phrase, or range syntax", field));
+    }
   }
 
   // ---- keywords / identifiers ----
@@ -677,16 +681,17 @@ private:
     }
     if (c == '[' || c == '{') {
       if (scope == nullptr) fail(pos, "a range needs a field: field:[low TO high]");
-      return parseRangeForm(scope->field);
+      return parseRangeForm(scope->field, *scope->type);
     }
     if (c == '<' || c == '>') {
       if (scope == nullptr) fail(pos, "a comparison needs a field: field:>=value");
-      return parseComparisonForm(scope->field, stops);
+      return parseComparisonForm(scope->field, *scope->type, stops);
     }
     if (c == '$') {
       if (scope == nullptr) {
         fail(pos, "a $variable is a value, not a clause; use field:$name or a function argument");
       }
+      requireValueQueryable(scope->field, *scope->type, pos);
       const api::Val* val = parseVarRef();
       return finishDecorations(makeMatch(scope->field, val), "a $variable");
     }
@@ -746,9 +751,10 @@ private:
       return finishDecorations(node, "a group");
     }
     if (c == '"' || c == '\'') return parsePhraseForm(field, ft);
-    if (c == '[' || c == '{') return parseRangeForm(field);
-    if (c == '<' || c == '>') return parseComparisonForm(field, stops);
+    if (c == '[' || c == '{') return parseRangeForm(field, ft);
+    if (c == '<' || c == '>') return parseComparisonForm(field, ft, stops);
     if (c == '$') {
+      requireValueQueryable(field, ft, pos);
       const api::Val* val = parseVarRef();
       return finishDecorations(makeMatch(field, val), "a $variable");
     }
@@ -762,6 +768,7 @@ private:
   // phrase; unanalyzed STRING/ID matches the whole text as one exact term;
   // numeric columns match the exact value (the quotes only delimit).
   const api::Query* parsePhraseForm(std::string_view field, FieldType& ft) {
+    requireValueQueryable(field, ft, cur.position());
     std::string_view body = scanQuoted();
     int32_t slop = 0;
     if (cur.peek() == '~') {
@@ -823,7 +830,8 @@ private:
     return allocVal(t.text);
   }
 
-  const api::Query* parseRangeForm(std::string_view field) {
+  const api::Query* parseRangeForm(std::string_view field, FieldType& ft) {
+    requireValueQueryable(field, ft, cur.position());
     bool loInclusive = cur.peek() == '[';
     cur.advance();
 
@@ -852,7 +860,9 @@ private:
     return finishDecorations(q, "a range");
   }
 
-  const api::Query* parseComparisonForm(std::string_view field, std::string_view stops) {
+  const api::Query* parseComparisonForm(std::string_view field, FieldType& ft,
+                                        std::string_view stops) {
+    requireValueQueryable(field, ft, cur.position());
     char op = cur.peek();
     cur.advance();
     bool orEqual = cur.consume('=');
@@ -910,24 +920,17 @@ private:
       return decorateToken(q, t);
     }
 
-    // field:* - "has a value", by the field's natural mechanism: an unbounded
-    // range over a numeric column, an empty prefix over a term field (matches
-    // every term; correct but proportional to the field's postings)
+    // field:* - a value was supplied for this field. QueryBuilder centrally
+    // validates that the field is indexed or column-stored.
     if (text == "*" && !t.escaped) {
-      if (numericQueryable(ft)) {
-        api::RangeQuery r;
-        r.field = field;
-        api::Query* q = allocQuery();
-        q->kind = r;
-        return decorateToken(q, t);
-      }
-      api::PrefixQuery p;
-      p.field = field;
-      p.prefix = {};
+      api::ExistsQuery e;
+      e.field = field;
       api::Query* q = allocQuery();
-      q->kind = p;
+      q->kind = e;
       return decorateToken(q, t);
     }
+
+    requireValueQueryable(field, ft, t.pos);
 
     // prefix: an unescaped trailing '*' (mid-token '*' is a literal byte)
     if (t.trailingStar) {
@@ -953,9 +956,6 @@ private:
 
     if (name.text == "expr") {
       fail(name.pos, "expr is not callable within expr; write the expression inline");
-    }
-    if (name.text == "field") {
-      fail(name.pos, "'field' is not a callable query type");
     }
     if (name.text == "all") {
       cur.skipWs();

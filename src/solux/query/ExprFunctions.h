@@ -35,7 +35,7 @@ inline constexpr std::array<std::string_view, 16> ARM_NAMES = {
     "match",          // Match
     "boolean",        // BooleanQuery
     "all",            // bool - callable as all(), handled specially
-    "field",          // string_view - not a valid query today; not callable
+    "exists",         // ExistsQuery
     "phrase",         // PhraseQuery
     "knn",            // KnnQuery
     "constant_score", // ConstantScoreQuery
@@ -59,6 +59,7 @@ static_assert(std::variant_size_v<decltype(api::Query::kind)> == ARM_NAMES.size(
 // string/Val slots, a sub-expression for Query slots.
 inline constexpr std::string_view mainValueArg(std::string_view fn) {
   if (fn == "match") return "val";
+  if (fn == "exists") return "field";
   if (fn == "phrase") return "text";
   if (fn == "simple_query") return "q";
   if (fn == "prefix") return "prefix";
@@ -77,15 +78,14 @@ inline constexpr std::string_view jsonName(std::string_view member) {
 
 // Emplace the message arm named `name` in q and invoke f on the fresh
 // message.  Returns false when no callable message arm has that name; the
-// caller owns the error (and the special cases: "all" is the bool arm,
-// "expr"/"field" exist but are deliberately not callable).
+// caller owns the error (and the special cases: "all" is the bool arm and
+// "expr" is deliberately not callable).
 template <typename F>
 bool withCallableArm(api::Query& q, std::string_view name, F&& f) {
   bool called = false;
   auto tryArm = [&]<size_t I>() {
     using Arm = std::variant_alternative_t<I, decltype(api::Query::kind)>;
     if constexpr (std::is_class_v<Arm> && !std::is_same_v<Arm, std::monostate> &&
-                  !std::is_same_v<Arm, std::string_view> &&
                   !std::is_same_v<Arm, api::ExprQuery> &&
                   !std::is_same_v<Arm, api::GeoBoxQuery> &&
                   !std::is_same_v<Arm, api::GeoDistanceQuery>) {

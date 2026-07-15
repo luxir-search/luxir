@@ -296,6 +296,7 @@ public:
       longStream.addVal(inverter.pool, val);
       n++;
     }
+    if (n == 0) return;
     numVals += n;
     docsWithVal.addDoc(inverter.pool, inverter.getDoc());
     lengthStream.addVal(inverter.pool, n);

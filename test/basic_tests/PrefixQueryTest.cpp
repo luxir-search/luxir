@@ -131,6 +131,7 @@ TEST_F(PrefixQueryTest, fieldTypeValidation) {
   EXPECT_NE(builder.createPrefixQuery("foo_s", "ab"), nullptr);   // STRING
   EXPECT_NE(builder.createPrefixQuery("foo_w", "ab"), nullptr);   // TEXT
   EXPECT_NE(builder.createPrefixQuery("id", "d"), nullptr);       // ID
+  EXPECT_THROW(builder.createPrefixQuery("foo_sc", "ab"), std::runtime_error);  // STRING column only
   EXPECT_THROW(builder.createPrefixQuery("foo_i", "1"), std::runtime_error);  // INT: no terms
 }
 
@@ -174,7 +175,7 @@ TEST_F(PrefixQueryE2ETest, textField) {
   EXPECT_EQ(prefixCount("body_w", "ap"), 3);   // apple, apricot -> d1, d3, d4
   EXPECT_EQ(prefixCount("body_w", "a"), 3);    // + avocado, still d1, d3, d4
   EXPECT_EQ(prefixCount("body_w", "ban"), 1);  // banana -> d2
-  EXPECT_EQ(prefixCount("body_w", ""), 4);     // empty prefix matches every doc
+  EXPECT_EQ(prefixCount("body_w", ""), 4);     // every doc has an indexed term
   EXPECT_EQ(prefixCount("body_w", "z"), 0);    // no matches
 }
 

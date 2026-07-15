@@ -392,10 +392,10 @@ TEST_F(SimpleQueryParserTest, fieldedDecorations) {
   EXPECT_EQ("title", f->field);
   EXPECT_EQ("abc", f->term);
 
-  // field:* = documents having the field (empty prefix)
-  const auto* has = std::get_if<api::PrefixQuery>(&parse("title:*").root->kind);
+  // field:* = documents supplied with the field
+  const auto* has = std::get_if<api::ExistsQuery>(&parse("title:*").root->kind);
   ASSERT_NE(nullptr, has);
-  EXPECT_EQ("", has->prefix);
+  EXPECT_EQ("title", has->field);
 }
 
 TEST_F(SimpleQueryParserTest, fieldedPhrase) {
@@ -552,14 +552,11 @@ TEST_F(SimpleQueryParserTest, numericFieldFuzzyDegrades) {
 }
 
 TEST_F(SimpleQueryParserTest, numericFieldExistenceStar) {
-  // field:* is the universal has-a-value idiom: an unbounded range over the
-  // column, same as expr (and no warning - nothing degraded)
+  // field:* is the universal has-a-value idiom, independent of field type.
   auto r = parse("count:*");
-  const auto* rq = std::get_if<api::RangeQuery>(&r.root->kind);
-  ASSERT_NE(nullptr, rq);
-  EXPECT_EQ("count", rq->field);
-  EXPECT_FALSE(rq->gte.has_value() || rq->gt.has_value() || rq->lte.has_value() ||
-               rq->lt.has_value());
+  const auto* exists = std::get_if<api::ExistsQuery>(&r.root->kind);
+  ASSERT_NE(nullptr, exists);
+  EXPECT_EQ("count", exists->field);
   EXPECT_TRUE(r.warnings.empty());
 }
 

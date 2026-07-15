@@ -52,6 +52,7 @@ public:
 
   // --- configure a TopDocs/Fusion op (assert kind) ---
   OpCursor& allQuery();
+  OpCursor& existsQuery(std::string_view field);
   OpCursor& matchQuery(std::string_view field, std::string_view value);
   OpCursor& matchQuery(std::string_view field, std::string_view value, solux::api::Match_::Operator op);
   OpCursor& matchFilter(std::string_view name, std::string_view field, std::string_view value);  // append to TopDocs.filter
@@ -405,6 +406,11 @@ inline OpCursor& OpCursor::genOpHelper(std::string_view name, std::string_view f
 }
 
 inline OpCursor& OpCursor::allQuery() { getOrCreateQuery().kind = true; return *this; }  // the `all` arm
+inline OpCursor& OpCursor::existsQuery(std::string_view field) {
+  auto& e = getOrCreateQuery().kind.emplace<solux::api::ExistsQuery>();
+  e.field = build::arenaStr(req_->mr, field);
+  return *this;
+}
 inline OpCursor& OpCursor::matchQuery(std::string_view field, std::string_view value) {
   auto& q = getOrCreateQuery();
   auto& m = std::holds_alternative<solux::api::Match>(q.kind)

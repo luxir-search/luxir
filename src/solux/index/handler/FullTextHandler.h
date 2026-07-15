@@ -92,6 +92,7 @@ public:
       throw std::runtime_error(fmt::format("Field '{}' is single-valued but received multiple values",
                                            std::string_view(fieldName)));
     }
+    if (vals.empty()) return;
 
     TokenChain& tc = *tokenChain;
     Token& tok = tc.head.getToken();
@@ -148,9 +149,7 @@ public:
 
   void flushPositions(Inverter& inverter) {
     auto sz = termsHash.size();
-    if (sz == 0) {
-      return;  // Drop the field if it has no terms.
-    }
+    if (numDocsWithField == 0) return;
 
     // gathering and sorting terms for each field could be done in parallel, but it probably doesn't
     // represent much time.  Fields that can result in their own file should be able to be parallelized easily!
@@ -167,8 +166,10 @@ public:
     // std::chrono::high_resolution_clock::time_point startTime = std::chrono::high_resolution_clock::now();
     // std::sort(terms, terms+sz);
     // boost::sort::pdqsort(terms, terms+sz);
-    boost::sort::spreadsort::string_sort(terms, terms + sz, TermRef::bracket(), TermRef::getsize(),
-                                         TermRef::lessthan());
+    if (sz > 0) {
+      boost::sort::spreadsort::string_sort(terms, terms + sz, TermRef::bracket(), TermRef::getsize(),
+                                           TermRef::lessthan());
+    }
     // auto endTime = std::chrono::high_resolution_clock::now();
     // auto thisElapsed = std::chrono::duration_cast<std::chrono::nanoseconds>( endTime - startTime ).count();
     // std::cout << "terms=" << sz << " SORT time ns=" << thisElapsed << std::endl;

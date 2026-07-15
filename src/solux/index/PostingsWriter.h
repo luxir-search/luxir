@@ -1468,8 +1468,18 @@ public:
     fieldInfo->sumDocFreq = sumDocFreq;
     fieldInfo->sumTotalTermFreq = sumTotalTermFreq;
 
+    if (numTerms == 0) {
+      assert(termBlockOffsets.empty());
+      fieldInfo->termBlockIndexLoc = {0, 0};
+      fieldInfo->termsLoc = {0, 0};
+      fieldInfo->docsLoc = {0, 0};
+      fieldInfo->posLoc = {0, 0};
+      fieldInfo->trieLoc = {0, 0};
+      fieldInfo->trieRootOff = 0;
+      return;
+    }
+
     fieldInfo->termBlockIndexLoc = seg_location(termOutput.streamNumber, termOutput.size());
-    // one way this assert can fail is if numTerms==0, but I think so far this always represents a bug elsewhere.
     assert((int)termBlockOffsets.size() == ((numTerms-1) / Postings::TERMS_BLOCK_SIZE) + 1);
     // Append the trie after the fixed block-offset array.  trieRootOff is
     // relative to trieLoc, while child links inside the trie are backward

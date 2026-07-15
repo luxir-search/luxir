@@ -417,6 +417,10 @@ private:
     }
   }
 
+  static bool existsQueryable(FieldType& fieldType) {
+    return fieldType.indexed() || fieldType.hasColumn();
+  }
+
   static std::string_view numericTypeName(FieldType::Type t) {
     switch (t) {
       case FieldType::Type::INT: return "integer";
@@ -461,6 +465,25 @@ private:
   FieldType* fieldedHead(std::string_view head) {
     FieldType* fieldType = fieldFor(head);
     if (fieldType == nullptr) return nullptr;
+    if (isAllowed(head)) return fieldType;
+    warn("field_narrowed",
+         fmt::format("field '{}' is outside this request's allowed_fields; treated as text", head));
+    return nullptr;
+  }
+
+  FieldType* fieldedExistsHead(std::string_view head) {
+    FieldType* fieldType = opts.schema->getFieldTypePtr(head);
+    if (fieldType == nullptr) {
+      warn("exists_field_unknown",
+           fmt::format("field '{}' is unknown; field:* was treated as text", head));
+      return nullptr;
+    }
+    if (!existsQueryable(*fieldType)) {
+      warn("exists_field_unqueryable",
+           fmt::format("field '{}' is neither indexed nor column-stored; field:* was treated as text",
+                       head));
+      return nullptr;
+    }
     if (isAllowed(head)) return fieldType;
     warn("field_narrowed",
          fmt::format("field '{}' is outside this request's allowed_fields; treated as text", head));
@@ -965,18 +988,18 @@ private:
       std::string_view tail = token.substr(*firstColon + 1);
       // an empty value is only meaningful with a prefix star (field:* = has field)
       if (!tail.empty() || (prefix && !sawFuzzy)) {
-        if (FieldType* ft = fieldedHead(head)) {
+        bool existsSyntax = prefix && !sawFuzzy && tail.empty();
+        FieldType* ft = existsSyntax ? fieldedExistsHead(head) : fieldedHead(head);
+        if (ft != nullptr) {
+          if (existsSyntax) {
+            api::ExistsQuery e;
+            e.field = arenaStr(head);
+            api::Query q;
+            q.kind = e;
+            addUnit(st, allocQuery(q));
+            return;
+          }
           if (numericQueryable(*ft)) {
-            // field:* is the universal "has a value" idiom: an unbounded range
-            // over the column (the same exists query expr compiles).
-            if (prefix && !sawFuzzy && tail.empty()) {
-              api::RangeQuery r;
-              r.field = arenaStr(head);
-              api::Query q;
-              q.kind = r;
-              addUnit(st, allocQuery(q));
-              return;
-            }
             // Otherwise numeric column fields take only an exact-match arm
             // (field:value).  Wildcard '*' / fuzzy '~' have no numeric meaning,
             // and a value that is not a valid number/date cannot be a numeric

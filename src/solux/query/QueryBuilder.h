@@ -11,6 +11,7 @@
 
 #include "solux/analysis/Analyzer.h"
 #include "solux/query/BooleanQuery.h"
+#include "solux/query/ExistsQuery.h"
 #include "solux/query/FuzzyQuery.h"
 #include "solux/query/MatchNoDocsQuery.h"
 #include "solux/query/NumericRangeQuery.h"
@@ -180,6 +181,15 @@ public:
     return pool.make<MatchNoDocsQuery>();
   }
 
+  Query* createExistsQuery(std::string_view field) {
+    FieldType& fieldType = *schema.getFieldTypeEx(field);
+    if (!fieldType.indexed() && !fieldType.hasColumn()) {
+      throw std::runtime_error(std::format(
+          "Exists query requires an indexed or column-stored field: {}", field));
+    }
+    return pool.make<ExistsQuery>(field);
+  }
+
   // Normalize multiterm query input (a prefix or fuzzy term) for a TEXT
   // field: the field's normalization chain applies - case/character folds,
   // never segmentation - so THOM* finds what "Thomas" indexed (the classic
@@ -206,6 +216,10 @@ public:
         [[fallthrough]];
       case FieldType::Type::ID:
       case FieldType::Type::STRING:
+        if (!fieldType.indexed()) {
+          throw std::runtime_error(std::format(
+              "Prefix query requires an indexed field: {}", field));
+        }
         // Indexed terms carry at most PackedTerm::MAX_LEN bytes; a longer
         // prefix is truncated so it matches terms of oversized source values.
         return pool.make<PrefixQuery>(field, PackedTerm::truncate(prefix));

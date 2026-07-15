@@ -139,6 +139,21 @@ TEST(JsonDialect, RangeQuery) {
   EXPECT_FALSE(r.lte.has_value());
 }
 
+TEST(JsonDialect, ExistsQuery) {
+  std::pmr::monotonic_buffer_resource mr;
+  P::Query q;
+  ASSERT_TRUE(P::read_json(q, R"({"exists":{"field":"body_w"}})", mr));
+  EXPECT_EQ("body_w", std::get<P::ExistsQuery>(q.kind).field);
+
+  std::string canonical;
+  ASSERT_TRUE(P::write_json(q, canonical));
+  EXPECT_EQ(R"({"exists":{"field":"body_w"}})", canonical);
+
+  // Tag 4 used to be a bare field arm. The old object spelling is not an arm.
+  P::Query old;
+  EXPECT_FALSE(P::read_json(old, R"({"field":"body_w"})", mr));
+}
+
 TEST(JsonDialect, QueryBareStringIsExprSugar) {
   std::pmr::monotonic_buffer_resource mr;
   P::Query q;

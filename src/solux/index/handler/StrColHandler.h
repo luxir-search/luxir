@@ -114,6 +114,7 @@ public:
       throw std::runtime_error(fmt::format("Field '{}' is single-valued but received multiple values",
                                           std::string_view(fieldName)));
     }
+    if (vals.empty()) return;
 
     numDocs++;
     docsWithVal.addDoc(inverter.pool, inverter.getDoc());

@@ -143,7 +143,7 @@ message Query {
     Match match = 1;                // selects all documents with a value match in the specified field
     BooleanQuery boolean = 2;
     bool all = 3;                   // selects all documents
-    string field = 4;               // selects all documents with the given field name.  // TODO: what about field regex?
+    ExistsQuery exists = 4;         // selects documents that supplied a value for the field
     PhraseQuery phrase = 5;         // selects all documents with a phrase
     KnnQuery knn = 6;               // approximate nearest-neighbor over a vector field
     ConstantScoreQuery constant_score = 7; // wraps a query and replaces each hit's score
@@ -161,6 +161,10 @@ message Query {
   }
 
 
+}
+
+message ExistsQuery {
+  string field = 1;
 }
 
 message ConstantScoreQuery {
@@ -305,7 +309,7 @@ message BooleanQuery {
 
 // Matches documents where `field` has a term starting with `prefix`.
 // The prefix is used exactly as provided.  An empty prefix matches documents
-// that have the field.
+// that have at least one indexed term for the field.
 message PrefixQuery {
   string field = 1;
   string prefix = 2;

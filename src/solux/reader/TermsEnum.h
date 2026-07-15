@@ -68,10 +68,10 @@ class TermsEnum {
   bool metadataRunsParsed = false;
 
   // term index level
-  const int64_t* termBlockOffsets;
+  const int64_t* termBlockOffsets = nullptr;
   InputStream trieIS;
   const char* trieBase;
-  int32_t numTermBlocks;
+  int32_t numTermBlocks = 0;
 
 public:
   struct EncodedImpactFrontier {
@@ -101,12 +101,13 @@ public:
   // fieldInfo is not copied and should remain valid throughout the lifetime of this TermsEnum and any related classes such as DocsEnum
   TermsEnum(MemPool& pool, PostingsReader& postingsReader, const SegFieldInfo& fieldInfo) : pool(pool), postingsReader(postingsReader), fieldInfo(fieldInfo) {
     unused(this->pool, this->postingsReader);
+    currTerm = PackedTerm(pool.alloc(PackedTerm::getMemSize(PackedTerm::MAX_BYTES)), 0);
+    if (fieldInfo.nTerms == 0) return;
     numTermBlocks = ((fieldInfo.nTerms-1) / Postings::TERMS_BLOCK_SIZE) + 1;
     termsIS = postingsReader.getInputStreamSeek(fieldInfo.termBlockIndexLoc);
     termBlockOffsets = reinterpret_cast<const int64_t*>(termsIS.ptr());  // offsets from termsLoc
     trieIS = postingsReader.getInputStreamSeek(fieldInfo.trieLoc);
     trieBase = trieIS.ptr();
-    currTerm = PackedTerm(pool.alloc(PackedTerm::getMemSize(PackedTerm::MAX_BYTES)), 0);
   }
 
   int32_t numTerms() const {
@@ -532,6 +533,7 @@ public:
   /// If there is a next term, this advances to it and returns true.
   /// Otherwise, no advance is done (i.e. ord() is not changed.)
   bool nextTerm() {
+    if (fieldInfo.nTerms == 0) return false;
     if (ordInBlock == maxOrdInBlock) {
       if (ord() + 1 >= fieldInfo.nTerms) {  // could also compare number of blocks to detect end.
         return false;
@@ -589,6 +591,7 @@ protected:
 
 public:
   bool seek(std::string_view target) {
+    if (fieldInfo.nTerms == 0) return false;
     seekBlock(target, 0);
     return seekInBlock(target);
   }
@@ -598,6 +601,7 @@ public:
   /// Otherwise descends the trie and asserts the result is at or after the next block.
   /// Can be called without a prior seek() - the first call will load the first block.
   bool seekForward(std::string_view target) {
+    if (fieldInfo.nTerms == 0) return false;
     if (termBlockIndex < 0) {
       // Not yet positioned - load first block
       termBlockIndex = 0;
@@ -636,6 +640,7 @@ public:
   /// if target sorts after every term.  To detect an exact match, compare
   /// term() to target after a true return.
   bool seekCeil(std::string_view target) {
+    if (fieldInfo.nTerms == 0) return false;
     // Start from the block whose first term is the greatest one <= target.
     seekBlock(target, 0);
     // nextTerm() can cross block boundaries, so this also handles a target

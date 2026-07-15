@@ -169,6 +169,12 @@ public:
     return builder.createPrefixQuery(prefixQuery.field, prefixQuery.prefix);
   }
 
+  solux::Query* parseExists(const solux::api::ExistsQuery& existsQuery) {
+    QueryBuilder builder(
+        pool, schema, context.coerceContext, context.opName, context.warnings);
+    return builder.createExistsQuery(existsQuery.field);
+  }
+
   solux::Query* parseRange(const solux::api::RangeQuery& rangeQuery) {
     auto ptr = [](const ::hpp_proto::optional_indirect_view<solux::api::Val>& v)
         -> const solux::api::Val* { return v.has_value() ? &*v : nullptr; };
@@ -382,6 +388,7 @@ public:
       [&](const solux::api::Match& m) -> solux::Query* { return parseMatch(m); },
       [&](const solux::api::PhraseQuery& p) -> solux::Query* { return parsePhrase(p); },
       [&](const solux::api::PrefixQuery& p) -> solux::Query* { return parsePrefix(p); },
+      [&](const solux::api::ExistsQuery& e) -> solux::Query* { return parseExists(e); },
       [&](const solux::api::RangeQuery& r) -> solux::Query* { return parseRange(r); },
       [&](const solux::api::GeoBoxQuery& g) -> solux::Query* { return parseGeoBox(g); },
       [&](const solux::api::GeoDistanceQuery& g) -> solux::Query* {
@@ -396,9 +403,6 @@ public:
       [&](const solux::api::ConstantScoreQuery& c) -> solux::Query* { return parseConstantScore(c); },
       [&](const solux::api::BoostQuery& b) -> solux::Query* { return parseBoost(b); },
       [&](std::monostate) -> solux::Query* { throw std::runtime_error("query oneof not set"); },
-      [&](std::string_view) -> solux::Query* {  // the bare `field` string arm is not a query
-        throw std::runtime_error("field-only query arm is not a valid query");
-      },
     }, pquery.kind);
   }
 

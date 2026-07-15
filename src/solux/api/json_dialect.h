@@ -330,8 +330,8 @@ struct from<JSON, solux::api::Query> {
             arm(std::in_place_type<api::BooleanQuery>);
           } else if (key == "all") {
             util::from_json<V>(value.kind.template emplace<bool>(), ctx, vit, vend);
-          } else if (key == "field") {
-            util::from_json<V>(value.kind.template emplace<std::string_view>(), ctx, vit, vend);
+          } else if (key == "exists") {
+            arm(std::in_place_type<api::ExistsQuery>);
           } else if (key == "phrase") {
             arm(std::in_place_type<api::PhraseQuery>);
           } else if (key == "knn") {

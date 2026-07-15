@@ -775,7 +775,9 @@ private:
         int cmp = b.tenum.term() <=> a.tenum.term();
         return cmp < 0 || (cmp == 0 && b.idx < a.idx);  // tiebreak by index so we visit segments in order
       };
-      IndirectPQ<TermsEnumIdx, decltype(termCmp)> termPQ(tenums, tenumPtrs, false);
+      // Only enums positioned on a term participate. Some indexed text
+      // segments legitimately have presence/norms but zero terms.
+      IndirectPQ<TermsEnumIdx, decltype(termCmp)> termPQ(tenumPtrs);
 
       // iterate through the terms in sorted order
       char termBuf[PackedTerm::MAX_BYTES];
