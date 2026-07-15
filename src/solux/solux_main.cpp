@@ -34,20 +34,25 @@ int solux_main(int argc, char** argv) {
            spdlog::level::to_string_view((spdlog::level::level_enum)SPDLOG_ACTIVE_LEVEL),
            spdlog::level::to_string_view(spdlog::get_level()));
 
-  SoluxNode node{config};
+  try {
+    SoluxNode node{config};
 
-  // The HTTP/JSON server runs on its own io threads; start it (non-blocking)
-  // before the blocking gRPC run().
-  std::optional<HttpServer> httpServer;
-  if (config.server.http.enabled) {
-    httpServer.emplace(node, config.server.http.resolveThreads(), config.server.http.port);
-    httpServer->start();
+    // The HTTP/JSON server runs on its own io threads; start it (non-blocking)
+    // before the blocking gRPC run().
+    std::optional<HttpServer> httpServer;
+    if (config.server.http.enabled) {
+      httpServer.emplace(node, config.server.http.resolveThreads(), config.server.http.port);
+      httpServer->start();
+    }
+
+    GRPCServer server(node, config.server.grpc.resolveThreads(), config.server.grpc.port);
+    server.run();
+
+    if (httpServer) httpServer->shutdown();
+  } catch (const std::exception &e) {
+    LOG_ERROR("Startup failed: {}", e.what());
+    return 1;
   }
-
-  GRPCServer server(node, config.server.grpc.resolveThreads(), config.server.grpc.port);
-  server.run();
-
-  if (httpServer) httpServer->shutdown();
   return 0;
 }
 

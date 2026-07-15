@@ -1,6 +1,8 @@
 #pragma once
 
+#include <optional>
 #include "Directory.h"
+#include "FileLock.h"
 #include "FSDirectory.h"
 #include "solux/util/log.h"
 
@@ -40,6 +42,7 @@ public:
 class FSDirFactory : public DirectoryFactory {
   std::filesystem::path basePath_;
   std::filesystem::path collectionsPath_;  // basePath_/c
+  std::optional<FileLock> lock_;
 
 public:
   explicit FSDirFactory(std::filesystem::path path)
@@ -50,6 +53,7 @@ public:
     } else {
       LOG_INFO("Using existing data directory: {}", basePath_.string());
     }
+    lock_.emplace(basePath_ / "write.lock");
   }
 
   std::shared_ptr<Directory> create(std::string_view collectionName) override {
