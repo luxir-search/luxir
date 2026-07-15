@@ -2,10 +2,9 @@
 // the end of the batch (never mid-request). A whole message stays in one inverter,
 // so within-request id overwrites stay correct; a non-stop stream is byte-batched
 // into many messages that accumulate in the reused idle inverter, and the
-// per-message check flushes it once it grows past a cap. See ProtoUpdateMessage.cpp
-// and solux-private/inverter-autoflush.md for the rationale (mid-request flush was
+// per-message check flushes it once it grows past a cap. Mid-request flush is
 // rejected because it splits a request's shared updateVersion across segments and
-// breaks version-gated overwrite deletes).
+// breaks version-gated overwrite deletes. See ProtoUpdateMessage.cpp.
 
 #include <gtest/gtest.h>
 

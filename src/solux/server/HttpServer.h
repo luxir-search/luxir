@@ -16,7 +16,7 @@ class HttpSessionRegistry;  // tracks live sessions for graceful shutdown (defin
 // A hand-written async HTTP/JSON front end (Boost.Beast) beside the gRPC server.
 // Phase 0: a single POST /collections/{c}/query endpoint plus GET /health.
 // Search responses stream as NDJSON (application/x-ndjson, chunked); each engine
-// SearchResponse becomes one line.  See /opt/code/solux-private/http-json-api.md.
+// SearchResponse becomes one line.
 class HttpServer {
 public:
   // port == 0 binds 127.0.0.1 on an OS-assigned port (tests); otherwise binds

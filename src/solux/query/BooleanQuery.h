@@ -3030,7 +3030,7 @@ public:
     // 2P+8E laptop to a ~1% crossover; RE-VALIDATE on uniform desktop / cloud / ARM (NEON/
     // SVE shifts the ratio). W_ARRAY < W_BITSET because array stream membership is an
     // O(log card) ArrDocSet::get binary search vs bitset O(1) get (W_ARRAY reasoned from the
-    // ~15% delta, not swept). See solux-private/tuning-constants.md + domain-pushdown.md.
+    // ~15% delta, not swept).
     constexpr static int64_t W_BITSET = 32;
     constexpr static int64_t W_ARRAY = 28;
     static_assert((kWindowSize % 64) == 0);

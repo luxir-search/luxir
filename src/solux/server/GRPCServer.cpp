@@ -213,9 +213,9 @@ static grpc::ByteBuffer serializeToByteBuffer(const Message& msg) {
 
 // Generic raw call: one state machine for every method, routed by RPC path.
 //
-// Generalizes the Track-1 RawSearcherSearchStreamingCall onto grpc::AsyncGenericService
-// (solux-private/hpp-proto-glaze.md). Every RPC - unary or streaming - is handled as a
-// raw ByteBuffer stream: outgoing bytes are OWNED here (writeBuffer + pending), fully
+// Generalizes the Track-1 RawSearcherSearchStreamingCall onto grpc::AsyncGenericService.
+// Every RPC - unary or streaming - is handled as a raw ByteBuffer stream: outgoing
+// bytes are OWNED here (writeBuffer + pending), fully
 // decoupled from any request/response arena, so handlers do eager cleanup with no
 // post-write callback. A unary RPC is just a stream with one read + one write.
 class GenericCallData : public CallData {
