@@ -9,6 +9,7 @@
 #include "IndexReader.h"
 #include "solux/schema/Schema.h"
 #include "solux/util/Clock.h"
+#include "solux/util/DateTime.h"
 #include "solux/util/proto.h"
 
 namespace solux {
@@ -49,6 +50,10 @@ public:
   // One clock snapshot for every query tree/op in this request. Parsers are
   // short-lived and numerous, so NOW belongs here rather than in a parser.
   const int64_t dateMathNowEpochMillis;
+  // Resolved eagerly from proto.time_zone. Invalid IANA/fixed specifications
+  // retain an error for submitBody to surface as a whole-request failure.
+  std::optional<TimeZone> timeZone;
+  std::string timeZoneError;
   MemPool requestPool;
   oneapi::tbb::task_group* tg = nullptr; // optional top-level task group for this request.
   SearchResponse* lastResponse = nullptr;
@@ -66,7 +71,9 @@ public:
 
   SearchRequest(SearchEngine& engine, const ReqProto& proto, google::protobuf::Arena& arena)
     : engine(engine), proto(proto), arena(arena),
-      dateMathNowEpochMillis(currentEpochMillis()) {
+      dateMathNowEpochMillis(currentEpochMillis()),
+      timeZone(resolveTimeZone(proto.time_zone)) {
+    if (!timeZone) timeZoneError = timeZoneResolutionError(proto.time_zone);
   }
 
   virtual ~SearchRequest() = default;

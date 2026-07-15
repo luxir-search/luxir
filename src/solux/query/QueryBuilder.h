@@ -37,6 +37,8 @@ class QueryBuilder {
   MemPool& pool;
   Schema& schema;
   CoerceContext coerceContext;
+  std::string_view opName;
+  std::vector<api::Warning>* warnings;
 
 public:
   static constexpr size_t MAX_PHRASE_SLOTS = 256;
@@ -168,9 +170,11 @@ public:
   // Mirrors the OpenSearch match "operator".
   enum class Operator { OR, AND };
 
-  QueryBuilder(MemPool& pool, Schema& schema,
-               int64_t dateMathNowEpochMillis = currentEpochMillis())
-    : pool(pool), schema(schema), coerceContext{dateMathNowEpochMillis} {}
+  QueryBuilder(MemPool& pool, Schema& schema, const CoerceContext& coerceContext,
+               std::string_view opName = {},
+               std::vector<api::Warning>* warnings = nullptr)
+    : pool(pool), schema(schema), coerceContext(coerceContext), opName(opName),
+      warnings(warnings) {}
 
   Query* matchNoDocs() {
     return pool.make<MatchNoDocsQuery>();
@@ -436,20 +440,50 @@ public:
     std::optional<int64_t> loEnc, hiEnc;
     if (fieldType.type() == FieldType::Type::DATE) {
       auto& dateType = (DateFieldType&)fieldType;
+      auto dateBound = [&](const api::Val& value) {
+        DateRange range = dateType.coerceDateRange(value, field, coerceContext);
+        if (range.granuleSkipped && warnings != nullptr) {
+          std::string_view text = std::get<std::string_view>(value.kind);
+          std::string message = opName.empty()
+              ? std::format(
+                    "DATE field '{}': date granule '{}' skipped: no such local granule in {}",
+                    field, text, coerceContext.timeZone.name())
+              : std::format(
+                    "op '{}', DATE field '{}': date granule '{}' skipped: "
+                    "no such local granule in {}",
+                    opName, field, text, coerceContext.timeZone.name());
+          bool duplicate = false;
+          for (const api::Warning& warning : *warnings) {
+            if (warning.code == "date_granule_skipped" && warning.message == message) {
+              duplicate = true;
+              break;
+            }
+          }
+          if (!duplicate) {
+            char* copy = pool.alloc(message.size());
+            std::memcpy(copy, message.data(), message.size());
+            warnings->push_back({"date_granule_skipped",
+                                 std::string_view(copy, message.size())});
+          }
+        }
+        return range;
+      };
       // Window edges chosen so the existing +/-1 exclusive fold below lands
       // on the granule boundary: gt = the window's last milli (+1 = past it),
       // lt = the window's first milli (-1 = before it).
-      if (hasGte) loEnc = dateType.coerceDateRange(
-          *gte, field, coerceContext).first;
-      if (hasGt)  loEnc = dateType.coerceDateRange(
-          *gt, field, coerceContext).second - 1;
-      if (hasLte) hiEnc = dateType.coerceDateRange(
-          *lte, field, coerceContext).second - 1;
-      if (hasLt)  hiEnc = dateType.coerceDateRange(
-          *lt, field, coerceContext).first;
+      if (hasGte) loEnc = dateBound(*gte).lo;
+      if (hasGt)  loEnc = dateBound(*gt).hiExclusive - 1;
+      if (hasLte) hiEnc = dateBound(*lte).hiExclusive - 1;
+      if (hasLt)  hiEnc = dateBound(*lt).lo;
     } else {
-      if (hasGte || hasGt) loEnc = fieldType.coerceColInt64(hasGte ? *gte : *gt, field);
-      if (hasLte || hasLt) hiEnc = fieldType.coerceColInt64(hasLte ? *lte : *lt, field);
+      if (hasGte || hasGt) {
+        loEnc = fieldType.coerceColInt64(
+            hasGte ? *gte : *gt, field, coerceContext);
+      }
+      if (hasLte || hasLt) {
+        hiEnc = fieldType.coerceColInt64(
+            hasLte ? *lte : *lt, field, coerceContext);
+      }
     }
 
     int64_t lo = std::numeric_limits<int64_t>::min();

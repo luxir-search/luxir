@@ -70,9 +70,12 @@ struct SimpleQueryOptions {
   // expansion; silently inapplicable when the top level cannot honor it
   // (that is contingent on user input, which must not cost warnings).
   int32_t min_match = 0;
-  // Used only while validating DATE field:value arms. Lowering receives the
-  // same snapshot through ParseContext/QueryBuilder.
-  int64_t dateMathNowEpochMillis = currentEpochMillis();
+  // Used only while validating DATE field:value arms. Lowering receives this
+  // same whole context through ParseContext/QueryBuilder.
+  CoerceContext coerceContext;
+
+  explicit SimpleQueryOptions(const CoerceContext& coerceContext)
+    : coerceContext(coerceContext) {}
 };
 
 struct SimpleQueryResult {
@@ -430,7 +433,7 @@ private:
     api::Val v;
     v.kind = value;
     try {
-      fieldType.coerceColInt64(v, fieldType.name(), {opts.dateMathNowEpochMillis});
+      fieldType.coerceColInt64(v, fieldType.name(), opts.coerceContext);
       return true;
     } catch (const std::exception&) {
       return false;

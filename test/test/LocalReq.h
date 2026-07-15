@@ -138,6 +138,13 @@ public:
     view.request_id = build::arenaStr(mr, id);
     return *this;
   }
+  LocalReq& timeZone(std::string_view zone) {
+    view.time_zone = build::arenaStr(mr, zone);
+    SearchRequest::timeZone = resolveTimeZone(view.time_zone);
+    timeZoneError = SearchRequest::timeZone
+        ? std::string{} : timeZoneResolutionError(view.time_zone);
+    return *this;
+  }
 
   // --- top-level op builders (descend from the root) ---
   OpCursor& topDocs(std::string_view name = "q") { return rootCursor_.topDocs(name); }

@@ -42,7 +42,7 @@ public:
   }
 
   SimpleQueryResult parse(std::string_view q) {
-    SimpleQueryOptions opts;
+    SimpleQueryOptions opts(CoerceContext{});
     opts.fields = std::span<const std::string_view>(fields.data(), fields.size());
     opts.schema = schema.get();
     opts.allowed_fields = std::span<const std::string_view>(allowed.data(), allowed.size());

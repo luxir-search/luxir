@@ -24,6 +24,9 @@ struct ParseContext {
   // the message into the pool (whose lifetime spans the request).  May be
   // null when there is nowhere to surface warnings (direct engine tests).
   std::vector<api::Warning>* warnings = nullptr;
+  // Top-level operation owning this parse. Warning text uses it to identify
+  // the affected request path.
+  std::string_view opName;
 
   // ONE nesting budget for everything recursive a request can stack: the
   // structured-query walk and any string parse it triggers (expr, including
@@ -34,15 +37,15 @@ struct ParseContext {
   int nestingBudget = 128;
 
   // Stable across every short-lived QueryBuilder participating in this parse.
-  // SearchRequest supplies its request snapshot; direct users get one when
-  // they construct the context.
-  int64_t dateMathNowEpochMillis = currentEpochMillis();
+  // Request-facing constructors require this explicitly so adding a parser
+  // call site cannot silently fall back to UTC.
+  CoerceContext coerceContext;
 
-  ParseContext(MemPool& pool, Schema& schema,
-               std::vector<api::Warning>* warnings = nullptr,
-               int64_t dateMathNowEpochMillis = currentEpochMillis())
-    : pool(pool), schema(schema), warnings(warnings),
-      dateMathNowEpochMillis(dateMathNowEpochMillis) {}
+  ParseContext(MemPool& pool, Schema& schema, const CoerceContext& coerceContext,
+               std::string_view opName,
+               std::vector<api::Warning>* warnings = nullptr)
+    : pool(pool), schema(schema), warnings(warnings), opName(opName),
+      coerceContext(coerceContext) {}
 
   // code must be a string with static storage duration (a literal).
   void warn(std::string_view code, std::string_view message) {

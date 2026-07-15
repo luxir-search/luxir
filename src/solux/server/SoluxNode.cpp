@@ -5,6 +5,7 @@
 #include "solux/reader/Postings.h"
 #include "solux/api/padded_input.h"
 #include "solux/api/solux_types.hpp"
+#include "solux/util/DateTime.h"
 
 #include <cctype>
 #include <memory_resource>
@@ -135,6 +136,7 @@ bool Collection::loadSchema() {
 SoluxNode::SoluxNode(SoluxConfig config)
   : config(std::move(config)),
     indexRamBudget(this->config.index.max_index_ram_mb * 1024 * 1024) {
+  preWarmTimeZoneDatabase();
   createSingletons();
   searchEngine = std::make_unique<SearchEngine>(*this);
 }

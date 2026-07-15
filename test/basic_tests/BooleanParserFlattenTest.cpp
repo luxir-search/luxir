@@ -38,7 +38,7 @@ protected:
   Query* parseExpr(std::string_view text) {
     api::Query node;
     node.kind.emplace<api::ExprQuery>().q = text;
-    ParseContext context{parsePool, *schema};
+    ParseContext context{parsePool, *schema, CoerceContext{}, ""};
     ProtobufQueryParser parser(context);
     return parser.parse(node);
   }
@@ -49,7 +49,7 @@ protected:
     auto& simple = node.kind.emplace<api::SimpleQuery>();
     simple.q = text;
     simple.fields = fields;
-    ParseContext context{parsePool, *schema};
+    ParseContext context{parsePool, *schema, CoerceContext{}, ""};
     ProtobufQueryParser parser(context);
     return parser.parse(node);
   }

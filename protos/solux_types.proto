@@ -31,6 +31,10 @@ message SearchRequest {
 
   // index view freshness requirement in microseconds. 0 (the default) means latest commit must be used.
   uint64 freshness_us = 4;
+
+  // Civil frame for date math and offset-less date literals. Empty is UTC;
+  // accepts Z, UTC, fixed offsets, or a case-sensitive IANA zone name.
+  string time_zone = 5;
 }
 
 // Different types of top-level search operations.

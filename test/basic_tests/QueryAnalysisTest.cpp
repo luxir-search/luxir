@@ -242,7 +242,7 @@ TEST(QueryBuilderPhraseCanonicalization, validatesAndNormalizesSlots) {
   auto schema = Schema::createDefaultSchema();
   schema->fieldTypeMap["no_positions"] = std::make_shared<TextFieldType>(
       "no_positions", FieldType::INDEX_DOCS_FREQS);
-  QueryBuilder builder(pool, *schema);
+  QueryBuilder builder(pool, *schema, CoerceContext{});
 
   std::vector<std::string_view> terms = {"a", "a", "b"};
   std::vector<int32_t> positions = {
@@ -292,7 +292,7 @@ TEST(QueryBuilderPhraseCanonicalization, validatesAndNormalizesSlots) {
 TEST(QueryBuilderPhraseCanonicalization, capsAnalysisAndRejectsNormalizedOverflow) {
   MemPool pool;
   auto schema = Schema::createDefaultSchema();
-  QueryBuilder builder(pool, *schema);
+  QueryBuilder builder(pool, *schema, CoerceContext{});
 
   std::string many;
   for (size_t i = 0; i < QueryBuilder::MAX_PHRASE_SLOTS + 1; i++) {

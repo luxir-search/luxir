@@ -309,7 +309,7 @@ TEST_F(FuzzyQueryTest, multiSegment) {
 TEST_F(FuzzyQueryTest, builderValidationAndAuto) {
   auto schema = Schema::createDefaultSchema();
   MemPool pool;
-  QueryBuilder builder(pool, *schema);
+  QueryBuilder builder(pool, *schema, CoerceContext{});
 
   EXPECT_NE(builder.createFuzzyQuery("foo_w", "apple"), nullptr);  // TEXT
   EXPECT_NE(builder.createFuzzyQuery("foo_s", "apple"), nullptr);  // STRING
@@ -331,7 +331,7 @@ TEST_F(FuzzyQueryTest, builderValidationAndAuto) {
 TEST_F(FuzzyQueryTest, builderDefaultPrefixLength) {
   auto schema = Schema::createDefaultSchema();
   MemPool pool;
-  QueryBuilder builder(pool, *schema);
+  QueryBuilder builder(pool, *schema, CoerceContext{});
 
   auto* dflt = (FuzzyQuery*)builder.createFuzzyQuery("foo_w", "apple", 2);  // prefix unset
   EXPECT_EQ(dflt->getPrefixLength(), 1);
@@ -355,7 +355,7 @@ TEST_F(FuzzyQueryTest, defaultPrefixExcludesLeadingEdit) {
   // Default prefix (1): "maple" is excluded (first char differs).
   {
     auto g = ti.pool.rewindScopeGuard();
-    QueryBuilder builder(ti.pool, *schema);
+    QueryBuilder builder(ti.pool, *schema, CoerceContext{});
     auto* q = builder.createFuzzyQuery("foo_w", "apple", 2);  // default prefix 1
     Query::Context ctx(ti.pool, *ti.reader);
     auto* scorer = q->createWeight(ctx, 0)->createScorer(ti.pool, ctx.topReader.segments()[0]);
@@ -366,7 +366,7 @@ TEST_F(FuzzyQueryTest, defaultPrefixExcludesLeadingEdit) {
   // Explicit prefix 0: "maple" is now reachable.
   {
     auto g = ti.pool.rewindScopeGuard();
-    QueryBuilder builder(ti.pool, *schema);
+    QueryBuilder builder(ti.pool, *schema, CoerceContext{});
     auto* q = builder.createFuzzyQuery("foo_w", "apple", 2, 0);  // full fuzzy
     Query::Context ctx(ti.pool, *ti.reader);
     auto* scorer = q->createWeight(ctx, 0)->createScorer(ti.pool, ctx.topReader.segments()[0]);

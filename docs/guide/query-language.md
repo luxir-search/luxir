@@ -175,11 +175,39 @@ clock snapshot for the entire search request or update message. Commands are
 evaluated left-to-right;
 accepted forms include `NOW-1DAY/DAY`, `2024-01-01T00:00:00Z+2MONTHS`, and
 `2024-01-01T00:00:00Z||+2M`. Solr word units are
-case-insensitive (`YEARS`, `MONTHS`, `DAYS`/`DATE`, `HOURS`, `MINUTES`,
-`SECONDS`, and the millisecond aliases). OpenSearch abbreviations are
+case-insensitive (`YEARS`, `MONTHS`, `WEEKS`, `DAYS`/`DATE`, `HOURS`,
+`MINUTES`, `SECONDS`, and the millisecond aliases). `WEEK`/`WEEKS` is a
+Solux extension beyond Solr's own grammar, coherent with the `w` abbreviation
+and civil week rounding. OpenSearch abbreviations are
 case-sensitive: `y`, `M`, `w`, `d`, `h`/`H`, `m`, and `s`, so `M` means month
-while `m` means minute. Week rounding starts Monday. Math and rounding use UTC;
-there is no request time-zone override yet.
+while `m` means minute. Week rounding starts Monday.
+
+`SearchRequest.time_zone` sets the civil frame for every query in the request.
+The default (`""`), `Z`, and `UTC` mean UTC. Fixed offsets accept `+hh`,
+`+hhmm`, or `+hh:mm` (and negative forms) through `+/-18:00`; otherwise the
+value is a case-sensitive IANA name such as `America/Denver`. An invalid zone
+rejects the whole request, even when the request contains no date clause.
+
+Offset-less literals are local civil times in that frame, as are rounding and
+calendar additions (`YEAR`, `MONTH`, `WEEK`, and `DAY`). Hour, minute, second,
+and millisecond additions are physical durations. `NOW` and epoch millis are
+instants and do not move when the frame changes. A literal with `Z` or its own
+numeric offset also names that offset's instant; subsequent math rebases the
+instant into the request frame.
+
+At a daylight-saving or political clock change, a nonexistent local time is
+shifted forward by the size of the gap. An ambiguous local time uses the
+earlier occurrence initially; later civil operations retain the source
+occurrence when its offset is still valid. A zone can skip a whole civil
+granule (for example, a dateline change can remove a day). The query keeps the
+gap-shifted result and returns a `date_granule_skipped` warning rather than
+silently hiding the substitution.
+
+Updates have no time-zone setting: ingest date math and offset-less ingest
+literals remain UTC. Consequently, under a zoned search request the same
+offset-less text is interpreted in the request zone at query time but in UTC
+at ingest. Use an explicit `Z` or numeric offset when the instant must be
+identical on both paths.
 
 The direct Solr suffix and OpenSearch `||` separator are both accepted. Prefer
 `||` when a truncated time or numeric zone offset makes the anchor boundary

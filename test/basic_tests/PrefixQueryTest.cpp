@@ -126,7 +126,7 @@ TEST_F(PrefixQueryTest, multiSegment) {
 TEST_F(PrefixQueryTest, fieldTypeValidation) {
   auto schema = Schema::createDefaultSchema();
   MemPool pool;
-  QueryBuilder builder(pool, *schema);
+  QueryBuilder builder(pool, *schema, CoerceContext{});
 
   EXPECT_NE(builder.createPrefixQuery("foo_s", "ab"), nullptr);   // STRING
   EXPECT_NE(builder.createPrefixQuery("foo_w", "ab"), nullptr);   // TEXT

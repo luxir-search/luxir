@@ -5,6 +5,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -12,6 +13,7 @@
 
 #include "solux/util/Clock.h"
 #include "solux/util/Cursor.h"
+#include "solux/util/log.h"
 
 namespace solux {
 
@@ -55,6 +57,8 @@ namespace datetime_detail {
 inline constexpr int kMinYear = -32767;
 inline constexpr int kMaxYear = 32767;
 inline constexpr int64_t kMsPerDay = 86400000LL;
+inline constexpr int kMaxLiteralOffsetMinutes = 23 * 60 + 59;
+inline constexpr int kMaxZoneParamOffsetMinutes = 18 * 60;
 inline constexpr int64_t kMinEpochMs =
     std::chrono::sys_days{std::chrono::year{kMinYear} / 1 / 1}.time_since_epoch().count() * kMsPerDay;
 inline constexpr int64_t kMaxEpochMs =
@@ -103,15 +107,266 @@ inline int varDigits(Cursor& cur, int maxDigits, long& out) {
 
 } // namespace datetime_detail
 
+// A request's civil frame. UTC and fixed offsets use arithmetic-only fast
+// paths; an IANA value points into the process-lifetime chrono tzdb snapshot.
+class TimeZone {
+public:
+  enum class Kind : uint8_t { UTC, FIXED, IANA };
+
+private:
+  Kind kind_;
+  int offsetMinutes_;
+  const std::chrono::time_zone* zone_;
+
+  constexpr TimeZone(Kind kind, int offsetMinutes,
+                     const std::chrono::time_zone* zone)
+    : kind_(kind), offsetMinutes_(offsetMinutes), zone_(zone) {}
+
+public:
+  static constexpr TimeZone utc() { return TimeZone(Kind::UTC, 0, nullptr); }
+  static constexpr TimeZone fixed(int offsetMinutes) {
+    return offsetMinutes == 0 ? utc() : TimeZone(Kind::FIXED, offsetMinutes, nullptr);
+  }
+  static constexpr TimeZone iana(const std::chrono::time_zone* zone) {
+    return TimeZone(Kind::IANA, 0, zone);
+  }
+
+  constexpr Kind kind() const { return kind_; }
+  constexpr bool isUtc() const { return kind_ == Kind::UTC; }
+  constexpr bool isFixed() const { return kind_ == Kind::FIXED; }
+  constexpr bool isIana() const { return kind_ == Kind::IANA; }
+  constexpr int offsetMinutes() const { return offsetMinutes_; }
+  constexpr const std::chrono::time_zone* ianaZone() const { return zone_; }
+
+  std::string name() const {
+    if (isUtc()) return "UTC";
+    if (isIana()) return std::string(zone_->name());
+    int magnitude = std::abs(offsetMinutes_);
+    char buf[7];
+    std::snprintf(buf, sizeof(buf), "%c%02d:%02d",
+                  offsetMinutes_ < 0 ? '-' : '+', magnitude / 60, magnitude % 60);
+    return buf;
+  }
+
+  friend constexpr bool operator==(const TimeZone&, const TimeZone&) = default;
+};
+
+namespace datetime_detail {
+
+struct TzdbState {
+  std::once_flag once;
+  const std::chrono::tzdb* database = nullptr;
+  std::string version = "unavailable";
+  std::string error;
+};
+
+inline TzdbState& tzdbState() {
+  static TzdbState state;
+  return state;
+}
+
+inline void loadTzdbOnce() {
+  TzdbState& state = tzdbState();
+  std::call_once(state.once, [&] {
+    try {
+      state.database = &std::chrono::get_tzdb();
+      state.version = state.database->version;
+      LOG_INFO("Loaded time-zone database version {}", state.version);
+    } catch (const std::exception& e) {
+      state.error = e.what();
+      LOG_ERROR("Time-zone database unavailable (probed system zoneinfo at "
+                "/usr/share/zoneinfo): {}. UTC and fixed offsets remain available",
+                state.error);
+    } catch (...) {
+      state.error = "unknown error";
+      LOG_ERROR("Time-zone database unavailable (probed system zoneinfo at "
+                "/usr/share/zoneinfo): unknown error. UTC and fixed offsets remain available");
+    }
+  });
+}
+
+inline bool parseFixedZoneOffset(std::string_view spec, int& offsetMinutes) {
+  if (spec.empty() || (spec[0] != '+' && spec[0] != '-')) return false;
+  if (spec.size() != 3 && spec.size() != 5 && spec.size() != 6) return false;
+  if (!isAsciiDigit(spec[1]) || !isAsciiDigit(spec[2])) return false;
+  int hours = (spec[1] - '0') * 10 + (spec[2] - '0');
+  int minutes = 0;
+  if (spec.size() == 5) {
+    if (!isAsciiDigit(spec[3]) || !isAsciiDigit(spec[4])) return false;
+    minutes = (spec[3] - '0') * 10 + (spec[4] - '0');
+  } else if (spec.size() == 6) {
+    if (spec[3] != ':' || !isAsciiDigit(spec[4]) || !isAsciiDigit(spec[5])) return false;
+    minutes = (spec[4] - '0') * 10 + (spec[5] - '0');
+  }
+  int magnitude = hours * 60 + minutes;
+  if (minutes > 59 || magnitude > kMaxZoneParamOffsetMinutes) return false;
+  offsetMinutes = spec[0] == '-' ? -magnitude : magnitude;
+  return true;
+}
+
+} // namespace datetime_detail
+
+// Force the process tzdb snapshot to load at server startup. Failure is
+// recorded rather than thrown so UTC/fixed-only service remains available.
+inline void preWarmTimeZoneDatabase() {
+  datetime_detail::loadTzdbOnce();
+}
+
+inline bool timeZoneDatabaseAvailable() {
+  datetime_detail::loadTzdbOnce();
+  return datetime_detail::tzdbState().database != nullptr;
+}
+
+inline std::string_view timeZoneDatabaseVersion() {
+  datetime_detail::loadTzdbOnce();
+  return datetime_detail::tzdbState().version;
+}
+
+inline std::string_view timeZoneDatabaseError() {
+  datetime_detail::loadTzdbOnce();
+  return datetime_detail::tzdbState().error;
+}
+
+// Exact request-zone grammar: UTC aliases, fixed +/-hh[[:]mm] capped at
+// 18:00, then a case-sensitive IANA lookup. No trimming or custom aliases.
+inline std::optional<TimeZone> resolveTimeZone(std::string_view spec) {
+  if (spec.empty() || spec == "Z" || spec == "UTC") return TimeZone::utc();
+  int offsetMinutes = 0;
+  if (datetime_detail::parseFixedZoneOffset(spec, offsetMinutes)) {
+    return TimeZone::fixed(offsetMinutes);
+  }
+  // A leading sign selected the fixed-offset grammar. Malformed fixed offsets
+  // are not eligible to become surprising IANA names.
+  if (spec[0] == '+' || spec[0] == '-') return std::nullopt;
+
+  datetime_detail::loadTzdbOnce();
+  auto* database = datetime_detail::tzdbState().database;
+  if (database == nullptr) return std::nullopt;
+  try {
+    return TimeZone::iana(database->locate_zone(std::string(spec)));
+  } catch (const std::exception&) {
+    return std::nullopt;
+  }
+}
+
+inline std::string timeZoneResolutionError(std::string_view spec) {
+  if (!spec.empty() && spec[0] != '+' && spec[0] != '-'
+      && !timeZoneDatabaseAvailable()) {
+    return "time zone '" + std::string(spec)
+        + "' requires the unavailable IANA time-zone database (tzdb version "
+        + std::string(timeZoneDatabaseVersion()) + "): "
+        + std::string(timeZoneDatabaseError());
+  }
+  return "invalid time zone '" + std::string(spec) + "' (tzdb version "
+      + std::string(timeZoneDatabaseVersion()) + ")";
+}
+
 // The [start, end) window a date text denotes at its own granularity.
 struct DateRange {
   int64_t lo;
   int64_t hiExclusive;
+  bool granuleSkipped = false;
 };
+
+// A parsed literal additionally preserves whether an offset token was present.
+// That bit distinguishes an offset-less civil literal from Z/+00:00 in a
+// non-UTC request frame.
+struct DateLiteralRange {
+  DateRange range;
+  bool hasExplicitOffset;
+};
+
+// Nominal local milliseconds since 1970 plus the actual offset at the source
+// instant. The offset uses seconds because historical IANA rules are not
+// restricted to whole minutes.
+struct CivilTime {
+  int64_t millis;
+  std::chrono::seconds offset;
+};
+
+inline std::optional<CivilTime> civilFromInstant(int64_t millis, const TimeZone& zone) {
+  namespace dd = datetime_detail;
+  using namespace std::chrono;
+  if (millis < dd::kMinEpochMs || millis > dd::kMaxEpochMs) return std::nullopt;
+
+  seconds offset{0};
+  if (zone.isFixed()) {
+    offset = minutes{zone.offsetMinutes()};
+  } else if (zone.isIana()) {
+    try {
+      auto info = zone.ianaZone()->get_info(sys_time<milliseconds>{milliseconds{millis}});
+      offset = info.offset;
+    } catch (const std::exception&) {
+      return std::nullopt;
+    }
+  }
+
+  __int128 local = (__int128)millis + duration_cast<milliseconds>(offset).count();
+  // This numerical guard precedes every year_month_day construction by callers
+  // and prevents chrono::year's 16-bit representation from narrowing.
+  if (local < dd::kMinEpochMs || local > dd::kMaxEpochMs) return std::nullopt;
+  return CivilTime{(int64_t)local, offset};
+}
+
+inline std::optional<int64_t> instantFromCivil(
+    int64_t civilMillis, const TimeZone& zone,
+    std::optional<std::chrono::seconds> preferredOffset = std::nullopt) {
+  namespace dd = datetime_detail;
+  using namespace std::chrono;
+  if (civilMillis < dd::kMinEpochMs || civilMillis > dd::kMaxEpochMs) {
+    return std::nullopt;
+  }
+
+  seconds offset{0};
+  if (zone.isFixed()) {
+    offset = minutes{zone.offsetMinutes()};
+  } else if (zone.isIana()) {
+    local_info info;
+    try {
+      info = zone.ianaZone()->get_info(local_time<milliseconds>{milliseconds{civilMillis}});
+    } catch (const std::exception&) {
+      return std::nullopt;
+    }
+    if (info.result == local_info::unique) {
+      offset = info.first.offset;
+    } else if (info.result == local_info::ambiguous) {
+      // libstdc++ 16 classifies the exact upper endpoint of some transition
+      // intervals with the interval itself. Civil transition intervals are
+      // half-open; at that endpoint only the post-transition offset is valid.
+      auto transition = duration_cast<milliseconds>(info.first.end.time_since_epoch()).count();
+      __int128 overlapEnd = (__int128)transition
+                          + duration_cast<milliseconds>(info.first.offset).count();
+      if ((__int128)civilMillis >= overlapEnd) {
+        offset = info.second.offset;
+      } else {
+        // Java ZonedDateTime.ofLocal: retain a valid preferred source offset;
+        // otherwise use the earlier (pre-transition) offset.
+        offset = preferredOffset && *preferredOffset == info.second.offset
+            ? info.second.offset : info.first.offset;
+      }
+    } else {
+      auto transition = duration_cast<milliseconds>(info.second.begin.time_since_epoch()).count();
+      __int128 gapEnd = (__int128)transition
+                      + duration_cast<milliseconds>(info.second.offset).count();
+      if ((__int128)civilMillis >= gapEnd) {
+        offset = info.second.offset;
+      } else {
+        // Java's gap shift is local - pre-transition offset. This deliberately
+        // does not use to_sys(choose::), which clamps to the transition instant.
+        offset = info.first.offset;
+      }
+    }
+  }
+
+  __int128 instant = (__int128)civilMillis - duration_cast<milliseconds>(offset).count();
+  if (instant < dd::kMinEpochMs || instant > dd::kMaxEpochMs) return std::nullopt;
+  return (int64_t)instant;
+}
 
 // Parse only the literal forms above. Date-math splitting calls this for each
 // possible fixed anchor, so it deliberately requires the whole input.
-inline std::optional<DateRange> parseDateLiteralRange(std::string_view s) {
+inline std::optional<DateLiteralRange> parseDateLiteralRange(
+    std::string_view s, const TimeZone& frameZone) {
   using namespace std::chrono;
   namespace dd = datetime_detail;
   Cursor input{s};
@@ -133,7 +388,7 @@ inline std::optional<DateRange> parseDateLiteralRange(std::string_view s) {
       auto [ptr, ec] = std::from_chars(token.begin(), token.end(), v);
       if (ec != std::errc{} || ptr != token.end()) return std::nullopt;
       if (v < dd::kMinEpochMs || v > dd::kMaxEpochMs) return std::nullopt;
-      return DateRange{v, v + 1};
+      return DateLiteralRange{DateRange{v, v + 1}, false};
     }
   }
 
@@ -155,6 +410,7 @@ inline std::optional<DateRange> parseDateLiteralRange(std::string_view s) {
   }
 
   int hh = 0, mm = 0, ss = 0, frac = 0, offsetMin = 0;
+  bool hasExplicitOffset = false;
   // The granule width the text pins down, as fixed millis; 0 = a calendar
   // month (variable width, handled by date arithmetic below).
   int64_t granuleMs = haveDay ? dd::kMsPerDay : 0;
@@ -189,8 +445,10 @@ inline std::optional<DateRange> parseDateLiteralRange(std::string_view s) {
     if (!c.atEnd()) {
       char z = c.peek();
       if (z == 'Z' || z == 'z') {
+        hasExplicitOffset = true;
         c.advance();
       } else if (z == '+' || z == '-') {
+        hasExplicitOffset = true;
         int zsign = (z == '-') ? -1 : 1;
         c.advance();
         int zh = 0, zm = 0;
@@ -199,7 +457,9 @@ inline std::optional<DateRange> parseDateLiteralRange(std::string_view s) {
         if (dd::isAsciiDigit(c.peek())) {
           if (!dd::fixedDigits(c, 2, zm)) return std::nullopt;
         }
-        if (zh > 23 || zm > 59) return std::nullopt;
+        if (zm > 59 || zh * 60 + zm > dd::kMaxLiteralOffsetMinutes) {
+          return std::nullopt;
+        }
         offsetMin = zsign * (zh * 60 + zm);
       } else {
         return std::nullopt;
@@ -221,28 +481,61 @@ inline std::optional<DateRange> parseDateLiteralRange(std::string_view s) {
   if (!ymd.ok()) return std::nullopt;  // rejects e.g. Feb 30, non-leap Feb 29
 
   int64_t epochDays = sys_days{ymd}.time_since_epoch().count();
-  int64_t millis = epochDays * 86400000LL
-                 + (int64_t)hh * 3600000LL + (int64_t)mm * 60000LL
-                 + (int64_t)ss * 1000LL + frac
-                 - (int64_t)offsetMin * 60000LL;
-  if (millis < dd::kMinEpochMs || millis > dd::kMaxEpochMs) return std::nullopt;
+  int64_t civilLo = epochDays * dd::kMsPerDay
+                  + (int64_t)hh * 3600000LL + (int64_t)mm * 60000LL
+                  + (int64_t)ss * 1000LL + frac;
 
+  int64_t civilLast;
+  std::optional<int64_t> civilNext;
   if (granuleMs != 0) {
-    return DateRange{millis, std::min(millis + granuleMs, dd::kMaxEpochMs + 1)};
+    civilLast = std::min(civilLo + granuleMs - 1, dd::kMaxEpochMs);
+    if (civilLast < dd::kMaxEpochMs) civilNext = civilLast + 1;
+  } else if (mo == 12 && year == dd::kMaxYear) {
+    // Do not construct chrono::year{kMaxYear + 1}: it narrows before it can
+    // be inspected.
+    civilLast = dd::kMaxEpochMs;
+  } else {
+    year_month_day next = (mo == 12)
+        ? year_month_day{std::chrono::year{(int)year + 1}, std::chrono::month{1},
+                         std::chrono::day{1}}
+        : year_month_day{ymd.year(), std::chrono::month{(unsigned)mo + 1},
+                         std::chrono::day{1}};
+    civilNext = sys_days{next}.time_since_epoch().count() * dd::kMsPerDay;
+    civilLast = *civilNext - 1;
   }
-  // Month granularity: the window ends at the first instant of the next month.
-  // Do not construct chrono::year{kMaxYear + 1}: year stores a 16-bit value
-  // and would narrow before we could inspect it.
-  if (mo == 12 && year == dd::kMaxYear) {
-    int64_t hiExclusive = dd::kMaxEpochMs + 1 - (int64_t)offsetMin * 60000LL;
-    return DateRange{millis, std::min(hiExclusive, dd::kMaxEpochMs + 1)};
+
+  TimeZone literalZone = hasExplicitOffset ? TimeZone::fixed(offsetMin) : frameZone;
+  auto lo = instantFromCivil(civilLo, literalZone);
+  if (!lo) return std::nullopt;
+  auto source = civilFromInstant(*lo, literalZone);
+  if (!source) return std::nullopt;
+  auto last = instantFromCivil(civilLast, literalZone, source->offset);
+  if (!last || *last < *lo) return std::nullopt;
+
+  bool granuleSkipped = false;
+  if (!hasExplicitOffset && civilNext) {
+    auto next = instantFromCivil(*civilNext, frameZone);
+    granuleSkipped = next && *next == *lo;
+    if (!granuleSkipped && frameZone.isIana()) {
+      // libstdc++ 16's text-tzdb reader places Apia's 2011 dateline jump one
+      // hour later than the system TZif file. The ofLocal result for the
+      // skipped label remains correct (it depends only on the pre-offset), but
+      // resolving the next label does not compare equal. If get_info reports a
+      // forward jump at least as wide as the whole nominal granule containing
+      // its last millisecond, this is the same zero-width-granule condition.
+      try {
+        auto info = frameZone.ianaZone()->get_info(
+            local_time<milliseconds>{milliseconds{civilLast}});
+        int64_t jump = duration_cast<milliseconds>(
+            info.second.offset - info.first.offset).count();
+        granuleSkipped = info.result == local_info::nonexistent
+                      && jump >= *civilNext - civilLo;
+      } catch (const std::exception&) {
+        return std::nullopt;
+      }
+    }
   }
-  year_month_day next = (mo == 12)
-      ? year_month_day{std::chrono::year{(int)year + 1}, std::chrono::month{1}, std::chrono::day{1}}
-      : year_month_day{ymd.year(), std::chrono::month{(unsigned)mo + 1}, std::chrono::day{1}};
-  int64_t hiExclusive = sys_days{next}.time_since_epoch().count() * dd::kMsPerDay
-                      - (int64_t)offsetMin * 60000LL;
-  return DateRange{millis, std::min(hiExclusive, dd::kMaxEpochMs + 1)};
+  return DateLiteralRange{DateRange{*lo, *last + 1, granuleSkipped}, hasExplicitOffset};
 }
 
 namespace datetime_detail {
@@ -277,6 +570,7 @@ inline std::optional<DateMathUnit> parseDateMathUnit(std::string_view unit) {
   auto is = [&](std::string_view name) { return asciiEqualIgnoreCase(unit, name); };
   if (is("YEAR") || is("YEARS")) return DateMathUnit::YEAR;
   if (is("MONTH") || is("MONTHS")) return DateMathUnit::MONTH;
+  if (is("WEEK") || is("WEEKS")) return DateMathUnit::WEEK;
   if (is("DAY") || is("DAYS") || is("DATE")) return DateMathUnit::DAY;
   if (is("HOUR") || is("HOURS")) return DateMathUnit::HOUR;
   if (is("MINUTE") || is("MINUTES")) return DateMathUnit::MINUTE;
@@ -297,13 +591,15 @@ inline std::optional<int64_t> addFixed(int64_t millis, int64_t amount, int64_t u
   return (int64_t)result;
 }
 
-// Calendar addition in UTC with end-of-month clamping (Jan 31 + 1 month is
-// the last day of February), matching Java time / Solr / OpenSearch behavior.
+// Calendar addition with end-of-month clamping (Jan 31 + 1 month is the last
+// day of February). The source instant's offset is the fold preference.
 inline std::optional<int64_t> addCalendar(int64_t millis, int64_t amount,
-                                          DateMathUnit unit) {
+                                          DateMathUnit unit, const TimeZone& zone) {
   using namespace std::chrono;
-  sys_time<milliseconds> tp{milliseconds{millis}};
-  sys_days dp = floor<days>(tp);
+  auto source = civilFromInstant(millis, zone);
+  if (!source) return std::nullopt;
+  local_time<milliseconds> tp{milliseconds{source->millis}};
+  local_days dp = floor<days>(tp);
   milliseconds timeOfDay = tp - dp;
   year_month_day ymd{dp};
 
@@ -328,20 +624,32 @@ inline std::optional<int64_t> addCalendar(int64_t millis, int64_t amount,
   month m{(unsigned)targetMonth};
   unsigned lastDay = (unsigned)year_month_day_last{y, month_day_last{m}}.day();
   unsigned targetDay = std::min((unsigned)ymd.day(), lastDay);
-  int64_t out = sys_days{year_month_day{y, m, day{targetDay}}}.time_since_epoch().count()
-              * kMsPerDay + timeOfDay.count();
-  if (!supportedInstant(out)) return std::nullopt;
-  return out;
+  int64_t outCivil = local_days{year_month_day{y, m, day{targetDay}}}
+                       .time_since_epoch().count() * kMsPerDay
+                   + timeOfDay.count();
+  return instantFromCivil(outCivil, zone, source->offset);
 }
 
 inline std::optional<int64_t> addUnit(int64_t millis, int64_t amount,
-                                      DateMathUnit unit) {
+                                      DateMathUnit unit, const TimeZone& zone) {
   switch (unit) {
     case DateMathUnit::YEAR:
     case DateMathUnit::MONTH:
-      return addCalendar(millis, amount, unit);
-    case DateMathUnit::WEEK: return addFixed(millis, amount, 7 * kMsPerDay);
-    case DateMathUnit::DAY: return addFixed(millis, amount, kMsPerDay);
+      return addCalendar(millis, amount, unit, zone);
+    case DateMathUnit::WEEK:
+    case DateMathUnit::DAY:
+      if (!zone.isIana()) {
+        return addFixed(millis, amount,
+                        unit == DateMathUnit::WEEK ? 7 * kMsPerDay : kMsPerDay);
+      } else {
+        auto source = civilFromInstant(millis, zone);
+        if (!source) return std::nullopt;
+        int64_t daysPerUnit = unit == DateMathUnit::WEEK ? 7 : 1;
+        __int128 civil = (__int128)source->millis
+                       + (__int128)amount * daysPerUnit * kMsPerDay;
+        if (civil < kMinEpochMs || civil > kMaxEpochMs) return std::nullopt;
+        return instantFromCivil((int64_t)civil, zone, source->offset);
+      }
     case DateMathUnit::HOUR: return addFixed(millis, amount, 3600000LL);
     case DateMathUnit::MINUTE: return addFixed(millis, amount, 60000LL);
     case DateMathUnit::SECOND: return addFixed(millis, amount, 1000LL);
@@ -350,66 +658,79 @@ inline std::optional<int64_t> addUnit(int64_t millis, int64_t amount,
   return std::nullopt;
 }
 
-// Return the inclusive [start,end] UTC interval containing millis at unit
-// granularity. Week follows ISO/OpenSearch convention and starts Monday.
+// Return the inclusive [start,end] interval containing millis at unit
+// granularity in the civil frame. Week follows ISO/OpenSearch and starts
+// Monday. The upper edge resolves the last inclusive civil millisecond, not
+// the next granule's start.
 inline std::optional<std::pair<int64_t, int64_t>> roundedInterval(
-    int64_t millis, DateMathUnit unit) {
+    int64_t millis, DateMathUnit unit, const TimeZone& zone) {
   using namespace std::chrono;
-  sys_time<milliseconds> tp{milliseconds{millis}};
-  int64_t lo;
-  int64_t hiExclusive;
-
   if (unit == DateMathUnit::MILLISECOND) return std::pair{millis, millis};
+
+  auto source = civilFromInstant(millis, zone);
+  if (!source) return std::nullopt;
+  local_time<milliseconds> tp{milliseconds{source->millis}};
+  int64_t civilLo;
+  int64_t civilLast;
+
   if (unit == DateMathUnit::SECOND) {
-    lo = floor<seconds>(tp).time_since_epoch().count() * 1000LL;
-    hiExclusive = lo + 1000LL;
+    civilLo = floor<seconds>(tp).time_since_epoch().count() * 1000LL;
+    civilLast = civilLo + 999;
   } else if (unit == DateMathUnit::MINUTE) {
-    lo = floor<minutes>(tp).time_since_epoch().count() * 60000LL;
-    hiExclusive = lo + 60000LL;
+    civilLo = floor<minutes>(tp).time_since_epoch().count() * 60000LL;
+    civilLast = civilLo + 59999;
   } else if (unit == DateMathUnit::HOUR) {
-    lo = floor<hours>(tp).time_since_epoch().count() * 3600000LL;
-    hiExclusive = lo + 3600000LL;
+    civilLo = floor<hours>(tp).time_since_epoch().count() * 3600000LL;
+    civilLast = civilLo + 3599999;
   } else {
-    sys_days dp = floor<days>(tp);
+    local_days dp = floor<days>(tp);
     if (unit == DateMathUnit::DAY) {
-      lo = dp.time_since_epoch().count() * kMsPerDay;
-      hiExclusive = lo + kMsPerDay;
+      civilLo = dp.time_since_epoch().count() * kMsPerDay;
+      civilLast = civilLo + kMsPerDay - 1;
     } else if (unit == DateMathUnit::WEEK) {
       unsigned isoDay = weekday{dp}.iso_encoding();  // Monday=1 ... Sunday=7
-      sys_days start = dp - days{isoDay - 1};
-      lo = start.time_since_epoch().count() * kMsPerDay;
-      hiExclusive = lo + 7 * kMsPerDay;
+      local_days start = dp - days{isoDay - 1};
+      civilLo = start.time_since_epoch().count() * kMsPerDay;
+      civilLast = civilLo + 7 * kMsPerDay - 1;
     } else {
       year_month_day ymd{dp};
       year y = ymd.year();
       month m = unit == DateMathUnit::YEAR ? month{1} : ymd.month();
-      lo = sys_days{year_month_day{y, m, day{1}}}.time_since_epoch().count() * kMsPerDay;
+      civilLo = local_days{year_month_day{y, m, day{1}}}
+                    .time_since_epoch().count() * kMsPerDay;
       if (unit == DateMathUnit::YEAR) {
-        hiExclusive = (int)y == kMaxYear
+        int64_t civilHi = (int)y == kMaxYear
             ? kMaxEpochMs + 1
-            : sys_days{year_month_day{y + years{1}, month{1}, day{1}}}
+            : local_days{year_month_day{y + years{1}, month{1}, day{1}}}
                   .time_since_epoch().count() * kMsPerDay;
+        civilLast = civilHi - 1;
       } else if ((int)y == kMaxYear && (unsigned)m == 12) {
-        hiExclusive = kMaxEpochMs + 1;
+        civilLast = kMaxEpochMs;
       } else {
         year_month ym = y / m + months{1};
-        hiExclusive = sys_days{year_month_day{ym.year(), ym.month(), day{1}}}
-                          .time_since_epoch().count() * kMsPerDay;
+        int64_t civilHi = local_days{year_month_day{ym.year(), ym.month(), day{1}}}
+                            .time_since_epoch().count() * kMsPerDay;
+        civilLast = civilHi - 1;
       }
     }
   }
 
-  if (lo < kMinEpochMs || lo > kMaxEpochMs) return std::nullopt;
-  hiExclusive = std::min(hiExclusive, kMaxEpochMs + 1);
-  if (hiExclusive <= lo) return std::nullopt;
-  return std::pair{lo, hiExclusive - 1};
+  if (civilLo < kMinEpochMs || civilLo > kMaxEpochMs
+      || civilLast < kMinEpochMs || civilLast > kMaxEpochMs) {
+    return std::nullopt;
+  }
+  auto lo = instantFromCivil(civilLo, zone, source->offset);
+  auto last = instantFromCivil(civilLast, zone, source->offset);
+  if (!lo || !last || *last < *lo) return std::nullopt;
+  return std::pair{*lo, *last};
 }
 
 // Evaluate once for the lower edge and once for the upper edge. A slash floors
 // the lower edge and rounds the upper edge to the unit's last millisecond;
 // later commands transform both. This is exactly the interval the existing
 // DATE range fold needs for gte/gt/lte/lt semantics.
-inline std::optional<DateRange> applyDateMath(int64_t anchor, std::string_view math) {
+inline std::optional<DateRange> applyDateMath(int64_t anchor, std::string_view math,
+                                              const TimeZone& zone) {
   Cursor cur{math};
   if (cur.atEnd()) return std::nullopt;
   int64_t lo = anchor;
@@ -434,14 +755,14 @@ inline std::optional<DateRange> applyDateMath(int64_t anchor, std::string_view m
     if (!unit) return std::nullopt;
 
     if (op == '/') {
-      auto lowWindow = roundedInterval(lo, *unit);
-      auto highWindow = roundedInterval(hi, *unit);
+      auto lowWindow = roundedInterval(lo, *unit, zone);
+      auto highWindow = roundedInterval(hi, *unit, zone);
       if (!lowWindow || !highWindow) return std::nullopt;
       lo = lowWindow->first;
       hi = highWindow->second;
     } else {
-      auto newLo = addUnit(lo, amount, *unit);
-      auto newHi = addUnit(hi, amount, *unit);
+      auto newLo = addUnit(lo, amount, *unit, zone);
+      auto newHi = addUnit(hi, amount, *unit, zone);
       if (!newLo || !newHi || *newLo > *newHi) return std::nullopt;
       lo = *newLo;
       hi = *newHi;
@@ -457,7 +778,8 @@ inline bool startsWithNow(const Cursor& input) {
 
 } // namespace datetime_detail
 
-inline std::optional<DateRange> parseDateRange(std::string_view s, int64_t nowEpochMillis) {
+inline std::optional<DateRange> parseDateRange(std::string_view s, int64_t nowEpochMillis,
+                                               const TimeZone& zone) {
   namespace dd = datetime_detail;
   Cursor input{s};
   if (input.atEnd() || input.size() > dd::kMaxDateMathParseLen
@@ -472,11 +794,13 @@ inline std::optional<DateRange> parseDateRange(std::string_view s, int64_t nowEp
     input.advance(3);
     input.consume("||");  // harmless union convenience
     return dd::applyDateMath(
-        nowEpochMillis, input.slice(input.position(), input.size()));
+        nowEpochMillis, input.slice(input.position(), input.size()), zone);
   }
 
   // A literal without math retains Solux's existing granularity window.
-  if (auto literal = parseDateLiteralRange(input.slice(0, input.size()))) return literal;
+  if (auto literal = parseDateLiteralRange(input.slice(0, input.size()), zone)) {
+    return literal->range;
+  }
 
   // OpenSearch uses an explicit anchor/math separator. It removes every
   // ambiguity with a partial time or numeric epoch anchor.
@@ -486,9 +810,12 @@ inline std::optional<DateRange> parseDateRange(std::string_view s, int64_t nowEp
     separatorScan.advance(2);
     size_t mathStart = separatorScan.position();
     if (separatorScan.findNext("||")) return std::nullopt;
-    auto anchor = parseDateLiteralRange(input.slice(0, separator));
+    auto anchor = parseDateLiteralRange(input.slice(0, separator), zone);
     if (!anchor) return std::nullopt;
-    return dd::applyDateMath(anchor->lo, input.slice(mathStart, input.size()));
+    auto result = dd::applyDateMath(
+        anchor->range.lo, input.slice(mathStart, input.size()), zone);
+    if (result) result->granuleSkipped = anchor->range.granuleSkipped;
+    return result;
   }
 
   // Solr appends math directly. Try operator positions from right to left so
@@ -501,29 +828,33 @@ inline std::optional<DateRange> parseDateRange(std::string_view s, int64_t nowEp
     char c = suffixScan.peek();
     if (c != '+' && c != '-' && c != '/') continue;
     size_t separator = suffixScan.position();
-    auto anchor = parseDateLiteralRange(input.slice(0, separator));
+    auto anchor = parseDateLiteralRange(input.slice(0, separator), zone);
     if (!anchor) continue;
     if (auto result = dd::applyDateMath(
-            anchor->lo, input.slice(separator, input.size()))) {
+            anchor->range.lo, input.slice(separator, input.size()), zone)) {
+      result->granuleSkipped = anchor->range.granuleSkipped;
       return result;
     }
   }
   return std::nullopt;
 }
 
-inline std::optional<DateRange> parseDateRange(std::string_view s) {
-  return parseDateRange(s, currentEpochMillis());
-}
-
 inline std::optional<int64_t> parseDateToEpochMillis(std::string_view s,
-                                                      int64_t nowEpochMillis) {
-  auto r = parseDateRange(s, nowEpochMillis);
+                                                      int64_t nowEpochMillis,
+                                                      const TimeZone& zone) {
+  auto r = parseDateRange(s, nowEpochMillis, zone);
   if (!r) return std::nullopt;
   return r->lo;  // ingest/sort use the window start (an instant)
 }
 
+// Ingest has no request time-zone surface and intentionally remains UTC.
+inline std::optional<int64_t> parseDateToEpochMillis(std::string_view s,
+                                                      int64_t nowEpochMillis) {
+  return parseDateToEpochMillis(s, nowEpochMillis, TimeZone::utc());
+}
+
 inline std::optional<int64_t> parseDateToEpochMillis(std::string_view s) {
-  return parseDateToEpochMillis(s, currentEpochMillis());
+  return parseDateToEpochMillis(s, currentEpochMillis(), TimeZone::utc());
 }
 
 // Render epoch millis as canonical UTC ISO-8601: 'YYYY-MM-DDThh:mm:ssZ', with

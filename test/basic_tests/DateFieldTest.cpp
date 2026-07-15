@@ -1,6 +1,8 @@
 #include <gtest/gtest.h>
 #include <algorithm>
+#include <atomic>
 #include <optional>
+#include <thread>
 #include "test/SoluxTest.h"
 #include "test/CollectionHelper.h"
 #include "test/LocalReq.h"
@@ -11,6 +13,35 @@
 
 using namespace solux;
 using namespace solux::test;
+
+namespace {
+
+TimeZone testZone(std::string_view name) {
+  auto zone = resolveTimeZone(name);
+  if (!zone) throw std::runtime_error(timeZoneResolutionError(name));
+  return *zone;
+}
+
+int64_t utcMs(std::string_view text) {
+  auto millis = parseDateToEpochMillis(text);
+  if (!millis) throw std::runtime_error("invalid UTC test instant");
+  return *millis;
+}
+
+DateRange zoneRange(std::string_view text, const TimeZone& zone, int64_t now = 0) {
+  auto range = parseDateRange(text, now, zone);
+  if (!range) throw std::runtime_error("invalid zoned test date: " + std::string(text));
+  return *range;
+}
+
+void expectZoneRange(std::string_view text, const TimeZone& zone,
+                     std::string_view lo, std::string_view hi, int64_t now = 0) {
+  DateRange range = zoneRange(text, zone, now);
+  EXPECT_EQ(utcMs(lo), range.lo) << text;
+  EXPECT_EQ(utcMs(hi), range.hiExclusive) << text;
+}
+
+} // namespace
 
 class DateFieldTest : public SoluxTest {
 };
@@ -90,12 +121,12 @@ TEST_F(DateFieldTest, parseOpenSearchDateMath) {
   EXPECT_EQ(*parseDateToEpochMillis("2022-07-17T00:00:00Z"),
             parseDateToEpochMillis("2022-05-18T15:23:17.789||+2M-1d/d", now));
 
-  auto day = parseDateRange("2022-05-18T15:23||/d", now);
+  auto day = parseDateRange("2022-05-18T15:23||/d", now, TimeZone::utc());
   ASSERT_TRUE(day.has_value());
   EXPECT_EQ(*parseDateToEpochMillis("2022-05-18T00:00:00Z"), day->lo);
   EXPECT_EQ(*parseDateToEpochMillis("2022-05-19T00:00:00Z"), day->hiExclusive);
 
-  auto week = parseDateRange("2024-06-26T12:00:00Z||/w", now);  // Wednesday
+  auto week = parseDateRange("2024-06-26T12:00:00Z||/w", now, TimeZone::utc());  // Wednesday
   ASSERT_TRUE(week.has_value());
   EXPECT_EQ(*parseDateToEpochMillis("2024-06-24T00:00:00Z"), week->lo);  // Monday
   EXPECT_EQ(*parseDateToEpochMillis("2024-07-01T00:00:00Z"), week->hiExclusive);
@@ -103,15 +134,15 @@ TEST_F(DateFieldTest, parseOpenSearchDateMath) {
 
 TEST_F(DateFieldTest, dateMathRoundingWindowAndAnchorCollision) {
   int64_t now = *parseDateToEpochMillis("2024-06-25T10:30:45.123Z");
-  auto shiftedDay = parseDateRange("NOW/DAY+1HOUR", now);
+  auto shiftedDay = parseDateRange("NOW/DAY+1HOUR", now, TimeZone::utc());
   ASSERT_TRUE(shiftedDay.has_value());
   EXPECT_EQ(*parseDateToEpochMillis("2024-06-25T01:00:00Z"), shiftedDay->lo);
   EXPECT_EQ(*parseDateToEpochMillis("2024-06-26T01:00:00Z"), shiftedDay->hiExclusive);
 
   // No math preserves the existing partial-literal window. Once math starts,
   // the partial anchor is its start instant; only slash creates a new window.
-  auto june = parseDateRange("2024-06", now);
-  auto july = parseDateRange("2024-06||+1M", now);
+  auto june = parseDateRange("2024-06", now, TimeZone::utc());
+  auto july = parseDateRange("2024-06||+1M", now, TimeZone::utc());
   ASSERT_TRUE(june.has_value());
   ASSERT_TRUE(july.has_value());
   EXPECT_EQ(30 * datetime_detail::kMsPerDay, june->hiExclusive - june->lo);
@@ -131,7 +162,7 @@ TEST_F(DateFieldTest, dateMathRejectsMalformedAndOverflow) {
          "now+1D", "now+9223372036854775807y",
          "32767-12-31T23:59:59.999Z+1MILLI"
        }) {
-    EXPECT_FALSE(parseDateRange(bad, now).has_value()) << bad;
+    EXPECT_FALSE(parseDateRange(bad, now, TimeZone::utc()).has_value()) << bad;
   }
 }
 
@@ -139,7 +170,7 @@ TEST(DateMathQueryBuilder, usesOneExplicitNowAndRoundingWindow) {
   auto schema = Schema::createDefaultSchema();
   MemPool pool;
   int64_t now = *parseDateToEpochMillis("2024-06-25T10:30:45.123Z");
-  QueryBuilder builder(pool, *schema, now);
+  QueryBuilder builder(pool, *schema, CoerceContext{now, TimeZone::utc()});
   api::Val val;
   val.kind = std::string_view("NOW/DAY");
   auto* range = dynamic_cast<NumericRangeQuery*>(
@@ -174,7 +205,7 @@ TEST_F(DateFieldTest, parseRejectsOutOfRange) {
   EXPECT_FALSE(parseDateToEpochMillis("100000-01-01").has_value());
   // boundary still parses (year 9999 ~ 2.5e14 ms, well inside the range)
   EXPECT_TRUE(parseDateToEpochMillis("9999-12-31T23:59:59Z").has_value());
-  auto maxMonth = parseDateRange("32767-12");
+  auto maxMonth = parseDateRange("32767-12", currentEpochMillis(), TimeZone::utc());
   ASSERT_TRUE(maxMonth.has_value());
   EXPECT_EQ(datetime_detail::kMaxEpochMs + 1, maxMonth->hiExclusive);
   EXPECT_FALSE(parseDateToEpochMillis("32767-12-31T23:59:59-01:00").has_value());
@@ -379,36 +410,336 @@ TEST_F(DateFieldTest, multiStringPartialFailureNoCorruption) {
 
 // Query-side granularity: a date literal denotes the window it names.
 TEST_F(DateFieldTest, parseGranularityWindows) {
-  auto day = parseDateRange("2024-06-25");
+  auto day = parseDateRange("2024-06-25", currentEpochMillis(), TimeZone::utc());
   ASSERT_TRUE(day.has_value());
   EXPECT_EQ(day->lo, *parseDateToEpochMillis("2024-06-25T00:00:00Z"));
   EXPECT_EQ(day->hiExclusive, *parseDateToEpochMillis("2024-06-26T00:00:00Z"));
 
-  auto month = parseDateRange("2024-02");  // leap February
+  auto month = parseDateRange("2024-02", currentEpochMillis(), TimeZone::utc());  // leap February
   ASSERT_TRUE(month.has_value());
   EXPECT_EQ(29 * 86400000LL, month->hiExclusive - month->lo);
-  auto dec = parseDateRange("2024-12");    // year rollover
+  auto dec = parseDateRange("2024-12", currentEpochMillis(), TimeZone::utc());    // year rollover
   ASSERT_TRUE(dec.has_value());
   EXPECT_EQ(dec->hiExclusive, *parseDateToEpochMillis("2025-01-01"));
 
-  auto minute = parseDateRange("2024-06-25T10:30");
+  auto minute = parseDateRange("2024-06-25T10:30", currentEpochMillis(), TimeZone::utc());
   ASSERT_TRUE(minute.has_value());
   EXPECT_EQ(60000, minute->hiExclusive - minute->lo);
-  auto instant = parseDateRange("2024-06-25T10:30:00.123Z");
+  auto instant = parseDateRange("2024-06-25T10:30:00.123Z", currentEpochMillis(), TimeZone::utc());
   ASSERT_TRUE(instant.has_value());
   EXPECT_EQ(1, instant->hiExclusive - instant->lo);
-  auto epoch = parseDateRange("1700000000000");
+  auto epoch = parseDateRange("1700000000000", currentEpochMillis(), TimeZone::utc());
   ASSERT_TRUE(epoch.has_value());
   EXPECT_EQ(1, epoch->hiExclusive - epoch->lo);
 
   // a zone offset shifts the whole window
-  auto offs = parseDateRange("2024-06-25T10-07:00");
+  auto offs = parseDateRange("2024-06-25T10-07:00", currentEpochMillis(), TimeZone::utc());
   ASSERT_TRUE(offs.has_value());
   EXPECT_EQ(3600000, offs->hiExclusive - offs->lo);
   EXPECT_EQ(offs->lo, *parseDateToEpochMillis("2024-06-25T17:00:00Z"));
 
   // a time needs a day: month + time stays invalid
-  EXPECT_FALSE(parseDateRange("2024-06T10").has_value());
+  EXPECT_FALSE(parseDateRange("2024-06T10", currentEpochMillis(), TimeZone::utc()).has_value());
+}
+
+TEST_F(DateFieldTest, timeZoneGrammarAndTzdbResolution) {
+  for (std::string_view spec : {"", "Z", "UTC", "+00", "-00:00"}) {
+    auto zone = resolveTimeZone(spec);
+    ASSERT_TRUE(zone.has_value()) << spec;
+    EXPECT_TRUE(zone->isUtc()) << spec;
+  }
+  for (std::string_view spec : {"+05:30", "+0530", "+05", "+18:00"}) {
+    auto zone = resolveTimeZone(spec);
+    ASSERT_TRUE(zone.has_value()) << spec;
+    EXPECT_TRUE(zone->isFixed()) << spec;
+  }
+  EXPECT_EQ(330, resolveTimeZone("+05:30")->offsetMinutes());
+  EXPECT_EQ(1080, resolveTimeZone("+18:00")->offsetMinutes());
+
+  std::string embeddedNul("America/Denver\0junk", 19);
+  for (std::string_view spec : {"utc", "z", "+18:01", "+24:00", "+5:30",
+                                " UTC", "UTC ", "No/Such_Zone"}) {
+    EXPECT_FALSE(resolveTimeZone(spec).has_value()) << spec;
+  }
+  EXPECT_FALSE(resolveTimeZone(embeddedNul).has_value());
+
+  auto alias = resolveTimeZone("EST5EDT");
+  ASSERT_TRUE(alias.has_value());
+  EXPECT_TRUE(alias->isIana());
+  EXPECT_EQ("America/New_York", alias->name());  // chrono returns the canonical target
+  EXPECT_TRUE(timeZoneDatabaseAvailable());
+  EXPECT_FALSE(timeZoneDatabaseVersion().empty());
+
+  std::atomic<bool> concurrentOk = true;
+  std::vector<std::thread> threads;
+  for (int i = 0; i < 8; ++i) {
+    threads.emplace_back([&] {
+      for (int j = 0; j < 100; ++j) {
+        auto zone = resolveTimeZone("America/Denver");
+        if (!zone || !zone->isIana()) concurrentOk = false;
+      }
+    });
+  }
+  for (auto& thread : threads) thread.join();
+  EXPECT_TRUE(concurrentOk);
+}
+
+TEST_F(DateFieldTest, literalOffsetPresenceCapsAndFrameRebase) {
+  TimeZone denver = testZone("America/Denver");
+  auto absent = parseDateLiteralRange("2024-01-15T00:00:00", denver);
+  auto zulu = parseDateLiteralRange("2024-01-15T00:00:00Z", denver);
+  auto plusZero = parseDateLiteralRange("2024-01-15T00:00:00+00:00", denver);
+  ASSERT_TRUE(absent && zulu && plusZero);
+  EXPECT_FALSE(absent->hasExplicitOffset);
+  EXPECT_TRUE(zulu->hasExplicitOffset);
+  EXPECT_TRUE(plusZero->hasExplicitOffset);
+  EXPECT_EQ(utcMs("2024-01-15T07:00:00Z"), absent->range.lo);
+  EXPECT_EQ(utcMs("2024-01-15T00:00:00Z"), zulu->range.lo);
+  EXPECT_EQ(zulu->range.lo, plusZero->range.lo);
+
+  for (std::string_view offset : {"+18:01", "+23:59", "-23:59"}) {
+    EXPECT_TRUE(parseDateLiteralRange(
+        std::string("2024-01-15T00:00:00") + std::string(offset), denver).has_value())
+        << offset;
+  }
+  EXPECT_FALSE(parseDateLiteralRange("2024-01-15T00:00:00+24:00", denver).has_value());
+
+  // The +20:00 token locates the anchor only. /DAY first rebases that instant
+  // into Denver (2024-03-09T02:30), so the result starts at Denver midnight.
+  expectZoneRange("2024-03-10T05:30:00+20:00/DAY", denver,
+                  "2024-03-09T07:00:00Z", "2024-03-10T07:00:00Z");
+}
+
+// Historical IANA assertions below depend on tzdb data in principle. They pin
+// politically stable, already-observed transitions (tzdb 2026a on this box).
+TEST_F(DateFieldTest, denverSpringForwardOfLocalAndDateMath) {
+  TimeZone denver = testZone("America/Denver");
+  expectZoneRange("2024-03-10T02", denver,
+                  "2024-03-10T09:00:00Z", "2024-03-10T10:00:00Z");
+  expectZoneRange("2024-03-10T02:30", denver,
+                  "2024-03-10T09:30:00Z", "2024-03-10T09:31:00Z");
+  expectZoneRange("2024-03-10T02:30:30", denver,
+                  "2024-03-10T09:30:30Z", "2024-03-10T09:30:31Z");
+
+  expectZoneRange("2024-03-10T12:00:00/DAY", denver,
+                  "2024-03-10T07:00:00Z", "2024-03-11T06:00:00Z");
+  expectZoneRange("2024-03-10T12:00:00/WEEK", denver,
+                  "2024-03-04T07:00:00Z", "2024-03-11T06:00:00Z");
+  expectZoneRange("2024-03-10T12:00:00/MONTH", denver,
+                  "2024-03-01T07:00:00Z", "2024-04-01T06:00:00Z");
+
+  int64_t noonBefore = utcMs("2024-03-09T19:00:00Z");  // Denver 12:00 MST
+  EXPECT_EQ(utcMs("2024-03-10T18:00:00Z"),
+            zoneRange("NOW+1DAY", denver, noonBefore).lo);
+  EXPECT_EQ(utcMs("2024-03-10T19:00:00Z"),
+            zoneRange("NOW+24HOURS", denver, noonBefore).lo);
+  EXPECT_EQ(utcMs("2024-03-09T18:00:00Z"),
+            zoneRange("NOW+1DAY-24HOURS", denver, noonBefore).lo);
+  EXPECT_EQ(noonBefore + 3600000,
+            zoneRange("NOW+1HOUR", denver, noonBefore).lo);
+  EXPECT_EQ(noonBefore + 3600000,
+            zoneRange("NOW+60MINUTES", denver, noonBefore).lo);
+
+  EXPECT_EQ(utcMs("2024-03-10T09:30:00Z"),
+            zoneRange("2024-03-09T02:30+1DAY", denver).lo);
+  EXPECT_EQ(utcMs("2024-03-09T10:30:00Z"),
+            zoneRange("2024-03-09T02:30+1DAY-1DAY", denver).lo);
+  EXPECT_EQ(utcMs("2024-03-11T09:30:00Z"),
+            zoneRange("2024-03-09T02:30+1DAY+1DAY", denver).lo);
+}
+
+TEST_F(DateFieldTest, denverSpringGapGranuleWarnings) {
+  TimeZone denver = testZone("America/Denver");
+  EXPECT_TRUE(zoneRange("2024-03-10T02:30", denver).granuleSkipped);
+  EXPECT_TRUE(zoneRange("2024-03-10T02", denver).granuleSkipped);
+  EXPECT_FALSE(zoneRange("2024-03-10", denver).granuleSkipped);
+  EXPECT_FALSE(zoneRange("2024-03-09T02:30", denver).granuleSkipped);
+
+  CollectionHelper helper;
+  helper.index(flatdoc("id", "gap", "when_dt", "2024-03-10T09:30:00Z"),
+               UpdateMessage::COMMIT);
+  auto req = localReq(soluxNode->getSearchEngine());
+  req->collection("main").timeZone("America/Denver").topDocs("q")
+      .matchQuery("when_dt", "2024-03-10T02:30").withStats();
+  req->execute();
+  ASSERT_TRUE(req->ok()) << req->errorMsg();
+  EXPECT_EQ(1, req->getMatchCount());
+  EXPECT_TRUE(req->hasWarning("date_granule_skipped"));
+}
+
+TEST_F(DateFieldTest, denverFallBackFoldRetentionAndLastMillisecond) {
+  TimeZone denver = testZone("America/Denver");
+  int64_t firstFold = utcMs("2024-11-03T07:30:00Z");
+  int64_t secondFold = utcMs("2024-11-03T08:30:00Z");
+  expectZoneRange("NOW/HOUR", denver,
+                  "2024-11-03T07:00:00Z", "2024-11-03T08:00:00Z", firstFold);
+  expectZoneRange("NOW/HOUR", denver,
+                  "2024-11-03T08:00:00Z", "2024-11-03T09:00:00Z", secondFold);
+  EXPECT_EQ(firstFold, zoneRange("NOW+0DAY", denver, firstFold).lo);
+  EXPECT_EQ(secondFold, zoneRange("NOW+0DAY", denver, secondFold).lo);
+
+  expectZoneRange("2024-11-03T01", denver,
+                  "2024-11-03T07:00:00Z", "2024-11-03T08:00:00Z");
+  expectZoneRange("2024-11-03", denver,
+                  "2024-11-03T06:00:00Z", "2024-11-04T07:00:00Z");
+  EXPECT_EQ(secondFold,
+            zoneRange("2024-11-03T01:30:00-07:00", denver).lo);
+  expectZoneRange("2024-11-03T01:30:00-07:00/DAY", denver,
+                  "2024-11-03T06:00:00Z", "2024-11-04T07:00:00Z");
+}
+
+TEST_F(DateFieldTest, politicalBoundaryRounding) {
+  TimeZone saoPaulo = testZone("America/Sao_Paulo");
+  expectZoneRange("2018-11-04T00:30", saoPaulo,
+                  "2018-11-04T03:30:00Z", "2018-11-04T03:31:00Z");
+  expectZoneRange("2018-11-04T00:30/DAY", saoPaulo,
+                  "2018-11-04T03:00:00Z", "2018-11-05T02:00:00Z");
+
+  TimeZone havana = testZone("America/Havana");
+  expectZoneRange("2015-11-01T00:30/MONTH", havana,
+                  "2015-11-01T04:00:00Z", "2015-12-01T05:00:00Z");
+  expectZoneRange("2015-10-15T12:00/MONTH", havana,
+                  "2015-10-01T04:00:00Z", "2015-11-01T04:00:00Z");
+
+  TimeZone kathmandu = testZone("Asia/Kathmandu");
+  expectZoneRange("1986-07-01T12:00/YEAR", kathmandu,
+                  "1985-12-31T18:30:00Z", "1986-12-31T18:15:00Z");
+}
+
+TEST_F(DateFieldTest, exoticOffsetsAndSubMinuteHistory) {
+  TimeZone lordHowe = testZone("Australia/Lord_Howe");
+  expectZoneRange("2024-10-06T02:15", lordHowe,
+                  "2024-10-05T15:45:00Z", "2024-10-05T15:46:00Z");
+  EXPECT_EQ(utcMs("2024-04-06T14:45:00Z"),
+            zoneRange("2024-04-07T01:45", lordHowe).lo);
+  EXPECT_EQ(utcMs("2024-04-06T15:15:00Z"),
+            zoneRange("2024-04-07T01:45+10:30", lordHowe).lo);
+
+  expectZoneRange("2024-06-01T00:00", testZone("Pacific/Chatham"),
+                  "2024-05-31T11:15:00Z", "2024-05-31T11:16:00Z");
+  expectZoneRange("2024-01-01T00:00", testZone("America/St_Johns"),
+                  "2024-01-01T03:30:00Z", "2024-01-01T03:31:00Z");
+
+  // Liberia used -00:44:30 through 1971. The IANA path must retain seconds;
+  // fixed request offsets intentionally remain minute-granular.
+  expectZoneRange("1970-01-01T00:00", testZone("Africa/Monrovia"),
+                  "1970-01-01T00:44:30Z", "1970-01-01T00:45:30Z");
+}
+
+TEST_F(DateFieldTest, fixedOffsetAndIanaEquivalence) {
+  TimeZone fixed = testZone("+05:00");
+  TimeZone iana = testZone("Etc/GMT-5");
+  for (std::string_view expression : {
+         "2024-03-10", "2024-03-10T02:30", "2024-03-10T02:30/DAY",
+         "2024-01-31T12:30+1MONTH", "2024-02-29T12:30+1YEAR",
+         "2024-03-10T02:30+1DAY+3HOURS", "2024-03-10T02:30/WEEK"}) {
+    DateRange a = zoneRange(expression, fixed);
+    DateRange b = zoneRange(expression, iana);
+    EXPECT_EQ(a.lo, b.lo) << expression;
+    EXPECT_EQ(a.hiExclusive, b.hiExclusive) << expression;
+  }
+}
+
+TEST_F(DateFieldTest, civilYearGuardAtInstantCaps) {
+  using namespace datetime_detail;
+  TimeZone plus14 = testZone("+14:00");
+  TimeZone minus12 = testZone("-12:00");
+  EXPECT_TRUE(civilFromInstant(kMinEpochMs, TimeZone::utc()).has_value());
+  EXPECT_TRUE(civilFromInstant(kMaxEpochMs, TimeZone::utc()).has_value());
+  EXPECT_TRUE(civilFromInstant(kMinEpochMs, plus14).has_value());
+  EXPECT_FALSE(civilFromInstant(kMaxEpochMs, plus14).has_value());
+  EXPECT_FALSE(civilFromInstant(kMinEpochMs, minus12).has_value());
+  EXPECT_TRUE(civilFromInstant(kMaxEpochMs, minus12).has_value());
+
+  std::string min = std::to_string(kMinEpochMs);
+  std::string max = std::to_string(kMaxEpochMs);
+  EXPECT_TRUE(parseDateRange(min, 0, plus14).has_value());  // epoch is zone-free
+  EXPECT_TRUE(parseDateRange(max, 0, plus14).has_value());
+  EXPECT_TRUE(parseDateLiteralRange("32767-12-31T00:00", plus14).has_value());
+  EXPECT_TRUE(parseDateLiteralRange("-32767-01-01T00:00", minus12).has_value());
+  EXPECT_FALSE(parseDateRange(max + "||/DAY", 0, plus14).has_value());
+  EXPECT_FALSE(parseDateRange(min + "||/YEAR", 0, minus12).has_value());
+  EXPECT_FALSE(parseDateRange(max + "||-1YEAR", 0, plus14).has_value());
+  EXPECT_FALSE(addUnit(kMaxEpochMs - 14 * 3600000LL, 1,
+                       DateMathUnit::YEAR, plus14).has_value());
+  EXPECT_FALSE(addUnit(kMinEpochMs + 12 * 3600000LL, -1,
+                       DateMathUnit::YEAR, minus12).has_value());
+
+  TimeZone namedPlus14 = testZone("Etc/GMT-14");
+  TimeZone namedMinus12 = testZone("Etc/GMT+12");
+  EXPECT_FALSE(civilFromInstant(kMaxEpochMs, namedPlus14).has_value());
+  EXPECT_FALSE(civilFromInstant(kMinEpochMs, namedMinus12).has_value());
+}
+
+TEST_F(DateFieldTest, requestZoneThreadsAllQueryDialectsAndBounds) {
+  CollectionHelper helper;
+  helper.index(flatdoc("id", "a", "when_dt", "2024-03-10T09:30:00Z"),
+               UpdateMessage::NO_COMMIT);
+  helper.index(flatdoc("id", "b", "when_dt", "2024-03-10T09:30:59.999Z"),
+               UpdateMessage::NO_COMMIT);
+  helper.index(flatdoc("id", "c", "when_dt", "2024-03-10T09:31:00Z"),
+               UpdateMessage::COMMIT);
+
+  auto req = localReq(soluxNode->getSearchEngine());
+  req->collection("main").timeZone("America/Denver");
+  auto& structured = req->topDocs("structured");
+  structured.rawQuery() = qb::range(
+      structured.mr(), "when_dt", qb::valStr(structured.mr(), "2024-03-10T02:30"),
+      nullptr, qb::valStr(structured.mr(), "2024-03-10T02:30"), nullptr);
+  structured.withStats();
+  req->topDocs("expr").exprQuery("when_dt:[2024-03-10T02:30 TO 2024-03-10T02:30]")
+      .withStats();
+  req->topDocs("simple").simpleQuery("when_dt:2024-03-10T02:30", {"id"})
+      .withStats();
+  req->execute();
+  ASSERT_TRUE(req->ok()) << req->errorMsg();
+  EXPECT_EQ(2, req->getMatchCount("structured"));
+  EXPECT_EQ(2, req->getMatchCount("expr"));
+  EXPECT_EQ(2, req->getMatchCount("simple"));
+}
+
+TEST_F(DateFieldTest, ingestRemainsUtcUnderZonedQueries) {
+  CollectionHelper helper;
+  helper.index(flatdoc("id", "utc", "when_dt", "2024-01-15"), UpdateMessage::COMMIT);
+
+  auto utc = localReq(soluxNode->getSearchEngine());
+  utc->collection("main").topDocs("q").matchQuery("when_dt", "2024-01-15").withStats();
+  utc->execute();
+  ASSERT_TRUE(utc->ok()) << utc->errorMsg();
+  EXPECT_EQ(1, utc->getMatchCount());
+
+  auto denver = localReq(soluxNode->getSearchEngine());
+  denver->collection("main").timeZone("America/Denver").topDocs("q")
+      .matchQuery("when_dt", "2024-01-15").withStats();
+  denver->execute();
+  ASSERT_TRUE(denver->ok()) << denver->errorMsg();
+  EXPECT_EQ(0, denver->getMatchCount());
+}
+
+TEST_F(DateFieldTest, skippedQueryGranuleWarnsAndInvalidZoneIsEager) {
+  CollectionHelper helper;
+  helper.index(flatdoc("id", "apia", "when_dt", "2011-12-30T10:00:00Z"),
+               UpdateMessage::COMMIT);  // 2011-12-31 local after the dateline jump
+
+  auto skipped = localReq(soluxNode->getSearchEngine());
+  skipped->collection("main").timeZone("Pacific/Apia").topDocs("q")
+      .matchQuery("when_dt", "2011-12-30").withStats();
+  skipped->execute();
+  ASSERT_TRUE(skipped->ok()) << skipped->errorMsg();
+  EXPECT_EQ(1, skipped->getMatchCount());
+  EXPECT_TRUE(zoneRange("2011-12-30", testZone("Pacific/Apia")).granuleSkipped);
+  EXPECT_TRUE(zoneRange("2011-12-30||+0DAY", testZone("Pacific/Apia")).granuleSkipped);
+  ASSERT_TRUE(skipped->hasWarning("date_granule_skipped"));
+  EXPECT_NE(skipped->respWarnings()[0].message.find("op 'q'"), std::string_view::npos);
+  EXPECT_NE(skipped->respWarnings()[0].message.find("2011-12-30"), std::string_view::npos);
+  EXPECT_NE(skipped->respWarnings()[0].message.find("Pacific/Apia"), std::string_view::npos);
+
+  auto invalid = localReq(soluxNode->getSearchEngine());
+  invalid->collection("main").timeZone("No/Such_Zone").topDocs("q").allQuery();
+  invalid->execute();
+  EXPECT_FALSE(invalid->ok());
+  EXPECT_NE(invalid->errorMsg().find("No/Such_Zone"), std::string::npos);
+  EXPECT_NE(invalid->errorMsg().find("tzdb version"), std::string::npos);
 }
 
 // Equality and range endpoints round by the literal's granularity end-to-end.

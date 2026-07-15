@@ -5,6 +5,7 @@ namespace solux {
 
 void SearchEngine::submitBody(SearchRequest& req) {
   try {
+    if (!req.timeZone) throw std::runtime_error(req.timeZoneError);
     getResources(req);
     // LOG_DEBUG("submitBody: IndexReader commitTime={}", req.reader->commitTime());
     req.lastResponse = SearchResponse::create(req, true);

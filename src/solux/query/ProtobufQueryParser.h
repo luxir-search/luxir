@@ -68,7 +68,8 @@ public:
                 ? QueryBuilder::Operator::AND
                 : QueryBuilder::Operator::OR;
 
-    QueryBuilder builder(pool, schema, context.dateMathNowEpochMillis);
+    QueryBuilder builder(
+        pool, schema, context.coerceContext, context.opName, context.warnings);
     if (matchQuery.val.has_value()) {
       // Val goes through the coercion contract: a numeric val against a
       // text/string field matches its canonical rendering (it used to
@@ -102,7 +103,8 @@ public:
 
   solux::Query* parsePhrase(const solux::api::PhraseQuery& phraseQuery) {
     std::string_view field = phraseQuery.field;
-    QueryBuilder builder(pool, schema, context.dateMathNowEpochMillis);
+    QueryBuilder builder(
+        pool, schema, context.coerceContext, context.opName, context.warnings);
 
     std::span<const int32_t> positions = phraseQuery.positions;
     if (phraseQuery.slop < 0) {
@@ -162,14 +164,16 @@ public:
 
 
   solux::Query* parsePrefix(const solux::api::PrefixQuery& prefixQuery) {
-    QueryBuilder builder(pool, schema, context.dateMathNowEpochMillis);
+    QueryBuilder builder(
+        pool, schema, context.coerceContext, context.opName, context.warnings);
     return builder.createPrefixQuery(prefixQuery.field, prefixQuery.prefix);
   }
 
   solux::Query* parseRange(const solux::api::RangeQuery& rangeQuery) {
     auto ptr = [](const ::hpp_proto::optional_indirect_view<solux::api::Val>& v)
         -> const solux::api::Val* { return v.has_value() ? &*v : nullptr; };
-    QueryBuilder builder(pool, schema, context.dateMathNowEpochMillis);
+    QueryBuilder builder(
+        pool, schema, context.coerceContext, context.opName, context.warnings);
     return builder.createRangeQuery(rangeQuery.field, ptr(rangeQuery.gte), ptr(rangeQuery.gt),
                                     ptr(rangeQuery.lte), ptr(rangeQuery.lt));
   }
@@ -193,7 +197,8 @@ public:
         std::format("Fuzzy query max_expansions must not be negative (got {})",
                     fuzzyQuery.max_expansions));
     }
-    QueryBuilder builder(pool, schema, context.dateMathNowEpochMillis);
+    QueryBuilder builder(
+        pool, schema, context.coerceContext, context.opName, context.warnings);
     std::optional<int> maxEdits = fuzzyQuery.max_edits.has_value()
         ? std::optional<int>(*fuzzyQuery.max_edits) : std::nullopt;
     std::optional<int> prefixLength = fuzzyQuery.prefix_length.has_value()
@@ -299,13 +304,12 @@ public:
     // happens at build) and applies min_match itself, where user clauses are
     // distinguishable from per-field expansion.  allowed_fields only narrows;
     // entries the schema cannot query are dead.
-    SimpleQueryOptions options;
+    SimpleQueryOptions options(context.coerceContext);
     options.fields = sq.fields;
     options.schema = &schema;
     options.allowed_fields = sq.allowed_fields;
     options.operator_ = sq.operator_;
     options.min_match = sq.min_match;
-    options.dateMathNowEpochMillis = context.dateMathNowEpochMillis;
 
     SimpleQueryResult result = solux::parseSimpleQuery(sq.q, options, pool);
     for (const auto& w : result.warnings) {
@@ -316,7 +320,8 @@ public:
       // Nothing parsed (e.g. all-whitespace q).  There is no structured
       // match-nothing arm to splice, so the string stays; the warnings
       // channel declares the degradation.
-      QueryBuilder builder(pool, schema, context.dateMathNowEpochMillis);
+      QueryBuilder builder(
+          pool, schema, context.coerceContext, context.opName, context.warnings);
       return builder.matchNoDocs();
     }
     // Splice the expansion over the simple_query arm, same as expr: both live

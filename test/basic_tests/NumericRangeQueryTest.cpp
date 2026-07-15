@@ -232,7 +232,7 @@ TEST_F(NumericRangeQueryTest, conjunctionAndConstantScore) {
 TEST(NumericRangeBuilder, validation) {
   auto schema = Schema::createDefaultSchema();
   MemPool pool;
-  QueryBuilder builder(pool, *schema);
+  QueryBuilder builder(pool, *schema, CoerceContext{});
 
   api::Val a; a.kind = (int64_t)5;
   api::Val b; b.kind = (int64_t)10;

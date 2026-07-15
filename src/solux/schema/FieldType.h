@@ -2,6 +2,7 @@
 
 #include "solux/analysis/Analyzer.h"
 #include "solux/reader/Postings.h"
+#include "solux/util/DateTime.h"
 
 #include <cstdint>
 #include <memory>
@@ -15,11 +16,11 @@ namespace solux {
 
 namespace api { struct Val; }  // the wire value oneof (api/solux_types.hpp)
 
-// Request/update-scoped inputs that can affect value coercion. NOW is the only
-// one today; a context avoids teaching generic column handlers about DATE and
-// leaves one seam for a future date-math time zone or other contextual types.
+// Request/update-scoped inputs that can affect value coercion. Updates use the
+// default UTC frame; request-facing parser seams always pass the whole context.
 struct CoerceContext {
   std::optional<int64_t> dateMathNowEpochMillis;
+  TimeZone timeZone = TimeZone::utc();
 };
 
 
@@ -274,7 +275,7 @@ public:
   // denotes at its own granularity: "2024-06-25" is the whole day, "2024-06"
   // the month, epoch millis a single instant.  Queries match/round by the
   // window; ingest and sorting use coerceColInt64 (the window start).
-  std::pair<int64_t, int64_t> coerceDateRange(
+  DateRange coerceDateRange(
       const api::Val& val, std::string_view fieldName,
       const CoerceContext& context = {}) const;
 };

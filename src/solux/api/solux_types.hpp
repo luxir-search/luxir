@@ -341,6 +341,7 @@ struct SearchRequest {                                          // needs Target
   std::optional<Target> collection;
   map_view<std::string_view, ::hpp_proto::indirect_view<SearchOp>> ops;
   uint64_t freshness_us = 0;
+  std::string_view time_zone;
 };
 struct Map { map_view<std::string_view, ::hpp_proto::indirect_view<Val>> fields; };
 struct Bucket {
