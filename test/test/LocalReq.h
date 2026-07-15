@@ -54,6 +54,7 @@ public:
   OpCursor& allQuery();
   OpCursor& matchQuery(std::string_view field, std::string_view value);
   OpCursor& matchQuery(std::string_view field, std::string_view value, solux::api::Match_::Operator op);
+  OpCursor& matchFilter(std::string_view name, std::string_view field, std::string_view value);  // append to TopDocs.filter
   OpCursor& prefixQuery(std::string_view field, std::string_view prefix);
   OpCursor& fuzzyQuery(std::string_view field, std::string_view term,
                        int maxEdits = -1, int prefixLength = -1, int maxExpansions = 0);
@@ -406,6 +407,22 @@ inline OpCursor& OpCursor::matchQuery(std::string_view field, std::string_view v
 inline OpCursor& OpCursor::matchQuery(std::string_view field, std::string_view value, solux::api::Match_::Operator op) {
   matchQuery(field, value);
   std::get<solux::api::Match>(getOrCreateQuery().kind).operator_ = op;
+  return *this;
+}
+inline OpCursor& OpCursor::matchFilter(std::string_view name, std::string_view field, std::string_view value) {
+  auto& td = asTopDocs();
+  auto old = td.filter;
+  auto* a = build::allocArray(td.filter, old.size() + 1, req_->mr);
+  std::copy(old.begin(), old.end(), a);
+  auto& named = a[old.size()];
+  named.name = build::arenaStr(req_->mr, name);
+  auto* q = req_->arenaNew<solux::api::Query>();
+  auto& m = q->kind.emplace<solux::api::Match>();
+  m.field = build::arenaStr(req_->mr, field);
+  auto* v = req_->arenaNew<solux::api::Val>();
+  v->kind = build::arenaStr(req_->mr, value);
+  m.val = v;
+  named.query = q;
   return *this;
 }
 inline OpCursor& OpCursor::simpleQuery(std::string_view q, std::initializer_list<std::string> fieldNames) {

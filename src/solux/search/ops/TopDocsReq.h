@@ -273,8 +273,10 @@ public:
         if (supplier != nullptr) {
           DocSet* filter = domain;
           std::unique_ptr<DocSet> newDomain;
+          // Owns the materialized filter sets; `filter` may alias one directly
+          // (single-filter case), so this must outlive the collection below.
+          std::vector<std::unique_ptr<DocSet>> filters;
           if (!preparedMode && !thisOp().filterWeights.empty()) {
-            std::vector<std::unique_ptr<DocSet>> filters;
             std::vector<DocSet*> filterPtrs;
             for (auto weight : thisOp().filterWeights) {
               filters.push_back(QueryPrep::materialize(*weight, nullptr, seg, nullptr));

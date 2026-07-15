@@ -642,6 +642,53 @@ TEST_F(SearchEngineTest, opAndFilterNameCharset) {
   }
 }
 
+TEST_F(SearchEngineTest, topDocsFilters) {
+  CollectionHelper helper;
+  helper.indexAll(std::array{
+    flatdoc("id", "1", "foo_w", "hello", "cat_s", "a", "size_s", "big"),
+    flatdoc("id", "2", "foo_w", "hello", "cat_s", "a", "size_s", "small"),
+    flatdoc("id", "3", "foo_w", "hello", "cat_s", "b", "size_s", "big"),
+    flatdoc("id", "4", "foo_w", "other", "cat_s", "a", "size_s", "big"),
+  }, UpdateMessage::COMMIT);
+
+  {  // single filter narrows the query domain
+    auto req = localReq(soluxNode->getSearchEngine());
+    req->collection("main");
+    req->topDocs("q").matchQuery("foo_w", "hello").getNumber().fields({"id"})
+        .matchFilter("f", "cat_s", "a");
+    req->execute();
+    ASSERT_FALSE(hasError(req->responses[0]->proto)) << req->toString();
+    auto& docs = std::get<api::DocList>(req->responses[0]->proto.ops.at("q")->kind);
+    EXPECT_EQ(2, docs.matches);
+  }
+  {  // two filters intersect
+    auto req = localReq(soluxNode->getSearchEngine());
+    req->collection("main");
+    req->topDocs("q").matchQuery("foo_w", "hello").getNumber().fields({"id"})
+        .matchFilter("f1", "cat_s", "a").matchFilter("f2", "size_s", "big");
+    req->execute();
+    ASSERT_FALSE(hasError(req->responses[0]->proto)) << req->toString();
+    auto& docs = std::get<api::DocList>(req->responses[0]->proto.ops.at("q")->kind);
+    EXPECT_EQ(1, docs.matches);
+  }
+  {  // a nested facet counts over the filtered domain
+    auto req = localReq(soluxNode->getSearchEngine());
+    req->collection("main");
+    auto& td = req->topDocs("q");
+    td.matchQuery("foo_w", "hello").getNumber().fields({"id"})
+        .matchFilter("f", "size_s", "big");
+    td.facet("cats", "cat_s").limit(-1);
+    req->execute();
+    ASSERT_FALSE(hasError(req->responses[0]->proto)) << req->toString();
+    auto& docs = std::get<api::DocList>(req->responses[0]->proto.ops.at("q")->kind);
+    EXPECT_EQ(2, docs.matches);
+    auto& facet = std::get<api::FacetResult>(docs.ops.at("cats")->kind);
+    ASSERT_EQ(2u, facet.counts.size());
+    EXPECT_EQ(1, facet.counts[0]);  // one "hello"+"big" doc in each of a and b
+    EXPECT_EQ(1, facet.counts[1]);
+  }
+}
+
 // Missing collection targets error cleanly and do not auto-create on reads.
 TEST_F(SearchEngineTest, missingCollectionErrors) {
   std::string name = "search_engine_missing_collection";
