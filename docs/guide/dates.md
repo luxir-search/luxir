@@ -54,7 +54,7 @@ By default everything above is UTC. Set `time_zone` on a search request to
 give it a civil frame:
 
 ```
-POST /collections/main/query
+POST /collections/main/_query
 {"time_zone": "America/Denver",
  "ops": {"q": {"top_docs": {"query":
    {"range": {"field": "when_dt", "gte": "NOW/DAY"}}}}}}
@@ -93,7 +93,7 @@ Range facets bucket DATE fields with either a fixed gap in milliseconds or a
 calendar gap in the facet's zone:
 
 ```
-POST /collections/main/query
+POST /collections/main/_query
 {"time_zone": "America/Denver",
  "ops": {"per_day": {"range_facet": {
    "field": "when_dt",
