@@ -79,6 +79,25 @@ public:
     uint32_t len = 0;
   };
 
+  // Immutable state captured from a positioned TermsEnum.  It is sufficient
+  // to construct independent DocsEnums without retaining this mutable enum or
+  // seeking the term dictionary again.
+  struct PostingsState {
+    InputStream docIS;
+    InputStream posIS;
+    EncodedImpactFrontier termImpactFrontier;
+    int64_t docsStart = 0;
+    int64_t docsEnd = 0;
+    int64_t posStart = 0;
+    int64_t totalTermFreq = 0;
+    int32_t docFreq = 0;
+    int32_t termOrdinal = -1;
+    int32_t pulsedDoc = -1;
+    int32_t pulsedPos = -1;
+    bool hasFreqs = false;
+    bool hasPositions = false;
+  };
+
   // fieldInfo is not copied and should remain valid throughout the lifetime of this TermsEnum and any related classes such as DocsEnum
   TermsEnum(MemPool& pool, PostingsReader& postingsReader, const SegFieldInfo& fieldInfo) : pool(pool), postingsReader(postingsReader), fieldInfo(fieldInfo) {
     unused(this->pool, this->postingsReader);
@@ -189,6 +208,46 @@ public:
     skipEncodedImpactFrontier(p, end);
     assert(p <= end);
     return {start, (uint32_t) (p - start)};
+  }
+
+  PostingsState postingsState() {
+    assert(ordInBlock >= 0);
+    decodePostings();
+
+    PostingsState state;
+    state.hasFreqs = FieldType::hasFreqs(fieldInfo.flags);
+    state.hasPositions = FieldType::hasPositions(fieldInfo.flags);
+    state.termOrdinal = ord();
+    state.docFreq = docFreq();
+    state.totalTermFreq = totalTermFreq();
+    state.termImpactFrontier = currentTermImpactFrontierSpan();
+
+    uint64_t startOffset = ordInBlock == 0 ? 0 : docsEnds[(size_t) ordInBlock - 1];
+    uint64_t endOffset = docsEnds[(size_t) ordInBlock];
+    assert(endOffset >= startOffset);
+    assert(startOffset <= INT64_MAX && endOffset <= INT64_MAX);
+    state.docsStart = locOfDocsForTermBlock + (int64_t) startOffset;
+    state.docsEnd = locOfDocsForTermBlock + (int64_t) endOffset;
+
+    if (state.docsStart == state.docsEnd) {
+      assert((pulsedMask & (1u << (uint32_t) ordInBlock)) != 0);
+      uint32_t pulsedOrd = std::popcount(
+          pulsedMask & ((1u << (uint32_t) ordInBlock) - 1));
+      uint32_t valueIndex = pulsedOrd * (state.hasPositions ? 2u : 1u);
+      state.pulsedDoc = (int32_t) pulsedValues[valueIndex];
+      if (state.hasPositions) {
+        state.pulsedPos = (int32_t) pulsedValues[valueIndex + 1];
+      }
+    } else {
+      state.docIS = postingsReader.getInputStream(fieldInfo.docsLoc.filenum());
+      state.docIS.seek(state.docsStart);
+      if (state.hasPositions) {
+        state.posStart = locOfPositionsForTermBlock + (int64_t) posOffsets[(size_t) ordInBlock];
+        state.posIS = postingsReader.getInputStream(fieldInfo.posLoc.filenum());
+        state.posIS.seek(state.posStart);
+      }
+    }
+    return state;
   }
 
 protected:

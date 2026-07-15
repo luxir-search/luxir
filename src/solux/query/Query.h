@@ -165,30 +165,27 @@ public:
 };
 
 struct CachedTermInfo {
-  int32_t sharedCount = 0;
   Similarity::TermStats termStats = {};
   Similarity::BM25Scorer* simScorer = nullptr;  // This may be null even if other elements are fille in (phrase query would have different one)
-  std::span<DocsEnum*> docsEnums = {}; // TODO: cache align if they will be used in multiple threads
+  std::span<const TermsEnum::PostingsState*> postingsStates = {};
 
-  /// Get an independent DocsEnum to iterate.  Always cloned: a scorer mutates the enum
-  /// it gets, and the clone is a cheap pool-free copy (DocsEnum buffers are immediate).
-  /// The old sharedCount fast path (hand out the cached enum un-cloned when only one
-  /// weight referenced the term) was fragile: the clone-or-not decision is made at
-  /// scorer-creation time, but sharedCount can rise afterwards, so a createWeight for
-  /// this term that ran after a scorer had already advanced the cached enum would later
-  /// clone the mutated state.  Cloning unconditionally removes that ordering hazard.
+  /// Construct an independent DocsEnum from the immutable state captured by the
+  /// original term seek. No dictionary re-seek or shared mutable enum is involved.
   DocsEnum* useDocsEnum(MemPool& targetPool, IndexReader::Segment& segment,
                         bool trackPositions = true) {
-    auto* docsEnum = docsEnums[segment.ord];
-    if (docsEnum == nullptr) {
+    auto* state = postingsStates[segment.ord];
+    if (state == nullptr) {
       return nullptr;
     }
-    auto* clone = targetPool.make<DocsEnum>(targetPool, *docsEnum);
-    clone->setTrackPositions(trackPositions);
-    return clone;
+    auto* docsEnum = targetPool.make<DocsEnum>(targetPool, *state);
+    docsEnum->setTrackPositions(trackPositions);
+    return docsEnum;
   }
 
-
+  int32_t docFreq(int32_t segmentOrd) const {
+    auto* state = postingsStates[segmentOrd];
+    return state == nullptr ? 0 : state->docFreq;
+  }
 };
 
 struct CachedFieldInfo {
@@ -403,25 +400,25 @@ public:
       auto [iter, inserted] = cachedFieldInfo.termInfos.try_emplace(term);
       CachedTermInfo& result = iter->second;
       if (!inserted) {
-        result.sharedCount++;
         return &result;
       }
 
       auto savepoint = pool.getSavePoint();
       auto numSegs = numSegments();
       int foundInSegCount = 0;
-      result.docsEnums = {pool.make_arr<DocsEnum*>(numSegs), numSegs};
+      result.postingsStates = {
+          pool.make_arr<const TermsEnum::PostingsState*>(numSegs), numSegs};
       for (int i = 0; i < numSegs; ++i) {
         auto& termsEnum = cachedFieldInfo.termsEnums[i];
         if (!termsEnum || !termsEnum->seek(term)) {
-          result.docsEnums[i] = nullptr;
+          result.postingsStates[i] = nullptr;
           continue;
         }
         foundInSegCount++;
-        DocsEnum* docsEnum = pool.make<DocsEnum>(pool, topReader.segments()[i].postingsReader(), *termsEnum);
-        result.docsEnums[i] = docsEnum;
-        result.termStats.docFreq += docsEnum->numDocs();
-        result.termStats.totalTermFreq += docsEnum->totalTermFreq();
+        auto* state = pool.make<TermsEnum::PostingsState>(termsEnum->postingsState());
+        result.postingsStates[i] = state;
+        result.termStats.docFreq += state->docFreq;
+        result.termStats.totalTermFreq += state->totalTermFreq;
       }
 
       if (foundInSegCount == 0) {

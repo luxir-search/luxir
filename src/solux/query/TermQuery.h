@@ -149,8 +149,7 @@ public:
       if (cachedTermInfo == nullptr) {
         return 0;
       }
-      auto* docsEnum = cachedTermInfo->docsEnums[segment.ord];
-      return docsEnum == nullptr ? 0 : docsEnum->numDocs();
+      return cachedTermInfo->docFreq(segment.ord);
     }
 
     // Per-segment supplier that exposes the term's real cost (its number of docs
@@ -166,8 +165,7 @@ public:
 
       int64_t cost() override {
         if (weight.cachedTermInfo == nullptr) return 0;
-        auto* docsEnum = weight.cachedTermInfo->docsEnums[segment.ord];
-        return docsEnum == nullptr ? 0 : docsEnum->numDocs();
+        return weight.cachedTermInfo->docFreq(segment.ord);
       }
 
       Query::Scorer* get(solux::MemPool& targetPool, int64_t leadCost) override {

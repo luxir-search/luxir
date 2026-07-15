@@ -2969,7 +2969,7 @@ TEST_F(TermScorerTest, termImpactFrontierIsExactBlockMax) {
   EXPECT_TRUE(sawTighterBlock);
 }
 
-TEST_F(TermScorerTest, cachedDocsEnumKeepsCurrentTermFrontierAfterTermsEnumSeek) {
+TEST_F(TermScorerTest, cachedPostingsStateKeepsCurrentTermFrontierAfterTermsEnumSeek) {
   TestIndex testIndex;
   TestField f(testIndex, "body_w");
   f.startIndexing();
@@ -3009,10 +3009,12 @@ TEST_F(TermScorerTest, cachedDocsEnumKeepsCurrentTermFrontierAfterTermsEnumSeek)
   EXPECT_EQ(clonedNorms, alphaNorms);
   EXPECT_EQ(clonedTfs, alphaTfs);
 
-  DocsEnum copied(testIndex.pool, alphaScorer->docsEnum);
+  auto* secondAlphaScorer = dynamic_cast<TermQuery::Scorer*>(
+      alphaWeight->createScorer(testIndex.pool, segment));
+  ASSERT_NE(secondAlphaScorer, nullptr);
   clonedNorms.clear();
   clonedTfs.clear();
-  ASSERT_GT(copied.readTermImpactFrontier(clonedNorms, clonedTfs), 0);
+  ASSERT_GT(secondAlphaScorer->docsEnum.readTermImpactFrontier(clonedNorms, clonedTfs), 0);
   EXPECT_EQ(clonedNorms, alphaNorms);
   EXPECT_EQ(clonedTfs, alphaTfs);
 }
@@ -7290,11 +7292,9 @@ TEST_F(TermScorerTest, getNumberDisablesImpactSkipping) {
   EXPECT_EQ(exactCollector.totalHits(), (int64_t) N);
 }
 
-// Regression: CachedTermInfo::useDocsEnum used to hand out the cached DocsEnum un-cloned
-// when only one weight referenced the term (sharedCount==0).  Creating a SECOND weight
-// for the same term (sharedCount->1) and a scorer AFTER the first scorer had already run
-// then cloned the exhausted cached enum.  useDocsEnum now always clones, so interleaved
-// createWeight / run / createWeight is safe.
+// Regression: CachedTermInfo used to cache a mutable DocsEnum prototype. A scorer could
+// consume that prototype before another weight cloned it. The cache now holds immutable
+// positioned-term state, so every scorer starts independently without another seek.
 TEST_F(TermScorerTest, interleavedScorersForSameTermAreIndependent) {
   const int32_t N = 3 * Postings::DOCS_BLOCK_SIZE + 7;  // multi-block, "needle" in every doc
   TestIndex testIndex;
@@ -7322,7 +7322,7 @@ TEST_F(TermScorerTest, interleavedScorersForSameTermAreIndependent) {
     return n;
   };
 
-  // First weight+scorer for "needle", fully consumed (its createWeight set sharedCount=0).
+  // First weight+scorer for "needle", fully consumed.
   EXPECT_EQ(countAll("needle"), (int64_t) N);
   // Second weight+scorer for the SAME term, created and run AFTER the first finished.
   // Pre-fix this cloned the exhausted cached enum and counted far fewer than N.

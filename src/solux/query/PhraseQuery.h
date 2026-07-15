@@ -234,9 +234,8 @@ public:
         if (weight.cachedFieldInfo == nullptr) return 0;
         int64_t minCost = -1;
         for (auto* termInfo : weight.cachedTermInfos) {
-          auto* docsEnum = termInfo->docsEnums[segment.ord];
-          if (docsEnum == nullptr) return 0;
-          int64_t c = docsEnum->numDocs();
+          int64_t c = termInfo->docFreq(segment.ord);
+          if (c == 0) return 0;
           if (minCost < 0 || c < minCost) minCost = c;
         }
         return minCost < 0 ? 0 : minCost;

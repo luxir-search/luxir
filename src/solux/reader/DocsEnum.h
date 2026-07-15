@@ -66,8 +66,6 @@ class DocsEnum {
 
   InputStream docIS;
   InputStream posIS;
-  PostingsReader& postingsReader;
-  const SegFieldInfo& fieldInfo;
   MemPool* pool;
   bool hasFreqs;      // field indexes term freqs (else tfreq is implicitly 1)
   bool hasPositions;  // field indexes positions (else there is no position stream)
@@ -80,8 +78,6 @@ class DocsEnum {
   int64_t startOfDocs;
   int64_t endOfDocs;
 
-  int64_t locOfDocsForTermBlock;
-  int64_t locOfPositionsForTermBlock;
   int64_t posStartLoc = 0;  // absolute location of this term's positions (base for L0 posByteOff)
   const char* termImpactFrontierPtr = nullptr;
   uint32_t termImpactFrontierLen = 0;
@@ -664,53 +660,38 @@ public:
   /// sentinel value used for both docs and positions
   static constexpr int32_t END = std::numeric_limits<int32_t>::max();
 
-  // After this constructor has finished, this DocsEnum instance is independent of the TermsEnum instance.
-  // This instance *does* rely on fieldInfo that was passed into the TermsEnum instance still being valid.
-  DocsEnum(MemPool& pool, PostingsReader& postingsReader, TermsEnum& tenum,
+  DocsEnum(MemPool& pool, const TermsEnum::PostingsState& state,
            int32_t* docsScratch=nullptr, int32_t* posScratch=nullptr, int32_t* tfreqScratch=nullptr)
-  : postingsReader(postingsReader), fieldInfo(tenum.fieldInfo), pool(&pool),
-    termOrdinal(tenum.ord())
+  : docIS(state.docIS), posIS(state.posIS), pool(&pool),
+    hasFreqs(state.hasFreqs), hasPositions(state.hasPositions),
+    docfreq(state.docFreq), ttf(state.totalTermFreq),
+    docsSize(state.docsEnd - state.docsStart), startOfDocs(state.docsStart),
+    endOfDocs(state.docsEnd), posStartLoc(state.posStart),
+    termImpactFrontierPtr(state.termImpactFrontier.ptr),
+    termImpactFrontierLen(state.termImpactFrontier.len), termOrdinal(state.termOrdinal)
   {
     unused(docsScratch, posScratch, tfreqScratch);
     docBuf=db;
     posBuf=pb;
     tfreqBuf=tb;
-    hasFreqs = FieldType::hasFreqs(fieldInfo.flags);
-    hasPositions = FieldType::hasPositions(fieldInfo.flags);
     trackPositions = hasPositions;
     hasNorms = hasPositions;
-    auto termFrontier = tenum.currentTermImpactFrontierSpan();
-    termImpactFrontierPtr = termFrontier.ptr;
-    termImpactFrontierLen = termFrontier.len;
-
-    // Since the same terms enum will often be used for multiple docs enum, we should copy everything we need
-    // from the terms enum that we need (that may change.)
-    // TODO: package those dependencies in a struct that can be simply assigned?  Or if there is enough overlap, simply copy the complete tenum?
-    // Or we could invert the responsibility and make the client copy the tenum if they are going to change it.
-    // Term-level postings bounds and stats are handed over by TermsEnum from
-    // the term-block metadata section.  The docs stream has no per-term trailer:
-    // DocsEnum receives absolute docsStart/docsEnd, df/ttf, posOffset, and any
-    // pulsed doc/pos payload through these accessors before it starts reading
-    // doc blocks or impact headers.
-    docsSize = tenum.docsSize();
+    assert(endOfDocs >= startOfDocs);
     docid = -1;
 
-    // TODO: look into deferring filling the buffer until we need it, then we can avoid allocating the buffers for a shared DocsEnum.
     if (docsSize == 0) {
       // postings pulsed
-      docfreq = tenum.docFreq();
       assert(docfreq == 1);
       tfreq = 1;
-      ttf = tenum.totalTermFreq();
       assert(ttf == 1);
       // fill buffers with the single pulsed doc (+ position, if the field indexes them)
-      docBuf[0] = tenum.pulsedDoc();
+      docBuf[0] = state.pulsedDoc;
       docBufEnd = 1;
       tfreqBuf[0] = 1;
       tfreqBufEnd = 1;
       posBufIdx = 0;
       if (hasPositions) {
-        posBuf[0] = tenum.pulsedPos();
+        posBuf[0] = state.pulsedPos;
         posBufEndDoc = posBufEnd = 1;
       } else {
         posBufEndDoc = posBufEnd = 0;
@@ -720,27 +701,16 @@ public:
 
     } else {
       pos = tfreq = -1;  // unnecessary initializations, but it makes some maybe-uninitialized warnings go away with -O3  // todo: revisit
-      locOfDocsForTermBlock = tenum.locOfDocsForTermBlock;
-      locOfPositionsForTermBlock = tenum.locOfPositionsForTermBlock;
-      docIS = postingsReader.getInputStream(fieldInfo.docsLoc.filenum());
-      startOfDocs = tenum.docsStart();
-      endOfDocs = tenum.docsEnd();
-      assert(endOfDocs >= startOfDocs);
       assert(endOfDocs - startOfDocs == docsSize);
-      docfreq = tenum.docFreq();
-      ttf = tenum.totalTermFreq();
       docBufEnd = 0;
       numDocBlocks = (docfreq + Postings::DOCS_BLOCK_SIZE - 1) / Postings::DOCS_BLOCK_SIZE;
       numDocGroups = (numDocBlocks + L1_PERIOD - 1) / L1_PERIOD;
 
       if (hasPositions) {
-        auto posOffset = tenum.posOffset();
-        posIS = postingsReader.getInputStream(fieldInfo.posLoc.filenum());
-        posStartLoc = locOfPositionsForTermBlock + posOffset;
-        posIS.seek(posStartLoc);
+        assert(posIS.offset() == posStartLoc);
       }
 
-      docIS.seek(startOfDocs);
+      assert(docIS.offset() == startOfDocs);
 
       posBufEndDoc = posBufEnd = 0; // no positions read yet
       cumulativeTermFreq = 0;
@@ -755,17 +725,15 @@ public:
     }
   }
 
-  DocsEnum(const DocsEnum& other) = delete;
-
-  DocsEnum(MemPool& pool, const DocsEnum& other) : postingsReader(other.postingsReader), fieldInfo(other.fieldInfo) {
-    memcpy(this, &other, sizeof(DocsEnum));  // is there a better way to copy everything that can be copied so we don't forget anything?
-    // re-point the internal pointers
-    this->pool = &pool; // new pool (currently unused though since buffers are immediate)
-    docBuf = db;
-    posBuf = pb;
-    tfreqBuf = tb;
-    // If buffers cease to be immediate, we need to copy in the pulsed docs/positions/freqs (first element)
+  // Capture the positioned term once, then initialize through the immutable
+  // state constructor used by the query cache.
+  DocsEnum(MemPool& pool, PostingsReader& postingsReader, TermsEnum& tenum,
+           int32_t* docsScratch=nullptr, int32_t* posScratch=nullptr, int32_t* tfreqScratch=nullptr)
+      : DocsEnum(pool, tenum.postingsState(), docsScratch, posScratch, tfreqScratch) {
+    assert(&postingsReader == &tenum.postingsReader);
   }
+
+  DocsEnum(const DocsEnum& other) = delete;
 
   /// whether this field indexes positions (false for DOCS / DOCS_AND_FREQS fields)
   bool indexHasPositions() const {
