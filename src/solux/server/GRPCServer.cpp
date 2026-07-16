@@ -199,14 +199,21 @@ static bool parseRequest(grpc::ByteBuffer& buf, HppRequestState<Message>& state,
 }
 
 // Serialize a concrete message into an OWNED ByteBuffer (decoupled from any arena).
-// grpc::Slice copies the bytes, so the temporary vector can go away.
+// The encoded bytes are handed to gRPC without a copy: the Slice takes ownership of
+// the heap-allocated vector and frees it when the transport drops its last ref.
 template <typename Message>
 static grpc::ByteBuffer serializeToByteBuffer(const Message& msg) {
-  std::vector<std::byte> v;
-  if (!solux::api::encode(msg, v)) {
+  auto v = std::make_unique<std::vector<std::byte>>();
+  if (!solux::api::encode(msg, *v)) {
     LOG_ERROR("gRPC: failed to serialize response");
   }
-  grpc::Slice slice((const void*)v.data(), v.size());
+  if (v->empty()) {
+    grpc::Slice slice;
+    return grpc::ByteBuffer(&slice, 1);
+  }
+  grpc::Slice slice(v->data(), v->size(),
+                    [](void* p) { delete (std::vector<std::byte>*)p; }, v.get());
+  v.release();
   return grpc::ByteBuffer(&slice, 1);
 }
 
