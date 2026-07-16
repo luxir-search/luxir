@@ -1935,9 +1935,14 @@ public:
     Scorer* notScorer;
     int32_t id = -1;
     int32_t notid = -1;
+    bool notTwoPhase;
   public:
-    MandNotScorer(solux::MemPool& targetPool, Scorer* mandScorer, Scorer* notScorer) : mandScorer(mandScorer),
-                                                                                       notScorer(notScorer) {
+    static inline bool disableNotTwoPhaseForTests = false;
+
+    MandNotScorer(solux::MemPool& targetPool, Scorer* mandScorer, Scorer* notScorer)
+      : mandScorer(mandScorer), notScorer(notScorer),
+        notTwoPhase(!disableTwoPhaseForTests && !disableNotTwoPhaseForTests
+                    && notScorer->hasTwoPhase()) {
       unused(targetPool);
     }
 
@@ -1990,9 +1995,13 @@ public:
     int32_t doNext() {
       while (id != solux::PostingsReader::END) {
         if (notid < id) {
-          notid = notScorer->advance(id);
+          notid = notTwoPhase ? notScorer->approximationAdvance(id)
+                              : notScorer->advance(id);
         }
         if (notid > id) {
+          return id;
+        }
+        if (notTwoPhase && !notScorer->matches()) {
           return id;
         }
         // at this point, notid == id, so we need to try another id by calling next again.
