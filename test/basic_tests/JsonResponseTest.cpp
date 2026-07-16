@@ -13,6 +13,99 @@ namespace solux::test {
 
 class JsonResponseTest : public SoluxTest {};
 
+namespace {
+
+// Reference JSON string escaper: the exact semantics appendJsonString's
+// scalar path implements (two-char escapes, \u00xx lowercase for other
+// control chars, raw UTF-8 passthrough).  The SIMD bulk path must render
+// byte-identically.
+std::string refEscape(std::string_view s) {
+  std::string out = "\"";
+  for (char c : s) {
+    switch (c) {
+      case '"':  out += R"(\")"; break;
+      case '\\': out += R"(\\)"; break;
+      case '\n': out += R"(\n)"; break;
+      case '\r': out += R"(\r)"; break;
+      case '\t': out += R"(\t)"; break;
+      case '\b': out += R"(\b)"; break;
+      case '\f': out += R"(\f)"; break;
+      default:
+        if ((unsigned char)c < 0x20) {
+          char buf[8];
+          std::snprintf(buf, sizeof(buf), R"(\u%04x)", (unsigned)(unsigned char)c);
+          out += buf;
+        } else {
+          out += c;
+        }
+    }
+  }
+  out += '"';
+  return out;
+}
+
+} // namespace
+
+// String escaping renders byte-identically across the short-string scalar
+// path, the SIMD bulk path, and the exotic-control-char restart, at block
+// boundaries and for every byte value.
+TEST_F(JsonResponseTest, stringEscapingSimdPathMatchesScalar) {
+  std::vector<std::string> vals;
+  vals.push_back(std::string(200, 'a'));  // clean, several AVX2 blocks
+  vals.push_back("short\"q");             // < 32 bytes: scalar path
+  {
+    std::string v(100, 'x');  // escapes at and around the 32-byte block edge
+    v[0] = '"'; v[31] = '\\'; v[32] = '\n'; v[33] = '\t'; v[98] = '"';
+    vals.push_back(v);
+  }
+  vals.push_back(std::string(40, 'y') + "\r\b\f" + std::string(40, 'z'));
+  {
+    std::string v(64, 'w');  // exotic control mid-string: bulk aborts, restarts scalar
+    v[40] = '\x01';
+    vals.push_back(v);
+  }
+  {
+    std::string v(47, 'v');  // exotic control in the scalar tail (< one SSE2 block)
+    v[46] = '\x1f';
+    vals.push_back(v);
+  }
+  {
+    std::string v;  // every byte value, including NUL and all control chars
+    for (int b = 0; b < 256; b++) v += (char)b;
+    vals.push_back(v);
+  }
+  vals.push_back("caf\xC3\xA9 \xE2\x98\x95 utf8 passthrough padded past the block size");
+
+  std::vector<std::string_view> views(vals.begin(), vals.end());
+  solux::api::Column col;
+  auto& strCol = col.kind.emplace<solux::api::ColStr>();
+  strCol.v = std::span<const std::string_view>(views);
+  std::pair<std::string_view, solux::api::Column> colPair{"s", col};
+
+  solux::api::DocList dl;
+  dl.columns = solux::api::map_view<std::string_view, solux::api::Column>(
+      std::span<const std::pair<std::string_view, solux::api::Column>>(&colPair, 1));
+  dl.row_count = (int32_t)views.size();
+
+  solux::api::Val val;
+  val.kind = dl;
+  std::pair<std::string_view, ::hpp_proto::indirect_view<solux::api::Val>> opPair{
+      "q", ::hpp_proto::indirect_view<solux::api::Val>{&val}};
+  solux::api::SearchResponse resp;
+  resp.ops = solux::api::map_view<std::string_view, ::hpp_proto::indirect_view<solux::api::Val>>(
+      std::span<const std::pair<std::string_view, ::hpp_proto::indirect_view<solux::api::Val>>>(&opPair, 1));
+
+  std::string expected = R"({"docs":[)";
+  for (size_t i = 0; i < vals.size(); i++) {
+    if (i) expected += ',';
+    expected += R"({"s":)";
+    expected += refEscape(vals[i]);
+    expected += '}';
+  }
+  expected += "]}\n";
+  EXPECT_EQ(expected, renderSearchResponseLine(resp));
+}
+
 TEST_F(JsonResponseTest, stringFacetRowsAndOptionalMetadata) {
   CollectionHelper helper;
   helper.indexAll(std::array{

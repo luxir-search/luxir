@@ -1,15 +1,31 @@
 #include "JsonResponse.h"
 
+#include <algorithm>
 #include <charconv>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <variant>
+#include <vector>
+
+// glaze's SIMD/scalar string-escape scan kernels + its two-char escape table
+// (used by the appendJsonString bulk path below).
+#include <glaze/simd/simd.hpp>
+#include <glaze/simd/avx.hpp>
+#include <glaze/simd/neon.hpp>
+#include <glaze/simd/sse.hpp>
+#include <glaze/util/parse.hpp>
 
 namespace solux {
 
 namespace {
 
-void appendJsonString(std::string& out, std::string_view s) {
+// Scalar escape loop: the reference implementation, the short-string path,
+// and the only path that renders exotic control characters (\u00xx).
+// Force-inlined so the hot short-string case stays as cheap as it was when
+// this WAS appendJsonString (the wrapper indirection measurably cost the
+// id-sized-string benchmark otherwise).
+[[gnu::always_inline]] inline void appendJsonStringScalar(std::string& out, std::string_view s) {
   out += '"';
   for (char c : s) {
     switch (c) {
@@ -34,6 +50,70 @@ void appendJsonString(std::string& out, std::string_view s) {
   out += '"';
 }
 
+void appendJsonString(std::string& out, std::string_view s) {
+  // Short strings stay scalar: below one SIMD block the kernels do nothing
+  // and the resize bookkeeping costs more than it saves.
+  if (s.size() < 32) {
+    appendJsonStringScalar(out, s);
+    return;
+  }
+
+  // Bulk path: glaze's escape-scan kernels (AVX2/SSE2/NEON blocks, flagging
+  // '"', '\\', and <0x20 while memcpy-ing clean runs) with this renderer's
+  // escaping as the write_escape callback.  glz::char_escape_table's
+  // two-char set is exactly ours (\b \t \n \f \r \" \\).  Control chars
+  // OUTSIDE that set need the six-byte \u00xx form, but this path reserves
+  // only two output bytes per input byte - so they flag `exotic` and the
+  // whole string restarts on the scalar path (they essentially never occur
+  // in real text; correctness over speed there).
+  const size_t base = out.size();
+  bool exotic = false;
+  out.resize_and_overwrite(base + 2 + 2 * s.size(), [&](char* p, size_t) -> size_t {
+    const char* c = s.data();
+    const char* const e = c + s.size();
+    char* data = p + base;
+    *data++ = '"';
+    auto writeEscape = [&]() {
+      const uint16_t escaped = glz::char_escape_table[(uint8_t)*c];
+      if (escaped) {
+        std::memcpy(data, &escaped, 2);
+        data += 2;
+      } else {
+        exotic = true;  // \u00xx case; result is discarded and re-rendered
+      }
+      ++c;
+    };
+#if defined(GLZ_USE_AVX2)
+    glz::detail::avx2_string_escape(c, e, data, s.size(), writeEscape);
+#endif
+#if defined(GLZ_USE_SSE2)
+    glz::detail::sse2_string_escape(c, e, data, s.size(), writeEscape);
+#elif defined(GLZ_USE_NEON)
+    glz::detail::neon_string_escape(c, e, data, s.size(), writeEscape);
+#endif
+    for (; c < e; ++c) {  // tail: less than one SIMD block remains
+      const uint16_t escaped = glz::char_escape_table[(uint8_t)*c];
+      if (escaped) {
+        std::memcpy(data, &escaped, 2);
+        data += 2;
+      } else if ((uint8_t)*c < 0x20) {
+        exotic = true;
+      } else {
+        *data++ = *c;
+      }
+    }
+    *data++ = '"';
+    return (size_t)(data - p);
+  });
+  if (exotic) [[unlikely]] {
+    out.resize(base);
+    appendJsonStringScalar(out, s);
+  }
+}
+
+// to_chars into a stack buffer, not std::format_to(back_inserter): identical
+// bytes, but format's per-call machinery measured ~2x slower for whole-doc
+// rendering (see BM_JsonRender).
 void appendInt(std::string& out, int64_t v) {
   char buf[24];
   auto [p, ec] = std::to_chars(buf, buf + sizeof(buf), v);
@@ -61,54 +141,89 @@ void appendArray(std::string& out, const Repeated& v, Emit&& emit) {
   out += ']';
 }
 
-// Emit doc i's value for this column, or null if the slot is missing.
-void appendCell(std::string& out, const solux::api::Column& col, size_t i) {
-  if (auto* c = std::get_if<solux::api::ColStr>(&col.kind)) {
-    if (i < c->v.size() && c->v[i] != c->missing_val) appendJsonString(out, c->v[i]);
-    else out += "null";
-  } else if (auto* c = std::get_if<solux::api::ColInt>(&col.kind)) {
-    if (i < c->v.size() && c->v[i] != c->missing_val) appendInt(out, c->v[i]);
-    else out += "null";
-  } else if (auto* c = std::get_if<solux::api::ColFloat>(&col.kind)) {
-    if (i < c->v.size() && c->v[i] != c->missing_val) appendFloating(out, c->v[i]);
-    else out += "null";
-  } else if (auto* c = std::get_if<solux::api::ColDouble>(&col.kind)) {
-    if (i < c->v.size() && c->v[i] != c->missing_val) appendFloating(out, c->v[i]);
-    else out += "null";
-  } else if (auto* c = std::get_if<solux::api::ArrArrStr>(&col.kind)) {
-    // Multi-valued columns signal "missing" structurally as an empty list; render
-    // that (and an out-of-range slot) as null, matching the scalar missing_val
-    // contract.  A present but genuinely empty list is indistinguishable from
-    // missing for these columns, so both map to null.
-    if (i < c->v.size() && !c->v[i].v.empty())
-      appendArray(out, c->v[i].v, [&](const auto& s){ appendJsonString(out, s); });
-    else out += "null";
-  } else if (auto* c = std::get_if<solux::api::ArrArrInt>(&col.kind)) {
-    if (i < c->v.size() && !c->v[i].v.empty())
-      appendArray(out, c->v[i].v, [&](int64_t x){ appendInt(out, x); });
-    else out += "null";
-  } else if (auto* c = std::get_if<solux::api::ArrArrFloat>(&col.kind)) {
-    if (i < c->v.size() && !c->v[i].v.empty())
-      appendArray(out, c->v[i].v, [&](float x){ appendFloating(out, x); });
-    else out += "null";
-  } else if (auto* c = std::get_if<solux::api::ArrArrDouble>(&col.kind)) {
-    if (i < c->v.size() && !c->v[i].v.empty())
-      appendArray(out, c->v[i].v, [&](double x){ appendFloating(out, x); });
-    else out += "null";
-  } else if (auto* c = std::get_if<solux::api::ColVector>(&col.kind)) {
-    if (i < c->v.size() && c->v[i].f32.has_value())
-      appendArray(out, c->v[i].f32->v, [&](float x){ appendFloating(out, x); });
-    else out += "null";
-  } else if (auto* c = std::get_if<solux::api::MultiVector>(&col.kind)) {
-    if (i < c->v.size() && !c->v[i].v.empty()) {
-      appendArray(out, c->v[i].v, [&](const solux::api::Vector& vec){
-        if (vec.f32.has_value()) appendArray(out, vec.f32->v, [&](float x){ appendFloating(out, x); });
-        else out += "null";
-      });
-    } else out += "null";
-  } else {
-    out += "null";
-  }
+// Per-cell renderers, one per column kind.  Missing renders as null: scalar
+// columns by the exact missing_val sentinel, multi-valued columns by empty
+// array (a present-but-empty list is indistinguishable from missing and also
+// maps to null), vectors by the unset f32 oneof.  Out-of-range slots render
+// null.  resolveCellFn dispatches a column's variant ONCE; the row walk then
+// calls the resolved function per cell.
+using CellFn = void (*)(std::string&, const solux::api::Column&, size_t);
+
+namespace cell {
+void str(std::string& out, const solux::api::Column& col, size_t i) {
+  auto& c = std::get<solux::api::ColStr>(col.kind);
+  if (i < c.v.size() && c.v[i] != c.missing_val) appendJsonString(out, c.v[i]);
+  else out += "null";
+}
+void int64(std::string& out, const solux::api::Column& col, size_t i) {
+  auto& c = std::get<solux::api::ColInt>(col.kind);
+  if (i < c.v.size() && c.v[i] != c.missing_val) appendInt(out, c.v[i]);
+  else out += "null";
+}
+void flt(std::string& out, const solux::api::Column& col, size_t i) {
+  auto& c = std::get<solux::api::ColFloat>(col.kind);
+  if (i < c.v.size() && c.v[i] != c.missing_val) appendFloating(out, c.v[i]);
+  else out += "null";
+}
+void dbl(std::string& out, const solux::api::Column& col, size_t i) {
+  auto& c = std::get<solux::api::ColDouble>(col.kind);
+  if (i < c.v.size() && c.v[i] != c.missing_val) appendFloating(out, c.v[i]);
+  else out += "null";
+}
+void arrStr(std::string& out, const solux::api::Column& col, size_t i) {
+  auto& c = std::get<solux::api::ArrArrStr>(col.kind);
+  if (i < c.v.size() && !c.v[i].v.empty())
+    appendArray(out, c.v[i].v, [&out](const auto& s){ appendJsonString(out, s); });
+  else out += "null";
+}
+void arrInt(std::string& out, const solux::api::Column& col, size_t i) {
+  auto& c = std::get<solux::api::ArrArrInt>(col.kind);
+  if (i < c.v.size() && !c.v[i].v.empty())
+    appendArray(out, c.v[i].v, [&out](int64_t x){ appendInt(out, x); });
+  else out += "null";
+}
+void arrFlt(std::string& out, const solux::api::Column& col, size_t i) {
+  auto& c = std::get<solux::api::ArrArrFloat>(col.kind);
+  if (i < c.v.size() && !c.v[i].v.empty())
+    appendArray(out, c.v[i].v, [&out](float x){ appendFloating(out, x); });
+  else out += "null";
+}
+void arrDbl(std::string& out, const solux::api::Column& col, size_t i) {
+  auto& c = std::get<solux::api::ArrArrDouble>(col.kind);
+  if (i < c.v.size() && !c.v[i].v.empty())
+    appendArray(out, c.v[i].v, [&out](double x){ appendFloating(out, x); });
+  else out += "null";
+}
+void vec(std::string& out, const solux::api::Column& col, size_t i) {
+  auto& c = std::get<solux::api::ColVector>(col.kind);
+  if (i < c.v.size() && c.v[i].f32.has_value())
+    appendArray(out, c.v[i].f32->v, [&out](float x){ appendFloating(out, x); });
+  else out += "null";
+}
+void multiVec(std::string& out, const solux::api::Column& col, size_t i) {
+  auto& c = std::get<solux::api::MultiVector>(col.kind);
+  if (i < c.v.size() && !c.v[i].v.empty()) {
+    appendArray(out, c.v[i].v, [&out](const solux::api::Vector& v){
+      if (v.f32.has_value()) appendArray(out, v.f32->v, [&out](float x){ appendFloating(out, x); });
+      else out += "null";
+    });
+  } else out += "null";
+}
+void nul(std::string& out, const solux::api::Column&, size_t) { out += "null"; }
+} // namespace cell
+
+CellFn resolveCellFn(const solux::api::Column& col) {
+  if (std::holds_alternative<solux::api::ColStr>(col.kind)) return cell::str;
+  if (std::holds_alternative<solux::api::ColInt>(col.kind)) return cell::int64;
+  if (std::holds_alternative<solux::api::ColFloat>(col.kind)) return cell::flt;
+  if (std::holds_alternative<solux::api::ColDouble>(col.kind)) return cell::dbl;
+  if (std::holds_alternative<solux::api::ArrArrStr>(col.kind)) return cell::arrStr;
+  if (std::holds_alternative<solux::api::ArrArrInt>(col.kind)) return cell::arrInt;
+  if (std::holds_alternative<solux::api::ArrArrFloat>(col.kind)) return cell::arrFlt;
+  if (std::holds_alternative<solux::api::ArrArrDouble>(col.kind)) return cell::arrDbl;
+  if (std::holds_alternative<solux::api::ColVector>(col.kind)) return cell::vec;
+  if (std::holds_alternative<solux::api::MultiVector>(col.kind)) return cell::multiVec;
+  return cell::nul;
 }
 
 // Facet bucket IDs are always present. Unlike document columns, their Column
@@ -135,20 +250,44 @@ void appendOpVal(std::string& out, const solux::api::Val& val);
 // contract); pure-rows and pure-columns are the degenerate cases.  Column
 // slots keep the sentinel rendering (missing -> null); row maps signal
 // missing structurally (key absent), so they are emitted as-is.
+//
+// Each column is resolved ONCE into a plan entry (pre-escaped ","key":"
+// prefix + per-kind cell function); the row walk then just executes the
+// plan, instead of re-dispatching the column variant and re-escaping the
+// field name for every cell.  Row maps (docs[i]) are heterogeneous by
+// nature and stay per-value.
 void appendDocs(std::string& out, const solux::api::DocList& docs) {
   size_t numDocs = (size_t)docs.row_count;
   out += '[';
+  if (numDocs == 0) {
+    out += ']';
+    return;
+  }
+
+  struct ColPlan {
+    std::string key;  // ","name":" (first column omits the comma)
+    CellFn fn;
+    const solux::api::Column* col;
+  };
+  std::vector<ColPlan> plan;
+  plan.reserve(docs.columns.size());
+  for (const auto& [name, col] : docs.columns) {
+    auto& p = plan.emplace_back();
+    if (plan.size() > 1) p.key += ',';
+    appendJsonString(p.key, name);
+    p.key += ':';
+    p.fn = resolveCellFn(col);
+    p.col = &col;
+  }
+
   for (size_t i = 0; i < numDocs; i++) {
     if (i) out += ',';
     out += '{';
-    bool first = true;
-    for (const auto& [name, col] : docs.columns) {
-      if (!first) out += ',';
-      first = false;
-      appendJsonString(out, name);
-      out += ':';
-      appendCell(out, col, i);
+    for (const auto& p : plan) {
+      out += p.key;
+      p.fn(out, *p.col, i);
     }
+    bool first = plan.empty();
     if (i < docs.docs.size()) {
       for (const auto& [name, val] : docs.docs[i].fields) {
         if (!first) out += ',';
