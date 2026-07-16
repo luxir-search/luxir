@@ -613,6 +613,12 @@ public:
       assert(false);
       std::unreachable();
     }
+    /// Flat SHOULD clauses that this scorer merges as a disjunction. Consumers
+    /// may decompose the scorer only when they understand every returned child;
+    /// an empty span keeps the scorer opaque.
+    virtual std::span<Scorer*> flatDisjunctionScorers() {
+      return {};
+    }
     virtual float matchCost() {
       return 0.0f;
     }

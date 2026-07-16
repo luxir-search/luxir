@@ -198,10 +198,10 @@ private:
     normalizeRequiredList(plan, plan.filter, /*parentIsFilter=*/true, pool);
     flattenDisjunctions(plan, pool);
 
-    // With no outer optional group, one required pure disjunction can become
-    // that group even beside other required clauses. This covers parser forms
-    // such as "a AND (b OR c)" while preserving independent nested groups.
-    if (plan.optional.empty()) {
+    // A sole required disjunction can become the positive side beside filters
+    // or exclusions. Multiple required clauses retain their boundaries so the
+    // conjunction planner can consume each clause's decomposable structure.
+    if (plan.optional.empty() && plan.mandatory.size() == 1) {
       for (size_t i = 0; i < plan.mandatory.size(); i++) {
         TransparentBoolean child = transparentBoolean(
           plan.mandatory[i], /*allowConstantScore=*/false);
@@ -410,6 +410,42 @@ public:
     int minShouldMatch = 0;
     bool needsScores = false;
 
+    static bool allTermScorers(std::span<Query::Scorer*> scorers) {
+      for (auto* scorer : scorers) {
+        if (dynamic_cast<TermQuery::Scorer*>(scorer) == nullptr) return false;
+      }
+      return true;
+    }
+
+    static bool lessMaxScore(float a, float b) {
+      bool finiteA = std::isfinite(a);
+      bool finiteB = std::isfinite(b);
+      if (finiteA != finiteB) return finiteA;
+      return a < b;
+    }
+
+    // Match MaxScoreDisjunctionScorer's stable score order when an externally
+    // driven flat term union uses the plain heap scorer instead.
+    static void sortByMaxScore(MemPool& targetPool,
+                               std::span<Query::Scorer*> scorers) {
+      auto bounds = targetPool.make_span<float>(scorers.size());
+      for (size_t i = 0; i < scorers.size(); i++) {
+        bounds[i] = scorers[i]->getMaxScoreForSetup(PostingsReader::END);
+      }
+      for (size_t i = 1; i < scorers.size(); i++) {
+        Query::Scorer* scorer = scorers[i];
+        float bound = bounds[i];
+        size_t j = i;
+        while (j > 0 && lessMaxScore(bound, bounds[j - 1])) {
+          scorers[j] = scorers[j - 1];
+          bounds[j] = bounds[j - 1];
+          j--;
+        }
+        scorers[j] = scorer;
+        bounds[j] = bound;
+      }
+    }
+
     // Returns a span of Weights, corresponding to the given span of Queries. Some weights can be null.
     std::span<Query::Weight*> createWeights(solux::MemPool& targetPool, Context& context,
                                             std::span<Query*> queries, int32_t flags,
@@ -506,7 +542,8 @@ public:
         std::span<Query::SegmentSource* const> prohibitedSources,
         std::span<Query::ScorerSupplier* const> filterSuppliers,
         int minShouldMatch,
-        bool needsScores) {
+        bool needsScores,
+        bool externallyDriven) {
       Required req = assembleRequired(targetPool, segment, mandatorySources, filterSuppliers);
       if (req.unsatisfiable) return nullptr;
       Query::Scorer* reqScorer = req.scorer;
@@ -534,8 +571,16 @@ public:
       Query::Scorer* optScorer = nullptr;
       if (!optionalScorers.empty()) {
         int optCount = (int)optionalScorers.size();
+        bool plainExternalTermDisjunction = externallyDriven && needsScores
+          && reqScorer == nullptr && prohibitedSources.empty()
+          && minShouldMatch <= 1 && optCount >= 2
+          && allTermScorers(optionalScorers);
+        if (plainExternalTermDisjunction) {
+          sortByMaxScore(targetPool, optionalScorers);
+        }
         bool useMaxScoreDisjunction = needsScores && reqScorer == nullptr
-          && prohibitedSources.empty() && minShouldMatch <= 1 && optCount >= 2;
+          && prohibitedSources.empty() && minShouldMatch <= 1 && optCount >= 2
+          && !plainExternalTermDisjunction;
         // minShouldMatch applies to optional scorers that exist in this segment.
         if (minShouldMatch <= 1) {
           if (optCount == 1) {
@@ -702,9 +747,9 @@ public:
       }
 
       Query::Scorer* get(MemPool& targetPool, int64_t leadCost) override {
-        unused(leadCost);
         return assembleScorer(targetPool, segment, mandatorySources, optionalSources,
-                              prohibitedSources, filterSuppliers, minShouldMatch, needsScores);
+                              prohibitedSources, filterSuppliers, minShouldMatch, needsScores,
+                              leadCost != std::numeric_limits<int64_t>::max());
       }
 
       // Bulk path for pure scored conjunctions (>= 2 mandatory clauses, nothing
@@ -2367,6 +2412,7 @@ public:
     // docs-only leapfrog until the lead gets quite sparse (measured minimum
     // on the 5M benchmark corpus; 32 and 16384 are both ~20% slower).
     static constexpr int32_t kDenseThresholdInverse = 512;
+    static inline bool disableDisjGroupBulkForTests = false;
 
   private:
     static constexpr int32_t kChunk = Postings::DOCS_BLOCK_SIZE;
@@ -2375,8 +2421,21 @@ public:
     static constexpr int32_t kDenseLeapfrogThreshold = kWindowSize / 32;
     static_assert((kWindowSize % 64) == 0);
 
+    struct TermClause {
+      std::span<Query::Scorer*> members;
+    };
+
+    struct BufferedTerm {
+      TermQuery::Scorer* scorer = nullptr;
+      std::span<int32_t> docs;
+      std::span<float> scores;
+      int32_t index = 0;
+      int32_t size = 0;
+    };
+
     std::span<Query::Scorer*> scorers;  // ascending cost; scorers[0] leads
     std::span<TermQuery::Scorer*> termScorers; // populated when every scorer is a term
+    std::span<TermClause> termClauses;  // direct terms or decomposed flat unions
     std::span<float> windowMax;         // per-clause bound over the current window
     std::span<double> suffixMax;        // suffixMax[c] = sum of windowMax[c..n)
     std::span<int32_t> candDocs;
@@ -2385,12 +2444,199 @@ public:
     std::span<float> outScores;
     std::span<uint64_t> windowBits;
     std::span<uint64_t> clauseBits;
+    std::span<uint64_t> groupMatchBits;
+    std::span<float> groupScores;
+    std::span<BufferedTerm> leadGroupTerms;
     int32_t maxDoc;
     float minCompetitiveScore = std::numeric_limits<float>::lowest();
     double scoreBoundFactor = 1.0;
     int64_t skippedWindowCount = 0;
     bool allTermScorers = false;
+    bool allTermClauses = false;
+    bool hasDisjGroup = false;
     bool denseCountPath = false;
+
+    TermQuery::Scorer* termClauseMember(size_t clause, size_t member) {
+      return static_cast<TermQuery::Scorer*>(
+          termClauses[clause].members[member]);
+    }
+
+    int32_t termClauseDocId(size_t clause) {
+      int32_t doc = PostingsReader::END;
+      for (size_t member = 0; member < termClauses[clause].members.size(); member++) {
+        doc = std::min(doc, termClauseMember(clause, member)->docsEnum.docId());
+      }
+      return doc;
+    }
+
+    int32_t termClauseCountAdvance(size_t clause, int32_t target) {
+      int32_t doc = PostingsReader::END;
+      for (size_t member = 0; member < termClauses[clause].members.size(); member++) {
+        auto* scorer = termClauseMember(clause, member);
+        int32_t memberDoc = scorer->docsEnum.docId();
+        if (memberDoc < target) {
+          memberDoc = scorer->docsEnum.advanceDocOnly(target);
+        }
+        doc = std::min(doc, memberDoc);
+      }
+      return doc;
+    }
+
+    void fillTermClauseWindowBits(size_t clause, std::span<uint64_t> bits,
+                                  int32_t windowBase, int32_t windowEnd) {
+      for (size_t member = 0; member < termClauses[clause].members.size(); member++) {
+        termClauseMember(clause, member)->fillWindowBits(bits, windowBase, windowEnd);
+      }
+    }
+
+    int32_t termClauseAdvanceShallow(size_t clause, int32_t target) {
+      int32_t upTo = PostingsReader::END;
+      for (size_t member = 0; member < termClauses[clause].members.size(); member++) {
+        upTo = std::min(upTo,
+            termClauseMember(clause, member)->advanceShallow(target));
+      }
+      return upTo;
+    }
+
+    float termClauseGetMaxScore(size_t clause, int32_t upTo) {
+      float sum = 0.0f;
+      for (size_t member = 0; member < termClauses[clause].members.size(); member++) {
+        float bound = termClauseMember(clause, member)->getMaxScore(upTo);
+        if (!std::isfinite(bound)) return std::numeric_limits<float>::infinity();
+        sum += bound;
+      }
+      return sum;
+    }
+
+    int32_t leadTermGroupDocId() {
+      int32_t doc = PostingsReader::END;
+      for (auto& term : leadGroupTerms) {
+        int32_t termDoc = term.index < term.size
+          ? term.docs[(size_t) term.index]
+          : term.scorer->docsEnum.docId();
+        doc = std::min(doc, termDoc);
+      }
+      return doc;
+    }
+
+    int32_t advanceLeadTermGroup(int32_t target) {
+      int32_t doc = PostingsReader::END;
+      for (auto& term : leadGroupTerms) {
+        while (term.index < term.size && term.docs[(size_t) term.index] < target) {
+          term.index++;
+        }
+        int32_t termDoc;
+        if (term.index < term.size) {
+          termDoc = term.docs[(size_t) term.index];
+        } else {
+          term.index = 0;
+          term.size = 0;
+          termDoc = term.scorer->docsEnum.docId();
+          if (termDoc < target) {
+            termDoc = term.scorer->advance(target);
+          }
+        }
+        doc = std::min(doc, termDoc);
+      }
+      return doc;
+    }
+
+    int32_t refillLeadGroupTerm(BufferedTerm& term, int32_t upTo) {
+      if (term.index < term.size) return term.docs[(size_t) term.index];
+      term.index = 0;
+      term.size = term.scorer->fillScoreBlock(
+          term.docs.data(), term.scores.data(), kChunk, upTo);
+      return term.size == 0 ? PostingsReader::END : term.docs[0];
+    }
+
+    int32_t fillLeadTermGroupScoreBlock(int32_t* docs, float* scores,
+                                        int32_t count, int32_t upTo) {
+      int32_t filled = 0;
+      while (filled < count) {
+        int32_t doc = PostingsReader::END;
+        for (auto& term : leadGroupTerms) {
+          doc = std::min(doc, refillLeadGroupTerm(term, upTo));
+        }
+        if (doc >= upTo) break;
+
+        float score = 0.0f;
+        for (auto& term : leadGroupTerms) {
+          if (term.index < term.size
+              && term.docs[(size_t) term.index] == doc) {
+            score += term.scores[(size_t) term.index];
+            term.index++;
+          }
+        }
+        docs[filled] = doc;
+        scores[filled] = score;
+        filled++;
+      }
+      return filled;
+    }
+
+    int32_t fillTermClauseLeadScoreBlock(int32_t* docs, float* scores,
+                                         int32_t count, int32_t upTo) {
+      if (leadGroupTerms.empty()) {
+        return termClauseMember(0, 0)->fillScoreBlock(
+            docs, scores, count, upTo);
+      }
+      return fillLeadTermGroupScoreBlock(docs, scores, count, upTo);
+    }
+
+    int32_t termClauseScoreDocId(size_t clause) {
+      return clause == 0 && !leadGroupTerms.empty()
+        ? leadTermGroupDocId()
+        : termClauseDocId(clause);
+    }
+
+    int32_t termClauseScoreAdvance(size_t clause, int32_t target) {
+      if (clause == 0 && !leadGroupTerms.empty()) {
+        return advanceLeadTermGroup(target);
+      }
+      int32_t doc = PostingsReader::END;
+      for (size_t member = 0; member < termClauses[clause].members.size(); member++) {
+        auto* scorer = termClauseMember(clause, member);
+        int32_t memberDoc = scorer->docId();
+        if (memberDoc < target) memberDoc = scorer->advance(target);
+        doc = std::min(doc, memberDoc);
+      }
+      return doc;
+    }
+
+    int32_t compactByRemainingBound(int32_t size, double remaining) {
+      int32_t write = 0;
+      for (int32_t i = 0; i < size; i++) {
+        if (((double) candScores[(size_t) i] + remaining) * scoreBoundFactor
+            < (double) minCompetitiveScore) {
+          continue;
+        }
+        if (write != i) {
+          candDocs[(size_t) write] = candDocs[(size_t) i];
+          candScores[(size_t) write] = candScores[(size_t) i];
+        }
+        write++;
+      }
+      return write;
+    }
+
+    int32_t applyTermGroupToCandidates(size_t clause, int32_t size) {
+      size_t words = ((size_t) size + 63) >> 6;
+      std::fill(groupMatchBits.begin(), groupMatchBits.begin() + (ptrdiff_t) words, 0);
+      std::fill(groupScores.begin(), groupScores.begin() + size, 0.0f);
+      auto matches = groupMatchBits.first(words);
+      for (size_t member = 0; member < termClauses[clause].members.size(); member++) {
+        termClauseMember(clause, member)->addToCandidates(
+            candDocs.data(), groupScores.data(), size, matches);
+      }
+      int32_t write = 0;
+      for (int32_t i = 0; i < size; i++) {
+        if ((matches[(size_t) (i >> 6)] & (1ULL << (i & 63))) == 0) continue;
+        candDocs[(size_t) write] = candDocs[(size_t) i];
+        candScores[(size_t) write] = candScores[(size_t) i] + groupScores[(size_t) i];
+        write++;
+      }
+      return write;
+    }
 
     template <bool TermFast>
     int32_t scorerDocId(size_t index) {
@@ -2583,6 +2829,119 @@ public:
       }
     }
 
+    int32_t scoreNextWindowTermClauses(ScoreWindow& out, DocSet* filter,
+                                       int32_t min, int32_t max,
+                                       float minCompetitiveScore) {
+      out.min = min;
+      out.max = min;
+      out.size = 0;
+      out.docs = outDocs;
+      out.scores = outScores;
+
+      max = std::min(max, maxDoc);
+      if (min >= max) return PostingsReader::END;
+      if (minCompetitiveScore > this->minCompetitiveScore) {
+        this->minCompetitiveScore = minCompetitiveScore;
+      }
+
+      int32_t leadDoc = termClauseScoreDocId(0);
+      if (leadDoc < min) leadDoc = termClauseScoreAdvance(0, min);
+
+      for (;;) {
+        if (leadDoc == PostingsReader::END) {
+          out.max = max;
+          return PostingsReader::END;
+        }
+        if (leadDoc >= max) {
+          out.max = max;
+          return leadDoc;
+        }
+
+        int32_t upTo = max - 1;
+        for (size_t c = 0; c < termClauses.size(); c++) {
+          upTo = std::min(upTo, termClauseAdvanceShallow(c, leadDoc));
+        }
+        if (upTo < leadDoc) upTo = leadDoc;
+        suffixMax[termClauses.size()] = 0.0;
+        for (size_t c = termClauses.size(); c-- > 0; ) {
+          windowMax[c] = termClauseGetMaxScore(c, upTo);
+          suffixMax[c] = suffixMax[c + 1] + (double) windowMax[c];
+        }
+        if (suffixMax[0] * scoreBoundFactor
+            < (double) this->minCompetitiveScore) {
+          skippedWindowCount++;
+          if (upTo >= max - 1) {
+            out.max = max;
+            return upTo + 1;
+          }
+          leadDoc = termClauseScoreAdvance(0, upTo + 1);
+          continue;
+        }
+
+        skipCount(SkipStats::conjDisjGroupScoreWindows);
+        out.max = upTo + 1;
+        int32_t lastDecided = -1;
+        for (;;) {
+          if (out.size + kChunk > (int32_t) outDocs.size()) {
+            assert(lastDecided >= 0);
+            return lastDecided + 1;
+          }
+          int32_t n = fillTermClauseLeadScoreBlock(
+              candDocs.data(), candScores.data(), kChunk, upTo + 1);
+          if (n == 0) break;
+          lastDecided = candDocs[(size_t) n - 1];
+
+          if (filter != nullptr) {
+            int32_t write = 0;
+            for (int32_t i = 0; i < n; i++) {
+              if (!filter->get(candDocs[(size_t) i])) continue;
+              if (write != i) {
+                candDocs[(size_t) write] = candDocs[(size_t) i];
+                candScores[(size_t) write] = candScores[(size_t) i];
+              }
+              write++;
+            }
+            n = write;
+          }
+
+          for (size_t c = 1; c < termClauses.size() && n > 0; c++) {
+            double remaining = suffixMax[c];
+            if (termClauses[c].members.size() > 1) {
+              n = compactByRemainingBound(n, remaining);
+              if (n > 0) n = applyTermGroupToCandidates(c, n);
+              continue;
+            }
+
+            auto* scorer = termClauseMember(c, 0);
+            int32_t scorerDoc = scorer->docId();
+            int32_t write = 0;
+            for (int32_t i = 0; i < n; i++) {
+              int32_t doc = candDocs[(size_t) i];
+              float sum = candScores[(size_t) i];
+              if (((double) sum + remaining) * scoreBoundFactor
+                  < (double) this->minCompetitiveScore) {
+                continue;
+              }
+              if (scorerDoc < doc) scorerDoc = scorer->advance(doc);
+              if (scorerDoc != doc) continue;
+              candDocs[(size_t) write] = doc;
+              candScores[(size_t) write] = sum + scorer->score();
+              write++;
+            }
+            n = write;
+          }
+
+          for (int32_t i = 0; i < n; i++) {
+            if (candScores[(size_t) i] < this->minCompetitiveScore) continue;
+            outDocs[(size_t) out.size] = candDocs[(size_t) i];
+            outScores[(size_t) out.size] = candScores[(size_t) i];
+            out.size++;
+          }
+        }
+        return upTo + 1;
+      }
+    }
+
     void clearWindowBits(std::span<uint64_t> bits) {
       std::fill(bits.begin(), bits.end(), 0);
     }
@@ -2638,10 +2997,10 @@ public:
     }
 
     int32_t ratchetDenseWindow(int32_t min, int32_t max) {
-      for (size_t c = 0; c < termScorers.size(); c++) {
-        int32_t doc = termScorers[c]->docsEnum.docId();
+      for (size_t c = 0; c < termClauses.size(); c++) {
+        int32_t doc = termClauseDocId(c);
         if (doc < min) {
-          doc = termScorers[c]->docsEnum.advanceDocOnly(min);
+          doc = termClauseCountAdvance(c, min);
         }
         if (doc > min) {
           min = doc;
@@ -2668,10 +3027,10 @@ public:
           }
           int32_t doc = windowBase + index;
           bool matched = true;
-          for (size_t c = firstClause; c < termScorers.size(); c++) {
-            int32_t scorerDoc = termScorers[c]->docsEnum.docId();
+          for (size_t c = firstClause; c < termClauses.size(); c++) {
+            int32_t scorerDoc = termClauseDocId(c);
             if (scorerDoc < doc) {
-              scorerDoc = termScorers[c]->docsEnum.advanceDocOnly(doc);
+              scorerDoc = termClauseCountAdvance(c, doc);
             }
             if (scorerDoc != doc) {
               matched = false;
@@ -2700,15 +3059,18 @@ public:
       int32_t windowEnd = std::min(requestedEnd, max);
 
       skipCount(SkipStats::conjDenseCountWindows);
+      if (hasDisjGroup) {
+        skipCount(SkipStats::conjDisjGroupCountWindows);
+      }
       clearWindowBits(windowBits);
-      termScorers[0]->fillWindowBits(windowBits, windowBase, windowEnd);
-      for (size_t c = 1; c < termScorers.size(); c++) {
+      fillTermClauseWindowBits(0, windowBits, windowBase, windowEnd);
+      for (size_t c = 1; c < termClauses.size(); c++) {
         clearWindowBits(clauseBits);
-        termScorers[c]->fillWindowBits(clauseBits, windowBase, windowEnd);
+        fillTermClauseWindowBits(c, clauseBits, windowBase, windowEnd);
         for (int32_t w = 0; w < kWindowWords; w++) {
           windowBits[(size_t) w] &= clauseBits[(size_t) w];
         }
-        if (termScorers.size() >= 3 && c + 1 < termScorers.size()) {
+        if (termClauses.size() >= 3 && c + 1 < termClauses.size()) {
           int32_t card = 0;
           for (uint64_t bits : windowBits) {
             card += (int32_t) std::popcount(bits);
@@ -2782,6 +3144,7 @@ public:
                           int32_t maxDoc, int64_t leadCost)
         : scorers(scorers),
           termScorers(pool.make_arr<TermQuery::Scorer*>(scorers.size()), scorers.size()),
+          termClauses(pool.make_arr<TermClause>(scorers.size()), scorers.size()),
           windowMax(pool.make_arr<float>(scorers.size()), scorers.size()),
           suffixMax(pool.make_arr<double>(scorers.size() + 1), scorers.size() + 1),
           candDocs(pool.make_arr<int32_t>((size_t) kChunk), (size_t) kChunk),
@@ -2790,22 +3153,64 @@ public:
           outScores(pool.make_arr<float>((size_t) kWindowSize), (size_t) kWindowSize),
           windowBits(pool.make_arr<uint64_t>((size_t) kWindowWords), (size_t) kWindowWords),
           clauseBits(pool.make_arr<uint64_t>((size_t) kWindowWords), (size_t) kWindowWords),
+          groupMatchBits(
+              pool.make_arr<uint64_t>(((size_t) kChunk + 63) >> 6),
+              ((size_t) kChunk + 63) >> 6),
+          groupScores(pool.make_arr<float>((size_t) kChunk), (size_t) kChunk),
           maxDoc(maxDoc) {
       assert(scorers.size() >= 2);
-      // Float-summation error headroom for the double bounds (see the MaxScore
-      // scorers' scoreBoundFactor).
-      scoreBoundFactor = 1.0 + (double) scorers.size() * 0x1p-24;
       allTermScorers = true;
+      allTermClauses = true;
+      size_t scoreAddends = 0;
       for (size_t i = 0; i < scorers.size(); i++) {
         termScorers[i] = dynamic_cast<TermQuery::Scorer*>(scorers[i]);
         allTermScorers &= termScorers[i] != nullptr;
+        if (termScorers[i] != nullptr) {
+          termClauses[i].members = scorers.subspan(i, 1);
+          scoreAddends++;
+          continue;
+        }
+        std::span<Query::Scorer*> members;
+        if (!disableDisjGroupBulkForTests) {
+          members = scorers[i]->flatDisjunctionScorers();
+        }
+        for (auto* member : members) {
+          if (dynamic_cast<TermQuery::Scorer*>(member) == nullptr) {
+            members = {};
+            break;
+          }
+        }
+        termClauses[i].members = members;
+        allTermClauses &= !members.empty();
+        hasDisjGroup |= !members.empty();
+        scoreAddends += members.empty() ? 1 : members.size();
       }
-      denseCountPath = allTermScorers && maxDoc >= kWindowSize
+      // Bounds cover the same number of float additions as final scoring,
+      // including every member contribution inside decomposed unions.
+      scoreBoundFactor = 1.0 + (double) scoreAddends * 0x1p-24;
+      if (allTermClauses && termClauses[0].members.size() > 1) {
+        size_t memberCount = termClauses[0].members.size();
+        leadGroupTerms = pool.make_span<BufferedTerm>(memberCount);
+        auto docs = pool.make_span<int32_t>(memberCount * (size_t) kChunk);
+        auto scores = pool.make_span<float>(memberCount * (size_t) kChunk);
+        for (size_t member = 0; member < memberCount; member++) {
+          leadGroupTerms[member].scorer = termClauseMember(0, member);
+          leadGroupTerms[member].docs = docs.subspan(member * (size_t) kChunk,
+                                                     (size_t) kChunk);
+          leadGroupTerms[member].scores = scores.subspan(member * (size_t) kChunk,
+                                                         (size_t) kChunk);
+        }
+      }
+      denseCountPath = allTermClauses && maxDoc >= kWindowSize
           && leadCost >= std::max<int64_t>(1, (int64_t) maxDoc / kDenseThresholdInverse);
     }
 
     int32_t scoreNextWindow(ScoreWindow& out, DocSet* filter, int32_t min, int32_t max,
                             float minCompetitiveScore) override {
+      if (allTermClauses && hasDisjGroup) {
+        return scoreNextWindowTermClauses(
+            out, filter, min, max, minCompetitiveScore);
+      }
       return allTermScorers
           ? scoreNextWindowImpl<true>(out, filter, min, max, minCompetitiveScore)
           : scoreNextWindowImpl<false>(out, filter, min, max, minCompetitiveScore);
@@ -2838,6 +3243,7 @@ public:
 
 
   class DisjunctionScorer final : public Query::Scorer {
+    std::span<Scorer*> clauses;  // stable decomposition and score order
     std::span<Scorer*> scorers;
 
     // TODO: OPT: heapifying with virtual methods prob isn't a good idea... pull out and save the docid.
@@ -2846,10 +3252,18 @@ public:
     solux::IndirectPQ<Scorer, decltype(idComparator)> pq;
 
     int32_t docid = -1;
+
+    static std::span<Scorer*> copyScorers(solux::MemPool& pool,
+                                          std::span<Scorer*> scorers) {
+      auto copy = pool.make_span<Scorer*>(scorers.size());
+      std::copy(scorers.begin(), scorers.end(), copy.begin());
+      return copy;
+    }
+
   public:
     // The passed in span of scorers will be modified (rearranged).
     DisjunctionScorer(solux::MemPool& pool, std::span<Scorer*> scorers)
-            : scorers(scorers), pq(scorers) {
+            : clauses(copyScorers(pool, scorers)), scorers(scorers), pq(scorers) {
     }
 
     int32_t next() override {
@@ -2907,34 +3321,32 @@ public:
       return docid;
     }
 
+    std::span<Scorer*> flatDisjunctionScorers() override {
+      return clauses;
+    }
+
     float score() override {
-      assert(docid == pq.top().docId());
-      float score = pq.top().score();
-      int increments = 0;
-      // If we ever had a huge disjunction, we don't really need to look at all of them for matches.  But equal
-      // ids could be on the left or the right of the heap, so just loop over all scorers for now.
-      for (int i = 1; i < pq.size(); i++) {
-        auto id = scorers[i]->docId();
-        assert(id >= docid);
-        if (id == docid) {
-          score += scorers[i]->score();
-        }
+      assert(pq.size() > 0 && docid == pq.top().docId());
+      float score = 0.0f;
+      for (auto* clause : clauses) {
+        if (clause->docId() == docid) score += clause->score();
       }
       return score;
     }
 
     int32_t advanceShallow(int32_t target) override {
       int32_t upTo = solux::PostingsReader::END;
-      for (int32_t i = 0; i < (int32_t) pq.size(); i++) {
-        upTo = std::min(upTo, scorers[(size_t) i]->advanceShallow(target));
+      for (auto* clause : clauses) {
+        if (clause->docId() != solux::PostingsReader::END) {
+          upTo = std::min(upTo, clause->advanceShallow(target));
+        }
       }
       return upTo;
     }
 
     float getMaxScore(int32_t upTo) override {
       float sum = 0.0f;
-      for (int32_t i = 0; i < (int32_t) pq.size(); i++) {
-        auto* scorer = scorers[(size_t) i];
+      for (auto* scorer : clauses) {
         int32_t doc = scorer->docId();
         if (doc != solux::PostingsReader::END && doc <= upTo) {
           sum += scorer->getMaxScore(upTo);
@@ -2945,8 +3357,7 @@ public:
 
     float refineMaxScore(int32_t upTo) override {
       float sum = 0.0f;
-      for (int32_t i = 0; i < (int32_t) pq.size(); i++) {
-        auto* scorer = scorers[(size_t) i];
+      for (auto* scorer : clauses) {
         int32_t doc = scorer->docId();
         if (doc != solux::PostingsReader::END && doc <= upTo) {
           sum += scorer->refineMaxScore(upTo);

@@ -425,9 +425,18 @@ public:
       ordAfter = probe.blockStartOrd + Postings::DOCS_BLOCK_SIZE;
     }
 
-    int32_t applyToCandidates(int32_t* docs, float* scores,
-                              int32_t size, bool required) override {
+    static void markCandidate(std::span<uint64_t> matchedWords, int32_t index) {
+      if (!matchedWords.empty()) {
+        matchedWords[(size_t) (index >> 6)] |= 1ULL << (index & 63);
+      }
+    }
+
+    int32_t applyToCandidatesImpl(int32_t* docs, float* scores,
+                                  int32_t size, bool required,
+                                  std::span<uint64_t> matchedWords) {
       assert(size >= 0);
+      assert(matchedWords.empty()
+          || matchedWords.size() * 64 >= (size_t) size);
       const int64_t advanceCallsBefore = SkipStats::advanceCalls;
       const int64_t wordProbeBeginsBefore = SkipStats::scoredWordProbeAdvances;
       int32_t matches = 0;
@@ -451,6 +460,7 @@ public:
                 target = docs[i];
                 assert(target >= (int32_t) probe.docBase);
                 const int32_t freqIndex = target - (int32_t) probe.docBase;
+                markCandidate(matchedWords, i);
                 if (simScorer != nullptr) {
                   int64_t encodedNorm = flatNormsBase != nullptr ? flatNormsBase[target]
                                                                  : advanceNorm(target);
@@ -489,6 +499,7 @@ public:
                 const bool matched = (word & (1ULL << bit)) != 0;
                 matches += (int32_t) matched;
                 if (matched) {
+                  markCandidate(matchedWords, i);
                   const int32_t ordAfter = cursor.ordBeforeWord
                       + (int32_t) std::popcount(word & lowBitsMask(bit)) + 1;
                   const int32_t freqIndex = ordAfter - probe.blockStartOrd - 1;
@@ -540,6 +551,9 @@ public:
         }
         bool matched = current == target;
         matches += (int32_t) matched;
+        if (matched) {
+          markCandidate(matchedWords, i);
+        }
         if (matched && simScorer != nullptr) {
           int32_t tf = docsEnum.termFreq();
           int64_t encodedNorm = flatNormsBase != nullptr ? flatNormsBase[target]
@@ -567,6 +581,16 @@ public:
         SkipStats::applyToCandidatesPlainAdvanceFallbacks += advances - wordProbeBegins;
       }
       return required ? write : size;
+    }
+
+    int32_t applyToCandidates(int32_t* docs, float* scores,
+                              int32_t size, bool required) override {
+      return applyToCandidatesImpl(docs, scores, size, required, {});
+    }
+
+    void addToCandidates(int32_t* docs, float* scores, int32_t size,
+                         std::span<uint64_t> matchedWords) {
+      applyToCandidatesImpl(docs, scores, size, false, matchedWords);
     }
 
     int32_t fillScoreBlockScalar(int32_t* docs, float* scores, int32_t count, int32_t upTo,

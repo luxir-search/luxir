@@ -94,6 +94,8 @@ struct SkipStats {
   // straight from the stream, without decoding to the doc buffer.
   static inline int64_t countBulkFillWordBlocks = 0;
   static inline int64_t conjDenseCountWindows = 0;
+  static inline int64_t conjDisjGroupCountWindows = 0;
+  static inline int64_t conjDisjGroupScoreWindows = 0;
   static inline int64_t conjCountFallbacks = 0;
   static inline int64_t bulkDomainWindowsFed = 0;
   static inline int64_t numericRangeSparseVerifyArms = 0;
@@ -188,6 +190,8 @@ struct SkipStats {
     countBulkFillContiguousBlocks = 0;
     countBulkFillWordBlocks = 0;
     conjDenseCountWindows = 0;
+    conjDisjGroupCountWindows = 0;
+    conjDisjGroupScoreWindows = 0;
     conjCountFallbacks = 0;
     bulkDomainWindowsFed = 0;
     numericRangeSparseVerifyArms = 0;
