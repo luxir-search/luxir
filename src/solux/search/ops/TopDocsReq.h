@@ -468,7 +468,8 @@ public:
         qr.topDocsProto.batch_size,
         qr.topDocsProto.offset,
         qr.topDocsProto.get_number,
-        qr.topDocsProto.get_scores);
+        qr.topDocsProto.get_scores,
+        qr.topDocsProto.document_format);
     } else {
       auto& collector = *mergeableCollector->scoreCollector;
       auto scoreDocs = collector.sort();
@@ -481,7 +482,8 @@ public:
         qr.topDocsProto.batch_size,
         qr.topDocsProto.offset,
         qr.topDocsProto.get_number,
-        qr.topDocsProto.get_scores);
+        qr.topDocsProto.get_scores,
+        qr.topDocsProto.document_format);
     }
   }
 

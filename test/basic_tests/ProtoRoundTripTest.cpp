@@ -242,7 +242,7 @@ void roundTripType(const char* nm) {
   X(FieldFacet)                                                                                     \
   X(CalendarGap) X(RangeFacet) X(Domain)                                                            \
   X(SearchResponse) X(DocList) X(FacetResult) X(Bucket) X(CommitParams) X(UpdateRequest)           \
-  X(UpdateResponse) X(NamedValue) X(Map) X(Columns) X(Val) X(ArrVal) X(ArrStr) X(ArrInt)           \
+  X(UpdateResponse) X(NamedValue) X(Map) X(Val) X(ArrVal) X(ArrStr) X(ArrInt)                      \
   X(ArrFloat) X(ArrDouble) X(ArrBin) X(ArrArrStr) X(ArrArrInt) X(ArrArrFloat) X(ArrArrDouble)      \
   X(ArrArrBin) X(Vector) X(ArrVector) X(ColStr) X(Column) X(ColVector) X(MultiVector) X(ColInt)    \
   X(ColFloat) X(ColDouble) X(ColMap) X(IndexInfo) X(AuxIndexInfo) X(SegmentInfo) X(AnalyzerDef)    \

@@ -1110,7 +1110,8 @@ TEST_F(HttpApiTest, ndjsonEndRejectsUnknownControlField) {
 }
 
 // HTTP results match the in-process engine for the same query, and a doc missing
-// a requested field renders that field as JSON null.
+// a requested field omits that key (rows format: missing is structural, no
+// null placeholders).
 TEST_F(HttpApiTest, matchQueryParityAndNull) {
   helper.indexAll(std::array{
     flatdoc("id", std::string("b1"), "title_w", std::string("dune novel"),
@@ -1139,8 +1140,10 @@ TEST_F(HttpApiTest, matchQueryParityAndNull) {
   EXPECT_EQ((int64_t)localIds.size(), hreq.found());
   ASSERT_EQ(2u, localIds.size()) << hreq.rawResponse();
 
-  // b2 lacks year_i -> rendered as null.
-  EXPECT_NE(hreq.rawResponse().find(R"("year_i":null)"), std::string::npos)
+  // b1 has year_i; b2 lacks it -> the key is absent from b2's doc (never null).
+  EXPECT_NE(hreq.rawResponse().find(R"("year_i":1965)"), std::string::npos)
+      << hreq.rawResponse();
+  EXPECT_EQ(hreq.rawResponse().find(R"("year_i":null)"), std::string::npos)
       << hreq.rawResponse();
 }
 
@@ -1267,9 +1270,9 @@ TEST_F(HttpApiTest, stringEscaping) {
   EXPECT_EQ(std::string("a\"b\nc\\d"), std::get<std::string>(*v));
 }
 
-// A multi-valued field present on one doc and absent on another: the absent slot
-// renders as null (not []), and the present one as an array.
-TEST_F(HttpApiTest, multiValuedMissingIsNull) {
+// A multi-valued field present on one doc and absent on another: the present
+// doc renders an array, the absent doc omits the key entirely (rows format).
+TEST_F(HttpApiTest, multiValuedMissingOmitsKey) {
   helper.indexAll(std::array{
     flatdoc("id", std::string("m1"), "title_w", std::string("multi"),
             "tags_ss", std::vector<std::string>{"x", "y"}),
@@ -1280,8 +1283,24 @@ TEST_F(HttpApiTest, multiValuedMissingIsNull) {
   hreq.matchQuery("title_w", "multi").fields({"id", "tags_ss"}).execute();
   ASSERT_EQ(200, hreq.status());
 
-  EXPECT_NE(hreq.rawResponse().find(R"("tags_ss":null)"), std::string::npos) << hreq.rawResponse();
   EXPECT_NE(hreq.rawResponse().find(R"("tags_ss":[)"), std::string::npos) << hreq.rawResponse();
+  EXPECT_EQ(hreq.rawResponse().find(R"("tags_ss":null)"), std::string::npos) << hreq.rawResponse();
+}
+
+// document_format parses from JSON ("columns") and overrides the HTTP rows
+// default: columnar cells keep null placeholders for missing slots.
+TEST_F(HttpApiTest, explicitColumnsFormatOverHttp) {
+  helper.indexAll(std::array{
+    flatdoc("id", std::string("c1"), "title_w", std::string("col fmt"),
+            "year_i", (int64_t)2001),
+    flatdoc("id", std::string("c2"), "title_w", std::string("col fmt")),
+  }, UpdateMessage::COMMIT);
+
+  auto res = httpRequest(port(), http::verb::post, "/collections/main/_query",
+      R"({"query":{"match":{"title_w":"col"}},"fields":["id","year_i"],"document_format":"columns"})");
+  ASSERT_EQ(200, res.result_int()) << res.body();
+  EXPECT_NE(res.body().find(R"("year_i":2001)"), std::string::npos) << res.body();
+  EXPECT_NE(res.body().find(R"("year_i":null)"), std::string::npos) << res.body();
 }
 
 // limit > one batch forces the engine to call reply() multiple times, exercising

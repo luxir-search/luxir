@@ -623,6 +623,67 @@ inline void loadStoredFields(SearchRequest& req, std::string_view resourceName,
   }
 }
 
+// ROWS format: scatter loaded columns into per-doc field maps (DocList.docs).
+// The loaders always fill column-shaped storage (pre-sized spans, filled in
+// parallel per segment); in ROWS mode that storage is arena scratch never
+// attached to the response, and this post-wait pass moves the values into
+// rows.  Presence uses the exact per-column contracts the COLUMNS wire shape
+// already guarantees: single-valued sentinel (missing_val, exact after
+// finishPendingCols), multi-valued empty array, vector unset f32.  Missing =
+// key absent; no sentinels in rows.  Values share the arena-backed spans and
+// string views with the scratch columns - nothing is copied.
+//
+// Returns the mutable row array so the caller can add pseudo-fields
+// (_score_).  fieldCap is each row map's slot capacity (distinct field
+// names, including pseudo-fields the caller will add).
+inline solux::api::Map* scatterColumnsToRows(const SearchResponse::ColumnsType& cols,
+                                             solux::api::DocList& docListProto,
+                                             size_t numDocs, size_t fieldCap,
+                                             std::pmr::memory_resource& mr)
+{
+  using solux::api::Val;
+  solux::api::Map* rows = build::allocArray(docListProto.docs, numDocs, mr);
+  for (const auto& [field, col] : cols) {
+    auto slot = [&](size_t i) -> Val& {
+      return *build::mapSlot<Val>(rows[i].fields, fieldCap, field, mr);
+    };
+    if (auto* c = std::get_if<solux::api::ColStr>(&col.kind)) {
+      for (size_t i = 0; i < numDocs; i++)
+        if (c->v[i] != c->missing_val) slot(i).kind = c->v[i];
+    } else if (auto* c = std::get_if<solux::api::ColInt>(&col.kind)) {
+      for (size_t i = 0; i < numDocs; i++)
+        if (c->v[i] != c->missing_val) slot(i).kind = c->v[i];
+    } else if (auto* c = std::get_if<solux::api::ColFloat>(&col.kind)) {
+      for (size_t i = 0; i < numDocs; i++)
+        if (c->v[i] != c->missing_val) slot(i).kind = c->v[i];
+    } else if (auto* c = std::get_if<solux::api::ColDouble>(&col.kind)) {
+      for (size_t i = 0; i < numDocs; i++)
+        if (c->v[i] != c->missing_val) slot(i).kind = c->v[i];
+    } else if (auto* c = std::get_if<solux::api::ArrArrStr>(&col.kind)) {
+      for (size_t i = 0; i < numDocs; i++)
+        if (!c->v[i].v.empty()) slot(i).kind = c->v[i];
+    } else if (auto* c = std::get_if<solux::api::ArrArrInt>(&col.kind)) {
+      for (size_t i = 0; i < numDocs; i++)
+        if (!c->v[i].v.empty()) slot(i).kind = c->v[i];
+    } else if (auto* c = std::get_if<solux::api::ArrArrFloat>(&col.kind)) {
+      for (size_t i = 0; i < numDocs; i++)
+        if (!c->v[i].v.empty()) slot(i).kind = c->v[i];
+    } else if (auto* c = std::get_if<solux::api::ArrArrDouble>(&col.kind)) {
+      for (size_t i = 0; i < numDocs; i++)
+        if (!c->v[i].v.empty()) slot(i).kind = c->v[i];
+    } else if (auto* c = std::get_if<solux::api::ColVector>(&col.kind)) {
+      for (size_t i = 0; i < numDocs; i++)
+        if (c->v[i].f32.has_value()) slot(i).kind = c->v[i];
+    } else if (auto* c = std::get_if<solux::api::MultiVector>(&col.kind)) {
+      for (size_t i = 0; i < numDocs; i++)
+        if (!c->v[i].v.empty()) slot(i).kind = c->v[i];
+    }
+    // monostate can't occur here (loaders always emplace a kind when
+    // numDocs > 0); ColMap/ArrVal are never produced by the doc loaders.
+  }
+  return rows;
+}
+
 // Stream a final ranked list of (segdoc, score) pairs back to the client as one
 // or more SearchResponses.  Both TopDocsReq and FusionOp call this after their
 // own ranking is complete.  The caller's `getDocList(response)` lambda returns
@@ -649,7 +710,8 @@ void emitDocsResponse(SearchRequest& req,
                       int32_t batchSize,
                       int64_t offset,
                       bool getNumber,
-                      bool getScores)
+                      bool getScores,
+                      solux::api::DocFormat docFormat)
 {
   int32_t maxBatchSize = batchSize;
   if (maxBatchSize <= 0) {
@@ -657,6 +719,12 @@ void emitDocsResponse(SearchRequest& req,
   } else if (maxBatchSize > 256) {
     maxBatchSize = 256;
   }
+
+  // DEFAULT resolves to the transport's preference (HTTP -> ROWS, gRPC ->
+  // COLUMNS); an out-of-range wire value falls back to the default too.
+  bool rowsMode = docFormat == solux::api::DocFormat::ROWS
+                  || (docFormat != solux::api::DocFormat::COLUMNS
+                      && req.docFormatDefault == solux::api::DocFormat::ROWS);
 
   // Upper bound on distinct response columns: one per requested field plus the
   // synthetic _score_ column. Used to pre-size the columns map's slot array.
@@ -691,6 +759,7 @@ void emitDocsResponse(SearchRequest& req,
     }
     std::span<const segdoc> segDocs(batchSegDocs);
     int columnSize = (int)segDocs.size();
+    docListProto.row_count = columnSize;
 
     std::optional<oneapi::tbb::task_group> loadColumnsTaskGroup;
     oneapi::tbb::task_group* tg = req.tg ? &loadColumnsTaskGroup.emplace() : nullptr;
@@ -714,7 +783,11 @@ void emitDocsResponse(SearchRequest& req,
     std::vector<uint8_t> segRunLength;
     std::ranges::copy(bySeg, std::back_inserter(segRunLength));
 
-    auto& columnsProto = docListProto.columns;
+    // In ROWS mode the loaders fill arena scratch columns that are never
+    // attached to the response; the post-wait scatter pass moves the values
+    // into docListProto.docs.  The loaders themselves are format-blind.
+    SearchResponse::ColumnsType scratchColumns;
+    auto& columnsProto = rowsMode ? scratchColumns : docListProto.columns;
 
     // Single-valued columns register here so the post-wait finish pass can
     // pick each column's exact missing_val and fill the missing slots.
@@ -814,7 +887,7 @@ void emitDocsResponse(SearchRequest& req,
       }
     }
 
-    if (returnScores) {
+    if (returnScores && !rowsMode) {
       auto& scoresProto = build::columnSlot(columnsProto, colCap, "_score_", mr);
       auto& floatColProto = scoresProto.kind.template emplace<solux::api::ColFloat>();
       float* scores = build::allocArray(floatColProto.v, columnSize, mr);
@@ -828,8 +901,23 @@ void emitDocsResponse(SearchRequest& req,
     }
 
     // All slots are loaded; pick each single-valued column's exact
-    // missing_val and fill its missing slots.
+    // missing_val and fill its missing slots.  (ROWS mode relies on the
+    // exact sentinels for its presence checks.)
     finishPendingCols(pendingCols);
+
+    if (rowsMode && columnSize > 0) {
+      // Scores bypass the scratch column: every doc has one, and a direct
+      // write avoids the all-present column's sentinel ambiguity (a real
+      // 0.0 score would collide with ColFloat's default missing_val).
+      size_t fieldCap = scratchColumns.size() + (returnScores ? 1 : 0);
+      auto* rows = scatterColumnsToRows(scratchColumns, docListProto, (size_t)columnSize, fieldCap, mr);
+      if (returnScores) {
+        for (int i = 0; i < columnSize; i++) {
+          build::mapSlot<solux::api::Val>(rows[i].fields, fieldCap, "_score_", mr)->kind =
+              getScore(batchStart + i);
+        }
+      }
+    }
 
     if (!lastResponse) {
       auto numBuffered = req.reply(response);

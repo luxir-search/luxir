@@ -147,8 +147,10 @@ clauses, under facet domains, as fusion sources, as filters.
   block-max pruning (per-block score bounds + MaxScore skipping); requests
   that ask for exact counts run exhaustively.
 - Sorting by field values (ascending/descending, composable with score and
-  doc order), offset/limit pagination, field projection with explicit
-  `null` for missing values.
+  doc order), offset/limit pagination, field projection.
+- Row- or column-oriented results per request (`document_format`): JSON
+  defaults to row-oriented docs (missing field = absent key), gRPC to dense
+  columns (missing = per-column sentinel) for analytics-friendly decoding.
 - Multiple named search ops in one request, executed in one parallel pass;
   chunked streaming responses for large result sets.
 - Count-only and aggregate-only requests: `limit: 0` returns exact counts

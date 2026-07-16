@@ -49,21 +49,6 @@ void appendFloating(std::string& out, F v) {
   out.append(buf, p);
 }
 
-// Number of doc rows a column represents (the active oneof's repeated length).
-size_t columnSize(const solux::api::Column& col) {
-  if (auto* c = std::get_if<solux::api::ColStr>(&col.kind)) return c->v.size();
-  if (auto* c = std::get_if<solux::api::ColInt>(&col.kind)) return c->v.size();
-  if (auto* c = std::get_if<solux::api::ColFloat>(&col.kind)) return c->v.size();
-  if (auto* c = std::get_if<solux::api::ColDouble>(&col.kind)) return c->v.size();
-  if (auto* c = std::get_if<solux::api::ArrArrStr>(&col.kind)) return c->v.size();
-  if (auto* c = std::get_if<solux::api::ArrArrInt>(&col.kind)) return c->v.size();
-  if (auto* c = std::get_if<solux::api::ArrArrFloat>(&col.kind)) return c->v.size();
-  if (auto* c = std::get_if<solux::api::ArrArrDouble>(&col.kind)) return c->v.size();
-  if (auto* c = std::get_if<solux::api::ColVector>(&col.kind)) return c->v.size();
-  if (auto* c = std::get_if<solux::api::MultiVector>(&col.kind)) return c->v.size();
-  return 0;
-}
-
 template <typename Repeated, typename Emit>
 void appendArray(std::string& out, const Repeated& v, Emit&& emit) {
   out += '[';
@@ -144,12 +129,14 @@ void appendBucketId(std::string& out, const solux::api::Column& col, size_t i) {
   }
 }
 
+void appendOpVal(std::string& out, const solux::api::Val& val);
+
+// Document i is the merge of columns row i and docs[i] (see the DocList
+// contract); pure-rows and pure-columns are the degenerate cases.  Column
+// slots keep the sentinel rendering (missing -> null); row maps signal
+// missing structurally (key absent), so they are emitted as-is.
 void appendDocs(std::string& out, const solux::api::DocList& docs) {
-  size_t numDocs = 0;
-  for (const auto& [name, col] : docs.columns) {
-    numDocs = columnSize(col);
-    break;
-  }
+  size_t numDocs = (size_t)docs.row_count;
   out += '[';
   for (size_t i = 0; i < numDocs; i++) {
     if (i) out += ',';
@@ -162,12 +149,19 @@ void appendDocs(std::string& out, const solux::api::DocList& docs) {
       out += ':';
       appendCell(out, col, i);
     }
+    if (i < docs.docs.size()) {
+      for (const auto& [name, val] : docs.docs[i].fields) {
+        if (!first) out += ',';
+        first = false;
+        appendJsonString(out, name);
+        out += ':';
+        appendOpVal(out, *val);
+      }
+    }
     out += '}';
   }
   out += ']';
 }
-
-void appendOpVal(std::string& out, const solux::api::Val& val);
 
 void appendDocList(std::string& out, const solux::api::DocList& docs) {
   out += '{';

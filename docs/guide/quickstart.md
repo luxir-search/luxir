@@ -60,9 +60,10 @@ POST /collections/main/_query
 ```
 
 `match` analyzes your text the same way the field was indexed, so `darkness`
-finds *"the left hand of darkness"*. `fields` chooses what comes back. Ask for
-a field a document doesn't have and you get an honest `null` for it - never a
-silently missing key.
+finds *"the left hand of darkness"*. `fields` chooses what comes back. A
+document that doesn't have a requested field simply omits that key - a doc
+object never carries `null` placeholders, so what you see is exactly what the
+document has.
 
 ### Counts are exact
 

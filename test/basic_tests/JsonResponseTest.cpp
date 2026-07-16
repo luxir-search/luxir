@@ -139,6 +139,26 @@ TEST_F(JsonResponseTest, wholeDomainStatsStayUnderOpsWithoutDocs) {
             renderSearchResponseLine(req->responses[0]->proto));
 }
 
+TEST_F(JsonResponseTest, rowsFormatRendersDocObjects) {
+  CollectionHelper helper;
+  helper.indexAll(std::array{
+    flatdoc("id", "1", "cat_s", "x", "n_i", (int64_t)5),
+    flatdoc("id", "2"),
+  }, UpdateMessage::COMMIT);
+
+  auto req = localReq(helper.getSearchEngine());
+  req->collection("main");
+  req->topDocs("q").allQuery().fields({"id", "cat_s", "n_i"})
+      .documentFormat(api::DocFormat::ROWS).limit(-1);
+  req->execute(false);
+  ASSERT_OK(req);
+
+  // Row maps signal missing structurally: doc 2 has no cat_s/n_i keys.
+  EXPECT_EQ(
+      R"({"docs":[{"id":"1","cat_s":"x","n_i":5},{"id":"2"}]})" "\n",
+      renderSearchResponseLine(req->responses[0]->proto));
+}
+
 TEST_F(JsonResponseTest, firstDocListIsPromotedAndFacetRemains) {
   CollectionHelper helper;
   helper.indexAll(std::array{

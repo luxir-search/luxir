@@ -215,7 +215,9 @@ public:
                     std::shared_ptr<HttpSession> s, google::protobuf::Arena& arena)
     : SearchRequest(engine, requestState->proto, arena),
       requestState(std::move(requestState)),
-      session(std::move(s)) {}
+      session(std::move(s)) {
+    docFormatDefault = solux::api::DocFormat::ROWS;
+  }
 
   int reply(SearchResponse& response) override;  // defined after HttpSession
   // done() is inherited: releaseArena(&arena) frees this request (and its

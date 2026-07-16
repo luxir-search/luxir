@@ -308,7 +308,8 @@ public:
         op.fusionProto.batch_size,
         op.fusionProto.offset,
         op.fusionProto.get_number,
-        op.fusionProto.get_scores);
+        op.fusionProto.get_scores,
+        op.fusionProto.document_format);
     }
   };
 

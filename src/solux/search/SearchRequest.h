@@ -63,6 +63,11 @@ public:
   // point into requestPool, which outlives response serialization.
   std::vector<api::Warning> warnings;
 
+  // Transport default for DocList field placement when an op leaves
+  // document_format at DEFAULT: gRPC serves COLUMNS; the HTTP/JSON layer sets
+  // ROWS (doc-oriented JSON consumers; row rendering becomes a passthrough).
+  solux::api::DocFormat docFormatDefault = solux::api::DocFormat::COLUMNS;
+
   // TEST-ONLY: wrap each top-docs root query in ForcePrepareQuery so tests
   // can assert prepared execution matches normal execution end-to-end.  This
   // is the engine seam that replaced the force_prepare wire arm (debug

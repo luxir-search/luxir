@@ -65,9 +65,11 @@ public:
   OpCursor& phraseText(std::string_view field, std::string_view text);
   OpCursor& phraseTerms(std::string_view field, std::initializer_list<std::string> terms);
   OpCursor& fields(std::initializer_list<std::string> fieldNames);
+  OpCursor& fields(std::span<const std::string> fieldNames);
   OpCursor& batchSize(int32_t n);
   OpCursor& getNumber(bool v = true);
   OpCursor& getScores(bool v = true);
+  OpCursor& documentFormat(solux::api::DocFormat v);
   OpCursor& withStats() { return getNumber().getScores(); }
 
   // --- configure a facet op ---
@@ -276,25 +278,28 @@ private:
     return p ? &**p : nullptr;
   }
 
-  // Convert a columnar DocList result back to Doc rows (skipping per-column missing slots).
+  // Convert a DocList result back to Doc rows: document i is the merge of
+  // columns row i and docs[i], with per-column missing slots and absent row
+  // keys skipped.  This is the reference client decode loop for the flat
+  // columns+docs pair.
   static std::vector<Doc> convertResultsToDocs(const solux::api::DocList& docs) {
     std::vector<Doc> results;
-    if (docs.columns.empty()) return results;
+    size_t numDocs = (size_t)docs.row_count;
 
-    // Row count comes from the field (non-_score_) columns, which must all agree in height.
-    size_t numDocs = 0;
-    bool haveCount = false;
+    // Column heights and docs alignment validate against the authoritative count.
     for (const auto& [fieldName, column] : docs.columns) {
-      if (fieldName == "_score_") continue;
       std::visit([&](const auto& col) {
         using C = std::decay_t<decltype(col)>;
         if constexpr (!std::is_same_v<C, std::monostate>) {
-          if (!haveCount) { numDocs = col.v.size(); haveCount = true; }
-          else { assert(col.v.size() == numDocs && "DocList field columns have mismatched row counts"); }
+          assert(col.v.size() == numDocs && "DocList column height != row_count");
+          (void)col;
         }
       }, column.kind);
+      (void)fieldName;
     }
-    if (!haveCount) return results;
+    assert(docs.docs.empty() || docs.docs.size() == numDocs);
+
+    if (numDocs == 0) return results;
     results.resize(numDocs);
 
     for (const auto& [fieldName, column] : docs.columns) {
@@ -342,6 +347,48 @@ private:
             }
             results[i].push_back({std::string(fieldName), std::move(vals)});
           }
+        }
+      }
+    }
+
+    // Merge the row side: docs[i] holds document i's fields not in columns.
+    for (size_t i = 0; i < docs.docs.size(); i++) {
+      for (const auto& [name, valPtr] : docs.docs[i].fields) {
+        if (name == "_score_") continue;  // parity with the _score_ column skip above
+        const auto& val = *valPtr;
+        if (const auto* s = std::get_if<std::string_view>(&val.kind)) {
+          results[i].push_back({std::string(name), std::string(*s)});
+        } else if (const auto* n = std::get_if<int64_t>(&val.kind)) {
+          results[i].push_back({std::string(name), *n});
+        } else if (const auto* f = std::get_if<float>(&val.kind)) {
+          results[i].push_back({std::string(name), *f});
+        } else if (const auto* d = std::get_if<double>(&val.kind)) {
+          results[i].push_back({std::string(name), *d});
+        } else if (const auto* b = std::get_if<bool>(&val.kind)) {
+          results[i].push_back({std::string(name), *b});
+        } else if (const auto* a = std::get_if<solux::api::ArrStr>(&val.kind)) {
+          std::vector<std::string> vals(a->v.begin(), a->v.end());
+          results[i].push_back({std::string(name), std::move(vals)});
+        } else if (const auto* a = std::get_if<solux::api::ArrInt>(&val.kind)) {
+          std::vector<int64_t> vals(a->v.begin(), a->v.end());
+          results[i].push_back({std::string(name), std::move(vals)});
+        } else if (const auto* a = std::get_if<solux::api::ArrFloat>(&val.kind)) {
+          std::vector<float> vals(a->v.begin(), a->v.end());
+          results[i].push_back({std::string(name), std::move(vals)});
+        } else if (const auto* a = std::get_if<solux::api::ArrDouble>(&val.kind)) {
+          std::vector<double> vals(a->v.begin(), a->v.end());
+          results[i].push_back({std::string(name), std::move(vals)});
+        } else if (const auto* v = std::get_if<solux::api::Vector>(&val.kind)) {
+          if (v->f32) {
+            std::vector<float> vals(v->f32->v.begin(), v->f32->v.end());
+            results[i].push_back({std::string(name), std::move(vals)});
+          }
+        } else if (const auto* av = std::get_if<solux::api::ArrVector>(&val.kind)) {
+          std::vector<std::vector<float>> vals;
+          for (const auto& vec : av->v) {
+            if (vec.f32) vals.emplace_back(vec.f32->v.begin(), vec.f32->v.end());
+          }
+          results[i].push_back({std::string(name), std::move(vals)});
         }
       }
     }
@@ -497,9 +544,15 @@ inline OpCursor& OpCursor::fields(std::initializer_list<std::string> fieldNames)
   for (const auto& f : fieldNames) req_->appendStr(td.fields, f);
   return *this;
 }
+inline OpCursor& OpCursor::fields(std::span<const std::string> fieldNames) {
+  auto& td = asTopDocs();
+  for (const auto& f : fieldNames) req_->appendStr(td.fields, f);
+  return *this;
+}
 inline OpCursor& OpCursor::batchSize(int32_t n) { asTopDocs().batch_size = n; return *this; }
 inline OpCursor& OpCursor::getNumber(bool v) { asTopDocs().get_number = v; return *this; }
 inline OpCursor& OpCursor::getScores(bool v) { asTopDocs().get_scores = v; return *this; }
+inline OpCursor& OpCursor::documentFormat(solux::api::DocFormat v) { asTopDocs().document_format = v; return *this; }
 
 inline OpCursor& OpCursor::limit(int64_t n) {
   if (auto* td = std::get_if<solux::api::TopDocs>(&op_->kind)) td->limit = n;
