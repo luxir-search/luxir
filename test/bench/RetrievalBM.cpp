@@ -4,6 +4,7 @@
 
 #include "bench/solux_bench.h"
 #include "solux/server/JsonResponse.h"
+#include "solux/util/random.h"
 #include "test/CollectionHelper.h"
 #include "test/LocalReq.h"
 
@@ -105,25 +106,21 @@ static void BM_FieldLoad(benchmark::State& state, const std::vector<std::string>
   state.counters["rate"] = benchmark::Counter(state.iterations(), benchmark::Counter::kIsRate);
 }
 
-static void BM_JsonRender(benchmark::State& state, const std::vector<std::string>& fields,
-                          solux::api::DocFormat format) {
-  CollectionHelper helper;
-  int64_t nDocs = 0;
-  bool reuseIndex = setupIndex(helper, nDocs);
+// JSON render corpus: its own tiny collection (one full response batch) so
+// the shared bench index is never touched.  One string column followed by
+// alternating int/float/double columns makes per-cell column-type branches
+// unpredictable - the case that punishes re-dispatching the column variant
+// for every cell instead of once per column.
+static const std::vector<std::string> FIELDS_MIXED7 = {"id", "a_i", "a_f", "a_d",
+                                                       "b_i", "b_f", "b_d"};
+// id-sized strings only: per-value fixed costs (key prefix, quoting, short
+// escape scans) with almost no payload bytes.
+static const std::vector<std::string> FIELDS_ID = {"id"};
 
-  // Build the response once; the handle keeps the response arena alive for
-  // the whole timing loop.
-  auto req = localReq(SoluxTest::soluxNode->getSearchEngine());
-  req->collection("main");
-  req->topDocs("q")
-      .matchQuery(pageQueryField(), "0")
-      .fields(std::span<const std::string>(fields))
-      .documentFormat(format)
-      .limit(100);
-  req->execute(false);
-  ASSERT_NE(req->docList("q"), nullptr);
-  const auto& proto = req->responses[0]->proto;
-
+// Render an already-built response repeatedly; the request handle stays in
+// the caller's scope so the response arena outlives the loop.
+// bytes_per_second reports render throughput.
+static void renderLoop(benchmark::State& state, const solux::api::SearchResponse& proto) {
   int64_t fp = -1;
   for (auto _ : state) {
     std::string line = renderSearchResponseLine(proto);
@@ -134,10 +131,88 @@ static void BM_JsonRender(benchmark::State& state, const std::vector<std::string
     }
     fp = ret;
   }
-
   state.counters["bytes"] = fp;
-  state.counters["reused"] = reuseIndex;
+  state.SetBytesProcessed(state.iterations() * fp);
   state.counters["rate"] = benchmark::Counter(state.iterations(), benchmark::Counter::kIsRate);
+}
+
+static void BM_JsonRender(benchmark::State& state, const std::vector<std::string>& fields,
+                          solux::api::DocFormat format) {
+  CollectionHelper helper("jsonbm");
+  helper.clear();  // idempotent across variants and repeated --bench runs
+  std::vector<Doc> corpus;
+  SplitMix64 r(42);
+  for (int i = 0; i < 100; i++) {
+    corpus.push_back(flatdoc("id", "doc" + std::to_string(i),
+                             "a_i", r.rint(1'000'000),
+                             "a_f", (float)r.rint(1'000'000) / 100.0f,
+                             "a_d", (double)r.rint(1'000'000'000) / 1000.0,
+                             "b_i", r.rint(1'000'000),
+                             "b_f", (float)r.rint(1'000'000) / 100.0f,
+                             "b_d", (double)r.rint(1'000'000'000) / 1000.0));
+  }
+  helper.indexAll(corpus, UpdateMessage::COMMIT);
+
+  auto req = localReq(SoluxTest::soluxNode->getSearchEngine());
+  req->collection("jsonbm");
+  req->topDocs("q")
+      .allQuery()
+      .fields(std::span<const std::string>(fields))
+      .documentFormat(format)
+      .limit(100);
+  req->execute(false);
+  ASSERT_NE(req->docList("q"), nullptr);
+  ASSERT_EQ(100, req->docList("q")->row_count);
+  renderLoop(state, req->responses[0]->proto);
+}
+
+// Really big strings: megabyte-scale stored text bodies, the case where the
+// per-byte string-escape loop is the whole cost.  Mostly clean prose with
+// newlines (escaped) and the occasional quote, so the escape path is
+// exercised at a realistic density rather than being dead code.
+static std::string makeBody(SplitMix64& r, size_t targetBytes) {
+  static constexpr const char* words[] = {
+      "the", "quick", "brown", "fox", "jumps", "over", "lazy", "dogs",
+      "search", "engine", "column", "stored", "field", "chunk", "postings"};
+  std::string s;
+  s.reserve(targetBytes + 16);
+  int wordsInLine = 0;
+  while (s.size() < targetBytes) {
+    s += words[r.rint(std::size(words))];
+    if (r.rint(97) == 0) s += '"';
+    if (++wordsInLine >= 12) {
+      s += '\n';
+      wordsInLine = 0;
+    } else {
+      s += ' ';
+    }
+  }
+  return s;
+}
+
+static void BM_JsonRenderBody(benchmark::State& state, solux::api::DocFormat format) {
+  size_t bodyBytes = solux::unit_tests ? 32 * 1024 : 1024 * 1024;
+  CollectionHelper helper("jsonbm_body");
+  helper.clear();
+  std::vector<Doc> corpus;
+  SplitMix64 r(7);
+  for (int i = 0; i < 10; i++) {
+    corpus.push_back(flatdoc("id", "doc" + std::to_string(i),
+                             "body_t", makeBody(r, bodyBytes)));
+  }
+  helper.indexAll(corpus, UpdateMessage::COMMIT);
+
+  auto req = localReq(SoluxTest::soluxNode->getSearchEngine());
+  req->collection("jsonbm_body");
+  req->topDocs("q")
+      .allQuery()
+      .fields({"id", "body_t"})
+      .documentFormat(format)
+      .limit(10);
+  req->execute(false);
+  ASSERT_NE(req->docList("q"), nullptr);
+  ASSERT_EQ(10, req->docList("q")->row_count);
+  renderLoop(state, req->responses[0]->proto);
 }
 
 static constexpr auto ROWS = solux::api::DocFormat::ROWS;
@@ -151,7 +226,9 @@ SOLUX_BENCHMARK_CAPTURE(BM_FieldLoad, str_rows, FIELDS_STR, ROWS);
 SOLUX_BENCHMARK_CAPTURE(BM_FieldLoad, mixed4_cols, FIELDS_MIXED, COLS);
 SOLUX_BENCHMARK_CAPTURE(BM_FieldLoad, mixed4_rows, FIELDS_MIXED, ROWS);
 
-SOLUX_BENCHMARK_CAPTURE(BM_JsonRender, str_cols, FIELDS_STR, COLS);
-SOLUX_BENCHMARK_CAPTURE(BM_JsonRender, str_rows, FIELDS_STR, ROWS);
-SOLUX_BENCHMARK_CAPTURE(BM_JsonRender, mixed4_cols, FIELDS_MIXED, COLS);
-SOLUX_BENCHMARK_CAPTURE(BM_JsonRender, mixed4_rows, FIELDS_MIXED, ROWS);
+SOLUX_BENCHMARK_CAPTURE(BM_JsonRender, mixed7_cols, FIELDS_MIXED7, COLS);
+SOLUX_BENCHMARK_CAPTURE(BM_JsonRender, mixed7_rows, FIELDS_MIXED7, ROWS);
+SOLUX_BENCHMARK_CAPTURE(BM_JsonRender, ids_cols, FIELDS_ID, COLS);
+SOLUX_BENCHMARK_CAPTURE(BM_JsonRender, ids_rows, FIELDS_ID, ROWS);
+SOLUX_BENCHMARK_CAPTURE(BM_JsonRenderBody, body_cols, COLS);
+SOLUX_BENCHMARK_CAPTURE(BM_JsonRenderBody, body_rows, ROWS);
