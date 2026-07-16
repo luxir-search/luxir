@@ -61,6 +61,11 @@ inline std::span<const PreparedSource> preparedSpan(const std::vector<PreparedSo
   return {sources.data(), sources.size()};
 }
 
+struct CostedScorers {
+  std::span<Query::Scorer*> scorers;
+  std::span<int64_t> costs;
+};
+
 inline std::span<Query::SegmentSource*> liveSources(MemPool& targetPool,
                                                     std::span<Query::Weight*> weights) {
   if (weights.empty()) return {};
@@ -94,16 +99,31 @@ inline std::span<Query::Scorer*> createScorers(MemPool& targetPool,
   return scorers;
 }
 
+inline CostedScorers createScorersWithCosts(
+    MemPool& targetPool, IndexReader::Segment& segment,
+    std::span<Query::SegmentSource* const> sources) {
+  if (sources.empty()) return {};
+  auto scorers = targetPool.make_span<Query::Scorer*>(sources.size());
+  auto costs = targetPool.make_span<int64_t>(sources.size());
+  size_t count = 0;
+  for (auto* source : sources) {
+    auto* supplier = source->scorerSupplier(targetPool, segment);
+    if (supplier == nullptr) continue;
+    int64_t cost = supplier->cost();
+    auto* scorer = supplier->get(targetPool, std::numeric_limits<int64_t>::max());
+    if (scorer == nullptr) continue;
+    scorers[count] = scorer;
+    costs[count++] = cost;
+  }
+  return {scorers.first(count), costs.first(count)};
+}
 
 
-// Like createScorers, but returns the surviving scorers ordered by ascending
-// supplier cost(). The cost is read from the ScorerSupplier (its planning role)
-// before the scorer is built, which lets a compound scorer pick lead iterators
-// by cost - e.g. the min-should-match lead/tail split, where the cheapest
-// (sparsest) iterators drive candidates and the densest are skipped onto them.
-inline std::span<Query::Scorer*> createScorersByCost(MemPool& targetPool,
-                                                     IndexReader::Segment& segment,
-                                                     std::span<Query::SegmentSource* const> sources) {
+// Like createScorers, but retains supplier costs and orders both parallel spans
+// by ascending cost.
+inline CostedScorers createScorersByCost(MemPool& targetPool,
+                                         IndexReader::Segment& segment,
+                                         std::span<Query::SegmentSource* const> sources) {
   if (sources.empty()) return {};
 
   struct CostedSupplier {
@@ -123,12 +143,16 @@ inline std::span<Query::Scorer*> createScorersByCost(MemPool& targetPool,
             [](const CostedSupplier& a, const CostedSupplier& b) { return a.cost < b.cost; });
 
   auto* scorers = targetPool.make_arr<Query::Scorer*>(sources.size());
+  auto* costs = targetPool.make_arr<int64_t>(sources.size());
   size_t count = 0;
   for (auto& c : costed) {
     auto* scorer = c.supplier->get(targetPool, std::numeric_limits<int64_t>::max());
-    if (scorer != nullptr) scorers[count++] = scorer;
+    if (scorer != nullptr) {
+      scorers[count] = scorer;
+      costs[count++] = c.cost;
+    }
   }
-  return {scorers, count};
+  return {{scorers, count}, {costs, count}};
 }
 
 // Collect a ScorerSupplier for each source, keeping a 1:1 mapping with the input

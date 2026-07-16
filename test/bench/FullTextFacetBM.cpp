@@ -290,7 +290,8 @@ ScoreTopKResult runMsmWandTopK(IndexReader& reader, int32_t topK, MsmWandMode mo
     std::span<Query::Scorer*> span(arr, (size_t) count);
     Query::Scorer* scorer = nullptr;
     if (count == minMatch) {
-      scorer = pool.make<BooleanQuery::ConjunctionScorer>(pool, span, span);
+      auto costs = pool.make_span<int64_t>((size_t) count);
+      scorer = pool.make<BooleanQuery::ConjunctionScorer>(pool, span, costs, span);
     } else if (mode == MsmWandMode::Wand) {
       scorer = pool.make<BooleanQuery::MinShouldMatchWandScorer>(pool, span, minMatch);
     } else {

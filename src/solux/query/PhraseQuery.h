@@ -779,12 +779,16 @@ public:
 
 #ifndef NDEBUG
     void markSinglePhase() {
-      assert(protocol != 2);
+      assert(protocol != 2 && protocol != 3);
       protocol = 1;
     }
     void markTwoPhase() {
-      assert(protocol != 1);
+      assert(protocol != 1 && protocol != 3);
       protocol = 2;
+    }
+    void markExternal() {
+      assert(protocol != 1 && protocol != 2);
+      protocol = 3;
     }
 #endif
 
@@ -877,10 +881,19 @@ public:
       return doApproximationAdvance(target);
     }
     int32_t approximationDocId() override { return docid; }
+    std::span<DocsEnum*> approximationEnums() override { return conjunctionEnums; }
     bool matches() override {
 #ifndef NDEBUG
       markTwoPhase();
 #endif
+      return doMatches();
+    }
+    bool matchesAt(int32_t doc) override {
+#ifndef NDEBUG
+      markExternal();
+      for (DocsEnum* docsEnum : conjunctionEnums) assert(docsEnum->docId() == doc);
+#endif
+      docid = doc;
       return doMatches();
     }
     float matchCost() override { return matchCostEstimate; }

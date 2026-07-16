@@ -431,6 +431,7 @@ public:
     struct Required {
       Query::Scorer* scorer;
       bool unsatisfiable;
+      int64_t cost;
     };
 
     // Build the required-clause conjunction. Mandatory clauses score; filter
@@ -453,14 +454,14 @@ public:
       boost::container::small_vector<Entry, 16> entries;
       for (auto* source : mandatorySources) {
         auto* supplier = source->scorerSupplier(targetPool, segment);
-        if (supplier == nullptr) return {nullptr, true};
+        if (supplier == nullptr) return {nullptr, true, 0};
         entries.push_back({supplier->cost(), supplier, true});
       }
       for (auto* supplier : filterSuppliers) {
-        if (supplier == nullptr) return {nullptr, true};
+        if (supplier == nullptr) return {nullptr, true, 0};
         entries.push_back({supplier->cost(), supplier, false});
       }
-      if (entries.empty()) return {nullptr, false};
+      if (entries.empty()) return {nullptr, false, 0};
 
       // leadCost is the cost of the sparsest required clause: it bounds how often
       // the others get driven, so each may plan eager vs lazy setup off it.
@@ -472,6 +473,7 @@ public:
                 [](const Entry& a, const Entry& b) { return a.cost < b.cost; });
 
       auto* all = targetPool.make_arr<Query::Scorer*>(entries.size());
+      auto* costs = targetPool.make_arr<int64_t>(entries.size());
       Query::Scorer** scoring = mandatorySources.empty()
         ? nullptr
         : targetPool.make_arr<Query::Scorer*>(mandatorySources.size());
@@ -479,17 +481,19 @@ public:
       size_t scoringCount = 0;
       for (auto& e : entries) {
         auto* scorer = e.supplier->get(targetPool, leadCost);
-        if (scorer == nullptr) return {nullptr, true};
-        all[allCount++] = scorer;
+        if (scorer == nullptr) return {nullptr, true, 0};
+        all[allCount] = scorer;
+        costs[allCount++] = e.cost;
         if (e.scoring) scoring[scoringCount++] = scorer;
       }
 
       // A lone scoring clause (one mandatory, no filters) needs no wrapper.
-      if (allCount == 1 && scoringCount == 1) return {all[0], false};
+      if (allCount == 1 && scoringCount == 1) return {all[0], false, leadCost};
       return {targetPool.make<BooleanQuery::ConjunctionScorer>(
                 targetPool, std::span<Query::Scorer*>(all, allCount),
+                std::span<int64_t>(costs, allCount),
                 std::span<Query::Scorer*>(scoring, scoringCount)),
-              false};
+              false, leadCost};
     }
 
     // Keep clause wiring in one place so prepared and non-prepared execution
@@ -517,9 +521,16 @@ public:
 
       // For min-should-match (> 1) order the optional scorers by cost so the
       // pigeonhole lead/tail split leads with the cheapest (sparsest) iterators.
-      auto optionalScorers = minShouldMatch > 1
-        ? QueryPrep::createScorersByCost(targetPool, segment, optionalSources)
-        : QueryPrep::createScorers(targetPool, segment, optionalSources);
+      QueryPrep::CostedScorers optional;
+      if (minShouldMatch > 1) {
+        optional = QueryPrep::createScorersByCost(targetPool, segment, optionalSources);
+      } else if (minShouldMatch == 1) {
+        optional = QueryPrep::createScorersWithCosts(targetPool, segment, optionalSources);
+      } else {
+        optional.scorers = QueryPrep::createScorers(targetPool, segment, optionalSources);
+      }
+      auto optionalScorers = optional.scorers;
+      auto optionalCosts = optional.costs;
       Query::Scorer* optScorer = nullptr;
       if (!optionalScorers.empty()) {
         int optCount = (int)optionalScorers.size();
@@ -538,7 +549,7 @@ public:
         } else if (optCount == minShouldMatch) {
           // Every surviving optional clause is required and scores.
           optScorer = targetPool.make<BooleanQuery::ConjunctionScorer>(
-            targetPool, optionalScorers, optionalScorers);
+            targetPool, optionalScorers, optionalCosts, optionalScorers);
         } else if (optCount > minShouldMatch) {
           bool useWand = needsScores && reqScorer == nullptr && prohibitedSources.empty();
           if (useWand) {
@@ -575,11 +586,16 @@ public:
         std::span<Query::Scorer*> allSpan(targetPool.make_arr<Query::Scorer*>(2), 2);
         allSpan[0] = reqScorer;
         allSpan[1] = optScorer;
+        std::span<int64_t> allCosts(targetPool.make_arr<int64_t>(2), 2);
+        allCosts[0] = req.cost;
+        allCosts[1] = optionalCost(
+            optionalCosts, minShouldMatch, segment.maxDoc());
         size_t nscoring = hasMandatory ? 2 : 1;
         std::span<Query::Scorer*> scoringSpan(targetPool.make_arr<Query::Scorer*>(nscoring), nscoring);
         scoringSpan[nscoring - 1] = optScorer;
         if (hasMandatory) scoringSpan[0] = reqScorer;
-        boolScorer = targetPool.make<BooleanQuery::ConjunctionScorer>(targetPool, allSpan, scoringSpan);
+        boolScorer = targetPool.make<BooleanQuery::ConjunctionScorer>(
+            targetPool, allSpan, allCosts, scoringSpan);
       }
 
       auto prohibitedScorers = QueryPrep::createScorers(targetPool, segment, prohibitedSources);
@@ -594,6 +610,23 @@ public:
 
     // Estimates the optional group's match cost: disjunction is the sum (capped),
     // min-should-match the sum of the cheapest n - mm + 1, all-required the rarest.
+    static int64_t optionalCost(std::span<const int64_t> costs,
+                                int minShouldMatch, int64_t maxDoc) {
+      int n = (int) costs.size();
+      if (n == 0) return 0;
+      if (minShouldMatch >= n) {
+        int64_t m = maxDoc;
+        for (auto c : costs) m = std::min(m, c);
+        return m;
+      }
+      int take = minShouldMatch <= 1 ? n : n - minShouldMatch + 1;
+      boost::container::small_vector<int64_t, 16> sorted(costs.begin(), costs.end());
+      if (take < n) std::sort(sorted.begin(), sorted.end());
+      int64_t sum = 0;
+      for (int i = 0; i < take; i++) sum += sorted[(size_t) i];
+      return std::min(sum, maxDoc);
+    }
+
     static int64_t optionalCost(
         MemPool& targetPool,
         IndexReader::Segment& segment,
@@ -605,18 +638,7 @@ public:
         auto* supplier = source->scorerSupplier(targetPool, segment);
         costs.push_back(supplier == nullptr ? 0 : supplier->cost());
       }
-      int n = (int)costs.size();
-      if (n == 0) return 0;
-      if (minShouldMatch >= n) {  // every optional clause required -> rarest
-        int64_t m = maxDoc;
-        for (auto c : costs) m = std::min(m, c);
-        return m;
-      }
-      int take = minShouldMatch <= 1 ? n : n - minShouldMatch + 1;
-      if (take < n) std::sort(costs.begin(), costs.end());
-      int64_t sum = 0;
-      for (int i = 0; i < take; i++) sum += costs[i];
-      return std::min(sum, maxDoc);
+      return optionalCost(costs, minShouldMatch, maxDoc);
     }
 
     // Estimates the boolean match cost from child supplier costs.
@@ -1938,19 +1960,42 @@ public:
 
   class ConjunctionScorer final : public Query::Scorer {
     struct ApproxSlot {
+      enum class Kind : uint8_t {
+        SINGLE_PHASE,
+        TWO_PHASE,
+        DOCS_ENUM
+      };
+
       Query::Scorer* scorer = nullptr;
-      bool twoPhase = false;
+      DocsEnum* docsEnum = nullptr;
+      int64_t cost = 0;
+      Kind kind = Kind::SINGLE_PHASE;
 
       int32_t next() const {
-        return twoPhase ? scorer->approximationNext() : scorer->next();
+        switch (kind) {
+          case Kind::SINGLE_PHASE: return scorer->next();
+          case Kind::TWO_PHASE: return scorer->approximationNext();
+          case Kind::DOCS_ENUM: return docsEnum->next();
+        }
+        std::unreachable();
       }
 
       int32_t advance(int32_t target) const {
-        return twoPhase ? scorer->approximationAdvance(target) : scorer->advance(target);
+        switch (kind) {
+          case Kind::SINGLE_PHASE: return scorer->advance(target);
+          case Kind::TWO_PHASE: return scorer->approximationAdvance(target);
+          case Kind::DOCS_ENUM: return docsEnum->advance(target);
+        }
+        std::unreachable();
       }
 
       int32_t docId() const {
-        return twoPhase ? scorer->approximationDocId() : scorer->docId();
+        switch (kind) {
+          case Kind::SINGLE_PHASE: return scorer->docId();
+          case Kind::TWO_PHASE: return scorer->approximationDocId();
+          case Kind::DOCS_ENUM: return docsEnum->docId();
+        }
+        std::unreachable();
       }
     };
 
@@ -1958,6 +2003,11 @@ public:
       Query::Scorer* scorer = nullptr;
       size_t approxIndex = 0;
       float matchCost = 0.0f;
+      bool externallyDriven = false;
+
+      bool matches(int32_t doc) const {
+        return externallyDriven ? scorer->matchesAt(doc) : scorer->matches();
+      }
     };
 
     std::span<Query::Scorer*> scorers; // subset of required clauses that contributes to score()
@@ -2127,7 +2177,7 @@ public:
         }
         // if we made it through the loop, all approximations matched.
         for (auto& verifier : verifiers) {
-          if (!verifier.scorer->matches()) {
+          if (!verifier.matches(target)) {
             int32_t id = approximations[verifier.approxIndex].next();
             target = leadTo(verifier.approxIndex == 0 ? id : first.advance(id));
             goto outer;
@@ -2145,32 +2195,66 @@ public:
     // neutral-to-worse at 5M - the natural per-block range prunes best at low
     // k; revisit only with fresh profiles.)
     static inline bool disablePruningForTests = false;
+    static inline bool disableApproxFlattenForTests = false;
 
-    // allScorers: every required iterator, ordered by ascending cost so
-    // allScorers[0] is the sparsest and leads the matching. scoringScorers: the
-    // subset whose score() contributes to the conjunction score (filter clauses
-    // iterate but do not score); every entry must also appear in allScorers.
+    // allCosts contains each allScorers entry's supplier cost. scoringScorers is
+    // the subset whose score() contributes to the conjunction score (filter
+    // clauses iterate but do not score); every entry must also appear in
+    // allScorers.
     // TODO: if any scoring scorer is boosted to 0 it could be dropped from the
     // scoring subset while staying in allScorers.
     ConjunctionScorer(solux::MemPool& pool, std::span<Query::Scorer*> allScorers,
+                      std::span<int64_t> allCosts,
                       std::span<Query::Scorer*> scoringScorers)
-            : scorers(scoringScorers),
-              approximations(pool.make_arr<ApproxSlot>(allScorers.size()), allScorers.size()) {
+            : scorers(scoringScorers) {
+      assert(allScorers.size() == allCosts.size());
+      auto flattened = pool.make_span<std::span<DocsEnum*>>(allScorers.size());
+      size_t approximationCount = 0;
       size_t verifierCount = 0;
+      bool expanded = false;
       for (size_t i = 0; i < allScorers.size(); i++) {
         bool twoPhase = !disableTwoPhaseForTests && allScorers[i]->hasTwoPhase();
-        approximations[i] = {allScorers[i], twoPhase};
+        if (twoPhase && !disableApproxFlattenForTests) {
+          flattened[i] = allScorers[i]->approximationEnums();
+          expanded |= !flattened[i].empty();
+        }
+        approximationCount += flattened[i].empty() ? 1 : flattened[i].size();
         if (twoPhase) verifierCount++;
       }
-      verifiers = {pool.make_arr<VerifierSlot>(verifierCount), verifierCount};
+
+      approximations = pool.make_span<ApproxSlot>(approximationCount);
+      verifiers = pool.make_span<VerifierSlot>(verifierCount);
+      size_t approximationIndex = 0;
       size_t verifierIndex = 0;
       for (size_t i = 0; i < allScorers.size(); i++) {
-        if (!approximations[i].twoPhase) {
+        Query::Scorer* scorer = allScorers[i];
+        bool twoPhase = !disableTwoPhaseForTests && scorer->hasTwoPhase();
+        if (!flattened[i].empty()) {
+          for (DocsEnum* docsEnum : flattened[i]) {
+            approximations[approximationIndex++] = {
+              nullptr, docsEnum, docsEnum->numDocs(), ApproxSlot::Kind::DOCS_ENUM};
+          }
+          verifiers[verifierIndex++] = {scorer, 0, scorer->matchCost(), true};
           continue;
         }
-        auto* scorer = approximations[i].scorer;
-        verifiers[verifierIndex++] = {scorer, i, scorer->matchCost()};
+        approximations[approximationIndex++] = {
+          scorer, nullptr, allCosts[i], twoPhase ? ApproxSlot::Kind::TWO_PHASE
+                                                : ApproxSlot::Kind::SINGLE_PHASE};
       }
+      assert(approximationIndex == approximations.size());
+      if (expanded) {
+        std::stable_sort(approximations.begin(), approximations.end(),
+                         [](const ApproxSlot& a, const ApproxSlot& b) {
+                           return a.cost < b.cost;
+                         });
+      }
+      for (size_t i = 0; i < approximations.size(); i++) {
+        if (approximations[i].kind == ApproxSlot::Kind::TWO_PHASE) {
+          Query::Scorer* scorer = approximations[i].scorer;
+          verifiers[verifierIndex++] = {scorer, i, scorer->matchCost(), false};
+        }
+      }
+      assert(verifierIndex == verifiers.size());
       std::sort(verifiers.begin(), verifiers.end(),
                 [](const VerifierSlot& a, const VerifierSlot& b) {
                   return a.matchCost < b.matchCost;
