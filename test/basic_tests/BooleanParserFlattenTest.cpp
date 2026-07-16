@@ -178,15 +178,15 @@ TEST_F(BooleanParserFlattenTest, conjunctionAndDisjunctionFormsFlatten) {
 
   Query* parsed = parseExpr("body_w:a AND (body_w:b OR body_w:c)");
   auto view = shape(parsed);
-  EXPECT_EQ(1, view.mandatoryCount);
-  EXPECT_EQ(2, view.optionalCount);
-  EXPECT_EQ(1, view.minShouldMatch);
-  EXPECT_EQ(BooleanQuery::R3_REQUIRED_DISJUNCTION_HOIST,
-            view.ruleMask & BooleanQuery::R3_REQUIRED_DISJUNCTION_HOIST);
-  Query* flatMandatory[] = {&a};
-  Query* flatOptional[] = {&b, &c};
-  BooleanQuery flat(flatMandatory, flatOptional, {}, {}, 1);
-  expectScoresNear(collectScores(*index.reader, flat),
+  EXPECT_EQ(2, view.mandatoryCount);
+  EXPECT_EQ(0, view.optionalCount);
+  EXPECT_EQ(0, view.minShouldMatch);
+  EXPECT_EQ(0u, view.ruleMask & BooleanQuery::R3_REQUIRED_DISJUNCTION_HOIST);
+  Query* bcOptional[] = {&b, &c};
+  BooleanQuery bc({}, bcOptional, {}, {});
+  Query* nestedMandatory[] = {&a, &bc};
+  BooleanQuery nested(nestedMandatory, {}, {}, {});
+  expectScoresNear(collectScores(*index.reader, nested),
                    collectScores(*index.reader, *parsed));
 
   parsed = parseExpr("(body_w:a OR body_w:b) AND NOT body_w:c");
@@ -206,6 +206,8 @@ TEST_F(BooleanParserFlattenTest, conjunctionAndDisjunctionFormsFlatten) {
   EXPECT_EQ(1, view.mandatoryCount);
   EXPECT_EQ(2, view.optionalCount);
   EXPECT_EQ(0, view.minShouldMatch);
+  Query* flatMandatory[] = {&a};
+  Query* flatOptional[] = {&b, &c};
   BooleanQuery defaultForm(flatMandatory, flatOptional, {}, {});
   expectScoresNear(collectScores(*index.reader, defaultForm),
                    collectScores(*index.reader, *parsed));
@@ -217,21 +219,20 @@ TEST_F(BooleanParserFlattenTest, boostedGroupUnderAndDistributesBoost) {
 
   Query* parsed = parseExpr("body_w:a AND (body_w:b body_w:c)^2");
   auto view = shape(parsed);
-  EXPECT_EQ(1, view.mandatoryCount);
-  EXPECT_EQ(2, view.optionalCount);
-  EXPECT_EQ(1, view.minShouldMatch);
-  EXPECT_EQ(std::type_index(typeid(BoostQuery)), view.optionalTypes[0]);
-  EXPECT_EQ(std::type_index(typeid(BoostQuery)), view.optionalTypes[1]);
+  EXPECT_EQ(2, view.mandatoryCount);
+  EXPECT_EQ(0, view.optionalCount);
+  EXPECT_EQ(0, view.minShouldMatch);
+  EXPECT_EQ(std::type_index(typeid(BoostQuery)), view.mandatoryTypes[1]);
 
   TermQuery a("body_w", "a");
   TermQuery b("body_w", "b");
   TermQuery c("body_w", "c");
-  BoostQuery boostedB(&b, 2.0f);
-  BoostQuery boostedC(&c, 2.0f);
-  Query* mandatory[] = {&a};
-  Query* optional[] = {&boostedB, &boostedC};
-  BooleanQuery flat(mandatory, optional, {}, {}, 1);
-  expectScoresNear(collectScores(*index.reader, flat),
+  Query* optional[] = {&b, &c};
+  BooleanQuery group({}, optional, {}, {});
+  BoostQuery boostedGroup(&group, 2.0f);
+  Query* mandatory[] = {&a, &boostedGroup};
+  BooleanQuery nested(mandatory, {}, {}, {});
+  expectScoresNear(collectScores(*index.reader, nested),
                    collectScores(*index.reader, *parsed));
 }
 
@@ -255,10 +256,10 @@ TEST_F(BooleanParserFlattenTest, topDocsExprAndNamedFilterCompose) {
   auto* topDocs = dynamic_cast<TopDocsReq*>(root->subOps.at("q"));
   ASSERT_NE(topDocs, nullptr);
   auto plan = shape(topDocs->query);
-  EXPECT_EQ(1, plan.mandatoryCount);
-  EXPECT_EQ(2, plan.optionalCount);
+  EXPECT_EQ(2, plan.mandatoryCount);
+  EXPECT_EQ(0, plan.optionalCount);
   EXPECT_EQ(1, plan.filterCount);
-  EXPECT_EQ(1, plan.minShouldMatch);
+  EXPECT_EQ(0, plan.minShouldMatch);
 
   auto req = localReq(soluxNode->getSearchEngine());
   req->collection("main");

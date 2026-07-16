@@ -38,6 +38,18 @@ struct ApproxFlattenGuard {
   }
 };
 
+struct DisjGroupBulkGuard {
+  bool saved = BooleanQuery::ConjunctionBulkScorer::disableDisjGroupBulkForTests;
+
+  explicit DisjGroupBulkGuard(bool disabled) {
+    BooleanQuery::ConjunctionBulkScorer::disableDisjGroupBulkForTests = disabled;
+  }
+
+  ~DisjGroupBulkGuard() {
+    BooleanQuery::ConjunctionBulkScorer::disableDisjGroupBulkForTests = saved;
+  }
+};
+
 } // namespace
 
 // Randomized differential test for boolean matching. body_w uses identity
@@ -80,6 +92,19 @@ public:
   }
 
   api::Query genBool(std::pmr::memory_resource& mr, int depth) {
+    if (depth > 0 && rng.rint(5) == 0) {
+      int groupCount = (int) rng.rint(2, 4);
+      std::vector<api::Query> required;
+      for (int group = 0; group < groupCount; group++) {
+        int termCount = (int) rng.rint(2, 4);
+        std::vector<api::Query> terms;
+        for (int term = 0; term < termCount; term++) {
+          terms.push_back(qb::match(mr, "body_w", randTerm()));
+        }
+        required.push_back(qb::boolean(mr, {}, terms));
+      }
+      return qb::boolean(mr, required);
+    }
     int nreq = (int)rng.rint(4);     // 0..3
     int nopt = (int)rng.rint(4);     // 0..3
     int nproh = (int)rng.rint(3);    // 0..2
@@ -591,8 +616,9 @@ TEST_F(BooleanFuzzTest, randomBooleanMatchesOracle) {
       if (boolMatches(std::get<api::BooleanQuery>(rootQuery.kind), toks)) expected.insert(id);
     }
 
-    auto run = [&](bool disableFlatten) {
+    auto run = [&](bool disableFlatten, bool disableDisjGroupBulk) {
       ApproxFlattenGuard flattenGuard(disableFlatten);
+      DisjGroupBulkGuard disjGroupGuard(disableDisjGroupBulk);
       auto req = localReq(helper.getSearchEngine());
       req->collection("main");
       auto& cur = req->topDocs("q");
@@ -617,25 +643,29 @@ TEST_F(BooleanFuzzTest, randomBooleanMatchesOracle) {
         req->getMatchCount(), std::move(result)};
     };
 
-    auto nested = run(true);
-    auto flattened = run(false);
+    auto opaque = run(true, true);
+    auto groupBulk = run(true, false);
+    auto flattened = run(false, false);
 
-    if (expected != nested.second || nested != flattened
-        || nested.first != (int64_t) expected.size()) {
+    if (expected != opaque.second || opaque != groupBulk || groupBulk != flattened
+        || opaque.first != (int64_t) expected.size()) {
       std::string diff;
       for (const auto& [id, toks] : docs) {
         bool brute = expected.contains(id);
-        bool oldPath = nested.second.contains(id);
+        bool oldPath = opaque.second.contains(id);
+        bool groupPath = groupBulk.second.contains(id);
         bool flatPath = flattened.second.contains(id);
-        if (!brute && !oldPath && !flatPath) continue;
+        if (!brute && !oldPath && !groupPath && !flatPath) continue;
         diff += "  " + id + " [brute=" + (brute ? "Y" : "N")
             + " nested=" + (oldPath ? "Y" : "N")
+            + " group=" + (groupPath ? "Y" : "N")
             + " flat=" + (flatPath ? "Y" : "N") + "] toks:";
         for (const auto& t : toks) diff += " " + t;
         diff += "\n";
       }
       ADD_FAILURE() << "iter=" << iter << " bruteCount=" << expected.size()
-                    << " nestedCount=" << nested.first
+                    << " nestedCount=" << opaque.first
+                    << " groupCount=" << groupBulk.first
                     << " flatCount=" << flattened.first
                     << "\ndiff docs:\n" << diff << "query=\n" << querySummary(rootQuery);
       break;
