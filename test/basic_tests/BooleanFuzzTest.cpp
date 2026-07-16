@@ -4,6 +4,7 @@
 #include <array>
 #include <cmath>
 #include <map>
+#include <memory_resource>
 #include <set>
 #include <string>
 #include <utility>
@@ -22,6 +23,22 @@ using namespace solux::test;
 
 namespace api = solux::api;
 namespace build = solux::api::build;
+
+namespace {
+
+struct ApproxFlattenGuard {
+  bool saved = BooleanQuery::ConjunctionScorer::disableApproxFlattenForTests;
+
+  explicit ApproxFlattenGuard(bool disabled) {
+    BooleanQuery::ConjunctionScorer::disableApproxFlattenForTests = disabled;
+  }
+
+  ~ApproxFlattenGuard() {
+    BooleanQuery::ConjunctionScorer::disableApproxFlattenForTests = saved;
+  }
+};
+
+} // namespace
 
 // Randomized differential test for boolean matching. body_w uses identity
 // analysis for this vocabulary, so the oracle can evaluate raw tokens.
@@ -63,7 +80,7 @@ public:
   }
 
   api::Query genBool(std::pmr::memory_resource& mr, int depth) {
-    int nreq = (int)rng.rint(3);     // 0..2
+    int nreq = (int)rng.rint(4);     // 0..3
     int nopt = (int)rng.rint(4);     // 0..3
     int nproh = (int)rng.rint(3);    // 0..2
     int nfilter = (int)rng.rint(3);  // 0..2
@@ -566,41 +583,60 @@ TEST_F(BooleanFuzzTest, randomBooleanMatchesOracle) {
   }
 
   for (int iter = 0; iter < 300; iter++) {
-    auto req = localReq(helper.getSearchEngine());
-    req->collection("main");
-    auto& cur = req->topDocs("q");
-    cur.getNumber()
-       .limit(numDocs)          // return every match, not just a top page
-       .batchSize(numDocs + 1)  // in one response batch (we only read responses[0])
-       .fields({"id"});
-    api::Query rootQuery = genBool(cur.mr(), 2);
-    cur.rawQuery() = rootQuery;
+    std::pmr::monotonic_buffer_resource queryArena;
+    api::Query rootQuery = genBool(queryArena, 2);
 
     std::set<std::string> expected;
     for (const auto& [id, toks] : docs) {
       if (boolMatches(std::get<api::BooleanQuery>(rootQuery.kind), toks)) expected.insert(id);
     }
 
-    req->execute();
-    int64_t engineCount = req->getMatchCount();
-    std::set<std::string> got;
-    for (const auto& doc : req->getDocs()) {
-      const auto* v = find(doc, "id");
-      ASSERT_NE(v, nullptr);
-      got.insert(std::get<std::string>(*v));
-    }
+    auto run = [&](bool disableFlatten) {
+      ApproxFlattenGuard flattenGuard(disableFlatten);
+      auto req = localReq(helper.getSearchEngine());
+      req->collection("main");
+      auto& cur = req->topDocs("q");
+      cur.getNumber()
+         .limit(numDocs)
+         .batchSize(numDocs + 1)
+         .fields({"id"});
+      cur.rawQuery() = rootQuery;
+      req->execute();
+      EXPECT_TRUE(req->ok()) << req->errorMsg();
 
-    if (expected != got) {
+      std::set<std::string> result;
+      for (const auto& doc : req->getDocs()) {
+        const auto* v = find(doc, "id");
+        if (v == nullptr) {
+          ADD_FAILURE() << "missing id field";
+          continue;
+        }
+        result.insert(std::get<std::string>(*v));
+      }
+      return std::pair<int64_t, std::set<std::string>>{
+        req->getMatchCount(), std::move(result)};
+    };
+
+    auto nested = run(true);
+    auto flattened = run(false);
+
+    if (expected != nested.second || nested != flattened
+        || nested.first != (int64_t) expected.size()) {
       std::string diff;
       for (const auto& [id, toks] : docs) {
-        bool e = expected.count(id), g = got.count(id);
-        if (!e && !g) continue;
-        diff += "  " + id + " [oracle=" + (e ? "Y" : "N") + " engine=" + (g ? "Y" : "N") + "] toks:";
+        bool brute = expected.contains(id);
+        bool oldPath = nested.second.contains(id);
+        bool flatPath = flattened.second.contains(id);
+        if (!brute && !oldPath && !flatPath) continue;
+        diff += "  " + id + " [brute=" + (brute ? "Y" : "N")
+            + " nested=" + (oldPath ? "Y" : "N")
+            + " flat=" + (flatPath ? "Y" : "N") + "] toks:";
         for (const auto& t : toks) diff += " " + t;
         diff += "\n";
       }
-      ADD_FAILURE() << "iter=" << iter << " oracleCount=" << expected.size()
-                    << " engineCount=" << engineCount << " gotDocs=" << got.size()
+      ADD_FAILURE() << "iter=" << iter << " bruteCount=" << expected.size()
+                    << " nestedCount=" << nested.first
+                    << " flatCount=" << flattened.first
                     << "\ndiff docs:\n" << diff << "query=\n" << querySummary(rootQuery);
       break;
     }

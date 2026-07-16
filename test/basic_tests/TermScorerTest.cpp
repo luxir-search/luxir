@@ -2002,7 +2002,8 @@ Query::Scorer* createMsmScorer(MemPool& pool, std::span<Query::Weight*> weights,
   if (count < minMatch) return nullptr;
   std::span<Query::Scorer*> span(arr, (size_t) count);
   if (count == minMatch) {
-    return pool.make<BooleanQuery::ConjunctionScorer>(pool, span, span);
+    auto costs = pool.make_span<int64_t>((size_t) count);
+    return pool.make<BooleanQuery::ConjunctionScorer>(pool, span, costs, span);
   }
   if (wand) {
     return pool.make<BooleanQuery::MinShouldMatchWandScorer>(pool, span, minMatch);

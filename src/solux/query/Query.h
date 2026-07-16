@@ -7,6 +7,7 @@
 #include <memory>
 #include <span>
 #include <stdexcept>
+#include <utility>
 #include <vector>
 #include <solux/util/heap.h>
 #include "solux/api/solux_types.hpp"
@@ -583,8 +584,10 @@ public:
     /// Two-phase iteration contract: a consumer picks one protocol for a
     /// scorer lifetime. If hasTwoPhase() is true, consumers that opt in drive
     /// approximation*()+matches() only and never call next()/advance() on that
-    /// scorer. matches() confirms the current approximation doc and leaves
-    /// score state ready; it must be idempotent for the current doc, or the
+    /// scorer. A non-empty approximationEnums() exposes the distinct iterators
+    /// whose conjunction is the approximation; a consumer may drive them and
+    /// call matchesAt() only after all are on that doc. Verification leaves
+    /// score state ready and must be idempotent for the current doc, or the
     /// consumer must call it at most once per approximation doc. score() is only
     /// valid after a successful match.
     virtual bool hasTwoPhase() const {
@@ -599,8 +602,16 @@ public:
     virtual int32_t approximationDocId() {
       return docId();
     }
+    virtual std::span<DocsEnum*> approximationEnums() {
+      return {};
+    }
     virtual bool matches() {
       return true;
+    }
+    virtual bool matchesAt(int32_t doc) {
+      unused(doc);
+      assert(false);
+      std::unreachable();
     }
     virtual float matchCost() {
       return 0.0f;
