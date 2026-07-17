@@ -883,7 +883,8 @@ public:
           return nullptr;
         }
         return targetPool.make<BooleanQuery::MaxScoreBulkScorer>(
-          targetPool, optionalScorers, optionalCosts, segment.maxDoc(), aggregateClauseCost);
+          targetPool, optionalScorers, optionalCosts, segment.maxDoc(), aggregateClauseCost,
+          !needsScores);
       }
     };
 
@@ -2081,6 +2082,7 @@ public:
     };
 
     std::span<Query::Scorer*> scorers; // subset of required clauses that contributes to score()
+    std::span<Query::Scorer*> conjunctionClauses; // every direct required clause
     std::span<ApproxSlot> approximations; // every required clause, ascending cost (lead first)
     std::span<VerifierSlot> verifiers; // two-phase clauses sorted by matchCost
 
@@ -2276,7 +2278,7 @@ public:
     ConjunctionScorer(solux::MemPool& pool, std::span<Query::Scorer*> allScorers,
                       std::span<int64_t> allCosts,
                       std::span<Query::Scorer*> scoringScorers)
-            : scorers(scoringScorers) {
+            : scorers(scoringScorers), conjunctionClauses(allScorers) {
       assert(allScorers.size() == allCosts.size());
       auto flattened = pool.make_span<std::span<DocsEnum*>>(allScorers.size());
       size_t approximationCount = 0;
@@ -2354,6 +2356,13 @@ public:
       return score;
     }
 
+    std::span<Query::Scorer*> flatConjunctionScorers() override {
+      for (auto* scorer : conjunctionClauses) {
+        if (dynamic_cast<TermQuery::Scorer*>(scorer) == nullptr) return {};
+      }
+      return conjunctionClauses;
+    }
+
     void setMinCompetitiveScore(float minScore) override {
       // The threshold applies to the conjunction's SUM; children must not see
       // it (a child pruning on its own score alone would drop docs whose sum
@@ -2419,6 +2428,26 @@ public:
         }
       }
       windowBits[w] &= domainWord & validMask;
+    }
+  }
+
+  static void applyDocSetToWindow(std::span<uint64_t> windowBits,
+                                  int32_t windowStart, int32_t windowEnd,
+                                  DocSet* filter) {
+    int32_t innerSize = windowEnd - windowStart;
+    for (int32_t word = 0; word < (int32_t) windowBits.size(); word++) {
+      uint64_t bits = windowBits[(size_t) word];
+      while (bits != 0) {
+        int32_t bit = (int32_t) std::countr_zero(bits);
+        int32_t index = (word << 6) + bit;
+        if (index >= innerSize) {
+          break;
+        }
+        if (!filter->get(windowStart + index)) {
+          windowBits[(size_t) word] &= ~(1ULL << bit);
+        }
+        bits &= bits - 1;
+      }
     }
   }
 
@@ -3001,26 +3030,6 @@ public:
       return total;
     }
 
-    void applyDocSetFilterToWindow(DocSet* filter, int32_t windowBase,
-                                   int32_t windowEnd) {
-      int32_t innerSize = windowEnd - windowBase;
-      for (int32_t word = 0; word < kWindowWords; word++) {
-        uint64_t bits = windowBits[(size_t) word];
-        while (bits != 0) {
-          int32_t bit = (int32_t) std::countr_zero(bits);
-          int32_t index = (word << 6) + bit;
-          if (index >= innerSize) {
-            break;
-          }
-          int32_t doc = windowBase + index;
-          if (!filter->get(doc)) {
-            windowBits[(size_t) word] &= ~(1ULL << bit);
-          }
-          bits &= bits - 1;
-        }
-      }
-    }
-
     int32_t ratchetDenseWindow(int32_t min, int32_t max) {
       for (size_t c = 0; c < termClauses.size(); c++) {
         int32_t doc = termClauseDocId(c);
@@ -3111,7 +3120,7 @@ public:
         applyDomainBitsToWindow(windowBits, windowBase, windowEnd,
                                 &((BitDocSet*) filter)->bits());
       } else if (filter != nullptr) {
-        applyDocSetFilterToWindow(filter, windowBase, windowEnd);
+        applyDocSetToWindow(windowBits, windowBase, windowEnd, filter);
       }
 
       if (domainOut != nullptr) {
@@ -3881,6 +3890,10 @@ public:
 
 
   class MaxScoreBulkScorer final : public BulkScorer {
+  public:
+    static inline bool disableDisjConjBulkForTests = false;
+
+  private:
     constexpr static int32_t kWindowSize = DocsEnum::L1_DOCS;
     constexpr static int32_t kWindowWords = kWindowSize / 64;
     constexpr static size_t kBs1MinClauses = 16;
@@ -3894,6 +3907,10 @@ public:
     constexpr static int64_t W_BITSET = 32;
     constexpr static int64_t W_ARRAY = 28;
     static_assert((kWindowSize % 64) == 0);
+
+    struct CountClause {
+      std::span<Query::Scorer*> terms;
+    };
 
     std::span<Query::Scorer*> scorers;  // stable global-max order
     std::span<int64_t> clauseCosts;     // kept aligned with scorers
@@ -3918,6 +3935,10 @@ public:
     std::span<float> windowScores;
     std::span<int32_t> outDocs;
     std::span<float> outScores;
+    std::span<CountClause> countClauses;
+    std::span<Query::Scorer*> countTerms;
+    std::span<uint64_t> countClauseBits;
+    std::span<uint64_t> countTermBits;
 
     int32_t maxDoc;
     int64_t aggregateClauseCost;
@@ -3939,6 +3960,60 @@ public:
     float minCompetitiveScore = std::numeric_limits<float>::lowest();
     float nextPartitionMcs = std::numeric_limits<float>::infinity();
     double scoreBoundFactor = 1.0;
+    bool disjConjCountPath = false;
+
+    // Exact unscored count decomposition is all-or-nothing. Any opaque or
+    // non-term member leaves the existing top-level scorer path in control.
+    void configureDisjConjCount(solux::MemPool& pool, bool enable) {
+      if (!enable || disableDisjConjBulkForTests) {
+        return;
+      }
+
+      size_t termCount = 0;
+      bool hasConjunction = false;
+      for (auto* scorer : scorers) {
+        if (dynamic_cast<TermQuery::Scorer*>(scorer) != nullptr) {
+          termCount++;
+          continue;
+        }
+        auto terms = scorer->flatConjunctionScorers();
+        if (terms.empty()) {
+          return;
+        }
+        for (auto* term : terms) {
+          if (dynamic_cast<TermQuery::Scorer*>(term) == nullptr) {
+            return;
+          }
+        }
+        termCount += terms.size();
+        hasConjunction = true;
+      }
+      if (!hasConjunction) {
+        return;
+      }
+
+      countClauses = pool.make_span<CountClause>(scorers.size());
+      countTerms = pool.make_span<Query::Scorer*>(termCount);
+      size_t termIndex = 0;
+      for (size_t i = 0; i < scorers.size(); i++) {
+        auto* scorer = scorers[i];
+        auto terms = scorer->flatConjunctionScorers();
+        if (terms.empty()) {
+          countTerms[termIndex] = scorer;
+          countClauses[i].terms = countTerms.subspan(termIndex, 1);
+          termIndex++;
+          continue;
+        }
+        for (auto* term : terms) {
+          countTerms[termIndex++] = term;
+        }
+        countClauses[i].terms = countTerms.subspan(termIndex - terms.size(), terms.size());
+      }
+      assert(termIndex == countTerms.size());
+      countClauseBits = pool.make_span<uint64_t>((size_t) kWindowWords);
+      countTermBits = pool.make_span<uint64_t>((size_t) kWindowWords);
+      disjConjCountPath = true;
+    }
 
     static bool lessMaxScore(float a, float b) {
       bool finiteA = std::isfinite(a);
@@ -4243,6 +4318,52 @@ public:
 
     void clearWindowBits() {
       std::fill(windowBits.begin(), windowBits.end(), 0);
+    }
+
+    static void clearCountBits(std::span<uint64_t> bits) {
+      std::fill(bits.begin(), bits.end(), 0);
+    }
+
+    void fillDisjConjCountBits() {
+      clearWindowBits();
+      for (auto& clause : countClauses) {
+        if (clause.terms.size() == 1) {
+          clause.terms[0]->fillWindowBits(windowBits, windowStart, windowEnd);
+          continue;
+        }
+
+        clearCountBits(countClauseBits);
+        clause.terms[0]->fillWindowBits(countClauseBits, windowStart, windowEnd);
+        for (size_t term = 1; term < clause.terms.size(); term++) {
+          clearCountBits(countTermBits);
+          clause.terms[term]->fillWindowBits(countTermBits, windowStart, windowEnd);
+          for (size_t word = 0; word < countClauseBits.size(); word++) {
+            countClauseBits[word] &= countTermBits[word];
+          }
+        }
+        for (size_t word = 0; word < windowBits.size(); word++) {
+          windowBits[word] |= countClauseBits[word];
+        }
+      }
+    }
+
+    int32_t countDisjConjWindow(int64_t& count, DocSetBuilder* domainOut,
+                                DocSet* filter, int32_t min, int32_t max) {
+      setWindowBounds(min, max);
+      skipCount(SkipStats::disjConjGroupCountWindows);
+      fillDisjConjCountBits();
+      if (filter != nullptr && filter->type == DocSet::BITSET) {
+        applyDomainBits(&((BitDocSet*) filter)->bits());
+      } else if (filter != nullptr) {
+        applyDocSetToWindow(windowBits, windowStart, windowEnd, filter);
+      }
+      if (domainOut != nullptr) {
+        domainOut->addWindowWords(windowBits.data(), windowStart, windowEnd);
+      }
+      for (uint64_t bits : windowBits) {
+        count += std::popcount(bits);
+      }
+      return windowEnd >= max ? PostingsReader::END : windowEnd;
     }
 
     void setWindowBit(int32_t index) {
@@ -4678,7 +4799,8 @@ public:
     // The passed in span of scorers will be modified (rearranged).
     MaxScoreBulkScorer(solux::MemPool& pool, std::span<Query::Scorer*> scorers,
                        std::span<int64_t> clauseCosts,
-                       int32_t maxDoc, int64_t aggregateClauseCost)
+                       int32_t maxDoc, int64_t aggregateClauseCost,
+                       bool enableDisjConjCount)
             : scorers(scorers),
               clauseCosts(clauseCosts),
               clauseMax(pool.make_arr<float>(scorers.size()), scorers.size()),
@@ -4704,6 +4826,7 @@ public:
       for (size_t i = 0; i < scorers.size(); i++) {
         windowOrder[i] = (int32_t) i;
       }
+      configureDisjConjCount(pool, enableDisjConjCount);
     }
 
     int32_t scoreNextWindow(ScoreWindow& out, DocSet* filter, int32_t min, int32_t max,
@@ -4826,6 +4949,9 @@ public:
           }
         });
         return windowEnd >= max ? PostingsReader::END : windowEnd;
+      }
+      if (disjConjCountPath) {
+        return countDisjConjWindow(count, domainOut, filter, min, max);
       }
 
       const FixedBitSet* domainBits = nullptr;

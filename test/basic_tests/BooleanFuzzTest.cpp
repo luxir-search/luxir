@@ -50,6 +50,18 @@ struct DisjGroupBulkGuard {
   }
 };
 
+struct DisjConjBulkGuard {
+  bool saved = BooleanQuery::MaxScoreBulkScorer::disableDisjConjBulkForTests;
+
+  explicit DisjConjBulkGuard(bool disabled) {
+    BooleanQuery::MaxScoreBulkScorer::disableDisjConjBulkForTests = disabled;
+  }
+
+  ~DisjConjBulkGuard() {
+    BooleanQuery::MaxScoreBulkScorer::disableDisjConjBulkForTests = saved;
+  }
+};
+
 struct NotTwoPhaseGuard {
   bool saved = BooleanQuery::MandNotScorer::disableNotTwoPhaseForTests;
 
@@ -130,16 +142,21 @@ public:
   api::Query genBool(std::pmr::memory_resource& mr, int depth) {
     if (depth > 0 && rng.rint(5) == 0) {
       int groupCount = (int) rng.rint(2, 4);
-      std::vector<api::Query> required;
+      bool disjunctionOfConjunctions = rng.rint(2) != 0;
+      std::vector<api::Query> groups;
       for (int group = 0; group < groupCount; group++) {
         int termCount = (int) rng.rint(2, 4);
         std::vector<api::Query> terms;
         for (int term = 0; term < termCount; term++) {
           terms.push_back(qb::match(mr, "body_w", randTerm()));
         }
-        required.push_back(qb::boolean(mr, {}, terms));
+        groups.push_back(disjunctionOfConjunctions
+            ? qb::boolean(mr, terms)
+            : qb::boolean(mr, {}, terms));
       }
-      return qb::boolean(mr, required);
+      return disjunctionOfConjunctions
+          ? qb::boolean(mr, {}, groups)
+          : qb::boolean(mr, groups);
     }
     int nreq = (int)rng.rint(4);     // 0..3
     int nopt = (int)rng.rint(4);     // 0..3
@@ -655,9 +672,11 @@ TEST_F(BooleanFuzzTest, randomBooleanMatchesOracle) {
     auto run = [&](bool disableFlatten, bool disableDisjGroupBulk,
                    bool disableNotTwoPhase = false,
                    bool disableDisjTwoPhase = false,
-                   bool disableOptionalDrop = false) {
+                   bool disableOptionalDrop = false,
+                   bool disableDisjConjBulk = false) {
       ApproxFlattenGuard flattenGuard(disableFlatten);
       DisjGroupBulkGuard disjGroupGuard(disableDisjGroupBulk);
+      DisjConjBulkGuard disjConjGuard(disableDisjConjBulk);
       NotTwoPhaseGuard notGuard(disableNotTwoPhase);
       DisjTwoPhaseGuard disjGuard(disableDisjTwoPhase);
       UnscoredOptionalDropGuard optionalDropGuard(disableOptionalDrop);
@@ -688,12 +707,13 @@ TEST_F(BooleanFuzzTest, randomBooleanMatchesOracle) {
     auto opaque = run(true, true);
     auto groupBulk = run(true, false);
     auto flattened = run(false, false);
+    auto disjConjOpaque = run(false, false, false, false, false, true);
     auto eagerNot = run(false, false, true);
     auto eagerDisj = run(false, false, false, true);
     auto retainedOptionals = run(false, false, false, false, true);
 
     if (expected != opaque.second || opaque != groupBulk || groupBulk != flattened
-        || flattened != eagerNot || flattened != eagerDisj
+        || flattened != disjConjOpaque || flattened != eagerNot || flattened != eagerDisj
         || flattened != retainedOptionals
         || opaque.first != (int64_t) expected.size()) {
       std::string diff;
@@ -702,15 +722,18 @@ TEST_F(BooleanFuzzTest, randomBooleanMatchesOracle) {
         bool oldPath = opaque.second.contains(id);
         bool groupPath = groupBulk.second.contains(id);
         bool flatPath = flattened.second.contains(id);
+        bool disjConjOpaquePath = disjConjOpaque.second.contains(id);
         bool eagerNotPath = eagerNot.second.contains(id);
         bool eagerDisjPath = eagerDisj.second.contains(id);
         bool retainedOptionalsPath = retainedOptionals.second.contains(id);
         if (!brute && !oldPath && !groupPath && !flatPath
-            && !eagerNotPath && !eagerDisjPath && !retainedOptionalsPath) continue;
+            && !disjConjOpaquePath && !eagerNotPath && !eagerDisjPath
+            && !retainedOptionalsPath) continue;
         diff += "  " + id + " [brute=" + (brute ? "Y" : "N")
             + " nested=" + (oldPath ? "Y" : "N")
             + " group=" + (groupPath ? "Y" : "N")
             + " flat=" + (flatPath ? "Y" : "N")
+            + " disj_conj_opaque=" + (disjConjOpaquePath ? "Y" : "N")
             + " eager_not=" + (eagerNotPath ? "Y" : "N")
             + " eager_disj=" + (eagerDisjPath ? "Y" : "N")
             + " retained_opt=" + (retainedOptionalsPath ? "Y" : "N") + "] toks:";
@@ -721,6 +744,7 @@ TEST_F(BooleanFuzzTest, randomBooleanMatchesOracle) {
                     << " nestedCount=" << opaque.first
                     << " groupCount=" << groupBulk.first
                     << " flatCount=" << flattened.first
+                    << " disjConjOpaqueCount=" << disjConjOpaque.first
                     << " eagerNotCount=" << eagerNot.first
                     << " eagerDisjCount=" << eagerDisj.first
                     << " retainedOptCount=" << retainedOptionals.first

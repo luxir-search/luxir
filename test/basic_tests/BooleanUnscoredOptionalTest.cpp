@@ -48,6 +48,18 @@ struct SkipStatsGuard {
   }
 };
 
+struct DisjConjBulkGuard {
+  bool saved = BooleanQuery::MaxScoreBulkScorer::disableDisjConjBulkForTests;
+
+  explicit DisjConjBulkGuard(bool disabled) {
+    BooleanQuery::MaxScoreBulkScorer::disableDisjConjBulkForTests = disabled;
+  }
+
+  ~DisjConjBulkGuard() {
+    BooleanQuery::MaxScoreBulkScorer::disableDisjConjBulkForTests = saved;
+  }
+};
+
 } // namespace
 
 class BooleanUnscoredOptionalTest : public SoluxTest {
@@ -59,6 +71,19 @@ public:
     FILTERED,
     PURE_DISJUNCTION,
     MIN_SHOULD_MATCH,
+    DISJ_CONJ_GROUPS,
+    DISJ_TERM_CONJ,
+    DISJ_CONJ_ABSENT,
+    DISJ_CONJ_PHRASE,
+  };
+
+  struct CountRun {
+    int64_t count = 0;
+    int64_t groupWindows = 0;
+  };
+
+  struct DomainRun : CountRun {
+    std::vector<int32_t> docs;
   };
 
   struct ScoredRun {
@@ -78,6 +103,11 @@ public:
     auto disjunction = [&] {
       return qb::boolean(mr, {}, {term("a"), term("b")});
     };
+    auto conjunction = [&](std::initializer_list<std::string_view> terms) {
+      std::vector<api::Query> required;
+      for (auto value : terms) required.push_back(term(value));
+      return qb::boolean(mr, required);
+    };
 
     switch (shape) {
       case Shape::REQUIRED_DISJUNCTION:
@@ -93,6 +123,19 @@ public:
         return qb::boolean(mr, {}, {term("a"), term("b"), term("c")});
       case Shape::MIN_SHOULD_MATCH:
         return qb::boolean(mr, {term("a")}, {term("b"), term("c")}, {}, {}, 1);
+      case Shape::DISJ_CONJ_GROUPS:
+        return qb::boolean(mr, {}, {conjunction({"a", "b"}),
+                                    conjunction({"c", "d"})});
+      case Shape::DISJ_TERM_CONJ:
+        return qb::boolean(mr, {}, {term("e"), conjunction({"a", "b"}),
+                                    conjunction({"c", "d"})});
+      case Shape::DISJ_CONJ_ABSENT:
+        return qb::boolean(mr, {}, {conjunction({"a", "missing"}),
+                                    conjunction({"a", "c"}),
+                                    conjunction({"c", "d"})});
+      case Shape::DISJ_CONJ_PHRASE:
+        return qb::boolean(mr, {}, {conjunction({"a", "b"}), term("e"),
+                                    qb::phraseWords(mr, "body_w", {"c", "d"})});
     }
     throw std::runtime_error("unknown test shape");
   }
@@ -107,6 +150,72 @@ public:
     req->execute(false);
     EXPECT_TRUE(req->ok()) << req->errorMsg();
     return req->getMatchCount();
+  }
+
+  CountRun runDisjConjCount(Shape shape, bool disabled) {
+    DisjConjBulkGuard bulkGuard(disabled);
+    SkipStatsGuard stats;
+    auto req = localReq(helper.getSearchEngine());
+    req->collection("main");
+    auto& cursor = req->topDocs("q");
+    cursor.getNumber().limit(0);
+    cursor.rawQuery() = makeQuery(cursor, shape);
+    req->execute(false);
+    EXPECT_TRUE(req->ok()) << req->errorMsg();
+    return {req->getMatchCount(), SkipStats::disjConjGroupCountWindows};
+  }
+
+  DomainRun runFilteredDisjConjCount(bool disabled) {
+    DisjConjBulkGuard bulkGuard(disabled);
+    SkipStatsGuard stats;
+    auto reader = helper.getIndexWriter()->getIndexReader();
+    MemPool pool;
+    Query::Context context(pool, *reader);
+    auto& segment = context.topReader.segments()[0];
+
+    TermQuery a("body_w", "a");
+    TermQuery b("body_w", "b");
+    TermQuery c("body_w", "c");
+    TermQuery d("body_w", "d");
+    Query* abTerms[] = {&a, &b};
+    Query* cdTerms[] = {&c, &d};
+    BooleanQuery ab(abTerms, {}, {}, {});
+    BooleanQuery cd(cdTerms, {}, {}, {});
+    Query* groups[] = {&ab, &cd};
+    BooleanQuery query({}, groups, {}, {});
+
+    auto* weight = query.createWeight(context, 0);
+    auto* supplier = weight->scorerSupplier(pool, segment);
+    EXPECT_NE(supplier, nullptr);
+    if (supplier == nullptr) return {};
+    auto* bulk = supplier->bulkScorer(pool);
+    EXPECT_NE(bulk, nullptr);
+    if (bulk == nullptr) return {};
+
+    RAMBitDocSet filter(segment.maxDoc());
+    for (int32_t doc = 0; doc < segment.maxDoc(); doc += 2) {
+      filter.mutableBits().set(doc);
+    }
+    DocSetBuilder builder(segment.maxDoc());
+    int64_t count = 0;
+    for (int32_t cursor = 0; cursor < segment.maxDoc();) {
+      int32_t next = bulk->countNextWindow(
+          count, &builder, &filter, cursor, segment.maxDoc());
+      if (next == PostingsReader::END) break;
+      EXPECT_GT(next, cursor);
+      if (next <= cursor) break;
+      cursor = next;
+    }
+
+    auto domain = builder.build();
+    DomainRun result;
+    result.count = count;
+    result.groupWindows = SkipStats::disjConjGroupCountWindows;
+    for (int32_t doc = 0; doc < segment.maxDoc(); doc++) {
+      if (domain->get(doc)) result.docs.push_back(doc);
+    }
+    EXPECT_EQ(result.count, domain->card());
+    return result;
   }
 
   std::map<std::string, int64_t> runFacet(Shape shape, bool disableDrop) {
@@ -209,6 +318,43 @@ TEST_F(BooleanUnscoredOptionalTest, requiredDisjunctionCountUsesBulkUnion) {
   SkipStatsGuard stats;
   EXPECT_EQ(7, runCount(Shape::REQUIRED_DISJUNCTION, false));
   EXPECT_GT(SkipStats::countBulkFillCalls, 0);
+}
+
+TEST_F(BooleanUnscoredOptionalTest, disjunctionConjunctionBulkCountMatchesOpaque) {
+  struct Case {
+    Shape shape;
+    int64_t expected;
+    bool eligible;
+  };
+  const std::array cases = {
+    Case{Shape::DISJ_CONJ_GROUPS, 2, true},
+    Case{Shape::DISJ_TERM_CONJ, 5, true},
+    Case{Shape::DISJ_CONJ_ABSENT, 4, true},
+    Case{Shape::DISJ_CONJ_PHRASE, 5, false},
+  };
+
+  for (const auto& testCase : cases) {
+    CountRun opaque = runDisjConjCount(testCase.shape, true);
+    CountRun bulk = runDisjConjCount(testCase.shape, false);
+    EXPECT_EQ(testCase.expected, opaque.count) << (int) testCase.shape;
+    EXPECT_EQ(opaque.count, bulk.count) << (int) testCase.shape;
+    EXPECT_EQ(0, opaque.groupWindows) << (int) testCase.shape;
+    if (testCase.eligible) {
+      EXPECT_GT(bulk.groupWindows, 0) << (int) testCase.shape;
+    } else {
+      EXPECT_EQ(0, bulk.groupWindows) << (int) testCase.shape;
+    }
+  }
+}
+
+TEST_F(BooleanUnscoredOptionalTest, disjunctionConjunctionBulkRespectsFilterAndDomainOut) {
+  DomainRun opaque = runFilteredDisjConjCount(true);
+  DomainRun bulk = runFilteredDisjConjCount(false);
+  EXPECT_EQ(1, opaque.count);
+  EXPECT_EQ(opaque.count, bulk.count);
+  EXPECT_EQ(opaque.docs, bulk.docs);
+  EXPECT_EQ(0, opaque.groupWindows);
+  EXPECT_GT(bulk.groupWindows, 0);
 }
 
 TEST_F(BooleanUnscoredOptionalTest, scoredTopKAndTopKCountAreUnchanged) {
