@@ -887,6 +887,28 @@ public:
       }
     };
 
+    static Query::ScorerSupplier* makeSupplier(
+        MemPool& targetPool,
+        IndexReader::Segment& segment,
+        std::span<Query::SegmentSource* const> mandatorySources,
+        std::span<Query::SegmentSource* const> optionalSources,
+        std::span<Query::SegmentSource* const> prohibitedSources,
+        std::span<Query::ScorerSupplier* const> filterSuppliers,
+        int minShouldMatch,
+        bool needsScores) {
+      // Weight-time optional removal can expose a Boolean child that
+      // normalization could not unwrap while the optionals were still present.
+      // Preserve the child's complete supplier contract, including bulkScorer.
+      if (minShouldMatch < 1 && mandatorySources.size() == 1 && optionalSources.empty()
+          && prohibitedSources.empty() && filterSuppliers.empty()) {
+        auto* child = mandatorySources[0]->scorerSupplier(targetPool, segment);
+        if (child != nullptr) return child;
+      }
+      return targetPool.make<Supplier>(
+        targetPool, segment, mandatorySources, optionalSources,
+        prohibitedSources, filterSuppliers, minShouldMatch, needsScores);
+    }
+
     class BooleanPreparedWeight final : public Query::Weight::PreparedWeight {
       std::vector<QueryPrep::PreparedSource> mandatorySources;
       std::vector<QueryPrep::PreparedSource> optionalSources;
@@ -916,7 +938,7 @@ public:
           filterSuppliers = {targetPool.make_arr<Query::ScorerSupplier*>(1), 1};
           filterSuppliers[0] = targetPool.make<QueryPrep::DocSetSupplier>(filterDomain, segment);
         }
-        return targetPool.make<BooleanQuery::Weight::Supplier>(
+        return makeSupplier(
           targetPool, segment,
           QueryPrep::segmentSources(targetPool, QueryPrep::preparedSpan(mandatorySources)),
           QueryPrep::segmentSources(targetPool, QueryPrep::preparedSpan(optionalSources)),
@@ -938,6 +960,8 @@ public:
 
 
   public:
+    static inline bool disableUnscoredOptionalDropForTests = false;
+
     Weight(Context& context, NormalizedBoolean& query, int32_t flags, float multiplier)
       : Query::Weight(context, flags) {
       needsScores = (flags & Query::NEED_SCORES) != 0;
@@ -959,7 +983,7 @@ public:
       // "+a b" count-only requests to the single-clause count() shortcut.
       // minShouldMatch >= 1 makes the optional group a membership constraint
       // even under a mandatory clause, so it must be kept.
-      bool dropOptional = !needsScores
+      bool dropOptional = !disableUnscoredOptionalDropForTests && !needsScores
         && (!mandatoryClauses.empty() || !filterClauses.empty())
         && query.minShouldMatch < 1;
       optionalWeights = dropOptional
@@ -1049,8 +1073,8 @@ public:
       auto prohibitedSources = QueryPrep::liveSources(targetPool, prohibitedWeights);
       auto filterSources = QueryPrep::liveSources(targetPool, filterWeights);
       auto filterSuppliers = QueryPrep::collectSuppliers(targetPool, segment, filterSources);
-      return targetPool.make<Supplier>(targetPool, segment, mandatorySources, optionalSources,
-                                       prohibitedSources, filterSuppliers, minShouldMatch, needsScores);
+      return makeSupplier(targetPool, segment, mandatorySources, optionalSources,
+                          prohibitedSources, filterSuppliers, minShouldMatch, needsScores);
     }
 
     Scorer* createScorer(solux::MemPool& targetPool, solux::IndexReader::Segment& segment) override {

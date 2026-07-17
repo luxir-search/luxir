@@ -74,6 +74,18 @@ struct DisjTwoPhaseGuard {
   }
 };
 
+struct UnscoredOptionalDropGuard {
+  bool saved = BooleanQuery::Weight::disableUnscoredOptionalDropForTests;
+
+  explicit UnscoredOptionalDropGuard(bool disabled) {
+    BooleanQuery::Weight::disableUnscoredOptionalDropForTests = disabled;
+  }
+
+  ~UnscoredOptionalDropGuard() {
+    BooleanQuery::Weight::disableUnscoredOptionalDropForTests = saved;
+  }
+};
+
 } // namespace
 
 // Randomized differential test for boolean matching. body_w uses identity
@@ -642,11 +654,13 @@ TEST_F(BooleanFuzzTest, randomBooleanMatchesOracle) {
 
     auto run = [&](bool disableFlatten, bool disableDisjGroupBulk,
                    bool disableNotTwoPhase = false,
-                   bool disableDisjTwoPhase = false) {
+                   bool disableDisjTwoPhase = false,
+                   bool disableOptionalDrop = false) {
       ApproxFlattenGuard flattenGuard(disableFlatten);
       DisjGroupBulkGuard disjGroupGuard(disableDisjGroupBulk);
       NotTwoPhaseGuard notGuard(disableNotTwoPhase);
       DisjTwoPhaseGuard disjGuard(disableDisjTwoPhase);
+      UnscoredOptionalDropGuard optionalDropGuard(disableOptionalDrop);
       auto req = localReq(helper.getSearchEngine());
       req->collection("main");
       auto& cur = req->topDocs("q");
@@ -676,9 +690,11 @@ TEST_F(BooleanFuzzTest, randomBooleanMatchesOracle) {
     auto flattened = run(false, false);
     auto eagerNot = run(false, false, true);
     auto eagerDisj = run(false, false, false, true);
+    auto retainedOptionals = run(false, false, false, false, true);
 
     if (expected != opaque.second || opaque != groupBulk || groupBulk != flattened
         || flattened != eagerNot || flattened != eagerDisj
+        || flattened != retainedOptionals
         || opaque.first != (int64_t) expected.size()) {
       std::string diff;
       for (const auto& [id, toks] : docs) {
@@ -688,14 +704,16 @@ TEST_F(BooleanFuzzTest, randomBooleanMatchesOracle) {
         bool flatPath = flattened.second.contains(id);
         bool eagerNotPath = eagerNot.second.contains(id);
         bool eagerDisjPath = eagerDisj.second.contains(id);
+        bool retainedOptionalsPath = retainedOptionals.second.contains(id);
         if (!brute && !oldPath && !groupPath && !flatPath
-            && !eagerNotPath && !eagerDisjPath) continue;
+            && !eagerNotPath && !eagerDisjPath && !retainedOptionalsPath) continue;
         diff += "  " + id + " [brute=" + (brute ? "Y" : "N")
             + " nested=" + (oldPath ? "Y" : "N")
             + " group=" + (groupPath ? "Y" : "N")
             + " flat=" + (flatPath ? "Y" : "N")
             + " eager_not=" + (eagerNotPath ? "Y" : "N")
-            + " eager_disj=" + (eagerDisjPath ? "Y" : "N") + "] toks:";
+            + " eager_disj=" + (eagerDisjPath ? "Y" : "N")
+            + " retained_opt=" + (retainedOptionalsPath ? "Y" : "N") + "] toks:";
         for (const auto& t : toks) diff += " " + t;
         diff += "\n";
       }
@@ -705,6 +723,7 @@ TEST_F(BooleanFuzzTest, randomBooleanMatchesOracle) {
                     << " flatCount=" << flattened.first
                     << " eagerNotCount=" << eagerNot.first
                     << " eagerDisjCount=" << eagerDisj.first
+                    << " retainedOptCount=" << retainedOptionals.first
                     << "\ndiff docs:\n" << diff << "query=\n" << querySummary(rootQuery);
       break;
     }
@@ -836,7 +855,8 @@ TEST_F(BooleanFuzzTest, explicitFlatteningTransformsMatchOracleAndTwin) {
                                            std::move(twinScores)};
     };
 
-    auto runNoScores = [&](bool prepared) {
+    auto runNoScores = [&](bool prepared, bool disableOptionalDrop) {
+      UnscoredOptionalDropGuard optionalDropGuard(disableOptionalDrop);
       auto req = localReq(helper.getSearchEngine());
       req->collection("main");
       auto& nestedCursor = req->topDocs("nested");
@@ -864,9 +884,14 @@ TEST_F(BooleanFuzzTest, explicitFlatteningTransformsMatchOracleAndTwin) {
                      "live vs prepared nested");
     expectScoresNear(liveScores.second, preparedScores.second, spec,
                      "live vs prepared twin");
-    auto liveCounts = runNoScores(false);
-    auto preparedCounts = runNoScores(true);
+    auto liveCounts = runNoScores(false, false);
+    auto preparedCounts = runNoScores(true, false);
+    auto retainedLiveCounts = runNoScores(false, true);
+    auto retainedPreparedCounts = runNoScores(true, true);
     EXPECT_EQ(liveCounts, preparedCounts) << "count live/prepared kind=" << spec.kind;
+    EXPECT_EQ(liveCounts, retainedLiveCounts) << "count reduced/retained live kind=" << spec.kind;
+    EXPECT_EQ(liveCounts, retainedPreparedCounts)
+      << "count reduced/retained prepared kind=" << spec.kind;
   }
 }
 
