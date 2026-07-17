@@ -62,6 +62,18 @@ struct NotTwoPhaseGuard {
   }
 };
 
+struct DisjTwoPhaseGuard {
+  bool saved = BooleanQuery::DisjunctionScorer::disableDisjTwoPhaseForTests;
+
+  explicit DisjTwoPhaseGuard(bool disabled) {
+    BooleanQuery::DisjunctionScorer::disableDisjTwoPhaseForTests = disabled;
+  }
+
+  ~DisjTwoPhaseGuard() {
+    BooleanQuery::DisjunctionScorer::disableDisjTwoPhaseForTests = saved;
+  }
+};
+
 } // namespace
 
 // Randomized differential test for boolean matching. body_w uses identity
@@ -629,10 +641,12 @@ TEST_F(BooleanFuzzTest, randomBooleanMatchesOracle) {
     }
 
     auto run = [&](bool disableFlatten, bool disableDisjGroupBulk,
-                   bool disableNotTwoPhase = false) {
+                   bool disableNotTwoPhase = false,
+                   bool disableDisjTwoPhase = false) {
       ApproxFlattenGuard flattenGuard(disableFlatten);
       DisjGroupBulkGuard disjGroupGuard(disableDisjGroupBulk);
       NotTwoPhaseGuard notGuard(disableNotTwoPhase);
+      DisjTwoPhaseGuard disjGuard(disableDisjTwoPhase);
       auto req = localReq(helper.getSearchEngine());
       req->collection("main");
       auto& cur = req->topDocs("q");
@@ -661,9 +675,11 @@ TEST_F(BooleanFuzzTest, randomBooleanMatchesOracle) {
     auto groupBulk = run(true, false);
     auto flattened = run(false, false);
     auto eagerNot = run(false, false, true);
+    auto eagerDisj = run(false, false, false, true);
 
     if (expected != opaque.second || opaque != groupBulk || groupBulk != flattened
-        || flattened != eagerNot || opaque.first != (int64_t) expected.size()) {
+        || flattened != eagerNot || flattened != eagerDisj
+        || opaque.first != (int64_t) expected.size()) {
       std::string diff;
       for (const auto& [id, toks] : docs) {
         bool brute = expected.contains(id);
@@ -671,12 +687,15 @@ TEST_F(BooleanFuzzTest, randomBooleanMatchesOracle) {
         bool groupPath = groupBulk.second.contains(id);
         bool flatPath = flattened.second.contains(id);
         bool eagerNotPath = eagerNot.second.contains(id);
-        if (!brute && !oldPath && !groupPath && !flatPath && !eagerNotPath) continue;
+        bool eagerDisjPath = eagerDisj.second.contains(id);
+        if (!brute && !oldPath && !groupPath && !flatPath
+            && !eagerNotPath && !eagerDisjPath) continue;
         diff += "  " + id + " [brute=" + (brute ? "Y" : "N")
             + " nested=" + (oldPath ? "Y" : "N")
             + " group=" + (groupPath ? "Y" : "N")
             + " flat=" + (flatPath ? "Y" : "N")
-            + " eager_not=" + (eagerNotPath ? "Y" : "N") + "] toks:";
+            + " eager_not=" + (eagerNotPath ? "Y" : "N")
+            + " eager_disj=" + (eagerDisjPath ? "Y" : "N") + "] toks:";
         for (const auto& t : toks) diff += " " + t;
         diff += "\n";
       }
@@ -685,6 +704,7 @@ TEST_F(BooleanFuzzTest, randomBooleanMatchesOracle) {
                     << " groupCount=" << groupBulk.first
                     << " flatCount=" << flattened.first
                     << " eagerNotCount=" << eagerNot.first
+                    << " eagerDisjCount=" << eagerDisj.first
                     << "\ndiff docs:\n" << diff << "query=\n" << querySummary(rootQuery);
       break;
     }

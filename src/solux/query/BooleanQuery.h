@@ -410,13 +410,6 @@ public:
     int minShouldMatch = 0;
     bool needsScores = false;
 
-    static bool allTermScorers(std::span<Query::Scorer*> scorers) {
-      for (auto* scorer : scorers) {
-        if (dynamic_cast<TermQuery::Scorer*>(scorer) == nullptr) return false;
-      }
-      return true;
-    }
-
     static bool lessMaxScore(float a, float b) {
       bool finiteA = std::isfinite(a);
       bool finiteB = std::isfinite(b);
@@ -425,7 +418,7 @@ public:
     }
 
     // Match MaxScoreDisjunctionScorer's stable score order when an externally
-    // driven flat term union uses the plain heap scorer instead.
+    // driven disjunction uses the plain heap scorer instead.
     static void sortByMaxScore(MemPool& targetPool,
                                std::span<Query::Scorer*> scorers) {
       auto bounds = targetPool.make_span<float>(scorers.size());
@@ -571,16 +564,15 @@ public:
       Query::Scorer* optScorer = nullptr;
       if (!optionalScorers.empty()) {
         int optCount = (int)optionalScorers.size();
-        bool plainExternalTermDisjunction = externallyDriven && needsScores
+        bool plainExternalDisjunction = externallyDriven && needsScores
           && reqScorer == nullptr && prohibitedSources.empty()
-          && minShouldMatch <= 1 && optCount >= 2
-          && allTermScorers(optionalScorers);
-        if (plainExternalTermDisjunction) {
+          && minShouldMatch <= 1 && optCount >= 2;
+        if (plainExternalDisjunction) {
           sortByMaxScore(targetPool, optionalScorers);
         }
         bool useMaxScoreDisjunction = needsScores && reqScorer == nullptr
           && prohibitedSources.empty() && minShouldMatch <= 1 && optCount >= 2
-          && !plainExternalTermDisjunction;
+          && !plainExternalDisjunction;
         // minShouldMatch applies to optional scorers that exist in this segment.
         if (minShouldMatch <= 1) {
           if (optCount == 1) {
@@ -3252,30 +3244,100 @@ public:
 
 
   class DisjunctionScorer final : public Query::Scorer {
-    std::span<Scorer*> clauses;  // stable decomposition and score order
-    std::span<Scorer*> scorers;
+    struct ApproxSlot {
+      Scorer* scorer = nullptr;
+      bool twoPhase = false;
+
+      int32_t next() const {
+        return twoPhase ? scorer->approximationNext() : scorer->next();
+      }
+
+      int32_t advance(int32_t target) const {
+        return twoPhase ? scorer->approximationAdvance(target) : scorer->advance(target);
+      }
+
+      int32_t docId() const {
+        return twoPhase ? scorer->approximationDocId() : scorer->docId();
+      }
+
+      float matchCost() const {
+        return twoPhase ? scorer->matchCost() : 0.0f;
+      }
+    };
+
+    std::span<Scorer*> clauses;  // stable decomposition order
+    std::span<ApproxSlot> members;  // stable score order and protocol latches
+    std::span<ApproxSlot*> heap;
+    std::span<ApproxSlot*> verificationOrder;
 
     // TODO: OPT: heapifying with virtual methods prob isn't a good idea... pull out and save the docid.
-    constexpr static auto idComparator = [](Query::Scorer& a, Query::Scorer& b) { return b.docId() < a.docId(); };
+    constexpr static auto idComparator = [](ApproxSlot& a, ApproxSlot& b) {
+      return b.docId() < a.docId();
+    };
 
-    solux::IndirectPQ<Scorer, decltype(idComparator)> pq;
+    solux::IndirectPQ<ApproxSlot, decltype(idComparator)> pq;
 
     int32_t docid = -1;
+    // Scorers expose no approximation cost for a weighted estimate.
+    float verificationCost = 0.0f;
+    bool anyTwoPhase = false;
 
-    static std::span<Scorer*> copyScorers(solux::MemPool& pool,
-                                          std::span<Scorer*> scorers) {
-      auto copy = pool.make_span<Scorer*>(scorers.size());
-      std::copy(scorers.begin(), scorers.end(), copy.begin());
-      return copy;
+    static std::span<ApproxSlot> makeMembers(solux::MemPool& pool,
+                                              std::span<Scorer*> scorers) {
+      auto members = pool.make_span<ApproxSlot>(scorers.size());
+      bool enableTwoPhase = !disableTwoPhaseForTests && !disableDisjTwoPhaseForTests;
+      for (size_t i = 0; i < scorers.size(); i++) {
+        members[i] = {scorers[i], enableTwoPhase && scorers[i]->hasTwoPhase()};
+      }
+      return members;
+    }
+
+    static std::span<ApproxSlot*> makePointers(solux::MemPool& pool,
+                                                std::span<ApproxSlot> members) {
+      auto pointers = pool.make_span<ApproxSlot*>(members.size());
+      for (size_t i = 0; i < members.size(); i++) pointers[i] = &members[i];
+      return pointers;
+    }
+
+    int32_t nextMatched(int32_t doc) {
+      while (doc != solux::PostingsReader::END && !matches()) {
+        doc = approximationNext();
+      }
+      return doc;
     }
 
   public:
-    // The passed in span of scorers will be modified (rearranged).
+    static inline bool disableDisjTwoPhaseForTests = false;
+
     DisjunctionScorer(solux::MemPool& pool, std::span<Scorer*> scorers)
-            : clauses(copyScorers(pool, scorers)), scorers(scorers), pq(scorers) {
+            : clauses(scorers), members(makeMembers(pool, scorers)),
+              heap(makePointers(pool, members)),
+              verificationOrder(makePointers(pool, members)), pq(heap) {
+      for (auto& member : members) {
+        if (member.twoPhase) {
+          anyTwoPhase = true;
+          verificationCost = std::max(verificationCost, member.matchCost());
+        }
+      }
+      std::stable_sort(verificationOrder.begin(), verificationOrder.end(),
+                       [](const ApproxSlot* a, const ApproxSlot* b) {
+                         return a->matchCost() < b->matchCost();
+                       });
     }
 
     int32_t next() override {
+      return nextMatched(approximationNext());
+    }
+
+    int32_t advance(int32_t target) override {
+      return nextMatched(approximationAdvance(target));
+    }
+
+    bool hasTwoPhase() const override {
+      return anyTwoPhase;
+    }
+
+    int32_t approximationNext() override {
       // Contract: callers must not re-poll after END (see Query::Scorer).
       assert(pq.size() > 0);
       int currid = docid;
@@ -3306,13 +3368,10 @@ public:
       return docid;
     }
 
-    // Advance every member below target through its own advance (block
-    // skips) instead of the base linear next() walk. Members are touched at
-    // most once: each surfaces at the top while behind, advances to >=
-    // target, and sifts down. Without this, per-candidate probes of a
-    // disjunction (the MandNot exclusion side, the MandOpt rank-only side)
-    // walk every doc of every member between candidates.
-    int32_t advance(int32_t target) override {
+    // Advance every member below target through its latched protocol. Members
+    // are touched at most once: each surfaces at the top while behind,
+    // advances to >= target, and sifts down.
+    int32_t approximationAdvance(int32_t target) override {
       assert(docid < target);
       while (pq.size() > 0 && pq.top().docId() < target) {
         if (pq.top().advance(target) == solux::PostingsReader::END) {
@@ -3330,6 +3389,22 @@ public:
       return docid;
     }
 
+    int32_t approximationDocId() override {
+      return docid;
+    }
+
+    bool matches() override {
+      for (ApproxSlot* member : verificationOrder) {
+        if (member->docId() != docid) continue;
+        if (!member->twoPhase || member->scorer->matches()) return true;
+      }
+      return false;
+    }
+
+    float matchCost() override {
+      return verificationCost;
+    }
+
     std::span<Scorer*> flatDisjunctionScorers() override {
       return clauses;
     }
@@ -3337,17 +3412,20 @@ public:
     float score() override {
       assert(pq.size() > 0 && docid == pq.top().docId());
       float score = 0.0f;
-      for (auto* clause : clauses) {
-        if (clause->docId() == docid) score += clause->score();
+      for (auto& member : members) {
+        if (member.docId() == docid
+            && (!member.twoPhase || member.scorer->matches())) {
+          score += member.scorer->score();
+        }
       }
       return score;
     }
 
     int32_t advanceShallow(int32_t target) override {
       int32_t upTo = solux::PostingsReader::END;
-      for (auto* clause : clauses) {
-        if (clause->docId() != solux::PostingsReader::END) {
-          upTo = std::min(upTo, clause->advanceShallow(target));
+      for (auto& member : members) {
+        if (member.docId() != solux::PostingsReader::END) {
+          upTo = std::min(upTo, member.scorer->advanceShallow(target));
         }
       }
       return upTo;
@@ -3355,10 +3433,10 @@ public:
 
     float getMaxScore(int32_t upTo) override {
       float sum = 0.0f;
-      for (auto* scorer : clauses) {
-        int32_t doc = scorer->docId();
+      for (auto& member : members) {
+        int32_t doc = member.docId();
         if (doc != solux::PostingsReader::END && doc <= upTo) {
-          sum += scorer->getMaxScore(upTo);
+          sum += member.scorer->getMaxScore(upTo);
         }
       }
       return sum;
@@ -3366,10 +3444,10 @@ public:
 
     float refineMaxScore(int32_t upTo) override {
       float sum = 0.0f;
-      for (auto* scorer : clauses) {
-        int32_t doc = scorer->docId();
+      for (auto& member : members) {
+        int32_t doc = member.docId();
         if (doc != solux::PostingsReader::END && doc <= upTo) {
-          sum += scorer->refineMaxScore(upTo);
+          sum += member.scorer->refineMaxScore(upTo);
         }
       }
       return sum;
