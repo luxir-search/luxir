@@ -211,6 +211,9 @@ public:
   /// Input flags for createWeight(). NEED_SCORES is propagated down the query
   /// tree and cleared for clauses whose score the parent never reads.
   static constexpr int32_t NEED_SCORES = 1;
+  /// The request may skip non-competitive matches because it does not require
+  /// an exact hit count. Propagated independently of NEED_SCORES.
+  static constexpr int32_t ALLOW_PRUNING = 1 << 1;
 
   /// Returns a non-owning pointer to the created weight.  The Query::Context
   /// is responsible for the lifecycle of the created Weight.
@@ -527,6 +530,9 @@ public:
     /// set this when built without NEED_SCORES; wrappers and compounds set it
     /// from their scoring semantics. Advisory: false is always safe.
     bool isConstantScoring() const noexcept { return (traits & IS_CONSTANT_SCORING) != 0; }
+
+    /// True when the request permits scorer-level competitive pruning.
+    bool allowsPruning() const noexcept { return (inputFlags & ALLOW_PRUNING) != 0; }
 
     /// Optional execution-time preparation for weights that need the domain for
     /// all segments before they can create a scorer for any individual segment,

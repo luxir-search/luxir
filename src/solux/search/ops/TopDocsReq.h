@@ -332,7 +332,7 @@ public:
             // window drives beat the doc-at-a-time heap disjunction even without
             // skipping. The accumulator is withheld too, so this segment's
             // threshold cannot leak into sibling segments' pruning decisions.
-            bool allowPruning = !op.topDocsProto.get_number;
+            bool allowPruning = op.weight->allowsPruning();
             BulkScorer* bulk = nullptr;
             bulk = supplier->bulkScorer(poolGuard.pool());
             if (bulk != nullptr) {

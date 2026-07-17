@@ -10,6 +10,8 @@
 #include "solux/util/random.h"
 #include <charconv>
 #include <algorithm>
+#include <cmath>
+#include <limits>
 
 using namespace solux;
 using namespace solux::test;
@@ -116,6 +118,23 @@ TEST_F(SortCollectorTest, scoreTieBreakDeterministic) {
     ASSERT_EQ(got2, expected) << "merge order dependence";
     ASSERT_EQ(hits2, (int64_t)docs.size());
   }
+}
+
+TEST_F(SortCollectorTest, scoreThresholdIsExclusiveOnlyPastTieBreakFloor) {
+  TopDocsCollector collector(2);
+  EXPECT_EQ(std::numeric_limits<float>::lowest(),
+            collector.minCompetitiveScoreForNextDoc(1, 0));
+
+  collector.collect(1, 0, 5.0f);
+  collector.collect(1, 2, 5.0f);
+  EXPECT_EQ(std::nextafter(5.0f, std::numeric_limits<float>::infinity()),
+            collector.minCompetitiveScoreForNextDoc(1, 3));
+  EXPECT_EQ(5.0f, collector.minCompetitiveScoreForNextDoc(0, 0));
+
+  collector.collect(0, 0, 5.0f);
+  EXPECT_EQ(5.0f, collector.minCompetitiveScoreForNextDoc(0, 1));
+  EXPECT_EQ(std::nextafter(5.0f, std::numeric_limits<float>::infinity()),
+            collector.minCompetitiveScoreForNextDoc(1, 3));
 }
 
 // Tie-break edge cases: k==1 and an all-equal-score corpus (the flat-score path where

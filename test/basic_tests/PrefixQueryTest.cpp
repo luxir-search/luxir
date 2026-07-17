@@ -1,13 +1,24 @@
 #include <gtest/gtest.h>
 
+#include <array>
+#include <bit>
+#include <cmath>
+#include <limits>
+
 #include "test/SoluxTest.h"
 #include "test/TestIndex.h"
 #include "test/CollectionHelper.h"
 #include "test/LocalReq.h"
 #include "test/QueryBuild.h"
+#include "solux/query/BooleanQuery.h"
+#include "solux/query/ConstantScoreQuery.h"
 #include "solux/query/PrefixQuery.h"
 #include "solux/query/QueryBuilder.h"
+#include "solux/query/TermQuery.h"
+#include "solux/reader/SkipStats.h"
 #include "solux/schema/Schema.h"
+#include "solux/search/Collector.h"
+#include "solux/search/ProtobufSearchParser.h"
 
 using namespace solux;
 using namespace solux::test;
@@ -32,6 +43,125 @@ protected:
     return docs;
   }
 };
+
+class LazyMultiTermGuard {
+  bool saved;
+
+public:
+  explicit LazyMultiTermGuard(bool disabled)
+    : saved(MultiTermQuery::Weight::disableLazyMultiTermForTests) {
+    MultiTermQuery::Weight::disableLazyMultiTermForTests = disabled;
+  }
+
+  ~LazyMultiTermGuard() {
+    MultiTermQuery::Weight::disableLazyMultiTermForTests = saved;
+  }
+};
+
+class SkipStatsGuard {
+  bool savedEnabled;
+
+public:
+  SkipStatsGuard() : savedEnabled(SkipStats::enabled) {
+    SkipStats::reset();
+    SkipStats::enabled = true;
+  }
+
+  ~SkipStatsGuard() {
+    SkipStats::enabled = savedEnabled;
+    SkipStats::reset();
+  }
+};
+
+static void buildSparsePrefixIndex(TestIndex& ti) {
+  constexpr std::array<int32_t, 15> docs = {
+      0, 2, 5, 127, 4095, 4096, 4100, 5000,
+      8191, 8192, 9000, 12000, 16000, 18000, 20000};
+  TestField field(ti, "foo_w");
+  field.startIndexing();
+  for (size_t i = 0; i < docs.size(); i++) {
+    std::string body = "pre";
+    body.push_back((char) ('a' + i));
+    if ((i & 1) == 0) body.append(" common");
+    field.add(docs[i], body);
+  }
+  ti.flush();
+  field.startReading();
+}
+
+static std::vector<TopDocsCollector::ScoreDoc> runPrefixTopK(
+    TestIndex& ti, int32_t k, bool disableLazy, bool conjunction = false,
+    bool allowPruning = true) {
+  LazyMultiTermGuard guard(disableLazy);
+  PrefixQuery prefix("foo_w", "pre");
+  TermQuery common("foo_w", "common");
+  Query* required[] = {&prefix, &common};
+  BooleanQuery both(required, {}, {}, {});
+  Query& query = conjunction ? (Query&) both : (Query&) prefix;
+
+  MemPool pool;
+  Query::Context context(pool, *ti.reader);
+  int32_t flags = Query::NEED_SCORES
+      | (allowPruning ? Query::ALLOW_PRUNING : 0);
+  auto* weight = query.createWeight(context, flags);
+  TopDocsCollector collector(k);
+  for (auto& segment : context.topReader.segments()) {
+    auto* scorer = weight->createScorer(pool, segment);
+    if (scorer != nullptr) {
+      collectTopK(segment.ord, scorer, nullptr, nullptr, collector, allowPruning);
+    }
+  }
+  auto sorted = collector.sort();
+  return {sorted.begin(), sorted.end()};
+}
+
+static void expectSamePrefixTopK(
+    std::span<const TopDocsCollector::ScoreDoc> expected,
+    std::span<const TopDocsCollector::ScoreDoc> actual) {
+  ASSERT_EQ(expected.size(), actual.size());
+  for (size_t i = 0; i < expected.size(); i++) {
+    EXPECT_EQ(expected[i].doc, actual[i].doc) << "rank=" << i;
+    EXPECT_EQ(std::bit_cast<uint32_t>(expected[i].score),
+              std::bit_cast<uint32_t>(actual[i].score)) << "rank=" << i;
+  }
+}
+
+struct PrefixDecodeRun {
+  std::vector<TopDocsCollector::ScoreDoc> docs;
+  int64_t hits;
+  int64_t blocks;
+};
+
+static PrefixDecodeRun runPrefixDecode(
+    TestIndex& ti, bool disableLazy, bool allowPruning,
+    bool conjunction = false, int64_t topCount = 10) {
+  LazyMultiTermGuard lazyGuard(disableLazy);
+  SkipStatsGuard statsGuard;
+  PrefixQuery prefix("foo_w", "pre");
+  TermQuery early("foo_w", "preearly");
+  Query* required[] = {&prefix, &early};
+  BooleanQuery both(required, {}, {}, {});
+  Query& query = conjunction ? (Query&) both : (Query&) prefix;
+  MemPool pool;
+  Query::Context context(pool, *ti.reader);
+  int32_t flags = Query::NEED_SCORES
+      | (allowPruning ? Query::ALLOW_PRUNING : 0);
+  auto* weight = query.createWeight(context, flags);
+  TopDocsCollector collector(topCount);
+  for (auto& segment : context.topReader.segments()) {
+    auto* supplier = weight->scorerSupplier(pool, segment);
+    auto* scorer = supplier == nullptr ? nullptr : supplier->get(
+        pool, std::numeric_limits<int64_t>::max());
+    if (scorer == nullptr) {
+      ADD_FAILURE() << "prefix scorer missing";
+      return {};
+    }
+    collectTopK(segment.ord, scorer, nullptr, nullptr, collector, allowPruning);
+  }
+  auto sorted = collector.sort();
+  return {{sorted.begin(), sorted.end()}, collector.totalHits(),
+          SkipStats::docBlocksDecoded};
+}
 
 TEST_F(PrefixQueryTest, singleSegment) {
   TestIndex ti;
@@ -122,6 +252,190 @@ TEST_F(PrefixQueryTest, multiSegment) {
   EXPECT_EQ(prefixDocs(ti, "foo_w", "b", 1), (V{1}));     // banana
 }
 
+TEST_F(PrefixQueryTest, lazyScoredPathMatchesMaterialized) {
+  TestIndex ti;
+  buildSparsePrefixIndex(ti);
+
+  for (int32_t k : {5, 15, 30}) {
+    auto materialized = runPrefixTopK(ti, k, true);
+    auto lazy = runPrefixTopK(ti, k, false);
+    expectSamePrefixTopK(materialized, lazy);
+  }
+
+  auto materializedConjunction = runPrefixTopK(ti, 4, true, true);
+  auto lazyConjunction = runPrefixTopK(ti, 4, false, true);
+  expectSamePrefixTopK(materializedConjunction, lazyConjunction);
+  expectSamePrefixTopK(runPrefixTopK(ti, 5, false, false, false),
+                       runPrefixTopK(ti, 5, false));
+  expectSamePrefixTopK(runPrefixTopK(ti, 4, false, true, false),
+                       lazyConjunction);
+
+  auto first = runPrefixTopK(ti, 15, false);
+  auto second = runPrefixTopK(ti, 15, false);
+  expectSamePrefixTopK(first, second);
+
+  auto top10 = runPrefixTopK(ti, 10, false);
+  auto top1000 = runPrefixTopK(ti, 1000, false);
+  ASSERT_EQ(10u, top10.size());
+  ASSERT_GE(top1000.size(), top10.size());
+  expectSamePrefixTopK(top10, std::span(top1000).first(top10.size()));
+}
+
+TEST_F(PrefixQueryTest, lazyRoutingKeepsCountMaterialized) {
+  TestIndex ti;
+  buildSparsePrefixIndex(ti);
+  auto& segment = ti.reader->segments()[0];
+
+  {
+    LazyMultiTermGuard guard(false);
+    MemPool pool;
+    Query::Context context(pool, *ti.reader);
+    PrefixQuery prefix("foo_w", "pre");
+    auto* weight = prefix.createWeight(
+        context, Query::NEED_SCORES | Query::ALLOW_PRUNING);
+    EXPECT_TRUE(weight->allowsPruning());
+    auto* supplier = weight->scorerSupplier(pool, segment);
+    auto* scorer = supplier->get(pool, std::numeric_limits<int64_t>::max());
+    ASSERT_NE(dynamic_cast<MultiTermQuery::LazyScorer*>(scorer), nullptr);
+    EXPECT_EQ(0, scorer->next());
+    scorer->setMinCompetitiveScore(
+        std::nextafter(1.0f, std::numeric_limits<float>::infinity()));
+    EXPECT_EQ(PostingsReader::END, scorer->next());
+  }
+
+  {
+    LazyMultiTermGuard guard(false);
+    MemPool pool;
+    Query::Context context(pool, *ti.reader);
+    PrefixQuery prefix("foo_w", "pre");
+    auto* weight = prefix.createWeight(context, Query::NEED_SCORES);
+    EXPECT_FALSE(weight->allowsPruning());
+    auto* supplier = weight->scorerSupplier(pool, segment);
+    auto* scorer = supplier->get(pool, std::numeric_limits<int64_t>::max());
+    ASSERT_NE(dynamic_cast<MultiTermQuery::Scorer*>(scorer), nullptr);
+    EXPECT_EQ(dynamic_cast<MultiTermQuery::LazyScorer*>(scorer), nullptr);
+  }
+
+  {
+    LazyMultiTermGuard guard(false);
+    MemPool pool;
+    Query::Context context(pool, *ti.reader);
+    PrefixQuery prefix("foo_w", "pre");
+    auto* weight = prefix.createWeight(
+        context, Query::NEED_SCORES | Query::ALLOW_PRUNING);
+    auto* supplier = weight->scorerSupplier(pool, segment);
+    auto* scorer = supplier->get(pool, 1);
+    ASSERT_NE(dynamic_cast<MultiTermQuery::Scorer*>(scorer), nullptr);
+    EXPECT_EQ(dynamic_cast<MultiTermQuery::LazyScorer*>(scorer), nullptr);
+  }
+
+  for (bool disableLazy : {false, true}) {
+    LazyMultiTermGuard guard(disableLazy);
+    MemPool pool;
+    Query::Context context(pool, *ti.reader);
+    PrefixQuery prefix("foo_w", "pre");
+    auto* scorer = prefix.createWeight(context, 0)->createScorer(pool, segment);
+    ASSERT_NE(dynamic_cast<MultiTermQuery::Scorer*>(scorer), nullptr);
+    EXPECT_EQ(dynamic_cast<MultiTermQuery::LazyScorer*>(scorer), nullptr);
+    int32_t count = 0;
+    for (int32_t doc = scorer->next(); doc != PostingsReader::END; doc = scorer->next()) {
+      count++;
+    }
+    EXPECT_EQ(15, count);
+  }
+
+  for (bool disableLazy : {false, true}) {
+    LazyMultiTermGuard guard(disableLazy);
+    PrefixQuery prefix("foo_w", "pre");
+    ConstantScoreQuery constant(&prefix, 2.5f);
+    MemPool pool;
+    Query::Context context(pool, *ti.reader);
+    auto* scorer = constant.createWeight(
+        context, Query::NEED_SCORES | Query::ALLOW_PRUNING)
+        ->createScorer(pool, segment);
+    ASSERT_NE(scorer, nullptr);
+    int32_t count = 0;
+    for (int32_t doc = scorer->next(); doc != PostingsReader::END; doc = scorer->next()) {
+      EXPECT_FLOAT_EQ(2.5f, scorer->score());
+      count++;
+    }
+    EXPECT_EQ(15, count);
+  }
+}
+
+TEST_F(PrefixQueryTest, lazyCrossoverKeepsHugeExpansionMaterialized) {
+  TestIndex ti;
+  TestField field(ti, "foo_w");
+  field.startIndexing();
+  constexpr int32_t termCount =
+      (int32_t) MultiTermQuery::Weight::MAX_LAZY_TERMS + 1;
+  for (int32_t doc = 0; doc < termCount; doc++) {
+    field.add(doc, "pre" + std::to_string(doc));
+  }
+  ti.flush();
+  field.startReading();
+
+  LazyMultiTermGuard guard(false);
+  MemPool pool;
+  Query::Context context(pool, *ti.reader);
+  PrefixQuery prefix("foo_w", "pre");
+  auto* scorer = prefix.createWeight(
+      context, Query::NEED_SCORES | Query::ALLOW_PRUNING)
+      ->createScorer(pool, context.topReader.segments()[0]);
+  ASSERT_NE(dynamic_cast<MultiTermQuery::Scorer*>(scorer), nullptr);
+  EXPECT_EQ(dynamic_cast<MultiTermQuery::LazyScorer*>(scorer), nullptr);
+  int32_t count = 0;
+  for (int32_t doc = scorer->next(); doc != PostingsReader::END; doc = scorer->next()) {
+    count++;
+  }
+  EXPECT_EQ(termCount, count);
+}
+
+TEST_F(PrefixQueryTest, lazyRoutingPinsPruningLeadAndDecodeVolume) {
+  TestIndex ti;
+  TestField field(ti, "foo_w");
+  field.startIndexing();
+  std::string lateBody = "preearly";
+  for (int32_t term = 0; term < 16; term++) {
+    lateBody.append(" prelate").append(std::to_string(term));
+  }
+  constexpr int32_t docCount = 20000;
+  for (int32_t doc = 0; doc < docCount; doc++) {
+    bool late = doc >= 13000 && doc <= 19350 && ((doc - 13000) % 50) == 0;
+    field.add(doc, late ? lateBody : "preearly");
+  }
+  ti.flush();
+  field.startReading();
+
+  auto eager = runPrefixDecode(ti, true, true);
+  auto lazy = runPrefixDecode(ti, false, true);
+  auto exactCount = runPrefixDecode(ti, false, false);
+  auto exactCountKnob = runPrefixDecode(ti, true, false);
+  auto driven = runPrefixDecode(ti, false, true, true);
+  auto drivenKnob = runPrefixDecode(ti, true, true, true);
+  auto lazyUnfilled = runPrefixDecode(ti, false, true, false, docCount + 1);
+  auto eagerUnfilled = runPrefixDecode(ti, true, true, false, docCount + 1);
+
+  expectSamePrefixTopK(eager.docs, lazy.docs);
+  expectSamePrefixTopK(eager.docs, exactCount.docs);
+  expectSamePrefixTopK(exactCount.docs, exactCountKnob.docs);
+  expectSamePrefixTopK(driven.docs, drivenKnob.docs);
+  expectSamePrefixTopK(lazyUnfilled.docs, eagerUnfilled.docs);
+  EXPECT_EQ(10, eager.hits);
+  EXPECT_EQ(10, lazy.hits);
+  EXPECT_EQ(docCount, exactCount.hits);
+  EXPECT_EQ(docCount, exactCountKnob.hits);
+  EXPECT_EQ(10, driven.hits);
+  EXPECT_EQ(docCount, lazyUnfilled.hits);
+  EXPECT_GT(eager.blocks, 0);
+  EXPECT_LT(lazy.blocks, eager.blocks);
+  EXPECT_EQ(exactCount.blocks, exactCountKnob.blocks);
+  EXPECT_EQ(exactCount.blocks, eager.blocks);
+  EXPECT_EQ(driven.blocks, drivenKnob.blocks);
+  EXPECT_LT(lazy.blocks, lazyUnfilled.blocks);
+  EXPECT_LE(lazyUnfilled.blocks, eagerUnfilled.blocks);
+}
+
 // QueryBuilder validates that prefix queries only run on term-backed fields.
 TEST_F(PrefixQueryTest, fieldTypeValidation) {
   auto schema = Schema::createDefaultSchema();
@@ -177,6 +491,27 @@ TEST_F(PrefixQueryE2ETest, textField) {
   EXPECT_EQ(prefixCount("body_w", "ban"), 1);  // banana -> d2
   EXPECT_EQ(prefixCount("body_w", ""), 4);     // every doc has an indexed term
   EXPECT_EQ(prefixCount("body_w", "z"), 0);    // no matches
+}
+
+TEST_F(PrefixQueryE2ETest, getNumberControlsPruningWeightFlag) {
+  auto parseAllowsPruning = [&](bool getNumber) -> std::optional<bool> {
+    auto request = localReq(helper.getSearchEngine());
+    auto& topDocs = request->collection("main").topDocs("q")
+        .prefixQuery("body_w", "ap").limit(10);
+    topDocs.getNumber(getNumber);
+    request->reader = helper.getIndexWriter()->getIndexReader();
+    request->schema = helper.collection().getSchema();
+    ProtobufSearchParser parser(*request);
+    auto* root = static_cast<RootOp*>(parser.parse());
+    auto it = root->subOps.find("q");
+    if (it == root->subOps.end()) return std::nullopt;
+    auto* parsed = dynamic_cast<TopDocsReq*>(it->second);
+    if (parsed == nullptr) return std::nullopt;
+    return parsed->weight->allowsPruning();
+  };
+
+  EXPECT_EQ(std::optional<bool>(true), parseAllowsPruning(false));
+  EXPECT_EQ(std::optional<bool>(false), parseAllowsPruning(true));
 }
 
 TEST_F(PrefixQueryE2ETest, asBooleanFilter) {

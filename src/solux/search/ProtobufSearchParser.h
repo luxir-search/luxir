@@ -639,8 +639,17 @@ public:
     // iterators.  Ranked requests (limit > 0) need scores to order docs even
     // when get_scores doesn't return them; field sorts keep that conservative
     // behavior for now.
-    int32_t requestFlags = (limit > 0 || topDocsReq.get_scores)
-        ? Query::NEED_SCORES : 0;
+    int32_t requestFlags = 0;
+    if (limit > 0 || topDocsReq.get_scores) {
+      requestFlags |= Query::NEED_SCORES;
+    }
+    // Competitive-score pruning requires a score-ranked heap and no consumer
+    // that needs the complete match domain.
+    bool allowPruning = limit > 0 && !topDocsReq.get_number
+        && !parsedSorts.useFieldSort && topDocsReq.ops.empty();
+    if (allowPruning) {
+      requestFlags |= Query::ALLOW_PRUNING;
+    }
     auto* weight = query->createWeight(*qcontext, requestFlags);
     auto filterWeights = foldFilters
       ? std::span<Query::Weight*>{}

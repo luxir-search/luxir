@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cmath>
 #include <limits>
 
 #include "solux/query/Query.h"
@@ -106,6 +107,21 @@ class TopDocsCollector {
         minCompetitiveVal = pq.top().score;
       }
     }
+  }
+
+  // The heap floor stays inclusive because an equal-scoring doc with a
+  // smaller total-order key can replace its root. For a monotone segment
+  // stream, once its next key is past the root, equal scores cannot enter and
+  // the scorer may use the next representable float as an exclusive floor.
+  float minCompetitiveScoreForNextDoc(int32_t segment, int32_t docid) const {
+    if (topCount == 0 || pq.size() < topCount) {
+      return std::numeric_limits<float>::lowest();
+    }
+    const ScoreDoc& floor = pq.top();
+    if (segdoc(segment, docid) > floor.doc) {
+      return std::nextafter(floor.score, std::numeric_limits<float>::infinity());
+    }
+    return floor.score;
   }
 
   int64_t totalHits() const {
@@ -347,30 +363,43 @@ void collectTopK(int32_t segnum, Query::Scorer* scorer, DocSet* filter,
   constexpr int32_t kAccumulatorPollPeriod = 1024;
   float lastPushedMinCompetitiveScore = std::numeric_limits<float>::lowest();
   int32_t accumulatorPollCount = 0;
-  auto pushMinCompetitiveScore = [&](bool localRise, bool periodicPoll) {
+  auto localMinCompetitiveScore = [&](int32_t nextDoc) {
+    if constexpr (requires {
+        collector.minCompetitiveScoreForNextDoc(segnum, nextDoc);
+      }) {
+      return collector.minCompetitiveScoreForNextDoc(segnum, nextDoc);
+    } else if constexpr (requires { collector.minCompetitiveVal; }) {
+      unused(nextDoc);
+      return collector.minCompetitiveVal;
+    } else {
+      unused(nextDoc);
+      return std::numeric_limits<float>::lowest();
+    }
+  };
+  auto pushMinCompetitiveScore = [&](float localScore, bool localRise,
+                                     bool periodicPoll) {
     if constexpr (requires { collector.minCompetitiveVal; }) {
       if (!allowPruning || builder != nullptr) {
         return;
       }
+      float minCompetitiveScore = localScore;
       if (accumulator != nullptr) {
         if (localRise) {
+          // Cross-segment publication stays inclusive: a sibling stream can
+          // still contain an equal-scoring doc with a smaller total-order key.
           accumulator->accumulate(collector.minCompetitiveVal);
-        } else if (!periodicPoll) {
-          return;
         }
-      } else if (!localRise) {
-        return;
+        if (localRise || periodicPoll) {
+          minCompetitiveScore = std::max(minCompetitiveScore, accumulator->get());
+        }
       }
-
-      float minCompetitiveScore = accumulator != nullptr
-        ? accumulator->get()
-        : collector.minCompetitiveVal;
       if (minCompetitiveScore > lastPushedMinCompetitiveScore) {
         scorer->setMinCompetitiveScore(minCompetitiveScore);
         lastPushedMinCompetitiveScore = minCompetitiveScore;
       }
     } else {
-      unused(localRise, periodicPoll, lastPushedMinCompetitiveScore, allowPruning, accumulator);
+      unused(localScore, localRise, periodicPoll, lastPushedMinCompetitiveScore,
+             allowPruning, accumulator);
     }
   };
   auto collectOne = [&](int32_t doc, float score) {
@@ -386,21 +415,22 @@ void collectTopK(int32_t segnum, Query::Scorer* scorer, DocSet* filter,
           periodicPoll = true;
         }
       }
-      pushMinCompetitiveScore(localRise, periodicPoll);
+      pushMinCompetitiveScore(localMinCompetitiveScore(doc + 1), localRise,
+                              periodicPoll);
     } else {
       unused(lastPushedMinCompetitiveScore, accumulatorPollCount, accumulator, allowPruning);
       collector.collect(segnum, doc, score);
     }
   };
 
-  // Seed the scorer with the shared threshold a sibling segment may have already
-  // raised, so this segment prunes from the FIRST doc instead of waiting for its
-  // own heap to fill (k docs) or the periodic poll.  This is what lets a segment
-  // that matches few docs but does heavy per-match work still benefit from the
-  // cross-segment threshold.
+  // Seed from both the local heap and the shared inclusive threshold so a
+  // reused collector or a sibling segment can prune from the first doc.
   if constexpr (requires { collector.minCompetitiveVal; }) {
-    if (allowPruning && builder == nullptr && accumulator != nullptr) {
-      float seed = accumulator->get();
+    if (allowPruning && builder == nullptr) {
+      float seed = localMinCompetitiveScore(0);
+      if (accumulator != nullptr) {
+        seed = std::max(seed, accumulator->get());
+      }
       if (seed > lastPushedMinCompetitiveScore) {
         scorer->setMinCompetitiveScore(seed);
         lastPushedMinCompetitiveScore = seed;
@@ -495,11 +525,19 @@ void collectTopKWindowed(int32_t segnum, BulkScorer* bulk, DocSet* filter,
   int32_t cursor = 0;
   ScoreWindow window;
   while (cursor != PostingsReader::END && cursor < maxDoc) {
+    float localTheta;
+    if constexpr (requires {
+        collector.minCompetitiveScoreForNextDoc(segnum, cursor);
+      }) {
+      localTheta = collector.minCompetitiveScoreForNextDoc(segnum, cursor);
+    } else {
+      localTheta = collector.minCompetitiveVal;
+    }
     float theta = !allowPruning
       ? std::numeric_limits<float>::lowest()
       : accumulator != nullptr
-        ? std::max(collector.minCompetitiveVal, accumulator->get())
-        : collector.minCompetitiveVal;
+        ? std::max(localTheta, accumulator->get())
+        : localTheta;
     int32_t next = bulk->scoreNextWindow(window, filter, cursor, maxDoc, theta);
 
     if (builder != nullptr) {
