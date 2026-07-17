@@ -100,6 +100,9 @@ public:
   ConstantScoreQuery(Query* child, float constantScore = 1.0f) : child(child), constantScore(constantScore) {}
 
   Query* getChild() const { return child; }
+  ScoreProfile scoreProfile() const override {
+    return ScoreProfile::explicitUniform(constantScore);
+  }
 
   Weight* createWeight(Context& context, int32_t flags,
                        float multiplier = 1.0f) override {
@@ -139,7 +142,8 @@ public:
   public:
     Weight(Context& context, ConstantScoreQuery& query, int32_t flags, float multiplier)
       : Query::Weight(context, flags),
-        constantScore(checkedBoostProduct(query.constantScore, multiplier)) {
+        constantScore((flags & NEED_SCORES) != 0
+            ? checkedBoostProduct(query.constantScore, multiplier) : 0.0f) {
       // The child constrains matches; this wrapper replaces its score.
       childWeight = query.child->createWeight(context, flags & ~NEED_SCORES, 1.0f);
       // The wrapper is constant-scoring; prepare still follows the child.

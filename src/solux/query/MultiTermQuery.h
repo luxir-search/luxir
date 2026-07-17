@@ -18,10 +18,13 @@ protected:
   float boost;
 
 public:
-  MultiTermQuery(std::string_view field, float boost = 1.0f) : field(field), boost(boost) {}
+  explicit MultiTermQuery(std::string_view field) : field(field), boost(1.0f) {}
 
   std::string_view getField() const { return field; }
   float getBoost() const { return boost; }
+  ScoreProfile scoreProfile() const override {
+    return ScoreProfile::automatic(1.0f);
+  }
 
   // Build the per-segment filtered term iterator.
   virtual FilteredTermsEnum* createFilteredEnum(MemPool& pool, TermsEnum& te) = 0;
@@ -226,7 +229,8 @@ public:
 
     Weight(Context& context, MultiTermQuery& query, int32_t flags, float multiplier)
       : Query::Weight(context, flags), query(query),
-        boost(checkedBoostProduct(multiplier, query.getBoost())),
+        boost((flags & NEED_SCORES) != 0
+            ? checkedBoostProduct(multiplier, query.getBoost()) : 0.0f),
         canUseLazy((flags & (NEED_SCORES | ALLOW_PRUNING))
                      == (NEED_SCORES | ALLOW_PRUNING)
                    && !disableLazyMultiTermForTests) {

@@ -780,6 +780,7 @@ public:
     // block-max conjunction hops quadratic: the enum stays behind while the
     // target hops ahead, and the widened scan walked every block in between.
     float getMaxScore(int32_t upTo) override {
+      if (simScorer == nullptr) return 0.0f;
       if (!hasImpacts()) {
         return std::numeric_limits<float>::infinity();
       }
@@ -834,6 +835,7 @@ public:
     }
 
     float refineMaxScore(int32_t upTo) override {
+      if (simScorer == nullptr) return 0.0f;
       if (!hasImpacts()) {
         return std::numeric_limits<float>::infinity();
       }
@@ -865,6 +867,7 @@ public:
     }
 
     float getMaxScoreForSetup(int32_t upTo) override {
+      if (simScorer == nullptr) return 0.0f;
       if (!hasImpacts()) {
         return std::numeric_limits<float>::infinity();
       }

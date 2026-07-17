@@ -158,7 +158,8 @@ year_i:>=1960                    also >, <=, <
 ```
 
 On string, id, and text fields the range runs over the indexed terms in
-plain byte order (no collation), and matches score a constant. Text
+plain byte order (no collation), and uses the positional constant-scoring
+rule described below. Text
 endpoints fold the way the field folds, like prefix and fuzzy text.
 
 Endpoints are converted exactly the way field values are at indexing time,
@@ -242,8 +243,16 @@ zero tokens are present, while an empty multi-valued array is missing. Values
 discarded during ingestion, such as a zero-norm cosine vector, are also missing.
 Stored-only fields cannot be queried for existence.
 
-Existence matches score `0`. Use the constant-score decoration when existence
-should contribute to ranking, for example `field:*^=2`.
+Existence is a filter-shaped query. At the root or in an optional clause it
+contributes `1`; as a required clause (`+field:*`) it contributes `0` and only
+restricts matching. An explicit boost opts it back into scoring even when it
+is required: `+field:*^1` contributes `1`, and `+field:*^3` contributes `3`.
+Use `^=N` to replace the score explicitly, for example `field:*^=2`.
+
+The same positional rule applies to match-all, numeric and geo ranges, prefix,
+and term-range queries: their default constant is `1`, a bare required clause
+is rank-neutral, and an explicit boost (including `^1`) makes the constant
+score in every position. Filter and prohibited clauses never score.
 
 Prefix and fuzzy text is folded the way the field folds - `title_wl:Runn*`
 finds what "Runner" indexed - but never split into words. On unanalyzed
@@ -265,7 +274,9 @@ title_w:"dune messiah"^1.5
 status_s:active^=2
 ```
 
-`^N` multiplies every matching score by `N`. Boosts nest by multiplication.
+`^N` multiplies every matching score by `N`. On a filter-shaped query it also
+makes the constant explicit, so the clause scores even in required position;
+this is true for `^1` as well. Boosts nest by multiplication.
 `^=N` is shorthand for `constant_score(..., score=N)`: it keeps the match set
 but replaces the child score. Only one score decoration is allowed on one
 clause. The value must be a literal finite non-negative number; `$variables`
@@ -277,7 +288,8 @@ accepts a numeric `boost` sibling as input sugar:
 arm itself, not the sibling sugar. Request echo and other encoding always use
 the structured wrapper form.
 
-An omitted boost means `1.0`. A boost of `0` is legal: matching documents
+An omitted boost means `1.0`; writing `^1` is observably different from
+omitting it on a required filter-shaped clause. A boost of `0` is legal: matching documents
 remain in the result set and their scores become zero. Boost has no effect in
 filter or prohibited context because those clauses are built without scores.
 Inside `constant_score`, a child boost is discarded; a boost outside

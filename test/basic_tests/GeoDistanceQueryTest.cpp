@@ -105,9 +105,11 @@ struct DistanceState {
   GeoDistanceQuery::Weight* weight;
 
   DistanceState(MemPool& pool, IndexReader& reader, std::string_view field,
-                double lat, double lon, double radius)
+                double lat, double lon, double radius, int32_t flags = 0,
+                float multiplier = 1.0f)
       : context(pool, reader), query(field, lat, lon, radius),
-        weight((GeoDistanceQuery::Weight*)query.createWeight(context, 0)) {}
+        weight((GeoDistanceQuery::Weight*)query.createWeight(
+            context, flags, multiplier)) {}
 };
 
 std::vector<int32_t> bruteColumn(IndexReader::Segment& segment,
@@ -319,6 +321,61 @@ TEST_F(BKDDistanceRelationTest, validatesInputs) {
 }
 
 class GeoDistanceQueryTest : public SoluxTest {};
+
+TEST_F(GeoDistanceQueryTest, uniformScoreAndBoundsAcrossExecutionArms) {
+  CollectionHelper helper;
+  setGeoSchema(helper);
+  auto writer = helper.getIndexWriter();
+  Inverter& inverter = writer->obtainInverter();
+  auto& single = inverter.getIndexHandler("geo_single");
+  for (int32_t doc = 0; doc < 40; doc++) {
+    inverter.startDoc();
+    single.index(inverter, (double)doc - 20.0, (double)doc * 2.0 - 40.0);
+    inverter.finishDoc();
+  }
+  writer->releaseInverter(inverter);
+  writer->commit();
+  auto reader = writer->getIndexReader();
+  auto& segment = reader->segments()[0];
+
+  auto check = [](Query::Scorer* scorer) {
+    ASSERT_NE(nullptr, scorer);
+    EXPECT_FLOAT_EQ(4.0f, scorer->getMaxScore(PostingsReader::END));
+    EXPECT_FLOAT_EQ(4.0f,
+                    scorer->getMaxScoreForSetup(PostingsReader::END));
+    scorer->setMinCompetitiveScore(4.0f);
+    ASSERT_NE(PostingsReader::END, scorer->next());
+    EXPECT_FLOAT_EQ(4.0f, scorer->score());
+  };
+
+  MemPool pool;
+  DistanceState state(pool, *reader, "geo_single", 0.0, 0.0, 2'000'000.0,
+                      Query::NEED_SCORES, 4.0f);
+  auto* supplier = state.weight->scorerSupplier(pool, segment);
+  ASSERT_NE(nullptr, supplier);
+  check(supplier->get(pool, 0));  // sparse verifier
+  check(supplier->get(pool, std::numeric_limits<int64_t>::max()));  // BKD
+  check(state.weight->createScanScorerForTests(pool, segment));
+
+  BulkScorer* bulk = supplier->bulkScorer(pool);
+  ASSERT_NE(nullptr, bulk);
+  ScoreWindow window;
+  bulk->scoreNextWindow(window, nullptr, 0, segment.maxDoc(), 4.0f);
+  ASSERT_GT(window.size, 0);
+  for (int32_t i = 0; i < window.size; i++) {
+    EXPECT_FLOAT_EQ(4.0f, window.scores[(size_t)i]);
+  }
+
+  MemPool noScorePool;
+  DistanceState noScore(noScorePool, *reader, "geo_single", 0.0, 0.0,
+                        2'000'000.0);
+  auto* unscored = noScore.weight->createScorer(noScorePool, segment);
+  ASSERT_NE(nullptr, unscored);
+  EXPECT_FLOAT_EQ(0.0f,
+                  unscored->getMaxScoreForSetup(PostingsReader::END));
+  ASSERT_NE(PostingsReader::END, unscored->next());
+  EXPECT_FLOAT_EQ(0.0f, unscored->score());
+}
 
 TEST_F(GeoDistanceQueryTest, bkdScanAndColumnOraclesAcrossCorpora) {
   for (Shape shape : {Shape::UNIFORM, Shape::CLUSTERED,

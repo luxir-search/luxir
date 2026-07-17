@@ -33,11 +33,14 @@ public:
   std::string_view getField() const { return field; }
   int64_t getLo() const { return lo; }
   int64_t getHi() const { return hi; }
+  ScoreProfile scoreProfile() const override {
+    return ScoreProfile::automatic(1.0f);
+  }
 
   Query::Weight* createWeight(Context& context, int32_t flags,
                               float multiplier = 1.0f) override {
-    unused(multiplier);
-    return context.pool.make<Weight>(context, *this, flags);
+    float score = (flags & NEED_SCORES) != 0 ? multiplier : 0.0f;
+    return context.pool.make<Weight>(context, *this, flags, score);
   }
 
   // This is deliberately the pre-zone-map scorer. It remains the sparse
@@ -52,6 +55,8 @@ public:
     bool allMatch;
     bool multi;
     int32_t docid = -1;
+    float constantScore;
+    bool exhausted = false;
 
     bool valueInRange() {
       if (docid == PostingsReader::END) return false;
@@ -70,18 +75,22 @@ public:
     }
 
   public:
-    RangeScorer(IntColReader& reader, int64_t lo, int64_t hi, bool allMatch)
+    RangeScorer(IntColReader& reader, int64_t lo, int64_t hi, bool allMatch,
+                float constantScore)
       : reader(reader), iter(reader), lo(lo), hi(hi), allMatch(allMatch),
-        multi(reader.multiValued()) {}
+        multi(reader.multiValued()), constantScore(constantScore) {}
 
     bool hasTwoPhase() const override { return true; }
-    int32_t approximationNext() override { docid = iter.next(); return docid; }
+    int32_t approximationNext() override {
+      docid = exhausted ? PostingsReader::END : iter.next();
+      return docid;
+    }
     int32_t approximationAdvance(int32_t target) override {
-      docid = iter.advance(target);
+      docid = exhausted ? PostingsReader::END : iter.advance(target);
       return docid;
     }
     int32_t approximationDocId() override { return docid; }
-    bool matches() override { return valueInRange(); }
+    bool matches() override { return !exhausted && valueInRange(); }
     float matchCost() override {
       if (allMatch) return 0.0f;
       if (!multi) return 1.0f;
@@ -90,12 +99,14 @@ public:
     }
 
     int32_t next() override {
+      if (exhausted) return docid = PostingsReader::END;
       for (;;) {
         docid = iter.next();
         if (docid == PostingsReader::END || valueInRange()) return docid;
       }
     }
     int32_t advance(int32_t target) override {
+      if (exhausted) return docid = PostingsReader::END;
       assert(docid < target);
       docid = iter.advance(target);
       while (docid != PostingsReader::END && !valueInRange()) {
@@ -104,16 +115,19 @@ public:
       return docid;
     }
     int32_t docId() override { return docid; }
-    float score() override { return 0.0f; }
+    float score() override { return constantScore; }
 
-    // Every match scores 0: a flat, exact bound with no shallow structure.
+    void setMinCompetitiveScore(float minScore) override {
+      if (minScore > constantScore) exhausted = true;
+    }
+
     float getMaxScore(int32_t upTo) override {
       unused(upTo);
-      return 0.0f;
+      return constantScore;
     }
     float getMaxScoreForSetup(int32_t upTo) override {
       unused(upTo);
-      return 0.0f;
+      return constantScore;
     }
     int32_t advanceShallowForSetup(int32_t target) override {
       unused(target);
@@ -220,6 +234,8 @@ public:
     int32_t docid = -1;
     int32_t iterWindowStart = 0;
     int32_t iterWindowEnd = 0;
+    float constantScore;
+    bool exhausted = false;
 
     static void setBit(std::span<uint64_t> words, int32_t windowStart,
                        int32_t doc) {
@@ -374,10 +390,10 @@ public:
   public:
     ZoneMapScorer(MemPool& pool, IntColReader& reader,
                   std::span<const BlockPlan> plans, int64_t lo, int64_t hi,
-                  int32_t maxDoc)
+                  int32_t maxDoc, float constantScore)
         : reader(reader), plans(plans), crossing(reader),
           iterBits(pool.make_arr<uint64_t>(ITER_WINDOW_WORDS), ITER_WINDOW_WORDS),
-          lo(lo), hi(hi), maxDoc(maxDoc) {
+          lo(lo), hi(hi), maxDoc(maxDoc), constantScore(constantScore) {
       if (!reader.denseDocsWithValue()) {
         const auto& bits = reader.docsWithValueBitSet();
         selector = pool.make<screaming::BitSet::Selector>(
@@ -396,24 +412,29 @@ public:
     }
 
     int32_t next() override {
+      if (exhausted) return docid = PostingsReader::END;
       assert(docid != PostingsReader::END);
       return seek(docid + 1);
     }
     int32_t advance(int32_t target) override {
+      if (exhausted) return docid = PostingsReader::END;
       assert(docid < target);
       return seek(target);
     }
     int32_t docId() override { return docid; }
-    float score() override { return 0.0f; }
+    float score() override { return constantScore; }
 
-    // Every match scores 0: a flat, exact bound with no shallow structure.
+    void setMinCompetitiveScore(float minScore) override {
+      if (minScore > constantScore) exhausted = true;
+    }
+
     float getMaxScore(int32_t upTo) override {
       unused(upTo);
-      return 0.0f;
+      return constantScore;
     }
     float getMaxScoreForSetup(int32_t upTo) override {
       unused(upTo);
-      return 0.0f;
+      return constantScore;
     }
     int32_t advanceShallowForSetup(int32_t target) override {
       unused(target);
@@ -432,6 +453,7 @@ public:
     int32_t maxDoc;
     int32_t windowStart = 0;
     int32_t windowEnd = 0;
+    float constantScore;
 
     static uint64_t validMask(int32_t remaining) {
       if (remaining >= 64) return ~0ULL;
@@ -502,12 +524,13 @@ public:
     }
 
   public:
-    RangeBulkScorer(MemPool& pool, ZoneMapScorer* scorer, int32_t maxDoc)
+    RangeBulkScorer(MemPool& pool, ZoneMapScorer* scorer, int32_t maxDoc,
+                    float constantScore)
         : scorer(scorer),
           windowBits(pool.make_arr<uint64_t>(WINDOW_WORDS), WINDOW_WORDS),
           outDocs(pool.make_arr<int32_t>(WINDOW_SIZE), WINDOW_SIZE),
           outScores(pool.make_arr<float>(WINDOW_SIZE), WINDOW_SIZE),
-          maxDoc(maxDoc) {}
+          maxDoc(maxDoc), constantScore(constantScore) {}
 
     int32_t countNextWindow(int64_t& count, DocSetBuilder* domainOut,
                             DocSet* filter, int32_t min, int32_t max) override {
@@ -538,7 +561,7 @@ public:
       fillWindow(filter, min, max);
       out.min = windowStart;
       out.max = windowEnd;
-      if (minCompetitiveScore <= 0.0f) {
+      if (minCompetitiveScore <= constantScore) {
         int32_t nbits = windowEnd - windowStart;
         for (int32_t w = 0; w < WINDOW_WORDS; w++) {
           uint64_t bits = windowBits[(size_t)w];
@@ -547,7 +570,7 @@ public:
             int32_t index = (w << 6) + bit;
             if (index >= nbits) break;
             outDocs[(size_t)out.size] = windowStart + index;
-            outScores[(size_t)out.size] = 0.0f;
+            outScores[(size_t)out.size] = constantScore;
             out.size++;
             bits &= bits - 1;
           }
@@ -564,6 +587,7 @@ public:
   class Weight final : public Query::Weight {
     NumericRangeQuery& query;
     std::span<SegFieldInfo*> segInfos;
+    float constantScore;
 
     static int64_t estimateCost(IntColReader& reader,
                                 std::span<const BlockPlan> plans) {
@@ -606,8 +630,10 @@ public:
     }
 
   public:
-    Weight(Context& context, NumericRangeQuery& query, int32_t flags)
-        : Query::Weight(context, flags), query(query) {
+    Weight(Context& context, NumericRangeQuery& query, int32_t flags,
+           float constantScore)
+        : Query::Weight(context, flags), query(query),
+          constantScore(constantScore) {
       traits |= IS_CONSTANT_SCORING;
       segInfos = context.readSegInfos(query.getField());
     }
@@ -728,22 +754,25 @@ public:
       }
 
       Query::Scorer* scorerFor(MemPool& pool, const Materialized& result) {
-        return PointsMaterialize::scorerFor(pool, result, segment.maxDoc());
+        return PointsMaterialize::scorerFor(
+            pool, result, segment.maxDoc(), weight.constantScore);
       }
 
       BulkScorer* bulkFor(MemPool& pool, const Materialized& result) {
-        return PointsMaterialize::bulkFor(pool, result, segment.maxDoc());
+        return PointsMaterialize::bulkFor(
+            pool, result, segment.maxDoc(), weight.constantScore);
       }
 
       Query::Scorer* phaseOneScorer(MemPool& pool) {
         if (!useZoneMap) {
           return pool.make<RangeScorer<IntColReader::Iterator>>(
-              reader, weight.query.getLo(), weight.query.getHi(), allMatch);
+              reader, weight.query.getLo(), weight.query.getHi(), allMatch,
+              weight.constantScore);
         }
         skipCount(SkipStats::numericRangeZoneArms);
         return pool.make<ZoneMapScorer>(
             pool, reader, plans, weight.query.getLo(), weight.query.getHi(),
-            segment.maxDoc());
+            segment.maxDoc(), weight.constantScore);
       }
 
       BulkScorer* phaseOneBulkScorer(MemPool& pool) {
@@ -751,8 +780,9 @@ public:
         skipCount(SkipStats::numericRangeZoneArms);
         auto* scorer = pool.make<ZoneMapScorer>(
             pool, reader, plans, weight.query.getLo(), weight.query.getHi(),
-            segment.maxDoc());
-        return pool.make<RangeBulkScorer>(pool, scorer, segment.maxDoc());
+            segment.maxDoc(), weight.constantScore);
+        return pool.make<RangeBulkScorer>(
+            pool, scorer, segment.maxDoc(), weight.constantScore);
       }
 
       // Complement is a wash against direct materialization when the range's
@@ -807,7 +837,8 @@ public:
         if (leadCost < cost()) {
           skipCount(SkipStats::numericRangeSparseVerifyArms);
           return targetPool.make<RangeScorer<IntColReader::SparseIterator>>(
-              reader, weight.query.getLo(), weight.query.getHi(), allMatch);
+              reader, weight.query.getLo(), weight.query.getHi(), allMatch,
+              weight.constantScore);
         }
         if (points != nullptr) {
           auto [begin, end] = exactPositions(targetPool);
@@ -912,7 +943,7 @@ public:
       if (colMax < query.getLo() || query.getHi() < colMin) return nullptr;
       bool allMatch = query.getLo() <= colMin && colMax <= query.getHi();
       return targetPool.make<RangeScorer<IntColReader::Iterator>>(
-          *reader, query.getLo(), query.getHi(), allMatch);
+          *reader, query.getLo(), query.getHi(), allMatch, constantScore);
     }
 
     Query::Scorer* createZoneMapScorerForTests(MemPool& targetPool,
@@ -931,7 +962,7 @@ public:
       }
       return targetPool.make<ZoneMapScorer>(
           targetPool, *reader, plans, query.getLo(), query.getHi(),
-          segment.maxDoc());
+          segment.maxDoc(), constantScore);
     }
 
     int64_t count(IndexReader::Segment& segment) override {

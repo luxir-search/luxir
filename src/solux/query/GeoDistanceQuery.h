@@ -37,6 +37,9 @@ public:
   double getCenterLongitude() const { return centerLongitude; }
   double getRadiusMeters() const { return radiusMeters; }
   bool isEmpty() const { return false; }
+  ScoreProfile scoreProfile() const override {
+    return ScoreProfile::automatic(1.0f);
+  }
 
   BKDDistanceRelation makeRelation() const {
     return {centerLatitude, centerLongitude, radiusMeters};
@@ -44,8 +47,8 @@ public:
 
   Query::Weight* createWeight(Context& context, int32_t flags,
                               float multiplier = 1.0f) override {
-    unused(multiplier);
-    return context.pool.make<Weight>(context, *this, flags);
+    float score = (flags & NEED_SCORES) != 0 ? multiplier : 0.0f;
+    return context.pool.make<Weight>(context, *this, flags, score);
   }
 };
 

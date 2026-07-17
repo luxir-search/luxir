@@ -215,6 +215,32 @@ public:
   /// an exact hit count. Propagated independently of NEED_SCORES.
   static constexpr int32_t ALLOW_PRUNING = 1 << 1;
 
+  // Query-tree score semantics, derived before Weight creation. This is
+  // intentionally separate from Weight::IS_CONSTANT_SCORING: the latter is
+  // an execution trait and may depend on NEED_SCORES, while this profile
+  // records whether a uniform score was implicit or explicitly requested.
+  struct ScoreProfile {
+    enum class Kind : uint8_t {
+      VARIABLE,
+      AUTO_UNIFORM,
+      EXPLICIT_UNIFORM
+    };
+
+    Kind kind = Kind::VARIABLE;
+    float value = 0.0f;
+
+    static ScoreProfile variable() { return {}; }
+    static ScoreProfile automatic(float value) {
+      return {Kind::AUTO_UNIFORM, value};
+    }
+    static ScoreProfile explicitUniform(float value) {
+      return {Kind::EXPLICIT_UNIFORM, value};
+    }
+  };
+
+  // Unknown and custom queries are conservatively variable-scoring.
+  virtual ScoreProfile scoreProfile() const { return ScoreProfile::variable(); }
+
   /// Returns a non-owning pointer to the created weight.  The Query::Context
   /// is responsible for the lifecycle of the created Weight.
   /// A Context is not generally thread-safe, so don't create weights from multiple threads with the same Context.

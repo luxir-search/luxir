@@ -26,6 +26,8 @@ class GeoQueryScorer final : public Query::Scorer {
   Relation relation;
   bool multi;
   int32_t docid = -1;
+  float constantScore;
+  bool exhausted = false;
 
   bool pointMatches(int64_t packed) const {
     return relation.matches(geo::unpackLatitude(packed),
@@ -43,21 +45,22 @@ class GeoQueryScorer final : public Query::Scorer {
   }
 
 public:
-  GeoQueryScorer(IntColReader& reader, const Relation& relation)
+  GeoQueryScorer(IntColReader& reader, const Relation& relation,
+                 float constantScore)
       : reader(reader), iter(reader), relation(relation),
-        multi(reader.multiValued()) {}
+        multi(reader.multiValued()), constantScore(constantScore) {}
 
   bool hasTwoPhase() const override { return true; }
   int32_t approximationNext() override {
-    docid = iter.next();
+    docid = exhausted ? PostingsReader::END : iter.next();
     return docid;
   }
   int32_t approximationAdvance(int32_t target) override {
-    docid = iter.advance(target);
+    docid = exhausted ? PostingsReader::END : iter.advance(target);
     return docid;
   }
   int32_t approximationDocId() override { return docid; }
-  bool matches() override { return valueMatches(); }
+  bool matches() override { return !exhausted && valueMatches(); }
   float matchCost() override {
     if (!multi) return 2.0f;
     int64_t docs = reader.docsWithValue();
@@ -65,12 +68,14 @@ public:
   }
 
   int32_t next() override {
+    if (exhausted) return docid = PostingsReader::END;
     for (;;) {
       docid = iter.next();
       if (docid == PostingsReader::END || valueMatches()) return docid;
     }
   }
   int32_t advance(int32_t target) override {
+    if (exhausted) return docid = PostingsReader::END;
     assert(docid < target);
     docid = iter.advance(target);
     while (docid != PostingsReader::END && !valueMatches()) {
@@ -79,16 +84,19 @@ public:
     return docid;
   }
   int32_t docId() override { return docid; }
-  float score() override { return 0.0f; }
+  float score() override { return constantScore; }
 
-  // Every match scores 0: a flat, exact bound with no shallow structure.
+  void setMinCompetitiveScore(float minScore) override {
+    if (minScore > constantScore) exhausted = true;
+  }
+
   float getMaxScore(int32_t upTo) override {
     unused(upTo);
-    return 0.0f;
+    return constantScore;
   }
   float getMaxScoreForSetup(int32_t upTo) override {
     unused(upTo);
-    return 0.0f;
+    return constantScore;
   }
   int32_t advanceShallowForSetup(int32_t target) override {
     unused(target);
@@ -100,6 +108,7 @@ template <class QueryType, class Relation>
 class GeoQueryWeight final : public Query::Weight {
   QueryType& query;
   std::span<SegFieldInfo*> segInfos;
+  float constantScore;
 
   bool segmentInfo(IndexReader::Segment& segment, SegFieldInfo*& info) const {
     if (segInfos.empty()) return false;
@@ -118,8 +127,10 @@ class GeoQueryWeight final : public Query::Weight {
   }
 
 public:
-  GeoQueryWeight(Query::Context& context, QueryType& query, int32_t flags)
-      : Query::Weight(context, flags), query(query) {
+  GeoQueryWeight(Query::Context& context, QueryType& query, int32_t flags,
+                 float constantScore)
+      : Query::Weight(context, flags), query(query),
+        constantScore(constantScore) {
     traits |= IS_CONSTANT_SCORING;
     segInfos = context.readSegInfos(query.getField());
   }
@@ -202,23 +213,25 @@ public:
         skipCount(SkipStats::geoSparseVerifyArms);
         return targetPool.make<
             GeoQueryScorer<Relation, IntColReader::SparseIterator>>(
-                reader, relation);
+                reader, relation, weight.constantScore);
       }
       if (bkd != nullptr) {
         skipCount(SkipStats::geoBKDArms);
         return PointsMaterialize::scorerFor(
-            targetPool, materialize(targetPool), segment.maxDoc());
+            targetPool, materialize(targetPool), segment.maxDoc(),
+            weight.constantScore);
       }
       skipCount(SkipStats::geoScanArms);
       return targetPool.make<GeoQueryScorer<Relation, IntColReader::Iterator>>(
-          reader, relation);
+          reader, relation, weight.constantScore);
     }
 
     BulkScorer* bulkScorer(MemPool& targetPool) override {
       if (bkd == nullptr) return nullptr;
       skipCount(SkipStats::geoBKDArms);
       return PointsMaterialize::bulkFor(
-          targetPool, materialize(targetPool), segment.maxDoc());
+          targetPool, materialize(targetPool), segment.maxDoc(),
+          weight.constantScore);
     }
   };
 
@@ -262,7 +275,7 @@ public:
     if (reader->numValues() == 0) return nullptr;
     Relation relation = query.makeRelation();
     return targetPool.make<GeoQueryScorer<Relation, IntColReader::Iterator>>(
-        *reader, relation);
+        *reader, relation, constantScore);
   }
 
   int64_t count(IndexReader::Segment& segment) override {

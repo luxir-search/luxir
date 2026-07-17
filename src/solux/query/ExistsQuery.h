@@ -20,6 +20,9 @@ public:
   explicit ExistsQuery(std::string_view field) : field(field) {}
 
   std::string_view getField() const { return field; }
+  ScoreProfile scoreProfile() const override {
+    return ScoreProfile::automatic(1.0f);
+  }
 
   class Weight;
 
@@ -29,34 +32,45 @@ public:
   class Scorer final : public Query::Scorer {
     DocsReader docs;
     screaming::BitSet::Iterator iterator;
+    float constantScore;
+    bool exhausted = false;
+    int32_t docid = -1;
 
   public:
-    Scorer(PostingsReader& postingsReader, const SegFieldInfo& fieldInfo)
-        : docs(postingsReader, fieldInfo), iterator(docs.bitset()) {
+    Scorer(PostingsReader& postingsReader, const SegFieldInfo& fieldInfo,
+           float constantScore)
+        : docs(postingsReader, fieldInfo), iterator(docs.bitset()),
+          constantScore(constantScore) {
       assert(fieldInfo.docsWithField > 0);
       assert(fieldInfo.docsWithField < postingsReader.maxDoc());
       assert(docs.hasBitset());
     }
 
-    int32_t next() override { return iterator.next(); }
+    int32_t next() override {
+      return docid = exhausted ? PostingsReader::END : iterator.next();
+    }
 
     int32_t advance(int32_t target) override {
       assert(docId() < target);
-      return iterator.advance(target);
+      return docid = exhausted ? PostingsReader::END : iterator.advance(target);
     }
 
-    int32_t docId() override { return iterator.val(); }
+    int32_t docId() override { return docid; }
 
-    float score() override { return 0.0f; }
+    float score() override { return constantScore; }
+
+    void setMinCompetitiveScore(float minScore) override {
+      if (minScore > constantScore) exhausted = true;
+    }
 
     float getMaxScore(int32_t upTo) override {
       unused(upTo);
-      return 0.0f;
+      return constantScore;
     }
 
     float getMaxScoreForSetup(int32_t upTo) override {
       unused(upTo);
-      return 0.0f;
+      return constantScore;
     }
 
     int32_t advanceShallowForSetup(int32_t target) override {
@@ -68,35 +82,41 @@ public:
   class Weight final : public Query::Weight {
     ExistsQuery& query;
     std::span<SegFieldInfo*> segInfos;
+    float constantScore;
 
     SegFieldInfo* segmentInfo(IndexReader::Segment& segment) const {
       return segInfos.empty() ? nullptr : segInfos[(size_t)segment.ord];
     }
 
   public:
-    Weight(Context& context, ExistsQuery& query, int32_t flags)
+    Weight(Context& context, ExistsQuery& query, int32_t flags,
+           float constantScore)
         : Query::Weight(context, flags), query(query),
-          segInfos(context.readSegInfos(query.getField())) {
+          segInfos(context.readSegInfos(query.getField())),
+          constantScore(constantScore) {
       traits |= IS_CONSTANT_SCORING;
     }
 
     class Supplier final : public Query::ScorerSupplier {
       IndexReader::Segment& segment;
       SegFieldInfo& fieldInfo;
+      float constantScore;
 
     public:
-      Supplier(IndexReader::Segment& segment, SegFieldInfo& fieldInfo)
-          : segment(segment), fieldInfo(fieldInfo) {}
+      Supplier(IndexReader::Segment& segment, SegFieldInfo& fieldInfo,
+               float constantScore)
+          : segment(segment), fieldInfo(fieldInfo),
+            constantScore(constantScore) {}
 
       int64_t cost() override { return fieldInfo.docsWithField; }
 
       Query::Scorer* get(MemPool& targetPool, int64_t leadCost) override {
         unused(leadCost);
         if (fieldInfo.docsWithField == segment.maxDoc()) {
-          return targetPool.make<AllQuery::Scorer>(segment);
+          return targetPool.make<AllQuery::Scorer>(segment, constantScore);
         }
         return targetPool.make<ExistsQuery::Scorer>(
-            segment.postingsReader(), fieldInfo);
+            segment.postingsReader(), fieldInfo, constantScore);
       }
     };
 
@@ -104,7 +124,7 @@ public:
         MemPool& targetPool, IndexReader::Segment& segment) override {
       SegFieldInfo* info = segmentInfo(segment);
       if (info == nullptr || info->docsWithField == 0) return nullptr;
-      return targetPool.make<Supplier>(segment, *info);
+      return targetPool.make<Supplier>(segment, *info, constantScore);
     }
 
     Query::Scorer* createScorer(
@@ -124,8 +144,8 @@ public:
 
 inline ExistsQuery::Weight* ExistsQuery::createWeight(
     Context& context, int32_t flags, float multiplier) {
-  unused(multiplier);
-  return context.pool.make<ExistsQuery::Weight>(context, *this, flags);
+  float score = (flags & NEED_SCORES) != 0 ? multiplier : 0.0f;
+  return context.pool.make<ExistsQuery::Weight>(context, *this, flags, score);
 }
 
 static_assert(std::is_trivially_destructible_v<ExistsQuery::Weight>);

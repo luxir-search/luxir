@@ -23,9 +23,9 @@ class TermRangeQuery final : public MultiTermQuery {
 
 public:
   TermRangeQuery(std::string_view field, std::optional<std::string_view> lower,
-                 bool includeLower, std::optional<std::string_view> upper, bool includeUpper,
-                 float boost = 1.0f)
-    : MultiTermQuery(field, boost), lower(lower), upper(upper),
+                 bool includeLower, std::optional<std::string_view> upper,
+                 bool includeUpper)
+    : MultiTermQuery(field), lower(lower), upper(upper),
       includeLower(includeLower), includeUpper(includeUpper) {}
 
   const std::optional<std::string_view>& getLower() const { return lower; }

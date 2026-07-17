@@ -182,6 +182,18 @@ TEST_F(BoostQueryTest, foldedBoundsMatchExhaustiveAcrossQueryKinds) {
   std::vector<Query*> highClauses = {&alphaOpt, &highConstant};
   BooleanQuery highOr({}, highClauses, {}, {});
   assertPrunedTopKMatchesExhaustive(*index.reader, highOr, "high-constant OR", 5, false);
+
+  PrefixQuery gammaPrefix("body_w", "gam");
+  std::vector<Query*> autoUniformClauses = {&alphaOpt, &gammaPrefix};
+  BooleanQuery autoUniformOr({}, autoUniformClauses, {}, {});
+  assertPrunedTopKMatchesExhaustive(
+      *index.reader, autoUniformOr, "auto-uniform OR", 5, false);
+
+  BoostQuery promotedPrefix(&gammaPrefix, 3.0f);
+  std::vector<Query*> explicitUniformClauses = {&alphaOpt, &promotedPrefix};
+  BooleanQuery explicitUniformOr({}, explicitUniformClauses, {}, {});
+  assertPrunedTopKMatchesExhaustive(
+      *index.reader, explicitUniformOr, "explicit-uniform OR", 5, false);
 }
 
 TEST_F(BoostQueryTest, flatBoundScorersReportExactBoundsAndExhaust) {
@@ -220,6 +232,22 @@ TEST_F(BoostQueryTest, flatBoundScorersReportExactBoundsAndExhaust) {
   EXPECT_EQ(1, multiTerm->next());
   multiTerm->setMinCompetitiveScore(3.5f);  // above the constant: exhausted
   EXPECT_EQ(PostingsReader::END, multiTerm->next());
+
+  auto* unscoredConstant = constant.createWeight(context, 0)
+      ->createScorer(pool, segment);
+  ASSERT_NE(nullptr, unscoredConstant);
+  ASSERT_EQ(0, unscoredConstant->next());
+  EXPECT_FLOAT_EQ(0.0f, unscoredConstant->score());
+  EXPECT_FLOAT_EQ(0.0f,
+                  unscoredConstant->getMaxScoreForSetup(PostingsReader::END));
+
+  auto* unscoredMultiTerm = boosted.createWeight(context, 0)
+      ->createScorer(pool, segment);
+  ASSERT_NE(nullptr, unscoredMultiTerm);
+  ASSERT_EQ(0, unscoredMultiTerm->next());
+  EXPECT_FLOAT_EQ(0.0f, unscoredMultiTerm->score());
+  EXPECT_FLOAT_EQ(0.0f,
+                  unscoredMultiTerm->getMaxScoreForSetup(PostingsReader::END));
 }
 
 TEST_F(BoostQueryTest, constantScoreAbsorbsOnlyOuterBoost) {

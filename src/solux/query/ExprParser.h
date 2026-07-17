@@ -571,7 +571,7 @@ private:
     }
 
     if (!infix) {
-      if (items.size() == 1 && (items[0].mod == Mod::NONE || items[0].mod == Mod::PLUS)) {
+      if (items.size() == 1 && items[0].mod == Mod::NONE) {
         return items[0].node;
       }
       // Juxtaposed comparisons/ranges on ONE field would combine as SHOULD:
@@ -647,7 +647,7 @@ private:
                                 std::pmr::vector<const api::Query*>& optional,
                                 std::pmr::vector<const api::Query*>& prohibited) {
     if (required.empty() && optional.empty()) {
-      optional.push_back(matchAll());  // purely negative: everything except...
+      required.push_back(matchAll());  // purely negative, non-scoring carrier
     }
     api::BooleanQuery bq;
     bq.required = querySpan(required);

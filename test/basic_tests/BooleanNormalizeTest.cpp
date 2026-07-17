@@ -15,6 +15,7 @@
 #include "solux/query/BooleanQuery.h"
 #include "solux/query/BoostQuery.h"
 #include "solux/query/ConstantScoreQuery.h"
+#include "solux/query/ExistsQuery.h"
 #include "solux/query/ForcePrepareQuery.h"
 #include "solux/query/TermQuery.h"
 
@@ -136,10 +137,10 @@ TEST_F(BooleanNormalizeTest, standalonePureNegativeSeedsAllAndStaysBoolean) {
   BooleanQuery pureNegative({}, {}, prohibited, {});
 
   auto view = shape(pureNegative);
-  EXPECT_EQ(0, view.mandatoryCount);
-  EXPECT_EQ(1, view.optionalCount);
+  EXPECT_EQ(1, view.mandatoryCount);
+  EXPECT_EQ(0, view.optionalCount);
   EXPECT_EQ(1, view.prohibitedCount);
-  EXPECT_EQ(std::type_index(typeid(AllQuery)), view.optionalTypes[0]);
+  EXPECT_EQ(std::type_index(typeid(AllQuery)), view.mandatoryTypes[0]);
   EXPECT_EQ(0u, view.ruleMask & BooleanQuery::R4_SINGLE_CLAUSE_UNWRAP);
   EXPECT_EQ(2, countHits(*testIndex.reader, pureNegative));
 
@@ -162,6 +163,60 @@ TEST_F(BooleanNormalizeTest, standalonePureNegativeSeedsAllAndStaysBoolean) {
   Query::Context prepareContext(preparePool, *testIndex.reader);
   EXPECT_TRUE(preparingComplement.createWeight(
       prepareContext, Query::NEED_SCORES)->needsPrepare());
+}
+
+TEST_F(BooleanNormalizeTest, positionalUniformScoresAndBoostPromotion) {
+  TestIndex testIndex;
+  const std::string_view bodies[] = {"a", "a b", "b"};
+  buildBodyIndex(testIndex, bodies);
+
+  ExistsQuery exists("body_w");
+  EXPECT_EQ(Query::ScoreProfile::Kind::AUTO_UNIFORM,
+            exists.scoreProfile().kind);
+  EXPECT_FLOAT_EQ(1.0f, exists.scoreProfile().value);
+  for (const auto& [doc, score] : collectScores(*testIndex.reader, exists)) {
+    unused(doc);
+    EXPECT_FLOAT_EQ(1.0f, score);
+  }
+
+  Query* requiredAuto[] = {&exists};
+  BooleanQuery suppressed(requiredAuto, {}, {}, {});
+  EXPECT_EQ(Query::ScoreProfile::Kind::AUTO_UNIFORM,
+            suppressed.scoreProfile().kind);
+  EXPECT_FLOAT_EQ(0.0f, suppressed.scoreProfile().value);
+  for (const auto& [doc, score] : collectScores(*testIndex.reader, suppressed)) {
+    unused(doc);
+    EXPECT_FLOAT_EQ(0.0f, score);
+  }
+
+  BoostQuery explicitOne(&exists, 1.0f);
+  EXPECT_EQ(Query::ScoreProfile::Kind::EXPLICIT_UNIFORM,
+            explicitOne.scoreProfile().kind);
+  Query* requiredExplicit[] = {&explicitOne};
+  BooleanQuery promoted(requiredExplicit, {}, {}, {});
+  for (const auto& [doc, score] : collectScores(*testIndex.reader, promoted)) {
+    unused(doc);
+    EXPECT_FLOAT_EQ(1.0f, score);
+  }
+
+  TermQuery term("body_w", "a");
+  Query* termAndExists[] = {&term, &exists};
+  BooleanQuery conjunction(termAndExists, {}, {}, {});
+  BoostQuery boostedConjunction(&conjunction, 3.0f);
+  BoostQuery boostedTerm(&term, 3.0f);
+  expectScoresNear(collectScores(*testIndex.reader, boostedTerm),
+                   collectScores(*testIndex.reader, boostedConjunction));
+
+  Query* disjuncts[] = {&exists, &exists};
+  BooleanQuery disjunction({}, disjuncts, {}, {});
+  EXPECT_EQ(Query::ScoreProfile::Kind::VARIABLE,
+            disjunction.scoreProfile().kind);
+  Query* nestedRequired[] = {&disjunction};
+  BooleanQuery nested(nestedRequired, {}, {}, {});
+  for (const auto& [doc, score] : collectScores(*testIndex.reader, nested)) {
+    unused(doc);
+    EXPECT_FLOAT_EQ(2.0f, score);
+  }
 }
 
 TEST_F(BooleanNormalizeTest, requiredComplementFormInlinesUnderBothOccurs) {

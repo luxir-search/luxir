@@ -2295,7 +2295,7 @@ TEST_F(TermScorerTest, multiSeg) {
     // try an all-scorer
     {
       auto poolFree = testIndex.pool.rewindScopeGuard();
-      float score = 0.0f; // current expected score for an all-scorer is 0.0f
+      float score = 1.0f;
       AllQuery allQuery;
       Query::Context qContext(testIndex.pool, *testIndex.reader);
       auto* weight = allQuery.createWeight(qContext, Query::NEED_SCORES);

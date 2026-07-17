@@ -160,8 +160,8 @@ TEST_F(SimpleQueryParserTest, negation) {
   auto r = parse("-foo");
   const auto& b = asBool(*r.root);
   ASSERT_EQ(1u, b.prohibited.size());
-  ASSERT_EQ(1u, b.optional.size());  // the match-all companion
-  EXPECT_TRUE(std::holds_alternative<bool>(b.optional[0].kind));
+  ASSERT_EQ(1u, b.required.size());  // the non-scoring match-all companion
+  EXPECT_TRUE(std::holds_alternative<bool>(b.required[0].kind));
   EXPECT_EQ("foo", matchVal(b.prohibited[0]));
 }
 
@@ -187,16 +187,18 @@ TEST_F(SimpleQueryParserTest, operatorsAreLiteralMidToken) {
 
 TEST_F(SimpleQueryParserTest, stackedLeadingSignsFirstWins) {
   // only the FIRST sign at a boundary is a modifier; the rest are literal
-  // term bytes.  '+-foo' = require the term "-foo" (single clause, unwrapped)
-  EXPECT_EQ("-foo", matchVal(*parse("+-foo").root));
+  // term bytes. '+-foo' = require the term "-foo".
+  const auto& required = asBool(*parse("+-foo").root);
+  ASSERT_EQ(1u, required.required.size());
+  EXPECT_EQ("-foo", matchVal(required.required[0]));
 
   // '-+foo' = prohibit the term "+foo"; a pure-negative level gets a match-all
   // companion so it means "everything except"
   const auto& b = asBool(*parse("-+foo").root);
   ASSERT_EQ(1u, b.prohibited.size());
   EXPECT_EQ("+foo", matchVal(b.prohibited[0]));
-  ASSERT_EQ(1u, b.optional.size());
-  EXPECT_TRUE(std::holds_alternative<bool>(b.optional[0].kind));
+  ASSERT_EQ(1u, b.required.size());
+  EXPECT_TRUE(std::holds_alternative<bool>(b.required[0].kind));
 
   // '--foo' no longer cancels: '-' modifier + literal term "-foo"
   const auto& b2 = asBool(*parse("--foo").root);
@@ -216,8 +218,10 @@ TEST_F(SimpleQueryParserTest, extraneousParenNeutralForBoundary) {
   ASSERT_EQ(1u, b.prohibited.size());
   EXPECT_EQ("foo", matchVal(b.prohibited[0]));
 
-  EXPECT_EQ("foo", matchVal(*parse("(+foo").root));  // required single -> leaf
-  EXPECT_EQ("foo", matchVal(*parse(")+foo").root));  // a stray ')' is neutral too
+  const auto& openRequired = asBool(*parse("(+foo").root);
+  EXPECT_EQ("foo", matchVal(openRequired.required[0]));
+  const auto& closeRequired = asBool(*parse(")+foo").root);
+  EXPECT_EQ("foo", matchVal(closeRequired.required[0]));
 }
 
 TEST_F(SimpleQueryParserTest, whitespaceBreaksNegation) {

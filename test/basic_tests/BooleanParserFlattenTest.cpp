@@ -154,14 +154,14 @@ TEST_F(BooleanParserFlattenTest, negationFormsNormalizeToComplements) {
   }
 
   AllQuery all;
-  Query* allOptional[] = {&all};
-  BooleanQuery complement({}, allOptional, prohibited, {});
+  Query* allRequired[] = {&all};
+  BooleanQuery complement(allRequired, {}, prohibited, {});
   for (Query* parsed : {parseExpr("NOT body_w:b"), parseSimple("-b")}) {
     auto view = shape(parsed);
-    EXPECT_EQ(0, view.mandatoryCount);
-    EXPECT_EQ(1, view.optionalCount);
+    EXPECT_EQ(1, view.mandatoryCount);
+    EXPECT_EQ(0, view.optionalCount);
     EXPECT_EQ(1, view.prohibitedCount);
-    EXPECT_EQ(std::type_index(typeid(AllQuery)), view.optionalTypes[0]);
+    EXPECT_EQ(std::type_index(typeid(AllQuery)), view.mandatoryTypes[0]);
     EXPECT_EQ(0u, view.ruleMask & BooleanQuery::R4_SINGLE_CLAUSE_UNWRAP);
     expectScoresNear(collectScores(*index.reader, complement),
                      collectScores(*index.reader, *parsed));
