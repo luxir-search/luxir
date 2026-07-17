@@ -50,6 +50,18 @@ struct DisjGroupBulkGuard {
   }
 };
 
+struct DisjConjBulkGuard {
+  bool saved = BooleanQuery::MaxScoreBulkScorer::disableDisjConjBulkForTests;
+
+  explicit DisjConjBulkGuard(bool disabled) {
+    BooleanQuery::MaxScoreBulkScorer::disableDisjConjBulkForTests = disabled;
+  }
+
+  ~DisjConjBulkGuard() {
+    BooleanQuery::MaxScoreBulkScorer::disableDisjConjBulkForTests = saved;
+  }
+};
+
 struct NotTwoPhaseGuard {
   bool saved = BooleanQuery::MandNotScorer::disableNotTwoPhaseForTests;
 
@@ -59,6 +71,30 @@ struct NotTwoPhaseGuard {
 
   ~NotTwoPhaseGuard() {
     BooleanQuery::MandNotScorer::disableNotTwoPhaseForTests = saved;
+  }
+};
+
+struct DisjTwoPhaseGuard {
+  bool saved = BooleanQuery::DisjunctionScorer::disableDisjTwoPhaseForTests;
+
+  explicit DisjTwoPhaseGuard(bool disabled) {
+    BooleanQuery::DisjunctionScorer::disableDisjTwoPhaseForTests = disabled;
+  }
+
+  ~DisjTwoPhaseGuard() {
+    BooleanQuery::DisjunctionScorer::disableDisjTwoPhaseForTests = saved;
+  }
+};
+
+struct UnscoredOptionalDropGuard {
+  bool saved = BooleanQuery::Weight::disableUnscoredOptionalDropForTests;
+
+  explicit UnscoredOptionalDropGuard(bool disabled) {
+    BooleanQuery::Weight::disableUnscoredOptionalDropForTests = disabled;
+  }
+
+  ~UnscoredOptionalDropGuard() {
+    BooleanQuery::Weight::disableUnscoredOptionalDropForTests = saved;
   }
 };
 
@@ -106,16 +142,21 @@ public:
   api::Query genBool(std::pmr::memory_resource& mr, int depth) {
     if (depth > 0 && rng.rint(5) == 0) {
       int groupCount = (int) rng.rint(2, 4);
-      std::vector<api::Query> required;
+      bool disjunctionOfConjunctions = rng.rint(2) != 0;
+      std::vector<api::Query> groups;
       for (int group = 0; group < groupCount; group++) {
         int termCount = (int) rng.rint(2, 4);
         std::vector<api::Query> terms;
         for (int term = 0; term < termCount; term++) {
           terms.push_back(qb::match(mr, "body_w", randTerm()));
         }
-        required.push_back(qb::boolean(mr, {}, terms));
+        groups.push_back(disjunctionOfConjunctions
+            ? qb::boolean(mr, terms)
+            : qb::boolean(mr, {}, terms));
       }
-      return qb::boolean(mr, required);
+      return disjunctionOfConjunctions
+          ? qb::boolean(mr, {}, groups)
+          : qb::boolean(mr, groups);
     }
     int nreq = (int)rng.rint(4);     // 0..3
     int nopt = (int)rng.rint(4);     // 0..3
@@ -629,10 +670,16 @@ TEST_F(BooleanFuzzTest, randomBooleanMatchesOracle) {
     }
 
     auto run = [&](bool disableFlatten, bool disableDisjGroupBulk,
-                   bool disableNotTwoPhase = false) {
+                   bool disableNotTwoPhase = false,
+                   bool disableDisjTwoPhase = false,
+                   bool disableOptionalDrop = false,
+                   bool disableDisjConjBulk = false) {
       ApproxFlattenGuard flattenGuard(disableFlatten);
       DisjGroupBulkGuard disjGroupGuard(disableDisjGroupBulk);
+      DisjConjBulkGuard disjConjGuard(disableDisjConjBulk);
       NotTwoPhaseGuard notGuard(disableNotTwoPhase);
+      DisjTwoPhaseGuard disjGuard(disableDisjTwoPhase);
+      UnscoredOptionalDropGuard optionalDropGuard(disableOptionalDrop);
       auto req = localReq(helper.getSearchEngine());
       req->collection("main");
       auto& cur = req->topDocs("q");
@@ -660,23 +707,36 @@ TEST_F(BooleanFuzzTest, randomBooleanMatchesOracle) {
     auto opaque = run(true, true);
     auto groupBulk = run(true, false);
     auto flattened = run(false, false);
+    auto disjConjOpaque = run(false, false, false, false, false, true);
     auto eagerNot = run(false, false, true);
+    auto eagerDisj = run(false, false, false, true);
+    auto retainedOptionals = run(false, false, false, false, true);
 
     if (expected != opaque.second || opaque != groupBulk || groupBulk != flattened
-        || flattened != eagerNot || opaque.first != (int64_t) expected.size()) {
+        || flattened != disjConjOpaque || flattened != eagerNot || flattened != eagerDisj
+        || flattened != retainedOptionals
+        || opaque.first != (int64_t) expected.size()) {
       std::string diff;
       for (const auto& [id, toks] : docs) {
         bool brute = expected.contains(id);
         bool oldPath = opaque.second.contains(id);
         bool groupPath = groupBulk.second.contains(id);
         bool flatPath = flattened.second.contains(id);
+        bool disjConjOpaquePath = disjConjOpaque.second.contains(id);
         bool eagerNotPath = eagerNot.second.contains(id);
-        if (!brute && !oldPath && !groupPath && !flatPath && !eagerNotPath) continue;
+        bool eagerDisjPath = eagerDisj.second.contains(id);
+        bool retainedOptionalsPath = retainedOptionals.second.contains(id);
+        if (!brute && !oldPath && !groupPath && !flatPath
+            && !disjConjOpaquePath && !eagerNotPath && !eagerDisjPath
+            && !retainedOptionalsPath) continue;
         diff += "  " + id + " [brute=" + (brute ? "Y" : "N")
             + " nested=" + (oldPath ? "Y" : "N")
             + " group=" + (groupPath ? "Y" : "N")
             + " flat=" + (flatPath ? "Y" : "N")
-            + " eager_not=" + (eagerNotPath ? "Y" : "N") + "] toks:";
+            + " disj_conj_opaque=" + (disjConjOpaquePath ? "Y" : "N")
+            + " eager_not=" + (eagerNotPath ? "Y" : "N")
+            + " eager_disj=" + (eagerDisjPath ? "Y" : "N")
+            + " retained_opt=" + (retainedOptionalsPath ? "Y" : "N") + "] toks:";
         for (const auto& t : toks) diff += " " + t;
         diff += "\n";
       }
@@ -684,7 +744,10 @@ TEST_F(BooleanFuzzTest, randomBooleanMatchesOracle) {
                     << " nestedCount=" << opaque.first
                     << " groupCount=" << groupBulk.first
                     << " flatCount=" << flattened.first
+                    << " disjConjOpaqueCount=" << disjConjOpaque.first
                     << " eagerNotCount=" << eagerNot.first
+                    << " eagerDisjCount=" << eagerDisj.first
+                    << " retainedOptCount=" << retainedOptionals.first
                     << "\ndiff docs:\n" << diff << "query=\n" << querySummary(rootQuery);
       break;
     }
@@ -816,7 +879,8 @@ TEST_F(BooleanFuzzTest, explicitFlatteningTransformsMatchOracleAndTwin) {
                                            std::move(twinScores)};
     };
 
-    auto runNoScores = [&](bool prepared) {
+    auto runNoScores = [&](bool prepared, bool disableOptionalDrop) {
+      UnscoredOptionalDropGuard optionalDropGuard(disableOptionalDrop);
       auto req = localReq(helper.getSearchEngine());
       req->collection("main");
       auto& nestedCursor = req->topDocs("nested");
@@ -844,9 +908,14 @@ TEST_F(BooleanFuzzTest, explicitFlatteningTransformsMatchOracleAndTwin) {
                      "live vs prepared nested");
     expectScoresNear(liveScores.second, preparedScores.second, spec,
                      "live vs prepared twin");
-    auto liveCounts = runNoScores(false);
-    auto preparedCounts = runNoScores(true);
+    auto liveCounts = runNoScores(false, false);
+    auto preparedCounts = runNoScores(true, false);
+    auto retainedLiveCounts = runNoScores(false, true);
+    auto retainedPreparedCounts = runNoScores(true, true);
     EXPECT_EQ(liveCounts, preparedCounts) << "count live/prepared kind=" << spec.kind;
+    EXPECT_EQ(liveCounts, retainedLiveCounts) << "count reduced/retained live kind=" << spec.kind;
+    EXPECT_EQ(liveCounts, retainedPreparedCounts)
+      << "count reduced/retained prepared kind=" << spec.kind;
   }
 }
 

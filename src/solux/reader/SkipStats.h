@@ -96,6 +96,8 @@ struct SkipStats {
   static inline int64_t conjDenseCountWindows = 0;
   static inline int64_t conjDisjGroupCountWindows = 0;
   static inline int64_t conjDisjGroupScoreWindows = 0;
+  // Pure disjunction count windows containing exact all-term conjunction members.
+  static inline int64_t disjConjGroupCountWindows = 0;
   static inline int64_t conjCountFallbacks = 0;
   static inline int64_t bulkDomainWindowsFed = 0;
   static inline int64_t numericRangeSparseVerifyArms = 0;
@@ -192,6 +194,7 @@ struct SkipStats {
     conjDenseCountWindows = 0;
     conjDisjGroupCountWindows = 0;
     conjDisjGroupScoreWindows = 0;
+    disjConjGroupCountWindows = 0;
     conjCountFallbacks = 0;
     bulkDomainWindowsFed = 0;
     numericRangeSparseVerifyArms = 0;

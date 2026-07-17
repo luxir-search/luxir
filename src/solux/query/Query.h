@@ -619,6 +619,12 @@ public:
     virtual std::span<Scorer*> flatDisjunctionScorers() {
       return {};
     }
+    /// Flat MUST clauses whose conjunction exactly matches this scorer without
+    /// verification. Consumers may decompose the scorer only when they
+    /// understand every returned child; an empty span keeps it opaque.
+    virtual std::span<Scorer*> flatConjunctionScorers() {
+      return {};
+    }
     virtual float matchCost() {
       return 0.0f;
     }
