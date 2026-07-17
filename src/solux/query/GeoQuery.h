@@ -50,15 +50,15 @@ public:
 
   bool hasTwoPhase() const override { return true; }
   int32_t approximationNext() override {
-    docid = exhausted ? PostingsReader::END : iter.next();
+    docid = iter.next();
     return docid;
   }
   int32_t approximationAdvance(int32_t target) override {
-    docid = exhausted ? PostingsReader::END : iter.advance(target);
+    docid = iter.advance(target);
     return docid;
   }
   int32_t approximationDocId() override { return docid; }
-  bool matches() override { return !exhausted && valueMatches(); }
+  bool matches() override { return valueMatches(); }
   float matchCost() override {
     if (!multi) return 2.0f;
     int64_t docs = reader.docsWithValue();
@@ -66,14 +66,12 @@ public:
   }
 
   int32_t next() override {
-    if (exhausted) return docid = PostingsReader::END;
     for (;;) {
       docid = iter.next();
       if (docid == PostingsReader::END || valueMatches()) return docid;
     }
   }
   int32_t advance(int32_t target) override {
-    if (exhausted) return docid = PostingsReader::END;
     assert(docid < target);
     docid = iter.advance(target);
     while (docid != PostingsReader::END && !valueMatches()) {

@@ -32,7 +32,6 @@ public:
   class Scorer final : public Query::ConstantScorer {
     DocsReader docs;
     screaming::BitSet::Iterator iterator;
-    int32_t docid = -1;
 
   public:
     Scorer(PostingsReader& postingsReader, const SegFieldInfo& fieldInfo,
@@ -45,15 +44,15 @@ public:
     }
 
     int32_t next() override {
-      return docid = exhausted ? PostingsReader::END : iterator.next();
+      return iterator.next();
     }
 
     int32_t advance(int32_t target) override {
       assert(docId() < target);
-      return docid = exhausted ? PostingsReader::END : iterator.advance(target);
+      return iterator.advance(target);
     }
 
-    int32_t docId() override { return docid; }
+    int32_t docId() override { return iterator.val(); }
   };
 
   class Weight final : public Query::Weight {

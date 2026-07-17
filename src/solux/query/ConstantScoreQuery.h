@@ -17,9 +17,15 @@ class ConstantScoreQuery final : public solux::Query {
   float constantScore;
 
   // setMinCompetitiveScore is not forwarded to the child: it was built
-  // scoreless, so the wrapper owns all score semantics.
+  // scoreless, so the wrapper owns all score semantics. The exhaustion
+  // latch is honored here (unlike leaf constant scorers) because the branch
+  // gates a child call, not a leaf's hot decode loop, and ending iteration
+  // skips all remaining child work.
   class Scorer final : public Query::ConstantScorer {
     Query::Scorer* child;
+    bool exhausted = false;
+
+    void exhaust() override { exhausted = true; }
 
   public:
     Scorer(Query::Scorer* child, float constantScore)

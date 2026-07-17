@@ -49,7 +49,7 @@ public:
     }
 
     int32_t next() override {
-      if (exhausted || docid >= lastDoc) {
+      if (docid >= lastDoc) {
         docid = PostingsReader::END;
       } else {
         docid++;
@@ -62,10 +62,12 @@ public:
       return docid;
     }
 
+    void exhaust() override { lastDoc = -1; }
+
     void fillWindowBits(std::span<uint64_t> windowBits, int32_t windowStart,
                         int32_t windowEnd) override {
       skipCount(SkipStats::countBulkFillCalls);
-      if (exhausted || windowEnd <= windowStart
+      if (windowEnd <= windowStart
           || docid == PostingsReader::END || docid >= windowEnd) return;
 
       int32_t start = std::max(windowStart, docid < 0 ? windowStart : docid);

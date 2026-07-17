@@ -80,15 +80,15 @@ public:
 
     bool hasTwoPhase() const override { return true; }
     int32_t approximationNext() override {
-      docid = exhausted ? PostingsReader::END : iter.next();
+      docid = iter.next();
       return docid;
     }
     int32_t approximationAdvance(int32_t target) override {
-      docid = exhausted ? PostingsReader::END : iter.advance(target);
+      docid = iter.advance(target);
       return docid;
     }
     int32_t approximationDocId() override { return docid; }
-    bool matches() override { return !exhausted && valueInRange(); }
+    bool matches() override { return valueInRange(); }
     float matchCost() override {
       if (allMatch) return 0.0f;
       if (!multi) return 1.0f;
@@ -97,14 +97,12 @@ public:
     }
 
     int32_t next() override {
-      if (exhausted) return docid = PostingsReader::END;
       for (;;) {
         docid = iter.next();
         if (docid == PostingsReader::END || valueInRange()) return docid;
       }
     }
     int32_t advance(int32_t target) override {
-      if (exhausted) return docid = PostingsReader::END;
       assert(docid < target);
       docid = iter.advance(target);
       while (docid != PostingsReader::END && !valueInRange()) {
@@ -391,16 +389,23 @@ public:
     }
 
     int32_t next() override {
-      if (exhausted) return docid = PostingsReader::END;
       assert(docid != PostingsReader::END);
       return seek(docid + 1);
     }
     int32_t advance(int32_t target) override {
-      if (exhausted) return docid = PostingsReader::END;
       assert(docid < target);
       return seek(target);
     }
     int32_t docId() override { return docid; }
+
+  protected:
+    // The current iteration window is behind docid, so emptying the doc
+    // range is enough; no per-call test on the seek path.
+    void exhaust() override {
+      maxDoc = 0;
+      iterWindowStart = 0;
+      iterWindowEnd = 0;
+    }
   };
 
   class RangeBulkScorer final : public BulkScorer {

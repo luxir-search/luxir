@@ -778,20 +778,25 @@ public:
   /// Base for scorers whose every match scores the same constant: a flat,
   /// exact bound with no shallow structure. Once the collector's floor rises
   /// above the constant no remaining doc can compete (ties stay competitive,
-  /// same convention as impact skipping), so setMinCompetitiveScore latches
-  /// `exhausted`; subclasses check it on their iteration paths so the current
-  /// position stays valid and only future iteration ends.
+  /// same convention as impact skipping), so setMinCompetitiveScore calls
+  /// exhaust(). The hint is advisory: subclasses that can end future
+  /// iteration for free override exhaust() to clamp an existing bound (the
+  /// current position stays valid; only future iteration ends). The default
+  /// ignores it - a per-call exhausted test on the hot iteration paths costs
+  /// far more than the latch ever saves (measured on the zone-map and
+  /// full-scan range arms).
   class ConstantScorer : public Scorer {
   protected:
     float constantScore;
-    bool exhausted = false;
 
     explicit ConstantScorer(float constantScore) : constantScore(constantScore) {}
+
+    virtual void exhaust() {}
 
   public:
     float score() override { return constantScore; }
     void setMinCompetitiveScore(float minScore) override {
-      if (minScore > constantScore) exhausted = true;
+      if (minScore > constantScore) exhaust();
     }
     float getMaxScore(int32_t upTo) override {
       unused(upTo);

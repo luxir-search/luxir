@@ -49,15 +49,17 @@ public:
       : Query::ConstantScorer(constantScore), bits(bits), maxDoc(maxDoc) {}
 
     int32_t next() override {
-      if (exhausted || docid == PostingsReader::END) return docid = PostingsReader::END;
+      if (docid == PostingsReader::END) return docid = PostingsReader::END;
       return advanceTo(docid + 1);
     }
     int32_t advance(int32_t target) override {
-      if (exhausted) return docid = PostingsReader::END;
       assert(docid < target);  // strict advance
       return advanceTo(target);
     }
     int32_t docId() override { return docid; }
+
+  protected:
+    void exhaust() override { maxDoc = 0; }
   };
 
   // Builds one doc-id window at a time while retaining each term's docs-only
@@ -127,7 +129,7 @@ public:
     }
 
     int32_t seek(int32_t target) {
-      if (exhausted || target >= maxDoc) {
+      if (target >= maxDoc) {
         return docid = PostingsReader::END;
       }
       int32_t found = findInWindow(target);
@@ -162,7 +164,7 @@ public:
     }
 
     int32_t next() override {
-      if (exhausted || docid == PostingsReader::END) {
+      if (docid == PostingsReader::END) {
         return docid = PostingsReader::END;
       }
       return seek(docid + 1);
@@ -172,6 +174,9 @@ public:
       return seek(target);
     }
     int32_t docId() override { return docid; }
+
+  protected:
+    void exhaust() override { maxDoc = 0; }
   };
 
   class Weight final : public Query::Weight {

@@ -71,7 +71,6 @@ struct PointsMaterialize {
       : Query::ConstantScorer(constantScore), docs(docs) {}
 
     int32_t next() override {
-      if (exhausted) return docid = PostingsReader::END;
       assert(docid != PostingsReader::END);
       index++;
       return docid = index < (int64_t)docs.size()
@@ -79,7 +78,6 @@ struct PointsMaterialize {
     }
 
     int32_t advance(int32_t target) override {
-      if (exhausted) return docid = PostingsReader::END;
       assert(docid < target);
       auto begin = docs.begin() + std::min<int64_t>(index + 1, docs.size());
       auto found = std::lower_bound(begin, docs.end(), target);
@@ -88,14 +86,18 @@ struct PointsMaterialize {
     }
 
     int32_t docId() override { return docid; }
+
+  protected:
+    void exhaust() override { index = (int64_t)docs.size(); }
   };
 
   class PointsBitScorer final : public Query::ConstantScorer {
     FixedBitSet bits;
+    int32_t limit;
     int32_t docid = -1;
 
     int32_t seek(int32_t target) {
-      if (target >= bits.size()) return docid = PostingsReader::END;
+      if (target >= limit) return docid = PostingsReader::END;
       int32_t found = bits.nextSetBit(target);
       return docid = found == FixedBitSet::MAX_INDEX
           ? PostingsReader::END : found;
@@ -103,15 +105,13 @@ struct PointsMaterialize {
 
   public:
     PointsBitScorer(FixedBitSet bits, float constantScore)
-      : Query::ConstantScorer(constantScore), bits(bits) {}
+      : Query::ConstantScorer(constantScore), bits(bits), limit(bits.size()) {}
 
     int32_t next() override {
-      if (exhausted) return docid = PostingsReader::END;
       assert(docid != PostingsReader::END);
       return seek(docid + 1);
     }
     int32_t advance(int32_t target) override {
-      if (exhausted) return docid = PostingsReader::END;
       assert(docid < target);
       return seek(target);
     }
