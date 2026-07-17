@@ -47,7 +47,7 @@ public:
 
   Query::Weight* createWeight(Context& context, int32_t flags,
                               float multiplier = 1.0f) override {
-    float score = (flags & NEED_SCORES) != 0 ? multiplier : 0.0f;
+    float score = constantWhenScored(flags, multiplier);
     return context.pool.make<Weight>(context, *this, flags, score);
   }
 };

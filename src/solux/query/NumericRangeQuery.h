@@ -39,7 +39,7 @@ public:
 
   Query::Weight* createWeight(Context& context, int32_t flags,
                               float multiplier = 1.0f) override {
-    float score = (flags & NEED_SCORES) != 0 ? multiplier : 0.0f;
+    float score = constantWhenScored(flags, multiplier);
     return context.pool.make<Weight>(context, *this, flags, score);
   }
 
@@ -47,7 +47,7 @@ public:
   // two-phase verifier and is also exposed to the benchmark as the old full
   // column-scan baseline when instantiated with IntColReader::Iterator.
   template <class ColIter>
-  class RangeScorer final : public Query::Scorer {
+  class RangeScorer final : public Query::ConstantScorer {
     IntColReader& reader;
     ColIter iter;
     int64_t lo;
@@ -55,8 +55,6 @@ public:
     bool allMatch;
     bool multi;
     int32_t docid = -1;
-    float constantScore;
-    bool exhausted = false;
 
     bool valueInRange() {
       if (docid == PostingsReader::END) return false;
@@ -77,8 +75,8 @@ public:
   public:
     RangeScorer(IntColReader& reader, int64_t lo, int64_t hi, bool allMatch,
                 float constantScore)
-      : reader(reader), iter(reader), lo(lo), hi(hi), allMatch(allMatch),
-        multi(reader.multiValued()), constantScore(constantScore) {}
+      : Query::ConstantScorer(constantScore), reader(reader), iter(reader),
+        lo(lo), hi(hi), allMatch(allMatch), multi(reader.multiValued()) {}
 
     bool hasTwoPhase() const override { return true; }
     int32_t approximationNext() override {
@@ -115,24 +113,6 @@ public:
       return docid;
     }
     int32_t docId() override { return docid; }
-    float score() override { return constantScore; }
-
-    void setMinCompetitiveScore(float minScore) override {
-      if (minScore > constantScore) exhausted = true;
-    }
-
-    float getMaxScore(int32_t upTo) override {
-      unused(upTo);
-      return constantScore;
-    }
-    float getMaxScoreForSetup(int32_t upTo) override {
-      unused(upTo);
-      return constantScore;
-    }
-    int32_t advanceShallowForSetup(int32_t target) override {
-      unused(target);
-      return PostingsReader::END;
-    }
   };
 
   enum class BlockRelation : uint8_t {
@@ -219,7 +199,7 @@ public:
     }
   };
 
-  class ZoneMapScorer final : public Query::Scorer {
+  class ZoneMapScorer final : public Query::ConstantScorer {
     static constexpr int32_t ITER_WINDOW_SIZE = 4096;
     static constexpr int32_t ITER_WINDOW_WORDS = ITER_WINDOW_SIZE / 64;
 
@@ -234,8 +214,6 @@ public:
     int32_t docid = -1;
     int32_t iterWindowStart = 0;
     int32_t iterWindowEnd = 0;
-    float constantScore;
-    bool exhausted = false;
 
     static void setBit(std::span<uint64_t> words, int32_t windowStart,
                        int32_t doc) {
@@ -391,9 +369,10 @@ public:
     ZoneMapScorer(MemPool& pool, IntColReader& reader,
                   std::span<const BlockPlan> plans, int64_t lo, int64_t hi,
                   int32_t maxDoc, float constantScore)
-        : reader(reader), plans(plans), crossing(reader),
+        : Query::ConstantScorer(constantScore), reader(reader), plans(plans),
+          crossing(reader),
           iterBits(pool.make_arr<uint64_t>(ITER_WINDOW_WORDS), ITER_WINDOW_WORDS),
-          lo(lo), hi(hi), maxDoc(maxDoc), constantScore(constantScore) {
+          lo(lo), hi(hi), maxDoc(maxDoc) {
       if (!reader.denseDocsWithValue()) {
         const auto& bits = reader.docsWithValueBitSet();
         selector = pool.make<screaming::BitSet::Selector>(
@@ -422,24 +401,6 @@ public:
       return seek(target);
     }
     int32_t docId() override { return docid; }
-    float score() override { return constantScore; }
-
-    void setMinCompetitiveScore(float minScore) override {
-      if (minScore > constantScore) exhausted = true;
-    }
-
-    float getMaxScore(int32_t upTo) override {
-      unused(upTo);
-      return constantScore;
-    }
-    float getMaxScoreForSetup(int32_t upTo) override {
-      unused(upTo);
-      return constantScore;
-    }
-    int32_t advanceShallowForSetup(int32_t target) override {
-      unused(target);
-      return PostingsReader::END;
-    }
   };
 
   class RangeBulkScorer final : public BulkScorer {

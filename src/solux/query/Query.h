@@ -255,6 +255,15 @@ public:
     return product;
   }
 
+  /// The constant a uniform-scoring weight contributes: its boost product
+  /// when scores are requested, 0 otherwise (built unscored means score 0
+  /// and zero bounds).
+  static float constantWhenScored(int32_t flags, float multiplier,
+                                  float local = 1.0f) {
+    return (flags & NEED_SCORES) != 0 ? checkedBoostProduct(multiplier, local)
+                                      : 0.0f;
+  }
+
   /// Per-segment planning state. Suppliers are allocated from the segment-local
   /// targetPool and only need to live until their parent has called get().
   // NOTE: no virtual destructor, so subclasses should not be owned or deleted through this type.
@@ -764,6 +773,38 @@ public:
     }
 
     // NOTE: no virtual destructor, so subclasses should be made trivially destructible
+  };
+
+  /// Base for scorers whose every match scores the same constant: a flat,
+  /// exact bound with no shallow structure. Once the collector's floor rises
+  /// above the constant no remaining doc can compete (ties stay competitive,
+  /// same convention as impact skipping), so setMinCompetitiveScore latches
+  /// `exhausted`; subclasses check it on their iteration paths so the current
+  /// position stays valid and only future iteration ends.
+  class ConstantScorer : public Scorer {
+  protected:
+    float constantScore;
+    bool exhausted = false;
+
+    explicit ConstantScorer(float constantScore) : constantScore(constantScore) {}
+
+  public:
+    float score() override { return constantScore; }
+    void setMinCompetitiveScore(float minScore) override {
+      if (minScore > constantScore) exhausted = true;
+    }
+    float getMaxScore(int32_t upTo) override {
+      unused(upTo);
+      return constantScore;
+    }
+    float getMaxScoreForSetup(int32_t upTo) override {
+      unused(upTo);
+      return constantScore;
+    }
+    int32_t advanceShallowForSetup(int32_t target) override {
+      unused(target);
+      return PostingsReader::END;
+    }
   };
 };
 

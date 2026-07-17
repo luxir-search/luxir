@@ -61,16 +61,14 @@ struct PointsMaterialize {
     bits.words[lastWord] &= ~lastMask;
   }
 
-  class PointsArrayScorer final : public Query::Scorer {
+  class PointsArrayScorer final : public Query::ConstantScorer {
     std::span<const int32_t> docs;
     int64_t index = -1;
     int32_t docid = -1;
-    float constantScore;
-    bool exhausted = false;
 
   public:
     PointsArrayScorer(std::span<const int32_t> docs, float constantScore)
-      : docs(docs), constantScore(constantScore) {}
+      : Query::ConstantScorer(constantScore), docs(docs) {}
 
     int32_t next() override {
       if (exhausted) return docid = PostingsReader::END;
@@ -90,29 +88,11 @@ struct PointsMaterialize {
     }
 
     int32_t docId() override { return docid; }
-    float score() override { return constantScore; }
-    void setMinCompetitiveScore(float minScore) override {
-      if (minScore > constantScore) exhausted = true;
-    }
-    float getMaxScore(int32_t upTo) override {
-      unused(upTo);
-      return constantScore;
-    }
-    float getMaxScoreForSetup(int32_t upTo) override {
-      unused(upTo);
-      return constantScore;
-    }
-    int32_t advanceShallowForSetup(int32_t target) override {
-      unused(target);
-      return PostingsReader::END;
-    }
   };
 
-  class PointsBitScorer final : public Query::Scorer {
+  class PointsBitScorer final : public Query::ConstantScorer {
     FixedBitSet bits;
     int32_t docid = -1;
-    float constantScore;
-    bool exhausted = false;
 
     int32_t seek(int32_t target) {
       if (target >= bits.size()) return docid = PostingsReader::END;
@@ -123,7 +103,7 @@ struct PointsMaterialize {
 
   public:
     PointsBitScorer(FixedBitSet bits, float constantScore)
-      : bits(bits), constantScore(constantScore) {}
+      : Query::ConstantScorer(constantScore), bits(bits) {}
 
     int32_t next() override {
       if (exhausted) return docid = PostingsReader::END;
@@ -136,22 +116,6 @@ struct PointsMaterialize {
       return seek(target);
     }
     int32_t docId() override { return docid; }
-    float score() override { return constantScore; }
-    void setMinCompetitiveScore(float minScore) override {
-      if (minScore > constantScore) exhausted = true;
-    }
-    float getMaxScore(int32_t upTo) override {
-      unused(upTo);
-      return constantScore;
-    }
-    float getMaxScoreForSetup(int32_t upTo) override {
-      unused(upTo);
-      return constantScore;
-    }
-    int32_t advanceShallowForSetup(int32_t target) override {
-      unused(target);
-      return PostingsReader::END;
-    }
   };
 
   class PointsArrayBulkScorer final : public BulkScorer {

@@ -540,6 +540,7 @@ public:
       Query::Scorer* scorer;
       bool unsatisfiable;
       int64_t cost;
+      size_t scoringCount;
     };
 
     // Build the required-clause conjunction. Mandatory clauses score; filter
@@ -562,17 +563,20 @@ public:
         bool scoring;
       };
       boost::container::small_vector<Entry, 16> entries;
+      size_t scoringCapacity = 0;
       for (size_t i = 0; i < mandatorySources.size(); i++) {
         auto* source = mandatorySources[i];
         auto* supplier = source->scorerSupplier(targetPool, segment);
-        if (supplier == nullptr) return {nullptr, true, 0};
-        entries.push_back({supplier->cost(), supplier, mandatoryScores[i] != 0});
+        if (supplier == nullptr) return {nullptr, true, 0, 0};
+        bool scores = mandatoryScores[i] != 0;
+        scoringCapacity += scores ? 1 : 0;
+        entries.push_back({supplier->cost(), supplier, scores});
       }
       for (auto* supplier : filterSuppliers) {
-        if (supplier == nullptr) return {nullptr, true, 0};
+        if (supplier == nullptr) return {nullptr, true, 0, 0};
         entries.push_back({supplier->cost(), supplier, false});
       }
-      if (entries.empty()) return {nullptr, false, 0};
+      if (entries.empty()) return {nullptr, false, 0, 0};
 
       // leadCost is the cost of the sparsest required clause: it bounds how often
       // the others get driven, so each may plan eager vs lazy setup off it.
@@ -585,8 +589,6 @@ public:
 
       auto* all = targetPool.make_arr<Query::Scorer*>(entries.size());
       auto* costs = targetPool.make_arr<int64_t>(entries.size());
-      size_t scoringCapacity = (size_t)std::count(
-          mandatoryScores.begin(), mandatoryScores.end(), (uint8_t)1);
       Query::Scorer** scoring = scoringCapacity == 0
         ? nullptr
         : targetPool.make_arr<Query::Scorer*>(scoringCapacity);
@@ -594,19 +596,19 @@ public:
       size_t scoringCount = 0;
       for (auto& e : entries) {
         auto* scorer = e.supplier->get(targetPool, leadCost);
-        if (scorer == nullptr) return {nullptr, true, 0};
+        if (scorer == nullptr) return {nullptr, true, 0, 0};
         all[allCount] = scorer;
         costs[allCount++] = e.cost;
         if (e.scoring) scoring[scoringCount++] = scorer;
       }
 
       // A lone scoring clause (one mandatory, no filters) needs no wrapper.
-      if (allCount == 1 && scoringCount == 1) return {all[0], false, leadCost};
+      if (allCount == 1 && scoringCount == 1) return {all[0], false, leadCost, 1};
       return {targetPool.make<BooleanQuery::ConjunctionScorer>(
                 targetPool, std::span<Query::Scorer*>(all, allCount),
                 std::span<int64_t>(costs, allCount),
                 std::span<Query::Scorer*>(scoring, scoringCount)),
-              false, leadCost};
+              false, leadCost, scoringCount};
     }
 
     // Keep clause wiring in one place so prepared and non-prepared execution
@@ -627,9 +629,7 @@ public:
           filterSuppliers);
       if (req.unsatisfiable) return nullptr;
       Query::Scorer* reqScorer = req.scorer;
-      bool hasScoringMandatory = std::find(
-          mandatoryScores.begin(), mandatoryScores.end(), (uint8_t)1)
-          != mandatoryScores.end();
+      bool hasScoringMandatory = req.scoringCount > 0;
       // Whether the optional group CONSTRAINS matching (Lucene bool
       // semantics): min_match >= 1 makes it a real constraint; otherwise
       // optionals only rank, provided a required or filter clause already

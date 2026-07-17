@@ -29,18 +29,16 @@ public:
   Weight* createWeight(Context& context, int32_t flags,
                        float multiplier = 1.0f) override;
 
-  class Scorer final : public Query::Scorer {
+  class Scorer final : public Query::ConstantScorer {
     DocsReader docs;
     screaming::BitSet::Iterator iterator;
-    float constantScore;
-    bool exhausted = false;
     int32_t docid = -1;
 
   public:
     Scorer(PostingsReader& postingsReader, const SegFieldInfo& fieldInfo,
            float constantScore)
-        : docs(postingsReader, fieldInfo), iterator(docs.bitset()),
-          constantScore(constantScore) {
+        : Query::ConstantScorer(constantScore),
+          docs(postingsReader, fieldInfo), iterator(docs.bitset()) {
       assert(fieldInfo.docsWithField > 0);
       assert(fieldInfo.docsWithField < postingsReader.maxDoc());
       assert(docs.hasBitset());
@@ -56,27 +54,6 @@ public:
     }
 
     int32_t docId() override { return docid; }
-
-    float score() override { return constantScore; }
-
-    void setMinCompetitiveScore(float minScore) override {
-      if (minScore > constantScore) exhausted = true;
-    }
-
-    float getMaxScore(int32_t upTo) override {
-      unused(upTo);
-      return constantScore;
-    }
-
-    float getMaxScoreForSetup(int32_t upTo) override {
-      unused(upTo);
-      return constantScore;
-    }
-
-    int32_t advanceShallowForSetup(int32_t target) override {
-      unused(target);
-      return PostingsReader::END;
-    }
   };
 
   class Weight final : public Query::Weight {
@@ -144,8 +121,8 @@ public:
 
 inline ExistsQuery::Weight* ExistsQuery::createWeight(
     Context& context, int32_t flags, float multiplier) {
-  float score = (flags & NEED_SCORES) != 0 ? multiplier : 0.0f;
-  return context.pool.make<ExistsQuery::Weight>(context, *this, flags, score);
+  return context.pool.make<ExistsQuery::Weight>(
+      context, *this, flags, Query::constantWhenScored(flags, multiplier));
 }
 
 static_assert(std::is_trivially_destructible_v<ExistsQuery::Weight>);

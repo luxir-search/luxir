@@ -36,7 +36,6 @@ public:
 
   Query* getChild() const { return child; }
   float getBoost() const { return boost; }
-  bool isExplicit() const { return promotesAuto; }
 
   ScoreProfile scoreProfile() const override {
     ScoreProfile profile = child->scoreProfile();

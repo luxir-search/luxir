@@ -20,14 +20,12 @@
 namespace solux {
 
 template <class Relation, class ColIter>
-class GeoQueryScorer final : public Query::Scorer {
+class GeoQueryScorer final : public Query::ConstantScorer {
   IntColReader& reader;
   ColIter iter;
   Relation relation;
   bool multi;
   int32_t docid = -1;
-  float constantScore;
-  bool exhausted = false;
 
   bool pointMatches(int64_t packed) const {
     return relation.matches(geo::unpackLatitude(packed),
@@ -47,8 +45,8 @@ class GeoQueryScorer final : public Query::Scorer {
 public:
   GeoQueryScorer(IntColReader& reader, const Relation& relation,
                  float constantScore)
-      : reader(reader), iter(reader), relation(relation),
-        multi(reader.multiValued()), constantScore(constantScore) {}
+      : Query::ConstantScorer(constantScore), reader(reader), iter(reader),
+        relation(relation), multi(reader.multiValued()) {}
 
   bool hasTwoPhase() const override { return true; }
   int32_t approximationNext() override {
@@ -84,24 +82,6 @@ public:
     return docid;
   }
   int32_t docId() override { return docid; }
-  float score() override { return constantScore; }
-
-  void setMinCompetitiveScore(float minScore) override {
-    if (minScore > constantScore) exhausted = true;
-  }
-
-  float getMaxScore(int32_t upTo) override {
-    unused(upTo);
-    return constantScore;
-  }
-  float getMaxScoreForSetup(int32_t upTo) override {
-    unused(upTo);
-    return constantScore;
-  }
-  int32_t advanceShallowForSetup(int32_t target) override {
-    unused(target);
-    return PostingsReader::END;
-  }
 };
 
 template <class QueryType, class Relation>

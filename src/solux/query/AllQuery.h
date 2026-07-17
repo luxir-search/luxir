@@ -16,9 +16,8 @@ public:
 
   AllQuery::Weight* createWeight(Context& context, int32_t flags,
                                  float multiplier = 1.0f) override {
-    float score = (flags & NEED_SCORES) != 0 ? multiplier : 0.0f;
     AllQuery::Weight* weight = context.pool.make<AllQuery::Weight>(
-        context, *this, flags, score);
+        context, *this, flags, constantWhenScored(flags, multiplier));
     return weight;
   }
 
@@ -38,17 +37,15 @@ public:
 
   };
 
-  class Scorer final : public Query::Scorer {
+  class Scorer final : public Query::ConstantScorer {
   public:
     solux::IndexReader::Segment& segment;
     int32_t docid = -1;
     int32_t lastDoc;
-    float constantScore;
-    bool exhausted = false;
 
     Scorer(solux::IndexReader::Segment& segment, float constantScore = 0.0f)
-      : segment(segment), lastDoc(segment.postingsReader().maxDoc() - 1),
-        constantScore(constantScore) {
+      : Query::ConstantScorer(constantScore), segment(segment),
+        lastDoc(segment.postingsReader().maxDoc() - 1) {
     }
 
     int32_t next() override {
@@ -63,27 +60,6 @@ public:
     /// doc we are positioned on
     int32_t docId() override {
       return docid;
-    }
-
-    float score() override {
-      return constantScore;
-    }
-
-    void setMinCompetitiveScore(float minScore) override {
-      if (minScore > constantScore) exhausted = true;
-    }
-
-    float getMaxScore(int32_t upTo) override {
-      unused(upTo);
-      return constantScore;
-    }
-    float getMaxScoreForSetup(int32_t upTo) override {
-      unused(upTo);
-      return constantScore;
-    }
-    int32_t advanceShallowForSetup(int32_t target) override {
-      unused(target);
-      return PostingsReader::END;
     }
 
     void fillWindowBits(std::span<uint64_t> windowBits, int32_t windowStart,

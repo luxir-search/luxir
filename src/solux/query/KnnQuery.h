@@ -285,7 +285,7 @@ public:
   public:
     Weight(Query::Context& context, KnnQuery& query, int32_t flags, float multiplier)
       : Query::Weight(context, flags), query(query),
-        boost((flags & NEED_SCORES) != 0 ? multiplier : 0.0f) {
+        boost(constantWhenScored(flags, multiplier)) {
       traits |= NEEDS_PREPARE;  // index-level ANN pass
       if (!query.getFieldType().knnSearchable()) {
         throw std::runtime_error(std::format(
