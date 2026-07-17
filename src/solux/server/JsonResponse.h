@@ -11,7 +11,7 @@ namespace solux {
 // flattened to row-major JSON; missing and non-finite slots render as JSON null.
 //
 // Shape:
-//   {"found": <count>, "max_score": <score>, "docs": [ {<field>: <val>, ...}, ... ],
+//   {"found": <count>, "docs": [ {<field>: <val>, ...}, ... ],
 //    "ops": {<name>: <row-shaped value>, ...},
 //    "warnings": [ {"code": ..., "message": ...}, ... ], "more": true}
 // Optional keys are omitted when absent. The first DocList is promoted to
@@ -30,7 +30,7 @@ struct DocLinesState {
   bool multiOp = false;               // request has more than one DocList op
   std::string_view currentOp;         // op of the last emitted run
   bool anyHeaderEmitted = false;      // request warnings ride on the first header
-  std::vector<std::string_view> headeredOps;  // ops whose found/max_score went out
+  std::vector<std::string_view> headeredOps;  // ops whose first run was processed
 };
 
 // One DocList op's contribution to a response, rendered as bare NDJSON
@@ -56,14 +56,13 @@ std::vector<DocRun> renderDocRuns(const solux::api::SearchResponse& resp);
 //
 // Single-op requests: pure document lines; a marker precedes them only when
 // there is content to carry - found (set exactly when the request asked
-// get_number), max_score, or warnings (degraded execution must not be
-// silent):
+// get_number) or warnings (degraded execution must not be silent):
 //   {"_header_":{"found":N,"warnings":[...]}}
 //
 // Multi-op requests: ops' outputs may interleave in RUNS (batches are emitted
 // as each op's collection completes), and every run is introduced by a meta
 // record naming its op - the first run of an op also carries its
-// found/max_score:
+// found value:
 //   {"_header_":{"op":"q1","found":N}}
 // Documents between markers belong to the named op.
 //

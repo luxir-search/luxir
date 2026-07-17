@@ -354,7 +354,6 @@ struct DocList {                                                // needs Column 
   std::span<const Map> docs;
   int64_t offset = 0;
   map_view<std::string_view, ::hpp_proto::indirect_view<Val>> ops;
-  std::optional<float> max_score;                              // align 4
   int32_t row_count = 0;                                       // align 4
   bool more = false;
 };

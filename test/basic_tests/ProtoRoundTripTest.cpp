@@ -304,7 +304,6 @@ P::SearchResponse buildResponse(std::pmr::memory_resource& mr) {
   dl.found = 42;
   dl.offset = 0;
   dl.more = false;
-  dl.max_score = 1.5f;
 
   // columns["id"] -> ColStr (single-valued string, index fill, arena-backed views)
   {
@@ -357,7 +356,6 @@ void verifyResponse(const P::SearchResponse& o) {
   ASSERT_NE(dlp, nullptr);
   const P::DocList& dl = *dlp;
   EXPECT_TRUE(dl.found && *dl.found == 42);
-  EXPECT_TRUE(dl.max_score && *dl.max_score == 1.5f);
   ASSERT_EQ(dl.columns.size(), 3u);
 
   const P::Column* id = dl.columns.find("id");

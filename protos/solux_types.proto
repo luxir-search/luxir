@@ -516,7 +516,6 @@ message DocList {
   // envelope and the format=docs _header_): the JSON response IS a flattened
   // DocList, so its keys are these field names.
   optional sint64 found = 1;
-  optional float max_score = 2;
 
   // Dense columns; each has exactly row_count slots.
   map<string, Column> columns = 3;

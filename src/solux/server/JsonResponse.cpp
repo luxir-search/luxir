@@ -333,11 +333,6 @@ void appendDocList(std::string& out, const solux::api::DocList& docs) {
     appendInt(out, *docs.found);
     out += ',';
   }
-  if (docs.max_score.has_value()) {
-    out += R"("max_score":)";
-    appendFloating(out, *docs.max_score);
-    out += ',';
-  }
   out += R"("docs":)";
   appendDocs(out, docs);
   if (!docs.ops.empty()) {
@@ -470,10 +465,6 @@ std::string renderSearchResponseLine(const solux::api::SearchResponse& resp) {
       appendKey("found");
       appendInt(out, *docs->found);
     }
-    if (docs->max_score.has_value()) {
-      appendKey("max_score");
-      appendFloating(out, *docs->max_score);
-    }
     appendKey("docs");
     appendDocs(out, *docs);
   }
@@ -536,18 +527,14 @@ bool frameDocRun(const DocRun& run, DocLinesState& state,
   bool firstForOp =
       std::find(state.headeredOps.begin(), state.headeredOps.end(), run.op) ==
       state.headeredOps.end();
-  // Scalar DocList fields go out with the op's first run; request warnings
-  // with the stream's first header.  Degraded execution must not be silent,
-  // so warnings force a header even without get_number.  NOTE: this assumes
-  // scalar fields are populated from the op's FIRST batch on (true for found;
-  // when the engine starts setting max_score it must do the same, or a
-  // late-arriving value would be suppressed here).
+  // Found goes out with the op's first run; request warnings with the stream's
+  // first header. Degraded execution must not be silent, so warnings force a
+  // header even without get_number.
   bool haveFound = firstForOp && docs.found.has_value();
-  bool haveMaxScore = firstForOp && docs.max_score.has_value();
   bool haveWarnings = !state.anyHeaderEmitted && !warnings.empty();
   // Multi-op framing: any change of op needs a marker for attribution.
   bool needMarker = state.multiOp && (firstForOp || run.op != state.currentOp);
-  bool haveContent = haveFound || haveMaxScore || haveWarnings;
+  bool haveContent = haveFound || haveWarnings;
   if (run.body.empty() && !haveContent) return false;  // nothing to say
 
   if (haveContent || needMarker) {
@@ -562,12 +549,6 @@ bool frameDocRun(const DocRun& run, DocLinesState& state,
       if (!first) marker += ',';
       marker += R"("found":)";
       appendInt(marker, *docs.found);
-      first = false;
-    }
-    if (haveMaxScore) {
-      if (!first) marker += ',';
-      marker += R"("max_score":)";
-      appendFloating(marker, *docs.max_score);
       first = false;
     }
     if (haveWarnings) {
