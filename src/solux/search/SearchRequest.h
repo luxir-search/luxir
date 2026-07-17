@@ -1,5 +1,8 @@
 #pragma once
 
+#include <atomic>
+#include <functional>
+#include <memory>
 #include <memory_resource>
 #include <mutex>
 #include <oneapi/tbb/task_group.h>
@@ -16,6 +19,10 @@ namespace solux {
 
 class SearchEngine;
 class SearchResponse;
+
+// Cumulative count of emitter pauses caused by reply() flow control.
+// Process-wide; read by tests and (eventually) server stats.
+inline std::atomic<int64_t> streamPauseCount{0};
 
 // --- Request/response proto model (concrete solux::api, non-owning) ---
 // The request proto is parsed once (by the gRPC handler) into a NON-OWNING concrete
@@ -83,10 +90,26 @@ public:
 
   virtual ~SearchRequest() = default;
 
+  /// Flow-control advice returned by reply().  The response is always accepted
+  /// (or dropped, for CANCEL); the status only tells a streaming producer what
+  /// to do next.
+  enum class ReplyStatus {
+    OK,      // keep producing
+    PAUSE,   // connection is over its buffer high-water mark: park via
+             // resumeWhenDrained() before producing the next response
+    CANCEL   // connection is gone: stop producing; further replies are dropped
+  };
+
   /// Call this to send a response back to the client (or cause it to be buffered).  This can be called multiple times for a single request.
   /// replyComplete will be called when the response has actually been written and is no longer needed.
-  /// Returns the number of buffered responses (0 if the response was written immediately).
-  virtual int reply(SearchResponse& response) = 0;
+  virtual ReplyStatus reply(SearchResponse& response) = 0;
+
+  /// Called by a streaming producer after reply() returned PAUSE.  The
+  /// transport must invoke `resume` exactly once, on a task-arena thread, when
+  /// the connection drains below its low-water mark (or immediately on error -
+  /// the producer's next reply() then observes CANCEL).  The default is for
+  /// transports without flow control: resume immediately.
+  virtual void resumeWhenDrained(std::function<void()> resume) { resume(); }
 
   /// This is called when the reply has completed (e.g. it has been written to a socket and not just buffered)
   /// This may be called from a gRPC server thread (and with a mutex locked), so it should be fast.
@@ -96,8 +119,64 @@ public:
   /// This is the place to do final cleanup (such as deleting or resetting the Arena)
   /// It may delete *this*, so nothing else should be accessed after this is called.
   virtual void done() {
+    rootCalc.reset();
     releaseArena(&arena);
   };
+
+  // --- Streaming-emit completion protocol -----------------------------------
+  //
+  // A paused emitter outlives submitBody(): its op task returns after parking,
+  // the task group drains, and submitBody reaches its final-response send while
+  // batches remain unproduced.  The final response therefore goes out when BOTH
+  // the request body has finished (bodyDone) AND every registered emit stream
+  // has ended - whichever happens last sends it.
+
+  // Keeps the calculator tree (collector output, getTarget chain) alive for
+  // paused emitters; submitBody moves the root calculator here and done()
+  // releases it before the arena.  Type-erased so this header does not depend
+  // on SearchOp.h; the shared_ptr's deleter runs ~Calculator (virtual).
+  std::shared_ptr<void> rootCalc;
+
+  /// A streaming emitter is starting; the final response is held until every
+  /// started stream has ended.
+  void streamStarted() {
+    std::lock_guard<std::mutex> lock(mutex);
+    activeStreams++;
+  }
+
+  /// The emitter produced its final batch (or was cancelled).  May send the
+  /// final response, which may delete *this* - callers must not touch the
+  /// request afterwards.
+  void streamEnded() { maybeSendFinal(true); }
+
+  /// Called by submitBody in place of directly replying with lastResponse.
+  /// May send the final response, which may delete *this* - callers must not
+  /// touch the request afterwards.
+  void bodyDone() { maybeSendFinal(false); }
+
+private:
+  // guarded by mutex:
+  int activeStreams = 0;
+  bool finalReady = false;
+  bool finalSent = false;
+
+  void maybeSendFinal(bool endingStream) {
+    bool send;
+    {
+      std::lock_guard<std::mutex> lock(mutex);
+      if (endingStream) {
+        assert(activeStreams > 0);
+        activeStreams--;
+      } else {
+        finalReady = true;
+      }
+      send = finalReady && activeStreams == 0 && !finalSent;
+      if (send) finalSent = true;
+    }
+    if (send) {
+      reply(*lastResponse);  // may delete *this*; nothing after this call
+    }
+  }
 };
 
 // A response object that can be used to send back results to the client.

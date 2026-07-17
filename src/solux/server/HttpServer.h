@@ -21,7 +21,9 @@ class HttpServer {
 public:
   // port == 0 binds 127.0.0.1 on an OS-assigned port (tests); otherwise binds
   // 0.0.0.0 on the given port.  threads <= 0 means auto (hw_concurrency / 2).
-  HttpServer(SoluxNode& node, int threads, int port);
+  // streamBufferBytes <= 0 means "use server.stream_buffer_bytes from the node
+  // config" (per-connection response buffering cap; see ServerConfig).
+  HttpServer(SoluxNode& node, int threads, int port, int64_t streamBufferBytes = -1);
   ~HttpServer();
 
   // Bind, begin accepting, and spawn worker threads.  Non-blocking; getPort() is
@@ -42,6 +44,7 @@ private:
   SoluxNode& node;
   int nthreads;
   int requestedPort;
+  int64_t streamBufferBytes_;
   int port_ = 0;
   bool started = false;
 

@@ -121,15 +121,16 @@ public:
     : SearchRequest(engine, this->view, arena), mr(&arena), rootCursor_(this, nullptr, nullptr, &view.ops) {
   }
 
-  int reply(SearchResponse& response) override {
+  ReplyStatus reply(SearchResponse& response) override {
     responses.push_back(&response);  // retain; the response's arena stays alive until done()
-    return 0;
+    return ReplyStatus::OK;
   }
   void replyCallback(SearchResponse& response) override { unused(response); }
 
   // Release each retained response's non-shared arena, then the request arena. Invoked by the
   // RAII handle (or directly); the engine does not auto-call done() for LocalReq.
   void done() override {
+    rootCalc.reset();  // calculator tree references op/collector state; drop before the arena
     for (auto* r : responses) {
       if (&r->arena != &this->SearchRequest::arena) releaseArena(&r->arena);
     }

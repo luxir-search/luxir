@@ -1,5 +1,6 @@
 #include <array>
 #include <chrono>
+#include <thread>
 #include <filesystem>
 #include <fstream>
 #include <optional>
@@ -1519,6 +1520,139 @@ TEST_F(HttpApiTest, shutdownDuringInflightRequest) {
 
   beast::error_code ec;
   sock.shutdown(tcp::socket::shutdown_both, ec);
+}
+
+// Flow control: a client that stops reading must not cause unbounded
+// server-side buffering.  A private server with a tiny stream buffer forces
+// the emitter to pause (observable via streamPauseCount) while the client
+// withholds reads; draining the response resumes it and every doc arrives.
+TEST_F(HttpApiTest, backpressurePausesEmitter) {
+  SoluxTest::clearCollection("http_bp");
+  CollectionHelper ch("http_bp");
+  std::string pad(400, 'x');
+  std::vector<Doc> docs;
+  for (int i = 0; i < 2000; i++) {
+    docs.push_back(flatdoc("id", "bp" + std::to_string(i), "pad_s", pad));
+  }
+  ch.indexAll(docs, UpdateMessage::COMMIT);
+
+  HttpServer bpServer(*SoluxTest::soluxNode, 2, 0, /*streamBufferBytes=*/4096);
+  bpServer.start();
+
+  net::io_context cioc;
+  tcp::socket sock(cioc);
+  sock.open(tcp::v4());
+  // Small receive buffer (set before connect) so the kernel absorbs little and
+  // the server's write queue backs up quickly.
+  sock.set_option(net::socket_base::receive_buffer_size(8192));
+  sock.connect(tcp::endpoint(net::ip::make_address("127.0.0.1"),
+                             (unsigned short)bpServer.getPort()));
+
+  int64_t pausesBefore = streamPauseCount.load();
+
+  http::request<http::string_body> req(http::verb::post, "/collections/http_bp/_query", 11);
+  req.set(http::field::host, "127.0.0.1");
+  req.set(http::field::content_type, "application/json");
+  req.body() = R"({"query":{"all":true},"limit":-1,"batch_size":100,"fields":["id","pad_s"]})";
+  req.prepare_payload();
+  http::write(sock, req);
+
+  // Withhold reads until the connection backs up and the emitter parks.
+  bool paused = false;
+  for (int i = 0; i < 400 && !paused; i++) {
+    paused = streamPauseCount.load() > pausesBefore;
+    if (!paused) std::this_thread::sleep_for(std::chrono::milliseconds(25));
+  }
+  EXPECT_TRUE(paused);
+
+  beast::flat_buffer buffer;
+  http::response<http::string_body> res;
+  http::read(sock, buffer, res);
+  EXPECT_EQ(200, res.result_int());
+
+  // Every doc arrived once the client drained the stream.
+  size_t count = 0;
+  std::string_view body = res.body();
+  for (size_t pos = 0; (pos = body.find(R"("id":"bp)", pos)) != std::string_view::npos; pos++) count++;
+  EXPECT_EQ(2000u, count);
+
+  beast::error_code ec;
+  sock.shutdown(tcp::socket::shutdown_both, ec);
+  bpServer.shutdown();
+}
+
+// An exception inside the batch emitter (here: an unknown output field) must
+// still complete the request: the error is recorded on the final response and
+// the stream ends, instead of stranding the completion protocol (which would
+// leak the request and never answer the client).
+TEST_F(HttpApiTest, emitterExceptionCompletesWithError) {
+  helper.index(flatdoc("id", std::string("ee1"), "title_w", std::string("emitex")),
+               UpdateMessage::NO_COMMIT);
+  helper.index(flatdoc("id", std::string("ee2"), "title_w", std::string("emitex")),
+               UpdateMessage::NO_COMMIT);
+  helper.index(flatdoc("id", std::string("ee3"), "title_w", std::string("emitex")),
+               UpdateMessage::COMMIT);
+  // Three docs at batch_size 1 make the throwing batch a NON-final one (fresh
+  // response arena), and "id" first puts its loader tasks in flight when the
+  // unknown field's schema lookup throws - exercising the emitter's task-group
+  // join and batch-arena cleanup, not just the error surface.
+  auto res = httpRequest(port(), http::verb::post, "/collections/main/_query",
+      R"({"query":{"all":true},"batch_size":1,"fields":["id","nosuchfield"]})");
+  EXPECT_EQ(200, res.result_int());
+  EXPECT_NE(std::string::npos, res.body().find(R"("error":)")) << res.body();
+  EXPECT_NE(std::string::npos, res.body().find("nosuchfield")) << res.body();
+}
+
+// A client that disconnects while the emitter is paused must not strand the
+// request: the write failure wakes the parked emitter, whose next reply()
+// observes CANCEL and completes the request.  A stranded request would hang
+// shutdown() here (it drains in-flight work).
+TEST_F(HttpApiTest, disconnectWhilePausedCancelsEmitter) {
+  SoluxTest::clearCollection("http_bp2");
+  CollectionHelper ch("http_bp2");
+  std::string pad(400, 'x');
+  std::vector<Doc> docs;
+  for (int i = 0; i < 2000; i++) {
+    docs.push_back(flatdoc("id", "bp" + std::to_string(i), "pad_s", pad));
+  }
+  ch.indexAll(docs, UpdateMessage::COMMIT);
+
+  std::optional<HttpServer> bpServer;
+  bpServer.emplace(*SoluxTest::soluxNode, 2, 0, /*streamBufferBytes=*/4096);
+  bpServer->start();
+
+  net::io_context cioc;
+  tcp::socket sock(cioc);
+  sock.open(tcp::v4());
+  sock.set_option(net::socket_base::receive_buffer_size(8192));
+  sock.connect(tcp::endpoint(net::ip::make_address("127.0.0.1"),
+                             (unsigned short)bpServer->getPort()));
+
+  int64_t pausesBefore = streamPauseCount.load();
+
+  http::request<http::string_body> req(http::verb::post, "/collections/http_bp2/_query", 11);
+  req.set(http::field::host, "127.0.0.1");
+  req.set(http::field::content_type, "application/json");
+  req.body() = R"({"query":{"all":true},"limit":-1,"batch_size":100,"fields":["id","pad_s"]})";
+  req.prepare_payload();
+  http::write(sock, req);
+
+  bool paused = false;
+  for (int i = 0; i < 400 && !paused; i++) {
+    paused = streamPauseCount.load() > pausesBefore;
+    if (!paused) std::this_thread::sleep_for(std::chrono::milliseconds(25));
+  }
+  ASSERT_TRUE(paused);
+
+  // Hard-close without reading: linger(0) sends RST so the server's in-flight
+  // write fails promptly instead of waiting out FIN semantics.
+  beast::error_code ec;
+  sock.set_option(net::socket_base::linger(true, 0), ec);
+  sock.close(ec);
+
+  bpServer->shutdown();  // hangs if the paused request was stranded
+  bpServer.reset();
+  SUCCEED();
 }
 
 } // namespace solux::test

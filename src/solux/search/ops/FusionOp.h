@@ -82,6 +82,9 @@ public:
     // Index parallel to op.sources.  Null entries mean the empty-index
     // path or an all-segments-empty source.
     std::vector<MergeableCollector*> deliveredCollectors;
+    // RRF-merged (segdoc, fused score) list, sorted; backs the emitter's
+    // getDoc/getScore callbacks, which can outlive doFusion (paused emitter).
+    std::vector<std::pair<segdoc, float>> fusedList;
 
     // Shared filter DocSet per segment, kept alive until fusion emits.
     std::vector<std::unique_ptr<DocSet>> segFilters;
@@ -281,8 +284,9 @@ public:
         }
       }
 
-      // Sort by fused score desc, segdoc asc as a stable tiebreaker.
-      std::vector<std::pair<segdoc, float>> fusedList;
+      // Sort by fused score desc, segdoc asc as a stable tiebreaker.  A Calc
+      // member (not a local): the emitter's getDoc/getScore callbacks read it,
+      // and a flow-controlled emitter can outlive this function.
       fusedList.reserve(fused.size());
       for (auto& [d, score] : fused) fusedList.emplace_back(d, score);
       std::sort(fusedList.begin(), fusedList.end(),
@@ -301,8 +305,8 @@ public:
 
       emitDocsResponse(op.req, getDocList,
         numCollected,
-        [&fusedList](int64_t i) { return fusedList[i].first; },
-        [&fusedList](int64_t i) { return fusedList[i].second; },
+        [this](int64_t i) { return fusedList[i].first; },
+        [this](int64_t i) { return fusedList[i].second; },
         totalHits,
         op.fusionProto.fields,
         op.fusionProto.batch_size,

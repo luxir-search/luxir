@@ -14,7 +14,12 @@ void SearchEngine::submitBody(SearchRequest& req) {
     auto* root = parser.parse();
     root->init();
     std::unique_ptr<SearchOp::Calculator> calc(root->createCalculator(nullptr, -1));
-    calc->calc(req.tg, -1, nullptr);
+    // The request owns the calculator tree: a flow-controlled emitter can
+    // outlive this function, and its callbacks reach into collector output and
+    // the getTarget chain.  Released in done().
+    auto* rootCalc = calc.get();
+    req.rootCalc = std::move(calc);
+    rootCalc->calc(req.tg, -1, nullptr);
 
     if (req.tg) {
       LOG_TRACE("SearchRequest: waiting for task group to finish for req={}", (void*)&req);
@@ -36,6 +41,9 @@ void SearchEngine::submitBody(SearchRequest& req) {
     }
     // proto.error is a non-owning string_view; e.what() points into the exception object,
     // which is destroyed when this catch block exits. Copy it into the response arena.
+    // Under req.mutex: a paused emitter resumed by the transport may be
+    // assembling its final batch into lastResponse (getTarget) concurrently.
+    std::lock_guard<std::mutex> lock(req.mutex);
     req.lastResponse->proto.error = solux::api::build::arenaStr(req.lastResponse->mr, e.what());
   }
 
@@ -49,9 +57,10 @@ void SearchEngine::submitBody(SearchRequest& req) {
     }
   }
 
-  // Send back the final response.  Do not access req after this point as it
-  // maybe asynchronously deleted.
-  req.reply(*req.lastResponse);
+  // Send back the final response - or, if a flow-controlled emitter is still
+  // paused with batches to produce, hand off: the last stream to end sends it.
+  // Do not access req after this point as it may be asynchronously deleted.
+  req.bodyDone();
 }
 
 void SearchEngine::submit(SearchRequest& req, bool parallel) {

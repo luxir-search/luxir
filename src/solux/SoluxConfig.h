@@ -7,6 +7,13 @@
 namespace solux {
 
 struct ServerConfig {
+  // Cap on buffered (rendered/serialized) response bytes, per HTTP connection
+  // and per gRPC call (an HTTP/2 connection can multiplex several calls, each
+  // with its own cap).  Streaming producers pause above this high-water mark
+  // and resume once the buffer drains below half of it.  Values < 1 are
+  // clamped to 1 by the servers.
+  int64_t stream_buffer_bytes = 1 << 20;
+
   struct Grpc {
     // <0 means "derive from the HTTP port" (http.port + 1), resolved in normalize().
     // An explicit --server.grpc.port / -p overrides.

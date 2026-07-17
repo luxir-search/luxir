@@ -9,6 +9,7 @@
 #include <span>
 #include <unordered_map>
 #include <vector>
+#include <grpcpp/alarm.h>
 #include <grpcpp/grpcpp.h>
 #include <grpcpp/generic/async_generic_service.h>
 #include <absl/strings/str_cat.h>
@@ -38,8 +39,13 @@ namespace solux {
 #define GRPC_DEBUG LOG_TRACE
 // #define GRPC_DEBUG LOG_DEBUG
 
-GRPCServer::GRPCServer(SoluxNode& node, int nthreads, int port)
-  : soluxNode(node), startLatch(1), startLatchThreads(nthreads), nthreads(nthreads), requestedPort(port) {
+GRPCServer::GRPCServer(SoluxNode& node, int nthreads, int port, int64_t streamBufferBytes)
+  : soluxNode(node), startLatch(1), startLatchThreads(nthreads), nthreads(nthreads), requestedPort(port),
+    // Clamp to >= 1: a non-positive high-water mark (misconfiguration) would
+    // pause every reply while the drain check (queuedBytes <= low) never fires.
+    streamBufferBytes_(std::max<int64_t>(1,
+        streamBufferBytes > 0 ? streamBufferBytes
+                              : node.getConfig().server.stream_buffer_bytes)) {
 }
 
 // NOTE: as of gRPC 1.39 there is a new C++ async callback API: https://github.com/grpc/grpc/pull/25728 in addition to an EventEngine
@@ -234,21 +240,39 @@ public:
 
   const MethodEntry* methodEntry = nullptr;  // resolved on CONNECT from the RPC path
 
+  const int64_t highWater;  // response flow control: pause producers above this
+  const int64_t lowWater;   // ... and resume them below this
+
   std::mutex mutex;
   // protected by mutex:
   std::deque<grpc::ByteBuffer> pending;  // buffered outgoing responses (owned bytes)
   grpc::ByteBuffer writeBuffer;          // bytes of the in-flight write; kept alive until WRITE completes
+  int64_t queuedBytes = 0;               // bytes in pending + writeBuffer
+  std::vector<std::function<void()>> drainWaiters;  // parked producer resumes
   bool errored = false;
   bool readsDone = false;
   bool writeOutstanding = false;
   bool finishSent = false;
+  // Serializes async request execution per call: while a dispatched request is
+  // active the next READ is not re-armed, so pipelined requests on one stream
+  // execute (and respond) in order.  rearmPending marks a READ whose re-arm
+  // was deferred to the active request's completion.
+  bool requestActive = false;
+  bool rearmPending = false;
   int32_t responsesExpected = 0;
   grpc::Status finishStatus = grpc::Status::OK;
+  // Engaged when a non-cq thread needs maybeSendFinish() to run: the KICK tag
+  // hands evaluation to this call's cq thread, the only thread allowed to
+  // initiate Finish (a Finish initiated elsewhere could race the FINISH
+  // completion deleting this object).  While engaged, Finish is held off so
+  // the in-flight alarm tag can never dangle.
+  std::optional<grpc::Alarm> finishKick;
 
-  enum CallTags { READ = 1, WRITE = 2, FINISH = 3, CONNECT = 4 };
+  enum CallTags { READ = 1, WRITE = 2, FINISH = 3, CONNECT = 4, KICK = 5 };
 
   GenericCallData(GRPCServer& server, grpc::AsyncGenericService& genericService, GRPCServer::ThreadInfo& threadInfo)
-      : CallData(server, threadInfo), genericService(genericService), readerWriter(&genericCtx) {
+      : CallData(server, threadInfo), genericService(genericService), readerWriter(&genericCtx),
+        highWater(server.streamBufferBytes()), lowWater(server.streamBufferBytes() / 2) {
     genericService.RequestCall(&genericCtx, &readerWriter, threadInfo.cq.get(), threadInfo.cq.get(), make_tag(CONNECT));
   }
 
@@ -264,56 +288,139 @@ public:
     readerWriter.Write(writeBuffer, make_tag(WRITE));
   }
 
-  // mutex held
+  // mutex held; must only run on this call's cq thread (see finishKick).
   void maybeSendFinish() {
-    if (!finishSent && readsDone && pending.empty() && !writeOutstanding && responsesExpected <= 0) {
-      readerWriter.Finish(finishStatus, make_tag(FINISH));
+    if (!finishSent && !finishKick && readsDone && pending.empty() && !writeOutstanding &&
+        responsesExpected <= 0) {
       finishSent = true;
+      readerWriter.Finish(finishStatus, make_tag(FINISH));
     }
   }
 
+  // mutex held; callable from any thread.  Schedules maybeSendFinish() on this
+  // call's cq thread via an immediately-expiring alarm.
+  void kickFinish() {
+    if (finishSent || finishKick) return;
+    finishKick.emplace();
+    finishKick->Set(threadInfo.cq.get(), gpr_now(GPR_CLOCK_MONOTONIC), make_tag(KICK));
+  }
+
   /// Enqueue an owned response (one outstanding write at a time).
-  /// Returns the number of buffered (not-yet-written) responses.
+  /// Returns the call's buffered (not-yet-written) response bytes - the
+  /// producer's flow-control signal (compare against highWater) - or -1 if the
+  /// call has errored and the response was dropped.
   /// NOTE: with finishCount>0 this may eventually delete "this" on another thread,
   /// so make it the last use of "this" in the caller.
-  size_t respondRaw(grpc::ByteBuffer&& buf, int32_t finishCount = 1) {
+  int64_t respondRaw(grpc::ByteBuffer&& buf, int32_t finishCount = 1) {
     const std::lock_guard<std::mutex> lock(mutex);
     responsesExpected -= finishCount;
+    if (finishCount > 0) requestCompleted();
+    if (errored) {
+      // Client is gone: drop the bytes.  The finish accounting above must still
+      // take effect, but Finish may only be initiated from the cq thread - kick
+      // it over there.
+      kickFinish();
+      return -1;
+    }
+    queuedBytes += (int64_t)buf.Length();
     if (writeOutstanding) {
       pending.emplace_back(std::move(buf));
     } else {
       doWrite(std::move(buf));
     }
-    return pending.size();
+    return queuedBytes;
   }
 
+  // mutex held.  The active async request sent its final response: allow the
+  // next pipelined request to be read, re-arming the READ if proceed() already
+  // deferred one to us.
+  void requestCompleted() {
+    requestActive = false;
+    if (rearmPending && !readsDone && !finishSent) {
+      rearmPending = false;
+      readRequest();
+    }
+  }
+
+  // Callable from any thread.  Parks a paused producer's resume callback; it is
+  // handed to the task arena once buffered bytes drop below the low-water mark,
+  // or immediately if the call has already drained or errored (the resumed
+  // producer's next respondRaw then observes the error).
+  void whenDrained(std::function<void()> resume) {
+    {
+      const std::lock_guard<std::mutex> lock(mutex);
+      if (!errored && queuedBytes > lowWater) {
+        drainWaiters.push_back(std::move(resume));
+        return;
+      }
+    }
+    enqueueResume(std::move(resume));
+  }
+
+  // Callable from any thread: finish evaluation goes through kickFinish so
+  // Finish is only ever initiated on this call's cq thread (handlers may run
+  // this from task-arena workers, e.g. async SayHelloStreaming).
   void decrementOutstanding(int32_t finishCount = 1) {
     const std::lock_guard<std::mutex> lock(mutex);
     responsesExpected -= finishCount;
-    maybeSendFinish();
+    kickFinish();
   }
 
+  // Callable from any thread (see decrementOutstanding).
   void finishWithError(grpc::Status status, int32_t finishCount = 1) {
-    const std::lock_guard<std::mutex> lock(mutex);
-    responsesExpected -= finishCount;
-    readsDone = true;
-    pending.clear();
-    finishStatus = status;
-    maybeSendFinish();
+    std::vector<std::function<void()>> waiters;
+    {
+      const std::lock_guard<std::mutex> lock(mutex);
+      responsesExpected -= finishCount;
+      readsDone = true;
+      dropPending();
+      finishStatus = status;
+      kickFinish();
+      waiters = std::move(drainWaiters);
+    }
+    for (auto& w : waiters) enqueueResume(std::move(w));
   }
 
   void writeFinished(bool ok) {
-    const std::lock_guard<std::mutex> lock(mutex);
-    if (!ok) { errored = true; readsDone = true; }
-    assert(writeOutstanding);
-    writeOutstanding = false;
-    writeBuffer.Clear();  // release the bytes we just wrote
-    if (!pending.empty()) {
-      grpc::ByteBuffer next = std::move(pending.front());
-      pending.pop_front();
-      doWrite(std::move(next));
-    } else {
-      maybeSendFinish();
+    std::vector<std::function<void()>> waiters;
+    {
+      const std::lock_guard<std::mutex> lock(mutex);
+      if (!ok) { errored = true; readsDone = true; }
+      assert(writeOutstanding);
+      writeOutstanding = false;
+      queuedBytes -= (int64_t)writeBuffer.Length();
+      writeBuffer.Clear();  // release the bytes we just wrote
+      if (errored) {
+        dropPending();  // don't chain doomed writes into a dead stream
+      }
+      if (!pending.empty()) {
+        grpc::ByteBuffer next = std::move(pending.front());
+        pending.pop_front();
+        doWrite(std::move(next));
+      } else {
+        maybeSendFinish();
+      }
+      if (errored || queuedBytes <= lowWater) waiters = std::move(drainWaiters);
+    }
+    // Outside the lock: wake paused producers (below low-water, or so an
+    // errored call's requests can finish and be freed).
+    for (auto& w : waiters) enqueueResume(std::move(w));
+  }
+
+  // mutex held
+  void dropPending() {
+    for (const auto& p : pending) queuedBytes -= (int64_t)p.Length();
+    pending.clear();
+  }
+
+  // Must not throw: callers run inside cq event handlers (runThread has no
+  // catch), and a lost resume strands its request forever - so an enqueue
+  // allocation failure falls back to running the resume inline.
+  void enqueueResume(std::function<void()> resume) {
+    try {
+      server.getSoluxNode().getTaskArena().enqueue(resume);  // copies; resume stays valid if this throws
+    } catch (...) {
+      if (resume) resume();
     }
   }
 
@@ -351,12 +458,27 @@ public:
         {
           const std::lock_guard<std::mutex> lock(mutex);
           if (readsDone || finishSent) break;
+          if (requestActive) {
+            // Async request still running (or paused on flow control): defer
+            // the next READ to its completion so pipelined requests on this
+            // stream execute, and respond, in order.
+            rearmPending = true;
+            break;
+          }
         }
         readRequest();
         break;
       case WRITE:
         writeFinished(ok);
         break;
+      case KICK: {
+        // A non-cq thread requested a finish evaluation (ok is irrelevant -
+        // even a cancelled alarm must clear finishKick so Finish can proceed).
+        const std::lock_guard<std::mutex> lock(mutex);
+        finishKick.reset();
+        maybeSendFinish();
+        break;
+      }
       case FINISH:
         delete this;
         break;
@@ -407,34 +529,61 @@ static void handleSearch(GenericCallData& call, grpc::ByteBuffer& readBuf) {
   class GRPCSearchRequest : public SearchRequest {
   public:
     GenericCallData* parent = nullptr;
+    // Owns the padded request bytes and parse resource that `proto` (and the
+    // op tree) borrow views of: submit() runs async on the task arena and a
+    // flow-controlled emitter can outlive it, so the views must live until
+    // done() releases this request.
+    std::unique_ptr<HppRequestState<SearchReqProto>> requestState;
+
     GRPCSearchRequest(SearchEngine& engine, const SearchReqProto& proto, google::protobuf::Arena& arena)
       : SearchRequest(engine, proto, arena) {}
 
-    int reply(SearchResponse& response) override {
+    ReplyStatus reply(SearchResponse& response) override {
       // Serialize eagerly into an OWNED ByteBuffer, then drop arenas (no post-write callback).
       response.proto.more = !response.last;
       grpc::ByteBuffer buf = serializeToByteBuffer(response.proto);
-      size_t buffered = parent->respondRaw(std::move(buf), 1);
+      // Only the request's final response decrements the call's outstanding
+      // count: an intermediate batch must not, or a transiently drained queue
+      // after the client's WritesDone would Finish the call mid-stream.
+      // Snapshot highWater first: once the final response is handed to
+      // respondRaw, the call can Finish and delete parent at any moment.
+      const int64_t highWater = parent->highWater;
+      int64_t buffered = parent->respondRaw(std::move(buf), response.last ? 1 : 0);
+      auto status = ReplyStatus::OK;
+      if (buffered < 0) status = ReplyStatus::CANCEL;
+      else if (buffered > highWater) status = ReplyStatus::PAUSE;
       // replyCallback() may delete "this" on the last response, so it must be the
       // last use of "this"/"response".
       response.req.replyCallback(response);
-      return (int)buffered;
+      return status;
+    }
+
+    void resumeWhenDrained(std::function<void()> resume) override {
+      parent->whenDrained(std::move(resume));
     }
   };
 
   auto* arena = createArena();
-  HppRequestState<SearchReqProto> request;
-  if (!parseRequest(readBuf, request, "Search")) {
+  auto requestState = std::make_unique<HppRequestState<SearchReqProto>>();
+  if (!parseRequest(readBuf, *requestState, "Search")) {
     releaseArena(arena);
     call.decrementOutstanding();  // balance the responsesExpected++ done before handle()
     return;
   }
   auto& engine = call.server.getSoluxNode().getSearchEngine();
-  auto& req = *solux::arenaCreate<GRPCSearchRequest>(*arena, engine, request.proto, *arena);
+  auto& req = *solux::arenaCreate<GRPCSearchRequest>(*arena, engine, requestState->proto, *arena);
+  req.requestState = std::move(requestState);
   req.parent = &call;
-  // submit() is synchronous (waits on its task group), so the padded request
-  // bytes and parse resource stay valid until all borrowed views are done.
-  engine.submit(req, true);
+  // Run the (synchronous) submit on the task arena, NOT this completion-queue
+  // thread: the cq thread must keep processing WRITE completions for response
+  // flow control to advance, and a long query must not head-of-line block the
+  // other calls served by this cq.  The call outlives the request because its
+  // outstanding-response count stays positive until the final reply, and
+  // requestActive keeps pipelined requests on this stream ordered.
+  { const std::lock_guard<std::mutex> lock(call.mutex); call.requestActive = true; }
+  call.server.getSoluxNode().getTaskArena().enqueue([&req, &engine] {
+    engine.submit(req, true);
+  });
 }
 
 

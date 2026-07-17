@@ -18,7 +18,13 @@ public:
   // Are those real cpu cores, or the hyper-threaded cores that hardware_concurrency reports?
   // https://grpc.io/docs/guides/performance/
   // port: The port to listen on. Use 0 for dynamic port allocation (useful for testing).
-  GRPCServer(SoluxNode& node, int nthreads = std::max(1u, std::thread::hardware_concurrency() / 2), int port = 0);
+  // streamBufferBytes <= 0 means "use server.stream_buffer_bytes from the node
+  // config" (per-connection response buffering cap; see ServerConfig).
+  GRPCServer(SoluxNode& node, int nthreads = std::max(1u, std::thread::hardware_concurrency() / 2),
+             int port = 0, int64_t streamBufferBytes = -1);
+
+  /// Per-call cap on buffered response bytes (flow-control high-water mark).
+  int64_t streamBufferBytes() const { return streamBufferBytes_; }
 
   /// This starts the server and blocks the current thread until shutdown.
   void run();
@@ -68,6 +74,7 @@ private:
   int nthreads;
   int serverPort = 0;
   int requestedPort = 0;
+  int64_t streamBufferBytes_;
 
 
   // this is run for each thread

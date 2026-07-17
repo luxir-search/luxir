@@ -219,7 +219,9 @@ public:
     docFormatDefault = solux::api::DocFormat::ROWS;
   }
 
-  int reply(SearchResponse& response) override;  // defined after HttpSession
+  // Both defined after HttpSession.
+  ReplyStatus reply(SearchResponse& response) override;
+  void resumeWhenDrained(std::function<void()> resume) override;
   // done() is inherited: releaseArena(&arena) frees this request (and its
   // IoPin).  reply() calls it eagerly once the final line is enqueued - the line
   // owns its bytes, so cleanup does not wait for the write to complete.
@@ -231,8 +233,9 @@ public:
 class HttpSession : public std::enable_shared_from_this<HttpSession> {
 public:
   HttpSession(std::shared_ptr<net::io_context> ioc, tcp::socket&& sock, SoluxNode& node,
-              std::shared_ptr<HttpSessionRegistry> registry)
-    : ioc_(std::move(ioc)), stream_(std::move(sock)), node_(node), registry_(std::move(registry)) {}
+              std::shared_ptr<HttpSessionRegistry> registry, int64_t streamBufferBytes)
+    : ioc_(std::move(ioc)), stream_(std::move(sock)), node_(node), registry_(std::move(registry)),
+      highWater_(streamBufferBytes), lowWater_(streamBufferBytes / 2) {}
 
   ~HttpSession() { if (deregister_) deregister_(); }
 
@@ -251,14 +254,66 @@ public:
   // Callable from any thread.  Queues a rendered NDJSON line (an owned string)
   // on the strand.  No completion callback: reply() already freed the arena the
   // line was rendered from, so the write depends on nothing but the string.
-  void enqueueLine(std::string line, bool last) {
+  // Returns the connection's buffered bytes including this line - the producer's
+  // flow-control signal (compare against highWater()).  Accounted here, before
+  // the dispatch, so the count never lags the producer.
+  int64_t enqueueLine(std::string line, bool last) {
+    int64_t bytes = (int64_t)line.size();
+    int64_t queued = queuedBytes_.fetch_add(bytes, std::memory_order_relaxed) + bytes;
+    try {
+      // The handler swallows every failure of its own (marking the connection
+      // failed), so an exception reaching the catch below can only mean the
+      // handler never ran - which keeps the rollback there exact.  Without
+      // this, dispatch running the handler INLINE (caller already on the
+      // strand) could propagate a post-queue failure into that catch and
+      // double-subtract bytes a completion path subtracts again.
+      net::dispatch(stream_.get_executor(),
+          [self = shared_from_this(), line = std::move(line), last]() mutable {
+            int64_t bytes = (int64_t)line.size();  // before the move below
+            if (self->errored_) {  // connection already failed; drop the line
+              self->queuedBytes_.fetch_sub(bytes, std::memory_order_relaxed);
+              return;
+            }
+            try {
+              self->pendingQ_.push_back(Pending{std::move(line), last});
+            } catch (...) {
+              // Allocation failed; the line was never queued.
+              self->queuedBytes_.fetch_sub(bytes, std::memory_order_relaxed);
+              self->failWrites(net::error::make_error_code(net::error::no_memory));
+              return;
+            }
+            try {
+              self->driveWrites();
+            } catch (...) {
+              self->failWrites(net::error::make_error_code(net::error::no_memory));
+            }
+          });
+    } catch (...) {
+      // The handler was never queued: roll the accounting back or the phantom
+      // bytes would wedge flow control at the high-water mark forever.
+      queuedBytes_.fetch_sub(bytes, std::memory_order_relaxed);
+      throw;
+    }
+    return queued;
+  }
+
+  // Callable from any thread.  Parks a paused producer's resume callback; it is
+  // handed to the task arena once buffered bytes drop below the low-water mark,
+  // or immediately if the connection has failed (the resumed producer's next
+  // reply() then observes CANCEL).  Registration runs on the strand, serialized
+  // with write completions, so a wakeup cannot be lost.
+  void whenDrained(std::function<void()> resume) {
     net::dispatch(stream_.get_executor(),
-        [self = shared_from_this(), line = std::move(line), last]() mutable {
-          if (self->errored_) return;  // connection already failed; drop the line
-          self->pendingQ_.push_back(Pending{std::move(line), last});
-          self->driveWrites();
+        [self = shared_from_this(), resume = std::move(resume)]() mutable {
+          self->drainWaiters_.push_back(std::move(resume));
+          self->maybeFireDrainWaiters();
         });
   }
+
+  // True once the connection has failed; producers should stop rendering.
+  bool aborted() const { return aborted_.load(std::memory_order_relaxed); }
+
+  int64_t highWater() const { return highWater_; }
 
   // Every off-io-thread holder of this session's executor must pin the context
   // through this helper, never via a raw executor_work_guard: IoPin's member
@@ -288,6 +343,15 @@ private:
   // Carried from the request for the (later, async) streaming response.
   unsigned httpVersion_ = 11;
   bool keepAlive_ = false;
+
+  // Response flow control.  queuedBytes_ counts rendered bytes accepted from
+  // producers but not yet written to the socket (pendingQ_ + inflightLine_);
+  // it is the only cross-thread piece - everything else is strand-only.
+  std::atomic<int64_t> queuedBytes_{0};
+  std::atomic<bool> aborted_{false};  // producer-visible mirror of errored_
+  int64_t highWater_;
+  int64_t lowWater_;
+  std::vector<std::function<void()>> drainWaiters_;  // parked producer resumes
 
   // Streaming write state - strand only.
   std::deque<Pending> pendingQ_;
@@ -1598,9 +1662,11 @@ private:
 
   void onChunkWritten(beast::error_code ec, std::size_t) {
     writeOutstanding_ = false;
+    queuedBytes_.fetch_sub((int64_t)inflightLine_.size(), std::memory_order_relaxed);
     inflightLine_.clear();
     if (ec) { failWrites(ec); return; }
     driveWrites();
+    maybeFireDrainWaiters();
   }
 
   void onChunkLastWritten(beast::error_code ec, std::size_t) {
@@ -1612,10 +1678,36 @@ private:
   void failWrites(beast::error_code ec) {
     LOG_TRACE("http write: {}", ec.message());
     errored_ = true;
+    aborted_.store(true, std::memory_order_relaxed);
     // Pending entries are just owned strings (their arenas were freed in reply()),
     // so dropping them frees everything.
+    int64_t dropped = 0;
+    for (const auto& p : pendingQ_) dropped += (int64_t)p.line.size();
     pendingQ_.clear();
+    queuedBytes_.fetch_sub(dropped, std::memory_order_relaxed);
+    // Wake paused producers so their requests can finish (and be freed); their
+    // next reply() observes CANCEL via aborted_.
+    maybeFireDrainWaiters();
     doClose();
+  }
+
+  // Strand only.  Hands parked producer resumes to the task arena once the
+  // queue has drained below low-water (or unconditionally after an error).
+  // Must not throw: it runs inside io handlers (ioc->run() has no catch), and
+  // a lost waiter strands its request forever - so an enqueue allocation
+  // failure falls back to running the resume inline.
+  void maybeFireDrainWaiters() {
+    if (drainWaiters_.empty()) return;
+    if (!errored_ && queuedBytes_.load(std::memory_order_relaxed) > lowWater_) return;
+    auto waiters = std::move(drainWaiters_);
+    drainWaiters_.clear();
+    for (auto& w : waiters) {
+      try {
+        node_.getTaskArena().enqueue(w);  // copies; w stays valid if this throws
+      } catch (...) {
+        if (w) w();
+      }
+    }
   }
 
   void finishResponse() {
@@ -1695,15 +1787,21 @@ void HttpSession::run() {
       beast::bind_front_handler(&HttpSession::doRead, shared_from_this()));
 }
 
-int HttpSearchRequest::reply(SearchResponse& response) {
+SearchRequest::ReplyStatus HttpSearchRequest::reply(SearchResponse& response) {
   // The line is rendered into an owned string, so once it is enqueued the proto
   // (and its arena) are dead weight - free them eagerly here instead of deferring
   // to a post-write callback.  Cleanup is unconditional after the try, so a
   // throwing render/post still releases the arena and lets shutdown drain.
   bool last = response.last;
+  auto status = ReplyStatus::OK;
   try {
     response.proto.more = !last;
-    session->enqueueLine(renderSearchResponseLine(response.proto), last);
+    if (session->aborted()) {
+      status = ReplyStatus::CANCEL;  // connection failed; skip the render
+    } else {
+      int64_t queued = session->enqueueLine(renderSearchResponseLine(response.proto), last);
+      if (queued > session->highWater()) status = ReplyStatus::PAUSE;
+    }
   } catch (...) {
     // fall through to cleanup
   }
@@ -1712,11 +1810,20 @@ int HttpSearchRequest::reply(SearchResponse& response) {
   } else if (&response.arena != &arena) {
     releaseArena(&response.arena);  // this batch's own arena
   }
-  return 0;
+  return status;
 }
 
-HttpServer::HttpServer(SoluxNode& node, int threads, int port)
+void HttpSearchRequest::resumeWhenDrained(std::function<void()> resume) {
+  session->whenDrained(std::move(resume));
+}
+
+HttpServer::HttpServer(SoluxNode& node, int threads, int port, int64_t streamBufferBytes)
   : node(node), nthreads(threads), requestedPort(port),
+    // Clamp to >= 1: a non-positive high-water mark (misconfiguration) would
+    // pause every reply while the drain check (queuedBytes <= low) never fires.
+    streamBufferBytes_(std::max<int64_t>(1,
+        streamBufferBytes > 0 ? streamBufferBytes
+                              : node.getConfig().server.stream_buffer_bytes)),
     ioc(std::make_shared<net::io_context>()) {}
 
 HttpServer::~HttpServer() { shutdown(); }
@@ -1759,7 +1866,8 @@ void HttpServer::doAccept() {
           // every HTTP server does.  Best-effort: an ec here is not fatal.
           beast::error_code nde;
           sock.set_option(tcp::no_delay(true), nde);
-          std::make_shared<HttpSession>(ioc, std::move(sock), node, registry)->run();
+          std::make_shared<HttpSession>(ioc, std::move(sock), node, registry,
+                                        streamBufferBytes_)->run();
         }
         if (acceptor && acceptor->is_open()) doAccept();
       });

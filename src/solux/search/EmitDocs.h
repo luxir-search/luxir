@@ -684,10 +684,11 @@ inline solux::api::Map* scatterColumnsToRows(const SearchResponse::ColumnsType& 
   return rows;
 }
 
-// Stream a final ranked list of (segdoc, score) pairs back to the client as one
-// or more SearchResponses.  Both TopDocsReq and FusionOp call this after their
-// own ranking is complete.  The caller's `getDocList(response)` lambda returns
-// the DocList in `response` (a SearchResponse*) to populate.
+// Streams a final ranked list of (segdoc, score) pairs back to the client as
+// one or more SearchResponses.  Both TopDocsReq and FusionOp use this (via
+// emitDocsResponse below) after their own ranking is complete.  The caller's
+// `getDocList(response)` callback returns the DocList in `response` (a
+// SearchResponse*) to populate.
 //
 // `getDoc(i)` and `getScore(i)` are invoked lazily, only for indices in the
 // current batch - no upfront materialization of a parallel array, so callers
@@ -695,49 +696,107 @@ inline solux::api::Map* scatterColumnsToRows(const SearchResponse::ColumnsType& 
 // SortDoc spans, RRF result vectors, etc.).  `getScore` is only called when
 // `getScores` is true.
 //
-// Blocks per batch on an internal task_group while column / stored-field loaders
-// fan out across segments, then sends each batch via req.reply() except the
-// last (the caller is expected to send req.lastResponse afterward).  All but
-// the final response have set_more(true).
+// Emission is resumable: each non-final batch goes out via req.reply(), and a
+// PAUSE status (connection over its buffer high-water mark) parks the emitter
+// until the transport drains it (SearchRequest::resumeWhenDrained).  The
+// emitter can therefore outlive submitBody(): it is allocated in the request
+// arena, and everything its callbacks reference is pinned by req.rootCalc
+// (calculator tree: collector output, getTarget chain) or owned by the
+// callbacks themselves.  The final batch is assembled into req.lastResponse
+// but NOT sent here - the completion protocol on SearchRequest (streamEnded /
+// bodyDone) decides who sends it.  All but the final response have more=true.
+class DocEmitter {
+public:
+  virtual void produce() = 0;
+  virtual ~DocEmitter() = default;
+};
+
 template <typename GetDocList, typename GetDoc, typename GetScore>
-void emitDocsResponse(SearchRequest& req,
-                      GetDocList&& getDocList,
-                      int64_t numCollected,
-                      GetDoc&& getDoc,
-                      GetScore&& getScore,
-                      int64_t totalHits,
-                      std::span<const std::string_view> fields,
-                      int32_t batchSize,
-                      int64_t offset,
-                      bool getNumber,
-                      bool getScores,
-                      solux::api::DocFormat docFormat)
-{
-  int32_t maxBatchSize = batchSize;
-  if (maxBatchSize <= 0) {
-    maxBatchSize = 100;  // what should the default be?
-  } else if (maxBatchSize > 256) {
-    maxBatchSize = 256;
+class DocEmitterImpl final : public DocEmitter {
+public:
+  SearchRequest& req;
+  GetDocList getDocList;
+  GetDoc getDoc;
+  GetScore getScore;
+  int64_t numCollected;
+  int64_t totalHits;
+  std::span<const std::string_view> fields;
+  int32_t maxBatchSize;
+  int64_t offset;
+  bool getNumber;
+  bool getScores;
+  bool rowsMode;
+  // Snapshot of req.tg != nullptr: req.tg points at submit()'s stack and may
+  // dangle by the time a resumed emitter runs.
+  bool parallel;
+  size_t colCap;
+  int64_t totalBatches;
+  int64_t batchStart = 0;  // resume cursor
+
+  DocEmitterImpl(SearchRequest& req, GetDocList getDocList, GetDoc getDoc,
+                 GetScore getScore, int64_t numCollected, int64_t totalHits,
+                 std::span<const std::string_view> fields, int32_t maxBatchSize,
+                 int64_t offset, bool getNumber, bool getScores, bool rowsMode,
+                 bool parallel, size_t colCap)
+      : req(req), getDocList(std::move(getDocList)), getDoc(std::move(getDoc)),
+        getScore(std::move(getScore)), numCollected(numCollected), totalHits(totalHits),
+        fields(fields), maxBatchSize(maxBatchSize), offset(offset), getNumber(getNumber),
+        getScores(getScores), rowsMode(rowsMode), parallel(parallel), colCap(colCap),
+        // If no documents were collected, we still need to send an empty response
+        totalBatches(numCollected > 0 ? numCollected : 1) {}
+
+  void produce() override;
+
+private:
+  // Returns true when the stream is over (all batches produced, or cancelled);
+  // false when paused (a resume callback re-enters produce()).  May throw.
+  bool produceBatches();
+};
+
+template <typename GetDocList, typename GetDoc, typename GetScore>
+void DocEmitterImpl<GetDocList, GetDoc, GetScore>::produce() {
+  // Exceptions must not escape: a resumed emitter runs detached on a task-arena
+  // thread with no catch frame, and even on the synchronous first call an
+  // escaping exception would leave the stream registered and the final
+  // response unsendable.  Record the error on the final response instead
+  // (mirrors submitBody's catch) and end the stream normally.
+  bool finished = true;
+  try {
+    finished = produceBatches();
+  } catch (const std::exception& e) {
+    std::lock_guard<std::mutex> lock(req.mutex);
+    if (req.lastResponse->proto.error.empty()) {
+      req.lastResponse->proto.error = solux::api::build::arenaStr(req.lastResponse->mr, e.what());
+    }
+  } catch (...) {
+    std::lock_guard<std::mutex> lock(req.mutex);
+    if (req.lastResponse->proto.error.empty()) {
+      req.lastResponse->proto.error = "unknown error while emitting documents";
+    }
   }
+  if (finished) {
+    // The final batch (assembled into req.lastResponse by produceBatches) is
+    // sent by the completion protocol; this may delete the request.
+    req.streamEnded();
+  }
+}
 
-  // DEFAULT resolves to the transport's preference (HTTP -> ROWS, gRPC ->
-  // COLUMNS); an out-of-range wire value falls back to the default too.
-  bool rowsMode = docFormat == solux::api::DocFormat::ROWS
-                  || (docFormat != solux::api::DocFormat::COLUMNS
-                      && req.docFormatDefault == solux::api::DocFormat::ROWS);
-
-  // Upper bound on distinct response columns: one per requested field plus the
-  // synthetic _score_ column. Used to pre-size the columns map's slot array.
-  size_t colCap = fields.size() + 1;
-
-  // If no documents were collected, we still need to send an empty response
-  int64_t totalBatches = numCollected > 0 ? numCollected : 1;
-  for (int64_t batchStart = 0; batchStart < totalBatches; batchStart += maxBatchSize) {
+template <typename GetDocList, typename GetDoc, typename GetScore>
+bool DocEmitterImpl<GetDocList, GetDoc, GetScore>::produceBatches() {
+  while (batchStart < totalBatches) {
     int64_t batchEnd = std::min(batchStart + maxBatchSize, numCollected);
     int64_t batchSizeLocal = batchEnd - batchStart;
 
     bool lastResponse = batchEnd >= numCollected;
     auto& response = lastResponse ? *req.lastResponse : *SearchResponse::create(req, lastResponse);
+    // A non-final batch has its own arena, released by reply()'s cleanup.  Until
+    // reply() takes over, this guard owns it so a throwing field lookup/loader
+    // (caught in produce()) does not leak the arena.
+    struct BatchArenaGuard {
+      google::protobuf::Arena* arena = nullptr;
+      ~BatchArenaGuard() { if (arena) releaseArena(arena); }
+    } batchArenaGuard;
+    if (!lastResponse) batchArenaGuard.arena = &response.arena;
     auto& docListProto = getDocList(&response);
     auto& mr = response.mr;  // arena backing this response's column data
     docListProto.offset = offset + batchStart;
@@ -762,7 +821,7 @@ void emitDocsResponse(SearchRequest& req,
     docListProto.row_count = columnSize;
 
     std::optional<oneapi::tbb::task_group> loadColumnsTaskGroup;
-    oneapi::tbb::task_group* tg = req.tg ? &loadColumnsTaskGroup.emplace() : nullptr;
+    oneapi::tbb::task_group* tg = parallel ? &loadColumnsTaskGroup.emplace() : nullptr;
 
     bool returnScores = getScores;
 
@@ -797,6 +856,22 @@ void emitDocsResponse(SearchRequest& req,
     // fields sharing one resource decompress each chunk only once.
     boost::unordered_flat_map<std::string_view, std::vector<StoredReq>,
                               PackedTermHash, PackedTermEqual> storedByResource;
+
+    // If anything below throws while loader tasks are in flight (e.g. a later
+    // field's schema lookup), the task_group must be joined before unwinding
+    // destroys what the tasks reference - declared HERE, after every local the
+    // loader tasks touch (sortedIdx, segRunLength, scratch columns, pending
+    // cols, storedByResource), so its join runs first.  Disarmed after the
+    // normal wait below.
+    struct TgJoinGuard {
+      oneapi::tbb::task_group* tg;
+      ~TgJoinGuard() {
+        if (tg) {
+          tg->cancel();
+          try { tg->wait(); } catch (...) {}
+        }
+      }
+    } tgJoin{tg};
 
     for (std::string_view field: fields) {
       // should we allow _scores_ as a field name?
@@ -899,6 +974,7 @@ void emitDocsResponse(SearchRequest& req,
     if (tg != nullptr) {
       tg->wait();
     }
+    tgJoin.tg = nullptr;  // joined normally
 
     // All slots are loaded; pick each single-valued column's exact
     // missing_val and fill its missing slots.  (ROWS mode relies on the
@@ -919,11 +995,68 @@ void emitDocsResponse(SearchRequest& req,
       }
     }
 
+    batchStart += maxBatchSize;
     if (!lastResponse) {
-      auto numBuffered = req.reply(response);
-      unused(numBuffered);
+      batchArenaGuard.arena = nullptr;  // reply() owns the arena release from here
+      switch (req.reply(response)) {
+        case SearchRequest::ReplyStatus::OK:
+          break;
+        case SearchRequest::ReplyStatus::PAUSE:
+          streamPauseCount++;
+          req.resumeWhenDrained([this] { produce(); });
+          return false;  // paused: the stream is NOT over; resume re-enters produce()
+        case SearchRequest::ReplyStatus::CANCEL:
+          batchStart = totalBatches;  // client is gone; skip the remaining batches
+          break;
+      }
     }
   }
+  return true;
+}
+
+// Entry point shared by TopDocsReq and FusionOp: creates a request-arena-owned
+// emitter and produces batches until done or paused.  See DocEmitter above for
+// the resumable-emission contract.
+template <typename GetDocList, typename GetDoc, typename GetScore>
+void emitDocsResponse(SearchRequest& req,
+                      GetDocList&& getDocList,
+                      int64_t numCollected,
+                      GetDoc&& getDoc,
+                      GetScore&& getScore,
+                      int64_t totalHits,
+                      std::span<const std::string_view> fields,
+                      int32_t batchSize,
+                      int64_t offset,
+                      bool getNumber,
+                      bool getScores,
+                      solux::api::DocFormat docFormat)
+{
+  int32_t maxBatchSize = batchSize;
+  if (maxBatchSize <= 0) {
+    maxBatchSize = 100;  // what should the default be?
+  } else if (maxBatchSize > 256) {
+    maxBatchSize = 256;
+  }
+
+  // DEFAULT resolves to the transport's preference (HTTP -> ROWS, gRPC ->
+  // COLUMNS); an out-of-range wire value falls back to the default too.
+  bool rowsMode = docFormat == solux::api::DocFormat::ROWS
+                  || (docFormat != solux::api::DocFormat::COLUMNS
+                      && req.docFormatDefault == solux::api::DocFormat::ROWS);
+
+  // Upper bound on distinct response columns: one per requested field plus the
+  // synthetic _score_ column. Used to pre-size the columns map's slot array.
+  size_t colCap = fields.size() + 1;
+
+  using Impl = DocEmitterImpl<std::decay_t<GetDocList>, std::decay_t<GetDoc>,
+                              std::decay_t<GetScore>>;
+  auto* emitter = solux::arenaCreate<Impl>(req.arena, req,
+      std::forward<GetDocList>(getDocList), std::forward<GetDoc>(getDoc),
+      std::forward<GetScore>(getScore), numCollected, totalHits, fields,
+      maxBatchSize, offset, getNumber, getScores, rowsMode,
+      /*parallel=*/req.tg != nullptr, colCap);
+  req.streamStarted();
+  emitter->produce();
 }
 
 } // namespace solux
