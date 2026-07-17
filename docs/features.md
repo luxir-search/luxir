@@ -102,7 +102,8 @@ clauses, under facet domains, as fusion sources, as filters.
   multi-value position gap of 100 can be crossed at slop 100 or more),
   `range` over numeric, date, and term-backed fields (`gte`/`gt`/`lte`/`lt`,
   any side open-ended; dates accept ISO-8601, epoch millis, or combined
-  Solr/OpenSearch date math with request-stable `NOW`/`now`, and a partial
+  Solr/OpenSearch date math with request-stable `NOW`/`now`, evaluated in
+  an optional request time zone (IANA or fixed offset), and a partial
   date means the window it names - equality on `2024-06-25` matches the
   whole day; string/text fields range over their indexed terms in byte
   order, constant-scoring; with no bounds it matches every document that
@@ -163,7 +164,11 @@ clauses, under facet domains, as fusion sources, as filters.
 ## Facets and analytics
 
 - Field (terms) facets over string, int, and date fields; range facets
-  over int and date fields.
+  over int, float, double, and date fields.
+- Date histograms: calendar gaps (day/week/month/quarter/year) stepped in
+  a request-level or per-facet time zone (IANA or fixed offset), bounds
+  accept date math (`NOW/DAY-30DAYS`), every bucket returned in order with
+  zero counts included.
 - Facet controls: limit, mincount, missing bucket, sort.
 - Nested sub-ops under string facets: sub-facets and metrics per bucket.
 - Counts are exact by default, never estimated.

@@ -35,6 +35,18 @@ struct ApproxFlattenGuard {
   }
 };
 
+struct NotTwoPhaseGuard {
+  bool saved = BooleanQuery::MandNotScorer::disableNotTwoPhaseForTests;
+
+  explicit NotTwoPhaseGuard(bool disabled) {
+    BooleanQuery::MandNotScorer::disableNotTwoPhaseForTests = disabled;
+  }
+
+  ~NotTwoPhaseGuard() {
+    BooleanQuery::MandNotScorer::disableNotTwoPhaseForTests = saved;
+  }
+};
+
 struct SkipStatsGuard {
   bool saved = SkipStats::enabled;
 
@@ -69,6 +81,34 @@ public:
 
   CollectionHelper helper;
 
+  static Run readRun(LocalReq& req, int64_t posSeeksBefore,
+                     int64_t phraseVerifiesBefore) {
+    Run result;
+    result.count = req.getMatchCount();
+    const api::DocList* docs = req.docList();
+    if (docs == nullptr && result.count != 0) {
+      ADD_FAILURE() << "missing doc list";
+    } else if (docs != nullptr && result.count != 0) {
+      const api::Column* ids = docs->columns.find("id");
+      const api::Column* scores = docs->columns.find("_score_");
+      if (ids == nullptr || scores == nullptr) {
+        ADD_FAILURE() << "missing id or score column";
+      } else {
+        const auto& idValues = std::get<api::ColStr>(ids->kind).v;
+        const auto& scoreValues = std::get<api::ColFloat>(scores->kind).v;
+        EXPECT_EQ(idValues.size(), scoreValues.size());
+        for (size_t i = 0; i < std::min(idValues.size(), scoreValues.size()); i++) {
+          std::string idValue(idValues[i]);
+          result.ids.insert(idValue);
+          result.scores.emplace(std::move(idValue), scoreValues[i]);
+        }
+      }
+    }
+    result.posSeeks = SkipStats::posSeeks - posSeeksBefore;
+    result.phraseVerifies = SkipStats::phraseVerifies - phraseVerifiesBefore;
+    return result;
+  }
+
   Run run(Shape shape, bool disableFlatten, int32_t slop = 0) {
     ApproxFlattenGuard flattenGuard(disableFlatten);
     SkipStatsGuard statsGuard;
@@ -100,31 +140,25 @@ public:
     cur.rawQuery() = qb::boolean(cur.mr(), required);
     req->execute(false);
     EXPECT_TRUE(req->ok()) << req->errorMsg();
+    return readRun(*req, posSeeksBefore, phraseVerifiesBefore);
+  }
 
-    Run result;
-    result.count = req->getMatchCount();
-    const api::DocList* docs = req->docList();
-    if (docs == nullptr && result.count != 0) {
-      ADD_FAILURE() << "missing doc list";
-    } else if (docs != nullptr && result.count != 0) {
-      const api::Column* ids = docs->columns.find("id");
-      const api::Column* scores = docs->columns.find("_score_");
-      if (ids == nullptr || scores == nullptr) {
-        ADD_FAILURE() << "missing id or score column";
-      } else {
-        const auto& idValues = std::get<api::ColStr>(ids->kind).v;
-        const auto& scoreValues = std::get<api::ColFloat>(scores->kind).v;
-        EXPECT_EQ(idValues.size(), scoreValues.size());
-        for (size_t i = 0; i < std::min(idValues.size(), scoreValues.size()); i++) {
-          std::string idValue(idValues[i]);
-          result.ids.insert(idValue);
-          result.scores.emplace(std::move(idValue), scoreValues[i]);
-        }
-      }
-    }
-    result.posSeeks = SkipStats::posSeeks - posSeeksBefore;
-    result.phraseVerifies = SkipStats::phraseVerifies - phraseVerifiesBefore;
-    return result;
+  Run runNot(bool disableNotTwoPhase, std::string_view mandatory) {
+    NotTwoPhaseGuard notGuard(disableNotTwoPhase);
+    SkipStatsGuard statsGuard;
+    int64_t posSeeksBefore = SkipStats::posSeeks;
+    int64_t phraseVerifiesBefore = SkipStats::phraseVerifies;
+
+    auto req = localReq(helper.getSearchEngine());
+    req->collection("main");
+    auto& cur = req->topDocs("q");
+    cur.getNumber().getScores().limit(32).batchSize(33).fields({"id"});
+    cur.rawQuery() = qb::boolean(
+      cur.mr(), {qb::match(cur.mr(), "body_w", mandatory)}, {},
+      {qb::phraseWords(cur.mr(), "body_w", {"p", "q"})});
+    req->execute(false);
+    EXPECT_TRUE(req->ok()) << req->errorMsg();
+    return readRun(*req, posSeeksBefore, phraseVerifiesBefore);
   }
 
   void SetUp() override {
@@ -140,7 +174,10 @@ public:
       flatdoc("id", "b0", "body_w", "u v"),
       flatdoc("id", "b1", "body_w", "u q v"),
       flatdoc("id", "b2", "body_w", "w x"),
-      flatdoc("id", "b3", "body_w", "w q x")
+      flatdoc("id", "b3", "body_w", "w q x"),
+      flatdoc("id", "n0", "body_w", "mand p q"),
+      flatdoc("id", "n1", "body_w", "mand p x q"),
+      flatdoc("id", "n2", "body_w", "mand lonely z")
     }, UpdateMessage::COMMIT);
   }
 };
@@ -178,4 +215,19 @@ TEST_F(PhraseConjunctionTest, flattenedEnumsPreserveResultsAndDeferVerification)
   EXPECT_EQ(nestedDisjoint.scores, flatDisjoint.scores);
   EXPECT_EQ(0, flatDisjoint.phraseVerifies);
   EXPECT_LE(flatDisjoint.posSeeks, nestedDisjoint.posSeeks);
+}
+
+TEST_F(PhraseConjunctionTest, prohibitedPhraseVerifiesOnlyMandatoryCollisions) {
+  Run deferred = runNot(false, "mand");
+  Run eager = runNot(true, "mand");
+
+  EXPECT_EQ(eager.count, deferred.count);
+  EXPECT_EQ(eager.ids, deferred.ids);
+  EXPECT_EQ(eager.scores, deferred.scores);
+  EXPECT_EQ((std::set<std::string>{"n1", "n2"}), deferred.ids);
+  EXPECT_EQ(2, deferred.phraseVerifies);
+
+  Run noCollision = runNot(false, "lonely");
+  EXPECT_EQ((std::set<std::string>{"n2"}), noCollision.ids);
+  EXPECT_EQ(0, noCollision.phraseVerifies);
 }

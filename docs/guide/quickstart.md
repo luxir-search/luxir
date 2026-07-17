@@ -65,6 +65,12 @@ document that doesn't have a requested field simply omits that key - a doc
 object never carries `null` placeholders, so what you see is exactly what the
 document has.
 
+Prefer a uniform shape instead? Add `"document_format": "columns"` to the
+request and every requested field appears in every doc, with an explicit
+`null` where the document has no value - handy when feeding rows into a
+table. (Over gRPC, responses are natively columnar; this setting picks the
+placement there too.)
+
 ### Counts are exact
 
 Add `get_number` and the response tells you exactly how many documents match,
