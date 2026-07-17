@@ -229,7 +229,7 @@ bool fingerprint(LocalReq& req, uint64_t& fp, std::string& error) {
     return false;
   }
   const auto& docs = std::get<api::DocList>((*opPtr)->kind);
-  fp = (uint64_t)(docs.matches ? *docs.matches : 0);
+  fp = (uint64_t)(docs.found ? *docs.found : 0);
   const auto* idCol = docs.columns.find("id");
   if (!idCol || !std::holds_alternative<api::ColStr>(idCol->kind)) {
     error = "missing id column";

@@ -301,7 +301,7 @@ P::SearchResponse buildResponse(std::pmr::memory_resource& mr) {
   // ops["results"] -> Val{DocList}
   P::Val* results = B::opsSlot(resp.ops, /*cap*/ 2, "results", mr);
   auto& dl = results->kind.emplace<P::DocList>();
-  dl.matches = 42;
+  dl.found = 42;
   dl.offset = 0;
   dl.more = false;
   dl.max_score = 1.5f;
@@ -356,7 +356,7 @@ void verifyResponse(const P::SearchResponse& o) {
   const auto* dlp = std::get_if<P::DocList>(&results.kind);
   ASSERT_NE(dlp, nullptr);
   const P::DocList& dl = *dlp;
-  EXPECT_TRUE(dl.matches && *dl.matches == 42);
+  EXPECT_TRUE(dl.found && *dl.found == 42);
   EXPECT_TRUE(dl.max_score && *dl.max_score == 1.5f);
   ASSERT_EQ(dl.columns.size(), 3u);
 
@@ -427,9 +427,9 @@ TEST(ProtoRoundTrip, BuildByBacking) {
     ASSERT_NE(resultsIv, nullptr);
     const auto* m = std::get_if<P::Map>(&(*resultsIv)->kind);
     ASSERT_NE(m, nullptr);
-    const auto* matches = m->fields.find("matches");
-    ASSERT_NE(matches, nullptr);
-    { const auto* n = std::get_if<std::int64_t>(&(**matches).kind);
+    const auto* found = m->fields.find("found");
+    ASSERT_NE(found, nullptr);
+    { const auto* n = std::get_if<std::int64_t>(&(**found).kind);
       ASSERT_NE(n, nullptr); EXPECT_EQ(*n, 42); }
     const auto* statsIv = out.ops.find("stats");
     ASSERT_NE(statsIv, nullptr);

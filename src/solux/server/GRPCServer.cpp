@@ -570,6 +570,14 @@ static void handleSearch(GenericCallData& call, grpc::ByteBuffer& readBuf) {
     call.decrementOutstanding();  // balance the responsesExpected++ done before handle()
     return;
   }
+  if (requestState->proto.response_format == solux::api::ResponseFormat::DOCS) {
+    releaseArena(arena);
+    // Doc-line framing is an HTTP/NDJSON concept; gRPC responses are already
+    // framed DocList messages.
+    call.finishWithError(grpc::Status(grpc::StatusCode::INVALID_ARGUMENT,
+                                      "response_format=docs applies to the HTTP NDJSON layer only"));
+    return;
+  }
   auto& engine = call.server.getSoluxNode().getSearchEngine();
   auto& req = *solux::arenaCreate<GRPCSearchRequest>(*arena, engine, requestState->proto, *arena);
   req.requestState = std::move(requestState);

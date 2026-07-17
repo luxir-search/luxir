@@ -495,7 +495,7 @@ TEST_F(FusionOpTest, emptyIndex) {
 
   const auto* dl = lreq->docList("f");
   ASSERT_TRUE(dl != nullptr);
-  EXPECT_EQ(dl->matches.value_or(0), 0);
+  EXPECT_EQ(dl->found.value_or(0), 0);
 
   lreq->done();
 }

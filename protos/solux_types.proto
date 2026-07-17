@@ -35,6 +35,19 @@ message SearchRequest {
   // Civil frame for date math and offset-less date literals. Empty is UTC;
   // accepts Z, UTC, fixed offsets, or a case-sensitive IANA zone name.
   string time_zone = 5;
+
+  // How the HTTP/NDJSON layer frames the response stream (request-level: one
+  // stream has one framing).  ENVELOPE (default): one JSON envelope line per
+  // batch.  DOCS: bare document lines with optional _header_ meta records -
+  // see the docs.  The HTTP ?format=docs URL param is an alias for setting
+  // this.  HTTP-only: gRPC responses are already framed DocList messages, so
+  // requests setting DOCS over gRPC are rejected.
+  ResponseFormat response_format = 6;
+}
+
+enum ResponseFormat {
+  ENVELOPE = 0;
+  DOCS = 1;
 }
 
 // Different types of top-level search operations.
@@ -498,7 +511,11 @@ message SearchResponse {
 // just the degenerate cases.  Which fields land where is a function of the
 // request (see DocFormat), never of the data.
 message DocList {
-  optional sint64 matches = 1;
+  // Exact number of matching documents; set when the request asked get_number.
+  // Named to match the wire rendering everywhere ("found" in the HTTP JSON
+  // envelope and the format=docs _header_): the JSON response IS a flattened
+  // DocList, so its keys are these field names.
+  optional sint64 found = 1;
   optional float max_score = 2;
 
   // Dense columns; each has exactly row_count slots.

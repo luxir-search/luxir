@@ -806,7 +806,7 @@ bool DocEmitterImpl<GetDocList, GetDoc, GetScore>::produceBatches() {
     }
 
     if (getNumber) {
-      docListProto.matches = totalHits;
+      docListProto.found = totalHits;
     }
 
     // Materialize just this batch's docs from getDoc.  Field loaders need a

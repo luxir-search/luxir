@@ -256,19 +256,13 @@ void appendOpVal(std::string& out, const solux::api::Val& val);
 // plan, instead of re-dispatching the column variant and re-escaping the
 // field name for every cell.  Row maps (docs[i]) are heterogeneous by
 // nature and stay per-value.
-void appendDocs(std::string& out, const solux::api::DocList& docs) {
-  size_t numDocs = (size_t)docs.row_count;
-  out += '[';
-  if (numDocs == 0) {
-    out += ']';
-    return;
-  }
+struct ColPlan {
+  std::string key;  // ","name":" (first column omits the comma)
+  CellFn fn;
+  const solux::api::Column* col;
+};
 
-  struct ColPlan {
-    std::string key;  // ","name":" (first column omits the comma)
-    CellFn fn;
-    const solux::api::Column* col;
-  };
+std::vector<ColPlan> buildColPlan(const solux::api::DocList& docs) {
   std::vector<ColPlan> plan;
   plan.reserve(docs.columns.size());
   for (const auto& [name, col] : docs.columns) {
@@ -279,24 +273,54 @@ void appendDocs(std::string& out, const solux::api::DocList& docs) {
     p.fn = resolveCellFn(col);
     p.col = &col;
   }
+  return plan;
+}
 
+// One document object: the merge of the planned dense columns and doc i's
+// sparse row map (a field name never appears in both).
+void appendDocObject(std::string& out, const std::vector<ColPlan>& plan,
+                     const solux::api::DocList& docs, size_t i) {
+  out += '{';
+  for (const auto& p : plan) {
+    out += p.key;
+    p.fn(out, *p.col, i);
+  }
+  bool first = plan.empty();
+  if (i < docs.docs.size()) {
+    for (const auto& [name, val] : docs.docs[i].fields) {
+      if (!first) out += ',';
+      first = false;
+      appendJsonString(out, name);
+      out += ':';
+      appendOpVal(out, *val);
+    }
+  }
+  out += '}';
+}
+
+void appendDocs(std::string& out, const solux::api::DocList& docs) {
+  size_t numDocs = (size_t)docs.row_count;
+  out += '[';
+  if (numDocs == 0) {
+    out += ']';
+    return;
+  }
+  auto plan = buildColPlan(docs);
   for (size_t i = 0; i < numDocs; i++) {
     if (i) out += ',';
-    out += '{';
-    for (const auto& p : plan) {
-      out += p.key;
-      p.fn(out, *p.col, i);
-    }
-    bool first = plan.empty();
-    if (i < docs.docs.size()) {
-      for (const auto& [name, val] : docs.docs[i].fields) {
-        if (!first) out += ',';
-        first = false;
-        appendJsonString(out, name);
-        out += ':';
-        appendOpVal(out, *val);
-      }
-    }
+    appendDocObject(out, plan, docs, i);
+  }
+  out += ']';
+}
+
+void appendWarnings(std::string& out, std::span<const solux::api::Warning> warnings) {
+  out += '[';
+  for (size_t i = 0; i < warnings.size(); i++) {
+    if (i) out += ',';
+    out += R"({"code":)";
+    appendJsonString(out, warnings[i].code);
+    out += R"(,"message":)";
+    appendJsonString(out, warnings[i].message);
     out += '}';
   }
   out += ']';
@@ -304,9 +328,14 @@ void appendDocs(std::string& out, const solux::api::DocList& docs) {
 
 void appendDocList(std::string& out, const solux::api::DocList& docs) {
   out += '{';
-  if (docs.matches.has_value()) {
+  if (docs.found.has_value()) {
     out += R"("found":)";
-    appendInt(out, *docs.matches);
+    appendInt(out, *docs.found);
+    out += ',';
+  }
+  if (docs.max_score.has_value()) {
+    out += R"("max_score":)";
+    appendFloating(out, *docs.max_score);
     out += ',';
   }
   out += R"("docs":)";
@@ -434,12 +463,16 @@ std::string renderSearchResponseLine(const solux::api::SearchResponse& resp) {
     out += ':';
   };
   if (docs) {
-    // "found" is opt-in: matches is set only when get_number was requested (an
-    // exact count forgoes dynamic pruning).  Omit the key when absent rather than
-    // rendering 0, so "not requested" is not confused with "zero matches".
-    if (docs->matches.has_value()) {
+    // "found" is opt-in: set only when get_number was requested (an exact
+    // count forgoes dynamic pruning).  Omit the key when absent rather than
+    // rendering 0, so "not requested" is not confused with "zero found".
+    if (docs->found.has_value()) {
       appendKey("found");
-      appendInt(out, *docs->matches);
+      appendInt(out, *docs->found);
+    }
+    if (docs->max_score.has_value()) {
+      appendKey("max_score");
+      appendFloating(out, *docs->max_score);
     }
     appendKey("docs");
     appendDocs(out, *docs);
@@ -470,16 +503,7 @@ std::string renderSearchResponseLine(const solux::api::SearchResponse& resp) {
   if (!resp.warnings.empty()) {
     // declared degradations (the request was served, but not exactly as written)
     appendKey("warnings");
-    out += '[';
-    for (size_t i = 0; i < resp.warnings.size(); i++) {
-      if (i) out += ',';
-      out += R"({"code":)";
-      appendJsonString(out, resp.warnings[i].code);
-      out += R"(,"message":)";
-      appendJsonString(out, resp.warnings[i].message);
-      out += '}';
-    }
-    out += ']';
+    appendWarnings(out, resp.warnings);
   }
   if (resp.more) {
     appendKey("more");
@@ -487,6 +511,76 @@ std::string renderSearchResponseLine(const solux::api::SearchResponse& resp) {
   }
   out += "}\n";
   return out;
+}
+
+std::vector<DocRun> renderDocRuns(const solux::api::SearchResponse& resp) {
+  std::vector<DocRun> runs;
+  for (const auto& [name, val] : resp.ops) {
+    if (const auto* dl = std::get_if<solux::api::DocList>(&val->kind)) {
+      auto& run = runs.emplace_back(DocRun{name, dl, {}});
+      if (dl->row_count > 0) {
+        auto plan = buildColPlan(*dl);
+        for (size_t i = 0; i < (size_t)dl->row_count; i++) {
+          appendDocObject(run.body, plan, *dl, i);
+          run.body += '\n';
+        }
+      }
+    }
+  }
+  return runs;
+}
+
+bool frameDocRun(const DocRun& run, DocLinesState& state,
+                 std::span<const solux::api::Warning> warnings, std::string& marker) {
+  const solux::api::DocList& docs = *run.docs;
+  bool firstForOp =
+      std::find(state.headeredOps.begin(), state.headeredOps.end(), run.op) ==
+      state.headeredOps.end();
+  // Scalar DocList fields go out with the op's first run; request warnings
+  // with the stream's first header.  Degraded execution must not be silent,
+  // so warnings force a header even without get_number.  NOTE: this assumes
+  // scalar fields are populated from the op's FIRST batch on (true for found;
+  // when the engine starts setting max_score it must do the same, or a
+  // late-arriving value would be suppressed here).
+  bool haveFound = firstForOp && docs.found.has_value();
+  bool haveMaxScore = firstForOp && docs.max_score.has_value();
+  bool haveWarnings = !state.anyHeaderEmitted && !warnings.empty();
+  // Multi-op framing: any change of op needs a marker for attribution.
+  bool needMarker = state.multiOp && (firstForOp || run.op != state.currentOp);
+  bool haveContent = haveFound || haveMaxScore || haveWarnings;
+  if (run.body.empty() && !haveContent) return false;  // nothing to say
+
+  if (haveContent || needMarker) {
+    marker += R"({"_header_":{)";
+    bool first = true;
+    if (state.multiOp) {
+      marker += R"("op":)";
+      appendJsonString(marker, run.op);
+      first = false;
+    }
+    if (haveFound) {
+      if (!first) marker += ',';
+      marker += R"("found":)";
+      appendInt(marker, *docs.found);
+      first = false;
+    }
+    if (haveMaxScore) {
+      if (!first) marker += ',';
+      marker += R"("max_score":)";
+      appendFloating(marker, *docs.max_score);
+      first = false;
+    }
+    if (haveWarnings) {
+      if (!first) marker += ',';
+      marker += R"("warnings":)";
+      appendWarnings(marker, warnings);
+    }
+    marker += "}}\n";
+    state.anyHeaderEmitted = true;
+  }
+  if (firstForOp) state.headeredOps.push_back(run.op);
+  state.currentOp = run.op;
+  return true;
 }
 
 std::string renderErrorBody(std::string_view message) {

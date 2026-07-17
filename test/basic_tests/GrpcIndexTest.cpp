@@ -180,7 +180,7 @@ public:
     bool read = rstream.Read(&sresponse);
     EXPECT_TRUE(read);
     const auto& docs = std::get<solux::api::DocList>(sresponse.msg.ops.at("q")->kind);
-    return docs.matches ? *docs.matches : 0;
+    return docs.found ? *docs.found : 0;
   }
 
   // How we do things here in the client isn't actually ok depending on how the server is implemented and could
@@ -704,8 +704,8 @@ TEST_F(GrpcIndexTest, threadsafeIndex) {
 
   ResponseChecker responseChecker = [&](int64_t docid, const solux::api::SearchResponse& response) {
     const auto& docList = std::get<solux::api::DocList>(response.ops.at("q")->kind);
-    ASSERT_TRUE(docList.matches.has_value());
-    ASSERT_EQ(1, *docList.matches);  // FIXME!  this comes up as "2" now sometimes with nDocs=100????
+    ASSERT_TRUE(docList.found.has_value());
+    ASSERT_EQ(1, *docList.found);  // FIXME!  this comes up as "2" now sometimes with nDocs=100????
     ASSERT_EQ(docList.columns.size(), retrieveFields.size()); // this might change in the future.
     verifyDoc(docid, docList.columns);
 
@@ -741,8 +741,8 @@ TEST_F(GrpcIndexTest, threadsafeIndex) {
   ResponseChecker respc2 = [&](int64_t docid, const solux::api::SearchResponse& response) {
     const auto& docList = std::get<solux::api::DocList>(response.ops.at("q")->kind);
     // not too much to check here... just record the hits we got
-    ASSERT_TRUE(docList.matches.has_value());
-    hits[docid % 10] = *docList.matches;
+    ASSERT_TRUE(docList.found.has_value());
+    hits[docid % 10] = *docList.found;
   };
 
   // this pass records the number of hits per t2_w:[0 - 10]
@@ -751,8 +751,8 @@ TEST_F(GrpcIndexTest, threadsafeIndex) {
   // now we can check the hits to see if we got the expected number of hits for each t2_w:[0 - 10]
   ResponseChecker respc2verify = [&](int64_t docid, const solux::api::SearchResponse& response) {
     const auto& docList = std::get<solux::api::DocList>(response.ops.at("q")->kind);
-    ASSERT_TRUE(docList.matches.has_value());
-    ASSERT_EQ(hits[docid % 10], *docList.matches);
+    ASSERT_TRUE(docList.found.has_value());
+    ASSERT_EQ(hits[docid % 10], *docList.found);
   };
 
   // With 10K docs and 32 threads, this reliably failed with the old non-thread-safe
@@ -783,11 +783,11 @@ TEST_F(GrpcIndexTest, threadsafeIndex) {
     ASSERT_EQ(std::errc(), ec);
     unused(ptr);
 
-    ASSERT_TRUE(docList.matches.has_value());
-    ASSERT_EQ(hits[reqid % 10], *docList.matches);
-    if (*docList.matches == 0) return;
+    ASSERT_TRUE(docList.found.has_value());
+    ASSERT_EQ(hits[reqid % 10], *docList.found);
+    if (*docList.found == 0) return;
 
-    auto max = std::min(limit, (int64_t)*docList.matches);
+    auto max = std::min(limit, (int64_t)*docList.found);
     auto expectedColSize = response.more ? batchSize : max % batchSize;
     if (expectedColSize == 0) expectedColSize = batchSize;
     size_t expectedSize = (size_t)expectedColSize;
@@ -795,7 +795,7 @@ TEST_F(GrpcIndexTest, threadsafeIndex) {
     // check the id field
     const auto& idColumn = std::get<solux::api::ColStr>(docList.columns.at("id").kind);
     if (idColumn.v.size() != expectedSize) {
-      LOG_ERROR("CLIENT RESULT: request_id={} more={} matches={}", requestId, response.more, *docList.matches);
+      LOG_ERROR("CLIENT RESULT: request_id={} more={} found={}", requestId, response.more, *docList.found);
     }
     ASSERT_EQ(expectedSize, idColumn.v.size());
 

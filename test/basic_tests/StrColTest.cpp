@@ -741,7 +741,7 @@ TEST_F(StrColTest, BasicMultiValuedColumnStoredStrings) {
 
   const auto* docs = req->docList("q");
   ASSERT_NE(docs, nullptr);
-  ASSERT_EQ(3, docs->matches.value_or(0));
+  ASSERT_EQ(3, docs->found.value_or(0));
 
   // Verify the returned multi-valued fields
   const auto& columns = docs->columns;
@@ -812,7 +812,7 @@ TEST_F(StrColTest, EmptyAndMissingValues) {
 
   const auto* docs = req->docList("q");
   ASSERT_NE(docs, nullptr);
-  ASSERT_EQ(3, docs->matches.value_or(0));
+  ASSERT_EQ(3, docs->found.value_or(0));
 
   // Verify handling of empty and missing values
   const auto& columns = docs->columns;
@@ -898,7 +898,7 @@ TEST_F(StrColTest, MultiValuedFixedSizeOptimization) {
 
   const auto* docs = req->docList("q");
   ASSERT_NE(docs, nullptr);
-  ASSERT_EQ(3, docs->matches.value_or(0));
+  ASSERT_EQ(3, docs->found.value_or(0));
 
   // Verify the values are correct
   const auto& columns = docs->columns;

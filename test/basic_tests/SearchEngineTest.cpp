@@ -128,7 +128,7 @@ TEST_F(SearchEngineTest, statsOpsEmptyIndexEmitNan) {
 
   const auto* docs = req->docList("q");
   ASSERT_NE(docs, nullptr);
-  ASSERT_EQ(0, docs->matches.value_or(0));
+  ASSERT_EQ(0, docs->found.value_or(0));
   ASSERT_TRUE(docs->ops.contains("nested_avg")) << req->toString();
   EXPECT_TRUE(std::isnan(std::get<double>(docs->ops.at("nested_avg")->kind)));
 }
@@ -296,7 +296,7 @@ TEST_F(SearchEngineTest, basic) {
     const auto& resp = req->responses[0]->proto;
     ASSERT_EQ(req->proto.request_id, resp.request_id);
     const auto& docs = *req->docList("q");
-    ASSERT_EQ(3, docs.matches.value_or(0));
+    ASSERT_EQ(3, docs.found.value_or(0));
     ASSERT_EQ(ncols, docs.columns.size());
 
     // Accessors: column arms (columns is a plain map) and facet arms (ops is indirect).
@@ -500,7 +500,7 @@ TEST_F(SearchEngineTest, basic) {
     auto colS = [&](const char* n) -> const solux::api::ColStr& {
       return std::get<solux::api::ColStr>(docs.columns.at(n).kind);
     };
-    ASSERT_EQ(3, docs.matches.value_or(0));
+    ASSERT_EQ(3, docs.found.value_or(0));
     ASSERT_EQ(3, docs.columns.size());
 
     // docs will be ordered by shortest field first since term freq is same for all.
@@ -523,7 +523,7 @@ TEST_F(SearchEngineTest, basic) {
     auto colS2 = [&](const char* n) -> const solux::api::ColStr& {
       return std::get<solux::api::ColStr>(docs2.columns.at(n).kind);
     };
-    ASSERT_EQ(3, docs2.matches.value_or(0));
+    ASSERT_EQ(3, docs2.found.value_or(0));
     ASSERT_EQ(2, docs2.offset);
     ASSERT_EQ(3, docs2.columns.size());
     ASSERT_EQ(1, colI2("foo_i").v.size());  // only the first 2 docs this time.  should I explicitly return the number of docs in this batch?
@@ -586,7 +586,7 @@ TEST_F(SearchEngineTest, forcePrepareWrapperMatchesChild) {
 
   const auto& normalDocs = *req->docList("normal");
   const auto& forcedDocs = *forcedReq->docList("forced");
-  ASSERT_EQ(normalDocs.matches.value_or(0), forcedDocs.matches.value_or(0));
+  ASSERT_EQ(normalDocs.found.value_or(0), forcedDocs.found.value_or(0));
 
   const auto& normalFoo = std::get<solux::api::ColInt>(normalDocs.columns.at("foo_i").kind).v;
   const auto& forcedFoo = std::get<solux::api::ColInt>(forcedDocs.columns.at("foo_i").kind).v;
@@ -644,7 +644,7 @@ TEST_F(SearchEngineTest, constantScoreWrapperSetsScore) {
   ASSERT_FALSE(hasError(req->responses[0]->proto)) << req->toString();
 
   const auto& docs = *req->docList("constant");
-  ASSERT_EQ(3, docs.matches.value_or(0));
+  ASSERT_EQ(3, docs.found.value_or(0));
 
   const auto& foo = std::get<solux::api::ColInt>(docs.columns.at("foo_i").kind).v;
   ASSERT_EQ(3, foo.size());
@@ -732,7 +732,7 @@ TEST_F(SearchEngineTest, topDocsFilters) {
     req->execute();
     ASSERT_FALSE(hasError(req->responses[0]->proto)) << req->toString();
     auto& docs = std::get<api::DocList>(req->responses[0]->proto.ops.at("q")->kind);
-    EXPECT_EQ(2, docs.matches);
+    EXPECT_EQ(2, docs.found);
   }
   {  // two filters intersect
     auto req = localReq(soluxNode->getSearchEngine());
@@ -742,7 +742,7 @@ TEST_F(SearchEngineTest, topDocsFilters) {
     req->execute();
     ASSERT_FALSE(hasError(req->responses[0]->proto)) << req->toString();
     auto& docs = std::get<api::DocList>(req->responses[0]->proto.ops.at("q")->kind);
-    EXPECT_EQ(1, docs.matches);
+    EXPECT_EQ(1, docs.found);
   }
   {  // a nested facet counts over the filtered domain
     auto req = localReq(soluxNode->getSearchEngine());
@@ -754,7 +754,7 @@ TEST_F(SearchEngineTest, topDocsFilters) {
     req->execute();
     ASSERT_FALSE(hasError(req->responses[0]->proto)) << req->toString();
     auto& docs = std::get<api::DocList>(req->responses[0]->proto.ops.at("q")->kind);
-    EXPECT_EQ(2, docs.matches);
+    EXPECT_EQ(2, docs.found);
     auto& facet = std::get<api::FacetResult>(docs.ops.at("cats")->kind);
     ASSERT_EQ(2u, facet.counts.size());
     EXPECT_EQ(1, facet.counts[0]);  // one "hello"+"big" doc in each of a and b

@@ -1013,7 +1013,7 @@ TEST_F(FacetTest, emptyIndexNestedFacet) {
   ASSERT_OK(req);
   const auto* docs = req->docList("q");
   ASSERT_NE(docs, nullptr) << req->toString();
-  ASSERT_EQ(0, docs->matches.value_or(0));
+  ASSERT_EQ(0, docs->found.value_or(0));
   ASSERT_TRUE(docs->ops.contains("f")) << req->toString();
   const auto* facetResult = docs->ops.at("f")->facetResult();
   ASSERT_NE(facetResult, nullptr) << req->toString();
@@ -1193,7 +1193,7 @@ TEST_F(FacetTest, fullTextFacetNestedSparseArrayDomain) {
   ASSERT_OK(req);
   const auto* docs = req->docList("q");
   ASSERT_NE(docs, nullptr) << req->toString();
-  ASSERT_EQ(3, docs->matches.value_or(0));
+  ASSERT_EQ(3, docs->found.value_or(0));
   ASSERT_TRUE(docs->ops.contains("f")) << req->toString();
   const auto* facetResult = docs->ops.at("f")->facetResult();
   ASSERT_NE(facetResult, nullptr) << req->toString();
@@ -1581,7 +1581,7 @@ TEST_F(FacetTest, emptyIndexForcePrepareNestedOps) {
   ASSERT_OK(req);
   const auto* docs = req->docList("q");
   ASSERT_NE(docs, nullptr) << req->toString();
-  ASSERT_EQ(0, docs->matches.value_or(0));
+  ASSERT_EQ(0, docs->found.value_or(0));
   // Both nested calculator families must still emit on an empty prepared index.
   ASSERT_TRUE(docs->ops.contains("f")) << req->toString();
   const auto* fFacet = docs->ops.at("f")->facetResult();
@@ -1763,7 +1763,7 @@ TEST_F(FacetTest, avgNestedSparseArrayDomain) {
   ASSERT_OK(req);
   const auto* docs = req->docList("q");
   ASSERT_NE(docs, nullptr) << req->toString();
-  ASSERT_EQ(3, docs->matches.value_or(0));
+  ASSERT_EQ(3, docs->found.value_or(0));
   // avg over the 3 in-domain docs: (10+20+30)/3 = 20
   EXPECT_DOUBLE_EQ(20.0, std::get<double>(docs->ops.at("a")->kind));
 }
@@ -1843,7 +1843,7 @@ TEST_F(FacetTest, fullTextFacetSparseDomainMissing) {
   ASSERT_OK(req);
   const auto* docs = req->docList("q");
   ASSERT_NE(docs, nullptr) << req->toString();
-  ASSERT_EQ(3, docs->matches.value_or(0));
+  ASSERT_EQ(3, docs->found.value_or(0));
   const auto* facetResult = docs->ops.at("f")->facetResult();
   ASSERT_NE(facetResult, nullptr) << req->toString();
   const auto& bucketIds = std::get<solux::api::ColStr>(facetResult->bucket_ids->kind);

@@ -1015,7 +1015,7 @@ static void BM_FullTextFacet(benchmark::State& state, int64_t nDocs, std::string
     req->execute(para);
 
     const auto* qDocs = req->responses[0]->proto.ops.at("q")->docList();
-    matches = qDocs->matches.value_or(0);
+    matches = qDocs->found.value_or(0);
     const auto* facetResult = qDocs->ops.at("f")->facetResult();
     const auto& counts = facetResult->counts;
     // Text faceting buckets are terms (col_s).

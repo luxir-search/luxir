@@ -155,6 +155,24 @@ TEST_F(GrpcSearchTest, backpressurePausesEmitter) {
   serverThread.join();
 }
 
+// Doc-line framing is an HTTP/NDJSON concept; gRPC rejects it explicitly
+// rather than silently returning envelope-framed batches.
+TEST_F(GrpcSearchTest, responseFormatDocsIsRejected) {
+  auto lreq = localReq(soluxNode->getSearchEngine());
+  lreq->collection("main").responseFormat(solux::api::ResponseFormat::DOCS)
+      .topDocs("q").allQuery().fields({"id"});
+
+  grpc::ClientContext context;
+  HppClientReaderWriter<solux::api::SearchRequest, solux::api::SearchResponse> stream(
+      channel.get(), rpc::Search, &context);
+  ASSERT_TRUE(stream.Write(lreq->proto));
+  stream.WritesDone();
+  Reply<solux::api::SearchResponse> response;
+  while (stream.Read(&response)) {}
+  auto status = stream.Finish();
+  EXPECT_EQ(grpc::StatusCode::INVALID_ARGUMENT, status.error_code());
+}
+
 // A client that cancels the RPC while the emitter is paused must not strand
 // the request: the failed writes wake the parked emitter, whose next reply()
 // observes CANCEL and completes the call.  A stranded call would hang

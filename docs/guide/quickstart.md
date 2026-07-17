@@ -151,6 +151,41 @@ curl -X POST http://localhost:9400/collections/main/_update \
   --data-binary @books.ndjson
 ```
 
+## Bulk export: stream every match, no cursor
+
+Add `?format=docs` to a query and the response is bare NDJSON documents - one
+per line, no envelope, no paging. `limit: -1` means every match, streamed over
+one connection; there is no scroll API or cursor token to manage:
+
+```
+POST /collections/main/_query?format=docs
+{"query": {"all": true}, "limit": -1, "fields": ["id", "title_w"]}
+```
+
+```json
+{"id":"1","title_w":"the left hand of darkness"}
+{"id":"2","title_w":"a wizard of earthsea"}
+{"id":"3","title_w":"the dispossessed"}
+```
+
+Ask for `get_number` and a `_header_` line leads the stream so tools know the
+total up front: `{"_header_":{"found":3}}`. Execution warnings, when there are
+any, also arrive in a `_header_` - degraded execution is never silent. Header
+lines are recognized (and skipped) by ingest, so export pipes straight back
+into `/_update`:
+
+```bash
+curl -s 'http://localhost:9400/collections/main/_query?format=docs' \
+     -H 'Content-Type: application/json' \
+     -d '{"query": {"all": true}, "limit": -1, "fields": ["id", "title_w"]}' |
+curl -X POST 'http://localhost:9400/collections/backup/_update?commit=true' \
+     -H 'Content-Type: application/x-ndjson' --data-binary @-
+```
+
+If anything fails mid-stream, the chunked response ends without its
+terminator, so HTTP clients report truncation instead of quietly delivering a
+partial result. A cleanly finished body is a complete result set.
+
 ## Many collections, one endpoint
 
 You never pre-create collections. Index to any name and it comes into existence

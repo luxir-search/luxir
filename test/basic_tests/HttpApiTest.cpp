@@ -3,6 +3,7 @@
 #include <thread>
 #include <filesystem>
 #include <fstream>
+#include <map>
 #include <optional>
 #include <set>
 #include <sstream>
@@ -1520,6 +1521,310 @@ TEST_F(HttpApiTest, shutdownDuringInflightRequest) {
 
   beast::error_code ec;
   sock.shutdown(tcp::socket::shutdown_both, ec);
+}
+
+// ?format=docs: every line is a bare document - no envelope, no batching
+// visible on the wire regardless of batch_size.
+TEST_F(HttpApiTest, docsFormatIsPureDocLines) {
+  SoluxTest::clearCollection("http_docs");
+  CollectionHelper ch("http_docs");
+  for (int i = 0; i < 5; i++) {
+    auto commit = i == 4 ? UpdateMessage::COMMIT : UpdateMessage::NO_COMMIT;
+    ch.index(flatdoc("id", "d" + std::to_string(i)), commit);
+  }
+
+  auto res = httpRequest(port(), http::verb::post, "/collections/http_docs/_query?format=docs",
+      R"({"query":{"all":true},"limit":-1,"batch_size":2,"fields":["id"]})");
+  ASSERT_EQ(200, res.result_int()) << res.body();
+
+  auto lines = splitLines(res.body());
+  ASSERT_EQ(5u, lines.size()) << res.body();
+  std::set<std::string> ids;
+  for (auto& line : lines) {
+    EXPECT_EQ(std::string::npos, line.find("\"docs\"")) << line;  // no envelope
+    EXPECT_EQ(std::string::npos, line.find("\"more\"")) << line;
+    glz::generic_i64 doc;
+    ASSERT_FALSE(glz::read_json(doc, line)) << line;
+    ids.insert(*doc["id"].get_if<std::string>());
+  }
+  EXPECT_EQ(std::set<std::string>({"d0", "d1", "d2", "d3", "d4"}), ids);
+}
+
+// The docs format is also selectable in the request body (full form,
+// request-level response_format) for clients that cannot set URL params.
+TEST_F(HttpApiTest, docsFormatSelectableInBody) {
+  SoluxTest::clearCollection("http_docs_body");
+  CollectionHelper ch("http_docs_body");
+  ch.index(flatdoc("id", std::string("b1")), UpdateMessage::COMMIT);
+
+  auto res = httpRequest(port(), http::verb::post, "/collections/http_docs_body/_query",
+      R"({"ops":{"q":{"top_docs":{"query":{"all":true},"fields":["id"]}}},"response_format":"docs"})");
+  ASSERT_EQ(200, res.result_int()) << res.body();
+  EXPECT_EQ(R"({"id":"b1"})" "\n", res.body());
+}
+
+// get_number puts the count in a _header_ meta record on the first line;
+// without it the body is pure documents.
+TEST_F(HttpApiTest, docsFormatHeaderCarriesFound) {
+  SoluxTest::clearCollection("http_docs_hdr");
+  CollectionHelper ch("http_docs_hdr");
+  ch.index(flatdoc("id", std::string("h1")), UpdateMessage::NO_COMMIT);
+  ch.index(flatdoc("id", std::string("h2")), UpdateMessage::COMMIT);
+
+  auto res = httpRequest(port(), http::verb::post, "/collections/http_docs_hdr/_query?format=docs",
+      R"({"query":{"all":true},"limit":-1,"get_number":true,"fields":["id"]})");
+  ASSERT_EQ(200, res.result_int()) << res.body();
+  auto lines = splitLines(res.body());
+  ASSERT_EQ(3u, lines.size()) << res.body();
+  EXPECT_EQ(R"({"_header_":{"found":2}})", lines[0]);
+  EXPECT_EQ(std::string::npos, res.body().find("_header_", lines[0].size())) << res.body();
+
+  auto pure = httpRequest(port(), http::verb::post, "/collections/http_docs_hdr/_query?format=docs",
+      R"({"query":{"all":true},"limit":-1,"fields":["id"]})");
+  EXPECT_EQ(std::string::npos, pure.body().find("_header_")) << pure.body();
+  EXPECT_EQ(2u, splitLines(pure.body()).size());
+}
+
+// The docs format rejects requests whose response would need an envelope.
+TEST_F(HttpApiTest, docsFormatValidation) {
+  auto facet = httpRequest(port(), http::verb::post, "/collections/main/_query?format=docs",
+      R"({"ops":{"cats":{"field_facet":{"field":"http_facet_s"}}}})");
+  EXPECT_EQ(400, facet.result_int()) << facet.body();
+
+  auto columns = httpRequest(port(), http::verb::post, "/collections/main/_query?format=docs",
+      R"({"query":{"all":true},"document_format":"columns","fields":["id"]})");
+  EXPECT_EQ(400, columns.result_int()) << columns.body();
+  EXPECT_NE(std::string::npos, columns.body().find("format=docs")) << columns.body();
+
+  auto unknown = httpRequest(port(), http::verb::post, "/collections/main/_query?format=lines",
+      R"({"query":{"all":true}})");
+  EXPECT_EQ(400, unknown.result_int()) << unknown.body();
+}
+
+// An engine error before anything streams is a plain HTTP error, not a 200
+// with an error line (the docs format has no in-band error representation).
+TEST_F(HttpApiTest, docsFormatErrorBeforeFlushIsHttpError) {
+  helper.index(flatdoc("id", std::string("de1")), UpdateMessage::COMMIT);
+  auto res = httpRequest(port(), http::verb::post, "/collections/main/_query?format=docs",
+      R"({"query":{"all":true},"fields":["nosuchfield"]})");
+  EXPECT_EQ(400, res.result_int()) << res.body();
+  EXPECT_NE(std::string::npos, res.body().find("nosuchfield")) << res.body();
+}
+
+// Object-valued sole-underscore-field records are the reserved meta/control
+// namespace in streaming ingest: unknown names are an error, never indexed as
+// documents.  Scalar-valued ones stay documents ({"_version_":42} is a
+// legitimate one-field export; every real control carries an object).
+TEST_F(HttpApiTest, ndjsonUnknownUnderscoreRecordIs400) {
+  auto res = httpRequest(port(), http::verb::post, "/collections/main/_update",
+      std::string(R"({"_bogus_":{"x":1}})") + "\n", "application/x-ndjson");
+  EXPECT_EQ(400, res.result_int()) << res.body();
+  EXPECT_NE(std::string::npos, res.body().find("_bogus_")) << res.body();
+
+  // Scalar payload: classified as a document, not an unknown control (it may
+  // still fail schema-level checks, but never as a control record).
+  auto scalar = httpRequest(port(), http::verb::post, "/collections/main/_update",
+      std::string(R"({"_version_":42})") + "\n", "application/x-ndjson");
+  EXPECT_EQ(std::string::npos, scalar.body().find("unknown control record")) << scalar.body();
+
+  // _header_ itself must carry an object.
+  auto malformed = httpRequest(port(), http::verb::post, "/collections/main/_update",
+      std::string(R"({"_header_":7})") + "\n", "application/x-ndjson");
+  EXPECT_EQ(400, malformed.result_int()) << malformed.body();
+  EXPECT_NE(std::string::npos, malformed.body().find("_header_")) << malformed.body();
+}
+
+// Meta records must not grow the batch arena unboundedly.  Both rotation
+// branches need > ingest.stream_batch_size (1MiB) of meta bytes: a
+// headers-only prefix (empty batch -> wholesale replacement) and headers
+// behind a pending doc (shared accounting -> threshold submit).
+TEST_F(HttpApiTest, ndjsonHeaderRecordsInterleaveWithDocs) {
+  SoluxTest::clearCollection("http_hdrs");
+  std::string headerLine = R"({"_header_":{"pad":")" + std::string(4096, 'h') + R"("}})" "\n";
+  std::string megOfHeaders;
+  for (int i = 0; i < 300; i++) megOfHeaders += headerLine;  // ~1.2MiB
+
+  std::string body = megOfHeaders;  // empty-batch branch: batch replacement
+  body += R"({"id":"hd0","num_i":0})" "\n";
+  body += megOfHeaders;             // pending-doc branch: threshold submit
+  body += R"({"id":"hd1","num_i":1})" "\n";
+  body += R"({"_end_":{"commit":{}}})" "\n";
+
+  auto res = httpRequest(port(), http::verb::post, "/collections/http_hdrs/_update",
+                         std::move(body), "application/x-ndjson");
+  ASSERT_EQ(200, res.result_int()) << res.body();
+
+  auto check = httpRequest(port(), http::verb::post, "/collections/http_hdrs/_query?format=docs",
+      R"({"query":{"all":true},"limit":-1,"get_number":true,"fields":["id"]})");
+  ASSERT_EQ(200, check.result_int()) << check.body();
+  auto lines = splitLines(check.body());
+  ASSERT_EQ(3u, lines.size()) << check.body();  // header + 2 docs
+  EXPECT_EQ(R"({"_header_":{"found":2}})", lines[0]);
+}
+
+// format=docs validation covers fusion source sub-ops (silently discarding
+// authored ops behind a format flag would be worse than rejecting them).
+TEST_F(HttpApiTest, docsFormatRejectsFusionSourceOps) {
+  auto res = httpRequest(port(), http::verb::post, "/collections/main/_query?format=docs",
+      R"({"ops":{"q":{"fusion":{"sources":{"a":{"query":{"all":true},)"
+      R"("ops":{"f":{"field_facet":{"field":"http_facet_s"}}}}},"rrf":{}}}}})");
+  EXPECT_EQ(400, res.result_int()) << res.body();
+  EXPECT_NE(std::string::npos, res.body().find("nested ops")) << res.body();
+
+  auto explain = httpRequest(port(), http::verb::post,
+      "/collections/main/_query?format=docs&explain=request", R"({"query":{"all":true}})");
+  EXPECT_EQ(400, explain.result_int()) << explain.body();
+
+  // Body-selected docs must not slip past explain either.
+  auto bodyExplain = httpRequest(port(), http::verb::post,
+      "/collections/main/_query?explain=request",
+      R"({"ops":{"q":{"top_docs":{"query":{"all":true}}}},"response_format":"docs"})");
+  EXPECT_EQ(400, bodyExplain.result_int()) << bodyExplain.body();
+
+  // Duplicate op names: the raw ops view keeps both entries (execution is
+  // last-wins), so docs framing rejects the ambiguity.
+  auto dup = httpRequest(port(), http::verb::post, "/collections/main/_query?format=docs",
+      R"({"ops":{"q":{"top_docs":{"query":{"all":true},"fields":["id"]}},)"
+      R"("q":{"top_docs":{"query":{"all":true},"fields":["id"]}}}})");
+  EXPECT_EQ(400, dup.result_int()) << dup.body();
+  EXPECT_NE(std::string::npos, dup.body().find("duplicate")) << dup.body();
+}
+
+// Multiple DocList ops in one docs-format request: outputs interleave in
+// runs, each introduced by an op-named _header_ marker; the op's first marker
+// carries its found.  Every doc is attributable by tracking the current
+// section.
+TEST_F(HttpApiTest, docsFormatMultiOpRunMarkers) {
+  SoluxTest::clearCollection("http_docs_multi");
+  CollectionHelper ch("http_docs_multi");
+  std::vector<Doc> docs;
+  for (int i = 0; i < 6; i++) docs.push_back(flatdoc("id", "a" + std::to_string(i), "kind_s", std::string("a")));
+  for (int i = 0; i < 4; i++) docs.push_back(flatdoc("id", "b" + std::to_string(i), "kind_s", std::string("b")));
+  ch.indexAll(docs, UpdateMessage::COMMIT);
+
+  auto res = httpRequest(port(), http::verb::post, "/collections/http_docs_multi/_query?format=docs",
+      R"({"ops":{)"
+      R"("qa":{"top_docs":{"query":{"match":{"kind_s":"a"}},"limit":-1,"batch_size":2,"get_number":true,"fields":["id"]}},)"
+      R"("qb":{"top_docs":{"query":{"match":{"kind_s":"b"}},"limit":-1,"batch_size":2,"get_number":true,"fields":["id"]}})"
+      R"(}})");
+  ASSERT_EQ(200, res.result_int()) << res.body();
+
+  std::map<std::string, std::set<std::string>> idsByOp;
+  std::map<std::string, int64_t> foundByOp;
+  std::string current;
+  for (auto& line : splitLines(res.body())) {
+    glz::generic_i64 root;
+    ASSERT_FALSE(glz::read_json(root, line)) << line;
+    if (root.contains("_header_")) {
+      auto& h = root["_header_"];
+      ASSERT_TRUE(h.contains("op")) << line;  // multi-op markers always name their op
+      current = *h["op"].get_if<std::string>();
+      if (h.contains("found")) foundByOp[current] = *h["found"].get_if<int64_t>();
+    } else {
+      ASSERT_FALSE(current.empty()) << "doc line before any marker: " << line;
+      idsByOp[current].insert(*root["id"].get_if<std::string>());
+    }
+  }
+  EXPECT_EQ(6u, idsByOp["qa"].size()) << res.body();
+  EXPECT_EQ(4u, idsByOp["qb"].size()) << res.body();
+  EXPECT_EQ(6, foundByOp["qa"]);
+  EXPECT_EQ(4, foundByOp["qb"]);
+}
+
+// Warnings force a _header_ even without get_number: degraded execution is
+// never silent, docs format included.
+TEST_F(HttpApiTest, docsFormatWarningsForceHeader) {
+  SoluxTest::clearCollection("http_docs_warn");
+  CollectionHelper ch("http_docs_warn");
+  ch.index(flatdoc("id", std::string("w1"), "tag_s", std::string("v")), UpdateMessage::COMMIT);
+
+  // Quoted-with-slop on a non-TEXT field degrades to an exact match and warns.
+  auto res = httpRequest(port(), http::verb::post, "/collections/http_docs_warn/_query?format=docs",
+      R"({"query":{"simple_query":{"q":"\"v\"~2","fields":["tag_s"]}},"fields":["id"]})");
+  ASSERT_EQ(200, res.result_int()) << res.body();
+  auto lines = splitLines(res.body());
+  ASSERT_EQ(2u, lines.size()) << res.body();
+  EXPECT_NE(std::string::npos, lines[0].find(R"({"_header_":{"warnings":)")) << res.body();
+  EXPECT_NE(std::string::npos, lines[0].find("phrase_slop_inapplicable")) << res.body();
+  EXPECT_EQ(R"({"id":"w1"})", lines[1]);
+}
+
+// Zero matches: pure mode returns an empty 200 body; with get_number the body
+// is the single header line.
+TEST_F(HttpApiTest, docsFormatZeroResults) {
+  SoluxTest::clearCollection("http_docs_zero");
+  CollectionHelper ch("http_docs_zero");
+  ch.index(flatdoc("id", std::string("z1")), UpdateMessage::COMMIT);
+
+  auto pure = httpRequest(port(), http::verb::post, "/collections/http_docs_zero/_query?format=docs",
+      R"({"query":{"match":{"id":"nomatch"}},"fields":["id"]})");
+  ASSERT_EQ(200, pure.result_int()) << pure.body();
+  EXPECT_TRUE(pure.body().empty()) << pure.body();
+
+  auto counted = httpRequest(port(), http::verb::post, "/collections/http_docs_zero/_query?format=docs",
+      R"({"query":{"match":{"id":"nomatch"}},"get_number":true,"fields":["id"]})");
+  ASSERT_EQ(200, counted.result_int()) << counted.body();
+  EXPECT_EQ(R"({"_header_":{"found":0}})" "\n", counted.body());
+}
+
+// Keep-alive: two docs-format responses on one connection.
+TEST_F(HttpApiTest, docsFormatKeepAliveReuse) {
+  SoluxTest::clearCollection("http_docs_ka");
+  CollectionHelper ch("http_docs_ka");
+  ch.index(flatdoc("id", std::string("k1")), UpdateMessage::COMMIT);
+
+  net::io_context cioc;
+  beast::tcp_stream stream(cioc);
+  tcp::resolver resolver(cioc);
+  stream.connect(resolver.resolve("127.0.0.1", std::to_string(port())));
+
+  for (int round = 0; round < 2; round++) {
+    http::request<http::string_body> req(http::verb::post,
+                                         "/collections/http_docs_ka/_query?format=docs", 11);
+    req.set(http::field::host, "127.0.0.1");
+    req.set(http::field::content_type, "application/json");
+    req.keep_alive(true);
+    req.body() = R"({"query":{"all":true},"fields":["id"]})";
+    req.prepare_payload();
+    http::write(stream, req);
+
+    beast::flat_buffer buffer;
+    http::response<http::string_body> res;
+    http::read(stream, buffer, res);
+    ASSERT_EQ(200, res.result_int()) << "round " << round << ": " << res.body();
+    EXPECT_EQ(R"({"id":"k1"})" "\n", res.body()) << "round " << round;
+  }
+  beast::error_code ec;
+  stream.socket().shutdown(tcp::socket::shutdown_both, ec);
+}
+
+// The flagship property: format=docs output (header included) pipes straight
+// back into streaming /update - the _header_ record is a recognized no-op.
+TEST_F(HttpApiTest, docsFormatRoundTripsIntoIngest) {
+  SoluxTest::clearCollection("http_rt_src");
+  SoluxTest::clearCollection("http_rt_dst");
+  CollectionHelper src("http_rt_src");
+  for (int i = 0; i < 7; i++) {
+    auto commit = i == 6 ? UpdateMessage::COMMIT : UpdateMessage::NO_COMMIT;
+    src.index(flatdoc("id", "rt" + std::to_string(i), "num_i", (int64_t)i), commit);
+  }
+
+  auto exported = httpRequest(port(), http::verb::post, "/collections/http_rt_src/_query?format=docs",
+      R"({"query":{"all":true},"limit":-1,"get_number":true,"fields":["id","num_i"]})");
+  ASSERT_EQ(200, exported.result_int()) << exported.body();
+  ASSERT_EQ(8u, splitLines(exported.body()).size());  // header + 7 docs
+
+  auto import = httpRequest(port(), http::verb::post, "/collections/http_rt_dst/_update?commit=true",
+                            std::string(exported.body()), "application/x-ndjson");
+  ASSERT_EQ(200, import.result_int()) << import.body();
+
+  // Verify by re-exporting the destination: identical doc lines, same count.
+  auto reexported = httpRequest(port(), http::verb::post, "/collections/http_rt_dst/_query?format=docs",
+      R"({"query":{"all":true},"limit":-1,"get_number":true,"fields":["id","num_i"]})");
+  ASSERT_EQ(200, reexported.result_int()) << reexported.body();
+  auto a = splitLines(exported.body());
+  auto b = splitLines(reexported.body());
+  EXPECT_EQ(std::set<std::string>(a.begin(), a.end()), std::set<std::string>(b.begin(), b.end()));
 }
 
 // Flow control: a client that stops reading must not cause unbounded

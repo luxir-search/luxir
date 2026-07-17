@@ -728,7 +728,7 @@ TEST_F(BooleanFuzzTest, explicitFlatteningTransformsMatchOracleAndTwin) {
       ADD_FAILURE() << "missing doc list for " << name;
       return result;
     }
-    if (list->matches.value_or(0) == 0) return result;
+    if (list->found.value_or(0) == 0) return result;
     const auto* ids = list->columns.find("id");
     const auto* scores = list->columns.find("_score_");
     if (ids == nullptr || scores == nullptr) {

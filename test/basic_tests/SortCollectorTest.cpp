@@ -404,7 +404,7 @@ TEST_F(SortCollectorTest, SortByStringField) {
   ASSERT_OK(req);
 
   const auto* docs = req->docList("q");
-  ASSERT_EQ(5, docs->matches.value_or(0));
+  ASSERT_EQ(5, docs->found.value_or(0));
 
   // Verify sort order: alice (doc2), alice (doc5), bob, charlie, david
   auto& idCol = std::get<solux::api::ColStr>(docs->columns.at("id_s").kind);
@@ -438,7 +438,7 @@ TEST_F(SortCollectorTest, SortByStringField) {
   ASSERT_OK(req3);
 
   const auto* docs3 = req3->docList("q");
-  ASSERT_EQ(5, docs3->matches.value_or(0));
+  ASSERT_EQ(5, docs3->found.value_or(0));
 
   // Verify descending sort order: david, charlie, bob, alice (doc2), alice (doc5)
   auto& idCol3 = std::get<solux::api::ColStr>(docs3->columns.at("id_s").kind);
@@ -477,7 +477,7 @@ TEST_F(SortCollectorTest, SortByPriceAscending) {
   ASSERT_OK(req);
 
   const auto* docs = req->docList("q");
-  ASSERT_EQ(5, docs->matches.value_or(0));
+  ASSERT_EQ(5, docs->found.value_or(0));
 
   // Check if we have columns
   ASSERT_GT((int)docs->columns.size(), 0) << "No columns returned";
@@ -512,7 +512,7 @@ TEST_F(SortCollectorTest, SortByPriceAscending) {
   ASSERT_OK(req2);
 
   const auto* docs2 = req2->docList("q");
-  ASSERT_EQ(5, docs2->matches.value_or(0));
+  ASSERT_EQ(5, docs2->found.value_or(0));
 
   // Verify same sort order as integer sort
   auto& idCol2 = std::get<solux::api::ColStr>(docs2->columns.at("id_s").kind);
@@ -556,7 +556,7 @@ TEST_F(SortCollectorTest, SortByMultipleFields) {
   ASSERT_OK(req);
 
   const auto* docs = req->docList("q");
-  ASSERT_EQ(5, docs->matches.value_or(0));
+  ASSERT_EQ(5, docs->found.value_or(0));
 
   // Expected order:
   // rating 5: doc4(75), doc1(100)
@@ -667,7 +667,7 @@ TEST_F(SortCollectorTest, SortWithBatchedResponses) {
 
   // Verify we got all 10 documents
   ASSERT_EQ(totalDocs, 10);
-  ASSERT_EQ(req->responses.back()->proto.ops.at("q")->docList()->matches.value_or(0), 10);
+  ASSERT_EQ(req->responses.back()->proto.ops.at("q")->docList()->found.value_or(0), 10);
 
   // Verify complete sort order: 10, 20, 30, ..., 100
   ASSERT_EQ(allPrices.size(), 10);
@@ -696,7 +696,7 @@ TEST_F(SortCollectorTest, SortWithMissingValues) {
   ASSERT_OK(req);
 
   const auto* docs = req->docList("q");
-  ASSERT_EQ(5, docs->matches.value_or(0));
+  ASSERT_EQ(5, docs->found.value_or(0));
 
   // Check order: documents with values first (50, 75, 100), then missing values
   auto& idCol = std::get<solux::api::ColStr>(docs->columns.at("id_s").kind);
@@ -742,7 +742,7 @@ TEST_F(SortCollectorTest, EmptyResults) {
   const auto* docs = req->docList("q");
 
   // Should have 0 matches but still have a valid response
-  ASSERT_EQ(0, docs->matches.value_or(0));
+  ASSERT_EQ(0, docs->found.value_or(0));
   ASSERT_EQ(0, (int)docs->columns.size()) << "Should have no columns for empty results";
 }
 
@@ -763,7 +763,7 @@ TEST_F(SortCollectorTest, SingleDocument) {
 
   const auto* docs = req->docList("q");
 
-  ASSERT_EQ(1, docs->matches.value_or(0));
+  ASSERT_EQ(1, docs->found.value_or(0));
   ASSERT_EQ("doc1", std::get<solux::api::ColStr>(docs->columns.at("id_s").kind).v[0]);
   ASSERT_EQ(100, std::get<solux::api::ColInt>(docs->columns.at("price_i").kind).v[0]);
 }
@@ -789,7 +789,7 @@ TEST_F(SortCollectorTest, ResultsExceedingTopCount) {
   const auto* docs = req->docList("q");
 
   // Should report total of 20 matches but only return 5
-  ASSERT_EQ(20, docs->matches.value_or(0));
+  ASSERT_EQ(20, docs->found.value_or(0));
 
   auto& priceCol = std::get<solux::api::ColInt>(docs->columns.at("price_i").kind);
   ASSERT_EQ(5, (int)priceCol.v.size()) << "Should only return top 5 documents";
@@ -820,7 +820,7 @@ TEST_F(SortCollectorTest, LimitOne) {
   const auto* docs = req->docList("q");
 
   // Should report 3 matches but only return 1
-  ASSERT_EQ(3, docs->matches.value_or(0));
+  ASSERT_EQ(3, docs->found.value_or(0));
 
   auto& idCol = std::get<solux::api::ColStr>(docs->columns.at("id_s").kind);
   auto& priceCol = std::get<solux::api::ColInt>(docs->columns.at("price_i").kind);
@@ -870,10 +870,10 @@ TEST_F(SortCollectorTest, DeterministicParallelSort) {
     ASSERT_OK(req);
 
     const auto* docs = req->docList("q");
-    ASSERT_EQ(300, docs->matches.value_or(0));
+    ASSERT_EQ(300, docs->found.value_or(0));
 
     // Calculate fingerprint of results
-    int64_t fp = docs->matches.value_or(0);
+    int64_t fp = docs->found.value_or(0);
     const auto& idCol = std::get<solux::api::ColStr>(docs->columns.at("id_s").kind);
 
     for (int i = 0; i < (int)idCol.v.size(); i++) {
@@ -915,7 +915,7 @@ TEST_F(SortCollectorTest, SortByNonIndexedStringColumn) {
     ASSERT_OK(req);
 
     const auto* docs = req->docList("q");
-    ASSERT_EQ(5, docs->matches.value_or(0));
+    ASSERT_EQ(5, docs->found.value_or(0));
 
     auto& nameCol = std::get<solux::api::ColStr>(docs->columns.at("name_s").kind);
 
@@ -938,7 +938,7 @@ TEST_F(SortCollectorTest, SortByNonIndexedStringColumn) {
     ASSERT_OK(req);
 
     const auto* docs = req->docList("q");
-    ASSERT_EQ(5, docs->matches.value_or(0));
+    ASSERT_EQ(5, docs->found.value_or(0));
 
     auto& idCol = std::get<solux::api::ColStr>(docs->columns.at("id_s").kind);
     auto& descCol = std::get<solux::api::ColStr>(docs->columns.at("description_sc").kind);
@@ -971,7 +971,7 @@ TEST_F(SortCollectorTest, SortByNonIndexedStringColumn) {
     ASSERT_OK(req);
 
     const auto* docs = req->docList("q");
-    ASSERT_EQ(5, docs->matches.value_or(0));
+    ASSERT_EQ(5, docs->found.value_or(0));
 
     auto& idCol = std::get<solux::api::ColStr>(docs->columns.at("id_s").kind);
     auto& descCol = std::get<solux::api::ColStr>(docs->columns.at("description_sc").kind);
@@ -1079,7 +1079,7 @@ TEST_F(SortCollectorTest, RandomValuesWithTieBreaking) {
 
       const auto* docs = req->docList("q");
 
-      ASSERT_EQ(docs->matches.value_or(0), docId) << "Should match all documents";
+      ASSERT_EQ(docs->found.value_or(0), docId) << "Should match all documents";
 
       // Debug: print how many segments we have
       auto reader = helper.getIndexWriter()->getIndexReader();

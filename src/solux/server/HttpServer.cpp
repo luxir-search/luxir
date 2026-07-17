@@ -2,6 +2,7 @@
 
 #include <cassert>
 #include <array>
+#include <algorithm>
 #include <cstddef>
 #include <deque>
 #include <functional>
@@ -71,6 +72,17 @@ struct HttpSearchRequestState {
   HttpSearchReqProto proto;  // non-owning; backed by `resource`
 };
 
+// Response shape for /_query.  Selected by the request-level proto field
+// SearchRequest.response_format, or the ?format= URL param as an alias (for
+// URL-capable clients; the param cannot express an explicit envelope, so
+// either source selecting DOCS wins).  The engine produces identical DocList
+// batches either way - only the NDJSON line framing differs - and gRPC
+// (framed messages) rejects DOCS outright.
+enum class HttpQueryFormat {
+  ENVELOPE,  // default: one NDJSON envelope line per batch ({"docs":[...],...})
+  DOCS,      // bare document lines, optional _header_ meta records
+};
+
 struct HttpUpdateState {
   std::pmr::monotonic_buffer_resource resource;
   HttpUpdateReqProto proto;  // non-owning; backed by `resource`
@@ -90,6 +102,7 @@ struct HttpStreamControlRequest {
 enum class HttpStreamControlKind {
   Open,
   Close,
+  Noop,  // recognized meta record with no ingest effect (e.g. _header_)
 };
 
 struct HttpStreamControl {
@@ -210,6 +223,20 @@ public:
   std::unique_ptr<HttpSearchRequestState> requestState;
   std::shared_ptr<HttpSession> session;
   std::shared_ptr<IoPin> ioPin;
+  HttpQueryFormat format = HttpQueryFormat::ENVELOPE;
+  // DOCS-format framing state.  Document bodies render unlocked (pure per
+  // batch); for multi-op requests - one emitter per op, concurrent replies -
+  // replyDocs serializes just the framing decisions and queue posts under a
+  // short req.mutex section so runs hit the wire whole.  Single-op requests
+  // touch this from one producer at a time (sequenced by the completion
+  // protocol) and take no lock.  reply() is never called with req.mutex held
+  // (getTarget takes and releases it during batch assembly; maybeSendFinal
+  // sends outside its critical section), so the lock cannot recurse.
+  DocLinesState docsState;
+  // True once output has been handed to the session (enqueued, not necessarily
+  // flushed) - the boundary past which an error must abort the chunked stream
+  // rather than answer with a plain HTTP error response.
+  bool docsOutputCommitted = false;
 
   HttpSearchRequest(SearchEngine& engine, std::unique_ptr<HttpSearchRequestState> requestState,
                     std::shared_ptr<HttpSession> s, google::protobuf::Arena& arena)
@@ -219,8 +246,9 @@ public:
     docFormatDefault = solux::api::DocFormat::ROWS;
   }
 
-  // Both defined after HttpSession.
+  // All defined after HttpSession.
   ReplyStatus reply(SearchResponse& response) override;
+  ReplyStatus replyDocs(SearchResponse& response);
   void resumeWhenDrained(std::function<void()> resume) override;
   // done() is inherited: releaseArena(&arena) frees this request (and its
   // IoPin).  reply() calls it eagerly once the final line is enqueued - the line
@@ -314,6 +342,30 @@ public:
   bool aborted() const { return aborted_.load(std::memory_order_relaxed); }
 
   int64_t highWater() const { return highWater_; }
+
+  // Callable from any thread.  Aborts a mid-stream chunked response WITHOUT
+  // the terminating 0-chunk: the client sees truncation (premature EOF)
+  // instead of a complete-looking result.  This is the docs format's
+  // mid-stream error signal - it has no envelope to carry an error in-band.
+  void abortStream() {
+    net::post(stream_.get_executor(), [self = shared_from_this()] {
+      if (!self->errored_) {
+        self->failWrites(net::error::make_error_code(net::error::operation_aborted));
+      }
+    });
+  }
+
+  // Callable from any thread.  One-shot error response for a request that has
+  // not streamed anything yet (docs format, failure before the first flush).
+  // Dropped if the connection has failed or a streaming response already
+  // started (the abortStream contract covers that case).
+  void respondErrorFromEngine(http::status status, std::string body) {
+    net::post(stream_.get_executor(),
+        [self = shared_from_this(), status, body = std::move(body)]() mutable {
+          if (self->errored_ || self->headerSent_) return;
+          self->respondSimple(status, "application/json", std::move(body));
+        });
+  }
 
   // Every off-io-thread holder of this session's executor must pin the context
   // through this helper, never via a raw executor_work_guard: IoPin's member
@@ -576,15 +628,30 @@ private:
     if (req.method() == http::verb::get && target == "/health") {
       respondSimple(http::status::ok, "application/json", R"({"status":"ok"})");
     } else if (req.method() == http::verb::post && parseQueryPath(target, coll)) {
+      auto format = HttpQueryFormat::ENVELOPE;
+      if (const std::string* f = findParam(params, "format")) {
+        if (*f == "docs") {
+          format = HttpQueryFormat::DOCS;
+        } else {
+          respondSimple(http::status::bad_request, "application/json",
+                        renderErrorBody("unknown format '" + *f + "' (valid: docs)"));
+          return;
+        }
+      }
       if (const std::string* explain = findParam(params, "explain")) {
         if (*explain != "request") {
           respondSimple(http::status::bad_request, "application/json",
                         renderErrorBody("unknown explain mode '" + *explain + "' (valid: request)"));
           return;
         }
+        if (format != HttpQueryFormat::ENVELOPE) {
+          respondSimple(http::status::bad_request, "application/json",
+                        renderErrorBody("format=docs cannot be combined with explain"));
+          return;
+        }
         handleExplain(req.body(), coll);
       } else {
-        handleQuery(req.body(), coll);
+        handleQuery(req.body(), coll, format);
       }
     } else if (req.method() == http::verb::post && parseUpdatePath(target, coll)) {
       handleUpdate(req.body(), coll);
@@ -647,6 +714,13 @@ private:
     std::string out;
     try {
       parseEffectiveRequest(body, coll, state);
+      // Mirrors the URL-param check in route(): the docs format can also be
+      // selected in the body, and it composes with explain no better.
+      if (state.proto.response_format == solux::api::ResponseFormat::DOCS) {
+        respondSimple(http::status::bad_request, "application/json",
+                      renderErrorBody("format=docs cannot be combined with explain"));
+        return;
+      }
       if (!solux::api::write_json(state.proto, out)) {
         throw std::runtime_error("failed to serialize request");
       }
@@ -658,7 +732,47 @@ private:
     respondSimple(http::status::ok, "application/json", out);
   }
 
-  void handleQuery(const std::string& body, const std::string& coll) {
+  // The docs format is pure document lines: every op must produce a DocList,
+  // with nothing that would need an envelope to carry.  Multi-op requests are
+  // fine - their runs are attributed by op-named _header_ markers.  Returns
+  // an error message, or nullptr when the request qualifies.
+  static const char* validateDocsFormat(const HttpSearchReqProto& proto) {
+    if (proto.ops.size() == 0) {
+      return "format=docs requires at least one op";
+    }
+    std::vector<std::string_view> seen;
+    for (const auto& [name, opView] : proto.ops) {
+      // The raw ops view preserves duplicate names (last wins at execution);
+      // docs framing attributes runs BY name, so duplicates would make the
+      // marker/multi-op decisions diverge from what actually executes.
+      if (std::find(seen.begin(), seen.end(), name) != seen.end()) {
+        return "format=docs does not support duplicate op names";
+      }
+      seen.push_back(name);
+      const solux::api::SearchOp& op = *opView;
+      if (const auto* td = std::get_if<solux::api::TopDocs>(&op.kind)) {
+        if (!td->ops.empty()) return "format=docs does not support nested ops";
+        if (td->document_format == solux::api::DocFormat::COLUMNS) {
+          return "format=docs emits row documents; document_format COLUMNS conflicts";
+        }
+      } else if (const auto* f = std::get_if<solux::api::Fusion>(&op.kind)) {
+        if (!f->ops.empty()) return "format=docs does not support nested ops";
+        // Per-source ops are ignored by fusion execution, but silently discarding
+        // authored work behind a format flag would be worse than rejecting it.
+        for (const auto& [srcName, src] : f->sources) {
+          if (!src.ops.empty()) return "format=docs does not support nested ops";
+        }
+        if (f->document_format == solux::api::DocFormat::COLUMNS) {
+          return "format=docs emits row documents; document_format COLUMNS conflicts";
+        }
+      } else {
+        return "format=docs requires top_docs or fusion ops";
+      }
+    }
+    return nullptr;
+  }
+
+  void handleQuery(const std::string& body, const std::string& coll, HttpQueryFormat format) {
     auto* arena = createArena();
     auto requestState = std::make_unique<HttpSearchRequestState>();
     try {
@@ -669,10 +783,27 @@ private:
                     renderErrorBody(e.what()));
       return;
     }
+    // The URL param is an alias for the request-level proto field (for clients
+    // that cannot set query params).  The param cannot express an explicit
+    // envelope, so either source selecting DOCS wins - no conflict exists.
+    if (requestState->proto.response_format == solux::api::ResponseFormat::DOCS) {
+      format = HttpQueryFormat::DOCS;
+    }
+    bool docsMultiOp = false;
+    if (format == HttpQueryFormat::DOCS) {
+      if (const char* err = validateDocsFormat(requestState->proto)) {
+        releaseArena(arena);
+        respondSimple(http::status::bad_request, "application/json", renderErrorBody(err));
+        return;
+      }
+      docsMultiOp = requestState->proto.ops.size() > 1;
+    }
 
     auto& engine = node_.getSearchEngine();
     auto* sreq = solux::arenaCreate<HttpSearchRequest>(
         *arena, engine, std::move(requestState), shared_from_this(), *arena);
+    sreq->format = format;
+    sreq->docsState.multiOp = docsMultiOp;
     // Pin the io_context: shutdown drains until this query finishes, and the
     // context survives the request's teardown on the task-arena thread.
     sreq->ioPin = makeIoPin();
@@ -928,7 +1059,14 @@ private:
     return true;
   }
 
-  // A control record is `{}` or a JSON object whose sole field is "_update_" or "_end_".
+  // A control record is `{}` or a JSON object whose sole field is "_update_" or
+  // "_end_".  Sole-underscore-field records with OBJECT payloads are reserved
+  // as the meta/control namespace: "_header_" (emitted by format=docs query
+  // responses, so exported output pipes straight back into /update) is a
+  // recognized no-op, and any other object-valued _name_ is an error rather
+  // than silently indexed as a document (a control-record typo must not become
+  // data).  Scalar-valued sole-underscore fields stay documents - {"_version_":42}
+  // is a legitimate one-field export, and every real control carries an object.
   // The control payload is decoded as a full UpdateRequest through the canonical JSON
   // codec so the streaming path accepts the same fields as buffered /update.
   static bool extractStreamControl(const solux::api::Map& map, HttpStreamControl& control,
@@ -943,7 +1081,23 @@ private:
     }
     if (map.fields.size() != 1) return true;
     const auto& entry = *map.fields.begin();
-    if (entry.first != "_update_" && entry.first != "_end_") return true;
+    if (entry.first == "_header_") {
+      isControl = true;
+      control.kind = HttpStreamControlKind::Noop;
+      if (std::get_if<solux::api::Map>(&(*entry.second).kind) == nullptr) {
+        err = "_header_ control value must be an object";
+        return false;
+      }
+      return true;
+    }
+    if (entry.first != "_update_" && entry.first != "_end_") {
+      if (entry.first.size() >= 2 && entry.first.front() == '_' && entry.first.back() == '_' &&
+          std::get_if<solux::api::Map>(&(*entry.second).kind) != nullptr) {
+        err = "unknown control record '" + std::string(entry.first) + "'";
+        return false;
+      }
+      return true;
+    }
 
     isControl = true;
     control.kind = entry.first == "_update_" ? HttpStreamControlKind::Open
@@ -1413,10 +1567,29 @@ private:
       return false;
     }
 
-    if (isControl) return applyStreamControl(std::move(control));
+    if (isControl && control.kind != HttpStreamControlKind::Noop) {
+      return applyStreamControl(std::move(control));
+    }
 
-    startImplicitStreamGroup();
-    state->batch->docs.push_back(map);
+    if (isControl) {
+      // Noop meta record (e.g. _header_).  It was decoded into the batch
+      // arena, so it must count toward rotation or a stream of meta records
+      // would grow the arena without bound.  With no docs buffered an empty
+      // batch carries no state (proto/collection are populated at submission),
+      // so past the target it is simply replaced - the same rotation
+      // submitStreamBatch performs, minus the submit.  With docs pending, fall
+      // through to the shared accounting and let the normal thresholds rotate.
+      if (state->batch->docs.size() == 0) {
+        state->batch->sourceBytes += record.size();
+        if (state->batch->sourceBytes >= state->batchTargetBytes) {
+          state->batch = std::make_unique<HttpStreamBatchState>(state->batchMaxDocs);
+        }
+        return true;
+      }
+    } else {
+      startImplicitStreamGroup();
+      state->batch->docs.push_back(map);
+    }
     state->batch->sourceBytes += record.size();
     if (state->group.allOrNone()) {
       if (state->batch->sourceBytes > state->maxRequestBody) {
@@ -1788,6 +1961,7 @@ void HttpSession::run() {
 }
 
 SearchRequest::ReplyStatus HttpSearchRequest::reply(SearchResponse& response) {
+  if (format == HttpQueryFormat::DOCS) return replyDocs(response);
   // The line is rendered into an owned string, so once it is enqueued the proto
   // (and its arena) are dead weight - free them eagerly here instead of deferring
   // to a post-write callback.  Cleanup is unconditional after the try, so a
@@ -1801,6 +1975,74 @@ SearchRequest::ReplyStatus HttpSearchRequest::reply(SearchResponse& response) {
     } else {
       int64_t queued = session->enqueueLine(renderSearchResponseLine(response.proto), last);
       if (queued > session->highWater()) status = ReplyStatus::PAUSE;
+    }
+  } catch (...) {
+    // fall through to cleanup
+  }
+  if (last) {
+    done();  // releases the request arena (this), its work guard, and session ref
+  } else if (&response.arena != &arena) {
+    releaseArena(&response.arena);  // this batch's own arena
+  }
+  return status;
+}
+
+// format=docs: every line is a document; an optional _header_ meta record
+// (found and/or warnings) leads the first reply.  Errors have no in-band form
+// here: before any output is committed to the session the request gets a
+// plain HTTP error response; after that the chunked stream is aborted without
+// its terminator so the client sees truncation rather than a
+// complete-looking result.
+SearchRequest::ReplyStatus HttpSearchRequest::replyDocs(SearchResponse& response) {
+  bool last = response.last;
+  auto status = ReplyStatus::OK;
+  try {
+    if (session->aborted()) {
+      status = ReplyStatus::CANCEL;
+    } else if (!response.proto.error.empty()) {
+      if (docsOutputCommitted) {
+        session->abortStream();
+      } else {
+        // TODO: distinguish request errors from server errors (submitBody has
+        // the same gap); everything surfaces as 400 for now.
+        session->respondErrorFromEngine(http::status::bad_request,
+                                        renderErrorBody(response.proto.error));
+      }
+    } else {
+      // Document bodies are a pure function of the batch: render them OUTSIDE
+      // any lock (this is the expensive part).  Only run framing depends on
+      // cross-emitter interleaving.
+      auto runs = renderDocRuns(response.proto);
+
+      // Multi-op requests have one emitter per op replying concurrently: the
+      // framing decisions and the queue posts must agree on order, so both
+      // happen under a SHORT critical section (marker render + posts; the
+      // strand does the actual writes).  Single-op requests have a single
+      // producer whose replies are already sequenced by the completion
+      // protocol - no lock, and the normal path is unchanged.
+      std::optional<std::lock_guard<std::mutex>> lock;
+      if (docsState.multiOp) lock.emplace(mutex);
+
+      std::vector<std::string> outLines;
+      for (auto& run : runs) {
+        std::string marker;
+        if (!frameDocRun(run, docsState, warnings, marker)) continue;
+        if (!marker.empty()) outLines.push_back(std::move(marker));
+        if (!run.body.empty()) outLines.push_back(std::move(run.body));
+      }
+      if (outLines.empty()) {
+        if (last) session->enqueueLine("", true);  // close the stream
+      } else {
+        int64_t queued = 0;
+        for (size_t i = 0; i < outLines.size(); i++) {
+          queued = session->enqueueLine(std::move(outLines[i]), last && i + 1 == outLines.size());
+        }
+        // Only after enqueueLine accepts the bytes: a throwing dispatch rolls
+        // the queue back, and the error path must then still be free to answer
+        // with a plain HTTP error rather than abort a stream that never began.
+        docsOutputCommitted = true;
+        if (queued > session->highWater()) status = ReplyStatus::PAUSE;
+      }
     }
   } catch (...) {
     // fall through to cleanup

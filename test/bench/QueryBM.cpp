@@ -257,7 +257,7 @@ static void BM_Query(benchmark::State& state, int64_t nDocs, std::string_view sh
     // convert the ids back to integers and add them up.
     const auto& idCol = std::get<solux::api::ColStr>(docs->columns.at("id").kind);
     // start with the number of matches
-    ret += docs->matches.value_or(0);
+    ret += docs->found.value_or(0);
     for (int i = 0; i < (int)idCol.v.size(); i++) {
       int64_t id = 0;
       std::from_chars(idCol.v[i].data(), idCol.v[i].data() + idCol.v[i].size(), id);
@@ -326,7 +326,7 @@ static void BM_QueryConj(benchmark::State& state, int64_t nDocs, std::string_vie
     req->execute(para);
 
     const auto* docs = req->responses[0]->proto.ops.at("q")->docList();
-    int64_t ret = docs->matches.value_or(0);
+    int64_t ret = docs->found.value_or(0);
     benchmark::DoNotOptimize(ret);
 
     if (fp != -1) {

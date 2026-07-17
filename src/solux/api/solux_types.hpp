@@ -123,6 +123,7 @@ enum class Unit { UNKNOWN = 0, DAY = 1, WEEK = 2, MONTH = 3, QUARTER = 4, YEAR =
 namespace UpdateResponse_ { enum class Status { UNKNOWN = 0, OK = 1, PARTIAL = 2, ERROR = 3 }; }
 enum class VectorMetric { NONE = 0, L2 = 1, IP = 2, COSINE = 3 };
 enum class DocFormat { DEFAULT = 0, ROWS = 1, COLUMNS = 2 };
+enum class ResponseFormat { ENVELOPE = 0, DOCS = 1 };
 namespace FieldDef_ {
 enum class FieldClass { STRING = 0, TEXT = 1, INT = 2, FLOAT = 3, DOUBLE = 4, BIN = 5, ID = 6, VECTOR = 7, DATE = 8, GEO_POINT = 9 };
 enum class IndexMode { NONE = 0, MATCH = 1, RANGE = 2 };
@@ -338,6 +339,7 @@ struct SearchRequest {                                          // needs Target
   map_view<std::string_view, ::hpp_proto::indirect_view<SearchOp>> ops;
   uint64_t freshness_us = 0;
   std::string_view time_zone;
+  ResponseFormat response_format = ResponseFormat::ENVELOPE;
 };
 struct Map { map_view<std::string_view, ::hpp_proto::indirect_view<Val>> fields; };
 struct Bucket {
@@ -345,7 +347,7 @@ struct Bucket {
   map_view<std::string_view, ::hpp_proto::indirect_view<Val>> ops;
 };
 struct DocList {                                                // needs Column (map by value)
-  std::optional<std::int64_t> matches;
+  std::optional<std::int64_t> found;
   map_view<std::string_view, Column> columns;
   // Per-document field maps: docs[i] holds document i's fields not in
   // columns (row_count entries when present).  See the .proto contract.

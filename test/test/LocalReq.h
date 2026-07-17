@@ -143,6 +143,10 @@ public:
     appendStr(view.collection->name, name);
     return *this;
   }
+  LocalReq& responseFormat(solux::api::ResponseFormat f) {
+    view.response_format = f;
+    return *this;
+  }
   LocalReq& requestId(std::string_view id) {
     view.request_id = build::arenaStr(mr, id);
     return *this;
@@ -203,7 +207,7 @@ public:
   }
   int64_t getMatchCount(std::string_view opName = "q") const {
     const auto* dl = docList(opName);
-    return (dl && dl->matches) ? *dl->matches : 0;
+    return (dl && dl->found) ? *dl->found : 0;
   }
 
   // Compact textual dump for test-failure diagnostics.
@@ -220,7 +224,7 @@ public:
       for (const auto& [name, valPtr] : resp.ops) {
         ret += "    " + std::string(name) + " -> ";
         if (const auto* dl = valPtr->docList()) {
-          ret += "DocList(matches=" + (dl->matches ? std::to_string(*dl->matches) : std::string("unset"))
+          ret += "DocList(found=" + (dl->found ? std::to_string(*dl->found) : std::string("unset"))
                + ", offset=" + std::to_string(dl->offset) + ", cols=[";
           bool fc = true;
           for (const auto& [cn, col] : dl->columns) { ret += (fc ? "" : ","); ret += std::string(cn); fc = false; }
