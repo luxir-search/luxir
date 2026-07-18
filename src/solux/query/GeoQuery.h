@@ -20,7 +20,7 @@
 namespace solux {
 
 template <class Relation, class ColIter>
-class GeoQueryScorer final : public Query::Scorer {
+class GeoQueryScorer final : public Query::ConstantScorer {
   IntColReader& reader;
   ColIter iter;
   Relation relation;
@@ -43,9 +43,10 @@ class GeoQueryScorer final : public Query::Scorer {
   }
 
 public:
-  GeoQueryScorer(IntColReader& reader, const Relation& relation)
-      : reader(reader), iter(reader), relation(relation),
-        multi(reader.multiValued()) {}
+  GeoQueryScorer(IntColReader& reader, const Relation& relation,
+                 float constantScore)
+      : Query::ConstantScorer(constantScore), reader(reader), iter(reader),
+        relation(relation), multi(reader.multiValued()) {}
 
   bool hasTwoPhase() const override { return true; }
   int32_t approximationNext() override {
@@ -79,27 +80,13 @@ public:
     return docid;
   }
   int32_t docId() override { return docid; }
-  float score() override { return 0.0f; }
-
-  // Every match scores 0: a flat, exact bound with no shallow structure.
-  float getMaxScore(int32_t upTo) override {
-    unused(upTo);
-    return 0.0f;
-  }
-  float getMaxScoreForSetup(int32_t upTo) override {
-    unused(upTo);
-    return 0.0f;
-  }
-  int32_t advanceShallowForSetup(int32_t target) override {
-    unused(target);
-    return PostingsReader::END;
-  }
 };
 
 template <class QueryType, class Relation>
 class GeoQueryWeight final : public Query::Weight {
   QueryType& query;
   std::span<SegFieldInfo*> segInfos;
+  float constantScore;
 
   bool segmentInfo(IndexReader::Segment& segment, SegFieldInfo*& info) const {
     if (segInfos.empty()) return false;
@@ -118,8 +105,10 @@ class GeoQueryWeight final : public Query::Weight {
   }
 
 public:
-  GeoQueryWeight(Query::Context& context, QueryType& query, int32_t flags)
-      : Query::Weight(context, flags), query(query) {
+  GeoQueryWeight(Query::Context& context, QueryType& query, int32_t flags,
+                 float constantScore)
+      : Query::Weight(context, flags), query(query),
+        constantScore(constantScore) {
     traits |= IS_CONSTANT_SCORING;
     segInfos = context.readSegInfos(query.getField());
   }
@@ -202,23 +191,25 @@ public:
         skipCount(SkipStats::geoSparseVerifyArms);
         return targetPool.make<
             GeoQueryScorer<Relation, IntColReader::SparseIterator>>(
-                reader, relation);
+                reader, relation, weight.constantScore);
       }
       if (bkd != nullptr) {
         skipCount(SkipStats::geoBKDArms);
         return PointsMaterialize::scorerFor(
-            targetPool, materialize(targetPool), segment.maxDoc());
+            targetPool, materialize(targetPool), segment.maxDoc(),
+            weight.constantScore);
       }
       skipCount(SkipStats::geoScanArms);
       return targetPool.make<GeoQueryScorer<Relation, IntColReader::Iterator>>(
-          reader, relation);
+          reader, relation, weight.constantScore);
     }
 
     BulkScorer* bulkScorer(MemPool& targetPool) override {
       if (bkd == nullptr) return nullptr;
       skipCount(SkipStats::geoBKDArms);
       return PointsMaterialize::bulkFor(
-          targetPool, materialize(targetPool), segment.maxDoc());
+          targetPool, materialize(targetPool), segment.maxDoc(),
+          weight.constantScore);
     }
   };
 
@@ -262,7 +253,7 @@ public:
     if (reader->numValues() == 0) return nullptr;
     Relation relation = query.makeRelation();
     return targetPool.make<GeoQueryScorer<Relation, IntColReader::Iterator>>(
-        *reader, relation);
+        *reader, relation, constantScore);
   }
 
   int64_t count(IndexReader::Segment& segment) override {

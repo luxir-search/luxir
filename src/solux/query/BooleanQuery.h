@@ -109,10 +109,14 @@ private:
   }
 
   static bool isComplementForm(const BooleanQuery& query) {
-    return query.mandatory.empty() && query.optional.size() == 1
-        && !query.prohibited.empty() && query.filter.empty()
-        && query.minShouldMatch <= 1
+    bool optionalCarrier = query.mandatory.empty()
+        && query.optional.size() == 1
         && dynamic_cast<AllQuery*>(query.optional[0]) != nullptr;
+    bool requiredCarrier = query.optional.empty()
+        && query.mandatory.size() == 1
+        && dynamic_cast<AllQuery*>(query.mandatory[0]) != nullptr;
+    return (optionalCarrier || requiredCarrier) && !query.prohibited.empty()
+        && query.filter.empty() && query.minShouldMatch <= 1;
   }
 
   static void normalizeRequiredList(NormalizedBoolean& plan, ClauseList& parents,
@@ -221,18 +225,21 @@ private:
       }
     }
 
-    // Pure negation is an engine-level complement. Seeding the positive side
-    // here covers raw API trees; expr/simple_query already emit the equivalent
-    // AllQuery carrier. Keep minShouldMatch unchanged so deliberately
-    // impossible direct-construction values remain impossible.
+    // Pure negation is an engine-level complement. Seed a required match-all;
+    // its AUTO_UNIFORM profile makes it required-but-non-scoring. This covers
+    // raw API trees; expr/simple_query already emit the equivalent carrier.
+    // Keep minShouldMatch unchanged so deliberately impossible direct-
+    // construction values remain impossible.
     if (plan.mandatory.empty() && plan.optional.empty() && plan.filter.empty()
         && !plan.prohibited.empty()) {
-      plan.optional.push_back(pool.make<AllQuery>());
+      plan.mandatory.push_back(pool.make<AllQuery>());
     }
 
     if (plan.prohibited.empty() && plan.filter.empty()) {
       if (plan.minShouldMatch == 0 && plan.mandatory.size() == 1
-          && plan.optional.empty()) {
+          && plan.optional.empty()
+          && plan.mandatory[0]->scoreProfile().kind
+              != ScoreProfile::Kind::AUTO_UNIFORM) {
         plan.singleChild = plan.mandatory[0];
       } else if (plan.minShouldMatch <= 1 && plan.mandatory.empty()
                  && plan.optional.size() == 1) {
@@ -374,6 +381,60 @@ public:
             minShouldMatch(minShouldMatch) {
   }
 
+  ScoreProfile scoreProfile() const override {
+    float sum = 0.0f;
+    bool explicitScore = false;
+
+    // AUTO_UNIFORM mandatory clauses are membership-only. Variable and
+    // explicit mandatory clauses contribute normally.
+    for (Query* clause : mandatory) {
+      ScoreProfile profile = clause->scoreProfile();
+      if (profile.kind == ScoreProfile::Kind::VARIABLE) {
+        return ScoreProfile::variable();
+      }
+      if (profile.kind == ScoreProfile::Kind::EXPLICIT_UNIFORM) {
+        sum += profile.value;
+        explicitScore = true;
+      }
+    }
+
+    if (optional.empty()) {
+      return explicitScore ? ScoreProfile::explicitUniform(sum)
+                           : ScoreProfile::automatic(sum);
+    }
+
+    int requiredOptionals = minShouldMatch;
+    if (mandatory.empty() && filter.empty()) {
+      requiredOptionals = std::max(1, requiredOptionals);
+    }
+    bool everyOptionalRequired = requiredOptionals >= (int)optional.size();
+    if (!everyOptionalRequired) {
+      // A non-zero optional contribution is data-dependent unless every
+      // optional must match. Zero-uniform optionals do not affect the sum.
+      for (Query* clause : optional) {
+        ScoreProfile profile = clause->scoreProfile();
+        if (profile.kind == ScoreProfile::Kind::VARIABLE
+            || profile.value != 0.0f) {
+          return ScoreProfile::variable();
+        }
+        explicitScore |= profile.kind == ScoreProfile::Kind::EXPLICIT_UNIFORM;
+      }
+      return explicitScore ? ScoreProfile::explicitUniform(sum)
+                           : ScoreProfile::automatic(sum);
+    }
+
+    for (Query* clause : optional) {
+      ScoreProfile profile = clause->scoreProfile();
+      if (profile.kind == ScoreProfile::Kind::VARIABLE) {
+        return ScoreProfile::variable();
+      }
+      sum += profile.value;
+      explicitScore |= profile.kind == ScoreProfile::Kind::EXPLICIT_UNIFORM;
+    }
+    return explicitScore ? ScoreProfile::explicitUniform(sum)
+                         : ScoreProfile::automatic(sum);
+  }
+
   NormalizeTestView normalizationForTest(MemPool& pool) const {
     NormalizedBoolean plan = normalize(pool);
     NormalizeTestView view;
@@ -404,6 +465,7 @@ public:
 
   class Weight final : public Query::Weight {
     std::span<Query::Weight*> mandatoryWeights;
+    std::span<uint8_t> mandatoryScores;
     std::span<Query::Weight*> optionalWeights;
     std::span<Query::Weight*> prohibitedWeights;
     std::span<Query::Weight*> filterWeights;
@@ -453,6 +515,23 @@ public:
       return {weights, queries.size()};
     }
 
+    void createMandatoryWeights(Context& context, std::span<Query*> queries,
+                                int32_t flags, float multiplier) {
+      if (queries.empty()) return;
+      mandatoryWeights = context.pool.make_span<Query::Weight*>(queries.size());
+      mandatoryScores = context.pool.make_span<uint8_t>(queries.size());
+      int32_t noScore = flags & ~NEED_SCORES;
+      bool parentNeedsScores = (flags & NEED_SCORES) != 0;
+      for (size_t i = 0; i < queries.size(); i++) {
+        bool contributes = parentNeedsScores
+            && queries[i]->scoreProfile().kind
+                != ScoreProfile::Kind::AUTO_UNIFORM;
+        mandatoryScores[i] = contributes ? 1 : 0;
+        mandatoryWeights[i] = queries[i]->createWeight(
+            context, contributes ? flags : noScore, multiplier);
+      }
+    }
+
     // Outcome of building the required (mandatory + filter) conjunction for a
     // segment. `scorer` is null when there are no required clauses at all;
     // `unsatisfiable` is true when a required clause cannot match this segment,
@@ -461,6 +540,7 @@ public:
       Query::Scorer* scorer;
       bool unsatisfiable;
       int64_t cost;
+      size_t scoringCount;
     };
 
     // Build the required-clause conjunction. Mandatory clauses score; filter
@@ -474,23 +554,29 @@ public:
         MemPool& targetPool,
         IndexReader::Segment& segment,
         std::span<Query::SegmentSource* const> mandatorySources,
+        std::span<const uint8_t> mandatoryScores,
         std::span<Query::ScorerSupplier* const> filterSuppliers) {
+      assert(mandatorySources.size() == mandatoryScores.size());
       struct Entry {
         int64_t cost;
         Query::ScorerSupplier* supplier;
         bool scoring;
       };
       boost::container::small_vector<Entry, 16> entries;
-      for (auto* source : mandatorySources) {
+      size_t scoringCapacity = 0;
+      for (size_t i = 0; i < mandatorySources.size(); i++) {
+        auto* source = mandatorySources[i];
         auto* supplier = source->scorerSupplier(targetPool, segment);
-        if (supplier == nullptr) return {nullptr, true, 0};
-        entries.push_back({supplier->cost(), supplier, true});
+        if (supplier == nullptr) return {nullptr, true, 0, 0};
+        bool scores = mandatoryScores[i] != 0;
+        scoringCapacity += scores ? 1 : 0;
+        entries.push_back({supplier->cost(), supplier, scores});
       }
       for (auto* supplier : filterSuppliers) {
-        if (supplier == nullptr) return {nullptr, true, 0};
+        if (supplier == nullptr) return {nullptr, true, 0, 0};
         entries.push_back({supplier->cost(), supplier, false});
       }
-      if (entries.empty()) return {nullptr, false, 0};
+      if (entries.empty()) return {nullptr, false, 0, 0};
 
       // leadCost is the cost of the sparsest required clause: it bounds how often
       // the others get driven, so each may plan eager vs lazy setup off it.
@@ -503,26 +589,26 @@ public:
 
       auto* all = targetPool.make_arr<Query::Scorer*>(entries.size());
       auto* costs = targetPool.make_arr<int64_t>(entries.size());
-      Query::Scorer** scoring = mandatorySources.empty()
+      Query::Scorer** scoring = scoringCapacity == 0
         ? nullptr
-        : targetPool.make_arr<Query::Scorer*>(mandatorySources.size());
+        : targetPool.make_arr<Query::Scorer*>(scoringCapacity);
       size_t allCount = 0;
       size_t scoringCount = 0;
       for (auto& e : entries) {
         auto* scorer = e.supplier->get(targetPool, leadCost);
-        if (scorer == nullptr) return {nullptr, true, 0};
+        if (scorer == nullptr) return {nullptr, true, 0, 0};
         all[allCount] = scorer;
         costs[allCount++] = e.cost;
         if (e.scoring) scoring[scoringCount++] = scorer;
       }
 
       // A lone scoring clause (one mandatory, no filters) needs no wrapper.
-      if (allCount == 1 && scoringCount == 1) return {all[0], false, leadCost};
+      if (allCount == 1 && scoringCount == 1) return {all[0], false, leadCost, 1};
       return {targetPool.make<BooleanQuery::ConjunctionScorer>(
                 targetPool, std::span<Query::Scorer*>(all, allCount),
                 std::span<int64_t>(costs, allCount),
                 std::span<Query::Scorer*>(scoring, scoringCount)),
-              false, leadCost};
+              false, leadCost, scoringCount};
     }
 
     // Keep clause wiring in one place so prepared and non-prepared execution
@@ -531,16 +617,19 @@ public:
         MemPool& targetPool,
         IndexReader::Segment& segment,
         std::span<Query::SegmentSource* const> mandatorySources,
+        std::span<const uint8_t> mandatoryScores,
         std::span<Query::SegmentSource* const> optionalSources,
         std::span<Query::SegmentSource* const> prohibitedSources,
         std::span<Query::ScorerSupplier* const> filterSuppliers,
         int minShouldMatch,
         bool needsScores,
         bool externallyDriven) {
-      Required req = assembleRequired(targetPool, segment, mandatorySources, filterSuppliers);
+      Required req = assembleRequired(
+          targetPool, segment, mandatorySources, mandatoryScores,
+          filterSuppliers);
       if (req.unsatisfiable) return nullptr;
       Query::Scorer* reqScorer = req.scorer;
-      bool hasMandatory = !mandatorySources.empty();
+      bool hasScoringMandatory = req.scoringCount > 0;
       // Whether the optional group CONSTRAINS matching (Lucene bool
       // semantics): min_match >= 1 makes it a real constraint; otherwise
       // optionals only rank, provided a required or filter clause already
@@ -627,10 +716,10 @@ public:
         allCosts[0] = req.cost;
         allCosts[1] = optionalCost(
             optionalCosts, minShouldMatch, segment.maxDoc());
-        size_t nscoring = hasMandatory ? 2 : 1;
+        size_t nscoring = hasScoringMandatory ? 2 : 1;
         std::span<Query::Scorer*> scoringSpan(targetPool.make_arr<Query::Scorer*>(nscoring), nscoring);
         scoringSpan[nscoring - 1] = optScorer;
-        if (hasMandatory) scoringSpan[0] = reqScorer;
+        if (hasScoringMandatory) scoringSpan[0] = reqScorer;
         boolScorer = targetPool.make<BooleanQuery::ConjunctionScorer>(
             targetPool, allSpan, allCosts, scoringSpan);
       }
@@ -716,6 +805,7 @@ public:
       MemPool& pool;
       IndexReader::Segment& segment;
       std::span<Query::SegmentSource* const> mandatorySources;
+      std::span<const uint8_t> mandatoryScores;
       std::span<Query::SegmentSource* const> optionalSources;
       std::span<Query::SegmentSource* const> prohibitedSources;
       std::span<Query::ScorerSupplier* const> filterSuppliers;
@@ -724,12 +814,14 @@ public:
     public:
       Supplier(MemPool& pool, IndexReader::Segment& segment,
                std::span<Query::SegmentSource* const> mandatorySources,
+               std::span<const uint8_t> mandatoryScores,
                std::span<Query::SegmentSource* const> optionalSources,
                std::span<Query::SegmentSource* const> prohibitedSources,
                std::span<Query::ScorerSupplier* const> filterSuppliers,
                int minShouldMatch,
                bool needsScores)
         : pool(pool), segment(segment), mandatorySources(mandatorySources),
+          mandatoryScores(mandatoryScores),
           optionalSources(optionalSources), prohibitedSources(prohibitedSources),
           filterSuppliers(filterSuppliers), minShouldMatch(minShouldMatch),
           needsScores(needsScores) {}
@@ -739,7 +831,8 @@ public:
       }
 
       Query::Scorer* get(MemPool& targetPool, int64_t leadCost) override {
-        return assembleScorer(targetPool, segment, mandatorySources, optionalSources,
+        return assembleScorer(targetPool, segment, mandatorySources,
+                              mandatoryScores, optionalSources,
                               prohibitedSources, filterSuppliers, minShouldMatch, needsScores,
                               leadCost != std::numeric_limits<int64_t>::max());
       }
@@ -820,9 +913,9 @@ public:
       }
 
       BulkScorer* bulkScorer(MemPool& targetPool) override {
-        // Scored or not: unscored clauses bound as +infinity, so the window
-        // skip never fires and the bulk intersection runs exhaustively - the
-        // right execution for exact conjunction counts too.
+        // Scored or not, the bulk intersection remains the right execution for
+        // exact conjunction counts. Unscored clauses contribute zero score and
+        // zero bounds.
         if (optionalSources.empty() && prohibitedSources.empty()
             && filterSuppliers.empty() && mandatorySources.size() >= 2) {
           return conjunctionBulkScorer(targetPool);
@@ -832,12 +925,9 @@ public:
             && filterSuppliers.empty() && minShouldMatch < 1) {
           return mandOptBulkScorer(targetPool);
         }
-        // Shape gate only - scoring is not required. Without scores the clause
-        // scorers report score()=0 / getMaxScore()=+inf, the window split stays
-        // at zero (every clause essential), and the window loop degenerates to
-        // an exhaustive per-clause OR into the window bitset - the right
-        // execution for unscored counting, far cheaper than the doc-at-a-time
-        // heap disjunction.
+        // Shape gate only - scoring is not required. In count-only mode the
+        // window loop exhaustively ORs each clause into the window bitset,
+        // which is far cheaper than a doc-at-a-time heap disjunction.
         if (!mandatorySources.empty() || !prohibitedSources.empty()
             || !filterSuppliers.empty() || minShouldMatch > 1 || optionalSources.size() < 2) {
           return nullptr;
@@ -892,6 +982,7 @@ public:
         MemPool& targetPool,
         IndexReader::Segment& segment,
         std::span<Query::SegmentSource* const> mandatorySources,
+        std::span<const uint8_t> mandatoryScores,
         std::span<Query::SegmentSource* const> optionalSources,
         std::span<Query::SegmentSource* const> prohibitedSources,
         std::span<Query::ScorerSupplier* const> filterSuppliers,
@@ -900,18 +991,20 @@ public:
       // Weight-time optional removal can expose a Boolean child that
       // normalization could not unwrap while the optionals were still present.
       // Preserve the child's complete supplier contract, including bulkScorer.
-      if (minShouldMatch < 1 && mandatorySources.size() == 1 && optionalSources.empty()
+      if (minShouldMatch < 1 && mandatorySources.size() == 1
+          && optionalSources.empty()
           && prohibitedSources.empty() && filterSuppliers.empty()) {
         auto* child = mandatorySources[0]->scorerSupplier(targetPool, segment);
         if (child != nullptr) return child;
       }
       return targetPool.make<Supplier>(
-        targetPool, segment, mandatorySources, optionalSources,
+        targetPool, segment, mandatorySources, mandatoryScores, optionalSources,
         prohibitedSources, filterSuppliers, minShouldMatch, needsScores);
     }
 
     class BooleanPreparedWeight final : public Query::Weight::PreparedWeight {
       std::vector<QueryPrep::PreparedSource> mandatorySources;
+      std::vector<uint8_t> mandatoryScores;
       std::vector<QueryPrep::PreparedSource> optionalSources;
       std::vector<QueryPrep::PreparedSource> prohibitedSources;
       std::vector<std::unique_ptr<DocSet>> filterDomains;
@@ -921,11 +1014,13 @@ public:
 
     public:
       BooleanPreparedWeight(std::vector<QueryPrep::PreparedSource>&& mandatorySources,
+                            std::span<const uint8_t> mandatoryScores,
                             std::vector<QueryPrep::PreparedSource>&& optionalSources,
                             std::vector<QueryPrep::PreparedSource>&& prohibitedSources,
                             std::vector<std::unique_ptr<DocSet>>&& filterDomains,
                             bool hasFilters, int minShouldMatch, bool needsScores)
         : mandatorySources(std::move(mandatorySources)),
+          mandatoryScores(mandatoryScores.begin(), mandatoryScores.end()),
           optionalSources(std::move(optionalSources)),
           prohibitedSources(std::move(prohibitedSources)),
           filterDomains(std::move(filterDomains)),
@@ -942,6 +1037,7 @@ public:
         return makeSupplier(
           targetPool, segment,
           QueryPrep::segmentSources(targetPool, QueryPrep::preparedSpan(mandatorySources)),
+          mandatoryScores,
           QueryPrep::segmentSources(targetPool, QueryPrep::preparedSpan(optionalSources)),
           QueryPrep::segmentSources(targetPool, QueryPrep::preparedSpan(prohibitedSources)),
           filterSuppliers, minShouldMatch, needsScores);
@@ -975,8 +1071,7 @@ public:
         mergeDuplicateScoringTerms(context.pool, query.optional, &removedOptional);
       auto prohibitedClauses = dropDuplicateFilterTerms(context.pool, query.prohibited);
       auto filterClauses = dropDuplicateFilterTerms(context.pool, query.filter);
-      mandatoryWeights = createWeights(context.pool, context, mandatoryClauses, flags,
-                                       multiplier);
+      createMandatoryWeights(context, mandatoryClauses, flags, multiplier);
       // With a mandatory clause and minShouldMatch unset, optional clauses are
       // a pure score add (MandOpt) - they never affect membership.  Without
       // scores they contribute nothing, so skip building their weights entirely
@@ -1062,7 +1157,8 @@ public:
       auto prohibitedSources = QueryPrep::prepareSources(prohibitedWeights, ctx);
 
       return std::make_unique<BooleanPreparedWeight>(
-        std::move(mandatorySources), std::move(optionalSources),
+        std::move(mandatorySources), mandatoryScores,
+        std::move(optionalSources),
         std::move(prohibitedSources), std::move(filterDomains),
         !filterSources.empty(), minShouldMatch, needsScores);
     }
@@ -1074,7 +1170,8 @@ public:
       auto prohibitedSources = QueryPrep::liveSources(targetPool, prohibitedWeights);
       auto filterSources = QueryPrep::liveSources(targetPool, filterWeights);
       auto filterSuppliers = QueryPrep::collectSuppliers(targetPool, segment, filterSources);
-      return makeSupplier(targetPool, segment, mandatorySources, optionalSources,
+      return makeSupplier(targetPool, segment, mandatorySources, mandatoryScores,
+                          optionalSources,
                           prohibitedSources, filterSuppliers, minShouldMatch, needsScores);
     }
 
@@ -2451,8 +2548,9 @@ public:
     }
   }
 
-  // Bulk execution for pure scored conjunctions (every clause required AND
-  // scoring, no two-phase members): windows anchor on the lead's current doc,
+  // Bulk execution for pure conjunctions (every clause required, no two-phase
+  // members; required-but-non-scoring clauses carry zero score and bounds):
+  // windows anchor on the lead's current doc,
   // whole windows are skipped when the summed clause bounds cannot reach the
   // threshold (Lucene BlockMaxConjunctionBulkScorer shape), and surviving
   // windows intersect the lead's decoded blocks against the other clauses in

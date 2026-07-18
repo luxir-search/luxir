@@ -284,7 +284,8 @@ public:
 
   public:
     Weight(Query::Context& context, KnnQuery& query, int32_t flags, float multiplier)
-      : Query::Weight(context, flags), query(query), boost(multiplier) {
+      : Query::Weight(context, flags), query(query),
+        boost(constantWhenScored(flags, multiplier)) {
       traits |= NEEDS_PREPARE;  // index-level ANN pass
       if (!query.getFieldType().knnSearchable()) {
         throw std::runtime_error(std::format(
@@ -1818,9 +1819,12 @@ public:
   class Scorer final : public Query::Scorer {
     std::span<const Hit> hits;
     int32_t cur = -1;
+    float maxScore = 0.0f;
 
   public:
-    explicit Scorer(std::span<const Hit> hits) noexcept : hits(hits) {}
+    explicit Scorer(std::span<const Hit> hits) noexcept : hits(hits) {
+      for (const Hit& hit : hits) maxScore = std::max(maxScore, hit.score);
+    }
 
     int32_t next() override {
       cur++;
@@ -1842,6 +1846,16 @@ public:
     float score() override {
       assert(cur >= 0 && cur < (int32_t)hits.size());
       return hits[cur].score;
+    }
+
+    float getMaxScore(int32_t upTo) override {
+      unused(upTo);
+      return maxScore;
+    }
+
+    float getMaxScoreForSetup(int32_t upTo) override {
+      unused(upTo);
+      return maxScore;
     }
   };
 

@@ -330,6 +330,51 @@ TEST_F(NumericRangePointsTest, allSelectionArmsAreReachable) {
       *reader, "arm_scan_sorted_i", 0, Postings::NUMERIC_BLOCK_SIZE - 1));
   EXPECT_EQ(std::get<0>(full),
             fullScan(*reader, "arm_scan_shuffled_i", 0, 9'999));
+
+  auto checkScoredArm = [&](std::string_view field, int64_t lo, int64_t hi,
+                            int64_t leadCost, bool expectBulk) {
+    MemPool pool;
+    Query::Context context(pool, *reader);
+    NumericRangeQuery query(field, lo, hi);
+    auto* weight = static_cast<NumericRangeQuery::Weight*>(
+        query.createWeight(context, Query::NEED_SCORES, 3.0f));
+    auto* supplier = weight->scorerSupplier(pool, segment);
+    ASSERT_NE(nullptr, supplier);
+    auto* scorer = supplier->get(pool, leadCost);
+    ASSERT_NE(nullptr, scorer);
+    EXPECT_FLOAT_EQ(3.0f, scorer->getMaxScore(PostingsReader::END));
+    EXPECT_FLOAT_EQ(3.0f,
+                    scorer->getMaxScoreForSetup(PostingsReader::END));
+    scorer->setMinCompetitiveScore(3.0f);
+    ASSERT_NE(PostingsReader::END, scorer->next());
+    EXPECT_FLOAT_EQ(3.0f, scorer->score());
+
+    BulkScorer* bulk = supplier->bulkScorer(pool);
+    if (!expectBulk) {
+      EXPECT_EQ(nullptr, bulk);
+      return;
+    }
+    ASSERT_NE(nullptr, bulk);
+    ScoreWindow window;
+    bulk->scoreNextWindow(window, nullptr, 0, segment.maxDoc(), 3.0f);
+    ASSERT_GT(window.size, 0);
+    for (int32_t i = 0; i < window.size; i++) {
+      EXPECT_FLOAT_EQ(3.0f, window.scores[(size_t)i]);
+    }
+  };
+
+  checkScoredArm("arm_sorted", 100, 100, 0, true);  // sparse pull, points bulk
+  checkScoredArm("arm_sorted", 100, 100,
+                 std::numeric_limits<int64_t>::max(), true);  // points array
+  checkScoredArm("arm_sorted", 0, Postings::NUMERIC_BLOCK_SIZE - 1,
+                 std::numeric_limits<int64_t>::max(), true);  // points bitset
+  checkScoredArm("arm_sorted", 0, 26'000,
+                 std::numeric_limits<int64_t>::max(), true);  // complement
+  checkScoredArm("arm_scan_sorted_i", 0,
+                 Postings::NUMERIC_BLOCK_SIZE - 1,
+                 std::numeric_limits<int64_t>::max(), true);  // zone map
+  checkScoredArm("arm_scan_shuffled_i", 0, 9'999,
+                 std::numeric_limits<int64_t>::max(), false);  // full scan
 }
 
 TEST_F(NumericRangePointsTest, optionalComplementAndMultiLeafDedup) {

@@ -10,34 +10,42 @@ class AllQuery final : public solux::Query {
 public:
   AllQuery() {}
 
+  ScoreProfile scoreProfile() const override {
+    return ScoreProfile::automatic(1.0f);
+  }
+
   AllQuery::Weight* createWeight(Context& context, int32_t flags,
                                  float multiplier = 1.0f) override {
-    unused(multiplier);
-    AllQuery::Weight* weight = context.pool.make<AllQuery::Weight>(context, *this, flags);
+    AllQuery::Weight* weight = context.pool.make<AllQuery::Weight>(
+        context, *this, flags, constantWhenScored(flags, multiplier));
     return weight;
   }
 
   class Weight final : public Query::Weight {
   protected:
     AllQuery& query;
+    float score;
   public:
-    Weight(Context& context, AllQuery& query, int32_t flags) : Query::Weight(context, flags), query(query) {
-      traits |= IS_CONSTANT_SCORING;  // every match scores 0
+    Weight(Context& context, AllQuery& query, int32_t flags, float score)
+      : Query::Weight(context, flags), query(query), score(score) {
+      traits |= IS_CONSTANT_SCORING;
     }
 
     AllQuery::Scorer* createScorer(solux::MemPool& targetPool, solux::IndexReader::Segment& segment) override {
-      return targetPool.make<AllQuery::Scorer>(segment);
+      return targetPool.make<AllQuery::Scorer>(segment, score);
     }
 
   };
 
-  class Scorer final : public Query::Scorer {
+  class Scorer final : public Query::ConstantScorer {
   public:
     solux::IndexReader::Segment& segment;
     int32_t docid = -1;
     int32_t lastDoc;
 
-    Scorer(solux::IndexReader::Segment& segment) : segment(segment), lastDoc(segment.postingsReader().maxDoc() - 1) {
+    Scorer(solux::IndexReader::Segment& segment, float constantScore = 0.0f)
+      : Query::ConstantScorer(constantScore), segment(segment),
+        lastDoc(segment.postingsReader().maxDoc() - 1) {
     }
 
     int32_t next() override {
@@ -54,28 +62,13 @@ public:
       return docid;
     }
 
-    float score() override {
-      return 0.0f;
-    }
-
-    // Every match scores 0: a flat, exact bound with no shallow structure.
-    float getMaxScore(int32_t upTo) override {
-      unused(upTo);
-      return 0.0f;
-    }
-    float getMaxScoreForSetup(int32_t upTo) override {
-      unused(upTo);
-      return 0.0f;
-    }
-    int32_t advanceShallowForSetup(int32_t target) override {
-      unused(target);
-      return PostingsReader::END;
-    }
+    void exhaust() override { lastDoc = -1; }
 
     void fillWindowBits(std::span<uint64_t> windowBits, int32_t windowStart,
                         int32_t windowEnd) override {
       skipCount(SkipStats::countBulkFillCalls);
-      if (windowEnd <= windowStart || docid == PostingsReader::END || docid >= windowEnd) return;
+      if (windowEnd <= windowStart
+          || docid == PostingsReader::END || docid >= windowEnd) return;
 
       int32_t start = std::max(windowStart, docid < 0 ? windowStart : docid);
       int32_t end = std::min(windowEnd, lastDoc + 1);

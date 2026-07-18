@@ -124,6 +124,7 @@ class SimpleQueryParser {
   struct Clause {
     const api::Query* q;
     Occur occur;
+    bool explicitRequired;
   };
 
   // One clause list under construction (the top level or one group), in the
@@ -343,10 +344,10 @@ private:
     return (api::Query*)mr.allocate(sizeof(api::Query) * n, alignof(api::Query));
   }
 
-  // Materialize a clause list into a single node: one positive clause is
-  // returned unwrapped (a single term is not a BooleanQuery); otherwise the
-  // clauses split into the required / optional / prohibited buckets.  A level
-  // with only prohibited clauses gets a match-all optional so `-foo` means
+  // Materialize a clause list into a single node: one optional clause is
+  // returned unwrapped; a required clause retains its observable occurrence.
+  // clauses split into the required / optional / prohibited buckets. A level
+  // with only prohibited clauses gets a match-all requirement so `-foo` means
   // "everything except foo" in the canonical parser output. The engine also
   // supplies this complement for raw pure-negative BooleanQuery trees.
   // min_match binds only when applyMinMatch
@@ -354,7 +355,10 @@ private:
   const api::Query* collapse(Level& st, bool applyMinMatch) {
     size_t n = st.clauses.size();
     if (n == 0) return nullptr;
-    if (n == 1 && st.clauses[0].occur != Occur::MUST_NOT) return st.clauses[0].q;
+    if (n == 1 && st.clauses[0].occur != Occur::MUST_NOT
+        && !st.clauses[0].explicitRequired) {
+      return st.clauses[0].q;
+    }
 
     size_t nReq = 0, nOpt = 0, nPro = 0;
     for (const Clause& c : st.clauses) {
@@ -363,10 +367,10 @@ private:
       else nOpt++;
     }
     bool pureNegative = (nReq == 0 && nOpt == 0);  // only prohibited -> all-except
-    size_t nOptOut = pureNegative ? 1 : nOpt;
+    size_t nReqOut = pureNegative ? 1 : nReq;
 
-    api::Query* req = nReq ? allocArr(nReq) : nullptr;
-    api::Query* opt = nOptOut ? allocArr(nOptOut) : nullptr;
+    api::Query* req = nReqOut ? allocArr(nReqOut) : nullptr;
+    api::Query* opt = nOpt ? allocArr(nOpt) : nullptr;
     api::Query* pro = nPro ? allocArr(nPro) : nullptr;
     size_t ri = 0, oi = 0, pi = 0;
     for (const Clause& c : st.clauses) {
@@ -375,13 +379,13 @@ private:
       else new (&opt[oi++]) api::Query(*c.q);
     }
     if (pureNegative) {
-      new (&opt[0]) api::Query();
-      opt[0].kind = true;  // the match-all `all` arm
+      new (&req[0]) api::Query();
+      req[0].kind = true;  // required and positionally non-scoring
     }
 
     api::BooleanQuery bq;
-    if (nReq) bq.required = std::span<const api::Query>(req, nReq);
-    if (nOptOut) bq.optional = std::span<const api::Query>(opt, nOptOut);
+    if (nReqOut) bq.required = std::span<const api::Query>(req, nReqOut);
+    if (nOpt) bq.optional = std::span<const api::Query>(opt, nOpt);
     if (nPro) bq.prohibited = std::span<const api::Query>(pro, nPro);
     if (applyMinMatch && opts.min_match > 0 && nReq == 0 && nOpt > 0) {
       bq.min_match = opts.min_match;  // the engine clamps to the count
@@ -1070,7 +1074,7 @@ private:
     Occur occ = prohibited                     ? Occur::MUST_NOT
               : defaultOccur == Occur::MUST     ? (orConj ? Occur::SHOULD : Occur::MUST)
               :                                   (plus ? Occur::MUST : Occur::SHOULD);
-    st.clauses.push_back({branch, occ});
+    st.clauses.push_back({branch, occ, plus && !prohibited});
   }
 };
 

@@ -8,6 +8,7 @@
 
 #include "solux/api/build.h"
 #include "solux/query/AllQuery.h"
+#include "solux/query/BoostQuery.h"
 #include "solux/query/ExistsQuery.h"
 #include "solux/reader/FieldReader.h"
 #include "solux/reader/TermsEnum.h"
@@ -203,8 +204,79 @@ TEST_F(ExistsQueryTest, BooleanCompositionAndScoring) {
     ASSERT_EQ(2u, scores.size());
     for (float score : scores) EXPECT_FLOAT_EQ(expected, score);
   };
-  checkScores("body_w:*", 0.0f);
+  checkScores("body_w:*", 1.0f);
   checkScores("body_w:*^=2", 2.0f);
+}
+
+TEST_F(ExistsQueryTest, PositionalBoostAndConstantScoreSemantics) {
+  auto responseScores = [](const LocalReq& req) {
+    const auto* docs = req.docList();
+    EXPECT_NE(nullptr, docs);
+    if (docs == nullptr) return std::vector<float>{};
+    const auto& values =
+        std::get<api::ColFloat>(docs->columns.at("_score_").kind).v;
+    return std::vector<float>(values.begin(), values.end());
+  };
+  auto exprScores = [&](std::string_view query) {
+    auto req = localReq(helper.getSearchEngine());
+    req->collection("main").topDocs("q").exprQuery(query)
+        .withStats().fields({"id"}).limit(-1);
+    req->execute();
+    EXPECT_TRUE(req->ok()) << req->errorMsg();
+    return responseScores(*req);
+  };
+  auto simpleScores = [&](std::string_view query) {
+    auto req = localReq(helper.getSearchEngine());
+    req->collection("main").topDocs("q").simpleQuery(query, {"body_w"})
+        .withStats().fields({"id"}).limit(-1);
+    req->execute();
+    EXPECT_TRUE(req->ok()) << req->errorMsg();
+    return responseScores(*req);
+  };
+  auto expectUniform = [](std::vector<float> scores, size_t count, float score) {
+    ASSERT_EQ(count, scores.size());
+    for (float actual : scores) EXPECT_FLOAT_EQ(score, actual);
+  };
+
+  expectUniform(exprScores("body_w:*"), 2, 1.0f);
+  expectUniform(exprScores("+body_w:*"), 2, 0.0f);
+  expectUniform(simpleScores("+body_w:*"), 2, 0.0f);
+  expectUniform(exprScores("+body_w:*^1"), 2, 0.0f);
+  expectUniform(exprScores("+body_w:*^3"), 2, 0.0f);
+  expectUniform(exprScores("body_w:*^3"), 2, 3.0f);
+  expectUniform(exprScores("+body_w:*^=3"), 2, 3.0f);
+  expectUniform(exprScores("NOT body_w:*"), 3, 0.0f);
+
+  auto nested = exprScores("+(body_w:* dense_w:*)");
+  std::sort(nested.begin(), nested.end());
+  EXPECT_EQ((std::vector<float>{1.0f, 1.0f, 1.0f, 2.0f, 2.0f}), nested);
+
+  auto baseline = exprScores("body_w:alpha^3");
+  auto distributed = exprScores("(+body_w:alpha +dense_w:*)^3");
+  ASSERT_EQ(1u, baseline.size());
+  ASSERT_EQ(baseline.size(), distributed.size());
+  EXPECT_FLOAT_EQ(baseline[0], distributed[0]);
+
+  auto structured = localReq(helper.getSearchEngine());
+  auto& structuredCursor = structured->collection("main").topDocs("q");
+  structuredCursor.rawQuery() = qb::boost(
+      structuredCursor.mr(), qb::exists(structuredCursor.mr(), "body_w"), 1.0f);
+  structuredCursor.withStats().fields({"id"}).limit(-1);
+  structured->execute();
+  ASSERT_TRUE(structured->ok()) << structured->errorMsg();
+  expectUniform(responseScores(*structured), 2, 1.0f);
+
+  auto json = localReq(helper.getSearchEngine());
+  auto& jsonCursor = json->collection("main").topDocs("q");
+  std::string error;
+  ASSERT_TRUE(api::read_json(
+      jsonCursor.rawQuery(),
+      R"({"boost":{"query":{"exists":{"field":"body_w"}},"boost":1}})",
+      jsonCursor.mr(), &error)) << error;
+  jsonCursor.withStats().fields({"id"}).limit(-1);
+  json->execute();
+  ASSERT_TRUE(json->ok()) << json->errorMsg();
+  expectUniform(responseScores(*json), 2, 1.0f);
 }
 
 TEST_F(ExistsQueryTest, SupplierCostIterationCountAndDeletes) {
@@ -233,6 +305,28 @@ TEST_F(ExistsQueryTest, SupplierCostIterationCountAndDeletes) {
   EXPECT_EQ(5, denseSupplier->cost());
   EXPECT_NE(nullptr, dynamic_cast<AllQuery::Scorer*>(
                          denseSupplier->get(pool, segment.maxDoc())));
+
+  MemPool scorePool;
+  Query::Context scoreContext(scorePool, *reader);
+  BoostQuery boostedSparse(&sparseQuery, 2.0f);
+  auto* scoredSparse = boostedSparse.createWeight(
+      scoreContext, Query::NEED_SCORES)->createScorer(scorePool, segment);
+  ASSERT_NE(nullptr, scoredSparse);
+  EXPECT_FLOAT_EQ(2.0f,
+                  scoredSparse->getMaxScoreForSetup(PostingsReader::END));
+  scoredSparse->setMinCompetitiveScore(2.0f);
+  ASSERT_EQ(0, scoredSparse->next());
+  EXPECT_FLOAT_EQ(2.0f, scoredSparse->score());
+
+  ExistsQuery scoredDenseQuery("dense_w");
+  BoostQuery boostedDense(&scoredDenseQuery, 3.0f);
+  auto* scoredDense = boostedDense.createWeight(
+      scoreContext, Query::NEED_SCORES)->createScorer(scorePool, segment);
+  ASSERT_NE(nullptr, dynamic_cast<AllQuery::Scorer*>(scoredDense));
+  EXPECT_FLOAT_EQ(3.0f,
+                  scoredDense->getMaxScoreForSetup(PostingsReader::END));
+  ASSERT_EQ(0, scoredDense->next());
+  EXPECT_FLOAT_EQ(3.0f, scoredDense->score());
 
   auto countReq = localReq(helper.getSearchEngine());
   countReq->collection("main").topDocs("q").existsQuery("body_w")

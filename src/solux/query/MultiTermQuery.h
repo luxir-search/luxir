@@ -15,13 +15,14 @@ namespace solux {
 class MultiTermQuery : public Query {
 protected:
   std::string_view field;
-  float boost;
 
 public:
-  MultiTermQuery(std::string_view field, float boost = 1.0f) : field(field), boost(boost) {}
+  explicit MultiTermQuery(std::string_view field) : field(field) {}
 
   std::string_view getField() const { return field; }
-  float getBoost() const { return boost; }
+  ScoreProfile scoreProfile() const override {
+    return ScoreProfile::automatic(1.0f);
+  }
 
   // Build the per-segment filtered term iterator.
   virtual FilteredTermsEnum* createFilteredEnum(MemPool& pool, TermsEnum& te) = 0;
@@ -32,12 +33,10 @@ public:
   }
 
   // Iterates set bits of the membership bitset under a constant score.
-  class Scorer final : public Query::Scorer {
+  class Scorer final : public Query::ConstantScorer {
     FixedBitSet bits;
     int32_t maxDoc;
-    float boost;
     int32_t docid = -1;
-    bool exhausted = false;  // latched when `boost` can no longer compete
 
     // First set bit at or after `from`, or END when none remain.
     int32_t advanceTo(int32_t from) {
@@ -46,56 +45,37 @@ public:
     }
 
   public:
-    Scorer(FixedBitSet bits, int32_t maxDoc, float boost) : bits(bits), maxDoc(maxDoc), boost(boost) {}
+    Scorer(FixedBitSet bits, int32_t maxDoc, float constantScore)
+      : Query::ConstantScorer(constantScore), bits(bits), maxDoc(maxDoc) {}
 
     int32_t next() override {
-      if (exhausted || docid == PostingsReader::END) return docid = PostingsReader::END;
+      if (docid == PostingsReader::END) return docid = PostingsReader::END;
       return advanceTo(docid + 1);
     }
     int32_t advance(int32_t target) override {
-      if (exhausted) return docid = PostingsReader::END;
       assert(docid < target);  // strict advance
       return advanceTo(target);
     }
     int32_t docId() override { return docid; }
-    float score() override { return boost; }
 
-    // Every match scores exactly `boost`: a flat, exact bound with no
-    // shallow structure.  Once the collector's floor rises above it, no
-    // remaining doc can compete (ties stay competitive).
-    void setMinCompetitiveScore(float minScore) override {
-      if (minScore > boost) exhausted = true;
-    }
-    float getMaxScore(int32_t upTo) override {
-      unused(upTo);
-      return boost;
-    }
-    float getMaxScoreForSetup(int32_t upTo) override {
-      unused(upTo);
-      return boost;
-    }
-    int32_t advanceShallowForSetup(int32_t target) override {
-      unused(target);
-      return PostingsReader::END;
-    }
+  protected:
+    void exhaust() override { maxDoc = 0; }
   };
 
   // Builds one doc-id window at a time while retaining each term's docs-only
   // cursor. Windows and conjunction-driven advances are monotone, so a postings
   // block is decoded at most once.
-  class LazyScorer final : public Query::Scorer {
+  class LazyScorer final : public Query::ConstantScorer {
     static constexpr int32_t WINDOW_SIZE = DocsEnum::L1_DOCS;
     static constexpr int32_t WINDOW_WORDS = WINDOW_SIZE / 64;
 
     std::span<DocsEnum> docsEnums;
     std::span<uint64_t> windowBits;
     int32_t maxDoc;
-    float boost;
     int32_t docid = -1;
     int32_t windowStart = -1;
     int32_t windowEnd = -1;
     int32_t nextWindowTarget = -1;
-    bool exhausted = false;
 
     int32_t findInWindow(int32_t target) const {
       if (target < windowStart || target >= windowEnd) {
@@ -149,7 +129,7 @@ public:
     }
 
     int32_t seek(int32_t target) {
-      if (exhausted || target >= maxDoc) {
+      if (target >= maxDoc) {
         return docid = PostingsReader::END;
       }
       int32_t found = findInWindow(target);
@@ -176,14 +156,15 @@ public:
 
   public:
     LazyScorer(std::span<DocsEnum> docsEnums,
-               std::span<uint64_t> windowBits, int32_t maxDoc, float boost)
-      : docsEnums(docsEnums), windowBits(windowBits), maxDoc(maxDoc), boost(boost) {
+               std::span<uint64_t> windowBits, int32_t maxDoc, float constantScore)
+      : Query::ConstantScorer(constantScore), docsEnums(docsEnums),
+        windowBits(windowBits), maxDoc(maxDoc) {
       static_assert((WINDOW_SIZE % 64) == 0);
       assert(windowBits.size() == WINDOW_WORDS);
     }
 
     int32_t next() override {
-      if (exhausted || docid == PostingsReader::END) {
+      if (docid == PostingsReader::END) {
         return docid = PostingsReader::END;
       }
       return seek(docid + 1);
@@ -193,23 +174,9 @@ public:
       return seek(target);
     }
     int32_t docId() override { return docid; }
-    float score() override { return boost; }
 
-    void setMinCompetitiveScore(float minScore) override {
-      if (minScore > boost) exhausted = true;
-    }
-    float getMaxScore(int32_t upTo) override {
-      unused(upTo);
-      return boost;
-    }
-    float getMaxScoreForSetup(int32_t upTo) override {
-      unused(upTo);
-      return boost;
-    }
-    int32_t advanceShallowForSetup(int32_t target) override {
-      unused(target);
-      return PostingsReader::END;
-    }
+  protected:
+    void exhaust() override { maxDoc = 0; }
   };
 
   class Weight final : public Query::Weight {
@@ -226,7 +193,7 @@ public:
 
     Weight(Context& context, MultiTermQuery& query, int32_t flags, float multiplier)
       : Query::Weight(context, flags), query(query),
-        boost(checkedBoostProduct(multiplier, query.getBoost())),
+        boost(constantWhenScored(flags, multiplier)),
         canUseLazy((flags & (NEED_SCORES | ALLOW_PRUNING))
                      == (NEED_SCORES | ALLOW_PRUNING)
                    && !disableLazyMultiTermForTests) {

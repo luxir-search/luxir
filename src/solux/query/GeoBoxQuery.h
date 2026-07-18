@@ -59,6 +59,9 @@ public:
   int32_t getMinLongitude() const { return minLongitude; }
   int32_t getMaxLongitude() const { return maxLongitude; }
   bool isEmpty() const { return empty; }
+  ScoreProfile scoreProfile() const override {
+    return ScoreProfile::automatic(1.0f);
+  }
 
   BKDBoxRelation makeRelation() const {
     return {minLatitude, maxLatitude, minLongitude, maxLongitude};
@@ -66,8 +69,8 @@ public:
 
   Query::Weight* createWeight(Context& context, int32_t flags,
                               float multiplier = 1.0f) override {
-    unused(multiplier);
-    return context.pool.make<Weight>(context, *this, flags);
+    float score = constantWhenScored(flags, multiplier);
+    return context.pool.make<Weight>(context, *this, flags, score);
   }
 };
 

@@ -937,6 +937,7 @@ public:
     }
 
     float getMaxScore(int32_t upTo) override {
+      if (simScorer == nullptr) return 0.0f;
       return matcher.getMaxScore(*this, upTo);
     }
 

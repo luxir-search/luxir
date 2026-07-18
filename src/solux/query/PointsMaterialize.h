@@ -61,13 +61,14 @@ struct PointsMaterialize {
     bits.words[lastWord] &= ~lastMask;
   }
 
-  class PointsArrayScorer final : public Query::Scorer {
+  class PointsArrayScorer final : public Query::ConstantScorer {
     std::span<const int32_t> docs;
     int64_t index = -1;
     int32_t docid = -1;
 
   public:
-    explicit PointsArrayScorer(std::span<const int32_t> docs) : docs(docs) {}
+    PointsArrayScorer(std::span<const int32_t> docs, float constantScore)
+      : Query::ConstantScorer(constantScore), docs(docs) {}
 
     int32_t next() override {
       assert(docid != PostingsReader::END);
@@ -85,22 +86,26 @@ struct PointsMaterialize {
     }
 
     int32_t docId() override { return docid; }
-    float score() override { return 0.0f; }
+
+  protected:
+    void exhaust() override { index = (int64_t)docs.size(); }
   };
 
-  class PointsBitScorer final : public Query::Scorer {
+  class PointsBitScorer final : public Query::ConstantScorer {
     FixedBitSet bits;
+    int32_t limit;
     int32_t docid = -1;
 
     int32_t seek(int32_t target) {
-      if (target >= bits.size()) return docid = PostingsReader::END;
+      if (target >= limit) return docid = PostingsReader::END;
       int32_t found = bits.nextSetBit(target);
       return docid = found == FixedBitSet::MAX_INDEX
           ? PostingsReader::END : found;
     }
 
   public:
-    explicit PointsBitScorer(FixedBitSet bits) : bits(bits) {}
+    PointsBitScorer(FixedBitSet bits, float constantScore)
+      : Query::ConstantScorer(constantScore), bits(bits), limit(bits.size()) {}
 
     int32_t next() override {
       assert(docid != PostingsReader::END);
@@ -111,22 +116,24 @@ struct PointsMaterialize {
       return seek(target);
     }
     int32_t docId() override { return docid; }
-    float score() override { return 0.0f; }
   };
 
   class PointsArrayBulkScorer final : public BulkScorer {
     std::span<const int32_t> docs;
     std::span<int32_t> outDocs;
     std::span<float> outScores;
+    float constantScore;
 
     bool accepted(DocSet* filter, int32_t doc) const {
       return filter == nullptr || filter->get(doc);
     }
 
   public:
-    PointsArrayBulkScorer(MemPool& pool, std::span<const int32_t> docs)
+    PointsArrayBulkScorer(MemPool& pool, std::span<const int32_t> docs,
+                          float constantScore)
         : docs(docs), outDocs(pool.make_span<int32_t>(docs.size())),
-          outScores(pool.make_span<float>(docs.size())) {}
+          outScores(pool.make_span<float>(docs.size())),
+          constantScore(constantScore) {}
 
     int32_t countNextWindow(int64_t& count, DocSetBuilder* domainOut,
                             DocSet* filter, int32_t min, int32_t max) override {
@@ -151,7 +158,7 @@ struct PointsMaterialize {
       out.size = 0;
       out.docs = outDocs;
       out.scores = outScores;
-      if (min >= max || minCompetitiveScore > 0.0f
+      if (min >= max || minCompetitiveScore > constantScore
           || (filter != nullptr && filter->card() == 0)) {
         return PostingsReader::END;
       }
@@ -160,7 +167,7 @@ struct PointsMaterialize {
       for (auto it = begin; it != end; ++it) {
         if (!accepted(filter, *it)) continue;
         outDocs[(size_t)out.size] = *it;
-        outScores[(size_t)out.size] = 0.0f;
+        outScores[(size_t)out.size] = constantScore;
         out.size++;
       }
       return PostingsReader::END;
@@ -177,6 +184,7 @@ struct PointsMaterialize {
     std::span<float> outScores;
     int32_t windowStart = 0;
     int32_t windowEnd = 0;
+    float constantScore;
 
     static uint64_t validMask(int32_t remaining) {
       if (remaining >= 64) return ~0ULL;
@@ -254,11 +262,12 @@ struct PointsMaterialize {
     }
 
   public:
-    PointsBitBulkScorer(MemPool& pool, FixedBitSet bits)
+    PointsBitBulkScorer(MemPool& pool, FixedBitSet bits, float constantScore)
         : bits(bits),
           windowBits(pool.make_span<uint64_t>(WINDOW_WORDS)),
           outDocs(pool.make_span<int32_t>(WINDOW_SIZE)),
-          outScores(pool.make_span<float>(WINDOW_SIZE)) {}
+          outScores(pool.make_span<float>(WINDOW_SIZE)),
+          constantScore(constantScore) {}
 
     int32_t countNextWindow(int64_t& count, DocSetBuilder* domainOut,
                             DocSet* filter, int32_t min, int32_t max) override {
@@ -289,7 +298,7 @@ struct PointsMaterialize {
       fillWindow(filter, min, max);
       out.min = windowStart;
       out.max = windowEnd;
-      if (minCompetitiveScore <= 0.0f) {
+      if (minCompetitiveScore <= constantScore) {
         int32_t nbits = windowEnd - windowStart;
         for (int32_t w = 0; w < WINDOW_WORDS; w++) {
           uint64_t word = windowBits[(size_t)w];
@@ -298,7 +307,7 @@ struct PointsMaterialize {
             int32_t index = (w << 6) + bit;
             if (index >= nbits) break;
             outDocs[(size_t)out.size] = windowStart + index;
-            outScores[(size_t)out.size] = 0.0f;
+            outScores[(size_t)out.size] = constantScore;
             out.size++;
             word &= word - 1;
           }
@@ -310,20 +319,21 @@ struct PointsMaterialize {
 
   static Query::Scorer* scorerFor(MemPool& pool,
                                   const Materialized& result,
-                                  int32_t maxDoc) {
+                                  int32_t maxDoc, float constantScore) {
     if (result.words != nullptr) {
-      return pool.make<PointsBitScorer>(FixedBitSet(result.words, maxDoc));
+      return pool.make<PointsBitScorer>(FixedBitSet(result.words, maxDoc),
+                                        constantScore);
     }
-    return pool.make<PointsArrayScorer>(result.docs);
+    return pool.make<PointsArrayScorer>(result.docs, constantScore);
   }
 
   static BulkScorer* bulkFor(MemPool& pool, const Materialized& result,
-                             int32_t maxDoc) {
+                             int32_t maxDoc, float constantScore) {
     if (result.words != nullptr) {
       return pool.make<PointsBitBulkScorer>(
-          pool, FixedBitSet(result.words, maxDoc));
+          pool, FixedBitSet(result.words, maxDoc), constantScore);
     }
-    return pool.make<PointsArrayBulkScorer>(pool, result.docs);
+    return pool.make<PointsArrayBulkScorer>(pool, result.docs, constantScore);
   }
 };
 

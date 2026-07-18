@@ -164,6 +164,23 @@ TEST_F(ScorerCostTest, needScoresFlagControlsScoring) {
   ASSERT_NE(unscored, nullptr);
   unscored->next();
   EXPECT_EQ(0.0f, unscored->score());
+  EXPECT_EQ(0.0f, unscored->getMaxScore(PostingsReader::END));
+  EXPECT_EQ(0.0f,
+            unscored->getMaxScoreForSetup(PostingsReader::END));
+
+  auto phraseTerms = pool.make_span<std::string_view>(2);
+  phraseTerms[0] = "a";
+  phraseTerms[1] = "b";
+  auto phrasePositions = pool.make_span<int32_t>(2);
+  phrasePositions[0] = 0;
+  phrasePositions[1] = 1;
+  PhraseQuery phrase("body_w", phraseTerms, phrasePositions);
+  auto* unscoredPhrase = phrase.createWeight(ctx, 0)->createScorer(pool, seg);
+  ASSERT_NE(nullptr, unscoredPhrase);
+  ASSERT_NE(PostingsReader::END, unscoredPhrase->next());
+  EXPECT_EQ(0.0f, unscoredPhrase->score());
+  EXPECT_EQ(0.0f,
+            unscoredPhrase->getMaxScoreForSetup(PostingsReader::END));
 }
 
 TEST_F(ScorerCostTest, constantScoringTrait) {

@@ -158,7 +158,8 @@ year_i:>=1960                    also >, <=, <
 ```
 
 On string, id, and text fields the range runs over the indexed terms in
-plain byte order (no collation), and matches score a constant. Text
+plain byte order (no collation), and uses the positional constant-scoring
+rule described below. Text
 endpoints fold the way the field folds, like prefix and fuzzy text.
 
 Endpoints are converted exactly the way field values are at indexing time,
@@ -242,8 +243,15 @@ zero tokens are present, while an empty multi-valued array is missing. Values
 discarded during ingestion, such as a zero-norm cosine vector, are also missing.
 Stored-only fields cannot be queried for existence.
 
-Existence matches score `0`. Use the constant-score decoration when existence
-should contribute to ranking, for example `field:*^=2`.
+Existence is a filter-shaped query. At the root or in an optional clause it
+contributes `1`; as a required clause (`+field:*`) it contributes `0` and only
+restricts matching. A boost multiplies the constant where the clause scores,
+so `+field:*^3` still contributes `0`; use `^=N` (constant_score) when a
+required clause should score, for example `+field:*^=2`.
+
+The same positional rule applies to match-all, numeric and geo ranges, prefix,
+and term-range queries: their default constant is `1` and a required clause
+contributes `0`. Filter and prohibited clauses never score.
 
 Prefix and fuzzy text is folded the way the field folds - `title_wl:Runn*`
 finds what "Runner" indexed - but never split into words. On unanalyzed
@@ -265,7 +273,9 @@ title_w:"dune messiah"^1.5
 status_s:active^=2
 ```
 
-`^N` multiplies every matching score by `N`. Boosts nest by multiplication.
+`^N` multiplies every matching score by `N`; on a required filter-shaped
+clause the suppressed constant stays `0`, so use `^=N` there instead. Boosts
+nest by multiplication.
 `^=N` is shorthand for `constant_score(..., score=N)`: it keeps the match set
 but replaces the child score. Only one score decoration is allowed on one
 clause. The value must be a literal finite non-negative number; `$variables`

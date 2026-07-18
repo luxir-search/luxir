@@ -16,13 +16,20 @@ class ConstantScoreQuery final : public solux::Query {
   Query* child;
   float constantScore;
 
-  class Scorer final : public Query::Scorer {
+  // setMinCompetitiveScore is not forwarded to the child: it was built
+  // scoreless, so the wrapper owns all score semantics. The exhaustion
+  // latch is honored here (unlike leaf constant scorers) because the branch
+  // gates a child call, not a leaf's hot decode loop, and ending iteration
+  // skips all remaining child work.
+  class Scorer final : public Query::ConstantScorer {
     Query::Scorer* child;
-    float constantScore;
-    bool exhausted = false;  // latched when the constant can no longer compete
+    bool exhausted = false;
+
+    void exhaust() override { exhausted = true; }
 
   public:
-    Scorer(Query::Scorer* child, float constantScore) : child(child), constantScore(constantScore) {}
+    Scorer(Query::Scorer* child, float constantScore)
+      : Query::ConstantScorer(constantScore), child(child) {}
 
     int32_t next() override {
       return exhausted ? PostingsReader::END : child->next();
@@ -34,32 +41,6 @@ class ConstantScoreQuery final : public solux::Query {
 
     int32_t docId() override {
       return child->docId();
-    }
-
-    float score() override {
-      return constantScore;
-    }
-
-    // Every match scores exactly the constant, so the bound is flat and
-    // exact: no shallow structure, and once the collector's floor rises
-    // above it no remaining doc can compete (ties stay competitive, same
-    // convention as impact skipping).  The current position stays valid;
-    // only future iteration ends.  Not forwarded to the child: it was built
-    // scoreless, so the wrapper owns all score semantics.
-    void setMinCompetitiveScore(float minScore) override {
-      if (minScore > constantScore) exhausted = true;
-    }
-    float getMaxScore(int32_t upTo) override {
-      unused(upTo);
-      return constantScore;
-    }
-    float getMaxScoreForSetup(int32_t upTo) override {
-      unused(upTo);
-      return constantScore;
-    }
-    int32_t advanceShallowForSetup(int32_t target) override {
-      unused(target);
-      return PostingsReader::END;
     }
 
     // Matching is exactly the child's, so forward two-phase iteration: a
@@ -100,6 +81,9 @@ public:
   ConstantScoreQuery(Query* child, float constantScore = 1.0f) : child(child), constantScore(constantScore) {}
 
   Query* getChild() const { return child; }
+  ScoreProfile scoreProfile() const override {
+    return ScoreProfile::explicitUniform(constantScore);
+  }
 
   Weight* createWeight(Context& context, int32_t flags,
                        float multiplier = 1.0f) override {
@@ -139,7 +123,7 @@ public:
   public:
     Weight(Context& context, ConstantScoreQuery& query, int32_t flags, float multiplier)
       : Query::Weight(context, flags),
-        constantScore(checkedBoostProduct(query.constantScore, multiplier)) {
+        constantScore(constantWhenScored(flags, multiplier, query.constantScore)) {
       // The child constrains matches; this wrapper replaces its score.
       childWeight = query.child->createWeight(context, flags & ~NEED_SCORES, 1.0f);
       // The wrapper is constant-scoring; prepare still follows the child.

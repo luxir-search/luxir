@@ -215,6 +215,32 @@ public:
   /// an exact hit count. Propagated independently of NEED_SCORES.
   static constexpr int32_t ALLOW_PRUNING = 1 << 1;
 
+  // Query-tree score semantics, derived before Weight creation. This is
+  // intentionally separate from Weight::IS_CONSTANT_SCORING: the latter is
+  // an execution trait and may depend on NEED_SCORES, while this profile
+  // records whether a uniform score was implicit or explicitly requested.
+  struct ScoreProfile {
+    enum class Kind : uint8_t {
+      VARIABLE,
+      AUTO_UNIFORM,
+      EXPLICIT_UNIFORM
+    };
+
+    Kind kind = Kind::VARIABLE;
+    float value = 0.0f;
+
+    static ScoreProfile variable() { return {}; }
+    static ScoreProfile automatic(float value) {
+      return {Kind::AUTO_UNIFORM, value};
+    }
+    static ScoreProfile explicitUniform(float value) {
+      return {Kind::EXPLICIT_UNIFORM, value};
+    }
+  };
+
+  // Unknown and custom queries are conservatively variable-scoring.
+  virtual ScoreProfile scoreProfile() const { return ScoreProfile::variable(); }
+
   /// Returns a non-owning pointer to the created weight.  The Query::Context
   /// is responsible for the lifecycle of the created Weight.
   /// A Context is not generally thread-safe, so don't create weights from multiple threads with the same Context.
@@ -227,6 +253,15 @@ public:
       throw std::runtime_error("query boost product must be finite");
     }
     return product;
+  }
+
+  /// The constant a uniform-scoring weight contributes: its boost product
+  /// when scores are requested, 0 otherwise (built unscored means score 0
+  /// and zero bounds).
+  static float constantWhenScored(int32_t flags, float multiplier,
+                                  float local = 1.0f) {
+    return (flags & NEED_SCORES) != 0 ? checkedBoostProduct(multiplier, local)
+                                      : 0.0f;
   }
 
   /// Per-segment planning state. Suppliers are allocated from the segment-local
@@ -738,6 +773,43 @@ public:
     }
 
     // NOTE: no virtual destructor, so subclasses should be made trivially destructible
+  };
+
+  /// Base for scorers whose every match scores the same constant: a flat,
+  /// exact bound with no shallow structure. Once the collector's floor rises
+  /// above the constant no remaining doc can compete (ties stay competitive,
+  /// same convention as impact skipping), so setMinCompetitiveScore calls
+  /// exhaust(). The hint is advisory: subclasses that can end future
+  /// iteration for free override exhaust() to clamp an existing bound (the
+  /// current position stays valid; only future iteration ends). The default
+  /// ignores it - a per-call exhausted test on the hot iteration paths costs
+  /// far more than the latch ever saves (measured on the zone-map and
+  /// full-scan range arms).
+  class ConstantScorer : public Scorer {
+  protected:
+    float constantScore;
+
+    explicit ConstantScorer(float constantScore) : constantScore(constantScore) {}
+
+    virtual void exhaust() {}
+
+  public:
+    float score() override { return constantScore; }
+    void setMinCompetitiveScore(float minScore) override {
+      if (minScore > constantScore) exhaust();
+    }
+    float getMaxScore(int32_t upTo) override {
+      unused(upTo);
+      return constantScore;
+    }
+    float getMaxScoreForSetup(int32_t upTo) override {
+      unused(upTo);
+      return constantScore;
+    }
+    int32_t advanceShallowForSetup(int32_t target) override {
+      unused(target);
+      return PostingsReader::END;
+    }
   };
 };
 

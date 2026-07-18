@@ -248,19 +248,21 @@ TEST_F(ExprParserTest, plusMinusBuckets) {
 
 TEST_F(ExprParserTest, singleClauseUnwraps) {
   EXPECT_EQ("a", matchVal(*parse("title:a")));
-  EXPECT_EQ("a", matchVal(*parse("+title:a")));   // one required clause is itself
+  const auto& required = asBool(*parse("+title:a"));
+  ASSERT_EQ(1u, required.required.size());
+  EXPECT_EQ("a", matchVal(required.required[0]));
   EXPECT_EQ("a", matchVal(*parse("(title:a)")));  // group of one is itself
 }
 
 TEST_F(ExprParserTest, pureNegativeGetsMatchAll) {
   const auto& b = asBool(*parse("-title:a"));
-  ASSERT_EQ(1u, b.optional.size());
-  EXPECT_TRUE(std::holds_alternative<bool>(b.optional[0].kind));
+  ASSERT_EQ(1u, b.required.size());
+  EXPECT_TRUE(std::holds_alternative<bool>(b.required[0].kind));
   ASSERT_EQ(1u, b.prohibited.size());
   EXPECT_EQ("a", matchVal(b.prohibited[0]));
   // several negatives fold into ONE all-except level
   const auto& b2 = asBool(*parse("-title:a -title:b"));
-  EXPECT_EQ(1u, b2.optional.size());
+  EXPECT_EQ(1u, b2.required.size());
   EXPECT_EQ(2u, b2.prohibited.size());
 }
 
@@ -283,7 +285,7 @@ TEST_F(ExprParserTest, notUnderAndMergesProhibited) {
 
 TEST_F(ExprParserTest, notAloneAndUnderOr) {
   const auto& b = asBool(*parse("NOT title:a"));
-  EXPECT_EQ(1u, b.optional.size());  // match-all
+  EXPECT_EQ(1u, b.required.size());  // non-scoring match-all
   EXPECT_EQ(1u, b.prohibited.size());
 
   // a OR NOT b: the NOT leg is its own all-except node
