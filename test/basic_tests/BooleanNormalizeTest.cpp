@@ -165,7 +165,7 @@ TEST_F(BooleanNormalizeTest, standalonePureNegativeSeedsAllAndStaysBoolean) {
       prepareContext, Query::NEED_SCORES)->needsPrepare());
 }
 
-TEST_F(BooleanNormalizeTest, positionalUniformScoresAndBoostPromotion) {
+TEST_F(BooleanNormalizeTest, positionalUniformScores) {
   TestIndex testIndex;
   const std::string_view bodies[] = {"a", "a b", "b"};
   buildBodyIndex(testIndex, bodies);
@@ -189,14 +189,27 @@ TEST_F(BooleanNormalizeTest, positionalUniformScoresAndBoostPromotion) {
     EXPECT_FLOAT_EQ(0.0f, score);
   }
 
-  BoostQuery explicitOne(&exists, 1.0f);
-  EXPECT_EQ(Query::ScoreProfile::Kind::EXPLICIT_UNIFORM,
-            explicitOne.scoreProfile().kind);
-  Query* requiredExplicit[] = {&explicitOne};
-  BooleanQuery promoted(requiredExplicit, {}, {}, {});
-  for (const auto& [doc, score] : collectScores(*testIndex.reader, promoted)) {
+  // A boost is a pure multiplier: it scales the constant but does not opt a
+  // suppressed automatic uniform back into scoring; constant_score does.
+  BoostQuery boostedAuto(&exists, 3.0f);
+  EXPECT_EQ(Query::ScoreProfile::Kind::AUTO_UNIFORM,
+            boostedAuto.scoreProfile().kind);
+  EXPECT_FLOAT_EQ(3.0f, boostedAuto.scoreProfile().value);
+  Query* requiredBoosted[] = {&boostedAuto};
+  BooleanQuery stillSuppressed(requiredBoosted, {}, {}, {});
+  for (const auto& [doc, score] : collectScores(*testIndex.reader, stillSuppressed)) {
     unused(doc);
-    EXPECT_FLOAT_EQ(1.0f, score);
+    EXPECT_FLOAT_EQ(0.0f, score);
+  }
+
+  ConstantScoreQuery explicitConstant(&exists, 3.0f);
+  EXPECT_EQ(Query::ScoreProfile::Kind::EXPLICIT_UNIFORM,
+            explicitConstant.scoreProfile().kind);
+  Query* requiredExplicit[] = {&explicitConstant};
+  BooleanQuery scoredFilter(requiredExplicit, {}, {}, {});
+  for (const auto& [doc, score] : collectScores(*testIndex.reader, scoredFilter)) {
+    unused(doc);
+    EXPECT_FLOAT_EQ(3.0f, score);
   }
 
   TermQuery term("body_w", "a");

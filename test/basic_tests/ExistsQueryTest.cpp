@@ -241,8 +241,9 @@ TEST_F(ExistsQueryTest, PositionalBoostAndConstantScoreSemantics) {
   expectUniform(exprScores("body_w:*"), 2, 1.0f);
   expectUniform(exprScores("+body_w:*"), 2, 0.0f);
   expectUniform(simpleScores("+body_w:*"), 2, 0.0f);
-  expectUniform(exprScores("+body_w:*^1"), 2, 1.0f);
-  expectUniform(exprScores("+body_w:*^3"), 2, 3.0f);
+  expectUniform(exprScores("+body_w:*^1"), 2, 0.0f);
+  expectUniform(exprScores("+body_w:*^3"), 2, 0.0f);
+  expectUniform(exprScores("body_w:*^3"), 2, 3.0f);
   expectUniform(exprScores("+body_w:*^=3"), 2, 3.0f);
   expectUniform(exprScores("NOT body_w:*"), 3, 0.0f);
 

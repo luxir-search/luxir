@@ -12,36 +12,25 @@ namespace solux {
 class BoostQuery final : public Query {
   Query* child;
   float boost;
-  bool promotesAuto;
-  struct InheritedScaleTag {};
 
-  void validate() {
+public:
+  BoostQuery(Query* child, float boost) : child(child), boost(boost) {
     if (!std::isfinite(boost) || boost < 0.0f) {
       throw std::invalid_argument("query boost must be finite and non-negative");
     }
   }
 
-public:
-  // Public construction always represents a caller-written boost, including
-  // boost 1. Boolean normalization uses inherited() for a non-promoting scale.
-  BoostQuery(Query* child, float boost)
-    : child(child), boost(boost), promotesAuto(true) { validate(); }
-
-  BoostQuery(Query* child, float boost, InheritedScaleTag)
-    : child(child), boost(boost), promotesAuto(false) { validate(); }
-
-  static BoostQuery* inherited(MemPool& pool, Query* child, float boost) {
-    return pool.make<BoostQuery>(child, boost, InheritedScaleTag{});
-  }
-
   Query* getChild() const { return child; }
   float getBoost() const { return boost; }
 
+  // A boost is a pure multiplier: it scales the child's uniform value but
+  // never changes its kind, so a boosted automatic constant is still
+  // suppressed in required position. constant_score (^=) is the opt-in for
+  // a constant that scores everywhere.
   ScoreProfile scoreProfile() const override {
     ScoreProfile profile = child->scoreProfile();
     if (profile.kind == ScoreProfile::Kind::VARIABLE) return profile;
     profile.value = checkedBoostProduct(profile.value, boost);
-    if (promotesAuto) profile.kind = ScoreProfile::Kind::EXPLICIT_UNIFORM;
     return profile;
   }
 

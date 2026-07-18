@@ -245,14 +245,13 @@ Stored-only fields cannot be queried for existence.
 
 Existence is a filter-shaped query. At the root or in an optional clause it
 contributes `1`; as a required clause (`+field:*`) it contributes `0` and only
-restricts matching. An explicit boost opts it back into scoring even when it
-is required: `+field:*^1` contributes `1`, and `+field:*^3` contributes `3`.
-Use `^=N` to replace the score explicitly, for example `field:*^=2`.
+restricts matching. A boost multiplies the constant where the clause scores,
+so `+field:*^3` still contributes `0`; use `^=N` (constant_score) when a
+required clause should score, for example `+field:*^=2`.
 
 The same positional rule applies to match-all, numeric and geo ranges, prefix,
-and term-range queries: their default constant is `1`, a bare required clause
-is rank-neutral, and an explicit boost (including `^1`) makes the constant
-score in every position. Filter and prohibited clauses never score.
+and term-range queries: their default constant is `1` and a required clause
+contributes `0`. Filter and prohibited clauses never score.
 
 Prefix and fuzzy text is folded the way the field folds - `title_wl:Runn*`
 finds what "Runner" indexed - but never split into words. On unanalyzed
@@ -274,9 +273,9 @@ title_w:"dune messiah"^1.5
 status_s:active^=2
 ```
 
-`^N` multiplies every matching score by `N`. On a filter-shaped query it also
-makes the constant explicit, so the clause scores even in required position;
-this is true for `^1` as well. Boosts nest by multiplication.
+`^N` multiplies every matching score by `N`; on a required filter-shaped
+clause the suppressed constant stays `0`, so use `^=N` there instead. Boosts
+nest by multiplication.
 `^=N` is shorthand for `constant_score(..., score=N)`: it keeps the match set
 but replaces the child score. Only one score decoration is allowed on one
 clause. The value must be a literal finite non-negative number; `$variables`
@@ -288,8 +287,7 @@ accepts a numeric `boost` sibling as input sugar:
 arm itself, not the sibling sugar. Request echo and other encoding always use
 the structured wrapper form.
 
-An omitted boost means `1.0`; writing `^1` is observably different from
-omitting it on a required filter-shaped clause. A boost of `0` is legal: matching documents
+An omitted boost means `1.0`. A boost of `0` is legal: matching documents
 remain in the result set and their scores become zero. Boost has no effect in
 filter or prohibited context because those clauses are built without scores.
 Inside `constant_score`, a child boost is discarded; a boost outside

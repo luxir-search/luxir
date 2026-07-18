@@ -99,7 +99,7 @@ private:
   }
 
   static Query* scoringClause(MemPool& pool, Query* query, float boost) {
-    return boost == 1.0f ? query : BoostQuery::inherited(pool, query, boost);
+    return boost == 1.0f ? query : pool.make<BoostQuery>(query, boost);
   }
 
   static bool isPureNegative(const BooleanQuery& query) {

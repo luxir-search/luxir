@@ -189,11 +189,11 @@ TEST_F(BoostQueryTest, foldedBoundsMatchExhaustiveAcrossQueryKinds) {
   assertPrunedTopKMatchesExhaustive(
       *index.reader, autoUniformOr, "auto-uniform OR", 5, false);
 
-  BoostQuery promotedPrefix(&gammaPrefix, 3.0f);
-  std::vector<Query*> explicitUniformClauses = {&alphaOpt, &promotedPrefix};
-  BooleanQuery explicitUniformOr({}, explicitUniformClauses, {}, {});
+  BoostQuery boostedPrefix(&gammaPrefix, 3.0f);
+  std::vector<Query*> boostedUniformClauses = {&alphaOpt, &boostedPrefix};
+  BooleanQuery boostedUniformOr({}, boostedUniformClauses, {}, {});
   assertPrunedTopKMatchesExhaustive(
-      *index.reader, explicitUniformOr, "explicit-uniform OR", 5, false);
+      *index.reader, boostedUniformOr, "boosted-uniform OR", 5, false);
 }
 
 TEST_F(BoostQueryTest, flatBoundScorersReportExactBoundsAndExhaust) {
