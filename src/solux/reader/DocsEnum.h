@@ -30,10 +30,11 @@ class DocsEnum {
   int64_t posOrd = 0;         // the ordinal of the current position we are on
   int64_t posOrdStart = 0;    // the starting position ordinal for the current doc
   int64_t cumulativeTermFreq; // Synonym for posOrdEnd.  Should be equal to posOrdStart + tfreq (i.e. a docs positions are [posOrdStart,cumulativeTermFreq)
+  bool positionBatchActive = false;
 
   int32_t posBufIdx = 0; // index of the next value to read in the position buffer
   int32_t posBufEnd;     // one-past the last decoded position delta (but may be past the deltas for *this* doc
-  int32_t posBufEndDoc;  // one-past the last decoded pos delta for *this* doc
+  int32_t posBufLimit;   // one-past the last delta in the current doc or merge batch
   int32_t pos;           // current position
 
   int32_t docOrd = 0;    // the ordinal of the current document we are on for this term
@@ -116,6 +117,11 @@ public:
       assert(block + 1 < (int32_t) offsets.size());
       return offsets[(size_t) block + 1] - offsets[(size_t) block];
     }
+  };
+
+  struct PositionDocBlock {
+    std::span<const int32_t> docs;
+    std::span<const int32_t> tfreqs;
   };
 
   struct GroupBlockImpactScratch {
@@ -656,6 +662,46 @@ private:
     clearPendingPositionRepair();
   }
 
+  bool ensurePositionDeltaAvailable() {
+    if (posBufIdx < posBufLimit) {
+      return true;
+    }
+
+    int64_t leftToRead = cumulativeTermFreq - posOrd;
+    if (leftToRead <= 0) {
+      assert(posOrd == cumulativeTermFreq);
+      return false;
+    }
+
+    if (posBufEnd > posBufLimit) {
+      posBufLimit = (int32_t) std::min(
+          (int64_t) posBufEnd, (int64_t) posBufIdx + leftToRead);
+      return true;
+    }
+
+    assert(posBufLimit == posBufEnd);
+    if (posOrd <= lastBlockEncodedPosOrd(ttf)) {
+      uint32_t outSz = Postings::POSITIONS_BLOCK_SIZE;
+      auto bytesRead = IndexCodec::posCodec.decodeBlock(
+          posIS.ptr(), posIS.left(), (uint32_t*) posBuf, outSz);
+      posIS.skip(bytesRead);
+      assert(outSz == Postings::POSITIONS_BLOCK_SIZE);
+      skipCount(SkipStats::posBlocksDecoded);
+      posBufIdx = 0;
+      posBufEnd = (int32_t) outSz;
+      posBufLimit = (int32_t) std::min((int64_t) posBufEnd, leftToRead);
+    } else {
+      assert(leftToRead < Postings::POSITIONS_BLOCK_SIZE);
+      posBufIdx = 0;
+      posBufEnd = (int32_t) leftToRead;
+      posBufLimit = posBufEnd;
+      for (int32_t i = posBufIdx; i < posBufEnd; i++) {
+        posBuf[i] = (int32_t) posIS.readVint();
+      }
+    }
+    return true;
+  }
+
 public:
   /// sentinel value used for both docs and positions
   static constexpr int32_t END = std::numeric_limits<int32_t>::max();
@@ -692,9 +738,9 @@ public:
       posBufIdx = 0;
       if (hasPositions) {
         posBuf[0] = state.pulsedPos;
-        posBufEndDoc = posBufEnd = 1;
+        posBufLimit = posBufEnd = 1;
       } else {
-        posBufEndDoc = posBufEnd = 0;
+        posBufLimit = posBufEnd = 0;
       }
       cumulativeTermFreq = 0;  // this will be incremented in nextDoc()
       // std::cout << "Pulsed posting: id=" << docid << "pos=" << posBuf[0] << std::endl;
@@ -712,7 +758,7 @@ public:
 
       assert(docIS.offset() == startOfDocs);
 
-      posBufEndDoc = posBufEnd = 0; // no positions read yet
+      posBufLimit = posBufEnd = 0; // no positions read yet
       cumulativeTermFreq = 0;
       nextL0Block = 0;
       nextL0Base = 0;
@@ -828,6 +874,7 @@ private:
     // Contract: callers must not re-poll after END (see Query::Scorer).
     assert(docid != PostingsReader::END);
     assert(!docBlockResident);
+    assert(!positionBatchActive);
     blockMode = false;
     if (docBufIdx >= docBufEnd) {
       if constexpr (!DOCS_ONLY) {
@@ -1749,9 +1796,9 @@ public:
             if (posBlockStartOrd > streamOrd) {
               posIS.seek(posStartLoc + (int64_t) blockPosByteOff);
               posOrd = posBlockStartOrd;
-              // Full buffer reset (stale posBufEndDoc reads past posBuf - see
+              // Full buffer reset (a stale posBufLimit reads past posBuf - see
               // the startPositions whole-block skip note).
-              posBufIdx = posBufEnd = posBufEndDoc = 0;
+              posBufIdx = posBufEnd = posBufLimit = 0;
               skipCount(SkipStats::posSeeks);
             }
           }
@@ -2316,6 +2363,7 @@ public:
     assert(!docBlockResident);
     assert(!docsOnlyConsumed);
     assert(!scoredWordProbeActive);
+    assert(!positionBatchActive);
     assert(hasPositions);  // positions are only queried on fields that index them
     assert(trackPositions);
     materializePendingPositionRepair();
@@ -2330,7 +2378,7 @@ public:
         // our start is within current decoded block
         posBufIdx += numToSkip;
         posOrd += numToSkip;
-        posBufEndDoc = std::min(posBufIdx + tfreq, posBufEnd);
+        posBufLimit = std::min(posBufIdx + tfreq, posBufEnd);
         return;
       }
 
@@ -2352,9 +2400,9 @@ public:
         skipCount(SkipStats::posBlocksSkipped);
         // Fully reset buffer state: a skip that lands exactly on posOrdStart
         // exits the loop without another decode, and nextPosition() must then
-        // take its fresh-decode path (a stale posBufEndDoc < posBufEnd would
+        // take its fresh-decode path (a stale posBufLimit < posBufEnd would
         // send it into the still-buffered branch and read past posBuf).
-        posBufIdx = posBufEnd = posBufEndDoc = 0;
+        posBufIdx = posBufEnd = posBufLimit = 0;
         continue;
       }
 
@@ -2372,7 +2420,7 @@ public:
         }
         posOrd += numToSkip;
         assert (posOrd == posOrdStart); // nocommit, trivial
-        posBufIdx = posBufEnd = posBufEndDoc = 0;
+        posBufIdx = posBufEnd = posBufLimit = 0;
         return;
       }
 
@@ -2385,61 +2433,101 @@ public:
       skipCount(SkipStats::posBlocksDecoded);
       posBufIdx = 0;
       posBufEnd = outSz;
-      posBufEndDoc = std::min(posBufEnd, tfreq);
+      posBufLimit = std::min(posBufEnd, tfreq);
     }
+  }
+
+  // The current decoded block begins at the already-positioned doc.  The
+  // caller may inspect remaps before choosing beginPositionDeltaBatch() or the
+  // ordinary per-doc position path.  The spans remain valid until the next
+  // doc-block decode.
+  PositionDocBlock currentPositionDocBlock() {
+    assert(!docBlockResident);
+    assert(!docsOnlyConsumed);
+    assert(!scoredWordProbeActive);
+    assert(!positionBatchActive);
+    assert(hasPositions);
+    assert(hasFreqs);
+    assert(trackPositions);
+    assert(!blockMode);
+    assert(docid >= 0 && docid != PostingsReader::END);
+    int32_t start = docBufIdx - 1;
+    assert(start >= 0 && start < docBufEnd);
+    int32_t count = docBufEnd - start;
+    return {
+      std::span<const int32_t>(docBuf + start, (size_t) count),
+      std::span<const int32_t>(tfreqBuf + start, (size_t) count)
+    };
+  }
+
+  // Align once at the first current doc, then make the requested consecutive
+  // docs one position-delta run.  Document and cumulative-tf cursors land on
+  // the run's last doc before the deltas are pulled.
+  void beginPositionDeltaBatch(int32_t docCount) {
+    assert(docCount > 0);
+    assert(!positionBatchActive);
+    assert(hasPositions && hasFreqs && trackPositions);
+    assert(!blockMode);
+    int32_t start = docBufIdx - 1;
+    int32_t limit = start + docCount;
+    assert(start >= 0 && limit <= docBufEnd);
+
+    startPositions();
+    int64_t tfSum = 0;
+    for (int32_t i = start; i < limit; i++) {
+      tfSum += (uint32_t) tfreqBuf[i];
+    }
+    assert(tfSum >= docCount);
+
+    int32_t newlyCounted = docCount - 1;
+    docOrd += newlyCounted;
+    tfreqOrd += newlyCounted;
+    docBufIdx = limit;
+    tfreqBufIdx = limit;
+    docid = docBuf[limit - 1];
+    tfreq = tfreqBuf[limit - 1];
+    blockMode = true;
+
+    cumulativeTermFreq += tfSum - (uint32_t) tfreqBuf[start];
+    posOrdStart = cumulativeTermFreq - tfreq;
+    clearPendingPositionRepair();
+    posBufLimit = (int32_t) std::min(
+        (int64_t) posBufEnd, (int64_t) posBufIdx + cumulativeTermFreq - posOrd);
+    assert(cumulativeTermFreq > posOrd);
+    if (docsSize != 0 && limit == docBufEnd) {
+      assert(cumulativeTermFreq == nextL0CumTf);
+    }
+    positionBatchActive = true;
+  }
+
+  // Return at most maxCount raw deltas from the active cross-doc run.  Limiting
+  // the pull lets TextWriter split one source block at output doc-block edges.
+  std::span<const int32_t> nextPositionDeltaBatchSpan(int64_t maxCount) {
+    assert(positionBatchActive);
+    assert(maxCount > 0);
+    if (!ensurePositionDeltaAvailable()) {
+      positionBatchActive = false;
+      return {};
+    }
+    int32_t start = posBufIdx;
+    int64_t available = posBufLimit - posBufIdx;
+    int32_t count = (int32_t) std::min(available, maxCount);
+    posBufIdx += count;
+    posOrd += count;
+    assert(posOrd <= cumulativeTermFreq);
+    if (posOrd == cumulativeTermFreq) {
+      positionBatchActive = false;
+    }
+    return {posBuf + start, (size_t) count};
   }
 
   int32_t nextPosition() {
     assert(!docBlockResident);
     assert(!scoredWordProbeActive);
-    if (posBufIdx >= posBufEndDoc) {
-      // Reached the end of buffered pos deltas, either because
-      // there are no more positions for this doc, or because we need
-      // to reload more.
-
-      int leftToRead = (int)(cumulativeTermFreq - posOrd); // should never be larger than 32 bit int
-
-      if (leftToRead <= 0) {
-        assert(posOrd == cumulativeTermFreq); // should not have gone past
-        // TODO: set pos to something, or keep last valid position?
-        pos = PostingsReader::END;
-        return pos;
-      }
-
-      // we moved to a new doc, but still have positions decoded in the buffer.
-      // TODO: it feels like we should move this case to startPositions()
-      if (posBufEnd > posBufEndDoc) {
-        // just update our new end pointer
-        posBufEndDoc = std::min(posBufEnd, posBufIdx+leftToRead);
-      } else {
-        // if we have more positions to read, then there should be no more buffered
-        assert(posBufEndDoc == posBufEnd);
-
-        if (posOrd <= lastBlockEncodedPosOrd(ttf)) {
-          // read a new block of positions
-          // TODO: refactor reading a new block (not skipping) to one place?
-          uint32_t outSz = Postings::POSITIONS_BLOCK_SIZE;
-          auto bytesRead = IndexCodec::posCodec.decodeBlock(posIS.ptr(), posIS.left(), (uint32_t*)posBuf, outSz);
-          posIS.skip(bytesRead);
-          assert(outSz == Postings::POSITIONS_BLOCK_SIZE);
-          skipCount(SkipStats::posBlocksDecoded);
-          posBufIdx = 0;
-          posBufEnd = outSz;
-          // This doc may have started in the previous positions block.
-          posBufEndDoc = std::min(posBufEnd, leftToRead);
-        } else {
-          // we are in the tail
-          // we could read position-by-position at the tail if we wanted...
-          // we could also handle pulsed positions here instead if sticking them in the buffer.
-          posBufIdx = 0;
-          posBufEnd = leftToRead; // only read enough for this doc
-          posBufEndDoc = leftToRead;
-          // std::cout << "FILL pos buffer docid=" << docid << " ords=" << posOrd << " through " << posOrd+tfreq-1 << std::endl;
-          for (int i = posBufIdx; i < posBufEnd; i++) {
-            posBuf[i] = posIS.readVint();
-          }
-        }
-      }
+    assert(!positionBatchActive);
+    if (!ensurePositionDeltaAvailable()) {
+      pos = PostingsReader::END;
+      return pos;
     }
     // std::cout << "RETN pos buffer docid=" << docid << " posOrd=" << posOrd << " posBufIdx=" << posBufIdx << std::endl;
     auto delta = posBuf[posBufIdx++];
@@ -2449,6 +2537,23 @@ public:
     posOrd++;
     pos += delta;
     return pos;
+  }
+
+  // The returned run is limited to the current doc and remains valid until the
+  // next call that refills the position buffer.  An empty span ends the doc.
+  // Do not mix this with nextPosition() within one doc: this path deliberately
+  // does not reconstruct the absolute-position accumulator.
+  std::span<const int32_t> nextPositionDeltaSpan() {
+    assert(!docBlockResident);
+    assert(!scoredWordProbeActive);
+    assert(!positionBatchActive);
+    if (!ensurePositionDeltaAvailable()) {
+      return {};
+    }
+    int32_t start = posBufIdx;
+    posBufIdx = posBufLimit;
+    posOrd += posBufLimit - start;
+    return {posBuf + start, (size_t) (posBufLimit - start)};
   }
 
   int32_t advancePosition(int32_t target) {

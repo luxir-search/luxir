@@ -15,6 +15,7 @@
 #include "solux/search/IndexReader.h"
 #include "solux/util/geo.h"
 
+#include <array>
 #include <atomic>
 #include <oneapi/tbb/task_group.h>
 
@@ -600,35 +601,80 @@ private:
   // add docs (with positions, or just freqs for positionless fields) from the provided DocsEnum
   void addDocsPos(TextWriter& textWriter, DocsEnum& docsEnum, const Segment& seg) {
     bool hasPositions = docsEnum.indexHasPositions();
-    for (;;) {
-      int32_t docid = docsEnum.nextDoc();
-      if (docid == INT_MAX) break;
+    if (!hasPositions) {
+      for (;;) {
+        int32_t docid = docsEnum.nextDoc();
+        if (docid == INT_MAX) break;
 
-      // predictable branch for deleted vs not
-      int mappedDoc = seg.remap.empty() ? docid : seg.remap[docid];
-      if (mappedDoc == -1) {
-        continue; // Document is deleted
-      }
-      int32_t newDocid = seg.base + mappedDoc;
-
-      if (hasPositions) {
-        textWriter.startDoc(newDocid);
-        docsEnum.startPositions();
-        int32_t lastPos = -1;
-        for (;;) {
-          auto pos = docsEnum.nextPosition();
-          if (pos == INT_MAX) break;
-          textWriter.addPositionDelta(pos - lastPos);
-          lastPos = pos;
+        // predictable branch for deleted vs not
+        int mappedDoc = seg.remap.empty() ? docid : seg.remap[docid];
+        if (mappedDoc == -1) {
+          continue; // Document is deleted
         }
-        textWriter.endDoc(newDocid);
-      } else {
         // No positions to copy; record the doc with the source term freq directly.
         // termFreq() is 1 for DOCS-only fields, the real freq for DOCS_AND_FREQS.
-        textWriter.addDoc(newDocid, docsEnum.termFreq());
+        textWriter.addDoc(seg.base + mappedDoc, docsEnum.termFreq());
       }
+      return;
     }
 
+    std::array<int32_t, Postings::DOCS_BLOCK_SIZE> mappedDocs;
+    int32_t docid = docsEnum.nextDoc();
+    while (docid != INT_MAX) {
+      auto block = docsEnum.currentPositionDocBlock();
+      int32_t blockCount = (int32_t) block.docs.size();
+      assert(blockCount > 0);
+      assert(block.tfreqs.size() == block.docs.size());
+
+      bool allLive = true;
+      if (seg.remap.empty()) {
+        for (int32_t i = 0; i < blockCount; i++) {
+          mappedDocs[(size_t) i] = seg.base + block.docs[(size_t) i];
+        }
+      } else {
+        for (int32_t i = 0; i < blockCount; i++) {
+          int32_t sourceDoc = block.docs[(size_t) i];
+          int32_t mappedDoc = seg.remap[sourceDoc];
+          if (mappedDoc == -1) {
+            allLive = false;
+            break;
+          }
+          mappedDocs[(size_t) i] = seg.base + mappedDoc;
+        }
+      }
+
+      if (allLive) {
+        docsEnum.beginPositionDeltaBatch(blockCount);
+        textWriter.addDocsWithPositions(
+            std::span<const int32_t>(mappedDocs.data(), (size_t) blockCount),
+            block.tfreqs,
+            [&](int64_t maxCount) {
+              return docsEnum.nextPositionDeltaBatchSpan(maxCount);
+            });
+        docid = docsEnum.nextDoc();
+        continue;
+      }
+
+      // A block containing any delete retains the doc-scoped path so skipped
+      // tfs continue through the existing deferred position repair.
+      for (int32_t i = 0; i < blockCount; i++) {
+        assert(docid == block.docs[(size_t) i]);
+        int32_t mappedDoc = seg.remap[docid];
+        if (mappedDoc != -1) {
+          int32_t newDocid = seg.base + mappedDoc;
+          int32_t tf = docsEnum.termFreq();
+          textWriter.startDoc(newDocid);
+          docsEnum.startPositions();
+          for (;;) {
+            auto deltas = docsEnum.nextPositionDeltaSpan();
+            if (deltas.empty()) break;
+            textWriter.appendPositionDeltas(deltas);
+          }
+          textWriter.endDoc(newDocid, tf);
+        }
+        docid = docsEnum.nextDoc();
+      }
+    }
   }
 
   // add docs and ordinals from the provided DocsEnum (for string column, record ord in docToOrd for each doc, to be written later)

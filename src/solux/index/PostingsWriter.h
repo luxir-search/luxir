@@ -510,6 +510,24 @@ class TextWriter {
   std::vector<char> termImpactRun;  // per-term encoded frontiers for the current term block
 
 private:  // some internal utility methods... not for use by indexers
+  void anchorPositionedDocBlock() {
+    if (hasPositions && docs.empty()) {
+      pendingBlockPosByteOff = posOutput.size();
+    }
+  }
+
+  void appendPositionDeltasRaw(std::span<const int32_t> deltas) {
+    while (!deltas.empty()) {
+      size_t count = std::min(
+          deltas.size(), Postings::POSITIONS_BLOCK_SIZE - posdeltas.size());
+      posdeltas.insert(posdeltas.end(), deltas.begin(), deltas.begin() + count);
+      deltas = deltas.subspan(count);
+      if (posdeltas.size() == Postings::POSITIONS_BLOCK_SIZE) {
+        flushPositions();
+      }
+    }
+  }
+
   static void appendVint(std::vector<char>& out, uint32_t val) {
     while (val > 0x7f) {
       out.push_back((char) (val | 0x80));
@@ -1508,9 +1526,7 @@ public:
     // This doc starts a new doc block: anchor the block to the position stream
     // before any of the doc's positions are added.  (All positioned paths -
     // Inverter's pushDocs and the merger's addDocsPos - route through here.)
-    if (hasPositions && docs.empty()) {
-      pendingBlockPosByteOff = posOutput.size();
-    }
+    anchorPositionedDocBlock();
   }
 
   // Record a doc with a known term freq and no positions.  Positionless fields (string/id,
@@ -1536,6 +1552,11 @@ public:
     addDoc(doc, curTf);
   }
 
+  void endDoc(int32_t doc, int32_t expectedTf) {
+    assert(curTf == expectedTf);
+    endDoc(doc);
+  }
+
   // Register one occurrence of the term in the current doc that carries a position.
   // The position is only stored when the field indexes positions; either way it
   // contributes to the term freq.
@@ -1546,6 +1567,53 @@ public:
       if (posdeltas.size() == Postings::POSITIONS_BLOCK_SIZE) {
         flushPositions();
       }
+    }
+  }
+
+  void appendPositionDeltas(std::span<const int32_t> deltas) {
+    assert(hasPositions);
+    curTf += (int32_t) deltas.size();
+    appendPositionDeltasRaw(deltas);
+  }
+
+  // Copy positioned docs in source order while retaining ownership of output
+  // doc-block anchors.  DeltaPull accepts a maximum count and may return
+  // multiple spans before satisfying each output chunk's tf sum.
+  template <typename DeltaPull>
+  void addDocsWithPositions(std::span<const int32_t> docids,
+                            std::span<const int32_t> tfValues,
+                            DeltaPull&& deltaPull) {
+    assert(hasPositions);
+    assert(docids.size() == tfValues.size());
+    size_t offset = 0;
+    while (offset < docids.size()) {
+      int32_t room = Postings::DOCS_BLOCK_SIZE - (int32_t) docs.size();
+      int32_t count = std::min(room, (int32_t) (docids.size() - offset));
+      assert(count > 0);
+
+      anchorPositionedDocBlock();
+      int64_t expectedDeltas = 0;
+      for (int32_t i = 0; i < count; i++) {
+        int32_t tf = tfValues[offset + (size_t) i];
+        assert(tf > 0);
+        expectedDeltas += (uint32_t) tf;
+      }
+
+      int64_t appendedDeltas = 0;
+      while (appendedDeltas < expectedDeltas) {
+        auto deltas = deltaPull(expectedDeltas - appendedDeltas);
+        assert(!deltas.empty());
+        assert((int64_t) deltas.size() <= expectedDeltas - appendedDeltas);
+        appendPositionDeltasRaw(deltas);
+        appendedDeltas += (int64_t) deltas.size();
+      }
+      assert(appendedDeltas == expectedDeltas);
+
+      for (int32_t i = 0; i < count; i++) {
+        size_t index = offset + (size_t) i;
+        addDoc(docids[index], tfValues[index]);
+      }
+      offset += (size_t) count;
     }
   }
 
