@@ -147,6 +147,10 @@ public:
     view.response_format = f;
     return *this;
   }
+  LocalReq& profile(bool enabled = true) {
+    view.profile = enabled;
+    return *this;
+  }
   LocalReq& requestId(std::string_view id) {
     view.request_id = build::arenaStr(mr, id);
     return *this;

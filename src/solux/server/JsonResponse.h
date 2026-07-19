@@ -13,7 +13,8 @@ namespace solux {
 // Shape:
 //   {"found": <count>, "docs": [ {<field>: <val>, ...}, ... ],
 //    "ops": {<name>: <row-shaped value>, ...},
-//    "warnings": [ {"code": ..., "message": ...}, ... ], "more": true}
+//    "warnings": [ {"code": ..., "message": ...}, ... ],
+//    "profile": {"ops": [...]}, "more": true}
 // Optional keys are omitted when absent. The first DocList is promoted to
 // found/docs; all remaining response ops stay under ops in response order.
 // On engine error:

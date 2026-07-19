@@ -326,6 +326,54 @@ void appendWarnings(std::string& out, std::span<const solux::api::Warning> warni
   out += ']';
 }
 
+void appendExecutionProfile(std::string& out, const solux::api::ExecutionProfile& profile) {
+  out += R"({"ops":[)";
+  for (size_t opIndex = 0; opIndex < profile.ops.size(); opIndex++) {
+    if (opIndex) out += ',';
+    const auto& op = profile.ops[opIndex];
+    out += R"({"name":)";
+    appendJsonString(out, op.name);
+    out += R"(,"pieces":[)";
+    for (size_t pieceIndex = 0; pieceIndex < op.pieces.size(); pieceIndex++) {
+      if (pieceIndex) out += ',';
+      const auto& piece = op.pieces[pieceIndex];
+      out += R"({"kind":)";
+      appendJsonString(out, piece.kind);
+      out += R"(,"segment":)";
+      appendInt(out, piece.segment);
+      out += R"(,"max_doc":)";
+      appendInt(out, piece.max_doc);
+      if (!piece.strategy.empty()) {
+        out += R"(,"strategy":)";
+        appendJsonString(out, piece.strategy);
+      }
+      if (piece.cardinality.has_value()) {
+        out += R"(,"cardinality":)";
+        appendInt(out, *piece.cardinality);
+      }
+      if (piece.domain_size.has_value()) {
+        out += R"(,"domain_size":)";
+        appendInt(out, *piece.domain_size);
+      }
+      out += R"(,"thread_id":)";
+      appendInt(out, piece.thread_id);
+      out += R"(,"elapsed_us":)";
+      appendInt(out, (int64_t)piece.elapsed_us);
+      if (!piece.details.empty()) {
+        out += R"(,"details":[)";
+        for (std::size_t d = 0; d < piece.details.size(); d++) {
+          if (d) out += ',';
+          appendJsonString(out, piece.details[d]);
+        }
+        out += ']';
+      }
+      out += '}';
+    }
+    out += "]}";
+  }
+  out += "]}";
+}
+
 void appendDocList(std::string& out, const solux::api::DocList& docs) {
   out += '{';
   if (docs.found.has_value()) {
@@ -495,6 +543,10 @@ std::string renderSearchResponseLine(const solux::api::SearchResponse& resp) {
     // declared degradations (the request was served, but not exactly as written)
     appendKey("warnings");
     appendWarnings(out, resp.warnings);
+  }
+  if (resp.profile.has_value()) {
+    appendKey("profile");
+    appendExecutionProfile(out, *resp.profile);
   }
   if (resp.more) {
     appendKey("more");

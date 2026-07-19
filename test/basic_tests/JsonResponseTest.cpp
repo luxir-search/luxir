@@ -131,6 +131,30 @@ TEST_F(JsonResponseTest, stringFacetRowsAndOptionalMetadata) {
       renderSearchResponseLine(req->responses[0]->proto));
 }
 
+TEST_F(JsonResponseTest, executionProfileShape) {
+  solux::api::ExecutionProfilePiece piece;
+  piece.kind = "segment";
+  piece.segment = 2;
+  piece.max_doc = 11;
+  piece.strategy = "hash";
+  std::array<std::string_view, 2> details = {"all-docs domain, bulk column scan",
+                                             "want=hash, found=skinny"};
+  piece.details = details;
+  piece.cardinality = 64;
+  piece.domain_size = 1;
+  piece.thread_id = 123;
+  piece.elapsed_us = 7;
+  solux::api::ExecutionProfileOp op;
+  op.name = "cats";
+  op.pieces = {&piece, 1};
+  solux::api::SearchResponse resp;
+  resp.profile.emplace().ops = {&op, 1};
+
+  EXPECT_EQ(
+      R"({"profile":{"ops":[{"name":"cats","pieces":[{"kind":"segment","segment":2,"max_doc":11,"strategy":"hash","cardinality":64,"domain_size":1,"thread_id":123,"elapsed_us":7,"details":["all-docs domain, bulk column scan","want=hash, found=skinny"]}]}]}})" "\n",
+      renderSearchResponseLine(resp));
+}
+
 TEST_F(JsonResponseTest, integerFacetPreservesZeroBucketId) {
   CollectionHelper helper;
   helper.indexAll(std::array{

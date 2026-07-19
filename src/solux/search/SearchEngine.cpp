@@ -47,6 +47,10 @@ void SearchEngine::submitBody(SearchRequest& req) {
     req.lastResponse->proto.error = solux::api::build::arenaStr(req.lastResponse->mr, e.what());
   }
 
+  // Profile slots are written only by segment tasks. Materialize the shared
+  // wire view after those tasks have drained (including the error path above).
+  req.fillExecutionProfile(*req.lastResponse);
+
   // Declared degradations ride on the final response (streaming responses
   // with more=true do not carry them).
   if (!req.warnings.empty()) {

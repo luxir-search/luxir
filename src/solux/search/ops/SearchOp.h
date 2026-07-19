@@ -1,5 +1,9 @@
 #pragma once
 
+#include <chrono>
+#include <sys/syscall.h>
+#include <unistd.h>
+
 #include "solux/search/SearchRequest.h"
 
 
@@ -43,6 +47,7 @@ public:
   std::string_view name;
   SearchOp* parent = nullptr;  // set by parser after construction.
   boost::unordered_flat_map<std::string_view, SearchOp*> subOps;  // set by parser after construction.
+  ExecutionProfileOpState* executionProfile = nullptr;
 
   // We can't pass both the parent and children to constructors (and have them fully formed)
   // one has to come before the other.  The parser currently sets subOps and parent
@@ -68,6 +73,16 @@ public:
 
   virtual ~SearchOp() = default;
 
+  // Opt an operation into request profiling. Other operations can adopt this
+  // hook independently without changing request dispatch or response assembly.
+  void enableExecutionProfile() {
+    executionProfile = req.addExecutionProfileOp(name);
+  }
+
+  ExecutionProfileRun* addExecutionProfileRun() {
+    return req.addExecutionProfileRun(executionProfile);
+  }
+
   class Calculator {
   protected:
     SearchOp& op;
@@ -77,7 +92,41 @@ public:
 
 
   public:
+    class ExecutionProfileScope {
+      ExecutionProfilePieceState* state;
+      std::chrono::steady_clock::time_point started;
+
+    public:
+      ExecutionProfileScope(ExecutionProfilePieceState* state, int32_t segnum) : state(state) {
+        if (state == nullptr) return;
+        state->wire.kind = "segment";
+        state->wire.segment = segnum;
+        state->wire.thread_id = (int64_t)::syscall(SYS_gettid);
+        started = std::chrono::steady_clock::now();
+      }
+      ExecutionProfileScope(const ExecutionProfileScope&) = delete;
+      ExecutionProfileScope& operator=(const ExecutionProfileScope&) = delete;
+      ~ExecutionProfileScope() {
+        if (state == nullptr) return;
+        state->wire.elapsed_us = (uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - started).count();
+        state->complete = true;
+      }
+
+      // Hand ops the full piece state: typed wire fields plus the owned
+      // detail string for composed human-readable text.
+      ExecutionProfilePieceState* get() {
+        return state;
+      }
+    };
+
     Calculator(SearchOp& op, Calculator* parent, int64_t slot, int64_t numSlots) : op(op), parent(parent), slot(slot), numSlots(numSlots) {}
+
+    ExecutionProfileScope profilePiece(ExecutionProfileRun* run, int32_t segnum) {
+      ExecutionProfilePieceState* state =
+          run == nullptr || segnum < 0 ? nullptr : &run->pieces[(size_t)segnum];
+      return ExecutionProfileScope(state, segnum);
+    }
 
     // --- Result assembly: getTarget() / getTargetForSub() ---
     // (1) BUBBLE-TO-ROOT slot resolution. A sub-op asks its PARENT for its spot

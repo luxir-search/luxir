@@ -102,6 +102,7 @@ struct Fusion; struct RrfFusion; struct SortSpec; struct Query;
 struct ExistsQuery; struct ConstantScoreQuery; struct BoostQuery; struct KnnQuery; struct Match; struct NamedQuery; struct BooleanQuery;
 struct PrefixQuery; struct FuzzyQuery; struct PhraseQuery; struct SimpleQuery; struct RangeQuery;
 struct GeoBoxQuery; struct GeoDistanceQuery; struct ExprQuery; struct Warning;
+struct ExecutionProfile; struct ExecutionProfileOp; struct ExecutionProfilePiece;
 struct FieldFacet; struct CalendarGap; struct RangeFacet;
 struct Domain; struct SearchResponse; struct DocList; struct FacetResult; struct Bucket;
 struct CommitParams; struct UpdateRequest; struct UpdateResponse; struct NamedValue; struct Map;
@@ -340,6 +341,7 @@ struct SearchRequest {                                          // needs Target
   uint64_t freshness_us = 0;
   std::string_view time_zone;
   ResponseFormat response_format = ResponseFormat::ENVELOPE;
+  bool profile = false;
 };
 struct Map { map_view<std::string_view, ::hpp_proto::indirect_view<Val>> fields; };
 struct Bucket {
@@ -399,11 +401,28 @@ struct SearchOp {                                               // needs TopDocs
   std::variant<std::monostate, TopDocs, Fusion, FieldFacet, RangeFacet, GenOp> kind;
 };
 struct Warning { std::string_view code; std::string_view message; };
+struct ExecutionProfilePiece {
+  std::string_view kind;
+  std::string_view strategy;
+  std::span<const std::string_view> details;
+  std::optional<std::int64_t> cardinality;
+  std::optional<std::int64_t> domain_size;
+  std::int64_t thread_id = 0;
+  std::uint64_t elapsed_us = 0;
+  std::int32_t segment = 0;
+  std::int32_t max_doc = 0;
+};
+struct ExecutionProfileOp {
+  std::string_view name;
+  std::span<const ExecutionProfilePiece> pieces;
+};
+struct ExecutionProfile { std::span<const ExecutionProfileOp> ops; };
 struct SearchResponse {
   std::string_view request_id;
   map_view<std::string_view, ::hpp_proto::indirect_view<Val>> ops;
   std::string_view error;
   std::span<const Warning> warnings;
+  std::optional<ExecutionProfile> profile;
   bool more = false;
 };
 struct NamedValue { std::string_view name; ::hpp_proto::optional_indirect_view<Val> val; };
@@ -484,7 +503,8 @@ SOLUX_TD(ExistsQuery)
 SOLUX_TD(ConstantScoreQuery) SOLUX_TD(BoostQuery) SOLUX_TD(KnnQuery) SOLUX_TD(Match) SOLUX_TD(NamedQuery) SOLUX_TD(BooleanQuery)
 SOLUX_TD(PrefixQuery) SOLUX_TD(FuzzyQuery) SOLUX_TD(PhraseQuery) SOLUX_TD(SimpleQuery) SOLUX_TD(RangeQuery)
 SOLUX_TD(GeoBoxQuery) SOLUX_TD(GeoDistanceQuery) SOLUX_TD(ExprQuery)
-SOLUX_TD(Warning) SOLUX_TD(FieldFacet) SOLUX_TD(CalendarGap) SOLUX_TD(RangeFacet)
+SOLUX_TD(Warning) SOLUX_TD(ExecutionProfile) SOLUX_TD(ExecutionProfileOp)
+SOLUX_TD(ExecutionProfilePiece) SOLUX_TD(FieldFacet) SOLUX_TD(CalendarGap) SOLUX_TD(RangeFacet)
 SOLUX_TD(Domain) SOLUX_TD(SearchResponse) SOLUX_TD(DocList) SOLUX_TD(FacetResult) SOLUX_TD(Bucket)
 SOLUX_TD(CommitParams) SOLUX_TD(UpdateRequest) SOLUX_TD(UpdateResponse) SOLUX_TD(NamedValue) SOLUX_TD(Map)
 SOLUX_TD(Val) SOLUX_TD(ArrVal) SOLUX_TD(ArrStr) SOLUX_TD(ArrInt) SOLUX_TD(ArrFloat)
@@ -511,7 +531,8 @@ SOLUX_ENTRY(Query) SOLUX_ENTRY(ExistsQuery) SOLUX_ENTRY(ConstantScoreQuery) SOLU
 SOLUX_ENTRY(KnnQuery) SOLUX_ENTRY(Match) SOLUX_ENTRY(NamedQuery) SOLUX_ENTRY(BooleanQuery)
 SOLUX_ENTRY(PrefixQuery) SOLUX_ENTRY(FuzzyQuery) SOLUX_ENTRY(PhraseQuery) SOLUX_ENTRY(SimpleQuery)
 SOLUX_ENTRY(RangeQuery) SOLUX_ENTRY(GeoBoxQuery) SOLUX_ENTRY(GeoDistanceQuery) SOLUX_ENTRY(ExprQuery)
-SOLUX_ENTRY(Warning) SOLUX_ENTRY(FieldFacet)
+SOLUX_ENTRY(Warning) SOLUX_ENTRY(ExecutionProfile) SOLUX_ENTRY(ExecutionProfileOp)
+SOLUX_ENTRY(ExecutionProfilePiece) SOLUX_ENTRY(FieldFacet)
 SOLUX_ENTRY(CalendarGap) SOLUX_ENTRY(RangeFacet) SOLUX_ENTRY(Domain) SOLUX_ENTRY(SearchResponse) SOLUX_ENTRY(DocList)
 SOLUX_ENTRY(FacetResult) SOLUX_ENTRY(Bucket) SOLUX_ENTRY(CommitParams) SOLUX_ENTRY(UpdateRequest)
 SOLUX_ENTRY(UpdateResponse) SOLUX_ENTRY(NamedValue) SOLUX_ENTRY(Map)

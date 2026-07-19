@@ -41,6 +41,32 @@ using RespProto = solux::api::SearchResponse;
 // Short alias for the response build-by-backing helpers (solux/api/build.h).
 namespace build = solux::api::build;
 
+// Runtime backing for request profiling. Each calculator owns one run with a
+// fixed slot per segment; the response wire objects are built only after all
+// segment work has drained.
+struct ExecutionProfilePieceState {
+  solux::api::ExecutionProfilePiece wire;
+  // Human-readable execution notes, one clause per entry; profiling is off
+  // the hot path by definition, so ops just push composed strings here and
+  // fillExecutionProfile builds the wire span over them.
+  std::vector<std::string> details;
+  bool complete = false;
+};
+
+struct ExecutionProfileRun {
+  std::vector<ExecutionProfilePieceState> pieces;
+
+  explicit ExecutionProfileRun(std::size_t numPieces) : pieces(numPieces) {}
+};
+
+struct ExecutionProfileOpState {
+  std::string_view name;
+  std::mutex mutex;
+  std::vector<std::unique_ptr<ExecutionProfileRun>> runs;
+
+  explicit ExecutionProfileOpState(std::string_view name) : name(name) {}
+};
+
 // The top-level request for the SearchEngine.
 class SearchRequest {
   friend class SearchEngine;
@@ -69,6 +95,9 @@ public:
   // copied onto the FINAL response's SearchResponse.warnings.  Message views
   // point into requestPool, which outlives response serialization.
   std::vector<api::Warning> warnings;
+  // Empty, with no backing allocation, unless an instrumented op observes
+  // proto.profile=true during parsing.
+  std::vector<std::unique_ptr<ExecutionProfileOpState>> executionProfileOps;
 
   // Transport default for DocList field placement when an op leaves
   // document_format at DEFAULT: gRPC serves COLUMNS; the HTTP/JSON layer sets
@@ -89,6 +118,25 @@ public:
   }
 
   virtual ~SearchRequest() = default;
+
+  ExecutionProfileOpState* addExecutionProfileOp(std::string_view name) {
+    if (!proto.profile) return nullptr;
+    auto state = std::make_unique<ExecutionProfileOpState>(name);
+    auto* result = state.get();
+    executionProfileOps.push_back(std::move(state));
+    return result;
+  }
+
+  ExecutionProfileRun* addExecutionProfileRun(ExecutionProfileOpState* opState) {
+    if (opState == nullptr) return nullptr;
+    auto run = std::make_unique<ExecutionProfileRun>(reader->segments().size());
+    auto* result = run.get();
+    std::lock_guard<std::mutex> lock(opState->mutex);
+    opState->runs.push_back(std::move(run));
+    return result;
+  }
+
+  void fillExecutionProfile(SearchResponse& response);
 
   /// Flow-control advice returned by reply().  The response is always accepted
   /// (or dropped, for CANCEL); the status only tells a streaming producer what
@@ -228,5 +276,41 @@ inline void SearchRequest::replyCallback(SearchResponse& response) {
     done();
   }
 };
+
+inline void SearchRequest::fillExecutionProfile(SearchResponse& response) {
+  if (!proto.profile) return;
+
+  auto& profile = response.proto.profile.emplace();
+  auto* outOps = build::allocArray(profile.ops, executionProfileOps.size(), response.mr);
+  for (std::size_t opIndex = 0; opIndex < executionProfileOps.size(); opIndex++) {
+    auto& state = *executionProfileOps[opIndex];
+    auto& outOp = outOps[opIndex];
+    outOp.name = state.name;
+
+    std::lock_guard<std::mutex> lock(state.mutex);
+    std::size_t numPieces = 0;
+    for (const auto& run : state.runs) {
+      for (const auto& piece : run->pieces) numPieces += piece.complete;
+    }
+    auto* outPieces = build::allocArray(outOp.pieces, numPieces, response.mr);
+    std::size_t pieceIndex = 0;
+    for (const auto& run : state.runs) {
+      for (const auto& piece : run->pieces) {
+        if (!piece.complete) continue;
+        outPieces[pieceIndex] = piece.wire;
+        if (!piece.details.empty()) {
+          // Views into request-owned strings: the piece state outlives
+          // response serialization (same lifetime rule as warnings).
+          auto* views = build::allocArray(outPieces[pieceIndex].details,
+                                          piece.details.size(), response.mr);
+          for (std::size_t d = 0; d < piece.details.size(); d++) {
+            views[d] = piece.details[d];
+          }
+        }
+        pieceIndex++;
+      }
+    }
+  }
+}
 
 }

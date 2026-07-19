@@ -10,6 +10,16 @@
 
 namespace solux {
 
+// How the domain will be walked, for the piece's human-readable detail.
+// Must mirror forEachIntColValue's dispatch (DomainIter.h): ARRAY domains
+// big-skip with the SparseIterator; bitset/null domains dense-scan with the
+// block-decoding bulk iterator.
+inline const char* domainDesc(DocSet* domain) {
+  return domain == nullptr ? "all-docs domain, bulk column scan"
+      : domain->type == DocSet::Type::ARRAY ? "array domain, sparse column skips"
+                                            : "bitset domain, bulk column scan";
+}
+
 //
 // expected vals = domain cardinality * field sparseness
 //   field sparseness = number of docs with the field / maxdoc of the segment
@@ -146,8 +156,9 @@ public:
     // merge; otherwise keep whatever data already holds (never downgrade), and
     // build fresh from monostate.  The driver owns `data` across the merge, so
     // releaseCount is never touched; merge equalizes missing_num so data's is
-    // already correct.  Exposed for direct unit testing of the upgrade.
-    static void ensureRep(MergeableStrData& data, Rep rep, int64_t globVals) {
+    // already correct. Returns whether storage was upgraded. Exposed for
+    // direct unit testing of the upgrade.
+    static bool ensureRep(MergeableStrData& data, Rep rep, int64_t globVals) {
       bool isMap = std::holds_alternative<OrdHash>(data.counts);
       bool isSkinny = std::holds_alternative<SkinnyCounter8>(data.counts);
       bool needUpgrade = (rep == Rep::Vector && (isMap || isSkinny))
@@ -192,6 +203,7 @@ public:
           data.counts = std::move(result->counts);
         }
       }
+      return needUpgrade;
     }
   };
 
@@ -229,15 +241,19 @@ public:
     std::string_view facetName, int64_t limit, int64_t minCount, bool missing,
     std::shared_ptr<OrdMap> ordMap) :
   FieldFacetReq(req, fieldFacet, fieldName, facetName, limit, minCount, missing),
-  ordMap(std::move(ordMap)) {}
+  ordMap(std::move(ordMap)) {
+    enableExecutionProfile();
+  }
 
   class Calc : public Calculator {
+    ExecutionProfileRun* profileRun;
     std::vector<DocSet*> input;
     SegmentMergeDriver<MergeableStrData> driver;
     SegmentMergeDriver<MergeableStrFacetInline> inlineDriver;
   public:
     Calc(SearchOp& op, Calculator* parent, int64_t slot, int64_t numSlots)
       : Calculator(op, parent, slot, numSlots),
+        profileRun(op.addExecutionProfileRun()),
         driver(op.req.reader->segments().size(),
                [this](std::unique_ptr<MergeableStrData> m){ facetResult(std::move(m)); }),
         inlineDriver(op.req.reader->segments().size(),
@@ -285,16 +301,27 @@ public:
         return;
       }
 
+      if (profileRun != nullptr) {
+        auto profile = profilePiece(profileRun, segnum);
+        if (!thisOp().inlineSubOps.empty()) {
+          calc2(segnum, domain, profile.get());
+        } else {
+          calcOrdMap(segnum, domain, profile.get());
+        }
+        return;
+      }
+
       if (!thisOp().inlineSubOps.empty()) {
-        calc2(segnum, domain);
+        calc2(segnum, domain, nullptr);
         return;
       } else {
-        calcOrdMap(segnum, domain);
+        calcOrdMap(segnum, domain, nullptr);
         return;
       }
     };
 
-    void calc2(int32_t segnum, DocSet* domain) {
+    void calc2(int32_t segnum, DocSet* domain,
+               ExecutionProfilePieceState* profile) {
       inlineDriver.contribute([&](MergeableStrFacetInline& data) {
         for (auto* calc : data.inlineCalcs) {
           calc->startSeg(segnum);
@@ -302,6 +329,13 @@ public:
         input[segnum] = domain;
         SegFieldInfo segFieldInfo;
         PostingsReader& postingsReader = thisOp().reader.segments()[segnum].postingsReader();
+        int32_t maxDoc = postingsReader.maxDoc();
+        if (profile != nullptr) {
+          profile->wire.max_doc = maxDoc;
+          profile->wire.domain_size = domain ? domain->card() : maxDoc;
+          profile->wire.strategy = "inline";
+          profile->details.emplace_back(domainDesc(domain));
+        }
         auto poolGuard = MemPool::threadLocalPoolGuard();
 
         FieldReader fieldReader(poolGuard.pool(), postingsReader);
@@ -310,6 +344,11 @@ public:
         if (found) {
           fieldReader.readFieldInfo(segFieldInfo);
           tenum.emplace(poolGuard.pool(), postingsReader, segFieldInfo);
+        }
+        if (profile != nullptr) {
+          profile->wire.cardinality = found
+              ? (thisOp().ordMap ? thisOp().ordMap->numOrds() : segFieldInfo.nTerms)
+              : 0;
         }
         int64_t missing_num = 0;
         auto& facetReq = (FacetReq&)getOp();
@@ -324,23 +363,33 @@ public:
       });
     }
 
-    void calcOrdMap(int32_t segnum, DocSet* domain) {
+    void calcOrdMap(int32_t segnum, DocSet* domain,
+                    ExecutionProfilePieceState* profile) {
       driver.contribute([&](MergeableStrData& data) {
         //write only to different slots, so no need to synchronize
         input[segnum] = domain;
         SegFieldInfo segFieldInfo;
         auto& postingsReader = thisOp().reader.segments()[segnum].postingsReader();
         int32_t maxDoc = postingsReader.maxDoc();
+        int32_t domainSize = domain ? domain->card() : maxDoc;
+        if (profile != nullptr) {
+          profile->wire.max_doc = maxDoc;
+          profile->wire.domain_size = domainSize;
+        }
         auto poolGuard = MemPool::threadLocalPoolGuard();
         FieldReader fieldReader(poolGuard.pool(), postingsReader);
         bool found = fieldReader.seek(thisOp().fieldName);
         if (!found) {
-          data.missing_num += domain ? domain->card() : maxDoc;
+          data.missing_num += domainSize;
+          if (profile != nullptr) {
+            profile->wire.cardinality = 0;
+            profile->wire.strategy = "none";
+            profile->details.emplace_back("field not present in segment");
+          }
           return; // field not found, but still a contribution (driver releases)
         }
         fieldReader.readFieldInfo(segFieldInfo);
 
-        int32_t domainSize = domain ? domain->card() : maxDoc;
         int64_t globVals = thisOp().ordMap ? thisOp().ordMap->numOrds() : segFieldInfo.nTerms;
 
         // want a vector of global ords if the domain size is much larger than the number of unique values
@@ -357,10 +406,26 @@ public:
         MergeableStrData::Rep rep = wantVec ? MergeableStrData::Rep::Vector
                                   : wantHash ? MergeableStrData::Rep::Hash
                                              : MergeableStrData::Rep::Skinny;
-        MergeableStrData::ensureRep(data, rep, globVals);
+        bool repUpgraded = MergeableStrData::ensureRep(data, rep, globVals);
         auto* countVec = std::get_if<MergeableStrData::CountVector>(&data.counts);
         auto* countMap = std::get_if<MergeableStrData::OrdHash>(&data.counts);
         auto* countSkinny = std::get_if<SkinnyCounter8>(&data.counts);
+        if (profile != nullptr) {
+          const char* want = rep == MergeableStrData::Rep::Vector ? "vector"
+                           : rep == MergeableStrData::Rep::Hash ? "hash"
+                                                                : "skinny";
+          const char* using_ = countVec ? "vector" : countMap ? "hash" : "skinny";
+          profile->wire.cardinality = globVals;
+          profile->wire.strategy = want;
+          profile->details.emplace_back(domainDesc(domain));
+          if (repUpgraded) {
+            // This piece grew the shared accumulator (and paid the fold).
+            profile->details.emplace_back(std::string("upgraded shared counters to ") + using_);
+          } else if (want != std::string_view(using_)) {
+            // Accumulator already outgrew our pick (no-downgrade rule).
+            profile->details.emplace_back(std::string("want=") + want + ", found=" + using_);
+          }
+        }
 
         int64_t missing_num = 0;
         auto& facetReq = (FacetReq&)getOp();
