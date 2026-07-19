@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <immintrin.h>
 
 #include "solux/reader/Postings.h"
 
@@ -114,6 +115,74 @@ public:
 // width maxb-b, NOT bestb (which mutates as the search finds a better base).
 void getBestBFromData(const uint32_t* in, uint8_t& bestb, uint8_t& bestcexcept, uint8_t& maxb) {
   constexpr uint32_t overheadofeachexcept = 8;
+#if defined(__AVX2__)
+  __m256i widths[4];
+  const __m256i zero = _mm256_setzero_si256();
+  const __m256i one = _mm256_set1_epi32(1);
+  const __m256i signBit = _mm256_set1_epi32((int32_t) 0x80000000u);
+  const __m256i maxWidth = _mm256_set1_epi32(32);
+  const __m256i exponentMask = _mm256_set1_epi32(0xff);
+  const __m256i exponentBias = _mm256_set1_epi32(127);
+
+  for (uint32_t block = 0; block < 4; block++) {
+    __m256i width32[4];
+    for (uint32_t row = 0; row < 4; row++) {
+      __m256i values = _mm256_loadu_si256(
+          (const __m256i*) (in + block * 32 + row * 8));
+      __m256i highBit = _mm256_cmpgt_epi32(zero, values);
+      __m256 converted = _mm256_cvtepi32_ps(values);
+      __m256i exponent = _mm256_sub_epi32(
+          _mm256_and_si256(
+              _mm256_srli_epi32(_mm256_castps_si256(converted), 23), exponentMask),
+          exponentBias);
+      __m256i width = _mm256_add_epi32(exponent, one);
+
+      // Integer-to-float conversion can round 2^k-1 up to 2^k. Correct that
+      // edge against the original unsigned value before narrowing the widths.
+      __m256i boundary = _mm256_sllv_epi32(one, exponent);
+      __m256i roundedUp = _mm256_cmpgt_epi32(
+          _mm256_xor_si256(boundary, signBit),
+          _mm256_xor_si256(values, signBit));
+      width = _mm256_add_epi32(width, roundedUp);
+      width = _mm256_min_epi32(width, maxWidth);
+      width = _mm256_andnot_si256(_mm256_cmpeq_epi32(values, zero), width);
+      width32[row] = _mm256_blendv_epi8(width, maxWidth, highBit);
+    }
+    widths[block] = _mm256_packus_epi16(
+        _mm256_packus_epi32(width32[0], width32[1]),
+        _mm256_packus_epi32(width32[2], width32[3]));
+  }
+
+  __m256i blockMax = _mm256_max_epu8(
+      _mm256_max_epu8(widths[0], widths[1]),
+      _mm256_max_epu8(widths[2], widths[3]));
+  __m128i widthMax = _mm_max_epu8(
+      _mm256_castsi256_si128(blockMax), _mm256_extracti128_si256(blockMax, 1));
+  widthMax = _mm_max_epu8(widthMax, _mm_srli_si128(widthMax, 8));
+  widthMax = _mm_max_epu8(widthMax, _mm_srli_si128(widthMax, 4));
+  widthMax = _mm_max_epu8(widthMax, _mm_srli_si128(widthMax, 2));
+  widthMax = _mm_max_epu8(widthMax, _mm_srli_si128(widthMax, 1));
+  bestb = (uint8_t) _mm_cvtsi128_si32(widthMax);
+  maxb = bestb;
+  uint32_t bestcost = bestb * BLOCK_SIZE;
+  bestcexcept = 0;
+  for (uint32_t b = bestb - 1; b < 32; --b) {
+    __m256i threshold = _mm256_set1_epi8((char) b);
+    uint32_t cexcept = 0;
+    for (uint32_t block = 0; block < 4; block++) {
+      cexcept += std::popcount((uint32_t) _mm256_movemask_epi8(
+          _mm256_cmpgt_epi8(widths[block], threshold)));
+    }
+    uint32_t thiscost = cexcept * overheadofeachexcept
+        + cexcept * (maxb - b) + b * BLOCK_SIZE + 8;
+    if (maxb - b == 1) thiscost -= cexcept;
+    if (thiscost < bestcost) {
+      bestcost = thiscost;
+      bestb = (uint8_t) b;
+      bestcexcept = (uint8_t) cexcept;
+    }
+  }
+#else
   uint32_t freqs[33];
   for (uint32_t k = 0; k <= 32; ++k) freqs[k] = 0;
   for (uint32_t k = 0; k < BLOCK_SIZE; ++k) freqs[FastPForLib::gccbits(in[k])]++;
@@ -133,6 +202,7 @@ void getBestBFromData(const uint32_t* in, uint8_t& bestb, uint8_t& bestcexcept, 
       bestcexcept = (uint8_t) cexcept;
     }
   }
+#endif
 }
 
 // Single-block PForDelta encode (NoDelta). Lean layout, no multi-block
@@ -158,12 +228,34 @@ void encodeBlockPFor(uint32_t* in, char* outc, uint32_t& outSz) {
     bpacker.clear();
     bpacker.ensureCapacity(maxb - bestb - 1, bestcexcept);
     const uint32_t maxval = 1U << bestb;
+#if defined(__AVX2__)
+    const __m256i signBit = _mm256_set1_epi32((int32_t) 0x80000000u);
+    const __m256i compareLimit = _mm256_set1_epi32(
+        (int32_t) ((maxval - 1) ^ 0x80000000u));
+    [[maybe_unused]] uint32_t emitted = 0;
+    for (uint32_t k = 0; k < BLOCK_SIZE; k += 8) {
+      __m256i values = _mm256_loadu_si256((const __m256i*) (in + k));
+      __m256i exceptions = _mm256_cmpgt_epi32(
+          _mm256_xor_si256(values, signBit), compareLimit);
+      uint32_t mask = (uint32_t) _mm256_movemask_ps(_mm256_castsi256_ps(exceptions));
+      while (mask != 0) {
+        uint32_t lane = (uint32_t) std::countr_zero(mask);
+        uint32_t position = k + lane;
+        bpacker.directAppend(maxb - bestb - 1, in[position] >> bestb);
+        *bc++ = (uint8_t) position;
+        emitted++;
+        mask &= mask - 1;
+      }
+    }
+    assert(emitted == bestcexcept);
+#else
     for (uint32_t k = 0; k < BLOCK_SIZE; ++k) {
       if (in[k] >= maxval) {
         bpacker.directAppend(maxb - bestb - 1, in[k] >> bestb);
         *bc++ = (uint8_t) k;
       }
     }
+#endif
   }
   // Word-align the base so the SIMD/scalar bit-packing kernels stay word-granular
   // (zero the pad bytes for a deterministic encoding).
