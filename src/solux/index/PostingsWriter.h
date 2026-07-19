@@ -587,11 +587,19 @@ private:  // some internal utility methods... not for use by indexers
     return norms.normForDoc(docid);
   }
 
-  void buildImpactFrontier(uint32_t docCount) {
+  uint32_t buildImpactFrontier(uint32_t docCount) {
     frontierNorms.resize(0);
     frontierTfs.resize(0);
-    if (!(hasFreqs && hasNorms)) {
-      return;
+    if (!hasNorms) {
+      return 0;
+    }
+
+    uint32_t minNorm = 255;
+    if (!hasFreqs) {
+      for (uint32_t i = 0; i < docCount; i++) {
+        minNorm = std::min(minNorm, normForDoc(docs[i]));
+      }
+      return minNorm;
     }
 
     maxTfPerNorm.fill(0);
@@ -599,6 +607,7 @@ private:  // some internal utility methods... not for use by indexers
       uint32_t norm = normForDoc(docs[i]);
       assert(norm <= 255);
       uint32_t tf = (uint32_t) tfreqs[i];
+      minNorm = std::min(minNorm, norm);
       maxTfPerNorm[norm] = std::max(maxTfPerNorm[norm], tf);
       termMaxTfPerNorm[norm] = std::max(termMaxTfPerNorm[norm], tf);
     }
@@ -612,6 +621,7 @@ private:  // some internal utility methods... not for use by indexers
         runningMaxTf = tf;
       }
     }
+    return minNorm;
   }
 
   // Encode the Pareto frontier of a (norm -> maxTf) surface as
@@ -855,20 +865,6 @@ private:  // some internal utility methods... not for use by indexers
     }
   }
 
-  uint32_t blockMinNorm(uint32_t docCount) const {
-    if (!hasNorms) {
-      return 0;
-    }
-    if (norms.empty()) {
-      return 0;
-    }
-    uint32_t minNorm = 255;
-    for (uint32_t i = 0; i < docCount; i++) {
-      minNorm = std::min(minNorm, normForDoc(docs[i]));
-    }
-    return minNorm;
-  }
-
   void flushL1Group() {
     if (l1GroupBlockCount == 0) {
       return;
@@ -994,7 +990,6 @@ public:
     const uint32_t lastDoc = (uint32_t) docs.back();
     uint64_t tfSum = 0;
     uint32_t maxTf = 0;
-    uint32_t minNorm = blockMinNorm(Postings::DOCS_BLOCK_SIZE);
     if (hasFreqs) {
       for (auto tf : tfreqs) {
         if (hasPositions) {
@@ -1003,7 +998,7 @@ public:
         maxTf = std::max(maxTf, (uint32_t) tf);
       }
     }
-    buildImpactFrontier(Postings::DOCS_BLOCK_SIZE);
+    uint32_t minNorm = buildImpactFrontier(Postings::DOCS_BLOCK_SIZE);
 
     // Doc-part encoding decision (token byte + body; see Postings::DOC_BLOCK_*
     // and DocsEnum). Dense blocks store doc ids as a bitset over (base, lastDoc]
@@ -1415,7 +1410,6 @@ public:
         const uint32_t lastDoc = (uint32_t) docs.back();
         uint64_t tfSum = 0;
         uint32_t maxTf = 0;
-        uint32_t minNorm = blockMinNorm(n);
         if (hasFreqs) {
           for (auto tf : tfreqs) {
             if (hasPositions) {
@@ -1424,7 +1418,7 @@ public:
             maxTf = std::max(maxTf, (uint32_t) tf);
           }
         }
-        buildImpactFrontier(n);
+        uint32_t minNorm = buildImpactFrontier(n);
         uint8_t* ddEnd = svb_encode_scalar_d1_init((const uint32_t*) docs.data(), dkeys, ddata, n, base);
         compressed_output.resize(0);
         appendBytes(compressed_output, dkeys, kb);
@@ -1609,9 +1603,15 @@ public:
       }
       assert(appendedDeltas == expectedDeltas);
 
-      for (int32_t i = 0; i < count; i++) {
-        size_t index = offset + (size_t) i;
-        addDoc(docids[index], tfValues[index]);
+      auto docChunk = docids.subspan(offset, (size_t) count);
+      auto tfChunk = tfValues.subspan(offset, (size_t) count);
+      docs.insert(docs.end(), docChunk.begin(), docChunk.end());
+      tfreqs.insert(tfreqs.end(), tfChunk.begin(), tfChunk.end());
+      ttfAcc += expectedDeltas;
+      assert(docs.size() == tfreqs.size());
+      assert(docs.size() <= Postings::DOCS_BLOCK_SIZE);
+      if (docs.size() == Postings::DOCS_BLOCK_SIZE) {
+        flushDocs();
       }
       offset += (size_t) count;
     }
